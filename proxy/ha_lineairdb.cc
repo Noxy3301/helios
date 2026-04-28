@@ -125,8 +125,14 @@
 #define BLOB_MEMROOT_ALLOC_SIZE (8192)
 #define FENCE false
 
-// DICT_UNIQUE from InnoDB dict0mem.h — defined locally to avoid InnoDB dependency
-static constexpr uint DICT_UNIQUE = 2;
+// LineairDB's wire format for SecondaryIndexType::FromRaw is the public
+// SecondaryIndexOption::Constraint bit layout (LineairDB/include/lineairdb/config.h):
+//   UNIQUE   = 1u << 0
+//   NOT_NULL = 1u << 1
+// Previously this was set to 2 (InnoDB's dict0mem.h LDB_INDEX_UNIQUE), which
+// collided with NOT_NULL on the LineairDB side and silently disabled UNIQUE
+// constraint enforcement after LineairDB submodule realigned kDictUnique.
+static constexpr uint LDB_INDEX_UNIQUE = 1u;
 
 namespace {
 constexpr unsigned char kKeyMarkerNotNull = 0x00;
@@ -1926,7 +1932,7 @@ int ha_lineairdb::create(const char *table_name, TABLE *table, HA_CREATE_INFO *,
   // Create secondary indexes (also ignore "already exists")
   for (uint i = 0; i < table->s->keys; i++) {
     auto key_info = table->key_info[i];
-    uint index_type = (key_info.flags & HA_NOSAME) ? DICT_UNIQUE : 0;
+    uint index_type = (key_info.flags & HA_NOSAME) ? LDB_INDEX_UNIQUE : 0;
     if (i != table->s->primary_key) {
       proxy->db_create_secondary_index(
           db_table_name, std::string(key_info.name), index_type);
@@ -1975,7 +1981,7 @@ bool ha_lineairdb::inplace_alter_table(TABLE *altered_table [[maybe_unused]],
     uint key_idx = ha_alter_info->index_add_buffer[i];
     KEY *key_info = &ha_alter_info->key_info_buffer[key_idx];
 
-    uint index_type = (key_info->flags & HA_NOSAME) ? DICT_UNIQUE : 0;
+    uint index_type = (key_info->flags & HA_NOSAME) ? LDB_INDEX_UNIQUE : 0;
 
     // In a disaggregated setup, another MySQL node may have already created
     // this secondary index on the shared LineairDB server. Treat "already
