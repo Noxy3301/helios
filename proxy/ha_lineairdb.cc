@@ -112,6 +112,7 @@
 #include "lineairdb.pb.h"
 #include "my_dbug.h"
 #include "mysql/plugin.h"
+#include "mysqld_error.h"
 #include "sql/field.h"
 #include "sql/item.h"
 #include "sql/item_cmpfunc.h"
@@ -157,6 +158,23 @@ struct LineairDBThdCtx {
 
 static int lineairdb_commit(handlerton *hton, THD *thd, bool shouldCommit);
 static int lineairdb_abort(handlerton *hton, THD *thd, bool);
+
+// Classify a tx-scoped failure into the right MySQL handler error code.
+// Used by every per-statement path (write_row, update_row, delete_row,
+// rnd_pos, scans, index_*, etc.) where tx state has been disturbed by an
+// RPC failure. Transport-level failures map to 1815/HY000 (non-retryable,
+// ambiguous outcome) so MySQL clients do not silently re-execute against
+// possibly-committed state. OCC aborts stay 1213/40001 (retryable). The
+// my_error() call seeds the diagnostics_area before we return so
+// ha_commit_low does not later wrap our return as ER_ERROR_DURING_COMMIT.
+static int handler_error_for_tx(LineairDBTransaction *tx) {
+  if (tx != nullptr && tx->transport_error_seen()) {
+    my_error(ER_INTERNAL_ERROR, MYF(0),
+             "LineairDB RPC failed (transport)");
+    return HA_ERR_INTERNAL_ERROR;
+  }
+  return HA_ERR_LOCK_DEADLOCK;
+}
 
 static MYSQL_THDVAR_STR(last_create_thdvar, PLUGIN_VAR_MEMALLOC, nullptr,
                         nullptr, nullptr, nullptr);
@@ -496,7 +514,7 @@ int ha_lineairdb::write_row(uchar *buf) {
 
   if (tx->is_aborted()) {
     thd_mark_transaction_to_rollback(ha_thd(), 1);
-    return HA_ERR_LOCK_DEADLOCK;
+    return handler_error_for_tx(tx);
   }
 
   // buffer_write appends to a local buffer (no RPC yet), so no error check needed.
@@ -526,7 +544,7 @@ int ha_lineairdb::write_row(uchar *buf) {
       bool ok = tx->write_secondary_index(key_info.name, secondary_key, key);
       if (!ok || tx->is_aborted()) {
         thd_mark_transaction_to_rollback(ha_thd(), 1);
-        return HA_ERR_LOCK_DEADLOCK;
+        return handler_error_for_tx(tx);
       }
     } else {
       tx->buffer_write_secondary_index(db_table_name, key_info.name,
@@ -536,7 +554,7 @@ int ha_lineairdb::write_row(uchar *buf) {
 
   if (tx->is_aborted()) {
     thd_mark_transaction_to_rollback(ha_thd(), 1);
-    return HA_ERR_LOCK_DEADLOCK;
+    return handler_error_for_tx(tx);
   }
 
   tx->add_rowcount_delta(share, db_table_name, +1);
@@ -565,7 +583,7 @@ int ha_lineairdb::update_row(const uchar *old_data, uchar *new_data) {
 
   if (tx->is_aborted()) {
     thd_mark_transaction_to_rollback(ha_thd(), 1);
-    return HA_ERR_LOCK_DEADLOCK;
+    return handler_error_for_tx(tx);
   }
 
   tx->choose_table(db_table_name);
@@ -573,7 +591,7 @@ int ha_lineairdb::update_row(const uchar *old_data, uchar *new_data) {
 
   if (tx->is_aborted()) {
     thd_mark_transaction_to_rollback(ha_thd(), 1);
-    return HA_ERR_LOCK_DEADLOCK;
+    return handler_error_for_tx(tx);
   }
 
   for (uint i = 0; i < table->s->keys; i++) {
@@ -597,7 +615,7 @@ int ha_lineairdb::update_row(const uchar *old_data, uchar *new_data) {
 
     if (tx->is_aborted()) {
       thd_mark_transaction_to_rollback(ha_thd(), 1);
-      return HA_ERR_LOCK_DEADLOCK;
+      return handler_error_for_tx(tx);
     }
   }
 
@@ -623,17 +641,17 @@ int ha_lineairdb::delete_row(const uchar *buf) {
 
   if (tx->is_aborted()) {
     thd_mark_transaction_to_rollback(ha_thd(), 1);
-    return HA_ERR_LOCK_DEADLOCK;
+    return handler_error_for_tx(tx);
   }
 
   tx->choose_table(db_table_name);
   bool is_successful = tx->delete_value(key);
   if (!is_successful)
-    return HA_ERR_LOCK_DEADLOCK;
+    return handler_error_for_tx(tx);
 
   if (tx->is_aborted()) {
     thd_mark_transaction_to_rollback(ha_thd(), 1);
-    return HA_ERR_LOCK_DEADLOCK;
+    return handler_error_for_tx(tx);
   }
 
   for (uint i = 0; i < table->s->keys; i++) {
@@ -644,11 +662,11 @@ int ha_lineairdb::delete_row(const uchar *buf) {
       bool is_successful =
           tx->delete_secondary_index(key_info.name, secondary_key, key);
       if (!is_successful)
-        return HA_ERR_LOCK_DEADLOCK;
+        return handler_error_for_tx(tx);
 
       if (tx->is_aborted()) {
         thd_mark_transaction_to_rollback(ha_thd(), 1);
-        return HA_ERR_LOCK_DEADLOCK;
+        return handler_error_for_tx(tx);
       }
     }
   }
@@ -668,7 +686,7 @@ int ha_lineairdb::index_read_map(uchar *buf, const uchar *key,
 
   if (tx->is_aborted()) {
     thd_mark_transaction_to_rollback(ha_thd(), 1);
-    return HA_ERR_LOCK_DEADLOCK;
+    return handler_error_for_tx(tx);
   }
 
   tx->choose_table(db_table_name);
@@ -690,7 +708,7 @@ int ha_lineairdb::index_next(uchar *buf) {
   auto tx = get_transaction(ha_thd());
   if (tx->is_aborted()) {
     thd_mark_transaction_to_rollback(ha_thd(), 1);
-    return HA_ERR_LOCK_DEADLOCK;
+    return handler_error_for_tx(tx);
   }
   tx->choose_table(db_table_name);
 
@@ -710,7 +728,7 @@ int ha_lineairdb::index_next_same(uchar *buf, const uchar *key [[maybe_unused]],
   auto tx = get_transaction(ha_thd());
   if (tx->is_aborted()) {
     thd_mark_transaction_to_rollback(ha_thd(), 1);
-    return HA_ERR_LOCK_DEADLOCK;
+    return handler_error_for_tx(tx);
   }
   tx->choose_table(db_table_name);
 
@@ -734,7 +752,7 @@ int ha_lineairdb::index_prev(uchar *buf) {
   auto tx = get_transaction(ha_thd());
   if (tx->is_aborted()) {
     thd_mark_transaction_to_rollback(ha_thd(), 1);
-    return HA_ERR_LOCK_DEADLOCK;
+    return handler_error_for_tx(tx);
   }
   tx->choose_table(db_table_name);
 
@@ -789,7 +807,7 @@ int ha_lineairdb::index_last(uchar *buf) {
   auto tx = get_transaction(ha_thd());
   if (tx->is_aborted()) {
     thd_mark_transaction_to_rollback(ha_thd(), 1);
-    return HA_ERR_LOCK_DEADLOCK;
+    return handler_error_for_tx(tx);
   }
 
   tx->choose_table(db_table_name);
@@ -806,7 +824,7 @@ int ha_lineairdb::index_last(uchar *buf) {
 
   if (tx->is_aborted()) {
     thd_mark_transaction_to_rollback(ha_thd(), 1);
-    return HA_ERR_LOCK_DEADLOCK;
+    return handler_error_for_tx(tx);
   }
 
   if (secondary_index_results_.empty()) {
@@ -1034,7 +1052,7 @@ int ha_lineairdb::rnd_init(bool) {
 
   if (tx->is_aborted()) {
     thd_mark_transaction_to_rollback(ha_thd(), 1);
-    DBUG_RETURN(HA_ERR_LOCK_DEADLOCK);
+    DBUG_RETURN(handler_error_for_tx(tx));
   }
 
   tx->choose_table(db_table_name);
@@ -1152,7 +1170,7 @@ int ha_lineairdb::rnd_next(uchar *buf) {
     if (!fetch_next_batch()) {
       auto tx = get_transaction(ha_thd());
       if (tx->is_aborted()) {
-        DBUG_RETURN(HA_ERR_LOCK_DEADLOCK);
+        DBUG_RETURN(handler_error_for_tx(tx));
       }
       scan_exhausted_ = true;
       DBUG_RETURN(HA_ERR_END_OF_FILE);
@@ -1241,11 +1259,19 @@ int ha_lineairdb::rnd_pos(uchar *buf, uchar *pos) {
 
   if (tx->is_aborted()) {
     thd_mark_transaction_to_rollback(ha_thd(), 1);
-    return HA_ERR_LOCK_DEADLOCK;
+    return handler_error_for_tx(tx);
   }
 
   tx->choose_table(db_table_name);
   auto result = tx->read(primary_key);
+
+  // tx->read() returns (nullptr, 0) for both genuine miss and transport
+  // failure. Disambiguate via the tx ledger so a broken RPC does not look
+  // like the row simply does not exist.
+  if (tx->transport_error_seen()) {
+    thd_mark_transaction_to_rollback(ha_thd(), 1);
+    return handler_error_for_tx(tx);
+  }
 
   if (result.first == nullptr || result.second == 0) {
     return HA_ERR_KEY_NOT_FOUND;
@@ -1353,7 +1379,7 @@ int ha_lineairdb::info(uint flag) {
       if (active_tx != nullptr && !active_tx->is_not_started()) {
         if (active_tx->is_aborted()) {
           thd_mark_transaction_to_rollback(thd, 1);
-          return HA_ERR_LOCK_DEADLOCK;
+          return handler_error_for_tx(active_tx);
         }
 
         const int64_t local_delta = active_tx->peek_rowcount_delta(share);
@@ -1595,11 +1621,30 @@ static int lineairdb_commit(handlerton *hton, THD *thd, bool all) {
   if (!should_terminate_now)
     return 0;
 
-  const bool committed = ctx->tx->end_transaction();
+  bool transport_error = false;
+  const bool committed = ctx->tx->end_transaction(&transport_error);
   ctx->tx = nullptr;
 
   if (!committed) {
     thd_mark_transaction_to_rollback(thd, true);
+    // Map the failure to a SQL-layer error before returning. ha_commit_low
+    // otherwise wraps any non-zero return as ER_ERROR_DURING_COMMIT
+    // (1180/HY000), which standard MySQL drivers do not auto-retry. By
+    // raising the right code here first, the diagnostics_area surfaces our
+    // classification to the client.
+    if (transport_error) {
+      // Network/RPC failure: the commit is ambiguous (request may or may
+      // not have reached the server). 1815/HY000 is non-retryable so the
+      // client is forced to handle it explicitly rather than silently
+      // double-committing on retry.
+      my_error(ER_INTERNAL_ERROR, MYF(0),
+               "LineairDB commit failed due to transport error");
+      return HA_ERR_INTERNAL_ERROR;
+    }
+    // OCC anti-dependency abort: the server cleanly rejected the commit.
+    // 1213/40001 is retryable per the SQL standard, so the client driver
+    // can transparently re-execute the transaction.
+    my_error(ER_LOCK_DEADLOCK, MYF(0));
     return HA_ERR_LOCK_DEADLOCK;
   }
   return 0;
@@ -2098,7 +2143,7 @@ int ha_lineairdb::multi_range_read_init(RANGE_SEQ_IF *seq, void *seq_init_param,
   auto tx = get_transaction(ha_thd());
   if (!tx || tx->is_aborted()) {
     thd_mark_transaction_to_rollback(ha_thd(), 1);
-    return HA_ERR_LOCK_DEADLOCK;
+    return handler_error_for_tx(tx);
   }
   tx->choose_table(db_table_name);
 
@@ -2109,7 +2154,7 @@ int ha_lineairdb::multi_range_read_init(RANGE_SEQ_IF *seq, void *seq_init_param,
 
   if (tx->is_aborted()) {
     thd_mark_transaction_to_rollback(ha_thd(), 1);
-    return HA_ERR_LOCK_DEADLOCK;
+    return handler_error_for_tx(tx);
   }
 
   // Buffer results for multi_range_read_next()
@@ -2415,7 +2460,7 @@ int ha_lineairdb::execute_index_first(uchar *buf, LineairDBTransaction *tx) {
   // phantom detection check
   if (tx->is_aborted()) {
     thd_mark_transaction_to_rollback(ha_thd(), 1);
-    return HA_ERR_LOCK_DEADLOCK;
+    return handler_error_for_tx(tx);
   }
 
   if (secondary_index_results_.empty()) {
@@ -2435,7 +2480,7 @@ int ha_lineairdb::execute_unique_point(uchar *buf, LineairDBTransaction *tx) {
 
     if (tx->is_aborted()) {
       thd_mark_transaction_to_rollback(ha_thd(), 1);
-      return HA_ERR_LOCK_DEADLOCK;
+      return handler_error_for_tx(tx);
     }
 
     if (result.first == nullptr || result.second == 0) {
@@ -2460,7 +2505,7 @@ int ha_lineairdb::execute_unique_point(uchar *buf, LineairDBTransaction *tx) {
 
     if (tx->is_aborted()) {
       thd_mark_transaction_to_rollback(ha_thd(), 1);
-      return HA_ERR_LOCK_DEADLOCK;
+      return handler_error_for_tx(tx);
     }
 
     for (auto &pk : primary_keys) {
@@ -2497,7 +2542,7 @@ int ha_lineairdb::execute_same_key_materialize(uchar *buf,
 
     if (tx->is_aborted()) {
       thd_mark_transaction_to_rollback(ha_thd(), 1);
-      return HA_ERR_LOCK_DEADLOCK;
+      return handler_error_for_tx(tx);
     }
 
     if (secondary_index_results_.empty()) {
@@ -2511,7 +2556,7 @@ int ha_lineairdb::execute_same_key_materialize(uchar *buf,
 
   if (tx->is_aborted()) {
     thd_mark_transaction_to_rollback(ha_thd(), 1);
-    return HA_ERR_LOCK_DEADLOCK;
+    return handler_error_for_tx(tx);
   }
 
   if (secondary_index_results_.empty()) {
@@ -2542,7 +2587,7 @@ int ha_lineairdb::execute_prefix_first(uchar *buf, LineairDBTransaction *tx) {
 
     if (tx->is_aborted()) {
       thd_mark_transaction_to_rollback(ha_thd(), 1);
-      return HA_ERR_LOCK_DEADLOCK;
+      return handler_error_for_tx(tx);
     }
 
     if (secondary_index_results_.empty()) {
@@ -2558,7 +2603,7 @@ int ha_lineairdb::execute_prefix_first(uchar *buf, LineairDBTransaction *tx) {
 
   if (tx->is_aborted()) {
     thd_mark_transaction_to_rollback(ha_thd(), 1);
-    return HA_ERR_LOCK_DEADLOCK;
+    return handler_error_for_tx(tx);
   }
 
   if (secondary_index_results_.empty()) {
@@ -2598,7 +2643,7 @@ int ha_lineairdb::execute_range_materialize(uchar *buf,
   // phantom detection check
   if (tx->is_aborted()) {
     thd_mark_transaction_to_rollback(ha_thd(), 1);
-    return HA_ERR_LOCK_DEADLOCK;
+    return handler_error_for_tx(tx);
   }
 
   if (secondary_index_results_.empty()) {
@@ -2634,7 +2679,7 @@ int ha_lineairdb::execute_prev_key(uchar *buf, LineairDBTransaction *tx) {
 
   if (tx->is_aborted()) {
     thd_mark_transaction_to_rollback(ha_thd(), 1);
-    return HA_ERR_LOCK_DEADLOCK;
+    return handler_error_for_tx(tx);
   }
 
   if (secondary_index_results_.empty()) {
@@ -2673,7 +2718,7 @@ int ha_lineairdb::execute_prefix_last(uchar *buf, LineairDBTransaction *tx) {
 
     if (tx->is_aborted()) {
       thd_mark_transaction_to_rollback(ha_thd(), 1);
-      return HA_ERR_LOCK_DEADLOCK;
+      return handler_error_for_tx(tx);
     }
 
     if (secondary_index_results_.empty()) {
@@ -2701,7 +2746,7 @@ int ha_lineairdb::execute_prefix_last(uchar *buf, LineairDBTransaction *tx) {
 
   if (tx->is_aborted()) {
     thd_mark_transaction_to_rollback(ha_thd(), 1);
-    return HA_ERR_LOCK_DEADLOCK;
+    return handler_error_for_tx(tx);
   }
 
   if (secondary_index_results_.empty()) {
@@ -2794,7 +2839,7 @@ int ha_lineairdb::fetch_and_set_current_result(uchar *buf,
     auto result = tx->read(primary_key);
     if (tx->is_aborted()) {
       thd_mark_transaction_to_rollback(ha_thd(), 1);
-      return HA_ERR_LOCK_DEADLOCK;
+      return handler_error_for_tx(tx);
     }
     if (result.first == nullptr || result.second == 0) {
       return HA_ERR_KEY_NOT_FOUND;

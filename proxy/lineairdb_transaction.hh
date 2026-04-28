@@ -92,7 +92,11 @@ public:
 
   void begin_transaction();
   void set_status_to_abort();
-  bool end_transaction();
+  // out_transport_error (when non-null) reports whether a return value of
+  // false was caused by a transport-layer failure rather than a clean OCC
+  // abort from the server. Lets the handler distinguish retryable OCC aborts
+  // from ambiguous network failures.
+  bool end_transaction(bool* out_transport_error = nullptr);
   void fence() const;
   
 
@@ -114,6 +118,19 @@ public:
     // Prevents subsequent RPC responses from accidentally clearing the flag.
     if (aborted) is_aborted_ = true;
   }
+
+  // Transport error ledger. Latches on first sighting so a mid-tx network
+  // failure (auto-flush, direct SI RPC, etc.) cannot be hidden by a later
+  // successful RPC. Also poisons the tx as aborted: a transport-failed RPC
+  // leaves the tx in an unknown state (request may or may not have reached
+  // the server), so subsequent buffered writes/reads must short-circuit
+  // instead of silently appearing to succeed. end_transaction folds this
+  // into the commit-time transport classification.
+  inline void mark_transport_error() {
+    transport_error_seen_ = true;
+    is_aborted_ = true;
+  }
+  inline bool transport_error_seen() const { return transport_error_seen_; }
 
   inline bool is_a_single_statement() const { return !isTransaction; }
 
@@ -152,6 +169,11 @@ private:
 
   // transaction abort status (updated by RPC responses)
   bool is_aborted_;
+
+  // Latched once any per-tx RPC failed at transport level. Never reset
+  // within a single tx lifetime; the only way to clear it is to start a
+  // fresh LineairDBTransaction.
+  bool transport_error_seen_ = false;
 
   struct RowCountDelta {
     LineairDB_share *share;

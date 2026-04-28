@@ -474,10 +474,28 @@ void LineairDBTransaction::set_status_to_abort() {
   clear_read_cache();
 }
 
-bool LineairDBTransaction::end_transaction() {
+bool LineairDBTransaction::end_transaction(bool* out_transport_error) {
   assert(tx_id != -1);
-  flush_write_buffer();
+  if (out_transport_error != nullptr) *out_transport_error = false;
+  // Snapshot is_aborted_ before flushing so we can tell whether flush itself
+  // flipped it. tx_batch_write sets is_aborted_ only on a clean OCC abort
+  // (response.is_aborted=true); transport failures (no connection / send
+  // failure) leave is_aborted_ unchanged. So if flush returns false but
+  // is_aborted_ did not change, the failure was transport, not OCC.
+  bool was_aborted_before_flush = is_aborted_;
+  bool flush_ok = flush_write_buffer();
+  // transport iff flush failed AND nothing in this tx was aborted before
+  // flush AND flush itself did not produce a new OCC abort. (Skip the
+  // "unchanged" shortcut: an already-aborted tx makes flush early-return
+  // false without that being a transport failure.)
+  bool flush_transport_error =
+      !flush_ok && !was_aborted_before_flush && !is_aborted_;
   bool was_aborted = is_aborted_;
+
+  // Pick up any transport failure that happened earlier in the tx
+  // (auto-flush in buffer_write, direct SI RPC in update_row, etc.).
+  // Once latched, that classification wins over a later "clean" END RPC.
+  bool prior_transport_error = transport_error_seen_;
 
   // Build row-delta pairs for the server (table_name, delta).
   std::vector<std::pair<std::string, int64_t>> server_deltas;
@@ -490,8 +508,18 @@ bool LineairDBTransaction::end_transaction() {
   }
 
   bool committed = lineairdb_proxy->db_end_transaction(tx_id, isFence, server_deltas);
+  // A prior mid-tx transport failure (auto-flush, direct SI RPC, etc.)
+  // means the server-side state is incomplete: at least one buffered op
+  // never reached the server. Force the commit to fail so the SQL layer
+  // gets a 1815 instead of silently appearing to succeed on a partial tx.
+  if (prior_transport_error) committed = false;
   if (!committed) {
     thd_mark_transaction_to_rollback(thread, 1);
+    if (out_transport_error != nullptr) {
+      *out_transport_error = prior_transport_error ||
+                             flush_transport_error ||
+                             lineairdb_proxy->last_end_was_transport_error();
+    }
   }
 
   // Flush committed row-count deltas to local shards (for this proxy's info()).

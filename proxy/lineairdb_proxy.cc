@@ -137,6 +137,7 @@ std::string LineairDBProxy::tx_read(LineairDBTransaction* tx, const std::string&
     LOG_DEBUG("CLIENT: tx_read called with tx_id=%ld, key=%s", tx_id, key.c_str());
     if (!connected_) {
         LOG_ERROR("RPC failed: Not connected to server");
+        if (tx) tx->mark_transport_error();
         return "";
     }
 
@@ -151,6 +152,7 @@ std::string LineairDBProxy::tx_read(LineairDBTransaction* tx, const std::string&
     if (!send_protobuf_message(request, response, MessageType::TX_READ,
                                "key=" + key)) {
         LOG_ERROR("RPC failed: Failed to send message to server");
+        if (tx) tx->mark_transport_error();
         return "";
     }
 
@@ -166,6 +168,7 @@ bool LineairDBProxy::tx_write(LineairDBTransaction* tx, const std::string& key, 
     LOG_DEBUG("CLIENT: tx_write called with tx_id=%ld, key=%s, value=%s", tx_id, key.c_str(), value.c_str());
     if (!connected_) {
         LOG_ERROR("RPC failed: Not connected to server");
+        if (tx) tx->mark_transport_error();
         return false;
     }
 
@@ -181,6 +184,7 @@ bool LineairDBProxy::tx_write(LineairDBTransaction* tx, const std::string& key, 
     if (!send_protobuf_message(request, response, MessageType::TX_WRITE,
                                "key=" + key + ",val_b=" + std::to_string(value.size()))) {
         LOG_ERROR("RPC failed: Failed to send message to server");
+        if (tx) tx->mark_transport_error();
         return false;
     }
 
@@ -196,6 +200,7 @@ bool LineairDBProxy::tx_delete(LineairDBTransaction* tx, const std::string& key)
     LOG_DEBUG("CLIENT: tx_delete called with tx_id=%ld, key=%s", tx_id, key.c_str());
     if (!connected_) {
         LOG_ERROR("RPC failed: Not connected to server");
+        if (tx) tx->mark_transport_error();
         return false;
     }
 
@@ -209,6 +214,7 @@ bool LineairDBProxy::tx_delete(LineairDBTransaction* tx, const std::string& key)
     if (!send_protobuf_message(request, response, MessageType::TX_DELETE,
                                "key=" + key)) {
         LOG_ERROR("RPC failed: Failed to send message to server");
+        if (tx) tx->mark_transport_error();
         return false;
     }
 
@@ -223,6 +229,7 @@ std::vector<LineairDBProxy::BatchReadResult> LineairDBProxy::tx_batch_read(
     int64_t tx_id = tx->get_tx_id();
     if (!connected_) {
         LOG_ERROR("RPC failed: Not connected to server");
+        if (tx) tx->mark_transport_error();
         return {};
     }
 
@@ -238,6 +245,7 @@ std::vector<LineairDBProxy::BatchReadResult> LineairDBProxy::tx_batch_read(
     if (!send_protobuf_message(request, response, MessageType::TX_BATCH_READ,
                                "n=" + std::to_string(keys.size()))) {
         LOG_ERROR("RPC failed: Failed to send batch_read message to server");
+        if (tx) tx->mark_transport_error();
         return {};
     }
 
@@ -259,6 +267,7 @@ bool LineairDBProxy::tx_batch_write(LineairDBTransaction* tx,
     int64_t tx_id = tx->get_tx_id();
     if (!connected_) {
         LOG_ERROR("RPC failed: Not connected to server");
+        if (tx) tx->mark_transport_error();
         return false;
     }
 
@@ -284,6 +293,7 @@ bool LineairDBProxy::tx_batch_write(LineairDBTransaction* tx,
     if (!send_protobuf_message(request, response, MessageType::TX_BATCH_WRITE,
                                "table=" + table_name + ",n_w=" + std::to_string(writes.size()) + ",n_si=" + std::to_string(si_writes.size()))) {
         LOG_ERROR("RPC failed: Failed to send batch_write message to server");
+        if (tx) tx->mark_transport_error();
         return false;
     }
 
@@ -299,6 +309,7 @@ std::vector<std::string> LineairDBProxy::tx_read_secondary_index(LineairDBTransa
               tx_id, index_name.c_str(), secondary_key.c_str());
     if (!connected_) {
         LOG_ERROR("RPC failed: Not connected to server");
+        if (tx) tx->mark_transport_error();
         return {};
     }
 
@@ -313,6 +324,7 @@ std::vector<std::string> LineairDBProxy::tx_read_secondary_index(LineairDBTransa
     if (!send_protobuf_message(request, response, MessageType::TX_READ_SECONDARY_INDEX,
                                "index=" + index_name + ",sk=" + secondary_key)) {
         LOG_ERROR("RPC failed: Failed to send message to server");
+        if (tx) tx->mark_transport_error();
         return {};
     }
 
@@ -336,6 +348,7 @@ bool LineairDBProxy::tx_write_secondary_index(LineairDBTransaction* tx,
               tx_id, index_name.c_str(), secondary_key.c_str());
     if (!connected_) {
         LOG_ERROR("RPC failed: Not connected to server");
+        if (tx) tx->mark_transport_error();
         return false;
     }
 
@@ -351,6 +364,7 @@ bool LineairDBProxy::tx_write_secondary_index(LineairDBTransaction* tx,
     if (!send_protobuf_message(request, response, MessageType::TX_WRITE_SECONDARY_INDEX,
                                "index=" + index_name + ",sk=" + secondary_key + ",pk=" + primary_key)) {
         LOG_ERROR("RPC failed: Failed to send message to server");
+        if (tx) tx->mark_transport_error();
         return false;
     }
 
@@ -369,6 +383,7 @@ bool LineairDBProxy::tx_delete_secondary_index(LineairDBTransaction* tx,
               tx_id, index_name.c_str(), secondary_key.c_str());
     if (!connected_) {
         LOG_ERROR("RPC failed: Not connected to server");
+        if (tx) tx->mark_transport_error();
         return false;
     }
 
@@ -384,6 +399,7 @@ bool LineairDBProxy::tx_delete_secondary_index(LineairDBTransaction* tx,
     if (!send_protobuf_message(request, response, MessageType::TX_DELETE_SECONDARY_INDEX,
                                "index=" + index_name + ",sk=" + secondary_key + ",pk=" + primary_key)) {
         LOG_ERROR("RPC failed: Failed to send message to server");
+        if (tx) tx->mark_transport_error();
         return false;
     }
 
@@ -403,6 +419,7 @@ bool LineairDBProxy::tx_update_secondary_index(LineairDBTransaction* tx,
               tx_id, index_name.c_str(), old_secondary_key.c_str(), new_secondary_key.c_str());
     if (!connected_) {
         LOG_ERROR("RPC failed: Not connected to server");
+        if (tx) tx->mark_transport_error();
         return false;
     }
 
@@ -419,6 +436,7 @@ bool LineairDBProxy::tx_update_secondary_index(LineairDBTransaction* tx,
     if (!send_protobuf_message(request, response, MessageType::TX_UPDATE_SECONDARY_INDEX,
                                "index=" + index_name + ",old_sk=" + old_secondary_key + ",new_sk=" + new_secondary_key)) {
         LOG_ERROR("RPC failed: Failed to send message to server");
+        if (tx) tx->mark_transport_error();
         return false;
     }
 
@@ -437,6 +455,7 @@ std::vector<std::string> LineairDBProxy::tx_get_matching_keys_in_range(LineairDB
     LOG_DEBUG("CLIENT: tx_get_matching_keys_in_range called with tx_id=%ld", tx_id);
     if (!connected_) {
         LOG_ERROR("RPC failed: Not connected to server");
+        if (tx) tx->mark_transport_error();
         return {};
     }
 
@@ -451,6 +470,7 @@ std::vector<std::string> LineairDBProxy::tx_get_matching_keys_in_range(LineairDB
     if (!send_protobuf_message(request, response, MessageType::TX_GET_MATCHING_KEYS_IN_RANGE,
                                "start=" + start_key + ",end=" + end_key)) {
         LOG_ERROR("RPC failed: Failed to send message to server");
+        if (tx) tx->mark_transport_error();
         return {};
     }
 
@@ -473,6 +493,7 @@ std::vector<KeyValue> LineairDBProxy::tx_get_matching_keys_and_values_in_range(L
     LOG_DEBUG("CLIENT: tx_get_matching_keys_and_values_in_range called with tx_id=%ld limit=%u", tx_id, limit);
     if (!connected_) {
         LOG_ERROR("RPC failed: Not connected to server");
+        if (tx) tx->mark_transport_error();
         return {};
     }
 
@@ -501,6 +522,7 @@ std::vector<KeyValue> LineairDBProxy::tx_get_matching_keys_and_values_in_range(L
                                    MessageType::TX_GET_MATCHING_KEYS_AND_VALUES_IN_RANGE,
                                    meta)) {
         LOG_ERROR("RPC failed: Failed to send message to server");
+        if (tx) tx->mark_transport_error();
         return {};
     }
 
@@ -518,6 +540,7 @@ std::vector<KeyValue> LineairDBProxy::tx_get_matching_keys_and_values_from_prefi
     LOG_DEBUG("CLIENT: tx_get_matching_keys_and_values_from_prefix called with tx_id=%ld, prefix=%s", tx_id, prefix.c_str());
     if (!connected_) {
         LOG_ERROR("RPC failed: Not connected to server");
+        if (tx) tx->mark_transport_error();
         return {};
     }
 
@@ -537,6 +560,7 @@ std::vector<KeyValue> LineairDBProxy::tx_get_matching_keys_and_values_from_prefi
                                    MessageType::TX_GET_MATCHING_KEYS_AND_VALUES_FROM_PREFIX,
                                    "prefix=" + prefix)) {
         LOG_ERROR("RPC failed: Failed to send message to server");
+        if (tx) tx->mark_transport_error();
         return {};
     }
 
@@ -559,6 +583,7 @@ int LineairDBProxy::tx_scan_into_buffers(LineairDBTransaction* tx,
     int64_t tx_id = tx->get_tx_id();
     if (!connected_) {
         LOG_ERROR("RPC failed: Not connected to server");
+        if (tx) tx->mark_transport_error();
         return -1;
     }
 
@@ -578,6 +603,7 @@ int LineairDBProxy::tx_scan_into_buffers(LineairDBTransaction* tx,
                                    MessageType::TX_GET_MATCHING_KEYS_AND_VALUES_FROM_PREFIX,
                                    "prefix=" + prefix)) {
         LOG_ERROR("RPC failed: Failed to send message to server");
+        if (tx) tx->mark_transport_error();
         return -1;
     }
 
@@ -646,6 +672,7 @@ std::optional<std::string> LineairDBProxy::tx_fetch_last_key_in_range(LineairDBT
     LOG_DEBUG("CLIENT: tx_fetch_last_key_in_range called with tx_id=%ld", tx_id);
     if (!connected_) {
         LOG_ERROR("RPC failed: Not connected to server");
+        if (tx) tx->mark_transport_error();
         return std::nullopt;
     }
 
@@ -660,6 +687,7 @@ std::optional<std::string> LineairDBProxy::tx_fetch_last_key_in_range(LineairDBT
     if (!send_protobuf_message(request, response, MessageType::TX_FETCH_LAST_KEY_IN_RANGE,
                                "start=" + start_key + ",end=" + end_key)) {
         LOG_ERROR("RPC failed: Failed to send message to server");
+        if (tx) tx->mark_transport_error();
         return std::nullopt;
     }
 
@@ -678,6 +706,7 @@ std::optional<std::string> LineairDBProxy::tx_fetch_first_key_with_prefix(Lineai
     LOG_DEBUG("CLIENT: tx_fetch_first_key_with_prefix called with tx_id=%ld, prefix=%s", tx_id, prefix.c_str());
     if (!connected_) {
         LOG_ERROR("RPC failed: Not connected to server");
+        if (tx) tx->mark_transport_error();
         return std::nullopt;
     }
 
@@ -692,6 +721,7 @@ std::optional<std::string> LineairDBProxy::tx_fetch_first_key_with_prefix(Lineai
     if (!send_protobuf_message(request, response, MessageType::TX_FETCH_FIRST_KEY_WITH_PREFIX,
                                "prefix=" + prefix + ",prefix_end=" + prefix_end)) {
         LOG_ERROR("RPC failed: Failed to send message to server");
+        if (tx) tx->mark_transport_error();
         return std::nullopt;
     }
 
@@ -710,6 +740,7 @@ std::optional<std::string> LineairDBProxy::tx_fetch_next_key_with_prefix(Lineair
     LOG_DEBUG("CLIENT: tx_fetch_next_key_with_prefix called with tx_id=%ld, last_key=%s", tx_id, last_key.c_str());
     if (!connected_) {
         LOG_ERROR("RPC failed: Not connected to server");
+        if (tx) tx->mark_transport_error();
         return std::nullopt;
     }
 
@@ -724,6 +755,7 @@ std::optional<std::string> LineairDBProxy::tx_fetch_next_key_with_prefix(Lineair
     if (!send_protobuf_message(request, response, MessageType::TX_FETCH_NEXT_KEY_WITH_PREFIX,
                                "last=" + last_key + ",prefix_end=" + prefix_end)) {
         LOG_ERROR("RPC failed: Failed to send message to server");
+        if (tx) tx->mark_transport_error();
         return std::nullopt;
     }
 
@@ -745,6 +777,7 @@ std::vector<std::string> LineairDBProxy::tx_get_matching_primary_keys_in_range(L
     LOG_DEBUG("CLIENT: tx_get_matching_primary_keys_in_range called with tx_id=%ld, index=%s", tx_id, index_name.c_str());
     if (!connected_) {
         LOG_ERROR("RPC failed: Not connected to server");
+        if (tx) tx->mark_transport_error();
         return {};
     }
 
@@ -761,6 +794,7 @@ std::vector<std::string> LineairDBProxy::tx_get_matching_primary_keys_in_range(L
                                MessageType::TX_GET_MATCHING_PRIMARY_KEYS_IN_RANGE,
                                "index=" + index_name + ",start=" + start_key + ",end=" + end_key)) {
         LOG_ERROR("RPC failed: Failed to send message to server");
+        if (tx) tx->mark_transport_error();
         return {};
     }
 
@@ -782,6 +816,7 @@ std::vector<KeyValue> LineairDBProxy::tx_get_matching_keys_and_values_in_index_r
     int64_t tx_id = tx->get_tx_id();
     if (!connected_) {
         LOG_ERROR("RPC failed: Not connected to server");
+        if (tx) tx->mark_transport_error();
         return {};
     }
 
@@ -798,6 +833,7 @@ std::vector<KeyValue> LineairDBProxy::tx_get_matching_keys_and_values_in_index_r
                                MessageType::TX_GET_MATCHING_KEYS_AND_VALUES_IN_INDEX_RANGE,
                                "index=" + index_name + ",start=" + start_key + ",end=" + end_key)) {
         LOG_ERROR("RPC failed: Failed to send message to server");
+        if (tx) tx->mark_transport_error();
         return {};
     }
 
@@ -819,6 +855,7 @@ std::vector<std::string> LineairDBProxy::tx_get_matching_primary_keys_from_prefi
               tx_id, index_name.c_str(), prefix.c_str());
     if (!connected_) {
         LOG_ERROR("RPC failed: Not connected to server");
+        if (tx) tx->mark_transport_error();
         return {};
     }
 
@@ -834,6 +871,7 @@ std::vector<std::string> LineairDBProxy::tx_get_matching_primary_keys_from_prefi
                                MessageType::TX_GET_MATCHING_PRIMARY_KEYS_FROM_PREFIX,
                                "index=" + index_name + ",prefix=" + prefix)) {
         LOG_ERROR("RPC failed: Failed to send message to server");
+        if (tx) tx->mark_transport_error();
         return {};
     }
 
@@ -856,6 +894,7 @@ std::optional<std::string> LineairDBProxy::tx_fetch_last_primary_key_in_secondar
     LOG_DEBUG("CLIENT: tx_fetch_last_primary_key_in_secondary_range called with tx_id=%ld, index=%s", tx_id, index_name.c_str());
     if (!connected_) {
         LOG_ERROR("RPC failed: Not connected to server");
+        if (tx) tx->mark_transport_error();
         return std::nullopt;
     }
 
@@ -872,6 +911,7 @@ std::optional<std::string> LineairDBProxy::tx_fetch_last_primary_key_in_secondar
                                MessageType::TX_FETCH_LAST_PRIMARY_KEY_IN_SECONDARY_RANGE,
                                "index=" + index_name + ",start=" + start_key + ",end=" + end_key)) {
         LOG_ERROR("RPC failed: Failed to send message to server");
+        if (tx) tx->mark_transport_error();
         return std::nullopt;
     }
 
@@ -891,6 +931,7 @@ std::optional<SecondaryIndexEntry> LineairDBProxy::tx_fetch_last_secondary_entry
     LOG_DEBUG("CLIENT: tx_fetch_last_secondary_entry_in_range called with tx_id=%ld, index=%s", tx_id, index_name.c_str());
     if (!connected_) {
         LOG_ERROR("RPC failed: Not connected to server");
+        if (tx) tx->mark_transport_error();
         return std::nullopt;
     }
 
@@ -907,6 +948,7 @@ std::optional<SecondaryIndexEntry> LineairDBProxy::tx_fetch_last_secondary_entry
                                MessageType::TX_FETCH_LAST_SECONDARY_ENTRY_IN_RANGE,
                                "index=" + index_name + ",start=" + start_key + ",end=" + end_key)) {
         LOG_ERROR("RPC failed: Failed to send message to server");
+        if (tx) tx->mark_transport_error();
         return std::nullopt;
     }
 
@@ -999,8 +1041,10 @@ bool LineairDBProxy::db_end_transaction(int64_t tx_id, bool isFence,
                                         const std::vector<std::pair<std::string, int64_t>>& row_deltas) {
     LOG_DEBUG("CLIENT: db_end_transaction (with row_deltas) called with tx_id=%ld, fence=%s, deltas=%zu",
               tx_id, isFence ? "true" : "false", row_deltas.size());
+    last_end_transport_error_ = false;
     if (!connected_) {
         LOG_ERROR("RPC failed: Not connected to server");
+        last_end_transport_error_ = true;
         return false;
     }
 
@@ -1017,6 +1061,7 @@ bool LineairDBProxy::db_end_transaction(int64_t tx_id, bool isFence,
 
     if (!send_protobuf_message(request, response, MessageType::DB_END_TRANSACTION, "")) {
         LOG_ERROR("RPC failed: Failed to send message to server");
+        last_end_transport_error_ = true;
         return false;
     }
 

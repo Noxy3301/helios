@@ -207,6 +207,12 @@ public:
                             const std::vector<std::pair<std::string, int64_t>>& row_deltas = {});
     void db_fence();
 
+    // True iff the most recent db_end_transaction failed for transport
+    // reasons (no connection, send/receive failure) rather than a server-side
+    // OCC abort. Lets the handler distinguish retryable OCC aborts from
+    // ambiguous network failures when mapping to MySQL error codes.
+    bool last_end_was_transport_error() const { return last_end_transport_error_; }
+
     // statistics: cached table row counts, refreshed on BEGIN/END
     const std::unordered_map<std::string, int64_t>& cached_table_stats() const {
         return table_stats_cache_;
@@ -240,6 +246,11 @@ private:
     // Pointer into the currently-active transaction's trace state. nullptr
     // outside any tx (initial connection state, between txns).
     TxRpcTrace* current_trace_ = nullptr;
+
+    // Captures whether db_end_transaction's last failure was due to
+    // transport (not connected, send/receive error) vs a clean OCC abort
+    // from the server. Cleared at the top of every db_end_transaction call.
+    bool last_end_transport_error_ = false;
 };
 
 #endif // LINEAIRDB_PROXY_H
