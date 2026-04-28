@@ -1482,6 +1482,16 @@ int ha_lineairdb::external_lock(THD *thd, int lock_type) {
 
   const bool tx_is_ready_to_commit = lock_type == F_UNLCK;
   if (tx_is_ready_to_commit) {
+    // Drop the predicate pushed by cond_push() so the next statement
+    // starts clean. Clear both the handler-local copy and the per-tx
+    // copy: explicit transactions reuse the same LineairDBTransaction
+    // across statements, and scan RPCs read the tx field directly.
+    pushed_filter_serialized_.clear();
+    auto *ctx = *reinterpret_cast<LineairDBThdCtx **>(
+        thd_ha_data(thd, lineairdb_hton));
+    if (ctx != nullptr && ctx->tx != nullptr) {
+      ctx->tx->clear_pushed_filter();
+    }
     return 0;
   }
 
