@@ -146,6 +146,33 @@ constexpr unsigned char kKeyTypeOther = 0xF0;
 
 } // namespace
 
+// Build a keypart_map with all user-defined keypart bits set
+static key_part_map full_user_keypart_map(const KEY *key) {
+  // No key metadata to inspect
+  if (key == nullptr) return 0;
+
+  // Avoid shifting by type width
+  const uint parts = key->user_defined_key_parts;
+  if (parts >= sizeof(key_part_map) * 8) {
+    return ~static_cast<key_part_map>(0);
+  }
+
+  // Lower N bits set
+  return (static_cast<key_part_map>(1) << parts) - 1;
+}
+
+// True only for a non-NULL equality point that binds every keypart
+static bool range_is_full_eq_range(const KEY_MULTI_RANGE &range, const KEY *key) {
+  if (key == nullptr) return false;                 // Need key metadata
+  if (!(range.range_flag & EQ_RANGE)) return false; // Must be point equality
+  if (range.range_flag & NULL_RANGE) return false;  // NULL can fallback scan
+
+  const key_part_map full_map = full_user_keypart_map(key);
+  if ((range.start_key.keypart_map & full_map) != full_map) return false; // All keyparts bound
+  if (range.start_key.length < key->key_length) return false;             // Full encoded key
+  return true;
+}
+
 // LineairDB server connection target (GLOBAL sysvars backing storage)
 static char *srv_server_host = nullptr;
 static ulong srv_server_port = 9999;
@@ -1947,6 +1974,31 @@ ha_rows ha_lineairdb::records_in_range(uint inx, key_range *min_key,
   if (estimate < 1)
     estimate = 1;
 
+  // Penalize only the PK shape that MySQL under-prices with LIMIT:
+  // an equality prefix that leaves the PK suffix unbound
+  const bool is_primary =
+      (table != nullptr && table->s != nullptr && inx == table->s->primary_key);
+  // eq_parts is the leading equality depth; key_parts_used also includes ranges
+  const bool uses_only_equality_prefix =
+      (eq_parts > 0 && eq_parts == key_parts_used);
+  // Bounded trailing-key ranges are already handled by the range heuristic above
+  const bool leaves_pk_suffix_unbound =
+      (eq_parts < key->user_defined_key_parts);
+
+  const bool should_penalize_partial_pk =
+      (is_primary && uses_only_equality_prefix && leaves_pk_suffix_unbound);
+
+  if (should_penalize_partial_pk) {
+    constexpr ha_rows kPartialPkPenalty = 10;
+
+    // Clamp before multiplying so overflow never turns into HA_POS_ERROR
+    if (estimate > (HA_POS_ERROR - 1) / kPartialPkPenalty) {
+      estimate = HA_POS_ERROR - 1;
+    } else {
+      estimate *= kPartialPkPenalty;
+    }
+  }
+
   return estimate;
 }
 
@@ -2077,15 +2129,30 @@ bool ha_lineairdb::inplace_alter_table(TABLE *altered_table [[maybe_unused]],
 ha_rows ha_lineairdb::multi_range_read_info_const(
     uint keyno, RANGE_SEQ_IF *seq, void *seq_init_param, uint n_ranges,
     uint *bufsz, uint *flags, bool *force_default_mrr, Cost_estimate *cost) {
+  const uint seq_flags = (flags != nullptr) ? *flags : 0;
   ha_rows rows = handler::multi_range_read_info_const(
       keyno, seq, seq_init_param, n_ranges, bufsz, flags, force_default_mrr,
       cost);
   if (rows == HA_POS_ERROR) return rows;
 
-  // Use custom batch MRR for PK point lookups (BKA JOINs).
-  // Range scans on secondary indexes must use the default path.
-  // Set cost=1 since batch_read sends all keys in a single RPC.
-  if (keyno == table->s->primary_key) {
+  bool full_pk_eq_ranges =
+      (table != nullptr && table->s != nullptr &&
+       keyno == table->s->primary_key);
+  if (full_pk_eq_ranges) {
+    const KEY *key = table->key_info + keyno;
+    range_seq_t seq_ctx = seq->init(seq_init_param, n_ranges, seq_flags);
+    KEY_MULTI_RANGE range;
+    while (seq->next(seq_ctx, &range) == 0) {
+      if (!range_is_full_eq_range(range, key)) {
+        full_pk_eq_ranges = false;
+        break;
+      }
+    }
+  }
+
+  // Use custom batch MRR only for full-PK point lookups. Partial PK ranges
+  // still need the default range iterator and should keep the default cost.
+  if (full_pk_eq_ranges) {
     *flags &= ~HA_MRR_USE_DEFAULT_IMPL;
     *bufsz = 0;
     if (cost) {
@@ -2102,8 +2169,11 @@ ha_rows ha_lineairdb::multi_range_read_info(uint keyno, uint n_ranges,
                                             Cost_estimate *cost) {
   ha_rows rows = handler::multi_range_read_info(keyno, n_ranges, keys, bufsz,
                                                 flags, cost);
-  // Use custom batch MRR for PK point lookups (BKA JOINs).
-  if (keyno == table->s->primary_key) {
+  // This non-const hook is documented as being called for n-keypart
+  // singlepoint ranges. Keep the batch path for those dynamic PK point
+  // lookups; const range planning above performs the stricter shape check.
+  if (table != nullptr && table->s != nullptr &&
+      keyno == table->s->primary_key) {
     *flags &= ~HA_MRR_USE_DEFAULT_IMPL;
     *bufsz = 0;
     if (cost) {
@@ -2140,19 +2210,11 @@ int ha_lineairdb::multi_range_read_init(RANGE_SEQ_IF *seq, void *seq_init_param,
   std::vector<std::string> batch_keys;
   std::vector<char *> range_infos;
 
-  // Determine the full-key keypart_map for the active index
-  const uint pk_parts = table->key_info[active_index].user_defined_key_parts;
-  const key_part_map full_key_map =
-      (pk_parts < sizeof(key_part_map) * 8)
-          ? ((static_cast<key_part_map>(1) << pk_parts) - 1)
-          : ~static_cast<key_part_map>(0);
-
   while (seq->next(seq_ctx, &range) == 0) {
     // Only batch full-key point lookups (EQ_RANGE with all PK parts).
     // Partial-key ranges (e.g. 3 of 4 PK cols) or range scans (e.g. id > 15)
     // cannot be converted to individual key lookups — fall back to default.
-    if (!(range.range_flag & EQ_RANGE) ||
-        (range.start_key.keypart_map & full_key_map) != full_key_map) {
+    if (!range_is_full_eq_range(range, &table->key_info[active_index])) {
       mrr_use_batch_ = false;
       m_ds_mrr.init(table);
       return m_ds_mrr.dsmrr_init(seq, seq_init_param, n_ranges,
