@@ -440,6 +440,18 @@ int ha_lineairdb::index_init(uint idx, bool sorted [[maybe_unused]]) {
   reset_index_search_buffers();
   last_fetched_primary_key_.clear();
 
+  // Mirror rnd_init's pushdown for the index path. choose_table must run
+  // before set_pushed_filter so its per-table drop doesn't wipe the new
+  // filter, and the empty branch must not clear because sibling handlers
+  // in the same tx share this state.
+  auto *tx = get_transaction(ha_thd());
+  if (tx != nullptr) {
+    tx->choose_table(db_table_name);
+    if (!pushed_filter_serialized_.empty()) {
+      tx->set_pushed_filter(pushed_filter_serialized_);
+    }
+  }
+
   return change_active_index(idx);
 }
 
@@ -1073,11 +1085,11 @@ int ha_lineairdb::rnd_init(bool) {
 
   tx->choose_table(db_table_name);
 
-  // Predicate pushdown: propagate filter serialized by cond_push() to transaction
+  // Predicate pushdown: propagate filter from this handler if available.
+  // Don't clear when empty — see index_init for rationale (other handlers
+  // in the same THD share the tx, F_UNLCK is the only correct clear point).
   if (!pushed_filter_serialized_.empty()) {
     tx->set_pushed_filter(pushed_filter_serialized_);
-  } else {
-    tx->clear_pushed_filter();
   }
 
   DBUG_RETURN(0);
