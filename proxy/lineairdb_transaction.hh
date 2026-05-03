@@ -86,8 +86,8 @@ public:
                                      const std::string& index_name,
                                      const std::string& secondary_key,
                                      const std::string& primary_key);
-  // Flush buffered writes to LineairDB so that subsequent reads can see them.
-  // Must be called before any read/scan RPC to ensure read-your-own-writes.
+  // Flush all buffered writes to LineairDB. Used at commit or before operations
+  // that require a globally materialized transaction state.
   bool flush_write_buffer();
 
   void begin_transaction();
@@ -185,11 +185,15 @@ private:
   // Predicate pushdown: serialized PushedPredicate for scan filtering
   std::string pushed_filter_;
 
-  // Write buffer for batch write operations
+  // Write buffers for batch write operations. Buffers are table-scoped so a
+  // read/scan on one table does not force unrelated writes on another table
+  // to be sent early.
   static constexpr size_t WRITE_BATCH_SIZE = 100;
-  std::string write_buffer_table_;
-  std::vector<LineairDBProxy::BatchWriteOp> write_buffer_ops_;
-  std::vector<LineairDBProxy::BatchSecondaryIndexOp> write_buffer_si_ops_;
+  struct PendingWriteBuffer {
+    std::vector<LineairDBProxy::BatchWriteOp> writes;
+    std::vector<LineairDBProxy::BatchSecondaryIndexOp> secondary_index_writes;
+  };
+  std::unordered_map<std::string, PendingWriteBuffer> write_buffers_;
 
   // Per-tx RPC trace. Inert when ENABLE_RPC_TRACE is unset (record() bails
   // early on !active()). Activated in begin_transaction; finalized in
@@ -208,6 +212,22 @@ private:
   // Drops one (table, key) entry from both positive and negative caches.
   // Called by every write / delete path before the RPC.
   void invalidate_pk_cache_entry(const std::string& table, const std::string& key);
+
+  // Flush only table_name so unrelated table buffers can stay lazy
+  bool flush_write_buffer_for_table(const std::string& table_name);
+  // True when table_name has any pending base-row or secondary-index write
+  bool table_has_pending_writes(const std::string& table_name) const;
+  // True when a pending base-row write targets exactly this primary key
+  bool table_has_pending_write_for_key(const std::string& table_name,
+                                       const std::string& key) const;
+  // True when a pending base-row write overlaps this primary-key scan range
+  bool table_has_pending_write_in_range(const std::string& table_name,
+                                        const std::string& start_key,
+                                        const std::string& end_key) const;
+  // True when a pending base-row write overlaps this primary-key prefix scan
+  bool table_has_pending_write_with_prefix(const std::string& table_name,
+                                           const std::string& prefix) const;
+
   // Empties both caches. Called on abort, since aborted writes are rolled back
   // server-side and any cached reads from this tx may now be stale.
   void clear_read_cache();
