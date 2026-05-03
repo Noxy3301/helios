@@ -2477,16 +2477,71 @@ void ha_lineairdb::build_search_plan(const uchar *key, key_part_map keypart_map,
   }
 }
 
-// Returns the SQL LIMIT N to forward to the server-side scan, or 0 to
-// disable pushdown.
-static uint32_t pushed_scan_limit(THD *thd) {
+// True when one ORDER BY item is exactly the requested PK keypart in ASC order
+static bool order_item_matches_key_part(ORDER *order, const KEY *key,
+                                        uint key_part_idx) {
+  // Validate the ORDER BY node shape before comparing fields
+  if (order == nullptr) return false;               // Missing ORDER node
+  if (key == nullptr) return false;                 // Missing key metadata
+  if (order->direction != ORDER_ASC) return false;  // DESC needs filesort
+
+  const bool key_part_exists = (key_part_idx < key->user_defined_key_parts);
+  if (!key_part_exists) return false;               // ORDER exceeds key
+
+  const bool has_order_item =
+      (order->item != nullptr && *(order->item) != nullptr);
+  if (!has_order_item) return false;                // Missing ORDER item
+
+  // Resolve ORDER BY expression to a table field
+  Item *item = (*order->item)->real_item();
+  const bool is_field_item = (item->type() == Item::FIELD_ITEM);
+  if (!is_field_item) return false;                 // Not a bare field
+
+  // Compare the ORDER BY field with the expected PK keypart
+  Item_field *field_item = down_cast<Item_field *>(item);
+  const Field *order_field = field_item->field;
+  const Field *key_field = key->key_part[key_part_idx].field;
+  if (order_field == nullptr) return false;         // Missing ORDER field
+  if (key_field == nullptr) return false;           // Missing key field
+
+  return order_field->field_index() == key_field->field_index();
+}
+
+// True when ORDER BY is empty or matches the remaining PK suffix in ASC order
+static bool order_by_matches_pk_asc(Query_block *qb, const KEY *active_key,
+                                    uint matched_prefix) {
+  // Empty ORDER BY is compatible with PK-ASC scan order
+  if (qb == nullptr) return false;                  // Missing query block
+  if (qb->order_list.elements == 0) return true;    // No ORDER BY
+  if (active_key == nullptr) return false;          // Missing key metadata
+
+  // If all PK parts are fixed, the scan can return at most one key
+  const uint pk_parts = active_key->user_defined_key_parts;
+  if (matched_prefix >= pk_parts) return true;      // Full PK fixed
+
+  // ORDER BY must match the unfixed PK suffix in ASC order
+  uint order_pos = 0;
+  for (ORDER *order = qb->order_list.first; order != nullptr;
+       order = order->next, ++order_pos) {
+    const uint pk_part_idx = matched_prefix + order_pos;
+    if (!order_item_matches_key_part(order, active_key, pk_part_idx)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+// Returns SQL LIMIT N to push to PK-ASC scans, or 0 when LIMIT must stay in
+// MySQL. ORDER BY is safe only when it is empty or follows the remaining PK.
+static uint32_t pushed_scan_limit(THD *thd,
+                                  const KEY *active_key,
+                                  uint matched_prefix) {
   if (thd == nullptr || thd->lex == nullptr) return 0;
 
-  // Resolve the query block driving this scan, and bail if it has ORDER BY
-  // (MySQL may filesort post-emit; a pushed LIMIT would chop sort input).
   Query_block *qb = thd->lex->current_query_block();
   if (qb == nullptr) return 0;
-  if (qb->order_list.elements > 0) return 0;
+
+  if (!order_by_matches_pk_asc(qb, active_key, matched_prefix)) return 0;
 
   // Extract LIMIT N from this block's expression and validate.
   Query_expression *unit = qb->master_query_expression();
@@ -2536,7 +2591,9 @@ int ha_lineairdb::execute_index_first(uchar *buf, LineairDBTransaction *tx) {
   if (current_plan_.is_primary) {
     // Forward the SQL LIMIT N — rows arrive PK-ASC so server-side
     // short-circuit at N matches preserves ORDER BY semantics.
-    const uint32_t limit = pushed_scan_limit(ha_thd());
+    const uint32_t limit =
+        pushed_scan_limit(ha_thd(), &table->key_info[active_index],
+                          current_plan_.used_key_parts);
     auto key_values = tx->get_matching_keys_and_values_in_range(
         start_key, end_key, limit);
     for (auto &kv : key_values) {
@@ -2622,7 +2679,9 @@ int ha_lineairdb::execute_same_key_materialize(uchar *buf,
 
   if (current_plan_.is_primary) {
     // Forward LIMIT N — PK exact-prefix scan emits PK-ASC rows.
-    const uint32_t limit = pushed_scan_limit(ha_thd());
+    const uint32_t limit =
+        pushed_scan_limit(ha_thd(), &table->key_info[active_index],
+                          current_plan_.used_key_parts);
     auto key_values = tx->get_matching_keys_and_values_in_range(
         prefix, prefix_end, limit);
     for (auto &kv : key_values) {
@@ -2667,7 +2726,9 @@ int ha_lineairdb::execute_prefix_first(uchar *buf, LineairDBTransaction *tx) {
   if (current_plan_.is_primary) {
     // Restrict to [prefix, prefix_end) so index_next never leaks non-prefix
     // rows. Forward the SQL LIMIT N — Delivery hot path uses this.
-    const uint32_t limit = pushed_scan_limit(ha_thd());
+    const uint32_t limit =
+        pushed_scan_limit(ha_thd(), &table->key_info[active_index],
+                          current_plan_.used_key_parts);
     auto key_values = tx->get_matching_keys_and_values_in_range(
         prefix, prefix_end, limit);
     for (auto &kv : key_values) {
@@ -2719,7 +2780,9 @@ int ha_lineairdb::execute_range_materialize(uchar *buf,
   // execute scan
   if (current_plan_.is_primary) {
     // Forward LIMIT N — PK range emits PK-ASC.
-    const uint32_t limit = pushed_scan_limit(ha_thd());
+    const uint32_t limit =
+        pushed_scan_limit(ha_thd(), &table->key_info[active_index],
+                          current_plan_.used_key_parts);
     auto key_values = tx->get_matching_keys_and_values_in_range(
         effective_start, effective_end, limit);
     for (auto &kv : key_values) {
