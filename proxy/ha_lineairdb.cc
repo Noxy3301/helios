@@ -915,8 +915,30 @@ static bool serialize_item(const Item *item,
       }
       return true;
     }
-    case Item::FUNC_ITEM:
     case Item::COND_ITEM: {
+      // Item_cond (AND / OR) holds children in a List<Item>, NOT in args[].
+      // argument_count() returns 0 for these, so we must iterate the list
+      // directly — otherwise the predicate serializes to a bare op with no
+      // children, defeating the entire pushdown.
+      auto *cond_item = const_cast<Item_cond *>(down_cast<const Item_cond *>(item));
+      switch (cond_item->functype()) {
+        case Item_func::COND_AND_FUNC:
+          expr->set_op(LineairDB::Protocol::FilterExpr::OP_AND);
+          break;
+        case Item_func::COND_OR_FUNC:
+          expr->set_op(LineairDB::Protocol::FilterExpr::OP_OR);
+          break;
+        default:
+          return false;
+      }
+      for (Item &child : *cond_item->argument_list()) {
+        if (!serialize_item(&child, expr->add_children())) {
+          return false;
+        }
+      }
+      return true;
+    }
+    case Item::FUNC_ITEM: {
       const Item_func *func = down_cast<const Item_func *>(item);
       Item **args = func->arguments();
       uint arg_count = func->argument_count();
@@ -960,12 +982,6 @@ static bool serialize_item(const Item *item,
           break;
         case Item_func::ISNOTNULL_FUNC:
           expr->set_op(LineairDB::Protocol::FilterExpr::OP_IS_NOT_NULL);
-          break;
-        case Item_func::COND_AND_FUNC:
-          expr->set_op(LineairDB::Protocol::FilterExpr::OP_AND);
-          break;
-        case Item_func::COND_OR_FUNC:
-          expr->set_op(LineairDB::Protocol::FilterExpr::OP_OR);
           break;
         case Item_func::NOT_FUNC:
           expr->set_op(LineairDB::Protocol::FilterExpr::OP_NOT);
