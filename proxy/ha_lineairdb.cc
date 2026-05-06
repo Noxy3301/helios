@@ -555,10 +555,8 @@ int ha_lineairdb::update_row(const uchar *old_data, uchar *new_data) {
     return HA_ERR_LOCK_DEADLOCK;
   }
 
-  tx->choose_table(db_table_name);
-  bool is_successful = tx->write(key, write_buffer_);
-  if (!is_successful)
-    return HA_ERR_LOCK_DEADLOCK;
+  // Buffer the base-row update; read/scan paths and commit flush it later.
+  tx->buffer_write(db_table_name, key, write_buffer_);
 
   if (tx->is_aborted()) {
     thd_mark_transaction_to_rollback(ha_thd(), 1);
