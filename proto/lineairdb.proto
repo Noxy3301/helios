@@ -324,6 +324,7 @@ message TxGetMatchingKeysAndValuesInRange {
         bytes end_key = 3;
         PushedPredicate filter = 5;
         string table_name = 6;
+        uint64 row_limit = 7; // 0 means no limit.
     }
     message Response {
         repeated KeyValue results = 1;

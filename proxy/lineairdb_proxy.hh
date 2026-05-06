@@ -148,7 +148,8 @@ public:
                                                            const std::string& end_key);
     std::vector<KeyValue> tx_get_matching_keys_and_values_in_range(LineairDBTransaction* tx,
                                                                     const std::string& start_key,
-                                                                    const std::string& end_key);
+                                                                    const std::string& end_key,
+                                                                    uint64_t row_limit = 0);
     std::vector<KeyValue> tx_get_matching_keys_and_values_from_prefix(LineairDBTransaction* tx,
                                                                        const std::string& prefix);
     // Zero-copy variant: parse binary response directly into caller-provided buffers.

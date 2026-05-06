@@ -117,6 +117,7 @@
 #include "sql/item_cmpfunc.h"
 #include "sql/item_func.h"
 #include "sql/sql_class.h"
+#include "sql/sql_lex.h"
 #include "sql/sql_plugin.h"
 #include "sql/table.h"
 #include "typelib.h"
@@ -137,6 +138,93 @@ constexpr unsigned char kKeyTypeDatetime = 0x30;
 constexpr unsigned char kKeyTypeOther = 0xF0;
 
 } // namespace
+
+// True when one ORDER BY item is exactly the requested keypart in ASC order
+static bool order_item_matches_key_part(ORDER *order, const KEY *key,
+                                        uint key_part_idx) {
+  // Validate the ORDER BY node shape before comparing fields
+  if (order == nullptr) return false;                // Missing ORDER node
+  if (key == nullptr) return false;                  // Missing key metadata
+  if (order->direction != ORDER_ASC) return false;   // DESC needs filesort
+
+  const bool key_part_exists = (key_part_idx < key->user_defined_key_parts);
+  if (!key_part_exists) return false;                // ORDER exceeds key
+
+  const bool has_order_item =
+      (order->item != nullptr && *(order->item) != nullptr);
+  if (!has_order_item) return false;                 // Missing ORDER item
+
+  // Resolve ORDER BY expression to a table field
+  Item *item = (*order->item)->real_item();
+  const bool is_field_item = (item->type() == Item::FIELD_ITEM);
+  if (!is_field_item) return false;                  // Not a bare field
+
+  // Compare the ORDER BY field with the expected keypart
+  Item_field *field_item = down_cast<Item_field *>(item);
+  const Field *order_field = field_item->field;
+  const Field *key_field = key->key_part[key_part_idx].field;
+  if (order_field == nullptr) return false;          // Missing ORDER field
+  if (key_field == nullptr) return false;            // Missing key field
+
+  return order_field->field_index() == key_field->field_index();
+}
+
+// True when ORDER BY is a prefix of the remaining key suffix in ASC order
+static bool order_by_matches_key_suffix_asc(Query_block *qb, const KEY *key,
+                                            uint matched_prefix) {
+  // LIMIT pushdown needs an explicit ORDER BY that matches scan order
+  if (qb == nullptr) return false;                   // Missing query block
+  if (key == nullptr) return false;                  // Missing key metadata
+  if (qb->order_list.elements == 0) return false;    // Unordered LIMIT
+
+  // If all keyparts are fixed, the scan can return at most one key
+  const uint key_parts = key->user_defined_key_parts;
+  if (matched_prefix >= key_parts) return true;      // Full key fixed
+
+  // ORDER BY must follow the unfixed key suffix in ASC order
+  uint order_pos = 0;
+  for (ORDER *order = qb->order_list.first; order != nullptr;
+       order = order->next, ++order_pos) {
+    const uint key_part_idx = matched_prefix + order_pos;
+    if (!order_item_matches_key_part(order, key, key_part_idx)) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+// Returns SQL LIMIT N to push into an ordered range scan, or 0 to keep it local
+static ha_rows ordered_range_scan_limit(THD *thd, const KEY *key,
+                                        uint matched_prefix,
+                                        bool has_extra_filter) {
+  // Keep filtered scans unlimited until filter and limit fallback are unified
+  if (has_extra_filter) return 0;                    // WHERE may drop rows
+
+  // Validate this is a simple SELECT with a query expression to inspect
+  if (thd == nullptr) return 0;                      // Missing session
+  if (thd->lex == nullptr) return 0;                 // Missing SQL state
+  if (thd->lex->unit == nullptr) return 0;           // Missing query unit
+  const bool is_select = (thd->lex->sql_command == SQLCOM_SELECT);
+  if (!is_select) return 0;                          // Not SELECT
+
+  // LIMIT pushdown is only safe for one-table, non-aggregate reads
+  Query_expression *unit = thd->lex->unit;
+  Query_block *qb = unit->global_parameters();
+  if (qb == nullptr) return 0;                       // Missing query block
+  if (qb->leaf_table_count != 1) return 0;           // Join needs root LIMIT
+  if (qb->is_explicitly_grouped()) return 0;         // GROUP BY changes rows
+  if (qb->is_implicitly_grouped()) return 0;         // Aggregate changes rows
+
+  // Extract LIMIT N and reject shapes the storage scan cannot represent
+  if (unit->offset_limit_cnt != 0) return 0;         // OFFSET not supported
+  if (unit->select_limit_cnt == 0) return 0;         // Empty LIMIT
+  const bool has_limit = (unit->select_limit_cnt != HA_POS_ERROR);
+  if (!has_limit) return 0;                          // No LIMIT clause
+  if (!order_by_matches_key_suffix_asc(qb, key, matched_prefix)) return 0;
+
+  return unit->select_limit_cnt;
+}
 
 // LineairDB server connection target (GLOBAL sysvars backing storage)
 static char *srv_server_host = nullptr;
@@ -994,12 +1082,14 @@ static bool serialize_item(const Item *item,
 const Item *ha_lineairdb::cond_push(const Item *cond) {
   DBUG_TRACE;
   pushed_filter_serialized_.clear();
+  has_unpushed_filter_ = false;
   if (!cond || !table) return cond;
 
   LineairDB::Protocol::PushedPredicate predicate;
   predicate.set_num_columns(table->s->fields);
   if (!serialize_item(cond, predicate.mutable_expr())) {
     // Serialization failed → no PP, MySQL evaluates everything
+    has_unpushed_filter_ = true;
     return cond;
   }
   predicate.SerializeToString(&pushed_filter_serialized_);
@@ -1494,6 +1584,7 @@ int ha_lineairdb::external_lock(THD *thd, int lock_type) {
   if (tx_is_ready_to_commit) {
     // Drop the predicate pushed by cond_push() so the next statement starts clean.
     pushed_filter_serialized_.clear();
+    has_unpushed_filter_ = false;
     LineairDBThdCtx **ctx_slot = reinterpret_cast<LineairDBThdCtx **>(
         thd_ha_data(thd, lineairdb_hton));
     if (ctx_slot != nullptr && *ctx_slot != nullptr &&
@@ -2461,8 +2552,13 @@ int ha_lineairdb::execute_same_key_materialize(uchar *buf,
   const std::string &prefix_end = current_plan_.same_group_end_serialized;
 
   if (current_plan_.is_primary) {
+    const KEY *key = &table->key_info[active_index];
+    const bool has_extra_filter =
+        has_unpushed_filter_ || !pushed_filter_serialized_.empty();
+    const ha_rows row_limit = ordered_range_scan_limit(
+        ha_thd(), key, current_plan_.used_key_parts, has_extra_filter);
     auto key_values = tx->get_matching_keys_and_values_in_range(
-        prefix, prefix_end);
+        prefix, prefix_end, static_cast<uint64_t>(row_limit));
     for (auto &kv : key_values) {
       secondary_index_results_.push_back(kv.first);
       secondary_index_payloads_.push_back(std::move(kv.second));
