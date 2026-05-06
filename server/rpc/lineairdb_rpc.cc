@@ -245,19 +245,38 @@ void LineairDBRpc::handleTxBatchWrite(const std::string& message, std::string& r
             tx->SetTable(request.table_name());
         }
 
-        for (int i = 0; i < request.writes_size(); i++) {
-            const auto& op = request.writes(i);
-            const std::string& value_str = op.value();
-            tx->Write(op.key(), reinterpret_cast<const std::byte*>(value_str.c_str()), value_str.size());
-            if (tx->IsAborted()) break;
-        }
-
         if (!tx->IsAborted()) {
-            for (int i = 0; i < request.secondary_index_writes_size(); i++) {
-                const auto& si = request.secondary_index_writes(i);
-                const std::string& pk = si.primary_key();
-                tx->WriteSecondaryIndex(si.index_name(), si.secondary_key(),
-                                        reinterpret_cast<const std::byte*>(pk.c_str()), pk.size());
+            for (int i = 0; i < request.ops_size(); i++) {
+                const auto& op = request.ops(i);
+                switch (op.type()) {
+                    case LineairDB::Protocol::BATCH_OP_WRITE: {
+                        const std::string& value_str = op.value();
+                        tx->Write(op.key(),
+                                  reinterpret_cast<const std::byte*>(value_str.c_str()),
+                                  value_str.size());
+                        break;
+                    }
+                    case LineairDB::Protocol::BATCH_OP_DELETE:
+                        tx->Delete(op.key());
+                        break;
+                    case LineairDB::Protocol::BATCH_OP_SECONDARY_INDEX_WRITE: {
+                        const std::string& pk = op.primary_key();
+                        tx->WriteSecondaryIndex(
+                            op.index_name(), op.secondary_key(),
+                            reinterpret_cast<const std::byte*>(pk.c_str()), pk.size());
+                        break;
+                    }
+                    case LineairDB::Protocol::BATCH_OP_SECONDARY_INDEX_DELETE: {
+                        const std::string& pk = op.primary_key();
+                        tx->DeleteSecondaryIndex(
+                            op.index_name(), op.secondary_key(),
+                            reinterpret_cast<const std::byte*>(pk.c_str()), pk.size());
+                        break;
+                    }
+                    case LineairDB::Protocol::BATCH_OP_UNKNOWN:
+                    default:
+                        break;
+                }
                 if (tx->IsAborted()) break;
             }
         }

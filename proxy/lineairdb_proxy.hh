@@ -110,19 +110,23 @@ public:
     };
     std::vector<BatchReadResult> tx_batch_read(LineairDBTransaction* tx,
                                                 const std::vector<std::string>& keys);
-    struct BatchWriteOp {
+    struct BatchOp {
+        enum class Type {
+            Write,
+            Delete,
+            SecondaryIndexWrite,
+            SecondaryIndexDelete
+        };
+        Type type;
         std::string key;
         std::string value;
-    };
-    struct BatchSecondaryIndexOp {
         std::string index_name;
         std::string secondary_key;
         std::string primary_key;
     };
     bool tx_batch_write(LineairDBTransaction* tx,
                         const std::string& table_name,
-                        const std::vector<BatchWriteOp>& writes,
-                        const std::vector<BatchSecondaryIndexOp>& si_writes);
+                        const std::vector<BatchOp>& ops);
 
     // secondary index operations
     std::vector<std::string> tx_read_secondary_index(LineairDBTransaction* tx,

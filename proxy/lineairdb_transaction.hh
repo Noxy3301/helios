@@ -31,8 +31,7 @@ public:
   const std::pair<const std::byte *const, const size_t> read(std::string key);
   std::vector<std::pair<bool, std::string>> batch_read(const std::vector<std::string>& keys);
   bool batch_write(const std::string& table_name,
-                   const std::vector<LineairDBProxy::BatchWriteOp>& writes,
-                   const std::vector<LineairDBProxy::BatchSecondaryIndexOp>& si_writes);
+                   const std::vector<LineairDBProxy::BatchOp>& ops);
   std::vector<std::string> get_all_keys();
   std::vector<std::string> get_matching_keys(std::string key);
   std::vector<std::string> get_matching_keys_in_range(std::string start_key, std::string end_key);
@@ -74,8 +73,14 @@ public:
                                      const std::string& index_name,
                                      const std::string& secondary_key,
                                      const std::string& primary_key);
-  // Flush buffered writes to LineairDB so that subsequent reads can see them.
-  // Must be called before any read/scan RPC to ensure read-your-own-writes.
+  void buffer_delete(const std::string& table_name,
+                     const std::string& key);
+  void buffer_delete_secondary_index(const std::string& table_name,
+                                     const std::string& index_name,
+                                     const std::string& secondary_key,
+                                     const std::string& primary_key);
+  // Flush buffered row/index ops before reads can observe the same table.
+  // Must be called before read/scan RPCs to ensure read-your-own-writes.
   bool flush_write_buffer();
 
   void begin_transaction();
@@ -147,11 +152,11 @@ private:
   // Predicate pushdown: serialized PushedPredicate for scan filtering
   std::string pushed_filter_;
 
-  // Write buffer for batch write operations
+  // Max number of buffered write/delete ops before an automatic flush
   static constexpr size_t WRITE_BATCH_SIZE = 100;
   std::string write_buffer_table_;
-  std::vector<LineairDBProxy::BatchWriteOp> write_buffer_ops_;
-  std::vector<LineairDBProxy::BatchSecondaryIndexOp> write_buffer_si_ops_;
+  // Stores row and secondary-index write/delete ops in MySQL issue order
+  std::vector<LineairDBProxy::BatchOp> write_buffer_ops_;
 
   TxRpcTrace rpc_trace_;
 

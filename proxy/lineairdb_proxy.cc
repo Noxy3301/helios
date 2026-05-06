@@ -250,8 +250,7 @@ std::vector<LineairDBProxy::BatchReadResult> LineairDBProxy::tx_batch_read(
 
 bool LineairDBProxy::tx_batch_write(LineairDBTransaction* tx,
                                     const std::string& table_name,
-                                    const std::vector<BatchWriteOp>& writes,
-                                    const std::vector<BatchSecondaryIndexOp>& si_writes) {
+                                    const std::vector<BatchOp>& ops) {
     int64_t tx_id = tx->get_tx_id();
     if (!connected_) {
         LOG_ERROR("RPC failed: Not connected to server");
@@ -264,17 +263,31 @@ bool LineairDBProxy::tx_batch_write(LineairDBTransaction* tx,
     request.set_transaction_id(tx_id);
     request.set_table_name(table_name);
 
-    for (const auto& w : writes) {
-        auto* op = request.add_writes();
-        op->set_key(w.key);
-        op->set_value(w.value);
-    }
-
-    for (const auto& si : si_writes) {
-        auto* op = request.add_secondary_index_writes();
-        op->set_index_name(si.index_name);
-        op->set_secondary_key(si.secondary_key);
-        op->set_primary_key(si.primary_key);
+    for (const auto& batch_op : ops) {
+        auto* op = request.add_ops();
+        switch (batch_op.type) {
+            case BatchOp::Type::Write:
+                op->set_type(LineairDB::Protocol::BATCH_OP_WRITE);
+                op->set_key(batch_op.key);
+                op->set_value(batch_op.value);
+                break;
+            case BatchOp::Type::Delete:
+                op->set_type(LineairDB::Protocol::BATCH_OP_DELETE);
+                op->set_key(batch_op.key);
+                break;
+            case BatchOp::Type::SecondaryIndexWrite:
+                op->set_type(LineairDB::Protocol::BATCH_OP_SECONDARY_INDEX_WRITE);
+                op->set_index_name(batch_op.index_name);
+                op->set_secondary_key(batch_op.secondary_key);
+                op->set_primary_key(batch_op.primary_key);
+                break;
+            case BatchOp::Type::SecondaryIndexDelete:
+                op->set_type(LineairDB::Protocol::BATCH_OP_SECONDARY_INDEX_DELETE);
+                op->set_index_name(batch_op.index_name);
+                op->set_secondary_key(batch_op.secondary_key);
+                op->set_primary_key(batch_op.primary_key);
+                break;
+        }
     }
 
     if (!send_protobuf_message(request, response, MessageType::TX_BATCH_WRITE)) {

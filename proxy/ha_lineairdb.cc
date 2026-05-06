@@ -701,10 +701,8 @@ int ha_lineairdb::delete_row(const uchar *buf) {
     return HA_ERR_LOCK_DEADLOCK;
   }
 
-  tx->choose_table(db_table_name);
-  bool is_successful = tx->delete_value(key);
-  if (!is_successful)
-    return HA_ERR_LOCK_DEADLOCK;
+  // Buffer the base-row delete; read/scan paths and commit flush it later.
+  tx->buffer_delete(db_table_name, key);
 
   if (tx->is_aborted()) {
     thd_mark_transaction_to_rollback(ha_thd(), 1);
@@ -716,16 +714,14 @@ int ha_lineairdb::delete_row(const uchar *buf) {
     if (i != table->s->primary_key) {
       std::string secondary_key = build_secondary_key_from_row(buf, key_info);
 
-      bool is_successful =
-          tx->delete_secondary_index(key_info.name, secondary_key, key);
-      if (!is_successful)
-        return HA_ERR_LOCK_DEADLOCK;
-
-      if (tx->is_aborted()) {
-        thd_mark_transaction_to_rollback(ha_thd(), 1);
-        return HA_ERR_LOCK_DEADLOCK;
-      }
+      tx->buffer_delete_secondary_index(db_table_name, key_info.name,
+                                        secondary_key, key);
     }
+  }
+
+  if (tx->is_aborted()) {
+    thd_mark_transaction_to_rollback(ha_thd(), 1);
+    return HA_ERR_LOCK_DEADLOCK;
   }
 
   tx->add_rowcount_delta(share, db_table_name, -1);

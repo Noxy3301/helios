@@ -62,9 +62,8 @@ LineairDBTransaction::batch_read(const std::vector<std::string>& keys) {
 
 bool LineairDBTransaction::batch_write(
     const std::string& table_name,
-    const std::vector<LineairDBProxy::BatchWriteOp>& writes,
-    const std::vector<LineairDBProxy::BatchSecondaryIndexOp>& si_writes) {
-  return lineairdb_proxy->tx_batch_write(this, table_name, writes, si_writes);
+    const std::vector<LineairDBProxy::BatchOp>& ops) {
+  return lineairdb_proxy->tx_batch_write(this, table_name, ops);
 }
 
 std::vector<std::string>
@@ -292,7 +291,11 @@ void LineairDBTransaction::buffer_write(const std::string& table_name,
     flush_write_buffer();
   }
   write_buffer_table_ = table_name;
-  write_buffer_ops_.push_back({key, value});
+  LineairDBProxy::BatchOp op;
+  op.type = LineairDBProxy::BatchOp::Type::Write;
+  op.key = key;
+  op.value = value;
+  write_buffer_ops_.push_back(std::move(op));
 
   if (write_buffer_ops_.size() >= WRITE_BATCH_SIZE) {
     flush_write_buffer();
@@ -303,21 +306,72 @@ void LineairDBTransaction::buffer_write_secondary_index(const std::string& table
                                                         const std::string& index_name,
                                                         const std::string& secondary_key,
                                                         const std::string& primary_key) {
-  write_buffer_si_ops_.push_back({index_name, secondary_key, primary_key});
+  if (!write_buffer_ops_.empty() && write_buffer_table_ != table_name) {
+    flush_write_buffer();
+  }
+  write_buffer_table_ = table_name;
+
+  LineairDBProxy::BatchOp op;
+  op.type = LineairDBProxy::BatchOp::Type::SecondaryIndexWrite;
+  op.index_name = index_name;
+  op.secondary_key = secondary_key;
+  op.primary_key = primary_key;
+  write_buffer_ops_.push_back(std::move(op));
+
+  if (write_buffer_ops_.size() >= WRITE_BATCH_SIZE) {
+    flush_write_buffer();
+  }
+}
+
+void LineairDBTransaction::buffer_delete(const std::string& table_name,
+                                         const std::string& key) {
+  if (!write_buffer_ops_.empty() && write_buffer_table_ != table_name) {
+    flush_write_buffer();
+  }
+  write_buffer_table_ = table_name;
+
+  LineairDBProxy::BatchOp op;
+  op.type = LineairDBProxy::BatchOp::Type::Delete;
+  op.key = key;
+  write_buffer_ops_.push_back(std::move(op));
+
+  if (write_buffer_ops_.size() >= WRITE_BATCH_SIZE) {
+    flush_write_buffer();
+  }
+}
+
+void LineairDBTransaction::buffer_delete_secondary_index(
+    const std::string& table_name,
+    const std::string& index_name,
+    const std::string& secondary_key,
+    const std::string& primary_key) {
+  if (!write_buffer_ops_.empty() && write_buffer_table_ != table_name) {
+    flush_write_buffer();
+  }
+  write_buffer_table_ = table_name;
+
+  LineairDBProxy::BatchOp op;
+  op.type = LineairDBProxy::BatchOp::Type::SecondaryIndexDelete;
+  op.index_name = index_name;
+  op.secondary_key = secondary_key;
+  op.primary_key = primary_key;
+  write_buffer_ops_.push_back(std::move(op));
+
+  if (write_buffer_ops_.size() >= WRITE_BATCH_SIZE) {
+    flush_write_buffer();
+  }
 }
 
 bool LineairDBTransaction::flush_write_buffer() {
-  if (write_buffer_ops_.empty() && write_buffer_si_ops_.empty()) return true;
+  if (write_buffer_ops_.empty()) return true;
   if (is_aborted_) {
     write_buffer_ops_.clear();
-    write_buffer_si_ops_.clear();
     return false;
   }
 
   bool ok = lineairdb_proxy->tx_batch_write(
-      this, write_buffer_table_, write_buffer_ops_, write_buffer_si_ops_);
+      this, write_buffer_table_, write_buffer_ops_);
   write_buffer_ops_.clear();
-  write_buffer_si_ops_.clear();
   return ok;
 }
 
