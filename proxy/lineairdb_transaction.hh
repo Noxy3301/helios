@@ -7,6 +7,7 @@
 #include "mysql/plugin.h"
 #include "sql/sql_class.h"
 #include "lineairdb_proxy.hh"
+#include "rpc_trace.hh"
 
 class LineairDB_share;
 
@@ -112,6 +113,8 @@ public:
   void add_rowcount_delta(LineairDB_share *share, const std::string &table_name, int64_t delta);
   int64_t peek_rowcount_delta(const LineairDB_share *share) const;
 
+  // RPC trace statement boundary; TxRpcTrace dedupes repeated SQL strings.
+  void on_stmt_boundary(const std::string& sql) { rpc_trace_.on_stmt(sql); }
 
   LineairDBTransaction(THD* thd, 
                        LineairDBProxy* lineairdb_proxy, 
@@ -149,6 +152,8 @@ private:
   std::string write_buffer_table_;
   std::vector<LineairDBProxy::BatchWriteOp> write_buffer_ops_;
   std::vector<LineairDBProxy::BatchSecondaryIndexOp> write_buffer_si_ops_;
+
+  TxRpcTrace rpc_trace_;
 
   bool thd_is_transaction() const;
   void register_transaction_to_mysql();

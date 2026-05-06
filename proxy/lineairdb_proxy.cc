@@ -4,12 +4,14 @@
 #include <arpa/inet.h>
 #include <unistd.h>
 #include <errno.h>
+#include <chrono>
 #include <cstring>
 #include <iostream>
 #include <vector>
 
 #include "lineairdb_proxy.hh"
 #include "lineairdb_transaction.hh"
+#include "rpc_trace.hh"
 #include "../common/log.h"
 
 
@@ -1025,13 +1027,17 @@ bool LineairDBProxy::send_message(const std::string& serialized_request, std::st
 }
 
 template<typename RequestType, typename ResponseType>
-bool LineairDBProxy::send_protobuf_message(const RequestType& request, ResponseType& response, MessageType message_type) {
+bool LineairDBProxy::send_protobuf_message(const RequestType& request,
+                                           ResponseType& response,
+                                           MessageType message_type,
+                                           const std::string& meta) {
     // serialize request
     std::string serialized_request = request.SerializeAsString();
 
     // send message with header
     std::string serialized_response;
-    if (!send_message_with_header(serialized_request, serialized_response, message_type)) {
+    if (!send_message_with_header(serialized_request, serialized_response,
+                                  message_type, meta)) {
         LOG_ERROR("PROTOBUF_MESSAGE: Failed to send message with header");
         return false;
     }
@@ -1050,9 +1056,11 @@ bool LineairDBProxy::send_protobuf_message(const RequestType& request, ResponseT
 template<typename RequestType>
 bool LineairDBProxy::send_protobuf_recv_binary(const RequestType& request,
                                                 std::string& raw_response,
-                                                MessageType message_type) {
+                                                MessageType message_type,
+                                                const std::string& meta) {
     std::string serialized_request = request.SerializeAsString();
-    return send_message_with_header(serialized_request, raw_response, message_type);
+    return send_message_with_header(serialized_request, raw_response,
+                                    message_type, meta);
 }
 
 // Parse flat binary scan response into vector<KeyValue>.
@@ -1107,7 +1115,11 @@ std::vector<KeyValue> LineairDBProxy::parse_binary_kv_response(const std::string
 
 bool LineairDBProxy::send_message_with_header(const std::string& serialized_request,
                                               std::string& serialized_response,
-                                              MessageType message_type) {
+                                              MessageType message_type,
+                                              const std::string& meta) {
+    auto rpc_start_ts = std::chrono::steady_clock::now();
+    const uint32_t req_bytes = static_cast<uint32_t>(serialized_request.size());
+
     if (!connected_) {
         LOG_ERROR("SEND_MESSAGE: Not connected!");
         return false;
@@ -1177,5 +1189,13 @@ bool LineairDBProxy::send_message_with_header(const std::string& serialized_requ
     }
 
     LOG_DEBUG("SEND_MESSAGE: Message exchange completed successfully");
+    if (current_trace_ != nullptr && current_trace_->active()) {
+        auto rpc_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                          std::chrono::steady_clock::now() - rpc_start_ts)
+                          .count();
+        current_trace_->record(
+            message_type, static_cast<uint64_t>(rpc_us), req_bytes,
+            static_cast<uint32_t>(serialized_response.size()), meta);
+    }
     return true;
 }
