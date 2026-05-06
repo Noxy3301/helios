@@ -18,6 +18,9 @@ LineairDBTransaction::LineairDBTransaction(THD* thd,
 std::string LineairDBTransaction::get_selected_table_name() { return db_table_key; }
 
 void LineairDBTransaction::choose_table(std::string db_table_name) {
+  if (db_table_key != db_table_name) {
+    pushed_filter_.clear();
+  }
   db_table_key = db_table_name;
 }
 

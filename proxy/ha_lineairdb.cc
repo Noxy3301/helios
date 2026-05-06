@@ -1479,6 +1479,14 @@ int ha_lineairdb::external_lock(THD *thd, int lock_type) {
 
   const bool tx_is_ready_to_commit = lock_type == F_UNLCK;
   if (tx_is_ready_to_commit) {
+    // Drop the predicate pushed by cond_push() so the next statement starts clean.
+    pushed_filter_serialized_.clear();
+    LineairDBThdCtx **ctx_slot = reinterpret_cast<LineairDBThdCtx **>(
+        thd_ha_data(thd, lineairdb_hton));
+    if (ctx_slot != nullptr && *ctx_slot != nullptr &&
+        (*ctx_slot)->tx != nullptr) {
+      (*ctx_slot)->tx->clear_pushed_filter();
+    }
     return 0;
   }
 
