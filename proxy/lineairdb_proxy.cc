@@ -475,7 +475,8 @@ std::vector<std::string> LineairDBProxy::tx_get_matching_keys_in_range(LineairDB
 std::vector<KeyValue> LineairDBProxy::tx_get_matching_keys_and_values_in_range(LineairDBTransaction* tx,
                                                                                 const std::string& start_key,
                                                                                 const std::string& end_key,
-                                                                                uint64_t row_limit) {
+                                                                                uint64_t row_limit,
+                                                                                bool reverse_scan) {
     int64_t tx_id = tx->get_tx_id();
     LOG_DEBUG("CLIENT: tx_get_matching_keys_and_values_in_range called with tx_id=%ld", tx_id);
     if (!connected_) {
@@ -489,6 +490,7 @@ std::vector<KeyValue> LineairDBProxy::tx_get_matching_keys_and_values_in_range(L
     request.set_start_key(start_key);
     request.set_end_key(end_key);
     request.set_row_limit(row_limit);
+    request.set_reverse_scan(reverse_scan);
 
     // Attach pushed predicate filter if available
     const auto& filter = tx->get_pushed_filter();

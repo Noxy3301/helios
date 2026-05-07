@@ -36,7 +36,8 @@ public:
   std::vector<std::string> get_matching_keys(std::string key);
   std::vector<std::string> get_matching_keys_in_range(std::string start_key, std::string end_key);
   std::vector<std::pair<std::string, std::string>> get_matching_keys_and_values_in_range(
-      std::string start_key, std::string end_key, uint64_t row_limit = 0);
+      std::string start_key, std::string end_key, uint64_t row_limit = 0,
+      bool reverse_scan = false);
   std::vector<std::pair<std::string, std::string>> get_matching_keys_and_values_from_prefix(
       std::string prefix);
   bool write(std::string key, const std::string value);

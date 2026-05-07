@@ -158,12 +158,13 @@ LineairDBTransaction::get_matching_keys_in_range(std::string start_key,
 std::vector<std::pair<std::string, std::string>>
 LineairDBTransaction::get_matching_keys_and_values_in_range(std::string start_key,
                                                             std::string end_key,
-                                                            uint64_t row_limit) {
+                                                            uint64_t row_limit,
+                                                            bool reverse_scan) {
   if (table_is_not_chosen()) return {};
   flush_write_buffer_for_table(db_table_key);
 
   auto results = lineairdb_proxy->tx_get_matching_keys_and_values_in_range(
-      this, start_key, end_key, row_limit);
+      this, start_key, end_key, row_limit, reverse_scan);
 
   std::vector<std::pair<std::string, std::string>> pairs;
   for (const auto& kv : results) {

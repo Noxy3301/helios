@@ -331,6 +331,7 @@ message TxGetMatchingKeysAndValuesInRange {
         PushedPredicate filter = 5;
         string table_name = 6;
         uint64 row_limit = 7; // 0 means no limit.
+        bool reverse_scan = 8; // true means scan in descending key order.
     }
     message Response {
         repeated KeyValue results = 1;

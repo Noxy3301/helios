@@ -537,6 +537,7 @@ void LineairDBRpc::handleTxGetMatchingKeysAndValuesInRange(const std::string& me
         std::string start_key = request.start_key();
         std::string end_key = request.end_key();
         const uint64_t row_limit = request.row_limit();
+        const bool reverse_scan = request.reverse_scan();
         // Count rows actually returned after tombstone and predicate checks.
         uint64_t returned_rows = 0;
 
@@ -550,9 +551,9 @@ void LineairDBRpc::handleTxGetMatchingKeysAndValuesInRange(const std::string& me
         PredicateEvaluator evaluator;
 
         // Scan callback: value is pair<const void*, size_t> from LineairDB
-        auto scan_result = tx->Scan(
-            start_key, end_opt, [&result, row_limit, &returned_rows,
-                                  filter_expr, filter_num_cols, &evaluator](auto key, auto value) {
+        auto append_matching_row =
+            [&result, row_limit, &returned_rows, filter_expr, filter_num_cols,
+             &evaluator](auto key, auto value) {
                 // Skip tombstones (deleted rows)
                 if (value.first == nullptr || value.second == 0) { return false; }
                 // Predicate pushdown: evaluate filter if present
@@ -575,7 +576,14 @@ void LineairDBRpc::handleTxGetMatchingKeysAndValuesInRange(const std::string& me
                 returned_rows++;
                 // Stop the LineairDB scan once the pushed LIMIT is satisfied.
                 return row_limit > 0 && returned_rows >= row_limit;
-            });
+            };
+
+        std::optional<size_t> scan_result;
+        if (reverse_scan) {
+            scan_result = tx->ScanReverse(start_key, end_opt, append_matching_row);
+        } else {
+            scan_result = tx->Scan(start_key, end_opt, append_matching_row);
+        }
 
         // Phantom detection: if Scan returns nullopt, the transaction is in an abort state
         if (!scan_result.has_value()) {
