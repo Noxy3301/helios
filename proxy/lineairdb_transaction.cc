@@ -40,6 +40,7 @@ LineairDBTransaction::read(std::string key) {
 
   // Silo-style local view: own writes are visible before remote reads
   if (auto entry = lookup_local_write_set(db_table_key, key)) {
+    rpc_trace_.record_local_view("read_write_hit");
     if (!entry->found) return {nullptr, 0};
     last_read_value_ = entry->value;
     return {reinterpret_cast<const std::byte*>(last_read_value_.data()), last_read_value_.size()};
@@ -47,12 +48,14 @@ LineairDBTransaction::read(std::string key) {
 
   // Repeat exact-key reads can use the local read set
   if (auto entry = lookup_local_read_set(db_table_key, key)) {
+    rpc_trace_.record_local_view("read_cache_hit");
     if (!entry->found) return {nullptr, 0};
     last_read_value_ = entry->value;
     return {reinterpret_cast<const std::byte*>(last_read_value_.data()), last_read_value_.size()};
   }
 
   // First exact-key read goes to the server and enters the local read set
+  rpc_trace_.record_local_view("read_miss");
   last_read_value_ = lineairdb_proxy->tx_read(this, key);
   if (last_read_value_.empty()) {
     record_local_read(db_table_key, key, false, ""); // value unused when not found
@@ -79,13 +82,16 @@ LineairDBTransaction::batch_read(const std::vector<std::string>& keys) {
   // Resolve keys covered by the local read/write sets first
   for (size_t i = 0; i < keys.size(); ++i) {
     if (auto entry = lookup_local_write_set(db_table_key, keys[i])) {
+      rpc_trace_.record_local_view("batch_write_hit");
       pairs[i] = {entry->found, entry->value};
       continue;
     }
     if (auto entry = lookup_local_read_set(db_table_key, keys[i])) {
+      rpc_trace_.record_local_view("batch_cache_hit");
       pairs[i] = {entry->found, entry->value};
       continue;
     }
+    rpc_trace_.record_local_view("batch_miss");
     rpc_positions.push_back(i);
     rpc_keys.push_back(keys[i]);
   }

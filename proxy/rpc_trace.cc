@@ -135,7 +135,9 @@ void TxRpcTrace::start(int64_t tx_id, std::thread::id tid) {
   started_wall_ = std::chrono::system_clock::now();
   rpcs_.clear();
   statements_.clear();
+  local_view_entries_.clear();
   by_type_.clear();
+  local_view_by_kind_.clear();
 }
 
 void TxRpcTrace::on_stmt(const std::string& sql) {
@@ -180,6 +182,22 @@ void TxRpcTrace::record(MessageType type, uint64_t us, uint32_t req_b,
   a.us += us;
   a.req_b += req_b;
   a.resp_b += resp_b;
+}
+
+void TxRpcTrace::record_local_view(const std::string& kind) {
+  if (!active_) return;
+  const uint64_t off = std::chrono::duration_cast<std::chrono::microseconds>(
+                           std::chrono::steady_clock::now() - started_)
+                           .count();
+
+  LocalViewEntry e;
+  e.kind = kind;
+  e.off_us = off;
+  e.stmt_idx = statements_.empty()
+                   ? UINT32_MAX
+                   : static_cast<uint32_t>(statements_.size() - 1);
+  local_view_entries_.push_back(std::move(e));
+  local_view_by_kind_[kind]++;
 }
 
 std::string TxRpcTrace::finalize_jsonl(bool committed) {
@@ -239,6 +257,24 @@ std::string TxRpcTrace::finalize_jsonl(bool committed) {
   }
   os << ']';
 
+  os << ",\"local_view_events\":[";
+  for (size_t i = 0; i < local_view_entries_.size(); ++i) {
+    const auto& e = local_view_entries_[i];
+    if (i > 0) os << ',';
+    os << '{'
+       << "\"i\":" << i
+       << ",\"kind\":\"" << json_escape(e.kind, 128) << '"'
+       << ",\"off_us\":" << e.off_us
+       << ",\"stmt\":";
+    if (e.stmt_idx == UINT32_MAX) {
+      os << "null";
+    } else {
+      os << e.stmt_idx;
+    }
+    os << '}';
+  }
+  os << ']';
+
   os << ",\"summary_by_type\":{";
   bool first = true;
   for (const auto& kv : by_type_) {
@@ -250,6 +286,15 @@ std::string TxRpcTrace::finalize_jsonl(bool committed) {
        << ",\"req_b\":" << kv.second.req_b
        << ",\"resp_b\":" << kv.second.resp_b
        << '}';
+  }
+  os << '}';
+
+  os << ",\"summary_local_view\":{";
+  bool first_local = true;
+  for (const auto& kv : local_view_by_kind_) {
+    if (!first_local) os << ',';
+    first_local = false;
+    os << '"' << json_escape(kv.first, 128) << "\":" << kv.second;
   }
   os << '}';
 
