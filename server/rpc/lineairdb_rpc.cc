@@ -563,8 +563,17 @@ void LineairDBRpc::handleTxGetMatchingKeysAndValuesInRange(const std::string& me
                         if (!evaluator.evaluate(*filter_expr)) {
                             return false;  // filter rejected → skip row, continue scanning
                         }
+                    } else {
+                        // Return parse-failed rows for MySQL to check, but do
+                        // not count them toward a pushed LIMIT.
+                        uint32_t klen = static_cast<uint32_t>(key.size());
+                        uint32_t vlen = static_cast<uint32_t>(value.second);
+                        result.append(reinterpret_cast<const char*>(&klen), 4);
+                        result.append(key.data(), key.size());
+                        result.append(reinterpret_cast<const char*>(&vlen), 4);
+                        result.append(static_cast<const char*>(value.first), value.second);
+                        return false;
                     }
-                    // parse_row failure → include row (safe fallback)
                 }
                 // Append key-value entry in flat binary format
                 uint32_t klen = static_cast<uint32_t>(key.size());
