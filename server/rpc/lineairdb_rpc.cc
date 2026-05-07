@@ -248,6 +248,11 @@ void LineairDBRpc::handleTxBatchWrite(const std::string& message, std::string& r
         if (!tx->IsAborted()) {
             for (int i = 0; i < request.ops_size(); i++) {
                 const auto& op = request.ops(i);
+                const std::string& op_table =
+                    op.table_name().empty() ? request.table_name() : op.table_name();
+                if (!op_table.empty()) {
+                    tx->SetTable(op_table);
+                }
                 switch (op.type()) {
                     case LineairDB::Protocol::BATCH_OP_WRITE: {
                         const std::string& value_str = op.value();

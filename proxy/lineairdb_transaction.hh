@@ -82,6 +82,7 @@ public:
   // Flush buffered row/index ops before reads can observe the same table.
   // Must be called before read/scan RPCs to ensure read-your-own-writes.
   bool flush_write_buffer();
+  bool flush_write_buffer_for_table(const std::string& table_name);
 
   void begin_transaction();
   void set_status_to_abort();
@@ -154,7 +155,6 @@ private:
 
   // Max number of buffered write/delete ops before an automatic flush
   static constexpr size_t WRITE_BATCH_SIZE = 100;
-  std::string write_buffer_table_;
   // Stores row and secondary-index write/delete ops in MySQL issue order
   std::vector<LineairDBProxy::BatchOp> write_buffer_ops_;
 

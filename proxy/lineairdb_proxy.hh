@@ -123,6 +123,7 @@ public:
         std::string index_name;
         std::string secondary_key;
         std::string primary_key;
+        std::string table_name;
     };
     bool tx_batch_write(LineairDBTransaction* tx,
                         const std::string& table_name,

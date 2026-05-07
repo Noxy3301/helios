@@ -270,22 +270,26 @@ bool LineairDBProxy::tx_batch_write(LineairDBTransaction* tx,
                 op->set_type(LineairDB::Protocol::BATCH_OP_WRITE);
                 op->set_key(batch_op.key);
                 op->set_value(batch_op.value);
+                op->set_table_name(batch_op.table_name);
                 break;
             case BatchOp::Type::Delete:
                 op->set_type(LineairDB::Protocol::BATCH_OP_DELETE);
                 op->set_key(batch_op.key);
+                op->set_table_name(batch_op.table_name);
                 break;
             case BatchOp::Type::SecondaryIndexWrite:
                 op->set_type(LineairDB::Protocol::BATCH_OP_SECONDARY_INDEX_WRITE);
                 op->set_index_name(batch_op.index_name);
                 op->set_secondary_key(batch_op.secondary_key);
                 op->set_primary_key(batch_op.primary_key);
+                op->set_table_name(batch_op.table_name);
                 break;
             case BatchOp::Type::SecondaryIndexDelete:
                 op->set_type(LineairDB::Protocol::BATCH_OP_SECONDARY_INDEX_DELETE);
                 op->set_index_name(batch_op.index_name);
                 op->set_secondary_key(batch_op.secondary_key);
                 op->set_primary_key(batch_op.primary_key);
+                op->set_table_name(batch_op.table_name);
                 break;
         }
     }

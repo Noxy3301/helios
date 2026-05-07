@@ -113,11 +113,12 @@ message TxBatchWrite {
         string index_name = 4;
         bytes secondary_key = 5;
         bytes primary_key = 6;
+        string table_name = 7;
     }
     message Request {
         int64 transaction_id = 1;
         string table_name = 2;
-        // Operations are applied in the same order as MySQL produced them.
+        // Operations are applied in the same order as MySQL issued them.
         repeated BatchOp ops = 3;
     }
     message Response {
