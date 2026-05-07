@@ -176,6 +176,8 @@ private:
       const std::string& table_name, const std::string& key) const;
   std::optional<LocalRowEntry> lookup_local_read_set(
       const std::string& table_name, const std::string& key) const;
+  void drop_local_read(const std::string& table_name,
+                       const std::string& key);
   void record_local_write(const std::string& table_name,
                           const std::string& key, bool found,
                           const std::string& value);

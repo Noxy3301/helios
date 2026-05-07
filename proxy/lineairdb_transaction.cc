@@ -470,10 +470,23 @@ LineairDBTransaction::lookup_local_read_set(
   return std::nullopt;
 }
 
+void LineairDBTransaction::drop_local_read(const std::string& table_name,
+                                           const std::string& key) {
+  for (auto it = local_read_set_.begin(); it != local_read_set_.end(); ++it) {
+    if (it->table_name == table_name && it->key == key) {
+      local_read_set_.erase(it);
+      return;
+    }
+  }
+}
+
 void LineairDBTransaction::record_local_write(const std::string& table_name,
                                               const std::string& key,
                                               bool found,
                                               const std::string& value) {
+  // A later write/delete replaces any cached read for the same key
+  drop_local_read(table_name, key);
+
   for (auto& entry : local_write_set_) {
     if (entry.table_name == table_name && entry.key == key) {
       entry.found = found;
