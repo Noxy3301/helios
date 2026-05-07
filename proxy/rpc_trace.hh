@@ -31,6 +31,13 @@ struct StatementEntry {
   uint32_t last_rpc_idx;
 };
 
+// Per-local-view decision captured before a point read falls back to RPC.
+struct LocalViewEntry {
+  std::string kind;
+  uint64_t off_us;
+  uint32_t stmt_idx;
+};
+
 // Per-LineairDBTransaction trace state.
 class TxRpcTrace {
  public:
@@ -39,6 +46,7 @@ class TxRpcTrace {
   void on_stmt(const std::string& sql);
   void record(MessageType type, uint64_t us, uint32_t req_b,
               uint32_t resp_b, const std::string& meta);
+  void record_local_view(const std::string& kind);
   std::string finalize_jsonl(bool committed);
 
   bool active() const { return active_; }
@@ -51,6 +59,7 @@ class TxRpcTrace {
   std::chrono::system_clock::time_point started_wall_;
   std::vector<RpcEntry> rpcs_;
   std::vector<StatementEntry> statements_;
+  std::vector<LocalViewEntry> local_view_entries_;
 
   struct Agg {
     uint32_t n = 0;
@@ -60,6 +69,7 @@ class TxRpcTrace {
   };
 
   std::map<MessageType, Agg> by_type_;
+  std::map<std::string, uint32_t> local_view_by_kind_;
 };
 
 // Singleton JSONL logger enabled by ENABLE_RPC_TRACE.

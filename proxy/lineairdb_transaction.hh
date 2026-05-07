@@ -151,16 +151,57 @@ private:
   };
   std::vector<RowCountDelta> rowcount_deltas_;
 
+  struct LocalRowEntry {
+    std::string table_name;
+    std::string key;
+    bool found;
+    std::string value;
+  };
+  // Proxy-side read set for exact primary-key reads
+  std::vector<LocalRowEntry> local_read_set_;
+  // Proxy-side write set for exact primary-key writes/deletes
+  std::vector<LocalRowEntry> local_write_set_;
+
   // Predicate pushdown: serialized PushedPredicate for scan filtering
   std::string pushed_filter_;
 
   // Max number of buffered write/delete ops before an automatic flush
   static constexpr size_t WRITE_BATCH_SIZE = 100;
-  // Stores row and secondary-index write/delete ops in MySQL issue order
+  // Pending RPC flush queue for row and secondary-index ops in MySQL order
   std::vector<LineairDBProxy::BatchOp> write_buffer_ops_;
 
   TxRpcTrace rpc_trace_;
 
+  std::optional<LocalRowEntry> lookup_local_write_set(
+      const std::string& table_name, const std::string& key) const;
+  std::optional<LocalRowEntry> lookup_local_read_set(
+      const std::string& table_name, const std::string& key) const;
+  void drop_local_read(const std::string& table_name,
+                       const std::string& key);
+  bool key_is_in_range(const std::string& key,
+                       const std::string& start_key,
+                       const std::string& end_key) const;
+  bool key_starts_with(const std::string& key,
+                       const std::string& prefix) const;
+  void remove_scan_row(std::vector<std::pair<std::string, std::string>>& rows,
+                       const std::string& key) const;
+  void insert_scan_row_in_order(
+      std::vector<std::pair<std::string, std::string>>& rows,
+      const std::string& key, const std::string& value,
+      bool reverse_scan) const;
+  void merge_pending_rows_into_range_scan(
+      std::vector<std::pair<std::string, std::string>>& rows,
+      const std::string& start_key, const std::string& end_key,
+      bool reverse_scan) const;
+  void merge_pending_rows_into_prefix_scan(
+      std::vector<std::pair<std::string, std::string>>& rows,
+      const std::string& prefix) const;
+  void record_local_write(const std::string& table_name,
+                          const std::string& key, bool found,
+                          const std::string& value);
+  void record_local_read(const std::string& table_name,
+                         const std::string& key, bool found,
+                         const std::string& value);
   bool thd_is_transaction() const;
   void register_transaction_to_mysql();
   void register_single_statement_to_mysql();
