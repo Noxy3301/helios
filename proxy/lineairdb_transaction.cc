@@ -38,10 +38,28 @@ const std::pair<const std::byte *const, const size_t>
 LineairDBTransaction::read(std::string key) {
   if (table_is_not_chosen()) return std::pair<const std::byte *const, const size_t>{nullptr, 0};
 
-  flush_write_buffer_for_table(db_table_key);
+  // Silo-style local view: own writes are visible before remote reads
+  if (auto entry = lookup_local_write_set(db_table_key, key)) {
+    if (!entry->found) return {nullptr, 0};
+    last_read_value_ = entry->value;
+    return {reinterpret_cast<const std::byte*>(last_read_value_.data()), last_read_value_.size()};
+  }
 
+  // Repeat exact-key reads can use the local read set
+  if (auto entry = lookup_local_read_set(db_table_key, key)) {
+    if (!entry->found) return {nullptr, 0};
+    last_read_value_ = entry->value;
+    return {reinterpret_cast<const std::byte*>(last_read_value_.data()), last_read_value_.size()};
+  }
+
+  // First exact-key read goes to the server and enters the local read set
   last_read_value_ = lineairdb_proxy->tx_read(this, key);
-  if (last_read_value_.empty()) return std::pair<const std::byte *const, const size_t>{nullptr, 0};
+  if (last_read_value_.empty()) {
+    record_local_read(db_table_key, key, false, ""); // value unused when not found
+    return std::pair<const std::byte *const, const size_t>{nullptr, 0};
+  }
+
+  record_local_read(db_table_key, key, true, last_read_value_);
 
   return {reinterpret_cast<const std::byte*>(last_read_value_.data()), last_read_value_.size()};
 }
@@ -49,13 +67,40 @@ LineairDBTransaction::read(std::string key) {
 std::vector<std::pair<bool, std::string>>
 LineairDBTransaction::batch_read(const std::vector<std::string>& keys) {
   if (table_is_not_chosen()) return {};
-  flush_write_buffer_for_table(db_table_key);
 
-  auto results = lineairdb_proxy->tx_batch_read(this, keys);
   std::vector<std::pair<bool, std::string>> pairs;
-  pairs.reserve(results.size());
-  for (auto& r : results) {
-    pairs.emplace_back(r.found, std::move(r.value));
+  pairs.resize(keys.size());
+
+  std::vector<std::string> rpc_keys;
+  std::vector<size_t> rpc_positions;
+  rpc_keys.reserve(keys.size());
+  rpc_positions.reserve(keys.size());
+
+  // Resolve keys covered by the local read/write sets first
+  for (size_t i = 0; i < keys.size(); ++i) {
+    if (auto entry = lookup_local_write_set(db_table_key, keys[i])) {
+      pairs[i] = {entry->found, entry->value};
+      continue;
+    }
+    if (auto entry = lookup_local_read_set(db_table_key, keys[i])) {
+      pairs[i] = {entry->found, entry->value};
+      continue;
+    }
+    rpc_positions.push_back(i);
+    rpc_keys.push_back(keys[i]);
+  }
+
+  // Fetch only cache misses; tx_batch_read() returns rows in rpc_keys order
+  //   Example: keys=[A,B,C], B is local -> rpc_keys=[A,C],
+  //            rpc_positions=[0,2], so RPC results fill pairs[0] and pairs[2].
+  if (!rpc_keys.empty()) {
+    auto results = lineairdb_proxy->tx_batch_read(this, rpc_keys);
+    for (size_t i = 0; i < results.size(); ++i) {
+      // Map each RPC result back to the original keys[] position
+      const size_t pos = rpc_positions[i];
+      pairs[pos] = {results[i].found, std::move(results[i].value)};
+      record_local_read(db_table_key, keys[pos], pairs[pos].first, pairs[pos].second);
+    }
   }
   return pairs;
 }
@@ -99,13 +144,17 @@ LineairDBTransaction::get_matching_keys(std::string first_key_part) {
 bool LineairDBTransaction::write(std::string key, const std::string value) {
   if (table_is_not_chosen()) return false;
 
-  return lineairdb_proxy->tx_write(this, key, value);
+  const bool ok = lineairdb_proxy->tx_write(this, key, value);
+  if (ok) record_local_write(db_table_key, key, true, value);
+  return ok;
 }
 
 bool LineairDBTransaction::delete_value(std::string key) {
   if (table_is_not_chosen()) return false;
 
-  return lineairdb_proxy->tx_delete(this, key);
+  const bool ok = lineairdb_proxy->tx_delete(this, key);
+  if (ok) record_local_write(db_table_key, key, false, ""); // value unused when not found
+  return ok;
 }
 
 // Secondary index operations
@@ -293,6 +342,7 @@ void LineairDBTransaction::buffer_write(const std::string& table_name,
   op.value = value;
   op.table_name = table_name;
   write_buffer_ops_.push_back(std::move(op));
+  record_local_write(table_name, key, true, value);
 
   if (write_buffer_ops_.size() >= WRITE_BATCH_SIZE) {
     flush_write_buffer();
@@ -323,6 +373,7 @@ void LineairDBTransaction::buffer_delete(const std::string& table_name,
   op.key = key;
   op.table_name = table_name;
   write_buffer_ops_.push_back(std::move(op));
+  record_local_write(table_name, key, false, ""); // value unused when not found
 
   if (write_buffer_ops_.size() >= WRITE_BATCH_SIZE) {
     flush_write_buffer();
@@ -397,6 +448,54 @@ bool LineairDBTransaction::flush_write_buffer_for_table(
 
   write_buffer_ops_ = std::move(keep_ops);
   return true;
+}
+
+std::optional<LineairDBTransaction::LocalRowEntry>
+LineairDBTransaction::lookup_local_write_set(
+    const std::string& table_name, const std::string& key) const {
+  for (auto it = local_write_set_.rbegin(); it != local_write_set_.rend(); ++it) {
+    if (it->table_name == table_name && it->key == key) {
+      return *it;
+    }
+  }
+  return std::nullopt;
+}
+
+std::optional<LineairDBTransaction::LocalRowEntry>
+LineairDBTransaction::lookup_local_read_set(
+    const std::string& table_name, const std::string& key) const {
+  for (auto it = local_read_set_.rbegin(); it != local_read_set_.rend(); ++it) {
+    if (it->table_name == table_name && it->key == key) return *it;
+  }
+  return std::nullopt;
+}
+
+void LineairDBTransaction::record_local_write(const std::string& table_name,
+                                              const std::string& key,
+                                              bool found,
+                                              const std::string& value) {
+  for (auto& entry : local_write_set_) {
+    if (entry.table_name == table_name && entry.key == key) {
+      entry.found = found;
+      entry.value = value;
+      return;
+    }
+  }
+  local_write_set_.push_back({table_name, key, found, value});
+}
+
+void LineairDBTransaction::record_local_read(const std::string& table_name,
+                                             const std::string& key,
+                                             bool found,
+                                             const std::string& value) {
+  for (auto& entry : local_read_set_) {
+    if (entry.table_name == table_name && entry.key == key) {
+      entry.found = found;
+      entry.value = value;
+      return;
+    }
+  }
+  local_read_set_.push_back({table_name, key, found, value});
 }
 
 void LineairDBTransaction::begin_transaction() {
