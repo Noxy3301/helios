@@ -7,6 +7,7 @@
 #include "mysql/plugin.h"
 #include "sql/sql_class.h"
 #include "lineairdb_proxy.hh"
+#include "rpc_trace.hh"
 
 class LineairDB_share;
 
@@ -30,13 +31,13 @@ public:
   const std::pair<const std::byte *const, const size_t> read(std::string key);
   std::vector<std::pair<bool, std::string>> batch_read(const std::vector<std::string>& keys);
   bool batch_write(const std::string& table_name,
-                   const std::vector<LineairDBProxy::BatchWriteOp>& writes,
-                   const std::vector<LineairDBProxy::BatchSecondaryIndexOp>& si_writes);
+                   const std::vector<LineairDBProxy::BatchOp>& ops);
   std::vector<std::string> get_all_keys();
   std::vector<std::string> get_matching_keys(std::string key);
   std::vector<std::string> get_matching_keys_in_range(std::string start_key, std::string end_key);
   std::vector<std::pair<std::string, std::string>> get_matching_keys_and_values_in_range(
-      std::string start_key, std::string end_key);
+      std::string start_key, std::string end_key, uint64_t row_limit = 0,
+      bool reverse_scan = false);
   std::vector<std::pair<std::string, std::string>> get_matching_keys_and_values_from_prefix(
       std::string prefix);
   bool write(std::string key, const std::string value);
@@ -73,9 +74,16 @@ public:
                                      const std::string& index_name,
                                      const std::string& secondary_key,
                                      const std::string& primary_key);
-  // Flush buffered writes to LineairDB so that subsequent reads can see them.
-  // Must be called before any read/scan RPC to ensure read-your-own-writes.
+  void buffer_delete(const std::string& table_name,
+                     const std::string& key);
+  void buffer_delete_secondary_index(const std::string& table_name,
+                                     const std::string& index_name,
+                                     const std::string& secondary_key,
+                                     const std::string& primary_key);
+  // Flush buffered row/index ops before reads can observe the same table.
+  // Must be called before read/scan RPCs to ensure read-your-own-writes.
   bool flush_write_buffer();
+  bool flush_write_buffer_for_table(const std::string& table_name);
 
   void begin_transaction();
   void set_status_to_abort();
@@ -112,6 +120,8 @@ public:
   void add_rowcount_delta(LineairDB_share *share, const std::string &table_name, int64_t delta);
   int64_t peek_rowcount_delta(const LineairDB_share *share) const;
 
+  // RPC trace statement boundary; TxRpcTrace dedupes repeated SQL strings.
+  void on_stmt_boundary(const std::string& sql) { rpc_trace_.on_stmt(sql); }
 
   LineairDBTransaction(THD* thd, 
                        LineairDBProxy* lineairdb_proxy, 
@@ -144,11 +154,12 @@ private:
   // Predicate pushdown: serialized PushedPredicate for scan filtering
   std::string pushed_filter_;
 
-  // Write buffer for batch write operations
+  // Max number of buffered write/delete ops before an automatic flush
   static constexpr size_t WRITE_BATCH_SIZE = 100;
-  std::string write_buffer_table_;
-  std::vector<LineairDBProxy::BatchWriteOp> write_buffer_ops_;
-  std::vector<LineairDBProxy::BatchSecondaryIndexOp> write_buffer_si_ops_;
+  // Stores row and secondary-index write/delete ops in MySQL issue order
+  std::vector<LineairDBProxy::BatchOp> write_buffer_ops_;
+
+  TxRpcTrace rpc_trace_;
 
   bool thd_is_transaction() const;
   void register_transaction_to_mysql();

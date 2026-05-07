@@ -398,6 +398,8 @@ public:
 private:
   // Serialized PushedPredicate protobuf from cond_push()
   std::string pushed_filter_serialized_;
+  // True when cond_push() cannot build a server-side filter
+  bool has_unpushed_filter_{false};
   /** The multi range read session object */
   DsMrr_impl m_ds_mrr;
 

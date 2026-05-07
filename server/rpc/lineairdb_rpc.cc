@@ -245,19 +245,43 @@ void LineairDBRpc::handleTxBatchWrite(const std::string& message, std::string& r
             tx->SetTable(request.table_name());
         }
 
-        for (int i = 0; i < request.writes_size(); i++) {
-            const auto& op = request.writes(i);
-            const std::string& value_str = op.value();
-            tx->Write(op.key(), reinterpret_cast<const std::byte*>(value_str.c_str()), value_str.size());
-            if (tx->IsAborted()) break;
-        }
-
         if (!tx->IsAborted()) {
-            for (int i = 0; i < request.secondary_index_writes_size(); i++) {
-                const auto& si = request.secondary_index_writes(i);
-                const std::string& pk = si.primary_key();
-                tx->WriteSecondaryIndex(si.index_name(), si.secondary_key(),
-                                        reinterpret_cast<const std::byte*>(pk.c_str()), pk.size());
+            for (int i = 0; i < request.ops_size(); i++) {
+                const auto& op = request.ops(i);
+                const std::string& op_table =
+                    op.table_name().empty() ? request.table_name() : op.table_name();
+                if (!op_table.empty()) {
+                    tx->SetTable(op_table);
+                }
+                switch (op.type()) {
+                    case LineairDB::Protocol::BATCH_OP_WRITE: {
+                        const std::string& value_str = op.value();
+                        tx->Write(op.key(),
+                                  reinterpret_cast<const std::byte*>(value_str.c_str()),
+                                  value_str.size());
+                        break;
+                    }
+                    case LineairDB::Protocol::BATCH_OP_DELETE:
+                        tx->Delete(op.key());
+                        break;
+                    case LineairDB::Protocol::BATCH_OP_SECONDARY_INDEX_WRITE: {
+                        const std::string& pk = op.primary_key();
+                        tx->WriteSecondaryIndex(
+                            op.index_name(), op.secondary_key(),
+                            reinterpret_cast<const std::byte*>(pk.c_str()), pk.size());
+                        break;
+                    }
+                    case LineairDB::Protocol::BATCH_OP_SECONDARY_INDEX_DELETE: {
+                        const std::string& pk = op.primary_key();
+                        tx->DeleteSecondaryIndex(
+                            op.index_name(), op.secondary_key(),
+                            reinterpret_cast<const std::byte*>(pk.c_str()), pk.size());
+                        break;
+                    }
+                    case LineairDB::Protocol::BATCH_OP_UNKNOWN:
+                    default:
+                        break;
+                }
                 if (tx->IsAborted()) break;
             }
         }
@@ -512,6 +536,10 @@ void LineairDBRpc::handleTxGetMatchingKeysAndValuesInRange(const std::string& me
         }
         std::string start_key = request.start_key();
         std::string end_key = request.end_key();
+        const uint64_t row_limit = request.row_limit();
+        const bool reverse_scan = request.reverse_scan();
+        // Count rows actually returned after tombstone and predicate checks.
+        uint64_t returned_rows = 0;
 
         std::optional<std::string_view> end_opt;
         if (!end_key.empty()) { end_opt = end_key; }
@@ -523,9 +551,9 @@ void LineairDBRpc::handleTxGetMatchingKeysAndValuesInRange(const std::string& me
         PredicateEvaluator evaluator;
 
         // Scan callback: value is pair<const void*, size_t> from LineairDB
-        auto scan_result = tx->Scan(
-            start_key, end_opt, [&result,
-                                  filter_expr, filter_num_cols, &evaluator](auto key, auto value) {
+        auto append_matching_row =
+            [&result, row_limit, &returned_rows, filter_expr, filter_num_cols,
+             &evaluator](auto key, auto value) {
                 // Skip tombstones (deleted rows)
                 if (value.first == nullptr || value.second == 0) { return false; }
                 // Predicate pushdown: evaluate filter if present
@@ -545,8 +573,17 @@ void LineairDBRpc::handleTxGetMatchingKeysAndValuesInRange(const std::string& me
                 result.append(key.data(), key.size());
                 result.append(reinterpret_cast<const char*>(&vlen), 4);
                 result.append(static_cast<const char*>(value.first), value.second);
-                return false;  // continue scanning
-            });
+                returned_rows++;
+                // Stop the LineairDB scan once the pushed LIMIT is satisfied.
+                return row_limit > 0 && returned_rows >= row_limit;
+            };
+
+        std::optional<size_t> scan_result;
+        if (reverse_scan) {
+            scan_result = tx->ScanReverse(start_key, end_opt, append_matching_row);
+        } else {
+            scan_result = tx->Scan(start_key, end_opt, append_matching_row);
+        }
 
         // Phantom detection: if Scan returns nullopt, the transaction is in an abort state
         if (!scan_result.has_value()) {

@@ -4,12 +4,14 @@
 #include <arpa/inet.h>
 #include <unistd.h>
 #include <errno.h>
+#include <chrono>
 #include <cstring>
 #include <iostream>
 #include <vector>
 
 #include "lineairdb_proxy.hh"
 #include "lineairdb_transaction.hh"
+#include "rpc_trace.hh"
 #include "../common/log.h"
 
 
@@ -248,8 +250,7 @@ std::vector<LineairDBProxy::BatchReadResult> LineairDBProxy::tx_batch_read(
 
 bool LineairDBProxy::tx_batch_write(LineairDBTransaction* tx,
                                     const std::string& table_name,
-                                    const std::vector<BatchWriteOp>& writes,
-                                    const std::vector<BatchSecondaryIndexOp>& si_writes) {
+                                    const std::vector<BatchOp>& ops) {
     int64_t tx_id = tx->get_tx_id();
     if (!connected_) {
         LOG_ERROR("RPC failed: Not connected to server");
@@ -262,17 +263,35 @@ bool LineairDBProxy::tx_batch_write(LineairDBTransaction* tx,
     request.set_transaction_id(tx_id);
     request.set_table_name(table_name);
 
-    for (const auto& w : writes) {
-        auto* op = request.add_writes();
-        op->set_key(w.key);
-        op->set_value(w.value);
-    }
-
-    for (const auto& si : si_writes) {
-        auto* op = request.add_secondary_index_writes();
-        op->set_index_name(si.index_name);
-        op->set_secondary_key(si.secondary_key);
-        op->set_primary_key(si.primary_key);
+    for (const auto& batch_op : ops) {
+        auto* op = request.add_ops();
+        switch (batch_op.type) {
+            case BatchOp::Type::Write:
+                op->set_type(LineairDB::Protocol::BATCH_OP_WRITE);
+                op->set_key(batch_op.key);
+                op->set_value(batch_op.value);
+                op->set_table_name(batch_op.table_name);
+                break;
+            case BatchOp::Type::Delete:
+                op->set_type(LineairDB::Protocol::BATCH_OP_DELETE);
+                op->set_key(batch_op.key);
+                op->set_table_name(batch_op.table_name);
+                break;
+            case BatchOp::Type::SecondaryIndexWrite:
+                op->set_type(LineairDB::Protocol::BATCH_OP_SECONDARY_INDEX_WRITE);
+                op->set_index_name(batch_op.index_name);
+                op->set_secondary_key(batch_op.secondary_key);
+                op->set_primary_key(batch_op.primary_key);
+                op->set_table_name(batch_op.table_name);
+                break;
+            case BatchOp::Type::SecondaryIndexDelete:
+                op->set_type(LineairDB::Protocol::BATCH_OP_SECONDARY_INDEX_DELETE);
+                op->set_index_name(batch_op.index_name);
+                op->set_secondary_key(batch_op.secondary_key);
+                op->set_primary_key(batch_op.primary_key);
+                op->set_table_name(batch_op.table_name);
+                break;
+        }
     }
 
     if (!send_protobuf_message(request, response, MessageType::TX_BATCH_WRITE)) {
@@ -455,7 +474,9 @@ std::vector<std::string> LineairDBProxy::tx_get_matching_keys_in_range(LineairDB
 
 std::vector<KeyValue> LineairDBProxy::tx_get_matching_keys_and_values_in_range(LineairDBTransaction* tx,
                                                                                 const std::string& start_key,
-                                                                                const std::string& end_key) {
+                                                                                const std::string& end_key,
+                                                                                uint64_t row_limit,
+                                                                                bool reverse_scan) {
     int64_t tx_id = tx->get_tx_id();
     LOG_DEBUG("CLIENT: tx_get_matching_keys_and_values_in_range called with tx_id=%ld", tx_id);
     if (!connected_) {
@@ -468,6 +489,8 @@ std::vector<KeyValue> LineairDBProxy::tx_get_matching_keys_and_values_in_range(L
     request.set_table_name(tx->get_selected_table_name());
     request.set_start_key(start_key);
     request.set_end_key(end_key);
+    request.set_row_limit(row_limit);
+    request.set_reverse_scan(reverse_scan);
 
     // Attach pushed predicate filter if available
     const auto& filter = tx->get_pushed_filter();
@@ -1025,13 +1048,17 @@ bool LineairDBProxy::send_message(const std::string& serialized_request, std::st
 }
 
 template<typename RequestType, typename ResponseType>
-bool LineairDBProxy::send_protobuf_message(const RequestType& request, ResponseType& response, MessageType message_type) {
+bool LineairDBProxy::send_protobuf_message(const RequestType& request,
+                                           ResponseType& response,
+                                           MessageType message_type,
+                                           const std::string& meta) {
     // serialize request
     std::string serialized_request = request.SerializeAsString();
 
     // send message with header
     std::string serialized_response;
-    if (!send_message_with_header(serialized_request, serialized_response, message_type)) {
+    if (!send_message_with_header(serialized_request, serialized_response,
+                                  message_type, meta)) {
         LOG_ERROR("PROTOBUF_MESSAGE: Failed to send message with header");
         return false;
     }
@@ -1050,9 +1077,11 @@ bool LineairDBProxy::send_protobuf_message(const RequestType& request, ResponseT
 template<typename RequestType>
 bool LineairDBProxy::send_protobuf_recv_binary(const RequestType& request,
                                                 std::string& raw_response,
-                                                MessageType message_type) {
+                                                MessageType message_type,
+                                                const std::string& meta) {
     std::string serialized_request = request.SerializeAsString();
-    return send_message_with_header(serialized_request, raw_response, message_type);
+    return send_message_with_header(serialized_request, raw_response,
+                                    message_type, meta);
 }
 
 // Parse flat binary scan response into vector<KeyValue>.
@@ -1107,7 +1136,11 @@ std::vector<KeyValue> LineairDBProxy::parse_binary_kv_response(const std::string
 
 bool LineairDBProxy::send_message_with_header(const std::string& serialized_request,
                                               std::string& serialized_response,
-                                              MessageType message_type) {
+                                              MessageType message_type,
+                                              const std::string& meta) {
+    auto rpc_start_ts = std::chrono::steady_clock::now();
+    const uint32_t req_bytes = static_cast<uint32_t>(serialized_request.size());
+
     if (!connected_) {
         LOG_ERROR("SEND_MESSAGE: Not connected!");
         return false;
@@ -1177,5 +1210,13 @@ bool LineairDBProxy::send_message_with_header(const std::string& serialized_requ
     }
 
     LOG_DEBUG("SEND_MESSAGE: Message exchange completed successfully");
+    if (current_trace_ != nullptr && current_trace_->active()) {
+        auto rpc_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                          std::chrono::steady_clock::now() - rpc_start_ts)
+                          .count();
+        current_trace_->record(
+            message_type, static_cast<uint64_t>(rpc_us), req_bytes,
+            static_cast<uint32_t>(serialized_response.size()), meta);
+    }
     return true;
 }

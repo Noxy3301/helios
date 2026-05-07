@@ -12,6 +12,7 @@
 #include "lineairdb.pb.h"
 
 class LineairDBTransaction;
+class TxRpcTrace;
 
 struct KeyValue {
     std::string key;
@@ -109,19 +110,24 @@ public:
     };
     std::vector<BatchReadResult> tx_batch_read(LineairDBTransaction* tx,
                                                 const std::vector<std::string>& keys);
-    struct BatchWriteOp {
+    struct BatchOp {
+        enum class Type {
+            Write,
+            Delete,
+            SecondaryIndexWrite,
+            SecondaryIndexDelete
+        };
+        Type type;
         std::string key;
         std::string value;
-    };
-    struct BatchSecondaryIndexOp {
         std::string index_name;
         std::string secondary_key;
         std::string primary_key;
+        std::string table_name;
     };
     bool tx_batch_write(LineairDBTransaction* tx,
                         const std::string& table_name,
-                        const std::vector<BatchWriteOp>& writes,
-                        const std::vector<BatchSecondaryIndexOp>& si_writes);
+                        const std::vector<BatchOp>& ops);
 
     // secondary index operations
     std::vector<std::string> tx_read_secondary_index(LineairDBTransaction* tx,
@@ -147,7 +153,9 @@ public:
                                                            const std::string& end_key);
     std::vector<KeyValue> tx_get_matching_keys_and_values_in_range(LineairDBTransaction* tx,
                                                                     const std::string& start_key,
-                                                                    const std::string& end_key);
+                                                                    const std::string& end_key,
+                                                                    uint64_t row_limit = 0,
+                                                                    bool reverse_scan = false);
     std::vector<KeyValue> tx_get_matching_keys_and_values_from_prefix(LineairDBTransaction* tx,
                                                                        const std::string& prefix);
     // Zero-copy variant: parse binary response directly into caller-provided buffers.
@@ -201,22 +209,31 @@ public:
         return table_stats_cache_;
     }
 
+    // Route per-RPC measurements to the active transaction trace.
+    void set_current_trace(TxRpcTrace* trace) { current_trace_ = trace; }
+
 private:
     std::unordered_map<std::string, int64_t> table_stats_cache_;
     template<typename RequestType, typename ResponseType>
-    bool send_protobuf_message(const RequestType& request, ResponseType& response, MessageType message_type);
+    bool send_protobuf_message(const RequestType& request, ResponseType& response,
+                               MessageType message_type, const std::string& meta = "");
     // Send protobuf request, receive raw binary response
     template<typename RequestType>
-    bool send_protobuf_recv_binary(const RequestType& request, std::string& raw_response, MessageType message_type);
+    bool send_protobuf_recv_binary(const RequestType& request, std::string& raw_response,
+                                   MessageType message_type, const std::string& meta = "");
     // Parse flat binary scan response: [is_aborted:1B] [entries...] [sentinel: key_len=0]
     static std::vector<KeyValue> parse_binary_kv_response(const std::string& raw, bool& is_aborted);
     bool send_message(const std::string& serialized_request, std::string& serialized_response);
-    bool send_message_with_header(const std::string& serialized_request, std::string& serialized_response, MessageType message_type);
+    bool send_message_with_header(const std::string& serialized_request,
+                                  std::string& serialized_response,
+                                  MessageType message_type,
+                                  const std::string& meta = "");
 
     int socket_fd_;
     bool connected_;
     std::string host_;
     int port_;
+    TxRpcTrace* current_trace_ = nullptr;
 };
 
 #endif // LINEAIRDB_PROXY_H

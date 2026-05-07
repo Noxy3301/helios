@@ -117,6 +117,7 @@
 #include "sql/item_cmpfunc.h"
 #include "sql/item_func.h"
 #include "sql/sql_class.h"
+#include "sql/sql_lex.h"
 #include "sql/sql_plugin.h"
 #include "sql/table.h"
 #include "typelib.h"
@@ -137,6 +138,119 @@ constexpr unsigned char kKeyTypeDatetime = 0x30;
 constexpr unsigned char kKeyTypeOther = 0xF0;
 
 } // namespace
+
+// LIMIT and direction to pass to a range scan
+struct RangeScanLimit {
+  ha_rows row_limit{0};
+  bool reverse_scan{false};
+};
+
+// True when one ORDER BY item is exactly the requested keypart and direction
+static bool order_item_matches_key_part(ORDER *order, const KEY *key,
+                                        uint key_part_idx,
+                                        enum_order direction) {
+  // Validate the ORDER BY node shape before comparing fields
+  if (order == nullptr) return false;                // Missing ORDER node
+  if (key == nullptr) return false;                  // Missing key metadata
+  if (order->direction != direction) return false;   // Wrong direction
+
+  const bool key_part_exists = (key_part_idx < key->user_defined_key_parts);
+  if (!key_part_exists) return false;                // ORDER exceeds key
+
+  const bool has_order_item =
+      (order->item != nullptr && *(order->item) != nullptr);
+  if (!has_order_item) return false;                 // Missing ORDER item
+
+  // Resolve ORDER BY expression to a table field
+  Item *item = (*order->item)->real_item();
+  const bool is_field_item = (item->type() == Item::FIELD_ITEM);
+  if (!is_field_item) return false;                  // Not a bare field
+
+  // Compare the ORDER BY field with the expected keypart
+  Item_field *field_item = down_cast<Item_field *>(item);
+  const Field *order_field = field_item->field;
+  const Field *key_field = key->key_part[key_part_idx].field;
+  if (order_field == nullptr) return false;          // Missing ORDER field
+  if (key_field == nullptr) return false;            // Missing key field
+
+  return order_field->field_index() == key_field->field_index();
+}
+
+// True when ORDER BY is a prefix of the remaining key suffix in one direction
+static bool order_by_matches_key_suffix(Query_block *qb, const KEY *key,
+                                        uint matched_prefix,
+                                        enum_order direction) {
+  // LIMIT needs an explicit ORDER BY that matches scan order
+  if (qb == nullptr) return false;                   // Missing query block
+  if (key == nullptr) return false;                  // Missing key metadata
+  if (qb->order_list.elements == 0) return false;    // Unordered LIMIT
+
+  // If all keyparts are fixed, the scan can return at most one key
+  const uint key_parts = key->user_defined_key_parts;
+  if (matched_prefix >= key_parts) return true;      // Full key fixed
+
+  // ORDER BY must follow the unfixed key suffix in one direction
+  uint order_pos = 0;
+  for (ORDER *order = qb->order_list.first; order != nullptr;
+       order = order->next, ++order_pos) {
+    const uint key_part_idx = matched_prefix + order_pos;
+    if (!order_item_matches_key_part(order, key, key_part_idx, direction)) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+// Returns LIMIT and scan direction to push, or row_limit=0 to keep it local
+static RangeScanLimit range_scan_limit_for_order(
+    THD *thd, const KEY *key, uint matched_prefix, bool has_mysql_only_filter) {
+  RangeScanLimit scan_limit;
+
+  // Keep scans unlimited when MySQL must evaluate a filter the server lacks
+  if (has_mysql_only_filter) return scan_limit;        // Server may miss rows
+
+  // Validate this is a simple SELECT with a query expression to inspect
+  if (thd == nullptr) return scan_limit;               // Missing session
+  if (thd->lex == nullptr) return scan_limit;          // Missing SQL state
+  if (thd->lex->unit == nullptr) return scan_limit;    // Missing query unit
+  const bool is_select = (thd->lex->sql_command == SQLCOM_SELECT);
+  if (!is_select) return scan_limit;                   // Not SELECT
+
+  // LIMIT is only safe for one-table, non-aggregate reads
+  Query_expression *unit = thd->lex->unit;
+  Query_block *qb = unit->global_parameters();
+  if (qb == nullptr) return scan_limit;                // Missing query block
+  if (qb->leaf_table_count != 1) return scan_limit;    // Join needs root LIMIT
+  if (qb->is_explicitly_grouped()) return scan_limit;  // GROUP BY changes rows
+  if (qb->is_implicitly_grouped()) return scan_limit;  // Aggregate changes rows
+
+  // Extract LIMIT N and reject shapes the storage scan cannot represent
+  if (unit->offset_limit_cnt != 0) return scan_limit;  // OFFSET not supported
+  if (unit->select_limit_cnt == 0) return scan_limit;  // Empty LIMIT
+  const bool has_limit = (unit->select_limit_cnt != HA_POS_ERROR);
+  if (!has_limit) return scan_limit;                   // No LIMIT clause
+
+  // A full-key point lookup returns at most one row, so direction is irrelevant
+  const uint key_parts = key->user_defined_key_parts;
+  if (matched_prefix >= key_parts) {
+    scan_limit.row_limit = unit->select_limit_cnt;
+    return scan_limit;
+  }
+
+  // ASC uses the natural key order; DESC uses LineairDB ScanReverse
+  if (order_by_matches_key_suffix(qb, key, matched_prefix, ORDER_ASC)) {
+    scan_limit.row_limit = unit->select_limit_cnt;
+    return scan_limit;
+  }
+  if (order_by_matches_key_suffix(qb, key, matched_prefix, ORDER_DESC)) {
+    scan_limit.row_limit = unit->select_limit_cnt;
+    scan_limit.reverse_scan = true;
+    return scan_limit;
+  }
+
+  return scan_limit;
+}
 
 // LineairDB server connection target (GLOBAL sysvars backing storage)
 static char *srv_server_host = nullptr;
@@ -555,10 +669,8 @@ int ha_lineairdb::update_row(const uchar *old_data, uchar *new_data) {
     return HA_ERR_LOCK_DEADLOCK;
   }
 
-  tx->choose_table(db_table_name);
-  bool is_successful = tx->write(key, write_buffer_);
-  if (!is_successful)
-    return HA_ERR_LOCK_DEADLOCK;
+  // Buffer the base-row update; read/scan paths and commit flush it later.
+  tx->buffer_write(db_table_name, key, write_buffer_);
 
   if (tx->is_aborted()) {
     thd_mark_transaction_to_rollback(ha_thd(), 1);
@@ -615,10 +727,8 @@ int ha_lineairdb::delete_row(const uchar *buf) {
     return HA_ERR_LOCK_DEADLOCK;
   }
 
-  tx->choose_table(db_table_name);
-  bool is_successful = tx->delete_value(key);
-  if (!is_successful)
-    return HA_ERR_LOCK_DEADLOCK;
+  // Buffer the base-row delete; read/scan paths and commit flush it later.
+  tx->buffer_delete(db_table_name, key);
 
   if (tx->is_aborted()) {
     thd_mark_transaction_to_rollback(ha_thd(), 1);
@@ -630,16 +740,14 @@ int ha_lineairdb::delete_row(const uchar *buf) {
     if (i != table->s->primary_key) {
       std::string secondary_key = build_secondary_key_from_row(buf, key_info);
 
-      bool is_successful =
-          tx->delete_secondary_index(key_info.name, secondary_key, key);
-      if (!is_successful)
-        return HA_ERR_LOCK_DEADLOCK;
-
-      if (tx->is_aborted()) {
-        thd_mark_transaction_to_rollback(ha_thd(), 1);
-        return HA_ERR_LOCK_DEADLOCK;
-      }
+      tx->buffer_delete_secondary_index(db_table_name, key_info.name,
+                                        secondary_key, key);
     }
+  }
+
+  if (tx->is_aborted()) {
+    thd_mark_transaction_to_rollback(ha_thd(), 1);
+    return HA_ERR_LOCK_DEADLOCK;
   }
 
   tx->add_rowcount_delta(share, db_table_name, -1);
@@ -661,6 +769,11 @@ int ha_lineairdb::index_read_map(uchar *buf, const uchar *key,
   }
 
   tx->choose_table(db_table_name);
+  if (!pushed_filter_serialized_.empty()) {
+    tx->set_pushed_filter(pushed_filter_serialized_);
+  } else {
+    tx->clear_pushed_filter();
+  }
 
   KEY *key_info = &table->key_info[active_index];
 
@@ -993,15 +1106,110 @@ static bool serialize_item(const Item *item,
   }
 }
 
+// True when one predicate operand is an integer field or integer constant
+static bool item_is_limit_safe_scalar(const Item *item) {
+  // Accept only expression shapes the server can compare exactly for LIMIT.
+  if (item == nullptr) return false;                 // Missing expression
+  if (item->type() == Item::INT_ITEM) return true;   // Integer constant
+
+  // Field operands must be integer columns to avoid string/collation mismatch.
+  if (item->type() != Item::FIELD_ITEM) return false; // Not a field
+  const Item_field *field_item = down_cast<const Item_field *>(item);
+  if (field_item->field == nullptr) return false;    // Missing field metadata
+  return field_item->field->result_type() == INT_RESULT;
+}
+
+// True when WHERE is an AND tree of simple integer comparisons
+static bool item_is_limit_safe_filter(const Item *item) {
+  if (item == nullptr) return true;                  // No WHERE to check
+
+  // AND is safe to recurse; OR is kept local until we add stricter tests.
+  if (item->type() == Item::COND_ITEM) {
+    // Keep LIMIT filters to AND trees; OR can be added after stricter tests.
+    auto *cond_item =
+        const_cast<Item_cond *>(down_cast<const Item_cond *>(item));
+    if (cond_item->functype() != Item_func::COND_AND_FUNC) return false;
+    for (Item &child : *cond_item->argument_list()) {
+      if (!item_is_limit_safe_filter(&child)) return false;
+    }
+    return true;
+  }
+
+  // Leaf predicates must be binary comparisons.
+  if (item->type() != Item::FUNC_ITEM) return false; // Not a comparison
+  const Item_func *func = down_cast<const Item_func *>(item);
+  switch (func->functype()) {
+    case Item_func::EQ_FUNC:
+    case Item_func::NE_FUNC:
+    case Item_func::LT_FUNC:
+    case Item_func::LE_FUNC:
+    case Item_func::GT_FUNC:
+    case Item_func::GE_FUNC:
+      break;
+    default:
+      return false;                                  // Complex predicate
+  }
+
+  // Both sides must be safe scalar operands.
+  if (func->argument_count() != 2) return false;     // Binary compare only
+  Item **args = func->arguments();
+  return item_is_limit_safe_scalar(args[0]) &&
+         item_is_limit_safe_scalar(args[1]);
+}
+
+// Push the SELECT WHERE into this transaction if LIMIT will depend on it
+static bool prepare_select_filter_for_tx(THD *thd, TABLE *table,
+                                         LineairDBTransaction *tx,
+                                         std::string *serialized_filter) {
+  // Check the handler state needed to inspect the current SELECT.
+  if (tx == nullptr) return false;                   // Missing transaction
+  if (thd == nullptr) return false;                  // Missing session
+  const bool has_table = (table != nullptr && table->s != nullptr);
+  if (!has_table) return false;                      // Missing table
+  if (thd->lex == nullptr) return false;             // Missing SQL state
+  if (thd->lex->unit == nullptr) return false;       // Missing query unit
+
+  // Read the current SELECT WHERE from MySQL's query block.
+  Query_block *qb = thd->lex->unit->global_parameters();
+  if (qb == nullptr) return false;                   // Missing query block
+
+  const Item *where = qb->where_cond();
+  if (where == nullptr) {
+    if (serialized_filter != nullptr) serialized_filter->clear();
+    tx->clear_pushed_filter();
+    return true;                                     // No WHERE to push
+  }
+
+  // Convert WHERE into the existing predicate protobuf format.
+  LineairDB::Protocol::PushedPredicate predicate;
+  predicate.set_num_columns(table->s->fields);
+  if (!serialize_item(where, predicate.mutable_expr())) {
+    if (serialized_filter != nullptr) serialized_filter->clear();
+    tx->clear_pushed_filter();
+    return false;                                    // MySQL must filter
+  }
+
+  // Attach the encoded filter to the transaction for the next scan RPC.
+  std::string encoded;
+  predicate.SerializeToString(&encoded);
+  if (serialized_filter != nullptr) {
+    *serialized_filter = encoded;
+  }
+  tx->set_pushed_filter(encoded);
+  return item_is_limit_safe_filter(where);
+}
+
 const Item *ha_lineairdb::cond_push(const Item *cond) {
   DBUG_TRACE;
   pushed_filter_serialized_.clear();
+  has_unpushed_filter_ = false;
   if (!cond || !table) return cond;
 
   LineairDB::Protocol::PushedPredicate predicate;
   predicate.set_num_columns(table->s->fields);
   if (!serialize_item(cond, predicate.mutable_expr())) {
     // Serialization failed → no PP, MySQL evaluates everything
+    has_unpushed_filter_ = true;
     return cond;
   }
   predicate.SerializeToString(&pushed_filter_serialized_);
@@ -1496,6 +1704,7 @@ int ha_lineairdb::external_lock(THD *thd, int lock_type) {
   if (tx_is_ready_to_commit) {
     // Drop the predicate pushed by cond_push() so the next statement starts clean.
     pushed_filter_serialized_.clear();
+    has_unpushed_filter_ = false;
     LineairDBThdCtx **ctx_slot = reinterpret_cast<LineairDBThdCtx **>(
         thd_ha_data(thd, lineairdb_hton));
     if (ctx_slot != nullptr && *ctx_slot != nullptr &&
@@ -1506,7 +1715,13 @@ int ha_lineairdb::external_lock(THD *thd, int lock_type) {
   }
 
   // get_transaction() will automatically start the transaction if needed
-  (void)get_transaction(thd);
+  LineairDBTransaction *tx = get_transaction(thd);
+  if (tx != nullptr) {
+    const LEX_CSTRING &q = thd->query();
+    if (q.str != nullptr && q.length > 0) {
+      tx->on_stmt_boundary(std::string(q.str, q.length));
+    }
+  }
 
   // Stats sync: apply cached table row counts from the server (received
   // in BEGIN/END responses) so the optimizer sees correct cardinalities.
@@ -2457,8 +2672,18 @@ int ha_lineairdb::execute_same_key_materialize(uchar *buf,
   const std::string &prefix_end = current_plan_.same_group_end_serialized;
 
   if (current_plan_.is_primary) {
+    // Push LIMIT only when the server can also apply the SELECT WHERE.
+    const KEY *key = &table->key_info[active_index];
+    const bool filter_ready = prepare_select_filter_for_tx(
+        ha_thd(), table, tx, &pushed_filter_serialized_);
+    const RangeScanLimit scan_limit = range_scan_limit_for_order(
+        ha_thd(), key, current_plan_.used_key_parts,
+        has_unpushed_filter_ || !filter_ready);
+
+    // Same-key scans can use ASC or DESC LIMIT when ORDER BY matches the key.
     auto key_values = tx->get_matching_keys_and_values_in_range(
-        prefix, prefix_end);
+        prefix, prefix_end, static_cast<uint64_t>(scan_limit.row_limit),
+        scan_limit.reverse_scan);
     for (auto &kv : key_values) {
       secondary_index_results_.push_back(kv.first);
       secondary_index_payloads_.push_back(std::move(kv.second));
@@ -2555,8 +2780,18 @@ int ha_lineairdb::execute_range_materialize(uchar *buf,
 
   // execute scan
   if (current_plan_.is_primary) {
+    // Push LIMIT only when the server can also apply the SELECT WHERE.
+    const KEY *key = &table->key_info[active_index];
+    const bool filter_ready = prepare_select_filter_for_tx(
+        ha_thd(), table, tx, &pushed_filter_serialized_);
+    const RangeScanLimit scan_limit = range_scan_limit_for_order(
+        ha_thd(), key, current_plan_.used_key_parts,
+        has_unpushed_filter_ || !filter_ready);
+
+    // Range scans can use ASC or DESC LIMIT when ORDER BY matches the key.
     auto key_values = tx->get_matching_keys_and_values_in_range(
-        effective_start, effective_end);
+        effective_start, effective_end,
+        static_cast<uint64_t>(scan_limit.row_limit), scan_limit.reverse_scan);
     for (auto &kv : key_values) {
       secondary_index_results_.push_back(kv.first);
       secondary_index_payloads_.push_back(std::move(kv.second));
@@ -2621,7 +2856,7 @@ int ha_lineairdb::execute_prev_key(uchar *buf, LineairDBTransaction *tx) {
 
 /**
  * @brief kPrefixLast: last row in prefix range
- * @note for now, return the last row in materialize mode (slow but correct)
+ * @note Materialize mode returns the last row directly (slow but correct)
  */
 int ha_lineairdb::execute_prefix_last(uchar *buf, LineairDBTransaction *tx) {
   if (current_plan_.find_flag == HA_READ_PREFIX_LAST_OR_PREV) {
@@ -2629,10 +2864,27 @@ int ha_lineairdb::execute_prefix_last(uchar *buf, LineairDBTransaction *tx) {
     const std::string &prefix_end = current_plan_.same_group_end_serialized;
 
     if (current_plan_.is_primary) {
-      auto key_values =
-          tx->get_matching_keys_and_values_in_range(prefix, prefix_end);
+      // Push LIMIT only when the server can also apply the SELECT WHERE.
+      const KEY *key = &table->key_info[active_index];
+      const bool filter_ready = prepare_select_filter_for_tx(
+          ha_thd(), table, tx, &pushed_filter_serialized_);
+      const RangeScanLimit scan_limit = range_scan_limit_for_order(
+          ha_thd(), key, current_plan_.used_key_parts,
+          has_unpushed_filter_ || !filter_ready);
+      const bool push_desc_limit =
+          (scan_limit.row_limit == 1 && scan_limit.reverse_scan);
+
+      // Prefix-last can use reverse scan for ORDER BY ... DESC LIMIT 1.
+      auto key_values = tx->get_matching_keys_and_values_in_range(
+          prefix, prefix_end,
+          push_desc_limit ? static_cast<uint64_t>(scan_limit.row_limit) : 0,
+          push_desc_limit);
       if (key_values.empty()) {
-        key_values = tx->get_matching_keys_and_values_in_range("", prefix);
+        // HA_READ_PREFIX_LAST_OR_PREV may fall back to the previous prefix.
+        key_values = tx->get_matching_keys_and_values_in_range(
+            "", prefix,
+            push_desc_limit ? static_cast<uint64_t>(scan_limit.row_limit) : 0,
+            push_desc_limit);
       }
       for (auto &kv : key_values) {
         secondary_index_results_.push_back(kv.first);
@@ -2663,9 +2915,22 @@ int ha_lineairdb::execute_prefix_last(uchar *buf, LineairDBTransaction *tx) {
 
   // materialize mode
   if (current_plan_.is_primary) {
+    // Push LIMIT only when the server can also apply the SELECT WHERE.
+    const KEY *key = &table->key_info[active_index];
+    const bool filter_ready = prepare_select_filter_for_tx(
+        ha_thd(), table, tx, &pushed_filter_serialized_);
+    const RangeScanLimit scan_limit = range_scan_limit_for_order(
+        ha_thd(), key, current_plan_.used_key_parts,
+        has_unpushed_filter_ || !filter_ready);
+    const bool push_desc_limit =
+        (scan_limit.row_limit == 1 && scan_limit.reverse_scan);
+
+    // Prefix-last materialization only uses DESC LIMIT 1.
     auto key_values = tx->get_matching_keys_and_values_in_range(
         current_plan_.same_group_prefix_serialized,
-        current_plan_.same_group_end_serialized);
+        current_plan_.same_group_end_serialized,
+        push_desc_limit ? static_cast<uint64_t>(scan_limit.row_limit) : 0,
+        push_desc_limit);
     for (auto &kv : key_values) {
       secondary_index_results_.push_back(kv.first);
       secondary_index_payloads_.push_back(std::move(kv.second));
