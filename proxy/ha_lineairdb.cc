@@ -1106,6 +1106,57 @@ static bool serialize_item(const Item *item,
   }
 }
 
+// True when one predicate operand is an integer field or integer constant
+static bool item_is_limit_safe_scalar(const Item *item) {
+  // Accept only expression shapes the server can compare exactly for LIMIT.
+  if (item == nullptr) return false;                 // Missing expression
+  if (item->type() == Item::INT_ITEM) return true;   // Integer constant
+
+  // Field operands must be integer columns to avoid string/collation mismatch.
+  if (item->type() != Item::FIELD_ITEM) return false; // Not a field
+  const Item_field *field_item = down_cast<const Item_field *>(item);
+  if (field_item->field == nullptr) return false;    // Missing field metadata
+  return field_item->field->result_type() == INT_RESULT;
+}
+
+// True when WHERE is an AND tree of simple integer comparisons
+static bool item_is_limit_safe_filter(const Item *item) {
+  if (item == nullptr) return true;                  // No WHERE to check
+
+  // AND is safe to recurse; OR is kept local until we add stricter tests.
+  if (item->type() == Item::COND_ITEM) {
+    // Keep LIMIT filters to AND trees; OR can be added after stricter tests.
+    auto *cond_item =
+        const_cast<Item_cond *>(down_cast<const Item_cond *>(item));
+    if (cond_item->functype() != Item_func::COND_AND_FUNC) return false;
+    for (Item &child : *cond_item->argument_list()) {
+      if (!item_is_limit_safe_filter(&child)) return false;
+    }
+    return true;
+  }
+
+  // Leaf predicates must be binary comparisons.
+  if (item->type() != Item::FUNC_ITEM) return false; // Not a comparison
+  const Item_func *func = down_cast<const Item_func *>(item);
+  switch (func->functype()) {
+    case Item_func::EQ_FUNC:
+    case Item_func::NE_FUNC:
+    case Item_func::LT_FUNC:
+    case Item_func::LE_FUNC:
+    case Item_func::GT_FUNC:
+    case Item_func::GE_FUNC:
+      break;
+    default:
+      return false;                                  // Complex predicate
+  }
+
+  // Both sides must be safe scalar operands.
+  if (func->argument_count() != 2) return false;     // Binary compare only
+  Item **args = func->arguments();
+  return item_is_limit_safe_scalar(args[0]) &&
+         item_is_limit_safe_scalar(args[1]);
+}
+
 // Push the SELECT WHERE into this transaction if LIMIT will depend on it
 static bool prepare_select_filter_for_tx(THD *thd, TABLE *table,
                                          LineairDBTransaction *tx,
@@ -1145,7 +1196,7 @@ static bool prepare_select_filter_for_tx(THD *thd, TABLE *table,
     *serialized_filter = encoded;
   }
   tx->set_pushed_filter(encoded);
-  return true;
+  return item_is_limit_safe_filter(where);
 }
 
 const Item *ha_lineairdb::cond_push(const Item *cond) {
@@ -2821,9 +2872,9 @@ int ha_lineairdb::execute_prefix_last(uchar *buf, LineairDBTransaction *tx) {
           ha_thd(), key, current_plan_.used_key_parts,
           has_unpushed_filter_ || !filter_ready);
       const bool push_desc_limit =
-          (scan_limit.row_limit > 0 && scan_limit.reverse_scan);
+          (scan_limit.row_limit == 1 && scan_limit.reverse_scan);
 
-      // Prefix-last can use reverse scan for ORDER BY ... DESC LIMIT N.
+      // Prefix-last can use reverse scan for ORDER BY ... DESC LIMIT 1.
       auto key_values = tx->get_matching_keys_and_values_in_range(
           prefix, prefix_end,
           push_desc_limit ? static_cast<uint64_t>(scan_limit.row_limit) : 0,
@@ -2872,9 +2923,9 @@ int ha_lineairdb::execute_prefix_last(uchar *buf, LineairDBTransaction *tx) {
         ha_thd(), key, current_plan_.used_key_parts,
         has_unpushed_filter_ || !filter_ready);
     const bool push_desc_limit =
-        (scan_limit.row_limit > 0 && scan_limit.reverse_scan);
+        (scan_limit.row_limit == 1 && scan_limit.reverse_scan);
 
-    // Prefix-last materialization only uses DESC LIMIT; ASC would change last.
+    // Prefix-last materialization only uses DESC LIMIT 1.
     auto key_values = tx->get_matching_keys_and_values_in_range(
         current_plan_.same_group_prefix_serialized,
         current_plan_.same_group_end_serialized,
