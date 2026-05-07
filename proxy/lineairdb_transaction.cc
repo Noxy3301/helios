@@ -210,7 +210,11 @@ LineairDBTransaction::get_matching_keys_and_values_in_range(std::string start_ke
                                                             uint64_t row_limit,
                                                             bool reverse_scan) {
   if (table_is_not_chosen()) return {};
-  flush_write_buffer_for_table(db_table_key);
+  const bool can_merge_local_rows = (row_limit == 0 && pushed_filter_.empty());
+  // LIMIT / pushed filter scans must see only server-filtered rows
+  if (!can_merge_local_rows) {
+    flush_write_buffer_for_table(db_table_key);
+  }
 
   auto results = lineairdb_proxy->tx_get_matching_keys_and_values_in_range(
       this, start_key, end_key, row_limit, reverse_scan);
@@ -219,19 +223,31 @@ LineairDBTransaction::get_matching_keys_and_values_in_range(std::string start_ke
   for (const auto& kv : results) {
     pairs.emplace_back(kv.key, kv.value);
   }
+  // Merge unflushed own writes after the server has validated the range
+  if (can_merge_local_rows) {
+    merge_pending_rows_into_range_scan(pairs, start_key, end_key, reverse_scan);
+  }
   return pairs;
 }
 
 std::vector<std::pair<std::string, std::string>>
 LineairDBTransaction::get_matching_keys_and_values_from_prefix(std::string prefix) {
   if (table_is_not_chosen()) return {};
-  flush_write_buffer_for_table(db_table_key);
+  const bool can_merge_local_rows = pushed_filter_.empty();
+  // Pushed filter scans must see only server-filtered rows
+  if (!can_merge_local_rows) {
+    flush_write_buffer_for_table(db_table_key);
+  }
 
   auto results = lineairdb_proxy->tx_get_matching_keys_and_values_from_prefix(this, prefix);
 
   std::vector<std::pair<std::string, std::string>> pairs;
   for (const auto& kv : results) {
     pairs.emplace_back(kv.key, kv.value);
+  }
+  // Merge unflushed own writes after the server has validated the prefix
+  if (can_merge_local_rows) {
+    merge_pending_rows_into_prefix_scan(pairs, prefix);
   }
   return pairs;
 }
@@ -476,6 +492,87 @@ void LineairDBTransaction::drop_local_read(const std::string& table_name,
     if (it->table_name == table_name && it->key == key) {
       local_read_set_.erase(it);
       return;
+    }
+  }
+}
+
+bool LineairDBTransaction::key_is_in_range(const std::string& key,
+                                           const std::string& start_key,
+                                           const std::string& end_key) const {
+  // LineairDB ranges are [start_key, end_key)
+  if (key < start_key) return false;
+  if (!end_key.empty() && key >= end_key) return false;
+  return true;
+}
+
+bool LineairDBTransaction::key_starts_with(const std::string& key,
+                                           const std::string& prefix) const {
+  // Prefix scans use the encoded primary-key prefix
+  if (key.size() < prefix.size()) return false;
+  return key.compare(0, prefix.size(), prefix) == 0;
+}
+
+void LineairDBTransaction::remove_scan_row(
+    std::vector<std::pair<std::string, std::string>>& rows,
+    const std::string& key) const {
+  // Local write/delete replaces any server row with the same key
+  for (auto it = rows.begin(); it != rows.end(); ++it) {
+    if (it->first == key) {
+      rows.erase(it);
+      return;
+    }
+  }
+}
+
+void LineairDBTransaction::insert_scan_row_in_order(
+    std::vector<std::pair<std::string, std::string>>& rows,
+    const std::string& key, const std::string& value,
+    bool reverse_scan) const {
+  // Keep the materialized scan result in key order
+  for (auto it = rows.begin(); it != rows.end(); ++it) {
+    if ((!reverse_scan && key < it->first) || (reverse_scan && key > it->first)) {
+      rows.insert(it, {key, value});
+      return;
+    }
+  }
+  rows.emplace_back(key, value);
+}
+
+void LineairDBTransaction::merge_pending_rows_into_range_scan(
+    std::vector<std::pair<std::string, std::string>>& rows,
+    const std::string& start_key, const std::string& end_key,
+    bool reverse_scan) const {
+  // Server scan validates the range; proxy only adds its unflushed row ops
+  for (const auto& op : write_buffer_ops_) {
+    if (op.table_name != db_table_key) continue;
+    if (op.type != LineairDBProxy::BatchOp::Type::Write &&
+        op.type != LineairDBProxy::BatchOp::Type::Delete) {
+      continue;
+    }
+    if (!key_is_in_range(op.key, start_key, end_key)) continue;
+
+    remove_scan_row(rows, op.key);
+    if (op.type == LineairDBProxy::BatchOp::Type::Write) {
+      insert_scan_row_in_order(rows, op.key, op.value, reverse_scan);
+    }
+  }
+}
+
+void LineairDBTransaction::merge_pending_rows_into_prefix_scan(
+    std::vector<std::pair<std::string, std::string>>& rows,
+    const std::string& prefix) const {
+  // Prefix scans are ASC, so inserted local rows keep ASC key order
+  for (const auto& op : write_buffer_ops_) {
+    if (op.table_name != db_table_key) continue;
+    if (op.type != LineairDBProxy::BatchOp::Type::Write &&
+        op.type != LineairDBProxy::BatchOp::Type::Delete) {
+      continue;
+    }
+    if (!key_starts_with(op.key, prefix)) continue;
+
+    remove_scan_row(rows, op.key);
+    if (op.type == LineairDBProxy::BatchOp::Type::Write) {
+      insert_scan_row_in_order(rows, op.key, op.value, false);
     }
   }
 }
