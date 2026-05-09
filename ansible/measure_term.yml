@@ -46,8 +46,14 @@
     export SDKMAN_DIR="$HOME/.sdkman"
     [ -s "$SDKMAN_DIR/bin/sdkman-init.sh" ] && source "$SDKMAN_DIR/bin/sdkman-init.sh"
     cd ~/ordo/third_party/benchbase/benchbase-mysql
+    out_dir="{{ sample_dir | default('/tmp/metrics') }}/bench-{{ run_id | default('run') }}"
+    dest="$out_dir/execute_{{ bench_term }}"
+    mkdir -p "$dest"
+    java_status=0
     output=$(java -jar benchbase.jar -b {{ bench_type }} -c "$CFG" \
-      --create=false --load=false --execute=true 2>&1)
+      --create=false --load=false --execute=true 2>&1) || java_status=$?
+    printf '%s\n' "$output" > "$dest/benchbase.out"
+    echo "benchbase_exit_status=$java_status" > "$dest/benchbase.status"
     rm -f "$CFG"
 
     # Parse: "= X requests/sec (throughput), Y requests/sec (goodput)"
@@ -56,6 +62,10 @@
     goodput=$(echo "$line" | sed -n 's/.*, \([0-9.]*\) requests\/sec (goodput).*/\1/p')
 
     if [ -n "$throughput" ]; then
+      if [ "$java_status" -ne 0 ]; then
+        echo "BenchBase exit status: $java_status" >&2
+        echo "$output" | tail -80 >&2
+      fi
       echo "{{ bench_term }},$throughput,$goodput"
     else
       echo "PARSE_ERROR: could not extract throughput" >&2

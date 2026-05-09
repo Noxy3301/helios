@@ -199,8 +199,12 @@
       shell: |
         mkdir -p {{ sample_dir }}
         nohup bash -c '
-        while ! pgrep -f "[b]enchbase.jar" > /dev/null 2>&1; do sleep 1; done
-        pid=$(pgrep -f "[b]enchbase.jar" | head -n1)
+        pid=""
+        while [ -z "$pid" ]; do
+          pid=$(ps -eo pid=,comm=,args= | awk '"'"'$2 == "java" && index($0, "benchbase.jar") { print $1; exit }'"'"')
+          [ -z "$pid" ] && sleep 1
+        done
+        echo "benchbase_java_pid=$pid"
         pidstat -u -w -p "$pid" {{ sample_interval }}
         ' > {{ sample_dir }}/pidstat-bench-{{ run_id }}.log 2>&1 &
         echo $! > {{ sample_dir }}/pidstat-bench-{{ run_id }}.pid

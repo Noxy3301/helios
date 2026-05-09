@@ -518,6 +518,10 @@ Examples:
 
     # Cluster topology overrides
     parser.add_argument("--mysql-count", type=int, default=None, help="Override MySQL node count")
+    parser.add_argument("--mysql-instance-type", default=None, help="Override MySQL instance type")
+    parser.add_argument("--haproxy-instance-type", default=None, help="Override HAProxy instance type")
+    parser.add_argument("--benchbase-count", type=int, default=None, help="Override BenchBase node count")
+    parser.add_argument("--benchbase-instance-type", default=None, help="Override BenchBase instance type")
     # Control options
     parser.add_argument("--branch", default=None, help="Git branch to checkout on remote nodes (default: keep current)")
     parser.add_argument("--on-demand", action="store_true", help="Skip spot, launch all instances as on-demand")
@@ -531,6 +535,14 @@ Examples:
     # Apply cluster overrides before building machine_spec
     if args.mysql_count is not None:
         CLUSTER["mysql"]["count"] = args.mysql_count
+    if args.mysql_instance_type is not None:
+        CLUSTER["mysql"]["instance_type"] = args.mysql_instance_type
+    if args.haproxy_instance_type is not None:
+        CLUSTER["haproxy"]["instance_type"] = args.haproxy_instance_type
+    if args.benchbase_count is not None:
+        CLUSTER["benchbase"]["count"] = args.benchbase_count
+    if args.benchbase_instance_type is not None:
+        CLUSTER["benchbase"]["instance_type"] = args.benchbase_instance_type
 
     machine_spec = build_machine_spec()
 
