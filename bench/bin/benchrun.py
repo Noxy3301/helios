@@ -40,6 +40,7 @@ SCRIPTS_DIR = Path(__file__).resolve().parents[2] / "scripts"
 ROOT = Path(__file__).resolve().parents[2]
 BENCHBASE_DIR = ROOT / "third_party" / "benchbase" / "benchbase-mysql"
 MYSQL_BIN = ROOT / "build" / "runtime_output_directory" / "mysql"
+LINEAIRDB_LOG_DIR = ROOT / "lineairdb_logs"
 
 YCSB_PROFILES = {
     "a": "50,0,0,50,0,0",
@@ -148,6 +149,30 @@ def stop_all_servers():
             Path(f).unlink()
         except FileNotFoundError:
             pass
+
+
+def cleanup_lineairdb_logs():
+    """Remove local LineairDB log files after managed benchmark runs."""
+    if not LINEAIRDB_LOG_DIR.exists():
+        return
+
+    if _find_pid("/build/server/lineairdb-server"):
+        print("  Skipping lineairdb_logs cleanup: lineairdb-server is still running")
+        return
+
+    removed = 0
+    for path in LINEAIRDB_LOG_DIR.iterdir():
+        try:
+            if path.is_dir() and not path.is_symlink():
+                shutil.rmtree(path)
+            else:
+                path.unlink()
+            removed += 1
+        except FileNotFoundError:
+            continue
+
+    if removed:
+        print(f"  Cleaned lineairdb_logs ({removed} entries)")
 
 
 def mysql_cmd(port, host, sql):
@@ -613,6 +638,8 @@ def main():
     parser.add_argument("--no-exec", action="store_true", help="Run setup only, skip execute phase")
     parser.add_argument("--external-server", action="store_true",
                         help="Skip auto start/stop of lineairdb-server and mysqld (assume already running)")
+    parser.add_argument("--keep-lineairdb-logs", action="store_true",
+                        help="Keep lineairdb_logs after the benchmark")
     args = parser.parse_args()
 
     # Validate
@@ -721,6 +748,8 @@ def main():
     finally:
         if managed:
             stop_all_servers()
+        if not args.keep_lineairdb_logs:
+            cleanup_lineairdb_logs()
 
 
 def _run_bench(args, config_work, thread_list, result_base):
