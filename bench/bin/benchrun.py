@@ -526,6 +526,32 @@ def _parse_sar_w(path):
     return samples
 
 
+def _parse_mpstat_cpu_count(path):
+    """Read the measured host CPU count from an mpstat header."""
+    try:
+        for line in path.read_text().splitlines():
+            m = re.search(r"\((\d+) CPU\)", line)
+            if m:
+                return int(m.group(1))
+    except OSError:
+        pass
+    return None
+
+
+def _detect_metrics_cpu_count(thread_dirs):
+    """Use the benchmark host CPU count, not the plotting host CPU count."""
+    import multiprocessing
+
+    for td in thread_dirs:
+        mpstat = td / "metrics" / "mpstat.log"
+        if not mpstat.exists():
+            continue
+        nproc = _parse_mpstat_cpu_count(mpstat)
+        if nproc:
+            return nproc
+    return multiprocessing.cpu_count()
+
+
 def _plot_metrics(result_base, plot_dir):
     """Plot stacked CPU area + system-wide cswch/s as a 2-row dashboard."""
     import multiprocessing
@@ -537,7 +563,7 @@ def _plot_metrics(result_base, plot_dir):
     if not thread_dirs:
         return
 
-    nproc = multiprocessing.cpu_count()
+    nproc = _detect_metrics_cpu_count(thread_dirs)
     cpu_max = nproc * 100
 
     terminals_list = []
