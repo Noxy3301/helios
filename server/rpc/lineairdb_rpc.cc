@@ -5,6 +5,8 @@
 #include <iostream>
 #include <vector>
 #include <cstring>
+#include <algorithm>
+#include <cstdlib>
 
 #include "lineairdb.pb.h"
 
@@ -31,6 +33,187 @@ void to_proto_range_versions(
             out->add_result_primary_keys(key);
         }
     }
+}
+
+// Copy exact index-entry snapshots into the proto repeated field.
+void to_proto_index_reads(
+    const std::vector<LineairDB::ExternalIndexValidationEntry>& in,
+    google::protobuf::RepeatedPtrField<
+        LineairDB::Protocol::IndexValidationEntry>* out_entries) {
+    for (const auto& entry : in) {
+        auto* out = out_entries->Add();
+        out->set_table_name(entry.table_name);
+        out->set_index_name(entry.index_name);
+        out->set_key(entry.key);
+        out->set_tid(entry.tid);
+        out->set_found(entry.found);
+    }
+}
+
+// Bump the byte string to its lexicographic successor; returns empty on overflow.
+std::string next_lexicographic_key(std::string key) {
+    for (size_t i = key.size(); i-- > 0;) {
+        auto byte = static_cast<unsigned char>(key[i]);
+        if (byte != 0xFF) {
+            key[i] = static_cast<char>(byte + 1);
+            key.resize(i + 1);
+            return key;
+        }
+    }
+    return {};
+}
+
+// Return the bytes of column `column_index` from a serialized MySQL row payload.
+std::string_view extract_value_column(const std::string& row,
+                                      int column_index) {
+    size_t offset = 0;
+    int field_index = 0;
+    const int target_field = column_index + 1; // field 0 is null flags.
+
+    while (offset < row.size()) {
+        const auto byte_size = static_cast<unsigned char>(row[offset]);
+        ++offset;
+        if (byte_size == 0xFF) {
+            if (field_index == target_field) return {};
+            ++field_index;
+            continue;
+        }
+        if (offset + byte_size > row.size()) return {};
+
+        size_t value_length = 0;
+        for (unsigned int i = 0; i < byte_size; ++i) {
+            value_length |= static_cast<size_t>(
+                static_cast<unsigned char>(row[offset + i])) << (8 * i);
+        }
+        offset += byte_size;
+        if (offset + value_length > row.size()) return {};
+
+        if (field_index == target_field) {
+            return std::string_view(row.data() + offset, value_length);
+        }
+        offset += value_length;
+        ++field_index;
+    }
+    return {};
+}
+
+// Build the int-keyed primary key bytes. Mirrors the layout produced by
+// ha_lineairdb::append_key_part_encoding, so server-side read-plan scan
+// boundaries match what the proxy wrote into LineairDB:
+//   [0x00 not-null marker | 0x10 INT type tag | 2-byte big-endian length=4
+//    | 4-byte signed int with top bit flipped]
+// Flipping the top bit makes byte-wise lexicographic sort agree with signed
+// integer order, so Masstree can sort without knowing the column type.
+// TODO: factor this and ha_lineairdb's encoder into a shared encoder so the
+// two ends cannot drift.
+std::string encode_int_key_part(int64_t value) {
+    const auto encoded = static_cast<uint32_t>(static_cast<int32_t>(value)) ^
+                         0x80000000U;
+    std::string out;
+    out.push_back(static_cast<char>(0x00));
+    out.push_back(static_cast<char>(0x10));
+    out.push_back(static_cast<char>(0x00));
+    out.push_back(static_cast<char>(0x04));
+    out.push_back(static_cast<char>((encoded >> 24) & 0xFF));
+    out.push_back(static_cast<char>((encoded >> 16) & 0xFF));
+    out.push_back(static_cast<char>((encoded >> 8) & 0xFF));
+    out.push_back(static_cast<char>(encoded & 0xFF));
+    return out;
+}
+
+// Parse a decimal-string column and encode it as int-keyed primary key bytes.
+std::string encode_column_as_int_key(std::string_view column,
+                                     int64_t int_delta) {
+    std::string tmp(column);
+    int64_t value = std::strtoll(tmp.c_str(), nullptr, 10);
+    return encode_int_key_part(value + int_delta);
+}
+
+// Pick the source byte string for a binding (from a step's scan key, scan value, or value).
+const std::string* select_source_bytes(
+    const LineairDB::Protocol::TxExecuteReadPlan::StepResult& source,
+    const LineairDB::Protocol::TxExecuteReadPlan::KeyBinding& binding,
+    bool from_key, int row_override) {
+    if (from_key) {
+        if (source.scan_keys_size() == 0) return nullptr;
+        int row = row_override >= 0 ? row_override : binding.source_row();
+        if (binding.use_midpoint()) row = (source.scan_keys_size() - 1) / 2;
+        row = std::min(row, source.scan_keys_size() - 1);
+        return &source.scan_keys(row);
+    }
+
+    if (source.scan_values_size() > 0) {
+        int row = row_override >= 0 ? row_override : binding.source_row();
+        if (binding.use_midpoint()) row = (source.scan_values_size() - 1) / 2;
+        row = std::min(row, source.scan_values_size() - 1);
+        return &source.scan_values(row);
+    }
+    return &source.value();
+}
+
+// Compose a read-plan key prefix plus all bindings into the actual scan key.
+std::string build_plan_key(
+    const std::string& prefix,
+    const google::protobuf::RepeatedPtrField<
+        LineairDB::Protocol::TxExecuteReadPlan::KeyBinding>& bindings,
+    const std::vector<LineairDB::Protocol::TxExecuteReadPlan::StepResult*>&
+        previous_results,
+    int row_override = -1,
+    bool *complete = nullptr) {
+    if (complete != nullptr) *complete = true;
+    std::string key = prefix;
+    for (const auto& binding : bindings) {
+        const int source_step = static_cast<int>(binding.source_step());
+        if (source_step < 0 ||
+            source_step >= static_cast<int>(previous_results.size())) {
+            if (complete != nullptr) *complete = false;
+            continue;
+        }
+
+        const auto& source = *previous_results[source_step];
+        std::string scratch;
+        std::string_view extracted;
+        if (binding.source_column() > 0) {
+            const std::string* bytes =
+                select_source_bytes(source, binding, false, row_override);
+            if (bytes != nullptr) {
+                extracted =
+                    extract_value_column(*bytes, binding.source_column() - 1);
+                if (binding.column_as_int_key()) {
+                    scratch =
+                        encode_column_as_int_key(extracted,
+                                                 binding.int_delta());
+                    extracted = scratch;
+                }
+            } else if (complete != nullptr) {
+                *complete = false;
+            }
+        } else {
+            const std::string* bytes =
+                select_source_bytes(source, binding, binding.from_key(),
+                                    row_override);
+            if (bytes != nullptr) {
+                uint32_t offset = binding.source_offset();
+                uint32_t length = binding.source_length();
+                if (offset < bytes->size()) {
+                    if (length == 0) length = bytes->size() - offset;
+                    length = std::min<uint32_t>(
+                        length, static_cast<uint32_t>(bytes->size() - offset));
+                    extracted = std::string_view(bytes->data() + offset,
+                                                 length);
+                } else if (complete != nullptr) {
+                    *complete = false;
+                }
+            } else if (complete != nullptr) {
+                *complete = false;
+            }
+        }
+        if (bindings.size() > 0 && extracted.empty() && complete != nullptr) {
+            *complete = false;
+        }
+        key.append(extracted.data(), extracted.size());
+    }
+    return key;
 }
 
 }  // namespace
@@ -75,6 +258,12 @@ void LineairDBRpc::handle_rpc(uint64_t sender_id, MessageType message_type,
             return;
         case MessageType::TX_STATELESS_SECONDARY_RANGE_SCAN:
             handleTxStatelessSecondaryRangeScan(message, result);
+            return;
+        case MessageType::TX_EXECUTE_READ_PLAN:
+            handleTxExecuteReadPlan(message, result);
+            return;
+        case MessageType::TX_VALIDATE_AND_COMMIT:
+            handleTxValidateAndCommit(message, result);
             return;
         case MessageType::TX_WRITE:
             handleTxWrite(message, result);
@@ -451,6 +640,218 @@ void LineairDBRpc::handleTxStatelessSecondaryRangeScan(
         out->set_key(entry.key);
         out->set_tid(entry.tid);
         out->set_found(entry.found);
+    }
+
+    result = response.SerializeAsString();
+}
+
+void LineairDBRpc::handleTxExecuteReadPlan(const std::string& message,
+                                           std::string& result) {
+    LineairDB::Protocol::TxExecuteReadPlan::Request request;
+    LineairDB::Protocol::TxExecuteReadPlan::Response response;
+    request.ParseFromString(message);
+    response.set_ok(true);
+
+    std::vector<LineairDB::Protocol::TxExecuteReadPlan::StepResult*>
+        previous_results;
+    previous_results.reserve(request.steps_size());
+
+    for (const auto& step : request.steps()) {
+        auto* step_result = response.add_results();
+        previous_results.push_back(step_result);
+
+        bool start_complete = true;
+        bool end_complete = true;
+        const std::string start_key =
+            build_plan_key(step.key_prefix(), step.bindings(),
+                           previous_results, -1, &start_complete);
+        std::string end_key =
+            build_plan_key(step.end_key_prefix(), step.end_bindings(),
+                           previous_results, -1, &end_complete);
+        if (!start_complete || !end_complete) continue;
+        if (step.is_scan() && end_key.empty()) {
+            end_key = next_lexicographic_key(start_key);
+        }
+
+        if (step.for_each()) {
+            int source_step = -1;
+            if (step.bindings_size() > 0) {
+                source_step = static_cast<int>(step.bindings(0).source_step());
+            }
+            if (source_step < 0 ||
+                source_step >= static_cast<int>(previous_results.size()) - 1) {
+                continue;
+            }
+
+            const auto* source = previous_results[source_step];
+            const int row_count =
+                std::max(source->scan_keys_size(), source->scan_values_size());
+            for (int row = 0; row < row_count; ++row) {
+                bool row_complete = true;
+                const std::string row_key =
+                    build_plan_key(step.key_prefix(), step.bindings(),
+                                   previous_results, row, &row_complete);
+                if (!row_complete) continue;
+                auto read_result =
+                    db_manager_->get_database()->StatelessRead(
+                        step.table_name(), row_key);
+                step_result->add_scan_keys(row_key);
+                step_result->add_scan_tids(read_result.tid);
+                if (read_result.found) {
+                    step_result->add_scan_values(
+                        std::move(read_result.value));
+                } else {
+                    step_result->add_scan_values("");
+                }
+            }
+            continue;
+        }
+
+        if (!step.is_scan()) {
+            auto read_result =
+                db_manager_->get_database()->StatelessRead(
+                    step.table_name(), start_key);
+            step_result->set_actual_key(start_key);
+            step_result->set_actual_start_key(start_key);
+            step_result->set_found(read_result.found);
+            step_result->set_tid(read_result.tid);
+            if (read_result.found) {
+                step_result->set_value(std::move(read_result.value));
+            }
+            continue;
+        }
+
+        if (step.index_name().empty()) {
+            step_result->set_actual_start_key(start_key);
+            step_result->set_actual_end_key(end_key);
+            auto scan_result =
+                db_manager_->get_database()->StatelessRangeScan(
+                    step.table_name(), start_key, end_key,
+                    step.scan_limit(), step.reverse_scan());
+            if (!scan_result.ok) {
+                response.set_ok(false);
+                result = response.SerializeAsString();
+                return;
+            }
+            for (auto& row : scan_result.rows) {
+                step_result->add_scan_keys(std::move(row.key));
+                step_result->add_scan_values(std::move(row.value));
+                step_result->add_scan_tids(row.tid);
+            }
+            to_proto_range_versions(scan_result.range_versions,
+                                  step_result->mutable_range_versions());
+            to_proto_index_reads(scan_result.index_reads,
+                               step_result->mutable_index_reads());
+        } else {
+            step_result->set_actual_start_key(start_key);
+            step_result->set_actual_end_key(end_key);
+            auto scan_result =
+                db_manager_->get_database()->StatelessSecondaryRangeScan(
+                    step.table_name(), step.index_name(), start_key, end_key,
+                    step.scan_limit(), step.reverse_scan());
+            if (!scan_result.ok) {
+                response.set_ok(false);
+                result = response.SerializeAsString();
+                return;
+            }
+            for (auto& row : scan_result.rows) {
+                step_result->add_secondary_keys(std::move(row.secondary_key));
+                step_result->add_scan_keys(std::move(row.primary_key));
+                step_result->add_scan_values(std::move(row.value));
+                step_result->add_scan_tids(row.tid);
+            }
+            to_proto_range_versions(scan_result.range_versions,
+                                  step_result->mutable_range_versions());
+            to_proto_index_reads(scan_result.index_reads,
+                               step_result->mutable_index_reads());
+        }
+    }
+
+    result = response.SerializeAsString();
+}
+
+void LineairDBRpc::handleTxValidateAndCommit(const std::string& message,
+                                             std::string& result) {
+    LineairDB::Protocol::TxValidateAndCommit::Request request;
+    LineairDB::Protocol::TxValidateAndCommit::Response response;
+
+    request.ParseFromString(message);
+
+    std::vector<LineairDB::ExternalReadEntry> reads;
+    reads.reserve(request.reads_size());
+    for (const auto& read : request.reads()) {
+        reads.push_back({read.table_name(), read.key(), read.tid(),
+                         read.found()});
+    }
+
+    std::vector<LineairDB::ExternalIndexValidationEntry> index_reads;
+    index_reads.reserve(request.index_reads_size());
+    for (const auto& read : request.index_reads()) {
+        index_reads.push_back({read.table_name(), read.index_name(),
+                               read.key(), read.tid(), read.found()});
+    }
+
+    std::vector<LineairDB::ExternalWriteEntry> writes;
+    writes.reserve(request.writes_size() + request.deletes_size());
+    for (const auto& write : request.writes()) {
+        writes.push_back({write.table_name(), write.key(), write.value(),
+                          write.is_delete()});
+    }
+    for (const auto& del : request.deletes()) {
+        writes.push_back({del.table_name(), del.key(), "", true});
+    }
+
+    std::vector<LineairDB::ExternalSecondaryIndexEntry> si_ops;
+    si_ops.reserve(request.secondary_index_ops_size());
+    for (const auto& op : request.secondary_index_ops()) {
+        si_ops.push_back({op.table_name(), op.index_name(),
+                          op.secondary_key(), op.primary_key(),
+                          op.is_delete()});
+    }
+
+    std::vector<LineairDB::ExternalRangeValidationEntry> range_reads;
+    range_reads.reserve(request.range_reads_size());
+    for (const auto& range : request.range_reads()) {
+        LineairDB::ExternalRangeValidationEntry entry{
+            range.table_name(), range.index_name(), range.owner_ptr(),
+            range.node_ptr(), range.version()};
+        entry.start_key = range.start_key();
+        entry.end_key = range.end_key();
+        entry.row_limit = range.row_limit();
+        entry.reverse_scan = range.reverse_scan();
+        entry.result_keys.reserve(range.result_keys_size());
+        for (const auto& key : range.result_keys()) {
+            entry.result_keys.push_back(key);
+        }
+        entry.result_primary_keys.reserve(range.result_primary_keys_size());
+        for (const auto& key : range.result_primary_keys()) {
+            entry.result_primary_keys.push_back(key);
+        }
+        range_reads.push_back(std::move(entry));
+    }
+
+    std::string abort_reason;
+    const bool committed =
+        db_manager_->get_database()->ValidateAndCommit(reads, writes, si_ops,
+                                                       range_reads,
+                                                       index_reads,
+                                                       &abort_reason);
+    response.set_committed(committed);
+    if (!committed && !abort_reason.empty()) {
+        response.set_abort_reason(abort_reason);
+    }
+
+    if (committed && request.row_deltas_size() > 0) {
+        row_counts_->apply_deltas(request.row_deltas());
+    }
+    if (committed && request.fence()) {
+        db_manager_->get_database()->Fence();
+    }
+
+    for (const auto& [name, count] : row_counts_->snapshot()) {
+        auto* ts = response.add_table_stats();
+        ts->set_table_name(name);
+        ts->set_row_count(count);
     }
 
     result = response.SerializeAsString();
