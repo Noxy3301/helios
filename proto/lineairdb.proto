@@ -45,6 +45,14 @@ enum OpCode {
     // Batch operations
     TX_BATCH_READ = 25;
     TX_BATCH_WRITE = 26;
+
+    // Experimental one-shot operations
+    TX_STATELESS_READ = 27;
+    TX_STATELESS_BATCH_READ = 28;
+    TX_VALIDATE_AND_COMMIT = 29;
+    TX_STATELESS_RANGE_SCAN = 30;
+    TX_STATELESS_SECONDARY_RANGE_SCAN = 31;
+    TX_EXECUTE_READ_PLAN = 32;
 }
 
 enum BatchOpType {
@@ -59,6 +67,31 @@ enum BatchOpType {
 message KeyValue {
     bytes key = 1;
     bytes value = 2;
+}
+
+// A Masstree leaf/node version observed while scanning.
+message RangeValidationEntry {
+    string table_name = 1;
+    string index_name = 2; // Empty means primary index.
+    uint64 owner_ptr = 3;
+    uint64 node_ptr = 4;
+    uint64 version = 5;
+    bytes start_key = 6;
+    bytes end_key = 7;
+    uint64 row_limit = 8; // 0 means compare the whole range.
+    bool reverse_scan = 9;
+    repeated bytes result_keys = 10; // PK scan: primary keys. SI scan: secondary keys.
+    repeated bytes result_primary_keys = 11; // SI scan only.
+}
+
+// Exact index entry version observed by a stateless scan.
+// Empty index_name means the primary index entry itself.
+message IndexValidationEntry {
+    string table_name = 1;
+    string index_name = 2;
+    bytes key = 3;
+    uint64 tid = 4;
+    bool found = 5;
 }
 
 // Secondary index entry: a secondary key and its associated primary keys.
@@ -124,6 +157,183 @@ message TxBatchWrite {
     message Response {
         bool success = 1;
         bool is_aborted = 2;
+    }
+}
+
+// Read a primary-key value without opening a server-side transaction.
+// The returned TID is validated later by TxValidateAndCommit.
+message TxStatelessRead {
+    message Request {
+        string table_name = 1;
+        bytes key = 2;
+    }
+    message Response {
+        bool found = 1;
+        bytes value = 2;
+        uint64 tid = 3;
+    }
+}
+
+// Read multiple primary-key values without opening a server-side transaction.
+message TxStatelessBatchRead {
+    message ReadOp {
+        string table_name = 1;
+        bytes key = 2;
+    }
+    message Request {
+        repeated ReadOp ops = 1;
+    }
+    message ReadResult {
+        bool found = 1;
+        bytes value = 2;
+        uint64 tid = 3;
+    }
+    message Response {
+        repeated ReadResult results = 1;
+    }
+}
+
+// Scan primary-key rows without opening a server-side transaction.
+// Returned row TIDs and range versions are validated by TxValidateAndCommit.
+message TxStatelessRangeScan {
+    message Request {
+        string table_name = 1;
+        bytes start_key = 2;
+        bytes end_key = 3;
+        uint64 row_limit = 4; // 0 means no limit.
+        bool reverse_scan = 5;
+    }
+    message Row {
+        bytes key = 1;
+        bytes value = 2;
+        uint64 tid = 3;
+        bool found = 4;
+    }
+    message Response {
+        repeated Row rows = 1;
+        repeated RangeValidationEntry range_versions = 2;
+        repeated IndexValidationEntry index_reads = 3;
+        bool ok = 4;
+    }
+}
+
+// Scan secondary-index entries without opening a server-side transaction.
+// The SI entry TIDs, base row TIDs, and range versions are all validated by
+// TxValidateAndCommit.
+message TxStatelessSecondaryRangeScan {
+    message Request {
+        string table_name = 1;
+        string index_name = 2;
+        bytes start_key = 3;
+        bytes end_key = 4;
+        uint64 row_limit = 5; // 0 means no limit.
+        bool reverse_scan = 6;
+    }
+    message Row {
+        bytes secondary_key = 1;
+        bytes primary_key = 2;
+        bytes value = 3;
+        uint64 tid = 4;
+        bool found = 5;
+    }
+    message Response {
+        repeated Row rows = 1;
+        repeated RangeValidationEntry range_versions = 2;
+        repeated IndexValidationEntry index_reads = 3;
+        bool ok = 4;
+    }
+}
+
+// Execute a dependent read plan in one RPC.
+// Steps may read values produced by earlier steps to build later keys.
+message TxExecuteReadPlan {
+    message KeyBinding {
+        uint32 source_step = 1;
+        uint32 source_row = 2;
+        uint32 source_offset = 3;
+        uint32 source_length = 4; // 0 means the rest of the source bytes.
+        bool use_midpoint = 5;
+        bool from_key = 6;
+        int32 source_column = 7; // 1-based row column; 0 means disabled.
+        bool column_as_int_key = 8;
+        int64 int_delta = 9;
+    }
+    message PlanStep {
+        string table_name = 1;
+        bytes key_prefix = 2;
+        bytes end_key_prefix = 3;
+        bool is_scan = 4;
+        uint64 scan_limit = 5; // 0 means no limit.
+        string index_name = 6; // Empty means primary index.
+        repeated KeyBinding bindings = 7;
+        repeated KeyBinding end_bindings = 8;
+        bool for_each = 9;
+        bool reverse_scan = 10;
+    }
+    message StepResult {
+        bool found = 1;
+        bytes value = 2;
+        uint64 tid = 3;
+        bytes actual_key = 4;
+        repeated bytes scan_keys = 5;
+        repeated bytes scan_values = 6;
+        repeated uint64 scan_tids = 7;
+        repeated bytes secondary_keys = 8;
+        bytes actual_start_key = 9;
+        bytes actual_end_key = 10;
+        repeated RangeValidationEntry range_versions = 11;
+        repeated IndexValidationEntry index_reads = 12;
+    }
+    message Request {
+        repeated PlanStep steps = 1;
+    }
+    message Response {
+        repeated StepResult results = 1;
+        repeated RangeValidationEntry range_versions = 2;
+        repeated IndexValidationEntry index_reads = 3;
+        bool ok = 4;
+    }
+}
+
+// Validate stateless reads and install buffered writes in one RPC.
+message TxValidateAndCommit {
+    message ReadEntry {
+        string table_name = 1;
+        bytes key = 2;
+        uint64 tid = 3;
+        bool found = 4;
+    }
+    message WriteEntry {
+        string table_name = 1;
+        bytes key = 2;
+        bytes value = 3;
+        bool is_delete = 4;
+    }
+    message DeleteEntry {
+        string table_name = 1;
+        bytes key = 2;
+    }
+    message SecondaryIndexEntry {
+        string table_name = 1;
+        string index_name = 2;
+        bytes secondary_key = 3;
+        bytes primary_key = 4;
+        bool is_delete = 5;
+    }
+    message Request {
+        repeated ReadEntry reads = 1;
+        repeated WriteEntry writes = 2;
+        repeated DeleteEntry deletes = 3;
+        repeated SecondaryIndexEntry secondary_index_ops = 4;
+        repeated TableRowDelta row_deltas = 5;
+        bool fence = 6;
+        repeated RangeValidationEntry range_reads = 7;
+        repeated IndexValidationEntry index_reads = 8;
+    }
+    message Response {
+        bool committed = 1;
+        repeated TableRowCount table_stats = 2;
+        string abort_reason = 3;
     }
 }
 

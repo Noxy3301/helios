@@ -51,5 +51,13 @@ enum class MessageType : uint32_t {
 
     // Batch operations
     TX_BATCH_READ = 25,
-    TX_BATCH_WRITE = 26
+    TX_BATCH_WRITE = 26,
+
+    // Experimental one-shot operations
+    TX_STATELESS_READ = 27,
+    TX_STATELESS_BATCH_READ = 28,
+    TX_VALIDATE_AND_COMMIT = 29,
+    TX_STATELESS_RANGE_SCAN = 30,
+    TX_STATELESS_SECONDARY_RANGE_SCAN = 31,
+    TX_EXECUTE_READ_PLAN = 32
 };
