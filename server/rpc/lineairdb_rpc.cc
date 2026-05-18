@@ -8,6 +8,33 @@
 
 #include "lineairdb.pb.h"
 
+namespace {
+
+// Copy range-scan node-version snapshots into the proto repeated field.
+void to_proto_range_versions(
+    const std::vector<LineairDB::ExternalRangeValidationEntry>& in,
+    google::protobuf::RepeatedPtrField<
+        LineairDB::Protocol::RangeValidationEntry>* out_entries) {
+    for (const auto& entry : in) {
+        auto* out = out_entries->Add();
+        out->set_table_name(entry.table_name);
+        out->set_index_name(entry.index_name);
+        out->set_owner_ptr(entry.owner_ptr);
+        out->set_node_ptr(entry.node_ptr);
+        out->set_version(entry.version);
+        out->set_start_key(entry.start_key);
+        out->set_end_key(entry.end_key);
+        out->set_row_limit(entry.row_limit);
+        out->set_reverse_scan(entry.reverse_scan);
+        for (const auto& key : entry.result_keys) out->add_result_keys(key);
+        for (const auto& key : entry.result_primary_keys) {
+            out->add_result_primary_keys(key);
+        }
+    }
+}
+
+}  // namespace
+
 LineairDBRpc::LineairDBRpc(std::shared_ptr<DatabaseManager> db_manager,
                            std::shared_ptr<TransactionManager> tx_manager,
                            std::shared_ptr<TableRowCounts> row_counts)
@@ -36,6 +63,18 @@ void LineairDBRpc::handle_rpc(uint64_t sender_id, MessageType message_type,
             return;
         case MessageType::TX_BATCH_WRITE:
             handleTxBatchWrite(message, result);
+            return;
+        case MessageType::TX_STATELESS_READ:
+            handleTxStatelessRead(message, result);
+            return;
+        case MessageType::TX_STATELESS_BATCH_READ:
+            handleTxStatelessBatchRead(message, result);
+            return;
+        case MessageType::TX_STATELESS_RANGE_SCAN:
+            handleTxStatelessRangeScan(message, result);
+            return;
+        case MessageType::TX_STATELESS_SECONDARY_RANGE_SCAN:
+            handleTxStatelessSecondaryRangeScan(message, result);
             return;
         case MessageType::TX_WRITE:
             handleTxWrite(message, result);
@@ -292,6 +331,126 @@ void LineairDBRpc::handleTxBatchWrite(const std::string& message, std::string& r
         response.set_success(false);
         response.set_is_aborted(true);
         LOG_WARNING("Transaction not found for batch_write: %ld", tx_id);
+    }
+
+    result = response.SerializeAsString();
+}
+
+void LineairDBRpc::handleTxStatelessRead(const std::string& message,
+                                         std::string& result) {
+    LineairDB::Protocol::TxStatelessRead::Request request;
+    LineairDB::Protocol::TxStatelessRead::Response response;
+
+    request.ParseFromString(message);
+
+    auto read_result =
+        db_manager_->get_database()->StatelessRead(request.table_name(),
+                                                   request.key());
+    response.set_found(read_result.found);
+    response.set_tid(read_result.tid);
+    if (read_result.found) {
+        response.set_value(std::move(read_result.value));
+    }
+
+    result = response.SerializeAsString();
+}
+
+void LineairDBRpc::handleTxStatelessBatchRead(const std::string& message,
+                                              std::string& result) {
+    LineairDB::Protocol::TxStatelessBatchRead::Request request;
+    LineairDB::Protocol::TxStatelessBatchRead::Response response;
+
+    request.ParseFromString(message);
+
+    std::vector<std::pair<std::string, std::string>> keys;
+    keys.reserve(request.ops_size());
+    for (const auto& op : request.ops()) {
+        keys.emplace_back(op.table_name(), op.key());
+    }
+
+    auto read_results = db_manager_->get_database()->StatelessBatchRead(keys);
+    for (auto& read_result : read_results) {
+        auto* out = response.add_results();
+        out->set_found(read_result.found);
+        out->set_tid(read_result.tid);
+        if (read_result.found) {
+            out->set_value(std::move(read_result.value));
+        }
+    }
+
+    result = response.SerializeAsString();
+}
+
+void LineairDBRpc::handleTxStatelessRangeScan(const std::string& message,
+                                              std::string& result) {
+    LineairDB::Protocol::TxStatelessRangeScan::Request request;
+    LineairDB::Protocol::TxStatelessRangeScan::Response response;
+
+    request.ParseFromString(message);
+
+    auto scan_result = db_manager_->get_database()->StatelessRangeScan(
+        request.table_name(), request.start_key(), request.end_key(),
+        request.row_limit(), request.reverse_scan());
+    response.set_ok(scan_result.ok);
+    if (!scan_result.ok) {
+        result = response.SerializeAsString();
+        return;
+    }
+
+    for (const auto& row : scan_result.rows) {
+        auto* out = response.add_rows();
+        out->set_key(row.key);
+        out->set_value(row.value);
+        out->set_tid(row.tid);
+        out->set_found(row.found);
+    }
+    to_proto_range_versions(scan_result.range_versions,
+                          response.mutable_range_versions());
+    for (const auto& entry : scan_result.index_reads) {
+        auto* out = response.add_index_reads();
+        out->set_table_name(entry.table_name);
+        out->set_index_name(entry.index_name);
+        out->set_key(entry.key);
+        out->set_tid(entry.tid);
+        out->set_found(entry.found);
+    }
+
+    result = response.SerializeAsString();
+}
+
+void LineairDBRpc::handleTxStatelessSecondaryRangeScan(
+    const std::string& message, std::string& result) {
+    LineairDB::Protocol::TxStatelessSecondaryRangeScan::Request request;
+    LineairDB::Protocol::TxStatelessSecondaryRangeScan::Response response;
+
+    request.ParseFromString(message);
+
+    auto scan_result = db_manager_->get_database()->StatelessSecondaryRangeScan(
+        request.table_name(), request.index_name(), request.start_key(),
+        request.end_key(), request.row_limit(), request.reverse_scan());
+    response.set_ok(scan_result.ok);
+    if (!scan_result.ok) {
+        result = response.SerializeAsString();
+        return;
+    }
+
+    for (const auto& row : scan_result.rows) {
+        auto* out = response.add_rows();
+        out->set_secondary_key(row.secondary_key);
+        out->set_primary_key(row.primary_key);
+        out->set_value(row.value);
+        out->set_tid(row.tid);
+        out->set_found(row.found);
+    }
+    to_proto_range_versions(scan_result.range_versions,
+                          response.mutable_range_versions());
+    for (const auto& entry : scan_result.index_reads) {
+        auto* out = response.add_index_reads();
+        out->set_table_name(entry.table_name);
+        out->set_index_name(entry.index_name);
+        out->set_key(entry.key);
+        out->set_tid(entry.tid);
+        out->set_found(entry.found);
     }
 
     result = response.SerializeAsString();
