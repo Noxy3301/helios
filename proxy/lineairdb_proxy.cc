@@ -14,6 +14,49 @@
 #include "rpc_trace.hh"
 #include "../common/log.h"
 
+namespace {
+
+LineairDBProxy::RangeValidationEntry decode_range_validation_entry(
+    const LineairDB::Protocol::RangeValidationEntry& entry) {
+    LineairDBProxy::RangeValidationEntry out;
+    out.table_name = entry.table_name();
+    out.index_name = entry.index_name();
+    out.owner_ptr = entry.owner_ptr();
+    out.node_ptr = entry.node_ptr();
+    out.version = entry.version();
+    out.start_key = entry.start_key();
+    out.end_key = entry.end_key();
+    out.row_limit = entry.row_limit();
+    out.reverse_scan = entry.reverse_scan();
+    out.result_keys.reserve(entry.result_keys_size());
+    for (const auto& key : entry.result_keys()) out.result_keys.push_back(key);
+    out.result_primary_keys.reserve(entry.result_primary_keys_size());
+    for (const auto& key : entry.result_primary_keys()) {
+        out.result_primary_keys.push_back(key);
+    }
+    return out;
+}
+
+void encode_range_validation_entry(
+    const LineairDBProxy::RangeValidationEntry& entry,
+    LineairDB::Protocol::RangeValidationEntry* out) {
+    out->set_table_name(entry.table_name);
+    out->set_index_name(entry.index_name);
+    out->set_owner_ptr(entry.owner_ptr);
+    out->set_node_ptr(entry.node_ptr);
+    out->set_version(entry.version);
+    out->set_start_key(entry.start_key);
+    out->set_end_key(entry.end_key);
+    out->set_row_limit(entry.row_limit);
+    out->set_reverse_scan(entry.reverse_scan);
+    for (const auto& key : entry.result_keys) out->add_result_keys(key);
+    for (const auto& key : entry.result_primary_keys) {
+        out->add_result_primary_keys(key);
+    }
+}
+
+}  // namespace
+
 
 LineairDBProxy::LineairDBProxy(const std::string& host, int port)
     : socket_fd_(-1), connected_(false), host_(host), port_(port) {
@@ -303,39 +346,167 @@ bool LineairDBProxy::tx_batch_write(LineairDBTransaction* tx,
     return response.success();
 }
 
-std::vector<std::string> LineairDBProxy::tx_read_secondary_index(LineairDBTransaction* tx,
-                                                                  const std::string& index_name,
-                                                                  const std::string& secondary_key) {
-    int64_t tx_id = tx->get_tx_id();
-    LOG_DEBUG("CLIENT: tx_read_secondary_index called with tx_id=%ld, index=%s, key=%s",
-              tx_id, index_name.c_str(), secondary_key.c_str());
+LineairDBProxy::StatelessReadResult LineairDBProxy::tx_stateless_read(
+    const std::string& table_name, const std::string& key) {
+    StatelessReadResult result;
+    if (!connected_) {
+        LOG_ERROR("RPC failed: Not connected to server");
+        return result;
+    }
+
+    LineairDB::Protocol::TxStatelessRead::Request request;
+    LineairDB::Protocol::TxStatelessRead::Response response;
+    request.set_table_name(table_name);
+    request.set_key(key);
+
+    if (!send_protobuf_message(request, response,
+                               MessageType::TX_STATELESS_READ)) {
+        LOG_ERROR("RPC failed: Failed to send stateless_read message to server");
+        return result;
+    }
+
+    result.ok = true;
+    result.found = response.found();
+    result.tid = response.tid();
+    if (result.found) result.value = response.value();
+    return result;
+}
+
+std::vector<LineairDBProxy::StatelessReadResult>
+LineairDBProxy::tx_stateless_batch_read(
+    const std::vector<StatelessReadKey>& keys) {
     if (!connected_) {
         LOG_ERROR("RPC failed: Not connected to server");
         return {};
     }
 
-    LineairDB::Protocol::TxReadSecondaryIndex::Request request;
-    LineairDB::Protocol::TxReadSecondaryIndex::Response response;
+    LineairDB::Protocol::TxStatelessBatchRead::Request request;
+    LineairDB::Protocol::TxStatelessBatchRead::Response response;
+    for (const auto& key : keys) {
+        auto* op = request.add_ops();
+        op->set_table_name(key.table_name);
+        op->set_key(key.key);
+    }
 
-    request.set_transaction_id(tx_id);
-    request.set_table_name(tx->get_selected_table_name());
-    request.set_index_name(index_name);
-    request.set_secondary_key(secondary_key);
-
-    if (!send_protobuf_message(request, response, MessageType::TX_READ_SECONDARY_INDEX)) {
-        LOG_ERROR("RPC failed: Failed to send message to server");
+    if (!send_protobuf_message(request, response,
+                               MessageType::TX_STATELESS_BATCH_READ)) {
+        LOG_ERROR("RPC failed: Failed to send stateless_batch_read message to server");
         return {};
     }
 
-    tx->set_aborted(response.is_aborted());
+    std::vector<StatelessReadResult> results;
+    results.reserve(response.results_size());
+    for (const auto& r : response.results()) {
+        StatelessReadResult result;
+        result.ok = true;
+        result.found = r.found();
+        result.value = r.found() ? r.value() : "";
+        result.tid = r.tid();
+        results.push_back(std::move(result));
+    }
+    return results;
+}
 
-    std::vector<std::string> values;
-    for (const auto& v : response.values()) {
-        values.emplace_back(v);
+LineairDBProxy::StatelessRangeScanResult
+LineairDBProxy::tx_stateless_range_scan(const std::string& table_name,
+                                        const std::string& start_key,
+                                        const std::string& end_key,
+                                        uint64_t row_limit,
+                                        bool reverse_scan) {
+    StatelessRangeScanResult result;
+    if (!connected_) {
+        LOG_ERROR("RPC failed: Not connected to server");
+        return result;
     }
 
-    LOG_DEBUG("CLIENT: tx_read_secondary_index completed, found %zu values", values.size());
-    return values;
+    LineairDB::Protocol::TxStatelessRangeScan::Request request;
+    LineairDB::Protocol::TxStatelessRangeScan::Response response;
+    request.set_table_name(table_name);
+    request.set_start_key(start_key);
+    request.set_end_key(end_key);
+    request.set_row_limit(row_limit);
+    request.set_reverse_scan(reverse_scan);
+
+    if (!send_protobuf_message(request, response,
+                               MessageType::TX_STATELESS_RANGE_SCAN)) {
+        LOG_ERROR("RPC failed: Failed to send stateless range scan message to server");
+        return result;
+    }
+
+    result.ok = response.ok();
+    if (!result.ok) return result;
+    result.rows.reserve(response.rows_size());
+    for (const auto& row : response.rows()) {
+        result.rows.push_back({row.key(), row.value(), row.found(),
+                               row.tid()});
+    }
+
+    result.range_versions.reserve(response.range_versions_size());
+    for (const auto& entry : response.range_versions()) {
+        result.range_versions.push_back(decode_range_validation_entry(entry));
+    }
+
+    result.index_reads.reserve(response.index_reads_size());
+    for (const auto& entry : response.index_reads()) {
+        result.index_reads.push_back({entry.table_name(), entry.index_name(),
+                                      entry.key(), entry.tid(),
+                                      entry.found()});
+    }
+
+    return result;
+}
+
+LineairDBProxy::StatelessSecondaryRangeScanResult
+LineairDBProxy::tx_stateless_secondary_range_scan(
+        const std::string& table_name,
+        const std::string& index_name,
+        const std::string& start_key,
+        const std::string& end_key,
+        uint64_t row_limit,
+        bool reverse_scan) {
+    StatelessSecondaryRangeScanResult result;
+    if (!connected_) {
+        LOG_ERROR("RPC failed: Not connected to server");
+        return result;
+    }
+
+    LineairDB::Protocol::TxStatelessSecondaryRangeScan::Request request;
+    LineairDB::Protocol::TxStatelessSecondaryRangeScan::Response response;
+    request.set_table_name(table_name);
+    request.set_index_name(index_name);
+    request.set_start_key(start_key);
+    request.set_end_key(end_key);
+    request.set_row_limit(row_limit);
+    request.set_reverse_scan(reverse_scan);
+
+    if (!send_protobuf_message(
+            request, response,
+            MessageType::TX_STATELESS_SECONDARY_RANGE_SCAN)) {
+        LOG_ERROR("RPC failed: Failed to send stateless secondary range scan message to server");
+        return result;
+    }
+
+    result.ok = response.ok();
+    if (!result.ok) return result;
+    result.rows.reserve(response.rows_size());
+    for (const auto& row : response.rows()) {
+        result.rows.push_back({row.secondary_key(), row.primary_key(),
+                               row.value(), row.found(), row.tid()});
+    }
+
+    result.range_versions.reserve(response.range_versions_size());
+    for (const auto& entry : response.range_versions()) {
+        result.range_versions.push_back(decode_range_validation_entry(entry));
+    }
+
+    result.index_reads.reserve(response.index_reads_size());
+    for (const auto& entry : response.index_reads()) {
+        result.index_reads.push_back({entry.table_name(), entry.index_name(),
+                                      entry.key(), entry.tid(),
+                                      entry.found()});
+    }
+
+    return result;
 }
 
 bool LineairDBProxy::tx_write_secondary_index(LineairDBTransaction* tx,
