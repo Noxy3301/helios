@@ -301,7 +301,7 @@
   tasks:
     - name: Capture MySQL diagnostics BEFORE benchmark (pre)
       shell: |
-        MYSQL=~/ordo/build/runtime_output_directory/mysql
+        MYSQL=~/helios/build/runtime_output_directory/mysql
         OUT={{ sample_dir }}/mysql-diag-pre-{{ run_id }}.txt
         mkdir -p {{ sample_dir }}
         {
@@ -558,8 +558,8 @@
     - name: Package LineairDB logs
       when: inventory_hostname in groups['lineairdb']
       shell: |
-        if ls ~/ordo/lineairdb_logs/*.log >/dev/null 2>&1; then
-          tar -czf {{ sample_dir }}/lineairdb-{{ run_id }}.tgz -C ~/ordo lineairdb_logs
+        if ls ~/helios/lineairdb_logs/*.log >/dev/null 2>&1; then
+          tar -czf {{ sample_dir }}/lineairdb-{{ run_id }}.tgz -C ~/helios lineairdb_logs
         fi
       args:
         executable: /bin/bash
@@ -567,7 +567,7 @@
     - name: Capture MySQL status snapshot
       when: inventory_hostname in groups['mysql']
       shell: |
-        ~/ordo/build/runtime_output_directory/mysql \
+        ~/helios/build/runtime_output_directory/mysql \
           -u root --protocol=TCP -h 127.0.0.1 -P 3307 \
           -e "SHOW GLOBAL STATUS" > {{ sample_dir }}/mysql-status-{{ run_id }}.txt
       args:
@@ -577,7 +577,7 @@
     - name: Capture MySQL diagnostics AFTER benchmark (post)
       when: inventory_hostname in groups['mysql']
       shell: |
-        MYSQL=~/ordo/build/runtime_output_directory/mysql
+        MYSQL=~/helios/build/runtime_output_directory/mysql
         OUT={{ sample_dir }}/mysql-diag-post-{{ run_id }}.txt
         {
           echo "=== SHOW TABLE STATUS ==="

@@ -2,17 +2,17 @@
 - hosts: mysql
   gather_facts: false
   tasks:
-    - name: Sync ordo repo + submodules
+    - name: Sync helios repo + submodules
       shell: |
         set -euo pipefail
-        cd ~/ordo
+        cd ~/helios
         ./scripts/stop_mysql.sh || true
         git fetch origin
-        git checkout {{ ordo_branch | default('main') }}
+        git checkout {{ helios_branch | default('main') }}
         git pull --ff-only
         git submodule update --init --recursive
         echo "=== SHAs ==="
-        echo "Ordo($(git rev-parse --abbrev-ref HEAD)@$(git rev-parse --short HEAD))"
+        echo "Helios($(git rev-parse --abbrev-ref HEAD)@$(git rev-parse --short HEAD))"
         echo "LineairDB($(cd third_party/LineairDB && git rev-parse --abbrev-ref HEAD)@$(cd third_party/LineairDB && git rev-parse --short HEAD))"
         echo "mysql-server($(cd third_party/mysql-server && git rev-parse --abbrev-ref HEAD)@$(cd third_party/mysql-server && git rev-parse --short HEAD))"
         echo "benchbase($(cd third_party/benchbase && git rev-parse --abbrev-ref HEAD)@$(cd third_party/benchbase && git rev-parse --short HEAD))"
@@ -27,7 +27,7 @@
     - name: Build server + proxy
       shell: |
         set -euo pipefail
-        cd ~/ordo
+        cd ~/helios
         ./scripts/build_partial.sh 2>&1 | tail -40
       args:
         executable: /bin/bash
@@ -40,7 +40,7 @@
     - name: Start MySQL with LineairDB-Proxy
       shell: |
         set -euo pipefail
-        cd ~/ordo
+        cd ~/helios
         ./scripts/start_mysql.sh \
           --mysqld-port 3307 \
           --server-host {{ hostvars['lineairdb-1'].private_ip }} \
@@ -51,9 +51,9 @@
     - name: apply bench/setup.sql
       shell: |
         set -euo pipefail
-        ~/ordo/build/runtime_output_directory/mysql \
+        ~/helios/build/runtime_output_directory/mysql \
           -u root --protocol=TCP -h 127.0.0.1 -P 3307 \
-          < ~/ordo/bench/setup.sql
+          < ~/helios/bench/setup.sql
       args:
         executable: /bin/bash
 
@@ -61,7 +61,7 @@
     - name: Create HAProxy and BenchBase access users
       shell: |
         set -euo pipefail
-        ~/ordo/build/runtime_output_directory/mysql \
+        ~/helios/build/runtime_output_directory/mysql \
           -u root --protocol=TCP -h 127.0.0.1 -P 3307 \
           -e "CREATE USER IF NOT EXISTS 'haproxy_check'@'%' IDENTIFIED WITH mysql_native_password BY '';
               GRANT USAGE ON *.* TO 'haproxy_check'@'%';

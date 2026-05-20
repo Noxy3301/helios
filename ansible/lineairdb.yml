@@ -4,17 +4,17 @@
   vars:
     lineairdb_nofile_limit: 1048576
   tasks:
-    - name: Sync ordo repo + submodules
+    - name: Sync helios repo + submodules
       shell: |
         set -euo pipefail
-        cd ~/ordo
+        cd ~/helios
         ./scripts/stop_server.sh || true
         git fetch origin
-        git checkout {{ ordo_branch | default('main') }}
+        git checkout {{ helios_branch | default('main') }}
         git pull --ff-only
         git submodule update --init --recursive
         echo "=== SHAs ==="
-        echo "Ordo($(git rev-parse --abbrev-ref HEAD)@$(git rev-parse --short HEAD))"
+        echo "Helios($(git rev-parse --abbrev-ref HEAD)@$(git rev-parse --short HEAD))"
         echo "LineairDB($(cd third_party/LineairDB && git rev-parse --abbrev-ref HEAD)@$(cd third_party/LineairDB && git rev-parse --short HEAD))"
         echo "mysql-server($(cd third_party/mysql-server && git rev-parse --abbrev-ref HEAD)@$(cd third_party/mysql-server && git rev-parse --short HEAD))"
         echo "benchbase($(cd third_party/benchbase && git rev-parse --abbrev-ref HEAD)@$(cd third_party/benchbase && git rev-parse --short HEAD))"
@@ -29,7 +29,7 @@
     - name: Build server + proxy
       shell: |
         set -euo pipefail
-        cd ~/ordo
+        cd ~/helios
         ./scripts/build_partial.sh 2>&1 | tail -40
       args:
         executable: /bin/bash
@@ -42,7 +42,7 @@
     - name: Start LineairDB-Server
       shell: |
         set -euo pipefail
-        cd ~/ordo
+        cd ~/helios
         ulimit -n {{ lineairdb_nofile_limit }}
         ./scripts/start_server.sh
       args:

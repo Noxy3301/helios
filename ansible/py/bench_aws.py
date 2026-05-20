@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Ordo distributed benchmark orchestrator.
+Helios distributed benchmark orchestrator.
 
 Launches spot instances, runs Ansible playbooks, collects results, and cleans up.
 If spot instances cannot be acquired, skips benchmarks and cleans up.
@@ -37,22 +37,22 @@ LOG_FILE = None  # set in main()
 # ──────────────────────────────────────────────
 CLUSTER = {
     "lineairdb": {
-        "tag": "ordo-lineairdb",
+        "tag": "helios-lineairdb",
         "instance_type": "c6i.16xlarge",
         "count": 1,
     },
     "mysql": {
-        "tag": "ordo-mysql",
+        "tag": "helios-mysql",
         "instance_type": "c6i.4xlarge",
         "count": 1,
     },
     "haproxy": {
-        "tag": "ordo-haproxy",
+        "tag": "helios-haproxy",
         "instance_type": "c6i.8xlarge",
         "count": 1,
     },
     "benchbase": {
-        "tag": "ordo-bench",
+        "tag": "helios-bench",
         "instance_type": "c6i.16xlarge",
         "count": 1,
     },
@@ -61,8 +61,8 @@ CLUSTER = {
 AWS_DEFAULTS = {
     "region": "ap-southeast-2",
     "launch_template": "lt-0f28a9f6b02e1c019",
-    "project_tag": "Ordo",
-    "ssh_key": "~/.ssh/ordo-aws.pem",
+    "project_tag": "Helios",
+    "ssh_key": "~/.ssh/helios-aws.pem",
     "ssh_user": "ubuntu",
     # On-demand fallback params (extracted from launch template)
     "ami_id": "ami-0dcfb21660acb41dd",
@@ -291,7 +291,7 @@ def deploy_infrastructure(branch=None):
     """Deploy LineairDB, MySQL, HAProxy in parallel, then wait."""
     log("Deploying infrastructure (lineairdb + mysql + haproxy in parallel)...")
     inv = str(ANSIBLE_DIR / "inventory.ini")
-    extra = f' -e "ordo_branch={branch}"' if branch else ""
+    extra = f' -e "helios_branch={branch}"' if branch else ""
     # Write deploy logs alongside bench_aws.log
     deploy_log_dir = Path(LOG_FILE.name).parent if LOG_FILE else None
     procs = []
@@ -483,7 +483,7 @@ def cleanup(args):
 # ──────────────────────────────────────────────
 def main():
     parser = argparse.ArgumentParser(
-        description="Ordo distributed benchmark orchestrator",
+        description="Helios distributed benchmark orchestrator",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:

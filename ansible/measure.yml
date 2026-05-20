@@ -53,7 +53,7 @@
     - name: Set TPC-H optimizer settings on each MySQL
       when: bench_type == 'tpch'
       shell: |
-        ~/ordo/build/runtime_output_directory/mysql \
+        ~/helios/build/runtime_output_directory/mysql \
           -u root --protocol=TCP \
           -h {{ hostvars[item].private_ip }} -P 3307 \
           -e "SET GLOBAL optimizer_switch='batched_key_access=on,mrr_cost_based=off,subquery_to_derived=on';

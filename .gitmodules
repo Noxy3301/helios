@@ -5,7 +5,7 @@
 [submodule "third_party/LineairDB"]
 	path = third_party/LineairDB
 	url = https://github.com/Noxy3301/LineairDB.git
-	branch = research/ordo
+	branch = research/helios
 	ignore = dirty
 [submodule "third_party/benchbase"]
 	path = third_party/benchbase

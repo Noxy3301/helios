@@ -1,7 +1,7 @@
 ---
 # Schema setup and data loading for distributed benchmarks.
 #
-# Creates tables on each MySQL node (Ordo DDL doesn't sync across nodes)
+# Creates tables on each MySQL node (Helios DDL doesn't sync across nodes)
 # and loads data once (data goes to shared LineairDB storage).
 #
 # Usage:
@@ -16,9 +16,9 @@
   vars:
     bench_type: ycsb
     bench_scalefactor: "{{ 0.1 if bench_type == 'tpch' else 10 }}"
-    _mysql_bin: ~/ordo/build/runtime_output_directory/mysql
-    _bb_dir: ~/ordo/third_party/benchbase/benchbase-mysql
-    _config_dir: ~/ordo/bench/config
+    _mysql_bin: ~/helios/build/runtime_output_directory/mysql
+    _bb_dir: ~/helios/third_party/benchbase/benchbase-mysql
+    _config_dir: ~/helios/bench/config
   tasks:
     - name: Reset benchbase database on each MySQL
       shell: |

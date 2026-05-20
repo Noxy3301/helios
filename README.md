@@ -1,4 +1,4 @@
-# Ordo
+# Helios
 
 ## Prerequisites
 
@@ -22,15 +22,15 @@ sdk install java 23-open
 ## Quick Start
 
 ```bash
-git clone --recursive https://github.com/Noxy3301/ordo.git
-cd ordo
+git clone --recursive https://github.com/Noxy3301/helios.git
+cd helios
 ./scripts/build.sh
 ```
 
 ### Start Servers
 
 ```bash
-# Terminal 1: Start Ordo Server
+# Terminal 1: Start Helios Server
 ./scripts/start_server.sh
 
 # Terminal 2: Start MySQL (auto-initializes data directory and installs LineairDB plugin)

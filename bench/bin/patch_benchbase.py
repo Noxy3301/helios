@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Patch and build BenchBase from third_party/benchbase for Ordo.
+Patch and build BenchBase from third_party/benchbase for Helios.
 
 Applies:
   1. Java version downgrade (23 -> 21) in pom.xml
@@ -236,7 +236,7 @@ def patch_loader_stock_retry():
 def patch_tpch_hash_join():
     """Add USE INDEX () to TPC-H queries to force hash join over NLJ.
 
-    In Ordo's RPC-based architecture, hash join (1 RPC per table scan) is
+    In Helios's RPC-based architecture, hash join (1 RPC per table scan) is
     vastly faster than NLJ with PK lookups (1 RPC per row probe).  MySQL's
     optimizer doesn't model RPC cost, so it always prefers eq_ref (PK lookup).
     Adding USE INDEX () disables all index access, forcing hash join.
@@ -372,7 +372,7 @@ def build_benchbase():
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Patch and build BenchBase for Ordo")
+    parser = argparse.ArgumentParser(description="Patch and build BenchBase for Helios")
     parser.add_argument("--patch", action="store_true", help="Patch only, skip build")
     args = parser.parse_args()
 

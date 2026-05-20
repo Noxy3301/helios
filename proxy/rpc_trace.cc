@@ -333,7 +333,7 @@ RpcTraceLogger::RpcTraceLogger() {
     path = path_env;
   } else {
     char buf[64];
-    std::snprintf(buf, sizeof(buf), "/tmp/ordo_rpc_trace_%d.jsonl",
+    std::snprintf(buf, sizeof(buf), "/tmp/helios_rpc_trace_%d.jsonl",
                   static_cast<int>(getpid()));
     path = buf;
   }

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Ordo benchmark runner — YCSB and TPC-C via BenchBase.
+Helios benchmark runner — YCSB and TPC-C via BenchBase.
 
 Usage:
   # Single run (default: tpcc, 64 terminals, SF=1)
@@ -650,7 +650,7 @@ def _plot_metrics(result_base, plot_dir):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Ordo benchmark runner")
+    parser = argparse.ArgumentParser(description="Helios benchmark runner")
     parser.add_argument("benchmark", choices=["tpcc", "tpcc-np", "tpch", "ycsb"], help="Benchmark type")
     parser.add_argument("--terminals", type=int, default=64, help="Number of terminals (default: 64)")
     parser.add_argument("--sweep", type=str, help="Comma-separated thread counts to sweep (e.g. 1,4,16,64)")

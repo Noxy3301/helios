@@ -1,4 +1,4 @@
--- Setup script for Ordo benchmarking with Benchbase
+-- Setup script for Helios benchmarking with Benchbase
 
 -- Install plugin only if it doesn't exist
 SET @plugin_exists = (SELECT COUNT(*) FROM INFORMATION_SCHEMA.PLUGINS WHERE PLUGIN_NAME = 'lineairdb');

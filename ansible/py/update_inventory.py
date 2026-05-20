@@ -6,10 +6,10 @@ import subprocess
 import sys
 
 ROLE_MAP = [
-    {"tag": "ordo-lineairdb", "group": "lineairdb", "prefix": "lineairdb"},
-    {"tag": "ordo-mysql", "group": "mysql", "prefix": "mysql"},
-    {"tag": "ordo-haproxy", "group": "haproxy", "prefix": "haproxy"},
-    {"tag": "ordo-bench", "group": "benchbase", "prefix": "bench"},
+    {"tag": "helios-lineairdb", "group": "lineairdb", "prefix": "lineairdb"},
+    {"tag": "helios-mysql", "group": "mysql", "prefix": "mysql"},
+    {"tag": "helios-haproxy", "group": "haproxy", "prefix": "haproxy"},
+    {"tag": "helios-bench", "group": "benchbase", "prefix": "bench"},
 ]
 TEMPLATE_PATH = Path(__file__).resolve().parent.parent / "templates" / "inventory.ini.template"
 
@@ -108,9 +108,9 @@ def main():
     parser = argparse.ArgumentParser(description="Generate ansible/inventory.ini from AWS tags")
     parser.add_argument("--region", type=str, default="ap-southeast-2", help="AWS region")
     parser.add_argument("--profile", type=str, default=None, help="AWS profile (optional)")
-    parser.add_argument("--project-tag", type=str, default="Ordo", help="Project tag value")
+    parser.add_argument("--project-tag", type=str, default="Helios", help="Project tag value")
     parser.add_argument("--user", type=str, default="ubuntu", help="ansible_user")
-    parser.add_argument("--key", type=str, default="~/.ssh/ordo-aws.pem", help="ssh private key path")
+    parser.add_argument("--key", type=str, default="~/.ssh/helios-aws.pem", help="ssh private key path")
     parser.add_argument(
         "--ansible-host",
         choices=["public", "private"],
@@ -129,7 +129,7 @@ def main():
     filters = ["Name=instance-state-name,Values=running"]
     if args.project_tag:
         filters.append(f"Name=tag:Project,Values={args.project_tag}")
-    # Use wildcard to match both "ordo-mysql" and "ordo-mysql-1" etc.
+    # Use wildcard to match both "helios-mysql" and "helios-mysql-1" etc.
     tag_patterns = [f"{t},{t}-*" for t in tags]
     filters.append("Name=tag:Name,Values=" + ",".join(tag_patterns))
 

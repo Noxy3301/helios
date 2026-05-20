@@ -1,4 +1,4 @@
-# Ansible for Ordo distributed benchmarks
+# Ansible for Helios distributed benchmarks
 
 ## Prerequisites
 
@@ -38,19 +38,19 @@ Add to `~/.bashrc`:
 echo 'source "$HOME/.sdkman/bin/sdkman-init.sh"' >> ~/.bashrc
 ```
 
-#### 3. Clone and build Ordo
+#### 3. Clone and build Helios
 
 ```bash
 cd ~
-git clone --recursive https://github.com/Noxy3301/ordo.git
-cd ordo
+git clone --recursive https://github.com/Noxy3301/helios.git
+cd helios
 ./scripts/build.sh
 ```
 
 #### 4. Patch and build BenchBase
 
 ```bash
-cd ~/ordo
+cd ~/helios
 python3 bench/bin/patch_benchbase.py
 ```
 
@@ -58,13 +58,13 @@ python3 bench/bin/patch_benchbase.py
 
 ```bash
 # Server binary exists
-ls ~/ordo/build/server/lineairdb-server
+ls ~/helios/build/server/lineairdb-server
 
 # MySQL binary exists
-ls ~/ordo/build/runtime_output_directory/mysqld
+ls ~/helios/build/runtime_output_directory/mysqld
 
 # BenchBase JAR exists
-ls ~/ordo/third_party/benchbase/benchbase-mysql/benchbase.jar
+ls ~/helios/third_party/benchbase/benchbase-mysql/benchbase.jar
 
 # Java version
 java --version
@@ -79,7 +79,7 @@ Stop the instance and create an AMI snapshot. All nodes (lineairdb, mysql, hapro
 
 | Playbook        | What it does                                                   |
 | --------------- | -------------------------------------------------------------- |
-| `lineairdb.yml` | Rebuild + start Ordo server                                    |
+| `lineairdb.yml` | Rebuild + start Helios server                                  |
 | `mysql.yml`     | Start MySQL, create users (HAProxy health check, bench access) |
 | `haproxy.yml`   | Deploy HAProxy config with backend IPs, restart                |
 | `benchbase.yml` | Create schema on each MySQL, load data                         |
@@ -90,7 +90,7 @@ Stop the instance and create an AMI snapshot. All nodes (lineairdb, mysql, hapro
 `bench_aws.py` automates the entire lifecycle: launch spot instances, deploy, run benchmarks, collect results, and clean up.
 
 ```bash
-cd ~/ordo/ansible
+cd ~/helios/ansible
 
 # TPC-C (default SF=1, terminal sweep)
 python3 py/bench_aws.py --bench-type tpcc --bench-terms 1,8,32,64,128,256 --bench-time 60
@@ -132,7 +132,7 @@ For debugging or running individual steps, you can use Ansible playbooks directl
 python3 py/update_inventory.py
 ```
 
-> Tag instances: `Name=ordo-lineairdb`, `Name=ordo-mysql`, `Name=ordo-haproxy`, `Name=ordo-bench`, `Project=Ordo`
+> Tag instances: `Name=helios-lineairdb`, `Name=helios-mysql`, `Name=helios-haproxy`, `Name=helios-bench`, `Project=Helios`
 
 ### 2. Deploy infrastructure
 
@@ -248,7 +248,7 @@ python3 py/plot_tpch.py          # TPC-H per-query latency (auto-called for tpch
 | Playbook            | Purpose                                                   |
 | ------------------- | --------------------------------------------------------- |
 | `site.yml`          | Master: lineairdb → mysql → haproxy → benchbase           |
-| `lineairdb.yml`     | Start Ordo server (rebuild + ulimit)                      |
+| `lineairdb.yml`     | Start Helios server (rebuild + ulimit)                    |
 | `mysql.yml`         | Start MySQL with LineairDB proxy, create users            |
 | `haproxy.yml`       | Deploy HAProxy config (L4 MySQL load balancing)           |
 | `benchbase.yml`     | Create schema + load data (supports ycsb/tpcc/tpch)       |
@@ -261,8 +261,8 @@ python3 py/plot_tpch.py          # TPC-H per-query latency (auto-called for tpch
 
 ## Important notes
 
-- **DDL doesn't sync**: `benchbase.yml` runs `--create` on each MySQL node separately because Ordo DDL is not replicated across MySQL instances.
+- **DDL doesn't sync**: `benchbase.yml` runs `--create` on each MySQL node separately because Helios DDL is not replicated across MySQL instances.
 - **Data is shared**: `--load` runs once; data goes to shared LineairDB storage.
-- **TPC-H optimizer settings**: `benchbase.yml` and `measure.yml` both set hash join / subquery optimizer flags on each MySQL node. This is needed because Ordo's RPC-based architecture makes hash join vastly faster than nested-loop with PK lookups.
-- **Server restart clears data**: LineairDB is in-memory. Restarting the Ordo server loses all data. Re-run `benchbase.yml` after restart.
+- **TPC-H optimizer settings**: `benchbase.yml` and `measure.yml` both set hash join / subquery optimizer flags on each MySQL node. This is needed because Helios's RPC-based architecture makes hash join vastly faster than nested-loop with PK lookups.
+- **Server restart clears data**: LineairDB is in-memory. Restarting the Helios server loses all data. Re-run `benchbase.yml` after restart.
 
