@@ -17,7 +17,7 @@
     bench_type: ycsb
     bench_scalefactor: "{{ 0.1 if bench_type == 'tpch' else 10 }}"
     _mysql_bin: ~/helios/build/runtime_output_directory/mysql
-    _bb_dir: ~/helios/third_party/benchbase/benchbase-mysql
+    _bb_dir: ~/helios/bench/benchbase-mysql
     _config_dir: ~/helios/bench/config
   tasks:
     - name: Reset benchbase database on each MySQL

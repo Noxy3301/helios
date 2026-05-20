@@ -9,7 +9,7 @@ import xml.etree.ElementTree as ET
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
-BENCHBASE_DIR = ROOT / "third_party" / "benchbase" / "benchbase-mysql"
+BENCHBASE_DIR = ROOT / "bench" / "benchbase-mysql"
 CONFIG_SRC = ROOT / "bench" / "config" / "tpch.xml"
 TIMEOUT = 120  # seconds per query
 

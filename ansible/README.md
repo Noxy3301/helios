@@ -64,7 +64,7 @@ ls ~/helios/build/server/lineairdb-server
 ls ~/helios/build/runtime_output_directory/mysqld
 
 # BenchBase JAR exists
-ls ~/helios/third_party/benchbase/benchbase-mysql/benchbase.jar
+ls ~/helios/bench/benchbase-mysql/benchbase.jar
 
 # Java version
 java --version

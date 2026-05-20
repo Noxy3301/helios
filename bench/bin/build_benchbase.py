@@ -18,7 +18,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 BENCHBASE_SRC = ROOT / "third_party" / "benchbase"
-EXTRACT_DIR = BENCHBASE_SRC / "benchbase-mysql"
+EXTRACT_DIR = ROOT / "bench" / "benchbase-mysql"
 
 
 def build_benchbase():

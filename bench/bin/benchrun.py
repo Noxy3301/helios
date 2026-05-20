@@ -38,7 +38,7 @@ from pathlib import Path
 SCRIPTS_DIR = Path(__file__).resolve().parents[2] / "scripts"
 
 ROOT = Path(__file__).resolve().parents[2]
-BENCHBASE_DIR = ROOT / "third_party" / "benchbase" / "benchbase-mysql"
+BENCHBASE_DIR = ROOT / "bench" / "benchbase-mysql"
 MYSQL_BIN = ROOT / "build" / "runtime_output_directory" / "mysql"
 LINEAIRDB_LOG_DIR = ROOT / "lineairdb_logs"
 

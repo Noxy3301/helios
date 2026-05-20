@@ -45,7 +45,7 @@
     # Execute BenchBase (ensure sdkman Java is on PATH)
     export SDKMAN_DIR="$HOME/.sdkman"
     [ -s "$SDKMAN_DIR/bin/sdkman-init.sh" ] && source "$SDKMAN_DIR/bin/sdkman-init.sh"
-    cd ~/helios/third_party/benchbase/benchbase-mysql
+    cd ~/helios/bench/benchbase-mysql
     out_dir="{{ sample_dir | default('/tmp/metrics') }}/bench-{{ run_id | default('run') }}"
     dest="$out_dir/execute_{{ bench_term }}"
     mkdir -p "$dest"
@@ -81,7 +81,7 @@
     out_dir="{{ sample_dir | default('/tmp/metrics') }}/bench-{{ run_id | default('run') }}"
     dest="$out_dir/execute_{{ bench_term }}"
     mkdir -p "$dest"
-    bb_results=~/helios/third_party/benchbase/benchbase-mysql/results
+    bb_results=~/helios/bench/benchbase-mysql/results
     if [ -d "$bb_results" ]; then
       # Copy latest result files (csv, json, xml) and remove originals to avoid mixing with next run
       for f in "$bb_results"/*.{csv,json,xml}; do

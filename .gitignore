@@ -8,7 +8,7 @@ boost
 
 lineairdb_logs
 
-bench/benchbase
+bench/benchbase-mysql/
 bench/results
 bench/config/multi
 bench/config/generated
