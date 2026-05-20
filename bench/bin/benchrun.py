@@ -850,12 +850,14 @@ def _run_bench(args, config_work, thread_list, result_base):
             plot_dir = result_base / "_plot"
             plot_dir.mkdir(parents=True, exist_ok=True)
 
-            # Throughput plot (always)
+            # Throughput plot (always): solid = throughput, dashed = goodput
             terminals = [r["terminals"] for r in all_results]
             throughput = [r.get("throughput", 0) for r in all_results]
+            goodput = [r.get("goodput", 0) for r in all_results]
 
             fig, ax = plt.subplots(figsize=(10, 6))
             ax.plot(terminals, throughput, "b-o", label="Throughput", linewidth=2)
+            ax.plot(terminals, goodput, "b--s", label="Goodput", linewidth=1.5, markersize=5, alpha=0.8)
             ax.set_xlabel("Terminals")
             ax.set_ylabel("req/s")
             ax.set_title(f"{args.benchmark.upper()} SF={args.scalefactor}")
