@@ -54,6 +54,12 @@ private:
     void handleTxRead(const std::string& message, std::string& result);
     void handleTxBatchRead(const std::string& message, std::string& result);
     void handleTxBatchWrite(const std::string& message, std::string& result);
+    void handleTxStatelessRead(const std::string& message, std::string& result);
+    void handleTxStatelessBatchRead(const std::string& message, std::string& result);
+    void handleTxStatelessRangeScan(const std::string& message, std::string& result);
+    void handleTxStatelessSecondaryRangeScan(const std::string& message, std::string& result);
+    void handleTxExecuteReadPlan(const std::string& message, std::string& result);
+    void handleTxValidateAndCommit(const std::string& message, std::string& result);
     void handleTxWrite(const std::string& message, std::string& result);
     void handleTxDelete(const std::string& message, std::string& result);
 

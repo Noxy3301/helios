@@ -193,7 +193,7 @@ def update_xml(config_path, **kwargs):
     config_path.write_text(text)
 
 
-def run_benchbase(benchmark, config_path, create=False, load=False, execute=False):
+def run_benchbase(benchmark, config_path, create=False, load=False, execute=False, oneshot=False):
     """Run BenchBase with given phases."""
     jar = BENCHBASE_DIR / "benchbase.jar"
     if not jar.exists():
@@ -203,9 +203,10 @@ def run_benchbase(benchmark, config_path, create=False, load=False, execute=Fals
     flags = f"--create={'true' if create else 'false'} --load={'true' if load else 'false'} --execute={'true' if execute else 'false'}"
     cmd = f"java -jar {jar} -b {benchmark} -c {config_path} {flags}"
 
+    env = {**os.environ, "HELIOS_ONESHOT_PLAN": "1"} if oneshot else None
     result = subprocess.run(
         cmd, shell=True, cwd=BENCHBASE_DIR,
-        capture_output=True, text=True,
+        capture_output=True, text=True, env=env,
     )
     return result
 
@@ -346,7 +347,7 @@ def setup_benchmark(benchmark, config_path, mysql_host, mysql_port):
     return load_time
 
 
-def run_execute(benchmark, config_path, terminals, result_base):
+def run_execute(benchmark, config_path, terminals, result_base, oneshot=False):
     """Run execute phase with metrics collection. Returns result dict."""
     print(f"\n{'='*50}")
     print(f"  {benchmark.upper()} | Terminals: {terminals}")
@@ -371,7 +372,8 @@ def run_execute(benchmark, config_path, terminals, result_base):
     jar = BENCHBASE_DIR / "benchbase.jar"
     bb_cmd = ["java", "-jar", str(jar), "-b", benchmark, "-c", str(config_path),
               "--create=false", "--load=false", "--execute=true"]
-    bb_proc = subprocess.Popen(bb_cmd, cwd=BENCHBASE_DIR, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    env = {**os.environ, "HELIOS_ONESHOT_PLAN": "1"} if oneshot else None
+    bb_proc = subprocess.Popen(bb_cmd, cwd=BENCHBASE_DIR, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env)
     # bb_proc.pid IS the java process (no shell wrapper)
     f = open(metrics_dir / "pidstat-bench.log", "w")
     p = subprocess.Popen(["pidstat", "-u", "-w", "-p", str(bb_proc.pid), "1"], stdout=f, stderr=subprocess.DEVNULL)
@@ -649,7 +651,7 @@ def _plot_metrics(result_base, plot_dir):
 
 def main():
     parser = argparse.ArgumentParser(description="Ordo benchmark runner")
-    parser.add_argument("benchmark", choices=["tpcc", "tpch", "ycsb"], help="Benchmark type")
+    parser.add_argument("benchmark", choices=["tpcc", "tpcc-np", "tpch", "ycsb"], help="Benchmark type")
     parser.add_argument("--terminals", type=int, default=64, help="Number of terminals (default: 64)")
     parser.add_argument("--sweep", type=str, help="Comma-separated thread counts to sweep (e.g. 1,4,16,64)")
     parser.add_argument("--scalefactor", type=float, default=1, help="Scale factor (default: 1)")
@@ -666,6 +668,9 @@ def main():
                         help="Skip auto start/stop of lineairdb-server and mysqld (assume already running)")
     parser.add_argument("--keep-lineairdb-logs", action="store_true",
                         help="Keep lineairdb_logs after the benchmark")
+    parser.add_argument("--oneshot", action="store_true",
+                        help="Enable Oneshot path: SET GLOBAL lineairdb_oneshot_execution=ON and "
+                             "pass HELIOS_ONESHOT_PLAN=1 to BenchBase (TPC-C procedures inject @_ldb_plan)")
     args = parser.parse_args()
 
     # Validate
@@ -780,6 +785,12 @@ def main():
 
 def _run_bench(args, config_work, thread_list, result_base):
     """Setup + execute sweep + summary + plots. Extracted so main() can wrap it."""
+    # Toggle Oneshot sysvar explicitly to avoid stale state from prior runs.
+    oneshot_value = "ON" if args.oneshot else "OFF"
+    print(f"  Setting lineairdb_oneshot_execution={oneshot_value}")
+    mysql_cmd(args.mysql_port, args.mysql_host,
+              f"SET GLOBAL lineairdb_oneshot_execution={oneshot_value};")
+
     # Setup phase
     load_time = None
     if args.no_setup:
@@ -807,7 +818,7 @@ def _run_bench(args, config_work, thread_list, result_base):
     # Execute: sweep terminal counts (data is reused)
     all_results = []
     for terminals in thread_list:
-        result = run_execute(args.benchmark, config_work, terminals, result_base)
+        result = run_execute(args.benchmark, config_work, terminals, result_base, oneshot=args.oneshot)
         if result:
             result["load_time"] = load_time
             all_results.append(result)
@@ -839,12 +850,14 @@ def _run_bench(args, config_work, thread_list, result_base):
             plot_dir = result_base / "_plot"
             plot_dir.mkdir(parents=True, exist_ok=True)
 
-            # Throughput plot (always)
+            # Throughput plot (always): solid = throughput, dashed = goodput
             terminals = [r["terminals"] for r in all_results]
             throughput = [r.get("throughput", 0) for r in all_results]
+            goodput = [r.get("goodput", 0) for r in all_results]
 
             fig, ax = plt.subplots(figsize=(10, 6))
             ax.plot(terminals, throughput, "b-o", label="Throughput", linewidth=2)
+            ax.plot(terminals, goodput, "b--s", label="Goodput", linewidth=1.5, markersize=5, alpha=0.8)
             ax.set_xlabel("Terminals")
             ax.set_ylabel("req/s")
             ax.set_title(f"{args.benchmark.upper()} SF={args.scalefactor}")
@@ -855,8 +868,8 @@ def _run_bench(args, config_work, thread_list, result_base):
             plt.close()
             print(f"Plot saved: {plot_dir / 'throughput.png'}")
 
-            # TPC-C latency distribution plot
-            if args.benchmark == "tpcc":
+            # TPC-C latency distribution plot (also for NP variant)
+            if args.benchmark in ("tpcc", "tpcc-np"):
                 _plot_tpcc_latency(result_base, plot_dir, args.scalefactor)
 
             # Metrics plots (CPU, context switches, per-process)

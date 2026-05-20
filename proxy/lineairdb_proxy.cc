@@ -14,6 +14,49 @@
 #include "rpc_trace.hh"
 #include "../common/log.h"
 
+namespace {
+
+LineairDBProxy::RangeValidationEntry decode_range_validation_entry(
+    const LineairDB::Protocol::RangeValidationEntry& entry) {
+    LineairDBProxy::RangeValidationEntry out;
+    out.table_name = entry.table_name();
+    out.index_name = entry.index_name();
+    out.owner_ptr = entry.owner_ptr();
+    out.node_ptr = entry.node_ptr();
+    out.version = entry.version();
+    out.start_key = entry.start_key();
+    out.end_key = entry.end_key();
+    out.row_limit = entry.row_limit();
+    out.reverse_scan = entry.reverse_scan();
+    out.result_keys.reserve(entry.result_keys_size());
+    for (const auto& key : entry.result_keys()) out.result_keys.push_back(key);
+    out.result_primary_keys.reserve(entry.result_primary_keys_size());
+    for (const auto& key : entry.result_primary_keys()) {
+        out.result_primary_keys.push_back(key);
+    }
+    return out;
+}
+
+void encode_range_validation_entry(
+    const LineairDBProxy::RangeValidationEntry& entry,
+    LineairDB::Protocol::RangeValidationEntry* out) {
+    out->set_table_name(entry.table_name);
+    out->set_index_name(entry.index_name);
+    out->set_owner_ptr(entry.owner_ptr);
+    out->set_node_ptr(entry.node_ptr);
+    out->set_version(entry.version);
+    out->set_start_key(entry.start_key);
+    out->set_end_key(entry.end_key);
+    out->set_row_limit(entry.row_limit);
+    out->set_reverse_scan(entry.reverse_scan);
+    for (const auto& key : entry.result_keys) out->add_result_keys(key);
+    for (const auto& key : entry.result_primary_keys) {
+        out->add_result_primary_keys(key);
+    }
+}
+
+}  // namespace
+
 
 LineairDBProxy::LineairDBProxy(const std::string& host, int port)
     : socket_fd_(-1), connected_(false), host_(host), port_(port) {
@@ -301,6 +344,374 @@ bool LineairDBProxy::tx_batch_write(LineairDBTransaction* tx,
 
     tx->set_aborted(response.is_aborted());
     return response.success();
+}
+
+LineairDBProxy::StatelessReadResult LineairDBProxy::tx_stateless_read(
+    const std::string& table_name, const std::string& key) {
+    StatelessReadResult result;
+    if (!connected_) {
+        LOG_ERROR("RPC failed: Not connected to server");
+        return result;
+    }
+
+    LineairDB::Protocol::TxStatelessRead::Request request;
+    LineairDB::Protocol::TxStatelessRead::Response response;
+    request.set_table_name(table_name);
+    request.set_key(key);
+
+    if (!send_protobuf_message(request, response,
+                               MessageType::TX_STATELESS_READ)) {
+        LOG_ERROR("RPC failed: Failed to send stateless_read message to server");
+        return result;
+    }
+
+    result.ok = true;
+    result.found = response.found();
+    result.tid = response.tid();
+    if (result.found) result.value = response.value();
+    return result;
+}
+
+std::vector<LineairDBProxy::StatelessReadResult>
+LineairDBProxy::tx_stateless_batch_read(
+    const std::vector<StatelessReadKey>& keys) {
+    if (!connected_) {
+        LOG_ERROR("RPC failed: Not connected to server");
+        return {};
+    }
+
+    LineairDB::Protocol::TxStatelessBatchRead::Request request;
+    LineairDB::Protocol::TxStatelessBatchRead::Response response;
+    for (const auto& key : keys) {
+        auto* op = request.add_ops();
+        op->set_table_name(key.table_name);
+        op->set_key(key.key);
+    }
+
+    if (!send_protobuf_message(request, response,
+                               MessageType::TX_STATELESS_BATCH_READ)) {
+        LOG_ERROR("RPC failed: Failed to send stateless_batch_read message to server");
+        return {};
+    }
+
+    std::vector<StatelessReadResult> results;
+    results.reserve(response.results_size());
+    for (const auto& r : response.results()) {
+        StatelessReadResult result;
+        result.ok = true;
+        result.found = r.found();
+        result.value = r.found() ? r.value() : "";
+        result.tid = r.tid();
+        results.push_back(std::move(result));
+    }
+    return results;
+}
+
+LineairDBProxy::StatelessRangeScanResult
+LineairDBProxy::tx_stateless_range_scan(const std::string& table_name,
+                                        const std::string& start_key,
+                                        const std::string& end_key,
+                                        uint64_t row_limit,
+                                        bool reverse_scan) {
+    StatelessRangeScanResult result;
+    if (!connected_) {
+        LOG_ERROR("RPC failed: Not connected to server");
+        return result;
+    }
+
+    LineairDB::Protocol::TxStatelessRangeScan::Request request;
+    LineairDB::Protocol::TxStatelessRangeScan::Response response;
+    request.set_table_name(table_name);
+    request.set_start_key(start_key);
+    request.set_end_key(end_key);
+    request.set_row_limit(row_limit);
+    request.set_reverse_scan(reverse_scan);
+
+    if (!send_protobuf_message(request, response,
+                               MessageType::TX_STATELESS_RANGE_SCAN)) {
+        LOG_ERROR("RPC failed: Failed to send stateless range scan message to server");
+        return result;
+    }
+
+    result.ok = response.ok();
+    if (!result.ok) return result;
+    result.rows.reserve(response.rows_size());
+    for (const auto& row : response.rows()) {
+        result.rows.push_back({row.key(), row.value(), row.found(),
+                               row.tid()});
+    }
+
+    result.range_versions.reserve(response.range_versions_size());
+    for (const auto& entry : response.range_versions()) {
+        result.range_versions.push_back(decode_range_validation_entry(entry));
+    }
+
+    result.index_reads.reserve(response.index_reads_size());
+    for (const auto& entry : response.index_reads()) {
+        result.index_reads.push_back({entry.table_name(), entry.index_name(),
+                                      entry.key(), entry.tid(),
+                                      entry.found()});
+    }
+
+    return result;
+}
+
+LineairDBProxy::StatelessSecondaryRangeScanResult
+LineairDBProxy::tx_stateless_secondary_range_scan(
+        const std::string& table_name,
+        const std::string& index_name,
+        const std::string& start_key,
+        const std::string& end_key,
+        uint64_t row_limit,
+        bool reverse_scan) {
+    StatelessSecondaryRangeScanResult result;
+    if (!connected_) {
+        LOG_ERROR("RPC failed: Not connected to server");
+        return result;
+    }
+
+    LineairDB::Protocol::TxStatelessSecondaryRangeScan::Request request;
+    LineairDB::Protocol::TxStatelessSecondaryRangeScan::Response response;
+    request.set_table_name(table_name);
+    request.set_index_name(index_name);
+    request.set_start_key(start_key);
+    request.set_end_key(end_key);
+    request.set_row_limit(row_limit);
+    request.set_reverse_scan(reverse_scan);
+
+    if (!send_protobuf_message(
+            request, response,
+            MessageType::TX_STATELESS_SECONDARY_RANGE_SCAN)) {
+        LOG_ERROR("RPC failed: Failed to send stateless secondary range scan message to server");
+        return result;
+    }
+
+    result.ok = response.ok();
+    if (!result.ok) return result;
+    result.rows.reserve(response.rows_size());
+    for (const auto& row : response.rows()) {
+        result.rows.push_back({row.secondary_key(), row.primary_key(),
+                               row.value(), row.found(), row.tid()});
+    }
+
+    result.range_versions.reserve(response.range_versions_size());
+    for (const auto& entry : response.range_versions()) {
+        result.range_versions.push_back(decode_range_validation_entry(entry));
+    }
+
+    result.index_reads.reserve(response.index_reads_size());
+    for (const auto& entry : response.index_reads()) {
+        result.index_reads.push_back({entry.table_name(), entry.index_name(),
+                                      entry.key(), entry.tid(),
+                                      entry.found()});
+    }
+
+    return result;
+}
+
+LineairDBProxy::ReadPlanResult LineairDBProxy::tx_execute_read_plan(
+    const std::vector<ReadPlanStep>& steps) {
+    ReadPlanResult result;
+    if (!connected_) {
+        LOG_ERROR("RPC failed: Not connected to server");
+        return result;
+    }
+
+    LineairDB::Protocol::TxExecuteReadPlan::Request request;
+    LineairDB::Protocol::TxExecuteReadPlan::Response response;
+    for (const auto& step : steps) {
+        auto* out = request.add_steps();
+        out->set_table_name(step.table_name);
+        out->set_key_prefix(step.key_prefix);
+        out->set_end_key_prefix(step.end_key_prefix);
+        out->set_is_scan(step.is_scan);
+        out->set_scan_limit(step.scan_limit);
+        out->set_index_name(step.index_name);
+        out->set_for_each(step.for_each);
+        out->set_reverse_scan(step.reverse_scan);
+        for (const auto& binding : step.bindings) {
+            auto* b = out->add_bindings();
+            b->set_source_step(binding.source_step);
+            b->set_source_row(binding.source_row);
+            b->set_source_offset(binding.source_offset);
+            b->set_source_length(binding.source_length);
+            b->set_use_midpoint(binding.use_midpoint);
+            b->set_from_key(binding.from_key);
+            b->set_source_column(binding.source_column);
+            b->set_column_as_int_key(binding.column_as_int_key);
+            b->set_int_delta(binding.int_delta);
+        }
+        for (const auto& binding : step.end_bindings) {
+            auto* b = out->add_end_bindings();
+            b->set_source_step(binding.source_step);
+            b->set_source_row(binding.source_row);
+            b->set_source_offset(binding.source_offset);
+            b->set_source_length(binding.source_length);
+            b->set_use_midpoint(binding.use_midpoint);
+            b->set_from_key(binding.from_key);
+            b->set_source_column(binding.source_column);
+            b->set_column_as_int_key(binding.column_as_int_key);
+            b->set_int_delta(binding.int_delta);
+        }
+    }
+
+    if (!send_protobuf_message(request, response,
+                               MessageType::TX_EXECUTE_READ_PLAN)) {
+        LOG_ERROR("RPC failed: Failed to send execute read plan message to server");
+        return result;
+    }
+
+    result.ok = response.ok();
+    if (!result.ok) return result;
+    result.steps.reserve(response.results_size());
+    for (const auto& step : response.results()) {
+        ReadPlanStepResult out;
+        out.found = step.found();
+        out.value = step.value();
+        out.tid = step.tid();
+        out.actual_key = step.actual_key();
+        out.actual_start_key = step.actual_start_key();
+        out.actual_end_key = step.actual_end_key();
+        out.scan_keys.reserve(step.scan_keys_size());
+        for (const auto& key : step.scan_keys()) out.scan_keys.push_back(key);
+        out.scan_values.reserve(step.scan_values_size());
+        for (const auto& value : step.scan_values()) out.scan_values.push_back(value);
+        out.scan_tids.reserve(step.scan_tids_size());
+        for (const auto tid : step.scan_tids()) out.scan_tids.push_back(tid);
+        out.secondary_keys.reserve(step.secondary_keys_size());
+        for (const auto& key : step.secondary_keys()) out.secondary_keys.push_back(key);
+        out.range_versions.reserve(step.range_versions_size());
+        for (const auto& entry : step.range_versions()) {
+            out.range_versions.push_back(decode_range_validation_entry(entry));
+        }
+        out.index_reads.reserve(step.index_reads_size());
+        for (const auto& entry : step.index_reads()) {
+            out.index_reads.push_back({entry.table_name(), entry.index_name(),
+                                       entry.key(), entry.tid(),
+                                       entry.found()});
+        }
+        result.steps.push_back(std::move(out));
+    }
+
+    result.range_versions.reserve(response.range_versions_size());
+    for (const auto& entry : response.range_versions()) {
+        result.range_versions.push_back(decode_range_validation_entry(entry));
+    }
+
+    result.index_reads.reserve(response.index_reads_size());
+    for (const auto& entry : response.index_reads()) {
+        result.index_reads.push_back({entry.table_name(), entry.index_name(),
+                                      entry.key(), entry.tid(),
+                                      entry.found()});
+    }
+
+    return result;
+}
+
+bool LineairDBProxy::tx_validate_and_commit(
+    const std::vector<StatelessReadKey>& reads,
+    const std::vector<uint64_t>& read_tids,
+    const std::vector<bool>& read_found,
+    const std::vector<RangeValidationEntry>& range_reads,
+    const std::vector<IndexValidationEntry>& index_reads,
+    const std::vector<BatchOp>& ops,
+    const std::vector<std::pair<std::string, int64_t>>& row_deltas,
+    bool isFence,
+    std::string* abort_reason) {
+    if (abort_reason != nullptr) abort_reason->clear();
+    if (!connected_) {
+        LOG_ERROR("RPC failed: Not connected to server");
+        return false;
+    }
+    if (reads.size() != read_tids.size() || reads.size() != read_found.size()) {
+        LOG_ERROR("validate_and_commit: read metadata size mismatch");
+        return false;
+    }
+
+    LineairDB::Protocol::TxValidateAndCommit::Request request;
+    LineairDB::Protocol::TxValidateAndCommit::Response response;
+    request.set_fence(isFence);
+
+    for (size_t i = 0; i < reads.size(); ++i) {
+        auto* read = request.add_reads();
+        read->set_table_name(reads[i].table_name);
+        read->set_key(reads[i].key);
+        read->set_tid(read_tids[i]);
+        read->set_found(read_found[i]);
+    }
+
+    for (const auto& entry : range_reads) {
+        auto* range = request.add_range_reads();
+        encode_range_validation_entry(entry, range);
+    }
+
+    for (const auto& entry : index_reads) {
+        auto* read = request.add_index_reads();
+        read->set_table_name(entry.table_name);
+        read->set_index_name(entry.index_name);
+        read->set_key(entry.key);
+        read->set_tid(entry.tid);
+        read->set_found(entry.found);
+    }
+
+    for (const auto& batch_op : ops) {
+        switch (batch_op.type) {
+            case BatchOp::Type::Write: {
+                auto* write = request.add_writes();
+                write->set_table_name(batch_op.table_name);
+                write->set_key(batch_op.key);
+                write->set_value(batch_op.value);
+                write->set_is_delete(false);
+                break;
+            }
+            case BatchOp::Type::Delete: {
+                auto* write = request.add_writes();
+                write->set_table_name(batch_op.table_name);
+                write->set_key(batch_op.key);
+                write->set_is_delete(true);
+                break;
+            }
+            case BatchOp::Type::SecondaryIndexWrite: {
+                auto* si = request.add_secondary_index_ops();
+                si->set_table_name(batch_op.table_name);
+                si->set_index_name(batch_op.index_name);
+                si->set_secondary_key(batch_op.secondary_key);
+                si->set_primary_key(batch_op.primary_key);
+                si->set_is_delete(false);
+                break;
+            }
+            case BatchOp::Type::SecondaryIndexDelete: {
+                auto* si = request.add_secondary_index_ops();
+                si->set_table_name(batch_op.table_name);
+                si->set_index_name(batch_op.index_name);
+                si->set_secondary_key(batch_op.secondary_key);
+                si->set_primary_key(batch_op.primary_key);
+                si->set_is_delete(true);
+                break;
+            }
+        }
+    }
+
+    for (const auto& [table, delta] : row_deltas) {
+        auto* rd = request.add_row_deltas();
+        rd->set_table_name(table);
+        rd->set_delta(delta);
+    }
+
+    if (!send_protobuf_message(request, response,
+                               MessageType::TX_VALIDATE_AND_COMMIT)) {
+        LOG_ERROR("RPC failed: Failed to send validate_and_commit message to server");
+        return false;
+    }
+
+    table_stats_cache_.clear();
+    for (const auto& ts : response.table_stats()) {
+        table_stats_cache_[ts.table_name()] = ts.row_count();
+    }
+    if (!response.committed() && abort_reason != nullptr) {
+        *abort_reason = response.abort_reason();
+    }
+    return response.committed();
 }
 
 std::vector<std::string> LineairDBProxy::tx_read_secondary_index(LineairDBTransaction* tx,

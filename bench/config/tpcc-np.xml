@@ -1,0 +1,74 @@
+<?xml version="1.0"?>
+<parameters>
+
+    <!--
+        TPC-C-NP: TPC-C subset that exercises only NewOrder and Payment.
+
+        NewOrder and Payment together cover 88% of the default TPC-C mix
+        (45% + 43%) and carry essentially all of the write-write
+        contention in the workload. The three transactions removed in
+        the NP variant are either read-only or deferred and therefore
+        do not exercise the concurrency-control path that NP is meant
+        to isolate:
+            - OrderStatus (4%): read-only customer inquiry
+            - Delivery   (4%): deferred / batch processing, whose tail
+                               latency reflects queue handling rather
+                               than CC overhead
+            - StockLevel (4%): read-only periodic report
+
+        The variant originates from DBx1000 (Yu et al., "Staring into
+        the Abyss: An Evaluation of Concurrency Control with One
+        Thousand Cores", VLDB 2014), whose README states "Only Payment
+        and New Order transactions are modeled." Subsequent concurrency
+        control papers, including Cicada (Lim et al., SIGMOD 2017),
+        adopt the same subset under the TPC-C-NP name.
+
+        Weights preserve the 45:43 spec ratio between NewOrder and
+        Payment (51.1% / 48.9% after renormalization). OrderStatus,
+        Delivery, and StockLevel remain declared as transaction types
+        but are weighted zero so the workload mix stays comparable
+        with the standard tpcc.xml definition.
+    -->
+
+    <!-- Connection details -->
+    <type>MYSQL</type>
+    <driver>com.mysql.cj.jdbc.Driver</driver>
+    <url>jdbc:mysql://localhost:3307/benchbase?rewriteBatchedStatements=true&amp;sslMode=DISABLED</url>
+    <username>root</username>
+    <password></password>
+    <isolation>TRANSACTION_SERIALIZABLE</isolation>
+    <batchsize>128</batchsize>
+    <allowPublicKeyRetrieval>true</allowPublicKeyRetrieval>
+
+    <!-- Scale factor is the number of warehouses in TPCC -->
+    <scalefactor>1</scalefactor>
+
+    <!-- The workload -->
+    <terminals>1</terminals>
+    <works>
+        <work>
+            <time>60</time>
+            <rate>unlimited</rate>
+            <weights>45,43,0,0,0</weights>
+        </work>
+    </works>
+
+    <!-- TPCC specific -->
+    <transactiontypes>
+        <transactiontype>
+            <name>NewOrder</name>
+        </transactiontype>
+        <transactiontype>
+            <name>Payment</name>
+        </transactiontype>
+        <transactiontype>
+            <name>OrderStatus</name>
+        </transactiontype>
+        <transactiontype>
+            <name>Delivery</name>
+        </transactiontype>
+        <transactiontype>
+            <name>StockLevel</name>
+        </transactiontype>
+    </transactiontypes>
+</parameters>

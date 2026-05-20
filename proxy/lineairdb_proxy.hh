@@ -73,7 +73,15 @@ enum class MessageType : uint32_t {
 
     // Batch operations
     TX_BATCH_READ = 25,
-    TX_BATCH_WRITE = 26
+    TX_BATCH_WRITE = 26,
+
+    // Experimental one-shot operations
+    TX_STATELESS_READ = 27,
+    TX_STATELESS_BATCH_READ = 28,
+    TX_VALIDATE_AND_COMMIT = 29,
+    TX_STATELESS_RANGE_SCAN = 30,
+    TX_STATELESS_SECONDARY_RANGE_SCAN = 31,
+    TX_EXECUTE_READ_PLAN = 32
 };
 
 /**
@@ -108,6 +116,104 @@ public:
         bool found;
         std::string value;
     };
+    struct StatelessReadResult {
+        bool ok = false;
+        bool found = false;
+        std::string value;
+        uint64_t tid = 0;
+    };
+    struct StatelessReadKey {
+        std::string table_name;
+        std::string key;
+    };
+    struct RangeValidationEntry {
+        std::string table_name;
+        std::string index_name;
+        uint64_t owner_ptr;
+        uint64_t node_ptr;
+        uint64_t version;
+        std::string start_key;
+        std::string end_key;
+        uint64_t row_limit = 0;
+        bool reverse_scan = false;
+        std::vector<std::string> result_keys;
+        std::vector<std::string> result_primary_keys;
+    };
+    struct IndexValidationEntry {
+        std::string table_name;
+        std::string index_name;
+        std::string key;
+        uint64_t tid;
+        bool found;
+    };
+    struct StatelessRangeScanRow {
+        std::string key;
+        std::string value;
+        bool found;
+        uint64_t tid;
+    };
+    struct StatelessRangeScanResult {
+        bool ok = false;
+        std::vector<StatelessRangeScanRow> rows;
+        std::vector<RangeValidationEntry> range_versions;
+        std::vector<IndexValidationEntry> index_reads;
+    };
+    struct StatelessSecondaryRangeScanRow {
+        std::string secondary_key;
+        std::string primary_key;
+        std::string value;
+        bool found;
+        uint64_t tid;
+    };
+    struct StatelessSecondaryRangeScanResult {
+        bool ok = false;
+        std::vector<StatelessSecondaryRangeScanRow> rows;
+        std::vector<RangeValidationEntry> range_versions;
+        std::vector<IndexValidationEntry> index_reads;
+    };
+    struct ReadPlanKeyBinding {
+        uint32_t source_step = 0;
+        uint32_t source_row = 0;
+        uint32_t source_offset = 0;
+        uint32_t source_length = 0;
+        bool use_midpoint = false;
+        bool from_key = false;
+        int32_t source_column = 0;
+        bool column_as_int_key = false;
+        int64_t int_delta = 0;
+    };
+    struct ReadPlanStep {
+        std::string table_name;
+        std::string key_prefix;
+        std::string end_key_prefix;
+        bool is_scan = false;
+        uint64_t scan_limit = 0;
+        std::string index_name;
+        std::vector<ReadPlanKeyBinding> bindings;
+        std::vector<ReadPlanKeyBinding> end_bindings;
+        bool for_each = false;
+        bool reverse_scan = false;
+    };
+    struct ReadPlanStepResult {
+        bool found = false;
+        std::string value;
+        uint64_t tid = 0;
+        std::string actual_key;
+        std::vector<std::string> scan_keys;
+        std::vector<std::string> scan_values;
+        std::vector<uint64_t> scan_tids;
+        std::vector<std::string> secondary_keys;
+        std::string actual_start_key;
+        std::string actual_end_key;
+        std::vector<RangeValidationEntry> range_versions;
+        std::vector<IndexValidationEntry> index_reads;
+    };
+    struct ReadPlanResult {
+        bool ok = false;
+        std::vector<ReadPlanStepResult> steps;
+        std::vector<RangeValidationEntry> range_versions;
+        std::vector<IndexValidationEntry> index_reads;
+    };
     std::vector<BatchReadResult> tx_batch_read(LineairDBTransaction* tx,
                                                 const std::vector<std::string>& keys);
     struct BatchOp {
@@ -128,6 +234,35 @@ public:
     bool tx_batch_write(LineairDBTransaction* tx,
                         const std::string& table_name,
                         const std::vector<BatchOp>& ops);
+    StatelessReadResult tx_stateless_read(const std::string& table_name,
+                                          const std::string& key);
+    std::vector<StatelessReadResult> tx_stateless_batch_read(
+        const std::vector<StatelessReadKey>& keys);
+    StatelessRangeScanResult tx_stateless_range_scan(
+        const std::string& table_name,
+        const std::string& start_key,
+        const std::string& end_key,
+        uint64_t row_limit,
+        bool reverse_scan);
+    StatelessSecondaryRangeScanResult tx_stateless_secondary_range_scan(
+        const std::string& table_name,
+        const std::string& index_name,
+        const std::string& start_key,
+        const std::string& end_key,
+        uint64_t row_limit,
+        bool reverse_scan);
+    ReadPlanResult tx_execute_read_plan(
+        const std::vector<ReadPlanStep>& steps);
+    bool tx_validate_and_commit(
+        const std::vector<StatelessReadKey>& reads,
+        const std::vector<uint64_t>& read_tids,
+        const std::vector<bool>& read_found,
+        const std::vector<RangeValidationEntry>& range_reads,
+        const std::vector<IndexValidationEntry>& index_reads,
+        const std::vector<BatchOp>& ops,
+        const std::vector<std::pair<std::string, int64_t>>& row_deltas,
+        bool isFence,
+        std::string* abort_reason = nullptr);
 
     // secondary index operations
     std::vector<std::string> tx_read_secondary_index(LineairDBTransaction* tx,

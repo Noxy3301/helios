@@ -89,9 +89,14 @@ public:
   void set_status_to_abort();
   bool end_transaction();
   void fence() const;
-  
+  void set_oneshot_mode(bool enabled) { oneshot_mode_ = enabled; }
+  bool is_oneshot_mode() const { return oneshot_mode_; }
+  void prefetch_stateless_reads(
+      const std::vector<LineairDBProxy::StatelessReadKey>& reads);
+  void execute_read_plan(const std::vector<LineairDBProxy::ReadPlanStep>& steps);
 
   inline bool is_not_started() const {
+    if (oneshot_mode_) return !oneshot_registered_;
     if (tx_id == -1) return true;
     return false;
   }
@@ -122,6 +127,7 @@ public:
 
   // RPC trace statement boundary; TxRpcTrace dedupes repeated SQL strings.
   void on_stmt_boundary(const std::string& sql) { rpc_trace_.on_stmt(sql); }
+  bool fallback_to_normal_transaction(const char* reason);
 
   LineairDBTransaction(THD* thd, 
                        LineairDBProxy* lineairdb_proxy, 
@@ -137,6 +143,8 @@ private:
   bool isTransaction;
   handlerton* hton;
   bool isFence;
+  bool oneshot_mode_{false};
+  bool oneshot_registered_{false};
 
   // stores the last RPC read result to maintain data pointer validity
   std::string last_read_value_;
@@ -156,11 +164,52 @@ private:
     std::string key;
     bool found;
     std::string value;
+    uint64_t tid = 0;
+    bool validate_on_use = false;
   };
+  // These sets live only inside one LineairDBTransaction.
+  // commit/abort deletes the object, so prefetched rows never cross txs.
+
   // Proxy-side read set for exact primary-key reads
   std::vector<LocalRowEntry> local_read_set_;
   // Proxy-side write set for exact primary-key writes/deletes
   std::vector<LocalRowEntry> local_write_set_;
+
+  struct StatelessReadEntry {
+    std::string table_name;
+    std::string key;
+    uint64_t tid;
+    bool found;
+  };
+  std::vector<StatelessReadEntry> stateless_read_set_;
+  std::vector<LineairDBProxy::RangeValidationEntry> range_validation_set_;
+  std::vector<LineairDBProxy::IndexValidationEntry> index_validation_set_;
+
+  struct LocalRangeScanEntry {
+    std::string table_name;
+    std::string start_key;
+    std::string end_key;
+    bool reverse_scan;
+    uint64_t row_limit = 0;
+    std::vector<std::pair<std::string, std::string>> rows;
+    std::vector<uint64_t> row_tids;
+    std::vector<LineairDBProxy::RangeValidationEntry> range_versions;
+    std::vector<LineairDBProxy::IndexValidationEntry> index_reads;
+  };
+  struct LocalSecondaryScanEntry {
+    std::string table_name;
+    std::string index_name;
+    std::string start_key;
+    std::string end_key;
+    bool reverse_scan;
+    uint64_t row_limit = 0;
+    std::vector<std::string> secondary_keys;
+    std::vector<std::string> primary_keys;
+    std::vector<LineairDBProxy::RangeValidationEntry> range_versions;
+    std::vector<LineairDBProxy::IndexValidationEntry> index_reads;
+  };
+  std::vector<LocalRangeScanEntry> local_range_scans_;
+  std::vector<LocalSecondaryScanEntry> local_secondary_scans_;
 
   // Predicate pushdown: serialized PushedPredicate for scan filtering
   std::string pushed_filter_;
@@ -196,12 +245,34 @@ private:
   void merge_pending_rows_into_prefix_scan(
       std::vector<std::pair<std::string, std::string>>& rows,
       const std::string& prefix) const;
+  bool has_pending_ops_for_table(const std::string& table_name) const;
+  bool has_pending_secondary_ops_for_index(
+      const std::string& table_name,
+      const std::string& index_name) const;
+  void drop_local_secondary_scans(const std::string& table_name,
+                                  const std::string& index_name);
   void record_local_write(const std::string& table_name,
                           const std::string& key, bool found,
                           const std::string& value);
   void record_local_read(const std::string& table_name,
                          const std::string& key, bool found,
-                         const std::string& value);
+                         const std::string& value, uint64_t tid = 0,
+                         bool validate_on_use = false);
+  void record_stateless_read(const std::string& table_name,
+                             const std::string& key, bool found,
+                             uint64_t tid);
+  void activate_local_read(const LocalRowEntry& entry);
+  void activate_range_validation(
+      const std::vector<LineairDBProxy::RangeValidationEntry>& ranges,
+      const std::vector<LineairDBProxy::IndexValidationEntry>& indexes);
+  std::optional<LocalRangeScanEntry> lookup_local_range_scan(
+      const std::string& table_name, const std::string& start_key,
+      const std::string& end_key, bool reverse_scan, uint64_t row_limit) const;
+  std::optional<LocalSecondaryScanEntry> lookup_local_secondary_scan(
+      const std::string& table_name, const std::string& index_name,
+      const std::string& start_key, const std::string& end_key,
+      bool reverse_scan, uint64_t row_limit) const;
+  bool oneshot_validate_and_commit();
   bool thd_is_transaction() const;
   void register_transaction_to_mysql();
   void register_single_statement_to_mysql();
