@@ -651,7 +651,7 @@ def _plot_metrics(result_base, plot_dir):
 
 def main():
     parser = argparse.ArgumentParser(description="Ordo benchmark runner")
-    parser.add_argument("benchmark", choices=["tpcc", "tpch", "ycsb"], help="Benchmark type")
+    parser.add_argument("benchmark", choices=["tpcc", "tpcc-np", "tpch", "ycsb"], help="Benchmark type")
     parser.add_argument("--terminals", type=int, default=64, help="Number of terminals (default: 64)")
     parser.add_argument("--sweep", type=str, help="Comma-separated thread counts to sweep (e.g. 1,4,16,64)")
     parser.add_argument("--scalefactor", type=float, default=1, help="Scale factor (default: 1)")
@@ -868,8 +868,8 @@ def _run_bench(args, config_work, thread_list, result_base):
             plt.close()
             print(f"Plot saved: {plot_dir / 'throughput.png'}")
 
-            # TPC-C latency distribution plot
-            if args.benchmark == "tpcc":
+            # TPC-C latency distribution plot (also for NP variant)
+            if args.benchmark in ("tpcc", "tpcc-np"):
                 _plot_tpcc_latency(result_base, plot_dir, args.scalefactor)
 
             # Metrics plots (CPU, context switches, per-process)
