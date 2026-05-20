@@ -13,7 +13,7 @@ Usage:
   python3 bench/bin/benchrun.py ycsb --profile a --terminals 8 --scalefactor 100
 
 Prerequisites:
-  - BenchBase patched and built (bench/bin/patch_benchbase.py)
+  - BenchBase built (bench/bin/build_benchbase.py)
 
 Server lifecycle:
   By default, this script auto-starts lineairdb-server + mysqld at the
@@ -197,7 +197,7 @@ def run_benchbase(benchmark, config_path, create=False, load=False, execute=Fals
     """Run BenchBase with given phases."""
     jar = BENCHBASE_DIR / "benchbase.jar"
     if not jar.exists():
-        print(f"ERROR: {jar} not found. Run: python3 bench/bin/patch_benchbase.py", file=sys.stderr)
+        print(f"ERROR: {jar} not found. Run: python3 bench/bin/build_benchbase.py", file=sys.stderr)
         sys.exit(1)
 
     flags = f"--create={'true' if create else 'false'} --load={'true' if load else 'false'} --execute={'true' if execute else 'false'}"
@@ -676,7 +676,7 @@ def main():
     # Validate
     jar = BENCHBASE_DIR / "benchbase.jar"
     if not jar.exists():
-        print(f"ERROR: {jar} not found.\nRun: python3 bench/bin/patch_benchbase.py", file=sys.stderr)
+        print(f"ERROR: {jar} not found.\nRun: python3 bench/bin/build_benchbase.py", file=sys.stderr)
         sys.exit(1)
 
     # Prepare config

@@ -9,10 +9,10 @@
 ./scripts/start_mysql.sh --mysqld-port 3307 --server-host 127.0.0.1 --server-port 9999
 ```
 
-### 2. Patch BenchBase (first time only)
+### 2. Build BenchBase (first time only)
 
 ```bash
-python3 bench/bin/patch_benchbase.py
+python3 bench/bin/build_benchbase.py
 ```
 
 ### 3. Run benchmark

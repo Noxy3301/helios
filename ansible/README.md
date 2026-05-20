@@ -47,11 +47,11 @@ cd helios
 ./scripts/build.sh
 ```
 
-#### 4. Patch and build BenchBase
+#### 4. Build BenchBase
 
 ```bash
 cd ~/helios
-python3 bench/bin/patch_benchbase.py
+python3 bench/bin/build_benchbase.py
 ```
 
 #### 5. Verify build

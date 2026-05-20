@@ -63,8 +63,8 @@ SELECT * FROM test WHERE id = 1;
 ## Benchmark
 
 ```bash
-# Patch BenchBase (first time only)
-python3 bench/bin/patch_benchbase.py
+# Build BenchBase (first time only)
+python3 bench/bin/build_benchbase.py
 
 # TPC-C
 python3 bench/bin/benchrun.py tpcc --terminals 64
