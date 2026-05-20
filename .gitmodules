@@ -9,5 +9,6 @@
 	ignore = dirty
 [submodule "third_party/benchbase"]
 	path = third_party/benchbase
-	url = https://github.com/cmu-db/benchbase.git
+	url = https://github.com/Noxy3301/benchbase.git
+	branch = research/helios
 	ignore = dirty
