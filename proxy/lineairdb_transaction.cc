@@ -471,17 +471,13 @@ LineairDBTransaction::get_matching_keys_in_range(std::string start_key,
         record_stateless_read(db_table_key, rows[i].first, true,
                               cached->row_tids[i]);
       }
+      // Activate validation against the pre-merge key list in
+      // cached->range_versions: server-side re-walk at commit cannot see
+      // this tx's pending writes, so validating against the post-merge
+      // view would false-abort on every own-insert / own-delete in range.
+      activate_range_validation(cached->range_versions, cached->index_reads);
+
       merge_pending_rows_into_range_scan(rows, start_key, end_key, false);
-      auto range_versions = cached->range_versions;
-      for (auto& range : range_versions) {
-        if (!range_validation_is_logical(range)) continue;
-        range.result_keys.clear();
-        range.result_primary_keys.clear();
-        for (const auto& row : rows) {
-          range.result_keys.push_back(row.first);
-        }
-      }
-      activate_range_validation(range_versions, cached->index_reads);
       std::vector<std::string> keys;
       keys.reserve(rows.size());
       for (const auto& row : rows) keys.push_back(row.first);
@@ -514,28 +510,16 @@ LineairDBTransaction::get_matching_keys_and_values_in_range(std::string start_ke
         record_stateless_read(db_table_key, cached->rows[i].first, true,
                               cached->row_tids[i]);
       }
+      // See get_matching_keys_in_range above for the rationale.
+      activate_range_validation(cached->range_versions, cached->index_reads);
+
       merge_pending_rows_into_range_scan(pairs, start_key, end_key,
                                          reverse_scan);
-      auto range_versions = cached->range_versions;
       if (row_limit > 0 && pairs.size() > row_limit) {
         pairs.resize(static_cast<size_t>(row_limit));
       }
       rpc_trace_.record_local_view(
           trace_count_event("use_pk_value_scan", db_table_key, pairs.size()));
-      for (auto& range : range_versions) {
-        if (!range_validation_is_logical(range)) continue;
-        range.start_key = start_key;
-        range.end_key = end_key;
-        range.result_keys.clear();
-        range.result_primary_keys.clear();
-        for (const auto& pair : pairs) {
-          range.result_keys.push_back(pair.first);
-        }
-        if (row_limit > 0) {
-          range.row_limit = row_limit;
-        }
-      }
-      activate_range_validation(range_versions, cached->index_reads);
       return pairs;
     }
 
