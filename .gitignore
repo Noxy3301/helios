@@ -10,6 +10,7 @@ lineairdb_logs
 
 bench/benchbase-mysql/
 bench/results
+bench/archive
 bench/config/multi
 bench/config/generated
 ansible/inventory.ini
