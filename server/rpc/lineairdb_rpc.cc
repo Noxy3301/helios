@@ -228,6 +228,15 @@ void LineairDBRpc::handle_rpc(uint64_t sender_id, MessageType message_type,
                              const std::string& message, std::string& result) {
     LOG_DEBUG("Handling RPC: message_type=%u", static_cast<uint32_t>(message_type));
 
+    // Close this thread's masstree RCU critical section after each
+    // self-contained handler (stateless RPCs and DB_END_TRANSACTION) so
+    // RCU can reclaim retired leaves; the next masstree op re-opens it.
+    auto release_masstree_thread_epoch = [this]() {
+        if (db_manager_) {
+            auto db = db_manager_->get_database();
+            if (db) db->ReleaseMasstreeThreadEpoch();
+        }
+    };
     switch(message_type) {
         // Transaction lifecycle
         case MessageType::TX_BEGIN_TRANSACTION:
@@ -249,21 +258,27 @@ void LineairDBRpc::handle_rpc(uint64_t sender_id, MessageType message_type,
             return;
         case MessageType::TX_STATELESS_READ:
             handleTxStatelessRead(message, result);
+            release_masstree_thread_epoch();
             return;
         case MessageType::TX_STATELESS_BATCH_READ:
             handleTxStatelessBatchRead(message, result);
+            release_masstree_thread_epoch();
             return;
         case MessageType::TX_STATELESS_RANGE_SCAN:
             handleTxStatelessRangeScan(message, result);
+            release_masstree_thread_epoch();
             return;
         case MessageType::TX_STATELESS_SECONDARY_RANGE_SCAN:
             handleTxStatelessSecondaryRangeScan(message, result);
+            release_masstree_thread_epoch();
             return;
         case MessageType::TX_EXECUTE_READ_PLAN:
             handleTxExecuteReadPlan(message, result);
+            release_masstree_thread_epoch();
             return;
         case MessageType::TX_VALIDATE_AND_COMMIT:
             handleTxValidateAndCommit(message, result);
+            release_masstree_thread_epoch();
             return;
         case MessageType::TX_WRITE:
             handleTxWrite(message, result);
@@ -326,6 +341,7 @@ void LineairDBRpc::handle_rpc(uint64_t sender_id, MessageType message_type,
             return;
         case MessageType::DB_END_TRANSACTION:
             handleDbEndTransaction(message, result);
+            release_masstree_thread_epoch();
             return;
         case MessageType::DB_CREATE_TABLE:
             handleDbCreateTable(message, result);
