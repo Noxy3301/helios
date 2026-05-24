@@ -193,6 +193,15 @@ def update_xml(config_path, **kwargs):
     config_path.write_text(text)
 
 
+def _benchbase_plugin(benchmark):
+    """BenchBase plugin name for a benchrun benchmark name.
+
+    tpcc-np reuses the tpcc plugin: workload mix differs via the config XML,
+    but the BenchBase class and resource directory (DDL, dialects) are shared.
+    """
+    return "tpcc" if benchmark == "tpcc-np" else benchmark
+
+
 def run_benchbase(benchmark, config_path, create=False, load=False, execute=False, oneshot=False):
     """Run BenchBase with given phases."""
     jar = BENCHBASE_DIR / "benchbase.jar"
@@ -201,7 +210,7 @@ def run_benchbase(benchmark, config_path, create=False, load=False, execute=Fals
         sys.exit(1)
 
     flags = f"--create={'true' if create else 'false'} --load={'true' if load else 'false'} --execute={'true' if execute else 'false'}"
-    cmd = f"java -jar {jar} -b {benchmark} -c {config_path} {flags}"
+    cmd = f"java -jar {jar} -b {_benchbase_plugin(benchmark)} -c {config_path} {flags}"
 
     env = {**os.environ, "HELIOS_ONESHOT_PLAN": "1"} if oneshot else None
     result = subprocess.run(
@@ -370,7 +379,7 @@ def run_execute(benchmark, config_path, terminals, result_base, oneshot=False):
     # Launch BenchBase execute asynchronously, then attach pidstat to Java process
     print("  Executing benchmark...")
     jar = BENCHBASE_DIR / "benchbase.jar"
-    bb_cmd = ["java", "-jar", str(jar), "-b", benchmark, "-c", str(config_path),
+    bb_cmd = ["java", "-jar", str(jar), "-b", _benchbase_plugin(benchmark), "-c", str(config_path),
               "--create=false", "--load=false", "--execute=true"]
     env = {**os.environ, "HELIOS_ONESHOT_PLAN": "1"} if oneshot else None
     bb_proc = subprocess.Popen(bb_cmd, cwd=BENCHBASE_DIR, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env)
