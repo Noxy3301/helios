@@ -65,7 +65,7 @@ AWS_DEFAULTS = {
     "ssh_key": "~/.ssh/helios-aws.pem",
     "ssh_user": "ubuntu",
     # On-demand fallback params (extracted from launch template)
-    "ami_id": "ami-0dcfb21660acb41dd",
+    "ami_id": "ami-06b4ab6c66b56fbd8",
     "security_group": "sg-02d9a0d5948d02dbb",
     "subnet": "subnet-0a15ff55a4cae198b",  # ap-southeast-2c (same-AZ pinning)
 }
