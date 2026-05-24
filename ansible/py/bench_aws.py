@@ -344,6 +344,8 @@ def run_benchmarks(args, run_id):
         exec_vars += f" bench_serial={'true' if args.bench_serial else 'false'}"
     if args.bench_profile:
         exec_vars += f" bench_profile={args.bench_profile}"
+    if args.bench_oneshot:
+        exec_vars += " bench_oneshot=true"
     if args.perf:
         exec_vars += " enable_perf=true"
 
@@ -489,6 +491,7 @@ def main():
 Examples:
   python3 py/bench_aws.py --bench-type ycsb --bench-profile b
   python3 py/bench_aws.py --bench-type tpcc --bench-terms 1,16,64,128
+  python3 py/bench_aws.py --bench-type tpcc --bench-oneshot --bench-terms 1,16,64,128
   python3 py/bench_aws.py --bench-type tpch --bench-scalefactor 0.1
   python3 py/bench_aws.py --bench-type tpch --bench-serial false --bench-terms 1,2,4,8 --bench-scalefactor 0.01
   python3 py/bench_aws.py --cleanup-only
@@ -504,6 +507,10 @@ Examples:
     parser.add_argument("--bench-profile", default=None, help="YCSB profile: a,b,c,e,f")
     parser.add_argument("--bench-serial", default=None, type=lambda x: x.lower() == "true",
                         help="TPC-H serial mode (true/false)")
+    parser.add_argument("--bench-oneshot", action="store_true",
+                        help="Run BenchBase in Helios oneshot mode "
+                             "(SET GLOBAL lineairdb_oneshot_execution=ON on every MySQL "
+                             "and HELIOS_ONESHOT_PLAN=1 env for the executor)")
     parser.add_argument("--perf", action="store_true", help="Enable perf profiling on lineairdb + mysql nodes")
 
     # AWS options
@@ -549,6 +556,8 @@ Examples:
     # Setup log directory: result/<run_id>/<machine_spec>/logs/
     global LOG_FILE
     run_id = datetime.now().strftime("%Y%m%d-%H%M%S")
+    if args.bench_oneshot:
+        run_id += "-oneshot"
     log_dir = ANSIBLE_DIR / "result" / run_id / machine_spec / "logs"
     log_dir.mkdir(parents=True, exist_ok=True)
     LOG_FILE = open(log_dir / "bench_aws.log", "w")

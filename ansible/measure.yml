@@ -23,6 +23,10 @@
     bench_type: ycsb
     bench_profile: b
     bench_serial: "{{ bench_type == 'tpch' }}"
+    # Run BenchBase in Helios oneshot mode: SET GLOBAL lineairdb_oneshot_execution=ON
+    # on every MySQL once per sweep, then prefix the BenchBase java invocation with
+    # HELIOS_ONESHOT_PLAN=1 so the TPC-C procedures inject @_ldb_plan hints.
+    bench_oneshot: false
 
     # -- Execution parameters --
     bench_time: 60
@@ -58,6 +62,20 @@
           -h {{ hostvars[item].private_ip }} -P 3307 \
           -e "SET GLOBAL optimizer_switch='batched_key_access=on,mrr_cost_based=off,subquery_to_derived=on';
               SET GLOBAL join_buffer_size=1073741824;"
+      args:
+        executable: /bin/bash
+      run_once: true
+      delegate_to: "{{ groups['benchbase'][0] }}"
+      loop: "{{ groups['mysql'] }}"
+      loop_control:
+        label: "{{ item }}"
+
+    - name: "Toggle lineairdb_oneshot_execution on each MySQL (={{ 'ON' if bench_oneshot | bool else 'OFF' }})"
+      shell: |
+        ~/helios/build/runtime_output_directory/mysql \
+          -u root --protocol=TCP \
+          -h {{ hostvars[item].private_ip }} -P 3307 \
+          -e "SET GLOBAL lineairdb_oneshot_execution={{ 'ON' if bench_oneshot | bool else 'OFF' }};"
       args:
         executable: /bin/bash
       run_once: true
