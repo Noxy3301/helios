@@ -2,6 +2,7 @@
 #define LINEAIRDB_TRANSACTION_HH
 
 #include <optional>
+#include <unordered_map>
 
 #include "sql/handler.h" /* handler */
 #include "mysql/plugin.h"
@@ -170,8 +171,18 @@ private:
   // These sets live only inside one LineairDBTransaction.
   // commit/abort deletes the object, so prefetched rows never cross txs.
 
-  // Proxy-side read set for exact primary-key reads
-  std::vector<LocalRowEntry> local_read_set_;
+  // Proxy-side read set for exact primary-key reads.
+  // Keyed by (table_name + '\0' + key) so dedup + lookup are O(1).
+  std::unordered_map<std::string, LocalRowEntry> local_read_set_;
+  static std::string make_local_read_key(const std::string& table,
+                                         const std::string& key) {
+    std::string k;
+    k.reserve(table.size() + 1 + key.size());
+    k.append(table);
+    k.push_back('\0');
+    k.append(key);
+    return k;
+  }
   // Proxy-side write set for exact primary-key writes/deletes
   std::vector<LocalRowEntry> local_write_set_;
 

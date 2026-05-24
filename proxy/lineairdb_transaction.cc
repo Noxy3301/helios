@@ -858,20 +858,14 @@ LineairDBTransaction::lookup_local_write_set(
 std::optional<LineairDBTransaction::LocalRowEntry>
 LineairDBTransaction::lookup_local_read_set(
     const std::string& table_name, const std::string& key) const {
-  for (auto it = local_read_set_.rbegin(); it != local_read_set_.rend(); ++it) {
-    if (it->table_name == table_name && it->key == key) return *it;
-  }
-  return std::nullopt;
+  auto it = local_read_set_.find(make_local_read_key(table_name, key));
+  if (it == local_read_set_.end()) return std::nullopt;
+  return it->second;
 }
 
 void LineairDBTransaction::drop_local_read(const std::string& table_name,
                                            const std::string& key) {
-  for (auto it = local_read_set_.begin(); it != local_read_set_.end(); ++it) {
-    if (it->table_name == table_name && it->key == key) {
-      local_read_set_.erase(it);
-      return;
-    }
-  }
+  local_read_set_.erase(make_local_read_key(table_name, key));
 }
 
 bool LineairDBTransaction::key_is_in_range(const std::string& key,
@@ -1018,17 +1012,8 @@ void LineairDBTransaction::record_local_read(const std::string& table_name,
                                              const std::string& value,
                                              uint64_t tid,
                                              bool validate_on_use) {
-  for (auto& entry : local_read_set_) {
-    if (entry.table_name == table_name && entry.key == key) {
-      entry.found = found;
-      entry.value = value;
-      entry.tid = tid;
-      entry.validate_on_use = validate_on_use;
-      return;
-    }
-  }
-  local_read_set_.push_back(
-      {table_name, key, found, value, tid, validate_on_use});
+  local_read_set_[make_local_read_key(table_name, key)] =
+      LocalRowEntry{table_name, key, found, value, tid, validate_on_use};
 }
 
 void LineairDBTransaction::record_stateless_read(const std::string& table_name,
