@@ -68,6 +68,24 @@
       run_once: true
       delegate_to: "{{ groups['benchbase'][0] }}"
 
+    - name: "Refresh MySQL stats with ANALYZE TABLE on each MySQL ({{ bench_type | upper }})"
+      # Oneshot mode requires MySQL's chosen plan to match the @_ldb_plan DSL.
+      # Without fresh stats, MySQL can pick PRIMARY for queries the DSL expects
+      # to take via a secondary index (e.g. OrderStatus customerByNameSQL),
+      # leading to plan/DSL mismatch and infinite oneshot retry.
+      shell: |
+        {{ _mysql_bin }} -u root --protocol=TCP \
+          -h {{ hostvars[item].private_ip }} -P 3307 \
+          -D benchbase \
+          -e "{% if bench_type == 'tpcc' %}ANALYZE TABLE customer, district, history, item, new_order, oorder, order_line, stock, warehouse;{% elif bench_type == 'ycsb' %}ANALYZE TABLE usertable;{% else %}ANALYZE TABLE customer, lineitem, nation, orders, part, partsupp, region, supplier;{% endif %}"
+      args:
+        executable: /bin/bash
+      run_once: true
+      delegate_to: "{{ groups['benchbase'][0] }}"
+      loop: "{{ groups['mysql'] }}"
+      loop_control:
+        label: "{{ item }}"
+
     - name: Set TPC-H optimizer settings on each MySQL
       when: bench_type == 'tpch'
       shell: |
