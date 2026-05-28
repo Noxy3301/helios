@@ -763,7 +763,13 @@ LineairDBTransaction::get_matching_keys_in_range(std::string start_key,
     if (end_key.empty()) end_key.assign(16, '\xff');  // (d/P1-c)
     if (auto cached =
             lookup_local_range_scan(db_table_key, start_key, end_key, false, 0)) {
-      std::vector<std::pair<std::string, std::string>> rows = cached->rows;
+      // Step2a: `cached` is a local optional destroyed at scope end, so move its
+      // rows into the working vector instead of a second full deep copy. For the
+      // step0 full-cover scan (Q21: 6M rows) this removes one 6M-row copy. The
+      // OCC recording below reads `rows` (not cached->rows) and uses
+      // cached->row_tids / cached->range_versions which are NOT moved.
+      std::vector<std::pair<std::string, std::string>> rows =
+          std::move(cached->rows);
       rpc_trace_.record_local_view(
           trace_count_event("use_pk_key_scan", db_table_key, rows.size()));
       // OCC recording is idempotent per probe (immutable cache); skip on a
@@ -855,7 +861,12 @@ LineairDBTransaction::get_matching_keys_and_values_in_range(std::string start_ke
       cached = lookup_local_range_scan(db_table_key, start_key, end_key,
                                        reverse_scan, row_limit);
     if (cached) {
-      std::vector<std::pair<std::string, std::string>> pairs = cached->rows;
+      // Step2a: move the sliced rows out of the local optional `cached` instead
+      // of a second full deep copy (`pairs = cached->rows`). The OCC loop below
+      // now reads `pairs` (the moved-to vector); cached->row_tids /
+      // cached->range_versions / cached->start_key are NOT moved and stay valid.
+      std::vector<std::pair<std::string, std::string>> pairs =
+          std::move(cached->rows);
       // OCC recording is idempotent per probe; skip on a repeat serve.
       if (!probe_occ_already_recorded(db_table_key, "", start_key, end_key,
                                       row_limit, reverse_scan)) {
@@ -865,8 +876,8 @@ LineairDBTransaction::get_matching_keys_and_values_in_range(std::string start_ke
         const bool rh_skip2 = rangehash_eligible_ && cached->start_key.empty();
         if (!rh_skip2)
         for (size_t i = 0;
-             i < cached->rows.size() && i < cached->row_tids.size(); ++i) {
-          record_stateless_read(db_table_key, cached->rows[i].first, true,
+             i < pairs.size() && i < cached->row_tids.size(); ++i) {
+          record_stateless_read(db_table_key, pairs[i].first, true,
                                 cached->row_tids[i]);
         }
         // See get_matching_keys_in_range above for the rationale.
@@ -1082,7 +1093,9 @@ LineairDBTransaction::get_matching_primary_keys_in_range(std::string index_name,
       if (!probe_occ_already_recorded(db_table_key, index_name, start_key,
                                       end_key, 0, false))
         activate_range_validation(cached->range_versions, cached->index_reads);
-      return cached->primary_keys;
+      // Step2a: `cached` is a local optional; move its primary_keys out instead
+      // of copying on return (FES inner-probe hot path, e.g. Q9).
+      return std::move(cached->primary_keys);
     }
 
     // Cache miss. With local state → stateless secondary scan (correct OCC);
