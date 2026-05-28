@@ -29,3 +29,6 @@ __pycache__/
 *.pem
 *.key
 .aws/
+
+# local DB data dirs (huge, env-specific)
+data_innodb/

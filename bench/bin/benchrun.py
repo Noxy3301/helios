@@ -212,7 +212,12 @@ def run_benchbase(benchmark, config_path, create=False, load=False, execute=Fals
     flags = f"--create={'true' if create else 'false'} --load={'true' if load else 'false'} --execute={'true' if execute else 'false'}"
     cmd = f"java -jar {jar} -b {_benchbase_plugin(benchmark)} -c {config_path} {flags}"
 
-    env = {**os.environ, "HELIOS_ONESHOT_PLAN": "1"} if oneshot else None
+    # Inject the per-query hardcoded @_ldb_plan ONLY for TPC-C (its procedures
+    # carry tuned plans). TPC-H uses pure auto-gen (QEP-derived prefetch); its
+    # legacy DSL plans over-scan and run 10-30x slower at SF=1, whereas auto-gen
+    # is clean 2-RPC (validated SF=1 22/22 OK, 0 fallback). Don't inject for tpch.
+    inject_plan = oneshot and _benchbase_plugin(benchmark) != "tpch"
+    env = {**os.environ, "HELIOS_ONESHOT_PLAN": "1"} if inject_plan else None
     result = subprocess.run(
         cmd, shell=True, cwd=BENCHBASE_DIR,
         capture_output=True, text=True, env=env,
@@ -381,7 +386,9 @@ def run_execute(benchmark, config_path, terminals, result_base, oneshot=False):
     jar = BENCHBASE_DIR / "benchbase.jar"
     bb_cmd = ["java", "-jar", str(jar), "-b", _benchbase_plugin(benchmark), "-c", str(config_path),
               "--create=false", "--load=false", "--execute=true"]
-    env = {**os.environ, "HELIOS_ONESHOT_PLAN": "1"} if oneshot else None
+    # TPC-H: pure auto-gen (no @_ldb_plan). TPC-C: keep injected plans. (See run_benchbase.)
+    inject_plan = oneshot and _benchbase_plugin(benchmark) != "tpch"
+    env = {**os.environ, "HELIOS_ONESHOT_PLAN": "1"} if inject_plan else None
     bb_proc = subprocess.Popen(bb_cmd, cwd=BENCHBASE_DIR, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env)
     # bb_proc.pid IS the java process (no shell wrapper)
     f = open(metrics_dir / "pidstat-bench.log", "w")
