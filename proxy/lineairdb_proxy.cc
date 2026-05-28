@@ -11,6 +11,9 @@
 
 #include "lineairdb_proxy.hh"
 #include "lineairdb_transaction.hh"
+#include "flat_read_plan_codec.hh"
+#include "mem_probe.hh"
+#include "rpc_compress.hh"
 #include "rpc_trace.hh"
 #include "../common/log.h"
 
@@ -509,6 +512,110 @@ LineairDBProxy::tx_stateless_secondary_range_scan(
     return result;
 }
 
+namespace {
+// (B1) Decode the flat read-plan response DIRECTLY into ReadPlanResult, WITHOUT
+// building a protobuf message. Mirrors helios_flat::encode_response_into /
+// enc_* field-for-field and in the SAME order — if the encoder changes, this
+// MUST change in lockstep (the oneshot md5 tests catch any drift). Eliminates
+// the per-request proto object (~1.7x the flat bytes) on the proxy.
+// Vectors are filled with a (i<n && r.ok) guard so a corrupt count cannot
+// pre-allocate unboundedly. Returns false on any framing/bounds error.
+using helios_flat::Reader;
+// reserve up to n elements, but only if n is plausible given the bytes left
+// (each element needs >= min_elem_bytes), so a corrupt count can't pre-allocate
+// unboundedly. Mirrors the reserve()s the old proto->ReadPlanResult path did.
+template <class V>
+inline void rdp_reserve(Reader& r, V& v, uint64_t n, uint64_t min_elem_bytes) {
+    if (r.ok && n <= static_cast<uint64_t>(r.end - r.p) / min_elem_bytes)
+        v.reserve(v.size() + n);
+}
+template <class V>  // vector<std::string>
+inline void rdp_vec_bytes(Reader& r, V& v) {
+    uint64_t n = r.u64();
+    rdp_reserve(r, v, n, 8);  // each byte-string is >= 8 bytes (its length prefix)
+    for (uint64_t i = 0; i < n && r.ok; ++i) { v.emplace_back(); r.bytes(&v.back()); }
+}
+template <class V>  // vector<uint64_t>
+inline void rdp_vec_u64(Reader& r, V& v) {
+    uint64_t n = r.u64();
+    rdp_reserve(r, v, n, 8);
+    for (uint64_t i = 0; i < n && r.ok; ++i) v.push_back(r.u64());
+}
+void rdp_rve(Reader& r, LineairDBProxy::RangeValidationEntry& e) {
+    r.bytes(&e.table_name);
+    r.bytes(&e.index_name);
+    e.owner_ptr = r.u64();
+    e.node_ptr = r.u64();
+    e.version = r.u64();
+    r.bytes(&e.start_key);
+    r.bytes(&e.end_key);
+    e.row_limit = r.u64();
+    e.reverse_scan = r.u8() != 0;
+    rdp_vec_bytes(r, e.result_keys);
+    rdp_vec_bytes(r, e.result_primary_keys);
+}
+void rdp_ive(Reader& r, LineairDBProxy::IndexValidationEntry& e) {
+    r.bytes(&e.table_name);
+    r.bytes(&e.index_name);
+    r.bytes(&e.key);
+    e.tid = r.u64();
+    e.found = r.u8() != 0;
+}
+void rdp_subscan(Reader& r, LineairDBProxy::ReadPlanSubScan& s) {
+    r.bytes(&s.start_key);
+    r.bytes(&s.end_key);
+    rdp_vec_bytes(r, s.scan_keys);
+    rdp_vec_bytes(r, s.scan_values);
+    rdp_vec_u64(r, s.scan_tids);
+    rdp_vec_bytes(r, s.secondary_keys);
+    uint64_t n = r.u64();
+    rdp_reserve(r, s.range_versions, n, 16);  // an RVE is at least ~16 bytes
+    for (uint64_t i = 0; i < n && r.ok; ++i) { s.range_versions.emplace_back(); rdp_rve(r, s.range_versions.back()); }
+}
+void rdp_step(Reader& r, LineairDBProxy::ReadPlanStepResult& s) {
+    s.found = r.u8() != 0;
+    r.bytes(&s.value);
+    s.tid = r.u64();
+    r.bytes(&s.actual_key);
+    rdp_vec_bytes(r, s.scan_keys);
+    rdp_vec_bytes(r, s.scan_values);
+    rdp_vec_u64(r, s.scan_tids);
+    rdp_vec_bytes(r, s.secondary_keys);
+    r.bytes(&s.actual_start_key);
+    r.bytes(&s.actual_end_key);
+    uint64_t n = r.u64();
+    rdp_reserve(r, s.range_versions, n, 16);
+    for (uint64_t i = 0; i < n && r.ok; ++i) { s.range_versions.emplace_back(); rdp_rve(r, s.range_versions.back()); }
+    n = r.u64();
+    rdp_reserve(r, s.index_reads, n, 16);
+    for (uint64_t i = 0; i < n && r.ok; ++i) { s.index_reads.emplace_back(); rdp_ive(r, s.index_reads.back()); }
+    n = r.u64();
+    rdp_reserve(r, s.subscans, n, 16);
+    for (uint64_t i = 0; i < n && r.ok; ++i) { s.subscans.emplace_back(); rdp_subscan(r, s.subscans.back()); }
+    rdp_vec_bytes(r, s.filtered_keys);
+    rdp_vec_u64(r, s.filtered_tids);
+}
+bool decode_flat_into_readplan(const char* data, size_t len,
+                               LineairDBProxy::ReadPlanResult& out) {
+    Reader r(data, len);
+    if (r.u64() != helios_flat::kMagic) return false;
+    if (r.u8() != helios_flat::kVersion) return false;
+    out.ok = r.u8() != 0;
+    uint64_t n = r.u64();
+    rdp_reserve(r, out.steps, n, 16);
+    for (uint64_t i = 0; i < n && r.ok; ++i) { out.steps.emplace_back(); rdp_step(r, out.steps.back()); }
+    n = r.u64();
+    rdp_reserve(r, out.range_versions, n, 16);
+    for (uint64_t i = 0; i < n && r.ok; ++i) { out.range_versions.emplace_back(); rdp_rve(r, out.range_versions.back()); }
+    n = r.u64();
+    rdp_reserve(r, out.index_reads, n, 16);
+    for (uint64_t i = 0; i < n && r.ok; ++i) { out.index_reads.emplace_back(); rdp_ive(r, out.index_reads.back()); }
+    // v2: physical-OCC tx_occ_key (0 = legacy/logical mode).
+    out.tx_occ_key = r.u64();
+    return r.ok && r.p == r.end;
+}
+}  // namespace
+
 LineairDBProxy::ReadPlanResult LineairDBProxy::tx_execute_read_plan(
     const std::vector<ReadPlanStep>& steps) {
     ReadPlanResult result;
@@ -518,7 +625,6 @@ LineairDBProxy::ReadPlanResult LineairDBProxy::tx_execute_read_plan(
     }
 
     LineairDB::Protocol::TxExecuteReadPlan::Request request;
-    LineairDB::Protocol::TxExecuteReadPlan::Response response;
     for (const auto& step : steps) {
         auto* out = request.add_steps();
         out->set_table_name(step.table_name);
@@ -529,6 +635,18 @@ LineairDBProxy::ReadPlanResult LineairDBProxy::tx_execute_read_plan(
         out->set_index_name(step.index_name);
         out->set_for_each(step.for_each);
         out->set_reverse_scan(step.reverse_scan);
+        // Pushed predicate is carried for any scan step (primary-PK S:, secondary
+        // SI:, and FER/FES join-prefetch). The server evaluates it against the
+        // step's table rows. Point reads (is_scan=false) carry no filter.
+        if (!step.filter_serialized.empty() && step.is_scan) {
+          out->mutable_filter()->ParseFromString(step.filter_serialized);
+        }
+        // Projection pushdown (empty => full row, legacy behavior).
+        if (!step.projection.empty()) {
+          auto* p = out->mutable_projection();
+          p->set_num_columns(step.projection_num_columns);
+          for (uint32_t idx : step.projection) p->add_field_indexes(idx);
+        }
         for (const auto& binding : step.bindings) {
             auto* b = out->add_bindings();
             b->set_source_step(binding.source_step);
@@ -555,56 +673,62 @@ LineairDBProxy::ReadPlanResult LineairDBProxy::tx_execute_read_plan(
         }
     }
 
-    if (!send_protobuf_message(request, response,
-                               MessageType::TX_EXECUTE_READ_PLAN)) {
+    // The read-plan response is FLAT-encoded (not protobuf) to avoid protobuf's
+    // ~2GB single-message serialization ceiling for large prefetch payloads.
+    // Send the protobuf request, receive raw bytes, flat-decode into `response`.
+    const bool memprof = std::getenv("HELIOS_MEMPROF") != nullptr;
+    const size_t je0 = memprof ? helios_mem::je_allocated() : 0;
+    std::string raw_response;
+    if (!send_protobuf_recv_binary(request, raw_response,
+                                   MessageType::TX_EXECUTE_READ_PLAN)) {
         LOG_ERROR("RPC failed: Failed to send execute read plan message to server");
+        result.ok = false;
         return result;
     }
-
-    result.ok = response.ok();
-    if (!result.ok) return result;
-    result.steps.reserve(response.results_size());
-    for (const auto& step : response.results()) {
-        ReadPlanStepResult out;
-        out.found = step.found();
-        out.value = step.value();
-        out.tid = step.tid();
-        out.actual_key = step.actual_key();
-        out.actual_start_key = step.actual_start_key();
-        out.actual_end_key = step.actual_end_key();
-        out.scan_keys.reserve(step.scan_keys_size());
-        for (const auto& key : step.scan_keys()) out.scan_keys.push_back(key);
-        out.scan_values.reserve(step.scan_values_size());
-        for (const auto& value : step.scan_values()) out.scan_values.push_back(value);
-        out.scan_tids.reserve(step.scan_tids_size());
-        for (const auto tid : step.scan_tids()) out.scan_tids.push_back(tid);
-        out.secondary_keys.reserve(step.secondary_keys_size());
-        for (const auto& key : step.secondary_keys()) out.secondary_keys.push_back(key);
-        out.range_versions.reserve(step.range_versions_size());
-        for (const auto& entry : step.range_versions()) {
-            out.range_versions.push_back(decode_range_validation_entry(entry));
+    // (②) The payload is CODEC-tagged: [0x00][flat] (raw) or [0x01][...] (LZ4).
+    // Strip/decompress to the flat buffer, then parse. For raw we decode in
+    // place (skip the 1 tag byte, no copy); for LZ4 we decompress into `flat`.
+    if (raw_response.empty()) { result.ok = false; return result; }
+    const uint8_t codec = static_cast<uint8_t>(raw_response[0]);
+    const char* fdata = nullptr;
+    size_t flen = 0;
+    std::string flat;
+    if (codec == helios_zip::kRaw) {
+        fdata = raw_response.data() + 1;
+        flen = raw_response.size() - 1;
+    } else if (codec == helios_zip::kLZ4) {
+        if (!helios_zip::decompress_payload(raw_response.data(),
+                                            raw_response.size(), flat)) {
+            LOG_ERROR("RPC failed: read plan LZ4 decompress failed (%zu bytes)",
+                      raw_response.size());
+            result.ok = false;
+            return result;
         }
-        out.index_reads.reserve(step.index_reads_size());
-        for (const auto& entry : step.index_reads()) {
-            out.index_reads.push_back({entry.table_name(), entry.index_name(),
-                                       entry.key(), entry.tid(),
-                                       entry.found()});
-        }
-        result.steps.push_back(std::move(out));
+        fdata = flat.data();
+        flen = flat.size();
+    } else {
+        LOG_ERROR("RPC failed: unknown read plan codec %u", codec);
+        result.ok = false;
+        return result;
     }
-
-    result.range_versions.reserve(response.range_versions_size());
-    for (const auto& entry : response.range_versions()) {
-        result.range_versions.push_back(decode_range_validation_entry(entry));
+    // (B1) Parse the flat buffer DIRECTLY into ReadPlanResult — no protobuf
+    // object is built on the proxy (it was ~1.7x the flat bytes per request).
+    if (!decode_flat_into_readplan(fdata, flen, result)) {
+        LOG_ERROR("RPC failed: flat decode of read plan response failed (%zu bytes)",
+                  raw_response.size());
+        result = ReadPlanResult{};
+        result.ok = false;
+        return result;
     }
-
-    result.index_reads.reserve(response.index_reads_size());
-    for (const auto& entry : response.index_reads()) {
-        result.index_reads.push_back({entry.table_name(), entry.index_name(),
-                                      entry.key(), entry.tid(),
-                                      entry.found()});
+    if (memprof) {
+        const size_t je2 = helios_mem::je_allocated();
+        std::fprintf(stderr,
+            "[MEMPROF-proxy] #3 raw_recv=%.2fGB | flat->ReadPlanResult (NO proto): "
+            "je_after=%.2fGB delta(#3+#5)=%.2fGB (baseline %.2fGB)\n",
+            raw_response.size() / 1e9, je2 / 1e9, (double)(je2 - je0) / 1e9,
+            je0 / 1e9);
+        std::fflush(stderr);
     }
-
     return result;
 }
 
@@ -617,7 +741,9 @@ bool LineairDBProxy::tx_validate_and_commit(
     const std::vector<BatchOp>& ops,
     const std::vector<std::pair<std::string, int64_t>>& row_deltas,
     bool isFence,
-    std::string* abort_reason) {
+    std::string* abort_reason,
+    uint64_t tx_occ_key,
+    bool use_range_hash) {
     if (abort_reason != nullptr) abort_reason->clear();
     if (!connected_) {
         LOG_ERROR("RPC failed: Not connected to server");
@@ -631,6 +757,8 @@ bool LineairDBProxy::tx_validate_and_commit(
     LineairDB::Protocol::TxValidateAndCommit::Request request;
     LineairDB::Protocol::TxValidateAndCommit::Response response;
     request.set_fence(isFence);
+    if (tx_occ_key != 0) request.set_tx_occ_key(tx_occ_key);
+    if (use_range_hash) request.set_use_range_hash(true);
 
     for (size_t i = 0; i < reads.size(); ++i) {
         auto* read = request.add_reads();
@@ -1561,10 +1689,11 @@ bool LineairDBProxy::send_message_with_header(const std::string& serialized_requ
               serialized_request.size(), static_cast<uint32_t>(message_type));
 
     // prepare message header
-    MessageHeader header;
+    MessageHeader header{};
     header.sender_id = htobe64(1);  // TODO: replace with actual sender ID
     header.message_type = htonl(static_cast<uint32_t>(message_type));
-    header.payload_size = htonl(static_cast<uint32_t>(serialized_request.size()));
+    header._pad = 0;
+    header.payload_size = htobe64(static_cast<uint64_t>(serialized_request.size()));
 
     LOG_DEBUG("SEND_MESSAGE: Prepared header: sender_id=1, message_type=%u, payload_size=%zu", 
               static_cast<uint32_t>(message_type), serialized_request.size());
@@ -1600,21 +1729,30 @@ bool LineairDBProxy::send_message_with_header(const std::string& serialized_requ
     // convert from network byte order to host byte order
     uint64_t response_sender_id = be64toh(response_header.sender_id);
     uint32_t response_message_type = ntohl(response_header.message_type);
-    uint32_t response_payload_size = ntohl(response_header.payload_size);
+    uint64_t response_payload_size = be64toh(response_header.payload_size);
 
-    LOG_DEBUG("SEND_MESSAGE: Received response header: sender_id=%lu, message_type=%u, payload_size=%u", 
-              response_sender_id, response_message_type, response_payload_size);
+    LOG_DEBUG("SEND_MESSAGE: Received response header: sender_id=%lu, message_type=%u, payload_size=%lu",
+              response_sender_id, response_message_type, (unsigned long)response_payload_size);
 
-    // receive response payload
+    // receive response payload (loop in <=1GB chunks: a single MSG_WAITALL recv
+    // is not reliable for multi-GB payloads, which the flat read-plan codec can
+    // produce).
     if (response_payload_size > 0) {
         serialized_response.resize(response_payload_size);
-        ssize_t payload_received = recv(socket_fd_, &serialized_response[0], response_payload_size, MSG_WAITALL);
-        if (payload_received != static_cast<ssize_t>(response_payload_size)) {
-            LOG_ERROR("SEND_MESSAGE: Failed to receive response payload, received %zd bytes instead of %u", 
-                      payload_received, response_payload_size);
-            return false;
+        uint64_t got = 0;
+        while (got < response_payload_size) {
+            size_t chunk = static_cast<size_t>(response_payload_size - got);
+            if (chunk > (1u << 30)) chunk = (1u << 30);
+            ssize_t n = recv(socket_fd_, &serialized_response[got], chunk, MSG_WAITALL);
+            if (n <= 0) {
+                LOG_ERROR("SEND_MESSAGE: Failed to receive response payload, got %lu/%lu",
+                          (unsigned long)got, (unsigned long)response_payload_size);
+                return false;
+            }
+            got += static_cast<uint64_t>(n);
         }
-        LOG_DEBUG("SEND_MESSAGE: Successfully received response payload (%zd bytes)", payload_received);
+        LOG_DEBUG("SEND_MESSAGE: Successfully received response payload (%lu bytes)",
+                  (unsigned long)response_payload_size);
     } else {
         LOG_DEBUG("SEND_MESSAGE: No response payload (empty response)");
         serialized_response.clear();

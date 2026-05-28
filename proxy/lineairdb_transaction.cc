@@ -1,9 +1,12 @@
 #include "lineairdb_transaction.hh"
+#include "mem_probe.hh"
 #include "storage/lineairdb/ha_lineairdb.hh"
 #include "../common/log.h"
 
 #include <thread>
 #include <unordered_set>
+#include <cstdio>
+#include <cstdlib>
 
 namespace {
 
@@ -28,9 +31,12 @@ bool range_validation_can_be_sliced(
     const std::vector<LineairDBProxy::RangeValidationEntry>& ranges,
     const std::vector<LineairDBProxy::IndexValidationEntry>& indexes) {
   if (!indexes.empty()) return false;
-  for (const auto& range : ranges) {
-    if (!range_validation_is_logical(range)) return false;
-  }
+  // Physical entries (end_key.empty(), Codex helios PHYSICAL_OCC) carry no
+  // result_keys — slicing is trivially a no-op on them and the captured
+  // (owner,node_ptr,version) covers the wider range that holds the probe.
+  // So they are sliceable. Logical entries still need at least one entry
+  // with a key list to be useful for negative-membership; we keep the
+  // existing "must have entries" guard.
   return !ranges.empty();
 }
 
@@ -89,6 +95,9 @@ const std::pair<const std::byte *const, const size_t>
 LineairDBTransaction::read(std::string key) {
   if (table_is_not_chosen()) return std::pair<const std::byte *const, const size_t>{nullptr, 0};
 
+  // Phase-3b: fire staged oneshot plan on first cache-targeting access
+  execute_pending_oneshot_plan();
+
   // Silo-style local view: own writes are visible before remote reads
   if (auto entry = lookup_local_write_set(db_table_key, key)) {
     rpc_trace_.record_local_view("read_write_hit");
@@ -106,14 +115,52 @@ LineairDBTransaction::read(std::string key) {
     return {reinterpret_cast<const std::byte*>(last_read_value_.data()), last_read_value_.size()};
   }
 
-  // Normal path misses go to the server; oneshot plans must prefetch them
-  rpc_trace_.record_local_view("read_miss");
+  // Negative caching: if a completed, unlimited PK range scan already
+  // covers this key and its authoritative pre-filter key set does NOT contain
+  // it, the row is provably absent — answer not-found locally instead of an
+  // RPC. (Q2's correlated MIN subquery point-reads partsupp by (ps_partkey,
+  // ps_suppkey) for many suppliers that don't stock the part; the FER prefix
+  // scan already proved those rows absent.) The covering range's phantom
+  // validation is activated so a concurrent INSERT still aborts at commit.
   if (oneshot_mode_) {
-    rpc_trace_.record_local_view("abort_oneshot_read_miss");
-    is_aborted_ = true;
-    return std::pair<const std::byte *const, const size_t>{nullptr, 0};
+    if (const LocalRangeScanEntry* cov =
+            find_negative_covering_range_scan(db_table_key, key)) {
+      rpc_trace_.record_local_view("read_negative_hit");
+      activate_range_validation(cov->range_versions, cov->index_reads);
+      record_local_read(db_table_key, key, false, "");  // non-validating; OCC via range
+      return std::pair<const std::byte *const, const size_t>{nullptr, 0};
+    }
   }
 
+  // Normal path misses go to the server; oneshot plans must prefetch them
+  rpc_trace_.record_local_view("read_miss:" + db_table_key);
+  if (oneshot_mode_) {
+    // Isolated bench: abort on prefetch miss instead of the per-probe stateless
+    // fallback (see note_oneshot_miss). Diagnoses which probe the plan failed
+    // to cover.
+    if (note_oneshot_miss("read", db_table_key, key))
+      return std::pair<const std::byte *const, const size_t>{nullptr, 0};
+    auto sr = lineairdb_proxy->tx_stateless_read(db_table_key, key);
+    if (!sr.ok) {
+      rpc_trace_.record_local_view("abort_oneshot_read_fallback_rpc");
+      is_aborted_ = true;
+      return std::pair<const std::byte *const, const size_t>{nullptr, 0};
+    }
+    record_local_read(db_table_key, key, sr.found, sr.value, sr.tid, true);
+    // (d/P1) Validate this fallback read at commit. record_local_read only
+    // enters stateless_read_set_ (the commit-validated set) when the entry is
+    // re-read (activate_local_read); a single read would otherwise go
+    // unvalidated. Record it directly so its TID is checked at commit.
+    record_stateless_read(db_table_key, key, sr.found, sr.tid);
+    if (!sr.found) {
+      return std::pair<const std::byte *const, const size_t>{nullptr, 0};
+    }
+    last_read_value_ = sr.value;
+    return {reinterpret_cast<const std::byte *>(last_read_value_.data()),
+            last_read_value_.size()};
+  }
+
+  ensure_started_for_normal_rpc();  // (d/P1-a) oneshot may be off w/ tx unstarted
   last_read_value_ = lineairdb_proxy->tx_read(this, key);
   if (last_read_value_.empty()) {
     record_local_read(db_table_key, key, false, ""); // value unused when not found
@@ -128,6 +175,12 @@ LineairDBTransaction::read(std::string key) {
 std::vector<std::pair<bool, std::string>>
 LineairDBTransaction::batch_read(const std::vector<std::string>& keys) {
   if (table_is_not_chosen()) return {};
+
+  // Phase-3b: fire staged oneshot plan before consulting the cache. The PK
+  // MRR / secondary-payload batching paths land here without going through
+  // read()/get_matching_keys_*, so without this hook the plan stays pending
+  // and every cache lookup misses, aborting the transaction.
+  execute_pending_oneshot_plan();
 
   std::vector<std::pair<bool, std::string>> pairs;
   pairs.resize(keys.size());
@@ -157,8 +210,27 @@ LineairDBTransaction::batch_read(const std::vector<std::string>& keys) {
 
   // Oneshot plans must fetch every key up front; misses mean the plan is short
   if (oneshot_mode_ && !rpc_keys.empty()) {
-    rpc_trace_.record_local_view("abort_oneshot_batch_miss");
-    is_aborted_ = true;
+    // Isolated bench: abort on prefetch miss instead of the stateless batch
+    // fallback.
+    if (note_oneshot_miss("batch_read", db_table_key, rpc_keys.front()))
+      return pairs;
+    std::vector<LineairDBProxy::StatelessReadKey> srk;
+    srk.reserve(rpc_keys.size());
+    for (const auto& k : rpc_keys) srk.push_back({db_table_key, k});
+    auto res = lineairdb_proxy->tx_stateless_batch_read(srk);
+    if (res.size() != rpc_keys.size()) {
+      rpc_trace_.record_local_view("abort_oneshot_batch_fallback_rpc");
+      is_aborted_ = true;
+      return pairs;
+    }
+    for (size_t i = 0; i < res.size(); ++i) {
+      const size_t pos = rpc_positions[i];
+      pairs[pos] = {res[i].found, res[i].value};
+      record_local_read(db_table_key, rpc_keys[i], res[i].found, res[i].value,
+                        res[i].tid, true);
+      // (d/P1) validate each fallback read at commit (see read()).
+      record_stateless_read(db_table_key, rpc_keys[i], res[i].found, res[i].tid);
+    }
     return pairs;
   }
 
@@ -166,6 +238,7 @@ LineairDBTransaction::batch_read(const std::vector<std::string>& keys) {
   //   Example: keys=[A,B,C], B is local -> rpc_keys=[A,C],
   //            rpc_positions=[0,2], so RPC results fill pairs[0] and pairs[2].
   if (!rpc_keys.empty()) {
+    ensure_started_for_normal_rpc();  // (d/P1-a) oneshot may be off w/ tx unstarted
     auto results = lineairdb_proxy->tx_batch_read(this, rpc_keys);
     if (results.size() != rpc_keys.size()) {
       rpc_trace_.record_local_view("abort_batch_size_mismatch");
@@ -228,22 +301,106 @@ void LineairDBTransaction::prefetch_stateless_reads(
   }
 }
 
+void LineairDBTransaction::stage_oneshot_plan(
+    std::vector<LineairDBProxy::ReadPlanStep> steps) {
+  if (!oneshot_mode_ || steps.empty()) return;
+  pending_oneshot_plan_steps_ = std::move(steps);
+}
+
+void LineairDBTransaction::execute_pending_oneshot_plan() {
+  if (pending_oneshot_plan_steps_.empty()) return;
+  auto steps = std::move(pending_oneshot_plan_steps_);
+  pending_oneshot_plan_steps_.clear();
+  // Drop into the existing execute_read_plan path — that one attaches the
+  // current pushed_filter_ to primary-PK S: steps before sending, which is
+  // exactly the point of the deferred-execution refactor.
+  execute_read_plan(steps);
+}
+
 void LineairDBTransaction::execute_read_plan(
     const std::vector<LineairDBProxy::ReadPlanStep>& steps) {
   if (!oneshot_mode_ || steps.empty()) return;
 
+  // Phase-3b: copy steps so we can stamp the current pushed_filter_ onto each
+  // primary-PK S: step. cond_push runs before MySQL hits the first scan, and
+  // rnd_init / index_init have already propagated pushed_filter_serialized_
+  // to the tx via set_pushed_filter() by the time this method fires (because
+  // the plan is now staged and only executed from the first read/scan call).
+  // Per Codex review: pushed_filter_ was serialized for whatever handler
+  // last called set_pushed_filter(), so we may only stamp it onto an S: step
+  // whose table_name matches the current scan's table (db_table_key). For a
+  // multi-table plan (e.g. lineitem + part) the filter is for one of them;
+  // stamping it on every primary scan step would let a predicate on lineitem
+  // columns reject part rows by index, producing incorrect results.
+  //
+  // Phase-3c: this stamping path is now LIVE for TPC-H SELECT full scans —
+  // rnd_init derives a single-table predicate via build_single_table_filter()
+  // and set_pushed_filter(), so S: steps actually ship a filter to the server.
+  // Range validation stays sound because the server builds the logical
+  // result_keys from the PRE-filter full range (database_impl.h:480) and
+  // lookup_local_range_scan() preserves that full key set (never narrows it to
+  // filter-passing rows). Remaining caveats, benign for read-only TPC-H but to
+  // close before HTAP / concurrent writes:
+  //   (P1) CLOSED (c): the server now ships filter-rejected rows' (key, tid) in
+  //        StepResult.filtered_keys/tids and the proxy records them as
+  //        validating stateless reads below, so a concurrent UPDATE flipping a
+  //        rejected row into the predicate before commit changes its TID and
+  //        aborts. (Both the full-S filter and the FER/FES fe_reject paths.)
+  //   (P2) local_range_scans_ cache key does not include the filter, so a later
+  //        same-range scan in the same tx with a different predicate could hit
+  //        the cached entry. TPC-H issues one scan per table per query, so this
+  //        does not arise today; include filter_serialized in the key to close.
+  std::vector<LineairDBProxy::ReadPlanStep> steps_with_filter;
+  steps_with_filter.reserve(steps.size());
+  for (const auto& step : steps) {
+    steps_with_filter.push_back(step);
+    auto& s = steps_with_filter.back();
+    const bool stamp_eligible = s.is_scan && !s.for_each &&
+                                s.index_name.empty() &&
+                                !pushed_filter_.empty() &&
+                                s.table_name == db_table_key;
+    if (stamp_eligible) {
+      s.filter_serialized = pushed_filter_;
+    }
+  }
+
   rpc_trace_.record_local_view("plan_request:steps=" +
-                               std::to_string(steps.size()));
-  auto result = lineairdb_proxy->tx_execute_read_plan(steps);
+                               std::to_string(steps_with_filter.size()));
+  // HELIOS_TIMEPROF: per-phase latency breakdown. ns timestamps around each
+  // major proxy-side phase so a profile can attribute time to RPC / ingest /
+  // MySQL handler work / commit. Aggregated counter is printed at commit.
+  const bool timeprof = std::getenv("HELIOS_TIMEPROF") != nullptr;
+  auto tp_now = []() {
+    timespec t; clock_gettime(CLOCK_MONOTONIC, &t);
+    return static_cast<uint64_t>(t.tv_sec) * 1000000000ull + t.tv_nsec;
+  };
+  const uint64_t tp_rpc_start = timeprof ? tp_now() : 0;
+  auto result = lineairdb_proxy->tx_execute_read_plan(steps_with_filter);
+  const uint64_t tp_rpc_end = timeprof ? tp_now() : 0;
   if (!result.ok || result.steps.size() != steps.size()) {
     rpc_trace_.record_local_view("abort_read_plan_rpc");
     is_aborted_ = true;
     return;
   }
+  // helios 2-RPC PHYSICAL OCC (Step 5): non-zero => server retained range/
+  // index OCC under this key. We just stash it; at commit we echo it.
+  tx_occ_key_ = result.tx_occ_key;
+  if (timeprof) {
+    tp_rpc_execute_ns_ += (tp_rpc_end - tp_rpc_start);
+    ++tp_rpc_execute_count_;
+    std::fprintf(stderr,
+        "[TIMEPROF] rpc_exec ok=%d tx_occ_key=%llu steps=%zu\n",
+        result.ok ? 1 : 0, (unsigned long long)result.tx_occ_key,
+        result.steps.size());
+    std::fflush(stderr);
+  }
+  const uint64_t tp_ingest_start = timeprof ? tp_now() : 0;
 
+  const bool memprof = std::getenv("HELIOS_MEMPROF") != nullptr;
+  const size_t je_pre_ingest = memprof ? helios_mem::je_allocated() : 0;
   for (size_t i = 0; i < result.steps.size() && i < steps.size(); ++i) {
     const auto& step = steps[i];
-    const auto& step_result = result.steps[i];
+    auto& step_result = result.steps[i];  // local result: move-from at ingest
 
     if (!step.is_scan && !step.for_each) {
       rpc_trace_.record_local_view(trace_count_event(
@@ -267,28 +424,109 @@ void LineairDBTransaction::execute_read_plan(
     std::vector<uint64_t> row_tids;
     rows.reserve(step_result.scan_keys.size());
     row_tids.reserve(step_result.scan_keys.size());
+    // Only the non-for_each PRIMARY path consumes `rows` (push_local_range_scan
+    // below). For a secondary scan, scan_keys is moved wholesale into
+    // cached.primary_keys later, so it must stay intact here (Codex P1: moving it
+    // into the unused `rows` would install moved-from strings as primary keys).
+    const bool build_primary_rows = !step.for_each && step.index_name.empty();
     for (size_t j = 0; j < step_result.scan_keys.size(); ++j) {
-      const std::string& key = step_result.scan_keys[j];
-      const std::string value =
-          j < step_result.scan_values.size() ? step_result.scan_values[j] : "";
+      std::string& key = step_result.scan_keys[j];
       const uint64_t tid =
           j < step_result.scan_tids.size() ? step_result.scan_tids[j] : 0;
-      const bool found = !value.empty();
-      record_local_read(step.table_name, key, found, value, tid, true);
+      const bool found =
+          j < step_result.scan_values.size() && !step_result.scan_values[j].empty();
       if (found) {
-        rows.emplace_back(key, value);
-        row_tids.push_back(tid);
+        std::string& value = step_result.scan_values[j];
+        // record_local_read copies key+value into local_read_set_ first; then
+        // (primary path only) move them out of the discarded RPC result into the
+        // cache row — avoids a third materialization of every matched row.
+        record_local_read(step.table_name, key, true, value, tid, true);
+        if (build_primary_rows) {
+          rows.emplace_back(std::move(key), std::move(value));
+          row_tids.push_back(tid);
+        }
+      } else {
+        record_local_read(step.table_name, key, false, std::string(), tid, true);
       }
     }
 
-    if (step.for_each) continue;
+    // (c) Validate rows the server's pushed filter REJECTED. They exist in the
+    // scanned range but were dropped from the result; record each (key, tid) as
+    // a validating read so a concurrent UPDATE that flips a rejected row's
+    // predicate column INTO the matched set before commit is detected (its TID
+    // changes → abort). Logical range key-list validation alone misses such
+    // value-only changes. (P1 closed.)
+    if (!step_result.filtered_keys.empty())
+      rpc_trace_.record_local_view(trace_count_event(
+          "filtered_validate", step.table_name, step_result.filtered_keys.size()));
+    for (size_t j = 0; j < step_result.filtered_keys.size(); ++j) {
+      const uint64_t ftid = j < step_result.filtered_tids.size()
+                                ? step_result.filtered_tids[j]
+                                : 0;
+      record_stateless_read(step.table_name, step_result.filtered_keys[j], true,
+                            ftid);
+    }
+
+    if (step.for_each) {
+      // FER/FES join prefetch: one cache entry per source-row sub-scan so each
+      // join probe hits the O(1) start-key index. (Plain FE point reads carry
+      // no subscans and were already recorded above.)
+      if (std::getenv("HELIOS_FE_DEBUG"))
+        std::fprintf(stderr,
+            "[INGEST] tbl=%s subscans=%zu flat_keys=%zu before_idx=%zu\n",
+            step.table_name.c_str(), step_result.subscans.size(),
+            step_result.scan_keys.size(), range_scan_index_.size());
+      for (auto& sub : step_result.subscans) {
+        if (step.index_name.empty()) {
+          std::vector<std::pair<std::string, std::string>> srows;
+          std::vector<uint64_t> stids;
+          srows.reserve(sub.scan_keys.size());
+          stids.reserve(sub.scan_keys.size());
+          for (size_t k = 0; k < sub.scan_keys.size(); ++k) {
+            if (k >= sub.scan_values.size() || sub.scan_values[k].empty())
+              continue;
+            // Move the decoded key/value out of the RPC result (a local that is
+            // discarded after ingest) straight into the cache row — avoids a
+            // second materialization of every for_each row (19.5M for Q21 SF1).
+            srows.emplace_back(std::move(sub.scan_keys[k]),
+                               std::move(sub.scan_values[k]));
+            stids.push_back(k < sub.scan_tids.size() ? sub.scan_tids[k] : 0);
+          }
+          push_local_range_scan({step.table_name, sub.start_key, sub.end_key,
+                                 false, 0, std::move(srows), std::move(stids),
+                                 std::move(sub.range_versions), {},
+                                 step.filter_serialized});
+        } else {
+          LocalSecondaryScanEntry cached;
+          cached.table_name = step.table_name;
+          cached.index_name = step.index_name;
+          cached.start_key = sub.start_key;
+          cached.end_key = sub.end_key;
+          cached.reverse_scan = false;
+          cached.row_limit = 0;
+          cached.secondary_keys = std::move(sub.secondary_keys);
+          cached.primary_keys = std::move(sub.scan_keys);
+          cached.range_versions = std::move(sub.range_versions);
+          push_local_secondary_scan(std::move(cached));
+        }
+      }
+      continue;
+    }
 
     if (step.index_name.empty()) {
-      local_range_scans_.push_back(
+      // Mark the entry with the predicate the server applied (plan-level filter
+      // on the step, or the driver filter late-stamped from pushed_filter_), so
+      // range_entry_matches won't serve these pruned rows to a different probe.
+      std::string eff_filter = step.filter_serialized;
+      if (eff_filter.empty() && step.is_scan && !step.for_each &&
+          step.table_name == db_table_key && !pushed_filter_.empty())
+        eff_filter = pushed_filter_;
+      push_local_range_scan(
           {step.table_name, step_result.actual_start_key,
            step_result.actual_end_key, step.reverse_scan, step.scan_limit,
-           std::move(rows), std::move(row_tids), step_result.range_versions,
-           step_result.index_reads});
+           std::move(rows), std::move(row_tids),
+           std::move(step_result.range_versions),
+           std::move(step_result.index_reads), std::move(eff_filter)});
     } else {
       LocalSecondaryScanEntry cached;
       cached.table_name = step.table_name;
@@ -297,18 +535,26 @@ void LineairDBTransaction::execute_read_plan(
       cached.end_key = step_result.actual_end_key;
       cached.reverse_scan = step.reverse_scan;
       cached.row_limit = step.scan_limit;
-      cached.secondary_keys.reserve(step_result.secondary_keys.size());
-      cached.primary_keys.reserve(step_result.scan_keys.size());
-      for (const auto& key : step_result.secondary_keys) {
-        cached.secondary_keys.push_back(key);
-      }
-      for (const auto& key : step_result.scan_keys) {
-        cached.primary_keys.push_back(key);
-      }
-      cached.range_versions = step_result.range_versions;
-      cached.index_reads = step_result.index_reads;
-      local_secondary_scans_.push_back(std::move(cached));
+      cached.secondary_keys = std::move(step_result.secondary_keys);
+      cached.primary_keys = std::move(step_result.scan_keys);
+      cached.range_versions = std::move(step_result.range_versions);
+      cached.index_reads = std::move(step_result.index_reads);
+      push_local_secondary_scan(std::move(cached));
     }
+  }
+  if (memprof) {
+    // ingest copied the rows from ReadPlanResult(#5) into the local cache(#6);
+    // the delta is #6 (the copy the join replays against; #5 frees on return).
+    const size_t je_post = helios_mem::je_allocated();
+    std::fprintf(stderr,
+        "[MEMPROF-proxy] #6 cache ingest_delta=%.2fGB | je_now(#5+#6)=%.2fGB\n",
+        (double)(je_post - je_pre_ingest) / 1e9, je_post / 1e9);
+    std::fflush(stderr);
+  }
+  if (timeprof) {
+    const uint64_t tp_ingest_end = tp_now();
+    tp_ingest_ns_ += (tp_ingest_end - tp_ingest_start);
+    ++tp_ingest_count_;
   }
 }
 
@@ -331,6 +577,7 @@ bool LineairDBTransaction::batch_write(
     return true;
   }
 
+  ensure_started_for_normal_rpc();  // (d/P1-a)
   return lineairdb_proxy->tx_batch_write(this, table_name, ops);
 }
 
@@ -373,6 +620,7 @@ bool LineairDBTransaction::write(std::string key, const std::string value) {
     return true;
   }
 
+  ensure_started_for_normal_rpc();  // (d/P1-a)
   const bool ok = lineairdb_proxy->tx_write(this, key, value);
   if (ok) record_local_write(db_table_key, key, true, value);
   return ok;
@@ -385,6 +633,7 @@ bool LineairDBTransaction::delete_value(std::string key) {
     return true;
   }
 
+  ensure_started_for_normal_rpc();  // (d/P1-a)
   const bool ok = lineairdb_proxy->tx_delete(this, key);
   if (ok) record_local_write(db_table_key, key, false, ""); // value unused when not found
   return ok;
@@ -423,6 +672,7 @@ bool LineairDBTransaction::write_secondary_index(std::string index_name,
     return true;
   }
 
+  ensure_started_for_normal_rpc();  // (d/P1-a)
   return lineairdb_proxy->tx_write_secondary_index(this, index_name, secondary_key, primary_key);
 }
 
@@ -436,6 +686,7 @@ bool LineairDBTransaction::delete_secondary_index(std::string index_name,
     return true;
   }
 
+  ensure_started_for_normal_rpc();  // (d/P1-a)
   return lineairdb_proxy->tx_delete_secondary_index(this, index_name, secondary_key, primary_key);
 }
 
@@ -452,6 +703,7 @@ bool LineairDBTransaction::update_secondary_index(std::string index_name,
     return true;
   }
 
+  ensure_started_for_normal_rpc();  // (d/P1-a)
   return lineairdb_proxy->tx_update_secondary_index(this, index_name, old_secondary_key, new_secondary_key, primary_key);
 }
 
@@ -461,21 +713,43 @@ std::vector<std::string>
 LineairDBTransaction::get_matching_keys_in_range(std::string start_key,
                                                  std::string end_key) {
   if (table_is_not_chosen()) return {};
+  // Phase-3b: deferred plan exec on first scan; relies on pushed_filter_ being
+  // set by rnd_init / index_init before MySQL hits the scan path.
+  execute_pending_oneshot_plan();
   if (oneshot_mode_) {
+    if (end_key.empty()) end_key.assign(16, '\xff');  // (d/P1-c)
     if (auto cached =
             lookup_local_range_scan(db_table_key, start_key, end_key, false, 0)) {
       std::vector<std::pair<std::string, std::string>> rows = cached->rows;
       rpc_trace_.record_local_view(
           trace_count_event("use_pk_key_scan", db_table_key, rows.size()));
-      for (size_t i = 0; i < rows.size() && i < cached->row_tids.size(); ++i) {
-        record_stateless_read(db_table_key, rows[i].first, true,
-                              cached->row_tids[i]);
+      // OCC recording is idempotent per probe (immutable cache); skip on a
+      // repeat serve of the same probe to avoid re-hashing result_keys.
+      if (!probe_occ_already_recorded(db_table_key, "", start_key, end_key, 0,
+                                      false)) {
+        // Per-row stateless read recording (REINSTATED: user 2026-05-29
+        // explicitly rejected Step C's value-update detection gap as
+        // unacceptable). The commit-RPC cost of sending millions of TIDs is
+        // accepted to keep physical OCC sound under concurrent UPDATE: node
+        // version doesn't bump on value update, so without a per-row TID
+        // record at commit a value flip would go undetected.
+        // Phase-6 range-hash OCC: for a read-only SELECT (rangehash_eligible_)
+        // serving from a FULL-COVER entry (start_key==""), skip per-row read
+        // recording — the server revalidates this range via its retained
+        // footprint digest at commit (correct value-update detection, O(1)
+        // wire). All other cases keep per-row recording.
+        const bool rh_skip = rangehash_eligible_ && cached->start_key.empty();
+        if (!rh_skip)
+        for (size_t i = 0; i < rows.size() && i < cached->row_tids.size(); ++i) {
+          record_stateless_read(db_table_key, rows[i].first, true,
+                                cached->row_tids[i]);
+        }
+        // Activate validation against the pre-merge key list in
+        // cached->range_versions: server-side re-walk at commit cannot see
+        // this tx's pending writes, so validating against the post-merge
+        // view would false-abort on every own-insert / own-delete in range.
+        activate_range_validation(cached->range_versions, cached->index_reads);
       }
-      // Activate validation against the pre-merge key list in
-      // cached->range_versions: server-side re-walk at commit cannot see
-      // this tx's pending writes, so validating against the post-merge
-      // view would false-abort on every own-insert / own-delete in range.
-      activate_range_validation(cached->range_versions, cached->index_reads);
 
       merge_pending_rows_into_range_scan(rows, start_key, end_key, false);
       std::vector<std::string> keys;
@@ -484,9 +758,25 @@ LineairDBTransaction::get_matching_keys_in_range(std::string start_key,
       return keys;
     }
 
-    rpc_trace_.record_local_view("abort_oneshot_pk_key_scan_miss");
-    is_aborted_ = true;
-    return {};
+    // Cache miss in oneshot mode. Previously fell back to a value-scan path
+    // (which itself may go stateless). User 2026-05-29: silent stateless
+    // fallback hides planner gaps; abort loudly so the missing prefetch
+    // surfaces. The note_oneshot_miss helper sets is_aborted_ and logs a
+    // [ONESHOT-MISS] line so the failing probe is debuggable. Set
+    // HELIOS_ALLOW_ONESHOT_FALLBACK=1 to restore the old fallback path.
+    if (has_oneshot_local_state()) {
+      if (std::getenv("HELIOS_ALLOW_ONESHOT_FALLBACK") != nullptr) {
+        rpc_trace_.record_local_view("oneshot_pk_key_scan_fallback");
+        auto pairs = get_matching_keys_and_values_in_range(start_key, end_key, 0, false);
+        std::vector<std::string> keys;
+        keys.reserve(pairs.size());
+        for (auto& kv : pairs) keys.push_back(kv.first);
+        return keys;
+      }
+      (void)note_oneshot_miss("pk_key_scan", db_table_key, start_key);
+      return {};
+    }
+    // clean tx: fall through to normal-transaction switch below
   }
 
   if (!fallback_to_normal_transaction("get_matching_keys_in_range")) return {};
@@ -501,17 +791,44 @@ LineairDBTransaction::get_matching_keys_and_values_in_range(std::string start_ke
                                                             uint64_t row_limit,
                                                             bool reverse_scan) {
   if (table_is_not_chosen()) return {};
+  execute_pending_oneshot_plan();  // Phase-3b: lazy plan exec
   if (oneshot_mode_) {
-    if (auto cached = lookup_local_range_scan(
-            db_table_key, start_key, end_key, reverse_scan, row_limit)) {
+    // (d/P1-c) Normalize an open-ended upper bound to the max sentinel BEFORE
+    // the cache lookup: an empty end_key sorts as the smallest string, so the
+    // cover test (end_key <= e.end_key) would wrongly treat any finite cached
+    // range as covering [start, +inf) and return an incomplete slice. The
+    // sentinel makes both the cover test and the stateless RPC use +inf.
+    if (end_key.empty()) end_key.assign(16, '\xff');
+    // (d/P1-b) A LIMIT-bounded cache entry holds only N rows; if this tx has
+    // buffered writes/deletes in the range, merging them could leave a hole the
+    // cache can't backfill (a deleted cached row's successor was never fetched).
+    // Bypass the cache in that case and take the stateless path (unlimited scan
+    // → merge → truncate). Unlimited cache entries (the common prefetch case)
+    // are unaffected.
+    const bool limited_with_writes =
+        row_limit > 0 && has_pending_ops_for_table(db_table_key);
+    std::optional<LocalRangeScanEntry> cached;
+    if (!limited_with_writes)
+      cached = lookup_local_range_scan(db_table_key, start_key, end_key,
+                                       reverse_scan, row_limit);
+    if (cached) {
       std::vector<std::pair<std::string, std::string>> pairs = cached->rows;
-      for (size_t i = 0; i < cached->rows.size() && i < cached->row_tids.size();
-           ++i) {
-        record_stateless_read(db_table_key, cached->rows[i].first, true,
-                              cached->row_tids[i]);
+      // OCC recording is idempotent per probe; skip on a repeat serve.
+      if (!probe_occ_already_recorded(db_table_key, "", start_key, end_key,
+                                      row_limit, reverse_scan)) {
+        // Per-row stateless read recording (REINSTATED — Step C reverted
+        // per user 2026-05-29). See get_matching_keys_in_range above.
+        // Phase-6 range-hash OCC: skip for read-only full-cover serve.
+        const bool rh_skip2 = rangehash_eligible_ && cached->start_key.empty();
+        if (!rh_skip2)
+        for (size_t i = 0;
+             i < cached->rows.size() && i < cached->row_tids.size(); ++i) {
+          record_stateless_read(db_table_key, cached->rows[i].first, true,
+                                cached->row_tids[i]);
+        }
+        // See get_matching_keys_in_range above for the rationale.
+        activate_range_validation(cached->range_versions, cached->index_reads);
       }
-      // See get_matching_keys_in_range above for the rationale.
-      activate_range_validation(cached->range_versions, cached->index_reads);
 
       merge_pending_rows_into_range_scan(pairs, start_key, end_key,
                                          reverse_scan);
@@ -523,11 +840,53 @@ LineairDBTransaction::get_matching_keys_and_values_in_range(std::string start_ke
       return pairs;
     }
 
-    rpc_trace_.record_local_view("abort_oneshot_pk_value_scan_miss:" +
-                                 std::to_string(start_key.size()) + ":" +
-                                 std::to_string(end_key.size()));
-    is_aborted_ = true;
-    return {};
+    // Cache miss. If this oneshot tx already accumulated local state, it cannot
+    // re-begin as a normal tx, so read this uncovered scan statelessly (correct
+    // range OCC, only the prefetch win is lost). If the tx is still CLEAN (e.g.
+    // a MIN/MAX or index-only query that never went through the auto-gen hook,
+    // so no plan was staged), fall through to switch to the normal scan-capable
+    // path instead of a stateless RPC. (d)
+    if (has_oneshot_local_state()) {
+      // Isolated bench: abort on prefetch miss instead of the stateless range
+      // fallback.
+      if (note_oneshot_miss("pk_value_scan", db_table_key, start_key)) return {};
+      rpc_trace_.record_local_view("oneshot_pk_value_scan_fallback");
+      // end_key is already normalized to the max sentinel above (P1-c).
+      // The stateless scan cannot apply the pushed WHERE filter (only the
+      // normal RPC carries it). A pushed LIMIT assumed server-side filtering,
+      // so an unfiltered limited scan could return fewer WHERE-passing rows
+      // than requested. With own writes to merge, a limited server scan also
+      // can't form the correct post-merge window. In either case fetch the
+      // full range and let MySQL apply WHERE + LIMIT locally. (d/P1-b, P1-LIMIT)
+      const bool merge_writes = has_pending_ops_for_table(db_table_key);
+      const bool has_filter = !pushed_filter_.empty();
+      const uint64_t eff_limit =
+          ((merge_writes || has_filter) && row_limit > 0) ? 0 : row_limit;
+      auto sr = lineairdb_proxy->tx_stateless_range_scan(
+          db_table_key, start_key, end_key, eff_limit, reverse_scan);
+      if (!sr.ok) {
+        rpc_trace_.record_local_view("abort_oneshot_range_fallback_rpc");
+        is_aborted_ = true;
+        return {};
+      }
+      std::vector<std::pair<std::string, std::string>> pairs;
+      pairs.reserve(sr.rows.size());
+      for (auto& row : sr.rows) {
+        record_stateless_read(db_table_key, row.key, row.found, row.tid);
+        if (row.found) pairs.emplace_back(row.key, row.value);
+      }
+      activate_range_validation(sr.range_versions, sr.index_reads);
+      // (d/P1-b) reflect this tx's own buffered writes/deletes in the range.
+      if (merge_writes)
+        merge_pending_rows_into_range_scan(pairs, start_key, end_key, reverse_scan);
+      // Only truncate to the caller's LIMIT when no pushed filter remains to be
+      // applied by MySQL (otherwise MySQL must see all candidates).
+      if (row_limit > 0 && !has_filter && pairs.size() > row_limit) {
+        pairs.resize(static_cast<size_t>(row_limit));
+      }
+      return pairs;
+    }
+    // clean tx: fall through to normal-transaction switch below
   }
 
   if (!fallback_to_normal_transaction("get_matching_keys_and_values_in_range")) return {};
@@ -554,12 +913,21 @@ LineairDBTransaction::get_matching_keys_and_values_in_range(std::string start_ke
 std::vector<std::pair<std::string, std::string>>
 LineairDBTransaction::get_matching_keys_and_values_from_prefix(std::string prefix) {
   if (table_is_not_chosen()) return {};
+  execute_pending_oneshot_plan();  // Phase-3b: lazy plan exec
   if (oneshot_mode_) {
-    const std::string prefix_end = next_lexicographic_key(prefix);
-    if (prefix_end.empty()) {
-      rpc_trace_.record_local_view("abort_pk_prefix_end");
-      is_aborted_ = true;
-      return {};
+    std::string prefix_end;
+    if (prefix.empty()) {
+      // Full-table scan: end_key cannot be derived from prefix (next_lex of ""
+      // is ""), so use a max sentinel. Plan-side S: with no bounds must use
+      // the same sentinel (see parse_plan_steps in ha_lineairdb.cc).
+      prefix_end.assign(16, '\xff');
+    } else {
+      prefix_end = next_lexicographic_key(prefix);
+      if (prefix_end.empty()) {
+        rpc_trace_.record_local_view("abort_pk_prefix_end");
+        is_aborted_ = true;
+        return {};
+      }
     }
     return get_matching_keys_and_values_in_range(prefix, prefix_end);
   }
@@ -588,6 +956,16 @@ std::optional<std::string>
 LineairDBTransaction::fetch_last_key_in_range(const std::string &start_key,
                                               const std::string &end_key) {
   if (table_is_not_chosen()) return std::nullopt;
+  if (oneshot_mode_ && has_oneshot_local_state()) {
+    // (d) Don't abort under oneshot state: derive the max key from the
+    // cache-or-stateless range scan (correct range OCC), then pick the max.
+    auto pairs = get_matching_keys_and_values_in_range(start_key, end_key, 0, false);
+    const std::string* mx = nullptr;
+    for (auto& kv : pairs)
+      if (mx == nullptr || kv.first > *mx) mx = &kv.first;
+    if (mx == nullptr) return std::nullopt;
+    return *mx;
+  }
   if (!fallback_to_normal_transaction("fetch_last_key_in_range")) return std::nullopt;
   flush_write_buffer_for_table(db_table_key);
 
@@ -598,6 +976,14 @@ std::optional<std::string>
 LineairDBTransaction::fetch_first_key_with_prefix(const std::string &prefix,
                                                   const std::string &prefix_end) {
   if (table_is_not_chosen()) return std::nullopt;
+  if (oneshot_mode_ && has_oneshot_local_state()) {
+    auto pairs = get_matching_keys_and_values_in_range(prefix, prefix_end, 0, false);
+    const std::string* mn = nullptr;
+    for (auto& kv : pairs)
+      if (mn == nullptr || kv.first < *mn) mn = &kv.first;
+    if (mn == nullptr) return std::nullopt;
+    return *mn;
+  }
   if (!fallback_to_normal_transaction("fetch_first_key_with_prefix")) return std::nullopt;
   flush_write_buffer_for_table(db_table_key);
 
@@ -608,6 +994,15 @@ std::optional<std::string>
 LineairDBTransaction::fetch_next_key_with_prefix(const std::string &last_key,
                                                  const std::string &prefix_end) {
   if (table_is_not_chosen()) return std::nullopt;
+  if (oneshot_mode_ && has_oneshot_local_state()) {
+    // Smallest key strictly greater than last_key within [last_key, prefix_end).
+    auto pairs = get_matching_keys_and_values_in_range(last_key, prefix_end, 0, false);
+    const std::string* mn = nullptr;
+    for (auto& kv : pairs)
+      if (kv.first > last_key && (mn == nullptr || kv.first < *mn)) mn = &kv.first;
+    if (mn == nullptr) return std::nullopt;
+    return *mn;
+  }
   if (!fallback_to_normal_transaction("fetch_next_key_with_prefix")) return std::nullopt;
   flush_write_buffer_for_table(db_table_key);
 
@@ -621,7 +1016,11 @@ LineairDBTransaction::get_matching_primary_keys_in_range(std::string index_name,
                                                          std::string start_key,
                                                          std::string end_key) {
   if (table_is_not_chosen()) return {};
+  execute_pending_oneshot_plan();  // Phase-3b: lazy plan exec
   if (oneshot_mode_) {
+    // (d/P1-c) normalize open-ended end_key before the cache lookup too, so the
+    // secondary cover test doesn't treat a finite cached range as covering +inf.
+    if (end_key.empty()) end_key.assign(16, '\xff');
     if (has_pending_secondary_ops_for_index(db_table_key, index_name)) {
       rpc_trace_.record_local_view("abort_secondary_scan_after_secondary_write:" +
                                    index_name);
@@ -634,16 +1033,44 @@ LineairDBTransaction::get_matching_primary_keys_in_range(std::string index_name,
       rpc_trace_.record_local_view("use_si_scan:" + db_table_key + ":" +
                                    index_name + ":n=" +
                                    std::to_string(cached->primary_keys.size()));
-      activate_range_validation(cached->range_versions, cached->index_reads);
+      // OCC recording idempotent per probe; skip re-activation (and its
+      // result_keys re-hash) on a repeat serve. This is the NLJ inner-probe hot
+      // path (e.g. lineitem-by-l_partkey for Q9).
+      if (!probe_occ_already_recorded(db_table_key, index_name, start_key,
+                                      end_key, 0, false))
+        activate_range_validation(cached->range_versions, cached->index_reads);
       return cached->primary_keys;
     }
 
-    rpc_trace_.record_local_view("abort_oneshot_secondary_scan_miss:" +
-                                 index_name + ":" +
-                                 std::to_string(start_key.size()) + ":" +
-                                 std::to_string(end_key.size()));
-    is_aborted_ = true;
-    return {};
+    // Cache miss. With local state → stateless secondary scan (correct OCC);
+    // clean → fall through to the normal scan-capable path. (d, see
+    // get_matching_keys_and_values_in_range for rationale.)
+    if (has_oneshot_local_state()) {
+      // Isolated bench: abort on prefetch miss instead of the stateless
+      // secondary fallback (this is the lineitem-by-l_partkey join probe path).
+      if (note_oneshot_miss(("secondary_scan:" + index_name).c_str(),
+                            db_table_key, start_key))
+        return {};
+      rpc_trace_.record_local_view("oneshot_secondary_scan_fallback:" + index_name);
+      // end_key already normalized to the max sentinel above (P1-c). Own
+      // secondary writes are excluded by the has_pending_secondary_ops guard.
+      auto sr = lineairdb_proxy->tx_stateless_secondary_range_scan(
+          db_table_key, index_name, start_key, end_key, 0, false);
+      if (!sr.ok) {
+        rpc_trace_.record_local_view("abort_oneshot_secondary_fallback_rpc");
+        is_aborted_ = true;
+        return {};
+      }
+      std::vector<std::string> primary_keys;
+      primary_keys.reserve(sr.rows.size());
+      for (auto& row : sr.rows) {
+        record_stateless_read(db_table_key, row.primary_key, row.found, row.tid);
+        primary_keys.push_back(row.primary_key);
+      }
+      activate_range_validation(sr.range_versions, sr.index_reads);
+      return primary_keys;
+    }
+    // clean tx: fall through to normal-transaction switch below
   }
 
   if (!fallback_to_normal_transaction("get_matching_primary_keys_in_range")) return {};
@@ -677,6 +1104,14 @@ LineairDBTransaction::fetch_last_primary_key_in_secondary_range(const std::strin
                                                                 const std::string &start_key,
                                                                 const std::string &end_key) {
   if (table_is_not_chosen()) return std::nullopt;
+  if (oneshot_mode_ && has_oneshot_local_state()) {
+    // (d) get_matching_primary_keys_in_range returns primary keys in ascending
+    // secondary-key order (cache-or-stateless, correct OCC); the last is the
+    // primary key of the entry with the max secondary key in range.
+    auto pks = get_matching_primary_keys_in_range(index_name, start_key, end_key);
+    if (pks.empty()) return std::nullopt;
+    return pks.back();
+  }
   if (!fallback_to_normal_transaction("fetch_last_primary_key_in_secondary_range")) return std::nullopt;
   flush_write_buffer_for_table(db_table_key);
 
@@ -688,6 +1123,52 @@ LineairDBTransaction::fetch_last_secondary_entry_in_range(const std::string &ind
                                                           const std::string &start_key,
                                                           const std::string &end_key) {
   if (table_is_not_chosen()) return std::nullopt;
+  if (oneshot_mode_ && has_oneshot_local_state()) {
+    // (d) Max secondary key (+ its primary keys) in range, from the cached
+    // secondary scan if present, else a stateless secondary range scan.
+    // (d/P1-c) normalize open-ended end_key before both lookup and stateless.
+    const std::string eff_end =
+        end_key.empty() ? std::string(16, '\xff') : end_key;
+    if (auto cached = lookup_local_secondary_scan(db_table_key, index_name,
+                                                  start_key, eff_end, false, 0)) {
+      if (!probe_occ_already_recorded(db_table_key, index_name, start_key,
+                                      eff_end, 0, false))
+        activate_range_validation(cached->range_versions, cached->index_reads);
+      if (cached->secondary_keys.empty()) return std::nullopt;
+      // secondary_keys/primary_keys are parallel, ascending by secondary key.
+      const std::string& maxsk = cached->secondary_keys.back();
+      SecondaryIndexEntry entry;
+      entry.secondary_key = maxsk;
+      for (size_t i = 0; i < cached->secondary_keys.size(); ++i)
+        if (cached->secondary_keys[i] == maxsk &&
+            i < cached->primary_keys.size())
+          entry.primary_keys.push_back(cached->primary_keys[i]);
+      return entry;
+    }
+    if (note_oneshot_miss(("secondary_entry:" + index_name).c_str(),
+                          db_table_key, start_key))
+      return std::nullopt;
+    rpc_trace_.record_local_view("oneshot_secondary_entry_fallback:" + index_name);
+    auto sr = lineairdb_proxy->tx_stateless_secondary_range_scan(
+        db_table_key, index_name, start_key, eff_end, 0, false);
+    if (!sr.ok) {
+      rpc_trace_.record_local_view("abort_oneshot_secondary_entry_fallback_rpc");
+      is_aborted_ = true;
+      return std::nullopt;
+    }
+    activate_range_validation(sr.range_versions, sr.index_reads);
+    std::optional<std::string> maxsk;
+    for (auto& row : sr.rows) {
+      record_stateless_read(db_table_key, row.primary_key, row.found, row.tid);
+      if (!maxsk || row.secondary_key > *maxsk) maxsk = row.secondary_key;
+    }
+    if (!maxsk) return std::nullopt;
+    SecondaryIndexEntry entry;
+    entry.secondary_key = *maxsk;
+    for (auto& row : sr.rows)
+      if (row.secondary_key == *maxsk) entry.primary_keys.push_back(row.primary_key);
+    return entry;
+  }
   if (!fallback_to_normal_transaction("fetch_last_secondary_entry_in_range")) return std::nullopt;
   flush_write_buffer_for_table(db_table_key);
 
@@ -798,6 +1279,7 @@ bool LineairDBTransaction::flush_write_buffer() {
     return false;
   }
 
+  ensure_started_for_normal_rpc();  // (d/P1-a)
   bool ok = lineairdb_proxy->tx_batch_write(this, "", write_buffer_ops_);
   write_buffer_ops_.clear();
   return ok;
@@ -834,6 +1316,7 @@ bool LineairDBTransaction::flush_write_buffer_for_table(
     }
   }
 
+  ensure_started_for_normal_rpc();  // (d/P1-a)
   bool ok = lineairdb_proxy->tx_batch_write(this, table_name, flush_ops);
   if (!ok) {
     write_buffer_ops_.clear();
@@ -987,6 +1470,14 @@ void LineairDBTransaction::drop_local_secondary_scans(
     kept.push_back(entry);
   }
   local_secondary_scans_.swap(kept);
+  // Rebuild the O(1) start-key index since entry positions changed.
+  secondary_scan_index_.clear();
+  for (size_t i = 0; i < local_secondary_scans_.size(); ++i) {
+    std::string ikey = local_secondary_scans_[i].index_name;
+    ikey.push_back('\0');
+    ikey.append(local_secondary_scans_[i].start_key);
+    secondary_scan_index_[ikey].push_back(i);
+  }
 }
 
 void LineairDBTransaction::record_local_write(const std::string& table_name,
@@ -1020,13 +1511,29 @@ void LineairDBTransaction::record_stateless_read(const std::string& table_name,
                                                  const std::string& key,
                                                  bool found,
                                                  uint64_t tid) {
-  for (auto& entry : stateless_read_set_) {
-    if (entry.table_name == table_name && entry.key == key) {
-      entry.found = found;
-      entry.tid = tid;
-      return;
+  // Compose a unique dedup key matching make_local_read_key's encoding.
+  std::string dedup_key;
+  dedup_key.reserve(table_name.size() + 1 + key.size());
+  dedup_key.append(table_name);
+  dedup_key.push_back('\0');
+  dedup_key.append(key);
+
+  auto it = stateless_read_index_.find(dedup_key);
+  if (it != stateless_read_index_.end()) {
+    auto& entry = stateless_read_set_[it->second];
+    // (d/P1) The same key was already observed in this transaction. Versions are
+    // stable per value, so re-reading an unchanged key yields the same TID. A
+    // DIFFERENT (tid, found) means the row changed under us between two reads in
+    // the same tx — a non-serializable read skew. Silently overwriting the
+    // earlier TID would drop its commit validation, so abort instead. (Equal
+    // observations are a harmless dedup no-op.)
+    if (entry.tid != tid || entry.found != found) {
+      rpc_trace_.record_local_view("abort_stateless_read_tid_conflict");
+      is_aborted_ = true;
     }
+    return;
   }
+  stateless_read_index_[std::move(dedup_key)] = stateless_read_set_.size();
   stateless_read_set_.push_back({table_name, key, tid, found});
 }
 
@@ -1037,97 +1544,550 @@ void LineairDBTransaction::activate_local_read(const LocalRowEntry& entry) {
   record_stateless_read(entry.table_name, entry.key, entry.found, entry.tid);
 }
 
+// FNV-1a folding helpers — hash ALL fields the exact comparison below uses,
+// including result_keys / result_primary_keys CONTENTS (the server's logical
+// range validation compares those, so two same-range entries with different
+// key lists are DISTINCT and must both be kept). Length-mixing avoids the
+// '\0'-separator ambiguity of binary keys. (Codex review.)
+static inline void hash_bytes(uint64_t& h, const char* p, size_t n) {
+  for (size_t i = 0; i < n; ++i) {
+    h ^= static_cast<unsigned char>(p[i]);
+    h *= 0x100000001b3ULL;
+  }
+}
+static inline void hash_str(uint64_t& h, const std::string& s) {
+  h ^= s.size(); h *= 0x100000001b3ULL;
+  hash_bytes(h, s.data(), s.size());
+}
+static inline void hash_u64(uint64_t& h, uint64_t v) {
+  hash_bytes(h, reinterpret_cast<const char*>(&v), sizeof(v));
+}
+static bool range_entry_equal(const LineairDBProxy::RangeValidationEntry& a,
+                              const LineairDBProxy::RangeValidationEntry& b) {
+  return a.table_name == b.table_name && a.index_name == b.index_name &&
+         a.owner_ptr == b.owner_ptr && a.node_ptr == b.node_ptr &&
+         a.version == b.version && a.start_key == b.start_key &&
+         a.end_key == b.end_key && a.row_limit == b.row_limit &&
+         a.reverse_scan == b.reverse_scan && a.result_keys == b.result_keys &&
+         a.result_primary_keys == b.result_primary_keys;
+}
+static bool index_entry_equal(const LineairDBProxy::IndexValidationEntry& a,
+                              const LineairDBProxy::IndexValidationEntry& b) {
+  return a.table_name == b.table_name && a.index_name == b.index_name &&
+         a.key == b.key && a.tid == b.tid && a.found == b.found;
+}
+
 void LineairDBTransaction::activate_range_validation(
     const std::vector<LineairDBProxy::RangeValidationEntry>& ranges,
     const std::vector<LineairDBProxy::IndexValidationEntry>& indexes) {
-  for (const auto& range : ranges) {
-    bool found = false;
-    for (const auto& active : range_validation_set_) {
-      const bool same_node =
-          active.table_name == range.table_name &&
-          active.index_name == range.index_name &&
-          active.owner_ptr == range.owner_ptr &&
-          active.node_ptr == range.node_ptr &&
-          active.version == range.version;
-      const bool same_logical =
-          active.start_key == range.start_key &&
-          active.end_key == range.end_key &&
-          active.row_limit == range.row_limit &&
-          active.reverse_scan == range.reverse_scan &&
-          active.result_keys == range.result_keys &&
-          active.result_primary_keys == range.result_primary_keys;
-      if (same_node && same_logical) {
-        found = true;
-        break;
-      }
+  // HELIOS_TIMEPROF accumulator.
+  struct TpGuard {
+    LineairDBTransaction* tx;
+    uint64_t t0;
+    bool on;
+    TpGuard(LineairDBTransaction* t) : tx(t), t0(0),
+        on(std::getenv("HELIOS_TIMEPROF") != nullptr) {
+      if (on) { timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+                t0 = uint64_t(ts.tv_sec)*1000000000ull + ts.tv_nsec; }
     }
-    if (!found) range_validation_set_.push_back(range);
+    ~TpGuard() {
+      if (on) { timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+                tx->tp_activate_rv_ns_ += (uint64_t(ts.tv_sec)*1000000000ull + ts.tv_nsec) - t0;
+                ++tx->tp_activate_rv_count_; }
+    }
+  } tp_guard(this);
+  // Dedup is O(1) amortized: hash all compared fields, then on a hash hit run
+  // the EXACT field-by-field comparison (range_entry_equal / index_entry_equal,
+  // identical to the old linear scan's same_node && same_logical). Distinct
+  // result_keys contents hash differently, so no distinct entry is dropped
+  // (no under-validation); duplicates collapse as before. Hashing is O(entry
+  // size) ⇒ O(total rows) overall, replacing the previous O(N^2) linear scan.
+  for (const auto& range : ranges) {
+    uint64_t h = 1469598103934665603ULL;
+    hash_str(h, range.table_name);
+    hash_str(h, range.index_name);
+    hash_u64(h, range.owner_ptr);
+    hash_u64(h, range.node_ptr);
+    hash_u64(h, range.version);
+    hash_str(h, range.start_key);
+    hash_str(h, range.end_key);
+    hash_u64(h, range.row_limit);
+    hash_u64(h, range.reverse_scan ? 1 : 0);
+    hash_u64(h, range.result_keys.size());
+    for (const auto& k : range.result_keys) hash_str(h, k);
+    hash_u64(h, range.result_primary_keys.size());
+    for (const auto& k : range.result_primary_keys) hash_str(h, k);
+    auto& bucket = range_validation_buckets_[h];
+    bool found = false;
+    for (size_t idx : bucket)
+      if (range_entry_equal(range_validation_set_[idx], range)) { found = true; break; }
+    if (!found) {
+      bucket.push_back(range_validation_set_.size());
+      range_validation_set_.push_back(range);
+    }
   }
 
   for (const auto& index : indexes) {
+    uint64_t h = 1469598103934665603ULL;
+    hash_str(h, index.table_name);
+    hash_str(h, index.index_name);
+    hash_str(h, index.key);
+    hash_u64(h, index.tid);
+    hash_u64(h, index.found ? 1 : 0);
+    auto& bucket = index_validation_buckets_[h];
     bool found = false;
-    for (const auto& active : index_validation_set_) {
-      if (active.table_name == index.table_name &&
-          active.index_name == index.index_name &&
-          active.key == index.key &&
-          active.tid == index.tid &&
-          active.found == index.found) {
-        found = true;
-        break;
-      }
+    for (size_t idx : bucket)
+      if (index_entry_equal(index_validation_set_[idx], index)) { found = true; break; }
+    if (!found) {
+      bucket.push_back(index_validation_set_.size());
+      index_validation_set_.push_back(index);
     }
-    if (!found) index_validation_set_.push_back(index);
   }
+}
+
+bool LineairDBTransaction::note_oneshot_miss(const char* what,
+                                            const std::string& table,
+                                            const std::string& key) {
+  // Isolated bench: a oneshot prefetch miss must NOT silently degrade into a
+  // per-probe stateless RPC (that breaks the 2-RPC contract and floods the wire
+  // with noise that hides where time goes). Abort loudly so misses are visible
+  // and the query fails fast instead of crawling. Logging is unconditional and
+  // flushed (mysqld stderr is block-buffered).
+  std::string h;
+  const size_t n = key.size() < 24 ? key.size() : 24;
+  static const char* hx = "0123456789abcdef";
+  for (size_t i = 0; i < n; ++i) {
+    unsigned char c = static_cast<unsigned char>(key[i]);
+    h.push_back(hx[c >> 4]);
+    h.push_back(hx[c & 0xf]);
+  }
+  std::fprintf(stderr, "[ONESHOT-MISS] %s tbl=%s keylen=%zu keyhex=%s -> ABORT\n",
+               what, table.c_str(), key.size(), h.c_str());
+  std::fflush(stderr);
+  rpc_trace_.record_local_view(std::string("oneshot_miss_abort:") + what + ":" +
+                               table);
+  is_aborted_ = true;
+  return true;
+}
+
+bool LineairDBTransaction::probe_occ_already_recorded(
+    const std::string& table_name, const std::string& index_name,
+    const std::string& start_key, const std::string& end_key,
+    uint64_t row_limit, bool reverse_scan) {
+  // Length-prefix each field so distinct probes can't alias even when keys
+  // contain 0x00 (a NUL separator would be ambiguous — same reasoning as the
+  // FER/FES dedup key on the server). Build is O(field sizes), far cheaper than
+  // re-hashing the cached range's full result_keys list on every serve.
+  std::string k;
+  k.reserve(table_name.size() + index_name.size() + start_key.size() +
+            end_key.size() + 24);
+  auto add = [&](const std::string& s) {
+    uint32_t n = static_cast<uint32_t>(s.size());
+    k.append(reinterpret_cast<const char*>(&n), sizeof(n));
+    k.append(s);
+  };
+  add(table_name);
+  add(index_name);
+  add(start_key);
+  add(end_key);
+  // Full 8 bytes for row_limit + a separate byte for reverse_scan: packing them
+  // into one shifted integer would drop row_limit's high bit (N collides with
+  // N+2^63). (Codex review.)
+  k.append(reinterpret_cast<const char*>(&row_limit), sizeof(row_limit));
+  k.push_back(reverse_scan ? '\x01' : '\x00');
+  // Include the active pushed predicate: the same physical range served under a
+  // different filter is a DISTINCT OCC obligation, so it must not be skipped as
+  // an already-recorded probe. Within one atomic statement pushed_filter_ is
+  // constant (no behavior change); it matters only across statements of a
+  // multi-statement tx that filter the same range differently. (Codex P1.)
+  add(pushed_filter_);
+  return !recorded_probe_keys_.insert(std::move(k)).second;
+}
+
+void LineairDBTransaction::push_local_range_scan(LocalRangeScanEntry entry) {
+  const std::string key = entry.start_key;
+  // Phase-1A: TRUE full-cover unfiltered S: entries (e.g. Q21 step0 lineitem)
+  // serve inner FER probes via slice_range_entry_fast which leaves the
+  // slice's range_versions EMPTY. The full-cover entry's own range_versions
+  // (covering the whole table) must already be in range_validation_set_ at
+  // first slice serve, so we eagerly activate at ingest. Other (filtered /
+  // limited / FER per-probe) entries keep lazy activation.
+  static const std::string kFullEnd16(16, '\xff');
+  const bool eager_eligible =
+      key.empty() && entry.end_key == kFullEnd16 &&
+      entry.filter_serialized.empty() && entry.row_limit == 0 &&
+      !entry.range_versions.empty();
+  if (eager_eligible) {
+    activate_range_validation(entry.range_versions, entry.index_reads);
+  }
+  local_range_scans_.push_back(std::move(entry));
+  range_scan_index_[key].push_back(local_range_scans_.size() - 1);
+}
+
+void LineairDBTransaction::push_local_secondary_scan(
+    LocalSecondaryScanEntry entry) {
+  std::string key = entry.index_name;
+  key.push_back('\0');
+  key.append(entry.start_key);
+  local_secondary_scans_.push_back(std::move(entry));
+  secondary_scan_index_[key].push_back(local_secondary_scans_.size() - 1);
+}
+
+// Shared body that tests whether a cached primary range entry can serve a
+// requested [start_key,end_key) probe, returning the (sliced) entry if so.
+static bool range_entry_matches(
+    const LineairDBTransaction::LocalRangeScanEntry& e,
+    const std::string& table_name, const std::string& start_key,
+    const std::string& end_key, bool reverse_scan, uint64_t row_limit,
+    bool (*can_slice)(const std::vector<LineairDBProxy::RangeValidationEntry>&,
+                      const std::vector<LineairDBProxy::IndexValidationEntry>&)) {
+  const bool same_table = e.table_name == table_name;
+  const bool same_direction = e.reverse_scan == reverse_scan;
+  const bool same_limit = e.row_limit == row_limit;
+  const bool covers_range = e.start_key <= start_key && end_key <= e.end_key;
+  const bool exact_range = e.start_key == start_key && e.end_key == end_key;
+  // A FILTERED entry holds only predicate-matching rows; serving it to a
+  // covering/sub-range probe (e.g. via the full-cover bucket) would return a
+  // pruned row set the probe doesn't expect. Restrict filtered entries to an
+  // exact-range hit (the scan that produced them). Unfiltered entries (the
+  // common prefetch case) are unaffected. (Codex P1.)
+  // RESIDUAL (latent, not reachable in single-statement atomic SQL): an exact
+  // [start,end) re-scan of the SAME range with a DIFFERENT predicate in a
+  // multi-statement transaction could still hit this filtered entry. A full
+  // filter-identity match (compare e.filter_serialized to the probe's requested
+  // filter) was considered but NOT applied: an FER/FES sub-scan's own pushed
+  // filter need not byte-equal the serve-site handler's pushed_filter_, so the
+  // strict match risks a false miss->abort for those probes. Revisit if
+  // multi-statement same-range-different-filter prefetch becomes real.
+  if (!e.filter_serialized.empty() && !exact_range) return false;
+  // Codex P1 #4 fix: a `[wide, LIMIT N]` cached entry holds the FIRST N
+  // rows of the wider range, not the N rows the narrower probe would have
+  // returned. Slicing is sound only when the cache is unlimited
+  // (row_limit == 0). For limited entries require exact_range.
+  return same_table && same_direction && same_limit && covers_range &&
+         (exact_range ||
+          (e.row_limit == 0 && can_slice(e.range_versions, e.index_reads)));
+}
+
+// Phase-1A fast slice for TRUE full-cover unfiltered entries.
+//
+// Why: the existing slice_range_entry does `cached = src` (deep copy of the
+// whole entry, including range_versions with all result_keys) then linearly
+// filters rows. For Q21 SF=1 step0 lineitem = 6M rows; an inner FER probe
+// expects ~4 matching rows. Doing 12M inner probes through that path = 36T
+// ops. Catastrophic.
+//
+// What: binary_search the sorted `src.rows` for [start, end), assign just the
+// matching slice. range_versions / index_reads / filter_serialized are left
+// EMPTY on purpose:
+//   - the SOURCE entry's range_versions are eagerly activated when it is
+//     pushed into local_range_scans_ (see push_local_range_scan below), so
+//     the OCC commit-time replay already covers the full range
+//   - the caller's `activate_range_validation(slice.range_versions, ...)` on
+//     an empty vector is a no-op (no result_keys to rehash). Returning the
+//     full src.range_versions would re-hash all 6M result_keys per probe,
+//     which made Phase-1A v1 time out at 200s.
+//
+// Safety: callers gate on the source entry being a TRUE full-cover (empty
+// start_key, no filter, no row_limit). See lookup_local_range_scan below.
+// Other slice cases continue to use slice_range_entry's verbatim path.
+static LineairDBTransaction::LocalRangeScanEntry slice_range_entry_fast(
+    const LineairDBTransaction::LocalRangeScanEntry& src,
+    const std::string& start_key, const std::string& end_key) {
+  LineairDBTransaction::LocalRangeScanEntry out;
+  out.table_name = src.table_name;
+  out.start_key = start_key;
+  out.end_key = end_key.empty() ? src.end_key : end_key;
+  out.reverse_scan = src.reverse_scan;
+  out.row_limit = src.row_limit;
+  auto key_less = [](const std::pair<std::string, std::string>& r,
+                     const std::string& k) { return r.first < k; };
+  auto lo = std::lower_bound(src.rows.begin(), src.rows.end(), start_key, key_less);
+  auto hi = std::lower_bound(src.rows.begin(), src.rows.end(), out.end_key, key_less);
+  out.rows.assign(lo, hi);
+  if (!src.row_tids.empty() && src.row_tids.size() == src.rows.size()) {
+    const size_t i0 = static_cast<size_t>(lo - src.rows.begin());
+    const size_t i1 = static_cast<size_t>(hi - src.rows.begin());
+    out.row_tids.assign(src.row_tids.begin() + i0, src.row_tids.begin() + i1);
+  }
+  // out.range_versions / out.index_reads / out.filter_serialized stay empty.
+  return out;
+}
+
+// Slice a matched primary range entry down to [start_key,end_key). For an
+// exact-range hit this is a verbatim copy (result_keys preserved); for a
+// narrower slice it keeps only rows/keys inside the requested window but never
+// drops filter-rejected keys from range_versions.result_keys (those keep the
+// server's pre-filter full key set so commit's logical revalidation matches).
+static LineairDBTransaction::LocalRangeScanEntry slice_range_entry(
+    const LineairDBTransaction::LocalRangeScanEntry& src,
+    const std::string& start_key, const std::string& end_key) {
+  LineairDBTransaction::LocalRangeScanEntry cached = src;
+  const bool exact_range =
+      src.start_key == start_key && src.end_key == end_key;
+  const std::string eff_end = end_key.empty() ? src.end_key : end_key;
+  cached.start_key = start_key;
+  cached.end_key = eff_end;
+  std::vector<std::pair<std::string, std::string>> rows;
+  std::vector<uint64_t> row_tids;
+  rows.reserve(cached.rows.size());
+  row_tids.reserve(cached.row_tids.size());
+  for (size_t i = 0; i < cached.rows.size(); ++i) {
+    const auto& row = cached.rows[i];
+    if (row.first >= start_key && row.first < eff_end) {
+      rows.push_back(row);
+      if (i < cached.row_tids.size()) row_tids.push_back(cached.row_tids[i]);
+    }
+  }
+  cached.rows = std::move(rows);
+  cached.row_tids = std::move(row_tids);
+  for (auto& range : cached.range_versions) {
+    if (!range_validation_is_logical(range)) continue;
+    if (!exact_range) {
+      std::vector<std::string> sliced_keys;
+      std::vector<std::string> sliced_pks;
+      sliced_keys.reserve(range.result_keys.size());
+      for (size_t k = 0; k < range.result_keys.size(); ++k) {
+        const std::string& rk = range.result_keys[k];
+        if (rk >= start_key && rk < eff_end) {
+          sliced_keys.push_back(rk);
+          if (k < range.result_primary_keys.size()) {
+            sliced_pks.push_back(range.result_primary_keys[k]);
+          }
+        }
+      }
+      range.result_keys = std::move(sliced_keys);
+      range.result_primary_keys = std::move(sliced_pks);
+    }
+    range.start_key = start_key;
+    range.end_key = eff_end;
+  }
+  return cached;
+}
+
+static std::string fe_hex(const std::string& s) {
+  static const char* h = "0123456789abcdef";
+  std::string o;
+  for (unsigned char c : s) { o.push_back(h[c >> 4]); o.push_back(h[c & 15]); }
+  return o;
+}
+
+// Encoded key-part prefixes of `key`, shortest-first, EXCLUDING the full key.
+// A FER/FES prefetch entry is keyed by N key parts, but MySQL's runtime probe
+// for a composite index can carry MORE parts (e.g. lineitem l_partkey prefetch
+// keyed by [l_partkey], probed by [l_partkey][l_suppkey]). The longer probe is
+// covered by the shorter prefetched range, so on an exact-start-key index miss
+// we retry with each prefix to find the covering entry in O(#keyparts). Each
+// int key part is [0x00 marker][0x10 INT][2-byte len][len bytes] (header 4 +
+// value). Parsing stops at the first non-int / malformed part (string parts and
+// the like simply yield no extra prefixes — safe, just no O(1) prefix hit).
+static std::vector<std::string> keypart_prefixes(const std::string& key) {
+  std::vector<std::string> out;
+  size_t off = 0;
+  while (off + 4 <= key.size()) {
+    const unsigned char marker = static_cast<unsigned char>(key[off]);
+    const unsigned char type = static_cast<unsigned char>(key[off + 1]);
+    if (marker != 0x00 || type != 0x10) break;  // only int parts understood
+    const size_t len = (static_cast<unsigned char>(key[off + 2]) << 8) |
+                       static_cast<unsigned char>(key[off + 3]);
+    const size_t part = 4 + len;
+    if (off + part > key.size()) break;
+    off += part;
+    if (off < key.size()) out.push_back(key.substr(0, off));  // exclude full key
+  }
+  return out;
 }
 
 std::optional<LineairDBTransaction::LocalRangeScanEntry>
 LineairDBTransaction::lookup_local_range_scan(
     const std::string& table_name, const std::string& start_key,
     const std::string& end_key, bool reverse_scan, uint64_t row_limit) const {
+  // O(1) exact-start-key path: FER prefetch registers one entry per probe.
+  auto idx_it = range_scan_index_.find(start_key);
+  if (std::getenv("HELIOS_FE_DEBUG") && !range_scan_index_.empty()) {
+    std::string sample;
+    if (!range_scan_index_.empty())
+      sample = fe_hex(range_scan_index_.begin()->first);
+    std::fprintf(stderr,
+        "[LURS] tbl=%s start=%s end_sz=%zu rlim=%llu idxhit=%d nidx=%zu "
+        "sample_entry_start=%s\n",
+        table_name.c_str(), fe_hex(start_key).c_str(), end_key.size(),
+        (unsigned long long)row_limit,
+        idx_it != range_scan_index_.end() ? 1 : 0, range_scan_index_.size(),
+        sample.c_str());
+  }
+  if (idx_it != range_scan_index_.end()) {
+    for (auto rit = idx_it->second.rbegin(); rit != idx_it->second.rend();
+         ++rit) {
+      const auto& cand = local_range_scans_[*rit];
+      if (range_entry_matches(cand, table_name, start_key, end_key,
+                              reverse_scan, row_limit,
+                              &range_validation_can_be_sliced)) {
+        return slice_range_entry(cand, start_key, end_key);
+      }
+    }
+  }
+  // O(#keyparts) prefix probe: a composite probe ([p0][p1]) may be covered by a
+  // prefetch entry keyed by a shorter prefix ([p0]). Try each key-part prefix.
+  for (const std::string& pfx : keypart_prefixes(start_key)) {
+    auto pit = range_scan_index_.find(pfx);
+    if (pit == range_scan_index_.end()) continue;
+    for (auto rit = pit->second.rbegin(); rit != pit->second.rend(); ++rit) {
+      const auto& cand = local_range_scans_[*rit];
+      if (range_entry_matches(cand, table_name, start_key, end_key, reverse_scan,
+                              row_limit, &range_validation_can_be_sliced))
+        return slice_range_entry(cand, start_key, end_key);
+    }
+  }
+  // Full-cover bucket: a full-table S: scan is registered under start_key "".
+  // It can cover ANY [start,end) probe, but the exact/keypart probes above key
+  // on the probe's own start, so they never find it. Check it explicitly here
+  // (O(#full scans), tiny) BEFORE the linear-cap bailout — otherwise, once many
+  // per-probe FER/FES entries exist (>cap), a probe coverable by the full scan
+  // would falsely miss and (with miss->abort) abort a correct query. (Codex.)
+  //
+  // Phase-1A: when the source is a TRUE full-cover (empty start_key,
+  // unfiltered, unlimited), route to slice_range_entry_fast which avoids the
+  // O(N) deep-copy + linear filter. Required when the inner FER step is
+  // dropped by the planner and N inner probes fall through to step0's 6M-row
+  // entry (otherwise: 36T ops per Q21).
+  {
+    auto fit = range_scan_index_.find(std::string());
+    if (fit != range_scan_index_.end()) {
+      for (auto rit = fit->second.rbegin(); rit != fit->second.rend(); ++rit) {
+        const auto& cand = local_range_scans_[*rit];
+        if (range_entry_matches(cand, table_name, start_key, end_key,
+                                reverse_scan, row_limit,
+                                &range_validation_can_be_sliced)) {
+          const bool full_cover_unfiltered =
+              cand.start_key.empty() && cand.filter_serialized.empty() &&
+              cand.row_limit == 0;
+          if (full_cover_unfiltered)
+            return slice_range_entry_fast(cand, start_key, end_key);
+          return slice_range_entry(cand, start_key, end_key);
+        }
+      }
+    }
+  }
+  // Linear fallback only for small caches (full-scan-slice plans); skipping it
+  // when many per-probe entries exist avoids O(N^2). A miss returns nullopt and
+  // the caller does a stateless RPC.
+  if (local_range_scans_.size() > kScanCacheLinearScanCap) return std::nullopt;
   for (auto it = local_range_scans_.rbegin();
        it != local_range_scans_.rend(); ++it) {
-    const bool same_table = it->table_name == table_name;
-    const bool same_direction = it->reverse_scan == reverse_scan;
-    const bool same_limit = it->row_limit == row_limit;
-    const bool covers_range =
-        it->start_key <= start_key && end_key <= it->end_key;
-    const bool exact_range =
-        it->start_key == start_key && it->end_key == end_key;
-    const bool can_slice_validation =
-        range_validation_can_be_sliced(it->range_versions, it->index_reads);
-    if (same_table && same_direction && same_limit && covers_range &&
-        (exact_range || can_slice_validation)) {
-      LocalRangeScanEntry cached = *it;
-      cached.start_key = start_key;
-      cached.end_key = end_key;
-      cached.row_limit = row_limit;
-      std::vector<std::pair<std::string, std::string>> rows;
-      std::vector<uint64_t> row_tids;
-      rows.reserve(cached.rows.size());
-      row_tids.reserve(cached.row_tids.size());
-      for (size_t i = 0; i < cached.rows.size(); ++i) {
-        const auto& row = cached.rows[i];
-        if (row.first >= start_key && row.first < end_key) {
-          rows.push_back(row);
-          if (i < cached.row_tids.size()) row_tids.push_back(cached.row_tids[i]);
-        }
-      }
-      cached.rows = std::move(rows);
-      cached.row_tids = std::move(row_tids);
-      for (auto& range : cached.range_versions) {
-        if (!range_validation_is_logical(range)) continue;
-        range.start_key = start_key;
-        range.end_key = end_key;
-        range.result_keys.clear();
-        range.result_primary_keys.clear();
-        for (const auto& row : cached.rows) {
-          range.result_keys.push_back(row.first);
-        }
-      }
-      return cached;
+    if (range_entry_matches(*it, table_name, start_key, end_key, reverse_scan,
+                            row_limit, &range_validation_can_be_sliced)) {
+      return slice_range_entry(*it, start_key, end_key);
     }
   }
   return std::nullopt;
+}
+
+const LineairDBTransaction::LocalRangeScanEntry*
+LineairDBTransaction::find_negative_covering_range_scan(
+    const std::string& table_name, const std::string& key) const {
+  // Above this many pre-filter keys we skip negative caching (the linear
+  // membership scan that proves absence would be too costly); the stateless
+  // fallback below stays correct, only the prefetch win is lost.
+  static constexpr size_t kNegativeMembershipCap = 8192;
+
+  auto entry_proves_absent =
+      [&](size_t idx) -> const LocalRangeScanEntry* {
+    const LocalRangeScanEntry& e = local_range_scans_[idx];
+    if (e.table_name != table_name) return nullptr;
+    if (e.row_limit != 0) return nullptr;   // limited scan: range not read in full
+    if (e.end_key.empty()) return nullptr;  // empty end_key unreliable for phantom
+    if (!key_is_in_range(key, e.start_key, e.end_key)) return nullptr;
+    // Prove absence against the LOGICAL pre-filter key set (range_versions.
+    // result_keys), NOT the post-filter cached rows: a row dropped by a pushed
+    // filter still exists on the server, so "in range but not in rows" is not
+    // absence. (Codex review.)
+    bool any_logical = false;
+    for (const auto& rv : e.range_versions) {
+      if (!range_validation_is_logical(rv)) continue;
+      any_logical = true;
+      if (rv.result_keys.size() > kNegativeMembershipCap) return nullptr;
+      for (const auto& rk : rv.result_keys)
+        if (rk == key) return nullptr;  // present (maybe filtered) -> not absent
+    }
+    if (!any_logical) return nullptr;  // no logical phantom set -> cannot prove
+    return &e;
+  };
+
+  // Candidate start-keys (deduped): the key itself ([key,next(key)) and
+  // single-PK point scans), each key-part prefix (FER prefix scans), and ""
+  // (full-table S: scans, which register under an empty start_key).
+  std::vector<std::string> cands;
+  cands.push_back(key);
+  for (auto& p : keypart_prefixes(key)) cands.push_back(p);
+  cands.emplace_back();
+  std::unordered_set<std::string> seen;
+  for (const auto& c : cands) {
+    if (!seen.insert(c).second) continue;
+    auto it = range_scan_index_.find(c);
+    if (it == range_scan_index_.end()) continue;
+    for (auto rit = it->second.rbegin(); rit != it->second.rend(); ++rit)
+      if (const LocalRangeScanEntry* e = entry_proves_absent(*rit)) return e;
+  }
+  // Small-cache linear fallback for entries not keyed by any candidate start.
+  if (local_range_scans_.size() <= kScanCacheLinearScanCap)
+    for (size_t i = local_range_scans_.size(); i-- > 0;)
+      if (const LocalRangeScanEntry* e = entry_proves_absent(i)) return e;
+  return nullptr;
+}
+
+static bool secondary_entry_matches(
+    const LineairDBTransaction::LocalSecondaryScanEntry& e,
+    const std::string& table_name, const std::string& index_name,
+    const std::string& start_key, const std::string& end_key,
+    uint64_t row_limit,
+    bool (*can_slice)(const std::vector<LineairDBProxy::RangeValidationEntry>&,
+                      const std::vector<LineairDBProxy::IndexValidationEntry>&)) {
+  const bool same_index =
+      e.table_name == table_name && e.index_name == index_name;
+  const bool same_limit = e.row_limit == row_limit;
+  const bool covers_range = e.start_key <= start_key && end_key <= e.end_key;
+  const bool exact_range = e.start_key == start_key && e.end_key == end_key;
+  // Codex P1 #4 fix (mirror of range_entry_matches): limited cached entry
+  // can only be reused on an exact-range match; slicing it loses the
+  // "first N of the wider range" semantics.
+  return same_index && same_limit && covers_range &&
+         (exact_range ||
+          (e.row_limit == 0 && can_slice(e.range_versions, e.index_reads)));
+}
+
+static LineairDBTransaction::LocalSecondaryScanEntry slice_secondary_entry(
+    const LineairDBTransaction::LocalSecondaryScanEntry& src,
+    const std::string& start_key, const std::string& end_key) {
+  LineairDBTransaction::LocalSecondaryScanEntry cached = src;
+  // Open-ended scan (empty end_key) means "to the cached entry's end" — mirror
+  // slice_range_entry, else `key < ""` rejects every row (Codex P1).
+  const std::string eff_end = end_key.empty() ? src.end_key : end_key;
+  cached.start_key = start_key;
+  cached.end_key = eff_end;
+  if (cached.secondary_keys.size() == cached.primary_keys.size()) {
+    std::vector<std::string> secondary_keys;
+    std::vector<std::string> primary_keys;
+    secondary_keys.reserve(cached.secondary_keys.size());
+    primary_keys.reserve(cached.primary_keys.size());
+    for (size_t i = 0; i < cached.secondary_keys.size(); ++i) {
+      if (cached.secondary_keys[i] >= start_key &&
+          cached.secondary_keys[i] < eff_end) {
+        secondary_keys.push_back(cached.secondary_keys[i]);
+        primary_keys.push_back(cached.primary_keys[i]);
+      }
+    }
+    cached.secondary_keys = std::move(secondary_keys);
+    cached.primary_keys = std::move(primary_keys);
+  }
+  for (auto& range : cached.range_versions) {
+    if (!range_validation_is_logical(range)) continue;
+    range.start_key = start_key;
+    range.end_key = eff_end;
+    range.result_keys = cached.secondary_keys;
+    range.result_primary_keys = cached.primary_keys;
+  }
+  return cached;
 }
 
 std::optional<LineairDBTransaction::LocalSecondaryScanEntry>
@@ -1137,61 +2097,98 @@ LineairDBTransaction::lookup_local_secondary_scan(
     bool reverse_scan, uint64_t row_limit) const {
   (void)reverse_scan; // SI cache keeps the query-specific order from the plan
 
+  // O(1) exact-start-key path: FES prefetch registers one entry per probe.
+  std::string ikey = index_name;
+  ikey.push_back('\0');
+  ikey.append(start_key);
+  auto idx_it = secondary_scan_index_.find(ikey);
+  if (std::getenv("HELIOS_FE_DEBUG") && !secondary_scan_index_.empty()) {
+    std::string sample = fe_hex(secondary_scan_index_.begin()->first);
+    std::fprintf(stderr,
+        "[LUSS] tbl=%s idx=%s start=%s end_sz=%zu idxhit=%d nidx=%zu "
+        "sample=%s\n", table_name.c_str(), index_name.c_str(),
+        fe_hex(start_key).c_str(), end_key.size(),
+        idx_it != secondary_scan_index_.end() ? 1 : 0,
+        secondary_scan_index_.size(), sample.c_str());
+  }
+  if (idx_it != secondary_scan_index_.end()) {
+    for (auto rit = idx_it->second.rbegin(); rit != idx_it->second.rend();
+         ++rit) {
+      const auto& cand = local_secondary_scans_[*rit];
+      if (secondary_entry_matches(cand, table_name, index_name, start_key,
+                                  end_key, row_limit,
+                                  &range_validation_can_be_sliced)) {
+        return slice_secondary_entry(cand, start_key, end_key);
+      }
+    }
+  }
+  // O(#keyparts) prefix probe: a composite-index probe ([p0][p1]) covered by a
+  // prefetch entry keyed by a shorter prefix ([p0]).
+  for (const std::string& pfx : keypart_prefixes(start_key)) {
+    std::string pk = index_name;
+    pk.push_back('\0');
+    pk.append(pfx);
+    auto pit = secondary_scan_index_.find(pk);
+    if (pit == secondary_scan_index_.end()) continue;
+    for (auto rit = pit->second.rbegin(); rit != pit->second.rend(); ++rit) {
+      const auto& cand = local_secondary_scans_[*rit];
+      if (secondary_entry_matches(cand, table_name, index_name, start_key,
+                                  end_key, row_limit,
+                                  &range_validation_can_be_sliced))
+        return slice_secondary_entry(cand, start_key, end_key);
+    }
+  }
+  // Full-cover bucket: a full secondary scan is registered under
+  // (index_name + '\0' + ""). Check it before the linear-cap bailout so a
+  // covering full scan still serves a probe when many per-probe entries exist.
+  // (Codex; mirrors lookup_local_range_scan.)
+  {
+    std::string fk = index_name;
+    fk.push_back('\0');
+    auto fit = secondary_scan_index_.find(fk);
+    if (fit != secondary_scan_index_.end()) {
+      for (auto rit = fit->second.rbegin(); rit != fit->second.rend(); ++rit) {
+        const auto& cand = local_secondary_scans_[*rit];
+        if (secondary_entry_matches(cand, table_name, index_name, start_key,
+                                    end_key, row_limit,
+                                    &range_validation_can_be_sliced))
+          return slice_secondary_entry(cand, start_key, end_key);
+      }
+    }
+  }
+  if (local_secondary_scans_.size() > kScanCacheLinearScanCap)
+    return std::nullopt;
   for (auto it = local_secondary_scans_.rbegin();
        it != local_secondary_scans_.rend(); ++it) {
-    const bool same_index =
-        it->table_name == table_name && it->index_name == index_name;
-    const bool same_limit = it->row_limit == row_limit;
-    const bool covers_range =
-        it->start_key <= start_key && end_key <= it->end_key;
-    const bool exact_range =
-        it->start_key == start_key && it->end_key == end_key;
-    const bool can_slice_validation =
-        range_validation_can_be_sliced(it->range_versions, it->index_reads);
-    if (same_index && same_limit && covers_range &&
-        (exact_range || can_slice_validation)) {
-      LocalSecondaryScanEntry cached = *it;
-      cached.start_key = start_key;
-      cached.end_key = end_key;
-      cached.row_limit = row_limit;
-      if (cached.secondary_keys.size() == cached.primary_keys.size()) {
-        std::vector<std::string> secondary_keys;
-        std::vector<std::string> primary_keys;
-        secondary_keys.reserve(cached.secondary_keys.size());
-        primary_keys.reserve(cached.primary_keys.size());
-        for (size_t i = 0; i < cached.secondary_keys.size(); ++i) {
-          if (cached.secondary_keys[i] >= start_key &&
-              cached.secondary_keys[i] < end_key) {
-            secondary_keys.push_back(cached.secondary_keys[i]);
-            primary_keys.push_back(cached.primary_keys[i]);
-          }
-        }
-        cached.secondary_keys = std::move(secondary_keys);
-        cached.primary_keys = std::move(primary_keys);
-      }
-      for (auto& range : cached.range_versions) {
-        if (!range_validation_is_logical(range)) continue;
-        range.start_key = start_key;
-        range.end_key = end_key;
-        range.result_keys = cached.secondary_keys;
-        range.result_primary_keys = cached.primary_keys;
-      }
-      return cached;
+    if (secondary_entry_matches(*it, table_name, index_name, start_key, end_key,
+                                row_limit, &range_validation_can_be_sliced)) {
+      return slice_secondary_entry(*it, start_key, end_key);
     }
   }
   return std::nullopt;
 }
 
+bool LineairDBTransaction::has_oneshot_local_state() const {
+  return !stateless_read_set_.empty() || !write_buffer_ops_.empty() ||
+         !rowcount_deltas_.empty() || !local_read_set_.empty() ||
+         !local_write_set_.empty() || !range_validation_set_.empty() ||
+         !index_validation_set_.empty() || !local_range_scans_.empty() ||
+         !local_secondary_scans_.empty();
+}
+
 bool LineairDBTransaction::fallback_to_normal_transaction(const char* reason) {
-  if (!oneshot_mode_) return true;
+  if (!oneshot_mode_) {
+    // oneshot may have been disabled mid-statement by maybe_auto_stage (no
+    // plan) AFTER begin already deferred the server tx (oneshot defers
+    // tx_begin to the prefetch RPC). A normal scan would then run with
+    // tx_id == -1 and the commit aborts (observed: MIN/MAX index access).
+    // Begin the server tx on demand so the normal path has a real tx. (d)
+    if (is_not_started()) begin_transaction();
+    return !is_aborted_;
+  }
 
   // A clean transaction can still switch to the normal scan-capable path
-  const bool has_oneshot_state =
-      !stateless_read_set_.empty() || !write_buffer_ops_.empty() ||
-      !rowcount_deltas_.empty() || !local_read_set_.empty() ||
-      !local_write_set_.empty() || !range_validation_set_.empty() ||
-      !index_validation_set_.empty() || !local_range_scans_.empty() ||
-      !local_secondary_scans_.empty();
+  const bool has_oneshot_state = has_oneshot_local_state();
   if (!has_oneshot_state) {
     oneshot_mode_ = false;
     oneshot_registered_ = false;
@@ -1234,14 +2231,70 @@ bool LineairDBTransaction::oneshot_validate_and_commit() {
 
   bool committed = false;
   std::string abort_reason;
+  const bool timeprof = std::getenv("HELIOS_TIMEPROF") != nullptr;
+  auto tp_now = []() {
+    timespec t; clock_gettime(CLOCK_MONOTONIC, &t);
+    return static_cast<uint64_t>(t.tv_sec) * 1000000000ull + t.tv_nsec;
+  };
   if (!was_aborted) {
+    const uint64_t t0 = timeprof ? tp_now() : 0;
+    // Phase-6 range-hash OCC: only for a read-only txn (no buffered writes)
+    // that was eligible. The server then revalidates full-cover ranges via
+    // retained footprint digests instead of the per-row reads we skipped.
+    const bool use_range_hash =
+        rangehash_eligible_ && write_buffer_ops_.empty();
     committed = lineairdb_proxy->tx_validate_and_commit(
         reads, read_tids, read_found, range_validation_set_,
         index_validation_set_,
-        write_buffer_ops_, server_deltas, isFence, &abort_reason);
+        write_buffer_ops_, server_deltas, isFence, &abort_reason,
+        tx_occ_key_, use_range_hash);
+    if (timeprof) {
+      tp_commit_rpc_ns_ += (tp_now() - t0);
+      ++tp_commit_rpc_count_;
+    }
     if (!committed && !abort_reason.empty()) {
       rpc_trace_.record_local_view("abort_validate_" + abort_reason);
     }
+  }
+  if (timeprof) {
+    auto ms = [](uint64_t ns){ return ns / 1000000.0; };
+    std::fprintf(stderr,
+        "[TIMEPROF] tx=%p oneshot=1 rpc_exec=%.1fms(%u) ingest=%.1fms(%u) "
+        "act_rv=%.1fms(%u) commit=%.1fms(%u) committed=%d aborted=%d\n",
+        (void*)this,
+        ms(tp_rpc_execute_ns_), tp_rpc_execute_count_,
+        ms(tp_ingest_ns_), tp_ingest_count_,
+        ms(tp_activate_rv_ns_), tp_activate_rv_count_,
+        ms(tp_commit_rpc_ns_), tp_commit_rpc_count_,
+        committed ? 1 : 0, was_aborted ? 1 : 0);
+    std::fflush(stderr);
+  }
+  if (htp_enabled()) {
+    auto ms = [](uint64_t ns){ return ns / 1000000.0; };
+    std::fprintf(stderr,
+        "[HTIMEPROF] tx=%p "
+        "rnd_init=%.2fms(%u) rnd_next=%.2fms(%u) rnd_pos=%.2fms(%u) "
+        "idx_init=%.2fms(%u) idx_read=%.2fms(%u) idx_next=%.2fms(%u) "
+        "idx_next_same=%.2fms(%u) idx_first=%.2fms(%u) idx_last=%.2fms(%u) "
+        "idx_prev=%.2fms(%u) "
+        "ext_lock=%.2fms(%u) start_stmt=%.2fms(%u) store_lock=%.2fms(%u) "
+        "set_fields=%.2fms(%u)\n",
+        (void*)this,
+        ms(htp_.rnd_init_ns), htp_.rnd_init_n,
+        ms(htp_.rnd_next_ns), htp_.rnd_next_n,
+        ms(htp_.rnd_pos_ns), htp_.rnd_pos_n,
+        ms(htp_.index_init_ns), htp_.index_init_n,
+        ms(htp_.index_read_map_ns), htp_.index_read_map_n,
+        ms(htp_.index_next_ns), htp_.index_next_n,
+        ms(htp_.index_next_same_ns), htp_.index_next_same_n,
+        ms(htp_.index_first_ns), htp_.index_first_n,
+        ms(htp_.index_last_ns), htp_.index_last_n,
+        ms(htp_.index_prev_ns), htp_.index_prev_n,
+        ms(htp_.external_lock_ns), htp_.external_lock_n,
+        ms(htp_.start_stmt_ns), htp_.start_stmt_n,
+        ms(htp_.store_lock_ns), htp_.store_lock_n,
+        ms(htp_.set_fields_ns), htp_.set_fields_n);
+    std::fflush(stderr);
   }
   if (!committed) {
     thd_mark_transaction_to_rollback(thread, 1);

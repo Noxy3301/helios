@@ -24,11 +24,13 @@ struct SecondaryIndexEntry {
     std::vector<std::string> primary_keys;
 };
 
-// Message header for RPC communication (matching server implementation)
+// Message header for RPC communication. MUST match server/protocol/message.hh
+// byte-for-byte (both peers memcpy this struct over the wire).
 struct MessageHeader {
     uint64_t sender_id;      // sender ID
     uint32_t message_type;   // OpCode from protobuf
-    uint32_t payload_size;   // size of the protobuf payload
+    uint32_t _pad;           // explicit padding so payload_size is 8-aligned
+    uint64_t payload_size;   // payload size (uint64: prefetch responses >4GB)
 };
 
 // MessageType enum (corresponds to protobuf OpCode)
@@ -193,6 +195,26 @@ public:
         std::vector<ReadPlanKeyBinding> end_bindings;
         bool for_each = false;
         bool reverse_scan = false;
+        // Serialized PushedPredicate (proto) applied on the server side when
+        // the step is a primary-PK scan (is_scan && !for_each && index_name
+        // empty). Populated by LineairDBTransaction::execute_read_plan from
+        // tx->pushed_filter_ at send time. Empty = no filter.
+        std::string filter_serialized;
+        // Projection pushdown: kept base-row field indices (0-based, ascending,
+        // unique). EMPTY = no projection => server returns the full row (legacy).
+        // projection_num_columns = table->s->fields when projecting.
+        std::vector<uint32_t> projection;
+        uint32_t projection_num_columns = 0;
+    };
+    // One per-source-row sub-scan from a for_each && is_scan step (FER/FES).
+    struct ReadPlanSubScan {
+        std::string start_key;
+        std::string end_key;
+        std::vector<std::string> scan_keys;       // primary keys
+        std::vector<std::string> scan_values;
+        std::vector<uint64_t> scan_tids;
+        std::vector<std::string> secondary_keys;  // secondary scans only
+        std::vector<RangeValidationEntry> range_versions;
     };
     struct ReadPlanStepResult {
         bool found = false;
@@ -207,12 +229,21 @@ public:
         std::string actual_end_key;
         std::vector<RangeValidationEntry> range_versions;
         std::vector<IndexValidationEntry> index_reads;
+        std::vector<ReadPlanSubScan> subscans;
+        // (c) filter-rejected rows in the range + their TIDs (validating reads)
+        std::vector<std::string> filtered_keys;
+        std::vector<uint64_t> filtered_tids;
     };
     struct ReadPlanResult {
         bool ok = false;
         std::vector<ReadPlanStepResult> steps;
         std::vector<RangeValidationEntry> range_versions;
         std::vector<IndexValidationEntry> index_reads;
+        // Non-zero in PHYSICAL OCC mode: opaque token the proxy echoes back in
+        // TX_VALIDATE_AND_COMMIT.Request.tx_occ_key. The server retains the
+        // full NodeVersionEntries + filtered/tombstone (key,tid) under this
+        // key; the proxy holds NO OCC bookkeeping for the prefetched ranges.
+        uint64_t tx_occ_key = 0;
     };
     std::vector<BatchReadResult> tx_batch_read(LineairDBTransaction* tx,
                                                 const std::vector<std::string>& keys);
@@ -262,7 +293,15 @@ public:
         const std::vector<BatchOp>& ops,
         const std::vector<std::pair<std::string, int64_t>>& row_deltas,
         bool isFence,
-        std::string* abort_reason = nullptr);
+        std::string* abort_reason = nullptr,
+        // helios 2-RPC OCC (Step 6): when non-zero, echo this key in the
+        // request so the server merges its retained TxOccState entries
+        // (range_versions + filtered + tombstones) into the validate input.
+        uint64_t tx_occ_key = 0,
+        // helios Phase-6 range-hash OCC: read-only only. Tells the server to
+        // revalidate full-cover ranges via retained footprint digests (the
+        // proxy skipped their per-row reads).
+        bool use_range_hash = false);
 
     // secondary index operations
     std::vector<std::string> tx_read_secondary_index(LineairDBTransaction* tx,

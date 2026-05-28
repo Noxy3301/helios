@@ -99,6 +99,7 @@
 #include <cctype>
 #include <cstdint>
 #include <cstdlib>
+#include <cstdio>
 #include <cstring>
 #include <iomanip>
 #include <iostream>
@@ -106,6 +107,7 @@
 #include <optional>
 #include <sstream>
 #include <string_view>
+#include <unordered_set>
 #include <vector>
 // for ::strcasecmp
 #include <strings.h>
@@ -122,6 +124,9 @@
 #include "sql/sql_lex.h"
 #include "sql/sql_plugin.h"
 #include "sql/table.h"
+#include "sql/sql_optimizer.h"             // JOIN
+#include "sql/join_optimizer/access_path.h"  // AccessPath (QEP tree)
+#include "sql/join_optimizer/materialize_path_parameters.h"  // MATERIALIZE param
 #include "typelib.h"
 
 #define BLOB_MEMROOT_ALLOC_SIZE (8192)
@@ -264,6 +269,18 @@ struct LineairDBThdCtx {
   std::shared_ptr<LineairDBProxy> proxy;
   LineairDBTransaction *tx{nullptr};
 };
+
+// Phase-5 handler-entry timing (Codex attribution). One file-scope env read so
+// the disabled path is a single bool branch — no get_transaction() cost on the
+// 6M-call rnd_next hot path when HELIOS_HANDLER_TIMEPROF is unset. When enabled,
+// HTP_SCOPE(field) obtains the tx and starts an RAII timer that accumulates into
+// tx->htp_.<field>_ns / _n; the [HTIMEPROF] line at commit dumps the totals.
+static const bool g_htp_on = std::getenv("HELIOS_HANDLER_TIMEPROF") != nullptr;
+#define HTP_SCOPE(field)                                                       \
+  LineairDBTransaction *_htp_tx = g_htp_on ? get_transaction(ha_thd()) : nullptr; \
+  LineairDBTransaction::HtimeprofScope _htp_scope(                             \
+      _htp_tx, _htp_tx ? &_htp_tx->htp_.field##_ns : nullptr,                  \
+      _htp_tx ? &_htp_tx->htp_.field##_n : nullptr)
 
 static int lineairdb_commit(handlerton *hton, THD *thd, bool shouldCommit);
 static int lineairdb_abort(handlerton *hton, THD *thd, bool);
@@ -521,8 +538,13 @@ int ha_lineairdb::change_active_index(uint keynr) {
   return 0;
 }
 
+// Phase-3e: defined later; auto-generates the QEP-based prefetch plan on the
+// first data access (when the optimizer's join plan is available).
+static void maybe_auto_stage_oneshot_plan(THD *thd, LineairDBTransaction *tx);
+
 int ha_lineairdb::index_init(uint idx, bool sorted [[maybe_unused]]) {
   DBUG_TRACE;
+  HTP_SCOPE(index_init);
   reset_index_search_buffers();
   last_fetched_primary_key_.clear();
 
@@ -759,9 +781,13 @@ int ha_lineairdb::index_read_map(uchar *buf, const uchar *key,
                                  key_part_map keypart_map,
                                  enum ha_rkey_function find_flag) {
   DBUG_TRACE;
+  HTP_SCOPE(index_read_map);
 
   stats.records = 0;
   auto tx = get_transaction(ha_thd());
+  // QEP is available now (optimizer has run) — auto-generate the prefetch plan
+  // if this is an index-driven query (driver reached via index_read).
+  maybe_auto_stage_oneshot_plan(ha_thd(), tx);
 
   if (tx->is_aborted()) {
     thd_mark_transaction_to_rollback(ha_thd(), 1);
@@ -788,6 +814,7 @@ int ha_lineairdb::index_read_map(uchar *buf, const uchar *key,
  */
 int ha_lineairdb::index_next(uchar *buf) {
   DBUG_TRACE;
+  HTP_SCOPE(index_next);
 
   auto tx = get_transaction(ha_thd());
   if (tx->is_aborted()) {
@@ -808,6 +835,7 @@ int ha_lineairdb::index_next(uchar *buf) {
 int ha_lineairdb::index_next_same(uchar *buf, const uchar *key [[maybe_unused]],
                                   uint key_len [[maybe_unused]]) {
   DBUG_TRACE;
+  HTP_SCOPE(index_next_same);
 
   auto tx = get_transaction(ha_thd());
   if (tx->is_aborted()) {
@@ -832,6 +860,7 @@ int ha_lineairdb::index_next_same(uchar *buf, const uchar *key [[maybe_unused]],
 
 int ha_lineairdb::index_prev(uchar *buf) {
   DBUG_TRACE;
+  HTP_SCOPE(index_prev);
 
   auto tx = get_transaction(ha_thd());
   if (tx->is_aborted()) {
@@ -861,6 +890,7 @@ int ha_lineairdb::index_prev(uchar *buf) {
 */
 int ha_lineairdb::index_first(uchar *buf) {
   DBUG_TRACE;
+  HTP_SCOPE(index_first);
   int error = index_read(buf, nullptr, 0, HA_READ_AFTER_KEY);
 
   /* MySQL does not seem to allow this to return HA_ERR_KEY_NOT_FOUND */
@@ -884,6 +914,7 @@ int ha_lineairdb::index_first(uchar *buf) {
 */
 int ha_lineairdb::index_last(uchar *buf) {
   DBUG_TRACE;
+  HTP_SCOPE(index_last);
 
   reset_index_search_buffers();
   last_fetched_primary_key_.clear();
@@ -938,6 +969,65 @@ int ha_lineairdb::index_last(uchar *buf) {
  * @param expr   FilterExpr protobuf to populate
  * @return true if serialization succeeded
  */
+// Compare-type tags shared with the server PredicateEvaluator.
+//   0=SIGNED_INT 1=UNSIGNED_INT 2=DOUBLE 3=STRING
+static constexpr uint32_t kCmpTypeSignedInt = 0;
+static constexpr uint32_t kCmpTypeUnsignedInt = 1;
+static constexpr uint32_t kCmpTypeDouble = 2;
+static constexpr uint32_t kCmpTypeString = 3;
+
+// Serialize a constant operand (literal, bound `?` param, or const-folded
+// expression such as `DATE ? + INTERVAL '1' MONTH`) into a CONST_* node.
+// Returns false when the item is not actually constant or cannot be evaluated.
+// DATE constants are emitted as CONST_STRING in ISO "YYYY-MM-DD" form because
+// DATE columns are stored and compared as ASCII text (compare_type STRING), so
+// lexicographic compare matches chronological order.
+static bool serialize_const_item(Item *item,
+                                 LineairDB::Protocol::FilterExpr *expr) {
+  if (item == nullptr || !item->const_item()) return false;
+
+  const enum_field_types dt = item->data_type();
+  if (dt == MYSQL_TYPE_DATE || dt == MYSQL_TYPE_NEWDATE) {
+    String buf;
+    String *s = item->val_str(&buf);  // ISO "YYYY-MM-DD"
+    if (item->null_value || s == nullptr) {
+      expr->set_op(LineairDB::Protocol::FilterExpr::CONST_NULL);
+    } else {
+      expr->set_op(LineairDB::Protocol::FilterExpr::CONST_STRING);
+      expr->set_string_val(s->ptr(), s->length());
+    }
+    return true;
+  }
+
+  switch (item->result_type()) {
+    case INT_RESULT:
+      if (item->unsigned_flag) {
+        expr->set_op(LineairDB::Protocol::FilterExpr::CONST_UINT);
+        expr->set_uint_val(item->val_uint());
+      } else {
+        expr->set_op(LineairDB::Protocol::FilterExpr::CONST_INT);
+        expr->set_int_val(item->val_int());
+      }
+      return !item->null_value;
+    case REAL_RESULT:
+    case DECIMAL_RESULT:
+      expr->set_op(LineairDB::Protocol::FilterExpr::CONST_DOUBLE);
+      expr->set_double_val(item->val_real());
+      return !item->null_value;
+    default: {
+      String buf;
+      String *s = item->val_str(&buf);
+      if (item->null_value || s == nullptr) {
+        expr->set_op(LineairDB::Protocol::FilterExpr::CONST_NULL);
+        return true;
+      }
+      expr->set_op(LineairDB::Protocol::FilterExpr::CONST_STRING);
+      expr->set_string_val(s->ptr(), s->length());
+      return true;
+    }
+  }
+}
+
 static bool serialize_item(const Item *item,
                            LineairDB::Protocol::FilterExpr *expr) {
   if (!item) return false;
@@ -983,20 +1073,21 @@ static bool serialize_item(const Item *item,
       expr->set_op(LineairDB::Protocol::FilterExpr::COLUMN_REF);
       expr->set_column_index(field->field_index());
 
-      // Set compare_type based on MySQL field type
+      // Set compare_type based on MySQL field type. NOTE: DATE/temporal row
+      // values are stored as ASCII text ("YYYY-MM-DD", verified at runtime),
+      // not packed binary, so they fall through to STRING and compare
+      // lexicographically — which equals chronological order for ISO dates.
       switch (field->result_type()) {
         case INT_RESULT:
-          if (field->is_unsigned())
-            expr->set_compare_type(1);  // UNSIGNED_INT
-          else
-            expr->set_compare_type(0);  // SIGNED_INT
+          expr->set_compare_type(field->is_unsigned() ? kCmpTypeUnsignedInt
+                                                      : kCmpTypeSignedInt);
           break;
         case REAL_RESULT:
         case DECIMAL_RESULT:
-          expr->set_compare_type(2);  // DOUBLE
+          expr->set_compare_type(kCmpTypeDouble);
           break;
         default:
-          expr->set_compare_type(3);  // STRING
+          expr->set_compare_type(kCmpTypeString);
           break;
       }
       return true;
@@ -1054,8 +1145,85 @@ static bool serialize_item(const Item *item,
           break;
         }
         case Item_func::IN_FUNC: {
-          expr->set_op(LineairDB::Protocol::FilterExpr::OP_IN);
           auto *in_func = down_cast<const Item_func_in *>(func);
+          // Step E2 (Codex 2026-05-29): Q22-class rewrite of
+          //   `SUBSTRING(col, 1, N) IN ('a','b',...)` (and not-negated)
+          // into
+          //   `col LIKE 'a%' OR col LIKE 'b%' OR ...`
+          // so the existing OP_LIKE/OP_OR pushdown path applies. Without
+          // this, the IN's first child (substring(...)) cannot be
+          // represented and the whole filter is dropped — Q22 ships full
+          // customer (1.4 GB raw wire vs ~40 MB needed). Pattern-detect:
+          // not-negated IN, first arg is FUNC_ITEM named "substr" with 3
+          // args (FIELD_ITEM, INT_ITEM=1, INT_ITEM=N), and the IN value
+          // list is all STRING_ITEM/varchar constants of length >= N.
+          // Restricted to the common SF=1 TPC-H Q22 shape; falls through
+          // to the generic OP_IN path when any check fails.
+          do {
+            if (in_func->negated) break;
+            if (arg_count < 2) break;
+            const Item *first = args[0];
+            if (first == nullptr || first->type() != Item::FUNC_ITEM) break;
+            const Item_func *fn = down_cast<const Item_func *>(first);
+            if (fn->func_name() == nullptr) break;
+            const std::string fname = fn->func_name();
+            if (fname != "substr" && fname != "substring") break;
+            if (fn->argument_count() != 3) break;
+            Item *sa0 = fn->arguments()[0];
+            Item *sa1 = fn->arguments()[1];
+            Item *sa2 = fn->arguments()[2];
+            if (sa0 == nullptr || sa0->type() != Item::FIELD_ITEM) break;
+            if (sa1 == nullptr || sa2 == nullptr) break;
+            if (!sa1->const_item() || !sa2->const_item()) break;
+            const longlong pos = const_cast<Item *>(sa1)->val_int();
+            const longlong nlen = const_cast<Item *>(sa2)->val_int();
+            if (pos != 1 || nlen <= 0 || nlen > 64) break;
+            const Item_field *fld = down_cast<const Item_field *>(sa0);
+            if (fld->field == nullptr) break;
+            // Build OP_OR of OP_LIKE(field, 'value%') for each remaining
+            // arg. Skip and bail if any constant isn't representable.
+            expr->set_op(LineairDB::Protocol::FilterExpr::OP_OR);
+            bool ok_all = true;
+            for (uint i = 1; i < arg_count; ++i) {
+              Item *val = args[i];
+              if (val == nullptr || !val->const_item()) { ok_all = false; break; }
+              String buf;
+              String *s = const_cast<Item *>(val)->val_str(&buf);
+              if (val->null_value || s == nullptr) { ok_all = false; break; }
+              std::string sv(s->ptr(), s->length());
+              if (static_cast<longlong>(sv.size()) < nlen) {
+                // Constant shorter than prefix length — no row's substring
+                // can equal it, so it contributes nothing. Skip silently.
+                continue;
+              }
+              auto *child = expr->add_children();
+              child->set_op(LineairDB::Protocol::FilterExpr::OP_LIKE);
+              auto *col = child->add_children();
+              col->set_op(LineairDB::Protocol::FilterExpr::COLUMN_REF);
+              // Inline qep_table_field_index (definition is later in file).
+              int field_idx = -1;
+              {
+                TABLE *t = fld->field->table;
+                for (uint k = 0; k < t->s->fields; ++k)
+                  if (t->field[k] == fld->field) { field_idx = static_cast<int>(k); break; }
+              }
+              if (field_idx < 0) { ok_all = false; break; }
+              col->set_column_index(field_idx);
+              col->set_compare_type(kCmpTypeString);
+              auto *pat = child->add_children();
+              pat->set_op(LineairDB::Protocol::FilterExpr::CONST_STRING);
+              std::string prefix = sv.substr(0, nlen);
+              prefix.push_back('%');
+              pat->set_string_val(prefix);
+            }
+            if (!ok_all || expr->children_size() == 0) {
+              expr->clear_op();
+              expr->clear_children();
+              break;  // fall through to generic IN below
+            }
+            return true;  // emitted as OR(LIKE...) — done
+          } while (false);
+          expr->set_op(LineairDB::Protocol::FilterExpr::OP_IN);
           expr->set_negated(in_func->negated);
           break;
         }
@@ -1072,7 +1240,10 @@ static bool serialize_item(const Item *item,
           expr->set_op(LineairDB::Protocol::FilterExpr::OP_NOT);
           break;
         default:
-          return false;  // unsupported function → skip PP
+          // Const-folded functions such as `DATE ? + INTERVAL '1' MONTH` are
+          // not comparison/logical ops but evaluate to a constant at execution
+          // time — emit them as a CONST_* node so date-range predicates push.
+          return serialize_const_item(const_cast<Item *>(item), expr);
       }
 
       // Recursively serialize arguments
@@ -1102,7 +1273,9 @@ static bool serialize_item(const Item *item,
       return true;
     }
     default:
-      return false;  // unsupported item type → skip PP
+      // Bound `?` params, DATE/temporal literals and other constant operands
+      // not matched by a dedicated case above.
+      return serialize_const_item(const_cast<Item *>(item), expr);
   }
 }
 
@@ -1119,8 +1292,11 @@ static bool item_is_limit_safe_scalar(const Item *item) {
   return field_item->field->result_type() == INT_RESULT;
 }
 
-// True when WHERE is an AND tree of simple integer comparisons
-static bool item_is_limit_safe_filter(const Item *item) {
+// True when WHERE is an AND tree of simple integer comparisons.
+// Currently unreferenced: prepare_select_filter_for_tx now always uses the
+// partial (not-LIMIT-safe) per-table filter. Kept for when a full-WHERE,
+// LIMIT-safe push is reintroduced. [[maybe_unused]] silences -Wunused-function.
+[[maybe_unused]] static bool item_is_limit_safe_filter(const Item *item) {
   if (item == nullptr) return true;                  // No WHERE to check
 
   // AND is safe to recurse; OR is kept local until we add stricter tests.
@@ -1235,7 +1411,7 @@ static bool try_parse_plan_int(const std::string& text, int64_t *value) {
   return end == text.c_str() + text.size();
 }
 
-static bool thd_has_ldb_plan(THD *thd) {
+[[maybe_unused]] static bool thd_has_ldb_plan(THD *thd) {
   if (thd == nullptr) return false;
   auto it = thd->user_vars.find("_ldb_plan");
   if (it == thd->user_vars.end()) return false;
@@ -1294,6 +1470,23 @@ static std::string normalize_plan_table_name(THD *thd,
     prefix += std::string(thd->db().str, thd->db().length) + "/";
   }
   return prefix + table_name;
+}
+
+// Physical-table key from a TABLE's own share: "./<db>/<table>", matching the
+// path ha_lineairdb::open() stores in db_table_name (the projection-map key).
+// Cross-db safe: derives the db from THIS table's share, NOT THD::db(), so two
+// same-named tables in different databases never collapse to one key (which
+// would let projection merge their read_sets / trim a needed column).
+static std::string physical_table_key(const TABLE *t) {
+  if (t == nullptr || t->s == nullptr) return std::string();
+  const TABLE_SHARE *s = t->s;
+  std::string key = "./";
+  if (s->db.str != nullptr && s->db.length > 0)
+    key.append(s->db.str, s->db.length);
+  key.push_back('/');
+  if (s->table_name.str != nullptr && s->table_name.length > 0)
+    key.append(s->table_name.str, s->table_name.length);
+  return key;
 }
 
 static LineairDBProxy::ReadPlanKeyBinding parse_plan_binding(
@@ -1408,6 +1601,17 @@ static std::vector<LineairDBProxy::ReadPlanStep> parse_plan_steps(
       token_start = 3;
     } else if (parts[0] == "FE") {
       parsed.for_each = true;
+    } else if (parts[0] == "FER") {
+      // for_each PK-prefix RANGE scan (one range per source row).
+      parsed.for_each = true;
+      parsed.is_scan = true;
+    } else if (parts[0] == "FES") {
+      // for_each SECONDARY range scan (one range per source row).
+      if (parts.size() < 3) continue;
+      parsed.for_each = true;
+      parsed.is_scan = true;
+      parsed.index_name = parts[2];
+      token_start = 3;
     } else {
       continue;
     }
@@ -1428,6 +1632,14 @@ static std::vector<LineairDBProxy::ReadPlanStep> parse_plan_steps(
         continue;
       }
       append_plan_key_token(&parsed, token, end_key);
+    }
+    // S: with no key bounds = full table scan. Use the same 16-byte 0xFF
+    // sentinel as get_matching_keys_and_values_from_prefix so the cached
+    // entry exactly matches the lookup MySQL will issue for rnd_init.
+    if (parsed.is_scan && !parsed.for_each && parsed.key_prefix.empty() &&
+        parsed.end_key_prefix.empty() && parsed.bindings.empty() &&
+        parsed.end_bindings.empty()) {
+      parsed.end_key_prefix.assign(16, '\xff');
     }
     if (!parsed.table_name.empty()) {
       steps.push_back(std::move(parsed));
@@ -1457,17 +1669,725 @@ static std::string read_and_clear_ldb_plan(THD *thd) {
   return plan;
 }
 
+static bool build_single_table_filter(THD *thd, TABLE *table,
+                                      std::string *out_serialized);
+
+// ---- Phase-3e: auto-generate the prefetch DSL from MySQL's query plan -------
+// Instead of the app hardcoding @_ldb_plan, walk MySQL's optimized AccessPath
+// tree (the QEP) and emit the equivalent S:/FE/FER/FES steps. Because the plan
+// mirrors the optimizer's *actual* join order and access paths, every per-row
+// access MySQL will perform is covered by a prefetch step → the whole query is
+// served from the local cache in 2 RPCs (prefetch + commit), no per-row RPC.
+
+// Collect the leaf table-access nodes of an AccessPath tree in nested-loop
+// drive order (outer before inner). *ok is cleared if we hit a node we cannot
+// model, so the caller drops the plan (better no plan than a partial one that
+// would fall back mid-query).
+// (a) True only for a field whose join key the bound-prefetch path encodes
+// EXACTLY as the server expects. The server (build_plan_key →
+// encode_column_as_int_key) does strtoll(value) → int32 → a 4-byte signed INT
+// key part, and the `4 + length` interior-PK slice assumes that same 4-byte
+// layout. So the only fully-safe type is plain signed 4-byte INT
+// (MYSQL_TYPE_LONG). TINYINT/SMALLINT/MEDIUMINT encode at 1/2/3-4 bytes,
+// BIGINT at 8, and DECIMAL/FLOAT/DOUBLE/YEAR map to LINEAIRDB_INT yet are not
+// strtoll-int32 safe; UNSIGNED breaks the sign-flip. All of those bail (→ full
+// S: of the target via the uncovered-net, still 2-RPC over-fetch) rather than
+// risk a corrupt probe key. TPC-H/TPC-C INTEGER keys are MYSQL_TYPE_LONG.
+static bool is_int32_key_field(const Field *f) {
+  return f != nullptr && f->type() == MYSQL_TYPE_LONG &&
+         f->pack_length() == 4 && !f->is_unsigned();
+}
+
+static void collect_qep_leaves(AccessPath *p, std::vector<AccessPath *> *out,
+                               bool *ok) {
+  if (p == nullptr || !*ok) return;
+  switch (p->type) {
+    case AccessPath::TABLE_SCAN:
+    case AccessPath::INDEX_SCAN:
+    case AccessPath::REF:
+    case AccessPath::REF_OR_NULL:
+    case AccessPath::EQ_REF:
+    case AccessPath::PUSHED_JOIN_REF:
+    case AccessPath::CONST_TABLE:
+      out->push_back(p);
+      return;
+    case AccessPath::NESTED_LOOP_JOIN:
+      collect_qep_leaves(p->nested_loop_join().outer, out, ok);
+      collect_qep_leaves(p->nested_loop_join().inner, out, ok);
+      return;
+    case AccessPath::BKA_JOIN:
+      collect_qep_leaves(p->bka_join().outer, out, ok);
+      collect_qep_leaves(p->bka_join().inner, out, ok);
+      return;
+    case AccessPath::HASH_JOIN:
+      collect_qep_leaves(p->hash_join().outer, out, ok);
+      collect_qep_leaves(p->hash_join().inner, out, ok);
+      return;
+    case AccessPath::FILTER:
+      collect_qep_leaves(p->filter().child, out, ok);
+      return;
+    case AccessPath::SORT:
+      collect_qep_leaves(p->sort().child, out, ok);
+      return;
+    case AccessPath::LIMIT_OFFSET:
+      collect_qep_leaves(p->limit_offset().child, out, ok);
+      return;
+    case AccessPath::AGGREGATE:
+      collect_qep_leaves(p->aggregate().child, out, ok);
+      return;
+    case AccessPath::TEMPTABLE_AGGREGATE:
+      // GROUP BY into a temp table — the base join feeds subquery_path.
+      collect_qep_leaves(p->temptable_aggregate().subquery_path, out, ok);
+      return;
+    case AccessPath::STREAM:
+      collect_qep_leaves(p->stream().child, out, ok);
+      return;
+    case AccessPath::NESTED_LOOP_SEMIJOIN_WITH_DUPLICATE_REMOVAL:
+      collect_qep_leaves(
+          p->nested_loop_semijoin_with_duplicate_removal().outer, out, ok);
+      collect_qep_leaves(
+          p->nested_loop_semijoin_with_duplicate_removal().inner, out, ok);
+      return;
+    case AccessPath::REMOVE_DUPLICATES:
+      collect_qep_leaves(p->remove_duplicates().child, out, ok);
+      return;
+    case AccessPath::WEEDOUT:
+      collect_qep_leaves(p->weedout().child, out, ok);
+      return;
+    case AccessPath::MATERIALIZE:
+      // Derived table / materialized subquery (e.g. Q13's FROM (SELECT ...)).
+      // Descend into each materialized operand's subquery so its base tables
+      // are prefetched too. The temp table the result feeds is skipped at the
+      // leaf level (tmp_table check in auto_generate_plan_from_qep).
+      if (p->materialize().param != nullptr)
+        for (auto &qb : p->materialize().param->query_blocks)
+          collect_qep_leaves(qb.subquery_path, out, ok);
+      return;
+    default:
+      // (b) An AccessPath type we don't model (index merge / ROWID
+      // intersection|union / group-index skip-scan / window / UNION APPEND /
+      // etc.). Don't abort the whole plan — just stop descending this subtree.
+      // Every base table of the statement is still covered as a full S: scan by
+      // the uncovered-base-table net in auto_generate_plan_from_qep, so the
+      // query degrades to a 2-RPC full-table prefetch (over-fetch) instead of
+      // collapsing to per-row NLJ. *ok stays true (best-effort coverage).
+      return;
+  }
+}
+
+static bool qep_leaf_info(AccessPath *p, TABLE **tbl, Index_lookup **ref,
+                          bool *is_full_scan, int *full_scan_index) {
+  *ref = nullptr;
+  *is_full_scan = false;
+  *full_scan_index = -1;  // -1 = primary/heap full scan; else secondary index
+  switch (p->type) {
+    case AccessPath::TABLE_SCAN:
+      *tbl = p->table_scan().table; *is_full_scan = true; return true;
+    case AccessPath::INDEX_SCAN:
+      *tbl = p->index_scan().table; *is_full_scan = true;
+      *full_scan_index = p->index_scan().idx; return true;
+    case AccessPath::REF:
+    case AccessPath::REF_OR_NULL:
+      *tbl = p->ref().table; *ref = p->ref().ref; return true;
+    case AccessPath::EQ_REF:
+      *tbl = p->eq_ref().table; *ref = p->eq_ref().ref; return true;
+    case AccessPath::PUSHED_JOIN_REF:
+      *tbl = p->pushed_join_ref().table; *ref = p->pushed_join_ref().ref;
+      return true;
+    case AccessPath::CONST_TABLE:
+      *tbl = p->const_table().table; *ref = p->const_table().ref; return true;
+    default:
+      return false;
+  }
+}
+
+// 0-based ordinal of a field within TABLE::field[] (the full serialized row
+// includes ALL columns, PK ones too — the server's PredicateEvaluator and
+// build_plan_key index by this full ordinal). -1 if not found. Per Codex
+// review: the earlier non-PK-only ordinal happened to match for columns before
+// a mid-PK part (e.g. lineitem l_partkey/l_suppkey) but is wrong in general
+// (e.g. a join on a column after l_linenumber).
+static int qep_table_field_index(TABLE *t, Field *f) {
+  for (uint i = 0; i < t->s->fields; ++i)
+    if (t->field[i] == f) return static_cast<int>(i);
+  return -1;
+}
+
+// Auto-generate prefetch steps from the current SELECT's QEP. Returns false if
+// the plan cannot be fully modelled (caller then runs without a prefetch plan).
+static bool auto_generate_plan_from_qep(
+    THD *thd, std::vector<LineairDBProxy::ReadPlanStep> *out) {
+  if (thd == nullptr || thd->lex == nullptr || thd->lex->unit == nullptr)
+    return false;
+  Query_block *qb = thd->lex->unit->first_query_block();
+  const bool dbg = std::getenv("HELIOS_FE_DEBUG") != nullptr;
+  if (qb == nullptr || qb->join == nullptr) {
+    if (dbg) std::fprintf(stderr, "[QEP] no qb/join (qb=%p join=%p)\n",
+                          (void*)qb, (void*)(qb?qb->join:nullptr));
+    return false;
+  }
+  AccessPath *root = qb->join->root_access_path();
+  if (root == nullptr) { if (dbg) std::fprintf(stderr, "[QEP] no root_access_path\n"); return false; }
+
+  std::vector<AccessPath *> leaves;
+  bool ok = true;
+  collect_qep_leaves(root, &leaves, &ok);
+  if (dbg) std::fprintf(stderr, "[QEP] root_type=%d collect_ok=%d leaves=%zu\n",
+                        (int)root->type, ok?1:0, leaves.size());
+  // (b) Do NOT bail on incomplete coverage or zero leaves: the uncovered-base-
+  // table net below prefetches every remaining base table as a full S: scan, so
+  // an unmodelled plan shape degrades to a 2-RPC full-table prefetch rather than
+  // per-row NLJ. We only give up (return false) if NO step at all can be formed
+  // (checked at the end via out->empty()).
+
+  std::unordered_map<TABLE *, int> tbl_step;
+  std::vector<LineairDBProxy::ReadPlanStep> steps;
+
+  // (b) Count how many times each base table NAME is referenced in the
+  // statement. A full-range S: scan caches rows under a (table,full-range) key;
+  // if the cached rows were pruned by a pushed single-table filter, a DIFFERENT
+  // reference to the same table that full-scans it (e.g. the two branches of a
+  // UNION, or a self-join) would wrongly reuse that filtered slice and miss
+  // rows. So a full-range filter is only sound when the table is referenced
+  // exactly once. (FER/FES per-probe entries key on distinct start_keys and
+  // don't collide, so they keep their filters.)
+  std::unordered_map<std::string, int> name_refs;
+  for (auto *tl = thd->lex->query_tables; tl != nullptr; tl = tl->next_global) {
+    if (tl->table == nullptr || tl->table->s == nullptr) continue;
+    if (tl->table->s->tmp_table != NO_TMP_TABLE) continue;
+    name_refs[physical_table_key(tl->table)]++;
+  }
+  steps.reserve(leaves.size());
+
+  // Compile ONE leaf access path into a plan step. Returns 1=added, 0=skipped
+  // (temp table or a table already covered by an earlier step — e.g. a
+  // correlated subquery re-scanning an outer table), -1=cannot model. Shared by
+  // the main join tree and the dependent/derived subquery walk below.
+  auto compile_leaf = [&](AccessPath *leaf) -> int {
+    TABLE *t = nullptr; Index_lookup *ref = nullptr; bool full_scan = false;
+    int full_scan_index = -1;
+    if (!qep_leaf_info(leaf, &t, &ref, &full_scan, &full_scan_index)) return -1;
+    if (t == nullptr || t->s == nullptr) return -1;
+    // Materialized derived/temp tables live only inside MySQL — skip.
+    if (t->s->tmp_table != NO_TMP_TABLE) return 0;
+    // Already covered (the driver, or an outer table a correlated subquery
+    // re-scans by the same key — the existing step's cache serves it).
+    if (tbl_step.find(t) != tbl_step.end()) return 0;
+
+    LineairDBProxy::ReadPlanStep step;
+    step.table_name = physical_table_key(t);
+
+    if (full_scan || ref == nullptr) {
+      // Full-scan leaf → full-range prefetch + its single-table filter. Sound at
+      // ANY position (driver, hash-join side, or nested-loop inner rescanned per
+      // outer row — all hit the cached full range). A secondary INDEX_SCAN
+      // (full_scan_index != primary) prefetches that secondary index (SI:) so
+      // MySQL's index scan hits the secondary cache instead of falling back.
+      step.is_scan = true;
+      step.end_key_prefix.assign(16, '\xff');  // full-range sentinel
+      if (full_scan_index >= 0 &&
+          full_scan_index != static_cast<int>(t->s->primary_key))
+        step.index_name = t->key_info[full_scan_index].name;
+      // (b) Push the single-table filter onto a full-range scan only when this
+      // table is referenced once (else a differently-filtered sibling scan
+      // would collide on the shared full-range cache key — see name_refs).
+      std::string f;
+      auto nr = name_refs.find(step.table_name);
+      if ((nr == name_refs.end() || nr->second <= 1) &&
+          build_single_table_filter(thd, t, &f) && !f.empty())
+        step.filter_serialized = f;
+    } else {
+      // ref / eq_ref join. Derive one binding PER key part: the lookup key is
+      // the concatenation of all key parts (build_plan_key appends each binding
+      // in order). Single-part covers FE/FER/FES on one column; multi-part
+      // covers composite-key eq_ref like partsupp PRIMARY (ps_partkey from one
+      // source table, ps_suppkey from another).
+      if (ref->key_parts == 0 || ref->items == nullptr) return -1;
+      uint bound_parts = 0;
+      int first_src = -1;
+      for (uint kp = 0; kp < ref->key_parts; ++kp) {
+        Item *val = ref->items[kp];
+        if (val == nullptr) return -1;
+        val = val->real_item();
+        if (val->type() != Item::FIELD_ITEM) return -1;
+        Field *sf = down_cast<Item_field *>(val)->field;
+        if (sf == nullptr || sf->table == nullptr) return -1;
+        auto it = tbl_step.find(sf->table);
+        if (it == tbl_step.end()) {
+          // Source isn't a prefetched step. If it's a materialized/temp table
+          // (e.g. Q15 joins supplier on revenue0.supplier_no, where revenue0 is
+          // a GROUP BY view materialized into a temp table), the per-row key
+          // values don't exist until runtime, so a bound FE/FER/FES is
+          // impossible. Skip this leaf so the uncovered-base-table net below
+          // prefetches the TARGET table in full (S:) instead — still 2-RPC, no
+          // NLJ. A real (non-temp) source not yet seen stays conservative.
+          if (sf->table->s != nullptr &&
+              sf->table->s->tmp_table != NO_TMP_TABLE)
+            return 0;
+          return -1;  // source not an earlier step
+        }
+
+        // Multi-keypart bindings concatenate into one lookup key, but the
+        // server applies the SAME source row index to every binding. That is
+        // only correct when all key parts come from the SAME source step (one
+        // flattened row = one tuple). If a later key part binds from a
+        // DIFFERENT step (e.g. lineitem (l_partkey<-partsupp, l_suppkey<-
+        // supplier)), the rows are uncorrelated, so we TRUNCATE to the leading
+        // same-source prefix and let the runtime composite probe be served by
+        // the prefix-probe in lookup_local_*_scan. (Codex review.)
+        if (kp == 0) first_src = it->second;
+        else if (it->second != first_src) break;
+
+        LineairDBProxy::ReadPlanKeyBinding b;
+        b.source_step = static_cast<uint32_t>(it->second);
+
+        TABLE *st = sf->table;
+        const uint spk = st->s->primary_key;
+        int pk_pos = -1, pk_parts = 0;
+        if (spk != MAX_KEY) {
+          KEY &k = st->key_info[spk];
+          pk_parts = static_cast<int>(k.user_defined_key_parts);
+          for (int j = 0; j < pk_parts; ++j)
+            if (k.key_part[j].field == sf) { pk_pos = j; break; }
+        }
+        // (a) The target index key-part this binding probes. Its key encoding
+        // must match what we feed; all bound join paths require BOTH the source
+        // and this target part to be plain signed 4-byte INT (the only layout
+        // the int-key/byte-copy path reproduces exactly). Otherwise bail → the
+        // target is prefetched as a full S: scan by the uncovered-net instead.
+        Field *tf = (ref->key >= 0 && ref->key < static_cast<int>(t->s->keys))
+                        ? t->key_info[ref->key].key_part[kp].field
+                        : nullptr;
+        if (!is_int32_key_field(tf)) return -1;
+
+        if (pk_pos == 0 && pk_parts == 1) {
+          if (!is_int32_key_field(sf)) return -1;  // source PK must be INT4 too
+          b.from_key = true;                       // whole single-column PK
+        } else if (pk_pos >= 0) {
+          // Any PK part (including an interior one, e.g. binding from
+          // partsupp.ps_suppkey = PK part 1). Slice it out of the source's
+          // encoded composite key: offset = sum of preceding parts' encoded
+          // lengths, length = this part's encoded length. (Codex: stop
+          // special-casing PK part 0.)
+          // (a) The offset math `4 + length` only holds for INT-encoded parts
+          // (header 4 + value). STRING parts encode as 5 + length and shift the
+          // offset, so an interior slice over a composite key containing any
+          // non-INT part up to pk_pos would cut the wrong bytes. Bail (skip →
+          // full S: of the target via the uncovered-net) unless every part
+          // [0..pk_pos] is INT-encoded.
+          KEY &k = st->key_info[spk];
+          for (int j = 0; j <= pk_pos; ++j) {
+            if (!is_int32_key_field(k.key_part[j].field))
+              return -1;  // non-4-byte-INT composite key part → can't slice safely
+          }
+          b.from_key = true;
+          uint off = 0;
+          for (int j = 0; j < pk_pos; ++j) off += 4 + k.key_part[j].length;
+          b.source_offset = off;
+          b.source_length = 4 + k.key_part[pk_pos].length;
+        } else {
+          // (a) Value-column binding re-encodes the source column as an INT key
+          // server-side (strtoll). Only valid when the source column is an
+          // integer type; for VARCHAR/DATE/DECIMAL/etc. the probe key would be
+          // wrong, so bail (skip → full S: of the target via the uncovered-net,
+          // still 2-RPC over-fetch) instead of emitting a corrupt int key. Only
+          // 4-byte SIGNED integers survive the server's strtoll→int32 path.
+          if (!is_int32_key_field(sf)) return -1;
+          const int fi = qep_table_field_index(st, sf);  // full field ordinal
+          if (fi < 0) return -1;
+          b.source_column = fi + 1;  // server extracts (source_column-1)
+          b.column_as_int_key = true;
+        }
+        step.bindings.push_back(std::move(b));
+        ++bound_parts;
+      }
+      if (bound_parts == 0) return -1;
+
+      // Child access op. Use bound_parts (after any truncation), not
+      // ref->key_parts: a truncated composite is a PREFIX, not a unique point.
+      const int cidx = ref->key;
+      if (cidx < 0) return -1;
+      const bool child_primary = (cidx == static_cast<int>(t->s->primary_key));
+      const uint child_pk_parts =
+          (t->s->primary_key != MAX_KEY)
+              ? t->key_info[t->s->primary_key].user_defined_key_parts
+              : 0;
+      step.for_each = true;
+      if (child_primary && bound_parts >= child_pk_parts) {
+        step.is_scan = false;                    // FE: PK point read
+      } else if (child_primary) {
+        step.is_scan = true;                     // FER: PK-prefix range
+      } else {
+        step.is_scan = true;                     // FES: secondary range
+        step.index_name = t->key_info[cidx].name;
+      }
+    }
+
+    tbl_step[t] = static_cast<int>(steps.size());  // step index (skips shift it)
+    steps.push_back(std::move(step));
+    return 1;
+  };  // compile_leaf
+
+  // Main join tree: compile each leaf best-effort. (b) An unmodelled leaf
+  // (compile_leaf < 0, e.g. a binding source that isn't a prefetched step) is
+  // SKIPPED rather than aborting the whole plan; its base table is then covered
+  // as a full S: scan by the uncovered-base-table net below. Worst case the
+  // whole query degrades to full-table prefetch (2-RPC, over-fetch), never NLJ.
+  for (size_t i = 0; i < leaves.size(); ++i)
+    (void)compile_leaf(leaves[i]);
+
+  // Dependent / derived subqueries: compile each nested query block's leaves
+  // too (sharing tbl_step), so correlated subquery scans (e.g. Q20's per-row
+  // SUM over lineitem keyed by the outer partsupp, Q2's MIN over partsupp) are
+  // also prefetched. An unmodellable subquery leaf is best-effort (left to the
+  // full-S: safety net below / stateless fallback) rather than aborting.
+  std::vector<Query_block *> stack{qb};
+  while (!stack.empty()) {
+    Query_block *b = stack.back();
+    stack.pop_back();
+    for (Query_expression *u = b->first_inner_query_expression(); u != nullptr;
+         u = u->next_query_expression()) {
+      for (Query_block *sub = u->first_query_block(); sub != nullptr;
+           sub = sub->next_query_block()) {
+        stack.push_back(sub);
+        if (sub->join == nullptr || sub->join->root_access_path() == nullptr)
+          continue;
+        std::vector<AccessPath *> sl;
+        bool sok = true;
+        collect_qep_leaves(sub->join->root_access_path(), &sl, &sok);
+        if (!sok) continue;
+        for (AccessPath *lf : sl) (void)compile_leaf(lf);
+      }
+    }
+  }
+
+  // Cover base tables that the main join tree did NOT reach — typically tables
+  // that live only in a subquery (e.g. Q18's IN(SELECT ... FROM lineitem GROUP
+  // BY ...), Q16's NOT IN(SELECT ... FROM supplier ...)). Prefetch each as a
+  // full S: scan so the subquery's scan is served from cache and the statement
+  // stays 2-RPC. (Correlated subqueries probed by a secondary index need a
+  // bound FES instead; those are handled separately / may still fall back.)
+  std::unordered_set<std::string> net_full_scans;  // (b) one full-S per name
+  for (auto *tl = thd->lex->query_tables; tl != nullptr; tl = tl->next_global) {
+    TABLE *bt = tl->table;
+    if (bt == nullptr || bt->s == nullptr) continue;
+    if (bt->s->tmp_table != NO_TMP_TABLE) continue;       // skip derived/temp
+    if (tbl_step.find(bt) != tbl_step.end()) continue;    // already covered
+    const std::string name = physical_table_key(bt);
+    // (b) Emit at most one full-range S: per table NAME. A second reference to
+    // the same table (e.g. the other UNION branch) shares the table-keyed
+    // cache, so one complete unfiltered scan serves all of them.
+    if (!net_full_scans.insert(name).second) continue;
+    LineairDBProxy::ReadPlanStep step;
+    step.table_name = name;
+    step.is_scan = true;
+    step.end_key_prefix.assign(16, '\xff');
+    // Push the filter only when this table is referenced exactly once; multiple
+    // references may full-scan it under different predicates and would collide
+    // on the shared full-range cache key (see name_refs).
+    std::string f;
+    auto nr = name_refs.find(name);
+    if ((nr == name_refs.end() || nr->second <= 1) &&
+        build_single_table_filter(thd, bt, &f) && !f.empty())
+      step.filter_serialized = f;
+    tbl_step[bt] = static_cast<int>(steps.size());
+    steps.push_back(std::move(step));
+  }
+
+  // Phase-1A / per-table OR-union: drop redundant inner FER (primary-prefix
+  // for_each scan) steps when a TRUE full-cover unfiltered S: step already
+  // covers the same physical table. For TPC-H Q21 the planner sees 3 lineitem
+  // aliases (l1, l2, l3); name_refs>1 has already disabled filter pushdown on
+  // l1's S: so step0 is an unfiltered full scan = OR-union(TRUE, TRUE, TRUE).
+  // l2/l3's FER are redundant copies of the same data. With this drop they
+  // are not emitted; MySQL's inner index_read_map probes fall through to
+  // step0's full-cover entry via lookup_local_range_scan's empty-start bucket
+  // + the slice_range_entry_fast path.
+  //
+  // Eligibility (S_outer eligible to subsume a FER S_inner):
+  //   - S_outer: is_scan && !for_each && index_name.empty() && bindings.empty()
+  //              && end_bindings.empty() && key_prefix.empty()
+  //              && end_key_prefix == 0xff*16 && scan_limit == 0
+  //              && filter_serialized.empty()
+  //   - S_inner: for_each && is_scan && index_name.empty()  (FER only)
+  //   - same table_name; S_inner is not a binding source of any later step
+  //
+  // FES (secondary) is NOT subsumed: a primary full scan does not provide a
+  // secondary-key index entry. Phase-2 work.
+  {
+    static const std::string kFullEnd16(16, '\xff');
+    auto is_full_cover = [&](const LineairDBProxy::ReadPlanStep& s) -> bool {
+      return s.is_scan && !s.for_each && s.index_name.empty() &&
+             s.bindings.empty() && s.end_bindings.empty() &&
+             s.key_prefix.empty() && s.end_key_prefix == kFullEnd16 &&
+             s.scan_limit == 0 && s.filter_serialized.empty();
+    };
+    std::unordered_map<std::string, size_t> full_coverer;
+    for (size_t i = 0; i < steps.size(); ++i)
+      if (is_full_cover(steps[i]))
+        full_coverer.try_emplace(steps[i].table_name, i);
+
+    std::unordered_set<uint32_t> bound_source_steps;
+    for (const auto &s : steps) {
+      for (const auto &b : s.bindings)     bound_source_steps.insert(b.source_step);
+      for (const auto &b : s.end_bindings) bound_source_steps.insert(b.source_step);
+    }
+
+    std::vector<bool> drop(steps.size(), false);
+    size_t n_drop = 0;
+    for (size_t i = 0; i < steps.size(); ++i) {
+      const auto &s = steps[i];
+      if (!(s.for_each && s.is_scan && s.index_name.empty())) continue;
+      auto it = full_coverer.find(s.table_name);
+      if (it == full_coverer.end() || it->second == i) continue;
+      if (bound_source_steps.count(static_cast<uint32_t>(i))) continue;
+      drop[i] = true;
+      ++n_drop;
+    }
+
+    // Phase-4 Q15 (Codex 2026-05-29): also drop duplicate S: (full-cover,
+    // unfiltered) steps for the same physical table. Q15 emits THREE
+    // lineitem S: scans (CREATE VIEW + 2× expansion in main SELECT),
+    // identical params, identical result. Keep the first, drop later
+    // duplicates. The MySQL handler's index_read_map / rnd_next on the
+    // dropped alias falls through to lookup_local_range_scan's full-cover
+    // bucket (the kept step's entry).
+    size_t n_drop_dup_s = 0;
+    for (size_t i = 0; i < steps.size(); ++i) {
+      if (drop[i]) continue;
+      const auto &s = steps[i];
+      if (!is_full_cover(s)) continue;
+      auto it = full_coverer.find(s.table_name);
+      if (it == full_coverer.end() || it->second == i) {
+        // i is not the duplicate. Either it IS the coverer (it->second == i)
+        // or there is no recorded coverer (shouldn't happen here). Skip.
+        continue;
+      }
+      // This S: shares table_name with full_coverer[s.table_name] which is
+      // earlier; the previous loop's dedup ran only on FER. Drop this S:.
+      if (bound_source_steps.count(static_cast<uint32_t>(i))) continue;
+      drop[i] = true;
+      ++n_drop_dup_s;
+    }
+    n_drop += n_drop_dup_s;
+
+    if (n_drop > 0) {
+      std::vector<size_t> new_idx(steps.size(), SIZE_MAX);
+      size_t out_i = 0;
+      for (size_t i = 0; i < steps.size(); ++i)
+        if (!drop[i]) new_idx[i] = out_i++;
+      std::vector<LineairDBProxy::ReadPlanStep> kept;
+      kept.reserve(out_i);
+      for (size_t i = 0; i < steps.size(); ++i) {
+        if (drop[i]) continue;
+        LineairDBProxy::ReadPlanStep s = std::move(steps[i]);
+        for (auto &b : s.bindings)
+          b.source_step = static_cast<uint32_t>(new_idx[b.source_step]);
+        for (auto &b : s.end_bindings)
+          b.source_step = static_cast<uint32_t>(new_idx[b.source_step]);
+        kept.push_back(std::move(s));
+      }
+      steps = std::move(kept);
+      if (std::getenv("HELIOS_FE_DEBUG"))
+        std::fprintf(stderr,
+                     "[QEP] phase1a-dedup dropped %zu redundant step(s) "
+                     "(dup-FER plus dup-S:=%zu)\n",
+                     n_drop, n_drop_dup_s);
+    }
+  }
+
+  if (std::getenv("HELIOS_FE_DEBUG")) {
+    for (size_t i = 0; i < steps.size(); ++i) {
+      const auto &s = steps[i];
+      const char *op = (!s.for_each) ? "S"
+                       : (!s.is_scan) ? "FE"
+                       : (s.index_name.empty()) ? "FER" : "FES";
+      std::string bs;
+      for (const auto &b : s.bindings) {
+        char buf[96];
+        std::snprintf(buf, sizeof(buf), " B%u.%s col=%d off=%u len=%u",
+                      b.source_step, b.from_key ? "K" : "CI", b.source_column,
+                      b.source_offset, b.source_length);
+        bs += buf;
+      }
+      std::fprintf(stderr, "[QEP] step%zu %s:%s idx=%s%s\n", i, op,
+                   s.table_name.c_str(), s.index_name.c_str(), bs.c_str());
+    }
+  }
+
+  *out = std::move(steps);
+  return !out->empty();
+}
+
+// Stage the plan, deriving a per-step single-table filter for each FER (PK-
+// prefix range) join-prefetch step's OWN table (e.g. lineitem.l_shipdate for
+// FER:lineitem) so deep join tables are pruned server-side. FES (secondary) is
+// excluded — slice_secondary_entry rebuilds result_keys from the shipped
+// secondary keys, so a filter that drops rows makes commit's full-range re-walk
+// mismatch (secondary_range_result_changed). The driver (primary-PK S:) keeps
+// its execute-time stamped filter from pushed_filter_.
+static void stage_plan_with_fer_filters(
+    THD *thd, LineairDBTransaction *tx,
+    std::vector<LineairDBProxy::ReadPlanStep> steps) {
+  if (thd->lex != nullptr) {
+    for (auto &step : steps) {
+      const bool needs_staged_filter =
+          step.is_scan && step.for_each && step.index_name.empty();
+      if (!needs_staged_filter) continue;
+      // (b) Count references to this table name. A FER step caches per-probe
+      // ranges keyed by (table, start_key); if the table is referenced more
+      // than once (self-join, UNION branches) the filter/predicate differs per
+      // reference but the cache key does not, so a filtered slice from one
+      // reference would be wrongly reused by another. Only push the filter when
+      // the table is referenced exactly once. (Mirrors name_refs in
+      // auto_generate_plan_from_qep for full-range scans.)
+      int refs = 0;
+      TABLE *match = nullptr;
+      for (auto *tl = thd->lex->query_tables; tl != nullptr;
+           tl = tl->next_global) {
+        if (tl->table == nullptr || tl->table->s == nullptr) continue;
+        if (physical_table_key(tl->table) != step.table_name)
+          continue;
+        ++refs;
+        match = tl->table;
+      }
+      if (refs != 1 || match == nullptr) continue;  // multi-ref → no FER filter
+      std::string f;
+      if (build_single_table_filter(thd, match, &f) && !f.empty())
+        step.filter_serialized = f;
+    }
+  }
+  tx->stage_oneshot_plan(std::move(steps));
+}
+
+// Called at begin (external_lock). Only handles an explicit @_ldb_plan override
+// (the QEP is NOT available yet here — external_lock runs before optimize). The
+// normal QEP-based auto-generation is deferred to maybe_auto_stage_oneshot_plan,
+// called from rnd_init/index_init once the optimizer has built the join plan.
 static void execute_oneshot_plan_if_present(THD *thd,
                                             LineairDBTransaction *tx) {
   if (tx == nullptr || !tx->is_oneshot_mode()) return;
-
   const std::string plan_text = read_and_clear_ldb_plan(thd);
-  if (plan_text.empty()) return;
-
-  const auto steps = parse_plan_steps(thd, plan_text);
+  if (plan_text.empty()) return;  // auto-gen deferred until the QEP exists
+  auto steps = parse_plan_steps(thd, plan_text);
   if (steps.empty()) return;
-  tx->execute_read_plan(steps);
+  tx->set_oneshot_plan_resolved(true);
+  stage_plan_with_fer_filters(thd, tx, std::move(steps));
 }
+
+// Called at the first rnd_init/index_init, where the optimizer has finished and
+// JOIN::root_access_path() exists. Auto-generates the prefetch plan from the QEP
+// exactly once. If the plan cannot be fully modelled, oneshot is turned off so
+// the statement runs as a plain (correct) query instead of falling back per-row.
+static void maybe_auto_stage_oneshot_plan(THD *thd, LineairDBTransaction *tx) {
+  if (tx == nullptr || !tx->is_oneshot_mode() || tx->oneshot_plan_resolved())
+    return;
+  tx->set_oneshot_plan_resolved(true);
+  std::vector<LineairDBProxy::ReadPlanStep> steps;
+  if (!auto_generate_plan_from_qep(thd, &steps) || steps.empty()) {
+    if (std::getenv("HELIOS_FE_DEBUG"))
+      std::fprintf(stderr, "[QEP] auto-gen produced no plan → oneshot off\n");
+    tx->set_oneshot_mode(false);
+    return;
+  }
+  if (std::getenv("HELIOS_FE_DEBUG"))
+    std::fprintf(stderr, "[QEP] auto-gen staged %zu steps\n", steps.size());
+
+  // --- Projection pushdown planning (v1) -----------------------------------
+  // For a pure SELECT, ask the server to return base-row VALUES trimmed to the
+  // columns this statement reads (table->read_set). v1 only projects
+  // SINGLE-REFERENCE tables (no self-join), skips value-binding-source steps
+  // (the server extracts binding columns positionally from the full value),
+  // generated-column tables, and the no-benefit case (all columns read).
+  // Uniform per table => one tx projection entry per table; the decoder uses it
+  // (validated by the parsed column count, so a stray full row still decodes).
+  if (thd->lex->sql_command == SQLCOM_SELECT) {
+    // Per PHYSICAL table (normalized "./db/table", NOT bare name — cross-db
+    // safe): UNION the read_set of every alias, so a self-joined table
+    // (Q21 lineitem l1/l2/l3) ships one uniform column set that is a SUPERSET
+    // of each alias's read_set. Each alias decodes the union and reads only its
+    // own columns (extras are harmless). One tx projection entry per table.
+    std::unordered_map<std::string, std::vector<bool>> union_rs;  // table->per-field
+    std::unordered_map<std::string, uint32_t> fields_of;
+    std::unordered_map<std::string, bool> gcol_of;
+    for (auto *tl = thd->lex->query_tables; tl != nullptr;
+         tl = tl->next_global) {
+      if (tl->table == nullptr || tl->table->s == nullptr) continue;
+      std::string n = physical_table_key(tl->table);
+      TABLE *T = tl->table;
+      const uint32_t nf = T->s->fields;
+      fields_of[n] = nf;
+      auto &u = union_rs[n];
+      if (u.size() < nf) u.resize(nf, false);
+      bool g = false;
+      for (uint f = 0; f < nf; ++f) {
+        if (T->field[f]->is_gcol()) g = true;
+        if (bitmap_is_set(T->read_set, f) && f < u.size()) u[f] = true;
+      }
+      gcol_of[n] = gcol_of.count(n) ? (gcol_of[n] || g) : g;
+    }
+    // Tables whose VALUE feeds a later value-column (!from_key) binding: the
+    // server extracts that column positionally from the FULL value, so such a
+    // table must NOT be projected (any of its steps).
+    std::unordered_set<std::string> vsrc_tables;
+    for (const auto &s : steps) {
+      for (const auto &b : s.bindings)
+        if (!b.from_key && b.source_step < steps.size())
+          vsrc_tables.insert(steps[b.source_step].table_name);
+      for (const auto &b : s.end_bindings)
+        if (!b.from_key && b.source_step < steps.size())
+          vsrc_tables.insert(steps[b.source_step].table_name);
+    }
+    // Decide kept per eligible table, then stamp every matching step.
+    std::unordered_map<std::string, std::vector<uint32_t>> kept_of;
+    for (auto &kv : union_rs) {
+      const std::string &n = kv.first;
+      if (gcol_of[n]) continue;
+      if (vsrc_tables.count(n)) continue;
+      const uint32_t nf = fields_of[n];
+      std::vector<uint32_t> kept;
+      for (uint32_t f = 0; f < nf; ++f)
+        if (kv.second[f]) kept.push_back(f);
+      if (kept.empty() || kept.size() == nf) continue;  // no benefit / all cols
+      tx->set_table_projection(n, kept);
+      kept_of.emplace(n, std::move(kept));
+    }
+    for (auto &s : steps) {
+      auto it = kept_of.find(s.table_name);
+      if (it == kept_of.end()) continue;
+      s.projection = it->second;
+      s.projection_num_columns = fields_of[s.table_name];
+      if (std::getenv("HELIOS_FE_DEBUG"))
+        std::fprintf(stderr, "[QEP] projection tbl=%s keep=%zu/%u\n",
+                     s.table_name.c_str(), it->second.size(),
+                     fields_of[s.table_name]);
+    }
+  }
+  // -------------------------------------------------------------------------
+
+  // helios Phase-6 range-hash OCC: eligible iff the gate is on AND this is a
+  // read-only SELECT (SELECT never installs writes, so the server's commit-time
+  // range re-scan has no write-after-stale-read window — see design doc). When
+  // eligible, full-cover cache serves skip per-row read-TID recording and the
+  // server revalidates via retained footprint digests.
+  static const bool rangehash_gate =
+      (std::getenv("HELIOS_RANGEHASH_OCC") != nullptr);
+  tx->set_rangehash_eligible(rangehash_gate &&
+                             thd->lex != nullptr &&
+                             thd->lex->sql_command == SQLCOM_SELECT);
+
+  stage_plan_with_fer_filters(thd, tx, std::move(steps));
+  // Execute the prefetch NOW. We are at the driver's rnd_init/index_read, i.e.
+  // immediately before the scan that probes the joined tables, so the local
+  // cache must be fully populated before the first per-row probe. (Deferring to
+  // the first lazy cache access can let early probes — e.g. EQ_REF point reads
+  // interleaved with the driver scan — miss the not-yet-fetched cache.)
+  tx->execute_pending_oneshot_plan();
+}
+
+// Forward declaration: defined after cond_push (reuses serialize_item).
+static bool build_single_table_filter(THD *thd, TABLE *table,
+                                      std::string *out_serialized);
 
 // Push the SELECT WHERE into this transaction if LIMIT will depend on it
 static bool prepare_select_filter_for_tx(THD *thd, TABLE *table,
@@ -1478,37 +2398,126 @@ static bool prepare_select_filter_for_tx(THD *thd, TABLE *table,
   if (thd == nullptr) return false;                  // Missing session
   const bool has_table = (table != nullptr && table->s != nullptr);
   if (!has_table) return false;                      // Missing table
-  if (thd->lex == nullptr) return false;             // Missing SQL state
-  if (thd->lex->unit == nullptr) return false;       // Missing query unit
 
-  // Read the current SELECT WHERE from MySQL's query block.
-  Query_block *qb = thd->lex->unit->global_parameters();
-  if (qb == nullptr) return false;                   // Missing query block
-
-  const Item *where = qb->where_cond();
-  if (where == nullptr) {
-    if (serialized_filter != nullptr) serialized_filter->clear();
+  // Use the join-safe per-table predicate in BOTH oneshot and non-oneshot
+  // (NLJ index-scan) paths. The previous non-oneshot path serialized the whole
+  // WHERE using THIS table's column count, which silently mis-applies a
+  // cross-table join conjunct (e.g. o_orderkey = l_orderkey) as a single-table
+  // filter evaluated against the wrong columns. When such a filter is shipped
+  // with an index materialize (execute_range_materialize / execute_index_first)
+  // it rejects almost every row, collapsing any 3+-table join to a handful of
+  // rows (observed: customer⋈orders⋈lineitem returned 1 row instead of 60175).
+  // build_single_table_filter keeps only top-level AND conjuncts that reference
+  // THIS table, so the server-side filter is always a sound subset of the
+  // WHERE; MySQL still re-evaluates the full WHERE, so a dropped join conjunct
+  // costs over-fetch, never correctness. Because the pushed filter is a partial
+  // subset, a row may pass it yet fail the full WHERE, so the result is never
+  // LIMIT-safe — always report not-LIMIT-safe to suppress any pushed LIMIT.
+  if (serialized_filter != nullptr) serialized_filter->clear();
+  std::string per_table;
+  if (build_single_table_filter(thd, table, &per_table)) {
+    if (serialized_filter != nullptr) *serialized_filter = per_table;
+    tx->set_pushed_filter(per_table);
+  } else {
     tx->clear_pushed_filter();
-    return true;                                     // No WHERE to push
   }
+  return false;
+}
 
-  // Convert WHERE into the existing predicate protobuf format.
+// Flatten an Item's top-level AND tree into conjuncts that reference ONLY
+// `me` (this table). Recurses through nested AND_FUNC nodes. Cross-table and
+// constant conjuncts are skipped; dropping them only relaxes the pushed filter.
+static void collect_driver_atoms(Item *it, table_map me,
+                                 std::vector<Item *> *out) {
+  if (it == nullptr) return;
+  if (it->type() == Item::COND_ITEM &&
+      down_cast<Item_cond *>(it)->functype() == Item_func::COND_AND_FUNC) {
+    for (Item &child : *down_cast<Item_cond *>(it)->argument_list()) {
+      collect_driver_atoms(&child, me, out);
+    }
+  } else if (it->used_tables() == me) {
+    out->push_back(it);
+  }
+}
+
+// Phase-3c/3d: derive a SOUND single-table predicate for the driver scan so the
+// oneshot prefetch is pruned the same way MySQL's scan is. We anchor on the
+// query block that OWNS this table's scan (pos_in_table_list->query_block) so a
+// driver inside a derived table / subquery is reached (global_parameters() only
+// gives the outermost WHERE). Two shapes are handled:
+//   - top-level AND (or single conjunct): keep conjuncts whose used_tables()==me
+//     (a cross-table join conjunct like l_partkey=p_partkey would be unsound to
+//     evaluate against one table with the wrong column index, so it is dropped).
+//   - top-level OR of disjuncts: a predicate is *implied by* the WHERE iff every
+//     disjunct implies it, so we take each disjunct's driver-only atoms and emit
+//     OR(AND(atoms_i)). If ANY disjunct has no driver atom, the OR constrains the
+//     driver by nothing → push nothing (sound: never stricter than the query).
+// serialize_item is reused verbatim so wire encoding/type handling matches the
+// proven cond_push path. MySQL re-evaluates the full WHERE, so a dropped/relaxed
+// predicate only costs over-fetch, never correctness.
+static bool build_single_table_filter(THD *thd, TABLE *table,
+                                      std::string *out_serialized) {
+  if (out_serialized == nullptr) return false;
+  out_serialized->clear();
+  if (thd == nullptr || table == nullptr || table->s == nullptr) return false;
+  if (table->pos_in_table_list == nullptr) return false;
+
+  Query_block *qb = table->pos_in_table_list->query_block;
+  if (qb == nullptr) return false;
+  Item *where = qb->where_cond();
+  if (where == nullptr) return false;
+
+  const table_map me = table->pos_in_table_list->map();
+
+  std::vector<LineairDB::Protocol::FilterExpr> serialized;
+
+  const bool is_or =
+      where->type() == Item::COND_ITEM &&
+      down_cast<Item_cond *>(where)->functype() == Item_func::COND_OR_FUNC;
+
+  if (is_or) {
+    // Sound necessary-condition extraction from an OR-of-ANDs.
+    LineairDB::Protocol::FilterExpr or_root;
+    or_root.set_op(LineairDB::Protocol::FilterExpr::OP_OR);
+    bool ok = true;
+    for (Item &disj : *down_cast<Item_cond *>(where)->argument_list()) {
+      std::vector<Item *> atoms;
+      collect_driver_atoms(&disj, me, &atoms);
+      if (atoms.empty()) { ok = false; break; }  // disjunct unconstrained → unsound
+      LineairDB::Protocol::FilterExpr branch;
+      if (atoms.size() == 1) {
+        if (!serialize_item(atoms[0], &branch)) { ok = false; break; }
+      } else {
+        branch.set_op(LineairDB::Protocol::FilterExpr::OP_AND);
+        for (Item *a : atoms) {
+          if (!serialize_item(a, branch.add_children())) { ok = false; break; }
+        }
+        if (!ok) break;
+      }
+      *or_root.add_children() = std::move(branch);
+    }
+    if (ok && or_root.children_size() > 0) serialized.push_back(std::move(or_root));
+  } else {
+    std::vector<Item *> keep;
+    collect_driver_atoms(where, me, &keep);
+    for (Item *conjunct : keep) {
+      LineairDB::Protocol::FilterExpr expr;
+      if (serialize_item(conjunct, &expr)) serialized.push_back(std::move(expr));
+    }
+  }
+  if (serialized.empty()) return false;
+
   LineairDB::Protocol::PushedPredicate predicate;
   predicate.set_num_columns(table->s->fields);
-  if (!serialize_item(where, predicate.mutable_expr())) {
-    if (serialized_filter != nullptr) serialized_filter->clear();
-    tx->clear_pushed_filter();
-    return false;                                    // MySQL must filter
+  if (serialized.size() == 1) {
+    *predicate.mutable_expr() = std::move(serialized[0]);
+  } else {
+    auto *root = predicate.mutable_expr();
+    root->set_op(LineairDB::Protocol::FilterExpr::OP_AND);
+    for (auto &expr : serialized) *root->add_children() = std::move(expr);
   }
-
-  // Attach the encoded filter to the transaction for the next scan RPC.
-  std::string encoded;
-  predicate.SerializeToString(&encoded);
-  if (serialized_filter != nullptr) {
-    *serialized_filter = encoded;
-  }
-  tx->set_pushed_filter(encoded);
-  return item_is_limit_safe_filter(where);
+  predicate.SerializeToString(out_serialized);
+  return !out_serialized->empty();
 }
 
 const Item *ha_lineairdb::cond_push(const Item *cond) {
@@ -1544,6 +2553,7 @@ const Item *ha_lineairdb::cond_push(const Item *cond) {
 */
 int ha_lineairdb::rnd_init(bool) {
   DBUG_ENTER("ha_lineairdb::rnd_init");
+  HTP_SCOPE(rnd_init);
   scanned_keys_.clear();
   scanned_values_.clear();
   scan_cache_.clear();
@@ -1557,6 +2567,8 @@ int ha_lineairdb::rnd_init(bool) {
   change_active_index(table->s->primary_key);
 
   auto tx = get_transaction(ha_thd());
+  // QEP is available now (optimizer has run) — auto-generate the prefetch plan.
+  maybe_auto_stage_oneshot_plan(ha_thd(), tx);
 
   if (tx->is_aborted()) {
     thd_mark_transaction_to_rollback(ha_thd(), 1);
@@ -1565,8 +2577,34 @@ int ha_lineairdb::rnd_init(bool) {
 
   tx->choose_table(db_table_name);
 
-  // Predicate pushdown: propagate filter serialized by cond_push() to transaction
+  // Predicate pushdown: propagate filter serialized by cond_push() to
+  // transaction. Falls back to reading WHERE directly via
+  // prepare_select_filter_for_tx() in oneshot mode because MySQL's optimizer
+  // does not always call cond_push() on the full-scan path for TPC-H queries
+  // (e.g. Q1's lineitem scan with DATE arithmetic). That helper performs the
+  // same serialize_item pass and assigns the result via set_pushed_filter,
+  // so the deferred oneshot plan can pick up the filter and the server-side
+  // S: step actually receives the predicate.
+  // Note: MySQL only calls cond_push() from sql_update.cc / sql_delete.cc,
+  // not from SELECT optimizer paths (which use idx_cond_push). For SELECT
+  // full-table scans pushed_filter_serialized_ is therefore empty here and
+  // the deferred oneshot plan ships an unfiltered S: scan to the server.
+  // Per Codex review: do NOT fall back to prepare_select_filter_for_tx with
+  // qb->where_cond() — that helper serializes the *whole* SELECT predicate
+  // using this table's column count, which is unsound for multi-table joins
+  // (e.g. l_partkey = p_partkey would be evaluated against lineitem only).
+  // Future work: extract per-table predicates via Item-tree walk, or expose
+  // inline predicates through the DSL (Phase 3c).
   if (!pushed_filter_serialized_.empty()) {
+    tx->set_pushed_filter(pushed_filter_serialized_);
+  } else if (tx->is_oneshot_mode() &&
+             build_single_table_filter(ha_thd(), table,
+                                       &pushed_filter_serialized_)) {
+    // Phase-3c: SELECT full-scan path. cond_push() is not invoked for SELECT,
+    // so derive a sound single-table predicate from the WHERE and hand it to
+    // the tx. execute_read_plan() stamps it onto the S: step whose table
+    // matches this scan, so the server filters lineitem rows in-scan instead
+    // of shipping the whole table back to the proxy.
     tx->set_pushed_filter(pushed_filter_serialized_);
   } else {
     tx->clear_pushed_filter();
@@ -1669,6 +2707,7 @@ void ha_lineairdb::reset_index_search_buffers() {
 int ha_lineairdb::rnd_next(uchar *buf) {
   DBUG_ENTER("ha_lineairdb::rnd_next");
   ha_statistic_increment(&System_status_var::ha_read_rnd_next_count);
+  HTP_SCOPE(rnd_next);
 
   if (buffer_position_ >= scanned_keys_.size()) {
     if (scan_exhausted_) {
@@ -1744,6 +2783,7 @@ void ha_lineairdb::position(const uchar *) {
 */
 int ha_lineairdb::rnd_pos(uchar *buf, uchar *pos) {
   DBUG_TRACE;
+  HTP_SCOPE(rnd_pos);
 
   std::string primary_key = extract_primary_key_from_ref(pos);
 
@@ -2009,6 +3049,7 @@ int ha_lineairdb::delete_all_rows() {
 */
 int ha_lineairdb::external_lock(THD *thd, int lock_type) {
   DBUG_TRACE;
+  HTP_SCOPE(external_lock);
 
   userThread = thd;
 
@@ -2059,6 +3100,7 @@ int ha_lineairdb::external_lock(THD *thd, int lock_type) {
 
 int ha_lineairdb::start_stmt(THD *thd, thr_lock_type lock_type) {
   assert(lock_type > 0);
+  HTP_SCOPE(start_stmt);
   userThread = thd;
   return external_lock(thd, lock_type);
 }
@@ -2093,9 +3135,13 @@ LineairDBTransaction *&ha_lineairdb::get_transaction(THD *thd) {
   if (ctx->tx == nullptr) {
     ctx->tx =
         new LineairDBTransaction(thd, ctx->proxy.get(), lineairdb_hton, FENCE);
+    // Phase-3e: oneshot no longer requires an app-supplied @_ldb_plan. When the
+    // global toggle is on and the statement is a SELECT/UPDATE/DELETE we enter
+    // oneshot mode; execute_oneshot_plan_if_present() then AUTO-GENERATES the
+    // prefetch plan from the QEP (or uses @_ldb_plan as an override), and turns
+    // oneshot back off if the plan cannot be fully modelled.
     const bool can_use_oneshot =
-        (srv_oneshot_execution && thd_can_use_oneshot(thd) &&
-         thd_has_ldb_plan(thd));
+        (srv_oneshot_execution && thd_can_use_oneshot(thd));
     ctx->tx->set_oneshot_mode(can_use_oneshot);
   }
   if (ctx->tx->is_not_started()) {
@@ -2122,6 +3168,13 @@ static int lineairdb_commit(handlerton *hton, THD *thd, bool all) {
     return 0;
 
   const bool committed = ctx->tx->end_transaction();
+  // NOTE: end_transaction() calls `delete this;` (lineairdb_transaction.cc
+  // line 2271 / oneshot_validate_and_commit line 2132). ctx->tx is dangling
+  // after the return; clear it. Adding `delete ctx->tx;` here is a
+  // DOUBLE-FREE — verified to corrupt MySQL's TABLE_SHARE cache and crash
+  // 2-3 statements later. The historical "30 GB RSS retained" is jemalloc
+  // decay behaviour (memory returned to arenas, not to the kernel), not a
+  // logic leak — tune with MALLOC_CONF=dirty_decay_ms:0 if release is needed.
   ctx->tx = nullptr;
 
   if (!committed) {
@@ -2144,6 +3197,7 @@ static int lineairdb_abort(handlerton *hton, THD *thd, bool) {
 
   ctx->tx->set_status_to_abort();
   (void)ctx->tx->end_transaction();
+  // end_transaction() self-deletes; ctx->tx is dangling. Do not delete again.
   ctx->tx = nullptr;
   return 0;
 }
@@ -2166,6 +3220,7 @@ static int lineairdb_close_connection(handlerton *hton, THD *thd) {
     LOG_INFO("lineairdb_close_connection: aborting pending tx=%p", ctx->tx);
     ctx->tx->set_status_to_abort();
     (void)ctx->tx->end_transaction();
+    // end_transaction() self-deletes; ctx->tx is dangling. Do not delete again.
     ctx->tx = nullptr;
   }
 
@@ -3850,6 +4905,7 @@ bool ha_lineairdb::store_blob_to_field(Field **field) {
 int ha_lineairdb::set_fields_from_lineairdb(uchar *buf,
                                             const std::byte *const read_buf,
                                             const size_t read_buf_size) {
+  HTP_SCOPE(set_fields);  // nested inside rnd_next/rnd_pos/fetch_* timings
   // Clear BLOB data from the previous row.
   blobroot.ClearForReuse();
   ldbField.make_mysql_table_row(read_buf, read_buf_size);
@@ -3868,19 +4924,54 @@ int ha_lineairdb::set_fields_from_lineairdb(uchar *buf,
   /* Avoid asserts in ::store() for columns that are not going to be updated
    */
   my_bitmap_map *org_bitmap = dbug_tmp_use_all_columns(table, table->write_set);
-  /**
-   * store each column value to corresponding field
-   */
-  size_t columnIndex = 0;
-  for (Field **field = table->field; *field; field++) {
-    const auto mysqlFieldValue = ldbField.get_column_of_row(columnIndex++);
-    if ((*field)->is_nullable() && (*field)->is_null_in_record(buf)) {
-      (*field)->set_null();
-    } else {
-      (*field)->store(mysqlFieldValue.data(), mysqlFieldValue.size(),
-                      &my_charset_bin, CHECK_FIELD_WARN);
-      if (store_blob_to_field(field))
-        return HA_ERR_OUT_OF_MEM;
+
+  // Projection pushdown: if this table's cached VALUES were trimmed to a subset
+  // of columns, the parsed row holds only the kept columns in order; map the
+  // k-th present column to field index kept[k]. Non-kept fields are left
+  // untouched (MySQL won't read columns outside read_set). null flags are kept
+  // FULL, so is_null_in_record(buf) is correct per field.
+  const std::vector<uint32_t> *kept = nullptr;
+  {
+    auto tx = get_transaction(ha_thd());
+    if (tx != nullptr) kept = tx->table_projection(db_table_name);
+  }
+  // Use the projected mapping ONLY when the value actually has the projected
+  // column count. This self-corrects against any table-name/key mismatch or a
+  // full row that slipped into a projected table (decode it positionally as
+  // full): projected value has kept->size() columns, a full value has s->fields.
+  if (kept != nullptr && ldbField.get_row_size() != kept->size()) {
+    kept = nullptr;
+  }
+  if (kept != nullptr) {
+    for (size_t k = 0; k < kept->size(); ++k) {
+      const uint32_t fi = (*kept)[k];
+      if (fi >= table->s->fields) break;  // safety: malformed projection
+      Field *f = table->field[fi];
+      const auto mysqlFieldValue = ldbField.get_column_of_row(k);
+      if (f->is_nullable() && f->is_null_in_record(buf)) {
+        f->set_null();
+      } else {
+        f->store(mysqlFieldValue.data(), mysqlFieldValue.size(), &my_charset_bin,
+                 CHECK_FIELD_WARN);
+        Field *arr[2] = {f, nullptr};
+        if (store_blob_to_field(arr)) return HA_ERR_OUT_OF_MEM;
+      }
+    }
+  } else {
+    /**
+     * store each column value to corresponding field (full row)
+     */
+    size_t columnIndex = 0;
+    for (Field **field = table->field; *field; field++) {
+      const auto mysqlFieldValue = ldbField.get_column_of_row(columnIndex++);
+      if ((*field)->is_nullable() && (*field)->is_null_in_record(buf)) {
+        (*field)->set_null();
+      } else {
+        (*field)->store(mysqlFieldValue.data(), mysqlFieldValue.size(),
+                        &my_charset_bin, CHECK_FIELD_WARN);
+        if (store_blob_to_field(field))
+          return HA_ERR_OUT_OF_MEM;
+      }
     }
   }
   dbug_tmp_restore_column_map(table->write_set, org_bitmap);
