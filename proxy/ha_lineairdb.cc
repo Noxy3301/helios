@@ -2370,8 +2370,11 @@ static void maybe_auto_stage_oneshot_plan(THD *thd, LineairDBTransaction *tx) {
   // range re-scan has no write-after-stale-read window — see design doc). When
   // eligible, full-cover cache serves skip per-row read-TID recording and the
   // server revalidates via retained footprint digests.
+  // Phase-7: ON by default now (read-only scope, verified 22/22 md5 both ways,
+  // commit OCC 7-11s -> ~2s on Q21). Opt out with HELIOS_RANGEHASH_OCC=0.
+  static const char* rh_env = std::getenv("HELIOS_RANGEHASH_OCC");
   static const bool rangehash_gate =
-      (std::getenv("HELIOS_RANGEHASH_OCC") != nullptr);
+      (rh_env == nullptr) || (std::strcmp(rh_env, "0") != 0);
   tx->set_rangehash_eligible(rangehash_gate &&
                              thd->lex != nullptr &&
                              thd->lex->sql_command == SQLCOM_SELECT);

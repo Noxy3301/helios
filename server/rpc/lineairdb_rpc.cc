@@ -1123,8 +1123,10 @@ void LineairDBRpc::buildExecuteReadPlanResponse(
             // to actually USE it at commit. Computing it for a write txn is
             // harmless (never validated). One extra range scan at prefetch —
             // the cost of a footprint-identical digest vs the commit re-scan.
+            // Phase-7: ON by default (opt out with HELIOS_RANGEHASH_OCC=0).
+            static const char* rh_env = std::getenv("HELIOS_RANGEHASH_OCC");
             static const bool rangehash_on =
-                (std::getenv("HELIOS_RANGEHASH_OCC") != nullptr);
+                (rh_env == nullptr) || (std::strcmp(rh_env, "0") != 0);
             // Only full-cover primary ranges (start_key == "") are hashed: the
             // proxy skips per-row reads exactly for rows served from a
             // full-cover cache entry, so the hashed set and the skipped set
