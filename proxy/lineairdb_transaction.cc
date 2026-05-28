@@ -115,6 +115,25 @@ LineairDBTransaction::read(std::string key) {
     return {reinterpret_cast<const std::byte*>(last_read_value_.data()), last_read_value_.size()};
   }
 
+  // Positive covering: a row prefetched by a FER/FES sub-scan lives ONLY in a
+  // range entry (push_local_range_scan never calls record_local_read), so an
+  // exact-PK point read would false-miss it here and abort. (Q2's correlated
+  // MIN joins part->partsupp by a ps_partkey prefix sub-scan, then the handler
+  // issues a full-PK point read on a matched partsupp row.) Serve the row's
+  // value from the range entry and record its per-row TID as a commit
+  // obligation so a concurrent value UPDATE is still detected (physical node
+  // validation alone misses value-only changes).
+  if (oneshot_mode_) {
+    if (auto hit = lookup_positive_covering_range_row(db_table_key, key)) {
+      rpc_trace_.record_local_view("read_range_hit");
+      const uint64_t tid = hit->entry->row_tids[hit->row_idx];
+      record_stateless_read(db_table_key, key, true, tid);
+      last_read_value_ = hit->entry->rows[hit->row_idx].second;
+      return {reinterpret_cast<const std::byte*>(last_read_value_.data()),
+              last_read_value_.size()};
+    }
+  }
+
   // Negative caching: if a completed, unlimited PK range scan already
   // covers this key and its authoritative pre-filter key set does NOT contain
   // it, the row is provably absent — answer not-found locally instead of an
@@ -202,6 +221,30 @@ LineairDBTransaction::batch_read(const std::vector<std::string>& keys) {
       activate_local_read(*entry);
       pairs[i] = {entry->found, entry->value};
       continue;
+    }
+    // Positive covering: serve a FER/FES-prefetched row from its range entry
+    // (see read()), recording the per-row TID obligation. Without this, batched
+    // / MRR PK reads hit the same false miss read() guards against.
+    if (oneshot_mode_) {
+      if (auto hit = lookup_positive_covering_range_row(db_table_key, keys[i])) {
+        rpc_trace_.record_local_view("batch_range_hit");
+        const uint64_t tid = hit->entry->row_tids[hit->row_idx];
+        record_stateless_read(db_table_key, keys[i], true, tid);
+        pairs[i] = {true, hit->entry->rows[hit->row_idx].second};
+        continue;
+      }
+      // Negative covering: prove the batched key absent from a covering range
+      // (mirrors read()); else absent MRR probes would false-miss and abort
+      // (Codex review). Activate the covering range's validation so a concurrent
+      // INSERT of this key still aborts at commit.
+      if (const LocalRangeScanEntry* cov =
+              find_negative_covering_range_scan(db_table_key, keys[i])) {
+        rpc_trace_.record_local_view("batch_negative_hit");
+        activate_range_validation(cov->range_versions, cov->index_reads);
+        record_local_read(db_table_key, keys[i], false, "");
+        pairs[i] = {false, ""};
+        continue;
+      }
     }
     rpc_trace_.record_local_view("batch_miss");
     rpc_positions.push_back(i);
@@ -2010,8 +2053,25 @@ LineairDBTransaction::find_negative_covering_range_scan(
       for (const auto& rk : rv.result_keys)
         if (rk == key) return nullptr;  // present (maybe filtered) -> not absent
     }
-    if (!any_logical) return nullptr;  // no logical phantom set -> cannot prove
-    return &e;
+    if (any_logical) return &e;
+    // No logical key set (PHYSICAL OCC mode, the default: scans emit only
+    // node-version entries, no result_keys). For an UNFILTERED, fully-read
+    // range, `rows` IS the complete set of existing keys in [start,end), so a
+    // key in range but absent from rows is provably absent — and the entry's
+    // node-version range_versions still abort at commit if a concurrent INSERT
+    // adds the key (the caller activates them). Filtered entries are excluded:
+    // a row dropped by the pushed filter still exists on the server, so
+    // absence-from-rows would be unsound there (Codex review). row_limit==0 was
+    // already required above. Binary search (rows are key-sorted) — O(log n),
+    // so no membership cap is needed (unlike the logical linear scan).
+    if (!e.filter_serialized.empty()) return nullptr;
+    if (e.reverse_scan) return nullptr;  // ascending-rows assumption (see lookup_positive_covering_range_row)
+    if (e.range_versions.empty()) return nullptr;  // no phantom guard -> unsafe
+    auto key_less = [](const std::pair<std::string, std::string>& r,
+                       const std::string& k) { return r.first < k; };
+    auto lb = std::lower_bound(e.rows.begin(), e.rows.end(), key, key_less);
+    if (lb != e.rows.end() && lb->first == key) return nullptr;  // present
+    return &e;  // absent
   };
 
   // Candidate start-keys (deduped): the key itself ([key,next(key)) and
@@ -2034,6 +2094,56 @@ LineairDBTransaction::find_negative_covering_range_scan(
     for (size_t i = local_range_scans_.size(); i-- > 0;)
       if (const LocalRangeScanEntry* e = entry_proves_absent(i)) return e;
   return nullptr;
+}
+
+std::optional<LineairDBTransaction::PositiveRangeHit>
+LineairDBTransaction::lookup_positive_covering_range_row(
+    const std::string& table_name, const std::string& key) const {
+  // Binary-search a covering range entry's sorted `rows` for the EXACT key.
+  // A hit means the row was prefetched and is provably present; we never infer
+  // absence here (that is find_negative_covering_range_scan's job, which is
+  // sound about filtered/physical entries). Filtered/limited entries are fine
+  // for a positive hit: a row that survives into `rows` is a real present row.
+  auto probe_entry = [&](size_t idx) -> std::optional<PositiveRangeHit> {
+    const LocalRangeScanEntry& e = local_range_scans_[idx];
+    if (e.table_name != table_name) return std::nullopt;
+    // Binary search assumes ascending rows; a reverse-scan entry may store them
+    // descending. FER sub-scans are always forward (ingest hardcodes false), so
+    // skipping reverse entries costs nothing here and stays safe.
+    if (e.reverse_scan) return std::nullopt;
+    if (!key_is_in_range(key, e.start_key, e.end_key)) return std::nullopt;
+    // Need a per-row TID for each row to record the commit obligation; without a
+    // 1:1 tid array we cannot validate the served value, so decline (fall back
+    // to the RPC/abort path rather than serve an unvalidatable row).
+    if (e.row_tids.size() != e.rows.size()) return std::nullopt;
+    auto key_less = [](const std::pair<std::string, std::string>& r,
+                       const std::string& k) { return r.first < k; };
+    auto it = std::lower_bound(e.rows.begin(), e.rows.end(), key, key_less);
+    if (it == e.rows.end() || it->first != key) return std::nullopt;
+    return PositiveRangeHit{&e, static_cast<size_t>(it - e.rows.begin())};
+  };
+
+  // Same candidate starts as the negative cache: the key itself (point/single-PK
+  // scans), each key-part prefix (FER/FES prefix sub-scans — the common case),
+  // and "" (full-table S: scans).
+  std::vector<std::string> cands;
+  cands.push_back(key);
+  for (auto& p : keypart_prefixes(key)) cands.push_back(p);
+  cands.emplace_back();
+  std::unordered_set<std::string> seen;
+  for (const auto& c : cands) {
+    if (!seen.insert(c).second) continue;
+    auto it = range_scan_index_.find(c);
+    if (it == range_scan_index_.end()) continue;
+    for (auto rit = it->second.rbegin(); rit != it->second.rend(); ++rit)
+      if (auto hit = probe_entry(*rit)) return hit;
+  }
+  // Small-cache linear fallback for entries not keyed by any candidate start
+  // (mirrors find_negative_covering_range_scan).
+  if (local_range_scans_.size() <= kScanCacheLinearScanCap)
+    for (size_t i = local_range_scans_.size(); i-- > 0;)
+      if (auto hit = probe_entry(i)) return hit;
+  return std::nullopt;
 }
 
 static bool secondary_entry_matches(

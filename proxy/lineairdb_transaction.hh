@@ -506,6 +506,19 @@ private:
   // validation so a concurrent INSERT of `key` still aborts at commit.
   const LocalRangeScanEntry* find_negative_covering_range_scan(
       const std::string& table_name, const std::string& key) const;
+  // Positive covering: an exact-key PK point read whose row was prefetched by a
+  // FER/FES sub-scan lives ONLY in a range entry (push_local_range_scan), never
+  // in local_read_set_, so read()/batch_read() would false-miss it and abort.
+  // Returns the range entry + row index whose `rows` holds `key` exactly (the
+  // row PROVABLY present), or nullopt. Caller serves the value and records the
+  // row's per-row TID as a commit obligation (value-update detection). Presence
+  // only — absence stays with find_negative_covering_range_scan.
+  struct PositiveRangeHit {
+    const LocalRangeScanEntry* entry;
+    size_t row_idx;
+  };
+  std::optional<PositiveRangeHit> lookup_positive_covering_range_row(
+      const std::string& table_name, const std::string& key) const;
   std::optional<LocalSecondaryScanEntry> lookup_local_secondary_scan(
       const std::string& table_name, const std::string& index_name,
       const std::string& start_key, const std::string& end_key,
