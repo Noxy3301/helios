@@ -82,3 +82,22 @@ set_fields 5.9s/1315万 ≒ **23s**、InnoDB 同条件 2.6s)を、InnoDB の技�
 - own-write invalidation: local write/delete 時に image/cache を落とす(drop_local_secondary_scans 等のタイミング)。
 - BLOB: image に pointer を焼かない(blobroot へ payload copy)。
 - メモリ二重保持回避。phantom-free OCC は不可侵。
+
+---
+## 実装結果ログ
+
+### Step 1 (record-image cache, index/re-probe path) — 2026-05-29 → **REVERTED(負の結果)**
+実装: `fetch_and_set_current_result` の inline path に PK→record[0] image cache(BLOB除外, rnd_init/index_init/write で clear)。
+測定(Q21 SF1, gate OFF, 22/22 md5 ✅ は維持):
+```
+              baseline   Step1
+idx_read      6968ms  →  8952ms   (悪化)
+set_fields    5855ms  →  6390ms   (13.1M 回 = ほぼ不変)
+total wall    52s     →  62s      (悪化)
+```
+**set_fields の呼び出し回数が 13.1M でほぼ不変 = cache がほぼヒットしない。**
+Q21 の FER probe(idx_read 7M)は「同じ行の re-probe」ではなく **distinct な行**だった(仮説外れ)。
+image cache は find/insert と 7M エントリ分のメモリを足すだけで利得ゼロ → revert。
+**教訓**: record-image cache は re-read 反復が多い workload 向け。TPC-H の oneshot 全行 prefetch では
+各行 ~1回 serve なので効かない。serve を速くするには「初回 decode を安くする(Step 4 binary/template)」か
+「per-probe の copy を消す(Step 2 slice-view)」が本筋。→ Step 2 へ前倒し。
