@@ -101,3 +101,26 @@ image cache は find/insert と 7M エントリ分のメモリを足すだけで
 **教訓**: record-image cache は re-read 反復が多い workload 向け。TPC-H の oneshot 全行 prefetch では
 各行 ~1回 serve なので効かない。serve を速くするには「初回 decode を安くする(Step 4 binary/template)」か
 「per-probe の copy を消す(Step 2 slice-view)」が本筋。→ Step 2 へ前倒し。
+
+### Step 2a (caller-side move, kill copy #2) — 2026-05-29 → **採用(小勝ち)**
+実装: lookup_local_range_scan / lookup_local_secondary_scan が返すローカル optional の
+rows/primary_keys を、消費側(get_matching_keys_in_range / get_matching_keys_and_values_in_range /
+get_matching_primary_keys_in_range)で2回目に deep copy していたのを std::move 化。OCC は
+moved-to vector を読むよう並べ替え(row_tids/range_versions/start_key は未 move)。
+
+測定(Q21 SF=1, range-hash ON, 同一データセットで A/B, md5 OK 維持):
+```
+                  hel_ms    mysqld_peak   server_peak
+pre-2a (76498f3)  43451ms   9.87GB        7.95GB
+2a     (cdee61b)  41895ms   9.65GB        7.95GB
+diff              -1556ms   -0.22GB       ±0       (-3.6% time)
+```
+※ InnoDB 比 (inn_ms 2882↔11021) は buffer-pool 暖機差のノイズ。helios 同士の A/B が有効値。
+
+**結論**: 純粋にコピーを減らすだけなので回帰リスクなし、小勝ち(-3.6%/-0.22GB)で採用。
+ただしコピーは Q21 の支配コストではない。残りの copy #1(slice_range_entry_fast の
+6M行 assign)は src 共有のため move 不可 → view/span(Step2b)が必要。mysqld +9.27GB の
+本体は LocalRangeScanEntry::rows の per-row 確保 → arena(Step3)。set_fields は Step4。
+
+現状の Q21 SF=1 全体像(range-hash + phase1a-drop + 2a 込み): 41.9s / mysqld peak 9.65GB /
+server peak 7.95GB / 101 rows / md5 OK。InnoDB 比は計測ごとにブレるが ~3.8x(暖機時)〜15x(冷時)。
