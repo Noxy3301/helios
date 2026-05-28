@@ -1,0 +1,90 @@
+
+2. **なぜ速いか**
+
+キモは「反復 probe を hash/cursor に逃がし、row 変換は template 化した型付き copy」に尽きます。
+
+- AHI hit は `hash(key prefix) -> rec pointer` で、B-tree の root→leaf と page directory 探索を省く。`btr0sea.cc:846-874`, `btr0sea.cc:891-932`
+- AHI が効かなくても、page 内探索は directory の二分探索 + 最大 4-8 record 程度の線形探索で済む。
+- `rec_cache.offsets` により NULL なし compact rec では offsets 再計算も避ける。`page0cur.cc:427-482`
+- row serve は `Field::store()` を列ごとに呼ばない。template の `mysql_col_offset`, `mysql_col_len`, `type` で直接 `memcpy`/軽い型変換をする。`row0sel.cc:2527-2696`
+- covering/key-read なら clustered lookup を避けられる。`row0mysql.h:537-542`, `ha_innodb.cc:8180-8229`
+
+3. **cherry-pick 可否**
+
+可。B-tree そのものではなく、AHI/page-directory の「probe 結果 cache」と row template を取るのがよいです。
+
+- `ProbeSliceCache` を作る: key は `(table,index,start,end,limit,reverse)`、value は `LocalRangeScanEntry`/`LocalSecondaryScanEntry` の `entry_id + [lo,hi)`。`lookup_local_range_scan()` / `lookup_local_secondary_scan()` の成功後に登録し、次回は `range_entry_matches()` と slice copy を飛ばす。現状の hot path は `range_scan_index_` hit 後も検証/切り出しを走る。`lineairdb_transaction.cc:1944-2010`, `lineairdb_transaction.cc:2203-2266`
+- full-cover cache 用に AHI 風 prefix map を持つ: encoded join prefix -> `[lo,hi)`。今の `slice_range_entry_fast()` は 6M rows に `lower_bound` 2回 + `out.rows.assign()`。`lineairdb_transaction.cc:1837-1857`
+- secondary cache も `secondary_key prefix -> primary_keys span` にする。今は `slice_secondary_entry()` が vector を作り直す。`lineairdb_transaction.cc:2169-2200`
+- row cache には `HeliosRowTemplate` を作る: field index, null byte/bit, MySQL record offset, pack length, type, blob flag, fast-store 関数。InnoDB の `mysql_row_templ_t` 相当。
+- `set_fields_from_lineairdb()` は現在 `make_mysql_table_row()` 後に列ごと `Field::store()`。`ha_lineairdb.cc:4911`, `ha_lineairdb.cc:4945-4975`  
+  変更後は `CachedRow.record_image` があれば `memcpy(buf, image, rec_len)` + BLOB pointer fixup。なければ一度だけ materialize して cache する。
+- 本命は KV value v2: `set_write_buffer()` が今 `Field::val_str()` を保存している。`ha_lineairdb.cc:4872-4881`  
+  ここを MySQL record image / native packed column bytes 保存へ寄せると、first serve から `Field::store()` を消せる。
+
+4. **移植の制約/リスク**
+
+- AHI は buffer pool の latch 済み page/rec pointer 前提。proxy は RPC 結果の `std::string`/vector が動くので raw pointer cache は危険。entry id + offset/span にする。
+- OCC/validation を壊さないこと。現状 positive hit は TID を記録し、negative hit は range validation を activate する。`lineairdb_transaction.cc:127-149`, `lineairdb_transaction.cc:1074-1085`
+- secondary write/delete 時の cache invalidation が必要。既存の `drop_local_secondary_scans()` と同じタイミングで probe cache も落とす。`lineairdb_transaction.cc:604-617`, `lineairdb_transaction.cc:1502-1523`
+- BLOB は record image の単純 memcpy だけでは危険。今は serve ごとに `blobroot` へコピーして pointer を張る。`ha_lineairdb.cc:4890-4900`
+- projection/read_set ごとに record image の意味が変わる。現在も `kept` と row column count を照合している。`ha_lineairdb.cc:4933-4944`
+- remote KV の既存 value は text-ish `val_str()` 由来なので、native format 化は互換/version tag が必要。
+
+5. **実装規模の見積もり**
+
+- ProbeSliceCache / prefix-span AHI: **M**。期待効果は `index_read` local lookup 部分の 1.5-3x。特に 7M probe で slice copy と lower_bound が残っている場合に効く。
+- lazy materialized `record_image` cache: **M**。同じ cached row を複数回 serve するなら `set_fields` はほぼ memcpy 化。単発 row だけだと効果は限定的。
+- KV value v2 native record format: **L**。`Field::store()` 5.9s/13.15M の大半を消せる可能性が高い。TPC-H Q21 では最優先の本丸。
+tokens used
+175,468
+1. **機構**
+
+- `index_read` 入口: MySQL key を `search_tuple` に変換して `row_search_mvcc()` へ渡す。`ha_innodb.cc:10254-10312`
+- B-tree 探索前に AHI を試す。条件は `last_hash_succ`, `!disable_ahi`, `btr_search_enabled` など。成功なら B-tree 降下せず return。`btr0cur.cc:773-797`
+- AHI miss 時は root から降下。root page は `root_guess` を hint に fetch。`btr0cur.cc:958-961`, `btr0cur.cc:1130`
+- 各ページ内は `page_cur_search_with_match*()`。page directory を二分探索し、その slot が owned する少数 record を線形探索。`page0cur.cc:420-425`, `page0cur.cc:488-497`, `page0cur.cc:532-542`
+- page directory slot は 2 byte offset、1 slot が基本 4-8 record を持つ。`page0page.h:63-74`, `page0page.ic:515-545`
+- leaf 探索時は byte match 情報を集め、AHI 学習に使う。`btr0cur.cc:1245-1258`, `btr0cur.cc:1647-1658`
+- AHI は通常探索結果から prefix を学習し、十分当たりそうなら page 単位で hash entry を張る。`btr0sea.cc:402-512`, `btr0sea.cc:520-572`, `btr0sea.cc:1404-1572`
+- secondary→clustered は、必要時に secondary rec から clustered ref を作って clustered index をもう一度開く。`row0sel.cc:3145-3151`, main path の gate は `need_to_access_clustered`。`row0sel.cc:5441-5445`
+- MySQL record への格納は `mysql_row_templ_t` に事前計算済み offset/type/null 情報を持ち、必要列だけ変換する。`row0mysql.h:455-503`, `ha_innodb.cc:8266-8328`, `row0sel.cc:2929-3030`, `row0sel.cc:2502-2696`
+
+2. **なぜ速いか**
+
+キモは「反復 probe を hash/cursor に逃がし、row 変換は template 化した型付き copy」に尽きます。
+
+- AHI hit は `hash(key prefix) -> rec pointer` で、B-tree の root→leaf と page directory 探索を省く。`btr0sea.cc:846-874`, `btr0sea.cc:891-932`
+- AHI が効かなくても、page 内探索は directory の二分探索 + 最大 4-8 record 程度の線形探索で済む。
+- `rec_cache.offsets` により NULL なし compact rec では offsets 再計算も避ける。`page0cur.cc:427-482`
+- row serve は `Field::store()` を列ごとに呼ばない。template の `mysql_col_offset`, `mysql_col_len`, `type` で直接 `memcpy`/軽い型変換をする。`row0sel.cc:2527-2696`
+- covering/key-read なら clustered lookup を避けられる。`row0mysql.h:537-542`, `ha_innodb.cc:8180-8229`
+
+3. **cherry-pick 可否**
+
+可。B-tree そのものではなく、AHI/page-directory の「probe 結果 cache」と row template を取るのがよいです。
+
+- `ProbeSliceCache` を作る: key は `(table,index,start,end,limit,reverse)`、value は `LocalRangeScanEntry`/`LocalSecondaryScanEntry` の `entry_id + [lo,hi)`。`lookup_local_range_scan()` / `lookup_local_secondary_scan()` の成功後に登録し、次回は `range_entry_matches()` と slice copy を飛ばす。現状の hot path は `range_scan_index_` hit 後も検証/切り出しを走る。`lineairdb_transaction.cc:1944-2010`, `lineairdb_transaction.cc:2203-2266`
+- full-cover cache 用に AHI 風 prefix map を持つ: encoded join prefix -> `[lo,hi)`。今の `slice_range_entry_fast()` は 6M rows に `lower_bound` 2回 + `out.rows.assign()`。`lineairdb_transaction.cc:1837-1857`
+- secondary cache も `secondary_key prefix -> primary_keys span` にする。今は `slice_secondary_entry()` が vector を作り直す。`lineairdb_transaction.cc:2169-2200`
+- row cache には `HeliosRowTemplate` を作る: field index, null byte/bit, MySQL record offset, pack length, type, blob flag, fast-store 関数。InnoDB の `mysql_row_templ_t` 相当。
+- `set_fields_from_lineairdb()` は現在 `make_mysql_table_row()` 後に列ごと `Field::store()`。`ha_lineairdb.cc:4911`, `ha_lineairdb.cc:4945-4975`  
+  変更後は `CachedRow.record_image` があれば `memcpy(buf, image, rec_len)` + BLOB pointer fixup。なければ一度だけ materialize して cache する。
+- 本命は KV value v2: `set_write_buffer()` が今 `Field::val_str()` を保存している。`ha_lineairdb.cc:4872-4881`  
+  ここを MySQL record image / native packed column bytes 保存へ寄せると、first serve から `Field::store()` を消せる。
+
+4. **移植の制約/リスク**
+
+- AHI は buffer pool の latch 済み page/rec pointer 前提。proxy は RPC 結果の `std::string`/vector が動くので raw pointer cache は危険。entry id + offset/span にする。
+- OCC/validation を壊さないこと。現状 positive hit は TID を記録し、negative hit は range validation を activate する。`lineairdb_transaction.cc:127-149`, `lineairdb_transaction.cc:1074-1085`
+- secondary write/delete 時の cache invalidation が必要。既存の `drop_local_secondary_scans()` と同じタイミングで probe cache も落とす。`lineairdb_transaction.cc:604-617`, `lineairdb_transaction.cc:1502-1523`
+- BLOB は record image の単純 memcpy だけでは危険。今は serve ごとに `blobroot` へコピーして pointer を張る。`ha_lineairdb.cc:4890-4900`
+- projection/read_set ごとに record image の意味が変わる。現在も `kept` と row column count を照合している。`ha_lineairdb.cc:4933-4944`
+- remote KV の既存 value は text-ish `val_str()` 由来なので、native format 化は互換/version tag が必要。
+
+5. **実装規模の見積もり**
+
+- ProbeSliceCache / prefix-span AHI: **M**。期待効果は `index_read` local lookup 部分の 1.5-3x。特に 7M probe で slice copy と lower_bound が残っている場合に効く。
+- lazy materialized `record_image` cache: **M**。同じ cached row を複数回 serve するなら `set_fields` はほぼ memcpy 化。単発 row だけだと効果は限定的。
+- KV value v2 native record format: **L**。`Field::store()` 5.9s/13.15M の大半を消せる可能性が高い。TPC-H Q21 では最優先の本丸。
+RC=0

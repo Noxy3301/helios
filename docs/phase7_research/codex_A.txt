@@ -1,0 +1,90 @@
+ 16652	  m_prebuilt->index = index;
+ 16653	  m_prebuilt->clear_search_tuples();
+ 16654	  m_prebuilt->read_just_key = 1;
+ 16655	  build_template(false);
+ 16656	
+ 16657	  size_t max_threads = thd_parallel_read_threads(m_prebuilt->trx->mysql_thd);
+ 16658	
+ 16659	  /* Count the records in the clustered index */
+ 16660	  ret =
+ 16661	      row_scan_index_for_mysql(m_prebuilt, index, max_threads, false, &n_rows);
+ 16662	  reset_template();
+ 16663	  switch (ret) {
+ 16664	    case DB_SUCCESS:
+ 16665	      break;
+ 16666	    case DB_DEADLOCK:
+
+codex
+1. **機構**
+- InnoDB は `row_prebuilt_t::mysql_template` に `mysql_row_templ_t` 配列を持つ。目的は「row transformations を速くする」構造そのもの: `third_party/mysql-server/storage/innobase/include/row0mysql.h:450`, `:455`, `:586`.
+- テンプレートには `rec_field_no / clust_rec_field_no`, `mysql_col_offset`, `mysql_col_len`, null byte/bit, `type`, `mysql_type`, `mysql_length_bytes`, `charset`, `mbminlen/mbmaxlen`, unsigned が入る: `row0mysql.h:456-503`.
+- `ha_innobase::build_template(false)` は read/write set を見て必要列だけ入れる。不要列は `nullptr` で skip: `handler/ha_innodb.cc:8174-8229`; build の目的コメント: `:8384-8386`.
+- 各列テンプレートは `build_template_field()` で MySQL record offset と pack length を事前計算する: `handler/ha_innodb.cc:8299-8328`. offset は `field->offset(table->record[0])`: `handler/ha_innodb.cc:7723-7729`.
+- hot path は `row_sel_store_mysql_rec()` が `prebuilt->mysql_template` を走査し、列ごとに `row_sel_store_mysql_field()` を呼ぶ: `row/row0sel.cc:2929-3030`.
+- `row_sel_store_mysql_field()` は InnoDB record から `data,len` を取り、NULL なら null bit と default record を copy、非NULLなら型別 materializer へ渡す: `row/row0sel.cc:2830-2844`, `:2876-2878`.
+- 型別 materializer は `Field::store()` ではなく switch。INT は byte order/sign bit 変換: `row/row0sel.cc:2530-2547`; TRUE VARCHAR は length prefix を書いて payload copy: `:2558-2568`; fixed/互換型は `memcpy`: `:2618-2620`, `:2695`; BLOB は MySQL BLOB ref を作る: `:2604-2608`.
+- scan では変換済み MySQL record を prefetch cache/Record_buffer に置き、次回 serve は prefix `memcpy` または template field copy: `row/row0sel.cc:3556-3610`, cache size/threshold は `include/row0mysql.h:505-507`, server buffer最大100行: `handler/ha_innodb.cc:23787-23803`.
+
+2. **なぜ速いか**
+- キモは「SQL 代入」ではなく「既に型付きの engine record から MySQL record image へ materialize」している点。`Field::store()` の charset/文字列検証/数値 parse を通らない。
+- 対比: helios は `set_fields_from_lineairdb()` で各列 `Field::store(slice, &my_charset_bin)` を呼ぶ: `proxy/ha_lineairdb.cc:4950-4955`, `:4964-4971`.
+- `Field_long::store(char*)` は文字列を `strntoull10rnd()` で parse する: `sql/field.cc:3653-3661`, `:1596-1612`.
+- `Field_string::store()` / `Field_varstring::store()` は `field_well_formed_copy_nchars()` で charset 変換/検証する: `sql/field.cc:6129-6150`, `:6574-6590`.
+- InnoDB は charset をテンプレートに保持し、必要なのは CHAR padding などだけ: `row0mysql.h:491-496`, `row0sel.cc:2578-2601`.
+
+3. **cherry-pick 可否**
+- 可。ただし現在の LineairDB value は `set_write_buffer()` が `Field::val_str()` で作る「表示/文字列寄り」の列 slice: `proxy/ha_lineairdb.cc:4865-4881`. そのまま全型 `memcpy` は不可。
+- 作るもの: `ha_lineairdb` 用 `LineairdbRowTemplate`。列ごとに `src_col/projected_src_col`, `mysql_col_offset`, `mysql_col_len`, `null_byte_offset`, `null_bit_mask`, `mysql_type`, `real_type`, `length_bytes`, `charset`, `copy_kind` を持つ。InnoDB の `mysql_row_templ_t` 相当。
+- `set_fields_from_lineairdb()` は、今の zero-copy parser `LineairDBField::make_mysql_table_row()` を残す: `proxy/lineairdb_field.cc:74-111`; null flags を `memcpy` 後、template の列だけ materialize する。
+- 変更後の流れ: `Field::store()` loop を消し、`materialize_column(buf + off, templ, slice)` に置換。NULL は `table->s->default_values + off` を copy して null bit 維持。BLOB は `blobroot` に payload copy して `Field_blob::set_ptr()` を直接呼ぶ。現行の後段 blob copy は `proxy/ha_lineairdb.cc:4890-4899`.
+- 最短案: 既存 text format に対し、CHAR/VARCHAR/BLOB は direct copy/length-prefix/pad、INT/DATE/DECIMAL は当面 fallback `Field::store()`。効果は限定的だが安全。
+- 本命案: KV value v2 または proxy row cache sidecar に「MySQL record-format column bytes」を持つ。fixed は `memcpy`、VARCHAR は length prefix + payload、BLOB は payload + `set_ptr()`。これで InnoDB と同じ型付き copy になる。
+
+4. **移植の制約/リスク**
+- InnoDB は engine record が型付き binary。helios は現在 `val_str()` 由来なので numeric/date/decimal が文字列 parse 必須。ここを変えない限り InnoDB 級にはならない: `proxy/ha_lineairdb.cc:4877-4879`.
+- server 側 predicate pushdown は現在 row value を文字列 slice として parse する: `server/rpc/predicate_evaluator.cc:20-27`, `:124-160`. binary-only value にすると filter/value-column binding が壊れる。
+- value-column binding も decimal string を `strtoll()` して key 化している: `server/rpc/lineairdb_rpc.cc:226-231`.
+- MySQL record image は TABLE metadata, charset, MySQL version, pointer size/endianness に依存する。remote KV の永続 value にするなら format version/schema id/migration が必要。
+- BLOB は record 内が pointer なので、そのまま永続化不可。payload を cache/row arena に copy して record には pointer を張る必要がある。InnoDB も BLOB は heap に copy してから ref 化する: `row/row0sel.cc:2847-2868`, `:2604-2608`.
+
+5. **実装規模の見積もり**
+- **M**: proxy-only template + text-format fast path。`set_fields_from_lineairdb()` の `Field::store()` を common型から順に外す。期待効果は `set_fields` 部分 30-60% 減、リスク低。
+- **L**: value v2/sidecar record-image cache + server predicate 互換維持。期待効果は `set_fields` をほぼ parse+memcpy/BLOB set_ptr 化し、5.9s の大半を削れる可能性が高い。ただし remote format と server filter まで触る。
+tokens used
+133,628
+1. **機構**
+- InnoDB は `row_prebuilt_t::mysql_template` に `mysql_row_templ_t` 配列を持つ。目的は「row transformations を速くする」構造そのもの: `third_party/mysql-server/storage/innobase/include/row0mysql.h:450`, `:455`, `:586`.
+- テンプレートには `rec_field_no / clust_rec_field_no`, `mysql_col_offset`, `mysql_col_len`, null byte/bit, `type`, `mysql_type`, `mysql_length_bytes`, `charset`, `mbminlen/mbmaxlen`, unsigned が入る: `row0mysql.h:456-503`.
+- `ha_innobase::build_template(false)` は read/write set を見て必要列だけ入れる。不要列は `nullptr` で skip: `handler/ha_innodb.cc:8174-8229`; build の目的コメント: `:8384-8386`.
+- 各列テンプレートは `build_template_field()` で MySQL record offset と pack length を事前計算する: `handler/ha_innodb.cc:8299-8328`. offset は `field->offset(table->record[0])`: `handler/ha_innodb.cc:7723-7729`.
+- hot path は `row_sel_store_mysql_rec()` が `prebuilt->mysql_template` を走査し、列ごとに `row_sel_store_mysql_field()` を呼ぶ: `row/row0sel.cc:2929-3030`.
+- `row_sel_store_mysql_field()` は InnoDB record から `data,len` を取り、NULL なら null bit と default record を copy、非NULLなら型別 materializer へ渡す: `row/row0sel.cc:2830-2844`, `:2876-2878`.
+- 型別 materializer は `Field::store()` ではなく switch。INT は byte order/sign bit 変換: `row/row0sel.cc:2530-2547`; TRUE VARCHAR は length prefix を書いて payload copy: `:2558-2568`; fixed/互換型は `memcpy`: `:2618-2620`, `:2695`; BLOB は MySQL BLOB ref を作る: `:2604-2608`.
+- scan では変換済み MySQL record を prefetch cache/Record_buffer に置き、次回 serve は prefix `memcpy` または template field copy: `row/row0sel.cc:3556-3610`, cache size/threshold は `include/row0mysql.h:505-507`, server buffer最大100行: `handler/ha_innodb.cc:23787-23803`.
+
+2. **なぜ速いか**
+- キモは「SQL 代入」ではなく「既に型付きの engine record から MySQL record image へ materialize」している点。`Field::store()` の charset/文字列検証/数値 parse を通らない。
+- 対比: helios は `set_fields_from_lineairdb()` で各列 `Field::store(slice, &my_charset_bin)` を呼ぶ: `proxy/ha_lineairdb.cc:4950-4955`, `:4964-4971`.
+- `Field_long::store(char*)` は文字列を `strntoull10rnd()` で parse する: `sql/field.cc:3653-3661`, `:1596-1612`.
+- `Field_string::store()` / `Field_varstring::store()` は `field_well_formed_copy_nchars()` で charset 変換/検証する: `sql/field.cc:6129-6150`, `:6574-6590`.
+- InnoDB は charset をテンプレートに保持し、必要なのは CHAR padding などだけ: `row0mysql.h:491-496`, `row0sel.cc:2578-2601`.
+
+3. **cherry-pick 可否**
+- 可。ただし現在の LineairDB value は `set_write_buffer()` が `Field::val_str()` で作る「表示/文字列寄り」の列 slice: `proxy/ha_lineairdb.cc:4865-4881`. そのまま全型 `memcpy` は不可。
+- 作るもの: `ha_lineairdb` 用 `LineairdbRowTemplate`。列ごとに `src_col/projected_src_col`, `mysql_col_offset`, `mysql_col_len`, `null_byte_offset`, `null_bit_mask`, `mysql_type`, `real_type`, `length_bytes`, `charset`, `copy_kind` を持つ。InnoDB の `mysql_row_templ_t` 相当。
+- `set_fields_from_lineairdb()` は、今の zero-copy parser `LineairDBField::make_mysql_table_row()` を残す: `proxy/lineairdb_field.cc:74-111`; null flags を `memcpy` 後、template の列だけ materialize する。
+- 変更後の流れ: `Field::store()` loop を消し、`materialize_column(buf + off, templ, slice)` に置換。NULL は `table->s->default_values + off` を copy して null bit 維持。BLOB は `blobroot` に payload copy して `Field_blob::set_ptr()` を直接呼ぶ。現行の後段 blob copy は `proxy/ha_lineairdb.cc:4890-4899`.
+- 最短案: 既存 text format に対し、CHAR/VARCHAR/BLOB は direct copy/length-prefix/pad、INT/DATE/DECIMAL は当面 fallback `Field::store()`。効果は限定的だが安全。
+- 本命案: KV value v2 または proxy row cache sidecar に「MySQL record-format column bytes」を持つ。fixed は `memcpy`、VARCHAR は length prefix + payload、BLOB は payload + `set_ptr()`。これで InnoDB と同じ型付き copy になる。
+
+4. **移植の制約/リスク**
+- InnoDB は engine record が型付き binary。helios は現在 `val_str()` 由来なので numeric/date/decimal が文字列 parse 必須。ここを変えない限り InnoDB 級にはならない: `proxy/ha_lineairdb.cc:4877-4879`.
+- server 側 predicate pushdown は現在 row value を文字列 slice として parse する: `server/rpc/predicate_evaluator.cc:20-27`, `:124-160`. binary-only value にすると filter/value-column binding が壊れる。
+- value-column binding も decimal string を `strtoll()` して key 化している: `server/rpc/lineairdb_rpc.cc:226-231`.
+- MySQL record image は TABLE metadata, charset, MySQL version, pointer size/endianness に依存する。remote KV の永続 value にするなら format version/schema id/migration が必要。
+- BLOB は record 内が pointer なので、そのまま永続化不可。payload を cache/row arena に copy して record には pointer を張る必要がある。InnoDB も BLOB は heap に copy してから ref 化する: `row/row0sel.cc:2847-2868`, `:2604-2608`.
+
+5. **実装規模の見積もり**
+- **M**: proxy-only template + text-format fast path。`set_fields_from_lineairdb()` の `Field::store()` を common型から順に外す。期待効果は `set_fields` 部分 30-60% 減、リスク低。
+- **L**: value v2/sidecar record-image cache + server predicate 互換維持。期待効果は `set_fields` をほぼ parse+memcpy/BLOB set_ptr 化し、5.9s の大半を削れる可能性が高い。ただし remote format と server filter まで触る。
+RC=0

@@ -1,0 +1,90 @@
+
+exec
+/bin/bash -lc "nl -ba third_party/mysql-server/storage/innobase/row/row0mysql.cc | sed -n '900,918p'" in /home/noxy/helios
+ succeeded in 0ms:
+   900	
+   901	  prebuilt->autoinc_error = DB_SUCCESS;
+   902	  prebuilt->autoinc_offset = 0;
+   903	
+   904	  /* Default to 1, we will set the actual value later in
+   905	  ha_innobase::get_auto_increment(). */
+   906	  prebuilt->autoinc_increment = 1;
+   907	
+   908	  prebuilt->autoinc_last_value = 0;
+   909	
+   910	  /* During UPDATE and DELETE we need the doc id. */
+   911	  prebuilt->fts_doc_id = 0;
+   912	
+   913	  prebuilt->mysql_row_len = mysql_row_len;
+   914	
+   915	  prebuilt->ins_sel_stmt = false;
+   916	  prebuilt->session = nullptr;
+   917	
+   918	  prebuilt->fts_doc_id_in_read_set = false;
+
+codex
+1. **機構**
+- InnoDB は `row_prebuilt_t` に MySQL record 形式の fetch cache を持つ。サイズは内部 cache が `MYSQL_FETCH_CACHE_SIZE=8`、開始閾値が `MYSQL_FETCH_CACHE_THRESHOLD=4`。`fetch_cache[]` は各 slot に `mysql_row_len` bytes を予約する。`third_party/mysql-server/storage/innobase/include/row0mysql.h:505`, `:711`, `:720`
+- cache の中身は **既に MySQL record 形式**。`row_sel_store_mysql_rec()` が InnoDB record から `mysql_template[]` に従って `mysql_rec` へ書く。`third_party/mysql-server/storage/innobase/row/row0sel.cc:2892`, `:2929`
+- `row_search_mvcc()` の冒頭で、`n_fetch_cached > 0` なら B-tree/MVCC/型変換に入らず `row_sel_dequeue_cached_row_for_mysql()` で `buf` にコピーして即 return。`third_party/mysql-server/storage/innobase/row/row0sel.cc:4519`, `:4564`
+- cache pop は短い row なら `ut_memcpy(buf, cached_rec, mysql_prefix_len)`、長い row は template の field offset ごとに copy。`third_party/mysql-server/storage/innobase/row/row0sel.cc:3557`, `:3589`, `:3609`
+- cache fill は row を見つけた後、条件を満たすと `row_sel_fetch_last_buf()` で slot を取り、`row_sel_store_mysql_rec()` で MySQL record 化し、`row_sel_enqueue_cache_row_for_mysql()` する。`third_party/mysql-server/storage/innobase/row/row0sel.cc:5592`, `:5629`, `:5631`, `:5690`
+- prefetch 条件は `Record_buffer` がある、または `match_mode == ROW_SEL_EXACT` か `n_rows_fetched >= 4` かつ `can_prefetch_records()`。不可条件は locking read、BLOB/fixed point、HANDLER scroll cursor、InnoDB API、FTS など。`third_party/mysql-server/storage/innobase/row/row0sel.cc:5592`, `third_party/mysql-server/storage/innobase/row/row0mysql.cc:4766`
+- MySQL executor 側の `Record_buffer` も同じ思想で、executor が複数 record 分の buffer を渡し、SE は次回以降の handler call でそこから `TABLE::record[0]` へ copy する。`third_party/mysql-server/sql/record_buffer.h:32`, `:40`; InnoDB は最大 100 rows 要求。`third_party/mysql-server/storage/innobase/handler/ha_innodb.cc:23787`, `:23802`
+
+2. **なぜ速いか**
+- キモは「prefetch cache の row を serialized value でなく MySQL record bytes として持つ」こと。cached hit は `Field::store()` でも decode でもなく、prefix `memcpy` だけ。`third_party/mysql-server/storage/innobase/row/row0sel.cc:3568`, `:3609`
+- `mysql_template[]` に field offset、pack length、NULL bit、型情報を事前計算するため、row 変換も virtual call 的な `Field::store()` 連打ではなく型別の直接 store。`third_party/mysql-server/storage/innobase/include/row0mysql.h:455`, `third_party/mysql-server/storage/innobase/handler/ha_innodb.cc:8307`
+- 注意点: InnoDB も handler call 数そのものは 1 row 1 call。安いのは cached call が `row_search_mvcc()` の PHASE 1 で終わり、B-tree cursor move/MVCC/record decode に入らない点。`third_party/mysql-server/storage/innobase/row/row0sel.cc:4564`
+
+3. **cherry-pick 可否**
+- 可。helios は既に full scan / index range をまとめて取得しているが、cache が LineairDB serialized value のままなので serve ごとに `set_fields_from_lineairdb()` が parse + `Field::store()` を実行している。`proxy/ha_lineairdb.cc:2651`, `:2731`, `:4905`, `:4954`, `:4970`
+- 作るもの: `MysqlRecordCache` と `LineairdbRecordTemplate`。template は `field_index`, `field->field_ptr() - table->record[0]`, `pack_length()`, NULL byte/bit、LineairDB projection mapping を持つ。InnoDB の `mysql_row_templ_t` 相当。`third_party/mysql-server/storage/innobase/include/row0mysql.h:470`
+- `fetch_next_batch()` は `scanned_values_` を持つ代わりに、取得直後に `materialize_lineairdb_record(dst, raw)` で MySQL record bytes へ変換し、`scan_cache_` は key -> record index を指す。`rnd_next()` は `memcpy(buf, cached_record, record_len)` に変える。対象箇所: `proxy/ha_lineairdb.cc:2636`, `:2662`, `:2727`
+- secondary index も `batch_fetch_secondary_payloads()` 後に `secondary_index_payloads_` を MySQL record cache 化し、`fetch_and_set_current_result()` は `set_fields_from_lineairdb()` でなく `memcpy` にする。対象箇所: `proxy/ha_lineairdb.cc:4343`, `:4377`, `:4400`
+- 第一段階は既存 `set_fields_from_lineairdb(tmp_record, raw)` で cache 作成してもよいが、Q21 の本命は `Field::store()` を避ける型別 materializer。現状の write path は `Field::val_str()` で serialized value を作るため、整数/日付は単純 memcpy ではなく、binary record format へ直接 encode する関数が必要。`proxy/ha_lineairdb.cc:4877`
+
+4. **移植の制約/リスク**
+- InnoDB は BLOB を fetch cache 対象外にしている。helios も最初は BLOB/GEOMETRY を record cache 対象外にし、既存 path に fallback するのが安全。`third_party/mysql-server/storage/innobase/row/row0mysql.cc:4770`, `proxy/ha_lineairdb.cc:4890`
+- projection pushdown と `read_set` で record image の有効範囲が変わる。template は statement / table alias / projection ごとに作り直す必要がある。現状 projection 判定は `set_fields_from_lineairdb()` 内。`proxy/ha_lineairdb.cc:4928`
+- remote KV では InnoDB の page latch / mtr に相当する安定性はない。record cache は statement-local / transaction-local に限定し、自トランザクション write 後の invalidation と commit validation との整合を守る必要がある。
+- full scan 600万行を全て MySQL record cache 化するとメモリが増える。今の `scanned_values_` を置換して二重保持しない設計が必須。`proxy/ha_lineairdb.hh:113`
+
+5. **実装規模の見積もり**
+- **M**: non-BLOB の MySQL record cache + 既存 `set_fields_from_lineairdb()` で cache materialize。実装は `rnd_next/rnd_pos/index_next/MRR` の pop を `memcpy` 化。効果は再読・重複 probe が多いほど大きいが、初回 materialize の `Field::store()` は残る。
+- **M-L**: InnoDB 風 template + 型別 direct materializer まで入れる。TPC-H 型なら INT/DATE/CHAR/VARCHAR/DECIMAL を優先。期待効果は `set_fields` 5.9s/1315万回の大半を削り、serve 側を decode/store から record memcpy に落とせる。
+- **L**: remote value format 自体を MySQL packed record 互換または typed binary に変更。最大効果だが、write/read compatibility と projection/cache invalidation のリスクが高い。
+tokens used
+110,850
+1. **機構**
+- InnoDB は `row_prebuilt_t` に MySQL record 形式の fetch cache を持つ。サイズは内部 cache が `MYSQL_FETCH_CACHE_SIZE=8`、開始閾値が `MYSQL_FETCH_CACHE_THRESHOLD=4`。`fetch_cache[]` は各 slot に `mysql_row_len` bytes を予約する。`third_party/mysql-server/storage/innobase/include/row0mysql.h:505`, `:711`, `:720`
+- cache の中身は **既に MySQL record 形式**。`row_sel_store_mysql_rec()` が InnoDB record から `mysql_template[]` に従って `mysql_rec` へ書く。`third_party/mysql-server/storage/innobase/row/row0sel.cc:2892`, `:2929`
+- `row_search_mvcc()` の冒頭で、`n_fetch_cached > 0` なら B-tree/MVCC/型変換に入らず `row_sel_dequeue_cached_row_for_mysql()` で `buf` にコピーして即 return。`third_party/mysql-server/storage/innobase/row/row0sel.cc:4519`, `:4564`
+- cache pop は短い row なら `ut_memcpy(buf, cached_rec, mysql_prefix_len)`、長い row は template の field offset ごとに copy。`third_party/mysql-server/storage/innobase/row/row0sel.cc:3557`, `:3589`, `:3609`
+- cache fill は row を見つけた後、条件を満たすと `row_sel_fetch_last_buf()` で slot を取り、`row_sel_store_mysql_rec()` で MySQL record 化し、`row_sel_enqueue_cache_row_for_mysql()` する。`third_party/mysql-server/storage/innobase/row/row0sel.cc:5592`, `:5629`, `:5631`, `:5690`
+- prefetch 条件は `Record_buffer` がある、または `match_mode == ROW_SEL_EXACT` か `n_rows_fetched >= 4` かつ `can_prefetch_records()`。不可条件は locking read、BLOB/fixed point、HANDLER scroll cursor、InnoDB API、FTS など。`third_party/mysql-server/storage/innobase/row/row0sel.cc:5592`, `third_party/mysql-server/storage/innobase/row/row0mysql.cc:4766`
+- MySQL executor 側の `Record_buffer` も同じ思想で、executor が複数 record 分の buffer を渡し、SE は次回以降の handler call でそこから `TABLE::record[0]` へ copy する。`third_party/mysql-server/sql/record_buffer.h:32`, `:40`; InnoDB は最大 100 rows 要求。`third_party/mysql-server/storage/innobase/handler/ha_innodb.cc:23787`, `:23802`
+
+2. **なぜ速いか**
+- キモは「prefetch cache の row を serialized value でなく MySQL record bytes として持つ」こと。cached hit は `Field::store()` でも decode でもなく、prefix `memcpy` だけ。`third_party/mysql-server/storage/innobase/row/row0sel.cc:3568`, `:3609`
+- `mysql_template[]` に field offset、pack length、NULL bit、型情報を事前計算するため、row 変換も virtual call 的な `Field::store()` 連打ではなく型別の直接 store。`third_party/mysql-server/storage/innobase/include/row0mysql.h:455`, `third_party/mysql-server/storage/innobase/handler/ha_innodb.cc:8307`
+- 注意点: InnoDB も handler call 数そのものは 1 row 1 call。安いのは cached call が `row_search_mvcc()` の PHASE 1 で終わり、B-tree cursor move/MVCC/record decode に入らない点。`third_party/mysql-server/storage/innobase/row/row0sel.cc:4564`
+
+3. **cherry-pick 可否**
+- 可。helios は既に full scan / index range をまとめて取得しているが、cache が LineairDB serialized value のままなので serve ごとに `set_fields_from_lineairdb()` が parse + `Field::store()` を実行している。`proxy/ha_lineairdb.cc:2651`, `:2731`, `:4905`, `:4954`, `:4970`
+- 作るもの: `MysqlRecordCache` と `LineairdbRecordTemplate`。template は `field_index`, `field->field_ptr() - table->record[0]`, `pack_length()`, NULL byte/bit、LineairDB projection mapping を持つ。InnoDB の `mysql_row_templ_t` 相当。`third_party/mysql-server/storage/innobase/include/row0mysql.h:470`
+- `fetch_next_batch()` は `scanned_values_` を持つ代わりに、取得直後に `materialize_lineairdb_record(dst, raw)` で MySQL record bytes へ変換し、`scan_cache_` は key -> record index を指す。`rnd_next()` は `memcpy(buf, cached_record, record_len)` に変える。対象箇所: `proxy/ha_lineairdb.cc:2636`, `:2662`, `:2727`
+- secondary index も `batch_fetch_secondary_payloads()` 後に `secondary_index_payloads_` を MySQL record cache 化し、`fetch_and_set_current_result()` は `set_fields_from_lineairdb()` でなく `memcpy` にする。対象箇所: `proxy/ha_lineairdb.cc:4343`, `:4377`, `:4400`
+- 第一段階は既存 `set_fields_from_lineairdb(tmp_record, raw)` で cache 作成してもよいが、Q21 の本命は `Field::store()` を避ける型別 materializer。現状の write path は `Field::val_str()` で serialized value を作るため、整数/日付は単純 memcpy ではなく、binary record format へ直接 encode する関数が必要。`proxy/ha_lineairdb.cc:4877`
+
+4. **移植の制約/リスク**
+- InnoDB は BLOB を fetch cache 対象外にしている。helios も最初は BLOB/GEOMETRY を record cache 対象外にし、既存 path に fallback するのが安全。`third_party/mysql-server/storage/innobase/row/row0mysql.cc:4770`, `proxy/ha_lineairdb.cc:4890`
+- projection pushdown と `read_set` で record image の有効範囲が変わる。template は statement / table alias / projection ごとに作り直す必要がある。現状 projection 判定は `set_fields_from_lineairdb()` 内。`proxy/ha_lineairdb.cc:4928`
+- remote KV では InnoDB の page latch / mtr に相当する安定性はない。record cache は statement-local / transaction-local に限定し、自トランザクション write 後の invalidation と commit validation との整合を守る必要がある。
+- full scan 600万行を全て MySQL record cache 化するとメモリが増える。今の `scanned_values_` を置換して二重保持しない設計が必須。`proxy/ha_lineairdb.hh:113`
+
+5. **実装規模の見積もり**
+- **M**: non-BLOB の MySQL record cache + 既存 `set_fields_from_lineairdb()` で cache materialize。実装は `rnd_next/rnd_pos/index_next/MRR` の pop を `memcpy` 化。効果は再読・重複 probe が多いほど大きいが、初回 materialize の `Field::store()` は残る。
+- **M-L**: InnoDB 風 template + 型別 direct materializer まで入れる。TPC-H 型なら INT/DATE/CHAR/VARCHAR/DECIMAL を優先。期待効果は `set_fields` 5.9s/1315万回の大半を削り、serve 側を decode/store から record memcpy に落とせる。
+- **L**: remote value format 自体を MySQL packed record 互換または typed binary に変更。最大効果だが、write/read compatibility と projection/cache invalidation のリスクが高い。
+RC=0

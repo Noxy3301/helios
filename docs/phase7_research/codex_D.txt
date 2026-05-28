@@ -1,0 +1,90 @@
+   940	  }
+  3958	                            : current_plan_.end_key_serialized;
+  3959	
+  3960	  if (current_plan_.is_primary) {
+  3961	    auto key_values = tx->get_matching_keys_and_values_in_range(
+  3962	        start_key, end_key);
+  3963	    for (auto &kv : key_values) {
+  3964	      secondary_index_results_.push_back(kv.first);
+  3965	      secondary_index_payloads_.push_back(std::move(kv.second));
+  3966	    }
+  3967	  } else {
+  3968	    secondary_index_results_ = tx->get_matching_primary_keys_in_range(
+  4056	    auto key_values = tx->get_matching_keys_and_values_in_range(
+  4057	        prefix, prefix_end, static_cast<uint64_t>(scan_limit.row_limit),
+  4058	        scan_limit.reverse_scan);
+  4059	    for (auto &kv : key_values) {
+  4060	      secondary_index_results_.push_back(kv.first);
+  4061	      secondary_index_payloads_.push_back(std::move(kv.second));
+  4062	    }
+  4063	
+  4064	    if (tx->is_aborted()) {
+
+codex
+1. **機構**: InnoDB がしていること
+- Compact record は「null bitmap + varlen 長 + record header + field bytes」の連続領域。field data の origin からの相対 offset で読む設計: `third_party/mysql-server/storage/innobase/rem/rem0rec.cc:94-132`
+- `rec_get_offsets()` が record ごとに累積 end-offset 配列を作る。compact では null bit、varlen 長、fixed_len を読み、`rec_offs_base(offsets)[i+1]` に各列末尾を入れる: `rem/rec.cc:359-410`, `rem/rec.h:1082-1260`
+- 列アクセスは `offs = offsets[n]`, `len = offsets[n+1]-offs`, `return rec + offs`。文字列 object 化や再パースではない: `include/rem0wrec.h:67-111`
+- page scan は同一 buffer frame 内で next offset を読んで `page + offs` に進む: `include/page0page.ic:607-623`, `include/page0cur.ic:135-142`
+- MySQL `record[0]` への変換は `mysql_row_templ_t` に列 offset/type/null bit を事前計算し、必要列だけ処理する: `include/row0mysql.h:455-488`, `handler/ha_innodb.cc:8252-8342`, `handler/ha_innodb.cc:8388-8465`
+- scan prefetch cache は変換済み MySQL row image を持ち、serve 時は多くの場合 `memcpy` だけ: `row/row0sel.cc:3482-3610`, allocation は `row/row0sel.cc:3627-3651`
+
+2. **なぜ速いか**: キモの一手
+- InnoDB は `Field::store(char*, charset)` を row serve ごとに呼ばない。int は byte-shuffle、varchar/string は長さ格納 + `memcpy`/pad: `row/row0sel.cc:2530-2568`, `row/row0sel.cc:2571-2601`, `row/row0sel.cc:2695`
+- offsets 配列は stack/preallocated buffer から再利用し、足りない時だけ heap: `include/rem0rec.h:265-334`, `rem/rec.cc:395-407`
+- record は page 内の連続 bytes。per-column `std::string` allocation がなく、列値は pointer+len で参照する: `rem/rem0rec.cc:123-132`, `include/rem0wrec.h:108-111`
+- prefetch cache に入った後の serve は MySQL row image copy。長い行でも必要 field copy、短い prefix は一括 copy: `row/row0sel.cc:3577-3610`
+
+3. **cherry-pick 可否**: helios proxy への具体案
+- 可。ただし exact InnoDB `rec_t` ではなく、技法を移す。現 helios は cache から serialized value を取り、毎 serve で `make_mysql_table_row()` と `Field::store()` を呼ぶ: `proxy/ha_lineairdb.cc:4911`, `proxy/ha_lineairdb.cc:4950-4955`, `proxy/ha_lineairdb.cc:4964-4971`
+- まず `CachedRowArena` を作る。`scanned_values_` の `vector<vector<byte>>` と `secondary_index_payloads_` の `vector<string>` を、連続 `arena` + `CachedRowRef{value_off,value_len,null_off,col_offsets_off,ncols}` に置換: 現状は `proxy/ha_lineairdb.hh:113-124`, `proxy/ha_lineairdb.cc:2662-2665`, `proxy/ha_lineairdb.cc:4351-4352`
+- prefetch 受信時に LineairDB value を一度だけ parse して、InnoDB の `rec_offs` 相当の `uint32_t col_end[]` を作る。現 checkout の `LineairDBField` は既に `string_view` zero-copy だが、parse 自体は serve ごと: `proxy/lineairdb_field.hh:49-58`, `proxy/lineairdb_field.cc:74-111`
+- `set_fields_from_lineairdb()` は `set_fields_from_cached_row(buf, CachedRowRef)` に分岐。null bytes は `memcpy`、列 slice は offsets で pointer+len 取得。さらに lazy に `mysql_record_image` を arena に作り、2 回目以降は `memcpy(buf, image, mysql_prefix_len)` にする。呼び出し元は `rnd_next`: `proxy/ha_lineairdb.cc:2727-2731`, `rnd_pos`: `proxy/ha_lineairdb.cc:2794-2800`, index path: `proxy/ha_lineairdb.cc:4400`
+- 最大効果には value format v2 が必要。現 write path は `Field::val_str()` で文字列表現を保存しているため、数値も direct memcpy できない: `proxy/ha_lineairdb.cc:4877-4880`, format 説明も “MySQL value shown to users”: `proxy/lineairdb_field.hh:16-25`
+
+4. **移植の制約/リスク**
+- 既存 LineairDB value は文字列 payload。InnoDB の typed copy をそのまま使うには、typed/binary value format への versioned migration が必要。
+- BLOB は危険。現状は serve ごとに `blobroot` を clear し、`Field_blob` pointer を張り直す: `proxy/ha_lineairdb.cc:4890-4900`, `proxy/ha_lineairdb.cc:4909-4910`。cached MySQL row image に BLOB pointer を永続保存してはいけない。
+- projection/read_set ごとに row image の有効性が変わる。現コードも projection count mismatch guard を持つ: `proxy/ha_lineairdb.cc:4933-4944`
+- remote-KV では InnoDB page latch のような lifetime がない。arena が transaction/cache lifetime を所有し、local write/delete 時に image/ref を invalidate する必要がある。range cache は TID/version 情報を既に持つ: `proxy/lineairdb_transaction.hh:370-372`
+- memory は二重化に注意。raw serialized value + MySQL image を両方持つと SF1 の +5〜13GB が悪化し得る。compact arena + offsets を主、row image は lazy/materialized only、不要なら raw を捨てる設計が必要。
+
+5. **実装規模の見積もり**(S/M/L)と期待効果
+- **S**: parse-once offsets だけ。`Field::store` は残る。実装小、期待効果は小〜中。
+- **M**: contiguous arena + lazy MySQL row image cache。`rnd_next/rnd_pos/index_read` の再 serve はほぼ `memcpy`。Q21 の `set_fields` 5.9s には直接効くが、初回 materialize 分は残る。
+- **L**: value format v2 を typed/binary 化し、InnoDB 風の direct writer を実装。`Field::store` の文字列 parse を除去できる本命。migration/backward compatibility 込みで大きいが、InnoDB の row serve に最も近づく。
+tokens used
+172,939
+1. **機構**: InnoDB がしていること
+- Compact record は「null bitmap + varlen 長 + record header + field bytes」の連続領域。field data の origin からの相対 offset で読む設計: `third_party/mysql-server/storage/innobase/rem/rem0rec.cc:94-132`
+- `rec_get_offsets()` が record ごとに累積 end-offset 配列を作る。compact では null bit、varlen 長、fixed_len を読み、`rec_offs_base(offsets)[i+1]` に各列末尾を入れる: `rem/rec.cc:359-410`, `rem/rec.h:1082-1260`
+- 列アクセスは `offs = offsets[n]`, `len = offsets[n+1]-offs`, `return rec + offs`。文字列 object 化や再パースではない: `include/rem0wrec.h:67-111`
+- page scan は同一 buffer frame 内で next offset を読んで `page + offs` に進む: `include/page0page.ic:607-623`, `include/page0cur.ic:135-142`
+- MySQL `record[0]` への変換は `mysql_row_templ_t` に列 offset/type/null bit を事前計算し、必要列だけ処理する: `include/row0mysql.h:455-488`, `handler/ha_innodb.cc:8252-8342`, `handler/ha_innodb.cc:8388-8465`
+- scan prefetch cache は変換済み MySQL row image を持ち、serve 時は多くの場合 `memcpy` だけ: `row/row0sel.cc:3482-3610`, allocation は `row/row0sel.cc:3627-3651`
+
+2. **なぜ速いか**: キモの一手
+- InnoDB は `Field::store(char*, charset)` を row serve ごとに呼ばない。int は byte-shuffle、varchar/string は長さ格納 + `memcpy`/pad: `row/row0sel.cc:2530-2568`, `row/row0sel.cc:2571-2601`, `row/row0sel.cc:2695`
+- offsets 配列は stack/preallocated buffer から再利用し、足りない時だけ heap: `include/rem0rec.h:265-334`, `rem/rec.cc:395-407`
+- record は page 内の連続 bytes。per-column `std::string` allocation がなく、列値は pointer+len で参照する: `rem/rem0rec.cc:123-132`, `include/rem0wrec.h:108-111`
+- prefetch cache に入った後の serve は MySQL row image copy。長い行でも必要 field copy、短い prefix は一括 copy: `row/row0sel.cc:3577-3610`
+
+3. **cherry-pick 可否**: helios proxy への具体案
+- 可。ただし exact InnoDB `rec_t` ではなく、技法を移す。現 helios は cache から serialized value を取り、毎 serve で `make_mysql_table_row()` と `Field::store()` を呼ぶ: `proxy/ha_lineairdb.cc:4911`, `proxy/ha_lineairdb.cc:4950-4955`, `proxy/ha_lineairdb.cc:4964-4971`
+- まず `CachedRowArena` を作る。`scanned_values_` の `vector<vector<byte>>` と `secondary_index_payloads_` の `vector<string>` を、連続 `arena` + `CachedRowRef{value_off,value_len,null_off,col_offsets_off,ncols}` に置換: 現状は `proxy/ha_lineairdb.hh:113-124`, `proxy/ha_lineairdb.cc:2662-2665`, `proxy/ha_lineairdb.cc:4351-4352`
+- prefetch 受信時に LineairDB value を一度だけ parse して、InnoDB の `rec_offs` 相当の `uint32_t col_end[]` を作る。現 checkout の `LineairDBField` は既に `string_view` zero-copy だが、parse 自体は serve ごと: `proxy/lineairdb_field.hh:49-58`, `proxy/lineairdb_field.cc:74-111`
+- `set_fields_from_lineairdb()` は `set_fields_from_cached_row(buf, CachedRowRef)` に分岐。null bytes は `memcpy`、列 slice は offsets で pointer+len 取得。さらに lazy に `mysql_record_image` を arena に作り、2 回目以降は `memcpy(buf, image, mysql_prefix_len)` にする。呼び出し元は `rnd_next`: `proxy/ha_lineairdb.cc:2727-2731`, `rnd_pos`: `proxy/ha_lineairdb.cc:2794-2800`, index path: `proxy/ha_lineairdb.cc:4400`
+- 最大効果には value format v2 が必要。現 write path は `Field::val_str()` で文字列表現を保存しているため、数値も direct memcpy できない: `proxy/ha_lineairdb.cc:4877-4880`, format 説明も “MySQL value shown to users”: `proxy/lineairdb_field.hh:16-25`
+
+4. **移植の制約/リスク**
+- 既存 LineairDB value は文字列 payload。InnoDB の typed copy をそのまま使うには、typed/binary value format への versioned migration が必要。
+- BLOB は危険。現状は serve ごとに `blobroot` を clear し、`Field_blob` pointer を張り直す: `proxy/ha_lineairdb.cc:4890-4900`, `proxy/ha_lineairdb.cc:4909-4910`。cached MySQL row image に BLOB pointer を永続保存してはいけない。
+- projection/read_set ごとに row image の有効性が変わる。現コードも projection count mismatch guard を持つ: `proxy/ha_lineairdb.cc:4933-4944`
+- remote-KV では InnoDB page latch のような lifetime がない。arena が transaction/cache lifetime を所有し、local write/delete 時に image/ref を invalidate する必要がある。range cache は TID/version 情報を既に持つ: `proxy/lineairdb_transaction.hh:370-372`
+- memory は二重化に注意。raw serialized value + MySQL image を両方持つと SF1 の +5〜13GB が悪化し得る。compact arena + offsets を主、row image は lazy/materialized only、不要なら raw を捨てる設計が必要。
+
+5. **実装規模の見積もり**(S/M/L)と期待効果
+- **S**: parse-once offsets だけ。`Field::store` は残る。実装小、期待効果は小〜中。
+- **M**: contiguous arena + lazy MySQL row image cache。`rnd_next/rnd_pos/index_read` の再 serve はほぼ `memcpy`。Q21 の `set_fields` 5.9s には直接効くが、初回 materialize 分は残る。
+- **L**: value format v2 を typed/binary 化し、InnoDB 風の direct writer を実装。`Field::store` の文字列 parse を除去できる本命。migration/backward compatibility 込みで大きいが、InnoDB の row serve に最も近づく。
+RC=0
