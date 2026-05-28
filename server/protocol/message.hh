@@ -6,7 +6,10 @@
 struct MessageHeader {
     uint64_t sender_id;      // sender ID (not used in LineairDB but keeping for consistency)
     uint32_t message_type;   // OpCode from protobuf
-    uint32_t payload_size;   // size of the protobuf payload
+    uint32_t _pad;           // explicit padding so payload_size is 8-aligned and
+                             // the struct layout is stable/identical on both peers
+    uint64_t payload_size;   // payload size (uint64: prefetch responses can exceed
+                             // 4GB; the flat read-plan codec needs >4GB frames)
 };
 
 // MessageType enum (corresponds to protobuf OpCode)

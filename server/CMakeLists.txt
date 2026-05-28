@@ -52,7 +52,8 @@ set(SOURCES
     rpc/lineairdb_rpc.hh
     rpc/predicate_evaluator.cc
     rpc/predicate_evaluator.hh
-    
+    rpc/tx_occ_store.hh
+
     # Storage layer
     storage/database_manager.cc
     storage/database_manager.hh

@@ -269,6 +269,38 @@ message TxExecuteReadPlan {
         repeated KeyBinding end_bindings = 8;
         bool for_each = 9;
         bool reverse_scan = 10;
+        // Pushed WHERE predicate applied to S: step scan rows on the server
+        // side. Empty = no filter. Only meaningful for is_scan steps without
+        // for_each. Matches the PushedPredicate format used by
+        // TxStatelessRangeScan / TxGetMatchingKeysAndValuesInRange.
+        PushedPredicate filter = 11;
+        // Projection pushdown: when present, the server returns each base-row
+        // VALUE trimmed to only field_indexes (0-based TABLE::field[], ascending,
+        // unique), re-emitting [full null_flags][kept columns]. Absent = full
+        // row (legacy). The proxy decodes by mapping the k-th present column to
+        // field field_indexes[k]. The server still parses the FULL row to
+        // evaluate `filter` before trimming.
+        RowProjection projection = 12;
+    }
+    // Set of base-row columns the query needs (= the proxy's read_set, unioned
+    // with any columns a later step binds from this step's row).
+    message RowProjection {
+        uint32 num_columns = 1;                          // table->s->fields
+        repeated uint32 field_indexes = 2 [packed = true]; // kept, ascending/unique
+    }
+    // One per-source-row sub-scan produced by a for_each && is_scan step
+    // (FER = PK-prefix range per source row, FES = secondary range per source
+    // row). Each carries its own range boundaries so the proxy can build one
+    // local range/secondary cache entry per join probe (O(1) lookup), instead
+    // of a single merged entry that would require O(N) slicing per probe.
+    message SubScan {
+        bytes start_key = 1;
+        bytes end_key = 2;
+        repeated bytes scan_keys = 3;       // primary keys
+        repeated bytes scan_values = 4;
+        repeated uint64 scan_tids = 5;
+        repeated bytes secondary_keys = 6;  // populated for secondary scans
+        repeated RangeValidationEntry range_versions = 7;
     }
     message StepResult {
         bool found = 1;
@@ -283,6 +315,14 @@ message TxExecuteReadPlan {
         bytes actual_end_key = 10;
         repeated RangeValidationEntry range_versions = 11;
         repeated IndexValidationEntry index_reads = 12;
+        repeated SubScan subscans = 13;
+        // (c) Rows in the scanned range that a pushed filter REJECTED, with
+        // their observed TIDs. The proxy records these as validating reads so a
+        // concurrent UPDATE flipping a rejected row's predicate column into the
+        // matched set before commit is detected (its TID changes). Logical
+        // range key-list validation alone misses such value-only changes.
+        repeated bytes filtered_keys = 14;
+        repeated uint64 filtered_tids = 15;
     }
     message Request {
         repeated PlanStep steps = 1;
@@ -292,6 +332,14 @@ message TxExecuteReadPlan {
         repeated RangeValidationEntry range_versions = 2;
         repeated IndexValidationEntry index_reads = 3;
         bool ok = 4;
+        // Non-zero when the server-side ran this prefetch in PHYSICAL OCC mode
+        // (HELIOS_PHYSICAL_OCC). The server retains the NodeVersionEntries +
+        // filtered/tombstone (key,tid) under this key in TxOccStore; the proxy
+        // echoes the same key in TxValidateAndCommit.Request.tx_occ_key for the
+        // server to look it up and validate. In physical mode result_keys /
+        // result_primary_keys / filtered_keys / filtered_tids are NOT populated
+        // on the wire (the server keeps the full data; the proxy holds nothing).
+        uint64 tx_occ_key = 5;
     }
 }
 
@@ -329,6 +377,20 @@ message TxValidateAndCommit {
         bool fence = 6;
         repeated RangeValidationEntry range_reads = 7;
         repeated IndexValidationEntry index_reads = 8;
+        // Echoed back from TxExecuteReadPlan.Response.tx_occ_key (non-zero =
+        // physical OCC). The server uses this to look up the retained
+        // TxOccState (NodeVersionEntries + filtered/tombstone (key,tid)) and
+        // runs Masstree's ValidatePhantoms + per-row TID re-read for the
+        // captured set. range_reads / index_reads / reads will then be empty
+        // for the prefetched ranges (the server already has the data).
+        uint64 tx_occ_key = 9;
+        // helios Phase-6 range-hash OCC. Set by the proxy ONLY for read-only
+        // txns: the proxy skipped recording per-row read TIDs for primary
+        // full-cover ranges, so the server must revalidate those ranges via
+        // the retained footprint digest (re-scan + SHA-256 compare). Never set
+        // for write txns (a re-scan outside the locked install phase would
+        // permit a write-after-stale-read anomaly).
+        bool use_range_hash = 10;
     }
     message Response {
         bool committed = 1;

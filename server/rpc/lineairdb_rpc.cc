@@ -6,7 +6,109 @@
 #include <vector>
 #include <cstring>
 #include <algorithm>
+#include <set>
+#include <unordered_set>
+#include <utility>
+#include "../../proxy/flat_read_plan_codec.hh"
+#include "../../proxy/rpc_compress.hh"
+#include "../network/message_handler.hh"
+#include "tx_occ_store.hh"
+#include <lineairdb/database.h>
+#include <atomic>
+#include <chrono>
+#include <sys/socket.h>
+#include <dlfcn.h>
+
+namespace {
+
+// helios 2-RPC OCC (Step 4 scaffolding): when the current TX_EXECUTE_READ_PLAN
+// handler is running in physical-OCC mode it sets this thread_local to the
+// TxOccState it is assembling. The filtered-row routing helper then routes
+// (key, tid) tuples into TxOccState.filtered_rows instead of the proto's
+// add_filtered_keys/tids, so the proxy never sees them. In Steps 1-4 no
+// handler sets this pointer, so the route stays through proto = byte-
+// equivalent to baseline. Step 5 introduces the setter on the physical-mode
+// entry path.
+thread_local helios::TxOccState* tls_current_tx_occ_state = nullptr;
+
+// Route a filter-rejected row's (table, key, tid) either to the proto
+// response (logical mode = baseline) or to the in-flight server-retained
+// TxOccState (physical mode). `table` is required: a filtered row's table
+// may differ from the last range_read's table (e.g. Q9 filters `part` but
+// the last scan is `orders/nation`), so the commit handler cannot infer it.
+inline void route_filtered_row(
+    LineairDB::Protocol::TxExecuteReadPlan::StepResult* step_result,
+    const std::string& table, const std::string& key, std::uint64_t tid) {
+  if (tls_current_tx_occ_state != nullptr) {
+    tls_current_tx_occ_state->filtered_rows.push_back({table, key, tid});
+  } else {
+    step_result->add_filtered_keys(key);
+    step_result->add_filtered_tids(tid);
+  }
+}
+// (Projection pushdown) Trim a full row VALUE to only the projected columns.
+// Row format (ha_lineairdb set_write_buffer): [null_flags field][col_0]..[col_{N-1}],
+// each field = [byteSize:1B][len:byteSize B][bytes], byteSize==0xFF => null (1 byte).
+// `kept` = ascending unique 0-based column indices. Emits [null_flags][kept cols]
+// (null_flags kept FULL). Returns false on any inconsistency; caller then ships
+// the FULL value unchanged (safe fallback). num_columns = table->s->fields.
+bool trim_row_value(const std::string& full,
+                    const google::protobuf::RepeatedField<uint32_t>& kept,
+                    uint32_t num_columns, std::string& out) {
+    out.clear();
+    const char* end = full.data() + full.size();
+    auto read_field = [&](const char*& q, const char*& fstart,
+                          size_t& flen) -> bool {
+        fstart = q;
+        if (q >= end) return false;
+        uint8_t bs = static_cast<uint8_t>(*q);
+        if (bs == 0xFF) { flen = 1; q += 1; return true; }
+        if (q + 1 + bs > end) return false;
+        size_t len = 0;
+        for (uint8_t i = 0; i < bs; i++)
+            len |= static_cast<size_t>(static_cast<uint8_t>(q[1 + i])) << (8 * i);
+        if (q + 1 + bs + len > end) return false;
+        flen = 1 + bs + len;
+        q += flen;
+        return true;
+    };
+    const char* q = full.data();
+    const char* fs;
+    size_t fl;
+    if (!read_field(q, fs, fl)) return false;  // field 0 = null_flags
+    out.append(fs, fl);
+    int ki = 0;
+    for (uint32_t c = 0; c < num_columns; c++) {  // column c is field index c+1
+        const char* cs;
+        size_t cl;
+        if (!read_field(q, cs, cl)) return false;
+        if (ki < kept.size() &&
+            kept.Get(ki) == static_cast<uint32_t>(c)) {
+            out.append(cs, cl);
+            ki++;
+        }
+    }
+    return ki == kept.size();  // every requested column was present
+}
+}  // namespace
+
+namespace {
+// HELIOS_MEMPROF: read jemalloc's live-heap accounting (allocator's view, not
+// affected by RSS/swap noise). dlsym so we don't link-depend on jemalloc.
+size_t je_stat(const char* name) {
+    using mallctl_t = int (*)(const char*, void*, size_t*, void*, size_t);
+    static mallctl_t mc = reinterpret_cast<mallctl_t>(dlsym(RTLD_DEFAULT, "mallctl"));
+    if (!mc) return 0;
+    // refresh the epoch so stats.* reflect the current state
+    uint64_t epoch = 1; size_t esz = sizeof(epoch);
+    mc("epoch", &epoch, &esz, &epoch, esz);
+    size_t v = 0; size_t vsz = sizeof(v);
+    if (mc(name, &v, &vsz, nullptr, 0) != 0) return 0;
+    return v;
+}
+}  // namespace
 #include <cstdlib>
+#include <cstdio>
 
 #include "lineairdb.pb.h"
 
@@ -661,11 +763,26 @@ void LineairDBRpc::handleTxStatelessSecondaryRangeScan(
     result = response.SerializeAsString();
 }
 
-void LineairDBRpc::handleTxExecuteReadPlan(const std::string& message,
-                                           std::string& result) {
+void LineairDBRpc::buildExecuteReadPlanResponse(
+    const std::string& message,
+    LineairDB::Protocol::TxExecuteReadPlan::Response& response) {
+    // Step F (Codex 2026-05-29): per-phase timers in server's read-plan
+    // build. Diagnostic only. HELIOS_SERVER_TIMEPROF=1 to emit.
+    const bool stp = (std::getenv("HELIOS_SERVER_TIMEPROF") != nullptr);
+    auto tp_now = []() -> uint64_t {
+      timespec t; clock_gettime(CLOCK_MONOTONIC, &t);
+      return uint64_t(t.tv_sec) * 1000000000ull + t.tv_nsec;
+    };
+    const uint64_t stp_total_start = stp ? tp_now() : 0;
+    uint64_t stp_parse_ns = 0, stp_db_ns = 0, stp_proto_ns = 0;
+    int stp_n_scan = 0, stp_n_pointread = 0, stp_n_secscan = 0;
+    uint64_t stp_t_parse_in = stp ? tp_now() : 0;
     LineairDB::Protocol::TxExecuteReadPlan::Request request;
-    LineairDB::Protocol::TxExecuteReadPlan::Response response;
-    request.ParseFromString(message);
+    const bool parsed_ok = request.ParseFromString(message);
+    if (stp) stp_parse_ns = tp_now() - stp_t_parse_in;
+    if (std::getenv("HELIOS_FE_DEBUG"))
+        std::fprintf(stderr, "[PLAN] parse_ok=%d msg_sz=%zu steps=%d\n",
+                     parsed_ok ? 1 : 0, message.size(), request.steps_size());
     response.set_ok(true);
 
     std::vector<LineairDB::Protocol::TxExecuteReadPlan::StepResult*>
@@ -675,6 +792,29 @@ void LineairDBRpc::handleTxExecuteReadPlan(const std::string& message,
     for (const auto& step : request.steps()) {
         auto* step_result = response.add_results();
         previous_results.push_back(step_result);
+
+        // Projection pushdown: trim each emitted base-row VALUE to the kept
+        // columns (after any predicate filter ran on the full row). Absent
+        // projection => identity (full row). On inconsistency, ship full (safe).
+        // Step D-1 (Phase-4, Codex 2026-05-29): the previous lambda returned
+        // std::string by value, forcing a COPY in the non-projection path
+        // (Q1 SF=1: 6M × ~150B = ~900 MB redundant copy = ~500-700ms).
+        // The new lambda mutates `v` (move-from) when no projection, so the
+        // caller can do `step_result->add_scan_values(std::move(v))` without
+        // an extra copy. The projection path still copies because the
+        // trimmer reads `v` and emits into a separate buffer.
+        const bool step_has_projection = step.has_projection();
+        // project_xfer: returns the std::string to be moved into the proto.
+        // If projection: trim into `out` and return out. Else: return `v`
+        // (the caller-supplied source) — caller must move-in.
+        auto project_xfer = [&step, step_has_projection](std::string& v) -> std::string {
+            if (!step_has_projection) return std::move(v);
+            std::string out;
+            if (trim_row_value(v, step.projection().field_indexes(),
+                               step.projection().num_columns(), out))
+                return out;
+            return std::move(v);
+        };
 
         bool start_complete = true;
         bool end_complete = true;
@@ -702,24 +842,178 @@ void LineairDBRpc::handleTxExecuteReadPlan(const std::string& message,
             const auto* source = previous_results[source_step];
             const int row_count =
                 std::max(source->scan_keys_size(), source->scan_values_size());
+            if (std::getenv("HELIOS_FE_DEBUG"))
+                std::fprintf(stderr,
+                    "[FE] enter tbl=%s src_step=%d src_keys=%d src_vals=%d "
+                    "row_count=%d is_scan=%d idx=%s\n",
+                    step.table_name().c_str(), source_step,
+                    source->scan_keys_size(), source->scan_values_size(),
+                    row_count, step.is_scan() ? 1 : 0,
+                    step.index_name().c_str());
+
+            if (!step.is_scan()) {
+                // FE: point read per source row (PK lookup).
+                // Dedup by PK: many source rows map to the same inner row (e.g.
+                // 16x for Q9 orders). The proxy cache is keyed by PK
+                // (record_local_read), so emitting each distinct PK once is
+                // sufficient and the proxy replays multiplicity itself. A single
+                // whole key (no separator) is a collision-free dedup key.
+                std::unordered_set<std::string> seen_keys;
+                for (int row = 0; row < row_count; ++row) {
+                    bool row_complete = true;
+                    const std::string row_key =
+                        build_plan_key(step.key_prefix(), step.bindings(),
+                                       previous_results, row, &row_complete);
+                    if (!row_complete) continue;
+                    if (!seen_keys.insert(row_key).second) continue;
+                    const uint64_t stp_db_t0 = stp ? tp_now() : 0;
+                    auto read_result =
+                        db_manager_->get_database()->StatelessRead(
+                            step.table_name(), row_key);
+                    if (stp) { stp_db_ns += tp_now() - stp_db_t0; ++stp_n_pointread; }
+                    step_result->add_scan_keys(row_key);
+                    step_result->add_scan_tids(read_result.tid);
+                    if (read_result.found) {
+                        step_result->add_scan_values(project_xfer(read_result.value));
+                    } else {
+                        step_result->add_scan_values("");
+                    }
+                }
+                continue;
+            }
+
+            // FER / FES: per-source-row RANGE scan. PK-prefix range when
+            // index_name is empty (e.g. lineitem by l_orderkey), secondary
+            // range otherwise (e.g. orders by o_custkey). Each source row
+            // yields one SubScan with its own [start,end) so the proxy can
+            // build one local cache entry per join probe (O(1) lookup).
+            const bool is_secondary = !step.index_name().empty();
+            // Phase-3d: a per-step pushed predicate (the FER/FES table's own
+            // single-table WHERE, e.g. lineitem.l_shipdate range) filters the
+            // sub-scan rows server-side so deep join tables are not over-fetched.
+            // range_versions (logical result_keys) stays the PRE-filter full
+            // range so commit revalidation matches — same contract as S: steps.
+            const bool fe_has_filter = step.has_filter() && step.filter().has_expr();
+            const uint32_t fe_num_cols =
+                fe_has_filter ? step.filter().num_columns() : 0;
+            PredicateEvaluator fe_eval;
+            auto fe_reject = [&](const std::string& value) -> bool {
+                if (!fe_has_filter) return false;
+                if (!fe_eval.parse_row(value.data(), value.size(), fe_num_cols))
+                    return false;  // parse failure → keep (safe)
+                return !fe_eval.evaluate(step.filter().expr());
+            };
+            // Dedup identical sub-ranges: many source rows yield the same
+            // [start,end) probe (e.g. 4x for Q9 lineitem-by-partkey, since a
+            // partkey recurs once per supplier). The proxy indexes subscans by
+            // start key and replays multiplicity itself, so one subscan per
+            // distinct range suffices. std::pair compares the two binary keys
+            // independently — collision-free even when keys contain NUL (a
+            // single concatenated string with a separator would NOT be, since
+            // storage keys embed 0x00). (Codex design review.)
+            std::set<std::pair<std::string, std::string>> seen_ranges;
             for (int row = 0; row < row_count; ++row) {
                 bool row_complete = true;
-                const std::string row_key =
+                const std::string row_start =
                     build_plan_key(step.key_prefix(), step.bindings(),
                                    previous_results, row, &row_complete);
-                if (!row_complete) continue;
-                auto read_result =
-                    db_manager_->get_database()->StatelessRead(
-                        step.table_name(), row_key);
-                step_result->add_scan_keys(row_key);
-                step_result->add_scan_tids(read_result.tid);
-                if (read_result.found) {
-                    step_result->add_scan_values(
-                        std::move(read_result.value));
+                if (!row_complete || row_start.empty()) continue;
+                std::string row_end;
+                if (step.end_bindings_size() > 0) {
+                    bool end_complete = true;
+                    row_end = build_plan_key(step.end_key_prefix(),
+                                             step.end_bindings(),
+                                             previous_results, row,
+                                             &end_complete);
+                    if (!end_complete || row_end.empty())
+                        row_end = next_lexicographic_key(row_start);
                 } else {
-                    step_result->add_scan_values("");
+                    row_end = next_lexicographic_key(row_start);
+                }
+                if (row_end.empty()) {
+                    if (std::getenv("HELIOS_FE_DEBUG"))
+                        std::fprintf(stderr,
+                            "[FE] empty row_end tbl=%s idx=%s start_sz=%zu\n",
+                            step.table_name().c_str(),
+                            step.index_name().c_str(), row_start.size());
+                    continue;  // skip this probe; proxy falls back
+                }
+                if (!seen_ranges.insert({row_start, row_end}).second)
+                    continue;  // identical sub-range already scanned + emitted
+                auto* sub = step_result->add_subscans();
+                sub->set_start_key(row_start);
+                sub->set_end_key(row_end);
+                if (is_secondary) {
+                    auto sr = db_manager_->get_database()
+                                  ->StatelessSecondaryRangeScan(
+                                      step.table_name(), step.index_name(),
+                                      row_start, row_end, 0, false);
+                    if (!sr.ok) {
+                        // Non-fatal: drop this sub-scan, the proxy falls back to
+                        // a stateless probe. Do not abort the whole plan RPC.
+                        if (std::getenv("HELIOS_FE_DEBUG"))
+                            std::fprintf(stderr,
+                                "[FES] scan !ok tbl=%s idx=%s start_sz=%zu "
+                                "end_sz=%zu\n", step.table_name().c_str(),
+                                step.index_name().c_str(), row_start.size(),
+                                row_end.size());
+                        step_result->mutable_subscans()->RemoveLast();
+                        continue;
+                    }
+                    for (auto& r : sr.rows) {
+                        if (fe_reject(r.value)) {  // (c) validate rejected row's TID
+                            route_filtered_row(step_result, step.table_name(), r.primary_key, r.tid);
+                            continue;
+                        }
+                        std::string pv = project_xfer(r.value);
+                        sub->add_secondary_keys(r.secondary_key);
+                        sub->add_scan_keys(r.primary_key);
+                        sub->add_scan_values(pv);
+                        sub->add_scan_tids(r.tid);
+                        step_result->add_secondary_keys(
+                            std::move(r.secondary_key));
+                        step_result->add_scan_keys(std::move(r.primary_key));
+                        step_result->add_scan_values(std::move(pv));
+                        step_result->add_scan_tids(r.tid);
+                    }
+                    to_proto_range_versions(sr.range_versions,
+                                            sub->mutable_range_versions());
+                } else {
+                    const uint64_t stp_db_t0 = stp ? tp_now() : 0;
+                    auto sr = db_manager_->get_database()->StatelessRangeScan(
+                        step.table_name(), row_start, row_end, 0, false);
+                    if (stp) { stp_db_ns += tp_now() - stp_db_t0; ++stp_n_scan; }
+                    if (!sr.ok) {
+                        if (std::getenv("HELIOS_FE_DEBUG"))
+                            std::fprintf(stderr,
+                                "[FER] scan !ok tbl=%s start_sz=%zu end_sz=%zu\n",
+                                step.table_name().c_str(), row_start.size(),
+                                row_end.size());
+                        step_result->mutable_subscans()->RemoveLast();
+                        continue;
+                    }
+                    for (auto& r : sr.rows) {
+                        if (fe_reject(r.value)) {  // (c) validate rejected row's TID
+                            route_filtered_row(step_result, step.table_name(), r.key, r.tid);
+                            continue;
+                        }
+                        std::string pv = project_xfer(r.value);
+                        sub->add_scan_keys(r.key);
+                        sub->add_scan_values(pv);
+                        sub->add_scan_tids(r.tid);
+                        step_result->add_scan_keys(std::move(r.key));
+                        step_result->add_scan_values(std::move(pv));
+                        step_result->add_scan_tids(r.tid);
+                    }
+                    to_proto_range_versions(sr.range_versions,
+                                            sub->mutable_range_versions());
                 }
             }
+            if (std::getenv("HELIOS_FE_DEBUG"))
+                std::fprintf(stderr,
+                    "[FE] done tbl=%s subscans=%d flat_keys=%d\n",
+                    step.table_name().c_str(), step_result->subscans_size(),
+                    step_result->scan_keys_size());
             continue;
         }
 
@@ -732,7 +1026,7 @@ void LineairDBRpc::handleTxExecuteReadPlan(const std::string& message,
             step_result->set_found(read_result.found);
             step_result->set_tid(read_result.tid);
             if (read_result.found) {
-                step_result->set_value(std::move(read_result.value));
+                step_result->set_value(project_xfer(read_result.value));
             }
             continue;
         }
@@ -740,40 +1034,133 @@ void LineairDBRpc::handleTxExecuteReadPlan(const std::string& message,
         if (step.index_name().empty()) {
             step_result->set_actual_start_key(start_key);
             step_result->set_actual_end_key(end_key);
+            // Phase-3b: when a predicate is attached we must disable the
+            // pushed scan_limit at the LineairDB layer and re-apply it after
+            // post-filter. Otherwise LineairDB returns the first N physical
+            // rows and we filter from them — for `WHERE x=1 LIMIT 1` that
+            // gives zero rows even when a matching row exists later. Per
+            // Codex P1 review.
+            const bool has_filter =
+                step.has_filter() && step.filter().has_expr();
+            const uint64_t scan_limit_for_lineairdb =
+                has_filter ? 0 : step.scan_limit();
+            const uint64_t stp_db_t0 = stp ? tp_now() : 0;
             auto scan_result =
                 db_manager_->get_database()->StatelessRangeScan(
                     step.table_name(), start_key, end_key,
-                    step.scan_limit(), step.reverse_scan());
+                    scan_limit_for_lineairdb, step.reverse_scan());
+            if (stp) { stp_db_ns += tp_now() - stp_db_t0; ++stp_n_scan; }
             if (!scan_result.ok) {
-                response.set_ok(false);
-                result = response.SerializeAsString();
+                if (std::getenv("HELIOS_FE_DEBUG"))
+                    std::fprintf(stderr,
+                        "[PLAN] S !ok tbl=%s start_sz=%zu end_sz=%zu\n",
+                        step.table_name().c_str(), start_key.size(),
+                        end_key.size());
+                response.set_ok(false);  // caller flat-encodes/streams this ok=false response
                 return;
+            }
+            // Predicate pushdown: post-process scan_result.rows. parse_row
+            // failures fall through to include the row (safe-fallback,
+            // matching the existing TxGetMatching* handler semantics).
+            //
+            // INCOMPLETE — Codex review round 2 P1: rejected rows' TIDs are
+            // currently dropped. Logical range validation only replays the
+            // returned key list, so a concurrent UPDATE that flips a row's
+            // predicate column into the matched set after our scan but
+            // before commit will go undetected. Fix options: emit rejected
+            // (key, tid) pairs in step_result for the proxy to add to its
+            // validation set, or re-evaluate the predicate during commit
+            // here. Filter pushdown is dormant in current callers (TPC-H
+            // SELECT cond_push is no-op, TPC-C oneshot plans don't carry
+            // unindexed S: scans with pushed_filter); enabling it for
+            // Phase-3c must address this.
+            if (has_filter && !scan_result.rows.empty()) {
+                const auto& filter_expr = step.filter().expr();
+                const uint32_t num_cols = step.filter().num_columns();
+                PredicateEvaluator evaluator;
+                std::vector<LineairDB::StatelessScanRow> filtered;
+                filtered.reserve(scan_result.rows.size());
+                for (auto& row : scan_result.rows) {
+                    bool keep = true;
+                    if (evaluator.parse_row(row.value.data(), row.value.size(),
+                                            num_cols)) {
+                        keep = evaluator.evaluate(filter_expr);
+                    }
+                    if (keep) {
+                        filtered.push_back(std::move(row));
+                    } else {
+                        // (c) Don't ship the rejected row's value, but record its
+                        // (key, tid) so the proxy validates it at commit: a
+                        // concurrent UPDATE flipping it INTO the predicate changes
+                        // its TID and aborts. Range key-list validation alone
+                        // misses such value-only changes. (Physical-mode routes
+                        // the row to TxOccState instead via route_filtered_row.)
+                        route_filtered_row(step_result, step.table_name(), row.key, row.tid);
+                    }
+                }
+                // Re-apply the pushed limit after filtering.
+                if (step.scan_limit() > 0 &&
+                    filtered.size() > step.scan_limit()) {
+                    filtered.resize(step.scan_limit());
+                }
+                scan_result.rows = std::move(filtered);
             }
             for (auto& row : scan_result.rows) {
                 step_result->add_scan_keys(std::move(row.key));
-                step_result->add_scan_values(std::move(row.value));
+                step_result->add_scan_values(project_xfer(row.value));
                 step_result->add_scan_tids(row.tid);
             }
             to_proto_range_versions(scan_result.range_versions,
                                   step_result->mutable_range_versions());
             to_proto_index_reads(scan_result.index_reads,
                                step_result->mutable_index_reads());
+
+            // helios Phase-6 range-hash OCC: for a primary full-range scan in
+            // physical mode (gated), capture a 32-byte footprint digest now so
+            // the read-only commit path can revalidate via re-scan instead of
+            // shipping/checking the O(rows) per-row read set. Gated by
+            // HELIOS_RANGEHASH_OCC; the proxy decides (read-only only) whether
+            // to actually USE it at commit. Computing it for a write txn is
+            // harmless (never validated). One extra range scan at prefetch —
+            // the cost of a footprint-identical digest vs the commit re-scan.
+            static const bool rangehash_on =
+                (std::getenv("HELIOS_RANGEHASH_OCC") != nullptr);
+            // Only full-cover primary ranges (start_key == "") are hashed: the
+            // proxy skips per-row reads exactly for rows served from a
+            // full-cover cache entry, so the hashed set and the skipped set
+            // align. Bounded/own-probe ranges keep per-row validation.
+            if (rangehash_on && tls_current_tx_occ_state != nullptr &&
+                !step.for_each() && step.index_name().empty() &&
+                start_key.empty()) {
+                helios::TxOccState::RangeHash rh;
+                rh.table_name = step.table_name();
+                rh.start_key = start_key;
+                rh.end_key = end_key;
+                rh.row_limit = step.scan_limit();
+                rh.reverse_scan = step.reverse_scan();
+                if (db_manager_->get_database()->ComputePrimaryRangeFootprintHash(
+                        rh.table_name, rh.start_key, rh.end_key, rh.row_limit,
+                        rh.reverse_scan, rh.root)) {
+                    tls_current_tx_occ_state->range_hashes.push_back(std::move(rh));
+                }
+            }
         } else {
             step_result->set_actual_start_key(start_key);
             step_result->set_actual_end_key(end_key);
+            const uint64_t stp_db_t0 = stp ? tp_now() : 0;
             auto scan_result =
                 db_manager_->get_database()->StatelessSecondaryRangeScan(
                     step.table_name(), step.index_name(), start_key, end_key,
                     step.scan_limit(), step.reverse_scan());
+            if (stp) { stp_db_ns += tp_now() - stp_db_t0; ++stp_n_secscan; }
             if (!scan_result.ok) {
-                response.set_ok(false);
-                result = response.SerializeAsString();
+                response.set_ok(false);  // caller flat-encodes/streams this ok=false response
                 return;
             }
             for (auto& row : scan_result.rows) {
                 step_result->add_secondary_keys(std::move(row.secondary_key));
                 step_result->add_scan_keys(std::move(row.primary_key));
-                step_result->add_scan_values(std::move(row.value));
+                step_result->add_scan_values(project_xfer(row.value));
                 step_result->add_scan_tids(row.tid);
             }
             to_proto_range_versions(scan_result.range_versions,
@@ -783,11 +1170,286 @@ void LineairDBRpc::handleTxExecuteReadPlan(const std::string& message,
         }
     }
 
-    result = response.SerializeAsString();
+    // [PLANSZ] per-step composition diagnostic (HELIOS_PLAN_SIZE). Logs, per
+    // step, how many rows/keys/values/result_keys/index_reads/filtered the
+    // server is shipping back, so over-fetch (e.g. the same big table
+    // materialized in many steps) is visible. fflush forces the line out even
+    // when stderr is block-buffered to a redirected file.
+    if (std::getenv("HELIOS_PLAN_SIZE")) {
+        size_t grand_val = 0, grand_rk = 0, grand_keys = 0;
+        for (int si = 0; si < response.results_size(); ++si) {
+            const auto& sr = response.results(si);
+            const auto& st = request.steps(si);
+            size_t valb = 0;
+            for (const auto& v : sr.scan_values()) valb += v.size();
+            valb += sr.value().size();
+            size_t rk = 0;
+            for (const auto& rv : sr.range_versions()) rk += rv.result_keys_size();
+            size_t idxr = sr.index_reads_size();
+            size_t fk = sr.filtered_keys_size();
+            size_t sub = sr.subscans_size();
+            grand_val += valb; grand_rk += rk; grand_keys += sr.scan_keys_size();
+            std::fprintf(stderr,
+                "[PLANSZ] step=%d tbl=%s idx=%s scan=%d foreach=%d "
+                "scan_keys=%d sec_keys=%d val_bytes=%zu result_keys=%zu "
+                "index_reads=%zu filtered=%zu subscans=%zu\n",
+                si, st.table_name().c_str(), st.index_name().c_str(),
+                st.is_scan() ? 1 : 0, st.for_each() ? 1 : 0,
+                sr.scan_keys_size(), sr.secondary_keys_size(), valb, rk,
+                idxr, fk, sub);
+        }
+        std::fprintf(stderr,
+            "[PLANSZ] TOTAL steps=%d scan_keys=%zu val_bytes=%zu "
+            "result_keys=%zu resp_bytes=%zu\n",
+            response.results_size(), grand_keys, grand_val, grand_rk,
+            response.ByteSizeLong());
+        std::fflush(stderr);
+    }
+
+    if (stp) {
+      const uint64_t stp_total = tp_now() - stp_total_start;
+      const uint64_t stp_other = (stp_total > stp_parse_ns + stp_db_ns)
+                                     ? stp_total - stp_parse_ns - stp_db_ns
+                                     : 0;
+      auto ms = [](uint64_t ns){ return ns / 1000000.0; };
+      std::fprintf(stderr,
+          "[STIMEPROF] build total=%.1fms parse=%.1fms db=%.1fms "
+          "proto_copy_other=%.1fms steps=%d (scan=%d ptread=%d sec=%d)\n",
+          ms(stp_total), ms(stp_parse_ns), ms(stp_db_ns), ms(stp_other),
+          response.results_size(), stp_n_scan, stp_n_pointread, stp_n_secscan);
+      std::fflush(stderr);
+    }
+
+    // (No serialization here: the caller flat-encodes `response`, either into a
+    // std::string (buffered) or streamed to the socket (handleTxExecuteReadPlanStreamed).)
+}
+
+// Buffered entry point (kept for handle_rpc dispatch compatibility). The hot
+// path (handle_client) uses handleTxExecuteReadPlanStreamed instead, which
+// avoids building a full flat buffer on top of the proto response.
+void LineairDBRpc::handleTxExecuteReadPlan(const std::string& message,
+                                           std::string& result) {
+    LineairDB::Protocol::TxExecuteReadPlan::Response response;
+    buildExecuteReadPlanResponse(message, response);
+    helios_flat::encode_response(response, &result);
+}
+
+namespace {
+// (A) Streams flat bytes to a socket in ~1MB chunks so the server never holds
+// a full second copy of the (multi-GB) response. Satisfies the codec Sink
+// concept (append(const char*, size_t)).
+struct SocketSink {
+    int fd;
+    bool failed = false;
+    std::string buf;
+    static constexpr size_t kChunk = 1u << 20;  // 1MB
+    explicit SocketSink(int s) : fd(s) { buf.reserve(kChunk); }
+    void send_all(const char* p, size_t n) {
+        size_t sent = 0;
+        while (sent < n) {
+            ssize_t k = ::send(fd, p + sent, n - sent, 0);
+            if (k <= 0) { failed = true; return; }
+            sent += static_cast<size_t>(k);
+        }
+    }
+    void append(const char* p, size_t n) {
+        if (failed) return;
+        buf.append(p, n);
+        if (buf.size() >= kChunk) { send_all(buf.data(), buf.size()); buf.clear(); }
+    }
+    bool finish() {
+        if (!failed && !buf.empty()) { send_all(buf.data(), buf.size()); buf.clear(); }
+        return !failed;
+    }
+};
+inline bool send_all_fd(int fd, const char* p, size_t n) {
+    size_t sent = 0;
+    while (sent < n) {
+        ssize_t k = ::send(fd, p + sent, n - sent, 0);
+        if (k <= 0) return false;
+        sent += static_cast<size_t>(k);
+    }
+    return true;
+}
+}  // namespace
+
+bool LineairDBRpc::handleTxExecuteReadPlanStreamed(int socket, uint64_t sender_id,
+                                                   const std::string& message) {
+    const bool memprof = std::getenv("HELIOS_MEMPROF") != nullptr;
+    const size_t je_before = memprof ? je_stat("stats.allocated") : 0;
+
+    // ---- helios PHYSICAL OCC (Step 5) setup --------------------------------
+    // Default = physical (Codex 2026-05-28: stateless.h:64 comment "always
+    // emits the physical form" was stale; logical mode shipped
+    // millions of result_keys per Q1/Q21 full scan and revalidated them on
+    // commit. Set HELIOS_LOGICAL_OCC=1 to fall back to the legacy logical
+    // path for A/B comparison.)
+    static const bool physical_mode_enabled =
+        (std::getenv("HELIOS_LOGICAL_OCC") == nullptr);
+    static std::atomic<std::uint64_t> next_tx_occ_key{1};
+    helios::TxOccState phys_state;
+    std::uint64_t phys_key = 0;
+    std::shared_ptr<LineairDB::Database> db_for_physical;
+    if (physical_mode_enabled && db_manager_) {
+        db_for_physical = db_manager_->get_database();
+        if (db_for_physical) {
+            phys_key = next_tx_occ_key.fetch_add(1, std::memory_order_relaxed);
+            phys_state.tx_key = phys_key;
+            phys_state.connection_fd = socket;
+            // Set BEFORE the build: scans will see physical mode and emit
+            // node_versions (instead of key lists) into per-step
+            // range_versions; route_filtered_row will route filter-rejected
+            // rows into phys_state.filtered_rows instead of proto.
+            tls_current_tx_occ_state = &phys_state;
+            db_for_physical->SetPhysicalValidationMode(true);
+        }
+    }
+
+    LineairDB::Protocol::TxExecuteReadPlan::Response response;
+    buildExecuteReadPlanResponse(message, response);
+
+    // ---- helios PHYSICAL OCC (Step 5) post-build hook ---------------------
+    // Simpler than the initial design: we DO NOT strip range_versions /
+    // index_reads from the wire. In physical mode those are already small
+    // (no result_keys; just owner_ptr/node_ptr/version of size ~24B per
+    // range, plus tombstone IndexValidationEntries). The proxy echoes them
+    // normally at commit, and the existing ValidateAndCommit path picks up
+    // physical entries (end_key.empty() at database_impl.h:1122).
+    //
+    // The TxOccState role is reduced to: (1) pin the masstree epoch, (2)
+    // retain filtered_rows server-side so the proxy never sees the 5.9M
+    // filter-rejected (key,tid) pairs. The proxy's wire OCC data therefore
+    // shrinks from O(rows) result_keys to O(leaves) node-versions, which is
+    // exactly the Masstree-paper-correct cost.
+    if (db_for_physical != nullptr) {
+        const bool pinned = db_for_physical
+                                ->RegisterTxEpochPinFromCurrentThread(phys_key);
+        // Codex P1 #1 fix: the pin MUST be kept whenever ANY physical-mode
+        // scan ran, regardless of filtered_rows. range_versions still carry
+        // raw node_ptrs on the wire; without the pin, RCU can reclaim those
+        // leaves between now and commit -> UAF when ValidateAndCommit
+        // dereferences them at database_impl.h:1152.
+        if (pinned) {
+            phys_state.pinned_epoch = db_for_physical->GetTxPinFloor();
+            const std::uint64_t ttl_ms = db_for_physical->GetTxPinTtlMs();
+            if (ttl_ms > 0) {
+                using clk = std::chrono::steady_clock;
+                const auto now_ns = std::chrono::duration_cast<
+                    std::chrono::nanoseconds>(clk::now().time_since_epoch())
+                                        .count();
+                phys_state.expires_at_ns = static_cast<std::uint64_t>(now_ns) +
+                                           ttl_ms * 1000000ull;
+            }
+            helios::GlobalTxOccStore().Insert(std::move(phys_state));
+            response.set_tx_occ_key(phys_key);
+        }
+        // Reset thread-locals/flag regardless of success.
+        tls_current_tx_occ_state = nullptr;
+        db_for_physical->SetPhysicalValidationMode(false);
+    }
+    // ---- end of Step 5 hook ----
+    if (memprof) {
+        const size_t je_after = je_stat("stats.allocated");
+        const size_t je_res = je_stat("stats.resident");
+        const uint64_t proto_bytes = response.SpaceUsedLong();
+        const uint64_t flat_bytes = helios_flat::flat_size(response);
+        std::fprintf(stderr,
+            "[MEMPROF] read_plan: je_allocated baseline=%.2fGB after_build=%.2fGB "
+            "delta(=proto+scratch)=%.2fGB | proto SpaceUsedLong=%.2fGB | "
+            "flat_size=%.2fGB | je_resident=%.2fGB\n",
+            je_before / 1e9, je_after / 1e9, (double)(je_after - je_before) / 1e9,
+            proto_bytes / 1e9, flat_bytes / 1e9, je_res / 1e9);
+        std::fflush(stderr);
+    }
+    // Mirror handle_rpc: close the masstree RCU epoch now that all KV reads are
+    // done (streaming below touches no KV state).
+    if (db_manager_) {
+        auto db = db_manager_->get_database();
+        if (db) db->ReleaseMasstreeThreadEpoch();
+    }
+    // (②) Optionally LZ4-compress the flat payload (env HELIOS_RPC_COMPRESS).
+    // Payload is always CODEC-tagged: [0x00][flat] (raw) or [0x01][raw_total:8]
+    // [chunks] (LZ4). The proxy strips the tag. Compression holds only the
+    // compressed bytes (CompressSink), not the full flat buffer.
+    const bool do_lz4 = std::getenv("HELIOS_RPC_COMPRESS") != nullptr &&
+                        helios_zip::lz4_available();
+    // Step F (Codex 2026-05-29) granular outer timer for the encode+send path.
+    const bool sthp = (std::getenv("HELIOS_SERVER_TIMEPROF") != nullptr);
+    auto sthp_now = []() -> uint64_t {
+      timespec t; clock_gettime(CLOCK_MONOTONIC, &t);
+      return uint64_t(t.tv_sec) * 1000000000ull + t.tv_nsec;
+    };
+    if (do_lz4) {
+        const uint64_t t_enc_start = sthp ? sthp_now() : 0;
+        helios_zip::CompressSink cs;
+        helios_flat::encode_response_into(response, cs);
+        cs.finish();
+        const uint64_t t_enc_end = sthp ? sthp_now() : 0;
+        if (!cs.failed) {
+            std::string hdr;
+            hdr.push_back(static_cast<char>(helios_zip::kLZ4));
+            helios_zip::put_u64(hdr, cs.raw_total_);
+            const uint64_t total = hdr.size() + cs.out_.size();
+            if (!MessageHandler::send_header(socket, sender_id,
+                                             MessageType::TX_EXECUTE_READ_PLAN,
+                                             total))
+                return false;
+            if (!send_all_fd(socket, hdr.data(), hdr.size())) return false;
+            const bool sok = send_all_fd(socket, cs.out_.data(), cs.out_.size());
+            if (sthp) {
+              const uint64_t t_send_end = sthp_now();
+              auto ms = [](uint64_t ns){ return ns / 1000000.0; };
+              std::fprintf(stderr,
+                  "[STIMEPROF] xmit lz4 enc=%.1fms send=%.1fms raw=%.2fMB "
+                  "compressed=%.2fMB\n",
+                  ms(t_enc_end - t_enc_start), ms(t_send_end - t_enc_end),
+                  cs.raw_total_ / 1024.0 / 1024.0,
+                  cs.out_.size() / 1024.0 / 1024.0);
+              std::fflush(stderr);
+            }
+            return sok;
+        }
+        // compression failed -> fall through to raw
+    }
+    // RAW: [0x00] + streamed flat.
+    const uint64_t t_size_start = sthp ? sthp_now() : 0;
+    const uint64_t sz = 1 + helios_flat::flat_size(response);
+    const uint64_t t_size_end = sthp ? sthp_now() : 0;
+    if (!MessageHandler::send_header(socket, sender_id,
+                                     MessageType::TX_EXECUTE_READ_PLAN, sz)) {
+        return false;
+    }
+    const char codec_raw = static_cast<char>(helios_zip::kRaw);
+    if (!send_all_fd(socket, &codec_raw, 1)) return false;
+    SocketSink sink(socket);
+    helios_flat::encode_response_into(response, sink);
+    const bool fok = sink.finish();
+    if (sthp) {
+      const uint64_t t_send_end = sthp_now();
+      auto ms = [](uint64_t ns){ return ns / 1000000.0; };
+      std::fprintf(stderr,
+          "[STIMEPROF] xmit raw size_walk=%.1fms send=%.1fms bytes=%.2fMB\n",
+          ms(t_size_end - t_size_start), ms(t_send_end - t_size_end),
+          (sz - 1) / 1024.0 / 1024.0);
+      std::fflush(stderr);
+    }
+    return fok;
 }
 
 void LineairDBRpc::handleTxValidateAndCommit(const std::string& message,
                                              std::string& result) {
+    // Codex Step 5/6 P2 fix: sweep stale TxOccState entries opportunistically.
+    // The corresponding masstree pin sweeper runs every ~40ms via
+    // MasstreeAdvanceEpoch; this complements it so server-side filtered_rows
+    // don't leak if no commits arrive for a while.
+    {
+        using clk = std::chrono::steady_clock;
+        const auto now_ns =
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                clk::now().time_since_epoch())
+                .count();
+        helios::GlobalTxOccStore().SweepExpired(static_cast<std::uint64_t>(now_ns));
+    }
     LineairDB::Protocol::TxValidateAndCommit::Request request;
     LineairDB::Protocol::TxValidateAndCommit::Response response;
 
@@ -846,12 +1508,87 @@ void LineairDBRpc::handleTxValidateAndCommit(const std::string& message,
         range_reads.push_back(std::move(entry));
     }
 
+    // ---- helios PHYSICAL OCC (Step 6) commit merge ------------------------
+    // When the proxy echoes a tx_occ_key, the server retained filtered_rows
+    // server-side at prefetch time. Take them, validate the pin is still
+    // alive (TTL / connection-close did not expire it), and append each as a
+    // stateless point read so ValidateAndCommit re-checks its TID. The pin
+    // is released regardless so masstree reclamation can resume. range/index
+    // entries come on the wire as before (small in physical mode).
+    std::uint64_t tx_occ_key = request.tx_occ_key();
+    bool tx_occ_expired = false;
+    bool tx_occ_lease_held = false;
+    // helios Phase-6 range-hash OCC: retained footprint digests to re-validate
+    // (read-only txns only; see use_range_hash). Moved out of the TxOccState
+    // before it is consumed.
+    std::vector<helios::TxOccState::RangeHash> range_hashes_to_check;
+    const bool use_range_hash = request.use_range_hash();
+    auto db = db_manager_->get_database();
+    if (tx_occ_key != 0) {
+        // Codex P1 #3 fix: atomically LEASE the pin so the TTL sweep cannot
+        // reclaim leaves we are about to dereference. Failure = pin already
+        // gone (TTL or close-hook) -> abort as expired.
+        if (db && db->LeaseTxPinForValidation(tx_occ_key)) {
+            tx_occ_lease_held = true;
+        }
+        auto state_opt = helios::GlobalTxOccStore().Take(tx_occ_key);
+        if (!tx_occ_lease_held || !state_opt.has_value()) {
+            tx_occ_expired = true;
+        } else {
+            auto& state = *state_opt;
+            // table_name is carried per-row (FilteredRow.table_name).
+            reads.reserve(reads.size() + state.filtered_rows.size());
+            for (auto& fr : state.filtered_rows) {
+                reads.push_back({fr.table_name, fr.key, fr.tid, true});
+            }
+            if (use_range_hash) {
+                range_hashes_to_check = std::move(state.range_hashes);
+            }
+        }
+    }
+
+    // helios Phase-6: re-derive each retained primary full-range footprint
+    // digest and compare to the prefetch capture. A mismatch means a value
+    // update / insert / delete touched the range between prefetch and commit
+    // → abort. This replaces the O(rows) per-row read set the proxy skipped
+    // for read-only txns. Done before ValidateAndCommit; for a read-only txn
+    // (no writes to install) there is no write-after-stale-read window, so the
+    // re-scan need not be inside the locked phase (Codex 2026-05-29).
+    bool range_hash_ok = true;
+    std::string range_hash_abort;
+    if (!tx_occ_expired && use_range_hash && db) {
+        for (const auto& rh : range_hashes_to_check) {
+            uint8_t cur[32];
+            if (!db->ComputePrimaryRangeFootprintHash(
+                    rh.table_name, rh.start_key, rh.end_key, rh.row_limit,
+                    rh.reverse_scan, cur)) {
+                range_hash_ok = false;
+                range_hash_abort = "range_hash_recompute_failed";
+                break;
+            }
+            if (std::memcmp(cur, rh.root, 32) != 0) {
+                range_hash_ok = false;
+                range_hash_abort = "range_hash_mismatch";
+                break;
+            }
+        }
+    }
+
     std::string abort_reason;
-    const bool committed =
+    const bool committed = !tx_occ_expired && range_hash_ok &&
         db_manager_->get_database()->ValidateAndCommit(reads, writes, si_ops,
                                                        range_reads,
                                                        index_reads,
                                                        &abort_reason);
+    if (!range_hash_ok && abort_reason.empty()) abort_reason = range_hash_abort;
+    // Codex P1 #2 fix: release the pin AFTER ValidateAndCommit (which is
+    // when node_ptrs covered by the pin are dereferenced). Drop the lease
+    // first so subsequent sweep can reclaim.
+    if (tx_occ_lease_held && db) {
+        db->DropTxPinValidationLease(tx_occ_key);
+        db->ReleaseTxEpochPin(tx_occ_key);
+    }
+    if (tx_occ_expired) abort_reason = "tx_occ_key expired";
     response.set_committed(committed);
     if (!committed && !abort_reason.empty()) {
         response.set_abort_reason(abort_reason);

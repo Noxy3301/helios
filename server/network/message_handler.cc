@@ -26,23 +26,32 @@ bool MessageHandler::receive_message(int socket, uint64_t& sender_id,
     // Convert message header (network order -> host order)
     sender_id = be64toh(net_header.sender_id);
     message_type = static_cast<MessageType>(ntohl(net_header.message_type));
-    uint32_t payload_size = ntohl(net_header.payload_size);
+    uint64_t payload_size = be64toh(net_header.payload_size);
 
     LOG_DEBUG("Received header: sender_id=%lu, message_type=%u, payload_size=%u", 
               sender_id, static_cast<uint32_t>(message_type), payload_size);
 
-    // Read payload (if exists)
+    // Read payload (if exists). Loop in bounded chunks: a single recv() with
+    // MSG_WAITALL is not reliable for multi-GB counts (it can return short, and
+    // some kernels cap a single transfer), so drive it ourselves.
     payload.clear();
     if (payload_size > 0) {
         payload.resize(payload_size);
-        ssize_t body_read = recv(socket, &payload[0], payload_size, MSG_WAITALL);
-        if (body_read != static_cast<ssize_t>(payload_size)) {
-            if (body_read < 0) {
-                LOG_ERROR("Failed to receive message payload");
-            } else {
-                LOG_DEBUG("Client disconnected while receiving payload");
+        uint64_t got = 0;
+        while (got < payload_size) {
+            size_t chunk = static_cast<size_t>(payload_size - got);
+            if (chunk > (1u << 30)) chunk = (1u << 30);  // 1GB per recv
+            ssize_t n = recv(socket, &payload[got], chunk, MSG_WAITALL);
+            if (n <= 0) {
+                if (n < 0) {
+                    LOG_ERROR("Failed to receive message payload (got %lu/%lu)",
+                              (unsigned long)got, (unsigned long)payload_size);
+                } else {
+                    LOG_DEBUG("Client disconnected while receiving payload");
+                }
+                return false;
             }
-            return false;
+            got += static_cast<uint64_t>(n);
         }
     }
 
@@ -54,10 +63,11 @@ bool MessageHandler::send_response(int socket, uint64_t sender_id,
     LOG_DEBUG("Sending response (%zu bytes)", payload.size());
     
     // Prepare response header
-    MessageHeader response_header;
+    MessageHeader response_header{};
     response_header.sender_id = htobe64(sender_id);
     response_header.message_type = htonl(static_cast<uint32_t>(message_type));
-    response_header.payload_size = htonl(static_cast<uint32_t>(payload.size()));
+    response_header._pad = 0;
+    response_header.payload_size = htobe64(static_cast<uint64_t>(payload.size()));
 
     // Combine header and response
     size_t response_total_size = sizeof(response_header) + payload.size();
@@ -85,10 +95,11 @@ bool MessageHandler::send_response_writev(int socket, uint64_t sender_id,
                                           MessageType message_type, const std::string& payload) {
     LOG_DEBUG("Sending response via writev (%zu bytes)", payload.size());
 
-    MessageHeader response_header;
+    MessageHeader response_header{};
     response_header.sender_id = htobe64(sender_id);
     response_header.message_type = htonl(static_cast<uint32_t>(message_type));
-    response_header.payload_size = htonl(static_cast<uint32_t>(payload.size()));
+    response_header._pad = 0;
+    response_header.payload_size = htobe64(static_cast<uint64_t>(payload.size()));
 
     struct iovec iov[2];
     iov[0].iov_base = &response_header;
@@ -123,5 +134,22 @@ bool MessageHandler::send_response_writev(int socket, uint64_t sender_id,
     }
 
     LOG_DEBUG("writev response sent successfully");
+    return true;
+}
+
+bool MessageHandler::send_header(int socket, uint64_t sender_id,
+                                 MessageType message_type, uint64_t payload_size) {
+    MessageHeader header{};
+    header.sender_id = htobe64(sender_id);
+    header.message_type = htonl(static_cast<uint32_t>(message_type));
+    header._pad = 0;
+    header.payload_size = htobe64(payload_size);
+    const char* p = reinterpret_cast<const char*>(&header);
+    size_t total = sizeof(header), sent = 0;
+    while (sent < total) {
+        ssize_t n = send(socket, p + sent, total - sent, 0);
+        if (n <= 0) { LOG_ERROR("send_header failed"); return false; }
+        sent += static_cast<size_t>(n);
+    }
     return true;
 }

@@ -9,6 +9,7 @@
 #include "../protocol/message.hh"
 #include "../storage/database_manager.hh"
 #include "../storage/transaction_manager.hh"
+#include "lineairdb.pb.h"  // for the TxExecuteReadPlan::Response type in the API below
 
 // Server-wide table row count tracker, shared across all connections.
 struct TableRowCounts {
@@ -41,6 +42,12 @@ public:
     void handle_rpc(uint64_t sender_id, MessageType message_type,
                    const std::string& message, std::string& result);
 
+    // (A) Streams the flat-encoded read-plan response directly to the socket,
+    // so the server never materializes a full (multi-GB) flat buffer in
+    // addition to the proto response. Returns false on socket failure.
+    bool handleTxExecuteReadPlanStreamed(int socket, uint64_t sender_id,
+                                         const std::string& message);
+
 private:
     std::shared_ptr<DatabaseManager> db_manager_;
     std::shared_ptr<TransactionManager> tx_manager_;
@@ -59,6 +66,11 @@ private:
     void handleTxStatelessRangeScan(const std::string& message, std::string& result);
     void handleTxStatelessSecondaryRangeScan(const std::string& message, std::string& result);
     void handleTxExecuteReadPlan(const std::string& message, std::string& result);
+    // Builds the proto read-plan response (shared by the buffered and streamed
+    // entry points). All the scan/bind work lives here.
+    void buildExecuteReadPlanResponse(
+        const std::string& message,
+        LineairDB::Protocol::TxExecuteReadPlan::Response& response);
     void handleTxValidateAndCommit(const std::string& message, std::string& result);
     void handleTxWrite(const std::string& message, std::string& result);
     void handleTxDelete(const std::string& message, std::string& result);
