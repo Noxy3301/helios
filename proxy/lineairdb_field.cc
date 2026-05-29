@@ -71,6 +71,17 @@ void LineairDBField::set_lineairdb_field(
       srcMysql);
 }
 
+// alloc-churn #5: little-endian byte decode WITHOUT std::variant/std::visit.
+// make_mysql_table_row always reads from const std::byte*, and the original
+// convert_bytes_to_numeric does a std::visit PER BYTE (~192M visits for Q21
+// SF=1 = ~16 cols x ~2 decodes x 6M rows). This direct loop drops that overhead.
+static inline size_t decode_le_bytes(const std::byte *p, size_t len) {
+  size_t n = 0;
+  for (size_t i = 0; i < len; ++i)
+    n |= static_cast<size_t>(static_cast<unsigned char>(p[i])) << (CHAR_BIT * i);
+  return n;
+}
+
 void LineairDBField::make_mysql_table_row(const std::byte *const ldbRawData,
                                           const size_t length) {
   // Zero-copy parse: record each field as a string_view pointing into
@@ -81,8 +92,7 @@ void LineairDBField::make_mysql_table_row(const std::byte *const ldbRawData,
   for (size_t offset = 0; offset < length;) {
     const auto ldbField = ldbRawData + offset;
 
-    byteSize =
-        static_cast<char>(convert_bytes_to_numeric(ldbField, sizeof(byteSize)));
+    byteSize = static_cast<char>(decode_le_bytes(ldbField, sizeof(byteSize)));
 
     if (byteSize == noValue) {
       if (offset != 0) {
@@ -96,7 +106,7 @@ void LineairDBField::make_mysql_table_row(const std::byte *const ldbRawData,
         static_cast<size_t>(static_cast<unsigned char>(byteSize));
 
     const size_t valueLength =
-        convert_bytes_to_numeric(ldbField + sizeof(byteSize), byteSizeForRead);
+        decode_le_bytes(ldbField + sizeof(byteSize), byteSizeForRead);
 
     assert(valueLength <= maxValueLength);
     const auto valueData = ldbField + byteSizeForRead + sizeof(byteSize);

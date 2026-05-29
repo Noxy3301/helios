@@ -15,3 +15,10 @@ scratch。record_stateless_read の dedup find も scratch(srr_scratch_)、新�
 測定(SF=1, 22/22 md5 OK): Q21 20367ms→19940ms(~-2%)/ mysqld 4.19GB 同。alloc は jemalloc 小確保が
 速く(~50ns×6M≈0.3s)効果は限定。lookup の self の大半は hash+探索+値コピーで、本丸は #2 ankerl。
 Codex GO(pointer lifetime/ scratch aliasing / dedup 意味論 / THD-scoped thread-safety 確認、findings なし)。
+
+## #5 make_mysql_table_row: variant→inline LE decode — 2026-05-29 → 採用(小勝ち)
+convert_bytes_to_numeric は std::variant をバイト毎に std::visit(Q21 SF=1 で ~192M 回)。
+make_mysql_table_row は常に const std::byte* なので variant 無しの decode_le_bytes に置換(他 caller 用の
+元関数は残す)。row vector は member+clear で容量保持済のため reserve は不要(Codex 指摘)。
+測定(22/22 md5 OK): q1 20060→19299, q7 15792→14956, q18 18116→17961(各~0.7s)、Q21 はノイズ範囲。
+Codex GO(decode 等価、4byte 高位ビットの旧 int-promotion UB をむしろ修正)。
