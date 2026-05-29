@@ -151,3 +151,27 @@ diff    -10993ms  -2.73GB   (-26% time, -28% mysqld peak)
 予想(ingest copy)以上の効果。local_read_set_ は 6M-entry unordered_map で、構築コスト
 (6M hash + node malloc + value 文字列 copy ~2.7GB)自体が wall に乗っていたため。
 OCC: positive-covering が per-row TID を記録、scan 自身は range validation。22/22 md5 OK で実証。
+
+### Step 3 (borrowed-span serve, InnoDB fetch-cache analog) — 2026-05-29 → **採用(大勝ち)**
+Codex スコープ判断: A(完全 zero-copy)/B(arena-copy)は却下、**C(contained borrowed span)推奨**。
+full-table primary scan を prefetch range entry から直接 serve(scanned_keys_/scanned_values_/
+scan_cache_ の多重 materialize を撤廃)= InnoDB の fetch cache + compact-record pointer access 相当。
+- tx->borrow_fullcover_pk_scan(): gate=oneshot & pending-write 無し & TRUE full-cover entry
+  (start_key=="" / end_key==16xff / filter 無 / row_limit 0 / !reverse / row_tids 1:1)。
+  OCC を一度だけ記録(copy path と同一: probe_occ_already_recorded + per-row read[range-hash時skip] +
+  activate_range_validation)。{ok, entry_idx, count} を返す。
+- handler: rnd_init で reset、fetch_next_batch で borrow 優先、rnd_next は borrowed_value(pos) から
+  set_fields 直接、rnd_pos は borrowed_value_for_key(pk) を二分探索。HELIOS_BORROW_SERVE=0 で opt-out。
+- Codex 実装レビュー GO(lifetime: local_range_scans_ は append-only でindex安全 / OCC一致 / rnd_pos
+  forward-only / empty OK)。指摘2点を反映: `#include <cstring>`、borrow を SQLCOM_SELECT に明示gate。
+
+測定(SF=1, 全22 md5 vs InnoDB = 22/22 OK):
+```
+       Step4a              Step3(borrow)
+Q21    28657ms / 6.94GB  → 22805ms / 4.84GB   (-20% time, -2.1GB)
+Q15    23111ms / 5.96GB  → 11144ms / 2.83GB   (-52% time, -3.1GB)
+Q1     20133ms / 4.57GB  → 18955ms / 4.58GB   (small)
+Q18    18655ms / 5.06GB  → 18683ms / 5.07GB   (不変: secondary 主体で primary full-cover 非該当)
+```
+attacks transient serve copy + handler 側 materialize(scanned_*/scan_cache_)。常駐 rows は不変
+(B/A が必要、保留)。累積 Q21 SF=1: 52s→22.8s(2.3x)/ mysqld 23GB→4.84GB(4.75x)。

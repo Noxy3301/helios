@@ -135,6 +135,11 @@ private:
   size_t buffer_position_{0};
   std::string last_batch_key_;
   bool scan_exhausted_{false};
+  // Phase-7 Step3: when a full-table scan can be served directly from its
+  // prefetch range entry (InnoDB fetch-cache analog), this holds the borrow
+  // handle; rnd_next/rnd_pos then serve from it instead of materializing
+  // scanned_keys_/scanned_values_/scan_cache_. ok=false => copy path is used.
+  LineairDBTransaction::BorrowedScan borrowed_scan_;
 
   // Search plan
   IndexSearchPlan current_plan_;

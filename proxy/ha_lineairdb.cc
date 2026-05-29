@@ -2563,6 +2563,7 @@ int ha_lineairdb::rnd_init(bool) {
   buffer_position_ = 0;
   last_batch_key_.clear();
   scan_exhausted_ = false;
+  borrowed_scan_ = LineairDBTransaction::BorrowedScan{};  // Step3: reset borrow
   last_fetched_primary_key_.clear();
   current_position_ = 0;
   stats.records = 0;
@@ -2651,6 +2652,31 @@ bool ha_lineairdb::fetch_next_batch() {
   scan_cache_.clear();
   buffer_position_ = 0;
 
+  // Phase-7 Step3 (InnoDB fetch-cache analog): if this full-table scan can be
+  // served directly from its prefetch range entry, borrow it — no per-row
+  // scanned_keys_/scanned_values_ copy and no 6M-entry scan_cache_ map. OCC
+  // obligations for the range are recorded once inside borrow_fullcover_pk_scan.
+  // rnd_next/rnd_pos read rows via the borrow accessors. Falls back to the copy
+  // path below when not borrowable (filtered/bounded/own-writes/non-oneshot).
+  // Gate to pure SELECT (Codex review): the borrow invariant is "read-only
+  // statement, no future own writes". thd_can_use_oneshot allows UPDATE/DELETE,
+  // whose later own-writes a borrowed (un-merged) span would not reflect; those
+  // statements take the copy path. (Mirrors the Step4a SELECT gate.)
+  THD *const thd_fnb = ha_thd();
+  const bool select_scan = thd_fnb != nullptr && thd_fnb->lex != nullptr &&
+                           thd_fnb->lex->sql_command == SQLCOM_SELECT;
+  borrowed_scan_ =
+      select_scan ? tx->borrow_fullcover_pk_scan()
+                  : LineairDBTransaction::BorrowedScan{};
+  if (borrowed_scan_.ok) {
+    if (tx->is_aborted()) {
+      thd_mark_transaction_to_rollback(ha_thd(), 1);
+      DBUG_RETURN(false);
+    }
+    scan_exhausted_ = true;
+    DBUG_RETURN(borrowed_scan_.count > 0);
+  }
+
   // Proxy: fetch all rows via RPC in one call (no batched Scan callback)
   auto key_value_pairs = tx->get_matching_keys_and_values_from_prefix("");
 
@@ -2712,7 +2738,9 @@ int ha_lineairdb::rnd_next(uchar *buf) {
   ha_statistic_increment(&System_status_var::ha_read_rnd_next_count);
   HTP_SCOPE(rnd_next);
 
-  if (buffer_position_ >= scanned_keys_.size()) {
+  // Lazily fetch (or borrow) on the first call / batch boundary. In borrow mode
+  // scanned_keys_ stays empty, so guard on !borrowed_scan_.ok to avoid re-fetch.
+  if (!borrowed_scan_.ok && buffer_position_ >= scanned_keys_.size()) {
     if (scan_exhausted_) {
       DBUG_RETURN(HA_ERR_END_OF_FILE);
     }
@@ -2725,6 +2753,30 @@ int ha_lineairdb::rnd_next(uchar *buf) {
       scan_exhausted_ = true;
       DBUG_RETURN(HA_ERR_END_OF_FILE);
     }
+  }
+
+  // Phase-7 Step3 borrow path: serve the row straight from the prefetch range
+  // entry (no scanned_keys_/scanned_values_ copy). last_fetched_primary_key_ is
+  // kept as an owning copy because position() needs it after rnd_end().
+  if (borrowed_scan_.ok) {
+    if (buffer_position_ >= borrowed_scan_.count) {
+      DBUG_RETURN(HA_ERR_END_OF_FILE);
+    }
+    auto tx = get_transaction(ha_thd());
+    const std::string *key = tx->borrowed_key(borrowed_scan_, buffer_position_);
+    const std::string *value =
+        tx->borrowed_value(borrowed_scan_, buffer_position_);
+    buffer_position_++;
+    if (key == nullptr || value == nullptr) {
+      DBUG_RETURN(HA_ERR_END_OF_FILE);
+    }
+    int error = set_fields_from_lineairdb(
+        buf, reinterpret_cast<const std::byte *>(value->data()), value->size());
+    if (error == 0) {
+      last_fetched_primary_key_ = *key;
+    }
+    current_position_++;
+    DBUG_RETURN(error);
   }
 
   auto &key = scanned_keys_[buffer_position_];
@@ -2792,6 +2844,24 @@ int ha_lineairdb::rnd_pos(uchar *buf, uchar *pos) {
 
   if (primary_key.empty()) {
     return HA_ERR_KEY_NOT_FOUND;
+  }
+
+  // Phase-7 Step3 borrow path: re-read by binary-searching the borrowed range
+  // entry's sorted rows (InnoDB Buffer-Pool re-read analog) instead of a
+  // separate scan_cache_ map. Falls through to tx->read if not found.
+  if (borrowed_scan_.ok) {
+    auto tx = get_transaction(ha_thd());
+    const std::string *value =
+        tx->borrowed_value_for_key(borrowed_scan_, primary_key);
+    if (value != nullptr) {
+      if (set_fields_from_lineairdb(
+              buf, reinterpret_cast<const std::byte *>(value->data()),
+              value->size())) {
+        return HA_ERR_OUT_OF_MEM;
+      }
+      last_fetched_primary_key_ = primary_key;
+      return 0;
+    }
   }
 
   // Return from scan_cache_ if available (equivalent of hitting InnoDB's Buffer

@@ -7,6 +7,7 @@
 #include <unordered_set>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>  // std::strcmp (HELIOS_BORROW_SERVE / range-hash gates)
 
 namespace {
 
@@ -1031,6 +1032,86 @@ LineairDBTransaction::get_matching_keys_and_values_from_prefix(std::string prefi
     merge_pending_rows_into_prefix_scan(pairs, prefix);
   }
   return pairs;
+}
+
+// ---- Phase-7 Step3: borrowed-span serve (InnoDB fetch-cache analog) --------
+LineairDBTransaction::BorrowedScan
+LineairDBTransaction::borrow_fullcover_pk_scan() {
+  BorrowedScan h;
+  // Opt-out: HELIOS_BORROW_SERVE=0 falls back to the copy path (for A/B).
+  static const char* bs_env = std::getenv("HELIOS_BORROW_SERVE");
+  if (bs_env != nullptr && std::strcmp(bs_env, "0") == 0) return h;
+  if (table_is_not_chosen()) return h;
+  execute_pending_oneshot_plan();
+  if (!oneshot_mode_ || is_aborted_) return h;
+  // Own-write merge cannot reflect into a borrowed (read-only) span; the copy
+  // path handles writes via merge_pending_rows_into_range_scan.
+  if (has_pending_ops_for_table(db_table_key)) return h;
+
+  // Find a TRUE full-cover unfiltered unlimited forward primary entry (the
+  // step0 S: scan), registered under the empty start_key bucket. Mirrors the
+  // full-cover gate in lookup_local_range_scan / slice_range_entry_fast.
+  static const std::string kFullEnd16(16, '\xff');
+  auto fit = range_scan_index_.find(std::string());
+  if (fit == range_scan_index_.end()) return h;
+  for (auto rit = fit->second.rbegin(); rit != fit->second.rend(); ++rit) {
+    const LocalRangeScanEntry& e = local_range_scans_[*rit];
+    if (e.table_name != db_table_key) continue;
+    if (!e.start_key.empty()) continue;
+    if (e.reverse_scan) continue;
+    if (e.row_limit != 0) continue;
+    if (!e.filter_serialized.empty()) continue;
+    if (e.end_key != kFullEnd16) continue;
+    if (e.row_tids.size() != e.rows.size()) continue;  // need 1:1 TIDs for OCC
+    // Record OCC obligations for the whole range ONCE (identical to the copy
+    // path in get_matching_keys_and_values_in_range): per-row TIDs unless this
+    // is a read-only range-hash full-cover serve, plus range validation.
+    if (!probe_occ_already_recorded(db_table_key, "", std::string(), kFullEnd16,
+                                    0, false)) {
+      const bool rh_skip = rangehash_eligible_ && e.start_key.empty();
+      if (!rh_skip)
+        for (size_t i = 0; i < e.rows.size() && i < e.row_tids.size(); ++i)
+          record_stateless_read(db_table_key, e.rows[i].first, true,
+                                e.row_tids[i]);
+      activate_range_validation(e.range_versions, e.index_reads);
+    }
+    h.ok = true;
+    h.entry_idx = *rit;
+    h.count = e.rows.size();
+    rpc_trace_.record_local_view(
+        trace_count_event("borrow_fullcover_serve", db_table_key, h.count));
+    return h;
+  }
+  return h;
+}
+
+const std::string* LineairDBTransaction::borrowed_value(const BorrowedScan& h,
+                                                        size_t pos) const {
+  if (!h.ok || h.entry_idx >= local_range_scans_.size()) return nullptr;
+  const LocalRangeScanEntry& e = local_range_scans_[h.entry_idx];
+  if (pos >= e.rows.size()) return nullptr;
+  return &e.rows[pos].second;
+}
+
+const std::string* LineairDBTransaction::borrowed_key(const BorrowedScan& h,
+                                                      size_t pos) const {
+  if (!h.ok || h.entry_idx >= local_range_scans_.size()) return nullptr;
+  const LocalRangeScanEntry& e = local_range_scans_[h.entry_idx];
+  if (pos >= e.rows.size()) return nullptr;
+  return &e.rows[pos].first;
+}
+
+const std::string* LineairDBTransaction::borrowed_value_for_key(
+    const BorrowedScan& h, const std::string& pk) const {
+  if (!h.ok || h.entry_idx >= local_range_scans_.size()) return nullptr;
+  const LocalRangeScanEntry& e = local_range_scans_[h.entry_idx];
+  // rows are sorted ascending by key (entry invariant; the borrow gate forbids
+  // reverse), so binary-search for the exact PK (rnd_pos re-read).
+  auto key_less = [](const std::pair<std::string, std::string>& r,
+                     const std::string& k) { return r.first < k; };
+  auto it = std::lower_bound(e.rows.begin(), e.rows.end(), pk, key_less);
+  if (it == e.rows.end() || it->first != pk) return nullptr;
+  return &it->second;
 }
 
 std::optional<std::string>

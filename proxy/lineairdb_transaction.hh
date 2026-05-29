@@ -44,6 +44,33 @@ public:
       bool reverse_scan = false);
   std::vector<std::pair<std::string, std::string>> get_matching_keys_and_values_from_prefix(
       std::string prefix);
+
+  // Phase-7 Step3 (borrowed-span serve): the helios analog of InnoDB's fetch
+  // cache + compact-record pointer access. A full-table primary scan is served
+  // DIRECTLY from its prefetch range entry (no slice copy, no per-row
+  // scanned_keys_/scanned_values_/scan_cache_ materialization). OCC obligations
+  // for the whole range are recorded once at borrow time.
+  struct BorrowedScan {
+    bool ok = false;
+    size_t entry_idx = 0;  // index into local_range_scans_ (append-only: stable)
+    size_t count = 0;      // number of rows in the borrowed entry
+  };
+  // Borrow the full-table ("" .. max-sentinel) primary scan for direct serving,
+  // recording its OCC obligations once. Returns ok=false (caller falls back to
+  // the copy path) unless ALL preconditions hold: oneshot mode, a TRUE
+  // full-cover unfiltered unlimited forward entry with row_tids 1:1, and NO
+  // pending writes for the table (own-write merge can't reflect into a borrow).
+  BorrowedScan borrow_fullcover_pk_scan();
+  // Accessors into a borrowed entry's row. Valid until the transaction ends;
+  // the no-pending-write gate forbids cache mutation during the scan, and
+  // local_range_scans_ is append-only so entry_idx stays valid. Return nullptr
+  // on out-of-range / not-found.
+  const std::string* borrowed_value(const BorrowedScan& h, size_t pos) const;
+  const std::string* borrowed_key(const BorrowedScan& h, size_t pos) const;
+  // rnd_pos: binary-search the borrowed entry's sorted rows for an exact PK.
+  const std::string* borrowed_value_for_key(const BorrowedScan& h,
+                                            const std::string& pk) const;
+
   bool write(std::string key, const std::string value);
   bool write_secondary_index(std::string index_name, std::string secondary_key, const std::string primary_key);
   std::vector<std::string> read_secondary_index(std::string index_name, std::string secondary_key);
