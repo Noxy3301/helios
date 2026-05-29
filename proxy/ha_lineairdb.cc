@@ -2326,31 +2326,69 @@ static void maybe_auto_stage_oneshot_plan(THD *thd, LineairDBTransaction *tx) {
       }
       gcol_of[n] = gcol_of.count(n) ? (gcol_of[n] || g) : g;
     }
-    // Tables whose VALUE feeds a later value-column (!from_key) binding: the
-    // server extracts that column positionally from the FULL value, so such a
-    // table must NOT be projected (any of its steps).
-    std::unordered_set<std::string> vsrc_tables;
+    // Bindings that read a SOURCE step's VALUE positionally (option-2, Codex
+    // 2026-05-29). Two forms:
+    //   - column form (source_column>0): the server extracts column
+    //     (source_column-1) from the value. PROJECTABLE: (a) force that column
+    //     into the source table's kept[] so it survives the trim, and (b) remap
+    //     source_column to its projected position (done after kept_of below).
+    //   - byte-slice form (!from_key && source_column==0): uses source_offset/
+    //     length into the raw value; NOT remappable -> keep the source full.
+    // (Previously ALL value-binding sources were excluded -> Q21 lineitem shipped
+    //  all 16 cols = 1.3GB. Now lineitem projects to its read_set union.)
+    std::unordered_set<std::string> unsafe_src;
+    auto force_binding_col = [&](const auto &b) {
+      if (b.from_key || b.source_step >= steps.size()) return;
+      const std::string &src = steps[b.source_step].table_name;
+      auto fo = fields_of.find(src);
+      if (fo == fields_of.end()) return;
+      if (b.source_column > 0) {
+        const uint32_t fi = static_cast<uint32_t>(b.source_column - 1);
+        if (fi >= fo->second) { unsafe_src.insert(src); return; }
+        auto &u = union_rs[src];
+        if (u.size() < fo->second) u.resize(fo->second, false);
+        u[fi] = true;  // keep the binding's source column through the trim
+      } else {
+        unsafe_src.insert(src);  // byte-slice form: not remappable
+      }
+    };
     for (const auto &s : steps) {
-      for (const auto &b : s.bindings)
-        if (!b.from_key && b.source_step < steps.size())
-          vsrc_tables.insert(steps[b.source_step].table_name);
-      for (const auto &b : s.end_bindings)
-        if (!b.from_key && b.source_step < steps.size())
-          vsrc_tables.insert(steps[b.source_step].table_name);
+      for (const auto &b : s.bindings) force_binding_col(b);
+      for (const auto &b : s.end_bindings) force_binding_col(b);
     }
-    // Decide kept per eligible table, then stamp every matching step.
+    // Decide kept per eligible table, build a full->projected index map.
     std::unordered_map<std::string, std::vector<uint32_t>> kept_of;
+    std::unordered_map<std::string, std::vector<uint32_t>> full_to_proj;
     for (auto &kv : union_rs) {
       const std::string &n = kv.first;
       if (gcol_of[n]) continue;
-      if (vsrc_tables.count(n)) continue;
+      if (unsafe_src.count(n)) continue;
       const uint32_t nf = fields_of[n];
       std::vector<uint32_t> kept;
       for (uint32_t f = 0; f < nf; ++f)
         if (kv.second[f]) kept.push_back(f);
       if (kept.empty() || kept.size() == nf) continue;  // no benefit / all cols
+      std::vector<uint32_t> f2p(nf, 0);  // full ordinal -> projected pos (1-idx)
+      for (uint32_t k = 0; k < kept.size(); ++k) f2p[kept[k]] = k + 1;
       tx->set_table_projection(n, kept);
+      full_to_proj.emplace(n, std::move(f2p));
       kept_of.emplace(n, std::move(kept));
+    }
+    // Remap column-form bindings whose source table is now projected: the server
+    // reads (source_column-1) from the projected value, so the index must point
+    // at the projected position. Forced into kept above => pos is nonzero.
+    auto remap_binding = [&](auto &b) {
+      if (b.from_key || b.source_column <= 0 || b.source_step >= steps.size())
+        return;
+      auto it = full_to_proj.find(steps[b.source_step].table_name);
+      if (it == full_to_proj.end()) return;  // source not projected
+      const uint32_t fi = static_cast<uint32_t>(b.source_column - 1);
+      const uint32_t pos = (fi < it->second.size()) ? it->second[fi] : 0;
+      if (pos > 0) b.source_column = static_cast<int32_t>(pos);
+    };
+    for (auto &s : steps) {
+      for (auto &b : s.bindings) remap_binding(b);
+      for (auto &b : s.end_bindings) remap_binding(b);
     }
     for (auto &s : steps) {
       auto it = kept_of.find(s.table_name);

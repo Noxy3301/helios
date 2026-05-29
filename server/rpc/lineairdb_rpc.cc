@@ -789,7 +789,25 @@ void LineairDBRpc::buildExecuteReadPlanResponse(
         previous_results;
     previous_results.reserve(request.steps_size());
 
+    // option-2 (Codex 2026-05-29): steps whose VALUE a later column-form binding
+    // extracts from. If such a step is PROJECTED and trim_row_value fails (would
+    // ship a full fallback row), the proxy's remapped source_column would read
+    // the wrong column. Make trim failure FATAL (ok=false) for these steps
+    // instead of silently shipping the full row.
+    std::unordered_set<int> strict_proj_src;
+    for (const auto& s : request.steps()) {
+        for (const auto& b : s.bindings())
+            if (b.source_column() > 0)
+                strict_proj_src.insert(static_cast<int>(b.source_step()));
+        for (const auto& b : s.end_bindings())
+            if (b.source_column() > 0)
+                strict_proj_src.insert(static_cast<int>(b.source_step()));
+    }
+    bool proj_trim_fatal = false;
+
+    int step_idx = -1;
     for (const auto& step : request.steps()) {
+        ++step_idx;  // before any `continue`, so the index tracks the step
         auto* step_result = response.add_results();
         previous_results.push_back(step_result);
 
@@ -804,15 +822,20 @@ void LineairDBRpc::buildExecuteReadPlanResponse(
         // an extra copy. The projection path still copies because the
         // trimmer reads `v` and emits into a separate buffer.
         const bool step_has_projection = step.has_projection();
+        const bool strict_src_step = strict_proj_src.count(step_idx) > 0;
         // project_xfer: returns the std::string to be moved into the proto.
         // If projection: trim into `out` and return out. Else: return `v`
         // (the caller-supplied source) — caller must move-in.
-        auto project_xfer = [&step, step_has_projection](std::string& v) -> std::string {
+        auto project_xfer = [&step, step_has_projection, strict_src_step,
+                             &proj_trim_fatal](std::string& v) -> std::string {
             if (!step_has_projection) return std::move(v);
             std::string out;
             if (trim_row_value(v, step.projection().field_indexes(),
                                step.projection().num_columns(), out))
                 return out;
+            // Trim failed. For a column-form binding source, a full fallback row
+            // would misalign the proxy's remapped source_column -> fail the plan.
+            if (strict_src_step) proj_trim_fatal = true;
             return std::move(v);
         };
 
@@ -1170,6 +1193,14 @@ void LineairDBRpc::buildExecuteReadPlanResponse(
             to_proto_index_reads(scan_result.index_reads,
                                step_result->mutable_index_reads());
         }
+    }
+
+    // option-2 guard: a projected binding-source step shipped a full fallback
+    // row (trim failed), which would misalign the proxy's remapped
+    // source_column. Fail the whole plan so the proxy aborts/falls back rather
+    // than build a wrong key. (Rare: only on a malformed row.)
+    if (proj_trim_fatal) {
+        response.set_ok(false);
     }
 
     // [PLANSZ] per-step composition diagnostic (HELIOS_PLAN_SIZE). Logs, per

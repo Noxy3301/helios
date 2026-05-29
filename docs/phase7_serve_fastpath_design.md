@@ -175,3 +175,28 @@ Q18    18655ms / 5.06GB  → 18683ms / 5.07GB   (不変: secondary 主体で pri
 ```
 attacks transient serve copy + handler 側 materialize(scanned_*/scan_cache_)。常駐 rows は不変
 (B/A が必要、保留)。累積 Q21 SF=1: 52s→22.8s(2.3x)/ mysqld 23GB→4.84GB(4.75x)。
+
+### option-2 / Step5 (project value-binding-source tables) — 2026-05-29 → **採用**
+rpc_exec 7.3s の正体(server STIMEPROF): db(scan)1.8s + proto_copy_other(serialize)2-3s + send 1s、
+payload 1.3GB = lineitem 全16列。Q21 は実際 4列のみ使用。lineitem が projection 外だったのは
+supplier の join が lineitem の値カラム l_suppkey を位置抽出する value-column binding(B0.CI col=3)で、
+projection ロジックが「value-binding source 表」を一律除外していたため。
+
+修正(Codex design GO + impl GO, proxy+server):
+- proxy planner: value-binding の source 列(source_column-1)を kept[] に強制 + projected 表の
+  column-form binding の source_column を projected 位置に remap(1-indexed)。byte-slice 形式
+  (!from_key && source_column==0)の source 表は unsafe で full 維持。旧 vsrc 一律除外を撤廃。
+- server: column-form binding の source step が projected かつ trim_row_value 失敗時は
+  response.ok=false(full fallback 行で remap index が誤読するのを防ぐ。malformed row のみの稀パス)。
+
+測定(SF=1, 全22 md5 = 22/22 OK, lineitem keep=4/16 / supplier 3/7 も追加projection):
+```
+       Step3              opt2
+Q21    22805ms / 4.84GB → 20367ms / 4.19GB  (-11% time, -0.65GB)
+payload 1319MB          → 778MB
+```
+server trim CPU が proto_copy を押し上げる(相殺)が、proxy ingest + send + 常駐 rows 減で net 改善。
+Codex 非ブロッカー指摘(将来 harden): remap は呼び出し1回前提で非冪等 / proj_trim_fatal 時の
+retained-OCC-state 挿入を response.ok() で gate するとより堅い。
+
+累積 Q21 SF=1: 52s→20.4s(2.55x)/ mysqld 23GB→4.19GB(5.5x)。全段 22/22 md5 OK。
