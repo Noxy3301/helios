@@ -124,3 +124,30 @@ diff              -1556ms   -0.22GB       ±0       (-3.6% time)
 
 現状の Q21 SF=1 全体像(range-hash + phase1a-drop + 2a 込み): 41.9s / mysqld peak 9.65GB /
 server peak 7.95GB / 101 rows / md5 OK。InnoDB 比は計測ごとにブレるが ~3.8x(暖機時)〜15x(冷時)。
+
+### Step 2c (skip redundant local_read_set_ for full-cover primary scan) — 2026-05-29 → **採用(大勝ち)**
+発見: ingest ループ(execute_pending_oneshot_plan)が full-cover primary S: スキャンの
+found 行ごとに record_local_read を呼び、6M 行を local_read_set_(unordered_map)へ COPY。
+同じ行は range entry(`rows`)にも move 格納される二重格納。for_each サブスキャンは既に
+record_local_read を呼ばず positive-covering 経由で serve しており、step0 だけが非対称だった。
+
+Codex review (2026-05-29): **GO はフルカバー限定**。lookup_positive_covering_range_row は
+汎用区間検索ではなく exact-key / keypart-prefix / "" full-cover バケット(+≤64 線形)でしか
+entry を発見できないため、境界付き primary range [A,Z)∋K は後で再発見できず NO-GO。
+"" full-cover scan のみ安全。ガード:
+```
+build_primary_rows && !reverse && j<scan_tids.size() &&
+!actual_end_key.empty() && key_is_in_range(key,start,end) && actual_start_key.empty()
+```
+not-found 行・reverse・secondary・境界付き range は従来どおり record_local_read 維持。
+
+測定(SF=1, range-hash ON, 全22 md5 vs InnoDB = 22/22 OK):
+```
+        hel_ms    mysqld_peak
+2a      41895ms   9.65GB
+2c      30902ms   6.92GB
+diff    -10993ms  -2.73GB   (-26% time, -28% mysqld peak)
+```
+予想(ingest copy)以上の効果。local_read_set_ は 6M-entry unordered_map で、構築コスト
+(6M hash + node malloc + value 文字列 copy ~2.7GB)自体が wall に乗っていたため。
+OCC: positive-covering が per-row TID を記録、scan 自身は range validation。22/22 md5 OK で実証。

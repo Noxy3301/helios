@@ -472,6 +472,26 @@ void LineairDBTransaction::execute_read_plan(
     // cached.primary_keys later, so it must stay intact here (Codex P1: moving it
     // into the unused `rows` would install moved-from strings as primary keys).
     const bool build_primary_rows = !step.for_each && step.index_name.empty();
+    // Step2c: a FULL-COVER primary scan (start_key=="", finite end) stores every
+    // found row in the range entry (`rows`) AND used to ALSO copy it into
+    // local_read_set_ — a redundant second materialization (Q21 step0: 6M rows,
+    // ~1GB, ~part of the 8.4s ingest). For these rows local_read_set_ is dead:
+    //   - serving: a later exact-PK read()/batch_read() is answered by
+    //     lookup_positive_covering_range_row, which DISCOVERS the entry via the
+    //     "" full-cover bucket (the for_each sub-scan path already relies on this
+    //     and never calls record_local_read).
+    //   - OCC: positive-covering records the per-row TID on use; the scan's own
+    //     range validation (range_versions / range-hash digest) covers the range.
+    // Codex GO is gated to the full-cover case ONLY: positive-covering is not a
+    // general interval lookup, so a BOUNDED primary range [A,Z) containing K is
+    // NOT rediscoverable (unless A=="" / A==K / A∈keypart_prefixes(K)). Bounded,
+    // reverse, tid-less, filtered-by-empty-tid, and secondary scans keep the
+    // local_read_set_ copy. Not-found rows always keep it (negative covering is
+    // only conditionally sound). (Codex review 2026-05-29.)
+    const bool fullcover_skip_eligible =
+        build_primary_rows && !step.reverse_scan &&
+        step_result.actual_start_key.empty() &&
+        !step_result.actual_end_key.empty();
     for (size_t j = 0; j < step_result.scan_keys.size(); ++j) {
       std::string& key = step_result.scan_keys[j];
       const uint64_t tid =
@@ -480,10 +500,17 @@ void LineairDBTransaction::execute_read_plan(
           j < step_result.scan_values.size() && !step_result.scan_values[j].empty();
       if (found) {
         std::string& value = step_result.scan_values[j];
-        // record_local_read copies key+value into local_read_set_ first; then
-        // (primary path only) move them out of the discarded RPC result into the
-        // cache row — avoids a third materialization of every matched row.
-        record_local_read(step.table_name, key, true, value, tid, true);
+        const bool skip_local_readset =
+            fullcover_skip_eligible && j < step_result.scan_tids.size() &&
+            key_is_in_range(key, step_result.actual_start_key,
+                            step_result.actual_end_key);
+        // record_local_read copies key+value into local_read_set_; for the
+        // full-cover-safe case we skip that copy (the row lives in the range
+        // entry, served via positive-covering + range-validation OCC). Then
+        // (primary path only) move the key/value out of the discarded RPC result
+        // into the cache row — avoids a further materialization of every row.
+        if (!skip_local_readset)
+          record_local_read(step.table_name, key, true, value, tid, true);
         if (build_primary_rows) {
           rows.emplace_back(std::move(key), std::move(value));
           row_tids.push_back(tid);
