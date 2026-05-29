@@ -5,6 +5,7 @@
 #include <ctime>
 #include <optional>
 #include <unordered_map>
+#include <ankerl/unordered_dense.h>  // alloc-churn #2: open-addressing maps
 #include <unordered_set>
 
 #include "sql/handler.h" /* handler */
@@ -311,7 +312,13 @@ private:
 
   // Proxy-side read set for exact primary-key reads.
   // Keyed by (table_name + '\0' + key) so dedup + lookup are O(1).
-  std::unordered_map<std::string, LocalRowEntry> local_read_set_;
+  // alloc-churn #2: open-addressing map (wyhash + no per-node alloc) replaces
+  // std::unordered_map. segmented_map keeps element references stable across
+  // INSERT (segmented storage), so lookup_local_read_set's returned
+  // const LocalRowEntry* (#1) stays valid through its immediate use. (erase
+  // swap-pops the last element, but no erase occurs between lookup and use on
+  // the read hot path.)
+  ankerl::unordered_dense::segmented_map<std::string, LocalRowEntry> local_read_set_;
   static std::string make_local_read_key(const std::string& table,
                                          const std::string& key) {
     std::string k;
@@ -352,7 +359,9 @@ private:
   // loop in record_stateless_read was O(N); for a TPC-H scan over 60k rows
   // that turns into O(N^2) = ~1.8B string compares (~8s wall time on the
   // commit hot path), which made oneshot ~30x slower than the NLJ baseline.
-  std::unordered_map<std::string, size_t> stateless_read_index_;
+  // alloc-churn #2: flat open-addressing map (no pointer is returned from this
+  // index; value is a size_t into stateless_read_set_, so flat is safe).
+  ankerl::unordered_dense::map<std::string, size_t> stateless_read_index_;
   std::vector<LineairDBProxy::RangeValidationEntry> range_validation_set_;
   std::vector<LineairDBProxy::IndexValidationEntry> index_validation_set_;
   // O(1)-amortized dedup buckets for the two validation sets. activate_range_

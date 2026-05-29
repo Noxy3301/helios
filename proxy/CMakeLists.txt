@@ -48,8 +48,8 @@ set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wno-error -Wextra -mcx16 -fPIC")
 
 if(WITH_LINEAIRDB_STORAGE_ENGINE AND NOT WITHOUT_LINEAIRDB_STORAGE_ENGINE)
   mysql_add_plugin(lineairdb_storage_engine ${LINEAIRDB_SOURCES} STORAGE_ENGINE
-                   DEFAULT LINK_LIBRARIES lineairdb::lineairdb lineairdb_proto ext::libprotobuf)
+                   DEFAULT LINK_LIBRARIES lineairdb::lineairdb lineairdb_proto ext::libprotobuf extra::unordered_dense)
 elseif(NOT WITHOUT_LINEAIRDB_STORAGE_ENGINE)
   mysql_add_plugin(lineairdb_storage_engine ${LINEAIRDB_SOURCES} STORAGE_ENGINE
-                   MODULE_ONLY LINK_LIBRARIES lineairdb::lineairdb lineairdb_proto ext::libprotobuf)
+                   MODULE_ONLY LINK_LIBRARIES lineairdb::lineairdb lineairdb_proto ext::libprotobuf extra::unordered_dense)
 endif()

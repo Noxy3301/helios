@@ -22,3 +22,19 @@ make_mysql_table_row は常に const std::byte* なので variant 無しの deco
 元関数は残す)。row vector は member+clear で容量保持済のため reserve は不要(Codex 指摘)。
 測定(22/22 md5 OK): q1 20060→19299, q7 15792→14956, q18 18116→17961(各~0.7s)、Q21 はノイズ範囲。
 Codex GO(decode 等価、4byte 高位ビットの旧 int-promotion UB をむしろ修正)。
+
+## #2 ankerl::unordered_dense maps — 2026-05-29 → 採用(本丸・大勝ち)
+std::unordered_map(per-node alloc + std::hash)を ankerl::unordered_dense(MySQL vendored 4.4.0、
+wyhash + open addressing + node alloc 無し)に置換。extra::unordered_dense(INTERFACE target)を
+proxy/CMakeLists.txt の plugin link に追加。
+- local_read_set_ → segmented_map(INSERT で reference 安定 → #1 の const* を保つ)
+- stateless_read_index_ → flat map(値 size_t、ポインタ非返却で flat 安全)
+全 call site は find/erase/operator[]/empty のみ(std 互換)。
+測定(SF=1, 22/22 md5 OK): Q21 20476ms→17428ms(-15%)/ mysqld 4.19→4.11GB。広範改善:
+q4 -45%, q13 -26%, q5/q9/q18/q22 等も低下(per-row map 操作が全クエリで軽量化)。
+Codex GO(reference 安定性 / flat 安全 / operator[]=try_emplace 互換 / NUL 全長 hash / INTERFACE link 健全 /
+iteration order 非依存、bug なし)。
+
+## alloc-churn まとめ
+#6 は Q21 の FE 点読みが range-cover 外で効果ゼロ → skip。#1(scratch+const*)小、#5(inline decode)小、
+#2(ankerl)大。累積 Q21 SF=1: 52s→17.4s(3.0x)/ mysqld 23GB→4.11GB(5.6x)。alloc/memcpy 48.7% を直撃。
