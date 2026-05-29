@@ -130,6 +130,21 @@ bool LineairDBProxy::is_connected() const {
     return connected_;
 }
 
+bool LineairDBProxy::fetch_table_stats() {
+    if (!connected_) return false;
+    LineairDB::Protocol::GetTableStats::Request request;
+    LineairDB::Protocol::GetTableStats::Response response;
+    if (!send_protobuf_message(request, response,
+                               MessageType::TX_GET_TABLE_STATS)) {
+        return false;
+    }
+    table_stats_cache_.clear();
+    for (const auto& ts : response.table_stats()) {
+        table_stats_cache_[ts.table_name()] = ts.row_count();
+    }
+    return true;
+}
+
 int64_t LineairDBProxy::tx_begin_transaction() {
     LOG_DEBUG("CLIENT: tx_begin_transaction called");
     if (!connected_) {

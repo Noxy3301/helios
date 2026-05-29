@@ -55,6 +55,7 @@ private:
 
     // Transaction lifecycle
     void handleTxBeginTransaction(const std::string& message, std::string& result);
+    void handleTxGetTableStats(const std::string& message, std::string& result);
     void handleTxAbort(const std::string& message, std::string& result);
 
     // Primary key operations

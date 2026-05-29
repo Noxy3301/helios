@@ -83,7 +83,8 @@ enum class MessageType : uint32_t {
     TX_VALIDATE_AND_COMMIT = 29,
     TX_STATELESS_RANGE_SCAN = 30,
     TX_STATELESS_SECONDARY_RANGE_SCAN = 31,
-    TX_EXECUTE_READ_PLAN = 32
+    TX_EXECUTE_READ_PLAN = 32,
+    TX_GET_TABLE_STATS = 33  // keep in sync with server/protocol/message.hh
 };
 
 /**
@@ -106,6 +107,10 @@ public:
 
     // transaction management
     int64_t tx_begin_transaction();
+    // Transaction-less fetch of all table row counts into table_stats_cache_
+    // (optimizer-stats seed). Returns true on success. Used on a stats
+    // cache-miss at optimize time (see ha_lineairdb::info / analyze).
+    bool fetch_table_stats();
     void tx_abort(int64_t tx_id);
 
     // primary key operations

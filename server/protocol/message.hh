@@ -62,5 +62,7 @@ enum class MessageType : uint32_t {
     TX_VALIDATE_AND_COMMIT = 29,
     TX_STATELESS_RANGE_SCAN = 30,
     TX_STATELESS_SECONDARY_RANGE_SCAN = 31,
-    TX_EXECUTE_READ_PLAN = 32
+    TX_EXECUTE_READ_PLAN = 32,
+    // Transaction-less fetch of all table row counts (optimizer stats seed).
+    TX_GET_TABLE_STATS = 33
 };

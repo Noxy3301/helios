@@ -378,6 +378,9 @@ void LineairDBRpc::handle_rpc(uint64_t sender_id, MessageType message_type,
             handleTxExecuteReadPlan(message, result);
             release_masstree_thread_epoch();
             return;
+        case MessageType::TX_GET_TABLE_STATS:
+            handleTxGetTableStats(message, result);
+            return;
         case MessageType::TX_VALIDATE_AND_COMMIT:
             handleTxValidateAndCommit(message, result);
             release_masstree_thread_epoch();
@@ -490,6 +493,23 @@ void LineairDBRpc::handleTxBeginTransaction(const std::string& message, std::str
     result = response.SerializeAsString();
 
     LOG_DEBUG("Created transaction: %ld", tx_id);
+}
+
+// Transaction-less row-count snapshot for the optimizer (no BeginTransaction,
+// no tx_id, no side effects). Used by the proxy to seed accurate cardinalities
+// at MySQL optimize time despite oneshot's deferred tx_begin.
+void LineairDBRpc::handleTxGetTableStats(const std::string& message,
+                                         std::string& result) {
+    (void)message;
+    LineairDB::Protocol::GetTableStats::Response response;
+    if (row_counts_) {
+        for (const auto& [name, count] : row_counts_->snapshot()) {
+            auto* ts = response.add_table_stats();
+            ts->set_table_name(name);
+            ts->set_row_count(count);
+        }
+    }
+    result = response.SerializeAsString();
 }
 
 void LineairDBRpc::handleTxAbort(const std::string& message, std::string& result) {

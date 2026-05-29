@@ -111,6 +111,17 @@ message TxBeginTransaction {
     }
 }
 
+// Standalone, transaction-less fetch of all table row counts. Lets the proxy
+// seed the MySQL optimizer with accurate cardinalities WITHOUT beginning a
+// transaction — required because oneshot defers tx_begin past the optimizer's
+// info() call, so the begin/end table_stats piggyback misses cold-start plans.
+message GetTableStats {
+    message Request {}
+    message Response {
+        repeated TableRowCount table_stats = 1;
+    }
+}
+
 // Abort a transaction.
 message TxAbort {
     message Request {
