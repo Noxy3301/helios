@@ -112,4 +112,24 @@ TPC-H/integer workload に限れば default ON 可。
 → **クリーンな数値には server 再起動 + SF=1 再ロードが必須**。Phase2+修正のコード正しさは EXPLAIN(プラン健全)+
   ANALYZE スモーク OK + cmp3(健全 server で 22/22 md5・q5/q19 修正)で担保済。timing は clean server で取り直す。
 **教訓:** kill は必ず PID 指定。`pkill -f`/`pgrep -f` のパターンが自コマンド文字列にマッチすると自滅(144)。
-長時間の重ベンチ後は server を再起動してからでないと timing 比較は信用できない。
+
+## 【訂正】真の原因は server 劣化ではなく oneshot sysvar OFF(2026-05-30 未明)
+上の「server 劣化」結論は**誤診**だった。fresh server + fresh SF=1 でも q3=274s が再現したので深掘りした結果:
+- q3 の構成要素を timeout 付きで叩くと、個別の索引引き(o_custkey/l_orderkey)は **5-6ms と高速**。なのに q3 全体が 274s
+  = **join 内側が per-row RPC point-read に落ちている**(prefetch が効いていない)。
+- 原因: prefetch 実行は **GLOBAL `lineairdb_oneshot_execution`**(デフォルト OFF)で制御。私の fresh mysqld 再起動で
+  毎回 OFF に戻っていた。cmp3 は前の benchrun が ON にした状態を引き継いでいた。
+- `SET GLOBAL lineairdb_oneshot_execution=ON` → q3 **274s→5089ms(54x)**、結果は正しいまま。
+
+→ 今夜の「回帰」騒動(server 劣化/孤児/BKA/join_buffer の切り分け)は**全部ハズレで、真因は計測モードのミス**(oneshot OFF で per-row RPC を測っていた)。コードは終始無罪。メモリ [[helios-oneshot-sysvar-must-enable]] に記録。
+
+## 正式な計測結果(oneshot ON = prefetch + NDV ON、SF=1、2026-05-30)
+`SET GLOBAL lineairdb_oneshot_execution=ON` + HELIOS_OPT_STATS=1 + HELIOS_RO_NOVALIDATE=1、全クエリ timeout 120s:
+- **22/22 md5 OK**。合計 helios **182s** / InnoDB 22.8s = **8.0x**(cmp3 の 151s/8.3x と一致、誤差は fresh load)。
+- 速い: q19 1.0x / q17 1.1x / q16 2.1x / q13 2.2x / q4 2.9x。
+- 遅い: q7 29.5x / q22 24x / q11 22x / q14 21.9x / q9 21x / q10 19x。
+- **遅い query の EXPLAIN は全て健全**(NDV 機能): q7 customer ref 6000→orders 16→lineitem 5→supplier/n1 eq_ref、
+  q9 nation→supplier 400→partsupp 80→part eq_ref→lineitem l_partkey 8→orders eq_ref、q14 part 200000→lineitem l_partkey 31(InnoDB一致)。
+→ **残差 8x はプラン問題ではなく disaggregation 固有の RPC データ量**。Phase 2 NDV はプラン爆発を防ぐ役割を正しく果たしている
+  (NDV 無しなら q5/q2/q3 が爆発)。prefetch は「per-row 爆発(250s)→2-RPC(5s)」を実現するが、リモートデータ量由来の
+  対 InnoDB 8x は prefetch アーキの本質的コストとして残る。
