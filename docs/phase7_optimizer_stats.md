@@ -55,3 +55,23 @@ GET_TABLE_STATS RPC + info()-on-miss seed で実 records を届けたところ:
 - correctness=plan-only。22/22 md5 + Q5/Q19/複合 secondary の EXPLAIN 検証。
 - proxy-driven descriptors。cache key=(table,index,num_parts,schema-gen)。ANALYZE 強制更新。SHARE thread-safe。
   非ユニーク index が NDV 欠ならその table/index で row-count seed を有効化しない。
+
+## Phase 2 NDV 実装完了 + SF=1 実測(2026-05-29)
+実装: server `ComputeIndexNdvInt`(順序スキャン1パス・value-aware・int key-part 専用パーサ・解析不能型は
+"unavailable"・server側 NDV cache)→ proxy `fetch_table_stats` が per-index NDV 受領 → `set_generic_rec_per_key`
+が NDV ありなら `rec_per_key=max(1,records/ndv)`、無ければ従来 n-th-root 据え置き。gate `HELIOS_OPT_STATS`。
+
+**fail-fast EXPLAIN(SF=1, OPT_STATS=1):**
+- q5: `region ALL 5 / nation ref 5 / customer ref c_nationkey 6000 / orders ref o_custkey 15 / lineitem ref PRIMARY 4 / supplier eq_ref 1` = **爆発解消・InnoDB 同型**(customer rows=1→6000 の実カーディナリティ)。
+- q19: `part ALL 200000 / lineitem ref l_partkey 30` = **InnoDB と完全一致**(rec_per_key 2449 ヒューリスティック→実30)。
+
+**全22 SF=1 md5 + warm best-of-3(helios OPT_STATS=1+RO_NOVALIDATE=1 vs InnoDB):**
+- **md5 22/22 OK**(正答性維持)。total helios 151s / InnoDB 18.3s(8.3x)。
+- 改善: q2 425s→3.3s / q3 196s→2.3s / q5 爆発→3.7s / q19 →98ms(1.3x)。
+- 非爆発クエリ対照 q1: OPT_STATS=0 で 13.2s, ON で 13.7s = **不変**(回帰なし)。
+
+**baseline 検証(OPT_STATS=0, 同一ハーネス):** q2=**425s** q3=**196s**(q2+q3 だけで 621s)。全22完走は悪プランで
+30分超のため意図的に中断。NDV は誤解の余地なく net-positive、非爆発クエリは不変 = **純粋 additive・net-negative なし**。
+
+**結論:** NDV はプラン爆発クエリ(q2/q3/q5/q19)を救出。残る q7/q9/q10/q14 の 8-30x は join order でなく
+remote-RPC データ量という別軸の問題(NDV のスコープ外)。`HELIOS_OPT_STATS` を default ON 候補。

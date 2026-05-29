@@ -108,9 +108,19 @@ public:
     // transaction management
     int64_t tx_begin_transaction();
     // Transaction-less fetch of all table row counts into table_stats_cache_
-    // (optimizer-stats seed). Returns true on success. Used on a stats
-    // cache-miss at optimize time (see ha_lineairdb::info / analyze).
-    bool fetch_table_stats();
+    // (optimizer-stats seed) + optional per-index NDV for ndv_table's indexes
+    // (Phase 2). ndv_descs = {(index_name, num_key_parts)} ("" = primary).
+    // force = ANALYZE TABLE (bust the server NDV cache). Results land in
+    // table_stats_cache_ (row counts) and last_index_ndv_ (per-index NDV).
+    bool fetch_table_stats(
+        const std::string& ndv_table = std::string(),
+        const std::vector<std::pair<std::string, uint32_t>>& ndv_descs = {},
+        bool force = false);
+    // Per-index NDV from the most recent fetch_table_stats (index_name ->
+    // (available, ndv-per-prefix)). Empty/absent => use the heuristic.
+    const std::unordered_map<std::string,
+                             std::pair<bool, std::vector<uint64_t>>>&
+    last_index_ndv() const { return last_index_ndv_; }
     void tx_abort(int64_t tx_id);
 
     // primary key operations
@@ -394,6 +404,9 @@ public:
 
 private:
     std::unordered_map<std::string, int64_t> table_stats_cache_;
+    // Phase 2: per-index NDV from the most recent fetch_table_stats with NDV.
+    std::unordered_map<std::string, std::pair<bool, std::vector<uint64_t>>>
+        last_index_ndv_;
     template<typename RequestType, typename ResponseType>
     bool send_protobuf_message(const RequestType& request, ResponseType& response,
                                MessageType message_type, const std::string& meta = "");

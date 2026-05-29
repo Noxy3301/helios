@@ -130,10 +130,22 @@ bool LineairDBProxy::is_connected() const {
     return connected_;
 }
 
-bool LineairDBProxy::fetch_table_stats() {
+bool LineairDBProxy::fetch_table_stats(
+    const std::string& ndv_table,
+    const std::vector<std::pair<std::string, uint32_t>>& ndv_descs,
+    bool force) {
     if (!connected_) return false;
     LineairDB::Protocol::GetTableStats::Request request;
     LineairDB::Protocol::GetTableStats::Response response;
+    if (!ndv_table.empty()) {
+        request.set_ndv_table(ndv_table);
+        request.set_ndv_force_recompute(force);
+        for (const auto& d : ndv_descs) {
+            auto* desc = request.add_ndv_indexes();
+            desc->set_index_name(d.first);
+            desc->set_num_key_parts(d.second);
+        }
+    }
     if (!send_protobuf_message(request, response,
                                MessageType::TX_GET_TABLE_STATS)) {
         return false;
@@ -141,6 +153,11 @@ bool LineairDBProxy::fetch_table_stats() {
     table_stats_cache_.clear();
     for (const auto& ts : response.table_stats()) {
         table_stats_cache_[ts.table_name()] = ts.row_count();
+    }
+    last_index_ndv_.clear();
+    for (const auto& in : response.index_ndv()) {
+        std::vector<uint64_t> ndv(in.ndv().begin(), in.ndv().end());
+        last_index_ndv_[in.index_name()] = {in.available(), std::move(ndv)};
     }
     return true;
 }

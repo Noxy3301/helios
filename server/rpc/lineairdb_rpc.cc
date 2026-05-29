@@ -320,6 +320,11 @@ std::string build_plan_key(
 
 }  // namespace
 
+// Phase 2 server-side NDV cache (shared across per-connection rpc instances).
+std::mutex LineairDBRpc::ndv_cache_mu_;
+std::unordered_map<std::string, std::pair<bool, std::vector<uint64_t>>>
+    LineairDBRpc::ndv_cache_;
+
 LineairDBRpc::LineairDBRpc(std::shared_ptr<DatabaseManager> db_manager,
                            std::shared_ptr<TransactionManager> tx_manager,
                            std::shared_ptr<TableRowCounts> row_counts)
@@ -380,6 +385,7 @@ void LineairDBRpc::handle_rpc(uint64_t sender_id, MessageType message_type,
             return;
         case MessageType::TX_GET_TABLE_STATS:
             handleTxGetTableStats(message, result);
+            release_masstree_thread_epoch();  // Phase 2: NDV scans touch the index
             return;
         case MessageType::TX_VALIDATE_AND_COMMIT:
             handleTxValidateAndCommit(message, result);
@@ -500,13 +506,48 @@ void LineairDBRpc::handleTxBeginTransaction(const std::string& message, std::str
 // at MySQL optimize time despite oneshot's deferred tx_begin.
 void LineairDBRpc::handleTxGetTableStats(const std::string& message,
                                          std::string& result) {
-    (void)message;
+    LineairDB::Protocol::GetTableStats::Request request;
+    request.ParseFromString(message);
     LineairDB::Protocol::GetTableStats::Response response;
     if (row_counts_) {
         for (const auto& [name, count] : row_counts_->snapshot()) {
             auto* ts = response.add_table_stats();
             ts->set_table_name(name);
             ts->set_row_count(count);
+        }
+    }
+    // Phase 2: optional per-index NDV (exact, live-filtered single pass) for the
+    // requested table's indexes, so the proxy can set accurate rec_per_key.
+    // Cached server-side (key = table\0index\0parts) so repeated requests don't
+    // re-scan; ANALYZE TABLE busts the cache via ndv_force_recompute.
+    if (!request.ndv_table().empty() && db_manager_) {
+        auto db = db_manager_->get_database();
+        for (const auto& desc : request.ndv_indexes()) {
+            auto* out = response.add_index_ndv();
+            out->set_index_name(desc.index_name());
+            std::string ck = request.ndv_table();
+            ck.push_back('\0'); ck.append(desc.index_name());
+            ck.push_back('\0'); ck.append(std::to_string(desc.num_key_parts()));
+            bool avail = false, found = false;
+            std::vector<uint64_t> ndv;
+            {
+                std::lock_guard<std::mutex> g(ndv_cache_mu_);
+                if (request.ndv_force_recompute()) ndv_cache_.erase(ck);
+                auto it = ndv_cache_.find(ck);
+                if (it != ndv_cache_.end()) {
+                    found = true; avail = it->second.first; ndv = it->second.second;
+                }
+            }
+            if (!found) {  // cache miss -> compute (outside the lock) + store
+                avail = db && db->ComputeIndexNdvInt(request.ndv_table(),
+                                                     desc.index_name(),
+                                                     desc.num_key_parts(), ndv);
+                std::lock_guard<std::mutex> g(ndv_cache_mu_);
+                ndv_cache_[ck] = {avail, ndv};
+            }
+            out->set_available(avail);
+            if (avail)
+                for (uint64_t v : ndv) out->add_ndv(v);
         }
     }
     result = response.SerializeAsString();
