@@ -37,3 +37,21 @@ GET_TABLE_STATS RPC + info()-on-miss seed で実 records を届けたところ:
 
 ## 実装結果ログ
 (以下追記)
+
+## Phase 2 設計(Codex GO with fixes、2026-05-29)
+方向 OK: server が per-index NDV を exact 計算 → proxy が rec_per_key=ceil(records/NDV) 設定、n-th-root 撤廃。
+**実装前に潰す4点(Codex):**
+1. secondary key は現状 PK 非付与(secondary parts のみ)。`num_user_defined_key_parts` 分だけ depth を数える(将来備え)。
+2. `keypart_prefixes()` 流用不可(int専用・string停止。string 符号化=payload+terminator+length, ha_lineairdb.cc:3923)。
+   専用 key-part 境界パーサを作る。**解析不能な型 → 該当 index は "NDV unavailable"**(出鱈目統計を入れない)。
+   → 実用上 TPC-H の join 駆動 index(l_partkey/s_nationkey/o_custkey/ps_suppkey/PK)は**全部 integer** なので
+   int-only パーサで足り、string-keyed index は unavailable で従来 heuristic 据え置き(join order に無関係)。
+3. tombstone 除外(keys-only は IsInitialized 不可 → value-aware scan か live のみ計上)。
+4. TX_GET_TABLE_STATS が index scan するなら dispatch で ReleaseMasstreeThreadEpoch() を呼ぶ。
+- exact-once-cached(sampling は順序クラスタで偏り不可)。巨大表ガード=上限超で "unavailable"+gated 維持。
+  **実 row-count + n-th-root へは戻さない**。
+- コストは現状(scan_time=records*10 / read_time=ranges+rows*0.5)で初回計測。必要なら後で secondary を
+  ranges*2+rows*1 へ。NDB の records*1000 へは測る前に飛ばない。
+- correctness=plan-only。22/22 md5 + Q5/Q19/複合 secondary の EXPLAIN 検証。
+- proxy-driven descriptors。cache key=(table,index,num_parts,schema-gen)。ANALYZE 強制更新。SHARE thread-safe。
+  非ユニーク index が NDV 欠ならその table/index で row-count seed を有効化しない。
