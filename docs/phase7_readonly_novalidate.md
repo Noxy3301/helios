@@ -69,3 +69,19 @@ connection-close/TTL で bounded・UAF/crash/誤結果なし)。
 RegisterTxEpochPin skip)+ 本物の read-only 契約 gate(thd_tx_is_read_only / session-global、
 非ロック、write surface 無し)。理由: Stage 0 は commit skip で TxOccState/pin が
 connection-close/TTL まで残る(全クエリ Stage 0 の持続負荷で遅延回収/メモリ増。UAF は無い)。
+
+### Stage 1(server no-retain + range-hash skip)— 2026-05-29 → 採用(production-correct)
+proto: TxExecuteReadPlan.Request に bool read_only_no_validate=2。proxy: tx_execute_read_plan に
+引数追加、tx が ro_novalidate_ を渡す。server: ro_novalidate 時に RegisterTxEpochPin + TxOccStore.Insert +
+set_tx_occ_key を skip(tx_occ_key=0、cleanup=tls reset/physical-mode off は維持)→ **leak 解消**。
+さらに Codex 指摘の dead work のうち最重量の **range-hash footprint SHA-256(6M行)を ro_novalidate で skip**
+(digest は未検証なので無駄)。
+測定(SF=1, 22/22 md5 OK):
+```
+            Stage0           Stage1(no-retain)   Stage1+rh-skip
+Q21         13575ms/2.66GB → 12654ms/2.66GB    → 10934ms/2.68GB
+```
+累積 Q21: 52s→10.9s(4.8x)/ mysqld 23GB→2.68GB(8.6x)。
+Codex GO(lifecycle/UAF 問題なし:pin/state 未登録で leak なし、node_ptr は proxy が deref しない、
+phys_state の use-after-scope なし、tx_occ_key=0 で proxy commit skip 前なので無害)。
+残 dead work: filtered_rows routing(physical 出力に絡む)→ Stage 2 で node_versions/TID suppress と併せて。

@@ -283,7 +283,8 @@ public:
         uint64_t row_limit,
         bool reverse_scan);
     ReadPlanResult tx_execute_read_plan(
-        const std::vector<ReadPlanStep>& steps);
+        const std::vector<ReadPlanStep>& steps,
+        bool read_only_no_validate = false);
     bool tx_validate_and_commit(
         const std::vector<StatelessReadKey>& reads,
         const std::vector<uint64_t>& read_tids,

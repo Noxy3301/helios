@@ -1154,7 +1154,11 @@ void LineairDBRpc::buildExecuteReadPlanResponse(
             // proxy skips per-row reads exactly for rows served from a
             // full-cover cache entry, so the hashed set and the skipped set
             // align. Bounded/own-probe ranges keep per-row validation.
-            if (rangehash_on && tls_current_tx_occ_state != nullptr &&
+            // read-only no-validation: the digest is never validated (no commit
+            // RPC), so skip the full-range SHA-256 footprint entirely — pure
+            // dead CPU over millions of rows otherwise. (Codex Stage 1.)
+            if (rangehash_on && !request.read_only_no_validate() &&
+                tls_current_tx_occ_state != nullptr &&
                 !step.for_each() && step.index_name().empty() &&
                 start_key.empty()) {
                 helios::TxOccState::RangeHash rh;
@@ -1311,6 +1315,17 @@ bool LineairDBRpc::handleTxExecuteReadPlanStreamed(int socket, uint64_t sender_i
     const bool memprof = std::getenv("HELIOS_MEMPROF") != nullptr;
     const size_t je_before = memprof ? je_stat("stats.allocated") : 0;
 
+    // read-only no-validation (Stage 1): the proxy will skip the
+    // commit-validation RPC, so we must NOT retain OCC state (no TxOccStore
+    // Insert, no epoch pin) — else it leaks until connection-close/TTL. Parse
+    // just this flag from the (small) plan request. (docs/phase7_readonly_novalidate.md)
+    bool read_only_no_validate = false;
+    {
+        LineairDB::Protocol::TxExecuteReadPlan::Request ro_req;
+        if (ro_req.ParseFromString(message))
+            read_only_no_validate = ro_req.read_only_no_validate();
+    }
+
     // ---- helios PHYSICAL OCC (Step 5) setup --------------------------------
     // Default = physical (Codex 2026-05-28: stateless.h:64 comment "always
     // emits the physical form" was stale; logical mode shipped
@@ -1355,6 +1370,13 @@ bool LineairDBRpc::handleTxExecuteReadPlanStreamed(int socket, uint64_t sender_i
     // shrinks from O(rows) result_keys to O(leaves) node-versions, which is
     // exactly the Masstree-paper-correct cost.
     if (db_for_physical != nullptr) {
+        // read-only no-validation: NO commit-validation RPC will come, so do
+        // not register the epoch pin or retain TxOccState (else they leak until
+        // connection-close/TTL). tx_occ_key stays 0. The range_versions still
+        // shipped (Stage 1) carry node_ptrs the proxy never dereferences in this
+        // mode, so skipping the pin is safe (no commit-time UAF possible). The
+        // cleanup below (tls reset + physical-mode off) still runs.
+        if (!read_only_no_validate) {
         const bool pinned = db_for_physical
                                 ->RegisterTxEpochPinFromCurrentThread(phys_key);
         // Codex P1 #1 fix: the pin MUST be kept whenever ANY physical-mode
@@ -1376,6 +1398,7 @@ bool LineairDBRpc::handleTxExecuteReadPlanStreamed(int socket, uint64_t sender_i
             helios::GlobalTxOccStore().Insert(std::move(phys_state));
             response.set_tx_occ_key(phys_key);
         }
+        }  // !read_only_no_validate
         // Reset thread-locals/flag regardless of success.
         tls_current_tx_occ_state = nullptr;
         db_for_physical->SetPhysicalValidationMode(false);

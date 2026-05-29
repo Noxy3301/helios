@@ -617,7 +617,8 @@ bool decode_flat_into_readplan(const char* data, size_t len,
 }  // namespace
 
 LineairDBProxy::ReadPlanResult LineairDBProxy::tx_execute_read_plan(
-    const std::vector<ReadPlanStep>& steps) {
+    const std::vector<ReadPlanStep>& steps,
+    bool read_only_no_validate) {
     ReadPlanResult result;
     if (!connected_) {
         LOG_ERROR("RPC failed: Not connected to server");
@@ -625,6 +626,7 @@ LineairDBProxy::ReadPlanResult LineairDBProxy::tx_execute_read_plan(
     }
 
     LineairDB::Protocol::TxExecuteReadPlan::Request request;
+    request.set_read_only_no_validate(read_only_no_validate);
     for (const auto& step : steps) {
         auto* out = request.add_steps();
         out->set_table_name(step.table_name);

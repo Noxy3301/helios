@@ -419,7 +419,8 @@ void LineairDBTransaction::execute_read_plan(
     return static_cast<uint64_t>(t.tv_sec) * 1000000000ull + t.tv_nsec;
   };
   const uint64_t tp_rpc_start = timeprof ? tp_now() : 0;
-  auto result = lineairdb_proxy->tx_execute_read_plan(steps_with_filter);
+  auto result =
+      lineairdb_proxy->tx_execute_read_plan(steps_with_filter, ro_novalidate_);
   const uint64_t tp_rpc_end = timeprof ? tp_now() : 0;
   if (!result.ok || result.steps.size() != steps.size()) {
     rpc_trace_.record_local_view("abort_read_plan_rpc");

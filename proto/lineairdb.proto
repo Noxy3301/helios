@@ -326,6 +326,11 @@ message TxExecuteReadPlan {
     }
     message Request {
         repeated PlanStep steps = 1;
+        // read-only no-validation (Stage 1): the proxy will skip the
+        // commit-validation RPC, so the server must NOT retain OCC state
+        // (no TxOccStore.Insert, no epoch pin) and returns tx_occ_key=0.
+        // Weaker isolation; gated, default OFF. (docs/phase7_readonly_novalidate.md)
+        bool read_only_no_validate = 2;
     }
     message Response {
         repeated StepResult results = 1;
