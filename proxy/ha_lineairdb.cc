@@ -2417,6 +2417,17 @@ static void maybe_auto_stage_oneshot_plan(THD *thd, LineairDBTransaction *tx) {
                              thd->lex != nullptr &&
                              thd->lex->sql_command == SQLCOM_SELECT);
 
+  // read-only no-validation mode (Stage 0, measurement gate). Explicit opt-in
+  // only (HELIOS_RO_NOVALIDATE=1) + pure SELECT. Skips OCC validation + the
+  // commit RPC. WEAKER ISOLATION (no serializability under concurrent writers);
+  // correct for the no-writer TPC-H benchmark. Production surface should be a
+  // session/global var + thd_tx_is_read_only(); env gate is for measurement.
+  // (Codex review 2026-05-29; docs/phase7_readonly_novalidate.md.)
+  static const char* ronv_env = std::getenv("HELIOS_RO_NOVALIDATE");
+  static const bool ronv_gate = ronv_env != nullptr && ronv_env[0] == '1';
+  tx->set_ro_novalidate(ronv_gate && thd->lex != nullptr &&
+                        thd->lex->sql_command == SQLCOM_SELECT);
+
   stage_plan_with_fer_filters(thd, tx, std::move(steps));
   // Execute the prefetch NOW. We are at the driver's rnd_init/index_read, i.e.
   // immediately before the scan that probes the joined tables, so the local

@@ -1680,6 +1680,9 @@ void LineairDBTransaction::record_stateless_read(const std::string& table_name,
                                                  const std::string& key,
                                                  bool found,
                                                  uint64_t tid) {
+  // read-only no-validation: no commit validation runs, so per-row TID
+  // recording is pure overhead -> skip entirely. (docs/phase7_readonly_novalidate.md)
+  if (ro_novalidate_) return;
   // #1: dedup-probe with the reusable scratch key (no per-call alloc). Hot path:
   // millions of repeated point reads dedup to a few unique keys, so almost every
   // call is a find-hit that now allocates nothing. Only a genuinely-new key
@@ -1748,6 +1751,9 @@ static bool index_entry_equal(const LineairDBProxy::IndexValidationEntry& a,
 void LineairDBTransaction::activate_range_validation(
     const std::vector<LineairDBProxy::RangeValidationEntry>& ranges,
     const std::vector<LineairDBProxy::IndexValidationEntry>& indexes) {
+  // read-only no-validation: the commit RPC is skipped, so accumulating range
+  // validation entries is pure overhead -> skip. (docs/phase7_readonly_novalidate.md)
+  if (ro_novalidate_) return;
   // HELIOS_TIMEPROF accumulator.
   struct TpGuard {
     LineairDBTransaction* tx;
@@ -2471,7 +2477,22 @@ bool LineairDBTransaction::oneshot_validate_and_commit() {
     timespec t; clock_gettime(CLOCK_MONOTONIC, &t);
     return static_cast<uint64_t>(t.tv_sec) * 1000000000ull + t.tv_nsec;
   };
-  if (!was_aborted) {
+  // read-only no-validation: skip the entire commit-validation RPC (2-RPC ->
+  // 1-RPC). Only when there are genuinely no buffered writes (the gate ensures
+  // SELECT, but assert here for safety: if a write somehow buffered, fall
+  // through to the normal validating commit). (docs/phase7_readonly_novalidate.md)
+  if (!was_aborted && ro_novalidate_) {
+    if (write_buffer_ops_.empty()) {
+      committed = true;  // read-only: no validation needed, skip commit RPC
+    } else {
+      // A write buffered under ro_novalidate_: the read/range OCC obligations
+      // were already skipped, so this write cannot be validly committed. The
+      // SELECT-only gate should make this impossible; hard-abort if it ever
+      // happens. (Codex 2026-05-29.)
+      committed = false;
+      rpc_trace_.record_local_view("abort_ro_novalidate_unexpected_write");
+    }
+  } else if (!was_aborted) {
     const uint64_t t0 = timeprof ? tp_now() : 0;
     // Phase-6 range-hash OCC: only for a read-only txn (no buffered writes)
     // that was eligible. The server then revalidates full-cover ranges via

@@ -181,6 +181,13 @@ public:
   // At commit the proxy sets use_range_hash so the server re-derives + compares.
   void set_rangehash_eligible(bool v) { rangehash_eligible_ = v; }
   bool rangehash_eligible() const { return rangehash_eligible_; }
+  // read-only no-validation mode (gated, weaker isolation; see
+  // docs/phase7_readonly_novalidate.md). When set, the tx skips ALL OCC
+  // obligations (per-row TID recording, range validation) and the commit-
+  // validation RPC (2-RPC -> 1-RPC). Correct only with no concurrent writers
+  // (TPC-H benchmark) or where read-committed-ish reads are acceptable.
+  void set_ro_novalidate(bool v) { ro_novalidate_ = v; }
+  bool ro_novalidate() const { return ro_novalidate_; }
 
   LineairDBTransaction(THD* thd, 
                        LineairDBProxy* lineairdb_proxy, 
@@ -210,6 +217,7 @@ private:
 
   // helios Phase-6 range-hash OCC eligibility (read-only SELECT + gate on).
   bool rangehash_eligible_{false};
+  bool ro_novalidate_{false};
 
   // HELIOS_TIMEPROF: per-phase wall time accumulators (ns). Printed at commit.
   // proxy-side only — the server publishes its own [MEMPROF-server] / [PLANSZ]
