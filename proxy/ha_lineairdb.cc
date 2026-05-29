@@ -4945,10 +4945,21 @@ int ha_lineairdb::set_fields_from_lineairdb(uchar *buf,
   if (kept != nullptr && ldbField.get_row_size() != kept->size()) {
     kept = nullptr;
   }
+  // Step4a: skip Field::store for columns MySQL won't read this statement
+  // (not in table->read_set). set_fields is the per-serve chokepoint (Q21 SF1:
+  // 13.1M calls, 5.9s) and a full lineitem row is ~16 columns while a query
+  // typically reads ~4. The projection path already relies on "non-read columns
+  // are safe to leave untouched"; this extends the same guard to every column.
+  // null flags for all columns are copied into buf above, so skipped columns
+  // stay null-consistent. Per-serve read_set is the right mask even for
+  // self-joins: each alias's handler reads only its own columns (the prefetch
+  // already widened the cached value to the union across aliases). Text->binary
+  // re-parse (Field::store) only happens for columns actually consumed.
   if (kept != nullptr) {
     for (size_t k = 0; k < kept->size(); ++k) {
       const uint32_t fi = (*kept)[k];
       if (fi >= table->s->fields) break;  // safety: malformed projection
+      if (!bitmap_is_set(table->read_set, fi)) continue;  // unread: skip store
       Field *f = table->field[fi];
       const auto mysqlFieldValue = ldbField.get_column_of_row(k);
       if (f->is_nullable() && f->is_null_in_record(buf)) {
@@ -4966,7 +4977,11 @@ int ha_lineairdb::set_fields_from_lineairdb(uchar *buf,
      */
     size_t columnIndex = 0;
     for (Field **field = table->field; *field; field++) {
+      // Advance the positional column index for EVERY column (the full-row
+      // value holds all columns in order), then skip the store for columns not
+      // in read_set.
       const auto mysqlFieldValue = ldbField.get_column_of_row(columnIndex++);
+      if (!bitmap_is_set(table->read_set, (*field)->field_index())) continue;
       if ((*field)->is_nullable() && (*field)->is_null_in_record(buf)) {
         (*field)->set_null();
       } else {
