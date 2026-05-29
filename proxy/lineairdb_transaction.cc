@@ -1502,17 +1502,22 @@ LineairDBTransaction::lookup_local_write_set(
   return std::nullopt;
 }
 
-std::optional<LineairDBTransaction::LocalRowEntry>
+const LineairDBTransaction::LocalRowEntry*
 LineairDBTransaction::lookup_local_read_set(
     const std::string& table_name, const std::string& key) const {
-  auto it = local_read_set_.find(make_local_read_key(table_name, key));
-  if (it == local_read_set_.end()) return std::nullopt;
-  return it->second;
+  // #1: probe with the reusable scratch key (no per-call string alloc) and
+  // return a pointer (no LocalRowEntry/value copy). Hot path: index_read_map
+  // FE point reads (Q21 = millions of probes).
+  fill_local_read_key(lrk_scratch_, table_name, key);
+  auto it = local_read_set_.find(lrk_scratch_);
+  if (it == local_read_set_.end()) return nullptr;
+  return &it->second;
 }
 
 void LineairDBTransaction::drop_local_read(const std::string& table_name,
                                            const std::string& key) {
-  local_read_set_.erase(make_local_read_key(table_name, key));
+  fill_local_read_key(lrk_scratch_, table_name, key);
+  local_read_set_.erase(lrk_scratch_);
 }
 
 bool LineairDBTransaction::key_is_in_range(const std::string& key,
@@ -1675,14 +1680,13 @@ void LineairDBTransaction::record_stateless_read(const std::string& table_name,
                                                  const std::string& key,
                                                  bool found,
                                                  uint64_t tid) {
-  // Compose a unique dedup key matching make_local_read_key's encoding.
-  std::string dedup_key;
-  dedup_key.reserve(table_name.size() + 1 + key.size());
-  dedup_key.append(table_name);
-  dedup_key.push_back('\0');
-  dedup_key.append(key);
+  // #1: dedup-probe with the reusable scratch key (no per-call alloc). Hot path:
+  // millions of repeated point reads dedup to a few unique keys, so almost every
+  // call is a find-hit that now allocates nothing. Only a genuinely-new key
+  // copies the scratch into an owning map key below.
+  fill_local_read_key(srr_scratch_, table_name, key);
 
-  auto it = stateless_read_index_.find(dedup_key);
+  auto it = stateless_read_index_.find(srr_scratch_);
   if (it != stateless_read_index_.end()) {
     auto& entry = stateless_read_set_[it->second];
     // (d/P1) The same key was already observed in this transaction. Versions are
@@ -1697,7 +1701,7 @@ void LineairDBTransaction::record_stateless_read(const std::string& table_name,
     }
     return;
   }
-  stateless_read_index_[std::move(dedup_key)] = stateless_read_set_.size();
+  stateless_read_index_[srr_scratch_] = stateless_read_set_.size();  // copy: new key
   stateless_read_set_.push_back({table_name, key, tid, found});
 }
 

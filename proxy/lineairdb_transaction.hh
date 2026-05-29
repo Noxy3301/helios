@@ -321,6 +321,22 @@ private:
     k.append(key);
     return k;
   }
+  // alloc-churn #1: fill a CALLER-OWNED reusable buffer with (table+'\0'+key)
+  // instead of allocating a fresh std::string per lookup/dedup. The buffer keeps
+  // its capacity across the millions of per-row probes (clear() does not free),
+  // so find()/erase() cost no allocation. Only NEW map inserts allocate (one per
+  // unique key). Used via the member scratch buffers below.
+  static void fill_local_read_key(std::string& out, const std::string& table,
+                                  const std::string& key) {
+    out.clear();
+    out.append(table);
+    out.push_back('\0');
+    out.append(key);
+  }
+  // Reusable scratch keys for the per-row hot paths (lookup/drop vs dedup-record
+  // use distinct buffers so they never alias mid-call). mutable: lookup is const.
+  mutable std::string lrk_scratch_;
+  std::string srr_scratch_;
   // Proxy-side write set for exact primary-key writes/deletes
   std::vector<LocalRowEntry> local_write_set_;
 
@@ -453,7 +469,10 @@ private:
 
   std::optional<LocalRowEntry> lookup_local_write_set(
       const std::string& table_name, const std::string& key) const;
-  std::optional<LocalRowEntry> lookup_local_read_set(
+  // alloc-churn #1: return a pointer into local_read_set_ (nullptr = miss)
+  // instead of copying the whole LocalRowEntry (incl its value string) per hit.
+  // Valid until the next mutation of local_read_set_; callers use it immediately.
+  const LocalRowEntry* lookup_local_read_set(
       const std::string& table_name, const std::string& key) const;
   void drop_local_read(const std::string& table_name,
                        const std::string& key);
