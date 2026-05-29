@@ -4945,6 +4945,18 @@ int ha_lineairdb::set_fields_from_lineairdb(uchar *buf,
   if (kept != nullptr && ldbField.get_row_size() != kept->size()) {
     kept = nullptr;
   }
+  // Step4a fix (Codex safety review 2026-05-29): skipping non-read_set columns
+  // is sound ONLY for a pure SELECT serve. DML (UPDATE/DELETE) reuses this row
+  // buffer: update_row/delete_row rebuild the old row + ALL secondary keys from
+  // every column, and the engine does NOT advertise HA_PARTIAL_COLUMN_READ, so
+  // MySQL may leave secondary-key/untouched columns out of read_set. Skipping
+  // them then corrupts secondary indexes / the base row. For any non-SELECT
+  // statement, materialize the full row (original behavior). TPC-H is all
+  // SELECT, so the set_fields win is preserved where it matters.
+  THD *const thd_for_serve = ha_thd();
+  const bool select_serve =
+      thd_for_serve != nullptr && thd_for_serve->lex != nullptr &&
+      thd_for_serve->lex->sql_command == SQLCOM_SELECT;
   // Step4a: skip Field::store for columns MySQL won't read this statement
   // (not in table->read_set). set_fields is the per-serve chokepoint (Q21 SF1:
   // 13.1M calls, 5.9s) and a full lineitem row is ~16 columns while a query
@@ -4959,7 +4971,8 @@ int ha_lineairdb::set_fields_from_lineairdb(uchar *buf,
     for (size_t k = 0; k < kept->size(); ++k) {
       const uint32_t fi = (*kept)[k];
       if (fi >= table->s->fields) break;  // safety: malformed projection
-      if (!bitmap_is_set(table->read_set, fi)) continue;  // unread: skip store
+      if (select_serve && !bitmap_is_set(table->read_set, fi))
+        continue;  // pure SELECT: skip store for columns MySQL won't read
       Field *f = table->field[fi];
       const auto mysqlFieldValue = ldbField.get_column_of_row(k);
       if (f->is_nullable() && f->is_null_in_record(buf)) {
@@ -4981,7 +4994,9 @@ int ha_lineairdb::set_fields_from_lineairdb(uchar *buf,
       // value holds all columns in order), then skip the store for columns not
       // in read_set.
       const auto mysqlFieldValue = ldbField.get_column_of_row(columnIndex++);
-      if (!bitmap_is_set(table->read_set, (*field)->field_index())) continue;
+      if (select_serve &&
+          !bitmap_is_set(table->read_set, (*field)->field_index()))
+        continue;
       if ((*field)->is_nullable() && (*field)->is_null_in_record(buf)) {
         (*field)->set_null();
       } else {

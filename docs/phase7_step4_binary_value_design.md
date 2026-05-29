@@ -66,3 +66,14 @@ wall          ~30.9s  → ~28.7s
 残 set_fields 3.4s = make_mysql_table_row(全列の framing parse)+ read 列の store。さらに削るには
 binary format 本体(下記 #1-2, INT32 限定 + server predicate/binding 対応 + row-head magic + dual-read)
 が必要。効果は残 3.4s の一部に留まり blast radius 大のため、費用対効果で後日判断(保留)。
+
+### Step4a 修正 — 2026-05-29(Codex 安全性レビュー指摘)
+Codex が Step4a に DML バグを発見: set_fields_from_lineairdb は SELECT の行提供だけでなく
+update_row/delete_row が読む行バッファ生成にも使われ、read_set 外スキップだと old 行/secondary key
+再構築が stale 列で壊れる(engine は HA_PARTIAL_COLUMN_READ 未宣言なので MySQL は secondary-key 列を
+read_set から外せる)。22/22 md5 が見逃したのは TPC-H が全 SELECT だから。
+修正: skip を `thd->lex->sql_command == SQLCOM_SELECT` に限定。非 SELECT は全列 materialize(従来同一)。
+- DML 中立の論証: 非 SELECT で select_serve=false → skip 無効 → pre-Step4a とバイト同一挙動。
+- 注: helios は ad-hoc autocommit DML(mysql クライアントの単発 UPDATE/DELETE)が pre-Step4a でも
+  Deadlock(40001)する既存制限あり(pre-Step4a 5535a14 で再現確認)。TPC-C は benchbase 経由で別経路。
+  本件はスコープ外。Step4a 修正は SELECT(q1/q6/q9/q21 md5 一致)+ DML 中立で担保。
