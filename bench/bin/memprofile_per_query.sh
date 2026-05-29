@@ -35,7 +35,7 @@ restart_helios_mysqld() {
   sleep 2
   cd /home/noxy/helios/build
   nohup env LD_PRELOAD="$JEMALLOC" MALLOC_CONF=dirty_decay_ms:1000,muzzy_decay_ms:1000 \
-    HELIOS_PIN_TTL_MS=1800000 \
+    HELIOS_PIN_TTL_MS=1800000 HELIOS_OPT_STATS=1 HELIOS_RO_NOVALIDATE=1 \
     ./runtime_output_directory/mysqld --datadir=./data --socket=$SOCK --port=3307 \
     --pid-file=/tmp/mysql.pid --default-storage-engine=lineairdb \
     --max-connections=16384 --open-files-limit=65535 --table-open-cache=8192 \
