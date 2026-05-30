@@ -2529,6 +2529,45 @@ static int qep_table_field_index(TABLE *t, Field *f) {
   return -1;
 }
 
+// P0 semijoin correctness whitelist. A semijoin membership-reduction ("drop
+// probe rows whose key is absent from the source set") is result-preserving
+// ONLY between two leaves joined by a plain INNER equi-join in the SAME
+// top-level query block. For anti-join (NOT IN / NOT EXISTS) the absent rows
+// are exactly the ones to KEEP, so the reduction corrupts results (observed:
+// q22 over-count, q21 -> 0 rows). Reject any leaf that is:
+//   (a) the inner side of an outer join (its NULL-extended rows must survive),
+//   (b) embedded in a semi-join or anti-join nest, or
+//   (c) not in the statement's top-level query block (correlated/derived
+//       subquery — its equality is not a top-level inner-join constraint).
+// The server compares membership keys as raw bytes (lineairdb_rpc.cc:1157), so
+// also require a non-nullable join key and byte-compatible field types between
+// source and probe.
+static bool helios_sj_safe_leaf(const TABLE *t) {
+  if (t == nullptr) return false;
+  const Table_ref *tr = t->pos_in_table_list;
+  if (tr == nullptr) return false;
+  if (tr->is_inner_table_of_outer_join()) return false;     // (a)
+  for (const Table_ref *emb = tr->embedding; emb != nullptr;  // (b)
+       emb = emb->embedding)
+    if (emb->is_sj_or_aj_nest()) return false;
+  const Query_block *qb = tr->query_block;                   // (c)
+  if (qb == nullptr || qb->outer_query_block() != nullptr) return false;
+  return true;
+}
+
+// Source/probe join keys must be byte-compatible for the server's raw-byte
+// membership test, and non-nullable (a NULL key cannot be matched soundly).
+static bool helios_sj_keys_compatible(const Field *src, const Field *probe) {
+  if (src == nullptr || probe == nullptr) return false;
+  if (src->is_nullable() || probe->is_nullable()) return false;
+  if (src->type() != probe->type()) return false;
+  if (src->pack_length() != probe->pack_length()) return false;
+  if (src->result_type() == STRING_RESULT &&
+      src->charset() != probe->charset())
+    return false;
+  return true;
+}
+
 // Auto-generate prefetch steps from the current SELECT's QEP. Returns false if
 // the plan cannot be fully modelled (caller then runs without a prefetch plan).
 static bool auto_generate_plan_from_qep(
@@ -2985,6 +3024,9 @@ static bool auto_generate_plan_from_qep(
       if (probe_step < 0 || probe_step >= (int)steps.size()) continue;
       auto &ps = steps[probe_step];
       if (!(ps.for_each && ps.is_scan)) continue;  // only FER/FES high-fanout
+      // P0: never reduce a probe that is anti/semi/outer/subquery — dropping
+      // its "unmatched" rows would change results (q21/q22).
+      if (!helios_sj_safe_leaf(probe_t)) continue;
       // probe join key field: the index field this step probes (l_partkey).
       // Recover it from the step's first binding target — but bindings don't
       // store the target field. Instead use the table's secondary index field
@@ -3024,6 +3066,14 @@ static bool auto_generate_plan_from_qep(
         if (src_t->s->primary_key == MAX_KEY) continue;
         Field *src_pk = src_t->key_info[src_t->s->primary_key].key_part[0].field;
         if (uf.find(src_pk) == uf.end() || find(src_pk) != cls) continue;
+        // P0: source must also be a plain inner-join leaf, and the source/probe
+        // join keys must be byte-compatible & non-nullable for the server's
+        // raw-byte membership test.
+        if (!helios_sj_safe_leaf(src_t)) continue;
+        if (!helios_sj_keys_compatible(src_pk, probe_field)) continue;
+        if (src_t->pos_in_table_list->query_block !=
+            probe_t->pos_in_table_list->query_block)
+          continue;  // must be the same top-level query block
         // attach: server collects src_pk values from source rows passing
         // sf_filter, drops probe rows whose probe_field is absent.
         const int sc = qep_table_field_index(src_t, src_pk);
@@ -3199,6 +3249,27 @@ static void maybe_auto_stage_oneshot_plan(THD *thd, LineairDBTransaction *tx) {
     for (const auto &s : steps) {
       for (const auto &b : s.bindings) force_binding_col(b);
       for (const auto &b : s.end_bindings) force_binding_col(b);
+    }
+    // Semijoin participants (projection reconciliation). The server reads a
+    // semijoin's source_column from the SOURCE step's value and probe_column
+    // from THIS (probe) step's value using 0-based ordinals (rpc:1157,1164).
+    // Projection trims the shipped row, so full ordinals would mis-extract:
+    // Semijoin projection reconciliation. The server builds the membership set
+    // from the SOURCE step's SHIPPED rows (previous_results[ss].scan_values,
+    // which are projection-trimmed) using source_column and the full-ordinal
+    // source_filter — so the SOURCE must ship full (unsafe_src). The PROBE is
+    // deliberately left untouched: fe_reject() runs on the probe's UNTRIMMED
+    // row (the server trims only afterwards — rpc:1196/1285/1317), so
+    // probe_column stays a FULL ordinal and the probe keeps its projection, so
+    // the semijoin's row reduction is a net transfer win (fewer rows, still
+    // trimmed columns).
+    for (const auto &s : steps) {
+      for (const auto &sj : s.semijoins) {
+        if (sj.source_step < steps.size()) {
+          const std::string &src = steps[sj.source_step].table_name;
+          if (fields_of.count(src)) unsafe_src.insert(src);
+        }
+      }
     }
     // Decide kept per eligible table, build a full->projected index map.
     std::unordered_map<std::string, std::vector<uint32_t>> kept_of;

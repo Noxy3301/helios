@@ -32,3 +32,4 @@ __pycache__/
 
 # local DB data dirs (huge, env-specific)
 data_innodb/
+data_innodb01/
