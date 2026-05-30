@@ -3435,6 +3435,36 @@ static void collect_driver_atoms(Item *it, table_map me,
   }
 }
 
+// Necessary condition implied by an OR-of-ANDs for table `me`: (A or B or ...)
+// implies a predicate P iff every disjunct implies P. Take each disjunct's
+// driver-only atoms (used_tables()==me) and emit OR(AND(atoms_i)). If ANY
+// disjunct has no driver atom the OR constrains `me` by nothing -> return false
+// (push nothing; sound, never stricter than the query). Works whether the OR's
+// disjuncts are single-table or mix tables (TPC-H q7:
+// ((n1=FR and n2=DE) or (n1=DE and n2=FR)) implies n2 in {DE,FR}).
+static bool serialize_or_necessary_condition(
+    Item *or_item, table_map me, LineairDB::Protocol::FilterExpr *out) {
+  if (or_item == nullptr || or_item->type() != Item::COND_ITEM ||
+      down_cast<Item_cond *>(or_item)->functype() != Item_func::COND_OR_FUNC)
+    return false;
+  out->set_op(LineairDB::Protocol::FilterExpr::OP_OR);
+  for (Item &disj : *down_cast<Item_cond *>(or_item)->argument_list()) {
+    std::vector<Item *> atoms;
+    collect_driver_atoms(&disj, me, &atoms);
+    if (atoms.empty()) return false;  // disjunct unconstrained -> unsound
+    LineairDB::Protocol::FilterExpr branch;
+    if (atoms.size() == 1) {
+      if (!serialize_item(atoms[0], &branch)) return false;
+    } else {
+      branch.set_op(LineairDB::Protocol::FilterExpr::OP_AND);
+      for (Item *a : atoms)
+        if (!serialize_item(a, branch.add_children())) return false;
+    }
+    *out->add_children() = std::move(branch);
+  }
+  return out->children_size() > 0;
+}
+
 // Phase-3c/3d: derive a SOUND single-table predicate for the driver scan so the
 // oneshot prefetch is pruned the same way MySQL's scan is. We anchor on the
 // query block that OWNS this table's scan (pos_in_table_list->query_block) so a
@@ -3466,38 +3496,33 @@ static bool build_single_table_filter(THD *thd, TABLE *table,
 
   std::vector<LineairDB::Protocol::FilterExpr> serialized;
 
-  const bool is_or =
-      where->type() == Item::COND_ITEM &&
-      down_cast<Item_cond *>(where)->functype() == Item_func::COND_OR_FUNC;
-
-  if (is_or) {
-    // Sound necessary-condition extraction from an OR-of-ANDs.
-    LineairDB::Protocol::FilterExpr or_root;
-    or_root.set_op(LineairDB::Protocol::FilterExpr::OP_OR);
-    bool ok = true;
-    for (Item &disj : *down_cast<Item_cond *>(where)->argument_list()) {
-      std::vector<Item *> atoms;
-      collect_driver_atoms(&disj, me, &atoms);
-      if (atoms.empty()) { ok = false; break; }  // disjunct unconstrained → unsound
-      LineairDB::Protocol::FilterExpr branch;
-      if (atoms.size() == 1) {
-        if (!serialize_item(atoms[0], &branch)) { ok = false; break; }
-      } else {
-        branch.set_op(LineairDB::Protocol::FilterExpr::OP_AND);
-        for (Item *a : atoms) {
-          if (!serialize_item(a, branch.add_children())) { ok = false; break; }
-        }
-        if (!ok) break;
-      }
-      *or_root.add_children() = std::move(branch);
-    }
-    if (ok && or_root.children_size() > 0) serialized.push_back(std::move(or_root));
+  // Iterate the top-level conjuncts (where is AND => its children; else [where]).
+  // For each: a single-table atom (or AND of them) is kept as-is; an OR conjunct
+  // — even one that MIXES tables — contributes its single-table necessary
+  // condition (this is what lets TPC-H q7's nested OR-of-nation predicate prune
+  // n2, which the old top-level-OR-only path missed); a cross-table join
+  // conjunct is dropped (unsound to evaluate against one table).
+  std::vector<Item *> conjuncts;
+  if (where->type() == Item::COND_ITEM &&
+      down_cast<Item_cond *>(where)->functype() == Item_func::COND_AND_FUNC) {
+    for (Item &c : *down_cast<Item_cond *>(where)->argument_list())
+      conjuncts.push_back(&c);
   } else {
-    std::vector<Item *> keep;
-    collect_driver_atoms(where, me, &keep);
-    for (Item *conjunct : keep) {
-      LineairDB::Protocol::FilterExpr expr;
-      if (serialize_item(conjunct, &expr)) serialized.push_back(std::move(expr));
+    conjuncts.push_back(where);
+  }
+  for (Item *c : conjuncts) {
+    if (c->type() == Item::COND_ITEM &&
+        down_cast<Item_cond *>(c)->functype() == Item_func::COND_OR_FUNC) {
+      LineairDB::Protocol::FilterExpr or_expr;
+      if (serialize_or_necessary_condition(c, me, &or_expr))
+        serialized.push_back(std::move(or_expr));
+    } else {
+      std::vector<Item *> atoms;
+      collect_driver_atoms(c, me, &atoms);
+      for (Item *a : atoms) {
+        LineairDB::Protocol::FilterExpr expr;
+        if (serialize_item(a, &expr)) serialized.push_back(std::move(expr));
+      }
     }
   }
   if (serialized.empty()) return false;
