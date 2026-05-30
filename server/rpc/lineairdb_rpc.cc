@@ -1513,6 +1513,27 @@ void LineairDBRpc::buildExecuteReadPlanResponse(
         response.set_ok(false);
     }
 
+    // read_only_no_validate: range_versions / scan_tids / index_reads are OCC
+    // validation metadata that the proxy discards in RO mode (it skips commit
+    // validation). An AGGREGATE step returns synthetic group rows; its
+    // range_versions (a full lineitem agg scan ships millions of result_keys =
+    // ~257MB at SF=1, dominating the response) feed NO downstream point-read or
+    // negative-cache, so they are pure waste here. Strip OCC metadata on
+    // aggregate steps only — non-aggregate steps keep result_keys, which the
+    // negative-caching path uses for absence proofs (correctness-affecting).
+    // 22/22 TPC-H md5 verified. SF=1: q1/q6 agg response 257MB -> ~0.
+    if (request.read_only_no_validate()) {
+        int si = -1;
+        for (auto& r : *response.mutable_results()) {
+            ++si;
+            if (si < request.steps_size() && request.steps(si).has_aggregate()) {
+                r.clear_scan_tids();
+                r.clear_range_versions();
+                r.clear_index_reads();
+            }
+        }
+    }
+
     // [PLANSZ] per-step composition diagnostic (HELIOS_PLAN_SIZE). Logs, per
     // step, how many rows/keys/values/result_keys/index_reads/filtered the
     // server is shipping back, so over-fetch (e.g. the same big table
