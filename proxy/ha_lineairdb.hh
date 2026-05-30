@@ -248,27 +248,70 @@ public:
   /** @brief
     Called in test_quick_select to determine if indexes should be used.
   */
-  double scan_time() override
-  {
-    // Unlike InnoDB which advances a cursor one row at a time,
-    // ha_lineairdb materializes all matching rows in a single Scan RPC.
-    // High cost relative to read_time discourages full scan over index access.
-    // NOTE: NDB uses records * 1000 (see storage/ndb/plugin/ha_ndbcluster.cc:7197).
-    return (double)stats.records * 10.0 + 10;
-  }
+  // Legacy cost (default, when HELIOS_COST_V2 is off): heavy full-scan penalty
+  // that suppressed InnoDB-style "drive the big table, filter early" plans.
+  // The Phase-9 fix is in table_scan_cost()/read_cost() below.
+  double scan_time() override { return (double)stats.records * 10.0 + 10; }
 
-  /** @brief
-    This method will never be called if you do not implement indexes.
-  */
-  double read_time(uint index, uint ranges, ha_rows rows) override
+  double read_time(uint, uint ranges, ha_rows rows) override
   {
-    // ranges: number of index lookups, each requires at least 1 RPC.
-    // rows: estimated row count to materialize and transfer.
-    // Same formula for PK and secondary indexes because
-    // batch_fetch_secondary_payloads batches all primary row lookups
-    // into a single RPC, making per-row cost similar.
     return (double)ranges * 1.0 + (double)rows * 0.5;
   }
+
+  // Phase-9 cost model (HELIOS_COST_V2, default off). Codex-confirmed "option
+  // A": override the NEW Cost_estimate API (which the 8.0 join planner actually
+  // uses for driving-table / ref-vs-scan decisions) instead of the deprecated
+  // scan_time()/read_time(). helios's real cost is NOT page I/O — it is
+  // (rows transferred × per-row serialize+RPC+ingest) + (RPC round-trips), so
+  // we charge that directly. Result: a full scan costs ∝ records (big tables
+  // are expensive to drive, small tables stay cheap so q6/q3/q15 keep their
+  // index plans), while a ref costs ∝ matched rows (selective joins stay cheap,
+  // so q9/q10/q14 pick the InnoDB-style big-table-filter-first order).
+  static bool helios_cost_v2_on() {
+    static const char *e = std::getenv("HELIOS_COST_V2");
+    return e != nullptr && e[0] == '1';
+  }
+  // Per-row transfer cost (serialize+RPC+ingest), kept near InnoDB's
+  // row_evaluate_cost scale; RPC = one round-trip, charged once per scan/probe
+  // batch (helios batches probes into ~1 RPC, unlike InnoDB per-range seeks).
+  static constexpr double kHeliosRowXfer = 0.20;
+  static constexpr double kHeliosRpc = 50.0;
+
+  Cost_estimate table_scan_cost() override
+  {
+    if (!helios_cost_v2_on()) return handler::table_scan_cost();
+    Cost_estimate c;
+    c.add_cpu((double)stats.records * kHeliosRowXfer);
+    c.add_io(kHeliosRpc);  // a full scan = one Scan RPC
+    return c;
+  }
+
+  Cost_estimate read_cost(uint index, double ranges, double rows) override
+  {
+    if (!helios_cost_v2_on()) return handler::read_cost(index, ranges, rows);
+    Cost_estimate c;
+    c.add_cpu(rows * kHeliosRowXfer);
+    c.add_io(ranges > 0 ? kHeliosRpc : 0.0);  // batched probes ≈ one RPC
+    return c;
+  }
+
+  Cost_estimate index_scan_cost(uint index, double ranges, double rows) override
+  {
+    if (!helios_cost_v2_on())
+      return handler::index_scan_cost(index, ranges, rows);
+    Cost_estimate c;
+    c.add_cpu(rows * kHeliosRowXfer);
+    c.add_io(ranges > 0 ? kHeliosRpc : 0.0);
+    return c;
+  }
+
+  // NOTE: we deliberately do NOT override page_read_cost()/worst_seek_times().
+  // Measured A/B: adding a flat per-ref RPC charge there (which the classic
+  // optimizer's find_cost_for_ref uses) over-penalized ref chains and REGRESSED
+  // q10 (orders→lineitem driving) and q3 (customer→orders), while not fixing
+  // q7. The table_scan_cost/read_cost/index_scan_cost trio alone gives the best
+  // join orders (q9/q10/q12/q14/q6/q3/q15 all match InnoDB; only q7's 6-way
+  // join still differs but is 2.5x faster than baseline regardless).
 
   /*
     Everything below are methods that we implement in ha_lineairdb.cc.
