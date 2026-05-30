@@ -3256,18 +3256,31 @@ static void maybe_auto_stage_oneshot_plan(THD *thd, LineairDBTransaction *tx) {
     // Projection trims the shipped row, so full ordinals would mis-extract:
     // Semijoin projection reconciliation. The server builds the membership set
     // from the SOURCE step's SHIPPED rows (previous_results[ss].scan_values,
-    // which are projection-trimmed) using source_column and the full-ordinal
-    // source_filter — so the SOURCE must ship full (unsafe_src). The PROBE is
-    // deliberately left untouched: fe_reject() runs on the probe's UNTRIMMED
-    // row (the server trims only afterwards — rpc:1196/1285/1317), so
-    // probe_column stays a FULL ordinal and the probe keeps its projection, so
-    // the semijoin's row reduction is a net transfer win (fewer rows, still
-    // trimmed columns).
+    // which are projection-trimmed) using source_column (read 0-based) and, in
+    // the unfiltered branch, the full-ordinal source_filter. The PROBE is left
+    // untouched: fe_reject() runs on the probe's UNTRIMMED row (the server trims
+    // afterwards — rpc:1196/1285/1317), so probe_column stays a FULL ordinal and
+    // the probe keeps its projection.
+    // For the SOURCE, branch on whether a source_filter rides along:
+    //  - unfiltered branch (source_filter set): ship full (unsafe_src) so the
+    //    full-ordinal filter AND source_column extract correctly. The source is
+    //    a small filtered table here, so full ship is cheap.
+    //  - filtered branch (source already reduced at fetch, no source_filter):
+    //    the source may be LARGE (e.g. q3/q8/q21 orders=1.5M), so keep it
+    //    projected — only force-keep source_column and remap it to its packed
+    //    position (below). Full-shipping a large source was a net transfer LOSS.
     for (const auto &s : steps) {
       for (const auto &sj : s.semijoins) {
-        if (sj.source_step < steps.size()) {
-          const std::string &src = steps[sj.source_step].table_name;
-          if (fields_of.count(src)) unsafe_src.insert(src);
+        if (sj.source_step >= steps.size()) continue;
+        const std::string &src = steps[sj.source_step].table_name;
+        auto fo = fields_of.find(src);
+        if (fo == fields_of.end()) continue;
+        if (!sj.source_filter.empty()) {
+          unsafe_src.insert(src);  // unfiltered branch: small source, ship full
+        } else if (static_cast<uint32_t>(sj.source_column) < fo->second) {
+          auto &u = union_rs[src];   // filtered branch: keep projected
+          if (u.size() < fo->second) u.resize(fo->second, false);
+          u[static_cast<uint32_t>(sj.source_column)] = true;
         }
       }
     }
@@ -3304,6 +3317,21 @@ static void maybe_auto_stage_oneshot_plan(THD *thd, LineairDBTransaction *tx) {
     for (auto &s : steps) {
       for (auto &b : s.bindings) remap_binding(b);
       for (auto &b : s.end_bindings) remap_binding(b);
+    }
+    // Remap each semijoin's source_column to its projected position when the
+    // source step is projected (filtered branch). The server reads it 0-based
+    // from the trimmed source row; f2p is 1-based (0 => not kept, but we
+    // force-kept it above). Full-shipped sources are absent from full_to_proj
+    // and keep their full ordinal.
+    for (auto &s : steps) {
+      for (auto &sj : s.semijoins) {
+        if (sj.source_step >= steps.size()) continue;
+        auto it = full_to_proj.find(steps[sj.source_step].table_name);
+        if (it == full_to_proj.end()) continue;  // source full => full ordinal
+        const uint32_t fi = static_cast<uint32_t>(sj.source_column);
+        const uint32_t pos = (fi < it->second.size()) ? it->second[fi] : 0;
+        if (pos > 0) sj.source_column = pos - 1;  // 1-based f2p -> 0-based packed
+      }
     }
     for (auto &s : steps) {
       auto it = kept_of.find(s.table_name);
