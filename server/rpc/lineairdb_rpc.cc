@@ -1118,6 +1118,59 @@ void LineairDBRpc::buildExecuteReadPlanResponse(
                     row_count, step.is_scan() ? 1 : 0,
                     step.index_name().c_str());
 
+            // Per-step pushed predicate + Phase-9 semijoin membership. Hoisted
+            // here so BOTH the FE point-read path and the FER/FES range path
+            // apply them. fe_reject(value) returns true => drop the row (still
+            // route its TID for OCC). Semijoin sets are built once from earlier
+            // steps' result columns; a probe row whose join key is absent from
+            // any set has no join partner and is safe to drop.
+            const bool fe_has_filter = step.has_filter() && step.filter().has_expr();
+            const uint32_t fe_num_cols =
+                fe_has_filter ? step.filter().num_columns() : 0;
+            PredicateEvaluator fe_eval;
+            struct FeSemijoin {
+                std::unordered_set<std::string> keys;
+                uint32_t probe_column;
+            };
+            std::vector<FeSemijoin> fe_semijoins;
+            for (const auto& sj : step.semijoins()) {
+                const int ss = static_cast<int>(sj.source_step());
+                if (ss < 0 || ss >= step_idx ||
+                    ss >= static_cast<int>(previous_results.size())) continue;
+                FeSemijoin fsj;
+                fsj.probe_column = sj.probe_column();
+                // Optional source predicate: collect the key only from source
+                // rows that satisfy it (e.g. green parts), so the set is the
+                // reduced join key set even though the source step shipped all
+                // its rows for the executor's point-probes.
+                const bool sf_on =
+                    sj.has_source_filter() && sj.source_filter().has_expr();
+                const uint32_t sf_cols =
+                    sf_on ? sj.source_filter().num_columns() : 0;
+                for (const auto& v : previous_results[ss]->scan_values()) {
+                    if (sf_on) {
+                        PredicateEvaluator se;
+                        if (se.parse_row(v.data(), v.size(), sf_cols) &&
+                            !se.evaluate(sj.source_filter().expr()))
+                            continue;  // source row fails predicate → skip key
+                    }
+                    auto col = extract_value_column(v, sj.source_column());
+                    if (!col.empty()) fsj.keys.emplace(col);
+                }
+                fe_semijoins.push_back(std::move(fsj));
+            }
+            auto fe_reject = [&](const std::string& value) -> bool {
+                for (const auto& fsj : fe_semijoins) {
+                    auto col = extract_value_column(value, fsj.probe_column);
+                    if (fsj.keys.find(std::string(col)) == fsj.keys.end())
+                        return true;  // no join partner → drop
+                }
+                if (!fe_has_filter) return false;
+                if (!fe_eval.parse_row(value.data(), value.size(), fe_num_cols))
+                    return false;  // parse failure → keep (safe)
+                return !fe_eval.evaluate(step.filter().expr());
+            };
+
             if (!step.is_scan()) {
                 // FE: point read per source row (PK lookup).
                 // Dedup by PK: many source rows map to the same inner row (e.g.
@@ -1138,6 +1191,13 @@ void LineairDBRpc::buildExecuteReadPlanResponse(
                         db_manager_->get_database()->StatelessRead(
                             step.table_name(), row_key);
                     if (stp) { stp_db_ns += tp_now() - stp_db_t0; ++stp_n_pointread; }
+                    // Phase-9 semijoin / per-step filter: drop FE point reads
+                    // whose join key has no partner (route TID for OCC).
+                    if (read_result.found && fe_reject(read_result.value)) {
+                        route_filtered_row(step_result, step.table_name(),
+                                           row_key, read_result.tid);
+                        continue;
+                    }
                     step_result->add_scan_keys(row_key);
                     step_result->add_scan_tids(read_result.tid);
                     if (read_result.found) {
@@ -1160,16 +1220,6 @@ void LineairDBRpc::buildExecuteReadPlanResponse(
             // sub-scan rows server-side so deep join tables are not over-fetched.
             // range_versions (logical result_keys) stays the PRE-filter full
             // range so commit revalidation matches — same contract as S: steps.
-            const bool fe_has_filter = step.has_filter() && step.filter().has_expr();
-            const uint32_t fe_num_cols =
-                fe_has_filter ? step.filter().num_columns() : 0;
-            PredicateEvaluator fe_eval;
-            auto fe_reject = [&](const std::string& value) -> bool {
-                if (!fe_has_filter) return false;
-                if (!fe_eval.parse_row(value.data(), value.size(), fe_num_cols))
-                    return false;  // parse failure → keep (safe)
-                return !fe_eval.evaluate(step.filter().expr());
-            };
             // Dedup identical sub-ranges: many source rows yield the same
             // [start,end) probe (e.g. 4x for Q9 lineitem-by-partkey, since a
             // partkey recurs once per supplier). The proxy indexes subscans by

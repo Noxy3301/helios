@@ -225,6 +225,14 @@ public:
         // returns group rows instead of base rows. Stamped by execute_read_plan
         // from tx->pushed_aggregate_ at send time. Empty = no aggregation.
         std::string aggregate_serialized;
+        // Phase-9 semijoin reduction: (source_step, source_column, probe_column)
+        // tuples. The server keeps only rows whose probe_column is among the
+        // source_column values of source_step's result. EMPTY = no semijoin.
+        struct Semijoin {
+          uint32_t source_step = 0, source_column = 0, probe_column = 0;
+          std::string source_filter;  // serialized PushedPredicate (empty=none)
+        };
+        std::vector<Semijoin> semijoins;
     };
     // One per-source-row sub-scan from a for_each && is_scan step (FER/FES).
     struct ReadPlanSubScan {

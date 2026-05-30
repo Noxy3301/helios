@@ -2931,6 +2931,134 @@ static bool auto_generate_plan_from_qep(
     }
   }
 
+  // Phase-9 semijoin reduction (gated HELIOS_ENABLE_SEMIJOIN, default off).
+  // Goal: for a high-fanout probe step (e.g. lineitem by partsupp.ps_partkey),
+  // if its probe join key is in the same equality class as a column of an
+  // EARLIER, selectively-filtered step (e.g. part with p_name LIKE '%green%'),
+  // ship only probe rows whose key is among that filtered step's surviving keys.
+  // The join itself stays on the compute side; this only drops rows that cannot
+  // join, so results are unchanged.
+  //
+  // Equality classes come from the join conditions (Index_lookup ref): for each
+  // bound leaf, ref->items[kp] (a source Field) == the target index key_part
+  // field. We union-find over (table,column) field pointers, map each class to
+  // its steps, find a class member step that (a) is earlier and (b) carries a
+  // single-table filter, and attach a SemijoinFilter to the later high-fanout
+  // step. q9: class {part.p_partkey, partsupp.ps_partkey, lineitem.l_partkey};
+  // part (step3, green) prunes lineitem (step4).
+  if (std::getenv("HELIOS_ENABLE_SEMIJOIN") != nullptr) {
+    // union-find over Field*
+    std::unordered_map<Field *, Field *> uf;
+    std::function<Field *(Field *)> find = [&](Field *x) -> Field * {
+      auto it = uf.find(x);
+      if (it == uf.end()) { uf[x] = x; return x; }
+      if (it->second == x) return x;
+      Field *r = find(it->second);
+      uf[x] = r;
+      return r;
+    };
+    auto unite = [&](Field *a, Field *b) { uf[find(a)] = find(b); };
+    // Re-derive equality edges from the join refs of every leaf.
+    auto add_edges = [&](AccessPath *leaf) {
+      TABLE *t = nullptr; Index_lookup *ref = nullptr;
+      bool fs = false; int fsi = -1;
+      if (!qep_leaf_info(leaf, &t, &ref, &fs, &fsi) || ref == nullptr) return;
+      for (uint kp = 0; kp < ref->key_parts; ++kp) {
+        Item *val = ref->items ? ref->items[kp] : nullptr;
+        if (val == nullptr) continue;
+        val = val->real_item();
+        if (val->type() != Item::FIELD_ITEM) continue;
+        Field *sf = down_cast<Item_field *>(val)->field;
+        Field *tf = (ref->key >= 0 && ref->key < (int)t->s->keys)
+                        ? t->key_info[ref->key].key_part[kp].field : nullptr;
+        if (sf && tf) unite(sf, tf);
+      }
+    };
+    for (AccessPath *lf : leaves) add_edges(lf);
+    // Which steps have a single-table filter (selective source candidates)?
+    // Map each step's TABLE* (via tbl_step) and its primary-key field's class.
+    // For each FER/FES probe step, look for an earlier filtered step in the same
+    // class and attach a semijoin on the probe's PK field.
+    for (auto &kvp : tbl_step) {
+      TABLE *probe_t = kvp.first;
+      int probe_step = kvp.second;
+      if (probe_step < 0 || probe_step >= (int)steps.size()) continue;
+      auto &ps = steps[probe_step];
+      if (!(ps.for_each && ps.is_scan)) continue;  // only FER/FES high-fanout
+      // probe join key field: the index field this step probes (l_partkey).
+      // Recover it from the step's first binding target — but bindings don't
+      // store the target field. Instead use the table's secondary index field
+      // for FES, or PK first part for FER. For q9 lineitem FES on l_partkey the
+      // index key_part[0] field is l_partkey.
+      Field *probe_field = nullptr;
+      if (!ps.index_name.empty()) {
+        for (uint k = 0; k < probe_t->s->keys; ++k)
+          if (ps.index_name == probe_t->key_info[k].name) {
+            probe_field = probe_t->key_info[k].key_part[0].field; break;
+          }
+      } else if (probe_t->s->primary_key != MAX_KEY) {
+        probe_field = probe_t->key_info[probe_t->s->primary_key].key_part[0].field;
+      }
+      if (probe_field == nullptr || uf.find(probe_field) == uf.end()) continue;
+      Field *cls = find(probe_field);
+      // find an earlier filtered step in the same class
+      for (auto &kvp2 : tbl_step) {
+        TABLE *src_t = kvp2.first;
+        int src_step = kvp2.second;
+        if (src_step >= probe_step || src_step < 0 ||
+            src_step >= (int)steps.size()) continue;
+        // The source must carry a selective single-table predicate (e.g.
+        // part.p_name LIKE '%green%'). We do NOT stamp it onto the source step:
+        // the source may be a join inner the executor point-probes for EVERY
+        // outer row, so dropping its non-matching rows from the prefetch cache
+        // would cause cache misses. Instead the predicate travels in the
+        // semijoin; the server builds the membership set from only the source
+        // rows that satisfy it, while still shipping the source step in full.
+        std::string sf_filter;
+        if (steps[src_step].is_scan && !steps[src_step].filter_serialized.empty())
+          sf_filter = steps[src_step].filter_serialized;  // already filtered at fetch
+        else if (!build_single_table_filter(thd, src_t, &sf_filter) ||
+                 sf_filter.empty())
+          continue;  // no selective predicate → not a useful semijoin source
+        // does src_t have a field in this class? use its PK (the join key).
+        if (src_t->s->primary_key == MAX_KEY) continue;
+        Field *src_pk = src_t->key_info[src_t->s->primary_key].key_part[0].field;
+        if (uf.find(src_pk) == uf.end() || find(src_pk) != cls) continue;
+        // attach: server collects src_pk values from source rows passing
+        // sf_filter, drops probe rows whose probe_field is absent.
+        const int sc = qep_table_field_index(src_t, src_pk);
+        const int pc = qep_table_field_index(probe_t, probe_field);
+        if (sc < 0 || pc < 0) continue;
+        LineairDBProxy::ReadPlanStep::Semijoin sj;
+        sj.source_step = (uint32_t)src_step;
+        sj.source_column = (uint32_t)sc;
+        sj.probe_column = (uint32_t)pc;
+        // Only carry the filter as a source_filter when the source step ships
+        // its rows UNFILTERED (FE point-read / unfiltered scan). If the source
+        // scan is already filtered at fetch, its shipped rows are the reduced
+        // set, so collect from all of them (empty source_filter).
+        if (!(steps[src_step].is_scan &&
+              !steps[src_step].filter_serialized.empty())) {
+          sj.source_filter = sf_filter;
+          // The server evaluates source_filter (full-row field indices) over the
+          // source step's shipped rows; disable that step's projection so it
+          // ships full rows whose layout matches the filter's column indices.
+          // The source is the small filtered table (e.g. part), so shipping it
+          // unprojected is cheap vs. the probe-side rows we prune.
+          steps[src_step].projection.clear();
+          steps[src_step].projection_num_columns = 0;
+        }
+        ps.semijoins.push_back(sj);
+        if (dbg)
+          std::fprintf(stderr,
+            "[QEP] semijoin: step%d(%s) probe_col=%d <- step%d(%s) src_col=%d\n",
+            probe_step, ps.table_name.c_str(), pc, src_step,
+            steps[src_step].table_name.c_str(), sc);
+        break;  // one semijoin source per probe step (PoC)
+      }
+    }
+  }
+
   *out = std::move(steps);
   return !out->empty();
 }
@@ -3819,7 +3947,9 @@ int ha_lineairdb::info(uint flag) {
             }
             const bool force = share->index_ndv_force_refresh_.exchange(
                 false, std::memory_order_relaxed);
-            if (ctx->proxy->fetch_table_stats(db_table_name, descs, force)) {
+            const bool fetched =
+                ctx->proxy->fetch_table_stats(db_table_name, descs, force);
+            if (fetched) {
               find_seed();
               std::lock_guard<std::mutex> g(share->index_ndv_mu_);
               share->index_ndv_.clear();
@@ -3944,8 +4074,9 @@ void ha_lineairdb::set_generic_rec_per_key(KEY *key, uint key_parts,
   if (share != nullptr &&
       share->index_ndv_loaded_.load(std::memory_order_relaxed)) {
     std::lock_guard<std::mutex> g(share->index_ndv_mu_);
-    auto it = share->index_ndv_.find(
-        is_primary ? std::string() : std::string(key->name ? key->name : ""));
+    const std::string lookup_key =
+        is_primary ? std::string() : std::string(key->name ? key->name : "");
+    auto it = share->index_ndv_.find(lookup_key);
     if (it != share->index_ndv_.end() && it->second.size() >= key_parts) {
       // Copy out under the lock so we can release it before set_records_per_key.
       static thread_local std::vector<uint64_t> ndv_local;
