@@ -681,6 +681,10 @@ LineairDBProxy::ReadPlanResult LineairDBProxy::tx_execute_read_plan(
           p->set_num_columns(step.projection_num_columns);
           for (uint32_t idx : step.projection) p->add_field_indexes(idx);
         }
+        // Phase-8 Phase B: aggregation pushdown (empty => no aggregation).
+        if (!step.aggregate_serialized.empty() && step.is_scan) {
+          out->mutable_aggregate()->ParseFromString(step.aggregate_serialized);
+        }
         for (const auto& binding : step.bindings) {
             auto* b = out->add_bindings();
             b->set_source_step(binding.source_step);

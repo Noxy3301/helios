@@ -406,6 +406,15 @@ void LineairDBTransaction::execute_read_plan(
     if (stamp_eligible) {
       s.filter_serialized = pushed_filter_;
     }
+    // Phase-8 Phase B: stamp the aggregate spec onto the matching primary scan.
+    // Disable projection on this step: the server parses full rows and reads
+    // group/arg columns by original field index (spec uses original indices).
+    if (s.is_scan && !s.for_each && s.index_name.empty() &&
+        !pushed_aggregate_.empty() && s.table_name == db_table_key) {
+      s.aggregate_serialized = pushed_aggregate_;
+      s.projection.clear();
+      s.projection_num_columns = 0;
+    }
   }
 
   rpc_trace_.record_local_view("plan_request:steps=" +

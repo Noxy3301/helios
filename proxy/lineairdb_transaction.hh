@@ -166,6 +166,9 @@ public:
   void set_pushed_filter(const std::string& s) { pushed_filter_ = s; }
   const std::string& get_pushed_filter() const { return pushed_filter_; }
   void clear_pushed_filter() { pushed_filter_.clear(); }
+  // Phase-8 Phase B: serialized AggregateSpec stamped onto the primary scan.
+  void set_pushed_aggregate(const std::string& s) { pushed_aggregate_ = s; }
+  void clear_pushed_aggregate() { pushed_aggregate_.clear(); }
 
   void add_rowcount_delta(LineairDB_share *share, const std::string &table_name, int64_t delta);
   int64_t peek_rowcount_delta(const LineairDB_share *share) const;
@@ -472,6 +475,8 @@ private:
 
   // Predicate pushdown: serialized PushedPredicate for scan filtering
   std::string pushed_filter_;
+  // Phase-8 Phase B: serialized AggregateSpec for server-side aggregation
+  std::string pushed_aggregate_;
 
   // Phase-3b: oneshot plan staged from ha_lineairdb.cc but not yet executed.
   // Executed lazily on the first read/scan via execute_pending_oneshot_plan().
