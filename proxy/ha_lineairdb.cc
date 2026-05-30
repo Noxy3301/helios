@@ -2568,6 +2568,113 @@ static bool helios_sj_keys_compatible(const Field *src, const Field *probe) {
   return true;
 }
 
+// Duplicate-fetch dedup. Two read-plan steps that fetch byte-identical data
+// (same physical table, same access shape + key bindings + filter + aggregate +
+// semijoins) ship that data twice. The transaction cache is keyed by physical
+// table + key (lookup_local_range_scan / local_read_set_, step/alias-agnostic),
+// so every alias handler resolves to whichever cached entry matches the probe —
+// the duplicate fetches are pure redundant network transfer (TPC-H q21:
+// lineitem fetched 3x by the l1/l2/l3 self-join aliases, all by orders.o_orderkey).
+// Keep the first step of each identical-signature group, drop the rest, and
+// remap every source_step reference (bindings/end_bindings/semijoins) to the
+// survivor. Steps that differ in filter/aggregate/semijoin/access-shape are NOT
+// merged (their fetched row sets differ). OCC is unaffected: the same physical
+// rows observed once vs thrice carry the same version; record_stateless_read /
+// activate_range_validation already dedup. Alias predicates (q21 l_receiptdate>
+// l_commitdate, l_suppkey<>...) are applied by MySQL post-fetch, not at fetch,
+// so sharing the candidate row set preserves result multiplicity.
+static void dedup_identical_fetch_steps(
+    std::vector<LineairDBProxy::ReadPlanStep> &steps) {
+  const bool dbg = std::getenv("HELIOS_FE_DEBUG") != nullptr;
+  auto put_u = [](std::string &s, uint64_t v) {
+    for (int i = 0; i < 8; ++i) s.push_back((char)((v >> (8 * i)) & 0xff));
+  };
+  auto put_s = [&](std::string &s, const std::string &v) {
+    put_u(s, v.size());
+    s.append(v);
+  };
+  std::vector<int> canonical_old(steps.size());     // earliest step with same sig
+  std::unordered_map<std::string, int> sig_to_canon;
+  for (size_t i = 0; i < steps.size(); ++i) {
+    const auto &st = steps[i];
+    std::string sig;
+    put_s(sig, st.table_name);
+    put_s(sig, st.key_prefix);
+    put_s(sig, st.end_key_prefix);
+    put_s(sig, st.index_name);
+    put_s(sig, st.filter_serialized);
+    put_s(sig, st.aggregate_serialized);
+    sig.push_back(st.is_scan ? 1 : 0);
+    sig.push_back(st.for_each ? 1 : 0);
+    sig.push_back(st.reverse_scan ? 1 : 0);
+    put_u(sig, st.scan_limit);
+    auto add_b = [&](const std::vector<LineairDBProxy::ReadPlanKeyBinding> &bs) {
+      put_u(sig, bs.size());
+      for (const auto &b : bs) {
+        // canonicalize the source ref so two consumers of duplicate sources
+        // still compare equal (sources have a smaller index => already set).
+        put_u(sig, (uint64_t)(uint32_t)canonical_old[b.source_step]);
+        put_u(sig, b.source_row);
+        put_u(sig, b.source_offset);
+        put_u(sig, b.source_length);
+        put_u(sig, (uint64_t)(uint32_t)b.source_column);
+        put_u(sig, (uint64_t)b.int_delta);
+        sig.push_back(b.use_midpoint ? 1 : 0);
+        sig.push_back(b.from_key ? 1 : 0);
+        sig.push_back(b.column_as_int_key ? 1 : 0);
+      }
+    };
+    add_b(st.bindings);
+    add_b(st.end_bindings);
+    put_u(sig, st.semijoins.size());
+    for (const auto &sj : st.semijoins) {
+      put_u(sig, (uint64_t)canonical_old[sj.source_step]);
+      put_u(sig, sj.source_column);
+      put_u(sig, sj.probe_column);
+      put_s(sig, sj.source_filter);
+    }
+    auto it = sig_to_canon.find(sig);
+    if (it == sig_to_canon.end()) {
+      sig_to_canon.emplace(std::move(sig), (int)i);
+      canonical_old[i] = (int)i;
+    } else {
+      canonical_old[i] = it->second;
+    }
+  }
+  // No duplicates => leave `steps` untouched and return. This MUST be checked
+  // before the move-compaction below: moving survivors into `kept` empties
+  // steps[i], so returning after the moves (when nothing was dropped) would
+  // hand the caller a vector of moved-from (empty) steps and break every query
+  // that has no duplicate fetch (observed: full-scan queries deadlocked).
+  if (sig_to_canon.size() == steps.size()) return;
+  // Compact survivors (canonical_old[i]==i), build old->new index map.
+  std::vector<int> old_to_new(steps.size(), -1);
+  std::vector<LineairDBProxy::ReadPlanStep> kept;
+  kept.reserve(steps.size());
+  for (size_t i = 0; i < steps.size(); ++i) {
+    if (canonical_old[i] == (int)i) {
+      old_to_new[i] = (int)kept.size();
+      kept.push_back(std::move(steps[i]));
+    } else if (dbg) {
+      std::fprintf(stderr,
+          "[DEDUP] drop step%zu (dup of step%d) tbl=%s idx=%s for_each=%d\n",
+          i, canonical_old[i], steps[i].table_name.c_str(),
+          steps[i].index_name.c_str(), steps[i].for_each ? 1 : 0);
+    }
+  }
+  auto remap = [&](uint32_t &src) {
+    src = (uint32_t)old_to_new[canonical_old[src]];  // canon is always a survivor
+  };
+  for (auto &st : kept) {
+    for (auto &b : st.bindings) remap(b.source_step);
+    for (auto &b : st.end_bindings) remap(b.source_step);
+    for (auto &sj : st.semijoins) remap(sj.source_step);
+  }
+  if (dbg)
+    std::fprintf(stderr, "[DEDUP] %zu -> %zu steps\n", steps.size(), kept.size());
+  steps = std::move(kept);
+}
+
 // Auto-generate prefetch steps from the current SELECT's QEP. Returns false if
 // the plan cannot be fully modelled (caller then runs without a prefetch plan).
 static bool auto_generate_plan_from_qep(
@@ -3049,6 +3156,22 @@ static bool auto_generate_plan_from_qep(
         int src_step = kvp2.second;
         if (src_step >= probe_step || src_step < 0 ||
             src_step >= (int)steps.size()) continue;
+        // Redundant-semijoin guard: if the probe already FER-probes FROM this
+        // source step (a binding's source_step == src_step) AND that source is
+        // fetched-filtered, the FER only fetches keys present in the filtered
+        // source, so the membership reduction is a no-op. Skipping it keeps the
+        // probe's fetch signature identical across self-join aliases so
+        // dedup_identical_fetch_steps can collapse them (q21: l1's redundant
+        // orders->lineitem semijoin otherwise blocks the lineitem 3->1 merge).
+        // (q7 differs: nation is NOT fetched-filtered, so its semijoin stays.)
+        {
+          bool probe_fers_from_src = false;
+          for (const auto &b : ps.bindings)
+            if ((int)b.source_step == src_step) { probe_fers_from_src = true; break; }
+          if (probe_fers_from_src && steps[src_step].is_scan &&
+              !steps[src_step].filter_serialized.empty())
+            continue;
+        }
         // The source must carry a selective single-table predicate (e.g.
         // part.p_name LIKE '%green%'). We do NOT stamp it onto the source step:
         // the source may be a join inner the executor point-probes for EVERY
@@ -3109,6 +3232,7 @@ static bool auto_generate_plan_from_qep(
     }
   }
 
+  dedup_identical_fetch_steps(steps);  // collapse byte-identical duplicate fetches
   *out = std::move(steps);
   return !out->empty();
 }
