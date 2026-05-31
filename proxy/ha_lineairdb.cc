@@ -2550,8 +2550,15 @@ static bool helios_sj_safe_leaf(const TABLE *t) {
   for (const Table_ref *emb = tr->embedding; emb != nullptr;  // (b)
        emb = emb->embedding)
     if (emb->is_sj_or_aj_nest()) return false;
-  const Query_block *qb = tr->query_block;                   // (c)
-  if (qb == nullptr || qb->outer_query_block() != nullptr) return false;
+  // (c) A leaf in a NON-top-level query block (a derived table or a SCALAR
+  // subquery, e.g. q11's HAVING threshold `(select sum(...) from partsupp,
+  // supplier,nation where ...)`) is still a sound semijoin participant as long
+  // as it is an inner-join leaf: EXISTS/IN/NOT EXISTS/NOT IN are flattened by
+  // MySQL into semi/anti-join NESTS, which (b) already rejects, and the attach
+  // site additionally requires source and probe to share the SAME query block,
+  // so a correlated reduction across blocks never forms. (Was top-level-only;
+  // that needlessly left q11's subquery supplier/partsupp unpruned -> 800k ship.)
+  if (tr->query_block == nullptr) return false;
   return true;
 }
 
@@ -2903,6 +2910,12 @@ static bool auto_generate_plan_from_qep(
   // SUM over lineitem keyed by the outer partsupp, Q2's MIN over partsupp) are
   // also prefetched. An unmodellable subquery leaf is best-effort (left to the
   // full-S: safety net below / stateless fallback) rather than aborting.
+  // Accumulate ALL leaves (main tree + every nested subquery) so the semijoin
+  // union-find below sees subquery join keys too. Without this, a scalar
+  // subquery's equi-join (q11's HAVING `(select ... from partsupp,supplier,
+  // nation where ...)`) is absent from the union-find, so its supplier/partsupp
+  // probes find no equality class and ship unpruned (q11 partsupp -> 800k).
+  std::vector<AccessPath *> sj_leaves = leaves;
   std::vector<Query_block *> stack{qb};
   while (!stack.empty()) {
     Query_block *b = stack.back();
@@ -2919,6 +2932,7 @@ static bool auto_generate_plan_from_qep(
         collect_qep_leaves(sub->join->root_access_path(), &sl, &sok);
         if (!sok) continue;
         for (AccessPath *lf : sl) (void)compile_leaf(lf);
+        sj_leaves.insert(sj_leaves.end(), sl.begin(), sl.end());
       }
     }
   }
@@ -3120,7 +3134,7 @@ static bool auto_generate_plan_from_qep(
         if (sf && tf) unite(sf, tf);
       }
     };
-    for (AccessPath *lf : leaves) add_edges(lf);
+    for (AccessPath *lf : sj_leaves) add_edges(lf);  // main + subquery leaves
     // Which steps have a single-table filter (selective source candidates)?
     // Map each step's TABLE* (via tbl_step) and its primary-key field's class.
     // For each FER/FES probe step, look for an earlier filtered step in the same
