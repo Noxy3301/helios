@@ -349,6 +349,68 @@ static void aggregate_rows_range(
   }
 }
 
+// Merge worker-local group map `src` into `dst`. COUNT adds; SUM/AVG add via
+// order-independent exact-decimal (int128 fixed-point) dec_addsub. Used by both
+// the morsel-parallel aggregate-over-rows path and the parallel-scan+agg path.
+static void merge_agg_groups(std::unordered_map<std::string, AggGroupState>& dst,
+                             std::unordered_map<std::string, AggGroupState>& src,
+                             int n_agg) {
+  if (dst.empty()) { dst = std::move(src); return; }
+  for (auto& kv : src) {
+    auto it = dst.find(kv.first);
+    if (it == dst.end()) {
+      dst.emplace(kv.first, std::move(kv.second));
+    } else {
+      AggGroupState& d = it->second;
+      AggGroupState& s = kv.second;
+      for (int a = 0; a < n_agg; ++a) {
+        d.count[a] += s.count[a];
+        dec_addsub(d.sum[a], s.sum[a], false);
+      }
+    }
+  }
+}
+
+// Emit one synthetic group row per group into step_result->scan_values
+// (format: [null_flags][group cols][per-agg value,count]). COUNT ships the row
+// count; SUM/AVG ship an exact decimal sum (ASCII) + non-null count. Implicit
+// grouping (no GROUP BY) emits exactly one row even over zero input.
+static void emit_agg_groups(
+    const LineairDB::Protocol::AggregateSpec& spec,
+    std::unordered_map<std::string, AggGroupState>& groups,
+    LineairDB::Protocol::TxExecuteReadPlan::StepResult* step_result) {
+  using AF = LineairDB::Protocol::AggFunc;
+  const int n_agg = spec.aggs_size();
+  const int n_grp = spec.group_columns_size();
+  if (n_grp == 0 && groups.empty()) {
+    AggGroupState s;
+    s.count.assign(n_agg, 0);
+    s.sum.assign(n_agg, Dec{});
+    groups.emplace(std::string(), std::move(s));
+  }
+  for (auto& kv : groups) {
+    AggGroupState& s = kv.second;
+    std::string row;
+    agg_emit_field(row, std::string_view(), false);  // null_flags (empty)
+    for (int g = 0; g < n_grp; ++g) agg_emit_field(row, s.key_cols[g], false);
+    for (int a = 0; a < n_agg; ++a) {
+      const auto& af = spec.aggs(a);
+      const std::string cnt = std::to_string(s.count[a]);
+      if (af.kind() == AF::AGG_COUNT) {
+        agg_emit_field(row, cnt, false);
+        agg_emit_field(row, cnt, false);
+      } else {  // SUM / AVG: (exact decimal sum | null) , non-null count
+        if (s.count[a] == 0) agg_emit_field(row, std::string_view(), true);
+        else agg_emit_field(row, dec_format(s.sum[a]), false);
+        agg_emit_field(row, cnt, false);
+      }
+    }
+    step_result->add_scan_keys(std::string());
+    step_result->add_scan_values(std::move(row));
+    step_result->add_scan_tids(0);
+  }
+}
+
 // Aggregate `rows` per `spec`, emitting one synthetic group row per group into
 // step_result->scan_values (format: [null_flags][group cols][per-agg value,count]).
 // COUNT ships the row count; SUM/AVG ship an exact decimal sum (ASCII) + non-null
@@ -397,52 +459,9 @@ bool server_aggregate_scan(
         });
       }
       for (auto& w : workers) w.join();
-      for (auto& lm : locals) {
-        if (groups.empty()) { groups = std::move(lm); continue; }
-        for (auto& kv : lm) {
-          auto it = groups.find(kv.first);
-          if (it == groups.end()) {
-            groups.emplace(kv.first, std::move(kv.second));
-          } else {
-            AggGroupState& dst = it->second;
-            AggGroupState& src = kv.second;
-            for (int a = 0; a < n_agg; ++a) {
-              dst.count[a] += src.count[a];
-              dec_addsub(dst.sum[a], src.sum[a], false);
-            }
-          }
-        }
-      }
+      for (auto& lm : locals) merge_agg_groups(groups, lm, n_agg);
     }
-    // Implicit grouping (no GROUP BY) must emit exactly one row even over zero
-    // input rows: COUNT(*) => 0, SUM/AVG => NULL. (P1, Codex review.)
-    if (n_grp == 0 && groups.empty()) {
-        AggGroupState s;
-        s.count.assign(n_agg, 0);
-        s.sum.assign(n_agg, Dec{});
-        groups.emplace(std::string(), std::move(s));
-    }
-    for (auto& kv : groups) {
-        AggGroupState& s = kv.second;
-        std::string row;
-        agg_emit_field(row, std::string_view(), false);  // null_flags (empty)
-        for (int g = 0; g < n_grp; ++g) agg_emit_field(row, s.key_cols[g], false);
-        for (int a = 0; a < n_agg; ++a) {
-            const auto& af = spec.aggs(a);
-            const std::string cnt = std::to_string(s.count[a]);
-            if (af.kind() == AF::AGG_COUNT) {
-                agg_emit_field(row, cnt, false);
-                agg_emit_field(row, cnt, false);
-            } else {  // SUM / AVG: (exact decimal sum | null) , non-null count
-                if (s.count[a] == 0) agg_emit_field(row, std::string_view(), true);
-                else agg_emit_field(row, dec_format(s.sum[a]), false);
-                agg_emit_field(row, cnt, false);
-            }
-        }
-        step_result->add_scan_keys(std::string());
-        step_result->add_scan_values(std::move(row));
-        step_result->add_scan_tids(0);
-    }
+    emit_agg_groups(spec, groups, step_result);
     return true;
 }
 
@@ -470,12 +489,143 @@ std::string encode_int_key_part(int64_t value) {
     return out;
 }
 
+// Inverse of encode_int_key_part: recover the leading int key-part value from a
+// primary key's bytes. Returns false if the key does not begin with the
+// [0x00 0x10 0x00 0x04 | 4-byte flipped int] layout (e.g. non-int leading part),
+// in which case the caller must NOT range-split on it. Used to compute balanced
+// scan-split boundaries from observed first/last keys (parallel scan).
+bool decode_leading_int_key(std::string_view key, int64_t& out) {
+    if (key.size() < 8) return false;
+    if (static_cast<uint8_t>(key[0]) != 0x00 ||
+        static_cast<uint8_t>(key[1]) != 0x10 ||
+        static_cast<uint8_t>(key[2]) != 0x00 ||
+        static_cast<uint8_t>(key[3]) != 0x04)
+        return false;
+    const uint32_t e = (static_cast<uint32_t>(static_cast<uint8_t>(key[4])) << 24) |
+                       (static_cast<uint32_t>(static_cast<uint8_t>(key[5])) << 16) |
+                       (static_cast<uint32_t>(static_cast<uint8_t>(key[6])) << 8) |
+                       (static_cast<uint32_t>(static_cast<uint8_t>(key[7])));
+    out = static_cast<int32_t>(e ^ 0x80000000U);
+    return true;
+}
+
 // Parse a decimal-string column and encode it as int-keyed primary key bytes.
 std::string encode_column_as_int_key(std::string_view column,
                                      int64_t int_delta) {
     std::string tmp(column);
     int64_t value = std::strtoll(tmp.c_str(), nullptr, 10);
     return encode_int_key_part(value + int_delta);
+}
+
+// Parallel primary range scan + filter + aggregate (gated
+// HELIOS_PARALLEL_SERVER_SCAN, default OFF). Splits [start_key, end_key) into
+// balanced sub-ranges on the LEADING int key part. Scan is half-open [begin,end)
+// (masstree_index.cpp ScanAdapter: "key >= end -> stop"), and boundaries are
+// placed at integer key-part values, so a composite key's rows never split
+// across a boundary and no key is double-counted — the partition is exact.
+//
+// Eligible ONLY for read-only no-validate primary AGGREGATE scans. There the OCC
+// metadata (range_versions/index_reads/filtered keys) is stripped downstream
+// anyway, so each worker runs logical-default mode and discards validation
+// output; it copies out only key/value/tid (no node pointers retained) and
+// releases its own Masstree RCU section before exit. Returns false (→ caller
+// falls back to the serial scan path, emitting nothing here) when the range
+// can't be int-decoded/split, is too small, or any worker scan fails.
+//
+// First cut uses per-query std::thread workers (matches the committed
+// HELIOS_PARALLEL_SERVER agg path). DB-touching short-lived threads churn
+// masstree threadinfo (Codex); if that shows up in measurement, swap to a
+// persistent server-local worker pool — the split/merge logic is unchanged.
+static bool parallel_primary_aggregate_scan(
+    LineairDB::Database* db,
+    const LineairDB::Protocol::TxExecuteReadPlan::PlanStep& step,
+    const std::string& start_key, const std::string& end_key,
+    LineairDB::Protocol::TxExecuteReadPlan::StepResult* step_result) {
+  static const bool scan_par_on =
+      std::getenv("HELIOS_PARALLEL_SERVER_SCAN") != nullptr;
+  if (!scan_par_on) return false;
+  auto env_sz = [](const char* n, size_t d) {
+    const char* e = std::getenv(n); if (!e || !e[0]) return d;
+    char* end = nullptr; long v = std::strtol(e, &end, 10);
+    return (end && end != e && v > 0) ? (size_t)v : d;
+  };
+  // Defaults follow SOTA morsel sizing (HyPer ~100k / DuckDB row group 122,880):
+  // morsel 128k, and DuckDB's "need >= threads * morsel rows to go parallel"
+  // gives the serial-fallback floor. threads cap min(hw, 8).
+  const size_t morsel = env_sz("HELIOS_SERVER_SCAN_MORSEL_ROWS", 128000);
+  const size_t min_rows = env_sz("HELIOS_SERVER_SCAN_MIN_ROWS", 500000);
+  const unsigned cap = (unsigned)env_sz(
+      "HELIOS_SERVER_SCAN_THREADS",
+      std::min<unsigned>(std::thread::hardware_concurrency()
+                             ? std::thread::hardware_concurrency() : 4u, 8u));
+  if (cap <= 1) return false;
+
+  // Probe actual first/last key (row_limit=1 forward/reverse) to bound the
+  // split. These run on the handler thread inside its established RCU section.
+  auto first = db->StatelessRangeScan(step.table_name(), start_key, end_key, 1, false);
+  if (!first.ok || first.rows.empty()) return false;
+  auto last = db->StatelessRangeScan(step.table_name(), start_key, end_key, 1, true);
+  if (!last.ok || last.rows.empty()) return false;
+  int64_t lo = 0, hi = 0;
+  if (!decode_leading_int_key(first.rows.front().key, lo) ||
+      !decode_leading_int_key(last.rows.front().key, hi))
+    return false;
+  if (hi <= lo) return false;
+  const uint64_t span = (uint64_t)(hi - lo) + 1;
+  if (span < min_rows) return false;  // too small to amortize thread overhead
+  const size_t desired = morsel ? (size_t)((span + morsel - 1) / morsel) : 1;
+  const unsigned T = (unsigned)std::min<size_t>(desired, cap);
+  if (T <= 1) return false;
+
+  // Integer-aligned boundaries: sub-range i = [start_i, end_i). start_0 keeps
+  // the original start_key, end_{T-1} keeps the original end_key; interior
+  // bounds are encode_int_key_part(b_i) with b_i = lo + span*i/T.
+  std::vector<std::string> starts(T), ends(T);
+  for (unsigned i = 0; i < T; ++i) {
+    const int64_t bi = lo + (int64_t)((span * i) / T);
+    const int64_t bn = (i + 1 == T) ? (hi + 1)
+                                    : lo + (int64_t)((span * (i + 1)) / T);
+    starts[i] = (i == 0) ? start_key : encode_int_key_part(bi);
+    ends[i] = (i + 1 == T) ? end_key : encode_int_key_part(bn);
+  }
+
+  const bool has_filter = step.has_filter() && step.filter().has_expr();
+  const auto& spec = step.aggregate();
+  const int n_agg = spec.aggs_size();
+  std::vector<std::unordered_map<std::string, AggGroupState>> locals(T);
+  std::vector<char> failed(T, 0);
+  std::vector<std::thread> workers;
+  workers.reserve(T);
+  for (unsigned i = 0; i < T; ++i) {
+    workers.emplace_back([&, i] {
+      auto sr = db->StatelessRangeScan(step.table_name(), starts[i], ends[i], 0, false);
+      if (!sr.ok) { failed[i] = 1; db->ReleaseMasstreeThreadEpoch(); return; }
+      if (has_filter && !sr.rows.empty()) {
+        const auto& filter_expr = step.filter().expr();
+        const uint32_t num_cols = step.filter().num_columns();
+        PredicateEvaluator ev;
+        std::vector<LineairDB::StatelessScanRow> kept;
+        kept.reserve(sr.rows.size());
+        for (auto& row : sr.rows) {
+          bool keep = true;
+          if (ev.parse_row(row.value.data(), row.value.size(), num_cols))
+            keep = ev.evaluate(filter_expr);
+          if (keep) kept.push_back(std::move(row));
+        }
+        sr.rows = std::move(kept);
+      }
+      aggregate_rows_range(spec, sr.rows, 0, sr.rows.size(), locals[i]);
+      db->ReleaseMasstreeThreadEpoch();
+    });
+  }
+  for (auto& w : workers) w.join();
+  for (unsigned i = 0; i < T; ++i)
+    if (failed[i]) return false;  // caller re-scans serially; nothing emitted yet
+
+  std::unordered_map<std::string, AggGroupState> groups;
+  for (auto& lm : locals) merge_agg_groups(groups, lm, n_agg);
+  emit_agg_groups(spec, groups, step_result);
+  return true;
 }
 
 // Pick the source byte string for a binding (from a step's scan key, scan value, or value).
@@ -1415,6 +1565,20 @@ void LineairDBRpc::buildExecuteReadPlanResponse(
         if (step.index_name().empty()) {
             step_result->set_actual_start_key(start_key);
             step_result->set_actual_end_key(end_key);
+            // Track-B parallel scan: for a read-only no-validate primary
+            // AGGREGATE scan (q1/q6/q15-class), split the range across worker
+            // threads, filter+aggregate per worker, merge, emit. On success the
+            // group rows are already in step_result and OCC metadata is stripped
+            // downstream, so skip the serial full scan entirely. Falls through
+            // to serial when ineligible / unsplittable / a worker failed.
+            if (request.read_only_no_validate() && !step.for_each() &&
+                step.scan_limit() == 0 && !step.reverse_scan() &&
+                step.has_aggregate() && step.aggregate().aggs_size() > 0) {
+                if (parallel_primary_aggregate_scan(
+                        db_manager_->get_database().get(), step, start_key,
+                        end_key, step_result))
+                    continue;
+            }
             // Phase-3b: when a predicate is attached we must disable the
             // pushed scan_limit at the LineairDB layer and re-apply it after
             // post-filter. Otherwise LineairDB returns the first N physical
