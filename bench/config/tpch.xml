@@ -11,6 +11,12 @@
     <isolation>TRANSACTION_SERIALIZABLE</isolation>
     <batchsize>1024</batchsize>
 
+    <!-- Parallel sharded data load (Helios): TPCHLoader shards each big table into
+         -Dtpch.load.shards (default 8) threads → total 3 + 5*shards threads. The
+         loader pool must be >= that total, else latch-blocked shards deadlock the
+         pool. 128 covers shards up to 25. See docs/phase13_load_speed_investigation.md -->
+    <loaderThreads>128</loaderThreads>
+
     <!-- Control scale factor to generate different amount of data -->
     <scalefactor>0.1</scalefactor>
 

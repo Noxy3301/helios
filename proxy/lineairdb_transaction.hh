@@ -482,8 +482,11 @@ private:
   // Executed lazily on the first read/scan via execute_pending_oneshot_plan().
   std::vector<LineairDBProxy::ReadPlanStep> pending_oneshot_plan_steps_;
 
-  // Max number of buffered write/delete ops before an automatic flush
-  static constexpr size_t WRITE_BATCH_SIZE = 100;
+  // Max number of buffered write/delete ops before an automatic flush.
+  // Sized to match benchbase's JDBC batch (1024 rows/statement) so a bulk-load
+  // statement ships in one TxBatchWrite RPC instead of ~10 mid-statement flushes
+  // — load is synchronous-RPC-round-trip bound, not CPU bound (phase13).
+  static constexpr size_t WRITE_BATCH_SIZE = 1024;
   // Pending RPC flush queue for row and secondary-index ops in MySQL order
   std::vector<LineairDBProxy::BatchOp> write_buffer_ops_;
 
