@@ -53,7 +53,7 @@ enum class MessageType : uint32_t {
     TX_BATCH_READ = 25,
     TX_BATCH_WRITE = 26,
 
-    // Experimental one-shot operations
+    // Experimental prefetch operations
     TX_STATELESS_READ = 27,
     TX_STATELESS_BATCH_READ = 28,
     TX_VALIDATE_AND_COMMIT = 29,

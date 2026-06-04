@@ -7,7 +7,7 @@ import mysql.connector
 from utils.connection import get_connection
 
 
-DBNAME = f"ha_lineairdb_oneshot_plan_{int(time.time())}"
+DBNAME = f"ha_lineairdb_prefetch_plan_{int(time.time())}"
 
 
 def reset(cursor, db):
@@ -26,7 +26,7 @@ def expect_commit_error(cursor):
 
 
 def test_prefetch_scope(cursor, db):
-    print("ONESHOT PLAN PREFETCH SCOPE TEST")
+    print("PREFETCH PLAN PREFETCH SCOPE TEST")
     cursor.execute(
         "CREATE TABLE t (id INT NOT NULL PRIMARY KEY, v INT NOT NULL) "
         "ENGINE=LineairDB"
@@ -34,8 +34,8 @@ def test_prefetch_scope(cursor, db):
     cursor.execute("INSERT INTO t VALUES (1,100),(2,200),(3,300)")
     db.commit()
 
-    cursor.execute("SET GLOBAL lineairdb_oneshot_execution=ON")
-    cursor.execute("SET @_ldb_plan='R:t:1;R:t:2;R:t:3'")
+    cursor.execute("SET GLOBAL lineairdb_prefetch_execution=ON")
+    cursor.execute("SET @_prefetch_plan='R:t:1;R:t:2;R:t:3'")
     cursor.execute("START TRANSACTION")
     cursor.execute("SELECT v FROM t WHERE id=1")
     if cursor.fetchone()[0] != 100:
@@ -47,7 +47,7 @@ def test_prefetch_scope(cursor, db):
     db.commit()
 
     # A new transaction gets a fresh plan and must read the latest value.
-    cursor.execute("SET @_ldb_plan='R:t:1'")
+    cursor.execute("SET @_prefetch_plan='R:t:1'")
     cursor.execute("START TRANSACTION")
     cursor.execute("SELECT v FROM t WHERE id=1")
     if cursor.fetchone()[0] != 777:
@@ -58,7 +58,7 @@ def test_prefetch_scope(cursor, db):
 
 
 def test_conflict_abort():
-    print("ONESHOT PLAN CONFLICT TEST")
+    print("PREFETCH PLAN CONFLICT TEST")
     a = get_connection(user=args.user, password=args.password)
     b = get_connection(user=args.user, password=args.password)
     ca = a.cursor()
@@ -66,8 +66,8 @@ def test_conflict_abort():
     try:
         ca.execute(f"USE {DBNAME}")
         cb.execute(f"USE {DBNAME}")
-        ca.execute("SET GLOBAL lineairdb_oneshot_execution=ON")
-        ca.execute("SET @_ldb_plan='R:t:1'")
+        ca.execute("SET GLOBAL lineairdb_prefetch_execution=ON")
+        ca.execute("SET @_prefetch_plan='R:t:1'")
         ca.execute("START TRANSACTION")
         ca.execute("SELECT v FROM t WHERE id=1")
         ca.fetchone()
@@ -95,7 +95,7 @@ def test_conflict_abort():
 
 
 def test_unique_commit_check(cursor, db):
-    print("ONESHOT PLAN UNIQUE SECONDARY TEST")
+    print("PREFETCH PLAN UNIQUE SECONDARY TEST")
     cursor.execute(
         "CREATE TABLE unique_c (id INT NOT NULL, c INT NOT NULL, "
         "PRIMARY KEY(id), UNIQUE KEY u_c(c)) ENGINE=LineairDB"
@@ -103,8 +103,8 @@ def test_unique_commit_check(cursor, db):
     cursor.execute("INSERT INTO unique_c VALUES (1,10)")
     db.commit()
 
-    cursor.execute("SET GLOBAL lineairdb_oneshot_execution=ON")
-    cursor.execute("SET @_ldb_plan='R:t:2'")
+    cursor.execute("SET GLOBAL lineairdb_prefetch_execution=ON")
+    cursor.execute("SET @_prefetch_plan='R:t:2'")
     cursor.execute("START TRANSACTION")
     cursor.execute("SELECT v FROM t WHERE id=2")
     cursor.fetchone()
@@ -120,7 +120,7 @@ def test_unique_commit_check(cursor, db):
 
 
 def test_range_clean_commit(cursor, db):
-    print("ONESHOT PLAN RANGE CLEAN COMMIT TEST")
+    print("PREFETCH PLAN RANGE CLEAN COMMIT TEST")
     cursor.execute(
         "CREATE TABLE range_clean_t (id INT NOT NULL PRIMARY KEY, "
         "v INT NOT NULL) ENGINE=LineairDB"
@@ -128,8 +128,8 @@ def test_range_clean_commit(cursor, db):
     cursor.execute("INSERT INTO range_clean_t VALUES (1,1),(10,10),(20,20)")
     db.commit()
 
-    cursor.execute("SET GLOBAL lineairdb_oneshot_execution=ON")
-    cursor.execute("SET @_ldb_plan='S:range_clean_t:10:E:30'")
+    cursor.execute("SET GLOBAL lineairdb_prefetch_execution=ON")
+    cursor.execute("SET @_prefetch_plan='S:range_clean_t:10:E:30'")
     cursor.execute("START TRANSACTION")
     cursor.execute(
         "SELECT id FROM range_clean_t FORCE INDEX(PRIMARY) "
@@ -143,7 +143,7 @@ def test_range_clean_commit(cursor, db):
 
 
 def test_range_phantom_abort():
-    print("ONESHOT PLAN RANGE PHANTOM TEST")
+    print("PREFETCH PLAN RANGE PHANTOM TEST")
     a = get_connection(user=args.user, password=args.password)
     b = get_connection(user=args.user, password=args.password)
     ca = a.cursor()
@@ -158,8 +158,8 @@ def test_range_phantom_abort():
         ca.execute("INSERT INTO range_t VALUES (1,1),(10,10),(20,20),(30,30)")
         a.commit()
 
-        ca.execute("SET GLOBAL lineairdb_oneshot_execution=ON")
-        ca.execute("SET @_ldb_plan='S:range_t:10:E:30'")
+        ca.execute("SET GLOBAL lineairdb_prefetch_execution=ON")
+        ca.execute("SET @_prefetch_plan='S:range_t:10:E:30'")
         ca.execute("START TRANSACTION")
         ca.execute(
             "SELECT id FROM range_t FORCE INDEX(PRIMARY) "
@@ -186,7 +186,7 @@ def test_range_phantom_abort():
 
 
 def test_range_tombstone_reinsert_abort():
-    print("ONESHOT PLAN RANGE TOMBSTONE REINSERT TEST")
+    print("PREFETCH PLAN RANGE TOMBSTONE REINSERT TEST")
     a = get_connection(user=args.user, password=args.password)
     b = get_connection(user=args.user, password=args.password)
     ca = a.cursor()
@@ -204,8 +204,8 @@ def test_range_tombstone_reinsert_abort():
         ca.execute("DELETE FROM tombstone_t WHERE id=15")
         a.commit()
 
-        ca.execute("SET GLOBAL lineairdb_oneshot_execution=ON")
-        ca.execute("SET @_ldb_plan='S:tombstone_t:10:E:30'")
+        ca.execute("SET GLOBAL lineairdb_prefetch_execution=ON")
+        ca.execute("SET @_prefetch_plan='S:tombstone_t:10:E:30'")
         ca.execute("START TRANSACTION")
         ca.execute(
             "SELECT id FROM tombstone_t FORCE INDEX(PRIMARY) "
@@ -232,7 +232,7 @@ def test_range_tombstone_reinsert_abort():
 
 
 def test_secondary_range_clean_commit(cursor, db):
-    print("ONESHOT PLAN SECONDARY RANGE CLEAN COMMIT TEST")
+    print("PREFETCH PLAN SECONDARY RANGE CLEAN COMMIT TEST")
     cursor.execute(
         "CREATE TABLE si_range_clean_t ("
         "id INT NOT NULL PRIMARY KEY, "
@@ -246,8 +246,8 @@ def test_secondary_range_clean_commit(cursor, db):
     )
     db.commit()
 
-    cursor.execute("SET GLOBAL lineairdb_oneshot_execution=ON")
-    cursor.execute("SET @_ldb_plan='SI:si_range_clean_t:c_idx:10'")
+    cursor.execute("SET GLOBAL lineairdb_prefetch_execution=ON")
+    cursor.execute("SET @_prefetch_plan='SI:si_range_clean_t:c_idx:10'")
     cursor.execute("START TRANSACTION")
     cursor.execute(
         "SELECT id FROM si_range_clean_t FORCE INDEX(c_idx) "
@@ -261,7 +261,7 @@ def test_secondary_range_clean_commit(cursor, db):
 
 
 def test_secondary_range_phantom_abort():
-    print("ONESHOT PLAN SECONDARY RANGE PHANTOM TEST")
+    print("PREFETCH PLAN SECONDARY RANGE PHANTOM TEST")
     a = get_connection(user=args.user, password=args.password)
     b = get_connection(user=args.user, password=args.password)
     ca = a.cursor()
@@ -282,8 +282,8 @@ def test_secondary_range_phantom_abort():
         )
         a.commit()
 
-        ca.execute("SET GLOBAL lineairdb_oneshot_execution=ON")
-        ca.execute("SET @_ldb_plan='SI:si_range_t:c_idx:10'")
+        ca.execute("SET GLOBAL lineairdb_prefetch_execution=ON")
+        ca.execute("SET @_prefetch_plan='SI:si_range_t:c_idx:10'")
         ca.execute("START TRANSACTION")
         ca.execute(
             "SELECT id FROM si_range_t FORCE INDEX(c_idx) "

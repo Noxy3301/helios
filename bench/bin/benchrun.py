@@ -202,7 +202,7 @@ def _benchbase_plugin(benchmark):
     return "tpcc" if benchmark == "tpcc-np" else benchmark
 
 
-def run_benchbase(benchmark, config_path, create=False, load=False, execute=False, oneshot=False):
+def run_benchbase(benchmark, config_path, create=False, load=False, execute=False, prefetch=False):
     """Run BenchBase with given phases."""
     jar = BENCHBASE_DIR / "benchbase.jar"
     if not jar.exists():
@@ -212,7 +212,7 @@ def run_benchbase(benchmark, config_path, create=False, load=False, execute=Fals
     flags = f"--create={'true' if create else 'false'} --load={'true' if load else 'false'} --execute={'true' if execute else 'false'}"
     cmd = f"java -jar {jar} -b {_benchbase_plugin(benchmark)} -c {config_path} {flags}"
 
-    env = {**os.environ, "HELIOS_ONESHOT_PLAN": "1"} if oneshot else None
+    env = {**os.environ, "HELIOS_PREFETCH_PLAN": "1"} if prefetch else None
     result = subprocess.run(
         cmd, shell=True, cwd=BENCHBASE_DIR,
         capture_output=True, text=True, env=env,
@@ -354,11 +354,11 @@ def setup_benchmark(benchmark, config_path, mysql_host, mysql_port):
     if load_time:
         print(f"  Load time: {load_time:.1f}s")
 
-    # Oneshot mode requires MySQL's chosen plan to match the @_ldb_plan DSL.
+    # Prefetch mode requires MySQL's chosen plan to match the @_prefetch_plan DSL.
     # Without fresh stats, MySQL can pick PRIMARY for queries the DSL expects
     # to take via a secondary index (e.g. OrderStatus customerByNameSQL),
-    # leading to plan/DSL mismatch and infinite oneshot retry. Refresh stats
-    # unconditionally so stateful and oneshot runs see the same optimizer
+    # leading to plan/DSL mismatch and infinite prefetch retry. Refresh stats
+    # unconditionally so stateful and prefetch runs see the same optimizer
     # decisions.
     analyze_sql = {
         "tpcc":   "ANALYZE TABLE customer, district, history, item, new_order, oorder, order_line, stock, warehouse;",
@@ -373,7 +373,7 @@ def setup_benchmark(benchmark, config_path, mysql_host, mysql_port):
     return load_time
 
 
-def run_execute(benchmark, config_path, terminals, result_base, oneshot=False):
+def run_execute(benchmark, config_path, terminals, result_base, prefetch=False):
     """Run execute phase with metrics collection. Returns result dict."""
     print(f"\n{'='*50}")
     print(f"  {benchmark.upper()} | Terminals: {terminals}")
@@ -398,7 +398,7 @@ def run_execute(benchmark, config_path, terminals, result_base, oneshot=False):
     jar = BENCHBASE_DIR / "benchbase.jar"
     bb_cmd = ["java", "-jar", str(jar), "-b", _benchbase_plugin(benchmark), "-c", str(config_path),
               "--create=false", "--load=false", "--execute=true"]
-    env = {**os.environ, "HELIOS_ONESHOT_PLAN": "1"} if oneshot else None
+    env = {**os.environ, "HELIOS_PREFETCH_PLAN": "1"} if prefetch else None
     bb_proc = subprocess.Popen(bb_cmd, cwd=BENCHBASE_DIR, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env)
     # bb_proc.pid IS the java process (no shell wrapper)
     f = open(metrics_dir / "pidstat-bench.log", "w")
@@ -694,9 +694,9 @@ def main():
                         help="Skip auto start/stop of lineairdb-server and mysqld (assume already running)")
     parser.add_argument("--keep-lineairdb-logs", action="store_true",
                         help="Keep lineairdb_logs after the benchmark")
-    parser.add_argument("--oneshot", action="store_true",
-                        help="Enable Oneshot path: SET GLOBAL lineairdb_oneshot_execution=ON and "
-                             "pass HELIOS_ONESHOT_PLAN=1 to BenchBase (TPC-C procedures inject @_ldb_plan)")
+    parser.add_argument("--prefetch", action="store_true",
+                        help="Enable Prefetch path: SET GLOBAL lineairdb_prefetch_execution=ON and "
+                             "pass HELIOS_PREFETCH_PLAN=1 to BenchBase (TPC-C procedures inject @_prefetch_plan)")
     args = parser.parse_args()
 
     # Validate
@@ -811,11 +811,11 @@ def main():
 
 def _run_bench(args, config_work, thread_list, result_base):
     """Setup + execute sweep + summary + plots. Extracted so main() can wrap it."""
-    # Toggle Oneshot sysvar explicitly to avoid stale state from prior runs.
-    oneshot_value = "ON" if args.oneshot else "OFF"
-    print(f"  Setting lineairdb_oneshot_execution={oneshot_value}")
+    # Toggle Prefetch sysvar explicitly to avoid stale state from prior runs.
+    prefetch_value = "ON" if args.prefetch else "OFF"
+    print(f"  Setting lineairdb_prefetch_execution={prefetch_value}")
     mysql_cmd(args.mysql_port, args.mysql_host,
-              f"SET GLOBAL lineairdb_oneshot_execution={oneshot_value};")
+              f"SET GLOBAL lineairdb_prefetch_execution={prefetch_value};")
 
     # Setup phase
     load_time = None
@@ -844,7 +844,7 @@ def _run_bench(args, config_work, thread_list, result_base):
     # Execute: sweep terminal counts (data is reused)
     all_results = []
     for terminals in thread_list:
-        result = run_execute(args.benchmark, config_work, terminals, result_base, oneshot=args.oneshot)
+        result = run_execute(args.benchmark, config_work, terminals, result_base, prefetch=args.prefetch)
         if result:
             result["load_time"] = load_time
             all_results.append(result)
