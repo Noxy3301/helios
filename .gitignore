@@ -1,5 +1,6 @@
 .vscode
 .claude
+.codex
 .note
 CLAUDE.md
 
@@ -29,6 +30,3 @@ __pycache__/
 *.pem
 *.key
 .aws/
-
-# Codex CLI helper working directory
-.codex/
