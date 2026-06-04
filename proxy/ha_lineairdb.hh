@@ -54,7 +54,7 @@
 #include "lineairdb_field.hh"
 #include "lineairdb_transaction.hh"
 #include "lineairdb_proxy.hh"
-#include "index_search_plan.hh"
+#include "lineairdb_index_search.hh"
 #include "my_base.h" /* ha_rows */
 #include "my_compiler.h"
 #include "my_inttypes.h"

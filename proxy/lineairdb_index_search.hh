@@ -1,8 +1,8 @@
-// index_search_plan.hh
+// lineairdb_index_search.hh
 // LineairDB Storage Engine: A structure to hold the search plan
 
-#ifndef INDEX_SEARCH_PLAN_HH
-#define INDEX_SEARCH_PLAN_HH
+#ifndef LINEAIRDB_INDEX_SEARCH_HH
+#define LINEAIRDB_INDEX_SEARCH_HH
 
 #include <string>
 #include <optional>
@@ -61,4 +61,4 @@ struct IndexSearchPlan
     }
 };
 
-#endif // INDEX_SEARCH_PLAN_HH
+#endif // LINEAIRDB_INDEX_SEARCH_HH
