@@ -45,6 +45,7 @@ set(LINEAIRDB_SOURCES ha_lineairdb.cc ha_lineairdb.hh
                       lineairdb_keyenc.cc lineairdb_keyenc.hh
                       lineairdb_pushdown.cc lineairdb_pushdown.hh
                       lineairdb_index_search.cc lineairdb_index_search.hh
+                      lineairdb_prefetch.cc lineairdb_prefetch.hh
                       rpc_trace.cc rpc_trace.hh)
 add_definitions(-DMYSQL_SERVER)
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wno-error -Wextra -mcx16 -fPIC")
