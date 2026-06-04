@@ -50,8 +50,8 @@
     dest="$out_dir/execute_{{ bench_term }}"
     mkdir -p "$dest"
     java_status=0
-    {% if bench_oneshot | default(false) | bool %}
-    export HELIOS_ONESHOT_PLAN=1
+    {% if bench_prefetch | default(false) | bool %}
+    export HELIOS_PREFETCH_PLAN=1
     {% endif %}
     output=$(java -jar benchbase.jar -b {{ bench_type }} -c "$CFG" \
       --create=false --load=false --execute=true 2>&1) || java_status=$?

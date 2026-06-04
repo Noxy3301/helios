@@ -257,7 +257,7 @@ static RangeScanLimit range_scan_limit_for_order(
 // LineairDB server connection target (GLOBAL sysvars backing storage)
 static char *srv_server_host = nullptr;
 static ulong srv_server_port = 9999;
-static bool srv_oneshot_execution = false;
+static bool srv_prefetch_execution = false;
 
 // THD-scoped context
 struct LineairDBThdCtx {
@@ -609,7 +609,7 @@ int ha_lineairdb::write_row(uchar *buf) {
 
   // Write secondary index entries.
   // Normal transactions check UNIQUE indexes immediately.
-  // Oneshot sends UNIQUE index writes to validate-and-commit with row writes.
+  // Prefetch sends UNIQUE index writes to validate-and-commit with row writes.
   for (uint i = 0; i < table->s->keys; i++) {
     auto key_info = table->key_info[i];
     if (i == table->s->primary_key) continue;
@@ -617,7 +617,7 @@ int ha_lineairdb::write_row(uchar *buf) {
     std::string secondary_key = build_secondary_key_from_row(buf, key_info);
 
     if (key_info.flags & HA_NOSAME) {
-      if (tx->is_oneshot_mode()) {
+      if (tx->is_prefetch_mode()) {
         tx->buffer_write_secondary_index(db_table_name, key_info.name,
                                          secondary_key, key);
       } else {
@@ -1157,8 +1157,8 @@ static bool item_is_limit_safe_filter(const Item *item) {
          item_is_limit_safe_scalar(args[1]);
 }
 
-// Enable Oneshot only for DML; DDL must keep the normal transaction path
-static bool thd_can_use_oneshot(THD *thd) {
+// Enable Prefetch only for DML; DDL must keep the normal transaction path
+static bool thd_can_use_prefetch(THD *thd) {
   if (thd == nullptr) return false;                  // Missing session
   if (thd->lex == nullptr) return false;             // Missing SQL state
 
@@ -1235,9 +1235,9 @@ static bool try_parse_plan_int(const std::string& text, int64_t *value) {
   return end == text.c_str() + text.size();
 }
 
-static bool thd_has_ldb_plan(THD *thd) {
+static bool thd_has_prefetch_plan(THD *thd) {
   if (thd == nullptr) return false;
-  auto it = thd->user_vars.find("_ldb_plan");
+  auto it = thd->user_vars.find("_prefetch_plan");
   if (it == thd->user_vars.end()) return false;
 
   auto *entry = it->second.get();
@@ -1437,12 +1437,12 @@ static std::vector<LineairDBProxy::ReadPlanStep> parse_plan_steps(
   return steps;
 }
 
-// Read @_ldb_plan once and clear it so the next statement starts clean
-static std::string read_and_clear_ldb_plan(THD *thd) {
+// Read @_prefetch_plan once and clear it so the next statement starts clean
+static std::string read_and_clear_prefetch_plan(THD *thd) {
   std::string plan;
   if (thd == nullptr) return plan;
 
-  auto it = thd->user_vars.find("_ldb_plan");
+  auto it = thd->user_vars.find("_prefetch_plan");
   if (it == thd->user_vars.end()) return plan;
 
   auto *entry = it->second.get();
@@ -1457,11 +1457,11 @@ static std::string read_and_clear_ldb_plan(THD *thd) {
   return plan;
 }
 
-static void execute_oneshot_plan_if_present(THD *thd,
+static void execute_prefetch_plan_if_present(THD *thd,
                                             LineairDBTransaction *tx) {
-  if (tx == nullptr || !tx->is_oneshot_mode()) return;
+  if (tx == nullptr || !tx->is_prefetch_mode()) return;
 
-  const std::string plan_text = read_and_clear_ldb_plan(thd);
+  const std::string plan_text = read_and_clear_prefetch_plan(thd);
   if (plan_text.empty()) return;
 
   const auto steps = parse_plan_steps(thd, plan_text);
@@ -2093,14 +2093,14 @@ LineairDBTransaction *&ha_lineairdb::get_transaction(THD *thd) {
   if (ctx->tx == nullptr) {
     ctx->tx =
         new LineairDBTransaction(thd, ctx->proxy.get(), lineairdb_hton, FENCE);
-    const bool can_use_oneshot =
-        (srv_oneshot_execution && thd_can_use_oneshot(thd) &&
-         thd_has_ldb_plan(thd));
-    ctx->tx->set_oneshot_mode(can_use_oneshot);
+    const bool can_use_prefetch =
+        (srv_prefetch_execution && thd_can_use_prefetch(thd) &&
+         thd_has_prefetch_plan(thd));
+    ctx->tx->set_prefetch_mode(can_use_prefetch);
   }
   if (ctx->tx->is_not_started()) {
     ctx->tx->begin_transaction();
-    execute_oneshot_plan_if_present(thd, ctx->tx);
+    execute_prefetch_plan_if_present(thd, ctx->tx);
   }
   return ctx->tx;
 }
@@ -3955,15 +3955,15 @@ static MYSQL_SYSVAR_STR(server_host, srv_server_host,
 static MYSQL_SYSVAR_ULONG(server_port, srv_server_port, PLUGIN_VAR_RQCMDARG,
                           "LineairDB server TCP port.", nullptr, nullptr, 9999,
                           1, 65535, 0);
-static MYSQL_SYSVAR_BOOL(oneshot_execution, srv_oneshot_execution,
+static MYSQL_SYSVAR_BOOL(prefetch_execution, srv_prefetch_execution,
                          PLUGIN_VAR_OPCMDARG,
-                         "Enable experimental one-shot execution.", nullptr,
+                         "Enable experimental prefetch execution.", nullptr,
                          nullptr, false);
 
 static SYS_VAR *lineairdb_system_variables[] = {
     MYSQL_SYSVAR(server_host),
     MYSQL_SYSVAR(server_port),
-    MYSQL_SYSVAR(oneshot_execution),
+    MYSQL_SYSVAR(prefetch_execution),
     MYSQL_SYSVAR(enum_var),
     MYSQL_SYSVAR(ulong_var),
     MYSQL_SYSVAR(double_var),

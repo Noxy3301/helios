@@ -106,10 +106,10 @@ LineairDBTransaction::read(std::string key) {
     return {reinterpret_cast<const std::byte*>(last_read_value_.data()), last_read_value_.size()};
   }
 
-  // Normal path misses go to the server; oneshot plans must prefetch them
+  // Normal path misses go to the server; prefetch plans must prefetch them
   rpc_trace_.record_local_view("read_miss");
-  if (oneshot_mode_) {
-    rpc_trace_.record_local_view("abort_oneshot_read_miss");
+  if (prefetch_mode_) {
+    rpc_trace_.record_local_view("abort_prefetch_read_miss");
     is_aborted_ = true;
     return std::pair<const std::byte *const, const size_t>{nullptr, 0};
   }
@@ -155,9 +155,9 @@ LineairDBTransaction::batch_read(const std::vector<std::string>& keys) {
     rpc_keys.push_back(keys[i]);
   }
 
-  // Oneshot plans must fetch every key up front; misses mean the plan is short
-  if (oneshot_mode_ && !rpc_keys.empty()) {
-    rpc_trace_.record_local_view("abort_oneshot_batch_miss");
+  // Prefetch plans must fetch every key up front; misses mean the plan is short
+  if (prefetch_mode_ && !rpc_keys.empty()) {
+    rpc_trace_.record_local_view("abort_prefetch_batch_miss");
     is_aborted_ = true;
     return pairs;
   }
@@ -184,7 +184,7 @@ LineairDBTransaction::batch_read(const std::vector<std::string>& keys) {
 
 void LineairDBTransaction::prefetch_stateless_reads(
     const std::vector<LineairDBProxy::StatelessReadKey>& reads) {
-  if (!oneshot_mode_ || reads.empty()) return;
+  if (!prefetch_mode_ || reads.empty()) return;
 
   std::vector<LineairDBProxy::StatelessReadKey> rpc_reads;
   rpc_reads.reserve(reads.size());
@@ -230,7 +230,7 @@ void LineairDBTransaction::prefetch_stateless_reads(
 
 void LineairDBTransaction::execute_read_plan(
     const std::vector<LineairDBProxy::ReadPlanStep>& steps) {
-  if (!oneshot_mode_ || steps.empty()) return;
+  if (!prefetch_mode_ || steps.empty()) return;
 
   rpc_trace_.record_local_view("plan_request:steps=" +
                                std::to_string(steps.size()));
@@ -315,7 +315,7 @@ void LineairDBTransaction::execute_read_plan(
 bool LineairDBTransaction::batch_write(
     const std::string& table_name,
     const std::vector<LineairDBProxy::BatchOp>& ops) {
-  if (oneshot_mode_) {
+  if (prefetch_mode_) {
     for (auto op : ops) {
       if (op.table_name.empty()) op.table_name = table_name;
       if (op.type == LineairDBProxy::BatchOp::Type::Write) {
@@ -368,7 +368,7 @@ LineairDBTransaction::get_matching_keys(std::string first_key_part) {
 
 bool LineairDBTransaction::write(std::string key, const std::string value) {
   if (table_is_not_chosen()) return false;
-  if (oneshot_mode_) {
+  if (prefetch_mode_) {
     buffer_write(db_table_key, key, value);
     return true;
   }
@@ -380,7 +380,7 @@ bool LineairDBTransaction::write(std::string key, const std::string value) {
 
 bool LineairDBTransaction::delete_value(std::string key) {
   if (table_is_not_chosen()) return false;
-  if (oneshot_mode_) {
+  if (prefetch_mode_) {
     buffer_delete(db_table_key, key);
     return true;
   }
@@ -396,7 +396,7 @@ std::vector<std::string>
 LineairDBTransaction::read_secondary_index(std::string index_name,
                                            std::string secondary_key) {
   if (table_is_not_chosen()) return {};
-  if (oneshot_mode_) {
+  if (prefetch_mode_) {
     const std::string end_key = next_lexicographic_key(secondary_key);
     if (end_key.empty()) {
       rpc_trace_.record_local_view("abort_secondary_key_end");
@@ -417,7 +417,7 @@ bool LineairDBTransaction::write_secondary_index(std::string index_name,
                                                  std::string secondary_key,
                                                  const std::string primary_key) {
   if (table_is_not_chosen()) return false;
-  if (oneshot_mode_) {
+  if (prefetch_mode_) {
     buffer_write_secondary_index(db_table_key, index_name, secondary_key,
                                  primary_key);
     return true;
@@ -430,7 +430,7 @@ bool LineairDBTransaction::delete_secondary_index(std::string index_name,
                                                   std::string secondary_key,
                                                   const std::string primary_key) {
   if (table_is_not_chosen()) return false;
-  if (oneshot_mode_) {
+  if (prefetch_mode_) {
     buffer_delete_secondary_index(db_table_key, index_name, secondary_key,
                                   primary_key);
     return true;
@@ -444,7 +444,7 @@ bool LineairDBTransaction::update_secondary_index(std::string index_name,
                                                   std::string new_secondary_key,
                                                   const std::string primary_key) {
   if (table_is_not_chosen()) return false;
-  if (oneshot_mode_) {
+  if (prefetch_mode_) {
     buffer_delete_secondary_index(db_table_key, index_name, old_secondary_key,
                                   primary_key);
     buffer_write_secondary_index(db_table_key, index_name, new_secondary_key,
@@ -461,7 +461,7 @@ std::vector<std::string>
 LineairDBTransaction::get_matching_keys_in_range(std::string start_key,
                                                  std::string end_key) {
   if (table_is_not_chosen()) return {};
-  if (oneshot_mode_) {
+  if (prefetch_mode_) {
     if (auto cached =
             lookup_local_range_scan(db_table_key, start_key, end_key, false, 0)) {
       std::vector<std::pair<std::string, std::string>> rows = cached->rows;
@@ -484,7 +484,7 @@ LineairDBTransaction::get_matching_keys_in_range(std::string start_key,
       return keys;
     }
 
-    rpc_trace_.record_local_view("abort_oneshot_pk_key_scan_miss");
+    rpc_trace_.record_local_view("abort_prefetch_pk_key_scan_miss");
     is_aborted_ = true;
     return {};
   }
@@ -501,7 +501,7 @@ LineairDBTransaction::get_matching_keys_and_values_in_range(std::string start_ke
                                                             uint64_t row_limit,
                                                             bool reverse_scan) {
   if (table_is_not_chosen()) return {};
-  if (oneshot_mode_) {
+  if (prefetch_mode_) {
     if (auto cached = lookup_local_range_scan(
             db_table_key, start_key, end_key, reverse_scan, row_limit)) {
       std::vector<std::pair<std::string, std::string>> pairs = cached->rows;
@@ -523,7 +523,7 @@ LineairDBTransaction::get_matching_keys_and_values_in_range(std::string start_ke
       return pairs;
     }
 
-    rpc_trace_.record_local_view("abort_oneshot_pk_value_scan_miss:" +
+    rpc_trace_.record_local_view("abort_prefetch_pk_value_scan_miss:" +
                                  std::to_string(start_key.size()) + ":" +
                                  std::to_string(end_key.size()));
     is_aborted_ = true;
@@ -554,7 +554,7 @@ LineairDBTransaction::get_matching_keys_and_values_in_range(std::string start_ke
 std::vector<std::pair<std::string, std::string>>
 LineairDBTransaction::get_matching_keys_and_values_from_prefix(std::string prefix) {
   if (table_is_not_chosen()) return {};
-  if (oneshot_mode_) {
+  if (prefetch_mode_) {
     const std::string prefix_end = next_lexicographic_key(prefix);
     if (prefix_end.empty()) {
       rpc_trace_.record_local_view("abort_pk_prefix_end");
@@ -621,7 +621,7 @@ LineairDBTransaction::get_matching_primary_keys_in_range(std::string index_name,
                                                          std::string start_key,
                                                          std::string end_key) {
   if (table_is_not_chosen()) return {};
-  if (oneshot_mode_) {
+  if (prefetch_mode_) {
     if (has_pending_secondary_ops_for_index(db_table_key, index_name)) {
       rpc_trace_.record_local_view("abort_secondary_scan_after_secondary_write:" +
                                    index_name);
@@ -638,7 +638,7 @@ LineairDBTransaction::get_matching_primary_keys_in_range(std::string index_name,
       return cached->primary_keys;
     }
 
-    rpc_trace_.record_local_view("abort_oneshot_secondary_scan_miss:" +
+    rpc_trace_.record_local_view("abort_prefetch_secondary_scan_miss:" +
                                  index_name + ":" +
                                  std::to_string(start_key.size()) + ":" +
                                  std::to_string(end_key.size()));
@@ -656,7 +656,7 @@ std::vector<std::string>
 LineairDBTransaction::get_matching_primary_keys_from_prefix(std::string index_name,
                                                             std::string prefix) {
   if (table_is_not_chosen()) return {};
-  if (oneshot_mode_) {
+  if (prefetch_mode_) {
     const std::string prefix_end = next_lexicographic_key(prefix);
     if (prefix_end.empty()) {
       rpc_trace_.record_local_view("abort_secondary_prefix_end");
@@ -734,7 +734,7 @@ void LineairDBTransaction::buffer_write(const std::string& table_name,
   write_buffer_ops_.push_back(std::move(op));
   record_local_write(table_name, key, true, value);
 
-  if (!oneshot_mode_ && write_buffer_ops_.size() >= WRITE_BATCH_SIZE) {
+  if (!prefetch_mode_ && write_buffer_ops_.size() >= WRITE_BATCH_SIZE) {
     flush_write_buffer();
   }
 }
@@ -752,7 +752,7 @@ void LineairDBTransaction::buffer_write_secondary_index(const std::string& table
   write_buffer_ops_.push_back(std::move(op));
   drop_local_secondary_scans(table_name, index_name);
 
-  if (!oneshot_mode_ && write_buffer_ops_.size() >= WRITE_BATCH_SIZE) {
+  if (!prefetch_mode_ && write_buffer_ops_.size() >= WRITE_BATCH_SIZE) {
     flush_write_buffer();
   }
 }
@@ -766,7 +766,7 @@ void LineairDBTransaction::buffer_delete(const std::string& table_name,
   write_buffer_ops_.push_back(std::move(op));
   record_local_write(table_name, key, false, ""); // value unused when not found
 
-  if (!oneshot_mode_ && write_buffer_ops_.size() >= WRITE_BATCH_SIZE) {
+  if (!prefetch_mode_ && write_buffer_ops_.size() >= WRITE_BATCH_SIZE) {
     flush_write_buffer();
   }
 }
@@ -785,14 +785,14 @@ void LineairDBTransaction::buffer_delete_secondary_index(
   write_buffer_ops_.push_back(std::move(op));
   drop_local_secondary_scans(table_name, index_name);
 
-  if (!oneshot_mode_ && write_buffer_ops_.size() >= WRITE_BATCH_SIZE) {
+  if (!prefetch_mode_ && write_buffer_ops_.size() >= WRITE_BATCH_SIZE) {
     flush_write_buffer();
   }
 }
 
 bool LineairDBTransaction::flush_write_buffer() {
   if (write_buffer_ops_.empty()) return true;
-  if (oneshot_mode_) return true;
+  if (prefetch_mode_) return true;
   if (is_aborted_) {
     write_buffer_ops_.clear();
     return false;
@@ -806,7 +806,7 @@ bool LineairDBTransaction::flush_write_buffer() {
 bool LineairDBTransaction::flush_write_buffer_for_table(
     const std::string& table_name) {
   if (write_buffer_ops_.empty()) return true;
-  if (oneshot_mode_) return true;
+  if (prefetch_mode_) return true;
   if (is_aborted_) {
     write_buffer_ops_.clear();
     return false;
@@ -1183,30 +1183,30 @@ LineairDBTransaction::lookup_local_secondary_scan(
 }
 
 bool LineairDBTransaction::fallback_to_normal_transaction(const char* reason) {
-  if (!oneshot_mode_) return true;
+  if (!prefetch_mode_) return true;
 
   // A clean transaction can still switch to the normal scan-capable path
-  const bool has_oneshot_state =
+  const bool has_prefetch_state =
       !stateless_read_set_.empty() || !write_buffer_ops_.empty() ||
       !rowcount_deltas_.empty() || !local_read_set_.empty() ||
       !local_write_set_.empty() || !range_validation_set_.empty() ||
       !index_validation_set_.empty() || !local_range_scans_.empty() ||
       !local_secondary_scans_.empty();
-  if (!has_oneshot_state) {
-    oneshot_mode_ = false;
-    oneshot_registered_ = false;
+  if (!has_prefetch_state) {
+    prefetch_mode_ = false;
+    prefetch_registered_ = false;
     begin_transaction();
     return !is_aborted_;
   }
 
   // Mixing stateless point reads with scans would need phantom tracking
-  LOG_WARNING("Oneshot fallback blocked by prior local state: %s", reason);
+  LOG_WARNING("Prefetch fallback blocked by prior local state: %s", reason);
   rpc_trace_.record_local_view(std::string("abort_fallback_") + reason);
   is_aborted_ = true;
   return false;
 }
 
-bool LineairDBTransaction::oneshot_validate_and_commit() {
+bool LineairDBTransaction::prefetch_validate_and_commit() {
   bool was_aborted = is_aborted_;
 
   std::vector<LineairDBProxy::StatelessReadKey> reads;
@@ -1276,8 +1276,8 @@ void LineairDBTransaction::begin_transaction() {
   rpc_trace_.start(-1, std::this_thread::get_id());
   lineairdb_proxy->set_current_trace(&rpc_trace_);
 
-  if (oneshot_mode_) {
-    oneshot_registered_ = true;
+  if (prefetch_mode_) {
+    prefetch_registered_ = true;
     is_aborted_ = false;
     if (thd_is_transaction()) {
       isTransaction = true;
@@ -1305,7 +1305,7 @@ void LineairDBTransaction::begin_transaction() {
 }
 
 void LineairDBTransaction::set_status_to_abort() {
-  if (oneshot_mode_ || tx_id == -1) {
+  if (prefetch_mode_ || tx_id == -1) {
     is_aborted_ = true;
     return;
   }
@@ -1317,8 +1317,8 @@ void LineairDBTransaction::set_status_to_abort() {
 }
 
 bool LineairDBTransaction::end_transaction() {
-  if (oneshot_mode_) {
-    return oneshot_validate_and_commit();
+  if (prefetch_mode_) {
+    return prefetch_validate_and_commit();
   }
 
   assert(tx_id != -1);

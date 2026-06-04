@@ -90,14 +90,14 @@ public:
   void set_status_to_abort();
   bool end_transaction();
   void fence() const;
-  void set_oneshot_mode(bool enabled) { oneshot_mode_ = enabled; }
-  bool is_oneshot_mode() const { return oneshot_mode_; }
+  void set_prefetch_mode(bool enabled) { prefetch_mode_ = enabled; }
+  bool is_prefetch_mode() const { return prefetch_mode_; }
   void prefetch_stateless_reads(
       const std::vector<LineairDBProxy::StatelessReadKey>& reads);
   void execute_read_plan(const std::vector<LineairDBProxy::ReadPlanStep>& steps);
 
   inline bool is_not_started() const {
-    if (oneshot_mode_) return !oneshot_registered_;
+    if (prefetch_mode_) return !prefetch_registered_;
     if (tx_id == -1) return true;
     return false;
   }
@@ -144,8 +144,8 @@ private:
   bool isTransaction;
   handlerton* hton;
   bool isFence;
-  bool oneshot_mode_{false};
-  bool oneshot_registered_{false};
+  bool prefetch_mode_{false};
+  bool prefetch_registered_{false};
 
   // stores the last RPC read result to maintain data pointer validity
   std::string last_read_value_;
@@ -283,7 +283,7 @@ private:
       const std::string& table_name, const std::string& index_name,
       const std::string& start_key, const std::string& end_key,
       bool reverse_scan, uint64_t row_limit) const;
-  bool oneshot_validate_and_commit();
+  bool prefetch_validate_and_commit();
   bool thd_is_transaction() const;
   void register_transaction_to_mysql();
   void register_single_statement_to_mysql();

@@ -69,10 +69,10 @@
       delegate_to: "{{ groups['benchbase'][0] }}"
 
     - name: "Refresh MySQL stats with ANALYZE TABLE on each MySQL ({{ bench_type | upper }})"
-      # Oneshot mode requires MySQL's chosen plan to match the @_ldb_plan DSL.
+      # Prefetch mode requires MySQL's chosen plan to match the @_prefetch_plan DSL.
       # Without fresh stats, MySQL can pick PRIMARY for queries the DSL expects
       # to take via a secondary index (e.g. OrderStatus customerByNameSQL),
-      # leading to plan/DSL mismatch and infinite oneshot retry.
+      # leading to plan/DSL mismatch and infinite prefetch retry.
       shell: |
         {{ _mysql_bin }} -u root --protocol=TCP \
           -h {{ hostvars[item].private_ip }} -P 3307 \

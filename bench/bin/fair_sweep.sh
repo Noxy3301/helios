@@ -6,7 +6,7 @@
 # runs.
 #
 # Usage:
-#   fair_sweep.sh [--mode oneshot|stateful] [--sf N] [--time S] [--terms LIST]
+#   fair_sweep.sh [--mode prefetch|stateful] [--sf N] [--time S] [--terms LIST]
 #                 [--label TAG]
 #
 # Output:
@@ -18,7 +18,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 SCRIPTS="$ROOT/scripts"
 
-MODE=oneshot          # oneshot | stateful
+MODE=prefetch          # prefetch | stateful
 SF=1
 TIME=30
 TERMS="1,4,16,32,64,128,256,384,512"
@@ -37,7 +37,7 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-[[ "$MODE" =~ ^(oneshot|stateful)$ ]] || { echo "Invalid --mode" >&2; exit 2; }
+[[ "$MODE" =~ ^(prefetch|stateful)$ ]] || { echo "Invalid --mode" >&2; exit 2; }
 
 ts=$(date +%Y%m%d_%H%M%S)
 tag="${LABEL:+${LABEL}-}${MODE}-sf${SF}"
@@ -46,8 +46,8 @@ mkdir -p "$OUT_DIR/log"
 SUMMARY="$OUT_DIR/summary.csv"
 echo "terminals,throughput,goodput,retry,wall_s,drain_s,load_s" > "$SUMMARY"
 
-ONESHOT_FLAG=""
-[[ "$MODE" == "oneshot" ]] && ONESHOT_FLAG="--oneshot"
+PREFETCH_FLAG=""
+[[ "$MODE" == "prefetch" ]] && PREFETCH_FLAG="--prefetch"
 
 echo "fair_sweep: mode=$MODE sf=$SF time=${TIME}s terms=$TERMS"
 echo "output: $OUT_DIR"
@@ -93,7 +93,7 @@ for term in "${TERM_LIST[@]}"; do
   set +e
   python3 "$ROOT/bench/bin/benchrun.py" tpcc \
     --terminals "$term" --time "$TIME" --scalefactor "$SF" \
-    --external-server $ONESHOT_FLAG \
+    --external-server $PREFETCH_FLAG \
     >>"$log" 2>&1
   rc=$?
   set -e
