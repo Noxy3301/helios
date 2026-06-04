@@ -29,3 +29,6 @@ __pycache__/
 *.pem
 *.key
 .aws/
+
+# Codex CLI helper working directory
+.codex/
