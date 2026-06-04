@@ -1,14 +1,19 @@
 // lineairdb_keyenc.hh
-// LineairDB Storage Engine: shared constants for index key / range encoding.
-//
-// These key-type tags and null markers are used both by the index key
-// encoders (ha_lineairdb::key_part_type_tag / append_key_part_encoding, defined
-// in lineairdb_keyenc.cc) and by the prefetch plan key encoders in
-// ha_lineairdb.cc. constexpr => internal linkage, safe to include in multiple
-// translation units.
+// LineairDB Storage Engine: shared index key / range encoding.
 
 #ifndef LINEAIRDB_KEYENC_HH
 #define LINEAIRDB_KEYENC_HH
+
+#include <cstddef>
+#include <string>
+
+#include "field_types.h"
+#include "lineairdb_field_types.h"
+#include "my_base.h"
+#include "my_inttypes.h"
+
+class Field;
+struct TABLE;
 
 constexpr unsigned char kKeyMarkerNotNull = 0x00;
 constexpr unsigned char kKeyMarkerNull = 0x01;
@@ -17,5 +22,24 @@ constexpr unsigned char kKeyTypeInt = 0x10;
 constexpr unsigned char kKeyTypeString = 0x20;
 constexpr unsigned char kKeyTypeDatetime = 0x30;
 constexpr unsigned char kKeyTypeOther = 0xF0;
+
+namespace lineairdb_keyenc {
+
+std::string encode_int_key(const uchar *data, size_t len);
+std::string encode_datetime_key(const uchar *data, size_t len,
+                                enum_field_types mysql_type);
+std::string encode_string_key(const uchar *data, size_t len);
+
+unsigned char key_part_type_tag(LineairDBFieldType type);
+void append_key_part_encoding(std::string &out, bool is_null,
+                              LineairDBFieldType type,
+                              const std::string &payload);
+std::string build_prefix_range_end(const std::string &prefix);
+
+std::string convert_key_to_ldbformat(TABLE *table, uint key_index,
+                                     const uchar *key,
+                                     key_part_map keypart_map);
+
+}  // namespace lineairdb_keyenc
 
 #endif // LINEAIRDB_KEYENC_HH
