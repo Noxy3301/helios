@@ -25,7 +25,7 @@
     bench_serial: "{{ bench_type == 'tpch' }}"
     # Run BenchBase in Helios prefetch mode: SET GLOBAL lineairdb_prefetch_execution=ON
     # on every MySQL once per sweep, then prefix the BenchBase java invocation with
-    # HELIOS_PREFETCH_PLAN=1 so the TPC-C procedures inject @_prefetch_plan hints.
+    # HELIOS_PREFETCH_PLAN=1 so the TPC-C procedures inject @_tx_plan hints.
     bench_prefetch: false
 
     # -- Execution parameters --

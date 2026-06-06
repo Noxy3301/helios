@@ -110,9 +110,9 @@ static bool try_parse_plan_int(const std::string& text, int64_t *value) {
   return end == text.c_str() + text.size();
 }
 
-bool thd_has_prefetch_plan(THD *thd) {
+bool thd_has_tx_plan(THD *thd) {
   if (thd == nullptr) return false;
-  auto it = thd->user_vars.find("_prefetch_plan");
+  auto it = thd->user_vars.find("_tx_plan");
   if (it == thd->user_vars.end()) return false;
 
   auto *entry = it->second.get();
@@ -312,12 +312,12 @@ static std::vector<LineairDBProxy::ReadPlanStep> parse_plan_steps(
   return steps;
 }
 
-// Read @_prefetch_plan once and clear it so the next statement starts clean
-static std::string read_and_clear_prefetch_plan(THD *thd) {
+// Read @_tx_plan once and clear it so the next statement starts clean
+static std::string read_and_clear_tx_plan(THD *thd) {
   std::string plan;
   if (thd == nullptr) return plan;
 
-  auto it = thd->user_vars.find("_prefetch_plan");
+  auto it = thd->user_vars.find("_tx_plan");
   if (it == thd->user_vars.end()) return plan;
 
   auto *entry = it->second.get();
@@ -332,11 +332,11 @@ static std::string read_and_clear_prefetch_plan(THD *thd) {
   return plan;
 }
 
-void execute_prefetch_plan_if_present(THD *thd,
+void maybe_prefetch_for_transaction(THD *thd,
                                             LineairDBTransaction *tx) {
   if (tx == nullptr || !tx->is_prefetch_mode()) return;
 
-  const std::string plan_text = read_and_clear_prefetch_plan(thd);
+  const std::string plan_text = read_and_clear_tx_plan(thd);
   if (plan_text.empty()) return;
 
   const auto steps = parse_plan_steps(thd, plan_text);

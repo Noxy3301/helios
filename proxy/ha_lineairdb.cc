@@ -1388,12 +1388,12 @@ LineairDBTransaction *&ha_lineairdb::get_transaction(THD *thd) {
         new LineairDBTransaction(thd, ctx->proxy.get(), lineairdb_hton, FENCE);
     const bool can_use_prefetch =
         (srv_prefetch_execution && thd_can_use_prefetch(thd) &&
-         thd_has_prefetch_plan(thd));
+         thd_has_tx_plan(thd));
     ctx->tx->set_prefetch_mode(can_use_prefetch);
   }
   if (ctx->tx->is_not_started()) {
     ctx->tx->begin_transaction();
-    execute_prefetch_plan_if_present(thd, ctx->tx);
+    maybe_prefetch_for_transaction(thd, ctx->tx);
   }
   return ctx->tx;
 }
