@@ -171,9 +171,12 @@ private:
   // These sets live only inside one LineairDBTransaction.
   // commit/abort deletes the object, so prefetched rows never cross txs.
 
-  // Proxy-side read set for exact primary-key reads.
-  // Keyed by (table_name + '\0' + key) so dedup + lookup are O(1).
-  std::unordered_map<std::string, LocalRowEntry> local_read_set_;
+  // Proxy-side value cache for exact primary-key reads: serves a row to the
+  // statement without an RPC. NOT a validation set -- the TID it carries feeds
+  // point_read_validation_set_ only when a cached row is actually consumed
+  // (see activate_cached_read). Keyed by (table_name + '\0' + key) for O(1)
+  // dedup + lookup.
+  std::unordered_map<std::string, LocalRowEntry> local_read_cache_;
   static std::string make_local_read_key(const std::string& table,
                                          const std::string& key) {
     std::string k;
@@ -186,13 +189,22 @@ private:
   // Proxy-side write set for exact primary-key writes/deletes
   std::vector<LocalRowEntry> local_write_set_;
 
+  // OCC commit-time validation, two axes:
+  //   content   (per-key DataItem TID): point_read_validation_set_ (base rows)
+  //                                     index_validation_set_      (secondary
+  //                                     index entries + primary tombstone slots)
+  //   structure (masstree node version): range_validation_set_     (phantom
+  //                                     guard; primary & secondary distinguished
+  //                                     by index_name)
+  // point + index are the same kind (per-key content TID); range is the odd one
+  // (structural node version, deliberately blind to in-place value changes).
   struct StatelessReadEntry {
     std::string table_name;
     std::string key;
     uint64_t tid;
     bool found;
   };
-  std::vector<StatelessReadEntry> stateless_read_set_;
+  std::vector<StatelessReadEntry> point_read_validation_set_;
   std::vector<LineairDBProxy::RangeValidationEntry> range_validation_set_;
   std::vector<LineairDBProxy::IndexValidationEntry> index_validation_set_;
 
@@ -234,7 +246,7 @@ private:
 
   std::optional<LocalRowEntry> lookup_local_write_set(
       const std::string& table_name, const std::string& key) const;
-  std::optional<LocalRowEntry> lookup_local_read_set(
+  std::optional<LocalRowEntry> lookup_local_read_cache(
       const std::string& table_name, const std::string& key) const;
   void drop_local_read(const std::string& table_name,
                        const std::string& key);
@@ -265,14 +277,14 @@ private:
   void record_local_write(const std::string& table_name,
                           const std::string& key, bool found,
                           const std::string& value);
-  void record_local_read(const std::string& table_name,
+  void record_local_read_cache(const std::string& table_name,
                          const std::string& key, bool found,
                          const std::string& value, uint64_t tid = 0,
                          bool validate_on_use = false);
-  void record_stateless_read(const std::string& table_name,
+  void record_point_read_validation(const std::string& table_name,
                              const std::string& key, bool found,
                              uint64_t tid);
-  void activate_local_read(const LocalRowEntry& entry);
+  void activate_cached_read(const LocalRowEntry& entry);
   void activate_range_validation(
       const std::vector<LineairDBProxy::RangeValidationEntry>& ranges,
       const std::vector<LineairDBProxy::IndexValidationEntry>& indexes);

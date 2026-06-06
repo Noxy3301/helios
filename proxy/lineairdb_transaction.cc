@@ -98,9 +98,9 @@ LineairDBTransaction::read(std::string key) {
   }
 
   // Repeat exact-key reads can use the local read set
-  if (auto entry = lookup_local_read_set(db_table_key, key)) {
+  if (auto entry = lookup_local_read_cache(db_table_key, key)) {
     rpc_trace_.record_local_view("read_cache_hit");
-    activate_local_read(*entry);
+    activate_cached_read(*entry);
     if (!entry->found) return {nullptr, 0};
     last_read_value_ = entry->value;
     return {reinterpret_cast<const std::byte*>(last_read_value_.data()), last_read_value_.size()};
@@ -116,11 +116,11 @@ LineairDBTransaction::read(std::string key) {
 
   last_read_value_ = lineairdb_proxy->tx_read(this, key);
   if (last_read_value_.empty()) {
-    record_local_read(db_table_key, key, false, ""); // value unused when not found
+    record_local_read_cache(db_table_key, key, false, ""); // value unused when not found
     return std::pair<const std::byte *const, const size_t>{nullptr, 0};
   }
 
-  record_local_read(db_table_key, key, true, last_read_value_);
+  record_local_read_cache(db_table_key, key, true, last_read_value_);
 
   return {reinterpret_cast<const std::byte*>(last_read_value_.data()), last_read_value_.size()};
 }
@@ -144,9 +144,9 @@ LineairDBTransaction::batch_read(const std::vector<std::string>& keys) {
       pairs[i] = {entry->found, entry->value};
       continue;
     }
-    if (auto entry = lookup_local_read_set(db_table_key, keys[i])) {
+    if (auto entry = lookup_local_read_cache(db_table_key, keys[i])) {
       rpc_trace_.record_local_view("batch_cache_hit");
-      activate_local_read(*entry);
+      activate_cached_read(*entry);
       pairs[i] = {entry->found, entry->value};
       continue;
     }
@@ -176,7 +176,7 @@ LineairDBTransaction::batch_read(const std::vector<std::string>& keys) {
       // Map each RPC result back to the original keys[] position
       const size_t pos = rpc_positions[i];
       pairs[pos] = {results[i].found, std::move(results[i].value)};
-      record_local_read(db_table_key, keys[pos], pairs[pos].first, pairs[pos].second);
+      record_local_read_cache(db_table_key, keys[pos], pairs[pos].first, pairs[pos].second);
     }
   }
   return pairs;
@@ -196,7 +196,7 @@ void LineairDBTransaction::prefetch_stateless_reads(
     const std::string seen_key = read.table_name + '\0' + read.key;
     if (!seen.insert(seen_key).second) continue;
     if (lookup_local_write_set(read.table_name, read.key)) continue;
-    if (lookup_local_read_set(read.table_name, read.key)) continue;
+    if (lookup_local_read_cache(read.table_name, read.key)) continue;
     rpc_reads.push_back(read);
   }
 
@@ -219,10 +219,10 @@ void LineairDBTransaction::prefetch_stateless_reads(
       return;
     }
     if (result.found) {
-      record_local_read(read.table_name, read.key, true, result.value,
+      record_local_read_cache(read.table_name, read.key, true, result.value,
                         result.tid, true);
     } else {
-      record_local_read(read.table_name, read.key, false, "",
+      record_local_read_cache(read.table_name, read.key, false, "",
                         result.tid, true); // value unused when not found
     }
   }
@@ -250,10 +250,10 @@ void LineairDBTransaction::execute_read_plan(
           step_result.found ? "plan_fetch:R:hit" : "plan_fetch:R:miss",
           step.table_name, 1));
       if (step_result.found) {
-        record_local_read(step.table_name, step_result.actual_key, true,
+        record_local_read_cache(step.table_name, step_result.actual_key, true,
                           step_result.value, step_result.tid, true);
       } else {
-        record_local_read(step.table_name, step_result.actual_key, false, "",
+        record_local_read_cache(step.table_name, step_result.actual_key, false, "",
                           step_result.tid, true);
       }
       continue;
@@ -274,7 +274,7 @@ void LineairDBTransaction::execute_read_plan(
       const uint64_t tid =
           j < step_result.scan_tids.size() ? step_result.scan_tids[j] : 0;
       const bool found = !value.empty();
-      record_local_read(step.table_name, key, found, value, tid, true);
+      record_local_read_cache(step.table_name, key, found, value, tid, true);
       if (found) {
         rows.emplace_back(key, value);
         row_tids.push_back(tid);
@@ -468,7 +468,7 @@ LineairDBTransaction::get_matching_keys_in_range(std::string start_key,
       rpc_trace_.record_local_view(
           trace_count_event("use_pk_key_scan", db_table_key, rows.size()));
       for (size_t i = 0; i < rows.size() && i < cached->row_tids.size(); ++i) {
-        record_stateless_read(db_table_key, rows[i].first, true,
+        record_point_read_validation(db_table_key, rows[i].first, true,
                               cached->row_tids[i]);
       }
       // Activate validation against the pre-merge key list in
@@ -507,7 +507,7 @@ LineairDBTransaction::get_matching_keys_and_values_in_range(std::string start_ke
       std::vector<std::pair<std::string, std::string>> pairs = cached->rows;
       for (size_t i = 0; i < cached->rows.size() && i < cached->row_tids.size();
            ++i) {
-        record_stateless_read(db_table_key, cached->rows[i].first, true,
+        record_point_read_validation(db_table_key, cached->rows[i].first, true,
                               cached->row_tids[i]);
       }
       // See get_matching_keys_in_range above for the rationale.
@@ -856,16 +856,16 @@ LineairDBTransaction::lookup_local_write_set(
 }
 
 std::optional<LineairDBTransaction::LocalRowEntry>
-LineairDBTransaction::lookup_local_read_set(
+LineairDBTransaction::lookup_local_read_cache(
     const std::string& table_name, const std::string& key) const {
-  auto it = local_read_set_.find(make_local_read_key(table_name, key));
-  if (it == local_read_set_.end()) return std::nullopt;
+  auto it = local_read_cache_.find(make_local_read_key(table_name, key));
+  if (it == local_read_cache_.end()) return std::nullopt;
   return it->second;
 }
 
 void LineairDBTransaction::drop_local_read(const std::string& table_name,
                                            const std::string& key) {
-  local_read_set_.erase(make_local_read_key(table_name, key));
+  local_read_cache_.erase(make_local_read_key(table_name, key));
 }
 
 bool LineairDBTransaction::key_is_in_range(const std::string& key,
@@ -1006,35 +1006,35 @@ void LineairDBTransaction::record_local_write(const std::string& table_name,
   local_write_set_.push_back({table_name, key, found, value});
 }
 
-void LineairDBTransaction::record_local_read(const std::string& table_name,
+void LineairDBTransaction::record_local_read_cache(const std::string& table_name,
                                              const std::string& key,
                                              bool found,
                                              const std::string& value,
                                              uint64_t tid,
                                              bool validate_on_use) {
-  local_read_set_[make_local_read_key(table_name, key)] =
+  local_read_cache_[make_local_read_key(table_name, key)] =
       LocalRowEntry{table_name, key, found, value, tid, validate_on_use};
 }
 
-void LineairDBTransaction::record_stateless_read(const std::string& table_name,
+void LineairDBTransaction::record_point_read_validation(const std::string& table_name,
                                                  const std::string& key,
                                                  bool found,
                                                  uint64_t tid) {
-  for (auto& entry : stateless_read_set_) {
+  for (auto& entry : point_read_validation_set_) {
     if (entry.table_name == table_name && entry.key == key) {
       entry.found = found;
       entry.tid = tid;
       return;
     }
   }
-  stateless_read_set_.push_back({table_name, key, tid, found});
+  point_read_validation_set_.push_back({table_name, key, tid, found});
 }
 
-void LineairDBTransaction::activate_local_read(const LocalRowEntry& entry) {
+void LineairDBTransaction::activate_cached_read(const LocalRowEntry& entry) {
   if (!entry.validate_on_use) return;
   rpc_trace_.record_local_view(
       trace_count_event("use_point_read", entry.table_name, 1));
-  record_stateless_read(entry.table_name, entry.key, entry.found, entry.tid);
+  record_point_read_validation(entry.table_name, entry.key, entry.found, entry.tid);
 }
 
 void LineairDBTransaction::activate_range_validation(
@@ -1187,8 +1187,8 @@ bool LineairDBTransaction::fallback_to_normal_transaction(const char* reason) {
 
   // A clean transaction can still switch to the normal scan-capable path
   const bool has_prefetch_state =
-      !stateless_read_set_.empty() || !write_buffer_ops_.empty() ||
-      !rowcount_deltas_.empty() || !local_read_set_.empty() ||
+      !point_read_validation_set_.empty() || !write_buffer_ops_.empty() ||
+      !rowcount_deltas_.empty() || !local_read_cache_.empty() ||
       !local_write_set_.empty() || !range_validation_set_.empty() ||
       !index_validation_set_.empty() || !local_range_scans_.empty() ||
       !local_secondary_scans_.empty();
@@ -1213,10 +1213,10 @@ bool LineairDBTransaction::prefetch_validate_and_commit() {
   std::vector<uint64_t> read_tids;
   std::vector<bool> read_found;
   if (!was_aborted) {
-    reads.reserve(stateless_read_set_.size());
-    read_tids.reserve(stateless_read_set_.size());
-    read_found.reserve(stateless_read_set_.size());
-    for (const auto& entry : stateless_read_set_) {
+    reads.reserve(point_read_validation_set_.size());
+    read_tids.reserve(point_read_validation_set_.size());
+    read_found.reserve(point_read_validation_set_.size());
+    for (const auto& entry : point_read_validation_set_) {
       reads.push_back({entry.table_name, entry.key});
       read_tids.push_back(entry.tid);
       read_found.push_back(entry.found);
