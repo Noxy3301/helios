@@ -175,7 +175,15 @@ public:
     This is a list of flags that indicate what functionality the storage engine
     implements. The current table flags are documented in handler.h
   */
-  ulonglong table_flags() const override { return HA_BINLOG_ROW_CAPABLE; }
+  // HA_BLOCK_CONST_TABLE keeps the optimizer from const-folding equality
+  // lookups on this engine. A const-table read happens during JOIN::optimize
+  // (read_const), before the QEP root_access_path exists, so the statement-
+  // scoped autogen prefetch hook cannot see it and would issue a per-row RPC
+  // or abort. Blocking const-table demotes such lookups to JT_EQ_REF, moving
+  // the read into the execution phase where autogen batches it into one RPC.
+  ulonglong table_flags() const override {
+    return HA_BINLOG_ROW_CAPABLE | HA_BLOCK_CONST_TABLE;
+  }
 
   /** @brief
     This is a bitmap of flags that indicates how the storage engine
