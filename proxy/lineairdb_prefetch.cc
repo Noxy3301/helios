@@ -16,11 +16,15 @@
 // for ::strcasecmp
 #include <strings.h>
 
+#include "lineairdb_autogen.hh"
 #include "lineairdb_field_types.h"
 #include "lineairdb_keyenc.hh"
 #include "lineairdb_prefetch.hh"
 #include "lineairdb.pb.h"
+#include "my_base.h"
 #include "my_dbug.h"
+#include "my_sys.h"
+#include "mysqld_error.h"
 #include "mysql/plugin.h"
 #include "sql/field.h"
 #include "sql/item.h"
@@ -341,5 +345,62 @@ void maybe_prefetch_for_transaction(THD *thd,
 
   const auto steps = parse_plan_steps(thd, plan_text);
   if (steps.empty()) return;
+  tx->set_tx_plan_used(true);
   tx->execute_read_plan(steps);
+}
+
+// Build the read plan from the statement's QEP and run it in one prefetch RPC.
+static int autogen_and_execute_prefetch(THD *thd, LineairDBTransaction *tx) {
+  std::vector<LineairDBProxy::ReadPlanStep> steps;
+  if (!autogen_read_plan_from_qep(thd, &steps)) {
+    // autogen has already raised a my_error describing the unsupported shape.
+    tx->set_status_to_abort();
+    thd_mark_transaction_to_rollback(thd, 1);
+    return HA_ERR_UNSUPPORTED;
+  }
+  if (steps.empty()) return 0;
+
+  // Loads the prefetched rows into the local cache and validation sets.
+  tx->execute_read_plan(steps);
+  return tx->is_aborted() ? HA_ERR_LOCK_DEADLOCK : 0;
+}
+
+int maybe_prefetch_for_statement(THD *thd, LineairDBTransaction *tx) {
+  if (tx == nullptr || !tx->is_prefetch_mode()) return 0;  // not prefetch protocol
+  if (tx->tx_plan_used()) return 0;                        // tx-scoped plan covers it
+
+  const uint64_t query_id =
+      (thd != nullptr) ? static_cast<uint64_t>(thd->query_id) : 0;
+  if (tx->autogen_query_id() != query_id) {
+    tx->reset_autogen_for_statement(query_id);
+  }
+  if (tx->autogen_stmt_resolved()) return 0;  // already done this statement
+  tx->mark_autogen_stmt_resolved();
+
+  // A read is imminent (called from rnd_init / index_read_map / ...). A command
+  // whose read side cannot be prefetched (e.g. INSERT ... SELECT) would miss and
+  // abort silently in prefetch mode, so fail loudly instead.
+  if (!thd_can_use_prefetch(thd)) {
+    return prefetch_reject_unsupported(
+        thd, tx, "read-bearing statement is not prefetch-eligible");
+  }
+
+  return autogen_and_execute_prefetch(thd, tx);
+}
+
+int prefetch_reject_unsupported(THD *thd, LineairDBTransaction *tx,
+                                const char *reason) {
+  std::string msg = "LineairDB prefetch unsupported: ";
+  msg += reason != nullptr ? reason : "unsupported access shape";
+  if (thd != nullptr) {
+    const LEX_CSTRING query = thd->query();
+    if (query.str != nullptr && query.length > 0) {
+      msg += " sql=";
+      msg.append(query.str, query.length);
+    }
+  }
+  my_error(ER_NOT_SUPPORTED_YET, MYF(0), msg.c_str());
+  if (tx != nullptr) tx->set_status_to_abort();
+  thd_mark_transaction_to_rollback(thd, 1);
+  return HA_ERR_UNSUPPORTED;
 }

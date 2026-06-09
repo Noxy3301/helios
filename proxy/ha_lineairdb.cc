@@ -653,6 +653,13 @@ int ha_lineairdb::index_read_map(uchar *buf, const uchar *key,
     tx->clear_pushed_filter();
   }
 
+  // The optimizer has run, so the QEP is available.
+  // Stage the statement's autogen prefetch plan once before planning the
+  // lookup, so the lookup is served from the local view.
+  if (int err = maybe_prefetch_for_statement(ha_thd(), tx)) {
+    return err;
+  }
+
   KEY *key_info = &table->key_info[active_index];
 
   // Phase 4: Separation of planning and execution
@@ -774,6 +781,17 @@ int ha_lineairdb::index_last(uchar *buf) {
 
   tx->choose_table(db_table_name);
 
+  // index_last seeks the index tail with no search key: it does not route
+  // through index_read_map and carries no range to build an autogen plan from,
+  // and a statement-scoped plan keyed by the QEP's range cannot cover it.
+  // Reject loudly under no-fallback rather than silently miss the local view.
+  // Range-driven reverse scans (ORDER BY ... DESC LIMIT) are supported; only
+  // this key-less tail seek is not.
+  // TODO: support index_last under prefetch (autogen reverse tail-scan).
+  if (tx->is_prefetch_mode()) {
+    return prefetch_reject_unsupported(ha_thd(), tx, "index_last access");
+  }
+
   if (active_index == table->s->primary_key) {
     auto key_values = tx->get_matching_keys_and_values_in_range("", "");
     for (auto &kv : key_values) {
@@ -863,6 +881,13 @@ int ha_lineairdb::rnd_init(bool) {
     tx->set_pushed_filter(pushed_filter_serialized_);
   } else {
     tx->clear_pushed_filter();
+  }
+
+  // The optimizer has run, so the QEP is available.
+  // Statement-scoped autogen stages and executes the prefetch plan once per
+  // statement; an unsupported QEP fails here.
+  if (int err = maybe_prefetch_for_statement(ha_thd(), tx)) {
+    DBUG_RETURN(err);
   }
 
   DBUG_RETURN(0);
@@ -1386,9 +1411,13 @@ LineairDBTransaction *&ha_lineairdb::get_transaction(THD *thd) {
   if (ctx->tx == nullptr) {
     ctx->tx =
         new LineairDBTransaction(thd, ctx->proxy.get(), lineairdb_hton, FENCE);
+    // Prefetch protocol is fixed for the transaction: enabled whenever the
+    // sysvar is on and the first statement is prefetch-eligible. Whether a plan
+    // is actually staged is decided per statement: an injected @_tx_plan
+    // at begin (tx-scoped), else statement-scoped autogen at
+    // rnd_init / index_read.
     const bool can_use_prefetch =
-        (srv_prefetch_execution && thd_can_use_prefetch(thd) &&
-         thd_has_tx_plan(thd));
+        (srv_prefetch_execution && thd_can_use_prefetch(thd));
     ctx->tx->set_prefetch_mode(can_use_prefetch);
   }
   if (ctx->tx->is_not_started()) {
