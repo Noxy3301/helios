@@ -652,16 +652,34 @@ int ha_lineairdb::index_read_map(uchar *buf, const uchar *key,
     tx->clear_pushed_filter();
   }
 
-  // The optimizer has run, so the QEP is available.
-  // Stage the statement's autogen prefetch plan once before planning the
-  // lookup, so the lookup is served from the local view.
-  if (int err = maybe_prefetch_for_statement(ha_thd(), tx)) {
-    return err;
-  }
-
   KEY *key_info = &table->key_info[active_index];
 
-  // Phase 4: Separation of planning and execution
+  // MySQL runs single-table UPDATE/DELETE through the old executor
+  // (sql_update.cc/sql_delete.cc), which has no JOIN/access path. Derive its
+  // autogen plan from the optimizer-selected handler access instead.
+  if (prefetch_needs_legacy_dml_handler(ha_thd(), tx)) {
+    build_search_plan(key, keypart_map, find_flag, key_info);
+    if (int err = maybe_prefetch_for_legacy_dml_handler(
+            ha_thd(), tx, table, active_index, current_plan_)) {
+      return err;
+    }
+    return execute_plan(buf, tx);
+  }
+
+  // A legacy single-table DML staged its plan on the first handler access; a
+  // second handler access here means the statement spans multiple index ranges
+  // (e.g. index merge over different indexes), which the single staged plan
+  // cannot cover. Reject loudly (no-fallback) rather than let the read miss the
+  // cache and surface as a retryable deadlock, which would livelock on retry.
+  if (tx->is_prefetch_mode() && !tx->tx_plan_used() &&
+      tx->is_autogen_stmt_handler_deferred()) {
+    return prefetch_reject_unsupported(
+        ha_thd(), tx, "legacy DML multi-index access (index merge)");
+  }
+
+  // The optimizer has run, so the SELECT/generic-DML QEP is available.
+  if (int err = maybe_prefetch_for_statement(ha_thd(), tx)) return err;
+
   build_search_plan(key, keypart_map, find_flag, key_info);
 
   return execute_plan(buf, tx);
@@ -874,6 +892,11 @@ int ha_lineairdb::rnd_init(bool) {
     tx->set_pushed_filter(pushed_filter_serialized_);
   } else {
     tx->clear_pushed_filter();
+  }
+
+  if (prefetch_needs_legacy_dml_handler(ha_thd(), tx)) {
+    DBUG_RETURN(prefetch_reject_unsupported(
+        ha_thd(), tx, "legacy DML full/reverse table scan"));
   }
 
   // The optimizer has run, so the QEP is available.
@@ -1923,6 +1946,8 @@ int ha_lineairdb::multi_range_read_init(RANGE_SEQ_IF *seq, void *seq_init_param,
       return prefetch_reject_unsupported(ha_thd(), tx,
                                          "native MRR under prefetch");
     }
+    const bool legacy_dml =
+        prefetch_needs_legacy_dml_handler(ha_thd(), tx);
     // Statement-scoped autogen stages a single forward range per statement.
     if (!tx->tx_plan_used()) {
       if (n_ranges != 1) {
@@ -1933,12 +1958,13 @@ int ha_lineairdb::multi_range_read_init(RANGE_SEQ_IF *seq, void *seq_init_param,
                                            "MRR reverse or non-standard range");
       }
     }
-    if (int err = maybe_prefetch_for_statement(ha_thd(), tx)) {
-      return err;
+    // Legacy single-table DML has no QEP plan. Default DS-MRR reaches
+    // read_range_first()->index_read_map(), where the complete bounds exist.
+    if (!legacy_dml) {
+      if (int err = maybe_prefetch_for_statement(ha_thd(), tx)) return err;
     }
     if (tx->is_aborted()) {
-      thd_mark_transaction_to_rollback(ha_thd(), 1);
-      return HA_ERR_LOCK_DEADLOCK;
+      return abort_errno(tx);
     }
     mrr_use_batch_ = false;
     mrr_buffer_.clear();

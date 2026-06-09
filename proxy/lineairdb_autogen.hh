@@ -4,7 +4,9 @@
 #include <vector>
 
 class THD;
+struct TABLE;
 
+#include "lineairdb_index_search.hh"
 #include "lineairdb_proxy.hh"
 
 // Auto-generate a statement-scoped prefetch read plan from the current
@@ -14,5 +16,11 @@ class THD;
 // statement when false.
 bool autogen_read_plan_from_qep(
     THD *thd, std::vector<LineairDBProxy::ReadPlanStep> *out);
+
+// Auto-generate one statement-scoped prefetch step from the handler access
+// selected for legacy single-table UPDATE/DELETE.
+bool autogen_read_plan_from_index_search(
+    THD *thd, TABLE *table, uint index, const IndexSearchPlan &search,
+    std::vector<LineairDBProxy::ReadPlanStep> *out);
 
 #endif

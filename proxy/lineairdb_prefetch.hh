@@ -3,6 +3,8 @@
 
 class THD;
 class LineairDBTransaction;
+struct IndexSearchPlan;
+struct TABLE;
 
 bool thd_can_use_prefetch(THD *thd);
 bool thd_has_tx_plan(THD *thd);
@@ -43,6 +45,24 @@ void maybe_prefetch_for_transaction(THD *thd,
  *         fail the statement.
  */
 int maybe_prefetch_for_statement(THD *thd, LineairDBTransaction *tx);
+
+/**
+ * @brief True when this statement must defer autogen until index_read_map()
+ *        exposes the legacy single-table DML handler access.
+ *        The handler entry points index_read_map(), rnd_init(), and
+ *        multi_range_read_init() consult this to route legacy single-table
+ *        UPDATE/DELETE to the deferred path.
+ */
+bool prefetch_needs_legacy_dml_handler(THD *thd,
+                                      LineairDBTransaction *tx);
+
+/**
+ * @brief Compile and stage a legacy single-table UPDATE/DELETE from its first
+ *        handler index access, at most once per statement.
+ */
+int maybe_prefetch_for_legacy_dml_handler(
+    THD *thd, LineairDBTransaction *tx, TABLE *table, uint index,
+    const IndexSearchPlan &search);
 
 /**
  * @brief Fail, loudly, a read surface or statement that prefetch mode cannot

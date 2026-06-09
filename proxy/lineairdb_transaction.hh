@@ -109,9 +109,16 @@ public:
   void reset_autogen_for_statement(uint64_t query_id) {
     autogen_query_id_ = query_id;
     autogen_stmt_resolved_ = false;
+    autogen_stmt_handler_deferred_ = false;
   }
   bool autogen_stmt_resolved() const { return autogen_stmt_resolved_; }
   void mark_autogen_stmt_resolved() { autogen_stmt_resolved_ = true; }
+  bool is_autogen_stmt_handler_deferred() const {
+    return autogen_stmt_handler_deferred_;
+  }
+  void mark_autogen_stmt_handler_deferred() {
+    autogen_stmt_handler_deferred_ = true;
+  }
 
   inline bool is_not_started() const {
     if (prefetch_mode_) return !prefetch_registered_;
@@ -168,6 +175,10 @@ private:
   bool tx_plan_used_{false};
   uint64_t autogen_query_id_{0};
   bool autogen_stmt_resolved_{false};
+  // Set when this statement's plan is built from the handler index access
+  // (deferred legacy-DML path) instead of the QEP; a second handler access
+  // then means an index merge the single staged range cannot serve.
+  bool autogen_stmt_handler_deferred_{false};
 
   // stores the last RPC read result to maintain data pointer validity
   std::string last_read_value_;

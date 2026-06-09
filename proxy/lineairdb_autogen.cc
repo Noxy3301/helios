@@ -602,6 +602,99 @@ bool compile_leaf(AccessPath *leaf,
   return compile_ref_lookup(table, ref, table_steps, step, reason);
 }
 
+// Translate one resolved handler IndexSearchPlan (point/prefix/range/
+// index-first) into a single ReadPlanStep; reject reverse/unbounded access.
+bool compile_index_search(TABLE *table, uint index,
+                          const IndexSearchPlan &search,
+                          LineairDBProxy::ReadPlanStep *step,
+                          std::string *reason) {
+  if (table == nullptr || table->s == nullptr || step == nullptr) {
+    if (reason != nullptr) *reason = "invalid handler search metadata";
+    return false;
+  }
+  if (index >= table->s->keys) {
+    if (reason != nullptr) *reason = "invalid handler index";
+    return false;
+  }
+
+  const bool is_primary = index == table->s->primary_key;
+  if (search.is_primary != is_primary) {
+    if (reason != nullptr) *reason = "handler primary-index mismatch";
+    return false;
+  }
+
+  step->table_name = physical_table_key(table);
+  if (step->table_name.empty()) {
+    if (reason != nullptr) *reason = "missing handler table name";
+    return false;
+  }
+
+  const auto set_scan = [&](const std::string &start,
+                            const std::string &end) {
+    step->is_scan = true;
+    step->key_prefix = start;
+    step->end_key_prefix =
+        end.empty() ? lineairdb_keyenc::scan_end_sentinel() : end;
+    if (!is_primary) step->index_name = table->key_info[index].name;
+  };
+
+  switch (search.op) {
+    case IndexSearchOp::kUniquePoint:
+      if (search.start_key_serialized.empty()) {
+        if (reason != nullptr) *reason = "missing handler point key";
+        return false;
+      }
+      if (is_primary) {
+        step->is_scan = false;
+        step->key_prefix = search.start_key_serialized;
+      } else {
+        set_scan(search.start_key_serialized,
+                 lineairdb_keyenc::build_prefix_range_end(
+                     search.start_key_serialized));
+      }
+      return true;
+
+    case IndexSearchOp::kSameKeyMaterialize:
+    case IndexSearchOp::kPrefixFirst:
+      if (search.same_group_prefix_serialized.empty()) {
+        if (reason != nullptr) *reason = "missing handler prefix bound";
+        return false;
+      }
+      set_scan(search.same_group_prefix_serialized,
+               search.same_group_end_serialized);
+      return true;
+
+    case IndexSearchOp::kRangeMaterialize: {
+      if (search.start_key_serialized.empty()) {
+        if (reason != nullptr) *reason = "missing handler range start";
+        return false;
+      }
+      std::string start = search.start_key_serialized;
+      if (search.find_flag == HA_READ_AFTER_KEY) start.push_back('\0');
+      set_scan(start, search.end_key_serialized);
+      return true;
+    }
+
+    case IndexSearchOp::kIndexFirst:
+      if (search.end_key_serialized.empty()) {
+        if (reason != nullptr) {
+          *reason = "unbounded index-first/full scan unsupported";
+        }
+        return false;
+      }
+      set_scan("", search.end_key_serialized);
+      return true;
+
+    case IndexSearchOp::kPrevKey:
+    case IndexSearchOp::kPrefixLast:
+      if (reason != nullptr) *reason = "reverse handler access unsupported";
+      return false;
+  }
+
+  if (reason != nullptr) *reason = "unsupported handler access";
+  return false;
+}
+
 }  // namespace
 
 bool autogen_read_plan_from_qep(
@@ -664,5 +757,25 @@ bool autogen_read_plan_from_qep(
   }
 
   *out = std::move(steps);
+  return true;
+}
+
+// Produce a one-step prefetch plan from the handler access, raising
+// ER_NOT_SUPPORTED on an unsupported shape.
+bool autogen_read_plan_from_index_search(
+    THD *thd, TABLE *table, uint index, const IndexSearchPlan &search,
+    std::vector<LineairDBProxy::ReadPlanStep> *out) {
+  if (out == nullptr) {
+    return raise_unsupported(thd, "HANDLER", "null output vector");
+  }
+  out->clear();
+
+  LineairDBProxy::ReadPlanStep step;
+  std::string reason;
+  if (!compile_index_search(table, index, search, &step, &reason)) {
+    return raise_unsupported(thd, "HANDLER", reason);
+  }
+
+  out->push_back(std::move(step));
   return true;
 }

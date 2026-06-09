@@ -32,8 +32,10 @@
 #include "sql/item_func.h"
 #include "sql/sql_class.h"
 #include "sql/sql_lex.h"
+#include "sql/sql_optimizer.h"
 #include "sql/sql_plugin.h"
 #include "sql/table.h"
+#include "sql/table_trigger_dispatcher.h"
 #include "typelib.h"
 
 // Enable Prefetch only for DML; DDL must keep the normal transaction path
@@ -365,15 +367,74 @@ static int autogen_and_execute_prefetch(THD *thd, LineairDBTransaction *tx) {
   return tx->is_aborted() ? HA_ERR_LOCK_DEADLOCK : 0;
 }
 
-int maybe_prefetch_for_statement(THD *thd, LineairDBTransaction *tx) {
-  if (tx == nullptr || !tx->is_prefetch_mode()) return 0;  // not prefetch protocol
-  if (tx->tx_plan_used()) return 0;                        // tx-scoped plan covers it
-
+static void sync_autogen_statement(THD *thd, LineairDBTransaction *tx) {
   const uint64_t query_id =
       (thd != nullptr) ? static_cast<uint64_t>(thd->query_id) : 0;
   if (tx->autogen_query_id() != query_id) {
     tx->reset_autogen_for_statement(query_id);
   }
+}
+
+// True for a single-table UPDATE/DELETE on the pre-iterator executor, where
+// no JOIN/root AccessPath exists for QEP autogen to read.
+static bool is_legacy_single_table_dml(THD *thd) {
+  if (thd == nullptr || thd->lex == nullptr || thd->lex->unit == nullptr) {
+    return false;
+  }
+  if (thd->lex->sql_command != SQLCOM_UPDATE &&
+      thd->lex->sql_command != SQLCOM_DELETE) {
+    return false;
+  }
+
+  Query_block *query_block = thd->lex->unit->first_query_block();
+  if (query_block == nullptr || query_block->join == nullptr) return true;
+  return query_block->join->root_access_path() == nullptr;
+}
+
+// Return why a legacy-DML shape (extra tables, subquery, ORDER BY/LIMIT,
+// partitioning, triggers) cannot be served by one staged range; nullptr when
+// the shape is safe.
+static const char *legacy_dml_shape_rejection(THD *thd, TABLE *table) {
+  if (thd == nullptr || thd->lex == nullptr || thd->lex->unit == nullptr ||
+      table == nullptr) {
+    return "missing legacy DML metadata";
+  }
+
+  Query_block *query_block = thd->lex->unit->first_query_block();
+  if (query_block == nullptr) return "missing legacy DML query block";
+  if (query_block->leaf_table_count != 1 ||
+      query_block->derived_table_count != 0 ||
+      query_block->materialized_derived_table_count != 0) {
+    return "legacy DML additional-table read";
+  }
+  if (query_block->first_inner_query_expression() != nullptr) {
+    return "legacy DML subquery";
+  }
+  if (query_block->is_ordered() || query_block->has_limit()) {
+    return "legacy DML ORDER BY/LIMIT";
+  }
+  if (query_block->partitioned_table_count != 0 ||
+      table->part_info != nullptr) {
+    return "legacy DML partitioned table";
+  }
+  if (table->triggers != nullptr) {
+    if (thd->lex->sql_command == SQLCOM_UPDATE &&
+        table->triggers->has_update_triggers()) {
+      return "legacy DML UPDATE trigger";
+    }
+    if (thd->lex->sql_command == SQLCOM_DELETE &&
+        table->triggers->has_delete_triggers()) {
+      return "legacy DML DELETE trigger";
+    }
+  }
+  return nullptr;
+}
+
+int maybe_prefetch_for_statement(THD *thd, LineairDBTransaction *tx) {
+  if (tx == nullptr || !tx->is_prefetch_mode()) return 0;  // not prefetch protocol
+  if (tx->tx_plan_used()) return 0;                        // tx-scoped plan covers it
+
+  sync_autogen_statement(thd, tx);
   if (tx->autogen_stmt_resolved()) return 0;  // already done this statement
   tx->mark_autogen_stmt_resolved();
 
@@ -386,6 +447,52 @@ int maybe_prefetch_for_statement(THD *thd, LineairDBTransaction *tx) {
   }
 
   return autogen_and_execute_prefetch(thd, tx);
+}
+
+// Gate for the handler entry points: true when autogen must defer to the
+// handler index access, marking it handler-deferred on the first call.
+bool prefetch_needs_legacy_dml_handler(THD *thd,
+                                      LineairDBTransaction *tx) {
+  if (tx == nullptr || !tx->is_prefetch_mode() || tx->tx_plan_used()) {
+    return false;
+  }
+  sync_autogen_statement(thd, tx);
+  if (tx->autogen_stmt_resolved()) return false;
+  if (tx->is_autogen_stmt_handler_deferred()) return true;
+  if (!is_legacy_single_table_dml(thd)) return false;
+  tx->mark_autogen_stmt_handler_deferred();
+  return true;
+}
+
+// Build, stage, and serve a legacy single-table UPDATE/DELETE plan from its
+// first handler index access, once per statement; reject unsupported shapes.
+int maybe_prefetch_for_legacy_dml_handler(
+    THD *thd, LineairDBTransaction *tx, TABLE *table, uint index,
+    const IndexSearchPlan &search) {
+  if (tx == nullptr || !tx->is_prefetch_mode() || tx->tx_plan_used()) return 0;
+
+  sync_autogen_statement(thd, tx);
+  if (tx->autogen_stmt_resolved()) return 0;
+  tx->mark_autogen_stmt_handler_deferred();
+  tx->mark_autogen_stmt_resolved();
+
+  if (!is_legacy_single_table_dml(thd)) {
+    return prefetch_reject_unsupported(
+        thd, tx, "handler-derived plan requested for non-legacy DML");
+  }
+  if (const char *reason = legacy_dml_shape_rejection(thd, table)) {
+    return prefetch_reject_unsupported(thd, tx, reason);
+  }
+
+  std::vector<LineairDBProxy::ReadPlanStep> steps;
+  if (!autogen_read_plan_from_index_search(thd, table, index, search, &steps)) {
+    tx->set_status_to_abort();
+    thd_mark_transaction_to_rollback(thd, 1);
+    return HA_ERR_UNSUPPORTED;
+  }
+
+  tx->execute_read_plan(steps);
+  return tx->is_aborted() ? HA_ERR_LOCK_DEADLOCK : 0;
 }
 
 int prefetch_reject_unsupported(THD *thd, LineairDBTransaction *tx,
