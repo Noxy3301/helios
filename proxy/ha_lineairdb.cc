@@ -526,7 +526,18 @@ int ha_lineairdb::write_row(uchar *buf) {
 int ha_lineairdb::update_row(const uchar *old_data, uchar *new_data) {
   DBUG_TRACE;
 
+  auto tx = get_transaction(ha_thd());
   auto key = extract_key_from_mysql(old_data);
+  const auto new_key = extract_key_from_mysql(new_data);
+
+  // FIXME: reject a PK-changing UPDATE. update_row overwrites in place at the old
+  // key and cannot move a row, so executing one would store new_data under the
+  // old key with nothing at the new key -- silent corruption. A real move (delete
+  // old + insert new + secondary-index rewrite) is not implemented.
+  if (key != new_key) {
+    return prefetch_reject_unsupported(ha_thd(), tx,
+                                       "primary-key-changing UPDATE");
+  }
 
   if (key.empty()) {
     key = last_fetched_primary_key_;
@@ -539,8 +550,6 @@ int ha_lineairdb::update_row(const uchar *old_data, uchar *new_data) {
   last_fetched_primary_key_ = key;
 
   set_write_buffer(new_data);
-
-  auto tx = get_transaction(ha_thd());
 
   if (tx->is_aborted()) {
     thd_mark_transaction_to_rollback(ha_thd(), 1);
