@@ -1814,12 +1814,39 @@ bool ha_lineairdb::inplace_alter_table(TABLE *altered_table [[maybe_unused]],
 }
 
 /**
- * @brief Advertise custom MRR for primary key lookups.
+ * @brief True only for MySQL's standard forward index-range sequence.
  *
- * When MySQL considers using MRR (e.g. for BKA joins), it calls this method
- * to ask the storage engine for cost estimates. We clear HA_MRR_USE_DEFAULT_IMPL
- * for PK lookups so that multi_range_read_init() receives our custom batch path,
- * which sends all keys in a single RPC instead of one RPC per key.
+ * The range source is identified by its seq->init function: quick_range_seq_init
+ * is the forward scan, quick_range_rev_seq_init is the reverse one, and BKA
+ * supplies its own callback. Only the forward range matches the forward-staged
+ * cache, so the others are rejected.
+ */
+static bool lineairdb_is_forward_index_range_sequence(RANGE_SEQ_IF *seq) {
+  extern range_seq_t quick_range_seq_init(void *, uint, uint);
+  return seq != nullptr && seq->init == quick_range_seq_init;
+}
+
+/**
+ * @brief Predict prefetch mode without starting a transaction.
+ *
+ * MRR cost estimation must stay side-effect-free, so it cannot call
+ * get_transaction() (which allocates and may emit RPCs). Reuse an existing
+ * transaction's fixed mode, else predict from the session as get_transaction will.
+ */
+static bool lineairdb_predict_prefetch_mode(THD *thd) {
+  auto *ctx =
+      *reinterpret_cast<LineairDBThdCtx **>(thd_ha_data(thd, lineairdb_hton));
+  if (ctx != nullptr && ctx->tx != nullptr) return ctx->tx->is_prefetch_mode();
+  return srv_prefetch_execution && thd_can_use_prefetch(thd);
+}
+
+/**
+ * @brief Advertise custom batch MRR for primary-key point lookups.
+ *
+ * In non-prefetch ("batched") mode, clear HA_MRR_USE_DEFAULT_IMPL for PK lookups
+ * so multi_range_read_init() takes the custom batch path that sends all keys in
+ * one RPC. Under prefetch the advertisement is suppressed: reads are served from
+ * the staged cache through default MRR (read_range_first -> index_read_map).
  */
 ha_rows ha_lineairdb::multi_range_read_info_const(
     uint keyno, RANGE_SEQ_IF *seq, void *seq_init_param, uint n_ranges,
@@ -1829,10 +1856,9 @@ ha_rows ha_lineairdb::multi_range_read_info_const(
       cost);
   if (rows == HA_POS_ERROR) return rows;
 
-  // Use custom batch MRR for PK point lookups (BKA JOINs).
-  // Range scans on secondary indexes must use the default path.
-  // Set cost=1 since batch_read sends all keys in a single RPC.
-  if (keyno == table->s->primary_key) {
+  // Custom batch MRR only in batched mode; prefetch serves reads from the cache.
+  if (!lineairdb_predict_prefetch_mode(ha_thd()) &&
+      keyno == table->s->primary_key) {
     *flags &= ~HA_MRR_USE_DEFAULT_IMPL;
     *bufsz = 0;
     if (cost) {
@@ -1849,8 +1875,9 @@ ha_rows ha_lineairdb::multi_range_read_info(uint keyno, uint n_ranges,
                                             Cost_estimate *cost) {
   ha_rows rows = handler::multi_range_read_info(keyno, n_ranges, keys, bufsz,
                                                 flags, cost);
-  // Use custom batch MRR for PK point lookups (BKA JOINs).
-  if (keyno == table->s->primary_key) {
+  // Custom batch MRR only in batched mode; prefetch serves reads from the cache.
+  if (!lineairdb_predict_prefetch_mode(ha_thd()) &&
+      keyno == table->s->primary_key) {
     *flags &= ~HA_MRR_USE_DEFAULT_IMPL;
     *bufsz = 0;
     if (cost) {
@@ -1875,6 +1902,46 @@ ha_rows ha_lineairdb::multi_range_read_info(uint keyno, uint n_ranges,
 int ha_lineairdb::multi_range_read_init(RANGE_SEQ_IF *seq, void *seq_init_param,
                                         uint n_ranges, uint mode,
                                         HANDLER_BUFFER *buf) {
+  auto tx = get_transaction(ha_thd());
+  if (!tx || tx->is_aborted()) {
+    thd_mark_transaction_to_rollback(ha_thd(), 1);
+    return HA_ERR_LOCK_DEADLOCK;
+  }
+
+  // Prefetch never uses the custom batch path: the staging RPC already holds the
+  // rows, so default MRR (read_range_first -> index_read_map) consumes the cache.
+  if (tx->is_prefetch_mode()) {
+    if (!(mode & HA_MRR_USE_DEFAULT_IMPL)) {
+      // Custom MRR is not advertised under prefetch, so native MRR reaching here
+      // is a shape the staged cache cannot serve.
+      return prefetch_reject_unsupported(ha_thd(), tx,
+                                         "native MRR under prefetch");
+    }
+    // Statement-scoped autogen stages a single forward range per statement.
+    if (!tx->tx_plan_used()) {
+      if (n_ranges != 1) {
+        return prefetch_reject_unsupported(ha_thd(), tx, "MRR multi-range scan");
+      }
+      if (!lineairdb_is_forward_index_range_sequence(seq)) {
+        return prefetch_reject_unsupported(ha_thd(), tx,
+                                           "MRR reverse or non-standard range");
+      }
+    }
+    if (int err = maybe_prefetch_for_statement(ha_thd(), tx)) {
+      return err;
+    }
+    if (tx->is_aborted()) {
+      thd_mark_transaction_to_rollback(ha_thd(), 1);
+      return HA_ERR_LOCK_DEADLOCK;
+    }
+    mrr_use_batch_ = false;
+    mrr_buffer_.clear();
+    mrr_buffer_pos_ = 0;
+    m_ds_mrr.init(table);
+    return m_ds_mrr.dsmrr_init(seq, seq_init_param, n_ranges,
+                               mode | HA_MRR_USE_DEFAULT_IMPL, buf);
+  }
+
   if (mode & HA_MRR_USE_DEFAULT_IMPL) {
     mrr_use_batch_ = false;
     m_ds_mrr.init(table);
@@ -1915,11 +1982,6 @@ int ha_lineairdb::multi_range_read_init(RANGE_SEQ_IF *seq, void *seq_init_param,
   mrr_buffer_.clear();
   mrr_buffer_pos_ = 0;
 
-  auto tx = get_transaction(ha_thd());
-  if (!tx || tx->is_aborted()) {
-    thd_mark_transaction_to_rollback(ha_thd(), 1);
-    return HA_ERR_LOCK_DEADLOCK;
-  }
   tx->choose_table(db_table_name);
 
   if (batch_keys.empty()) return 0;
