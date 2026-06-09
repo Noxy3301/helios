@@ -1,5 +1,6 @@
 #include "lineairdb_transaction.hh"
 #include "storage/lineairdb/ha_lineairdb.hh"
+#include "lineairdb_keyenc.hh"
 #include "../common/log.h"
 
 #include <thread>
@@ -19,17 +20,17 @@ std::string next_lexicographic_key(std::string key) {
   return {};
 }
 
-bool range_validation_is_logical(
+bool range_is_logical(
     const LineairDBProxy::RangeValidationEntry& entry) {
   return !entry.end_key.empty();
 }
 
-bool range_validation_can_be_sliced(
+bool range_can_be_sliced(
     const std::vector<LineairDBProxy::RangeValidationEntry>& ranges,
     const std::vector<LineairDBProxy::IndexValidationEntry>& indexes) {
   if (!indexes.empty()) return false;
   for (const auto& range : ranges) {
-    if (!range_validation_is_logical(range)) return false;
+    if (!range_is_logical(range)) return false;
   }
   return !ranges.empty();
 }
@@ -90,7 +91,7 @@ LineairDBTransaction::read(std::string key) {
   if (table_is_not_chosen()) return std::pair<const std::byte *const, const size_t>{nullptr, 0};
 
   // Silo-style local view: own writes are visible before remote reads
-  if (auto entry = lookup_local_write_set(db_table_key, key)) {
+  if (auto entry = lookup_write_set(db_table_key, key)) {
     rpc_trace_.record_local_view("read_write_hit");
     if (!entry->found) return {nullptr, 0};
     last_read_value_ = entry->value;
@@ -98,9 +99,15 @@ LineairDBTransaction::read(std::string key) {
   }
 
   // Repeat exact-key reads can use the local read set
-  if (auto entry = lookup_local_read_cache(db_table_key, key)) {
+  if (auto entry = lookup_row_cache(db_table_key, key)) {
     rpc_trace_.record_local_view("read_cache_hit");
-    activate_cached_read(*entry);
+    // A consumed cache hit appends to the point read set (staged rows only).
+    if (entry->validate_on_use) {
+      rpc_trace_.record_local_view(
+          trace_count_event("use_point_read", entry->table_name, 1));
+      append_base_row_read(entry->table_name, entry->key,
+                                   entry->found, entry->tid);
+    }
     if (!entry->found) return {nullptr, 0};
     last_read_value_ = entry->value;
     return {reinterpret_cast<const std::byte*>(last_read_value_.data()), last_read_value_.size()};
@@ -116,11 +123,11 @@ LineairDBTransaction::read(std::string key) {
 
   last_read_value_ = lineairdb_proxy->tx_read(this, key);
   if (last_read_value_.empty()) {
-    record_local_read_cache(db_table_key, key, false, ""); // value unused when not found
+    record_row_cache(db_table_key, key, false, ""); // value unused when not found
     return std::pair<const std::byte *const, const size_t>{nullptr, 0};
   }
 
-  record_local_read_cache(db_table_key, key, true, last_read_value_);
+  record_row_cache(db_table_key, key, true, last_read_value_);
 
   return {reinterpret_cast<const std::byte*>(last_read_value_.data()), last_read_value_.size()};
 }
@@ -139,14 +146,19 @@ LineairDBTransaction::batch_read(const std::vector<std::string>& keys) {
 
   // Resolve keys covered by the local read/write sets first
   for (size_t i = 0; i < keys.size(); ++i) {
-    if (auto entry = lookup_local_write_set(db_table_key, keys[i])) {
+    if (auto entry = lookup_write_set(db_table_key, keys[i])) {
       rpc_trace_.record_local_view("batch_write_hit");
       pairs[i] = {entry->found, entry->value};
       continue;
     }
-    if (auto entry = lookup_local_read_cache(db_table_key, keys[i])) {
+    if (auto entry = lookup_row_cache(db_table_key, keys[i])) {
       rpc_trace_.record_local_view("batch_cache_hit");
-      activate_cached_read(*entry);
+      if (entry->validate_on_use) {
+        rpc_trace_.record_local_view(
+            trace_count_event("use_point_read", entry->table_name, 1));
+        append_base_row_read(entry->table_name, entry->key,
+                                     entry->found, entry->tid);
+      }
       pairs[i] = {entry->found, entry->value};
       continue;
     }
@@ -176,7 +188,7 @@ LineairDBTransaction::batch_read(const std::vector<std::string>& keys) {
       // Map each RPC result back to the original keys[] position
       const size_t pos = rpc_positions[i];
       pairs[pos] = {results[i].found, std::move(results[i].value)};
-      record_local_read_cache(db_table_key, keys[pos], pairs[pos].first, pairs[pos].second);
+      record_row_cache(db_table_key, keys[pos], pairs[pos].first, pairs[pos].second);
     }
   }
   return pairs;
@@ -195,8 +207,8 @@ void LineairDBTransaction::prefetch_stateless_reads(
   for (const auto& read : reads) {
     const std::string seen_key = read.table_name + '\0' + read.key;
     if (!seen.insert(seen_key).second) continue;
-    if (lookup_local_write_set(read.table_name, read.key)) continue;
-    if (lookup_local_read_cache(read.table_name, read.key)) continue;
+    if (lookup_write_set(read.table_name, read.key)) continue;
+    if (lookup_row_cache(read.table_name, read.key)) continue;
     rpc_reads.push_back(read);
   }
 
@@ -219,10 +231,10 @@ void LineairDBTransaction::prefetch_stateless_reads(
       return;
     }
     if (result.found) {
-      record_local_read_cache(read.table_name, read.key, true, result.value,
+      record_row_cache(read.table_name, read.key, true, result.value,
                         result.tid, true);
     } else {
-      record_local_read_cache(read.table_name, read.key, false, "",
+      record_row_cache(read.table_name, read.key, false, "",
                         result.tid, true); // value unused when not found
     }
   }
@@ -250,10 +262,10 @@ void LineairDBTransaction::execute_read_plan(
           step_result.found ? "plan_fetch:R:hit" : "plan_fetch:R:miss",
           step.table_name, 1));
       if (step_result.found) {
-        record_local_read_cache(step.table_name, step_result.actual_key, true,
+        record_row_cache(step.table_name, step_result.actual_key, true,
                           step_result.value, step_result.tid, true);
       } else {
-        record_local_read_cache(step.table_name, step_result.actual_key, false, "",
+        record_row_cache(step.table_name, step_result.actual_key, false, "",
                           step_result.tid, true);
       }
       continue;
@@ -274,7 +286,7 @@ void LineairDBTransaction::execute_read_plan(
       const uint64_t tid =
           j < step_result.scan_tids.size() ? step_result.scan_tids[j] : 0;
       const bool found = !value.empty();
-      record_local_read_cache(step.table_name, key, found, value, tid, true);
+      record_row_cache(step.table_name, key, found, value, tid, true);
       if (found) {
         rows.emplace_back(key, value);
         row_tids.push_back(tid);
@@ -284,7 +296,7 @@ void LineairDBTransaction::execute_read_plan(
     if (step.for_each) continue;
 
     if (step.index_name.empty()) {
-      local_range_scans_.push_back(
+      range_scan_cache_.push_back(
           {step.table_name, step_result.actual_start_key,
            step_result.actual_end_key, step.reverse_scan, step.scan_limit,
            std::move(rows), std::move(row_tids), step_result.range_versions,
@@ -307,7 +319,7 @@ void LineairDBTransaction::execute_read_plan(
       }
       cached.range_versions = step_result.range_versions;
       cached.index_reads = step_result.index_reads;
-      local_secondary_scans_.push_back(std::move(cached));
+      secondary_scan_cache_.push_back(std::move(cached));
     }
   }
 }
@@ -319,12 +331,12 @@ bool LineairDBTransaction::batch_write(
     for (auto op : ops) {
       if (op.table_name.empty()) op.table_name = table_name;
       if (op.type == LineairDBProxy::BatchOp::Type::Write) {
-        record_local_write(op.table_name, op.key, true, op.value);
+        record_write(op.table_name, op.key, true, op.value);
       } else if (op.type == LineairDBProxy::BatchOp::Type::Delete) {
-        record_local_write(op.table_name, op.key, false, ""); // value unused when not found
+        record_write(op.table_name, op.key, false, ""); // value unused when not found
       } else if (op.type == LineairDBProxy::BatchOp::Type::SecondaryIndexWrite ||
                  op.type == LineairDBProxy::BatchOp::Type::SecondaryIndexDelete) {
-        drop_local_secondary_scans(op.table_name, op.index_name);
+        drop_secondary_scan_cache(op.table_name, op.index_name);
       }
       write_buffer_ops_.push_back(std::move(op));
     }
@@ -374,7 +386,7 @@ bool LineairDBTransaction::write(std::string key, const std::string value) {
   }
 
   const bool ok = lineairdb_proxy->tx_write(this, key, value);
-  if (ok) record_local_write(db_table_key, key, true, value);
+  if (ok) record_write(db_table_key, key, true, value);
   return ok;
 }
 
@@ -386,7 +398,7 @@ bool LineairDBTransaction::delete_value(std::string key) {
   }
 
   const bool ok = lineairdb_proxy->tx_delete(this, key);
-  if (ok) record_local_write(db_table_key, key, false, ""); // value unused when not found
+  if (ok) record_write(db_table_key, key, false, ""); // value unused when not found
   return ok;
 }
 
@@ -463,19 +475,19 @@ LineairDBTransaction::get_matching_keys_in_range(std::string start_key,
   if (table_is_not_chosen()) return {};
   if (prefetch_mode_) {
     if (auto cached =
-            lookup_local_range_scan(db_table_key, start_key, end_key, false, 0)) {
+            lookup_range_scan_cache(db_table_key, start_key, end_key, false, 0)) {
       std::vector<std::pair<std::string, std::string>> rows = cached->rows;
       rpc_trace_.record_local_view(
           trace_count_event("use_pk_key_scan", db_table_key, rows.size()));
       for (size_t i = 0; i < rows.size() && i < cached->row_tids.size(); ++i) {
-        record_point_read_validation(db_table_key, rows[i].first, true,
+        append_base_row_read(db_table_key, rows[i].first, true,
                               cached->row_tids[i]);
       }
       // Activate validation against the pre-merge key list in
       // cached->range_versions: server-side re-walk at commit cannot see
       // this tx's pending writes, so validating against the post-merge
       // view would false-abort on every own-insert / own-delete in range.
-      activate_range_validation(cached->range_versions, cached->index_reads);
+      append_scan_read_sets(cached->range_versions, cached->index_reads);
 
       merge_pending_rows_into_range_scan(rows, start_key, end_key, false);
       std::vector<std::string> keys;
@@ -502,16 +514,19 @@ LineairDBTransaction::get_matching_keys_and_values_in_range(std::string start_ke
                                                             bool reverse_scan) {
   if (table_is_not_chosen()) return {};
   if (prefetch_mode_) {
-    if (auto cached = lookup_local_range_scan(
+    // Unbounded-upper: map an empty end to the sentinel the scan was staged with
+    // so the [start, sentinel) slice keeps every row (see scan_end_sentinel).
+    if (end_key.empty()) end_key = lineairdb_keyenc::scan_end_sentinel();
+    if (auto cached = lookup_range_scan_cache(
             db_table_key, start_key, end_key, reverse_scan, row_limit)) {
       std::vector<std::pair<std::string, std::string>> pairs = cached->rows;
       for (size_t i = 0; i < cached->rows.size() && i < cached->row_tids.size();
            ++i) {
-        record_point_read_validation(db_table_key, cached->rows[i].first, true,
+        append_base_row_read(db_table_key, cached->rows[i].first, true,
                               cached->row_tids[i]);
       }
       // See get_matching_keys_in_range above for the rationale.
-      activate_range_validation(cached->range_versions, cached->index_reads);
+      append_scan_read_sets(cached->range_versions, cached->index_reads);
 
       merge_pending_rows_into_range_scan(pairs, start_key, end_key,
                                          reverse_scan);
@@ -629,12 +644,13 @@ LineairDBTransaction::get_matching_primary_keys_in_range(std::string index_name,
       return {};
     }
 
-    if (auto cached = lookup_local_secondary_scan(
+    if (end_key.empty()) end_key = lineairdb_keyenc::scan_end_sentinel();
+    if (auto cached = lookup_secondary_scan_cache(
             db_table_key, index_name, start_key, end_key, false, 0)) {
       rpc_trace_.record_local_view("use_si_scan:" + db_table_key + ":" +
                                    index_name + ":n=" +
                                    std::to_string(cached->primary_keys.size()));
-      activate_range_validation(cached->range_versions, cached->index_reads);
+      append_scan_read_sets(cached->range_versions, cached->index_reads);
       return cached->primary_keys;
     }
 
@@ -732,7 +748,7 @@ void LineairDBTransaction::buffer_write(const std::string& table_name,
   op.value = value;
   op.table_name = table_name;
   write_buffer_ops_.push_back(std::move(op));
-  record_local_write(table_name, key, true, value);
+  record_write(table_name, key, true, value);
 
   if (!prefetch_mode_ && write_buffer_ops_.size() >= WRITE_BATCH_SIZE) {
     flush_write_buffer();
@@ -750,7 +766,7 @@ void LineairDBTransaction::buffer_write_secondary_index(const std::string& table
   op.primary_key = primary_key;
   op.table_name = table_name;
   write_buffer_ops_.push_back(std::move(op));
-  drop_local_secondary_scans(table_name, index_name);
+  drop_secondary_scan_cache(table_name, index_name);
 
   if (!prefetch_mode_ && write_buffer_ops_.size() >= WRITE_BATCH_SIZE) {
     flush_write_buffer();
@@ -764,7 +780,7 @@ void LineairDBTransaction::buffer_delete(const std::string& table_name,
   op.key = key;
   op.table_name = table_name;
   write_buffer_ops_.push_back(std::move(op));
-  record_local_write(table_name, key, false, ""); // value unused when not found
+  record_write(table_name, key, false, ""); // value unused when not found
 
   if (!prefetch_mode_ && write_buffer_ops_.size() >= WRITE_BATCH_SIZE) {
     flush_write_buffer();
@@ -783,7 +799,7 @@ void LineairDBTransaction::buffer_delete_secondary_index(
   op.primary_key = primary_key;
   op.table_name = table_name;
   write_buffer_ops_.push_back(std::move(op));
-  drop_local_secondary_scans(table_name, index_name);
+  drop_secondary_scan_cache(table_name, index_name);
 
   if (!prefetch_mode_ && write_buffer_ops_.size() >= WRITE_BATCH_SIZE) {
     flush_write_buffer();
@@ -845,9 +861,9 @@ bool LineairDBTransaction::flush_write_buffer_for_table(
 }
 
 std::optional<LineairDBTransaction::LocalRowEntry>
-LineairDBTransaction::lookup_local_write_set(
+LineairDBTransaction::lookup_write_set(
     const std::string& table_name, const std::string& key) const {
-  for (auto it = local_write_set_.rbegin(); it != local_write_set_.rend(); ++it) {
+  for (auto it = own_writes_.rbegin(); it != own_writes_.rend(); ++it) {
     if (it->table_name == table_name && it->key == key) {
       return *it;
     }
@@ -856,16 +872,16 @@ LineairDBTransaction::lookup_local_write_set(
 }
 
 std::optional<LineairDBTransaction::LocalRowEntry>
-LineairDBTransaction::lookup_local_read_cache(
+LineairDBTransaction::lookup_row_cache(
     const std::string& table_name, const std::string& key) const {
-  auto it = local_read_cache_.find(make_local_read_key(table_name, key));
-  if (it == local_read_cache_.end()) return std::nullopt;
+  auto it = row_cache_.find(make_row_cache_key(table_name, key));
+  if (it == row_cache_.end()) return std::nullopt;
   return it->second;
 }
 
-void LineairDBTransaction::drop_local_read(const std::string& table_name,
+void LineairDBTransaction::drop_row_cache(const std::string& table_name,
                                            const std::string& key) {
-  local_read_cache_.erase(make_local_read_key(table_name, key));
+  row_cache_.erase(make_row_cache_key(table_name, key));
 }
 
 bool LineairDBTransaction::key_is_in_range(const std::string& key,
@@ -973,119 +989,79 @@ bool LineairDBTransaction::has_pending_secondary_ops_for_index(
   return false;
 }
 
-void LineairDBTransaction::drop_local_secondary_scans(
+void LineairDBTransaction::drop_secondary_scan_cache(
     const std::string& table_name,
     const std::string& index_name) {
   std::vector<LocalSecondaryScanEntry> kept;
-  kept.reserve(local_secondary_scans_.size());
+  kept.reserve(secondary_scan_cache_.size());
 
   // A buffered SI write/delete can make old scan results incomplete
-  for (const auto& entry : local_secondary_scans_) {
+  for (const auto& entry : secondary_scan_cache_) {
     if (entry.table_name == table_name && entry.index_name == index_name) {
       continue;
     }
     kept.push_back(entry);
   }
-  local_secondary_scans_.swap(kept);
+  secondary_scan_cache_.swap(kept);
 }
 
-void LineairDBTransaction::record_local_write(const std::string& table_name,
+void LineairDBTransaction::record_write(const std::string& table_name,
                                               const std::string& key,
                                               bool found,
                                               const std::string& value) {
   // A later write/delete replaces any cached read for the same key
-  drop_local_read(table_name, key);
+  drop_row_cache(table_name, key);
 
-  for (auto& entry : local_write_set_) {
+  for (auto& entry : own_writes_) {
     if (entry.table_name == table_name && entry.key == key) {
       entry.found = found;
       entry.value = value;
       return;
     }
   }
-  local_write_set_.push_back({table_name, key, found, value});
+  own_writes_.push_back({table_name, key, found, value});
 }
 
-void LineairDBTransaction::record_local_read_cache(const std::string& table_name,
-                                             const std::string& key,
-                                             bool found,
-                                             const std::string& value,
-                                             uint64_t tid,
-                                             bool validate_on_use) {
-  local_read_cache_[make_local_read_key(table_name, key)] =
+void LineairDBTransaction::record_row_cache(
+    const std::string& table_name, const std::string& key, bool found,
+    const std::string& value, uint64_t tid, bool validate_on_use) {
+  // Overwrite with the latest staged row. Staging runs once per statement, so
+  // the cached value stays stable while the statement consumes it (repeatable
+  // within the statement); the next statement re-stages and overwrites. Each
+  // consume appends to base_row_read_set_, so an overwrite never loses
+  // a prior observation's TID.
+  row_cache_[make_row_cache_key(table_name, key)] =
       LocalRowEntry{table_name, key, found, value, tid, validate_on_use};
 }
 
-void LineairDBTransaction::record_point_read_validation(const std::string& table_name,
-                                                 const std::string& key,
-                                                 bool found,
-                                                 uint64_t tid) {
-  for (auto& entry : point_read_validation_set_) {
-    if (entry.table_name == table_name && entry.key == key) {
-      entry.found = found;
-      entry.tid = tid;
-      return;
-    }
-  }
-  point_read_validation_set_.push_back({table_name, key, tid, found});
+void LineairDBTransaction::append_base_row_read(
+    const std::string& table_name, const std::string& key, bool found,
+    uint64_t tid) {
+  // Append every observation, like Silo's read set (txn_impl.h: read_set is
+  // emplace_back-only, no dedup). Repeats carry the cached value's TID, so a
+  // key read N times validates that same TID N times -- redundant but never
+  // wrong. Commit aborts if any entry's TID no longer matches the server.
+  base_row_read_set_.push_back({table_name, key, tid, found});
 }
 
-void LineairDBTransaction::activate_cached_read(const LocalRowEntry& entry) {
-  if (!entry.validate_on_use) return;
-  rpc_trace_.record_local_view(
-      trace_count_event("use_point_read", entry.table_name, 1));
-  record_point_read_validation(entry.table_name, entry.key, entry.found, entry.tid);
-}
-
-void LineairDBTransaction::activate_range_validation(
+void LineairDBTransaction::append_scan_read_sets(
     const std::vector<LineairDBProxy::RangeValidationEntry>& ranges,
     const std::vector<LineairDBProxy::IndexValidationEntry>& indexes) {
-  for (const auto& range : ranges) {
-    bool found = false;
-    for (const auto& active : range_validation_set_) {
-      const bool same_node =
-          active.table_name == range.table_name &&
-          active.index_name == range.index_name &&
-          active.owner_ptr == range.owner_ptr &&
-          active.node_ptr == range.node_ptr &&
-          active.version == range.version;
-      const bool same_logical =
-          active.start_key == range.start_key &&
-          active.end_key == range.end_key &&
-          active.row_limit == range.row_limit &&
-          active.reverse_scan == range.reverse_scan &&
-          active.result_keys == range.result_keys &&
-          active.result_primary_keys == range.result_primary_keys;
-      if (same_node && same_logical) {
-        found = true;
-        break;
-      }
-    }
-    if (!found) range_validation_set_.push_back(range);
-  }
-
-  for (const auto& index : indexes) {
-    bool found = false;
-    for (const auto& active : index_validation_set_) {
-      if (active.table_name == index.table_name &&
-          active.index_name == index.index_name &&
-          active.key == index.key &&
-          active.tid == index.tid &&
-          active.found == index.found) {
-        found = true;
-        break;
-      }
-    }
-    if (!found) index_validation_set_.push_back(index);
-  }
+  // Append, like the point and Silo read sets. A scan consumed twice records
+  // its node versions twice; commit re-checks each, so duplicates are redundant
+  // but never wrong.
+  range_read_set_.insert(range_read_set_.end(), ranges.begin(),
+                               ranges.end());
+  index_entry_read_set_.insert(index_entry_read_set_.end(), indexes.begin(),
+                               indexes.end());
 }
 
 std::optional<LineairDBTransaction::LocalRangeScanEntry>
-LineairDBTransaction::lookup_local_range_scan(
+LineairDBTransaction::lookup_range_scan_cache(
     const std::string& table_name, const std::string& start_key,
     const std::string& end_key, bool reverse_scan, uint64_t row_limit) const {
-  for (auto it = local_range_scans_.rbegin();
-       it != local_range_scans_.rend(); ++it) {
+  for (auto it = range_scan_cache_.rbegin();
+       it != range_scan_cache_.rend(); ++it) {
     const bool same_table = it->table_name == table_name;
     const bool same_direction = it->reverse_scan == reverse_scan;
     const bool same_limit = it->row_limit == row_limit;
@@ -1094,7 +1070,7 @@ LineairDBTransaction::lookup_local_range_scan(
     const bool exact_range =
         it->start_key == start_key && it->end_key == end_key;
     const bool can_slice_validation =
-        range_validation_can_be_sliced(it->range_versions, it->index_reads);
+        range_can_be_sliced(it->range_versions, it->index_reads);
     if (same_table && same_direction && same_limit && covers_range &&
         (exact_range || can_slice_validation)) {
       LocalRangeScanEntry cached = *it;
@@ -1115,7 +1091,7 @@ LineairDBTransaction::lookup_local_range_scan(
       cached.rows = std::move(rows);
       cached.row_tids = std::move(row_tids);
       for (auto& range : cached.range_versions) {
-        if (!range_validation_is_logical(range)) continue;
+        if (!range_is_logical(range)) continue;
         range.start_key = start_key;
         range.end_key = end_key;
         range.result_keys.clear();
@@ -1131,14 +1107,14 @@ LineairDBTransaction::lookup_local_range_scan(
 }
 
 std::optional<LineairDBTransaction::LocalSecondaryScanEntry>
-LineairDBTransaction::lookup_local_secondary_scan(
+LineairDBTransaction::lookup_secondary_scan_cache(
     const std::string& table_name, const std::string& index_name,
     const std::string& start_key, const std::string& end_key,
     bool reverse_scan, uint64_t row_limit) const {
   (void)reverse_scan; // SI cache keeps the query-specific order from the plan
 
-  for (auto it = local_secondary_scans_.rbegin();
-       it != local_secondary_scans_.rend(); ++it) {
+  for (auto it = secondary_scan_cache_.rbegin();
+       it != secondary_scan_cache_.rend(); ++it) {
     const bool same_index =
         it->table_name == table_name && it->index_name == index_name;
     const bool same_limit = it->row_limit == row_limit;
@@ -1147,7 +1123,7 @@ LineairDBTransaction::lookup_local_secondary_scan(
     const bool exact_range =
         it->start_key == start_key && it->end_key == end_key;
     const bool can_slice_validation =
-        range_validation_can_be_sliced(it->range_versions, it->index_reads);
+        range_can_be_sliced(it->range_versions, it->index_reads);
     if (same_index && same_limit && covers_range &&
         (exact_range || can_slice_validation)) {
       LocalSecondaryScanEntry cached = *it;
@@ -1170,7 +1146,7 @@ LineairDBTransaction::lookup_local_secondary_scan(
         cached.primary_keys = std::move(primary_keys);
       }
       for (auto& range : cached.range_versions) {
-        if (!range_validation_is_logical(range)) continue;
+        if (!range_is_logical(range)) continue;
         range.start_key = start_key;
         range.end_key = end_key;
         range.result_keys = cached.secondary_keys;
@@ -1187,11 +1163,11 @@ bool LineairDBTransaction::fallback_to_normal_transaction(const char* reason) {
 
   // A clean transaction can still switch to the normal scan-capable path
   const bool has_prefetch_state =
-      !point_read_validation_set_.empty() || !write_buffer_ops_.empty() ||
-      !rowcount_deltas_.empty() || !local_read_cache_.empty() ||
-      !local_write_set_.empty() || !range_validation_set_.empty() ||
-      !index_validation_set_.empty() || !local_range_scans_.empty() ||
-      !local_secondary_scans_.empty();
+      !base_row_read_set_.empty() || !write_buffer_ops_.empty() ||
+      !rowcount_deltas_.empty() || !row_cache_.empty() ||
+      !own_writes_.empty() || !range_read_set_.empty() ||
+      !index_entry_read_set_.empty() || !range_scan_cache_.empty() ||
+      !secondary_scan_cache_.empty();
   if (!has_prefetch_state) {
     prefetch_mode_ = false;
     prefetch_registered_ = false;
@@ -1213,10 +1189,10 @@ bool LineairDBTransaction::prefetch_validate_and_commit() {
   std::vector<uint64_t> read_tids;
   std::vector<bool> read_found;
   if (!was_aborted) {
-    reads.reserve(point_read_validation_set_.size());
-    read_tids.reserve(point_read_validation_set_.size());
-    read_found.reserve(point_read_validation_set_.size());
-    for (const auto& entry : point_read_validation_set_) {
+    reads.reserve(base_row_read_set_.size());
+    read_tids.reserve(base_row_read_set_.size());
+    read_found.reserve(base_row_read_set_.size());
+    for (const auto& entry : base_row_read_set_) {
       reads.push_back({entry.table_name, entry.key});
       read_tids.push_back(entry.tid);
       read_found.push_back(entry.found);
@@ -1236,8 +1212,8 @@ bool LineairDBTransaction::prefetch_validate_and_commit() {
   std::string abort_reason;
   if (!was_aborted) {
     committed = lineairdb_proxy->tx_validate_and_commit(
-        reads, read_tids, read_found, range_validation_set_,
-        index_validation_set_,
+        reads, read_tids, read_found, range_read_set_,
+        index_entry_read_set_,
         write_buffer_ops_, server_deltas, isFence, &abort_reason);
     if (!committed && !abort_reason.empty()) {
       rpc_trace_.record_local_view("abort_validate_" + abort_reason);
