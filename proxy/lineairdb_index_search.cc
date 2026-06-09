@@ -758,12 +758,13 @@ int ha_lineairdb::fetch_and_set_current_result(uchar *buf,
     const std::string &inline_value =
         secondary_index_payloads_[current_position_in_index_];
     if (inline_value.empty()) {
-      // A secondary entry whose base-row fetch returned no payload. A real row
-      // encoding is never empty, so this is the primary key missing. In prefetch
-      // mode that means a stale speculative cache miss for the key (its absence
-      // is validated, so commit aborts); never decode an empty buffer -- fail
-      // the statement explicitly. In the normal path the base row is simply
-      // gone, so report not-found for this position.
+      // An empty payload means the base row was deleted between the server's
+      // index walk and its row fetch; a real row encoding is never empty.
+      // Under prefetch the staged absence fails commit validation, so abort
+      // as retryable contention and let a retry stage a consistent snapshot.
+      // A permanently dangling index entry is an index-maintenance bug and
+      // shows up here as a retry loop, never as a wrong result.
+      // In the normal path the base row is simply gone: report not-found.
       if (tx->is_prefetch_mode()) {
         tx->set_status_to_abort();
         return abort_errno(tx);
