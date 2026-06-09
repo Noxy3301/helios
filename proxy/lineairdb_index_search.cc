@@ -411,9 +411,13 @@ int ha_lineairdb::execute_same_key_materialize(uchar *buf,
     const KEY *key = &table->key_info[active_index];
     const bool filter_ready = prepare_select_filter_for_tx(
         ha_thd(), table, tx, &pushed_filter_serialized_);
-    const RangeScanLimit scan_limit = range_scan_limit_for_order(
+    RangeScanLimit scan_limit = range_scan_limit_for_order(
         ha_thd(), key, current_plan_.used_key_parts,
         has_unpushed_filter_ || !filter_ready);
+    // Autogen stages the full forward range without a pushed filter; request the
+    // canonical {forward, unlimited} shape so MySQL applies LIMIT/WHERE above
+    // (see execute_range_materialize). DSL keeps its explicit pushdown.
+    if (tx->is_prefetch_mode() && !tx->tx_plan_used()) scan_limit = RangeScanLimit{};
 
     // Same-key scans can use ASC or DESC LIMIT when ORDER BY matches the key.
     auto key_values = tx->get_matching_keys_and_values_in_range(
@@ -519,9 +523,16 @@ int ha_lineairdb::execute_range_materialize(uchar *buf,
     const KEY *key = &table->key_info[active_index];
     const bool filter_ready = prepare_select_filter_for_tx(
         ha_thd(), table, tx, &pushed_filter_serialized_);
-    const RangeScanLimit scan_limit = range_scan_limit_for_order(
+    RangeScanLimit scan_limit = range_scan_limit_for_order(
         ha_thd(), key, current_plan_.used_key_parts,
         has_unpushed_filter_ || !filter_ready);
+    // Statement-scoped autogen stages the full forward range and its read-plan
+    // scan carries no pushed filter, so a server-side LIMIT/reverse would
+    // truncate rows before MySQL applies the WHERE (wrong results) and would not
+    // match the staged {forward, unlimited} cache. Request the canonical shape
+    // and let MySQL apply ORDER BY / LIMIT / WHERE above the handler. The
+    // tx-scoped DSL path keeps its explicit pushdown (its plan matches it).
+    if (tx->is_prefetch_mode() && !tx->tx_plan_used()) scan_limit = RangeScanLimit{};
 
     // Range scans can use ASC or DESC LIMIT when ORDER BY matches the key.
     auto key_values = tx->get_matching_keys_and_values_in_range(
@@ -603,9 +614,15 @@ int ha_lineairdb::execute_prefix_last(uchar *buf, LineairDBTransaction *tx) {
       const KEY *key = &table->key_info[active_index];
       const bool filter_ready = prepare_select_filter_for_tx(
           ha_thd(), table, tx, &pushed_filter_serialized_);
-      const RangeScanLimit scan_limit = range_scan_limit_for_order(
+      RangeScanLimit scan_limit = range_scan_limit_for_order(
           ha_thd(), key, current_plan_.used_key_parts,
           has_unpushed_filter_ || !filter_ready);
+      // Autogen stages the full forward range without a pushed filter; drop the
+      // pushdown so MySQL applies LIMIT/WHERE above (see
+      // execute_range_materialize). DSL keeps its explicit pushdown.
+      if (tx->is_prefetch_mode() && !tx->tx_plan_used()) {
+        scan_limit = RangeScanLimit{};
+      }
       const bool push_desc_limit =
           (scan_limit.row_limit == 1 && scan_limit.reverse_scan);
 
@@ -654,9 +671,15 @@ int ha_lineairdb::execute_prefix_last(uchar *buf, LineairDBTransaction *tx) {
     const KEY *key = &table->key_info[active_index];
     const bool filter_ready = prepare_select_filter_for_tx(
         ha_thd(), table, tx, &pushed_filter_serialized_);
-    const RangeScanLimit scan_limit = range_scan_limit_for_order(
+    RangeScanLimit scan_limit = range_scan_limit_for_order(
         ha_thd(), key, current_plan_.used_key_parts,
         has_unpushed_filter_ || !filter_ready);
+    // Autogen stages the full forward range without a pushed filter; drop the
+    // pushdown so MySQL applies LIMIT/WHERE above (see
+    // execute_range_materialize). DSL keeps its explicit pushdown.
+    if (tx->is_prefetch_mode() && !tx->tx_plan_used()) {
+      scan_limit = RangeScanLimit{};
+    }
     const bool push_desc_limit =
         (scan_limit.row_limit == 1 && scan_limit.reverse_scan);
 
@@ -745,6 +768,20 @@ int ha_lineairdb::fetch_and_set_current_result(uchar *buf,
   if (has_inline_value) {
     const std::string &inline_value =
         secondary_index_payloads_[current_position_in_index_];
+    if (inline_value.empty()) {
+      // A secondary entry whose base-row fetch returned no payload. A real row
+      // encoding is never empty, so this is the primary key missing. In prefetch
+      // mode that means a stale speculative cache miss for the key (its absence
+      // is validated, so commit aborts); never decode an empty buffer -- fail
+      // the statement explicitly. In the normal path the base row is simply
+      // gone, so report not-found for this position.
+      if (tx->is_prefetch_mode()) {
+        tx->set_status_to_abort();
+        thd_mark_transaction_to_rollback(ha_thd(), 1);
+        return HA_ERR_LOCK_DEADLOCK;
+      }
+      return HA_ERR_KEY_NOT_FOUND;
+    }
     value_ptr = reinterpret_cast<const std::byte *>(inline_value.data());
     value_size = inline_value.size();
   } else {
