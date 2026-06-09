@@ -116,8 +116,7 @@ LineairDBTransaction::read(std::string key) {
   // Normal path misses go to the server; prefetch plans must prefetch them
   rpc_trace_.record_local_view("read_miss");
   if (prefetch_mode_) {
-    rpc_trace_.record_local_view("abort_prefetch_read_miss");
-    is_aborted_ = true;
+    abort_prefetch_cache_miss("read");
     return std::pair<const std::byte *const, const size_t>{nullptr, 0};
   }
 
@@ -169,8 +168,7 @@ LineairDBTransaction::batch_read(const std::vector<std::string>& keys) {
 
   // Prefetch plans must fetch every key up front; misses mean the plan is short
   if (prefetch_mode_ && !rpc_keys.empty()) {
-    rpc_trace_.record_local_view("abort_prefetch_batch_miss");
-    is_aborted_ = true;
+    abort_prefetch_cache_miss("batch_read");
     return pairs;
   }
 
@@ -411,8 +409,7 @@ LineairDBTransaction::read_secondary_index(std::string index_name,
   if (prefetch_mode_) {
     const std::string end_key = next_lexicographic_key(secondary_key);
     if (end_key.empty()) {
-      rpc_trace_.record_local_view("abort_secondary_key_end");
-      is_aborted_ = true;
+      abort_prefetch_cache_miss("secondary point range end");
       return {};
     }
     return get_matching_primary_keys_in_range(index_name, secondary_key,
@@ -496,8 +493,7 @@ LineairDBTransaction::get_matching_keys_in_range(std::string start_key,
       return keys;
     }
 
-    rpc_trace_.record_local_view("abort_prefetch_pk_key_scan_miss");
-    is_aborted_ = true;
+    abort_prefetch_cache_miss("primary key scan");
     return {};
   }
 
@@ -538,10 +534,7 @@ LineairDBTransaction::get_matching_keys_and_values_in_range(std::string start_ke
       return pairs;
     }
 
-    rpc_trace_.record_local_view("abort_prefetch_pk_value_scan_miss:" +
-                                 std::to_string(start_key.size()) + ":" +
-                                 std::to_string(end_key.size()));
-    is_aborted_ = true;
+    abort_prefetch_cache_miss("primary value scan");
     return {};
   }
 
@@ -572,8 +565,7 @@ LineairDBTransaction::get_matching_keys_and_values_from_prefix(std::string prefi
   if (prefetch_mode_) {
     const std::string prefix_end = next_lexicographic_key(prefix);
     if (prefix_end.empty()) {
-      rpc_trace_.record_local_view("abort_pk_prefix_end");
-      is_aborted_ = true;
+      abort_prefetch_cache_miss("primary prefix range end");
       return {};
     }
     return get_matching_keys_and_values_in_range(prefix, prefix_end);
@@ -638,9 +630,7 @@ LineairDBTransaction::get_matching_primary_keys_in_range(std::string index_name,
   if (table_is_not_chosen()) return {};
   if (prefetch_mode_) {
     if (has_pending_secondary_ops_for_index(db_table_key, index_name)) {
-      rpc_trace_.record_local_view("abort_secondary_scan_after_secondary_write:" +
-                                   index_name);
-      is_aborted_ = true;
+      abort_prefetch_cache_miss("secondary scan after secondary write");
       return {};
     }
 
@@ -654,11 +644,7 @@ LineairDBTransaction::get_matching_primary_keys_in_range(std::string index_name,
       return cached->primary_keys;
     }
 
-    rpc_trace_.record_local_view("abort_prefetch_secondary_scan_miss:" +
-                                 index_name + ":" +
-                                 std::to_string(start_key.size()) + ":" +
-                                 std::to_string(end_key.size()));
-    is_aborted_ = true;
+    abort_prefetch_cache_miss("secondary scan");
     return {};
   }
 
@@ -675,8 +661,7 @@ LineairDBTransaction::get_matching_primary_keys_from_prefix(std::string index_na
   if (prefetch_mode_) {
     const std::string prefix_end = next_lexicographic_key(prefix);
     if (prefix_end.empty()) {
-      rpc_trace_.record_local_view("abort_secondary_prefix_end");
-      is_aborted_ = true;
+      abort_prefetch_cache_miss("secondary prefix range end");
       return {};
     }
     return get_matching_primary_keys_in_range(index_name, prefix, prefix_end);
@@ -1056,6 +1041,16 @@ void LineairDBTransaction::append_scan_read_sets(
                                indexes.end());
 }
 
+void LineairDBTransaction::abort_prefetch_cache_miss(
+    const std::string& reason) {
+  rpc_trace_.record_local_view("abort_prefetch_cache_miss:" + reason);
+  LOG_WARNING("Prefetch cache miss: %s table=%s", reason.c_str(),
+              db_table_key.c_str());
+  is_aborted_ = true;
+  aborted_by_cache_miss_ = true;
+  thd_mark_transaction_to_rollback(thread, 1);
+}
+
 std::optional<LineairDBTransaction::LocalRangeScanEntry>
 LineairDBTransaction::lookup_range_scan_cache(
     const std::string& table_name, const std::string& start_key,
@@ -1161,24 +1156,7 @@ LineairDBTransaction::lookup_secondary_scan_cache(
 bool LineairDBTransaction::fallback_to_normal_transaction(const char* reason) {
   if (!prefetch_mode_) return true;
 
-  // A clean transaction can still switch to the normal scan-capable path
-  const bool has_prefetch_state =
-      !base_row_read_set_.empty() || !write_buffer_ops_.empty() ||
-      !rowcount_deltas_.empty() || !row_cache_.empty() ||
-      !own_writes_.empty() || !range_read_set_.empty() ||
-      !index_entry_read_set_.empty() || !range_scan_cache_.empty() ||
-      !secondary_scan_cache_.empty();
-  if (!has_prefetch_state) {
-    prefetch_mode_ = false;
-    prefetch_registered_ = false;
-    begin_transaction();
-    return !is_aborted_;
-  }
-
-  // Mixing stateless point reads with scans would need phantom tracking
-  LOG_WARNING("Prefetch fallback blocked by prior local state: %s", reason);
-  rpc_trace_.record_local_view(std::string("abort_fallback_") + reason);
-  is_aborted_ = true;
+  abort_prefetch_cache_miss(std::string("unstaged read surface: ") + reason);
   return false;
 }
 

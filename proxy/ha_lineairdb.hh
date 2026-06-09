@@ -421,6 +421,12 @@ private:
   bool mrr_use_batch_ = false;
   LineairDBTransaction *&
   get_transaction(THD *thd);
+  /**
+   * @brief Map an aborted transaction to a handler errno: HA_ERR_UNSUPPORTED
+   * (non-retryable) for a prefetch cache miss, or HA_ERR_LOCK_DEADLOCK (MySQL's
+   * conventional retry signal) for a genuine OCC abort.
+   */
+  int abort_errno(LineairDBTransaction *tx);
 
   // Key conversion helpers
   static std::string encode_int_key(const uchar *data, size_t len);

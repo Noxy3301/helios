@@ -335,8 +335,7 @@ int ha_lineairdb::execute_index_first(uchar *buf, LineairDBTransaction *tx) {
 
   // phantom detection check
   if (tx->is_aborted()) {
-    thd_mark_transaction_to_rollback(ha_thd(), 1);
-    return HA_ERR_LOCK_DEADLOCK;
+    return abort_errno(tx);
   }
 
   if (secondary_index_results_.empty()) {
@@ -355,8 +354,7 @@ int ha_lineairdb::execute_unique_point(uchar *buf, LineairDBTransaction *tx) {
     auto result = tx->read(current_plan_.start_key_serialized);
 
     if (tx->is_aborted()) {
-      thd_mark_transaction_to_rollback(ha_thd(), 1);
-      return HA_ERR_LOCK_DEADLOCK;
+      return abort_errno(tx);
     }
 
     if (result.first == nullptr || result.second == 0) {
@@ -380,8 +378,7 @@ int ha_lineairdb::execute_unique_point(uchar *buf, LineairDBTransaction *tx) {
         current_index_name, current_plan_.start_key_serialized);
 
     if (tx->is_aborted()) {
-      thd_mark_transaction_to_rollback(ha_thd(), 1);
-      return HA_ERR_LOCK_DEADLOCK;
+      return abort_errno(tx);
     }
 
     for (auto &pk : primary_keys) {
@@ -429,8 +426,7 @@ int ha_lineairdb::execute_same_key_materialize(uchar *buf,
     }
 
     if (tx->is_aborted()) {
-      thd_mark_transaction_to_rollback(ha_thd(), 1);
-      return HA_ERR_LOCK_DEADLOCK;
+      return abort_errno(tx);
     }
 
     if (secondary_index_results_.empty()) {
@@ -445,8 +441,7 @@ int ha_lineairdb::execute_same_key_materialize(uchar *buf,
   batch_fetch_secondary_payloads(tx);
 
   if (tx->is_aborted()) {
-    thd_mark_transaction_to_rollback(ha_thd(), 1);
-    return HA_ERR_LOCK_DEADLOCK;
+    return abort_errno(tx);
   }
 
   if (secondary_index_results_.empty()) {
@@ -475,8 +470,7 @@ int ha_lineairdb::execute_prefix_first(uchar *buf, LineairDBTransaction *tx) {
     }
 
     if (tx->is_aborted()) {
-      thd_mark_transaction_to_rollback(ha_thd(), 1);
-      return HA_ERR_LOCK_DEADLOCK;
+      return abort_errno(tx);
     }
 
     if (secondary_index_results_.empty()) {
@@ -493,8 +487,7 @@ int ha_lineairdb::execute_prefix_first(uchar *buf, LineairDBTransaction *tx) {
   batch_fetch_secondary_payloads(tx);
 
   if (tx->is_aborted()) {
-    thd_mark_transaction_to_rollback(ha_thd(), 1);
-    return HA_ERR_LOCK_DEADLOCK;
+    return abort_errno(tx);
   }
 
   if (secondary_index_results_.empty()) {
@@ -550,8 +543,7 @@ int ha_lineairdb::execute_range_materialize(uchar *buf,
 
   // phantom detection check
   if (tx->is_aborted()) {
-    thd_mark_transaction_to_rollback(ha_thd(), 1);
-    return HA_ERR_LOCK_DEADLOCK;
+    return abort_errno(tx);
   }
 
   if (secondary_index_results_.empty()) {
@@ -588,8 +580,7 @@ int ha_lineairdb::execute_prev_key(uchar *buf, LineairDBTransaction *tx) {
   }
 
   if (tx->is_aborted()) {
-    thd_mark_transaction_to_rollback(ha_thd(), 1);
-    return HA_ERR_LOCK_DEADLOCK;
+    return abort_errno(tx);
   }
 
   if (secondary_index_results_.empty()) {
@@ -653,8 +644,7 @@ int ha_lineairdb::execute_prefix_last(uchar *buf, LineairDBTransaction *tx) {
     }
 
     if (tx->is_aborted()) {
-      thd_mark_transaction_to_rollback(ha_thd(), 1);
-      return HA_ERR_LOCK_DEADLOCK;
+      return abort_errno(tx);
     }
 
     if (secondary_index_results_.empty()) {
@@ -701,8 +691,7 @@ int ha_lineairdb::execute_prefix_last(uchar *buf, LineairDBTransaction *tx) {
   }
 
   if (tx->is_aborted()) {
-    thd_mark_transaction_to_rollback(ha_thd(), 1);
-    return HA_ERR_LOCK_DEADLOCK;
+    return abort_errno(tx);
   }
 
   if (secondary_index_results_.empty()) {
@@ -777,8 +766,7 @@ int ha_lineairdb::fetch_and_set_current_result(uchar *buf,
       // gone, so report not-found for this position.
       if (tx->is_prefetch_mode()) {
         tx->set_status_to_abort();
-        thd_mark_transaction_to_rollback(ha_thd(), 1);
-        return HA_ERR_LOCK_DEADLOCK;
+        return abort_errno(tx);
       }
       return HA_ERR_KEY_NOT_FOUND;
     }
@@ -787,8 +775,7 @@ int ha_lineairdb::fetch_and_set_current_result(uchar *buf,
   } else {
     auto result = tx->read(primary_key);
     if (tx->is_aborted()) {
-      thd_mark_transaction_to_rollback(ha_thd(), 1);
-      return HA_ERR_LOCK_DEADLOCK;
+      return abort_errno(tx);
     }
     if (result.first == nullptr || result.second == 0) {
       return HA_ERR_KEY_NOT_FOUND;

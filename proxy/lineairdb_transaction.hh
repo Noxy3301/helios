@@ -127,6 +127,8 @@ public:
     return is_aborted_;
   }
 
+  bool aborted_by_cache_miss() const { return aborted_by_cache_miss_; }
+
   inline void set_aborted(bool aborted) {
     // Once aborted, stay aborted (matches LineairDB's irreversible Abort semantics).
     // Prevents subsequent RPC responses from accidentally clearing the flag.
@@ -172,6 +174,9 @@ private:
 
   // transaction abort status (updated by RPC responses)
   bool is_aborted_;
+  // Set when the abort came from a prefetch cache miss (an unstaged read
+  // surface), so the handler returns a non-retryable error, not a deadlock.
+  bool aborted_by_cache_miss_{false};
 
   struct RowCountDelta {
     LineairDB_share *share;
@@ -306,6 +311,7 @@ private:
   void append_scan_read_sets(
       const std::vector<LineairDBProxy::RangeValidationEntry>& ranges,
       const std::vector<LineairDBProxy::IndexValidationEntry>& indexes);
+  void abort_prefetch_cache_miss(const std::string& reason);
   std::optional<LocalRangeScanEntry> lookup_range_scan_cache(
       const std::string& table_name, const std::string& start_key,
       const std::string& end_key, bool reverse_scan, uint64_t row_limit) const;
