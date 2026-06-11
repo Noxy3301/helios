@@ -16,35 +16,10 @@
 
 namespace {
 
-LineairDBProxy::RangeValidationEntry decode_range_validation_entry(
-    const LineairDB::Protocol::RangeValidationEntry& entry) {
-    LineairDBProxy::RangeValidationEntry out;
-    out.table_name = entry.table_name();
-    out.index_name = entry.index_name();
-    out.owner_ptr = entry.owner_ptr();
-    out.node_ptr = entry.node_ptr();
-    out.version = entry.version();
-    out.start_key = entry.start_key();
-    out.end_key = entry.end_key();
-    out.row_limit = entry.row_limit();
-    out.reverse_scan = entry.reverse_scan();
-    out.result_keys.reserve(entry.result_keys_size());
-    for (const auto& key : entry.result_keys()) out.result_keys.push_back(key);
-    out.result_primary_keys.reserve(entry.result_primary_keys_size());
-    for (const auto& key : entry.result_primary_keys()) {
-        out.result_primary_keys.push_back(key);
-    }
-    return out;
-}
-
-void encode_range_validation_entry(
-    const LineairDBProxy::RangeValidationEntry& entry,
-    LineairDB::Protocol::RangeValidationEntry* out) {
+void encode_range_read_entry(const LineairDBProxy::RangeReadEntry& entry,
+                             LineairDB::Protocol::RangeReadEntry* out) {
     out->set_table_name(entry.table_name);
     out->set_index_name(entry.index_name);
-    out->set_owner_ptr(entry.owner_ptr);
-    out->set_node_ptr(entry.node_ptr);
-    out->set_version(entry.version);
     out->set_start_key(entry.start_key);
     out->set_end_key(entry.end_key);
     out->set_row_limit(entry.row_limit);
@@ -441,18 +416,6 @@ LineairDBProxy::tx_stateless_range_scan(const std::string& table_name,
                                row.tid()});
     }
 
-    result.range_versions.reserve(response.range_versions_size());
-    for (const auto& entry : response.range_versions()) {
-        result.range_versions.push_back(decode_range_validation_entry(entry));
-    }
-
-    result.index_reads.reserve(response.index_reads_size());
-    for (const auto& entry : response.index_reads()) {
-        result.index_reads.push_back({entry.table_name(), entry.index_name(),
-                                      entry.key(), entry.tid(),
-                                      entry.found()});
-    }
-
     return result;
 }
 
@@ -492,18 +455,6 @@ LineairDBProxy::tx_stateless_secondary_range_scan(
     for (const auto& row : response.rows()) {
         result.rows.push_back({row.secondary_key(), row.primary_key(),
                                row.value(), row.found(), row.tid()});
-    }
-
-    result.range_versions.reserve(response.range_versions_size());
-    for (const auto& entry : response.range_versions()) {
-        result.range_versions.push_back(decode_range_validation_entry(entry));
-    }
-
-    result.index_reads.reserve(response.index_reads_size());
-    for (const auto& entry : response.index_reads()) {
-        result.index_reads.push_back({entry.table_name(), entry.index_name(),
-                                      entry.key(), entry.tid(),
-                                      entry.found()});
     }
 
     return result;
@@ -580,29 +531,7 @@ LineairDBProxy::ReadPlanResult LineairDBProxy::tx_execute_read_plan(
         for (const auto tid : step.scan_tids()) out.scan_tids.push_back(tid);
         out.secondary_keys.reserve(step.secondary_keys_size());
         for (const auto& key : step.secondary_keys()) out.secondary_keys.push_back(key);
-        out.range_versions.reserve(step.range_versions_size());
-        for (const auto& entry : step.range_versions()) {
-            out.range_versions.push_back(decode_range_validation_entry(entry));
-        }
-        out.index_reads.reserve(step.index_reads_size());
-        for (const auto& entry : step.index_reads()) {
-            out.index_reads.push_back({entry.table_name(), entry.index_name(),
-                                       entry.key(), entry.tid(),
-                                       entry.found()});
-        }
         result.steps.push_back(std::move(out));
-    }
-
-    result.range_versions.reserve(response.range_versions_size());
-    for (const auto& entry : response.range_versions()) {
-        result.range_versions.push_back(decode_range_validation_entry(entry));
-    }
-
-    result.index_reads.reserve(response.index_reads_size());
-    for (const auto& entry : response.index_reads()) {
-        result.index_reads.push_back({entry.table_name(), entry.index_name(),
-                                      entry.key(), entry.tid(),
-                                      entry.found()});
     }
 
     return result;
@@ -612,8 +541,7 @@ bool LineairDBProxy::tx_validate_and_commit(
     const std::vector<StatelessReadKey>& reads,
     const std::vector<uint64_t>& read_tids,
     const std::vector<bool>& read_found,
-    const std::vector<RangeValidationEntry>& range_reads,
-    const std::vector<IndexValidationEntry>& index_reads,
+    const std::vector<RangeReadEntry>& range_reads,
     const std::vector<BatchOp>& ops,
     const std::vector<std::pair<std::string, int64_t>>& row_deltas,
     bool isFence,
@@ -642,16 +570,7 @@ bool LineairDBProxy::tx_validate_and_commit(
 
     for (const auto& entry : range_reads) {
         auto* range = request.add_range_reads();
-        encode_range_validation_entry(entry, range);
-    }
-
-    for (const auto& entry : index_reads) {
-        auto* read = request.add_index_reads();
-        read->set_table_name(entry.table_name);
-        read->set_index_name(entry.index_name);
-        read->set_key(entry.key);
-        read->set_tid(entry.tid);
-        read->set_found(entry.found);
+        encode_range_read_entry(entry, range);
     }
 
     for (const auto& batch_op : ops) {

@@ -225,14 +225,11 @@ private:
   // Proxy-side write set for exact primary-key writes/deletes
   std::vector<LocalRowEntry> own_writes_;
 
-  // OCC commit-time read validation, three append-only sets (Silo read_set
+  // OCC commit-time read validation, two append-only sets (Silo read_set
   // style); the server re-checks each at commit and aborts on a mismatch:
-  //   base_row_read_set_    per-key TID of base rows -> value changes
-  //   index_entry_read_set_ per-key TID of secondary entries + tombstone slots
-  //   range_read_set_       observed range membership (result key-list),
-  //                         re-validated by logical replay -> phantoms
-  // range_read_set_ also carries masstree node-version fields, dormant while
-  // the server validates ranges logically (use_logical_validation).
+  //   base_row_read_set_  per-key TID of base rows -> value changes
+  //   range_read_set_     observed range membership (result key-list),
+  //                       re-validated by logical replay -> phantoms
   struct StatelessReadEntry {
     std::string table_name;
     std::string key;
@@ -240,8 +237,7 @@ private:
     bool found;
   };
   std::vector<StatelessReadEntry> base_row_read_set_;
-  std::vector<LineairDBProxy::RangeValidationEntry> range_read_set_;
-  std::vector<LineairDBProxy::IndexValidationEntry> index_entry_read_set_;
+  std::vector<LineairDBProxy::RangeReadEntry> range_read_set_;
 
   struct LocalRangeScanEntry {
     std::string table_name;
@@ -251,8 +247,6 @@ private:
     uint64_t row_limit = 0;
     std::vector<std::pair<std::string, std::string>> rows;
     std::vector<uint64_t> row_tids;
-    std::vector<LineairDBProxy::RangeValidationEntry> range_versions;
-    std::vector<LineairDBProxy::IndexValidationEntry> index_reads;
   };
   struct LocalSecondaryScanEntry {
     std::string table_name;
@@ -263,8 +257,6 @@ private:
     uint64_t row_limit = 0;
     std::vector<std::string> secondary_keys;
     std::vector<std::string> primary_keys;
-    std::vector<LineairDBProxy::RangeValidationEntry> range_versions;
-    std::vector<LineairDBProxy::IndexValidationEntry> index_reads;
   };
   std::vector<LocalRangeScanEntry> range_scan_cache_;
   std::vector<LocalSecondaryScanEntry> secondary_scan_cache_;
@@ -319,9 +311,8 @@ private:
   void append_base_row_read(const std::string& table_name,
                                     const std::string& key, bool found,
                                     uint64_t tid);
-  void append_scan_read_sets(
-      const std::vector<LineairDBProxy::RangeValidationEntry>& ranges,
-      const std::vector<LineairDBProxy::IndexValidationEntry>& indexes);
+  void append_range_read(const LocalRangeScanEntry& cached);
+  void append_secondary_range_read(const LocalSecondaryScanEntry& cached);
   void abort_prefetch_cache_miss(const std::string& reason);
   std::optional<LocalRangeScanEntry> lookup_range_scan_cache(
       const std::string& table_name, const std::string& start_key,

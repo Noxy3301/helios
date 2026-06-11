@@ -20,21 +20,6 @@ std::string next_lexicographic_key(std::string key) {
   return {};
 }
 
-bool range_is_logical(
-    const LineairDBProxy::RangeValidationEntry& entry) {
-  return !entry.end_key.empty();
-}
-
-bool range_can_be_sliced(
-    const std::vector<LineairDBProxy::RangeValidationEntry>& ranges,
-    const std::vector<LineairDBProxy::IndexValidationEntry>& indexes) {
-  if (!indexes.empty()) return false;
-  for (const auto& range : ranges) {
-    if (!range_is_logical(range)) return false;
-  }
-  return !ranges.empty();
-}
-
 std::string trace_count_event(const char* kind, const std::string& table_name,
                               size_t count) {
   return std::string(kind) + ":" + table_name + ":n=" +
@@ -297,8 +282,7 @@ void LineairDBTransaction::execute_read_plan(
       range_scan_cache_.push_back(
           {step.table_name, step_result.actual_start_key,
            step_result.actual_end_key, step.reverse_scan, step.scan_limit,
-           std::move(rows), std::move(row_tids), step_result.range_versions,
-           step_result.index_reads});
+           std::move(rows), std::move(row_tids)});
     } else {
       LocalSecondaryScanEntry cached;
       cached.table_name = step.table_name;
@@ -315,8 +299,6 @@ void LineairDBTransaction::execute_read_plan(
       for (const auto& key : step_result.scan_keys) {
         cached.primary_keys.push_back(key);
       }
-      cached.range_versions = step_result.range_versions;
-      cached.index_reads = step_result.index_reads;
       secondary_scan_cache_.push_back(std::move(cached));
     }
   }
@@ -480,11 +462,11 @@ LineairDBTransaction::get_matching_keys_in_range(std::string start_key,
         append_base_row_read(db_table_key, rows[i].first, true,
                               cached->row_tids[i]);
       }
-      // Activate validation against the pre-merge key list in
-      // cached->range_versions: server-side re-walk at commit cannot see
-      // this tx's pending writes, so validating against the post-merge
-      // view would false-abort on every own-insert / own-delete in range.
-      append_scan_read_sets(cached->range_versions, cached->index_reads);
+      // Assemble the range read from the pre-merge cached rows: server-side
+      // re-walk at commit cannot see this tx's pending writes, and
+      // validating against the post-merge view would false-abort on every
+      // own-insert / own-delete in range.
+      append_range_read(*cached);
 
       merge_pending_rows_into_range_scan(rows, start_key, end_key, false);
       std::vector<std::string> keys;
@@ -522,7 +504,7 @@ LineairDBTransaction::get_matching_keys_and_values_in_range(std::string start_ke
                               cached->row_tids[i]);
       }
       // See get_matching_keys_in_range above for the rationale.
-      append_scan_read_sets(cached->range_versions, cached->index_reads);
+      append_range_read(*cached);
 
       merge_pending_rows_into_range_scan(pairs, start_key, end_key,
                                          reverse_scan);
@@ -640,7 +622,7 @@ LineairDBTransaction::get_matching_primary_keys_in_range(std::string index_name,
       rpc_trace_.record_local_view("use_si_scan:" + db_table_key + ":" +
                                    index_name + ":n=" +
                                    std::to_string(cached->primary_keys.size()));
-      append_scan_read_sets(cached->range_versions, cached->index_reads);
+      append_secondary_range_read(*cached);
       return cached->primary_keys;
     }
 
@@ -1029,16 +1011,37 @@ void LineairDBTransaction::append_base_row_read(
   base_row_read_set_.push_back({table_name, key, tid, found});
 }
 
-void LineairDBTransaction::append_scan_read_sets(
-    const std::vector<LineairDBProxy::RangeValidationEntry>& ranges,
-    const std::vector<LineairDBProxy::IndexValidationEntry>& indexes) {
-  // Append, like the point and Silo read sets. A scan consumed twice records
-  // its node versions twice; commit re-checks each, so duplicates are redundant
-  // but never wrong.
-  range_read_set_.insert(range_read_set_.end(), ranges.begin(),
-                               ranges.end());
-  index_entry_read_set_.insert(index_entry_read_set_.end(), indexes.begin(),
-                               indexes.end());
+void LineairDBTransaction::append_range_read(
+    const LocalRangeScanEntry& cached) {
+  // Assemble the commit-side range read from the cached scan: the bounds
+  // describe the replay and result_keys is the observed key list in scan
+  // order. Append, like the point and Silo read sets; a scan consumed twice
+  // is revalidated twice -- redundant but never wrong.
+  LineairDBProxy::RangeReadEntry entry;
+  entry.table_name = cached.table_name;
+  entry.start_key = cached.start_key;
+  entry.end_key = cached.end_key;
+  entry.row_limit = cached.row_limit;
+  entry.reverse_scan = cached.reverse_scan;
+  entry.result_keys.reserve(cached.rows.size());
+  for (const auto& row : cached.rows) {
+    entry.result_keys.push_back(row.first);
+  }
+  range_read_set_.push_back(std::move(entry));
+}
+
+void LineairDBTransaction::append_secondary_range_read(
+    const LocalSecondaryScanEntry& cached) {
+  LineairDBProxy::RangeReadEntry entry;
+  entry.table_name = cached.table_name;
+  entry.index_name = cached.index_name;
+  entry.start_key = cached.start_key;
+  entry.end_key = cached.end_key;
+  entry.row_limit = cached.row_limit;
+  entry.reverse_scan = cached.reverse_scan;
+  entry.result_keys = cached.secondary_keys;
+  entry.result_primary_keys = cached.primary_keys;
+  range_read_set_.push_back(std::move(entry));
 }
 
 void LineairDBTransaction::abort_prefetch_cache_miss(
@@ -1062,12 +1065,7 @@ LineairDBTransaction::lookup_range_scan_cache(
     const bool same_limit = it->row_limit == row_limit;
     const bool covers_range =
         it->start_key <= start_key && end_key <= it->end_key;
-    const bool exact_range =
-        it->start_key == start_key && it->end_key == end_key;
-    const bool can_slice_validation =
-        range_can_be_sliced(it->range_versions, it->index_reads);
-    if (same_table && same_direction && same_limit && covers_range &&
-        (exact_range || can_slice_validation)) {
+    if (same_table && same_direction && same_limit && covers_range) {
       LocalRangeScanEntry cached = *it;
       cached.start_key = start_key;
       cached.end_key = end_key;
@@ -1085,16 +1083,6 @@ LineairDBTransaction::lookup_range_scan_cache(
       }
       cached.rows = std::move(rows);
       cached.row_tids = std::move(row_tids);
-      for (auto& range : cached.range_versions) {
-        if (!range_is_logical(range)) continue;
-        range.start_key = start_key;
-        range.end_key = end_key;
-        range.result_keys.clear();
-        range.result_primary_keys.clear();
-        for (const auto& row : cached.rows) {
-          range.result_keys.push_back(row.first);
-        }
-      }
       return cached;
     }
   }
@@ -1115,12 +1103,7 @@ LineairDBTransaction::lookup_secondary_scan_cache(
     const bool same_limit = it->row_limit == row_limit;
     const bool covers_range =
         it->start_key <= start_key && end_key <= it->end_key;
-    const bool exact_range =
-        it->start_key == start_key && it->end_key == end_key;
-    const bool can_slice_validation =
-        range_can_be_sliced(it->range_versions, it->index_reads);
-    if (same_index && same_limit && covers_range &&
-        (exact_range || can_slice_validation)) {
+    if (same_index && same_limit && covers_range) {
       LocalSecondaryScanEntry cached = *it;
       cached.start_key = start_key;
       cached.end_key = end_key;
@@ -1139,13 +1122,6 @@ LineairDBTransaction::lookup_secondary_scan_cache(
         }
         cached.secondary_keys = std::move(secondary_keys);
         cached.primary_keys = std::move(primary_keys);
-      }
-      for (auto& range : cached.range_versions) {
-        if (!range_is_logical(range)) continue;
-        range.start_key = start_key;
-        range.end_key = end_key;
-        range.result_keys = cached.secondary_keys;
-        range.result_primary_keys = cached.primary_keys;
       }
       return cached;
     }
@@ -1191,7 +1167,6 @@ bool LineairDBTransaction::prefetch_validate_and_commit() {
   if (!was_aborted) {
     committed = lineairdb_proxy->tx_validate_and_commit(
         reads, read_tids, read_found, range_read_set_,
-        index_entry_read_set_,
         write_buffer_ops_, server_deltas, isFence, &abort_reason);
     if (!committed && !abort_reason.empty()) {
       rpc_trace_.record_local_view("abort_validate_" + abort_reason);

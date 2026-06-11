@@ -126,25 +126,15 @@ public:
         std::string table_name;
         std::string key;
     };
-    struct RangeValidationEntry {
+    struct RangeReadEntry {
         std::string table_name;
         std::string index_name;
-        uint64_t owner_ptr;
-        uint64_t node_ptr;
-        uint64_t version;
         std::string start_key;
         std::string end_key;
         uint64_t row_limit = 0;
         bool reverse_scan = false;
         std::vector<std::string> result_keys;
         std::vector<std::string> result_primary_keys;
-    };
-    struct IndexValidationEntry {
-        std::string table_name;
-        std::string index_name;
-        std::string key;
-        uint64_t tid;
-        bool found;
     };
     struct StatelessRangeScanRow {
         std::string key;
@@ -155,8 +145,6 @@ public:
     struct StatelessRangeScanResult {
         bool ok = false;
         std::vector<StatelessRangeScanRow> rows;
-        std::vector<RangeValidationEntry> range_versions;
-        std::vector<IndexValidationEntry> index_reads;
     };
     struct StatelessSecondaryRangeScanRow {
         std::string secondary_key;
@@ -168,8 +156,6 @@ public:
     struct StatelessSecondaryRangeScanResult {
         bool ok = false;
         std::vector<StatelessSecondaryRangeScanRow> rows;
-        std::vector<RangeValidationEntry> range_versions;
-        std::vector<IndexValidationEntry> index_reads;
     };
     struct ReadPlanKeyBinding {
         uint32_t source_step = 0;
@@ -205,14 +191,10 @@ public:
         std::vector<std::string> secondary_keys;
         std::string actual_start_key;
         std::string actual_end_key;
-        std::vector<RangeValidationEntry> range_versions;
-        std::vector<IndexValidationEntry> index_reads;
     };
     struct ReadPlanResult {
         bool ok = false;
         std::vector<ReadPlanStepResult> steps;
-        std::vector<RangeValidationEntry> range_versions;
-        std::vector<IndexValidationEntry> index_reads;
     };
     std::vector<BatchReadResult> tx_batch_read(LineairDBTransaction* tx,
                                                 const std::vector<std::string>& keys);
@@ -257,8 +239,7 @@ public:
         const std::vector<StatelessReadKey>& reads,
         const std::vector<uint64_t>& read_tids,
         const std::vector<bool>& read_found,
-        const std::vector<RangeValidationEntry>& range_reads,
-        const std::vector<IndexValidationEntry>& index_reads,
+        const std::vector<RangeReadEntry>& range_reads,
         const std::vector<BatchOp>& ops,
         const std::vector<std::pair<std::string, int64_t>>& row_deltas,
         bool isFence,

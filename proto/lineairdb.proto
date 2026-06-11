@@ -69,29 +69,17 @@ message KeyValue {
     bytes value = 2;
 }
 
-// A Masstree leaf/node version observed while scanning.
-message RangeValidationEntry {
+// Range read observed by a stateless scan. The commit re-runs the scan
+// described by the bounds and asserts the observed key set is unchanged.
+message RangeReadEntry {
     string table_name = 1;
     string index_name = 2; // Empty means primary index.
-    uint64 owner_ptr = 3;
-    uint64 node_ptr = 4;
-    uint64 version = 5;
-    bytes start_key = 6;
-    bytes end_key = 7;
-    uint64 row_limit = 8; // 0 means compare the whole range.
-    bool reverse_scan = 9;
-    repeated bytes result_keys = 10; // PK scan: primary keys. SI scan: secondary keys.
-    repeated bytes result_primary_keys = 11; // SI scan only.
-}
-
-// Exact index entry version observed by a stateless scan.
-// Empty index_name means the primary index entry itself.
-message IndexValidationEntry {
-    string table_name = 1;
-    string index_name = 2;
-    bytes key = 3;
-    uint64 tid = 4;
-    bool found = 5;
+    bytes start_key = 3;
+    bytes end_key = 4;
+    uint64 row_limit = 5; // 0 means compare the whole range.
+    bool reverse_scan = 6;
+    repeated bytes result_keys = 7; // PK scan: primary keys. SI scan: secondary keys.
+    repeated bytes result_primary_keys = 8; // SI scan only.
 }
 
 // Secondary index entry: a secondary key and its associated primary keys.
@@ -194,7 +182,8 @@ message TxStatelessBatchRead {
 }
 
 // Scan primary-key rows without opening a server-side transaction.
-// Returned row TIDs and range versions are validated by TxValidateAndCommit.
+// Returned row TIDs and the proxy-assembled range read are validated by
+// TxValidateAndCommit.
 message TxStatelessRangeScan {
     message Request {
         string table_name = 1;
@@ -211,14 +200,12 @@ message TxStatelessRangeScan {
     }
     message Response {
         repeated Row rows = 1;
-        repeated RangeValidationEntry range_versions = 2;
-        repeated IndexValidationEntry index_reads = 3;
-        bool ok = 4;
+        bool ok = 2;
     }
 }
 
 // Scan secondary-index entries without opening a server-side transaction.
-// The SI entry TIDs, base row TIDs, and range versions are all validated by
+// Base row TIDs and the proxy-assembled range read are validated by
 // TxValidateAndCommit.
 message TxStatelessSecondaryRangeScan {
     message Request {
@@ -238,9 +225,7 @@ message TxStatelessSecondaryRangeScan {
     }
     message Response {
         repeated Row rows = 1;
-        repeated RangeValidationEntry range_versions = 2;
-        repeated IndexValidationEntry index_reads = 3;
-        bool ok = 4;
+        bool ok = 2;
     }
 }
 
@@ -281,17 +266,13 @@ message TxExecuteReadPlan {
         repeated bytes secondary_keys = 8;
         bytes actual_start_key = 9;
         bytes actual_end_key = 10;
-        repeated RangeValidationEntry range_versions = 11;
-        repeated IndexValidationEntry index_reads = 12;
     }
     message Request {
         repeated PlanStep steps = 1;
     }
     message Response {
         repeated StepResult results = 1;
-        repeated RangeValidationEntry range_versions = 2;
-        repeated IndexValidationEntry index_reads = 3;
-        bool ok = 4;
+        bool ok = 2;
     }
 }
 
@@ -327,8 +308,7 @@ message TxValidateAndCommit {
         repeated SecondaryIndexEntry secondary_index_ops = 4;
         repeated TableRowDelta row_deltas = 5;
         bool fence = 6;
-        repeated RangeValidationEntry range_reads = 7;
-        repeated IndexValidationEntry index_reads = 8;
+        repeated RangeReadEntry range_reads = 7;
     }
     message Response {
         bool committed = 1;
