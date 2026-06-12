@@ -1,0 +1,19 @@
+diff --git a/proxy/ha_lineairdb.cc b/proxy/ha_lineairdb.cc
+index 304b8f3..848f15e 100644
+--- a/proxy/ha_lineairdb.cc
++++ b/proxy/ha_lineairdb.cc
+@@ -5058,6 +5058,14 @@ int ha_lineairdb::multi_range_read_init(RANGE_SEQ_IF *seq, void *seq_init_param,
+   mrr_buffer_pos_ = 0;
+ 
+   auto tx = get_transaction(ha_thd());
++  // Defect-① fix (phase14): the custom full-PK MRR path bypasses
++  // index_read_map()/rnd_init(), so without this the QEP-derived oneshot plan is
++  // never staged and every batch_read() cache lookup misses and aborts (e.g.
++  // TPC-C `SELECT ... FROM warehouse WHERE w_id=?`, a const/EQ_REF point read
++  // routed through this batch path). Stage here, before batch_read() consults the
++  // cache. Idempotent via oneshot_plan_resolved(); non-point MRR already fell
++  // back to the default impl above, so this only fires for full-PK point batches.
++  maybe_auto_stage_oneshot_plan(ha_thd(), tx);
+   if (!tx || tx->is_aborted()) {
+     thd_mark_transaction_to_rollback(ha_thd(), 1);
+     return HA_ERR_LOCK_DEADLOCK;
