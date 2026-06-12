@@ -48,6 +48,92 @@ bool serialize_item(const Item *item,
                     LineairDB::Protocol::FilterExpr *expr) {
   if (!item) return false;
 
+  // Constant subexpressions that are not bare literals — DATE '...' +
+  // INTERVAL arithmetic, '0.06' - 0.01, <cache> wrappers from constant
+  // folding — are evaluated NOW and serialized as literals (a const item's
+  // value at serialize time equals its value at execution time). Without
+  // this, every TPC-H date/decimal predicate fails serialization and both
+  // scan-filter and aggregation pushdown silently fall back. Bare literals
+  // keep their dedicated cases below.
+  // <cache> wrappers from constant propagation may be UNPOPULATED at staging
+  // time (their val_* would yield NULL and degenerate the predicate); fold
+  // the wrapped example expression instead, which is evaluable any time.
+  if (item->type() == Item::CACHE_ITEM) {
+    const Item *example =
+        down_cast<const Item_cache *>(item)->get_example();
+    if (example != nullptr) return serialize_item(example, expr);
+    return false;
+  }
+
+  if (item->const_item() && !item->has_subquery() &&
+      item->type() != Item::INT_ITEM && item->type() != Item::REAL_ITEM &&
+      item->type() != Item::STRING_ITEM &&
+      item->type() != Item::DECIMAL_ITEM && item->type() != Item::NULL_ITEM &&
+      item->type() != Item::COND_ITEM && item->type() != Item::FIELD_ITEM) {
+    // Comparison/boolean functions are handled structurally below even when
+    // const; only fold VALUE-producing expressions.
+    const bool is_bool_func =
+        item->type() == Item::FUNC_ITEM &&
+        down_cast<const Item_func *>(item)->functype() != Item_func::UNKNOWN_FUNC;
+    if (!is_bool_func) {
+      Item *mut = const_cast<Item *>(item);
+      // Temporal constants (DATE '...' +/- INTERVAL) MUST fold as strings:
+      // rows store dates as "YYYY-MM-DD" ASCII and compare lexicographically.
+      // Their result_type can report INT_RESULT, whose val_int form
+      // (19980902) degenerates the string comparison to always-true.
+      if (mut->is_temporal()) {
+        String tbuf;
+        String *ts = mut->val_str(&tbuf);
+        if (mut->null_value || ts == nullptr) {
+          expr->set_op(LineairDB::Protocol::FilterExpr::CONST_NULL);
+        } else {
+          expr->set_op(LineairDB::Protocol::FilterExpr::CONST_STRING);
+          expr->set_string_val(ts->ptr(), ts->length());
+        }
+        return true;
+      }
+      switch (mut->result_type()) {
+        case INT_RESULT: {
+          const longlong v = mut->val_int();
+          if (mut->null_value) {
+            expr->set_op(LineairDB::Protocol::FilterExpr::CONST_NULL);
+          } else if (mut->unsigned_flag) {
+            expr->set_op(LineairDB::Protocol::FilterExpr::CONST_UINT);
+            expr->set_uint_val(static_cast<ulonglong>(v));
+          } else {
+            expr->set_op(LineairDB::Protocol::FilterExpr::CONST_INT);
+            expr->set_int_val(v);
+          }
+          return true;
+        }
+        case REAL_RESULT:
+        case DECIMAL_RESULT: {
+          const double v = mut->val_real();
+          if (mut->null_value) {
+            expr->set_op(LineairDB::Protocol::FilterExpr::CONST_NULL);
+          } else {
+            expr->set_op(LineairDB::Protocol::FilterExpr::CONST_DOUBLE);
+            expr->set_double_val(v);
+          }
+          return true;
+        }
+        case STRING_RESULT: {
+          String buf;
+          String *s = mut->val_str(&buf);
+          if (mut->null_value || s == nullptr) {
+            expr->set_op(LineairDB::Protocol::FilterExpr::CONST_NULL);
+          } else {
+            expr->set_op(LineairDB::Protocol::FilterExpr::CONST_STRING);
+            expr->set_string_val(s->ptr(), s->length());
+          }
+          return true;
+        }
+        default:
+          return false;
+      }
+    }
+  }
+
   switch (item->type()) {
     case Item::INT_ITEM: {
       if (item->unsigned_flag) {
