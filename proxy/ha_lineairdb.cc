@@ -1813,10 +1813,12 @@ bool ha_lineairdb::tx_is_aborted() {
 
 bool ha_lineairdb::tx_ro_novalidate() {
   // The override decides Phase B BEFORE the read path begins the tx (which is
-  // where ro_novalidate_ gets set), so consult the sysvar gate directly; the
+  // where ro_novalidate_ gets set), so consult the sysvar gates directly; the
   // SQLCOM_SELECT / read-only half is already guaranteed by the offload
-  // whitelist. (Keeps Phase B OCC-sound = read-only scope.)
-  return srv_prefetch_ro_novalidate;
+  // whitelist. Phase B additionally requires PREFETCH mode: its group rows
+  // arrive via the staged read plan, while the stateful scan path returns
+  // BASE rows that the group-row parser would (loudly) reject as malformed.
+  return srv_prefetch_execution && srv_prefetch_ro_novalidate;
 }
 void ha_lineairdb::tx_clear_pushed_aggregate() {
   get_transaction(ha_thd())->clear_pushed_aggregate();

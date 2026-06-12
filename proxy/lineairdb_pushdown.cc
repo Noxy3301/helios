@@ -493,21 +493,29 @@ bool prepare_select_filter_for_tx(THD *thd, TABLE *table,
     return true;                                     // No WHERE to push
   }
 
-  // Convert WHERE into the existing predicate protobuf format.
-  LineairDB::Protocol::PushedPredicate predicate;
-  predicate.set_num_columns(table->s->fields);
-  if (!serialize_item(where, predicate.mutable_expr())) {
+  // Push only the TABLE-LOCAL necessary condition. Serializing the whole
+  // WHERE shipped cross-table join conjuncts (p_partkey = ps_partkey, both
+  // sides plain FIELD_ITEMs) that the server then evaluated against
+  // SINGLE-TABLE rows with the wrong column ordinals — every row failed and
+  // stateful joins returned zero rows (q2/q9/q16 zero-rows bug).
+  std::string encoded;
+  if (!build_single_table_filter(thd, table, &encoded) || encoded.empty()) {
     if (serialized_filter != nullptr) serialized_filter->clear();
     tx->clear_pushed_filter();
-    return false;                                    // MySQL must filter
+    // No pushable table-local predicate. Safe (MySQL filters), but a server
+    // LIMIT would cut rows MySQL still needs -> not limit-safe.
+    return false;
   }
-
-  // Attach the encoded filter to the transaction for the next scan RPC.
-  std::string encoded;
-  predicate.SerializeToString(&encoded);
   if (serialized_filter != nullptr) {
     *serialized_filter = encoded;
   }
   tx->set_pushed_filter(encoded);
-  return item_is_limit_safe_filter(where);
+
+  // LIMIT pushdown stays sound only when the server scan saw EVERY predicate
+  // MySQL applies before the limit: the WHERE must reference only this table
+  // (so the table-local push above IS the whole WHERE) and stay within the
+  // integer-comparison shapes the limit guard accepts.
+  if (table->pos_in_table_list == nullptr) return false;
+  const table_map me = table->pos_in_table_list->map();
+  return where->used_tables() == me && item_is_limit_safe_filter(where);
 }
