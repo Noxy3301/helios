@@ -538,4 +538,43 @@ WriteSecondaryIndex の種読みが CC Read 経由で validation 登録される
 - COST_V2 は係数較正+カバレッジ完全化(q17/q20 の miss 形状解消)後に再評価。
   q21 の hash-plan メモリ(44.8GB)には memory-budget aware costing が必要(Codex 提案 #9/#10)。
 
+### [2026-06-12] エントリ27: InnoDB vs Helios 正面対決表(SF=1)+ フェーズ総括
+
+**InnoDB(同一マシン・ローカル・バッファプール常駐)vs Helios(prefetch ON+novalidate)、
+md5 22/22 一致**(/tmp/compare_sf1/compare.csv、再現は bench/bin/tpch_compare.sh):
+
+| q | Helios s | InnoDB s | q | Helios s | InnoDB s |
+|---|---|---|---|---|---|
+| q1 | 30.3 | 8.5 | q12 | 27.3 | 1.6 |
+| q2 | 2.2 | 0.6 | q13 | 7.3 | 5.0 |
+| q3 | 27.2 | 3.5 | q14 | 27.2 | 1.7* |
+| q4 | 28.8 | 0.6 | q15 | 54.9 | 2.5 |
+| q5 | 335* | 1.6 | q16 | 3.5 | 0.3 |
+| q6 | 22.6 | 1.0 | q17 | 63.7 | 0.4 |
+| q7 | 26.0 | 0.2 | q18 | 53.4 | 1.6 |
+| q8 | 30.2 | 1.5 | q19 | 22.2 | 0.2 |
+| q9 | 37.7 | 8.4 | q20 | 35.0 | 0.5 |
+| q10 | 26.0 | 1.4 | q21 | 64.8 | 1.8 |
+| q11 | 5.7 | 0.5 | q22 | 6.9 | 0.4 |
+(*q5 はデフォルト cost の NLJ 病理。COST_V2 なら 19.5s。q14 の InnoDB 値は計時アーティファクト)
+- Helios peak RSS 列は累積高水位(13→41GB; 10s decay でクエリ連続時は purge が遅行)。
+- **解釈**: ローカル InnoDB は disaggregation なしの理想下界。現 Helios は「全行転送+
+  全実体化」実行のため 5-100x 差。詰める弾は確立済み(下記バックログ=旧ブランチ実証済み:
+  projection/agg pushdown で q1 0.49s 等、suite 全体で対 InnoDB 3-4x まで詰めた実績)。
+
+**フェーズ15 総括(本日の確定成果)**:
+| 指標 | before(本日朝) | after |
+|---|---|---|
+| TPC-H prefetch カバレッジ | SF=0.1 で 2/22(full scan 不可) | **SF=1 で 22/22** |
+| TPC-H 正しさ | 未検証 | **md5 22/22 vs InnoDB(SF=0.1/SF=1 両方)** |
+| TPC-H stateful 比 | — | 重 9 本: >120s timeout → 1.5-65s |
+| TPC-C explicit | 189(エラー258) | **191-200 req/s・エラー 0・C1-C4 全 0** |
+| TPC-C autogen | 123(abort storm 解消済) | 125・エラー 0 |
+| TATP | 未対応 | ハーネス対応+autogen +19%(1591) |
+| SF=1 ロード | 227s(単線) | **27-33s(並列・SI 完全)** |
+| 重大バグ修正 | — | DROP 残留 SI(運用回避)/ **Silo own-locked 検証**(lost update)/ **SI merge-install** / protobuf 2GB / recv 2GB / jemalloc decay |
+- ブランチ: claude/prefetch-maxopt(20 コミット)+ LineairDB helios/prefetch-maxopt(3f5a6f7)
+  + benchbase helios/prefetch-maxopt(6f3f578e)。push なし。
+- Codex レビュー対応済み(P0 含む 6 件)。SOTA 調査 2 本(Claude/Codex)完了・バックログ化。
+
 (以降追記)
