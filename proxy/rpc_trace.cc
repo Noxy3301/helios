@@ -150,6 +150,7 @@ void TxRpcTrace::start(int64_t tx_id, std::thread::id tid) {
   local_view_entries_.clear();
   by_type_.clear();
   local_view_by_kind_.clear();
+  sections_.clear();
 }
 
 void TxRpcTrace::on_stmt(const std::string& sql) {
@@ -210,6 +211,18 @@ void TxRpcTrace::record_local_view(const std::string& kind) {
                    : static_cast<uint32_t>(statements_.size() - 1);
   local_view_entries_.push_back(std::move(e));
   local_view_by_kind_[kind]++;
+}
+
+void TxRpcTrace::record_section(const std::string& kind, uint64_t us) {
+  if (!active_) return;
+  auto& a = sections_[kind];
+  a.n++;
+  a.us += us;
+}
+
+void TxRpcTrace::record_section_count(const std::string& kind, uint64_t n) {
+  if (!active_) return;
+  sections_[kind].n += n;
 }
 
 std::string TxRpcTrace::finalize_jsonl(bool committed) {
@@ -307,6 +320,18 @@ std::string TxRpcTrace::finalize_jsonl(bool committed) {
     if (!first_local) os << ',';
     first_local = false;
     os << '"' << json_escape(kv.first, 128) << "\":" << kv.second;
+  }
+  os << '}';
+
+  os << ",\"sections\":{";
+  bool first_section = true;
+  for (const auto& kv : sections_) {
+    if (!first_section) os << ',';
+    first_section = false;
+    os << '"' << json_escape(kv.first, 128) << "\":{"
+       << "\"n\":" << kv.second.n
+       << ",\"us\":" << kv.second.us
+       << '}';
   }
   os << '}';
 

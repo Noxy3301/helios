@@ -890,6 +890,29 @@ bool autogen_read_plan_from_qep(
       return raise_unsupported(thd, leaf->type, reason);
     }
 
+    // LIMIT pushdown into staging (TPC-C Delivery: `... ORDER BY pk ASC
+    // LIMIT 1` otherwise stages a whole district queue per RPC). Gate: the
+    // root is LIMIT_OFFSET(offset=0) whose child IS this single REF leaf —
+    // no FILTER/SORT between means the WHERE is fully absorbed into the key
+    // prefix, so a server-side limit cannot cut rows MySQL still needed.
+    // ASC only (forward entries); the consumer marks the served result
+    // truncated and aborts loudly if anything reads past the staged limit.
+    if (root->type == AccessPath::LIMIT_OFFSET &&
+        root->limit_offset().offset == 0 &&
+        root->limit_offset().child == leaf && leaves.size() == 1 &&
+        leaf->type == AccessPath::REF && ref != nullptr &&
+        ref->key >= 0 && ref->key < static_cast<int>(table->s->keys) &&
+        step.is_scan && !step.for_each && step.index_name.empty() &&
+        step.scan_limit == 0) {
+      const RangeScanLimit lim = range_scan_limit_for_order(
+          thd, &table->key_info[ref->key], ref->key_parts,
+          /*has_mysql_only_filter=*/false);
+      if (lim.row_limit > 0 && !lim.reverse_scan) {
+        step.scan_limit = static_cast<uint64_t>(lim.row_limit);
+        step.reverse_scan = false;
+      }
+    }
+
     // Attach the table-local cond_push() filter to every scan step (full
     // scans, secondary scans, and FER/FES probe groups) so the server drops
     // non-matching rows before transfer. Only when commit-time validation is

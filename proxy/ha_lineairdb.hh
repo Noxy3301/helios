@@ -86,6 +86,21 @@ public:
   std::atomic<uint64_t> stats_base_records{0};
 };
 
+// LIMIT and direction to pass to a range scan. Computed from the statement's
+// ORDER BY / LIMIT by range_scan_limit_for_order (lineairdb_index_search.cc);
+// also used by the autogen compiler to stage limit-aware scan steps.
+struct RangeScanLimit {
+  ha_rows row_limit{0};
+  bool reverse_scan{false};
+};
+
+// Returns LIMIT and scan direction to push, or row_limit=0 to keep it local.
+// Safe only when the server scan sees every WHERE predicate (or none exists
+// beyond the key range itself) — the caller owns that gate.
+RangeScanLimit range_scan_limit_for_order(THD *thd, const KEY *key,
+                                          uint matched_prefix,
+                                          bool has_mysql_only_filter);
+
 /** @brief
   Class definition for the storage engine
 */
@@ -122,6 +137,10 @@ private:
   std::unordered_map<std::string, size_t> scan_cache_;  // primary key -> index in scanned_values_
   std::vector<std::string> secondary_index_results_;
   std::vector<std::string> secondary_index_payloads_;
+  // Set when the materialized results came from a limit-staged prefetch entry
+  // (autogen LIMIT pushdown): reading past the last row must abort the tx
+  // instead of reporting EOF, because the real range may hold more rows.
+  bool materialized_scan_truncated_{false};
   std::string last_fetched_primary_key_;
   std::string end_range_exclusive_key_; // For HA_READ_BEFORE_KEY: exclude this key from results
   my_off_t

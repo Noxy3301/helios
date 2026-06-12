@@ -33,11 +33,8 @@
 #include "sql/table.h"
 #include "typelib.h"
 
-// LIMIT and direction to pass to a range scan
-struct RangeScanLimit {
-  ha_rows row_limit{0};
-  bool reverse_scan{false};
-};
+// RangeScanLimit is declared in ha_lineairdb.hh (shared with the autogen
+// compiler for limit-aware staging).
 
 // True when one ORDER BY item is exactly the requested keypart and direction
 static bool order_item_matches_key_part(ORDER *order, const KEY *key,
@@ -97,7 +94,7 @@ static bool order_by_matches_key_suffix(Query_block *qb, const KEY *key,
 }
 
 // Returns LIMIT and scan direction to push, or row_limit=0 to keep it local
-static RangeScanLimit range_scan_limit_for_order(
+RangeScanLimit range_scan_limit_for_order(
     THD *thd, const KEY *key, uint matched_prefix, bool has_mysql_only_filter) {
   RangeScanLimit scan_limit;
 
@@ -417,9 +414,11 @@ int ha_lineairdb::execute_same_key_materialize(uchar *buf,
     if (tx->is_prefetch_mode() && !tx->tx_plan_used()) scan_limit = RangeScanLimit{};
 
     // Same-key scans can use ASC or DESC LIMIT when ORDER BY matches the key.
+    // Forward streaming consumer: opt in to limit-staged (truncated) entries —
+    // index_next past the staged limit aborts instead of faking EOF.
     auto key_values = tx->get_matching_keys_and_values_in_range(
         prefix, prefix_end, static_cast<uint64_t>(scan_limit.row_limit),
-        scan_limit.reverse_scan);
+        scan_limit.reverse_scan, &materialized_scan_truncated_);
     for (auto &kv : key_values) {
       secondary_index_results_.push_back(kv.first);
       secondary_index_payloads_.push_back(std::move(kv.second));
@@ -461,9 +460,10 @@ int ha_lineairdb::execute_prefix_first(uchar *buf, LineairDBTransaction *tx) {
 
   if (current_plan_.is_primary) {
     // Restrict to [prefix, prefix_end) so index_next never leaks non-prefix
-    // rows.
+    // rows. Forward streaming consumer: accepts limit-staged entries (see
+    // execute_same_key_materialize).
     auto key_values = tx->get_matching_keys_and_values_in_range(
-        prefix, prefix_end);
+        prefix, prefix_end, 0, false, &materialized_scan_truncated_);
     for (auto &kv : key_values) {
       secondary_index_results_.push_back(kv.first);
       secondary_index_payloads_.push_back(std::move(kv.second));
@@ -528,9 +528,12 @@ int ha_lineairdb::execute_range_materialize(uchar *buf,
     if (tx->is_prefetch_mode() && !tx->tx_plan_used()) scan_limit = RangeScanLimit{};
 
     // Range scans can use ASC or DESC LIMIT when ORDER BY matches the key.
+    // Forward streaming consumer: accepts limit-staged entries (see
+    // execute_same_key_materialize).
     auto key_values = tx->get_matching_keys_and_values_in_range(
         effective_start, effective_end,
-        static_cast<uint64_t>(scan_limit.row_limit), scan_limit.reverse_scan);
+        static_cast<uint64_t>(scan_limit.row_limit), scan_limit.reverse_scan,
+        &materialized_scan_truncated_);
     for (auto &kv : key_values) {
       secondary_index_results_.push_back(kv.first);
       secondary_index_payloads_.push_back(std::move(kv.second));

@@ -345,7 +345,11 @@ void maybe_prefetch_for_transaction(THD *thd,
   const std::string plan_text = read_and_clear_tx_plan(thd);
   if (plan_text.empty()) return;
 
-  const auto steps = parse_plan_steps(thd, plan_text);
+  std::vector<LineairDBProxy::ReadPlanStep> steps;
+  {
+    SectionTimer parse_timer(tx->trace(), "txplan_parse");
+    steps = parse_plan_steps(thd, plan_text);
+  }
   if (steps.empty()) return;
   tx->set_tx_plan_used(true);
   tx->execute_read_plan(steps);
@@ -355,13 +359,22 @@ void maybe_prefetch_for_transaction(THD *thd,
 static int autogen_and_execute_prefetch(THD *thd, AccessPath *root,
                                         LineairDBTransaction *tx) {
   std::vector<LineairDBProxy::ReadPlanStep> steps;
-  if (!autogen_read_plan_from_qep(thd, root, tx->ro_novalidate(), &steps)) {
+  bool compile_ok;
+  {
+    SectionTimer compile_timer(tx->trace(), "autogen_compile");
+    compile_ok = autogen_read_plan_from_qep(thd, root, tx->ro_novalidate(),
+                                            &steps);
+  }
+  if (!compile_ok) {
     // autogen has already raised a my_error describing the unsupported shape.
     tx->set_status_to_abort();
     thd_mark_transaction_to_rollback(thd, 1);
     return HA_ERR_UNSUPPORTED;
   }
   if (steps.empty()) return 0;
+  if (tx->trace()->active()) {
+    tx->trace()->record_section_count("autogen_steps", steps.size());
+  }
 
   // Loads the prefetched rows into the local cache and validation sets.
   tx->execute_read_plan(steps);

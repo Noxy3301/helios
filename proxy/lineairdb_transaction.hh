@@ -37,9 +37,13 @@ public:
   std::vector<std::string> get_all_keys();
   std::vector<std::string> get_matching_keys(std::string key);
   std::vector<std::string> get_matching_keys_in_range(std::string start_key, std::string end_key);
+  // served_truncated (optional out): set true when an unbounded request was
+  // served from a limit-staged prefetch entry, i.e. the returned rows are the
+  // first N of the range and the real range may hold more. Passing a non-null
+  // pointer is the caller's opt-in to handle that (abort on over-read).
   std::vector<std::pair<std::string, std::string>> get_matching_keys_and_values_in_range(
       std::string start_key, std::string end_key, uint64_t row_limit = 0,
-      bool reverse_scan = false);
+      bool reverse_scan = false, bool *served_truncated = nullptr);
   std::vector<std::pair<std::string, std::string>> get_matching_keys_and_values_from_prefix(
       std::string prefix);
   bool write(std::string key, const std::string value);
@@ -168,6 +172,8 @@ public:
 
   // RPC trace statement boundary; TxRpcTrace dedupes repeated SQL strings.
   void on_stmt_boundary(const std::string& sql) { rpc_trace_.on_stmt(sql); }
+  // Section timing hook for code outside this class (autogen compile etc.).
+  TxRpcTrace* trace() { return &rpc_trace_; }
   bool fallback_to_normal_transaction(const char* reason);
 
   LineairDBTransaction(THD* thd, 
@@ -265,6 +271,10 @@ private:
     uint64_t row_limit = 0;
     std::vector<std::pair<std::string, std::string>> rows;
     std::vector<uint64_t> row_tids;
+    // Set only on copies returned by lookup_range_scan_cache: the entry was
+    // staged with a row limit and filled to it, so rows past the last one may
+    // exist server-side (over-reads must abort, not report EOF).
+    bool truncated = false;
   };
   struct LocalSecondaryScanEntry {
     std::string table_name;
@@ -294,7 +304,8 @@ private:
   // Pending RPC flush queue for row and secondary-index ops in MySQL order
   std::vector<LineairDBProxy::BatchOp> write_buffer_ops_;
 
-  TxRpcTrace rpc_trace_;
+  // mutable: const cache lookups time themselves into the trace.
+  mutable TxRpcTrace rpc_trace_;
 
   std::optional<LocalRowEntry> lookup_write_set(
       const std::string& table_name, const std::string& key) const;
@@ -321,6 +332,9 @@ private:
       std::vector<std::pair<std::string, std::string>>& rows,
       const std::string& prefix) const;
   bool has_pending_ops_for_table(const std::string& table_name) const;
+  bool has_pending_row_ops_in_range(const std::string& table_name,
+                                    const std::string& start_key,
+                                    const std::string& end_key) const;
   bool has_pending_secondary_ops_for_index(
       const std::string& table_name,
       const std::string& index_name) const;
@@ -341,7 +355,8 @@ private:
   void abort_prefetch_cache_miss(const std::string& reason);
   std::optional<LocalRangeScanEntry> lookup_range_scan_cache(
       const std::string& table_name, const std::string& start_key,
-      const std::string& end_key, bool reverse_scan, uint64_t row_limit) const;
+      const std::string& end_key, bool reverse_scan, uint64_t row_limit,
+      bool allow_truncated = false) const;
   std::optional<LocalSecondaryScanEntry> lookup_secondary_scan_cache(
       const std::string& table_name, const std::string& index_name,
       const std::string& start_key, const std::string& end_key,

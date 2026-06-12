@@ -240,16 +240,65 @@ void LineairDBTransaction::prefetch_stateless_reads(
 }
 
 void LineairDBTransaction::execute_read_plan(
-    const std::vector<LineairDBProxy::ReadPlanStep>& steps) {
-  if (!prefetch_mode_ || steps.empty()) return;
+    const std::vector<LineairDBProxy::ReadPlanStep>& full_steps) {
+  if (!prefetch_mode_ || full_steps.empty()) return;
+
+  // Drop exact point steps whose row is already in the local view: the
+  // SELECT ... FOR UPDATE -> UPDATE pattern re-stages the same row once per
+  // statement otherwise (TPC-C: one redundant RPC per stock/district/
+  // warehouse/customer write). Serving the later statement from the cached
+  // row is exactly what the runtime cache-hit path does anyway, and its TID
+  // is validated at commit. Bound steps resolve keys at runtime and scans
+  // have coverage semantics, so only constant-key scalar reads are dropped.
+  std::vector<LineairDBProxy::ReadPlanStep> steps;
+  steps.reserve(full_steps.size());
+  size_t covered = 0;
+  for (const auto& step : full_steps) {
+    const bool constant_point_read = !step.is_scan && !step.for_each &&
+                                     step.bindings.empty() &&
+                                     step.end_bindings.empty() &&
+                                     !step.key_prefix.empty();
+    if (constant_point_read &&
+        (lookup_write_set(step.table_name, step.key_prefix) ||
+         lookup_row_cache(step.table_name, step.key_prefix))) {
+      ++covered;
+      continue;
+    }
+    steps.push_back(step);
+  }
+  if (covered > 0) {
+    rpc_trace_.record_section_count("plan_steps_covered", covered);
+  }
+  if (steps.empty()) return;  // everything already staged: no RPC needed
 
   rpc_trace_.record_local_view("plan_request:steps=" +
                                std::to_string(steps.size()));
-  auto result = lineairdb_proxy->tx_execute_read_plan(steps);
+  LineairDBProxy::ReadPlanResult result;
+  {
+    // Overlapping span: contains the TX_EXECUTE_READ_PLAN RPC (recorded
+    // separately in summary_by_type) plus request build + flat-codec decode.
+    // Aggregators must not add this into a non-RPC sections sum; decode-only
+    // time = this section minus the RPC entry.
+    SectionTimer rpc_decode_timer(&rpc_trace_, "stage_rpc_and_decode");
+    result = lineairdb_proxy->tx_execute_read_plan(steps);
+  }
   if (!result.ok || result.steps.size() != steps.size()) {
     rpc_trace_.record_local_view("abort_read_plan_rpc");
     is_aborted_ = true;
     return;
+  }
+
+  SectionTimer stage_local_timer(&rpc_trace_, "stage_local");
+  if (rpc_trace_.active()) {
+    uint64_t staged_rows = 0;
+    for (size_t i = 0; i < result.steps.size(); ++i) {
+      // Scalar point steps carry their row in found/value, not scan_keys.
+      staged_rows += (!steps[i].is_scan && !steps[i].for_each)
+                         ? 1
+                         : static_cast<uint64_t>(
+                               result.steps[i].scan_keys.size());
+    }
+    rpc_trace_.record_section_count("staged_rows", staged_rows);
   }
 
   // Staging consumes `result` destructively: each step's payload is moved
@@ -571,10 +620,13 @@ LineairDBTransaction::get_matching_keys_in_range(std::string start_key,
       std::vector<std::pair<std::string, std::string>> rows = cached->rows;
       rpc_trace_.record_local_view(
           trace_count_event("use_pk_key_scan", db_table_key, rows.size()));
-      for (size_t i = 0; i < rows.size() && i < cached->row_tids.size(); ++i) {
-        append_base_row_read(db_table_key, rows[i].first, true,
-                              cached->row_tids[i]);
-      }
+      // Keys-only consumption: membership/order is guarded by the range
+      // replay below, and key bytes cannot change without a delete+insert
+      // (which the replay catches). Row VALUES are not returned here; a later
+      // value read goes through read(), whose cache hit appends the per-row
+      // TID validation on use. Per-row base appends here would re-validate
+      // every row in the range for no extra guarantee.
+      //
       // Assemble the range read from the pre-merge cached rows: server-side
       // re-walk at commit cannot see this tx's pending writes, and
       // validating against the post-merge view would false-abort on every
@@ -602,16 +654,28 @@ std::vector<std::pair<std::string, std::string>>
 LineairDBTransaction::get_matching_keys_and_values_in_range(std::string start_key,
                                                             std::string end_key,
                                                             uint64_t row_limit,
-                                                            bool reverse_scan) {
+                                                            bool reverse_scan,
+                                                            bool *served_truncated) {
+  if (served_truncated != nullptr) *served_truncated = false;
   if (table_is_not_chosen()) return {};
   if (prefetch_mode_) {
     // Unbounded-upper: map an empty end to the sentinel the scan was staged with
     // so the [start, sentinel) slice keeps every row (see scan_end_sentinel).
     if (end_key.empty()) end_key = lineairdb_keyenc::scan_end_sentinel();
     if (auto cached = lookup_range_scan_cache(
-            db_table_key, start_key, end_key, reverse_scan, row_limit)) {
+            db_table_key, start_key, end_key, reverse_scan, row_limit,
+            /*allow_truncated=*/served_truncated != nullptr)) {
+      if (served_truncated != nullptr) *served_truncated = cached->truncated;
       std::vector<std::pair<std::string, std::string>> pairs = cached->rows;
-      for (size_t i = 0; i < cached->rows.size() && i < cached->row_tids.size();
+      // Values are returned (and thus read) only for rows inside the limit
+      // window; rows sliced away below were never observed by the statement,
+      // so their TIDs need no validation — the range replay still guards
+      // membership/order of the whole staged range.
+      const size_t validated_rows =
+          (row_limit > 0)
+              ? std::min<size_t>(row_limit, cached->rows.size())
+              : cached->rows.size();
+      for (size_t i = 0; i < validated_rows && i < cached->row_tids.size();
            ++i) {
         append_base_row_read(db_table_key, cached->rows[i].first, true,
                               cached->row_tids[i]);
@@ -1068,6 +1132,20 @@ bool LineairDBTransaction::has_pending_ops_for_table(
   return false;
 }
 
+bool LineairDBTransaction::has_pending_row_ops_in_range(
+    const std::string& table_name, const std::string& start_key,
+    const std::string& end_key) const {
+  for (const auto& op : write_buffer_ops_) {
+    if (op.table_name != table_name) continue;
+    if (op.type != LineairDBProxy::BatchOp::Type::Write &&
+        op.type != LineairDBProxy::BatchOp::Type::Delete) {
+      continue;
+    }
+    if (op.key >= start_key && op.key < end_key) return true;
+  }
+  return false;
+}
+
 bool LineairDBTransaction::has_pending_secondary_ops_for_index(
     const std::string& table_name,
     const std::string& index_name) const {
@@ -1213,7 +1291,9 @@ void LineairDBTransaction::push_secondary_scan_cache(
 std::optional<LineairDBTransaction::LocalRangeScanEntry>
 LineairDBTransaction::lookup_range_scan_cache(
     const std::string& table_name, const std::string& start_key,
-    const std::string& end_key, bool reverse_scan, uint64_t row_limit) const {
+    const std::string& end_key, bool reverse_scan, uint64_t row_limit,
+    bool allow_truncated) const {
+  SectionTimer section_timer(&rpc_trace_, "lookup_range");
   // Fast path: exact-start staged entry (the FER probe pattern).
   auto idx_it = range_scan_start_index_.find(
       scan_cache_index_key(table_name, "", start_key));
@@ -1274,6 +1354,31 @@ LineairDBTransaction::lookup_range_scan_cache(
       return cached;
     }
   }
+
+  // Limit-staged fallback (autogen LIMIT pushdown): an unbounded request can
+  // be served from a forward limit-N entry of the EXACT same range — the
+  // entry holds the first N rows; the caller opted in (allow_truncated) to
+  // abort if anything reads past them. Pending own row writes INSIDE this
+  // range make the merged order ambiguous against a truncated prefix, so
+  // reject those (ops on other ranges of the table — e.g. TPC-C Delivery's
+  // earlier-district deletes — cannot affect this window).
+  if (allow_truncated && row_limit == 0 && !reverse_scan &&
+      !has_pending_row_ops_in_range(table_name, start_key, end_key)) {
+    auto idx_it = range_scan_start_index_.find(
+        scan_cache_index_key(table_name, "", start_key));
+    if (idx_it != range_scan_start_index_.end()) {
+      for (auto rit = idx_it->second.rbegin(); rit != idx_it->second.rend();
+           ++rit) {
+        const auto& e = range_scan_cache_[*rit];
+        if (e.row_limit > 0 && !e.reverse_scan && e.start_key == start_key &&
+            e.end_key == end_key) {
+          LocalRangeScanEntry cached = e;
+          cached.truncated = (e.rows.size() >= e.row_limit);
+          return cached;
+        }
+      }
+    }
+  }
   return std::nullopt;
 }
 
@@ -1282,6 +1387,7 @@ LineairDBTransaction::lookup_secondary_scan_cache(
     const std::string& table_name, const std::string& index_name,
     const std::string& start_key, const std::string& end_key,
     bool reverse_scan, uint64_t row_limit) const {
+  SectionTimer section_timer(&rpc_trace_, "lookup_secondary");
   // Direction only matters for truncated scans: an unlimited entry holds the
   // whole range whichever way it was produced, but a limit-N entry holds the
   // first N in ITS direction, so serving a DESC request from an ASC-limited
@@ -1378,6 +1484,18 @@ bool LineairDBTransaction::prefetch_validate_and_commit() {
     lineairdb_proxy->set_current_trace(nullptr);
     delete this;
     return true;
+  }
+
+  if (rpc_trace_.active()) {
+    rpc_trace_.record_section_count("commit_base_rows",
+                                    base_row_read_set_.size());
+    rpc_trace_.record_section_count("commit_range_entries",
+                                    range_read_set_.size());
+    uint64_t range_keys = 0;
+    for (const auto& e : range_read_set_) range_keys += e.result_keys.size();
+    rpc_trace_.record_section_count("commit_range_keys", range_keys);
+    rpc_trace_.record_section_count("commit_write_ops",
+                                    write_buffer_ops_.size());
   }
 
   std::vector<LineairDBProxy::StatelessReadKey> reads;

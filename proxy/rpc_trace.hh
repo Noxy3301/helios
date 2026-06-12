@@ -47,6 +47,12 @@ class TxRpcTrace {
   void record(MessageType type, uint64_t us, uint32_t req_b,
               uint32_t resp_b, const std::string& meta);
   void record_local_view(const std::string& kind);
+  // Non-RPC section timing (autogen compile, local staging, cache lookups),
+  // aggregated per kind within the transaction.
+  void record_section(const std::string& kind, uint64_t us);
+  // Pure counters carried in the same table (n accumulates, us stays 0):
+  // staged row counts, validation set sizes, ...
+  void record_section_count(const std::string& kind, uint64_t n);
   std::string finalize_jsonl(bool committed);
 
   bool active() const { return active_; }
@@ -68,8 +74,40 @@ class TxRpcTrace {
     uint64_t resp_b = 0;
   };
 
+  struct SectionAgg {
+    uint64_t n = 0;
+    uint64_t us = 0;
+  };
+
   std::map<MessageType, Agg> by_type_;
   std::map<std::string, uint32_t> local_view_by_kind_;
+  std::map<std::string, SectionAgg> sections_;
+};
+
+// RAII timer feeding TxRpcTrace::record_section; no-op when the trace is
+// inactive so the disabled path costs one branch, not two clock reads.
+class SectionTimer {
+ public:
+  SectionTimer(TxRpcTrace* trace, const char* kind)
+      : trace_(trace != nullptr && trace->active() ? trace : nullptr),
+        kind_(kind) {
+    if (trace_ != nullptr) start_ = std::chrono::steady_clock::now();
+  }
+  ~SectionTimer() {
+    if (trace_ != nullptr) {
+      const auto us = std::chrono::duration_cast<std::chrono::microseconds>(
+                          std::chrono::steady_clock::now() - start_)
+                          .count();
+      trace_->record_section(kind_, static_cast<uint64_t>(us));
+    }
+  }
+  SectionTimer(const SectionTimer&) = delete;
+  SectionTimer& operator=(const SectionTimer&) = delete;
+
+ private:
+  TxRpcTrace* trace_;
+  const char* kind_;
+  std::chrono::steady_clock::time_point start_;
 };
 
 // Singleton JSONL logger enabled by ENABLE_RPC_TRACE.
