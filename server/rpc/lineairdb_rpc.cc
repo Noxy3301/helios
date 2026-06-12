@@ -726,6 +726,24 @@ void LineairDBRpc::handleTxExecuteReadPlan(const std::string& message,
             end_key = next_lexicographic_key(start_key);
         }
 
+        // Step-level row filter (cond_push pushdown): drop non-matching rows
+        // before transfer; rows the evaluator cannot parse are returned for
+        // MySQL to re-evaluate (same contract as the stateless scan RPCs).
+        const bool step_has_filter =
+            step.has_filter() && step.filter().has_expr();
+        const auto* step_filter =
+            step_has_filter ? &step.filter().expr() : nullptr;
+        const uint32_t step_filter_cols =
+            step_has_filter ? step.filter().num_columns() : 0;
+        PredicateEvaluator step_eval;
+        auto row_passes = [&](const std::string& v) {
+            if (step_filter == nullptr) return true;
+            if (!step_eval.parse_row(v.data(), v.size(), step_filter_cols)) {
+                return true;  // unparseable: ship it, MySQL re-checks
+            }
+            return step_eval.evaluate(*step_filter);
+        };
+
         if (step.for_each()) {
             int source_step = -1;
             if (step.bindings_size() > 0) {
@@ -767,6 +785,7 @@ void LineairDBRpc::handleTxExecuteReadPlan(const std::string& message,
                             return;
                         }
                         for (auto& r : scan_result.rows) {
+                            if (!row_passes(r.value)) continue;
                             step_result->add_scan_keys(std::move(r.key));
                             step_result->add_scan_values(std::move(r.value));
                             step_result->add_scan_tids(r.tid);
@@ -785,6 +804,7 @@ void LineairDBRpc::handleTxExecuteReadPlan(const std::string& message,
                             return;
                         }
                         for (auto& r : scan_result.rows) {
+                            if (!row_passes(r.value)) continue;
                             step_result->add_secondary_keys(
                                 std::move(r.secondary_key));
                             step_result->add_scan_keys(std::move(r.primary_key));
@@ -841,23 +861,8 @@ void LineairDBRpc::handleTxExecuteReadPlan(const std::string& message,
                 flat_plan::encode_to_string(response, result);
                 return;
             }
-            // Server-side row filter (same contract as the stateless scan
-            // RPCs): drop non-matching rows; keep rows the evaluator cannot
-            // parse so MySQL re-evaluates them.
-            const bool has_filter =
-                step.has_filter() && step.filter().has_expr();
-            const auto* filter_expr =
-                has_filter ? &step.filter().expr() : nullptr;
-            const uint32_t filter_num_cols =
-                has_filter ? step.filter().num_columns() : 0;
-            PredicateEvaluator evaluator;
             for (auto& row : scan_result.rows) {
-                if (filter_expr != nullptr &&
-                    evaluator.parse_row(row.value.data(), row.value.size(),
-                                        filter_num_cols) &&
-                    !evaluator.evaluate(*filter_expr)) {
-                    continue;
-                }
+                if (!row_passes(row.value)) continue;
                 step_result->add_scan_keys(std::move(row.key));
                 step_result->add_scan_values(std::move(row.value));
                 step_result->add_scan_tids(row.tid);
@@ -875,6 +880,7 @@ void LineairDBRpc::handleTxExecuteReadPlan(const std::string& message,
                 return;
             }
             for (auto& row : scan_result.rows) {
+                if (!row_passes(row.value)) continue;
                 step_result->add_secondary_keys(std::move(row.secondary_key));
                 step_result->add_scan_keys(std::move(row.primary_key));
                 step_result->add_scan_values(std::move(row.value));

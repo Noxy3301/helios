@@ -883,12 +883,12 @@ bool autogen_read_plan_from_qep(
       return raise_unsupported(thd, leaf->type, reason);
     }
 
-    // Attach the table-local cond_push() filter to non-probe scans so the
-    // server drops non-matching rows before transfer. Only when commit-time
-    // validation is off (the replay could not reproduce a filtered key set);
-    // MySQL re-evaluates the condition either way.
-    if (allow_filter_pushdown && step.is_scan && !step.for_each &&
-        step.index_name.empty() && table->file != nullptr) {
+    // Attach the table-local cond_push() filter to every scan step (full
+    // scans, secondary scans, and FER/FES probe groups) so the server drops
+    // non-matching rows before transfer. Only when commit-time validation is
+    // off (the replay could not reproduce a filtered key set); MySQL
+    // re-evaluates the condition either way.
+    if (allow_filter_pushdown && step.is_scan && table->file != nullptr) {
       step.serialized_filter =
           down_cast<ha_lineairdb *>(table->file)->pushed_filter_for_autogen();
     }
