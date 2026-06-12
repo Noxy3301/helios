@@ -458,4 +458,43 @@ q1 27.5s / q3 22.5s / q5 37.2s / q12 23.0s / q14 21.1s / q19 19.8s / q20 27.8s �
 ⑤storage-side zone maps。LZ4 wire 圧縮は localhost では非推奨に格下げ(VLDB'17)、
 代替=軽量列エンコード(FOR/dict/RLE)。Codex 版 deep research も受領済み(統合は後段)。
 
+### [2026-06-12] エントリ22: SF=1 md5 完全一致(クリーンデータ)+ LineairDB Silo 検証バグ修正
+
+**単線ロードデータで SF=1 md5 = 22/22 完全一致** — 12 本不一致は 100% 並列ロード起因と確定、
+**prefetch スタックは SF=1 でも正確**。SI スポットチェック(7 custkey + 4878020)も全一致。
+※ 計測補足: stateful の `COUNT(FORCE INDEX)` 全 SI walk が 82 分経っても終わらず kill
+(stateful 二次 index 全表 count は実用不能級に遅い — 別途認知)。
+
+**LineairDB Silo own-locked read 検証バグ**(SI 6.7% 脱落の真因)を修正:
+- 場所: src/concurrency_control/impl/silo_nwr.hpp Precommit の lock 取得ループ。
+- 旧: own-locked な validation entry の期待 TID を **locked TID(desired)で上書き**
+  → 「Read と Lock の間の他 tx の install」が検出不能 → stale base での RMW install が
+  他 tx の SI PK-list 追記を上書き消去(lost update)。
+- 新: 期待 TID = **読時 TID | lock bit**(クラシック Silo 準拠)。間に install があれば
+  TID 不一致 → abort(リトライ可能)。重複 validation entry(ReadDirect 由来)は各自の
+  読時 TID を保持したまま全件に lock bit を付与(conservative-correct)。
+- submodule branch `helios/prefetch-maxopt`(4852e52 起点)で作業。
+- 検証中: **並列 SF=1 ロード→SI 整合**(修正後はロード中の同一 custkey RMW 競合が
+  正しく abort→リトライされるか、benchbase loader のエラー挙動も観察対象)。
+
+### [2026-06-12] エントリ23: LineairDB SI lost-update の本修正(merge-install + 検証設計)
+
+**Silo own-locked read 修正(エントリ22)の余波**: 検証が正しくなった結果、並列ロードが
+正当に abort 多発 → loader 無リトライで全滅。診断ログで判明した衝突源 = **TPC-H customer の
+`c_nationkey` 索引**(25 nation に 15 万行集中 = 超ホット SI キー、全 customer-loader tx が相互衝突)。
+WriteSecondaryIndex の種読みが CC Read 経由で validation 登録されることが衝突の入口。
+
+**本修正(stateless 側 commit と同型の設計へ)**:
+1. **merge-install**: 非 UNIQUE SI エントリの write snapshot は commit install 時に
+   `secondary_index_deltas`(Add/Remove)を**現在のリストへロック下で適用**
+   (read 時 copy の丸ごと上書きを廃止)。set 演算は可換なので並行 adder 同士は競合不要。
+2. **種読みの検証除外**: CC に `ReadUnvalidated`(同一アトミックスナップショット読取、
+   validation 登録なし)を追加し、SI 書込の種読み 4 箇所(Write/Delete/Update×2)で使用。
+   SI エントリを「実際に読む」経路(ScanSecondaryIndex/ReadSecondaryIndex)は従来通り検証。
+3. **UNIQUE 索引は従来 semantics 維持**(検証付き読み+copy-install): unique 制約チェックは
+   可換でないため、並行 adder は正しく abort させる(oorder の unique 索引、TATP sub_nbr 等)。
+- own-locked read の期待 TID 修正(読時 TID|lockbit)はそのまま(一般 RMW の正しさ)。
+- 一時診断ログ(silo-validate-fail、先頭16件)は検証完了後に削除予定。
+- 期待効果: 並列ロードが**abort なしで正しい SI** を構築(ロスも衝突も消える)。
+
 (以降追記)
