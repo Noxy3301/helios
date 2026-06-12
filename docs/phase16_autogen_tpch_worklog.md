@@ -590,4 +590,26 @@ inner-unit Phase B 化が次の大物)。scalar-source for_each、NWR pivot 16B�
   Phase A — binding の group-row remap が次の梃子)、q14 6.8x、q12 5.0x、q4 4.5x、
   q21 3.4x。
 
+### [2026-06-13] エントリ23: server 並列化拡張(filtered scan + for_each probes)+ plan 不安定性の特定
+
+**Track-B 並列化の拡張**(server/rpc, gate HELIOS_PARALLEL_SERVER_SCAN 共用):
+- **parallel_primary_filter_scan**: 集約なし filtered primary scan も morsel 分割
+  (q12/q14 の 6M 行 scan+filter が serial だった)。emission は morsel 連結 =
+  global key 順で serial と byte 同一(validation/coverage 不変)。worker 失敗は
+  全破棄 → serial 再走(fail-closed 維持)。
+- **parallel for_each probes**: probe key を先に serial 解決(順序保持 dedup)→
+  4096 probe 以上で worker 分割実行 → probe 順 emit(group bookkeeping 含め
+  serial と同一列)。worker-local evaluator/projection、fe_semijoins は read-only
+  共有。
+- 効果(SF=1, warm): q12 7.6→6.5 / q14 7.8→6.2 / q22 3.15→2.4(matrix v4 で
+  1.73)/ q21 10.7→9.05 / q4 1.88→0.75 / q3 1.30→0.81。md5 **22/22 OK**。
+
+**plan 不安定性が最大の残差**(matrix v3 vs v4, 同一バイナリ):
+- q17: 0.19 ↔ 20.3s、q20: 0.53 ↔ 16.9s、q18: 16.2 ↔ 21.0s — NDV stats の
+  同期タイミングで join order が flip(probe-driver ↔ scan-driver)。良 plan 時は
+  fold/併合が直撃して 100x 速いが、悪 plan は probe 爆発。suite 合計の振れ
+  62〜99s は実質この3クエリ。
+- **次の本命: plan 安定化**(NDV 取得を deterministic に / COST_V2 の probe cost
+  較正で悪 plan を排除)+ q18 cold plan の group-row binding remap。
+
 (以降追記)
