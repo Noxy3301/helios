@@ -116,4 +116,56 @@ throughput(traced): stateful 132.3 / autogen 121.3 / explicit 185.1(トレード
   分岐)、stage_rpc_decode→stage_rpc_and_decode(overlapping 明示、集計側で除外+
   decode_only 導出)、trace OFF 時の無駄計算ガード。
 
+### [2026-06-12] エントリ5: Track A 修正ラウンド2(F2: LIMIT-aware staging)+最終計測
+
+**F2 設計(entry-driven)**: runtime の canonical unbounded 要求は維持したまま、
+- コンパイラ(lineairdb_autogen.cc): root が `LIMIT_OFFSET(offset=0) → 単一 REF leaf 直結`
+  (= FILTER/SORT 無し = WHERE が key prefix に完全吸収)のとき
+  `range_scan_limit_for_order`(runtime と同一判定関数、ha_lineairdb.hh に公開)で
+  step.scan_limit を staging。**ASC のみ**(DESC staged entry が tail consumer に
+  渡る事故を構造的に排除)。
+- cache(lineairdb_transaction.cc): unbounded 要求 ← limit-staged entry の opt-in fallback
+  (完全同一 range・forward・**範囲内** pending own-write 無し)。truncated フラグ
+  (rows.size()>=row_limit)を返し、forward 消費者(same_key/prefix_first/range_materialize)
+  だけが opt-in。prefix_last/prev_key は渡さない(tail 消費は絶対に truncated を見ない)。
+- 消費(ha_lineairdb.cc): truncated な materialization を limit 越えて index_next すると
+  **EOF を偽らず loud abort**(gate にバグがあっても wrong result でなく可視エラー)。
+- validation: staged entry の row_limit=N がそのまま range replay に乗る(server は
+  limit-N scan を再実行して N key を比較 = 正しい phantom guard、DSL で実証済みの経路)。
+
+**踏んだバグ**: 初版は fallback の pending-ops 拒否がテーブル粒度
+(has_pending_ops_for_table)で、Delivery の district 1 の DELETE(バッファ済み)が
+district 2-10 の scan fallback を拒否 → 393 エラー。**範囲交差チェック**
+(has_pending_row_ops_in_range、merge と同一ソース・同一条件)に精緻化して解消。
+
+**traced 比較(terminals=1)**: autogen 121.3 → F1+F3: 135.1 → +F2: **142.1**(エラー0)。
+per-tx: staged rows 407→**38.3**(explicit 33.6)、commit base rows 406→**44.7**(43.6)、
+commit range keys 381→**18.4**(17.5)、validate req 38.7KB→**7.6KB**・353→**187us**
+(explicit と同値)、RPC 21.6→**14.9**、受信 35.5KB→10.1KB。
+
+**最終 untraced(各リロード付き、60s, terminals=1)**:
+| モード | before | after |
+|---|---|---|
+| TPC-C stateful | 140 | 135.2(run分散内) |
+| **TPC-C autogen** | **125** | **149.5(+20%、stateful 超え)** |
+| TPC-C explicit | 191 | 188.6(回帰なし) |
+| TATP stateful | 1335 | 1287 |
+| TATP autogen | 1591 | 1594(回帰なし) |
+- **エラー/retry: autogen 0/0**、C1-C4(+C2b)= 全 0(post-autogen データ、prefetch OFF で検査)。
+- commit 354dedc。Codex 敵対的レビュー依頼中(F1/F2/F3 個別 verdict)。
+- **残差の構造**: autogen 149.5 vs explicit 188.6 の差 = first-touch per-statement staging
+  RPC 13.9/tx vs 1/tx。次の梃子 = 同型 tx の read-set テンプレート学習(cross-statement
+  先読み、miss は既存 abort 安全網)— エントリ3の構造的天井の項を参照。
+
+### [2026-06-12] エントリ6: Track B1 NDV stats 移植(コミット済、ビルド/計測待ち)
+
+- 移植列: proto d99ab02(3b0775c)→ Phase1 f4029cb(3cc1c9c)→ Phase2 0aa8ab7(c6e0e4c)
+  → review fix 85af297(5ada3d3)。proto は NDV 拡張版 GetTableStats を正とした。
+- LineairDB 側 `Database::ComputeIndexNdvInt` は 10c6e2c(NDV+無関係な tx-pin/sha256 の
+  混載 snapshot)から **NDV 部分のみ手で抽出**して helios/prefetch-maxopt 作業樹に適用
+  (database.h / database.cpp / database_impl.h、既存 Scan/Get API のみ使用・API 整合確認済)。
+  gitlink はビルド検証後に submodule commit + 更新予定。
+- gate: HELIOS_OPT_STATS=1(default OFF)。次: build_partial → SF=0.1/1 で q5 EXPLAIN/実測
+  → COST_V2(phase15 移植済、default OFF)と併用評価・係数再較正。
+
 (以降、変更・計測ごとにエントリ追記)
