@@ -325,4 +325,28 @@ md5 参照系は InnoDB(3308 に SF=0.1 ロード、SF=1 ref はマイルスト�
 - **B2 クローズ**。残課題(優先度低): scalar-source for_each が probe しない既存制約、
   stateful 経路の q2/q9/q16 0行既存バグ(別調査)。
 
+### [2026-06-13] エントリ14: B3 aggregation pushdown 移植(4+2コミット)
+
+- 移植列: proto 03def12 → plumbing 0b33ba7(手書き適合: stamp は本ブランチの
+  execute_read_plan の F1 後に配置)→ server 1e9c727(競合解決: row_passes 前置 +
+  fail-closed projection と共存)→ executor a2ad6f1(+777行 auto-merge、適合2点:
+  borrowed-scan 機構なし→ scanned_values_ serve、env→sysvar gate)
+  → morsel 並列 28c92ec/267ee36(gate HELIOS_PARALLEL_SERVER、filter+limit 後適用
+  fix も同梱)。
+- **踏んだ正しさバグ**: 初版で q6 が **152x 過大**・q1 N/O グループ過大 = Phase B が
+  **WHERE 未適用の全行を集約**。旧ブランチは rnd_init→set_pushed_filter→stamp の経路で
+  filter が乗っていたが、本ブランチの compile 時 attach(cond_push 由来)は実際には
+  空(cond_push 不発)だった。修正 = tx_set_pushed_aggregate で
+  prepare_select_filter_for_tx に **WHERE 全直列化を要求**(不能なら Phase A に fallback
+  = ローカル評価で常に正しい)+ execute_read_plan の stamp で filter を同梱。
+- 検証(SF=0.1): q1/q6 InnoDB と byte 一致、**md5 22/22(HELIOS_AGG_PUSHDOWN=1)**、
+  over-hijack なし(他20 query 不変)。q1 1.97→**1.53s**、q6 1.32→**1.08s**。
+  morsel 並列は SF=0.1 では誤差圏(入力 600k 行で scan/RPC が支配)— SF=1 区切りで評価。
+- 付随発見: cond_push が本ブランチで実質不発(pushed_filter_serialized_ 空)
+  → ro_novalidate の compile 時 filter attach は無効化されていた(staged scan は全行
+  ship し MySQL がローカル filter)。**WHERE の server filter 化は
+  prepare_select_filter_for_tx 経路が実働**。scan filter pushdown の全面有効化は
+  別項(q6 の非集約時転送をさらに削れる余地)。
+- **B3 クローズ**(commit 471fcf7 まで)。
+
 (以降、変更・計測ごとにエントリ追記)
