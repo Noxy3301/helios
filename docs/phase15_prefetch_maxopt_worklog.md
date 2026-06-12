@@ -114,4 +114,77 @@ epoch 回収が必要)は大工事のため本フェーズでは見送り、**�
 - 初回ベースライン値(OFF 0 / explicit 127 / autogen 122)は**汚染データのため全て無効**。再計測する。
 - ビルドは以後 `scripts/build_partial.sh` を使用(user 指示: server make + proxy ソース同期 + ninja 一括)。
 
+### [2026-06-12] エントリ4: TPC-C クリーンベースライン + 「explicit が実は無効」発見
+
+**クリーンベースライン**(1wh/1term/SERIALIZABLE/30s、ロード毎に server 再起動):
+
+| モード | throughput | goodput | retry |
+|---|---|---|---|
+| stateful(OFF) | 142.0 | 145.0 | 24 |
+| explicit(--prefetch) | 124.9 | 127.9 | **0** |
+| autogen(--prefetch-stmt) | 123.5 | 125.6 | **0** |
+
+- **prefetch 系は abort/retry ゼロ**= phase14 の abort storm(3334件)は本ブランチで構造的に解消済。
+- 実行後の SI 強プローブ(全 (d,last) の index vs fullscan 件数照合)も完全一致 — write 経路健全。
+- しかし prefetch が stateful より ~12% 遅い(旧ブランチ: explicit 202 vs stateful 136 で +49% だったのに)。
+
+**rpc_trace プロファイル(--prefetch, 15s)**: NewOrder=**35 RPC/tx**(TX_EXECUTE_READ_PLAN×34+commit×1)、
+Payment=7.1、Delivery=**71 RPC/tx**。explicit のはずが **per-statement autogen として動作**。
+
+**根因**: `bench/benchbase-mysql/benchbase.jar` が 6/1 ビルドの古い版で、セッション変数が
+旧名 `@_ldb_plan` のまま(submodule は `@_tx_plan` に改名済 a21a9821、proxy も `_tx_plan` を読む)。
+→ proxy は plan を見つけられず全 statement autogen に silent degrade。
+proxy 側の tx-plan 経路(maybe_prefetch_for_transaction @ get_transaction:1444)自体は配線済で healthy。
+
+**対処**: build_benchbase.py で jar を submodule(34b8ac94)から再ビルド → explicit 再計測へ。
+**教訓**: 成果物 jar と submodule の整合は計測前に必ず確認(jar 内 TPCCProcedure.class の strings で変数名を見る)。
+
+### [2026-06-12] エントリ5: TPC-C 正式ベースライン(新 jar)
+
+| モード | throughput | retry | unexpected errors |
+|---|---|---|---|
+| stateful(OFF) | 140.3 | 34 | 0 |
+| **explicit(--prefetch)** | **189.0 (+35%)** | 0 | **258** |
+| autogen(--prefetch-stmt) | 124.5 (−11%) | 0 | 0 |
+
+- explicit の 2-RPC アーキテクチャが新 jar で復活(140→189)。
+- **explicit の残エラー 258 件は全て同一形状**: OrderStatus の最新注文取得
+  `SELECT O_ID,O_CARRIER_ID,O_ENTRY_D ... ORDER BY O_ID DESC LIMIT 1`(oorder 二次索引の
+  reverse+limit scan)が prefetch cache miss → 非リトライ abort。
+  = phase14 Class-B(極値 scan covering)残課題。staged 側は reverse=1/limit=1 で持っているが、
+  runtime の lookup_secondary_scan_cache が (reverse=false, limit=0) 固定 + reverse 系 handler
+  経路(index_last/kPrevKey/kPrefixLast)が prefetch 下で未対応。
+- autogen は per-statement RPC(NewOrder 35 RPC/tx、Delivery 71 RPC/tx)なので構造的に
+  stateful(per-row RPC)と同程度+plan 生成 CPU 分やや遅い。TPC-C での本命は explicit。
+- **TPC-C 改善バックログ**: (1) Class-B reverse+limit covering(explicit エラー 0 化、上の 258 件)
+  (2) autogen の per-statement plan 生成コスト削減(plan cache)— 優先度低
+  (3) 二次 scan ステップの行 payload 同梱(SI scan→batch read の 2 RPC を 1 に)— 要調査
+
+### [2026-06-12] エントリ6: TATP ベースライン
+
+| モード | throughput | retry | errors |
+|---|---|---|---|
+| stateful(OFF) | 1334.9 | 0 | 0 |
+| **autogen(--prefetch-stmt)** | **1590.7 (+19%)** | 0 | 0 |
+
+- TATP(SF=1=100k subscribers, 1term/30s)は **autogen が無修正で全カバー+19% 勝ち**。
+  短 tx(1-3 statement)では per-statement autogen の RPC 数が stateful の per-row より少ないため。
+- TATP procedures には benchbase 側 explicit plan パッチ無し(=--prefetch は autogen と同義)。
+
+### [2026-06-12] エントリ7: TPC-C Class-B 実装(explicit の DESC LIMIT 1 covering)
+
+**変更**(commit 予定):
+1. `LineairDBTransaction::get_matching_primary_keys_in_range` に `row_limit/reverse_scan`
+   パラメータ追加(default 0/false で既存呼び出し不変)。prefetch 分岐で staged エントリ照合に
+   (reverse,limit) を透過し、miss 時は (false,0)(autogen の全範囲 staged scan)へフォールバック
+   (全集合は部分集合を被覆、呼び出し側が tail に position するため安全)。
+2. `execute_prefix_last` materialize-mode 非 primary 分岐: primary 分岐と同じ
+   `range_scan_limit_for_order` ガード(SQL が単表 SELECT + LIMIT 1 + DESC 一致 + 残余フィルタ無し)
+   を通った時のみ (reverse=1,limit=1) で cache 照合。
+   → explicit plan の `S:oorder:o_w_id:limit=1:reverse=1` staged エントリが OrderStatus の
+   `ORDER BY o_id DESC LIMIT 1` にヒットするようになる。
+3. stateful 経路は従来通り全範囲 fetch(hint 無視)で意味不変。
+- validation 健全性: lookup が返す cached エントリは staged の reverse=1/limit=1 を保持
+  → commit 時 RangeReadEntry(row_limit/reverse_scan 対応済)で server が同条件 replay 検証。
+
 (以降追記)

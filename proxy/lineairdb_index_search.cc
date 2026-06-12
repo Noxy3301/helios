@@ -684,9 +684,25 @@ int ha_lineairdb::execute_prefix_last(uchar *buf, LineairDBTransaction *tx) {
       secondary_index_payloads_.push_back(std::move(kv.second));
     }
   } else {
+    // Mirror the primary branch: a DESC LIMIT 1 prefix read can be served by
+    // an explicit-plan staged (reverse, limit=1) secondary scan. Stateful
+    // execution ignores the hint and fetches the full prefix range as before.
+    const KEY *key = &table->key_info[active_index];
+    const bool filter_ready = prepare_select_filter_for_tx(
+        ha_thd(), table, tx, &pushed_filter_serialized_);
+    RangeScanLimit scan_limit = range_scan_limit_for_order(
+        ha_thd(), key, current_plan_.used_key_parts,
+        has_unpushed_filter_ || !filter_ready);
+    if (tx->is_prefetch_mode() && !tx->tx_plan_used()) {
+      scan_limit = RangeScanLimit{};
+    }
+    const bool desc_limit_one =
+        (scan_limit.row_limit == 1 && scan_limit.reverse_scan);
+
     secondary_index_results_ = tx->get_matching_primary_keys_in_range(
         current_index_name, current_plan_.same_group_prefix_serialized,
-        current_plan_.same_group_end_serialized);
+        current_plan_.same_group_end_serialized,
+        desc_limit_one ? 1 : 0, desc_limit_one);
     batch_fetch_secondary_payloads(tx);
   }
 

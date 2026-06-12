@@ -608,7 +608,9 @@ LineairDBTransaction::fetch_next_key_with_prefix(const std::string &last_key,
 std::vector<std::string>
 LineairDBTransaction::get_matching_primary_keys_in_range(std::string index_name,
                                                          std::string start_key,
-                                                         std::string end_key) {
+                                                         std::string end_key,
+                                                         uint64_t row_limit,
+                                                         bool reverse_scan) {
   if (table_is_not_chosen()) return {};
   if (prefetch_mode_) {
     if (has_pending_secondary_ops_for_index(db_table_key, index_name)) {
@@ -617,8 +619,16 @@ LineairDBTransaction::get_matching_primary_keys_in_range(std::string index_name,
     }
 
     if (end_key.empty()) end_key = lineairdb_keyenc::scan_end_sentinel();
-    if (auto cached = lookup_secondary_scan_cache(
-            db_table_key, index_name, start_key, end_key, false, 0)) {
+    auto cached = lookup_secondary_scan_cache(
+        db_table_key, index_name, start_key, end_key, reverse_scan, row_limit);
+    if (!cached && row_limit != 0) {
+      // A limited request (e.g. DESC LIMIT 1 prefix-last) is also covered by
+      // an unlimited staged scan of the same range: the full key set contains
+      // the limited one and the caller positions on the tail itself.
+      cached = lookup_secondary_scan_cache(db_table_key, index_name, start_key,
+                                           end_key, false, 0);
+    }
+    if (cached) {
       rpc_trace_.record_local_view("use_si_scan:" + db_table_key + ":" +
                                    index_name + ":n=" +
                                    std::to_string(cached->primary_keys.size()));
