@@ -612,4 +612,25 @@ inner-unit Phase B 化が次の大物)。scalar-source for_each、NWR pivot 16B�
 - **次の本命: plan 安定化**(NDV 取得を deterministic に / COST_V2 の probe cost
   較正で悪 plan を排除)+ q18 cold plan の group-row binding remap。
 
+### [2026-06-13] エントリ24: MySQL 本体改変の撤回(user 指示 — 絶対制約)
+
+- **制約確定**: 改変してよいのは proxy(プラグイン)/server/LineairDB まで。
+  **MySQL 本体は未改変であるべき**(研究主張の根幹)。`override_executor_func` を
+  プラグインから **set する**のは可(フックも sql_union.cc:1711 の bypass も
+  in-tree)。新フックを本体に足すのは不可。memory に恒久記録済み。
+- **撤回内容**: submodule を公式 2d6d5e10436 へ戻し(参照用に branch
+  helios/materialize-override-hook は保持)、mysqld を pristine ソースから再ビルド。
+  プラグインの inner-unit gate を「**uncorrelated SCALAR subquery のみ**
+  (= in-tree の ExecuteIteratorQuery bypass で届く範囲)」に縮小。derived /
+  materialized IN は MaterializeIterator 経由でフックが無いため hijack しない
+  (押印もされず raw 行 + Phase 不関与で従来通り動く)。
+- **影響**(SF=1, md5 22/22 OK 確認済み): q15 は inner 集約を失い 0.4 → **7.6s**
+  (それでも fold+filter で元の 26.2s から 3.4x 改善は維持)。q18 は元々
+  cold plan で Phase A だったため実質不変(21.4s)。q22 の scalar-unit 経路・
+  top-level Phase B(q1 0.61s)・fold・並列化・server-side HAVING 機構は全て
+  MySQL 無改変で成立するためそのまま。
+- 残る q15 の 7.6s を MySQL 無改変で詰める案: 集約は無理でも、materialize 消費が
+  2 回走る分は fold 済みなので、残差は「660k 行 ×2 回の MySQL temp agg」。
+  打ち手があるとすれば CTE 化判定や view merge 誘導だがクエリ改変は不可 — 保留。
+
 (以降追記)

@@ -503,34 +503,20 @@ static bool helios_offloadable_shape(THD *thd, JOIN *join) {
                    (unsigned)qe->uncacheable);
     return false;
   }
-  // IN/ALL/ANY subquery units: ONLY the materialization strategy executes the
-  // unit once through MaterializeIterator (where the hook consumes our group
-  // rows). The EXISTS strategy re-executes per outer row with the injected
-  // in2exists conditions active — and uncacheable does NOT flag it (the
-  // re-execution is driven by Item_in_optimizer, not the cache bits). The
-  // strategy is final here: decide_subquery_strategy() runs before
-  // JOIN::push_to_engines() (sql_optimizer.cc).
-  if (inner_unit && qe->item != nullptr) {
-    switch (qe->item->substype()) {
-      case Item_subselect::IN_SUBS:
-      case Item_subselect::ALL_SUBS:
-      case Item_subselect::ANY_SUBS: {
-        auto *in_pred = down_cast<Item_in_subselect *>(qe->item);
-        if (in_pred->strategy != Subquery_strategy::SUBQ_MATERIALIZATION) {
-          if (aggdbg)
-            std::fprintf(stderr, "[AGGPD] inner reject: IN strategy=%d\n",
-                         (int)in_pred->strategy);
-          return false;
-        }
-        break;
-      }
-      case Item_subselect::SINGLEROW_SUBS:
-        break;  // uncorrelated scalar: executes once via unit->execute
-      default:
-        if (aggdbg)
-          std::fprintf(stderr, "[AGGPD] inner reject: substype=%d\n",
-                       (int)qe->item->substype());
-        return false;  // EXISTS_SUBS and friends: per-outer-row semantics
+  // MySQL-UNMODIFIED constraint: an inner unit may be hijacked ONLY when it
+  // executes through Query_expression::execute -> ExecuteIteratorQuery, whose
+  // override_executor_func bypass is IN-TREE MySQL (sql_union.cc:1711). That
+  // is the uncorrelated SCALAR subquery path (SubqueryWithResult::exec).
+  // Derived tables and materialized IN consume their unit through
+  // MaterializeIterator, which has no in-tree hook — installing the override
+  // there would stage group rows nobody consumes (cache-miss abort). Never
+  // hijack those.
+  if (inner_unit) {
+    if (qe->item == nullptr ||
+        qe->item->substype() != Item_subselect::SINGLEROW_SUBS) {
+      if (aggdbg)
+        std::fprintf(stderr, "[AGGPD] inner reject: not a scalar unit\n");
+      return false;
     }
   }
   if (qb->leaf_table_count != 1) return false;     // exactly one base table
