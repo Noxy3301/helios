@@ -358,7 +358,8 @@ void maybe_prefetch_for_transaction(THD *thd,
 // Build the read plan from the given QEP root and run it in one prefetch RPC.
 static int autogen_and_execute_prefetch(THD *thd, AccessPath *root,
                                         LineairDBTransaction *tx,
-                                        bool include_inner_units = false) {
+                                        bool include_inner_units = false,
+                                        bool allow_projection = false) {
   std::vector<LineairDBProxy::ReadPlanStep> steps;
   bool compile_ok;
   {
@@ -381,11 +382,17 @@ static int autogen_and_execute_prefetch(THD *thd, AccessPath *root,
   // The tx ends with this statement, so the trimmed cached values can never
   // feed a later DML's row rebuild (the set_fields DML trap), and commit-time
   // validation (which the trims would not affect anyway) is elided here.
+  // ALSO only for the STATEMENT-ROOT staging episode (allow_projection):
+  // optimize-time subquery unit episodes run before read_sets are final, and
+  // two episodes trimming the same table differently would let the decoder
+  // misread an earlier cached row whose kept-count happens to match the later
+  // layout (Codex finding #1). Unit episodes ship full rows, which the
+  // parsed-column-count check always distinguishes from the one trim layout.
   // HELIOS_PROJECTION=0 disables (A/B measurement + emergency off-switch).
   static const char *proj_env = std::getenv("HELIOS_PROJECTION");
   static const bool projection_enabled =
       proj_env == nullptr || std::strcmp(proj_env, "0") != 0;
-  if (projection_enabled && tx->ro_novalidate()) {
+  if (allow_projection && projection_enabled && tx->ro_novalidate()) {
     std::unordered_map<std::string, std::vector<uint32_t>> kept_of;
     plan_projection_pushdown(thd, &steps, &kept_of);
     for (auto &kv : kept_of) {
@@ -512,9 +519,11 @@ int maybe_prefetch_for_statement(THD *thd, LineairDBTransaction *tx,
 
     // Statement-level staging also sweeps Item-embedded subquery plan trees
     // (dependent scalar subqueries / in_optimizer IN), which execute at
-    // runtime but are invisible to the main-tree leaf walk.
+    // runtime but are invisible to the main-tree leaf walk. This is the one
+    // episode allowed to project (single trim layout per table per tx).
     return autogen_and_execute_prefetch(thd, stmt_root, tx,
-                                        /*include_inner_units=*/true);
+                                        /*include_inner_units=*/true,
+                                        /*allow_projection=*/true);
   }
 
   // No statement root yet: the optimizer is evaluating a subquery (constant
