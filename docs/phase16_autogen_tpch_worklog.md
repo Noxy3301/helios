@@ -445,4 +445,39 @@ ro_novalidate + projection(default ON)。InnoDB ref は 3308 に SF=1 再構築�
   FER probe が支配)、q18 29.8s、q15 26.8s、q20 16.6s、q17 20.3s — semijoin/
   membership reduction(旧ブランチ実証済)と FER probe への filter 適用が次の梃子。
 
+### [2026-06-13] エントリ19: semijoin reduction 移植 + stateful 0行バグ根治(Track C2)
+
+**semijoin/membership reduction**(commit 系列、gate HELIOS_ENABLE_SEMIJOIN):
+- compile 時に join ref の equality edge を収集 → union-find で等価クラス →
+  FER/FES 高 fanout probe step に対し「同クラスの先行 step に選択的単一表述語があれば
+  SemijoinFilter を付与」。server は membership set(source_filter 通過行の key 列)に
+  無い probe 行を ship しない。FE point probe の棄却は not-found 供給(被覆維持)。
+- P0 正当性 whitelist 同梱(inner equi-join のみ: outer-join inner / semi/anti nest /
+  非 top-level / nullable・型不一致 key を拒否 — 旧ブランチで q21 0行・q22 過大の実績
+  ある罠)。projection reconciliation(source_filter 持ち source は full ship、
+  pre-filtered source は membership 列を force-keep + remap)。
+- **F1 の潜在バグも同時修正**: covered-step drop が binding/semijoin の source_step
+  index をずらす穴 → 参照済み step は drop 禁止 + 残 step の index remap。
+- **SF=1: q7 12.2 → 1.3s**(semijoin 直撃)、q11 2.5→1.4s、**suite 152.2s(6.2x)**、
+  対 InnoDB 中央値 **2.5x**、md5 22/22(ref 汚染事故2回 — SF=0.1 反復スクリプトが
+  3308 を上書きしていた。要恒久対策: ref 専用ポートのデータを iteration script から守る)。
+
+**stateful 0行バグ根治**(q2/q9/q16、pre-B2 から存在):
+- 切り分け: 単一表 OK / `part ⋈ partsupp` で 0 行 → **prepare_select_filter_for_tx が
+  WHERE 全体(cross-table 結合述語 p_partkey=ps_partkey 含む)を直列化**し、stateful
+  scan が単一表の行に対して別表の列 ordinal で評価 → 全行 false が真因。
+  FIELD=FIELD は昔から直列化可能だったため pre-B2 でも再現していた。
+- 修正: prepare を build_single_table_filter(table-local 必要条件)ベースに変更。
+  LIMIT 安全性は「WHERE がこの表のみ参照」のときに限定(部分 filter + server LIMIT は
+  MySQL が必要とする行を切るため)。**2表スライス 42,656 = InnoDB 完全一致**。
+- 副次修正: HELIOS_AGG_PUSHDOWN が stateful モードでも Phase B に入り
+  「agg group row malformed」エラー(stateful scan は生 base 行)→ Phase B gate に
+  srv_prefetch_execution を追加。
+- 回帰: prefetch SF=1 suite 全 OK + md5 22/22(warm 108.9s)、OLTP TPC-C 163.0 /
+  TATP 1729.9、エラー全0。
+
+残バックログ(優先順): q18/q15/q17/q20 の残 16-29s = materialized subquery 内
+single-table GROUP BY の server 集約拡張(override は top-level 限定のため未適用、
+inner-unit Phase B 化が次の大物)。scalar-source for_each、NWR pivot 16B。
+
 (以降追記)
