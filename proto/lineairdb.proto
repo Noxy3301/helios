@@ -99,6 +99,38 @@ message TxBeginTransaction {
     }
 }
 
+// Standalone, transaction-less fetch of all table row counts. Lets the proxy
+// seed the MySQL optimizer with accurate cardinalities WITHOUT beginning a
+// transaction — required because oneshot defers tx_begin past the optimizer's
+// info() call, so the begin/end table_stats piggyback misses cold-start plans.
+message GetTableStats {
+    // Optional per-index NDV request (Phase 2). If ndv_table is set, the server
+    // ALSO computes the number-of-distinct-values per key-part prefix for each
+    // listed index (exact, one ordered live-row pass), so the proxy can set
+    // accurate rec_per_key instead of the n-th-root heuristic. The proxy passes
+    // num_key_parts (the SECONDARY user key-parts; PK is not appended today).
+    message IndexDesc {
+        string index_name = 1;     // "" = primary index
+        uint32 num_key_parts = 2;
+    }
+    message Request {
+        string ndv_table = 1;
+        repeated IndexDesc ndv_indexes = 2;
+    }
+    // Per-index NDV result. available=false => a key-part type the server can't
+    // parse (e.g. string); the proxy keeps its heuristic for that index rather
+    // than trusting bad stats. ndv[k] = distinct values of prefix (parts 0..k).
+    message IndexNdv {
+        string index_name = 1;
+        bool available = 2;
+        repeated uint64 ndv = 3;
+    }
+    message Response {
+        repeated TableRowCount table_stats = 1;
+        repeated IndexNdv index_ndv = 2;
+    }
+}
+
 // Abort a transaction.
 message TxAbort {
     message Request {
