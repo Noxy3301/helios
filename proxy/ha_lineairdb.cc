@@ -1197,13 +1197,33 @@ int ha_lineairdb::info(uint flag) {
         LineairDBThdCtx *ctx =
             *reinterpret_cast<LineairDBThdCtx **>(thd_ha_data(thd, lineairdb_hton));
         if (ctx != nullptr && ctx->proxy) {
-          const auto &stats_cache = ctx->proxy->cached_table_stats();
-          auto it = stats_cache.find(db_table_name);
-          if (it != stats_cache.end() && it->second > 0) {
-            share->stats_base_records.store(
-                static_cast<uint64_t>(it->second), std::memory_order_relaxed);
-            for (auto &shard : share->rowcount_shards)
-              shard.delta.store(0, std::memory_order_relaxed);
+          auto find_seed = [&]() -> bool {
+            const auto &sc = ctx->proxy->cached_table_stats();
+            auto it = sc.find(db_table_name);
+            if (it != sc.end() && it->second > 0) {
+              share->stats_base_records.store(
+                  static_cast<uint64_t>(it->second), std::memory_order_relaxed);
+              for (auto &shard : share->rowcount_shards)
+                shard.delta.store(0, std::memory_order_relaxed);
+              return true;
+            }
+            return false;
+          };
+          // Access-path fix: the begin/end table_stats piggyback misses at
+          // optimize time under oneshot (deferred tx_begin), so the optimizer
+          // would otherwise see stats.records==2 and pick full-scan + bad join
+          // order. On a cache-miss, do a transaction-less GET_TABLE_STATS RPC
+          // once, then seed the GLOBAL share (persists across connections).
+          // GATED (HELIOS_OPT_STATS=1, default OFF): row-count WITHOUT real
+          // per-index cardinality regresses the suite (the n-th-root rec_per_key
+          // heuristic makes the optimizer mis-treat non-unique FK joins as 1:1
+          // -> explosive join orders, e.g. Q5 107s). Keep OFF until Phase 2
+          // ships NDB-style NDV sampling. (docs/phase7_optimizer_stats.md)
+          static const char *opt_stats_env = std::getenv("HELIOS_OPT_STATS");
+          static const bool opt_stats_on =
+              opt_stats_env != nullptr && opt_stats_env[0] == '1';
+          if (opt_stats_on && !find_seed()) {
+            if (ctx->proxy->fetch_table_stats()) find_seed();
           }
         }
       }
@@ -1263,6 +1283,22 @@ int ha_lineairdb::info(uint flag) {
   }
 
   return 0;
+}
+
+// ANALYZE TABLE: refresh optimizer statistics from the server. Resets the
+// cached base row count so the next info() re-fetches the live count (via the
+// GET_TABLE_STATS RPC on cache-miss) and recomputes rec_per_key. The info()
+// cache-miss hook makes stats correct WITHOUT this, but ANALYZE TABLE is the
+// SQL-standard way to force a refresh (and lets a loader run it post-load).
+int ha_lineairdb::analyze(THD *, HA_CHECK_OPT *) {
+  DBUG_TRACE;
+  if (share != nullptr) {
+    share->stats_base_records.store(0, std::memory_order_relaxed);
+    for (auto &shard : share->rowcount_shards)
+      shard.delta.store(0, std::memory_order_relaxed);
+  }
+  info(HA_STATUS_VARIABLE | HA_STATUS_CONST);
+  return HA_ADMIN_OK;
 }
 
 /**

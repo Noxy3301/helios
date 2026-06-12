@@ -455,6 +455,7 @@ public:
   int rnd_pos(uchar *buf, uchar *pos) override; ///< required
   void position(const uchar *record) override;  ///< required
   int info(uint flag) override;                 ///< required
+  int analyze(THD *thd, HA_CHECK_OPT *check_opt) override;  // refresh stats
   int extra(enum ha_extra_function operation) override;
   int external_lock(THD *thd, int lock_type) override; ///< required
   int start_stmt(THD *thd, thr_lock_type lock_type) override;
