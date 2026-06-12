@@ -382,4 +382,30 @@ q1 27.5s / q3 22.5s / q5 37.2s / q12 23.0s / q14 21.1s / q19 19.8s / q20 27.8s �
 - 既知の残メモリ構造(将来の伸びしろ、phase12 と同系): proxy 側 raw(3.4GB)+ decode 構造体
   + row_cache コピー + scan entry rows コピー(~4 重)。zero-copy/共有化は未着手。
 
+### [2026-06-12] エントリ19: **TPC-H SF=1 完全制覇(22/22)**
+
+**r6 対処(commit 2c9894f)**:
+1. **filter pushdown を全 scan 種へ拡張**(FER/FES probe group + secondary full scan も)。
+   step 単位の共有 evaluator lambda に統一。q21 は lineitem 3 脚中 2 脚に
+   `l_receiptdate > l_commitdate`(column-vs-column、DATE は ASCII 格納なので辞書順比較が正当)
+   があり転送・staging 半減。
+2. **proxy staging の destructive/move 化**: decode 済み応答から row_cache/scan entry へ
+   string move + step ごとに即解放。さらに「for_each step 用に組んで捨てていた rows ベクタ
+   (全行フルコピー)」を発見・除去。
+→ q21 単発: **RSS 44.6GB→17.7GB で初完走**(100 行、exit 0)。
+
+**SF=1 フルマトリクス(/tmp/matrix_sf1f)**: **22/22 OK、watchdog 0、suite peak RSS 43.0GB**
+| q | s | q | s | q | s | q | s |
+|---|---|---|---|---|---|---|---|
+| q1 | 27.4 | q7 | 3.2 | q13 | 3.5 | q19 | 18.1 |
+| q2 | 2.8 | q8 | 4.1 | q14 | 23.4 | q20 | 28.4 |
+| q3 | 17.8 | q9 | 20.4 | q15 | 45.7 | q21 | 54.7 |
+| q4 | 24.0 | q10 | 1.0 | q16 | 3.3 | q22 | 5.4 |
+| q5 | 37.1 | q11 | 2.8 | q17 | 55.3 | — | — |
+| q6 | 19.7 | q12 | 25.0 | q18 | 49.0 | — | — |
+(stateful OFF は SF=0.1 ですら 9 本 >120s だったことに留意。「SF=1 が通るか不明」だった
+状態から、全 22 本が ~1-55s で完走+ロード 27-33s に到達)
+
+次: SF=1 md5(InnoDB 参照に SF=1 ロード中)→ 最終 OLTP 回帰 → SOTA 調査結果の取り込み。
+
 (以降追記)
