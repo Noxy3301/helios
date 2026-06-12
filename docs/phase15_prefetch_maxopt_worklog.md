@@ -187,4 +187,21 @@ proxy 側の tx-plan 経路(maybe_prefetch_for_transaction @ get_transaction:144
 - validation 健全性: lookup が返す cached エントリは staged の reverse=1/limit=1 を保持
   → commit 時 RangeReadEntry(row_limit/reverse_scan 対応済)で server が同条件 replay 検証。
 
+### [2026-06-12] エントリ8: Class-B 計測確定 + TPC-H M0 実装
+
+**Class-B 後の explicit TPC-C**: **191.3 req/s, retry 0, errors 0**(stateful 140.3 比 +36%)。
+C1-C4 整合 0 violation、SI 強プローブ clean。commit d946546。
+
+**TPC-H 戦線 M0(full-scan prefetch)実装**(commit 予定):
+1. `compile_leaf`(lineairdb_autogen.cc): full scan 拒否を条件付き許可に。
+   gate = 純 SELECT(`sql_command==SQLCOM_SELECT` かつ `reginfo.lock_type<=TL_READ`、
+   FOR UPDATE/SHARE と DML は従来通り拒否)かつ primary 順(TABLE_SCAN または primary INDEX_SCAN)。
+   step = `{is_scan, key_prefix="", end_key_prefix=sentinel}`(全表 staged scan)。
+2. `get_matching_keys_and_values_from_prefix`(serving): 空 prefix(=rnd full scan)を
+   `in_range("", sentinel)` へルーティング(従来は next_lex("")="" で無条件 abort)。
+- 既知の制限(次マイルストーン): MATERIALIZE(派生表/サブクエリ)QEP node は未対応のため
+  q2/4/7/8/9/11/13/15/16/17/18/20/21/22 あたりは NO-PLAN のはず。filter pushdown も plan step に
+  未配線(全表転送)。validation は全 range replay(read-only no-validate gate は M2 で導入予定)。
+- 並行で bench/queries/q1-22.sql(spec qualification 固定パラメータ版、md5 検証用)を生成中。
+
 (以降追記)

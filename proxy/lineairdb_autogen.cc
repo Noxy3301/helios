@@ -588,12 +588,32 @@ bool compile_leaf(AccessPath *leaf,
     return compile_index_range_scan(leaf, table, step, reason);
   }
   if (full_scan) {
-    // A full TABLE_SCAN / INDEX_SCAN has no key bound, so the prefetched row set
-    // cannot be matched against what rnd_next iterates (scan consumption is only
-    // validated for bounded ranges). Reject under no-fallback rather than risk
-    // serving a mismatched row set.
-    if (reason != nullptr) *reason = "full table/index scan unsupported";
-    return false;
+    // A primary full scan of a plain SELECT stages the whole table as the
+    // range ["", sentinel): the row path (rnd_next / index_first) consumes
+    // exactly that range from the scan cache and commit revalidates the same
+    // bounds. Locked reads (FOR UPDATE/SHARE) and DML keep the old rejection:
+    // their row set must come from the locking read path.
+    const THD *leaf_thd = table->in_use;
+    const bool plain_select = leaf_thd != nullptr && leaf_thd->lex != nullptr &&
+                              leaf_thd->lex->sql_command == SQLCOM_SELECT &&
+                              table->reginfo.lock_type <= TL_READ;
+    const bool primary_order =
+        full_scan_index < 0 ||
+        (table->s->primary_key != MAX_KEY &&
+         full_scan_index == static_cast<int>(table->s->primary_key));
+    if (!plain_select || !primary_order) {
+      if (reason != nullptr) *reason = "full table/index scan unsupported";
+      return false;
+    }
+    step->table_name = physical_table_key(table);
+    if (step->table_name.empty()) {
+      if (reason != nullptr) *reason = "missing leaf table name";
+      return false;
+    }
+    step->is_scan = true;
+    step->key_prefix.clear();
+    step->end_key_prefix = lineairdb_keyenc::scan_end_sentinel();
+    return true;
   }
   if (ref == nullptr) {
     if (reason != nullptr) *reason = "table access without ref or range bound";

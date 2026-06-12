@@ -545,6 +545,11 @@ std::vector<std::pair<std::string, std::string>>
 LineairDBTransaction::get_matching_keys_and_values_from_prefix(std::string prefix) {
   if (table_is_not_chosen()) return {};
   if (prefetch_mode_) {
+    if (prefix.empty()) {
+      // Full table scan: serve from a staged ["", sentinel) range
+      // (in_range maps the empty end key to the sentinel).
+      return get_matching_keys_and_values_in_range("", std::string());
+    }
     const std::string prefix_end = next_lexicographic_key(prefix);
     if (prefix_end.empty()) {
       abort_prefetch_cache_miss("primary prefix range end");
