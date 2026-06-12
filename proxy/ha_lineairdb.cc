@@ -1380,7 +1380,8 @@ int ha_lineairdb::index_read_map(uchar *buf, const uchar *key,
   tx->choose_table(db_table_name);
   if (!pushed_filter_serialized_.empty()) {
     tx->set_pushed_filter(pushed_filter_serialized_);
-  } else {
+  } else if (!tx->has_pushed_aggregate()) {
+    // See rnd_init: a pending aggregation pushdown owns the tx filter.
     tx->clear_pushed_filter();
   }
 
@@ -1630,10 +1631,14 @@ int ha_lineairdb::rnd_init(bool) {
 
   tx->choose_table(db_table_name);
 
-  // Predicate pushdown: propagate filter serialized by cond_push() to transaction
+  // Predicate pushdown: propagate filter serialized by cond_push() to the
+  // transaction. When an aggregation pushdown is pending, the tx filter was
+  // prepared by tx_set_pushed_aggregate from the statement WHERE — clearing
+  // it here (cond_push is empty in practice) would make the server aggregate
+  // UNFILTERED rows.
   if (!pushed_filter_serialized_.empty()) {
     tx->set_pushed_filter(pushed_filter_serialized_);
-  } else {
+  } else if (!tx->has_pushed_aggregate()) {
     tx->clear_pushed_filter();
   }
 

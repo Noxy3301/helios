@@ -172,6 +172,7 @@ public:
   // primary scan step at send time (see execute_read_plan).
   void set_pushed_aggregate(const std::string& s) { pushed_aggregate_ = s; }
   void clear_pushed_aggregate() { pushed_aggregate_.clear(); }
+  bool has_pushed_aggregate() const { return !pushed_aggregate_.empty(); }
 
   // Projection pushdown (ro_novalidate SELECT only): per physical table, the
   // kept 0-based field ordinals its staged VALUES were trimmed to. The row

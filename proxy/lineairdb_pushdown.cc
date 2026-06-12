@@ -71,11 +71,29 @@ bool serialize_item(const Item *item,
       item->type() != Item::DECIMAL_ITEM && item->type() != Item::NULL_ITEM &&
       item->type() != Item::COND_ITEM && item->type() != Item::FIELD_ITEM) {
     // Comparison/boolean functions are handled structurally below even when
-    // const; only fold VALUE-producing expressions.
-    const bool is_bool_func =
-        item->type() == Item::FUNC_ITEM &&
-        down_cast<const Item_func *>(item)->functype() != Item_func::UNKNOWN_FUNC;
-    if (!is_bool_func) {
+    // const; everything else (arithmetic, DATE +/- INTERVAL whose functype is
+    // DATEADD_FUNC — i.e. NOT just UNKNOWN_FUNC) folds to a literal.
+    const bool is_structural_func = [&] {
+      if (item->type() != Item::FUNC_ITEM) return false;
+      switch (down_cast<const Item_func *>(item)->functype()) {
+        case Item_func::EQ_FUNC:
+        case Item_func::NE_FUNC:
+        case Item_func::LT_FUNC:
+        case Item_func::LE_FUNC:
+        case Item_func::GT_FUNC:
+        case Item_func::GE_FUNC:
+        case Item_func::BETWEEN:
+        case Item_func::IN_FUNC:
+        case Item_func::LIKE_FUNC:
+        case Item_func::ISNULL_FUNC:
+        case Item_func::ISNOTNULL_FUNC:
+        case Item_func::NOT_FUNC:
+          return true;
+        default:
+          return false;
+      }
+    }();
+    if (!is_structural_func) {
       Item *mut = const_cast<Item *>(item);
       // Temporal constants (DATE '...' +/- INTERVAL) MUST fold as strings:
       // rows store dates as "YYYY-MM-DD" ASCII and compare lexicographically.

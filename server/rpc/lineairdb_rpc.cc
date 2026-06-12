@@ -476,8 +476,11 @@ static bool parallel_primary_aggregate_scan(
   if (!last.ok || last.rows.empty()) return false;
   int64_t lo = 0, hi = 0;
   if (!decode_leading_int_key(first.rows.front().key, lo) ||
-      !decode_leading_int_key(last.rows.front().key, hi))
+      !decode_leading_int_key(last.rows.front().key, hi)) {
+    if (dbg) fprintf(stderr, "[PSCAN] decode fail klen=%zu\n",
+                     first.rows.front().key.size());
     return false;
+  }
   if (hi <= lo) return false;
   const uint64_t span = (uint64_t)(hi - lo) + 1;
   if (span < min_rows) return false;  // too small to amortize thread overhead
