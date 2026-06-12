@@ -200,6 +200,11 @@ public:
         // unique). Empty = ship full rows. num_columns = table->s->fields.
         std::vector<uint32_t> projection;
         uint32_t projection_num_columns = 0;
+        // Aggregation pushdown: serialized AggregateSpec (proto). When
+        // non-empty and the step is a primary-PK scan, the server aggregates
+        // scanned rows and returns group rows instead of base rows. Stamped
+        // by execute_read_plan from tx->pushed_aggregate_ at send time.
+        std::string aggregate_serialized;
     };
     struct ReadPlanStepResult {
         bool found = false;

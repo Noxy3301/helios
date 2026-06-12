@@ -271,6 +271,20 @@ void LineairDBTransaction::execute_read_plan(
   }
   if (steps.empty()) return;  // everything already staged: no RPC needed
 
+  // Aggregation pushdown: stamp the spec onto the matching primary scan and
+  // disable that step's projection — the spec addresses group/arg columns by
+  // ORIGINAL field index, so the server must parse full rows.
+  if (!pushed_aggregate_.empty()) {
+    for (auto& s : steps) {
+      if (s.is_scan && !s.for_each && s.index_name.empty() &&
+          s.table_name == db_table_key) {
+        s.aggregate_serialized = pushed_aggregate_;
+        s.projection.clear();
+        s.projection_num_columns = 0;
+      }
+    }
+  }
+
   rpc_trace_.record_local_view("plan_request:steps=" +
                                std::to_string(steps.size()));
   LineairDBProxy::ReadPlanResult result;

@@ -168,6 +168,11 @@ public:
   const std::string& get_pushed_filter() const { return pushed_filter_; }
   void clear_pushed_filter() { pushed_filter_.clear(); }
 
+  // Aggregation pushdown: serialized AggregateSpec stamped onto the matching
+  // primary scan step at send time (see execute_read_plan).
+  void set_pushed_aggregate(const std::string& s) { pushed_aggregate_ = s; }
+  void clear_pushed_aggregate() { pushed_aggregate_.clear(); }
+
   // Projection pushdown (ro_novalidate SELECT only): per physical table, the
   // kept 0-based field ordinals its staged VALUES were trimmed to. The row
   // decoder maps the k-th parsed column to kept[k]; nullptr = full rows.
@@ -319,6 +324,8 @@ private:
 
   // Predicate pushdown: serialized PushedPredicate for scan filtering
   std::string pushed_filter_;
+  // Aggregation pushdown: serialized AggregateSpec for the primary scan
+  std::string pushed_aggregate_;
 
   // Projection pushdown: physical table name -> kept field ordinals.
   std::unordered_map<std::string, std::vector<uint32_t>> table_projection_;
