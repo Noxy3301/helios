@@ -306,4 +306,23 @@ md5 参照系は InnoDB(3308 に SF=0.1 ロード、SF=1 ref はマイルスト�
   proxy 側 RSS も同率縮小(SF=1 はマイルストーン計測で確認)。
 - Codex 敵対的レビュー実行中(binding/フィルタ × trimmed 行の交差攻撃ベクタ)。
 
+### [2026-06-12] エントリ13: B2 hardening(Codex 2巡目)+ OLTP 回帰修正 → B2 クローズ
+
+- Codex 1巡目 Finding#1(複数 staging episode の layout 上書き)→ **episode gate**:
+  projection は statement-root episode のみ(unit episode は常に full ship、
+  parsed-column-count で常に判別可能)。commit 0d7d91b 後に 354dedc 系として fc01f96。
+- Codex 2巡目 P1(remap 済み binding が trim-fallback の full 行を誤読)→
+  **read-plan の trim 失敗は fail-closed**(ok=false で loud abort。trim 失敗 = 行破損
+  なので silent 続行自体が誤り)。その他の攻撃ベクタ(unsafe+force-kept 順序 /
+  int_delta / midpoint / episode 再走 / for_each 行数)は全て GO。
+- **OLTP 一律 -5% 回帰**の真因 = set_fields 毎行の tx lookup + projection map の
+  文字列ハッシュ find。**per-statement メモ化**(query_id + process-wide projection
+  epoch で失効 — unit serve が staging 前にメモを stamp する穴を epoch が塞ぐ)。
+- 再検証: SF=0.1 md5 **22/22**、TPC-C autogen **162.2 req/s**(pre-B2 148.6 比 +9%!
+  Step4a の Field::store skip が OLTP でも純益化)、TATP **1694**(+7.5%)。
+- 教訓: 全 Deadlock 事故1件は stale lineairdb-server(pidfile 不整合で旧 image が
+  残存)による運用問題 — サービス再起動で解消、コード起因ではない。
+- **B2 クローズ**。残課題(優先度低): scalar-source for_each が probe しない既存制約、
+  stateful 経路の q2/q9/q16 0行既存バグ(別調査)。
+
 (以降、変更・計測ごとにエントリ追記)
