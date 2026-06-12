@@ -208,6 +208,24 @@ void collect_qep_leaves(AccessPath *p, std::vector<AccessPath *> *out,
     case AccessPath::STREAM:
       collect_qep_leaves(p->stream().child, out, ok, unsupported);
       return;
+    case AccessPath::TEMPTABLE_AGGREGATE:
+      // GROUP BY via a local temp table: only the feeding subquery touches
+      // LineairDB tables; the table_path reads the temp table (its leaves are
+      // skipped as tmp-table leaves by the compile loop).
+      collect_qep_leaves(p->temptable_aggregate().subquery_path, out, ok,
+                         unsupported);
+      collect_qep_leaves(p->temptable_aggregate().table_path, out, ok,
+                         unsupported);
+      return;
+    case AccessPath::MATERIALIZE:
+      // Derived table / subquery materialization: prefetch the operand
+      // subqueries; the materialized temp table itself is local.
+      for (const MaterializePathParameters::QueryBlock &qb :
+           p->materialize().param->query_blocks) {
+        collect_qep_leaves(qb.subquery_path, out, ok, unsupported);
+      }
+      collect_qep_leaves(p->materialize().table_path, out, ok, unsupported);
+      return;
     case AccessPath::DELETE_ROWS:
       collect_qep_leaves(p->delete_rows().child, out, ok, unsupported);
       return;
@@ -761,6 +779,11 @@ bool autogen_read_plan_from_qep(
     if (!qep_leaf_info(leaf, &table, &ref, &full_scan, &full_scan_index) ||
         table == nullptr) {
       return raise_unsupported(thd, leaf->type, "unsupported QEP leaf");
+    }
+    if (table->s != nullptr && table->s->tmp_table != NO_TMP_TABLE) {
+      // Local temp table (materialized derived table / GROUP BY buffer):
+      // reading it needs no prefetch step.
+      continue;
     }
     if (table_steps.find(table) != table_steps.end()) {
       return raise_unsupported(thd, leaf->type, "duplicate QEP table leaf");

@@ -204,4 +204,40 @@ C1-C4 整合 0 violation、SI 強プローブ clean。commit d946546。
   未配線(全表転送)。validation は全 range replay(read-only no-validate gate は M2 で導入予定)。
 - 並行で bench/queries/q1-22.sql(spec qualification 固定パラメータ版、md5 検証用)を生成中。
 
+### [2026-06-12] エントリ9: M2(read-only no-validation)実装 + md5 検証準備
+
+**M2 実装**(commit 5cfcf3d): GLOBAL sysvar `lineairdb_prefetch_ro_novalidate`(default OFF)。
+ON のとき、autocommit 単文 SELECT(prefetch)に限り:
+- read-set/range-read-set の蓄積を skip(proxy CPU/メモリ削減 — full scan で 60万 key の蓄積が消える)
+- commit 時 validation RPC を完全省略 → **SELECT が 1 RPC で完結**
+- write を持つ tx / multi-statement tx は従来通り full validation(gate はそれらに触れない)
+- 根拠: user 指示「TPC-H は read-only で validation 不要」。並行 writer 無し環境でのみ健全(help text 明記)。
+
+**md5 検証ハーネス**: bench/queries/q1..q22.sql(spec qualification 固定パラメータ、benchbase 発行と
+同一 SQL)+ bench/bin/tpch_md5.sh(target vs InnoDB 参照、ソート後 md5 比較)。
+q6 は benchbase 由来の `'0.06'`(文字列)を忠実再現(両エンジン同条件なので比較は公正)。
+
+**TPC-H stateful ベースライン(進行中)**: SF=0.1 で q5/q7/q8/q9/q10 が 120s タイムアウトの模様
+(重 join。Phase7-10 スタック不在の本ブランチでは想定通り)。完走後に確定表を記載。
+
+### [2026-06-12] エントリ10: TPC-H stateful ベースライン確定 + M0/M2/M3 動作確認
+
+**stateful(OFF)SF=0.1 22-suite**(120s timeout、結果 bench/results/tpch_individual_20260612_102531):
+OK 13/22。TIMEOUT: q5,7,8,9,10,17,18,20,21(重 join 系)。OK 組も q3 36.5s / q4 80.9s / q13 94.5s。
+軽量組: q1 4.7s, q6 2.7s, q2 2.7s, q11 2.5s, q19 1.8s, q22 2.9s 等。
+
+**M0+M2 単体確認(q6, SF=0.1)**: OFF 1.26s / ON+validation 2.87s / ON+novalidate 2.04s、結果一致。
+→ ON が OFF より遅い理由: OFF は ECP(server 側フィルタ)済み行のみ転送、M0 は全表転送。
+**M1(plan step への filter pushdown)が transfer 削減の本命**と確定。
+
+**M3 実装**: collect_qep_leaves に TEMPTABLE_AGGREGATE / MATERIALIZE を追加(subquery_path +
+table_path を再帰、temp table leaf は compile loop で skip)。q1 が prefetch ON で完走(結果妥当)。
+
+**q3 の新ブロッカ**: NLJ inner が orders を二次索引 REF probe → **FES(for_each secondary probe)
+が server 未対応**で NO-PLAN。対応案: (a) server for_each に secondary range probe 追加(wire 拡張要)
+(b) cost model 較正で hash join に倒す(旧ブランチ HELIOS_COST_V2 の移植)。実測インパクト順で判断。
+
+**運用教訓**: `build_partial.sh` は稼働中の lineairdb-server バイナリを上書きする → 直後にサーバが
+silent crash(10:47 の障害の真因)。**ビルド後は必ず server 再起動+リロード**。
+
 (以降追記)
