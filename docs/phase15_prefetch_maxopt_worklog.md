@@ -353,4 +353,20 @@ stateful ベースライン(13/22 OK・9 本 >120s TIMEOUT)に対する質的飛
   (旧実測 q1 0.49s)。q6 はフィルタが '0.06'(文字列)比較のため serialize_item が落ちて
   pushdown 無効の可能性 → 要確認。
 
+### [2026-06-12] エントリ17: SF=1 2回目(decay purge 有効)→ flat codec 移植
+
+**SF=1 r2 結果**: **19/22 OK、peak RSS 29.4GB、watchdog 発動なし**(decay purge 有効)。
+q1 27.5s / q3 22.5s / q5 37.2s / q12 23.0s / q14 21.1s / q19 19.8s / q20 27.8s 等。
+失敗 3 本 = q17(10.2s)/ q18(4.8s)/ q21(7.2s)が「Deadlock」— server ログで
+`TxExecuteReadPlan.Response exceeded maximum protobuf size of 2GB: 2.2GB/2.3GB/3.4GB` を確認。
+**旧ブランチ既知の protobuf 2GB シリアライズ上限**(偽 Deadlock)と同一根因。
+
+**対処 = flat codec 移植**(旧 2d0b8d1 の設計を現行 Response 形状に合わせて新実装):
+- server: `flat_plan::encode_to_string`(u64 長プレフィックス、native endian、magic+version)で
+  TX_EXECUTE_READ_PLAN 応答のみ flat 化(他 RPC は protobuf のまま)。
+- proxy: `send_protobuf_recv_binary` + bounds-checked Reader で ReadPlanResult へ直接 decode
+  (中間 protobuf Response を排除 = 1 copy 削減)。
+- 上限は transport frame の u32(4.29GB)へ移動。SF=1 の最大 3.4GB は収まる。SF≥2 は
+  u64 framing が必要(未対応、本 doc に記録)。
+
 (以降追記)

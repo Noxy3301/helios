@@ -469,7 +469,6 @@ LineairDBProxy::ReadPlanResult LineairDBProxy::tx_execute_read_plan(
     }
 
     LineairDB::Protocol::TxExecuteReadPlan::Request request;
-    LineairDB::Protocol::TxExecuteReadPlan::Response response;
     for (const auto& step : steps) {
         auto* out = request.add_steps();
         out->set_table_name(step.table_name);
@@ -509,38 +508,92 @@ LineairDBProxy::ReadPlanResult LineairDBProxy::tx_execute_read_plan(
         }
     }
 
-    if (!send_protobuf_message(request, response,
-                               MessageType::TX_EXECUTE_READ_PLAN)) {
+    // The response is flat binary, not protobuf: heavy plans materialize
+    // 2-3.4GB in one response and protobuf serialization has a hard ~2GB
+    // limit. Format must match flat_plan::encode in server/rpc/
+    // lineairdb_rpc.cc exactly (u64 magic 'TDBFLATP' | u8 version | u8 ok |
+    // u64 count | per-step fields; bytes = u64 len + raw; native endian).
+    std::string raw;
+    if (!send_protobuf_recv_binary(request, raw,
+                                   MessageType::TX_EXECUTE_READ_PLAN)) {
         LOG_ERROR("RPC failed: Failed to send execute read plan message to server");
         return result;
     }
 
-    result.ok = response.ok();
-    if (!result.ok) return result;
-    result.steps.reserve(response.results_size());
-    for (const auto& step : response.results()) {
+    struct Reader {
+        const char* p;
+        const char* end;
+        bool ok = true;
+        Reader(const char* d, size_t n) : p(d), end(d + n) {}
+        uint64_t u64() {
+            if (end - p < 8) { ok = false; return 0; }
+            uint64_t v;
+            std::memcpy(&v, p, 8);
+            p += 8;
+            return v;
+        }
+        uint8_t u8() {
+            if (end - p < 1) { ok = false; return 0; }
+            return static_cast<uint8_t>(*p++);
+        }
+        std::string bytes() {
+            uint64_t n = u64();
+            if (!ok || static_cast<uint64_t>(end - p) < n) { ok = false; return {}; }
+            std::string s(p, n);
+            p += n;
+            return s;
+        }
+    };
+
+    static constexpr uint64_t kFlatMagic = 0x5054414C46424454ull;  // "TDBFLATP"
+    Reader r(raw.data(), raw.size());
+    if (r.u64() != kFlatMagic || r.u8() != 1) {
+        LOG_ERROR("RPC failed: bad flat read-plan response header");
+        return result;
+    }
+    const bool resp_ok = r.u8() != 0;
+    const uint64_t count = r.u64();
+    if (!r.ok) return result;
+    result.ok = resp_ok;
+    if (!resp_ok) return result;
+
+    result.steps.reserve(count);
+    for (uint64_t i = 0; i < count && r.ok; ++i) {
         ReadPlanStepResult out;
-        out.found = step.found();
-        out.value = step.value();
-        out.tid = step.tid();
-        out.actual_key = step.actual_key();
-        out.actual_start_key = step.actual_start_key();
-        out.actual_end_key = step.actual_end_key();
-        out.scan_keys.reserve(step.scan_keys_size());
-        for (const auto& key : step.scan_keys()) out.scan_keys.push_back(key);
-        out.scan_values.reserve(step.scan_values_size());
-        for (const auto& value : step.scan_values()) out.scan_values.push_back(value);
-        out.scan_tids.reserve(step.scan_tids_size());
-        for (const auto tid : step.scan_tids()) out.scan_tids.push_back(tid);
-        out.secondary_keys.reserve(step.secondary_keys_size());
-        for (const auto& key : step.secondary_keys()) out.secondary_keys.push_back(key);
-        out.group_sizes.reserve(step.group_sizes_size());
-        for (const auto sz : step.group_sizes()) out.group_sizes.push_back(sz);
-        out.group_start_keys.reserve(step.group_start_keys_size());
-        for (const auto& key : step.group_start_keys()) out.group_start_keys.push_back(key);
-        out.group_end_keys.reserve(step.group_end_keys_size());
-        for (const auto& key : step.group_end_keys()) out.group_end_keys.push_back(key);
+        out.found = r.u8() != 0;
+        out.tid = r.u64();
+        out.value = r.bytes();
+        out.actual_key = r.bytes();
+        out.actual_start_key = r.bytes();
+        out.actual_end_key = r.bytes();
+        uint64_t n = r.u64();
+        out.scan_keys.reserve(n);
+        for (uint64_t j = 0; j < n && r.ok; ++j) out.scan_keys.push_back(r.bytes());
+        n = r.u64();
+        out.scan_values.reserve(n);
+        for (uint64_t j = 0; j < n && r.ok; ++j) out.scan_values.push_back(r.bytes());
+        n = r.u64();
+        out.scan_tids.reserve(n);
+        for (uint64_t j = 0; j < n && r.ok; ++j) out.scan_tids.push_back(r.u64());
+        n = r.u64();
+        out.secondary_keys.reserve(n);
+        for (uint64_t j = 0; j < n && r.ok; ++j) out.secondary_keys.push_back(r.bytes());
+        n = r.u64();
+        out.group_sizes.reserve(n);
+        for (uint64_t j = 0; j < n && r.ok; ++j)
+            out.group_sizes.push_back(static_cast<uint32_t>(r.u64()));
+        n = r.u64();
+        out.group_start_keys.reserve(n);
+        for (uint64_t j = 0; j < n && r.ok; ++j) out.group_start_keys.push_back(r.bytes());
+        n = r.u64();
+        out.group_end_keys.reserve(n);
+        for (uint64_t j = 0; j < n && r.ok; ++j) out.group_end_keys.push_back(r.bytes());
         result.steps.push_back(std::move(out));
+    }
+    if (!r.ok) {
+        LOG_ERROR("RPC failed: truncated flat read-plan response");
+        result.ok = false;
+        result.steps.clear();
     }
 
     return result;

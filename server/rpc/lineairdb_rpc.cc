@@ -603,6 +603,96 @@ void LineairDBRpc::handleTxStatelessSecondaryRangeScan(
     result = response.SerializeAsString();
 }
 
+// ---- flat codec for TxExecuteReadPlan responses ---------------------------
+// Protobuf's SerializeAsString has a hard ~2GB (INT_MAX) single-message limit;
+// heavy TPC-H plans at SF>=1 materialize 2-3.4GB of rows in one response and
+// the serialize fails (surfacing as a fake retryable abort). The response is
+// therefore written as a flat length-prefixed buffer with 64-bit lengths; the
+// transport frame still carries a uint32 payload size, so the ceiling moves
+// from 2GB to 4GB. Same-host deployment: integers are native-endian via
+// memcpy, guarded by a magic word. The proxy-side decoder
+// (lineairdb_proxy.cc tx_execute_read_plan) must match this format exactly:
+//
+//   u64 magic 'LDBFLATP' | u8 version=1 | u8 ok
+//   u64 results_count, then per StepResult:
+//     u8 found | u64 tid
+//     bytes value | bytes actual_key | bytes actual_start_key
+//     bytes actual_end_key
+//     u64 n | n x bytes scan_keys
+//     u64 n | n x bytes scan_values
+//     u64 n | n x u64 scan_tids
+//     u64 n | n x bytes secondary_keys
+//     u64 n | n x u64 group_sizes
+//     u64 n | n x bytes group_start_keys
+//     u64 n | n x bytes group_end_keys
+//   (bytes = u64 length + raw)
+namespace flat_plan {
+static constexpr uint64_t kMagic = 0x5054414C46424454ull;  // "TDBFLATP" bytes
+static constexpr uint8_t kVersion = 1;
+
+template <class Sink>
+inline void w_u64(Sink& o, uint64_t v) {
+    char b[8];
+    std::memcpy(b, &v, 8);
+    o.append(b, 8);
+}
+template <class Sink>
+inline void w_u8(Sink& o, uint8_t v) {
+    char c = static_cast<char>(v);
+    o.append(&c, 1);
+}
+template <class Sink>
+inline void w_bytes(Sink& o, const std::string& s) {
+    w_u64(o, s.size());
+    o.append(s.data(), s.size());
+}
+struct CountSink {
+    uint64_t n = 0;
+    void append(const char*, size_t k) { n += k; }
+};
+
+template <class Sink>
+static void encode(const LineairDB::Protocol::TxExecuteReadPlan::Response& r,
+                   Sink& out) {
+    w_u64(out, kMagic);
+    w_u8(out, kVersion);
+    w_u8(out, r.ok() ? 1 : 0);
+    w_u64(out, static_cast<uint64_t>(r.results_size()));
+    for (const auto& s : r.results()) {
+        w_u8(out, s.found() ? 1 : 0);
+        w_u64(out, s.tid());
+        w_bytes(out, s.value());
+        w_bytes(out, s.actual_key());
+        w_bytes(out, s.actual_start_key());
+        w_bytes(out, s.actual_end_key());
+        w_u64(out, static_cast<uint64_t>(s.scan_keys_size()));
+        for (const auto& k : s.scan_keys()) w_bytes(out, k);
+        w_u64(out, static_cast<uint64_t>(s.scan_values_size()));
+        for (const auto& v : s.scan_values()) w_bytes(out, v);
+        w_u64(out, static_cast<uint64_t>(s.scan_tids_size()));
+        for (const auto t : s.scan_tids()) w_u64(out, t);
+        w_u64(out, static_cast<uint64_t>(s.secondary_keys_size()));
+        for (const auto& k : s.secondary_keys()) w_bytes(out, k);
+        w_u64(out, static_cast<uint64_t>(s.group_sizes_size()));
+        for (const auto g : s.group_sizes()) w_u64(out, g);
+        w_u64(out, static_cast<uint64_t>(s.group_start_keys_size()));
+        for (const auto& k : s.group_start_keys()) w_bytes(out, k);
+        w_u64(out, static_cast<uint64_t>(s.group_end_keys_size()));
+        for (const auto& k : s.group_end_keys()) w_bytes(out, k);
+    }
+}
+
+static void encode_to_string(
+    const LineairDB::Protocol::TxExecuteReadPlan::Response& r,
+    std::string& out) {
+    CountSink c;
+    encode(r, c);
+    out.clear();
+    out.reserve(c.n);
+    encode(r, out);
+}
+}  // namespace flat_plan
+
 void LineairDBRpc::handleTxExecuteReadPlan(const std::string& message,
                                            std::string& result) {
     LineairDB::Protocol::TxExecuteReadPlan::Request request;
@@ -668,7 +758,7 @@ void LineairDBRpc::handleTxExecuteReadPlan(const std::string& message,
                                 step.scan_limit(), step.reverse_scan());
                         if (!scan_result.ok) {
                             response.set_ok(false);
-                            result = response.SerializeAsString();
+                            flat_plan::encode_to_string(response, result);
                             return;
                         }
                         for (auto& r : scan_result.rows) {
@@ -686,7 +776,7 @@ void LineairDBRpc::handleTxExecuteReadPlan(const std::string& message,
                                     step.reverse_scan());
                         if (!scan_result.ok) {
                             response.set_ok(false);
-                            result = response.SerializeAsString();
+                            flat_plan::encode_to_string(response, result);
                             return;
                         }
                         for (auto& r : scan_result.rows) {
@@ -743,7 +833,7 @@ void LineairDBRpc::handleTxExecuteReadPlan(const std::string& message,
                     step.scan_limit(), step.reverse_scan());
             if (!scan_result.ok) {
                 response.set_ok(false);
-                result = response.SerializeAsString();
+                flat_plan::encode_to_string(response, result);
                 return;
             }
             // Server-side row filter (same contract as the stateless scan
@@ -776,7 +866,7 @@ void LineairDBRpc::handleTxExecuteReadPlan(const std::string& message,
                     step.scan_limit(), step.reverse_scan());
             if (!scan_result.ok) {
                 response.set_ok(false);
-                result = response.SerializeAsString();
+                flat_plan::encode_to_string(response, result);
                 return;
             }
             for (auto& row : scan_result.rows) {
@@ -788,7 +878,7 @@ void LineairDBRpc::handleTxExecuteReadPlan(const std::string& message,
         }
     }
 
-    result = response.SerializeAsString();
+    flat_plan::encode_to_string(response, result);
 }
 
 void LineairDBRpc::handleTxValidateAndCommit(const std::string& message,
