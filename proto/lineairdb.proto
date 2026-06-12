@@ -304,6 +304,26 @@ message TxExecuteReadPlan {
         // Phase-8 Phase B: when present, the server aggregates scanned rows and
         // returns group rows (see AggregateSpec) instead of base rows.
         AggregateSpec aggregate = 13;
+        // Phase-9 semijoin reduction: when present, the server keeps only rows
+        // whose probe_column value is a member of the set of source_column
+        // values produced by an EARLIER step (source_step < this step). The
+        // join itself stays on the compute side; the server merely avoids
+        // shipping rows that cannot join (result-preserving for plain INNER
+        // equi-joins; the planner whitelists eligible leaves).
+        repeated SemijoinFilter semijoins = 14;
+    }
+    // Phase-9 semijoin: drop probe rows whose join key is absent from an
+    // earlier step's result. Columns are 0-based TABLE::field[] ordinals; the
+    // server compares the raw stored bytes of source_column vs probe_column.
+    message SemijoinFilter {
+        uint32 source_step = 1;    // earlier step whose result supplies the key set
+        uint32 source_column = 2;  // column of source rows to collect
+        uint32 probe_column = 3;   // column of this step's rows to test
+        // Optional predicate on the SOURCE rows: the membership set collects
+        // source_column only from source rows satisfying this filter. The source
+        // step still ships ALL its rows (it may be a join inner the executor
+        // point-probes), but the set is reduced so the probe side is pruned.
+        PushedPredicate source_filter = 4;
     }
     // Set of base-row columns the query needs (= the proxy's read_set union
     // across aliases of the same physical table).

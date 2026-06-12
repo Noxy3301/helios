@@ -205,6 +205,16 @@ public:
         // scanned rows and returns group rows instead of base rows. Stamped
         // by execute_read_plan from tx->pushed_aggregate_ at send time.
         std::string aggregate_serialized;
+        // Phase-9 semijoin reduction: drop this step's rows whose probe_column
+        // is absent from source_step's source_column value set (optionally
+        // reduced by source_filter, a serialized PushedPredicate).
+        struct Semijoin {
+            uint32_t source_step = 0;
+            uint32_t source_column = 0;
+            uint32_t probe_column = 0;
+            std::string source_filter;
+        };
+        std::vector<Semijoin> semijoins;
     };
     struct ReadPlanStepResult {
         bool found = false;

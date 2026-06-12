@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <functional>
 #include <limits>
 #include <string>
 #include <unordered_map>
@@ -850,7 +851,9 @@ static bool compile_tree_leaves(
     THD *thd, AccessPath *root, bool allow_filter_pushdown,
     std::unordered_map<TABLE *, int> *table_steps,
     std::vector<LineairDBProxy::ReadPlanStep> *steps,
-    std::vector<TABLE *> *added_tables, UnsupportedQep *unsupported) {
+    std::vector<TABLE *> *added_tables,
+    std::vector<std::pair<Field *, Field *>> *eq_edges,
+    UnsupportedQep *unsupported) {
   std::vector<AccessPath *> leaves;
   bool ok = true;
   collect_qep_leaves(root, &leaves, &ok, unsupported);
@@ -873,6 +876,22 @@ static bool compile_tree_leaves(
       unsupported->type = leaf->type;
       unsupported->reason = "unsupported QEP leaf";
       return false;
+    }
+    // Join equality edges for the semijoin planner: ref->items[kp] (a source
+    // field) joins this leaf's index key_part[kp] field.
+    if (eq_edges != nullptr && ref != nullptr && ref->items != nullptr &&
+        ref->key >= 0 && ref->key < static_cast<int>(table->s->keys)) {
+      for (uint kp = 0; kp < ref->key_parts; ++kp) {
+        Item *val = ref->items[kp];
+        if (val == nullptr) continue;
+        val = val->real_item();
+        if (val->type() != Item::FIELD_ITEM) continue;
+        Field *sf = down_cast<Item_field *>(val)->field;
+        Field *tf = (kp < table->key_info[ref->key].user_defined_key_parts)
+                        ? table->key_info[ref->key].key_part[kp].field
+                        : nullptr;
+        if (sf != nullptr && tf != nullptr) eq_edges->emplace_back(sf, tf);
+      }
     }
     if (table->s != nullptr && table->s->tmp_table != NO_TMP_TABLE) {
       // Local temp table (materialized derived table / GROUP BY buffer):
@@ -929,6 +948,43 @@ static bool compile_tree_leaves(
   return true;
 }
 
+// P0 semijoin correctness whitelist. A semijoin membership-reduction ("drop
+// probe rows whose key is absent from the source set") is result-preserving
+// ONLY between two leaves joined by a plain INNER equi-join in the SAME
+// top-level query block. For anti-join (NOT IN / NOT EXISTS) the absent rows
+// are exactly the ones to KEEP, so the reduction corrupts results (old
+// branch: q22 over-count, q21 -> 0 rows). Reject any leaf that is:
+//   (a) the inner side of an outer join (NULL-extended rows must survive),
+//   (b) embedded in a semi-join or anti-join nest, or
+//   (c) not in the statement's top-level query block.
+static bool helios_sj_safe_leaf(const TABLE *t) {
+  if (t == nullptr) return false;
+  const Table_ref *tr = t->pos_in_table_list;
+  if (tr == nullptr) return false;
+  if (tr->is_inner_table_of_outer_join()) return false;      // (a)
+  for (const Table_ref *emb = tr->embedding; emb != nullptr;  // (b)
+       emb = emb->embedding) {
+    if (emb->is_sj_or_aj_nest()) return false;
+  }
+  const Query_block *qb = tr->query_block;  // (c)
+  if (qb == nullptr || qb->outer_query_block() != nullptr) return false;
+  return true;
+}
+
+// Source/probe join keys must be byte-compatible for the server's raw-byte
+// membership test, and non-nullable (a NULL key cannot be matched soundly).
+static bool helios_sj_keys_compatible(const Field *src, const Field *probe) {
+  if (src == nullptr || probe == nullptr) return false;
+  if (src->is_nullable() || probe->is_nullable()) return false;
+  if (src->type() != probe->type()) return false;
+  if (src->pack_length() != probe->pack_length()) return false;
+  if (src->result_type() == STRING_RESULT &&
+      src->charset() != probe->charset()) {
+    return false;
+  }
+  return true;
+}
+
 // Collect plan roots of every inner query expression below `unit`,
 // recursively: dependent scalar subqueries and in_optimizer materialized IN
 // hang off Item conditions, so their plan trees never appear in the main
@@ -974,8 +1030,9 @@ bool autogen_read_plan_from_qep(
   std::vector<TABLE *> added_tables;
   UnsupportedQep unsupported;
 
+  std::vector<std::pair<Field *, Field *>> eq_edges;
   if (!compile_tree_leaves(thd, root, allow_filter_pushdown, &table_steps,
-                           &steps, &added_tables, &unsupported)) {
+                           &steps, &added_tables, &eq_edges, &unsupported)) {
     return raise_unsupported(thd, unsupported.type, unsupported.reason);
   }
 
@@ -995,7 +1052,7 @@ bool autogen_read_plan_from_qep(
       const size_t table_mark = added_tables.size();
       UnsupportedQep inner_unsupported;
       if (!compile_tree_leaves(thd, inner_root, allow_filter_pushdown,
-                               &table_steps, &steps, &added_tables,
+                               &table_steps, &steps, &added_tables, &eq_edges,
                                &inner_unsupported)) {
         steps.resize(step_mark);
         for (size_t i = table_mark; i < added_tables.size(); ++i) {
@@ -1030,6 +1087,92 @@ bool autogen_read_plan_from_qep(
       std::string table_filter;
       if (build_single_table_filter(thd, t, &table_filter)) {
         s.serialized_filter = std::move(table_filter);
+      }
+    }
+  }
+
+  // Phase-9 semijoin reduction (gated HELIOS_ENABLE_SEMIJOIN): for each
+  // FER/FES high-fanout probe step, if its probe join key is in the same
+  // equality class (union-find over the collected join edges) as an EARLIER
+  // step whose table carries a selective single-table predicate, attach a
+  // SemijoinFilter: the server ships only probe rows whose key appears among
+  // the (predicate-passing) source rows. Results are unchanged for plain
+  // inner equi-joins (helios_sj_safe_leaf / key-compat guards).
+  static const bool semijoin_on = std::getenv("HELIOS_ENABLE_SEMIJOIN") != nullptr;
+  if (semijoin_on && allow_filter_pushdown && !eq_edges.empty()) {
+    std::unordered_map<Field *, Field *> uf;
+    std::function<Field *(Field *)> find_root = [&](Field *x) -> Field * {
+      auto it = uf.find(x);
+      if (it == uf.end()) { uf[x] = x; return x; }
+      if (it->second == x) return x;
+      Field *r = find_root(it->second);
+      uf[x] = r;
+      return r;
+    };
+    for (auto &e : eq_edges) uf[find_root(e.first)] = find_root(e.second);
+
+    for (auto &kvp : table_steps) {
+      TABLE *probe_t = kvp.first;
+      const int probe_step = kvp.second;
+      if (probe_step < 0 || probe_step >= static_cast<int>(steps.size()))
+        continue;
+      auto &ps = steps[probe_step];
+      if (!(ps.for_each && ps.is_scan)) continue;  // FER/FES high-fanout only
+      if (!helios_sj_safe_leaf(probe_t)) continue;
+      Field *probe_field = nullptr;
+      if (!ps.index_name.empty()) {
+        for (uint k = 0; k < probe_t->s->keys; ++k) {
+          if (ps.index_name == probe_t->key_info[k].name) {
+            probe_field = probe_t->key_info[k].key_part[0].field;
+            break;
+          }
+        }
+      } else if (probe_t->s->primary_key != MAX_KEY) {
+        probe_field =
+            probe_t->key_info[probe_t->s->primary_key].key_part[0].field;
+      }
+      if (probe_field == nullptr || uf.find(probe_field) == uf.end()) continue;
+      Field *cls = find_root(probe_field);
+
+      for (auto &kvp2 : table_steps) {
+        TABLE *src_t = kvp2.first;
+        const int src_step = kvp2.second;
+        if (src_step >= probe_step || src_step < 0 ||
+            src_step >= static_cast<int>(steps.size()))
+          continue;
+        if (!helios_sj_safe_leaf(src_t)) continue;
+        if (src_t->pos_in_table_list->query_block !=
+            probe_t->pos_in_table_list->query_block)
+          continue;
+        // The source must carry a selective single-table predicate. If its
+        // scan is already filtered at fetch, its shipped rows ARE the reduced
+        // set (no source_filter needed). Otherwise the predicate rides in the
+        // semijoin and the server collects keys only from rows passing it,
+        // while the source step still ships in full (it may be a join inner
+        // the executor point-probes for every outer row).
+        std::string sf_filter;
+        const bool src_prefiltered =
+            steps[src_step].is_scan && !steps[src_step].for_each &&
+            !steps[src_step].serialized_filter.empty();
+        if (!src_prefiltered &&
+            (!build_single_table_filter(thd, src_t, &sf_filter) ||
+             sf_filter.empty()))
+          continue;  // no selective predicate -> not a useful source
+        if (src_t->s->primary_key == MAX_KEY) continue;
+        Field *src_pk =
+            src_t->key_info[src_t->s->primary_key].key_part[0].field;
+        if (uf.find(src_pk) == uf.end() || find_root(src_pk) != cls) continue;
+        if (!helios_sj_keys_compatible(src_pk, probe_field)) continue;
+        const int sc = qep_table_field_index(src_t, src_pk);
+        const int pc = qep_table_field_index(probe_t, probe_field);
+        if (sc < 0 || pc < 0) continue;
+        LineairDBProxy::ReadPlanStep::Semijoin sj;
+        sj.source_step = static_cast<uint32_t>(src_step);
+        sj.source_column = static_cast<uint32_t>(sc);
+        sj.probe_column = static_cast<uint32_t>(pc);
+        if (!src_prefiltered) sj.source_filter = std::move(sf_filter);
+        ps.semijoins.push_back(std::move(sj));
+        break;  // one semijoin source per probe step
       }
     }
   }
@@ -1107,6 +1250,29 @@ void plan_projection_pushdown(
     for (const auto &b : s.end_bindings) force_binding_col(b);
   }
 
+  // Semijoin reconciliation: the server reads sj.source_column from the
+  // SOURCE step's SHIPPED rows. With a source_filter (full-row column
+  // indices) the source must ship FULL rows; without one (pre-filtered
+  // source) keep it projected but force-keep the membership column and remap
+  // its ordinal to the packed position below. The PROBE side is untouched:
+  // fe_reject runs on the probe's untrimmed row server-side (trim happens at
+  // emission), so probe_column stays a full ordinal.
+  for (const auto &s : *steps) {
+    for (const auto &sj : s.semijoins) {
+      if (sj.source_step >= steps->size()) continue;
+      const std::string &src = (*steps)[sj.source_step].table_name;
+      auto fo = fields_of.find(src);
+      if (fo == fields_of.end()) continue;
+      if (!sj.source_filter.empty()) {
+        unsafe_src.insert(src);  // full-row filter indices -> ship full
+      } else if (sj.source_column < fo->second) {
+        auto &u = union_rs[src];
+        if (u.size() < fo->second) u.resize(fo->second, false);
+        u[sj.source_column] = true;
+      }
+    }
+  }
+
   // Decide kept per eligible table and build full-ordinal -> projected
   // position maps (1-based; 0 = not kept) for the binding remap.
   std::unordered_map<std::string, std::vector<uint32_t>> full_to_proj;
@@ -1141,6 +1307,20 @@ void plan_projection_pushdown(
   for (auto &s : *steps) {
     for (auto &b : s.bindings) remap_binding(b);
     for (auto &b : s.end_bindings) remap_binding(b);
+  }
+
+  // Remap each semijoin's source_column to its projected position when the
+  // source step is projected (pre-filtered branch; force-kept above, so the
+  // packed position is nonzero). Full-shipped sources keep full ordinals.
+  for (auto &s : *steps) {
+    for (auto &sj : s.semijoins) {
+      if (sj.source_step >= steps->size()) continue;
+      auto it = full_to_proj.find((*steps)[sj.source_step].table_name);
+      if (it == full_to_proj.end()) continue;
+      const uint32_t fi = sj.source_column;
+      const uint32_t pos = (fi < it->second.size()) ? it->second[fi] : 0;
+      if (pos > 0) sj.source_column = pos - 1;  // 1-based f2p -> 0-based packed
+    }
   }
 
   for (auto &s : *steps) {

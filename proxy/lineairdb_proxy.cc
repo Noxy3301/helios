@@ -524,6 +524,15 @@ LineairDBProxy::ReadPlanResult LineairDBProxy::tx_execute_read_plan(
         if (!step.aggregate_serialized.empty() && step.is_scan) {
             out->mutable_aggregate()->ParseFromString(step.aggregate_serialized);
         }
+        for (const auto& sj : step.semijoins) {
+            auto* o = out->add_semijoins();
+            o->set_source_step(sj.source_step);
+            o->set_source_column(sj.source_column);
+            o->set_probe_column(sj.probe_column);
+            if (!sj.source_filter.empty()) {
+                o->mutable_source_filter()->ParseFromString(sj.source_filter);
+            }
+        }
         for (const auto& binding : step.bindings) {
             auto* b = out->add_bindings();
             b->set_source_step(binding.source_step);
