@@ -905,7 +905,7 @@ static bool helios_override_executor(JOIN *join, Query_result *query_result) {
         t->file->ha_rnd_end();
         goto phase_a_fallthrough;
       }
-      if (!server_b || !hl->tx_begin_inner_agg_consume()) {
+      if (!server_b || !hl->tx_begin_inner_agg_consume(spec_ser)) {
         // Stamped means the step ships GROUP rows; without a consumable spec
         // Phase A would aggregate group rows as base rows. Fail loudly.
         t->file->ha_rnd_end();
@@ -2257,19 +2257,19 @@ void ha_lineairdb::tx_register_inner_aggregate(const std::string &spec,
   auto tx = get_transaction(ha_thd());
   if (tx == nullptr) return;
   tx->choose_table(db_table_name);
-  tx->register_inner_aggregate_current(spec, filter);
+  tx->register_inner_aggregate_current(spec, filter, table);
 }
 bool ha_lineairdb::tx_inner_agg_stamped() {
   auto tx = get_transaction(ha_thd());
   if (tx == nullptr) return false;
   tx->choose_table(db_table_name);
-  return tx->inner_agg_stamped_current();
+  return tx->inner_agg_stamped_current(table);
 }
-bool ha_lineairdb::tx_begin_inner_agg_consume() {
+bool ha_lineairdb::tx_begin_inner_agg_consume(const std::string &expect_spec) {
   auto tx = get_transaction(ha_thd());
   if (tx == nullptr) return false;
   tx->choose_table(db_table_name);
-  return tx->begin_inner_agg_consume();
+  return tx->begin_inner_agg_consume(expect_spec);
 }
 bool ha_lineairdb::tx_is_aborted() {
   auto tx = get_transaction(ha_thd());

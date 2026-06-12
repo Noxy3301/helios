@@ -1377,8 +1377,12 @@ LineairDBTransaction::lookup_range_scan_cache(
       has_pending_row_ops_in_range(table_name, start_key, end_key);
 
   // GROUP-row entries (aggregate-stamped steps) are visible ONLY to the
-  // aggregate's own consuming scan; any other reader skips them.
-  const bool agg_visible =
+  // aggregate's own consuming scan, and that scan sees ONLY them: while the
+  // consume window for this table is open the consumer must never match a
+  // raw same-table entry (its parser expects group rows), and no other
+  // reader may match the group rows (Codex P1-3 — exclusivity is enforced
+  // BOTH directions, per table).
+  const bool agg_consumer =
       !pushed_aggregate_.empty() && pushed_aggregate_table_ == table_name;
 
   // Fast path: exact-start staged entry (the FER probe pattern).
@@ -1388,7 +1392,7 @@ LineairDBTransaction::lookup_range_scan_cache(
     for (auto rit = idx_it->second.rbegin(); rit != idx_it->second.rend();
          ++rit) {
       const auto& e = range_scan_cache_[*rit];
-      if (e.aggregate_rows && !agg_visible) continue;
+      if (e.aggregate_rows != agg_consumer) continue;
       if (e.row_limit != 0 && pending_in_range) continue;
       if (e.reverse_scan == reverse_scan && e.row_limit == row_limit &&
           end_key <= e.end_key) {
@@ -1417,7 +1421,7 @@ LineairDBTransaction::lookup_range_scan_cache(
 
   for (auto it = range_scan_cache_.rbegin();
        it != range_scan_cache_.rend(); ++it) {
-    if (it->aggregate_rows && !agg_visible) continue;
+    if (it->aggregate_rows != agg_consumer) continue;
     if (it->row_limit != 0 && pending_in_range) continue;
     const bool same_table = it->table_name == table_name;
     const bool same_direction = it->reverse_scan == reverse_scan;
@@ -1461,7 +1465,7 @@ LineairDBTransaction::lookup_range_scan_cache(
       for (auto rit = idx_it->second.rbegin(); rit != idx_it->second.rend();
            ++rit) {
         const auto& e = range_scan_cache_[*rit];
-        if (e.aggregate_rows && !agg_visible) continue;
+        if (e.aggregate_rows != agg_consumer) continue;
         if (e.row_limit > 0 && !e.reverse_scan && e.start_key == start_key &&
             e.end_key == end_key) {
           LocalRangeScanEntry cached = e;

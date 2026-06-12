@@ -556,4 +556,38 @@ inner-unit Phase B 化が次の大物)。scalar-source for_each、NWR pivot 16B�
 プロトコル再確認: **load 前は必ず server 再起動**。pkill -x mysqld は 3308 ref を
 巻き込むため禁止(pid file 使用)。
 
+### [2026-06-13] エントリ22: Codex P1×3 修正 + for_each fold(q17/q20/q21 直撃)
+
+**Codex レビュー(NO-GO → 全 P1 修正)**:
+- **P1-1 表キー衝突**: 同一表に異なる spec の inner unit が複数あると登録が上書き。
+  → 登録を (spec,filter) 同一なら leaves 追記 / 異なれば **poison**(その表は一切
+  押印せず全 unit が Phase A へ = fail-closed)。consume は executor のローカル
+  spec と登録 spec の **byte 同一性必須**(begin_inner_agg_consume(expect_spec))。
+- **P1-2 fold との合成**: 同一バイトの raw consumer scan が集約 step に fold され
+  ると raw 供給が消える。→ 押印に **ownership guard**: folded alias 全員が登録
+  unit の leaf であるときのみ押印。
+- **P1-3 table 単位の可視窓**: consume 窓が開いている間、同表 lookup が両方向に
+  混線し得る。→ `e.aggregate_rows != agg_consumer` で **双方向排他**(consumer は
+  group entry のみ・他は raw のみ)。
+- 押印記録も leaf 単位化(`inner_agg_stamped_leaves_`): 自分の unit が押印された
+  ときだけ Phase B、他者押印は Phase A に綺麗に落ちる。
+
+**for_each fold(旧ブランチ dedup_identical_fetch_steps の一般化移植)**:
+- fold 対象を「bindings が deep-equal な for_each probe step」へ拡張。q21 の
+  自己結合(l2/l3 が同一 probe-by-l_orderkey fetch)や **q17/q20 の相関 probe
+  (main join と subquery が同一 l_partkey probe)** が1本化。
+- **semijoin pass を全 alias 一致(unanimity)制に書換**: folded step への
+  membership reduction は「全 alias が同一 (source,columns,filter) を選ぶ」とき
+  のみ付与(1 alias でも非対応/不一致なら veto — 片側だけの reduction は他 alias
+  の必要行を落とし得るため)。
+
+**SF=1 計測**(matrix v3 / 全22 md5 OK=22):
+- **q17 19.9→0.19s、q20 16.4→0.53s、q21 18.0→10.7s、q15 26.2→0.42s**
+- suite **152.2 → 65.0s**(phase15 比 14.4x)。mysqld RSS 5.2GB / server 4.5GB。
+- **InnoDB(3308, 同時再計測 75.4s)を suite 合計で逆転**。勝ち **10/22**
+  (q1,2,5,6,8,9,11,15,17,20)、対 InnoDB 中央値 **~1.35x**(2.5x から改善)。
+- 残ギャップ: q22 31x(3.15 vs 0.10s!)、q18 17x(16.2 vs 0.94s, cold plan で
+  Phase A — binding の group-row remap が次の梃子)、q14 6.8x、q12 5.0x、q4 4.5x、
+  q21 3.4x。
+
 (以降追記)

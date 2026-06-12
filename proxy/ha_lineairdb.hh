@@ -495,7 +495,7 @@ public:
   void tx_register_inner_aggregate(const std::string &spec,
                                    const std::string &filter);
   bool tx_inner_agg_stamped();
-  bool tx_begin_inner_agg_consume();
+  bool tx_begin_inner_agg_consume(const std::string &expect_spec);
   int rnd_pos(uchar *buf, uchar *pos) override; ///< required
   void position(const uchar *record) override;  ///< required
   int info(uint flag) override;                 ///< required

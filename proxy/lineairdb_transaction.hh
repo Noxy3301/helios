@@ -193,41 +193,71 @@ public:
   struct InnerAggregate {
     std::string spec;    // serialized AggregateSpec
     std::string filter;  // serialized PushedPredicate the spec requires ("" = none)
+    // Leaf TABLE*s of the registered units (identity only, never dereferenced)
+    // — the stamp pass requires EVERY alias folded into a step to be one of
+    // these, so a raw same-table consumer can never be merged into an
+    // aggregate step (Codex P1-2).
+    std::unordered_set<const void*> leaves;
+    // Two same-table inner units with DIFFERENT specs/filters cannot share a
+    // table-keyed registration: poison it so nothing stamps and both fall
+    // back to Phase A over raw rows (Codex P1-1).
+    bool poisoned = false;
   };
-  void register_inner_aggregate(const std::string& table, std::string spec,
-                                std::string filter) {
-    inner_agg_specs_[table] = {std::move(spec), std::move(filter)};
-  }
   const InnerAggregate* inner_aggregate(const std::string& table) const {
     auto it = inner_agg_specs_.find(table);
-    return it == inner_agg_specs_.end() ? nullptr : &it->second;
+    if (it == inner_agg_specs_.end() || it->second.poisoned) return nullptr;
+    return &it->second;
   }
+  // Stamp record is LEAF-scoped: the executor asks "was MY unit's leaf
+  // stamped", so a same-table unit whose own step stayed raw (poisoned or
+  // later-registered) cleanly falls back to Phase A instead of tripping the
+  // stamped-but-unconsumable error.
   void mark_inner_agg_stamped(const std::string& table) {
-    inner_agg_stamped_.insert(table);
-  }
-  bool inner_agg_stamped(const std::string& table) const {
-    return inner_agg_stamped_.count(table) != 0;
+    auto it = inner_agg_specs_.find(table);
+    if (it == inner_agg_specs_.end()) return;
+    auto& dst = inner_agg_stamped_leaves_[table];
+    for (const void* l : it->second.leaves) dst.insert(l);
   }
   // _current variants operate on the chosen table (db_table_key).
-  void register_inner_aggregate_current(std::string spec, std::string filter) {
-    inner_agg_specs_[db_table_key] = {std::move(spec), std::move(filter)};
+  void register_inner_aggregate_current(std::string spec, std::string filter,
+                                        const void* leaf) {
+    auto it = inner_agg_specs_.find(db_table_key);
+    if (it == inner_agg_specs_.end()) {
+      InnerAggregate ia;
+      ia.spec = std::move(spec);
+      ia.filter = std::move(filter);
+      ia.leaves.insert(leaf);
+      inner_agg_specs_.emplace(db_table_key, std::move(ia));
+      return;
+    }
+    if (it->second.poisoned) return;
+    if (it->second.spec != spec || it->second.filter != filter) {
+      it->second.poisoned = true;
+      return;
+    }
+    it->second.leaves.insert(leaf);  // identical clone (q15's two view refs)
   }
-  bool inner_agg_stamped_current() const {
-    return inner_agg_stamped_.count(db_table_key) != 0;
+  bool inner_agg_stamped_current(const void* leaf) const {
+    auto it = inner_agg_stamped_leaves_.find(db_table_key);
+    return it != inner_agg_stamped_leaves_.end() &&
+           it->second.count(leaf) != 0;
   }
   // Begin consuming the CURRENT table's staged group rows: opens the lookup
-  // gate (and protects the pushed filter from rnd_init clearing). Paired
-  // with clear_pushed_aggregate() after the consuming scan ends.
-  bool begin_inner_agg_consume() {
+  // gate (and protects the pushed filter from rnd_init clearing). The caller
+  // passes the spec it intends to parse with; identity with the registered
+  // (= stamped) spec is required (Codex P1-1). Paired with
+  // clear_pushed_aggregate() after the consuming scan ends.
+  bool begin_inner_agg_consume(const std::string& expect_spec) {
     auto it = inner_agg_specs_.find(db_table_key);
-    if (it == inner_agg_specs_.end()) return false;
+    if (it == inner_agg_specs_.end() || it->second.poisoned) return false;
+    if (it->second.spec != expect_spec) return false;
     pushed_aggregate_ = it->second.spec;
     pushed_aggregate_table_ = db_table_key;
     return true;
   }
   void clear_inner_aggregates() {
     inner_agg_specs_.clear();
-    inner_agg_stamped_.clear();
+    inner_agg_stamped_leaves_.clear();
   }
 
   // Projection pushdown (ro_novalidate SELECT only): per physical table, the
@@ -391,9 +421,10 @@ private:
   std::string pushed_aggregate_;
   // Physical table whose staged GROUP rows the pushed aggregate may consume
   std::string pushed_aggregate_table_;
-  // Inner-unit aggregation registrations + which tables actually got stamped
+  // Inner-unit aggregation registrations + which leaves actually got stamped
   std::unordered_map<std::string, InnerAggregate> inner_agg_specs_;
-  std::unordered_set<std::string> inner_agg_stamped_;
+  std::unordered_map<std::string, std::unordered_set<const void*>>
+      inner_agg_stamped_leaves_;
 
   // Projection pushdown: physical table name -> kept field ordinals.
   std::unordered_map<std::string, std::vector<uint32_t>> table_projection_;
