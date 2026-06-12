@@ -897,8 +897,14 @@ bool autogen_read_plan_from_qep(
     // prefix, so a server-side limit cannot cut rows MySQL still needed.
     // ASC only (forward entries); the consumer marks the served result
     // truncated and aborts loudly if anything reads past the staged limit.
+    // count_all_rows (SQL_CALC_FOUND_ROWS) keeps reading past LIMIT to count
+    // the rest; reject_multiple_rows (scalar subquery LIMIT) reads one row
+    // beyond to detect cardinality errors. Both need rows past the staged
+    // limit, so a truncated staging would abort a valid statement (Codex F2).
     if (root->type == AccessPath::LIMIT_OFFSET &&
         root->limit_offset().offset == 0 &&
+        !root->limit_offset().count_all_rows &&
+        !root->limit_offset().reject_multiple_rows &&
         root->limit_offset().child == leaf && leaves.size() == 1 &&
         leaf->type == AccessPath::REF && ref != nullptr &&
         ref->key >= 0 && ref->key < static_cast<int>(table->s->keys) &&

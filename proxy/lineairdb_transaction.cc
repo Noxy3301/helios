@@ -1294,6 +1294,14 @@ LineairDBTransaction::lookup_range_scan_cache(
     const std::string& end_key, bool reverse_scan, uint64_t row_limit,
     bool allow_truncated) const {
   SectionTimer section_timer(&rpc_trace_, "lookup_range");
+  // A LIMITED staged entry holds only its first-N window. Own pending row
+  // writes inside the requested range can change which rows belong to that
+  // window (an own delete of row 1 makes the serial answer row N+1, which
+  // the entry never fetched), so limited entries must not serve such ranges
+  // (Codex F3). Unbounded entries are safe: the merge sees the full window.
+  const bool pending_in_range =
+      has_pending_row_ops_in_range(table_name, start_key, end_key);
+
   // Fast path: exact-start staged entry (the FER probe pattern).
   auto idx_it = range_scan_start_index_.find(
       scan_cache_index_key(table_name, "", start_key));
@@ -1301,6 +1309,7 @@ LineairDBTransaction::lookup_range_scan_cache(
     for (auto rit = idx_it->second.rbegin(); rit != idx_it->second.rend();
          ++rit) {
       const auto& e = range_scan_cache_[*rit];
+      if (e.row_limit != 0 && pending_in_range) continue;
       if (e.reverse_scan == reverse_scan && e.row_limit == row_limit &&
           end_key <= e.end_key) {
         LocalRangeScanEntry cached = e;
@@ -1328,6 +1337,7 @@ LineairDBTransaction::lookup_range_scan_cache(
 
   for (auto it = range_scan_cache_.rbegin();
        it != range_scan_cache_.rend(); ++it) {
+    if (it->row_limit != 0 && pending_in_range) continue;
     const bool same_table = it->table_name == table_name;
     const bool same_direction = it->reverse_scan == reverse_scan;
     const bool same_limit = it->row_limit == row_limit;
@@ -1363,7 +1373,7 @@ LineairDBTransaction::lookup_range_scan_cache(
   // reject those (ops on other ranges of the table — e.g. TPC-C Delivery's
   // earlier-district deletes — cannot affect this window).
   if (allow_truncated && row_limit == 0 && !reverse_scan &&
-      !has_pending_row_ops_in_range(table_name, start_key, end_key)) {
+      !pending_in_range) {
     auto idx_it = range_scan_start_index_.find(
         scan_cache_index_key(table_name, "", start_key));
     if (idx_it != range_scan_start_index_.end()) {
