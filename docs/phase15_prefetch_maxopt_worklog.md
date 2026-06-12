@@ -338,4 +338,19 @@ stateful ベースライン(13/22 OK・9 本 >120s TIMEOUT)に対する質的飛
 - **SF=1 開始**: 並列ローダでロード → ON+novalidate で 22 本(timeout 300s)、RAM watchdog
   (avail<2GB で abort、/tmp/mem_sf1.log に RSS 記録)。
 
+### [2026-06-12] エントリ16: SF=1 初回 — q1-q11 完走するも RSS 44.6GB で watchdog 発動
+
+- **SF=1 ロード = 27.5s**(並列ローダ。旧ブランチ計測の単線 227s 比 ~8x)。
+- q1-q11 全部 OK(q1 29.5s / q2 1.4s / q5 35.2s / q7 4.4s / q10 4.0s / q11 3.4s)。
+  lineitem full scan を含むクエリ(q1/q3/q4/q5/q6/q9)が ~26-35s で支配的。
+- **q12 実行中に helios 合計 RSS 44.6GB → avail 1978MB → watchdog abort**。
+  原因 = jemalloc が解放済みページを保持(クエリごとの数GB working set が高水位のまま蓄積)。
+- **対処**: start_mysql.sh / start_server.sh に
+  `MALLOC_CONF=background_thread:true,dirty_decay_ms:1000,muzzy_decay_ms:1000` を導入
+  (解放ページを ~1s で OS へ返却)。恣意的チューニングではなく一般的メモリ衛生。再走中。
+- 次の伸びしろ(SF=1 の ~27s/lineitem-scan の内訳調査が前提):
+  旧ブランチの flat codec(protobuf 全量 decode 回避)/ borrowed-span serve / agg pushdown
+  (旧実測 q1 0.49s)。q6 はフィルタが '0.06'(文字列)比較のため serialize_item が落ちて
+  pushdown 無効の可能性 → 要確認。
+
 (以降追記)

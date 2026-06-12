@@ -33,6 +33,11 @@ cd "$ROOT_DIR/build"
 JEMALLOC="/lib/x86_64-linux-gnu/libjemalloc.so.2"
 if [ -f "$JEMALLOC" ]; then
   export LD_PRELOAD="$JEMALLOC"
+  # Return freed pages to the OS promptly: analytical queries allocate
+  # multi-GB working sets per statement and the default decay keeps RSS at
+  # the high-water mark across statements (observed 44GB after 11 TPC-H
+  # SF=1 queries).
+  export MALLOC_CONF="${MALLOC_CONF:-background_thread:true,dirty_decay_ms:1000,muzzy_decay_ms:1000}"
 else
   echo "WARNING: jemalloc not found, using system malloc (apt install libjemalloc2)" >&2
 fi
