@@ -487,6 +487,7 @@ public:
   bool tx_set_pushed_aggregate(const std::string &s);  // false: WHERE not pushable
   void tx_clear_pushed_aggregate();
   bool tx_ro_novalidate();  // Phase-8 Phase B OCC gate
+  bool tx_is_aborted();     // staging abort check for the Phase B read loop
   int rnd_pos(uchar *buf, uchar *pos) override; ///< required
   void position(const uchar *record) override;  ///< required
   int info(uint flag) override;                 ///< required

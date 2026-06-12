@@ -515,10 +515,15 @@ static bool parallel_primary_aggregate_scan(
         std::vector<LineairDB::StatelessScanRow> kept;
         kept.reserve(sr.rows.size());
         for (auto& row : sr.rows) {
-          bool keep = true;
-          if (ev.parse_row(row.value.data(), row.value.size(), num_cols))
-            keep = ev.evaluate(filter_expr);
-          if (keep) kept.push_back(std::move(row));
+          // Fail closed on parse failure (Codex P2): an unparseable row can
+          // never be re-checked by MySQL once aggregated. Worker failure makes
+          // the caller fall back to the serial path, which aborts loudly.
+          if (!ev.parse_row(row.value.data(), row.value.size(), num_cols)) {
+            failed[i] = 1;
+            db->ReleaseMasstreeThreadEpoch();
+            return;
+          }
+          if (ev.evaluate(filter_expr)) kept.push_back(std::move(row));
         }
         sr.rows = std::move(kept);
       }
@@ -1432,10 +1437,29 @@ void LineairDBRpc::handleTxExecuteReadPlan(const std::string& message,
             bool aggregated = false;
             if (step.has_aggregate() && step.aggregate().aggs_size() > 0) {
                 if (step_filter != nullptr) {
+                    // Aggregate input filtering FAILS CLOSED on a parse
+                    // failure: the usual ship-and-let-MySQL-recheck contract
+                    // is impossible once rows are folded into group rows
+                    // (Codex P2), and an unparseable row means a malformed
+                    // value that must never silently join an aggregate.
+                    PredicateEvaluator agg_eval;
+                    bool parse_failed = false;
                     std::remove_reference_t<decltype(scan_result.rows)> filtered;
                     filtered.reserve(scan_result.rows.size());
                     for (auto& row : scan_result.rows) {
-                        if (row_passes(row.value)) filtered.push_back(std::move(row));
+                        if (!agg_eval.parse_row(row.value.data(),
+                                                row.value.size(),
+                                                step_filter_cols)) {
+                            parse_failed = true;
+                            break;
+                        }
+                        if (agg_eval.evaluate(*step_filter))
+                            filtered.push_back(std::move(row));
+                    }
+                    if (parse_failed) {
+                        response.set_ok(false);
+                        flat_plan::encode_to_string(response, result);
+                        return;
                     }
                     scan_result.rows = std::move(filtered);
                 }

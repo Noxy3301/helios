@@ -707,6 +707,13 @@ static bool helios_override_executor(JOIN *join, Query_result *query_result) {
       }
       t->file->ha_rnd_end();
       hl->tx_clear_pushed_aggregate();
+      // A staging abort during the read must not surface as an empty (or
+      // truncated) aggregate (Codex P2): agg_next_raw returns false on abort,
+      // so distinguish abort from EOF here and fail the statement.
+      if (hl->tx_is_aborted()) {
+        my_error(ER_LOCK_DEADLOCK, MYF(0));
+        return true;
+      }
 
       mem_root_deque<Item *> row(thd->mem_root);
       if (helios_make_output_caches(join, &row)) return true;
@@ -1778,12 +1785,27 @@ bool ha_lineairdb::tx_set_pushed_aggregate(const std::string &s) {
   // WHERE must ride along as the step filter — otherwise the aggregate counts
   // unfiltered rows (q1 N/O group, q6 152x). Fully-serializable WHERE only;
   // on failure the caller falls back to Phase A (local WHERE evaluation).
-  if (!prepare_select_filter_for_tx(ha_thd(), table, tx, nullptr)) {
-    return false;
+  // NOTE (Codex P1): prepare's return value ANDs in limit-safety (integer
+  // comparisons only), which would reject q1/q6's DATE/DECIMAL filters; the
+  // aggregate gate only needs FULL SERIALIZATION, observable as a non-empty
+  // installed filter (or no WHERE at all).
+  prepare_select_filter_for_tx(ha_thd(), table, tx, nullptr);
+  const Item *agg_where = nullptr;
+  if (ha_thd()->lex != nullptr && ha_thd()->lex->unit != nullptr) {
+    Query_block *qb = ha_thd()->lex->unit->global_parameters();
+    if (qb != nullptr) agg_where = qb->where_cond();
+  }
+  if (agg_where != nullptr && tx->get_pushed_filter().empty()) {
+    return false;  // WHERE exists but could not be fully serialized
   }
   tx->set_pushed_aggregate(s);
   return true;
 }
+bool ha_lineairdb::tx_is_aborted() {
+  auto tx = get_transaction(ha_thd());
+  return tx == nullptr || tx->is_aborted();
+}
+
 bool ha_lineairdb::tx_ro_novalidate() {
   // The override decides Phase B BEFORE the read path begins the tx (which is
   // where ro_novalidate_ gets set), so consult the sysvar gate directly; the
@@ -1800,6 +1822,12 @@ void ha_lineairdb::tx_clear_pushed_aggregate() {
 bool ha_lineairdb::agg_next_raw(std::string_view *out_value) {
   // (The old branch had a zero-copy borrowed-scan fast path here; this branch
   // materializes scan rows into scanned_values_, so serve from there.)
+  // Surface staging aborts: without this, a failed/missed aggregate staging
+  // would read as an EMPTY but successful aggregate (Codex P2).
+  {
+    auto tx = get_transaction(ha_thd());
+    if (tx != nullptr && tx->is_aborted()) return false;
+  }
   if (buffer_position_ >= scanned_keys_.size()) {
     if (scan_exhausted_) return false;
     if (!fetch_next_batch()) { scan_exhausted_ = true; return false; }
