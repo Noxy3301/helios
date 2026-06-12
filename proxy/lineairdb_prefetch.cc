@@ -357,13 +357,14 @@ void maybe_prefetch_for_transaction(THD *thd,
 
 // Build the read plan from the given QEP root and run it in one prefetch RPC.
 static int autogen_and_execute_prefetch(THD *thd, AccessPath *root,
-                                        LineairDBTransaction *tx) {
+                                        LineairDBTransaction *tx,
+                                        bool include_inner_units = false) {
   std::vector<LineairDBProxy::ReadPlanStep> steps;
   bool compile_ok;
   {
     SectionTimer compile_timer(tx->trace(), "autogen_compile");
     compile_ok = autogen_read_plan_from_qep(thd, root, tx->ro_novalidate(),
-                                            &steps);
+                                            &steps, include_inner_units);
   }
   if (!compile_ok) {
     // autogen has already raised a my_error describing the unsupported shape.
@@ -493,7 +494,11 @@ int maybe_prefetch_for_statement(THD *thd, LineairDBTransaction *tx,
           thd, tx, "read-bearing statement is not prefetch-eligible");
     }
 
-    return autogen_and_execute_prefetch(thd, stmt_root, tx);
+    // Statement-level staging also sweeps Item-embedded subquery plan trees
+    // (dependent scalar subqueries / in_optimizer IN), which execute at
+    // runtime but are invisible to the main-tree leaf walk.
+    return autogen_and_execute_prefetch(thd, stmt_root, tx,
+                                        /*include_inner_units=*/true);
   }
 
   // No statement root yet: the optimizer is evaluating a subquery (constant

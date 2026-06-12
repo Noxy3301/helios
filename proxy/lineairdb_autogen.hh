@@ -16,9 +16,17 @@ struct AccessPath;
 // finalized yet). Returns true with steps on full success. On ANY unsupported
 // QEP shape it raises my_error(...) and returns false (NO fallback, NO
 // best-effort coverage). Caller must fail the statement when false.
+//
+// include_inner_units: also compile the plan trees of the statement's inner
+// query expressions (dependent scalar subqueries / in_optimizer materialized
+// IN), which hang off Item conditions and are invisible to the main-tree
+// walk. Their leaves share the main tree's step table so correlated probes
+// bind as for_each. Inner-unit compile failures are NON-fatal (that unit is
+// skipped; executing it later misses and aborts, i.e. today's behavior).
 bool autogen_read_plan_from_qep(
     THD *thd, AccessPath *root, bool allow_filter_pushdown,
-    std::vector<LineairDBProxy::ReadPlanStep> *out);
+    std::vector<LineairDBProxy::ReadPlanStep> *out,
+    bool include_inner_units = false);
 
 // Auto-generate one statement-scoped prefetch step from the handler access
 // selected for legacy single-table UPDATE/DELETE.

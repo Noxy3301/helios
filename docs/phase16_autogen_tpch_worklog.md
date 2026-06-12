@@ -168,4 +168,50 @@ commit range keys 381→**18.4**(17.5)、validate req 38.7KB→**7.6KB**・353�
 - gate: HELIOS_OPT_STATS=1(default OFF)。次: build_partial → SF=0.1/1 で q5 EXPLAIN/実測
   → COST_V2(phase15 移植済、default OFF)と併用評価・係数再較正。
 
+### [2026-06-12] エントリ7: Track B1 NDV 効果実証 — q5 SF=1 335s → 23.1s(14.5x)
+
+- Codex 敵対的レビュー(Track A)反映: **F1 GO / F2 NO-GO / F3 NO-GO** →
+  F2 = SQL_CALC_FOUND_ROWS(count_all_rows)と scalar-subquery LIMIT
+  (reject_multiple_rows)は LIMIT 後も行を読むので staging gate に除外条件追加。
+  F3 = limited staged entry は「範囲内 pending own-write あり」では一切 serve しない
+  (own delete で正解行が窓の外に出る反例)— 3 lookup 経路全部に
+  has_pending_row_ops_in_range ガード。修正後 autogen traced 146.8、エラー0
+  (commit 6e6c1cb)。
+- LineairDB submodule に ComputeIndexNdvInt をコミット(535a077)、gitlink 更新(ce5a05c)。
+- **SF=0.1**: EXPLAIN q5 が全段現実推定(customer rows=600=15k/25 厳密値、orders 15、
+  lineitem 5)で region→nation→customer→orders→lineitem→supplier の健全プラン。1.87s。
+- **SF=1**(HELIOS_OPT_STATS=1、prefetch+ro_novalidate ON、デフォルト cost):
+  q5 **23.1s**(phase15 比較表 335.4s → **14.5x**)。プランは旧ブランチ実証形と同型
+  (customer 6000/orders 16/lineitem 5)。COST_V2 無しで雪崩解消 = NDV(GIGO 解消)が
+  主因という旧ブランチの結論を再確認。
+- 実行中: 全22 matrix(回帰確認)→ md5 22/22 vs InnoDB(3308)。
+
+### [2026-06-12] エントリ8: NDV 単独 / NDV+COST_V2 全22 matrix(SF=1)
+
+| gate | 結果 | 主要値 |
+|---|---|---|
+| NDV のみ | 22/22 OK | q5 22.2s(335→)、広範改善(q3/4/7/9/17/21/22 で -15〜44%)、**q2 21x退行(2.2→47.4s)**、q18 +11% |
+| NDV+COST_V2 | 20/22 OK | q2 2.0s(退行解消)、q17 **20.2s**(63.7→)、q10 18.0、q11 1.9、q15 33.9、q21 47.0s・**OOM 無し**(peak mysqld ~25GB 一時)| 
+- q2 退行の真因: NDV で基数は正しくなったが legacy handler cost が「supplier 駆動の
+  derived 実体化(partsupp 16万 probe)」を安く見積もる。COST_V2(RPC/転送比例)併用で
+  part 駆動プランに復帰 = **NDV(基数)と COST_V2(アクセスコスト)は補完関係**、
+  という想定どおりの結果。
+- COST_V2 既知問題の再評価: q17 カバレッジ破壊は NDV 併用で**消えた**(プラン変化)、
+  q21 44GB OOM も**消えた**。残るは **q18 / q20 の ERROR(prefetch cache miss)**。
+
+**q18/q20 真因診断**(EXPLAIN + mysqld ログ):
+- q20: dependent scalar subquery(select #4)が lineitem を l_partkey 2-part probe
+  → miss "secondary scan lineitem"
+- q18: `<in_optimizer>` の run-once materialized subquery(select #2)内の
+  lineitem PRIMARY full index scan → miss "primary value scan lineitem"
+- 共通根: **Item(Filter 条件)内に埋め込まれた subquery の AccessPath ツリーは
+  collect_qep_leaves の child 走査に乗らない**(別ツリー)。default/NDV-only では
+  semijoin 等で main ツリー内に展開されていたため露見しなかった。COST_V2 が
+  in_optimizer/dependent 形を選ぶと未 stage アクセスが出る。
+- 修正方針: autogen_read_plan_from_qep を「main 木 + statement の全 inner
+  Query_expression の plan root」の葉を**同一 table_steps で一括コンパイル**に拡張。
+  相関 probe(q20)は既存 FES binding(compile_ref_lookup の source step 解決)に
+  そのまま乗る。run-once materialize(q18)は full scan staging で可。
+  subquery 側の TABLE* は別インスタンスなので duplicate-leaf 検査とは衝突しない見込み。
+
 (以降、変更・計測ごとにエントリ追記)

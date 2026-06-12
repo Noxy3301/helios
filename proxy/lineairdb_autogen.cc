@@ -839,32 +839,27 @@ bool compile_index_search(TABLE *table, uint index,
 
 }  // namespace
 
-bool autogen_read_plan_from_qep(
+// Compile every leaf of one plan tree into `steps`, sharing `table_steps`
+// across trees so later trees can bind probes to earlier steps. On failure
+// sets unsupported and returns false WITHOUT raising; the caller decides
+// whether the failure is fatal (main tree) or skippable (inner unit).
+// added_tables records this call's table_steps insertions for rollback.
+static bool compile_tree_leaves(
     THD *thd, AccessPath *root, bool allow_filter_pushdown,
-    std::vector<LineairDBProxy::ReadPlanStep> *out) {
-  if (out == nullptr) {
-    return raise_unsupported(thd, "NONE", "null output vector");
-  }
-  out->clear();
-
-  if (root == nullptr) {
-    return raise_unsupported(thd, "NONE", "missing JOIN root_access_path");
-  }
-
+    std::unordered_map<TABLE *, int> *table_steps,
+    std::vector<LineairDBProxy::ReadPlanStep> *steps,
+    std::vector<TABLE *> *added_tables, UnsupportedQep *unsupported) {
   std::vector<AccessPath *> leaves;
   bool ok = true;
-  UnsupportedQep unsupported;
-  collect_qep_leaves(root, &leaves, &ok, &unsupported);
+  collect_qep_leaves(root, &leaves, &ok, unsupported);
   if (!ok) {
-    return raise_unsupported(thd, unsupported.type, unsupported.reason);
+    return false;
   }
   if (leaves.empty()) {
-    return raise_unsupported(thd, root->type, "QEP has no table leaves");
+    unsupported->type = root->type;
+    unsupported->reason = "QEP has no table leaves";
+    return false;
   }
-
-  std::unordered_map<TABLE *, int> table_steps;
-  std::vector<LineairDBProxy::ReadPlanStep> steps;
-  steps.reserve(leaves.size());
 
   for (AccessPath *leaf : leaves) {
     TABLE *table = nullptr;
@@ -873,21 +868,27 @@ bool autogen_read_plan_from_qep(
     int full_scan_index = -1;
     if (!qep_leaf_info(leaf, &table, &ref, &full_scan, &full_scan_index) ||
         table == nullptr) {
-      return raise_unsupported(thd, leaf->type, "unsupported QEP leaf");
+      unsupported->type = leaf->type;
+      unsupported->reason = "unsupported QEP leaf";
+      return false;
     }
     if (table->s != nullptr && table->s->tmp_table != NO_TMP_TABLE) {
       // Local temp table (materialized derived table / GROUP BY buffer):
       // reading it needs no prefetch step.
       continue;
     }
-    if (table_steps.find(table) != table_steps.end()) {
-      return raise_unsupported(thd, leaf->type, "duplicate QEP table leaf");
+    if (table_steps->find(table) != table_steps->end()) {
+      unsupported->type = leaf->type;
+      unsupported->reason = "duplicate QEP table leaf";
+      return false;
     }
 
     LineairDBProxy::ReadPlanStep step;
     std::string reason;
-    if (!compile_leaf(leaf, table_steps, &step, &reason)) {
-      return raise_unsupported(thd, leaf->type, reason);
+    if (!compile_leaf(leaf, *table_steps, &step, &reason)) {
+      unsupported->type = leaf->type;
+      unsupported->reason = reason;
+      return false;
     }
 
     // LIMIT pushdown into staging (TPC-C Delivery: `... ORDER BY pk ASC
@@ -929,8 +930,92 @@ bool autogen_read_plan_from_qep(
           down_cast<ha_lineairdb *>(table->file)->pushed_filter_for_autogen();
     }
 
-    table_steps[table] = static_cast<int>(steps.size());
-    steps.push_back(std::move(step));
+    (*table_steps)[table] = static_cast<int>(steps->size());
+    added_tables->push_back(table);
+    steps->push_back(std::move(step));
+  }
+  return true;
+}
+
+// Collect plan roots of every inner query expression below `unit`,
+// recursively: dependent scalar subqueries and in_optimizer materialized IN
+// hang off Item conditions, so their plan trees never appear in the main
+// AccessPath tree's child pointers.
+static void collect_inner_unit_roots(Query_expression *unit,
+                                     std::vector<AccessPath *> *roots) {
+  if (unit == nullptr) return;
+  for (Query_block *qb = unit->first_query_block(); qb != nullptr;
+       qb = qb->next_query_block()) {
+    for (Query_expression *inner = qb->first_inner_query_expression();
+         inner != nullptr; inner = inner->next_query_expression()) {
+      AccessPath *r = inner->root_access_path();
+      if (r == nullptr) {
+        // Materialized IN-subqueries keep their plan on the subquery JOIN;
+        // the unit-level root is only populated for some shapes (same
+        // fallback as table_unit_plan_root in lineairdb_prefetch.cc).
+        Query_block *iqb = inner->first_query_block();
+        if (iqb != nullptr && iqb->join != nullptr) {
+          r = iqb->join->root_access_path();
+        }
+      }
+      if (r != nullptr) roots->push_back(r);
+      collect_inner_unit_roots(inner, roots);
+    }
+  }
+}
+
+bool autogen_read_plan_from_qep(
+    THD *thd, AccessPath *root, bool allow_filter_pushdown,
+    std::vector<LineairDBProxy::ReadPlanStep> *out,
+    bool include_inner_units) {
+  if (out == nullptr) {
+    return raise_unsupported(thd, "NONE", "null output vector");
+  }
+  out->clear();
+
+  if (root == nullptr) {
+    return raise_unsupported(thd, "NONE", "missing JOIN root_access_path");
+  }
+
+  std::unordered_map<TABLE *, int> table_steps;
+  std::vector<LineairDBProxy::ReadPlanStep> steps;
+  std::vector<TABLE *> added_tables;
+  UnsupportedQep unsupported;
+
+  if (!compile_tree_leaves(thd, root, allow_filter_pushdown, &table_steps,
+                           &steps, &added_tables, &unsupported)) {
+    return raise_unsupported(thd, unsupported.type, unsupported.reason);
+  }
+
+  // Stage Item-embedded subquery plans too: a plan that keeps an IN-subquery
+  // in in_optimizer form (q18) or probes inside a dependent scalar subquery
+  // (q20) executes those trees at runtime, and their leaves are invisible to
+  // the main-tree walk above. Compiled into the SAME step list so correlated
+  // probes bind to outer steps as for_each. A failed inner unit rolls back
+  // and is non-fatal: an unstaged subquery that never executes costs
+  // nothing, and one that does execute misses and aborts exactly as before.
+  if (include_inner_units && thd != nullptr && thd->lex != nullptr) {
+    std::vector<AccessPath *> inner_roots;
+    collect_inner_unit_roots(thd->lex->unit, &inner_roots);
+    for (AccessPath *inner_root : inner_roots) {
+      if (inner_root == root) continue;
+      const size_t step_mark = steps.size();
+      const size_t table_mark = added_tables.size();
+      UnsupportedQep inner_unsupported;
+      if (!compile_tree_leaves(thd, inner_root, allow_filter_pushdown,
+                               &table_steps, &steps, &added_tables,
+                               &inner_unsupported)) {
+        steps.resize(step_mark);
+        for (size_t i = table_mark; i < added_tables.size(); ++i) {
+          table_steps.erase(added_tables[i]);
+        }
+        added_tables.resize(table_mark);
+      }
+    }
+  }
+
+  if (steps.empty()) {
+    return raise_unsupported(thd, root->type, "QEP has no stageable leaves");
   }
 
   *out = std::move(steps);

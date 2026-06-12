@@ -1205,8 +1205,20 @@ int ha_lineairdb::info(uint flag) {
     if ((need_rowcount || need_ndv) && !db_table_name.empty()) {
       THD *thd = ha_thd();
       if (thd != nullptr) {
-        LineairDBThdCtx *ctx =
+        LineairDBThdCtx *&ctx =
             *reinterpret_cast<LineairDBThdCtx **>(thd_ha_data(thd, lineairdb_hton));
+        // True cold optimizer path (EXPLAIN / first statement before any
+        // table access): no THD ctx or proxy exists yet, so the stats RPC
+        // below would silently never run (Codex review). With the stats gate
+        // ON, create the proxy lazily — that RPC is the gate's whole point.
+        // Gate OFF keeps the old behavior (no connection from info()).
+        if (opt_stats_on && ctx == nullptr) ctx = new LineairDBThdCtx();
+        if (opt_stats_on && ctx != nullptr && !ctx->proxy) {
+          std::string host =
+              srv_server_host ? srv_server_host : std::string("127.0.0.1");
+          ctx->proxy = std::make_shared<LineairDBProxy>(
+              host, static_cast<int>(srv_server_port));
+        }
         if (ctx != nullptr && ctx->proxy) {
           auto find_seed = [&]() -> bool {
             const auto &sc = ctx->proxy->cached_table_stats();
@@ -1220,6 +1232,11 @@ int ha_lineairdb::info(uint flag) {
             }
             return false;
           };
+          // Pre-existing (UNGATED) path: seed the row count from the
+          // begin/end table_stats piggyback cache. Must run regardless of
+          // HELIOS_OPT_STATS — gating it regressed the default row-count
+          // seeding (Codex review).
+          const bool seeded = find_seed();
           // Access-path fix: the begin/end table_stats piggyback misses at
           // optimize time under oneshot (deferred tx_begin), so the optimizer
           // would otherwise see stats.records==2 and pick full-scan + bad join
@@ -1231,7 +1248,7 @@ int ha_lineairdb::info(uint flag) {
           // instead of the n-th-root heuristic that mis-treated non-unique FK
           // joins as 1:1 -> Q5 explosion. (docs/phase7_optimizer_stats.md)
           if (opt_stats_on &&
-              (!find_seed() ||
+              (!seeded ||
                !share->index_ndv_loaded_.load(std::memory_order_relaxed))) {
             // Build index descriptors from THIS table's schema (the server is
             // schema-light). Primary index uses "" to match GetPrimaryIndex();
