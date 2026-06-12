@@ -426,4 +426,23 @@ ro_novalidate + projection(default ON)。InnoDB ref は 3308 に SF=1 再構築�
   late materialization の徹底。NWR pivot 16B 削減、scalar-source for_each、
   stateful q2/q9/q16 0行バグ調査も残。
 
+### [2026-06-13] エントリ18: scan filter pushdown 全面適用 + negative coverage(Track C1)
+
+- **実装**(commit 系列): build_single_table_filter + nested-OR 必要条件抽出(旧ブランチ
+  P1 predicate transfer)を移植し、**全 staged scan に table-local WHERE を同梱**
+  (ro_novalidate gate)。const-fold(エントリ16)が前提条件だった。
+- **被覆問題を2段で解決**: filter で落ちた行への point probe(EXISTS 変換 probe、
+  temp-fallback 経由)が cache miss → ①「物理表が plan 内で唯一の leaf のときのみ
+  filter 付与」(alias 交差 serve を構造排除)②それでも不可視 consumer が残るため
+  **filtered_keys 返送 + negative row-cache 登録**(flat codec v2、StepResult.filtered_keys。
+  alias の WHERE conjunct で落ちた行は MySQL も捨てるので not-found 供給は per-alias 健全)。
+- **SF=1 最終**: **suite 938 → 167.2s(5.6x)**、md5 22/22(stale ref による全 MISMATCH
+  事故1回 — ref 再ロードで解消、target hash は検証済み値と一致)、OLTP 回帰なし
+  (TPC-C 160.9 / TATP 1728.9)。**mysqld RSS 41.5 → 8.1GB(-80%)**。
+- **InnoDB に 6 本勝利**: q1(0.1x)q3(0.4x)q5(0.6x)q6(0.3x)q9(0.3x)q19(0.8x)。
+  対 InnoDB 中央値 **2.7x**(phase15 ~17x)。q5 は 335s→0.9s(372x)。
+- 残ギャップ上位: q7 12.2s(nation OR は necessary-condition で押せているが lineitem
+  FER probe が支配)、q18 29.8s、q15 26.8s、q20 16.6s、q17 20.3s — semijoin/
+  membership reduction(旧ブランチ実証済)と FER probe への filter 適用が次の梃子。
+
 (以降追記)
