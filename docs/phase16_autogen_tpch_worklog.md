@@ -367,4 +367,63 @@ md5 参照系は InnoDB(3308 に SF=0.1 ロード、SF=1 ref はマイルスト�
   → `pgrep -x lineairdb-serve`(15字切詰め名)を使う。
 - **B4 クローズ**。残: SF=1 区切りフル計測(B2+B3+B4 一括、InnoDB ref 再構築込み)。
 
-(以降、変更・計測ごとにエントリ追記)
+### [2026-06-13] エントリ16: Phase B を真に発火させるまでの三段バグ(q1/q6)
+
+SF=1 区切り計測で q1 22s / q6 19s(改善が小さい)に気づき追跡。**実は agg pushdown の
+server 経路(Phase B)は一度も WHERE 付きで動いていなかった**(常に Phase A に fallback、
+md5 は Phase A が正しいため検出されず):
+
+1. **serialize_item が裸リテラル専用**: TPC-H の述語に含まれる `DATE ± INTERVAL` /
+   `'0.06' - 0.01` は直列化失敗 → const-fold 追加(const_item は即時評価して
+   リテラル化)。temporal は **必ず文字列で fold**(INT 形式 19980902 は ASCII 日付との
+   辞書順比較を常真に退化させる — 全行 COUNT 6,001,215 で発覚)。
+   `<cache>` ラッパは**未充填だと val_* が NULL** → example へ再帰(commit 0bb2035)。
+2. **is_bool_func 判定の誤り**: 「functype != UNKNOWN_FUNC は構造直列化へ」とした
+   が `DATE±INTERVAL` は DATEADD_FUNC → fold を素通りして失敗継続。比較/論理演算子の
+   **明示ホワイトリスト**に変更(これで初めて Phase B が WHERE 付きで発火)。
+3. **rnd_init / index init の filter 上書き**: cond_push 状態(実質常に空)を毎回
+   tx に伝播するため、tx_set_pushed_aggregate が準備した WHERE filter を
+   `clear_pushed_filter()` が**消していた** → server が無 filter 集約
+   (q6 = 全 6M 行の SUM、q1 N/O 過大)。aggregate 保留中は clear をスキップ。
+- 各段階を `SELECT COUNT(*) ... WHERE l_shipdate <= DATE-INTERVAL`(正解 5,916,591)
+  の即値プローブで切り分け。**0.81s の「成功」が実は死にかけ server のエラー応答**
+  (staging 1.3ms/246B は物理的に不可能)という罠も踏んだ — 異常に速い数字は疑え。
+- **最終(SF=1, warm)**: q1 **0.57s**(phase15 30.3s 比 **53x**、InnoDB 8.48s 比 15x)、
+  q6 **0.35s**(65x、InnoDB 1.03s 比 3x)、両方 byte 一致(commit f7e6f3c 系)。
+  並列 scan+filter+agg(HELIOS_PARALLEL_SERVER_SCAN、T=8、l_orderkey 整数分割)が
+  実効。途中観測した「server 消滅」は上記エラー応答期の残骸で、修正後の
+  q1→q6→q1 連続実行では再現せず。
+
+### [2026-06-13] エントリ17: Track B 完走 — SF=1 最終区切り計測
+
+計測 env: HELIOS_OPT_STATS=1 + HELIOS_COST_V2=1 + HELIOS_AGG_PUSHDOWN=1 +
+HELIOS_PARALLEL_SERVER=1 + HELIOS_PARALLEL_SERVER_SCAN=1(server)+ prefetch +
+ro_novalidate + projection(default ON)。InnoDB ref は 3308 に SF=1 再構築。
+
+| q | ph15 | 最終 | 倍率 | vs InnoDB | q | ph15 | 最終 | 倍率 | vs InnoDB |
+|---|---|---|---|---|---|---|---|---|---|
+| q1 | 30.3 | **0.8** | 39x | **0.1x(勝ち)** | q12 | 27.3 | 19.3 | 1.4x | 11.8x |
+| q2 | 2.2 | 3.0 | 0.7x | 4.7x | q13 | 7.3 | 5.3 | 1.4x | 1.1x |
+| q3 | 27.2 | 19.0 | 1.4x | 5.4x | q14 | 27.2 | 17.2 | 1.6x | — |
+| q4 | 28.8 | 15.4 | 1.9x | 27.9x | q15 | 54.9 | 39.9 | 1.4x | 16.0x |
+| q5 | 335.4 | 18.3 | 18.3x | 11.4x | q16 | 3.5 | 1.6 | 2.1x | 5.1x |
+| q6 | 22.6 | **0.3** | 65x | **0.3x(勝ち)** | q17 | 63.7 | 34.2 | 1.9x | 85.7x |
+| q7 | 26.0 | 19.0 | 1.4x | 120x | q18 | 53.4 | 30.0 | 1.8x | 18.7x |
+| q8 | 30.2 | 21.1 | 1.4x | 14.1x | q19 | 22.2 | 15.9 | 1.4x | 80.9x |
+| q9 | 37.7 | 24.8 | 1.5x | 3.0x | q20 | 35.0 | 24.8 | 1.4x | 45.6x |
+| q10 | 26.0 | 16.4 | 1.6x | 11.4x | q21 | 64.8 | 40.9 | 1.6x | 22.2x |
+| q11 | 5.7 | 3.9 | 1.4x | 7.2x | q22 | 6.9 | 3.8 | 1.8x | 10.3x |
+
+- **suite 合計 938.2s → 375.0s(2.5x)**、**md5 22/22 vs InnoDB**、エラー0。
+  対 InnoDB 中央値 **11.4x**(phase15 ~17x)。**q1/q6 は InnoDB に勝利**
+  (agg pushdown + 並列 scan+filter+agg の全部入り)。
+- メモリ: server RSS 4186MB(load 後; phase15 想定 ~6GB → **-30%**, B4 slim)、
+  **mysqld RSS 17.1GB(matrix 後; phase15 41.5GB → -59%**, B2 projection -57% 転送)。
+- データ: docs/phase16_final_sf1.csv(phase15/final/InnoDB 3列)。
+- 残バックログ(優先順): 大表 scan ship 系(q3/q7/q8/q12 等)の残 ~19s は
+  「scan+filter pushdown の非集約クエリへの全面適用 + 転送後の proxy decode CPU」
+  が支配 — 次フェーズは join を含む partial agg / group-by pushdown 拡張か
+  late materialization の徹底。NWR pivot 16B 削減、scalar-source for_each、
+  stateful q2/q9/q16 0行バグ調査も残。
+
+(以降追記)
