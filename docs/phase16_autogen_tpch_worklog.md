@@ -633,4 +633,40 @@ inner-unit Phase B 化が次の大物)。scalar-source for_each、NWR pivot 16B�
   2 回走る分は fold 済みなので、残差は「660k 行 ×2 回の MySQL temp agg」。
   打ち手があるとすれば CTE 化判定や view merge 誘導だがクエリ改変は不可 — 保留。
 
+### [2026-06-13] エントリ25(設計): q15 GroupedSummary 復活 + plan 安定化①(進行中)
+
+**NDV staleness 修正(実装済み・検証中)**: NDV は share 生成時に1回 fetch して凍結、
+行数は begin/end piggyback で漂流 → load 中に作られた share は「部分ロード NDV ×
+確定後行数」の不整合ペアを恒久保持 = plan flip の有力仮説。修正: share に
+`index_ndv_records_`(NDV 取得時の行数)を持ち、**SELECT 時に行数が 20% 超漂流して
+いたら force refetch**(load 中の INSERT では refetch しない)。`HELIOS_STATS_DEBUG`
+で optimizer が見た records/NDV を出力。検証: /tmp/plan_stability_test.sh
+(2 cycle × load→PRE 計測→full matrix→POST 計測、q17/18/20 の時間と plan が
+cycle 間・PRE/POST 間で一致するか)。
+
+**q15 GroupedSummary 設計(MySQL 無改変、旧 phase10 recipe の拡張)**:
+- 旧 recipe(q18 用、md5 実証済み): handler が inner unit の scan を hijack し、
+  server group 行から synthetic 行(1行/group、SUM を carrier 列に格納)を emit、
+  MySQL の再集約は冪等。q18 では win 無しで不採用だったが **q15 は有効条件
+  「集約対象表が outer で非 scan」を満たす**。
+- q15 への拡張点:
+  1. **rnd 経路 activation**(q15 inner は temp-table agg over TABLE_SCAN。
+     順序不要なので index 経路より単純)。今 session の registration 機構を再利用:
+     push_to_engine で derived unit を GS 登録(override は付けない)。
+  2. **式 SUM の exact 2行分解**: SUM(ep*(1-disc)) は scale 4 で carrier(ep scale2)
+     に入らない → 群ごとに row1: ep=trunc2(S), disc=0.00(寄与=trunc2(S))+
+     row2: ep=0.01, disc=1-r*100(r=S-trunc2(S)<0.01, disc は scale2 ✓、
+     寄与=r exact)。SUM の加法性で 2 行の再集約 = S exact。COUNT/AVG が
+     SELECT list に居たら不成立 → reject(q15 は SUM のみ ✓)。
+  3. **WHERE 再評価対策**: synthetic 行は MySQL の FILTER を通る必要がある。
+     登録時に「各 WHERE 列へ自然な候補定数(>=/=/BETWEEN-low/IN 先頭)を入れた
+     template 行」を作り、**実 WHERE Item を 1 回評価して通ることを検証**
+     (通らなければ GS reject → 通常 scan、fail-soft)。q15 は shipdate >= 下限が
+     '<' 上限も満たす ✓。
+  4. **C2 prefetch skip**: GS 登録された leaf の S: step を autogen が出さない
+     (660k 行の staging 自体を消す)。handler は cache 非 ingest の raw 実行
+     (旧 execute_read_plan_raw_values 相当、本 branch に要移植)で group 行を取得。
+  5. fail-closed: carrier 桁溢れ/形状不一致は activation しない(通常 scan)。
+- 期待: q15 7.6s → 1-2s(server 集約 + ship ~10k group 行 ×2 消費)。
+
 (以降追記)

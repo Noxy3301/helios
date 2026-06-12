@@ -2453,6 +2453,29 @@ int ha_lineairdb::info(uint flag) {
         opt_stats_env != nullptr && opt_stats_env[0] == '1';
     const bool need_rowcount =
         share->stats_base_records.load(std::memory_order_relaxed) == 0;
+    // NDV staleness (plan-stability fix): refetch when the row count has
+    // drifted >20% from the count at NDV-fetch time. Trigger on SELECT
+    // statements only — refetching during bulk loads would recompute the
+    // NDV over a growing table once per drift step. The first SELECT after
+    // a load settles the (records, NDV) pair once, deterministically.
+    bool ndv_stale = false;
+    if (opt_stats_on &&
+        share->index_ndv_loaded_.load(std::memory_order_relaxed)) {
+      const uint64_t at_fetch =
+          share->index_ndv_records_.load(std::memory_order_relaxed);
+      const uint64_t now_base =
+          share->stats_base_records.load(std::memory_order_relaxed);
+      const uint64_t hi = std::max(at_fetch, now_base);
+      const uint64_t lo = std::min(at_fetch, now_base);
+      THD *sthd = ha_thd();
+      const bool is_select = sthd != nullptr && sthd->lex != nullptr &&
+                             sthd->lex->sql_command == SQLCOM_SELECT;
+      ndv_stale = is_select && hi > 0 && (hi - lo) * 5 > hi;  // >20% drift
+      if (ndv_stale) {
+        share->index_ndv_force_refresh_.store(true, std::memory_order_relaxed);
+        share->index_ndv_loaded_.store(false, std::memory_order_relaxed);
+      }
+    }
     const bool need_ndv =
         opt_stats_on &&
         !share->index_ndv_loaded_.load(std::memory_order_relaxed);
@@ -2527,7 +2550,25 @@ int ha_lineairdb::info(uint flag) {
                 if (kv.second.first)  // available
                   share->index_ndv_[kv.first] = kv.second.second;
               }
+              // Remember the row count this NDV snapshot belongs to (the
+              // staleness check above compares future counts against it).
+              share->index_ndv_records_.store(
+                  share->stats_base_records.load(std::memory_order_relaxed),
+                  std::memory_order_relaxed);
               share->index_ndv_loaded_.store(true, std::memory_order_relaxed);
+              if (std::getenv("HELIOS_STATS_DEBUG") != nullptr) {
+                std::string dbg = "[STATS] ndv fetch " + db_table_name +
+                                  " records=" +
+                                  std::to_string(share->stats_base_records.load(
+                                      std::memory_order_relaxed));
+                for (const auto &kv : share->index_ndv_) {
+                  dbg += " " + (kv.first.empty() ? std::string("PRIMARY")
+                                                 : kv.first) + "=[";
+                  for (uint64_t v : kv.second) dbg += std::to_string(v) + ",";
+                  dbg += "]";
+                }
+                std::fprintf(stderr, "%s\n", dbg.c_str());
+              }
             }
           }
         }
@@ -2546,6 +2587,17 @@ int ha_lineairdb::info(uint flag) {
       total = 0;
 
     stats.records = static_cast<ha_rows>(total);
+    if (std::getenv("HELIOS_STATS_DEBUG") != nullptr) {
+      std::fprintf(stderr,
+                   "[STATS] info %s records=%lld (base=%lld delta=%lld) "
+                   "ndv_loaded=%d ndv_at=%llu stale_refetch=%d\n",
+                   db_table_name.c_str(), (long long)total, (long long)base,
+                   (long long)delta_sum,
+                   (int)share->index_ndv_loaded_.load(std::memory_order_relaxed),
+                   (unsigned long long)share->index_ndv_records_.load(
+                       std::memory_order_relaxed),
+                   (int)ndv_stale);
+    }
 
     // Check for uncommitted row-count delta in the active transaction
     THD *thd = ha_thd();

@@ -93,6 +93,14 @@ public:
   std::mutex index_ndv_mu_;
   std::unordered_map<std::string, std::vector<uint64_t>> index_ndv_;
   std::atomic<bool> index_ndv_loaded_{false};
+  // Row count observed when the NDV snapshot was fetched. NDV is otherwise
+  // frozen for the share's lifetime while row counts keep drifting toward
+  // truth via the begin/end piggyback — a share instantiated mid-load would
+  // permanently pair partial-table NDV with settled row counts and flip
+  // join orders run-to-run (plan instability, phase16 entry 25). A SELECT
+  // seeing >20% drift refetches the NDV (force) so stats converge to the
+  // settled snapshot deterministically.
+  std::atomic<uint64_t> index_ndv_records_{0};
   // ANALYZE TABLE sets this so the next info() NDV fetch passes force=true,
   // making the server recompute (rather than serve its cached) NDV.
   std::atomic<bool> index_ndv_force_refresh_{false};
