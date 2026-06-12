@@ -254,6 +254,13 @@ message TxExecuteReadPlan {
         repeated KeyBinding end_bindings = 8;
         bool for_each = 9;
         bool reverse_scan = 10;
+        // Server-side row filter for primary scans (same semantics as the
+        // stateless scan RPCs): non-matching rows are dropped from the
+        // response; rows the server cannot parse are returned for MySQL to
+        // re-evaluate. Only attached when commit-time validation is off
+        // (read-only no-validate), since a replay could not reproduce the
+        // filtered key set.
+        PushedPredicate filter = 11;
     }
     message StepResult {
         bool found = 1;

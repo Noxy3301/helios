@@ -480,6 +480,9 @@ LineairDBProxy::ReadPlanResult LineairDBProxy::tx_execute_read_plan(
         out->set_index_name(step.index_name);
         out->set_for_each(step.for_each);
         out->set_reverse_scan(step.reverse_scan);
+        if (!step.serialized_filter.empty()) {
+            out->mutable_filter()->ParseFromString(step.serialized_filter);
+        }
         for (const auto& binding : step.bindings) {
             auto* b = out->add_bindings();
             b->set_source_step(binding.source_step);

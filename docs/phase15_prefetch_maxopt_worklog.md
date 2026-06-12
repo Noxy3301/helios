@@ -286,4 +286,45 @@ COST_V2(旧ブランチ移植、env gate)を ON にした実験では plan が�
 - 注意した点: 一時的に「直前クエリのエラー形状を引き継ぐ」ように見える断続事象を観測(再現せず)。
   計測ハーネスを per-query stderr 完全保存(bench/bin/tpch_matrix.sh)に変更して追跡可能化。
 
+### [2026-06-12] エントリ13: **TPC-H 22/22 達成**(prefetch ON+novalidate, SF=0.1)
+
+matrix r5(per-unit staging)で 21/22、r6(q15 temp-driven probe fallback)で **22/22 OK**。
+commit 8759228。各クエリ数秒以内(最遅 q21/q5 ~4.6s、suite 合計 ~45s)。
+stateful ベースライン(13/22 OK・9 本 >120s TIMEOUT)に対する質的飛躍:
+| 例 | stateful | prefetch ON |
+|---|---|---|
+| q3 | 36.5s | 2.2s |
+| q4 | 80.9s | 2.1s |
+| q5/q7-q10/q17/q18/q20/q21 | >120s TIMEOUT | 1.5-4.6s |
+| q13 | 94.5s | 0.4s |
+
+次: (1) InnoDB 参照(port 3308)に同一 SF ロード→ 22 本 md5 全照合(正しさ確定)
+(2) TPC-C 3 モード + TATP 2 モード回帰(共有経路改修のため必須)
+(3) その後 perf 磨き込み(M1 filter pushdown / SF=1 へのスケール)
+
+### [2026-06-12] エントリ14: 正しさ確定 + OLTP 回帰クリア + M1 実装
+
+**md5 全照合**: InnoDB 参照インスタンス(port 3308, 同一 SF=0.1, benchbase ロード 12.7s)に対し
+**22/22 md5 完全一致**(qualification 固定パラメータ、ソート後比較)。prefetch ON+novalidate の
+結果は InnoDB と同一 = カバレッジ拡張は正確性を保っている。
+
+**OLTP 回帰**(FER/FES+per-unit staging+cache 索引導入後):
+| | before | after |
+|---|---|---|
+| TPC-C stateful | 140.3 | 143.8 |
+| TPC-C explicit | 191.3 | **196.2**(err 0) |
+| TPC-C autogen | 124.5 | 125.0 |
+| TATP stateful | 1334.9 | 1330.0 |
+| TATP autogen | 1590.7 | 1586.3 |
+回帰なし(誤差範囲)。C1-C4 + SI 強プローブは explicit 実行後に再検証中。
+
+**M1(filter pushdown to plan steps)実装**(ビルド前):
+- proto PlanStep += `PushedPredicate filter`(semantics は stateless scan RPC と同一:
+  不一致行 drop、parse 不能行は返して MySQL 再評価)。
+- server: primary plan scan に PredicateEvaluator 適用。
+- autogen: 非 for_each・primary scan step に cond_push 由来の table-local filter を付与。
+  **gate = tx->ro_novalidate()**(validation replay は filtered key set を再現できないため、
+  validation 有効時は従来通り未フィルタ転送)。autocommit 単文限定なので
+  filtered エントリの statement 越え再利用も構造的に発生しない。
+
 (以降追記)

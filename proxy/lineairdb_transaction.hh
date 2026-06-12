@@ -116,6 +116,9 @@ public:
   }
   bool autogen_stmt_resolved() const { return autogen_stmt_resolved_; }
   void mark_autogen_stmt_resolved() { autogen_stmt_resolved_ = true; }
+  // Autocommit read-only SELECT with validation elided (sysvar gate); also
+  // gates filter pushdown into staged scan steps.
+  bool ro_novalidate() const { return ro_novalidate_; }
   // Optimize-time subquery staging: one staging per plan root within the
   // statement (the statement-level root is not built yet at that point).
   bool autogen_root_staged(const void *root) const {

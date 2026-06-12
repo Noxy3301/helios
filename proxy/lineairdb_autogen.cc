@@ -21,6 +21,7 @@
 #include "sql/sql_optimizer.h"
 #include "sql/sql_opt_exec_shared.h"
 #include "sql/table.h"
+#include "storage/lineairdb/ha_lineairdb.hh"
 
 namespace {
 
@@ -832,7 +833,7 @@ bool compile_index_search(TABLE *table, uint index,
 }  // namespace
 
 bool autogen_read_plan_from_qep(
-    THD *thd, AccessPath *root,
+    THD *thd, AccessPath *root, bool allow_filter_pushdown,
     std::vector<LineairDBProxy::ReadPlanStep> *out) {
   if (out == nullptr) {
     return raise_unsupported(thd, "NONE", "null output vector");
@@ -880,6 +881,16 @@ bool autogen_read_plan_from_qep(
     std::string reason;
     if (!compile_leaf(leaf, table_steps, &step, &reason)) {
       return raise_unsupported(thd, leaf->type, reason);
+    }
+
+    // Attach the table-local cond_push() filter to non-probe scans so the
+    // server drops non-matching rows before transfer. Only when commit-time
+    // validation is off (the replay could not reproduce a filtered key set);
+    // MySQL re-evaluates the condition either way.
+    if (allow_filter_pushdown && step.is_scan && !step.for_each &&
+        step.index_name.empty() && table->file != nullptr) {
+      step.serialized_filter =
+          down_cast<ha_lineairdb *>(table->file)->pushed_filter_for_autogen();
     }
 
     table_steps[table] = static_cast<int>(steps.size());

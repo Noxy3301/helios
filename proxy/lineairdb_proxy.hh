@@ -179,6 +179,8 @@ public:
         std::vector<ReadPlanKeyBinding> end_bindings;
         bool for_each = false;
         bool reverse_scan = false;
+        // Serialized PushedPredicate (empty = no filter); see the proto note.
+        std::string serialized_filter;
     };
     struct ReadPlanStepResult {
         bool found = false;

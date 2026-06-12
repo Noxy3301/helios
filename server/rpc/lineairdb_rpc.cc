@@ -746,7 +746,23 @@ void LineairDBRpc::handleTxExecuteReadPlan(const std::string& message,
                 result = response.SerializeAsString();
                 return;
             }
+            // Server-side row filter (same contract as the stateless scan
+            // RPCs): drop non-matching rows; keep rows the evaluator cannot
+            // parse so MySQL re-evaluates them.
+            const bool has_filter =
+                step.has_filter() && step.filter().has_expr();
+            const auto* filter_expr =
+                has_filter ? &step.filter().expr() : nullptr;
+            const uint32_t filter_num_cols =
+                has_filter ? step.filter().num_columns() : 0;
+            PredicateEvaluator evaluator;
             for (auto& row : scan_result.rows) {
+                if (filter_expr != nullptr &&
+                    evaluator.parse_row(row.value.data(), row.value.size(),
+                                        filter_num_cols) &&
+                    !evaluator.evaluate(*filter_expr)) {
+                    continue;
+                }
                 step_result->add_scan_keys(std::move(row.key));
                 step_result->add_scan_values(std::move(row.value));
                 step_result->add_scan_tids(row.tid);
