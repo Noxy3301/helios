@@ -408,4 +408,54 @@ q1 27.5s / q3 22.5s / q5 37.2s / q12 23.0s / q14 21.1s / q19 19.8s / q20 27.8s �
 
 次: SF=1 md5(InnoDB 参照に SF=1 ロード中)→ 最終 OLTP 回帰 → SOTA 調査結果の取り込み。
 
+### [2026-06-12] エントリ20: user 指示の追加(方針拡張)
+
+1. **headline 指標 = InnoDB 対比**: Q1-22 を InnoDB vs Helios で時間+メモリの表に。
+   → bench/bin/tpch_compare.sh(時間/peak RSS/md5 一括)+ tpch_explain_diff.sh(plan 等価性)を追加(commit 88b85f2)。
+2. **メモリ過食の本格対策**: SF=1 ≈ 1GB 生データに対し過大。InnoDB のメモリ管理 /
+   LineairDB・Helios 側の削減策を DeepResearch のうえ改善(SOTA 調査の帰着後に着手)。
+   「そもそも転送・実体化しない」系(aggregate pushdown 等)を含む。
+3. **LineairDB へのメス解禁**: Helios は LineairDB を「Silo 搭載の pluggable storage core」と
+   してのみ使用(CC-switchable 特性は不使用)→ per-record メタの死荷重(phase12 調査:
+   192B 中 ~128B = 2PL RW-lock 64B / NWR pivot / checkpoint)を妥当性検討のうえ削減してよい。
+   作業時は submodule に feature branch を切る(既定ルール)。
+4. **Codex レビュー運用**: ベンチ待機中に累積 diff(origin/feat/prefetch-autogen..HEAD,
+   +3681/-135, 54 files)を codex exec(read-only)へ投下済み。正しさ/1SR 安全性/flat codec
+   境界/stateful 回帰の観点で P0-P2 指摘+GO/NO-GO を要求。
+
+### [2026-06-12] エントリ21: SF=1 md5 不一致の真因(ロード並行性による SI 脱落)+ Codex レビュー対応
+
+**SF=1 md5 12 本不一致の調査**:
+- q3 差分 = order 4878020 の行のみ欠落(他は byte 一致)。カテゴリ列 CRC は両エンジン一致 → データ生成は無罪。
+- **prefetch OFF でも再現** → 自分の prefetch 改修ではない。
+- 決定打: `o_custkey=69961` が fullscan で 27 件、**二次索引経由で 25 件**。
+  全表計測: orders SI **6.7% 脱落**(1,399,452/1,500,000)、lineitem SI 0.7% 脱落。
+- **真因 = 並列ロード(16-way)時の LineairDB SI insert 競合で committed tx の SI エントリが消失**
+  (同一 SI キーへの並行 RMW の lost update 疑い。SF=0.1 の 22/22 一致は当時単線ロードだったため)。
+- 切り分け: `JAVA_TOOL_OPTIONS=-Dtpch.load.shards=1` で単線再ロード→SI 整合→md5 再検証(実行中)。
+- **LineairDB 側の修正対象として登録**(user が LineairDB へのメス解禁済み。commit install の
+  SI delta replay / SI read 検証経路を精査予定)。
+
+**Codex レビュー(累積 diff、verdict NO-GO)→ 全 6 指摘に対応**:
+1. P1 `<unordered_set>` include 欠落(transitively 通っていた)→ 追加。
+2. **P0 二次 scan cache lookup が方向無視**(ASC limit=1 staged を DESC 要求に供し得る)
+   → `row_limit!=0 なら方向一致必須` を fast path/linear 両方に追加。
+3. P1 ro_novalidate ゲートが SQLCOM_SELECT のみ(FOR UPDATE/SHARE を含んでしまう)
+   → 全 query_tables の lock_descriptor().type <= TL_READ を要求。
+4. P1 temp 駆動 fallback が常に primary full scan(secondary ref probe だと miss)
+   → ref の索引が secondary なら secondary full scan を staging。
+5. P2 u32 frame 超過時のヘッダ黙殺 → server send_response(+writev)/proxy request 側に
+   >UINT32_MAX ガード追加。decoder の reserve も wire サイズで cap(破損フレーム対策)。
+6. P2 parse_row が short row で true を返す → `field_index == total_fields` を要求
+   (parse 失敗=行を ship して MySQL 再評価、の契約を回復)。
+※ ビルド・再検証は実行中の単線リロード+md5 完了後(稼働バイナリ保護)。
+
+**SOTA 調査(Claude 側)完了**: docs/phase15_sota_pushdown_survey.md。
+上位提案: ①Calvin OLLP/Chardonnay 型 dry-run prefetch(TPC-C autogen の構造解)
+②HyPer precision locking(検証 O(read)→O(concurrent writes) 反転)
+③RANGEHASH digest 検証の RW 拡張は**公表例なし=新規性**
+④predicate transfer(CIDR'24 3.3x)の one-RPC 内 SIP は文献になし=新規性
+⑤storage-side zone maps。LZ4 wire 圧縮は localhost では非推奨に格下げ(VLDB'17)、
+代替=軽量列エンコード(FOR/dict/RLE)。Codex 版 deep research も受領済み(統合は後段)。
+
 (以降追記)

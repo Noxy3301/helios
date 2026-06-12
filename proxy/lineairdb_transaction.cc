@@ -2,6 +2,8 @@
 #include "storage/lineairdb/ha_lineairdb.hh"
 #include "lineairdb_keyenc.hh"
 #include "../common/log.h"
+#include "sql/sql_lex.h"
+#include "sql/table.h"
 
 #include <thread>
 #include <unordered_set>
@@ -1280,7 +1282,13 @@ LineairDBTransaction::lookup_secondary_scan_cache(
     const std::string& table_name, const std::string& index_name,
     const std::string& start_key, const std::string& end_key,
     bool reverse_scan, uint64_t row_limit) const {
-  (void)reverse_scan; // SI cache keeps the query-specific order from the plan
+  // Direction only matters for truncated scans: an unlimited entry holds the
+  // whole range whichever way it was produced, but a limit-N entry holds the
+  // first N in ITS direction, so serving a DESC request from an ASC-limited
+  // entry would return the wrong end of the range (Codex P0).
+  const auto direction_compatible = [&](const LocalSecondaryScanEntry& e) {
+    return e.row_limit == 0 || e.reverse_scan == reverse_scan;
+  };
 
   // Fast path: exact-start staged entry (the FES probe pattern).
   auto idx_it = secondary_scan_start_index_.find(
@@ -1289,7 +1297,8 @@ LineairDBTransaction::lookup_secondary_scan_cache(
     for (auto rit = idx_it->second.rbegin(); rit != idx_it->second.rend();
          ++rit) {
       const auto& e = secondary_scan_cache_[*rit];
-      if (e.row_limit == row_limit && end_key <= e.end_key) {
+      if (e.row_limit == row_limit && end_key <= e.end_key &&
+          direction_compatible(e)) {
         LocalSecondaryScanEntry cached = e;
         cached.start_key = start_key;
         cached.end_key = end_key;
@@ -1321,7 +1330,8 @@ LineairDBTransaction::lookup_secondary_scan_cache(
     const bool same_limit = it->row_limit == row_limit;
     const bool covers_range =
         it->start_key <= start_key && end_key <= it->end_key;
-    if (same_index && same_limit && covers_range) {
+    if (same_index && same_limit && covers_range &&
+        direction_compatible(*it)) {
       LocalSecondaryScanEntry cached = *it;
       cached.start_key = start_key;
       cached.end_key = end_key;
@@ -1444,13 +1454,26 @@ void LineairDBTransaction::begin_transaction() {
       register_transaction_to_mysql();
     }
     else {
-      // Autocommit single-statement SELECT: when the operator enabled
+      // Autocommit single-statement plain SELECT: when the operator enabled
       // lineairdb_prefetch_ro_novalidate, skip read-set accumulation and the
       // commit-time validation RPC entirely (sound without concurrent
-      // writers; see the sysvar help text).
+      // writers; see the sysvar help text). Locking reads (FOR UPDATE/SHARE)
+      // keep full validation: every referenced table must be opened with a
+      // plain read lock (Codex P1).
       extern bool srv_prefetch_ro_novalidate;
-      ro_novalidate_ = srv_prefetch_ro_novalidate && thread != nullptr &&
-                       thd_sql_command(thread) == SQLCOM_SELECT;
+      bool plain_read_only = srv_prefetch_ro_novalidate && thread != nullptr &&
+                             thd_sql_command(thread) == SQLCOM_SELECT &&
+                             thread->lex != nullptr;
+      if (plain_read_only) {
+        for (Table_ref *t = thread->lex->query_tables; t != nullptr;
+             t = t->next_global) {
+          if (t->lock_descriptor().type > TL_READ) {
+            plain_read_only = false;
+            break;
+          }
+        }
+      }
+      ro_novalidate_ = plain_read_only;
       register_single_statement_to_mysql();
     }
     return;

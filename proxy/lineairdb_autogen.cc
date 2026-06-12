@@ -568,7 +568,14 @@ bool compile_ref_lookup(
         step->is_scan = true;
         step->key_prefix.clear();
         step->end_key_prefix = lineairdb_keyenc::scan_end_sentinel();
-        step->index_name.clear();
+        // The runtime probes whatever index the ref chose, so the staged
+        // full scan must live on that same index: a primary full scan
+        // cannot serve secondary-cache lookups (Codex P1).
+        if (ref->key == static_cast<int>(table->s->primary_key)) {
+          step->index_name.clear();
+        } else {
+          step->index_name = table->key_info[ref->key].name;
+        }
         return !step->table_name.empty();
       }
       if (reason != nullptr) *reason = "bound source is not an earlier step";

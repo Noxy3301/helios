@@ -4,6 +4,7 @@
 #include <arpa/inet.h>
 #include <unistd.h>
 #include <errno.h>
+#include <algorithm>
 #include <chrono>
 #include <cstring>
 #include <iostream>
@@ -557,7 +558,12 @@ LineairDBProxy::ReadPlanResult LineairDBProxy::tx_execute_read_plan(
     result.ok = resp_ok;
     if (!resp_ok) return result;
 
-    result.steps.reserve(count);
+    // Bound reservations by what the wire could possibly hold so a corrupt
+    // count cannot force a huge allocation (every element costs >=1 byte).
+    const auto cap = [&raw](uint64_t n) {
+        return static_cast<size_t>(std::min<uint64_t>(n, raw.size()));
+    };
+    result.steps.reserve(cap(count));
     for (uint64_t i = 0; i < count && r.ok; ++i) {
         ReadPlanStepResult out;
         out.found = r.u8() != 0;
@@ -567,26 +573,26 @@ LineairDBProxy::ReadPlanResult LineairDBProxy::tx_execute_read_plan(
         out.actual_start_key = r.bytes();
         out.actual_end_key = r.bytes();
         uint64_t n = r.u64();
-        out.scan_keys.reserve(n);
+        out.scan_keys.reserve(cap(n));
         for (uint64_t j = 0; j < n && r.ok; ++j) out.scan_keys.push_back(r.bytes());
         n = r.u64();
-        out.scan_values.reserve(n);
+        out.scan_values.reserve(cap(n));
         for (uint64_t j = 0; j < n && r.ok; ++j) out.scan_values.push_back(r.bytes());
         n = r.u64();
-        out.scan_tids.reserve(n);
+        out.scan_tids.reserve(cap(n));
         for (uint64_t j = 0; j < n && r.ok; ++j) out.scan_tids.push_back(r.u64());
         n = r.u64();
-        out.secondary_keys.reserve(n);
+        out.secondary_keys.reserve(cap(n));
         for (uint64_t j = 0; j < n && r.ok; ++j) out.secondary_keys.push_back(r.bytes());
         n = r.u64();
-        out.group_sizes.reserve(n);
+        out.group_sizes.reserve(cap(n));
         for (uint64_t j = 0; j < n && r.ok; ++j)
             out.group_sizes.push_back(static_cast<uint32_t>(r.u64()));
         n = r.u64();
-        out.group_start_keys.reserve(n);
+        out.group_start_keys.reserve(cap(n));
         for (uint64_t j = 0; j < n && r.ok; ++j) out.group_start_keys.push_back(r.bytes());
         n = r.u64();
-        out.group_end_keys.reserve(n);
+        out.group_end_keys.reserve(cap(n));
         for (uint64_t j = 0; j < n && r.ok; ++j) out.group_end_keys.push_back(r.bytes());
         result.steps.push_back(std::move(out));
     }
@@ -1535,6 +1541,12 @@ bool LineairDBProxy::send_message_with_header(const std::string& serialized_requ
 
     if (!connected_) {
         LOG_ERROR("SEND_MESSAGE: Not connected!");
+        return false;
+    }
+    // The frame header carries a uint32 payload size.
+    if (serialized_request.size() > UINT32_MAX) {
+        LOG_ERROR("SEND_MESSAGE: request %zu bytes exceeds the u32 frame limit",
+                  serialized_request.size());
         return false;
     }
 

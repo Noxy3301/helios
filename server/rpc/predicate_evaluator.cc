@@ -67,7 +67,10 @@ bool PredicateEvaluator::parse_row(const char* data, size_t length,
     field_index++;
   }
 
-  return true;
+  // A short row (fewer fields than the filter expects) must report a parse
+  // failure so callers ship the row for MySQL to re-evaluate; evaluating a
+  // filter against missing columns would silently drop valid rows.
+  return field_index == total_fields;
 }
 
 // ---------------------------------------------------------------------------
