@@ -477,8 +477,6 @@ static bool parallel_primary_aggregate_scan(
   int64_t lo = 0, hi = 0;
   if (!decode_leading_int_key(first.rows.front().key, lo) ||
       !decode_leading_int_key(last.rows.front().key, hi)) {
-    if (dbg) fprintf(stderr, "[PSCAN] decode fail klen=%zu\n",
-                     first.rows.front().key.size());
     return false;
   }
   if (hi <= lo) return false;
@@ -1142,7 +1140,7 @@ void LineairDBRpc::handleTxStatelessSecondaryRangeScan(
 //   (bytes = u64 length + raw)
 namespace flat_plan {
 static constexpr uint64_t kMagic = 0x5054414C46424454ull;  // "TDBFLATP" bytes
-static constexpr uint8_t kVersion = 1;
+static constexpr uint8_t kVersion = 2;
 
 template <class Sink>
 inline void w_u64(Sink& o, uint64_t v) {
@@ -1188,6 +1186,8 @@ static void encode_step(
     for (const auto& k : s.group_start_keys()) w_bytes(out, k);
     w_u64(out, static_cast<uint64_t>(s.group_end_keys_size()));
     for (const auto& k : s.group_end_keys()) w_bytes(out, k);
+    w_u64(out, static_cast<uint64_t>(s.filtered_keys_size()));
+    for (const auto& k : s.filtered_keys()) w_bytes(out, k);
 }
 
 // Destructive: each step is released right after it is encoded, so the peak
@@ -1472,7 +1472,14 @@ void LineairDBRpc::handleTxExecuteReadPlan(const std::string& message,
             if (!aggregated) {
                 uint64_t emitted = 0;
                 for (auto& row : scan_result.rows) {
-                    if (!row_passes(row.value)) continue;
+                    if (!row_passes(row.value)) {
+                        // Coverage for point probes into a filtered scan: ship
+                        // the rejected KEY so the proxy can answer not-found
+                        // locally (sound: the filter is this alias's WHERE
+                        // conjunct, so MySQL would discard the row anyway).
+                        step_result->add_filtered_keys(std::move(row.key));
+                        continue;
+                    }
                     step_result->add_scan_keys(std::move(row.key));
                     step_result->add_scan_values(project_value(std::move(row.value)));
                     step_result->add_scan_tids(row.tid);
@@ -1494,7 +1501,11 @@ void LineairDBRpc::handleTxExecuteReadPlan(const std::string& message,
                 return;
             }
             for (auto& row : scan_result.rows) {
-                if (!row_passes(row.value)) continue;
+                if (!row_passes(row.value)) {
+                    // See the primary branch: negative coverage by primary key.
+                    step_result->add_filtered_keys(std::move(row.primary_key));
+                    continue;
+                }
                 step_result->add_secondary_keys(std::move(row.secondary_key));
                 step_result->add_scan_keys(std::move(row.primary_key));
                 step_result->add_scan_values(project_value(std::move(row.value)));

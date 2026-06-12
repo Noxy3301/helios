@@ -329,6 +329,12 @@ message TxExecuteReadPlan {
         repeated uint32 group_sizes = 11;
         repeated bytes group_start_keys = 12;
         repeated bytes group_end_keys = 13;
+        // Scan filter pushdown coverage: keys of rows the step filter
+        // REJECTED (plain scans only). The proxy registers them as negative
+        // row-cache entries so point probes into a filtered scan resolve to
+        // not-found locally — sound per alias, because the filter is a
+        // conjunct of that alias's WHERE (MySQL would discard the row).
+        repeated bytes filtered_keys = 14;
     }
     message Request {
         repeated PlanStep steps = 1;

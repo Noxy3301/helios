@@ -10,6 +10,7 @@
 #include <vector>
 
 #include "lineairdb_keyenc.hh"
+#include "lineairdb_pushdown.hh"
 #include "my_base.h"
 #include "my_sys.h"
 #include "mysqld_error.h"
@@ -921,16 +922,6 @@ static bool compile_tree_leaves(
       }
     }
 
-    // Attach the table-local cond_push() filter to every scan step (full
-    // scans, secondary scans, and FER/FES probe groups) so the server drops
-    // non-matching rows before transfer. Only when commit-time validation is
-    // off (the replay could not reproduce a filtered key set); MySQL
-    // re-evaluates the condition either way.
-    if (allow_filter_pushdown && step.is_scan && table->file != nullptr) {
-      step.serialized_filter =
-          down_cast<ha_lineairdb *>(table->file)->pushed_filter_for_autogen();
-    }
-
     (*table_steps)[table] = static_cast<int>(steps->size());
     added_tables->push_back(table);
     steps->push_back(std::move(step));
@@ -1017,6 +1008,30 @@ bool autogen_read_plan_from_qep(
 
   if (steps.empty()) {
     return raise_unsupported(thd, root->type, "QEP has no stageable leaves");
+  }
+
+  // Scan filter pushdown (post-pass; ro_novalidate only). A table-local WHERE
+  // filter is attached ONLY when the physical table backs exactly ONE plan
+  // step: with multiple steps (self-join aliases, temp-source full-scan
+  // coverage fallbacks) the table-name-keyed caches cross-serve entries, and
+  // a row dropped by one alias's filter would silently vanish from another
+  // alias's reads (q2/q20: point probes into the temp-fallback part scan).
+  // With a single step, every consumer of the table sees rows filtered by
+  // that alias's OWN WHERE conjunct — rows MySQL would discard anyway.
+  if (allow_filter_pushdown) {
+    std::unordered_map<std::string, int> table_step_count;
+    for (const auto &s : steps) table_step_count[s.table_name]++;
+    for (size_t i = 0; i < steps.size(); ++i) {
+      auto &s = steps[i];
+      if (!s.is_scan) continue;
+      if (table_step_count[s.table_name] != 1) continue;
+      TABLE *t = i < added_tables.size() ? added_tables[i] : nullptr;
+      if (t == nullptr) continue;
+      std::string table_filter;
+      if (build_single_table_filter(thd, t, &table_filter)) {
+        s.serialized_filter = std::move(table_filter);
+      }
+    }
   }
 
   *out = std::move(steps);

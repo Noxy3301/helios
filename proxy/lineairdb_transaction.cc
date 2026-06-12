@@ -452,6 +452,13 @@ void LineairDBTransaction::execute_read_plan(
           {step.table_name, step_result.actual_start_key,
            step_result.actual_end_key, step.reverse_scan, step.scan_limit,
            std::move(rows), std::move(row_tids)});
+      // Negative coverage for the step filter's rejected rows: point probes
+      // into this filtered scan resolve to not-found locally instead of
+      // aborting on a cache miss (sound per alias — the filter is that
+      // alias's WHERE conjunct, so MySQL would discard the row anyway).
+      for (auto& fk : step_result.filtered_keys) {
+        record_row_cache(step.table_name, fk, false, "", 0, true);
+      }
     } else {
       // Secondary scan: primary_keys must stay 1:1 aligned with
       // secondary_keys (including not-found base rows), as the cache slicing
@@ -480,6 +487,10 @@ void LineairDBTransaction::execute_read_plan(
         cached.primary_keys.push_back(std::move(key));
       }
       push_secondary_scan_cache(std::move(cached));
+      // See the primary branch: negative coverage by primary key.
+      for (auto& fk : step_result.filtered_keys) {
+        record_row_cache(step.table_name, fk, false, "", 0, true);
+      }
     }
     step_result = LineairDBProxy::ReadPlanStepResult{};
   }
