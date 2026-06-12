@@ -577,4 +577,15 @@ md5 22/22 一致**(/tmp/compare_sf1/compare.csv、再現は bench/bin/tpch_compa
   + benchbase helios/prefetch-maxopt(6f3f578e)。push なし。
 - Codex レビュー対応済み(P0 含む 6 件)。SOTA 調査 2 本(Claude/Codex)完了・バックログ化。
 
+### [2026-06-12] エントリ28: EXPLAIN 等価性チェック(plan 品質ギャップの確証)
+
+q5 の両エンジン plan(/tmp/explain_sf1/、再現は bench/bin/tpch_explain_diff.sh):
+- **InnoDB**: orders を日付フィルタ付き full scan(rows=165k と現実的な推定)→ region⋈nation を
+  hash join → customer/lineitem へ NLJ。「大表を先にフィルタして駆動」の定石形。
+- **Helios(デフォルト cost)**: region→nation→supplier→customer→orders→lineitem の NLJ 連鎖、
+  **全段 rows=1 の誤推定**(総 cost=318!)→ 実際は数十万 probe の雪崩 = 335s の正体。
+- 確証: plan 品質ギャップ = 「per-index NDV 統計の不在」+「legacy handler cost」の合せ技。
+  両方とも旧ブランチに実証済みポートあり(NDV stats = GET_TABLE_STATS RPC + 0aa8ab7、
+  cost = HELIOS_COST_V2 較正)。バックログ⑥を「NDV stats 移植 → COST_V2 再評価」の順に具体化。
+
 (以降追記)
