@@ -1,0 +1,54 @@
+<?xml version="1.0"?>
+<parameters>
+
+    <!-- Connection details -->
+    <type>MYSQL</type>
+    <driver>com.mysql.cj.jdbc.Driver</driver>
+    <url>jdbc:mysql://localhost:3307/benchbase?rewriteBatchedStatements=true&amp;sslMode=DISABLED</url>
+    <username>root</username>
+    <password></password>
+    <isolation>TRANSACTION_SERIALIZABLE</isolation>
+    <batchsize>128</batchsize>
+    <allowPublicKeyRetrieval>true</allowPublicKeyRetrieval>
+
+    <!-- Scalefactor increases the number of subscribers (SF=1 -> 100k subscribers) -->
+    <scalefactor>1</scalefactor>
+
+    <!-- The workload: standard TATP mix
+         (weights follow transactiontypes order below:
+          DeleteCallForwarding 2, GetAccessData 35, GetNewDestination 10,
+          GetSubscriberData 35, InsertCallForwarding 2, UpdateLocation 14,
+          UpdateSubscriberData 2) -->
+    <terminals>1</terminals>
+    <works>
+        <work>
+            <time>60</time>
+            <rate>unlimited</rate>
+            <weights>2,35,10,35,2,14,2</weights>
+        </work>
+    </works>
+
+    <transactiontypes>
+        <transactiontype>
+            <name>DeleteCallForwarding</name>
+        </transactiontype>
+        <transactiontype>
+            <name>GetAccessData</name>
+        </transactiontype>
+        <transactiontype>
+            <name>GetNewDestination</name>
+        </transactiontype>
+        <transactiontype>
+            <name>GetSubscriberData</name>
+        </transactiontype>
+        <transactiontype>
+            <name>InsertCallForwarding</name>
+        </transactiontype>
+        <transactiontype>
+            <name>UpdateLocation</name>
+        </transactiontype>
+        <transactiontype>
+            <name>UpdateSubscriberData</name>
+        </transactiontype>
+    </transactiontypes>
+</parameters>

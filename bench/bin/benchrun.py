@@ -270,6 +270,16 @@ def _find_pid(pattern):
         return None
 
 
+def _start_sampler(samplers, name, argv, log_file):
+    """Start one metrics sampler; skip with a warning if the tool is missing."""
+    try:
+        f = open(log_file, "w")
+        p = subprocess.Popen(argv, stdout=f, stderr=subprocess.DEVNULL)
+        samplers.append((name, p, f))
+    except FileNotFoundError:
+        print(f"  WARNING: {argv[0]} not found, skipping {name} metrics")
+
+
 def _start_metrics(metrics_dir):
     """Start background metrics samplers. Returns list of (name, Popen, file) to stop later."""
     metrics_dir.mkdir(parents=True, exist_ok=True)
@@ -277,30 +287,23 @@ def _start_metrics(metrics_dir):
     interval = "1"
 
     # mpstat -P ALL (overall CPU per core)
-    f = open(metrics_dir / "mpstat.log", "w")
-    p = subprocess.Popen(["mpstat", "-P", "ALL", interval], stdout=f, stderr=subprocess.DEVNULL)
-    samplers.append(("mpstat", p, f))
+    _start_sampler(samplers, "mpstat", ["mpstat", "-P", "ALL", interval], metrics_dir / "mpstat.log")
 
     # vmstat (memory, IO, CPU overview)
-    f = open(metrics_dir / "vmstat.log", "w")
-    p = subprocess.Popen(["vmstat", interval], stdout=f, stderr=subprocess.DEVNULL)
-    samplers.append(("vmstat", p, f))
+    _start_sampler(samplers, "vmstat", ["vmstat", interval], metrics_dir / "vmstat.log")
 
     # sar -w (system-wide context switches/s)
-    f = open(metrics_dir / "sar-w.log", "w")
-    p = subprocess.Popen(["sar", "-w", interval], stdout=f, stderr=subprocess.DEVNULL)
-    samplers.append(("sar-w", p, f))
+    _start_sampler(samplers, "sar-w", ["sar", "-w", interval], metrics_dir / "sar-w.log")
 
     # pidstat for lineairdb-server
     server_pid = _find_pid("/build/server/lineairdb-server")
     if server_pid:
-        f = open(metrics_dir / "pidstat-server.log", "w")
-        p = subprocess.Popen(["pidstat", "-u", "-w", "-p", server_pid, interval], stdout=f, stderr=subprocess.DEVNULL)
-        samplers.append(("pidstat-server", p, f))
-
-        f = open(metrics_dir / "pidstat-server-threads.log", "w")
-        p = subprocess.Popen(["pidstat", "-t", "-u", "-p", server_pid, "5"], stdout=f, stderr=subprocess.DEVNULL)
-        samplers.append(("pidstat-server-threads", p, f))
+        _start_sampler(samplers, "pidstat-server",
+                       ["pidstat", "-u", "-w", "-p", server_pid, interval],
+                       metrics_dir / "pidstat-server.log")
+        _start_sampler(samplers, "pidstat-server-threads",
+                       ["pidstat", "-t", "-u", "-p", server_pid, "5"],
+                       metrics_dir / "pidstat-server-threads.log")
 
     # pidstat for mysqld — use PID file to get the actual mysqld process,
     # not the wrapper script that pgrep might pick up first.
@@ -311,9 +314,9 @@ def _start_metrics(metrics_dir):
     if not mysql_pid:
         mysql_pid = _find_pid("mysqld.*lineairdb")
     if mysql_pid:
-        f = open(metrics_dir / "pidstat-mysql.log", "w")
-        p = subprocess.Popen(["pidstat", "-u", "-w", "-p", mysql_pid, interval], stdout=f, stderr=subprocess.DEVNULL)
-        samplers.append(("pidstat-mysql", p, f))
+        _start_sampler(samplers, "pidstat-mysql",
+                       ["pidstat", "-u", "-w", "-p", mysql_pid, interval],
+                       metrics_dir / "pidstat-mysql.log")
 
     return samplers
 
@@ -365,6 +368,7 @@ def setup_benchmark(benchmark, config_path, mysql_host, mysql_port):
         "tpcc-np": "ANALYZE TABLE customer, district, history, item, new_order, oorder, order_line, stock, warehouse;",
         "ycsb":   "ANALYZE TABLE usertable;",
         "tpch":   "ANALYZE TABLE customer, lineitem, nation, orders, part, partsupp, region, supplier;",
+        "tatp":   "ANALYZE TABLE subscriber, access_info, special_facility, call_forwarding;",
     }.get(benchmark)
     if analyze_sql:
         print("  Refreshing MySQL stats (ANALYZE TABLE)...")
@@ -401,9 +405,9 @@ def run_execute(benchmark, config_path, terminals, result_base, prefetch=False):
     env = {**os.environ, "HELIOS_PREFETCH_PLAN": "1"} if prefetch else None
     bb_proc = subprocess.Popen(bb_cmd, cwd=BENCHBASE_DIR, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env)
     # bb_proc.pid IS the java process (no shell wrapper)
-    f = open(metrics_dir / "pidstat-bench.log", "w")
-    p = subprocess.Popen(["pidstat", "-u", "-w", "-p", str(bb_proc.pid), "1"], stdout=f, stderr=subprocess.DEVNULL)
-    samplers.append(("pidstat-bench", p, f))
+    _start_sampler(samplers, "pidstat-bench",
+                   ["pidstat", "-u", "-w", "-p", str(bb_proc.pid), "1"],
+                   metrics_dir / "pidstat-bench.log")
     print(f"  Metrics: {len(samplers)} samplers started")
 
     # Wait for BenchBase to finish
@@ -681,7 +685,7 @@ def _plot_metrics(result_base, plot_dir):
 
 def main():
     parser = argparse.ArgumentParser(description="Helios benchmark runner")
-    parser.add_argument("benchmark", choices=["tpcc", "tpcc-np", "tpch", "ycsb"], help="Benchmark type")
+    parser.add_argument("benchmark", choices=["tpcc", "tpcc-np", "tpch", "ycsb", "tatp"], help="Benchmark type")
     parser.add_argument("--terminals", type=int, default=64, help="Number of terminals (default: 64)")
     parser.add_argument("--sweep", type=str, help="Comma-separated thread counts to sweep (e.g. 1,4,16,64)")
     parser.add_argument("--scalefactor", type=float, default=1, help="Scale factor (default: 1)")
