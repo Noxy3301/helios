@@ -30,3 +30,6 @@ __pycache__/
 *.pem
 *.key
 .aws/
+
+data_innodb/
+data_innodb01/
