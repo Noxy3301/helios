@@ -1586,16 +1586,24 @@ bool LineairDBProxy::send_message_with_header(const std::string& serialized_requ
     LOG_DEBUG("SEND_MESSAGE: Received response header: sender_id=%lu, message_type=%u, payload_size=%u", 
               response_sender_id, response_message_type, response_payload_size);
 
-    // receive response payload
+    // receive response payload. A single recv() transfers at most
+    // MAX_RW_COUNT (~2GB) regardless of MSG_WAITALL, so payloads above that
+    // (TPC-H SF>=1 read-plan responses reach 3.4GB) must be drained in a loop.
     if (response_payload_size > 0) {
         serialized_response.resize(response_payload_size);
-        ssize_t payload_received = recv(socket_fd_, &serialized_response[0], response_payload_size, MSG_WAITALL);
-        if (payload_received != static_cast<ssize_t>(response_payload_size)) {
-            LOG_ERROR("SEND_MESSAGE: Failed to receive response payload, received %zd bytes instead of %u", 
-                      payload_received, response_payload_size);
-            return false;
+        size_t received_total = 0;
+        while (received_total < response_payload_size) {
+            ssize_t chunk = recv(socket_fd_, &serialized_response[received_total],
+                                 response_payload_size - received_total,
+                                 MSG_WAITALL);
+            if (chunk <= 0) {
+                LOG_ERROR("SEND_MESSAGE: Failed to receive response payload, received %zu/%u bytes",
+                          received_total, response_payload_size);
+                return false;
+            }
+            received_total += static_cast<size_t>(chunk);
         }
-        LOG_DEBUG("SEND_MESSAGE: Successfully received response payload (%zd bytes)", payload_received);
+        LOG_DEBUG("SEND_MESSAGE: Successfully received response payload (%zu bytes)", received_total);
     } else {
         LOG_DEBUG("SEND_MESSAGE: No response payload (empty response)");
         serialized_response.clear();

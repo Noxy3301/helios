@@ -652,44 +652,49 @@ struct CountSink {
 };
 
 template <class Sink>
-static void encode(const LineairDB::Protocol::TxExecuteReadPlan::Response& r,
-                   Sink& out) {
+static void encode_step(
+    const LineairDB::Protocol::TxExecuteReadPlan::StepResult& s, Sink& out) {
+    w_u8(out, s.found() ? 1 : 0);
+    w_u64(out, s.tid());
+    w_bytes(out, s.value());
+    w_bytes(out, s.actual_key());
+    w_bytes(out, s.actual_start_key());
+    w_bytes(out, s.actual_end_key());
+    w_u64(out, static_cast<uint64_t>(s.scan_keys_size()));
+    for (const auto& k : s.scan_keys()) w_bytes(out, k);
+    w_u64(out, static_cast<uint64_t>(s.scan_values_size()));
+    for (const auto& v : s.scan_values()) w_bytes(out, v);
+    w_u64(out, static_cast<uint64_t>(s.scan_tids_size()));
+    for (const auto t : s.scan_tids()) w_u64(out, t);
+    w_u64(out, static_cast<uint64_t>(s.secondary_keys_size()));
+    for (const auto& k : s.secondary_keys()) w_bytes(out, k);
+    w_u64(out, static_cast<uint64_t>(s.group_sizes_size()));
+    for (const auto g : s.group_sizes()) w_u64(out, g);
+    w_u64(out, static_cast<uint64_t>(s.group_start_keys_size()));
+    for (const auto& k : s.group_start_keys()) w_bytes(out, k);
+    w_u64(out, static_cast<uint64_t>(s.group_end_keys_size()));
+    for (const auto& k : s.group_end_keys()) w_bytes(out, k);
+}
+
+// Destructive: each step is released right after it is encoded, so the peak
+// is one payload (the flat buffer plus the not-yet-encoded tail) instead of
+// the full protobuf object plus the full flat buffer (two ~3.4GB copies at
+// TPC-H SF=1).
+static void encode_to_string(
+    LineairDB::Protocol::TxExecuteReadPlan::Response& r, std::string& out) {
+    CountSink c;
+    c.n = 8 + 1 + 1 + 8;  // magic + version + ok + count
+    for (const auto& s : r.results()) encode_step(s, c);
+    out.clear();
+    out.reserve(c.n);
     w_u64(out, kMagic);
     w_u8(out, kVersion);
     w_u8(out, r.ok() ? 1 : 0);
     w_u64(out, static_cast<uint64_t>(r.results_size()));
-    for (const auto& s : r.results()) {
-        w_u8(out, s.found() ? 1 : 0);
-        w_u64(out, s.tid());
-        w_bytes(out, s.value());
-        w_bytes(out, s.actual_key());
-        w_bytes(out, s.actual_start_key());
-        w_bytes(out, s.actual_end_key());
-        w_u64(out, static_cast<uint64_t>(s.scan_keys_size()));
-        for (const auto& k : s.scan_keys()) w_bytes(out, k);
-        w_u64(out, static_cast<uint64_t>(s.scan_values_size()));
-        for (const auto& v : s.scan_values()) w_bytes(out, v);
-        w_u64(out, static_cast<uint64_t>(s.scan_tids_size()));
-        for (const auto t : s.scan_tids()) w_u64(out, t);
-        w_u64(out, static_cast<uint64_t>(s.secondary_keys_size()));
-        for (const auto& k : s.secondary_keys()) w_bytes(out, k);
-        w_u64(out, static_cast<uint64_t>(s.group_sizes_size()));
-        for (const auto g : s.group_sizes()) w_u64(out, g);
-        w_u64(out, static_cast<uint64_t>(s.group_start_keys_size()));
-        for (const auto& k : s.group_start_keys()) w_bytes(out, k);
-        w_u64(out, static_cast<uint64_t>(s.group_end_keys_size()));
-        for (const auto& k : s.group_end_keys()) w_bytes(out, k);
+    for (int i = 0; i < r.results_size(); ++i) {
+        encode_step(r.results(i), out);
+        r.mutable_results(i)->Clear();
     }
-}
-
-static void encode_to_string(
-    const LineairDB::Protocol::TxExecuteReadPlan::Response& r,
-    std::string& out) {
-    CountSink c;
-    encode(r, c);
-    out.clear();
-    out.reserve(c.n);
-    encode(r, out);
 }
 }  // namespace flat_plan
 

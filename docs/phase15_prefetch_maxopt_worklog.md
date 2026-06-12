@@ -369,4 +369,17 @@ q1 27.5s / q3 22.5s / q5 37.2s / q12 23.0s / q14 21.1s / q19 19.8s / q20 27.8s �
 - 上限は transport frame の u32(4.29GB)へ移動。SF=1 の最大 3.4GB は収まる。SF≥2 は
   u64 framing が必要(未対応、本 doc に記録)。
 
+### [2026-06-12] エントリ18: SF=1 の 2GB/4GB/メモリ三重壁の突破過程
+
+- **r3(flat codec 後)**: q15/q17/q18/q21 が依然失敗 — 新症状 `writev failed (sent 2157825866/...)`。
+  **根因 = proxy の応答受信が単発 recv(MSG_WAITALL)**: カーネルは 1 回の recv を
+  MAX_RW_COUNT(~2.147GB)で打ち切るため、>2GB 応答で受信不足 → proxy がエラー扱い →
+  接続破棄 → server 側 writev が EPIPE。**受信ループ化で修正**。
+- **r4(recv ループ後)**: q15(46s)/q17(54.9s)/q18(44.9s)が通過。ただし **q21 で RSS 44.6GB
+  → watchdog**。server 側で「protobuf Response 3.4GB + flat string 3.4GB」の二重保持が主犯。
+- **r5 対処 = destructive encode**: flat 化しながら per-step で protobuf 側を Clear()
+  (peak ≈ 片側 3.4GB+ε に半減)。再走中(watchdog 閾値 avail<1500MB に調整)。
+- 既知の残メモリ構造(将来の伸びしろ、phase12 と同系): proxy 側 raw(3.4GB)+ decode 構造体
+  + row_cache コピー + scan entry rows コピー(~4 重)。zero-copy/共有化は未着手。
+
 (以降追記)
