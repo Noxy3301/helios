@@ -16,7 +16,7 @@ JEMALLOC="/lib/x86_64-linux-gnu/libjemalloc.so.2"
 if [ -f "$JEMALLOC" ]; then
   export LD_PRELOAD="$JEMALLOC"
   # Return freed pages to the OS promptly (see start_mysql.sh).
-  export MALLOC_CONF="${MALLOC_CONF:-background_thread:true,dirty_decay_ms:1000,muzzy_decay_ms:1000}"
+  export MALLOC_CONF="${MALLOC_CONF:-background_thread:true,dirty_decay_ms:10000,muzzy_decay_ms:10000}"
 else
   echo "WARNING: jemalloc not found, using system malloc (apt install libjemalloc2)" >&2
 fi
