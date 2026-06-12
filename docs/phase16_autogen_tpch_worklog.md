@@ -214,4 +214,53 @@ commit range keys 381→**18.4**(17.5)、validate req 38.7KB→**7.6KB**・353�
   そのまま乗る。run-once materialize(q18)は full scan staging で可。
   subquery 側の TABLE* は別インスタンスなので duplicate-leaf 検査とは衝突しない見込み。
 
+### [2026-06-12] エントリ9: q18/q20 修正 — Item 埋め込み subquery の inner-unit staging
+
+- **実装**(commit 61c08dc): autogen_read_plan_from_qep に include_inner_units を追加。
+  statement の全 inner Query_expression を再帰列挙(unit root が null なら
+  qb->join->root_access_path() にフォールバック — q18 の materialized IN はここ)し、
+  **main 木と同一 table_steps/steps に追記コンパイル** → 相関 probe(q20 の
+  lineitem 2-part probe)は既存 FES binding にそのまま乗る。inner unit の compile 失敗は
+  **rollback して非致命**(stage されない subquery が実行されれば従来どおり miss abort
+  = 退行ゼロ設計)。compile ループは compile_tree_leaves に分離(raise しない契約)。
+- 結果(SF=1, NDV+COST_V2): q18 ERROR→**33.5s OK**、q20 ERROR→**24.6s OK**。
+  q2/q4/q17/q21/q22 回帰なし。
+- Codex NDV-port レビュー(NO-GO 2件)も同コミットで反映:
+  (1) info() の row-count seeding を**非 gate に復元**(port が gate 内に巻き込み
+  default 経路を退行させていた)+ gate ON 時は cold path で THD proxy を遅延生成。
+  (2) ComputeIndexNdvInt の liveness 判定を **Silo stable-read プロトコル**
+  (double-TID bracket + lock-bit spin)に変更 — 生読みは並行 writer と race
+  (secondary PK vector の再割当で UB の可能性)。submodule 62eee2e + gitlink 8f34c74。
+  ※ stable-read 修正は次回 server 再起動から有効(本日の matrix は read-only 単線で
+  race window なし、結果有効)。
+
+### [2026-06-12] エントリ10: Track B1 区切り計測(SF=1 フル)— 22/22 + md5 全一致
+
+計測 env: HELIOS_OPT_STATS=1 + HELIOS_COST_V2=1 + prefetch + ro_novalidate(+MALLOC_CONF)。
+
+| q | before(phase15) | B1後 | q | before | B1後 |
+|---|---|---|---|---|---|
+| q1 | 30.3 | 27.0 | q12 | 27.3 | 25.6 |
+| q2 | 2.2 | 3.1 | q13 | 7.3 | **3.2** |
+| q3 | 27.2 | 24.0 | q14 | 27.2 | 24.0 |
+| q4 | 28.8 | **16.6** | q15 | 54.9 | **38.6** |
+| q5 | **335.4** | **19.3** | q16 | 3.5 | 2.2 |
+| q6 | 22.6 | 22.4 | q17 | 63.7 | **35.7** |
+| q7 | 26.0 | 20.1 | q18 | 53.4 | **33.5** |
+| q8 | 30.2 | 23.0 | q19 | 22.2 | 17.6 |
+| q9 | 37.7 | 27.7 | q20 | 35.0 | **24.6** |
+| q10 | 26.0 | **17.6** | q21 | 64.8 | **55.1** |
+| q11 | 5.7 | 3.3 | q22 | 6.9 | **2.1** |
+
+- **suite 合計 938.3s → 466.4s(2.0x)**、全22 OK、**md5 22/22 vs InnoDB 一致**。
+  OOM なし。q5 は 17x。
+- **結論: NDV(基数)× COST_V2(アクセスコスト)は併用が正解**。今後の標準計測 env に
+  HELIOS_OPT_STATS=1 + HELIOS_COST_V2=1 を追加。
+- user 指示(本日): 以降のイテレーションは **SF=0.1 基本**(転送バイト・staged 行数・RSS の
+  量的指標を厳密に見る、プラン影響変更は両 SF で EXPLAIN 確認)、**SF=1 フルは
+  トラック区切りのみ**(Track B 全完了時など)。
+- OLTP 回帰(default gates、各リロード付き): TPC-C autogen **148.6 req/s**(149.5 と
+  誤差圏)/ TATP autogen **1575.7**(1594 と誤差圏)、エラー/retry 全 0。**B1 クローズ**。
+- 次: Track B2(projection pushdown + late materialization)を SF=0.1 イテレーションで。
+
 (以降、変更・計測ごとにエントリ追記)
