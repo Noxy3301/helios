@@ -1214,16 +1214,40 @@ int ha_lineairdb::info(uint flag) {
           // would otherwise see stats.records==2 and pick full-scan + bad join
           // order. On a cache-miss, do a transaction-less GET_TABLE_STATS RPC
           // once, then seed the GLOBAL share (persists across connections).
-          // GATED (HELIOS_OPT_STATS=1, default OFF): row-count WITHOUT real
-          // per-index cardinality regresses the suite (the n-th-root rec_per_key
-          // heuristic makes the optimizer mis-treat non-unique FK joins as 1:1
-          // -> explosive join orders, e.g. Q5 107s). Keep OFF until Phase 2
-          // ships NDB-style NDV sampling. (docs/phase7_optimizer_stats.md)
+          // GATED (HELIOS_OPT_STATS=1, default OFF). Phase 2: fetch the real row
+          // count AND per-index NDV in one RPC, then seed the GLOBAL share.
+          // rec_per_key is then computed from real NDV (see set_generic_rec_per_key)
+          // instead of the n-th-root heuristic that mis-treated non-unique FK
+          // joins as 1:1 -> Q5 explosion. (docs/phase7_optimizer_stats.md)
           static const char *opt_stats_env = std::getenv("HELIOS_OPT_STATS");
           static const bool opt_stats_on =
               opt_stats_env != nullptr && opt_stats_env[0] == '1';
-          if (opt_stats_on && !find_seed()) {
-            if (ctx->proxy->fetch_table_stats()) find_seed();
+          if (opt_stats_on &&
+              (!find_seed() ||
+               !share->index_ndv_loaded_.load(std::memory_order_relaxed))) {
+            // Build index descriptors from THIS table's schema (the server is
+            // schema-light). Primary index uses "" to match GetPrimaryIndex();
+            // num_key_parts = the SECONDARY user key-parts (PK not appended).
+            std::vector<std::pair<std::string, uint32_t>> descs;
+            if (table != nullptr && table->s != nullptr) {
+              for (uint i = 0; i < table->s->keys; i++) {
+                KEY *k = table->key_info + i;
+                const bool is_pri = (i == table->s->primary_key);
+                descs.emplace_back(is_pri ? std::string()
+                                          : std::string(k->name ? k->name : ""),
+                                   k->user_defined_key_parts);
+              }
+            }
+            if (ctx->proxy->fetch_table_stats(db_table_name, descs, false)) {
+              find_seed();
+              std::lock_guard<std::mutex> g(share->index_ndv_mu_);
+              share->index_ndv_.clear();
+              for (const auto &kv : ctx->proxy->last_index_ndv()) {
+                if (kv.second.first)  // available
+                  share->index_ndv_[kv.first] = kv.second.second;
+              }
+              share->index_ndv_loaded_.store(true, std::memory_order_relaxed);
+            }
           }
         }
       }
@@ -1320,7 +1344,29 @@ int ha_lineairdb::analyze(THD *, HA_CHECK_OPT *) {
 void ha_lineairdb::set_generic_rec_per_key(KEY *key, uint key_parts,
                                            bool is_primary) {
   bool is_unique = (key->flags & HA_NOSAME);
-  // How much each additional key part narrows the result set
+
+  // Phase 2: if the server returned real NDV for this index, use it:
+  //   rec_per_key[j] = ceil(records / NDV(prefix 0..j)).
+  // NDV(prefix) = distinct values of the first j+1 key parts (exact, from the
+  // server's ordered live scan). This replaces the n-th-root heuristic that
+  // mis-estimated non-unique FK indexes as ~unique (rpk=1) -> bad join orders.
+  // Falls back to the heuristic when NDV is absent (gate off, or a non-int /
+  // string-keyed index the server marked "unavailable").
+  const std::vector<uint64_t> *ndv = nullptr;
+  if (share != nullptr &&
+      share->index_ndv_loaded_.load(std::memory_order_relaxed)) {
+    std::lock_guard<std::mutex> g(share->index_ndv_mu_);
+    auto it = share->index_ndv_.find(
+        is_primary ? std::string() : std::string(key->name ? key->name : ""));
+    if (it != share->index_ndv_.end() && it->second.size() >= key_parts) {
+      // Copy out under the lock so we can release it before set_records_per_key.
+      static thread_local std::vector<uint64_t> ndv_local;
+      ndv_local = it->second;
+      ndv = &ndv_local;
+    }
+  }
+
+  // How much each additional key part narrows the result set (heuristic fallback)
   double per_part = std::max(2.0, std::pow(static_cast<double>(stats.records), 1.0 / key_parts));
 
   for (uint j = 0; j < key_parts; j++) {
@@ -1328,6 +1374,10 @@ void ha_lineairdb::set_generic_rec_per_key(KEY *key, uint key_parts,
     if ((is_primary || is_unique) && j == key_parts - 1) {
       // All parts specified on a UNIQUE/PK -> exactly 1 row
       rpk = 1;
+    } else if (ndv != nullptr && (*ndv)[j] > 0) {
+      // Real cardinality: avg rows per distinct prefix value.
+      rpk = static_cast<ulong>(std::max<double>(
+          1.0, static_cast<double>(stats.records) / static_cast<double>((*ndv)[j])));
     } else {
       // per_part^(j+1) = total divisor for j+1 key parts
       double selectivity = std::pow(per_part, static_cast<double>(j + 1));

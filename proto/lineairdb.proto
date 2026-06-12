@@ -116,6 +116,7 @@ message GetTableStats {
     message Request {
         string ndv_table = 1;
         repeated IndexDesc ndv_indexes = 2;
+        bool ndv_force_recompute = 3;  // ANALYZE TABLE: bust the server NDV cache
     }
     // Per-index NDV result. available=false => a key-part type the server can't
     // parse (e.g. string); the proxy keeps its heuristic for that index rather

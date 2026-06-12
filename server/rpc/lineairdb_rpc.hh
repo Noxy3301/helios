@@ -5,6 +5,8 @@
 #include <mutex>
 #include <shared_mutex>
 #include <unordered_map>
+#include <vector>
+#include <utility>
 
 #include "../protocol/message.hh"
 #include "../storage/database_manager.hh"
@@ -45,6 +47,15 @@ private:
     std::shared_ptr<DatabaseManager> db_manager_;
     std::shared_ptr<TransactionManager> tx_manager_;
     std::shared_ptr<TableRowCounts> row_counts_;
+
+    // Phase 2: server-side NDV cache so repeated GET_TABLE_STATS requests do NOT
+    // re-scan the index (the ordered pass is O(rows)). Key = table\0index\0parts;
+    // value = (available, ndv-per-prefix). ANALYZE TABLE busts it via
+    // ndv_force_recompute. Static so it is shared across all per-connection
+    // LineairDBRpc instances.
+    static std::mutex ndv_cache_mu_;
+    static std::unordered_map<std::string,
+                              std::pair<bool, std::vector<uint64_t>>> ndv_cache_;
 
     // Transaction lifecycle
     void handleTxBeginTransaction(const std::string& message, std::string& result);
