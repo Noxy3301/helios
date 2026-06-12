@@ -1067,6 +1067,76 @@ bool autogen_read_plan_from_qep(
     return raise_unsupported(thd, root->type, "QEP has no stageable leaves");
   }
 
+  // SharedScan dedup: identical SELF-CONTAINED scan steps (same table/index/
+  // bounds, no bindings, no for_each, no LIMIT) are staged ONCE. A view that
+  // is materialized twice (q15's revenue0) compiles two byte-identical full
+  // scans of the base table — without folding, every row ships twice AND the
+  // duplicate step count blocks the single-step filter pushdown below. The
+  // fold keeps the EARLIEST step and records every folded alias so the filter
+  // pass can verify all aliases agree on the pushed predicate. Later-step
+  // index references (bindings/semijoins source_step) are remapped, the same
+  // pattern as the covered-step drop in execute_read_plan.
+  std::vector<std::vector<TABLE *>> step_aliases(steps.size());
+  for (size_t i = 0; i < steps.size() && i < added_tables.size(); ++i) {
+    if (added_tables[i] != nullptr) step_aliases[i].push_back(added_tables[i]);
+  }
+  {
+    const auto foldable = [](const LineairDBProxy::ReadPlanStep &s) {
+      return s.is_scan && !s.for_each && s.scan_limit == 0 &&
+             s.bindings.empty() && s.end_bindings.empty() &&
+             s.aggregate_serialized.empty() && s.semijoins.empty();
+    };
+    const auto same_step = [](const LineairDBProxy::ReadPlanStep &a,
+                              const LineairDBProxy::ReadPlanStep &b) {
+      return a.table_name == b.table_name && a.index_name == b.index_name &&
+             a.key_prefix == b.key_prefix &&
+             a.end_key_prefix == b.end_key_prefix &&
+             a.reverse_scan == b.reverse_scan &&
+             a.serialized_filter == b.serialized_filter;
+    };
+    std::vector<uint32_t> new_index(steps.size(), 0);
+    std::vector<LineairDBProxy::ReadPlanStep> folded;
+    std::vector<std::vector<TABLE *>> folded_aliases;
+    folded.reserve(steps.size());
+    folded_aliases.reserve(steps.size());
+    bool any_fold = false;
+    for (size_t j = 0; j < steps.size(); ++j) {
+      int target = -1;
+      if (foldable(steps[j])) {
+        for (size_t i = 0; i < folded.size(); ++i) {
+          if (foldable(folded[i]) && same_step(folded[i], steps[j])) {
+            target = static_cast<int>(i);
+            break;
+          }
+        }
+      }
+      if (target >= 0) {
+        new_index[j] = static_cast<uint32_t>(target);
+        for (TABLE *t : step_aliases[j])
+          folded_aliases[target].push_back(t);
+        any_fold = true;
+      } else {
+        new_index[j] = static_cast<uint32_t>(folded.size());
+        folded.push_back(std::move(steps[j]));
+        folded_aliases.push_back(std::move(step_aliases[j]));
+      }
+    }
+    steps = std::move(folded);
+    step_aliases = std::move(folded_aliases);
+    if (any_fold) {
+      for (auto &s : steps) {
+        for (auto &b : s.bindings) b.source_step = new_index[b.source_step];
+        for (auto &b : s.end_bindings)
+          b.source_step = new_index[b.source_step];
+        for (auto &sj : s.semijoins) sj.source_step = new_index[sj.source_step];
+      }
+      for (auto &kv : table_steps) {
+        if (kv.second >= 0 && kv.second < static_cast<int>(new_index.size()))
+          kv.second = static_cast<int>(new_index[kv.second]);
+      }
+    }
+  }
+
   // Scan filter pushdown (post-pass; ro_novalidate only). A table-local WHERE
   // filter is attached ONLY when the physical table backs exactly ONE plan
   // step: with multiple steps (self-join aliases, temp-source full-scan
@@ -1074,7 +1144,10 @@ bool autogen_read_plan_from_qep(
   // a row dropped by one alias's filter would silently vanish from another
   // alias's reads (q2/q20: point probes into the temp-fallback part scan).
   // With a single step, every consumer of the table sees rows filtered by
-  // that alias's OWN WHERE conjunct — rows MySQL would discard anyway.
+  // that alias's OWN WHERE conjunct — rows MySQL would discard anyway. A
+  // step folded from several aliases qualifies only when EVERY alias builds
+  // the SAME serialized predicate (identical view clones): then a dropped
+  // row is one each alias's own WHERE discards.
   if (allow_filter_pushdown) {
     std::unordered_map<std::string, int> table_step_count;
     for (const auto &s : steps) table_step_count[s.table_name]++;
@@ -1082,12 +1155,25 @@ bool autogen_read_plan_from_qep(
       auto &s = steps[i];
       if (!s.is_scan) continue;
       if (table_step_count[s.table_name] != 1) continue;
-      TABLE *t = i < added_tables.size() ? added_tables[i] : nullptr;
-      if (t == nullptr) continue;
+      const std::vector<TABLE *> &aliases = step_aliases[i];
+      if (aliases.empty()) continue;
       std::string table_filter;
-      if (build_single_table_filter(thd, t, &table_filter)) {
-        s.serialized_filter = std::move(table_filter);
+      bool agree = true;
+      for (size_t a = 0; a < aliases.size(); ++a) {
+        std::string f;
+        if (aliases[a] == nullptr ||
+            !build_single_table_filter(thd, aliases[a], &f) || f.empty()) {
+          agree = false;
+          break;
+        }
+        if (a == 0) {
+          table_filter = std::move(f);
+        } else if (f != table_filter) {
+          agree = false;
+          break;
+        }
       }
+      if (agree) s.serialized_filter = std::move(table_filter);
     }
   }
 

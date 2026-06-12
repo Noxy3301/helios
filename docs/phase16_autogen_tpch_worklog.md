@@ -480,4 +480,29 @@ ro_novalidate + projection(default ON)。InnoDB ref は 3308 に SF=1 再構築�
 single-table GROUP BY の server 集約拡張(override は top-level 限定のため未適用、
 inner-unit Phase B 化が次の大物)。scalar-source for_each、NWR pivot 16B。
 
+### [2026-06-13] エントリ20: SharedScan dedup — 同一 self-contained scan step の畳み込み(q15)
+
+- **q9 stateful 再検証の顛末**: 前夜の background check が rc=1(`benchbase.part`
+  不存在 = reload 競合)→ 早朝の再検は rc=124 timeout。真因は **mysqld が
+  HELIOS_OPT_STATS/COST_V2 なしで再起動されていた**こと(default plan + stateful
+  per-row RPC = 爆発)。標準 env で再起動後 **q9 stateful 10s MATCH**。回帰なし。
+  教訓: stateful 計測も prefetch 同様 mysqld env 必須(plan が変わる)。
+- **q15 真因**(RPC trace 実測, SF=0.1): view revenue0 の 2 回 materialize が
+  byte-identical な lineitem full scan step を 2 本 stage →
+  `plan_fetch:S:lineitem:keys=600572 ×2`、staged_rows=1,202,144。さらに
+  lineitem が 2 step を持つため single-step ルールが filter pushdown を阻止
+  (本来 ~66k 行で済む shipdate 3ヶ月窓が全行 ship ×2)。
+- **修正**(lineairdb_autogen.cc): filter post-pass の直前に SharedScan dedup
+  post-pass を追加。fold 条件 = is_scan / !for_each / scan_limit==0 /
+  bindings・end_bindings 空 / aggregate・semijoin 未付与、同一
+  (table, index, key_prefix, end_key_prefix, reverse, filter)。最初の step に
+  畳み、binding/semijoin の source_step と table_steps を index remap
+  (F1 covered-drop と同パターン)。folded alias リストを保持し、filter pass は
+  「全 alias の build_single_table_filter が byte-identical」のときのみ付与
+  (識別不能 clone = q15 view。異なる述語の self-join は不付与のまま)。
+- **結果**(SF=0.1): q15 2.10s → **0.92s**、md5 **22/22 OK**(fold は q15 のみ
+  発火、他クエリ無影響)。q18 1.65s 不変(full scan + for_each probe は別形状、
+  fold 対象外 — こちらは inner-unit Phase B 案件)。
+- 旧ブランチの SharedScan(5fab65c)は本ブランチ非祖先で未移植だったもの。
+
 (以降追記)
