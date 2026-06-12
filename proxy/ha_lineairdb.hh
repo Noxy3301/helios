@@ -488,6 +488,14 @@ public:
   void tx_clear_pushed_aggregate();
   bool tx_ro_novalidate();  // Phase-8 Phase B OCC gate
   bool tx_is_aborted();     // staging abort check for the Phase B read loop
+  // Phase-16 inner-unit aggregation: optimize-time registration of a
+  // materialized subquery's Phase-B spec (+ the exact WHERE it requires),
+  // the post-staging stamp decision, and the consumption gate around the
+  // override executor's group-row scan.
+  void tx_register_inner_aggregate(const std::string &spec,
+                                   const std::string &filter);
+  bool tx_inner_agg_stamped();
+  bool tx_begin_inner_agg_consume();
   int rnd_pos(uchar *buf, uchar *pos) override; ///< required
   void position(const uchar *record) override;  ///< required
   int info(uint flag) override;                 ///< required

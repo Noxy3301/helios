@@ -418,7 +418,9 @@ static bool serialize_or_necessary_condition(
 // nested-OR necessary-condition extraction); anchors on the query block that
 // OWNS this table's scan so drivers inside derived tables/subqueries work.
 bool build_single_table_filter(THD *thd, TABLE *table,
-                               std::string *out_serialized) {
+                               std::string *out_serialized,
+                               bool *out_exact) {
+  if (out_exact != nullptr) *out_exact = false;
   if (out_serialized == nullptr) return false;
   out_serialized->clear();
   if (thd == nullptr || table == nullptr || table->s == nullptr) return false;
@@ -432,6 +434,7 @@ bool build_single_table_filter(THD *thd, TABLE *table,
   const table_map me = table->pos_in_table_list->map();
 
   std::vector<LineairDB::Protocol::FilterExpr> serialized;
+  bool exact = true;  // refuted by any conjunct that is not serialized verbatim
 
   std::vector<Item *> conjuncts;
   if (where->type() == Item::COND_ITEM &&
@@ -447,16 +450,22 @@ bool build_single_table_filter(THD *thd, TABLE *table,
       LineairDB::Protocol::FilterExpr or_expr;
       if (serialize_or_necessary_condition(c, me, &or_expr))
         serialized.push_back(std::move(or_expr));
+      exact = false;  // necessary condition of an OR is weaker than the OR
     } else {
       std::vector<Item *> atoms;
       collect_driver_atoms(c, me, &atoms);
+      // Verbatim conjunct = exactly one atom, the conjunct itself, serialized.
+      bool verbatim = atoms.size() == 1 && atoms[0] == c;
       for (Item *a : atoms) {
         LineairDB::Protocol::FilterExpr expr;
         if (serialize_item(a, &expr)) serialized.push_back(std::move(expr));
+        else verbatim = false;
       }
+      if (!verbatim) exact = false;
     }
   }
   if (serialized.empty()) return false;
+  if (out_exact != nullptr) *out_exact = exact;
 
   LineairDB::Protocol::PushedPredicate predicate;
   predicate.set_num_columns(table->s->fields);

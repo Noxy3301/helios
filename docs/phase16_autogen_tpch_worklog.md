@@ -505,4 +505,55 @@ inner-unit Phase B 化が次の大物)。scalar-source for_each、NWR pivot 16B�
   fold 対象外 — こちらは inner-unit Phase B 案件)。
 - 旧ブランチの SharedScan(5fab65c)は本ブランチ非祖先で未移植だったもの。
 
+### [2026-06-13] エントリ21: inner-unit Phase B — materialized subquery の server 集約(q15/q18)
+
+**機構**(エントリ19の「次の大物」を実装):
+- **MySQL 側 hook**(submodule mysql-server, branch `helios/materialize-override-hook`,
+  commit bb8795e048d): MaterializeQueryBlock 冒頭で inner JOIN の
+  `override_executor_func` を確認し、設定済みなら iterator pipeline を回さず
+  override に Query_result(temp table へ hash-dedup/write/spill 同等処理で格納)を
+  渡す。ExecuteIteratorQuery の既存 bypass(sql_union.cc:1711)の materialize 版。
+  override 未設定なら byte-identical(in-tree 利用者なし)。
+- **shape gate 拡張**(ha_lineairdb.cc): (a) inner unit を許可 — 条件 =
+  uncorrelated(`qe->uncacheable==0`)+ IN/ALL/ANY は **strategy ==
+  SUBQ_MATERIALIZATION 必須**(EXISTS は per-outer-row 再実行で uncacheable では
+  弾けない — decide_subquery_strategy が push_to_engines より先に確定するのを確認
+  済)+ leaf が自 engine + ro_novalidate sysvar。(b) GROUP BY key に INT 許可
+  (ORDER BY 無しのとき; emission 順は padded-binary で数値順でない)。
+  (c) **HAVING 対応**: 「bare aggregate vs 定数」1比較のみ。q18 の inner HAVING は
+  optimize 時点で in2exists 注入条件(`<cache>(o_orderkey)=<ref_null_helper>(...)`)
+  が AND されている — `created_by_in2exists()` マーカーで注入分を strip
+  (materialization 経路は注入条件を評価しないので正当)。
+- **flow**: push_to_engine(optimize 時)で inner の Phase-B spec + 「WHERE の
+  **EXACT** 直列化」(必要条件では集約は不正 — 新 out_exact フラグ)を tx に登録
+  → autogen の **stamp pass**(fold/filter pass 後)が「step の filter ==
+  登録 filter」のときのみ spec を staged scan step に押印し決定を tx に記録 →
+  server が group rows を返却 → MaterializeIterator hook → override executor が
+  rnd_init(staging 誘発)→ 押印確認 → Phase B consume(押印無しなら Phase A で
+  生行を proxy 集約 — どちらも HAVING を評価)。
+- **server-side HAVING**(AggregateSpec.having_op/agg_index/const): SUM/COUNT の
+  group を emit 時に int128 exact 比較で落とす(q18: 150k groups → 5 行 ship)。
+  AVG は div_precincrement のため proxy 側評価のまま。
+- **隔離**(group rows は base 行ではない): range cache entry に `aggregate_rows`
+  フラグ — 集約自身の consume(pushed_aggregate gate)以外の lookup は skip、
+  row cache 登録・filtered_keys 負被覆も skip。binding 参照される step は押印
+  しない(positional read が壊れる)。semijoin source からも除外。projection は
+  押印 step を trim しない。
+- **latent bug 修正**: top-level Phase B の WHERE fullness 検査が「非空」のみで
+  部分直列化(necessary condition)を見逃していた → out_exact 必須化。
+
+**計測**(SF=0.1): q15 **2.10 → 0.92(fold)→ 0.05s**(支配項消滅、InnoDB 0.21s に
+勝利)、q18 1.65 → 1.7s(下記 plan 依存)、**md5 22/22 OK**。
+- q18 の plan は stats 状態で2形態を往復: (A) orders driver + in_optimizer probe →
+  inner scan 非参照 → **押印 OK**(server having で 5 行 ship)。(B) materialized
+  subquery driver → orders FER probe が inner scan に **binding 参照** → 押印拒否
+  (正当)→ Phase A fallback(正しいが 150k probe group が重い)。
+- **残バックログ**: (B) plan で binding を group-row column へ remap すれば probe が
+  HAVING 通過キー(SF=1 で ~57)だけになり大幅短縮(from_key slice binding の
+  column-form 化が必要)。ado: COST_V2 が (B) を選びがちな probe cost 較正。
+
+**運用ミス記録**: load 前の server 再起動を怠り q15/q18 検証がハング(DROP残渣)。
+プロトコル再確認: **load 前は必ず server 再起動**。pkill -x mysqld は 3308 ref を
+巻き込むため禁止(pid file 使用)。
+
 (以降追記)

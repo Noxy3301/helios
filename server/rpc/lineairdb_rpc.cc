@@ -279,6 +279,39 @@ static void merge_agg_groups(std::unordered_map<std::string, AggGroupState>& dst
   }
 }
 
+// Server-side HAVING (Phase-16): exact-decimal comparison of one aggregate
+// against a constant, applied at group emission. COUNT compares the row
+// count; SUM compares the int128 fixed-point sum (NULL sum — zero non-null
+// inputs — never passes, matching SQL three-valued logic).
+static bool agg_having_passes(const LineairDB::Protocol::AggregateSpec& spec,
+                              const AggGroupState& s) {
+    const uint32_t op = spec.having_op();
+    if (op == 0) return true;
+    const int ai = static_cast<int>(spec.having_agg_index());
+    if (ai < 0 || ai >= spec.aggs_size()) return false;
+    Dec val;
+    if (spec.aggs(ai).kind() == LineairDB::Protocol::AggFunc::AGG_COUNT) {
+        val.m = static_cast<__int128>(s.count[ai]);
+        val.s = 0;
+    } else {  // AGG_SUM
+        if (s.count[ai] == 0) return false;
+        val = s.sum[ai];
+    }
+    const Dec c = dec_parse(spec.having_const());
+    __int128 a = val.m, b = c.m;
+    if (val.s < c.s) a *= dec_pow10(c.s - val.s);
+    else if (c.s < val.s) b *= dec_pow10(val.s - c.s);
+    switch (op) {
+        case 1: return a > b;
+        case 2: return a >= b;
+        case 3: return a < b;
+        case 4: return a <= b;
+        case 5: return a == b;
+        case 6: return a != b;
+        default: return false;
+    }
+}
+
 // Emit one synthetic group row per group into step_result->scan_values
 // (format: [null_flags][group cols][per-agg value,count]). COUNT ships the row
 // count; SUM/AVG ship an exact decimal sum (ASCII) + non-null count. Implicit
@@ -298,6 +331,7 @@ static void emit_agg_groups(
   }
   for (auto& kv : groups) {
     AggGroupState& s = kv.second;
+    if (!agg_having_passes(spec, s)) continue;
     std::string row;
     agg_emit_field(row, std::string_view(), false);  // null_flags (empty)
     for (int g = 0; g < n_grp; ++g) agg_emit_field(row, s.key_cols[g], false);

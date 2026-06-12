@@ -120,6 +120,7 @@
 #include "sql/item.h"
 #include "sql/item_cmpfunc.h"
 #include "sql/item_func.h"
+#include "sql/item_subselect.h"               // Item_in_subselect (Phase-16)
 #include "sql/sql_class.h"
 #include "sql/sql_lex.h"
 #include "sql/sql_plugin.h"
@@ -352,6 +353,121 @@ static bool helios_plan_outputs(JOIN *join, std::vector<HeliosOut> *out) {
   return !out->empty();
 }
 
+// HAVING support (Phase-16, q18's `HAVING SUM(l_quantity) > 300` class): a
+// single comparison of one BARE aggregate against one constant. The executor
+// computes the aggregate per group (an extra non-emitted accumulator slot)
+// and filters groups before emission — in BOTH phases, so correctness never
+// depends on which phase runs.
+namespace {
+struct HeliosHavingDesc {
+  Item_sum *sum = nullptr;  // bare aggregate (nullptr = no HAVING)
+  HeliosAggKind kind = HK_COUNT;
+  Item *arg = nullptr;                 // aggregate argument (nullptr=COUNT*)
+  Item_result rtype = INT_RESULT;      // accumulation type (DECIMAL/INT only)
+  Item_func::Functype op = Item_func::EQ_FUNC;  // comparison, sum on the LEFT
+  Item *cnst = nullptr;                // constant side
+};
+}  // namespace
+
+// Validate one bare aggregate under the same rules helios_plan_outputs applies
+// to SELECT outputs. REAL aggregates are rejected here (HAVING compares via
+// exact my_decimal; double would drift).
+static bool helios_classify_having_sum(Item_sum *s, HeliosHavingDesc *out) {
+  if (s->has_wf() || s->has_subquery()) return false;
+  switch (s->sum_func()) {
+    case Item_sum::COUNT_FUNC:
+      out->kind = HK_COUNT;
+      if (s->argument_count() > 0) {
+        Item *a0 = s->arguments()[0];
+        if (!a0->const_item() || a0->is_nullable() || a0->is_null())
+          return false;
+      }
+      break;
+    case Item_sum::SUM_FUNC: out->kind = HK_SUM; break;
+    case Item_sum::AVG_FUNC: out->kind = HK_AVG; break;
+    default: return false;
+  }
+  out->rtype = s->result_type();
+  if (out->kind != HK_COUNT && out->rtype != DECIMAL_RESULT &&
+      out->rtype != INT_RESULT)
+    return false;  // REAL / STRING aggregates: not exactly comparable
+  out->arg = (s->argument_count() > 0) ? s->arguments()[0] : nullptr;
+  if (out->arg != nullptr &&
+      (out->arg->has_subquery() || out->arg->has_aggregation() ||
+       out->arg->is_non_deterministic()))
+    return false;
+  out->sum = s;
+  return true;
+}
+
+// Parse qb->having_cond(). Returns true with out->sum==nullptr when there is
+// no HAVING; false when a HAVING exists but is not the supported shape.
+static bool helios_parse_having(Query_block *qb, HeliosHavingDesc *out) {
+  *out = HeliosHavingDesc();
+  Item *h = qb->having_cond();
+  if (h == nullptr) return true;
+  // Strip the speculative IN->EXISTS conjuncts (marked created_by_in2exists):
+  // they implement the per-outer-row EXISTS strategy and are NOT part of the
+  // materialized subquery this override replaces (the offload whitelist only
+  // admits IN units whose strategy is SUBQ_MATERIALIZATION). q18's inner
+  // HAVING arrives as (sum(l_quantity) > 300) AND (<cache>(o_orderkey) =
+  // <ref_null_helper>(l_orderkey)) — only the first conjunct is the user's.
+  if (h->type() == Item::COND_ITEM &&
+      down_cast<Item_cond *>(h)->functype() == Item_func::COND_AND_FUNC) {
+    Item *user_having = nullptr;
+    for (Item &c : *down_cast<Item_cond *>(h)->argument_list()) {
+      if (c.created_by_in2exists()) continue;
+      if (user_having != nullptr) return false;  // >1 user conjunct
+      user_having = &c;
+    }
+    if (user_having == nullptr) return true;  // injected-only: no user HAVING
+    h = user_having;
+  } else if (h->created_by_in2exists()) {
+    return true;  // pure injected HAVING; the user wrote none
+  }
+  if (h->type() != Item::FUNC_ITEM) return false;
+  Item_func *f = down_cast<Item_func *>(h);
+  Item_func::Functype op = f->functype();
+  switch (op) {
+    case Item_func::EQ_FUNC: case Item_func::NE_FUNC:
+    case Item_func::LT_FUNC: case Item_func::LE_FUNC:
+    case Item_func::GT_FUNC: case Item_func::GE_FUNC: break;
+    default: return false;
+  }
+  if (f->argument_count() != 2) return false;
+  Item *a = f->arguments()[0]->real_item();  // unwrap Item_aggregate_ref
+  Item *b = f->arguments()[1]->real_item();
+  Item *sum_side = nullptr, *const_side = nullptr;
+  bool sum_on_left = false;
+  if (a->type() == Item::SUM_FUNC_ITEM && b->const_item()) {
+    sum_side = a; const_side = b; sum_on_left = true;
+  } else if (b->type() == Item::SUM_FUNC_ITEM && a->const_item()) {
+    sum_side = b; const_side = a; sum_on_left = false;
+  } else {
+    return false;
+  }
+  if (const_side->has_subquery() || const_side->is_non_deterministic())
+    return false;
+  const Item_result crt = const_side->result_type();
+  if (crt != INT_RESULT && crt != DECIMAL_RESULT) return false;
+  if (!helios_classify_having_sum(down_cast<Item_sum *>(sum_side), out))
+    return false;
+  // Normalize: sum on the LEFT of the comparison.
+  if (sum_on_left) {
+    out->op = op;
+  } else {
+    switch (op) {
+      case Item_func::LT_FUNC: out->op = Item_func::GT_FUNC; break;
+      case Item_func::LE_FUNC: out->op = Item_func::GE_FUNC; break;
+      case Item_func::GT_FUNC: out->op = Item_func::LT_FUNC; break;
+      case Item_func::GE_FUNC: out->op = Item_func::LE_FUNC; break;
+      default: out->op = op; break;  // EQ/NE symmetric
+    }
+  }
+  out->cnst = const_side;
+  return true;
+}
+
 // Conservative offload whitelist. Anything outside it leaves the normal path
 // untouched (override_executor_func stays null). MUST only return true for
 // shapes helios_override_executor can emit correct final rows for — once the
@@ -368,37 +484,104 @@ static bool helios_offloadable_shape(THD *thd, JOIN *join) {
   if (thd->lex->is_explain()) return false;
   Query_block *qb = join->query_block;
   if (qb == nullptr) return false;
-  // Top-level query block ONLY. override_executor_func is honored solely by the
-  // top-level Query_expression::ExecuteIteratorQuery (sql_union.cc:1711); a
-  // subquery's or derived table's JOIN must never be hijacked (e.g. TPC-H q17/
-  // q20 carry a single-table aggregate correlated subquery that otherwise
-  // matches this whitelist and would be mis-executed). outer_query_block()==null
-  // means this is the statement's outermost block.
-  if (qb->outer_query_block() != nullptr) return false;
   // No UNION / set operations: the enclosing query expression must be a plain
   // single query block (is_simple lives on Query_expression, not Query_block).
   Query_expression *qe = qb->master_query_expression();
   if (qe == nullptr || !qe->is_simple()) return false;
+  // Top-level blocks are taken over via Query_expression::
+  // ExecuteIteratorQuery (sql_union.cc:1711). An INNER unit's JOIN may be
+  // taken over too (Phase-16) — its rows are stored by the MaterializeIterator
+  // hook — but ONLY when the unit is UNCORRELATED and executed once
+  // (uncacheable==0): a correlated subquery (TPC-H q17/q20's per-outer-row
+  // aggregate) re-executes per outer row with outer references our executor
+  // cannot see, and in_to_exists rewrites mark the unit uncacheable too.
+  const bool inner_unit = qb->outer_query_block() != nullptr;
+  static const bool aggdbg = std::getenv("HELIOS_FE_DEBUG") != nullptr;
+  if (inner_unit && qe->uncacheable != 0) {
+    if (aggdbg)
+      std::fprintf(stderr, "[AGGPD] inner reject: uncacheable=%x\n",
+                   (unsigned)qe->uncacheable);
+    return false;
+  }
+  // IN/ALL/ANY subquery units: ONLY the materialization strategy executes the
+  // unit once through MaterializeIterator (where the hook consumes our group
+  // rows). The EXISTS strategy re-executes per outer row with the injected
+  // in2exists conditions active — and uncacheable does NOT flag it (the
+  // re-execution is driven by Item_in_optimizer, not the cache bits). The
+  // strategy is final here: decide_subquery_strategy() runs before
+  // JOIN::push_to_engines() (sql_optimizer.cc).
+  if (inner_unit && qe->item != nullptr) {
+    switch (qe->item->substype()) {
+      case Item_subselect::IN_SUBS:
+      case Item_subselect::ALL_SUBS:
+      case Item_subselect::ANY_SUBS: {
+        auto *in_pred = down_cast<Item_in_subselect *>(qe->item);
+        if (in_pred->strategy != Subquery_strategy::SUBQ_MATERIALIZATION) {
+          if (aggdbg)
+            std::fprintf(stderr, "[AGGPD] inner reject: IN strategy=%d\n",
+                         (int)in_pred->strategy);
+          return false;
+        }
+        break;
+      }
+      case Item_subselect::SINGLEROW_SUBS:
+        break;  // uncorrelated scalar: executes once via unit->execute
+      default:
+        if (aggdbg)
+          std::fprintf(stderr, "[AGGPD] inner reject: substype=%d\n",
+                       (int)qe->item->substype());
+        return false;  // EXISTS_SUBS and friends: per-outer-row semantics
+    }
+  }
   if (qb->leaf_table_count != 1) return false;     // exactly one base table
   if (!qb->is_grouped()) return false;             // GROUP BY or aggregate funcs
   if (qb->is_distinct()) return false;             // DISTINCT not handled
-  if (qb->having_cond() != nullptr) return false;  // HAVING not handled
   if (qb->has_limit()) return false;               // LIMIT/OFFSET handled later
   if (qb->olap != UNSPECIFIED_OLAP_TYPE) return false;  // no ROLLUP
   if (qb->has_windows()) return false;                  // no window functions
+  // HAVING: one bare-aggregate-vs-constant comparison (q18's
+  // SUM(l_quantity) > 300); anything else stays on the normal path. The
+  // executor evaluates it per group in BOTH phases.
+  if (qb->having_cond() != nullptr) {
+    HeliosHavingDesc hd;
+    if (!helios_parse_having(qb, &hd)) {
+      if (aggdbg && inner_unit)
+        std::fprintf(stderr, "[AGGPD] inner reject: having shape\n");
+      return false;
+    }
+  }
 
-  // GROUP BY items: restrict to plain string base columns (q1's
-  // l_returnflag/l_linestatus). String keys are encoded collation-correctly via
-  // strnxfrm in the executor. Numeric/temporal grouping would need an
-  // order-preserving typed key encoding and is deferred.
+  // GROUP BY items: plain base columns, STRING or INT result. String keys are
+  // encoded collation-correctly via strnxfrm in the executor. INT keys (q15's
+  // l_suppkey / q18's l_orderkey) group correctly by the same byte-equality,
+  // but their padded-binary emission order is not numeric order — only
+  // acceptable when no ORDER BY rides on the override.
   std::vector<Item *> gitems;
   for (ORDER *g = qb->group_list.first; g != nullptr; g = g->next) {
     Item *gi = *g->item;
     if (gi->type() != Item::FIELD_ITEM) return false;
-    if (gi->result_type() != STRING_RESULT) return false;
+    const Item_result grt = gi->result_type();
+    if (grt != STRING_RESULT && grt != INT_RESULT) return false;
+    if (grt == INT_RESULT && qb->order_list.elements != 0) return false;
     if (gi->is_temporal() || gi->data_type() == MYSQL_TYPE_JSON) return false;
     if (gi->has_aggregation() || gi->has_subquery()) return false;
     gitems.push_back(gi);
+  }
+  // Inner units additionally require: the single leaf is OUR engine (the
+  // hook fires per matching leaf, but stay defensive) and the read-only
+  // no-validate prefetch scope — the staged plan is how group rows travel,
+  // and OLTP/stateful statements must never be hijacked.
+  if (inner_unit) {
+    TABLE *lt = qb->leaf_tables != nullptr ? qb->leaf_tables->table : nullptr;
+    if (lt == nullptr || lt->file == nullptr ||
+        lt->file->ht != lineairdb_hton) {
+      if (aggdbg) std::fprintf(stderr, "[AGGPD] inner reject: leaf engine\n");
+      return false;
+    }
+    if (!down_cast<ha_lineairdb *>(lt->file)->tx_ro_novalidate()) {
+      if (aggdbg) std::fprintf(stderr, "[AGGPD] inner reject: not ro_novalidate\n");
+      return false;
+    }
   }
 
   // Every output column must be executable by the proxy aggregator. Non-agg
@@ -494,6 +677,109 @@ static bool helios_serialize_arith(const Item *it,
   }
 }
 
+// Phase-B spec builder, shared by the override executor (top-level) and the
+// optimize-time inner-unit registration so the two can never diverge. Returns
+// true and fills the serialized AggregateSpec + the output->spec mappings
+// when EVERY output column (and the HAVING aggregate, if any) is computable
+// server-side under the read-only no-validate scope.
+static bool helios_build_phase_b_spec(
+    TABLE *t, bool ro_novalidate, const std::vector<HeliosOut> &outs,
+    const std::vector<Item *> &gitems, const HeliosHavingDesc &having,
+    std::vector<int> *out_agg, std::vector<int> *out_grp, int *h_agg_pos,
+    std::string *spec_ser) {
+  const size_t n = outs.size();
+  out_agg->assign(n, -1);
+  out_grp->assign(n, -1);
+  *h_agg_pos = -1;
+  spec_ser->clear();
+  // OCC soundness (Codex P1): group rows carry synthetic key/tid, so per-row
+  // TID / range validation cannot catch concurrent writes — read-only
+  // no-validate scope only.
+  if (!ro_novalidate) return false;
+  // Nullable GROUP BY columns (Codex P1): the server's extract_value_column
+  // cannot distinguish NULL from empty.
+  for (Item *gi : gitems)
+    if (gi->is_nullable()) return false;
+  int agg_pos = 0;
+  for (size_t c = 0; c < n; ++c) {
+    if (outs[c].kind == HK_PASS) {
+      Field *of = down_cast<Item_field *>(outs[c].orig)->field;
+      for (size_t g = 0; g < gitems.size(); ++g)
+        if (down_cast<Item_field *>(gitems[g])->field == of) {
+          (*out_grp)[c] = static_cast<int>(g);
+          break;
+        }
+      if ((*out_grp)[c] < 0) return false;  // passthrough not a group col
+    } else {
+      (*out_agg)[c] = agg_pos++;
+    }
+  }
+  LineairDB::Protocol::AggregateSpec spec;
+  spec.set_num_columns(t->s->fields);
+  for (Item *gi : gitems)
+    spec.add_group_columns(down_cast<Item_field *>(gi)->field->field_index());
+  for (size_t c = 0; c < n; ++c) {
+    if (outs[c].kind == HK_PASS) continue;
+    auto *af = spec.add_aggs();
+    if (outs[c].kind == HK_COUNT) {
+      af->set_kind(LineairDB::Protocol::AggFunc::AGG_COUNT);
+    } else {
+      af->set_kind(outs[c].kind == HK_SUM
+                       ? LineairDB::Protocol::AggFunc::AGG_SUM
+                       : LineairDB::Protocol::AggFunc::AGG_AVG);
+      // Only DECIMAL-result SUM/AVG go server-side (exact int128 path).
+      if (outs[c].rtype != DECIMAL_RESULT || outs[c].arg == nullptr ||
+          !helios_serialize_arith(outs[c].arg, af->mutable_arg()))
+        return false;
+    }
+    af->set_result_scale(0);
+  }
+  if (having.sum != nullptr) {
+    // The HAVING aggregate rides as one extra (non-emitted) agg column.
+    auto *af = spec.add_aggs();
+    if (having.kind == HK_COUNT) {
+      af->set_kind(LineairDB::Protocol::AggFunc::AGG_COUNT);
+    } else {
+      af->set_kind(having.kind == HK_SUM
+                       ? LineairDB::Protocol::AggFunc::AGG_SUM
+                       : LineairDB::Protocol::AggFunc::AGG_AVG);
+      if (having.rtype != DECIMAL_RESULT || having.arg == nullptr ||
+          !helios_serialize_arith(having.arg, af->mutable_arg()))
+        return false;
+    }
+    af->set_result_scale(0);
+    *h_agg_pos = spec.aggs_size() - 1;
+    // Server-side HAVING for SUM/COUNT: the server drops failing groups at
+    // emission, so only passing groups ship (q18: 1.5M -> ~57). AVG keeps
+    // proxy-side filtering (div_precincrement semantics live here). The
+    // executor's having_passes re-checks the survivors either way.
+    if (having.kind != HK_AVG && having.cnst != nullptr) {
+      uint32_t hop = 0;
+      switch (having.op) {
+        case Item_func::GT_FUNC: hop = 1; break;
+        case Item_func::GE_FUNC: hop = 2; break;
+        case Item_func::LT_FUNC: hop = 3; break;
+        case Item_func::LE_FUNC: hop = 4; break;
+        case Item_func::EQ_FUNC: hop = 5; break;
+        case Item_func::NE_FUNC: hop = 6; break;
+        default: hop = 0; break;
+      }
+      my_decimal cval;
+      my_decimal *cp = having.cnst->val_decimal(&cval);
+      if (hop != 0 && cp != nullptr && !having.cnst->null_value) {
+        String cstr;
+        if (my_decimal2string(E_DEC_FATAL_ERROR, cp, &cstr) == E_DEC_OK) {
+          spec.set_having_op(hop);
+          spec.set_having_agg_index(static_cast<uint32_t>(*h_agg_pos));
+          spec.set_having_const(std::string(cstr.ptr(), cstr.length()));
+        }
+      }
+    }
+  }
+  spec.SerializeToString(spec_ser);
+  return true;
+}
+
 // Override executor. Contract (sql_union.cc:1697-1729): the caller has already
 // sent result-set metadata and will send EOF; here we only emit data rows via
 // query_result->send_data(thd, items) and set join->send_records. PS re-exec
@@ -520,6 +806,58 @@ static bool helios_override_executor(JOIN *join, Query_result *query_result) {
     gitems.push_back(*g->item);
   const bool implicit = gitems.empty();
 
+  // HAVING: parsed shape was verified by the offload whitelist; re-derive it
+  // (deterministic) and evaluate the constant once. A NULL constant filters
+  // every group (SQL: comparison with NULL is never TRUE).
+  HeliosHavingDesc having;
+  if (!helios_parse_having(qb, &having)) {
+    my_error(ER_INTERNAL_ERROR, MYF(0), "helios having shape diverged");
+    return true;
+  }
+  const bool has_having = having.sum != nullptr;
+  // Accumulator slots per group: n visible outputs + 1 hidden HAVING slot.
+  const size_t n_slots = n + (has_having ? 1 : 0);
+  my_decimal having_const;
+  bool having_const_null = false;
+  if (has_having) {
+    my_decimal *d = having.cnst->val_decimal(&having_const);
+    having_const_null = having.cnst->null_value || d == nullptr;
+    if (d != nullptr && d != &having_const) having_const = *d;
+  }
+  const int having_div_inc =
+      static_cast<int>(thd->variables.div_precincrement);
+  // Group filter shared by both phases; slot `n` holds the HAVING aggregate.
+  const auto having_passes = [&](std::vector<HeliosAccum> &g) -> bool {
+    if (!has_having) return true;
+    if (having_const_null) return false;
+    HeliosAccum &a = g[n];
+    my_decimal val;
+    if (having.kind == HK_COUNT) {
+      int2my_decimal(E_DEC_FATAL_ERROR, a.cnt, false, &val);
+    } else {
+      if (a.cnt == 0) return false;  // SUM/AVG over no rows -> NULL -> filtered
+      if (having.kind == HK_AVG) {
+        my_decimal cnt_dec;
+        int2my_decimal(E_DEC_FATAL_ERROR, a.cnt, false, &cnt_dec);
+        if (!a.dec_init) my_decimal_set_zero(&a.dec);
+        my_decimal_div(E_DEC_FATAL_ERROR, &val, &a.dec, &cnt_dec,
+                       having_div_inc);
+      } else {
+        val = a.dec;
+      }
+    }
+    const int cmp = my_decimal_cmp(&val, &having_const);
+    switch (having.op) {
+      case Item_func::GT_FUNC: return cmp > 0;
+      case Item_func::GE_FUNC: return cmp >= 0;
+      case Item_func::LT_FUNC: return cmp < 0;
+      case Item_func::LE_FUNC: return cmp <= 0;
+      case Item_func::EQ_FUNC: return cmp == 0;
+      case Item_func::NE_FUNC: return cmp != 0;
+      default: return false;
+    }
+  };
+
   // ---- Phase-8 Phase B: server-side aggregation ----------------------------
   // When every aggregate in this query is one the server can compute (B0:
   // COUNT(*) only), push GROUP BY + the aggregates to the server: it returns one
@@ -527,85 +865,80 @@ static bool helios_override_executor(JOIN *join, Query_result *query_result) {
   // them here. Single server + single scan ⇒ groups are final; we still merge by
   // collation key (cheap, robust to any batching) and emit in sorted order.
   {
-    bool server_b = true;
+    bool kinds_ok = true;
     for (const HeliosOut &o : outs)
       if (o.kind != HK_PASS && o.kind != HK_COUNT &&
-          o.kind != HK_SUM && o.kind != HK_AVG) server_b = false;
-    // OCC soundness (Codex P1): the server returns only group rows (synthetic
-    // key/tid), so range_versions/per-row TID validation cannot catch a
-    // concurrent UPDATE of an aggregated column. Restrict server-side
-    // aggregation to the read-only no-validate scope (no concurrent writers,
-    // the TPC-H measurement mode); otherwise fall back to Phase A, which scans
-    // every base row and records the read footprint normally.
-    if (!down_cast<ha_lineairdb *>(t->file)->tx_ro_novalidate()) server_b = false;
-    // Nullable GROUP BY columns (Codex P1): the server's extract_value_column
-    // cannot distinguish NULL from empty, so reject nullable group keys here
-    // (Phase A handles them correctly with its own NULL marker).
-    for (Item *gi : gitems)
-      if (gi->is_nullable()) server_b = false;
-    std::vector<int> out_agg(n, -1), out_grp(n, -1);
-    if (server_b) {
-      int agg_pos = 0;
-      for (size_t c = 0; c < n && server_b; ++c) {
-        if (outs[c].kind == HK_PASS) {
-          Field *of = down_cast<Item_field *>(outs[c].orig)->field;
-          for (size_t g = 0; g < gitems.size(); ++g)
-            if (down_cast<Item_field *>(gitems[g])->field == of) { out_grp[c] = (int)g; break; }
-          if (out_grp[c] < 0) server_b = false;  // passthrough not a group col
-        } else {
-          out_agg[c] = agg_pos++;
-        }
+          o.kind != HK_SUM && o.kind != HK_AVG) kinds_ok = false;
+    ha_lineairdb *hl = down_cast<ha_lineairdb *>(t->file);
+    const bool inner_unit = qb->outer_query_block() != nullptr;
+    std::vector<int> out_agg, out_grp;
+    int h_agg_pos = -1;
+    std::string spec_ser;
+    const bool server_b =
+        kinds_ok &&
+        helios_build_phase_b_spec(t, hl->tx_ro_novalidate(), outs, gitems,
+                                  having, &out_agg, &out_grp, &h_agg_pos,
+                                  &spec_ser);
+    if (std::getenv("HELIOS_FE_DEBUG"))
+      std::fprintf(stderr,
+                   "[AGGSRV] server_b=%d inner=%d having=%d ser_bytes=%zu n_out=%zu\n",
+                   (int)server_b, (int)inner_unit, (int)has_having,
+                   spec_ser.size(), n);
+    if (inner_unit) {
+      // Inner units: the spec was registered at optimize time; the autogen
+      // stamp pass decided DURING PLAN STAGING whether the staged step really
+      // returns group rows (the registered filter must have matched the
+      // step's attached one). Staging fires on the first table access —
+      // trigger it via rnd_init, then read the decision.
+      int err = t->file->ha_rnd_init(true);
+      if (err) {
+        t->file->print_error(err, MYF(0));
+        return true;
       }
-    }
-    if (server_b) {
-      LineairDB::Protocol::AggregateSpec spec;
-      spec.set_num_columns(t->s->fields);
-      for (Item *gi : gitems)
-        spec.add_group_columns(down_cast<Item_field *>(gi)->field->field_index());
-      for (size_t c = 0; c < n && server_b; ++c) {
-        if (outs[c].kind == HK_PASS) continue;
-        auto *af = spec.add_aggs();
-        if (outs[c].kind == HK_COUNT) {
-          af->set_kind(LineairDB::Protocol::AggFunc::AGG_COUNT);
-        } else {  // HK_SUM / HK_AVG: serialize the exact-decimal arg expression
-          af->set_kind(outs[c].kind == HK_SUM
-                           ? LineairDB::Protocol::AggFunc::AGG_SUM
-                           : LineairDB::Protocol::AggFunc::AGG_AVG);
-          // Only DECIMAL-result SUM/AVG go server-side (exact int128 path);
-          // REAL aggregates stay on Phase A.
-          if (outs[c].rtype != DECIMAL_RESULT || outs[c].arg == nullptr ||
-              !helios_serialize_arith(outs[c].arg, af->mutable_arg())) {
-            server_b = false;
-            break;
-          }
-        }
-        af->set_result_scale(0);
+      if (hl->tx_is_aborted()) {
+        t->file->ha_rnd_end();
+        my_error(ER_LOCK_DEADLOCK, MYF(0));
+        return true;
       }
-      if (!server_b) {
-        // Spec not fully server-aggregatable — fall through to Phase A. (No tx
-        // state was set yet.)
+      if (!hl->tx_inner_agg_stamped()) {
+        // Raw rows were staged — aggregate them proxy-side instead.
+        t->file->ha_rnd_end();
         goto phase_a_fallthrough;
       }
-      std::string spec_ser;
-      spec.SerializeToString(&spec_ser);
-      if (std::getenv("HELIOS_FE_DEBUG"))
-        std::fprintf(stderr, "[AGGSRV] spec: groups=%d aggs=%d ser_bytes=%zu n_out=%zu\n",
-                     spec.group_columns_size(), spec.aggs_size(), spec_ser.size(), n);
-      ha_lineairdb *hl = down_cast<ha_lineairdb *>(t->file);
+      if (!server_b || !hl->tx_begin_inner_agg_consume()) {
+        // Stamped means the step ships GROUP rows; without a consumable spec
+        // Phase A would aggregate group rows as base rows. Fail loudly.
+        t->file->ha_rnd_end();
+        my_error(ER_INTERNAL_ERROR, MYF(0),
+                 "helios inner agg stamped but unconsumable");
+        return true;
+      }
+    } else {
+      if (!server_b) {
+        // Spec not fully server-aggregatable — fall through to Phase A. (No
+        // tx state was set yet.)
+        goto phase_a_fallthrough;
+      }
       if (!hl->tx_set_pushed_aggregate(spec_ser)) {
         // WHERE not fully pushable -> the server would aggregate unfiltered
         // rows; Phase A evaluates the WHERE locally instead.
         goto phase_a_fallthrough;
       }
-
       int err = t->file->ha_rnd_init(true);
       if (err) {
         hl->tx_clear_pushed_aggregate();
         t->file->print_error(err, MYF(0));
         return true;
       }
+    }
+    {
       const size_t ng = gitems.size();
-      const int n_aggs = spec.aggs_size();
+      const int n_aggs =
+          static_cast<int>(std::count_if(outs.begin(), outs.end(),
+                                         [](const HeliosOut &o) {
+                                           return o.kind != HK_PASS;
+                                         })) +
+          (has_having ? 1 : 0);
 
       auto parse_fields = [](std::string_view row, std::vector<std::string_view> *fv,
                              std::vector<bool> *nul) -> bool {
@@ -663,7 +996,7 @@ static bool helios_override_executor(JOIN *join, Query_result *query_result) {
         std::vector<HeliosAccum> *grp;
         if (it == groups.end()) {
           auto &v = groups[key];
-          v.resize(n);
+          v.resize(n_slots);
           for (size_t c = 0; c < n; ++c)
             if (outs[c].kind == HK_PASS) {
               std::string_view gv = fv[1 + out_grp[c]];
@@ -675,13 +1008,14 @@ static bool helios_override_executor(JOIN *join, Query_result *query_result) {
         } else {
           grp = &it->second;
         }
-        for (size_t c = 0; c < n; ++c) {
-          const HeliosOut &o = outs[c];
-          if (o.kind == HK_PASS) continue;
-          const size_t vi = 1 + ng + 2 * out_agg[c];  // value column in fv
-          const size_t ci = vi + 1;                    // count column in fv
-          HeliosAccum &a = (*grp)[c];
-          if (o.kind == HK_COUNT) {
+        // One accumulation routine for visible aggregates (slot c, spec
+        // position out_agg[c]) and the hidden HAVING aggregate (slot n, spec
+        // position h_agg_pos).
+        const auto accumulate_agg = [&](HeliosAccum &a, HeliosAggKind kind,
+                                        int agg_pos) {
+          const size_t vi = 1 + ng + 2 * agg_pos;  // value column in fv
+          const size_t ci = vi + 1;                // count column in fv
+          if (kind == HK_COUNT) {
             if (vi < fv.size() && !nul[vi]) {
               std::string s(fv[vi]);
               a.cnt += std::strtoll(s.c_str(), nullptr, 10);
@@ -703,7 +1037,14 @@ static bool helios_override_executor(JOIN *join, Query_result *query_result) {
               a.cnt += std::strtoll(s.c_str(), nullptr, 10);
             }
           }
+        };
+        for (size_t c = 0; c < n; ++c) {
+          const HeliosOut &o = outs[c];
+          if (o.kind == HK_PASS) continue;
+          accumulate_agg((*grp)[c], o.kind, out_agg[c]);
         }
+        if (has_having)
+          accumulate_agg((*grp)[n], having.kind, h_agg_pos);
       }
       t->file->ha_rnd_end();
       hl->tx_clear_pushed_aggregate();
@@ -720,6 +1061,7 @@ static bool helios_override_executor(JOIN *join, Query_result *query_result) {
       const int div_inc = static_cast<int>(thd->variables.div_precincrement);
       for (auto &kv : groups) {
         std::vector<HeliosAccum> &g = kv.second;
+        if (!having_passes(g)) continue;
         for (size_t c = 0; c < n; ++c) {
           Item_cache *cache = down_cast<Item_cache *>(row[c]);
           const HeliosOut &o = outs[c];
@@ -727,7 +1069,34 @@ static bool helios_override_executor(JOIN *join, Query_result *query_result) {
           if (o.kind == HK_PASS) {
             if (a.p_null) { cache->store_null(); continue; }
             cache->null_value = false;
-            down_cast<Item_cache_str *>(cache)->store_value(cache, a.p_str);
+            // The group key arrived as raw column bytes (p_str); the cache
+            // cell is typed after the ORIGINAL item (Item_cache_int for an
+            // INT key like q18's l_orderkey), so convert per result type.
+            switch (o.rtype) {
+              case INT_RESULT: {
+                std::string s(a.p_str.ptr(), a.p_str.length());
+                down_cast<Item_cache_int *>(cache)->store_value(
+                    cache, std::strtoll(s.c_str(), nullptr, 10));
+                break;
+              }
+              case DECIMAL_RESULT: {
+                my_decimal d;
+                str2my_decimal(E_DEC_FATAL_ERROR, a.p_str.ptr(),
+                               a.p_str.length(), &my_charset_bin, &d);
+                down_cast<Item_cache_decimal *>(cache)->store_value(cache, &d);
+                break;
+              }
+              case REAL_RESULT: {
+                std::string s(a.p_str.ptr(), a.p_str.length());
+                down_cast<Item_cache_real *>(cache)->store_value(
+                    cache, std::strtod(s.c_str(), nullptr));
+                break;
+              }
+              default:
+                down_cast<Item_cache_str *>(cache)->store_value(cache,
+                                                                a.p_str);
+                break;
+            }
           } else if (o.kind == HK_COUNT) {
             cache->null_value = false;
             down_cast<Item_cache_int *>(cache)->store_value(cache, a.cnt);
@@ -762,7 +1131,7 @@ phase_a_fallthrough:;
   std::vector<HeliosAccum> *implicit_grp = nullptr;
   if (implicit) {  // implicit grouping emits exactly one row even over 0 input rows
     auto &v = groups[std::string()];
-    v.resize(n);
+    v.resize(n_slots);
     implicit_grp = &v;
   }
 
@@ -817,7 +1186,7 @@ phase_a_fallthrough:;
         grp = &it->second;
       } else {
         auto &v = groups[key];
-        v.resize(n);
+        v.resize(n_slots);
         // Capture passthrough columns once, from this first row of the group.
         for (size_t c = 0; c < n; ++c) {
           if (outs[c].kind != HK_PASS) continue;
@@ -867,6 +1236,23 @@ phase_a_fallthrough:;
         }
       }
     }
+    if (has_having) {  // hidden HAVING aggregate (slot n); DECIMAL/INT only
+      HeliosAccum &a = (*grp)[n];
+      if (having.kind == HK_COUNT) {
+        ++a.cnt;
+      } else {
+        my_decimal *d = having.arg->val_decimal(&dec_buf);
+        if (!having.arg->null_value && d != nullptr) {
+          if (!a.dec_init) { a.dec = *d; a.dec_init = true; }
+          else {
+            my_decimal tmp;
+            my_decimal_add(E_DEC_FATAL_ERROR, &tmp, &a.dec, d);
+            a.dec = tmp;
+          }
+          ++a.cnt;
+        }
+      }
+    }
   }
   const int end_err = t->file->ha_rnd_end();
   if (err != HA_ERR_END_OF_FILE) { t->file->print_error(err, MYF(0)); return true; }
@@ -890,6 +1276,7 @@ phase_a_fallthrough:;
 
   for (auto &kv : groups) {  // std::map => ascending group-key order
     std::vector<HeliosAccum> &g = kv.second;
+    if (!having_passes(g)) continue;
     for (size_t c = 0; c < n; ++c) {
       Item_cache *cache = down_cast<Item_cache *>(row[c]);
       const HeliosOut &o = outs[c];
@@ -938,12 +1325,56 @@ phase_a_fallthrough:;
   return false;
 }
 
+// Best-effort optimize-time Phase-B registration for an offloadable INNER
+// unit: build the full spec (visible aggregates + HAVING) and verify the
+// inner WHERE is EXACTLY pushable, then register both on the tx. The autogen
+// stamp pass later attaches the spec to the staged scan step (group rows);
+// without a registration the override still runs, aggregating the staged raw
+// rows proxy-side (Phase A).
+static void helios_register_inner_aggregate(THD *thd, JOIN *join) {
+  Query_block *qb = join->query_block;
+  TABLE *t = qb->leaf_tables->table;
+  std::vector<HeliosOut> outs;
+  if (!helios_plan_outputs(join, &outs)) return;
+  std::vector<Item *> gitems;
+  for (ORDER *g = qb->group_list.first; g != nullptr; g = g->next)
+    gitems.push_back(*g->item);
+  HeliosHavingDesc having;
+  if (!helios_parse_having(qb, &having)) return;
+  ha_lineairdb *hl = down_cast<ha_lineairdb *>(t->file);
+  std::vector<int> out_agg, out_grp;
+  int h_agg_pos = -1;
+  std::string spec_ser;
+  if (!helios_build_phase_b_spec(t, hl->tx_ro_novalidate(), outs, gitems,
+                                 having, &out_agg, &out_grp, &h_agg_pos,
+                                 &spec_ser))
+    return;
+  // Group rows cannot be re-filtered by MySQL: the WHERE must be EXACTLY the
+  // filter the staged step will carry. No WHERE = no filter required.
+  std::string filter_ser;
+  if (qb->where_cond() != nullptr) {
+    bool exact = false;
+    if (!build_single_table_filter(thd, t, &filter_ser, &exact) ||
+        filter_ser.empty() || !exact)
+      return;
+  }
+  hl->tx_register_inner_aggregate(spec_ser, filter_ser);
+  if (std::getenv("HELIOS_FE_DEBUG"))
+    std::fprintf(stderr, "[AGGPD] inner unit registered (spec=%zuB filter=%zuB)\n",
+                 spec_ser.size(), filter_ser.size());
+}
+
 static int lineairdb_push_to_engine(THD *thd, AccessPath * /*root_path*/,
                                     JOIN *join) {
   if (!helios_agg_pushdown_enabled()) return 0;
   if (!helios_offloadable_shape(thd, join)) return 0;
   if (std::getenv("HELIOS_FE_DEBUG"))
-    std::fprintf(stderr, "[AGGPD] installing override_executor_func\n");
+    std::fprintf(stderr, "[AGGPD] installing override_executor_func%s\n",
+                 join->query_block->outer_query_block() != nullptr
+                     ? " (inner unit)"
+                     : "");
+  if (join->query_block->outer_query_block() != nullptr)
+    helios_register_inner_aggregate(thd, join);
   join->override_executor_func = &helios_override_executor;
   return 0;
 }
@@ -1800,11 +2231,45 @@ bool ha_lineairdb::tx_set_pushed_aggregate(const std::string &s) {
     Query_block *qb = ha_thd()->lex->unit->global_parameters();
     if (qb != nullptr) agg_where = qb->where_cond();
   }
-  if (agg_where != nullptr && tx->get_pushed_filter().empty()) {
-    return false;  // WHERE exists but could not be fully serialized
+  if (agg_where != nullptr) {
+    if (tx->get_pushed_filter().empty()) {
+      return false;  // WHERE exists but could not be serialized at all
+    }
+    // Non-emptiness is NOT fullness: build_single_table_filter returns the
+    // table-local NECESSARY condition, which may be weaker than the WHERE
+    // (an unserializable conjunct silently drops). Rows the dropped conjunct
+    // excludes would then join the aggregate with no MySQL recheck possible.
+    // Require EXACT (verbatim, complete) serialization.
+    bool exact = false;
+    std::string probe;
+    if (!build_single_table_filter(ha_thd(), table, &probe, &exact) || !exact) {
+      tx->clear_pushed_filter();
+      return false;
+    }
   }
   tx->set_pushed_aggregate(s);
   return true;
+}
+
+// Phase-16 inner-unit aggregation wrappers.
+void ha_lineairdb::tx_register_inner_aggregate(const std::string &spec,
+                                               const std::string &filter) {
+  auto tx = get_transaction(ha_thd());
+  if (tx == nullptr) return;
+  tx->choose_table(db_table_name);
+  tx->register_inner_aggregate_current(spec, filter);
+}
+bool ha_lineairdb::tx_inner_agg_stamped() {
+  auto tx = get_transaction(ha_thd());
+  if (tx == nullptr) return false;
+  tx->choose_table(db_table_name);
+  return tx->inner_agg_stamped_current();
+}
+bool ha_lineairdb::tx_begin_inner_agg_consume() {
+  auto tx = get_transaction(ha_thd());
+  if (tx == nullptr) return false;
+  tx->choose_table(db_table_name);
+  return tx->begin_inner_agg_consume();
 }
 bool ha_lineairdb::tx_is_aborted() {
   auto tx = get_transaction(ha_thd());
@@ -2298,6 +2763,9 @@ int ha_lineairdb::external_lock(THD *thd, int lock_type) {
     if (ctx_slot != nullptr && *ctx_slot != nullptr &&
         (*ctx_slot)->tx != nullptr) {
       (*ctx_slot)->tx->clear_pushed_filter();
+      // Inner-unit aggregate registrations are statement-scoped: a stale
+      // registration could stamp a LATER statement's scan step.
+      (*ctx_slot)->tx->clear_inner_aggregates();
     }
     return 0;
   }

@@ -365,7 +365,7 @@ static int autogen_and_execute_prefetch(THD *thd, AccessPath *root,
   {
     SectionTimer compile_timer(tx->trace(), "autogen_compile");
     compile_ok = autogen_read_plan_from_qep(thd, root, tx->ro_novalidate(),
-                                            &steps, include_inner_units);
+                                            &steps, include_inner_units, tx);
   }
   if (!compile_ok) {
     // autogen has already raised a my_error describing the unsupported shape.

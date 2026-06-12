@@ -12,6 +12,7 @@
 
 #include "lineairdb_keyenc.hh"
 #include "lineairdb_pushdown.hh"
+#include "lineairdb_transaction.hh"
 #include "my_base.h"
 #include "my_sys.h"
 #include "mysqld_error.h"
@@ -1015,7 +1016,7 @@ static void collect_inner_unit_roots(Query_expression *unit,
 bool autogen_read_plan_from_qep(
     THD *thd, AccessPath *root, bool allow_filter_pushdown,
     std::vector<LineairDBProxy::ReadPlanStep> *out,
-    bool include_inner_units) {
+    bool include_inner_units, LineairDBTransaction *tx) {
   if (out == nullptr) {
     return raise_unsupported(thd, "NONE", "null output vector");
   }
@@ -1177,6 +1178,62 @@ bool autogen_read_plan_from_qep(
     }
   }
 
+  // Inner-unit aggregate stamping (Phase-16): a materialized uncorrelated
+  // subquery whose JOIN the override executor took over registered its
+  // Phase-B AggregateSpec (+ the exact WHERE it requires) on the tx at
+  // optimize time. Stamp the spec onto the matching staged scan step so the
+  // server returns GROUP rows — but ONLY when the step's attached filter is
+  // byte-identical to the registered one (a missing/different filter would
+  // make the server aggregate rows the inner WHERE excludes). The decision is
+  // recorded on the tx: the executor consumes group rows for stamped tables
+  // and falls back to proxy-side (Phase A) aggregation over raw rows
+  // otherwise. Steps referenced by bindings stay raw: a binding reads the
+  // source's shipped row positionally, which a group row would break.
+  if (allow_filter_pushdown && tx != nullptr) {
+    static const bool aggdbg = std::getenv("HELIOS_FE_DEBUG") != nullptr;
+    std::vector<bool> referenced(steps.size(), false);
+    for (const auto &s : steps) {
+      for (const auto &b : s.bindings)
+        if (b.source_step < referenced.size()) referenced[b.source_step] = true;
+      for (const auto &b : s.end_bindings)
+        if (b.source_step < referenced.size()) referenced[b.source_step] = true;
+    }
+    for (size_t i = 0; i < steps.size(); ++i) {
+      auto &s = steps[i];
+      if (!s.is_scan || s.for_each || !s.index_name.empty() ||
+          s.scan_limit != 0 || s.reverse_scan || referenced[i] ||
+          !s.bindings.empty() || !s.end_bindings.empty() ||
+          !s.aggregate_serialized.empty()) {
+        if (aggdbg && s.is_scan && !s.for_each &&
+            tx->inner_aggregate(s.table_name) != nullptr)
+          std::fprintf(stderr,
+                       "[AGGSTAMP] skip step=%zu tbl=%s idx=%s lim=%llu rev=%d "
+                       "ref=%d nbind=%zu\n",
+                       i, s.table_name.c_str(), s.index_name.c_str(),
+                       (unsigned long long)s.scan_limit, (int)s.reverse_scan,
+                       (int)referenced[i], s.bindings.size());
+        continue;
+      }
+      const auto *reg = tx->inner_aggregate(s.table_name);
+      if (reg == nullptr) continue;
+      if (s.serialized_filter != reg->filter) {
+        if (aggdbg)
+          std::fprintf(stderr,
+                       "[AGGSTAMP] filter mismatch tbl=%s step=%zuB reg=%zuB\n",
+                       s.table_name.c_str(), s.serialized_filter.size(),
+                       reg->filter.size());
+        continue;
+      }
+      s.aggregate_serialized = reg->spec;
+      s.projection.clear();
+      s.projection_num_columns = 0;
+      tx->mark_inner_agg_stamped(s.table_name);
+      if (aggdbg)
+        std::fprintf(stderr, "[AGGSTAMP] stamped tbl=%s step=%zu\n",
+                     s.table_name.c_str(), i);
+    }
+  }
+
   // Phase-9 semijoin reduction (gated HELIOS_ENABLE_SEMIJOIN): for each
   // FER/FES high-fanout probe step, if its probe join key is in the same
   // equality class (union-find over the collected join edges) as an EARLIER
@@ -1236,6 +1293,9 @@ bool autogen_read_plan_from_qep(
         // semijoin and the server collects keys only from rows passing it,
         // while the source step still ships in full (it may be a join inner
         // the executor point-probes for every outer row).
+        // An aggregate-stamped step ships GROUP rows — its shipped values are
+        // not base rows, so it can never be a membership source.
+        if (!steps[src_step].aggregate_serialized.empty()) continue;
         std::string sf_filter;
         const bool src_prefiltered =
             steps[src_step].is_scan && !steps[src_step].for_each &&
@@ -1410,6 +1470,9 @@ void plan_projection_pushdown(
   }
 
   for (auto &s : *steps) {
+    // Aggregate-stamped steps ship group rows computed from FULL rows (the
+    // spec addresses original field ordinals); never trim them.
+    if (!s.aggregate_serialized.empty()) continue;
     auto it = kept_out->find(s.table_name);
     if (it == kept_out->end()) continue;
     s.projection = it->second;

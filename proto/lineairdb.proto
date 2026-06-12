@@ -802,4 +802,12 @@ message AggregateSpec {
     uint32 num_columns = 1;                            // table->s->fields (row parse)
     repeated uint32 group_columns = 2 [packed = true]; // 0-based field indices (GROUP BY)
     repeated AggFunc aggs = 3;
+    // Server-side HAVING (Phase-16): drop groups failing
+    //   aggs[having_agg_index] <op> having_const   at emission, so only
+    // passing groups ship (q18: 1.5M groups -> ~57). SUM/COUNT aggregates
+    // only (AVG needs div_precincrement semantics; the proxy filters those).
+    // having_op: 0=none 1:'>' 2:'>=' 3:'<' 4:'<=' 5:'=' 6:'!='
+    uint32 having_op = 4;
+    uint32 having_agg_index = 5;
+    string having_const = 6;                           // ASCII decimal
 }

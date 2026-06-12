@@ -461,6 +461,13 @@ void LineairDBTransaction::execute_read_plan(
     }
 
     if (step.index_name.empty()) {
+      // An aggregate-stamped step returns synthetic GROUP rows (empty keys):
+      // they must never enter the ROW cache (their keys are not base keys,
+      // and the step's filter is the INNER unit's WHERE — its rejections are
+      // no statement about what other consumers of the table may read), and
+      // the range entry is flagged so only the aggregate's own consuming
+      // scan can be served from it.
+      const bool agg_step = !step.aggregate_serialized.empty();
       std::vector<std::pair<std::string, std::string>> rows;
       std::vector<uint64_t> row_tids;
       rows.reserve(step_result.scan_keys.size());
@@ -473,22 +480,28 @@ void LineairDBTransaction::execute_read_plan(
         const uint64_t tid =
             j < step_result.scan_tids.size() ? step_result.scan_tids[j] : 0;
         const bool found = !value.empty();
-        record_row_cache(step.table_name, key, found, value, tid, true);
+        if (!agg_step) {
+          record_row_cache(step.table_name, key, found, value, tid, true);
+        }
         if (found) {
           rows.emplace_back(std::move(key), std::move(value));
           row_tids.push_back(tid);
         }
       }
-      push_range_scan_cache(
-          {step.table_name, step_result.actual_start_key,
-           step_result.actual_end_key, step.reverse_scan, step.scan_limit,
-           std::move(rows), std::move(row_tids)});
+      LocalRangeScanEntry scan_entry{
+          step.table_name, step_result.actual_start_key,
+          step_result.actual_end_key, step.reverse_scan, step.scan_limit,
+          std::move(rows), std::move(row_tids)};
+      scan_entry.aggregate_rows = agg_step;
+      push_range_scan_cache(std::move(scan_entry));
       // Negative coverage for the step filter's rejected rows: point probes
       // into this filtered scan resolve to not-found locally instead of
       // aborting on a cache miss (sound per alias — the filter is that
       // alias's WHERE conjunct, so MySQL would discard the row anyway).
-      for (auto& fk : step_result.filtered_keys) {
-        record_row_cache(step.table_name, fk, false, "", 0, true);
+      if (!agg_step) {
+        for (auto& fk : step_result.filtered_keys) {
+          record_row_cache(step.table_name, fk, false, "", 0, true);
+        }
       }
     } else {
       // Secondary scan: primary_keys must stay 1:1 aligned with
@@ -1363,6 +1376,11 @@ LineairDBTransaction::lookup_range_scan_cache(
   const bool pending_in_range =
       has_pending_row_ops_in_range(table_name, start_key, end_key);
 
+  // GROUP-row entries (aggregate-stamped steps) are visible ONLY to the
+  // aggregate's own consuming scan; any other reader skips them.
+  const bool agg_visible =
+      !pushed_aggregate_.empty() && pushed_aggregate_table_ == table_name;
+
   // Fast path: exact-start staged entry (the FER probe pattern).
   auto idx_it = range_scan_start_index_.find(
       scan_cache_index_key(table_name, "", start_key));
@@ -1370,6 +1388,7 @@ LineairDBTransaction::lookup_range_scan_cache(
     for (auto rit = idx_it->second.rbegin(); rit != idx_it->second.rend();
          ++rit) {
       const auto& e = range_scan_cache_[*rit];
+      if (e.aggregate_rows && !agg_visible) continue;
       if (e.row_limit != 0 && pending_in_range) continue;
       if (e.reverse_scan == reverse_scan && e.row_limit == row_limit &&
           end_key <= e.end_key) {
@@ -1398,6 +1417,7 @@ LineairDBTransaction::lookup_range_scan_cache(
 
   for (auto it = range_scan_cache_.rbegin();
        it != range_scan_cache_.rend(); ++it) {
+    if (it->aggregate_rows && !agg_visible) continue;
     if (it->row_limit != 0 && pending_in_range) continue;
     const bool same_table = it->table_name == table_name;
     const bool same_direction = it->reverse_scan == reverse_scan;
@@ -1441,6 +1461,7 @@ LineairDBTransaction::lookup_range_scan_cache(
       for (auto rit = idx_it->second.rbegin(); rit != idx_it->second.rend();
            ++rit) {
         const auto& e = range_scan_cache_[*rit];
+        if (e.aggregate_rows && !agg_visible) continue;
         if (e.row_limit > 0 && !e.reverse_scan && e.start_key == start_key &&
             e.end_key == end_key) {
           LocalRangeScanEntry cached = e;

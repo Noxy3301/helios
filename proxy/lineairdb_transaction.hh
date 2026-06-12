@@ -169,10 +169,66 @@ public:
   void clear_pushed_filter() { pushed_filter_.clear(); }
 
   // Aggregation pushdown: serialized AggregateSpec stamped onto the matching
-  // primary scan step at send time (see execute_read_plan).
-  void set_pushed_aggregate(const std::string& s) { pushed_aggregate_ = s; }
-  void clear_pushed_aggregate() { pushed_aggregate_.clear(); }
+  // primary scan step at send time (see execute_read_plan). The table key is
+  // remembered as the consumption gate: range-cache entries holding GROUP
+  // rows are served only while the aggregate's own scan is consuming them
+  // (see lookup_range_scan_cache), never to other readers of the table.
+  void set_pushed_aggregate(const std::string& s) {
+    pushed_aggregate_ = s;
+    pushed_aggregate_table_ = db_table_key;
+  }
+  void clear_pushed_aggregate() {
+    pushed_aggregate_.clear();
+    pushed_aggregate_table_.clear();
+  }
   bool has_pushed_aggregate() const { return !pushed_aggregate_.empty(); }
+
+  // Inner-unit aggregation (Phase-16): an offloaded MATERIALIZED uncorrelated
+  // subquery registers its full Phase-B spec + the exact WHERE filter it
+  // requires at optimize time, keyed by physical table ("./db/tbl"). The
+  // autogen stamp pass attaches the spec to the matching staged scan step
+  // ONLY when the step's attached filter equals the registered one, and
+  // records that decision so the override executor knows whether the staged
+  // step returns GROUP rows (Phase B consume) or raw rows (Phase A fallback).
+  struct InnerAggregate {
+    std::string spec;    // serialized AggregateSpec
+    std::string filter;  // serialized PushedPredicate the spec requires ("" = none)
+  };
+  void register_inner_aggregate(const std::string& table, std::string spec,
+                                std::string filter) {
+    inner_agg_specs_[table] = {std::move(spec), std::move(filter)};
+  }
+  const InnerAggregate* inner_aggregate(const std::string& table) const {
+    auto it = inner_agg_specs_.find(table);
+    return it == inner_agg_specs_.end() ? nullptr : &it->second;
+  }
+  void mark_inner_agg_stamped(const std::string& table) {
+    inner_agg_stamped_.insert(table);
+  }
+  bool inner_agg_stamped(const std::string& table) const {
+    return inner_agg_stamped_.count(table) != 0;
+  }
+  // _current variants operate on the chosen table (db_table_key).
+  void register_inner_aggregate_current(std::string spec, std::string filter) {
+    inner_agg_specs_[db_table_key] = {std::move(spec), std::move(filter)};
+  }
+  bool inner_agg_stamped_current() const {
+    return inner_agg_stamped_.count(db_table_key) != 0;
+  }
+  // Begin consuming the CURRENT table's staged group rows: opens the lookup
+  // gate (and protects the pushed filter from rnd_init clearing). Paired
+  // with clear_pushed_aggregate() after the consuming scan ends.
+  bool begin_inner_agg_consume() {
+    auto it = inner_agg_specs_.find(db_table_key);
+    if (it == inner_agg_specs_.end()) return false;
+    pushed_aggregate_ = it->second.spec;
+    pushed_aggregate_table_ = db_table_key;
+    return true;
+  }
+  void clear_inner_aggregates() {
+    inner_agg_specs_.clear();
+    inner_agg_stamped_.clear();
+  }
 
   // Projection pushdown (ro_novalidate SELECT only): per physical table, the
   // kept 0-based field ordinals its staged VALUES were trimmed to. The row
@@ -302,6 +358,12 @@ private:
     // staged with a row limit and filled to it, so rows past the last one may
     // exist server-side (over-reads must abort, not report EOF).
     bool truncated = false;
+    // The staged step carried an AggregateSpec: `rows` are synthetic GROUP
+    // rows (empty keys), not base rows. Served ONLY to the aggregate's own
+    // consuming scan (pushed_aggregate gate); every other lookup skips the
+    // entry — sub-range serving or point coverage from group rows would
+    // corrupt any other reader of the same table.
+    bool aggregate_rows = false;
   };
   struct LocalSecondaryScanEntry {
     std::string table_name;
@@ -327,6 +389,11 @@ private:
   std::string pushed_filter_;
   // Aggregation pushdown: serialized AggregateSpec for the primary scan
   std::string pushed_aggregate_;
+  // Physical table whose staged GROUP rows the pushed aggregate may consume
+  std::string pushed_aggregate_table_;
+  // Inner-unit aggregation registrations + which tables actually got stamped
+  std::unordered_map<std::string, InnerAggregate> inner_agg_specs_;
+  std::unordered_set<std::string> inner_agg_stamped_;
 
   // Projection pushdown: physical table name -> kept field ordinals.
   std::unordered_map<std::string, std::vector<uint32_t>> table_projection_;

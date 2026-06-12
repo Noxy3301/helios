@@ -13,6 +13,7 @@ struct TABLE;
 #include "lineairdb_proxy.hh"
 
 struct AccessPath;
+class LineairDBTransaction;
 
 // Auto-generate a statement-scoped prefetch read plan from the given QEP root
 // (statement root, or a subquery unit's root when the statement plan is not
@@ -26,10 +27,14 @@ struct AccessPath;
 // walk. Their leaves share the main tree's step table so correlated probes
 // bind as for_each. Inner-unit compile failures are NON-fatal (that unit is
 // skipped; executing it later misses and aborts, i.e. today's behavior).
+// tx (optional): consulted for inner-unit aggregate registrations — a staged
+// scan step whose table was registered (and whose attached filter equals the
+// registered one) is stamped with the AggregateSpec so the server returns
+// group rows; the stamp decision is recorded back on the tx.
 bool autogen_read_plan_from_qep(
     THD *thd, AccessPath *root, bool allow_filter_pushdown,
     std::vector<LineairDBProxy::ReadPlanStep> *out,
-    bool include_inner_units = false);
+    bool include_inner_units = false, LineairDBTransaction *tx = nullptr);
 
 // Auto-generate one statement-scoped prefetch step from the handler access
 // selected for legacy single-table UPDATE/DELETE.
