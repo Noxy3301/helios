@@ -266,4 +266,24 @@ COST_V2(旧ブランチ移植、env gate)を ON にした実験では plan が�
 - validation 整合: 各 group は bounded range なので従来の RangeReadEntry replay で検証可能
   (novalidate OFF でも健全)。
 
+### [2026-06-12] エントリ12: TPC-H カバレッジ 2→19/22(SF=0.1)
+
+**FER/FES 後の進捗**(matrix r3 → r4、計測は tpch_matrix.sh = per-query 完全ログ方式):
+- r3(FER/FES+WEEDOUT 等追加前のビルド): 18/22 OK。stateful で TIMEOUT だった q5(4.2s)
+  q7(1.7s) q8(1.9s) q10(1.7s) q17(0.96s) q18(3.8s) q20(2.5s) q21(4.6s) が全て数秒で完走。
+- **q9 の根因**: lineitem probe の 2 つの bound keypart が異なる source step(partsupp.ps_partkey
+  + supplier.s_suppkey)に跨り、staging のペアリングが破綻 → runtime miss。
+  **修正 = multi-source remap**: bound source のうち最新 step を iterating source とし、他表
+  field は Item_field::item_equal_all_join_nests(multiple equality)経由で iterating source の
+  等価列へ付け替え(例: s_suppkey→ps_suppkey)。不能なら明示 reject。→ **r4: 19/22 OK**(q9 2.3s)。
+- QEP node 追加: WEEDOUT / NESTED_LOOP_SEMIJOIN_WITH_DUPLICATE_REMOVAL / ZERO_ROWS(q4/q5 等の
+  semijoin 戦略)。root は unit->root_access_path() を優先。
+- 残り 3 本(q11/q15/q22)= **optimize 時に評価される非相関スカラサブクエリ**が外側 plan 確定前に
+  handler を叩き「missing JOIN root_access_path」になる構造問題。
+  **対処 = per-unit staging**: statement root が未構築なら table の所属 unit の root を解決して
+  その subtree だけ staging(tx に staged-roots set を導入、query_id でリセット)。statement root
+  が後で構築されたら従来通り一度だけ statement staging(resolved flag は維持)。
+- 注意した点: 一時的に「直前クエリのエラー形状を引き継ぐ」ように見える断続事象を観測(再現せず)。
+  計測ハーネスを per-query stderr 完全保存(bench/bin/tpch_matrix.sh)に変更して追跡可能化。
+
 (以降追記)

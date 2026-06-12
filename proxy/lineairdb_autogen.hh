@@ -9,13 +9,15 @@ struct TABLE;
 #include "lineairdb_index_search.hh"
 #include "lineairdb_proxy.hh"
 
-// Auto-generate a statement-scoped prefetch read plan from the current
-// statement's MySQL QEP (JOIN::root_access_path()). Returns true with steps on
-// full success. On ANY unsupported QEP shape it raises my_error(...) and
-// returns false (NO fallback, NO best-effort coverage). Caller must fail the
-// statement when false.
+struct AccessPath;
+
+// Auto-generate a statement-scoped prefetch read plan from the given QEP root
+// (statement root, or a subquery unit's root when the statement plan is not
+// finalized yet). Returns true with steps on full success. On ANY unsupported
+// QEP shape it raises my_error(...) and returns false (NO fallback, NO
+// best-effort coverage). Caller must fail the statement when false.
 bool autogen_read_plan_from_qep(
-    THD *thd, std::vector<LineairDBProxy::ReadPlanStep> *out);
+    THD *thd, AccessPath *root, std::vector<LineairDBProxy::ReadPlanStep> *out);
 
 // Auto-generate one statement-scoped prefetch step from the handler access
 // selected for legacy single-table UPDATE/DELETE.
