@@ -13,6 +13,7 @@
 #include <map>
 #include <set>
 #include <type_traits>
+#include <thread>
 
 namespace {
 
@@ -214,6 +215,48 @@ struct AggGroupState {
     std::vector<Dec> sum;                // per agg: SUM/AVG accumulator
 };
 
+// Accumulate rows[begin,end) into `out` (group key -> AggGroupState). Pure over
+// const spec/rows + the worker's own `out`, so it is safe to run on a worker
+// thread for morsel-parallel aggregation (no shared state, no DB/RCU touch).
+static void aggregate_rows_range(
+    const LineairDB::Protocol::AggregateSpec& spec,
+    const std::vector<LineairDB::StatelessScanRow>& rows, size_t begin,
+    size_t end, std::unordered_map<std::string, AggGroupState>& out) {
+  using AF = LineairDB::Protocol::AggFunc;
+  const int n_agg = spec.aggs_size();
+  const int n_grp = spec.group_columns_size();
+  std::string keybuf;
+  std::vector<std::string_view> gv(n_grp);
+  for (size_t r = begin; r < end; ++r) {
+    const auto& row = rows[r];
+    keybuf.clear();
+    for (int g = 0; g < n_grp; ++g) {
+      gv[g] = extract_value_column(row.value, spec.group_columns(g));
+      const uint32_t l = static_cast<uint32_t>(gv[g].size());
+      keybuf.append(reinterpret_cast<const char*>(&l), sizeof(l));
+      keybuf.append(gv[g].data(), gv[g].size());
+    }
+    auto it = out.find(keybuf);
+    AggGroupState* gs;
+    if (it == out.end()) {
+      AggGroupState s;
+      s.key_cols.resize(n_grp);
+      for (int g = 0; g < n_grp; ++g) s.key_cols[g] = std::string(gv[g]);
+      s.count.assign(n_agg, 0);
+      s.sum.assign(n_agg, Dec{});
+      gs = &out.emplace(keybuf, std::move(s)).first->second;
+    } else {
+      gs = &it->second;
+    }
+    for (int a = 0; a < n_agg; ++a) {
+      const auto& af = spec.aggs(a);
+      if (af.kind() == AF::AGG_COUNT) { gs->count[a] += 1; continue; }
+      Dec v = dec_eval(af.arg(), row.value);
+      if (!v.null) { dec_addsub(gs->sum[a], v, false); gs->count[a] += 1; }
+    }
+  }
+}
+
 // Aggregate `rows` per `spec`, emitting one synthetic group row per group into
 // step_result->scan_values (format: [null_flags][group cols][per-agg value,count]).
 // COUNT ships the row count; SUM/AVG ship an exact decimal sum (ASCII) + non-null
@@ -227,36 +270,57 @@ bool server_aggregate_scan(
     const int n_grp = spec.group_columns_size();
 
     std::unordered_map<std::string, AggGroupState> groups;
-    std::string keybuf;
-    std::vector<std::string_view> gv(n_grp);
-    for (auto& row : rows) {
-        keybuf.clear();
-        for (int g = 0; g < n_grp; ++g) {
-            gv[g] = extract_value_column(row.value, spec.group_columns(g));
-            const uint32_t l = static_cast<uint32_t>(gv[g].size());
-            keybuf.append(reinterpret_cast<const char*>(&l), sizeof(l));
-            keybuf.append(gv[g].data(), gv[g].size());
+    // Morsel-parallel aggregation (gated HELIOS_PARALLEL_SERVER, default OFF):
+    // split rows into T chunks, each worker accumulates into its own thread-local
+    // map (no shared state, no DB/RCU touch — pure over const spec/rows), then the
+    // parent merges. exact-decimal merge is order-independent (Dec is fixed-point
+    // int128). Emit order is irrelevant: the agg result feeds MySQL which applies
+    // the query's ORDER BY. Serial path (T==1) is byte-identical to the original.
+    static const bool par_on = std::getenv("HELIOS_PARALLEL_SERVER") != nullptr;
+    auto env_sz = [](const char* n, size_t d) {
+      const char* e = std::getenv(n); if (!e || !e[0]) return d;
+      char* end = nullptr; long v = std::strtol(e, &end, 10);
+      return (end && end != e && v > 0) ? (size_t)v : d;
+    };
+    const size_t morsel = env_sz("HELIOS_SERVER_MORSEL_ROWS", 100000);
+    unsigned cap = (unsigned)env_sz("HELIOS_SERVER_THREADS",
+                                    std::thread::hardware_concurrency()
+                                        ? std::thread::hardware_concurrency() : 4);
+    const size_t desired = morsel ? (rows.size() + morsel - 1) / morsel : 1;
+    unsigned T = (par_on && desired > 1 && cap > 1)
+                     ? (unsigned)std::min<size_t>(desired, cap) : 1;
+    if (T <= 1) {
+      aggregate_rows_range(spec, rows, 0, rows.size(), groups);
+    } else {
+      std::vector<std::unordered_map<std::string, AggGroupState>> locals(T);
+      std::vector<std::thread> workers;
+      workers.reserve(T);
+      const size_t chunk = (rows.size() + T - 1) / T;
+      for (unsigned t = 0; t < T; ++t) {
+        const size_t b = (size_t)t * chunk;
+        const size_t e = std::min(rows.size(), b + chunk);
+        if (b >= e) break;
+        workers.emplace_back([&, t, b, e] {
+          aggregate_rows_range(spec, rows, b, e, locals[t]);
+        });
+      }
+      for (auto& w : workers) w.join();
+      for (auto& lm : locals) {
+        if (groups.empty()) { groups = std::move(lm); continue; }
+        for (auto& kv : lm) {
+          auto it = groups.find(kv.first);
+          if (it == groups.end()) {
+            groups.emplace(kv.first, std::move(kv.second));
+          } else {
+            AggGroupState& dst = it->second;
+            AggGroupState& src = kv.second;
+            for (int a = 0; a < n_agg; ++a) {
+              dst.count[a] += src.count[a];
+              dec_addsub(dst.sum[a], src.sum[a], false);
+            }
+          }
         }
-        auto it = groups.find(keybuf);
-        AggGroupState* gs;
-        if (it == groups.end()) {
-            AggGroupState s;
-            s.key_cols.resize(n_grp);
-            for (int g = 0; g < n_grp; ++g) s.key_cols[g] = std::string(gv[g]);
-            s.count.assign(n_agg, 0);
-            s.sum.assign(n_agg, Dec{});
-            gs = &groups.emplace(std::move(keybuf), std::move(s)).first->second;
-            keybuf.clear();
-        } else {
-            gs = &it->second;
-        }
-        for (int a = 0; a < n_agg; ++a) {
-            const auto& af = spec.aggs(a);
-            if (af.kind() == AF::AGG_COUNT) { gs->count[a] += 1; continue; }
-            // SUM / AVG: evaluate the exact decimal arg, accumulate non-nulls.
-            Dec v = dec_eval(af.arg(), row.value);
-            if (!v.null) { dec_addsub(gs->sum[a], v, false); gs->count[a] += 1; }
-        }
+      }
     }
     // Implicit grouping (no GROUP BY) must emit exactly one row even over zero
     // input rows: COUNT(*) => 0, SUM/AVG => NULL. (P1, Codex review.)
