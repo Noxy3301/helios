@@ -194,6 +194,12 @@ public:
    */
   const char *table_type() const override { return "LineairDB"; }
 
+  // Phase-8 (gated, default OFF): advertise engine-pushdown capability so the
+  // optimizer calls handlerton::push_to_engine for queries over our tables.
+  // Used to install JOIN::override_executor_func for full aggregation pushdown.
+  // Returns lineairdb_hton only when HELIOS_AGG_PUSHDOWN is set, else nullptr.
+  const handlerton *hton_supporting_engine_pushdown() override;
+
   /**
     Replace key algorithm with one supported by SE, return the default key
     algorithm for SE if explicit key algorithm was not provided.
@@ -471,6 +477,16 @@ public:
   int rnd_init(bool scan) override; // required
   int rnd_end() override;
   int rnd_next(uchar *buf) override;            ///< required
+  // Phase-8 Phase B: advance the prefetch cursor like rnd_next but return the
+  // raw cached row VALUE bytes (a server-produced group row) without unpacking
+  // into record[0]. Returns false at end of scan. The view is valid until the
+  // next call / rnd_end().
+  bool agg_next_raw(std::string_view *out_value);
+  // Phase-8 Phase B: set/clear the serialized AggregateSpec on this handler's
+  // transaction (public wrappers so the override executor can reach the tx).
+  void tx_set_pushed_aggregate(const std::string &s);
+  void tx_clear_pushed_aggregate();
+  bool tx_ro_novalidate();  // Phase-8 Phase B OCC gate
   int rnd_pos(uchar *buf, uchar *pos) override; ///< required
   void position(const uchar *record) override;  ///< required
   int info(uint flag) override;                 ///< required
