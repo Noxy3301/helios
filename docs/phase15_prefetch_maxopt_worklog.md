@@ -327,4 +327,15 @@ stateful ベースライン(13/22 OK・9 本 >120s TIMEOUT)に対する質的飛
   validation 有効時は従来通り未フィルタ転送)。autocommit 単文限定なので
   filtered エントリの statement 越え再利用も構造的に発生しない。
 
+### [2026-06-12] エントリ15: M1 検証完了 + SF=1 開始
+
+- **M1 後も 22/22 OK + md5 22/22 一致**(matrix r7)。q6 2.04→1.56s。commit 051e116。
+- C1-C4 再検証(FER/FES 後の explicit 200.5 req/s 実行後)= 全 0、SI 強プローブ clean。
+- benchbase submodule にローカルブランチ `helios/prefetch-maxopt`(34b8ac94 ベース)を作成し
+  旧ブランチ検証済みの並列 TPC-H ローダ(1d637862)を cherry-pick(6f3f578e)→ jar 再ビルド。
+- 運用注意: `scripts/stop_mysql.sh` は port 3308 の InnoDB 参照 mysqld も殺す(pkill being broad)。
+  参照インスタンスはディスク永続なので再起動で復旧可。
+- **SF=1 開始**: 並列ローダでロード → ON+novalidate で 22 本(timeout 300s)、RAM watchdog
+  (avail<2GB で abort、/tmp/mem_sf1.log に RSS 記録)。
+
 (以降追記)
