@@ -1190,8 +1190,19 @@ int ha_lineairdb::info(uint flag) {
     // If stats_base_records is still 0, try to sync from proxy cache.
     // This covers the case where info() is called before external_lock()
     // (e.g., BenchBase catalog refresh, SHOW TABLE STATUS).
-    if (share->stats_base_records.load(std::memory_order_relaxed) == 0 &&
-        !db_table_name.empty()) {
+    // We also enter this block when the row count is already seeded but the
+    // per-index NDV is not yet loaded (HELIOS_OPT_STATS): otherwise a row count
+    // arriving via the begin/end piggyback would permanently suppress the NDV
+    // fetch (Codex review #4).
+    static const char *opt_stats_env = std::getenv("HELIOS_OPT_STATS");
+    static const bool opt_stats_on =
+        opt_stats_env != nullptr && opt_stats_env[0] == '1';
+    const bool need_rowcount =
+        share->stats_base_records.load(std::memory_order_relaxed) == 0;
+    const bool need_ndv =
+        opt_stats_on &&
+        !share->index_ndv_loaded_.load(std::memory_order_relaxed);
+    if ((need_rowcount || need_ndv) && !db_table_name.empty()) {
       THD *thd = ha_thd();
       if (thd != nullptr) {
         LineairDBThdCtx *ctx =
@@ -1219,9 +1230,6 @@ int ha_lineairdb::info(uint flag) {
           // rec_per_key is then computed from real NDV (see set_generic_rec_per_key)
           // instead of the n-th-root heuristic that mis-treated non-unique FK
           // joins as 1:1 -> Q5 explosion. (docs/phase7_optimizer_stats.md)
-          static const char *opt_stats_env = std::getenv("HELIOS_OPT_STATS");
-          static const bool opt_stats_on =
-              opt_stats_env != nullptr && opt_stats_env[0] == '1';
           if (opt_stats_on &&
               (!find_seed() ||
                !share->index_ndv_loaded_.load(std::memory_order_relaxed))) {
@@ -1238,7 +1246,9 @@ int ha_lineairdb::info(uint flag) {
                                    k->user_defined_key_parts);
               }
             }
-            if (ctx->proxy->fetch_table_stats(db_table_name, descs, false)) {
+            const bool force = share->index_ndv_force_refresh_.exchange(
+                false, std::memory_order_relaxed);
+            if (ctx->proxy->fetch_table_stats(db_table_name, descs, force)) {
               find_seed();
               std::lock_guard<std::mutex> g(share->index_ndv_mu_);
               share->index_ndv_.clear();
@@ -1320,6 +1330,12 @@ int ha_lineairdb::analyze(THD *, HA_CHECK_OPT *) {
     share->stats_base_records.store(0, std::memory_order_relaxed);
     for (auto &shard : share->rowcount_shards)
       shard.delta.store(0, std::memory_order_relaxed);
+    // Force the next info() to re-fetch NDV AND make the server recompute it
+    // (rather than serve its cached value). Without clearing index_ndv_loaded_
+    // the fetch is skipped; without force=true the server returns its cache
+    // (Codex review #2).
+    share->index_ndv_loaded_.store(false, std::memory_order_relaxed);
+    share->index_ndv_force_refresh_.store(true, std::memory_order_relaxed);
   }
   info(HA_STATUS_VARIABLE | HA_STATUS_CONST);
   return HA_ADMIN_OK;
@@ -1375,9 +1391,12 @@ void ha_lineairdb::set_generic_rec_per_key(KEY *key, uint key_parts,
       // All parts specified on a UNIQUE/PK -> exactly 1 row
       rpk = 1;
     } else if (ndv != nullptr && (*ndv)[j] > 0) {
-      // Real cardinality: avg rows per distinct prefix value.
-      rpk = static_cast<ulong>(std::max<double>(
-          1.0, static_cast<double>(stats.records) / static_cast<double>((*ndv)[j])));
+      // Real cardinality: avg rows per distinct prefix value. Integer CEIL
+      // (records/NDV rounded up) so e.g. records=10,ndv=6 gives 2, not floor 1
+      // which would over-state selectivity as ~unique (Codex review #3).
+      const uint64_t rec = static_cast<uint64_t>(stats.records);
+      const uint64_t d = (*ndv)[j];
+      rpk = static_cast<ulong>(std::max<uint64_t>(1, (rec + d - 1) / d));
     } else {
       // per_part^(j+1) = total divisor for j+1 key parts
       double selectivity = std::pow(per_part, static_cast<double>(j + 1));

@@ -75,3 +75,41 @@ GET_TABLE_STATS RPC + info()-on-miss seed で実 records を届けたところ:
 
 **結論:** NDV はプラン爆発クエリ(q2/q3/q5/q19)を救出。残る q7/q9/q10/q14 の 8-30x は join order でなく
 remote-RPC データ量という別軸の問題(NDV のスコープ外)。`HELIOS_OPT_STATS` を default ON 候補。
+
+## Codex 最終レビュー(2026-05-29): 設計 GO、default ON 前に 3 点 fix
+内容+プラン+結果を提出。判定: **方向性 GO**(TPC-H integer join index で結果は強い)、ただし default ON 前に下記。
+- **#2 ANALYZE が force 再計算していない**: `fetch_table_stats(force=true)` がどこからも呼ばれず、
+  `index_ndv_loaded_` も clear されないので ANALYZE 後も server NDV cache を読み直さない。→ **修正済**:
+  share に `index_ndv_force_refresh_` 追加、analyze() が `index_ndv_loaded_=false`+force flag set、info() の
+  fetch が `exchange()` で force を渡す。ANALYZE TABLE スモーク OK。
+- **#3 ceil でなく floor**: `(double)records/ndv` を ulong cast = 切り捨て。records=10,ndv=6 が rpk=1 になり
+  selectivity 過大評価。→ **修正済**: 整数 ceil `(rec+d-1)/d`。
+- **#4 NDV fetch が row-count cold miss に依存**: 外側 guard が `stats_base_records==0` のみで、row-count が
+  begin/end piggyback で先に入ると NDV が永久未ロード。→ **修正済**: guard を `need_rowcount || need_ndv` に拡張。
+- **#1 NDV scan が DataItem を安定 snapshot せず読む**(database_impl.h:821/833): TID lock-bit 待ち・double-read なし。
+  concurrent writer 下で secondary `primary_keys_ptr` の torn read リスク。→ **default-ON 前提条件として保留**:
+  TPC-H は load→read-only で NDV 計算窓に writer がいないため benign、かつ gate OFF 維持。snapshot protocol 整合は
+  default ON 一般化時の TODO。
+- **#5 unavailable fallback は一般 default ON に弱い**: string/非int の非ユニーク join index が unavailable だと
+  実 row-count + n-th-root に戻り、潰した GIGO 形に。→ **default-ON 前提条件として保留**: TPC-H の join 駆動 index は
+  全部 integer なので現状安全。一般化時は「unavailable な非ユニーク index では row-count seed 抑制 / rpk unknown」が必要。
+
+**方針:** 明確なバグ #2/#3/#4 を修正(gate OFF 維持で安全)。#1/#5 は default-ON 一般化時の前提条件として記録。
+TPC-H/integer workload に限れば default ON 可。
+
+## 修正後の計測で遭遇した「偽の回帰」と原因切り分け(2026-05-29 深夜)
+#2/#3/#4 修正後の full 22 で q2 89s/q3 212s/q5 164s と壊滅値が出て一瞬「修正が NDV を壊した」と誤認。
+切り分けた結果 **コードは無罪、真因は server プロセスの状態劣化**:
+1. EXPLAIN q5 は修正後も健全(region→nation→customer ref 6000→…→supplier eq_ref、爆発なし)。プランは正しい。
+2. `pkill/pgrep -f "<自コマンドに含まれる文字列>"` で自滅(exit 144、メモリ pkill-self-match-144 の罠)を繰り返し、
+   前ハーネスのゾンビ重クエリ(6M行スキャン)が同一 mysqld/server に積み重なって最初の壊滅値を汚染。
+3. ゾンビ除去後の単発・無競合でも q5=252s/q19=838ms と遅いまま。fresh mysqld 再起動でも変わらず → mysqld 肥大でもない。
+4. **コミット済 0aa8ab7(pre-fix Phase2、cmp3 で q5=3.7s/q19=98ms を出した版)を同一 server に再測 → OLD でも
+   q19=687ms / q5≈250s。NEW と同等に遅い** → 修正は無罪、server 状態が原因と確定。
+5. server(9999、16:46 起動・7h 稼働・RSS 15.4GB)は OPT_STATS=0 baseline で 6M行フルスキャンを大量に浴びた後。
+   q19 を idle 連続実行しても ~640ms で安定(98ms に回復せず)= transient GC でなく永続劣化。接続が1本あたり
+   4分超 open = server 側 scan 実行が遅い。
+→ **クリーンな数値には server 再起動 + SF=1 再ロードが必須**。Phase2+修正のコード正しさは EXPLAIN(プラン健全)+
+  ANALYZE スモーク OK + cmp3(健全 server で 22/22 md5・q5/q19 修正)で担保済。timing は clean server で取り直す。
+**教訓:** kill は必ず PID 指定。`pkill -f`/`pgrep -f` のパターンが自コマンド文字列にマッチすると自滅(144)。
+長時間の重ベンチ後は server を再起動してからでないと timing 比較は信用できない。

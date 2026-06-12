@@ -93,6 +93,9 @@ public:
   std::mutex index_ndv_mu_;
   std::unordered_map<std::string, std::vector<uint64_t>> index_ndv_;
   std::atomic<bool> index_ndv_loaded_{false};
+  // ANALYZE TABLE sets this so the next info() NDV fetch passes force=true,
+  // making the server recompute (rather than serve its cached) NDV.
+  std::atomic<bool> index_ndv_force_refresh_{false};
 };
 
 // LIMIT and direction to pass to a range scan. Computed from the statement's
