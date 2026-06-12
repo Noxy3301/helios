@@ -279,6 +279,11 @@ void LineairDBTransaction::execute_read_plan(
       if (s.is_scan && !s.for_each && s.index_name.empty() &&
           s.table_name == db_table_key) {
         s.aggregate_serialized = pushed_aggregate_;
+        // The statement's WHERE rides as the step filter so the server
+        // aggregates exactly the rows MySQL would have kept.
+        if (s.serialized_filter.empty() && !pushed_filter_.empty()) {
+          s.serialized_filter = pushed_filter_;
+        }
         s.projection.clear();
         s.projection_num_columns = 0;
       }

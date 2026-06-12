@@ -592,7 +592,11 @@ static bool helios_override_executor(JOIN *join, Query_result *query_result) {
         std::fprintf(stderr, "[AGGSRV] spec: groups=%d aggs=%d ser_bytes=%zu n_out=%zu\n",
                      spec.group_columns_size(), spec.aggs_size(), spec_ser.size(), n);
       ha_lineairdb *hl = down_cast<ha_lineairdb *>(t->file);
-      hl->tx_set_pushed_aggregate(spec_ser);
+      if (!hl->tx_set_pushed_aggregate(spec_ser)) {
+        // WHERE not fully pushable -> the server would aggregate unfiltered
+        // rows; Phase A evaluates the WHERE locally instead.
+        goto phase_a_fallthrough;
+      }
 
       int err = t->file->ha_rnd_init(true);
       if (err) {
@@ -1764,13 +1768,21 @@ int ha_lineairdb::rnd_next(uchar *buf) {
   DBUG_RETURN(error);
 }
 
-void ha_lineairdb::tx_set_pushed_aggregate(const std::string &s) {
+bool ha_lineairdb::tx_set_pushed_aggregate(const std::string &s) {
   auto tx = get_transaction(ha_thd());
   // The override drives the scan via agg_next_raw, which bypasses the normal
   // read path that selects the table; select it here so execute_read_plan's
   // db_table_key matches this scan step and stamps the aggregate (and filter).
   tx->choose_table(db_table_name);
+  // The server aggregates over the staged scan's rows, so the statement's
+  // WHERE must ride along as the step filter — otherwise the aggregate counts
+  // unfiltered rows (q1 N/O group, q6 152x). Fully-serializable WHERE only;
+  // on failure the caller falls back to Phase A (local WHERE evaluation).
+  if (!prepare_select_filter_for_tx(ha_thd(), table, tx, nullptr)) {
+    return false;
+  }
   tx->set_pushed_aggregate(s);
+  return true;
 }
 bool ha_lineairdb::tx_ro_novalidate() {
   // The override decides Phase B BEFORE the read path begins the tx (which is

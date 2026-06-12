@@ -484,7 +484,7 @@ public:
   bool agg_next_raw(std::string_view *out_value);
   // Phase-8 Phase B: set/clear the serialized AggregateSpec on this handler's
   // transaction (public wrappers so the override executor can reach the tx).
-  void tx_set_pushed_aggregate(const std::string &s);
+  bool tx_set_pushed_aggregate(const std::string &s);  // false: WHERE not pushable
   void tx_clear_pushed_aggregate();
   bool tx_ro_novalidate();  // Phase-8 Phase B OCC gate
   int rnd_pos(uchar *buf, uchar *pos) override; ///< required
