@@ -497,4 +497,45 @@ WriteSecondaryIndex の種読みが CC Read 経由で validation 登録される
 - 一時診断ログ(silo-validate-fail、先頭16件)は検証完了後に削除予定。
 - 期待効果: 並列ロードが**abort なしで正しい SI** を構築(ロスも衝突も消える)。
 
+### [2026-06-12] エントリ24: merge-install 検証 + q5 の真相と COST_V2
+
+- **merge-install 後の並列 SF=1 ロード = 30-33s・SI 完全・validation abort 0**。
+  LineairDB fix を submodule branch にコミット(3f5a6f7)+ helios pointer bump(b77a873)。
+- 完全データでの SF=1 matrix(committed build): 21/22 OK。**q5 のみ TIMEOUT(>120-300s)**。
+  ※ 重要な気づき: これまでの「q5=35s」は **SI 欠損データで probe 仕事量が減っていた見かけの速さ**。
+  完全 SI では q5 の NLJ 連鎖(optimizer の rows=1 誤推定、c_nationkey→o_custkey→lineitem の
+  カスケード)が真に重い。データ正しさが直ったことで顕在化した、本物の plan 品質問題。
+- **HELIOS_COST_V2(移植済み gate)を ON にすると q5 = 35.3s(結果正・INDONESIA top)**。
+  ただし q3 は 22→30s と悪化(plan が scan 寄りに)— per-query mixed → フル A/B 実施中。
+- 運用注意の再確認: stop_mysql.sh が 3308(InnoDB 参照)を巻き添えにする件、再発。
+  参照インスタンスは使用直前に必ず ping→再起動。
+
+### [2026-06-12] エントリ25: OLTP 回帰の 25% 低下 → jemalloc decay が真因
+
+- Silo 変更後の OLTP 回帰で全モード一律 ~25% 低下(explicit 196→150, TATP 1586→1323)。
+  **正しさは完璧**(C1-C4 全 0、SI 強プローブ clean、エラー/リトライ 0)。
+- 一律性から環境要因を疑い A/B: **中立 MALLOC_CONF で 187.9 に回復** → 真因 = 1s decay が
+  OLTP のワーキングセットページを tx 間で OS へ返却し再 fault させていた。
+- **対処: decay 10s へ緩和**(commit 655278a)→ explicit **191.1 req/s**(基準 196 と誤差圏)。
+  分析クエリ間(各 20-50s)の GB 返却は 10s でも機能。Silo merge-install の OLTP コストは
+  実質ゼロと確認。
+
+### [2026-06-12] エントリ26: SOTA 統合バックログ(Claude+Codex 両調査の収束)
+
+両 deep research(docs/phase15_sota_pushdown_survey.md + Codex 版)はほぼ同順位に収束:
+1. **Projection pushdown + late materialization(+streaming batch)** — 転送/メモリ両減。
+   PlanStep に column 集合を追加し server で列スライス。S/M。両調査の最上位圏。
+2. **Partial aggregation pushdown** — q1 型を「集約状態のみ返す」(旧ブランチ実測 q1 0.49s)。
+   メモリ上限付き hash + 超過時 pushback(FPDB 型)。M。
+3. **Zone maps / pruning metadata(Snowflake 99.4% 削減の教訓)** — index-node min/max で
+   scan fragment を事前棄却。M-L。
+4. **粗粒度 RW 検証(precision locking / range-hash 拡張)** — 巨大 scan の per-key 検証を
+   範囲トークン化。user 発案 digest 検証は公表例なし=新規性。L。
+5. **SIP(Bloom/predicate transfer)の one-RPC 内実装** — 文献になし=新規性(CIDR'24 3.3x)。M。
+6. **One-shot tx テンプレート(Chardonnay 型 dry-run prefetch)** — TPC-C autogen の構造解。L。
+7. LZ4 wire 圧縮は **localhost では非推奨**(VLDB'17)→ 軽量列エンコード(FOR/dict/RLE)を優先。
+8. LineairDB per-record メタ圧縮(192B→、user 解禁済み)— phase12 ロードマップ続行。M-L。
+- COST_V2 は係数較正+カバレッジ完全化(q17/q20 の miss 形状解消)後に再評価。
+  q21 の hash-plan メモリ(44.8GB)には memory-budget aware costing が必要(Codex 提案 #9/#10)。
+
 (以降追記)
