@@ -377,6 +377,22 @@ static int autogen_and_execute_prefetch(THD *thd, AccessPath *root,
     tx->trace()->record_section_count("autogen_steps", steps.size());
   }
 
+  // Projection pushdown: only for the read-only no-validate autocommit path.
+  // The tx ends with this statement, so the trimmed cached values can never
+  // feed a later DML's row rebuild (the set_fields DML trap), and commit-time
+  // validation (which the trims would not affect anyway) is elided here.
+  // HELIOS_PROJECTION=0 disables (A/B measurement + emergency off-switch).
+  static const char *proj_env = std::getenv("HELIOS_PROJECTION");
+  static const bool projection_enabled =
+      proj_env == nullptr || std::strcmp(proj_env, "0") != 0;
+  if (projection_enabled && tx->ro_novalidate()) {
+    std::unordered_map<std::string, std::vector<uint32_t>> kept_of;
+    plan_projection_pushdown(thd, &steps, &kept_of);
+    for (auto &kv : kept_of) {
+      tx->set_table_projection(kv.first, std::move(kv.second));
+    }
+  }
+
   // Loads the prefetched rows into the local cache and validation sets.
   tx->execute_read_plan(steps);
   return tx->is_aborted() ? HA_ERR_LOCK_DEADLOCK : 0;

@@ -2264,12 +2264,71 @@ int ha_lineairdb::set_fields_from_lineairdb(uchar *buf,
   /* Avoid asserts in ::store() for columns that are not going to be updated
    */
   my_bitmap_map *org_bitmap = dbug_tmp_use_all_columns(table, table->write_set);
+
+  // Projection pushdown: if this table's cached VALUES were trimmed to a
+  // subset of columns, the parsed row holds only the kept columns in order;
+  // map the k-th present column to field index kept[k]. Non-kept fields are
+  // left untouched (MySQL won't read columns outside read_set; projection is
+  // only planned for ro_novalidate SELECT, so no DML ever rebuilds a row from
+  // this buffer). null flags stay FULL, so is_null_in_record(buf) is correct.
+  const std::vector<uint32_t> *kept = nullptr;
+  {
+    auto tx = get_transaction(ha_thd());
+    if (tx != nullptr) kept = tx->table_projection(db_table_name);
+  }
+  // Use the projected mapping ONLY when the value actually has the projected
+  // column count: self-corrects against a full row that slipped into a
+  // projected table (server-side safe fallback ships full rows unchanged).
+  if (kept != nullptr && ldbField.get_row_size() != kept->size()) {
+    kept = nullptr;
+  }
+  // Skipping Field::store for non-read_set columns is sound ONLY for a pure
+  // SELECT serve: DML reuses this row buffer to rebuild the old row and ALL
+  // secondary keys, and MySQL may leave untouched columns out of read_set
+  // (the engine does not advertise HA_PARTIAL_COLUMN_READ).
+  THD *const thd_for_serve = ha_thd();
+  const bool select_serve =
+      thd_for_serve != nullptr && thd_for_serve->lex != nullptr &&
+      thd_for_serve->lex->sql_command == SQLCOM_SELECT;
+
+  if (kept != nullptr) {
+    for (size_t k = 0; k < kept->size(); ++k) {
+      const uint32_t fi = (*kept)[k];
+      if (fi >= table->s->fields) break;  // safety: malformed projection
+      if (select_serve && !bitmap_is_set(table->read_set, fi))
+        continue;  // pure SELECT: skip store for columns MySQL won't read
+      Field *f = table->field[fi];
+      const auto mysqlFieldValue = ldbField.get_column_of_row(k);
+      if (f->is_nullable() && f->is_null_in_record(buf)) {
+        f->set_null();
+      } else {
+        f->store(mysqlFieldValue.data(), mysqlFieldValue.size(),
+                 &my_charset_bin, CHECK_FIELD_WARN);
+        Field *arr[2] = {f, nullptr};
+        if (store_blob_to_field(arr)) {
+          dbug_tmp_restore_column_map(table->write_set, org_bitmap);
+          return HA_ERR_OUT_OF_MEM;
+        }
+      }
+    }
+    dbug_tmp_restore_column_map(table->write_set, org_bitmap);
+    return 0;
+  }
+
   /**
-   * store each column value to corresponding field
+   * store each column value to corresponding field (full row). Text->binary
+   * re-parse (Field::store) only happens for columns the statement reads —
+   * the per-serve read_set skip is the set_fields chokepoint win (the old
+   * branch measured 13.1M calls / 5.9s on q21 SF=1 before it).
    */
   size_t columnIndex = 0;
   for (Field **field = table->field; *field; field++) {
+    if (columnIndex >= ldbField.get_row_size()) break;  // short/trimmed value
     const auto mysqlFieldValue = ldbField.get_column_of_row(columnIndex++);
+    if (select_serve &&
+        !bitmap_is_set(table->read_set, (*field)->field_index())) {
+      continue;  // pure SELECT: column not read this statement
+    }
     if ((*field)->is_nullable() && (*field)->is_null_in_record(buf)) {
       (*field)->set_null();
     } else {

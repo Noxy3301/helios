@@ -1,6 +1,9 @@
 #ifndef LINEAIRDB_AUTOGEN_HH
 #define LINEAIRDB_AUTOGEN_HH
 
+#include <cstdint>
+#include <string>
+#include <unordered_map>
 #include <vector>
 
 class THD;
@@ -33,5 +36,15 @@ bool autogen_read_plan_from_qep(
 bool autogen_read_plan_from_index_search(
     THD *thd, TABLE *table, uint index, const IndexSearchPlan &search,
     std::vector<LineairDBProxy::ReadPlanStep> *out);
+
+// Projection pushdown planning (ro_novalidate SELECT only): per physical
+// table, union the read_set across aliases; annotate eligible scan steps with
+// the kept column set so the server trims shipped VALUES. kept_out gets one
+// entry per projected table for the tx-side decoder map. Tables serving
+// value-form bindings (the server extracts columns/bytes from their shipped
+// rows positionally) and generated-column tables ship full.
+void plan_projection_pushdown(
+    THD *thd, std::vector<LineairDBProxy::ReadPlanStep> *steps,
+    std::unordered_map<std::string, std::vector<uint32_t>> *kept_out);
 
 #endif

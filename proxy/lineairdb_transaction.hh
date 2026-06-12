@@ -167,6 +167,19 @@ public:
   const std::string& get_pushed_filter() const { return pushed_filter_; }
   void clear_pushed_filter() { pushed_filter_.clear(); }
 
+  // Projection pushdown (ro_novalidate SELECT only): per physical table, the
+  // kept 0-based field ordinals its staged VALUES were trimmed to. The row
+  // decoder maps the k-th parsed column to kept[k]; nullptr = full rows.
+  void set_table_projection(const std::string& table_name,
+                            std::vector<uint32_t> kept) {
+    table_projection_[table_name] = std::move(kept);
+  }
+  const std::vector<uint32_t>* table_projection(
+      const std::string& table_name) const {
+    auto it = table_projection_.find(table_name);
+    return it == table_projection_.end() ? nullptr : &it->second;
+  }
+
   void add_rowcount_delta(LineairDB_share *share, const std::string &table_name, int64_t delta);
   int64_t peek_rowcount_delta(const LineairDB_share *share) const;
 
@@ -298,6 +311,9 @@ private:
 
   // Predicate pushdown: serialized PushedPredicate for scan filtering
   std::string pushed_filter_;
+
+  // Projection pushdown: physical table name -> kept field ordinals.
+  std::unordered_map<std::string, std::vector<uint32_t>> table_projection_;
 
   // Max number of buffered write/delete ops before an automatic flush
   static constexpr size_t WRITE_BATCH_SIZE = 100;

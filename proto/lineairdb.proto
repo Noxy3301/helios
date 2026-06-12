@@ -294,6 +294,19 @@ message TxExecuteReadPlan {
         // (read-only no-validate), since a replay could not reproduce the
         // filtered key set.
         PushedPredicate filter = 11;
+        // Projection pushdown: when present, the server returns each base-row
+        // VALUE trimmed to only field_indexes (0-based TABLE::field[], ascending,
+        // unique), re-emitting [full null_flags][kept columns]. Absent = full
+        // row (legacy). The proxy decodes by mapping the k-th present column to
+        // field field_indexes[k]. The server still parses the FULL row to
+        // evaluate `filter` before trimming.
+        RowProjection projection = 12;
+    }
+    // Set of base-row columns the query needs (= the proxy's read_set union
+    // across aliases of the same physical table).
+    message RowProjection {
+        uint32 num_columns = 1;                            // table->s->fields
+        repeated uint32 field_indexes = 2 [packed = true]; // kept, ascending/unique
     }
     message StepResult {
         bool found = 1;

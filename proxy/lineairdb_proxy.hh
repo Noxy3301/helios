@@ -196,6 +196,10 @@ public:
         bool reverse_scan = false;
         // Serialized PushedPredicate (empty = no filter); see the proto note.
         std::string serialized_filter;
+        // Projection pushdown: kept 0-based TABLE::field[] ordinals (ascending,
+        // unique). Empty = ship full rows. num_columns = table->s->fields.
+        std::vector<uint32_t> projection;
+        uint32_t projection_num_columns = 0;
     };
     struct ReadPlanStepResult {
         bool found = false;

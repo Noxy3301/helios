@@ -263,4 +263,47 @@ commit range keys 381→**18.4**(17.5)、validate req 38.7KB→**7.6KB**・353�
   誤差圏)/ TATP autogen **1575.7**(1594 と誤差圏)、エラー/retry 全 0。**B1 クローズ**。
 - 次: Track B2(projection pushdown + late materialization)を SF=0.1 イテレーションで。
 
+### [2026-06-12] エントリ11: Track B2 projection pushdown 実装(SF=0.1 イテレーション)
+
+**実装**(旧ブランチからの設計移植、semijoin 連携部は本ブランチに無いため除外):
+- proto: ReadPlanStep に `RowProjection projection = 12`(num_columns + kept field_indexes)。
+- proxy 計画(lineairdb_autogen.cc plan_projection_pushdown): physical table 単位で
+  全 alias の read_set を UNION(自己結合は superset を共有)。除外 = gcol 表 /
+  value-form binding(from_key=false)の source 表(v1 は remap せず full ship)/
+  全列読み。**gate = ro_novalidate autocommit SELECT のみ**(tx がその statement で
+  終わるため trimmed cache 行が後続 DML の行再構築に流れる罠を構造排除)+
+  `HELIOS_PROJECTION=0` で無効化可(A/B + 緊急 off)。
+- server(lineairdb_rpc.cc): `trim_row_value`(旧ブランチ移植 — [null_flags full]
+  [kept cols] 再 emit、不整合は full ship の安全 fallback)を全6 emission 箇所
+  (plain P/S scan, FER, FES, for_each point, scalar point)に `project_value` で適用。
+  filter 評価は full row のまま(trim は評価後)。
+- proxy decode(set_fields_from_lineairdb): tx の table_projection map で k 番目の
+  parsed 列 → kept[k] へマップ(列数一致時のみ=自己修正)。**Step4a**(read_set 外の
+  Field::store skip、SQLCOM_SELECT gate)も同時移植。LineairDBField に get_row_size()。
+- SF=0.1 matrix: 22/22 OK。
+
+**重大な副産物発見: stateful 経路の既存バグ**。md5 の参照系を「同一データの
+prefetch OFF(stateful)」にしたところ q2/q9/q16 の ref が **rc=0 で 0 行**。
+**B2 変更を stash した pre-B2 バイナリでも再現** = 既存バグ(B2 無関係)。
+共通点 = part への文字列述語(LIKE 系)。ECP off でも再現。phase15 の stateful 重
+query は SF=1 で >120s timeout のため一度も結果検証されていなかった。
+→ バックログ化(stateful は計測対象外経路だが正しさバグとして要調査)。
+md5 参照系は InnoDB(3308 に SF=0.1 ロード、SF=1 ref はマイルストーン時に再構築)へ変更。
+
+### [2026-06-12] エントリ12: B2 計測(SF=0.1)— md5 22/22 + 転送 57% 削減
+
+- **md5 22/22 vs InnoDB(SF=0.1)** — v1 と option-2 remap 後の両方で一致。
+  (副次確認: stateful 0行バグの 3 query も target 側は正しかった)
+- **A/B(HELIOS_PROJECTION=1 vs 0、全22、ENABLE_RPC_TRACE)**:
+  - v1(remap 無し): 3019MB → 1786MB(-41%)、wall 41.0→36.9s(-10%)
+  - 取り残し q5/q7/q8/q14/q21(2-13%しか減らず)の真因 = lineitem が value-form
+    binding(l_partkey/l_suppkey 等の値列 probe)の source で unsafe 扱い
+  - **option-2 remap 実装後: 3019MB → 1313MB(-57%)、wall 39.0→34.9s(-11%)**。
+    q21 370→165MB(-56%)、q5 145→61MB、q14 113→46MB — 全 query 45-66% 削減
+- remap = binding の source 列を kept に強制 + source_column を projected 位置
+  (1-based)に書換え。server の extract_value_column は trimmed 行の位置で読む。
+- SF=1 換算で suite あたり ~12GB の転送削減見込み + staged value 縮小により
+  proxy 側 RSS も同率縮小(SF=1 はマイルストーン計測で確認)。
+- Codex 敵対的レビュー実行中(binding/フィルタ × trimmed 行の交差攻撃ベクタ)。
+
 (以降、変更・計測ごとにエントリ追記)

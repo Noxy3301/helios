@@ -5,6 +5,7 @@
 #include <limits>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -1020,6 +1021,119 @@ bool autogen_read_plan_from_qep(
 
   *out = std::move(steps);
   return true;
+}
+
+// Projection pushdown planning (v1, ported from the old branch minus the
+// semijoin reconciliation it carried there): per PHYSICAL table ("./db/tbl",
+// cross-db safe), UNION the read_set of every alias so a self-joined table
+// ships one uniform column set that is a superset of each alias's needs.
+// Excluded: generated-column tables (server can't recompute), tables whose
+// shipped rows feed value-form bindings (the server slices their VALUES
+// positionally; v1 ships those full instead of remapping), and the
+// no-benefit cases (no columns / all columns read).
+void plan_projection_pushdown(
+    THD *thd, std::vector<LineairDBProxy::ReadPlanStep> *steps,
+    std::unordered_map<std::string, std::vector<uint32_t>> *kept_out) {
+  kept_out->clear();
+  if (thd == nullptr || thd->lex == nullptr || steps == nullptr) return;
+
+  std::unordered_map<std::string, std::vector<bool>> union_rs;
+  std::unordered_map<std::string, uint32_t> fields_of;
+  std::unordered_set<std::string> gcol_tables;
+  for (auto *tl = thd->lex->query_tables; tl != nullptr; tl = tl->next_global) {
+    if (tl->table == nullptr || tl->table->s == nullptr) continue;
+    TABLE *t = tl->table;
+    const std::string n = physical_table_key(t);
+    const uint32_t nf = t->s->fields;
+    fields_of[n] = nf;
+    auto &u = union_rs[n];
+    if (u.size() < nf) u.resize(nf, false);
+    for (uint f = 0; f < nf; ++f) {
+      if (t->field[f]->is_gcol()) gcol_tables.insert(n);
+      if (bitmap_is_set(t->read_set, f)) u[f] = true;
+    }
+  }
+
+  // Value-form bindings read the SOURCE step's shipped row positionally
+  // (option-2, ported from the old branch):
+  //  - column form (source_column > 0): the server extracts column
+  //    (source_column - 1) from the value. PROJECTABLE: force that column
+  //    into the source table's kept set, then remap source_column to its
+  //    projected position below. (Without this, lineitem ships all 16
+  //    columns on q5/q7/q8/q14/q21 because l_partkey/l_suppkey probes are
+  //    value columns — the single largest transfer left.)
+  //  - byte-slice form (source_column == 0): offsets into the raw value are
+  //    not remappable -> the source ships full.
+  std::unordered_set<std::string> unsafe_src;
+  const auto force_binding_col =
+      [&](const LineairDBProxy::ReadPlanKeyBinding &b) {
+        if (b.from_key || b.source_step >= steps->size()) return;
+        const std::string &src = (*steps)[b.source_step].table_name;
+        auto fo = fields_of.find(src);
+        if (fo == fields_of.end()) {
+          unsafe_src.insert(src);
+          return;
+        }
+        if (b.source_column > 0) {
+          const uint32_t fi = static_cast<uint32_t>(b.source_column - 1);
+          if (fi >= fo->second) {
+            unsafe_src.insert(src);
+            return;
+          }
+          auto &u = union_rs[src];
+          if (u.size() < fo->second) u.resize(fo->second, false);
+          u[fi] = true;  // keep the binding's source column through the trim
+        } else {
+          unsafe_src.insert(src);  // byte-slice form: not remappable
+        }
+      };
+  for (const auto &s : *steps) {
+    for (const auto &b : s.bindings) force_binding_col(b);
+    for (const auto &b : s.end_bindings) force_binding_col(b);
+  }
+
+  // Decide kept per eligible table and build full-ordinal -> projected
+  // position maps (1-based; 0 = not kept) for the binding remap.
+  std::unordered_map<std::string, std::vector<uint32_t>> full_to_proj;
+  for (auto &kv : union_rs) {
+    const std::string &n = kv.first;
+    if (gcol_tables.count(n) != 0 || unsafe_src.count(n) != 0) continue;
+    const uint32_t nf = fields_of[n];
+    std::vector<uint32_t> kept;
+    for (uint32_t f = 0; f < nf; ++f) {
+      if (kv.second[f]) kept.push_back(f);
+    }
+    if (kept.empty() || kept.size() == nf) continue;  // no benefit
+    std::vector<uint32_t> f2p(nf, 0);
+    for (uint32_t k = 0; k < kept.size(); ++k) f2p[kept[k]] = k + 1;
+    full_to_proj.emplace(n, std::move(f2p));
+    kept_out->emplace(n, std::move(kept));
+  }
+
+  // Remap column-form bindings whose source table is now projected: the
+  // server reads (source_column - 1) from the SHIPPED (trimmed) value, so
+  // the index must point at the projected position. The column was forced
+  // into kept above, so its position is nonzero.
+  const auto remap_binding = [&](LineairDBProxy::ReadPlanKeyBinding &b) {
+    if (b.from_key || b.source_column <= 0 || b.source_step >= steps->size())
+      return;
+    auto it = full_to_proj.find((*steps)[b.source_step].table_name);
+    if (it == full_to_proj.end()) return;  // source ships full rows
+    const uint32_t fi = static_cast<uint32_t>(b.source_column - 1);
+    const uint32_t pos = (fi < it->second.size()) ? it->second[fi] : 0;
+    if (pos > 0) b.source_column = static_cast<int32_t>(pos);
+  };
+  for (auto &s : *steps) {
+    for (auto &b : s.bindings) remap_binding(b);
+    for (auto &b : s.end_bindings) remap_binding(b);
+  }
+
+  for (auto &s : *steps) {
+    auto it = kept_out->find(s.table_name);
+    if (it == kept_out->end()) continue;
+    s.projection = it->second;
+    s.projection_num_columns = fields_of[s.table_name];
+  }
 }
 
 // Produce a one-step prefetch plan from the handler access, raising
