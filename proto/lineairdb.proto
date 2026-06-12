@@ -266,6 +266,13 @@ message TxExecuteReadPlan {
         repeated bytes secondary_keys = 8;
         bytes actual_start_key = 9;
         bytes actual_end_key = 10;
+        // for_each scan probes (FER/FES): the flat arrays above are sliced
+        // into per-probe groups. group_sizes[i] rows belong to the probe
+        // whose effective bounds are [group_start_keys[i], group_end_keys[i]).
+        // Probes are deduplicated by start key on the server.
+        repeated uint32 group_sizes = 11;
+        repeated bytes group_start_keys = 12;
+        repeated bytes group_end_keys = 13;
     }
     message Request {
         repeated PlanStep steps = 1;

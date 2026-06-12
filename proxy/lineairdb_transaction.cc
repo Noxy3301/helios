@@ -8,6 +8,20 @@
 
 namespace {
 
+// Composite key for the scan-cache exact-start lookup indexes.
+inline std::string scan_cache_index_key(const std::string& table,
+                                        const std::string& index,
+                                        const std::string& start) {
+  std::string k;
+  k.reserve(table.size() + index.size() + start.size() + 2);
+  k += table;
+  k.push_back('\x01');
+  k += index;
+  k.push_back('\x01');
+  k += start;
+  return k;
+}
+
 std::string next_lexicographic_key(std::string key) {
   for (size_t i = key.size(); i-- > 0;) {
     auto byte = static_cast<unsigned char>(key[i]);
@@ -276,10 +290,63 @@ void LineairDBTransaction::execute_read_plan(
       }
     }
 
+    if (step.for_each && step.is_scan) {
+      // FER/FES probe groups: stage one bounded scan entry per (deduplicated)
+      // probe so the runtime per-outer-row range lookups hit the cache.
+      size_t flat = 0;  // index into the full (found or not) flat arrays
+      for (size_t g = 0; g < step_result.group_sizes.size(); ++g) {
+        const size_t n = step_result.group_sizes[g];
+        const std::string& gstart = g < step_result.group_start_keys.size()
+                                        ? step_result.group_start_keys[g]
+                                        : std::string();
+        const std::string& gend = g < step_result.group_end_keys.size()
+                                      ? step_result.group_end_keys[g]
+                                      : std::string();
+        if (step.index_name.empty()) {
+          LocalRangeScanEntry entry;
+          entry.table_name = step.table_name;
+          entry.start_key = gstart;
+          entry.end_key = gend;
+          entry.reverse_scan = step.reverse_scan;
+          entry.row_limit = step.scan_limit;
+          for (size_t j = flat; j < flat + n && j < step_result.scan_keys.size();
+               ++j) {
+            const std::string& key = step_result.scan_keys[j];
+            const std::string value = j < step_result.scan_values.size()
+                                          ? step_result.scan_values[j]
+                                          : "";
+            if (value.empty()) continue;
+            entry.rows.emplace_back(key, value);
+            entry.row_tids.push_back(
+                j < step_result.scan_tids.size() ? step_result.scan_tids[j] : 0);
+          }
+          push_range_scan_cache(std::move(entry));
+        } else {
+          LocalSecondaryScanEntry entry;
+          entry.table_name = step.table_name;
+          entry.index_name = step.index_name;
+          entry.start_key = gstart;
+          entry.end_key = gend;
+          entry.reverse_scan = step.reverse_scan;
+          entry.row_limit = step.scan_limit;
+          for (size_t j = flat; j < flat + n && j < step_result.scan_keys.size();
+               ++j) {
+            entry.primary_keys.push_back(step_result.scan_keys[j]);
+            if (j < step_result.secondary_keys.size()) {
+              entry.secondary_keys.push_back(step_result.secondary_keys[j]);
+            }
+          }
+          push_secondary_scan_cache(std::move(entry));
+        }
+        flat += n;
+      }
+      continue;
+    }
+
     if (step.for_each) continue;
 
     if (step.index_name.empty()) {
-      range_scan_cache_.push_back(
+      push_range_scan_cache(
           {step.table_name, step_result.actual_start_key,
            step_result.actual_end_key, step.reverse_scan, step.scan_limit,
            std::move(rows), std::move(row_tids)});
@@ -299,7 +366,7 @@ void LineairDBTransaction::execute_read_plan(
       for (const auto& key : step_result.scan_keys) {
         cached.primary_keys.push_back(key);
       }
-      secondary_scan_cache_.push_back(std::move(cached));
+      push_secondary_scan_cache(std::move(cached));
     }
   }
 }
@@ -985,6 +1052,15 @@ void LineairDBTransaction::drop_secondary_scan_cache(
     kept.push_back(entry);
   }
   secondary_scan_cache_.swap(kept);
+  // Vector indices shifted: rebuild the exact-start lookup index.
+  secondary_scan_start_index_.clear();
+  for (size_t i = 0; i < secondary_scan_cache_.size(); ++i) {
+    const auto& e = secondary_scan_cache_[i];
+    secondary_scan_start_index_[scan_cache_index_key(e.table_name,
+                                                     e.index_name,
+                                                     e.start_key)]
+        .push_back(i);
+  }
 }
 
 void LineairDBTransaction::record_write(const std::string& table_name,
@@ -1072,10 +1148,58 @@ void LineairDBTransaction::abort_prefetch_cache_miss(
   thd_mark_transaction_to_rollback(thread, 1);
 }
 
+void LineairDBTransaction::push_range_scan_cache(LocalRangeScanEntry entry) {
+  range_scan_start_index_[scan_cache_index_key(entry.table_name, "",
+                                               entry.start_key)]
+      .push_back(range_scan_cache_.size());
+  range_scan_cache_.push_back(std::move(entry));
+}
+
+void LineairDBTransaction::push_secondary_scan_cache(
+    LocalSecondaryScanEntry entry) {
+  secondary_scan_start_index_[scan_cache_index_key(
+                                  entry.table_name, entry.index_name,
+                                  entry.start_key)]
+      .push_back(secondary_scan_cache_.size());
+  secondary_scan_cache_.push_back(std::move(entry));
+}
+
 std::optional<LineairDBTransaction::LocalRangeScanEntry>
 LineairDBTransaction::lookup_range_scan_cache(
     const std::string& table_name, const std::string& start_key,
     const std::string& end_key, bool reverse_scan, uint64_t row_limit) const {
+  // Fast path: exact-start staged entry (the FER probe pattern).
+  auto idx_it = range_scan_start_index_.find(
+      scan_cache_index_key(table_name, "", start_key));
+  if (idx_it != range_scan_start_index_.end()) {
+    for (auto rit = idx_it->second.rbegin(); rit != idx_it->second.rend();
+         ++rit) {
+      const auto& e = range_scan_cache_[*rit];
+      if (e.reverse_scan == reverse_scan && e.row_limit == row_limit &&
+          end_key <= e.end_key) {
+        LocalRangeScanEntry cached = e;
+        cached.start_key = start_key;
+        cached.end_key = end_key;
+        cached.row_limit = row_limit;
+        std::vector<std::pair<std::string, std::string>> rows;
+        std::vector<uint64_t> row_tids;
+        rows.reserve(cached.rows.size());
+        row_tids.reserve(cached.row_tids.size());
+        for (size_t i = 0; i < cached.rows.size(); ++i) {
+          const auto& row = cached.rows[i];
+          if (row.first >= start_key && row.first < end_key) {
+            rows.push_back(row);
+            if (i < cached.row_tids.size())
+              row_tids.push_back(cached.row_tids[i]);
+          }
+        }
+        cached.rows = std::move(rows);
+        cached.row_tids = std::move(row_tids);
+        return cached;
+      }
+    }
+  }
+
   for (auto it = range_scan_cache_.rbegin();
        it != range_scan_cache_.rend(); ++it) {
     const bool same_table = it->table_name == table_name;
@@ -1113,6 +1237,38 @@ LineairDBTransaction::lookup_secondary_scan_cache(
     const std::string& start_key, const std::string& end_key,
     bool reverse_scan, uint64_t row_limit) const {
   (void)reverse_scan; // SI cache keeps the query-specific order from the plan
+
+  // Fast path: exact-start staged entry (the FES probe pattern).
+  auto idx_it = secondary_scan_start_index_.find(
+      scan_cache_index_key(table_name, index_name, start_key));
+  if (idx_it != secondary_scan_start_index_.end()) {
+    for (auto rit = idx_it->second.rbegin(); rit != idx_it->second.rend();
+         ++rit) {
+      const auto& e = secondary_scan_cache_[*rit];
+      if (e.row_limit == row_limit && end_key <= e.end_key) {
+        LocalSecondaryScanEntry cached = e;
+        cached.start_key = start_key;
+        cached.end_key = end_key;
+        cached.row_limit = row_limit;
+        if (cached.secondary_keys.size() == cached.primary_keys.size()) {
+          std::vector<std::string> secondary_keys;
+          std::vector<std::string> primary_keys;
+          secondary_keys.reserve(cached.secondary_keys.size());
+          primary_keys.reserve(cached.primary_keys.size());
+          for (size_t i = 0; i < cached.secondary_keys.size(); ++i) {
+            if (cached.secondary_keys[i] >= start_key &&
+                cached.secondary_keys[i] < end_key) {
+              secondary_keys.push_back(cached.secondary_keys[i]);
+              primary_keys.push_back(cached.primary_keys[i]);
+            }
+          }
+          cached.secondary_keys = std::move(secondary_keys);
+          cached.primary_keys = std::move(primary_keys);
+        }
+        return cached;
+      }
+    }
+  }
 
   for (auto it = secondary_scan_cache_.rbegin();
        it != secondary_scan_cache_.rend(); ++it) {

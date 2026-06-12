@@ -531,6 +531,12 @@ LineairDBProxy::ReadPlanResult LineairDBProxy::tx_execute_read_plan(
         for (const auto tid : step.scan_tids()) out.scan_tids.push_back(tid);
         out.secondary_keys.reserve(step.secondary_keys_size());
         for (const auto& key : step.secondary_keys()) out.secondary_keys.push_back(key);
+        out.group_sizes.reserve(step.group_sizes_size());
+        for (const auto sz : step.group_sizes()) out.group_sizes.push_back(sz);
+        out.group_start_keys.reserve(step.group_start_keys_size());
+        for (const auto& key : step.group_start_keys()) out.group_start_keys.push_back(key);
+        out.group_end_keys.reserve(step.group_end_keys_size());
+        for (const auto& key : step.group_end_keys()) out.group_end_keys.push_back(key);
         result.steps.push_back(std::move(out));
     }
 

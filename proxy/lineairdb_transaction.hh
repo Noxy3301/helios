@@ -264,6 +264,13 @@ private:
   };
   std::vector<LocalRangeScanEntry> range_scan_cache_;
   std::vector<LocalSecondaryScanEntry> secondary_scan_cache_;
+  // Exact-start lookup index over the scan caches: FER/FES staging creates one
+  // bounded entry per join probe (tens of thousands), and every runtime probe
+  // would otherwise scan the whole vector. Keyed table\x01index\x01start_key.
+  std::unordered_map<std::string, std::vector<size_t>> range_scan_start_index_;
+  std::unordered_map<std::string, std::vector<size_t>> secondary_scan_start_index_;
+  void push_range_scan_cache(LocalRangeScanEntry entry);
+  void push_secondary_scan_cache(LocalSecondaryScanEntry entry);
 
   // Predicate pushdown: serialized PushedPredicate for scan filtering
   std::string pushed_filter_;

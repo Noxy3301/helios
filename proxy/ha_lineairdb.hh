@@ -255,6 +255,84 @@ public:
     return (double)ranges * 1.0 + (double)rows * 0.5;
   }
 
+  /* ---- Disaggregated cost model (HELIOS_COST_V2, ported from phase-9/9b) ----
+   * Override the NEW Cost_estimate API (which the 8.0 join planner actually
+   * uses for driving-table / ref-vs-scan decisions) instead of the deprecated
+   * scan_time()/read_time(). Helios's real cost is NOT page I/O — it is
+   * (rows transferred × per-row serialize+RPC+ingest) + (RPC round-trips):
+   *
+   *   scan : io = C_rpc + bytes*C_byte               ; cpu = rows*(C_row + C_remote)
+   *   ref  : io = ranges*(C_rpc/batch) + bytes*C_byte ; cpu = rows*(C_probe + C_row)
+   *
+   * A ref lookup does not charge a full RPC per outer row: probe keys ship in
+   * batches, so a high-fanout nested loop costs ~prefix/batch RPCs. All terms
+   * are env-overridable for sweeping/calibration; defaults are in MySQL cost
+   * units (ROW_EVALUATE_COST=0.1).
+   */
+  static bool helios_cost_v2_on() {
+    static const char *e = std::getenv("HELIOS_COST_V2");
+    return e != nullptr && e[0] == '1';
+  }
+  static double helios_cost_param(const char *name, double def) {
+    const char *e = std::getenv(name);
+    if (!e || !e[0]) return def;
+    char *end = nullptr;
+    double v = strtod(e, &end);
+    return (end && end != e) ? v : def;
+  }
+  static double kC_rpc()    { static const double v = helios_cost_param("HELIOS_C_RPC",    50.0);   return v; }
+  static double kC_byte()   { static const double v = helios_cost_param("HELIOS_C_BYTE",   0.0008); return v; }
+  static double kC_row()    { static const double v = helios_cost_param("HELIOS_C_ROW",    0.10);   return v; }
+  static double kC_probe()  { static const double v = helios_cost_param("HELIOS_C_PROBE",  0.05);   return v; }
+  static double kC_remote() { static const double v = helios_cost_param("HELIOS_C_REMOTE", 0.05);   return v; }
+  static double kEffBatch() { static const double v = helios_cost_param("HELIOS_BATCH",    1024.0); return v; }
+
+  double helios_row_bytes() const {
+    // stats.mean_rec_length is set in info() from table->s->reclength (>=100).
+    // Must NOT deref table->s here: TABLE is incomplete in this header.
+    double b = (double)stats.mean_rec_length;
+    return b > 0 ? b : 64.0;                            // floor for unknown
+  }
+  Cost_estimate helios_ref_cost(double ranges, double rows) const {
+    Cost_estimate c;
+    const double bytes = rows * helios_row_bytes();
+    // per-lookup RPC amortized over the prefetch batch size.
+    const double rpc = (ranges > 0 ? ranges : 1.0) * (kC_rpc() / kEffBatch());
+    c.add_io(rpc + bytes * kC_byte());
+    c.add_cpu(rows * (kC_probe() + kC_row()));
+    return c;
+  }
+
+  Cost_estimate table_scan_cost() override
+  {
+    if (!helios_cost_v2_on()) return handler::table_scan_cost();
+    Cost_estimate c;
+    const double rows = (double)stats.records;
+    const double bytes = rows * helios_row_bytes();
+    c.add_io(kC_rpc() + bytes * kC_byte());      // 1 scan RPC + transfer wait
+    c.add_cpu(rows * (kC_row() + kC_remote()));  // materialize + remote scan CPU
+    return c;
+  }
+
+  Cost_estimate read_cost(uint index, double ranges, double rows) override
+  {
+    if (!helios_cost_v2_on()) return handler::read_cost(index, ranges, rows);
+    return helios_ref_cost(ranges, rows);
+  }
+
+  Cost_estimate index_scan_cost(uint index, double ranges, double rows) override
+  {
+    if (!helios_cost_v2_on())
+      return handler::index_scan_cost(index, ranges, rows);
+    return helios_ref_cost(ranges, rows);
+  }
+
+  // NOTE: we deliberately do NOT override page_read_cost()/worst_seek_times().
+  // Measured A/B on the phase-9 branch: a flat per-ref RPC charge there
+  // over-penalized ref chains and regressed q10/q3 while not fixing q7. The
+  // table_scan_cost/read_cost/index_scan_cost trio alone gives the best join
+  // orders.
+
   /*
     Everything below are methods that we implement in ha_lineairdb.cc.
 

@@ -644,12 +644,67 @@ void LineairDBRpc::handleTxExecuteReadPlan(const std::string& message,
             const auto* source = previous_results[source_step];
             const int row_count =
                 std::max(source->scan_keys_size(), source->scan_values_size());
+            // Dedup probes: many source rows share a join key, and the proxy
+            // serves every runtime probe of one key from the single staged
+            // result, so re-executing the probe only inflates the response.
+            std::unordered_set<std::string> seen_probe_keys;
+            seen_probe_keys.reserve(static_cast<size_t>(row_count));
             for (int row = 0; row < row_count; ++row) {
                 bool row_complete = true;
                 const std::string row_key =
                     build_plan_key(step.key_prefix(), step.bindings(),
                                    previous_results, row, &row_complete);
                 if (!row_complete) continue;
+                if (!seen_probe_keys.insert(row_key).second) continue;
+
+                if (step.is_scan()) {
+                    // FER/FES: per-probe prefix range [row_key, next(row_key)).
+                    const std::string row_end = next_lexicographic_key(row_key);
+                    int group_rows = 0;
+                    if (step.index_name().empty()) {
+                        auto scan_result =
+                            db_manager_->get_database()->StatelessRangeScan(
+                                step.table_name(), row_key, row_end,
+                                step.scan_limit(), step.reverse_scan());
+                        if (!scan_result.ok) {
+                            response.set_ok(false);
+                            result = response.SerializeAsString();
+                            return;
+                        }
+                        for (auto& r : scan_result.rows) {
+                            step_result->add_scan_keys(std::move(r.key));
+                            step_result->add_scan_values(std::move(r.value));
+                            step_result->add_scan_tids(r.tid);
+                            ++group_rows;
+                        }
+                    } else {
+                        auto scan_result =
+                            db_manager_->get_database()
+                                ->StatelessSecondaryRangeScan(
+                                    step.table_name(), step.index_name(),
+                                    row_key, row_end, step.scan_limit(),
+                                    step.reverse_scan());
+                        if (!scan_result.ok) {
+                            response.set_ok(false);
+                            result = response.SerializeAsString();
+                            return;
+                        }
+                        for (auto& r : scan_result.rows) {
+                            step_result->add_secondary_keys(
+                                std::move(r.secondary_key));
+                            step_result->add_scan_keys(std::move(r.primary_key));
+                            step_result->add_scan_values(std::move(r.value));
+                            step_result->add_scan_tids(r.tid);
+                            ++group_rows;
+                        }
+                    }
+                    step_result->add_group_sizes(
+                        static_cast<uint32_t>(group_rows));
+                    step_result->add_group_start_keys(row_key);
+                    step_result->add_group_end_keys(row_end);
+                    continue;
+                }
+
                 auto read_result =
                     db_manager_->get_database()->StatelessRead(
                         step.table_name(), row_key);

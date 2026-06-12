@@ -191,6 +191,10 @@ public:
         std::vector<std::string> secondary_keys;
         std::string actual_start_key;
         std::string actual_end_key;
+        // for_each scan probes (FER/FES): per-probe slices of the flat arrays.
+        std::vector<uint32_t> group_sizes;
+        std::vector<std::string> group_start_keys;
+        std::vector<std::string> group_end_keys;
     };
     struct ReadPlanResult {
         bool ok = false;

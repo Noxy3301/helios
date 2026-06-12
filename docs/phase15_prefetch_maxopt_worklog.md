@@ -240,4 +240,30 @@ table_path を再帰、temp table leaf は compile loop で skip)。q1 が prefe
 **運用教訓**: `build_partial.sh` は稼働中の lineairdb-server バイナリを上書きする → 直後にサーバが
 silent crash(10:47 の障害の真因)。**ビルド後は必ず server 再起動+リロード**。
 
+### [2026-06-12] エントリ11: TPC-H カバレッジ攻略 — FER/FES 実装
+
+**M0+M2+M3 後のカバレッジ**(固定パラメータ 22 本, prefetch ON+novalidate): q1/q6 のみ OK。
+残り 20 本は全て **FER(for_each primary range probe)/ FES(for_each secondary probe)未対応**
+(=NLJ の inner を outer 行ごとに部分鍵/二次索引で引く形)による NO-PLAN。
+COST_V2(旧ブランチ移植、env gate)を ON にした実験では plan が別の未対応形状
+(secondary INDEX_SCAN / missing root_access_path / q6 まで REF 化)へ移るだけで改善せず
+→ **カバレッジ欠落を直すのが先**、cost model は全形状対応後に再評価(ポートは gated でコミット済)。
+
+**FER/FES 実装**(proto+server+proxy+autogen):
+1. proto StepResult += `group_sizes/group_start_keys/group_end_keys`(flat 配列の per-probe スライス)。
+2. server handleTxExecuteReadPlan: for_each && is_scan のとき、source 行ごとに
+   `[row_key, next_lex(row_key))` の prefix range を StatelessRangeScan(FER)/
+   StatelessSecondaryRangeScan(FES)で実行し group 化して返す。**probe key で dedup**
+   (旧ブランチ「foreach 重複 14x」教訓: 同一 join 鍵の重複 probe は 1 回だけ実行)。
+   point for_each も同様に dedup(record_row_cache は key ベースで冪等)。
+3. proxy execute_read_plan: group ごとに LocalRangeScanEntry / LocalSecondaryScanEntry を staging
+   (runtime の per-outer-row probe が exact-range で hit)。
+4. **scan cache に exact-start ハッシュ索引**(`table\x01index\x01start`)を追加。
+   FER/FES は probe 数万件の staging になるため線形 lookup だと O(N²) で破綻する。
+   push_range/secondary_scan_cache ヘルパで索引維持、drop_secondary_scan_cache で再構築。
+5. autogen compile_ref_lookup: FER/FES 拒否を撤廃し is_scan for_each step を発行
+   (secondary は index_name 付与)。
+- validation 整合: 各 group は bounded range なので従来の RangeReadEntry replay で検証可能
+  (novalidate OFF でも健全)。
+
 (以降追記)
