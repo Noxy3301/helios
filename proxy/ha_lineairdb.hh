@@ -153,6 +153,13 @@ private:
   // (autogen LIMIT pushdown): reading past the last row must abort the tx
   // instead of reporting EOF, because the real range may hold more rows.
   bool materialized_scan_truncated_{false};
+  // Per-statement memo for set_fields_from_lineairdb (the per-row chokepoint):
+  // projection layout + SELECT-serve flag, refreshed on query_id change. The
+  // tx (and thus the projection pointee) outlives the statement.
+  uint64_t serve_memo_query_id_{0};
+  uint64_t serve_memo_proj_epoch_{0};
+  const std::vector<uint32_t> *serve_memo_projection_{nullptr};
+  bool serve_memo_select_{false};
   std::string last_fetched_primary_key_;
   std::string end_range_exclusive_key_; // For HA_READ_BEFORE_KEY: exclude this key from results
   my_off_t

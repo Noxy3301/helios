@@ -853,10 +853,13 @@ void LineairDBRpc::handleTxExecuteReadPlan(const std::string& message,
 
         // Projection pushdown: trim each emitted base-row VALUE to the kept
         // columns. Runs AFTER row_passes (the filter parses the FULL row).
-        // On any inconsistency the full value ships unchanged — the proxy
-        // decoder keys off the parsed column count, so a stray full row in a
-        // projected table still decodes correctly.
+        // Trim failure FAILS CLOSED (ok=false, the statement aborts loudly):
+        // a full row slipping into a projected stream would be misread by any
+        // later step whose binding source_column was remapped to the
+        // projected layout (Codex P1), and a failed trim means a malformed
+        // row, which must never pass silently.
         const bool step_has_projection = step.has_projection();
+        bool projection_failed = false;
         auto project_value = [&](std::string&& v) -> std::string {
             if (!step_has_projection || v.empty()) return std::move(v);
             std::string out;
@@ -864,6 +867,7 @@ void LineairDBRpc::handleTxExecuteReadPlan(const std::string& message,
                                step.projection().num_columns(), out)) {
                 return out;
             }
+            projection_failed = true;
             return std::move(v);
         };
 
@@ -957,6 +961,11 @@ void LineairDBRpc::handleTxExecuteReadPlan(const std::string& message,
                     step_result->add_scan_values("");
                 }
             }
+            if (projection_failed) {
+                response.set_ok(false);
+                flat_plan::encode_to_string(response, result);
+                return;
+            }
             continue;
         }
 
@@ -970,6 +979,11 @@ void LineairDBRpc::handleTxExecuteReadPlan(const std::string& message,
             step_result->set_tid(read_result.tid);
             if (read_result.found) {
                 step_result->set_value(project_value(std::move(read_result.value)));
+            }
+            if (projection_failed) {
+                response.set_ok(false);
+                flat_plan::encode_to_string(response, result);
+                return;
             }
             continue;
         }
@@ -1011,6 +1025,11 @@ void LineairDBRpc::handleTxExecuteReadPlan(const std::string& message,
                 step_result->add_scan_values(project_value(std::move(row.value)));
                 step_result->add_scan_tids(row.tid);
             }
+        }
+        if (projection_failed) {
+            response.set_ok(false);
+            flat_plan::encode_to_string(response, result);
+            return;
         }
     }
 

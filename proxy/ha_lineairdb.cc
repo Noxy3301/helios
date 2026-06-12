@@ -2271,25 +2271,42 @@ int ha_lineairdb::set_fields_from_lineairdb(uchar *buf,
   // left untouched (MySQL won't read columns outside read_set; projection is
   // only planned for ro_novalidate SELECT, so no DML ever rebuilds a row from
   // this buffer). null flags stay FULL, so is_null_in_record(buf) is correct.
-  const std::vector<uint32_t> *kept = nullptr;
-  {
-    auto tx = get_transaction(ha_thd());
-    if (tx != nullptr) kept = tx->table_projection(db_table_name);
+  //
+  // Memoized per statement: set_fields is the per-row chokepoint and the tx
+  // lookup + string-keyed map find per row cost every mode ~5% OLTP. The tx
+  // (and thus the pointee) outlives the statement; query_id change refreshes.
+  THD *const thd_for_serve = ha_thd();
+  const uint64_t serve_query_id =
+      thd_for_serve != nullptr
+          ? static_cast<uint64_t>(thd_for_serve->query_id)
+          : 0;
+  // Epoch guard: optimize-time unit serves can stamp the memo BEFORE the
+  // statement-root staging registers projection layouts; any registration
+  // bumps the process-wide epoch and forces a refresh.
+  const uint64_t proj_epoch = LineairDBTransaction::projection_global_epoch();
+  if (serve_memo_query_id_ != serve_query_id ||
+      serve_memo_proj_epoch_ != proj_epoch) {
+    serve_memo_query_id_ = serve_query_id;
+    serve_memo_proj_epoch_ = proj_epoch;
+    auto tx = get_transaction(thd_for_serve);
+    serve_memo_projection_ =
+        tx != nullptr ? tx->table_projection(db_table_name) : nullptr;
+    // Skipping Field::store for non-read_set columns is sound ONLY for a pure
+    // SELECT serve: DML reuses this row buffer to rebuild the old row and ALL
+    // secondary keys, and MySQL may leave untouched columns out of read_set
+    // (the engine does not advertise HA_PARTIAL_COLUMN_READ).
+    serve_memo_select_ = thd_for_serve != nullptr &&
+                         thd_for_serve->lex != nullptr &&
+                         thd_for_serve->lex->sql_command == SQLCOM_SELECT;
   }
+  const std::vector<uint32_t> *kept = serve_memo_projection_;
   // Use the projected mapping ONLY when the value actually has the projected
   // column count: self-corrects against a full row that slipped into a
-  // projected table (server-side safe fallback ships full rows unchanged).
+  // projected table (unit-episode staging ships full rows).
   if (kept != nullptr && ldbField.get_row_size() != kept->size()) {
     kept = nullptr;
   }
-  // Skipping Field::store for non-read_set columns is sound ONLY for a pure
-  // SELECT serve: DML reuses this row buffer to rebuild the old row and ALL
-  // secondary keys, and MySQL may leave untouched columns out of read_set
-  // (the engine does not advertise HA_PARTIAL_COLUMN_READ).
-  THD *const thd_for_serve = ha_thd();
-  const bool select_serve =
-      thd_for_serve != nullptr && thd_for_serve->lex != nullptr &&
-      thd_for_serve->lex->sql_command == SQLCOM_SELECT;
+  const bool select_serve = serve_memo_select_;
 
   if (kept != nullptr) {
     for (size_t k = 0; k < kept->size(); ++k) {

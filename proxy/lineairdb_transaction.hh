@@ -1,6 +1,7 @@
 #ifndef LINEAIRDB_TRANSACTION_HH
 #define LINEAIRDB_TRANSACTION_HH
 
+#include <atomic>
 #include <optional>
 #include <unordered_map>
 #include <unordered_set>
@@ -170,9 +171,16 @@ public:
   // Projection pushdown (ro_novalidate SELECT only): per physical table, the
   // kept 0-based field ordinals its staged VALUES were trimmed to. The row
   // decoder maps the k-th parsed column to kept[k]; nullptr = full rows.
+  // Registration bumps a process-wide epoch so the handler's per-statement
+  // serve memo (possibly stamped BEFORE staging registered the layouts —
+  // optimize-time unit serves precede statement-root staging) refreshes.
+  static uint64_t projection_global_epoch() {
+    return projection_epoch_.load(std::memory_order_relaxed);
+  }
   void set_table_projection(const std::string& table_name,
                             std::vector<uint32_t> kept) {
     table_projection_[table_name] = std::move(kept);
+    projection_epoch_.fetch_add(1, std::memory_order_relaxed);
   }
   const std::vector<uint32_t>* table_projection(
       const std::string& table_name) const {
@@ -314,6 +322,8 @@ private:
 
   // Projection pushdown: physical table name -> kept field ordinals.
   std::unordered_map<std::string, std::vector<uint32_t>> table_projection_;
+  // Process-wide registration epoch for the handler serve memo (see above).
+  static inline std::atomic<uint64_t> projection_epoch_{0};
 
   // Max number of buffered write/delete ops before an automatic flush
   static constexpr size_t WRITE_BATCH_SIZE = 100;
