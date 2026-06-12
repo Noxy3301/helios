@@ -301,6 +301,9 @@ message TxExecuteReadPlan {
         // field field_indexes[k]. The server still parses the FULL row to
         // evaluate `filter` before trimming.
         RowProjection projection = 12;
+        // Phase-8 Phase B: when present, the server aggregates scanned rows and
+        // returns group rows (see AggregateSpec) instead of base rows.
+        AggregateSpec aggregate = 13;
     }
     // Set of base-row columns the query needs (= the proxy's read_set union
     // across aliases of the same physical table).
@@ -732,6 +735,9 @@ message FilterExpr {
         OP_AND = 20; OP_OR = 21; OP_NOT = 22;
         OP_BETWEEN = 30; OP_IN = 31; OP_LIKE = 32;
         OP_IS_NULL = 33; OP_IS_NOT_NULL = 34;
+        // Arithmetic (Phase-8 Phase B aggregate-argument expressions). Evaluated
+        // server-side in exact (mantissa,scale) integer form for decimals.
+        OP_ADD = 40; OP_SUB = 41; OP_MUL = 42; OP_DIV = 43; OP_NEG = 44;
     }
     Op op = 1;
     int64 int_val = 2;
@@ -747,4 +753,27 @@ message FilterExpr {
 message PushedPredicate {
     FilterExpr expr = 1;
     uint32 num_columns = 2;
+}
+
+// Phase-8 Phase B: aggregation pushdown. When attached to an is_scan PlanStep,
+// the server GROUP-BYs the scanned (post-filter) rows by `group_columns` and
+// computes `aggs`, returning ONE synthetic group row per group via the step's
+// scan_values (NOT the raw base rows). Each group row reuses the standard row
+// format [null_flags][cols...]: first the group-key columns (raw stored bytes,
+// in group_columns order), then 2 columns per aggregate — (value, count):
+//   COUNT: value=row count (count col unused)
+//   SUM:   value=exact decimal sum as ASCII (null/empty if 0 non-null), count=non-null count
+//   AVG:   value=exact decimal sum as ASCII, count=non-null count (proxy divides)
+// The proxy decodes positionally (it built the spec) and emits via Item_cache.
+// Single server + single scan ⇒ groups are FINAL (no cross-node merge needed).
+message AggFunc {
+    enum Kind { AGG_COUNT = 0; AGG_SUM = 1; AGG_AVG = 2; }
+    Kind kind = 1;
+    FilterExpr arg = 2;        // argument expression (absent for COUNT(*))
+    uint32 result_scale = 3;   // decimal scale of the per-row arg value
+}
+message AggregateSpec {
+    uint32 num_columns = 1;                            // table->s->fields (row parse)
+    repeated uint32 group_columns = 2 [packed = true]; // 0-based field indices (GROUP BY)
+    repeated AggFunc aggs = 3;
 }
