@@ -114,6 +114,23 @@ def start_lineairdb_server():
     return True
 
 
+def restart_lineairdb_server():
+    """Restart lineairdb-server to guarantee a pristine in-memory store.
+
+    The server keeps all rows and secondary-index entries in memory and the
+    proxy's delete_table()/DROP TABLE is a no-op on the server side, so a
+    DROP+CREATE+LOAD cycle in the same server lifetime accumulates stale
+    secondary-index entries from previous loads (index scans then return
+    rows from earlier generations of the table). Restarting before a load
+    is the supported way to get a clean state; the proxy reconnects
+    automatically.
+    """
+    print("  Restarting lineairdb-server for a clean in-memory state...")
+    subprocess.run([str(SCRIPTS_DIR / "stop_server.sh")], capture_output=True)
+    time.sleep(1)
+    return start_lineairdb_server()
+
+
 def start_mysql_server(mysqld_port=3307, server_host="127.0.0.1", server_port=9999):
     """Start mysqld via scripts/start_mysql.sh."""
     if _is_port_open("127.0.0.1", mysqld_port):
@@ -844,6 +861,13 @@ def _run_bench(args, config_work, thread_list, result_base):
             print(f"  WARNING: CREATE had errors (may be OK for shared-storage)")
         load_time = 0
     else:
+        # Full setup reloads data: restart the in-memory server first so the
+        # new load does not inherit stale rows/secondary-index entries from a
+        # previous load of the same tables (DROP TABLE is a server-side no-op).
+        if not args.external_server:
+            if not restart_lineairdb_server():
+                print("Failed to restart lineairdb-server.", file=sys.stderr)
+                sys.exit(1)
         load_time = setup_benchmark(args.benchmark, config_work, args.mysql_host, args.mysql_port)
         if load_time is None:
             print("Setup failed.", file=sys.stderr)

@@ -73,5 +73,45 @@
 ### [2026-06-12] エントリ2: TPC-C ベースライン(着手)
 - 条件: 1 warehouse / 1 terminal / SERIALIZABLE / 30s、3 モード(OFF / explicit / autogen)。
 - benchrun.py は毎回 DROP+CREATE+LOAD(fresh state、fair comparison)。
+- ハーネス補修: sysstat 系(mpstat/sar/pidstat)不在で execute が落ちる → `_start_sampler` で
+  欠損ツールを warning+skip に(commit f7c77b4)。TATP 用 config + choices 追加も同コミット。
+
+### [2026-06-12] エントリ3: 【重大】二次索引 stale エントリ問題の発見と根因特定
+
+**症状**: 初回ベースラインで stateful(OFF)が 0 req/s(benchbase が
+`C_LAST=... not found!` で即死)。explicit 127 / autogen 122 req/s は「動いているように見えた」。
+
+**調査過程**(再現→切り分け→バイセクト):
+1. 手動再現: `SELECT ... WHERE c_w_id=1 AND c_d_id=5 AND c_last='X' ORDER BY c_first` が 0 行。
+   同条件 COUNT(*)(PK-MRR 経路)= 5 行で正常 → 二次索引 range scan だけが異常。
+2. rpc_trace: TX_GET_MATCHING_PRIMARY_KEYS_IN_RANGE が **26 PK** を返し(期待5)、batch read も
+   26 行 fetch、しかし MySQL へは 0 行。FORCE INDEX(ref access)だと **26 行がそのまま見える**
+   (別 last_name の行が WHERE 素通り = ref は SE の鍵一致契約を信頼するため)+ c_id=245 が ~10 重複。
+   → range 経路の 0 行は「範囲外の先頭行で compare_key が即 EOF」、ref 経路は「junk 可視」。同一根因。
+3. fresh load(ベンチ実行ゼロ)でも junk 再現。10行/3000行の合成テーブル(同型 DDL)では再現せず。
+4. **バイセクト**(helios × LineairDB submodule の整合ペアで7点、各点 server+plugin 再ビルド+再ロード+プローブ):
+   P1 c0ce5d1+2120d5a GOOD / P2' +f7f9a42 GOOD / P3 +435a7d5 GOOD / P4 +8833d1c GOOD /
+   P5 +c4a5c86 GOOD / P6 HEAD+a9db890 GOOD / P7 HEAD+139b709 GOOD / 4852e52 は純リネーム diff
+   → 「どのコミットでも壊れない」= バイセクトの前提(決定的再現)が崩れる。
+5. 真相: バイセクト中は毎回 server を再起動していた(=1 server 寿命に 1 load)。元の失敗環境は
+   **同一 server 寿命内に複数回 DROP+CREATE+LOAD**(初回計測の試行錯誤で 7 回)していた。
+   同一寿命で 2 回ロード → 全名照合の強プローブ(index 経由件数 vs fullscan 件数の全 (d,last) 比較)で
+   **via_idx ≈ 2×truth** を確認。**stale SI エントリの世代堆積**が根因と確定。
+
+**根本原因**: `ha_lineairdb::delete_table` は **no-op**(server に何も伝えない)+
+`create` は server 側 db_create_table の「already exists を無視して再利用」設計。
+→ DROP+CREATE+LOAD で base row は同 PK 上書きで一見正常だが、**二次索引には旧世代の
+(旧名→PK) エントリが残留・堆積**。scan が旧世代 PK を返し、現世代の行と名前が食い違う。
+- 旧ブランチ(phase14)で顕在化しなかったのは計測手順の違い(server 再起動を挟む運用)による
+  可能性が高い(LineairDB 側の table dict / MPMCConcurrentSet に erase API が無いのは共通)。
+
+**対処(本セッション)**: 真の DROP 伝搬(LineairDB に安全な table 削除 + concurrent set erase +
+epoch 回収が必要)は大工事のため本フェーズでは見送り、**ハーネスの実験プロトコルとして
+「ロードを伴う setup の直前に lineairdb-server を再起動」**を benchrun.py に実装
+(restart_lineairdb_server(); proxy は自動再接続することを確認済)。
+- これは恣意的チューニングではなく in-memory store の正当なクリーン状態保証。
+- server 側 DROP 未実装は**既知の defect として残置**(本 doc が記録)。恒久修正は別途。
+- 初回ベースライン値(OFF 0 / explicit 127 / autogen 122)は**汚染データのため全て無効**。再計測する。
+- ビルドは以後 `scripts/build_partial.sh` を使用(user 指示: server make + proxy ソース同期 + ninja 一括)。
 
 (以降追記)
