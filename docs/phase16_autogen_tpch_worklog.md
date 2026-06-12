@@ -349,4 +349,22 @@ md5 参照系は InnoDB(3308 に SF=0.1 ロード、SF=1 ref はマイルスト�
   別項(q6 の非集約時転送をさらに削れる余地)。
 - **B3 クローズ**(commit 471fcf7 まで)。
 
+### [2026-06-13] エントリ15: B4 LineairDB DataItem スリム化(phase12 A1+A2 実施)
+
+- **方式**: per-record の死荷重(2PL RW-lock 64B cache-line aligned + checkpoint 3
+  fields ~56B)を **static inline ダミー**化(submodule b2cbe3a)。参照コード
+  (TwoPhaseLocking = Masstree 構成では runtime 拒否済 / CheckpointManager =
+  checkpointing=false で idle)は**無修正でコンパイル**され、per-record コストのみ
+  消える。`LINEAIRDB_WITH_2PL_CHECKPOINT_METADATA` 定義で原状復帰可能。
+  DataItem 192B → ~72B(**-120B/record**)。NWR pivot(16B)は silo_nwr 内 44 参照
+  のため見送り(残課題)。
+- **計測(SF=0.1、フレッシュロード後 server RSS)**: fat **956MB → slim 838MB**
+  (-120MB/-13%)。SK entry も DataItem なので行数以上に効く。SF=1 では ~1.2GB+
+  の削減見込み(区切り計測で確定)。
+- 検証: md5 **22/22**、TPC-C autogen **164.1**(退行なし、むしろ +1%)、
+  TATP **1729.8**(+2% — DataItem 縮小によるキャッシュ効率向上の線)。エラー全0。
+- 計測の罠(再発): pgrep -f が bash wrapper に self-match して RSS 4MB を返す
+  → `pgrep -x lineairdb-serve`(15字切詰め名)を使う。
+- **B4 クローズ**。残: SF=1 区切りフル計測(B2+B3+B4 一括、InnoDB ref 再構築込み)。
+
 (以降、変更・計測ごとにエントリ追記)
