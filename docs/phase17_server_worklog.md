@@ -972,3 +972,22 @@ UpdLocation(read+UPDATE)は begin/end 無しで prefetch 完走(2 RPC)なので�
 非durable InnoDB との ~39% 差(168us vs 102us/tx)は「read ごと 1 RPC」の**不可避な disaggregation 税**で
 無駄ではない。durable InnoDB には 8x 勝つ(インメモリ優位)。→ **OLTP read の prefetch は理論値に到達**。
 InnoDB 3310(TATP, data_3310)は計測後 down。3308(TPC-H ref)は不変。
+
+### 【訂正】InsertCallFwd「fallback」は load 混入の誤分析 — write 経路に fallback 無し
+先の「InsertCallFwd 75% が begin/end で fallback」は **load フェーズの multi-row
+`INSERT INTO call_forwarding VALUES(...),(...)` が分類器で InsertCallFwd に混入**したもの。load を除外
+(execute のみ)した clean な集計では **全 TATP tx が begin/end 0% = prefetch 完走、fallback 皆無**:
+```
+type           n      rpc/tx us/tx begin% sk%
+GetSubData     11487  1.0    115   0%     100%   ← read 理論床
+GetAccessData  11184  1.0    102   0%     100%   ← read 理論床(先の82%も load 混入。clean は100%)
+UpdLocation    4606   2.0    225   0%     -      ← read+update 最小(plan+commit)
+GetNewDest     3248   1.6    168   0%     42%    ← join(multi-key 部分skip)
+InsertCallFwd  648    3.0    362   0%     -      ← read+read+insert(plan×2+commit)最小
+DeleteCallFwd  632    2.2    233   0%     -
+UpdSubData     631    2.4    214   0%     -
+```
+→ OLTP write 経路の coverage gap は無く、write tx も prefetch で 2-3 RPC(必要最小)。**TATP は全 tx で
+near-ideal**。read は single-key RO skip で 1 RPC(理論床)、write は plan+commit の最小構成。
+**Phase 20 の安全な伸びしろは概ね掘り切った**(残るのは multi-key read-only の commit-skip だが
+single-version OCC では snapshot 読み不可ゆえ validation 必須 = 実装不可、と確定)。
