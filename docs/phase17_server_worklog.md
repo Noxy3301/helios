@@ -1089,3 +1089,21 @@ user 方針確定: **Helios は Serializable を提供。validation-skip は「�
 - 記録: [[helios-serializable-no-si]]。**multi-key RO commit-skip(server snapshot=SI)も同方針で却下**(roadmap から除外)。
 - 含意: OLTP read の「理論最小 1 RPC」は read-only 専用文脈(ro_novalidate)でのみ成立し、混合では
   read plan + validation の 2 RPC が正しい下限(Serializable の代償)。
+
+---
+
+## エントリ: ④ q21 SIP — focused 実測(branch claude/q21-secondary-index)(2026-06-14)
+l_sk index を load 時実体化(lineitem CREATE TABLE に KEY l_sk/l_sk_pk 追加=benchbase jar DDL 更新)して q21 評価。
+背景: helios の CREATE INDEX(DDL)は backfill 未実装(inplace_alter_table が metadata 登録のみ)→ load 時構築で実体化。
+
+### 結果(SF=1 warm)
+- q21: helios 13.24→3.85s(3.4x)・md5 一致 ✅。supplier 駆動(s_nationkey 400 → l1 using l_sk → orders PK)。lever 実在。
+- 🔴 helios q15 が md5 不一致(誤): no-index 正(238879…/0.93s)、l_sk 有り誤(281ce0…/0.024s)。revenue0 内側集約単体は
+  index 有でも正 → 誤るのは VIEW+外側+prefetch+l_sk の組合せ = prefetch×SI×view correctness バグ。
+- ⚠️ InnoDB q15 3.52→21.88s(optimizer が l_sk_pk 誤用)。suite: helios 30.04 / InnoDB 55.87(歪み)。md5 ERR=1(q15)。
+- load 31→105s(6M×2 index)。
+
+### 結論
+q21 の勝ちは本物だが l_sk を素で入れると q15 を壊す(helios)+ InnoDB q15 退行。full 実装は backfill だけでなく
+prefetch×SI×view correctness(q15)修正を含む大きめの作業。user 判断待ち: (a)full投資 (b)index撤退しq21は①②へ (c)絞り込み継続。
+branch throwaway 前提。現状 helios=l_sk 込みロード, InnoDB3308=l_sk/l_sk_pk 追加済。
