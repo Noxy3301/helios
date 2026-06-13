@@ -446,3 +446,29 @@ for_each step に scan_limit=1)。q21 の l2/l3 は `FILTER(l_suppkey<>...)→RE
 
 
 
+
+---
+
+## [2026-06-13] エントリ12: ★計測環境の重大発見★ C6 deep-sleep が OLTP T1 を 3.7x throttle
+
+ユーザの「TPC-C 1T が遅すぎる(前は200出た)」疑念を追ったら、**真因は CPU の C6 C-state(復帰遅延170µs)だった**。コードでも退行でもない。
+
+### 実測(HEAD, SF=1, T1, tpcc_compare.sh ×3, 同一マシン)
+| モード | schedutil + C6有効(before) | **performance + C6無効(after)** | 倍率 |
+|---|---|---|---|
+| autogen `--prefetch-stmt` | ~104 | **390.7**(380–398, retry0) | 3.7x |
+| DSL `--prefetch` | ~115 | **440.4**(432–446, retry0) | 3.8x |
+
+### 機構
+T1 は単一クライアントの遅延律速。TPC-C 1tx ≈ 20–30 RPC 往復で、各アイドルごとに CPU が C6 に落ち
+復帰に 170µs。170µs × ~30 ≈ 5–6ms/tx の上乗せ → before 9ms/tx(108)が after 2.3ms/tx(440)。
+
+### 含意(重要)
+- **「200」はローカルで余裕で超える**(本来 ~390–440)。AWS c6i.24xlarge の 363 すら上回る
+  (ベアメタルはコアが速く、C-state を外せば AWS 超え)。過去の「200」記憶は AWS or C6 throttle 前。
+- これまでの **TPC-C/TPC-H 絶対値は全て C6 throttle 下**。相対比較(helios vs InnoDB)は同条件なので
+  結論不変(Phase17 退行なしも不変)。だが**絶対値の再計測は C-state 無効が前提**。
+- 設定(マシン全体・再起動で消える): `cpupower frequency-set -g performance` +
+  `cpupower idle-set -D 50`(or sysfs state3/disable=1)。AWS は大型/metal のみ可、
+  恒久は GRUB `intel_idle.max_cstate=1 processor.max_cstate=1`。Graviton 不可。
+- 計測手順(tpcc_compare.sh 等)に C6 無効チェックを入れるべき。今後の SF=1 milestone も C-state 固定で。
