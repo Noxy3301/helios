@@ -1259,3 +1259,15 @@ index_read になり破綻)。
   q1/q6=F'(commit 4be3801)、q15=GS-skip guard。誤結果ゼロ。
 - **⚠ 性能(latency)は未計測**: ここまで correctness(md5)のみ。Goal の「suite 再計測(q21 改善・q1/q6 非退行)」が未達。
   → SF1 + cstate guard + 標準索引で suite 性能を実測する(次)。
+
+## Step ④ 実装 dual-review = GO
+Claude grounded(49 tool-use 実コード精読)= **GO**、Codex = CHANGES だが懸念は grounded 裁定で全 refute:
+- FIX1: `pushed_aggregate_` 非空 ⟺ Phase B(exact WHERE)— `tx_set_pushed_aggregate` が `exact==true` 必須(ha:2635-2640)、
+  さもなくば Phase A(pushed_aggregate_ 未 set)。rewrite は pushed_aggregate_ ゲートゆえ常に exact filter 下 → range 落とし安全。
+  single-table のみ(leaf_table_count==1, ha:523)で double-stamp なし。
+- FIX2: GS synthetic は full-scan 経路のみ(rnd_init ha:2476 / index_read_map は key==nullptr ha:2190)。kept secondary は
+  gs_skipped 未 mark。**1 leaf TABLE* は 1 step のみ・fold は byte-identical(同 index_name)のみ → primary(drop+mark)と
+  secondary(keep)が同一 alias 共有は構造的に不可** → Codex の dual-access double-count 懸念は発生不可。q18 GS は primary で不変。
+- FIX1(execute_read_plan, post-autogen)× FIX2(autogen GS-skip)は別機構・別段階で同一 step に co-fire しない。
+- 全 cache は per-tx member(statement 毎 clear)= cross-tx caching なし。ro_novalidate + SELECT ゲートで DML/TPC-C/TATP 無影響。1SR 保持。
+→ **Step ④ correctness GO**(grounded 裁定)。残: 性能計測(下記)+ OLTP 退行確認。
