@@ -311,6 +311,18 @@ message TxExecuteReadPlan {
         // shipping rows that cannot join (result-preserving for plain INNER
         // equi-joins; the planner whitelists eligible leaves).
         repeated SemijoinFilter semijoins = 14;
+        // Negative-coverage suppression: filtered_keys (the keys of rows a
+        // pushed `filter` rejected) exist ONLY so a later point probe into the
+        // same table answers not-found locally instead of aborting. When this
+        // table is read by no other plan step, those keys are pure dead weight
+        // (q14: lineitem ships 593k rejected keys / 9.5MB that nobody reads).
+        // Set true to tell the server to drop them. Sound: it can never make a
+        // filtered-out row visible. Worst case, if the planner missed a same-
+        // table point consumer, that probe becomes a cache-miss prefetch abort
+        // (fail-closed, loud) rather than a wrong local not-found. The planner
+        // sets it only when this table appears in no other plan step, so no such
+        // probe exists.
+        bool suppress_filtered_keys = 15;
     }
     // Phase-9 semijoin: drop probe rows whose join key is absent from an
     // earlier step's result. Columns are 0-based TABLE::field[] ordinals; the

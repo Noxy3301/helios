@@ -321,6 +321,28 @@ void LineairDBTransaction::execute_read_plan(
     }
   }
 
+  // Negative-coverage suppression: a filtered scan ships filtered_keys (the
+  // rejected rows' keys) ONLY so a later point probe into that same table can
+  // answer not-found locally. If the table is read by no other step, no such
+  // probe exists, and those keys are pure transfer/decode waste (q14: lineitem
+  // ships 593k rejected keys / ~9.5MB nobody consumes). Skipping can never make
+  // a filtered-out row visible; worst case, a same-table point consumer the
+  // planner failed to foresee aborts the prefetch (fail-closed, loud) instead
+  // of answering not-found locally. The single-step guard means no such
+  // consumer exists. An aggregate-stamped step ships group rows, not base
+  // rows, and never emits filtered_keys, so leave it alone.
+  {
+    std::unordered_map<std::string, int> table_step_count;
+    for (const auto& s : steps) table_step_count[s.table_name]++;
+    for (auto& s : steps) {
+      if (s.is_scan && s.aggregate_serialized.empty() &&
+          !s.serialized_filter.empty() &&
+          table_step_count[s.table_name] == 1) {
+        s.suppress_filtered_keys = true;
+      }
+    }
+  }
+
   rpc_trace_.record_local_view("plan_request:steps=" +
                                std::to_string(steps.size()));
   LineairDBProxy::ReadPlanResult result;

@@ -639,6 +639,7 @@ static bool parallel_primary_filter_scan(
   std::vector<WorkerOut> outs(T);
   std::vector<char> failed(T, 0);
   const bool has_projection = step.has_projection();
+  const bool suppress_fkeys = step.suppress_filtered_keys();
   std::vector<std::thread> workers;
   workers.reserve(T);
   for (unsigned i = 0; i < T; ++i) {
@@ -656,7 +657,7 @@ static bool parallel_primary_filter_scan(
           pass = ev.evaluate(filter_expr);
         }  // unparseable: ship it, MySQL re-checks (serial row_passes contract)
         if (!pass) {
-          o.fkeys.push_back(std::move(row.key));
+          if (!suppress_fkeys) o.fkeys.push_back(std::move(row.key));
           continue;
         }
         if (has_projection && !row.value.empty()) {
@@ -1405,6 +1406,9 @@ void LineairDBRpc::handleTxExecuteReadPlan(const std::string& message,
             }
             return step_eval.evaluate(*step_filter);
         };
+        // Negative-coverage keys are dead weight when the planner proved no
+        // other step reads this table (see PlanStep.suppress_filtered_keys).
+        const bool suppress_fkeys = step.suppress_filtered_keys();
 
         // Projection pushdown: trim each emitted base-row VALUE to the kept
         // columns. Runs AFTER row_passes (the filter parses the FULL row).
@@ -1846,7 +1850,8 @@ void LineairDBRpc::handleTxExecuteReadPlan(const std::string& message,
                         // the rejected KEY so the proxy can answer not-found
                         // locally (sound: the filter is this alias's WHERE
                         // conjunct, so MySQL would discard the row anyway).
-                        step_result->add_filtered_keys(std::move(row.key));
+                        if (!suppress_fkeys)
+                            step_result->add_filtered_keys(std::move(row.key));
                         continue;
                     }
                     step_result->add_scan_keys(std::move(row.key));
@@ -1872,7 +1877,8 @@ void LineairDBRpc::handleTxExecuteReadPlan(const std::string& message,
             for (auto& row : scan_result.rows) {
                 if (!row_passes(row.value)) {
                     // See the primary branch: negative coverage by primary key.
-                    step_result->add_filtered_keys(std::move(row.primary_key));
+                    if (!suppress_fkeys)
+                        step_result->add_filtered_keys(std::move(row.primary_key));
                     continue;
                 }
                 step_result->add_secondary_keys(std::move(row.secondary_key));

@@ -1,0 +1,227 @@
+# Phase 17: サーバー(XG6326-2U)公式再ベースライン + SF=1 TPC-H 完全制覇
+
+ゴール: (A) 本マシンで helios / InnoDB ref 両方の公式ベースラインを取り直す。
+(B) 22/22 md5 を維持したまま suite 合計で InnoDB を下回る(目標: 勝ち 15/22、
+中央値 <1.0x、suite 合計 InnoDB の 1/2 以下)。
+
+ルール: WSL 時代の絶対値とは比較しない。MySQL 本体改変禁止。push/hard reset 禁止。
+ビルドは scripts/build_partial.sh(services 停止後)。pid file で kill(pkill -x mysqld 禁止)。
+server はインメモリ(load 前に必ず server 再起動 / mysqld 再起動で prefetch sysvar OFF)。
+
+---
+
+## [2026-06-13] エントリ1: 環境確認 + Track A 着手
+
+**マシン**: XG6326-2U, 64 core, 125GB RAM, Linux 6.17.0-20-generic(native, 非WSL)。
+**作業点**: branch `claude/prefetch-maxopt` HEAD 9c01359(clean)。
+submodule: LineairDB 72b11754(helios/prefetch-maxopt)/ benchbase 6f3f578e(並列ローダ入り、
+jar 2026-06-12 ビルド)/ mysql-server 8.0.43(無改変)。
+
+**ビルド**: /tmp/helios_build.log = 4816/4816 完走、`error:`/`FAILED` ゼロ。再ビルド不要。
+
+**初期状態**: mysqld / lineairdb-server とも停止、ポート 3306/3307/3308/9999 リスナー無し。
+/tmp に旧 pid/sock 残渣(6/12 以前)→ 削除済み。build/data は空(datadir 未初期化)、
+build/data_3308 無し → 両方ゼロから構築。
+
+**計測 env(標準、scripts/dev/README.md 踏襲)**:
+- mysqld: `HELIOS_OPT_STATS=1 HELIOS_COST_V2=1 HELIOS_AGG_PUSHDOWN=1 HELIOS_ENABLE_SEMIJOIN=1`
+- server: `HELIOS_PARALLEL_SERVER=1 HELIOS_PARALLEL_SERVER_SCAN=1`
+- 接続後: `SET GLOBAL lineairdb_prefetch_execution=ON; SET GLOBAL lineairdb_prefetch_ro_novalidate=ON;`
+- jemalloc LD_PRELOAD + MALLOC_CONF(start scripts 内蔵)
+
+**InnoDB ref(3308)公式構成(本フェーズで確立)**: 旧環境の起動コマンドは docs に
+未記録だったため、ここで明文化する。plain mysqld(plugin 無し、default engine = InnoDB)、
+datadir `build/data_3308`、`--innodb-buffer-pool-size=16G`(SF=1 データ ~数GB を完全
+キャッシュし、ディスク I/O 差ではなく実行エンジン差を測る fair 設定)、
+`--disable-log-bin`、その他は helios 側 start_mysql.sh と同等の汎用上限のみ。
+起動スクリプト: `scripts/dev/start_innodb_ref.sh`(本フェーズで追加)。
+
+---
+
+## [2026-06-13] エントリ2: ビルド事故(field_types.h sync 漏れ)→ 修正 + 公式ベースライン確定
+
+### ビルド事故と恒久修正
+起動後 `lineairdb_prefetch_ro_novalidate` sysvar が `SHOW VARIABLES` に出ず、SET でも
+`Unknown system variable`。プラグイン .so に文字列が含まれていなかった(`strings | grep` = 0)。
+真因: `scripts/build_partial.sh` の proxy sync が `*.cc *.hh` のみコピーで、
+**`proxy/*.h`(`lineairdb_field_types.h`)が storage/lineairdb に未反映**。
+移行後の clone で third_party 側が古い field_types.h を持ち、プラグインがソース最新と乖離。
+→ build_partial.sh の cp に `"$ROOT_DIR"/proxy/*.h` を追加(恒久修正)。再ビルドで sysvar 復活。
+旧 /tmp/helios_build.log の 4816/4816 は full build だが、この sync 経路だけ穴があった。
+
+### 公式ベースライン(本マシン・専有計測)
+- **マシン**: Xeon Gold 6326 @2.90GHz, 2 socket × 16 core = 32 物理 / 64 論理, 2 NUMA。
+- **load**: helios SF=1 = **86.0s**(16 loader 並列, 全行数正解), InnoDB ref = 360.2s(terminals=1)。
+  helios 行数: lineitem 6001215 / orders 1.5M / customer 150k / partsupp 800k / part 200k 等 = 正解。
+- **RSS(matrix 後)**: server 5351MB, helios mysqld 4384MB, InnoDB mysqld 4035MB。
+- **md5: 22/22 OK**(InnoDB ref と完全一致)。
+
+### per-query matrix(timeout 420s, gates 全 ON + prefetch ON+novalidate)
+
+| Q | helios(s) | InnoDB(s) | 比 h/i | 判定 |
+|---|---|---|---|---|
+| q1 | 0.86 | 10.60 | **0.08** | ★WIN 12x(agg pushdown) |
+| q2 | 0.33 | 0.14 | 2.36 | lose |
+| q3 | 1.30 | 1.30 | 1.00 | tie |
+| q4 | 1.99 | 0.72 | 2.76 | lose |
+| q5 | 1.02 | 1.06 | **0.96** | ★win |
+| q6 | 0.41 | 1.62 | **0.25** | ★WIN 4x |
+| q7 | 1.52 | 1.14 | 1.33 | lose |
+| q8 | 2.82 | 2.77 | 1.02 | ~tie |
+| q9 | 3.77 | 2.38 | 1.58 | lose |
+| q10 | 3.59 | 1.64 | 2.19 | lose |
+| q11 | 0.29 | 0.24 | 1.21 | lose |
+| q12 | 7.73 | 2.49 | 3.10 | lose |
+| q13 | 5.80 | 3.83 | 1.51 | lose |
+| q14 | 8.21 | 1.70 | 4.83 | lose |
+| q15 | 1.18 | 3.61 | **0.33** | ★WIN 3x(GroupedSummary) |
+| q16 | 0.74 | 0.33 | 2.24 | lose |
+| q17 | 0.36 | 0.44 | **0.82** | ★win |
+| q18 | 30.96 | 2.17 | 14.27 | lose（最大ギャップ） |
+| q19 | 0.26 | 0.26 | 1.00 | tie |
+| q20 | 0.47 | 0.46 | 1.02 | ~tie |
+| q21 | 13.76 | 5.06 | 2.72 | lose |
+| q22 | 3.16 | 0.19 | 16.6 | lose |
+| **計** | **90.55** | **44.15** | **2.05** | helios 2.05x 遅い |
+
+- **現状: 勝ち 5/22(q1,q5,q6,q15,q17)+ tie 4本。suite 合計で InnoDB に 2.05x 負け。**
+- WSL 知見と整合: 残ギャップは q18>q21>q14>q12>q22>q13。
+
+### Track B 作業キュー(ギャップ絶対値 = helios秒 − InnoDB秒、大きい順)
+1. **q18: 28.79s 差**（30.96 vs 2.17）← 単独で全ギャップ 46.4s の 62%。最優先。
+2. **q21: 8.70s 差**（13.76 vs 5.06）自己結合
+3. **q14: 6.51s 差**（8.21 vs 1.70）for_each probe
+4. **q12: 5.24s 差**（7.73 vs 2.49）for_each probe
+5. **q22: 2.97s 差**（3.16 vs 0.19）
+6. **q13: 1.97s 差**（5.80 vs 3.83）
+7. q10: 1.95s 差 / q9: 1.39s 差 / q16: 0.41 / q4: 1.27 / q7: 0.38
+
+注: q18 を 2.17s 並みに削れれば suite 90.5→61.8s。q18+q21+q14+q12 で計 49.2s 削減 →
+理論上 41.3s となり InnoDB 44.15s を逆転可能。**q18 が天王山。**
+
+数学的事実: 他の負けクエリの対 InnoDB ギャップ合計は約 21s に過ぎず、q18 を温存したまま
+他を全部ゼロにしても helios 62s で InnoDB 44s に届かない。**q18(28.8s 差)の解決は必達条件。**
+
+---
+
+## [2026-06-13] エントリ3: q18 RPC trace 真因(lineitem 二重フルスキャン = 426MB 転送)
+
+`ENABLE_RPC_TRACE=1` で mysqld 再起動(データ非消失)、q18 単発 30.29s 実行。trace 集計:
+
+```
+duration: 27.71s (committed tx)
+time split: rpc 4.07s  sections 6.68s  residual(mysql+proxy cpu) 3.10s
+TX_EXECUTE_READ_PLAN: 1 RPC, resp_b = 426,682,328 (426MB!), 8.14s
+stage_local: 12.05s (13.6M 行をローカル read-cache へ staging)
+stage_rpc_and_decode: 9.50s (内 RPC 8.14s + decode 1.37s)
+staged_rows: 13,602,426  ( = 6.0M × 2 ≒ lineitem 全体を二重に取得 )
+出力: わずか 57 行
+```
+
+**真因**: q18 は lineitem を2回フルスキャンしている。
+1. 内側サブクエリ `lineitem GROUP BY l_orderkey HAVING SUM(l_quantity) > 300`
+   → EXPLAIN では `Index scan on lineitem PRIMARY (6M)` + group aggregate。prefetch は
+   全 lineitem 6M 行を staging。本来の出力は「SUM>300 の orderkey」= **57 個**だけ。
+2. 外側 join `orders ⋈ lineitem ON o_orderkey = l_orderkey`
+   → IN フィルタ通過後の orders は 57 行のみだが、prefetch は join 鍵を動的に絞れず
+   lineitem を再び全 6M 行 staging。
+
+426MB を運んで 57 行を出すのは、転送・staging・decode の三重苦。InnoDB(2.17s)は
+データがローカルなので RPC ゼロ + ストリーミング group-by で済む。
+
+**勝ち筋の仮説**(エントリ4 で検証):
+- (A) 内側集約を server 側で実行 → (orderkey, sum) を 57 行だけ返す = GroupedSummary/agg pushdown。
+- (B) 外側 lineitem join を「57 orderkey の keyed fetch」に変える → ~400 行転送。
+- 重要な等価性: 外側の `SUM(l_quantity) GROUP BY ..., o_orderkey` は o_orderkey=l_orderkey
+  なので内側の per-orderkey SUM と**同一値**。理論上は外側 lineitem scan 自体が冗長
+  (内側集約結果を流用可能)。ただし MySQL optimizer はこの等価を知らない。
+- 過去の GroupedSummary 単独適用は「外側も lineitem scan するため転送不変 + RPC 上乗せで
+  +21% 退行」で revert 済み(memory: helios-grouped-summary-q18-semijoin-decision)。
+  → 今回は (A) と (B) を**セットで**解く必要がある。これが未踏領域。
+
+---
+
+## [2026-06-13] エントリ4: OLTP 回帰ベースライン + q18 コード機構の精査
+
+### OLTP 回帰ベースライン(現バイナリ = HEAD 9c01359 を正しく rebuild した姿、gates OFF default 経路)
+| | req/s | errors |
+|---|---|---|
+| TPCC autogen (terminals=1) | **109.6** | 0 |
+| TATP autogen (terminals=1) | **1462.9** | 0 |
+
+これが Track B 各変更後の回帰判定の基準。**Track A 完了。**
+
+### q18 の壁(コード精査で確定): MySQL 無改変では内側 IN サブクエリを override できない
+- `helios_should_pushdown_aggregation`(ha_lineairdb.cc:490-）は **q18 を明示的に想定して設計**
+  されている: HAVING `SUM(l_quantity) > 300`(529-531行), INT group key `l_orderkey`(543行)を
+  処理可能。**だが inner unit は SINGLEROW_SUBS(スカラーサブクエリ)のみ hijack 可**(515-522行)。
+  q18 の `o_orderkey IN (...)` は **MaterializeIterator** 経由で消費され
+  `override_executor_func` の in-tree フックが存在しない → override 不可能。
+  (override が効くのは ExecuteIteratorQuery=スカラーサブクエリ経路のみ。MySQL 改変なしでは
+  materialize 経路にフックを挿せない。)
+- GroupedSummary(合成行・handler scan 乗っ取り)は IN サブクエリを明示 reject(1367行
+  「DERIVED inner units only」)。仮に拡張しても、合成行は MySQL に HAVING 再適用させるため
+  **全 1.5M グループ**(l_orderkey は 1.5M distinct)を返す必要 = 6M→1.5M の 4x 削減止まり。
+  外側 6M は不変。→ q18 28s→推定16s 程度の部分改善にとどまり、suite 逆転には不足。
+
+### q18 の非対称構造(これが設計の鍵)
+- **内側** `lineitem GROUP BY l_orderkey HAVING SUM>300`: server 側集約必須(でないと 6M 読取)。
+- **外側** `orders ⋈ lineitem`: IN 通過後の orders は **57 行のみ**。本来 prefetch せず
+  57×~4=~228 点読でも 0.2s 程度。現状は for_each が IN フィルタ前の全 orders を source に
+  全 lineitem(6M)を staging しているのが無駄。
+- MySQL のプラン自体は「subquery materialize(57鍵)→ orders を IN で絞る → join」と正しい順序。
+  問題は **prefetch が一括先行ステージングで IN フィルタを適用できない**こと。
+
+### 方針転換の判断
+- q18 をいきなり完全解(内側 server 集約 + 外側 keyed fetch の依存ステージング)は機構新設が大きく
+  リスク高。**先に for_each オーバーヘッドの汎用機構を q12/q14 で理解・改善**する
+  (for_each は q12/q14/q18外側で共通。汎用化が効く)。その知見を q18 外側へ展開する順で進める。
+
+---
+
+## [2026-06-13] エントリ5: ★大勝★ filtered_keys(negative coverage)の無駄送信を除去 → suite -20s
+
+### 真因(step ごとのバイト計測で確定)
+q14 の RPC 応答 15.2MB を step 別に計測(`HELIOS_STEP_BYTES` 一時計装):
+```
+step0 lineitem scan: rows=7630 val=269KB key=122KB  fkeys=592942 fkey_bytes=9.49MB ★
+step1 part  probe  : rows=6338 val=190KB key=51KB   fkeys=0
+```
+実 row データは全 step 合計わずか 0.63MB。残り ~14.5MB(flat-codec framing 込み)は
+**filter で reject された 59万行のキー(filtered_keys)**。これは「filter された表を後段が
+point-read した時に not-found を即答する negative coverage」用だが、**q14 の lineitem は
+range scan のみで point-probe されない → 完全に無駄**。lineitem 600k を scan して 7630 を残し
+592k を reject、その 592k 全キーを送って proxy は record_row_cache(not-found) を 59万回実行
+していた(これが stage_local 324ms の正体でもある)。
+
+メモリ「20x肥大はOCC range keys」の転送版。memory note は materialize(server RAM)を move 化で
+緩和したが、**転送と proxy staging への影響は手付かずだった**。
+
+### 修正(MySQL 無改変・proxy+server+proto)
+- proto `PlanStep.suppress_filtered_keys=15` 追加。
+- server: 主スキャン/2次スキャン/並列スキャンの3経路すべてで、フラグ時 `add_filtered_keys` を
+  skip(並列経路は worker の push 自体を抑止しメモリも節約)。
+- proxy `execute_read_plan`: **「filter 付き scan step かつ その table_name が他のどの step にも
+  現れない」step にのみ flag を立てる**。table が1 step しか触れない = 後段 point-read が構造上
+  存在しない、の安全条件。aggregate-stamp 済み step は base row を出さないので除外。
+- 健全性: suppress しても最悪「予見できなかった probe が cache-miss fallback になる」だけで
+  結果不変(filtered_keys は性能用の安全網であって正しさの根拠ではない)。
+
+### 効果(SF=1 公式、md5 22/22 OK 維持)
+| Q | 前 | 後 | InnoDB | 判定 |
+|---|---|---|---|---|
+| q4 | 1.99 | **0.70** | 0.72 | lose→**WIN** |
+| q10 | 3.59 | **1.75** | 1.64 | lose→~tie |
+| q12 | 7.73 | **0.66** | 2.49 | lose→**WIN 3.8x** |
+| q14 | 8.21 | **0.84** | 1.70 | lose→**WIN 2x** |
+| q19 | 0.26 | **0.14** | 0.26 | tie→**WIN** |
+| q2/q9/q13/q16/q21 等 | | 微減 | | |
+
+- **suite 合計 90.55 → 70.83s(-20s/-22%)**。対 InnoDB ギャップ 46.4s → 26.7s。
+- **勝ち 5/22 → 9/22**(q1,q4,q5,q6,q12,q14,q15,q17,q19)。
+- q14 SF=0.1: 0.736→0.109s(6.7x)、resp_b 15.2MB→0.97MB、stage_local 324ms→4.3ms。
+- 残ギャップはほぼ q18 単独(30.94 vs 2.17 = 28.8s)に集約。次は q18 が事実上唯一の壁。
+
+
+
+

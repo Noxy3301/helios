@@ -215,6 +215,10 @@ public:
             std::string source_filter;
         };
         std::vector<Semijoin> semijoins;
+        // When true the server drops filtered_keys (negative-coverage keys for
+        // a pushed filter's rejected rows). Set only when no other plan step
+        // reads this table, so no point probe can need that coverage.
+        bool suppress_filtered_keys = false;
     };
     struct ReadPlanStepResult {
         bool found = false;
