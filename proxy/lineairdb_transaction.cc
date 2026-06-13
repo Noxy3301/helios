@@ -306,6 +306,29 @@ void LineairDBTransaction::execute_read_plan(
   // disable that step's projection — the spec addresses group/arg columns by
   // ORIGINAL field index, so the server must parse full rows.
   if (!pushed_aggregate_.empty()) {
+    // Phase-21 Step-4 (F'): the aggregation-pushdown override always reads the
+    // table via a PRIMARY full scan (agg_next_raw -> fetch_next_batch ->
+    // get_matching_keys_and_values_from_prefix("")). But once a secondary index
+    // exists the optimizer can make autogen stage a SECONDARY range step for
+    // this table (index_name != ""); the stamp below only matches a primary
+    // scan, so the aggregate is never stamped and the override's primary scan
+    // misses the staged cache -> prefetch abort (q1/q6 Deadlock, q15). Rewrite
+    // this table's secondary scan step into the primary full scan the override
+    // will actually consume. The pushed WHERE filter (attached below) still
+    // restricts the aggregated rows, so dropping the secondary range bound is a
+    // safe over-stage fully covered by the filter — identical to the no-index
+    // agg-pushdown path. Only fires when agg-pushdown is active for this table.
+    for (auto& s : steps) {
+      if (s.is_scan && !s.for_each && !s.index_name.empty() &&
+          s.table_name == db_table_key) {
+        s.index_name.clear();
+        s.key_prefix.clear();
+        s.end_key_prefix = lineairdb_keyenc::scan_end_sentinel();
+        s.scan_limit = 0;
+        s.reverse_scan = false;
+      }
+    }
+    int stamped = 0;
     for (auto& s : steps) {
       if (s.is_scan && !s.for_each && s.index_name.empty() &&
           s.table_name == db_table_key) {
@@ -317,7 +340,14 @@ void LineairDBTransaction::execute_read_plan(
         }
         s.projection.clear();
         s.projection_num_columns = 0;
+        ++stamped;
       }
+    }
+    // Guardrail (Codex): the override WILL primary-full-scan db_table_key and
+    // expects an aggregate-stamped primary step. If none was stamped the scan
+    // would miss the cache and abort; surface it loudly rather than silently.
+    if (stamped == 0) {
+      rpc_trace_.record_local_view("agg_pushdown_unstamped:" + db_table_key);
     }
   }
 

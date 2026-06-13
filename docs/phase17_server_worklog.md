@@ -1200,3 +1200,38 @@ helios で全23を chunk-COMMIT backfill 構築(SF0.1, 計 1m22s)。
   prefetch×SI で壊す + 全23索引 backfill で load 重化)。手動 postload で検証済み、config 化は ④ 後。
 - **Step ④ スコープ確定: prefetch×secondary-index×view correctness = q1, q6, q15**(prefetch ON で SI range/view scan を
   prefetch 実行が stage 不可 → abort/unsupported。prefetch OFF normal 経路は正)。次ステップへ。
+
+## Step ④ 根因 + 設計(grounded 調査 + Codex review + user 承認 = F')
+**根因(grounded 81 tool-use 精読、初期仮説は誤りと訂正)**: SI staging 自体は実装済(compile_index_range_scan,
+autogen:395-465 が secondary range を index_name 付きで stage、serve も lookup_secondary_scan_cache:1531 で存在)。
+真因は **agg-pushdown override と optimizer leaf 選択の食い違い**:
+- agg-pushdown override(JOIN::override_executor_func, ha:1742)は**常に primary 全スキャン**
+  (`get_matching_keys_and_values_from_prefix("")` → primary range_scan_cache_)で読み server 側 filter+集約。
+- SI(l_sd)在りだと optimizer は **secondary INDEX_RANGE_SCAN** を選び autogen は `index_name="l_sd"` の secondary step を
+  stage。agg-stamp ループ(transaction.cc:310)は **primary scan step のみマッチ**(`index_name.empty()`)→ aggregate step
+  生成されず primary range も staged されない → override の primary 全スキャンが miss → abort。
+- q1/q6 は override が `my_error(ER_LOCK_DEADLOCK)` 直叩き(ha:1039)→ **1213 Deadlock**。q15 は derived-table 内
+  materialize で同 divergence → abort_errno → **1235 unsupported**。EXPLAIN ANALYZE は agg-pushdown hijack 除外
+  (ha:483)ゆえ working secondary 経路で成功 = 索引内容は正しい証左。
+**設計 = F'(高速化維持, user 承認)**: agg-pushdown が有効な時、autogen staging を **optimizer の SI leaf でなく
+primary 全スキャンに固定**(override の実動作に一致)。SI 無しの時と同じ proven 経路 = correct かつ agg-pushdown 勝ち
+(q1 13→5s, q6 152x)維持。**dual-review**: Codex=SOUND(前提=WHERE 完全 push、既存 agg-pushdown が保証)、grounded の
+事実も F' を支持。ガードレール: (1)agg-pushdown 実有効時のみ適用 (2)aggregate を当該 primary step に確実 stamp
+(3)q15 derived inner unit も同様 (4)mismatch の runtime assert/log。Option F(override 無効化=最小だが q1/q6 perf 退行)・
+S(secondary 上で集約=blast radius 大)は不採用。→ 実装へ。
+
+## Step ④ 実装 — F'(1): main agg-pushdown 経路(q1/q6 修正済)
+`execute_read_plan`(transaction.cc:308 直前)で、agg-pushdown 有効時(pushed_aggregate_ 非空)に db_table_key の
+**secondary scan step を primary 全スキャンに rewrite**(index_name/key_prefix クリア, end=sentinel, limit/reverse リセット)。
+直後の既存 stamp ループが primary step にマッチ → aggregate + WHERE filter(pushed_filter_)を stamp。override は元々
+`agg_next_raw`=primary 全スキャンを consume するので staged と一致。stamped==0 を trace に記録(guardrail)。
+**検証(SF0.1, prefetch ON, 全23索引)**: q1=2903e9.. / q6=17ded5.. = baseline 完全一致(従来 Deadlock)。**diff が
+{q1,q6,q15} → {q15} に縮小 = 21/22**。range bound を落としても pushed_filter_(exact WHERE)が制限するので正(tx_set_pushed_aggregate
+が exact serialization を要求、さもなくば Phase A fallback)。
+
+## Step ④ 実装 — F'(2): q15 inner-aggregate 経路(実装中)
+q15 は view `revenue0`(GROUP BY l_suppkey)= inner-aggregate(Phase16)。consume は override 内で stamped 時のみ
+`agg_next_raw`(primary 全スキャン)、未 stamp 時は phase-A で raw secondary scan を読み miss → 1235。inner-agg stamp
+(autogen:1404)も index_name.empty() 要求ゆえ secondary では未 stamp。→ 同型 F': inner-agg 登録表の secondary scan を
+primary 全スキャンに rewrite + **serialized_filter=reg->filter(inner WHERE 完全形)**を付与して stamp 成立させる
+(range bound を落とす分 reg->filter が制限)。reg->filter の完全性が correctness 前提。
