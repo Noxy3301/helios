@@ -359,8 +359,15 @@ def setup_benchmark(benchmark, config_path, mysql_host, mysql_port):
     mysql_cmd(mysql_port, mysql_host, f"DROP DATABASE IF EXISTS {db_name}; CREATE DATABASE {db_name};")
 
     if benchmark == "tpch":
+        # NOTE: subquery_to_derived was set =on here for years (pre-inner-unit
+        # staging, correlated scalar subqueries crawled per-row). It is a
+        # HEURISTIC (non-cost-based) transform, and with for_each probe
+        # staging + probe folds the correlated form is now the fast path:
+        # q17 20.4s -> 0.22s, q20 15.5s -> 0.25s with the transform off
+        # (default). Explicitly set =off so a stale global from older runs
+        # can never leak into a measurement.
         mysql_cmd(mysql_port, mysql_host,
-                  "SET GLOBAL optimizer_switch='batched_key_access=on,mrr_cost_based=off,subquery_to_derived=on';"
+                  "SET GLOBAL optimizer_switch='batched_key_access=on,mrr_cost_based=off,subquery_to_derived=off';"
                   "SET GLOBAL join_buffer_size=1073741824;")
 
     print("  Creating schema + Loading data...")
