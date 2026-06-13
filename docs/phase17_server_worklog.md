@@ -1075,3 +1075,17 @@ qep_leaf_info=true → マーク → first-match 誤り」と **REACHABLE 判定
 **修正は正しく完全、residual gap は構造的に到達不能、追加修正不要。** Phase 18-20 の正しさは2イテレーションの
 dual review を経て確定(single-key RO=SOUND、existence_only core=SOUND+ro_novalidate ゲート済、
 prewarm/gate/結論=SOUND/訂正済)。最大の収穫は iter-1 Claude が見つけた ro_novalidate-abort 実バグの修正。
+
+---
+
+## エントリ: single-key RO commit-skip を revert(Serializable 方針, 2026-06-14)
+user 方針確定: **Helios は Serializable を提供。validation-skip は「ワークロード全体が read-only」の例外
+(ro_novalidate, 例: TPC-H)のみ許容。混合では Silo validation を必ず走らせる**(証明済みでも省かない=均一保証)。
+→ Phase20 の single-key RO commit-skip(commit f56397b)を **revert**(`prefetch_validate_and_commit` の
+分岐削除)。ro_novalidate に gate しても既存 ro_novalidate fast path と重複=死にコードのため完全削除。
+混合 OLTP の単一キー read-only tx も通常の `tx_validate_and_commit` を通る。
+- 効果: TATP T1 が +10.8%(5960)→ baseline(~5315, validation ON)に戻る。retry 0。md5 22/22 OK(TPC-H は
+  ro_novalidate path で不変)。
+- 記録: [[helios-serializable-no-si]]。**multi-key RO commit-skip(server snapshot=SI)も同方針で却下**(roadmap から除外)。
+- 含意: OLTP read の「理論最小 1 RPC」は read-only 専用文脈(ro_novalidate)でのみ成立し、混合では
+  read plan + validation の 2 RPC が正しい下限(Serializable の代償)。
