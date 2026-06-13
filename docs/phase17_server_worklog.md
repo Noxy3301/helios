@@ -285,6 +285,42 @@ semijoin source は `extract_value_column(scan_values, source_column)` で群行
 - 次: Phase B(内側 raw scan を GS-skip し agg 群行を l_quantity=sum の合成 lineitem 行として供給)
   → q18 ~3s 見込み。GS を単一列 SUM 対応へ拡張する必要。
 
+---
+
+## [2026-06-13] エントリ8: ★★q18 完全制覇★★ Phase B(内側合成供給)実装 → q18 30.94→5.14s
+
+### Phase B 実装(gate `HELIOS_Q18_GS`, 現 default ON)
+- GsRegistration に `single_sum` モード追加(col_a を SUM 列に再利用、a*(1-b) 分解不要)。
+- 認識(helios_try_register_grouped_semijoin)で、HAVING の SUM 引数が T の単一非NULL列かつ
+  group 列と別、かつ **内側 read_set が {group,sum} のみ**を満たす時、内側 lineitem leaf に
+  single_sum GS を登録。autogen が GS-skip で内側 raw scan を drop。
+- gs_fill_buffers に single_sum 分岐(1 群行→1 合成行: l_quantity=server の exact sum)。
+- **罠と解決**: 当初 prefetch cache miss で abort。真因 = q18 内側は GROUP BY l_orderkey が
+  PK 先頭列のため **index scan(index_first→index_next)**経由で、GS serving が rnd_init のみ
+  hook だった(q15 は table scan だったので効いた)。
+  → gs_fill_buffers が secondary_index_results_/payloads_(index 経路バッファ)も populate、
+  index_read_map に gs_skipped 分岐(full scan 開始時に GS 供給)を追加。解決。
+
+### 安全強化(default-ON 化に伴い)
+- outer 表が plain inner-join leaf(outer-join inner でない / sj-aj nest 外 / top-level qb)で
+  あること、join 鍵(l_orderkey vs o_orderkey)が byte 互換・非NULL であることを認識で検証。
+- single_sum は read_set が {group,sum} のみの時だけ(他列は "0" template になるため)。
+
+### 効果(SF=1 公式、default-ON 標準 env、md5 22/22 OK)
+| | baseline | Phase A | Phase A+B |
+|---|---|---|---|
+| q18 SF=0.1 | 2.79s | 1.59s | **0.36s** |
+| q18 SF=1 | 30.94s | 19.0s | **5.14s**（rows=57, 2 RPC, staged 50, resp 3.8KB） |
+| 内側 lineitem | staged 6M | staged 6M | **GS 合成 57**（index 供給） |
+| 外側 lineitem/cust/orders | 全件 | 57縮約 | 57縮約 |
+
+- **q18 30.94→5.14s(-25.8s, 6x)。対 InnoDB 14.3x→2.4x。**
+- mysqld RSS 4384→2621MB(大量ステージ解消)。
+- **suite 合計 ≈ 45.5s**（run間ノイズ 45.2-46.1）vs InnoDB 44.15 — ほぼ拮抗、わずかに上。
+  決定的逆転には q21(13.2s)/q13(6.1s)/q22(3.3s) であと数秒。
+- 機構: agg step(semijoin source)+ GS(内側合成供給)が agg spec を共有。MySQL 無改変。
+
+
 
 
 

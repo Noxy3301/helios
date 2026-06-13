@@ -1570,7 +1570,9 @@ static std::string helios_phys_table_key(const TABLE *t) {
 }
 
 static void helios_try_register_grouped_semijoin(THD *thd, JOIN *join) {
-  static const bool gate = std::getenv("HELIOS_Q18_SEMIJOIN") != nullptr;
+  // Default ON; HELIOS_Q18_SEMIJOIN=0 disables (A/B measurement + off-switch).
+  static const char *q18_env = std::getenv("HELIOS_Q18_SEMIJOIN");
+  static const bool gate = q18_env == nullptr || std::strcmp(q18_env, "0") != 0;
   if (!gate) return;
   if (thd == nullptr || join == nullptr || thd->lex == nullptr) return;
   if (thd->lex->sql_command != SQLCOM_SELECT || thd->lex->is_explain()) return;
@@ -1636,18 +1638,94 @@ static void helios_try_register_grouped_semijoin(THD *thd, JOIN *join) {
   for (uint i = 0; i < ot->s->fields; ++i)
     if (ot->field[i] == of) { probe_col = static_cast<int>(i); break; }
   if (probe_col < 0) return;
+  // Soundness: the outer table must be a plain inner-join leaf in the top-level
+  // query block (an outer-join inner or a semi/anti-join nest member would lose
+  // NULL-extended / membership rows when we prune it). And the membership test
+  // is a raw-byte compare of the inner group column vs outer.col, so the two
+  // fields must be byte-compatible and non-nullable.
+  {
+    Field *grp_f = down_cast<Item_field *>(gi)->field;
+    const Table_ref *otr = ot->pos_in_table_list;
+    if (otr == nullptr) return;
+    if (otr->is_inner_table_of_outer_join()) return;
+    for (const Table_ref *emb = otr->embedding; emb != nullptr;
+         emb = emb->embedding)
+      if (emb->is_sj_or_aj_nest()) return;
+    if (otr->query_block == nullptr ||
+        otr->query_block->outer_query_block() != nullptr)
+      return;
+    if (grp_f == nullptr || grp_f->is_nullable() || of->is_nullable()) return;
+    if (grp_f->type() != of->type() ||
+        grp_f->pack_length() != of->pack_length())
+      return;
+    if (grp_f->result_type() == STRING_RESULT &&
+        grp_f->charset() != of->charset())
+      return;
+  }
+  const std::string inner_key = helios_phys_table_key(t);
+  const std::string outer_key = helios_phys_table_key(ot);
+  if (inner_key.empty() || outer_key.empty()) return;
+
+  // Phase B (gate HELIOS_Q18_GS): also serve the INNER subquery scan
+  // synthetically so MySQL never stages T's raw rows. The aggregated column
+  // (l_quantity) itself holds the exact group sum, so one synthetic row per
+  // surviving group re-aggregates idempotently. Requires the HAVING aggregate
+  // to be SUM over a plain non-nullable column of T distinct from the group
+  // column, and that the inner read_set touches ONLY {group, sum} (every other
+  // read column would be served the "0" template). Decide eligibility BEFORE
+  // registering anything so the two registrations stay consistent.
+  // Default ON; HELIOS_Q18_GS=0 disables the inner synthetic serving (Phase B).
+  static const char *gs_env = std::getenv("HELIOS_Q18_GS");
+  static const bool gs_gate = gs_env == nullptr || std::strcmp(gs_env, "0") != 0;
+  bool serve_inner = false;
+  int sum_col = -1, grp_col = -1;
+  Field *gf = down_cast<Item_field *>(gi)->field;
+  if (gs_gate && having.kind == HK_SUM && having.arg != nullptr) {
+    Item *sarg = having.arg->real_item();
+    if (sarg->type() == Item::FIELD_ITEM && !sarg->is_nullable()) {
+      Field *sumf = down_cast<Item_field *>(sarg)->field;
+      if (sumf != nullptr && sumf->table == t && sumf != gf) {
+        for (uint i = 0; i < t->s->fields; ++i) {
+          if (t->field[i] == sumf) sum_col = static_cast<int>(i);
+          if (t->field[i] == gf) grp_col = static_cast<int>(i);
+        }
+        if (sum_col >= 0 && grp_col >= 0) {
+          serve_inner = true;
+          for (uint i = 0; i < t->s->fields; ++i) {
+            if (!bitmap_is_set(t->read_set, i)) continue;
+            if (static_cast<int>(i) != sum_col &&
+                static_cast<int>(i) != grp_col) {
+              serve_inner = false;
+              break;
+            }
+          }
+        }
+      }
+    }
+  }
+
   LineairDBTransaction::GroupedSemijoin gs;
-  gs.inner_table_key = helios_phys_table_key(t);
-  gs.agg_spec = std::move(spec_ser);
-  gs.outer_table_key = helios_phys_table_key(ot);
+  gs.inner_table_key = inner_key;
+  gs.agg_spec = spec_ser;  // copy: the GS below reuses spec_ser
+  gs.outer_table_key = outer_key;
   gs.outer_probe_column = static_cast<uint32_t>(probe_col);
-  if (gs.inner_table_key.empty() || gs.outer_table_key.empty()) return;
   if (aggdbg)
     std::fprintf(stderr,
-                 "[GSEMI] registered inner=%s outer=%s probe_col=%d\n",
-                 gs.inner_table_key.c_str(), gs.outer_table_key.c_str(),
-                 probe_col);
+                 "[GSEMI] registered inner=%s outer=%s probe_col=%d serve=%d\n",
+                 inner_key.c_str(), outer_key.c_str(), probe_col,
+                 (int)serve_inner);
   hl->tx_register_grouped_semijoin(std::move(gs));
+
+  if (!serve_inner) return;
+  LineairDBTransaction::GsRegistration reg;
+  reg.spec = std::move(spec_ser);
+  reg.filter.clear();  // q18 inner has no WHERE
+  reg.template_cols.assign(t->s->fields, "0");
+  reg.group_col = static_cast<uint32_t>(grp_col);
+  reg.col_a = static_cast<uint32_t>(sum_col);
+  reg.col_b = static_cast<uint32_t>(sum_col);  // masked by col_a in emit_row
+  reg.single_sum = true;
+  hl->tx_register_gs(std::move(reg));
 }
 
 static int lineairdb_push_to_engine(THD *thd, AccessPath * /*root_path*/,
@@ -2097,6 +2175,20 @@ int ha_lineairdb::index_read_map(uchar *buf, const uchar *key,
   }
 
   tx->choose_table(db_table_name);
+
+  // GroupedSummary on the index-scan path (Phase-17 q18): the inner subquery
+  // scans T by an ordered PRIMARY index. autogen dropped its base scan, so
+  // serve the synthetic group rows here (gs_fill_buffers fills both the rnd and
+  // index buffers). Fires once at the full-scan start (no search key); the rest
+  // come from index_next reading secondary_index_results_.
+  if (tx->gs_skipped(table) && key == nullptr) {
+    reset_index_search_buffers();
+    last_fetched_primary_key_.clear();
+    if (int e = gs_fill_buffers(tx)) return e;
+    if (secondary_index_results_.empty()) return HA_ERR_END_OF_FILE;
+    return fetch_and_set_current_result(buf, tx);
+  }
+
   if (!pushed_filter_serialized_.empty()) {
     tx->set_pushed_filter(pushed_filter_serialized_);
   } else if (!tx->has_pushed_aggregate()) {
@@ -2648,6 +2740,12 @@ int ha_lineairdb::gs_fill_buffers(LineairDBTransaction *tx) {
                        std::to_string(scanned_keys_.size());
     const size_t idx = scanned_keys_.size();
     scanned_keys_.push_back(skey);
+    // Index-scan path (q18's inner uses an ordered PRIMARY index scan, not a
+    // table scan): fetch_and_set_current_result serves the inline payload, so
+    // the synthetic key is a placeholder. Both buffer sets are filled so rnd
+    // (q15) and index (q18) consumers each find their rows.
+    secondary_index_results_.push_back(skey);
+    secondary_index_payloads_.push_back(value);
     scan_cache_[std::move(skey)] = idx;
     scanned_values_.emplace_back(
         reinterpret_cast<const std::byte *>(value.data()),
@@ -2662,6 +2760,31 @@ int ha_lineairdb::gs_fill_buffers(LineairDBTransaction *tx) {
       return HA_ERR_INTERNAL_ERROR;
     }
     const std::string gkey(fv[1]);
+    // Phase-17 q18 single-column SUM: the aggregated column itself holds the
+    // exact sum, so emit ONE synthetic row per group (col_a = sum) — MySQL's
+    // SUM over that single row reproduces the value, and re-applied HAVING
+    // passes (the server already kept only qualifying groups). col_b is unused.
+    if (reg->single_sum) {
+      // Field::store fails closed on overflow of col_a (Codex parity with the
+      // carrier-overflow guard below): a group sum exceeding the column's
+      // precision would be silently clipped.
+      Field *sf = table->field[reg->col_a];
+      size_t digits = 0;
+      for (char ch : fv[2]) {
+        if (ch == '.') break;
+        if (ch >= '0' && ch <= '9') ++digits;
+      }
+      const uint max_int_digits =
+          sf->field_length >= (sf->decimals() + 2)
+              ? static_cast<uint>(sf->field_length) - sf->decimals() - 2
+              : 0;
+      if (digits > max_int_digits) {
+        my_error(ER_INTERNAL_ERROR, MYF(0), "helios gs sum overflow");
+        return HA_ERR_INTERNAL_ERROR;
+      }
+      emit_row(gkey, std::string(fv[2]), std::string());
+      continue;
+    }
     // Exact decomposition of S (scale<=4) into a*(1-b) contributions with
     // a, b at scale 2:  S = S2 + r,  S2 = trunc2(S), |r| < 0.01.
     //   row1: a=S2,  b=0.00              -> contributes S2 exactly

@@ -277,6 +277,11 @@ public:
     uint32_t group_col = 0;  // field ordinal of the (single) group column
     uint32_t col_a = 0;      // SUM(a * (1 - b)): carrier columns
     uint32_t col_b = 0;
+    // Phase-17 q18: single-column SUM mode. The aggregated column (col_a) can
+    // hold the exact group sum directly, so one synthetic row per group (col_a
+    // = sum) re-aggregates idempotently — no a*(1-b) carrier decomposition.
+    // The server applies HAVING, so only qualifying groups (q18: ~57) arrive.
+    bool single_sum = false;
   };
   void register_gs(const void* leaf, GsRegistration reg) {
     gs_regs_.emplace(leaf, std::move(reg));
