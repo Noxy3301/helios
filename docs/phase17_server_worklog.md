@@ -1037,3 +1037,41 @@ filter/projection pushdown が同じ理由(reduced 結果は replay 不能)で�
 
 ### hygiene
 `.cache/clangd/index/*`(数千ファイル)が過去 `git add -A` で混入していた。`.gitignore` に `.cache/` 追加。
+
+---
+
+## エントリ: Phase 18-20 dual review iteration-2(post-fix 検証 + residual-gap 決着)(2026-06-14)
+iteration-1 の fix(existence_only を ro_novalidate ゲート)を Codex + Claude で再レビュー。焦点は
+①修正の正しさ・完全性、②iter-1 で Codex が挙げた residual-gap の到達可能性。
+
+### ① 修正判定: 正しい・完全(Claude grounded で実証)
+`allow_filter_pushdown == tx->ro_novalidate()` をコールチェーン全域で確認(`lineairdb_prefetch.cc:367`→
+`autogen_read_plan_from_qep`→`compile_tree_leaves`、再代入なし)。ro_novalidate OFF で no-residual NOT EXISTS
+が完走(abort 解消)、ro_novalidate ON で q22 マーク継続を実証。ゲート配置の副作用なし。
+
+### ② residual-gap 判定: NOT-REACHABLE(構造証明で決着、Codex の REACHABLE は false positive)
+Codex(iter-2, file-blind)は「相関残差 `i.b>o.x` が **ICP(pushed_idx_cond)に畳まれ bare REF のまま** →
+qep_leaf_info=true → マーク → first-match 誤り」と **REACHABLE 判定**。しかし **data 非依存の構造証明**で否定:
+- **helios の `index_flags` は `HA_READ_RANGE|HA_READ_NEXT|HA_READ_ORDER|HA_READ_PREV` のみで
+  `HA_DO_INDEX_COND_PUSHDOWN` を広告しない**(`ha_lineairdb.hh:250-254`、proxy 全体に皆無)。MySQL は
+  この flag を広告する index にしか ICP を使わない → **helios 表には ICP が一切適用されない** → Codex の
+  ICP 畳み込みは helios では発生し得ない。
+- **EXPLAIN FORMAT=TREE(data 非依存)** で Codex の厳密ケース(idx_ab(a,b), `i.b>o.x`)を実測 → inner は
+  `-> Filter:(i.b > o.x)` → `-> Index lookup on i using idx_ab(a=o.a)` = **残差は独立 FILTER ノード**
+  (REF に畳まれず)→ qep_leaf_info=false → existence_only 非マーク。
+- Claude のソース根拠: REF/EQ_REF/MRR の AccessPath struct は条件フィールドを持たない(`access_path.h:870-876`)。
+→ Codex は generic MySQL/InnoDB(ICP 対応)から推論した false positive。**helios は ICP 非対応なので residual は
+常に FILTER 化 → existence_only は構造的に安全。hardening 不要。**
+
+### 副次発見(tangential・pre-existing・review 対象外)
+- 経験的 row 比較テストは **helios の ad-hoc multi-row INSERT + secondary index が行を取りこぼす**既存制約で
+  汚染された(`INSERT ... VALUES(4 rows)` で 1 行しか入らず、index lookup も誤行を返した)。benchbase の bulk
+  load 経路は正常(md5 22/22 が証拠)。ad-hoc DML 経路は別問題で本 review の射程外。
+- **DROP TABLE が in-mem server の KV 行を purge しない**(同名 CREATE で旧行復活)。テスト hygiene 上の注意。
+  ベンチは server 再起動 + fresh load なので影響なし。
+→ いずれも residual-gap の結論(構造証明で NOT-REACHABLE)に影響しない。
+
+### iteration-2 総括
+**修正は正しく完全、residual gap は構造的に到達不能、追加修正不要。** Phase 18-20 の正しさは2イテレーションの
+dual review を経て確定(single-key RO=SOUND、existence_only core=SOUND+ro_novalidate ゲート済、
+prewarm/gate/結論=SOUND/訂正済)。最大の収穫は iter-1 Claude が見つけた ro_novalidate-abort 実バグの修正。
