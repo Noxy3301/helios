@@ -3960,9 +3960,15 @@ bool ha_lineairdb::inplace_alter_table(TABLE *altered_table [[maybe_unused]],
       return true;
     }
 
-    // Register the (empty) index on the server. First cut assumes a fresh load
-    // (no pre-existing same-name index); a whole-index clear / DROP purge is a
-    // Step-3 co-requisite for safe re-CREATE on a dirty server.
+    // Phase-21 Step-3 (clean-slate / FIX-5): drop any pre-existing same-name
+    // index BEFORE creating the fresh one. CreateSecondaryIndex is a no-op on an
+    // existing name, so without this an index left from a prior failed/repeated
+    // CREATE (dirty server) or a single-statement same-name modify (DROP X|ADD X)
+    // would be backfilled on top -> double/wrong entries. Idempotent (no-op if
+    // absent). Pure drops (names NOT re-added) are processed AFTER all adds
+    // succeed (below) so an add/backfill failure cannot leave a MySQL-visible
+    // index missing on the engine (the Codex Step-3 review BLOCKER).
+    proxy->db_drop_secondary_index(db_table_name, idx_name);
     proxy->db_create_secondary_index(db_table_name, idx_name, index_type);
 
     // Read the whole table in one ordered scan under the EXCLUSIVE lock through
@@ -4008,6 +4014,33 @@ bool ha_lineairdb::inplace_alter_table(TABLE *altered_table [[maybe_unused]],
     if (failed || scan_tx->is_aborted()) return true;
     // Commit the final partial chunk.
     if (!backfill_commit_chunk(write_chunk)) return true;
+  }
+
+  // Phase-21 Step-3: process pure DROP INDEX (names dropped but NOT re-added) —
+  // e.g. a user DROP INDEX, or the FK-auto-index removed when CREATE INDEX
+  // replaces it (MySQL sends DROP old-name | ADD new-name together). Done AFTER
+  // all adds succeed so an add/backfill failure above (return true) leaves these
+  // indexes intact and MySQL's DD rollback stays consistent with the engine
+  // (Codex Step-3 review BLOCKER). A same-name DROP X | ADD X (modify) was
+  // already cleared+rebuilt by the add loop's drop-if-exists, so it is skipped
+  // here. EXCLUSIVE lock => no concurrent DML. index_drop_buffer[j] is a KEY*
+  // into the OLD table def; read its name directly (unlike index_add_buffer,
+  // which is an offset into key_info_buffer).
+  for (uint j = 0; j < ha_alter_info->index_drop_count; j++) {
+    const KEY *drop_key = ha_alter_info->index_drop_buffer[j];
+    if (drop_key == nullptr || drop_key->name == nullptr) continue;
+    const std::string drop_name(drop_key->name);
+    bool re_added = false;
+    for (uint i = 0; i < ha_alter_info->index_add_count; i++) {
+      const KEY *add_key =
+          &ha_alter_info->key_info_buffer[ha_alter_info->index_add_buffer[i]];
+      if (add_key->name != nullptr && drop_name == add_key->name) {
+        re_added = true;
+        break;
+      }
+    }
+    if (re_added) continue;  // cleared+rebuilt by the add loop's drop-if-exists
+    proxy->db_drop_secondary_index(db_table_name, drop_name);  // idempotent
   }
 
   return false;

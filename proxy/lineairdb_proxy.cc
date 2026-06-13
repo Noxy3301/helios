@@ -1394,6 +1394,33 @@ bool LineairDBProxy::db_create_secondary_index(const std::string& table_name,
     return response.success();
 }
 
+// Phase-21 Step-3: DROP INDEX purge. Non-transactional (mirrors create). Returns
+// true if an index was removed, false if the table/index was absent (idempotent:
+// a missing index on DROP is a safe no-op the caller does not fail the DDL on).
+bool LineairDBProxy::db_drop_secondary_index(const std::string& table_name,
+                                             const std::string& index_name) {
+    LOG_DEBUG("CLIENT: db_drop_secondary_index called with table=%s, index=%s",
+              table_name.c_str(), index_name.c_str());
+    if (!connected_) {
+        LOG_ERROR("RPC failed: Not connected to server");
+        return false;
+    }
+
+    LineairDB::Protocol::DbDropSecondaryIndex::Request request;
+    LineairDB::Protocol::DbDropSecondaryIndex::Response response;
+
+    request.set_table_name(table_name);
+    request.set_index_name(index_name);
+
+    if (!send_protobuf_message(request, response, MessageType::DB_DROP_SECONDARY_INDEX)) {
+        LOG_ERROR("RPC failed: Failed to send message to server");
+        return false;
+    }
+
+    LOG_DEBUG("CLIENT: db_drop_secondary_index completed, success: %s", response.success() ? "true" : "false");
+    return response.success();
+}
+
 bool LineairDBProxy::db_end_transaction(int64_t tx_id, bool isFence,
                                         const std::vector<std::pair<std::string, int64_t>>& row_deltas) {
     LOG_DEBUG("CLIENT: db_end_transaction (with row_deltas) called with tx_id=%ld, fence=%s, deltas=%zu",

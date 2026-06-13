@@ -1321,3 +1321,32 @@ read-only prefetch SELECT 経路のみで DML 非関与 — 実測でも確認�
 per-key Delete のみ)。whole-index clear/drop primitive(LineairDB-core, feature branch)+ proxy db_drop_secondary_index
 RPC + DROP_INDEX wire が必要。afterLoad full-set を wire しない方針ゆえ re-CREATE robustness の駆動力は低いが、DROP INDEX は
 foundational DBMS capability ゆえ lifecycle 完成として実装。process: 既存系調査 → 設計 → dual-review → 実装 → dual-review。
+
+## Step ③ 設計 + dual-review(grounded + Codex)
+**grounded 調査**: SI は `Table::secondary_indices_`(unordered_map<string, unique_ptr<SecondaryIndex>>, table_lock_ 保護)。
+`CreateSecondaryIndex` は既存名で no-op(reset しない)→ re-CREATE が stale に上塗り。**whole-index remove(erase)**が正
+(clear-keep は型/uniqueness 継承や rebuild skip の罠)。masstree teardown は leak(RCU-free でない=memory-safe)、PL は free。
+raw SI* は RPC 跨ぎで cache されない + DROP は EXCLUSIVE lock = dangling なし。既存系(InnoDB/PG/Hekaton)も「exclusive
+lock 下で構造実除去、re-create clean」で一致。
+**Codex review = CHANGES(BLOCKER)**: 非トランザクショナル **DROP-before-ADD は ADD/backfill 失敗時に MySQL DD(旧 index 有)
+と server(削除済)が不整合**(create-first hazard より悪い=可視 index 欠落)。→ 設計改訂:
+- **ADD-before-DROP**: ① ADD ループで各 create 前に **drop-if-exists**(FIX-5 clean-slate=dirty-server re-CREATE / same-name
+  modify も正)+ create + backfill。② re-add されない **pure-DROP のみ ADD 後**に処理。→ ADD 失敗時 pure-drop 未実行=
+  DD rollback と整合(FK 置換=異名 DROP の common case が安全)。残失敗窓は単一文 same-name modify のみ(rare・文書化)。
+- idempotent(absent は no-op)、EXCLUSIVE lock 下。
+
+## Step ③ 実装
+- **LineairDB-core**(submodule feature branch `helios/q21-drop-index`): `Table::DropSecondaryIndex`(table.h, `erase`)、
+  `DatabaseImpl::DropSecondaryIndex`(database_impl.h)、`Database::DropSecondaryIndex`(database.cpp + include/database.h)。
+- **proxy/server**: proto `DbDropSecondaryIndex`、`DB_DROP_SECONDARY_INDEX=34`(両 enum 同期)、`db_drop_secondary_index`
+  client、`handleDbDropSecondaryIndex` + dispatch、rpc_trace label。
+- **wire**: `ha_lineairdb::inplace_alter_table` を ADD-before-DROP(create 前 drop-if-exists + 後段 pure-DROP)に。build clean。
+- **検証(SF0.1)全 PASS**: ①baseline q21=d36a1caf ②CREATE l_sk→使用・q21 OK ③**DROP l_sk→information_schema から消滅・
+  FORCE INDEX(l_sk)=ERROR 1176(完全除去)・q21 OK** ④re-CREATE l_sk→q21 OK(**stale/double なし=FIX-5 達成**)
+  ⑤composite l_sk_pk の create/drop/recreate→q21 OK ⑥idempotent DROP→q21 OK ⑦**全22クエリ 0 errors**(退行なし)。
+  → **DROP INDEX が実際に index を解放し、re-CREATE が clean**。
+
+## Phase 21 lifecycle 完成
+**secondary-index lifecycle = build(② chunk-COMMIT backfill)→ use-correctly(④ prefetch×SI:q1/q6/q15)→ drop(③ purge)**
+を foundational に実装・全 dual-review GO・全検証 PASS。**性能 finding**(標準索引一式は helios 2x 退行、cost-model が本命)
+は別軸 follow-up として文書化、afterLoad full-set は非 wire。

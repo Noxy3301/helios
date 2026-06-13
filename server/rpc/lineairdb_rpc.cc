@@ -923,6 +923,9 @@ void LineairDBRpc::handle_rpc(uint64_t sender_id, MessageType message_type,
         case MessageType::DB_CREATE_SECONDARY_INDEX:
             handleDbCreateSecondaryIndex(message, result);
             return;
+        case MessageType::DB_DROP_SECONDARY_INDEX:
+            handleDbDropSecondaryIndex(message, result);
+            return;
 
         default:
             LOG_ERROR("Unknown message type: %u", static_cast<uint32_t>(message_type));
@@ -2871,6 +2874,24 @@ void LineairDBRpc::handleDbCreateSecondaryIndex(const std::string& message, std:
 
     bool success = db_manager_->get_database()->CreateSecondaryIndex(
         request.table_name(), request.index_name(), request.index_type());
+    response.set_success(success);
+
+    result = response.SerializeAsString();
+}
+
+// Phase-21 Step-3: DROP INDEX purge — remove a secondary index outright so a
+// re-CREATE backfills onto a fresh empty index. Idempotent: success=false when
+// the table/index was absent (the proxy does not fail the DDL on that).
+void LineairDBRpc::handleDbDropSecondaryIndex(const std::string& message, std::string& result) {
+    LOG_DEBUG("Handling DbDropSecondaryIndex");
+
+    LineairDB::Protocol::DbDropSecondaryIndex::Request request;
+    LineairDB::Protocol::DbDropSecondaryIndex::Response response;
+
+    request.ParseFromString(message);
+
+    bool success = db_manager_->get_database()->DropSecondaryIndex(
+        request.table_name(), request.index_name());
     response.set_success(success);
 
     result = response.SerializeAsString();

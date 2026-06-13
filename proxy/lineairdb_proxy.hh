@@ -82,7 +82,8 @@ enum class MessageType : uint32_t {
     TX_STATELESS_RANGE_SCAN = 30,
     TX_STATELESS_SECONDARY_RANGE_SCAN = 31,
     TX_EXECUTE_READ_PLAN = 32,
-    TX_GET_TABLE_STATS = 33  // keep in sync with server/protocol/message.hh
+    TX_GET_TABLE_STATS = 33,
+    DB_DROP_SECONDARY_INDEX = 34  // keep in sync with server/protocol/message.hh
 };
 
 /**
@@ -364,6 +365,9 @@ public:
     bool db_create_secondary_index(const std::string& table_name,
                                    const std::string& index_name,
                                    uint32_t index_type);
+    // Phase-21 Step-3: DROP INDEX purge (idempotent whole-index remove).
+    bool db_drop_secondary_index(const std::string& table_name,
+                                 const std::string& index_name);
 
     // database operations
     bool db_end_transaction(int64_t tx_id, bool isFence,

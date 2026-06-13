@@ -61,5 +61,7 @@ enum class MessageType : uint32_t {
     TX_STATELESS_SECONDARY_RANGE_SCAN = 31,
     TX_EXECUTE_READ_PLAN = 32,
     // Transaction-less fetch of all table row counts (optimizer stats seed).
-    TX_GET_TABLE_STATS = 33
+    TX_GET_TABLE_STATS = 33,
+    // Phase-21 Step-3: DROP INDEX purge (whole-secondary-index remove).
+    DB_DROP_SECONDARY_INDEX = 34
 };

@@ -609,6 +609,17 @@ message DbCreateSecondaryIndex {
     }
 }
 
+// Phase-21 Step-3: DROP INDEX purge — remove a secondary index outright.
+message DbDropSecondaryIndex {
+    message Request {
+        string table_name = 1;
+        string index_name = 2;
+    }
+    message Response {
+        bool success = 1;
+    }
+}
+
 // Scan keys in [start_key, end_key) range.
 // @see LineairDBTransaction::get_matching_keys_in_range()
 message TxGetMatchingKeysInRange {

@@ -79,6 +79,8 @@ const char* message_type_name(MessageType t) {
       return "DB_SET_TABLE";
     case MessageType::DB_CREATE_SECONDARY_INDEX:
       return "DB_CREATE_SECONDARY_INDEX";
+    case MessageType::DB_DROP_SECONDARY_INDEX:
+      return "DB_DROP_SECONDARY_INDEX";
     case MessageType::TX_BATCH_READ:
       return "TX_BATCH_READ";
     case MessageType::TX_BATCH_WRITE:

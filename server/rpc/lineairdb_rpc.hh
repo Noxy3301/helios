@@ -101,6 +101,7 @@ private:
     void handleDbCreateTable(const std::string& message, std::string& result);
     void handleDbSetTable(const std::string& message, std::string& result);
     void handleDbCreateSecondaryIndex(const std::string& message, std::string& result);
+    void handleDbDropSecondaryIndex(const std::string& message, std::string& result);
 
     // utility
     bool key_prefix_is_matching(const std::string& key_prefix, const std::string& key);
