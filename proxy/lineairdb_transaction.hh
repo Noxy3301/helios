@@ -260,6 +260,7 @@ public:
     inner_agg_stamped_leaves_.clear();
     gs_regs_.clear();
     gs_skipped_.clear();
+    grouped_semijoins_.clear();
   }
 
   // GroupedSummary (Phase-16 entry 25, q15-class): a DERIVED inner unit's
@@ -287,6 +288,28 @@ public:
   void mark_gs_skipped(const void* leaf) { gs_skipped_.insert(leaf); }
   bool gs_skipped(const void* leaf) const {
     return gs_skipped_.count(leaf) != 0;
+  }
+
+  // GroupedSemijoin (Phase-17 q18): an IN subquery
+  //   outer.col IN (SELECT gcol FROM T GROUP BY gcol HAVING agg>const)
+  // reduces the outer table to rows whose col is one of the qualifying groups.
+  // We add a server-side AGGREGATE step over T (group rows survive HAVING ->
+  // q18: ~57 keys) and a semijoin on the outer scan against that step's group
+  // column. Result-preserving: the semijoin set is EXACTLY the IN set (positive
+  // membership, not anti-join). Registered at optimize time; the autogen turns
+  // it into (agg step, semijoin) over the staged plan.
+  struct GroupedSemijoin {
+    std::string inner_table_key;   // db_table_key of T (the aggregated table)
+    std::string agg_spec;          // serialized AggregateSpec (GROUP BY gcol +
+                                   // HAVING agg, server-side HAVING)
+    std::string outer_table_key;   // db_table_key of the outer table
+    uint32_t outer_probe_column;   // 0-based field ordinal of outer.col
+  };
+  void register_grouped_semijoin(GroupedSemijoin gs) {
+    grouped_semijoins_.push_back(std::move(gs));
+  }
+  const std::vector<GroupedSemijoin>& grouped_semijoins() const {
+    return grouped_semijoins_;
   }
   // Execute a one-step read plan and hand back the raw scan_values WITHOUT
   // staging anything into the tx caches (GS group rows are not base rows).
@@ -462,6 +485,7 @@ private:
       inner_agg_stamped_leaves_;
   std::unordered_map<const void*, GsRegistration> gs_regs_;
   std::unordered_set<const void*> gs_skipped_;
+  std::vector<GroupedSemijoin> grouped_semijoins_;
 
   // Projection pushdown: physical table name -> kept field ordinals.
   std::unordered_map<std::string, std::vector<uint32_t>> table_projection_;

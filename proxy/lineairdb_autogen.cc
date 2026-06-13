@@ -1467,6 +1467,68 @@ bool autogen_read_plan_from_qep(
     }
   }
 
+  // Phase-17 q18 grouped-semijoin: for each registered
+  //   outer.col IN (SELECT gcol FROM T GROUP BY gcol HAVING agg>const)
+  // prepend a server-side AGGREGATE step over T (group rows survive the
+  // server-side HAVING -> ~57 keys) and attach a semijoin on the outer scan
+  // step against that step's group column (field ordinal 0). The outer is then
+  // staged reduced to the qualifying orders, so the for_each probes hanging off
+  // it (customer/lineitem) fetch only those. Result-preserving: the membership
+  // set equals the IN set (positive, not anti-join). MySQL still materializes
+  // the subquery itself by scanning T's raw rows (a separate step), so this
+  // only prunes the OUTER staging (Phase A; the inner removal is Phase B).
+  if (allow_filter_pushdown && tx != nullptr &&
+      !tx->grouped_semijoins().empty()) {
+    static const bool gdbg = std::getenv("HELIOS_FE_DEBUG") != nullptr;
+    for (const auto &gs : tx->grouped_semijoins()) {
+      // Find a plain outer scan step on the outer table (not for_each, not
+      // already aggregate-stamped, no existing semijoin) to reduce.
+      int outer_idx = -1;
+      for (size_t i = 0; i < steps.size(); ++i) {
+        const auto &s = steps[i];
+        if (s.is_scan && !s.for_each && s.table_name == gs.outer_table_key &&
+            s.aggregate_serialized.empty() && s.index_name.empty() &&
+            s.semijoins.empty()) {
+          outer_idx = static_cast<int>(i);
+          break;
+        }
+      }
+      if (outer_idx < 0) {
+        if (gdbg)
+          std::fprintf(stderr, "[GSEMI] no plain outer scan for %s\n",
+                       gs.outer_table_key.c_str());
+        continue;
+      }
+      // Build the AGGREGATE step over T (full primary scan + the HAVING spec).
+      LineairDBProxy::ReadPlanStep agg;
+      agg.table_name = gs.inner_table_key;
+      agg.is_scan = true;
+      agg.for_each = false;
+      agg.end_key_prefix = lineairdb_keyenc::scan_end_sentinel();
+      agg.aggregate_serialized = gs.agg_spec;
+      // Insert at the FRONT so the server has its group rows in previous_results
+      // before the (later) outer step's semijoin reads them. Shift every
+      // existing source_step reference by +1.
+      steps.insert(steps.begin(), std::move(agg));
+      for (auto &s : steps) {
+        for (auto &b : s.bindings) b.source_step += 1;
+        for (auto &b : s.end_bindings) b.source_step += 1;
+        for (auto &sj : s.semijoins) sj.source_step += 1;
+      }
+      LineairDBProxy::ReadPlanStep::Semijoin sj;
+      sj.source_step = 0;            // the agg step we just prepended
+      sj.source_column = 0;          // group col 0 = gcol (field ordinal 1)
+      sj.probe_column = gs.outer_probe_column;
+      steps[outer_idx + 1].semijoins.push_back(std::move(sj));
+      if (gdbg)
+        std::fprintf(stderr,
+                     "[GSEMI] agg step for %s + semijoin on %s (step %d) "
+                     "probe_col=%u\n",
+                     gs.inner_table_key.c_str(), gs.outer_table_key.c_str(),
+                     outer_idx + 1, gs.outer_probe_column);
+    }
+  }
+
   *out = std::move(steps);
   return true;
 }

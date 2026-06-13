@@ -1430,26 +1430,19 @@ void LineairDBRpc::handleTxExecuteReadPlan(const std::string& message,
             return std::move(v);
         };
 
-        if (step.for_each()) {
-            int source_step = -1;
-            if (step.bindings_size() > 0) {
-                source_step = static_cast<int>(step.bindings(0).source_step());
-            }
-            if (source_step < 0 ||
-                source_step >= static_cast<int>(previous_results.size()) - 1) {
-                continue;
-            }
-
-            // Phase-9 semijoin membership: build each set once from the
-            // earlier source step's shipped value column (optionally only
-            // from rows passing source_filter), then drop probe rows whose
-            // join key is absent — they cannot have a join partner, so the
-            // result is unchanged (planner whitelists inner equi-joins).
-            struct FeSemijoin {
-                std::unordered_set<std::string> keys;
-                uint32_t probe_column;
-            };
-            std::vector<FeSemijoin> fe_semijoins;
+        // Phase-9 semijoin membership: build each set once from the earlier
+        // source step's shipped value column (optionally only from rows passing
+        // source_filter), then drop probe rows whose join key is absent — they
+        // cannot have a join partner, so the result is unchanged (planner
+        // whitelists inner equi-joins). Built BEFORE the for_each/plain-scan
+        // branch so a plain scan (Phase-17 q18 grouped-semijoin: orders reduced
+        // against the aggregate step's group keys) applies it too.
+        struct FeSemijoin {
+            std::unordered_set<std::string> keys;
+            uint32_t probe_column;
+        };
+        std::vector<FeSemijoin> fe_semijoins;
+        {
             const int this_step_idx =
                 static_cast<int>(previous_results.size()) - 1;
             for (const auto& sj : step.semijoins()) {
@@ -1474,14 +1467,25 @@ void LineairDBRpc::handleTxExecuteReadPlan(const std::string& message,
                 }
                 fe_semijoins.push_back(std::move(fsj));
             }
-            auto sj_reject = [&](const std::string& value) -> bool {
-                for (const auto& fsj : fe_semijoins) {
-                    auto col = extract_value_column(value, fsj.probe_column);
-                    if (fsj.keys.find(std::string(col)) == fsj.keys.end())
-                        return true;  // no join partner -> drop
-                }
-                return false;
-            };
+        }
+        auto sj_reject = [&](const std::string& value) -> bool {
+            for (const auto& fsj : fe_semijoins) {
+                auto col = extract_value_column(value, fsj.probe_column);
+                if (fsj.keys.find(std::string(col)) == fsj.keys.end())
+                    return true;  // no join partner -> drop
+            }
+            return false;
+        };
+
+        if (step.for_each()) {
+            int source_step = -1;
+            if (step.bindings_size() > 0) {
+                source_step = static_cast<int>(step.bindings(0).source_step());
+            }
+            if (source_step < 0 ||
+                source_step >= static_cast<int>(previous_results.size()) - 1) {
+                continue;
+            }
 
             const auto* source = previous_results[source_step];
             const int row_count =
@@ -1854,6 +1858,12 @@ void LineairDBRpc::handleTxExecuteReadPlan(const std::string& message,
                             step_result->add_filtered_keys(std::move(row.key));
                         continue;
                     }
+                    // Grouped-semijoin (Phase-17 q18): drop rows whose join key
+                    // is absent from the source step's group keys. NOT shipped
+                    // as filtered_keys: the IN reduction is a membership prune,
+                    // not this alias's local WHERE, so a stray point probe must
+                    // still miss and abort rather than read a wrong not-found.
+                    if (!fe_semijoins.empty() && sj_reject(row.value)) continue;
                     step_result->add_scan_keys(std::move(row.key));
                     step_result->add_scan_values(project_value(std::move(row.value)));
                     step_result->add_scan_tids(row.tid);

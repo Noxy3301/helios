@@ -1550,10 +1550,111 @@ static void helios_try_register_gs(THD *thd, JOIN *join) {
   hl->tx_register_gs(std::move(reg));
 }
 
+// Phase-17 q18 grouped-semijoin recognition. An IN subquery
+//   outer.col IN (SELECT gcol FROM T GROUP BY gcol HAVING SUM(x) > c)
+// lets us reduce the outer scan to rows whose col is one of the qualifying
+// groups (positive membership = the IN set exactly). Records the intent on the
+// tx; the autogen turns it into a server-side AGGREGATE step over T plus a
+// semijoin on the outer scan. MySQL stays unmodified and still materializes
+// the subquery normally (this only prunes the outer staging). Self-gating:
+// off-shape simply doesn't register. Gate HELIOS_Q18_SEMIJOIN (default OFF).
+static std::string helios_phys_table_key(const TABLE *t) {
+  if (t == nullptr || t->s == nullptr) return std::string();
+  const TABLE_SHARE *s = t->s;
+  std::string key = "./";
+  if (s->db.str != nullptr && s->db.length > 0) key.append(s->db.str, s->db.length);
+  key.push_back('/');
+  if (s->table_name.str != nullptr && s->table_name.length > 0)
+    key.append(s->table_name.str, s->table_name.length);
+  return key;
+}
+
+static void helios_try_register_grouped_semijoin(THD *thd, JOIN *join) {
+  static const bool gate = std::getenv("HELIOS_Q18_SEMIJOIN") != nullptr;
+  if (!gate) return;
+  if (thd == nullptr || join == nullptr || thd->lex == nullptr) return;
+  if (thd->lex->sql_command != SQLCOM_SELECT || thd->lex->is_explain()) return;
+  const bool aggdbg = std::getenv("HELIOS_FE_DEBUG") != nullptr;
+  Query_block *qb = join->query_block;
+  if (qb == nullptr || qb->outer_query_block() == nullptr) return;  // inner only
+  Query_expression *qe = qb->master_query_expression();
+  if (qe == nullptr || !qe->is_simple() || qe->uncacheable != 0) return;
+  // The unit's Item must be an IN subquery.
+  if (qe->item == nullptr ||
+      qe->item->substype() != Item_subselect::IN_SUBS)
+    return;
+  Item_in_subselect *insub = down_cast<Item_in_subselect *>(qe->item);
+  if (insub->left_expr == nullptr) return;
+  // Inner shape: exactly one base table, grouped by ONE plain non-nullable
+  // column, the SELECT list is just that column, plus a HAVING aggregate.
+  if (qb->leaf_table_count != 1 || !qb->is_grouped()) return;
+  if (qb->is_distinct() || qb->has_limit() ||
+      qb->olap != UNSPECIFIED_OLAP_TYPE || qb->has_windows() ||
+      qb->group_list.elements != 1 || qb->having_cond() == nullptr)
+    return;
+  // The agg step scans T unfiltered: a subquery WHERE would change which rows
+  // aggregate, so the membership set would no longer equal the IN set. q18 has
+  // no inner WHERE; reject anything that does.
+  if (qb->where_cond() != nullptr) return;
+  TABLE *t = qb->leaf_tables != nullptr ? qb->leaf_tables->table : nullptr;
+  if (t == nullptr || t->file == nullptr || t->file->ht != lineairdb_hton)
+    return;
+  ha_lineairdb *hl = down_cast<ha_lineairdb *>(t->file);
+  if (!hl->tx_ro_novalidate()) return;
+  Item *gi = *qb->group_list.first->item;
+  if (gi->type() != Item::FIELD_ITEM || gi->is_nullable()) return;
+  // The (single) SELECT output must BE the group column (q18: SELECT l_orderkey).
+  std::vector<HeliosOut> outs;
+  if (!helios_plan_outputs(join, &outs)) return;
+  if (outs.size() != 1 || outs[0].kind != HK_PASS) return;
+  // HAVING: one bare-aggregate-vs-const (helios_parse_having's q18 shape).
+  HeliosHavingDesc having;
+  if (!helios_parse_having(qb, &having) || having.sum == nullptr) return;
+  std::vector<Item *> gitems{gi};
+  std::vector<int> out_agg, out_grp;
+  int h_agg_pos = -1;
+  std::string spec_ser;
+  if (!helios_build_phase_b_spec(t, hl->tx_ro_novalidate(), outs, gitems, having,
+                                 &out_agg, &out_grp, &h_agg_pos, &spec_ser))
+    return;
+  // Server-side HAVING must be live (else the agg ships every group, and the
+  // membership set would not equal the IN set without proxy re-filtering).
+  {
+    LineairDB::Protocol::AggregateSpec chk;
+    if (!chk.ParseFromString(spec_ser) || chk.having_op() == 0) return;
+  }
+  // The IN's left expr must be a single outer base-table column on our engine.
+  Item *lhs = insub->left_expr->real_item();
+  if (lhs->type() != Item::FIELD_ITEM) return;
+  Field *of = down_cast<Item_field *>(lhs)->field;
+  if (of == nullptr || of->table == nullptr || of->table->file == nullptr ||
+      of->table->file->ht != lineairdb_hton)
+    return;
+  TABLE *ot = of->table;
+  if (ot == t) return;  // the outer table must differ from the aggregated one
+  int probe_col = -1;
+  for (uint i = 0; i < ot->s->fields; ++i)
+    if (ot->field[i] == of) { probe_col = static_cast<int>(i); break; }
+  if (probe_col < 0) return;
+  LineairDBTransaction::GroupedSemijoin gs;
+  gs.inner_table_key = helios_phys_table_key(t);
+  gs.agg_spec = std::move(spec_ser);
+  gs.outer_table_key = helios_phys_table_key(ot);
+  gs.outer_probe_column = static_cast<uint32_t>(probe_col);
+  if (gs.inner_table_key.empty() || gs.outer_table_key.empty()) return;
+  if (aggdbg)
+    std::fprintf(stderr,
+                 "[GSEMI] registered inner=%s outer=%s probe_col=%d\n",
+                 gs.inner_table_key.c_str(), gs.outer_table_key.c_str(),
+                 probe_col);
+  hl->tx_register_grouped_semijoin(std::move(gs));
+}
+
 static int lineairdb_push_to_engine(THD *thd, AccessPath * /*root_path*/,
                                     JOIN *join) {
   if (!helios_agg_pushdown_enabled()) return 0;
   helios_try_register_gs(thd, join);  // self-gating (derived inner units)
+  helios_try_register_grouped_semijoin(thd, join);  // self-gating (q18 IN)
   if (!helios_offloadable_shape(thd, join)) return 0;
   if (std::getenv("HELIOS_FE_DEBUG"))
     std::fprintf(stderr, "[AGGPD] installing override_executor_func%s\n",
@@ -2469,6 +2570,13 @@ void ha_lineairdb::tx_register_gs(LineairDBTransaction::GsRegistration reg) {
   auto tx = get_transaction(ha_thd());
   if (tx == nullptr) return;
   tx->register_gs(table, std::move(reg));
+}
+
+void ha_lineairdb::tx_register_grouped_semijoin(
+    LineairDBTransaction::GroupedSemijoin gs) {
+  auto tx = get_transaction(ha_thd());
+  if (tx == nullptr) return;
+  tx->register_grouped_semijoin(std::move(gs));
 }
 
 // GroupedSummary consume: fetch server group rows for this leaf (raw, no

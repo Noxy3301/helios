@@ -222,6 +222,71 @@ range scan のみで point-probe されない → 完全に無駄**。lineitem 6
 - q14 SF=0.1: 0.736→0.109s(6.7x)、resp_b 15.2MB→0.97MB、stage_local 324ms→4.3ms。
 - 残ギャップはほぼ q18 単独(30.94 vs 2.17 = 28.8s)に集約。次は q18 が事実上唯一の壁。
 
+---
+
+## [2026-06-13] エントリ6: q18 完全解の設計確定(agg-step を共通基盤に Phase A/B)
+
+### 数学的必然
+filtered_keys 後 helios 70.83 vs InnoDB 44.15(gap 26.7s)。**他の負けクエリのギャップ合計は
+14.6s に過ぎず、q18(28.8s 差)を解かない限り suite 逆転は不可能**。q18 が唯一の道。
+上位敗者 q21/q13/q9/q8 は再 trace で **residual(MySQL executor CPU)律速**(filtered_keys 的
+転送の無駄なし)→ join+agg を server 押し込みしないと改善せず、q18 と同じ大型機構が必要。
+
+### q18 構造(SF=0.1 trace: staged 1.36M 行, stage 974ms+RPC 788ms)
+- 内側 `lineitem GROUP BY l_orderkey HAVING SUM(l_quantity)>300`: 600k scan→57 鍵。
+- 外側 `customer⋈orders⋈lineitem`: IN 通過後 orders は 57 のみだが prefetch は一括先行
+  ステージングで IN を適用できず、orders 全件(150k)を source に外側 lineitem 600k 全件 fetch。
+- agg-pushdown の override は IN サブクエリ(MaterializeIterator)に挿せない(MySQL 無改変の壁)。
+
+### 設計: agg step を共通基盤に
+server の `emit_agg_groups` は HAVING を server 側適用でき(`agg_having_passes`)、
+semijoin source は `extract_value_column(scan_values, source_column)` で群行の列を読める。
+→ **inner 集約を専用 agg step として発行**し、その 57 (orderkey, sum) 群行を2用途に使う:
+- **Phase A(外側縮約・GS不要・先行実装)**: orders scan に semijoin(source=agg step,
+  source_column=0=orderkey, probe=o_orderkey)を付与 → orders 57 に縮約 → 外側 lineitem/
+  customer の for_each は自動的に 57 件分だけ。IN は positive semijoin なので result-preserving。
+  期待: 外側 6M 除去 → q18 ~16s。内側 6M は残る。
+- **Phase B(内側除去・GS型・後続)**: 内側 lineitem scan を GS-skip、handler が agg step の
+  群行を l_quantity=sum の合成 lineitem 行として供給 → MySQL が 57 鍵 materialize。
+  期待: 内側 6M も除去 → q18 ~2s。**suite 逆転**(helios ~42 < InnoDB 44)。
+
+### リスクと検証
+- semijoin source = agg step(HAVING>300 群行)は IN 条件と厳密一致 → result-preserving。
+  exact-decimal sum は agg pushdown 既存。anti-join でない(positive IN)ので whitelist OK。
+- 最大リスクは autogen の q18 形状認識と step 順序(agg step を orders より前に)。md5 で gate。
+- Phase A 単独でも -15s の bankable 改善。段階コミットで進める。
+
+---
+
+## [2026-06-13] エントリ7: q18 Phase A 実装・動作(外側縮約、md5 22/22)
+
+### 実装(gate `HELIOS_Q18_SEMIJOIN`, default OFF)
+- proxy: `helios_try_register_grouped_semijoin`(ha_lineairdb.cc)が IN サブクエリ
+  `o_orderkey IN (SELECT l_orderkey FROM lineitem GROUP BY l_orderkey HAVING SUM(l_quantity)>300)`
+  を厳密認識(単一 group col / 出力=group col / HAVING SUM / 内側 WHERE 無し / 両表 our engine)。
+  既存 `helios_build_phase_b_spec` で agg spec(server HAVING 込み)を組み、tx に
+  GroupedSemijoin{inner=lineitem, spec, outer=orders, probe_col=o_orderkey} 登録。
+- autogen: 登録があれば agg step(lineitem 全 scan + spec)を**先頭に挿入**し source_step を
+  +1 remap、orders の plain scan step に semijoin(source=agg step, source_col=0=l_orderkey,
+  probe=o_orderkey)を付与。
+- server: **semijoin(sj_reject)を for_each 経路だけでなく plain scan emit でも適用**するよう
+  `fe_semijoins` 構築をブランチ前に移動(非 semijoin step では空=no-op、回帰無し)。
+- バグ修正: 当初 plain scan で sj_reject 未適用 → orders 縮約されず(staged 不変)。移動で解決。
+
+### 効果(md5 22/22 OK 維持、両 SF)
+| | baseline | Phase A |
+|---|---|---|
+| q18 SF=0.1 | 2.79s | **1.59s** |
+| q18 SF=1 | 30.94s | **19.0s** (-12s, rows=57 正しい) |
+| staged_rows SF=0.1 | 1.36M | **600k**(外側 600k+150k 除去、内側 600k 残) |
+
+- 外側 lineitem/customer/orders を IN 通過 57 件に縮約成功。**内側 lineitem 6M scan が残り 19s の主因**。
+- 他 21 クエリ回帰なし(SF=0.1 matrix 全 OK)。server 変更は非 gate 経路で no-op。
+- 次: Phase B(内側 raw scan を GS-skip し agg 群行を l_quantity=sum の合成 lineitem 行として供給)
+  → q18 ~3s 見込み。GS を単一列 SUM 対応へ拡張する必要。
+
+
+
 
 
 

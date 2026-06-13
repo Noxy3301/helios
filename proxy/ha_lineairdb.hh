@@ -506,6 +506,11 @@ public:
   // rnd_init-time fetch that fills the scan buffers with synthetic rows.
   void tx_register_gs(LineairDBTransaction::GsRegistration reg);
   int gs_fill_buffers(LineairDBTransaction *tx);
+  // Phase-17 q18 grouped-semijoin: optimize-time registration of an
+  // "outer.col IN (SELECT gcol FROM T GROUP BY gcol HAVING agg)" intent so the
+  // autogen reduces the outer scan to the qualifying groups.
+  void tx_register_grouped_semijoin(
+      LineairDBTransaction::GroupedSemijoin gs);
   bool tx_inner_agg_stamped();
   bool tx_begin_inner_agg_consume(const std::string &expect_spec);
   int rnd_pos(uchar *buf, uchar *pos) override; ///< required
