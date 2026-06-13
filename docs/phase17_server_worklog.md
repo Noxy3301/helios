@@ -824,3 +824,17 @@ share を seed できることも確認(cold shares で全8表 EXPLAIN → 続�
 `HELIOS_Q22_MEMBERSHIP` を q18 と同じ default-ON パターンに変更(`env==nullptr || env[0]!='0'`、
 `=0` で OFF)。検証: **env 未設定の mysqld で q22 ~0.92s(最適化が効く)・md5 22/22 OK**。
 residual 保護(qep_leaf_info ベース)で q21 等は不変。OLTP は gate と無関係(antijoin inner 非該当)。
+
+## ③ q22 残差(customer staging)調査 — near disaggregation floor
+- projection は **default-ON で既に効いている**: q22 staged は `HELIOS_PROJECTION=0` で 53.4MB、
+  ON で **21.5MB(60%削減)**。customer は read_set {c_custkey,c_phone,c_acctbal} に trim 済
+  (o_custkey binding は c_custkey=PK で from_key、unsafe 化せず)。
+- 残 21.5MB = projection 済み作業集合(customer 150k 駆動行 + orders existence マーカー)。
+  customer 150k は AVG subquery + outer の両 scan で全件必要(filter は scan 後評価)→ 削れない。
+  customer は1回 staging し2回 scan(batch_cache_hit)なので AVG pushdown でも staging は不変。
+- **value-less existence は不可**: プロトコル上 scan_value `""` = not-found。found を `""` で送ると
+  handler が「存在せず」と誤判定し customer を誤って通過させる(md5 破壊)。found は実値が要る。
+- 結論: q22 0.92s vs InnoDB 0.17s の残差は **disaggregation の床**(150k 駆動行の RPC 転送+decode ~0.59s)。
+  これ以上は customer scan 自体を staging しない = **full query pushdown(server で filter+AVG+antijoin+
+  GROUP+SUM を計算し結果行のみ返す)**が要る大機構。suite は既に勝ち越し(0.943x)なので polish には過剰。
+  → #3 は「projection で既に床近く、cheap lever 無し」と結論。full pushdown は将来課題として保留。
