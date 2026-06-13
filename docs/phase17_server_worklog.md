@@ -784,3 +784,13 @@ membership-staging を **existence_only** モードとして実装。設計通�
 - existence_only の更なる削減: 値を捨て distinct key 集合のみ(21.5→数MB)化は handler の value-less serving 要、別途。
 - gate を default ON にするか: 22/22 維持・suite 改善・residual 保護済み。OLTP 回帰確認後に判断。
 - **次**: OLTP 回帰(TPC-C/TATP)で退行0 を確認 → 必要なら default ON 検討。
+
+### 回帰テスト結果(Phase18, 全クリア)
+performance + C6 無効下(cstate_guard OK)。新バイナリ(existence_only 実装後)で計測。
+- **md5 22/22 OK**(gate ON、q21 含め全一致)。
+- **TPC-H suite: 41.67 → 38.66s**(q22 -2.18s 主因、他21クエリ退行なし)。対 InnoDB 0.943x。
+- **TPC-C T1**(autogen, default=gate OFF): mean 374.6(367-382)req/s, retry 0。baseline ~390 と誤差内・退行なし。
+- **TATP T1**(autogen, default): 5305.7 req/s, retry 0, errors 0。baseline ~5379 と誤差内・退行なし。
+- 結論: **q22 membership-staging は suite を勝ち越しに乗せつつ md5/OLTP に退行なし**。gate default ON は妥当
+  (residual 保護で q21 安全)。現状は opt-in のまま。
+- 注: 回帰計測で server in-mem は TATP ロード状態(TPC-H 要時は reload)。3308=InnoDB TPC-H ref 維持。
