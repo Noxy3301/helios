@@ -498,3 +498,48 @@ T1 は単一クライアントの遅延律速。TPC-C 1tx ≈ 20–30 RPC 往復
 - TPC-H suite は C6 込みでも **helios ≈ InnoDB(互角)**。この run では helios が 1.4s 前へ出たが
   ノイズ帯内。**Phase17 退行なしの結論は不変**。
 - 計測環境の確定事項: **絶対値計測は C-state 固定(performance + idle-set -D 50)必須**。相対比較は不変。
+
+---
+
+## [2026-06-13] エントリ14: ★Compact 前チェックポイント / 引き継ぎ★
+
+context compact を挟むため現状を集約。**working tree クリーン・全 commit 済み**(branch claude/prefetch-maxopt)。
+
+### Phase17 成果サマリ(全て MySQL 無改変・md5 22/22 維持・OLTP errors 0・Codex GO)
+1. **filtered_keys 抑止**(commit 39de1c1, -20s): filter scan の reject 行キー送信が無駄、単一 step 表で suppress。
+2. **q18 天王山 攻略**(3108f4d/d58c976/1875383/4558f21, 30.9→2.6s, 14.3x→1.2x): agg-step semijoin(外側縮約)
+   + GS 合成供給(内側 index-scan 経路も対応)+ 2回の集約を tx cache で1回に統合。**default ON**
+   (`HELIOS_Q18_SEMIJOIN=0`/`HELIOS_Q18_GS=0` で OFF)。
+3. **suite 90.55 → ~41.6s(2.1x改善)、対 InnoDB 2.05x→~1.0x(互角)**。勝ち 5→6/22。
+
+### ★最重要の環境発見(エントリ11-13)★
+- **CPU C6 deep-sleep(復帰170µs)が latency律速 OLTP T1 を 3.7x throttle**していた。
+  performance governor + C6 無効で TPC-C T1 autogen 104→390 / DSL 115→440、TATP 1462→5379。
+- **TPC-H は CPU 律速で C6 ほぼ無関係**(helios 42.79→41.58)。InnoDB OLTP は fsync 律速で C6 微増。
+- 「前は200出た」= AWS(c6i.24xl 363)or C6 制御前の記憶。ローカル本来は OLTP T1 ~390-440。
+- **Phase17 退行なし**(baseline 9c01359 = HEAD、feat/prefetch-autogen も実機計測)。
+- **絶対値計測は C-state 固定が前提**: `sudo cpupower frequency-set -g performance; sudo cpupower idle-set -D 50`
+  (再起動で消える)。恒久/AWS は GRUB `intel_idle.max_cstate=1 processor.max_cstate=1`。
+
+### 現在の環境状態(compact 後に再開する人へ)
+- CPU: **performance + C6 無効**(再起動で戻る。戻ったら上記コマンド再実行。`cstate_guard` が warn)。
+- ポート: 9999=helios server / 3307=helios mysqld(**今 TATP ロード済み**、TPC-H 要なら reload)/
+  3308=InnoDB TPC-H ref(lineitem 6M, 復元済み)。3309(SF=0.1 InnoDB ref)は停止中・要時 restart。
+- 計測 env(標準): mysqld gates `HELIOS_OPT_STATS=1 HELIOS_COST_V2=1 HELIOS_AGG_PUSHDOWN=1
+  HELIOS_ENABLE_SEMIJOIN=1`、server `HELIOS_PARALLEL_SERVER=1 HELIOS_PARALLEL_SERVER_SCAN=1`、
+  接続後 prefetch sysvar 2つ ON。load 前は必ず server 再起動。
+
+### 固定済み資産
+- スクリプト: `scripts/dev/{sf1_milestone,oltp_regression,plan_stability_test,start_innodb_ref,
+  tpcc_compare,cstate_guard}.sh`(後ろ3つは Phase17 新規、cstate_guard は milestone/tpcc_compare に組込済)。
+- メモリ: helios-filtered-keys-suppression / helios-q18-grouped-semijoin / helios-cstate-oltp-throttle。
+
+### 未解決・次手の候補(優先順)
+1. **TPC-H suite を warm 状態で複数回測り helios vs InnoDB を確定**(現状互角、helios が前に出た run も
+   あるがノイズ帯。warm + 多 run で勝ち/互角を pin)。
+2. **q21(最大の残敗者, ~13s, 対 InnoDB 2.6x)**: lineitem 3重自己結合 + EXISTS(l2)/NOT EXISTS(l3)。
+   inner が FILTER(REF) で first-match 不可。**filtered-existence の server 集約 pushdown**(q18級)が要る。
+3. **q22(NOT EXISTS over-fetch)**: first-match(scan_limit=1)を試作したが MySQL antijoin が limit-1 を
+   超読みして abort(revert 済, commit f985be3)。consumer 側「membership-staging 契約」が本筋。
+4. q13(o_comment NOT LIKE が LEFT JOIN ON句で未 push)、小 point-read 群(disaggregation 固定費)。
+- goal の必達(suite < InnoDB)は C-state 込みで**ほぼ達成(互角)**。decisive な勝ちには q21 が鍵。
