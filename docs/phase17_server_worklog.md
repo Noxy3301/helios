@@ -1169,3 +1169,34 @@ SF0.1 で q21 md5 = ground-truth `d36a1caf...` 完全一致(FIX-1 含め正し�
   既存性質/既知 hazard(measured 非発火、Step ③ で対応)、C2/C5 は grounded が非 bug 裁定。grounded の MED(read-chunking
   が server memory を bound せず O(N²/read_chunk) を足す)を受け **read-chunking を撤去・単一スキャンに**。
   詳細 docs/phase21_create_index_backfill_design.md。**Step ② = GO**(SF0.1/SF1 とも md5 = ground-truth)。
+
+## afterload md5 検証(標準23索引一式, SF0.1, user 承認 A+B)
+標準 SI 一式 = benchbase postload-mysql.sql の **23 索引**(UNIQUE 8 = 全て NOT NULL PK 列上、非UNIQUE 15)。
+helios で全23を chunk-COMMIT backfill 構築(SF0.1, 計 1m22s)。
+
+**Option A(helios 自己整合)**: 同一データで baseline(索引なし)vs full-index の全22 md5。
+- **19/22 は prefetch ON でも完全一致**(= 索引が結果を変えない=正しい)。
+- 差分は q1・q6(prefetch ON で Deadlock=prefetch abort)+ q15(unsupported QEP/view)。
+- **prefetch OFF で q1/q6/q15 を再実行 → 3つとも baseline と完全一致**(q1=2903e9.. q6=17ded5.. q15=7fcde3..)。
+  → **index 破損でなく純粋に prefetch×secondary-index 経路のバグ**(optimizer が SI plan を選ぶが prefetch 実行が SI
+  range/view scan を stage 不可で abort)。**= Step ④ のスコープ確定(q1, q6, q15)**。
+- 結論: **backfill は標準23索引を正しく構築**(prefetch OFF=22/22 相当・全クエリ正、prefetch ON=19/22 で残3は Step ④)。
+- 検証手法の注記: helios は **FORCE INDEX を honor せず full table scan に倒す**(EXPLAIN type=ALL)ため Codex 提案の
+  per-index forced (key,pk) scan は空振り。代わりに prefetch-OFF 全クエリ突合(optimizer が自然に使う索引を広く検証)+
+  機構論証(build_secondary_key_from_row = write_row と byte 一致・全行・dual-review GO)で担保。query が使わない
+  redundant UNIQUE(r_rk/p_pk/o_ok/ps_pk_sk 等、PK 列上)の完全性は機構論証に依存(残リスク低)。
+- **発見**: helios の FK auto-index(l_partkey 等)は postload の同列 explicit index 作成で整理され、lineitem は postload
+  の 8 本(l_ok/l_pk/l_sk/l_sd/l_cd/l_rd/l_pk_sk/l_sk_pk)+ PRIMARY に収束(非PRIMARY 計 23 = postload 全数)。
+
+**Option B(helios vs InnoDB, 両系 SF0.1 + 全23索引)**: tpch_md5 helios(prefetch ON) vs InnoDB(native)。
+- **OK=19, MISMATCH=0, ERR=3**(q1/q6/q15)。**誤結果ゼロ** — ERR は helios 側 prefetch×SI abort のみ
+  (q1/q6=Deadlock 40001, q15=unsupported QEP 1235)。q21=OK(helios=InnoDB, supplier 駆動 l_sk)。
+- → A と完全整合: backfill 索引は正しく InnoDB と一致、結果を変える failure は全て prefetch×SI(Step ④)。
+- InnoDB(3308)は検証後 **SF1 + l_sk/l_sk_pk の標準 fixture に復元**(disk 永続)。
+
+## afterload md5 ステップ 結論
+- **backfill は標準23索引一式を正しく構築**(helios 自己整合 prefetch OFF=22/22 + helios vs InnoDB=19/22 誤り0)。
+- **afterLoad config 恒久 wiring は Step ④ 完了まで保留**(今 wire すると通常 suite が prefetch ON で q1/q6/q15 を
+  prefetch×SI で壊す + 全23索引 backfill で load 重化)。手動 postload で検証済み、config 化は ④ 後。
+- **Step ④ スコープ確定: prefetch×secondary-index×view correctness = q1, q6, q15**(prefetch ON で SI range/view scan を
+  prefetch 実行が stage 不可 → abort/unsupported。prefetch OFF normal 経路は正)。次ステップへ。
