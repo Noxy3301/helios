@@ -350,6 +350,54 @@ server 並列(HELIOS_PARALLEL_SERVER)依存のため**コア競合で重 join(q8
 悪化**(suite 45→53s)。InnoDB は単スレッドで競合に鈍感(41.4s で安定)。**公平比較は静穏窓で、
 かつ helios/InnoDB を同条件・背中合わせで取る必要**。q18/filtered_keys の構造改善は競合非依存で堅牢。
 
+---
+
+## [2026-06-13] エントリ10: ★Phase17 総括★ 公式最終比較 + 残フロンティア
+
+### 公式最終比較(静穏窓 load 1.79、helios/InnoDB 背中合わせ、md5 22/22 OK)
+| Q | helios | InnoDB | 比 | | Q | helios | InnoDB | 比 |
+|---|---|---|---|---|---|---|---|---|
+| q1 | **0.83** | 10.37 | 0.08★ | | q12 | **0.62** | 2.41 | 0.26★ |
+| q2 | 0.21 | 0.14 | 1.50 | | q13 | 5.82 | 3.84 | 1.52 |
+| q3 | 1.24 | 1.19 | 1.04 | | q14 | **0.87** | 1.69 | 0.51★ |
+| q4 | 0.69 | 0.60 | 1.15 | | q15 | **1.11** | 3.53 | 0.31★ |
+| q5 | 1.00 | 0.94 | 1.06 | | q16 | 0.59 | 0.32 | 1.84 |
+| q6 | **0.40** | 1.56 | 0.26★ | | q17 | 0.31 | 0.29 | 1.07 |
+| q7 | 1.46 | 0.89 | 1.64 | | q18 | 2.60 | 2.16 | 1.20 |
+| q8 | 2.97 | 2.51 | 1.18 | | q19 | **0.12** | 0.18 | 0.67★ |
+| q9 | 3.30 | 1.52 | 2.17 | | q20 | 0.46 | 0.23 | 2.00 |
+| q10 | 1.83 | 1.62 | 1.13 | | q21 | 12.98 | 4.99 | 2.60 |
+| q11 | 0.28 | 0.13 | 2.15 | | q22 | 3.10 | 0.18 | 17.2 |
+| | | | | | **計** | **42.79** | **41.29** | **1.036** |
+
+### Phase17 全体の到達点
+- **suite 90.55 → 42.79s(2.12x 改善)。対 InnoDB 2.05x → 1.036x(実質拮抗、+1.5s)。勝ち 5→6/22。**
+- 二大成果(共に MySQL 無改変・md5 22/22・OLTP errors 0・Codex GO):
+  1. **filtered_keys 抑止**(-20s): filter scan の reject 行キー送信が無駄。q14 8.2→0.84, q12 7.7→0.66。
+  2. **q18 grouped-semijoin + GS 合成 + 集約統合**(-28.3s): 30.94→2.60s(14.3x→1.2x)。天王山攻略。
+- mysqld RSS 4384→2621MB。
+
+### 必達(suite < InnoDB)に届かなかった理由と残フロンティア
+あと **-1.5s**。残ギャップの構造:
+- **q21(12.98 vs 4.99, -8s)**: 最難。lineitem 3重自己結合 + EXISTS(l2) + NOT EXISTS(l3 anti-join)。
+  staged 3.6M + MySQL CPU 6.8s。EXISTS/NOT EXISTS を per-orderkey 述語として server 集約 pushdown
+  すれば staging 激減見込みだが、**q18 級の大型機構 + anti-join 正しさが繊細**。
+- **q22(3.10 vs 0.18, -2.9s)**: NOT EXISTS(orders) が全 150k customer 駆動で orders 1.5M staging。
+  真因 = customer filter(`SUBSTRING(c_phone,1,2) IN(...)` + `c_acctbal > (scalar avg subquery)`)が
+  orders probe 前に適用不可(SUBSTRING/scalar-subquery は push 困難)。q18 と同型の over-fetch。
+- **小 point-read 系(q2/q11/q20/q16/q7)**: 各 0.1-1.5s だが ratio 1.5-2.2x。disaggregation の
+  per-statement RPC/staging 固定費を InnoDB のローカルアクセスが上回る**構造的劣位**(量が小さく
+  pushdown で回収する余地が薄い)。
+- **q13(5.82 vs 3.84)**: orders が `o_comment NOT LIKE` を MySQL 評価のため o_comment(49B)ship。
+  LIKE は evaluator/serializer 対応済だが LEFT JOIN ON句 filter が build_single_table_filter 未抽出。
+  ON句 filter の右表 push は正しさ繊細。期待 -0.8s。
+
+### 計測上の重大注意
+共有マシン(他 7+ codex worktree)競合で helios suite は 42.8(静穏)〜52.8s(競合)に振れる。
+InnoDB は単スレッドで 41.3s 安定。**専有環境でないと「suite < InnoDB」の最終判定は不可能**。
+本フェーズの構造改善(filtered_keys/q18)は競合非依存で堅牢に再現。次フェーズは専有環境 + q21/q22。
+
+
 
 
 
