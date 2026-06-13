@@ -95,3 +95,73 @@ ready flag は防御的後続。DROP purge(Step ③)と「CREATE は clean slate
 lineairdb_keyenc.cc:213(canonical encoder), proxy/lineairdb_proxy.cc:794(tx_write_secondary_index),
 server/rpc/lineairdb_rpc.cc:2864(handleDbCreateSecondaryIndex), third_party/LineairDB/src/index/secondary_index.h,
 src/table/table.h:21, benchbase tpch/postload-mysql.sql, docs/phase17_server_worklog.md:1095-.
+
+---
+
+# v2 改訂(dual-review 反映 — Codex + Claude grounded)
+
+両 review = CHANGES-NEEDED。方向性(A2 handler-driven / exclusive-lock offline / 同期 gate)は GO 支持。
+以下の必須修正を反映して v2 とする。
+
+## 🔴 [CRITICAL] FIX-1: KEY の出所を `altered_table->key_info[]` にする(fieldnr 規約)
+- `build_secondary_key_from_row`(keyenc.cc:226)は `table->field[key_part.fieldnr - 1]`(**1-based** = runtime
+  `TABLE::key_info` 規約)。
+- `inplace_alter_table` の `ha_alter_info->key_info_buffer[idx]`(ha:3875)は **0-based fieldnr**(MySQL 本体は
+  `field[fieldnr]` を -1 なしで引く: sql_table.cc:12521、規約差は handler.h:3434-3442 に明記)。
+- そのまま canonical encoder に渡すと **全 key part が1列左を読む** → crash せず UNIQUE 違反も出さず**静かに index 破壊**。
+- **修正**: backfill は `key_info_buffer` でなく **`altered_table->key_info[]` の対応 KEY**(1-based, encoder と整合)を
+  使う。純 ADD INDEX で列増減が無いので `altered_table` と `table` の field 配置は同一 → record[0] はそのまま使える。
+- **受け入れ条件**: テスト 6.1(load-built vs backfilled の全件 `(sk, sorted PK)` 等価)に **列順違い composite
+  (`l_pk_sk`/`l_sk_pk`, `ps_pk_sk`/`ps_sk_pk`)を必須**化(md5 だけでは列取り違えを取りこぼす)。
+
+## [必須] FIX-2: backfill を行 chunk 分割 commit
+- SF1 lineitem 600万行 ×(特に UNIQUE)を**単一 tx** backfill すると、既知の **protobuf 2GB framing
+  (helios-prefetch-flat-codec-2gb)/ OCC read-set 肥大(helios-occ-rangekeys-bloat)**に抵触し得る。
+- **修正**: 行 chunk(例 数万〜数十万行)ごとに write をためて commit、を繰り返す。
+- **不変条件 追加(完全性の前提)**: chunk 分割しても **EXCLUSIVE lock 解除前(=inplace_alter が success を返す前)に
+  全 chunk 完了**すること。途中 commit 済み + 未 commit の中間状態は lock 下で不可視。
+
+## [追記] FIX-3: handler 自己 scan の `inited` 状態管理
+- `inplace_alter_table` は original handler(`table->file`, open 済み・EXCLUSIVE lock 下)で呼ばれ、commit phase で
+  同 handler を再利用する。backfill 用の scan(rnd_init/rnd_next or 低レベル batched scan)が handler の `inited`
+  状態を汚さないこと(scan 後に確実に reset、or 専用経路)。DDL は prefetch 無効(prefetch.cc:46)なので
+  素の `fetch_next_batch`(prefix("") 全件)が無改変で使える。
+
+## [追記] FIX-4: commit-abort 耐性 と「定義先行」hazard
+- ALTER の statement tx は DDL 末尾の `trans_commit_stmt`→`lineairdb_commit`(ha:3506)→flush で commit(明示 flush 不要)。
+  OCC abort 時は `lineairdb_commit` が `HA_ERR_LOCK_DEADLOCK`(ha:3522)→ ALTER 全体 rollback。afterload は並行 DML
+  ゼロなので実 abort 確率は低い。
+- **hazard**: `db_create_secondary_index`(定義)は **非トランザクショナル**で backfill より先(ha:3882)。backfill が
+  abort/crash すると「定義あり・entry なし」の空 index が server に残る。single-node では可視性 gate(DD 未 commit)で
+  optimizer は使わないが、multi-node や restart で空定義を拾う hazard。→ first cut は single-node 前提で許容、
+  ready flag(server 側)を防御として後続。失敗時は可能なら index 定義も clear(FIX-5 の primitive 流用)。
+
+## [前提繰り上げ] FIX-5: clean-slate(③ DROP purge を ② の co-requisite に)
+- whole-index clear / DROP purge primitive は**現存しない**(table.h:21 CreateSecondaryIndex は既存なら false 返すのみ、
+  secondary_index.h は per-key Delete/Purge のみ、DROP INDEX は ha:3873 で無視)。→ **再 CREATE で二重充填 / stale**。
+- **first 計測は fresh load(server 再起動→ロード)→ CREATE INDEX 1回**なので再 CREATE せず回避可(blocker でない)。
+- ただし robustness のため **whole-index clear(or DROP purge)RPC を Step ② に取り込む**(Step ③ 前倒し)。最低限
+  「CREATE 時に同名 index があれば server 側で空にしてから backfill」。これが入るまでは「dirty server で再 CREATE しない」
+  を運用制約として明記。
+
+## v2 フロー(確定)
+`inplace_alter_table`(各 add index):
+1. （clean-slate primitive があれば）同名既存 index を server で空に。無ければ fresh load 前提。
+2. `db_create_secondary_index`(空定義、既存)。
+3. **`altered_table->key_info[]` から対応 KEY を取得**(FIX-1)。
+4. 表を **素の batched scan**(prefetch 無効、`inited` 非汚染、FIX-3)で全件、`table->record[0]` に各行復元。
+5. 各行 `build_secondary_key_from_row(record, key)` → `write_secondary_index`。**chunk ごとに commit**(FIX-2)。
+   UNIQUE は重複検出で即失敗。
+6. **全 chunk 完了まで同期**(lock 解除前)。成功 → return false(MySQL が DD commit=可視化)/ 失敗 → error(DD 未 commit
+   =不可視、可能なら空定義も clear)。
+
+## v2 テスト(更新)
+- 6.1 を**列順違い composite 必須**で受け入れ条件化(FIX-1 検証)。
+- chunk 分割 backfill が SF1 で完走(memory/2GB 非抵触)。
+- 他は v1 の §6 を踏襲(load-built 等価主軸、TPC-H md5 prefetch ON/OFF、UNIQUE 失敗不可視、DATE 列、空表)。
+
+## v2 結論
+A2 handler-driven + exclusive-lock offline + 同期 gate を維持しつつ、**FIX-1(altered_table->key_info, CRITICAL)・
+FIX-2(chunk 分割)・FIX-3(inited)・FIX-4(abort/定義先行)・FIX-5(clean-slate を ② co-req)** を反映。build 自体は
+「scan + canonical 経路で各行のキーを入れる」のままシンプル。heavy machinery(generation/online/ready 必須)は afterload
+単一ノードでは不要。再 review にかけて GO を確認する。
