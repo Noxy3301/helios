@@ -26,6 +26,9 @@ python3 bench/bin/benchrun.py tpch --scalefactor 1 --terminals 1 --no-exec --ext
 
 echo "=== [4/5] matrix ==="
 $MYSQL -e "SET GLOBAL lineairdb_prefetch_execution=ON; SET GLOBAL lineairdb_prefetch_ro_novalidate=ON;"
+# Seed the optimizer NDV/row-count cache (one-time-per-table stats RPC) before
+# measuring, so it does not land inside a measured query as noise.
+bash "$ROOT/scripts/dev/prewarm_stats.sh" /tmp/mysql.sock benchbase
 bash bench/bin/tpch_matrix.sh /tmp/final_matrix_sf1_v2 420
 SRV=$(pgrep -x lineairdb-serve | head -1)
 echo "server RSS after matrix: $(ps -o rss= -p $SRV | awk '{printf "%.0fMB", $1/1024}')"

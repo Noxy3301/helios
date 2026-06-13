@@ -794,3 +794,28 @@ performance + C6 無効下(cstate_guard OK)。新バイナリ(existence_only 実
 - 結論: **q22 membership-staging は suite を勝ち越しに乗せつつ md5/OLTP に退行なし**。gate default ON は妥当
   (residual 保護で q21 安全)。現状は opt-in のまま。
 - 注: 回帰計測で server in-mem は TATP ロード状態(TPC-H 要時は reload)。3308=InnoDB TPC-H ref 維持。
+
+---
+
+# Phase 19: q22 仕上げ + NDV pre-warm + q22 残差 + q21
+
+user 指示: ①NDV pre-warm(計測ノイズ除去)→ ②q22 gate default ON → ③q22 残差(customer staging)→
+④q21、の順で進める。議事録を書きながら。
+
+## ① NDV pre-warm 調査
+**前提の再確認(コード読解)**: stats/NDV は `ctx->proxy`(接続ごと)が `fetch_table_stats`(TX_GET_TABLE_STATS)
+で取得するが、**NDV 値とロード状態は GLOBAL な TABLE_SHARE に seed**(`share->index_ndv_`,
+`share->index_ndv_loaded_`, `share->stats_base_records`)。info() の fetch は `!share->index_ndv_loaded_`
+で gate されるため、**ある接続が最初に各表へ触れて share を埋めれば、以降は別接続でも再 fetch されない**
+(= stats RPC は「表ごと・mysqld 生存中に一度きり」)。
+→ 仮説: warmup run 1回で全表 share が埋まり、計測 run では stats RPC が消える。実測で確認する。
+
+**実測結果**: 仮説どおり。warm mysqld(warmup 1回後)では q21/q22 とも **RPC=1本(TX_EXECUTE_READ_PLAN)・
+stats RPC ゼロ**。`EXPLAIN SELECT * FROM <table>`(optimizer は走るが実行しない)で info() を発火させ
+share を seed できることも確認(cold shares で全8表 EXPLAIN → 続く q9/q21/q22 すべて RPC=1本・stats 0)。
+**コード変更不要**。
+
+**成果物**: `scripts/dev/prewarm_stats.sh`(SHOW TABLES → 各表 `EXPLAIN SELECT *` で share seed、
+行転送ゼロ)。`sf1_milestone.sh` に sysvar 有効化直後の prewarm 呼び出しを追加。
+→ 計測前に1回流せば stats RPC が measured query に混入しない。従来の begin/end piggyback・on-demand は
+そのまま温存(通常運用は無変更)。「stats はベンチ中ノイズ」問題は **share-gated(表ごと一度)+ prewarm** で解消。
