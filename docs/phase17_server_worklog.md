@@ -695,3 +695,56 @@ q22: stage_rpc_and_decode=0.93s + stage_local=1.42s = 2.35s(first-row gap 2.43s 
 汎用に barrier を崩せるが volume を減らさねば decode CPU は残る。q22 の NOT EXISTS は partial set で「不在」を
 証明できず、key-range partition ごとに "complete" marker が必要。OCC は streaming 中の snapshot 揺れで
 bit-exact 破綻 → read epoch 固定 or chunk 単位 version/range validation。
+
+---
+
+# Phase 18: q22 membership-staging(antijoin 存在判定の集合化)
+
+目的: q22 の `NOT EXISTS(orders WHERE o_custkey=c_custkey)` で orders 全件(値付き 1.5M 行 / 100.3MB)を
+FES staging しているのを、**存在する DISTINCT o_custkey 集合だけ**(≈150k key ≈ 600KB, ~167x 縮小)に置換し、
+antijoin 存在判定を proxy ローカルで解く。狙い: first-row gap ~2.4s(loss の 82%)をほぼ消す。
+md5 22/22 維持・OLTP 退行なしを必須とし、回帰テストで締める。SOTA(Codex): late-materialization /
+covering-index existence(InnoDB q22 がこれ)/ semijoin-antijoin existence aggregation の disaggregated 版。
+
+## 現状の経路(Explore + trace で確定)
+- proto `PlanStep`(lineairdb.proto:279-326): table/index/bindings/for_each/filter/projection/aggregate/
+  semijoins(14)/suppress_filtered_keys(15)。`SemijoinFilter`(330-339)。`StepResult`(346-)に
+  scan_keys/scan_values/secondary_keys/group_sizes。
+- 出力経路: autogen `compile_ref_lookup`(autogen.cc:467-681)の FES 分岐(~649-661)が orders を
+  o_custkey 二次索引で for_each scan(`is_scan=true, for_each=true, index_name=o_custkey`)。
+  ※ semijoin reduction(1351-1470)は antijoin leaf を `helios_sj_safe_leaf`(955-973)で除外
+  (「antijoin は不在行こそ残す対象」)。つまり q22 orders は semijoin でなく素の FES で値ごと staging。
+- staging: transaction.cc execute_read_plan(242-575)、FES 分岐(437-462)が `LocalSecondaryScanEntry`
+  (secondary_keys/primary_keys)を push。serving: ha_lineairdb.cc index_read_map(2171-)→
+  get_matching_primary_keys→lookup_secondary_scan_cache。
+- server: lineairdb_rpc.cc handleTxExecuteReadPlan(1364-1478+)、FES probe 実行(1480+)。
+- 既存の keys-only/membership 専用モードは無し。projection(値trim)/semijoin(source_column 抽出)/
+  q18 GroupedSummary(集約 step + 合成 group 供給)が近い scaffolding。
+
+## 設計(membership-staging contract)
+- **proto**: `PlanStep` に `bool existence_only = 16`(命名要検討)。true の時、server は当該 FES/scan を
+  実行し **probe された inner の DISTINCT 二次キー集合(o_custkey)だけ** を返す(値・per-probe primary key 無し)。
+- **autogen**: ref-lookup が NOT EXISTS/antijoin の inner(AccessPath が antijoin、上位に inner 列が
+  projection されない)の時に existence_only=true を立てる。判定は `helios_sj_safe_leaf` の antijoin 検出
+  ロジック(is_sj_or_aj_nest 等)を再利用。
+- **server**: existence_only step は scan して DISTINCT secondary key 集合を StepResult.secondary_keys に
+  集約(values/primary_keys 省略)。
+- **proxy staging**: membership 集合(secondary key の set)を保持する軽量 cache に格納。
+- **handler serving**: antijoin の index_read 存在 probe を membership set 照合に置換
+  (in-set → 合成 found 1行で NOT EXISTS reject、absent → not-found で customer 通過)。inner 列は
+  上に出ないので合成行の値は不問。
+- **bit-exact risk**: (1) NULL o_custkey は集合に入れない(=は UNKNOWN, 非マッチ); (2) MySQL antijoin が
+  first-match 後も読む問題 → existence_only は inner 列が上に出ない antijoin/semijoin node 限定で付与
+  (revert 済 first-match と別機構: scan_limit でなく membership 即答); (3) OCC phantom 保護 →
+  集合を read epoch に紐付け or range validate(ro_novalidate は read-only bench 限定で既に安全);
+  (4) GROUP BY cntrycode/ORDER BY/decimal 集約は MySQL 側のまま、membership は存在判定のみ変更。
+- **gate**: `HELIOS_Q22_MEMBERSHIP`(default 後で判断、まず opt-in で検証)。
+
+## 進め方
+1. autogen の antijoin 検出と FES 生成箇所を精読 → existence_only を立てる最小箇所を特定。
+2. proto/proxy struct/serialization に existence_only 追加。
+3. server に DISTINCT-key 集約モード。
+4. proxy staging + handler serving。
+5. build(services 停止 → build_partial.sh)→ md5 q22 一致確認 → q22 計測。
+6. 回帰: md5 22/22 + suite warm + OLTP(TPC-C/TATP)→ 退行0 確認。
+7. NDV pre-warm(measurement hygiene, 別タスク・低優先): 計測前に全表/索引 NDV を一括取得する hook。
