@@ -2683,16 +2683,24 @@ int ha_lineairdb::gs_fill_buffers(LineairDBTransaction *tx) {
     my_error(ER_INTERNAL_ERROR, MYF(0), "helios gs skipped but unregistered");
     return HA_ERR_INTERNAL_ERROR;
   }
-  LineairDBProxy::ReadPlanStep step;
-  step.table_name = db_table_name;
-  step.is_scan = true;
-  step.end_key_prefix = lineairdb_keyenc::scan_end_sentinel();
-  step.serialized_filter = reg->filter;
-  step.aggregate_serialized = reg->spec;
+  // q18 unification: if a grouped-semijoin agg step already aggregated this
+  // table in the main prefetch, reuse those exact group rows instead of a
+  // second full-table aggregation RPC. Falls back to the RPC otherwise (q15).
   std::vector<std::string> groups;
-  if (!tx->execute_read_plan_raw({step}, &groups)) {
-    my_error(ER_LOCK_DEADLOCK, MYF(0));
-    return HA_ERR_LOCK_DEADLOCK;
+  if (const std::vector<std::string> *cached =
+          tx->grouped_semijoin_groups(db_table_name)) {
+    groups = *cached;
+  } else {
+    LineairDBProxy::ReadPlanStep step;
+    step.table_name = db_table_name;
+    step.is_scan = true;
+    step.end_key_prefix = lineairdb_keyenc::scan_end_sentinel();
+    step.serialized_filter = reg->filter;
+    step.aggregate_serialized = reg->spec;
+    if (!tx->execute_read_plan_raw({step}, &groups)) {
+      my_error(ER_LOCK_DEADLOCK, MYF(0));
+      return HA_ERR_LOCK_DEADLOCK;
+    }
   }
   // Group row layout: [null_flags][group key][sum][count], agg_emit_field
   // framing (same parser as the Phase-B executor).

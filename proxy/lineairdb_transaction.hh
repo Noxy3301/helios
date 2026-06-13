@@ -261,6 +261,7 @@ public:
     gs_regs_.clear();
     gs_skipped_.clear();
     grouped_semijoins_.clear();
+    grouped_semijoin_groups_.clear();
   }
 
   // GroupedSummary (Phase-16 entry 25, q15-class): a DERIVED inner unit's
@@ -315,6 +316,19 @@ public:
   }
   const std::vector<GroupedSemijoin>& grouped_semijoins() const {
     return grouped_semijoins_;
+  }
+  // Phase-17 q18 unification: the main prefetch's grouped-semijoin AGGREGATE
+  // step and the inner GroupedSummary serving compute the SAME group rows. The
+  // agg step (staged first) caches them here so gs_fill_buffers reuses them
+  // instead of issuing a second full-table aggregation RPC (q18: 2 scans -> 1).
+  void cache_grouped_semijoin_groups(const std::string& table,
+                                     std::vector<std::string> rows) {
+    grouped_semijoin_groups_[table] = std::move(rows);
+  }
+  const std::vector<std::string>* grouped_semijoin_groups(
+      const std::string& table) const {
+    auto it = grouped_semijoin_groups_.find(table);
+    return it == grouped_semijoin_groups_.end() ? nullptr : &it->second;
   }
   // Execute a one-step read plan and hand back the raw scan_values WITHOUT
   // staging anything into the tx caches (GS group rows are not base rows).
@@ -491,6 +505,8 @@ private:
   std::unordered_map<const void*, GsRegistration> gs_regs_;
   std::unordered_set<const void*> gs_skipped_;
   std::vector<GroupedSemijoin> grouped_semijoins_;
+  std::unordered_map<std::string, std::vector<std::string>>
+      grouped_semijoin_groups_;
 
   // Projection pushdown: physical table name -> kept field ordinals.
   std::unordered_map<std::string, std::vector<uint32_t>> table_projection_;

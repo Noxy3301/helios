@@ -490,6 +490,15 @@ void LineairDBTransaction::execute_read_plan(
       // the range entry is flagged so only the aggregate's own consuming
       // scan can be served from it.
       const bool agg_step = !step.aggregate_serialized.empty();
+      // q18 unification: if this agg step is a grouped-semijoin's source over
+      // table T, cache its group rows so the inner GroupedSummary serving of T
+      // reuses them instead of re-aggregating (one full scan, not two).
+      bool gs_agg_step = false;
+      if (agg_step) {
+        for (const auto& g : grouped_semijoins_)
+          if (g.inner_table_key == step.table_name) { gs_agg_step = true; break; }
+      }
+      std::vector<std::string> gs_group_cache;
       std::vector<std::pair<std::string, std::string>> rows;
       std::vector<uint64_t> row_tids;
       rows.reserve(step_result.scan_keys.size());
@@ -506,10 +515,13 @@ void LineairDBTransaction::execute_read_plan(
           record_row_cache(step.table_name, key, found, value, tid, true);
         }
         if (found) {
+          if (gs_agg_step) gs_group_cache.push_back(value);
           rows.emplace_back(std::move(key), std::move(value));
           row_tids.push_back(tid);
         }
       }
+      if (gs_agg_step)
+        cache_grouped_semijoin_groups(step.table_name, std::move(gs_group_cache));
       LocalRangeScanEntry scan_entry{
           step.table_name, step_result.actual_start_key,
           step_result.actual_end_key, step.reverse_scan, step.scan_limit,

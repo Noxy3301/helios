@@ -320,6 +320,37 @@ semijoin source は `extract_value_column(scan_values, source_column)` で群行
   決定的逆転には q21(13.2s)/q13(6.1s)/q22(3.3s) であと数秒。
 - 機構: agg step(semijoin source)+ GS(内側合成供給)が agg spec を共有。MySQL 無改変。
 
+---
+
+## [2026-06-13] エントリ9: q18 二重集約の統合 → q18 5.14→2.65s(InnoDB 2.16s 並み)
+
+### 真因(trace)
+q18 5.14s = **2 RPC × ~2.3s = lineitem 6M を2回 server 集約**(agg step[semijoin source] +
+GS serving RPC)。データ転送は 38KB と極小、residual も 5ms。純粋に server 集約スキャン2回が律速。
+
+### 統合(MySQL 無改変)
+主 prefetch の agg step が group 行(57)を tx に cache(`grouped_semijoin_groups_`、
+inner_table_key で識別)。gs_fill_buffers は RPC の代わりにこの cache を読む(無ければ RPC に
+fallback=q15 経路)。→ 6M 集約スキャンが1回に。
+
+### 効果(md5 22/22 OK)
+- **q18 SF=1: 5.14→2.65s**(rpc/tx 2.0→1.0)。対 InnoDB 2.16s = 1.2x まで肉薄。
+- q18 単独 3 回: 2.74/2.93/2.64s 安定。
+
+### Codex review(read-only)結論
+- q18 の正確な形状では **sound**: HAVING フィルタ済 group key 集合 = IN 集合(positive membership)、
+  単一合成行の l_quantity=S は再 SUM で S 再現、NULL group key はガード済。
+- broader recognizer の silent-corruption edge(将来 generalize 時に要対処): IN が NOT/OR/CASE/
+  select-list 下にある場合の positive 文脈証明、key の真の SQL 等価性(signedness/collation/
+  decimal metadata)、sum store の rounding/truncation 警告での abort。現状 q18 形状には影響なし。
+
+### 計測環境の注意(重要)
+本マシンは他ワークツリー(/tmp/ordo-worktrees の 7+ codex セッション)と**共有**。helios は
+server 並列(HELIOS_PARALLEL_SERVER)依存のため**コア競合で重 join(q8/q9/q13/q21)が大きく
+悪化**(suite 45→53s)。InnoDB は単スレッドで競合に鈍感(41.4s で安定)。**公平比較は静穏窓で、
+かつ helios/InnoDB を同条件・背中合わせで取る必要**。q18/filtered_keys の構造改善は競合非依存で堅牢。
+
+
 
 
 
