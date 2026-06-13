@@ -1409,6 +1409,11 @@ void LineairDBRpc::handleTxExecuteReadPlan(const std::string& message,
         // Negative-coverage keys are dead weight when the planner proved no
         // other step reads this table (see PlanStep.suppress_filtered_keys).
         const bool suppress_fkeys = step.suppress_filtered_keys();
+        // Anti-join existence membership (Phase-18 q22): cap each for_each probe
+        // at its FIRST surviving match — NOT EXISTS only needs existence, never
+        // inner rows. Collapses e.g. q22's 1.5M order rows into one marker per
+        // distinct o_custkey. See PlanStep.existence_only.
+        const bool existence_only = step.existence_only();
 
         // Projection pushdown: trim each emitted base-row VALUE to the kept
         // columns. Runs AFTER row_passes (the filter parses the FULL row).
@@ -1583,6 +1588,7 @@ void LineairDBRpc::handleTxExecuteReadPlan(const std::string& message,
                                             wp_project(std::move(r.value)));
                                         o.tids.push_back(r.tid);
                                         ++group_rows;
+                                        if (existence_only) break;
                                     }
                                 } else {
                                     auto sr = dbp->StatelessSecondaryRangeScan(
@@ -1603,6 +1609,7 @@ void LineairDBRpc::handleTxExecuteReadPlan(const std::string& message,
                                             wp_project(std::move(r.value)));
                                         o.tids.push_back(r.tid);
                                         ++group_rows;
+                                        if (existence_only) break;
                                     }
                                 }
                                 o.group_rows.push_back(group_rows);
@@ -1685,6 +1692,7 @@ void LineairDBRpc::handleTxExecuteReadPlan(const std::string& message,
                                 project_value(std::move(r.value)));
                             step_result->add_scan_tids(r.tid);
                             ++group_rows;
+                            if (existence_only) break;
                         }
                     } else {
                         auto scan_result =
@@ -1709,6 +1717,7 @@ void LineairDBRpc::handleTxExecuteReadPlan(const std::string& message,
                                 project_value(std::move(r.value)));
                             step_result->add_scan_tids(r.tid);
                             ++group_rows;
+                            if (existence_only) break;
                         }
                     }
                     step_result->add_group_sizes(

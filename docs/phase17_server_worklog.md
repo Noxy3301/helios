@@ -748,3 +748,39 @@ covering-index existence(InnoDB q22 がこれ)/ semijoin-antijoin existence aggr
 5. build(services 停止 → build_partial.sh)→ md5 q22 一致確認 → q22 計測。
 6. 回帰: md5 22/22 + suite warm + OLTP(TPC-C/TATP)→ 退行0 確認。
 7. NDV pre-warm(measurement hygiene, 別タスク・低優先): 計測前に全表/索引 NDV を一括取得する hook。
+
+---
+
+## エントリ18: Phase18 実装完了 — q22 membership-staging(existence_only)(2026-06-13)
+
+membership-staging を **existence_only** モードとして実装。設計通り「antijoin inner は存在判定のみ
+→ server が probe ごと最初の1 match で打ち切る」。**md5 22/22 OK・suite 41.67→38.66s・対 InnoDB
+1.016x→0.943x で helios が前に出た**。
+
+### 実装(MySQL 無改変・gate `HELIOS_Q22_MEMBERSHIP`・default OFF)
+- proto `PlanStep.existence_only = 16`(suppress_filtered_keys と同じ4点配線)。
+- proxy `ReadPlanStep.existence_only` + serialization(lineairdb_proxy.cc)。
+- autogen: `collect_existence_only_antijoin_inners(root)` で **antijoin の inner が「FILTER 無しの素の
+  leaf」(= `qep_leaf_info()` が true)** の表だけを存在判定安全と判定し、for_each step に existence_only。
+  **SOUND な residual 検出**: q22 orders は素の index lookup → 採用、q21 l3 は `Filter:`(相関 residual
+  l_suppkey<>l1.l_suppkey AND dates)付き → `qep_leaf_info` が false で除外。これで q21 を壊さない。
+- server(lineairdb_rpc.cc): FES の4 scan path(parallel/serial × primary/secondary)で
+  `if (existence_only) break;` を 1 match push 後に挿入。scan_limit は触らない→`materialized_scan_truncated_`
+  が立たず handler の index_next が EOF を綺麗に返す(revert 済 first-match=scan_limit truncation とは別機構)。
+- serving/staging は無改変(per-probe group 構造そのまま、group 当たり行数が ≤1 になるだけ)。
+
+### 計測(SF=1 warm, gate ON vs OFF vs InnoDB)
+- **q22: 3.13s → 0.95s**(対 InnoDB 18.4x → 5.59x)。
+- trace: orders staged `keys=1500000`→**`99996`**(orders を持つ distinct o_custkey, 15x減)、
+  resp 100.3MB→**21.5MB**(残りは customer 150k 行が主)、staging 2.35s→**0.59s**
+  (stage_rpc_and_decode 0.93→0.36 / stage_local 1.42→0.23)、staged_rows 1.65M→**250k**。
+- 実行時 antijoin probe 19000 のうち order 有 12616(reject)/無 6384(NOT EXISTS 通過)= 結果 6384 行と一致。
+- **suite: 41.67 → 38.66s。対 InnoDB 1.016x → 0.943x(helios 勝ち)**。他21クエリ退行なし(全て誤差内)。
+- md5 22/22 OK(gate ON、q21 含め全一致)。
+
+### 残課題・次手
+- q22 残差 0.95s vs InnoDB 0.17s(5.6x): 残りは customer 150k 行 full-value staging(21.5MB の主)+
+  customer を2回 scan(AVG subquery + outer)。customer projection 圧縮 or AVG 用 scan 共有が次の梃子。
+- existence_only の更なる削減: 値を捨て distinct key 集合のみ(21.5→数MB)化は handler の value-less serving 要、別途。
+- gate を default ON にするか: 22/22 維持・suite 改善・residual 保護済み。OLTP 回帰確認後に判断。
+- **次**: OLTP 回帰(TPC-C/TATP)で退行0 を確認 → 必要なら default ON 検討。

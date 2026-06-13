@@ -323,6 +323,19 @@ message TxExecuteReadPlan {
         // sets it only when this table appears in no other plan step, so no such
         // probe exists.
         bool suppress_filtered_keys = 15;
+        // Membership-staging (Phase-18 q22): this step is the inner of an
+        // ANTI-JOIN (NOT EXISTS / NOT IN), so the executor only needs to know
+        // whether ANY matching inner row EXISTS for each probe key — never the
+        // row contents (an anti-join never projects inner columns). The server
+        // emits at most ONE row per (deduped) probe key instead of every match,
+        // collapsing e.g. q22's 1.5M order rows (100MB) into ~one existence
+        // marker per distinct o_custkey (~MB). Result-preserving: for NOT
+        // EXISTS only existence matters, so capping at the first match cannot
+        // change which outer rows survive. Unlike a scan_limit truncation this
+        // carries no "more rows exist" lie — the membership answer is complete,
+        // so index_next legitimately reports EOF (no truncation fallback).
+        // The planner sets it only for an anti-join nest's inner leaf.
+        bool existence_only = 16;
     }
     // Phase-9 semijoin: drop probe rows whose join key is absent from an
     // earlier step's result. Columns are 0-based TABLE::field[] ordinals; the

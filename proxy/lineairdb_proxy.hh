@@ -219,6 +219,10 @@ public:
         // a pushed filter's rejected rows). Set only when no other plan step
         // reads this table, so no point probe can need that coverage.
         bool suppress_filtered_keys = false;
+        // Anti-join existence membership (Phase-18 q22): emit at most one row
+        // per probe key (existence is all NOT EXISTS needs). Set only for an
+        // anti-join nest's inner leaf. See PlanStep.existence_only in the proto.
+        bool existence_only = false;
     };
     struct ReadPlanStepResult {
         bool found = false;

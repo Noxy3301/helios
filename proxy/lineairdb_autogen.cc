@@ -843,6 +843,84 @@ bool compile_index_search(TABLE *table, uint index,
 
 }  // namespace
 
+// Phase-18 membership-staging: collect tables that are the SOLE, residual-free
+// inner of an ANTI-JOIN (NOT EXISTS / NOT IN). For an anti-join the executor
+// only ever asks "does a match exist?" and never reads inner columns, so the
+// server may ship ONE row per probe (existence) instead of every match — but
+// ONLY when the anti-join inner is a bare table access with no FILTER/SORT
+// above the leaf. A residual the executor re-checks (q21's NOT EXISTS l3:
+// l_suppkey<>l1.l_suppkey AND l_receiptdate>l_commitdate) could reject the
+// server's first row while a later one qualifies, turning a real match into a
+// false "not exists". qep_leaf_info() returns true ONLY for a bare leaf access
+// path (FILTER/SORT/etc. return false), so it is exactly the residual-free
+// test. Partial recursion is sound: an unhandled node just yields no marking.
+static void collect_existence_only_antijoin_inners(
+    AccessPath *p, std::unordered_set<const TABLE *> *out) {
+  if (p == nullptr) return;
+  auto mark_if_bare = [&](AccessPath *inner) {
+    TABLE *t = nullptr;
+    Index_lookup *ref = nullptr;
+    bool fs = false;
+    int fsi = -1;
+    if (inner != nullptr && qep_leaf_info(inner, &t, &ref, &fs, &fsi) &&
+        t != nullptr) {
+      out->insert(t);
+    }
+  };
+  switch (p->type) {
+    case AccessPath::NESTED_LOOP_JOIN:
+      if (p->nested_loop_join().join_type == JoinType::ANTI)
+        mark_if_bare(p->nested_loop_join().inner);
+      collect_existence_only_antijoin_inners(p->nested_loop_join().outer, out);
+      collect_existence_only_antijoin_inners(p->nested_loop_join().inner, out);
+      return;
+    case AccessPath::BKA_JOIN:
+      if (p->bka_join().join_type == JoinType::ANTI)
+        mark_if_bare(p->bka_join().inner);
+      collect_existence_only_antijoin_inners(p->bka_join().outer, out);
+      collect_existence_only_antijoin_inners(p->bka_join().inner, out);
+      return;
+    case AccessPath::HASH_JOIN:
+      // A hash anti-join probes its build side as a whole, not once per outer
+      // row, so "one row per probe" does not apply — just recurse.
+      collect_existence_only_antijoin_inners(p->hash_join().outer, out);
+      collect_existence_only_antijoin_inners(p->hash_join().inner, out);
+      return;
+    case AccessPath::FILTER:
+      collect_existence_only_antijoin_inners(p->filter().child, out);
+      return;
+    case AccessPath::SORT:
+      collect_existence_only_antijoin_inners(p->sort().child, out);
+      return;
+    case AccessPath::LIMIT_OFFSET:
+      collect_existence_only_antijoin_inners(p->limit_offset().child, out);
+      return;
+    case AccessPath::AGGREGATE:
+      collect_existence_only_antijoin_inners(p->aggregate().child, out);
+      return;
+    case AccessPath::STREAM:
+      collect_existence_only_antijoin_inners(p->stream().child, out);
+      return;
+    case AccessPath::TEMPTABLE_AGGREGATE:
+      collect_existence_only_antijoin_inners(
+          p->temptable_aggregate().subquery_path, out);
+      collect_existence_only_antijoin_inners(
+          p->temptable_aggregate().table_path, out);
+      return;
+    case AccessPath::WEEDOUT:
+      collect_existence_only_antijoin_inners(p->weedout().child, out);
+      return;
+    case AccessPath::NESTED_LOOP_SEMIJOIN_WITH_DUPLICATE_REMOVAL:
+      collect_existence_only_antijoin_inners(
+          p->nested_loop_semijoin_with_duplicate_removal().outer, out);
+      collect_existence_only_antijoin_inners(
+          p->nested_loop_semijoin_with_duplicate_removal().inner, out);
+      return;
+    default:
+      return;
+  }
+}
+
 // Compile every leaf of one plan tree into `steps`, sharing `table_steps`
 // across trees so later trees can bind probes to earlier steps. On failure
 // sets unsupported and returns false WITHOUT raising; the caller decides
@@ -858,6 +936,15 @@ static bool compile_tree_leaves(
   std::vector<AccessPath *> leaves;
   bool ok = true;
   collect_qep_leaves(root, &leaves, &ok, unsupported);
+
+  // Phase-18 membership-staging (q22): tables whose only role is an anti-join
+  // existence probe with no executor-side residual. Gated until validated.
+  static const bool q22_membership_on =
+      std::getenv("HELIOS_Q22_MEMBERSHIP") != nullptr;
+  std::unordered_set<const TABLE *> existence_only_inners;
+  if (q22_membership_on) {
+    collect_existence_only_antijoin_inners(root, &existence_only_inners);
+  }
   if (!ok) {
     return false;
   }
@@ -940,6 +1027,15 @@ static bool compile_tree_leaves(
         step.scan_limit = static_cast<uint64_t>(lim.row_limit);
         step.reverse_scan = false;
       }
+    }
+
+    // Phase-18 membership-staging (q22): a for_each probe of a residual-free
+    // anti-join inner otherwise stages every matching inner row (q22: all 1.5M
+    // orders by o_custkey, 100MB) when one existence marker per probe key
+    // suffices. Cap at the first match per probe. Restricted to for_each steps
+    // (the over-fetching shape) and to the tables proven residual-free above.
+    if (step.for_each && existence_only_inners.count(table) != 0) {
+      step.existence_only = true;
     }
 
     (*table_steps)[table] = static_cast<int>(steps->size());
