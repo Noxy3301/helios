@@ -936,3 +936,27 @@ range は phantom 懸念で除外。gate `HELIOS_RO_SINGLEKEY_COMMIT`(default ON
 - GetSubData(1行 read-only): **2.0 → 1.0 RPC/tx**(skip 100%)= 単一行 read の理論値。
 - GetAccessData 2.1→1.5(skip 82%)、GetNewDest 2.0→1.6(skip 42%, join 単一キー時)。
 - 書き込み tx は skip 0%(正しく対象外)。md5 は TPC-H が multi-key+ro_novalidate で本 path 非該当=不変。
+
+### single-key RO commit-skip クリーン A/B(TATP T1, 同一バイナリ, 15s, trace 無し)
+- gate OFF(`HELIOS_RO_SINGLEKEY_COMMIT=0`): 5369/5385 → ~5377 req/s(メモリ baseline ~5379 と一致)
+- gate ON(default): 5986/5935 → **~5960 req/s = +10.8%**。retry 0, errors 0。
+- 回帰: TPC-C T1 376.6(退行なし)、TPC-H md5 22/22 OK(本 path 非該当)。
+
+### InsertCallFwd の write-path fallback(特性記録・将来課題)
+InsertCallFwd(TATP の ~7%, 995us/tx, 5.5 RPC/tx)は **75% が BEGIN/END:0.75 = prefetch attempt が
+cache miss → stateful retry に落ちている**(multi-statement read+INSERT の coverage gap)。write_row 自体は
+prefetch でバッファするが、tx 途中の未 stage read(insert 前の存在確認等)で cache miss → fallback。
+UpdLocation(read+UPDATE)は begin/end 無しで prefetch 完走(2 RPC)なので差は INSERT 系の read 構造。
+**TPC-C/TATP の write 経路は md5 オラクルが無く、修正は silent corruption リスクが高い**ため今回は見送り、
+特性のみ記録。将来 lever: insert 前の存在確認 read を plan に stage して fallback を消す(要 write-path 検証基盤)。
+
+## Phase 20 結論(OLTP near-ideal 検証 + 無駄削減)
+**prefetch は read 系で実質理論値だと確認**:
+- TPC-C DSL(tx-scoped @_tx_plan): NewOrder 2.1 RPC/tx(35文)/ Delivery 2.0 RPC/tx(70文)= near-ideal。
+  throughput 401 > InnoDB ~390。helios 寄与 ~115us、残りは MySQL/JDBC 文実行(InnoDB と同じ・削れない)。
+- TPC-C autogen(stmt-scoped, JDBC 用に必須): NewOrder 22.8 RPC/tx(文ごと1 plan)。TPC-C は JDBC 律速で
+  storage engine は少数派(helios 寄与 ~15%)。文を跨ぐバッチは autogen では原理的に不可。
+- TATP: read 系は single-key RO commit-skip で **1 RPC/tx(GetSubData)= 単一行 read の理論値**に到達。
+**削った無駄**: read-only single-key tx の OCC validation RPC(SOUND, +10.8% TATP)。
+**残る無駄(将来)**: InsertCallFwd 系 write tx の stateful fallback、multi-key read-only の commit-skip
+(server 側 snapshot 読みが必要)、per-RPC 固定費 ~24.5us(ほぼ床)。
