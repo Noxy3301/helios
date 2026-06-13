@@ -397,6 +397,33 @@ server 並列(HELIOS_PARALLEL_SERVER)依存のため**コア競合で重 join(q8
 InnoDB は単スレッドで 41.3s 安定。**専有環境でないと「suite < InnoDB」の最終判定は不可能**。
 本フェーズの構造改善(filtered_keys/q18)は競合非依存で堅牢に再現。次フェーズは専有環境 + q21/q22。
 
+## [2026-06-13] エントリ11: TPC-C T1 退行疑い調査 → 退行なし(モード差+WSL/サーバ差)
+
+ユーザ指摘「前は T1 で 200 req/s 出ていた、最近のコミットで 108 に退行?」を厳密検証。
+**計測手順をスクリプト化**(`scripts/dev/tpcc_compare.sh`、commit 済): load 毎に server
+クリーン再起動を強制(怠ると in-mem 残渣で CREATE 失敗 → 無出力の事故を実際に起こした)、
+mysqld を固定 env で再起動、稼働バイナリがビルド後か検証、CSV に throughput/goodput/retry 記録。
+
+### 同一マシン(XG6326-2U)実測(SF=1, T1, 各3回 mean)
+| 版 | DSL `--prefetch` | autogen `--prefetch-stmt` |
+|---|---|---|
+| feat/prefetch-autogen (~/helios, LineairDB 4852e527) | 119.7 (※103 errors) | 87.1 |
+| baseline 9c01359 (Phase17前) | **119.4** (116–124) | **103.9** (102–106) |
+| HEAD Phase17 | **115.0** (105–124) | ~104 典型(稀に165–182スパイク) |
+
+### 結論
+- **Phase17 に退行なし**: baseline ≈ HEAD(DSL ~118, autogen ~104)。むしろ autogen は
+  feat 87 → 現 104 と**改善**(phase15/16 の autogen 強化の成果)。HEAD は下振れせず稀に上振れ。
+- **「108」= autogen モード**(このサーバで全版 ~87–104)。ユーザが回帰テストで見た値。
+- **「180–200」はこのサーバのどの版でも再現しない**(DSL 最大 ~124)。メモリの WSL explicit=196.2
+  に一致 → **WSL 時代の別ハード数値**。memory「WSL時代の絶対数値とは比較しない」の通り。
+- **T1 は遅延律速で振れる**(HEAD autogen 100–182)。手順固定(tpcc_compare.sh)で再現性確保。
+- 教訓再確認: ① load 前に server 再起動必須 ② stop スクリプトは全 mysqld/server を巻き込む
+  (InnoDB ref 3308/3309 も。ただしディスク永続なので restart で復活) ③ pgrep レースで
+  「already running」誤判定 → 旧 server 死亡待ちを挟む。
+
+---
+
 ### first-match(scan_limit=1)レバー: 試作 → 不採用(antijoin の超読みで abort)
 EXISTS/antijoin の inner probe は first-match(1行で十分)なので scan_limit=1 で staging 削減を狙い、
 **試作実装**(collect_first_match_inners で NESTED_LOOP_JOIN(ANTI/SEMI)の bare-REF inner をマーク →
