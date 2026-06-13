@@ -669,4 +669,32 @@ cycle 間・PRE/POST 間で一致するか)。
   5. fail-closed: carrier 桁溢れ/形状不一致は activation しない(通常 scan)。
 - 期待: q15 7.6s → 1-2s(server 集約 + ship ~10k group 行 ×2 消費)。
 
+### [2026-06-13] エントリ26: plan 安定化②確定 + GroupedSummary 実装(q15 7.6→1.15s)
+
+**plan 安定化の真因は 2 つだった**:
+1. NDV staleness(エントリ25、commit 7fc1c70)— 決定性の確立。
+2. **benchrun.py が TPC-H load 時に GLOBAL `subquery_to_derived=on` を設定**
+   (pre-inner-unit-staging 時代の遺産)。これは**ヒューリスティック変換**
+   (コスト比較しない)で、mysqld 再起動で OFF に戻る — q17/q20 の 0.2s↔20s
+   往復の正体はこの **GLOBAL の生死**だった(NDV ではない)。correlated form は
+   いまや probe fold で最速経路: =off で **q17 20.4→0.22s / q20 15.5→0.25s**、
+   両方 MATCH。benchrun を =off 明示に変更(commit 4ac1fb2)。COST_V2 較正は
+   **不要**と確定。q18 は既に best plan(orders-driver)で 22.7s は構造的残差。
+
+**GroupedSummary 実装**(エントリ25設計の実装、MySQL 無改変):
+- optimize 時 `helios_try_register_gs`: derived inner unit(qe->item==nullptr)
+  で「単一表 / GROUP BY 1列 / SUM(a*(1-b)) のみ / WHERE exact + template 行が
+  実 WHERE Item を通る / read_set ⊆ {group,a,b,where列} / a,b は DECIMAL(s=2)
+  non-null」を認識して tx に登録(leaf TABLE* キー)。
+- autogen post-pass: 全 alias が GS 登録済みの未参照 plain scan step を
+  **staging から削除**(remap 同梱)し skip を tx に記録 → 660k 行の staging 消滅。
+- handler rnd_init: skip 記録があれば `execute_read_plan_raw`(cache 非 ingest、
+  ro_novalidate 限定)で server group 行を取得し、**exact 2行分解**
+  (S=S2+r, row1: a=S2,b=0 / row2: a=±0.01,b=1∓100r — my_decimal で厳密)で
+  synthetic full-width 行を scan buffer に直接展開。MySQL の再集約は冪等。
+  失敗は全て fail-closed(staged fallback が無いため)。
+- **SF=1: q15 7.6 → 1.15s(InnoDB 2.12s に勝利)、md5 22/22 OK**。
+  2 つの view clone がそれぞれ 10,000 groups / 19,905 synthetic 行で serve。
+- 残: Codex レビュー送付。
+
 (以降追記)

@@ -258,7 +258,42 @@ public:
   void clear_inner_aggregates() {
     inner_agg_specs_.clear();
     inner_agg_stamped_leaves_.clear();
+    gs_regs_.clear();
+    gs_skipped_.clear();
   }
+
+  // GroupedSummary (Phase-16 entry 25, q15-class): a DERIVED inner unit's
+  // single-table SUM-only GROUP BY is served by the HANDLER hijacking its own
+  // scan — fetch server group rows (raw, no cache ingest), emit synthetic
+  // full-width rows whose re-aggregation by MySQL is idempotent. MySQL
+  // stays unmodified: this is pure handler behavior. Registered at optimize
+  // (push_to_engine) keyed by leaf TABLE* identity; autogen drops the leaf's
+  // scan step (and records that) so the base rows are never staged.
+  struct GsRegistration {
+    std::string spec;     // AggregateSpec: group col + SUM(arith expr)
+    std::string filter;   // exact WHERE (serialized PushedPredicate)
+    std::vector<std::string> template_cols;  // per-column ASCII for ALL fields
+    uint32_t group_col = 0;  // field ordinal of the (single) group column
+    uint32_t col_a = 0;      // SUM(a * (1 - b)): carrier columns
+    uint32_t col_b = 0;
+  };
+  void register_gs(const void* leaf, GsRegistration reg) {
+    gs_regs_.emplace(leaf, std::move(reg));
+  }
+  const GsRegistration* gs_registration(const void* leaf) const {
+    auto it = gs_regs_.find(leaf);
+    return it == gs_regs_.end() ? nullptr : &it->second;
+  }
+  void mark_gs_skipped(const void* leaf) { gs_skipped_.insert(leaf); }
+  bool gs_skipped(const void* leaf) const {
+    return gs_skipped_.count(leaf) != 0;
+  }
+  // Execute a one-step read plan and hand back the raw scan_values WITHOUT
+  // staging anything into the tx caches (GS group rows are not base rows).
+  // ro_novalidate scope only — nothing is recorded for validation either.
+  bool execute_read_plan_raw(
+      const std::vector<LineairDBProxy::ReadPlanStep>& steps,
+      std::vector<std::string>* values);
 
   // Projection pushdown (ro_novalidate SELECT only): per physical table, the
   // kept 0-based field ordinals its staged VALUES were trimmed to. The row
@@ -425,6 +460,8 @@ private:
   std::unordered_map<std::string, InnerAggregate> inner_agg_specs_;
   std::unordered_map<std::string, std::unordered_set<const void*>>
       inner_agg_stamped_leaves_;
+  std::unordered_map<const void*, GsRegistration> gs_regs_;
+  std::unordered_set<const void*> gs_skipped_;
 
   // Projection pushdown: physical table name -> kept field ordinals.
   std::unordered_map<std::string, std::vector<uint32_t>> table_projection_;

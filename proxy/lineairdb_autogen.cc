@@ -1165,6 +1165,73 @@ bool autogen_read_plan_from_qep(
     }
   }
 
+  // GroupedSummary skip (Phase-16 entry 25): a leaf registered for the
+  // handler-local grouped-summary scan must NOT have its base rows staged —
+  // the handler fetches server group rows itself and serves synthetic rows.
+  // Only unreferenced plain scans whose EVERY alias is GS-registered drop;
+  // the decision is recorded on the tx so the handler activates exactly when
+  // the step was really removed (otherwise the staged raw scan serves).
+  if (allow_filter_pushdown && tx != nullptr) {
+    std::vector<bool> referenced(steps.size(), false);
+    for (const auto &st : steps) {
+      for (const auto &b : st.bindings)
+        if (b.source_step < referenced.size()) referenced[b.source_step] = true;
+      for (const auto &b : st.end_bindings)
+        if (b.source_step < referenced.size()) referenced[b.source_step] = true;
+    }
+    std::vector<uint32_t> new_index(steps.size(), 0);
+    std::vector<bool> dropped(steps.size(), false);
+    std::vector<LineairDBProxy::ReadPlanStep> kept;
+    std::vector<std::vector<TABLE *>> kept_aliases;
+    bool any_drop = false;
+    for (size_t i = 0; i < steps.size(); ++i) {
+      bool drop = steps[i].is_scan && !steps[i].for_each &&
+                  steps[i].scan_limit == 0 && !referenced[i] &&
+                  i < step_aliases.size() && !step_aliases[i].empty() &&
+                  steps[i].semijoins.empty();
+      if (drop) {
+        for (TABLE *at : step_aliases[i])
+          if (at == nullptr || tx->gs_registration(at) == nullptr) {
+            drop = false;
+            break;
+          }
+      }
+      if (drop) {
+        for (TABLE *at : step_aliases[i]) tx->mark_gs_skipped(at);
+        dropped[i] = true;
+        any_drop = true;
+        continue;
+      }
+      new_index[i] = static_cast<uint32_t>(kept.size());
+      kept.push_back(std::move(steps[i]));
+      kept_aliases.push_back(std::move(step_aliases[i]));
+    }
+    if (any_drop) {
+      steps = std::move(kept);
+      step_aliases = std::move(kept_aliases);
+      for (auto &st : steps) {
+        for (auto &b : st.bindings) b.source_step = new_index[b.source_step];
+        for (auto &b : st.end_bindings)
+          b.source_step = new_index[b.source_step];
+        for (auto &sj : st.semijoins) sj.source_step = new_index[sj.source_step];
+      }
+      for (auto it = table_steps.begin(); it != table_steps.end();) {
+        const int idx = it->second;
+        if (idx >= 0 && idx < static_cast<int>(dropped.size()) &&
+            dropped[idx]) {
+          it = table_steps.erase(it);
+        } else {
+          if (idx >= 0 && idx < static_cast<int>(new_index.size()))
+            it->second = static_cast<int>(new_index[idx]);
+          ++it;
+        }
+      }
+    } else {
+      steps = std::move(kept);
+      step_aliases = std::move(kept_aliases);
+    }
+  }
+
   // Scan filter pushdown (post-pass; ro_novalidate only). A table-local WHERE
   // filter is attached ONLY when the physical table backs exactly ONE plan
   // step: with multiple steps (self-join aliases, temp-source full-scan

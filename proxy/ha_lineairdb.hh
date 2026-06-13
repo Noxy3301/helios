@@ -502,6 +502,10 @@ public:
   // override executor's group-row scan.
   void tx_register_inner_aggregate(const std::string &spec,
                                    const std::string &filter);
+  // GroupedSummary (Phase-16 entry 25): optimize-time registration + the
+  // rnd_init-time fetch that fills the scan buffers with synthetic rows.
+  void tx_register_gs(LineairDBTransaction::GsRegistration reg);
+  int gs_fill_buffers(LineairDBTransaction *tx);
   bool tx_inner_agg_stamped();
   bool tx_begin_inner_agg_consume(const std::string &expect_spec);
   int rnd_pos(uchar *buf, uchar *pos) override; ///< required

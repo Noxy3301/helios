@@ -94,6 +94,7 @@
 
 #include "storage/lineairdb/ha_lineairdb.hh"
 #include "../common/log.h"
+#include "lineairdb_keyenc.hh"
 
 #include <algorithm>
 #include <cctype>
@@ -1350,9 +1351,175 @@ static void helios_register_inner_aggregate(THD *thd, JOIN *join) {
                  spec_ser.size(), filter_ser.size());
 }
 
+// GroupedSummary registration (Phase-16 entry 25): a DERIVED inner unit
+// (q15's view clones) whose shape is "single table, GROUP BY one column,
+// SUM(a * (1 - b)) only, exact WHERE" is served by the handler hijacking its
+// own scan — MySQL re-aggregates synthetic rows idempotently, so the core
+// stays unmodified. Self-gating: anything off-shape simply doesn't register.
+static void helios_try_register_gs(THD *thd, JOIN *join) {
+  if (thd == nullptr || join == nullptr || thd->lex == nullptr) return;
+  if (thd->lex->sql_command != SQLCOM_SELECT || thd->lex->is_explain()) return;
+  Query_block *qb = join->query_block;
+  if (qb == nullptr) return;
+  Query_expression *qe = qb->master_query_expression();
+  if (qe == nullptr || !qe->is_simple()) return;
+  // DERIVED inner units only (no Item): scalar/IN subqueries take other paths.
+  if (qb->outer_query_block() == nullptr || qe->item != nullptr) return;
+  if (qe->uncacheable != 0) return;
+  if (qb->leaf_table_count != 1 || !qb->is_grouped()) return;
+  if (qb->is_distinct() || qb->having_cond() != nullptr || qb->has_limit() ||
+      qb->olap != UNSPECIFIED_OLAP_TYPE || qb->has_windows() ||
+      qb->order_list.elements != 0)
+    return;
+  TABLE *t = qb->leaf_tables != nullptr ? qb->leaf_tables->table : nullptr;
+  if (t == nullptr || t->file == nullptr || t->file->ht != lineairdb_hton)
+    return;
+  ha_lineairdb *hl = down_cast<ha_lineairdb *>(t->file);
+  if (!hl->tx_ro_novalidate()) return;
+  // ONE group column, a plain non-nullable field.
+  if (qb->group_list.elements != 1) return;
+  Item *gi = *qb->group_list.first->item;
+  if (gi->type() != Item::FIELD_ITEM || gi->is_nullable()) return;
+  Field *gf = down_cast<Item_field *>(gi)->field;
+  // Outputs: passthrough == the group column, plus EXACTLY ONE
+  // SUM(a * (1 - b)) with a,b non-nullable DECIMAL fields (q15's revenue).
+  Item_sum *the_sum = nullptr;
+  for (Item *it : VisibleFields(qb->fields)) {
+    if (it->type() == Item::SUM_FUNC_ITEM) {
+      Item_sum *sm = down_cast<Item_sum *>(it);
+      if (the_sum != nullptr || sm->sum_func() != Item_sum::SUM_FUNC ||
+          sm->has_wf() || sm->has_subquery() || sm->argument_count() != 1)
+        return;
+      the_sum = sm;
+    } else if (it->type() == Item::FIELD_ITEM) {
+      if (down_cast<Item_field *>(it)->field != gf) return;
+    } else {
+      return;
+    }
+  }
+  if (the_sum == nullptr) return;
+  // Recognize a * (1 - b) (either MUL arg order).
+  Item *arg = the_sum->arguments()[0];
+  if (arg->type() != Item::FUNC_ITEM) return;
+  Item_func *mul = down_cast<Item_func *>(arg);
+  if (mul->functype() != Item_func::MUL_FUNC || mul->argument_count() != 2)
+    return;
+  Item *m0 = mul->arguments()[0], *m1 = mul->arguments()[1];
+  Item_field *fa = nullptr;
+  Item_func *sub = nullptr;
+  if (m0->type() == Item::FIELD_ITEM && m1->type() == Item::FUNC_ITEM) {
+    fa = down_cast<Item_field *>(m0);
+    sub = down_cast<Item_func *>(m1);
+  } else if (m1->type() == Item::FIELD_ITEM && m0->type() == Item::FUNC_ITEM) {
+    fa = down_cast<Item_field *>(m1);
+    sub = down_cast<Item_func *>(m0);
+  } else {
+    return;
+  }
+  if (sub->functype() != Item_func::MINUS_FUNC || sub->argument_count() != 2)
+    return;
+  Item *s0 = sub->arguments()[0], *s1 = sub->arguments()[1];
+  if (s0->type() != Item::INT_ITEM || s0->val_int() != 1 ||
+      s1->type() != Item::FIELD_ITEM)
+    return;
+  Item_field *fb = down_cast<Item_field *>(s1);
+  Field *cfa = fa->field, *cfb = fb->field;
+  // Carrier feasibility: a, b DECIMAL scale 2, non-nullable, same table.
+  if (cfa->is_nullable() || cfb->is_nullable()) return;
+  if (cfa->type() != MYSQL_TYPE_NEWDECIMAL ||
+      cfb->type() != MYSQL_TYPE_NEWDECIMAL || cfa->decimals() != 2 ||
+      cfb->decimals() != 2)
+    return;
+  // WHERE: exact serialization, then a TEMPLATE row that the actual WHERE
+  // Item accepts (the synthetic rows must pass MySQL's re-evaluated FILTER).
+  std::string filter_ser;
+  std::vector<std::pair<Field *, std::string>> where_cands;
+  Item *where = qb->where_cond();
+  if (where != nullptr) {
+    bool exact = false;
+    if (!build_single_table_filter(thd, t, &filter_ser, &exact) ||
+        filter_ser.empty() || !exact)
+      return;
+    // Candidate constants: FIELD >= C / FIELD = C / FIELD BETWEEN C AND C2
+    // contribute C for their column; verification below uses the REAL Item.
+    std::vector<Item *> conj;
+    if (where->type() == Item::COND_ITEM &&
+        down_cast<Item_cond *>(where)->functype() == Item_func::COND_AND_FUNC) {
+      for (Item &c : *down_cast<Item_cond *>(where)->argument_list())
+        conj.push_back(&c);
+    } else {
+      conj.push_back(where);
+    }
+    for (Item *c : conj) {
+      if (c->type() != Item::FUNC_ITEM) continue;
+      Item_func *f = down_cast<Item_func *>(c);
+      const auto ft = f->functype();
+      if ((ft != Item_func::GE_FUNC && ft != Item_func::EQ_FUNC &&
+           ft != Item_func::BETWEEN) ||
+          f->argument_count() < 2)
+        continue;
+      Item *lhs = f->arguments()[0]->real_item();
+      Item *rhs = f->arguments()[1];
+      if (lhs->type() != Item::FIELD_ITEM || !rhs->const_item()) continue;
+      String sbuf, *sv = rhs->val_str(&sbuf);
+      if (sv == nullptr || rhs->null_value) continue;
+      where_cands.emplace_back(down_cast<Item_field *>(lhs)->field,
+                               std::string(sv->ptr(), sv->length()));
+    }
+  }
+  // read_set must be covered by {group, a, b, WHERE-candidate columns}.
+  for (uint i = 0; i < t->s->fields; ++i) {
+    if (!bitmap_is_set(t->read_set, i)) continue;
+    Field *fld = t->field[i];
+    if (fld == gf || fld == cfa || fld == cfb) continue;
+    bool covered = false;
+    for (auto &wc : where_cands)
+      if (wc.first == fld) covered = true;
+    if (!covered) return;
+  }
+  // Build the per-column ASCII template ("0" placeholders are never stored:
+  // the read_set store-skip ignores columns outside the read_set).
+  std::vector<std::string> tmpl(t->s->fields, "0");
+  for (auto &wc : where_cands) tmpl[wc.first->field_index()] = wc.second;
+  // Verify the template passes the REAL WHERE: store candidates into
+  // record[0] (saved/restored) and evaluate the Item tree once.
+  if (where != nullptr) {
+    std::vector<uchar> saved(t->record[0], t->record[0] + t->s->rec_buff_length);
+    my_bitmap_map *org = tmp_use_all_columns(t, t->write_set);
+    for (auto &wc : where_cands)
+      wc.first->store(wc.second.data(), wc.second.size(), &my_charset_bin);
+    tmp_restore_column_map(t->write_set, org);
+    const longlong pass = where->val_int();
+    const bool was_null = where->null_value;
+    memcpy(t->record[0], saved.data(), saved.size());
+    if (thd->is_error() || was_null || pass == 0) return;
+  }
+  // Spec: GROUP BY gf + SUM(a * (1 - b)) — serialized via the shared arith
+  // path so the server computes the exact scale-4 sums.
+  LineairDB::Protocol::AggregateSpec spec;
+  spec.set_num_columns(t->s->fields);
+  spec.add_group_columns(gf->field_index());
+  auto *af = spec.add_aggs();
+  af->set_kind(LineairDB::Protocol::AggFunc::AGG_SUM);
+  if (!helios_serialize_arith(arg, af->mutable_arg())) return;
+  af->set_result_scale(0);
+  LineairDBTransaction::GsRegistration reg;
+  spec.SerializeToString(&reg.spec);
+  reg.filter = std::move(filter_ser);
+  reg.template_cols = std::move(tmpl);
+  reg.group_col = gf->field_index();
+  reg.col_a = cfa->field_index();
+  reg.col_b = cfb->field_index();
+  if (std::getenv("HELIOS_FE_DEBUG"))
+    std::fprintf(stderr, "[GS] registered table=%s group=%u a=%u b=%u\n",
+                 t->s->table_name.str, reg.group_col, reg.col_a, reg.col_b);
+  hl->tx_register_gs(std::move(reg));
+}
+
 static int lineairdb_push_to_engine(THD *thd, AccessPath * /*root_path*/,
                                     JOIN *join) {
   if (!helios_agg_pushdown_enabled()) return 0;
+  helios_try_register_gs(thd, join);  // self-gating (derived inner units)
   if (!helios_offloadable_shape(thd, join)) return 0;
   if (std::getenv("HELIOS_FE_DEBUG"))
     std::fprintf(stderr, "[AGGPD] installing override_executor_func%s\n",
@@ -2071,6 +2238,12 @@ int ha_lineairdb::rnd_init(bool) {
     DBUG_RETURN(err);
   }
 
+  // GroupedSummary: autogen dropped this leaf's scan step (recorded on the
+  // tx), so serve synthetic group rows instead of staged base rows.
+  if (tx->gs_skipped(table)) {
+    DBUG_RETURN(gs_fill_buffers(tx));
+  }
+
   DBUG_RETURN(0);
 }
 
@@ -2256,6 +2429,124 @@ bool ha_lineairdb::tx_begin_inner_agg_consume(const std::string &expect_spec) {
   if (tx == nullptr) return false;
   tx->choose_table(db_table_name);
   return tx->begin_inner_agg_consume(expect_spec);
+}
+
+void ha_lineairdb::tx_register_gs(LineairDBTransaction::GsRegistration reg) {
+  auto tx = get_transaction(ha_thd());
+  if (tx == nullptr) return;
+  tx->register_gs(table, std::move(reg));
+}
+
+// GroupedSummary consume: fetch server group rows for this leaf (raw, no
+// cache ingest), decompose each group's exact scale-4 SUM into one or two
+// synthetic rows whose re-aggregation by MySQL is idempotent, and fill the
+// scan buffers rnd_next serves from. Anything unexpected fails CLOSED
+// (HA_ERR_INTERNAL_ERROR): the staged plan no longer carries this table's
+// base rows, so there is no silent fallback.
+int ha_lineairdb::gs_fill_buffers(LineairDBTransaction *tx) {
+  const LineairDBTransaction::GsRegistration *reg = tx->gs_registration(table);
+  if (reg == nullptr) {
+    my_error(ER_INTERNAL_ERROR, MYF(0), "helios gs skipped but unregistered");
+    return HA_ERR_INTERNAL_ERROR;
+  }
+  LineairDBProxy::ReadPlanStep step;
+  step.table_name = db_table_name;
+  step.is_scan = true;
+  step.end_key_prefix = lineairdb_keyenc::scan_end_sentinel();
+  step.serialized_filter = reg->filter;
+  step.aggregate_serialized = reg->spec;
+  std::vector<std::string> groups;
+  if (!tx->execute_read_plan_raw({step}, &groups)) {
+    my_error(ER_LOCK_DEADLOCK, MYF(0));
+    return HA_ERR_LOCK_DEADLOCK;
+  }
+  // Group row layout: [null_flags][group key][sum][count], agg_emit_field
+  // framing (same parser as the Phase-B executor).
+  auto parse_fields = [](std::string_view row,
+                         std::vector<std::string_view> *fv,
+                         std::vector<bool> *nul) -> bool {
+    size_t off = 0;
+    while (off < row.size()) {
+      uint8_t bs = static_cast<uint8_t>(row[off++]);
+      if (bs == 0xFF) { fv->emplace_back(); nul->push_back(true); continue; }
+      if (off + bs > row.size()) return false;
+      size_t len = 0;
+      for (uint8_t i = 0; i < bs; ++i)
+        len |= static_cast<size_t>(static_cast<uint8_t>(row[off + i]))
+               << (8 * i);
+      off += bs;
+      if (off + len > row.size()) return false;
+      fv->push_back(std::string_view(row.data() + off, len));
+      nul->push_back(false);
+      off += len;
+    }
+    return true;
+  };
+  const uint nf = table->s->fields;
+  std::vector<uchar> zero_nulls(table->s->null_bytes, 0);
+  const auto emit_row = [&](const std::string &gkey, const std::string &a_str,
+                            const std::string &b_str) {
+    LineairDBField ldb;
+    ldb.set_null_field(zero_nulls.data(), zero_nulls.size());
+    std::string value = ldb.get_null_field();
+    for (uint i = 0; i < nf; ++i) {
+      const std::string *src = &reg->template_cols[i];
+      if (i == reg->group_col) src = &gkey;
+      else if (i == reg->col_a) src = &a_str;
+      else if (i == reg->col_b) src = &b_str;
+      ldb.set_lineairdb_field(src->c_str(), src->size());
+      value += ldb.get_lineairdb_field();
+    }
+    scanned_keys_.emplace_back();
+    scanned_values_.emplace_back(
+        reinterpret_cast<const std::byte *>(value.data()),
+        reinterpret_cast<const std::byte *>(value.data()) + value.size());
+  };
+  String dec_str;
+  for (const std::string &grow : groups) {
+    std::vector<std::string_view> fv;
+    std::vector<bool> nul;
+    if (!parse_fields(grow, &fv, &nul) || fv.size() != 4 || nul[1] || nul[2]) {
+      my_error(ER_INTERNAL_ERROR, MYF(0), "helios gs group row malformed");
+      return HA_ERR_INTERNAL_ERROR;
+    }
+    const std::string gkey(fv[1]);
+    // Exact decomposition of S (scale<=4) into a*(1-b) contributions with
+    // a, b at scale 2:  S = S2 + r,  S2 = trunc2(S), |r| < 0.01.
+    //   row1: a=S2,  b=0.00              -> contributes S2 exactly
+    //   row2 (r>0): a=0.01,  b=1-100r    -> 0.01*(100r) = r exactly
+    //   row2 (r<0): a=-0.01, b=1+100r    -> -0.01*(-100r) = r exactly
+    my_decimal S, S2, r;
+    str2my_decimal(E_DEC_FATAL_ERROR, fv[2].data(), fv[2].size(),
+                   &my_charset_bin, &S);
+    my_decimal_round(E_DEC_FATAL_ERROR, &S, 2, true /*truncate*/, &S2);
+    my_decimal_sub(E_DEC_FATAL_ERROR, &r, &S, &S2);
+    dec_str.length(0);
+    my_decimal2string(E_DEC_FATAL_ERROR, &S2, &dec_str);
+    const std::string a1(dec_str.ptr(), dec_str.length());
+    emit_row(gkey, a1, "0.00");
+    if (!my_decimal_is_zero(&r)) {
+      my_decimal r100, hundred, one, b2;
+      int2my_decimal(E_DEC_FATAL_ERROR, 100, false, &hundred);
+      int2my_decimal(E_DEC_FATAL_ERROR, 1, false, &one);
+      my_decimal_mul(E_DEC_FATAL_ERROR, &r100, &r, &hundred);
+      const bool neg = r.sign();
+      if (!neg) {
+        my_decimal_sub(E_DEC_FATAL_ERROR, &b2, &one, &r100);   // 1 - 100r
+      } else {
+        my_decimal_add(E_DEC_FATAL_ERROR, &b2, &one, &r100);   // 1 + 100r
+      }
+      dec_str.length(0);
+      my_decimal2string(E_DEC_FATAL_ERROR, &b2, &dec_str);
+      emit_row(gkey, neg ? "-0.01" : "0.01",
+               std::string(dec_str.ptr(), dec_str.length()));
+    }
+  }
+  scan_exhausted_ = true;
+  if (std::getenv("HELIOS_FE_DEBUG"))
+    std::fprintf(stderr, "[GS] served groups=%zu rows=%zu\n", groups.size(),
+                 scanned_values_.size());
+  return 0;
 }
 bool ha_lineairdb::tx_is_aborted() {
   auto tx = get_transaction(ha_thd());

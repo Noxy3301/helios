@@ -1346,6 +1346,21 @@ void LineairDBTransaction::abort_prefetch_cache_miss(
   thd_mark_transaction_to_rollback(thread, 1);
 }
 
+bool LineairDBTransaction::execute_read_plan_raw(
+    const std::vector<LineairDBProxy::ReadPlanStep>& steps,
+    std::vector<std::string>* values) {
+  if (values == nullptr || steps.empty()) return false;
+  if (!ro_novalidate_) return false;  // GS is read-only no-validate scope
+  LineairDBProxy::ReadPlanResult result =
+      lineairdb_proxy->tx_execute_read_plan(steps);
+  if (!result.ok || result.steps.size() != steps.size()) {
+    is_aborted_ = true;
+    return false;
+  }
+  *values = std::move(result.steps[0].scan_values);
+  return true;
+}
+
 void LineairDBTransaction::push_range_scan_cache(LocalRangeScanEntry entry) {
   range_scan_start_index_[scan_cache_index_key(entry.table_name, "",
                                                entry.start_key)]
