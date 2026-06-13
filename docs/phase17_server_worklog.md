@@ -819,3 +819,8 @@ share を seed できることも確認(cold shares で全8表 EXPLAIN → 続�
 行転送ゼロ)。`sf1_milestone.sh` に sysvar 有効化直後の prewarm 呼び出しを追加。
 → 計測前に1回流せば stats RPC が measured query に混入しない。従来の begin/end piggyback・on-demand は
 そのまま温存(通常運用は無変更)。「stats はベンチ中ノイズ」問題は **share-gated(表ごと一度)+ prewarm** で解消。
+
+## ② q22 membership-staging を default ON
+`HELIOS_Q22_MEMBERSHIP` を q18 と同じ default-ON パターンに変更(`env==nullptr || env[0]!='0'`、
+`=0` で OFF)。検証: **env 未設定の mysqld で q22 ~0.92s(最適化が効く)・md5 22/22 OK**。
+residual 保護(qep_leaf_info ベース)で q21 等は不変。OLTP は gate と無関係(antijoin inner 非該当)。

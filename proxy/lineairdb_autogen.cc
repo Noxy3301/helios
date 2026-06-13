@@ -938,9 +938,11 @@ static bool compile_tree_leaves(
   collect_qep_leaves(root, &leaves, &ok, unsupported);
 
   // Phase-18 membership-staging (q22): tables whose only role is an anti-join
-  // existence probe with no executor-side residual. Gated until validated.
-  static const bool q22_membership_on =
-      std::getenv("HELIOS_Q22_MEMBERSHIP") != nullptr;
+  // existence probe with no executor-side residual. Default ON (md5 22/22 +
+  // suite win + OLTP no-regression validated, Phase-18/19); HELIOS_Q22_MEMBERSHIP=0
+  // disables (off-switch / A-B).
+  static const char *q22_env = std::getenv("HELIOS_Q22_MEMBERSHIP");
+  static const bool q22_membership_on = q22_env == nullptr || q22_env[0] != '0';
   std::unordered_set<const TABLE *> existence_only_inners;
   if (q22_membership_on) {
     collect_existence_only_antijoin_inners(root, &existence_only_inners);
