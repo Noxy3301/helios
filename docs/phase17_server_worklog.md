@@ -1107,3 +1107,25 @@ l_sk index を load 時実体化(lineitem CREATE TABLE に KEY l_sk/l_sk_pk 追�
 q21 の勝ちは本物だが l_sk を素で入れると q15 を壊す(helios)+ InnoDB q15 退行。full 実装は backfill だけでなく
 prefetch×SI×view correctness(q15)修正を含む大きめの作業。user 判断待ち: (a)full投資 (b)index撤退しq21は①②へ (c)絞り込み継続。
 branch throwaway 前提。現状 helios=l_sk 込みロード, InnoDB3308=l_sk/l_sk_pk 追加済。
+
+---
+
+# Phase 21: secondary-index ライフサイクルの foundational 実装(branch claude/q21-secondary-index)
+
+目的: helios を **BenchBase 標準(InnoDB+MySQL 等価=afterload で標準索引一式)** に対応させる。q21 SIP の勝ち
+(3.4x)はこの副産物。correctness 最優先。
+
+## 順序(user 承認)
+② CREATE INDEX backfill → afterload 有効化 + md5 → ④ prefetch×SI×view correctness(q15 級)→ ③ DROP purge。
+
+## プロセス(user 指示)
+- 各ステップ実装前に **既存システム(InnoDB / PostgreSQL / OSS / in-memory OCC 系)を Claude・Codex 並列調査**して
+  設計の絵を描く。
+- 各ステップを **Claude・Codex で厳密 dual review**、GO が出るまで反復してから次へ。
+
+## Step ② 設計調査(進行中)
+Claude(general-purpose, web+code)+ Codex(knowledge)を並列起動。論点: server 側 backfill vs proxy 駆動 /
+exclusive-lock offline build(afterload は concurrent DML 無し)vs online build / ready-gating(完成まで index 不可視)/
+Silo single-version OCC 下の一貫性 / RPC flow / correctness 不変条件(全 committed 行が1回・phantom/dup 無し・
+secondary key 符号化が DML 経路と一致)/ test(CREATE INDEX 後の md5 vs InnoDB、count by col、load-built index 等価)。
+→ 両調査を synthesis → 設計 dual review(GO まで)→ 実装 → 実装 dual review(GO まで)。
