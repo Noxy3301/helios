@@ -1,7 +1,7 @@
 #!/bin/bash
 # B1 close-out: OLTP regression with final binary (gates OFF = default path).
 set -euo pipefail
-ROOT=/home/noxy/helios
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$ROOT"
 
 restart_services() {

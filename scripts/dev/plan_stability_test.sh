@@ -2,7 +2,7 @@
 # Plan stability test: 2 cycles of fresh-load -> time q17/q18/q20 -> full
 # matrix -> time again. Stable = pre/post and cross-cycle times agree.
 set -uo pipefail
-ROOT=/home/noxy/helios
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$ROOT"
 MYSQL="$ROOT/build/runtime_output_directory/mysql -u root --socket=/tmp/mysql.sock"
 
