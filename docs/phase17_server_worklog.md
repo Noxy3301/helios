@@ -874,3 +874,65 @@ InnoDB 同等。staging は helios だけが払う純オーバーヘッド。**�
 q21 は **本セッションでの安全な実装範囲を超える**(大機構 or 横断 codec)。suite は q22 で既に勝ち越し
 (0.943x)のため、q21 大機構は費用対効果と 22/22 リスクを user 判断にゆだねる。#4 は「精査して
 cheap lever 無しを確定・選択肢を提示」で一旦クローズ。
+
+---
+
+# Phase 20: TPC-C / TATP カリカリチューニング(OLTP)
+
+ゴール(user /goal): TPC-C と TATP を徹底チューニング。prefetch が理論値(ideal)にどれだけ近いかを
+詳細検証し、内部パス・アクセス方法の無駄を削って性能改善。手法は TPC-H と同じ
+(per-tx RPC trace → 理論最小との差分 → 無駄特定 → 削減 → md5/回帰 → 議事録)。
+
+既知の出発点(メモリ helios-tpcc-prefetch-coverage-gap): TPC-C prefetch は coverage ~10% と低く、
+PK-MRR batch_read 経路が prefetch plan 未 stage(warehouse 点読 = abort の 88%)、plan は once-per-tx
+staging で多 statement 非対応、note_oneshot_miss は無条件 abort。まず実測で裏取りする。
+
+## ① ベースライン + RPC trace 採取(理論値との差分測定)
+
+### TPC-C T1 RPC trace 解析(autogen vs DSL, C6-off)
+per-tx RPC 構成と sections 内訳(理論値との差分):
+```
+mode     NewOrder      Delivery     仕組み
+autogen  22.8 RPC/tx   51 RPC/tx    読み文ごとに1 EXECUTE_READ_PLAN(statement-scoped)
+DSL      2.1 RPC/tx    2.0 RPC/tx   tx 全読みを1 plan + 1 commit(@_tx_plan, transaction-scoped)
+```
+- throughput: DSL 401.7 / autogen 359.2 / InnoDB ~390 → **DSL は既に InnoDB 超え**、autogen がやや下。
+- sections(NewOrder, us/tx):
+  - DSL: helios 寄与 ~115us(stage_rpc_and_decode 90 + txplan_parse 15 + stage_local 10)。残り ~3200us は
+    **MySQL 35文実行 + benchbase JDBC 往復**(InnoDB でも同じ・helios では削れない)→ **DSL prefetch は実質理論値**。
+  - autogen: helios 寄与 ~579us(stage_rpc_and_decode 528=21.6 RPC×24.5us + autogen_compile 41 + stage_local 9)。
+    NewOrder 全体 3844us の ~15%。autogen は文単位なので跨いでバッチ不可(JDBC 用途では DSL 注入できない)。
+- **結論(TPC-C)**: TPC-C T1 は **JDBC/MySQL 文実行律速**で storage engine は少数派。DSL は near-ideal で
+  InnoDB 超え済み。autogen の梃子は per-statement RPC の固定費(~24.5us/RPC)削減 = 全モード横断で効く。
+  ただし TPC-C 全体への寄与は限定的(~15%上限)。**storage-engine の伸びしろは単文中心の TATP の方が大きい見込み**。
+
+### TATP T1 RPC trace 解析(autogen, C6-off, 4483 req/s)
+per-tx(read 系は 2 RPC = 1 EXECUTE_READ_PLAN + 1 VALIDATE_AND_COMMIT):
+```
+type           n      rpc/tx stmt us/tx  helios(stage/compile/local)  種別
+GetAccessData  11101  2.1    1.0  146    rpc25+comp2+loc1             read-only(1 key)
+GetSubData     10677  2.0    1.0  138    rpc25+comp2+loc1             read-only(1 key)
+UpdLocation    4405   2.0    2.0  221    rpc29+comp2+loc2             1 read + 1 update
+GetNewDest     3087   2.0    1.0  180    rpc40+comp4+loc4             read-only(join)
+InsertCallFwd  2528   5.5    1.5  995    write 系
+```
+- helios 寄与は read 系で ~28us(stage_rpc_and_decode 25 + compile 2 + local 1)。残り ~110us は
+  MySQL parse/optimize/execute + JDBC 往復 + **VALIDATE_AND_COMMIT RPC**。
+- **★lever 候補★**: read-only tx が **commit RPC(VALIDATE_AND_COMMIT)を打っている**。TPC-H read は
+  `ro_novalidate_commit` で commit RPC 無しだったが OLTP では validate RPC が残る。**read-only かつ全読みを
+  1 EXECUTE_READ_PLAN で読み切った tx は単発アトミック読み → その timestamp で直列化可能で validation 不要**。
+  blanket ro_novalidate(無条件 validation 省略=並行下で危険)とは別の、**「single-shot read-only は
+  commit RPC をローカルで完結」**という SOUND 最適化が可能か commit パスで確認する(read-only TATP ~70% に効く)。
+
+## ② single-key read-only commit-skip(SOUND・実装)
+**機構**: read-only かつ全 read-set が単一 point read(`write/range/delta 無し + base_row_read_set ≤1`)の tx は、
+読んだ版を生成した write の直後に直列順序へ置けるため **並行下でも常に直列化可能** → OCC validation RPC を
+ローカル完結で省略。blanket ro_novalidate(無条件省略=並行下で危険)とは別物の、証明可能な単項目 read-only ケース。
+multi-key は server の plan 読みが stateless(snapshot 非アトミック)ゆえ cross-key 不整合の可能性があり除外、
+range は phantom 懸念で除外。gate `HELIOS_RO_SINGLEKEY_COMMIT`(default ON, =0 で OFF)。
+実装: `prefetch_validate_and_commit` に ro_novalidate fast path の直後で分岐追加。
+
+**効果(TATP T1 autogen)**: throughput **4483 → 4819.9 req/s(+7.5%)**, retry 0, errors 0。
+- GetSubData(1行 read-only): **2.0 → 1.0 RPC/tx**(skip 100%)= 単一行 read の理論値。
+- GetAccessData 2.1→1.5(skip 82%)、GetNewDest 2.0→1.6(skip 42%, join 単一キー時)。
+- 書き込み tx は skip 0%(正しく対象外)。md5 は TPC-H が multi-key+ro_novalidate で本 path 非該当=不変。

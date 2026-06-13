@@ -1631,6 +1631,35 @@ bool LineairDBTransaction::prefetch_validate_and_commit() {
     return true;
   }
 
+  // Single-key read-only fast path (Phase-20): a read-only transaction whose
+  // ENTIRE read-set is a single point read is serializable at its read
+  // timestamp regardless of concurrent writes — a one-item read-only
+  // transaction can always be placed in the serial order immediately after the
+  // write that produced the version it read, so OCC validation can only ever
+  // pass. There is nothing to install and nothing another transaction's
+  // validation depends on, so end locally with no commit RPC (halves the RPC
+  // count of single-row OLTP reads: TATP GetSubscriberData/GetAccessData).
+  // Soundness needs the read to be a single key: a multi-key read can observe
+  // an inconsistent cross-key state (the server's plan reads are stateless, not
+  // a snapshot), which only validation rules out; range reads are excluded for
+  // the phantom concern. This is NOT ro_novalidate (which blanket-skips
+  // validation for any read set and is unsafe under concurrency) — it is the
+  // provably-always-serializable single-item read-only case. Default ON;
+  // HELIOS_RO_SINGLEKEY_COMMIT=0 disables (off-switch / A-B).
+  static const char* sk_env = std::getenv("HELIOS_RO_SINGLEKEY_COMMIT");
+  static const bool single_key_ro_on = sk_env == nullptr || sk_env[0] != '0';
+  if (single_key_ro_on && !was_aborted && write_buffer_ops_.empty() &&
+      rowcount_deltas_.empty() && range_read_set_.empty() &&
+      base_row_read_set_.size() <= 1) {
+    if (rpc_trace_.active()) {
+      rpc_trace_.record_local_view("ro_singlekey_commit");
+      RpcTraceLogger::instance().log_line(rpc_trace_.finalize_jsonl(true));
+    }
+    lineairdb_proxy->set_current_trace(nullptr);
+    delete this;
+    return true;
+  }
+
   if (rpc_trace_.active()) {
     rpc_trace_.record_section_count("commit_base_rows",
                                     base_row_read_set_.size());
