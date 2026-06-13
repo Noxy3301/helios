@@ -3859,6 +3859,35 @@ enum_alter_inplace_result ha_lineairdb::check_if_supported_inplace_alter(
   return HA_ALTER_INPLACE_EXCLUSIVE_LOCK;
 }
 
+bool ha_lineairdb::backfill_commit_chunk(
+    std::vector<LineairDBProxy::BatchOp> &ops) {
+  if (ops.empty()) return true;
+
+  // Each chunk is its OWN transaction (NOT the ALTER statement's ctx->tx): the
+  // server's WriteSecondaryIndex does a per-write linear scan of the tx
+  // read_set_/write_set_ (transaction_impl.cpp:359-386), so accumulating all
+  // backfill rows in one transaction is O(rows^2). A fresh transaction per
+  // chunk bounds each scan to the chunk size -> O(rows * chunk). FENCE
+  // (== false) matches ctx->tx, so no per-chunk durability fence. Sequential
+  // synchronous commits keep correctness: non-unique PK-list adds merge-commute
+  // and a cross-chunk UNIQUE duplicate aborts against the persistent
+  // already-initialized index leaf.
+  auto *chunk_tx = new LineairDBTransaction(ha_thd(), get_proxy(),
+                                            lineairdb_hton, FENCE);
+  chunk_tx->set_prefetch_mode(false);
+  chunk_tx->begin_transaction();
+  chunk_tx->choose_table(db_table_name);
+  for (auto &op : ops) {
+    chunk_tx->buffer_write_secondary_index(op.table_name, op.index_name,
+                                           op.secondary_key, op.primary_key);
+    if (chunk_tx->is_aborted()) break;  // UNIQUE dup against committed data
+  }
+  ops.clear();
+  // end_transaction() flushes the buffer, runs the OCC commit, and deletes the
+  // transaction object (so chunk_tx must not be used afterwards).
+  return chunk_tx->end_transaction();
+}
+
 bool ha_lineairdb::inplace_alter_table(TABLE *altered_table [[maybe_unused]],
                                        Alter_inplace_info *ha_alter_info,
                                        const dd::Table *old_table_def
@@ -3876,14 +3905,33 @@ bool ha_lineairdb::inplace_alter_table(TABLE *altered_table [[maybe_unused]],
   // + the secondary-index write), so the backfilled keys are byte-identical to
   // a load-built index (zero encoding drift). ADD INDEX holds an EXCLUSIVE lock
   // (check_if_supported_inplace_alter), so the committed row set is invariant
-  // during the build and a single offline scan is correct. The buffered writes
-  // commit with the ALTER statement's transaction at DDL end; success is
-  // returned only after the full scan completes, so MySQL commits the index to
-  // its data dictionary (making it optimizer-visible) only when fully built.
-  // NOTE (first cut): validated at SF=0.1. At SF=1 the all-at-once scan
-  // (fetch_next_batch) and the single end-of-statement commit need chunking to
-  // avoid the 2GB framing / OCC write-set bloat (Step-2 follow-up).
-  static const uint64_t kBackfillFlushRows = 50000;
+  // during the build and a single offline scan is correct.
+  //
+  // The base-row SCAN runs in the ALTER statement's transaction (reads only;
+  // its commit validates those reads at DDL end). The SI WRITES are committed
+  // in independent kBackfillWriteChunkRows-sized transactions
+  // (backfill_commit_chunk) instead of the ALTER transaction, because the
+  // server's per-write WriteSecondaryIndex scan makes a single all-rows commit
+  // O(rows^2). Success is returned only after the whole scan + all chunk commits
+  // finish, so MySQL commits the index to its data dictionary (optimizer-visible)
+  // only when it is fully built; a failed chunk commit (e.g. a UNIQUE duplicate)
+  // fails the DDL and leaves the index invisible.
+  //
+  // The per-write WriteSecondaryIndex scan is O(distinct keys in the open chunk
+  // transaction), so a smaller write chunk keeps it small for high-cardinality
+  // (composite) indexes.
+  //
+  // NOTE: read-chunking (bounded PK ranges) was tried and removed. The scan
+  // response uses a flat binary codec with NO 2GB protobuf limit, and the
+  // server's unbounded-end Scan (transaction_impl.cpp:565) collects ALL
+  // remaining keys per call regardless of row_limit (row_limit caps only the
+  // returned rows, not the server-side key collection). So bounded reads added
+  // O(rows^2 / read_chunk) server work and did NOT bound server memory -- a
+  // single ordered full-table scan (O(rows) once) is both correct and faster.
+  // Bounding the server-side scan would need a true limited-scan path in
+  // LineairDB core (relax the line-565 early-stop to honor row_limit on an
+  // unbounded end); that is a separate optimization.
+  static const uint64_t kBackfillWriteChunkRows = 2000;
 
   for (uint i = 0; i < ha_alter_info->index_add_count; i++) {
     const uint buf_idx = ha_alter_info->index_add_buffer[i];
@@ -3917,40 +3965,49 @@ bool ha_lineairdb::inplace_alter_table(TABLE *altered_table [[maybe_unused]],
     // Step-3 co-requisite for safe re-CREATE on a dirty server.
     proxy->db_create_secondary_index(db_table_name, idx_name, index_type);
 
-    // Backfill from existing rows under the EXCLUSIVE lock.
-    auto tx = get_transaction(ha_thd());
-    if (tx->is_aborted()) return true;
-    if (rnd_init(true) != 0 || tx->is_aborted()) return true;
+    // Read the whole table in one ordered scan under the EXCLUSIVE lock through
+    // the ALTER transaction (reads only; its commit validates those reads at
+    // DDL end). For each row reconstruct the record and emit an SI write into
+    // the open write chunk; commit each kBackfillWriteChunkRows-sized chunk as
+    // its own transaction.
+    auto scan_tx = get_transaction(ha_thd());
+    if (scan_tx->is_aborted()) return true;
+    scan_tx->choose_table(db_table_name);
+    auto rows = scan_tx->get_matching_keys_and_values_from_prefix(std::string());
+    if (scan_tx->is_aborted()) return true;
 
     bool failed = false;
-    uint64_t n = 0;
-    int rc;
-    while ((rc = rnd_next(table->record[0])) == 0) {
-      const std::string pk = extract_key(table->record[0]);
-      const std::string sk = build_secondary_key_from_row(table->record[0], *new_key);
-      if (index_type == LDB_INDEX_UNIQUE) {
-        tx->flush_write_buffer();
-        tx->choose_table(db_table_name);
-        if (!tx->write_secondary_index(idx_name, sk, pk) || tx->is_aborted()) {
+    std::vector<LineairDBProxy::BatchOp> write_chunk;
+    write_chunk.reserve(kBackfillWriteChunkRows);
+    for (auto &kv : rows) {
+      if (kv.second.empty()) continue;  // tombstone (server already skips)
+      if (set_fields_from_lineairdb(
+              table->record[0],
+              reinterpret_cast<const std::byte *>(kv.second.data()),
+              kv.second.size()) != 0) {
+        failed = true;
+        break;
+      }
+      LineairDBProxy::BatchOp op;
+      op.type = LineairDBProxy::BatchOp::Type::SecondaryIndexWrite;
+      op.table_name = db_table_name;
+      op.index_name = idx_name;
+      op.primary_key = kv.first;  // stored PK == canonical extract_key output
+      op.secondary_key = build_secondary_key_from_row(table->record[0], *new_key);
+      write_chunk.push_back(std::move(op));
+      if (write_chunk.size() >= kBackfillWriteChunkRows) {
+        if (!backfill_commit_chunk(write_chunk)) {  // aborts (e.g. UNIQUE dup)
           failed = true;
           break;
         }
-      } else {
-        tx->buffer_write_secondary_index(db_table_name, idx_name, sk, pk);
       }
-      if ((++n % kBackfillFlushRows) == 0) tx->flush_write_buffer();
     }
-    rnd_end();
-    // Leave the scan state clean: the commit phase reuses this handler.
-    scanned_keys_.clear();
-    scanned_values_.clear();
-    scan_cache_.clear();
-    buffer_position_ = 0;
-    scan_exhausted_ = false;
-    last_fetched_primary_key_.clear();
+    // Free any blob memory set_fields_from_lineairdb allocated during the scan.
+    blobroot.Clear();
 
-    if (failed || rc != HA_ERR_END_OF_FILE || tx->is_aborted()) return true;
-    tx->flush_write_buffer();
+    if (failed || scan_tx->is_aborted()) return true;
+    // Commit the final partial chunk.
+    if (!backfill_commit_chunk(write_chunk)) return true;
   }
 
   return false;

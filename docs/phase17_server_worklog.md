@@ -1129,3 +1129,43 @@ exclusive-lock offline build(afterload は concurrent DML 無し)vs online build
 Silo single-version OCC 下の一貫性 / RPC flow / correctness 不変条件(全 committed 行が1回・phantom/dup 無し・
 secondary key 符号化が DML 経路と一致)/ test(CREATE INDEX 後の md5 vs InnoDB、count by col、load-built index 等価)。
 → 両調査を synthesis → 設計 dual review(GO まで)→ 実装 → 実装 dual review(GO まで)。
+
+## Step ② 設計(GO 済み, docs/phase21_create_index_backfill_design.md)
+A2 handler-driven backfill: `inplace_alter_table` が表を scan し各行 `build_secondary_key_from_row` +
+secondary-index write を**再利用**(符号化 drift ゼロ)。exclusive-lock offline build(afterload は並行 DML 無し)。
+FIX-1: KEY は `key_info_buffer`(0-based fieldnr)でなく **`altered_table->key_info` を index 名マッチ**で取得
+(encoder の 1-based 規約と整合、silent index 破壊回避)。設計 v1→v2→v2.1 で Codex+Claude dual-review GO。
+
+## Step ② 実装 first-cut(commit a5f0747): correct だが O(N²)
+SF0.1 で q21 md5 = ground-truth `d36a1caf...` 完全一致(FIX-1 含め正しい index 生成を実証)。**ただし CREATE INDEX
+14m57s/SF0.1**。真因 = 全 ~1.2M SI entry を**単一 OCC commit**で install、server `WriteSecondaryIndex`
+(transaction_impl.cpp:359-386)が書込ごとに read_set_/write_set_ を線形走査 = O(N²)。
+
+## Step ② chunk-COMMIT + read-chunking(本実装)
+- **chunk-COMMIT**: SI 書込を ALTER の statement tx でなく **独立 tx 群**で chunk(2000 行)ごとに
+  begin→buffer→end(commit)。各 tx の read_set_/write_set_ が chunk 内に限定 → 書込ごと走査 O(chunk)、
+  全体 O(rows×chunk)。helper `ha_lineairdb::backfill_commit_chunk`。FENCE(=false)で per-chunk fence なし。
+- **read-chunking**: 全行一括 fetch をやめ bounded PK-range scan(`get_matching_keys_and_values_in_range(cursor,
+  "",50000)`、cursor = last+`'\0'` で厳密後続)→ SF≥1 で全行を一括 materialize しない。set_fields_from_lineairdb で
+  行復元、PK は stored key kv.first を直接使用。
+- **correctness**: 逐次・独立 tx で load-built と等価。非 UNIQUE は同一 SI キー跨りが merge-commute(commit 時 delta
+  set-add)、UNIQUE 跨り重複は persistent leaf の IsInitialized() で abort。md5 で実証(下記)。
+- **perf(SF0.1)**: 14m57s → **l_sk 10.8s + l_sk_pk(複合)9.5s ≈ 20s**。複合は chunk 縮小で 22.9→9.5s。
+  q21 md5(backfilled)= `d36a1caf...` = ground-truth(回帰なし)。
+- **perf(SF1, 6M 行)**: l_sk **3m31s** / l_sk_pk(複合)**1m40s** / 計 ~5min。q21 md5(backfilled)=
+  ground-truth `49e5b76c...`(**SF1 でも回帰なし**)。O(N²) は解消(さもなくば数時間)。残差 = O(N×chunk) の write 走査
+  + **非 UNIQUE の PK-list cross-chunk 再 seed コスト**(suppkey ごと list が成長し chunk 跨ぎで ReadUnvalidated +
+  list コピー = ~O(list²))。後者ゆえ SF1 では low-distinct の l_sk(list 成長大)が複合 l_sk_pk より遅いという反転。
+  (read-chunking 撤去前は l_sk 4m31s/l_sk_pk 2m40s/計 ~7min → 撤去で ~5min。)
+- **dev は SF0.1(~20s)で回す方針**ゆえ backfill perf は dev には十分。SF1 は milestone のみ(one-time afterload、
+  数分=許容)。さらなる高速化は LineairDB core(WriteSecondaryIndex を hash-set lookup 化 + 非 UNIQUE PK-list を
+  append-only 化)= 将来の別 feature-branch 最適化。
+- **知見**: range/prefix scan 応答は flat binary codec で 2GB protobuf 制限外(read の 2GB 懸念は非該当、read-chunk の
+  効用は transient メモリ抑制)。chunk size 最適は index cardinality 依存(low-distinct は大・high-distinct は小)。
+  さらなる高速化が要れば LineairDB core の WriteSecondaryIndex を hash-set lookup 化が本筋(feature branch)。
+- **実装 dual-review = GO**: Claude(grounded, 実ファイル 59 tool-use 精読)= GO・correctness bug なし(C1 を
+  AddSecondaryIndexValue の sorted PK-list 冪等 dedup で補強、md5 が捕まえない UNIQUE/NULL/複合列順/空表/境界跨り
+  重複/中断も safe と実証)。Codex = CHANGES だが指摘の C1 UNIQUE+NULL / C4 失敗時 partial は chunk-COMMIT の回帰でなく
+  既存性質/既知 hazard(measured 非発火、Step ③ で対応)、C2/C5 は grounded が非 bug 裁定。grounded の MED(read-chunking
+  が server memory を bound せず O(N²/read_chunk) を足す)を受け **read-chunking を撤去・単一スキャンに**。
+  詳細 docs/phase21_create_index_backfill_design.md。**Step ② = GO**(SF0.1/SF1 とも md5 = ground-truth)。

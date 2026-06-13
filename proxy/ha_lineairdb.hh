@@ -624,6 +624,12 @@ private:
   std::string convert_key_to_ldbformat(const uchar *key, key_part_map keypart_map);
   std::string serialize_key_from_field(Field *field);
   std::string build_secondary_key_from_row(const uchar *row_buffer, const KEY &key_info);
+  // Phase-21 Step-2: commit one CREATE INDEX backfill chunk as an independent
+  // OCC transaction (separate from the ALTER statement's transaction) so the
+  // server's per-write WriteSecondaryIndex scan stays O(chunk) instead of
+  // O(rows). Clears `ops` on success; returns false if the chunk commit aborted
+  // (e.g. a cross-chunk UNIQUE duplicate).
+  bool backfill_commit_chunk(std::vector<LineairDBProxy::BatchOp> &ops);
   std::string extract_key(const uchar *buf);
   std::string autogenerate_key();
   std::string extract_key_from_mysql(const uchar *row_buffer);

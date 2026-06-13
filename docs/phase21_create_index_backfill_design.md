@@ -227,3 +227,124 @@ exclusive-lock offline + chunk-flush + 同期 gate、single-node first-cut。mul
   あわせて read 側(fetch_next_batch の全行一括)も chunk 化(SF1 で 2GB framing 回避)。
 - 次手: ① backfill を chunk-COMMIT 化(独立 tx)+ read chunk 化 → SF0.1 で perf 再計測(目標: 秒オーダー)→
   SF1 で md5 + perf → ② 実装 dual-review(GO まで)。correctness は first-cut で確認済みなので回帰させないこと。
+
+---
+
+# v2.2(chunk-COMMIT 設計 — O(N²) を grounding して独立 tx 群に分割)
+
+## O(N²) の正確な所在(コード裏取り)
+15min の真因は **commit の dedup でなく、書込ごとの per-write 線形走査**。`third_party/LineairDB/src/
+transaction_impl.cpp::WriteSecondaryIndex`(:320-423)は **1 write ごとに**:
+- `read_set_` を線形走査(:359-367, RMW 判定)
+- `write_set_` を線形走査(:370-386, UNIQUE 制約 + 同一キー merge)
+
+さらに非 UNIQUE は新規キーごとに `read_set_` に seed entry を積む(:388-409 `ReadUnvalidated`)。
+→ 1 tx に N 件貯めると read_set_/write_set_ が N まで成長し、各 write が O(N) 走査 = **O(N²)**。
+SF0.1 は index ごと ~600k 行 → 600k² ×2 索引 ≈ 7.2e11 比較 ≈ 15min。server-side(handleTxBatchWrite が
+flush RPC 受信時に WriteSecondaryIndex を呼ぶ)で発生し、proxy は待つだけ(user/sys≈0 と整合)。
+
+## 設計: 独立 tx 群で chunk-COMMIT
+ALTER の statement tx(`ctx->tx` = `get_transaction(thd)`)は **read 専用**(全件 scan は ctx->tx の read_set を
+作るが read validation は O(N) で支配項でない)。SI **書込は ctx->tx に貯めず、`kBackfillChunkRows` 行ごとに
+独立した別 tx で begin→buffer→end(commit)** する。
+- 各 chunk tx は `new LineairDBTransaction(thd, proxy, hton, FENCE)`(`#define FENCE false` = isFence=false,
+  ctx->tx と同条件・per-chunk db_fence なし)→ `set_prefetch_mode(false)` → `begin_transaction()`(server で
+  新 tx_id・`trans_register_ha` は同一 hton で冪等=無害)→ `choose_table` →
+  `buffer_write_secondary_index`(WRITE_BATCH_SIZE で自動 flush)→ `end_transaction()`(flush+`db_end_transaction`
+  +`delete this`)。
+- 効果: 各 chunk tx の read_set_/write_set_ は chunk 内に限定 → write ごと走査 O(chunk)、全体 **O(rows×chunk)**。
+  chunk=C, rows=N で N/C 倍高速化(C=5000, N=600k → 120x、15min→~7.5s 見込み)。
+
+## correctness 論証(逐次・独立 tx で load-built と等価)
+EXCLUSIVE lock 下・単一スレッド・**逐次** commit(`end_transaction` は同期 RPC、戻り時に Precommit/install 完了):
+1. **非 UNIQUE merge-commute**: 同一 SI キー K が chunk A(行 r1)と chunk B(行 r2)に跨る場合、A commit で leaf={r1}。
+   B は `GetOrInsertForWrite(K)` で既存 leaf を得(非 UNIQUE は initialized でも abort せず)、`ReadUnvalidated` で
+   現値 {r1} を seed → delta Add r2 を merge-install(:397 "set add commutes")→ leaf={r1,r2}。逐次なので順序非依存で
+   union 正しい。同一 chunk 内反復キーは write_set_ 走査(:370-386)が merge。
+2. **UNIQUE 跨り検出**: A commit で K の leaf が **initialized**。B の `WriteSecondaryIndex(K)` は
+   `index_leaf->IsInitialized() && IsUnique()` で **Abort**(:352)→ chunk tx commit=false → DDL を error 失敗
+   (index は DD 未 commit=不可視)。同一 chunk 内の重複は write_set_ 走査(:374)が Abort。→ 全件 UNIQUE 整合維持。
+   (本計測の l_sk/l_sk_pk は非 UNIQUE。)
+3. **ctx->tx(read)と chunk tx(write)の非干渉**: 別 tx_id・別キー空間(base PK vs SI)。chunk tx の Precommit は
+   自身の read_set(SI seed)のみ検証、ctx->tx の base-row read は SI 書込で不変 → 相互 abort なし。共有 proxy/socket は
+   単一スレッド逐次 RPC なので衝突なし。chunk commit が proxy の current_trace を null 化するが trace は非 correctness。
+4. → **不変条件 1-6(v1 §4)を維持**。md5 と「load-built vs backfilled 全件等価(列順違い composite 含む)」で実証必須。
+
+## read 側 chunk 化(SF1)
+`fetch_next_batch`(ha:2503)は `get_matching_keys_and_values_from_prefix("")` で **全行を 1 RPC** に載せる。SF1
+lineitem 6M 行 ×~150B ≈ 900MB を 1 protobuf に詰めると 2GB framing(memory helios-prefetch-flat-codec-2gb)/メモリ
+肥大の懸念。**backfill 専用の bounded PK-range scan ループ**(`get_matching_keys_and_values_in_range(cursor, "",
+LIMIT)` で cursor を進める)で read も chunk 化する。SF0.1(~600k 行 ~90MB)は 1 RPC で問題なく、write-fix の検証は
+先に SF0.1 で行い、read-chunk は SF1 robustness として続けて入れる。**hot path の汎用 `fetch_next_batch` は変更しない**
+(全 full-scan に波及するため)。
+
+## chunk サイズ
+初期 `kBackfillChunkRows = 5000`(O(N×C) と commit RPC 回数 N/C のトレードオフ中庸、SF0.1 で ~120 commits/index)。
+SF0.1 計測後にチューニング。
+
+## v2.2 結論
+write を独立 tx 群に分割(chunk-COMMIT)、read を bounded-range で chunk 化。correctness は逐次・独立 tx の
+merge-commute / persistent-leaf-UNIQUE で load-built と等価を維持。SF0.1 で perf(秒オーダー)+ md5 不変を確認 →
+SF1 → 実装 dual-review。
+
+## v2.2 SF0.1 検証結果(chunk=5000, 2026-06-14)
+chunk-COMMIT 実装(ha_lineairdb::backfill_commit_chunk + inplace_alter_table 書換)を build → SF0.1 で検証。
+- **correctness ✅**: q21 md5(backfilled)= `d36a1caf7da30bf792c4cbb7e9682823` = ground-truth。**回帰なし**
+  (chunk-COMMIT が単一 commit と同じ index を生成、name-match FIX-1 含め維持)。複合 l_sk_pk も生成。
+- **perf**: l_sk(単一列)**8.2s** / l_sk_pk(複合2列)**22.9s** / 計 ~31s。**14m57s → ~29x 高速化**。
+  user/sys≈0(server CPU = WriteSecondaryIndex の chunk 内 per-write 線形走査)。
+- **観察**: 複合 l_sk_pk が l_sk の ~3x。理由 = chunk 内の **distinct key 数**が支配項。l_sk は suppkey 単独で
+  SF0.1 では distinct ~1000 → chunk(5000)内で多数 merge され write_set_ は ~1000 止まり。l_sk_pk は
+  suppkey+partkey でほぼ全行 distinct → write_set_ が chunk まで成長 = O(chunk²)。→ **distinct が高い索引ほど
+  小さい chunk が有利**。SF1 は N が 10x なので O(N×C) が ~10x(l_sk_pk ~230s)に伸びる見込み → chunk 縮小 +
+  read-chunking が SF1 で必須。
+- 次手: chunk を 2000 に縮小 + read 側 chunk 化(bounded PK-range scan)→ SF0.1 再検証(md5 不変・perf 改善)→
+  SF1 で md5 + perf。
+
+## v2.2 SF0.1 再検証(read-chunk + write chunk=2000, 2026-06-14)
+read 側を bounded PK-range scan(`get_matching_keys_and_values_in_range(cursor,"",50000)`、cursor=last+`'\0'`
+で厳密後続)に置換 + write chunk を 2000 に縮小して再 build → SF0.1。
+- **correctness ✅**: q21 md5(backfilled)= `d36a1caf...` = ground-truth。**read-chunk 経路でも回帰なし**
+  (set_fields_from_lineairdb は active-index 非依存・DDL は projection 無効で full-row 復元、PK は stored key
+  kv.first を直接使用)。
+- **perf**: l_sk **10.8s** / l_sk_pk(複合)**9.5s** / 計 ~20s。
+  - 複合 22.9→**9.5s**(2.4x): high-distinct は chunk² が支配項なので chunk 縮小が効く。
+  - l_sk 8.2→**10.8s**(微増): distinct suppkey ~1000 が write_set 上限なので chunk 縮小で scan は減らず、commit 数
+    増(120→300)+ read RPC 分割(1→12)の overhead だけ乗る。→ **chunk サイズは index cardinality で最適が逆**
+    (low-distinct は大 chunk、high-distinct は小 chunk)。2000 は両者の中庸で SF0.1 合計最小。
+- **codec 知見**: range/prefix scan の応答は flat binary codec(send_protobuf_recv_binary/parse_binary_kv_response)
+  で **protobuf 2GB 制限の対象外**だった(設計が懸念した「2GB framing」は read には非該当)。read-chunk の効用は
+  transient メモリ抑制(SF1 で全行 ~1GB を一括 materialize しない)。
+- 観察: commit 1回 ~10ms(epoch group-commit, isFence=false でも)。SF1 は N が ~10x なので commit 数も ~10x、
+  commit latency が無視できなくなる可能性 → SF1 実測で確認。さらなる高速化が要るなら LineairDB core の
+  WriteSecondaryIndex を hash-set lookup 化(per-write O(1))が本筋(feature branch・別途 dual-review)。
+
+## v2.2 実装 dual-review(2026-06-14)
+Claude(grounded, 実ファイル 59 tool-use 精読)+ Codex(inline)を並列。
+- **Claude grounded = GO**(correctness bug なし)。8 facts + C1-C5 すべて file:line 付きで CONFIRMED。特に
+  **C1 を補強**: `AddSecondaryIndexValue`(data_item.hpp:176-184)は PK list を **sorted 保持・既存 PK は早期 return
+  =冪等** → 再読/chunk 跨りで PK 二重化は構造上不可能(cursor 論証の上にさらに backstop)。C2 cursor は `begin`
+  inclusive + `\0` 最小バイト=厳密後続で正(prefix-free 不要)。C3 SI 構造は primary index と disjoint で OCC 干渉なし。
+  C4 失敗→DDL 失敗→不可視。C5 benign。md5 が捕まえない全ケース(UNIQUE/NULL/複合列順/空表/境界跨り重複/中断)も safe。
+- **Codex = CHANGES-NEEDED** だが裁定の結果:C1 UNIQUE+NULL / C4 失敗時 partial SI は **chunk-COMMIT の回帰でなく
+  既存 LineairDB SI 性質 / 既知 FIX-4・FIX-5 hazard**。measured(非 UNIQUE・fresh-load 単一 CREATE)では非発火、
+  grounded reviewer も benign と確認。Step ③(DROP purge / clean-slate)で対応。C2/C5 は grounded が非 bug 裁定。
+  RAII leak は throw 時のみ(現状 throw 経路なし、既存 get_transaction も raw new)= LOW。
+- **MED(perf, grounded 指摘)→ read-chunking を撤去**: bounded read は (1) 応答 codec が flat binary で 2GB 制限外、
+  (2) server の unbounded-end Scan(transaction_impl.cpp:565)が chunk ごとに残り全 key を収集し row_limit は応答だけ
+  cap = **server memory を bound せず O(rows²/read_chunk) を足すだけ**、の二点で前提が崩れていた。→ **単一順序スキャン
+  (O(rows) 1回)に戻した**。write chunk-COMMIT(correctness の要・両者 GO)は不変、correctness surface は縮小、
+  cursor 論点は消滅。server 側スキャンの真の bounding は LineairDB core(:565 の early-stop を unbounded-end でも
+  row_limit 尊重)= 将来の最適化。
+- → write chunk-COMMIT は **GO**。read 単一スキャンへ戻して再 build → SF0.1/SF1 md5 + perf 再確認(下記)。
+
+## v2.2 最終(read-chunking 撤去後, 2026-06-14)
+single-scan read + write chunk-COMMIT(chunk=2000)で再 build → 検証。
+- **correctness ✅**: SF0.1 q21 md5 = `d36a1caf...` / SF1 q21 md5 = `49e5b76c...`、いずれも backfilled == ground-truth
+  (no-index)。read 撤去で回帰なし。
+- **perf**: SF0.1 l_sk 10.6s / l_sk_pk 9.0s(計 ~20s)。SF1 l_sk 3m31s / l_sk_pk 1m40s(計 ~5min、read-chunk 撤去で
+  ~7min から短縮)。14m57s(first-cut 単一 commit)比 SF0.1 ~45x。O(N²) 解消。
+- **Step ② 結論 = GO**。correctness 最優先を満たし、dual-review GO(grounded)、md5 両 SF 一致。残課題は (i) UNIQUE+NULL
+  の SQL 準拠(現状 LineairDB SI が NULL を unique 衝突扱い → TPC-H 標準索引は非 UNIQUE なので非該当、将来 UNIQUE 対応時に
+  encode-with-PK 等)、(ii) 失敗時/再 CREATE の clean-slate = Step ③ DROP purge、(iii) perf の core hash-set 化。
+  いずれも本 step の measured スコープ外で文書化済。
