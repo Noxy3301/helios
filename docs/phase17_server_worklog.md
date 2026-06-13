@@ -1229,9 +1229,20 @@ S(secondary 上で集約=blast radius 大)は不採用。→ 実装へ。
 {q1,q6,q15} → {q15} に縮小 = 21/22**。range bound を落としても pushed_filter_(exact WHERE)が制限するので正(tx_set_pushed_aggregate
 が exact serialization を要求、さもなくば Phase A fallback)。
 
-## Step ④ 実装 — F'(2): q15 inner-aggregate 経路(実装中)
-q15 は view `revenue0`(GROUP BY l_suppkey)= inner-aggregate(Phase16)。consume は override 内で stamped 時のみ
-`agg_next_raw`(primary 全スキャン)、未 stamp 時は phase-A で raw secondary scan を読み miss → 1235。inner-agg stamp
-(autogen:1404)も index_name.empty() 要求ゆえ secondary では未 stamp。→ 同型 F': inner-agg 登録表の secondary scan を
-primary 全スキャンに rewrite + **serialized_filter=reg->filter(inner WHERE 完全形)**を付与して stamp 成立させる
-(range bound を落とす分 reg->filter が制限)。reg->filter の完全性が correctness 前提。
+## Step ④ q15 — 真因は inner-agg でなく「MATERIALIZE 内 SI scan」の coverage バグ(別系統)
+当初 q15 を inner-aggregate 経路と仮定し F' を試作したが **revert**: trace で q15 の view(GROUP BY l_suppkey)は
+**"not a scalar unit"** で inner-aggregate に登録されない(Phase16 は scalar uncorrelated subquery 限定)→ inner-agg F' は
+無効。真因は **secondary-range scan の stage/consume coverage miss**(`Prefetch cache miss: secondary scan
+table=lineitem`、transaction.cc:929)。切り分け(SF0.1, prefetch ON, 全索引):
+- (a) view を **1回だけ** materialize(`SELECT * FROM revenue0`)→ **失敗**(cache miss)。∴ view 二重 materialize は無関係。
+- (b) 直接の l_sd range scan(view/agg 無し `SELECT ... WHERE l_shipdate range`)→ **成功**。∴ 基本 SI range prefetch は OK。
+- (c) grouped-agg over l_sd range を **standalone**(materialize せず)→ **成功**(F' が効く)。
+→ 真因は **MATERIALIZE→AGGREGATE subtree 内の SI(l_sd)range scan**。collect_qep_leaves は MATERIALIZE に降り
+(autogen:62-70)leaf を collect・compile_index_range_scan で staged するが、materialization 実行時の consume が staged
+secondary range を miss する(bounds/coverage mismatch、materialize-aggregate 文脈固有)。**q1/q6(agg-pushdown)とは
+別系統の deeper bug**。focused な「staged 範囲 vs materialize consume の secondary-range bounds」debug が要る。
+
+## Step ④ 現状
+- **q1/q6 = F' で修正済(commit 4be3801)。prefetch ON で 21/22 一致**(誤結果ゼロ、prefetch OFF は元々 22/22)。
+- **q15 = 残**: MATERIALIZE 内 SI scan の coverage バグ(上記)。inner-agg F' は revert 済(autogen clean)。次は q15 の
+  secondary-range materialize-consume を focused debug(dual-review 経て実装)。
