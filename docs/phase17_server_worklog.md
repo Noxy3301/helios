@@ -584,3 +584,47 @@ q11       0.21     0.14   1.50x  lose         q22       3.13     0.17  18.41x  l
 - 小クエリの負け(q2/q11/q16/q20 等)は disaggregation 固定費(RPC 往復)で 0.1-0.5s 帯、絶対影響小。
 - **結論: 現状は「互角」を warm 多 run で pin 完了。decisive 勝ちの唯一の鍵は q21**。
   次手は候補②(q21 filtered-existence server 集約 pushdown)に集中するのが最も費用対効果が高い。
+
+---
+
+## エントリ16: q21/q22 詳細 root-cause(EXPLAIN ANALYZE + RPC trace)(2026-06-13)
+
+候補①の地図(q21/q22 が最大の負け)を受け、両者の「なぜ InnoDB が速く helios が遅いか」を実測で確定。
+**結論: q21/q22 の遅さは plan 差でも per-probe 遅延でもなく、prefetch が driving scan の前に
+inner 作業集合を「全量・直列」で staging するコスト**。InnoDB は (a) scan と probe を pipeline し、
+(b) 存在述語を covering index で行 fetch 無しに解くため、この量を一切 materialize しない。
+
+### 計測根拠
+**q21(13.34s vs InnoDB 4.88s, 2.73x)**
+- EXPLAIN(TREE)は両者**構造完全一致**(join 順・EXISTS=semijoin・NOT EXISTS=antijoin・lineitem は
+  全て PRIMARY index lookup by l_orderkey)。cost 値だけ COST_V2 で ~6x 高め。plan 問題ではない。
+- EXPLAIN ANALYZE: InnoDB の `Table scan on orders` は first row 1.6ms(即パイプライン)。
+  helios は **first row 6559ms**(driving scan が出力を始めるまで 6.5s の空白)。空白後の per-probe は
+  l1 0.0028ms×729413 / supplier 0.0008ms×1.83M / l2 0.0027ms×75871 / l3 0.0021ms×73089 と
+  **InnoDB と同等**(prefetch cache 供給が B-tree 並み)。残り ~6.8s が join 本体。
+- RPC trace(`ENABLE_RPC_TRACE`): RPC 4本・resp 合計 **293.8MB**・転送 1.96s(1本が 293.77MB)。
+  6.5s 空白の内訳 ≈ 転送 2s + **proxy 側 293.8MB の decode/materialize ~4.5s**。
+  293.8MB ≈ lineitem 全6M行 projection(l_orderkey,l_suppkey,l_receiptdate,l_commitdate,l_linenumber)
+  + orders。**EXISTS/NOT EXISTS の存在判定に lineitem 行を丸ごと運んでいる**。
+
+**q22(3.13s vs InnoDB 0.17s, 18.4x)**
+- EXPLAIN ANALYZE: InnoDB は `Covering index lookup on orders using o_custkey`(index だけで存在判定・
+  行 fetch 無し)0.003ms×19000=55ms、全体 190ms。helios は非covering `Index lookup`、per-probe は
+  0.0078ms×19000 と速いが、**antijoin 外側 customer scan の first row が ~2429ms**(~2.3s 空白)。
+- RPC trace: RPC 2本・resp **100.3MB**・転送 0.78s ≈ orders 全体(1.5M)。
+  **NOT EXISTS の存在判定のために orders を全量 staging**(InnoDB は covering index で 0 materialize)。
+
+### 梃子(設計方向・未実装)
+- **q22(高 payoff・低リスク)**: orders 全量 staging を、存在する distinct o_custkey の
+  **membership set**(≈150k uint32 ≈ 600KB、100MB の ~166x 縮小)に置換し NOT EXISTS をローカル解決
+  =「membership-staging 契約」(worklog 候補③)。リスク: OCC validation に staged set の range/key を含める、
+  NULL/重複 custkey、GROUP BY 安定性。
+- **q21(高 payoff・中リスク)**: EXISTS(l2)/NOT EXISTS(l3) を **l_orderkey keyed の server 側
+  grouped existence summary**(q18 流)に push し、l2/l3 行 materialize を排除。l1 は実行に行が要るが
+  o_orderstatus='F' の orders に紐づく分へ staging を絞れるか検討。リスク: l_suppkey<>l1.l_suppkey の
+  self-exclusion、重複 orderkey、bit-exact。first-match 単独は antijoin が limit-1 超読みで不可(revert 済 f985be3)。
+- **汎用**: staging を実行と **overlap(stream/pipeline)** できれば直列 barrier を崩せ、q21/q22 以外にも効く
+  (固定費 disaggregation の本丸)。OCC・単一RPC staging モデルとの両立を要検討。Codex に inline 証拠で深掘り依頼中。
+
+注: この計測のため mysqld は `ENABLE_RPC_TRACE=1` 付きで再起動済み(trace 微小オーバーヘッド)。
+次の本計測前に trace 無しで再起動推奨。
