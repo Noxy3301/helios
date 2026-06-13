@@ -1424,12 +1424,18 @@ static void helios_try_register_gs(THD *thd, JOIN *join) {
     return;
   Item_field *fb = down_cast<Item_field *>(s1);
   Field *cfa = fa->field, *cfb = fb->field;
-  // Carrier feasibility: a, b DECIMAL scale 2, non-nullable, same table.
+  // Carrier feasibility: a, b DECIMAL scale 2, SIGNED, non-nullable, and the
+  // three roles pairwise DISTINCT (Codex P0-2: GROUP BY a / SUM(x*(1-x))
+  // would silently drop part of the synthetic assignment). b must be able to
+  // store values in [0, 2) (precision-scale >= 1).
+  if (cfa == cfb || cfa == gf || cfb == gf) return;
   if (cfa->is_nullable() || cfb->is_nullable()) return;
+  if (cfa->is_unsigned() || cfb->is_unsigned()) return;  // row2 may be -0.01
   if (cfa->type() != MYSQL_TYPE_NEWDECIMAL ||
       cfb->type() != MYSQL_TYPE_NEWDECIMAL || cfa->decimals() != 2 ||
       cfb->decimals() != 2)
     return;
+  if (cfb->field_length < 5) return;  // "1.00" must fit (prec-scale >= 1)
   // WHERE: exact serialization, then a TEMPLATE row that the actual WHERE
   // Item accepts (the synthetic rows must pass MySQL's re-evaluated FILTER).
   std::string filter_ser;
@@ -1467,6 +1473,31 @@ static void helios_try_register_gs(THD *thd, JOIN *join) {
                                std::string(sv->ptr(), sv->length()));
     }
   }
+  // The EXACT filter enumerates every WHERE column (serialize_item emits
+  // COLUMN_REF per field). Those columns must be DISJOINT from
+  // {group, a, b}: synthetic rows overwrite those three, so any WHERE atom
+  // touching them would be re-evaluated against fabricated values
+  // (Codex P0-1 — a '<' atom on l_discount was not catchable before).
+  // Disjointness also makes the template verification below an exact proof:
+  // every WHERE-referenced column holds the SAME bytes at verification time
+  // and at emission time.
+  if (!filter_ser.empty()) {
+    LineairDB::Protocol::PushedPredicate pred;
+    if (!pred.ParseFromString(filter_ser) || !pred.has_expr()) return;
+    std::vector<uint32_t> wcols;
+    std::function<void(const LineairDB::Protocol::FilterExpr &)> collect =
+        [&](const LineairDB::Protocol::FilterExpr &e) {
+          if (e.op() == LineairDB::Protocol::FilterExpr::COLUMN_REF)
+            wcols.push_back(e.column_index());
+          for (const auto &c : e.children()) collect(c);
+        };
+    collect(pred.expr());
+    for (uint32_t c : wcols) {
+      if (c == gf->field_index() || c == cfa->field_index() ||
+          c == cfb->field_index())
+        return;
+    }
+  }
   // read_set must be covered by {group, a, b, WHERE-candidate columns}.
   for (uint i = 0; i < t->s->fields; ++i) {
     if (!bitmap_is_set(t->read_set, i)) continue;
@@ -1485,12 +1516,15 @@ static void helios_try_register_gs(THD *thd, JOIN *join) {
   // record[0] (saved/restored) and evaluate the Item tree once.
   if (where != nullptr) {
     std::vector<uchar> saved(t->record[0], t->record[0] + t->s->rec_buff_length);
+    const enum_check_fields saved_check = thd->check_for_truncated_fields;
+    thd->check_for_truncated_fields = CHECK_FIELD_IGNORE;  // no warning spam
     my_bitmap_map *org = tmp_use_all_columns(t, t->write_set);
     for (auto &wc : where_cands)
       wc.first->store(wc.second.data(), wc.second.size(), &my_charset_bin);
     tmp_restore_column_map(t->write_set, org);
     const longlong pass = where->val_int();
     const bool was_null = where->null_value;
+    thd->check_for_truncated_fields = saved_check;
     memcpy(t->record[0], saved.data(), saved.size());
     if (thd->is_error() || was_null || pass == 0) return;
   }
@@ -2484,6 +2518,11 @@ int ha_lineairdb::gs_fill_buffers(LineairDBTransaction *tx) {
   };
   const uint nf = table->s->fields;
   std::vector<uchar> zero_nulls(table->s->null_bytes, 0);
+  // Synthetic rows get UNIQUE synthetic keys and a scan_cache_ entry so the
+  // position()/rnd_pos() rowid-reread contract holds (Codex P1-2): a sort or
+  // rowid materialization above this scan re-serves the synthetic row from
+  // scanned_values_, exactly like a normal cached scan. The keys never reach
+  // the server or the row cache (this scan is buffer-local).
   const auto emit_row = [&](const std::string &gkey, const std::string &a_str,
                             const std::string &b_str) {
     LineairDBField ldb;
@@ -2497,7 +2536,11 @@ int ha_lineairdb::gs_fill_buffers(LineairDBTransaction *tx) {
       ldb.set_lineairdb_field(src->c_str(), src->size());
       value += ldb.get_lineairdb_field();
     }
-    scanned_keys_.emplace_back();
+    std::string skey = "\x01gs:" + gkey + ":" +
+                       std::to_string(scanned_keys_.size());
+    const size_t idx = scanned_keys_.size();
+    scanned_keys_.push_back(skey);
+    scan_cache_[std::move(skey)] = idx;
     scanned_values_.emplace_back(
         reinterpret_cast<const std::byte *>(value.data()),
         reinterpret_cast<const std::byte *>(value.data()) + value.size());
@@ -2524,6 +2567,25 @@ int ha_lineairdb::gs_fill_buffers(LineairDBTransaction *tx) {
     dec_str.length(0);
     my_decimal2string(E_DEC_FATAL_ERROR, &S2, &dec_str);
     const std::string a1(dec_str.ptr(), dec_str.length());
+    // Carrier overflow fails CLOSED (Codex P1-1): a group sum whose integer
+    // digits exceed col_a's precision would be silently clipped by
+    // Field::store. col_a is DECIMAL(p,2): max integer digits = p - 2;
+    // a1 holds sign + digits + '.' + 2 frac digits.
+    {
+      size_t digits = 0;
+      for (char ch : a1) {
+        if (ch == '.') break;
+        if (ch >= '0' && ch <= '9') ++digits;
+      }
+      const uint max_int_digits =
+          table->field[reg->col_a]->field_length >= 5
+              ? static_cast<uint>(table->field[reg->col_a]->field_length) - 4
+              : 0;  // signed DECIMAL(p,2): field_length = p+2, int digits = p-2
+      if (digits > max_int_digits) {
+        my_error(ER_INTERNAL_ERROR, MYF(0), "helios gs carrier overflow");
+        return HA_ERR_INTERNAL_ERROR;
+      }
+    }
     emit_row(gkey, a1, "0.00");
     if (!my_decimal_is_zero(&r)) {
       my_decimal r100, hundred, one, b2;
