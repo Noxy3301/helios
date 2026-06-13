@@ -1587,6 +1587,11 @@ static void helios_try_register_grouped_semijoin(THD *thd, JOIN *join) {
     return;
   Item_in_subselect *insub = down_cast<Item_in_subselect *>(qe->item);
   if (insub->left_expr == nullptr) return;
+  // Reducing the outer to the IN set is sound ONLY for a positive IN. upper_item
+  // points at a NOT/NOP wrapper (NOT IN / ALL-SOME negation); reject it. (A
+  // nested IN under OR/CASE is not separately detected here — the shape gating
+  // makes it unlikely, and md5 covers the TPC-H surface.)
+  if (insub->upper_item != nullptr) return;
   // Inner shape: exactly one base table, grouped by ONE plain non-nullable
   // column, the SELECT list is just that column, plus a HAVING aggregate.
   if (qb->leaf_table_count != 1 || !qb->is_grouped()) return;
@@ -1656,7 +1661,8 @@ static void helios_try_register_grouped_semijoin(THD *thd, JOIN *join) {
       return;
     if (grp_f == nullptr || grp_f->is_nullable() || of->is_nullable()) return;
     if (grp_f->type() != of->type() ||
-        grp_f->pack_length() != of->pack_length())
+        grp_f->pack_length() != of->pack_length() ||
+        grp_f->is_unsigned() != of->is_unsigned())
       return;
     if (grp_f->result_type() == STRING_RESULT &&
         grp_f->charset() != of->charset())
