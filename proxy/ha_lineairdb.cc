@@ -3870,17 +3870,87 @@ bool ha_lineairdb::inplace_alter_table(TABLE *altered_table [[maybe_unused]],
   userThread = ha_thd();
   auto proxy = get_proxy();
 
+  // Phase-21 Step-2: CREATE INDEX backfill. The index is registered empty on
+  // the server, then populated from the existing rows by scanning the table and
+  // reusing the SAME canonical path the load uses (build_secondary_key_from_row
+  // + the secondary-index write), so the backfilled keys are byte-identical to
+  // a load-built index (zero encoding drift). ADD INDEX holds an EXCLUSIVE lock
+  // (check_if_supported_inplace_alter), so the committed row set is invariant
+  // during the build and a single offline scan is correct. The buffered writes
+  // commit with the ALTER statement's transaction at DDL end; success is
+  // returned only after the full scan completes, so MySQL commits the index to
+  // its data dictionary (making it optimizer-visible) only when fully built.
+  // NOTE (first cut): validated at SF=0.1. At SF=1 the all-at-once scan
+  // (fetch_next_batch) and the single end-of-statement commit need chunking to
+  // avoid the 2GB framing / OCC write-set bloat (Step-2 follow-up).
+  static const uint64_t kBackfillFlushRows = 50000;
+
   for (uint i = 0; i < ha_alter_info->index_add_count; i++) {
-    uint key_idx = ha_alter_info->index_add_buffer[i];
-    KEY *key_info = &ha_alter_info->key_info_buffer[key_idx];
+    const uint buf_idx = ha_alter_info->index_add_buffer[i];
+    const KEY *def_key = &ha_alter_info->key_info_buffer[buf_idx];
+    const std::string idx_name(def_key->name);
+    const uint index_type = (def_key->flags & HA_NOSAME) ? LDB_INDEX_UNIQUE : 0;
 
-    uint index_type = (key_info->flags & HA_NOSAME) ? LDB_INDEX_UNIQUE : 0;
+    // CRITICAL: key_info_buffer uses a 0-based KEY_PART_INFO::fieldnr, but
+    // build_secondary_key_from_row reads table->field[fieldnr - 1] (the 1-based
+    // runtime TABLE::key_info convention). Passing the buffer KEY as-is would
+    // read one column to the left and silently build a corrupt index. Resolve
+    // the runtime KEY by NAME from altered_table->key_info (as InnoDB does);
+    // index_add_buffer entries are offsets into key_info_buffer, NOT indices
+    // into altered_table->key_info.
+    const KEY *new_key = nullptr;
+    for (uint k = 0; k < altered_table->s->keys; k++) {
+      if (altered_table->key_info[k].name != nullptr &&
+          idx_name == altered_table->key_info[k].name) {
+        new_key = &altered_table->key_info[k];
+        break;
+      }
+    }
+    if (new_key == nullptr) {
+      // The added index must exist in the new table definition; refuse to build
+      // a wrong index rather than guess.
+      return true;
+    }
 
-    // In a disaggregated setup, another MySQL node may have already created
-    // this secondary index on the shared LineairDB server. Treat "already
-    // exists" as success — the MySQL-side metadata still needs to be updated.
-    proxy->db_create_secondary_index(
-        db_table_name, std::string(key_info->name), index_type);
+    // Register the (empty) index on the server. First cut assumes a fresh load
+    // (no pre-existing same-name index); a whole-index clear / DROP purge is a
+    // Step-3 co-requisite for safe re-CREATE on a dirty server.
+    proxy->db_create_secondary_index(db_table_name, idx_name, index_type);
+
+    // Backfill from existing rows under the EXCLUSIVE lock.
+    auto tx = get_transaction(ha_thd());
+    if (tx->is_aborted()) return true;
+    if (rnd_init(true) != 0 || tx->is_aborted()) return true;
+
+    bool failed = false;
+    uint64_t n = 0;
+    int rc;
+    while ((rc = rnd_next(table->record[0])) == 0) {
+      const std::string pk = extract_key(table->record[0]);
+      const std::string sk = build_secondary_key_from_row(table->record[0], *new_key);
+      if (index_type == LDB_INDEX_UNIQUE) {
+        tx->flush_write_buffer();
+        tx->choose_table(db_table_name);
+        if (!tx->write_secondary_index(idx_name, sk, pk) || tx->is_aborted()) {
+          failed = true;
+          break;
+        }
+      } else {
+        tx->buffer_write_secondary_index(db_table_name, idx_name, sk, pk);
+      }
+      if ((++n % kBackfillFlushRows) == 0) tx->flush_write_buffer();
+    }
+    rnd_end();
+    // Leave the scan state clean: the commit phase reuses this handler.
+    scanned_keys_.clear();
+    scanned_values_.clear();
+    scan_cache_.clear();
+    buffer_position_ = 0;
+    scan_exhausted_ = false;
+    last_fetched_primary_key_.clear();
+
+    if (failed || rc != HA_ERR_END_OF_FILE || tx->is_aborted()) return true;
+    tx->flush_write_buffer();
   }
 
   return false;

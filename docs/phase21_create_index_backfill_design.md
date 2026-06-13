@@ -208,3 +208,22 @@ index が ready になった時点でストレージの **DDL version が bump**
 ## v2.1 結論
 **GO**(上記 name-マッチ明記で Claude の唯一の must-fix 解消、Codex は既に GO)。Step ② = A2 handler-driven +
 exclusive-lock offline + chunk-flush + 同期 gate、single-node first-cut。multi-node 可視性は DDL-version-sync へ。
+
+---
+
+# Step② 実装 first-cut の SF0.1 検証結果(2026-06-14)
+
+実装(ha_lineairdb::inplace_alter_table の A2 handler-driven backfill, FIX-1 name-match 反映)を build → SF0.1 で検証。
+- **correctness ✅**: lineitem に l_sk/l_sk_pk が backfill で生成され、q21 が supplier 駆動(l_sk)plan に切替。
+  **q21 md5(backfilled)= ground-truth(index 無し)= `d36a1caf7da30bf792c4cbb7e9682823` 完全一致**。
+  → FIX-1(name-match で altered_table->key_info の 1-based KEY を使用)が効き、silent index 破壊なし。backfill は
+  正しい index を生成する、と実証。
+- **🔴 perf 致命的**: CREATE INDEX が **14m57s(SF0.1, ~600k 行 × 2 索引)**。user/sys≈0=全 server/RPC 待ち。
+  原因: 末尾の**単一 OCC commit で ~1.2M SI entry を一括 install**(known O(N²) commit dedup,
+  memory helios-oneshot-dedup-on2-perf)。
+- **結論**: FIX-2 の chunk-flush(1 tx 維持・commit は末尾1回)は **perf に不十分**。**chunk-COMMIT
+  (chunk ごとに独立 tx で begin→write→commit)が必須**。これは「ALTER の statement tx を途中で触らない」という
+  Claude の懸念と衝突するので、**backfill を ALTER の statement tx でなく自前の独立 tx 群で回す**設計に改める必要。
+  あわせて read 側(fetch_next_batch の全行一括)も chunk 化(SF1 で 2GB framing 回避)。
+- 次手: ① backfill を chunk-COMMIT 化(独立 tx)+ read chunk 化 → SF0.1 で perf 再計測(目標: 秒オーダー)→
+  SF1 で md5 + perf → ② 実装 dual-review(GO まで)。correctness は first-cut で確認済みなので回帰させないこと。
