@@ -543,3 +543,44 @@ context compact を挟むため現状を集約。**working tree クリーン・�
    超読みして abort(revert 済, commit f985be3)。consumer 側「membership-staging 契約」が本筋。
 4. q13(o_comment NOT LIKE が LEFT JOIN ON句で未 push)、小 point-read 群(disaggregation 固定費)。
 - goal の必達(suite < InnoDB)は C-state 込みで**ほぼ達成(互角)**。decisive な勝ちには q21 が鍵。
+
+---
+
+## エントリ15: TPC-H SF=1 warm 全22クエリ helios vs InnoDB 確定計測(2026-06-13)
+
+compact 後の最初の作業(次手候補①)。**C6 無効 + performance governor**下、helios と InnoDB を
+それぞれ warm-up + 2run の最小値で比較。md5 22/22 OK。
+
+### 計測条件
+- helios: TPC-H SF=1 リロード(server 再起動で TATP 残渣クリア → gates 付き mysqld → 並列 load 31.4s,
+  lineitem=6001215)。prefetch sysvar 2つ ON。port 3307。
+- InnoDB: 3308(16G buffer pool, disk 永続, lineitem=6001215, 再ロード不要)。
+- 各 warm-up 1回 + 計測 2回、per-query は 2run の min を採用(ノイズ低減)。
+- helios suite: r1=42.59 / r2=41.76s。InnoDB: r1=41.78 / r2=41.33s。
+
+### 結果(秒, 各クエリ 2run min)
+```
+query   helios   innodb   ratio  verdict      query   helios   innodb   ratio  verdict
+q1        0.77    10.22   0.08x  WIN          q12       0.55     2.41   0.23x  WIN
+q2        0.13     0.10   1.30x  lose         q13       5.80     3.96   1.46x  lose
+q3        1.20     1.21   0.99x  ~tie         q14       0.74     1.68   0.44x  WIN
+q4        0.59     0.61   0.97x  ~tie         q15       0.95     3.52   0.27x  WIN
+q5        0.99     0.94   1.05x  lose         q16       0.53     0.31   1.71x  lose
+q6        0.38     1.54   0.25x  WIN          q17       0.23     0.28   0.82x  WIN
+q7        1.42     0.90   1.58x  lose         q18       2.56     2.14   1.20x  lose
+q8        2.65     2.39   1.11x  lose         q19       0.11     0.15   0.73x  WIN
+q9        3.30     1.60   2.06x  lose         q20       0.40     0.25   1.60x  lose
+q10       1.69     1.60   1.06x  lose         q21      13.34     4.88   2.73x  lose
+q11       0.21     0.14   1.50x  lose         q22       3.13     0.17  18.41x  lose
+```
+- **suite: helios 41.67s vs InnoDB 41.00s = 1.016x(互角・誤差帯)**。
+- median per-query ratio = 1.083x。勝ち(<0.95x)=7 / tie=2 / 負け(>1.05x)=13。md5 22/22 OK。
+
+### 読み取り(decisive win への梃子)
+- **絶対損失は q21 が突出**: +8.46s(2.73x)。q21 を InnoDB 並み(4.88s)にできれば suite 33.2s →
+  対 InnoDB **0.81x の明確な勝ち**になる。**q21 が単独の天王山**(他を全部足しても q21 1本に及ばない)。
+- q22 は比率 18.41x と派手だが絶対は +2.96s。q9 +1.70s、q13 +1.84s が次点。
+- 勝ち筋は agg pushdown 系(q1 0.08x, q12 0.23x, q6 0.25x, q15 0.27x, q14 0.44x)。
+- 小クエリの負け(q2/q11/q16/q20 等)は disaggregation 固定費(RPC 往復)で 0.1-0.5s 帯、絶対影響小。
+- **結論: 現状は「互角」を warm 多 run で pin 完了。decisive 勝ちの唯一の鍵は q21**。
+  次手は候補②(q21 filtered-existence server 集約 pushdown)に集中するのが最も費用対効果が高い。
