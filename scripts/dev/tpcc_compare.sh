@@ -36,6 +36,10 @@ OUT="/tmp/tpcc_compare_${LABEL}.csv"
 PLUGIN_MTIME=$(stat -c %Y build/lib/plugin/ha_lineairdb_storage_engine.so 2>/dev/null || echo 0)
 SERVER_MTIME=$(stat -c %Y build/server/lineairdb-server 2>/dev/null || echo 0)
 
+# Warn if the CPU isn't pinned (deep C-states throttle single-terminal OLTP).
+source "$(dirname "${BASH_SOURCE[0]}")/cstate_guard.sh"
+cstate_guard
+
 restart_stack() {
   # STOP both, then START fresh — the only safe way to clear the in-mem server
   # before a load. Verify the new processes started after the last build.

@@ -472,3 +472,29 @@ T1 は単一クライアントの遅延律速。TPC-C 1tx ≈ 20–30 RPC 往復
   `cpupower idle-set -D 50`(or sysfs state3/disable=1)。AWS は大型/metal のみ可、
   恒久は GRUB `intel_idle.max_cstate=1 processor.max_cstate=1`。Graviton 不可。
 - 計測手順(tpcc_compare.sh 等)に C6 無効チェックを入れるべき。今後の SF=1 milestone も C-state 固定で。
+
+---
+
+## [2026-06-13] エントリ13: C6 無効での全面再計測(TPC-H/TATP/TPC-C × helios/InnoDB)
+
+ユーザ依頼で performance governor + C6 無効を前提に一式再計測。`scripts/dev/cstate_guard.sh`
+追加(governor!=performance or 深いC-state有効を warn)し sf1_milestone.sh / tpcc_compare.sh に組込。
+
+### 結果(C6 off, SF=1, T1)
+| ワークロード | helios (C6 on→off) | InnoDB (C6 on→off) | 備考 |
+|---|---|---|---|
+| **TPC-H suite** | 42.79 → **41.58s** | 41.29 → **42.98s** | md5 22/22 OK。ほぼ互角(ノイズ帯) |
+| **TPC-C T1 autogen** | ~104 → **390** | — | helios 3.7x |
+| **TPC-C T1 DSL** | ~115 → **440** | 56.9 → 70.9 | helios 3.8x / InnoDB ~1.25x |
+| **TATP T1** | 1462.9 → **5379** | — → 682.8 | helios 3.7x |
+
+### 結論(C6 効果の本質)
+- **latency 律速(OLTP T1: TPC-C/TATP)は C6 off で一律 ~3.7x**。単一端末は RPC 往復ごとに
+  CPU がアイドル→C6(170µs)で復帰遅延が積もるため。TPC-C 1tx≈20-30 RPC × 170µs ≈ 5-6ms/tx。
+- **CPU 律速(TPC-H 並列 scan)は C6 ほぼ無関係**(コアが常時ビジー)。helios 42.79→41.58 と微差。
+- **InnoDB OLTP は fsync 律速**なので C6 off でも微増(56.9→70.9)。helios(インメモリ・no fsync)が
+  3.7x 跳ねたのと対照的 → OLTP の helios>>InnoDB は大部分が durability 差。
+- **load も C6 off で高速化**: helios TPC-H load 86→30s、InnoDB TPC-H load 360→346s。
+- TPC-H suite は C6 込みでも **helios ≈ InnoDB(互角)**。この run では helios が 1.4s 前へ出たが
+  ノイズ帯内。**Phase17 退行なしの結論は不変**。
+- 計測環境の確定事項: **絶対値計測は C-state 固定(performance + idle-set -D 50)必須**。相対比較は不変。

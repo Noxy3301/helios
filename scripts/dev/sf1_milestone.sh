@@ -4,6 +4,11 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$ROOT"
 MYSQL="$ROOT/build/runtime_output_directory/mysql -u root --socket=/tmp/mysql.sock"
 
+# Warn if the CPU isn't pinned for low-latency benchmarking (deep C-states
+# throttle absolute numbers; see scripts/dev/cstate_guard.sh).
+source "$ROOT/scripts/dev/cstate_guard.sh"
+cstate_guard
+
 echo "=== [1/5] fresh helios stack ==="
 if [ -f /tmp/mysql.pid ]; then kill -9 "$(cat /tmp/mysql.pid)" 2>/dev/null || true; fi
 ./scripts/stop_server.sh || true
