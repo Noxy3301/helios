@@ -1346,6 +1346,15 @@ lock 下で構造実除去、re-create clean」で一致。
   ⑤composite l_sk_pk の create/drop/recreate→q21 OK ⑥idempotent DROP→q21 OK ⑦**全22クエリ 0 errors**(退行なし)。
   → **DROP INDEX が実際に index を解放し、re-CREATE が clean**。
 
+## Step ③ 実装 dual-review = GO
+**grounded(29 tool-use 実コード精読)= GO・blocking なし**: DropSecondaryIndex の exclusive-lock erase・masstree leak が
+memory-safe(RCU-free でない)・raw SI* は RPC 跨ぎ非 cache(GetSecondaryIndex 毎回再取得)・clean-slate は fresh index 構築・
+DROP は inplace_alter_table の2箇所のみ(DML 無影響)・per-tx scan cache を全 file:line で CONFIRM。4 失敗シナリオ精査で
+(i)(ii)(iii) SAFE・(iv) same-name modify は EXCLUSIVE MDL 単一ノードで benign。**Codex = CHANGES**: HIGH#1=multi-ADD 失敗の
+orphaned engine SI(correctness-safe=DD 非参照・将来 re-CREATE が掃除、だが cleaner にすべき)→ **fail-cleanup 追加**(本 ALTER で
+created した SI を失敗時に全 drop、`fail_alter` lambda)。HIGH#2=same-name modify 失敗窓は非トランザクショナル DDL の本質
+(temp-name staging 要)→ 文書化(rare・非 TPC-H)。→ **Step ③ GO**。
+
 ## Phase 21 lifecycle 完成
 **secondary-index lifecycle = build(② chunk-COMMIT backfill)→ use-correctly(④ prefetch×SI:q1/q6/q15)→ drop(③ purge)**
 を foundational に実装・全 dual-review GO・全検証 PASS。**性能 finding**(標準索引一式は helios 2x 退行、cost-model が本命)

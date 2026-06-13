@@ -3933,6 +3933,20 @@ bool ha_lineairdb::inplace_alter_table(TABLE *altered_table [[maybe_unused]],
   // unbounded end); that is a separate optimization.
   static const uint64_t kBackfillWriteChunkRows = 2000;
 
+  // On any add/backfill failure, drop the SIs this ALTER already created so the
+  // engine matches MySQL's data-dictionary rollback (which discards a failed
+  // ALTER's indexes) instead of keeping an orphaned, succeeded-then-rolled-back
+  // index. (A single-statement same-name modify DROP X|ADD X still loses the old
+  // X if the new X's backfill fails -- a non-transactional-DDL limit that needs
+  // temp-name staging to close; rare and not exercised by TPC-H. Codex Step-3
+  // impl-review HIGH-2, documented.) Codex Step-3 impl-review HIGH-1.
+  std::vector<std::string> created_this_alter;
+  auto fail_alter = [&]() {
+    for (const std::string &n : created_this_alter)
+      proxy->db_drop_secondary_index(db_table_name, n);
+    return true;
+  };
+
   for (uint i = 0; i < ha_alter_info->index_add_count; i++) {
     const uint buf_idx = ha_alter_info->index_add_buffer[i];
     const KEY *def_key = &ha_alter_info->key_info_buffer[buf_idx];
@@ -3957,7 +3971,7 @@ bool ha_lineairdb::inplace_alter_table(TABLE *altered_table [[maybe_unused]],
     if (new_key == nullptr) {
       // The added index must exist in the new table definition; refuse to build
       // a wrong index rather than guess.
-      return true;
+      return fail_alter();
     }
 
     // Phase-21 Step-3 (clean-slate / FIX-5): drop any pre-existing same-name
@@ -3970,6 +3984,7 @@ bool ha_lineairdb::inplace_alter_table(TABLE *altered_table [[maybe_unused]],
     // index missing on the engine (the Codex Step-3 review BLOCKER).
     proxy->db_drop_secondary_index(db_table_name, idx_name);
     proxy->db_create_secondary_index(db_table_name, idx_name, index_type);
+    created_this_alter.push_back(idx_name);
 
     // Read the whole table in one ordered scan under the EXCLUSIVE lock through
     // the ALTER transaction (reads only; its commit validates those reads at
@@ -3977,10 +3992,10 @@ bool ha_lineairdb::inplace_alter_table(TABLE *altered_table [[maybe_unused]],
     // the open write chunk; commit each kBackfillWriteChunkRows-sized chunk as
     // its own transaction.
     auto scan_tx = get_transaction(ha_thd());
-    if (scan_tx->is_aborted()) return true;
+    if (scan_tx->is_aborted()) return fail_alter();
     scan_tx->choose_table(db_table_name);
     auto rows = scan_tx->get_matching_keys_and_values_from_prefix(std::string());
-    if (scan_tx->is_aborted()) return true;
+    if (scan_tx->is_aborted()) return fail_alter();
 
     bool failed = false;
     std::vector<LineairDBProxy::BatchOp> write_chunk;
@@ -4011,9 +4026,9 @@ bool ha_lineairdb::inplace_alter_table(TABLE *altered_table [[maybe_unused]],
     // Free any blob memory set_fields_from_lineairdb allocated during the scan.
     blobroot.Clear();
 
-    if (failed || scan_tx->is_aborted()) return true;
+    if (failed || scan_tx->is_aborted()) return fail_alter();
     // Commit the final partial chunk.
-    if (!backfill_commit_chunk(write_chunk)) return true;
+    if (!backfill_commit_chunk(write_chunk)) return fail_alter();
   }
 
   // Phase-21 Step-3: process pure DROP INDEX (names dropped but NOT re-added) —
