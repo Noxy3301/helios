@@ -397,6 +397,20 @@ server 並列(HELIOS_PARALLEL_SERVER)依存のため**コア競合で重 join(q8
 InnoDB は単スレッドで 41.3s 安定。**専有環境でないと「suite < InnoDB」の最終判定は不可能**。
 本フェーズの構造改善(filtered_keys/q18)は競合非依存で堅牢に再現。次フェーズは専有環境 + q21/q22。
 
+### first-match(scan_limit=1)レバー: 試作 → 不採用(antijoin の超読みで abort)
+EXISTS/antijoin の inner probe は first-match(1行で十分)なので scan_limit=1 で staging 削減を狙い、
+**試作実装**(collect_first_match_inners で NESTED_LOOP_JOIN(ANTI/SEMI)の bare-REF inner をマーク →
+for_each step に scan_limit=1)。q21 の l2/l3 は `FILTER(l_suppkey<>...)→REF` で bare でないため
+正しく除外された(ガード機能)。
+- **実測**: q22 staged 1.5M→250k に激減(機構は動作)。だが **prefetch cache miss で abort(ERROR)**。
+  真因: MySQL の nested-loop **antijoin はマッチ後も index_next を呼び**、limit-1 で truncated と
+  マークされた範囲の先を読む → fail-closed abort。**first-match の素朴な仮定(マッチ後に読み止める)が
+  MySQL の antijoin 実装では崩れる**。
+- SEMI 限定にすれば q22(ANTI)は対象外で回帰しないが、q22 は改善しない。**不採用・revert**。
+  正しく効かせるには「truncated 範囲を antijoin が読んでも、それが limit を意図した step なら
+  END_OF_FILE を返して abort しない」consumer 側の対応が要る(=staging が membership を表す契約)。
+  これは proxy consumer の改修で、次フェーズ候補。
+
 
 
 
