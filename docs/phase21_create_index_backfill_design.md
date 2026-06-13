@@ -165,3 +165,46 @@ A2 handler-driven + exclusive-lock offline + 同期 gate を維持しつつ、**
 FIX-2(chunk 分割)・FIX-3(inited)・FIX-4(abort/定義先行)・FIX-5(clean-slate を ② co-req)** を反映。build 自体は
 「scan + canonical 経路で各行のキーを入れる」のままシンプル。heavy machinery(generation/online/ready 必須)は afterload
 単一ノードでは不要。再 review にかけて GO を確認する。
+
+---
+
+# v2.1(re-review GO 反映 + multi-node DDL-sync 接続)
+
+両 re-review: Codex=GO / Claude(grounded)=CHANGES-NEEDED(軽微1点)。以下を反映で **GO**。
+
+## must-fix(GO 条件): FIX-1 の KEY 特定を「index 名マッチ」に明記
+v2 手順3「`altered_table->key_info[]` の対応 KEY を取得」の **対応の取り方**が未記述だった。
+- `ha_alter_info->index_add_buffer[i]`(ha:3874)は **`key_info_buffer` への offset であって `altered_table->key_info[]`
+  の添字ではない**(sql_table.cc:11918-11919 のコメント)。`altered_table->key_info[index_add_buffer[i]]` と直接
+  添字すると別 index を指し得る(既存 index 混在 ALTER で顕在化)→ FIX-1 が潰した「静かな index 破壊」を別経路で再導入。
+- **正**: `key_info_buffer[index_add_buffer[i]].name` で `altered_table->key_info[0..s->keys]` を **name 走査して
+  マッチ**(InnoDB も name マッチ: handler0alter.cc:2688)。マッチした KEY は 1-based fieldnr(runtime 規約、
+  encoder と整合: table.cc:686 `fieldnr=field_index()+1`)。
+- 受け入れテスト 6.1 に「**複数 index 同時 ADD で 1 つが既存 index と隣接**」を1本追加(name マッチ欠落も捕捉)。
+
+## 実装 must-watch(GO 後)
+1. **FIX-2 chunk 境界は「tx end」でなく `flush_write_buffer`(buffered SI writes を RPC 送出)**。OCC tx の
+   commit/begin は ALTER 末尾の1回(`lineairdb_commit` ha:3506 が参照する `ctx->tx` ライフサイクルとの干渉回避)。
+   2GB framing 回避(chunk ごと送出)と tx 干渉回避を両立。UNIQUE は write_row 非 prefetch 経路(ha:2036, 即時
+   `write_secondary_index`)で chunk 内重複検出 → 失敗で error 返却(DDL 失敗・不可視)。
+2. abort 時に MySQL-DD 未コミットで rollback / engine 側 index 定義が restart・fresh-load を跨いで残らない。
+3. chunk 境界で scan cursor / handler `inited` が行 skip/重複を起こさない。EXCLUSIVE lock を**最後の chunk まで**保持。
+4. doc 参照訂正: prefetch DDL gate は `prefetch.cc:46` でなく **`proxy/ha_lineairdb.cc:482`**(sql_command!=SELECT→false)。
+
+## multi-node DDL-sync(本来の前提・本設計の visibility の最終形)
+Helios の本題は **複数 MySQL クエリ層 + 単一 fast storage で水平 scale**(~/helios CLAUDE.md: Strict
+Serializability/1SR 維持・read-intensive scale-out)。よって single-node 前提は first-cut の簡略化で、本来は **multi-node
+DDL 同期**が correctness の肝。既存方針(~/helios architecture.md:89「**Stats/DDL 同期を BEGIN/END レスポンス
+相乗り**」、stats は 2026-04-01 実装済・DDL は予定 / troubleshooting.md:27)+ user 提案の強化版:
+> **ストレージが DDL+version を保持。MySQL は全 RPC に自分の DDL 版を乗せる。版が古ければストレージが reject →
+> 現行 DDL を返す → MySQL が再適用してから retry。giant lock 不要・双方ステートレス風。**
+
+→ **本 backfill 設計で「後回し」とした server-side ready flag は、この DDL-version-sync に包含される**:
+index が ready になった時点でストレージの **DDL version が bump**、stale 版の他 MySQL ノードは reject されて resync し
+新 index(ready 済)を拾う。= per-index ready flag でなく **統一 DDL 版機構**で multi-node 可視性を担保。
+**Step ② first-cut は single-node の同期 gate で実装**し、**multi-node 可視性はこの DDL-version-sync(別 step / 将来)
+に乗せる**。backfill のサーバ状態(index 定義 + ready)は DDL version に紐付ける設計とする。
+
+## v2.1 結論
+**GO**(上記 name-マッチ明記で Claude の唯一の must-fix 解消、Codex は既に GO)。Step ② = A2 handler-driven +
+exclusive-lock offline + chunk-flush + 同期 gate、single-node first-cut。multi-node 可視性は DDL-version-sync へ。
