@@ -697,4 +697,24 @@ cycle 間・PRE/POST 間で一致するか)。
   2 つの view clone がそれぞれ 10,000 groups / 19,905 synthetic 行で serve。
 - 残: Codex レビュー送付。
 
+### [2026-06-13] エントリ27: GS Codex 修正 + 計測環境の汚染を特定(セッション締め)
+
+**GS Codex レビュー(NO-GO → 全件修正, commit 4274d13)**:
+- P0-1: WHERE が carrier 列(a/b)や group 列に触れるケースは検出不能だった
+  ('<' atom 等)→ **exact filter の protobuf を parse して COLUMN_REF を列挙**し
+  {group,a,b} と disjoint を要求(template 検証が厳密証明になる副効果)。
+- P0-2: group/a/b の pairwise distinct 必須(SUM(x*(1-x)) 等を reject)。
+- P1: carrier は signed 必須・b は [0,2) 格納可・a の整数桁あふれは emission で
+  fail-closed。P1: synthetic 行に一意 local key + scan_cache_ 登録で
+  position()/rnd_pos 契約を回復。P2: template 検証中の truncation warning 抑止。
+- 修正後: q15 1.42s MATCH、SF=1 md5 22/22。
+
+**計測環境の汚染(重要)**: 夕方以降、**同一コード・同一データで全処理が
+~40-50% 遅化**(load 29→46s、q18 22.7→33s、q12 7.2→10s)。bisect で GS 無関係を
+確認(pre-GS plugin でも 34s)、plan/stats/NDV も同一、guest は idle/メモリ潤沢。
+**ホスト側干渉(Windows プロセス/thermal/WSL 12日稼働)を強く示唆** — guest から
+観測不能。クリーン環境での確定値は v5 系: **suite 71.9s(InnoDB 75.4s)、
+q15 1.15s / q17 0.22s / q20 0.25s、md5 22/22**。次セッションの最初に
+`wsl --shutdown` 後の再計測を推奨(数値の確定はそれまで保留)。
+
 (以降追記)
