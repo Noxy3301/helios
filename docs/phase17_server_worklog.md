@@ -1295,3 +1295,18 @@ q8    2.74   8.69🔴   0.32          総計  39.14  77.19🔴  30.75
 - **含意**: 「afterload 標準構成と等価」= helios には **性能的に逆効果**(索引なし 39s の方が速い)。afterLoad の恒久 wiring
   (task 9)は**保留すべき**。方向性は (A) cost model 較正で索引在りでも full-scan plan を維持しつつ q21 だけ l_sk 活用 /
   (B) helios に効く索引のみ選択構築(l_sk 等)/ (C) Phase21 前提の再考。→ Codex 相談 + user 報告。
+
+## 追検証: l_sk-only(option B)と Codex 戦略 — cost model が本命と確定
+**l_sk-only(l_sk+l_sk_pk のみ, SF1)**: 総計 **40.76s**(noidx 39.14 / full 77.19)。q21 = **3.89s**(SIP 勝ち)だが
+**q15 = 0.99→10.10s 退行**(q15 も GROUP BY l_suppkey、l_sd 無しだと optimizer が l_sk を遅い形で使う。full-set では
+l_sd 経由 1.45s)。→ **q21 の節約が q15 の退行で相殺、net 横ばい**。**どの索引構成も cost model 抜きでは clean win に
+ならない**ことが確定(noidx が素で最速、index を入れると optimizer が必ずどこかで誤用)。
+**Codex 戦略相談**: (1) afterLoad 標準等価は disaggregated engine には誤った目標(noidx の方が速い)、(2) **主方向 = A:
+cost model 較正**(per-row-probe/NLJ の RPC コスト・prefetch amortization 喪失・outer×inner-probe を高く price、
+index は総 remote 行/bytes を大きく減らす時のみ選択)、B=選択索引は戦術橋渡し、C=full-set を default 計測構成にしない、
+(3) Spark/Presto/Snowflake も構造的に NLJ-point-lookup を回避(分散エンジンの定石)、(4) **secondary-index lifecycle は
+foundational で残すが full-set を default に wire しない、q21 は targeted index + cost-model nudge で取る**。
+→ **結論**: Phase21 の secondary-index lifecycle(②build/④use/③drop)は foundational として正しく実装(②④ 済・③ 残)。
+だが **afterLoad full-set の wiring(task 9)は実施しない**(2x 退行)。**full-set を net-positive にする本命 = cost-model
+較正(NLJ/probe 抑制)で別軸の follow-up**。q21 SIP 勝ちは data で実証済(12.96→3.89/4.06s)だが、cost-model 無しでは
+他クエリの誤用で相殺されるため、cost-model が q21 win を「単独で」活かす前提。
