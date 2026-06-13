@@ -1271,3 +1271,27 @@ Claude grounded(49 tool-use 実コード精読)= **GO**、Codex = CHANGES だが
 - FIX1(execute_read_plan, post-autogen)× FIX2(autogen GS-skip)は別機構・別段階で同一 step に co-fire しない。
 - 全 cache は per-tx member(statement 毎 clear)= cross-tx caching なし。ro_novalidate + SELECT ゲートで DML/TPC-C/TATP 無影響。1SR 保持。
 → **Step ④ correctness GO**(grounded 裁定)。残: 性能計測(下記)+ OLTP 退行確認。
+
+## 🔴 性能計測(SF1, prefetch ON, cstate pinned) — 標準索引一式は helios を 2x 遅くする
+user 指摘で実測(これまで md5 のみだった抜け)。helios 索引なし vs 標準23索引 vs InnoDB23索引(per-query 秒):
+```
+q     noidx  fullidx  innodb        q     noidx  fullidx  innodb
+q1    0.80   0.79     10.28         q12   0.57   1.34     2.38
+q3    1.19   5.58🔴   1.14          q13   5.57   5.53     3.58
+q5    0.99   3.49🔴   0.92          q15   0.99   1.45     1.10
+q6    0.39   0.39     1.54          q18   2.44   24.25🔴  2.17
+q7    1.40   12.73🔴  1.31          q21   12.96  4.06✅   1.15
+q8    2.74   8.69🔴   0.32          総計  39.14  77.19🔴  30.75
+```
+- **q21 = SIP で改善 12.96→4.06s**✅(Phase21 の主目的・l_sk)。**q1/q6 = F' で非退行**✅。
+- **だが標準索引一式で helios 総計 39→77s(~2x 退行)**。q18 が 2.4→24.25s(Phase17 GroupedSemijoin 勝ちが消失)、
+  q7 1.4→12.7s、q8 2.7→8.7s、q3/q5 も大退行。
+- **EXPLAIN 確認**: 索引があると optimizer が **index-nested-loop plan** を選ぶ(q18=Index scan l_ok + Materialize-NLJ、
+  q7=5段 NLJ + per-row PRIMARY index lookup)。InnoDB は buffer-pool で安い(30.75s)が、helios は disaggregated RPC で
+  per-row probe が激高 → prefetch staging でも full-scan+hash+pushdown に大敗。
+- **真因 = cost model が disaggregation の per-row-probe/NLJ コストを過小評価**(COST_V2 でも不足)。helios の強みは
+  full-scan+prefetch+hash+pushdown。標準索引(InnoDB の point-lookup 向け)は optimizer を NLJ に誘導し helios に逆効果。
+  q21 だけは l_sk で lineitem touch を減らす SIP が disaggregation でも勝つ例外。
+- **含意**: 「afterload 標準構成と等価」= helios には **性能的に逆効果**(索引なし 39s の方が速い)。afterLoad の恒久 wiring
+  (task 9)は**保留すべき**。方向性は (A) cost model 較正で索引在りでも full-scan plan を維持しつつ q21 だけ l_sk 活用 /
+  (B) helios に効く索引のみ選択構築(l_sk 等)/ (C) Phase21 前提の再考。→ Codex 相談 + user 報告。
