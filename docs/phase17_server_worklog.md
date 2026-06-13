@@ -1310,3 +1310,14 @@ foundational で残すが full-set を default に wire しない、q21 は targ
 だが **afterLoad full-set の wiring(task 9)は実施しない**(2x 退行)。**full-set を net-positive にする本命 = cost-model
 較正(NLJ/probe 抑制)で別軸の follow-up**。q21 SIP 勝ちは data で実証済(12.96→3.89/4.06s)だが、cost-model 無しでは
 他クエリの誤用で相殺されるため、cost-model が q21 win を「単独で」活かす前提。
+
+## Step ④ OLTP 退行チェック = clean
+TPC-C T1(prefetch-stmt, SF? load, terminals=1, C6-off): run2 388 / run3 381(run1 332=warmup)、median ~385。
+健全範囲(~390)内 = **退行なし**。Step ④ の変更(execute_read_plan の agg rewrite, autogen GS-skip guard)は
+read-only prefetch SELECT 経路のみで DML 非関与 — 実測でも確認。→ **Step ④ 完了**(correctness dual-review GO + OLTP clean)。
+
+## Phase 21 残: Step ③ DROP purge(lifecycle 最後)
+現 DROP INDEX は no-op(ha:3846)。server に DropSecondaryIndex 無し(table.h は Create/Get のみ、secondary_index.h は
+per-key Delete のみ)。whole-index clear/drop primitive(LineairDB-core, feature branch)+ proxy db_drop_secondary_index
+RPC + DROP_INDEX wire が必要。afterLoad full-set を wire しない方針ゆえ re-CREATE robustness の駆動力は低いが、DROP INDEX は
+foundational DBMS capability ゆえ lifecycle 完成として実装。process: 既存系調査 → 設計 → dual-review → 実装 → dual-review。
