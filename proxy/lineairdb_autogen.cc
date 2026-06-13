@@ -938,13 +938,22 @@ static bool compile_tree_leaves(
   collect_qep_leaves(root, &leaves, &ok, unsupported);
 
   // Phase-18 membership-staging (q22): tables whose only role is an anti-join
-  // existence probe with no executor-side residual. Default ON (md5 22/22 +
-  // suite win + OLTP no-regression validated, Phase-18/19); HELIOS_Q22_MEMBERSHIP=0
+  // existence probe with no executor-side residual. Default ON gate; HELIOS_Q22_MEMBERSHIP=0
   // disables (off-switch / A-B).
+  //
+  // REQUIRES ro_novalidate (allow_filter_pushdown == tx->ro_novalidate()): the
+  // existence cap ships ONE row per probe, an INCOMPLETE secondary-range result.
+  // Under commit-time validation, validate_secondary_key_list re-scans the full
+  // range and demands an exact key-list match, so the capped staging would
+  // DETERMINISTICALLY mismatch and abort (livelock) — exactly why pushed filters
+  // and projection are also ro_novalidate-gated (a replay cannot reproduce a
+  // reduced result set). Gating here scopes existence_only to the no-validate
+  // read path where the reduction is sound. (Review: Phase-18 Claude found the
+  // deterministic-abort bug when this was unconditionally default-on.)
   static const char *q22_env = std::getenv("HELIOS_Q22_MEMBERSHIP");
   static const bool q22_membership_on = q22_env == nullptr || q22_env[0] != '0';
   std::unordered_set<const TABLE *> existence_only_inners;
-  if (q22_membership_on) {
+  if (q22_membership_on && allow_filter_pushdown) {
     collect_existence_only_antijoin_inners(root, &existence_only_inners);
   }
   if (!ok) {

@@ -845,7 +845,12 @@ q21(13.34s vs InnoDB 4.88s, +8.46s)の梃子を精査。**安価な最適化は�
 ### なぜ各 lever が塞がっているか
 - **SAUDI-supplier の SIP/predicate-transfer(lineitem を l_suppkey∈SAUDI で枝刈り)= 不可**:
   semijoin reduction は **probe 表の KEY** で枝刈りするが、lineitem(l1)は **l_orderkey で probe**
-  (orders 駆動)、l_suppkey は VALUE 列で probe key でない。lineitem に l_suppkey 二次索引も無い。
+  (orders 駆動)、l_suppkey は VALUE 列で probe key でない。
+  【訂正(Phase18-20 review, Claude grounded)】「lineitem に l_suppkey 二次索引も無い」は**事実誤認**:
+  `third_party/benchbase/.../tpch/postload-mysql.sql:24` に `CREATE INDEX l_sk ON lineitem(l_suppkey)` が
+  **実在**。ただし計測 config `bench/config/tpch.xml` が `<afterload>` を wire しないため計測では作られない
+  だけ。→ **afterload を有効化すれば l_suppkey 二次索引が実体化し、supplier-set を l_suppkey で probe する
+  SIP が未検討 lever として開く**(要: InnoDB 側との公平性 + LineairDB 二次索引 scan コストの実測)。
   加えて supplier の選択性は nation 経由(`n_name='SAUDI ARABIA'`)で **supplier 単一表述語でない** →
   semijoin source 条件(選択的単一表述語)も不成立。よって既存 semijoin で lineitem は枝刈りされず 2.9M のまま。
 - **l1 date filter(`l_receiptdate>l_commitdate`)の push = 不可**: lineitem は **SharedScan で l1/l2/l3 が
@@ -989,5 +994,46 @@ UpdSubData     631    2.4    214   0%     -
 ```
 → OLTP write 経路の coverage gap は無く、write tx も prefetch で 2-3 RPC(必要最小)。**TATP は全 tx で
 near-ideal**。read は single-key RO skip で 1 RPC(理論床)、write は plan+commit の最小構成。
-**Phase 20 の安全な伸びしろは概ね掘り切った**(残るのは multi-key read-only の commit-skip だが
-single-version OCC では snapshot 読み不可ゆえ validation 必須 = 実装不可、と確定)。
+**Phase 20 の安全な伸びしろは概ね掘り切った**(残るのは multi-key read-only の commit-skip)。
+【訂正(Phase18-20 review 両者一致)】「実装不可」は不正確: multi-key read-only **自体は通常 validation で
+完全サポート済み・正当**。局所証明できないのは **commit RPC の省略(skip)**だけで、現 stateless plan reads が
+一貫 snapshot でないため。server 側に一貫 snapshot read API を足せば multi-key RO の skip も将来可能 →
+「RPC 省略が局所証明不可」が正確で「実装不可」ではない。
+
+---
+
+## エントリ: Phase 18-20 deep review(Codex×3 + Claude×3, per-phase)+ 修正(2026-06-14)
+user 依頼で直近 Phase を Codex と Claude 双方に厳密 adversarial review させた。Codex 3件は sandbox
+(bwrap loopback)でファイル読込不可=inline 推論のみ、Claude 3件は実コード精読(grounded)。
+
+### 確定した実バグと修正 🔴
+**existence_only(q22)が default-ON × `ro_novalidate` OFF で確定 abort/livelock**(Phase18 Claude grounded 発見)。
+existence_only は probe あたり1行の **incomplete secondary-range** を read-set に積むが、commit-time
+`validate_secondary_key_list`(LineairDB commit.cpp:371-435)が全範囲再scan+完全一致を要求するため、
+ro_novalidate OFF では確定不一致 → abort → 同一プランで livelock。md5 22/22 が通っていたのは計測 env が
+ro_novalidate ON だったため(abort 方向で誤コミットではない)。
+**修正(commit 後述)**: existence_only を `allow_filter_pushdown`(== `tx->ro_novalidate()`)でゲート。
+filter/projection pushdown が同じ理由(reduced 結果は replay 不能)で既に ro_novalidate-gated なのと同一設計。
+**検証**: prefetch ON + ro_novalidate OFF で q22 が **完走(7行・abort 無し)**、ro_novalidate ON で q22
+~0.95s(existence_only 継続)+ **md5 22/22 OK**。
+
+### 残す hardening 項目 🟡
+- **Codex(Phase18)の residual gap(未検証)**: `qep_leaf_info(REF)=true` は FILTER ノード不在を見るだけで、
+  REF に付随する residual(attached condition / ICP)が leaf 外で再評価されるケースを排除しきれない可能性
+  (server first row を MySQL が reject → outer 誤残し = silent 誤り)。Claude grounded では TPC-H 実プランの
+  residual は必ず FILTER 化(q21 で確認)= qep_leaf_info で除外され、md5 22/22 で実害なしを確認。任意クエリでの
+  一般保証は未証明 → **hardening: anti-join inner に executor 側 residual / pushed_idx_cond が無いことの明示
+  チェックを追加検討**(現状は ro_novalidate 限定 + FILTER-residual 前提で TPC-H 健全)。
+- **q21 SIP**: l_suppkey 二次索引は postload DDL に実在(afterload 有効化で lever 化)。上の q21 訂正参照。
+- **multi-key RO commit-skip**: server snapshot read API で将来可能。上の Phase20 訂正参照。
+
+### review が SOUND 確認した主点(対応不要)
+- single-key RO commit-skip: guard 述語が読み面を真に1キーに拘束(全 read 経路が base/range read-set に登録、
+  すり抜け不可)、LineairDB read-only set は無ロック・無 install で他 tx 非依存。Claude grounded で反例構築不能。
+- existence_only core: NestedLoop/BKA ANTI は inner 1行で打ち切り列を読まない(MySQL executor 意味論一致)、
+  NOT IN の NULL 反転は ANTI 変換自体が拒否され除外、residual(FILTER)検出は健全。
+- prewarm: EXPLAIN が cold path で info() 発火 → stats RPC を測定外へ。caveat=TDC 安定前提(FLUSH/DDL/ANALYZE で seed 失効)。
+- value-less existence 不可は正(proto に per-row found 無し)。q22/q21 の floor/lever 結論は「現実装制約下で」の限定付きで妥当。
+
+### hygiene
+`.cache/clangd/index/*`(数千ファイル)が過去 `git add -A` で混入していた。`.gitignore` に `.cache/` 追加。

@@ -33,3 +33,5 @@ __pycache__/
 
 data_innodb/
 data_innodb01/
+# clangd index cache (was accidentally committed via git add -A)
+.cache/
