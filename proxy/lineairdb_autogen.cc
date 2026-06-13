@@ -1292,7 +1292,15 @@ bool autogen_read_plan_from_qep(
     std::vector<std::vector<TABLE *>> kept_aliases;
     bool any_drop = false;
     for (size_t i = 0; i < steps.size(); ++i) {
+      // index_name.empty(): GS synthetic rows are served ONLY on the full-scan
+      // path (rnd_init -> gs_fill_buffers, and index_read_map only when key ==
+      // nullptr). A keyed SECONDARY index range scan (e.g. q15's view body over
+      // l_sd) never takes the GS branch, so dropping its staged step leaves the
+      // keyed index_read with nothing to consume -> prefetch cache miss. Keep
+      // secondary scan steps staged; the normal scan serves them and MySQL
+      // aggregates the rows itself (correct, just no GS optimization).
       bool drop = steps[i].is_scan && !steps[i].for_each &&
+                  steps[i].index_name.empty() &&
                   steps[i].scan_limit == 0 && !referenced[i] &&
                   i < step_aliases.size() && !step_aliases[i].empty() &&
                   steps[i].semijoins.empty();

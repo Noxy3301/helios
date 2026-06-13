@@ -1242,7 +1242,20 @@ table=lineitem`、transaction.cc:929)。切り分け(SF0.1, prefetch ON, 全索�
 secondary range を miss する(bounds/coverage mismatch、materialize-aggregate 文脈固有)。**q1/q6(agg-pushdown)とは
 別系統の deeper bug**。focused な「staged 範囲 vs materialize consume の secondary-range bounds」debug が要る。
 
-## Step ④ 現状
-- **q1/q6 = F' で修正済(commit 4be3801)。prefetch ON で 21/22 一致**(誤結果ゼロ、prefetch OFF は元々 22/22)。
-- **q15 = 残**: MATERIALIZE 内 SI scan の coverage バグ(上記)。inner-agg F' は revert 済(autogen clean)。次は q15 の
-  secondary-range materialize-consume を focused debug(dual-review 経て実装)。
+## Step ④ q15 真因確定 + 修正(GS-skip guard)
+focused trace(HELIOS_Q15_DEBUG 計装→除去済)で確定: q15 の view body は **GroupedSummary(GS, Phase16)に登録**され、
+autogen 後段の **GS-skip pass(autogen:1291)が GS 登録表の scan step を drop**(handler が gs_fill_buffers で synthetic
+group rows を供給する前提)。だが GS 供給は **full-scan 経路のみ**(rnd_init→gs_fill_buffers / index_read_map は key==nullptr
+時のみ)。l_sd 索引があると optimizer は **keyed secondary index_read** を使い GS 経路を通らない → drop された step を
+raw SI scan で consume し miss(`secondary_scan_cache_ 0 entries`)。トレース順: main compile が l_sd を PUSH(steps=1)→
+GS-skip が drop(steps=0)→ consume miss。
+**修正**: GS-skip drop 条件に **`index_name.empty()` を追加**(autogen:1311)= **primary full-scan step のみ GS-skip**、
+secondary scan は staged 維持 → keyed index_read が hit、MySQL がローカル集約(GS 最適化なしだが correct)。q18 等の GS は
+primary scan(index_name 空)なので不変。q1/q6 の F' と同クラス(prefetch 最適化が full-scan consume を仮定、SI で
+index_read になり破綻)。
+
+## Step ④ 完了(correctness)
+- **TPC-H 全 suite が prefetch ON + 標準23索引で 22/22 一致**(helios 自己整合 baseline vs full-index, ALL 22 IDENTICAL)。
+  q1/q6=F'(commit 4be3801)、q15=GS-skip guard。誤結果ゼロ。
+- **⚠ 性能(latency)は未計測**: ここまで correctness(md5)のみ。Goal の「suite 再計測(q21 改善・q1/q6 非退行)」が未達。
+  → SF1 + cstate guard + 標準索引で suite 性能を実測する(次)。
