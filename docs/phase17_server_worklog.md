@@ -960,3 +960,15 @@ UpdLocation(read+UPDATE)は begin/end 無しで prefetch 完走(2 RPC)なので�
 **削った無駄**: read-only single-key tx の OCC validation RPC(SOUND, +10.8% TATP)。
 **残る無駄(将来)**: InsertCallFwd 系 write tx の stateful fallback、multi-key read-only の commit-skip
 (server 側 snapshot 読みが必要)、per-RPC 固定費 ~24.5us(ほぼ床)。
+
+### helios vs InnoDB TATP T1(near-theoretical 検証, 確定)
+| 構成 | req/s | 備考 |
+|---|---|---|
+| InnoDB durable(default, commit毎 fsync) | 750 | fsync 律速(本番現実の durable 比較) |
+| helios in-mem(single-key RO skip 後) | 5960 | **durable InnoDB の 8x** |
+| InnoDB 非durable(flush_log=2, doublewrite=0) | 9812 | ローカル・公平な床 |
+
+**結論**: helios TATP read は **1 RPC = disaggregation の理論最小**(リモート行取得に最低 1 RPC は必須)。
+非durable InnoDB との ~39% 差(168us vs 102us/tx)は「read ごと 1 RPC」の**不可避な disaggregation 税**で
+無駄ではない。durable InnoDB には 8x 勝つ(インメモリ優位)。→ **OLTP read の prefetch は理論値に到達**。
+InnoDB 3310(TATP, data_3310)は計測後 down。3308(TPC-H ref)は不変。
