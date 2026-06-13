@@ -628,3 +628,70 @@ inner 作業集合を「全量・直列」で staging するコスト**。InnoDB
 
 注: この計測のため mysqld は `ENABLE_RPC_TRACE=1` 付きで再起動済み(trace 微小オーバーヘッド)。
 次の本計測前に trace 無しで再起動推奨。
+
+---
+
+## エントリ17: q21/q22 設計統合(自己調査 + Codex deep research)(2026-06-13)
+
+### RPC 本数の疑義 → 解消(prefetch は正常)
+trace の「q21=4本/q22=2本」は prefetch 失敗ではない。バルク転送は両者とも **1本の
+`TX_EXECUTE_READ_PLAN`** に集約済み(q21=293.8MB/4表, q22=100.3MB/2表)。残りの小 RPC は
+`TX_GET_TABLE_STATS`(=33, cost model の行数/NDV、HELIOS_OPT_STATS/COST_V2 由来、各 ~238B/数十µs)。
+`rpc_trace.cc` の type_to_string が 32 までしか case を持たず 33 を `UNDEFINED` 表示していただけ
+(**1行の cosmetic ラベル漏れ**)。q22 commit は `ro_novalidate_commit:1` で validate/commit RPC 無し。
+→ 本数は無問題。コストは「staging の量 + 直列 barrier」。
+
+### sections 実測(真の内訳)
+```
+q21: stage_rpc_and_decode=2.34s + stage_local=4.00s = 6.34s(first-row gap 6.56s ≒ loss の 77.5%)
+     staged rows=3,641,158 = lineitem 2,901,744 + orders 729,413 + supplier 10,000 + nation 1
+q22: stage_rpc_and_decode=0.93s + stage_local=1.42s = 2.35s(first-row gap 2.43s ≒ loss の 82%)
+     staged rows=1,650,000 = orders 1,500,000(全件) + customer 150,000
+```
+- **`stage_local`(proxy 側 decode/materialize)が最大要素**(q21 4.0s)。65MB/s は raw memcpy には遅く、
+  row decode + hash/cache build + alloc が主因(Codex 評: hash-build/codec が有力、OCC read-set は仮説、
+  dedup O(N²)は低)。server scan は RPC 1.96s 側。
+
+### Codex の精緻化(診断の限界)
+- **「staging が全て」は強すぎ**。q21 は staging を完全に消しても実行 6.78s 残り、InnoDB 4.88s に
+  **1.9s 届かない**(per-probe は既に良好: l2 0.0027ms×75871≈205ms, l3 0.0021ms×73089≈153ms)。
+  staging は loss の 77.5% = 支配的だが 100% ではない。
+- q22 は診断が強い(per-probe 差は loss の ~3%)。orders 全件 staging が過大。
+
+### 設計(Codex + 自己検証)
+**q22 membership-staging(高 payoff・低リスク, 推奨第一手)**
+- server: `DISTINCT o_custkey FROM orders WHERE o_custkey IS NOT NULL` を sorted uint32[] で ship
+  (≈150k×4B=600KB、現 100.3MB の **~167x 縮小**、転送 ~4.7ms)。proxy は hash-set で NOT EXISTS をローカル解決。
+- bit-exact risk: NULL(=は UNKNOWN, NULL inner は非マッチ)/ MySQL が first-match 後も読む問題 →
+  inner 列が上に proj  されない semijoin/antijoin node にのみ contract 付与 / OCC phantom 保護
+  (set を read epoch に紐付け or range validate、ro_novalidate は read-only bench 限定)。
+
+**q21 grouped-existence summary(複雑・要注意)**
+- per `l_orderkey`: `distinct_supp_count` / `late_distinct_supp_count` / `late_only_suppkey`。
+  proxy 評価: EXISTS l2 ⇔ distinct_supp_count≥2 / NOT EXISTS l3 ⇔
+  NOT(late_distinct≥2 OR (late_distinct=1 AND late_only_suppkey≠l1.suppkey))。
+  **boolean では不可**(l_suppkey<>l1.l_suppkey の self-exclusion + 同一supplier重複lineitem対応に
+  distinct-supplier-count が必須)。
+- **★自己検証で判明した落とし穴★**: staged lineitem 2,901,744 は **SharedScan で l1/l2/l3 が共有する1本の
+  fetch**で、その実体は **l1 が必要とする per-order lineitem 行**(l1 は orderkey index lookup 4行/order ×
+  729413 orders ≈ 2.9M、receiptdate>commitdate で 2.51行に絞る)。l2/l3 を summary 化しても
+  **l1 が同じ 2.9M 行を実体で要求するので staging 量はほぼ減らない**(lineitem は staged rows の 80%)。
+  → q21 の existence summary は**正しさは出せても速度 win は小さい見込み**。l2/l3 probe(計 ~0.35s)を
+  消すだけ。q21 の真の梃子は (a) **staging を実行と overlap(streaming)**(下限 ~max(6.34,6.78)=6.8s、
+  ただし InnoDB 4.88s には未達)か (b) **l1⋈supplier⋈nation+existence+COUNT を server 側 full 集約 pushdown**
+  (q18 の全クエリ版、大機構)。q21 は構造的に難物。
+
+### 効果/労力ランキング
+1. **q22 membership-staging**(barrier ~2.4s の大半消去、~0.6MB ship、リスク=handler existence contract)。
+2. q21: existence summary 単独は薄い → overlap or full-agg-pushdown が要。複雑。
+
+### SOTA 対応(Codex survey, 既存実装の有無付き)
+- decorrelation/unnesting(Neumann 2412.04294)/ Yannakakis semijoin(helios: semijoin/filtered_keys/q18 GS 実装済)/
+  magic sets / groupjoin・JOIN-AGG(1906.05745, helios q18 GS が該当)/ predicate transfer・SIP(q21 orders-F→lineitem,
+  q22 customer→orders)/ **Bloom は NOT EXISTS 単体不可**(false-positive で出すべき行を落とす、exact fallback 要)/
+  late materialization・covering-index existence(InnoDB q22 がこれ)/ disaggregated pushdown(Aurora/PushdownDB 2002.05837)。
+
+### Codex 注記(streaming overlap)
+汎用に barrier を崩せるが volume を減らさねば decode CPU は残る。q22 の NOT EXISTS は partial set で「不在」を
+証明できず、key-range partition ごとに "complete" marker が必要。OCC は streaming 中の snapshot 揺れで
+bit-exact 破綻 → read epoch 固定 or chunk 単位 version/range validation。
