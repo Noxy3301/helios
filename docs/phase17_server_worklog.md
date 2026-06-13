@@ -838,3 +838,39 @@ residual 保護(qep_leaf_info ベース)で q21 等は不変。OLTP は gate と
   これ以上は customer scan 自体を staging しない = **full query pushdown(server で filter+AVG+antijoin+
   GROUP+SUM を計算し結果行のみ返す)**が要る大機構。suite は既に勝ち越し(0.943x)なので polish には過剰。
   → #3 は「projection で既に床近く、cheap lever 無し」と結論。full pushdown は将来課題として保留。
+
+## ④ q21 調査 — cheap lever 無し、大機構が必要(慎重結論)
+q21(13.34s vs InnoDB 4.88s, +8.46s)の梃子を精査。**安価な最適化は存在しない**と結論。
+
+### なぜ各 lever が塞がっているか
+- **SAUDI-supplier の SIP/predicate-transfer(lineitem を l_suppkey∈SAUDI で枝刈り)= 不可**:
+  semijoin reduction は **probe 表の KEY** で枝刈りするが、lineitem(l1)は **l_orderkey で probe**
+  (orders 駆動)、l_suppkey は VALUE 列で probe key でない。lineitem に l_suppkey 二次索引も無い。
+  加えて supplier の選択性は nation 経由(`n_name='SAUDI ARABIA'`)で **supplier 単一表述語でない** →
+  semijoin source 条件(選択的単一表述語)も不成立。よって既存 semijoin で lineitem は枝刈りされず 2.9M のまま。
+- **l1 date filter(`l_receiptdate>l_commitdate`)の push = 不可**: lineitem は **SharedScan で l1/l2/l3 が
+  1 fetch 共有**(commit 5fab65c)。l2(EXISTS)は date 無条件の全行が要るため、共有 fetch に l1 の date
+  filter を push すると l2 が壊れる。un-share して l1 だけ filter すると fetch が 1→3 本に増え逆効果。
+- **既に最適化済み**: lineitem は projection 済(read_set {l_orderkey,l_suppkey,l_receiptdate,l_commitdate}
+  + binding 強制列、column-form なので projection 維持)、orders は o_orderstatus='F' で 729k に絞り込み済、
+  supplier 10k。staging 293.8MB の主は lineitem 2.9M×~60B(DATE は ASCII 10B×2 が効く副因)。
+- **existence_only(Phase18)も効かない**: l3(NOT EXISTS)は相関 residual で除外、l2(EXISTS)も
+  SharedScan で l1 と fetch 共有のため、存在判定化しても l1 が同じ行を実体で要し staging 不変。
+
+### 構造(再掲)
+13.34s = staging 6.5s(stage_rpc_and_decode 2.34 + stage_local 4.0)+ 実行 6.8s。実行の per-probe は
+InnoDB 同等。staging は helios だけが払う純オーバーヘッド。**完全 overlap しても下限 ~max(6.5,6.8)=6.8s**
+で InnoDB 4.88s には未達 → overlap 単独でも勝てない。
+
+### 残る選択肢(いずれも大機構・別途判断)
+1. **streaming/overlap prefetch**: staging barrier を崩す汎用機構。q21 以外にも効くが、chunk 化・partial
+   cache・OCC(snapshot 固定 or chunk validation)で重い。単独では InnoDB 未達。
+2. **q21 full pushdown**: server で orders⋈l1⋈supplier⋈nation + EXISTS/NOT EXISTS + COUNT/GROUP BY を
+   計算し結果行(411 group)のみ返す。q1 agg-pushdown の多表・相関版で最も効くが最も重い・bit-exact риск大。
+3. **DATE packed codec**: row value の DATE を ASCII(10B)→packed(3-4B)。全クエリ横断の codec 変更で
+   lineitem 等の転送を一律削減(q21 で ~35MB 減)。範囲広く慎重要。
+
+### 結論
+q21 は **本セッションでの安全な実装範囲を超える**(大機構 or 横断 codec)。suite は q22 で既に勝ち越し
+(0.943x)のため、q21 大機構は費用対効果と 22/22 リスクを user 判断にゆだねる。#4 は「精査して
+cheap lever 無しを確定・選択肢を提示」で一旦クローズ。
