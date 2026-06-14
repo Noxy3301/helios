@@ -1292,15 +1292,26 @@ bool autogen_read_plan_from_qep(
     std::vector<std::vector<TABLE *>> kept_aliases;
     bool any_drop = false;
     for (size_t i = 0; i < steps.size(); ++i) {
-      // index_name.empty(): GS synthetic rows are served ONLY on the full-scan
-      // path (rnd_init -> gs_fill_buffers, and index_read_map only when key ==
-      // nullptr). A keyed SECONDARY index range scan (e.g. q15's view body over
-      // l_sd) never takes the GS branch, so dropping its staged step leaves the
-      // keyed index_read with nothing to consume -> prefetch cache miss. Keep
-      // secondary scan steps staged; the normal scan serves them and MySQL
-      // aggregates the rows itself (correct, just no GS optimization).
+      // GS synthetic rows are served ONLY on the FULL-scan path (rnd_init ->
+      // gs_fill_buffers, and index_read_map only when key == nullptr). That
+      // covers a PRIMARY full scan AND a full SECONDARY index scan (q18's inner
+      // `Index scan using l_ok`: index_first drives it with key==nullptr). The
+      // gating shape is therefore "unbounded full scan", NOT "index_name empty":
+      // key_prefix empty && end_key_prefix == sentinel && no pushed filter.
+      // M5(q18): the old `index_name.empty()` (commit ceb5a50) was over-broad --
+      // it kept q18's full l_ok secondary scan staged (24s) when the optimizer
+      // chose l_ok over PRIMARY, bypassing GS. A keyed/range SECONDARY scan
+      // (q15's view body over an l_sd RANGE: non-empty key_prefix or non-sentinel
+      // end) MUST stay staged -- its keyed index_read (key!=nullptr) never takes
+      // the GS branch, so dropping it would orphan the lookup (ceb5a50's case).
+      // The full-scan shape keeps q15 staged while letting q18's l_ok be served
+      // by GS; gs_fill_buffers aggregates the FULL leaf under reg->filter (empty
+      // for q18), producing the identical group set the dropped scan would have.
       bool drop = steps[i].is_scan && !steps[i].for_each &&
-                  steps[i].index_name.empty() &&
+                  steps[i].key_prefix.empty() &&
+                  steps[i].end_key_prefix ==
+                      lineairdb_keyenc::scan_end_sentinel() &&
+                  steps[i].serialized_filter.empty() &&
                   steps[i].scan_limit == 0 && !referenced[i] &&
                   i < step_aliases.size() && !step_aliases[i].empty() &&
                   steps[i].semijoins.empty();
