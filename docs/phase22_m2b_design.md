@@ -1,44 +1,42 @@
-# Phase 22 — M2b: rigorous calibration (DESIGN v2, post-grounding, pre-review)
+# Phase 22 — M2b: rigorous calibration (DESIGN v4, post-grounding, post-3-rounds-review)
 
-_v1 (proxy-side per-RPC NNLS decomposition) was NO-GO'd by both Codex and the
-grounded Claude panel; their core objection — the probes assumed an execution
-shape that does not match the deployment regime — was then CONFIRMED by direct
-measurement (docs/phase22_m2b_taxonomy.md + the pivotal latency sweep). v2 is
-re-grounded on that measurement. Status: **draft for design dual-review round 2.**_
+_v1 (proxy-side per-RPC NNLS) NO-GO'd → measured the RPC taxonomy → v2 reframe
+(prefetch-ON latency, steering-proxy, suite-decides) → v3 (broke circularity, anchor-
+as-definition, T0/clip/cond fixes). v3 round-3 review: Codex GO, statistical lens GO,
+**confounds lens NO-GO on a code-grounded BLOCKING** — v3's PK-join C_mat anchor is
+priced by un-overridden page_read_cost, so it never exercises read_cost()/C_mat;
+also the pivotal probe used an implicitly-grouped aggregate (gate SKIPS it). v4 fixes
+both: C_mat anchor = standalone NON-GROUPED non-covering SECONDARY RANGE (the ONLY
+access class read_cost governs, §4-note), pivotal probe forced non-grouped, plus the
+statistical/Codex MINOR+wording items. Status: **draft for confounds-lens
+re-confirmation.**_
 
-## 0. What changed from v1 (the grounding that forced a reframe)
+## 0. Reframe (unchanged from v2, validated by review) + the central thesis
 
-Measured with ENABLE_RPC_TRACE on the live SF1 server (scripts/dev/m2b_taxonomy.sh):
+Measured (docs/phase22_m2b_taxonomy.md, scripts/dev/m2b_taxonomy.sh): under
+**prefetch ON (deployment) every access class issues ONE `TX_EXECUTE_READ_PLAN`**;
+per-row `TX_READ` is prefetch-OFF-only (eq_ref join: 503 TX_READ OFF vs 1 staged
+RPC ON). Pivotal sweep: 2ary range ~linear ~4 µs/row, beats the flat 19.2 s full
+scan to ~70% selectivity; per-row server materialise ≈ 0.5 µs/row. So the read_cost
+`ceil(rows/B_eff)·C_rpc` IO term counts NO real RPC in deployment (a STEERING PROXY)
+and `C_materialise` is entangled with downstream context (agg-pushdown collapses a
+scan's transfer; a join inflates a range via NLJ).
 
-1. **Under prefetch ON (the deployment + acceptance regime) EVERY access class —
-   full scan, covering range, non-covering range, eq_ref join, point read — issues
-   exactly ONE `TX_EXECUTE_READ_PLAN` RPC.** The per-row `TX_READ` round-trip that
-   the cost model's read_cost charge (`ceil(rows/B_eff)·C_rpc + rows·C_mat`) is
-   built around occurs ONLY with prefetch OFF (eq_ref join = 503 TX_READ OFF vs 1
-   staged RPC ON). So v1's per-RPC-class decomposition is invalid for deployment.
-2. **Pivotal latency sweep (prefetch ON, single-table, agg/semijoin OFF):** the
-   2ary range is ~linear in R (~4 µs/row) and BEATS the flat 19.2 s full scan up
-   to ~70% selectivity; the non-covering vs covering latency gap is the per-row
-   server-side materialise cost ≈ **0.5 µs/row** (1.75 s over 3.6M rows). So the
-   physical per-row materialise cost is small and measurable — yet M1 found
-   `C_materialise=8.0` must make full-scan+prefetch WIN at far lower selectivity
-   for the JOIN regressors. The reconciliation: full-scan wins in deployment not
-   on raw single-table access cost but because **(a) agg-pushdown collapses a full
-   scan's transfer to ~zero, and (b) a range feeding a join inner runs a per-driver
-   NLJ** — neither of which a single-table isolated probe exercises.
+**Central thesis (promoted from v2 §10 to the headline, per reviewers):** in a
+disaggregated engine the per-row remote-materialisation cost is **context-dependent
+on the execution alternative**, so it cannot be a single hardware constant; Helios
+prices it via an **executor-coupled gate** (M2a, helios_charge_materialise()), and
+the paper's evidence is the **gap between the measured physical slope (~0.5 µs/row)
+and the steering magnitude (8.0 cost-units)**. M2b's job is to (i) MEASURE the
+physical slopes that ARE scale-invariant, (ii) DERIVE the steering parameter from
+those physical slopes (not from the suite), and (iii) use the 22-suite ONLY as a
+pre-registered HOLD-OUT confirmation. PASS ⇒ physics reproduces the win and the
+calibrated model is VALIDATED; FAIL ⇒ a NEGATIVE calibration result that validates
+ONLY the context-dependence finding (the physical ~0.5 µs/row slope does NOT explain
+the production steering need) — NOT a validated cost model. Both are publishable; we
+state which is being claimed in each branch (Codex r3 #9).
 
-**Reframe.** `C_materialise` is not a pure hardware constant; it is entangled with
-downstream context (agg-pushdown, join strategy) — exactly what M2a's gate already
-encodes and what the methodology flagged as the "structural-flag" risk, now proven
-by measurement. v2 therefore (i) calibrates the PHYSICAL per-row/per-byte/fixed-RPC
-costs that ARE scale-invariant, from end-to-end latency under prefetch ON; (ii)
-treats the read_cost `ceil/C_rpc` term as an explicit, documented STEERING PROXY,
-not a measured RPC fanout; and (iii) lets **the 22-query suite be the arbiter** of
-whether physically-grounded constants reproduce the M1/M2a net-positive result —
-a decisive, paper-defensible outcome either way (8.0 confirmed-from-physics, or
-8.0 demonstrated to be an irreducible steering parameter with the gap quantified).
-
-## 1. The model form (VERIFIED proxy/ha_lineairdb.hh:336–417)
+## 1. Model form (VERIFIED ha_lineairdb.hh:336–417)
 
 ```
 full scan   (table_scan_cost):  io = C_rpc·1              + bytes·C_byte
@@ -46,168 +44,208 @@ full scan   (table_scan_cost):  io = C_rpc·1              + bytes·C_byte
 covering ref(index_scan_cost):  io = (ranges|1)·(C_rpc/B_eff) + bytes·C_byte
   = helios_ref_cost             cpu = rows·(C_probe + C_row)
 non-cov ref (read_cost):        helios_ref_cost
-  (charge-materialise gate ON)  + io: ceil(rows/B_eff)·C_rpc     ← STEERING PROXY
-                                + cpu: rows·C_materialise         ← server per-row CPU
+  (charge-materialise gate ON)  + io: ceil(rows/B_eff)·C_rpc   ← STEERING PROXY (not a real RPC count under prefetch ON)
+                                + cpu: rows·C_materialise        ← server per-row materialise CPU
 ```
-Env knobs (helios_cost_param): C_RPC=50, C_BYTE=0.0008, C_ROW=0.10, C_PROBE=0.05,
-C_REMOTE=0.05, C_MATERIALISE=8.0, BATCH=1024. `total_cost()=io+cpu+import`, a plain
-linear sum, equal-weighted (VERIFIED handler.h:3717); `multiply()` scales all three
-uniformly (:3746) — so a uniform µs→cost-unit rescale is plan-invariant IN
-ISOLATION; commensurability with MySQL's NON-rescalable server_cost (row_evaluate
-=0.1) is what the anchor (§5) fixes. The `(ranges>0?ranges:1)` floor (hh:368) means
-the covering io term is `C_rpc/B_eff` (~0.05) even at ranges=0 — negligible.
+`total_cost()=io+cpu+import`, equal-weighted (VERIFIED handler.h:3717); `multiply()`
+scales all three uniformly (:3746). **Because total_cost sums io+cpu+import 1:1, the
+assignment of a fitted latency slope to the io vs cpu bucket is cost-neutral at plan
+time; we keep the code's existing buckets for readability and the fit targets
+total_cost** (closes review item B3). Uniform µs→cost-unit scaling is therefore
+plan-invariant in isolation; commensurability with MySQL's NON-rescalable
+ROW_EVALUATE_COST=0.10 (VERIFIED opt_costconstants) is what the anchor pins.
 
-### 1.1 Identifiable quantities (reconciled with the measured regime)
+### 1.1 Identifiable quantities + env mapping (anchor as definition, no rescale)
 
-Runtime cannot separate C_row from C_remote (only their sum is ever multiplied) nor
-C_probe from C_row. We fit the composite slopes the code multiplies; we recover env
-knobs by IMPOSING the anchor as a DEFINITION (no division, no rescale — per both
-reviewers): **C_row := 0.10 by fiat; C_remote := max(0, S_scan − 0.10);
-C_probe := max(0, S_ref − 0.10).** State explicitly in the paper that
-(C_row,C_remote) and (C_probe,C_row) are individually non-identifiable; only the
-sums S_scan, S_ref are data-constrained.
+Only the SUMS S_scan=C_row+C_remote, S_ref=C_probe+C_row are data-constrained;
+C_row/C_remote/C_probe are individually non-identifiable. We IMPOSE the anchor as a
+pure partition: **C_row := 0.10; C_remote := S_scan − 0.10; C_probe := S_ref −
+0.10**, with the clip handled as a FALSIFICATION TRIP-WIRE (§5.3), not silent
+max(0,·). Substituting these reproduces the fitted S_scan/S_ref exactly.
 
 | fit symbol | physical meaning (prefetch-ON, server-side) | env mapping |
 |---|---|---|
-| `C_rpc`  | fixed cost of one staged TX_EXECUTE_READ_PLAN (the UNIT) | `HELIOS_C_RPC` |
-| `C_byte` | per byte shipped in the staged response (resp_b) | `HELIOS_C_BYTE` |
-| `S_scan` | full-scan server CPU per row scanned (≈3.2 µs/row prelim) | `C_REMOTE=S_scan−0.10` |
-| `S_ref`  | covering-range server CPU per row | `C_PROBE=S_ref−0.10` |
-| `C_mat`  | per-row server-side base-row PK materialise CPU (≈0.5 µs/row prelim) | `HELIOS_C_MATERIALISE` |
-| `B_eff`  | steering-proxy batch divisor (NOT a measured RPC count under prefetch) | `HELIOS_BATCH` |
+| `C_rpc`  | measured fixed cost of one staged TX_EXECUTE_READ_PLAN | `HELIOS_C_RPC` (physically frozen, §5.1) |
+| `C_byte` | per byte the optimizer prices = per `rows·floored mean_rec_length` (§4b) | `HELIOS_C_BYTE` |
+| `S_scan` | full-scan server CPU/row (≈3.2 µs/row prelim) | `C_REMOTE=S_scan−0.10` |
+| `S_ref`  | covering-range server CPU/row | `C_PROBE=S_ref−0.10` |
+| `C_mat`  | per-row server materialise CPU **in the JOIN regime it governs** (§4e′) | `HELIOS_C_MATERIALISE` |
+| `B_eff`  | the SINGLE steering DoF — set so the proxy term reproduces the **physically-derived** s*_access (§5.4), NOT tuned on the suite | `HELIOS_BATCH` |
 
-`B_eff` note (reviewer MAJOR): one env knob drives TWO terms — per-RANGE in
-helios_ref_cost and per-ROW in read_cost. Under prefetch ON neither is a real RPC
-count; B_eff is a steering-proxy magnitude. We do NOT "measure" it from a trace; we
-treat the read_cost `ceil(rows/B_eff)·C_rpc` term as a steering contribution and
-choose B_eff (with C_rpc) by the plan-choice acceptance test (§7), documenting it as
-such. T0 (per-statement fixed overhead) is REAL in latency but has NO env mapping —
-it is measured-and-subtracted, then DISCARDED (§5), never folded into any C_*.
+Two-constant honesty (review E/Codex#6): `C_rpc` appears as BOTH the measured
+one-staged-RPC overhead (physical) AND inside the read_cost steering term. We report
+them as two CONCEPTUAL quantities — `C_rpc_phys` (measured, §4a) and the optimizer
+penalty magnitude `P_steer = C_rpc/B_eff per row` (derived, §5.4) — even though the
+code reuses one knob.
 
-## 2. Instrumentation & the measured n-vector
-
+## 2. Instrumentation & measured n-vector
 `ENABLE_RPC_TRACE` → `summary_by_type{TYPE:{n,us,req_b,resp_b}}` (rpc_trace.cc:
-241–340). Under prefetch ON the data-path n-vector is dominated by ONE
-`TX_EXECUTE_READ_PLAN` whose `resp_b` is the bytes term and whose `us`+end-to-end
-latency carry the server-side CPU. The full MessageType taxonomy (rpc_trace.cc:
-30–99) and which classes each regime emits are tabulated in
-docs/phase22_m2b_taxonomy.md. Timing: `bench/bin/tpch_matrix.sh` (suite),
-`scripts/dev/m2b_taxonomy.sh` (probes). Fit: scipy `nnls`, `numpy.linalg.cond` on a
-COLUMN-STANDARDIZED matrix, VIF=1/(1−R²_j) by per-column OLS, CIs by jackknife over
-DESIGN POINTS (not only reps) + bootstrap over reps for pure-error.
+241–340). Under prefetch ON the data path is one TX_EXECUTE_READ_PLAN; resp_b = the
+byte term; us+latency = server CPU. **Realised-class trace gate caveat (review,
+confounds MAJOR):** under prefetch ON the trace CANNOT distinguish covering (d) from
+non-covering (e) — both are 1× TX_EXECUTE_READ_PLAN. So the realised-class trace
+gate validates only scan-vs-range-vs-point; **covering-vs-non-covering is gated by
+EXPLAIN `Extra` (`Using index`) AND a prefetch-OFF trace pass** (where P2 emits
+GET_MATCHING_PRIMARY_KEYS_IN_RANGE-only and P3 adds TX_BATCH_READ — taxonomy:19-20).
+Fit: scipy `nnls`; `numpy.linalg.cond` + Belsley condition-index on the COLUMN-
+STANDARDIZED matrix (gate: cond<30 AND VIF<10); CIs by jackknife-over-design-points
++ bootstrap-over-reps.
 
-## 3. Calibration target: prefetch-ON end-to-end latency vs KNOWN cardinality
+## 3. Calibration target
+y = end-to-end latency (median over ≥15 reps, 2 warm dropped; report median+p95+CV),
+trace OFF, prefetch ON; n = analytically-known COUNT(*)-exact counts, cross-checked
+per RPC-type on a ≥3-rep trace pass (trace `us` used for NOTHING in the fit).
+governor=performance + C6 off, recorded in provenance.
 
-y = end-to-end statement latency (median over ≥15 reps, 2 warm dropped; report
-median+p95+inter-rep CV), measured **trace OFF** in the **deployment regime
-(prefetch ON)**; n = analytically-known counts from probe construction
-(COUNT(*)-exact tables), cross-checked per RPC-type against a ≥3-rep trace pass
-(trace `us` used for NOTHING in the fit — only n/bytes, which are instrumentation-
-invariant). Governor=performance + C6 off (cstate_guard) recorded in provenance.
+## 4. Bench battery (prefetch ON, latency-based)
 
-## 4. Bench battery (prefetch ON, latency-based, one coefficient each)
+Probe tables (exact COUNT(*)): `cal_n(pk BIGINT PK, k INT, KEY sk(k))`,
+`cal_w(pk BIGINT PK, k INT, pad VARCHAR(512), KEY sk(k))`, N∈{1e3,1e4,1e5,1e6}; `k`
+gives known range cardinality R. Probes verified by EXPLAIN + the §2 trace gate.
 
-Probe tables (Wu calibration queries, exact COUNT(*)): `cal_n(pk BIGINT PK, k INT,
-KEY sk(k))` and `cal_w(pk BIGINT PK, k INT, pad VARCHAR(512), KEY sk(k))`, sizes
-N∈{1e3,1e4,1e5,1e6}; `k` gives known range cardinality R. ALL probes verified by
-BOTH `EXPLAIN` AND the trace's realised RPC classes (reject the row unless the
-expected class fired and unexpected ones — agg/GS in summary_local_view — did not).
-AGG_PUSHDOWN/SEMIJOIN OFF for the isolating probes (documented); the suite
-acceptance (§7) runs them ON.
-
-| # | coeff | probe (prefetch ON, forced+trace-verified) | swept | isolation |
+| # | coeff | probe (prefetch ON) | swept | isolation |
 |---|---|---|---|---|
-| a | `C_rpc` (+T0) | one staged scan returning ~1 row (tiny range) | — | intercept of latency at ~0 work = T0 + one-staged-RPC fixed cost |
-| b | `C_byte` | full scan of fixed-N cal_w, project narrow vs wide | width W (resp_b) | fixed N, one staged RPC; Δlatency/Δresp_b. Fit against the MODEL's bytes basis (rows·floored mean_rec_length) AND raw resp_b; report both |
-| c | `S_scan` | full scan cal_n, narrow | N∈{1e3..1e6} | Δlatency/ΔN minus byte term = server scan CPU/row |
-| d | `S_ref` | covering range `SELECT k … BETWEEN` (index-only, trace: no base-row fetch) | R | Δlatency/ΔR minus byte = covering-range server CPU/row |
-| e | `C_mat` | **non-covering range on the SAME cal_w, SAME k-range, projection-only diff** (`SELECT k,pad` vs `SELECT k`) | R | (e_latency − d_latency)/R = server per-row materialise CPU. Prelim ≈0.5 µs/row. SAME table/index/range — only the projected non-covering column differs (reviewer fix) |
-| f | per-row regime | (secondary, prefetch OFF) eq_ref join → R×TX_READ | R | the FALLBACK per-row cost, for the prefetch-OFF cost path + a physical cross-check of C_mat in true per-row execution |
+| a | `C_rpc_phys` (+T0) | T0 baseline = `SELECT 1` (NO table, trace shows ZERO TX_EXECUTE_READ_PLAN); then a 1-row staged point read (exactly one TX_EXECUTE_READ_PLAN) | — | C_rpc_phys = (1-row staged latency − T0_hat). T0 issues no data-path RPC (review confounds MINOR) |
+| b | `C_byte` | full scan cal_w, project narrow vs wide | resp_b | fit/ship against the CODE's basis `rows·floored mean_rec_length`; raw resp_b is a DIAGNOSTIC only (review: code only ever multiplies the floored basis) |
+| c | `S_scan` | full scan cal_n narrow | N | Δlatency/ΔN − byte term |
+| d | `S_ref` | covering range `SELECT k … BETWEEN` | R | index-only (EXPLAIN+OFF-trace gated); Δlatency/ΔR − byte |
+| **e** | `C_mat` **(PRIMARY)** | **standalone NON-GROUPED non-covering SECONDARY RANGE** `SELECT pad FROM cal_w FORCE INDEX(sk) WHERE k BETWEEN a AND b` (no aggregate/GROUP BY → is_grouped()=false → gate CHARGES, ha_lineairdb.cc:4117); swept R | R | (e_latency − d_latency)/R = per-row server materialise CPU. **MANDATORY optimizer_trace verification that the inner cost is computed by read_cost()/helios_ref_cost (the range/MRR path), NOT page_read_cost** — see §4-note. This is the C_mat anchor. |
+| e′ | `C_mat` cross-checks | (1) the ACTUAL q3/q5/q7/q8 regressor access (optimizer_trace: confirm it is the SAME non-covering secondary RANGE→read_cost path); (2) prefetch-OFF execution (per-row TX_READ, 503-style) | R | reconcile A(standalone staged) vs B(regressor staged) vs C(prefetch-OFF per-row). Agreement ⇒ hardware constant; disagreement IS the context-dependence result (§7/§0 thesis) |
+| f | regime check | re-run c/d/e with AGG_PUSHDOWN+SEMIJOIN ON | — | slopes must be within jackknife CI of the OFF fit; else constants are "regime-dependent," not "irreducible" (review confounds MAJOR) |
 
-T0 isolation (a): run a SELECT-1 / 1-row point-read baseline at high rep, take
-median as T0_hat with bootstrap CI, SUBTRACT from every y before the marginal fit;
-the residual single-staged-RPC intercept = C_rpc. C_rpc collinearity with T0 (both
-reviewers BLOCKING) is thereby removed by construction, not fit.
+**§4-note — where read_cost/C_mat actually fires (code-grounded, review r3 confounds
+BLOCKING):** the optimizer reaches the overridden `read_cost()` (hence the C_mat
+charge) ONLY for a NON-COVERING SECONDARY **RANGE** access (range optimizer → MRR
+→ read_cost). It does NOT fire for a `ref`/`eq_ref` lookup: `find_cost_for_ref`
+(sql_planner.cc:157–163) routes a ref to `read_cost()` only when
+`keyno==primary_key && primary_key_is_clustered()`, but the proxy never overrides
+`primary_key_is_clustered()` (default false, handler.h:5875), so PK and secondary
+ref lookups fall to `page_read_cost` — which Helios deliberately does NOT override
+(hh:420–424). Therefore (i) the C_mat probe MUST be a non-covering secondary RANGE,
+not a PK/secondary join-ref (v3's PK-join anchor was wrong); (ii) `C_materialise`
+governs exactly the non-covering-secondary-range access class and nothing else —
+state this scope precisely in the paper.
 
-## 5. Fit (identifiable composites; anchor as definition; gated)
+§4e paired measurement (review statistical MINOR): e and its covering counterpart
+are measured as INTERLEAVED paired reps; C_mat's CI = bootstrap over per-rep
+DIFFERENCES (cancels shared T0/RPC variance), report paired-difference CV.
 
-1. Subtract T0_hat from all y. NNLS on the column set the code multiplies
-   (`[bytes, n_scanrow, n_refrow, n_matrow]`; the staged-RPC fixed term is the T0-
-   removed intercept = C_rpc). Also run UNCONSTRAINED OLS; flag any coefficient
-   negative or within 1 CI of 0 as near-boundary (NNLS-clip bias warning).
-2. Impose the anchor as DEFINITION (no rescale): C_row:=0.10, C_remote:=max(0,
-   S_scan−0.10), C_probe:=max(0,S_ref−0.10). Report identifiable composites
-   (C_rpc,C_byte,S_scan,S_ref,C_mat) with jackknife-over-design-point CIs.
-3. Identifiability gates on the COLUMN-STANDARDIZED design matrix: report cond(),
-   per-column VIF, and per-RPC-type measured-vs-analytical n (must match the
-   designed INTEGER exactly, control RPCs excluded). Reject+redesign any probe
-   whose target coefficient has VIF>10 or a CI spanning an order of magnitude.
-4. engine_cost SEPARATELY (eq_ref micro-bench), NOT in this NNLS (methodology BI-7).
+**§4f predeclaration (Codex r3 #4 + review r3 statistical power):** an agg/semijoin
+ON-vs-OFF slope drift does NOT block shipping the gate-based approach; it only
+changes the CLAIM from "irreducible hardware constant" to "regime-dependent
+constant." Because the §4e C_mat CI can be wide (it is a subtraction), the §4f
+"within jackknife CI" test has low power; report the §4f test's CI half-width and
+treat a WIDE-CI pass as "inconclusive," not "regime-invariant" (cite the half-width
+in §9 provenance).
 
-## 6. Scale-invariance (three tiers; honest about in-memory residency)
+## 5. Fit — DERIVATION stands alone; suite is hold-out (circularity broken)
 
-- **Linearity / no-residency-cliff (in-session):** the N∈{1e3..1e6} sweep — refit
-  on {1e3,1e4} vs {1e5,1e6}; require CI overlap. Plot residuals vs N/bytes; if
-  S_scan or C_mat drift, attribute to CPU-cache/NUMA/scan-thread saturation/OCC
-  working-set (NOT dismiss as noise) and report the working-set size of the knee.
-  (The "fully in-memory ⇒ no residency regime" claim is SOFTENED per reviewers:
-  no buffer-pool DISK spill, but in-memory residency regimes remain and ARE what
-  the SF re-fit tests. Pin server thread count + NUMA in provenance.)
-- **Scale-invariance (primary):** re-run the §4 battery at TPC-H SF0.1 and SF1
-  (SF3 if time); require fitted constants stable within jackknife CI.
-- **Headline (decision-relevant):** hold N, sweep selectivity R/N across the
-  crossover; report s* = the measured selectivity where range latency = full-scan+
-  prefetch latency IN DEPLOYMENT (agg ON) — the dimensionless, SF-independent
-  quantity the paper should report instead of "8.0". Verify the calibrated model
-  predicts s* and that s* is invariant across SF.
+1. **C_rpc_phys frozen from §4a**, S_scan/S_ref/C_byte/C_mat from §4 micro-bench CIs
+   ALONE. These ARE the paper's claim; they do not consult the suite. NNLS on the
+   columns the code multiplies; ALSO unconstrained OLS — flag any coefficient <0 or
+   within 1 CI of 0 as near-boundary (NNLS-clip warning). The 1-CI flag is a
+   DIAGNOSTIC (~68%, weak) that feeds §5.3, NOT a ship gate; the ship gate is the
+   §5.3 anchor-consistency trip-wire + the §7.1 pre-registered hold-out (review r3).
+2. T0 measured-and-subtracted, then DISCARDED (no env mapping). **Propagate T0
+   uncertainty** (review statistical MAJOR): bootstrap T0_hat jointly (resample the
+   SELECT-1 reps inside each bootstrap iteration and re-subtract) so C_rpc_phys's CI
+   includes Var(T0_hat); OR fit T0+C_rpc jointly with a 'staged-RPC-fired' indicator.
+3. **Clip = falsification trip-wire:** report raw unclipped S_scan/S_ref with CI; if
+   (S−0.10)<0 or its CI admits C_remote/C_probe<0, do NOT clip-and-ship — surface
+   "anchor inconsistent with data," report the mis-scale, re-anchor. The clip is a
+   trip-wire, not a coefficient transform.
+4. **B_eff = the single steering DoF, derived from physics not the suite
+   (PRE-REGISTERED equation, Codex r3 #1):** with C_rpc frozen at §4a, the
+   physically-implied access crossover is the selectivity s*_access where
+   range-cost(R=s*·N) = fullscan-cost, i.e. (from §4 slopes) the R solving
+   `helios_ref_cost(R) + ceil(R/B_eff)·C_rpc + R·C_mat = table_scan_cost(N)`. SET
+   `B_eff := the value making that equality hold at the MEASURED crossover
+   R* = s*_access·N` (s*_access from §4c/§4d/§4e physical slopes, §7.0). Propagate
+   the §4 slope CIs into B_eff's CI. Report the physically-implied s* and the
+   proxy-implied s* SEPARATELY — they must agree WITHOUT consulting the 22-suite
+   (review B/Codex#5). C_rpc stays frozen at §4a.
+5. engine_cost SEPARATELY (eq_ref micro-bench), not in this NNLS.
 
-## 7. Acceptance — THE SUITE DECIDES (the decisive experiment)
+## 6. Scale-invariance (two distinct s*, regime-separated)
 
-Plug the physically-derived constants into the env knobs; run the **full 22-query
-suite, fullidx SF1, full deployment (prefetch+agg-pushdown+semijoin ON)**, back-to-
-back same-session vs the M5 baseline (governor/C6 pinned; relative delta, never a
-stored cross-session number — reviewer). Outcomes:
+- **s*_access (defensible SF-independent headline):** the agg-OFF single-table
+  range-vs-fullscan crossover, which the access-cost model CAN legitimately predict
+  from physical C_mat/C_byte/S_scan. Report it; verify the calibrated model predicts
+  it; verify invariance across SF0.1/SF1(/SF3).
+- **s*_deploy (a DIFFERENT regime, NOT predicted by the access model):** the agg-ON
+  deployment crossover, governed by agg-pushdown; the 22-suite (§7) is its arbiter,
+  the access-cost model is NOT asked to predict it (review scale-inv MAJOR).
+- **Tiers:** (1) N∈{1e3..1e6} sweep = linearity/no-residency-cliff (residuals vs
+  N/bytes; attribute any knee to CPU-cache/NUMA/scan-thread/OCC working-set, report
+  the size; NOT "no residency regime" — softened); pin server threads+NUMA in
+  provenance. (2) SF0.1/SF1 re-fit of §4 = primary empirical scale-invariance.
 
-- **PASS** (suite ≤ M5 baseline 31.75 s ±noise, md5 22/22 vs InnoDB:3308): the
-  physically-grounded constants reproduce the M1/M2a win → 8.0 (or its physical
-  replacement) is "right for the right reason." Ship with provenance.
-- **FAIL** (physical constants regress the suite): this is itself a *result* —
-  C_materialise is an irreducible steering parameter, not a hardware constant.
-  Quantify the gap (which queries flip, by how much), attribute it to the un-modeled
-  downstream context (agg-pushdown scan-collapse / join NLJ), and EITHER keep 8.0 as
-  a documented, plan-choice-calibrated steering default OR (out of M2b scope) propose
-  restructuring the cost model to model that context. Do NOT ship a regressing value.
+## 7. Acceptance — pivotal gate, then pre-registered hold-out
 
-Per-constant robustness (replaces v1's vacuous ±50% band): for each constant sweep
-until the FIRST plan flip in the regressor set (q3/q5/q7/q8) and report the distance
-to that edge (plan-stability margin); + leave-one-query-out CV + 2–10× prefix_rowcount
-/rec_per_key perturbation that must not flip scan-vs-NLJ. Reconcile the M1 [8,10] vs
-M2a "16-OK" band move (the gate changed the band — document it).
+**7.0 Gating precondition (run FIRST, review r3 confounds MAJOR + r2 scale-inv/G):**
+staged non-covering-range vs staged-full-scan latency at MATCHED OUTPUT cardinality,
+prefetch ON. **The probe MUST be in the CHARGE regime — NON-GROUPED** (no aggregate,
+no GROUP BY): recall `is_grouped()=(group_list>0 || m_agg_func_used)` (sql_lex.h:1283),
+so a single-table `SUM(...)…BETWEEN` is implicitly grouped → gate SKIPS it
+(ha_lineairdb.cc:4117) → it measures the wrong (un-charged) regime. (NB: the
+preliminary pivotal sweep in docs/phase22_m2b_taxonomy.md used `SUM(...)` and is
+therefore a SKIP-regime diagnostic only; §7.0 must re-run it non-grouped.) If
+staged non-covering-range is genuinely slower per output row in the CHARGED regime,
+that slope IS the physical C_mat and the design is on solid ground. If NOT slower,
+the penalty is a **prefetch-OFF-fallback-only** cost and the paper says so — this
+gates the entire PASS/FAIL interpretation below.
+
+**7.1 Hold-out confirmation (pre-registered):** fix the §5 physically-derived
+constants; PRE-REGISTER the PASS threshold BEFORE running — the registered baseline
+is the same-session re-verification run **31.75 s** (docs/phase22_verification.md:30,
+NOT the 31.65 s of phase22_m5_findings.md:63 which is a different run; cite the exact
+commit), and the noise band is the §3 inter-run CV measured back-to-back (state the
+numeric ±band, do not let PASS drift to the looser number — review r3 MINOR); require
+md5 22/22; run the 22-query suite fullidx SF1 full-deployment
+(prefetch+agg+semijoin ON), back-to-back same-session vs M5 (governor/C6 pinned,
+relative delta). **If FAIL, do NOT search B_eff/C_rpc to make it pass** — report the
+0.5-vs-8.0 gap as the context-dependence result (§0 thesis).
+
+**7.2 Steering attribution (review E):** with C_mat held at its measured slope,
+report what fraction of EACH regressor's (q3/q5/q7/q8) plan flip is carried by the
+cpu term (C_mat) vs the io steering term (ceil/C_rpc). If the io term is load-bearing
+(taxonomy predicts it is), the honest headline is the COMBINED per-row steering
+magnitude — the read_cost term `ceil(rows/B_eff)·C_rpc` (i.e. per-row `C_rpc/B_eff`)
+plus `C_mat` — reported as the primary lever with its own plan-stability margin
+(Codex r3 #5: `B_eff×C_rpc` is dimensionally wrong; the magnitude is `C_rpc/B_eff`
+per row). NB (review r3 statistical): at plan time only the SUM
+(`C_mat + C_rpc/B_eff`)·rows is identifiable from plan behaviour; `C_mat`'s SEPARATE
+identification rests SOLELY on the §4e physical latency slope, never on the suite.
+
+**7.3 Robustness:** per-constant plan-stability margin (sweep each until the FIRST
+regressor plan flip; report distance to edge) + leave-one-query-out CV + 2–10×
+prefix_rowcount/rec_per_key perturbation that must not flip scan-vs-NLJ + an
+io/cpu-apportionment perturbation (reassign the same total between buckets; must not
+flip any plan — closes B3). **Also exercise the gate SKIP branch** (review cost-form
+MINOR): require q15/q1/q6 to keep helios_charge_materialise()=false AND not flip
+across the C_mat sweep — tests the gate predicate the methodology calls load-bearing.
 
 ## 8. Operational plan
-1. Build probe generator; load cal_n/cal_w (1e3..1e6) into the live server.
-2. Bench (§4) prefetch ON, trace-verified n; `m2b_fit.py` → constants+CIs+cond/VIF.
-3. Scale-invariance tiers (§6): in-session sweep now; SF0.1/SF1 re-fit needs server
-   reloads (server-only, mysqld stays); s* crossover under agg ON.
-4. Acceptance (§7): reload fullidx SF1 (server SF1 + 23-idx backfill ~30s+~30min)
-   once; env-sweep via mysqld restart only; back-to-back vs M5.
-5. engine_cost eq_ref bench; decide lever (keep gated so it can't flip q8); re-confirm.
-6. Findings + provenance; update constants ONLY where §7 PASSES; commit on branch.
+1. probe generator; load cal_n/cal_w (1e3..1e6) into the live server.
+2. §4 bench prefetch ON, trace-gated; `m2b_fit.py` → constants+CIs+cond/VIF + s*.
+3. §6 scale tiers (in-session sweep now; SF0.1/SF1 re-fit = server-only reload).
+4. §7.0 pivotal gate; reload fullidx SF1 (server SF1 + 23-idx backfill, once);
+   §7.1 pre-registered hold-out via mysqld-restart env-sweep; §7.2/7.3.
+5. engine_cost eq_ref bench; decide lever (gated, must not flip q8); re-confirm.
+6. findings + provenance; update constants ONLY where §7 PASSES; commit on branch.
 
 ## 9. Provenance (per shipped constant)
-date, host CPU/RAM, governor/C-state, server thread count + NUMA, server git SHA +
-build flags, RPC codec, prefetch regime, SF, fitted value, jackknife CI, cond/VIF,
-plan-stability margin, originating probe id. Re-derive on config/record-layout
-change; NEVER per-SF.
+date, host CPU/RAM, governor/C-state, server threads+NUMA, server SHA+flags, RPC
+codec, prefetch regime, SF, fitted value, jackknife CI, cond/VIF, plan-stability
+margin, originating probe id. Re-derive on config/record-layout change; never per-SF.
 
-## 10. Residual risks the reviewers must still pressure-test
-1. Is letting "the suite decide" (§7) a sound substitute for a clean per-constant
-   physical derivation, or does it re-introduce over-fitting to the 22 queries?
-2. C_mat measured standalone (§4e) vs applied only in the join/non-grouped regime
-   (M2a gate, ha_lineairdb.cc:4117) — is the per-row server materialise cost the
-   SAME in a join (per-driver-row) as in a standalone range? (§4f cross-checks.)
-3. The `ceil/C_rpc` steering-proxy framing — is documenting it honest enough for a
-   paper, or must the model be restructured to remove the fiction before publishing?
-4. Synthetic probe row layout → mean_rec_length → bytes term: validate ≥1 constant
-   (C_byte or S_scan) on a known-COUNT(*) real TPC-H table (mandatory, not optional).
-5. Anything that makes a "physical" constant non-scale-invariant that §6 misses.
+## 10. Residual risks for the focused re-confirmation
+1. Does the §4e join-regime C_mat anchor + §4e′ A/B/C reconciliation fully close the
+   "calibrated where the gate skips / applied where it charges" gap?
+2. Is the §5.4 "derive B_eff from physical s*, suite is hold-out" genuinely
+   non-circular, or does deriving B_eff from C_rpc (frozen) + physical slopes still
+   smuggle a free knob?
+3. Is the §7.0 pivotal gate the right precondition, and is the §0 PASS/FAIL thesis
+   (gate + 0.5-vs-8.0 gap as the central result) defensible for publication?
+4. Anything in §4f (agg ON/OFF regime-transfer check) that would still leave a
+   "regime-dependent vs irreducible" ambiguity unresolved.
