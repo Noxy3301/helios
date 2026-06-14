@@ -46,6 +46,7 @@
 
 #include <array>
 #include <atomic>
+#include <cmath>
 #include <mutex>
 #include <cstdint>
 #include <unordered_map>
@@ -338,6 +339,21 @@ public:
   static double kC_probe()  { static const double v = helios_cost_param("HELIOS_C_PROBE",  0.05);   return v; }
   static double kC_remote() { static const double v = helios_cost_param("HELIOS_C_REMOTE", 0.05);   return v; }
   static double kEffBatch() { static const double v = helios_cost_param("HELIOS_BATCH",    1024.0); return v; }
+  // Phase-22 M1: per-row remote PK-materialization charge for a NON-COVERING
+  // secondary range/ref. A non-covering scan fetches every qualifying row from
+  // the remote server by PK after the index narrows the key set; the prior
+  // helios_ref_cost omitted this, so a large range scan was priced cheaper than
+  // a full scan yet ran 3-8x slower (SF1 q7 13.3s range vs 1.7s full). Default
+  // 8.0 is the M1 SF1 calibration window (scripts/dev/m1_sweep.sh + q15 probe):
+  // it flips the JOIN regressors q3/q5/q7/q8 to full-scan+prefetch and fully
+  // recovers them (q7 13.3->1.6s, q8 8.6->2.7s) WITHOUT regressing the AGG/view
+  // query q15 (1.5s; q15 breaks at >=11 because its non-covering l_sd range is
+  // bulk-prefetched / server-aggregated, NOT per-row materialized, so an
+  // over-large charge wrongly flips it to a full scan). Safe band ~[8,10]; it is
+  // narrow because one row-scaled constant cannot tell a join (materializes rows
+  // -> charge right) from an agg-pushdown/GS scan (server aggregates -> charge
+  // wrong). M2 widens it with a prefetch/agg-aware gate. Env-tunable for sweeps.
+  static double kC_materialise() { static const double v = helios_cost_param("HELIOS_C_MATERIALISE", 8.0); return v; }
 
   double helios_row_bytes() const {
     // stats.mean_rec_length is set in info() from table->s->reclength (>=100).
@@ -369,7 +385,17 @@ public:
   Cost_estimate read_cost(uint index, double ranges, double rows) override
   {
     if (!helios_cost_v2_on()) return handler::read_cost(index, ranges, rows);
-    return helios_ref_cost(ranges, rows);
+    // read_cost() is the NON-COVERING branch: handler::multi_range_read_info_*
+    // dispatches a covering scan to index_scan_cost() and a non-covering scan to
+    // read_cost() (sql/handler.cc, HA_MRR_INDEX_ONLY). A non-covering scan must
+    // therefore also pay to materialize each row remotely by PK: one batched RPC
+    // per kEffBatch rows + a per-row remote-fetch CPU term. This makes full-scan
+    // +prefetch win once R is large, while selective small-R ranges (small extra)
+    // and covering scans (index_scan_cost, untouched) stay cheap. (Phase-22 M1.)
+    Cost_estimate c = helios_ref_cost(ranges, rows);
+    c.add_io(std::ceil(rows / kEffBatch()) * kC_rpc());
+    c.add_cpu(rows * kC_materialise());
+    return c;
   }
 
   Cost_estimate index_scan_cost(uint index, double ranges, double rows) override
