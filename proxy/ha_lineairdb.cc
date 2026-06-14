@@ -3157,6 +3157,16 @@ int ha_lineairdb::info(uint flag) {
                 if (!h.available || h.bounds.empty() ||
                     h.bounds.size() != h.cum.size())
                   continue;
+                // defense-in-depth (review r-impl): admit only a well-formed
+                // snapshot — monotone non-decreasing cum AND ascending bounds.
+                // (A non-snapshot-consistent two-pass build under concurrent
+                // writes could otherwise publish a non-monotone array; read-only
+                // TPC-H never hits this, but reject it rather than trust it.)
+                bool mono = true;
+                for (size_t i = 1; i < h.cum.size() && mono; i++)
+                  if (h.cum[i] < h.cum[i - 1] || h.bounds[i] < h.bounds[i - 1])
+                    mono = false;
+                if (!mono) continue;
                 LineairDB_share::RangeHist rh;
                 rh.bounds = h.bounds;
                 rh.cum = h.cum;
@@ -3834,17 +3844,18 @@ ha_rows ha_lineairdb::records_in_range(uint inx, key_range *min_key,
           };
           const key_part_map lead = 1;  // leading column only
           double lo = 0.0, hi = total_live;
+          bool enc_ok = true;  // a PRESENT bound that fails to encode => fail closed
           if (min_key != nullptr) {
             std::string ek = lineairdb_keyenc::convert_key_to_ldbformat(
                 table, inx, min_key->key, lead);
-            if (!ek.empty()) lo = rank_le(ek);
+            if (ek.empty()) enc_ok = false; else lo = rank_le(ek);
           }
-          if (max_key != nullptr) {
+          if (enc_ok && max_key != nullptr) {
             std::string ek = lineairdb_keyenc::convert_key_to_ldbformat(
                 table, inx, max_key->key, lead);
-            if (!ek.empty()) hi = rank_le(ek);
+            if (ek.empty()) enc_ok = false; else hi = rank_le(ek);
           }
-          const double est = hi - lo;
+          const double est = enc_ok ? (hi - lo) : -1.0;  // -1 => keep heuristic
           if (std::getenv("HELIOS_STATS_DEBUG") != nullptr) {
             fprintf(stderr,
                     "[RANGEHIST] idx=%s bounds=%zu total=%.0f lo=%.0f hi=%.0f "

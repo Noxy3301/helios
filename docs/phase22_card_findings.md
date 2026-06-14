@@ -59,9 +59,14 @@ regressors (median-of-3 s):
 ~2.** q3/q7/q8 are fast at EVERY C_mat including 0.27 — their entire steering need is
 **retired by cardinality alone** (q7: 12.37 s @ 0.27 OFF → 1.70 s ON; q8: 8.34 → 0.46).
 Only q5 retains a residual, needing C_mat ≥ 2 (down from 8). So **cardinality explains
-the bulk of the steering gap (band edge 8 → 2); the residual (~2 vs physical ~0.27) is
-the join-NLJ context M2b hypothesised** — now measured. This is exactly Leis ("fix
-cardinality first; cost is the guardrail"), confirmed in Helios.
+the bulk of the steering gap (band edge 8 → 2)**; the residual (~2, vs physical ~0.27)
+is **consistent with** the join-NLJ context M2b hypothesised — its EXISTENCE is measured
+(q5 still needs C_mat ≥ 2), but its CAUSE is inferred, not isolated (a clean
+decomposition would need q5 plan/handler-counter diffs). The q3/q7/q8 retirement IS
+measured directly (same fixed C_mat=0.27, gate ON vs OFF isolates the cardinality
+effect). This is Leis ("fix cardinality first; cost is the guardrail"), confirmed in
+Helios. NB the §4 suite headline mixes two levers (cardinality + C_mat 8→4); the clean
+cardinality-only isolation is the per-query ON/OFF-at-fixed-C_mat contrast above.
 
 ## 4. Result 3 — acceptance: net-positive + correct
 
@@ -93,3 +98,25 @@ uses `primary_keys().size()` (≈ live count for read-only TPC-H). Production ha
 (NULLs, all key_range flags, composite trailing ranges, sub-bucket interpolation,
 histogram-specific freshness, configurable B, 1-pass build) is documented in the design
 review (docs/phase22_card_design.md §7) and deferred.
+
+## 7. Implementation dual-review (④) — GO (Codex + Claude panel 3/3)
+
+All four reviewers GO. The PK-count weighting was confirmed "the right conceptual
+correction"; all five invariants verified line-by-line; md5 22/22 confirms. Zero
+BLOCKING. The MAJORs are production-hardening for MUTABLE workloads, explicitly out of
+this read-only-TPC-H feasibility scope (live-PK count vs `primary_keys().size()`;
+two-pass snapshot consistency; delete/update PK-list staleness). Cheap correctness/
+honesty items APPLIED post-review:
+- **STRING-type fail-closed** (review MAJOR): `leading_end` now rejects any leading part
+  whose type tag is not INT(0x10)/DATE(0x30), so a STRING key cannot produce a
+  wrong-but-in-bounds boundary the FLOOR would wrongly accept. (Latent — all 23 TPC-H
+  fullidx indexes are INT/DATE, which is why md5 held — but now provably closed.)
+- **encode-failure fail-closed** (Codex): a PRESENT range bound that fails to encode now
+  skips the histogram entirely (was: treated as unbounded, could over-raise).
+- **monotonicity guard**: the proxy admits a histogram only if cum is monotone and bounds
+  ascending (defense-in-depth vs a non-snapshot two-pass build).
+- **wording** (§3): residual-is-join-NLJ softened to "consistent with / inferred"; the
+  suite headline noted as mixing two levers (the per-query fixed-C_mat ON/OFF contrast is
+  the clean cardinality isolation).
+These are behaviourally identical on the validated INT/DATE suite (the fixes only harden
+non-INT/DATE / non-monotone paths that TPC-H never exercises), so the §2–4 results stand.
