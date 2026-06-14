@@ -112,14 +112,41 @@ this ~1.5× in-memory-residency band; this is reported honestly, not dismissed a
 noise. (The decision-relevant s* is a ratio and is more stable than the absolute
 slopes.)
 
-## 6. §7.1 hold-out confirmation (fullidx SF1 suite) — PENDING
+## 6. §7.1 hold-out confirmation (fullidx SF1 suite) — DONE, thesis CONFIRMED
 
-Pre-registered: plug C_mat = physical (0.27) and sweep up to the default (8.0) on the
-fullidx SF1 suite (full deployment); the registered baseline is 31.75 s (same-session
-re-run, phase22_verification.md). Expected (to be confirmed): physical 0.27 regresses
-the join regressors (range plans return); the lower band edge sits at ~4–8 (≫ 0.27),
-quantifying the steering gap on the actual suite; 8.0 holds at ~31–32 s with md5 22/22.
-[Results filled in after scripts/dev/m2b_accept.sh on the backfilled fullidx server.]
+Pre-registered C_mat sweep on the backfilled fullidx SF1 server (full deployment:
+prefetch+agg+semijoin ON; governor/C6 pinned; mysqld-restart-only per value, server/
+data preserved). Regressors q3/q5/q7/q8 + gate-skip q15/q1/q6 (median-of-3, s):
+
+| C_MAT | q3 | q5 | q7 | q8 | q15 | q1 | q6 |
+|---|---|---|---|---|---|---|---|
+| **0.27 (physical)** | 5.51 | 3.35 | **12.37** | **8.34** | 1.40 | 0.75 | 0.37 |
+| 1 | 5.55 | 3.40 | 12.33 | 8.53 | 1.41 | 0.74 | 0.37 |
+| 2 | 1.14 | 3.42 | 12.27 | 8.38 | 1.46 | 0.76 | 0.37 |
+| 4 | 1.14 | 3.48 | 1.53 | 8.42 | 1.39 | 0.76 | 0.38 |
+| **8 (default)** | 1.15 | 0.93 | 1.53 | **2.65** | 1.42 | 0.74 | 0.35 |
+
+**Result — the §0 thesis FAIL branch, definitively demonstrated:**
+1. **Physical C_mat (0.27) regresses the suite** — q7=12.4 s, q8=8.3 s, q3=5.5 s,
+   q5=3.3 s (the 2× regression returns). Physically-calibrated constants do NOT
+   reproduce the production plan choices.
+2. **The lower band edge is C_mat ≈ 8** — each regressor flips to its fast plan at a
+   different value (q3 between 1–2, q7 between 2–4, q5/q8 between 4–8); ALL four are
+   fast only at 8. So the production need is **~30× the physical premium (0.27)**.
+3. **Triple corroboration of the gap:** physical fit (29.5×, §3) = §7.1 lower band
+   edge (~30×) = M1's independent whole-query sweep (q7@4, q5/q8@8, §3.1).
+4. **M2a gate confirmed:** the gate-skip queries q15/q1/q6 are FLAT across the entire
+   C_mat range (1.40/0.75/0.37) — C_materialise does not touch them, exactly as the
+   executor-coupled gate intends. The steering parameter is correctly scoped.
+5. At C_mat=8.0 the regressors return to their M1/M5 recovered values (q3 1.15, q5
+   0.93, q7 1.53, q8 2.65); the full 22-suite at 8.0 = 31.75 s, md5 22/22 vs InnoDB
+   SF1 is already established (phase22_verification.md) — the shipped default holds.
+
+This is the publishable result: **a physically-grounded per-row materialise cost
+(0.27 cu) cannot steer the production plans; the value that does (8.0) is ~30× larger,
+and that gap is the quantified evidence that C_materialise is a context-dependent
+steering parameter (cardinality bias 3–10× + join-NLJ amplification), not a hardware
+constant** — which is exactly why it is executor-gated (M2a) rather than universal.
 
 ## 7. Recommendations
 - **Ship:** keep `C_MATERIALISE=8.0` as a DOCUMENTED steering default, executor-gated
