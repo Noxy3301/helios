@@ -1307,6 +1307,17 @@ bool autogen_read_plan_from_qep(
       // The full-scan shape keeps q15 staged while letting q18's l_ok be served
       // by GS; gs_fill_buffers aggregates the FULL leaf under reg->filter (empty
       // for q18), producing the identical group set the dropped scan would have.
+      // AUDIT NOTE (phase22 logic audit): the LOAD-BEARING safety net is the
+      // per-alias gs_registration()!=nullptr guard below + the strict GS-shape
+      // gates (single non-nullable group col, single SUM(a*(1-b)), RO-novalidate)
+      // -- NOT the shape test alone. serialized_filter/semijoins are attached by
+      // LATER passes so they are always empty here (forward-guards, currently
+      // inert -- kept so a future pass-reorder cannot silently drop a filtered/
+      // semijoin step). A both-unbounded INDEX_RANGE_SCAN (NO_MIN+NO_MAX) also
+      // matches key_prefix-empty + sentinel-end, but is harmless: it too is
+      // consumed with key==nullptr (read_range_first -> index_first) so GS serves
+      // it correctly. The discriminator vs q15 is the keyed/bounded range
+      // (non-empty key_prefix OR non-sentinel end), which stays staged.
       bool drop = steps[i].is_scan && !steps[i].for_each &&
                   steps[i].key_prefix.empty() &&
                   steps[i].end_key_prefix ==
