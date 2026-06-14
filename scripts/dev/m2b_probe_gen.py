@@ -23,7 +23,16 @@ def pad_for(pk: int) -> str:
         seed = seed * 1103515245 + 12345
     return "".join(out)[:512]
 
-def emit_table(name, n, wide, batch):
+def kval(p, n, shuffle):
+    # shuffle: k = LCG permutation of 1..n so 'k BETWEEN 1 AND R' selects R rows whose
+    # base PKs are SCATTERED (genuine random materialise), removing the k=pk contiguity
+    # confound (review r4). P coprime to n; (p-1)*P mod n is a bijection on 0..n-1.
+    if not shuffle:
+        return p
+    P = 99991  # prime; coprime to the n's used (powers of 10)
+    return ((p - 1) * P) % n + 1
+
+def emit_table(name, n, wide, batch, shuffle):
     cols = "(pk BIGINT PRIMARY KEY, k INT NOT NULL, pad VARCHAR(512) NOT NULL, KEY sk (k))" if wide \
            else "(pk BIGINT PRIMARY KEY, k INT NOT NULL, KEY sk (k))"
     print(f"DROP TABLE IF EXISTS {name};")
@@ -32,10 +41,10 @@ def emit_table(name, n, wide, batch):
     while i <= n:
         hi = min(i + batch - 1, n)
         if wide:
-            vals = ",".join(f"({p},{p},'{pad_for(p)}')" for p in range(i, hi + 1))
+            vals = ",".join(f"({p},{kval(p,n,shuffle)},'{pad_for(p)}')" for p in range(i, hi + 1))
             print(f"INSERT INTO {name} (pk,k,pad) VALUES {vals};")
         else:
-            vals = ",".join(f"({p},{p})" for p in range(i, hi + 1))
+            vals = ",".join(f"({p},{kval(p,n,shuffle)})" for p in range(i, hi + 1))
             print(f"INSERT INTO {name} (pk,k) VALUES {vals};")
         i = hi + 1
 
@@ -44,9 +53,10 @@ def main():
     ap.add_argument("--kind", choices=["n", "w"], required=True)
     ap.add_argument("--n", type=int, required=True)
     ap.add_argument("--batch", type=int, default=2000)
+    ap.add_argument("--shuffle", action="store_true", help="scatter base PKs (k=LCG perm) to remove the k=pk contiguity confound")
     a = ap.parse_args()
-    name = f"cal_{a.kind}_{a.n}"
-    emit_table(name, a.n, wide=(a.kind == "w"), batch=a.batch)
+    name = f"cal_{a.kind}_{'shuf_' if a.shuffle else ''}{a.n}"
+    emit_table(name, a.n, wide=(a.kind == "w"), batch=a.batch, shuffle=a.shuffle)
 
 if __name__ == "__main__":
     main()

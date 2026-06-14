@@ -1,0 +1,40 @@
+# Phase-22 M2b physical bench summary (reproducible via scripts/dev/m2b_{taxonomy,fit,probe_gen}.py)
+# === m2b_fit.py on the structure trace (server-side us, prefetch ON) ===
+== measured server-side us (median) ==
+  scan_n: 1000:385us/44032.0B, 10000:2808us/449033.0B, 100000:35807us/4589034.0B, 1000000:436600us/46889035.0B
+  noncov: 1000:1382us/573032.0B, 5000:6395us/2869032.0B, 20000:32258us/11489033.0B, 50000:86165us/28739033.0B, 100000:177224us/57489034.0B
+  cov: 1000:705us/58032.0B, 5000:2995us/294032.0B, 20000:13994us/1189033.0B, 50000:39900us/2989033.0B, 100000:80455us/5989034.0B
+  fullscan_filter: 1000:60110us/557032.0B, 5000:59547us/2789032.0B, 20000:81196us/11169033.0B, 50000:108435us/27939033.0B, 100000:156980us/55889034.0B
+  point(1row): 81us
+
+S_scan (sequential scan, cal_n narrow) = 439.2 ns/row  [95% 324,554]  intercept=-3089127ns
+B_ship (server ship) = 1.825 ns/byte  (from noncov-cov byte delta)
+non-cov range per-row = 1787.1 ns/row  [95% 1715,1859]
+fullscan marginal ship per-row = 993.8 ns/row ; fullscan fixed (scan-all) intercept = 58272821ns
+
+*** C_mat (random materialise premium) = noncov_per_row - fullscan_ship_per_row = 793.3 ns/row ***
+
+== anchor (S_scan = C_ROW+C_REMOTE = 0.15000000000000002 cu) ==
+  1 ns = 3.415263e-04 cu   (1 cu = 2928 ns)
+
+== physical constant vs current default (cost-units) ==
+  C_RPC         : physical=27.66  default=50  ratio(default/phys)=1.8x
+  C_BYTE        : physical=0.0006231  default=0.0008  ratio(default/phys)=1.3x
+  C_MATERIALISE : physical=0.2709  default=8  ratio(default/phys)=29.5x
+
+== access crossover s* (single-table, N=100000) ==
+  measured s*_access = fullscan_fixed / ((noncov-fullscan_ship)*N) = 73.5% selectivity
+  (model with physical C_mat should predict ~this; with default 8.0 it predicts a far LOWER s* = over-penalises range)
+
+# === scattered-vs-contiguous random-materialise premium (cal_w_shuf vs cal_w, k=LCG perm) ===
+      R   shuf us  contig us  fullscan us
+   1000      1451       1089        34910
+   5000      6056       4735        36999
+  20000     27789      26022        50167
+  50000     72099      68028        77543
+ 100000    149013     142772       117527
+
+per-row slopes (ns/row): scattered=1491  contiguous=1431  fullscan_ship=835
+C_mat premium (scattered) = shuf - fullscan_ship = 656 ns/row
+C_mat premium (contiguous, prior)= contig - fullscan_ship = 597 ns/row
+scattered/contiguous premium ratio = 1.10x

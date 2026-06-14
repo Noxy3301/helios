@@ -1,0 +1,15 @@
+# Phase-22 M2b §7.1 pre-registered hold-out: C_materialise sweep on fullidx SF1
+# (full deployment prefetch+agg+semijoin ON; governor=performance + C6 off;
+#  mysqld-restart-only per C_mat value, server/data preserved). median-of-3 (s).
+# Driver: scripts/dev/m2b_accept.sh. q3/q5/q7/q8 = join regressors;
+# q15/q1/q6 = M2a gate-skip queries (must be flat).
+C_MAT | q3            q5           q7            q8           | q15          q1           q6
+0.27  | 5.507986887   3.349718525  12.372673953  8.341857009  | 1.402215438  0.750319522  0.373901959
+1     | 5.549017338   3.399588402  12.329364702  8.526446360  | 1.412250959  0.742528052  0.367444630
+2     | 1.138670344   3.418771666  12.271145745  8.376174042  | 1.462136489  0.764073230  0.371762898
+4     | 1.140658461   3.484556658  1.529585842   8.423348426  | 1.394038643  0.758631242  0.384351562
+8     | 1.147107366   0.932817784  1.533647352   2.646011246  | 1.422606051  0.735079074  0.350667926
+# Reading: physical-ish C_mat=0.27 regresses q3/q5/q7/q8; all four fast only at 8.
+# Per-query flip: q3 in (1,2], q7 in (2,4], q5 & q8 in (4,8]. Lower band edge bracketed (4,8].
+# Gate-skip q15/q1/q6 flat across the whole sweep -> M2a gate firing by construction.
+# C_mat=8.0 full 22-suite = 31.75s, md5 22/22 vs InnoDB SF1 (phase22_verification.md).
