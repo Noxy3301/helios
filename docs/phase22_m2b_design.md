@@ -8,8 +8,12 @@ priced by un-overridden page_read_cost, so it never exercises read_cost()/C_mat;
 also the pivotal probe used an implicitly-grouped aggregate (gate SKIPS it). v4 fixes
 both: C_mat anchor = standalone NON-GROUPED non-covering SECONDARY RANGE (the ONLY
 access class read_cost governs, §4-note), pivotal probe forced non-grouped, plus the
-statistical/Codex MINOR+wording items. Status: **draft for confounds-lens
-re-confirmation.**_
+statistical/Codex MINOR+wording items. **Status: dual-review GO** — round-4
+re-confirmation: Codex GO + grounded confounds lens GO (both v3 items RESOLVED,
+code-grounded: multi_range_read_info_const handler.cc:6291-6296 routes the
+non-covering range to the overridden read_cost; no new BLOCKING). With v2's
+cost-form + scale-invariance GO and v3's statistical GO, ALL five review lenses +
+Codex are GO. **Ready to implement (§8).**_
 
 ## 0. Reframe (unchanged from v2, validated by review) + the central thesis
 
@@ -108,7 +112,7 @@ gives known range cardinality R. Probes verified by EXPLAIN + the §2 trace gate
 | a | `C_rpc_phys` (+T0) | T0 baseline = `SELECT 1` (NO table, trace shows ZERO TX_EXECUTE_READ_PLAN); then a 1-row staged point read (exactly one TX_EXECUTE_READ_PLAN) | — | C_rpc_phys = (1-row staged latency − T0_hat). T0 issues no data-path RPC (review confounds MINOR) |
 | b | `C_byte` | full scan cal_w, project narrow vs wide | resp_b | fit/ship against the CODE's basis `rows·floored mean_rec_length`; raw resp_b is a DIAGNOSTIC only (review: code only ever multiplies the floored basis) |
 | c | `S_scan` | full scan cal_n narrow | N | Δlatency/ΔN − byte term |
-| d | `S_ref` | covering range `SELECT k … BETWEEN` | R | index-only (EXPLAIN+OFF-trace gated); Δlatency/ΔR − byte |
+| d | `S_ref` | covering range `SELECT k … BETWEEN` | R | index-only — MUST confirm EXPLAIN `Extra=Using index` on THIS engine (index_flags lacks HA_KEYREAD_ONLY, hh:251-255; the §2 EXPLAIN+OFF-trace gate covers it); Δlatency/ΔR − byte |
 | **e** | `C_mat` **(PRIMARY)** | **standalone NON-GROUPED non-covering SECONDARY RANGE** `SELECT pad FROM cal_w FORCE INDEX(sk) WHERE k BETWEEN a AND b` (no aggregate/GROUP BY → is_grouped()=false → gate CHARGES, ha_lineairdb.cc:4117); swept R | R | (e_latency − d_latency)/R = per-row server materialise CPU. **MANDATORY optimizer_trace verification that the inner cost is computed by read_cost()/helios_ref_cost (the range/MRR path), NOT page_read_cost** — see §4-note. This is the C_mat anchor. |
 | e′ | `C_mat` cross-checks | (1) the ACTUAL q3/q5/q7/q8 regressor access (optimizer_trace: confirm it is the SAME non-covering secondary RANGE→read_cost path); (2) prefetch-OFF execution (per-row TX_READ, 503-style) | R | reconcile A(standalone staged) vs B(regressor staged) vs C(prefetch-OFF per-row). Agreement ⇒ hardware constant; disagreement IS the context-dependence result (§7/§0 thesis) |
 | f | regime check | re-run c/d/e with AGG_PUSHDOWN+SEMIJOIN ON | — | slopes must be within jackknife CI of the OFF fit; else constants are "regime-dependent," not "irreducible" (review confounds MAJOR) |
@@ -121,10 +125,18 @@ charge) ONLY for a NON-COVERING SECONDARY **RANGE** access (range optimizer → 
 `keyno==primary_key && primary_key_is_clustered()`, but the proxy never overrides
 `primary_key_is_clustered()` (default false, handler.h:5875), so PK and secondary
 ref lookups fall to `page_read_cost` — which Helios deliberately does NOT override
-(hh:420–424). Therefore (i) the C_mat probe MUST be a non-covering secondary RANGE,
-not a PK/secondary join-ref (v3's PK-join anchor was wrong); (ii) `C_materialise`
-governs exactly the non-covering-secondary-range access class and nothing else —
-state this scope precisely in the paper.
+(hh:420–424). (Confirmed r3-reconfirm: a non-covering range fails the index_only
+test (index_range_scan_plan.cc:617-620), so HA_MRR_INDEX_ONLY is NOT set and
+multi_range_read_info_const (handler.cc:6291-6296) routes the non-INDEX_ONLY branch
+to the overridden read_cost; the proxy's own multi_range_read_info_const override
+(ha_lineairdb.cc:4140-4148) leaves cost untouched for keyno≠primary_key, so the
+overridden read_cost stands.) Therefore (i) the C_mat probe MUST be a non-covering
+secondary RANGE, not a PK/secondary join-ref (v3's PK-join anchor was wrong); (ii)
+`C_materialise` governs the non-covering-secondary-range access class specifically
+(do NOT over-claim read_cost is unreachable by every other range-like path unless
+separately proven — Codex r4 MINOR). The §4e/§4d optimizer_trace gate MUST be
+captured in the SAME prefetch regime (ON) as the latency probe so the priced class
+and the measured class coincide (r3-reconfirm MINOR).
 
 §4e paired measurement (review statistical MINOR): e and its covering counterpart
 are measured as INTERLEAVED paired reps; C_mat's CI = bootstrap over per-rep
