@@ -28,8 +28,9 @@ pinned.)
 (index_flags lacks HA_KEYREAD_ONLY, hh:251-255; EXPLAIN of a covering `SELECT k`
 shows `Using where`, not `Using index`). So the covering-vs-non-covering difference
 is a BYTE difference, not a materialise-vs-not step. C_mat is therefore measured as
-the **random-materialise PREMIUM of a range over a sequential scan** (the
-PostgreSQL random_page_cost analog), not as covering−non-covering.
+the **random-materialise PREMIUM of a range over a sequential scan** (loosely the
+PostgreSQL random_page_cost analog — but scoped to THIS in-memory/prefetch-ON regime;
+NOT generalised to a disk-based random-access penalty), not as covering−non-covering.
 
 **Contiguity confound resolved by a scattered-PK probe (cal_w_shuf, k=LCG
 permutation so `k BETWEEN 1 AND R` selects R rows with SCATTERED base PKs).** The
@@ -61,7 +62,8 @@ none reverse the conclusion):** (1) noncov ships a constant +16 B/row vs fullsca
 (byte-correcting drops C_mat ~29 ns/row, ≈3.7%). (2) the fullscan SLOPE (994 ns/row)
 is the marginal emit+ship of one OUTPUT row, not the sequential per-row VISIT cost
 (which lives in the ~58 ms full-scan intercept ≈ 583 ns/row); so C_mat ≈ walk +
-PK-fetch − emit, a GENEROUS (upper-leaning) estimate of the pure premium. (3) the
+PK-fetch − emit, a GENEROUS (upper-leaning) estimate of the random-materialise
+premium under this estimator (not a "pure" premium). (3) the
 contiguity confound is measured at ~10% (scattered probe, §1). Net: the physical
 C_mat premium is small and bounded — **~0.2–0.33 cost-units** after anchoring (§3).
 
