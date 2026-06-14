@@ -784,6 +784,9 @@ std::string build_plan_key(
 std::mutex LineairDBRpc::ndv_cache_mu_;
 std::unordered_map<std::string, std::pair<bool, std::vector<uint64_t>>>
     LineairDBRpc::ndv_cache_;
+// Phase-22 range-histogram cache (same key/mutex/busting as the NDV cache).
+std::unordered_map<std::string, LineairDBRpc::HistEntry>
+    LineairDBRpc::hist_cache_;
 
 LineairDBRpc::LineairDBRpc(std::shared_ptr<DatabaseManager> db_manager,
                            std::shared_ptr<TransactionManager> tx_manager,
@@ -1011,6 +1014,33 @@ void LineairDBRpc::handleTxGetTableStats(const std::string& message,
             out->set_available(avail);
             if (avail)
                 for (uint64_t v : ndv) out->add_ndv(v);
+
+            // Phase-22: per-index equi-depth range histogram (leading key part).
+            // Independent of NDV `avail` (DATE indexes have avail=false but DO get a
+            // histogram). Same cache key / mutex / ANALYZE busting as NDV.
+            constexpr uint32_t kHistBuckets = 64;
+            HistEntry he;
+            bool hist_found = false;
+            {
+                std::lock_guard<std::mutex> g(ndv_cache_mu_);
+                if (request.ndv_force_recompute()) hist_cache_.erase(ck);
+                auto hit = hist_cache_.find(ck);
+                if (hit != hist_cache_.end()) { hist_found = true; he = hit->second; }
+            }
+            if (!hist_found) {  // cache miss -> compute (outside the lock) + store
+                he.available =
+                    db && db->ComputeIndexHistogram(request.ndv_table(),
+                                                    desc.index_name(), kHistBuckets,
+                                                    he.bounds, he.cum);
+                if (!he.available) { he.bounds.clear(); he.cum.clear(); }
+                std::lock_guard<std::mutex> g(ndv_cache_mu_);
+                hist_cache_[ck] = he;
+            }
+            out->set_hist_available(he.available);
+            if (he.available) {
+                for (const auto& b : he.bounds) out->add_hist_bounds(b);
+                for (uint64_t c : he.cum) out->add_hist_cum(c);
+            }
         }
     }
     result = response.SerializeAsString();

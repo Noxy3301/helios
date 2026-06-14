@@ -128,9 +128,19 @@ bool LineairDBProxy::fetch_table_stats(
         table_stats_cache_[ts.table_name()] = ts.row_count();
     }
     last_index_ndv_.clear();
+    last_index_hist_.clear();
     for (const auto& in : response.index_ndv()) {
         std::vector<uint64_t> ndv(in.ndv().begin(), in.ndv().end());
         last_index_ndv_[in.index_name()] = {in.available(), std::move(ndv)};
+        // Phase-22 range histogram (independent of NDV availability).
+        if (in.hist_available() && in.hist_bounds_size() > 0 &&
+            in.hist_bounds_size() == in.hist_cum_size()) {
+            IndexHist h;
+            h.available = true;
+            h.bounds.assign(in.hist_bounds().begin(), in.hist_bounds().end());
+            h.cum.assign(in.hist_cum().begin(), in.hist_cum().end());
+            last_index_hist_[in.index_name()] = std::move(h);
+        }
     }
     return true;
 }

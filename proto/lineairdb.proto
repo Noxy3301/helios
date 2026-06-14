@@ -125,6 +125,15 @@ message GetTableStats {
         string index_name = 1;
         bool available = 2;
         repeated uint64 ndv = 3;
+        // Phase-22 range cardinality: per-index equi-depth boundary histogram on the
+        // LEADING key part (proxy records_in_range range estimate). Independent of
+        // `available` (NDV) above. hist_bounds[i] = raw stored leading-part-prefix key
+        // (byte-identical to convert_key_to_ldbformat); hist_cum[i] = cumulative live
+        // rows with leading-part <= bound[i] (monotone; last == total). Empty/absent =>
+        // proxy keeps its 5%/10% heuristic (fail-closed).
+        repeated bytes hist_bounds = 4;
+        repeated uint64 hist_cum = 5;
+        bool hist_available = 6;
     }
     message Response {
         repeated TableRowCount table_stats = 1;

@@ -105,6 +105,16 @@ public:
   // ANALYZE TABLE sets this so the next info() NDV fetch passes force=true,
   // making the server recompute (rather than serve its cached) NDV.
   std::atomic<bool> index_ndv_force_refresh_{false};
+
+  // Phase-22: per-index equi-depth range histogram (LEADING key part), fetched in
+  // the SAME stats call as NDV (guarded by index_ndv_mu_, same lifetime/loaded gate).
+  // index name -> {ascending raw boundary keys, cumulative live counts}; last cum ==
+  // total live rows. Absence => records_in_range keeps its 5%/10% heuristic.
+  struct RangeHist {
+    std::vector<std::string> bounds;
+    std::vector<uint64_t> cum;
+  };
+  std::unordered_map<std::string, RangeHist> index_hist_;
 };
 
 // LIMIT and direction to pass to a range scan. Computed from the statement's

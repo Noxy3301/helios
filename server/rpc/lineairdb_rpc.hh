@@ -57,6 +57,16 @@ private:
     static std::unordered_map<std::string,
                               std::pair<bool, std::vector<uint64_t>>> ndv_cache_;
 
+    // Phase-22 range cardinality: per-index equi-depth boundary histogram (leading
+    // key part), cached alongside NDV (same key, same mutex, same ANALYZE busting).
+    // available + ascending boundary keys + cumulative live counts (last == total).
+    struct HistEntry {
+        bool available = false;
+        std::vector<std::string> bounds;
+        std::vector<uint64_t> cum;
+    };
+    static std::unordered_map<std::string, HistEntry> hist_cache_;
+
     // Transaction lifecycle
     void handleTxBeginTransaction(const std::string& message, std::string& result);
     void handleTxGetTableStats(const std::string& message, std::string& result);

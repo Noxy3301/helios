@@ -3148,6 +3148,26 @@ int ha_lineairdb::info(uint flag) {
                 if (kv.second.first)  // available
                   share->index_ndv_[kv.first] = kv.second.second;
               }
+              // Phase-22: seed the per-index range histogram from the SAME fetch
+              // (independent of NDV availability; DATE indexes get a histogram but
+              // no NDV). Only well-formed, monotone snapshots are admitted.
+              share->index_hist_.clear();
+              for (const auto &kv : ctx->proxy->last_index_hist()) {
+                const auto &h = kv.second;
+                if (!h.available || h.bounds.empty() ||
+                    h.bounds.size() != h.cum.size())
+                  continue;
+                LineairDB_share::RangeHist rh;
+                rh.bounds = h.bounds;
+                rh.cum = h.cum;
+                share->index_hist_[kv.first] = std::move(rh);
+              }
+              if (std::getenv("HELIOS_STATS_DEBUG") != nullptr) {
+                size_t recv = ctx->proxy->last_index_hist().size();
+                fprintf(stderr,
+                        "[RANGEHIST] seed %s: received=%zu seeded=%zu\n",
+                        db_table_name.c_str(), recv, share->index_hist_.size());
+              }
               // Remember the row count this NDV snapshot belongs to (the
               // staleness check above compares future counts against it).
               share->index_ndv_records_.store(
@@ -3782,12 +3802,63 @@ ha_rows ha_lineairdb::records_in_range(uint inx, key_range *min_key,
       estimate = std::max(static_cast<ha_rows>(1), estimate / 2);
     }
   } else {
-    // No equality at all -> pure range scan.
-    // Heuristic: two-sided range ~5%, one-sided ~10% (NDB fallback).
+    // No equality at all -> pure range scan on the LEADING column.
+    // Heuristic baseline: two-sided ~5%, one-sided ~10% (NDB fallback).
     if (min_key != nullptr && max_key != nullptr) {
       estimate = std::max(static_cast<ha_rows>(2), total_records / 20);
     } else {
       estimate = std::max(static_cast<ha_rows>(2), total_records / 10);
+    }
+    // Phase-22 (HELIOS_RANGE_HIST, default OFF): replace the distribution-blind flat
+    // fraction with a server-built EQUI-DEPTH boundary histogram on the leading key
+    // part (fixes the dominant one-sided q3/q10 underestimate). Applied as a FLOOR
+    // (never below the heuristic) so it can only RAISE an underestimate, never lower
+    // a correct-or-high one (grounded-reviewer arbitration). READ-ONLY over
+    // SHARE-resident state seeded in info() -> ZERO plan-time RPC. Fail-closed to the
+    // heuristic on any absence/size/encoding mismatch. Step estimator (B buckets):
+    // inclusive/exclusive bound nuance is within bucket granularity (feasibility).
+    static const bool hist_gate = (std::getenv("HELIOS_RANGE_HIST") != nullptr);
+    if (hist_gate && key->name != nullptr && share != nullptr) {
+      std::lock_guard<std::mutex> g(share->index_ndv_mu_);
+      auto hit = share->index_hist_.find(key->name);
+      if (hit != share->index_hist_.end()) {
+        const LineairDB_share::RangeHist &h = hit->second;
+        if (!h.bounds.empty() && h.bounds.size() == h.cum.size()) {
+          const double total_live = static_cast<double>(h.cum.back());
+          // # live rows whose leading-part <= ek (step; ascending bounds, monotone cum)
+          auto rank_le = [&](const std::string &ek) -> double {
+            if (ek >= h.bounds.back()) return static_cast<double>(h.cum.back());
+            auto it = std::upper_bound(h.bounds.begin(), h.bounds.end(), ek);
+            if (it == h.bounds.begin()) return 0.0;
+            return static_cast<double>(h.cum[(it - h.bounds.begin()) - 1]);
+          };
+          const key_part_map lead = 1;  // leading column only
+          double lo = 0.0, hi = total_live;
+          if (min_key != nullptr) {
+            std::string ek = lineairdb_keyenc::convert_key_to_ldbformat(
+                table, inx, min_key->key, lead);
+            if (!ek.empty()) lo = rank_le(ek);
+          }
+          if (max_key != nullptr) {
+            std::string ek = lineairdb_keyenc::convert_key_to_ldbformat(
+                table, inx, max_key->key, lead);
+            if (!ek.empty()) hi = rank_le(ek);
+          }
+          const double est = hi - lo;
+          if (std::getenv("HELIOS_STATS_DEBUG") != nullptr) {
+            fprintf(stderr,
+                    "[RANGEHIST] idx=%s bounds=%zu total=%.0f lo=%.0f hi=%.0f "
+                    "est=%.0f heuristic=%lld\n",
+                    key->name, h.bounds.size(), total_live, lo, hi, est,
+                    (long long)estimate);
+          }
+          if (est >= 1.0 && static_cast<ha_rows>(est) > estimate)
+            estimate = static_cast<ha_rows>(est);  // FLOOR: only ever raise
+        }
+      } else if (std::getenv("HELIOS_STATS_DEBUG") != nullptr) {
+        fprintf(stderr, "[RANGEHIST] idx=%s NO histogram in share (count=%zu)\n",
+                key->name, share->index_hist_.size());
+      }
     }
   }
 

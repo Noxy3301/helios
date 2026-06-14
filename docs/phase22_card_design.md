@@ -185,7 +185,71 @@ MINOR: B configurable (default 64, test 128/256); proto field tags 4/5/6 + rebui
 NOT sufficient — also gate on wall-clock + RPC counters (worse-prefetch-path risk);
 leading-column-only scope explicit in the EXPLAIN validation list.
 
-_Status: v1 NO-GO. v2 (incorporating the above) pending — see the implementation-arc
-note: v2 + impl is a multi-component LineairDB-submodule change (DATE parser + boundary
-histogram + proto + server cache + proxy SHARE + records_in_range rank logic + rebuild
-+ co-tuning sweep + reload)._
+_Status: v1 NO-GO → v2 below._
+
+## 8. Design v2 — resolved, implementation-ready (FEASIBILITY-scoped)
+
+User framing: this branch confirms FEASIBILITY (does correcting range cardinality
+help?), not a production-complete estimator. So v2 implements ENOUGH to demonstrate
+the q3/q10 DATE-range fix with all INVARIANTS intact and fail-closed everywhere else.
+Scope: single-column leading-prefix range on INT/DATE indexes (the q3/q10 case;
+TPC-H date columns are NOT NULL); everything else → existing 5%/10% fallback.
+
+**Data model (resolves B2):** per (table, index, leading-col), the server emits an
+equi-depth boundary array of `B+1` entries, each `(encoded_key, cum_count)` where
+cum_count = number of live rows with key ≤ this boundary (cumulative, monotone). B=64
+default (env HELIOS_RANGE_HIST_BUCKETS). The encoded_key is the RAW stored key bytes
+(byte-identical to convert_key_to_ldbformat output) so proxy memcmp matches.
+
+**LineairDB (feature branch; resolves B1):** extend `count_key` / the
+ComputeIndexNdvInt ordered pass (database_impl.h:432-503) to (1) PARSE tag 0x30
+(kKeyTypeDatetime, 2-byte BE length-prefixed) in addition to 0x10 (int) for the
+LEADING part, and (2) over the same ordered live-key walk, record the leading-part key
++ running live-count at every ⌈live/B⌉-th live row → boundary array + total. Emit it
+in a NEW field; do NOT change the existing NDV `available` semantics (resolves the
+rec_per_key-perturbation half of the MAJOR: keep NDV unavailable/unchanged for DATE;
+only ADD boundaries). A separate `hist_available` = (boundaries non-empty).
+
+**proto (field tags 4/5/6 on IndexNdv):** `repeated bytes hist_bounds = 4;
+repeated uint64 hist_cum = 5; bool hist_available = 6;` (+ reuse total).
+
+**server:** cache hist_bounds/hist_cum in ndv_cache_ next to NDV (same key, same
+ANALYZE/force_recompute bust); ship in GetTableStats.
+
+**proxy SHARE + info():** seed a `std::vector<std::string> hist_bounds` +
+`std::vector<uint64_t> hist_cum` + `hist_available` per (index, leading-col) next to
+index_ndv_ (3143-3156); refresh with the existing >20%-drift gate (feasibility:
+NDV-drift gate is reused; histogram-specific freshness is a documented follow-up).
+
+**records_in_range estimator (resolves B2 rank + the encoder MAJOR; gate
+HELIOS_RANGE_HIST default OFF):** in the pure-range branch (3784-3792), iff
+hist_available for this `inx`'s leading col AND the range is a single-col INT/DATE
+range:
+- encode min/max via the FREE `lineairdb_keyenc::convert_key_to_ldbformat(table, inx,
+  key, keypart_map_leading)` (NOT the active_index-bound member), keypart_map from the
+  leading col of key_parts_used.
+- define `rank_le(k)=cum_count at the last boundary with boundary_key ≤ k` (binary
+  search), `rank_lt`, and for the open ends use 0 / total. estimate =
+  rank_hi − rank_lo per the key_range flags (HA_READ_KEY_EXACT/OR_NEXT/AFTER_KEY/
+  BEFORE_KEY → le/lt selection). Whole-boundary STEP granularity (named as such; B=64
+  → ±~1.56%; feasibility-adequate for the 48–54% target; sub-bucket interpolation is a
+  documented follow-up).
+- **FLOOR (grounded-reviewer arbitration):** `return max(step_estimate,
+  current_fixed_fraction)` — fixes the dominant one-sided UNDERESTIMATE; never lowers.
+  Documented limitation: cannot correct a true-value-below-fraction case.
+- **fail-closed:** absent/multi-part/non-INT-DATE/encode-mismatch/non-monotone bounds
+  → exact current 5%/10%. **records_in_range is strictly READ-ONLY wrt the stats cache
+  (no RPC / lazy-fill / recompute)** — boundaries are SHARE-resident only (resolves the
+  zero-plan-time-RPC MAJOR); add a fallback counter.
+
+**co-tuning (resolves B3, honest):** ship the histogram (gate ON) and SEPARATELY
+re-run the M2b C_materialise sweep. RESET C_materialise from its physical anchor
+(~0.2–0.33 cu) as the starting point, then find the lowest value that keeps the
+22-suite net-positive + md5 22/22. The OUTCOME is reported as measured — C_materialise
+may settle ABOVE physical if a join-NLJ residual remains (NOT asserted to reach
+physical). Acceptance = (histogram, C_mat) pair that is net-positive + md5 22/22 +
+q3/q10 q-error ≤~2×, with wall-clock + RPC counters (not cardinality alone) as the gate.
+
+**Invariants (unchanged, sacrosanct):** MySQL core untouched; advisory stats never in
+OCC read-set (boundaries ride the NDV stats path, outside the txn read path); 1SR;
+fail-closed; LineairDB on a feature branch; md5 22/22 mandatory on every plan flip.

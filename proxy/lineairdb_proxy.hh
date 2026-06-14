@@ -120,6 +120,16 @@ public:
     const std::unordered_map<std::string,
                              std::pair<bool, std::vector<uint64_t>>>&
     last_index_ndv() const { return last_index_ndv_; }
+    // Phase-22 per-index equi-depth range histogram from the most recent
+    // fetch_table_stats (index_name -> {available, ascending boundary keys,
+    // cumulative live counts}). Empty/absent => use the 5%/10% heuristic.
+    struct IndexHist {
+        bool available = false;
+        std::vector<std::string> bounds;
+        std::vector<uint64_t> cum;
+    };
+    const std::unordered_map<std::string, IndexHist>&
+    last_index_hist() const { return last_index_hist_; }
     void tx_abort(int64_t tx_id);
 
     // primary key operations
@@ -387,6 +397,8 @@ private:
     // Phase 2: per-index NDV from the most recent fetch_table_stats with NDV.
     std::unordered_map<std::string, std::pair<bool, std::vector<uint64_t>>>
         last_index_ndv_;
+    // Phase-22: per-index equi-depth range histogram from the same fetch.
+    std::unordered_map<std::string, IndexHist> last_index_hist_;
     template<typename RequestType, typename ResponseType>
     bool send_protobuf_message(const RequestType& request, ResponseType& response,
                                MessageType message_type, const std::string& meta = "");
