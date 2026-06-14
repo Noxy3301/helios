@@ -393,10 +393,22 @@ public:
     // +prefetch win once R is large, while selective small-R ranges (small extra)
     // and covering scans (index_scan_cost, untouched) stay cheap. (Phase-22 M1.)
     Cost_estimate c = helios_ref_cost(ranges, rows);
-    c.add_io(std::ceil(rows / kEffBatch()) * kC_rpc());
-    c.add_cpu(rows * kC_materialise());
+    // M2 gate: charge per-row PK materialisation ONLY when rows are actually
+    // materialised per-row to the proxy. Skip it when this scan feeds a bulk-
+    // prefetched / server-aggregated single-table grouped read-only SELECT
+    // (q15/q1/q6 shape) -- there the rows are bulk-staged, not per-row fetched,
+    // so the charge would wrongly flip it to a full scan. Out-of-line because
+    // TABLE is incomplete in this header. Conservative default = charge.
+    if (helios_charge_materialise()) {
+      c.add_io(std::ceil(rows / kEffBatch()) * kC_rpc());
+      c.add_cpu(rows * kC_materialise());
+    }
     return c;
   }
+  // M2: returns true iff read_cost should add the per-row materialisation charge
+  // (i.e. this non-covering scan really materialises base rows per-row to the
+  // proxy). Defined in ha_lineairdb.cc (needs the complete TABLE/Query_block).
+  bool helios_charge_materialise() const;
 
   Cost_estimate index_scan_cost(uint index, double ranges, double rows) override
   {

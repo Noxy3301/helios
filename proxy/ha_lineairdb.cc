@@ -4088,6 +4088,38 @@ static bool lineairdb_predict_prefetch_mode(THD *thd) {
   return srv_prefetch_execution && thd_can_use_prefetch(thd);
 }
 
+// Phase-22 M2 gate for read_cost()'s per-row materialisation charge. Returns
+// true when the non-covering scan really materialises base rows per-row to the
+// proxy (-> charge), false when the rows are bulk-prefetched / server-aggregated
+// (-> skip). Reads ONLY prepare-time Query_block + THD state (group/leaf shape),
+// which exists at best_access_path/read_cost time (JOIN::optimize make_join_plan);
+// it must NOT touch tx aggregate state or the finalized QEP, which are set later
+// at push_to_engine. The "single-table grouped read-only SELECT under prefetch"
+// shape is the necessary precondition shared by helios_try_register_gs /
+// helios_offloadable_shape, so the cost model and the executor agree on which
+// scans are per-row-materialised. Conservative default (missing context) = charge
+// (today's proven M1 pricing -> never under-prices a real per-row join scan).
+bool ha_lineairdb::helios_charge_materialise() const {
+  const TABLE *t = table;
+  if (t == nullptr || t->in_use == nullptr) return true;
+  THD *thd = t->in_use;
+  if (thd->lex == nullptr) return true;
+  if (thd->lex->sql_command != SQLCOM_SELECT || thd->lex->is_explain())
+    return true;                                    // DML / EXPLAIN -> per-row
+  if (t->reginfo.lock_type > TL_READ) return true;  // locked read -> not bulk-staged
+  if (!lineairdb_predict_prefetch_mode(thd)) return true;  // no bulk prefetch
+  Table_ref *tr = t->pos_in_table_list;
+  if (tr == nullptr) return true;
+  Query_block *qb = tr->query_block;
+  if (qb == nullptr) return true;
+  // Single-table grouped read-only SELECT = the bulk-staged / server-aggregated
+  // shape (q15 view body, q1/q6): rows are NOT per-row materialised to the proxy.
+  if (qb->leaf_table_count != 1 || !qb->is_grouped()) return true;
+  if (qb->is_distinct() || qb->olap != UNSPECIFIED_OLAP_TYPE || qb->has_windows())
+    return true;
+  return false;  // bulk/agg-served -> skip the materialisation charge
+}
+
 /**
  * @brief Advertise custom batch MRR for primary-key point lookups.
  *
