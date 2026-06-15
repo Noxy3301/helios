@@ -52,6 +52,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include "helios_gate.hh"
 #include "lineairdb_field_types.h"
 #include "lineairdb_field.hh"
 #include "lineairdb_transaction.hh"
@@ -333,8 +334,11 @@ public:
    * units (ROW_EVALUATE_COST=0.1).
    */
   static bool helios_cost_v2_on() {
-    static const char *e = std::getenv("HELIOS_COST_V2");
-    return e != nullptr && e[0] == '1';
+    // Phase-22: default-ON. Disabled only by an explicit HELIOS_COST_V2=0
+    // (or false/off/no). OLTP-safe (TPC-C parity in isolation tests); the
+    // OLTP-catastrophic feature is HELIOS_AGG_PUSHDOWN, which stays opt-in.
+    static const bool on = helios::gate_default_on("HELIOS_COST_V2");
+    return on;
   }
   static double helios_cost_param(const char *name, double def) {
     const char *e = std::getenv(name);
@@ -409,7 +413,7 @@ public:
     // (q15/q1/q6 shape) -- there the rows are bulk-staged, not per-row fetched,
     // so the charge would wrongly flip it to a full scan. Out-of-line because
     // TABLE is incomplete in this header. Conservative default = charge.
-    if (helios_charge_materialise()) {
+    if (helios_charge_materialise(index)) {
       c.add_io(std::ceil(rows / kEffBatch()) * kC_rpc());
       c.add_cpu(rows * kC_materialise());
     }
@@ -418,7 +422,9 @@ public:
   // M2: returns true iff read_cost should add the per-row materialisation charge
   // (i.e. this non-covering scan really materialises base rows per-row to the
   // proxy). Defined in ha_lineairdb.cc (needs the complete TABLE/Query_block).
-  bool helios_charge_materialise() const;
+  // `index` lets it skip the charge for a clustered-PRIMARY-KEY access, which has
+  // no index->PK double-hop (Phase-22 A2a). TABLE->s is incomplete in this header.
+  bool helios_charge_materialise(uint index) const;
 
   Cost_estimate index_scan_cost(uint index, double ranges, double rows) override
   {

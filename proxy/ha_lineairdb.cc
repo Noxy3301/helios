@@ -94,6 +94,7 @@
 
 #include "storage/lineairdb/ha_lineairdb.hh"
 #include "../common/log.h"
+#include "helios_gate.hh"
 #include "lineairdb_keyenc.hh"
 
 #include <algorithm>
@@ -118,6 +119,7 @@
 #include "my_dbug.h"
 #include "mysql/plugin.h"
 #include "sql/field.h"
+#include "sql/key.h"  // key_restore (Phase-22 D1 trailing-range decode)
 #include "sql/item.h"
 #include "sql/item_cmpfunc.h"
 #include "sql/item_func.h"
@@ -257,7 +259,10 @@ static handler *lineairdb_create_handler(handlerton *hton, TABLE_SHARE *table,
 // an empty result set instead of its normal rows, with no crash and correct
 // protocol (metadata + EOF are sent by the caller around the override).
 static bool helios_agg_pushdown_enabled() {
-  static const bool on = std::getenv("HELIOS_AGG_PUSHDOWN") != nullptr;
+  // Opt-in (default-OFF): the OLTP-catastrophic feature, enabled only by an
+  // explicit HELIOS_AGG_PUSHDOWN=1 (or true/on/yes). Previously presence-based,
+  // which wrongly treated `=0` as enabled (Phase-22 / Codex review #4).
+  static const bool on = helios::gate_default_off("HELIOS_AGG_PUSHDOWN");
   return on;
 }
 
@@ -3046,9 +3051,9 @@ int ha_lineairdb::info(uint flag) {
     // per-index NDV is not yet loaded (HELIOS_OPT_STATS): otherwise a row count
     // arriving via the begin/end piggyback would permanently suppress the NDV
     // fetch (Codex review #4).
-    static const char *opt_stats_env = std::getenv("HELIOS_OPT_STATS");
-    static const bool opt_stats_on =
-        opt_stats_env != nullptr && opt_stats_env[0] == '1';
+    // Phase-22: default-ON (companion to HELIOS_COST_V2; the cost model needs
+    // the per-index NDV/rec_per_key it loads). Disabled by HELIOS_OPT_STATS=0.
+    static const bool opt_stats_on = helios::gate_default_on("HELIOS_OPT_STATS");
     const bool need_rowcount =
         share->stats_base_records.load(std::memory_order_relaxed) == 0;
     // NDV staleness (plan-stability fix): refetch when the row count has
@@ -3117,7 +3122,8 @@ int ha_lineairdb::info(uint flag) {
           // would otherwise see stats.records==2 and pick full-scan + bad join
           // order. On a cache-miss, do a transaction-less GET_TABLE_STATS RPC
           // once, then seed the GLOBAL share (persists across connections).
-          // GATED (HELIOS_OPT_STATS=1, default OFF). Phase 2: fetch the real row
+          // GATED (HELIOS_OPT_STATS, Phase-22 default-ON; disable with
+          // HELIOS_OPT_STATS=0). Phase 2: fetch the real row
           // count AND per-index NDV in one RPC, then seed the GLOBAL share.
           // rec_per_key is then computed from real NDV (see set_generic_rec_per_key)
           // instead of the n-th-root heuristic that mis-treated non-unique FK
@@ -3720,6 +3726,30 @@ int ha_lineairdb::rename_table(const char *, const char *, const dd::Table *,
   @see
   check_quick_keys() in opt_range.cc
 */
+// Phase-22 D1: decode a fixed-width integer key part from a range endpoint's key
+// buffer via the official key_restore path (signedness / key-format / byte-order
+// safe; raw byte reads are not). Restores into the scratch record[1] so record[0]
+// is untouched, then reads the field there via move_field_offset. Returns false on
+// any shape we don't handle -> caller falls back to the /2 heuristic.
+static bool helios_decode_keypart_int(TABLE *table, KEY *key, uint part,
+                                      const key_range *kr, longlong *out) {
+  if (table == nullptr || kr == nullptr || kr->key == nullptr) return false;
+  if (part >= key->user_defined_key_parts) return false;
+  const KEY_PART_INFO &kp = key->key_part[part];
+  Field *f = kp.field;
+  if (f == nullptr || f->result_type() != INT_RESULT) return false;  // fixed int only
+  if (f->is_nullable()) return false;                   // skip null-marker complexity
+  if (kp.key_part_flag & HA_REVERSE_SORT) return false; // ascending only
+  uchar *scratch = table->record[1];
+  if (scratch == nullptr) return false;
+  key_restore(scratch, const_cast<uchar *>(kr->key), key, kr->length);
+  const ptrdiff_t delta = static_cast<ptrdiff_t>(scratch - table->record[0]);
+  f->move_field_offset(delta);
+  *out = f->val_int();
+  f->move_field_offset(-delta);
+  return true;
+}
+
 ha_rows ha_lineairdb::records_in_range(uint inx, key_range *min_key,
                                        key_range *max_key) {
   DBUG_TRACE;
@@ -3807,9 +3837,38 @@ ha_rows ha_lineairdb::records_in_range(uint inx, key_range *min_key,
     } else {
       estimate = 1;
     }
-    // Range conditions after equality prefix -> halve (NDB heuristic)
+    // Range after the equality prefix. Phase-22 D1: the eq prefix bounds the
+    // group; the trailing RANGE must narrow it. Averaged rec_per_key can't see a
+    // range, so the old /2 returned the WHOLE prefix group (order_line PK
+    // (w,d,o,n): rec_per_key[1]=records/NDV(w,d)~=30000, /2~=17802 for a 20-order
+    // window vs ~273 actual = 66x over -> 38x TPC-C collapse on the OPT_STATS join
+    // path). Estimate instead, InnoDB-index-dive style (SOTA survey + Codex GO):
+    //   rows ~= (#trailing key-values in [lo,hi]) * rec_per_key[eq_parts]
+    // where rec_per_key[eq_parts] = avg rows per distinct trailing value. Only
+    // under HELIOS_OPT_STATS (NDV-real rec_per_key); fail-closed to /2 on any
+    // non-int / nullable / descending / missing-endpoint / decode miss.
     if (eq_parts < key_parts_used) {
-      estimate = std::max(static_cast<ha_rows>(1), estimate / 2);
+      static const bool trail_on =
+          helios::gate_default_on("HELIOS_OPT_STATS") &&
+          helios::gate_default_on("HELIOS_TRAIL_RANGE");
+      longlong lo = 0, hi = 0;
+      if (trail_on && eq_parts < key->user_defined_key_parts &&
+          key->rec_per_key[eq_parts] > 0 &&
+          helios_decode_keypart_int(table, key, eq_parts, min_key, &lo) &&
+          helios_decode_keypart_int(table, key, eq_parts, max_key, &hi) &&
+          hi >= lo) {
+        const double rpk_deep = static_cast<double>(key->rec_per_key[eq_parts]);
+        // #distinct trailing values in the range (endpoint inclusivity is within
+        // estimate noise; floor 1 covers hi==lo / half-open).
+        const double range_vals = (hi > lo) ? static_cast<double>(hi - lo) : 1.0;
+        double est = range_vals * rpk_deep;
+        const double cap = static_cast<double>(key->rec_per_key[rpk_idx]);
+        if (cap >= 1.0 && est > cap) est = cap;  // can't exceed the eq-prefix group
+        if (est < 1.0) est = 1.0;                // floor 1 (Codex: no lower clamp)
+        estimate = static_cast<ha_rows>(est);
+      } else {
+        estimate = std::max(static_cast<ha_rows>(1), estimate / 2);  // fallback
+      }
     }
   } else {
     // No equality at all -> pure range scan on the LEADING column.
@@ -3827,7 +3886,14 @@ ha_rows ha_lineairdb::records_in_range(uint inx, key_range *min_key,
     // SHARE-resident state seeded in info() -> ZERO plan-time RPC. Fail-closed to the
     // heuristic on any absence/size/encoding mismatch. Step estimator (B buckets):
     // inclusive/exclusive bound nuance is within bucket granularity (feasibility).
-    static const bool hist_gate = (std::getenv("HELIOS_RANGE_HIST") != nullptr);
+    // Phase-22: kept OPT-IN (default-OFF). The fullidx/noidx sweep showed it is
+    // NEUTRAL in the default (AGG-off) deployment (its q3/q10 q-error benefit only
+    // manifests in the AGG-on analytical regime, where it took the suite
+    // 31.75->28.42s), and Codex (#2) cautioned that a floor-only estimate bump
+    // can still flip plans on unmeasured workloads. So it rides with
+    // HELIOS_AGG_PUSHDOWN as an analytical opt-in (enable with HELIOS_RANGE_HIST=1).
+    // FLOOR-only + fail-closed to the heuristic on any absence/encoding mismatch.
+    static const bool hist_gate = helios::gate_default_off("HELIOS_RANGE_HIST");
     if (hist_gate && key->name != nullptr && share != nullptr) {
       std::lock_guard<std::mutex> g(share->index_ndv_mu_);
       auto hit = share->index_hist_.find(key->name);
@@ -4181,9 +4247,21 @@ static bool lineairdb_predict_prefetch_mode(THD *thd) {
 // helios_offloadable_shape, so the cost model and the executor agree on which
 // scans are per-row-materialised. Conservative default (missing context) = charge
 // (today's proven M1 pricing -> never under-prices a real per-row join scan).
-bool ha_lineairdb::helios_charge_materialise() const {
+bool ha_lineairdb::helios_charge_materialise(uint index) const {
   const TABLE *t = table;
   if (t == nullptr || t->in_use == nullptr) return true;
+  // Phase-22 A2a: a clustered-PRIMARY-KEY range/ref has NO index->PK double-hop
+  // (the PK scan brings the row directly; helios_ref_cost's transfer term already
+  // covers it), so it must NOT pay the per-row PK materialisation RPC. Without
+  // this, a tiny-table OLTP PK UPDATE (warehouse 1-2 rows / district 10) was
+  // priced ABOVE a full scan (PK 58.6 > scan 53.1), flipped to type=ALL, and then
+  // rejected by the prefetch path ("legacy DML full/reverse table scan") -> the
+  // TPC-C goodput collapse. TPC-H-orthogonal: non-covering SECONDARY refs
+  // (index != primary_key) still charge; eq_ref NLJ is priced at
+  // sql_planner.cc:433 via engine_cost, never through read_cost/this gate.
+  if (t->s != nullptr && t->s->primary_key != MAX_KEY &&
+      index == t->s->primary_key)
+    return false;
   THD *thd = t->in_use;
   if (thd->lex == nullptr) return true;
   if (thd->lex->sql_command != SQLCOM_SELECT || thd->lex->is_explain())

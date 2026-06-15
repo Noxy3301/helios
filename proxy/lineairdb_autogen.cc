@@ -10,6 +10,7 @@
 #include <utility>
 #include <vector>
 
+#include "helios_gate.hh"
 #include "lineairdb_keyenc.hh"
 #include "lineairdb_pushdown.hh"
 #include "lineairdb_transaction.hh"
@@ -108,6 +109,8 @@ bool raise_unsupported(THD *thd, const char *type_name,
   msg += " sql=";
   msg += sql;
 
+  if (std::getenv("HELIOS_REJECT_DEBUG") != nullptr)
+    std::fprintf(stderr, "[REJECT-AUTOGEN] %s\n", msg.c_str());
   my_error(ER_NOT_SUPPORTED_YET, MYF(0), msg.c_str());
   return false;
 }
@@ -1492,7 +1495,9 @@ bool autogen_read_plan_from_qep(
   // SemijoinFilter: the server ships only probe rows whose key appears among
   // the (predicate-passing) source rows. Results are unchanged for plain
   // inner equi-joins (helios_sj_safe_leaf / key-compat guards).
-  static const bool semijoin_on = std::getenv("HELIOS_ENABLE_SEMIJOIN") != nullptr;
+  // Phase-22: default-ON (net-win on TPC-H, q21 SIP; TPC-C parity in isolation
+  // tests). Disabled by HELIOS_ENABLE_SEMIJOIN=0.
+  static const bool semijoin_on = helios::gate_default_on("HELIOS_ENABLE_SEMIJOIN");
   if (semijoin_on && allow_filter_pushdown && !eq_edges.empty()) {
     std::unordered_map<Field *, Field *> uf;
     std::function<Field *(Field *)> find_root = [&](Field *x) -> Field * {
