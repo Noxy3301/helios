@@ -109,8 +109,6 @@ bool raise_unsupported(THD *thd, const char *type_name,
   msg += " sql=";
   msg += sql;
 
-  if (std::getenv("HELIOS_REJECT_DEBUG") != nullptr)
-    std::fprintf(stderr, "[REJECT-AUTOGEN] %s\n", msg.c_str());
   my_error(ER_NOT_SUPPORTED_YET, MYF(0), msg.c_str());
   return false;
 }

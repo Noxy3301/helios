@@ -90,6 +90,15 @@ TPC-C execution failure(§5)はdependency chainにおいてD1 cardinality bugの
 ## 9. D1 fix SHIPPED — records_in_rangeでのtrailing-range narrowing
 eq-prefix + trailing-rangeの`estimate/2`(ha_lineairdb.cc:3816)をInnoDB-index-dive-styleなestimateに置換した: trailing key-partの整数をmin_key/max_keyから`key_restore`経由でdecodeし(signedness/key-format safe, scratch `record[1]` + move_field_offsetへ)、`range_vals * rec_per_key[eq_parts]`を`rec_per_key[eq_parts-1]`でcapして推定、floor 1。HELIOS_OPT_STATS下でgate(+ HELIOS_TRAIL_RANGE kill switch)、non-int / nullable / descending / missing-endpoint / decode missの各caseで`/2`へfail-close。新規`helios_decode_keypart_int` helper。Codex ②設計 GO-WITH-CHANGESを適用(floor 1, lower clampなし, safe key_restore decode, guards)。
 
-**RESULT (cost_v2+opt_stats, A2a+D1 binary):** order_line range estimate **17802 → 220**(~actual 273); stockは`eq_ref`でjoinする; cost_v2+opt_stats+prefetch TPC-C **goodput 394 / errors 0 / reject 0**(= stock ~390)。TPC-H md5/suite no-regression: _pending eval_。
+**RESULT (cost_v2+opt_stats, A2a+D1 binary):** order_line range estimate **17802 → 220**(~actual 273); stockは`eq_ref`でjoinする; cost_v2+opt_stats+prefetch TPC-C **goodput 394 / errors 0 / reject 0**(= stock ~390)。**TPC-H md5/suite no-regression CONFIRMED:** md5 base/full **22/22**(MISMATCH=0); fullidx full 94.9s(A2aの94.3sと同等 → suite-neutral)。
 
-**STATUS:** A2a + D1により、default-deployment cost model(COST_V2 + OPT_STATS + SEMIJOIN, AGG opt-in)は今やTPC-C-clean(reject 0, errors 0, goodput = stock)AND TPC-H net-positive + md5である — cost-model default-onへの2つのOLTP blockerはクリアされた。Remaining: D1でのTPC-H md5/suite re-confirm、および最終commit cleanup(reject debug logをrevert/gate、A2a commentをtighten)。
+**STATUS:** A2a + D1により、default-deployment cost model(COST_V2 + OPT_STATS + SEMIJOIN, AGG opt-in)は今やTPC-C-clean(reject 0, errors 0, goodput = stock)AND TPC-H net-positive + md5である — cost-model default-onへの2つのOLTP blockerはクリアされた。
+
+## 10. D2 fix SHIPPED — AGG pushdownがaccess pathを尊重する(AGGをOLTP-safe化)
+「fallbackで逃げる」のではなくcost_v2をautogen-compatibleなplanへsteerしたA2a/D1と異なり、D2はAGG pushdown(opt-in)自体を直す。AGG overrideは`helios_override_executor`が`ha_rnd_init`(full table scan)をoptimizerの選んだaccess pathに関わらず駆動していた — TPC-C Delivery `SUM(ol_amount) WHERE w=? AND d=? AND o=?`(PK-bounded ~10行)が~300k full scanになり、AGG-onでTPC-C崩壊(16.6 req/s)。
+
+**Fix:** `lineairdb_push_to_engine`(ha_lineairdb.cc:1742)で破棄されていた`root_path`を使い、`WalkAccessPaths`で最初のbase-table leafを取り、leafがbounded(REF/REF_OR_NULL/EQ_REF/INDEX_RANGE_SCAN)かつsmall(`num_output_rows() < kMinScanRows=1000`)ならoverrideをinstallしない(MySQLの通常bounded pipeline + native aggregationに委譲)。TABLE_SCAN / full INDEX_SCAN(TPC-H q1/q6/q18, large estimate)は依然fire。④review hardeningでleafがblock自身のtableか明示確認(fail-closed)。
+
+**RESULT (full bundle + AGG on):** AGG-on TPC-C **goodput 16.6→391, errors 0**(Delivery 4940 skip, install 0); AGG-on TPC-H **md5 22/22**, suite 40s(install 9 = q1/q6/q18依然fire, skip 0 = 誤爆なし)。**AGGがOLTP-safe化した。** ④ grounded review = GO(WalkAccessPaths API-correct, wrong-leafなし, GS/grouped-semijoinとstate orthogonal, 結果不変 = optimize-time install/skip判断のみ)。Codexは環境block継続(`bwrap` loopback)。
+
+**最終blocker chain:** (1)✅ A2a eq_ref pricing → (2)✅ D1 cardinality → (3)✅ D2 AGG access-path = **cost model も AGG も両方OLTP-safe**。reject debug logはrevert済(役目終了)。残: AGG自体をdefault-onにするかは閾値1000の頑健性を別workloadで確認後に判断(現状opt-in維持)。

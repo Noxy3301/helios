@@ -130,6 +130,7 @@
 #include "sql/table.h"
 #include "sql/sql_optimizer.h"             // JOIN
 #include "sql/join_optimizer/access_path.h"  // AccessPath (QEP tree)
+#include "sql/join_optimizer/walk_access_paths.h"  // WalkAccessPaths (Phase-22 D2)
 #include "sql/join_optimizer/materialize_path_parameters.h"  // MATERIALIZE param
 #include "sql/query_result.h"                 // Query_result (Phase-8 override)
 #include "sql/item_sum.h"                     // Item_sum (Phase-8 aggregation)
@@ -1739,12 +1740,54 @@ static void helios_try_register_grouped_semijoin(THD *thd, JOIN *join) {
   hl->tx_register_gs(std::move(reg));
 }
 
-static int lineairdb_push_to_engine(THD *thd, AccessPath * /*root_path*/,
+static int lineairdb_push_to_engine(THD *thd, AccessPath *root_path,
                                     JOIN *join) {
   if (!helios_agg_pushdown_enabled()) return 0;
   helios_try_register_gs(thd, join);  // self-gating (derived inner units)
   helios_try_register_grouped_semijoin(thd, join);  // self-gating (q18 IN)
   if (!helios_offloadable_shape(thd, join)) return 0;
+  // Phase-22 D2: do NOT hijack a BOUNDED, SMALL aggregate into a full table scan.
+  // helios_override_executor drives ha_rnd_init (a full-table-scan RPC); for a
+  // PK-prefix / ref / range access with few rows (TPC-C Delivery SUM over ~10
+  // order_line rows) that becomes a ~300k full scan -> AGG-on OLTP collapse. When
+  // the optimizer already chose a bounded+small access path, leave the override
+  // uninstalled so MySQL's normal bounded pipeline + native aggregation run.
+  // TABLE_SCAN / full INDEX_SCAN (TPC-H q1/q6/q18, large estimate) keep firing.
+  if (root_path != nullptr) {
+    const AccessPath *leaf = nullptr;
+    WalkAccessPaths(root_path, join, WalkAccessPathPolicy::ENTIRE_TREE,
+                    [&leaf](AccessPath *p, const JOIN *) -> bool {
+                      if (GetBasicTable(p) != nullptr) {
+                        leaf = p;
+                        return true;  // first base-table leaf -> stop the walk
+                      }
+                      return false;
+                    });
+    // ④-review hardening: act ONLY on the block's own single base table
+    // (helios_offloadable_shape already enforced leaf_table_count==1). Fail
+    // closed (keep firing AGG) if the walked leaf is somehow not that table.
+    const TABLE *leaf_tbl = (leaf != nullptr) ? GetBasicTable(leaf) : nullptr;
+    if (leaf_tbl != nullptr && join->query_block != nullptr &&
+        join->query_block->leaf_tables != nullptr &&
+        leaf_tbl == join->query_block->leaf_tables->table) {
+      const double rows = leaf->num_output_rows();
+      const bool bounded = leaf->type == AccessPath::REF ||
+                           leaf->type == AccessPath::REF_OR_NULL ||
+                           leaf->type == AccessPath::EQ_REF ||
+                           leaf->type == AccessPath::INDEX_RANGE_SCAN;
+      static const double kMinScanRows = [] {
+        const char *e = std::getenv("HELIOS_AGG_MIN_SCAN_ROWS");
+        return (e && e[0]) ? std::atof(e) : 1000.0;
+      }();
+      if (bounded && rows >= 0.0 && rows < kMinScanRows) {
+        if (std::getenv("HELIOS_FE_DEBUG"))
+          std::fprintf(stderr,
+                       "[AGGPD] skip override: bounded access type=%d rows=%.0f\n",
+                       static_cast<int>(leaf->type), rows);
+        return 0;  // bounded+small -> normal bounded execution + native agg
+      }
+    }
+  }
   if (std::getenv("HELIOS_FE_DEBUG"))
     std::fprintf(stderr, "[AGGPD] installing override_executor_func%s\n",
                  join->query_block->outer_query_block() != nullptr

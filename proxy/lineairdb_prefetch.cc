@@ -605,8 +605,6 @@ int prefetch_reject_unsupported(THD *thd, LineairDBTransaction *tx,
       msg.append(query.str, query.length);
     }
   }
-  if (std::getenv("HELIOS_REJECT_DEBUG") != nullptr)
-    std::fprintf(stderr, "[REJECT-PREFETCH] %s\n", msg.c_str());
   my_error(ER_NOT_SUPPORTED_YET, MYF(0), msg.c_str());
   if (tx != nullptr) tx->set_status_to_abort();
   thd_mark_transaction_to_rollback(thd, 1);
