@@ -2,6 +2,7 @@
 .claude
 .codex
 .note
+.cache
 CLAUDE.md
 
 build
