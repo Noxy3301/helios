@@ -265,7 +265,7 @@ private:
   std::string pushed_filter_;
 
   // Max number of buffered write/delete ops before an automatic flush
-  static constexpr size_t WRITE_BATCH_SIZE = 100;
+  static constexpr size_t WRITE_BATCH_SIZE = 1024;
   // Pending RPC flush queue for row and secondary-index ops in MySQL order
   std::vector<LineairDBProxy::BatchOp> write_buffer_ops_;
 
