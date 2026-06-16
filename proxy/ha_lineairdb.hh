@@ -175,7 +175,15 @@ public:
     This is a list of flags that indicate what functionality the storage engine
     implements. The current table flags are documented in handler.h
   */
-  ulonglong table_flags() const override { return HA_BINLOG_ROW_CAPABLE; }
+  // HA_BLOCK_CONST_TABLE keeps the optimizer from const-folding equality
+  // lookups on this engine. A const-table read happens during JOIN::optimize
+  // (read_const), before the QEP root_access_path exists, so the statement-
+  // scoped autogen prefetch hook cannot see it and would issue a per-row RPC
+  // or abort. Blocking const-table demotes such lookups to JT_EQ_REF, moving
+  // the read into the execution phase where autogen batches it into one RPC.
+  ulonglong table_flags() const override {
+    return HA_BINLOG_ROW_CAPABLE | HA_BLOCK_CONST_TABLE;
+  }
 
   /** @brief
     This is a bitmap of flags that indicates how the storage engine
@@ -413,6 +421,12 @@ private:
   bool mrr_use_batch_ = false;
   LineairDBTransaction *&
   get_transaction(THD *thd);
+  /**
+   * @brief Map an aborted transaction to a handler errno: HA_ERR_UNSUPPORTED
+   * (non-retryable) for a prefetch cache miss, or HA_ERR_LOCK_DEADLOCK (MySQL's
+   * conventional retry signal) for a genuine OCC abort.
+   */
+  int abort_errno(LineairDBTransaction *tx);
 
   // Key conversion helpers
   static std::string encode_int_key(const uchar *data, size_t len);

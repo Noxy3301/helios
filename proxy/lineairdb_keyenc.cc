@@ -1,7 +1,6 @@
 // lineairdb_keyenc.cc
 // LineairDB Storage Engine: MySQL index key <-> LineairDB key/range encoding.
-// Relocated from ha_lineairdb.cc (handler API stays there). These remain
-// ha_lineairdb member definitions; declarations live in ha_lineairdb.hh.
+// Handler members delegate to the free functions in this module.
 
 #include "storage/lineairdb/ha_lineairdb.hh"
 #include "../common/log.h"
@@ -31,7 +30,9 @@
 #include "sql/item_func.h"
 #include "lineairdb_keyenc.hh"
 
-unsigned char ha_lineairdb::key_part_type_tag(LineairDBFieldType type) {
+namespace lineairdb_keyenc {
+
+unsigned char key_part_type_tag(LineairDBFieldType type) {
   switch (type) {
   case LineairDBFieldType::LINEAIRDB_INT:
     return kKeyTypeInt;
@@ -45,9 +46,9 @@ unsigned char ha_lineairdb::key_part_type_tag(LineairDBFieldType type) {
   }
 }
 
-void ha_lineairdb::append_key_part_encoding(std::string &out, bool is_null,
-                                            LineairDBFieldType type,
-                                            const std::string &payload) {
+void append_key_part_encoding(std::string &out, bool is_null,
+                              LineairDBFieldType type,
+                              const std::string &payload) {
   constexpr size_t kLengthFieldSize = 2;
   const size_t max_payload_length = std::numeric_limits<uint16_t>::max();
   size_t copy_length = std::min(payload.size(), max_payload_length);
@@ -97,7 +98,7 @@ void ha_lineairdb::append_key_part_encoding(std::string &out, bool is_null,
  * case we return an empty string as a sentinel for "no upper bound", which the
  * caller treats as an open-ended range (e.g., converted to std::nullopt).
  */
-std::string ha_lineairdb::build_prefix_range_end(const std::string &prefix) {
+std::string build_prefix_range_end(const std::string &prefix) {
   std::string end = prefix;
   for (size_t i = end.size(); i-- > 0;) {
     unsigned char byte = static_cast<unsigned char>(end[i]);
@@ -109,6 +110,22 @@ std::string ha_lineairdb::build_prefix_range_end(const std::string &prefix) {
   }
   // no upper bound
   return std::string();
+}
+
+}  // namespace lineairdb_keyenc
+
+unsigned char ha_lineairdb::key_part_type_tag(LineairDBFieldType type) {
+  return lineairdb_keyenc::key_part_type_tag(type);
+}
+
+void ha_lineairdb::append_key_part_encoding(std::string &out, bool is_null,
+                                            LineairDBFieldType type,
+                                            const std::string &payload) {
+  lineairdb_keyenc::append_key_part_encoding(out, is_null, type, payload);
+}
+
+std::string ha_lineairdb::build_prefix_range_end(const std::string &prefix) {
+  return lineairdb_keyenc::build_prefix_range_end(prefix);
 }
 
 /**
@@ -358,7 +375,9 @@ std::string ha_lineairdb::autogenerate_key() {
  * @param len Key length (1, 2, 4, or 8 bytes)
  * @return Big-endian binary string with sign bit flipped
  */
-std::string ha_lineairdb::encode_int_key(const uchar *data, size_t len) {
+namespace lineairdb_keyenc {
+
+std::string encode_int_key(const uchar *data, size_t len) {
   uint64_t value = 0;
 
   if (len == 1) {
@@ -414,8 +433,8 @@ std::string ha_lineairdb::encode_int_key(const uchar *data, size_t len) {
  * Must be converted to big-endian for correct lexicographic sorting.
  * DATETIME2, TIMESTAMP2, TIME2: already in big-endian sortable format.
  */
-std::string ha_lineairdb::encode_datetime_key(const uchar *data, size_t len,
-                                              enum_field_types mysql_type) {
+std::string encode_datetime_key(const uchar *data, size_t len,
+                                enum_field_types mysql_type) {
   if (mysql_type == MYSQL_TYPE_DATE || mysql_type == MYSQL_TYPE_NEWDATE) {
     char buf[3];
     buf[0] = static_cast<char>(data[2]);
@@ -436,7 +455,7 @@ std::string ha_lineairdb::encode_datetime_key(const uchar *data, size_t len,
  * @param len Total key length
  * @return Actual string data without prefix or padding
  */
-std::string ha_lineairdb::encode_string_key(const uchar *data, size_t len) {
+std::string encode_string_key(const uchar *data, size_t len) {
   if (len < 2)
     return std::string();
 
@@ -451,6 +470,21 @@ std::string ha_lineairdb::encode_string_key(const uchar *data, size_t len) {
 
   // Return actual string data (skip 2-byte prefix, exclude padding)
   return std::string(reinterpret_cast<const char *>(data + 2), str_len);
+}
+
+}  // namespace lineairdb_keyenc
+
+std::string ha_lineairdb::encode_int_key(const uchar *data, size_t len) {
+  return lineairdb_keyenc::encode_int_key(data, len);
+}
+
+std::string ha_lineairdb::encode_datetime_key(const uchar *data, size_t len,
+                                              enum_field_types mysql_type) {
+  return lineairdb_keyenc::encode_datetime_key(data, len, mysql_type);
+}
+
+std::string ha_lineairdb::encode_string_key(const uchar *data, size_t len) {
+  return lineairdb_keyenc::encode_string_key(data, len);
 }
 
 /**
@@ -472,9 +506,12 @@ std::string ha_lineairdb::encode_string_key(const uchar *data, size_t len) {
  * @param keypart_map Bitmap indicating which key parts are used
  * @return LineairDB formatted key string (concatenated sortable format)
  */
-std::string ha_lineairdb::convert_key_to_ldbformat(const uchar *key,
-                                                   key_part_map keypart_map) {
-  KEY *key_info = &table->key_info[active_index];
+namespace lineairdb_keyenc {
+
+std::string convert_key_to_ldbformat(TABLE *table, uint key_index,
+                                     const uchar *key,
+                                     key_part_map keypart_map) {
+  KEY *key_info = &table->key_info[key_index];
   std::string result;
   const uchar *key_ptr = key;
 
@@ -543,6 +580,14 @@ std::string ha_lineairdb::convert_key_to_ldbformat(const uchar *key,
   }
 
   return result;
+}
+
+}  // namespace lineairdb_keyenc
+
+std::string ha_lineairdb::convert_key_to_ldbformat(const uchar *key,
+                                                   key_part_map keypart_map) {
+  return lineairdb_keyenc::convert_key_to_ldbformat(table, active_index, key,
+                                                    keypart_map);
 }
 
 /**

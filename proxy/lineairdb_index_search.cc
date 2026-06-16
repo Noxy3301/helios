@@ -335,8 +335,7 @@ int ha_lineairdb::execute_index_first(uchar *buf, LineairDBTransaction *tx) {
 
   // phantom detection check
   if (tx->is_aborted()) {
-    thd_mark_transaction_to_rollback(ha_thd(), 1);
-    return HA_ERR_LOCK_DEADLOCK;
+    return abort_errno(tx);
   }
 
   if (secondary_index_results_.empty()) {
@@ -355,8 +354,7 @@ int ha_lineairdb::execute_unique_point(uchar *buf, LineairDBTransaction *tx) {
     auto result = tx->read(current_plan_.start_key_serialized);
 
     if (tx->is_aborted()) {
-      thd_mark_transaction_to_rollback(ha_thd(), 1);
-      return HA_ERR_LOCK_DEADLOCK;
+      return abort_errno(tx);
     }
 
     if (result.first == nullptr || result.second == 0) {
@@ -380,8 +378,7 @@ int ha_lineairdb::execute_unique_point(uchar *buf, LineairDBTransaction *tx) {
         current_index_name, current_plan_.start_key_serialized);
 
     if (tx->is_aborted()) {
-      thd_mark_transaction_to_rollback(ha_thd(), 1);
-      return HA_ERR_LOCK_DEADLOCK;
+      return abort_errno(tx);
     }
 
     for (auto &pk : primary_keys) {
@@ -411,9 +408,13 @@ int ha_lineairdb::execute_same_key_materialize(uchar *buf,
     const KEY *key = &table->key_info[active_index];
     const bool filter_ready = prepare_select_filter_for_tx(
         ha_thd(), table, tx, &pushed_filter_serialized_);
-    const RangeScanLimit scan_limit = range_scan_limit_for_order(
+    RangeScanLimit scan_limit = range_scan_limit_for_order(
         ha_thd(), key, current_plan_.used_key_parts,
         has_unpushed_filter_ || !filter_ready);
+    // Autogen stages the full forward range without a pushed filter; request the
+    // canonical {forward, unlimited} shape so MySQL applies LIMIT/WHERE above
+    // (see execute_range_materialize). DSL keeps its explicit pushdown.
+    if (tx->is_prefetch_mode() && !tx->tx_plan_used()) scan_limit = RangeScanLimit{};
 
     // Same-key scans can use ASC or DESC LIMIT when ORDER BY matches the key.
     auto key_values = tx->get_matching_keys_and_values_in_range(
@@ -425,8 +426,7 @@ int ha_lineairdb::execute_same_key_materialize(uchar *buf,
     }
 
     if (tx->is_aborted()) {
-      thd_mark_transaction_to_rollback(ha_thd(), 1);
-      return HA_ERR_LOCK_DEADLOCK;
+      return abort_errno(tx);
     }
 
     if (secondary_index_results_.empty()) {
@@ -441,8 +441,7 @@ int ha_lineairdb::execute_same_key_materialize(uchar *buf,
   batch_fetch_secondary_payloads(tx);
 
   if (tx->is_aborted()) {
-    thd_mark_transaction_to_rollback(ha_thd(), 1);
-    return HA_ERR_LOCK_DEADLOCK;
+    return abort_errno(tx);
   }
 
   if (secondary_index_results_.empty()) {
@@ -471,8 +470,7 @@ int ha_lineairdb::execute_prefix_first(uchar *buf, LineairDBTransaction *tx) {
     }
 
     if (tx->is_aborted()) {
-      thd_mark_transaction_to_rollback(ha_thd(), 1);
-      return HA_ERR_LOCK_DEADLOCK;
+      return abort_errno(tx);
     }
 
     if (secondary_index_results_.empty()) {
@@ -489,8 +487,7 @@ int ha_lineairdb::execute_prefix_first(uchar *buf, LineairDBTransaction *tx) {
   batch_fetch_secondary_payloads(tx);
 
   if (tx->is_aborted()) {
-    thd_mark_transaction_to_rollback(ha_thd(), 1);
-    return HA_ERR_LOCK_DEADLOCK;
+    return abort_errno(tx);
   }
 
   if (secondary_index_results_.empty()) {
@@ -519,9 +516,16 @@ int ha_lineairdb::execute_range_materialize(uchar *buf,
     const KEY *key = &table->key_info[active_index];
     const bool filter_ready = prepare_select_filter_for_tx(
         ha_thd(), table, tx, &pushed_filter_serialized_);
-    const RangeScanLimit scan_limit = range_scan_limit_for_order(
+    RangeScanLimit scan_limit = range_scan_limit_for_order(
         ha_thd(), key, current_plan_.used_key_parts,
         has_unpushed_filter_ || !filter_ready);
+    // Statement-scoped autogen stages the full forward range and its read-plan
+    // scan carries no pushed filter, so a server-side LIMIT/reverse would
+    // truncate rows before MySQL applies the WHERE (wrong results) and would not
+    // match the staged {forward, unlimited} cache. Request the canonical shape
+    // and let MySQL apply ORDER BY / LIMIT / WHERE above the handler. The
+    // tx-scoped DSL path keeps its explicit pushdown (its plan matches it).
+    if (tx->is_prefetch_mode() && !tx->tx_plan_used()) scan_limit = RangeScanLimit{};
 
     // Range scans can use ASC or DESC LIMIT when ORDER BY matches the key.
     auto key_values = tx->get_matching_keys_and_values_in_range(
@@ -539,8 +543,7 @@ int ha_lineairdb::execute_range_materialize(uchar *buf,
 
   // phantom detection check
   if (tx->is_aborted()) {
-    thd_mark_transaction_to_rollback(ha_thd(), 1);
-    return HA_ERR_LOCK_DEADLOCK;
+    return abort_errno(tx);
   }
 
   if (secondary_index_results_.empty()) {
@@ -577,8 +580,7 @@ int ha_lineairdb::execute_prev_key(uchar *buf, LineairDBTransaction *tx) {
   }
 
   if (tx->is_aborted()) {
-    thd_mark_transaction_to_rollback(ha_thd(), 1);
-    return HA_ERR_LOCK_DEADLOCK;
+    return abort_errno(tx);
   }
 
   if (secondary_index_results_.empty()) {
@@ -603,9 +605,15 @@ int ha_lineairdb::execute_prefix_last(uchar *buf, LineairDBTransaction *tx) {
       const KEY *key = &table->key_info[active_index];
       const bool filter_ready = prepare_select_filter_for_tx(
           ha_thd(), table, tx, &pushed_filter_serialized_);
-      const RangeScanLimit scan_limit = range_scan_limit_for_order(
+      RangeScanLimit scan_limit = range_scan_limit_for_order(
           ha_thd(), key, current_plan_.used_key_parts,
           has_unpushed_filter_ || !filter_ready);
+      // Autogen stages the full forward range without a pushed filter; drop the
+      // pushdown so MySQL applies LIMIT/WHERE above (see
+      // execute_range_materialize). DSL keeps its explicit pushdown.
+      if (tx->is_prefetch_mode() && !tx->tx_plan_used()) {
+        scan_limit = RangeScanLimit{};
+      }
       const bool push_desc_limit =
           (scan_limit.row_limit == 1 && scan_limit.reverse_scan);
 
@@ -636,8 +644,7 @@ int ha_lineairdb::execute_prefix_last(uchar *buf, LineairDBTransaction *tx) {
     }
 
     if (tx->is_aborted()) {
-      thd_mark_transaction_to_rollback(ha_thd(), 1);
-      return HA_ERR_LOCK_DEADLOCK;
+      return abort_errno(tx);
     }
 
     if (secondary_index_results_.empty()) {
@@ -654,9 +661,15 @@ int ha_lineairdb::execute_prefix_last(uchar *buf, LineairDBTransaction *tx) {
     const KEY *key = &table->key_info[active_index];
     const bool filter_ready = prepare_select_filter_for_tx(
         ha_thd(), table, tx, &pushed_filter_serialized_);
-    const RangeScanLimit scan_limit = range_scan_limit_for_order(
+    RangeScanLimit scan_limit = range_scan_limit_for_order(
         ha_thd(), key, current_plan_.used_key_parts,
         has_unpushed_filter_ || !filter_ready);
+    // Autogen stages the full forward range without a pushed filter; drop the
+    // pushdown so MySQL applies LIMIT/WHERE above (see
+    // execute_range_materialize). DSL keeps its explicit pushdown.
+    if (tx->is_prefetch_mode() && !tx->tx_plan_used()) {
+      scan_limit = RangeScanLimit{};
+    }
     const bool push_desc_limit =
         (scan_limit.row_limit == 1 && scan_limit.reverse_scan);
 
@@ -678,8 +691,7 @@ int ha_lineairdb::execute_prefix_last(uchar *buf, LineairDBTransaction *tx) {
   }
 
   if (tx->is_aborted()) {
-    thd_mark_transaction_to_rollback(ha_thd(), 1);
-    return HA_ERR_LOCK_DEADLOCK;
+    return abort_errno(tx);
   }
 
   if (secondary_index_results_.empty()) {
@@ -745,13 +757,26 @@ int ha_lineairdb::fetch_and_set_current_result(uchar *buf,
   if (has_inline_value) {
     const std::string &inline_value =
         secondary_index_payloads_[current_position_in_index_];
+    if (inline_value.empty()) {
+      // An empty payload means the base row was deleted between the server's
+      // index walk and its row fetch; a real row encoding is never empty.
+      // Under prefetch the staged absence fails commit validation, so abort
+      // as retryable contention and let a retry stage a consistent snapshot.
+      // A permanently dangling index entry is an index-maintenance bug and
+      // shows up here as a retry loop, never as a wrong result.
+      // In the normal path the base row is simply gone: report not-found.
+      if (tx->is_prefetch_mode()) {
+        tx->set_status_to_abort();
+        return abort_errno(tx);
+      }
+      return HA_ERR_KEY_NOT_FOUND;
+    }
     value_ptr = reinterpret_cast<const std::byte *>(inline_value.data());
     value_size = inline_value.size();
   } else {
     auto result = tx->read(primary_key);
     if (tx->is_aborted()) {
-      thd_mark_transaction_to_rollback(ha_thd(), 1);
-      return HA_ERR_LOCK_DEADLOCK;
+      return abort_errno(tx);
     }
     if (result.first == nullptr || result.second == 0) {
       return HA_ERR_KEY_NOT_FOUND;

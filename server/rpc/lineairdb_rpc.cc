@@ -12,44 +12,6 @@
 
 namespace {
 
-// Copy range-scan node-version snapshots into the proto repeated field.
-void to_proto_range_versions(
-    const std::vector<LineairDB::ExternalRangeValidationEntry>& in,
-    google::protobuf::RepeatedPtrField<
-        LineairDB::Protocol::RangeValidationEntry>* out_entries) {
-    for (const auto& entry : in) {
-        auto* out = out_entries->Add();
-        out->set_table_name(entry.table_name);
-        out->set_index_name(entry.index_name);
-        out->set_owner_ptr(entry.owner_ptr);
-        out->set_node_ptr(entry.node_ptr);
-        out->set_version(entry.version);
-        out->set_start_key(entry.start_key);
-        out->set_end_key(entry.end_key);
-        out->set_row_limit(entry.row_limit);
-        out->set_reverse_scan(entry.reverse_scan);
-        for (const auto& key : entry.result_keys) out->add_result_keys(key);
-        for (const auto& key : entry.result_primary_keys) {
-            out->add_result_primary_keys(key);
-        }
-    }
-}
-
-// Copy exact index-entry snapshots into the proto repeated field.
-void to_proto_index_reads(
-    const std::vector<LineairDB::ExternalIndexValidationEntry>& in,
-    google::protobuf::RepeatedPtrField<
-        LineairDB::Protocol::IndexValidationEntry>* out_entries) {
-    for (const auto& entry : in) {
-        auto* out = out_entries->Add();
-        out->set_table_name(entry.table_name);
-        out->set_index_name(entry.index_name);
-        out->set_key(entry.key);
-        out->set_tid(entry.tid);
-        out->set_found(entry.found);
-    }
-}
-
 // Bump the byte string to its lexicographic successor; returns empty on overflow.
 std::string next_lexicographic_key(std::string key) {
     for (size_t i = key.size(); i-- > 0;) {
@@ -262,14 +224,6 @@ void LineairDBRpc::handle_rpc(uint64_t sender_id, MessageType message_type,
             return;
         case MessageType::TX_STATELESS_BATCH_READ:
             handleTxStatelessBatchRead(message, result);
-            release_masstree_thread_epoch();
-            return;
-        case MessageType::TX_STATELESS_RANGE_SCAN:
-            handleTxStatelessRangeScan(message, result);
-            release_masstree_thread_epoch();
-            return;
-        case MessageType::TX_STATELESS_SECONDARY_RANGE_SCAN:
-            handleTxStatelessSecondaryRangeScan(message, result);
             release_masstree_thread_epoch();
             return;
         case MessageType::TX_EXECUTE_READ_PLAN:
@@ -586,81 +540,6 @@ void LineairDBRpc::handleTxStatelessBatchRead(const std::string& message,
     result = response.SerializeAsString();
 }
 
-void LineairDBRpc::handleTxStatelessRangeScan(const std::string& message,
-                                              std::string& result) {
-    LineairDB::Protocol::TxStatelessRangeScan::Request request;
-    LineairDB::Protocol::TxStatelessRangeScan::Response response;
-
-    request.ParseFromString(message);
-
-    auto scan_result = db_manager_->get_database()->StatelessRangeScan(
-        request.table_name(), request.start_key(), request.end_key(),
-        request.row_limit(), request.reverse_scan());
-    response.set_ok(scan_result.ok);
-    if (!scan_result.ok) {
-        result = response.SerializeAsString();
-        return;
-    }
-
-    for (const auto& row : scan_result.rows) {
-        auto* out = response.add_rows();
-        out->set_key(row.key);
-        out->set_value(row.value);
-        out->set_tid(row.tid);
-        out->set_found(row.found);
-    }
-    to_proto_range_versions(scan_result.range_versions,
-                          response.mutable_range_versions());
-    for (const auto& entry : scan_result.index_reads) {
-        auto* out = response.add_index_reads();
-        out->set_table_name(entry.table_name);
-        out->set_index_name(entry.index_name);
-        out->set_key(entry.key);
-        out->set_tid(entry.tid);
-        out->set_found(entry.found);
-    }
-
-    result = response.SerializeAsString();
-}
-
-void LineairDBRpc::handleTxStatelessSecondaryRangeScan(
-    const std::string& message, std::string& result) {
-    LineairDB::Protocol::TxStatelessSecondaryRangeScan::Request request;
-    LineairDB::Protocol::TxStatelessSecondaryRangeScan::Response response;
-
-    request.ParseFromString(message);
-
-    auto scan_result = db_manager_->get_database()->StatelessSecondaryRangeScan(
-        request.table_name(), request.index_name(), request.start_key(),
-        request.end_key(), request.row_limit(), request.reverse_scan());
-    response.set_ok(scan_result.ok);
-    if (!scan_result.ok) {
-        result = response.SerializeAsString();
-        return;
-    }
-
-    for (const auto& row : scan_result.rows) {
-        auto* out = response.add_rows();
-        out->set_secondary_key(row.secondary_key);
-        out->set_primary_key(row.primary_key);
-        out->set_value(row.value);
-        out->set_tid(row.tid);
-        out->set_found(row.found);
-    }
-    to_proto_range_versions(scan_result.range_versions,
-                          response.mutable_range_versions());
-    for (const auto& entry : scan_result.index_reads) {
-        auto* out = response.add_index_reads();
-        out->set_table_name(entry.table_name);
-        out->set_index_name(entry.index_name);
-        out->set_key(entry.key);
-        out->set_tid(entry.tid);
-        out->set_found(entry.found);
-    }
-
-    result = response.SerializeAsString();
-}
-
 void LineairDBRpc::handleTxExecuteReadPlan(const std::string& message,
                                            std::string& result) {
     LineairDB::Protocol::TxExecuteReadPlan::Request request;
@@ -754,10 +633,6 @@ void LineairDBRpc::handleTxExecuteReadPlan(const std::string& message,
                 step_result->add_scan_values(std::move(row.value));
                 step_result->add_scan_tids(row.tid);
             }
-            to_proto_range_versions(scan_result.range_versions,
-                                  step_result->mutable_range_versions());
-            to_proto_index_reads(scan_result.index_reads,
-                               step_result->mutable_index_reads());
         } else {
             step_result->set_actual_start_key(start_key);
             step_result->set_actual_end_key(end_key);
@@ -776,10 +651,6 @@ void LineairDBRpc::handleTxExecuteReadPlan(const std::string& message,
                 step_result->add_scan_values(std::move(row.value));
                 step_result->add_scan_tids(row.tid);
             }
-            to_proto_range_versions(scan_result.range_versions,
-                                  step_result->mutable_range_versions());
-            to_proto_index_reads(scan_result.index_reads,
-                               step_result->mutable_index_reads());
         }
     }
 
@@ -800,13 +671,6 @@ void LineairDBRpc::handleTxValidateAndCommit(const std::string& message,
                          read.found()});
     }
 
-    std::vector<LineairDB::ExternalIndexValidationEntry> index_reads;
-    index_reads.reserve(request.index_reads_size());
-    for (const auto& read : request.index_reads()) {
-        index_reads.push_back({read.table_name(), read.index_name(),
-                               read.key(), read.tid(), read.found()});
-    }
-
     std::vector<LineairDB::ExternalWriteEntry> writes;
     writes.reserve(request.writes_size() + request.deletes_size());
     for (const auto& write : request.writes()) {
@@ -825,12 +689,12 @@ void LineairDBRpc::handleTxValidateAndCommit(const std::string& message,
                           op.is_delete()});
     }
 
-    std::vector<LineairDB::ExternalRangeValidationEntry> range_reads;
+    std::vector<LineairDB::ExternalRangeReadEntry> range_reads;
     range_reads.reserve(request.range_reads_size());
     for (const auto& range : request.range_reads()) {
-        LineairDB::ExternalRangeValidationEntry entry{
-            range.table_name(), range.index_name(), range.owner_ptr(),
-            range.node_ptr(), range.version()};
+        LineairDB::ExternalRangeReadEntry entry;
+        entry.table_name = range.table_name();
+        entry.index_name = range.index_name();
         entry.start_key = range.start_key();
         entry.end_key = range.end_key();
         entry.row_limit = range.row_limit();
@@ -850,7 +714,6 @@ void LineairDBRpc::handleTxValidateAndCommit(const std::string& message,
     const bool committed =
         db_manager_->get_database()->ValidateAndCommit(reads, writes, si_ops,
                                                        range_reads,
-                                                       index_reads,
                                                        &abort_reason);
     response.set_committed(committed);
     if (!committed && !abort_reason.empty()) {

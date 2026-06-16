@@ -96,6 +96,30 @@ public:
       const std::vector<LineairDBProxy::StatelessReadKey>& reads);
   void execute_read_plan(const std::vector<LineairDBProxy::ReadPlanStep>& steps);
 
+  // Set when an injected tx-scoped plan (@_tx_plan / DSL) ran at begin, so the
+  // statement-scoped autogen path stays out of the way (the two are mutually
+  // exclusive per transaction).
+  void set_tx_plan_used(bool used) { tx_plan_used_ = used; }
+  bool tx_plan_used() const { return tx_plan_used_; }
+
+  // Statement-scoped autogen staging is gated per MySQL statement, keyed by
+  // thd->query_id: the plan is auto-generated and executed once per statement,
+  // and the reads accumulate into this transaction's validation set.
+  uint64_t autogen_query_id() const { return autogen_query_id_; }
+  void reset_autogen_for_statement(uint64_t query_id) {
+    autogen_query_id_ = query_id;
+    autogen_stmt_resolved_ = false;
+    autogen_stmt_handler_deferred_ = false;
+  }
+  bool autogen_stmt_resolved() const { return autogen_stmt_resolved_; }
+  void mark_autogen_stmt_resolved() { autogen_stmt_resolved_ = true; }
+  bool is_autogen_stmt_handler_deferred() const {
+    return autogen_stmt_handler_deferred_;
+  }
+  void mark_autogen_stmt_handler_deferred() {
+    autogen_stmt_handler_deferred_ = true;
+  }
+
   inline bool is_not_started() const {
     if (prefetch_mode_) return !prefetch_registered_;
     if (tx_id == -1) return true;
@@ -109,6 +133,8 @@ public:
   inline bool is_aborted() const { 
     return is_aborted_;
   }
+
+  bool aborted_by_cache_miss() const { return aborted_by_cache_miss_; }
 
   inline void set_aborted(bool aborted) {
     // Once aborted, stay aborted (matches LineairDB's irreversible Abort semantics).
@@ -146,12 +172,22 @@ private:
   bool isFence;
   bool prefetch_mode_{false};
   bool prefetch_registered_{false};
+  bool tx_plan_used_{false};
+  uint64_t autogen_query_id_{0};
+  bool autogen_stmt_resolved_{false};
+  // Set when this statement's plan is built from the handler index access
+  // (deferred legacy-DML path) instead of the QEP; a second handler access
+  // then means an index merge the single staged range cannot serve.
+  bool autogen_stmt_handler_deferred_{false};
 
   // stores the last RPC read result to maintain data pointer validity
   std::string last_read_value_;
 
   // transaction abort status (updated by RPC responses)
   bool is_aborted_;
+  // Set when the abort came from a prefetch cache miss (an unstaged read
+  // surface), so the handler returns a non-retryable error, not a deadlock.
+  bool aborted_by_cache_miss_{false};
 
   struct RowCountDelta {
     LineairDB_share *share;
@@ -171,10 +207,13 @@ private:
   // These sets live only inside one LineairDBTransaction.
   // commit/abort deletes the object, so prefetched rows never cross txs.
 
-  // Proxy-side read set for exact primary-key reads.
-  // Keyed by (table_name + '\0' + key) so dedup + lookup are O(1).
-  std::unordered_map<std::string, LocalRowEntry> local_read_set_;
-  static std::string make_local_read_key(const std::string& table,
+  // Proxy-side value cache for exact primary-key reads: serves a row to the
+  // statement without an RPC. NOT a validation set -- the TID it carries feeds
+  // base_row_read_set_ only when a cached row is actually consumed (the
+  // cache-hit paths in read()/batch_read() append it). Overwritten when a
+  // statement re-stages the key. Keyed by (table_name + '\0' + key) for O(1) lookup.
+  std::unordered_map<std::string, LocalRowEntry> row_cache_;
+  static std::string make_row_cache_key(const std::string& table,
                                          const std::string& key) {
     std::string k;
     k.reserve(table.size() + 1 + key.size());
@@ -184,17 +223,21 @@ private:
     return k;
   }
   // Proxy-side write set for exact primary-key writes/deletes
-  std::vector<LocalRowEntry> local_write_set_;
+  std::vector<LocalRowEntry> own_writes_;
 
+  // OCC commit-time read validation, two append-only sets (Silo read_set
+  // style); the server re-checks each at commit and aborts on a mismatch:
+  //   base_row_read_set_  per-key TID of base rows -> value changes
+  //   range_read_set_     observed range membership (result key-list),
+  //                       re-validated by logical replay -> phantoms
   struct StatelessReadEntry {
     std::string table_name;
     std::string key;
     uint64_t tid;
     bool found;
   };
-  std::vector<StatelessReadEntry> stateless_read_set_;
-  std::vector<LineairDBProxy::RangeValidationEntry> range_validation_set_;
-  std::vector<LineairDBProxy::IndexValidationEntry> index_validation_set_;
+  std::vector<StatelessReadEntry> base_row_read_set_;
+  std::vector<LineairDBProxy::RangeReadEntry> range_read_set_;
 
   struct LocalRangeScanEntry {
     std::string table_name;
@@ -204,8 +247,6 @@ private:
     uint64_t row_limit = 0;
     std::vector<std::pair<std::string, std::string>> rows;
     std::vector<uint64_t> row_tids;
-    std::vector<LineairDBProxy::RangeValidationEntry> range_versions;
-    std::vector<LineairDBProxy::IndexValidationEntry> index_reads;
   };
   struct LocalSecondaryScanEntry {
     std::string table_name;
@@ -216,11 +257,9 @@ private:
     uint64_t row_limit = 0;
     std::vector<std::string> secondary_keys;
     std::vector<std::string> primary_keys;
-    std::vector<LineairDBProxy::RangeValidationEntry> range_versions;
-    std::vector<LineairDBProxy::IndexValidationEntry> index_reads;
   };
-  std::vector<LocalRangeScanEntry> local_range_scans_;
-  std::vector<LocalSecondaryScanEntry> local_secondary_scans_;
+  std::vector<LocalRangeScanEntry> range_scan_cache_;
+  std::vector<LocalSecondaryScanEntry> secondary_scan_cache_;
 
   // Predicate pushdown: serialized PushedPredicate for scan filtering
   std::string pushed_filter_;
@@ -232,11 +271,11 @@ private:
 
   TxRpcTrace rpc_trace_;
 
-  std::optional<LocalRowEntry> lookup_local_write_set(
+  std::optional<LocalRowEntry> lookup_write_set(
       const std::string& table_name, const std::string& key) const;
-  std::optional<LocalRowEntry> lookup_local_read_set(
+  std::optional<LocalRowEntry> lookup_row_cache(
       const std::string& table_name, const std::string& key) const;
-  void drop_local_read(const std::string& table_name,
+  void drop_row_cache(const std::string& table_name,
                        const std::string& key);
   bool key_is_in_range(const std::string& key,
                        const std::string& start_key,
@@ -260,26 +299,25 @@ private:
   bool has_pending_secondary_ops_for_index(
       const std::string& table_name,
       const std::string& index_name) const;
-  void drop_local_secondary_scans(const std::string& table_name,
+  void drop_secondary_scan_cache(const std::string& table_name,
                                   const std::string& index_name);
-  void record_local_write(const std::string& table_name,
+  void record_write(const std::string& table_name,
                           const std::string& key, bool found,
                           const std::string& value);
-  void record_local_read(const std::string& table_name,
-                         const std::string& key, bool found,
-                         const std::string& value, uint64_t tid = 0,
-                         bool validate_on_use = false);
-  void record_stateless_read(const std::string& table_name,
-                             const std::string& key, bool found,
-                             uint64_t tid);
-  void activate_local_read(const LocalRowEntry& entry);
-  void activate_range_validation(
-      const std::vector<LineairDBProxy::RangeValidationEntry>& ranges,
-      const std::vector<LineairDBProxy::IndexValidationEntry>& indexes);
-  std::optional<LocalRangeScanEntry> lookup_local_range_scan(
+  void record_row_cache(const std::string& table_name,
+                               const std::string& key, bool found,
+                               const std::string& value, uint64_t tid = 0,
+                               bool validate_on_use = false);
+  void append_base_row_read(const std::string& table_name,
+                                    const std::string& key, bool found,
+                                    uint64_t tid);
+  void append_range_read(const LocalRangeScanEntry& cached);
+  void append_secondary_range_read(const LocalSecondaryScanEntry& cached);
+  void abort_prefetch_cache_miss(const std::string& reason);
+  std::optional<LocalRangeScanEntry> lookup_range_scan_cache(
       const std::string& table_name, const std::string& start_key,
       const std::string& end_key, bool reverse_scan, uint64_t row_limit) const;
-  std::optional<LocalSecondaryScanEntry> lookup_local_secondary_scan(
+  std::optional<LocalSecondaryScanEntry> lookup_secondary_scan_cache(
       const std::string& table_name, const std::string& index_name,
       const std::string& start_key, const std::string& end_key,
       bool reverse_scan, uint64_t row_limit) const;

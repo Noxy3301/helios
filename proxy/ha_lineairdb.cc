@@ -477,8 +477,7 @@ int ha_lineairdb::write_row(uchar *buf) {
   auto tx = get_transaction(ha_thd());
 
   if (tx->is_aborted()) {
-    thd_mark_transaction_to_rollback(ha_thd(), 1);
-    return HA_ERR_LOCK_DEADLOCK;
+    return abort_errno(tx);
   }
 
   // buffer_write appends to a local buffer (no RPC yet), so no error check needed.
@@ -503,8 +502,7 @@ int ha_lineairdb::write_row(uchar *buf) {
         tx->choose_table(db_table_name);
         bool ok = tx->write_secondary_index(key_info.name, secondary_key, key);
         if (!ok || tx->is_aborted()) {
-          thd_mark_transaction_to_rollback(ha_thd(), 1);
-          return HA_ERR_LOCK_DEADLOCK;
+          return abort_errno(tx);
         }
       }
     } else {
@@ -514,8 +512,7 @@ int ha_lineairdb::write_row(uchar *buf) {
   }
 
   if (tx->is_aborted()) {
-    thd_mark_transaction_to_rollback(ha_thd(), 1);
-    return HA_ERR_LOCK_DEADLOCK;
+    return abort_errno(tx);
   }
 
   tx->add_rowcount_delta(share, db_table_name, +1);
@@ -526,7 +523,18 @@ int ha_lineairdb::write_row(uchar *buf) {
 int ha_lineairdb::update_row(const uchar *old_data, uchar *new_data) {
   DBUG_TRACE;
 
+  auto tx = get_transaction(ha_thd());
   auto key = extract_key_from_mysql(old_data);
+  const auto new_key = extract_key_from_mysql(new_data);
+
+  // FIXME: reject a PK-changing UPDATE. update_row overwrites in place at the old
+  // key and cannot move a row, so executing one would store new_data under the
+  // old key with nothing at the new key -- silent corruption. A real move (delete
+  // old + insert new + secondary-index rewrite) is not implemented.
+  if (key != new_key) {
+    return prefetch_reject_unsupported(ha_thd(), tx,
+                                       "primary-key-changing UPDATE");
+  }
 
   if (key.empty()) {
     key = last_fetched_primary_key_;
@@ -540,19 +548,15 @@ int ha_lineairdb::update_row(const uchar *old_data, uchar *new_data) {
 
   set_write_buffer(new_data);
 
-  auto tx = get_transaction(ha_thd());
-
   if (tx->is_aborted()) {
-    thd_mark_transaction_to_rollback(ha_thd(), 1);
-    return HA_ERR_LOCK_DEADLOCK;
+    return abort_errno(tx);
   }
 
   // Buffer the base-row update; read/scan paths and commit flush it later.
   tx->buffer_write(db_table_name, key, write_buffer_);
 
   if (tx->is_aborted()) {
-    thd_mark_transaction_to_rollback(ha_thd(), 1);
-    return HA_ERR_LOCK_DEADLOCK;
+    return abort_errno(tx);
   }
 
   for (uint i = 0; i < table->s->keys; i++) {
@@ -575,8 +579,7 @@ int ha_lineairdb::update_row(const uchar *old_data, uchar *new_data) {
                                new_secondary_key, key);
 
     if (tx->is_aborted()) {
-      thd_mark_transaction_to_rollback(ha_thd(), 1);
-      return HA_ERR_LOCK_DEADLOCK;
+      return abort_errno(tx);
     }
   }
 
@@ -601,16 +604,14 @@ int ha_lineairdb::delete_row(const uchar *buf) {
   auto tx = get_transaction(ha_thd());
 
   if (tx->is_aborted()) {
-    thd_mark_transaction_to_rollback(ha_thd(), 1);
-    return HA_ERR_LOCK_DEADLOCK;
+    return abort_errno(tx);
   }
 
   // Buffer the base-row delete; read/scan paths and commit flush it later.
   tx->buffer_delete(db_table_name, key);
 
   if (tx->is_aborted()) {
-    thd_mark_transaction_to_rollback(ha_thd(), 1);
-    return HA_ERR_LOCK_DEADLOCK;
+    return abort_errno(tx);
   }
 
   for (uint i = 0; i < table->s->keys; i++) {
@@ -624,8 +625,7 @@ int ha_lineairdb::delete_row(const uchar *buf) {
   }
 
   if (tx->is_aborted()) {
-    thd_mark_transaction_to_rollback(ha_thd(), 1);
-    return HA_ERR_LOCK_DEADLOCK;
+    return abort_errno(tx);
   }
 
   tx->add_rowcount_delta(share, db_table_name, -1);
@@ -642,8 +642,7 @@ int ha_lineairdb::index_read_map(uchar *buf, const uchar *key,
   auto tx = get_transaction(ha_thd());
 
   if (tx->is_aborted()) {
-    thd_mark_transaction_to_rollback(ha_thd(), 1);
-    return HA_ERR_LOCK_DEADLOCK;
+    return abort_errno(tx);
   }
 
   tx->choose_table(db_table_name);
@@ -655,7 +654,32 @@ int ha_lineairdb::index_read_map(uchar *buf, const uchar *key,
 
   KEY *key_info = &table->key_info[active_index];
 
-  // Phase 4: Separation of planning and execution
+  // MySQL runs single-table UPDATE/DELETE through the old executor
+  // (sql_update.cc/sql_delete.cc), which has no JOIN/access path. Derive its
+  // autogen plan from the optimizer-selected handler access instead.
+  if (prefetch_needs_legacy_dml_handler(ha_thd(), tx)) {
+    build_search_plan(key, keypart_map, find_flag, key_info);
+    if (int err = maybe_prefetch_for_legacy_dml_handler(
+            ha_thd(), tx, table, active_index, current_plan_)) {
+      return err;
+    }
+    return execute_plan(buf, tx);
+  }
+
+  // A legacy single-table DML staged its plan on the first handler access; a
+  // second handler access here means the statement spans multiple index ranges
+  // (e.g. index merge over different indexes), which the single staged plan
+  // cannot cover. Reject loudly (no-fallback) rather than let the read miss the
+  // cache and surface as a retryable deadlock, which would livelock on retry.
+  if (tx->is_prefetch_mode() && !tx->tx_plan_used() &&
+      tx->is_autogen_stmt_handler_deferred()) {
+    return prefetch_reject_unsupported(
+        ha_thd(), tx, "legacy DML multi-index access (index merge)");
+  }
+
+  // The optimizer has run, so the SELECT/generic-DML QEP is available.
+  if (int err = maybe_prefetch_for_statement(ha_thd(), tx)) return err;
+
   build_search_plan(key, keypart_map, find_flag, key_info);
 
   return execute_plan(buf, tx);
@@ -669,8 +693,7 @@ int ha_lineairdb::index_next(uchar *buf) {
 
   auto tx = get_transaction(ha_thd());
   if (tx->is_aborted()) {
-    thd_mark_transaction_to_rollback(ha_thd(), 1);
-    return HA_ERR_LOCK_DEADLOCK;
+    return abort_errno(tx);
   }
   tx->choose_table(db_table_name);
 
@@ -689,8 +712,7 @@ int ha_lineairdb::index_next_same(uchar *buf, const uchar *key [[maybe_unused]],
 
   auto tx = get_transaction(ha_thd());
   if (tx->is_aborted()) {
-    thd_mark_transaction_to_rollback(ha_thd(), 1);
-    return HA_ERR_LOCK_DEADLOCK;
+    return abort_errno(tx);
   }
   tx->choose_table(db_table_name);
 
@@ -713,8 +735,7 @@ int ha_lineairdb::index_prev(uchar *buf) {
 
   auto tx = get_transaction(ha_thd());
   if (tx->is_aborted()) {
-    thd_mark_transaction_to_rollback(ha_thd(), 1);
-    return HA_ERR_LOCK_DEADLOCK;
+    return abort_errno(tx);
   }
   tx->choose_table(db_table_name);
 
@@ -768,11 +789,21 @@ int ha_lineairdb::index_last(uchar *buf) {
 
   auto tx = get_transaction(ha_thd());
   if (tx->is_aborted()) {
-    thd_mark_transaction_to_rollback(ha_thd(), 1);
-    return HA_ERR_LOCK_DEADLOCK;
+    return abort_errno(tx);
   }
 
   tx->choose_table(db_table_name);
+
+  // index_last seeks the index tail with no search key: it does not route
+  // through index_read_map and carries no range to build an autogen plan from,
+  // and a statement-scoped plan keyed by the QEP's range cannot cover it.
+  // Reject loudly under no-fallback rather than silently miss the local view.
+  // Range-driven reverse scans (ORDER BY ... DESC LIMIT) are supported; only
+  // this key-less tail seek is not.
+  // TODO: support index_last under prefetch (autogen reverse tail-scan).
+  if (tx->is_prefetch_mode()) {
+    return prefetch_reject_unsupported(ha_thd(), tx, "index_last access");
+  }
 
   if (active_index == table->s->primary_key) {
     auto key_values = tx->get_matching_keys_and_values_in_range("", "");
@@ -787,8 +818,7 @@ int ha_lineairdb::index_last(uchar *buf) {
   }
 
   if (tx->is_aborted()) {
-    thd_mark_transaction_to_rollback(ha_thd(), 1);
-    return HA_ERR_LOCK_DEADLOCK;
+    return abort_errno(tx);
   }
 
   if (secondary_index_results_.empty()) {
@@ -852,8 +882,7 @@ int ha_lineairdb::rnd_init(bool) {
   auto tx = get_transaction(ha_thd());
 
   if (tx->is_aborted()) {
-    thd_mark_transaction_to_rollback(ha_thd(), 1);
-    DBUG_RETURN(HA_ERR_LOCK_DEADLOCK);
+    DBUG_RETURN(abort_errno(tx));
   }
 
   tx->choose_table(db_table_name);
@@ -863,6 +892,18 @@ int ha_lineairdb::rnd_init(bool) {
     tx->set_pushed_filter(pushed_filter_serialized_);
   } else {
     tx->clear_pushed_filter();
+  }
+
+  if (prefetch_needs_legacy_dml_handler(ha_thd(), tx)) {
+    DBUG_RETURN(prefetch_reject_unsupported(
+        ha_thd(), tx, "legacy DML full/reverse table scan"));
+  }
+
+  // The optimizer has run, so the QEP is available.
+  // Statement-scoped autogen stages and executes the prefetch plan once per
+  // statement; an unsupported QEP fails here.
+  if (int err = maybe_prefetch_for_statement(ha_thd(), tx)) {
+    DBUG_RETURN(err);
   }
 
   DBUG_RETURN(0);
@@ -971,7 +1012,7 @@ int ha_lineairdb::rnd_next(uchar *buf) {
     if (!fetch_next_batch()) {
       auto tx = get_transaction(ha_thd());
       if (tx->is_aborted()) {
-        DBUG_RETURN(HA_ERR_LOCK_DEADLOCK);
+        DBUG_RETURN(abort_errno(tx));
       }
       scan_exhausted_ = true;
       DBUG_RETURN(HA_ERR_END_OF_FILE);
@@ -1059,13 +1100,17 @@ int ha_lineairdb::rnd_pos(uchar *buf, uchar *pos) {
   auto tx = get_transaction(ha_thd());
 
   if (tx->is_aborted()) {
-    thd_mark_transaction_to_rollback(ha_thd(), 1);
-    return HA_ERR_LOCK_DEADLOCK;
+    return abort_errno(tx);
   }
 
   tx->choose_table(db_table_name);
   auto result = tx->read(primary_key);
 
+  // read() aborts the tx on a prefetch cache miss; catch it before the empty
+  // result below reads as a missing key.
+  if (tx->is_aborted()) {
+    return abort_errno(tx);
+  }
   if (result.first == nullptr || result.second == 0) {
     return HA_ERR_KEY_NOT_FOUND;
   }
@@ -1171,8 +1216,7 @@ int ha_lineairdb::info(uint flag) {
       LineairDBTransaction *active_tx = (ctx != nullptr) ? ctx->tx : nullptr;
       if (active_tx != nullptr && !active_tx->is_not_started()) {
         if (active_tx->is_aborted()) {
-          thd_mark_transaction_to_rollback(thd, 1);
-          return HA_ERR_LOCK_DEADLOCK;
+          return abort_errno(active_tx);
         }
 
         const int64_t local_delta = active_tx->peek_rowcount_delta(share);
@@ -1386,16 +1430,31 @@ LineairDBTransaction *&ha_lineairdb::get_transaction(THD *thd) {
   if (ctx->tx == nullptr) {
     ctx->tx =
         new LineairDBTransaction(thd, ctx->proxy.get(), lineairdb_hton, FENCE);
+    // Prefetch protocol is fixed for the transaction: enabled whenever the
+    // sysvar is on and the first statement is prefetch-eligible. Whether a plan
+    // is actually staged is decided per statement: an injected @_tx_plan
+    // at begin (tx-scoped), else statement-scoped autogen at
+    // rnd_init / index_read.
     const bool can_use_prefetch =
-        (srv_prefetch_execution && thd_can_use_prefetch(thd) &&
-         thd_has_prefetch_plan(thd));
+        (srv_prefetch_execution && thd_can_use_prefetch(thd));
     ctx->tx->set_prefetch_mode(can_use_prefetch);
   }
   if (ctx->tx->is_not_started()) {
     ctx->tx->begin_transaction();
-    execute_prefetch_plan_if_present(thd, ctx->tx);
+    maybe_prefetch_for_transaction(thd, ctx->tx);
   }
   return ctx->tx;
+}
+
+int ha_lineairdb::abort_errno(LineairDBTransaction *tx) {
+  // A prefetch cache miss is an unsupported access shape, not contention, so
+  // reject it non-retryably -- retrying the same read cannot make it hit.
+  if (tx != nullptr && tx->aborted_by_cache_miss()) {
+    return prefetch_reject_unsupported(ha_thd(), tx, "prefetch cache miss");
+  }
+  // Default: a genuine OCC/server abort is retryable contention.
+  thd_mark_transaction_to_rollback(ha_thd(), 1);
+  return HA_ERR_LOCK_DEADLOCK;
 }
 
 /**
@@ -1785,12 +1844,39 @@ bool ha_lineairdb::inplace_alter_table(TABLE *altered_table [[maybe_unused]],
 }
 
 /**
- * @brief Advertise custom MRR for primary key lookups.
+ * @brief True only for MySQL's standard forward index-range sequence.
  *
- * When MySQL considers using MRR (e.g. for BKA joins), it calls this method
- * to ask the storage engine for cost estimates. We clear HA_MRR_USE_DEFAULT_IMPL
- * for PK lookups so that multi_range_read_init() receives our custom batch path,
- * which sends all keys in a single RPC instead of one RPC per key.
+ * The range source is identified by its seq->init function: quick_range_seq_init
+ * is the forward scan, quick_range_rev_seq_init is the reverse one, and BKA
+ * supplies its own callback. Only the forward range matches the forward-staged
+ * cache, so the others are rejected.
+ */
+static bool lineairdb_is_forward_index_range_sequence(RANGE_SEQ_IF *seq) {
+  extern range_seq_t quick_range_seq_init(void *, uint, uint);
+  return seq != nullptr && seq->init == quick_range_seq_init;
+}
+
+/**
+ * @brief Predict prefetch mode without starting a transaction.
+ *
+ * MRR cost estimation must stay side-effect-free, so it cannot call
+ * get_transaction() (which allocates and may emit RPCs). Reuse an existing
+ * transaction's fixed mode, else predict from the session as get_transaction will.
+ */
+static bool lineairdb_predict_prefetch_mode(THD *thd) {
+  auto *ctx =
+      *reinterpret_cast<LineairDBThdCtx **>(thd_ha_data(thd, lineairdb_hton));
+  if (ctx != nullptr && ctx->tx != nullptr) return ctx->tx->is_prefetch_mode();
+  return srv_prefetch_execution && thd_can_use_prefetch(thd);
+}
+
+/**
+ * @brief Advertise custom batch MRR for primary-key point lookups.
+ *
+ * In non-prefetch ("batched") mode, clear HA_MRR_USE_DEFAULT_IMPL for PK lookups
+ * so multi_range_read_init() takes the custom batch path that sends all keys in
+ * one RPC. Under prefetch the advertisement is suppressed: reads are served from
+ * the staged cache through default MRR (read_range_first -> index_read_map).
  */
 ha_rows ha_lineairdb::multi_range_read_info_const(
     uint keyno, RANGE_SEQ_IF *seq, void *seq_init_param, uint n_ranges,
@@ -1800,10 +1886,9 @@ ha_rows ha_lineairdb::multi_range_read_info_const(
       cost);
   if (rows == HA_POS_ERROR) return rows;
 
-  // Use custom batch MRR for PK point lookups (BKA JOINs).
-  // Range scans on secondary indexes must use the default path.
-  // Set cost=1 since batch_read sends all keys in a single RPC.
-  if (keyno == table->s->primary_key) {
+  // Custom batch MRR only in batched mode; prefetch serves reads from the cache.
+  if (!lineairdb_predict_prefetch_mode(ha_thd()) &&
+      keyno == table->s->primary_key) {
     *flags &= ~HA_MRR_USE_DEFAULT_IMPL;
     *bufsz = 0;
     if (cost) {
@@ -1820,8 +1905,9 @@ ha_rows ha_lineairdb::multi_range_read_info(uint keyno, uint n_ranges,
                                             Cost_estimate *cost) {
   ha_rows rows = handler::multi_range_read_info(keyno, n_ranges, keys, bufsz,
                                                 flags, cost);
-  // Use custom batch MRR for PK point lookups (BKA JOINs).
-  if (keyno == table->s->primary_key) {
+  // Custom batch MRR only in batched mode; prefetch serves reads from the cache.
+  if (!lineairdb_predict_prefetch_mode(ha_thd()) &&
+      keyno == table->s->primary_key) {
     *flags &= ~HA_MRR_USE_DEFAULT_IMPL;
     *bufsz = 0;
     if (cost) {
@@ -1846,6 +1932,48 @@ ha_rows ha_lineairdb::multi_range_read_info(uint keyno, uint n_ranges,
 int ha_lineairdb::multi_range_read_init(RANGE_SEQ_IF *seq, void *seq_init_param,
                                         uint n_ranges, uint mode,
                                         HANDLER_BUFFER *buf) {
+  auto tx = get_transaction(ha_thd());
+  if (!tx || tx->is_aborted()) {
+    return abort_errno(tx);
+  }
+
+  // Prefetch never uses the custom batch path: the staging RPC already holds the
+  // rows, so default MRR (read_range_first -> index_read_map) consumes the cache.
+  if (tx->is_prefetch_mode()) {
+    if (!(mode & HA_MRR_USE_DEFAULT_IMPL)) {
+      // Custom MRR is not advertised under prefetch, so native MRR reaching here
+      // is a shape the staged cache cannot serve.
+      return prefetch_reject_unsupported(ha_thd(), tx,
+                                         "native MRR under prefetch");
+    }
+    const bool legacy_dml =
+        prefetch_needs_legacy_dml_handler(ha_thd(), tx);
+    // Statement-scoped autogen stages a single forward range per statement.
+    if (!tx->tx_plan_used()) {
+      if (n_ranges != 1) {
+        return prefetch_reject_unsupported(ha_thd(), tx, "MRR multi-range scan");
+      }
+      if (!lineairdb_is_forward_index_range_sequence(seq)) {
+        return prefetch_reject_unsupported(ha_thd(), tx,
+                                           "MRR reverse or non-standard range");
+      }
+    }
+    // Legacy single-table DML has no QEP plan. Default DS-MRR reaches
+    // read_range_first()->index_read_map(), where the complete bounds exist.
+    if (!legacy_dml) {
+      if (int err = maybe_prefetch_for_statement(ha_thd(), tx)) return err;
+    }
+    if (tx->is_aborted()) {
+      return abort_errno(tx);
+    }
+    mrr_use_batch_ = false;
+    mrr_buffer_.clear();
+    mrr_buffer_pos_ = 0;
+    m_ds_mrr.init(table);
+    return m_ds_mrr.dsmrr_init(seq, seq_init_param, n_ranges,
+                               mode | HA_MRR_USE_DEFAULT_IMPL, buf);
+  }
+
   if (mode & HA_MRR_USE_DEFAULT_IMPL) {
     mrr_use_batch_ = false;
     m_ds_mrr.init(table);
@@ -1886,11 +2014,6 @@ int ha_lineairdb::multi_range_read_init(RANGE_SEQ_IF *seq, void *seq_init_param,
   mrr_buffer_.clear();
   mrr_buffer_pos_ = 0;
 
-  auto tx = get_transaction(ha_thd());
-  if (!tx || tx->is_aborted()) {
-    thd_mark_transaction_to_rollback(ha_thd(), 1);
-    return HA_ERR_LOCK_DEADLOCK;
-  }
   tx->choose_table(db_table_name);
 
   if (batch_keys.empty()) return 0;
@@ -1899,8 +2022,7 @@ int ha_lineairdb::multi_range_read_init(RANGE_SEQ_IF *seq, void *seq_init_param,
   auto results = tx->batch_read(batch_keys);
 
   if (tx->is_aborted()) {
-    thd_mark_transaction_to_rollback(ha_thd(), 1);
-    return HA_ERR_LOCK_DEADLOCK;
+    return abort_errno(tx);
   }
 
   // Buffer results for multi_range_read_next()

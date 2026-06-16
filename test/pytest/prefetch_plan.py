@@ -35,7 +35,7 @@ def test_prefetch_scope(cursor, db):
     db.commit()
 
     cursor.execute("SET GLOBAL lineairdb_prefetch_execution=ON")
-    cursor.execute("SET @_prefetch_plan='R:t:1;R:t:2;R:t:3'")
+    cursor.execute("SET @_tx_plan='R:t:1;R:t:2;R:t:3'")
     cursor.execute("START TRANSACTION")
     cursor.execute("SELECT v FROM t WHERE id=1")
     if cursor.fetchone()[0] != 100:
@@ -47,7 +47,7 @@ def test_prefetch_scope(cursor, db):
     db.commit()
 
     # A new transaction gets a fresh plan and must read the latest value.
-    cursor.execute("SET @_prefetch_plan='R:t:1'")
+    cursor.execute("SET @_tx_plan='R:t:1'")
     cursor.execute("START TRANSACTION")
     cursor.execute("SELECT v FROM t WHERE id=1")
     if cursor.fetchone()[0] != 777:
@@ -67,7 +67,7 @@ def test_conflict_abort():
         ca.execute(f"USE {DBNAME}")
         cb.execute(f"USE {DBNAME}")
         ca.execute("SET GLOBAL lineairdb_prefetch_execution=ON")
-        ca.execute("SET @_prefetch_plan='R:t:1'")
+        ca.execute("SET @_tx_plan='R:t:1'")
         ca.execute("START TRANSACTION")
         ca.execute("SELECT v FROM t WHERE id=1")
         ca.fetchone()
@@ -104,7 +104,7 @@ def test_unique_commit_check(cursor, db):
     db.commit()
 
     cursor.execute("SET GLOBAL lineairdb_prefetch_execution=ON")
-    cursor.execute("SET @_prefetch_plan='R:t:2'")
+    cursor.execute("SET @_tx_plan='R:t:2'")
     cursor.execute("START TRANSACTION")
     cursor.execute("SELECT v FROM t WHERE id=2")
     cursor.fetchone()
@@ -129,7 +129,7 @@ def test_range_clean_commit(cursor, db):
     db.commit()
 
     cursor.execute("SET GLOBAL lineairdb_prefetch_execution=ON")
-    cursor.execute("SET @_prefetch_plan='S:range_clean_t:10:E:30'")
+    cursor.execute("SET @_tx_plan='S:range_clean_t:10:E:30'")
     cursor.execute("START TRANSACTION")
     cursor.execute(
         "SELECT id FROM range_clean_t FORCE INDEX(PRIMARY) "
@@ -159,7 +159,7 @@ def test_range_phantom_abort():
         a.commit()
 
         ca.execute("SET GLOBAL lineairdb_prefetch_execution=ON")
-        ca.execute("SET @_prefetch_plan='S:range_t:10:E:30'")
+        ca.execute("SET @_tx_plan='S:range_t:10:E:30'")
         ca.execute("START TRANSACTION")
         ca.execute(
             "SELECT id FROM range_t FORCE INDEX(PRIMARY) "
@@ -205,7 +205,7 @@ def test_range_tombstone_reinsert_abort():
         a.commit()
 
         ca.execute("SET GLOBAL lineairdb_prefetch_execution=ON")
-        ca.execute("SET @_prefetch_plan='S:tombstone_t:10:E:30'")
+        ca.execute("SET @_tx_plan='S:tombstone_t:10:E:30'")
         ca.execute("START TRANSACTION")
         ca.execute(
             "SELECT id FROM tombstone_t FORCE INDEX(PRIMARY) "
@@ -247,7 +247,7 @@ def test_secondary_range_clean_commit(cursor, db):
     db.commit()
 
     cursor.execute("SET GLOBAL lineairdb_prefetch_execution=ON")
-    cursor.execute("SET @_prefetch_plan='SI:si_range_clean_t:c_idx:10'")
+    cursor.execute("SET @_tx_plan='SI:si_range_clean_t:c_idx:10'")
     cursor.execute("START TRANSACTION")
     cursor.execute(
         "SELECT id FROM si_range_clean_t FORCE INDEX(c_idx) "
@@ -283,7 +283,7 @@ def test_secondary_range_phantom_abort():
         a.commit()
 
         ca.execute("SET GLOBAL lineairdb_prefetch_execution=ON")
-        ca.execute("SET @_prefetch_plan='SI:si_range_t:c_idx:10'")
+        ca.execute("SET @_tx_plan='SI:si_range_t:c_idx:10'")
         ca.execute("START TRANSACTION")
         ca.execute(
             "SELECT id FROM si_range_t FORCE INDEX(c_idx) "

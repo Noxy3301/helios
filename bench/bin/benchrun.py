@@ -354,7 +354,7 @@ def setup_benchmark(benchmark, config_path, mysql_host, mysql_port):
     if load_time:
         print(f"  Load time: {load_time:.1f}s")
 
-    # Prefetch mode requires MySQL's chosen plan to match the @_prefetch_plan DSL.
+    # Prefetch mode requires MySQL's chosen plan to match the @_tx_plan DSL.
     # Without fresh stats, MySQL can pick PRIMARY for queries the DSL expects
     # to take via a secondary index (e.g. OrderStatus customerByNameSQL),
     # leading to plan/DSL mismatch and infinite prefetch retry. Refresh stats
@@ -413,6 +413,10 @@ def run_execute(benchmark, config_path, terminals, result_base, prefetch=False):
     _stop_metrics(samplers)
 
     combined = stdout + stderr
+    try:
+        (res_dir / "benchbase_output.log").write_text(combined)
+    except Exception:
+        pass
     perf = extract_throughput(combined)
     histograms = extract_histograms(combined)
 
@@ -696,7 +700,11 @@ def main():
                         help="Keep lineairdb_logs after the benchmark")
     parser.add_argument("--prefetch", action="store_true",
                         help="Enable Prefetch path: SET GLOBAL lineairdb_prefetch_execution=ON and "
-                             "pass HELIOS_PREFETCH_PLAN=1 to BenchBase (TPC-C procedures inject @_prefetch_plan)")
+                             "pass HELIOS_PREFETCH_PLAN=1 to BenchBase (TPC-C procedures inject @_tx_plan)")
+    parser.add_argument("--prefetch-stmt", action="store_true",
+                        help="Statement-scoped autogen prefetch: SET GLOBAL lineairdb_prefetch_execution=ON "
+                             "WITHOUT HELIOS_PREFETCH_PLAN, so the proxy derives a per-statement read plan "
+                             "from the QEP instead of the injected @_tx_plan DSL")
     args = parser.parse_args()
 
     # Validate
@@ -812,7 +820,7 @@ def main():
 def _run_bench(args, config_work, thread_list, result_base):
     """Setup + execute sweep + summary + plots. Extracted so main() can wrap it."""
     # Toggle Prefetch sysvar explicitly to avoid stale state from prior runs.
-    prefetch_value = "ON" if args.prefetch else "OFF"
+    prefetch_value = "ON" if (args.prefetch or args.prefetch_stmt) else "OFF"
     print(f"  Setting lineairdb_prefetch_execution={prefetch_value}")
     mysql_cmd(args.mysql_port, args.mysql_host,
               f"SET GLOBAL lineairdb_prefetch_execution={prefetch_value};")
