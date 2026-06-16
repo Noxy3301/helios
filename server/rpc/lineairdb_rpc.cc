@@ -226,14 +226,6 @@ void LineairDBRpc::handle_rpc(uint64_t sender_id, MessageType message_type,
             handleTxStatelessBatchRead(message, result);
             release_masstree_thread_epoch();
             return;
-        case MessageType::TX_STATELESS_RANGE_SCAN:
-            handleTxStatelessRangeScan(message, result);
-            release_masstree_thread_epoch();
-            return;
-        case MessageType::TX_STATELESS_SECONDARY_RANGE_SCAN:
-            handleTxStatelessSecondaryRangeScan(message, result);
-            release_masstree_thread_epoch();
-            return;
         case MessageType::TX_EXECUTE_READ_PLAN:
             handleTxExecuteReadPlan(message, result);
             release_masstree_thread_epoch();
@@ -543,61 +535,6 @@ void LineairDBRpc::handleTxStatelessBatchRead(const std::string& message,
         if (read_result.found) {
             out->set_value(std::move(read_result.value));
         }
-    }
-
-    result = response.SerializeAsString();
-}
-
-void LineairDBRpc::handleTxStatelessRangeScan(const std::string& message,
-                                              std::string& result) {
-    LineairDB::Protocol::TxStatelessRangeScan::Request request;
-    LineairDB::Protocol::TxStatelessRangeScan::Response response;
-
-    request.ParseFromString(message);
-
-    auto scan_result = db_manager_->get_database()->StatelessRangeScan(
-        request.table_name(), request.start_key(), request.end_key(),
-        request.row_limit(), request.reverse_scan());
-    response.set_ok(scan_result.ok);
-    if (!scan_result.ok) {
-        result = response.SerializeAsString();
-        return;
-    }
-
-    for (const auto& row : scan_result.rows) {
-        auto* out = response.add_rows();
-        out->set_key(row.key);
-        out->set_value(row.value);
-        out->set_tid(row.tid);
-        out->set_found(row.found);
-    }
-
-    result = response.SerializeAsString();
-}
-
-void LineairDBRpc::handleTxStatelessSecondaryRangeScan(
-    const std::string& message, std::string& result) {
-    LineairDB::Protocol::TxStatelessSecondaryRangeScan::Request request;
-    LineairDB::Protocol::TxStatelessSecondaryRangeScan::Response response;
-
-    request.ParseFromString(message);
-
-    auto scan_result = db_manager_->get_database()->StatelessSecondaryRangeScan(
-        request.table_name(), request.index_name(), request.start_key(),
-        request.end_key(), request.row_limit(), request.reverse_scan());
-    response.set_ok(scan_result.ok);
-    if (!scan_result.ok) {
-        result = response.SerializeAsString();
-        return;
-    }
-
-    for (const auto& row : scan_result.rows) {
-        auto* out = response.add_rows();
-        out->set_secondary_key(row.secondary_key);
-        out->set_primary_key(row.primary_key);
-        out->set_value(row.value);
-        out->set_tid(row.tid);
-        out->set_found(row.found);
     }
 
     result = response.SerializeAsString();

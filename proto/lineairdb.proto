@@ -50,9 +50,7 @@ enum OpCode {
     TX_STATELESS_READ = 27;
     TX_STATELESS_BATCH_READ = 28;
     TX_VALIDATE_AND_COMMIT = 29;
-    TX_STATELESS_RANGE_SCAN = 30;
-    TX_STATELESS_SECONDARY_RANGE_SCAN = 31;
-    TX_EXECUTE_READ_PLAN = 32;
+    TX_EXECUTE_READ_PLAN = 30;
 }
 
 enum BatchOpType {
@@ -178,54 +176,6 @@ message TxStatelessBatchRead {
     }
     message Response {
         repeated ReadResult results = 1;
-    }
-}
-
-// Scan primary-key rows without opening a server-side transaction.
-// Returned row TIDs and the proxy-assembled range read are validated by
-// TxValidateAndCommit.
-message TxStatelessRangeScan {
-    message Request {
-        string table_name = 1;
-        bytes start_key = 2;
-        bytes end_key = 3;
-        uint64 row_limit = 4; // 0 means no limit.
-        bool reverse_scan = 5;
-    }
-    message Row {
-        bytes key = 1;
-        bytes value = 2;
-        uint64 tid = 3;
-        bool found = 4;
-    }
-    message Response {
-        repeated Row rows = 1;
-        bool ok = 2;
-    }
-}
-
-// Scan secondary-index entries without opening a server-side transaction.
-// Base row TIDs and the proxy-assembled range read are validated by
-// TxValidateAndCommit.
-message TxStatelessSecondaryRangeScan {
-    message Request {
-        string table_name = 1;
-        string index_name = 2;
-        bytes start_key = 3;
-        bytes end_key = 4;
-        uint64 row_limit = 5; // 0 means no limit.
-        bool reverse_scan = 6;
-    }
-    message Row {
-        bytes secondary_key = 1;
-        bytes primary_key = 2;
-        bytes value = 3;
-        uint64 tid = 4;
-        bool found = 5;
-    }
-    message Response {
-        repeated Row rows = 1;
-        bool ok = 2;
     }
 }
 

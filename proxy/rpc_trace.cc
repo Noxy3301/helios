@@ -89,10 +89,6 @@ const char* message_type_name(MessageType t) {
       return "TX_STATELESS_BATCH_READ";
     case MessageType::TX_VALIDATE_AND_COMMIT:
       return "TX_VALIDATE_AND_COMMIT";
-    case MessageType::TX_STATELESS_RANGE_SCAN:
-      return "TX_STATELESS_RANGE_SCAN";
-    case MessageType::TX_STATELESS_SECONDARY_RANGE_SCAN:
-      return "TX_STATELESS_SECONDARY_RANGE_SCAN";
     case MessageType::TX_EXECUTE_READ_PLAN:
       return "TX_EXECUTE_READ_PLAN";
   }
