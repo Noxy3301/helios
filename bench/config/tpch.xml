@@ -11,6 +11,9 @@
     <isolation>TRANSACTION_SERIALIZABLE</isolation>
     <batchsize>1024</batchsize>
 
+    <!-- Loader pool >= 3 + 5*tpch.load.shards; 128 covers up to 25 shards. -->
+    <loaderThreads>128</loaderThreads>
+
     <!-- Control scale factor to generate different amount of data -->
     <scalefactor>0.1</scalefactor>
 
