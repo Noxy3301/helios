@@ -49,10 +49,16 @@ bool MessageHandler::receive_message(int socket, uint64_t& sender_id,
     return true;
 }
 
-bool MessageHandler::send_response(int socket, uint64_t sender_id, 
+bool MessageHandler::send_response(int socket, uint64_t sender_id,
                                   MessageType message_type, const std::string& payload) {
     LOG_DEBUG("Sending response (%zu bytes)", payload.size());
-    
+
+    if (payload.size() > UINT32_MAX) {
+        LOG_ERROR("Response payload %zu bytes exceeds the u32 frame limit; dropping",
+                  payload.size());
+        return false;
+    }
+
     // Prepare response header
     MessageHeader response_header;
     response_header.sender_id = htobe64(sender_id);
@@ -84,6 +90,12 @@ bool MessageHandler::send_response(int socket, uint64_t sender_id,
 bool MessageHandler::send_response_writev(int socket, uint64_t sender_id,
                                           MessageType message_type, const std::string& payload) {
     LOG_DEBUG("Sending response via writev (%zu bytes)", payload.size());
+
+    if (payload.size() > UINT32_MAX) {
+        LOG_ERROR("Response payload %zu bytes exceeds the u32 frame limit; dropping",
+                  payload.size());
+        return false;
+    }
 
     MessageHeader response_header;
     response_header.sender_id = htobe64(sender_id);

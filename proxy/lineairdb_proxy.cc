@@ -4,6 +4,7 @@
 #include <arpa/inet.h>
 #include <unistd.h>
 #include <errno.h>
+#include <algorithm>
 #include <chrono>
 #include <cstring>
 #include <iostream>
@@ -391,7 +392,6 @@ LineairDBProxy::ReadPlanResult LineairDBProxy::tx_execute_read_plan(
     }
 
     LineairDB::Protocol::TxExecuteReadPlan::Request request;
-    LineairDB::Protocol::TxExecuteReadPlan::Response response;
     for (const auto& step : steps) {
         auto* out = request.add_steps();
         out->set_table_name(step.table_name);
@@ -431,38 +431,110 @@ LineairDBProxy::ReadPlanResult LineairDBProxy::tx_execute_read_plan(
         }
     }
 
-    if (!send_protobuf_message(request, response,
-                               MessageType::TX_EXECUTE_READ_PLAN)) {
+    // TxExecuteReadPlan responses can exceed protobuf's ~2GB message limit, so
+    // the server returns this response as flat binary.
+    std::string raw;
+    if (!send_protobuf_recv_binary(request, raw,
+                                   MessageType::TX_EXECUTE_READ_PLAN)) {
         LOG_ERROR("RPC failed: Failed to send execute read plan message to server");
         return result;
     }
 
-    result.ok = response.ok();
-    if (!result.ok) return result;
-    result.steps.reserve(response.results_size());
-    for (const auto& step : response.results()) {
+    struct Reader {
+        const char* p;
+        const char* end;
+        bool ok = true;
+        Reader(const char* data, size_t n) : p(data), end(data + n) {}
+        uint8_t u8() {
+            if (end - p < 1) {
+                ok = false;
+                return 0;
+            }
+            return static_cast<uint8_t>(*p++);
+        }
+        uint64_t u64() {
+            if (end - p < 8) {
+                ok = false;
+                return 0;
+            }
+            uint64_t v;
+            std::memcpy(&v, p, 8);
+            p += 8;
+            return v;
+        }
+        std::string bytes() {
+            const uint64_t n = u64();
+            if (!ok || static_cast<uint64_t>(end - p) < n) {
+                ok = false;
+                return {};
+            }
+            std::string out(p, n);
+            p += n;
+            return out;
+        }
+    };
+
+    // Native-endian bytes spell "LDBFLATP" (LineairDB flat payload).
+    static constexpr uint64_t kFlatMagic = 0x5054414C4642444Cull;
+    Reader r(raw.data(), raw.size());
+    if (r.u64() != kFlatMagic || r.u8() != 1) {
+        LOG_ERROR("RPC failed: bad flat read-plan response header");
+        return result;
+    }
+    const bool resp_ok = r.u8() != 0;
+    const uint64_t count = r.u64();
+    if (!r.ok) return result;
+    result.ok = resp_ok;
+    if (!resp_ok) return result;
+
+    // Cap reserves by the wire size: every encoded element costs at least one
+    // byte, so a corrupt count cannot force a huge allocation.
+    const auto cap = [&raw](uint64_t n) {
+        return static_cast<size_t>(std::min<uint64_t>(n, raw.size()));
+    };
+    result.steps.reserve(cap(count));
+    for (uint64_t i = 0; i < count && r.ok; ++i) {
         ReadPlanStepResult out;
-        out.found = step.found();
-        out.value = step.value();
-        out.tid = step.tid();
-        out.actual_key = step.actual_key();
-        out.actual_start_key = step.actual_start_key();
-        out.actual_end_key = step.actual_end_key();
-        out.scan_keys.reserve(step.scan_keys_size());
-        for (const auto& key : step.scan_keys()) out.scan_keys.push_back(key);
-        out.scan_values.reserve(step.scan_values_size());
-        for (const auto& value : step.scan_values()) out.scan_values.push_back(value);
-        out.scan_tids.reserve(step.scan_tids_size());
-        for (const auto tid : step.scan_tids()) out.scan_tids.push_back(tid);
-        out.secondary_keys.reserve(step.secondary_keys_size());
-        for (const auto& key : step.secondary_keys()) out.secondary_keys.push_back(key);
-        out.group_sizes.reserve(step.group_sizes_size());
-        for (const auto sz : step.group_sizes()) out.group_sizes.push_back(sz);
-        out.group_start_keys.reserve(step.group_start_keys_size());
-        for (const auto& key : step.group_start_keys()) out.group_start_keys.push_back(key);
-        out.group_end_keys.reserve(step.group_end_keys_size());
-        for (const auto& key : step.group_end_keys()) out.group_end_keys.push_back(key);
+        out.found = r.u8() != 0;
+        out.tid = r.u64();
+        out.value = r.bytes();
+        out.actual_key = r.bytes();
+        out.actual_start_key = r.bytes();
+        out.actual_end_key = r.bytes();
+        uint64_t n = r.u64();
+        out.scan_keys.reserve(cap(n));
+        for (uint64_t j = 0; j < n && r.ok; ++j)
+            out.scan_keys.push_back(r.bytes());
+        n = r.u64();
+        out.scan_values.reserve(cap(n));
+        for (uint64_t j = 0; j < n && r.ok; ++j)
+            out.scan_values.push_back(r.bytes());
+        n = r.u64();
+        out.scan_tids.reserve(cap(n));
+        for (uint64_t j = 0; j < n && r.ok; ++j)
+            out.scan_tids.push_back(r.u64());
+        n = r.u64();
+        out.secondary_keys.reserve(cap(n));
+        for (uint64_t j = 0; j < n && r.ok; ++j)
+            out.secondary_keys.push_back(r.bytes());
+        n = r.u64();
+        out.group_sizes.reserve(cap(n));
+        for (uint64_t j = 0; j < n && r.ok; ++j)
+            out.group_sizes.push_back(static_cast<uint32_t>(r.u64()));
+        n = r.u64();
+        out.group_start_keys.reserve(cap(n));
+        for (uint64_t j = 0; j < n && r.ok; ++j)
+            out.group_start_keys.push_back(r.bytes());
+        n = r.u64();
+        out.group_end_keys.reserve(cap(n));
+        for (uint64_t j = 0; j < n && r.ok; ++j)
+            out.group_end_keys.push_back(r.bytes());
         result.steps.push_back(std::move(out));
+    }
+    if (!r.ok) {
+        LOG_ERROR("RPC failed: truncated flat read-plan response");
+        result.ok = false;
+        result.steps.clear();
     }
 
     return result;
@@ -1406,6 +1478,11 @@ bool LineairDBProxy::send_message_with_header(const std::string& serialized_requ
         LOG_ERROR("SEND_MESSAGE: Not connected!");
         return false;
     }
+    if (serialized_request.size() > UINT32_MAX) {
+        LOG_ERROR("SEND_MESSAGE: request %zu bytes exceeds the u32 frame limit",
+                  serialized_request.size());
+        return false;
+    }
 
     LOG_DEBUG("SEND_MESSAGE: Sending message of size %zu bytes with message_type %u", 
               serialized_request.size(), static_cast<uint32_t>(message_type));
@@ -1455,16 +1532,23 @@ bool LineairDBProxy::send_message_with_header(const std::string& serialized_requ
     LOG_DEBUG("SEND_MESSAGE: Received response header: sender_id=%lu, message_type=%u, payload_size=%u", 
               response_sender_id, response_message_type, response_payload_size);
 
-    // receive response payload
+    // Receive the response payload. recv(MSG_WAITALL) still caps one call near
+    // 2GB, so large read-plan responses must be drained in a loop.
     if (response_payload_size > 0) {
         serialized_response.resize(response_payload_size);
-        ssize_t payload_received = recv(socket_fd_, &serialized_response[0], response_payload_size, MSG_WAITALL);
-        if (payload_received != static_cast<ssize_t>(response_payload_size)) {
-            LOG_ERROR("SEND_MESSAGE: Failed to receive response payload, received %zd bytes instead of %u", 
-                      payload_received, response_payload_size);
-            return false;
+        size_t received_total = 0;
+        while (received_total < response_payload_size) {
+            const ssize_t chunk =
+                recv(socket_fd_, &serialized_response[received_total],
+                     response_payload_size - received_total, MSG_WAITALL);
+            if (chunk <= 0) {
+                LOG_ERROR("SEND_MESSAGE: Failed to receive response payload, received %zu/%u bytes",
+                          received_total, response_payload_size);
+                return false;
+            }
+            received_total += static_cast<size_t>(chunk);
         }
-        LOG_DEBUG("SEND_MESSAGE: Successfully received response payload (%zd bytes)", payload_received);
+        LOG_DEBUG("SEND_MESSAGE: Successfully received response payload (%zu bytes)", received_total);
     } else {
         LOG_DEBUG("SEND_MESSAGE: No response payload (empty response)");
         serialized_response.clear();
