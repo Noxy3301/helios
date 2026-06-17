@@ -491,6 +491,13 @@ bool compile_ref_lookup(
   bool saw_binding = false;
   uint bound_parts = 0;
 
+  // First pass: validate shape (constants strictly before bindings) and
+  // collect the bound keyparts so we can pick a single iterating source.
+  struct BoundPart {
+    uint kp;
+    Item_field *item;
+  };
+  std::vector<BoundPart> bound_items;
   for (uint kp = 0; kp < ref->key_parts; ++kp) {
     Item *item = ref->items[kp];
     if (item == nullptr) {
@@ -517,17 +524,26 @@ bool compile_ref_lookup(
     }
 
     saw_binding = true;
-    Field *source_field = down_cast<Item_field *>(item)->field;
-    if (source_field == nullptr || source_field->table == nullptr) {
+    Item_field *item_field = down_cast<Item_field *>(item);
+    if (item_field->field == nullptr || item_field->field->table == nullptr) {
       if (reason != nullptr) *reason = "missing bound source field";
       return false;
     }
-    auto source = table_steps.find(source_field->table);
+    bound_items.push_back({kp, item_field});
+  }
+
+  // Pick one iterator source; equality remap covers key parts bound through
+  // other earlier tables.
+  TABLE *iter_table = nullptr;
+  int iter_step = -1;
+  for (const BoundPart &bp : bound_items) {
+    auto source = table_steps.find(bp.item->field->table);
     if (source == table_steps.end()) {
-      TABLE *src_table = source_field->table;
+      TABLE *src_table = bp.item->field->table;
       if (src_table->s != nullptr && src_table->s->tmp_table != NO_TMP_TABLE) {
-        // The probe key comes from a MySQL temp table, so it is unavailable
-        // during staging. Cover the runtime probe by staging the probed index.
+        // The probe key comes from a MySQL temp table, so staging cannot
+        // enumerate its values. Cover the runtime probe by staging the probed
+        // table/index as a full range.
         const THD *leaf_thd = table->in_use;
         const bool plain_select =
             leaf_thd != nullptr && leaf_thd->lex != nullptr &&
@@ -555,7 +571,42 @@ bool compile_ref_lookup(
       if (reason != nullptr) *reason = "bound source is not an earlier step";
       return false;
     }
-    if (!append_bound_keypart(table, ref, kp, source_field, source->second,
+    // Use the latest bound source as the probe iterator.
+    if (source->second > iter_step) {
+      iter_step = source->second;
+      iter_table = bp.item->field->table;
+    }
+  }
+
+  // Append every bound key part against the chosen iterator source.
+  for (const BoundPart &bp : bound_items) {
+    Field *source_field = bp.item->field;
+    if (source_field->table != iter_table) {
+      // This key part came from another table; find its equal field on the
+      // iterator table.
+      Item_equal *eq = bp.item->item_equal_all_join_nests != nullptr
+                           ? bp.item->item_equal_all_join_nests
+                           : bp.item->item_equal;
+      Field *remapped = nullptr;
+      if (eq != nullptr) {
+        Item_equal::FieldProxy proxy(eq);
+        for (Item_field &candidate : proxy) {
+          if (candidate.field != nullptr &&
+              candidate.field->table == iter_table) {
+            remapped = candidate.field;
+            break;
+          }
+        }
+      }
+      if (remapped == nullptr) {
+        if (reason != nullptr) {
+          *reason = "for_each binding spans multiple source steps";
+        }
+        return false;
+      }
+      source_field = remapped;
+    }
+    if (!append_bound_keypart(table, ref, bp.kp, source_field, iter_step,
                               step, reason)) {
       return false;
     }
@@ -778,27 +829,13 @@ bool compile_index_search(TABLE *table, uint index,
 }  // namespace
 
 bool autogen_read_plan_from_qep(
-    THD *thd, std::vector<LineairDBProxy::ReadPlanStep> *out) {
+    THD *thd, AccessPath *root,
+    std::vector<LineairDBProxy::ReadPlanStep> *out) {
   if (out == nullptr) {
     return raise_unsupported(thd, "NONE", "null output vector");
   }
   out->clear();
 
-  if (thd == nullptr || thd->lex == nullptr || thd->lex->unit == nullptr) {
-    return raise_unsupported(thd, "NONE", "missing THD/LEX query unit");
-  }
-
-  // Prefer the unit-level plan root: for statements whose top level is a
-  // materialized set operation / aggregated subquery the per-block JOIN root
-  // is empty and the executable plan hangs off the query expression.
-  AccessPath *root = thd->lex->unit->root_access_path();
-  if (root == nullptr) {
-    Query_block *query_block = thd->lex->unit->first_query_block();
-    if (query_block == nullptr || query_block->join == nullptr) {
-      return raise_unsupported(thd, "NONE", "missing query block JOIN");
-    }
-    root = query_block->join->root_access_path();
-  }
   if (root == nullptr) {
     return raise_unsupported(thd, "NONE", "missing JOIN root_access_path");
   }

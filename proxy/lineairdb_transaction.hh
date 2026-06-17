@@ -3,6 +3,7 @@
 
 #include <optional>
 #include <unordered_map>
+#include <unordered_set>
 
 #include "sql/handler.h" /* handler */
 #include "mysql/plugin.h"
@@ -110,9 +111,18 @@ public:
     autogen_query_id_ = query_id;
     autogen_stmt_resolved_ = false;
     autogen_stmt_handler_deferred_ = false;
+    autogen_staged_roots_.clear();
   }
   bool autogen_stmt_resolved() const { return autogen_stmt_resolved_; }
   void mark_autogen_stmt_resolved() { autogen_stmt_resolved_ = true; }
+  // Subqueries may be staged before the statement root exists. Remember each
+  // root so the same subquery plan is not prefetched twice in one statement.
+  bool autogen_root_staged(const void *root) const {
+    return autogen_staged_roots_.count(root) != 0;
+  }
+  void mark_autogen_root_staged(const void *root) {
+    autogen_staged_roots_.insert(root);
+  }
   bool is_autogen_stmt_handler_deferred() const {
     return autogen_stmt_handler_deferred_;
   }
@@ -178,6 +188,7 @@ private:
   bool tx_plan_used_{false};
   uint64_t autogen_query_id_{0};
   bool autogen_stmt_resolved_{false};
+  std::unordered_set<const void*> autogen_staged_roots_;
   // Set when this statement's plan is built from the handler index access
   // (deferred legacy-DML path) instead of the QEP; a second handler access
   // then means an index merge the single staged range cannot serve.

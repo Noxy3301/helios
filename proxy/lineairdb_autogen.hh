@@ -9,16 +9,26 @@ struct TABLE;
 #include "lineairdb_index_search.hh"
 #include "lineairdb_proxy.hh"
 
-// Auto-generate a statement-scoped prefetch read plan from the current
-// statement's MySQL QEP (JOIN::root_access_path()). Returns true with steps on
-// full success. On ANY unsupported QEP shape it raises my_error(...) and
-// returns false (NO fallback, NO best-effort coverage). Caller must fail the
-// statement when false.
-bool autogen_read_plan_from_qep(
-    THD *thd, std::vector<LineairDBProxy::ReadPlanStep> *out);
+struct AccessPath;
 
-// Auto-generate one statement-scoped prefetch step from the handler access
-// selected for legacy single-table UPDATE/DELETE.
+/**
+ * @brief Build a statement-scoped prefetch read plan from a QEP root.
+ *
+ * @details `root` may be the whole statement root, or a subquery unit root
+ * when MySQL evaluates the subquery before the statement plan is finalized.
+ *
+ * @note Unsupported QEP shapes raise my_error() and return false. Callers must
+ * fail the statement; this path intentionally has no best-effort fallback.
+ */
+bool autogen_read_plan_from_qep(
+    THD *thd, AccessPath *root, std::vector<LineairDBProxy::ReadPlanStep> *out);
+
+/**
+ * @brief Build one statement-scoped prefetch step from handler index access.
+ *
+ * @details Used for legacy single-table UPDATE/DELETE, where the handler
+ * supplies the selected index/range instead of a normal QEP root.
+ */
 bool autogen_read_plan_from_index_search(
     THD *thd, TABLE *table, uint index, const IndexSearchPlan &search,
     std::vector<LineairDBProxy::ReadPlanStep> *out);

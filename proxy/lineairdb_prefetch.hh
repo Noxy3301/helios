@@ -44,7 +44,8 @@ void maybe_prefetch_for_transaction(THD *thd,
  *         (e.g. a read miss), with no my_error. Propagate any non-zero return to
  *         fail the statement.
  */
-int maybe_prefetch_for_statement(THD *thd, LineairDBTransaction *tx);
+int maybe_prefetch_for_statement(THD *thd, LineairDBTransaction *tx,
+                                 TABLE *table);
 
 /**
  * @brief True when this statement must defer autogen until index_read_map()

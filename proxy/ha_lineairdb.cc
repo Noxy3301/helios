@@ -680,7 +680,7 @@ int ha_lineairdb::index_read_map(uchar *buf, const uchar *key,
   }
 
   // The optimizer has run, so the SELECT/generic-DML QEP is available.
-  if (int err = maybe_prefetch_for_statement(ha_thd(), tx)) return err;
+  if (int err = maybe_prefetch_for_statement(ha_thd(), tx, table)) return err;
 
   build_search_plan(key, keypart_map, find_flag, key_info);
 
@@ -904,7 +904,7 @@ int ha_lineairdb::rnd_init(bool) {
   // The optimizer has run, so the QEP is available.
   // Statement-scoped autogen stages and executes the prefetch plan once per
   // statement; an unsupported QEP fails here.
-  if (int err = maybe_prefetch_for_statement(ha_thd(), tx)) {
+  if (int err = maybe_prefetch_for_statement(ha_thd(), tx, table)) {
     DBUG_RETURN(err);
   }
 
@@ -1963,7 +1963,7 @@ int ha_lineairdb::multi_range_read_init(RANGE_SEQ_IF *seq, void *seq_init_param,
     // Legacy single-table DML has no QEP plan. Default DS-MRR reaches
     // read_range_first()->index_read_map(), where the complete bounds exist.
     if (!legacy_dml) {
-      if (int err = maybe_prefetch_for_statement(ha_thd(), tx)) return err;
+      if (int err = maybe_prefetch_for_statement(ha_thd(), tx, table)) return err;
     }
     if (tx->is_aborted()) {
       return abort_errno(tx);
