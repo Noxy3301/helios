@@ -156,6 +156,8 @@ public:
         std::vector<ReadPlanKeyBinding> end_bindings;
         bool for_each = false;
         bool reverse_scan = false;
+        // Serialized PushedPredicate; empty means no server-side filter.
+        std::string serialized_filter;
     };
     struct ReadPlanStepResult {
         bool found = false;

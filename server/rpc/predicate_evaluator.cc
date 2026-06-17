@@ -67,7 +67,9 @@ bool PredicateEvaluator::parse_row(const char* data, size_t length,
     field_index++;
   }
 
-  return true;
+  // If the row ended before all filter columns were present, keep it in the
+  // response so MySQL can evaluate the condition.
+  return field_index == total_fields;
 }
 
 // ---------------------------------------------------------------------------

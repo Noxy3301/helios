@@ -355,7 +355,7 @@ void maybe_prefetch_for_transaction(THD *thd,
 static int autogen_and_execute_prefetch(THD *thd, AccessPath *root,
                                         LineairDBTransaction *tx) {
   std::vector<LineairDBProxy::ReadPlanStep> steps;
-  if (!autogen_read_plan_from_qep(thd, root, &steps)) {
+  if (!autogen_read_plan_from_qep(thd, root, tx->ro_novalidate(), &steps)) {
     // autogen has already raised a my_error describing the unsupported shape.
     tx->set_status_to_abort();
     thd_mark_transaction_to_rollback(thd, 1);

@@ -403,6 +403,11 @@ public:
   /** Predicate pushdown: serialize WHERE conditions for server-side filtering */
   const Item *cond_push(const Item *cond) override;
 
+  /** Table-local filter from cond_push(), for autogen scan-step pushdown. */
+  const std::string &pushed_filter_for_autogen() const {
+    return pushed_filter_serialized_;
+  }
+
 private:
   // Serialized PushedPredicate protobuf from cond_push()
   std::string pushed_filter_serialized_;

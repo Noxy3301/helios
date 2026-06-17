@@ -115,6 +115,8 @@ public:
   }
   bool autogen_stmt_resolved() const { return autogen_stmt_resolved_; }
   void mark_autogen_stmt_resolved() { autogen_stmt_resolved_ = true; }
+  // True for the read-only no-validation path; staged filters use the same gate.
+  bool ro_novalidate() const { return ro_novalidate_; }
   // Subqueries may be staged before the statement root exists. Remember each
   // root so the same subquery plan is not prefetched twice in one statement.
   bool autogen_root_staged(const void *root) const {

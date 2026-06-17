@@ -204,6 +204,7 @@ message TxExecuteReadPlan {
         repeated KeyBinding end_bindings = 8;
         bool for_each = 9;
         bool reverse_scan = 10;
+        PushedPredicate filter = 11; // Optional row filter for staged scans.
     }
     message StepResult {
         bool found = 1;
