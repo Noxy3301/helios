@@ -880,10 +880,9 @@ bool autogen_read_plan_from_qep(
       return raise_unsupported(thd, leaf->type, reason);
     }
 
-    // Push cond_push() only for full primary scans here. Validated commits
-    // need the full scanned key set, so this is gated by ro_novalidate.
-    if (allow_filter_pushdown && step.is_scan && !step.for_each &&
-        step.index_name.empty() && table->file != nullptr) {
+    // Attach scan filters only when the caller allows filtered read-plan
+    // results. Callers that need a complete scanned key set pass false.
+    if (allow_filter_pushdown && step.is_scan && table->file != nullptr) {
       step.serialized_filter =
           down_cast<ha_lineairdb *>(table->file)->pushed_filter_for_autogen();
     }

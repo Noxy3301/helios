@@ -16,7 +16,7 @@ struct AccessPath;
  *
  * @details `root` may be the whole statement root, or a subquery unit root
  * when MySQL evaluates the subquery before the statement plan is finalized.
- * If `allow_filter_pushdown` is true, eligible primary scans carry the
+ * If `allow_filter_pushdown` is true, eligible scan steps carry the
  * table-local cond_push() filter.
  *
  * @note Unsupported QEP shapes raise my_error() and return false. Callers must

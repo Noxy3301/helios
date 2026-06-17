@@ -252,9 +252,11 @@ void LineairDBTransaction::execute_read_plan(
     return;
   }
 
+  // Consume each decoded step destructively: move strings into local caches,
+  // then release the step before staging the next one.
   for (size_t i = 0; i < result.steps.size() && i < steps.size(); ++i) {
     const auto& step = steps[i];
-    const auto& step_result = result.steps[i];
+    auto& step_result = result.steps[i];
 
     if (!step.is_scan && !step.for_each) {
       rpc_trace_.record_local_view(trace_count_event(
@@ -267,30 +269,13 @@ void LineairDBTransaction::execute_read_plan(
         record_row_cache(step.table_name, step_result.actual_key, false, "",
                           step_result.tid, true);
       }
+      step_result = LineairDBProxy::ReadPlanStepResult{};
       continue;
     }
 
     rpc_trace_.record_local_view(trace_plan_scan_event(
         step.table_name, step.index_name, step_result.scan_keys.size(),
         step_result.scan_values.size(), step.scan_limit, step.for_each));
-
-    std::vector<std::pair<std::string, std::string>> rows;
-    std::vector<uint64_t> row_tids;
-    rows.reserve(step_result.scan_keys.size());
-    row_tids.reserve(step_result.scan_keys.size());
-    for (size_t j = 0; j < step_result.scan_keys.size(); ++j) {
-      const std::string& key = step_result.scan_keys[j];
-      const std::string value =
-          j < step_result.scan_values.size() ? step_result.scan_values[j] : "";
-      const uint64_t tid =
-          j < step_result.scan_tids.size() ? step_result.scan_tids[j] : 0;
-      const bool found = !value.empty();
-      record_row_cache(step.table_name, key, found, value, tid, true);
-      if (found) {
-        rows.emplace_back(key, value);
-        row_tids.push_back(tid);
-      }
-    }
 
     if (step.for_each && step.is_scan) {
       // Stage grouped for_each range results as ordinary scan-cache entries.
@@ -314,14 +299,18 @@ void LineairDBTransaction::execute_read_plan(
           entry.row_limit = step.scan_limit;
           for (size_t j = flat; j < flat + n && j < step_result.scan_keys.size();
                ++j) {
-            const std::string& key = step_result.scan_keys[j];
-            const std::string value = j < step_result.scan_values.size()
-                                          ? step_result.scan_values[j]
-                                          : "";
-            if (value.empty()) continue;
-            entry.rows.emplace_back(key, value);
-            entry.row_tids.push_back(
-                j < step_result.scan_tids.size() ? step_result.scan_tids[j] : 0);
+            std::string key = std::move(step_result.scan_keys[j]);
+            std::string value = j < step_result.scan_values.size()
+                                    ? std::move(step_result.scan_values[j])
+                                    : std::string();
+            const uint64_t tid =
+                j < step_result.scan_tids.size() ? step_result.scan_tids[j] : 0;
+            const bool found = !value.empty();
+            record_row_cache(step.table_name, key, found, value, tid, true);
+            if (found) {
+              entry.rows.emplace_back(std::move(key), std::move(value));
+              entry.row_tids.push_back(tid);
+            }
           }
           push_range_scan_cache(std::move(entry));
         } else {
@@ -335,26 +324,70 @@ void LineairDBTransaction::execute_read_plan(
           entry.row_limit = step.scan_limit;
           for (size_t j = flat; j < flat + n && j < step_result.scan_keys.size();
                ++j) {
-            entry.primary_keys.push_back(step_result.scan_keys[j]);
+            std::string key = std::move(step_result.scan_keys[j]);
+            std::string value = j < step_result.scan_values.size()
+                                    ? std::move(step_result.scan_values[j])
+                                    : std::string();
+            const uint64_t tid =
+                j < step_result.scan_tids.size() ? step_result.scan_tids[j] : 0;
+            record_row_cache(step.table_name, key, !value.empty(), value, tid,
+                             true);
             if (j < step_result.secondary_keys.size()) {
-              entry.secondary_keys.push_back(step_result.secondary_keys[j]);
+              entry.secondary_keys.push_back(
+                  std::move(step_result.secondary_keys[j]));
             }
+            entry.primary_keys.push_back(std::move(key));
           }
           push_secondary_scan_cache(std::move(entry));
         }
         flat += n;
       }
+      step_result = LineairDBProxy::ReadPlanStepResult{};
       continue;
     }
 
-    if (step.for_each) continue;
+    if (step.for_each) {
+      // Point probes only populate the row cache.
+      for (size_t j = 0; j < step_result.scan_keys.size(); ++j) {
+        std::string key = std::move(step_result.scan_keys[j]);
+        std::string value = j < step_result.scan_values.size()
+                                ? std::move(step_result.scan_values[j])
+                                : std::string();
+        const uint64_t tid =
+            j < step_result.scan_tids.size() ? step_result.scan_tids[j] : 0;
+        record_row_cache(step.table_name, key, !value.empty(), value, tid,
+                         true);
+      }
+      step_result = LineairDBProxy::ReadPlanStepResult{};
+      continue;
+    }
 
     if (step.index_name.empty()) {
+      // Primary scan: cache row values and stage one primary range entry.
+      std::vector<std::pair<std::string, std::string>> rows;
+      std::vector<uint64_t> row_tids;
+      rows.reserve(step_result.scan_keys.size());
+      row_tids.reserve(step_result.scan_keys.size());
+      for (size_t j = 0; j < step_result.scan_keys.size(); ++j) {
+        std::string key = std::move(step_result.scan_keys[j]);
+        std::string value = j < step_result.scan_values.size()
+                                ? std::move(step_result.scan_values[j])
+                                : std::string();
+        const uint64_t tid =
+            j < step_result.scan_tids.size() ? step_result.scan_tids[j] : 0;
+        const bool found = !value.empty();
+        record_row_cache(step.table_name, key, found, value, tid, true);
+        if (found) {
+          rows.emplace_back(std::move(key), std::move(value));
+          row_tids.push_back(tid);
+        }
+      }
       push_range_scan_cache(
           {step.table_name, step_result.actual_start_key,
            step_result.actual_end_key, step.reverse_scan, step.scan_limit,
            std::move(rows), std::move(row_tids)});
     } else {
+      // Keep secondary_keys and primary_keys aligned; lookup walks the pairs.
       LocalSecondaryScanEntry cached;
       cached.table_name = step.table_name;
       cached.index_name = step.index_name;
@@ -363,15 +396,24 @@ void LineairDBTransaction::execute_read_plan(
       cached.reverse_scan = step.reverse_scan;
       cached.row_limit = step.scan_limit;
       cached.secondary_keys.reserve(step_result.secondary_keys.size());
-      cached.primary_keys.reserve(step_result.scan_keys.size());
-      for (const auto& key : step_result.secondary_keys) {
-        cached.secondary_keys.push_back(key);
+      for (auto& key : step_result.secondary_keys) {
+        cached.secondary_keys.push_back(std::move(key));
       }
-      for (const auto& key : step_result.scan_keys) {
-        cached.primary_keys.push_back(key);
+      cached.primary_keys.reserve(step_result.scan_keys.size());
+      for (size_t j = 0; j < step_result.scan_keys.size(); ++j) {
+        std::string key = std::move(step_result.scan_keys[j]);
+        std::string value = j < step_result.scan_values.size()
+                                ? std::move(step_result.scan_values[j])
+                                : std::string();
+        const uint64_t tid =
+            j < step_result.scan_tids.size() ? step_result.scan_tids[j] : 0;
+        record_row_cache(step.table_name, key, !value.empty(), value, tid,
+                         true);
+        cached.primary_keys.push_back(std::move(key));
       }
       push_secondary_scan_cache(std::move(cached));
     }
+    step_result = LineairDBProxy::ReadPlanStepResult{};
   }
 }
 
