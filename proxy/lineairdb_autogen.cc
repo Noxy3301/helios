@@ -171,7 +171,7 @@ void collect_qep_leaves(AccessPath *p, std::vector<AccessPath *> *out,
     case AccessPath::MRR:
       // MRR is BKA's inner-table access: a ref-like (table, ref) leaf whose ref
       // keyparts bind to the outer table, so compile_ref_lookup turns it into a
-      // for_each point probe (FER/FES still rejected there).
+      // for_each point/range probe.
       out->push_back(p);
       return;
     case AccessPath::NESTED_LOOP_JOIN:
@@ -232,6 +232,21 @@ void collect_qep_leaves(AccessPath *p, std::vector<AccessPath *> *out,
       return;
     case AccessPath::UPDATE_ROWS:
       collect_qep_leaves(p->update_rows().child, out, ok, unsupported);
+      return;
+    case AccessPath::WEEDOUT:
+      // Semijoin duplicate weedout dedups locally via handler rowids;
+      // position()/rnd_pos() re-reads hit the staged row cache.
+      collect_qep_leaves(p->weedout().child, out, ok, unsupported);
+      return;
+    case AccessPath::NESTED_LOOP_SEMIJOIN_WITH_DUPLICATE_REMOVAL:
+      collect_qep_leaves(p->nested_loop_semijoin_with_duplicate_removal().outer,
+                         out, ok, unsupported);
+      collect_qep_leaves(p->nested_loop_semijoin_with_duplicate_removal().inner,
+                         out, ok, unsupported);
+      return;
+    case AccessPath::ZERO_ROWS:
+      // The optimizer proved this subtree returns nothing; no rows will be
+      // read at runtime, so no prefetch step is needed.
       return;
     default:
       set_unsupported(p, "unsupported QEP node", ok, unsupported);
@@ -509,6 +524,34 @@ bool compile_ref_lookup(
     }
     auto source = table_steps.find(source_field->table);
     if (source == table_steps.end()) {
+      TABLE *src_table = source_field->table;
+      if (src_table->s != nullptr && src_table->s->tmp_table != NO_TMP_TABLE) {
+        // The probe key comes from a MySQL temp table, so it is unavailable
+        // during staging. Cover the runtime probe by staging the probed index.
+        const THD *leaf_thd = table->in_use;
+        const bool plain_select =
+            leaf_thd != nullptr && leaf_thd->lex != nullptr &&
+            leaf_thd->lex->sql_command == SQLCOM_SELECT &&
+            table->reginfo.lock_type <= TL_READ;
+        if (!plain_select) {
+          if (reason != nullptr) {
+            *reason = "temp-table-driven probe outside plain SELECT";
+          }
+          return false;
+        }
+        step->bindings.clear();
+        step->end_bindings.clear();
+        step->for_each = false;
+        step->is_scan = true;
+        step->key_prefix.clear();
+        step->end_key_prefix = lineairdb_keyenc::scan_end_sentinel();
+        if (ref->key == static_cast<int>(table->s->primary_key)) {
+          step->index_name.clear();
+        } else {
+          step->index_name = key.name;
+        }
+        return !step->table_name.empty();
+      }
       if (reason != nullptr) *reason = "bound source is not an earlier step";
       return false;
     }
@@ -544,20 +587,17 @@ bool compile_ref_lookup(
 
   if (bound_parts > 0) {
     step->for_each = true;
-    // The server executes for_each as a per-source-row point StatelessRead only
-    // (lineairdb_rpc.cc); a per-row range probe (FER, primary partial key) or
-    // secondary probe (FES) is not implemented. Require a full-primary-key point
-    // probe and reject anything that would need a range scan per source row.
     if (child_primary && used_key_parts >= child_pk_parts) {
+      // Full-primary-key point probe per source row.
       step->is_scan = false;
       return !step->table_name.empty();
     }
-    if (reason != nullptr) {
-      *reason = child_primary
-                    ? "for_each primary range probe (FER) unsupported by server"
-                    : "for_each secondary probe (FES) unsupported by server";
-    }
-    return false;
+    // Otherwise each source row drives a bounded range probe: a primary-prefix
+    // scan for partial primary keys, or a secondary-index scan for secondary
+    // refs. The server groups rows by deduplicated probe key.
+    step->is_scan = true;
+    if (!child_primary) step->index_name = key.name;
+    return !step->table_name.empty();
   }
 
   step->key_prefix = lineairdb_keyenc::convert_key_to_ldbformat(
@@ -612,11 +652,7 @@ bool compile_leaf(AccessPath *leaf,
     const bool plain_select = leaf_thd != nullptr && leaf_thd->lex != nullptr &&
                               leaf_thd->lex->sql_command == SQLCOM_SELECT &&
                               table->reginfo.lock_type <= TL_READ;
-    const bool primary_order =
-        full_scan_index < 0 ||
-        (table->s->primary_key != MAX_KEY &&
-         full_scan_index == static_cast<int>(table->s->primary_key));
-    if (!plain_select || !primary_order) {
+    if (!plain_select) {
       if (reason != nullptr) *reason = "full table/index scan unsupported";
       return false;
     }
@@ -625,9 +661,18 @@ bool compile_leaf(AccessPath *leaf,
       if (reason != nullptr) *reason = "missing leaf table name";
       return false;
     }
+    const bool primary_order =
+        full_scan_index < 0 ||
+        (table->s->primary_key != MAX_KEY &&
+         full_scan_index == static_cast<int>(table->s->primary_key));
     step->is_scan = true;
     step->key_prefix.clear();
     step->end_key_prefix = lineairdb_keyenc::scan_end_sentinel();
+    if (!primary_order) {
+      // Full secondary INDEX_SCAN: stage the secondary range itself. Runtime
+      // index_first/index_next consumes it, then base rows come from row cache.
+      step->index_name = table->key_info[full_scan_index].name;
+    }
     return true;
   }
   if (ref == nullptr) {
@@ -743,12 +788,17 @@ bool autogen_read_plan_from_qep(
     return raise_unsupported(thd, "NONE", "missing THD/LEX query unit");
   }
 
-  Query_block *query_block = thd->lex->unit->first_query_block();
-  if (query_block == nullptr || query_block->join == nullptr) {
-    return raise_unsupported(thd, "NONE", "missing query block JOIN");
+  // Prefer the unit-level plan root: for statements whose top level is a
+  // materialized set operation / aggregated subquery the per-block JOIN root
+  // is empty and the executable plan hangs off the query expression.
+  AccessPath *root = thd->lex->unit->root_access_path();
+  if (root == nullptr) {
+    Query_block *query_block = thd->lex->unit->first_query_block();
+    if (query_block == nullptr || query_block->join == nullptr) {
+      return raise_unsupported(thd, "NONE", "missing query block JOIN");
+    }
+    root = query_block->join->root_access_path();
   }
-
-  AccessPath *root = query_block->join->root_access_path();
   if (root == nullptr) {
     return raise_unsupported(thd, "NONE", "missing JOIN root_access_path");
   }

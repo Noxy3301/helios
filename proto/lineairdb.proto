@@ -216,6 +216,11 @@ message TxExecuteReadPlan {
         repeated bytes secondary_keys = 8;
         bytes actual_start_key = 9;
         bytes actual_end_key = 10;
+        // for_each range probes return one group per deduplicated start key.
+        // group_sizes[i] rows belong to [group_start_keys[i], group_end_keys[i]).
+        repeated uint32 group_sizes = 11;
+        repeated bytes group_start_keys = 12;
+        repeated bytes group_end_keys = 13;
     }
     message Request {
         repeated PlanStep steps = 1;
