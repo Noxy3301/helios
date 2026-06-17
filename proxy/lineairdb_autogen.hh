@@ -18,13 +18,17 @@ struct AccessPath;
  * when MySQL evaluates the subquery before the statement plan is finalized.
  * If `allow_filter_pushdown` is true, eligible scan steps carry the
  * table-local cond_push() filter.
+ * If `include_inner_units` is true, Item-held subquery plans are compiled into
+ * the same step list so correlated probes can bind to earlier outer steps.
  *
  * @note Unsupported QEP shapes raise my_error() and return false. Callers must
- * fail the statement; this path intentionally has no best-effort fallback.
+ * fail the statement. Inner-unit failures are ignored only when
+ * `include_inner_units` is true; the outer plan remains unchanged.
  */
 bool autogen_read_plan_from_qep(
     THD *thd, AccessPath *root, bool allow_filter_pushdown,
-    std::vector<LineairDBProxy::ReadPlanStep> *out);
+    std::vector<LineairDBProxy::ReadPlanStep> *out,
+    bool include_inner_units = false);
 
 /**
  * @brief Build one statement-scoped prefetch step from handler index access.
