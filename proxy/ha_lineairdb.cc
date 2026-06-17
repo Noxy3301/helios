@@ -136,6 +136,8 @@ static constexpr uint LDB_INDEX_UNIQUE = 1u;
 static char *srv_server_host = nullptr;
 static ulong srv_server_port = 9999;
 static bool srv_prefetch_execution = false;
+// Non-static: read by LineairDBTransaction at begin (see lineairdb_transaction.cc)
+bool srv_prefetch_ro_novalidate = false;
 
 // THD-scoped context
 struct LineairDBThdCtx {
@@ -2219,11 +2221,18 @@ static MYSQL_SYSVAR_BOOL(prefetch_execution, srv_prefetch_execution,
                          PLUGIN_VAR_OPCMDARG,
                          "Enable experimental prefetch execution.", nullptr,
                          nullptr, false);
+static MYSQL_SYSVAR_BOOL(
+    prefetch_ro_novalidate, srv_prefetch_ro_novalidate, PLUGIN_VAR_OPCMDARG,
+    "Skip commit-time read validation for autocommit read-only SELECT under "
+    "prefetch execution. Sound only without concurrent writers (e.g. "
+    "analytical read-only workloads); the commit RPC is omitted entirely.",
+    nullptr, nullptr, false);
 
 static SYS_VAR *lineairdb_system_variables[] = {
     MYSQL_SYSVAR(server_host),
     MYSQL_SYSVAR(server_port),
     MYSQL_SYSVAR(prefetch_execution),
+    MYSQL_SYSVAR(prefetch_ro_novalidate),
     MYSQL_SYSVAR(enum_var),
     MYSQL_SYSVAR(ulong_var),
     MYSQL_SYSVAR(double_var),

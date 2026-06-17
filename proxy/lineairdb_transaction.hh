@@ -172,6 +172,9 @@ private:
   bool isFence;
   bool prefetch_mode_{false};
   bool prefetch_registered_{false};
+  // Autocommit single-statement SELECT with lineairdb_prefetch_ro_novalidate=ON:
+  // read sets are not accumulated and commit skips the validation RPC.
+  bool ro_novalidate_{false};
   bool tx_plan_used_{false};
   uint64_t autogen_query_id_{0};
   bool autogen_stmt_resolved_{false};
