@@ -208,6 +208,25 @@ void collect_qep_leaves(AccessPath *p, std::vector<AccessPath *> *out,
     case AccessPath::STREAM:
       collect_qep_leaves(p->stream().child, out, ok, unsupported);
       return;
+    case AccessPath::TEMPTABLE_AGGREGATE:
+      // MySQL can run GROUP BY by filling an internal temp table and reading it
+      // back. Prefetch only needs the LineairDB reads that feed that temp table;
+      // the temp-table leaves themselves are skipped in the compile loop.
+      collect_qep_leaves(p->temptable_aggregate().subquery_path, out, ok,
+                         unsupported);
+      collect_qep_leaves(p->temptable_aggregate().table_path, out, ok,
+                         unsupported);
+      return;
+    case AccessPath::MATERIALIZE:
+      // Derived tables and materialized subqueries have the same shape: the
+      // source subqueries may read LineairDB, but the materialized table is
+      // local to MySQL.
+      for (const MaterializePathParameters::QueryBlock &qb :
+           p->materialize().param->query_blocks) {
+        collect_qep_leaves(qb.subquery_path, out, ok, unsupported);
+      }
+      collect_qep_leaves(p->materialize().table_path, out, ok, unsupported);
+      return;
     case AccessPath::DELETE_ROWS:
       collect_qep_leaves(p->delete_rows().child, out, ok, unsupported);
       return;
@@ -757,6 +776,11 @@ bool autogen_read_plan_from_qep(
     if (!qep_leaf_info(leaf, &table, &ref, &full_scan, &full_scan_index) ||
         table == nullptr) {
       return raise_unsupported(thd, leaf->type, "unsupported QEP leaf");
+    }
+    if (table->s != nullptr && table->s->tmp_table != NO_TMP_TABLE) {
+      // Local MySQL temp tables are not stored in LineairDB, so there is
+      // nothing to prefetch for this leaf.
+      continue;
     }
     if (table_steps.find(table) != table_steps.end()) {
       return raise_unsupported(thd, leaf->type, "duplicate QEP table leaf");
