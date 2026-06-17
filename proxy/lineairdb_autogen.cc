@@ -21,6 +21,7 @@
 #include "sql/sql_optimizer.h"
 #include "sql/sql_opt_exec_shared.h"
 #include "sql/table.h"
+#include "storage/lineairdb/ha_lineairdb.hh"
 
 namespace {
 
@@ -171,7 +172,7 @@ void collect_qep_leaves(AccessPath *p, std::vector<AccessPath *> *out,
     case AccessPath::MRR:
       // MRR is BKA's inner-table access: a ref-like (table, ref) leaf whose ref
       // keyparts bind to the outer table, so compile_ref_lookup turns it into a
-      // for_each point probe (FER/FES still rejected there).
+      // for_each point/range probe.
       out->push_back(p);
       return;
     case AccessPath::NESTED_LOOP_JOIN:
@@ -208,11 +209,45 @@ void collect_qep_leaves(AccessPath *p, std::vector<AccessPath *> *out,
     case AccessPath::STREAM:
       collect_qep_leaves(p->stream().child, out, ok, unsupported);
       return;
+    case AccessPath::TEMPTABLE_AGGREGATE:
+      // MySQL can run GROUP BY by filling an internal temp table and reading it
+      // back. Prefetch only needs the LineairDB reads that feed that temp table;
+      // the temp-table leaves themselves are skipped in the compile loop.
+      collect_qep_leaves(p->temptable_aggregate().subquery_path, out, ok,
+                         unsupported);
+      collect_qep_leaves(p->temptable_aggregate().table_path, out, ok,
+                         unsupported);
+      return;
+    case AccessPath::MATERIALIZE:
+      // Derived tables and materialized subqueries have the same shape: the
+      // source subqueries may read LineairDB, but the materialized table is
+      // local to MySQL.
+      for (const MaterializePathParameters::QueryBlock &qb :
+           p->materialize().param->query_blocks) {
+        collect_qep_leaves(qb.subquery_path, out, ok, unsupported);
+      }
+      collect_qep_leaves(p->materialize().table_path, out, ok, unsupported);
+      return;
     case AccessPath::DELETE_ROWS:
       collect_qep_leaves(p->delete_rows().child, out, ok, unsupported);
       return;
     case AccessPath::UPDATE_ROWS:
       collect_qep_leaves(p->update_rows().child, out, ok, unsupported);
+      return;
+    case AccessPath::WEEDOUT:
+      // Semijoin duplicate weedout dedups locally via handler rowids;
+      // position()/rnd_pos() re-reads hit the staged row cache.
+      collect_qep_leaves(p->weedout().child, out, ok, unsupported);
+      return;
+    case AccessPath::NESTED_LOOP_SEMIJOIN_WITH_DUPLICATE_REMOVAL:
+      collect_qep_leaves(p->nested_loop_semijoin_with_duplicate_removal().outer,
+                         out, ok, unsupported);
+      collect_qep_leaves(p->nested_loop_semijoin_with_duplicate_removal().inner,
+                         out, ok, unsupported);
+      return;
+    case AccessPath::ZERO_ROWS:
+      // The optimizer proved this subtree returns nothing; no rows will be
+      // read at runtime, so no prefetch step is needed.
       return;
     default:
       set_unsupported(p, "unsupported QEP node", ok, unsupported);
@@ -457,6 +492,13 @@ bool compile_ref_lookup(
   bool saw_binding = false;
   uint bound_parts = 0;
 
+  // First pass: validate shape (constants strictly before bindings) and
+  // collect the bound keyparts so we can pick a single iterating source.
+  struct BoundPart {
+    uint kp;
+    Item_field *item;
+  };
+  std::vector<BoundPart> bound_items;
   for (uint kp = 0; kp < ref->key_parts; ++kp) {
     Item *item = ref->items[kp];
     if (item == nullptr) {
@@ -483,17 +525,89 @@ bool compile_ref_lookup(
     }
 
     saw_binding = true;
-    Field *source_field = down_cast<Item_field *>(item)->field;
-    if (source_field == nullptr || source_field->table == nullptr) {
+    Item_field *item_field = down_cast<Item_field *>(item);
+    if (item_field->field == nullptr || item_field->field->table == nullptr) {
       if (reason != nullptr) *reason = "missing bound source field";
       return false;
     }
-    auto source = table_steps.find(source_field->table);
+    bound_items.push_back({kp, item_field});
+  }
+
+  // Pick one iterator source; equality remap covers key parts bound through
+  // other earlier tables.
+  TABLE *iter_table = nullptr;
+  int iter_step = -1;
+  for (const BoundPart &bp : bound_items) {
+    auto source = table_steps.find(bp.item->field->table);
     if (source == table_steps.end()) {
+      TABLE *src_table = bp.item->field->table;
+      if (src_table->s != nullptr && src_table->s->tmp_table != NO_TMP_TABLE) {
+        // The probe key comes from a MySQL temp table, so staging cannot
+        // enumerate its values. Cover the runtime probe by staging the probed
+        // table/index as a full range.
+        const THD *leaf_thd = table->in_use;
+        const bool plain_select =
+            leaf_thd != nullptr && leaf_thd->lex != nullptr &&
+            leaf_thd->lex->sql_command == SQLCOM_SELECT &&
+            table->reginfo.lock_type <= TL_READ;
+        if (!plain_select) {
+          if (reason != nullptr) {
+            *reason = "temp-table-driven probe outside plain SELECT";
+          }
+          return false;
+        }
+        step->bindings.clear();
+        step->end_bindings.clear();
+        step->for_each = false;
+        step->is_scan = true;
+        step->key_prefix.clear();
+        step->end_key_prefix = lineairdb_keyenc::scan_end_sentinel();
+        if (ref->key == static_cast<int>(table->s->primary_key)) {
+          step->index_name.clear();
+        } else {
+          step->index_name = key.name;
+        }
+        return !step->table_name.empty();
+      }
       if (reason != nullptr) *reason = "bound source is not an earlier step";
       return false;
     }
-    if (!append_bound_keypart(table, ref, kp, source_field, source->second,
+    // Use the latest bound source as the probe iterator.
+    if (source->second > iter_step) {
+      iter_step = source->second;
+      iter_table = bp.item->field->table;
+    }
+  }
+
+  // Append every bound key part against the chosen iterator source.
+  for (const BoundPart &bp : bound_items) {
+    Field *source_field = bp.item->field;
+    if (source_field->table != iter_table) {
+      // This key part came from another table; find its equal field on the
+      // iterator table.
+      Item_equal *eq = bp.item->item_equal_all_join_nests != nullptr
+                           ? bp.item->item_equal_all_join_nests
+                           : bp.item->item_equal;
+      Field *remapped = nullptr;
+      if (eq != nullptr) {
+        Item_equal::FieldProxy proxy(eq);
+        for (Item_field &candidate : proxy) {
+          if (candidate.field != nullptr &&
+              candidate.field->table == iter_table) {
+            remapped = candidate.field;
+            break;
+          }
+        }
+      }
+      if (remapped == nullptr) {
+        if (reason != nullptr) {
+          *reason = "for_each binding spans multiple source steps";
+        }
+        return false;
+      }
+      source_field = remapped;
+    }
+    if (!append_bound_keypart(table, ref, bp.kp, source_field, iter_step,
                               step, reason)) {
       return false;
     }
@@ -525,20 +639,17 @@ bool compile_ref_lookup(
 
   if (bound_parts > 0) {
     step->for_each = true;
-    // The server executes for_each as a per-source-row point StatelessRead only
-    // (lineairdb_rpc.cc); a per-row range probe (FER, primary partial key) or
-    // secondary probe (FES) is not implemented. Require a full-primary-key point
-    // probe and reject anything that would need a range scan per source row.
     if (child_primary && used_key_parts >= child_pk_parts) {
+      // Full-primary-key point probe per source row.
       step->is_scan = false;
       return !step->table_name.empty();
     }
-    if (reason != nullptr) {
-      *reason = child_primary
-                    ? "for_each primary range probe (FER) unsupported by server"
-                    : "for_each secondary probe (FES) unsupported by server";
-    }
-    return false;
+    // Otherwise each source row drives a bounded range probe: a primary-prefix
+    // scan for partial primary keys, or a secondary-index scan for secondary
+    // refs. The server groups rows by deduplicated probe key.
+    step->is_scan = true;
+    if (!child_primary) step->index_name = key.name;
+    return !step->table_name.empty();
   }
 
   step->key_prefix = lineairdb_keyenc::convert_key_to_ldbformat(
@@ -588,12 +699,33 @@ bool compile_leaf(AccessPath *leaf,
     return compile_index_range_scan(leaf, table, step, reason);
   }
   if (full_scan) {
-    // A full TABLE_SCAN / INDEX_SCAN has no key bound, so the prefetched row set
-    // cannot be matched against what rnd_next iterates (scan consumption is only
-    // validated for bounded ranges). Reject under no-fallback rather than risk
-    // serving a mismatched row set.
-    if (reason != nullptr) *reason = "full table/index scan unsupported";
-    return false;
+    // Plain SELECT primary scans consume the staged ["", sentinel) range.
+    const THD *leaf_thd = table->in_use;
+    const bool plain_select = leaf_thd != nullptr && leaf_thd->lex != nullptr &&
+                              leaf_thd->lex->sql_command == SQLCOM_SELECT &&
+                              table->reginfo.lock_type <= TL_READ;
+    if (!plain_select) {
+      if (reason != nullptr) *reason = "full table/index scan unsupported";
+      return false;
+    }
+    step->table_name = physical_table_key(table);
+    if (step->table_name.empty()) {
+      if (reason != nullptr) *reason = "missing leaf table name";
+      return false;
+    }
+    const bool primary_order =
+        full_scan_index < 0 ||
+        (table->s->primary_key != MAX_KEY &&
+         full_scan_index == static_cast<int>(table->s->primary_key));
+    step->is_scan = true;
+    step->key_prefix.clear();
+    step->end_key_prefix = lineairdb_keyenc::scan_end_sentinel();
+    if (!primary_order) {
+      // Full secondary INDEX_SCAN: stage the secondary range itself. Runtime
+      // index_first/index_next consumes it, then base rows come from row cache.
+      step->index_name = table->key_info[full_scan_index].name;
+    }
+    return true;
   }
   if (ref == nullptr) {
     if (reason != nullptr) *reason = "table access without ref or range bound";
@@ -698,22 +830,13 @@ bool compile_index_search(TABLE *table, uint index,
 }  // namespace
 
 bool autogen_read_plan_from_qep(
-    THD *thd, std::vector<LineairDBProxy::ReadPlanStep> *out) {
+    THD *thd, AccessPath *root, bool allow_filter_pushdown,
+    std::vector<LineairDBProxy::ReadPlanStep> *out) {
   if (out == nullptr) {
     return raise_unsupported(thd, "NONE", "null output vector");
   }
   out->clear();
 
-  if (thd == nullptr || thd->lex == nullptr || thd->lex->unit == nullptr) {
-    return raise_unsupported(thd, "NONE", "missing THD/LEX query unit");
-  }
-
-  Query_block *query_block = thd->lex->unit->first_query_block();
-  if (query_block == nullptr || query_block->join == nullptr) {
-    return raise_unsupported(thd, "NONE", "missing query block JOIN");
-  }
-
-  AccessPath *root = query_block->join->root_access_path();
   if (root == nullptr) {
     return raise_unsupported(thd, "NONE", "missing JOIN root_access_path");
   }
@@ -742,6 +865,11 @@ bool autogen_read_plan_from_qep(
         table == nullptr) {
       return raise_unsupported(thd, leaf->type, "unsupported QEP leaf");
     }
+    if (table->s != nullptr && table->s->tmp_table != NO_TMP_TABLE) {
+      // Local MySQL temp tables are not stored in LineairDB, so there is
+      // nothing to prefetch for this leaf.
+      continue;
+    }
     if (table_steps.find(table) != table_steps.end()) {
       return raise_unsupported(thd, leaf->type, "duplicate QEP table leaf");
     }
@@ -750,6 +878,13 @@ bool autogen_read_plan_from_qep(
     std::string reason;
     if (!compile_leaf(leaf, table_steps, &step, &reason)) {
       return raise_unsupported(thd, leaf->type, reason);
+    }
+
+    // Attach scan filters only when the caller allows filtered read-plan
+    // results. Callers that need a complete scanned key set pass false.
+    if (allow_filter_pushdown && step.is_scan && table->file != nullptr) {
+      step.serialized_filter =
+          down_cast<ha_lineairdb *>(table->file)->pushed_filter_for_autogen();
     }
 
     table_steps[table] = static_cast<int>(steps.size());

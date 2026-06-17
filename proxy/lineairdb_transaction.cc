@@ -2,11 +2,27 @@
 #include "storage/lineairdb/ha_lineairdb.hh"
 #include "lineairdb_keyenc.hh"
 #include "../common/log.h"
+#include "sql/sql_lex.h"
+#include "sql/table.h"
 
 #include <thread>
 #include <unordered_set>
 
 namespace {
+
+// Composite key for the scan-cache exact-start lookup indexes.
+inline std::string scan_cache_index_key(const std::string& table,
+                                        const std::string& index,
+                                        const std::string& start) {
+  std::string k;
+  k.reserve(table.size() + index.size() + start.size() + 2);
+  k += table;
+  k.push_back('\x01');
+  k += index;
+  k.push_back('\x01');
+  k += start;
+  return k;
+}
 
 std::string next_lexicographic_key(std::string key) {
   for (size_t i = key.size(); i-- > 0;) {
@@ -236,9 +252,11 @@ void LineairDBTransaction::execute_read_plan(
     return;
   }
 
+  // Consume each decoded step destructively: move strings into local caches,
+  // then release the step before staging the next one.
   for (size_t i = 0; i < result.steps.size() && i < steps.size(); ++i) {
     const auto& step = steps[i];
-    const auto& step_result = result.steps[i];
+    auto& step_result = result.steps[i];
 
     if (!step.is_scan && !step.for_each) {
       rpc_trace_.record_local_view(trace_count_event(
@@ -251,6 +269,7 @@ void LineairDBTransaction::execute_read_plan(
         record_row_cache(step.table_name, step_result.actual_key, false, "",
                           step_result.tid, true);
       }
+      step_result = LineairDBProxy::ReadPlanStepResult{};
       continue;
     }
 
@@ -258,32 +277,117 @@ void LineairDBTransaction::execute_read_plan(
         step.table_name, step.index_name, step_result.scan_keys.size(),
         step_result.scan_values.size(), step.scan_limit, step.for_each));
 
-    std::vector<std::pair<std::string, std::string>> rows;
-    std::vector<uint64_t> row_tids;
-    rows.reserve(step_result.scan_keys.size());
-    row_tids.reserve(step_result.scan_keys.size());
-    for (size_t j = 0; j < step_result.scan_keys.size(); ++j) {
-      const std::string& key = step_result.scan_keys[j];
-      const std::string value =
-          j < step_result.scan_values.size() ? step_result.scan_values[j] : "";
-      const uint64_t tid =
-          j < step_result.scan_tids.size() ? step_result.scan_tids[j] : 0;
-      const bool found = !value.empty();
-      record_row_cache(step.table_name, key, found, value, tid, true);
-      if (found) {
-        rows.emplace_back(key, value);
-        row_tids.push_back(tid);
+    if (step.for_each && step.is_scan) {
+      // Stage grouped for_each range results as ordinary scan-cache entries.
+      // Each group corresponds to one deduplicated probe key.
+      size_t flat = 0;  // Offset into the flat scan arrays across all groups.
+      for (size_t g = 0; g < step_result.group_sizes.size(); ++g) {
+        const size_t n = step_result.group_sizes[g];
+        const std::string& gstart = g < step_result.group_start_keys.size()
+                                        ? step_result.group_start_keys[g]
+                                        : std::string();
+        const std::string& gend = g < step_result.group_end_keys.size()
+                                      ? step_result.group_end_keys[g]
+                                      : std::string();
+        if (step.index_name.empty()) {
+          // Primary range group: cache row values by primary key.
+          LocalRangeScanEntry entry;
+          entry.table_name = step.table_name;
+          entry.start_key = gstart;
+          entry.end_key = gend;
+          entry.reverse_scan = step.reverse_scan;
+          entry.row_limit = step.scan_limit;
+          for (size_t j = flat; j < flat + n && j < step_result.scan_keys.size();
+               ++j) {
+            std::string key = std::move(step_result.scan_keys[j]);
+            std::string value = j < step_result.scan_values.size()
+                                    ? std::move(step_result.scan_values[j])
+                                    : std::string();
+            const uint64_t tid =
+                j < step_result.scan_tids.size() ? step_result.scan_tids[j] : 0;
+            const bool found = !value.empty();
+            record_row_cache(step.table_name, key, found, value, tid, true);
+            if (found) {
+              entry.rows.emplace_back(std::move(key), std::move(value));
+              entry.row_tids.push_back(tid);
+            }
+          }
+          push_range_scan_cache(std::move(entry));
+        } else {
+          // Secondary range group: cache secondary keys and their primary keys.
+          LocalSecondaryScanEntry entry;
+          entry.table_name = step.table_name;
+          entry.index_name = step.index_name;
+          entry.start_key = gstart;
+          entry.end_key = gend;
+          entry.reverse_scan = step.reverse_scan;
+          entry.row_limit = step.scan_limit;
+          for (size_t j = flat; j < flat + n && j < step_result.scan_keys.size();
+               ++j) {
+            std::string key = std::move(step_result.scan_keys[j]);
+            std::string value = j < step_result.scan_values.size()
+                                    ? std::move(step_result.scan_values[j])
+                                    : std::string();
+            const uint64_t tid =
+                j < step_result.scan_tids.size() ? step_result.scan_tids[j] : 0;
+            record_row_cache(step.table_name, key, !value.empty(), value, tid,
+                             true);
+            if (j < step_result.secondary_keys.size()) {
+              entry.secondary_keys.push_back(
+                  std::move(step_result.secondary_keys[j]));
+            }
+            entry.primary_keys.push_back(std::move(key));
+          }
+          push_secondary_scan_cache(std::move(entry));
+        }
+        flat += n;
       }
+      step_result = LineairDBProxy::ReadPlanStepResult{};
+      continue;
     }
 
-    if (step.for_each) continue;
+    if (step.for_each) {
+      // Point probes only populate the row cache.
+      for (size_t j = 0; j < step_result.scan_keys.size(); ++j) {
+        std::string key = std::move(step_result.scan_keys[j]);
+        std::string value = j < step_result.scan_values.size()
+                                ? std::move(step_result.scan_values[j])
+                                : std::string();
+        const uint64_t tid =
+            j < step_result.scan_tids.size() ? step_result.scan_tids[j] : 0;
+        record_row_cache(step.table_name, key, !value.empty(), value, tid,
+                         true);
+      }
+      step_result = LineairDBProxy::ReadPlanStepResult{};
+      continue;
+    }
 
     if (step.index_name.empty()) {
-      range_scan_cache_.push_back(
+      // Primary scan: cache row values and stage one primary range entry.
+      std::vector<std::pair<std::string, std::string>> rows;
+      std::vector<uint64_t> row_tids;
+      rows.reserve(step_result.scan_keys.size());
+      row_tids.reserve(step_result.scan_keys.size());
+      for (size_t j = 0; j < step_result.scan_keys.size(); ++j) {
+        std::string key = std::move(step_result.scan_keys[j]);
+        std::string value = j < step_result.scan_values.size()
+                                ? std::move(step_result.scan_values[j])
+                                : std::string();
+        const uint64_t tid =
+            j < step_result.scan_tids.size() ? step_result.scan_tids[j] : 0;
+        const bool found = !value.empty();
+        record_row_cache(step.table_name, key, found, value, tid, true);
+        if (found) {
+          rows.emplace_back(std::move(key), std::move(value));
+          row_tids.push_back(tid);
+        }
+      }
+      push_range_scan_cache(
           {step.table_name, step_result.actual_start_key,
            step_result.actual_end_key, step.reverse_scan, step.scan_limit,
            std::move(rows), std::move(row_tids)});
     } else {
+      // Keep secondary_keys and primary_keys aligned; lookup walks the pairs.
       LocalSecondaryScanEntry cached;
       cached.table_name = step.table_name;
       cached.index_name = step.index_name;
@@ -292,15 +396,24 @@ void LineairDBTransaction::execute_read_plan(
       cached.reverse_scan = step.reverse_scan;
       cached.row_limit = step.scan_limit;
       cached.secondary_keys.reserve(step_result.secondary_keys.size());
+      for (auto& key : step_result.secondary_keys) {
+        cached.secondary_keys.push_back(std::move(key));
+      }
       cached.primary_keys.reserve(step_result.scan_keys.size());
-      for (const auto& key : step_result.secondary_keys) {
-        cached.secondary_keys.push_back(key);
+      for (size_t j = 0; j < step_result.scan_keys.size(); ++j) {
+        std::string key = std::move(step_result.scan_keys[j]);
+        std::string value = j < step_result.scan_values.size()
+                                ? std::move(step_result.scan_values[j])
+                                : std::string();
+        const uint64_t tid =
+            j < step_result.scan_tids.size() ? step_result.scan_tids[j] : 0;
+        record_row_cache(step.table_name, key, !value.empty(), value, tid,
+                         true);
+        cached.primary_keys.push_back(std::move(key));
       }
-      for (const auto& key : step_result.scan_keys) {
-        cached.primary_keys.push_back(key);
-      }
-      secondary_scan_cache_.push_back(std::move(cached));
+      push_secondary_scan_cache(std::move(cached));
     }
+    step_result = LineairDBProxy::ReadPlanStepResult{};
   }
 }
 
@@ -545,6 +658,9 @@ std::vector<std::pair<std::string, std::string>>
 LineairDBTransaction::get_matching_keys_and_values_from_prefix(std::string prefix) {
   if (table_is_not_chosen()) return {};
   if (prefetch_mode_) {
+    if (prefix.empty()) {
+      return get_matching_keys_and_values_in_range("", std::string());
+    }
     const std::string prefix_end = next_lexicographic_key(prefix);
     if (prefix_end.empty()) {
       abort_prefetch_cache_miss("primary prefix range end");
@@ -970,6 +1086,15 @@ void LineairDBTransaction::drop_secondary_scan_cache(
     kept.push_back(entry);
   }
   secondary_scan_cache_.swap(kept);
+  // Vector indices shifted: rebuild the exact-start lookup index.
+  secondary_scan_start_index_.clear();
+  for (size_t i = 0; i < secondary_scan_cache_.size(); ++i) {
+    const auto& e = secondary_scan_cache_[i];
+    secondary_scan_start_index_[scan_cache_index_key(e.table_name,
+                                                     e.index_name,
+                                                     e.start_key)]
+        .push_back(i);
+  }
 }
 
 void LineairDBTransaction::record_write(const std::string& table_name,
@@ -1008,6 +1133,7 @@ void LineairDBTransaction::append_base_row_read(
   // emplace_back-only, no dedup). Repeats carry the cached value's TID, so a
   // key read N times validates that same TID N times -- redundant but never
   // wrong. Commit aborts if any entry's TID no longer matches the server.
+  if (ro_novalidate_) return;  // read-only commit skips validation
   base_row_read_set_.push_back({table_name, key, tid, found});
 }
 
@@ -1017,6 +1143,7 @@ void LineairDBTransaction::append_range_read(
   // describe the replay and result_keys is the observed key list in scan
   // order. Append, like the point and Silo read sets; a scan consumed twice
   // is revalidated twice -- redundant but never wrong.
+  if (ro_novalidate_) return;  // read-only commit skips validation
   LineairDBProxy::RangeReadEntry entry;
   entry.table_name = cached.table_name;
   entry.start_key = cached.start_key;
@@ -1032,6 +1159,7 @@ void LineairDBTransaction::append_range_read(
 
 void LineairDBTransaction::append_secondary_range_read(
     const LocalSecondaryScanEntry& cached) {
+  if (ro_novalidate_) return;  // read-only commit skips validation
   LineairDBProxy::RangeReadEntry entry;
   entry.table_name = cached.table_name;
   entry.index_name = cached.index_name;
@@ -1054,10 +1182,60 @@ void LineairDBTransaction::abort_prefetch_cache_miss(
   thd_mark_transaction_to_rollback(thread, 1);
 }
 
+void LineairDBTransaction::push_range_scan_cache(LocalRangeScanEntry entry) {
+  range_scan_start_index_[scan_cache_index_key(entry.table_name, "",
+                                               entry.start_key)]
+      .push_back(range_scan_cache_.size());
+  range_scan_cache_.push_back(std::move(entry));
+}
+
+void LineairDBTransaction::push_secondary_scan_cache(
+    LocalSecondaryScanEntry entry) {
+  secondary_scan_start_index_[scan_cache_index_key(
+                                  entry.table_name, entry.index_name,
+                                  entry.start_key)]
+      .push_back(secondary_scan_cache_.size());
+  secondary_scan_cache_.push_back(std::move(entry));
+}
+
 std::optional<LineairDBTransaction::LocalRangeScanEntry>
 LineairDBTransaction::lookup_range_scan_cache(
     const std::string& table_name, const std::string& start_key,
     const std::string& end_key, bool reverse_scan, uint64_t row_limit) const {
+  // Grouped for_each range probes are staged by exact start key. Try that
+  // index before falling back to the wider range-cache scan below.
+  auto idx_it = range_scan_start_index_.find(
+      scan_cache_index_key(table_name, "", start_key));
+  if (idx_it != range_scan_start_index_.end()) {
+    for (auto rit = idx_it->second.rbegin(); rit != idx_it->second.rend();
+         ++rit) {
+      const auto& e = range_scan_cache_[*rit];
+      if (e.reverse_scan == reverse_scan && e.row_limit == row_limit &&
+          end_key <= e.end_key) {
+        // Copy and trim because the staged group may cover a wider range.
+        LocalRangeScanEntry cached = e;
+        cached.start_key = start_key;
+        cached.end_key = end_key;
+        cached.row_limit = row_limit;
+        std::vector<std::pair<std::string, std::string>> rows;
+        std::vector<uint64_t> row_tids;
+        rows.reserve(cached.rows.size());
+        row_tids.reserve(cached.row_tids.size());
+        for (size_t i = 0; i < cached.rows.size(); ++i) {
+          const auto& row = cached.rows[i];
+          if (row.first >= start_key && row.first < end_key) {
+            rows.push_back(row);
+            if (i < cached.row_tids.size())
+              row_tids.push_back(cached.row_tids[i]);
+          }
+        }
+        cached.rows = std::move(rows);
+        cached.row_tids = std::move(row_tids);
+        return cached;
+      }
+    }
+  }
+
   for (auto it = range_scan_cache_.rbegin();
        it != range_scan_cache_.rend(); ++it) {
     const bool same_table = it->table_name == table_name;
@@ -1095,6 +1273,40 @@ LineairDBTransaction::lookup_secondary_scan_cache(
     const std::string& start_key, const std::string& end_key,
     bool reverse_scan, uint64_t row_limit) const {
   (void)reverse_scan; // SI cache keeps the query-specific order from the plan
+
+  // Grouped for_each secondary probes are staged by exact start key. Try that
+  // index before falling back to the wider secondary-cache scan below.
+  auto idx_it = secondary_scan_start_index_.find(
+      scan_cache_index_key(table_name, index_name, start_key));
+  if (idx_it != secondary_scan_start_index_.end()) {
+    for (auto rit = idx_it->second.rbegin(); rit != idx_it->second.rend();
+         ++rit) {
+      const auto& e = secondary_scan_cache_[*rit];
+      if (e.row_limit == row_limit && end_key <= e.end_key) {
+        // Copy and trim paired secondary/primary keys to the requested range.
+        LocalSecondaryScanEntry cached = e;
+        cached.start_key = start_key;
+        cached.end_key = end_key;
+        cached.row_limit = row_limit;
+        if (cached.secondary_keys.size() == cached.primary_keys.size()) {
+          std::vector<std::string> secondary_keys;
+          std::vector<std::string> primary_keys;
+          secondary_keys.reserve(cached.secondary_keys.size());
+          primary_keys.reserve(cached.primary_keys.size());
+          for (size_t i = 0; i < cached.secondary_keys.size(); ++i) {
+            if (cached.secondary_keys[i] >= start_key &&
+                cached.secondary_keys[i] < end_key) {
+              secondary_keys.push_back(cached.secondary_keys[i]);
+              primary_keys.push_back(cached.primary_keys[i]);
+            }
+          }
+          cached.secondary_keys = std::move(secondary_keys);
+          cached.primary_keys = std::move(primary_keys);
+        }
+        return cached;
+      }
+    }
+  }
 
   for (auto it = secondary_scan_cache_.rbegin();
        it != secondary_scan_cache_.rend(); ++it) {
@@ -1138,6 +1350,19 @@ bool LineairDBTransaction::fallback_to_normal_transaction(const char* reason) {
 
 bool LineairDBTransaction::prefetch_validate_and_commit() {
   bool was_aborted = is_aborted_;
+
+  // Read-only fast path: no writes and no read validation to send.
+  // Finish locally so the SELECT uses only the read-plan RPC.
+  if (!was_aborted && ro_novalidate_ && write_buffer_ops_.empty() &&
+      rowcount_deltas_.empty()) {
+    if (rpc_trace_.active()) {
+      rpc_trace_.record_local_view("ro_novalidate_commit");
+      RpcTraceLogger::instance().log_line(rpc_trace_.finalize_jsonl(true));
+    }
+    lineairdb_proxy->set_current_trace(nullptr);
+    delete this;
+    return true;
+  }
 
   std::vector<LineairDBProxy::StatelessReadKey> reads;
   std::vector<uint64_t> read_tids;
@@ -1213,6 +1438,23 @@ void LineairDBTransaction::begin_transaction() {
       register_transaction_to_mysql();
     }
     else {
+      // Enable the no-validation fast path only for autocommit SELECTs whose
+      // tables use plain read locks. SELECT ... FOR UPDATE/SHARE and other
+      // stronger locks keep normal read-set validation.
+      extern bool srv_prefetch_ro_novalidate;
+      bool plain_read_only = srv_prefetch_ro_novalidate && thread != nullptr &&
+                             thd_sql_command(thread) == SQLCOM_SELECT &&
+                             thread->lex != nullptr;
+      if (plain_read_only) {
+        for (Table_ref *t = thread->lex->query_tables; t != nullptr;
+             t = t->next_global) {
+          if (t->lock_descriptor().type > TL_READ) {
+            plain_read_only = false;
+            break;
+          }
+        }
+      }
+      ro_novalidate_ = plain_read_only;
       register_single_statement_to_mysql();
     }
     return;

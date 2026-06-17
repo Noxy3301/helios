@@ -351,10 +351,11 @@ void maybe_prefetch_for_transaction(THD *thd,
   tx->execute_read_plan(steps);
 }
 
-// Build the read plan from the statement's QEP and run it in one prefetch RPC.
-static int autogen_and_execute_prefetch(THD *thd, LineairDBTransaction *tx) {
+// Build the read plan from the given QEP root and run it in one prefetch RPC.
+static int autogen_and_execute_prefetch(THD *thd, AccessPath *root,
+                                        LineairDBTransaction *tx) {
   std::vector<LineairDBProxy::ReadPlanStep> steps;
-  if (!autogen_read_plan_from_qep(thd, &steps)) {
+  if (!autogen_read_plan_from_qep(thd, root, tx->ro_novalidate(), &steps)) {
     // autogen has already raised a my_error describing the unsupported shape.
     tx->set_status_to_abort();
     thd_mark_transaction_to_rollback(thd, 1);
@@ -365,6 +366,34 @@ static int autogen_and_execute_prefetch(THD *thd, LineairDBTransaction *tx) {
   // Loads the prefetched rows into the local cache and validation sets.
   tx->execute_read_plan(steps);
   return tx->is_aborted() ? HA_ERR_LOCK_DEADLOCK : 0;
+}
+
+// Plan root of the whole statement. This can still be null while MySQL is
+// evaluating an uncorrelated subquery before the outer plan exists.
+static AccessPath *statement_plan_root(THD *thd) {
+  if (thd == nullptr || thd->lex == nullptr || thd->lex->unit == nullptr) {
+    return nullptr;
+  }
+  if (AccessPath *root = thd->lex->unit->root_access_path()) return root;
+  Query_block *qb = thd->lex->unit->first_query_block();
+  if (qb == nullptr || qb->join == nullptr) return nullptr;
+  return qb->join->root_access_path();
+}
+
+// Plan root of the query expression that owns `table`: the subquery being
+// evaluated when the statement-level root is not available yet.
+static AccessPath *table_unit_plan_root(TABLE *table) {
+  if (table == nullptr || table->pos_in_table_list == nullptr) return nullptr;
+  Query_block *qb = table->pos_in_table_list->query_block;
+  if (qb == nullptr) return nullptr;
+  Query_expression *unit = qb->master_query_expression();
+  if (unit != nullptr) {
+    if (AccessPath *root = unit->root_access_path()) return root;
+  }
+  if (qb->join != nullptr) {
+    if (AccessPath *root = qb->join->root_access_path()) return root;
+  }
+  return nullptr;
 }
 
 static void sync_autogen_statement(THD *thd, LineairDBTransaction *tx) {
@@ -430,23 +459,48 @@ static const char *legacy_dml_shape_rejection(THD *thd, TABLE *table) {
   return nullptr;
 }
 
-int maybe_prefetch_for_statement(THD *thd, LineairDBTransaction *tx) {
+int maybe_prefetch_for_statement(THD *thd, LineairDBTransaction *tx,
+                                 TABLE *table) {
   if (tx == nullptr || !tx->is_prefetch_mode()) return 0;  // not prefetch protocol
   if (tx->tx_plan_used()) return 0;                        // tx-scoped plan covers it
 
   sync_autogen_statement(thd, tx);
-  if (tx->autogen_stmt_resolved()) return 0;  // already done this statement
-  tx->mark_autogen_stmt_resolved();
 
-  // A read is imminent (called from rnd_init / index_read_map / ...). A command
-  // whose read side cannot be prefetched (e.g. INSERT ... SELECT) would miss and
-  // abort silently in prefetch mode, so fail loudly instead.
+  AccessPath *stmt_root = statement_plan_root(thd);
+  if (stmt_root != nullptr) {
+    if (tx->autogen_stmt_resolved()) return 0;  // already done this statement
+    tx->mark_autogen_stmt_resolved();
+
+    // A read is imminent (called from rnd_init / index_read_map / ...). A
+    // command whose read side cannot be prefetched (e.g. INSERT ... SELECT)
+    // would miss and abort silently in prefetch mode, so fail loudly instead.
+    if (!thd_can_use_prefetch(thd)) {
+      return prefetch_reject_unsupported(
+          thd, tx, "read-bearing statement is not prefetch-eligible");
+    }
+
+    return autogen_and_execute_prefetch(thd, stmt_root, tx);
+  }
+
+  // No statement root yet: MySQL is evaluating a subquery before the outer
+  // plan is built. Stage that subquery's own plan once; the full statement is
+  // still staged later when outer execution starts.
+  AccessPath *unit_root = table_unit_plan_root(table);
+  if (unit_root == nullptr) {
+    if (tx->autogen_stmt_resolved()) return 0;
+    tx->mark_autogen_stmt_resolved();
+    return prefetch_reject_unsupported(thd, tx,
+                                       "missing JOIN root_access_path");
+  }
+  if (tx->autogen_root_staged(unit_root)) return 0;
+  tx->mark_autogen_root_staged(unit_root);
+
   if (!thd_can_use_prefetch(thd)) {
     return prefetch_reject_unsupported(
         thd, tx, "read-bearing statement is not prefetch-eligible");
   }
 
-  return autogen_and_execute_prefetch(thd, tx);
+  return autogen_and_execute_prefetch(thd, unit_root, tx);
 }
 
 // Gate for the handler entry points: true when autogen must defer to the

@@ -3,6 +3,7 @@
 
 #include <optional>
 #include <unordered_map>
+#include <unordered_set>
 
 #include "sql/handler.h" /* handler */
 #include "mysql/plugin.h"
@@ -110,9 +111,20 @@ public:
     autogen_query_id_ = query_id;
     autogen_stmt_resolved_ = false;
     autogen_stmt_handler_deferred_ = false;
+    autogen_staged_roots_.clear();
   }
   bool autogen_stmt_resolved() const { return autogen_stmt_resolved_; }
   void mark_autogen_stmt_resolved() { autogen_stmt_resolved_ = true; }
+  // True for the read-only no-validation path; staged filters use the same gate.
+  bool ro_novalidate() const { return ro_novalidate_; }
+  // Subqueries may be staged before the statement root exists. Remember each
+  // root so the same subquery plan is not prefetched twice in one statement.
+  bool autogen_root_staged(const void *root) const {
+    return autogen_staged_roots_.count(root) != 0;
+  }
+  void mark_autogen_root_staged(const void *root) {
+    autogen_staged_roots_.insert(root);
+  }
   bool is_autogen_stmt_handler_deferred() const {
     return autogen_stmt_handler_deferred_;
   }
@@ -172,9 +184,13 @@ private:
   bool isFence;
   bool prefetch_mode_{false};
   bool prefetch_registered_{false};
+  // Autocommit single-statement SELECT with lineairdb_prefetch_ro_novalidate=ON:
+  // read sets are not accumulated and commit skips the validation RPC.
+  bool ro_novalidate_{false};
   bool tx_plan_used_{false};
   uint64_t autogen_query_id_{0};
   bool autogen_stmt_resolved_{false};
+  std::unordered_set<const void*> autogen_staged_roots_;
   // Set when this statement's plan is built from the handler index access
   // (deferred legacy-DML path) instead of the QEP; a second handler access
   // then means an index merge the single staged range cannot serve.
@@ -260,6 +276,12 @@ private:
   };
   std::vector<LocalRangeScanEntry> range_scan_cache_;
   std::vector<LocalSecondaryScanEntry> secondary_scan_cache_;
+  // Exact-start indexes for grouped range scans. Without these, each runtime
+  // probe would scan the whole cache vector. Keyed table\x01index\x01start_key.
+  std::unordered_map<std::string, std::vector<size_t>> range_scan_start_index_;
+  std::unordered_map<std::string, std::vector<size_t>> secondary_scan_start_index_;
+  void push_range_scan_cache(LocalRangeScanEntry entry);
+  void push_secondary_scan_cache(LocalSecondaryScanEntry entry);
 
   // Predicate pushdown: serialized PushedPredicate for scan filtering
   std::string pushed_filter_;

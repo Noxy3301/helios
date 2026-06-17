@@ -156,6 +156,8 @@ public:
         std::vector<ReadPlanKeyBinding> end_bindings;
         bool for_each = false;
         bool reverse_scan = false;
+        // Serialized PushedPredicate; empty means no server-side filter.
+        std::string serialized_filter;
     };
     struct ReadPlanStepResult {
         bool found = false;
@@ -168,6 +170,10 @@ public:
         std::vector<std::string> secondary_keys;
         std::string actual_start_key;
         std::string actual_end_key;
+        // Per-probe groups for for_each range scans; sizes split scan arrays.
+        std::vector<uint32_t> group_sizes;
+        std::vector<std::string> group_start_keys;
+        std::vector<std::string> group_end_keys;
     };
     struct ReadPlanResult {
         bool ok = false;

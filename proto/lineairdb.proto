@@ -204,6 +204,7 @@ message TxExecuteReadPlan {
         repeated KeyBinding end_bindings = 8;
         bool for_each = 9;
         bool reverse_scan = 10;
+        PushedPredicate filter = 11; // Optional row filter for staged scans.
     }
     message StepResult {
         bool found = 1;
@@ -216,6 +217,11 @@ message TxExecuteReadPlan {
         repeated bytes secondary_keys = 8;
         bytes actual_start_key = 9;
         bytes actual_end_key = 10;
+        // for_each range probes return one group per deduplicated start key.
+        // group_sizes[i] rows belong to [group_start_keys[i], group_end_keys[i]).
+        repeated uint32 group_sizes = 11;
+        repeated bytes group_start_keys = 12;
+        repeated bytes group_end_keys = 13;
     }
     message Request {
         repeated PlanStep steps = 1;

@@ -7,6 +7,7 @@
 #include <cstring>
 #include <algorithm>
 #include <cstdlib>
+#include <unordered_set>
 
 #include "lineairdb.pb.h"
 
@@ -540,6 +541,81 @@ void LineairDBRpc::handleTxStatelessBatchRead(const std::string& message,
     result = response.SerializeAsString();
 }
 
+namespace flat_plan {
+// Native-endian bytes spell "LDBFLATP" (LineairDB flat payload).
+static constexpr uint64_t kMagic = 0x5054414C4642444Cull;
+static constexpr uint8_t kVersion = 1;
+
+template <class Sink>
+void w_u8(Sink& out, uint8_t v) {
+    const char c = static_cast<char>(v);
+    out.append(&c, 1);
+}
+
+template <class Sink>
+void w_u64(Sink& out, uint64_t v) {
+    char bytes[8];
+    std::memcpy(bytes, &v, 8);
+    out.append(bytes, 8);
+}
+
+template <class Sink>
+void w_bytes(Sink& out, const std::string& s) {
+    w_u64(out, static_cast<uint64_t>(s.size()));
+    out.append(s.data(), s.size());
+}
+
+struct CountSink {
+    uint64_t n = 0;
+    void append(const char*, size_t k) { n += k; }
+};
+
+template <class Sink>
+void encode_step(
+    const LineairDB::Protocol::TxExecuteReadPlan::StepResult& s, Sink& out) {
+    w_u8(out, s.found() ? 1 : 0);
+    w_u64(out, s.tid());
+    w_bytes(out, s.value());
+    w_bytes(out, s.actual_key());
+    w_bytes(out, s.actual_start_key());
+    w_bytes(out, s.actual_end_key());
+    w_u64(out, static_cast<uint64_t>(s.scan_keys_size()));
+    for (const auto& k : s.scan_keys()) w_bytes(out, k);
+    w_u64(out, static_cast<uint64_t>(s.scan_values_size()));
+    for (const auto& v : s.scan_values()) w_bytes(out, v);
+    w_u64(out, static_cast<uint64_t>(s.scan_tids_size()));
+    for (const auto t : s.scan_tids()) w_u64(out, t);
+    w_u64(out, static_cast<uint64_t>(s.secondary_keys_size()));
+    for (const auto& k : s.secondary_keys()) w_bytes(out, k);
+    w_u64(out, static_cast<uint64_t>(s.group_sizes_size()));
+    for (const auto g : s.group_sizes()) w_u64(out, g);
+    w_u64(out, static_cast<uint64_t>(s.group_start_keys_size()));
+    for (const auto& k : s.group_start_keys()) w_bytes(out, k);
+    w_u64(out, static_cast<uint64_t>(s.group_end_keys_size()));
+    for (const auto& k : s.group_end_keys()) w_bytes(out, k);
+}
+
+// Destructive: release each StepResult after encoding it so large read-plan
+// responses do not keep both protobuf rows and the flat payload alive.
+void encode_to_string(LineairDB::Protocol::TxExecuteReadPlan::Response& r,
+                      std::string& out) {
+    CountSink count;
+    count.n = 8 + 1 + 1 + 8;  // magic + version + ok + result count
+    for (const auto& s : r.results()) encode_step(s, count);
+
+    out.clear();
+    out.reserve(count.n);
+    w_u64(out, kMagic);
+    w_u8(out, kVersion);
+    w_u8(out, r.ok() ? 1 : 0);
+    w_u64(out, static_cast<uint64_t>(r.results_size()));
+    for (int i = 0; i < r.results_size(); ++i) {
+        encode_step(r.results(i), out);
+        r.mutable_results(i)->Clear();
+    }
+}
+}  // namespace flat_plan
+
 void LineairDBRpc::handleTxExecuteReadPlan(const std::string& message,
                                            std::string& result) {
     LineairDB::Protocol::TxExecuteReadPlan::Request request;
@@ -568,6 +644,24 @@ void LineairDBRpc::handleTxExecuteReadPlan(const std::string& message,
             end_key = next_lexicographic_key(start_key);
         }
 
+        // Step-level row filter: parseable non-matches are dropped; rows the
+        // evaluator cannot parse are returned for MySQL to re-check.
+        const bool step_has_filter =
+            step.has_filter() && step.filter().has_expr();
+        const auto* step_filter =
+            step_has_filter ? &step.filter().expr() : nullptr;
+        const uint32_t step_filter_cols =
+            step_has_filter ? step.filter().num_columns() : 0;
+        PredicateEvaluator step_eval;
+        auto row_passes = [&](const std::string& value) {
+            if (step_filter == nullptr) return true;
+            if (!step_eval.parse_row(value.data(), value.size(),
+                                     step_filter_cols)) {
+                return true;
+            }
+            return step_eval.evaluate(*step_filter);
+        };
+
         if (step.for_each()) {
             int source_step = -1;
             if (step.bindings_size() > 0) {
@@ -581,12 +675,69 @@ void LineairDBRpc::handleTxExecuteReadPlan(const std::string& message,
             const auto* source = previous_results[source_step];
             const int row_count =
                 std::max(source->scan_keys_size(), source->scan_values_size());
+            // Dedup probes: many source rows share a join key, and the proxy
+            // serves every runtime probe of one key from the single staged
+            // result, so re-executing the probe only inflates the response.
+            std::unordered_set<std::string> seen_probe_keys;
+            seen_probe_keys.reserve(static_cast<size_t>(row_count));
             for (int row = 0; row < row_count; ++row) {
                 bool row_complete = true;
                 const std::string row_key =
                     build_plan_key(step.key_prefix(), step.bindings(),
                                    previous_results, row, &row_complete);
                 if (!row_complete) continue;
+                if (!seen_probe_keys.insert(row_key).second) continue;
+
+                if (step.is_scan()) {
+                    // Per-probe range scan: [row_key, next(row_key)).
+                    const std::string row_end = next_lexicographic_key(row_key);
+                    int group_rows = 0;
+                    if (step.index_name().empty()) {
+                        auto scan_result =
+                            db_manager_->get_database()->StatelessRangeScan(
+                                step.table_name(), row_key, row_end,
+                                step.scan_limit(), step.reverse_scan());
+                        if (!scan_result.ok) {
+                            response.set_ok(false);
+                            flat_plan::encode_to_string(response, result);
+                            return;
+                        }
+                        for (auto& r : scan_result.rows) {
+                            if (!row_passes(r.value)) continue;
+                            step_result->add_scan_keys(std::move(r.key));
+                            step_result->add_scan_values(std::move(r.value));
+                            step_result->add_scan_tids(r.tid);
+                            ++group_rows;
+                        }
+                    } else {
+                        auto scan_result =
+                            db_manager_->get_database()
+                                ->StatelessSecondaryRangeScan(
+                                    step.table_name(), step.index_name(),
+                                    row_key, row_end, step.scan_limit(),
+                                    step.reverse_scan());
+                        if (!scan_result.ok) {
+                            response.set_ok(false);
+                            flat_plan::encode_to_string(response, result);
+                            return;
+                        }
+                        for (auto& r : scan_result.rows) {
+                            if (!row_passes(r.value)) continue;
+                            step_result->add_secondary_keys(
+                                std::move(r.secondary_key));
+                            step_result->add_scan_keys(std::move(r.primary_key));
+                            step_result->add_scan_values(std::move(r.value));
+                            step_result->add_scan_tids(r.tid);
+                            ++group_rows;
+                        }
+                    }
+                    step_result->add_group_sizes(
+                        static_cast<uint32_t>(group_rows));
+                    step_result->add_group_start_keys(row_key);
+                    step_result->add_group_end_keys(row_end);
+                    continue;
+                }
+
                 auto read_result =
                     db_manager_->get_database()->StatelessRead(
                         step.table_name(), row_key);
@@ -625,10 +776,11 @@ void LineairDBRpc::handleTxExecuteReadPlan(const std::string& message,
                     step.scan_limit(), step.reverse_scan());
             if (!scan_result.ok) {
                 response.set_ok(false);
-                result = response.SerializeAsString();
+                flat_plan::encode_to_string(response, result);
                 return;
             }
             for (auto& row : scan_result.rows) {
+                if (!row_passes(row.value)) continue;
                 step_result->add_scan_keys(std::move(row.key));
                 step_result->add_scan_values(std::move(row.value));
                 step_result->add_scan_tids(row.tid);
@@ -642,10 +794,11 @@ void LineairDBRpc::handleTxExecuteReadPlan(const std::string& message,
                     step.scan_limit(), step.reverse_scan());
             if (!scan_result.ok) {
                 response.set_ok(false);
-                result = response.SerializeAsString();
+                flat_plan::encode_to_string(response, result);
                 return;
             }
             for (auto& row : scan_result.rows) {
+                if (!row_passes(row.value)) continue;
                 step_result->add_secondary_keys(std::move(row.secondary_key));
                 step_result->add_scan_keys(std::move(row.primary_key));
                 step_result->add_scan_values(std::move(row.value));
@@ -654,7 +807,7 @@ void LineairDBRpc::handleTxExecuteReadPlan(const std::string& message,
         }
     }
 
-    result = response.SerializeAsString();
+    flat_plan::encode_to_string(response, result);
 }
 
 void LineairDBRpc::handleTxValidateAndCommit(const std::string& message,
