@@ -832,13 +832,16 @@ bool compile_index_search(TABLE *table, uint index,
  *
  * @details The main statement tree and optional inner subquery trees share
  * `table_steps`, so correlated inner probes can bind to earlier outer steps.
+ * `allow_limit_pushdown` is kept off for optional inner roots because LIMIT
+ * metadata is read from the current statement context.
  *
  * @note Failures are returned through `unsupported` instead of raising
  * immediately; `added_tables` lets optional callers roll back only this tree's
  * additions.
  */
 bool compile_tree_leaves(
-    AccessPath *root, bool allow_filter_pushdown,
+    THD *thd, AccessPath *root, bool allow_filter_pushdown,
+    bool allow_limit_pushdown,
     std::unordered_map<TABLE *, int> *table_steps,
     std::vector<LineairDBProxy::ReadPlanStep> *steps,
     std::vector<TABLE *> *added_tables, UnsupportedQep *unsupported) {
@@ -882,6 +885,27 @@ bool compile_tree_leaves(
       unsupported->type = leaf->type;
       unsupported->reason = reason;
       return false;
+    }
+
+    // Push LIMIT into a single ASC REF scan only when LIMIT sits directly
+    // above this leaf. count_all_rows and reject_multiple_rows both read past
+    // LIMIT, so they cannot use a truncated staged entry.
+    if (allow_limit_pushdown && root->type == AccessPath::LIMIT_OFFSET &&
+        root->limit_offset().offset == 0 &&
+        !root->limit_offset().count_all_rows &&
+        !root->limit_offset().reject_multiple_rows &&
+        root->limit_offset().child == leaf && leaves.size() == 1 &&
+        leaf->type == AccessPath::REF && ref != nullptr && ref->key >= 0 &&
+        table->s != nullptr && ref->key < static_cast<int>(table->s->keys) &&
+        step.is_scan && !step.for_each && step.index_name.empty() &&
+        step.scan_limit == 0) {
+      const RangeScanLimit limit = range_scan_limit_for_order(
+          thd, &table->key_info[ref->key], ref->key_parts,
+          /*has_mysql_only_filter=*/false);
+      if (limit.row_limit > 0 && !limit.reverse_scan) {
+        step.scan_limit = static_cast<uint64_t>(limit.row_limit);
+        step.reverse_scan = false;
+      }
     }
 
     // Attach scan filters only when the caller allows filtered read-plan
@@ -946,7 +970,8 @@ bool autogen_read_plan_from_qep(
   std::vector<TABLE *> added_tables;
   UnsupportedQep unsupported;
 
-  if (!compile_tree_leaves(root, allow_filter_pushdown, &table_steps, &steps,
+  if (!compile_tree_leaves(thd, root, allow_filter_pushdown,
+                           /*allow_limit_pushdown=*/true, &table_steps, &steps,
                            &added_tables, &unsupported)) {
     return raise_unsupported(thd, unsupported.type, unsupported.reason);
   }
@@ -962,7 +987,8 @@ bool autogen_read_plan_from_qep(
       const size_t step_mark = steps.size();
       const size_t table_mark = added_tables.size();
       UnsupportedQep inner_unsupported;
-      if (!compile_tree_leaves(inner_root, allow_filter_pushdown, &table_steps,
+      if (!compile_tree_leaves(thd, inner_root, allow_filter_pushdown,
+                               /*allow_limit_pushdown=*/false, &table_steps,
                                &steps, &added_tables,
                                &inner_unsupported)) {
         steps.resize(step_mark);

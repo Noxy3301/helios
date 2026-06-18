@@ -619,14 +619,18 @@ std::vector<std::pair<std::string, std::string>>
 LineairDBTransaction::get_matching_keys_and_values_in_range(std::string start_key,
                                                             std::string end_key,
                                                             uint64_t row_limit,
-                                                            bool reverse_scan) {
+                                                            bool reverse_scan,
+                                                            bool *served_truncated) {
+  if (served_truncated != nullptr) *served_truncated = false;
   if (table_is_not_chosen()) return {};
   if (prefetch_mode_) {
     // Unbounded-upper: map an empty end to the sentinel the scan was staged with
     // so the [start, sentinel) slice keeps every row (see scan_end_sentinel).
     if (end_key.empty()) end_key = lineairdb_keyenc::scan_end_sentinel();
     if (auto cached = lookup_range_scan_cache(
-            db_table_key, start_key, end_key, reverse_scan, row_limit)) {
+            db_table_key, start_key, end_key, reverse_scan, row_limit,
+            /*allow_truncated=*/served_truncated != nullptr)) {
+      if (served_truncated != nullptr) *served_truncated = cached->truncated;
       std::vector<std::pair<std::string, std::string>> pairs = cached->rows;
       for (size_t i = 0; i < cached->rows.size() && i < cached->row_tids.size();
            ++i) {
@@ -1073,6 +1077,20 @@ bool LineairDBTransaction::has_pending_ops_for_table(
   return false;
 }
 
+bool LineairDBTransaction::has_pending_row_ops_in_range(
+    const std::string& table_name, const std::string& start_key,
+    const std::string& end_key) const {
+  for (const auto& op : write_buffer_ops_) {
+    if (op.table_name != table_name) continue;
+    if (op.type != LineairDBProxy::BatchOp::Type::Write &&
+        op.type != LineairDBProxy::BatchOp::Type::Delete) {
+      continue;
+    }
+    if (op.key >= start_key && op.key < end_key) return true;
+  }
+  return false;
+}
+
 bool LineairDBTransaction::has_pending_secondary_ops_for_index(
     const std::string& table_name,
     const std::string& index_name) const {
@@ -1218,7 +1236,11 @@ void LineairDBTransaction::push_secondary_scan_cache(
 std::optional<LineairDBTransaction::LocalRangeScanEntry>
 LineairDBTransaction::lookup_range_scan_cache(
     const std::string& table_name, const std::string& start_key,
-    const std::string& end_key, bool reverse_scan, uint64_t row_limit) const {
+    const std::string& end_key, bool reverse_scan, uint64_t row_limit,
+    bool allow_truncated) const {
+  const bool pending_in_range =
+      has_pending_row_ops_in_range(table_name, start_key, end_key);
+
   // Grouped for_each range probes are staged by exact start key. Try that
   // index before falling back to the wider range-cache scan below.
   auto idx_it = range_scan_start_index_.find(
@@ -1227,6 +1249,7 @@ LineairDBTransaction::lookup_range_scan_cache(
     for (auto rit = idx_it->second.rbegin(); rit != idx_it->second.rend();
          ++rit) {
       const auto& e = range_scan_cache_[*rit];
+      if (e.row_limit != 0 && pending_in_range) continue;
       if (e.reverse_scan == reverse_scan && e.row_limit == row_limit &&
           end_key <= e.end_key) {
         // Copy and trim because the staged group may cover a wider range.
@@ -1255,6 +1278,7 @@ LineairDBTransaction::lookup_range_scan_cache(
 
   for (auto it = range_scan_cache_.rbegin();
        it != range_scan_cache_.rend(); ++it) {
+    if (it->row_limit != 0 && pending_in_range) continue;
     const bool same_table = it->table_name == table_name;
     const bool same_direction = it->reverse_scan == reverse_scan;
     const bool same_limit = it->row_limit == row_limit;
@@ -1279,6 +1303,27 @@ LineairDBTransaction::lookup_range_scan_cache(
       cached.rows = std::move(rows);
       cached.row_tids = std::move(row_tids);
       return cached;
+    }
+  }
+
+  // Serve an unbounded handler request from a LIMIT-staged entry only when
+  // the caller opted in to over-read aborts and no own row op can change the
+  // first-N window. `truncated` flows out through served_truncated.
+  if (allow_truncated && row_limit == 0 && !reverse_scan &&
+      !pending_in_range) {
+    auto idx_it = range_scan_start_index_.find(
+        scan_cache_index_key(table_name, "", start_key));
+    if (idx_it != range_scan_start_index_.end()) {
+      for (auto rit = idx_it->second.rbegin(); rit != idx_it->second.rend();
+           ++rit) {
+        const auto& e = range_scan_cache_[*rit];
+        if (e.row_limit > 0 && !e.reverse_scan && e.start_key == start_key &&
+            e.end_key == end_key) {
+          LocalRangeScanEntry cached = e;
+          cached.truncated = (e.rows.size() >= e.row_limit);
+          return cached;
+        }
+      }
     }
   }
   return std::nullopt;

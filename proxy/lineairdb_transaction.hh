@@ -37,9 +37,13 @@ public:
   std::vector<std::string> get_all_keys();
   std::vector<std::string> get_matching_keys(std::string key);
   std::vector<std::string> get_matching_keys_in_range(std::string start_key, std::string end_key);
+  // Optional out: set when this call is served from a LIMIT-staged cache
+  // entry. The handler must not treat exhausting the returned rows as EOF.
+  // TODO: replace this out-param with a small result struct when scan-cache
+  // serving is split out of LineairDBTransaction.
   std::vector<std::pair<std::string, std::string>> get_matching_keys_and_values_in_range(
       std::string start_key, std::string end_key, uint64_t row_limit = 0,
-      bool reverse_scan = false);
+      bool reverse_scan = false, bool *served_truncated = nullptr);
   std::vector<std::pair<std::string, std::string>> get_matching_keys_and_values_from_prefix(
       std::string prefix);
   bool write(std::string key, const std::string value);
@@ -263,6 +267,9 @@ private:
     uint64_t row_limit = 0;
     std::vector<std::pair<std::string, std::string>> rows;
     std::vector<uint64_t> row_tids;
+    // Set only on lookup return copies: this entry came from a LIMIT-staged
+    // window, so the handler must abort if MySQL asks past these rows.
+    bool truncated = false;
   };
   struct LocalSecondaryScanEntry {
     std::string table_name;
@@ -318,6 +325,9 @@ private:
       std::vector<std::pair<std::string, std::string>>& rows,
       const std::string& prefix) const;
   bool has_pending_ops_for_table(const std::string& table_name) const;
+  bool has_pending_row_ops_in_range(const std::string& table_name,
+                                    const std::string& start_key,
+                                    const std::string& end_key) const;
   bool has_pending_secondary_ops_for_index(
       const std::string& table_name,
       const std::string& index_name) const;
@@ -338,7 +348,8 @@ private:
   void abort_prefetch_cache_miss(const std::string& reason);
   std::optional<LocalRangeScanEntry> lookup_range_scan_cache(
       const std::string& table_name, const std::string& start_key,
-      const std::string& end_key, bool reverse_scan, uint64_t row_limit) const;
+      const std::string& end_key, bool reverse_scan, uint64_t row_limit,
+      bool allow_truncated = false) const;
   std::optional<LocalSecondaryScanEntry> lookup_secondary_scan_cache(
       const std::string& table_name, const std::string& index_name,
       const std::string& start_key, const std::string& end_key,

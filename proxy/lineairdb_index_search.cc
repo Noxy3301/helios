@@ -33,12 +33,6 @@
 #include "sql/table.h"
 #include "typelib.h"
 
-// LIMIT and direction to pass to a range scan
-struct RangeScanLimit {
-  ha_rows row_limit{0};
-  bool reverse_scan{false};
-};
-
 // True when one ORDER BY item is exactly the requested keypart and direction
 static bool order_item_matches_key_part(ORDER *order, const KEY *key,
                                         uint key_part_idx,
@@ -96,8 +90,7 @@ static bool order_by_matches_key_suffix(Query_block *qb, const KEY *key,
   return true;
 }
 
-// Returns LIMIT and scan direction to push, or row_limit=0 to keep it local
-static RangeScanLimit range_scan_limit_for_order(
+RangeScanLimit range_scan_limit_for_order(
     THD *thd, const KEY *key, uint matched_prefix, bool has_mysql_only_filter) {
   RangeScanLimit scan_limit;
 
@@ -419,7 +412,7 @@ int ha_lineairdb::execute_same_key_materialize(uchar *buf,
     // Same-key scans can use ASC or DESC LIMIT when ORDER BY matches the key.
     auto key_values = tx->get_matching_keys_and_values_in_range(
         prefix, prefix_end, static_cast<uint64_t>(scan_limit.row_limit),
-        scan_limit.reverse_scan);
+        scan_limit.reverse_scan, &materialized_scan_truncated_);
     for (auto &kv : key_values) {
       secondary_index_results_.push_back(kv.first);
       secondary_index_payloads_.push_back(std::move(kv.second));
@@ -461,9 +454,9 @@ int ha_lineairdb::execute_prefix_first(uchar *buf, LineairDBTransaction *tx) {
 
   if (current_plan_.is_primary) {
     // Restrict to [prefix, prefix_end) so index_next never leaks non-prefix
-    // rows.
+    // rows. A limit-staged hit must abort if index_next reads past it.
     auto key_values = tx->get_matching_keys_and_values_in_range(
-        prefix, prefix_end);
+        prefix, prefix_end, 0, false, &materialized_scan_truncated_);
     for (auto &kv : key_values) {
       secondary_index_results_.push_back(kv.first);
       secondary_index_payloads_.push_back(std::move(kv.second));
@@ -530,7 +523,8 @@ int ha_lineairdb::execute_range_materialize(uchar *buf,
     // Range scans can use ASC or DESC LIMIT when ORDER BY matches the key.
     auto key_values = tx->get_matching_keys_and_values_in_range(
         effective_start, effective_end,
-        static_cast<uint64_t>(scan_limit.row_limit), scan_limit.reverse_scan);
+        static_cast<uint64_t>(scan_limit.row_limit), scan_limit.reverse_scan,
+        &materialized_scan_truncated_);
     for (auto &kv : key_values) {
       secondary_index_results_.push_back(kv.first);
       secondary_index_payloads_.push_back(std::move(kv.second));
