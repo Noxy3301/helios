@@ -745,7 +745,9 @@ LineairDBTransaction::fetch_next_key_with_prefix(const std::string &last_key,
 std::vector<std::string>
 LineairDBTransaction::get_matching_primary_keys_in_range(std::string index_name,
                                                          std::string start_key,
-                                                         std::string end_key) {
+                                                         std::string end_key,
+                                                         uint64_t row_limit,
+                                                         bool reverse_scan) {
   if (table_is_not_chosen()) return {};
   if (prefetch_mode_) {
     if (has_pending_secondary_ops_for_index(db_table_key, index_name)) {
@@ -754,8 +756,15 @@ LineairDBTransaction::get_matching_primary_keys_in_range(std::string index_name,
     }
 
     if (end_key.empty()) end_key = lineairdb_keyenc::scan_end_sentinel();
-    if (auto cached = lookup_secondary_scan_cache(
-            db_table_key, index_name, start_key, end_key, false, 0)) {
+    auto cached = lookup_secondary_scan_cache(
+        db_table_key, index_name, start_key, end_key, reverse_scan, row_limit);
+    if (!cached && row_limit != 0) {
+      // A full staged scan of the same range covers a limited request; the
+      // caller positions on the requested end of the materialized result.
+      cached = lookup_secondary_scan_cache(db_table_key, index_name, start_key,
+                                           end_key, false, 0);
+    }
+    if (cached) {
       rpc_trace_.record_local_view("use_si_scan:" + db_table_key + ":" +
                                    index_name + ":n=" +
                                    std::to_string(cached->primary_keys.size()));
@@ -1334,7 +1343,11 @@ LineairDBTransaction::lookup_secondary_scan_cache(
     const std::string& table_name, const std::string& index_name,
     const std::string& start_key, const std::string& end_key,
     bool reverse_scan, uint64_t row_limit) const {
-  (void)reverse_scan; // SI cache keeps the query-specific order from the plan
+  // Direction only matters for limited scans: an unlimited entry holds the
+  // whole range, but a LIMIT entry holds the first rows in its own direction.
+  const auto direction_compatible = [&](const LocalSecondaryScanEntry& e) {
+    return e.row_limit == 0 || e.reverse_scan == reverse_scan;
+  };
 
   // Grouped for_each secondary probes are staged by exact start key. Try that
   // index before falling back to the wider secondary-cache scan below.
@@ -1344,7 +1357,8 @@ LineairDBTransaction::lookup_secondary_scan_cache(
     for (auto rit = idx_it->second.rbegin(); rit != idx_it->second.rend();
          ++rit) {
       const auto& e = secondary_scan_cache_[*rit];
-      if (e.row_limit == row_limit && end_key <= e.end_key) {
+      if (e.row_limit == row_limit && end_key <= e.end_key &&
+          direction_compatible(e)) {
         // Copy and trim paired secondary/primary keys to the requested range.
         LocalSecondaryScanEntry cached = e;
         cached.start_key = start_key;
@@ -1377,7 +1391,8 @@ LineairDBTransaction::lookup_secondary_scan_cache(
     const bool same_limit = it->row_limit == row_limit;
     const bool covers_range =
         it->start_key <= start_key && end_key <= it->end_key;
-    if (same_index && same_limit && covers_range) {
+    if (same_index && same_limit && covers_range &&
+        direction_compatible(*it)) {
       LocalSecondaryScanEntry cached = *it;
       cached.start_key = start_key;
       cached.end_key = end_key;

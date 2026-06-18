@@ -50,7 +50,8 @@ public:
   bool write_secondary_index(std::string index_name, std::string secondary_key, const std::string primary_key);
   std::vector<std::string> read_secondary_index(std::string index_name, std::string secondary_key);
   std::vector<std::string> get_matching_primary_keys_in_range(
-      std::string index_name, std::string start_key, std::string end_key);
+      std::string index_name, std::string start_key, std::string end_key,
+      uint64_t row_limit = 0, bool reverse_scan = false);
   std::vector<std::string> get_matching_primary_keys_from_prefix(
       std::string index_name, std::string prefix);
   std::optional<std::string> fetch_last_key_in_range(
