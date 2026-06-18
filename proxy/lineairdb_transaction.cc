@@ -240,8 +240,25 @@ void LineairDBTransaction::prefetch_stateless_reads(
 }
 
 void LineairDBTransaction::execute_read_plan(
-    const std::vector<LineairDBProxy::ReadPlanStep>& steps) {
-  if (!prefetch_mode_ || steps.empty()) return;
+    const std::vector<LineairDBProxy::ReadPlanStep>& full_steps) {
+  if (!prefetch_mode_ || full_steps.empty()) return;
+
+  // Exact point reads already covered by the local view need no staging RPC.
+  std::vector<LineairDBProxy::ReadPlanStep> steps;
+  steps.reserve(full_steps.size());
+  for (const auto& step : full_steps) {
+    const bool constant_point_read = !step.is_scan && !step.for_each &&
+                                     step.bindings.empty() &&
+                                     step.end_bindings.empty() &&
+                                     !step.key_prefix.empty();
+    if (constant_point_read &&
+        (lookup_write_set(step.table_name, step.key_prefix) ||
+         lookup_row_cache(step.table_name, step.key_prefix))) {
+      continue;
+    }
+    steps.push_back(step);
+  }
+  if (steps.empty()) return;
 
   rpc_trace_.record_local_view("plan_request:steps=" +
                                std::to_string(steps.size()));
