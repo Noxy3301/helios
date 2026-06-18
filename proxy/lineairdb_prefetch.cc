@@ -353,9 +353,11 @@ void maybe_prefetch_for_transaction(THD *thd,
 
 // Build the read plan from the given QEP root and run it in one prefetch RPC.
 static int autogen_and_execute_prefetch(THD *thd, AccessPath *root,
-                                        LineairDBTransaction *tx) {
+                                        LineairDBTransaction *tx,
+                                        bool include_inner_units = false) {
   std::vector<LineairDBProxy::ReadPlanStep> steps;
-  if (!autogen_read_plan_from_qep(thd, root, tx->ro_novalidate(), &steps)) {
+  if (!autogen_read_plan_from_qep(thd, root, tx->ro_novalidate(), &steps,
+                                  include_inner_units)) {
     // autogen has already raised a my_error describing the unsupported shape.
     tx->set_status_to_abort();
     thd_mark_transaction_to_rollback(thd, 1);
@@ -479,7 +481,9 @@ int maybe_prefetch_for_statement(THD *thd, LineairDBTransaction *tx,
           thd, tx, "read-bearing statement is not prefetch-eligible");
     }
 
-    return autogen_and_execute_prefetch(thd, stmt_root, tx);
+    // Some subqueries live under Item conditions instead of the main plan tree.
+    return autogen_and_execute_prefetch(thd, stmt_root, tx,
+                                        /*include_inner_units=*/true);
   }
 
   // No statement root yet: MySQL is evaluating a subquery before the outer

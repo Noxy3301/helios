@@ -702,6 +702,10 @@ int ha_lineairdb::index_next(uchar *buf) {
   // materialize mode
   if (secondary_index_results_.empty() ||
       current_position_in_index_ >= secondary_index_results_.size()) {
+    if (materialized_scan_truncated_ && !secondary_index_results_.empty()) {
+      tx->fallback_to_normal_transaction("read past limit-staged scan");
+      return abort_errno(tx);
+    }
     return HA_ERR_END_OF_FILE;
   }
 
@@ -721,6 +725,10 @@ int ha_lineairdb::index_next_same(uchar *buf, const uchar *key [[maybe_unused]],
   // materialize mode
   if (secondary_index_results_.empty() ||
       current_position_in_index_ >= secondary_index_results_.size()) {
+    if (materialized_scan_truncated_ && !secondary_index_results_.empty()) {
+      tx->fallback_to_normal_transaction("read past limit-staged scan");
+      return abort_errno(tx);
+    }
     return HA_ERR_END_OF_FILE;
   }
 
@@ -983,6 +991,7 @@ void ha_lineairdb::reset_index_search_buffers() {
   secondary_index_results_.clear();
   secondary_index_payloads_.clear();
   current_position_in_index_ = 0;
+  materialized_scan_truncated_ = false;
 }
 
 /**

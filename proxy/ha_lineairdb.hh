@@ -86,6 +86,20 @@ public:
   std::atomic<uint64_t> stats_base_records{0};
 };
 
+// LIMIT and direction that a handler range scan may push to LineairDB.
+// row_limit=0 means keep the scan unbounded and let MySQL apply LIMIT.
+struct RangeScanLimit {
+  ha_rows row_limit{0};
+  bool reverse_scan{false};
+};
+
+// Returns LIMIT and scan direction to push, or row_limit=0 to keep it local.
+// Safe only when the server scan sees every WHERE predicate that can affect
+// which rows belong before the LIMIT.
+RangeScanLimit range_scan_limit_for_order(THD *thd, const KEY *key,
+                                          uint matched_prefix,
+                                          bool has_mysql_only_filter);
+
 /** @brief
   Class definition for the storage engine
 */
@@ -122,6 +136,10 @@ private:
   std::unordered_map<std::string, size_t> scan_cache_;  // primary key -> index in scanned_values_
   std::vector<std::string> secondary_index_results_;
   std::vector<std::string> secondary_index_payloads_;
+  // Set by get_matching_keys_and_values_in_range() when these materialized
+  // rows are only a LIMIT-staged window. index_next()/index_next_same() consume
+  // it and abort on over-read instead of returning a false EOF.
+  bool materialized_scan_truncated_{false};
   std::string last_fetched_primary_key_;
   std::string end_range_exclusive_key_; // For HA_READ_BEFORE_KEY: exclude this key from results
   my_off_t
