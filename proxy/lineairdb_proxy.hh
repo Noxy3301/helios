@@ -79,7 +79,8 @@ enum class MessageType : uint32_t {
     TX_STATELESS_READ = 27,
     TX_STATELESS_BATCH_READ = 28,
     TX_VALIDATE_AND_COMMIT = 29,
-    TX_EXECUTE_READ_PLAN = 30
+    TX_EXECUTE_READ_PLAN = 30,
+    TX_GET_TABLE_STATS = 31
 };
 
 /**
@@ -102,6 +103,8 @@ public:
 
     // transaction management
     int64_t tx_begin_transaction();
+    // Refresh row-count stats without opening a LineairDB transaction.
+    bool fetch_table_stats();
     void tx_abort(int64_t tx_id);
 
     // primary key operations

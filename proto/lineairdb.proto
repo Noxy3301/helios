@@ -51,6 +51,7 @@ enum OpCode {
     TX_STATELESS_BATCH_READ = 28;
     TX_VALIDATE_AND_COMMIT = 29;
     TX_EXECUTE_READ_PLAN = 30;
+    TX_GET_TABLE_STATS = 31;
 }
 
 enum BatchOpType {

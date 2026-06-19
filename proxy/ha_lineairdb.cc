@@ -145,6 +145,23 @@ struct LineairDBThdCtx {
   LineairDBTransaction *tx{nullptr};
 };
 
+// Return the THD-local LineairDB context slot.
+static LineairDBThdCtx *&lineairdb_thd_ctx(THD *thd, handlerton *hton) {
+  return *reinterpret_cast<LineairDBThdCtx **>(thd_ha_data(thd, hton));
+}
+
+// Create the THD context and RPC proxy if this thread does not have them yet.
+static void ensure_lineairdb_proxy(LineairDBThdCtx *&ctx) {
+  if (ctx == nullptr)
+    ctx = new LineairDBThdCtx();
+  if (!ctx->proxy) {
+    std::string host =
+        srv_server_host ? srv_server_host : std::string("127.0.0.1");
+    int port = static_cast<int>(srv_server_port);
+    ctx->proxy = std::make_shared<LineairDBProxy>(host, port);
+  }
+}
+
 static int lineairdb_commit(handlerton *hton, THD *thd, bool shouldCommit);
 static int lineairdb_abort(handlerton *hton, THD *thd, bool);
 
@@ -274,17 +291,8 @@ err:
 LineairDBProxy *ha_lineairdb::get_proxy() {
   // thd_ha_data provides a single void* slot per THD per storage engine.
   // We need LineairDBThdCtx to hold both the RPC proxy and the transaction.
-  LineairDBThdCtx *&ctx =
-      *reinterpret_cast<LineairDBThdCtx **>(thd_ha_data(userThread, lineairdb_hton));
-  if (ctx == nullptr)
-    ctx = new LineairDBThdCtx();
-  if (!ctx->proxy) {
-    // Construct RPC proxy using GLOBAL sysvars
-    std::string host =
-        srv_server_host ? srv_server_host : std::string("127.0.0.1");
-    int port = static_cast<int>(srv_server_port);
-    ctx->proxy = std::make_shared<LineairDBProxy>(host, port);
-  }
+  LineairDBThdCtx *&ctx = lineairdb_thd_ctx(userThread, lineairdb_hton);
+  ensure_lineairdb_proxy(ctx);
   return ctx->proxy.get();
 }
 
@@ -1184,23 +1192,35 @@ int ha_lineairdb::info(uint flag) {
   }
 
   if (flag & (HA_STATUS_VARIABLE | HA_STATUS_CONST)) {
-    // If stats_base_records is still 0, try to sync from proxy cache.
-    // This covers the case where info() is called before external_lock()
-    // (e.g., BenchBase catalog refresh, SHOW TABLE STATUS).
+    // If stats_base_records is still 0, try to seed it from server stats.
+    // This covers info() calls before external_lock() has synced the cache.
     if (share->stats_base_records.load(std::memory_order_relaxed) == 0 &&
         !db_table_name.empty()) {
       THD *thd = ha_thd();
       if (thd != nullptr) {
-        LineairDBThdCtx *ctx =
-            *reinterpret_cast<LineairDBThdCtx **>(thd_ha_data(thd, lineairdb_hton));
+        LineairDBThdCtx *&ctx = lineairdb_thd_ctx(thd, lineairdb_hton);
+        ensure_lineairdb_proxy(ctx);
+
         if (ctx != nullptr && ctx->proxy) {
-          const auto &stats_cache = ctx->proxy->cached_table_stats();
-          auto it = stats_cache.find(db_table_name);
-          if (it != stats_cache.end() && it->second > 0) {
+          auto seed_from_cache = [&]() -> bool {
+            const auto &stats_cache = ctx->proxy->cached_table_stats();
+            auto it = stats_cache.find(db_table_name);
+            if (it == stats_cache.end() || it->second <= 0)
+              return false;
+
             share->stats_base_records.store(
                 static_cast<uint64_t>(it->second), std::memory_order_relaxed);
             for (auto &shard : share->rowcount_shards)
               shard.delta.store(0, std::memory_order_relaxed);
+            return true;
+          };
+
+          // Existing path: use BEGIN/END piggyback stats when available.
+          const bool seeded = seed_from_cache();
+
+          // Cold optimizer paths can reach info() before tx_begin.
+          if (!seeded && ctx->proxy->fetch_table_stats()) {
+            seed_from_cache();
           }
         }
       }
@@ -1260,6 +1280,19 @@ int ha_lineairdb::info(uint flag) {
   }
 
   return 0;
+}
+
+int ha_lineairdb::analyze(THD *, HA_CHECK_OPT *) {
+  DBUG_TRACE;
+
+  if (share != nullptr) {
+    share->stats_base_records.store(0, std::memory_order_relaxed);
+    for (auto &shard : share->rowcount_shards)
+      shard.delta.store(0, std::memory_order_relaxed);
+  }
+
+  info(HA_STATUS_VARIABLE | HA_STATUS_CONST);
+  return HA_ADMIN_OK;
 }
 
 /**
@@ -1428,16 +1461,8 @@ int ha_lineairdb::start_stmt(THD *thd, thr_lock_type lock_type) {
  * would result in a nullptr dereference or assertion failure.
  */
 LineairDBTransaction *&ha_lineairdb::get_transaction(THD *thd) {
-  LineairDBThdCtx *&ctx =
-      *reinterpret_cast<LineairDBThdCtx **>(thd_ha_data(thd, lineairdb_hton));
-  if (ctx == nullptr)
-    ctx = new LineairDBThdCtx();
-  if (!ctx->proxy) {
-    std::string host =
-        srv_server_host ? srv_server_host : std::string("127.0.0.1");
-    int port = static_cast<int>(srv_server_port);
-    ctx->proxy = std::make_shared<LineairDBProxy>(host, port);
-  }
+  LineairDBThdCtx *&ctx = lineairdb_thd_ctx(thd, lineairdb_hton);
+  ensure_lineairdb_proxy(ctx);
   if (ctx->tx == nullptr) {
     ctx->tx =
         new LineairDBTransaction(thd, ctx->proxy.get(), lineairdb_hton, FENCE);
