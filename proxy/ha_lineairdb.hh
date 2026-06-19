@@ -91,6 +91,9 @@ public:
   std::mutex index_ndv_mu_;
   std::unordered_map<std::string, std::vector<uint64_t>> index_ndv_;
   std::atomic<bool> index_ndv_loaded_{false};
+
+  // ANALYZE TABLE sets this so the next NDV fetch recomputes server stats.
+  std::atomic<bool> index_ndv_force_refresh_{false};
 };
 
 // LIMIT and direction that a handler range scan may push to LineairDB.

@@ -1217,7 +1217,9 @@ void ha_lineairdb::seed_optimizer_stats() {
       share->stats_base_records.load(std::memory_order_relaxed) == 0;
   const bool need_ndv =
       !share->index_ndv_loaded_.load(std::memory_order_relaxed);
-  if (!need_rowcount && !need_ndv)
+  const bool force_ndv =
+      share->index_ndv_force_refresh_.load(std::memory_order_relaxed);
+  if (!need_rowcount && !need_ndv && !force_ndv)
     return;
 
   THD *thd = ha_thd();
@@ -1233,17 +1235,22 @@ void ha_lineairdb::seed_optimizer_stats() {
   const bool seeded = seed_row_count_from_cache(ctx->proxy.get());
 
   // Cold optimizer paths can reach info() before tx_begin.
-  if (!seeded || need_ndv) {
+  if (!seeded || need_ndv || force_ndv) {
     bool fetched = false;
-    if (need_ndv) {
+    bool requested_ndv = false;
+    if (need_ndv || force_ndv) {
       const auto descs = index_ndv_descriptors(table);
-      fetched = ctx->proxy->fetch_table_stats(db_table_name, descs);
+      // Consume ANALYZE's force flag only when issuing the NDV RPC.
+      const bool force = share->index_ndv_force_refresh_.exchange(
+          false, std::memory_order_relaxed);
+      fetched = ctx->proxy->fetch_table_stats(db_table_name, descs, force);
+      requested_ndv = true;
     } else {
       fetched = ctx->proxy->fetch_table_stats();
     }
     if (fetched) {
       seed_row_count_from_cache(ctx->proxy.get());
-      if (need_ndv)
+      if (requested_ndv)
         load_index_ndv_from_cache(ctx->proxy.get());
     }
   }
@@ -1362,6 +1369,8 @@ int ha_lineairdb::analyze(THD *, HA_CHECK_OPT *) {
     share->stats_base_records.store(0, std::memory_order_relaxed);
     for (auto &shard : share->rowcount_shards)
       shard.delta.store(0, std::memory_order_relaxed);
+    share->index_ndv_loaded_.store(false, std::memory_order_relaxed);
+    share->index_ndv_force_refresh_.store(true, std::memory_order_relaxed);
   }
 
   info(HA_STATUS_VARIABLE | HA_STATUS_CONST);
