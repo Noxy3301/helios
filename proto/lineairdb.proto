@@ -51,6 +51,7 @@ enum OpCode {
     TX_STATELESS_BATCH_READ = 28;
     TX_VALIDATE_AND_COMMIT = 29;
     TX_EXECUTE_READ_PLAN = 30;
+    TX_GET_TABLE_STATS = 31;
 }
 
 enum BatchOpType {
@@ -94,6 +95,29 @@ message TxBeginTransaction {
     message Response {
         int64 transaction_id = 1;
         repeated TableRowCount table_stats = 2;
+    }
+}
+
+// Fetch optimizer stats before the proxy opens a LineairDB transaction.
+message GetTableStats {
+    message IndexDesc {
+        string index_name = 1; // Empty means primary index.
+        uint32 num_key_parts = 2; // Number of leading key parts to measure.
+    }
+    message Request {
+        string ndv_table = 1; // Table to compute NDV for; empty means row counts only.
+        repeated IndexDesc ndv_indexes = 2;
+        bool ndv_force_recompute = 3; // ANALYZE TABLE forces NDV recomputation.
+    }
+    // NDV (Number of Distinct Values) per key-prefix length.
+    message IndexNdv {
+        string index_name = 1;
+        bool available = 2; // False when NDV is unavailable for this index.
+        repeated uint64 ndv = 3;
+    }
+    message Response {
+        repeated TableRowCount table_stats = 1;
+        repeated IndexNdv index_ndv = 2;
     }
 }
 

@@ -181,6 +181,10 @@ std::string build_plan_key(
 
 }  // namespace
 
+std::mutex LineairDBRpc::ndv_cache_mu_;
+std::unordered_map<std::string, std::pair<bool, std::vector<uint64_t>>>
+    LineairDBRpc::ndv_cache_;
+
 LineairDBRpc::LineairDBRpc(std::shared_ptr<DatabaseManager> db_manager,
                            std::shared_ptr<TransactionManager> tx_manager,
                            std::shared_ptr<TableRowCounts> row_counts)
@@ -229,6 +233,10 @@ void LineairDBRpc::handle_rpc(uint64_t sender_id, MessageType message_type,
             return;
         case MessageType::TX_EXECUTE_READ_PLAN:
             handleTxExecuteReadPlan(message, result);
+            release_masstree_thread_epoch();
+            return;
+        case MessageType::TX_GET_TABLE_STATS:
+            handleTxGetTableStats(message, result);
             release_masstree_thread_epoch();
             return;
         case MessageType::TX_VALIDATE_AND_COMMIT:
@@ -343,6 +351,64 @@ void LineairDBRpc::handleTxBeginTransaction(const std::string& message, std::str
     result = response.SerializeAsString();
 
     LOG_DEBUG("Created transaction: %ld", tx_id);
+}
+
+void LineairDBRpc::handleTxGetTableStats(const std::string& message,
+                                         std::string& result) {
+    LineairDB::Protocol::GetTableStats::Request request;
+    request.ParseFromString(message);
+    LineairDB::Protocol::GetTableStats::Response response;
+
+    if (row_counts_) {
+        for (const auto& [name, count] : row_counts_->snapshot()) {
+            auto* ts = response.add_table_stats();
+            ts->set_table_name(name);
+            ts->set_row_count(count);
+        }
+    }
+
+    if (!request.ndv_table().empty() && db_manager_) {
+        auto db = db_manager_->get_database();
+        for (const auto& desc : request.ndv_indexes()) {
+            auto* out = response.add_index_ndv();
+            out->set_index_name(desc.index_name());
+
+            std::string cache_key = request.ndv_table();
+            cache_key.push_back('\0');
+            cache_key.append(desc.index_name());
+            cache_key.push_back('\0');
+            cache_key.append(std::to_string(desc.num_key_parts()));
+
+            bool cached = false;
+            bool available = false;
+            std::vector<uint64_t> ndv;
+            {
+                std::lock_guard<std::mutex> lock(ndv_cache_mu_);
+                if (request.ndv_force_recompute()) ndv_cache_.erase(cache_key);
+                auto it = ndv_cache_.find(cache_key);
+                if (it != ndv_cache_.end()) {
+                    cached = true;
+                    available = it->second.first;
+                    ndv = it->second.second;
+                }
+            }
+
+            if (!cached) {
+                available = db && db->ComputeIndexNdvInt(
+                                      request.ndv_table(), desc.index_name(),
+                                      desc.num_key_parts(), ndv);
+                std::lock_guard<std::mutex> lock(ndv_cache_mu_);
+                ndv_cache_[cache_key] = {available, ndv};
+            }
+
+            out->set_available(available);
+            if (available) {
+                for (uint64_t value : ndv) out->add_ndv(value);
+            }
+        }
+    }
+
+    result = response.SerializeAsString();
 }
 
 void LineairDBRpc::handleTxAbort(const std::string& message, std::string& result) {

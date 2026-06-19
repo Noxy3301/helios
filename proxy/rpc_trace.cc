@@ -91,6 +91,8 @@ const char* message_type_name(MessageType t) {
       return "TX_VALIDATE_AND_COMMIT";
     case MessageType::TX_EXECUTE_READ_PLAN:
       return "TX_EXECUTE_READ_PLAN";
+    case MessageType::TX_GET_TABLE_STATS:
+      return "TX_GET_TABLE_STATS";
   }
   return "UNDEFINED";
 }

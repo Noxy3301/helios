@@ -5,6 +5,8 @@
 #include <mutex>
 #include <shared_mutex>
 #include <unordered_map>
+#include <utility>
+#include <vector>
 
 #include "../protocol/message.hh"
 #include "../storage/database_manager.hh"
@@ -46,8 +48,14 @@ private:
     std::shared_ptr<TransactionManager> tx_manager_;
     std::shared_ptr<TableRowCounts> row_counts_;
 
+    // NDV cache shared by all RPC connections. Key is table\0index\0parts.
+    static std::mutex ndv_cache_mu_;
+    static std::unordered_map<std::string,
+                              std::pair<bool, std::vector<uint64_t>>> ndv_cache_;
+
     // Transaction lifecycle
     void handleTxBeginTransaction(const std::string& message, std::string& result);
+    void handleTxGetTableStats(const std::string& message, std::string& result);
     void handleTxAbort(const std::string& message, std::string& result);
 
     // Primary key operations
