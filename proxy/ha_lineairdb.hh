@@ -92,6 +92,9 @@ public:
   std::unordered_map<std::string, std::vector<uint64_t>> index_ndv_;
   std::atomic<bool> index_ndv_loaded_{false};
 
+  // Row count observed when index_ndv_ was fetched.
+  std::atomic<uint64_t> index_ndv_records_{0};
+
   // ANALYZE TABLE sets this so the next NDV fetch recomputes server stats.
   std::atomic<bool> index_ndv_force_refresh_{false};
 };
@@ -510,6 +513,7 @@ private:
   // rec_per_key helpers
   bool seed_row_count_from_cache(LineairDBProxy *proxy);
   void load_index_ndv_from_cache(LineairDBProxy *proxy);
+  void mark_stale_index_ndv_for_select();
   void seed_optimizer_stats();
   void set_generic_rec_per_key(KEY *key, uint key_parts, bool is_primary);
 

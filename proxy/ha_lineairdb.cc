@@ -1196,18 +1196,49 @@ void ha_lineairdb::load_index_ndv_from_cache(LineairDBProxy *proxy) {
   if (proxy == nullptr || share == nullptr)
     return;
 
+  const uint64_t records =
+      share->stats_base_records.load(std::memory_order_relaxed);
   std::lock_guard<std::mutex> lock(share->index_ndv_mu_);
   share->index_ndv_.clear();
   for (const auto &entry : proxy->last_index_ndv()) {
     if (entry.second.available)
       share->index_ndv_[entry.first] = entry.second.values;
   }
+  share->index_ndv_records_.store(records, std::memory_order_relaxed);
   share->index_ndv_loaded_.store(true, std::memory_order_relaxed);
 }
 
 /**
- * @brief Fetch row-count and per-index NDV stats before optimizer planning when
- * the shared table metadata is missing them.
+ * @brief Mark cached NDV stale when a SELECT sees more than 20% row-count
+ * drift.
+ */
+void ha_lineairdb::mark_stale_index_ndv_for_select() {
+  if (share == nullptr ||
+      !share->index_ndv_loaded_.load(std::memory_order_relaxed))
+    return;
+
+  THD *thd = ha_thd();
+  const bool is_select = thd != nullptr && thd->lex != nullptr &&
+                         thd->lex->sql_command == SQLCOM_SELECT;
+  if (!is_select)
+    return;
+
+  const uint64_t at_fetch =
+      share->index_ndv_records_.load(std::memory_order_relaxed);
+  const uint64_t now =
+      share->stats_base_records.load(std::memory_order_relaxed);
+  const uint64_t hi = std::max(at_fetch, now);
+  const uint64_t lo = std::min(at_fetch, now);
+  // Refetch when the gap is more than 20% of the larger row count.
+  if (hi == 0 || (hi - lo) * 5 <= hi)
+    return;
+
+  share->index_ndv_force_refresh_.store(true, std::memory_order_relaxed);
+  share->index_ndv_loaded_.store(false, std::memory_order_relaxed);
+}
+
+/**
+ * @brief Fetch row-count and per-index NDV stats before optimizer planning.
  */
 void ha_lineairdb::seed_optimizer_stats() {
   if (share == nullptr || db_table_name.empty())
@@ -1215,6 +1246,7 @@ void ha_lineairdb::seed_optimizer_stats() {
 
   const bool need_rowcount =
       share->stats_base_records.load(std::memory_order_relaxed) == 0;
+  mark_stale_index_ndv_for_select();
   const bool need_ndv =
       !share->index_ndv_loaded_.load(std::memory_order_relaxed);
   const bool force_ndv =
