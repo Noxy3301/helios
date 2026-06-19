@@ -103,11 +103,24 @@ bool LineairDBProxy::is_connected() const {
     return connected_;
 }
 
-bool LineairDBProxy::fetch_table_stats() {
+bool LineairDBProxy::fetch_table_stats(
+    const std::string& ndv_table,
+    const std::vector<std::pair<std::string, uint32_t>>& ndv_indexes,
+    bool force_ndv) {
     if (!connected_) return false;
 
     LineairDB::Protocol::GetTableStats::Request request;
     LineairDB::Protocol::GetTableStats::Response response;
+    if (!ndv_table.empty()) {
+        request.set_ndv_table(ndv_table);
+        request.set_ndv_force_recompute(force_ndv);
+        for (const auto& [index_name, key_parts] : ndv_indexes) {
+            auto* desc = request.add_ndv_indexes();
+            desc->set_index_name(index_name);
+            desc->set_num_key_parts(key_parts);
+        }
+    }
+
     if (!send_protobuf_message(request, response,
                                MessageType::TX_GET_TABLE_STATS)) {
         return false;
@@ -116,6 +129,13 @@ bool LineairDBProxy::fetch_table_stats() {
     table_stats_cache_.clear();
     for (const auto& ts : response.table_stats()) {
         table_stats_cache_[ts.table_name()] = ts.row_count();
+    }
+    last_index_ndv_.clear();
+    for (const auto& in : response.index_ndv()) {
+        IndexNdvResult result;
+        result.available = in.available();
+        result.values.assign(in.ndv().begin(), in.ndv().end());
+        last_index_ndv_[in.index_name()] = std::move(result);
     }
     return true;
 }

@@ -103,8 +103,19 @@ public:
 
     // transaction management
     int64_t tx_begin_transaction();
-    // Refresh row-count stats without opening a LineairDB transaction.
-    bool fetch_table_stats();
+    struct IndexNdvResult {
+        bool available = false;
+        // values[i] is the NDV for the first i+1 key parts.
+        std::vector<uint64_t> values;
+    };
+    // Refresh row counts, and optionally per-index NDV for one table.
+    bool fetch_table_stats(
+        const std::string& ndv_table = std::string(),
+        const std::vector<std::pair<std::string, uint32_t>>& ndv_indexes = {},
+        bool force_ndv = false);
+    const std::unordered_map<std::string, IndexNdvResult>& last_index_ndv() const {
+        return last_index_ndv_;
+    }
     void tx_abort(int64_t tx_id);
 
     // primary key operations
@@ -303,6 +314,7 @@ public:
 
 private:
     std::unordered_map<std::string, int64_t> table_stats_cache_;
+    std::unordered_map<std::string, IndexNdvResult> last_index_ndv_;
     template<typename RequestType, typename ResponseType>
     bool send_protobuf_message(const RequestType& request, ResponseType& response,
                                MessageType message_type, const std::string& meta = "");

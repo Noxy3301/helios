@@ -106,6 +106,7 @@
 #include <optional>
 #include <sstream>
 #include <string_view>
+#include <utility>
 #include <vector>
 // for ::strcasecmp
 #include <strings.h>
@@ -145,12 +146,16 @@ struct LineairDBThdCtx {
   LineairDBTransaction *tx{nullptr};
 };
 
-// Return the THD-local LineairDB context slot.
+/**
+ * @brief Return the THD-local LineairDB context slot.
+ */
 static LineairDBThdCtx *&lineairdb_thd_ctx(THD *thd, handlerton *hton) {
   return *reinterpret_cast<LineairDBThdCtx **>(thd_ha_data(thd, hton));
 }
 
-// Create the THD context and RPC proxy if this thread does not have them yet.
+/**
+ * @brief Create the THD context and RPC proxy when this thread has none.
+ */
 static void ensure_lineairdb_proxy(LineairDBThdCtx *&ctx) {
   if (ctx == nullptr)
     ctx = new LineairDBThdCtx();
@@ -160,6 +165,26 @@ static void ensure_lineairdb_proxy(LineairDBThdCtx *&ctx) {
     int port = static_cast<int>(srv_server_port);
     ctx->proxy = std::make_shared<LineairDBProxy>(host, port);
   }
+}
+
+/**
+ * @brief List the indexes whose key-prefix NDV the server should measure.
+ */
+static std::vector<std::pair<std::string, uint32_t>> index_ndv_descriptors(
+    TABLE *table) {
+  std::vector<std::pair<std::string, uint32_t>> descs;
+  if (table == nullptr || table->s == nullptr)
+    return descs;
+
+  descs.reserve(table->s->keys);
+  for (uint i = 0; i < table->s->keys; ++i) {
+    KEY *key = table->key_info + i;
+    const bool is_primary = (i == table->s->primary_key);
+    descs.emplace_back(is_primary ? std::string()
+                                  : std::string(key->name ? key->name : ""),
+                       key->user_defined_key_parts);
+  }
+  return descs;
 }
 
 static int lineairdb_commit(handlerton *hton, THD *thd, bool shouldCommit);
@@ -1145,6 +1170,86 @@ int ha_lineairdb::rnd_pos(uchar *buf, uchar *pos) {
 }
 
 /**
+ * @brief Seed this table's row-count baseline from the proxy stats cache.
+ */
+bool ha_lineairdb::seed_row_count_from_cache(LineairDBProxy *proxy) {
+  if (proxy == nullptr || share == nullptr || db_table_name.empty())
+    return false;
+
+  const auto &stats_cache = proxy->cached_table_stats();
+  auto it = stats_cache.find(db_table_name);
+  if (it == stats_cache.end() || it->second <= 0)
+    return false;
+
+  share->stats_base_records.store(static_cast<uint64_t>(it->second),
+                                  std::memory_order_relaxed);
+  for (auto &shard : share->rowcount_shards)
+    shard.delta.store(0, std::memory_order_relaxed);
+  return true;
+}
+
+/**
+ * @brief Copy the proxy's latest per-index NDV results into the shared table
+ * metadata.
+ */
+void ha_lineairdb::load_index_ndv_from_cache(LineairDBProxy *proxy) {
+  if (proxy == nullptr || share == nullptr)
+    return;
+
+  std::lock_guard<std::mutex> lock(share->index_ndv_mu_);
+  share->index_ndv_.clear();
+  for (const auto &entry : proxy->last_index_ndv()) {
+    if (entry.second.available)
+      share->index_ndv_[entry.first] = entry.second.values;
+  }
+  share->index_ndv_loaded_.store(true, std::memory_order_relaxed);
+}
+
+/**
+ * @brief Fetch row-count and per-index NDV stats before optimizer planning when
+ * the shared table metadata is missing them.
+ */
+void ha_lineairdb::seed_optimizer_stats() {
+  if (share == nullptr || db_table_name.empty())
+    return;
+
+  const bool need_rowcount =
+      share->stats_base_records.load(std::memory_order_relaxed) == 0;
+  const bool need_ndv =
+      !share->index_ndv_loaded_.load(std::memory_order_relaxed);
+  if (!need_rowcount && !need_ndv)
+    return;
+
+  THD *thd = ha_thd();
+  if (thd == nullptr)
+    return;
+
+  LineairDBThdCtx *&ctx = lineairdb_thd_ctx(thd, lineairdb_hton);
+  ensure_lineairdb_proxy(ctx);
+  if (ctx == nullptr || !ctx->proxy)
+    return;
+
+  // Existing path: use BEGIN/END piggyback stats when available.
+  const bool seeded = seed_row_count_from_cache(ctx->proxy.get());
+
+  // Cold optimizer paths can reach info() before tx_begin.
+  if (!seeded || need_ndv) {
+    bool fetched = false;
+    if (need_ndv) {
+      const auto descs = index_ndv_descriptors(table);
+      fetched = ctx->proxy->fetch_table_stats(db_table_name, descs);
+    } else {
+      fetched = ctx->proxy->fetch_table_stats();
+    }
+    if (fetched) {
+      seed_row_count_from_cache(ctx->proxy.get());
+      if (need_ndv)
+        load_index_ndv_from_cache(ctx->proxy.get());
+    }
+  }
+}
+
+/**
   @brief
   ::info() is used to return information to the optimizer. See my_base.h for
   the complete description.
@@ -1192,39 +1297,7 @@ int ha_lineairdb::info(uint flag) {
   }
 
   if (flag & (HA_STATUS_VARIABLE | HA_STATUS_CONST)) {
-    // If stats_base_records is still 0, try to seed it from server stats.
-    // This covers info() calls before external_lock() has synced the cache.
-    if (share->stats_base_records.load(std::memory_order_relaxed) == 0 &&
-        !db_table_name.empty()) {
-      THD *thd = ha_thd();
-      if (thd != nullptr) {
-        LineairDBThdCtx *&ctx = lineairdb_thd_ctx(thd, lineairdb_hton);
-        ensure_lineairdb_proxy(ctx);
-
-        if (ctx != nullptr && ctx->proxy) {
-          auto seed_from_cache = [&]() -> bool {
-            const auto &stats_cache = ctx->proxy->cached_table_stats();
-            auto it = stats_cache.find(db_table_name);
-            if (it == stats_cache.end() || it->second <= 0)
-              return false;
-
-            share->stats_base_records.store(
-                static_cast<uint64_t>(it->second), std::memory_order_relaxed);
-            for (auto &shard : share->rowcount_shards)
-              shard.delta.store(0, std::memory_order_relaxed);
-            return true;
-          };
-
-          // Existing path: use BEGIN/END piggyback stats when available.
-          const bool seeded = seed_from_cache();
-
-          // Cold optimizer paths can reach info() before tx_begin.
-          if (!seeded && ctx->proxy->fetch_table_stats()) {
-            seed_from_cache();
-          }
-        }
-      }
-    }
+    seed_optimizer_stats();
 
     int64_t delta_sum = 0;
     for (const auto &shard : share->rowcount_shards) {
@@ -1296,36 +1369,63 @@ int ha_lineairdb::analyze(THD *, HA_CHECK_OPT *) {
 }
 
 /**
- * Estimate rec_per_key (average rows matching a key prefix) for each
- * key part of an index.
+ * @brief Estimate rec_per_key, the average rows matching each key prefix.
  *
- * Assumes uniform data distribution: N total rows split evenly across
- * K key parts means each part divides by N^(1/K).
+ * @details Prefer server-measured NDV and compute rows / NDV(prefix). If NDV
+ * is unavailable, keep the old uniform-distribution heuristic as a fallback.
  *
- * Example: 1,000,000 rows, 4-part UNIQUE KEY
- *   per_part = 1000000^(1/4) ≈ 31.6
- *   1 part specified: 1000000 / 31.6   = 31,623 rows
- *   2 parts:          1000000 / 31.6^2 = 1,000 rows
- *   3 parts:          1000000 / 31.6^3 = 32 rows
- *   4 parts (full):   1 row (UNIQUE)
+ * The fallback assumes N rows are split evenly across K key parts, so each
+ * additional key part narrows the estimate by N^(1/K).
+ *
+ * Example with 1,000,000 rows and a 4-part unique key:
+ * @verbatim
+ * per_part = 1000000^(1/4) ~= 31.6
+ * 1 part: 1000000 / 31.6   = 31,623 rows
+ * 2 parts: 1000000 / 31.6^2 = 1,000 rows
+ * 3 parts: 1000000 / 31.6^3 = 32 rows
+ * 4 parts: full unique key  = 1 row
+ * @endverbatim
+ *
+ * Full primary or unique keys are always costed as one row.
  *
  * See also: NDB's ndb_index_stat_set_rpk (ha_ndb_index_stat.cc:2529).
  */
 void ha_lineairdb::set_generic_rec_per_key(KEY *key, uint key_parts,
                                            bool is_primary) {
   bool is_unique = (key->flags & HA_NOSAME);
-  // How much each additional key part narrows the result set
-  double per_part = std::max(2.0, std::pow(static_cast<double>(stats.records), 1.0 / key_parts));
+
+  std::vector<uint64_t> ndv;
+  if (share != nullptr &&
+      share->index_ndv_loaded_.load(std::memory_order_relaxed)) {
+    const std::string index_name =
+        is_primary ? std::string() : std::string(key->name ? key->name : "");
+    std::lock_guard<std::mutex> lock(share->index_ndv_mu_);
+    auto it = share->index_ndv_.find(index_name);
+    if (it != share->index_ndv_.end() && it->second.size() >= key_parts)
+      ndv = it->second;
+  }
+  const bool has_ndv = ndv.size() >= key_parts;
+
+  // How much each additional key part narrows the result set (fallback path).
+  double per_part = std::max(
+      2.0, std::pow(static_cast<double>(stats.records), 1.0 / key_parts));
 
   for (uint j = 0; j < key_parts; j++) {
     ulong rpk; // records per key
     if ((is_primary || is_unique) && j == key_parts - 1) {
       // All parts specified on a UNIQUE/PK -> exactly 1 row
       rpk = 1;
+    } else if (has_ndv && ndv[j] > 0) {
+      // Real stats: average rows per distinct key-prefix value.
+      const uint64_t records = static_cast<uint64_t>(stats.records);
+      const uint64_t distinct = ndv[j];
+      rpk = static_cast<ulong>(
+          std::max<uint64_t>(1, (records + distinct - 1) / distinct));
     } else {
       // per_part^(j+1) = total divisor for j+1 key parts
       double selectivity = std::pow(per_part, static_cast<double>(j + 1));
-      rpk = static_cast<ulong>(std::max(1.0, static_cast<double>(stats.records) / selectivity));
+      rpk = static_cast<ulong>(
+          std::max(1.0, static_cast<double>(stats.records) / selectivity));
     }
     key->rec_per_key[j] = rpk;
     key->set_records_per_key(j, static_cast<rec_per_key_t>(rpk));

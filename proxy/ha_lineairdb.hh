@@ -47,6 +47,7 @@
 #include <array>
 #include <atomic>
 #include <cstdint>
+#include <mutex>
 #include <unordered_map>
 #include <vector>
 
@@ -84,6 +85,12 @@ public:
 
   // Baseline for committed row count (currently unused; defaults to 0).
   std::atomic<uint64_t> stats_base_records{0};
+
+  // Per-index NDV, indexed by MySQL index name. Empty name means primary key.
+  // values[i] is the NDV for the first i+1 key parts.
+  std::mutex index_ndv_mu_;
+  std::unordered_map<std::string, std::vector<uint64_t>> index_ndv_;
+  std::atomic<bool> index_ndv_loaded_{false};
 };
 
 // LIMIT and direction that a handler range scan may push to LineairDB.
@@ -498,6 +505,9 @@ private:
                                 const size_t read_buf_size);
 
   // rec_per_key helpers
+  bool seed_row_count_from_cache(LineairDBProxy *proxy);
+  void load_index_ndv_from_cache(LineairDBProxy *proxy);
+  void seed_optimizer_stats();
   void set_generic_rec_per_key(KEY *key, uint key_parts, bool is_primary);
 
   // records_in_range helpers
