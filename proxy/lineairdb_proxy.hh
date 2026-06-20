@@ -176,6 +176,15 @@ public:
         // unique). Empty = ship full rows. num_columns = table->s->fields.
         std::vector<uint32_t> projection;
         uint32_t projection_num_columns = 0;
+        // Semijoin reduction: keep probe rows only when their join key appears
+        // in an earlier source step.
+        struct Semijoin {
+            uint32_t source_step = 0;
+            uint32_t source_column = 0;
+            uint32_t probe_column = 0;
+            std::string source_filter;
+        };
+        std::vector<Semijoin> semijoins;
     };
     struct ReadPlanStepResult {
         bool found = false;

@@ -804,6 +804,46 @@ void LineairDBRpc::handleTxExecuteReadPlan(const std::string& message,
                 continue;
             }
 
+            // Build membership sets from earlier source steps, then drop
+            // probe rows whose join key is absent.
+            struct FeSemijoin {
+                std::unordered_set<std::string> keys;
+                uint32_t probe_column;
+            };
+            std::vector<FeSemijoin> fe_semijoins;
+            const int this_step_idx =
+                static_cast<int>(previous_results.size()) - 1;
+            for (const auto& sj : step.semijoins()) {
+                const int ss = static_cast<int>(sj.source_step());
+                if (ss < 0 || ss >= this_step_idx) continue;
+                FeSemijoin fsj;
+                fsj.probe_column = sj.probe_column();
+                const bool sf_on =
+                    sj.has_source_filter() && sj.source_filter().has_expr();
+                const uint32_t sf_cols =
+                    sf_on ? sj.source_filter().num_columns() : 0;
+                for (const auto& v : previous_results[ss]->scan_values()) {
+                    if (v.empty()) continue;
+                    if (sf_on) {
+                        PredicateEvaluator se;
+                        if (se.parse_row(v.data(), v.size(), sf_cols) &&
+                            !se.evaluate(sj.source_filter().expr()))
+                            continue;
+                    }
+                    auto col = extract_value_column(v, sj.source_column());
+                    if (!col.empty()) fsj.keys.emplace(col);
+                }
+                fe_semijoins.push_back(std::move(fsj));
+            }
+            auto sj_reject = [&](const std::string& value) -> bool {
+                for (const auto& fsj : fe_semijoins) {
+                    auto col = extract_value_column(value, fsj.probe_column);
+                    if (fsj.keys.find(std::string(col)) == fsj.keys.end())
+                        return true;  // no join partner -> drop
+                }
+                return false;
+            };
+
             const auto* source = previous_results[source_step];
             const int row_count =
                 std::max(source->scan_keys_size(), source->scan_values_size());
@@ -836,6 +876,8 @@ void LineairDBRpc::handleTxExecuteReadPlan(const std::string& message,
                         }
                         for (auto& r : scan_result.rows) {
                             if (!row_passes(r.value)) continue;
+                            if (!fe_semijoins.empty() && sj_reject(r.value))
+                                continue;
                             step_result->add_scan_keys(std::move(r.key));
                             step_result->add_scan_values(
                                 project_value(std::move(r.value)));
@@ -856,6 +898,8 @@ void LineairDBRpc::handleTxExecuteReadPlan(const std::string& message,
                         }
                         for (auto& r : scan_result.rows) {
                             if (!row_passes(r.value)) continue;
+                            if (!fe_semijoins.empty() && sj_reject(r.value))
+                                continue;
                             step_result->add_secondary_keys(
                                 std::move(r.secondary_key));
                             step_result->add_scan_keys(std::move(r.primary_key));
@@ -877,10 +921,13 @@ void LineairDBRpc::handleTxExecuteReadPlan(const std::string& message,
                         step.table_name(), row_key);
                 step_result->add_scan_keys(row_key);
                 step_result->add_scan_tids(read_result.tid);
-                if (read_result.found) {
+                if (read_result.found &&
+                    !(!fe_semijoins.empty() &&
+                      sj_reject(read_result.value))) {
                     step_result->add_scan_values(
                         project_value(std::move(read_result.value)));
                 } else {
+                    // Semijoin-rejected point probes are covered as not-found.
                     step_result->add_scan_values("");
                 }
             }

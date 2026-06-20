@@ -244,19 +244,50 @@ void LineairDBTransaction::execute_read_plan(
   if (!prefetch_mode_ || full_steps.empty()) return;
 
   // Exact point reads already covered by the local view need no staging RPC.
+  // Referenced steps must survive because later bindings/semijoins point at
+  // them by source_step index.
+  std::vector<bool> referenced(full_steps.size(), false);
+  for (const auto& step : full_steps) {
+    for (const auto& b : step.bindings) {
+      if (b.source_step < referenced.size()) referenced[b.source_step] = true;
+    }
+    for (const auto& b : step.end_bindings) {
+      if (b.source_step < referenced.size()) referenced[b.source_step] = true;
+    }
+    for (const auto& sj : step.semijoins) {
+      if (sj.source_step < referenced.size())
+        referenced[sj.source_step] = true;
+    }
+  }
+
   std::vector<LineairDBProxy::ReadPlanStep> steps;
   steps.reserve(full_steps.size());
-  for (const auto& step : full_steps) {
+  std::vector<uint32_t> new_index(full_steps.size(), 0);
+  size_t covered = 0;
+  for (size_t si = 0; si < full_steps.size(); ++si) {
+    const auto& step = full_steps[si];
     const bool constant_point_read = !step.is_scan && !step.for_each &&
                                      step.bindings.empty() &&
                                      step.end_bindings.empty() &&
                                      !step.key_prefix.empty();
-    if (constant_point_read &&
+    if (constant_point_read && !referenced[si] &&
         (lookup_write_set(step.table_name, step.key_prefix) ||
          lookup_row_cache(step.table_name, step.key_prefix))) {
+      ++covered;
       continue;
     }
+    new_index[si] = static_cast<uint32_t>(steps.size());
     steps.push_back(step);
+  }
+  if (covered > 0) {
+    // Remap source_step after dropping covered point reads.
+    for (auto& step : steps) {
+      for (auto& b : step.bindings) b.source_step = new_index[b.source_step];
+      for (auto& b : step.end_bindings)
+        b.source_step = new_index[b.source_step];
+      for (auto& sj : step.semijoins)
+        sj.source_step = new_index[sj.source_step];
+    }
   }
   if (steps.empty()) return;
 

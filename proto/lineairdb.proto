@@ -232,6 +232,17 @@ message TxExecuteReadPlan {
         // Optional column subset for staged rows. The server keeps full null
         // flags, sends only listed column values, and filters before trimming.
         RowProjection projection = 12;
+        // Optional membership reduction for high-fanout join probes.
+        repeated SemijoinFilter semijoins = 14;
+    }
+    // Drop probe rows whose join key is absent from an earlier step's result.
+    // Columns are 0-based TABLE::field[] ordinals.
+    message SemijoinFilter {
+        uint32 source_step = 1;
+        uint32 source_column = 2;
+        uint32 probe_column = 3;
+        // Optional filter applied while building the source membership set.
+        PushedPredicate source_filter = 4;
     }
     message RowProjection {
         uint32 num_columns = 1; // table->s->fields
