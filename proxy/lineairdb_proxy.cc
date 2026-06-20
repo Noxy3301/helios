@@ -442,6 +442,11 @@ LineairDBProxy::ReadPlanResult LineairDBProxy::tx_execute_read_plan(
         if (!step.serialized_filter.empty()) {
             out->mutable_filter()->ParseFromString(step.serialized_filter);
         }
+        if (!step.projection.empty() && step.projection_num_columns > 0) {
+            auto* p = out->mutable_projection();
+            p->set_num_columns(step.projection_num_columns);
+            for (uint32_t f : step.projection) p->add_field_indexes(f);
+        }
         for (const auto& binding : step.bindings) {
             auto* b = out->add_bindings();
             b->set_source_step(binding.source_step);

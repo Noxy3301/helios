@@ -5,6 +5,7 @@
 #include <limits>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -1018,6 +1019,105 @@ bool autogen_read_plan_from_qep(
 
   *out = std::move(steps);
   return true;
+}
+
+void plan_projection_pushdown(
+    THD *thd, std::vector<LineairDBProxy::ReadPlanStep> *steps,
+    std::unordered_map<std::string, std::vector<uint32_t>> *kept_out) {
+  kept_out->clear();
+  if (thd == nullptr || thd->lex == nullptr || steps == nullptr) return;
+
+  std::unordered_map<std::string, std::vector<bool>> union_rs;
+  std::unordered_map<std::string, uint32_t> fields_of;
+  std::unordered_set<std::string> gcol_tables;
+
+  // Merge read_set by physical table; one projection layout is shared by all
+  // aliases that read the same LineairDB table.
+  for (auto *tl = thd->lex->query_tables; tl != nullptr; tl = tl->next_global) {
+    if (tl->table == nullptr || tl->table->s == nullptr) continue;
+    TABLE *t = tl->table;
+    const std::string n = physical_table_key(t);
+    const uint32_t nf = t->s->fields;
+    fields_of[n] = nf;
+    auto &u = union_rs[n];
+    if (u.size() < nf) u.resize(nf, false);
+    for (uint f = 0; f < nf; ++f) {
+      if (t->field[f]->is_gcol()) gcol_tables.insert(n);
+      if (bitmap_is_set(t->read_set, f)) u[f] = true;
+    }
+  }
+
+  // Keep columns needed by value bindings. Column-form bindings can be
+  // remapped to the trimmed layout; byte-slice bindings need the source row
+  // to stay full because their offsets are not column-aware.
+  std::unordered_set<std::string> unsafe_src;
+  const auto force_binding_col =
+      [&](const LineairDBProxy::ReadPlanKeyBinding &b) {
+        if (b.from_key || b.source_step >= steps->size()) return;
+        const std::string &src = (*steps)[b.source_step].table_name;
+        auto fo = fields_of.find(src);
+        if (fo == fields_of.end()) {
+          unsafe_src.insert(src);
+          return;
+        }
+        if (b.source_column > 0) {
+          const uint32_t fi = static_cast<uint32_t>(b.source_column - 1);
+          if (fi >= fo->second) {
+            unsafe_src.insert(src);
+            return;
+          }
+          auto &u = union_rs[src];
+          if (u.size() < fo->second) u.resize(fo->second, false);
+          u[fi] = true;  // keep the binding's source column through the trim
+        } else {
+          unsafe_src.insert(src);  // byte-slice form: not remappable
+        }
+      };
+  for (const auto &s : *steps) {
+    for (const auto &b : s.bindings) force_binding_col(b);
+    for (const auto &b : s.end_bindings) force_binding_col(b);
+  }
+
+  // Pick projected tables and build full ordinal -> projected position maps.
+  // Positions are 1-based because source_column==0 means byte-slice binding.
+  std::unordered_map<std::string, std::vector<uint32_t>> full_to_proj;
+  for (auto &kv : union_rs) {
+    const std::string &n = kv.first;
+    if (gcol_tables.count(n) != 0 || unsafe_src.count(n) != 0) continue;
+    const uint32_t nf = fields_of[n];
+    std::vector<uint32_t> kept;
+    for (uint32_t f = 0; f < nf; ++f) {
+      if (kv.second[f]) kept.push_back(f);
+    }
+    if (kept.empty() || kept.size() == nf) continue;  // no benefit
+    std::vector<uint32_t> f2p(nf, 0);
+    for (uint32_t k = 0; k < kept.size(); ++k) f2p[kept[k]] = k + 1;
+    full_to_proj.emplace(n, std::move(f2p));
+    kept_out->emplace(n, std::move(kept));
+  }
+
+  // Remap column-form bindings from original column ordinal to projected
+  // ordinal, matching the row layout the server will actually ship.
+  const auto remap_binding = [&](LineairDBProxy::ReadPlanKeyBinding &b) {
+    if (b.from_key || b.source_column <= 0 || b.source_step >= steps->size())
+      return;
+    auto it = full_to_proj.find((*steps)[b.source_step].table_name);
+    if (it == full_to_proj.end()) return;  // source ships full rows
+    const uint32_t fi = static_cast<uint32_t>(b.source_column - 1);
+    const uint32_t pos = (fi < it->second.size()) ? it->second[fi] : 0;
+    if (pos > 0) b.source_column = static_cast<int32_t>(pos);
+  };
+  for (auto &s : *steps) {
+    for (auto &b : s.bindings) remap_binding(b);
+    for (auto &b : s.end_bindings) remap_binding(b);
+  }
+
+  for (auto &s : *steps) {
+    auto it = kept_out->find(s.table_name);
+    if (it == kept_out->end()) continue;
+    s.projection = it->second;
+    s.projection_num_columns = fields_of[s.table_name];
+  }
 }
 
 // Produce a one-step prefetch plan from the handler access, raising

@@ -1,6 +1,7 @@
 #ifndef LINEAIRDB_TRANSACTION_HH
 #define LINEAIRDB_TRANSACTION_HH
 
+#include <atomic>
 #include <optional>
 #include <unordered_map>
 #include <unordered_set>
@@ -166,6 +167,21 @@ public:
   const std::string& get_pushed_filter() const { return pushed_filter_; }
   void clear_pushed_filter() { pushed_filter_.clear(); }
 
+  // Projection pushdown stores kept field ordinals per physical table.
+  static uint64_t load_projection_global_epoch() {
+    return projection_epoch_.load(std::memory_order_relaxed);
+  }
+  void set_table_projection(const std::string& table_name,
+                            std::vector<uint32_t> kept) {
+    table_projection_[table_name] = std::move(kept);
+    projection_epoch_.fetch_add(1, std::memory_order_relaxed);
+  }
+  const std::vector<uint32_t>* load_table_projection(
+      const std::string& table_name) const {
+    auto it = table_projection_.find(table_name);
+    return it == table_projection_.end() ? nullptr : &it->second;
+  }
+
   void add_rowcount_delta(LineairDB_share *share, const std::string &table_name, int64_t delta);
   int64_t peek_rowcount_delta(const LineairDB_share *share) const;
 
@@ -293,6 +309,11 @@ private:
 
   // Predicate pushdown: serialized PushedPredicate for scan filtering
   std::string pushed_filter_;
+
+  // Physical table name -> kept field ordinals for projected staged rows.
+  std::unordered_map<std::string, std::vector<uint32_t>> table_projection_;
+  // Process-wide registration epoch for handler decode memo refresh.
+  static inline std::atomic<uint64_t> projection_epoch_{0};
 
   // Max number of buffered write/delete ops before an automatic flush
   static constexpr size_t WRITE_BATCH_SIZE = 1024;

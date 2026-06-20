@@ -2305,12 +2305,81 @@ int ha_lineairdb::set_fields_from_lineairdb(uchar *buf,
   /* Avoid asserts in ::store() for columns that are not going to be updated
    */
   my_bitmap_map *org_bitmap = dbug_tmp_use_all_columns(table, table->write_set);
-  /**
-   * store each column value to corresponding field
-   */
+
+  THD *const thd_for_serve = ha_thd();
+  const uint64_t serve_query_id =
+      thd_for_serve != nullptr
+          ? static_cast<uint64_t>(thd_for_serve->query_id)
+          : 0;
+
+  // Refresh once per statement, and again if statement-root staging registers
+  // projection after an earlier unit serve populated the memo.
+  const uint64_t proj_epoch =
+      LineairDBTransaction::load_projection_global_epoch();
+  if (serve_memo_query_id_ != serve_query_id ||
+      serve_memo_proj_epoch_ != proj_epoch) {
+    serve_memo_query_id_ = serve_query_id;
+    serve_memo_proj_epoch_ = proj_epoch;
+    auto tx = get_transaction(thd_for_serve);
+    serve_memo_projection_ =
+        tx != nullptr ? tx->load_table_projection(db_table_name) : nullptr;
+
+    // DML may rebuild rows and secondary keys from this buffer, so only a
+    // plain SELECT can leave unread fields untouched.
+    serve_memo_can_skip_unread_fields_ =
+        thd_for_serve != nullptr && thd_for_serve->lex != nullptr &&
+        thd_for_serve->lex->sql_command == SQLCOM_SELECT;
+  }
+
+  const bool can_skip_unread_fields = serve_memo_can_skip_unread_fields_;
+
+  {
+    // Projected rows contain kept columns only; null flags remain full-width.
+    const std::vector<uint32_t> *kept = serve_memo_projection_;
+
+    // Unit-only prefetch can still serve full rows for a projected table.
+    if (kept != nullptr && ldbField.get_row_size() != kept->size()) {
+      kept = nullptr;
+    }
+
+    if (kept != nullptr) {
+      for (size_t projected_col = 0; projected_col < kept->size();
+           ++projected_col) {
+        const uint32_t field_index = (*kept)[projected_col];
+        if (field_index >= table->s->fields) break;
+        if (can_skip_unread_fields &&
+            !bitmap_is_set(table->read_set, field_index)) {
+          continue;
+        }
+        Field *f = table->field[field_index];
+        const auto mysqlFieldValue =
+            ldbField.get_column_of_row(projected_col);
+        if (f->is_nullable() && f->is_null_in_record(buf)) {
+          f->set_null();
+        } else {
+          f->store(mysqlFieldValue.data(), mysqlFieldValue.size(),
+                   &my_charset_bin, CHECK_FIELD_WARN);
+          Field *arr[2] = {f, nullptr};
+          if (store_blob_to_field(arr)) {
+            dbug_tmp_restore_column_map(table->write_set, org_bitmap);
+            return HA_ERR_OUT_OF_MEM;
+          }
+        }
+      }
+      dbug_tmp_restore_column_map(table->write_set, org_bitmap);
+      return 0;
+    }
+  }
+
+  // Full rows map parsed column index directly to TABLE::field[].
   size_t columnIndex = 0;
   for (Field **field = table->field; *field; field++) {
+    if (columnIndex >= ldbField.get_row_size()) break;  // short/trimmed value
     const auto mysqlFieldValue = ldbField.get_column_of_row(columnIndex++);
+    if (can_skip_unread_fields &&
+        !bitmap_is_set(table->read_set, (*field)->field_index())) {
+      continue;  // pure SELECT: column not read this statement
+    }
     if ((*field)->is_nullable() && (*field)->is_null_in_record(buf)) {
       (*field)->set_null();
     } else {

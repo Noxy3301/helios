@@ -229,6 +229,13 @@ message TxExecuteReadPlan {
         bool for_each = 9;
         bool reverse_scan = 10;
         PushedPredicate filter = 11; // Optional row filter for staged scans.
+        // Optional column subset for staged rows. The server keeps full null
+        // flags, sends only listed column values, and filters before trimming.
+        RowProjection projection = 12;
+    }
+    message RowProjection {
+        uint32 num_columns = 1; // table->s->fields
+        repeated uint32 field_indexes = 2 [packed = true]; // 0-based, sorted.
     }
     message StepResult {
         bool found = 1;
