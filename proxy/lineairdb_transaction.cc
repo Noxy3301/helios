@@ -291,6 +291,19 @@ void LineairDBTransaction::execute_read_plan(
   }
   if (steps.empty()) return;
 
+  // Suppress negative coverage only when this table has one filtered scan step;
+  // no later same-table point probe can need those rejected keys.
+  {
+    std::unordered_map<std::string, int> table_step_count;
+    for (const auto& s : steps) table_step_count[s.table_name]++;
+    for (auto& s : steps) {
+      if (s.is_scan && !s.serialized_filter.empty() &&
+          table_step_count[s.table_name] == 1) {
+        s.suppress_filtered_keys = true;
+      }
+    }
+  }
+
   rpc_trace_.record_local_view("plan_request:steps=" +
                                std::to_string(steps.size()));
   auto result = lineairdb_proxy->tx_execute_read_plan(steps);
