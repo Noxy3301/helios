@@ -403,6 +403,11 @@ void LineairDBTransaction::execute_read_plan(
           {step.table_name, step_result.actual_start_key,
            step_result.actual_end_key, step.reverse_scan, step.scan_limit,
            std::move(rows), std::move(row_tids)});
+      // Rejected primary keys become local not-found answers for later point
+      // probes into this filtered scan.
+      for (auto& fk : step_result.filtered_keys) {
+        record_row_cache(step.table_name, fk, false, "", 0, true);
+      }
     } else {
       // Keep secondary_keys and primary_keys aligned; lookup walks the pairs.
       LocalSecondaryScanEntry cached;
@@ -429,6 +434,11 @@ void LineairDBTransaction::execute_read_plan(
         cached.primary_keys.push_back(std::move(key));
       }
       push_secondary_scan_cache(std::move(cached));
+      // Secondary scans also register rejected primary keys as local not-found
+      // rows.
+      for (auto& fk : step_result.filtered_keys) {
+        record_row_cache(step.table_name, fk, false, "", 0, true);
+      }
     }
     step_result = LineairDBProxy::ReadPlanStepResult{};
   }

@@ -513,8 +513,9 @@ LineairDBProxy::ReadPlanResult LineairDBProxy::tx_execute_read_plan(
 
     // Native-endian bytes spell "LDBFLATP" (LineairDB flat payload).
     static constexpr uint64_t kFlatMagic = 0x5054414C4642444Cull;
+    static constexpr uint8_t kFlatVersion = 2;
     Reader r(raw.data(), raw.size());
-    if (r.u64() != kFlatMagic || r.u8() != 1) {
+    if (r.u64() != kFlatMagic || r.u8() != kFlatVersion) {
         LOG_ERROR("RPC failed: bad flat read-plan response header");
         return result;
     }
@@ -566,6 +567,10 @@ LineairDBProxy::ReadPlanResult LineairDBProxy::tx_execute_read_plan(
         out.group_end_keys.reserve(cap(n));
         for (uint64_t j = 0; j < n && r.ok; ++j)
             out.group_end_keys.push_back(r.bytes());
+        n = r.u64();
+        out.filtered_keys.reserve(cap(n));
+        for (uint64_t j = 0; j < n && r.ok; ++j)
+            out.filtered_keys.push_back(r.bytes());
         result.steps.push_back(std::move(out));
     }
     if (!r.ok) {

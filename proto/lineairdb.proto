@@ -246,6 +246,9 @@ message TxExecuteReadPlan {
         repeated uint32 group_sizes = 11;
         repeated bytes group_start_keys = 12;
         repeated bytes group_end_keys = 13;
+        // Primary keys rejected by the pushed scan filter. The proxy records
+        // them as negative row-cache entries for later point probes.
+        repeated bytes filtered_keys = 14;
     }
     message Request {
         repeated PlanStep steps = 1;

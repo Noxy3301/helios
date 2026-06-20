@@ -610,7 +610,7 @@ void LineairDBRpc::handleTxStatelessBatchRead(const std::string& message,
 namespace flat_plan {
 // Native-endian bytes spell "LDBFLATP" (LineairDB flat payload).
 static constexpr uint64_t kMagic = 0x5054414C4642444Cull;
-static constexpr uint8_t kVersion = 1;
+static constexpr uint8_t kVersion = 2;
 
 template <class Sink>
 void w_u8(Sink& out, uint8_t v) {
@@ -659,6 +659,8 @@ void encode_step(
     for (const auto& k : s.group_start_keys()) w_bytes(out, k);
     w_u64(out, static_cast<uint64_t>(s.group_end_keys_size()));
     for (const auto& k : s.group_end_keys()) w_bytes(out, k);
+    w_u64(out, static_cast<uint64_t>(s.filtered_keys_size()));
+    for (const auto& k : s.filtered_keys()) w_bytes(out, k);
 }
 
 // Destructive: release each StepResult after encoding it so large read-plan
@@ -846,7 +848,11 @@ void LineairDBRpc::handleTxExecuteReadPlan(const std::string& message,
                 return;
             }
             for (auto& row : scan_result.rows) {
-                if (!row_passes(row.value)) continue;
+                if (!row_passes(row.value)) {
+                    // Negative coverage for point probes into this scan.
+                    step_result->add_filtered_keys(std::move(row.key));
+                    continue;
+                }
                 step_result->add_scan_keys(std::move(row.key));
                 step_result->add_scan_values(std::move(row.value));
                 step_result->add_scan_tids(row.tid);
@@ -864,7 +870,11 @@ void LineairDBRpc::handleTxExecuteReadPlan(const std::string& message,
                 return;
             }
             for (auto& row : scan_result.rows) {
-                if (!row_passes(row.value)) continue;
+                if (!row_passes(row.value)) {
+                    // Secondary scans report rejected rows by primary key.
+                    step_result->add_filtered_keys(std::move(row.primary_key));
+                    continue;
+                }
                 step_result->add_secondary_keys(std::move(row.secondary_key));
                 step_result->add_scan_keys(std::move(row.primary_key));
                 step_result->add_scan_values(std::move(row.value));

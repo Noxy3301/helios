@@ -188,6 +188,8 @@ public:
         std::vector<uint32_t> group_sizes;
         std::vector<std::string> group_start_keys;
         std::vector<std::string> group_end_keys;
+        // Keys the step filter rejected (plain scans): negative coverage.
+        std::vector<std::string> filtered_keys;
     };
     struct ReadPlanResult {
         bool ok = false;

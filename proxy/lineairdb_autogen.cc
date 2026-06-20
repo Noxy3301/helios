@@ -9,6 +9,7 @@
 #include <vector>
 
 #include "lineairdb_keyenc.hh"
+#include "lineairdb_pushdown.hh"
 #include "my_base.h"
 #include "my_sys.h"
 #include "mysqld_error.h"
@@ -840,8 +841,7 @@ bool compile_index_search(TABLE *table, uint index,
  * additions.
  */
 bool compile_tree_leaves(
-    THD *thd, AccessPath *root, bool allow_filter_pushdown,
-    bool allow_limit_pushdown,
+    THD *thd, AccessPath *root, bool allow_limit_pushdown,
     std::unordered_map<TABLE *, int> *table_steps,
     std::vector<LineairDBProxy::ReadPlanStep> *steps,
     std::vector<TABLE *> *added_tables, UnsupportedQep *unsupported) {
@@ -908,13 +908,6 @@ bool compile_tree_leaves(
       }
     }
 
-    // Attach scan filters only when the caller allows filtered read-plan
-    // results. Callers that need a complete scanned key set pass false.
-    if (allow_filter_pushdown && step.is_scan && table->file != nullptr) {
-      step.serialized_filter =
-          down_cast<ha_lineairdb *>(table->file)->pushed_filter_for_autogen();
-    }
-
     (*table_steps)[table] = static_cast<int>(steps->size());
     added_tables->push_back(table);
     steps->push_back(std::move(step));
@@ -970,8 +963,8 @@ bool autogen_read_plan_from_qep(
   std::vector<TABLE *> added_tables;
   UnsupportedQep unsupported;
 
-  if (!compile_tree_leaves(thd, root, allow_filter_pushdown,
-                           /*allow_limit_pushdown=*/true, &table_steps, &steps,
+  if (!compile_tree_leaves(thd, root, /*allow_limit_pushdown=*/true,
+                           &table_steps, &steps,
                            &added_tables, &unsupported)) {
     return raise_unsupported(thd, unsupported.type, unsupported.reason);
   }
@@ -987,10 +980,9 @@ bool autogen_read_plan_from_qep(
       const size_t step_mark = steps.size();
       const size_t table_mark = added_tables.size();
       UnsupportedQep inner_unsupported;
-      if (!compile_tree_leaves(thd, inner_root, allow_filter_pushdown,
+      if (!compile_tree_leaves(thd, inner_root,
                                /*allow_limit_pushdown=*/false, &table_steps,
-                               &steps, &added_tables,
-                               &inner_unsupported)) {
+                               &steps, &added_tables, &inner_unsupported)) {
         steps.resize(step_mark);
         for (size_t i = table_mark; i < added_tables.size(); ++i) {
           table_steps.erase(added_tables[i]);
@@ -1002,6 +994,26 @@ bool autogen_read_plan_from_qep(
 
   if (steps.empty()) {
     return raise_unsupported(thd, root->type, "QEP has no stageable leaves");
+  }
+
+  // Attach scan filters after the full plan is known.
+  if (allow_filter_pushdown) {
+    std::unordered_map<std::string, int> table_step_count;
+    for (const auto &s : steps) table_step_count[s.table_name]++;
+    for (size_t i = 0; i < steps.size(); ++i) {
+      auto &s = steps[i];
+      if (!s.is_scan) continue;
+      // Rejected keys become table-level not-found cache entries. If the same
+      // physical table appears more than once, aliases may have different
+      // predicates, so skip filter pushdown for that table.
+      if (table_step_count[s.table_name] != 1) continue;
+      TABLE *t = i < added_tables.size() ? added_tables[i] : nullptr;
+      if (t == nullptr) continue;
+      std::string table_filter;
+      if (build_single_table_filter(thd, t, &table_filter)) {
+        s.serialized_filter = std::move(table_filter);
+      }
+    }
   }
 
   *out = std::move(steps);
