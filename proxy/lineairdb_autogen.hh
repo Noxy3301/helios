@@ -1,6 +1,9 @@
 #ifndef LINEAIRDB_AUTOGEN_HH
 #define LINEAIRDB_AUTOGEN_HH
 
+#include <cstdint>
+#include <string>
+#include <unordered_map>
 #include <vector>
 
 class THD;
@@ -39,5 +42,18 @@ bool autogen_read_plan_from_qep(
 bool autogen_read_plan_from_index_search(
     THD *thd, TABLE *table, uint index, const IndexSearchPlan &search,
     std::vector<LineairDBProxy::ReadPlanStep> *out);
+
+/**
+ * @brief Plan column projection for staged read-plan rows.
+ *
+ * @details For each physical table, union read_set across aliases and annotate
+ * eligible steps with the kept column ordinals. Column-form value bindings
+ * force their source column to stay in the projection and are remapped to the
+ * trimmed layout. Byte-slice bindings and generated-column tables ship full
+ * rows.
+ */
+void plan_projection_pushdown(
+    THD *thd, std::vector<LineairDBProxy::ReadPlanStep> *steps,
+    std::unordered_map<std::string, std::vector<uint32_t>> *kept_out);
 
 #endif

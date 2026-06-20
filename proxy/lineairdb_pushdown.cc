@@ -263,7 +263,122 @@ static bool item_is_limit_safe_filter(const Item *item) {
          item_is_limit_safe_scalar(args[1]);
 }
 
-// Push the SELECT WHERE into this transaction if LIMIT will depend on it
+/**
+ * @brief Collect predicates that reference only one table from an AND tree.
+ *
+ * @details Cross-table and constant predicates are skipped. Dropping them only
+ * relaxes the pushed filter, because MySQL still evaluates the full WHERE
+ * later.
+ */
+static void collect_table_local_predicates(Item *it, table_map me,
+                                           std::vector<Item *> *out) {
+  if (it == nullptr) return;
+  if (it->type() == Item::COND_ITEM &&
+      down_cast<Item_cond *>(it)->functype() == Item_func::COND_AND_FUNC) {
+    for (Item &child : *down_cast<Item_cond *>(it)->argument_list()) {
+      collect_table_local_predicates(&child, me, out);
+    }
+  } else if (it->used_tables() == me) {
+    out->push_back(it);
+  }
+}
+
+/**
+ * @brief Serialize the table-local necessary condition of an OR predicate.
+ *
+ * @details Every OR branch must constrain this table. If one branch does not,
+ * pushing the OR would be stricter than the query, so this returns false.
+ *
+ * @return true when the OR has a safe table-local predicate.
+ */
+static bool serialize_or_necessary_condition(
+    Item *or_item, table_map me, LineairDB::Protocol::FilterExpr *out) {
+  if (or_item == nullptr || or_item->type() != Item::COND_ITEM ||
+      down_cast<Item_cond *>(or_item)->functype() != Item_func::COND_OR_FUNC)
+    return false;
+  out->set_op(LineairDB::Protocol::FilterExpr::OP_OR);
+
+  // Every OR branch must have a predicate for this table.
+  for (Item &disj : *down_cast<Item_cond *>(or_item)->argument_list()) {
+    std::vector<Item *> branch_predicates;
+    collect_table_local_predicates(&disj, me, &branch_predicates);
+    if (branch_predicates.empty()) return false;  // unconstrained branch
+
+    // Multiple predicates in one branch stay grouped under AND.
+    LineairDB::Protocol::FilterExpr branch;
+    if (branch_predicates.size() == 1) {
+      if (!serialize_item(branch_predicates[0], &branch)) return false;
+    } else {
+      branch.set_op(LineairDB::Protocol::FilterExpr::OP_AND);
+      for (Item *predicate : branch_predicates)
+        if (!serialize_item(predicate, branch.add_children())) return false;
+    }
+    *out->add_children() = std::move(branch);
+  }
+  return out->children_size() > 0;
+}
+
+bool build_single_table_filter(THD *thd, TABLE *table,
+                               std::string *out_serialized) {
+  if (out_serialized == nullptr) return false;
+  out_serialized->clear();
+  if (thd == nullptr || table == nullptr || table->s == nullptr) return false;
+  if (table->pos_in_table_list == nullptr) return false;
+
+  // Read the WHERE from the query block that owns this table reference.
+  Query_block *qb = table->pos_in_table_list->query_block;
+  if (qb == nullptr) return false;
+  Item *where = qb->where_cond();
+  if (where == nullptr) return false;
+
+  const table_map me = table->pos_in_table_list->map();
+
+  std::vector<LineairDB::Protocol::FilterExpr> serialized;
+
+  // Split only the top-level AND; each conjunct can be pushed independently.
+  std::vector<Item *> conjuncts;
+  if (where->type() == Item::COND_ITEM &&
+      down_cast<Item_cond *>(where)->functype() == Item_func::COND_AND_FUNC) {
+    for (Item &c : *down_cast<Item_cond *>(where)->argument_list())
+      conjuncts.push_back(&c);
+  } else {
+    conjuncts.push_back(where);
+  }
+
+  // Serialize table-local predicates. OR must be safe as a necessary condition.
+  for (Item *c : conjuncts) {
+    if (c->type() == Item::COND_ITEM &&
+        down_cast<Item_cond *>(c)->functype() == Item_func::COND_OR_FUNC) {
+      LineairDB::Protocol::FilterExpr or_expr;
+      if (serialize_or_necessary_condition(c, me, &or_expr))
+        serialized.push_back(std::move(or_expr));
+    } else {
+      std::vector<Item *> table_predicates;
+      collect_table_local_predicates(c, me, &table_predicates);
+      for (Item *predicate : table_predicates) {
+        LineairDB::Protocol::FilterExpr expr;
+        if (serialize_item(predicate, &expr))
+          serialized.push_back(std::move(expr));
+      }
+    }
+  }
+  if (serialized.empty()) return false;
+
+  // Combine all pushed pieces with AND and attach the table column count.
+  LineairDB::Protocol::PushedPredicate predicate;
+  predicate.set_num_columns(table->s->fields);
+  if (serialized.size() == 1) {
+    *predicate.mutable_expr() = std::move(serialized[0]);
+  } else {
+    auto *root = predicate.mutable_expr();
+    root->set_op(LineairDB::Protocol::FilterExpr::OP_AND);
+    for (auto &expr : serialized) *root->add_children() = std::move(expr);
+  }
+  predicate.SerializeToString(out_serialized);
+  return !out_serialized->empty();
+}
+
+// Push the SELECT WHERE into this transaction if LIMIT will depend on it.
 bool prepare_select_filter_for_tx(THD *thd, TABLE *table,
                                   LineairDBTransaction *tx,
                                   std::string *serialized_filter) {

@@ -244,21 +244,65 @@ void LineairDBTransaction::execute_read_plan(
   if (!prefetch_mode_ || full_steps.empty()) return;
 
   // Exact point reads already covered by the local view need no staging RPC.
+  // Referenced steps must survive because later bindings/semijoins point at
+  // them by source_step index.
+  std::vector<bool> referenced(full_steps.size(), false);
+  for (const auto& step : full_steps) {
+    for (const auto& b : step.bindings) {
+      if (b.source_step < referenced.size()) referenced[b.source_step] = true;
+    }
+    for (const auto& b : step.end_bindings) {
+      if (b.source_step < referenced.size()) referenced[b.source_step] = true;
+    }
+    for (const auto& sj : step.semijoins) {
+      if (sj.source_step < referenced.size())
+        referenced[sj.source_step] = true;
+    }
+  }
+
   std::vector<LineairDBProxy::ReadPlanStep> steps;
   steps.reserve(full_steps.size());
-  for (const auto& step : full_steps) {
+  std::vector<uint32_t> new_index(full_steps.size(), 0);
+  size_t covered = 0;
+  for (size_t si = 0; si < full_steps.size(); ++si) {
+    const auto& step = full_steps[si];
     const bool constant_point_read = !step.is_scan && !step.for_each &&
                                      step.bindings.empty() &&
                                      step.end_bindings.empty() &&
                                      !step.key_prefix.empty();
-    if (constant_point_read &&
+    if (constant_point_read && !referenced[si] &&
         (lookup_write_set(step.table_name, step.key_prefix) ||
          lookup_row_cache(step.table_name, step.key_prefix))) {
+      ++covered;
       continue;
     }
+    new_index[si] = static_cast<uint32_t>(steps.size());
     steps.push_back(step);
   }
+  if (covered > 0) {
+    // Remap source_step after dropping covered point reads.
+    for (auto& step : steps) {
+      for (auto& b : step.bindings) b.source_step = new_index[b.source_step];
+      for (auto& b : step.end_bindings)
+        b.source_step = new_index[b.source_step];
+      for (auto& sj : step.semijoins)
+        sj.source_step = new_index[sj.source_step];
+    }
+  }
   if (steps.empty()) return;
+
+  // Suppress negative coverage only when this table has one filtered scan step;
+  // no later same-table point probe can need those rejected keys.
+  {
+    std::unordered_map<std::string, int> table_step_count;
+    for (const auto& s : steps) table_step_count[s.table_name]++;
+    for (auto& s : steps) {
+      if (s.is_scan && !s.serialized_filter.empty() &&
+          table_step_count[s.table_name] == 1) {
+        s.suppress_filtered_keys = true;
+      }
+    }
+  }
 
   rpc_trace_.record_local_view("plan_request:steps=" +
                                std::to_string(steps.size()));
@@ -403,6 +447,11 @@ void LineairDBTransaction::execute_read_plan(
           {step.table_name, step_result.actual_start_key,
            step_result.actual_end_key, step.reverse_scan, step.scan_limit,
            std::move(rows), std::move(row_tids)});
+      // Rejected primary keys become local not-found answers for later point
+      // probes into this filtered scan.
+      for (auto& fk : step_result.filtered_keys) {
+        record_row_cache(step.table_name, fk, false, "", 0, true);
+      }
     } else {
       // Keep secondary_keys and primary_keys aligned; lookup walks the pairs.
       LocalSecondaryScanEntry cached;
@@ -429,6 +478,11 @@ void LineairDBTransaction::execute_read_plan(
         cached.primary_keys.push_back(std::move(key));
       }
       push_secondary_scan_cache(std::move(cached));
+      // Secondary scans also register rejected primary keys as local not-found
+      // rows.
+      for (auto& fk : step_result.filtered_keys) {
+        record_row_cache(step.table_name, fk, false, "", 0, true);
+      }
     }
     step_result = LineairDBProxy::ReadPlanStepResult{};
   }

@@ -172,6 +172,21 @@ public:
         bool reverse_scan = false;
         // Serialized PushedPredicate; empty means no server-side filter.
         std::string serialized_filter;
+        // Projection pushdown: kept 0-based TABLE::field[] ordinals (ascending,
+        // unique). Empty = ship full rows. num_columns = table->s->fields.
+        std::vector<uint32_t> projection;
+        uint32_t projection_num_columns = 0;
+        // Semijoin reduction: keep probe rows only when their join key appears
+        // in an earlier source step.
+        struct Semijoin {
+            uint32_t source_step = 0;
+            uint32_t source_column = 0;
+            uint32_t probe_column = 0;
+            std::string source_filter;
+        };
+        std::vector<Semijoin> semijoins;
+        // Drop filtered_keys when no later same-table probe can need them.
+        bool suppress_filtered_keys = false;
     };
     struct ReadPlanStepResult {
         bool found = false;
@@ -188,6 +203,8 @@ public:
         std::vector<uint32_t> group_sizes;
         std::vector<std::string> group_start_keys;
         std::vector<std::string> group_end_keys;
+        // Keys the step filter rejected (plain scans): negative coverage.
+        std::vector<std::string> filtered_keys;
     };
     struct ReadPlanResult {
         bool ok = false;

@@ -153,6 +153,18 @@ private:
   // rows are only a LIMIT-staged window. index_next()/index_next_same() consume
   // it and abort on over-read instead of returning a false EOF.
   bool materialized_scan_truncated_{false};
+  // Per-statement memo for set_fields_from_lineairdb.
+  // Refreshed when query_id or projection registration epoch changes.
+  uint64_t serve_memo_query_id_{0};
+  uint64_t serve_memo_proj_epoch_{0};
+
+  // Projection layout for the table currently being decoded; nullptr means
+  // rows are full-width.
+  const std::vector<uint32_t> *serve_memo_projection_{nullptr};
+
+  // True when this statement can skip Field::store outside read_set.
+  bool serve_memo_can_skip_unread_fields_{false};
+
   std::string last_fetched_primary_key_;
   std::string end_range_exclusive_key_; // For HA_READ_BEFORE_KEY: exclude this key from results
   my_off_t

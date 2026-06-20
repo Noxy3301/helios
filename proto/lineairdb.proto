@@ -229,6 +229,27 @@ message TxExecuteReadPlan {
         bool for_each = 9;
         bool reverse_scan = 10;
         PushedPredicate filter = 11; // Optional row filter for staged scans.
+        // Optional column subset for staged rows. The server keeps full null
+        // flags, sends only listed column values, and filters before trimming.
+        RowProjection projection = 12;
+        // Optional membership reduction for high-fanout join probes.
+        repeated SemijoinFilter semijoins = 14;
+        // Drop filtered_keys when no later same-table probe can need negative
+        // coverage for rows rejected by the pushed filter.
+        bool suppress_filtered_keys = 15;
+    }
+    // Drop probe rows whose join key is absent from an earlier step's result.
+    // Columns are 0-based TABLE::field[] ordinals.
+    message SemijoinFilter {
+        uint32 source_step = 1;
+        uint32 source_column = 2;
+        uint32 probe_column = 3;
+        // Optional filter applied while building the source membership set.
+        PushedPredicate source_filter = 4;
+    }
+    message RowProjection {
+        uint32 num_columns = 1; // table->s->fields
+        repeated uint32 field_indexes = 2 [packed = true]; // 0-based, sorted.
     }
     message StepResult {
         bool found = 1;
@@ -246,6 +267,9 @@ message TxExecuteReadPlan {
         repeated uint32 group_sizes = 11;
         repeated bytes group_start_keys = 12;
         repeated bytes group_end_keys = 13;
+        // Primary keys rejected by the pushed scan filter. The proxy records
+        // them as negative row-cache entries for later point probes.
+        repeated bytes filtered_keys = 14;
     }
     message Request {
         repeated PlanStep steps = 1;

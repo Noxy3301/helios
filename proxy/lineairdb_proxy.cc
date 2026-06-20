@@ -439,8 +439,23 @@ LineairDBProxy::ReadPlanResult LineairDBProxy::tx_execute_read_plan(
         out->set_index_name(step.index_name);
         out->set_for_each(step.for_each);
         out->set_reverse_scan(step.reverse_scan);
+        out->set_suppress_filtered_keys(step.suppress_filtered_keys);
         if (!step.serialized_filter.empty()) {
             out->mutable_filter()->ParseFromString(step.serialized_filter);
+        }
+        if (!step.projection.empty() && step.projection_num_columns > 0) {
+            auto* p = out->mutable_projection();
+            p->set_num_columns(step.projection_num_columns);
+            for (uint32_t f : step.projection) p->add_field_indexes(f);
+        }
+        for (const auto& sj : step.semijoins) {
+            auto* o = out->add_semijoins();
+            o->set_source_step(sj.source_step);
+            o->set_source_column(sj.source_column);
+            o->set_probe_column(sj.probe_column);
+            if (!sj.source_filter.empty()) {
+                o->mutable_source_filter()->ParseFromString(sj.source_filter);
+            }
         }
         for (const auto& binding : step.bindings) {
             auto* b = out->add_bindings();
@@ -513,8 +528,9 @@ LineairDBProxy::ReadPlanResult LineairDBProxy::tx_execute_read_plan(
 
     // Native-endian bytes spell "LDBFLATP" (LineairDB flat payload).
     static constexpr uint64_t kFlatMagic = 0x5054414C4642444Cull;
+    static constexpr uint8_t kFlatVersion = 2;
     Reader r(raw.data(), raw.size());
-    if (r.u64() != kFlatMagic || r.u8() != 1) {
+    if (r.u64() != kFlatMagic || r.u8() != kFlatVersion) {
         LOG_ERROR("RPC failed: bad flat read-plan response header");
         return result;
     }
@@ -566,6 +582,10 @@ LineairDBProxy::ReadPlanResult LineairDBProxy::tx_execute_read_plan(
         out.group_end_keys.reserve(cap(n));
         for (uint64_t j = 0; j < n && r.ok; ++j)
             out.group_end_keys.push_back(r.bytes());
+        n = r.u64();
+        out.filtered_keys.reserve(cap(n));
+        for (uint64_t j = 0; j < n && r.ok; ++j)
+            out.filtered_keys.push_back(r.bytes());
         result.steps.push_back(std::move(out));
     }
     if (!r.ok) {
