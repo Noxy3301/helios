@@ -234,9 +234,6 @@ message TxExecuteReadPlan {
         RowProjection projection = 12;
         // Optional membership reduction for high-fanout join probes.
         repeated SemijoinFilter semijoins = 14;
-        // Drop filtered_keys when no later same-table probe can need negative
-        // coverage for rows rejected by the pushed filter.
-        bool suppress_filtered_keys = 15;
     }
     // Drop probe rows whose join key is absent from an earlier step's result.
     // Columns are 0-based TABLE::field[] ordinals.

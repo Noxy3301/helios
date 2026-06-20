@@ -185,8 +185,6 @@ public:
             std::string source_filter;
         };
         std::vector<Semijoin> semijoins;
-        // Drop filtered_keys when no later same-table probe can need them.
-        bool suppress_filtered_keys = false;
     };
     struct ReadPlanStepResult {
         bool found = false;

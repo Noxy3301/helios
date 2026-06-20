@@ -777,9 +777,6 @@ void LineairDBRpc::handleTxExecuteReadPlan(const std::string& message,
             }
             return step_eval.evaluate(*step_filter);
         };
-        // Negative-coverage keys are dead weight when the planner proved no
-        // other step reads this table (see PlanStep.suppress_filtered_keys).
-        const bool suppress_fkeys = step.suppress_filtered_keys();
 
         // Filters read the full row. Projection then trims emitted VALUES to
         // the kept columns; malformed rows fail the plan instead of mixing
@@ -976,8 +973,7 @@ void LineairDBRpc::handleTxExecuteReadPlan(const std::string& message,
             for (auto& row : scan_result.rows) {
                 if (!row_passes(row.value)) {
                     // Negative coverage for point probes into this scan.
-                    if (!suppress_fkeys)
-                        step_result->add_filtered_keys(std::move(row.key));
+                    step_result->add_filtered_keys(std::move(row.key));
                     continue;
                 }
                 step_result->add_scan_keys(std::move(row.key));
@@ -999,8 +995,7 @@ void LineairDBRpc::handleTxExecuteReadPlan(const std::string& message,
             for (auto& row : scan_result.rows) {
                 if (!row_passes(row.value)) {
                     // Secondary scans report rejected rows by primary key.
-                    if (!suppress_fkeys)
-                        step_result->add_filtered_keys(std::move(row.primary_key));
+                    step_result->add_filtered_keys(std::move(row.primary_key));
                     continue;
                 }
                 step_result->add_secondary_keys(std::move(row.secondary_key));
