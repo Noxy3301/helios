@@ -46,6 +46,7 @@
 
 #include <array>
 #include <atomic>
+#include <cmath>
 #include <cstdint>
 #include <mutex>
 #include <unordered_map>
@@ -378,6 +379,15 @@ public:
     return v;
   }
 
+  // C_materialise: one remote PK row fetch after a non-covering secondary scan.
+  // 8.0 is an inflated steering value: it makes large row-by-row materialization
+  // lose to bulk full-scan+prefetch even when cardinality is underestimated.
+  static double kC_materialise() {
+    static const double v =
+        helios_cost_param("HELIOS_C_MATERIALISE", 8.0);
+    return v;
+  }
+
   double helios_row_bytes() const {
     // stats.mean_rec_length is set in info() from table->s->reclength (>=100).
     // Must NOT deref table->s here: TABLE is incomplete in this header.
@@ -407,7 +417,14 @@ public:
   Cost_estimate read_cost(uint index [[maybe_unused]], double ranges,
                           double rows) override
   {
-    return helios_ref_cost(ranges, rows);
+    Cost_estimate c = helios_ref_cost(ranges, rows);
+
+    // read_cost() is the non-covering path: the index narrows keys, then each
+    // matching base row is fetched by PK. Charge that row materialization here;
+    // covering scans use index_scan_cost() and stay cheap.
+    c.add_io(std::ceil(rows / kEffBatch()) * kC_rpc());
+    c.add_cpu(rows * kC_materialise());
+    return c;
   }
 
   Cost_estimate index_scan_cost(uint index [[maybe_unused]], double ranges,
