@@ -806,6 +806,8 @@ std::string build_plan_key(
 std::mutex LineairDBRpc::ndv_cache_mu_;
 std::unordered_map<std::string, std::pair<bool, std::vector<uint64_t>>>
     LineairDBRpc::ndv_cache_;
+std::unordered_map<std::string, LineairDBRpc::HistEntry>
+    LineairDBRpc::hist_cache_;
 
 LineairDBRpc::LineairDBRpc(std::shared_ptr<DatabaseManager> db_manager,
                            std::shared_ptr<TransactionManager> tx_manager,
@@ -1026,6 +1028,42 @@ void LineairDBRpc::handleTxGetTableStats(const std::string& message,
             out->set_available(available);
             if (available) {
                 for (uint64_t value : ndv) out->add_ndv(value);
+            }
+
+            constexpr uint32_t kHistogramBuckets = 64;
+            HistEntry hist;
+            bool hist_cached = false;
+            {
+                std::lock_guard<std::mutex> lock(ndv_cache_mu_);
+                if (request.ndv_force_recompute()) hist_cache_.erase(cache_key);
+                auto it = hist_cache_.find(cache_key);
+                if (it != hist_cache_.end()) {
+                    hist_cached = true;
+                    hist = it->second;
+                }
+            }
+
+            if (!hist_cached) {
+                hist.available = db && db->ComputeIndexHistogram(
+                                            request.ndv_table(),
+                                            desc.index_name(),
+                                            kHistogramBuckets,
+                                            hist.bounds,
+                                            hist.cum);
+                if (!hist.available) {
+                    hist.bounds.clear();
+                    hist.cum.clear();
+                }
+                std::lock_guard<std::mutex> lock(ndv_cache_mu_);
+                hist_cache_[cache_key] = hist;
+            }
+
+            out->set_hist_available(hist.available);
+            if (hist.available) {
+                for (const auto& bound : hist.bounds)
+                    out->add_hist_bounds(bound);
+                for (uint64_t value : hist.cum)
+                    out->add_hist_cum(value);
             }
         }
     }

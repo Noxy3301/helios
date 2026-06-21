@@ -112,6 +112,7 @@
 #include <strings.h>
 
 #include "lineairdb_field_types.h"
+#include "lineairdb_keyenc.hh"
 #include "lineairdb_prefetch.hh"
 #include "lineairdb_pushdown.hh"
 #include "lineairdb.pb.h"
@@ -1898,10 +1899,10 @@ bool ha_lineairdb::seed_row_count_from_cache(LineairDBProxy *proxy) {
 }
 
 /**
- * @brief Copy the proxy's latest per-index NDV results into the shared table
+ * @brief Copy the proxy's latest per-index optimizer stats into shared table
  * metadata.
  */
-void ha_lineairdb::load_index_ndv_from_cache(LineairDBProxy *proxy) {
+void ha_lineairdb::load_index_stats_from_cache(LineairDBProxy *proxy) {
   if (proxy == nullptr || share == nullptr)
     return;
 
@@ -1909,9 +1910,32 @@ void ha_lineairdb::load_index_ndv_from_cache(LineairDBProxy *proxy) {
       share->stats_base_records.load(std::memory_order_relaxed);
   std::lock_guard<std::mutex> lock(share->index_ndv_mu_);
   share->index_ndv_.clear();
+  share->index_hist_.clear();
   for (const auto &entry : proxy->last_index_ndv()) {
     if (entry.second.available)
       share->index_ndv_[entry.first] = entry.second.values;
+  }
+  for (const auto &entry : proxy->last_index_hist()) {
+    const auto &hist = entry.second;
+    if (!hist.available || hist.bounds.empty() ||
+        hist.bounds.size() != hist.cum.size())
+      continue;
+
+    bool monotone = true;
+    for (size_t i = 1; i < hist.cum.size(); ++i) {
+      if (hist.cum[i] < hist.cum[i - 1] ||
+          hist.bounds[i] < hist.bounds[i - 1]) {
+        monotone = false;
+        break;
+      }
+    }
+    if (!monotone)
+      continue;
+
+    LineairDB_share::RangeHist range_hist;
+    range_hist.bounds = hist.bounds;
+    range_hist.cum = hist.cum;
+    share->index_hist_[entry.first] = std::move(range_hist);
   }
   share->index_ndv_records_.store(records, std::memory_order_relaxed);
   share->index_ndv_loaded_.store(true, std::memory_order_relaxed);
@@ -1992,7 +2016,7 @@ void ha_lineairdb::seed_optimizer_stats() {
     if (fetched) {
       seed_row_count_from_cache(ctx->proxy.get());
       if (requested_ndv)
-        load_index_ndv_from_cache(ctx->proxy.get());
+        load_index_stats_from_cache(ctx->proxy.get());
     }
   }
 }
@@ -2690,6 +2714,59 @@ ha_rows ha_lineairdb::records_in_range(uint inx, key_range *min_key,
       estimate = std::max(static_cast<ha_rows>(2), total_records / 20);
     } else {
       estimate = std::max(static_cast<ha_rows>(2), total_records / 10);
+    }
+
+    // Leading-key range histogram: use the server-built cumulative counts as
+    // a floor over the heuristic. Missing or malformed stats keep the heuristic.
+    const bool is_primary = table->s != nullptr && inx == table->s->primary_key;
+    const std::string index_name =
+        is_primary ? std::string() : std::string(key->name ? key->name : "");
+    if (share != nullptr) {
+      std::lock_guard<std::mutex> lock(share->index_ndv_mu_);
+      auto hist_it = share->index_hist_.find(index_name);
+      if (hist_it != share->index_hist_.end()) {
+        const LineairDB_share::RangeHist &hist = hist_it->second;
+        if (!hist.bounds.empty() && hist.bounds.size() == hist.cum.size()) {
+          auto rank_le = [&](const std::string &encoded_key) -> double {
+            if (encoded_key >= hist.bounds.back())
+              return static_cast<double>(hist.cum.back());
+            auto it =
+                std::upper_bound(hist.bounds.begin(), hist.bounds.end(),
+                                 encoded_key);
+            if (it == hist.bounds.begin())
+              return 0.0;
+            const size_t pos =
+                static_cast<size_t>((it - hist.bounds.begin()) - 1);
+            return static_cast<double>(hist.cum[pos]);
+          };
+
+          constexpr key_part_map kLeadingPart = 1;
+          bool enc_ok = true;
+          double lo = 0.0;
+          double hi = static_cast<double>(hist.cum.back());
+          if (min_key != nullptr) {
+            std::string encoded = lineairdb_keyenc::convert_key_to_ldbformat(
+                table, inx, min_key->key, kLeadingPart);
+            if (encoded.empty())
+              enc_ok = false;
+            else
+              lo = rank_le(encoded);
+          }
+          if (enc_ok && max_key != nullptr) {
+            std::string encoded = lineairdb_keyenc::convert_key_to_ldbformat(
+                table, inx, max_key->key, kLeadingPart);
+            if (encoded.empty())
+              enc_ok = false;
+            else
+              hi = rank_le(encoded);
+          }
+          const double hist_est = enc_ok ? (hi - lo) : -1.0;
+          if (hist_est >= 1.0 &&
+              static_cast<ha_rows>(hist_est) > estimate) {
+            estimate = static_cast<ha_rows>(hist_est);
+          }
+        }
+      }
     }
   }
 

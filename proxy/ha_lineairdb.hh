@@ -98,6 +98,14 @@ public:
 
   // ANALYZE TABLE sets this so the next NDV fetch recomputes server stats.
   std::atomic<bool> index_ndv_force_refresh_{false};
+
+  // Per-index range histogram on the leading key part. Empty index name means
+  // primary key. Guarded by index_ndv_mu_ and refreshed with NDV stats.
+  struct RangeHist {
+    std::vector<std::string> bounds;
+    std::vector<uint64_t> cum;
+  };
+  std::unordered_map<std::string, RangeHist> index_hist_;
 };
 
 // LIMIT and direction that a handler range scan may push to LineairDB.
@@ -697,7 +705,7 @@ private:
 
   // rec_per_key helpers
   bool seed_row_count_from_cache(LineairDBProxy *proxy);
-  void load_index_ndv_from_cache(LineairDBProxy *proxy);
+  void load_index_stats_from_cache(LineairDBProxy *proxy);
   void mark_stale_index_ndv_for_select();
   void seed_optimizer_stats();
   void set_generic_rec_per_key(KEY *key, uint key_parts, bool is_primary);

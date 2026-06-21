@@ -114,6 +114,11 @@ message GetTableStats {
         string index_name = 1;
         bool available = 2; // False when NDV is unavailable for this index.
         repeated uint64 ndv = 3;
+        // Leading-key range histogram. bounds[i] is a raw encoded leading-key
+        // boundary; cum[i] is the cumulative live-row count up to that bound.
+        repeated bytes hist_bounds = 4;
+        repeated uint64 hist_cum = 5;
+        bool hist_available = 6;
     }
     message Response {
         repeated TableRowCount table_stats = 1;

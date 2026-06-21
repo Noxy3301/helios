@@ -108,6 +108,11 @@ public:
         // values[i] is the NDV for the first i+1 key parts.
         std::vector<uint64_t> values;
     };
+    struct IndexHistResult {
+        bool available = false;
+        std::vector<std::string> bounds;
+        std::vector<uint64_t> cum;
+    };
     // Refresh row counts, and optionally per-index NDV for one table.
     bool fetch_table_stats(
         const std::string& ndv_table = std::string(),
@@ -115,6 +120,9 @@ public:
         bool force_ndv = false);
     const std::unordered_map<std::string, IndexNdvResult>& last_index_ndv() const {
         return last_index_ndv_;
+    }
+    const std::unordered_map<std::string, IndexHistResult>& last_index_hist() const {
+        return last_index_hist_;
     }
     void tx_abort(int64_t tx_id);
 
@@ -333,6 +341,7 @@ public:
 private:
     std::unordered_map<std::string, int64_t> table_stats_cache_;
     std::unordered_map<std::string, IndexNdvResult> last_index_ndv_;
+    std::unordered_map<std::string, IndexHistResult> last_index_hist_;
     template<typename RequestType, typename ResponseType>
     bool send_protobuf_message(const RequestType& request, ResponseType& response,
                                MessageType message_type, const std::string& meta = "");

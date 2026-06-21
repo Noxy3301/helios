@@ -53,6 +53,14 @@ private:
     static std::unordered_map<std::string,
                               std::pair<bool, std::vector<uint64_t>>> ndv_cache_;
 
+    // Range histogram cache shared with the NDV stats fetch path.
+    struct HistEntry {
+        bool available = false;
+        std::vector<std::string> bounds;
+        std::vector<uint64_t> cum;
+    };
+    static std::unordered_map<std::string, HistEntry> hist_cache_;
+
     // Transaction lifecycle
     void handleTxBeginTransaction(const std::string& message, std::string& result);
     void handleTxGetTableStats(const std::string& message, std::string& result);
