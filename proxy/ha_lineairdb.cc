@@ -1746,9 +1746,8 @@ bool ha_lineairdb::tx_is_aborted() {
  * @brief Return whether server aggregation may use read-only no-validation.
  */
 bool ha_lineairdb::tx_ro_novalidate() {
-  // The override decides server-side aggregation before the read path sets
-  // ro_novalidate_, so consult the sysvar gate directly.
-  return srv_prefetch_ro_novalidate;
+  // Server aggregation consumes staged group rows, so require prefetch mode.
+  return srv_prefetch_execution && srv_prefetch_ro_novalidate;
 }
 
 /**

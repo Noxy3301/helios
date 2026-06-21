@@ -490,21 +490,22 @@ bool prepare_select_filter_for_tx(THD *thd, TABLE *table,
     return true;                                     // No WHERE to push
   }
 
-  // Convert WHERE into the existing predicate protobuf format.
-  LineairDB::Protocol::PushedPredicate predicate;
-  predicate.set_num_columns(table->s->fields);
-  if (!serialize_item(where, predicate.mutable_expr())) {
+  // Push only predicates that can be evaluated on this table's rows.
+  std::string encoded;
+  if (!build_single_table_filter(thd, table, &encoded) || encoded.empty()) {
     if (serialized_filter != nullptr) serialized_filter->clear();
     tx->clear_pushed_filter();
     return false;                                    // MySQL must filter
   }
 
   // Attach the encoded filter to the transaction for the next scan RPC.
-  std::string encoded;
-  predicate.SerializeToString(&encoded);
   if (serialized_filter != nullptr) {
     *serialized_filter = encoded;
   }
   tx->set_pushed_filter(encoded);
-  return item_is_limit_safe_filter(where);
+
+  // LIMIT pushdown is safe only when the table-local filter is the whole WHERE.
+  if (table->pos_in_table_list == nullptr) return false;
+  const table_map me = table->pos_in_table_list->map();
+  return where->used_tables() == me && item_is_limit_safe_filter(where);
 }
