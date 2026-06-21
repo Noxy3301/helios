@@ -578,6 +578,142 @@ static bool parallel_primary_aggregate_scan(
     return true;
 }
 
+/**
+ * @brief Scan integer primary-key slices in parallel for filtered base rows.
+ *
+ * @return true when rows were emitted; false lets the caller use the serial
+ * scan path.
+ */
+static bool parallel_primary_filter_scan(
+    LineairDB::Database* db,
+    const LineairDB::Protocol::TxExecuteReadPlan::PlanStep& step,
+    const std::string& start_key, const std::string& end_key,
+    LineairDB::Protocol::TxExecuteReadPlan::StepResult* step_result) {
+    if (db == nullptr) return false;
+
+    const size_t morsel_rows = 128000;  // FIXME: make configurable
+    const size_t min_rows = 500000;     // FIXME: make configurable
+    const unsigned nproc = std::thread::hardware_concurrency();
+    const unsigned max_threads =
+        std::min<unsigned>(nproc ? nproc : 4, 8);  // FIXME: make configurable
+    if (max_threads <= 1) return false;
+
+    // Probe the actual key span before creating split boundaries.
+    auto first = db->StatelessRangeScan(step.table_name(), start_key, end_key,
+                                        1, false);
+    if (!first.ok || first.rows.empty()) return false;
+    auto last = db->StatelessRangeScan(step.table_name(), start_key, end_key,
+                                       1, true);
+    if (!last.ok || last.rows.empty()) return false;
+
+    int64_t lo = 0;
+    int64_t hi = 0;
+    if (!decode_leading_int_key(first.rows.front().key, lo) ||
+        !decode_leading_int_key(last.rows.front().key, hi)) {
+        return false;
+    }
+    if (hi <= lo) return false;
+
+    const uint64_t span = static_cast<uint64_t>(hi - lo) + 1;
+    if (span < min_rows) return false;
+    const size_t desired_workers =
+        morsel_rows > 0 ? (span + morsel_rows - 1) / morsel_rows : 1;
+    const unsigned worker_count =
+        static_cast<unsigned>(std::min<size_t>(desired_workers, max_threads));
+    if (worker_count <= 1) return false;
+
+    // Interior bounds are integer key prefixes; each slice is [start, end).
+    std::vector<std::string> starts(worker_count);
+    std::vector<std::string> ends(worker_count);
+    for (unsigned i = 0; i < worker_count; ++i) {
+        const int64_t begin_value =
+            lo + static_cast<int64_t>((span * i) / worker_count);
+        const int64_t end_value =
+            (i + 1 == worker_count)
+                ? hi + 1
+                : lo + static_cast<int64_t>((span * (i + 1)) / worker_count);
+        starts[i] = (i == 0) ? start_key : encode_int_key_part(begin_value);
+        ends[i] = (i + 1 == worker_count) ? end_key
+                                          : encode_int_key_part(end_value);
+    }
+
+    struct WorkerOut {
+        std::vector<std::string> keys;
+        std::vector<std::string> values;
+        std::vector<std::string> filtered_keys;
+        std::vector<uint64_t> tids;
+    };
+    std::vector<WorkerOut> outputs(worker_count);
+    std::vector<char> failed(worker_count, 0);
+    const bool has_projection = step.has_projection();
+    std::vector<std::thread> workers;
+    workers.reserve(worker_count);
+
+    for (unsigned worker_index = 0; worker_index < worker_count;
+         ++worker_index) {
+        workers.emplace_back([&, worker_index] {
+            auto scan_result =
+                db->StatelessRangeScan(step.table_name(),
+                                       starts[worker_index],
+                                       ends[worker_index], 0, false);
+            if (!scan_result.ok) {
+                failed[worker_index] = 1;
+                db->ReleaseMasstreeThreadEpoch();
+                return;
+            }
+
+            PredicateEvaluator evaluator;
+            WorkerOut& out = outputs[worker_index];
+            out.keys.reserve(scan_result.rows.size());
+            for (auto& row : scan_result.rows) {
+                bool pass = true;
+                if (evaluator.parse_row(row.value.data(), row.value.size(),
+                                        step.filter().num_columns())) {
+                    pass = evaluator.evaluate(step.filter().expr());
+                }
+                // Unparseable rows are shipped so MySQL can re-check them.
+                if (!pass) {
+                    out.filtered_keys.push_back(std::move(row.key));
+                    continue;
+                }
+
+                if (has_projection && !row.value.empty()) {
+                    std::string trimmed;
+                    if (!trim_row_value(row.value,
+                                        step.projection().field_indexes(),
+                                        step.projection().num_columns(),
+                                        trimmed)) {
+                        failed[worker_index] = 1;
+                        break;
+                    }
+                    row.value = std::move(trimmed);
+                }
+                out.keys.push_back(std::move(row.key));
+                out.values.push_back(std::move(row.value));
+                out.tids.push_back(row.tid);
+            }
+            db->ReleaseMasstreeThreadEpoch();
+        });
+    }
+    for (auto& worker : workers) worker.join();
+    for (char worker_failed : failed) {
+        if (worker_failed) return false;
+    }
+
+    // Append worker chunks in range order to match the serial scan output.
+    for (WorkerOut& out : outputs) {
+        for (size_t i = 0; i < out.keys.size(); ++i) {
+            step_result->add_scan_keys(std::move(out.keys[i]));
+            step_result->add_scan_values(std::move(out.values[i]));
+            step_result->add_scan_tids(out.tids[i]);
+        }
+        for (auto& filtered_key : out.filtered_keys) {
+            step_result->add_filtered_keys(std::move(filtered_key));
+        }
+    }
+    return true;
+}
+
 // Pick the source byte string for a binding (from a step's scan key, scan value, or value).
 const std::string* select_source_bytes(
     const LineairDB::Protocol::TxExecuteReadPlan::StepResult& source,
@@ -1288,16 +1424,203 @@ void LineairDBRpc::handleTxExecuteReadPlan(const std::string& message,
             // Dedup probes: many source rows share a join key, and the proxy
             // serves every runtime probe of one key from the single staged
             // result, so re-executing the probe only inflates the response.
-            std::unordered_set<std::string> seen_probe_keys;
-            seen_probe_keys.reserve(static_cast<size_t>(row_count));
-            for (int row = 0; row < row_count; ++row) {
-                bool row_complete = true;
-                const std::string row_key =
-                    build_plan_key(step.key_prefix(), step.bindings(),
-                                   previous_results, row, &row_complete);
-                if (!row_complete) continue;
-                if (!seen_probe_keys.insert(row_key).second) continue;
+            std::vector<std::string> probe_keys;
+            probe_keys.reserve(static_cast<size_t>(row_count));
+            {
+                std::unordered_set<std::string> seen_probe_keys;
+                seen_probe_keys.reserve(static_cast<size_t>(row_count));
+                for (int row = 0; row < row_count; ++row) {
+                    bool row_complete = true;
+                    const std::string row_key =
+                        build_plan_key(step.key_prefix(), step.bindings(),
+                                       previous_results, row, &row_complete);
+                    if (!row_complete) continue;
+                    if (!seen_probe_keys.insert(row_key).second) continue;
+                    probe_keys.push_back(row_key);
+                }
+            }
 
+            const size_t min_parallel_probes = 4096;  // FIXME: make configurable
+            const unsigned nproc = std::thread::hardware_concurrency();
+            const unsigned max_probe_threads =
+                std::min<unsigned>(nproc ? nproc : 4, 8);  // FIXME: make configurable
+            if (probe_keys.size() >= min_parallel_probes &&
+                max_probe_threads > 1) {
+                const size_t probe_count = probe_keys.size();
+                const unsigned worker_count = static_cast<unsigned>(
+                    std::min<size_t>(max_probe_threads, probe_count));
+                struct ProbeOut {
+                    std::vector<std::string> keys;
+                    std::vector<std::string> values;
+                    std::vector<std::string> secondary_keys;
+                    std::vector<uint64_t> tids;
+                    std::vector<uint32_t> group_rows;
+                };
+                std::vector<ProbeOut> outputs(worker_count);
+                std::vector<char> failed(worker_count, 0);
+                auto* db = db_manager_->get_database().get();
+                const bool scan_probe = step.is_scan();
+                const bool has_projection = step.has_projection();
+                std::vector<std::thread> workers;
+                workers.reserve(worker_count);
+
+                // Workers execute disjoint probe slices into local buffers.
+                for (unsigned worker_index = 0; worker_index < worker_count;
+                     ++worker_index) {
+                    workers.emplace_back([&, worker_index] {
+                        const size_t begin =
+                            probe_count * worker_index / worker_count;
+                        const size_t end =
+                            probe_count * (worker_index + 1) / worker_count;
+                        PredicateEvaluator evaluator;
+                        auto worker_row_passes = [&](const std::string& value) {
+                            if (step_filter == nullptr) return true;
+                            if (!evaluator.parse_row(value.data(),
+                                                     value.size(),
+                                                     step_filter_cols)) {
+                                return true;
+                            }
+                            return evaluator.evaluate(*step_filter);
+                        };
+                        auto worker_project = [&](std::string&& value) {
+                            if (!has_projection || value.empty())
+                                return std::move(value);
+                            std::string trimmed;
+                            if (trim_row_value(
+                                    value, step.projection().field_indexes(),
+                                    step.projection().num_columns(),
+                                    trimmed)) {
+                                return trimmed;
+                            }
+                            failed[worker_index] = 1;
+                            return std::move(value);
+                        };
+
+                        ProbeOut& out = outputs[worker_index];
+                        for (size_t probe_index = begin;
+                             probe_index < end && !failed[worker_index];
+                             ++probe_index) {
+                            const std::string& row_key =
+                                probe_keys[probe_index];
+                            if (scan_probe) {
+                                const std::string row_end =
+                                    next_lexicographic_key(row_key);
+                                uint32_t group_rows = 0;
+                                if (step.index_name().empty()) {
+                                    auto scan_result =
+                                        db->StatelessRangeScan(
+                                            step.table_name(), row_key,
+                                            row_end, step.scan_limit(),
+                                            step.reverse_scan());
+                                    if (!scan_result.ok) {
+                                        failed[worker_index] = 1;
+                                        break;
+                                    }
+                                    for (auto& r : scan_result.rows) {
+                                        if (!worker_row_passes(r.value))
+                                            continue;
+                                        if (!fe_semijoins.empty() &&
+                                            sj_reject(r.value))
+                                            continue;
+                                        out.keys.push_back(std::move(r.key));
+                                        out.values.push_back(worker_project(
+                                            std::move(r.value)));
+                                        out.tids.push_back(r.tid);
+                                        ++group_rows;
+                                    }
+                                } else {
+                                    auto scan_result =
+                                        db->StatelessSecondaryRangeScan(
+                                            step.table_name(),
+                                            step.index_name(), row_key,
+                                            row_end, step.scan_limit(),
+                                            step.reverse_scan());
+                                    if (!scan_result.ok) {
+                                        failed[worker_index] = 1;
+                                        break;
+                                    }
+                                    for (auto& r : scan_result.rows) {
+                                        if (!worker_row_passes(r.value))
+                                            continue;
+                                        if (!fe_semijoins.empty() &&
+                                            sj_reject(r.value))
+                                            continue;
+                                        out.secondary_keys.push_back(
+                                            std::move(r.secondary_key));
+                                        out.keys.push_back(
+                                            std::move(r.primary_key));
+                                        out.values.push_back(worker_project(
+                                            std::move(r.value)));
+                                        out.tids.push_back(r.tid);
+                                        ++group_rows;
+                                    }
+                                }
+                                out.group_rows.push_back(group_rows);
+                            } else {
+                                auto read_result =
+                                    db->StatelessRead(step.table_name(),
+                                                      row_key);
+                                out.keys.push_back(row_key);
+                                out.tids.push_back(read_result.tid);
+                                if (read_result.found &&
+                                    !(!fe_semijoins.empty() &&
+                                      sj_reject(read_result.value))) {
+                                    out.values.push_back(worker_project(
+                                        std::move(read_result.value)));
+                                } else {
+                                    out.values.push_back("");
+                                }
+                            }
+                        }
+                        db->ReleaseMasstreeThreadEpoch();
+                    });
+                }
+                for (auto& worker : workers) worker.join();
+
+                bool any_failed = false;
+                for (char worker_failed : failed) {
+                    if (worker_failed) any_failed = true;
+                }
+                if (!any_failed) {
+                    // Append worker chunks in probe order.
+                    for (unsigned worker_index = 0;
+                         worker_index < worker_count; ++worker_index) {
+                        ProbeOut& out = outputs[worker_index];
+                        for (size_t i = 0; i < out.keys.size(); ++i) {
+                            if (!out.secondary_keys.empty()) {
+                                step_result->add_secondary_keys(
+                                    std::move(out.secondary_keys[i]));
+                            }
+                            step_result->add_scan_keys(
+                                std::move(out.keys[i]));
+                            step_result->add_scan_values(
+                                std::move(out.values[i]));
+                            step_result->add_scan_tids(out.tids[i]);
+                        }
+                        if (scan_probe) {
+                            const size_t begin =
+                                probe_count * worker_index / worker_count;
+                            const size_t end =
+                                probe_count * (worker_index + 1) /
+                                worker_count;
+                            for (size_t probe_index = begin;
+                                 probe_index < end; ++probe_index) {
+                                const std::string& row_key =
+                                    probe_keys[probe_index];
+                                step_result->add_group_sizes(
+                                    out.group_rows[probe_index - begin]);
+                                step_result->add_group_start_keys(row_key);
+                                step_result->add_group_end_keys(
+                                    next_lexicographic_key(row_key));
+                            }
+                        }
+                    }
+                    continue;
+                }
+                // Nothing was emitted yet; use the serial loop below.
+            }
+
+            for (const std::string& row_key : probe_keys) {
                 if (step.is_scan()) {
                     // Per-probe range scan: [row_key, next(row_key)).
                     const std::string row_end = next_lexicographic_key(row_key);
@@ -1403,6 +1726,16 @@ void LineairDBRpc::handleTxExecuteReadPlan(const std::string& message,
                 !step.reverse_scan() && step.has_aggregate() &&
                 step.aggregate().aggs_size() > 0) {
                 if (parallel_primary_aggregate_scan(
+                        db_manager_->get_database().get(), step, start_key,
+                        end_key, step_result)) {
+                    continue;
+                }
+            }
+            if (!step.for_each() && step.scan_limit() == 0 &&
+                !step.reverse_scan() &&
+                !(step.has_aggregate() && step.aggregate().aggs_size() > 0) &&
+                step.has_filter() && step.filter().has_expr()) {
+                if (parallel_primary_filter_scan(
                         db_manager_->get_database().get(), step, start_key,
                         end_key, step_result)) {
                     continue;
