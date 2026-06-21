@@ -2756,6 +2756,40 @@ static bool lineairdb_predict_prefetch_mode(THD *thd) {
 }
 
 /**
+ * @brief Return whether read_cost() should charge per-row materialization.
+ *
+ * @details Non-covering ref/range reads usually fetch each base row by PK after
+ * the index probe, so they should pay the materialization charge. The exception
+ * is a plain grouped single-table SELECT served through bulk prefetch: rows are
+ * staged/aggregated in bulk, not fetched one by one by PK.
+ */
+bool ha_lineairdb::helios_charge_materialise() const {
+  const TABLE *t = table;
+  if (t == nullptr || t->in_use == nullptr) return true;
+
+  THD *thd = t->in_use;
+  if (thd->lex == nullptr) return true;
+
+  // Only plain read-only SELECTs can use the bulk grouped path.
+  if (thd->lex->sql_command != SQLCOM_SELECT || thd->lex->is_explain())
+    return true;
+  if (t->reginfo.lock_type > TL_READ) return true;
+  if (!lineairdb_predict_prefetch_mode(thd)) return true;
+
+  // The grouped bulk path is recognizable before the final QEP exists.
+  Table_ref *tr = t->pos_in_table_list;
+  if (tr == nullptr || tr->query_block == nullptr) return true;
+  Query_block *qb = tr->query_block;
+  if (qb->leaf_table_count != 1 || !qb->is_grouped()) return true;
+  if (qb->is_distinct() || qb->olap != UNSPECIFIED_OLAP_TYPE ||
+      qb->has_windows()) {
+    return true;
+  }
+
+  return false;
+}
+
+/**
  * @brief Advertise custom batch MRR for primary-key point lookups.
  *
  * In non-prefetch ("batched") mode, clear HA_MRR_USE_DEFAULT_IMPL for PK lookups
