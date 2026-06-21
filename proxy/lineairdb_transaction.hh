@@ -167,6 +167,11 @@ public:
   const std::string& get_pushed_filter() const { return pushed_filter_; }
   void clear_pushed_filter() { pushed_filter_.clear(); }
 
+  // Aggregation pushdown: serialized AggregateSpec for the primary scan.
+  void set_pushed_aggregate(const std::string& s) { pushed_aggregate_ = s; }
+  void clear_pushed_aggregate() { pushed_aggregate_.clear(); }
+  bool has_pushed_aggregate() const { return !pushed_aggregate_.empty(); }
+
   // Projection pushdown stores kept field ordinals per physical table.
   static uint64_t load_projection_global_epoch() {
     return projection_epoch_.load(std::memory_order_relaxed);
@@ -309,6 +314,8 @@ private:
 
   // Predicate pushdown: serialized PushedPredicate for scan filtering
   std::string pushed_filter_;
+  // Aggregation pushdown: serialized AggregateSpec for the primary scan
+  std::string pushed_aggregate_;
 
   // Physical table name -> kept field ordinals for projected staged rows.
   std::unordered_map<std::string, std::vector<uint32_t>> table_projection_;

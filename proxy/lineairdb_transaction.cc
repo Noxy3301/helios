@@ -291,6 +291,22 @@ void LineairDBTransaction::execute_read_plan(
   }
   if (steps.empty()) return;
 
+  // Attach aggregate work to the matching full primary scan.
+  if (!pushed_aggregate_.empty()) {
+    for (auto& s : steps) {
+      if (s.is_scan && !s.for_each && s.index_name.empty() &&
+          s.table_name == db_table_key) {
+        s.aggregate_serialized = pushed_aggregate_;
+        if (s.serialized_filter.empty() && !pushed_filter_.empty()) {
+          s.serialized_filter = pushed_filter_;
+        }
+        // Aggregate specs use original field indexes, so ship full rows.
+        s.projection.clear();
+        s.projection_num_columns = 0;
+      }
+    }
+  }
+
   rpc_trace_.record_local_view("plan_request:steps=" +
                                std::to_string(steps.size()));
   auto result = lineairdb_proxy->tx_execute_read_plan(steps);

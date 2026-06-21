@@ -176,6 +176,9 @@ public:
         // unique). Empty = ship full rows. num_columns = table->s->fields.
         std::vector<uint32_t> projection;
         uint32_t projection_num_columns = 0;
+        // Aggregation pushdown: serialized AggregateSpec. When set on a primary
+        // scan, the server returns grouped rows instead of base rows.
+        std::string aggregate_serialized;
         // Semijoin reduction: keep probe rows only when their join key appears
         // in an earlier source step.
         struct Semijoin {
