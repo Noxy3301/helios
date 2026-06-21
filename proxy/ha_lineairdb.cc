@@ -121,6 +121,7 @@
 #include "sql/item.h"
 #include "sql/item_cmpfunc.h"
 #include "sql/item_func.h"
+#include "sql/key.h"
 #include "sql/sql_class.h"
 #include "sql/sql_lex.h"
 #include "sql/sql_plugin.h"
@@ -2511,6 +2512,45 @@ int ha_lineairdb::rename_table(const char *, const char *, const dd::Table *,
 }
 
 /**
+ * @brief Decode an integer key part from a MySQL range endpoint.
+ *
+ * @details Uses key_restore() into table->record[1] instead of reading raw key
+ * bytes, so MySQL owns signedness and key-format decoding. Unsupported shapes
+ * return false and the caller falls back to the old coarse estimate.
+ */
+static bool helios_decode_keypart_int(TABLE *table, KEY *key, uint part,
+                                      const key_range *range,
+                                      longlong *out_value) {
+  if (table == nullptr || key == nullptr || range == nullptr ||
+      range->key == nullptr || out_value == nullptr) {
+    return false;
+  }
+  if (part >= key->user_defined_key_parts) return false;
+
+  uint required = 0;
+  for (uint i = 0; i <= part; ++i) {
+    required += key->key_part[i].store_length;
+  }
+  if (range->length < required) return false;
+
+  const KEY_PART_INFO &kp = key->key_part[part];
+  Field *field = kp.field;
+  if (field == nullptr || field->result_type() != INT_RESULT) return false;
+  if (field->is_nullable()) return false;
+  if (kp.key_part_flag & HA_REVERSE_SORT) return false;
+  if (table->record[0] == nullptr || table->record[1] == nullptr) return false;
+
+  uchar *scratch = table->record[1];
+  key_restore(scratch, range->key, key, range->length);
+  const ptrdiff_t delta =
+      static_cast<ptrdiff_t>(scratch - table->record[0]);
+  field->move_field_offset(delta);
+  *out_value = field->val_int();
+  field->move_field_offset(-delta);
+  return true;
+}
+
+/**
   @brief
   Given a starting key and an ending key, estimate the number of rows that
   will exist between the two keys.
@@ -2619,9 +2659,29 @@ ha_rows ha_lineairdb::records_in_range(uint inx, key_range *min_key,
     } else {
       estimate = 1;
     }
-    // Range conditions after equality prefix -> halve (NDB heuristic)
+    // Range after an equality prefix: estimate how many distinct trailing
+    // values fall inside the range, then multiply by rows per trailing value.
+    // Unsupported key shapes fall back to the old /2 heuristic.
     if (eq_parts < key_parts_used) {
-      estimate = std::max(static_cast<ha_rows>(1), estimate / 2);
+      longlong lo = 0;
+      longlong hi = 0;
+      if (eq_parts < key->user_defined_key_parts &&
+          key->rec_per_key[eq_parts] > 0 &&
+          helios_decode_keypart_int(table, key, eq_parts, min_key, &lo) &&
+          helios_decode_keypart_int(table, key, eq_parts, max_key, &hi) &&
+          hi >= lo) {
+        const double range_vals =
+            (hi > lo) ? static_cast<double>(hi - lo) : 1.0;
+        double est =
+            range_vals * static_cast<double>(key->rec_per_key[eq_parts]);
+
+        const double cap = static_cast<double>(key->rec_per_key[rpk_idx]);
+        if (cap >= 1.0 && est > cap) est = cap;
+        if (est < 1.0) est = 1.0;
+        estimate = static_cast<ha_rows>(est);
+      } else {
+        estimate = std::max(static_cast<ha_rows>(1), estimate / 2);
+      }
     }
   } else {
     // No equality at all -> pure range scan.
