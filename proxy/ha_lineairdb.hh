@@ -391,11 +391,11 @@ public:
   /**
    * @brief Return whether read_cost() should charge remote row materialization.
    *
-   * The default is true. It returns false only for bulk-prefetched grouped
-   * single-table SELECTs, where rows are staged/aggregated in bulk instead of
-   * fetched one-by-one by PK.
+   * The default is true. It returns false for clustered primary-key access and
+   * for bulk-prefetched grouped single-table SELECTs, where rows are not fetched
+   * one-by-one by a secondary-key-to-PK lookup.
    */
-  bool helios_charge_materialise() const;
+  bool helios_charge_materialise(uint index) const;
 
   double helios_row_bytes() const {
     // stats.mean_rec_length is set in info() from table->s->reclength (>=100).
@@ -430,7 +430,7 @@ public:
 
     // read_cost() is the non-covering path: the index narrows keys, then each
     // matching base row is fetched by PK. Covering scans use index_scan_cost().
-    if (helios_charge_materialise()) {
+    if (helios_charge_materialise(index)) {
       c.add_io(std::ceil(rows / kEffBatch()) * kC_rpc());
       c.add_cpu(rows * kC_materialise());
     }

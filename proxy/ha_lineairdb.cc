@@ -2758,14 +2758,19 @@ static bool lineairdb_predict_prefetch_mode(THD *thd) {
 /**
  * @brief Return whether read_cost() should charge per-row materialization.
  *
- * @details Non-covering ref/range reads usually fetch each base row by PK after
- * the index probe, so they should pay the materialization charge. The exception
- * is a plain grouped single-table SELECT served through bulk prefetch: rows are
- * staged/aggregated in bulk, not fetched one by one by PK.
+ * @details Non-covering secondary ref/range reads usually fetch each base row
+ * by PK after the index probe, so they should pay the materialization charge.
+ * Primary-key reads already produce the base row, and grouped single-table
+ * SELECTs served by bulk prefetch do not fetch rows one by one by PK.
  */
-bool ha_lineairdb::helios_charge_materialise() const {
+bool ha_lineairdb::helios_charge_materialise(uint index) const {
   const TABLE *t = table;
   if (t == nullptr || t->in_use == nullptr) return true;
+
+  if (t->s != nullptr && t->s->primary_key != MAX_KEY &&
+      index == t->s->primary_key) {
+    return false;
+  }
 
   THD *thd = t->in_use;
   if (thd->lex == nullptr) return true;
