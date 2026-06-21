@@ -200,6 +200,14 @@ public:
   const char *table_type() const override { return "LineairDB"; }
 
   /**
+   * @brief Advertise the MySQL engine-pushdown hook.
+   *
+   * The hook still checks the query shape before installing the aggregate
+   * executor override; unsupported queries keep the normal iterator path.
+   */
+  const handlerton *hton_supporting_engine_pushdown() override;
+
+  /**
     Replace key algorithm with one supported by SE, return the default key
     algorithm for SE if explicit key algorithm was not provided.
 
@@ -398,6 +406,34 @@ public:
   int rnd_init(bool scan) override; // required
   int rnd_end() override;
   int rnd_next(uchar *buf) override;            ///< required
+  /**
+   * @brief Return the next cached aggregate group row as raw VALUE bytes.
+   */
+  bool agg_next_raw(std::string_view *out_value);
+
+  /**
+   * @brief Attach a serialized AggregateSpec to this handler's transaction.
+   *
+   * @return false when the statement WHERE exists but cannot be serialized for
+   * server-side aggregation.
+   */
+  bool tx_set_pushed_aggregate(const std::string &s);
+
+  /**
+   * @brief Clear this transaction's pushed AggregateSpec.
+   */
+  void tx_clear_pushed_aggregate();
+
+  /**
+   * @brief Return whether server aggregation may use read-only no-validation.
+   */
+  bool tx_ro_novalidate();
+
+  /**
+   * @brief Return true if aggregate staging aborted.
+   */
+  bool tx_is_aborted();
+
   int rnd_pos(uchar *buf, uchar *pos) override; ///< required
   void position(const uchar *record) override;  ///< required
   int info(uint flag) override;                 ///< required

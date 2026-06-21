@@ -37,16 +37,105 @@
 // ---------------------------------------------------------------------------
 
 /**
- * Recursively serialize a MySQL Item expression tree into a FilterExpr protobuf.
- * Returns false if the Item type is not supported (PP is silently skipped).
+ * @brief Serialize a MySQL Item expression into a FilterExpr protobuf.
  *
- * @param item   MySQL Item node (condition expression)
- * @param expr   FilterExpr protobuf to populate
- * @return true if serialization succeeded
+ * @return false when the expression is unsupported by server-side filtering.
  */
 bool serialize_item(const Item *item,
                     LineairDB::Protocol::FilterExpr *expr) {
   if (!item) return false;
+
+  // Unwrap constant-propagation caches before reading their value.
+  if (item->type() == Item::CACHE_ITEM) {
+    const Item *example =
+        down_cast<const Item_cache *>(item)->get_example();
+    if (example != nullptr) return serialize_item(example, expr);
+    return false;
+  }
+
+  // Fold constant expressions that are not already bare literals.
+  if (item->const_item() && !item->has_subquery() &&
+      item->type() != Item::INT_ITEM && item->type() != Item::REAL_ITEM &&
+      item->type() != Item::STRING_ITEM &&
+      item->type() != Item::DECIMAL_ITEM && item->type() != Item::NULL_ITEM &&
+      item->type() != Item::COND_ITEM && item->type() != Item::FIELD_ITEM) {
+    // Comparison and boolean functions must keep their expression shape.
+    const bool is_structural_func = [&] {
+      if (item->type() != Item::FUNC_ITEM) return false;
+      switch (down_cast<const Item_func *>(item)->functype()) {
+        case Item_func::EQ_FUNC:
+        case Item_func::NE_FUNC:
+        case Item_func::LT_FUNC:
+        case Item_func::LE_FUNC:
+        case Item_func::GT_FUNC:
+        case Item_func::GE_FUNC:
+        case Item_func::BETWEEN:
+        case Item_func::IN_FUNC:
+        case Item_func::LIKE_FUNC:
+        case Item_func::ISNULL_FUNC:
+        case Item_func::ISNOTNULL_FUNC:
+        case Item_func::NOT_FUNC:
+          return true;
+        default:
+          return false;
+      }
+    }();
+    if (!is_structural_func) {
+      Item *mut = const_cast<Item *>(item);
+      // Stored temporal values compare as their string representation.
+      if (mut->is_temporal()) {
+        String tbuf;
+        String *ts = mut->val_str(&tbuf);
+        if (mut->null_value || ts == nullptr) {
+          expr->set_op(LineairDB::Protocol::FilterExpr::CONST_NULL);
+        } else {
+          expr->set_op(LineairDB::Protocol::FilterExpr::CONST_STRING);
+          expr->set_string_val(ts->ptr(), ts->length());
+        }
+        return true;
+      }
+      // Serialize the folded value using MySQL's result type.
+      switch (mut->result_type()) {
+        case INT_RESULT: {
+          const longlong v = mut->val_int();
+          if (mut->null_value) {
+            expr->set_op(LineairDB::Protocol::FilterExpr::CONST_NULL);
+          } else if (mut->unsigned_flag) {
+            expr->set_op(LineairDB::Protocol::FilterExpr::CONST_UINT);
+            expr->set_uint_val(static_cast<ulonglong>(v));
+          } else {
+            expr->set_op(LineairDB::Protocol::FilterExpr::CONST_INT);
+            expr->set_int_val(v);
+          }
+          return true;
+        }
+        case REAL_RESULT:
+        case DECIMAL_RESULT: {
+          const double v = mut->val_real();
+          if (mut->null_value) {
+            expr->set_op(LineairDB::Protocol::FilterExpr::CONST_NULL);
+          } else {
+            expr->set_op(LineairDB::Protocol::FilterExpr::CONST_DOUBLE);
+            expr->set_double_val(v);
+          }
+          return true;
+        }
+        case STRING_RESULT: {
+          String buf;
+          String *s = mut->val_str(&buf);
+          if (mut->null_value || s == nullptr) {
+            expr->set_op(LineairDB::Protocol::FilterExpr::CONST_NULL);
+          } else {
+            expr->set_op(LineairDB::Protocol::FilterExpr::CONST_STRING);
+            expr->set_string_val(s->ptr(), s->length());
+          }
+          return true;
+        }
+        default:
+          return false;
+      }
+    }
+  }
 
   switch (item->type()) {
     case Item::INT_ITEM: {
@@ -401,21 +490,22 @@ bool prepare_select_filter_for_tx(THD *thd, TABLE *table,
     return true;                                     // No WHERE to push
   }
 
-  // Convert WHERE into the existing predicate protobuf format.
-  LineairDB::Protocol::PushedPredicate predicate;
-  predicate.set_num_columns(table->s->fields);
-  if (!serialize_item(where, predicate.mutable_expr())) {
+  // Push only predicates that can be evaluated on this table's rows.
+  std::string encoded;
+  if (!build_single_table_filter(thd, table, &encoded) || encoded.empty()) {
     if (serialized_filter != nullptr) serialized_filter->clear();
     tx->clear_pushed_filter();
     return false;                                    // MySQL must filter
   }
 
   // Attach the encoded filter to the transaction for the next scan RPC.
-  std::string encoded;
-  predicate.SerializeToString(&encoded);
   if (serialized_filter != nullptr) {
     *serialized_filter = encoded;
   }
   tx->set_pushed_filter(encoded);
-  return item_is_limit_safe_filter(where);
+
+  // LIMIT pushdown is safe only when the table-local filter is the whole WHERE.
+  if (table->pos_in_table_list == nullptr) return false;
+  const table_map me = table->pos_in_table_list->map();
+  return where->used_tables() == me && item_is_limit_safe_filter(where);
 }

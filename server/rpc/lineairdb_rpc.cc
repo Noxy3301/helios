@@ -10,6 +10,9 @@
 #include <unordered_set>
 
 #include "lineairdb.pb.h"
+#include <map>
+#include <set>
+#include <type_traits>
 
 namespace {
 
@@ -106,6 +109,215 @@ std::string_view extract_value_column(const std::string& row,
         ++field_index;
     }
     return {};
+}
+
+/**
+ * @brief Append one LineairDBField-format field to a synthetic group row.
+ *
+ * Format: [byteSize][valueLength][value]. A null field is encoded as 0xFF.
+ */
+void agg_emit_field(std::string& out, std::string_view v, bool is_null) {
+    if (is_null) { out.push_back(static_cast<char>(0xFF)); return; }
+    size_t len = v.size();
+    size_t bs = 1;
+    for (size_t t = len >> 8; t; t >>= 8) ++bs;
+    out.push_back(static_cast<char>(bs));
+    for (size_t i = 0; i < bs; ++i)
+        out.push_back(static_cast<char>((len >> (8 * i)) & 0xFF));
+    out.append(v.data(), v.size());
+}
+
+/**
+ * @brief Exact fixed-point decimal used for server-side SUM/AVG partials.
+ */
+struct Dec { __int128 m = 0; int s = 0; bool null = false; };
+
+/**
+ * @brief Return 10^n as an exact integer.
+ */
+static __int128 dec_pow10(int n) {
+    __int128 r = 1;
+    while (n-- > 0) r *= 10;
+    return r;
+}
+
+/**
+ * @brief Parse an ASCII decimal string into Dec.
+ */
+static Dec dec_parse(std::string_view v) {
+    Dec d;
+    if (v.empty()) { d.null = true; return d; }
+    size_t i = 0; bool neg = false;
+    if (v[0] == '-') { neg = true; i = 1; } else if (v[0] == '+') i = 1;
+    __int128 m = 0; int scale = 0; bool dot = false;
+    for (; i < v.size(); ++i) {
+        char c = v[i];
+        if (c == '.') { dot = true; continue; }
+        if (c < '0' || c > '9') { d.null = true; return d; }
+        m = m * 10 + (c - '0');
+        if (dot) ++scale;
+    }
+    d.m = neg ? -m : m; d.s = scale;
+    return d;
+}
+
+/**
+ * @brief Add or subtract two Dec values after aligning their scales.
+ */
+static void dec_addsub(Dec& a, const Dec& b, bool sub) {
+    const int s = a.s > b.s ? a.s : b.s;
+    __int128 am = a.m * dec_pow10(s - a.s);
+    __int128 bm = b.m * dec_pow10(s - b.s);
+    a.m = sub ? am - bm : am + bm;
+    a.s = s;
+    a.null = a.null || b.null;
+}
+
+/**
+ * @brief Evaluate an aggregate argument expression against one base row.
+ */
+static Dec dec_eval(const LineairDB::Protocol::FilterExpr& e,
+                    const std::string& row) {
+    using FE = LineairDB::Protocol::FilterExpr;
+    switch (e.op()) {
+        case FE::COLUMN_REF:
+            return dec_parse(extract_value_column(row, e.column_index()));
+        case FE::CONST_INT:  { Dec d; d.m = e.int_val();  d.s = 0; return d; }
+        case FE::CONST_UINT: { Dec d; d.m = (__int128)e.uint_val(); d.s = 0; return d; }
+        case FE::OP_ADD: {
+            if (e.children_size() != 2) { Dec d; d.null = true; return d; }
+            Dec a = dec_eval(e.children(0), row);
+            dec_addsub(a, dec_eval(e.children(1), row), false);
+            return a;
+        }
+        case FE::OP_SUB: {
+            if (e.children_size() != 2) { Dec d; d.null = true; return d; }
+            Dec a = dec_eval(e.children(0), row);
+            dec_addsub(a, dec_eval(e.children(1), row), true);
+            return a;
+        }
+        case FE::OP_MUL: {
+            if (e.children_size() != 2) { Dec d; d.null = true; return d; }
+            Dec a = dec_eval(e.children(0), row);
+            Dec b = dec_eval(e.children(1), row);
+            Dec r; r.m = a.m * b.m; r.s = a.s + b.s; r.null = a.null || b.null;
+            return r;
+        }
+        case FE::OP_NEG: {
+            if (e.children_size() != 1) { Dec d; d.null = true; return d; }
+            Dec a = dec_eval(e.children(0), row); a.m = -a.m; return a;
+        }
+        default: { Dec d; d.null = true; return d; }
+    }
+}
+
+/**
+ * @brief Format Dec back to its decimal string representation.
+ */
+static std::string dec_format(const Dec& d) {
+    __int128 m = d.m; bool neg = m < 0; if (neg) m = -m;
+    std::string digits;
+    if (m == 0) digits = "0";
+    else { while (m) { digits.push_back(char('0' + int(m % 10))); m /= 10; }
+           std::reverse(digits.begin(), digits.end()); }
+    while (static_cast<int>(digits.size()) <= d.s) digits.insert(digits.begin(), '0');
+    std::string out;
+    if (neg) out.push_back('-');
+    if (d.s == 0) { out += digits; return out; }
+    const size_t ip = digits.size() - d.s;
+    out.append(digits, 0, ip); out.push_back('.'); out.append(digits, ip, std::string::npos);
+    return out;
+}
+
+/**
+ * @brief Accumulators for one GROUP BY key.
+ */
+struct AggGroupState {
+    std::vector<std::string> key_cols;   // captured group-by column values
+    std::vector<uint64_t> count;         // per agg: COUNT / non-null counter
+    std::vector<Dec> sum;                // per agg: SUM/AVG accumulator
+};
+
+/**
+ * @brief Aggregate scan rows and emit one synthetic group row per group.
+ *
+ * Each output row is [null_flags][group columns][value,count per aggregate].
+ */
+bool server_aggregate_scan(
+    const LineairDB::Protocol::AggregateSpec& spec,
+    std::vector<LineairDB::StatelessScanRow>& rows,
+    LineairDB::Protocol::TxExecuteReadPlan::StepResult* step_result) {
+    using AF = LineairDB::Protocol::AggFunc;
+    const int n_agg = spec.aggs_size();
+    const int n_grp = spec.group_columns_size();
+
+    std::unordered_map<std::string, AggGroupState> groups;
+    std::string keybuf;
+    std::vector<std::string_view> gv(n_grp);
+    for (auto& row : rows) {
+        // Build an unambiguous binary key from the group column bytes.
+        keybuf.clear();
+        for (int g = 0; g < n_grp; ++g) {
+            gv[g] = extract_value_column(row.value, spec.group_columns(g));
+            const uint32_t l = static_cast<uint32_t>(gv[g].size());
+            keybuf.append(reinterpret_cast<const char*>(&l), sizeof(l));
+            keybuf.append(gv[g].data(), gv[g].size());
+        }
+        auto it = groups.find(keybuf);
+        AggGroupState* gs;
+        if (it == groups.end()) {
+            AggGroupState s;
+            s.key_cols.resize(n_grp);
+            for (int g = 0; g < n_grp; ++g) s.key_cols[g] = std::string(gv[g]);
+            s.count.assign(n_agg, 0);
+            s.sum.assign(n_agg, Dec{});
+            gs = &groups.emplace(std::move(keybuf), std::move(s)).first->second;
+            keybuf.clear();
+        } else {
+            gs = &it->second;
+        }
+
+        // Apply each aggregate to this row.
+        for (int a = 0; a < n_agg; ++a) {
+            const auto& af = spec.aggs(a);
+            if (af.kind() == AF::AGG_COUNT) { gs->count[a] += 1; continue; }
+            // SUM / AVG: evaluate the exact decimal arg, accumulate non-nulls.
+            Dec v = dec_eval(af.arg(), row.value);
+            if (!v.null) { dec_addsub(gs->sum[a], v, false); gs->count[a] += 1; }
+        }
+    }
+    // Implicit grouping must emit one row even over zero input rows:
+    // COUNT(*) => 0, SUM/AVG => NULL.
+    if (n_grp == 0 && groups.empty()) {
+        AggGroupState s;
+        s.count.assign(n_agg, 0);
+        s.sum.assign(n_agg, Dec{});
+        groups.emplace(std::string(), std::move(s));
+    }
+
+    // Serialize final group states as synthetic rows for the proxy.
+    for (auto& kv : groups) {
+        AggGroupState& s = kv.second;
+        std::string row;
+        agg_emit_field(row, std::string_view(), false);  // null_flags (empty)
+        for (int g = 0; g < n_grp; ++g) agg_emit_field(row, s.key_cols[g], false);
+        for (int a = 0; a < n_agg; ++a) {
+            const auto& af = spec.aggs(a);
+            const std::string cnt = std::to_string(s.count[a]);
+            if (af.kind() == AF::AGG_COUNT) {
+                agg_emit_field(row, cnt, false);
+                agg_emit_field(row, cnt, false);
+            } else {  // SUM / AVG: (exact decimal sum | null) , non-null count
+                if (s.count[a] == 0) agg_emit_field(row, std::string_view(), true);
+                else agg_emit_field(row, dec_format(s.sum[a]), false);
+                agg_emit_field(row, cnt, false);
+            }
+        }
+        step_result->add_scan_keys(std::string());
+        step_result->add_scan_values(std::move(row));
+        step_result->add_scan_tids(0);
+    }
+    return true;
 }
 
 // Build the int-keyed primary key bytes. Mirrors the layout produced by
@@ -970,15 +1182,47 @@ void LineairDBRpc::handleTxExecuteReadPlan(const std::string& message,
                 flat_plan::encode_to_string(response, result);
                 return;
             }
-            for (auto& row : scan_result.rows) {
-                if (!row_passes(row.value)) {
-                    // Negative coverage for point probes into this scan.
-                    step_result->add_filtered_keys(std::move(row.key));
-                    continue;
+            // Aggregation emits synthetic group rows instead of base rows.
+            bool aggregated = false;
+            if (step.has_aggregate() && step.aggregate().aggs_size() > 0) {
+                if (step_filter != nullptr) {
+                    // Aggregate filters fail closed: once rows are folded into
+                    // groups, MySQL cannot recheck an unparseable base row.
+                    PredicateEvaluator agg_eval;
+                    bool parse_failed = false;
+                    std::remove_reference_t<decltype(scan_result.rows)> filtered;
+                    filtered.reserve(scan_result.rows.size());
+                    for (auto& row : scan_result.rows) {
+                        if (!agg_eval.parse_row(row.value.data(),
+                                                row.value.size(),
+                                                step_filter_cols)) {
+                            parse_failed = true;
+                            break;
+                        }
+                        if (agg_eval.evaluate(*step_filter))
+                            filtered.push_back(std::move(row));
+                    }
+                    if (parse_failed) {
+                        response.set_ok(false);
+                        flat_plan::encode_to_string(response, result);
+                        return;
+                    }
+                    scan_result.rows = std::move(filtered);
                 }
-                step_result->add_scan_keys(std::move(row.key));
-                step_result->add_scan_values(project_value(std::move(row.value)));
-                step_result->add_scan_tids(row.tid);
+                aggregated = server_aggregate_scan(step.aggregate(),
+                                                   scan_result.rows, step_result);
+            }
+            if (!aggregated) {
+                for (auto& row : scan_result.rows) {
+                    if (!row_passes(row.value)) {
+                        // Negative coverage for point probes into this scan.
+                        step_result->add_filtered_keys(std::move(row.key));
+                        continue;
+                    }
+                    step_result->add_scan_keys(std::move(row.key));
+                    step_result->add_scan_values(project_value(std::move(row.value)));
+                    step_result->add_scan_tids(row.tid);
+                }
             }
         } else {
             step_result->set_actual_start_key(start_key);

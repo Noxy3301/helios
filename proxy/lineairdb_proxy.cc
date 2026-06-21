@@ -447,6 +447,9 @@ LineairDBProxy::ReadPlanResult LineairDBProxy::tx_execute_read_plan(
             p->set_num_columns(step.projection_num_columns);
             for (uint32_t f : step.projection) p->add_field_indexes(f);
         }
+        if (!step.aggregate_serialized.empty() && step.is_scan) {
+            out->mutable_aggregate()->ParseFromString(step.aggregate_serialized);
+        }
         for (const auto& sj : step.semijoins) {
             auto* o = out->add_semijoins();
             o->set_source_step(sj.source_step);
