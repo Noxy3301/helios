@@ -129,6 +129,7 @@
 #include "sql/table.h"
 #include "sql/sql_optimizer.h"             // JOIN
 #include "sql/join_optimizer/access_path.h"  // AccessPath (QEP tree)
+#include "sql/join_optimizer/walk_access_paths.h"
 #include "sql/join_optimizer/materialize_path_parameters.h"  // MATERIALIZE param
 #include "sql/query_result.h"                 // Query_result
 #include "sql/item_sum.h"                     // Item_sum
@@ -876,14 +877,58 @@ local_aggregate_fallback:;
 }
 
 /**
+ * @brief Return true when MySQL already chose a small bounded aggregate input.
+ *
+ * @details The aggregate override drives the handler through rnd_init(), which
+ * is a full scan. That is useful for large scan aggregates, but wasteful when
+ * the chosen access path is already a bounded ref/range lookup. If the access
+ * tree cannot be tied back to this query block's single base table, keep the
+ * existing override behavior.
+ */
+static bool helios_has_small_bounded_aggregate_input(AccessPath *root_path,
+                                                     JOIN *join) {
+  if (root_path == nullptr || join == nullptr || join->query_block == nullptr ||
+      join->query_block->leaf_tables == nullptr) {
+    return false;
+  }
+
+  const AccessPath *leaf = nullptr;
+  WalkAccessPaths(root_path, join, WalkAccessPathPolicy::ENTIRE_TREE,
+                  [&leaf](AccessPath *path, const JOIN *) -> bool {
+                    if (GetBasicTable(path) == nullptr)
+                      return false;
+                    leaf = path;
+                    return true;
+                  });
+  if (leaf == nullptr)
+    return false;
+
+  const TABLE *leaf_table = GetBasicTable(leaf);
+  if (leaf_table != join->query_block->leaf_tables->table)
+    return false;
+
+  const bool bounded = leaf->type == AccessPath::REF ||
+                       leaf->type == AccessPath::REF_OR_NULL ||
+                       leaf->type == AccessPath::EQ_REF ||
+                       leaf->type == AccessPath::INDEX_RANGE_SCAN;
+  if (!bounded)
+    return false;
+
+  constexpr double kSmallAggregateInputRows = 1000.0;  // FIXME: make configurable
+  const double rows = leaf->num_output_rows();
+  return rows >= 0.0 && rows < kSmallAggregateInputRows;
+}
+
+/**
  * @brief Install the aggregate executor override for supported query shapes.
  *
  * Unsupported queries leave `override_executor_func` unset and continue through
  * MySQL's normal iterator executor.
  */
-static int lineairdb_push_to_engine(THD *thd, AccessPath * /*root_path*/,
+static int lineairdb_push_to_engine(THD *thd, AccessPath *root_path,
                                     JOIN *join) {
   if (!helios_offloadable_shape(thd, join)) return 0;
+  if (helios_has_small_bounded_aggregate_input(root_path, join)) return 0;
   join->override_executor_func = &helios_override_executor;
   return 0;
 }
