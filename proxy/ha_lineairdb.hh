@@ -46,6 +46,7 @@
 
 #include <array>
 #include <atomic>
+#include <cmath>
 #include <cstdint>
 #include <mutex>
 #include <unordered_map>
@@ -97,6 +98,14 @@ public:
 
   // ANALYZE TABLE sets this so the next NDV fetch recomputes server stats.
   std::atomic<bool> index_ndv_force_refresh_{false};
+
+  // Per-index range histogram on the leading key part. Empty index name means
+  // primary key. Guarded by index_ndv_mu_ and refreshed with NDV stats.
+  struct RangeHist {
+    std::vector<std::string> bounds;
+    std::vector<uint64_t> cum;
+  };
+  std::unordered_map<std::string, RangeHist> index_hist_;
 };
 
 // LIMIT and direction that a handler range scan may push to LineairDB.
@@ -304,6 +313,142 @@ public:
     // batch_fetch_secondary_payloads batches all primary row lookups
     // into a single RPC, making per-row cost similar.
     return (double)ranges * 1.0 + (double)rows * 0.5;
+  }
+
+  /**
+   * @brief Helios cost model for the MySQL 8.0 Cost_estimate API.
+   *
+   * @details The join planner uses these methods for scan-vs-ref and
+   * join-order decisions. LineairDB does not pay page-I/O cost like InnoDB;
+   * the dominant costs are RPC round trips, transferred bytes, row
+   * materialization, and batched remote probes.
+   *
+   *   scan : io = C_rpc + bytes*C_byte               ; cpu = rows*(C_row + C_remote)
+   *   ref  : io = ranges*(C_rpc/batch) + bytes*C_byte ; cpu = rows*(C_probe + C_row)
+   *
+   * Ref probes are batched, so a nested-loop chain is charged by effective
+   * batches instead of one RPC per outer row.
+   *
+   * @note Defaults are optimizer units, not wall-clock time. Later calibration
+   * can fit them with NNLS (non-negative least squares):
+   *
+   *   measured_time ~= C_rpc*rpc_count + C_byte*bytes + C_row*rows + ...
+   *
+   * NNLS keeps every coefficient >= 0, so more RPCs/bytes/rows cannot make the
+   * fitted cost cheaper.
+   */
+  static double helios_cost_param(const char *name, double def) {
+    // Optional calibration knob; the Helios cost model itself is always on.
+    const char *e = std::getenv(name);
+    if (!e || !e[0]) return def;
+    char *end = nullptr;
+    double v = strtod(e, &end);
+    return (end && end != e) ? v : def;
+  }
+  // C_rpc: one client/server round trip. 50.0 means one RPC costs about
+  // 500 row evaluations on MySQL's ROW_EVALUATE_COST=0.1 scale.
+  static double kC_rpc() {
+    static const double v = helios_cost_param("HELIOS_C_RPC", 50.0);
+    return v;
+  }
+
+  // C_byte: one transferred byte. 0.0008 makes 1 KiB cost about 0.82, so
+  // wide rows affect plan choice without overwhelming the fixed RPC cost.
+  static double kC_byte() {
+    static const double v = helios_cost_param("HELIOS_C_BYTE", 0.0008);
+    return v;
+  }
+
+  // C_row: one row materialized and decoded on the MySQL/proxy side. 0.10
+  // matches MySQL's ROW_EVALUATE_COST baseline for one row.
+  static double kC_row() {
+    static const double v = helios_cost_param("HELIOS_C_ROW", 0.10);
+    return v;
+  }
+
+  // C_probe: one ref/index probe key before row materialization. 0.05 treats
+  // probe handling as lighter than decoding a full row.
+  static double kC_probe() {
+    static const double v = helios_cost_param("HELIOS_C_PROBE", 0.05);
+    return v;
+  }
+
+  // C_remote: one row scanned on the LineairDB server side. 0.05 models remote
+  // scan work as lighter than decoding a full row on the MySQL side.
+  static double kC_remote() {
+    static const double v = helios_cost_param("HELIOS_C_REMOTE", 0.05);
+    return v;
+  }
+
+  // B_eff: effective probe batch size used to amortize RPC cost. 1024 is a
+  // steering estimate, not a protocol limit.
+  static double kEffBatch() {
+    static const double v = helios_cost_param("HELIOS_BATCH", 1024.0);
+    return v;
+  }
+
+  // C_materialise: one remote PK row fetch after a non-covering secondary scan.
+  // 8.0 is an inflated steering value: it makes large row-by-row materialization
+  // lose to bulk full-scan+prefetch even when cardinality is underestimated.
+  static double kC_materialise() {
+    static const double v =
+        helios_cost_param("HELIOS_C_MATERIALISE", 8.0);
+    return v;
+  }
+
+  /**
+   * @brief Return whether read_cost() should charge remote row materialization.
+   *
+   * The default is true. It returns false for clustered primary-key access and
+   * for bulk-prefetched grouped single-table SELECTs, where rows are not fetched
+   * one-by-one by a secondary-key-to-PK lookup.
+   */
+  bool helios_charge_materialise(uint index) const;
+
+  double helios_row_bytes() const {
+    // stats.mean_rec_length is set in info() from table->s->reclength (>=100).
+    // Must NOT deref table->s here: TABLE is incomplete in this header.
+    double b = (double)stats.mean_rec_length;
+    return b > 0 ? b : 64.0;                            // floor for unknown
+  }
+  Cost_estimate helios_ref_cost(double ranges, double rows) const {
+    Cost_estimate c;
+    const double bytes = rows * helios_row_bytes();
+    // per-lookup RPC amortized over the prefetch batch size.
+    const double rpc = (ranges > 0 ? ranges : 1.0) * (kC_rpc() / kEffBatch());
+    c.add_io(rpc + bytes * kC_byte());
+    c.add_cpu(rows * (kC_probe() + kC_row()));
+    return c;
+  }
+
+  Cost_estimate table_scan_cost() override
+  {
+    Cost_estimate c;
+    const double rows = (double)stats.records;
+    const double bytes = rows * helios_row_bytes();
+    c.add_io(kC_rpc() + bytes * kC_byte());      // 1 scan RPC + transfer wait
+    c.add_cpu(rows * (kC_row() + kC_remote()));  // materialize + remote scan CPU
+    return c;
+  }
+
+  Cost_estimate read_cost(uint index [[maybe_unused]], double ranges,
+                          double rows) override
+  {
+    Cost_estimate c = helios_ref_cost(ranges, rows);
+
+    // read_cost() is the non-covering path: the index narrows keys, then each
+    // matching base row is fetched by PK. Covering scans use index_scan_cost().
+    if (helios_charge_materialise(index)) {
+      c.add_io(std::ceil(rows / kEffBatch()) * kC_rpc());
+      c.add_cpu(rows * kC_materialise());
+    }
+    return c;
+  }
+
+  Cost_estimate index_scan_cost(uint index [[maybe_unused]], double ranges,
+                                double rows) override
+  {
+    return helios_ref_cost(ranges, rows);
   }
 
   /*
@@ -560,7 +705,7 @@ private:
 
   // rec_per_key helpers
   bool seed_row_count_from_cache(LineairDBProxy *proxy);
-  void load_index_ndv_from_cache(LineairDBProxy *proxy);
+  void load_index_stats_from_cache(LineairDBProxy *proxy);
   void mark_stale_index_ndv_for_select();
   void seed_optimizer_stats();
   void set_generic_rec_per_key(KEY *key, uint key_parts, bool is_primary);

@@ -131,11 +131,21 @@ bool LineairDBProxy::fetch_table_stats(
         table_stats_cache_[ts.table_name()] = ts.row_count();
     }
     last_index_ndv_.clear();
+    last_index_hist_.clear();
     for (const auto& in : response.index_ndv()) {
         IndexNdvResult result;
         result.available = in.available();
         result.values.assign(in.ndv().begin(), in.ndv().end());
         last_index_ndv_[in.index_name()] = std::move(result);
+
+        if (in.hist_available() && in.hist_bounds_size() > 0 &&
+            in.hist_bounds_size() == in.hist_cum_size()) {
+            IndexHistResult hist;
+            hist.available = true;
+            hist.bounds.assign(in.hist_bounds().begin(), in.hist_bounds().end());
+            hist.cum.assign(in.hist_cum().begin(), in.hist_cum().end());
+            last_index_hist_[in.index_name()] = std::move(hist);
+        }
     }
     return true;
 }
