@@ -920,6 +920,7 @@ std::vector<KeyValue> LineairDBProxy::tx_get_matching_keys_and_values_from_prefi
     LOG_DEBUG("CLIENT: tx_get_matching_keys_and_values_from_prefix called with tx_id=%ld, prefix=%s", tx_id, prefix.c_str());
     if (!connected_) {
         LOG_ERROR("RPC failed: Not connected to server");
+        tx->set_aborted(true);  // fail closed: a dead connection is not "no rows"
         return {};
     }
 
@@ -937,6 +938,7 @@ std::vector<KeyValue> LineairDBProxy::tx_get_matching_keys_and_values_from_prefi
     std::string raw_response;
     if (!send_protobuf_recv_binary(request, raw_response, MessageType::TX_GET_MATCHING_KEYS_AND_VALUES_FROM_PREFIX)) {
         LOG_ERROR("RPC failed: Failed to send message to server");
+        tx->set_aborted(true);  // fail closed: a transport failure is not "no rows"
         return {};
     }
 
