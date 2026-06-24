@@ -694,6 +694,15 @@ private:
   std::string autogenerate_key();
   std::string extract_key_from_mysql(const uchar *row_buffer);
 
+  /**
+   * @brief Commit one CREATE INDEX backfill chunk in its own transaction.
+   *
+   * @details Backfill may touch every row in the table. Chunking keeps each OCC
+   * transaction bounded while preserving the normal secondary-index write path.
+   * `ops` is cleared before return.
+   */
+  bool backfill_commit_chunk(std::vector<LineairDBProxy::BatchOp> &ops);
+
   void set_write_buffer(uchar *buf);
   bool is_primary_key_exists();
   bool is_primary_key_type_int();

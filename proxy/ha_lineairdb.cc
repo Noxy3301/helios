@@ -2883,7 +2883,28 @@ enum_alter_inplace_result ha_lineairdb::check_if_supported_inplace_alter(
   return HA_ALTER_INPLACE_EXCLUSIVE_LOCK;
 }
 
-bool ha_lineairdb::inplace_alter_table(TABLE *altered_table [[maybe_unused]],
+bool ha_lineairdb::backfill_commit_chunk(
+    std::vector<LineairDBProxy::BatchOp> &ops) {
+  if (ops.empty()) return true;
+
+  auto *chunk_tx =
+      new LineairDBTransaction(ha_thd(), get_proxy(), lineairdb_hton, FENCE);
+  chunk_tx->set_prefetch_mode(false);
+  chunk_tx->begin_transaction();
+  chunk_tx->choose_table(db_table_name);
+
+  // One checked batch write per chunk so a server-side abort is observed.
+  const bool wrote = chunk_tx->batch_write(db_table_name, ops);
+  ops.clear();
+  if (!wrote || chunk_tx->is_aborted()) {
+    chunk_tx->set_status_to_abort();
+    chunk_tx->end_transaction();
+    return false;
+  }
+  return chunk_tx->end_transaction();
+}
+
+bool ha_lineairdb::inplace_alter_table(TABLE *altered_table,
                                        Alter_inplace_info *ha_alter_info,
                                        const dd::Table *old_table_def
                                        [[maybe_unused]],
@@ -2891,20 +2912,98 @@ bool ha_lineairdb::inplace_alter_table(TABLE *altered_table [[maybe_unused]],
                                        [[maybe_unused]]) {
   DBUG_TRACE;
 
+  // Fill each new secondary index from existing rows. The EXCLUSIVE metadata
+  // lock is node-local, so this covers single-node ADD INDEX only; cross-node
+  // DDL coordination belongs to the ddl-sync work.
   userThread = ha_thd();
   auto proxy = get_proxy();
 
+  // Rows per backfill transaction; bounds each OCC write-set.
+  static constexpr uint64_t kBackfillWriteChunkRows = 2000;  // FIXME: make configurable
+
+  if (altered_table == nullptr || altered_table->s == nullptr) return true;
+
   for (uint i = 0; i < ha_alter_info->index_add_count; i++) {
-    uint key_idx = ha_alter_info->index_add_buffer[i];
-    KEY *key_info = &ha_alter_info->key_info_buffer[key_idx];
+    const uint key_idx = ha_alter_info->index_add_buffer[i];
+    const KEY *key_info = &ha_alter_info->key_info_buffer[key_idx];
+    const std::string index_name(key_info->name ? key_info->name : "");
+    if (index_name.empty()) return true;  // fail closed: unnamed index
 
-    uint index_type = (key_info->flags & HA_NOSAME) ? LDB_INDEX_UNIQUE : 0;
+    const uint index_type = (key_info->flags & HA_NOSAME) ? LDB_INDEX_UNIQUE : 0;
 
-    // In a disaggregated setup, another MySQL node may have already created
-    // this secondary index on the shared LineairDB server. Treat "already
-    // exists" as success — the MySQL-side metadata still needs to be updated.
-    proxy->db_create_secondary_index(
-        db_table_name, std::string(key_info->name), index_type);
+    // key_info_buffer and TABLE::key_info use different field-number bases;
+    // resolve the runtime KEY by name or the encoder reads the wrong column.
+    const KEY *runtime_key = nullptr;
+    for (uint k = 0; k < altered_table->s->keys; ++k) {
+      const KEY *candidate = &altered_table->key_info[k];
+      if (candidate->name != nullptr && index_name == candidate->name) {
+        runtime_key = candidate;
+        break;
+      }
+    }
+    if (runtime_key == nullptr) return true;
+
+    // LineairDB treats an encoded NULL key as a duplicate, but SQL allows many
+    // NULLs in a UNIQUE index; reject nullable UNIQUE backfill instead.
+    if (key_info->flags & HA_NOSAME) {
+      for (uint p = 0; p < runtime_key->user_defined_key_parts; ++p) {
+        if (runtime_key->key_part[p].null_bit != 0) return true;
+      }
+    }
+
+    // Register the index; fail closed on error. On a multi-index ALTER a later
+    // failure leaves earlier backfilled indexes on the server (the DD rollback
+    // hides them); purging them is the ddl-sync DROP work.
+    if (!proxy->db_create_secondary_index(db_table_name, index_name,
+                                          index_type)) {
+      return true;
+    }
+
+    auto *scan_tx = get_transaction(ha_thd());
+    if (scan_tx == nullptr || scan_tx->is_aborted()) return true;
+    scan_tx->choose_table(db_table_name);
+
+    // Fill from existing base rows in bounded chunks.
+    std::vector<LineairDBProxy::BatchOp> write_chunk;
+    write_chunk.reserve(kBackfillWriteChunkRows);
+    auto rows =
+        scan_tx->get_matching_keys_and_values_from_prefix(std::string());
+    if (scan_tx->is_aborted()) return true;  // aborted scan: emit no writes
+
+    bool failed = false;
+    for (auto &row : rows) {
+      if (row.second.empty()) continue;
+
+      const auto *value =
+          reinterpret_cast<const std::byte *>(row.second.data());
+      if (set_fields_from_lineairdb(table->record[0], value,
+                                    row.second.size())) {
+        failed = true;
+        break;
+      }
+
+      LineairDBProxy::BatchOp op;
+      op.type = LineairDBProxy::BatchOp::Type::SecondaryIndexWrite;
+      op.table_name = db_table_name;
+      op.index_name = index_name;
+      op.primary_key = std::move(row.first);
+      op.secondary_key =
+          build_secondary_key_from_row(table->record[0], *runtime_key);
+      write_chunk.push_back(std::move(op));
+
+      if (write_chunk.size() >= kBackfillWriteChunkRows &&
+          !backfill_commit_chunk(write_chunk)) {
+        failed = true;
+        break;
+      }
+    }
+
+    // Release the per-row blob arena on every loop exit.
+    blobroot.Clear();
+    if (failed || scan_tx->is_aborted() ||
+        !backfill_commit_chunk(write_chunk)) {
+      return true;
+    }
   }
 
   return false;
