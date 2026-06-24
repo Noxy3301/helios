@@ -403,7 +403,7 @@ public:
    * for bulk-prefetched grouped single-table SELECTs, where rows are not fetched
    * one-by-one by a secondary-key-to-PK lookup.
    */
-  bool helios_charge_materialise(uint index) const;
+  bool helios_charge_materialise(uint index, double rows) const;
 
   double helios_row_bytes() const {
     // stats.mean_rec_length is set in info() from table->s->reclength (>=100).
@@ -431,14 +431,13 @@ public:
     return c;
   }
 
-  Cost_estimate read_cost(uint index [[maybe_unused]], double ranges,
-                          double rows) override
+  Cost_estimate read_cost(uint index, double ranges, double rows) override
   {
     Cost_estimate c = helios_ref_cost(ranges, rows);
 
     // read_cost() is the non-covering path: the index narrows keys, then each
     // matching base row is fetched by PK. Covering scans use index_scan_cost().
-    if (helios_charge_materialise(index)) {
+    if (helios_charge_materialise(index, rows)) {
       c.add_io(std::ceil(rows / kEffBatch()) * kC_rpc());
       c.add_cpu(rows * kC_materialise());
     }

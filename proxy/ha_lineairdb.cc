@@ -876,26 +876,33 @@ local_aggregate_fallback:;
   return false;
 }
 
+// Row count at or above which a grouped aggregate is served by the override
+// (a primary full scan) rather than a selective secondary index.
+static constexpr double kSmallAggregateInputRows = 1000.0;  // FIXME: make configurable
+
 /**
- * @brief Return true when MySQL already chose a small bounded aggregate input.
+ * @brief Return true when the chosen leaf is a full PRIMARY scan.
  *
- * @details The aggregate override drives the handler through rnd_init(), which
- * is a full scan. That is useful for large scan aggregates, but wasteful when
- * the chosen access path is already a bounded ref/range lookup. If the access
- * tree cannot be tied back to this query block's single base table, keep the
- * existing override behavior.
+ * @details The override reads the table by a primary full scan, and autogen
+ * stages that primary range. Install it only for such a leaf; a secondary or
+ * bounded leaf would be staged as a scan the override never reads, so prefetch
+ * would miss and abort. Other leaves run on MySQL's normal executor.
  */
-static bool helios_has_small_bounded_aggregate_input(AccessPath *root_path,
-                                                     JOIN *join) {
+static bool helios_leaf_is_full_primary_scan(AccessPath *root_path,
+                                             JOIN *join) {
   if (root_path == nullptr || join == nullptr || join->query_block == nullptr ||
       join->query_block->leaf_tables == nullptr) {
     return false;
   }
 
-  const AccessPath *leaf = nullptr;
+  AccessPath *leaf = nullptr;
   WalkAccessPaths(root_path, join, WalkAccessPathPolicy::ENTIRE_TREE,
                   [&leaf](AccessPath *path, const JOIN *) -> bool {
-                    if (GetBasicTable(path) == nullptr)
+                    const TABLE *t = GetBasicTable(path);
+                    // Skip MySQL's internal aggregate temp table (autogen skips
+                    // it too); the override reads the base table, not the temp.
+                    if (t == nullptr ||
+                        (t->s != nullptr && t->s->tmp_table != NO_TMP_TABLE))
                       return false;
                     leaf = path;
                     return true;
@@ -907,16 +914,16 @@ static bool helios_has_small_bounded_aggregate_input(AccessPath *root_path,
   if (leaf_table != join->query_block->leaf_tables->table)
     return false;
 
-  const bool bounded = leaf->type == AccessPath::REF ||
-                       leaf->type == AccessPath::REF_OR_NULL ||
-                       leaf->type == AccessPath::EQ_REF ||
-                       leaf->type == AccessPath::INDEX_RANGE_SCAN;
-  if (!bounded)
-    return false;
-
-  constexpr double kSmallAggregateInputRows = 1000.0;  // FIXME: make configurable
-  const double rows = leaf->num_output_rows();
-  return rows >= 0.0 && rows < kSmallAggregateInputRows;
+  // A plain full table scan is the primary range the override reads.
+  if (leaf->type == AccessPath::TABLE_SCAN)
+    return true;
+  // A full index scan on the primary key is staged identically (no secondary
+  // index name), so the override consumes it too.
+  if (leaf->type == AccessPath::INDEX_SCAN && leaf_table->s != nullptr &&
+      leaf_table->s->primary_key != MAX_KEY &&
+      leaf->index_scan().idx == static_cast<int>(leaf_table->s->primary_key))
+    return true;
+  return false;
 }
 
 /**
@@ -928,7 +935,9 @@ static bool helios_has_small_bounded_aggregate_input(AccessPath *root_path,
 static int lineairdb_push_to_engine(THD *thd, AccessPath *root_path,
                                     JOIN *join) {
   if (!helios_offloadable_shape(thd, join)) return 0;
-  if (helios_has_small_bounded_aggregate_input(root_path, join)) return 0;
+  // The override reads a PRIMARY full scan; install it only when the plan chose
+  // that scan, else its read misses the staged secondary and prefetch aborts.
+  if (!helios_leaf_is_full_primary_scan(root_path, join)) return 0;
   join->override_executor_func = &helios_override_executor;
   return 0;
 }
@@ -3044,7 +3053,7 @@ static bool lineairdb_predict_prefetch_mode(THD *thd) {
  * Primary-key reads already produce the base row, and grouped single-table
  * SELECTs served by bulk prefetch do not fetch rows one by one by PK.
  */
-bool ha_lineairdb::helios_charge_materialise(uint index) const {
+bool ha_lineairdb::helios_charge_materialise(uint index, double rows) const {
   const TABLE *t = table;
   if (t == nullptr || t->in_use == nullptr) return true;
 
@@ -3072,7 +3081,10 @@ bool ha_lineairdb::helios_charge_materialise(uint index) const {
     return true;
   }
 
-  return false;
+  // A large grouped aggregate is served by the override via a primary full scan.
+  // Above the threshold, charge so the optimizer prefers that primary scan;
+  // below it, keep the secondary cheap so a small aggregate still uses the index.
+  return rows >= kSmallAggregateInputRows;
 }
 
 /**
