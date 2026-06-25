@@ -939,9 +939,10 @@ bool compile_tree_leaves(
 /**
  * @brief Return true when semijoin membership reduction is result-preserving.
  *
- * @details The reduction is limited to plain inner joins in the top-level
- * query block. Outer joins, semi/anti nests, and nested query blocks can need
- * rows that fail the membership test.
+ * @details The reduction is limited to plain inner joins. Outer joins and
+ * semi/anti nests can need rows that fail the membership test and stay
+ * rejected. Nested query blocks are allowed because the caller pairs source
+ * and probe within a single query block.
  */
 bool semijoin_safe_leaf(const TABLE *table) {
   if (table == nullptr) return false;
@@ -952,10 +953,10 @@ bool semijoin_safe_leaf(const TABLE *table) {
        embedding = embedding->embedding) {
     if (embedding->is_sj_or_aj_nest()) return false;
   }
-  const Query_block *query_block = ref->query_block;
-  if (query_block == nullptr || query_block->outer_query_block() != nullptr) {
-    return false;
-  }
+  // A leaf in a nested query block is allowed: the reduction loop pairs source
+  // and probe only within one query block, so membership stays a same-block
+  // inner-join reachability set that cannot drop a needed row.
+  if (ref->query_block == nullptr) return false;
   return true;
 }
 
