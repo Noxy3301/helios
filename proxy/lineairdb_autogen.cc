@@ -536,49 +536,132 @@ bool compile_ref_lookup(
     bound_items.push_back({kp, item_field});
   }
 
-  // Pick one iterator source; equality remap covers key parts bound through
-  // other earlier tables.
+  // Pick the iterator source. A keypart bound to a real earlier step iterates
+  // directly. One bound to a materialized temp table is remapped via Item_equal
+  // onto a real earlier step, staging only the leading key prefix; the dropped
+  // trailing keyparts over-fetch a superset that the WHERE re-check trims.
   TABLE *iter_table = nullptr;
   int iter_step = -1;
-  for (const BoundPart &bp : bound_items) {
-    auto source = table_steps.find(bp.item->field->table);
-    if (source == table_steps.end()) {
-      TABLE *src_table = bp.item->field->table;
-      if (src_table->s != nullptr && src_table->s->tmp_table != NO_TMP_TABLE) {
-        // The probe key comes from a MySQL temp table, so staging cannot
-        // enumerate its values. Cover the runtime probe by staging the probed
-        // table/index as a full range.
-        const THD *leaf_thd = table->in_use;
-        const bool plain_select =
-            leaf_thd != nullptr && leaf_thd->lex != nullptr &&
-            leaf_thd->lex->sql_command == SQLCOM_SELECT &&
-            table->reginfo.lock_type <= TL_READ;
-        if (!plain_select) {
-          if (reason != nullptr) {
-            *reason = "temp-table-driven probe outside plain SELECT";
-          }
-          return false;
-        }
-        step->bindings.clear();
-        step->end_bindings.clear();
-        step->for_each = false;
-        step->is_scan = true;
-        step->key_prefix.clear();
-        step->end_key_prefix = lineairdb_keyenc::scan_end_sentinel();
-        if (ref->key == static_cast<int>(table->s->primary_key)) {
-          step->index_name.clear();
-        } else {
-          step->index_name = key.name;
-        }
-        return !step->table_name.empty();
+
+  // Stage the probed table/index as a full range. Used when a temp-table-driven
+  // probe has no salvageable leading prefix.
+  auto stage_full_range = [&]() -> bool {
+    const THD *leaf_thd = table->in_use;
+    const bool plain_select =
+        leaf_thd != nullptr && leaf_thd->lex != nullptr &&
+        leaf_thd->lex->sql_command == SQLCOM_SELECT &&
+        table->reginfo.lock_type <= TL_READ;
+    if (!plain_select) {
+      if (reason != nullptr) {
+        *reason = "temp-table-driven probe outside plain SELECT";
       }
+      return false;
+    }
+    step->bindings.clear();
+    step->end_bindings.clear();
+    step->for_each = false;
+    step->is_scan = true;
+    step->key_prefix.clear();
+    step->end_key_prefix = lineairdb_keyenc::scan_end_sentinel();
+    if (ref->key == static_cast<int>(table->s->primary_key)) {
+      step->index_name.clear();
+    } else {
+      step->index_name = key.name;
+    }
+    return !step->table_name.empty();
+  };
+
+  // Resolve a bound keypart to a real earlier step: a direct staged source if
+  // it has one, else the latest real step among its Item_equal members.
+  auto resolve_real_step = [&](Item_field *bound, TABLE **out_table,
+                               int *out_step) -> bool {
+    auto direct = table_steps.find(bound->field->table);
+    if (direct != table_steps.end()) {
+      *out_table = bound->field->table;
+      *out_step = direct->second;
+      return true;
+    }
+    Item_equal *eq = bound->item_equal_all_join_nests != nullptr
+                         ? bound->item_equal_all_join_nests
+                         : bound->item_equal;
+    if (eq == nullptr) return false;
+    TABLE *best = nullptr;
+    int best_step = -1;
+    Item_equal::FieldProxy proxy(eq);
+    for (Item_field &candidate : proxy) {
+      if (candidate.field == nullptr) continue;
+      auto real = table_steps.find(candidate.field->table);
+      if (real != table_steps.end() && real->second > best_step) {
+        best_step = real->second;
+        best = candidate.field->table;
+      }
+    }
+    if (best == nullptr) return false;
+    *out_table = best;
+    *out_step = best_step;
+    return true;
+  };
+
+  // True when the keypart's field is on the iterator table or has an Item_equal
+  // member there (so the second pass below can bind it to that iterator).
+  auto remaps_onto = [&](Item_field *bound, TABLE *target) -> bool {
+    if (bound->field->table == target) return true;
+    Item_equal *eq = bound->item_equal_all_join_nests != nullptr
+                         ? bound->item_equal_all_join_nests
+                         : bound->item_equal;
+    if (eq == nullptr) return false;
+    Item_equal::FieldProxy proxy(eq);
+    for (Item_field &candidate : proxy) {
+      if (candidate.field != nullptr && candidate.field->table == target) {
+        return true;
+      }
+    }
+    return false;
+  };
+
+  bool saw_temp_source = false;
+  for (const BoundPart &bp : bound_items) {
+    if (table_steps.find(bp.item->field->table) != table_steps.end()) continue;
+    TABLE *src_table = bp.item->field->table;
+    if (src_table != nullptr && src_table->s != nullptr &&
+        src_table->s->tmp_table != NO_TMP_TABLE) {
+      saw_temp_source = true;
+    } else {
+      // Unknown source (neither a staged step nor a temp table): fail the read
+      // plan as unsupported, rather than salvaging or full-ranging it.
       if (reason != nullptr) *reason = "bound source is not an earlier step";
       return false;
     }
-    // Use the latest bound source as the probe iterator.
-    if (source->second > iter_step) {
-      iter_step = source->second;
-      iter_table = bp.item->field->table;
+  }
+
+  if (!saw_temp_source) {
+    // Every bound source is a real earlier step; iterate from the latest.
+    for (const BoundPart &bp : bound_items) {
+      const int source_step = table_steps.find(bp.item->field->table)->second;
+      if (source_step > iter_step) {
+        iter_step = source_step;
+        iter_table = bp.item->field->table;
+      }
+    }
+  } else {
+    // The first keypart picks the iterator; keep later keyparts only while they
+    // remap onto it. Drop the rest -- only a leading prefix can form a range.
+    std::vector<BoundPart> leading;
+    for (const BoundPart &bp : bound_items) {
+      if (iter_table == nullptr) {
+        TABLE *cand_table = nullptr;
+        int cand_step = -1;
+        if (!resolve_real_step(bp.item, &cand_table, &cand_step)) break;
+        iter_table = cand_table;
+        iter_step = cand_step;
+      } else if (!remaps_onto(bp.item, iter_table)) {
+        break;
+      }
+      leading.push_back(bp);
+    }
+    bound_items.swap(leading);
+    if (bound_items.empty() && leading_constant_parts == 0) {
+      return stage_full_range();
     }
   }
 
@@ -603,6 +686,7 @@ bool compile_ref_lookup(
         }
       }
       if (remapped == nullptr) {
+        if (saw_temp_source) return stage_full_range();
         if (reason != nullptr) {
           *reason = "for_each binding spans multiple source steps";
         }
@@ -612,6 +696,7 @@ bool compile_ref_lookup(
     }
     if (!append_bound_keypart(table, ref, bp.kp, source_field, iter_step,
                               step, reason)) {
+      if (saw_temp_source) return stage_full_range();
       return false;
     }
     ++bound_parts;
@@ -656,13 +741,13 @@ bool compile_ref_lookup(
   }
 
   step->key_prefix = lineairdb_keyenc::convert_key_to_ldbformat(
-      table, ref->key, ref->key_buff, first_n_keyparts_map(ref->key_parts));
+      table, ref->key, ref->key_buff, first_n_keyparts_map(used_key_parts));
   if (step->key_prefix.empty()) {
     if (reason != nullptr) *reason = "failed to encode constant key";
     return false;
   }
 
-  if (child_primary && ref->key_parts >= child_pk_parts) {
+  if (child_primary && used_key_parts >= child_pk_parts) {
     step->is_scan = false;
   } else {
     step->is_scan = true;
