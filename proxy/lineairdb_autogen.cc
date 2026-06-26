@@ -1144,23 +1144,121 @@ bool autogen_read_plan_from_qep(
     return raise_unsupported(thd, root->type, "QEP has no stageable leaves");
   }
 
-  // Attach scan filters after the full plan is known.
+  // SharedScan dedup: fold byte-identical staged steps into one -- (a)
+  // self-contained scans (a view read twice) and (b) for_each probes with
+  // deep-equal bindings (a self-join or correlated subquery). Keep the
+  // earliest, record the folded aliases (the filter/semijoin passes require
+  // agreement), and remap later steps' source_step (like execute_read_plan).
+  std::vector<std::vector<TABLE *>> step_aliases(steps.size());
+  for (size_t i = 0; i < steps.size() && i < added_tables.size(); ++i) {
+    if (added_tables[i] != nullptr) step_aliases[i].push_back(added_tables[i]);
+  }
+  {
+    const auto foldable = [](const LineairDBProxy::ReadPlanStep &s) {
+      return s.is_scan && s.scan_limit == 0 &&
+             s.aggregate_serialized.empty() && s.semijoins.empty();
+    };
+    const auto same_binding = [](const LineairDBProxy::ReadPlanKeyBinding &a,
+                                 const LineairDBProxy::ReadPlanKeyBinding &b) {
+      return a.source_step == b.source_step && a.source_row == b.source_row &&
+             a.source_offset == b.source_offset &&
+             a.source_length == b.source_length &&
+             a.use_midpoint == b.use_midpoint && a.from_key == b.from_key &&
+             a.source_column == b.source_column &&
+             a.column_as_int_key == b.column_as_int_key &&
+             a.int_delta == b.int_delta;
+    };
+    const auto same_bindings =
+        [&](const std::vector<LineairDBProxy::ReadPlanKeyBinding> &a,
+            const std::vector<LineairDBProxy::ReadPlanKeyBinding> &b) {
+          if (a.size() != b.size()) return false;
+          for (size_t k = 0; k < a.size(); ++k)
+            if (!same_binding(a[k], b[k])) return false;
+          return true;
+        };
+    const auto same_step = [&](const LineairDBProxy::ReadPlanStep &a,
+                               const LineairDBProxy::ReadPlanStep &b) {
+      return a.table_name == b.table_name && a.index_name == b.index_name &&
+             a.key_prefix == b.key_prefix &&
+             a.end_key_prefix == b.end_key_prefix &&
+             a.for_each == b.for_each && a.reverse_scan == b.reverse_scan &&
+             a.serialized_filter == b.serialized_filter &&
+             same_bindings(a.bindings, b.bindings) &&
+             same_bindings(a.end_bindings, b.end_bindings);
+    };
+    std::vector<uint32_t> new_index(steps.size(), 0);
+    std::vector<LineairDBProxy::ReadPlanStep> folded;
+    std::vector<std::vector<TABLE *>> folded_aliases;
+    folded.reserve(steps.size());
+    folded_aliases.reserve(steps.size());
+    bool any_fold = false;
+    for (size_t j = 0; j < steps.size(); ++j) {
+      int target = -1;
+      if (foldable(steps[j])) {
+        for (size_t i = 0; i < folded.size(); ++i) {
+          if (foldable(folded[i]) && same_step(folded[i], steps[j])) {
+            target = static_cast<int>(i);
+            break;
+          }
+        }
+      }
+      if (target >= 0) {
+        new_index[j] = static_cast<uint32_t>(target);
+        for (TABLE *t : step_aliases[j]) folded_aliases[target].push_back(t);
+        any_fold = true;
+      } else {
+        new_index[j] = static_cast<uint32_t>(folded.size());
+        folded.push_back(std::move(steps[j]));
+        folded_aliases.push_back(std::move(step_aliases[j]));
+      }
+    }
+    steps = std::move(folded);
+    step_aliases = std::move(folded_aliases);
+    if (any_fold) {
+      for (auto &s : steps) {
+        for (auto &b : s.bindings) b.source_step = new_index[b.source_step];
+        for (auto &b : s.end_bindings)
+          b.source_step = new_index[b.source_step];
+        for (auto &sj : s.semijoins)
+          sj.source_step = new_index[sj.source_step];
+      }
+      for (auto &kv : table_steps) {
+        if (kv.second >= 0 && kv.second < static_cast<int>(new_index.size()))
+          kv.second = static_cast<int>(new_index[kv.second]);
+      }
+    }
+  }
+
+  // Attach scan filters once the plan is known. A rejected key caches as a
+  // table-level not-found entry shared by every step on the table, so skip a
+  // multi-step table; on a folded step attach only when EVERY alias builds the
+  // SAME predicate (then a dropped row is one each alias's own WHERE discards).
   if (allow_filter_pushdown) {
     std::unordered_map<std::string, int> table_step_count;
     for (const auto &s : steps) table_step_count[s.table_name]++;
     for (size_t i = 0; i < steps.size(); ++i) {
       auto &s = steps[i];
       if (!s.is_scan) continue;
-      // Rejected keys become table-level not-found cache entries. If the same
-      // physical table appears more than once, aliases may have different
-      // predicates, so skip filter pushdown for that table.
       if (table_step_count[s.table_name] != 1) continue;
-      TABLE *t = i < added_tables.size() ? added_tables[i] : nullptr;
-      if (t == nullptr) continue;
+      const std::vector<TABLE *> &aliases = step_aliases[i];
+      if (aliases.empty()) continue;
       std::string table_filter;
-      if (build_single_table_filter(thd, t, &table_filter)) {
-        s.serialized_filter = std::move(table_filter);
+      bool agree = true;
+      for (size_t a = 0; a < aliases.size(); ++a) {
+        std::string f;
+        if (aliases[a] == nullptr ||
+            !build_single_table_filter(thd, aliases[a], &f) || f.empty()) {
+          agree = false;
+          break;
+        }
+        if (a == 0) {
+          table_filter = std::move(f);
+        } else if (f != table_filter) {
+          agree = false;
+          break;
+        }
       }
+      if (agree) s.serialized_filter = std::move(table_filter);
     }
   }
 
@@ -1179,16 +1277,14 @@ bool autogen_read_plan_from_qep(
     };
     for (auto &e : eq_edges) uf[find_root(e.first)] = find_root(e.second);
 
-    // Probe candidates are grouped range scans driven by earlier rows.
-    for (auto &kvp : table_steps) {
-      TABLE *probe_t = kvp.first;
-      const int probe_step = kvp.second;
-      if (probe_step < 0 || probe_step >= static_cast<int>(steps.size()))
-        continue;
+    // Per-alias chooser: a qualifying membership source for probe_t's step, or
+    // false if none. Candidates are earlier steps in the same query block.
+    const auto choose_semijoin =
+        [&](TABLE *probe_t, size_t probe_step,
+            LineairDBProxy::ReadPlanStep::Semijoin *out_sj) -> bool {
       auto &ps = steps[probe_step];
-      if (!(ps.for_each && ps.is_scan)) continue;  // FER/FES high-fanout only
-      if (!semijoin_safe_leaf(probe_t)) continue;
-      if (probe_t->s == nullptr) continue;
+      if (!semijoin_safe_leaf(probe_t)) return false;
+      if (probe_t->s == nullptr) return false;
 
       // Find the field whose value each probe row will join on.
       Field *probe_field = nullptr;
@@ -1203,14 +1299,14 @@ bool autogen_read_plan_from_qep(
         probe_field =
             probe_t->key_info[probe_t->s->primary_key].key_part[0].field;
       }
-      if (probe_field == nullptr || uf.find(probe_field) == uf.end()) continue;
+      if (probe_field == nullptr || uf.find(probe_field) == uf.end())
+        return false;
       Field *cls = find_root(probe_field);
 
-      // Source candidates must be earlier steps in the same query block.
       for (auto &kvp2 : table_steps) {
         TABLE *src_t = kvp2.first;
         const int src_step = kvp2.second;
-        if (src_step >= probe_step || src_step < 0 ||
+        if (src_step >= static_cast<int>(probe_step) || src_step < 0 ||
             src_step >= static_cast<int>(steps.size()))
           continue;
         if (!semijoin_safe_leaf(src_t)) continue;
@@ -1235,18 +1331,46 @@ bool autogen_read_plan_from_qep(
         if (uf.find(src_pk) == uf.end() || find_root(src_pk) != cls) continue;
         if (!semijoin_keys_compatible(src_pk, probe_field)) continue;
 
-        // Attach one source membership test to this probe step.
         const int sc = qep_table_field_index(src_t, src_pk);
         const int pc = qep_table_field_index(probe_t, probe_field);
         if (sc < 0 || pc < 0) continue;
-        LineairDBProxy::ReadPlanStep::Semijoin sj;
-        sj.source_step = static_cast<uint32_t>(src_step);
-        sj.source_column = static_cast<uint32_t>(sc);
-        sj.probe_column = static_cast<uint32_t>(pc);
-        if (!src_prefiltered) sj.source_filter = std::move(sf_filter);
-        ps.semijoins.push_back(std::move(sj));
-        break;  // one semijoin source per probe step
+        out_sj->source_step = static_cast<uint32_t>(src_step);
+        out_sj->source_column = static_cast<uint32_t>(sc);
+        out_sj->probe_column = static_cast<uint32_t>(pc);
+        out_sj->source_filter = src_prefiltered ? std::string() : sf_filter;
+        return true;  // one semijoin source per probe step
       }
+      return false;
+    };
+
+    // A folded probe serves several aliases, so a membership reduction is sound
+    // only when EVERY alias picks the SAME semijoin -- a row one alias prunes
+    // must be one every alias's join would drop. Any mismatch vetoes.
+    for (size_t pi = 0; pi < steps.size(); ++pi) {
+      auto &ps = steps[pi];
+      if (!(ps.for_each && ps.is_scan)) continue;  // FER/FES high-fanout only
+      if (pi >= step_aliases.size()) continue;
+      const std::vector<TABLE *> &aliases = step_aliases[pi];
+      if (aliases.empty()) continue;
+      LineairDBProxy::ReadPlanStep::Semijoin chosen;
+      bool unanimous = true;
+      for (size_t a = 0; a < aliases.size(); ++a) {
+        LineairDBProxy::ReadPlanStep::Semijoin cand;
+        if (aliases[a] == nullptr || !choose_semijoin(aliases[a], pi, &cand)) {
+          unanimous = false;
+          break;
+        }
+        if (a == 0) {
+          chosen = cand;
+        } else if (!(chosen.source_step == cand.source_step &&
+                     chosen.source_column == cand.source_column &&
+                     chosen.probe_column == cand.probe_column &&
+                     chosen.source_filter == cand.source_filter)) {
+          unanimous = false;
+          break;
+        }
+      }
+      if (unanimous) ps.semijoins.push_back(std::move(chosen));
     }
   }
 
