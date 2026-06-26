@@ -727,6 +727,10 @@ bool compile_ref_lookup(
 
   if (bound_parts > 0) {
     step->for_each = true;
+    // Lossless only when every ref keypart was staged. A temp-table-driven
+    // probe that dropped trailing keyparts (above) stages a wider superset the
+    // WHERE re-check trims; existence_only must not cap such a probe.
+    step->exact_keyed_probe = (used_key_parts == ref->key_parts);
     if (child_primary && used_key_parts >= child_pk_parts) {
       // Full-primary-key point probe per source row.
       step->is_scan = false;
@@ -1087,6 +1091,76 @@ void collect_inner_unit_roots(Query_expression *unit,
   }
 }
 
+// Collect tables that are the bare, residual-free inner of an anti-join. Only
+// such an inner is safe to cap at one row: a filter above the leaf could reject
+// the first match while a later row qualifies. qep_leaf_info() is that test.
+static void collect_existence_only_antijoin_inners(
+    AccessPath *p, std::unordered_set<const TABLE *> *out) {
+  if (p == nullptr) return;
+  auto mark_if_bare = [&](AccessPath *inner) {
+    TABLE *t = nullptr;
+    Index_lookup *ref = nullptr;
+    bool fs = false;
+    int fsi = -1;
+    if (inner != nullptr && qep_leaf_info(inner, &t, &ref, &fs, &fsi) &&
+        t != nullptr) {
+      out->insert(t);
+    }
+  };
+  switch (p->type) {
+    case AccessPath::NESTED_LOOP_JOIN:
+      if (p->nested_loop_join().join_type == JoinType::ANTI)
+        mark_if_bare(p->nested_loop_join().inner);
+      collect_existence_only_antijoin_inners(p->nested_loop_join().outer, out);
+      collect_existence_only_antijoin_inners(p->nested_loop_join().inner, out);
+      return;
+    case AccessPath::BKA_JOIN:
+      if (p->bka_join().join_type == JoinType::ANTI)
+        mark_if_bare(p->bka_join().inner);
+      collect_existence_only_antijoin_inners(p->bka_join().outer, out);
+      collect_existence_only_antijoin_inners(p->bka_join().inner, out);
+      return;
+    case AccessPath::HASH_JOIN:
+      // A hash anti-join probes its build side as a whole, not once per outer
+      // row; "one row per probe" does not apply -- just recurse.
+      collect_existence_only_antijoin_inners(p->hash_join().outer, out);
+      collect_existence_only_antijoin_inners(p->hash_join().inner, out);
+      return;
+    case AccessPath::FILTER:
+      collect_existence_only_antijoin_inners(p->filter().child, out);
+      return;
+    case AccessPath::SORT:
+      collect_existence_only_antijoin_inners(p->sort().child, out);
+      return;
+    case AccessPath::LIMIT_OFFSET:
+      collect_existence_only_antijoin_inners(p->limit_offset().child, out);
+      return;
+    case AccessPath::AGGREGATE:
+      collect_existence_only_antijoin_inners(p->aggregate().child, out);
+      return;
+    case AccessPath::STREAM:
+      collect_existence_only_antijoin_inners(p->stream().child, out);
+      return;
+    case AccessPath::TEMPTABLE_AGGREGATE:
+      collect_existence_only_antijoin_inners(
+          p->temptable_aggregate().subquery_path, out);
+      collect_existence_only_antijoin_inners(
+          p->temptable_aggregate().table_path, out);
+      return;
+    case AccessPath::WEEDOUT:
+      collect_existence_only_antijoin_inners(p->weedout().child, out);
+      return;
+    case AccessPath::NESTED_LOOP_SEMIJOIN_WITH_DUPLICATE_REMOVAL:
+      collect_existence_only_antijoin_inners(
+          p->nested_loop_semijoin_with_duplicate_removal().outer, out);
+      collect_existence_only_antijoin_inners(
+          p->nested_loop_semijoin_with_duplicate_removal().inner, out);
+      return;
+    default:
+      return;
+  }
+}
+
 }  // namespace
 
 bool autogen_read_plan_from_qep(
@@ -1205,6 +1279,11 @@ bool autogen_read_plan_from_qep(
       if (target >= 0) {
         new_index[j] = static_cast<uint32_t>(target);
         for (TABLE *t : step_aliases[j]) folded_aliases[target].push_back(t);
+        // Two probes can fold to the same shape yet differ in exactness (one
+        // dropped a keypart). Keep the folded group exact only when every member
+        // was; otherwise the cap could hit a widened probe.
+        folded[target].exact_keyed_probe =
+            folded[target].exact_keyed_probe && steps[j].exact_keyed_probe;
         any_fold = true;
       } else {
         new_index[j] = static_cast<uint32_t>(folded.size());
@@ -1371,6 +1450,32 @@ bool autogen_read_plan_from_qep(
         }
       }
       if (unanimous) ps.semijoins.push_back(std::move(chosen));
+    }
+  }
+
+  // Mark anti-join inner probes to cap at the first match. Only on the
+  // no-validate read path: a capped, incomplete range cannot pass commit-time
+  // validation, the same reason filter and projection pushdown gate on it.
+  if (allow_filter_pushdown) {
+    std::unordered_set<const TABLE *> existence_only_inners;
+    collect_existence_only_antijoin_inners(root, &existence_only_inners);
+    // A folded probe stands for several aliases. Cap it only when all of them
+    // are residual-free anti-join inners and the probe is an exact lookup, the
+    // same all-must-agree rule the filter and semijoin passes use.
+    for (size_t i = 0; i < steps.size(); ++i) {
+      auto &s = steps[i];
+      if (!(s.for_each && s.exact_keyed_probe)) continue;
+      if (i >= step_aliases.size()) continue;
+      const std::vector<TABLE *> &aliases = step_aliases[i];
+      if (aliases.empty()) continue;
+      bool all_inner = true;
+      for (TABLE *t : aliases) {
+        if (t == nullptr || existence_only_inners.count(t) == 0) {
+          all_inner = false;
+          break;
+        }
+      }
+      if (all_inner) s.existence_only = true;
     }
   }
 

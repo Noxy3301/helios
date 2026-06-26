@@ -1407,6 +1407,10 @@ void LineairDBRpc::handleTxExecuteReadPlan(const std::string& message,
         };
 
         if (step.for_each()) {
+            // Anti-join probe: it only needs a match to exist. Stop after the
+            // first surviving row. No scan_limit -- index_next reports a clean
+            // EOF (see PlanStep.existence_only).
+            const bool existence_only = step.existence_only();
             int source_step = -1;
             if (step.bindings_size() > 0) {
                 source_step = static_cast<int>(step.bindings(0).source_step());
@@ -1565,6 +1569,7 @@ void LineairDBRpc::handleTxExecuteReadPlan(const std::string& message,
                                             std::move(r.value)));
                                         out.tids.push_back(r.tid);
                                         ++group_rows;
+                                        if (existence_only) break;
                                     }
                                 } else {
                                     auto scan_result =
@@ -1591,6 +1596,7 @@ void LineairDBRpc::handleTxExecuteReadPlan(const std::string& message,
                                             std::move(r.value)));
                                         out.tids.push_back(r.tid);
                                         ++group_rows;
+                                        if (existence_only) break;
                                     }
                                 }
                                 out.group_rows.push_back(group_rows);
@@ -1682,6 +1688,7 @@ void LineairDBRpc::handleTxExecuteReadPlan(const std::string& message,
                                 project_value(std::move(r.value)));
                             step_result->add_scan_tids(r.tid);
                             ++group_rows;
+                            if (existence_only) break;
                         }
                     } else {
                         auto scan_result =
@@ -1706,6 +1713,7 @@ void LineairDBRpc::handleTxExecuteReadPlan(const std::string& message,
                                 project_value(std::move(r.value)));
                             step_result->add_scan_tids(r.tid);
                             ++group_rows;
+                            if (existence_only) break;
                         }
                     }
                     step_result->add_group_sizes(
