@@ -376,7 +376,7 @@ static int autogen_and_execute_prefetch(THD *thd, AccessPath *root,
 
   // Loads the prefetched rows into the local cache and validation sets.
   tx->execute_read_plan(steps);
-  return tx->is_aborted() ? HA_ERR_LOCK_DEADLOCK : 0;
+  return prefetch_abort_errno(thd, tx);
 }
 
 // Plan root of the whole statement. This can still be null while MySQL is
@@ -562,7 +562,7 @@ int maybe_prefetch_for_legacy_dml_handler(
   }
 
   tx->execute_read_plan(steps);
-  return tx->is_aborted() ? HA_ERR_LOCK_DEADLOCK : 0;
+  return prefetch_abort_errno(thd, tx);
 }
 
 int prefetch_reject_unsupported(THD *thd, LineairDBTransaction *tx,
@@ -580,4 +580,13 @@ int prefetch_reject_unsupported(THD *thd, LineairDBTransaction *tx,
   if (tx != nullptr) tx->set_status_to_abort();
   thd_mark_transaction_to_rollback(thd, 1);
   return HA_ERR_UNSUPPORTED;
+}
+
+int prefetch_abort_errno(THD *thd, LineairDBTransaction *tx) {
+  if (tx == nullptr || !tx->is_aborted()) return 0;
+  if (tx->aborted_by_cache_miss()) {
+    return prefetch_reject_unsupported(thd, tx, "prefetch cache miss");
+  }
+  thd_mark_transaction_to_rollback(thd, 1);
+  return HA_ERR_LOCK_DEADLOCK;
 }
