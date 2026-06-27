@@ -2893,12 +2893,14 @@ enum_alter_inplace_result ha_lineairdb::check_if_supported_inplace_alter(
 }
 
 bool ha_lineairdb::backfill_commit_chunk(
-    std::vector<LineairDBProxy::BatchOp> &ops) {
+    std::vector<LineairDBProxy::BatchOp> &ops, bool use_stateless_commit) {
   if (ops.empty()) return true;
 
   auto *chunk_tx =
       new LineairDBTransaction(ha_thd(), get_proxy(), lineairdb_hton, FENCE);
-  chunk_tx->set_prefetch_mode(false);
+  // FIXME: set_prefetch_mode is misnamed -- the flag selects the stateless commit
+  // path (true skips the staging read-set/write-set scans), not a read-prefetch toggle.
+  chunk_tx->set_prefetch_mode(use_stateless_commit);
   chunk_tx->begin_transaction();
   chunk_tx->choose_table(db_table_name);
 
@@ -2939,6 +2941,9 @@ bool ha_lineairdb::inplace_alter_table(TABLE *altered_table,
     if (index_name.empty()) return true;  // fail closed: unnamed index
 
     const uint index_type = (key_info->flags & HA_NOSAME) ? LDB_INDEX_UNIQUE : 0;
+    // A unique index keeps the staging commit path for its in-write duplicate
+    // check; only a non-unique index is safe to route through the stateless path.
+    const bool use_stateless_commit = (index_type != LDB_INDEX_UNIQUE);
 
     // key_info_buffer and TABLE::key_info use different field-number bases;
     // resolve the runtime KEY by name or the encoder reads the wrong column.
@@ -3001,7 +3006,7 @@ bool ha_lineairdb::inplace_alter_table(TABLE *altered_table,
       write_chunk.push_back(std::move(op));
 
       if (write_chunk.size() >= kBackfillWriteChunkRows &&
-          !backfill_commit_chunk(write_chunk)) {
+          !backfill_commit_chunk(write_chunk, use_stateless_commit)) {
         failed = true;
         break;
       }
@@ -3010,7 +3015,7 @@ bool ha_lineairdb::inplace_alter_table(TABLE *altered_table,
     // Release the per-row blob arena on every loop exit.
     blobroot.Clear();
     if (failed || scan_tx->is_aborted() ||
-        !backfill_commit_chunk(write_chunk)) {
+        !backfill_commit_chunk(write_chunk, use_stateless_commit)) {
       return true;
     }
   }

@@ -697,10 +697,13 @@ private:
    * @brief Commit one CREATE INDEX backfill chunk in its own transaction.
    *
    * @details Backfill may touch every row in the table. Chunking keeps each OCC
-   * transaction bounded while preserving the normal secondary-index write path.
-   * `ops` is cleared before return.
+   * transaction bounded. When `use_stateless_commit` is true the chunk commits
+   * through the stateless path, which skips the staging per-write read-set and
+   * write-set scans; it is reserved for non-unique indexes. `ops` is cleared
+   * before return.
    */
-  bool backfill_commit_chunk(std::vector<LineairDBProxy::BatchOp> &ops);
+  bool backfill_commit_chunk(std::vector<LineairDBProxy::BatchOp> &ops,
+                             bool use_stateless_commit);
 
   void set_write_buffer(uchar *buf);
   bool is_primary_key_exists();
