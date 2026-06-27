@@ -266,6 +266,9 @@ private:
   }
   // Proxy-side write set for exact primary-key writes/deletes
   std::vector<LocalRowEntry> own_writes_;
+  // Dedup/lookup index into own_writes_, keyed like row_cache_. own_writes_ only
+  // ever grows by push_back, so a stored index never moves and stays valid.
+  std::unordered_map<std::string, size_t> own_writes_index_;
 
   // OCC commit-time read validation, two append-only sets (Silo read_set
   // style); the server re-checks each at commit and aborts on a mismatch:

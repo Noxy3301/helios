@@ -1033,12 +1033,9 @@ bool LineairDBTransaction::flush_write_buffer_for_table(
 std::optional<LineairDBTransaction::LocalRowEntry>
 LineairDBTransaction::lookup_write_set(
     const std::string& table_name, const std::string& key) const {
-  for (auto it = own_writes_.rbegin(); it != own_writes_.rend(); ++it) {
-    if (it->table_name == table_name && it->key == key) {
-      return *it;
-    }
-  }
-  return std::nullopt;
+  auto it = own_writes_index_.find(make_row_cache_key(table_name, key));
+  if (it == own_writes_index_.end()) return std::nullopt;
+  return own_writes_[it->second];
 }
 
 std::optional<LineairDBTransaction::LocalRowEntry>
@@ -1205,14 +1202,18 @@ void LineairDBTransaction::record_write(const std::string& table_name,
   // A later write/delete replaces any cached read for the same key
   drop_row_cache(table_name, key);
 
-  for (auto& entry : own_writes_) {
-    if (entry.table_name == table_name && entry.key == key) {
-      entry.found = found;
-      entry.value = value;
-      return;
-    }
+  std::string index_key = make_row_cache_key(table_name, key);
+  auto it = own_writes_index_.find(index_key);
+  if (it != own_writes_index_.end()) {
+    LocalRowEntry& entry = own_writes_[it->second];
+    entry.found = found;
+    entry.value = value;
+    return;
   }
+  // Append first so a throwing push_back leaves both containers untouched; the
+  // index entry then points at the element that is already in place.
   own_writes_.push_back({table_name, key, found, value});
+  own_writes_index_.emplace(std::move(index_key), own_writes_.size() - 1);
 }
 
 void LineairDBTransaction::record_row_cache(
