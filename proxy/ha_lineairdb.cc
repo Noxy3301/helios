@@ -2926,6 +2926,16 @@ bool ha_lineairdb::backfill_indexes_parallel(
   // secondary-key hash. Single-threaded -- decode uses the shared record buffer.
   std::vector<std::vector<LineairDBProxy::BatchOp>> partition(
       kBackfillParallelWorkers);
+  // Reserve each bucket to its expected hash share so the per-row push_back
+  // below does not repeatedly reallocate the per-worker write buffers.
+  const size_t total_ops = rows.size() * specs.size();
+  const size_t reserve_per_bucket =
+      total_ops == 0 ? 0
+                     : total_ops / kBackfillParallelWorkers +
+                           total_ops / (kBackfillParallelWorkers * 8) + 1;
+  if (reserve_per_bucket != 0) {
+    for (auto &bucket : partition) bucket.reserve(reserve_per_bucket);
+  }
   std::hash<std::string> hasher;
   bool decode_failed = false;
   for (auto &row : rows) {
