@@ -697,13 +697,36 @@ private:
    * @brief Commit one CREATE INDEX backfill chunk in its own transaction.
    *
    * @details Backfill may touch every row in the table. Chunking keeps each OCC
-   * transaction bounded. When `use_stateless_commit` is true the chunk commits
-   * through the stateless path, which skips the staging per-write read-set and
-   * write-set scans; it is reserved for non-unique indexes. `ops` is cleared
-   * before return.
+   * transaction bounded while preserving the normal secondary-index write path.
+   * `ops` is cleared before return.
    */
-  bool backfill_commit_chunk(std::vector<LineairDBProxy::BatchOp> &ops,
-                             bool use_stateless_commit);
+  bool backfill_commit_chunk(std::vector<LineairDBProxy::BatchOp> &ops);
+
+  /**
+   * @brief Backfill one or more non-unique secondary indexes in parallel.
+   *
+   * @details Decodes each row once on the calling thread and builds one write
+   * per index in `specs` (name, runtime KEY), so a single scan and decode feed
+   * every index. Writes are partitioned by secondary-key hash and committed on
+   * per-partition worker threads, each with its own server connection. The hash
+   * partition commits every op for a secondary key on one worker, so no two
+   * workers mutate the same index DataItem; distinct keys commit through the
+   * normal concurrent path LineairDB serves for multiple query layers.
+   * Returns false if any worker commit fails; the caller fails the ALTER.
+   */
+  bool backfill_indexes_parallel(
+      std::vector<std::pair<std::string, std::string>> &rows,
+      const std::vector<std::pair<std::string, const KEY *>> &specs);
+
+  /**
+   * @brief Backfill one unique secondary index serially via the staging path.
+   *
+   * @details Scans the table and commits in bounded chunks, keeping the staging
+   * commit path so the server's in-write duplicate check runs. Returns false on
+   * any failure; the caller fails the ALTER.
+   */
+  bool backfill_unique_serial(const std::string &index_name,
+                              const KEY &runtime_key);
 
   void set_write_buffer(uchar *buf);
   bool is_primary_key_exists();

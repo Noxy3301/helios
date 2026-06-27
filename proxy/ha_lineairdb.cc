@@ -106,6 +106,7 @@
 #include <optional>
 #include <sstream>
 #include <string_view>
+#include <thread>
 #include <utility>
 #include <vector>
 // for ::strcasecmp
@@ -143,6 +144,11 @@
 
 // LineairDB SecondaryIndexOption::Constraint wire bit for UNIQUE.
 static constexpr uint LDB_INDEX_UNIQUE = 1u;
+
+// Rows per backfill commit; bounds each OCC write-set.
+static constexpr uint64_t kBackfillWriteChunkRows = 2000;  // FIXME: make configurable
+// Worker threads that commit a non-unique index backfill in parallel.
+static constexpr size_t kBackfillParallelWorkers = 16;  // FIXME: make configurable
 
 // LineairDB server connection target (GLOBAL sysvars backing storage)
 static char *srv_server_host = nullptr;
@@ -2893,14 +2899,12 @@ enum_alter_inplace_result ha_lineairdb::check_if_supported_inplace_alter(
 }
 
 bool ha_lineairdb::backfill_commit_chunk(
-    std::vector<LineairDBProxy::BatchOp> &ops, bool use_stateless_commit) {
+    std::vector<LineairDBProxy::BatchOp> &ops) {
   if (ops.empty()) return true;
 
   auto *chunk_tx =
       new LineairDBTransaction(ha_thd(), get_proxy(), lineairdb_hton, FENCE);
-  // FIXME: set_prefetch_mode is misnamed -- the flag selects the stateless commit
-  // path (true skips the staging read-set/write-set scans), not a read-prefetch toggle.
-  chunk_tx->set_prefetch_mode(use_stateless_commit);
+  chunk_tx->set_prefetch_mode(false);
   chunk_tx->begin_transaction();
   chunk_tx->choose_table(db_table_name);
 
@@ -2913,6 +2917,121 @@ bool ha_lineairdb::backfill_commit_chunk(
     return false;
   }
   return chunk_tx->end_transaction();
+}
+
+bool ha_lineairdb::backfill_indexes_parallel(
+    std::vector<std::pair<std::string, std::string>> &rows,
+    const std::vector<std::pair<std::string, const KEY *>> &specs) {
+  // Phase A: decode each row once, build one write per index, and bucket it by
+  // secondary-key hash. Single-threaded -- decode uses the shared record buffer.
+  std::vector<std::vector<LineairDBProxy::BatchOp>> partition(
+      kBackfillParallelWorkers);
+  std::hash<std::string> hasher;
+  bool decode_failed = false;
+  for (auto &row : rows) {
+    if (row.second.empty()) continue;
+    const auto *value = reinterpret_cast<const std::byte *>(row.second.data());
+    if (set_fields_from_lineairdb(table->record[0], value, row.second.size())) {
+      decode_failed = true;
+      break;
+    }
+    for (const auto &spec : specs) {
+      LineairDBProxy::BatchOp op;
+      op.type = LineairDBProxy::BatchOp::Type::SecondaryIndexWrite;
+      op.table_name = db_table_name;
+      op.index_name = spec.first;
+      op.primary_key = row.first;
+      op.secondary_key =
+          build_secondary_key_from_row(table->record[0], *spec.second);
+      partition[hasher(op.secondary_key) % kBackfillParallelWorkers].push_back(
+          std::move(op));
+    }
+  }
+  blobroot.Clear();
+  if (decode_failed) return false;
+
+  // Phase B: one worker per partition, each on its own connection. The hash
+  // partition commits every op for a secondary key on one worker, so no two
+  // workers mutate the same index DataItem; distinct keys are distinct DataItems
+  // committed through the normal concurrent path LineairDB serves for multiple
+  // query layers. Workers touch no MySQL state; a failure sets the shared flag
+  // for the caller to report.
+  std::atomic<bool> failed{false};
+  const std::string host =
+      srv_server_host ? srv_server_host : std::string("127.0.0.1");
+  const int port = static_cast<int>(srv_server_port);
+  std::vector<std::thread> workers;
+  workers.reserve(kBackfillParallelWorkers);
+  for (size_t w = 0; w < kBackfillParallelWorkers; ++w) {
+    if (partition[w].empty()) continue;
+    workers.emplace_back([&, w]() {
+      LineairDBProxy conn(host, port);
+      std::vector<LineairDBProxy::BatchOp> chunk;
+      chunk.reserve(kBackfillWriteChunkRows);
+      // Ship the buffered writes as one stateless commit (no reads to validate).
+      auto commit_chunk = [&]() -> bool {
+        if (chunk.empty()) return true;
+        std::string reason;
+        const bool ok = conn.tx_validate_and_commit({}, {}, {}, {}, chunk, {},
+                                                     FENCE, &reason);
+        chunk.clear();
+        return ok;
+      };
+      for (auto &op : partition[w]) {
+        if (failed.load(std::memory_order_relaxed)) return;
+        chunk.push_back(std::move(op));
+        if (chunk.size() >= kBackfillWriteChunkRows && !commit_chunk()) {
+          failed.store(true, std::memory_order_relaxed);
+          return;
+        }
+      }
+      if (!commit_chunk()) failed.store(true, std::memory_order_relaxed);
+    });
+  }
+  for (auto &t : workers) t.join();
+  return !failed.load(std::memory_order_relaxed);
+}
+
+bool ha_lineairdb::backfill_unique_serial(const std::string &index_name,
+                                          const KEY &runtime_key) {
+  // A unique index scans and commits serially through the staging path, which
+  // keeps the in-write duplicate check. Its cost is small (no unique index is on
+  // the large fact table); the parallel scan-once path is for the non-unique set.
+  auto *scan_tx = get_transaction(ha_thd());
+  if (scan_tx == nullptr || scan_tx->is_aborted()) return false;
+  scan_tx->choose_table(db_table_name);
+  auto rows = scan_tx->get_matching_keys_and_values_from_prefix(std::string());
+  if (scan_tx->is_aborted()) return false;
+
+  std::vector<LineairDBProxy::BatchOp> write_chunk;
+  write_chunk.reserve(kBackfillWriteChunkRows);
+  bool failed = false;
+  for (auto &row : rows) {
+    if (row.second.empty()) continue;
+    const auto *value = reinterpret_cast<const std::byte *>(row.second.data());
+    if (set_fields_from_lineairdb(table->record[0], value, row.second.size())) {
+      failed = true;
+      break;
+    }
+    LineairDBProxy::BatchOp op;
+    op.type = LineairDBProxy::BatchOp::Type::SecondaryIndexWrite;
+    op.table_name = db_table_name;
+    op.index_name = index_name;
+    op.primary_key = std::move(row.first);
+    op.secondary_key = build_secondary_key_from_row(table->record[0], runtime_key);
+    write_chunk.push_back(std::move(op));
+    if (write_chunk.size() >= kBackfillWriteChunkRows &&
+        !backfill_commit_chunk(write_chunk)) {
+      failed = true;
+      break;
+    }
+  }
+  blobroot.Clear();
+  if (failed || scan_tx->is_aborted() ||
+      !backfill_commit_chunk(write_chunk)) {
+    return false;
+  }
+  return true;
 }
 
 bool ha_lineairdb::inplace_alter_table(TABLE *altered_table,
@@ -2929,11 +3048,12 @@ bool ha_lineairdb::inplace_alter_table(TABLE *altered_table,
   userThread = ha_thd();
   auto proxy = get_proxy();
 
-  // Rows per backfill transaction; bounds each OCC write-set.
-  static constexpr uint64_t kBackfillWriteChunkRows = 2000;  // FIXME: make configurable
-
   if (altered_table == nullptr || altered_table->s == nullptr) return true;
 
+  // Non-unique indexes are collected and backfilled together below so a single
+  // scan and decode pass feeds them all. A unique index keeps the staging commit
+  // path (its in-write duplicate check) and is backfilled serially.
+  std::vector<std::pair<std::string, const KEY *>> nu_specs;
   for (uint i = 0; i < ha_alter_info->index_add_count; i++) {
     const uint key_idx = ha_alter_info->index_add_buffer[i];
     const KEY *key_info = &ha_alter_info->key_info_buffer[key_idx];
@@ -2941,9 +3061,6 @@ bool ha_lineairdb::inplace_alter_table(TABLE *altered_table,
     if (index_name.empty()) return true;  // fail closed: unnamed index
 
     const uint index_type = (key_info->flags & HA_NOSAME) ? LDB_INDEX_UNIQUE : 0;
-    // A unique index keeps the staging commit path for its in-write duplicate
-    // check; only a non-unique index is safe to route through the stateless path.
-    const bool use_stateless_commit = (index_type != LDB_INDEX_UNIQUE);
 
     // key_info_buffer and TABLE::key_info use different field-number bases;
     // resolve the runtime KEY by name or the encoder reads the wrong column.
@@ -2973,51 +3090,24 @@ bool ha_lineairdb::inplace_alter_table(TABLE *altered_table,
       return true;
     }
 
+    if (index_type == LDB_INDEX_UNIQUE) {
+      if (!backfill_unique_serial(index_name, *runtime_key)) return true;
+    } else {
+      nu_specs.emplace_back(index_name, runtime_key);
+    }
+  }
+
+  // Non-unique indexes share one scan and one decode pass, then commit in
+  // parallel. A multi-index ALTER on the fact table makes this the common path.
+  if (!nu_specs.empty()) {
     auto *scan_tx = get_transaction(ha_thd());
     if (scan_tx == nullptr || scan_tx->is_aborted()) return true;
     scan_tx->choose_table(db_table_name);
 
-    // Fill from existing base rows in bounded chunks.
-    std::vector<LineairDBProxy::BatchOp> write_chunk;
-    write_chunk.reserve(kBackfillWriteChunkRows);
     auto rows =
         scan_tx->get_matching_keys_and_values_from_prefix(std::string());
     if (scan_tx->is_aborted()) return true;  // aborted scan: emit no writes
-
-    bool failed = false;
-    for (auto &row : rows) {
-      if (row.second.empty()) continue;
-
-      const auto *value =
-          reinterpret_cast<const std::byte *>(row.second.data());
-      if (set_fields_from_lineairdb(table->record[0], value,
-                                    row.second.size())) {
-        failed = true;
-        break;
-      }
-
-      LineairDBProxy::BatchOp op;
-      op.type = LineairDBProxy::BatchOp::Type::SecondaryIndexWrite;
-      op.table_name = db_table_name;
-      op.index_name = index_name;
-      op.primary_key = std::move(row.first);
-      op.secondary_key =
-          build_secondary_key_from_row(table->record[0], *runtime_key);
-      write_chunk.push_back(std::move(op));
-
-      if (write_chunk.size() >= kBackfillWriteChunkRows &&
-          !backfill_commit_chunk(write_chunk, use_stateless_commit)) {
-        failed = true;
-        break;
-      }
-    }
-
-    // Release the per-row blob arena on every loop exit.
-    blobroot.Clear();
-    if (failed || scan_tx->is_aborted() ||
-        !backfill_commit_chunk(write_chunk, use_stateless_commit)) {
-      return true;
-    }
+    if (!backfill_indexes_parallel(rows, nu_specs)) return true;
   }
 
   return false;
