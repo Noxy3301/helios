@@ -40,9 +40,9 @@ void maybe_prefetch_for_transaction(THD *thd,
  * @return 0 on success or skip (including an empty plan). HA_ERR_UNSUPPORTED
  *         when the statement's shape cannot be prefetched (no fallback; a
  *         my_error is raised first, by the eligibility check or by autogen).
- *         HA_ERR_LOCK_DEADLOCK when the prefetch ran but the transaction aborted
- *         (e.g. a read miss), with no my_error. Propagate any non-zero return to
- *         fail the statement.
+ *         HA_ERR_LOCK_DEADLOCK when the prefetch aborted for any other reason --
+ *         an OCC conflict or a read-plan failure -- with no my_error. Propagate
+ *         any non-zero return to fail the statement.
  */
 int maybe_prefetch_for_statement(THD *thd, LineairDBTransaction *tx,
                                  TABLE *table);
@@ -80,5 +80,22 @@ int maybe_prefetch_for_legacy_dml_handler(
  */
 int prefetch_reject_unsupported(THD *thd, LineairDBTransaction *tx,
                                 const char *reason);
+
+/**
+ * @brief Map a completed prefetch attempt to a handler error code.
+ *
+ * A prefetch cache miss maps to HA_ERR_UNSUPPORTED via
+ * prefetch_reject_unsupported (non-retryable: retrying cannot make it hit); any
+ * other abort maps to the retryable HA_ERR_LOCK_DEADLOCK with the transaction
+ * marked for rollback. This guards on is_aborted() (returning 0 when the
+ * transaction is live or null), unlike abort_errno, whose callers may pass a
+ * live or null transaction and still need a deadlock.
+ *
+ * @param thd Current session.
+ * @param tx  Transaction whose outcome is inspected; may be null.
+ * @return 0 when live or null, HA_ERR_UNSUPPORTED on a cache miss, or
+ *         HA_ERR_LOCK_DEADLOCK on a retryable abort.
+ */
+int prefetch_abort_errno(THD *thd, LineairDBTransaction *tx);
 
 #endif // LINEAIRDB_PREFETCH_HH

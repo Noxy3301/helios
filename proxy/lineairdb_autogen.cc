@@ -536,49 +536,132 @@ bool compile_ref_lookup(
     bound_items.push_back({kp, item_field});
   }
 
-  // Pick one iterator source; equality remap covers key parts bound through
-  // other earlier tables.
+  // Pick the iterator source. A keypart bound to a real earlier step iterates
+  // directly. One bound to a materialized temp table is remapped via Item_equal
+  // onto a real earlier step, staging only the leading key prefix; the dropped
+  // trailing keyparts over-fetch a superset that the WHERE re-check trims.
   TABLE *iter_table = nullptr;
   int iter_step = -1;
-  for (const BoundPart &bp : bound_items) {
-    auto source = table_steps.find(bp.item->field->table);
-    if (source == table_steps.end()) {
-      TABLE *src_table = bp.item->field->table;
-      if (src_table->s != nullptr && src_table->s->tmp_table != NO_TMP_TABLE) {
-        // The probe key comes from a MySQL temp table, so staging cannot
-        // enumerate its values. Cover the runtime probe by staging the probed
-        // table/index as a full range.
-        const THD *leaf_thd = table->in_use;
-        const bool plain_select =
-            leaf_thd != nullptr && leaf_thd->lex != nullptr &&
-            leaf_thd->lex->sql_command == SQLCOM_SELECT &&
-            table->reginfo.lock_type <= TL_READ;
-        if (!plain_select) {
-          if (reason != nullptr) {
-            *reason = "temp-table-driven probe outside plain SELECT";
-          }
-          return false;
-        }
-        step->bindings.clear();
-        step->end_bindings.clear();
-        step->for_each = false;
-        step->is_scan = true;
-        step->key_prefix.clear();
-        step->end_key_prefix = lineairdb_keyenc::scan_end_sentinel();
-        if (ref->key == static_cast<int>(table->s->primary_key)) {
-          step->index_name.clear();
-        } else {
-          step->index_name = key.name;
-        }
-        return !step->table_name.empty();
+
+  // Stage the probed table/index as a full range. Used when a temp-table-driven
+  // probe has no salvageable leading prefix.
+  auto stage_full_range = [&]() -> bool {
+    const THD *leaf_thd = table->in_use;
+    const bool plain_select =
+        leaf_thd != nullptr && leaf_thd->lex != nullptr &&
+        leaf_thd->lex->sql_command == SQLCOM_SELECT &&
+        table->reginfo.lock_type <= TL_READ;
+    if (!plain_select) {
+      if (reason != nullptr) {
+        *reason = "temp-table-driven probe outside plain SELECT";
       }
+      return false;
+    }
+    step->bindings.clear();
+    step->end_bindings.clear();
+    step->for_each = false;
+    step->is_scan = true;
+    step->key_prefix.clear();
+    step->end_key_prefix = lineairdb_keyenc::scan_end_sentinel();
+    if (ref->key == static_cast<int>(table->s->primary_key)) {
+      step->index_name.clear();
+    } else {
+      step->index_name = key.name;
+    }
+    return !step->table_name.empty();
+  };
+
+  // Resolve a bound keypart to a real earlier step: a direct staged source if
+  // it has one, else the latest real step among its Item_equal members.
+  auto resolve_real_step = [&](Item_field *bound, TABLE **out_table,
+                               int *out_step) -> bool {
+    auto direct = table_steps.find(bound->field->table);
+    if (direct != table_steps.end()) {
+      *out_table = bound->field->table;
+      *out_step = direct->second;
+      return true;
+    }
+    Item_equal *eq = bound->item_equal_all_join_nests != nullptr
+                         ? bound->item_equal_all_join_nests
+                         : bound->item_equal;
+    if (eq == nullptr) return false;
+    TABLE *best = nullptr;
+    int best_step = -1;
+    Item_equal::FieldProxy proxy(eq);
+    for (Item_field &candidate : proxy) {
+      if (candidate.field == nullptr) continue;
+      auto real = table_steps.find(candidate.field->table);
+      if (real != table_steps.end() && real->second > best_step) {
+        best_step = real->second;
+        best = candidate.field->table;
+      }
+    }
+    if (best == nullptr) return false;
+    *out_table = best;
+    *out_step = best_step;
+    return true;
+  };
+
+  // True when the keypart's field is on the iterator table or has an Item_equal
+  // member there (so the second pass below can bind it to that iterator).
+  auto remaps_onto = [&](Item_field *bound, TABLE *target) -> bool {
+    if (bound->field->table == target) return true;
+    Item_equal *eq = bound->item_equal_all_join_nests != nullptr
+                         ? bound->item_equal_all_join_nests
+                         : bound->item_equal;
+    if (eq == nullptr) return false;
+    Item_equal::FieldProxy proxy(eq);
+    for (Item_field &candidate : proxy) {
+      if (candidate.field != nullptr && candidate.field->table == target) {
+        return true;
+      }
+    }
+    return false;
+  };
+
+  bool saw_temp_source = false;
+  for (const BoundPart &bp : bound_items) {
+    if (table_steps.find(bp.item->field->table) != table_steps.end()) continue;
+    TABLE *src_table = bp.item->field->table;
+    if (src_table != nullptr && src_table->s != nullptr &&
+        src_table->s->tmp_table != NO_TMP_TABLE) {
+      saw_temp_source = true;
+    } else {
+      // Unknown source (neither a staged step nor a temp table): fail the read
+      // plan as unsupported, rather than salvaging or full-ranging it.
       if (reason != nullptr) *reason = "bound source is not an earlier step";
       return false;
     }
-    // Use the latest bound source as the probe iterator.
-    if (source->second > iter_step) {
-      iter_step = source->second;
-      iter_table = bp.item->field->table;
+  }
+
+  if (!saw_temp_source) {
+    // Every bound source is a real earlier step; iterate from the latest.
+    for (const BoundPart &bp : bound_items) {
+      const int source_step = table_steps.find(bp.item->field->table)->second;
+      if (source_step > iter_step) {
+        iter_step = source_step;
+        iter_table = bp.item->field->table;
+      }
+    }
+  } else {
+    // The first keypart picks the iterator; keep later keyparts only while they
+    // remap onto it. Drop the rest -- only a leading prefix can form a range.
+    std::vector<BoundPart> leading;
+    for (const BoundPart &bp : bound_items) {
+      if (iter_table == nullptr) {
+        TABLE *cand_table = nullptr;
+        int cand_step = -1;
+        if (!resolve_real_step(bp.item, &cand_table, &cand_step)) break;
+        iter_table = cand_table;
+        iter_step = cand_step;
+      } else if (!remaps_onto(bp.item, iter_table)) {
+        break;
+      }
+      leading.push_back(bp);
+    }
+    bound_items.swap(leading);
+    if (bound_items.empty() && leading_constant_parts == 0) {
+      return stage_full_range();
     }
   }
 
@@ -603,6 +686,7 @@ bool compile_ref_lookup(
         }
       }
       if (remapped == nullptr) {
+        if (saw_temp_source) return stage_full_range();
         if (reason != nullptr) {
           *reason = "for_each binding spans multiple source steps";
         }
@@ -612,6 +696,7 @@ bool compile_ref_lookup(
     }
     if (!append_bound_keypart(table, ref, bp.kp, source_field, iter_step,
                               step, reason)) {
+      if (saw_temp_source) return stage_full_range();
       return false;
     }
     ++bound_parts;
@@ -642,6 +727,10 @@ bool compile_ref_lookup(
 
   if (bound_parts > 0) {
     step->for_each = true;
+    // Lossless only when every ref keypart was staged. A temp-table-driven
+    // probe that dropped trailing keyparts (above) stages a wider superset the
+    // WHERE re-check trims; existence_only must not cap such a probe.
+    step->exact_keyed_probe = (used_key_parts == ref->key_parts);
     if (child_primary && used_key_parts >= child_pk_parts) {
       // Full-primary-key point probe per source row.
       step->is_scan = false;
@@ -656,13 +745,13 @@ bool compile_ref_lookup(
   }
 
   step->key_prefix = lineairdb_keyenc::convert_key_to_ldbformat(
-      table, ref->key, ref->key_buff, first_n_keyparts_map(ref->key_parts));
+      table, ref->key, ref->key_buff, first_n_keyparts_map(used_key_parts));
   if (step->key_prefix.empty()) {
     if (reason != nullptr) *reason = "failed to encode constant key";
     return false;
   }
 
-  if (child_primary && ref->key_parts >= child_pk_parts) {
+  if (child_primary && used_key_parts >= child_pk_parts) {
     step->is_scan = false;
   } else {
     step->is_scan = true;
@@ -939,9 +1028,10 @@ bool compile_tree_leaves(
 /**
  * @brief Return true when semijoin membership reduction is result-preserving.
  *
- * @details The reduction is limited to plain inner joins in the top-level
- * query block. Outer joins, semi/anti nests, and nested query blocks can need
- * rows that fail the membership test.
+ * @details The reduction is limited to plain inner joins. Outer joins and
+ * semi/anti nests can need rows that fail the membership test and stay
+ * rejected. Nested query blocks are allowed because the caller pairs source
+ * and probe within a single query block.
  */
 bool semijoin_safe_leaf(const TABLE *table) {
   if (table == nullptr) return false;
@@ -952,10 +1042,10 @@ bool semijoin_safe_leaf(const TABLE *table) {
        embedding = embedding->embedding) {
     if (embedding->is_sj_or_aj_nest()) return false;
   }
-  const Query_block *query_block = ref->query_block;
-  if (query_block == nullptr || query_block->outer_query_block() != nullptr) {
-    return false;
-  }
+  // A leaf in a nested query block is allowed: the reduction loop pairs source
+  // and probe only within one query block, so membership stays a same-block
+  // inner-join reachability set that cannot drop a needed row.
+  if (ref->query_block == nullptr) return false;
   return true;
 }
 
@@ -998,6 +1088,76 @@ void collect_inner_unit_roots(Query_expression *unit,
       if (root != nullptr) roots->push_back(root);
       collect_inner_unit_roots(inner, roots);
     }
+  }
+}
+
+// Collect tables that are the bare, residual-free inner of an anti-join. Only
+// such an inner is safe to cap at one row: a filter above the leaf could reject
+// the first match while a later row qualifies. qep_leaf_info() is that test.
+static void collect_existence_only_antijoin_inners(
+    AccessPath *p, std::unordered_set<const TABLE *> *out) {
+  if (p == nullptr) return;
+  auto mark_if_bare = [&](AccessPath *inner) {
+    TABLE *t = nullptr;
+    Index_lookup *ref = nullptr;
+    bool fs = false;
+    int fsi = -1;
+    if (inner != nullptr && qep_leaf_info(inner, &t, &ref, &fs, &fsi) &&
+        t != nullptr) {
+      out->insert(t);
+    }
+  };
+  switch (p->type) {
+    case AccessPath::NESTED_LOOP_JOIN:
+      if (p->nested_loop_join().join_type == JoinType::ANTI)
+        mark_if_bare(p->nested_loop_join().inner);
+      collect_existence_only_antijoin_inners(p->nested_loop_join().outer, out);
+      collect_existence_only_antijoin_inners(p->nested_loop_join().inner, out);
+      return;
+    case AccessPath::BKA_JOIN:
+      if (p->bka_join().join_type == JoinType::ANTI)
+        mark_if_bare(p->bka_join().inner);
+      collect_existence_only_antijoin_inners(p->bka_join().outer, out);
+      collect_existence_only_antijoin_inners(p->bka_join().inner, out);
+      return;
+    case AccessPath::HASH_JOIN:
+      // A hash anti-join probes its build side as a whole, not once per outer
+      // row; "one row per probe" does not apply -- just recurse.
+      collect_existence_only_antijoin_inners(p->hash_join().outer, out);
+      collect_existence_only_antijoin_inners(p->hash_join().inner, out);
+      return;
+    case AccessPath::FILTER:
+      collect_existence_only_antijoin_inners(p->filter().child, out);
+      return;
+    case AccessPath::SORT:
+      collect_existence_only_antijoin_inners(p->sort().child, out);
+      return;
+    case AccessPath::LIMIT_OFFSET:
+      collect_existence_only_antijoin_inners(p->limit_offset().child, out);
+      return;
+    case AccessPath::AGGREGATE:
+      collect_existence_only_antijoin_inners(p->aggregate().child, out);
+      return;
+    case AccessPath::STREAM:
+      collect_existence_only_antijoin_inners(p->stream().child, out);
+      return;
+    case AccessPath::TEMPTABLE_AGGREGATE:
+      collect_existence_only_antijoin_inners(
+          p->temptable_aggregate().subquery_path, out);
+      collect_existence_only_antijoin_inners(
+          p->temptable_aggregate().table_path, out);
+      return;
+    case AccessPath::WEEDOUT:
+      collect_existence_only_antijoin_inners(p->weedout().child, out);
+      return;
+    case AccessPath::NESTED_LOOP_SEMIJOIN_WITH_DUPLICATE_REMOVAL:
+      collect_existence_only_antijoin_inners(
+          p->nested_loop_semijoin_with_duplicate_removal().outer, out);
+      collect_existence_only_antijoin_inners(
+          p->nested_loop_semijoin_with_duplicate_removal().inner, out);
+      return;
+    default:
+      return;
   }
 }
 
@@ -1058,23 +1218,126 @@ bool autogen_read_plan_from_qep(
     return raise_unsupported(thd, root->type, "QEP has no stageable leaves");
   }
 
-  // Attach scan filters after the full plan is known.
+  // SharedScan dedup: fold byte-identical staged steps into one -- (a)
+  // self-contained scans (a view read twice) and (b) for_each probes with
+  // deep-equal bindings (a self-join or correlated subquery). Keep the
+  // earliest, record the folded aliases (the filter/semijoin passes require
+  // agreement), and remap later steps' source_step (like execute_read_plan).
+  std::vector<std::vector<TABLE *>> step_aliases(steps.size());
+  for (size_t i = 0; i < steps.size() && i < added_tables.size(); ++i) {
+    if (added_tables[i] != nullptr) step_aliases[i].push_back(added_tables[i]);
+  }
+  {
+    const auto foldable = [](const LineairDBProxy::ReadPlanStep &s) {
+      return s.is_scan && s.scan_limit == 0 &&
+             s.aggregate_serialized.empty() && s.semijoins.empty();
+    };
+    const auto same_binding = [](const LineairDBProxy::ReadPlanKeyBinding &a,
+                                 const LineairDBProxy::ReadPlanKeyBinding &b) {
+      return a.source_step == b.source_step && a.source_row == b.source_row &&
+             a.source_offset == b.source_offset &&
+             a.source_length == b.source_length &&
+             a.use_midpoint == b.use_midpoint && a.from_key == b.from_key &&
+             a.source_column == b.source_column &&
+             a.column_as_int_key == b.column_as_int_key &&
+             a.int_delta == b.int_delta;
+    };
+    const auto same_bindings =
+        [&](const std::vector<LineairDBProxy::ReadPlanKeyBinding> &a,
+            const std::vector<LineairDBProxy::ReadPlanKeyBinding> &b) {
+          if (a.size() != b.size()) return false;
+          for (size_t k = 0; k < a.size(); ++k)
+            if (!same_binding(a[k], b[k])) return false;
+          return true;
+        };
+    const auto same_step = [&](const LineairDBProxy::ReadPlanStep &a,
+                               const LineairDBProxy::ReadPlanStep &b) {
+      return a.table_name == b.table_name && a.index_name == b.index_name &&
+             a.key_prefix == b.key_prefix &&
+             a.end_key_prefix == b.end_key_prefix &&
+             a.for_each == b.for_each && a.reverse_scan == b.reverse_scan &&
+             a.serialized_filter == b.serialized_filter &&
+             same_bindings(a.bindings, b.bindings) &&
+             same_bindings(a.end_bindings, b.end_bindings);
+    };
+    std::vector<uint32_t> new_index(steps.size(), 0);
+    std::vector<LineairDBProxy::ReadPlanStep> folded;
+    std::vector<std::vector<TABLE *>> folded_aliases;
+    folded.reserve(steps.size());
+    folded_aliases.reserve(steps.size());
+    bool any_fold = false;
+    for (size_t j = 0; j < steps.size(); ++j) {
+      int target = -1;
+      if (foldable(steps[j])) {
+        for (size_t i = 0; i < folded.size(); ++i) {
+          if (foldable(folded[i]) && same_step(folded[i], steps[j])) {
+            target = static_cast<int>(i);
+            break;
+          }
+        }
+      }
+      if (target >= 0) {
+        new_index[j] = static_cast<uint32_t>(target);
+        for (TABLE *t : step_aliases[j]) folded_aliases[target].push_back(t);
+        // Two probes can fold to the same shape yet differ in exactness (one
+        // dropped a keypart). Keep the folded group exact only when every member
+        // was; otherwise the cap could hit a widened probe.
+        folded[target].exact_keyed_probe =
+            folded[target].exact_keyed_probe && steps[j].exact_keyed_probe;
+        any_fold = true;
+      } else {
+        new_index[j] = static_cast<uint32_t>(folded.size());
+        folded.push_back(std::move(steps[j]));
+        folded_aliases.push_back(std::move(step_aliases[j]));
+      }
+    }
+    steps = std::move(folded);
+    step_aliases = std::move(folded_aliases);
+    if (any_fold) {
+      for (auto &s : steps) {
+        for (auto &b : s.bindings) b.source_step = new_index[b.source_step];
+        for (auto &b : s.end_bindings)
+          b.source_step = new_index[b.source_step];
+        for (auto &sj : s.semijoins)
+          sj.source_step = new_index[sj.source_step];
+      }
+      for (auto &kv : table_steps) {
+        if (kv.second >= 0 && kv.second < static_cast<int>(new_index.size()))
+          kv.second = static_cast<int>(new_index[kv.second]);
+      }
+    }
+  }
+
+  // Attach scan filters once the plan is known. A rejected key caches as a
+  // table-level not-found entry shared by every step on the table, so skip a
+  // multi-step table; on a folded step attach only when EVERY alias builds the
+  // SAME predicate (then a dropped row is one each alias's own WHERE discards).
   if (allow_filter_pushdown) {
     std::unordered_map<std::string, int> table_step_count;
     for (const auto &s : steps) table_step_count[s.table_name]++;
     for (size_t i = 0; i < steps.size(); ++i) {
       auto &s = steps[i];
       if (!s.is_scan) continue;
-      // Rejected keys become table-level not-found cache entries. If the same
-      // physical table appears more than once, aliases may have different
-      // predicates, so skip filter pushdown for that table.
       if (table_step_count[s.table_name] != 1) continue;
-      TABLE *t = i < added_tables.size() ? added_tables[i] : nullptr;
-      if (t == nullptr) continue;
+      const std::vector<TABLE *> &aliases = step_aliases[i];
+      if (aliases.empty()) continue;
       std::string table_filter;
-      if (build_single_table_filter(thd, t, &table_filter)) {
-        s.serialized_filter = std::move(table_filter);
+      bool agree = true;
+      for (size_t a = 0; a < aliases.size(); ++a) {
+        std::string f;
+        if (aliases[a] == nullptr ||
+            !build_single_table_filter(thd, aliases[a], &f) || f.empty()) {
+          agree = false;
+          break;
+        }
+        if (a == 0) {
+          table_filter = std::move(f);
+        } else if (f != table_filter) {
+          agree = false;
+          break;
+        }
       }
+      if (agree) s.serialized_filter = std::move(table_filter);
     }
   }
 
@@ -1093,16 +1356,14 @@ bool autogen_read_plan_from_qep(
     };
     for (auto &e : eq_edges) uf[find_root(e.first)] = find_root(e.second);
 
-    // Probe candidates are grouped range scans driven by earlier rows.
-    for (auto &kvp : table_steps) {
-      TABLE *probe_t = kvp.first;
-      const int probe_step = kvp.second;
-      if (probe_step < 0 || probe_step >= static_cast<int>(steps.size()))
-        continue;
+    // Per-alias chooser: a qualifying membership source for probe_t's step, or
+    // false if none. Candidates are earlier steps in the same query block.
+    const auto choose_semijoin =
+        [&](TABLE *probe_t, size_t probe_step,
+            LineairDBProxy::ReadPlanStep::Semijoin *out_sj) -> bool {
       auto &ps = steps[probe_step];
-      if (!(ps.for_each && ps.is_scan)) continue;  // FER/FES high-fanout only
-      if (!semijoin_safe_leaf(probe_t)) continue;
-      if (probe_t->s == nullptr) continue;
+      if (!semijoin_safe_leaf(probe_t)) return false;
+      if (probe_t->s == nullptr) return false;
 
       // Find the field whose value each probe row will join on.
       Field *probe_field = nullptr;
@@ -1117,14 +1378,14 @@ bool autogen_read_plan_from_qep(
         probe_field =
             probe_t->key_info[probe_t->s->primary_key].key_part[0].field;
       }
-      if (probe_field == nullptr || uf.find(probe_field) == uf.end()) continue;
+      if (probe_field == nullptr || uf.find(probe_field) == uf.end())
+        return false;
       Field *cls = find_root(probe_field);
 
-      // Source candidates must be earlier steps in the same query block.
       for (auto &kvp2 : table_steps) {
         TABLE *src_t = kvp2.first;
         const int src_step = kvp2.second;
-        if (src_step >= probe_step || src_step < 0 ||
+        if (src_step >= static_cast<int>(probe_step) || src_step < 0 ||
             src_step >= static_cast<int>(steps.size()))
           continue;
         if (!semijoin_safe_leaf(src_t)) continue;
@@ -1149,18 +1410,72 @@ bool autogen_read_plan_from_qep(
         if (uf.find(src_pk) == uf.end() || find_root(src_pk) != cls) continue;
         if (!semijoin_keys_compatible(src_pk, probe_field)) continue;
 
-        // Attach one source membership test to this probe step.
         const int sc = qep_table_field_index(src_t, src_pk);
         const int pc = qep_table_field_index(probe_t, probe_field);
         if (sc < 0 || pc < 0) continue;
-        LineairDBProxy::ReadPlanStep::Semijoin sj;
-        sj.source_step = static_cast<uint32_t>(src_step);
-        sj.source_column = static_cast<uint32_t>(sc);
-        sj.probe_column = static_cast<uint32_t>(pc);
-        if (!src_prefiltered) sj.source_filter = std::move(sf_filter);
-        ps.semijoins.push_back(std::move(sj));
-        break;  // one semijoin source per probe step
+        out_sj->source_step = static_cast<uint32_t>(src_step);
+        out_sj->source_column = static_cast<uint32_t>(sc);
+        out_sj->probe_column = static_cast<uint32_t>(pc);
+        out_sj->source_filter = src_prefiltered ? std::string() : sf_filter;
+        return true;  // one semijoin source per probe step
       }
+      return false;
+    };
+
+    // A folded probe serves several aliases, so a membership reduction is sound
+    // only when EVERY alias picks the SAME semijoin -- a row one alias prunes
+    // must be one every alias's join would drop. Any mismatch vetoes.
+    for (size_t pi = 0; pi < steps.size(); ++pi) {
+      auto &ps = steps[pi];
+      if (!(ps.for_each && ps.is_scan)) continue;  // FER/FES high-fanout only
+      if (pi >= step_aliases.size()) continue;
+      const std::vector<TABLE *> &aliases = step_aliases[pi];
+      if (aliases.empty()) continue;
+      LineairDBProxy::ReadPlanStep::Semijoin chosen;
+      bool unanimous = true;
+      for (size_t a = 0; a < aliases.size(); ++a) {
+        LineairDBProxy::ReadPlanStep::Semijoin cand;
+        if (aliases[a] == nullptr || !choose_semijoin(aliases[a], pi, &cand)) {
+          unanimous = false;
+          break;
+        }
+        if (a == 0) {
+          chosen = cand;
+        } else if (!(chosen.source_step == cand.source_step &&
+                     chosen.source_column == cand.source_column &&
+                     chosen.probe_column == cand.probe_column &&
+                     chosen.source_filter == cand.source_filter)) {
+          unanimous = false;
+          break;
+        }
+      }
+      if (unanimous) ps.semijoins.push_back(std::move(chosen));
+    }
+  }
+
+  // Mark anti-join inner probes to cap at the first match. Only on the
+  // no-validate read path: a capped, incomplete range cannot pass commit-time
+  // validation, the same reason filter and projection pushdown gate on it.
+  if (allow_filter_pushdown) {
+    std::unordered_set<const TABLE *> existence_only_inners;
+    collect_existence_only_antijoin_inners(root, &existence_only_inners);
+    // A folded probe stands for several aliases. Cap it only when all of them
+    // are residual-free anti-join inners and the probe is an exact lookup, the
+    // same all-must-agree rule the filter and semijoin passes use.
+    for (size_t i = 0; i < steps.size(); ++i) {
+      auto &s = steps[i];
+      if (!(s.for_each && s.exact_keyed_probe)) continue;
+      if (i >= step_aliases.size()) continue;
+      const std::vector<TABLE *> &aliases = step_aliases[i];
+      if (aliases.empty()) continue;
+      bool all_inner = true;
+      for (TABLE *t : aliases) {
+        if (t == nullptr || existence_only_inners.count(t) == 0) {
+          all_inner = false;
+          break;
+        }
+      }
+      if (all_inner) s.existence_only = true;
     }
   }
 

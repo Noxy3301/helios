@@ -241,6 +241,10 @@ message TxExecuteReadPlan {
         AggregateSpec aggregate = 13;
         // Optional membership reduction for high-fanout join probes.
         repeated SemijoinFilter semijoins = 14;
+        // Anti-join probe: only the existence of a match matters, never the
+        // inner rows. Emit at most one row per probe key. A complete answer,
+        // not a truncated window -- index_next still reports a clean EOF.
+        bool existence_only = 15;
     }
     // Drop probe rows whose join key is absent from an earlier step's result.
     // Columns are 0-based TABLE::field[] ordinals.

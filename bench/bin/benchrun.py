@@ -340,7 +340,7 @@ def setup_benchmark(benchmark, config_path, mysql_host, mysql_port):
 
     if benchmark == "tpch":
         mysql_cmd(mysql_port, mysql_host,
-                  "SET GLOBAL optimizer_switch='batched_key_access=on,mrr_cost_based=off,subquery_to_derived=on';"
+                  "SET GLOBAL optimizer_switch='batched_key_access=on,mrr_cost_based=off,subquery_to_derived=off';"
                   "SET GLOBAL join_buffer_size=1073741824;")
 
     print("  Creating schema + Loading data...")

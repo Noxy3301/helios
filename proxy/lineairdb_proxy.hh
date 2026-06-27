@@ -196,6 +196,13 @@ public:
             std::string source_filter;
         };
         std::vector<Semijoin> semijoins;
+        // Emit one row per probe key: an anti-join only needs to know a match
+        // exists. See PlanStep.existence_only in the proto for the contract.
+        bool existence_only = false;
+        // True when the probe staged every ref keypart exactly, with no dropped
+        // keypart or widening. existence_only needs it: capping a widened probe
+        // at the first row could skip the real match in a later row.
+        bool exact_keyed_probe = false;
     };
     struct ReadPlanStepResult {
         bool found = false;
