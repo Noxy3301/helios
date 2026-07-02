@@ -1220,11 +1220,6 @@ bool build_block(THD *thd, Query_block *qb,
   std::vector<Item *> tuple_conjuncts;  // cross-table non-equi (q7/q19 ORs)
   {
     Item *where_cond = qb->where_cond();
-    if (getenv("LDBC_DIAG") != nullptr && where_cond != nullptr) {
-      String str;
-      where_cond->print(thd, &str, QT_ORDINARY);
-      fprintf(stderr, "[LDBC] WHERE: %.600s\n", str.c_ptr_safe());
-    }
     std::vector<Item *> conjuncts;
     flatten_and(where_cond, &conjuncts);
     for (Item *c : conjuncts) {
