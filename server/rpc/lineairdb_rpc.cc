@@ -755,6 +755,13 @@ static bool parallel_primary_pax_aggregate_scan(
     return true;
 }
 
+// Membership set for one hoisted semijoin reduction (built from an earlier
+// step's rows); probe rows whose join-key column is absent are dropped.
+struct FeSemijoin {
+    std::unordered_set<std::string> keys;
+    uint32_t probe_column;
+};
+
 /**
  * @brief Row-returning primary scan over PAX refs: evaluate the pushed
  * filter on column strips, gather only surviving rows (projected when the
@@ -775,7 +782,7 @@ static bool pax_ref_scan_emit(
     const LineairDB::Protocol::TxExecuteReadPlan::PlanStep& step,
     const std::string& start_key, const std::string& end_key,
     LineairDB::Protocol::TxExecuteReadPlan::StepResult* step_result,
-    bool& projection_failed) {
+    bool& projection_failed, const std::vector<FeSemijoin>& fe_semijoins) {
     if (db == nullptr) return false;
     const bool has_filter = step.has_filter() && step.filter().has_expr();
     const bool has_projection = step.has_projection();
@@ -821,8 +828,22 @@ static bool pax_ref_scan_emit(
                 }
                 pass = evaluator.evaluate(step.filter().expr());
             }
+            // Hoisted semijoin reduction: drop rows without a join partner.
+            // Distinct from `pass` — rejected rows are NOT negative-cache
+            // material (membership is plan-local, not a row predicate).
+            bool sj_drop = false;
+            if (pass && !fe_semijoins.empty()) {
+                for (const auto& fsj : fe_semijoins) {
+                    const std::string_view col =
+                        grp->cell(fsj.probe_column + 1, r.slot);
+                    if (fsj.keys.find(std::string(col)) == fsj.keys.end()) {
+                        sj_drop = true;
+                        break;
+                    }
+                }
+            }
             std::string value;
-            if (pass) {
+            if (pass && !sj_drop) {
                 if (has_projection) {
                     if (!grp->GatherRowProjected(r.slot, kept.data(),
                                                  kept.size(), value)) {
@@ -854,6 +875,15 @@ static bool pax_ref_scan_emit(
                     out.filtered_keys.push_back(std::move(r.key));
                     continue;
                 }
+                bool ssj_drop = false;
+                for (const auto& fsj : fe_semijoins) {
+                    auto col = extract_value_column(rr.value, fsj.probe_column);
+                    if (fsj.keys.find(std::string(col)) == fsj.keys.end()) {
+                        ssj_drop = true;
+                        break;
+                    }
+                }
+                if (ssj_drop) continue;
                 std::string sout;
                 if (has_projection) {
                     if (!trim_row_value(rr.value,
@@ -875,6 +905,7 @@ static bool pax_ref_scan_emit(
                 out.filtered_keys.push_back(std::move(r.key));
                 continue;
             }
+            if (sj_drop) continue;
             out.scan_keys.push_back(std::move(r.key));
             out.scan_values.push_back(std::move(value));
             out.tids.push_back(r.tid);
@@ -1908,10 +1939,6 @@ void LineairDBRpc::handleTxExecuteReadPlan(const std::string& message,
             return std::move(v);
         };
 
-        struct FeSemijoin {
-            std::unordered_set<std::string> keys;
-            uint32_t probe_column;
-        };
         std::vector<FeSemijoin> fe_semijoins;
         {
             const int this_step_idx =
@@ -2291,7 +2318,7 @@ void LineairDBRpc::handleTxExecuteReadPlan(const std::string& message,
                 // not fully PAX-resident.
                 if (pax_ref_scan_emit(db_manager_->get_database().get(), step,
                                       start_key, end_key, step_result,
-                                      projection_failed)) {
+                                      projection_failed, fe_semijoins)) {
                     if (projection_failed) {
                         response.set_ok(false);
                         flat_plan::encode_to_string(response, result);
