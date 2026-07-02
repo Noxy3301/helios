@@ -730,9 +730,20 @@ message QbColumnRef {
     uint32 prefix_len = 4;
 }
 
+// Semi-join filter: keep only rows whose column value appears in the key
+// set produced by an earlier (already-executed) node's output column.
+// Carries the optimizer's selectivity knowledge into scans and derived
+// aggregations (sideways information passing; lineage log Phase D).
+message QbSemiFilter {
+    uint32 source_node = 1;      // node index, must precede this node
+    QbColumnRef source_column = 2;
+    uint32 my_column = 3;        // column of this scan's table
+}
+
 message QbScan {
     uint32 table_idx = 1;
     PushedPredicate filter = 2;  // fully-pushed single-table conjuncts
+    QbSemiFilter semi = 3;
 }
 
 // A predicate over a joined tuple: FilterExpr column_index values are
@@ -795,6 +806,11 @@ message QbSortKey {
 // sub-block's output ordinals; refs are row numbers.
 message QbSubBlock {
     TxExecuteQueryBlock.Request block = 1;
+    // Restrict the sub-block's aggregation domain to keys seen in an outer
+    // node (q17: only the ~20 part keys instead of every l_partkey).
+    QbSemiFilter semi = 2;       // source in the OUTER plan's node space
+    uint32 target_table = 3;     // table inside the sub-block
+    uint32 target_column = 4;    // its column matching the source keys
 }
 
 message QbNode {

@@ -1456,40 +1456,137 @@ bool build_block(THD *thd, Query_block *qb,
   req.Clear();
 
   // Scan nodes (one per table) with their fully-pushed filters.
-  std::vector<int> scan_node_of(n_tabs);
-  for (size_t i = 0; i < n_real; ++i) {
+  // Node issue order follows the optimizer's cardinality estimates: the
+  // most selective tables execute first, and each later scan/sub-block
+  // gains a semi-join key filter from the smallest already-issued table
+  // it joins with (sideways information passing; q17's derived aggregates
+  // only the ~20 filtered part keys instead of every l_partkey).
+  for (size_t i = 0; i < n_real; ++i)
     req.add_tables()->set_table_name(tabs[i].table->s->normalized_path.str);
-    auto *node = req.add_nodes();
-    auto *scan = node->mutable_scan();
-    scan->set_table_idx(static_cast<uint32_t>(i));
-    scan_node_of[i] = req.nodes_size() - 1;
-    if (!table_filters[i].empty()) {
-      auto *pred = scan->mutable_filter();
-      pred->set_num_columns(tabs[i].table->s->fields);
-      if (table_filters[i].size() == 1) {
-        if (!serialize_scan_conjunct(table_filters[i][0],
-                                     pred->mutable_expr()))
-          LDB_COL_REJECT("filter not pushable");
+  std::vector<int> scan_node_of(n_tabs, -1);
+  std::vector<size_t> issue_order;
+  for (size_t i = 0; i < n_tabs; ++i) issue_order.push_back(i);
+  std::stable_sort(issue_order.begin(), issue_order.end(),
+                   [&](size_t a, size_t b) {
+                     return tabs[a].records < tabs[b].records;
+                   });
+  // Sub-blocks must be appended in virtual-table order server-side, so
+  // pre-assign their node slots after all scans is NOT possible — instead
+  // keep virtual tables in tabs order relative to each other.
+  {
+    std::vector<size_t> reals, virts;
+    for (size_t t : issue_order)
+      (tab_virtual[t] ? virts : reals).push_back(t);
+    // Interleave: keep the global estimate order but virtuals stay in
+    // ascending tabs order among themselves (server numbering contract).
+    std::sort(virts.begin(), virts.end());
+    issue_order.clear();
+    size_t vi = 0;
+    for (size_t t : reals) {
+      // Issue any virtual whose estimate is smaller than this real table
+      // and whose tabs-order turn has come.
+      while (vi < virts.size() &&
+             tabs[virts[vi]].records <= tabs[t].records) {
+        issue_order.push_back(virts[vi]);
+        ++vi;
+      }
+      issue_order.push_back(t);
+    }
+    while (vi < virts.size()) issue_order.push_back(virts[vi++]);
+  }
+
+  std::vector<bool> issued(n_tabs, false);
+  for (size_t t : issue_order) {
+    // Best semi source: smallest issued table sharing an edge, at least
+    // 8x more selective. LEFT-derived and nest tables keep plan-level
+    // semantics; semi filters only reduce scan/aggregation input.
+    int semi_src = -1;
+    const Field *semi_src_field = nullptr;
+    const Field *semi_my_field = nullptr;
+    for (const auto &e : edges) {
+      int other = -1;
+      const Field *of = nullptr;
+      const Field *mf = nullptr;
+      if (e.t1 == static_cast<int>(t)) {
+        other = e.t2;
+        of = e.f2;
+        mf = e.f1;
+      } else if (e.t2 == static_cast<int>(t)) {
+        other = e.t1;
+        of = e.f1;
+        mf = e.f2;
       } else {
-        auto *root = pred->mutable_expr();
-        root->set_op(LineairDB::Protocol::FilterExpr::OP_AND);
-        for (Item *c : table_filters[i]) {
-          if (!serialize_scan_conjunct(c, root->add_children()))
+        continue;
+      }
+      if (!issued[other]) continue;
+      if (tabs[other].records * 8 > tabs[t].records) continue;
+      if (semi_src < 0 || tabs[other].records < tabs[semi_src].records) {
+        semi_src = other;
+        semi_src_field = of;
+        semi_my_field = mf;
+      }
+    }
+
+    if (!tab_virtual[t]) {
+      auto *scan = req.add_nodes()->mutable_scan();
+      scan->set_table_idx(static_cast<uint32_t>(t));
+      scan_node_of[t] = req.nodes_size() - 1;
+      if (!table_filters[t].empty()) {
+        auto *pred = scan->mutable_filter();
+        pred->set_num_columns(tabs[t].table->s->fields);
+        if (table_filters[t].size() == 1) {
+          if (!serialize_scan_conjunct(table_filters[t][0],
+                                       pred->mutable_expr()))
             LDB_COL_REJECT("filter not pushable");
+        } else {
+          auto *root = pred->mutable_expr();
+          root->set_op(LineairDB::Protocol::FilterExpr::OP_AND);
+          for (Item *c : table_filters[t]) {
+            if (!serialize_scan_conjunct(c, root->add_children()))
+              LDB_COL_REJECT("filter not pushable");
+          }
+        }
+      }
+      if (semi_src >= 0) {
+        auto *sm = scan->mutable_semi();
+        sm->set_source_node(scan_node_of[semi_src]);
+        auto *sc = sm->mutable_source_column();
+        sc->set_table_idx(semi_src);
+        sc->set_column(semi_src_field->field_index());
+        sm->set_my_column(semi_my_field->field_index());
+      }
+    } else {
+      auto *sub = req.add_nodes()->mutable_sub_block();
+      if (!build_block(thd, virtual_inner[t - n_real],
+                       *sub->mutable_block(), why, qep_rows))
+        return false;
+      scan_node_of[t] = req.nodes_size() - 1;
+      if (semi_src >= 0) {
+        // Resolve the derived column (output ordinal) to the base table
+        // and column inside the sub-block via its GROUP output mapping.
+        const auto &sreq = sub->block();
+        const uint32_t ordinal = semi_my_field->field_index();
+        if (ordinal < static_cast<uint32_t>(sreq.output_size()) &&
+            sreq.output(ordinal).source() ==
+                LineairDB::Protocol::QbOutputExpr::GROUP &&
+            sreq.nodes_size() > 0 &&
+            sreq.nodes(sreq.nodes_size() - 1).has_aggregate()) {
+          const auto &sagg = sreq.nodes(sreq.nodes_size() - 1).aggregate();
+          const uint32_t g = sreq.output(ordinal).ordinal();
+          if (g < static_cast<uint32_t>(sagg.group_columns_size()) &&
+              sagg.group_columns(g).prefix_len() == 0) {
+            auto *sm = sub->mutable_semi();
+            sm->set_source_node(scan_node_of[semi_src]);
+            auto *sc = sm->mutable_source_column();
+            sc->set_table_idx(semi_src);
+            sc->set_column(semi_src_field->field_index());
+            sub->set_target_table(sagg.group_columns(g).table_idx());
+            sub->set_target_column(sagg.group_columns(g).column());
+          }
         }
       }
     }
-  }
-
-  // Derived tables build recursively as sub-blocks; the k-th sub_block
-  // node becomes virtual table n_real + k server-side (matching tabs).
-  for (size_t i = n_real; i < n_tabs; ++i) {
-    auto *node = req.add_nodes();
-    auto *sub = node->mutable_sub_block();
-    if (!build_block(thd, virtual_inner[i - n_real], *sub->mutable_block(),
-                     why, qep_rows))
-      return false;
-    scan_node_of[i] = req.nodes_size() - 1;
+    issued[t] = true;
   }
 
   // Join tree ordered by the optimizer's cardinality estimates (QEP

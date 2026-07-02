@@ -7,6 +7,7 @@
 #include <string>
 #include <thread>
 #include <set>
+#include <unordered_set>
 #include <unordered_map>
 #include <vector>
 
@@ -16,6 +17,15 @@
 #include "predicate_evaluator.hh"
 
 namespace qb {
+
+// Sub-block execution with an externally-injected semi-join key filter.
+void ExecuteQueryBlockFiltered(
+    LineairDB::Database* db,
+    const LineairDB::Protocol::TxExecuteQueryBlock::Request& request,
+    LineairDB::Protocol::TxExecuteQueryBlock::Response* response,
+    const std::unordered_set<std::string>* ext_keys,
+    uint32_t ext_filter_table, uint32_t ext_filter_column);
+
 namespace {
 
 using LineairDB::Pax::PaxGroup;
@@ -296,6 +306,32 @@ struct Executor {
     };
     std::vector<VirtualTable> virtuals;
 
+    // External semi-join filter injected by a parent executor: rows of
+    // ext_filter_table must have ext_filter_column's cell in ext_keys.
+    const std::unordered_set<std::string>* ext_keys = nullptr;
+    uint32_t ext_filter_table = 0;
+    uint32_t ext_filter_column = 0;
+
+    // Build the key set of an executed node's output column.
+    bool collect_keys(const pb::QbSemiFilter& semi,
+                      std::unordered_set<std::string>* out) {
+        if (semi.source_node() >= results.size())
+            return fail("semi source out of range");
+        const NodeResult& src = results[semi.source_node()];
+        const int pos = src.table_pos(semi.source_column().table_idx());
+        if (pos < 0) return fail("semi source table");
+        out->reserve(src.rows());
+        for (size_t r = 0; r < src.rows(); ++r) {
+            const uint64_t ref = src.refs[pos][r];
+            if (ref == kNullRef) continue;
+            std::string_view v =
+                value_of(semi.source_column().table_idx(), ref,
+                         semi.source_column().column());
+            if (!v.empty()) out->emplace(v);
+        }
+        return true;
+    }
+
     bool is_virtual(uint32_t table_idx) const {
         return table_idx >= static_cast<uint32_t>(req.tables_size());
     }
@@ -374,6 +410,19 @@ struct Executor {
         out->refs.resize(1);
         if (n_groups == 0) return true;
 
+        // Semi-join key filters: from the plan (earlier node's keys) and/or
+        // injected by a parent executor (sub-block domain restriction).
+        std::unordered_set<std::string> semi_keys;
+        const std::unordered_set<std::string>* semi_set = nullptr;
+        uint32_t semi_col = 0;
+        if (scan.has_semi()) {
+            if (!collect_keys(scan.semi(), &semi_keys)) return false;
+            semi_set = &semi_keys;
+            semi_col = scan.semi().my_column();
+        }
+        const bool use_ext = ext_keys != nullptr &&
+                             ext_filter_table == scan.table_idx();
+
         const bool has_filter =
             scan.has_filter() && scan.filter().has_expr();
         const unsigned wc =
@@ -400,6 +449,18 @@ struct Executor {
                                 __builtin_ctzll(bits));
                             bits &= bits - 1;
                             const uint32_t slot = base + s;
+                            if (semi_set != nullptr) {
+                                const std::string_view kv =
+                                    grp->cell(semi_col + 1, slot);
+                                if (semi_set->count(std::string(kv)) == 0)
+                                    continue;
+                            }
+                            if (use_ext) {
+                                const std::string_view kv = grp->cell(
+                                    ext_filter_column + 1, slot);
+                                if (ext_keys->count(std::string(kv)) == 0)
+                                    continue;
+                            }
                             if (has_filter) {
                                 if (!ev.set_row_from_pax(
                                         *grp, slot,
@@ -429,8 +490,15 @@ struct Executor {
 
     // ----- Sub-blocks (derived tables) --------------------------------------
     bool RunSubBlock(const pb::QbSubBlock& sub, NodeResult* out) {
+        std::unordered_set<std::string> outer_keys;
+        const std::unordered_set<std::string>* inject = nullptr;
+        if (sub.has_semi()) {
+            if (!collect_keys(sub.semi(), &outer_keys)) return false;
+            inject = &outer_keys;
+        }
         pb::TxExecuteQueryBlock::Response resp;
-        ExecuteQueryBlock(db, sub.block(), &resp);
+        ExecuteQueryBlockFiltered(db, sub.block(), &resp, inject,
+                                  sub.target_table(), sub.target_column());
         if (!resp.ok())
             return fail(resp.error().empty() ? "sub-block failed"
                                              : resp.error());
@@ -1505,6 +1573,34 @@ struct Executor {
 };
 
 }  // namespace
+
+void ExecuteQueryBlockFiltered(
+    LineairDB::Database* db,
+    const pb::TxExecuteQueryBlock::Request& request,
+    pb::TxExecuteQueryBlock::Response* response,
+    const std::unordered_set<std::string>* ext_keys,
+    uint32_t ext_filter_table, uint32_t ext_filter_column) {
+    Executor ex{db, request, {}, {}, {}, {}};
+    ex.ext_keys = ext_keys;
+    ex.ext_filter_table = ext_filter_table;
+    ex.ext_filter_column = ext_filter_column;
+    bool ok = false;
+    try {
+        ok = ex.Run(response);
+    } catch (const std::exception& e) {
+        ex.error = e.what();
+    } catch (...) {
+        ex.error = "query block execution failed";
+    }
+    if (!ok) {
+        response->set_ok(false);
+        response->set_error(ex.error.empty() ? "query block failed"
+                                             : ex.error);
+        response->clear_rows();
+        return;
+    }
+    response->set_ok(true);
+}
 
 void ExecuteQueryBlock(
     LineairDB::Database* db,
