@@ -494,7 +494,9 @@ struct Executor {
         const std::unordered_set<std::string>* inject = nullptr;
         if (sub.has_semi()) {
             if (!collect_keys(sub.semi(), &outer_keys)) return false;
-            inject = &outer_keys;
+            // A huge key set costs more to probe than it prunes.
+            if (outer_keys.size() <= (size_t{4} << 20))
+                inject = &outer_keys;
         }
         pb::TxExecuteQueryBlock::Response resp;
         ExecuteQueryBlockFiltered(db, sub.block(), &resp, inject,

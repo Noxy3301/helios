@@ -1102,6 +1102,10 @@ using QepRows = std::map<const TABLE *, double>;
 
 // Collect per-table output-row estimates from the AccessPath tree
 // (FILTER-over-TABLE_SCAN overrides the raw scan estimate).
+// Coverage note: secondary tables report HA_NO_INDEX_ACCESS, so the
+// hypergraph plan only produces TABLE_SCAN leaves for them; REF/EQ_REF/
+// INDEX_* paths would silently fall back to stats.records if that ever
+// changes (review finding D2-F3/Codex#1).
 static void collect_qep_rows(AccessPath *root, JOIN *join, QepRows *out) {
   if (root == nullptr) return;
   WalkAccessPaths(root, join, WalkAccessPathPolicy::ENTIRE_TREE,
@@ -1191,8 +1195,11 @@ bool build_block(THD *thd, Query_block *qb,
     ha_rows est = tl->table->file->stats.records;
     if (qep_rows != nullptr) {
       auto it = qep_rows->find(tl->table);
+      // NaN/-1 (kUnknownRowCount) fail the >= 0 test; +inf / >2^63 would be
+      // UB in the narrowing cast, so they clamp to "huge" instead.
       if (it != qep_rows->end() && it->second >= 0)
-        est = static_cast<ha_rows>(it->second);
+        est = it->second < 9.0e18 ? static_cast<ha_rows>(it->second)
+                                  : HA_POS_ERROR - 1;
     }
     tabs.push_back({tl, tl->table, tl->map(), est});
     tab_nest.push_back(nest);
@@ -1213,7 +1220,14 @@ bool build_block(THD *thd, Query_block *qb,
     Query_block *iqb = du->first_query_block();
     if (iqb == nullptr) LDB_COL_REJECT("derived inner");
     const int nest = nest_index_of(tl);
-    tabs.push_back({tl, tl->table, tl->map(), 0});
+    ha_rows vest = HA_POS_ERROR - 1;  // unknown: sort/semi-source unfriendly
+    if (qep_rows != nullptr) {
+      auto it = qep_rows->find(tl->table);
+      if (it != qep_rows->end() && it->second >= 0)
+        vest = it->second < 9.0e18 ? static_cast<ha_rows>(it->second)
+                                   : HA_POS_ERROR - 1;
+    }
+    tabs.push_back({tl, tl->table, tl->map(), vest});
     tab_nest.push_back(nest);
     tab_virtual.push_back(true);
     virtual_inner.push_back(iqb);
@@ -1231,6 +1245,7 @@ bool build_block(THD *thd, Query_block *qb,
     if (tab_virtual[ti]) return f;  // derived fields are already canonical
     return resolve_base_field(f, tabs[ti].table);
   };
+
 
   auto table_index_of_field = [&](const Field *f) -> int {
     for (size_t i = 0; i < n_tabs; ++i)
@@ -1463,37 +1478,13 @@ bool build_block(THD *thd, Query_block *qb,
   // only the ~20 filtered part keys instead of every l_partkey).
   for (size_t i = 0; i < n_real; ++i)
     req.add_tables()->set_table_name(tabs[i].table->s->normalized_path.str);
+  // Real scans issue by ascending estimate (selective tables first, so
+  // they can seed semi filters); sub-blocks always issue last, in tabs
+  // order (the server numbers virtual tables by sub_block appearance),
+  // receiving domain filters from the already-issued scans.
   std::vector<int> scan_node_of(n_tabs, -1);
   std::vector<size_t> issue_order;
   for (size_t i = 0; i < n_tabs; ++i) issue_order.push_back(i);
-  std::stable_sort(issue_order.begin(), issue_order.end(),
-                   [&](size_t a, size_t b) {
-                     return tabs[a].records < tabs[b].records;
-                   });
-  // Sub-blocks must be appended in virtual-table order server-side, so
-  // pre-assign their node slots after all scans is NOT possible — instead
-  // keep virtual tables in tabs order relative to each other.
-  {
-    std::vector<size_t> reals, virts;
-    for (size_t t : issue_order)
-      (tab_virtual[t] ? virts : reals).push_back(t);
-    // Interleave: keep the global estimate order but virtuals stay in
-    // ascending tabs order among themselves (server numbering contract).
-    std::sort(virts.begin(), virts.end());
-    issue_order.clear();
-    size_t vi = 0;
-    for (size_t t : reals) {
-      // Issue any virtual whose estimate is smaller than this real table
-      // and whose tabs-order turn has come.
-      while (vi < virts.size() &&
-             tabs[virts[vi]].records <= tabs[t].records) {
-        issue_order.push_back(virts[vi]);
-        ++vi;
-      }
-      issue_order.push_back(t);
-    }
-    while (vi < virts.size()) issue_order.push_back(virts[vi++]);
-  }
 
   std::vector<bool> issued(n_tabs, false);
   for (size_t t : issue_order) {
@@ -1519,7 +1510,8 @@ bool build_block(THD *thd, Query_block *qb,
         continue;
       }
       if (!issued[other]) continue;
-      if (tabs[other].records * 8 > tabs[t].records) continue;
+      if (!tab_virtual[t] && tabs[other].records > tabs[t].records / 8)
+        continue;
       if (semi_src < 0 || tabs[other].records < tabs[semi_src].records) {
         semi_src = other;
         semi_src_field = of;
@@ -1594,15 +1586,10 @@ bool build_block(THD *thd, Query_block *qb,
   // each next table is the smallest one connected to the joined set. The
   // server additionally swaps INNER build/probe by actual size and caps
   // intermediate cardinality.
+  // Real tables keep FROM order (an estimate-greedy order can pick an M:N
+  // edge first and blow up the intermediate — q5); the QEP estimates guide
+  // the semi filters below, not the join shape.
   std::vector<int> join_order = main_tabs;
-  std::stable_sort(join_order.begin(), join_order.end(), [&](int a, int b) {
-    // One-row deriveds join keyless; they must never drive (no edges).
-    auto key = [&](int t) -> ha_rows {
-      if (tab_virtual[t] && virtual_one_row[t - n_real]) return HA_POS_ERROR;
-      return tabs[t].records;
-    };
-    return key(a) < key(b);
-  });
 
   int current_node;
   std::vector<bool> joined(n_tabs, false);
