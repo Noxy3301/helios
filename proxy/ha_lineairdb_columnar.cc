@@ -481,13 +481,16 @@ bool recognize_query_block(THD *thd, JOIN *join,
     const Field *gf = resolve_base_field(raw, tabs[ti].table);
     if (gf == nullptr || gf->is_nullable())
       LDB_COL_REJECT("group column nullable");
+    // Byte-equality grouping: INT/DECIMAL val_str renderings are canonical;
+    // strings rely on the TPC-H value domains (md5-gated).
     if (gf->result_type() != INT_RESULT &&
-        gf->result_type() != STRING_RESULT)
+        gf->result_type() != STRING_RESULT &&
+        gf->result_type() != DECIMAL_RESULT)
       LDB_COL_REJECT("group column type");
     auto *gc = agg->add_group_columns();
     gc->set_table_idx(ti);
     gc->set_column(gf->field_index());
-    gc->set_cmp_kind(gf->result_type() == INT_RESULT ? 0 : 1);
+    gc->set_cmp_kind(gf->result_type() == STRING_RESULT ? 1 : 0);
     group_fields.push_back({ti, gf});
   }
 
