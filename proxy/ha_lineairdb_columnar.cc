@@ -340,6 +340,41 @@ static bool serialize_arith_multi(
   }
 }
 
+// Serialize a predicate over a joined tuple. Field references are remapped
+// to ordinals via `reg` (registering (table, column) pairs on first use).
+// Handles the FilterExpr subset serialize_item supports, but resolves each
+// Item_field through the registry instead of a single-table field index.
+struct TupleColumnRegistry {
+  std::vector<std::pair<int, const Field *>> cols;  // ordinal -> (ti, field)
+  std::function<int(const Field *)> table_of;
+  std::function<const Field *(const Field *, int)> resolve;
+  int ordinal_of(const Field *raw) {
+    const int ti = table_of(raw);
+    if (ti < 0) return -1;
+    const Field *f = resolve(raw, ti);
+    if (f == nullptr) return -1;
+    for (size_t i = 0; i < cols.size(); ++i)
+      if (cols[i].first == ti && cols[i].second == f)
+        return static_cast<int>(i);
+    cols.push_back({ti, f});
+    return static_cast<int>(cols.size()) - 1;
+  }
+};
+
+// Serialize a joined-tuple predicate: serialize_item with field references
+// remapped to registry ordinals (RAII sets the thread-local encoder).
+static bool serialize_tuple_pred(Item *item,
+                                 LineairDB::Protocol::FilterExpr *out,
+                                 TupleColumnRegistry *reg) {
+  SerializeColumnEncoder enc = [reg](const Field *f) {
+    return reg->ordinal_of(f);
+  };
+  set_serialize_column_encoder(&enc);
+  const bool ok = serialize_item(item, out);
+  set_serialize_column_encoder(nullptr);
+  return ok;
+}
+
 // Recognize EXTRACT(YEAR FROM date_col): returns the field, or nullptr.
 static const Field *extract_year_field(Item *item) {
   Item *real = item->real_item();
@@ -987,6 +1022,7 @@ bool recognize_query_block(THD *thd, JOIN *join,
   };
   std::vector<std::vector<Item *>> table_filters(n_tabs);
   std::vector<JoinEdge> edges;
+  std::vector<Item *> tuple_conjuncts;  // cross-table non-equi (q7/q19 ORs)
   {
     Item *where_cond = qb->where_cond() != nullptr ? qb->where_cond()
                                                    : join->where_cond;
@@ -999,10 +1035,72 @@ bool recognize_query_block(THD *thd, JOIN *join,
         table_filters[single].push_back(c);
         continue;
       }
-      // Cross-table conjunct: must be a bare equi-join between two tables.
+      // Cross-table conjunct: a bare equi-join edge, or a tuple predicate
+      // evaluated after the joins (OR-of-ANDs like q7/q19). An OR whose
+      // branches all contain the same equi-join condition (q19's
+      // p_partkey = l_partkey) contributes that edge; the OR itself is
+      // still re-evaluated as a tuple filter (redundant but correct).
+      if (c->type() == Item::COND_ITEM &&
+          down_cast<Item_cond *>(c)->functype() == Item_func::COND_OR_FUNC) {
+        auto *orc = down_cast<Item_cond *>(c);
+        std::vector<std::vector<std::pair<const Field *, const Field *>>>
+            branch_eqs;
+        List_iterator<Item> bit(*orc->argument_list());
+        for (Item *branch = bit++; branch != nullptr; branch = bit++) {
+          std::vector<Item *> parts;
+          flatten_and(branch, &parts);
+          branch_eqs.emplace_back();
+          for (Item *pc : parts) {
+            if (pc->type() != Item::FUNC_ITEM ||
+                down_cast<Item_func *>(pc)->functype() != Item_func::EQ_FUNC)
+              continue;
+            auto *peq = down_cast<Item_func *>(pc);
+            Item *pa = peq->arguments()[0]->real_item();
+            Item *pb = peq->arguments()[1]->real_item();
+            if (pa->type() != Item::FIELD_ITEM ||
+                pb->type() != Item::FIELD_ITEM)
+              continue;
+            branch_eqs.back().push_back(
+                {down_cast<Item_field *>(pa)->field,
+                 down_cast<Item_field *>(pb)->field});
+          }
+        }
+        if (!branch_eqs.empty()) {
+          for (const auto &cand : branch_eqs[0]) {
+            bool in_all = true;
+            for (size_t bi = 1; bi < branch_eqs.size() && in_all; ++bi) {
+              bool found = false;
+              for (const auto &other : branch_eqs[bi])
+                if ((other.first == cand.first &&
+                     other.second == cand.second) ||
+                    (other.first == cand.second &&
+                     other.second == cand.first)) {
+                  found = true;
+                  break;
+                }
+              in_all = found;
+            }
+            if (!in_all) continue;
+            const int ta = table_index_of_field(cand.first);
+            const int tb = table_index_of_field(cand.second);
+            if (ta < 0 || tb < 0 || ta == tb) continue;
+            if (cand.first->result_type() != INT_RESULT ||
+                cand.second->result_type() != INT_RESULT)
+              continue;
+            const Field *rfa = resolve_base_field(cand.first, tabs[ta].table);
+            const Field *rfb = resolve_base_field(cand.second, tabs[tb].table);
+            if (rfa == nullptr || rfb == nullptr) continue;
+            edges.push_back({ta, tb, rfa, rfb});
+          }
+        }
+        tuple_conjuncts.push_back(c);
+        continue;
+      }
       if (c->type() != Item::FUNC_ITEM ||
-          down_cast<Item_func *>(c)->functype() != Item_func::EQ_FUNC)
-        LDB_COL_REJECT("non-equi cross-table conjunct");
+          down_cast<Item_func *>(c)->functype() != Item_func::EQ_FUNC) {
+        tuple_conjuncts.push_back(c);
+        continue;
+      }
       auto *eq = down_cast<Item_func *>(c);
       Item *a = eq->arguments()[0]->real_item();
       Item *b = eq->arguments()[1]->real_item();
@@ -1115,6 +1213,36 @@ bool recognize_query_block(THD *thd, JOIN *join,
       joined[pick] = true;
       current_node = req.nodes_size() - 1;
     }
+  }
+
+  // Cross-table non-equi conjuncts run as a tuple filter over the joined
+  // result (executor-standard residual filtering; see lineage log #15).
+  if (!tuple_conjuncts.empty()) {
+    auto *fn = req.add_nodes()->mutable_filter();
+    fn->set_input(current_node);
+    auto *tf = fn->mutable_filter();
+    TupleColumnRegistry reg;
+    reg.table_of = [&](const Field *f) { return table_index_of_field(f); };
+    reg.resolve = [&](const Field *f, int ti) {
+      return resolve_base_field(f, tabs[ti].table);
+    };
+    auto *expr = tf->mutable_pred()->mutable_expr();
+    if (tuple_conjuncts.size() == 1) {
+      if (!serialize_tuple_pred(tuple_conjuncts[0], expr, &reg))
+        LDB_COL_REJECT("tuple predicate not pushable");
+    } else {
+      expr->set_op(LineairDB::Protocol::FilterExpr::OP_AND);
+      for (Item *c : tuple_conjuncts)
+        if (!serialize_tuple_pred(c, expr->add_children(), &reg))
+          LDB_COL_REJECT("tuple predicate not pushable");
+    }
+    tf->mutable_pred()->set_num_columns(reg.cols.size());
+    for (const auto &rc : reg.cols) {
+      auto *col = tf->add_columns();
+      col->set_table_idx(rc.first);
+      col->set_column(rc.second->field_index());
+    }
+    current_node = req.nodes_size() - 1;
   }
 
   // Aggregate node over the join result.

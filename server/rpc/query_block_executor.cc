@@ -109,6 +109,36 @@ std::string dec_format(const Dec& d) {
     return out;
 }
 
+// MySQL decimal division: scale(a/b) = a.scale + div_precision_increment(4),
+// round half up (validated by the md5 gates).
+Dec dec_div(const Dec& a, const Dec& b, int out_scale) {
+    Dec r;
+    if (a.null || b.null || b.m == 0) return r;
+    __int128 num = a.m;
+    __int128 den = b.m;
+    bool neg = false;
+    if (num < 0) {
+        num = -num;
+        neg = !neg;
+    }
+    if (den < 0) {
+        den = -den;
+        neg = !neg;
+    }
+    // Scale numerator so quotient has out_scale + 1 digits, then round.
+    const int shift = out_scale + b.s - a.s + 1;
+    if (shift > 0)
+        num *= dec_pow10(shift);
+    else if (shift < 0)
+        num /= dec_pow10(-shift);
+    __int128 q = num / den;
+    q = (q + 5) / 10;
+    r.m = neg ? -q : q;
+    r.s = out_scale;
+    r.null = false;
+    return r;
+}
+
 // MySQL AVG: scale = arg_scale + div_precision_increment(4), round half up.
 Dec dec_divide(const Dec& sum, uint64_t count, int out_scale) {
     Dec r;
@@ -365,6 +395,96 @@ struct Executor {
         return true;
     }
 
+    // ----- Tuple filters ----------------------------------------------------
+    // Resolve a QbTupleFilter against one tuple of `nr` (row r), evaluating
+    // FilterExpr ordinals over the mapped (table, column) cells. LEFT-join
+    // misses become SQL NULLs.
+    struct TupleFilterCtx {
+        std::vector<int> pos;            // per filter column: ref column pos
+        std::vector<std::string_view> cells;
+        std::vector<bool> nulls;
+    };
+
+    bool prep_tuple_filter(const pb::QbTupleFilter& tf, const NodeResult& nr,
+                           TupleFilterCtx* ctx) {
+        ctx->pos.resize(tf.columns_size());
+        for (int i = 0; i < tf.columns_size(); ++i) {
+            ctx->pos[i] = nr.table_pos(tf.columns(i).table_idx());
+            if (ctx->pos[i] < 0) return fail("tuple filter table");
+        }
+        ctx->cells.resize(tf.columns_size());
+        ctx->nulls.resize(tf.columns_size());
+        return true;
+    }
+
+    bool eval_tuple_filter(const pb::QbTupleFilter& tf, const NodeResult& nr,
+                           size_t row, TupleFilterCtx* ctx,
+                           PredicateEvaluator* ev) {
+        for (int i = 0; i < tf.columns_size(); ++i) {
+            const uint64_t ref = nr.refs[ctx->pos[i]][row];
+            if (ref == kNullRef) {
+                ctx->cells[i] = {};
+                ctx->nulls[i] = true;
+            } else {
+                ctx->cells[i] = cell_of(stores[tf.columns(i).table_idx()],
+                                        ref, tf.columns(i).column());
+                ctx->nulls[i] = false;
+            }
+        }
+        ev->set_row_from_views(ctx->cells, ctx->nulls);
+        return ev->evaluate(tf.pred().expr());
+    }
+
+    bool RunFilter(const pb::QbTupleFilterNode& fn, NodeResult* out) {
+        if (fn.input() >= results.size()) return fail("filter child");
+        const NodeResult& in = results[fn.input()];
+        out->tables = in.tables;
+        out->refs.assign(in.tables.size(), {});
+        const size_t n = in.rows();
+        const unsigned wc = static_cast<unsigned>(
+            std::min<size_t>(workers(), std::max<size_t>(n / 16384, 1)));
+        struct ChunkOut {
+            std::vector<std::vector<uint64_t>> refs;
+        };
+        std::vector<ChunkOut> chunks(wc);
+        std::vector<char> failed(wc, 0);
+        std::vector<std::thread> pool;
+        pool.reserve(wc);
+        for (unsigned w = 0; w < wc; ++w) {
+            pool.emplace_back([&, w] {
+                TupleFilterCtx ctx;
+                if (!prep_tuple_filter(fn.filter(), in, &ctx)) {
+                    failed[w] = 1;
+                    return;
+                }
+                PredicateEvaluator ev;
+                auto& mine = chunks[w].refs;
+                mine.assign(in.tables.size(), {});
+                const size_t begin = n * w / wc;
+                const size_t end = n * (w + 1) / wc;
+                for (size_t r = begin; r < end; ++r) {
+                    if (!eval_tuple_filter(fn.filter(), in, r, &ctx, &ev))
+                        continue;
+                    for (size_t c = 0; c < in.tables.size(); ++c)
+                        mine[c].push_back(in.refs[c][r]);
+                }
+            });
+        }
+        for (auto& t : pool) t.join();
+        for (char f : failed)
+            if (f) return false;
+        size_t total = 0;
+        for (auto& ch : chunks)
+            total += ch.refs.empty() ? 0 : ch.refs[0].size();
+        for (size_t c = 0; c < out->refs.size(); ++c) {
+            out->refs[c].reserve(total);
+            for (auto& ch : chunks)
+                out->refs[c].insert(out->refs[c].end(), ch.refs[c].begin(),
+                                    ch.refs[c].end());
+        }
+        return true;
+    }
+
     // ----- Join ------------------------------------------------------------
     static void append_join_key(std::string& key, std::string_view cell) {
         const uint32_t l = static_cast<uint32_t>(cell.size());
@@ -410,6 +530,34 @@ struct Executor {
             pk[i] = {pos, c.column(), stores[c.table_idx()]};
         }
 
+        // Residual predicate over the (probe ++ build) tuple, applied per
+        // key match. Pre-resolve each referenced column to its side.
+        struct ResidualCol {
+            bool from_build;
+            int pos;
+            uint32_t table_idx;
+            uint32_t column;
+        };
+        std::vector<ResidualCol> residual_cols;
+        const bool has_residual =
+            join.has_residual() && join.residual().pred().has_expr();
+        if (has_residual) {
+            if (join.type() == pb::QbJoin::LEFT)
+                return fail("residual on LEFT join");
+            for (const auto& c : join.residual().columns()) {
+                int pos = probe.table_pos(c.table_idx());
+                if (pos >= 0) {
+                    residual_cols.push_back(
+                        {false, pos, c.table_idx(), c.column()});
+                    continue;
+                }
+                pos = build.table_pos(c.table_idx());
+                if (pos < 0) return fail("residual column table");
+                residual_cols.push_back(
+                    {true, pos, c.table_idx(), c.column()});
+            }
+        }
+
         // Build hash table: key bytes -> build row indexes.
         std::unordered_map<std::string, std::vector<uint32_t>> ht;
         ht.reserve(build.rows());
@@ -450,6 +598,24 @@ struct Executor {
                 auto& mine = chunks[w].refs;
                 mine.assign(out->tables.size(), {});
                 std::string key;
+                PredicateEvaluator ev;
+                std::vector<std::string_view> rcells(residual_cols.size());
+                std::vector<bool> rnulls(residual_cols.size(), false);
+                // True when build row `br` passes the residual predicate
+                // against probe row `r`.
+                auto residual_ok = [&](size_t r, uint32_t br) {
+                    if (!has_residual) return true;
+                    for (size_t i = 0; i < residual_cols.size(); ++i) {
+                        const auto& rc = residual_cols[i];
+                        const uint64_t ref = rc.from_build
+                                                 ? build.refs[rc.pos][br]
+                                                 : probe.refs[rc.pos][r];
+                        rcells[i] =
+                            cell_of(stores[rc.table_idx], ref, rc.column);
+                    }
+                    ev.set_row_from_views(rcells, rnulls);
+                    return ev.evaluate(join.residual().pred().expr());
+                };
                 const size_t begin = n * w / wc;
                 const size_t end = n * (w + 1) / wc;
                 for (size_t r = begin; r < end; ++r) {
@@ -460,12 +626,20 @@ struct Executor {
                                          k.column));
                     }
                     const auto it = ht.find(key);
-                    const bool matched =
-                        it != ht.end() && !it->second.empty();
+                    bool matched = it != ht.end() && !it->second.empty();
+                    if (matched && has_residual) {
+                        matched = false;
+                        for (uint32_t br : it->second)
+                            if (residual_ok(r, br)) {
+                                matched = true;
+                                break;
+                            }
+                    }
                     switch (join.type()) {
                         case pb::QbJoin::INNER:
                             if (!matched) break;
                             for (uint32_t br : it->second) {
+                                if (!residual_ok(r, br)) continue;
                                 for (size_t c = 0; c < probe.tables.size();
                                      ++c)
                                     mine[c].push_back(probe.refs[c][r]);
@@ -725,6 +899,71 @@ struct Executor {
         }
     }
 
+    // Evaluate an output expression (source=EXPR): COLUMN_REF ordinals
+    // address [group columns..., aggregates...]; OP_DIV follows MySQL
+    // decimal division. Returns a null Dec on failure.
+    Dec EvalOutExpr(const pb::FilterExpr& e, const pb::QbAggregate& agg,
+                    const GroupState& gs) {
+        using FE = pb::FilterExpr;
+        const int n_grp = agg.group_columns_size();
+        switch (e.op()) {
+            case FE::COLUMN_REF: {
+                const int ord = static_cast<int>(e.column_index());
+                if (ord < n_grp) return dec_parse(gs.key_cols[ord]);
+                const int a = ord - n_grp;
+                if (a >= agg.aggs_size()) return {};
+                bool is_null = false;
+                const std::string v =
+                    AggValue(agg.aggs(a), gs, a, &is_null);
+                if (is_null) return {};
+                return dec_parse(v);
+            }
+            case FE::CONST_INT: {
+                Dec d;
+                d.m = e.int_val();
+                d.s = 0;
+                d.null = false;
+                return d;
+            }
+            case FE::CONST_STRING:
+                return dec_parse(std::string_view(e.string_val()));
+            case FE::OP_ADD:
+            case FE::OP_SUB: {
+                if (e.children_size() != 2) return {};
+                Dec a = EvalOutExpr(e.children(0), agg, gs);
+                Dec b = EvalOutExpr(e.children(1), agg, gs);
+                if (a.null || b.null) return {};
+                dec_addsub(a, b, e.op() == FE::OP_SUB);
+                return a;
+            }
+            case FE::OP_MUL: {
+                if (e.children_size() != 2) return {};
+                Dec a = EvalOutExpr(e.children(0), agg, gs);
+                Dec b = EvalOutExpr(e.children(1), agg, gs);
+                if (a.null || b.null) return {};
+                Dec r;
+                r.m = a.m * b.m;
+                r.s = a.s + b.s;
+                r.null = false;
+                return r;
+            }
+            case FE::OP_DIV: {
+                if (e.children_size() != 2) return {};
+                Dec a = EvalOutExpr(e.children(0), agg, gs);
+                Dec b = EvalOutExpr(e.children(1), agg, gs);
+                return dec_div(a, b, a.null ? 0 : a.s + 4);
+            }
+            case FE::OP_NEG: {
+                if (e.children_size() != 1) return {};
+                Dec a = EvalOutExpr(e.children(0), agg, gs);
+                if (!a.null) a.m = -a.m;
+                return a;
+            }
+            default:
+                return {};
+        }
+    }
+
     // Format one aggregate's final value ("" + is_null for SQL NULL).
     std::string AggValue(const pb::QbAggFunc& af, const GroupState& gs, int a,
                          bool* is_null) {
@@ -903,6 +1142,24 @@ struct Executor {
                         row.nulls.push_back(is_null);
                         break;
                     }
+                    case pb::QbOutputExpr::EXPR: {
+                        Dec v = EvalOutExpr(oe.expr(), agg, gs);
+                        if (!v.null && v.s > static_cast<int>(
+                                                 oe.result_scale())) {
+                            // Round to the declared output scale.
+                            const int drop = v.s - oe.result_scale();
+                            __int128 m = v.m;
+                            const bool neg = m < 0;
+                            if (neg) m = -m;
+                            m = (m + dec_pow10(drop) / 2) / dec_pow10(drop);
+                            v.m = neg ? -m : m;
+                            v.s = oe.result_scale();
+                        }
+                        row.vals.push_back(v.null ? std::string()
+                                                  : dec_format(v));
+                        row.nulls.push_back(v.null);
+                        break;
+                    }
                     default:
                         return fail("unsupported output source");
                 }
@@ -972,6 +1229,10 @@ struct Executor {
                         return fail("join child order");
                 }
                 if (!RunJoin(node.join(), &results[i])) return false;
+            } else if (node.has_filter()) {
+                if (node.filter().input() >= static_cast<uint32_t>(i))
+                    return fail("filter child order");
+                if (!RunFilter(node.filter(), &results[i])) return false;
             } else if (node.has_aggregate()) {
                 if (i != req.nodes_size() - 1)
                     return fail("aggregate must be the root");

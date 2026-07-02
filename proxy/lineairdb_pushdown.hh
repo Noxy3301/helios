@@ -13,6 +13,15 @@ class LineairDBTransaction;
 bool serialize_item(const Item *item,
                     LineairDB::Protocol::FilterExpr *expr);
 
+// Optional column-reference encoder for serialize_item. When set (non-null),
+// every Item_field is encoded via this callback (return the column_index to
+// emit, or -1 to reject) instead of the default single-table field_index().
+// Used by the secondary engine to serialize predicates over joined tuples.
+#include <functional>
+class Field;
+using SerializeColumnEncoder = std::function<int(const Field *)>;
+void set_serialize_column_encoder(const SerializeColumnEncoder *encoder);
+
 bool prepare_select_filter_for_tx(THD *thd, TABLE *table,
                                   LineairDBTransaction *tx,
                                   std::string *serialized_filter);
