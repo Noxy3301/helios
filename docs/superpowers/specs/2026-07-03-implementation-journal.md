@@ -48,3 +48,11 @@ INNER/SEMI/ANTI/LEFT・equijoin_conditions・非等値 join_conditions が全部
 置き換え。semi filter 伝播は写像の上のルールとして残す。期待効果:
 TPC-H 特化ヒューリスティックの大半 (FROM 順・Item_equal 展開・等値書き戻し
 ・nest mini-tree) がプラン写像に吸収されて消える。
+
+### E1 実装記録 (2026-07-03)
+
+| 試行 | 観測 | 判断 |
+|---|---|---|
+| AccessPath 写像の一発切替 | 初回ゲート 1/22。原因 3 連: (1) 旧経路の cross-join チェックが写像モードでも作動 (edges を作らないので常に空)、(2) req.Clear() が add_tables の後に走り登録消滅、(3) SF=0.01 では NLJ プランが出る (NESTED_LOOP_JOIN 未対応) | 順に修正。NLJ も JoinPredicate を持つので HASH_JOIN と同一写像 |
+| 残 6 本 (WEEDOUT=type37, subquery materialization, keyless INNER) | q20/q21 は weedout 戦略、q4/q22 は leaf にない MATERIALIZE、q19 は OR 内の equi キーが equijoin_conditions に正規化されず keyless cross 化 → 64M cap | **写像失敗→構文ビルダーへリトライ** (最終 reject は loud のまま)。q19 は「keyless INNER over base tables」を写像側で reject し構文側の OR factor-out が受ける |
+| 結果 | 22/22 MATCH。join 構造はプラン由来が第一経路、TPC-H 特化ヒューリスティックは第二経路に降格 | E2 で semi filter ルールを写像経路にも配線 (現在は構文経路のみ) |
