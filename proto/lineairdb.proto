@@ -699,6 +699,9 @@ message QbAggFunc {
     // Table the argument reads from (index into QbRequest.tables).
     uint32 arg_table = 2;
     // Argument expression over that table's columns (FilterExpr arithmetic).
+    // COLUMN_REF nodes may address other tables by encoding
+    // (table_idx << 16 | column) in column_index when the high bits are set;
+    // arg_table remains the default table for untagged refs.
     // Unset for COUNT(*).
     FilterExpr arg = 3;
     // Optional per-row predicate (SUM(CASE WHEN p THEN 1 ELSE 0) => COUNT
@@ -714,6 +717,9 @@ message QbColumnRef {
     uint32 table_idx = 1;
     uint32 column = 2;      // 0-based TABLE::field index
     uint32 cmp_kind = 3;    // 0=int64, 1=binary string, 2=decimal-as-number
+    // When >0, group/emit only the first N bytes of the cell. Lowers
+    // EXTRACT(YEAR FROM date_col) (dates are "YYYY-MM-DD") to prefix 4.
+    uint32 prefix_len = 4;
 }
 
 message QbScan {

@@ -143,13 +143,35 @@ inline std::string_view cell_of(const PaxStore* store, uint64_t ref,
                    static_cast<uint32_t>(ref % PaxGroup::kRows));
 }
 
-// Evaluate a FilterExpr arithmetic tree (COLUMN_REF/CONST/ADD/SUB/MUL/NEG)
-// over one row of one table.
-Dec eval_arith(const pb::FilterExpr& e, const PaxStore* store, uint64_t ref) {
+// Evaluate a FilterExpr arithmetic tree (COLUMN_REF/CONST/ADD/SUB/MUL/NEG).
+// `store`/`ref` address the default table; a COLUMN_REF may target another
+// table via (table_idx << 16 | column) when `ctx` row context is given.
+struct ArithRowCtx {
+    const std::vector<PaxStore*>* stores;
+    const std::vector<uint32_t>* tables;      // table_idx per ref column
+    const std::vector<std::vector<uint64_t>>* refs;
+    size_t row;
+};
+
+Dec eval_arith(const pb::FilterExpr& e, const PaxStore* store, uint64_t ref,
+               const ArithRowCtx* ctx = nullptr) {
     using FE = pb::FilterExpr;
     switch (e.op()) {
-        case FE::COLUMN_REF:
-            return dec_parse(cell_of(store, ref, e.column_index()));
+        case FE::COLUMN_REF: {
+            const uint32_t enc = e.column_index();
+            if (enc < (1u << 16) || ctx == nullptr)
+                return dec_parse(cell_of(store, ref, enc));
+            const uint32_t t = enc >> 16;
+            const uint32_t col = enc & 0xFFFF;
+            for (size_t i = 0; i < ctx->tables->size(); ++i) {
+                if ((*ctx->tables)[i] == t) {
+                    const uint64_t r = (*ctx->refs)[i][ctx->row];
+                    if (r == kNullRef) return {};
+                    return dec_parse(cell_of((*ctx->stores)[t], r, col));
+                }
+            }
+            return {};
+        }
         case FE::CONST_INT: {
             Dec d;
             d.m = e.int_val();
@@ -167,16 +189,16 @@ Dec eval_arith(const pb::FilterExpr& e, const PaxStore* store, uint64_t ref) {
         case FE::OP_ADD:
         case FE::OP_SUB: {
             if (e.children_size() != 2) return {};
-            Dec a = eval_arith(e.children(0), store, ref);
-            Dec b = eval_arith(e.children(1), store, ref);
+            Dec a = eval_arith(e.children(0), store, ref, ctx);
+            Dec b = eval_arith(e.children(1), store, ref, ctx);
             if (a.null || b.null) return {};
             dec_addsub(a, b, e.op() == FE::OP_SUB);
             return a;
         }
         case FE::OP_MUL: {
             if (e.children_size() != 2) return {};
-            Dec a = eval_arith(e.children(0), store, ref);
-            Dec b = eval_arith(e.children(1), store, ref);
+            Dec a = eval_arith(e.children(0), store, ref, ctx);
+            Dec b = eval_arith(e.children(1), store, ref, ctx);
             if (a.null || b.null) return {};
             Dec r;
             r.m = a.m * b.m;
@@ -186,7 +208,7 @@ Dec eval_arith(const pb::FilterExpr& e, const PaxStore* store, uint64_t ref) {
         }
         case FE::OP_NEG: {
             if (e.children_size() != 1) return {};
-            Dec a = eval_arith(e.children(0), store, ref);
+            Dec a = eval_arith(e.children(0), store, ref, ctx);
             if (!a.null) a.m = -a.m;
             return a;
         }
@@ -547,6 +569,8 @@ struct Executor {
                 gv[g] = ref == kNullRef
                             ? std::string_view()
                             : cell_of(stores[c.table_idx()], ref, c.column());
+                if (c.prefix_len() > 0 && gv[g].size() > c.prefix_len())
+                    gv[g] = gv[g].substr(0, c.prefix_len());
                 const uint32_t l = static_cast<uint32_t>(gv[g].size());
                 keybuf.append(reinterpret_cast<const char*>(&l), sizeof(l));
                 keybuf.append(gv[g].data(), gv[g].size());
@@ -568,6 +592,7 @@ struct Executor {
             } else {
                 gs = &it->second;
             }
+            ArithRowCtx arith_ctx{&stores, &in.tables, &in.refs, r};
             for (int a = 0; a < n_agg; ++a) {
                 const auto& af = agg.aggs(a);
                 const uint64_t ref =
@@ -591,7 +616,8 @@ struct Executor {
                     case pb::QbAggFunc::SUM:
                     case pb::QbAggFunc::AVG: {
                         Dec v = eval_arith(af.arg(),
-                                           stores[af.arg_table()], ref);
+                                           stores[af.arg_table()], ref,
+                                           &arith_ctx);
                         if (v.null) break;  // NULL input skipped
                         if (gs->count[a] == 0)
                             gs->acc[a] = v;
