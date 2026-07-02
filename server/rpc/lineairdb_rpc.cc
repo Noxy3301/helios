@@ -2349,6 +2349,8 @@ void LineairDBRpc::handleTxExecuteReadPlan(const std::string& message,
                     scan_limit_for_lineairdb, step.reverse_scan());
             if (!scan_result.ok) {
                 response.set_ok(false);
+                LOG_ERROR("readplan fail site L2351 table='%s' start=%zu end=%zu",
+                          step.table_name().c_str(), start_key.size(), end_key.size());  // handleTxExecuteReadPlan-diag
                 flat_plan::encode_to_string(response, result);
                 return;
             }

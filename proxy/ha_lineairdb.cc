@@ -186,6 +186,19 @@ static void ensure_lineairdb_proxy(LineairDBThdCtx *&ctx) {
 }
 
 /**
+ * @brief Shared RPC connection for the LINEAIRDB_COLUMNAR secondary engine.
+ *
+ * Both engines talk to the same LineairDB server through the THD-scoped
+ * context owned by this (primary) engine.
+ */
+std::shared_ptr<LineairDBProxy> lineairdb_acquire_shared_proxy(THD *thd) {
+  if (thd == nullptr || lineairdb_hton == nullptr) return nullptr;
+  LineairDBThdCtx *&ctx = lineairdb_thd_ctx(thd, lineairdb_hton);
+  ensure_lineairdb_proxy(ctx);
+  return ctx->proxy;
+}
+
+/**
  * @brief List the indexes whose key-prefix NDV the server should measure.
  */
 static std::vector<std::pair<std::string, uint32_t>> index_ndv_descriptors(
@@ -506,8 +519,9 @@ static bool helios_make_output_caches(JOIN *join,
 /**
  * @brief Serialize an aggregate argument for server-side decimal evaluation.
  */
-static bool helios_serialize_arith(const Item *it,
-                                   LineairDB::Protocol::FilterExpr *out) {
+// Non-static: also used by the LINEAIRDB_COLUMNAR secondary engine.
+bool helios_serialize_arith(const Item *it,
+                            LineairDB::Protocol::FilterExpr *out) {
   switch (it->type()) {
     case Item::FIELD_ITEM: {
       const Item_field *f = down_cast<const Item_field *>(it);
@@ -1577,7 +1591,12 @@ static int lineairdb_init_func(void *p) {
   lineairdb_hton = (handlerton *)p;
   lineairdb_hton->state = SHOW_OPTION_YES;
   lineairdb_hton->create = lineairdb_create_handler;
-  lineairdb_hton->flags = HTON_CAN_RECREATE;
+  lineairdb_hton->flags =
+      HTON_CAN_RECREATE | HTON_SUPPORTS_SECONDARY_ENGINE;
+  // ALTER TABLE ... SECONDARY_LOAD/UNLOAD unconditionally invokes the
+  // primary engine's post_ddl hook (sql_table.cc, cleanup lambda); LineairDB
+  // DDL needs no post-commit work, but the pointer must be non-null.
+  lineairdb_hton->post_ddl = [](THD *) {};
   lineairdb_hton->is_supported_system_table =
       lineairdb_is_supported_system_table;
   lineairdb_hton->db_type = DB_TYPE_UNKNOWN;
@@ -3726,6 +3745,17 @@ enum_alter_inplace_result ha_lineairdb::check_if_supported_inplace_alter(
       Alter_inplace_info::ADD_UNIQUE_INDEX |
       Alter_inplace_info::DROP_UNIQUE_INDEX;
 
+  // ALTER TABLE ... SECONDARY_ENGINE = x|NULL is a pure metadata change
+  // (the DD option string); no storage work is needed.
+  if (ha_alter_info->handler_flags == Alter_inplace_info::CHANGE_CREATE_OPTION &&
+      ha_alter_info->create_info != nullptr &&
+      (ha_alter_info->create_info->used_fields &
+       HA_CREATE_USED_SECONDARY_ENGINE) &&
+      !(ha_alter_info->create_info->used_fields &
+        ~HA_CREATE_USED_SECONDARY_ENGINE)) {
+    return HA_ALTER_INPLACE_INSTANT;
+  }
+
   if (ha_alter_info->handler_flags & ~dominated_flags) {
     // Unsupported operation requested
     return HA_ALTER_INPLACE_NOT_SUPPORTED;
@@ -4512,6 +4542,10 @@ static SHOW_VAR func_status[] = {
      SHOW_SCOPE_GLOBAL},
     {nullptr, nullptr, SHOW_UNDEF, SHOW_SCOPE_UNDEF}};
 
+extern struct st_mysql_storage_engine lineairdb_columnar_storage_engine;
+extern int lineairdb_columnar_init(void *p);
+extern int lineairdb_columnar_deinit(void *p);
+
 mysql_declare_plugin(lineairdb){
     MYSQL_STORAGE_ENGINE_PLUGIN,
     &lineairdb_storage_engine,
@@ -4527,4 +4561,20 @@ mysql_declare_plugin(lineairdb){
     lineairdb_system_variables, /* system variables */
     nullptr,                    /* config options */
     0,                          /* flags */
+},
+{
+    MYSQL_STORAGE_ENGINE_PLUGIN,
+    &lineairdb_columnar_storage_engine,
+    "LINEAIRDB_COLUMNAR",
+    PLUGIN_AUTHOR_ORACLE,
+    "LineairDB columnar secondary engine",
+    PLUGIN_LICENSE_GPL,
+    lineairdb_columnar_init,   /* Plugin Init */
+    nullptr,                   /* Plugin check uninstall */
+    lineairdb_columnar_deinit, /* Plugin Deinit */
+    0x0001 /* 0.1 */,
+    nullptr, /* status variables */
+    nullptr, /* system variables */
+    nullptr, /* config options */
+    0,       /* flags */
 } mysql_declare_plugin_end;
