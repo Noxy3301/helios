@@ -261,6 +261,28 @@ static Item *case_to_count_filter(Item *arg) {
   return when;
 }
 
+// SUM(CASE WHEN pred THEN expr ELSE 0 END) => filtered SUM with
+// zero-if-empty semantics. Returns the predicate and THEN expression.
+static bool case_to_filtered_sum(Item *arg, Item **out_pred,
+                                 Item **out_expr) {
+  if (arg->type() != Item::FUNC_ITEM) return false;
+  auto *fn = down_cast<Item_func *>(arg);
+  if (fn->functype() != Item_func::CASE_FUNC) return false;
+  if (fn->argument_count() != 3) return false;
+  Item *when = fn->arguments()[0];
+  Item *then = fn->arguments()[1];
+  Item *els = fn->arguments()[2];
+  const bool when_is_pred =
+      when->type() == Item::COND_ITEM ||
+      (when->type() == Item::FUNC_ITEM &&
+       down_cast<Item_func *>(when)->functype() != Item_func::UNKNOWN_FUNC);
+  if (!when_is_pred) return false;
+  if (!els->const_item() || els->val_int() != 0) return false;
+  *out_pred = when;
+  *out_expr = then;
+  return true;
+}
+
 struct QbTableCtx {
   Table_ref *tl;
   TABLE *table;
@@ -1292,6 +1314,225 @@ bool recognize_query_block(THD *thd, JOIN *join,
   }
 
   // Output expressions from the visible field list (pre-optimizer items).
+  // register_aggregate returns the aggregate's ordinal (or -1 + why).
+  const char *agg_why = nullptr;
+  auto register_aggregate = [&](Item_sum *sum) -> int {
+    auto *af = agg->add_aggs();
+    switch (sum->sum_func()) {
+      case Item_sum::COUNT_FUNC: {
+        if (sum->argument_count() != 1) {
+          agg_why = "COUNT arg count";
+          return -1;
+        }
+        Item *arg = sum->get_arg(0)->real_item();
+        af->set_arg_table(0);
+        if (!arg->const_item()) {
+          if (arg->type() != Item::FIELD_ITEM) {
+            agg_why = "COUNT arg shape";
+            return -1;
+          }
+          const Field *raw = down_cast<Item_field *>(arg)->field;
+          const int ti = table_index_of_field(raw);
+          const Field *cf =
+              ti >= 0 ? resolve_base_field(raw, tabs[ti].table) : nullptr;
+          if (cf == nullptr || cf->is_nullable()) {
+            agg_why = "COUNT arg nullable";
+            return -1;
+          }
+          af->set_arg_table(ti);
+          af->mutable_arg()->set_op(
+              LineairDB::Protocol::FilterExpr::COLUMN_REF);
+          af->mutable_arg()->set_column_index(cf->field_index());
+        }
+        af->set_kind(LineairDB::Protocol::QbAggFunc::COUNT);
+        return agg->aggs_size() - 1;
+      }
+      case Item_sum::SUM_FUNC:
+      case Item_sum::AVG_FUNC: {
+        if (sum->argument_count() != 1) {
+          agg_why = "agg arg count";
+          return -1;
+        }
+        Item *arg = sum->get_arg(0)->real_item();
+        if (sum->sum_func() == Item_sum::SUM_FUNC) {
+          if (Item *pred = case_to_count_filter(arg)) {
+            const int ti = single_table_of(
+                pred->used_tables() & ~PSEUDO_TABLE_BITS, tabs);
+            if (ti < 0) {
+              agg_why = "CASE filter tables";
+              return -1;
+            }
+            auto *pf = af->mutable_filter();
+            pf->set_num_columns(tabs[ti].table->s->fields);
+            if (!serialize_item(pred, pf->mutable_expr())) {
+              agg_why = "CASE filter not pushable";
+              return -1;
+            }
+            af->set_arg_table(ti);
+            af->set_filter_table(ti);
+            af->set_kind(LineairDB::Protocol::QbAggFunc::COUNT);
+            return agg->aggs_size() - 1;
+          }
+          Item *pred = nullptr;
+          Item *then_expr = nullptr;
+          if (case_to_filtered_sum(arg, &pred, &then_expr)) {
+            const int pti = single_table_of(
+                pred->used_tables() & ~PSEUDO_TABLE_BITS, tabs);
+            if (pti < 0) {
+              agg_why = "CASE filter tables";
+              return -1;
+            }
+            auto *pf = af->mutable_filter();
+            pf->set_num_columns(tabs[pti].table->s->fields);
+            if (!serialize_item(pred, pf->mutable_expr())) {
+              agg_why = "CASE filter not pushable";
+              return -1;
+            }
+            af->set_filter_table(pti);
+            Item *texpr = then_expr->real_item();
+            int ti = single_table_of(
+                texpr->used_tables() & ~PSEUDO_TABLE_BITS, tabs);
+            if (ti >= 0) {
+              if (!helios_serialize_arith(texpr, af->mutable_arg())) {
+                agg_why = "CASE expr not pushable";
+                return -1;
+              }
+            } else {
+              auto resolver2 = [&](const Field *f, int t) -> const Field * {
+                return resolve_base_field(f, tabs[t].table);
+              };
+              if (!serialize_arith_multi(
+                      texpr, af->mutable_arg(),
+                      [&](const Field *f) { return table_index_of_field(f); },
+                      resolver2)) {
+                agg_why = "CASE expr not pushable";
+                return -1;
+              }
+              ti = 0;
+            }
+            af->set_arg_table(ti);
+            af->set_kind(LineairDB::Protocol::QbAggFunc::SUM);
+            af->set_arg_scale(texpr->decimals);
+            af->set_zero_if_empty(true);
+            return agg->aggs_size() - 1;
+          }
+        }
+        if (arg->result_type() != DECIMAL_RESULT &&
+            arg->result_type() != INT_RESULT) {
+          agg_why = "agg arg type";
+          return -1;
+        }
+        int ti = single_table_of(arg->used_tables() & ~PSEUDO_TABLE_BITS,
+                                 tabs);
+        if (ti >= 0) {
+          if (!helios_serialize_arith(arg, af->mutable_arg())) {
+            agg_why = "agg expr not pushable";
+            return -1;
+          }
+        } else {
+          auto resolver2 = [&](const Field *f, int t) -> const Field * {
+            return resolve_base_field(f, tabs[t].table);
+          };
+          if (!serialize_arith_multi(
+                  arg, af->mutable_arg(),
+                  [&](const Field *f) { return table_index_of_field(f); },
+                  resolver2)) {
+            agg_why = "agg expr not pushable";
+            return -1;
+          }
+          ti = 0;
+        }
+        af->set_arg_table(ti);
+        af->set_kind(sum->sum_func() == Item_sum::SUM_FUNC
+                         ? LineairDB::Protocol::QbAggFunc::SUM
+                         : LineairDB::Protocol::QbAggFunc::AVG);
+        af->set_arg_scale(arg->decimals);
+        return agg->aggs_size() - 1;
+      }
+      case Item_sum::MIN_FUNC:
+      case Item_sum::MAX_FUNC: {
+        if (sum->argument_count() != 1) {
+          agg_why = "agg arg count";
+          return -1;
+        }
+        Item *arg = sum->get_arg(0)->real_item();
+        if (arg->type() != Item::FIELD_ITEM) {
+          agg_why = "minmax arg";
+          return -1;
+        }
+        const Field *raw = down_cast<Item_field *>(arg)->field;
+        const int ti = table_index_of_field(raw);
+        const Field *mf =
+            ti >= 0 ? resolve_base_field(raw, tabs[ti].table) : nullptr;
+        if (mf == nullptr) {
+          agg_why = "minmax unresolvable";
+          return -1;
+        }
+        af->mutable_arg()->set_op(
+            LineairDB::Protocol::FilterExpr::COLUMN_REF);
+        af->mutable_arg()->set_column_index(mf->field_index());
+        af->set_arg_table(ti);
+        af->set_kind(sum->sum_func() == Item_sum::MIN_FUNC
+                         ? LineairDB::Protocol::QbAggFunc::MIN
+                         : LineairDB::Protocol::QbAggFunc::MAX);
+        af->set_cmp_kind(mf->result_type() == STRING_RESULT ? 1 : 0);
+        return agg->aggs_size() - 1;
+      }
+      default:
+        agg_why = "unsupported aggregate";
+        return -1;
+    }
+  };
+
+  // Serialize an output expression over aggregates (q8/q14 SUM ratios):
+  // Item_sum children become COLUMN_REF ordinals into the stage-1 layout.
+  const int n_grp_final = agg->group_columns_size();
+  std::function<bool(Item *, LineairDB::Protocol::FilterExpr *)> ser_out =
+      [&](Item *it, LineairDB::Protocol::FilterExpr *out) -> bool {
+    it = it->real_item();
+    if (it->type() == Item::SUM_FUNC_ITEM) {
+      const int ord = register_aggregate(down_cast<Item_sum *>(it));
+      if (ord < 0) return false;
+      out->set_op(LineairDB::Protocol::FilterExpr::COLUMN_REF);
+      out->set_column_index(n_grp_final + ord);
+      return true;
+    }
+    if (it->type() == Item::INT_ITEM) {
+      out->set_op(LineairDB::Protocol::FilterExpr::CONST_INT);
+      out->set_int_val(it->val_int());
+      return true;
+    }
+    if (it->const_item() && (it->result_type() == DECIMAL_RESULT ||
+                             it->result_type() == REAL_RESULT)) {
+      StringBuffer<STRING_BUFFER_USUAL_SIZE> buf;
+      String *sv = it->val_str(&buf);
+      if (sv == nullptr) return false;
+      out->set_op(LineairDB::Protocol::FilterExpr::CONST_STRING);
+      out->set_string_val(sv->ptr(), sv->length());
+      return true;
+    }
+    if (it->type() != Item::FUNC_ITEM) return false;
+    auto *fn = down_cast<Item_func *>(it);
+    const char *name = fn->func_name();
+    LineairDB::Protocol::FilterExpr::Op op;
+    if (strcmp(name, "+") == 0)
+      op = LineairDB::Protocol::FilterExpr::OP_ADD;
+    else if (strcmp(name, "-") == 0)
+      op = fn->argument_count() == 1
+               ? LineairDB::Protocol::FilterExpr::OP_NEG
+               : LineairDB::Protocol::FilterExpr::OP_SUB;
+    else if (strcmp(name, "*") == 0)
+      op = LineairDB::Protocol::FilterExpr::OP_MUL;
+    else if (strcmp(name, "/") == 0)
+      op = LineairDB::Protocol::FilterExpr::OP_DIV;
+    else
+      return false;
+    out->set_op(op);
+    for (uint i = 0; i < fn->argument_count(); ++i)
+      if (!ser_out(fn->arguments()[i], out->add_children())) return false;
+    return true;
+  };
+
   std::vector<Item *> out_items;
   for (Item *item : VisibleFields(qb->fields)) out_items.push_back(item);
   for (Item *item : out_items) {
@@ -1316,7 +1557,15 @@ bool recognize_query_block(THD *thd, JOIN *join,
       oe->set_ordinal(pos);
       continue;
     }
-    if (real->type() != Item::SUM_FUNC_ITEM) {
+    if (real->type() == Item::SUM_FUNC_ITEM) {
+      const int ord = register_aggregate(down_cast<Item_sum *>(real));
+      if (ord < 0) LDB_COL_REJECT(agg_why != nullptr ? agg_why : "aggregate");
+      oe->set_source(LineairDB::Protocol::QbOutputExpr::AGG);
+      oe->set_ordinal(ord);
+      continue;
+    }
+    // A group expression (e.g. the EXTRACT item) referenced in the output.
+    {
       int pos = -1;
       for (size_t g = 0; g < group_items.size(); ++g) {
         if (group_items[g] == real ||
@@ -1325,106 +1574,17 @@ bool recognize_query_block(THD *thd, JOIN *join,
           break;
         }
       }
-      if (pos < 0) LDB_COL_REJECT("output not aggregate");
-      oe->set_source(LineairDB::Protocol::QbOutputExpr::GROUP);
-      oe->set_ordinal(pos);
-      continue;
+      if (pos >= 0) {
+        oe->set_source(LineairDB::Protocol::QbOutputExpr::GROUP);
+        oe->set_ordinal(pos);
+        continue;
+      }
     }
-    Item_sum *sum = down_cast<Item_sum *>(real);
-    auto *af = agg->add_aggs();
-    switch (sum->sum_func()) {
-      case Item_sum::COUNT_FUNC: {
-        if (sum->argument_count() != 1) LDB_COL_REJECT("COUNT arg count");
-        Item *arg = sum->get_arg(0)->real_item();
-        af->set_arg_table(0);
-        if (!arg->const_item()) {
-          if (arg->type() != Item::FIELD_ITEM)
-            LDB_COL_REJECT("COUNT arg shape");
-          const Field *raw = down_cast<Item_field *>(arg)->field;
-          const int ti = table_index_of_field(raw);
-          const Field *cf =
-              ti >= 0 ? resolve_base_field(raw, tabs[ti].table) : nullptr;
-          if (cf == nullptr || cf->is_nullable())
-            LDB_COL_REJECT("COUNT arg nullable");
-          af->set_arg_table(ti);
-          af->mutable_arg()->set_op(
-              LineairDB::Protocol::FilterExpr::COLUMN_REF);
-          af->mutable_arg()->set_column_index(cf->field_index());
-        }
-        af->set_kind(LineairDB::Protocol::QbAggFunc::COUNT);
-        break;
-      }
-      case Item_sum::SUM_FUNC:
-      case Item_sum::AVG_FUNC: {
-        if (sum->argument_count() != 1) LDB_COL_REJECT("agg arg count");
-        Item *arg = sum->get_arg(0)->real_item();
-        // SUM(CASE WHEN pred THEN 1 ELSE 0) => COUNT with filter.
-        if (sum->sum_func() == Item_sum::SUM_FUNC) {
-          if (Item *pred = case_to_count_filter(arg)) {
-            const int ti = single_table_of(
-                pred->used_tables() & ~PSEUDO_TABLE_BITS, tabs);
-            if (ti < 0) LDB_COL_REJECT("CASE filter tables");
-            auto *pf = af->mutable_filter();
-            pf->set_num_columns(tabs[ti].table->s->fields);
-            if (!serialize_item(pred, pf->mutable_expr()))
-              LDB_COL_REJECT("CASE filter not pushable");
-            af->set_arg_table(ti);
-            af->set_kind(LineairDB::Protocol::QbAggFunc::COUNT);
-            break;
-          }
-        }
-        if (arg->result_type() != DECIMAL_RESULT &&
-            arg->result_type() != INT_RESULT)
-          LDB_COL_REJECT("agg arg type");
-        int ti = single_table_of(arg->used_tables() & ~PSEUDO_TABLE_BITS,
-                                 tabs);
-        if (ti >= 0) {
-          if (!helios_serialize_arith(arg, af->mutable_arg()))
-            LDB_COL_REJECT("agg expr not pushable");
-        } else {
-          // Spans tables: serialize with (table_idx << 16) column tags.
-          auto resolver = [&](const Field *f, int t) -> const Field * {
-            return resolve_base_field(f, tabs[t].table);
-          };
-          if (!serialize_arith_multi(
-                  arg, af->mutable_arg(),
-                  [&](const Field *f) { return table_index_of_field(f); },
-                  resolver))
-            LDB_COL_REJECT("agg expr not pushable");
-          ti = 0;
-        }
-        af->set_arg_table(ti);
-        af->set_kind(sum->sum_func() == Item_sum::SUM_FUNC
-                         ? LineairDB::Protocol::QbAggFunc::SUM
-                         : LineairDB::Protocol::QbAggFunc::AVG);
-        af->set_arg_scale(arg->decimals);
-        break;
-      }
-      case Item_sum::MIN_FUNC:
-      case Item_sum::MAX_FUNC: {
-        if (sum->argument_count() != 1) LDB_COL_REJECT("agg arg count");
-        Item *arg = sum->get_arg(0)->real_item();
-        if (arg->type() != Item::FIELD_ITEM) LDB_COL_REJECT("minmax arg");
-        const Field *raw = down_cast<Item_field *>(arg)->field;
-        const int ti = table_index_of_field(raw);
-        const Field *mf =
-            ti >= 0 ? resolve_base_field(raw, tabs[ti].table) : nullptr;
-        if (mf == nullptr) LDB_COL_REJECT("minmax unresolvable");
-        af->mutable_arg()->set_op(
-            LineairDB::Protocol::FilterExpr::COLUMN_REF);
-        af->mutable_arg()->set_column_index(mf->field_index());
-        af->set_arg_table(ti);
-        af->set_kind(sum->sum_func() == Item_sum::MIN_FUNC
-                         ? LineairDB::Protocol::QbAggFunc::MIN
-                         : LineairDB::Protocol::QbAggFunc::MAX);
-        af->set_cmp_kind(mf->result_type() == STRING_RESULT ? 1 : 0);
-        break;
-      }
-      default:
-        LDB_COL_REJECT("unsupported aggregate");
-    }
-    oe->set_source(LineairDB::Protocol::QbOutputExpr::AGG);
-    oe->set_ordinal(agg->aggs_size() - 1);
+    // Arithmetic over aggregates (SUM ratios).
+    if (!ser_out(real, oe->mutable_expr()))
+      LDB_COL_REJECT(agg_why != nullptr ? agg_why : "output expr");
+    oe->set_source(LineairDB::Protocol::QbOutputExpr::EXPR);
+    oe->set_result_scale(real->decimals);
   }
   if (agg->aggs_size() == 0) LDB_COL_REJECT("no aggregates");
 
@@ -1545,6 +1705,9 @@ bool OptimizeSecondaryEngine(THD *thd, LEX *lex) {
     char msg[128];
     snprintf(msg, sizeof(msg), "LINEAIRDB_COLUMNAR unsupported shape: %s",
              why ? why : "?");
+    // Loud reject (PoC policy): every unsupported shape is surfaced in the
+    // server log, never silently absorbed by a fallback.
+    fprintf(stderr, "[LINEAIRDB_COLUMNAR] reject: %s\n", why ? why : "?");
     my_error(ER_SECONDARY_ENGINE_PLUGIN, MYF(0), msg);
     return true;
   }

@@ -52,6 +52,12 @@ bool serialize_item(const Item *item,
                     LineairDB::Protocol::FilterExpr *expr) {
   if (!item) return false;
 
+  // Unwrap references (view/derived-table refs point at the real item).
+  if (item->type() == Item::REF_ITEM) {
+    const Item *real = const_cast<Item *>(item)->real_item();
+    if (real != nullptr && real != item) return serialize_item(real, expr);
+  }
+
   // Unwrap constant-propagation caches before reading their value.
   if (item->type() == Item::CACHE_ITEM) {
     const Item *example =

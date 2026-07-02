@@ -726,10 +726,15 @@ struct Executor {
             if (gpos[g] < 0) return fail("group table not in input");
         }
         std::vector<int> apos(n_agg, -1);
+        std::vector<int> fpos(n_agg, -1);
         for (int a = 0; a < n_agg; ++a) {
             if (agg.aggs(a).has_arg() || agg.aggs(a).has_filter()) {
                 apos[a] = in.table_pos(agg.aggs(a).arg_table());
                 if (apos[a] < 0) return fail("agg table not in input");
+            }
+            if (agg.aggs(a).has_filter()) {
+                fpos[a] = in.table_pos(agg.aggs(a).filter_table());
+                if (fpos[a] < 0) return fail("agg filter table not in input");
             }
         }
         PredicateEvaluator ev;
@@ -773,12 +778,14 @@ struct Executor {
                     apos[a] >= 0 ? in.refs[apos[a]][r] : 0;
                 if (apos[a] >= 0 && ref == kNullRef) continue;  // LEFT null
                 if (af.has_filter() && af.filter().has_expr()) {
-                    const PaxStore* st = stores[af.arg_table()];
+                    const uint64_t fref = in.refs[fpos[a]][r];
+                    if (fref == kNullRef) continue;
+                    const PaxStore* st = stores[af.filter_table()];
                     const PaxGroup* grp =
-                        st->group(ref / PaxGroup::kRows);
+                        st->group(fref / PaxGroup::kRows);
                     if (!ev.set_row_from_pax(
                             *grp,
-                            static_cast<uint32_t>(ref % PaxGroup::kRows),
+                            static_cast<uint32_t>(fref % PaxGroup::kRows),
                             af.filter().num_columns()))
                         return fail("agg filter unevaluable");
                     if (!ev.evaluate(af.filter().expr())) continue;
@@ -973,6 +980,13 @@ struct Executor {
                 return std::to_string(gs.count[a]);
             case pb::QbAggFunc::SUM:
                 if (gs.count[a] == 0) {
+                    if (af.zero_if_empty()) {
+                        Dec z;
+                        z.m = 0;
+                        z.s = static_cast<int>(af.arg_scale());
+                        z.null = false;
+                        return dec_format(z);
+                    }
                     *is_null = true;
                     return {};
                 }
