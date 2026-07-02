@@ -1,5 +1,6 @@
 #include "lineairdb_rpc.hh"
 #include "predicate_evaluator.hh"
+#include "query_block_executor.hh"
 #include "../../common/log.h"
 
 #include <iostream>
@@ -1379,6 +1380,9 @@ void LineairDBRpc::handle_rpc(uint64_t sender_id, MessageType message_type,
             handleTxStatelessBatchRead(message, result);
             release_masstree_thread_epoch();
             return;
+        case MessageType::TX_EXECUTE_QUERY_BLOCK:
+            handleTxExecuteQueryBlock(message, result);
+            return;
         case MessageType::TX_EXECUTE_READ_PLAN:
             handleTxExecuteReadPlan(message, result);
             release_masstree_thread_epoch();
@@ -2441,6 +2445,17 @@ void LineairDBRpc::handleTxExecuteReadPlan(const std::string& message,
     }
 
     flat_plan::encode_to_string(response, result);
+}
+
+void LineairDBRpc::handleTxExecuteQueryBlock(const std::string& message,
+                                             std::string& result) {
+    LineairDB::Protocol::TxExecuteQueryBlock::Request request;
+    LineairDB::Protocol::TxExecuteQueryBlock::Response response;
+    request.ParseFromString(message);
+    qb::ExecuteQueryBlock(db_manager_->get_database().get(), request,
+                          &response);
+    db_manager_->get_database()->ReleaseMasstreeThreadEpoch();
+    result = response.SerializeAsString();
 }
 
 void LineairDBRpc::handleTxValidateAndCommit(const std::string& message,

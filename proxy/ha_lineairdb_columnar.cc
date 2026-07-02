@@ -135,12 +135,8 @@ class Columnar_execution_context : public Secondary_engine_execution_context {
   }
 
   // Offload plan (set when recognition succeeds).
-  std::string table_name;             // server-side name (normalized path)
-  std::string serialized_filter;      // full-WHERE PushedPredicate ("" = none)
-  std::string serialized_aggregate;   // AggregateSpec
-  std::vector<OutBinding> bindings;   // one per visible output field
-  int n_group_columns = 0;
-  int n_aggs = 0;
+  LineairDB::Protocol::TxExecuteQueryBlock::Request qb_request;
+  bool plan_ready = false;
 
  private:
   const JOIN *m_current_join{nullptr};
@@ -214,72 +210,108 @@ bool group_column_is_binary_safe(const Field *f) {
   }
 }
 
-// Returns true and fills `ctx` when this JOIN is an offloadable single-table
-// aggregation. Never raises errors — a false return means "let the primary
-// engine run it".
-bool recognize_single_table_aggregate(THD *thd, JOIN *join,
-                                      Columnar_execution_context *ctx,
-                                      const char **why) {
+// Map an ORDER BY item to an output ordinal (same Item as a visible field,
+// or the same base Field as a group column in the output).
+static int order_output_ordinal(Item *order_item,
+                                const std::vector<Item *> &out_items,
+                                TABLE *t) {
+  Item *oreal = order_item->real_item();
+  for (size_t i = 0; i < out_items.size(); ++i) {
+    Item *freal = out_items[i]->real_item();
+    if (freal == oreal) return static_cast<int>(i);
+    if (oreal->type() == Item::FIELD_ITEM &&
+        freal->type() == Item::FIELD_ITEM) {
+      const Field *of =
+          resolve_base_field(down_cast<Item_field *>(oreal)->field, t);
+      const Field *ff =
+          resolve_base_field(down_cast<Item_field *>(freal)->field, t);
+      if (of != nullptr && of == ff) return static_cast<int>(i);
+    }
+  }
+  return -1;
+}
+
+// Returns true and fills ctx->qb_request when this JOIN is an offloadable
+// query block (Phase B0: single-table aggregation incl. ORDER BY/LIMIT and
+// SUM/COUNT/AVG/MIN/MAX). Never raises errors — a false return means "let
+// the primary engine run it".
+bool recognize_query_block(THD *thd, JOIN *join,
+                           Columnar_execution_context *ctx,
+                           const char **why) {
 #define LDB_COL_REJECT(reason) \
   do {                         \
     *why = (reason);           \
     return false;              \
   } while (0)
   Query_block *qb = join->query_block;
-  if (qb == nullptr || qb->outer_query_block() != nullptr) LDB_COL_REJECT("not top-level");
+  if (qb == nullptr || qb->outer_query_block() != nullptr)
+    LDB_COL_REJECT("not top-level");
   Query_expression *unit = qb->master_query_expression();
   if (unit == nullptr || !unit->is_simple()) LDB_COL_REJECT("not simple unit");
 
-  // Exactly one base table, no ORDER/HAVING/LIMIT/DISTINCT/windows/rollup.
+  // Phase B0: exactly one base table.
   Table_ref *tl = qb->leaf_tables;
-  if (tl == nullptr || tl->next_leaf != nullptr) LDB_COL_REJECT("not single table");
+  if (tl == nullptr || tl->next_leaf != nullptr)
+    LDB_COL_REJECT("not single table");
   TABLE *t = tl->table;
   if (t == nullptr || t->s == nullptr) LDB_COL_REJECT("no TABLE");
   if (join->having_cond != nullptr) LDB_COL_REJECT("has HAVING");
-  if (join->order.order != nullptr || qb->order_list.elements > 0) LDB_COL_REJECT("has ORDER BY");
   if (join->select_distinct) LDB_COL_REJECT("has DISTINCT");
-  if (qb->has_limit()) LDB_COL_REJECT("has LIMIT");
   if (qb->m_windows.elements > 0) LDB_COL_REJECT("has windows");
-  if (join->rollup_state != JOIN::RollupState::NONE) LDB_COL_REJECT("has ROLLUP");
-  // Aggregation only: a plain projection scan gains nothing here (Phase A).
-  if (!join->implicit_grouping && qb->group_list.elements == 0) LDB_COL_REJECT("no aggregation");
-
-  // Table must be SECONDARY_LOADed into this engine.
+  if (join->rollup_state != JOIN::RollupState::NONE)
+    LDB_COL_REJECT("has ROLLUP");
+  if (!join->implicit_grouping && qb->group_list.elements == 0)
+    LDB_COL_REJECT("no aggregation");
   if (!loaded_tables->contains(t->s->db.str, t->s->table_name.str))
     LDB_COL_REJECT("not SECONDARY_LOADed");
 
-  // WHERE must be fully server-evaluable: after grouping MySQL cannot
-  // re-check dropped rows, so partial pushdown is not an option.
+  auto &req = ctx->qb_request;
+  req.Clear();
+  req.add_tables()->set_table_name(t->s->normalized_path.str);
+
+  // Scan node with the fully-pushed WHERE (fail-closed: after grouping,
+  // MySQL cannot re-check dropped rows).
+  auto *scan_node = req.add_nodes();
+  auto *scan = scan_node->mutable_scan();
+  scan->set_table_idx(0);
   Item *where_cond = qb->where_cond() != nullptr ? qb->where_cond()
                                                  : join->where_cond;
-  LineairDB::Protocol::PushedPredicate predicate;
   if (where_cond != nullptr) {
-    if (!serialize_item(where_cond, predicate.mutable_expr()))
+    if (!serialize_item(where_cond, scan->mutable_filter()->mutable_expr()))
       LDB_COL_REJECT("WHERE not pushable");
-    predicate.set_num_columns(t->s->fields);
+    scan->mutable_filter()->set_num_columns(t->s->fields);
   }
 
-  // GROUP BY: plain, binary-safe, non-nullable columns of this table.
-  LineairDB::Protocol::AggregateSpec spec;
-  spec.set_num_columns(t->s->fields);
+  // Aggregate node.
+  auto *agg_node = req.add_nodes();
+  auto *agg = agg_node->mutable_aggregate();
+  agg->set_input(0);
   std::vector<const Field *> group_fields;
   for (ORDER *g = qb->group_list.first; g != nullptr; g = g->next) {
     Item *gi = (*g->item)->real_item();
-    if (gi->type() != Item::FIELD_ITEM) LDB_COL_REJECT("group item not a column");
+    if (gi->type() != Item::FIELD_ITEM) LDB_COL_REJECT("group not a column");
     const Field *gf =
         resolve_base_field(down_cast<Item_field *>(gi)->field, t);
     if (gf == nullptr) LDB_COL_REJECT("group column foreign");
-    if (gf->is_nullable() || !group_column_is_binary_safe(gf)) LDB_COL_REJECT("group column not binary-safe");
-    spec.add_group_columns(gf->field_index());
+    if (gf->is_nullable()) LDB_COL_REJECT("group column nullable");
+    // Byte-equality grouping. INT is always safe; strings rely on the
+    // TPC-H value domains (md5-gated); other types are rejected.
+    if (gf->result_type() != INT_RESULT &&
+        gf->result_type() != STRING_RESULT)
+      LDB_COL_REJECT("group column type");
+    auto *gc = agg->add_group_columns();
+    gc->set_table_idx(0);
+    gc->set_column(gf->field_index());
+    gc->set_cmp_kind(gf->result_type() == INT_RESULT ? 0 : 1);
     group_fields.push_back(gf);
   }
 
-  // Output fields: GROUP BY columns pass through; aggregates are SUM with a
-  // server-evaluable argument, or COUNT over something never-null
-  // (== COUNT(*), which is what the server's AGG_COUNT computes).
-  ctx->bindings.clear();
-  for (Item *item : VisibleFields(qb->fields)) {
+  // Output expressions from the visible field list (pre-optimizer items).
+  std::vector<Item *> out_items;
+  for (Item *item : VisibleFields(qb->fields)) out_items.push_back(item);
+  for (Item *item : out_items) {
     Item *real = item->real_item();
+    auto *oe = req.add_output();
     if (real->type() == Item::FIELD_ITEM) {
       const Field *of =
           resolve_base_field(down_cast<Item_field *>(real)->field, t);
@@ -291,19 +323,20 @@ bool recognize_single_table_aggregate(THD *thd, JOIN *join,
           break;
         }
       }
-      if (pos < 0) LDB_COL_REJECT("output field not a group column");
-      ctx->bindings.push_back({false, pos});
+      if (pos < 0) LDB_COL_REJECT("output not a group column");
+      oe->set_source(LineairDB::Protocol::QbOutputExpr::GROUP);
+      oe->set_ordinal(pos);
       continue;
     }
-    if (real->type() != Item::SUM_FUNC_ITEM) LDB_COL_REJECT("output not aggregate");
+    if (real->type() != Item::SUM_FUNC_ITEM)
+      LDB_COL_REJECT("output not aggregate");
     Item_sum *sum = down_cast<Item_sum *>(real);
-    auto *af = spec.add_aggs();
-    af->set_result_scale(0);
+    auto *af = agg->add_aggs();
+    af->set_arg_table(0);
     switch (sum->sum_func()) {
       case Item_sum::COUNT_FUNC: {
         if (sum->argument_count() != 1) LDB_COL_REJECT("COUNT arg count");
         Item *arg = sum->get_arg(0)->real_item();
-        // AGG_COUNT counts rows; only COUNT(*) / COUNT(non-nullable) match.
         if (!arg->const_item()) {
           if (arg->type() != Item::FIELD_ITEM)
             LDB_COL_REJECT("COUNT arg shape");
@@ -312,54 +345,74 @@ bool recognize_single_table_aggregate(THD *thd, JOIN *join,
           if (cf == nullptr || cf->is_nullable())
             LDB_COL_REJECT("COUNT arg nullable");
         }
-        af->set_kind(LineairDB::Protocol::AggFunc::AGG_COUNT);
+        af->set_kind(LineairDB::Protocol::QbAggFunc::COUNT);
         break;
       }
-      case Item_sum::SUM_FUNC: {
-        if (sum->argument_count() != 1) LDB_COL_REJECT("SUM arg count");
+      case Item_sum::SUM_FUNC:
+      case Item_sum::AVG_FUNC: {
+        if (sum->argument_count() != 1) LDB_COL_REJECT("agg arg count");
         Item *arg = sum->get_arg(0)->real_item();
         if (arg->result_type() != DECIMAL_RESULT &&
             arg->result_type() != INT_RESULT)
-          LDB_COL_REJECT("SUM arg type");
-        if (arg->type() == Item::FIELD_ITEM) {
-          // Bare column: resolve to the base table (temp-table slices under
-          // GROUP BY plans carry wrong field indexes).
-          const Field *sf =
-              resolve_base_field(down_cast<Item_field *>(arg)->field, t);
-          if (sf == nullptr) LDB_COL_REJECT("SUM arg unresolvable");
-          auto *ref = af->mutable_arg();
-          ref->set_op(LineairDB::Protocol::FilterExpr::COLUMN_REF);
-          ref->set_column_index(sf->field_index());
-        } else if (qb->group_list.elements == 0) {
-          // Implicit grouping keeps base-slice items: expressions are safe
-          // to serialize as-is.
-          if (!helios_serialize_arith(arg, af->mutable_arg()))
-            LDB_COL_REJECT("SUM expr not pushable");
-        } else {
-          // Expression arguments under a GROUP BY temp-table plan may
-          // reference temp slices: Phase B.
-          LDB_COL_REJECT("SUM expr under GROUP BY");
-        }
-        af->set_kind(LineairDB::Protocol::AggFunc::AGG_SUM);
+          LDB_COL_REJECT("agg arg type");
+        if (!helios_serialize_arith(arg, af->mutable_arg()))
+          LDB_COL_REJECT("agg expr not pushable");
+        af->set_kind(sum->sum_func() == Item_sum::SUM_FUNC
+                         ? LineairDB::Protocol::QbAggFunc::SUM
+                         : LineairDB::Protocol::QbAggFunc::AVG);
+        af->set_arg_scale(arg->decimals);
+        break;
+      }
+      case Item_sum::MIN_FUNC:
+      case Item_sum::MAX_FUNC: {
+        if (sum->argument_count() != 1) LDB_COL_REJECT("agg arg count");
+        Item *arg = sum->get_arg(0)->real_item();
+        if (arg->type() != Item::FIELD_ITEM) LDB_COL_REJECT("minmax arg");
+        const Field *mf =
+            resolve_base_field(down_cast<Item_field *>(arg)->field, t);
+        if (mf == nullptr) LDB_COL_REJECT("minmax unresolvable");
+        af->mutable_arg()->set_op(
+            LineairDB::Protocol::FilterExpr::COLUMN_REF);
+        af->mutable_arg()->set_column_index(mf->field_index());
+        af->set_kind(sum->sum_func() == Item_sum::MIN_FUNC
+                         ? LineairDB::Protocol::QbAggFunc::MIN
+                         : LineairDB::Protocol::QbAggFunc::MAX);
+        af->set_cmp_kind(mf->result_type() == STRING_RESULT ? 1 : 0);
         break;
       }
       default:
-        return false;  // AVG/MIN/MAX etc.: Phase B
+        LDB_COL_REJECT("unsupported aggregate");
     }
-    ctx->bindings.push_back({true, spec.aggs_size() - 1});
+    oe->set_source(LineairDB::Protocol::QbOutputExpr::AGG);
+    oe->set_ordinal(agg->aggs_size() - 1);
   }
-  if (spec.aggs_size() == 0) LDB_COL_REJECT("no aggregates");
+  if (agg->aggs_size() == 0) LDB_COL_REJECT("no aggregates");
 
-  ctx->table_name.assign(t->s->normalized_path.str);
-  ctx->n_group_columns = spec.group_columns_size();
-  ctx->n_aggs = spec.aggs_size();
-  if (where_cond != nullptr) {
-    predicate.SerializeToString(&ctx->serialized_filter);
-  } else {
-    ctx->serialized_filter.clear();
+  // ORDER BY over output ordinals only.
+  for (ORDER *o = qb->order_list.first; o != nullptr; o = o->next) {
+    const int ord = order_output_ordinal(*o->item, out_items, t);
+    if (ord < 0) LDB_COL_REJECT("ORDER BY not an output column");
+    auto *k = req.add_order_by();
+    k->set_output_ordinal(ord);
+    k->set_descending(o->direction == ORDER_DESC);
+    // Numeric compare for INT/DECIMAL outputs, binary for strings.
+    Item *oi = out_items[ord]->real_item();
+    k->set_cmp_kind(oi->result_type() == STRING_RESULT ? 1 : 0);
   }
-  spec.SerializeToString(&ctx->serialized_aggregate);
+
+  // LIMIT/OFFSET (values were resolved during optimize).
+  if (qb->has_limit()) {
+    if (unit->select_limit_cnt != HA_POS_ERROR)
+      req.set_limit(unit->select_limit_cnt);
+    if (unit->offset_limit_cnt > 0) {
+      req.set_offset(unit->offset_limit_cnt);
+      if (req.limit() > 0)  // select_limit_cnt includes the offset
+        req.set_limit(req.limit() - unit->offset_limit_cnt);
+    }
+  }
+
   (void)thd;
+  ctx->plan_ready = true;
   *why = nullptr;
   return true;
 #undef LDB_COL_REJECT
@@ -372,7 +425,7 @@ bool ColumnarExecute(JOIN *join, Query_result *result) {
   THD *thd = current_thd;
   auto *ctx = down_cast<Columnar_execution_context *>(
       thd->lex->secondary_engine_execution_context());
-  if (ctx == nullptr || ctx->serialized_aggregate.empty()) {
+  if (ctx == nullptr || !ctx->plan_ready) {
     my_error(ER_SECONDARY_ENGINE_PLUGIN, MYF(0),
              "LINEAIRDB_COLUMNAR: no offload plan");
     return true;
@@ -385,17 +438,13 @@ bool ColumnarExecute(JOIN *join, Query_result *result) {
     return true;
   }
 
-  LineairDBProxy::ReadPlanStep step;
-  step.table_name = ctx->table_name;
-  step.is_scan = true;
-  step.end_key_prefix = lineairdb_keyenc::scan_end_sentinel();
-  step.serialized_filter = ctx->serialized_filter;
-  step.aggregate_serialized = ctx->serialized_aggregate;
-
-  LineairDBProxy::ReadPlanResult rpc = proxy->tx_execute_read_plan({step});
-  if (!rpc.ok || rpc.steps.size() != 1) {
-    my_error(ER_SECONDARY_ENGINE_PLUGIN, MYF(0),
-             "LINEAIRDB_COLUMNAR: aggregate scan RPC failed");
+  LineairDB::Protocol::TxExecuteQueryBlock::Response rpc;
+  if (!proxy->tx_execute_query_block(ctx->qb_request, &rpc) || !rpc.ok()) {
+    char msg[160];
+    snprintf(msg, sizeof(msg), "LINEAIRDB_COLUMNAR: %s",
+             rpc.error().empty() ? "query block RPC failed"
+                                 : rpc.error().c_str());
+    my_error(ER_SECONDARY_ENGINE_PLUGIN, MYF(0), msg);
     return true;
   }
 
@@ -408,39 +457,21 @@ bool ColumnarExecute(JOIN *join, Query_result *result) {
     values.push_back(v);
     out_items.push_back(v);
   }
-  assert(values.size() == ctx->bindings.size());
 
   std::vector<DecodedField> fields;
-  for (const std::string &row : rpc.steps[0].scan_values) {
-    if (!decode_row_fields(row, &fields)) {
+  const size_t expected = 1 + values.size();  // null placeholder + outputs
+  for (const std::string &row : rpc.rows()) {
+    if (!decode_row_fields(row, &fields) || fields.size() != expected) {
       my_error(ER_SECONDARY_ENGINE_PLUGIN, MYF(0),
-               "LINEAIRDB_COLUMNAR: malformed group row");
+               "LINEAIRDB_COLUMNAR: malformed result row");
       return true;
     }
-    // Row shape: [null_flags][group cols][value,count per agg].
-    const size_t expected = 1 + static_cast<size_t>(ctx->n_group_columns) +
-                            2 * static_cast<size_t>(ctx->n_aggs);
-    if (fields.size() != expected) {
-      my_error(ER_SECONDARY_ENGINE_PLUGIN, MYF(0),
-               "LINEAIRDB_COLUMNAR: unexpected group row shape");
-      return true;
-    }
-    for (size_t i = 0; i < ctx->bindings.size(); ++i) {
-      const OutBinding &b = ctx->bindings[i];
-      const DecodedField &f =
-          b.is_aggregate ? fields[1 + ctx->n_group_columns + 2 * b.index]
-                         : fields[1 + b.index];
-      if (f.empty) {
-        // Aggregates: empty means SQL NULL (e.g. SUM over zero rows).
-        // Group columns are non-nullable by recognition; an empty field is
-        // the empty string.
-        if (b.is_aggregate)
-          values[i]->set_null_value();
-        else
-          values[i]->set_value("", 0);
-      } else {
+    for (size_t i = 0; i < values.size(); ++i) {
+      const DecodedField &f = fields[1 + i];
+      if (f.empty)
+        values[i]->set_null_value();
+      else
         values[i]->set_value(f.ptr, f.len);
-      }
     }
     if (result->send_data(thd, out_items)) return true;
     ++join->send_records;
@@ -472,8 +503,7 @@ bool OptimizeSecondaryEngine(THD *thd, LEX *lex) {
   Query_block *qb = lex->unit->first_query_block();
   JOIN *join = qb != nullptr ? qb->join : nullptr;
   const char *why = "no JOIN";
-  if (join == nullptr ||
-      !recognize_single_table_aggregate(thd, join, ctx, &why)) {
+  if (join == nullptr || !recognize_query_block(thd, join, ctx, &why)) {
     // Unsupported shape: reject the offload; the server re-prepares the
     // statement on the primary engine (use_secondary_engine=ON semantics).
     char msg[128];

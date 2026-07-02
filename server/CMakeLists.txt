@@ -52,6 +52,8 @@ set(SOURCES
     rpc/lineairdb_rpc.hh
     rpc/predicate_evaluator.cc
     rpc/predicate_evaluator.hh
+    rpc/query_block_executor.cc
+    rpc/query_block_executor.hh
     
     # Storage layer
     storage/database_manager.cc

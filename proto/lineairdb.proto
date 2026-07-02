@@ -52,6 +52,10 @@ enum OpCode {
     TX_VALIDATE_AND_COMMIT = 29;
     TX_EXECUTE_READ_PLAN = 30;
     TX_GET_TABLE_STATS = 31;
+
+    // Secondary-engine computation pushdown: execute a whole query block
+    // (scans, joins, aggregation, sort, limit) server-side over PAX strips.
+    TX_EXECUTE_QUERY_BLOCK = 36;
 }
 
 enum BatchOpType {
@@ -675,6 +679,107 @@ message TxFetchLastSecondaryEntryInRange {
         bool found = 1;
         SecondaryIndexEntry entry = 2;
         bool is_aborted = 3;
+    }
+}
+
+// ============================================================
+// Secondary-engine query-block IR (computation pushdown).
+//
+// A query block is a tree of operators over base tables. Rows are
+// represented server-side as tuples of per-table PAX row references
+// (late materialization); expressions reference (table_idx, column).
+// The response carries final result rows in the proxy row format
+// ([null_flags][col_0]..[col_n]) — one field per output expression —
+// so the proxy streams them straight into the client protocol.
+// ============================================================
+
+message QbAggFunc {
+    enum Kind { COUNT = 0; SUM = 1; AVG = 2; MIN = 3; MAX = 4; }
+    Kind kind = 1;
+    // Table the argument reads from (index into QbRequest.tables).
+    uint32 arg_table = 2;
+    // Argument expression over that table's columns (FilterExpr arithmetic).
+    // Unset for COUNT(*).
+    FilterExpr arg = 3;
+    // Optional per-row predicate (SUM(CASE WHEN p THEN 1 ELSE 0) => COUNT
+    // with filter). Evaluated on the same table as arg_table.
+    PushedPredicate filter = 4;
+    // Decimal scale of the argument (result formatting).
+    uint32 arg_scale = 5;
+    // MIN/MAX comparison semantics: 0=numeric(decimal) 1=binary string.
+    uint32 cmp_kind = 6;
+}
+
+message QbColumnRef {
+    uint32 table_idx = 1;
+    uint32 column = 2;      // 0-based TABLE::field index
+    uint32 cmp_kind = 3;    // 0=int64, 1=binary string, 2=decimal-as-number
+}
+
+message QbScan {
+    uint32 table_idx = 1;
+    PushedPredicate filter = 2;  // fully-pushed single-table conjuncts
+}
+
+message QbJoin {
+    uint32 build = 1;  // node index into QbRequest.nodes
+    uint32 probe = 2;
+    // Equi-key pairs (parallel arrays).
+    repeated QbColumnRef build_keys = 3;
+    repeated QbColumnRef probe_keys = 4;
+    enum Type { INNER = 0; LEFT = 1; SEMI = 2; ANTI = 3; }
+    Type type = 5;
+    // Residual non-equi join predicate tables/exprs: Phase B2+.
+}
+
+message QbAggregate {
+    uint32 input = 1;                       // node index
+    repeated QbColumnRef group_columns = 2; // byte-equality grouping
+    repeated QbAggFunc aggs = 3;
+    PushedPredicate having = 4;             // over emitted group row (agg idx via num_columns marker semantics)
+}
+
+message QbSortKey {
+    // Either an output ordinal (group column / aggregate position in the
+    // final output row) ...
+    uint32 output_ordinal = 1;
+    bool descending = 2;
+    uint32 cmp_kind = 3;  // 0=int64 numeric, 1=binary string, 2=decimal numeric
+}
+
+message QbNode {
+    oneof op {
+        QbScan scan = 1;
+        QbJoin join = 2;
+        QbAggregate aggregate = 3;
+    }
+}
+
+message QbOutputExpr {
+    // Output column: either a group-key ordinal / aggregate ordinal from the
+    // aggregate node, or (for non-aggregated blocks) a base column.
+    enum Source { GROUP = 0; AGG = 1; COLUMN = 2; }
+    Source source = 1;
+    uint32 ordinal = 2;      // GROUP: group_columns idx; AGG: aggs idx
+    QbColumnRef column = 3;  // COLUMN source
+}
+
+message TxExecuteQueryBlock {
+    message TableDesc {
+        string table_name = 1;
+    }
+    message Request {
+        repeated TableDesc tables = 1;
+        repeated QbNode nodes = 2;   // topological order; last node = root
+        repeated QbOutputExpr output = 3;
+        repeated QbSortKey order_by = 4;
+        uint64 limit = 5;            // 0 = no limit
+        uint64 offset = 6;
+    }
+    message Response {
+        bool ok = 1;
+        string error = 2;
+        repeated bytes rows = 3;     // proxy row format, output order
     }
 }
 

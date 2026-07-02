@@ -430,6 +430,21 @@ LineairDBProxy::tx_stateless_batch_read(
     return results;
 }
 
+bool LineairDBProxy::tx_execute_query_block(
+    const LineairDB::Protocol::TxExecuteQueryBlock::Request& request,
+    LineairDB::Protocol::TxExecuteQueryBlock::Response* response) {
+    if (!connected_) {
+        LOG_ERROR("RPC failed: Not connected to server");
+        return false;
+    }
+    if (!send_protobuf_message(request, *response,
+                               MessageType::TX_EXECUTE_QUERY_BLOCK)) {
+        LOG_ERROR("RPC failed: query block message");
+        return false;
+    }
+    return true;
+}
+
 LineairDBProxy::ReadPlanResult LineairDBProxy::tx_execute_read_plan(
     const std::vector<ReadPlanStep>& steps) {
     ReadPlanResult result;

@@ -73,6 +73,7 @@ private:
     void handleTxStatelessRead(const std::string& message, std::string& result);
     void handleTxStatelessBatchRead(const std::string& message, std::string& result);
     void handleTxExecuteReadPlan(const std::string& message, std::string& result);
+    void handleTxExecuteQueryBlock(const std::string& message, std::string& result);
     void handleTxValidateAndCommit(const std::string& message, std::string& result);
     void handleTxWrite(const std::string& message, std::string& result);
     void handleTxDelete(const std::string& message, std::string& result);
