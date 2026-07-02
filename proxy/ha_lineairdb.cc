@@ -2845,6 +2845,58 @@ ha_rows ha_lineairdb::records_in_range(uint inx, key_range *min_key,
   ha_create_table() in handle.cc
 */
 
+// PAX single-copy storage: per-field cell widths shipped at CREATE TABLE.
+// Each width is a safe upper bound on the bytes Field::val_str() can render
+// (the row format stores val_str strings, see LineairDBField). Widths are
+// only a performance hint — a row that outgrows its cell falls back to the
+// server's heap path — but a table containing any oversized field skips PAX
+// entirely (empty result) to avoid pathological padding.
+static std::vector<uint32_t> compute_pax_field_widths(TABLE *table) {
+  constexpr uint32_t kMaxCellBytes = 2048;
+  std::vector<uint32_t> widths;
+  widths.reserve(table->s->fields + 1);
+  widths.push_back(table->s->null_bytes);  // field #0: null flags, verbatim
+  for (uint i = 0; i < table->s->fields; i++) {
+    Field *f = table->field[i];
+    uint32_t w = f->field_length;
+    switch (f->type()) {
+      case MYSQL_TYPE_TINY:
+      case MYSQL_TYPE_SHORT:
+      case MYSQL_TYPE_INT24:
+      case MYSQL_TYPE_LONG:
+      case MYSQL_TYPE_LONGLONG:
+      case MYSQL_TYPE_YEAR:
+        // field_length is a display width; val_str can render up to 20
+        // digits + sign regardless.
+        w = std::max<uint32_t>(w, 21);
+        break;
+      case MYSQL_TYPE_FLOAT:
+      case MYSQL_TYPE_DOUBLE:
+        w = std::max<uint32_t>(w, 40);
+        break;
+      case MYSQL_TYPE_DECIMAL:
+      case MYSQL_TYPE_NEWDECIMAL:
+        w += 2;  // sign + decimal point slack
+        break;
+      case MYSQL_TYPE_DATE:
+      case MYSQL_TYPE_NEWDATE:
+      case MYSQL_TYPE_TIME:
+      case MYSQL_TYPE_TIME2:
+      case MYSQL_TYPE_DATETIME:
+      case MYSQL_TYPE_DATETIME2:
+      case MYSQL_TYPE_TIMESTAMP:
+      case MYSQL_TYPE_TIMESTAMP2:
+        w = std::max<uint32_t>(w, 32);
+        break;
+      default:
+        break;  // strings/enums: field_length already bounds val_str bytes
+    }
+    if (w > kMaxCellBytes) return {};  // e.g. TEXT/BLOB: keep row-store
+    widths.push_back(w);
+  }
+  return widths;
+}
+
 int ha_lineairdb::create(const char *table_name, TABLE *table, HA_CREATE_INFO *,
                          dd::Table *) {
   DBUG_TRACE;
@@ -2859,7 +2911,7 @@ int ha_lineairdb::create(const char *table_name, TABLE *table, HA_CREATE_INFO *,
   // storage. The table may already exist from another node's CREATE TABLE.
   // Ignore "already exists" — MySQL-side metadata still needs to be created.
   auto proxy = get_proxy();
-  proxy->db_create_table(db_table_name);
+  proxy->db_create_table(db_table_name, compute_pax_field_widths(table));
 
   // Create secondary indexes (also ignore "already exists")
   for (uint i = 0; i < table->s->keys; i++) {

@@ -326,7 +326,11 @@ public:
                                                                                const std::string& end_key);
 
     // table/index management (non-transactional)
-    bool db_create_table(const std::string& table_name);
+    // pax_field_max_bytes: PAX cell widths per row-format field (index 0 =
+    // null-flags field, then columns in field order); empty keeps the
+    // row-store layout. The server ignores it unless HELIOS_PAX_STORAGE=1.
+    bool db_create_table(const std::string& table_name,
+                         const std::vector<uint32_t>& pax_field_max_bytes = {});
     bool db_set_table(int64_t tx_id, const std::string& table_name);
     bool db_create_secondary_index(const std::string& table_name,
                                    const std::string& index_name,

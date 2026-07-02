@@ -2803,6 +2803,22 @@ void LineairDBRpc::handleDbCreateTable(const std::string& message, std::string& 
     response.set_success(success);
     LOG_DEBUG("CreateTable '%s': %s", request.table_name().c_str(), success ? "success" : "already exists");
 
+    // PAX single-copy storage: shred this table's rows into column strips.
+    // Gated on the server env so gate-off runs are byte-identical row-store.
+    static const bool pax_storage_enabled = []() {
+        const char* v = std::getenv("HELIOS_PAX_STORAGE");
+        return v != nullptr && v[0] == '1';
+    }();
+    if (pax_storage_enabled && request.pax_field_max_bytes_size() > 0) {
+        std::vector<uint32_t> widths(request.pax_field_max_bytes().begin(),
+                                     request.pax_field_max_bytes().end());
+        const bool installed = db_manager_->get_database()->InstallPaxSchema(
+            request.table_name(), widths);
+        LOG_INFO("PAX schema for '%s': %zu fields, %s",
+                 request.table_name().c_str(), widths.size(),
+                 installed ? "installed" : "skipped (exists or unsupported)");
+    }
+
     result = response.SerializeAsString();
 }
 

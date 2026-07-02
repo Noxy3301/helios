@@ -474,6 +474,12 @@ message TxUpdateSecondaryIndex {
 message DbCreateTable {
     message Request {
         string table_name = 1;
+        // PAX single-copy storage: max payload bytes per row-format field,
+        // index 0 = the null-flags field, then one entry per column in
+        // TABLE::field order. Empty = row-store (heap) layout. The server
+        // additionally gates on HELIOS_PAX_STORAGE=1; proxies may always
+        // send this.
+        repeated uint32 pax_field_max_bytes = 2 [packed = true];
     }
     message Response {
         bool success = 1;
