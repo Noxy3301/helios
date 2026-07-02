@@ -72,6 +72,26 @@ bool PredicateEvaluator::parse_row(const char* data, size_t length,
   return field_index == total_fields;
 }
 
+bool PredicateEvaluator::set_row_from_pax(const LineairDB::Pax::PaxGroup& group,
+                                          uint32_t slot,
+                                          uint32_t num_columns) {
+  columns_.clear();
+  null_flags_.clear();
+  // Field 0 is the null-flags field; MySQL column i is field i+1. Mirrors
+  // parse_row's semantics: an empty cell is a null/empty column, and NULLness
+  // is decided by the null-flags bitmap.
+  if (group.schema().field_count() < static_cast<size_t>(num_columns) + 1) {
+    return false;
+  }
+  const std::string_view nf = group.cell(0, slot);
+  null_flags_.assign(nf.data(), nf.size());
+  columns_.reserve(num_columns);
+  for (uint32_t i = 0; i < num_columns; i++) {
+    columns_.push_back(group.cell(i + 1, slot));
+  }
+  return true;
+}
+
 // ---------------------------------------------------------------------------
 // Value extraction
 // ---------------------------------------------------------------------------

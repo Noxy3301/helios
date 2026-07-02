@@ -10,6 +10,7 @@
 #include <unordered_set>
 
 #include "lineairdb.pb.h"
+#include <lineairdb/pax_store.h>
 #include <map>
 #include <set>
 #include <thread>
@@ -174,15 +175,30 @@ static void dec_addsub(Dec& a, const Dec& b, bool sub) {
     a.null = a.null || b.null;
 }
 
+// Row-source abstraction for aggregate-argument evaluation: a materialized
+// row string walks the field headers per access; a PAX row reads the cell
+// straight from its column strip.
+struct PaxRowRef {
+    const LineairDB::Pax::PaxGroup* group;
+    uint32_t slot;
+};
+static inline std::string_view row_column(const std::string& row,
+                                          uint32_t idx) {
+    return extract_value_column(row, idx);
+}
+static inline std::string_view row_column(const PaxRowRef& row, uint32_t idx) {
+    return row.group->cell(idx + 1, row.slot);  // field 0 = null flags
+}
+
 /**
  * @brief Evaluate an aggregate argument expression against one base row.
  */
-static Dec dec_eval(const LineairDB::Protocol::FilterExpr& e,
-                    const std::string& row) {
+template <typename Row>
+static Dec dec_eval(const LineairDB::Protocol::FilterExpr& e, const Row& row) {
     using FE = LineairDB::Protocol::FilterExpr;
     switch (e.op()) {
         case FE::COLUMN_REF:
-            return dec_parse(extract_value_column(row, e.column_index()));
+            return dec_parse(row_column(row, e.column_index()));
         case FE::CONST_INT:  { Dec d; d.m = e.int_val();  d.s = 0; return d; }
         case FE::CONST_UINT: { Dec d; d.m = (__int128)e.uint_val(); d.s = 0; return d; }
         case FE::OP_ADD: {
@@ -467,6 +483,277 @@ std::string encode_column_as_int_key(std::string_view column,
  * @return true when group rows were emitted; false lets the caller use the
  * serial scan path.
  */
+/**
+ * @brief Fold the visible rows of one PAX group into a group map,
+ * evaluating the filter and aggregate arguments straight on column strips
+ * (no row materialization).
+ *
+ * Returns false when a row's filter columns are unparsable (caller falls
+ * back to the materializing path, which fails the plan the same way the
+ * row-store path does).
+ */
+static bool aggregate_pax_group(
+    const LineairDB::Protocol::TxExecuteReadPlan::PlanStep& step,
+    const LineairDB::Pax::PaxGroup& group,
+    std::unordered_map<std::string, AggGroupState>& groups) {
+    using AF = LineairDB::Protocol::AggFunc;
+    const auto& spec = step.aggregate();
+    const bool has_filter = step.has_filter() && step.filter().has_expr();
+    const int n_agg = spec.aggs_size();
+    const int n_grp = spec.group_columns_size();
+    PredicateEvaluator evaluator;
+    std::string keybuf;
+    std::vector<std::string_view> gv(n_grp);
+    for (uint32_t base = 0; base < LineairDB::Pax::PaxGroup::kRows;
+         base += 64) {
+        // Visibility is checked per 64-slot word so fully-empty regions
+        // (e.g. the unfilled tail group) cost one load.
+        uint64_t bits = 0;
+        for (uint32_t s = 0; s < 64; ++s) {
+            if (group.IsVisible(base + s)) bits |= (uint64_t{1} << s);
+        }
+        while (bits != 0) {
+            const uint32_t s = static_cast<uint32_t>(__builtin_ctzll(bits));
+            bits &= bits - 1;
+            const uint32_t slot = base + s;
+            if (has_filter) {
+                if (!evaluator.set_row_from_pax(group, slot,
+                                                step.filter().num_columns())) {
+                    return false;
+                }
+                if (!evaluator.evaluate(step.filter().expr())) continue;
+            }
+            const PaxRowRef row{&group, slot};
+            keybuf.clear();
+            for (int g = 0; g < n_grp; ++g) {
+                gv[g] = row_column(row, spec.group_columns(g));
+                const uint32_t l = static_cast<uint32_t>(gv[g].size());
+                keybuf.append(reinterpret_cast<const char*>(&l), sizeof(l));
+                keybuf.append(gv[g].data(), gv[g].size());
+            }
+            auto it = groups.find(keybuf);
+            AggGroupState* gs;
+            if (it == groups.end()) {
+                AggGroupState st;
+                st.key_cols.resize(n_grp);
+                for (int g = 0; g < n_grp; ++g)
+                    st.key_cols[g] = std::string(gv[g]);
+                st.count.assign(n_agg, 0);
+                st.sum.assign(n_agg, Dec{});
+                gs = &groups.emplace(std::move(keybuf), std::move(st))
+                          .first->second;
+                keybuf.clear();
+            } else {
+                gs = &it->second;
+            }
+            for (int a = 0; a < n_agg; ++a) {
+                const auto& af = spec.aggs(a);
+                if (af.kind() == AF::AGG_COUNT) {
+                    gs->count[a] += 1;
+                    continue;
+                }
+                Dec v = dec_eval(af.arg(), row);
+                if (!v.null) {
+                    dec_addsub(gs->sum[a], v, false);
+                    gs->count[a] += 1;
+                }
+            }
+        }
+    }
+    return true;
+}
+
+/**
+ * @brief Full-table aggregate scan over PAX column strips.
+ *
+ * Applies to unvalidated full-range primary scans of a fully-PAX table
+ * (aggregate steps emit synthetic group rows with no keys/tids, so no OCC
+ * evidence is lost). Consistency: group write counters are snapshotted
+ * before and re-checked after the fold; any concurrent modification falls
+ * back to the row-materializing path.
+ */
+static bool parallel_primary_pax_aggregate_scan(
+    LineairDB::Database* db,
+    const LineairDB::Protocol::TxExecuteReadPlan::PlanStep& step,
+    const std::string& start_key, const std::string& end_key,
+    LineairDB::Protocol::TxExecuteReadPlan::StepResult* step_result) {
+    if (db == nullptr) return false;
+    // Full-table scans only: PAX strips carry no encoded PK to bound a range.
+    // The proxy encodes "whole table" as an empty start plus the 16x0xFF
+    // scan-end sentinel (lineairdb_keyenc::scan_end_sentinel).
+    const bool end_is_sentinel =
+        end_key.size() == 16 &&
+        end_key.find_first_not_of('\xff') == std::string::npos;
+    if (!start_key.empty() || !end_is_sentinel) return false;
+    auto* store = db->GetPaxStore(step.table_name());
+    if (store == nullptr) return false;
+    // Heap-fallback rows are invisible to strips: never strip-scan then.
+    if (store->overflow_count() > 0) return false;
+
+    const size_t n_groups = store->group_count();
+    std::unordered_map<std::string, AggGroupState> groups;
+    if (n_groups > 0) {
+        std::vector<uint64_t> wc_before(n_groups, 0);
+        for (size_t g = 0; g < n_groups; ++g) {
+            auto* grp = store->group(g);
+            wc_before[g] =
+                grp ? grp->write_counter.load(std::memory_order_acquire) : 0;
+        }
+
+        const unsigned nproc = std::thread::hardware_concurrency();
+        const unsigned max_threads = std::min<unsigned>(nproc ? nproc : 4, 8);
+        const unsigned worker_count = static_cast<unsigned>(
+            std::min<size_t>(std::max<size_t>(n_groups / 8, 1), max_threads));
+        const int n_agg = step.aggregate().aggs_size();
+
+        std::vector<std::unordered_map<std::string, AggGroupState>> locals(
+            worker_count);
+        std::vector<char> failed(worker_count, 0);
+        std::vector<std::thread> workers;
+        workers.reserve(worker_count);
+        for (unsigned w = 0; w < worker_count; ++w) {
+            workers.emplace_back([&, w] {
+                const size_t begin = n_groups * w / worker_count;
+                const size_t end = n_groups * (w + 1) / worker_count;
+                for (size_t g = begin; g < end; ++g) {
+                    auto* grp = store->group(g);
+                    if (grp == nullptr) continue;
+                    if (!aggregate_pax_group(step, *grp, locals[w])) {
+                        failed[w] = 1;
+                        return;
+                    }
+                }
+            });
+        }
+        for (auto& worker : workers) worker.join();
+        for (char worker_failed : failed) {
+            if (worker_failed) return false;
+        }
+        // Re-check quiescence: any concurrent scatter/retire in the scanned
+        // window poisons cell reads — fall back to the TID-checked path.
+        for (size_t g = 0; g < n_groups; ++g) {
+            auto* grp = store->group(g);
+            const uint64_t wc_now =
+                grp ? grp->write_counter.load(std::memory_order_acquire) : 0;
+            if (wc_now != wc_before[g]) return false;
+        }
+        for (auto& local : locals) merge_agg_groups(groups, local, n_agg);
+    }
+    emit_agg_groups(step.aggregate(), groups, step_result);
+    return true;
+}
+
+/**
+ * @brief Row-returning primary scan over PAX refs: evaluate the pushed
+ * filter on column strips, gather only surviving rows (projected when the
+ * step carries a RowProjection), and re-check each row's TID after its cell
+ * reads — rows touched by concurrent writers are re-read through
+ * StatelessRead, so validated (non-ro_novalidate) plans stay correct.
+ *
+ * Returns false (emitting nothing) when the table is not fully
+ * PAX-resident or the schema is too narrow — caller uses the materializing
+ * path. `projection_failed` mirrors the trim_row_value contract.
+ */
+static bool pax_ref_scan_emit(
+    LineairDB::Database* db,
+    const LineairDB::Protocol::TxExecuteReadPlan::PlanStep& step,
+    const std::string& start_key, const std::string& end_key,
+    LineairDB::Protocol::TxExecuteReadPlan::StepResult* step_result,
+    bool& projection_failed) {
+    if (db == nullptr) return false;
+    const bool has_filter = step.has_filter() && step.filter().has_expr();
+    const bool has_projection = step.has_projection();
+    // With a pushed filter, LIMIT applies after filter evaluation.
+    const uint64_t scan_limit = has_filter ? 0 : step.scan_limit();
+    auto refs = db->StatelessPaxRefScan(step.table_name(), start_key, end_key,
+                                        scan_limit, step.reverse_scan());
+    if (!refs.ok) return false;
+
+    std::vector<uint32_t> kept;
+    if (has_projection) {
+        kept.assign(step.projection().field_indexes().begin(),
+                    step.projection().field_indexes().end());
+    }
+
+    // Row-at-a-time slow path for rows a writer touched mid-read.
+    auto slow_row = [&](LineairDB::StatelessPaxRefRow& r) {
+        auto rr = db->StatelessRead(step.table_name(), r.key);
+        if (!rr.found) return;  // deleted meanwhile: skip like a tombstone
+        bool pass = true;
+        if (has_filter) {
+            PredicateEvaluator ev;
+            if (ev.parse_row(rr.value.data(), rr.value.size(),
+                             step.filter().num_columns())) {
+                pass = ev.evaluate(step.filter().expr());
+            }  // parse failure -> keep the row for MySQL to re-check
+        }
+        if (!pass) {
+            step_result->add_filtered_keys(std::move(r.key));
+            return;
+        }
+        std::string out;
+        if (has_projection) {
+            if (!trim_row_value(rr.value, step.projection().field_indexes(),
+                                step.projection().num_columns(), out)) {
+                projection_failed = true;
+                out = std::move(rr.value);
+            }
+        } else {
+            out = std::move(rr.value);
+        }
+        step_result->add_scan_keys(std::move(r.key));
+        step_result->add_scan_values(std::move(out));
+        step_result->add_scan_tids(rr.tid);
+    };
+
+    PredicateEvaluator evaluator;
+    uint64_t emitted = 0;
+    for (auto& r : refs.rows) {
+        const auto* grp = static_cast<const LineairDB::Pax::PaxGroup*>(r.group);
+        bool pass = true;
+        bool filter_parsed = true;
+        if (has_filter) {
+            if (!evaluator.set_row_from_pax(*grp, r.slot,
+                                            step.filter().num_columns())) {
+                return false;  // schema narrower than the filter: fall back
+            }
+            pass = evaluator.evaluate(step.filter().expr());
+        }
+        std::string value;
+        if (pass) {
+            if (has_projection) {
+                value.reserve(64);
+                if (!grp->GatherRowProjected(r.slot, kept.data(), kept.size(),
+                                             value)) {
+                    return false;  // projected column outside schema
+                }
+            } else {
+                value.resize(r.row_size);
+                const size_t got = grp->GatherRow(
+                    r.slot, reinterpret_cast<std::byte*>(value.data()),
+                    r.row_size);
+                if (got != r.row_size) value.resize(got);
+            }
+        }
+        // The cells we just read (filter + gather) are only trustworthy if
+        // no writer touched the row since the scan observed its TID.
+        if (LineairDB::PaxRefCurrentTid(r) != r.tid) {
+            slow_row(r);
+            (void)filter_parsed;
+            continue;
+        }
+        if (!pass) {
+            step_result->add_filtered_keys(std::move(r.key));
+            continue;
+        }
+        step_result->add_scan_keys(std::move(r.key));
+        step_result->add_scan_values(std::move(value));
+        step_result->add_scan_tids(r.tid);
+        if (step.scan_limit() > 0 && ++emitted >= step.scan_limit()) break;
+    }
+    return true;
+}
+
 static bool parallel_primary_aggregate_scan(
     LineairDB::Database* db,
     const LineairDB::Protocol::TxExecuteReadPlan::PlanStep& step,
@@ -1771,9 +2058,29 @@ void LineairDBRpc::handleTxExecuteReadPlan(const std::string& message,
             if (!step.for_each() && step.scan_limit() == 0 &&
                 !step.reverse_scan() && step.has_aggregate() &&
                 step.aggregate().aggs_size() > 0) {
+                if (parallel_primary_pax_aggregate_scan(
+                        db_manager_->get_database().get(), step, start_key,
+                        end_key, step_result)) {
+                    continue;
+                }
                 if (parallel_primary_aggregate_scan(
                         db_manager_->get_database().get(), step, start_key,
                         end_key, step_result)) {
+                    continue;
+                }
+            }
+            if (!(step.has_aggregate() && step.aggregate().aggs_size() > 0)) {
+                // Strip-direct row scan: filter on PAX cells, gather
+                // survivors only (projected). Falls back when the table is
+                // not fully PAX-resident.
+                if (pax_ref_scan_emit(db_manager_->get_database().get(), step,
+                                      start_key, end_key, step_result,
+                                      projection_failed)) {
+                    if (projection_failed) {
+                        response.set_ok(false);
+                        flat_plan::encode_to_string(response, result);
+                        return;
+                    }
                     continue;
                 }
             }

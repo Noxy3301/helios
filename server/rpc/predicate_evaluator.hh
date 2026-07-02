@@ -3,6 +3,8 @@
 
 #include "lineairdb.pb.h"
 
+#include <lineairdb/pax_store.h>
+
 #include <cstddef>
 #include <cstdint>
 #include <string>
@@ -25,6 +27,13 @@ class PredicateEvaluator {
   // byteSize == 0xFF means null/empty.
   // Returns false if the row is malformed.
   bool parse_row(const char* data, size_t length, uint32_t num_columns);
+
+  // PAX strip-direct variant of parse_row: point columns_ straight at the
+  // group's column cells (no row materialization). The views stay valid as
+  // long as the group's write counter is unchanged — the caller's
+  // quiescence re-check covers evaluation.
+  bool set_row_from_pax(const LineairDB::Pax::PaxGroup& group, uint32_t slot,
+                        uint32_t num_columns);
 
   // Recursively evaluate a FilterExpr tree against the parsed row.
   // Returns true if the row satisfies the predicate.
