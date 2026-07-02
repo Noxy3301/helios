@@ -55,3 +55,13 @@ school) の OSS 代表。**
 - 実行戦略: DuckDB/HyPer-Umbra 系譜に準拠 (上表)。「確立された
   vectorized-interpreted + morsel + unnesting 系譜が、OLTP 最適化された
   1-copy PAX ストア上でもそのまま成立する」ことが検証内容。
+
+## 追記 (2026-07-02 Phase C 中盤)
+
+| # | 設計判断 | 出典 (系譜) | 対象クエリ |
+|---|---|---|---|
+| 17 | sj/aj nest → SEMI/ANTI join ノード (キーは sj_outer/inner_exprs、WHERE 残差は per-match residual) | Neumann & Kemper unnesting (#12) + MySQL optimizer の nest 正規化に相乗り | q4 q21 |
+| 18 | **サブクエリの残りは全て「derived サブブロックの再帰実行 + virtual table join」に一本化** — secondary prepare 時に MySQL が NOT EXISTS/相関スカラを derived+outer join へ自動変換する (HeatWave 向け transform) ことを発見。自前 decorrelation を書かず、この変換済みプランを受ける | HeatWave の secondary-engine transform + Neumann-Kemper (変換の意味論は同じ decorrelation) | q2 q11 q15 q16 q17 q18 q20 q21 q22 |
+
+実装形: IR に QbSubBlock (再帰 Request)。サーバは実表 table_idx 空間の後ろに
+virtual 表 (サブブロック結果行) を追加し、cell アクセスを value_of() で統一。
