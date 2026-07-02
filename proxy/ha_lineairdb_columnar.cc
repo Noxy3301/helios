@@ -20,6 +20,7 @@
 #include "sql/item_sum.h"
 #include "sql/item_timefunc.h"
 #include "sql/nested_join.h"
+#include "sql/join_optimizer/explain_access_path.h"
 #include "sql/mem_root_array.h"
 #include "sql/query_result.h"
 #include "sql/sql_class.h"
@@ -2376,6 +2377,11 @@ bool recognize_query_block(THD *thd, JOIN *join,
       qb->leaf_tables->is_view_or_derived()) {
     if (recognize_double_aggregate(thd, join, qb, ctx, why)) return true;
     if (recognize_flattened_agg(thd, join, qb, ctx, why)) return true;
+  }
+  if (getenv("LDBC_QEP") != nullptr && join->root_access_path() != nullptr) {
+    std::string plan =
+        PrintQueryPlan(0, join->root_access_path(), join, true);
+    fprintf(stderr, "[LDBC-QEP]\n%s\n", plan.c_str());
   }
   if (!build_block(thd, qb, ctx->qb_request, why)) return false;
   ctx->plan_ready = true;
