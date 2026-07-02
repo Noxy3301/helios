@@ -7,6 +7,7 @@
 #include <cstring>
 #include <algorithm>
 #include <cstdlib>
+#include <limits>
 #include <unordered_set>
 
 #include "lineairdb.pb.h"
@@ -272,6 +273,83 @@ static std::string dec_format(const Dec& d) {
     return out;
 }
 
+static constexpr uint32_t kAggregateHavingFilterColumns =
+    std::numeric_limits<uint32_t>::max();
+
+static bool is_aggregate_having_filter(
+    const LineairDB::Protocol::TxExecuteReadPlan::PlanStep& step) {
+    return step.has_aggregate() && step.has_filter() &&
+           step.filter().has_expr() &&
+           step.filter().num_columns() == kAggregateHavingFilterColumns;
+}
+
+static bool dec_from_filter_const(const LineairDB::Protocol::FilterExpr& e,
+                                  Dec& out) {
+    using FE = LineairDB::Protocol::FilterExpr;
+    switch (e.op()) {
+        case FE::CONST_INT:
+            out.m = e.int_val();
+            out.s = 0;
+            out.null = false;
+            return true;
+        case FE::CONST_UINT:
+            out.m = static_cast<__int128>(e.uint_val());
+            out.s = 0;
+            out.null = false;
+            return true;
+        case FE::CONST_STRING:
+            out = dec_parse(e.string_val());
+            return !out.null;
+        default:
+            return false;
+    }
+}
+
+static bool aggregate_having_row_passes(
+    const LineairDB::Protocol::PushedPredicate* pred,
+    const std::string& group_row) {
+    if (pred == nullptr) return true;
+    const auto& e = pred->expr();
+    using FE = LineairDB::Protocol::FilterExpr;
+    switch (e.op()) {
+        case FE::OP_GT:
+        case FE::OP_GE:
+        case FE::OP_LT:
+        case FE::OP_LE:
+        case FE::OP_EQ:
+        case FE::OP_NE:
+            break;
+        default:
+            return false;
+    }
+    if (e.children_size() != 2 ||
+        e.children(0).op() != FE::COLUMN_REF)
+        return false;
+
+    Dec lhs = dec_parse(
+        extract_value_column(group_row, e.children(0).column_index()));
+    Dec rhs;
+    if (lhs.null || !dec_from_filter_const(e.children(1), rhs)) return false;
+
+    __int128 a = lhs.m;
+    __int128 b = rhs.m;
+    if (lhs.s < rhs.s) {
+        a *= dec_pow10(rhs.s - lhs.s);
+    } else if (rhs.s < lhs.s) {
+        b *= dec_pow10(lhs.s - rhs.s);
+    }
+
+    switch (e.op()) {
+        case FE::OP_GT: return a > b;
+        case FE::OP_GE: return a >= b;
+        case FE::OP_LT: return a < b;
+        case FE::OP_LE: return a <= b;
+        case FE::OP_EQ: return a == b;
+        case FE::OP_NE: return a != b;
+        default: return false;
+    }
+}
+
 /**
  * @brief Accumulators for one GROUP BY key.
  */
@@ -362,7 +440,8 @@ static void merge_agg_groups(
 static void emit_agg_groups(
     const LineairDB::Protocol::AggregateSpec& spec,
     std::unordered_map<std::string, AggGroupState>& groups,
-    LineairDB::Protocol::TxExecuteReadPlan::StepResult* step_result) {
+    LineairDB::Protocol::TxExecuteReadPlan::StepResult* step_result,
+    const LineairDB::Protocol::PushedPredicate* group_having = nullptr) {
     using AF = LineairDB::Protocol::AggFunc;
     const int n_agg = spec.aggs_size();
     const int n_grp = spec.group_columns_size();
@@ -394,6 +473,7 @@ static void emit_agg_groups(
                 agg_emit_field(row, cnt, false);
             }
         }
+        if (!aggregate_having_row_passes(group_having, row)) continue;
         step_result->add_scan_keys(std::string());
         step_result->add_scan_values(std::move(row));
         step_result->add_scan_tids(0);
@@ -408,7 +488,8 @@ static void emit_agg_groups(
 bool server_aggregate_scan(
     const LineairDB::Protocol::AggregateSpec& spec,
     std::vector<LineairDB::StatelessScanRow>& rows,
-    LineairDB::Protocol::TxExecuteReadPlan::StepResult* step_result) {
+    LineairDB::Protocol::TxExecuteReadPlan::StepResult* step_result,
+    const LineairDB::Protocol::PushedPredicate* group_having = nullptr) {
     const int n_agg = spec.aggs_size();
     std::unordered_map<std::string, AggGroupState> groups;
 
@@ -446,7 +527,7 @@ bool server_aggregate_scan(
         for (auto& local : locals) merge_agg_groups(groups, local, n_agg);
     }
 
-    emit_agg_groups(spec, groups, step_result);
+    emit_agg_groups(spec, groups, step_result, group_having);
     return true;
 }
 
@@ -524,7 +605,10 @@ static bool aggregate_pax_group(
     std::unordered_map<std::string, AggGroupState>& groups) {
     using AF = LineairDB::Protocol::AggFunc;
     const auto& spec = step.aggregate();
-    const bool has_filter = step.has_filter() && step.filter().has_expr();
+    // A HAVING carrier (num_columns == UINT32_MAX marker) is a group-level
+    // predicate applied at emit time, never a per-row filter.
+    const bool has_filter = !is_aggregate_having_filter(step) &&
+                            step.has_filter() && step.filter().has_expr();
     const int n_agg = spec.aggs_size();
     const int n_grp = spec.group_columns_size();
     PredicateEvaluator evaluator;
@@ -665,7 +749,9 @@ static bool parallel_primary_pax_aggregate_scan(
         }
         for (auto& local : locals) merge_agg_groups(groups, local, n_agg);
     }
-    emit_agg_groups(step.aggregate(), groups, step_result);
+    emit_agg_groups(step.aggregate(), groups, step_result,
+                    is_aggregate_having_filter(step) ? &step.filter()
+                                                     : nullptr);
     return true;
 }
 
@@ -924,7 +1010,9 @@ static bool parallel_primary_aggregate_scan(
                                           : encode_int_key_part(end_value);
     }
 
-    const bool has_filter = step.has_filter() && step.filter().has_expr();
+    const bool group_having = is_aggregate_having_filter(step);
+    const bool has_filter =
+        step.has_filter() && step.filter().has_expr() && !group_having;
     const auto& spec = step.aggregate();
     const int n_agg = spec.aggs_size();
     std::vector<std::unordered_map<std::string, AggGroupState>> locals(
@@ -978,7 +1066,8 @@ static bool parallel_primary_aggregate_scan(
 
     std::unordered_map<std::string, AggGroupState> groups;
     for (auto& local : locals) merge_agg_groups(groups, local, n_agg);
-    emit_agg_groups(spec, groups, step_result);
+    emit_agg_groups(spec, groups, step_result,
+                    group_having ? &step.filter() : nullptr);
     return true;
 }
 
@@ -1778,8 +1867,10 @@ void LineairDBRpc::handleTxExecuteReadPlan(const std::string& message,
 
         // Step-level row filter: parseable non-matches are dropped; rows the
         // evaluator cannot parse are returned for MySQL to re-check.
+        const bool step_has_group_having = is_aggregate_having_filter(step);
         const bool step_has_filter =
-            step.has_filter() && step.filter().has_expr();
+            step.has_filter() && step.filter().has_expr() &&
+            !step_has_group_having;
         const auto* step_filter =
             step_has_filter ? &step.filter().expr() : nullptr;
         const uint32_t step_filter_cols =
@@ -1817,27 +1908,12 @@ void LineairDBRpc::handleTxExecuteReadPlan(const std::string& message,
             return std::move(v);
         };
 
-        if (step.for_each()) {
-            // Anti-join probe: it only needs a match to exist. Stop after the
-            // first surviving row. No scan_limit -- index_next reports a clean
-            // EOF (see PlanStep.existence_only).
-            const bool existence_only = step.existence_only();
-            int source_step = -1;
-            if (step.bindings_size() > 0) {
-                source_step = static_cast<int>(step.bindings(0).source_step());
-            }
-            if (source_step < 0 ||
-                source_step >= static_cast<int>(previous_results.size()) - 1) {
-                continue;
-            }
-
-            // Build membership sets from earlier source steps, then drop
-            // probe rows whose join key is absent.
-            struct FeSemijoin {
-                std::unordered_set<std::string> keys;
-                uint32_t probe_column;
-            };
-            std::vector<FeSemijoin> fe_semijoins;
+        struct FeSemijoin {
+            std::unordered_set<std::string> keys;
+            uint32_t probe_column;
+        };
+        std::vector<FeSemijoin> fe_semijoins;
+        {
             const int this_step_idx =
                 static_cast<int>(previous_results.size()) - 1;
             for (const auto& sj : step.semijoins()) {
@@ -1862,14 +1938,29 @@ void LineairDBRpc::handleTxExecuteReadPlan(const std::string& message,
                 }
                 fe_semijoins.push_back(std::move(fsj));
             }
-            auto sj_reject = [&](const std::string& value) -> bool {
-                for (const auto& fsj : fe_semijoins) {
-                    auto col = extract_value_column(value, fsj.probe_column);
-                    if (fsj.keys.find(std::string(col)) == fsj.keys.end())
-                        return true;  // no join partner -> drop
-                }
-                return false;
-            };
+        }
+        auto sj_reject = [&](const std::string& value) -> bool {
+            for (const auto& fsj : fe_semijoins) {
+                auto col = extract_value_column(value, fsj.probe_column);
+                if (fsj.keys.find(std::string(col)) == fsj.keys.end())
+                    return true;
+            }
+            return false;
+        };
+
+        if (step.for_each()) {
+            // Anti-join probe: it only needs a match to exist. Stop after the
+            // first surviving row. No scan_limit -- index_next reports a clean
+            // EOF (see PlanStep.existence_only).
+            const bool existence_only = step.existence_only();
+            int source_step = -1;
+            if (step.bindings_size() > 0) {
+                source_step = static_cast<int>(step.bindings(0).source_step());
+            }
+            if (source_step < 0 ||
+                source_step >= static_cast<int>(previous_results.size()) - 1) {
+                continue;
+            }
 
             const auto* source = previous_results[source_step];
             const int row_count =
@@ -2262,7 +2353,11 @@ void LineairDBRpc::handleTxExecuteReadPlan(const std::string& message,
                     scan_result.rows = std::move(filtered);
                 }
                 aggregated = server_aggregate_scan(step.aggregate(),
-                                                   scan_result.rows, step_result);
+                                                   scan_result.rows,
+                                                   step_result,
+                                                   step_has_group_having
+                                                       ? &step.filter()
+                                                       : nullptr);
             }
             if (!aggregated) {
                 uint64_t emitted = 0;
@@ -2272,6 +2367,8 @@ void LineairDBRpc::handleTxExecuteReadPlan(const std::string& message,
                         step_result->add_filtered_keys(std::move(row.key));
                         continue;
                     }
+                    if (!fe_semijoins.empty() && sj_reject(row.value))
+                        continue;
                     step_result->add_scan_keys(std::move(row.key));
                     step_result->add_scan_values(project_value(std::move(row.value)));
                     step_result->add_scan_tids(row.tid);
@@ -2299,6 +2396,8 @@ void LineairDBRpc::handleTxExecuteReadPlan(const std::string& message,
                     step_result->add_filtered_keys(std::move(row.primary_key));
                     continue;
                 }
+                if (!fe_semijoins.empty() && sj_reject(row.value))
+                    continue;
                 step_result->add_secondary_keys(std::move(row.secondary_key));
                 step_result->add_scan_keys(std::move(row.primary_key));
                 step_result->add_scan_values(project_value(std::move(row.value)));

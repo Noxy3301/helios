@@ -1,6 +1,8 @@
 #include "lineairdb_autogen.hh"
 
 #include <algorithm>
+#include <cstdio>
+#include <cstdlib>
 #include <cstdint>
 #include <functional>
 #include <limits>
@@ -1308,6 +1310,108 @@ bool autogen_read_plan_from_qep(
     }
   }
 
+  LineairDBTransaction *tx = nullptr;
+  const auto find_tx = [&]() -> LineairDBTransaction * {
+    if (tx != nullptr) return tx;
+    for (const auto &aliases : step_aliases) {
+      for (TABLE *t : aliases) {
+        if (t == nullptr || t->file == nullptr || t->file->ht != lineairdb_hton)
+          continue;
+        tx = down_cast<ha_lineairdb *>(t->file)->tx_for_autogen();
+        return tx;
+      }
+    }
+    return nullptr;
+  };
+
+  // q18 GroupedSummary: if the handler registered this full-scan leaf for
+  // synthetic serving, remove its base scan from staging and mark the TABLE*.
+  // Guard on a live GS registration: otherwise this pass must not touch `steps`
+  // (it moves every step into `kept` and only commits `kept` back when a drop
+  // happened — running it for an unregistered query would leave `steps`
+  // moved-from and corrupt the plan).
+  if (allow_filter_pushdown) {
+    LineairDBTransaction *qtx = find_tx();
+    if (qtx != nullptr && qtx->has_gs_registrations()) {
+      std::vector<bool> referenced(steps.size(), false);
+      for (const auto &st : steps) {
+        for (const auto &b : st.bindings)
+          if (b.source_step < referenced.size())
+            referenced[b.source_step] = true;
+        for (const auto &b : st.end_bindings)
+          if (b.source_step < referenced.size())
+            referenced[b.source_step] = true;
+        for (const auto &sj : st.semijoins)
+          if (sj.source_step < referenced.size())
+            referenced[sj.source_step] = true;
+      }
+
+      std::vector<uint32_t> new_index(steps.size(), 0);
+      std::vector<bool> dropped(steps.size(), false);
+      std::vector<LineairDBProxy::ReadPlanStep> kept;
+      std::vector<std::vector<TABLE *>> kept_aliases;
+      kept.reserve(steps.size());
+      kept_aliases.reserve(step_aliases.size());
+      bool any_drop = false;
+      for (size_t i = 0; i < steps.size(); ++i) {
+        bool drop = steps[i].is_scan && !steps[i].for_each &&
+                    steps[i].key_prefix.empty() &&
+                    steps[i].end_key_prefix ==
+                        lineairdb_keyenc::scan_end_sentinel() &&
+                    steps[i].serialized_filter.empty() &&
+                    steps[i].scan_limit == 0 && !referenced[i] &&
+                    i < step_aliases.size() && !step_aliases[i].empty() &&
+                    steps[i].semijoins.empty();
+        if (drop) {
+          for (TABLE *at : step_aliases[i]) {
+            if (at == nullptr || qtx->gs_registration(at) == nullptr) {
+              drop = false;
+              break;
+            }
+          }
+        }
+        if (drop) {
+          for (TABLE *at : step_aliases[i]) qtx->mark_gs_skipped(at);
+          dropped[i] = true;
+          any_drop = true;
+          continue;
+        }
+        new_index[i] = static_cast<uint32_t>(kept.size());
+        kept.push_back(std::move(steps[i]));
+        kept_aliases.push_back(std::move(step_aliases[i]));
+      }
+      // Always commit `kept` (a faithful move of the surviving steps): the loop
+      // moved every step into it, so leaving `steps` here would be moved-from.
+      // The index rebind only matters when a drop actually shifted ordinals.
+      steps = std::move(kept);
+      step_aliases = std::move(kept_aliases);
+      if (any_drop) {
+        for (auto &st : steps) {
+          for (auto &b : st.bindings)
+            if (b.source_step < new_index.size())
+              b.source_step = new_index[b.source_step];
+          for (auto &b : st.end_bindings)
+            if (b.source_step < new_index.size())
+              b.source_step = new_index[b.source_step];
+          for (auto &sj : st.semijoins)
+            if (sj.source_step < new_index.size())
+              sj.source_step = new_index[sj.source_step];
+        }
+        for (auto it = table_steps.begin(); it != table_steps.end();) {
+          const int idx = it->second;
+          if (idx >= 0 && idx < static_cast<int>(dropped.size()) &&
+              dropped[idx]) {
+            it = table_steps.erase(it);
+          } else {
+            if (idx >= 0 && idx < static_cast<int>(new_index.size()))
+              it->second = static_cast<int>(new_index[idx]);
+            ++it;
+          }
+        }
+      }
+    }
+  }
+
   // Attach scan filters once the plan is known. A rejected key caches as a
   // table-level not-found entry shared by every step on the table, so skip a
   // multi-step table; on a folded step attach only when EVERY alias builds the
@@ -1479,6 +1583,68 @@ bool autogen_read_plan_from_qep(
     }
   }
 
+  // q18 grouped-semijoin: prepend a HAVING-filtered aggregate over lineitem
+  // and semijoin the plain outer orders scan against its group keys. This runs
+  // after the real-QEP leaf mutation passes: the aggregate step reuses the
+  // physical table name but emits group rows, so it must not participate in
+  // alias/drop/table_steps decisions meant for base-table leaves.
+  if (allow_filter_pushdown) {
+    LineairDBTransaction *qtx = find_tx();
+    if (qtx != nullptr && !qtx->grouped_semijoins().empty()) {
+      const bool gdbg = std::getenv("HELIOS_FE_DEBUG") != nullptr;
+      for (const auto &gs : qtx->grouped_semijoins()) {
+        int outer_idx = -1;
+        for (size_t i = 0; i < steps.size(); ++i) {
+          const auto &s = steps[i];
+          if (s.is_scan && !s.for_each && s.table_name == gs.outer_table_key &&
+              s.aggregate_serialized.empty() && s.index_name.empty() &&
+              s.key_prefix.empty() &&
+              s.end_key_prefix == lineairdb_keyenc::scan_end_sentinel() &&
+              s.scan_limit == 0 && s.semijoins.empty()) {
+            outer_idx = static_cast<int>(i);
+            break;
+          }
+        }
+        if (outer_idx < 0) {
+          if (gdbg)
+            std::fprintf(stderr, "[GSEMI] no plain outer scan for %s\n",
+                         gs.outer_table_key.c_str());
+          continue;
+        }
+
+        LineairDBProxy::ReadPlanStep agg;
+        agg.table_name = gs.inner_table_key;
+        agg.is_scan = true;
+        agg.for_each = false;
+        agg.end_key_prefix = lineairdb_keyenc::scan_end_sentinel();
+        agg.aggregate_serialized = gs.agg_spec;
+        agg.serialized_filter = gs.having_filter;
+
+        steps.insert(steps.begin(), std::move(agg));
+        step_aliases.insert(step_aliases.begin(), {});
+        for (auto &s : steps) {
+          for (auto &b : s.bindings) b.source_step += 1;
+          for (auto &b : s.end_bindings) b.source_step += 1;
+          for (auto &sj : s.semijoins) sj.source_step += 1;
+        }
+        for (auto &kv : table_steps) {
+          if (kv.second >= 0) kv.second += 1;
+        }
+
+        LineairDBProxy::ReadPlanStep::Semijoin sj;
+        sj.source_step = 0;
+        sj.source_column = 0;
+        sj.probe_column = gs.outer_probe_column;
+        steps[outer_idx + 1].semijoins.push_back(std::move(sj));
+        if (gdbg)
+          std::fprintf(stderr,
+                       "[GSEMI] agg step for %s + semijoin on %s step=%d\n",
+                       gs.inner_table_key.c_str(), gs.outer_table_key.c_str(),
+                       outer_idx + 1);
+      }
+    }
+  }
+
   *out = std::move(steps);
   return true;
 }
@@ -1492,6 +1658,10 @@ void plan_projection_pushdown(
   std::unordered_map<std::string, std::vector<bool>> union_rs;
   std::unordered_map<std::string, uint32_t> fields_of;
   std::unordered_set<std::string> gcol_tables;
+  const auto source_is_aggregate = [&](uint32_t source_step) {
+    return source_step < steps->size() &&
+           !(*steps)[source_step].aggregate_serialized.empty();
+  };
 
   // Merge read_set by physical table; one projection layout is shared by all
   // aliases that read the same LineairDB table.
@@ -1516,6 +1686,7 @@ void plan_projection_pushdown(
   const auto force_binding_col =
       [&](const LineairDBProxy::ReadPlanKeyBinding &b) {
         if (b.from_key || b.source_step >= steps->size()) return;
+        if (source_is_aggregate(b.source_step)) return;
         const std::string &src = (*steps)[b.source_step].table_name;
         auto fo = fields_of.find(src);
         if (fo == fields_of.end()) {
@@ -1545,6 +1716,7 @@ void plan_projection_pushdown(
   for (const auto &s : *steps) {
     for (const auto &sj : s.semijoins) {
       if (sj.source_step >= steps->size()) continue;
+      if (source_is_aggregate(sj.source_step)) continue;
       const std::string &src = (*steps)[sj.source_step].table_name;
       auto fo = fields_of.find(src);
       if (fo == fields_of.end()) continue;
@@ -1581,6 +1753,7 @@ void plan_projection_pushdown(
   const auto remap_binding = [&](LineairDBProxy::ReadPlanKeyBinding &b) {
     if (b.from_key || b.source_column <= 0 || b.source_step >= steps->size())
       return;
+    if (source_is_aggregate(b.source_step)) return;
     auto it = full_to_proj.find((*steps)[b.source_step].table_name);
     if (it == full_to_proj.end()) return;  // source ships full rows
     const uint32_t fi = static_cast<uint32_t>(b.source_column - 1);
@@ -1598,6 +1771,7 @@ void plan_projection_pushdown(
   for (auto &s : *steps) {
     for (auto &sj : s.semijoins) {
       if (sj.source_step >= steps->size()) continue;
+      if (source_is_aggregate(sj.source_step)) continue;
       auto it = full_to_proj.find((*steps)[sj.source_step].table_name);
       if (it == full_to_proj.end()) continue;
       const uint32_t fi = sj.source_column;
@@ -1607,6 +1781,7 @@ void plan_projection_pushdown(
   }
 
   for (auto &s : *steps) {
+    if (!s.aggregate_serialized.empty()) continue;
     auto it = kept_out->find(s.table_name);
     if (it == kept_out->end()) continue;
     s.projection = it->second;

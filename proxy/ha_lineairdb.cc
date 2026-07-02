@@ -100,6 +100,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <functional>
 #include <iomanip>
 #include <iostream>
 #include <limits>
@@ -310,6 +311,55 @@ struct HeliosAccum {
   my_decimal p_dec;
   String p_str;            // owns a copy
 };
+
+struct HeliosHavingDesc {
+  Item_sum *sum = nullptr;
+  HeliosAggKind kind = HK_COUNT;
+  Item *arg = nullptr;
+  Item_result rtype = INT_RESULT;
+  Item_func::Functype op = Item_func::EQ_FUNC;
+  Item *cnst = nullptr;
+};
+
+static constexpr uint kHeliosAggregateDecimalPrecisionMax = 18;
+
+/**
+ * @brief Return true if a field is safe for server-side decimal aggregation.
+ *
+ * The server evaluates aggregate arguments from raw Field::val_str() bytes with
+ * dec_parse(), so the text must be decimal syntax with the same numeric meaning
+ * SQL gives the field. Temporal strings such as YYYY-MM-DD are not safe even
+ * though MySQL can SUM them numerically. The server also accumulates mantissas
+ * in signed __int128; DECIMAL precision 18 keeps each value below 10^18,
+ * leaving more than 20 decimal digits of headroom under 2^127 for realistic
+ * per-group accumulation while still accepting TPC-H q18's DECIMAL(15,2).
+ */
+static bool helios_safe_decimal_aggregate_field(const Field *field) {
+  if (field == nullptr || field->is_array()) return false;
+  switch (field->real_type()) {
+    case MYSQL_TYPE_TINY:
+    case MYSQL_TYPE_SHORT:
+    case MYSQL_TYPE_INT24:
+    case MYSQL_TYPE_LONG:
+    case MYSQL_TYPE_LONGLONG:
+      return field->result_type() == INT_RESULT;
+    case MYSQL_TYPE_NEWDECIMAL:
+      return field->result_type() == DECIMAL_RESULT &&
+             down_cast<const Field_new_decimal *>(field)->precision <=
+                 kHeliosAggregateDecimalPrecisionMax;
+    default:
+      return false;
+  }
+}
+
+static Item_field *helios_safe_bare_decimal_aggregate_arg(Item *arg) {
+  if (arg == nullptr) return nullptr;
+  Item *real = arg->real_item();
+  if (real == nullptr || real->type() != Item::FIELD_ITEM) return nullptr;
+  Item_field *field_arg = down_cast<Item_field *>(real);
+  return helios_safe_decimal_aggregate_field(field_arg->field) ? field_arg
+                                                              : nullptr;
+}
 }  // namespace
 
 /**
@@ -493,6 +543,571 @@ static bool helios_serialize_arith(const Item *it,
     default:
       return false;
   }
+}
+
+static bool helios_q18_env_enabled(const char *name) {
+  const char *v = std::getenv(name);
+  return v != nullptr && std::strcmp(v, "1") == 0;
+}
+
+static constexpr uint32_t kHeliosAggregateHavingFilterColumns =
+    std::numeric_limits<uint32_t>::max();
+
+static bool helios_classify_having_sum(Item_sum *s, HeliosHavingDesc *out) {
+  if (s == nullptr || out == nullptr) return false;
+  if (s->has_wf() || s->has_subquery()) return false;
+  switch (s->sum_func()) {
+    case Item_sum::COUNT_FUNC:
+      out->kind = HK_COUNT;
+      if (s->argument_count() > 0) {
+        Item *a0 = s->arguments()[0];
+        if (!a0->const_item() || a0->is_nullable() || a0->is_null())
+          return false;
+      }
+      break;
+    case Item_sum::SUM_FUNC:
+      out->kind = HK_SUM;
+      break;
+    case Item_sum::AVG_FUNC:
+      out->kind = HK_AVG;
+      break;
+    default:
+      return false;
+  }
+  out->rtype = s->result_type();
+  if (out->kind != HK_COUNT && out->rtype != DECIMAL_RESULT &&
+      out->rtype != INT_RESULT)
+    return false;
+  out->arg = (s->argument_count() > 0) ? s->arguments()[0] : nullptr;
+  if (out->arg != nullptr &&
+      (out->arg->has_subquery() || out->arg->has_aggregation() ||
+       out->arg->is_non_deterministic()))
+    return false;
+  if (out->kind != HK_COUNT) {
+    Item_field *field_arg = helios_safe_bare_decimal_aggregate_arg(out->arg);
+    if (field_arg == nullptr) return false;
+    out->arg = field_arg;
+  }
+  out->sum = s;
+  return true;
+}
+
+static bool helios_parse_having(Query_block *qb, HeliosHavingDesc *out) {
+  if (qb == nullptr || out == nullptr) return false;
+  *out = HeliosHavingDesc();
+  Item *h = qb->having_cond();
+  if (h == nullptr) return true;
+
+  if (h->type() == Item::COND_ITEM &&
+      down_cast<Item_cond *>(h)->functype() == Item_func::COND_AND_FUNC) {
+    Item *user_having = nullptr;
+    for (Item &c : *down_cast<Item_cond *>(h)->argument_list()) {
+      if (c.created_by_in2exists()) continue;
+      if (user_having != nullptr) return false;
+      user_having = &c;
+    }
+    if (user_having == nullptr) return true;
+    h = user_having;
+  } else if (h->created_by_in2exists()) {
+    return true;
+  }
+
+  if (h->type() != Item::FUNC_ITEM) return false;
+  Item_func *f = down_cast<Item_func *>(h);
+  Item_func::Functype op = f->functype();
+  switch (op) {
+    case Item_func::EQ_FUNC:
+    case Item_func::NE_FUNC:
+    case Item_func::LT_FUNC:
+    case Item_func::LE_FUNC:
+    case Item_func::GT_FUNC:
+    case Item_func::GE_FUNC:
+      break;
+    default:
+      return false;
+  }
+  if (f->argument_count() != 2) return false;
+
+  Item *a = f->arguments()[0]->real_item();
+  Item *b = f->arguments()[1]->real_item();
+  Item *sum_side = nullptr;
+  Item *const_side = nullptr;
+  bool sum_on_left = false;
+  if (a->type() == Item::SUM_FUNC_ITEM && b->const_item()) {
+    sum_side = a;
+    const_side = b;
+    sum_on_left = true;
+  } else if (b->type() == Item::SUM_FUNC_ITEM && a->const_item()) {
+    sum_side = b;
+    const_side = a;
+    sum_on_left = false;
+  } else {
+    return false;
+  }
+  if (const_side->has_subquery() || const_side->is_non_deterministic())
+    return false;
+  const Item_result crt = const_side->result_type();
+  if (crt != INT_RESULT && crt != DECIMAL_RESULT) return false;
+  /*
+    DECIMAL constants need the same precision bound as DECIMAL aggregate
+    arguments: both operands are parsed into signed __int128 mantissas before
+    scale alignment, so a wider literal can overflow even when SUM/AVG input is
+    safe. INT_RESULT is exempt because LLONG_MAX is already inside the same
+    __int128 headroom. This is the literal mantissa precision reported by
+    decimal_precision(), not the byte count of any post-scale-align product.
+  */
+  if (crt == DECIMAL_RESULT &&
+      const_side->decimal_precision() > kHeliosAggregateDecimalPrecisionMax)
+    return false;
+  if (!helios_classify_having_sum(down_cast<Item_sum *>(sum_side), out))
+    return false;
+
+  if (sum_on_left) {
+    out->op = op;
+  } else {
+    switch (op) {
+      case Item_func::LT_FUNC:
+        out->op = Item_func::GT_FUNC;
+        break;
+      case Item_func::LE_FUNC:
+        out->op = Item_func::GE_FUNC;
+        break;
+      case Item_func::GT_FUNC:
+        out->op = Item_func::LT_FUNC;
+        break;
+      case Item_func::GE_FUNC:
+        out->op = Item_func::LE_FUNC;
+        break;
+      default:
+        out->op = op;
+        break;
+    }
+  }
+  out->cnst = const_side;
+  return true;
+}
+
+static bool helios_build_phase_b_spec(
+    TABLE *t, bool ro_novalidate, const std::vector<HeliosOut> &outs,
+    const std::vector<Item *> &gitems, const HeliosHavingDesc &having,
+    std::vector<int> *out_agg, std::vector<int> *out_grp, int *h_agg_pos,
+    std::string *spec_ser) {
+  if (t == nullptr || out_agg == nullptr || out_grp == nullptr ||
+      h_agg_pos == nullptr || spec_ser == nullptr)
+    return false;
+  const size_t n = outs.size();
+  out_agg->assign(n, -1);
+  out_grp->assign(n, -1);
+  *h_agg_pos = -1;
+  spec_ser->clear();
+  if (!ro_novalidate) return false;
+  for (Item *gi : gitems)
+    if (gi == nullptr || gi->is_nullable()) return false;
+
+  int agg_pos = 0;
+  for (size_t c = 0; c < n; ++c) {
+    if (outs[c].kind == HK_PASS) {
+      Field *of = down_cast<Item_field *>(outs[c].orig)->field;
+      for (size_t g = 0; g < gitems.size(); ++g) {
+        if (down_cast<Item_field *>(gitems[g])->field == of) {
+          (*out_grp)[c] = static_cast<int>(g);
+          break;
+        }
+      }
+      if ((*out_grp)[c] < 0) return false;
+    } else {
+      (*out_agg)[c] = agg_pos++;
+    }
+  }
+
+  LineairDB::Protocol::AggregateSpec spec;
+  spec.set_num_columns(t->s->fields);
+  for (Item *gi : gitems) {
+    spec.add_group_columns(down_cast<Item_field *>(gi)->field->field_index());
+  }
+  for (size_t c = 0; c < n; ++c) {
+    if (outs[c].kind == HK_PASS) continue;
+    auto *af = spec.add_aggs();
+    if (outs[c].kind == HK_COUNT) {
+      af->set_kind(LineairDB::Protocol::AggFunc::AGG_COUNT);
+    } else {
+      af->set_kind(outs[c].kind == HK_SUM
+                       ? LineairDB::Protocol::AggFunc::AGG_SUM
+                       : LineairDB::Protocol::AggFunc::AGG_AVG);
+      if (outs[c].rtype != DECIMAL_RESULT || outs[c].arg == nullptr ||
+          !helios_serialize_arith(outs[c].arg, af->mutable_arg()))
+        return false;
+    }
+    af->set_result_scale(0);
+  }
+  if (having.sum != nullptr) {
+    auto *af = spec.add_aggs();
+    if (having.kind == HK_COUNT) {
+      af->set_kind(LineairDB::Protocol::AggFunc::AGG_COUNT);
+    } else {
+      af->set_kind(having.kind == HK_SUM
+                       ? LineairDB::Protocol::AggFunc::AGG_SUM
+                       : LineairDB::Protocol::AggFunc::AGG_AVG);
+      if (having.rtype != DECIMAL_RESULT || having.arg == nullptr ||
+          !helios_serialize_arith(having.arg, af->mutable_arg()))
+        return false;
+    }
+    af->set_result_scale(0);
+    *h_agg_pos = spec.aggs_size() - 1;
+  }
+  spec.SerializeToString(spec_ser);
+  return true;
+}
+
+static bool helios_build_aggregate_having_filter(
+    const HeliosHavingDesc &having, uint32_t group_row_value_col,
+    std::string *out) {
+  if (out == nullptr || having.sum == nullptr || having.cnst == nullptr)
+    return false;
+  out->clear();
+  if (having.kind == HK_AVG) return false;
+
+  LineairDB::Protocol::FilterExpr::Op op;
+  switch (having.op) {
+    case Item_func::GT_FUNC:
+      op = LineairDB::Protocol::FilterExpr::OP_GT;
+      break;
+    case Item_func::GE_FUNC:
+      op = LineairDB::Protocol::FilterExpr::OP_GE;
+      break;
+    case Item_func::LT_FUNC:
+      op = LineairDB::Protocol::FilterExpr::OP_LT;
+      break;
+    case Item_func::LE_FUNC:
+      op = LineairDB::Protocol::FilterExpr::OP_LE;
+      break;
+    case Item_func::EQ_FUNC:
+      op = LineairDB::Protocol::FilterExpr::OP_EQ;
+      break;
+    case Item_func::NE_FUNC:
+      op = LineairDB::Protocol::FilterExpr::OP_NE;
+      break;
+    default:
+      return false;
+  }
+
+  my_decimal cval;
+  my_decimal *cp = having.cnst->val_decimal(&cval);
+  if (cp == nullptr || having.cnst->null_value) return false;
+  String cstr;
+  if (my_decimal2string(E_DEC_FATAL_ERROR, cp, &cstr) != E_DEC_OK)
+    return false;
+
+  LineairDB::Protocol::PushedPredicate pred;
+  pred.set_num_columns(kHeliosAggregateHavingFilterColumns);
+  auto *expr = pred.mutable_expr();
+  expr->set_op(op);
+  auto *lhs = expr->add_children();
+  lhs->set_op(LineairDB::Protocol::FilterExpr::COLUMN_REF);
+  lhs->set_column_index(group_row_value_col);
+  auto *rhs = expr->add_children();
+  rhs->set_op(LineairDB::Protocol::FilterExpr::CONST_STRING);
+  rhs->set_string_val(std::string(cstr.ptr(), cstr.length()));
+  pred.SerializeToString(out);
+  return true;
+}
+
+static std::string helios_phys_table_key(const TABLE *t) {
+  if (t == nullptr || t->s == nullptr) return std::string();
+  const TABLE_SHARE *s = t->s;
+  std::string key = "./";
+  if (s->db.str != nullptr && s->db.length > 0)
+    key.append(s->db.str, s->db.length);
+  key.push_back('/');
+  if (s->table_name.str != nullptr && s->table_name.length > 0)
+    key.append(s->table_name.str, s->table_name.length);
+  return key;
+}
+
+static Item_in_subselect *helios_as_where_in_subselect(Item *item) {
+  if (item == nullptr) return nullptr;
+  Item *cur = item->real_item();
+  if (cur == nullptr) return nullptr;
+  if (cur->type() == Item::CACHE_ITEM) {
+    cur = down_cast<Item_cache *>(cur)->get_example();
+    if (cur == nullptr) return nullptr;
+    cur = cur->real_item();
+    if (cur == nullptr) return nullptr;
+  }
+  if (cur->type() == Item::SUBSELECT_ITEM) {
+    Item_subselect *subselect = down_cast<Item_subselect *>(cur);
+    if (subselect->substype() == Item_subselect::IN_SUBS)
+      return down_cast<Item_in_subselect *>(subselect);
+  }
+
+  if (cur->type() != Item::FUNC_ITEM) return nullptr;
+  Item_func *func = down_cast<Item_func *>(cur);
+  if (func->argument_count() != 1 ||
+      std::strcmp(func->func_name(), "<in_optimizer>") != 0)
+    return nullptr;
+  Item *arg = func->get_arg(0);
+  if (arg == nullptr) return nullptr;
+  arg = arg->real_item();
+  if (arg == nullptr || arg->type() != Item::SUBSELECT_ITEM)
+    return nullptr;
+  Item_subselect *subselect = down_cast<Item_subselect *>(arg);
+  if (subselect->substype() != Item_subselect::IN_SUBS) return nullptr;
+  return down_cast<Item_in_subselect *>(subselect);
+}
+
+static bool helios_is_outer_where_top_level_in(Item *wc,
+                                               const Item_in_subselect *insub) {
+  if (wc == nullptr || insub == nullptr) return false;
+  if (helios_as_where_in_subselect(wc) == insub) return true;
+  if (wc->type() != Item::COND_ITEM ||
+      down_cast<Item_cond *>(wc)->functype() != Item_func::COND_AND_FUNC)
+    return false;
+  for (Item &arg : *down_cast<Item_cond *>(wc)->argument_list()) {
+    if (helios_as_where_in_subselect(&arg) == insub) return true;
+  }
+  return false;
+}
+
+static bool helios_table_belongs_to_query_block(const Query_block *qb,
+                                                const TABLE *table) {
+  if (qb == nullptr || table == nullptr) return false;
+  for (const Table_ref *tr = qb->leaf_tables; tr != nullptr;
+       tr = tr->next_leaf) {
+    if (tr->table == table) return true;
+  }
+  return false;
+}
+
+// The grouped semijoin is bound to the outer probe scan at injection time by
+// matching the physical table key against a read-plan step (lineairdb_autogen
+// .cc), taking the first match. The autogen path stages the whole statement --
+// the outer block, materialized derived blocks, and item-held inner units -- in
+// one step vector and folds byte-identical scans, so a probe table that also
+// appears in another query block can leave an earlier or folded same-key step
+// that the membership filter binds to instead, silently dropping rows for an
+// alias the IN never constrained (and the same drop pass that removes the inner
+// base scan only re-serves it through the bound step). Requiring the probe's
+// physical table to be unique across the whole statement makes that bind
+// unambiguous, so there is exactly one candidate scan and the inner-scan drop
+// and the membership injection stay paired.
+static bool helios_phys_table_unique_in_statement(THD *thd,
+                                                  const TABLE *table) {
+  if (thd == nullptr || thd->lex == nullptr || table == nullptr) return false;
+  const std::string key = helios_phys_table_key(table);
+  if (key.empty()) return false;
+  int count = 0;
+  for (const Table_ref *tr = thd->lex->query_tables; tr != nullptr;
+       tr = tr->next_global) {
+    if (tr->table != nullptr && helios_phys_table_key(tr->table) == key) {
+      if (++count > 1) return false;
+    }
+  }
+  return count == 1;
+}
+
+static bool helios_grouped_semijoin_integer_key_type(const Field *f) {
+  if (f == nullptr || f->result_type() != INT_RESULT) return false;
+  switch (f->type()) {
+    case MYSQL_TYPE_TINY:
+    case MYSQL_TYPE_SHORT:
+    case MYSQL_TYPE_INT24:
+    case MYSQL_TYPE_LONG:
+    case MYSQL_TYPE_LONGLONG:
+      return true;
+    default:
+      return false;
+  }
+}
+
+static bool helios_grouped_semijoin_key_bytes_match_sql_equality(
+    const Field *gf, const Field *of) {
+  if (!helios_grouped_semijoin_integer_key_type(gf) ||
+      !helios_grouped_semijoin_integer_key_type(of))
+    return false;
+  if (gf->is_unsigned() != of->is_unsigned()) return false;
+  // The server groups and probes membership on raw Field::val_str() bytes, which
+  // is canonical decimal text for integers EXCEPT under ZEROFILL: val_str() then
+  // left-pads to the declared display width (Field_num::prepend_zeros), so two
+  // SQL-equal values in columns of different display width serialize to distinct
+  // bytes and a surviving outer row is silently dropped. The integer-type check
+  // above guarantees a Field_num, so read the same flag val_str() consults.
+  if (down_cast<const Field_num *>(gf)->zerofill ||
+      down_cast<const Field_num *>(of)->zerofill)
+    return false;
+  return true;
+}
+
+static void helios_try_register_grouped_semijoin(THD *thd, JOIN *join) {
+  const bool semijoin_gate = helios_q18_env_enabled("HELIOS_Q18_SEMIJOIN");
+  const bool gs_gate = helios_q18_env_enabled("HELIOS_Q18_GS");
+  if (!semijoin_gate && !gs_gate) return;
+  if (thd == nullptr || join == nullptr || thd->lex == nullptr) return;
+  if (thd->lex->sql_command != SQLCOM_SELECT || thd->lex->is_explain()) return;
+
+  Query_block *qb = join->query_block;
+  if (qb == nullptr || qb->outer_query_block() == nullptr) return;
+  Query_block *oqb = qb->outer_query_block();
+  Query_expression *qe = qb->master_query_expression();
+  if (qe == nullptr || !qe->is_simple() || qe->uncacheable != 0) return;
+  if (qe->item == nullptr ||
+      qe->item->substype() != Item_subselect::IN_SUBS)
+    return;
+  Item_in_subselect *insub = down_cast<Item_in_subselect *>(qe->item);
+  if (insub->left_expr == nullptr) return;
+  // The outer scan can be reduced only when the IN predicate itself is a
+  // positive top-level conjunct of the outer block's WHERE. MySQL may store
+  // that conjunct as the Item_in_subselect directly or as Item_in_optimizer
+  // with the subselect in args[0]; anything nested below OR/NOT/comparison is
+  // not proof that surviving outer rows are present in the grouped key set.
+  Item *outer_where = oqb->where_cond();
+  if (!helios_is_outer_where_top_level_in(outer_where, insub)) return;
+  // Reject negated / IS-FALSE forms. NOT IN and the IS-[NOT]-FALSE family share
+  // substype()==IN_SUBS with a positive IN, distinguished only by value_transform;
+  // they flip membership, so a positive grouped-semijoin would return the
+  // complement (silent wrong rows). Only the positive transforms are safe: plain
+  // IN is BOOL_IDENTITY, and a WHERE-context IN usually becomes BOOL_IS_TRUE.
+  if (insub->value_transform != Item::BOOL_IDENTITY &&
+      insub->value_transform != Item::BOOL_IS_TRUE)
+    return;
+
+  if (qb->leaf_table_count != 1 || !qb->is_grouped()) return;
+  if (qb->is_distinct() || qb->has_limit() ||
+      qb->olap != UNSPECIFIED_OLAP_TYPE || qb->has_windows() ||
+      qb->group_list.elements != 1 || qb->having_cond() == nullptr)
+    return;
+  if (qb->where_cond() != nullptr) return;
+
+  TABLE *t = qb->leaf_tables != nullptr ? qb->leaf_tables->table : nullptr;
+  if (t == nullptr || t->file == nullptr || t->file->ht != lineairdb_hton)
+    return;
+  ha_lineairdb *hl = down_cast<ha_lineairdb *>(t->file);
+  if (!hl->tx_ro_novalidate()) return;
+
+  Item *gi = *qb->group_list.first->item;
+  if (gi->type() != Item::FIELD_ITEM || gi->is_nullable()) return;
+  Field *gf = down_cast<Item_field *>(gi)->field;
+  if (gf == nullptr || gf->is_nullable()) return;
+
+  std::vector<HeliosOut> outs;
+  if (!helios_plan_outputs(join, &outs)) return;
+  if (outs.size() != 1 || outs[0].kind != HK_PASS) return;
+  if (down_cast<Item_field *>(outs[0].orig)->field != gf) return;
+
+  HeliosHavingDesc having;
+  if (!helios_parse_having(qb, &having) || having.sum == nullptr) return;
+
+  std::vector<Item *> gitems{gi};
+  std::vector<int> out_agg, out_grp;
+  int h_agg_pos = -1;
+  std::string spec_ser;
+  if (!helios_build_phase_b_spec(t, hl->tx_ro_novalidate(), outs, gitems,
+                                 having, &out_agg, &out_grp, &h_agg_pos,
+                                 &spec_ser))
+    return;
+  if (h_agg_pos < 0) return;
+  std::string having_filter;
+  const uint32_t having_value_col =
+      static_cast<uint32_t>(gitems.size() + 2 * h_agg_pos);
+  if (!helios_build_aggregate_having_filter(having, having_value_col,
+                                            &having_filter))
+    return;
+
+  Item *lhs = insub->left_expr->real_item();
+  if (lhs->type() != Item::FIELD_ITEM) return;
+  Field *of = down_cast<Item_field *>(lhs)->field;
+  if (of == nullptr || of->table == nullptr || of->table->file == nullptr ||
+      of->table->file->ht != lineairdb_hton)
+    return;
+  TABLE *ot = of->table;
+  if (ot == t) return;
+  if (!helios_table_belongs_to_query_block(oqb, ot)) return;
+  // The injection binds the membership filter to the first read-plan step whose
+  // physical table key matches, and the autogen path stages the whole statement
+  // (outer block, derived blocks, inner units) into one folded step vector.
+  // Require the probe's physical table to be unique across the statement so that
+  // bind is unambiguous: a same-key scan from another block or a folded
+  // multi-alias step would otherwise take the filter and drop unconstrained rows.
+  if (!helios_phys_table_unique_in_statement(thd, ot)) return;
+
+  int probe_col = -1;
+  for (uint i = 0; i < ot->s->fields; ++i) {
+    if (ot->field[i] == of) {
+      probe_col = static_cast<int>(i);
+      break;
+    }
+  }
+  if (probe_col < 0) return;
+
+  const Table_ref *otr = ot->pos_in_table_list;
+  if (otr == nullptr || otr->is_inner_table_of_outer_join()) return;
+  for (const Table_ref *emb = otr->embedding; emb != nullptr;
+       emb = emb->embedding) {
+    if (emb->is_sj_or_aj_nest()) return;
+  }
+  if (otr->query_block == nullptr ||
+      otr->query_block->outer_query_block() != nullptr)
+    return;
+  if (of->is_nullable()) return;
+  if (gf->type() != of->type() || gf->pack_length() != of->pack_length())
+    return;
+  if (gf->result_type() == STRING_RESULT && gf->charset() != of->charset())
+    return;
+  if (!helios_grouped_semijoin_key_bytes_match_sql_equality(gf, of)) return;
+
+  const std::string inner_key = helios_phys_table_key(t);
+  const std::string outer_key = helios_phys_table_key(ot);
+  if (inner_key.empty() || outer_key.empty()) return;
+
+  // At most one grouped semijoin per statement. The inner aggregate is served
+  // from a per-statement cache keyed by physical inner-table name (gs_regs_ /
+  // grouped_semijoin_groups_), so a second registration over the same inner
+  // table -- e.g. a second top-level IN conjunct on the same probe with a
+  // different HAVING -- would reuse the first aggregate's group set and silently
+  // answer the second IN with the wrong membership. q18 has a single grouped IN;
+  // reject any further candidate and let it run through normal execution.
+  if (hl->tx_has_grouped_semijoin()) return;
+
+  if (semijoin_gate) {
+    LineairDBTransaction::GroupedSemijoin gs;
+    gs.inner_table_key = inner_key;
+    gs.agg_spec = spec_ser;
+    gs.having_filter = having_filter;
+    gs.outer_table_key = outer_key;
+    gs.outer_probe_column = static_cast<uint32_t>(probe_col);
+    hl->tx_register_grouped_semijoin(std::move(gs));
+  }
+
+  if (!gs_gate) return;
+  if (having.kind != HK_SUM || having.arg == nullptr) return;
+  Item *sarg = having.arg->real_item();
+  if (sarg->type() != Item::FIELD_ITEM || sarg->is_nullable()) return;
+  Field *sumf = down_cast<Item_field *>(sarg)->field;
+  if (sumf == nullptr || sumf->table != t || sumf == gf ||
+      sumf->is_nullable())
+    return;
+
+  int sum_col = -1;
+  int grp_col = -1;
+  for (uint i = 0; i < t->s->fields; ++i) {
+    if (t->field[i] == sumf) sum_col = static_cast<int>(i);
+    if (t->field[i] == gf) grp_col = static_cast<int>(i);
+  }
+  if (sum_col < 0 || grp_col < 0) return;
+  for (uint i = 0; i < t->s->fields; ++i) {
+    if (!bitmap_is_set(t->read_set, i)) continue;
+    if (static_cast<int>(i) != sum_col && static_cast<int>(i) != grp_col)
+      return;
+  }
+
+  LineairDBTransaction::GsRegistration reg;
+  reg.spec = std::move(spec_ser);
+  reg.filter = std::move(having_filter);
+  reg.template_cols.assign(t->s->fields, "0");
+  reg.group_col = static_cast<uint32_t>(grp_col);
+  reg.col_a = static_cast<uint32_t>(sum_col);
+  reg.col_b = static_cast<uint32_t>(sum_col);
+  reg.single_sum = true;
+  hl->tx_register_gs(std::move(reg));
 }
 
 /**
@@ -940,6 +1555,7 @@ static bool helios_leaf_is_full_primary_scan(AccessPath *root_path,
  */
 static int lineairdb_push_to_engine(THD *thd, AccessPath *root_path,
                                     JOIN *join) {
+  helios_try_register_grouped_semijoin(thd, join);
   if (!helios_offloadable_shape(thd, join)) return 0;
   // The override reads a PRIMARY full scan; install it only when the plan chose
   // that scan, else its read misses the staged secondary and prefetch aborts.
@@ -1407,6 +2023,14 @@ int ha_lineairdb::index_read_map(uchar *buf, const uchar *key,
   // The optimizer has run, so the SELECT/generic-DML QEP is available.
   if (int err = maybe_prefetch_for_statement(ha_thd(), tx, table)) return err;
 
+  if (tx->gs_skipped(table) && key == nullptr) {
+    reset_index_search_buffers();
+    last_fetched_primary_key_.clear();
+    if (int err = gs_fill_buffers(tx)) return err;
+    if (secondary_index_results_.empty()) return HA_ERR_END_OF_FILE;
+    return fetch_and_set_current_result(buf, tx);
+  }
+
   build_search_plan(key, keypart_map, find_flag, key_info);
 
   return execute_plan(buf, tx);
@@ -1645,6 +2269,10 @@ int ha_lineairdb::rnd_init(bool) {
     DBUG_RETURN(err);
   }
 
+  if (tx->gs_skipped(table)) {
+    DBUG_RETURN(gs_fill_buffers(tx));
+  }
+
   DBUG_RETURN(0);
 }
 
@@ -1804,12 +2432,168 @@ bool ha_lineairdb::tx_is_aborted() {
   return tx == nullptr || tx->is_aborted();
 }
 
+void ha_lineairdb::tx_register_gs(LineairDBTransaction::GsRegistration reg) {
+  auto tx = get_transaction(ha_thd());
+  if (tx == nullptr) return;
+  THD *thd = ha_thd();
+  const uint64_t query_id =
+      thd != nullptr ? static_cast<uint64_t>(thd->query_id) : 0;
+  if (tx->autogen_query_id() != query_id)
+    tx->reset_autogen_for_statement(query_id);
+  tx->register_gs(table, std::move(reg));
+}
+
+void ha_lineairdb::tx_register_grouped_semijoin(
+    LineairDBTransaction::GroupedSemijoin gs) {
+  auto tx = get_transaction(ha_thd());
+  if (tx == nullptr) return;
+  THD *thd = ha_thd();
+  const uint64_t query_id =
+      thd != nullptr ? static_cast<uint64_t>(thd->query_id) : 0;
+  if (tx->autogen_query_id() != query_id)
+    tx->reset_autogen_for_statement(query_id);
+  tx->register_grouped_semijoin(std::move(gs));
+}
+
+bool ha_lineairdb::tx_has_grouped_semijoin() {
+  auto tx = get_transaction(ha_thd());
+  if (tx == nullptr) return false;
+  THD *thd = ha_thd();
+  const uint64_t query_id =
+      thd != nullptr ? static_cast<uint64_t>(thd->query_id) : 0;
+  // Registrations carry over in the transaction until the next register resets
+  // them for a new statement (reset_autogen_for_statement). A stale query id
+  // means any held registration belongs to an earlier statement, so it does not
+  // count against the current one.
+  if (tx->autogen_query_id() != query_id) return false;
+  return tx->has_gs_registrations() || !tx->grouped_semijoins().empty();
+}
+
+LineairDBTransaction *ha_lineairdb::tx_for_autogen() {
+  return get_transaction(ha_thd());
+}
+
 /**
  * @brief Return whether server aggregation may use read-only no-validation.
  */
 bool ha_lineairdb::tx_ro_novalidate() {
   // Server aggregation consumes staged group rows, so require prefetch mode.
   return srv_prefetch_execution && srv_prefetch_ro_novalidate;
+}
+
+int ha_lineairdb::gs_fill_buffers(LineairDBTransaction *tx) {
+  const LineairDBTransaction::GsRegistration *reg = tx->gs_registration(table);
+  if (reg == nullptr) {
+    my_error(ER_INTERNAL_ERROR, MYF(0), "helios gs skipped but unregistered");
+    return HA_ERR_INTERNAL_ERROR;
+  }
+
+  std::vector<std::string> groups;
+  if (const std::vector<std::string> *cached =
+          tx->grouped_semijoin_groups(db_table_name)) {
+    groups = *cached;
+  } else {
+    LineairDBProxy::ReadPlanStep step;
+    step.table_name = db_table_name;
+    step.is_scan = true;
+    step.end_key_prefix = lineairdb_keyenc::scan_end_sentinel();
+    step.serialized_filter = reg->filter;
+    step.aggregate_serialized = reg->spec;
+    if (!tx->execute_read_plan_raw({step}, &groups)) {
+      my_error(ER_LOCK_DEADLOCK, MYF(0));
+      return HA_ERR_LOCK_DEADLOCK;
+    }
+  }
+
+  auto parse_fields = [](std::string_view row,
+                         std::vector<std::string_view> *fv,
+                         std::vector<bool> *nul) -> bool {
+    size_t off = 0;
+    while (off < row.size()) {
+      uint8_t bs = static_cast<uint8_t>(row[off++]);
+      if (bs == 0xFF) {
+        fv->emplace_back();
+        nul->push_back(true);
+        continue;
+      }
+      if (off + bs > row.size()) return false;
+      size_t len = 0;
+      for (uint8_t i = 0; i < bs; ++i) {
+        len |= static_cast<size_t>(static_cast<uint8_t>(row[off + i]))
+               << (8 * i);
+      }
+      off += bs;
+      if (off + len > row.size()) return false;
+      fv->push_back(std::string_view(row.data() + off, len));
+      nul->push_back(false);
+      off += len;
+    }
+    return true;
+  };
+
+  const uint nf = table->s->fields;
+  std::vector<uchar> zero_nulls(table->s->null_bytes, 0);
+  const auto emit_row = [&](const std::string &gkey, const std::string &a_str,
+                            const std::string &b_str) {
+    LineairDBField ldb;
+    ldb.set_null_field(zero_nulls.data(), zero_nulls.size());
+    std::string value = ldb.get_null_field();
+    for (uint i = 0; i < nf; ++i) {
+      const std::string *src = &reg->template_cols[i];
+      if (i == reg->group_col)
+        src = &gkey;
+      else if (i == reg->col_a)
+        src = &a_str;
+      else if (i == reg->col_b)
+        src = &b_str;
+      ldb.set_lineairdb_field(src->c_str(), src->size());
+      value += ldb.get_lineairdb_field();
+    }
+    std::string skey = "\x01gs:" + gkey + ":" +
+                       std::to_string(scanned_keys_.size());
+    const size_t idx = scanned_keys_.size();
+    scanned_keys_.push_back(skey);
+    secondary_index_results_.push_back(skey);
+    secondary_index_payloads_.push_back(value);
+    scan_cache_[std::move(skey)] = idx;
+    scanned_values_.emplace_back(
+        reinterpret_cast<const std::byte *>(value.data()),
+        reinterpret_cast<const std::byte *>(value.data()) + value.size());
+  };
+
+  for (const std::string &grow : groups) {
+    std::vector<std::string_view> fv;
+    std::vector<bool> nul;
+    if (!parse_fields(grow, &fv, &nul) || fv.size() != 4 || nul[1] ||
+        nul[2]) {
+      my_error(ER_INTERNAL_ERROR, MYF(0), "helios gs group row malformed");
+      return HA_ERR_INTERNAL_ERROR;
+    }
+    const std::string gkey(fv[1]);
+    if (!reg->single_sum) {
+      my_error(ER_INTERNAL_ERROR, MYF(0), "helios gs unsupported mode");
+      return HA_ERR_INTERNAL_ERROR;
+    }
+
+    Field *sf = table->field[reg->col_a];
+    size_t digits = 0;
+    for (char ch : fv[2]) {
+      if (ch == '.') break;
+      if (ch >= '0' && ch <= '9') ++digits;
+    }
+    const uint max_int_digits =
+        sf->field_length >= (sf->decimals() + 2)
+            ? static_cast<uint>(sf->field_length) - sf->decimals() - 2
+            : 0;
+    if (digits > max_int_digits) {
+      my_error(ER_INTERNAL_ERROR, MYF(0), "helios gs sum overflow");
+      return HA_ERR_INTERNAL_ERROR;
+    }
+    emit_row(gkey, std::string(fv[2]), std::string());
+  }
+
+  scan_exhausted_ = true;
+  return 0;
 }
 
 /**

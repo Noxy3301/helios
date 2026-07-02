@@ -108,6 +108,8 @@ public:
   std::unordered_map<std::string, RangeHist> index_hist_;
 };
 
+extern handlerton *lineairdb_hton;
+
 // LIMIT and direction that a handler range scan may push to LineairDB.
 // row_limit=0 means keep the scan unbounded and let MySQL apply LIMIT.
 struct RangeScanLimit {
@@ -577,6 +579,15 @@ public:
    * @brief Return true if aggregate staging aborted.
    */
   bool tx_is_aborted();
+
+  // q18 grouped-semijoin / GroupedSummary registration and autogen access.
+  void tx_register_gs(LineairDBTransaction::GsRegistration reg);
+  int gs_fill_buffers(LineairDBTransaction *tx);
+  void tx_register_grouped_semijoin(
+      LineairDBTransaction::GroupedSemijoin gs);
+  // True if a grouped semijoin is already registered for the current statement.
+  bool tx_has_grouped_semijoin();
+  LineairDBTransaction *tx_for_autogen();
 
   int rnd_pos(uchar *buf, uchar *pos) override; ///< required
   void position(const uchar *record) override;  ///< required
