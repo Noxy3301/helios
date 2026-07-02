@@ -56,3 +56,28 @@ TPC-H 特化ヒューリスティックの大半 (FROM 順・Item_equal 展開�
 | AccessPath 写像の一発切替 | 初回ゲート 1/22。原因 3 連: (1) 旧経路の cross-join チェックが写像モードでも作動 (edges を作らないので常に空)、(2) req.Clear() が add_tables の後に走り登録消滅、(3) SF=0.01 では NLJ プランが出る (NESTED_LOOP_JOIN 未対応) | 順に修正。NLJ も JoinPredicate を持つので HASH_JOIN と同一写像 |
 | 残 6 本 (WEEDOUT=type37, subquery materialization, keyless INNER) | q20/q21 は weedout 戦略、q4/q22 は leaf にない MATERIALIZE、q19 は OR 内の equi キーが equijoin_conditions に正規化されず keyless cross 化 → 64M cap | **写像失敗→構文ビルダーへリトライ** (最終 reject は loud のまま)。q19 は「keyless INNER over base tables」を写像側で reject し構文側の OR factor-out が受ける |
 | 結果 | 22/22 MATCH。join 構造はプラン由来が第一経路、TPC-H 特化ヒューリスティックは第二経路に降格 | E2 で semi filter ルールを写像経路にも配線 (現在は構文経路のみ) |
+
+### E1 SF=1 計測と「プラン写像の罠」(2026-07-03)
+
+| 構成 | FORCED 合計 | 特記 |
+|---|---|---|
+| C3 (構文+FROM順) | 22.1s | |
+| D3 (semi filter, 構文経路) | 21.0s | q17 95ms |
+| **E1 (プラン写像第一)** | **27.0s** | **q5 231ms→4.7s、q9 305ms→1.0s に退行** |
+
+**観測**: 写像は正しさ完璧 (22/22 md5) だが、q5/q9 で退行。原因は
+**「MySQL のプランは NLJ+インデックス前提のコストで選ばれている」**こと。
+NLJ なら安い順序 (例: M:N 辺を先に置いてもインデックスで引くだけ) を、
+全 hash join の我々の実行に写すと中間結果が爆発する。オプティマイザと
+実行エンジンが同じコスト前提を共有する DuckDB 型のバンドルでは起きない、
+**「借り物オプティマイザ」構成に固有の問題**。HeatWave が
+secondary_engine_modify_access_path_cost フック (プラン候補ごとに
+secondary 向けコストを注入し、オプティマイザに hash 実行前提のプランを
+選ばせる) を持つ理由の実証になった。
+
+**次の選択肢**:
+- E2: semi filter の写像経路への配線 (q17 回復、設計済み)
+- E3: コストフック実装 — secondary 実行 (全 hash join+PAX scan) のコスト
+  モデルをオプティマイザに返し、プラン自体を secondary 向けに最適化させる
+  (HeatWave 方式の完成形)。q5/q9 退行の根本解
+- 暫定: プラン写像の適用条件を絞る (退行検出時は構文経路優先) — 検証用
