@@ -21,6 +21,8 @@
 #include "sql/item_timefunc.h"
 #include "sql/nested_join.h"
 #include "sql/join_optimizer/explain_access_path.h"
+#include "sql/join_optimizer/access_path.h"
+#include "sql/join_optimizer/walk_access_paths.h"
 #include "sql/mem_root_array.h"
 #include "sql/query_result.h"
 #include "sql/sql_class.h"
@@ -1094,12 +1096,36 @@ bool recognize_flattened_agg(THD *thd, JOIN *join, Query_block *qb,
 #undef LDB_COL_REJECT
 }
 
+// QEP cardinality estimates per base table (post-filter output rows from
+// the hypergraph plan). Guides join order and semi-filter placement.
+using QepRows = std::map<const TABLE *, double>;
+
+// Collect per-table output-row estimates from the AccessPath tree
+// (FILTER-over-TABLE_SCAN overrides the raw scan estimate).
+static void collect_qep_rows(AccessPath *root, JOIN *join, QepRows *out) {
+  if (root == nullptr) return;
+  WalkAccessPaths(root, join, WalkAccessPathPolicy::ENTIRE_TREE,
+                  [out](AccessPath *path, const JOIN *) {
+                    if (path->type == AccessPath::TABLE_SCAN) {
+                      const TABLE *t = path->table_scan().table;
+                      if (out->find(t) == out->end())
+                        (*out)[t] = path->num_output_rows();
+                    } else if (path->type == AccessPath::FILTER &&
+                               path->filter().child->type ==
+                                   AccessPath::TABLE_SCAN) {
+                      (*out)[path->filter().child->table_scan().table] =
+                          path->num_output_rows();
+                    }
+                    return false;
+                  });
+}
+
 // Build the query-block IR for `qb` into `req`. Recursion-safe: derived
 // tables build their inner blocks as QbSubBlock nodes (virtual tables).
 // Never raises errors — a false return means "primary runs it".
 bool build_block(THD *thd, Query_block *qb,
                  LineairDB::Protocol::TxExecuteQueryBlock::Request &req,
-                 const char **why) {
+                 const char **why, const QepRows *qep_rows = nullptr) {
 #define LDB_COL_REJECT(reason) \
   do {                         \
     *why = (reason);           \
@@ -1162,8 +1188,13 @@ bool build_block(THD *thd, Query_block *qb,
     if (!loaded_tables->contains(tl->table->s->db.str,
                                  tl->table->s->table_name.str))
       LDB_COL_REJECT("not SECONDARY_LOADed");
-    tabs.push_back({tl, tl->table, tl->map(),
-                    tl->table->file->stats.records});
+    ha_rows est = tl->table->file->stats.records;
+    if (qep_rows != nullptr) {
+      auto it = qep_rows->find(tl->table);
+      if (it != qep_rows->end() && it->second >= 0)
+        est = static_cast<ha_rows>(it->second);
+    }
+    tabs.push_back({tl, tl->table, tl->map(), est});
     tab_nest.push_back(nest);
     tab_virtual.push_back(false);
     if (nest < 0)
@@ -1456,18 +1487,25 @@ bool build_block(THD *thd, Query_block *qb,
     auto *node = req.add_nodes();
     auto *sub = node->mutable_sub_block();
     if (!build_block(thd, virtual_inner[i - n_real], *sub->mutable_block(),
-                     why))
+                     why, qep_rows))
       return false;
     scan_node_of[i] = req.nodes_size() - 1;
   }
 
-  // Join tree in FROM-clause order (leaf_tables): each next table
-  // hash-joins against the accumulated result. TPC-H FROM clauses list
-  // chained tables, so every step joins on a real edge; a records-greedy
-  // order can pick a low-selectivity edge first (e.g. nationkey) and blow
-  // up the intermediate result. The server additionally swaps build/probe
-  // per INNER join by actual size and caps intermediate cardinality.
+  // Join tree ordered by the optimizer's cardinality estimates (QEP
+  // post-filter rows when available): the most selective table drives and
+  // each next table is the smallest one connected to the joined set. The
+  // server additionally swaps INNER build/probe by actual size and caps
+  // intermediate cardinality.
   std::vector<int> join_order = main_tabs;
+  std::stable_sort(join_order.begin(), join_order.end(), [&](int a, int b) {
+    // One-row deriveds join keyless; they must never drive (no edges).
+    auto key = [&](int t) -> ha_rows {
+      if (tab_virtual[t] && virtual_one_row[t - n_real]) return HA_POS_ERROR;
+      return tabs[t].records;
+    };
+    return key(a) < key(b);
+  });
 
   int current_node;
   std::vector<bool> joined(n_tabs, false);
@@ -2383,7 +2421,9 @@ bool recognize_query_block(THD *thd, JOIN *join,
         PrintQueryPlan(0, join->root_access_path(), join, true);
     fprintf(stderr, "[LDBC-QEP]\n%s\n", plan.c_str());
   }
-  if (!build_block(thd, qb, ctx->qb_request, why)) return false;
+  QepRows qep_rows;
+  collect_qep_rows(join->root_access_path(), join, &qep_rows);
+  if (!build_block(thd, qb, ctx->qb_request, why, &qep_rows)) return false;
   ctx->plan_ready = true;
   return true;
 }
