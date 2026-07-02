@@ -175,6 +175,32 @@ static void dec_addsub(Dec& a, const Dec& b, bool sub) {
     a.null = a.null || b.null;
 }
 
+// Collect every column a FilterExpr tree references.
+static void collect_filter_columns(const LineairDB::Protocol::FilterExpr& e,
+                                   std::set<uint32_t>& out) {
+    if (e.op() == LineairDB::Protocol::FilterExpr::COLUMN_REF) {
+        out.insert(e.column_index());
+    }
+    for (const auto& c : e.children()) collect_filter_columns(c, out);
+}
+
+// Columns a step actually consumes server- or proxy-side. Non-empty ONLY
+// when the step carries a RowProjection (the proxy's read_set bound): the
+// scan may then materialize just these columns for PAX rows, leaving the
+// rest as 1-byte placeholders (full row shape). Without a projection the
+// proxy may read any column, so the full row is required.
+static std::vector<uint32_t> build_sparse_columns(
+    const LineairDB::Protocol::TxExecuteReadPlan::PlanStep& step) {
+    if (!step.has_projection()) return {};
+    std::set<uint32_t> cols(step.projection().field_indexes().begin(),
+                            step.projection().field_indexes().end());
+    if (step.has_filter() && step.filter().has_expr()) {
+        collect_filter_columns(step.filter().expr(), cols);
+    }
+    for (const auto& sj : step.semijoins()) cols.insert(sj.probe_column());
+    return std::vector<uint32_t>(cols.begin(), cols.end());
+}
+
 // Row-source abstraction for aggregate-argument evaluation: a materialized
 // row string walks the field headers per access; a PAX row reads the cell
 // straight from its column strip.
@@ -650,6 +676,10 @@ static bool parallel_primary_pax_aggregate_scan(
  * reads — rows touched by concurrent writers are re-read through
  * StatelessRead, so validated (non-ro_novalidate) plans stay correct.
  *
+ * Integer-keyed ranges without LIMIT are sliced across worker threads
+ * (same slicing as parallel_primary_filter_scan), each worker running its
+ * own ref-scan + strip evaluation; chunk outputs are appended in key order.
+ *
  * Returns false (emitting nothing) when the table is not fully
  * PAX-resident or the schema is too narrow — caller uses the materializing
  * path. `projection_failed` mirrors the trim_row_value contract.
@@ -664,10 +694,7 @@ static bool pax_ref_scan_emit(
     const bool has_filter = step.has_filter() && step.filter().has_expr();
     const bool has_projection = step.has_projection();
     // With a pushed filter, LIMIT applies after filter evaluation.
-    const uint64_t scan_limit = has_filter ? 0 : step.scan_limit();
-    auto refs = db->StatelessPaxRefScan(step.table_name(), start_key, end_key,
-                                        scan_limit, step.reverse_scan());
-    if (!refs.ok) return false;
+    const uint64_t ref_scan_limit = has_filter ? 0 : step.scan_limit();
 
     std::vector<uint32_t> kept;
     if (has_projection) {
@@ -675,81 +702,171 @@ static bool pax_ref_scan_emit(
                     step.projection().field_indexes().end());
     }
 
-    // Row-at-a-time slow path for rows a writer touched mid-read.
-    auto slow_row = [&](LineairDB::StatelessPaxRefRow& r) {
-        auto rr = db->StatelessRead(step.table_name(), r.key);
-        if (!rr.found) return;  // deleted meanwhile: skip like a tombstone
-        bool pass = true;
-        if (has_filter) {
-            PredicateEvaluator ev;
-            if (ev.parse_row(rr.value.data(), rr.value.size(),
-                             step.filter().num_columns())) {
-                pass = ev.evaluate(step.filter().expr());
-            }  // parse failure -> keep the row for MySQL to re-check
-        }
-        if (!pass) {
-            step_result->add_filtered_keys(std::move(r.key));
-            return;
-        }
-        std::string out;
-        if (has_projection) {
-            if (!trim_row_value(rr.value, step.projection().field_indexes(),
-                                step.projection().num_columns(), out)) {
-                projection_failed = true;
-                out = std::move(rr.value);
-            }
-        } else {
-            out = std::move(rr.value);
-        }
-        step_result->add_scan_keys(std::move(r.key));
-        step_result->add_scan_values(std::move(out));
-        step_result->add_scan_tids(rr.tid);
+    struct RefChunkOut {
+        std::vector<std::string> scan_keys, scan_values, filtered_keys;
+        std::vector<uint64_t> tids;
+        std::atomic<bool> bail{false};
+        bool not_pax = false;
+        bool projection_failed = false;
     };
 
-    PredicateEvaluator evaluator;
-    uint64_t emitted = 0;
-    for (auto& r : refs.rows) {
-        const auto* grp = static_cast<const LineairDB::Pax::PaxGroup*>(r.group);
-        bool pass = true;
-        bool filter_parsed = true;
-        if (has_filter) {
-            if (!evaluator.set_row_from_pax(*grp, r.slot,
-                                            step.filter().num_columns())) {
-                return false;  // schema narrower than the filter: fall back
-            }
-            pass = evaluator.evaluate(step.filter().expr());
+    // Per-chunk worker: ref-scan [s, e), evaluate on strips, gather
+    // survivors, TID-recheck. `release_epoch` for extra threads only.
+    auto run_range = [&](const std::string& s, const std::string& e,
+                         RefChunkOut& out, bool release_epoch) {
+        auto refs = db->StatelessPaxRefScan(step.table_name(), s, e,
+                                            ref_scan_limit,
+                                            step.reverse_scan());
+        if (!refs.ok) {
+            out.not_pax = true;
+            if (release_epoch) db->ReleaseMasstreeThreadEpoch();
+            return;
         }
-        std::string value;
-        if (pass) {
-            if (has_projection) {
-                value.reserve(64);
-                if (!grp->GatherRowProjected(r.slot, kept.data(), kept.size(),
-                                             value)) {
-                    return false;  // projected column outside schema
+        PredicateEvaluator evaluator;
+        for (auto& r : refs.rows) {
+            const auto* grp =
+                static_cast<const LineairDB::Pax::PaxGroup*>(r.group);
+            bool pass = true;
+            if (has_filter) {
+                if (!evaluator.set_row_from_pax(
+                        *grp, r.slot, step.filter().num_columns())) {
+                    out.bail.store(true, std::memory_order_relaxed);
+                    break;  // schema narrower than the filter: fall back
                 }
-            } else {
-                value.resize(r.row_size);
-                const size_t got = grp->GatherRow(
-                    r.slot, reinterpret_cast<std::byte*>(value.data()),
-                    r.row_size);
-                if (got != r.row_size) value.resize(got);
+                pass = evaluator.evaluate(step.filter().expr());
+            }
+            std::string value;
+            if (pass) {
+                if (has_projection) {
+                    if (!grp->GatherRowProjected(r.slot, kept.data(),
+                                                 kept.size(), value)) {
+                        out.bail.store(true, std::memory_order_relaxed);
+                        break;  // projected column outside schema
+                    }
+                } else {
+                    value.resize(r.row_size);
+                    const size_t got = grp->GatherRow(
+                        r.slot, reinterpret_cast<std::byte*>(value.data()),
+                        r.row_size);
+                    if (got != r.row_size) value.resize(got);
+                }
+            }
+            // The cells just read are only trustworthy if no writer touched
+            // the row since the scan observed its TID.
+            if (LineairDB::PaxRefCurrentTid(r) != r.tid) {
+                auto rr = db->StatelessRead(step.table_name(), r.key);
+                if (!rr.found) continue;  // deleted meanwhile: skip
+                bool spass = true;
+                if (has_filter) {
+                    PredicateEvaluator ev;
+                    if (ev.parse_row(rr.value.data(), rr.value.size(),
+                                     step.filter().num_columns())) {
+                        spass = ev.evaluate(step.filter().expr());
+                    }  // parse failure -> keep for MySQL to re-check
+                }
+                if (!spass) {
+                    out.filtered_keys.push_back(std::move(r.key));
+                    continue;
+                }
+                std::string sout;
+                if (has_projection) {
+                    if (!trim_row_value(rr.value,
+                                        step.projection().field_indexes(),
+                                        step.projection().num_columns(),
+                                        sout)) {
+                        out.projection_failed = true;
+                        sout = std::move(rr.value);
+                    }
+                } else {
+                    sout = std::move(rr.value);
+                }
+                out.scan_keys.push_back(std::move(r.key));
+                out.scan_values.push_back(std::move(sout));
+                out.tids.push_back(rr.tid);
+                continue;
+            }
+            if (!pass) {
+                out.filtered_keys.push_back(std::move(r.key));
+                continue;
+            }
+            out.scan_keys.push_back(std::move(r.key));
+            out.scan_values.push_back(std::move(value));
+            out.tids.push_back(r.tid);
+        }
+        if (release_epoch) db->ReleaseMasstreeThreadEpoch();
+    };
+
+    // Try to slice integer-keyed, LIMIT-less forward scans across threads.
+    std::vector<RefChunkOut> chunks;
+    bool parallel_done = false;
+    if (step.scan_limit() == 0 && !step.reverse_scan()) {
+        const unsigned nproc = std::thread::hardware_concurrency();
+        const unsigned max_threads = std::min<unsigned>(nproc ? nproc : 4, 8);
+        auto first = db->StatelessRangeScan(step.table_name(), start_key,
+                                            end_key, 1, false);
+        auto last = db->StatelessRangeScan(step.table_name(), start_key,
+                                           end_key, 1, true);
+        int64_t lo = 0, hi = 0;
+        if (max_threads > 1 && first.ok && !first.rows.empty() && last.ok &&
+            !last.rows.empty() &&
+            decode_leading_int_key(first.rows.front().key, lo) &&
+            decode_leading_int_key(last.rows.front().key, hi) && hi > lo &&
+            static_cast<uint64_t>(hi - lo) + 1 >= 500000) {
+            const uint64_t span = static_cast<uint64_t>(hi - lo) + 1;
+            const unsigned worker_count = static_cast<unsigned>(
+                std::min<size_t>((span + 127999) / 128000, max_threads));
+            if (worker_count > 1) {
+                std::vector<std::string> starts(worker_count);
+                std::vector<std::string> ends(worker_count);
+                for (unsigned i = 0; i < worker_count; ++i) {
+                    const int64_t begin_value =
+                        lo + static_cast<int64_t>((span * i) / worker_count);
+                    const int64_t end_value =
+                        (i + 1 == worker_count)
+                            ? hi + 1
+                            : lo + static_cast<int64_t>((span * (i + 1)) /
+                                                        worker_count);
+                    starts[i] = (i == 0) ? start_key
+                                         : encode_int_key_part(begin_value);
+                    ends[i] = (i + 1 == worker_count)
+                                  ? end_key
+                                  : encode_int_key_part(end_value);
+                }
+                chunks = std::vector<RefChunkOut>(worker_count);
+                std::vector<std::thread> workers;
+                workers.reserve(worker_count);
+                for (unsigned w = 0; w < worker_count; ++w) {
+                    workers.emplace_back([&, w] {
+                        run_range(starts[w], ends[w], chunks[w], true);
+                    });
+                }
+                for (auto& worker : workers) worker.join();
+                parallel_done = true;
             }
         }
-        // The cells we just read (filter + gather) are only trustworthy if
-        // no writer touched the row since the scan observed its TID.
-        if (LineairDB::PaxRefCurrentTid(r) != r.tid) {
-            slow_row(r);
-            (void)filter_parsed;
-            continue;
+    }
+    if (!parallel_done) {
+        chunks = std::vector<RefChunkOut>(1);
+        run_range(start_key, end_key, chunks[0], false);
+    }
+    for (auto& c : chunks) {
+        if (c.not_pax || c.bail.load(std::memory_order_relaxed)) return false;
+        if (c.projection_failed) projection_failed = true;
+    }
+
+    uint64_t emitted = 0;
+    for (auto& c : chunks) {
+        for (auto& fk : c.filtered_keys) {
+            step_result->add_filtered_keys(std::move(fk));
         }
-        if (!pass) {
-            step_result->add_filtered_keys(std::move(r.key));
-            continue;
+        for (size_t i = 0; i < c.scan_keys.size(); ++i) {
+            step_result->add_scan_keys(std::move(c.scan_keys[i]));
+            step_result->add_scan_values(std::move(c.scan_values[i]));
+            step_result->add_scan_tids(c.tids[i]);
+            if (step.scan_limit() > 0 && ++emitted >= step.scan_limit()) {
+                return true;
+            }
         }
-        step_result->add_scan_keys(std::move(r.key));
-        step_result->add_scan_values(std::move(value));
-        step_result->add_scan_tids(r.tid);
-        if (step.scan_limit() > 0 && ++emitted >= step.scan_limit()) break;
     }
     return true;
 }
@@ -1677,6 +1794,13 @@ void LineairDBRpc::handleTxExecuteReadPlan(const std::string& message,
             return step_eval.evaluate(*step_filter);
         };
 
+        // PAX sparse materialization: when a projection bounds this step's
+        // read set, scans need only these columns' strips; other fields come
+        // back as placeholders (heap rows are unaffected).
+        const std::vector<uint32_t> sparse_cols = build_sparse_columns(step);
+        const std::vector<uint32_t>* sparse =
+            sparse_cols.empty() ? nullptr : &sparse_cols;
+
         // Filters read the full row. Projection then trims emitted VALUES to
         // the kept columns; malformed rows fail the plan instead of mixing
         // full and projected layouts.
@@ -1840,7 +1964,7 @@ void LineairDBRpc::handleTxExecuteReadPlan(const std::string& message,
                                         db->StatelessRangeScan(
                                             step.table_name(), row_key,
                                             row_end, step.scan_limit(),
-                                            step.reverse_scan());
+                                            step.reverse_scan(), sparse);
                                     if (!scan_result.ok) {
                                         failed[worker_index] = 1;
                                         break;
@@ -1864,7 +1988,7 @@ void LineairDBRpc::handleTxExecuteReadPlan(const std::string& message,
                                             step.table_name(),
                                             step.index_name(), row_key,
                                             row_end, step.scan_limit(),
-                                            step.reverse_scan());
+                                            step.reverse_scan(), sparse);
                                     if (!scan_result.ok) {
                                         failed[worker_index] = 1;
                                         break;
@@ -1890,7 +2014,7 @@ void LineairDBRpc::handleTxExecuteReadPlan(const std::string& message,
                             } else {
                                 auto read_result =
                                     db->StatelessRead(step.table_name(),
-                                                      row_key);
+                                                      row_key, sparse);
                                 out.keys.push_back(row_key);
                                 out.tids.push_back(read_result.tid);
                                 if (read_result.found &&
@@ -1960,7 +2084,8 @@ void LineairDBRpc::handleTxExecuteReadPlan(const std::string& message,
                         auto scan_result =
                             db_manager_->get_database()->StatelessRangeScan(
                                 step.table_name(), row_key, row_end,
-                                step.scan_limit(), step.reverse_scan());
+                                step.scan_limit(), step.reverse_scan(),
+                                sparse);
                         if (!scan_result.ok) {
                             response.set_ok(false);
                             flat_plan::encode_to_string(response, result);
@@ -1983,7 +2108,7 @@ void LineairDBRpc::handleTxExecuteReadPlan(const std::string& message,
                                 ->StatelessSecondaryRangeScan(
                                     step.table_name(), step.index_name(),
                                     row_key, row_end, step.scan_limit(),
-                                    step.reverse_scan());
+                                    step.reverse_scan(), sparse);
                         if (!scan_result.ok) {
                             response.set_ok(false);
                             flat_plan::encode_to_string(response, result);
@@ -2012,7 +2137,7 @@ void LineairDBRpc::handleTxExecuteReadPlan(const std::string& message,
 
                 auto read_result =
                     db_manager_->get_database()->StatelessRead(
-                        step.table_name(), row_key);
+                        step.table_name(), row_key, sparse);
                 step_result->add_scan_keys(row_key);
                 step_result->add_scan_tids(read_result.tid);
                 if (read_result.found &&
@@ -2036,7 +2161,7 @@ void LineairDBRpc::handleTxExecuteReadPlan(const std::string& message,
         if (!step.is_scan()) {
             auto read_result =
                 db_manager_->get_database()->StatelessRead(
-                    step.table_name(), start_key);
+                    step.table_name(), start_key, sparse);
             step_result->set_actual_key(start_key);
             step_result->set_actual_start_key(start_key);
             step_result->set_found(read_result.found);
@@ -2162,7 +2287,7 @@ void LineairDBRpc::handleTxExecuteReadPlan(const std::string& message,
             auto scan_result =
                 db_manager_->get_database()->StatelessSecondaryRangeScan(
                     step.table_name(), step.index_name(), start_key, end_key,
-                    step.scan_limit(), step.reverse_scan());
+                    step.scan_limit(), step.reverse_scan(), sparse);
             if (!scan_result.ok) {
                 response.set_ok(false);
                 flat_plan::encode_to_string(response, result);
