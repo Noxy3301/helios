@@ -6,6 +6,7 @@
 #include <memory>
 #include <string>
 #include <thread>
+#include <set>
 #include <unordered_map>
 #include <vector>
 
@@ -800,6 +801,9 @@ struct Executor {
         std::vector<Dec> acc;          // SUM/AVG accumulator or MIN/MAX (numeric)
         std::vector<std::string> sval; // MIN/MAX (binary string)
         std::vector<bool> has;         // MIN/MAX seen any
+        // COUNT(DISTINCT): per-agg distinct value sets (small groups at
+        // TPC-H scale; lineage log #16).
+        std::vector<std::set<std::string>> dset;
     };
     using GroupMap = std::unordered_map<std::string, GroupState>;
 
@@ -853,6 +857,7 @@ struct Executor {
                 st.acc.assign(n_agg, Dec{});
                 st.sval.assign(n_agg, {});
                 st.has.assign(n_agg, false);
+                st.dset.resize(n_agg);
                 gs = &groups.emplace(std::move(keybuf), std::move(st))
                           .first->second;
                 keybuf.clear();
@@ -880,6 +885,14 @@ struct Executor {
                 }
                 switch (af.kind()) {
                     case pb::QbAggFunc::COUNT:
+                        if (af.distinct()) {
+                            const std::string_view dv = value_of(
+                                af.arg_table(), ref,
+                                af.arg().column_index());
+                            if (!dv.empty())
+                                gs->dset[a].emplace(dv);
+                            break;
+                        }
                         gs->count[a] += 1;
                         break;
                     case pb::QbAggFunc::SUM:
@@ -951,6 +964,10 @@ struct Executor {
             for (int a = 0; a < n_agg; ++a) {
                 switch (agg.aggs(a).kind()) {
                     case pb::QbAggFunc::COUNT:
+                        if (agg.aggs(a).distinct()) {
+                            d.dset[a].merge(s.dset[a]);
+                            break;
+                        }
                         d.count[a] += s.count[a];
                         break;
                     case pb::QbAggFunc::SUM:
@@ -1065,7 +1082,8 @@ struct Executor {
         *is_null = false;
         switch (af.kind()) {
             case pb::QbAggFunc::COUNT:
-                return std::to_string(gs.count[a]);
+                return std::to_string(af.distinct() ? gs.dset[a].size()
+                                                    : gs.count[a]);
             case pb::QbAggFunc::SUM:
                 if (gs.count[a] == 0) {
                     if (af.zero_if_empty()) {
@@ -1139,6 +1157,7 @@ struct Executor {
             st.acc.assign(agg.aggs_size(), Dec{});
             st.sval.assign(agg.aggs_size(), {});
             st.has.assign(agg.aggs_size(), false);
+            st.dset.resize(agg.aggs_size());
             groups.emplace(std::string(), std::move(st));
         }
 

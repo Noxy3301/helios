@@ -1421,7 +1421,8 @@ bool build_block(THD *thd, Query_block *qb,
       }
       if (!is_key) residuals.push_back(c);
     }
-    if (jn->build_keys_size() == 0) LDB_COL_REJECT("derived LEFT keyless");
+    if (jn->build_keys_size() == 0 && !virtual_one_row[vt - n_real])
+      LDB_COL_REJECT("derived LEFT keyless");
     if (!residuals.empty()) {
       TupleColumnRegistry reg;
       reg.table_of = [&](const Field *f) { return table_index_of_field(f); };
@@ -1610,6 +1611,31 @@ bool build_block(THD *thd, Query_block *qb,
   auto register_aggregate = [&](Item_sum *sum) -> int {
     auto *af = agg->add_aggs();
     switch (sum->sum_func()) {
+      case Item_sum::COUNT_DISTINCT_FUNC: {
+        if (sum->argument_count() != 1) {
+          agg_why = "COUNT DISTINCT arity";
+          return -1;
+        }
+        Item *arg = sum->get_arg(0)->real_item();
+        if (arg->type() != Item::FIELD_ITEM) {
+          agg_why = "COUNT DISTINCT arg";
+          return -1;
+        }
+        const Field *raw = down_cast<Item_field *>(arg)->field;
+        const int ti = table_index_of_field(raw);
+        const Field *cf = ti >= 0 ? resolve_in(raw, ti) : nullptr;
+        if (cf == nullptr) {
+          agg_why = "COUNT DISTINCT column";
+          return -1;
+        }
+        af->set_arg_table(ti);
+        af->mutable_arg()->set_op(
+            LineairDB::Protocol::FilterExpr::COLUMN_REF);
+        af->mutable_arg()->set_column_index(cf->field_index());
+        af->set_kind(LineairDB::Protocol::QbAggFunc::COUNT);
+        af->set_distinct(true);
+        return agg->aggs_size() - 1;
+      }
       case Item_sum::COUNT_FUNC: {
         if (sum->argument_count() != 1) {
           agg_why = "COUNT arg count";
@@ -1786,6 +1812,25 @@ bool build_block(THD *thd, Query_block *qb,
       out->set_column_index(n_grp_final + ord);
       return true;
     }
+    if (it->type() == Item::FIELD_ITEM) {
+      // A one-row derived column (uncorrelated scalar subquery, q11's
+      // HAVING threshold): register MIN(col) — identical over one row —
+      // so the value rides the aggregate ordinal space.
+      const Field *raw = down_cast<Item_field *>(it)->field;
+      const int ti = table_index_of_field(raw);
+      if (ti < 0 || !tab_virtual[ti] || !virtual_one_row[ti - n_real])
+        return false;
+      auto *af = agg->add_aggs();
+      af->set_arg_table(ti);
+      af->mutable_arg()->set_op(
+          LineairDB::Protocol::FilterExpr::COLUMN_REF);
+      af->mutable_arg()->set_column_index(raw->field_index());
+      af->set_kind(LineairDB::Protocol::QbAggFunc::MIN);
+      af->set_cmp_kind(raw->result_type() == STRING_RESULT ? 1 : 0);
+      out->set_op(LineairDB::Protocol::FilterExpr::COLUMN_REF);
+      out->set_column_index(n_grp_final + agg->aggs_size() - 1);
+      return true;
+    }
     if (it->type() == Item::INT_ITEM) {
       out->set_op(LineairDB::Protocol::FilterExpr::CONST_INT);
       out->set_int_val(it->val_int());
@@ -1874,9 +1919,6 @@ bool build_block(THD *thd, Query_block *qb,
     oe->set_source(LineairDB::Protocol::QbOutputExpr::EXPR);
     oe->set_result_scale(real->decimals);
   }
-  if (agg->aggs_size() == 0 && !distinct_as_group)
-    LDB_COL_REJECT("no aggregates");
-
   // HAVING over the stage-1 value layout (agg refs become ordinals).
   if (qb->having_cond() != nullptr) {
     std::function<bool(Item *, LineairDB::Protocol::FilterExpr *)>
@@ -1933,6 +1975,9 @@ bool build_block(THD *thd, Query_block *qb,
       LDB_COL_REJECT("HAVING not pushable");
     hv->set_num_columns(n_grp_final + agg->aggs_size());
   }
+  if (agg->aggs_size() == 0 && !distinct_as_group &&
+      agg->group_columns_size() == 0)
+    LDB_COL_REJECT("no aggregates");
 
   // ORDER BY over output ordinals only.
   for (ORDER *o = qb->order_list.first; o != nullptr; o = o->next) {
