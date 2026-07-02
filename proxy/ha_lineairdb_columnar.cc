@@ -1708,6 +1708,39 @@ bool build_block(THD *thd, Query_block *qb,
               return -1;
             }
           }
+          // Rule (E2): a derived build side gets a domain filter from the
+          // probe side — the sub-block aggregates only the keys that can
+          // actually join (sideways information passing on the mapped plan).
+          if (jn->build_keys_size() > 0 &&
+              req.nodes(build).has_sub_block()) {
+            auto *sub = req.mutable_nodes(build)->mutable_sub_block();
+            if (!sub->has_semi()) {
+              const auto &bk0 = jn->build_keys(0);
+              const auto &pk0 = jn->probe_keys(0);
+              const auto &sreq = sub->block();
+              const uint32_t ordinal = bk0.column();
+              if (ordinal < static_cast<uint32_t>(sreq.output_size()) &&
+                  sreq.output(ordinal).source() ==
+                      LineairDB::Protocol::QbOutputExpr::GROUP &&
+                  sreq.nodes_size() > 0 &&
+                  sreq.nodes(sreq.nodes_size() - 1).has_aggregate()) {
+                const auto &sagg =
+                    sreq.nodes(sreq.nodes_size() - 1).aggregate();
+                const uint32_t g = sreq.output(ordinal).ordinal();
+                if (g < static_cast<uint32_t>(
+                            sagg.group_columns_size()) &&
+                    sagg.group_columns(g).prefix_len() == 0) {
+                  auto *sm = sub->mutable_semi();
+                  sm->set_source_node(probe);
+                  auto *sc = sm->mutable_source_column();
+                  sc->set_table_idx(pk0.table_idx());
+                  sc->set_column(pk0.column());
+                  sub->set_target_table(sagg.group_columns(g).table_idx());
+                  sub->set_target_column(sagg.group_columns(g).column());
+                }
+              }
+            }
+          }
           std::set<int> united = node_tabs[probe];
           if (jt == LineairDB::Protocol::QbJoin::INNER ||
               jt == LineairDB::Protocol::QbJoin::LEFT)
@@ -2873,6 +2906,58 @@ bool ColumnarExecute(JOIN *join, Query_result *result) {
 // ---------------------------------------------------------------------------
 // Secondary-engine hooks.
 // ---------------------------------------------------------------------------
+
+// Cost model for the PAX executor: everything runs as sequential strip
+// scans + in-memory hash joins, so nested-loop and index paths (priced
+// for InnoDB B-trees) are heavily penalized and hash joins re-priced
+// linear-in-rows. Called only during secondary preparation — the primary
+// (OLTP) planner is untouched.
+static bool ModifyAccessPathCost(THD *thd [[maybe_unused]],
+                                 const JoinHypergraph &hypergraph
+                                 [[maybe_unused]],
+                                 AccessPath *path) {
+  switch (path->type) {
+    case AccessPath::NESTED_LOOP_JOIN:
+    case AccessPath::BKA_JOIN:
+    case AccessPath::NESTED_LOOP_SEMIJOIN_WITH_DUPLICATE_REMOVAL:
+      // Row-at-a-time probes are the worst case for the RPC-backed store;
+      // reject so the optimizer explores hash alternatives.
+      return true;
+    case AccessPath::EQ_REF:
+    case AccessPath::REF:
+    case AccessPath::REF_OR_NULL:
+    case AccessPath::INDEX_SCAN:
+    case AccessPath::INDEX_RANGE_SCAN:
+      // No index access on the secondary engine.
+      return true;
+    case AccessPath::HASH_JOIN: {
+      // Linear build+probe with a small per-row constant.
+      const double build =
+          std::max(1.0, path->hash_join().inner->num_output_rows());
+      const double probe =
+          std::max(1.0, path->hash_join().outer->num_output_rows());
+      const double cost = path->hash_join().outer->cost +
+                          path->hash_join().inner->cost +
+                          0.05 * (build + probe);
+      path->cost = cost;
+      path->cost_before_filter = cost;
+      path->init_cost = path->hash_join().inner->cost + 0.05 * build;
+      return false;
+    }
+    case AccessPath::TABLE_SCAN: {
+      // Morsel-parallel PAX strip scan: cheap and linear.
+      const double rows = std::max(1.0, path->num_output_rows());
+      const double cost = 0.01 * rows;
+      path->cost = cost;
+      path->cost_before_filter = cost;
+      path->init_cost = 0.0;
+      return false;
+    }
+    default:
+      return false;
+  }
+}
+
 bool PrepareSecondaryEngine(THD *thd, LEX *lex) {
   // Stop const-table/subquery evaluation during optimization from touching
   // storage before we decide how to execute (same as the mock engine).
@@ -3024,6 +3109,8 @@ int lineairdb_columnar_init(void *p) {
   hton->optimize_secondary_engine =
       lineairdb_columnar::OptimizeSecondaryEngine;
   hton->compare_secondary_engine_cost = lineairdb_columnar::CompareJoinCost;
+  hton->secondary_engine_modify_access_path_cost =
+      lineairdb_columnar::ModifyAccessPathCost;
   hton->secondary_engine_flags =
       MakeSecondaryEngineFlags(SecondaryEngineFlag::SUPPORTS_HASH_JOIN,
                                SecondaryEngineFlag::SUPPORTS_NESTED_LOOP_JOIN);
