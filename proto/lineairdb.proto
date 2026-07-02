@@ -727,6 +727,14 @@ message QbScan {
     PushedPredicate filter = 2;  // fully-pushed single-table conjuncts
 }
 
+// A predicate over a joined tuple: FilterExpr column_index values are
+// ordinals into `columns`, which map to (table, column) refs of the tuple.
+// A LEFT-join miss makes a table's columns NULL.
+message QbTupleFilter {
+    PushedPredicate pred = 1;
+    repeated QbColumnRef columns = 2;
+}
+
 message QbJoin {
     uint32 build = 1;  // node index into QbRequest.nodes
     uint32 probe = 2;
@@ -735,7 +743,17 @@ message QbJoin {
     repeated QbColumnRef probe_keys = 4;
     enum Type { INNER = 0; LEFT = 1; SEMI = 2; ANTI = 3; }
     Type type = 5;
-    // Residual non-equi join predicate tables/exprs: Phase B2+.
+    // Residual predicate applied per key match, over the combined
+    // probe++build tuple. For SEMI/ANTI it decides whether a same-key build
+    // row counts as a match (q21's l2.l_suppkey <> l1.l_suppkey).
+    QbTupleFilter residual = 6;
+}
+
+// Filter a node's tuples by a multi-table predicate (OR-of-ANDs conjuncts
+// that reference several tables, e.g. q7/q19).
+message QbTupleFilterNode {
+    uint32 input = 1;
+    QbTupleFilter filter = 2;
 }
 
 message QbAggregate {
@@ -768,16 +786,25 @@ message QbNode {
         QbScan scan = 1;
         QbJoin join = 2;
         QbAggregate aggregate = 3;
+        QbTupleFilterNode filter = 4;
     }
 }
 
 message QbOutputExpr {
-    // Output column: either a group-key ordinal / aggregate ordinal from the
-    // aggregate node, or (for non-aggregated blocks) a base column.
-    enum Source { GROUP = 0; AGG = 1; COLUMN = 2; }
+    // Output column: a group-key ordinal / aggregate ordinal from the
+    // aggregate node, a base column (non-aggregated blocks), or an
+    // arithmetic expression over aggregate results (q8/q14's SUM ratios).
+    enum Source { GROUP = 0; AGG = 1; COLUMN = 2; EXPR = 3; }
     Source source = 1;
     uint32 ordinal = 2;      // GROUP: group_columns idx; AGG: aggs idx
     QbColumnRef column = 3;  // COLUMN source
+    // EXPR: arithmetic FilterExpr where COLUMN_REF ordinals address the
+    // stage-1 value layout [group columns..., aggregates...]. OP_DIV uses
+    // MySQL decimal division (scale = arg scale + 4, round half-even per
+    // my_decimal — validated by the md5 gates), then the result is rounded
+    // to `result_scale`.
+    FilterExpr expr = 4;
+    uint32 result_scale = 5;
 }
 
 message TxExecuteQueryBlock {

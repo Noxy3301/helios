@@ -92,6 +92,16 @@ bool PredicateEvaluator::set_row_from_pax(const LineairDB::Pax::PaxGroup& group,
   return true;
 }
 
+void PredicateEvaluator::set_row_from_views(
+    const std::vector<std::string_view>& cells,
+    const std::vector<bool>& nulls) {
+  columns_.assign(cells.begin(), cells.end());
+  null_flags_.assign((cells.size() + 7) / 8, 0);
+  for (size_t i = 0; i < nulls.size() && i < cells.size(); ++i) {
+    if (nulls[i]) null_flags_[i / 8] |= static_cast<char>(1u << (i % 8));
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Value extraction
 // ---------------------------------------------------------------------------

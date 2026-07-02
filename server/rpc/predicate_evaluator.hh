@@ -35,6 +35,11 @@ class PredicateEvaluator {
   bool set_row_from_pax(const LineairDB::Pax::PaxGroup& group, uint32_t slot,
                         uint32_t num_columns);
 
+  // Synthesized-row variant for joined tuples: columns_[i] = cells[i];
+  // nulls[i] marks SQL NULL (e.g. a LEFT-join miss).
+  void set_row_from_views(const std::vector<std::string_view>& cells,
+                          const std::vector<bool>& nulls);
+
   // Recursively evaluate a FilterExpr tree against the parsed row.
   // Returns true if the row satisfies the predicate.
   bool evaluate(const LineairDB::Protocol::FilterExpr& expr) const;
