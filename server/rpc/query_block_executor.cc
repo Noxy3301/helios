@@ -1136,6 +1136,88 @@ struct Executor {
         }
     }
 
+    // Row-returning blocks (q2/q15/q20): emit output columns straight from
+    // the final tuple set, then sort/limit.
+    bool RunEmitRows(const NodeResult& in,
+                     pb::TxExecuteQueryBlock::Response* response) {
+        struct OutRow {
+            std::vector<std::string> vals;
+            std::vector<bool> nulls;
+        };
+        std::vector<OutRow> rows;
+        rows.reserve(in.rows());
+        std::vector<int> pos(req.output_size(), -1);
+        for (int i = 0; i < req.output_size(); ++i) {
+            const auto& oe = req.output(i);
+            if (oe.source() != pb::QbOutputExpr::COLUMN)
+                return fail("row output source");
+            pos[i] = in.table_pos(oe.column().table_idx());
+            if (pos[i] < 0) return fail("row output table");
+        }
+        for (size_t r = 0; r < in.rows(); ++r) {
+            OutRow row;
+            row.vals.reserve(req.output_size());
+            row.nulls.reserve(req.output_size());
+            for (int i = 0; i < req.output_size(); ++i) {
+                const auto& oe = req.output(i);
+                const uint64_t ref = in.refs[pos[i]][r];
+                if (ref == kNullRef ||
+                    null_of(oe.column().table_idx(), ref,
+                            oe.column().column())) {
+                    row.vals.emplace_back();
+                    row.nulls.push_back(true);
+                    continue;
+                }
+                std::string_view v = value_of(oe.column().table_idx(), ref,
+                                              oe.column().column());
+                if (oe.column().prefix_len() > 0 &&
+                    v.size() > oe.column().prefix_len())
+                    v = v.substr(0, oe.column().prefix_len());
+                row.vals.emplace_back(v);
+                row.nulls.push_back(v.empty());
+            }
+            rows.push_back(std::move(row));
+        }
+
+        if (req.order_by_size() > 0) {
+            std::sort(rows.begin(), rows.end(), [&](const OutRow& a,
+                                                    const OutRow& b) {
+                for (const auto& k : req.order_by()) {
+                    const uint32_t o = k.output_ordinal();
+                    const bool an = a.nulls[o];
+                    const bool bn = b.nulls[o];
+                    if (an != bn) return k.descending() ? bn : an;
+                    if (an) continue;
+                    int c;
+                    if (k.cmp_kind() == 1) {
+                        c = a.vals[o].compare(b.vals[o]);
+                    } else {
+                        Dec da = dec_parse(a.vals[o]);
+                        Dec db = dec_parse(b.vals[o]);
+                        Dec diff = da;
+                        dec_addsub(diff, db, true);
+                        c = diff.m < 0 ? -1 : (diff.m > 0 ? 1 : 0);
+                    }
+                    if (c != 0) return k.descending() ? c > 0 : c < 0;
+                }
+                return false;
+            });
+        }
+        size_t begin = std::min<size_t>(req.offset(), rows.size());
+        size_t end = req.limit() > 0
+                         ? std::min<size_t>(begin + req.limit(), rows.size())
+                         : rows.size();
+        std::string rowbuf;
+        for (size_t r = begin; r < end; ++r) {
+            rowbuf.clear();
+            emit_field(rowbuf, {}, true);
+            for (size_t c = 0; c < rows[r].vals.size(); ++c)
+                emit_field(rowbuf, rows[r].vals[c], rows[r].nulls[c]);
+            response->add_rows(rowbuf);
+        }
+        return true;
+    }
+
     bool RunAggregateAndEmit(const pb::QbAggregate& agg,
                              pb::TxExecuteQueryBlock::Response* response) {
         const NodeResult& in = results[agg.input()];
@@ -1411,8 +1493,12 @@ struct Executor {
                 return fail("unknown node");
             }
         }
-        if (final_agg == nullptr) return fail("root must aggregate (B0)");
-        if (!RunAggregateAndEmit(*final_agg, response)) return false;
+        if (final_agg == nullptr) {
+            if (!RunEmitRows(results[req.nodes_size() - 1], response))
+                return false;
+        } else if (!RunAggregateAndEmit(*final_agg, response)) {
+            return false;
+        }
         if (!Quiesced()) return fail("concurrent modification");
         return true;
     }
