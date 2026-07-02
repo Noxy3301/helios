@@ -22,6 +22,12 @@ echo "== [2/4] postload 23-index set =="
 time "$MYSQL" -u root --socket=$SOCK benchbase \
   < "$ROOT/third_party/benchbase/src/main/resources/benchmarks/tpch/postload-mysql.sql"
 
+echo "== [2.5/4] secondary engine attach + load =="
+for T in region nation supplier customer part partsupp orders lineitem; do
+  "$MYSQL" -u root --socket=$SOCK benchbase -e "ALTER TABLE $T SECONDARY_ENGINE='LINEAIRDB_COLUMNAR';" 2>/dev/null || true
+  "$MYSQL" -u root --socket=$SOCK benchbase -e "ALTER TABLE $T SECONDARY_LOAD;"
+done
+
 echo "== [3/4] ANALYZE =="
 "$MYSQL" -u root --socket=$SOCK benchbase \
   -e "ANALYZE TABLE customer, lineitem, nation, orders, part, partsupp, region, supplier;" >/dev/null

@@ -281,6 +281,272 @@ static int single_table_of(table_map used,
   return found;
 }
 
+// q13 shape: SELECT g, COUNT(*) FROM (SELECT k, COUNT(x) FROM a LEFT JOIN b
+// ON a.k=b.k AND <b filter> GROUP BY k) d GROUP BY g ORDER BY ... — a
+// derived-table double aggregation. The inner block becomes scan+scan+LEFT
+// join+aggregate; the outer becomes the aggregate's second stage.
+bool recognize_double_aggregate(THD *thd, JOIN *join, Query_block *qb,
+                                Columnar_execution_context *ctx,
+                                const char **why) {
+#define LDB_COL_REJECT(reason) \
+  do {                         \
+    *why = (reason);           \
+    return false;              \
+  } while (0)
+  Table_ref *dt = qb->leaf_tables;
+  Query_expression *inner_unit = dt->derived_query_expression();
+  if (inner_unit == nullptr || !inner_unit->is_simple())
+    LDB_COL_REJECT("derived not simple");
+  Query_block *iqb = inner_unit->first_query_block();
+  if (iqb == nullptr) LDB_COL_REJECT("no inner block");
+
+  // Outer block restrictions.
+  if (join->having_cond != nullptr || join->select_distinct ||
+      qb->m_windows.elements > 0 ||
+      join->rollup_state != JOIN::RollupState::NONE)
+    LDB_COL_REJECT("outer shape");
+  if (qb->where_cond() != nullptr) LDB_COL_REJECT("outer WHERE");
+  if (qb->group_list.elements == 0) LDB_COL_REJECT("outer not grouped");
+
+  // Inner block: two base tables, one LEFT-joined, single-column GROUP BY.
+  if (iqb->where_cond() != nullptr) LDB_COL_REJECT("inner WHERE");
+  if (iqb->order_list.elements > 0 || iqb->has_limit())
+    LDB_COL_REJECT("inner order/limit");
+  Table_ref *t1 = iqb->leaf_tables;
+  Table_ref *t2 = t1 != nullptr ? t1->next_leaf : nullptr;
+  if (t1 == nullptr || t2 == nullptr || t2->next_leaf != nullptr)
+    LDB_COL_REJECT("inner not two tables");
+  Table_ref *outer_tl = t1->outer_join ? t1 : (t2->outer_join ? t2 : nullptr);
+  Table_ref *inner_tl = outer_tl == t1 ? t2 : t1;
+  if (outer_tl == nullptr || inner_tl->outer_join)
+    LDB_COL_REJECT("inner join shape");
+  for (Table_ref *tl : {t1, t2}) {
+    if (tl->table == nullptr || tl->table->s == nullptr)
+      LDB_COL_REJECT("inner no TABLE");
+    if (!loaded_tables->contains(tl->table->s->db.str,
+                                 tl->table->s->table_name.str))
+      LDB_COL_REJECT("inner not loaded");
+  }
+  TABLE *probe_t = inner_tl->table;   // row-preserving side
+  TABLE *build_t = outer_tl->table;   // nullable side
+
+  // ON condition: equi keys + build-side-only filters.
+  Item *on_cond = outer_tl->join_cond();
+  if (on_cond == nullptr) LDB_COL_REJECT("no ON");
+  std::vector<Item *> conjuncts;
+  flatten_and(on_cond, &conjuncts);
+  const Field *probe_key = nullptr;
+  const Field *build_key = nullptr;
+  std::vector<Item *> build_filters;
+  for (Item *c : conjuncts) {
+    const table_map used = c->used_tables() & ~PSEUDO_TABLE_BITS;
+    if (used == outer_tl->map()) {
+      build_filters.push_back(c);
+      continue;
+    }
+    if (c->type() != Item::FUNC_ITEM ||
+        down_cast<Item_func *>(c)->functype() != Item_func::EQ_FUNC)
+      LDB_COL_REJECT("ON not equi");
+    auto *eq = down_cast<Item_func *>(c);
+    Item *a = eq->arguments()[0]->real_item();
+    Item *b = eq->arguments()[1]->real_item();
+    if (a->type() != Item::FIELD_ITEM || b->type() != Item::FIELD_ITEM)
+      LDB_COL_REJECT("ON key shape");
+    const Field *fa = down_cast<Item_field *>(a)->field;
+    const Field *fb = down_cast<Item_field *>(b)->field;
+    if (probe_key != nullptr) LDB_COL_REJECT("multiple ON keys");
+    if (fa->table == probe_t && fb->table == build_t) {
+      probe_key = fa;
+      build_key = fb;
+    } else if (fa->table == build_t && fb->table == probe_t) {
+      probe_key = fb;
+      build_key = fa;
+    } else {
+      LDB_COL_REJECT("ON key tables");
+    }
+    if (probe_key->result_type() != INT_RESULT ||
+        build_key->result_type() != INT_RESULT)
+      LDB_COL_REJECT("ON key type");
+  }
+  if (probe_key == nullptr) LDB_COL_REJECT("no ON key");
+
+  // Inner GROUP BY: one non-nullable probe-side column.
+  if (iqb->group_list.elements != 1) LDB_COL_REJECT("inner group arity");
+  Item *gi = (*iqb->group_list.first->item)->real_item();
+  if (gi->type() != Item::FIELD_ITEM) LDB_COL_REJECT("inner group shape");
+  const Field *gf = down_cast<Item_field *>(gi)->field;
+  if (gf->table != probe_t || gf->is_nullable())
+    LDB_COL_REJECT("inner group column");
+
+  // Inner output: [group column, COUNT(build column|*)] in some order.
+  // Map inner visible position -> stage-1 value ordinal (0 = group,
+  // 1 = the count).
+  std::vector<Item *> inner_out;
+  for (Item *item : VisibleFields(iqb->fields)) inner_out.push_back(item);
+  if (inner_out.size() != 2) LDB_COL_REJECT("inner output arity");
+  std::vector<int> stage1_ordinal(2, -1);
+  bool have_count = false;
+  const Field *count_arg_field = nullptr;
+  for (size_t i = 0; i < inner_out.size(); ++i) {
+    Item *real = inner_out[i]->real_item();
+    if (real->type() == Item::FIELD_ITEM &&
+        down_cast<Item_field *>(real)->field == gf) {
+      stage1_ordinal[i] = 0;
+      continue;
+    }
+    if (real->type() != Item::SUM_FUNC_ITEM)
+      LDB_COL_REJECT("inner output shape");
+    Item_sum *sum = down_cast<Item_sum *>(real);
+    if (sum->sum_func() != Item_sum::COUNT_FUNC ||
+        sum->argument_count() != 1)
+      LDB_COL_REJECT("inner agg not count");
+    Item *arg = sum->get_arg(0)->real_item();
+    if (!arg->const_item()) {
+      if (arg->type() != Item::FIELD_ITEM) LDB_COL_REJECT("count arg");
+      const Field *cf = down_cast<Item_field *>(arg)->field;
+      if (cf->table != build_t || cf->is_nullable())
+        LDB_COL_REJECT("count arg column");
+      count_arg_field = cf;
+    }
+    have_count = true;
+    stage1_ordinal[i] = 1;
+  }
+  if (!have_count) LDB_COL_REJECT("inner no count");
+
+  // Build the IR.
+  auto &req = ctx->qb_request;
+  req.Clear();
+  req.add_tables()->set_table_name(probe_t->s->normalized_path.str);  // 0
+  req.add_tables()->set_table_name(build_t->s->normalized_path.str);  // 1
+  auto *scan_p = req.add_nodes()->mutable_scan();   // node 0
+  scan_p->set_table_idx(0);
+  auto *scan_b = req.add_nodes()->mutable_scan();   // node 1
+  scan_b->set_table_idx(1);
+  if (!build_filters.empty()) {
+    auto *pred = scan_b->mutable_filter();
+    pred->set_num_columns(build_t->s->fields);
+    if (build_filters.size() == 1) {
+      if (!serialize_item(build_filters[0], pred->mutable_expr()))
+        LDB_COL_REJECT("ON filter not pushable");
+    } else {
+      auto *root = pred->mutable_expr();
+      root->set_op(LineairDB::Protocol::FilterExpr::OP_AND);
+      for (Item *c : build_filters)
+        if (!serialize_item(c, root->add_children()))
+          LDB_COL_REJECT("ON filter not pushable");
+    }
+  }
+  auto *jn = req.add_nodes()->mutable_join();       // node 2
+  jn->set_type(LineairDB::Protocol::QbJoin::LEFT);
+  jn->set_build(1);
+  jn->set_probe(0);
+  auto *bk = jn->add_build_keys();
+  bk->set_table_idx(1);
+  bk->set_column(build_key->field_index());
+  auto *pkk = jn->add_probe_keys();
+  pkk->set_table_idx(0);
+  pkk->set_column(probe_key->field_index());
+  auto *agg = req.add_nodes()->mutable_aggregate(); // node 3
+  agg->set_input(2);
+  auto *gc = agg->add_group_columns();
+  gc->set_table_idx(0);
+  gc->set_column(gf->field_index());
+  gc->set_cmp_kind(gf->result_type() == INT_RESULT ? 0 : 1);
+  auto *af = agg->add_aggs();
+  af->set_kind(LineairDB::Protocol::QbAggFunc::COUNT);
+  af->set_arg_table(1);  // count matches on the nullable side
+  if (count_arg_field != nullptr) {
+    af->mutable_arg()->set_op(LineairDB::Protocol::FilterExpr::COLUMN_REF);
+    af->mutable_arg()->set_column_index(count_arg_field->field_index());
+  }
+  if (count_arg_field == nullptr) {
+    // COUNT(*) over the joined row would count no-match rows too; require
+    // a build-side argument for LEFT semantics.
+    LDB_COL_REJECT("inner count(*) under LEFT");
+  }
+
+  // Outer block: GROUP BY derived columns + COUNT(*).
+  auto *second = agg->mutable_second();
+  second->set_count_star(true);
+  std::vector<Item *> out_items;
+  for (Item *item : VisibleFields(qb->fields)) out_items.push_back(item);
+  // Outer group ordinals in second-stage layout.
+  std::vector<int> outer_group_pos;  // second-stage group slot per group item
+  for (ORDER *g = qb->group_list.first; g != nullptr; g = g->next) {
+    Item *ogi = (*g->item)->real_item();
+    if (ogi->type() != Item::FIELD_ITEM) LDB_COL_REJECT("outer group shape");
+    const Field *ogf = down_cast<Item_field *>(ogi)->field;
+    if (ogf->table != dt->table) LDB_COL_REJECT("outer group table");
+    const uint32_t inner_pos = ogf->field_index();
+    if (inner_pos >= stage1_ordinal.size() || stage1_ordinal[inner_pos] < 0)
+      LDB_COL_REJECT("outer group mapping");
+    second->add_group_value_ordinals(stage1_ordinal[inner_pos]);
+    outer_group_pos.push_back(second->group_value_ordinals_size() - 1);
+  }
+  // Outer outputs.
+  int emitted_group = 0;
+  for (Item *item : out_items) {
+    Item *real = item->real_item();
+    auto *oe = req.add_output();
+    if (real->type() == Item::FIELD_ITEM) {
+      const Field *of = down_cast<Item_field *>(real)->field;
+      if (of->table != dt->table) LDB_COL_REJECT("outer output table");
+      const uint32_t inner_pos = of->field_index();
+      // Find which second-stage group slot carries this value.
+      int slot = -1;
+      int gidx = 0;
+      for (ORDER *g = qb->group_list.first; g != nullptr;
+           g = g->next, ++gidx) {
+        Item *ogi = (*g->item)->real_item();
+        if (ogi->type() == Item::FIELD_ITEM &&
+            down_cast<Item_field *>(ogi)->field == of) {
+          slot = outer_group_pos[gidx];
+          break;
+        }
+      }
+      if (slot < 0) LDB_COL_REJECT("outer output not grouped");
+      oe->set_source(LineairDB::Protocol::QbOutputExpr::GROUP);
+      oe->set_ordinal(slot);
+      emitted_group++;
+      continue;
+    }
+    if (real->type() != Item::SUM_FUNC_ITEM)
+      LDB_COL_REJECT("outer output shape");
+    Item_sum *sum = down_cast<Item_sum *>(real);
+    if (sum->sum_func() != Item_sum::COUNT_FUNC)
+      LDB_COL_REJECT("outer agg not count");
+    oe->set_source(LineairDB::Protocol::QbOutputExpr::AGG);
+    oe->set_ordinal(0);
+  }
+
+  // Outer ORDER BY / LIMIT.
+  for (ORDER *o = qb->order_list.first; o != nullptr; o = o->next) {
+    const int ord = order_output_ordinal(*o->item, out_items);
+    if (ord < 0) LDB_COL_REJECT("outer ORDER BY");
+    auto *k = req.add_order_by();
+    k->set_output_ordinal(ord);
+    k->set_descending(o->direction == ORDER_DESC);
+    Item *oi = out_items[ord]->real_item();
+    k->set_cmp_kind(oi->result_type() == STRING_RESULT ? 1 : 0);
+  }
+  Query_expression *unit = qb->master_query_expression();
+  if (qb->has_limit()) {
+    if (unit->select_limit_cnt != HA_POS_ERROR)
+      req.set_limit(unit->select_limit_cnt);
+    if (unit->offset_limit_cnt > 0) {
+      req.set_offset(unit->offset_limit_cnt);
+      if (req.limit() > 0) req.set_limit(req.limit() - unit->offset_limit_cnt);
+    }
+  }
+
+  (void)thd;
+  (void)join;
+  ctx->plan_ready = true;
+  *why = nullptr;
+  return true;
+#undef LDB_COL_REJECT
+}
+
 // Returns true and fills ctx->qb_request when this JOIN is an offloadable
 // query block: N inner-joined base tables + aggregation (+ORDER BY/LIMIT).
 // Never raises errors — a false return means "primary runs it".
@@ -297,6 +563,10 @@ bool recognize_query_block(THD *thd, JOIN *join,
     LDB_COL_REJECT("not top-level");
   Query_expression *unit = qb->master_query_expression();
   if (unit == nullptr || !unit->is_simple()) LDB_COL_REJECT("not simple unit");
+  if (qb->leaf_tables != nullptr && qb->leaf_tables->next_leaf == nullptr &&
+      qb->leaf_tables->is_view_or_derived()) {
+    return recognize_double_aggregate(thd, join, qb, ctx, why);
+  }
   if (join->having_cond != nullptr) LDB_COL_REJECT("has HAVING");
   if (join->select_distinct) LDB_COL_REJECT("has DISTINCT");
   if (qb->m_windows.elements > 0) LDB_COL_REJECT("has windows");
@@ -403,33 +673,30 @@ bool recognize_query_block(THD *thd, JOIN *join,
     }
   }
 
-  // Greedy join tree: drive from the largest table; repeatedly hash-join
-  // the smallest connected remaining table as the build side.
+  // Join tree in FROM-clause order (leaf_tables): each next table
+  // hash-joins against the accumulated result. TPC-H FROM clauses list
+  // chained tables, so every step joins on a real edge; a records-greedy
+  // order can pick a low-selectivity edge first (e.g. nationkey) and blow
+  // up the intermediate result. The server additionally swaps build/probe
+  // per INNER join by actual size and caps intermediate cardinality.
+  std::vector<int> join_order;
+  for (size_t i = 0; i < n_tabs; ++i) join_order.push_back(static_cast<int>(i));
+
   int current_node;
   std::vector<bool> joined(n_tabs, false);
   {
-    size_t driver = 0;
-    for (size_t i = 1; i < n_tabs; ++i)
-      if (tabs[i].records > tabs[driver].records) driver = i;
-    joined[driver] = true;
-    current_node = scan_node_of[driver];
-    size_t remaining = n_tabs - 1;
-    while (remaining > 0) {
-      int pick = -1;
-      for (size_t i = 0; i < n_tabs; ++i) {
-        if (joined[i]) continue;
-        bool connected = false;
-        for (const auto &e : edges)
-          if ((e.t1 == static_cast<int>(i) && joined[e.t2]) ||
-              (e.t2 == static_cast<int>(i) && joined[e.t1])) {
-            connected = true;
-            break;
-          }
-        if (!connected) continue;
-        if (pick < 0 || tabs[i].records < tabs[pick].records)
-          pick = static_cast<int>(i);
-      }
-      if (pick < 0) LDB_COL_REJECT("disconnected join graph");
+    joined[join_order[0]] = true;
+    current_node = scan_node_of[join_order[0]];
+    for (size_t oi = 1; oi < join_order.size(); ++oi) {
+      const int pick = join_order[oi];
+      bool connected = false;
+      for (const auto &e : edges)
+        if ((e.t1 == pick && joined[e.t2]) ||
+            (e.t2 == pick && joined[e.t1])) {
+          connected = true;
+          break;
+        }
+      if (!connected) LDB_COL_REJECT("disconnected join graph");
       auto *node = req.add_nodes();
       auto *jn = node->mutable_join();
       jn->set_type(LineairDB::Protocol::QbJoin::INNER);
@@ -459,7 +726,6 @@ bool recognize_query_block(THD *thd, JOIN *join,
       }
       joined[pick] = true;
       current_node = req.nodes_size() - 1;
-      remaining--;
     }
   }
 
@@ -537,6 +803,9 @@ bool recognize_query_block(THD *thd, JOIN *join,
           if (cf == nullptr || cf->is_nullable())
             LDB_COL_REJECT("COUNT arg nullable");
           af->set_arg_table(ti);
+          af->mutable_arg()->set_op(
+              LineairDB::Protocol::FilterExpr::COLUMN_REF);
+          af->mutable_arg()->set_column_index(cf->field_index());
         }
         af->set_kind(LineairDB::Protocol::QbAggFunc::COUNT);
         break;

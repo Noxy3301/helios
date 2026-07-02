@@ -737,6 +737,16 @@ message QbAggregate {
     repeated QbColumnRef group_columns = 2; // byte-equality grouping
     repeated QbAggFunc aggs = 3;
     PushedPredicate having = 4;             // over emitted group row (agg idx via num_columns marker semantics)
+    // Second-stage re-aggregation (q13 shape): re-group this aggregate's
+    // rows by stage-1 value ordinals (0..n_grp-1 = group columns,
+    // n_grp.. = aggregates) and COUNT(*) per group. When present, the
+    // block's output ordinals refer to the second stage's layout:
+    // GROUP ordinal i = group_value_ordinals[i], AGG 0 = the count.
+    message SecondStage {
+        repeated uint32 group_value_ordinals = 1;
+        bool count_star = 2;
+    }
+    SecondStage second = 5;
 }
 
 message QbSortKey {

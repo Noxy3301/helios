@@ -353,8 +353,17 @@ struct Executor {
     bool RunJoin(const pb::QbJoin& join, NodeResult* out) {
         if (join.build() >= results.size() || join.probe() >= results.size())
             return fail("join child out of range");
-        const NodeResult& build = results[join.build()];
-        const NodeResult& probe = results[join.probe()];
+        // INNER is symmetric: hash the smaller side regardless of what the
+        // plan called build/probe.
+        const bool swap =
+            join.type() == pb::QbJoin::INNER &&
+            results[join.build()].rows() > results[join.probe()].rows();
+        const NodeResult& build = results[swap ? join.probe() : join.build()];
+        const NodeResult& probe = results[swap ? join.build() : join.probe()];
+        const auto& build_key_refs =
+            swap ? join.probe_keys() : join.build_keys();
+        const auto& probe_key_refs =
+            swap ? join.build_keys() : join.probe_keys();
         if (join.build_keys_size() != join.probe_keys_size() ||
             join.build_keys_size() == 0)
             return fail("join key arity");
@@ -365,15 +374,15 @@ struct Executor {
             uint32_t column;
             const PaxStore* store;
         };
-        std::vector<KeyCol> bk(join.build_keys_size()), pk(join.probe_keys_size());
-        for (int i = 0; i < join.build_keys_size(); ++i) {
-            const auto& c = join.build_keys(i);
+        std::vector<KeyCol> bk(build_key_refs.size()), pk(probe_key_refs.size());
+        for (int i = 0; i < build_key_refs.size(); ++i) {
+            const auto& c = build_key_refs.Get(i);
             const int pos = build.table_pos(c.table_idx());
             if (pos < 0) return fail("build key table not in child");
             bk[i] = {pos, c.column(), stores[c.table_idx()]};
         }
-        for (int i = 0; i < join.probe_keys_size(); ++i) {
-            const auto& c = join.probe_keys(i);
+        for (int i = 0; i < probe_key_refs.size(); ++i) {
+            const auto& c = probe_key_refs.Get(i);
             const int pos = probe.table_pos(c.table_idx());
             if (pos < 0) return fail("probe key table not in child");
             pk[i] = {pos, c.column(), stores[c.table_idx()]};
@@ -486,6 +495,10 @@ struct Executor {
         for (auto& t : pool) t.join();
         size_t total = 0;
         for (auto& ch : chunks) total += ch.refs.empty() ? 0 : ch.refs[0].size();
+        // Fan-out safety valve: a blown-up intermediate means the join
+        // order was wrong for this shape — fail and let the primary run it.
+        if (total > (size_t{64} << 20))
+            return fail("join intermediate too large");
         for (size_t c = 0; c < out->refs.size(); ++c) {
             out->refs[c].reserve(total);
             for (auto& ch : chunks)
@@ -768,6 +781,74 @@ struct Executor {
             std::vector<bool> nulls;
         };
         std::vector<OutRow> rows;
+        if (agg.has_second()) {
+            // Second-stage re-aggregation (q13 shape): re-group stage-1
+            // values and COUNT(*) per group. Stage-1 value ordinal space:
+            // [group columns..., aggregates...].
+            if (!agg.second().count_star())
+                return fail("second stage must count");
+            std::unordered_map<std::string, uint64_t> second;
+            std::string key;
+            std::vector<std::string> kvals;
+            for (auto& kv : groups) {
+                GroupState& gs = kv.second;
+                key.clear();
+                kvals.clear();
+                for (uint32_t ord : agg.second().group_value_ordinals()) {
+                    std::string v;
+                    bool is_null = false;
+                    if (ord < static_cast<uint32_t>(n_grp)) {
+                        v = gs.key_cols[ord];
+                    } else {
+                        const int a = static_cast<int>(ord) - n_grp;
+                        if (a >= agg.aggs_size())
+                            return fail("second stage ordinal");
+                        v = AggValue(agg.aggs(a), gs, a, &is_null);
+                    }
+                    const uint32_t l = static_cast<uint32_t>(v.size());
+                    key.append(reinterpret_cast<const char*>(&l), sizeof(l));
+                    key.append(v);
+                    kvals.push_back(std::move(v));
+                }
+                auto ins = second.emplace(key, 0);
+                ins.first->second += 1;
+            }
+            rows.reserve(second.size());
+            for (auto& kv : second) {
+                // Re-split the composite key back into values.
+                OutRow row;
+                std::vector<std::string> gvals;
+                {
+                    const std::string& k = kv.first;
+                    size_t off = 0;
+                    while (off + 4 <= k.size()) {
+                        uint32_t l;
+                        std::memcpy(&l, k.data() + off, 4);
+                        off += 4;
+                        gvals.emplace_back(k.data() + off, l);
+                        off += l;
+                    }
+                }
+                for (const auto& oe : req.output()) {
+                    switch (oe.source()) {
+                        case pb::QbOutputExpr::GROUP:
+                            if (oe.ordinal() >= gvals.size())
+                                return fail("second output ordinal");
+                            row.vals.push_back(gvals[oe.ordinal()]);
+                            row.nulls.push_back(false);
+                            break;
+                        case pb::QbOutputExpr::AGG:
+                            row.vals.push_back(
+                                std::to_string(kv.second));
+                            row.nulls.push_back(false);
+                            break;
+                        default:
+                            return fail("second output source");
+                    }
+                }
+                rows.push_back(std::move(row));
+            }
+        } else {
         rows.reserve(groups.size());
         for (auto& kv : groups) {
             GroupState& gs = kv.second;
@@ -801,6 +882,7 @@ struct Executor {
                 }
             }
             rows.push_back(std::move(row));
+        }
         }
 
         // ORDER BY over output ordinals.
@@ -888,7 +970,15 @@ void ExecuteQueryBlock(
     const pb::TxExecuteQueryBlock::Request& request,
     pb::TxExecuteQueryBlock::Response* response) {
     Executor ex{db, request, {}, {}, {}, {}};
-    if (!ex.Run(response)) {
+    bool ok = false;
+    try {
+        ok = ex.Run(response);
+    } catch (const std::exception& e) {
+        ex.error = e.what();
+    } catch (...) {
+        ex.error = "query block execution failed";
+    }
+    if (!ok) {
         response->set_ok(false);
         response->set_error(ex.error.empty() ? "query block failed"
                                              : ex.error);
