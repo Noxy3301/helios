@@ -2452,8 +2452,13 @@ void LineairDBRpc::handleTxExecuteQueryBlock(const std::string& message,
     LineairDB::Protocol::TxExecuteQueryBlock::Request request;
     LineairDB::Protocol::TxExecuteQueryBlock::Response response;
     request.ParseFromString(message);
+    fprintf(stderr, "[QB] enter nodes=%d tables=%d\n", request.nodes_size(),
+            request.tables_size());
     qb::ExecuteQueryBlock(db_manager_->get_database().get(), request,
                           &response);
+    fprintf(stderr, "[QB] exit ok=%d err='%s' rows=%d\n",
+            (int)response.ok(), response.error().c_str(),
+            response.rows_size());
     db_manager_->get_database()->ReleaseMasstreeThreadEpoch();
     result = response.SerializeAsString();
 }

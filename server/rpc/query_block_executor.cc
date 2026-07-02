@@ -871,6 +871,8 @@ struct Executor {
                     apos[a] >= 0 ? in.refs[apos[a]][r] : 0;
                 if (apos[a] >= 0 && ref == kNullRef) continue;  // LEFT null
                 if (af.has_filter() && af.filter().has_expr()) {
+                    if (is_virtual(af.filter_table()))
+                        return fail("agg filter on virtual table");
                     const uint64_t fref = in.refs[fpos[a]][r];
                     if (fref == kNullRef) continue;
                     const PaxStore* st = stores[af.filter_table()];
@@ -883,6 +885,9 @@ struct Executor {
                         return fail("agg filter unevaluable");
                     if (!ev.evaluate(af.filter().expr())) continue;
                 }
+                // Virtual-table aggregate arguments (one-row derived
+                // scalars, q11): read through value_of, not stores[].
+                const bool arg_virtual = is_virtual(af.arg_table());
                 switch (af.kind()) {
                     case pb::QbAggFunc::COUNT:
                         if (af.distinct()) {
@@ -897,9 +902,14 @@ struct Executor {
                         break;
                     case pb::QbAggFunc::SUM:
                     case pb::QbAggFunc::AVG: {
-                        Dec v = eval_arith(af.arg(),
-                                           stores[af.arg_table()], ref,
-                                           &arith_ctx);
+                        Dec v =
+                            arg_virtual
+                                ? dec_parse(value_of(
+                                      af.arg_table(), ref,
+                                      af.arg().column_index()))
+                                : eval_arith(af.arg(),
+                                             stores[af.arg_table()], ref,
+                                             &arith_ctx);
                         if (v.null) break;  // NULL input skipped
                         if (gs->count[a] == 0)
                             gs->acc[a] = v;
@@ -913,8 +923,8 @@ struct Executor {
                         const bool want_max =
                             af.kind() == pb::QbAggFunc::MAX;
                         if (af.cmp_kind() == 1) {
-                            std::string_view cv = cell_of(
-                                stores[af.arg_table()], ref,
+                            std::string_view cv = value_of(
+                                af.arg_table(), ref,
                                 af.arg().column_index());
                             if (cv.empty()) break;
                             if (!gs->has[a] ||
@@ -923,8 +933,13 @@ struct Executor {
                                 gs->sval[a] = std::string(cv);
                             gs->has[a] = true;
                         } else {
-                            Dec v = eval_arith(af.arg(),
-                                               stores[af.arg_table()], ref);
+                            Dec v = arg_virtual
+                                        ? dec_parse(value_of(
+                                              af.arg_table(), ref,
+                                              af.arg().column_index()))
+                                        : eval_arith(af.arg(),
+                                                     stores[af.arg_table()],
+                                                     ref);
                             if (v.null) break;
                             if (!gs->has[a]) {
                                 gs->acc[a] = v;

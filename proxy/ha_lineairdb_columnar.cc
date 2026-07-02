@@ -1131,6 +1131,11 @@ bool build_block(THD *thd, Query_block *qb,
   std::vector<Item *> tuple_conjuncts;  // cross-table non-equi (q7/q19 ORs)
   {
     Item *where_cond = qb->where_cond();
+    if (getenv("LDBC_DIAG") != nullptr && where_cond != nullptr) {
+      String str;
+      where_cond->print(thd, &str, QT_ORDINARY);
+      fprintf(stderr, "[LDBC] WHERE: %.600s\n", str.c_ptr_safe());
+    }
     std::vector<Item *> conjuncts;
     flatten_and(where_cond, &conjuncts);
     for (Item *c : conjuncts) {
@@ -1144,6 +1149,35 @@ bool build_block(THD *thd, Query_block *qb,
         // Virtual (derived) tables have no scan to push into; evaluate
         // after the joins (q21's IS NULL anti test).
         tuple_conjuncts.push_back(c);
+        continue;
+      }
+      // Multiple equalities (Item_equal, e.g. l1.l_orderkey = o_orderkey
+      // = l2.l_orderkey in q21): expand to pairwise integer edges between
+      // non-nest tables. Pairs involving nest tables are already carried
+      // by sj_outer/inner_exprs.
+      if (c->type() == Item::FUNC_ITEM &&
+          down_cast<Item_func *>(c)->functype() ==
+              Item_func::MULT_EQUAL_FUNC) {
+        auto *meq = down_cast<Item_equal *>(c);
+        if (meq->const_arg() != nullptr)
+          LDB_COL_REJECT("multiple equality with constant");
+        std::vector<const Field *> flds;
+        for (Item_field &fi : meq->get_fields()) flds.push_back(fi.field);
+        for (size_t a = 0; a < flds.size(); ++a) {
+          for (size_t b = a + 1; b < flds.size(); ++b) {
+            const int ta = table_index_of_field(flds[a]);
+            const int tb = table_index_of_field(flds[b]);
+            if (ta < 0 || tb < 0 || ta == tb) continue;
+            if (tab_nest[ta] >= 0 || tab_nest[tb] >= 0) continue;
+            if (flds[a]->result_type() != INT_RESULT ||
+                flds[b]->result_type() != INT_RESULT)
+              continue;
+            const Field *rfa = resolve_in(flds[a], ta);
+            const Field *rfb = resolve_in(flds[b], tb);
+            if (rfa == nullptr || rfb == nullptr) continue;
+            edges.push_back({ta, tb, rfa, rfb});
+          }
+        }
         continue;
       }
       // Conjuncts touching a semijoin-nest table: outer x inner
@@ -1160,6 +1194,51 @@ bool build_block(THD *thd, Query_block *qb,
         }
         if (multi_nest) LDB_COL_REJECT("conjunct spans nests");
         if (nest >= 0) {
+          // Equality propagation may route a main-table equi edge through
+          // the nest's inner column (q21: o_orderkey = l2.l_orderkey).
+          // Rewrite the inner column to its sj_outer equivalent; if both
+          // sides are then main tables, it is a join edge.
+          if (c->type() == Item::FUNC_ITEM &&
+              down_cast<Item_func *>(c)->functype() == Item_func::EQ_FUNC) {
+            auto *eq2 = down_cast<Item_func *>(c);
+            Item *a2 = eq2->arguments()[0]->real_item();
+            Item *b2 = eq2->arguments()[1]->real_item();
+            if (a2->type() == Item::FIELD_ITEM &&
+                b2->type() == Item::FIELD_ITEM) {
+              const Field *fa2 = down_cast<Item_field *>(a2)->field;
+              const Field *fb2 = down_cast<Item_field *>(b2)->field;
+              const auto &oes = sj_infos[nest].nest->nested_join
+                                    ->sj_outer_exprs;
+              const auto &ies = sj_infos[nest].nest->nested_join
+                                    ->sj_inner_exprs;
+              auto outer_equiv = [&](const Field *f) -> const Field * {
+                for (size_t k = 0; k < ies.size() && k < oes.size(); ++k) {
+                  Item *ii = ies[k]->real_item();
+                  Item *oi = oes[k]->real_item();
+                  if (ii->type() == Item::FIELD_ITEM &&
+                      oi->type() == Item::FIELD_ITEM &&
+                      down_cast<Item_field *>(ii)->field == f)
+                    return down_cast<Item_field *>(oi)->field;
+                }
+                return f;
+              };
+              const Field *ra = outer_equiv(fa2);
+              const Field *rb = outer_equiv(fb2);
+              const int ta = table_index_of_field(ra);
+              const int tb = table_index_of_field(rb);
+              if (ta >= 0 && tb >= 0 && ta != tb && tab_nest[ta] < 0 &&
+                  tab_nest[tb] < 0 && ra->result_type() == INT_RESULT &&
+                  rb->result_type() == INT_RESULT) {
+                const Field *rfa = resolve_in(ra, ta);
+                const Field *rfb = resolve_in(rb, tb);
+                if (rfa != nullptr && rfb != nullptr) {
+                  edges.push_back({ta, tb, rfa, rfb});
+                  continue;  // rewritten to a main edge; not a residual
+                }
+              }
+              if (ta >= 0 && tb >= 0 && ta == tb) continue;  // tautology
+            }
+          }
           sj_infos[nest].residuals.push_back(c);
           continue;
         }
@@ -1373,6 +1452,25 @@ bool build_block(THD *thd, Query_block *qb,
   // Outer-joined derived tables (MySQL's NOT EXISTS / antijoin transform,
   // q21): LEFT join with the ON condition split into equi keys and a
   // per-match residual; the WHERE's IS NULL test runs in the tuple filter.
+  // Nest-inner columns referenced outside their nest (equality propagation)
+  // rewrite to the sj_outer equivalent — the SEMI/ANTI output only carries
+  // probe-side tables.
+  auto nest_outer_equiv = [&](const Field *f) -> const Field * {
+    for (auto &sj : sj_infos) {
+      const auto &oes = sj.nest->nested_join->sj_outer_exprs;
+      const auto &ies = sj.nest->nested_join->sj_inner_exprs;
+      for (size_t k = 0; k < ies.size() && k < oes.size(); ++k) {
+        Item *ii = ies[k]->real_item();
+        Item *oi = oes[k]->real_item();
+        if (ii->type() == Item::FIELD_ITEM &&
+            oi->type() == Item::FIELD_ITEM &&
+            down_cast<Item_field *>(ii)->field == f)
+          return down_cast<Item_field *>(oi)->field;
+      }
+    }
+    return f;
+  };
+
   for (int vt : left_deriveds) {
     Table_ref *tl = tabs[vt].tl;
     Item *on_cond = tl->join_cond();
@@ -1392,8 +1490,10 @@ bool build_block(THD *thd, Query_block *qb,
         Item *a = eq->arguments()[0]->real_item();
         Item *b = eq->arguments()[1]->real_item();
         if (a->type() == Item::FIELD_ITEM && b->type() == Item::FIELD_ITEM) {
-          const Field *fa = down_cast<Item_field *>(a)->field;
-          const Field *fb = down_cast<Item_field *>(b)->field;
+          const Field *fa = nest_outer_equiv(
+              down_cast<Item_field *>(a)->field);
+          const Field *fb = nest_outer_equiv(
+              down_cast<Item_field *>(b)->field);
           int ta = table_index_of_field(fa);
           int tb = table_index_of_field(fb);
           if (ta == vt || tb == vt) {
