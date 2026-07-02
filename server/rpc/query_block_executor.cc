@@ -287,6 +287,37 @@ struct Executor {
     std::vector<std::vector<uint64_t>> wc_snapshots;  // per table, per group
     std::vector<NodeResult> results;          // per node
 
+    // Virtual tables: sub-block results in plan order. Virtual table k has
+    // table_idx = req.tables_size() + k; refs are row numbers.
+    struct VirtualTable {
+        std::vector<std::vector<std::string>> vals;  // [row][col]
+        std::vector<std::vector<bool>> nulls;
+    };
+    std::vector<VirtualTable> virtuals;
+
+    bool is_virtual(uint32_t table_idx) const {
+        return table_idx >= static_cast<uint32_t>(req.tables_size());
+    }
+    // Unified cell access across real PAX tables and virtual tables.
+    std::string_view value_of(uint32_t table_idx, uint64_t ref,
+                              uint32_t column) const {
+        if (!is_virtual(table_idx))
+            return cell_of(stores[table_idx], ref, column);
+        const VirtualTable& vt =
+            virtuals[table_idx - req.tables_size()];
+        if (ref >= vt.vals.size() || column >= vt.vals[ref].size())
+            return {};
+        return vt.vals[ref][column];
+    }
+    bool null_of(uint32_t table_idx, uint64_t ref, uint32_t column) const {
+        if (!is_virtual(table_idx)) return false;  // PAX: empty cell = null
+        const VirtualTable& vt =
+            virtuals[table_idx - req.tables_size()];
+        if (ref >= vt.nulls.size() || column >= vt.nulls[ref].size())
+            return true;
+        return vt.nulls[ref][column];
+    }
+
     unsigned workers() const {
         const unsigned hw = std::thread::hardware_concurrency();
         return std::min<unsigned>(hw ? hw : 8, 32);
@@ -395,6 +426,62 @@ struct Executor {
         return true;
     }
 
+    // ----- Sub-blocks (derived tables) --------------------------------------
+    bool RunSubBlock(const pb::QbSubBlock& sub, NodeResult* out) {
+        pb::TxExecuteQueryBlock::Response resp;
+        ExecuteQueryBlock(db, sub.block(), &resp);
+        if (!resp.ok())
+            return fail(resp.error().empty() ? "sub-block failed"
+                                             : resp.error());
+        VirtualTable vt;
+        vt.vals.reserve(resp.rows_size());
+        vt.nulls.reserve(resp.rows_size());
+        for (const std::string& row : resp.rows()) {
+            // Proxy row format: [null placeholder field][col fields...].
+            std::vector<std::string> vals;
+            std::vector<bool> nulls;
+            size_t off = 0;
+            bool first = true;
+            while (off < row.size()) {
+                const uint8_t prefix = static_cast<uint8_t>(row[off]);
+                off += 1;
+                if (prefix == 0xFF) {
+                    if (!first) {
+                        vals.emplace_back();
+                        nulls.push_back(true);
+                    }
+                    first = false;
+                    continue;
+                }
+                if (off + prefix > row.size()) return fail("sub row");
+                uint32_t len = 0;
+                for (uint32_t b = 0; b < prefix; ++b)
+                    len |= static_cast<uint32_t>(
+                               static_cast<uint8_t>(row[off + b]))
+                           << (8 * b);
+                off += prefix;
+                if (off + len > row.size()) return fail("sub row");
+                if (!first) {
+                    vals.emplace_back(row.substr(off, len));
+                    nulls.push_back(false);
+                }
+                first = false;
+                off += len;
+            }
+            vt.vals.push_back(std::move(vals));
+            vt.nulls.push_back(std::move(nulls));
+        }
+        const uint32_t vidx = static_cast<uint32_t>(
+            req.tables_size() + virtuals.size());
+        virtuals.push_back(std::move(vt));
+        out->tables = {vidx};
+        out->refs.resize(1);
+        const size_t n = virtuals.back().vals.size();
+        out->refs[0].reserve(n);
+        for (size_t r = 0; r < n; ++r) out->refs[0].push_back(r);
+        return true;
+    }
+
     // ----- Tuple filters ----------------------------------------------------
     // Resolve a QbTupleFilter against one tuple of `nr` (row r), evaluating
     // FilterExpr ordinals over the mapped (table, column) cells. LEFT-join
@@ -426,9 +513,11 @@ struct Executor {
                 ctx->cells[i] = {};
                 ctx->nulls[i] = true;
             } else {
-                ctx->cells[i] = cell_of(stores[tf.columns(i).table_idx()],
-                                        ref, tf.columns(i).column());
-                ctx->nulls[i] = false;
+                ctx->cells[i] = value_of(tf.columns(i).table_idx(), ref,
+                                         tf.columns(i).column());
+                ctx->nulls[i] =
+                    null_of(tf.columns(i).table_idx(), ref,
+                            tf.columns(i).column());
             }
         }
         ev->set_row_from_views(ctx->cells, ctx->nulls);
@@ -506,28 +595,27 @@ struct Executor {
             swap ? join.probe_keys() : join.build_keys();
         const auto& probe_key_refs =
             swap ? join.build_keys() : join.probe_keys();
-        if (join.build_keys_size() != join.probe_keys_size() ||
-            join.build_keys_size() == 0)
+        if (join.build_keys_size() != join.probe_keys_size())
             return fail("join key arity");
 
         // Resolve key columns to (ref column position, column).
         struct KeyCol {
             int pos;
             uint32_t column;
-            const PaxStore* store;
+            uint32_t table_idx;
         };
         std::vector<KeyCol> bk(build_key_refs.size()), pk(probe_key_refs.size());
         for (int i = 0; i < build_key_refs.size(); ++i) {
             const auto& c = build_key_refs.Get(i);
             const int pos = build.table_pos(c.table_idx());
             if (pos < 0) return fail("build key table not in child");
-            bk[i] = {pos, c.column(), stores[c.table_idx()]};
+            bk[i] = {pos, c.column(), c.table_idx()};
         }
         for (int i = 0; i < probe_key_refs.size(); ++i) {
             const auto& c = probe_key_refs.Get(i);
             const int pos = probe.table_pos(c.table_idx());
             if (pos < 0) return fail("probe key table not in child");
-            pk[i] = {pos, c.column(), stores[c.table_idx()]};
+            pk[i] = {pos, c.column(), c.table_idx()};
         }
 
         // Residual predicate over the (probe ++ build) tuple, applied per
@@ -542,8 +630,6 @@ struct Executor {
         const bool has_residual =
             join.has_residual() && join.residual().pred().has_expr();
         if (has_residual) {
-            if (join.type() == pb::QbJoin::LEFT)
-                return fail("residual on LEFT join");
             for (const auto& c : join.residual().columns()) {
                 int pos = probe.table_pos(c.table_idx());
                 if (pos >= 0) {
@@ -567,8 +653,9 @@ struct Executor {
                 key.clear();
                 for (const auto& k : bk) {
                     append_join_key(key,
-                                    cell_of(k.store, build.refs[k.pos][r],
-                                            k.column));
+                                    value_of(k.table_idx,
+                                             build.refs[k.pos][r],
+                                             k.column));
                 }
                 ht[key].push_back(static_cast<uint32_t>(r));
             }
@@ -610,8 +697,8 @@ struct Executor {
                         const uint64_t ref = rc.from_build
                                                  ? build.refs[rc.pos][br]
                                                  : probe.refs[rc.pos][r];
-                        rcells[i] =
-                            cell_of(stores[rc.table_idx], ref, rc.column);
+                        rcells[i] = value_of(rc.table_idx, ref, rc.column);
+                        rnulls[i] = null_of(rc.table_idx, ref, rc.column);
                     }
                     ev.set_row_from_views(rcells, rnulls);
                     return ev.evaluate(join.residual().pred().expr());
@@ -622,8 +709,8 @@ struct Executor {
                     key.clear();
                     for (const auto& k : pk) {
                         append_join_key(
-                            key, cell_of(k.store, probe.refs[k.pos][r],
-                                         k.column));
+                            key, value_of(k.table_idx, probe.refs[k.pos][r],
+                                          k.column));
                     }
                     const auto it = ht.find(key);
                     bool matched = it != ht.end() && !it->second.empty();
@@ -652,6 +739,7 @@ struct Executor {
                         case pb::QbJoin::LEFT:
                             if (matched) {
                                 for (uint32_t br : it->second) {
+                                    if (!residual_ok(r, br)) continue;
                                     for (size_t c = 0;
                                          c < probe.tables.size(); ++c)
                                         mine[c].push_back(probe.refs[c][r]);
@@ -747,7 +835,7 @@ struct Executor {
                 const uint64_t ref = in.refs[gpos[g]][r];
                 gv[g] = ref == kNullRef
                             ? std::string_view()
-                            : cell_of(stores[c.table_idx()], ref, c.column());
+                            : value_of(c.table_idx(), ref, c.column());
                 if (c.prefix_len() > 0 && gv[g].size() > c.prefix_len())
                     gv[g] = gv[g].substr(0, c.prefix_len());
                 const uint32_t l = static_cast<uint32_t>(gv[g].size());
@@ -1054,6 +1142,35 @@ struct Executor {
             groups.emplace(std::string(), std::move(st));
         }
 
+        // HAVING: drop groups failing the predicate over the stage-1
+        // value layout [group values..., aggregate values...].
+        if (agg.has_having() && agg.having().has_expr()) {
+            PredicateEvaluator hev;
+            std::vector<std::string> hv;
+            std::vector<std::string_view> hcells;
+            std::vector<bool> hnulls;
+            for (auto it = groups.begin(); it != groups.end();) {
+                GroupState& gs = it->second;
+                hv.clear();
+                hnulls.clear();
+                for (int g = 0; g < n_grp; ++g) {
+                    hv.push_back(gs.key_cols[g]);
+                    hnulls.push_back(false);
+                }
+                for (int a = 0; a < agg.aggs_size(); ++a) {
+                    bool is_null = false;
+                    hv.push_back(AggValue(agg.aggs(a), gs, a, &is_null));
+                    hnulls.push_back(is_null);
+                }
+                hcells.assign(hv.begin(), hv.end());
+                hev.set_row_from_views(hcells, hnulls);
+                if (hev.evaluate(agg.having().expr()))
+                    ++it;
+                else
+                    it = groups.erase(it);
+            }
+        }
+
         // Build output rows: value strings per output expression.
         struct OutRow {
             std::vector<std::string> vals;
@@ -1243,6 +1360,9 @@ struct Executor {
                         return fail("join child order");
                 }
                 if (!RunJoin(node.join(), &results[i])) return false;
+            } else if (node.has_sub_block()) {
+                if (!RunSubBlock(node.sub_block(), &results[i]))
+                    return false;
             } else if (node.has_filter()) {
                 if (node.filter().input() >= static_cast<uint32_t>(i))
                     return fail("filter child order");

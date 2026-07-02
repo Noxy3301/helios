@@ -110,6 +110,27 @@ class Item_columnar_value final : public Item_string {
     null_value = false;
   }
   void set_null_value() { null_value = true; }
+
+  // Item::send asserts null_value == (val_str() == nullptr); honor SQL
+  // NULL across every access path.
+  String *val_str(String *str) override {
+    return null_value ? nullptr : Item_string::val_str(str);
+  }
+  double val_real() override {
+    return null_value ? 0.0 : Item_string::val_real();
+  }
+  longlong val_int() override {
+    return null_value ? 0 : Item_string::val_int();
+  }
+  my_decimal *val_decimal(my_decimal *dec) override {
+    return null_value ? nullptr : Item_string::val_decimal(dec);
+  }
+  bool get_date(MYSQL_TIME *ltime, my_time_flags_t flags) override {
+    return null_value ? true : Item_string::get_date(ltime, flags);
+  }
+  bool get_time(MYSQL_TIME *ltime) override {
+    return null_value ? true : Item_string::get_time(ltime);
+  }
 };
 
 // One output column of the offloaded aggregate: either a GROUP BY column
@@ -984,34 +1005,31 @@ bool recognize_flattened_agg(THD *thd, JOIN *join, Query_block *qb,
 #undef LDB_COL_REJECT
 }
 
-// Returns true and fills ctx->qb_request when this JOIN is an offloadable
-// query block: N inner-joined base tables + aggregation (+ORDER BY/LIMIT).
+// Build the query-block IR for `qb` into `req`. Recursion-safe: derived
+// tables build their inner blocks as QbSubBlock nodes (virtual tables).
 // Never raises errors — a false return means "primary runs it".
-bool recognize_query_block(THD *thd, JOIN *join,
-                           Columnar_execution_context *ctx,
-                           const char **why) {
+bool build_block(THD *thd, Query_block *qb,
+                 LineairDB::Protocol::TxExecuteQueryBlock::Request &req,
+                 const char **why) {
 #define LDB_COL_REJECT(reason) \
   do {                         \
     *why = (reason);           \
     return false;              \
   } while (0)
-  Query_block *qb = join->query_block;
-  if (qb == nullptr || qb->outer_query_block() != nullptr)
-    LDB_COL_REJECT("not top-level");
   Query_expression *unit = qb->master_query_expression();
   if (unit == nullptr || !unit->is_simple()) LDB_COL_REJECT("not simple unit");
-  if (qb->leaf_tables != nullptr && qb->leaf_tables->next_leaf == nullptr &&
-      qb->leaf_tables->is_view_or_derived()) {
-    if (recognize_double_aggregate(thd, join, qb, ctx, why)) return true;
-    return recognize_flattened_agg(thd, join, qb, ctx, why);
-  }
-  if (join->having_cond != nullptr) LDB_COL_REJECT("has HAVING");
-  if (join->select_distinct) LDB_COL_REJECT("has DISTINCT");
   if (qb->m_windows.elements > 0) LDB_COL_REJECT("has windows");
-  if (join->rollup_state != JOIN::RollupState::NONE)
-    LDB_COL_REJECT("has ROLLUP");
-  if (!join->implicit_grouping && qb->group_list.elements == 0)
-    LDB_COL_REJECT("no aggregation");
+  if (qb->olap != UNSPECIFIED_OLAP_TYPE) LDB_COL_REJECT("has ROLLUP");
+  // SELECT DISTINCT c1..cn (no aggregates) == GROUP BY c1..cn.
+  const bool distinct_as_group =
+      qb->is_distinct() && !qb->is_grouped() && !qb->with_sum_func;
+  if (qb->is_distinct() && !distinct_as_group)
+    LDB_COL_REJECT("has DISTINCT");
+  // Plain row-returning blocks (no grouping at all) emit base columns.
+  const bool plain_rows = !qb->is_implicitly_grouped() &&
+                          qb->group_list.elements == 0 &&
+                          !distinct_as_group;
+  if (plain_rows) LDB_COL_REJECT("no aggregation");
 
   // Base tables. Tables inside semijoin/antijoin nests (EXISTS / NOT
   // EXISTS unnested by MySQL) are scanned like base tables but joined via
@@ -1040,10 +1058,15 @@ bool recognize_query_block(THD *thd, JOIN *join,
     return -1;
   };
 
+  // Two passes: real tables first, then derived tables — tabs indexes must
+  // match the server's table_idx space (real 0..n-1, virtual n..).
   std::vector<QbTableCtx> tabs;
-  std::vector<int> main_tabs;      // indexes into tabs
+  std::vector<int> main_tabs;      // indexes into tabs (FROM order)
   std::vector<int> tab_nest;       // per tab: sj_infos index or -1
+  std::vector<bool> tab_virtual;
+  std::vector<int> left_deriveds;  // outer-joined derived tabs (post-joins)
   for (Table_ref *tl = qb->leaf_tables; tl != nullptr; tl = tl->next_leaf) {
+    if (tl->is_view_or_derived()) continue;
     if (tl->table == nullptr || tl->table->s == nullptr)
       LDB_COL_REJECT("no TABLE");
     const int nest = nest_index_of(tl);
@@ -1054,13 +1077,39 @@ bool recognize_query_block(THD *thd, JOIN *join,
     tabs.push_back({tl, tl->table, tl->map(),
                     tl->table->file->stats.records});
     tab_nest.push_back(nest);
+    tab_virtual.push_back(false);
     if (nest < 0)
       main_tabs.push_back(static_cast<int>(tabs.size()) - 1);
     else
       sj_infos[nest].inner_tabs.push_back(static_cast<int>(tabs.size()) - 1);
   }
+  const size_t n_real = tabs.size();
+  std::vector<Query_block *> virtual_inner;  // per virtual tab
+  std::vector<bool> virtual_one_row;         // implicitly grouped => 1 row
+  for (Table_ref *tl = qb->leaf_tables; tl != nullptr; tl = tl->next_leaf) {
+    if (!tl->is_view_or_derived()) continue;
+    if (tl->table == nullptr) LDB_COL_REJECT("derived no TABLE");
+    if (nest_index_of(tl) >= 0) LDB_COL_REJECT("derived in nest");
+    Query_expression *du = tl->derived_query_expression();
+    if (du == nullptr || !du->is_simple()) LDB_COL_REJECT("derived unit");
+    Query_block *iqb = du->first_query_block();
+    if (iqb == nullptr) LDB_COL_REJECT("derived inner");
+    tabs.push_back({tl, tl->table, tl->map(), 0});
+    tab_nest.push_back(-1);
+    tab_virtual.push_back(true);
+    virtual_inner.push_back(iqb);
+    virtual_one_row.push_back(iqb->is_implicitly_grouped());
+    if (tl->outer_join)
+      left_deriveds.push_back(static_cast<int>(tabs.size()) - 1);
+    else
+      main_tabs.push_back(static_cast<int>(tabs.size()) - 1);
+  }
   if (main_tabs.empty()) LDB_COL_REJECT("no tables");
   const size_t n_tabs = tabs.size();
+  auto resolve_in = [&](const Field *f, int ti) -> const Field * {
+    if (tab_virtual[ti]) return f;  // derived fields are already canonical
+    return resolve_base_field(f, tabs[ti].table);
+  };
 
   auto table_index_of_field = [&](const Field *f) -> int {
     for (size_t i = 0; i < n_tabs; ++i)
@@ -1081,15 +1130,20 @@ bool recognize_query_block(THD *thd, JOIN *join,
   std::vector<JoinEdge> edges;
   std::vector<Item *> tuple_conjuncts;  // cross-table non-equi (q7/q19 ORs)
   {
-    Item *where_cond = qb->where_cond() != nullptr ? qb->where_cond()
-                                                   : join->where_cond;
+    Item *where_cond = qb->where_cond();
     std::vector<Item *> conjuncts;
     flatten_and(where_cond, &conjuncts);
     for (Item *c : conjuncts) {
       const table_map used = c->used_tables() & ~PSEUDO_TABLE_BITS;
       const int single = single_table_of(used, tabs);
-      if (single >= 0) {
+      if (single >= 0 && !tab_virtual[single]) {
         table_filters[single].push_back(c);
+        continue;
+      }
+      if (single >= 0) {
+        // Virtual (derived) tables have no scan to push into; evaluate
+        // after the joins (q21's IS NULL anti test).
+        tuple_conjuncts.push_back(c);
         continue;
       }
       // Conjuncts touching a semijoin-nest table: outer x inner
@@ -1190,20 +1244,24 @@ bool recognize_query_block(THD *thd, JOIN *join,
       if (fa->result_type() != INT_RESULT ||
           fb->result_type() != INT_RESULT)
         LDB_COL_REJECT("non-integer join key");
-      const Field *rfa = resolve_base_field(fa, tabs[ta].table);
-      const Field *rfb = resolve_base_field(fb, tabs[tb].table);
+      const Field *rfa = resolve_in(fa, ta);
+      const Field *rfb = resolve_in(fb, tb);
       if (rfa == nullptr || rfb == nullptr) LDB_COL_REJECT("join key resolve");
       edges.push_back({ta, tb, rfa, rfb});
     }
   }
-  if (main_tabs.size() > 1 && edges.empty()) LDB_COL_REJECT("cross join");
+  bool has_one_row_virtual = false;
+  for (int t : main_tabs)
+    if (tab_virtual[t] && virtual_one_row[t - n_real])
+      has_one_row_virtual = true;
+  if (main_tabs.size() > 1 && edges.empty() && !has_one_row_virtual)
+    LDB_COL_REJECT("cross join");
 
-  auto &req = ctx->qb_request;
   req.Clear();
 
   // Scan nodes (one per table) with their fully-pushed filters.
   std::vector<int> scan_node_of(n_tabs);
-  for (size_t i = 0; i < n_tabs; ++i) {
+  for (size_t i = 0; i < n_real; ++i) {
     req.add_tables()->set_table_name(tabs[i].table->s->normalized_path.str);
     auto *node = req.add_nodes();
     auto *scan = node->mutable_scan();
@@ -1224,6 +1282,17 @@ bool recognize_query_block(THD *thd, JOIN *join,
         }
       }
     }
+  }
+
+  // Derived tables build recursively as sub-blocks; the k-th sub_block
+  // node becomes virtual table n_real + k server-side (matching tabs).
+  for (size_t i = n_real; i < n_tabs; ++i) {
+    auto *node = req.add_nodes();
+    auto *sub = node->mutable_sub_block();
+    if (!build_block(thd, virtual_inner[i - n_real], *sub->mutable_block(),
+                     why))
+      return false;
+    scan_node_of[i] = req.nodes_size() - 1;
   }
 
   // Join tree in FROM-clause order (leaf_tables): each next table
@@ -1254,6 +1323,18 @@ bool recognize_query_block(THD *thd, JOIN *join,
             break;
           }
         if (pick >= 0) break;
+      }
+      if (pick < 0) {
+        // A one-row derived (uncorrelated scalar subquery, q22's AVG) may
+        // legally cross join: zero-key join against a single row.
+        for (size_t i = 0; i < pending.size(); ++i) {
+          const int t = pending[i];
+          if (tab_virtual[t] && virtual_one_row[t - n_real]) {
+            pick = t;
+            pick_pos = i;
+            break;
+          }
+        }
       }
       if (pick < 0) LDB_COL_REJECT("disconnected join graph");
       pending.erase(pending.begin() + pick_pos);
@@ -1287,6 +1368,83 @@ bool recognize_query_block(THD *thd, JOIN *join,
       joined[pick] = true;
       current_node = req.nodes_size() - 1;
     }
+  }
+
+  // Outer-joined derived tables (MySQL's NOT EXISTS / antijoin transform,
+  // q21): LEFT join with the ON condition split into equi keys and a
+  // per-match residual; the WHERE's IS NULL test runs in the tuple filter.
+  for (int vt : left_deriveds) {
+    Table_ref *tl = tabs[vt].tl;
+    Item *on_cond = tl->join_cond();
+    if (on_cond == nullptr) LDB_COL_REJECT("derived LEFT without ON");
+    std::vector<Item *> on_parts;
+    flatten_and(on_cond, &on_parts);
+    auto *jn = req.add_nodes()->mutable_join();
+    jn->set_type(LineairDB::Protocol::QbJoin::LEFT);
+    jn->set_build(scan_node_of[vt]);
+    jn->set_probe(current_node);
+    std::vector<Item *> residuals;
+    for (Item *c : on_parts) {
+      bool is_key = false;
+      if (c->type() == Item::FUNC_ITEM &&
+          down_cast<Item_func *>(c)->functype() == Item_func::EQ_FUNC) {
+        auto *eq = down_cast<Item_func *>(c);
+        Item *a = eq->arguments()[0]->real_item();
+        Item *b = eq->arguments()[1]->real_item();
+        if (a->type() == Item::FIELD_ITEM && b->type() == Item::FIELD_ITEM) {
+          const Field *fa = down_cast<Item_field *>(a)->field;
+          const Field *fb = down_cast<Item_field *>(b)->field;
+          int ta = table_index_of_field(fa);
+          int tb = table_index_of_field(fb);
+          if (ta == vt || tb == vt) {
+            if (ta != vt) {
+              std::swap(ta, tb);
+              std::swap(fa, fb);
+            }
+            // fa/ta = derived side, fb/tb = probe side
+            if (tb >= 0 && fa->result_type() == INT_RESULT &&
+                fb->result_type() == INT_RESULT) {
+              const Field *rfa = resolve_in(fa, ta);
+              const Field *rfb = resolve_in(fb, tb);
+              if (rfa != nullptr && rfb != nullptr) {
+                auto *bk = jn->add_build_keys();
+                bk->set_table_idx(vt);
+                bk->set_column(rfa->field_index());
+                auto *pkk = jn->add_probe_keys();
+                pkk->set_table_idx(tb);
+                pkk->set_column(rfb->field_index());
+                is_key = true;
+              }
+            }
+          }
+        }
+      }
+      if (!is_key) residuals.push_back(c);
+    }
+    if (jn->build_keys_size() == 0) LDB_COL_REJECT("derived LEFT keyless");
+    if (!residuals.empty()) {
+      TupleColumnRegistry reg;
+      reg.table_of = [&](const Field *f) { return table_index_of_field(f); };
+      reg.resolve = [&](const Field *f, int ti) { return resolve_in(f, ti); };
+      auto *tf = jn->mutable_residual();
+      auto *expr = tf->mutable_pred()->mutable_expr();
+      if (residuals.size() == 1) {
+        if (!serialize_tuple_pred(residuals[0], expr, &reg))
+          LDB_COL_REJECT("derived ON residual not pushable");
+      } else {
+        expr->set_op(LineairDB::Protocol::FilterExpr::OP_AND);
+        for (Item *c : residuals)
+          if (!serialize_tuple_pred(c, expr->add_children(), &reg))
+            LDB_COL_REJECT("derived ON residual not pushable");
+      }
+      tf->mutable_pred()->set_num_columns(reg.cols.size());
+      for (const auto &rc : reg.cols) {
+        auto *col = tf->add_columns();
+        col->set_table_idx(rc.first);
+        col->set_column(rc.second->field_index());
+      }
+    }
+    current_node = req.nodes_size() - 1;
   }
 
   // Cross-table non-equi conjuncts run as a tuple filter over the joined
@@ -1398,8 +1556,7 @@ bool recognize_query_block(THD *thd, JOIN *join,
     group_items.push_back(gi);
     if (const Field *yf = extract_year_field(gi)) {
       const int ti = table_index_of_field(yf);
-      const Field *rf =
-          ti >= 0 ? resolve_base_field(yf, tabs[ti].table) : nullptr;
+      const Field *rf = ti >= 0 ? resolve_in(yf, ti) : nullptr;
       if (rf == nullptr || rf->is_nullable()) LDB_COL_REJECT("group year col");
       auto *gc = agg->add_group_columns();
       gc->set_table_idx(ti);
@@ -1413,8 +1570,8 @@ bool recognize_query_block(THD *thd, JOIN *join,
     const Field *raw = down_cast<Item_field *>(gi)->field;
     const int ti = table_index_of_field(raw);
     if (ti < 0) LDB_COL_REJECT("group column foreign");
-    const Field *gf = resolve_base_field(raw, tabs[ti].table);
-    if (gf == nullptr || gf->is_nullable())
+    const Field *gf = resolve_in(raw, ti);
+    if (gf == nullptr || (gf->is_nullable() && !tab_virtual[ti]))
       LDB_COL_REJECT("group column nullable");
     // Byte-equality grouping: INT/DECIMAL val_str renderings are canonical;
     // strings rely on the TPC-H value domains (md5-gated).
@@ -1427,6 +1584,24 @@ bool recognize_query_block(THD *thd, JOIN *join,
     gc->set_column(gf->field_index());
     gc->set_cmp_kind(gf->result_type() == STRING_RESULT ? 1 : 0);
     group_fields.push_back({ti, gf});
+  }
+
+  if (distinct_as_group) {
+    for (Item *item : VisibleFields(qb->fields)) {
+      Item *real = item->real_item();
+      if (real->const_item()) continue;  // constants don't affect DISTINCT
+      if (real->type() != Item::FIELD_ITEM) LDB_COL_REJECT("distinct expr");
+      const Field *raw = down_cast<Item_field *>(real)->field;
+      const int ti = table_index_of_field(raw);
+      const Field *gf = ti >= 0 ? resolve_in(raw, ti) : nullptr;
+      if (gf == nullptr) LDB_COL_REJECT("distinct column");
+      auto *gc = agg->add_group_columns();
+      gc->set_table_idx(ti);
+      gc->set_column(gf->field_index());
+      gc->set_cmp_kind(gf->result_type() == STRING_RESULT ? 1 : 0);
+      group_fields.push_back({ti, gf});
+      group_items.push_back(real);
+    }
   }
 
   // Output expressions from the visible field list (pre-optimizer items).
@@ -1449,8 +1624,7 @@ bool recognize_query_block(THD *thd, JOIN *join,
           }
           const Field *raw = down_cast<Item_field *>(arg)->field;
           const int ti = table_index_of_field(raw);
-          const Field *cf =
-              ti >= 0 ? resolve_base_field(raw, tabs[ti].table) : nullptr;
+          const Field *cf = ti >= 0 ? resolve_in(raw, ti) : nullptr;
           if (cf == nullptr || cf->is_nullable()) {
             agg_why = "COUNT arg nullable";
             return -1;
@@ -1578,8 +1752,7 @@ bool recognize_query_block(THD *thd, JOIN *join,
         }
         const Field *raw = down_cast<Item_field *>(arg)->field;
         const int ti = table_index_of_field(raw);
-        const Field *mf =
-            ti >= 0 ? resolve_base_field(raw, tabs[ti].table) : nullptr;
+        const Field *mf = ti >= 0 ? resolve_in(raw, ti) : nullptr;
         if (mf == nullptr) {
           agg_why = "minmax unresolvable";
           return -1;
@@ -1657,8 +1830,7 @@ bool recognize_query_block(THD *thd, JOIN *join,
     if (real->type() == Item::FIELD_ITEM) {
       const Field *raw = down_cast<Item_field *>(real)->field;
       const int ti = table_index_of_field(raw);
-      const Field *of =
-          ti >= 0 ? resolve_base_field(raw, tabs[ti].table) : nullptr;
+      const Field *of = ti >= 0 ? resolve_in(raw, ti) : nullptr;
       if (of == nullptr) LDB_COL_REJECT("output column unresolvable");
       int pos = -1;
       for (size_t g = 0; g < group_fields.size(); ++g) {
@@ -1696,13 +1868,71 @@ bool recognize_query_block(THD *thd, JOIN *join,
         continue;
       }
     }
-    // Arithmetic over aggregates (SUM ratios).
+    // Arithmetic over aggregates (SUM ratios) or a constant output.
     if (!ser_out(real, oe->mutable_expr()))
       LDB_COL_REJECT(agg_why != nullptr ? agg_why : "output expr");
     oe->set_source(LineairDB::Protocol::QbOutputExpr::EXPR);
     oe->set_result_scale(real->decimals);
   }
-  if (agg->aggs_size() == 0) LDB_COL_REJECT("no aggregates");
+  if (agg->aggs_size() == 0 && !distinct_as_group)
+    LDB_COL_REJECT("no aggregates");
+
+  // HAVING over the stage-1 value layout (agg refs become ordinals).
+  if (qb->having_cond() != nullptr) {
+    std::function<bool(Item *, LineairDB::Protocol::FilterExpr *)>
+        ser_having = [&](Item *it,
+                         LineairDB::Protocol::FilterExpr *out) -> bool {
+      it = it->real_item();
+      if (it->type() == Item::COND_ITEM) {
+        auto *cond = down_cast<Item_cond *>(it);
+        out->set_op(cond->functype() == Item_func::COND_AND_FUNC
+                        ? LineairDB::Protocol::FilterExpr::OP_AND
+                        : LineairDB::Protocol::FilterExpr::OP_OR);
+        List_iterator<Item> li(*cond->argument_list());
+        for (Item *sub = li++; sub != nullptr; sub = li++)
+          if (!ser_having(sub, out->add_children())) return false;
+        return true;
+      }
+      if (it->type() != Item::FUNC_ITEM) return false;
+      auto *fn = down_cast<Item_func *>(it);
+      LineairDB::Protocol::FilterExpr::Op op;
+      switch (fn->functype()) {
+        case Item_func::EQ_FUNC:
+          op = LineairDB::Protocol::FilterExpr::OP_EQ;
+          break;
+        case Item_func::NE_FUNC:
+          op = LineairDB::Protocol::FilterExpr::OP_NE;
+          break;
+        case Item_func::LT_FUNC:
+          op = LineairDB::Protocol::FilterExpr::OP_LT;
+          break;
+        case Item_func::LE_FUNC:
+          op = LineairDB::Protocol::FilterExpr::OP_LE;
+          break;
+        case Item_func::GT_FUNC:
+          op = LineairDB::Protocol::FilterExpr::OP_GT;
+          break;
+        case Item_func::GE_FUNC:
+          op = LineairDB::Protocol::FilterExpr::OP_GE;
+          break;
+        default:
+          return false;
+      }
+      if (fn->argument_count() != 2) return false;
+      out->set_op(op);
+      for (uint i = 0; i < 2; ++i) {
+        auto *child = out->add_children();
+        if (!ser_out(fn->arguments()[i], child)) return false;
+        // Aggregate/decimal values compare as doubles.
+        child->set_compare_type(2);
+      }
+      return true;
+    };
+    auto *hv = agg->mutable_having();
+    if (!ser_having(qb->having_cond(), hv->mutable_expr()))
+      LDB_COL_REJECT("HAVING not pushable");
+    hv->set_num_columns(n_grp_final + agg->aggs_size());
+  }
 
   // ORDER BY over output ordinals only.
   for (ORDER *o = qb->order_list.first; o != nullptr; o = o->next) {
@@ -1727,10 +1957,34 @@ bool recognize_query_block(THD *thd, JOIN *join,
   }
 
   (void)thd;
-  ctx->plan_ready = true;
   *why = nullptr;
   return true;
 #undef LDB_COL_REJECT
+}
+
+// Top-level recognizer: dispatches special derived shapes, then builds the
+// generic block IR (recursively for derived tables).
+bool recognize_query_block(THD *thd, JOIN *join,
+                           Columnar_execution_context *ctx,
+                           const char **why) {
+  Query_block *qb = join->query_block;
+  if (qb == nullptr || qb->outer_query_block() != nullptr) {
+    *why = "not top-level";
+    return false;
+  }
+  Query_expression *unit = qb->master_query_expression();
+  if (unit == nullptr || !unit->is_simple()) {
+    *why = "not simple unit";
+    return false;
+  }
+  if (qb->leaf_tables != nullptr && qb->leaf_tables->next_leaf == nullptr &&
+      qb->leaf_tables->is_view_or_derived()) {
+    if (recognize_double_aggregate(thd, join, qb, ctx, why)) return true;
+    if (recognize_flattened_agg(thd, join, qb, ctx, why)) return true;
+  }
+  if (!build_block(thd, qb, ctx->qb_request, why)) return false;
+  ctx->plan_ready = true;
+  return true;
 }
 
 bool ColumnarExecute(JOIN *join, Query_result *result) {

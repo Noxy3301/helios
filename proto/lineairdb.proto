@@ -787,12 +787,21 @@ message QbSortKey {
     uint32 cmp_kind = 3;  // 0=int64 numeric, 1=binary string, 2=decimal numeric
 }
 
+// A nested query block (a derived table): executed recursively, its result
+// rows become virtual table number (tables_size + k) where k counts
+// sub_block nodes in plan order. Virtual-table column refs address the
+// sub-block's output ordinals; refs are row numbers.
+message QbSubBlock {
+    TxExecuteQueryBlock.Request block = 1;
+}
+
 message QbNode {
     oneof op {
         QbScan scan = 1;
         QbJoin join = 2;
         QbAggregate aggregate = 3;
         QbTupleFilterNode filter = 4;
+        QbSubBlock sub_block = 5;
     }
 }
 
