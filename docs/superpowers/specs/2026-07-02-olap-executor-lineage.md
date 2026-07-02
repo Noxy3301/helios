@@ -65,3 +65,27 @@ school) の OSS 代表。**
 
 実装形: IR に QbSubBlock (再帰 Request)。サーバは実表 table_idx 空間の後ろに
 virtual 表 (サブブロック結果行) を追加し、cell アクセスを value_of() で統一。
+
+## 追記 2: SOTA 調査 (olap-engine-survey 追加調査) と実装の照合 (2026-07-02)
+
+22/22 達成後に受領した詳細調査との照合。実装判断が系譜の結論と一致することの
+検証記録 (論文の design-validation 節の一次ソース)。
+
+| 実装済みの判断 | 調査の裏付け (出典) | 一致 |
+|---|---|---|
+| 相関スカラ集約 = 相関キー GROUP BY derived + join (MySQL の secondary 変換を受ける) | Neumann&Kemper BTW2015 の Γ 拡張則そのもの。MySQL WL#13520 が同変換を実装 (調査が同 WL を発見) | ✓ |
+| EXISTS/NOT EXISTS = 素の hash semi/anti (3 値マーク不要) | 「EXISTS は NULL 比較を含まず常に 2 値」(BTW2015 simple unnesting; DuckDB/Velox/Spark の実装差の比較から) | ✓ |
+| q21 残余述語: 同キー候補列挙→残余評価→全候補失敗のみ ANTI keep | DuckDB ScanStructure::ResolvePredicates / issue #4950 (これを欠くと TPC-H Q21 類似で性能崩壊) | ✓ (LEFT+IS NULL 形で同値) |
+| 非相関スカラ = 1 回実行して定数注入 (1 行 derived の keyless join + MIN 登録) | PostgreSQL InitPlan / DuckDB は依存結合の自由変数空ケースとして自動帰着。GROUP BY なし集約は常に 1 行なので cardinality check 不要 | ✓ |
+| OR-of-ANDs = join 後の残差ブール式木評価 (UNION 書き換えしない) | MySQL Index Merge Union は単一表アクセスパス限定; 残差式木評価が標準 (Dreseler et al. VLDB2020 のチョークポイント分析) | ✓ |
+| COUNT(DISTINCT) = per-group set + union merge | ClickHouse uniqExact 型。調査推奨は Spark RewriteDistinctAggregates の 2 段 GROUP BY (スケール時の代替として記録) | ✓ (SF≤10 で等価) |
+
+**要注意事項 (調査指摘)**: q16 の NOT IN は理論上 has_null 1 ビットが必要
+(NULL-aware anti join)。本実装は MySQL の secondary-engine 変換が生成する
+derived+ANTI 形を受けており、TPC-H スキーマ (ps_suppkey 非 NULL) では正しいが、
+nullable 列の NOT IN を許すなら has_null ガードを allowlist 条件に追加すべき
+(現状は列 nullable なら reject 側に倒れる)。
+
+追加出典: DuckDB flatten_dependent_join.cpp / join_hashtable.cpp、
+MySQL WL#13520、Neumann BTW2025 (Umbra も 2015 アルゴリズム使用と明言)、
+Birler&Neumann CIDR2026 (mark join 線形時間)、Spark SPARK-32290/32494。
