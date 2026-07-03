@@ -748,6 +748,13 @@ static bool parallel_primary_pax_aggregate_scan(
                 grp ? grp->write_counter.load(std::memory_order_acquire) : 0;
             if (wc_now != wc_before[g]) return false;
         }
+        // A row that overflowed to the heap mid-scan (e.g. a genuine multibyte
+        // value now that string cells are sized to char_length()) retired its
+        // strip slot and is silently absent above. overflow_count() was 0 at
+        // the top; re-check the monotonic latch so any 0->1 transition that
+        // raced the write_counter snapshot rejects this strip pass. ASCII data
+        // never overflows, so this never fires for the tested workloads.
+        if (store->overflow_count() > 0) return false;
         for (auto& local : locals) merge_agg_groups(groups, local, n_agg);
     }
     emit_agg_groups(step.aggregate(), groups, step_result,

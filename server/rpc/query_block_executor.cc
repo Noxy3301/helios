@@ -735,6 +735,20 @@ struct Executor {
 
     bool Quiesced() {
         for (int i = 0; i < req.tables_size(); ++i) {
+            // A row that overflows to the heap mid-scan retires its strip slot
+            // (BumpOverflow -> RetireSlot); the visible-bit clear makes it
+            // silently absent from a strip-direct pass. Prepare() proved
+            // overflow_count()==0 at the start, so re-checking the monotonic
+            // latch here rejects any 0->1 transition that raced the snapshot
+            // and falls the block back to the TID-checked path. (String cells
+            // sized to char_length() make this reachable for genuine multibyte
+            // data; ASCII never overflows so this never fires.) The happens-
+            // before is carried by the same write_counter release/acquire the
+            // loop below already relies on: RetireSlot's release bump is
+            // sequenced after BumpOverflow, so if the snapshot acquire-loaded
+            // the post-retire counter (the only case the loop below passes),
+            // this later load observes the overflow.
+            if (stores[i]->overflow_count() > 0) return false;
             const auto& snap = wc_snapshots[i];
             for (size_t g = 0; g < snap.size(); ++g) {
                 PaxGroup* grp = stores[i]->group(g);

@@ -3691,8 +3691,25 @@ static std::vector<uint32_t> compute_pax_field_widths(TABLE *table) {
       case MYSQL_TYPE_TIMESTAMP2:
         w = std::max<uint32_t>(w, 32);
         break;
+      case MYSQL_TYPE_STRING:
+      case MYSQL_TYPE_VARCHAR:
+      case MYSQL_TYPE_VAR_STRING:
+      case MYSQL_TYPE_ENUM:
+      case MYSQL_TYPE_SET:
+        // field_length is the charset OCTET length: utf8mb4 reserves 4 bytes
+        // per declared character, so a VARCHAR(44) utf8mb4 cell pads to 176 B
+        // even though pure-ASCII data (all of TPC-H/TPC-C) needs at most 44.
+        // Size the cell to the declared CHARACTER length instead
+        // (char_length() == field_length / mbmaxlen; a no-op for latin1/binary
+        // where mbmaxlen == 1). A genuine multibyte row whose encoded bytes
+        // exceed char_length() overflows to the EXISTING per-row heap fallback
+        // (ScatterRow -> false -> BumpOverflow): never wrong, but it disables
+        // strip-direct scans for that table (loud/slow degradation), so this
+        // trades a rare-row scan slowdown for a ~4x string-strip memory cut.
+        w = f->char_length();
+        break;
       default:
-        break;  // strings/enums: field_length already bounds val_str bytes
+        break;  // other types: field_length already bounds val_str bytes
     }
     if (w > kMaxCellBytes) return {};  // e.g. TEXT/BLOB: keep row-store
     widths.push_back(w);

@@ -535,3 +535,90 @@ MonetDB imprints (Sidirourgos & Kersten, SIGMOD2013)。新規性は 1-copy 制�
 nation は自明) → **E18 は実装しない**。visibility/strip パスの共有は将来「大表を複数の
 独立述語で同時集計する」ワークロードが現れたら再検討 (Crescando: Unterbrunner et al.
 VLDB2009 / SharedDB: Giannikis et al. VLDB2012 の系譜)。
+
+## メモリ圧縮フェーズ (2026-07-03〜): SF=5 分析からの改善
+
+SF=5 分析 (`2026-07-03-sf5-analysis.md`) が RSS 38.5GB を arena 27.7GB (72%) +
+primary index 7.0GB + secondary 3.8GB に分解し、arena のうち **13GB が utf8mb4 の
+4× 文字列パッド**・**7GB が ASCII テキスト格納の数値**であることを示した。ここから
+compression candidate を #1 文字列ストライド byte 幅化 → #2 型付き数値セル →
+#3 低カーディナリティ辞書 の順で実装していく。
+
+### M1: 文字列ストライドの byte 幅化 — utf8mb4 4× パッド除去 (2026-07-03)
+
+**動機 (candidate #1).** PAX の文字列 cell は charset の**オクテット**長を予約していた:
+utf8mb4 は 1 宣言文字あたり 4 バイト確保するので `l_comment VARCHAR(44)` は
+純 ASCII データ (TPC-H/TPC-C 全て、実観測 max 43B) でも 176B の stride を張る = 丸損。
+
+**変更 (1 箇所, proxy).** `compute_pax_field_widths` の文字列系型
+(STRING/VARCHAR/VAR_STRING/ENUM/SET) の cell 幅を `f->field_length` (オクテット長)
+から `f->char_length()` (宣言**文字**数 = field_length/mbmaxlen) に。latin1/binary
+(mbmaxlen==1) では no-op。lineitem の文字列 stride は **334→91 B/row** (l_comment
+178→46, l_shipinstruct 102→27, l_shipmode 42→12, returnflag/linestatus 6→3 ×2)、
+行フットプリント 614→371 B。
+
+**なぜ proxy 側か (engine 側でなく).** field_max_bytes は proxy が唯一計算し engine は
+消費するだけ。char/charset 情報は proxy の `Field` にしかない。かつ field_max_bytes は
+単一値で (a) stride (メモリ)・(b) ScatterRow の overflow 閾値・(c) cell()/GatherRow の
+clamp を同時に駆動する — stride だけ engine 側で縮めて overflow 閾値をオクテット幅の
+まま残すと `char_length < len ≤ octet` の行が ScatterRow の幅検査を通過するのに小さい
+stride に収まらず**破損**する。従って cap は field_max_bytes 自体を縮めるしかなく、それは
+`compute_pax_field_widths`。charset 非依存の cap を採用 (charset ベースのサイジングは
+utf8mb4 宣言の TPC-H では無利益)。
+
+**overflow フォールバックのトレードオフ (loud/slow, never wrong).** 実バイト数が
+char_length() を超える行 (= 真のマルチバイト値) は既存の per-row heap フォールバック
+(ScatterRow→false→BumpOverflow→heap Reset) に落ちる。overflow_count>0 は当該表の
+strip-direct scan を無効化 → row-engine 経路 (正しいが遅い) に退化。query-block の
+FORCED では `ER_SECONDARY_ENGINE` で loud reject (Codex 指摘、**silent wrong-result
+ではない**)。TPC-H/TPC-C は純 ASCII なので overflow_count==0 を全 SF で実測確認。
+**罠**: 単一の非 ASCII 行が表全体の strip scan を恒久無効化する poison-pill 特性
+(overflow_count 単調・非リセット) — 純 ASCII では非発火だが、国際化データを載せる際は
+要注意 (将来 #2 型付きセル/#3 辞書で緩和)。
+
+**メモリ実測 (同一 jemalloc スタック、clean load、apples-to-apples).**
+| SF | OLD (pre-M1) | M1 | 削減 |
+|---|---|---|---|
+| SF=1 lineairdb-server VmRSS | 9.79 GB | **7.33 GB** | **−25.1% (−2.46GB)** |
+| SF=5 | 38.48 GB (分析ベースライン) | **25.38 GB** | **−34.0% (−13.10GB)** |
+
+削減量が分析予測 (SF=5 で −13.09GB 文字列パッド、arena 27.7→14.6GB、RSS 38.5→25.4) と
+一致。SF=5 の −34% は arena が RSS の 72% を占めるため大きく、SF=1 は arena 比率が低いので
+−25%。SF=1 FORCED 合計は 6.33s(E17)/6.09s(E16b) → **5.96s** (狭い strip で転送減、微減)。
+
+**dual review 対応 (Codex + code-reviewer).**
+- **[code-reviewer, Important] silent wrong-result race → 修正済み.** strip-direct scan
+  (query_block_executor `Quiesced` / lineairdb_rpc 集計経路) の quiesce 再検査が
+  write_counter のみ見て overflow_count を見ない → overflow_count が scan 中に 0→1 遷移
+  する狭い窓 (退避行が visible bit クリアで無音に欠落) で 1 行落とし得る。本変更**前**は
+  文字列 overflow が実質デッドコード (field_length が val_str の物理上限) だったため到達
+  不能 (table-full の 2^31 行のみ)、char_length() 化で非 ASCII 行が normal event として
+  到達可能に。**修正**: 両 strip-direct 経路の quiesce に `overflow_count()>0 → return
+  false` を追加。overflow_count は単調で Prepare 時点 0 保証なので再検査で >0 = scan 中
+  遷移 → TID 検査経路へフォールバック。happens-before は既存の write_counter
+  release/acquire が担う (RetireSlot の release bump は BumpOverflow の後に sequenced、
+  snapshot が退避後カウンタを acquire-load した唯一のケース = write_counter 検査を通る
+  ケースで overflow を必ず観測) ので **submodule の順序変更不要・server 側 2 ファイルのみ**。
+  ASCII では overflow_count 恒久 0 なので非発火 → md5 不変 (再ゲートで確認)。ref-scan 経路
+  (read.cpp) は heap 行を `!is_pax()` で検出し cancel、記録済み ref も per-row TID 再検査
+  するため元々安全 (非変更)。
+- **[Codex, High] 非 ASCII で query-block が loud fail.** 上記トレードオフの明示
+  (never wrong, FORCED で reject)。設計上の loud degradation として受容・文書化。
+- **[code-reviewer, Suggestion] wide-column admission.** 末尾 `w>kMaxCellBytes` ガードが
+  char_length() 縮小で以前 reject された広い utf8mb4 列 (VARCHAR(513..2048)) を PAX に
+  admit — 真のマルチバイト列だと arena 確保後に overflow で strip 無効化 = row-store より
+  悪化し得る。純 ASCII では問題なし。将来 charset ベースの admit ゲートを検討。
+
+**検証 (最終バイナリ: proxy plugin 1e346e0a + server 01197c67).** OLAP: SF=0.01 22/22
+FORCED-vs-OFF ALL-MATCH + 回帰 3 本 (null-eq-join MATCH / string-stride round-trip
+[full-width 10-char ASCII が新 stride 境界に収まる] / <=> loud-reject)、SF=1 22/22 md5 が
+**E17 とバイト一致** (意味論保存)、overflow_count==0。TPC-C (書込パス接触必須):
+1/8/32/64t = **420/1553/3663/5032 req/s、全点 Unexpected Errors=0**、ベースライン
+(426/1546/3647/4892) 比 ±5% 内。
+
+**設計系譜**: charset-aware storage sizing の古典。novelty は 1-copy PAX 制約下で
+「per-row heap overflow を安全弁に strip 幅を宣言文字長へ攻める」点と、それが暴いた
+quiesce プロトコルの overflow_count 再検査欠落の閉塞。次段: **candidate #2 型付き数値
+セル** (INT/DATE/DECIMAL の ASCII テキスト格納を native 化、arena さらに −6.9GB +
+ASCII パース税 [q1/q6 の 25-52%] 消滅、scatter 経路接触の本丸 = SIMD スパイクの結論
+「型付けは効く」の受け皿)。
