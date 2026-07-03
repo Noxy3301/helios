@@ -293,3 +293,27 @@ join 順を自力で当てる (Item_equal の rec_per_key 経路)。
 結果 (SF=1, 全 md5 MATCH): **q18 2413→1903ms (-21%)**、q13 441ms、q20 655ms。
 **合計 8.04s = InnoDB champion 42.2s の 5.2 倍。本日: 24.6s → 8.04s (3.1 倍)**。
 残: q18 1.9s (次は int64 キー特化 or radix 並列マージ)、q21 1.29s、q4 694ms。
+
+### E13: perf/RSS 実測と実行時型判定キー (2026-07-03)
+
+perf 再計測 (q18/q21/q20/q4): 4 本共通の支配項は**文字列キーの hash 処理** —
+q21 は semi キー probe (unordered_set<string>::find 15.4% + hash 4.4% +
+memcmp 5% + 一時 string 2.7%)、q4 は join hash 表 probe (16%+)、q18 は
+group map find 10.6% + semi 5.6%。**RSS は健全**: baseline 10.4GB (SF=1 PAX
+常駐) に対しクエリ中の増分 ≤30MB — late materialization (NodeResult=row-ref
+のみ) で中間表現は爆発していない。
+
+E13 = **実行時型判定の int64 キー特化** (server のみ、proto/proxy 変更なし):
+「キー集合の全要素が int64 として完全パース (from_chars, 全長消費) できれば
+int セット/int マップへ切替。1 つでも失敗 (DECIMAL/空/オーバーフロー) したら
+従来のバイト比較経路」。canonical INT cell は値↔バイト表現が 1:1 なので
+値等価 = バイト等価が保存される (意味論不変の証明つき置換)。対象:
+(a) scan の semi/ext キー集合、(b) RunJoin の単一列キー hash 表。
+SOTA 系譜: DuckDB/Umbra の typed hash keys の縮小版 —
+本命の「型付きセル (SIMD の受け皿)」への中間段。
+
+E13 結果: **合計 7.77s** (InnoDB の 5.4 倍)。q4 642→360ms、q13 441→290ms、
+q21 1181ms、q9 222ms。q8/q10/q18 の +50-220ms は実行分散圏
+(q18 は 1.9-2.4s で揺れる)。dual review: Codex は E8-E12 に
+「correctness バグなし」(collect_columns 再帰網羅・AggSlot 残置なし・
+info() 同一性・eff-chain 型安全の 4 点検証済み)。

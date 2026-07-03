@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <charconv>
 #include <cstring>
 #include <memory>
 #include <string>
@@ -176,6 +177,34 @@ Dec dec_divide(const Dec& sum, uint64_t count, int out_scale) {
 // Row references and cell access.
 // ---------------------------------------------------------------------------
 constexpr uint64_t kNullRef = ~uint64_t{0};  // LEFT-join no-match marker
+
+// Typed-key fast path (E13): canonical INT cells parse losslessly to
+// int64, and canonical forms are unique per value, so value equality on
+// int64 is exactly byte equality on the cells. A set/table switches to
+// the int64 representation only when EVERY key converts with a
+// full-length parse; one failure (DECIMAL, empty/NULL, overflow) keeps
+// the byte-comparison path, so semantics never change.
+inline bool parse_i64(std::string_view v, int64_t* out) {
+    if (v.empty()) return false;
+    const char* first = v.data();
+    const char* last = v.data() + v.size();
+    auto res = std::from_chars(first, last, *out);
+    return res.ec == std::errc() && res.ptr == last;
+}
+
+inline bool to_int_set(const std::unordered_set<std::string>& in,
+                       std::unordered_set<int64_t>* out) {
+    out->reserve(in.size());
+    for (const auto& k : in) {
+        int64_t v;
+        if (!parse_i64(k, &v)) {
+            out->clear();
+            return false;
+        }
+        out->insert(v);
+    }
+    return true;
+}
 
 inline std::string_view cell_of(const PaxStore* store, uint64_t ref,
                                 uint32_t column) {
@@ -426,6 +455,11 @@ struct Executor {
         }
         const bool use_ext = ext_keys != nullptr &&
                              ext_filter_table == scan.table_idx();
+        // Typed-key probes (E13): int64 sets when every key converts.
+        std::unordered_set<int64_t> semi_ikeys, ext_ikeys;
+        const bool semi_int =
+            semi_set != nullptr && to_int_set(*semi_set, &semi_ikeys);
+        const bool ext_int = use_ext && to_int_set(*ext_keys, &ext_ikeys);
 
         const bool has_filter =
             scan.has_filter() && scan.filter().has_expr();
@@ -463,14 +497,30 @@ struct Executor {
                             if (semi_set != nullptr) {
                                 const std::string_view kv =
                                     grp->cell(semi_col + 1, slot);
-                                probe.assign(kv.data(), kv.size());
-                                if (semi_set->count(probe) == 0) continue;
+                                if (semi_int) {
+                                    int64_t v;
+                                    if (!parse_i64(kv, &v) ||
+                                        semi_ikeys.count(v) == 0)
+                                        continue;
+                                } else {
+                                    probe.assign(kv.data(), kv.size());
+                                    if (semi_set->count(probe) == 0)
+                                        continue;
+                                }
                             }
                             if (use_ext) {
                                 const std::string_view kv = grp->cell(
                                     ext_filter_column + 1, slot);
-                                probe.assign(kv.data(), kv.size());
-                                if (ext_keys->count(probe) == 0) continue;
+                                if (ext_int) {
+                                    int64_t v;
+                                    if (!parse_i64(kv, &v) ||
+                                        ext_ikeys.count(v) == 0)
+                                        continue;
+                                } else {
+                                    probe.assign(kv.data(), kv.size());
+                                    if (ext_keys->count(probe) == 0)
+                                        continue;
+                                }
                             }
                             if (has_filter) {
                                 if (!ev.set_row_from_pax_cols(
@@ -727,10 +777,28 @@ struct Executor {
             }
         }
 
-        // Build hash table: key bytes -> build row indexes.
+        // Build hash table: key bytes -> build row indexes. Single-column
+        // INT keys switch to an int64 table (E13); one non-converting key
+        // falls back to byte keys, so match semantics are unchanged.
         std::unordered_map<std::string, std::vector<uint32_t>> ht;
-        ht.reserve(build.rows());
-        {
+        std::unordered_map<int64_t, std::vector<uint32_t>> iht;
+        bool int_join = bk.size() == 1;
+        if (int_join) {
+            iht.reserve(build.rows());
+            for (size_t r = 0; r < build.rows(); ++r) {
+                int64_t v;
+                const std::string_view kv = value_of(
+                    bk[0].table_idx, build.refs[bk[0].pos][r], bk[0].column);
+                if (!parse_i64(kv, &v)) {
+                    int_join = false;
+                    iht.clear();
+                    break;
+                }
+                iht[v].push_back(static_cast<uint32_t>(r));
+            }
+        }
+        if (!int_join) {
+            ht.reserve(build.rows());
             std::string key;
             for (size_t r = 0; r < build.rows(); ++r) {
                 key.clear();
@@ -789,17 +857,31 @@ struct Executor {
                 const size_t begin = n * w / wc;
                 const size_t end = n * (w + 1) / wc;
                 for (size_t r = begin; r < end; ++r) {
-                    key.clear();
-                    for (const auto& k : pk) {
-                        append_join_key(
-                            key, value_of(k.table_idx, probe.refs[k.pos][r],
-                                          k.column));
+                    const std::vector<uint32_t>* mrows = nullptr;
+                    if (int_join) {
+                        int64_t v;
+                        const std::string_view kv =
+                            value_of(pk[0].table_idx,
+                                     probe.refs[pk[0].pos][r], pk[0].column);
+                        if (parse_i64(kv, &v)) {
+                            const auto iit = iht.find(v);
+                            if (iit != iht.end()) mrows = &iit->second;
+                        }
+                    } else {
+                        key.clear();
+                        for (const auto& k : pk) {
+                            append_join_key(
+                                key, value_of(k.table_idx,
+                                              probe.refs[k.pos][r],
+                                              k.column));
+                        }
+                        const auto it = ht.find(key);
+                        if (it != ht.end()) mrows = &it->second;
                     }
-                    const auto it = ht.find(key);
-                    bool matched = it != ht.end() && !it->second.empty();
+                    bool matched = mrows != nullptr && !mrows->empty();
                     if (matched && has_residual) {
                         matched = false;
-                        for (uint32_t br : it->second)
+                        for (uint32_t br : *mrows)
                             if (residual_ok(r, br)) {
                                 matched = true;
                                 break;
@@ -808,7 +890,7 @@ struct Executor {
                     switch (join.type()) {
                         case pb::QbJoin::INNER:
                             if (!matched) break;
-                            for (uint32_t br : it->second) {
+                            for (uint32_t br : *mrows) {
                                 if (!residual_ok(r, br)) continue;
                                 for (size_t c = 0; c < probe.tables.size();
                                      ++c)
@@ -821,7 +903,7 @@ struct Executor {
                             break;
                         case pb::QbJoin::LEFT:
                             if (matched) {
-                                for (uint32_t br : it->second) {
+                                for (uint32_t br : *mrows) {
                                     if (!residual_ok(r, br)) continue;
                                     for (size_t c = 0;
                                          c < probe.tables.size(); ++c)
