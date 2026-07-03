@@ -744,3 +744,65 @@ bit 一致、p≤15 で m<2^53 保証・s≤p で 10^s も exact); [Codex] strto
 dead code 化 (但し p>15 UNTYPED decimal 用に残存、zone map は元々 TPC-H perf-neutral =
 無害)。**submodule 変更なし** (engine DEC64 codec は M2a の 66ec58b で既にコミット済み、
 M2b は proxy+server の 2 hunk のみ)。
+
+### DDL-derivation の検討 (ユーザー設計入力への回答, 2026-07-03)
+
+**ユーザー提案**: 「storage server は multi-MySQL-QP DDL 同期のため既に table DDL を
+受信/格納しているはず (system key/row)。型付きセルの field kind を proto plumbing でなく
+**その格納 DDL から server 側で導出**すれば、導出点 1 箇所・ALTER で skew し得る並行
+チャネル無し・将来の multi-QP と整合。」
+
+**検証 (コード調査)**: **格納 DDL は存在しない。** 根拠:
+- `DbCreateTable` proto は `table_name` + 派生済み `pax_field_max_bytes/kind/scale` のみ
+  (DDL テキスト・列型・precision/scale の生データは一切含まない)。proto 全メッセージに
+  DDL/AlterTable/schema メッセージ無し。
+- server `handleDbCreateTable` は `Database::CreateTable(table_name)` (名前のみ) +
+  pax metadata install。列型/DDL を一切 persist しない。engine `Table` も PAX
+  `TableSchema`(我々が install する widths/kind/scale)以外の schema を持たない。
+- proxy の SE system-tables 配列は空 (`{nullptr,nullptr}`)。SDI/.frm を store に
+  serialize する経路無し。列定義を store に書く grep もヒット 0。
+- **disaggregated model の実体** (proxy:3811「multiple MySQL nodes share the same
+  LineairDB storage. The table may already exist from another node's CREATE
+  TABLE.」): 各 mysqld QP が**自ノードの MySQL data-dictionary/.frm**を持ち、同一 DDL を
+  それぞれ実行し、共有 server には冪等 `db_create_table` を投げる (2 回目は "already
+  exists")。**server 側に共有 DDL は無い**; QP 間の一貫性は「各 QP が同一 SQL を実行して
+  同一 Field を得る」ことで担保される (server 経由の DDL 共有ではない)。
+
+**判定: proto plumbing を維持 (推奨)。** 理由:
+1. 格納 DDL が無いので server 側導出は不可能 — 実現には (a) DDL/列型を store に永続化する
+   新メッセージ + server 側の型/precision/scale 表現、(b) server 側パーサ/導出 が必要で、
+   **現状より plumbing が増え surface/risk が上がる** (server は列型の概念を持たない)。
+2. ユーザーの狙い「導出点 1 箇所・skew する並行チャネル無し」は**現設計で既に成立**:
+   `compute_pax_field_widths` が唯一の導出点で、kind/scale は widths と**同一 Field から
+   同一関数で計算し同一 DbCreateTable メッセージで送出**。widths は M1 以前から同経路で
+   送っており、M2 は同メッセージを拡張しただけ (新規並行チャネルではない) → kind が width
+   に対し skew し得ない。ALTER は同一導出を再実行 (kind と width が一緒に更新)。QP 間で
+   kind が食い違うのは DDL 自体が食い違う場合のみで、それは widths/row-format も同様に
+   食い違う既存の共有ストレージ前提外の事象。
+3. **将来方針として記録**: 別目的で server 側 DDL/schema ストア (SDI 永続化等) が導入される
+   なら、その時点で kind 導出をそこへ寄せるのは綺麗な統合 — ユーザー提案を preferred
+   future direction として保持。今 M2 のためだけに DDL ストアを新設するのは非推奨。
+
+### SF=5 再計測 (M2 = M1+M2a+M2b, label PAX-SE-M2-sf5, 2026-07-03)
+
+分析 doc (2026-07-03-sf5-analysis.md) の予測「#1+#2 で arena 27.7→7.7GB・RSS 38.5→~18.5GB」
+の検証。手順は分析と同一 (fresh load・1 warm+3 timed・min-of-3)。**RSS が予測を的中**:
+
+| | E17 baseline (分析) | M1 (SF=5 RSS のみ) | **M2 (M2b)** | E17→M2 |
+|---|---|---|---|---|
+| VmRSS | 38.48 GB | 25.38 GB | **18.95 GB** | **−50.8%** (M1 比 −25.4%) |
+| FORCED wall total | 32.90s (※ON) | (未計測) | **30.96s** | (mode 差あり注記) |
+| vs DuckDB 1.31s | 25.2× | — | **23.6×** | |
+
+**RSS 18.95GB は分析予測 ~18.5GB とほぼ一致** — 型付き数値セルで arena がさらに縮み、
+M1+M2 で E17 比半減。q1/q6/q17 の FORCED-vs-OFF md5 MATCH (SF=5 correctness spot check)。
+**per-query 改善 (vs E17)**: q1 1164→930 (**−20%**, DECIMAL SUM 税), q13 1740→1330 (−24%),
+q7 1182→891 (−25%), q21 5822→5131 (−691), q5/q8/q9/q3/q4 各 −130〜150。q6 は 196→192 と
+微小 (SF=5 では scan/cell-fetch がメモリ帯域律速で parse 除去の効果が出にくい=SIMD スパイクの
+「int64 化後は帯域律速」と整合)。**唯一の退行: q18 9086→9782 (+696)** = IntKey group の
+`key_cols` を新グループ毎に key_view で ASCII format する費用 (1.5M グループ×format vs
+pre-M2 の raw-ASCII copy)。**注記**: E17 baseline は `use_secondary_engine=ON`(auto)、
+本計測は FORCED なので wall total の直接比較は mode 差を含む (RSS と md5 は無影響)。
+**次レバー (M2 scope 外)**: q18 の key_cols を emit 時遅延 format 化 (ORDER BY+LIMIT 100 の
+生存グループのみ format) で +696 を回収可能; 本丸は radix 並列 agg (DuckDB が q18/q20 を
+~90× で勝つ真因)。計測後スタック停止 (mysqld+server)。
