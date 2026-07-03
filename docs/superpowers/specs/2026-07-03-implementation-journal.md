@@ -806,3 +806,14 @@ pre-M2 の raw-ASCII copy)。**注記**: E17 baseline は `use_secondary_engine=
 **次レバー (M2 scope 外)**: q18 の key_cols を emit 時遅延 format 化 (ORDER BY+LIMIT 100 の
 生存グループのみ format) で +696 を回収可能; 本丸は radix 並列 agg (DuckDB が q18/q20 を
 ~90× で勝つ真因)。計測後スタック停止 (mysqld+server)。
+
+### 訂正: DDL 由来型導出の在り処 (2026-07-03, ユーザー指摘)
+
+M2 の「サーバ側 DDL ストア無し」判定は helios-pax 系譜では正しいが、
+**~/experimental/helios の `claude/ddl-version-sync` ブランチに SDI ベースの
+DDL 同期が実在**する (dd::serialize をストアへ保存 + handlerton::discover で
+未作成ノードが resync、Phase1/2、dual-review 済み、TPC-C/TATP/TPC-H 検証済み)。
+helios-pax には参照コメント 2 箇所のみで未移植。SDI JSON は列型/精度/スケールを
+完全に含むため、**移植すれば型 kind 導出を保存 SDI に一元化できる**
+(サーバ側に軽量 SDI リーダーを追加)。それまでは M2 の「幅と kind を同一関数・
+同一 DbCreateTable で導出」が正当 (スキュー構造なし)。
