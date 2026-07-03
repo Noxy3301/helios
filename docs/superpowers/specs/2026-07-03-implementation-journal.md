@@ -701,4 +701,46 @@ TPC-C 1/8/32/64t = **415.5/1505.7/3603.3/5086.3 req/s、全点 Unexpected Errors
   secondary/row の YEAR 表示差は別課題として記録 (M2a scope 外)。
 両修正後に再ゲート **22/22 + 回帰 12/12 ALL-MATCH**。**教訓**: 型付き列の全 reader は
 schema-driven 必須 (byte-sniff は特定値だけ静かに壊れ md5 が運で通る) — 決定的回帰
-(all-digit-byte 値・UNSIGNED・DATE キー・YEAR round-trip) で網羅。
+(all-digit-byte 値・UNSIGNED・DATE キー・YEAR round-trip) で網羅。コミット: submodule
+66ec58b + parent fbecec8。
+
+### M2b: 型付き DECIMAL セル (FK_DEC64) + strtod-double 境界の保存 (2026-07-03)
+
+**変更は 2 hunk のみ** (M2a で codec/read_dec/key_view/decode_cell_i64-reject は実装済み):
+(1) proxy `compute_pax_field_widths` で NEWDECIMAL(p,s) を **FK_DEC64** (value×10^s の
+scaled int64、8B) に、(2) predicate evaluator の DEC64 フィルタ分岐。
+
+**核心 = strtod-double 境界の保存 (SIMD スパイクの罠).** byte 経路は DECIMAL を
+`strtod(val_str)` の **double** で比較する (q6 の `BETWEEN 0.06-0.01 AND 0.06+0.01` は
+0.07 を除外: strtod("0.07")=0.0700…067 > 畳込み上限 0.0699…983)。**罠を回避する鍵**:
+scaled int m を **`(double)m/10^s` に変換して DOUBLE 比較**すれば、m と 10^s が両方
+exact double である限り strtod(val_str) と **bit 一致** (単一 IEEE 除算 = 正確丸め =
+strtod)。これは `m < 2^53` で保証 → proxy を **precision ≤ 15** に cap (10^15 < 2^53)。
+これで既存の DOUBLE compare がそのまま byte 一致、演算子別の整数境界ロジック不要
+(スパイクの llround アプローチが境界で誤ったのは整数比較に落としたため — DOUBLE 空間に
+留めれば罠なし)。AGG (SUM/AVG) は `decode_cell_dec`→Dec.m を exact int64 mantissa で
+持つので dec_parse と完全一致 (q1 の 4 本の DECIMAL SUM)。p>15/ZEROFILL は UNTYPED 維持。
+
+**実測 (SF=1, clean).**
+| | M1 (f75270b) | M2a | **M2b** | M1→M2b |
+|---|---|---|---|---|
+| VmRSS | 7.33 GB | 6.32 GB | **6.06 GB** | **−1.27 GB (−17.3%)** |
+| FORCED wall | 6.04 s | 5.88 s | **5.79 s** | −0.25 s |
+| **q1** (DECIMAL SUM×4) | 258 | 254 | **209** | **−19%** (dec_parse 税消滅) |
+| **q6** (DECIMAL filter) | 73 | 76 | **67** | −8% |
+q9 187, q18 1507 も改善。SF=1 は固定コスト律速のため q1/q6 の改善は −8〜19%、**SF=5 では
+per-row 税が cardinality 比例で伸びるため大幅拡大見込み** (分析: #2 は SF=5 で arena
+−6.9GB・q1/q6 の 25-52% バケット消滅)。q4/q19/q21 の +数十ms は DEC64 非接触経路で noise
+(join/semi 系)。**検証**: SF=0.01 22/22 FORCED-vs-OFF + 回帰 16/16 (DECIMAL 境界
+`p BETWEEN 0.06±0.01`・`p>=0.07`・負値・9999999999999.99 の SUM・round-trip)、
+**q6 md5 が M2a/M1 とバイト一致 (double 境界保存の直接証明)**、SF=1 22/22 md5 M1 一致。
+TPC-C 1/8/32/64t = **427.9/1516.4/3647.3/5063.0 req/s、全点 0 errors** (M1 比 ±2.5%、
+DECIMAL scatter 影響なし)。**dual review 両者 correctness bug なし**: [code-reviewer]
+`(double)m/10^s == strtod(val_str)` を厳密証明 (両者とも同一有理数の round-to-nearest =
+bit 一致、p≤15 で m<2^53 保証・s≤p で 10^s も exact); [Codex] strtod と (double)m/10^s を
+境界/乱数/負値/DECIMAL(15,15)/max で実測比較し 1-ULP 差分なし・q6 の 0.07 除外を再確認。
+両者 AGG mantissa 一致・round-trip byte 一致・M2a 経路非破壊を確認。code-reviewer の
+非correctness 指摘: DEC64 列は zone map skip されるので ZKind::DECIMAL 経路が TPC-H で
+dead code 化 (但し p>15 UNTYPED decimal 用に残存、zone map は元々 TPC-H perf-neutral =
+無害)。**submodule 変更なし** (engine DEC64 codec は M2a の 66ec58b で既にコミット済み、
+M2b は proxy+server の 2 hunk のみ)。

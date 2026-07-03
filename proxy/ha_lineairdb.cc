@@ -3734,13 +3734,28 @@ static std::vector<uint32_t> compute_pax_field_widths(
         w = std::max<uint32_t>(w, 40);
         break;
       case MYSQL_TYPE_DECIMAL:
-      case MYSQL_TYPE_NEWDECIMAL:
-        w += 2;  // sign + decimal point slack (UNTYPED bound)
-        // [M2b] A fixed-scale DECIMAL(p,s) whose value fits a scaled int64
-        // becomes an 8-byte FK_DEC64 cell here; DISABLED in M2a (DECIMAL stays
-        // ASCII UNTYPED) — enabled in the M2b stage together with the server's
-        // typed-decimal filter/agg path (strtod-double boundary semantics).
+        w += 2;  // sign + decimal point slack (UNTYPED bound); old DECIMAL only
         break;
+      case MYSQL_TYPE_NEWDECIMAL: {
+        w += 2;  // sign + decimal point slack (UNTYPED bound)
+        // [M2b] A fixed-scale DECIMAL(p,s) -> 8-byte FK_DEC64 (value * 10^s as a
+        // scaled int64). Two exactness requirements set the precision cap of 15:
+        //   * the scaled int64 must hold every value: 10^15 - 1 < INT64_MAX (ok
+        //     up to p<=18), and
+        //   * the FILTER path compares (double)scaled / 10^s, which must equal
+        //     strtod(val_str) EXACTLY so the byte-path double semantics (the
+        //     q6 BETWEEN 0.07 boundary from the SIMD spike) are preserved. That
+        //     holds only while scaled and 10^s are both exact doubles, i.e.
+        //     scaled < 2^53 => p <= 15 (10^15 < 2^53). The AGG path stays exact
+        //     regardless (int64 mantissa). p > 15 or ZEROFILL stays UNTYPED.
+        const auto *fd = down_cast<const Field_new_decimal *>(f);
+        if (!zerofill && fd->precision <= 15) {
+          kind = pax_kind::DEC64;
+          scale = static_cast<int32_t>(f->decimals());
+          w = 8;
+        }
+        break;
+      }
       case MYSQL_TYPE_DATE:
       case MYSQL_TYPE_NEWDATE:
         // DATE val_str is always "YYYY-MM-DD" -> YYYYMMDD int (fits int32).

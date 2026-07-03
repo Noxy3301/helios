@@ -237,8 +237,22 @@ PredicateEvaluator::Val PredicateEvaluator::extract_value(
           }
           break;
         }
-        // FK_DEC64 is introduced in M2b (DECIMAL); until then decimals are
-        // UNTYPED, so a typed DEC64 cell never reaches here.
+        if (kind == LineairDB::Pax::FK_DEC64) {
+          // M2b: reproduce the byte path's DECIMAL comparison, which folds the
+          // cell to a double via strtod(val_str). For a scaled int64 m with
+          // scale s, (double)m / 10^s is bit-identical to strtod("m/10^s")
+          // whenever m and 10^s are both exact doubles — guaranteed by the
+          // proxy's precision<=15 cap (m < 2^53). So a plain DOUBLE Val keeps
+          // the existing DOUBLE compare byte-identical (no boundary trap).
+          int64_t m;
+          std::memcpy(&m, col.data(), 8);
+          const int s = schema_->scale_of(static_cast<size_t>(idx) + 1);
+          double p = 1.0;
+          for (int k2 = 0; k2 < s; ++k2) p *= 10.0;
+          v.type = ValType::DOUBLE;
+          v.d = static_cast<double>(m) / p;
+          break;
+        }
       }
       // Convert column string to typed value based on compare_type hint.
       switch (expr.compare_type()) {
