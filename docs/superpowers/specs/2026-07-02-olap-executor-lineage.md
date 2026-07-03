@@ -89,3 +89,11 @@ nullable 列の NOT IN を許すなら has_null ガードを allowlist 条件に
 追加出典: DuckDB flatten_dependent_join.cpp / join_hashtable.cpp、
 MySQL WL#13520、Neumann BTW2025 (Umbra も 2015 アルゴリズム使用と明言)、
 Birler&Neumann CIDR2026 (mark join 線形時間)、Spark SPARK-32290/32494。
+
+## 追記 3: Phase E6/E7 の採用判断 (2026-07-03)
+
+| # | 採用判断 | 系譜・出典 | 対象 |
+|---|---|---|---|
+| 19 | **scan 間の実行時キーフィルタ連鎖** (selective scan 先行発行 → 後続 scan が実行済みノードの実キー集合で strip probe)。join 型/側の安全規則: build 側=常に可、probe 側=INNER/SEMI のみ | Sideways Information Passing / LIP (Zhu et al., SIGMOD 2017 "Looking Ahead Makes Query Plans Robust")、DuckDB dynamic filter pushdown、Redshift/Spark AQE runtime filter。安全規則は semi-join reduction の保存則 (Bernstein-Chiu 1981 semijoin program) | q2 q5 q7 q9 q20 q22 (E6 で合計 24.5→19.6s) |
+| 20 | **DuplicateWeedout プランの hash SEMI への逆写像** (WEEDOUT(FILTER*(INNER)) で dedup rowid 集合=join 片側 → SEMI+残差)。旧 optimizer の物理戦略を論理 semijoin に戻して自前実行 | weedout ≡ semijoin は MySQL 自身の sj 戦略定義 (WL#3985 DuplicateWeedout)。hash semi 実行は HyPer/DuckDB 標準 | q20 q21 (E7) |
+| 21 | **「借り物オプティマイザ」の統計限界の実証**: 旧 optimizer は field=field 等値を COND_FILTER_EQUALITY=0.1 でハードフロア (ヒストグラム不発・rec_per_key は REF 専用) — secondary へ統計を貸すだけでは不足で、プラン品質は実行時ルール (#19/#20) で回収する設計に | MySQL ソース読解 (item_cmpfunc.cc get_filtering_effect / item.cc get_cond_filter_default_probability)。HeatWave が index metadata を secondary に保持する設計との対比 | 論文 discussion |

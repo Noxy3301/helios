@@ -104,3 +104,98 @@ secondary 向けコストを注入し、オプティマイザに hash 実行前�
 | semi source 後処理 (scan 先行発行 + 「group キーと equi-join する最小実表 scan」選定) | **q17 3.06s→97ms** — 写像経路で D3 相当を回復。q22 119ms |
 | hash join コストに出力行数項 | q5 4.0s 未回復。仮説: NLJ/index の全 reject で探索空間が痩せ、生き残る唯一の prefix が M:N 順 — reject でなく高価格化 (探索柔軟性を残す) が次の一手 |
 | 合計 | 24.6s (D3 21.0s, 残差は q5 4.0s + q21 9.6s)。q21 は LEFT derived への実行時フィルタ注入 (構造課題) |
+
+### E5: reject→高価格化 実験と「旧オプティマイザ」の発見 (2026-07-03)
+
+| 試行 | 観測 | 判断 |
+|---|---|---|
+| コストフックの NLJ/index 系を reject(return true) から有限ペナルティ (100x+1) に変更 | ゲート 22/22 PASS、SF=1 合計 24.5s — **q5 4.15s 変化なし。仮説棄却** | 変更自体は維持 (原理的に安全な形) |
+| q5/q21 の EXPLAIN 精査 | `orders⋈customer` 見積 13.7e9 行、`l1⋈l2 (orderkey)` 32.4e9 行 (真値 24M)、q21 全体 24.3e18 行 — **FK join の等値選択率が既定値に落ちている** | 探索でなく見積もりの問題と断定 |
+| optimizer trace 取得 | **トレースは旧オプティマイザ形式** (`considered_execution_plans` / `condition_filtering_pct: 10` / weedout 戦略)。`SET optimizer_switch='hypergraph_optimizer=on'` → 「not supported in non-debug builds」 | **重大な訂正: このビルドは hypergraph 非対応。secondary 経路は常に旧 (System-R 型) オプティマイザで計画されていた** |
+
+**訂正が波及する過去の記述 (論文用に重要)**:
+1. Phase B の「hypergraph optimizer が使われ旧構造は未構築」→ 誤り。best_positions nil の理由は別 (要再調査だが、旧 optimizer が AccessPath 木も生成するため写像自体は有効)
+2. E3 の `secondary_engine_modify_access_path_cost` フックは **hypergraph 専用 = このビルドでは一度も呼ばれていない死にコード**。E3/E5 の「効果」とされた q22 改善は実際には同時に入れた E2 (semi rule) のもの
+3. 「プラン写像の罠 = NLJ 前提コストのプランを hash 実行に写すと爆発」という E1 の解釈 → 真因はより単純: **secondary TABLE インスタンスに rec_per_key が無く、全等値 join の選択率が盲目既定値 (0.1 / 1e-4) に落ち、FK join が M:N 爆発として見積もられる**。旧 optimizer は「爆発の小さい方」として本物の M:N 辺を先に選んでいた
+4. 「HeatWave がコストフックを持つ理由の実証」→ このビルドでは検証不能 (フック不発)。主張は「借り物オプティマイザには secondary 向け統計の供給が必要」に差し替え — こちらの方が一般的で強い主張
+
+### E6 バンドル (2026-07-03, 実装中)
+
+| # | 変更 | 狙い |
+|---|---|---|
+| 1 | `info(HA_STATUS_CONST)` で primary TABLE (thd->open_tables から handler 一致で回収) の rec_per_key を secondary TABLE へ転写 | 等値選択率の根本修正 = q5/q21/q18/q20 のプラン正常化。「stats 同期」の完成 |
+| 2 | syntax 経路の scan 発行順を records 昇順に (join tree は FROM 順のまま) | q21 (weedout→syntax fallback) で nation→supplier→l1→derived の semi 連鎖を形成 |
+| 3 | 写像経路の semi 後処理を一般化: (a) join 型/側の安全性規則 (build 側=常に可、probe 側=INNER/SEMI のみ — LEFT/ANTI の probe 側注入は行落ち=Codex#1 と独立に同定した潜在バグ)、(b) 対象に実表 scan も追加 (scan 連鎖)、(c) source 候補に「join 相手サブツリーの実行済み root ノード」を追加 | q21 系 (derived が joined 中間のキー集合を受ける)、safety 修正 |
+| 4 | Codex レビュー対応: FILTER 単一表 conjunct はポインタ一致時のみ skip (#2)、residual の表スコープ検査→写像 reject (#4)、NLJ は `join_type` を正、hash の `rewrite_semi_to_inner` は reject (#3) | 正しさ (wrong-results 級 2 件を先回りで封鎖) |
+
+### E6 結果 (2026-07-03, SF=1 FORCED, 全 md5 MATCH)
+
+| 指標 | E5 | E6 | 要因 |
+|---|---|---|---|
+| 合計 (min-of-3) | 24.5s | **19.6s (歴代最良、D3 21.0s 超え)** | scan semi 連鎖 |
+| q2 | 273ms | **39ms** | region→nation→supplier 連鎖 |
+| q7 | 829ms | **258ms** | nation 起点連鎖 |
+| q9 | 980ms | **332ms** | 同上 |
+| q5 | 4153ms | **2151ms** | scan 入力半減 (M:N 中間は残存) |
+| q20 | 2063ms | **850ms** | 連鎖+derived semi |
+| q22 | 117ms | **76ms** | |
+| q21 | 9566ms | 9188ms (フラット) | weedout→syntax、vt semi 不発のまま |
+| q18 | ~3.3s | フラット | derived agg (キーが agg 後に決まる形) |
+
+**E6 の負の結果 2 件 (論文の重要観測)**:
+1. rec_per_key 転写もヒストグラム (ANALYZE UPDATE HISTOGRAM + FLUSH TABLES) も**見積もりを 1 ミリも動かさなかった** (probe join 依然 900e9 行)。ソース読解で確定: 旧 optimizer の `Item_func_eq::get_filtering_effect` は field=field に対し (a) ヒストグラムは field=const 専用で不発、(b) フォールバックは `max(1/NDV, COND_FILTER_EQUALITY=0.1)` — **等値 join の選択率は 0.1 でハードフロア**。rec_per_key は REF アクセスのコストにしか効かず、index を持たない (scan+hash のみの) secondary エンジンには届かない
+2. 教訓の一般化: 「借り物オプティマイザには統計を貸すだけでは足りず、**統計が効くアクセスパス (REF) ごと貸す**か、プラン品質は実行時ルール (sideways information passing) で取り返すかの二択」。HeatWave が cost フックだけでなく index metadata を secondary に保持する理由とも整合
+
+### E7 (2026-07-03, 実装済み・検証中)
+
+| # | 変更 | 狙い |
+|---|---|---|
+| 1 | **WEEDOUT→SEMI 写像**: WEEDOUT(FILTER*(INNER JOIN)) で dedup rowid 集合が join の片側と一致する形を hash SEMI (残差=中間 FILTER+非等値) に書き換え | q21/q20 の写像経路化 — semi ルール群 (scan 連鎖・derived 注入) がq21に届く |
+| 2 | keyless INNER の緩和: 片側の見積もりが極小 (≤100 行) なら許可 (q21 の nation×weedout クロス)。q19 型 (両側巨大) は据え置き reject | q21 が keyless ガードで syntax に落ちるのを防ぐ |
+| 3 | Claude レビュー F1-F5: 複数 derived の vt 番号不一致→emission 順序検査 (Critical, TPC-H 未発火の潜在 wrong-results)、`<=>` を等値キーとして写像しない、非 root の SORT/LIMIT/AGGREGATE を透過しない (root spine 検査)、HAVING conjunct はポインタ一致で skip (agg.having と二重化しない)、cost フックの負値ガード | 正しさ |
+| 4 | 回帰テスト 2 本をゲートに追加 (2-derived 逆順 join / `<=>` NULL join) | レビュー提案 |
+
+E7 の安全条件 (レビュー追認 2 点): (a) weedout→SEMI は dedup 表集合が join
+片側と**完全一致**の場合のみ (subset は reject)。消される側への下流参照は
+node_tabs 非包含で loud reject に落ちる。(b) keyless INNER の ≤100 行緩和は
+見積もり由来 — 過大なら reject (syntax へ、安全側)、過小でも server の 64M
+中間キャップが上限 (perf 事故止まり、wrong results にはならない)。
+
+### E7 結果 (2026-07-03, SF=1)
+
+ゲート 22/22 + 回帰 2 本 (two-derived MATCH / `<=>` loud reject) PASS、
+SF=1 hot 5 本 md5 MATCH、合計 19.78s (E6 19.6s とフラット)。
+**q21 は 9.6s のまま — weedout→SEMI 写像は着地したが q21 は依然 reject**。
+プラン精査で真因特定: MySQL の等値伝播が LEFT join キーを
+`derived.col = l2.l_orderkey` と **SEMI 化で消えた l2 の列**で表現しており、
+サイド解決 (node_tabs 包含) が失敗して "plan join key sides" → syntax 落ち。
+orders の join キー (`o_orderkey = l2.l_orderkey`) も同型。
+
+### E7b: 強制済みキー等価による書き換え (2026-07-03)
+
+サイド解決を一般化: **既発行の INNER/SEMI join キーペアを等価辺として蓄積**し、
+キー端点の表が要求サイドに無い場合は等価クラス内の「サイドに居る」列へ置換。
+健全性: INNER/SEMI のキーは生存行すべてで等値が強制済み (LEFT は null 拡張行、
+ANTI は非一致行で不成立のため**辺に加えない**)。weedout→SEMI で消えた l2 への
+参照が、SEMI 自身が強制した l1.ok=l2.ok を通じて l1 に書き戻る。
+期待: q21 が写像経路に乗り、scan 連鎖 (nation→supplier→l1→l2) +
+derived への 15 万キー注入で 9.6s → ~1s 圏。
+
+| 試行 | 観測 | 判断 |
+|---|---|---|
+| E7b 初版 (サイド解決を常に等価クラス経由に) | ゲートで q10 MISMATCH — pick() が「元の端点が有効でも」クラスの別列を返し得るため join 出力の行順が変わり、q10 既知の ORDER BY 同値タイ+LIMIT 20 境界が発火 | 置換を**両向き失敗時のフォールバックに限定** (既写像クエリの挙動変更ゼロを保証)。ゲートに MISMATCH 時の diff+「same rows, order differs」判定を常設 |
+
+### E7c 結果 (2026-07-03, SF=1 FORCED, ゲート 22/22 + 回帰 2 + hot md5 全 MATCH)
+
+| 指標 | E6/E7 | E7c | 要因 |
+|---|---|---|---|
+| **合計 (min-of-3)** | 19.6s | **12.0s** | q21 の写像経路化 |
+| q21 | 9,601ms | **1,457ms (6.6x)** | weedout→SEMI + E7b 書き換え + scan 連鎖 + derived 注入 |
+| q20 | 835ms | 999ms | 同経路 (微増はノイズ域) |
+| q5 | 2,099ms | 2,154ms | 未解決 (M:N 順序、REF 貸与が本命) |
+| q18 | 2,922ms | 2,930ms | 未解決 (derived agg、キーが agg 後に決まる) |
+
+**歴代**: C3 22.1s → D3 21.0s → E1 27.0s → E4 24.6s → E6 19.6s → **E7c 12.0s**
+(InnoDB champion 42.2s の 3.5 倍、Phase D 目標 ~13s を達成)。
+残る主要打者: q18 2.9s (サーバ集計の 1.5M group アロケーション疑い — perf へ) と
+q5 2.2s (プラン順序)。
