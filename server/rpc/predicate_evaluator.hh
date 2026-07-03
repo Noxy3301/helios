@@ -35,6 +35,18 @@ class PredicateEvaluator {
   bool set_row_from_pax(const LineairDB::Pax::PaxGroup& group, uint32_t slot,
                         uint32_t num_columns);
 
+  // Like set_row_from_pax, but fetch only the given column ordinals — the
+  // ones the filter expression actually references (collect_columns).
+  // Untouched columns stay empty and must not be read by the expression.
+  bool set_row_from_pax_cols(const LineairDB::Pax::PaxGroup& group,
+                             uint32_t slot, uint32_t num_columns,
+                             const std::vector<uint32_t>& cols);
+
+  // Gather the column ordinals referenced by an expression tree
+  // (sorted, deduplicated).
+  static void collect_columns(const LineairDB::Protocol::FilterExpr& expr,
+                              std::vector<uint32_t>* out);
+
   // Synthesized-row variant for joined tuples: columns_[i] = cells[i];
   // nulls[i] marks SQL NULL (e.g. a LEFT-join miss).
   void set_row_from_views(const std::vector<std::string_view>& cells,

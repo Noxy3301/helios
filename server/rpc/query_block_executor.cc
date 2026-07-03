@@ -425,6 +425,12 @@ struct Executor {
 
         const bool has_filter =
             scan.has_filter() && scan.filter().has_expr();
+        // Fetch only the cells the filter actually references — a wide
+        // table's full-row load dominated filtered scans (perf: q20).
+        std::vector<uint32_t> filter_cols;
+        if (has_filter)
+            PredicateEvaluator::collect_columns(scan.filter().expr(),
+                                                &filter_cols);
         const unsigned wc =
             static_cast<unsigned>(std::min<size_t>(workers(), n_groups));
         std::vector<std::vector<uint64_t>> locals(wc);
@@ -435,6 +441,7 @@ struct Executor {
             pool.emplace_back([&, w] {
                 PredicateEvaluator ev;
                 auto& mine = locals[w];
+                std::string probe;  // reused key buffer: no per-row alloc
                 for (size_t g = w; g < n_groups; g += wc) {
                     PaxGroup* grp = store->group(g);
                     if (grp == nullptr) continue;
@@ -452,19 +459,20 @@ struct Executor {
                             if (semi_set != nullptr) {
                                 const std::string_view kv =
                                     grp->cell(semi_col + 1, slot);
-                                if (semi_set->count(std::string(kv)) == 0)
-                                    continue;
+                                probe.assign(kv.data(), kv.size());
+                                if (semi_set->count(probe) == 0) continue;
                             }
                             if (use_ext) {
                                 const std::string_view kv = grp->cell(
                                     ext_filter_column + 1, slot);
-                                if (ext_keys->count(std::string(kv)) == 0)
-                                    continue;
+                                probe.assign(kv.data(), kv.size());
+                                if (ext_keys->count(probe) == 0) continue;
                             }
                             if (has_filter) {
-                                if (!ev.set_row_from_pax(
+                                if (!ev.set_row_from_pax_cols(
                                         *grp, slot,
-                                        scan.filter().num_columns())) {
+                                        scan.filter().num_columns(),
+                                        filter_cols)) {
                                     failed[w] = 1;
                                     return;
                                 }
@@ -889,6 +897,7 @@ struct Executor {
         }
         std::vector<int> apos(n_agg, -1);
         std::vector<int> fpos(n_agg, -1);
+        std::vector<std::vector<uint32_t>> fcols(n_agg);
         for (int a = 0; a < n_agg; ++a) {
             if (agg.aggs(a).has_arg() || agg.aggs(a).has_filter()) {
                 apos[a] = in.table_pos(agg.aggs(a).arg_table());
@@ -897,6 +906,9 @@ struct Executor {
             if (agg.aggs(a).has_filter()) {
                 fpos[a] = in.table_pos(agg.aggs(a).filter_table());
                 if (fpos[a] < 0) return fail("agg filter table not in input");
+                if (agg.aggs(a).filter().has_expr())
+                    PredicateEvaluator::collect_columns(
+                        agg.aggs(a).filter().expr(), &fcols[a]);
             }
         }
         PredicateEvaluator ev;
@@ -948,10 +960,10 @@ struct Executor {
                     const PaxStore* st = stores[af.filter_table()];
                     const PaxGroup* grp =
                         st->group(fref / PaxGroup::kRows);
-                    if (!ev.set_row_from_pax(
+                    if (!ev.set_row_from_pax_cols(
                             *grp,
                             static_cast<uint32_t>(fref % PaxGroup::kRows),
-                            af.filter().num_columns()))
+                            af.filter().num_columns(), fcols[a]))
                         return fail("agg filter unevaluable");
                     if (!ev.evaluate(af.filter().expr())) continue;
                 }
@@ -1314,7 +1326,18 @@ struct Executor {
             for (auto& t : pool) t.join();
             for (char f : failed)
                 if (f) return false;
-            for (auto& l : locals) MergeGroups(groups, l, agg);
+            // One up-front rehash to the merged size; per-step growth
+            // would rehash the (large) destination once per local.
+            size_t total = 0;
+            for (auto& l : locals) total += l.size();
+            bool first = true;
+            for (auto& l : locals) {
+                MergeGroups(groups, l, agg);
+                if (first && !groups.empty()) {
+                    groups.reserve(total);
+                    first = false;
+                }
+            }
         }
 
         // Implicit grouping emits one row over zero input.

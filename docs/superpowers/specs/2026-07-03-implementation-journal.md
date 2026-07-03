@@ -199,3 +199,19 @@ derived への 15 万キー注入で 9.6s → ~1s 圏。
 (InnoDB champion 42.2s の 3.5 倍、Phase D 目標 ~13s を達成)。
 残る主要打者: q18 2.9s (サーバ集計の 1.5M group アロケーション疑い — perf へ) と
 q5 2.2s (プラン順序)。
+
+### E8: perf 駆動のサーバ側チューニング (2026-07-03)
+
+perf 実測 (SF=1): q20 は `set_row_from_pax` (フィルタ評価用の全 16 列ロード) が
+**37%**、q18 は string キー hash map (GroupState find + semi set probe +
+hash/memcmp) が合計 **~31%**。
+
+| 施策 | 結果 | 教訓 |
+|---|---|---|
+| フィルタが参照する列だけロード (`set_row_from_pax_cols` + collect_columns) | 全フィルタ付き scan が改善: q6 111→78ms, q14 165→111ms, q15 302→196ms, q12 132→96ms, q7 309→227ms | 幅広表の行全載せがフィルタ scan の支配項だった |
+| semi/ext キー probe の一時 string 再利用 (per-row alloc 排除) | q20 999→912ms, q21 1457→1347ms | C++17 の unordered_set は heterogeneous lookup 不可 — assign 再利用で十分 |
+| MergeGroups 内で毎ステップ reserve | **q18 2.93→4.95s に退行** — マージ 31 回それぞれが成長サイズへ rehash | reserve は「最初の move 後に合計サイズで 1 回」(E8b) — q18 2.93→**2.38s** |
+
+**E8b 合計: 11.0s** (E7c 12.0s → -1.0s、全 md5 MATCH)。InnoDB champion 42.2s
+の **3.8 倍**。残: q18 2.38s (hash map 本体 — compact GroupState + int64 キー
+特化が次)、q5 2.24s (REF アクセス貸与)、q4 693ms、q13 498ms。
