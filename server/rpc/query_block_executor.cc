@@ -8,6 +8,7 @@
 #include <string>
 #include <thread>
 #include <set>
+#include <type_traits>
 #include <unordered_set>
 #include <unordered_map>
 #include <vector>
@@ -992,9 +993,24 @@ struct Executor {
         std::vector<AggSlot> aggs;
     };
     using GroupMap = std::unordered_map<std::string, GroupState>;
+    // E15: int64-keyed variant for the single-INT-group-column fast path.
+    using IntGroupMap = std::unordered_map<int64_t, GroupState>;
 
-    bool AccumulateRange(const pb::QbAggregate& agg, const NodeResult& in,
-                         size_t begin, size_t end, GroupMap& groups) {
+    // Accumulates rows [begin,end) into `groups`. Generic over the map key:
+    // the string-keyed GroupMap builds length-prefixed byte keys as before,
+    // while the int64-keyed IntGroupMap (E15) parses the single group cell
+    // as int64. In the int path the first cell that does not parse
+    // full-length sets *parse_fail and returns false, so the caller discards
+    // the partial result and re-runs the whole aggregation on the string
+    // path — semantics stay identical (only pure-INT single group columns
+    // ever take the fast path; canonical INT cells have value==byte equality,
+    // mirroring the E13 join-key convention).
+    template <typename MapT>
+    bool AccumulateRangeT(const pb::QbAggregate& agg, const NodeResult& in,
+                          size_t begin, size_t end, MapT& groups,
+                          std::atomic<bool>* parse_fail) {
+        constexpr bool IntKey =
+            std::is_same_v<typename MapT::key_type, int64_t>;
         const int n_agg = agg.aggs_size();
         const int n_grp = agg.group_columns_size();
         // Resolve positions once.
@@ -1020,35 +1036,63 @@ struct Executor {
             }
         }
         PredicateEvaluator ev;
-        std::string keybuf;
-        std::vector<std::string_view> gv(n_grp);
+        [[maybe_unused]] std::string keybuf;
+        [[maybe_unused]] std::vector<std::string_view> gv(n_grp);
         for (size_t r = begin; r < end; ++r) {
-            keybuf.clear();
-            for (int g = 0; g < n_grp; ++g) {
-                const auto& c = agg.group_columns(g);
-                const uint64_t ref = in.refs[gpos[g]][r];
-                gv[g] = ref == kNullRef
-                            ? std::string_view()
-                            : value_of(c.table_idx(), ref, c.column());
-                if (c.prefix_len() > 0 && gv[g].size() > c.prefix_len())
-                    gv[g] = gv[g].substr(0, c.prefix_len());
-                const uint32_t l = static_cast<uint32_t>(gv[g].size());
-                keybuf.append(reinterpret_cast<const char*>(&l), sizeof(l));
-                keybuf.append(gv[g].data(), gv[g].size());
-            }
-            auto it = groups.find(keybuf);
             GroupState* gs;
-            if (it == groups.end()) {
-                GroupState st;
-                st.key_cols.resize(n_grp);
-                for (int g = 0; g < n_grp; ++g)
-                    st.key_cols[g] = std::string(gv[g]);
-                st.aggs.resize(n_agg);
-                gs = &groups.emplace(std::move(keybuf), std::move(st))
-                          .first->second;
-                keybuf.clear();
+            if constexpr (IntKey) {
+                // Single group column, prefix_len==0 (enforced by caller).
+                const auto& c = agg.group_columns(0);
+                const uint64_t ref = in.refs[gpos[0]][r];
+                const std::string_view cell =
+                    ref == kNullRef
+                        ? std::string_view()
+                        : value_of(c.table_idx(), ref, c.column());
+                int64_t iv;
+                if (!parse_i64(cell, &iv)) {
+                    // Non-INT (or NULL) key: abandon the int path; the
+                    // caller re-runs this aggregation over string keys.
+                    parse_fail->store(true, std::memory_order_relaxed);
+                    return false;
+                }
+                auto it = groups.find(iv);
+                if (it == groups.end()) {
+                    GroupState st;
+                    st.key_cols.resize(1);
+                    st.key_cols[0] = std::string(cell);  // HAVING/output
+                    st.aggs.resize(n_agg);
+                    gs = &groups.emplace(iv, std::move(st)).first->second;
+                } else {
+                    gs = &it->second;
+                }
             } else {
-                gs = &it->second;
+                keybuf.clear();
+                for (int g = 0; g < n_grp; ++g) {
+                    const auto& c = agg.group_columns(g);
+                    const uint64_t ref = in.refs[gpos[g]][r];
+                    gv[g] = ref == kNullRef
+                                ? std::string_view()
+                                : value_of(c.table_idx(), ref, c.column());
+                    if (c.prefix_len() > 0 && gv[g].size() > c.prefix_len())
+                        gv[g] = gv[g].substr(0, c.prefix_len());
+                    const uint32_t l = static_cast<uint32_t>(gv[g].size());
+                    keybuf.append(reinterpret_cast<const char*>(&l),
+                                  sizeof(l));
+                    keybuf.append(gv[g].data(), gv[g].size());
+                }
+                auto it = groups.find(keybuf);
+                if (it == groups.end()) {
+                    GroupState st;
+                    st.key_cols.resize(n_grp);
+                    for (int g = 0; g < n_grp; ++g)
+                        st.key_cols[g] = std::string(gv[g]);
+                    st.aggs.resize(n_agg);
+                    gs = &groups.emplace(std::move(keybuf), std::move(st))
+                              .first->second;
+                    keybuf.clear();
+                } else {
+                    gs = &it->second;
+                }
             }
             ArithRowCtx arith_ctx{&stores, &in.tables, &in.refs, r};
             for (int a = 0; a < n_agg; ++a) {
@@ -1147,7 +1191,8 @@ struct Executor {
         return true;
     }
 
-    static void MergeGroups(GroupMap& dst, GroupMap& src,
+    template <typename MapT>
+    static void MergeGroups(MapT& dst, MapT& src,
                             const pb::QbAggregate& agg) {
         const int n_agg = agg.aggs_size();
         if (dst.empty()) {
@@ -1409,46 +1454,22 @@ struct Executor {
         const NodeResult& in = results[agg.input()];
         const int n_grp = agg.group_columns_size();
         const size_t n = in.rows();
-
-        GroupMap groups;
         const unsigned wc = static_cast<unsigned>(std::min<size_t>(
             workers(), std::max<size_t>(n / 65536, 1)));
-        if (wc <= 1) {
-            if (!AccumulateRange(agg, in, 0, n, groups)) return false;
-        } else {
-            std::vector<GroupMap> locals(wc);
-            std::vector<char> failed(wc, 0);
-            std::vector<std::thread> pool;
-            pool.reserve(wc);
-            for (unsigned w = 0; w < wc; ++w) {
-                pool.emplace_back([&, w] {
-                    if (!AccumulateRange(agg, in, n * w / wc,
-                                         n * (w + 1) / wc, locals[w]))
-                        failed[w] = 1;
-                });
-            }
-            for (auto& t : pool) t.join();
-            for (char f : failed)
-                if (f) return false;
-            // One up-front rehash to the merged size; per-step growth
-            // would rehash the (large) destination once per local.
-            size_t total = 0;
-            for (auto& l : locals) total += l.size();
-            bool first = true;
-            for (auto& l : locals) {
-                MergeGroups(groups, l, agg);
-                if (first && !groups.empty()) {
-                    groups.reserve(total);
-                    first = false;
-                }
-            }
-        }
 
-        // Implicit grouping emits one row over zero input.
-        if (n_grp == 0 && groups.empty()) {
-            GroupState st;
-            st.aggs.resize(agg.aggs_size());
-            groups.emplace(std::string(), std::move(st));
+        // Post-accumulation pipeline (HAVING → second stage / output →
+        // ORDER BY / LIMIT / serialize), generic over the map key type so
+        // the int64 fast path (E15) and the string path share it verbatim.
+        auto emit = [&](auto& groups) -> bool {
+        using KeyT = typename std::decay_t<decltype(groups)>::key_type;
+        // Implicit grouping emits one row over zero input. Reachable only
+        // for the string map — the int path always has one group column.
+        if constexpr (std::is_same_v<KeyT, std::string>) {
+            if (n_grp == 0 && groups.empty()) {
+                GroupState st;
+                st.aggs.resize(agg.aggs_size());
+                groups.emplace(std::string(), std::move(st));
+            }
         }
 
         // HAVING: drop groups failing the predicate over the stage-1
@@ -1649,6 +1670,87 @@ struct Executor {
             response->add_rows(rowbuf);
         }
         return true;
+        };  // emit
+
+        // Int64 group-key fast path (E15): a single group column, no prefix,
+        // and every key cell an int64. A parse failure anywhere discards the
+        // partial int result and re-runs the aggregation on the string path
+        // (only reached for non-INT columns, so the extra scan is rare).
+        if (n_grp == 1 && agg.group_columns(0).prefix_len() == 0) {
+            IntGroupMap igroups;
+            std::atomic<bool> parse_fail{false};
+            bool ok;
+            if (wc <= 1) {
+                ok = AccumulateRangeT(agg, in, 0, n, igroups, &parse_fail);
+            } else {
+                std::vector<IntGroupMap> locals(wc);
+                std::vector<char> failed(wc, 0);
+                std::vector<std::thread> pool;
+                pool.reserve(wc);
+                for (unsigned w = 0; w < wc; ++w) {
+                    pool.emplace_back([&, w] {
+                        if (!AccumulateRangeT(agg, in, n * w / wc,
+                                              n * (w + 1) / wc, locals[w],
+                                              &parse_fail))
+                            failed[w] = 1;
+                    });
+                }
+                for (auto& t : pool) t.join();
+                ok = true;
+                for (char f : failed)
+                    if (f) { ok = false; break; }
+                if (ok) {
+                    size_t total = 0;
+                    for (auto& l : locals) total += l.size();
+                    bool first = true;
+                    for (auto& l : locals) {
+                        MergeGroups(igroups, l, agg);
+                        if (first && !igroups.empty()) {
+                            igroups.reserve(total);
+                            first = false;
+                        }
+                    }
+                }
+            }
+            if (ok) return emit(igroups);          // every key was int64
+            if (!parse_fail.load()) return false;  // structural failure
+            // else: a cell did not parse → fall through to the string path.
+        }
+
+        GroupMap groups;
+        if (wc <= 1) {
+            if (!AccumulateRangeT(agg, in, 0, n, groups, nullptr))
+                return false;
+        } else {
+            std::vector<GroupMap> locals(wc);
+            std::vector<char> failed(wc, 0);
+            std::vector<std::thread> pool;
+            pool.reserve(wc);
+            for (unsigned w = 0; w < wc; ++w) {
+                pool.emplace_back([&, w] {
+                    if (!AccumulateRangeT(agg, in, n * w / wc,
+                                          n * (w + 1) / wc, locals[w],
+                                          nullptr))
+                        failed[w] = 1;
+                });
+            }
+            for (auto& t : pool) t.join();
+            for (char f : failed)
+                if (f) return false;
+            // One up-front rehash to the merged size; per-step growth
+            // would rehash the (large) destination once per local.
+            size_t total = 0;
+            for (auto& l : locals) total += l.size();
+            bool first = true;
+            for (auto& l : locals) {
+                MergeGroups(groups, l, agg);
+                if (first && !groups.empty()) {
+                    groups.reserve(total);
+                    first = false;
+                }
+            }
+        }
+        return emit(groups);
     }
 
     bool Run(pb::TxExecuteQueryBlock::Response* response) {

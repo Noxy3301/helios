@@ -327,3 +327,37 @@ Claude review (E8-E12) の Important 1 件: RunJoin の byte キーが空セル 
 hash join と同一意味論に統一。回帰 regr-null-eq-join (NULL 入り =join,
 期待 2) を常設 — MATCH。合計 7.74s 維持。Codex + Claude の dual review で
 E8-E13 の指摘は全消化。
+
+### E15: int64 グループキー特化 (2026-07-03)
+
+E13 の perf 所見で残った最後の支配項 = 集計 GroupMap の
+`unordered_map<string, GroupState>` (長さ接頭辞付きバイトキー)。q18 の
+find+hash+memcmp が ~19%。E13 の join キー int64 化と同じ実行時型判定を
+**グループキー**へ適用: 集計が (a) グループ列が 1 本、(b) prefix_len==0、
+(c) 全キーセルが `from_chars` 完全長で int64 パース可 のとき
+`unordered_map<int64_t, GroupState>` へ蓄積。1 つでも非 int (DECIMAL/空/
+非正準文字列) があれば atomic parse_fail を立てて false を返し、集計全体を
+文字列キー経路で再実行 (非 INT 列でしか起きないので追加スキャンは稀)。
+canonical INT セルは値↔バイト 1:1 なので意味論不変 (E13 と同じ論拠)。
+
+実装: `AccumulateRange` を `AccumulateRangeT<MapT>` にテンプレート化
+(`if constexpr (IntKey)` でキー計算だけ分岐、集計本体は共有)、`MergeGroups`
+も同テンプレート化、`GroupState.key_cols` は従来どおり文字列で埋めるので
+HAVING/second-stage/出力は不変 — ただし後段全体 (HAVING フィルタ・q13 型
+二段集計・出力 emit・ORDER/LIMIT) を `emit(auto& groups)` の generic lambda に
+くくり出し両マップで呼べるように。並列ワーカーの locals は int パス時
+IntGroupMap 型、共有 atomic の parse_fail で文字列経路再実行をトリガ。
+構造エラー (fail()) は parse_fail と区別して伝播。
+
+| 指標 | E14 | E15 | 要因 |
+|---|---|---|---|
+| **合計 (min-of-3)** | 7.74s | **6.88s** | int64 group map |
+| q18 | 2054ms | **1459ms (-29%)** | o_orderkey/l_orderkey が INT |
+| q13 | 307ms | **228ms (-26%)** | c_custkey が INT (二段集計) |
+| q16 | 129ms | 129ms | p_brand/type/size は文字列 → 文字列経路 (設計どおり) |
+| q20 | 633ms | 640ms | ノイズ域 |
+
+ゲート 22/22 MATCH + 回帰 3 本 (two-derived MATCH / nullsafe-eq REJECT /
+null-eq-join MATCH) + SF=1 hot-5 md5 全 MATCH。SF=1 の 22 本 md5 は E14 と
+**全一致** (same=22 diff=0) — 置換の意味論不変を実証。InnoDB champion 42.2s の
+**6.1 倍**、本日 24.6→6.88s (3.6 倍)。残: q21 1.17s、q20 640ms、q10 495ms。
