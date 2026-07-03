@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <atomic>
 #include <charconv>
+#include <cstdio>
 #include <cstring>
 #include <memory>
 #include <string>
@@ -17,6 +18,7 @@
 #include <lineairdb/pax_store.h>
 
 #include "predicate_evaluator.hh"
+#include "simd_scan.hh"
 
 namespace qb {
 
@@ -470,6 +472,32 @@ struct Executor {
         if (has_filter)
             PredicateEvaluator::collect_columns(scan.filter().expr(),
                                                 &filter_cols);
+
+        // SIMD/typed-cell spike (LDBC_SIMD): when the whole filter is a
+        // conjunction of simple comparisons over typed columns, evaluate it
+        // over prebuilt int64 arrays (scalar or AVX2). Only engaged for plain
+        // filtered scans (no semi/ext key filter) so the block kernel stays
+        // clean; every other case keeps the byte path unchanged.
+        const simd::Mode smode = simd::CurrentMode();
+        simd::Filter tfilter;
+        bool typed_ok = false;
+        if (smode != simd::Mode::OFF && has_filter && semi_set == nullptr &&
+            !use_ext) {
+            uint64_t build_ns = 0;
+            typed_ok = simd::Compile(scan.filter().expr(), store, &tfilter,
+                                     &build_ns);
+            if (typed_ok)
+                fprintf(stderr,
+                        "[SIMD] table=%u typed scan: %zu preds, "
+                        "build=%.3fms, cache=%.1fMB, mode=%s\n",
+                        scan.table_idx(), tfilter.preds.size(),
+                        build_ns / 1e6, simd::CacheBytes() / 1048576.0,
+                        smode == simd::Mode::AVX2 ? "avx2" : "scalar");
+        }
+        const bool use_avx2 =
+            typed_ok && smode == simd::Mode::AVX2 &&
+            __builtin_cpu_supports("avx2");
+
         const unsigned wc =
             static_cast<unsigned>(std::min<size_t>(workers(), n_groups));
         std::vector<std::vector<uint64_t>> locals(wc);
@@ -481,6 +509,35 @@ struct Executor {
                 PredicateEvaluator ev;
                 auto& mine = locals[w];
                 std::string probe;  // reused key buffer: no per-row alloc
+                // --- SIMD/typed fast path: block-at-a-time over int64 arrays.
+                if (typed_ok) {
+                    for (size_t g = w; g < n_groups; g += wc) {
+                        PaxGroup* grp = store->group(g);
+                        if (grp == nullptr) continue;
+                        const size_t gbase = g * PaxGroup::kRows;
+                        for (uint32_t base = 0; base < PaxGroup::kRows;
+                             base += 64) {
+                            uint64_t vis = 0;
+                            for (uint32_t s = 0; s < 64; ++s)
+                                if (grp->IsVisible(base + s))
+                                    vis |= (uint64_t{1} << s);
+                            if (vis == 0) continue;
+                            const uint64_t match =
+                                use_avx2 ? simd::EvalBlock64Avx2(
+                                               tfilter, gbase + base)
+                                         : simd::EvalBlock64Scalar(
+                                               tfilter, gbase + base);
+                            uint64_t bits = vis & match;
+                            while (bits != 0) {
+                                const uint32_t s = static_cast<uint32_t>(
+                                    __builtin_ctzll(bits));
+                                bits &= bits - 1;
+                                mine.push_back(gbase + base + s);
+                            }
+                        }
+                    }
+                    return;
+                }
                 for (size_t g = w; g < n_groups; g += wc) {
                     PaxGroup* grp = store->group(g);
                     if (grp == nullptr) continue;

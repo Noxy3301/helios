@@ -54,7 +54,9 @@ set(SOURCES
     rpc/predicate_evaluator.hh
     rpc/query_block_executor.cc
     rpc/query_block_executor.hh
-    
+    rpc/simd_scan.cc
+    rpc/simd_scan.hh
+
     # Storage layer
     storage/database_manager.cc
     storage/database_manager.hh
