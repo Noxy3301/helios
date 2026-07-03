@@ -96,3 +96,11 @@ secondary 向けコストを注入し、オプティマイザに hash 実行前�
 |---|---|---|
 | q17 semi 不発 | プランは (lineitem⋈derived)⋈part — E2 は発火するが semi source が lineitem(6M) で絞り込み効果ゼロ。D3 が速かったのは source=part(20行) だったから。derived の rows=0 見積もりがこの順序を作っている | sub_block の semi source を「join の直接相手」でなく「group キーと equi-join される最小の実表 scan」に。scan を先行発行 (records 昇順) して任意 scan を source にできるノード順を確保 |
 | q5 3.96s | プランの中間 join 見積もりが rows=13.7e9 / 82.5e15 と大破綻。それでも hash 線形コスト (入力行数のみ) では M:N 順が最安評価 | HASH_JOIN コストに出力行数項 (+0.01*output_rows) を追加 — M:N 爆発プランが正しく高コスト化される |
+
+### E4 結果 (2026-07-03)
+
+| 修正 | 結果 |
+|---|---|
+| semi source 後処理 (scan 先行発行 + 「group キーと equi-join する最小実表 scan」選定) | **q17 3.06s→97ms** — 写像経路で D3 相当を回復。q22 119ms |
+| hash join コストに出力行数項 | q5 4.0s 未回復。仮説: NLJ/index の全 reject で探索空間が痩せ、生き残る唯一の prefix が M:N 順 — reject でなく高価格化 (探索柔軟性を残す) が次の一手 |
+| 合計 | 24.6s (D3 21.0s, 残差は q5 4.0s + q21 9.6s)。q21 は LEFT derived への実行時フィルタ注入 (構造課題) |
