@@ -802,12 +802,21 @@ struct Executor {
             std::string key;
             for (size_t r = 0; r < build.rows(); ++r) {
                 key.clear();
+                bool null_key = false;
                 for (const auto& k : bk) {
-                    append_join_key(key,
-                                    value_of(k.table_idx,
-                                             build.refs[k.pos][r],
-                                             k.column));
+                    const std::string_view kv = value_of(
+                        k.table_idx, build.refs[k.pos][r], k.column);
+                    // SQL equijoin: NULL (empty cell) never matches —
+                    // mirror MySQL's null-rejecting hash join (review I1;
+                    // byte keys used to match empty==empty, diverging
+                    // from the semi filters' NULL-drop semantics).
+                    if (kv.empty()) {
+                        null_key = true;
+                        break;
+                    }
+                    append_join_key(key, kv);
                 }
+                if (null_key) continue;
                 ht[key].push_back(static_cast<uint32_t>(r));
             }
         }
@@ -869,14 +878,21 @@ struct Executor {
                         }
                     } else {
                         key.clear();
+                        bool null_key = false;
                         for (const auto& k : pk) {
-                            append_join_key(
-                                key, value_of(k.table_idx,
-                                              probe.refs[k.pos][r],
-                                              k.column));
+                            const std::string_view kv =
+                                value_of(k.table_idx, probe.refs[k.pos][r],
+                                         k.column);
+                            if (kv.empty()) {  // NULL never matches (I1)
+                                null_key = true;
+                                break;
+                            }
+                            append_join_key(key, kv);
                         }
-                        const auto it = ht.find(key);
-                        if (it != ht.end()) mrows = &it->second;
+                        if (!null_key) {
+                            const auto it = ht.find(key);
+                            if (it != ht.end()) mrows = &it->second;
+                        }
                     }
                     bool matched = mrows != nullptr && !mrows->empty();
                     if (matched && has_residual) {

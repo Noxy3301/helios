@@ -317,3 +317,13 @@ q21 1181ms、q9 222ms。q8/q10/q18 の +50-220ms は実行分散圏
 (q18 は 1.9-2.4s で揺れる)。dual review: Codex は E8-E12 に
 「correctness バグなし」(collect_columns 再帰網羅・AggSlot 残置なし・
 info() 同一性・eff-chain 型安全の 4 点検証済み)。
+
+### E14: NULL join 意味論の統一 (2026-07-03, review I1)
+
+Claude review (E8-E12) の Important 1 件: RunJoin の byte キーが空セル (NULL)
+同士をマッチさせ、semi filter (NULL を drop) と乖離 — semi の適用有無 (4M
+ガード/eff 連鎖) で同一クエリの結果が変わり得た (TPC-H は全キー NOT NULL で
+不可視)。build/probe 両側で空キー成分の行をスキップ = MySQL の null-rejecting
+hash join と同一意味論に統一。回帰 regr-null-eq-join (NULL 入り =join,
+期待 2) を常設 — MATCH。合計 7.74s 維持。Codex + Claude の dual review で
+E8-E13 の指摘は全消化。
