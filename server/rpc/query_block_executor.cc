@@ -1051,6 +1051,25 @@ struct Executor {
     using GroupMap = std::unordered_map<std::string, GroupState>;
     // E15: int64-keyed variant for the single-INT-group-column fast path.
     using IntGroupMap = std::unordered_map<int64_t, GroupState>;
+    // E16b: two INT group columns packed into a POD 128-bit key — the
+    // two-column analogue of the E15 fast path (perf: q20 groups by
+    // (l_partkey, l_suppkey), both INT). Same value<->byte 1:1 invariant,
+    // so results are unchanged.
+    struct Int2Key {
+        int64_t a, b;
+        bool operator==(const Int2Key& o) const {
+            return a == o.a && b == o.b;
+        }
+    };
+    struct Int2Hash {
+        size_t operator()(const Int2Key& k) const {
+            size_t h = std::hash<int64_t>()(k.a);
+            h ^= std::hash<int64_t>()(k.b) + 0x9e3779b97f4a7c15ULL +
+                 (h << 6) + (h >> 2);
+            return h;
+        }
+    };
+    using Int2GroupMap = std::unordered_map<Int2Key, GroupState, Int2Hash>;
 
     // Accumulates rows [begin,end) into `groups`. Generic over the map key:
     // the string-keyed GroupMap builds length-prefixed byte keys as before,
@@ -1067,6 +1086,8 @@ struct Executor {
                           std::atomic<bool>* parse_fail) {
         constexpr bool IntKey =
             std::is_same_v<typename MapT::key_type, int64_t>;
+        constexpr bool Int2 =
+            std::is_same_v<typename MapT::key_type, Int2Key>;
         const int n_agg = agg.aggs_size();
         const int n_grp = agg.group_columns_size();
         // Resolve positions once.
@@ -1118,6 +1139,36 @@ struct Executor {
                     st.key_cols[0] = std::string(cell);  // HAVING/output
                     st.aggs.resize(n_agg);
                     gs = &groups.emplace(iv, std::move(st)).first->second;
+                } else {
+                    gs = &it->second;
+                }
+            } else if constexpr (Int2) {
+                // Two group columns, both prefix_len==0 (enforced by
+                // caller). Parse each cell to int64; any failure abandons
+                // the packed path and the caller re-runs on string keys.
+                const auto& c0 = agg.group_columns(0);
+                const auto& c1 = agg.group_columns(1);
+                const uint64_t r0 = in.refs[gpos[0]][r];
+                const uint64_t r1 = in.refs[gpos[1]][r];
+                const std::string_view cell0 =
+                    r0 == kNullRef ? std::string_view()
+                                   : value_of(c0.table_idx(), r0, c0.column());
+                const std::string_view cell1 =
+                    r1 == kNullRef ? std::string_view()
+                                   : value_of(c1.table_idx(), r1, c1.column());
+                Int2Key key;
+                if (!parse_i64(cell0, &key.a) || !parse_i64(cell1, &key.b)) {
+                    parse_fail->store(true, std::memory_order_relaxed);
+                    return false;
+                }
+                auto it = groups.find(key);
+                if (it == groups.end()) {
+                    GroupState st;
+                    st.key_cols.resize(2);
+                    st.key_cols[0] = std::string(cell0);  // HAVING/output
+                    st.key_cols[1] = std::string(cell1);
+                    st.aggs.resize(n_agg);
+                    gs = &groups.emplace(key, std::move(st)).first->second;
                 } else {
                     gs = &it->second;
                 }
@@ -1728,18 +1779,21 @@ struct Executor {
         return true;
         };  // emit
 
-        // Int64 group-key fast path (E15): a single group column, no prefix,
-        // and every key cell an int64. A parse failure anywhere discards the
-        // partial int result and re-runs the aggregation on the string path
-        // (only reached for non-INT columns, so the extra scan is rare).
-        if (n_grp == 1 && agg.group_columns(0).prefix_len() == 0) {
-            IntGroupMap igroups;
+        // Typed group-key fast paths: a single INT group column (E15) or two
+        // INT group columns packed into a POD key (E16b), both prefix_len==0.
+        // Accumulate into a fresh map of the given type; a parse failure
+        // discards the partial result and the caller falls through to the
+        // string path (reached only for non-INT columns, so the re-scan is
+        // rare). Returns 0 on success (map ready to emit), 1 on parse
+        // fallback, 2 on structural failure.
+        auto run_typed = [&](auto& groups) -> int {
+            using MapT = std::decay_t<decltype(groups)>;
             std::atomic<bool> parse_fail{false};
             bool ok;
             if (wc <= 1) {
-                ok = AccumulateRangeT(agg, in, 0, n, igroups, &parse_fail);
+                ok = AccumulateRangeT(agg, in, 0, n, groups, &parse_fail);
             } else {
-                std::vector<IntGroupMap> locals(wc);
+                std::vector<MapT> locals(wc);
                 std::vector<char> failed(wc, 0);
                 std::vector<std::thread> pool;
                 pool.reserve(wc);
@@ -1756,21 +1810,47 @@ struct Executor {
                 for (char f : failed)
                     if (f) { ok = false; break; }
                 if (ok) {
+                    // One up-front rehash to the merged size (E8b).
                     size_t total = 0;
                     for (auto& l : locals) total += l.size();
                     bool first = true;
                     for (auto& l : locals) {
-                        MergeGroups(igroups, l, agg);
-                        if (first && !igroups.empty()) {
-                            igroups.reserve(total);
+                        MergeGroups(groups, l, agg);
+                        if (first && !groups.empty()) {
+                            groups.reserve(total);
                             first = false;
                         }
                     }
                 }
             }
-            if (ok) return emit(igroups);          // every key was int64
-            if (!parse_fail.load()) return false;  // structural failure
-            // else: a cell did not parse → fall through to the string path.
+            if (ok) return 0;
+            return parse_fail.load() ? 1 : 2;
+        };
+
+        // The int fast paths only take numeric group columns (cmp_kind==0):
+        // a STRING column could carry non-canonical numeric spellings
+        // ("01" vs "1") that byte-group apart but parse to the same int64,
+        // whereas numeric columns store canonical val_str so parse-success
+        // is value<->byte 1:1. The proxy always sets cmp_kind (1 for STRING
+        // result type, 0 for numeric) on every group column.
+        const bool grp0_int = n_grp >= 1 &&
+                              agg.group_columns(0).prefix_len() == 0 &&
+                              agg.group_columns(0).cmp_kind() == 0;
+        const bool grp1_int = n_grp >= 2 &&
+                              agg.group_columns(1).prefix_len() == 0 &&
+                              agg.group_columns(1).cmp_kind() == 0;
+        if (n_grp == 1 && grp0_int) {
+            IntGroupMap igroups;
+            const int st = run_typed(igroups);
+            if (st == 0) return emit(igroups);   // every key was int64
+            if (st == 2) return false;           // structural failure
+            // st == 1: a cell did not parse → fall through to string path.
+        } else if (n_grp == 2 && grp0_int && grp1_int) {
+            Int2GroupMap i2groups;
+            const int st = run_typed(i2groups);
+            if (st == 0) return emit(i2groups);  // both keys were int64
+            if (st == 2) return false;
+            // st == 1: fall through to the string path.
         }
 
         GroupMap groups;

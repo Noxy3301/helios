@@ -401,3 +401,41 @@ null-eq-join MATCH) + SF=1 hot-5 md5 全 MATCH。SF=1 の 22 本 md5 は E15 と
 (3) md5 全一致で実証。SF=1 では最大 semi source ≤1.5M で 4M 境界に届かない。
 残: q18 1.5-1.7s (集計)、q20 640ms (sub_block ext の型付き化が残レバー)、
 q21 901ms。
+
+### E16b: 2 INT グループ列のパック型キー (2026-07-03)
+
+q20 の call-graph (E16 上): derived サブブロックの
+`GROUP BY l_partkey, l_suppkey` (両 INT) が**文字列 GroupMap** 経路 —
+Hashtable ~12.75% + `_Hash_bytes` 1.83% + key_cols push_back 2.08% +
+GroupState vector 1.95% + `_M_replace` 1.42% ≈ **21%**。E15 の int64 高速
+経路は単一グループ列 (`n_grp==1`) 限定でここに効かなかった。
+
+E16b = **2 INT 列を POD 128bit キー (`Int2Key{int64 a,b}` + カスタム
+hash) にパック**する E15 の 2 列版。E15 の accumulate + 並列マージ
+dispatch を汎用 lambda `run_typed` に括り出し (0=成功/1=parse fallback/
+2=構造エラー)、単一 int (E15) と 2 int (E16b) の両 dispatch で共有。perf
+で `_Hashtable<Int2Key>` が有効化を実証 (文字列 map シンボルは消失)。
+
+**Codex review 対応 (correctness hardening)**: 高速経路のゲートを
+`prefix_len==0` に加え **`cmp_kind()==0` (数値 result type)** へ厳格化。
+STRING 列は非正準な数値表記 ("01" vs "1") を持ち得てバイトでは別グループ
+だが int64 では衝突する — 数値列は canonical val_str なので parse 成功
+= 値↔バイト 1:1。proxy は全 group column に cmp_kind を設定 (STRING→1/
+数値→0) するので、STRING 列は確実に int 経路から除外される。単一 int
+(E15) 経路にも同ゲートを遡及適用 (整合性 + 厳密化)。Codex 最終 review:
+correctness バグなし・grp0/grp1 は n_grp≥1/≥2 で範囲保護・run_typed は
+E15 と挙動一致を確認。
+
+| 指標 | E16 | E16b | 要因 |
+|---|---|---|---|
+| q20 | 668ms | **569ms (-15%)** | (l_partkey,l_suppkey) パックキー |
+| q13 | 228ms | 233ms | 単一 int 経路維持 (cmp_kind ゲート後も) |
+| q18 | 1567ms | 1508ms | 単一 int 経路維持 |
+
+SF=1 の 22 本 md5 は **E16 と全一致** (semantics 保存を実証) + 回帰 3 本
+(two-derived MATCH / nullsafe-eq REJECT / null-eq-join MATCH) + FORCED-vs-
+OFF (q20/q18/q13/q1) MATCH。**罠**: 検証中に primary (LineairDB 行エンジン)
+が q5/q8 の重 join で稀に**ハング**し gate の `timeout 90` が空結果 → 偽
+MISMATCH を出す (secondary 経路と直交・前段の foreground timeout 巻き添え
+が誘発)。対策として semantics 検証は **md5-vs-E16 比較** (E16 は primary
+検証済み) に切替 — flake-proof。残: q18 1.5s、q21 0.9s、q10 0.37s。
