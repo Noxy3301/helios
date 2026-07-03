@@ -1575,6 +1575,19 @@ struct Executor {
     struct GroupState {
         std::vector<std::string> key_cols;
         std::vector<AggSlot> aggs;
+        // Typed group-key fast paths (E15/E16b) defer key_cols formatting to
+        // emit time (M3a): only groups surviving HAVING (when it references a
+        // group column), the second stage, or the output ever pay the ASCII
+        // format — q18's derived `GROUP BY l_orderkey` prunes ~1.5M groups to
+        // a handful before any key string is built. key_ref holds the
+        // representative row ref per group column so key_view reproduces the
+        // exact canonical bytes on demand (byte-identical to eager formatting,
+        // and immune to non-canonical spellings like ZEROFILL that a
+        // to_string(int64) round-trip would corrupt). key_done marks key_cols
+        // already materialized; the string path fills it eagerly, so it is
+        // true there and this deferral is a pure no-op for string keys.
+        uint64_t key_ref[2] = {kNullRef, kNullRef};
+        bool key_done = true;
     };
     using GroupMap = std::unordered_map<std::string, GroupState>;
     // E15: int64-keyed variant for the single-INT-group-column fast path.
@@ -1642,7 +1655,6 @@ struct Executor {
         }
         PredicateEvaluator ev;
         [[maybe_unused]] std::string keybuf;
-        [[maybe_unused]] std::string kdisp;  // typed -> canonical ASCII (key_cols)
         std::string aggbuf;  // typed -> canonical ASCII (agg arg values)
         [[maybe_unused]] std::vector<std::string_view> gv(n_grp);
         [[maybe_unused]] std::vector<std::string> gbufs(n_grp);
@@ -1663,9 +1675,11 @@ struct Executor {
                 auto it = groups.find(iv);
                 if (it == groups.end()) {
                     GroupState st;
-                    st.key_cols.resize(1);
-                    st.key_cols[0] = std::string(  // canonical ASCII (HAVING/out)
-                        key_view(c.table_idx(), ref, c.column(), kdisp));
+                    // Defer the canonical-ASCII format to emit (M3a): stash
+                    // the representative ref; key_cols is built lazily only
+                    // for groups that survive HAVING/second-stage/output.
+                    st.key_ref[0] = ref;
+                    st.key_done = false;
                     st.aggs.resize(n_agg);
                     gs = &groups.emplace(iv, std::move(st)).first->second;
                 } else {
@@ -1690,11 +1704,10 @@ struct Executor {
                 auto it = groups.find(key);
                 if (it == groups.end()) {
                     GroupState st;
-                    st.key_cols.resize(2);
-                    st.key_cols[0] = std::string(
-                        key_view(c0.table_idx(), r0, c0.column(), kdisp));
-                    st.key_cols[1] = std::string(
-                        key_view(c1.table_idx(), r1, c1.column(), kdisp));
+                    // Defer both cells' canonical-ASCII format to emit (M3a).
+                    st.key_ref[0] = r0;
+                    st.key_ref[1] = r1;
+                    st.key_done = false;
                     st.aggs.resize(n_agg);
                     gs = &groups.emplace(key, std::move(st)).first->second;
                 } else {
@@ -2101,6 +2114,25 @@ struct Executor {
         // Post-accumulation pipeline (HAVING → second stage / output →
         // ORDER BY / LIMIT / serialize), generic over the map key type so
         // the int64 fast path (E15) and the string path share it verbatim.
+        // Lazily materialize a group's key_cols from its representative refs
+        // (M3a): a no-op on the string path (key_done already true) and on the
+        // typed fast paths for groups whose keys are never read. key_view on
+        // the stored ref reproduces the exact canonical bytes, so the deferred
+        // format is byte-identical to eager formatting. Reentrant (local buf)
+        // so parallel per-partition emit stages can call it concurrently on
+        // disjoint groups.
+        auto ensure_keys = [&](GroupState& gs) {
+            if (gs.key_done) return;
+            gs.key_cols.resize(n_grp);
+            std::string buf;
+            for (int g = 0; g < n_grp; ++g) {
+                const auto& c = agg.group_columns(g);
+                gs.key_cols[g] = std::string(
+                    key_view(c.table_idx(), gs.key_ref[g], c.column(), buf));
+            }
+            gs.key_done = true;
+        };
+
         auto emit = [&](auto& groups) -> bool {
         using KeyT = typename std::decay_t<decltype(groups)>::key_type;
         // Implicit grouping emits one row over zero input. Reachable only
@@ -2113,6 +2145,21 @@ struct Executor {
             }
         }
 
+        // Does HAVING actually reference a group column (ordinal < n_grp)?
+        // If not (q18: `sum(l_quantity) > 300` reads only the aggregate), the
+        // 1.5M-group HAVING scan never materializes a key — the whole point of
+        // the M3a deferral.
+        bool having_uses_group = false;
+        if (agg.has_having() && agg.having().has_expr()) {
+            std::vector<uint32_t> hcols;
+            PredicateEvaluator::collect_columns(agg.having().expr(), &hcols);
+            for (uint32_t o : hcols)
+                if (o < static_cast<uint32_t>(n_grp)) {
+                    having_uses_group = true;
+                    break;
+                }
+        }
+
         // HAVING: drop groups failing the predicate over the stage-1
         // value layout [group values..., aggregate values...].
         if (agg.has_having() && agg.having().has_expr()) {
@@ -2122,10 +2169,14 @@ struct Executor {
             std::vector<bool> hnulls;
             for (auto it = groups.begin(); it != groups.end();) {
                 GroupState& gs = it->second;
+                if (having_uses_group) ensure_keys(gs);
                 hv.clear();
                 hnulls.clear();
                 for (int g = 0; g < n_grp; ++g) {
-                    hv.push_back(gs.key_cols[g]);
+                    // Placeholder when HAVING never reads group columns; the
+                    // evaluator only touches ordinals the expression names.
+                    hv.push_back(having_uses_group ? gs.key_cols[g]
+                                                   : std::string());
                     hnulls.push_back(false);
                 }
                 for (int a = 0; a < agg.aggs_size(); ++a) {
@@ -2165,6 +2216,7 @@ struct Executor {
                     std::string v;
                     bool is_null = false;
                     if (ord < static_cast<uint32_t>(n_grp)) {
+                        ensure_keys(gs);
                         v = gs.key_cols[ord];
                     } else {
                         const int a = static_cast<int>(ord) - n_grp;
@@ -2219,6 +2271,7 @@ struct Executor {
         rows.reserve(groups.size());
         for (auto& kv : groups) {
             GroupState& gs = kv.second;
+            ensure_keys(gs);  // survivors only (M3a): GROUP/EXPR read key_cols
             OutRow row;
             row.vals.reserve(req.output_size());
             row.nulls.reserve(req.output_size());

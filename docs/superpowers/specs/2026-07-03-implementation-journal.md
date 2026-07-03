@@ -817,3 +817,52 @@ helios-pax には参照コメント 2 箇所のみで未移植。SDI JSON は列
 完全に含むため、**移植すれば型 kind 導出を保存 SDI に一元化できる**
 (サーバ側に軽量 SDI リーダーを追加)。それまでは M2 の「幅と kind を同一関数・
 同一 DbCreateTable で導出」が正当 (スキュー構造なし)。
+
+## 集計フェーズ (2026-07-04〜): q18/q20 高カーディナリティ集計の改善
+
+SF=5 分析の敗因 ② =「高カーディナリティ group-by (q18/q20) を直列 morsel 毎 hash
+agg でこなす (DuckDB は radix 並列で ~85×)」への対応。まず M2 の唯一の SF=5 退行
+(q18 +696ms) を潰し (M3a)、次に直列マージ律速そのものを radix 並列化する (M3b)。
+
+### M3a: group-key ASCII フォーマットの emit 遅延 (2026-07-04)
+
+M2 の SF=5 唯一の退行 q18 9086→9782 (+696ms) の原因は、型付き group-key の高速経路
+(単一 INT=E15 / 2 INT=E16b) が**新グループ生成のたびに** group cell を `key_view()` で
+canonical ASCII 化し `GroupState.key_cols` に詰めていた点。q18 の derived
+`GROUP BY l_orderkey` は distinct orderkey ぶん (SF=5 で ~7.5M) format するが、直後の
+`HAVING sum(l_quantity)>300` が大半を捨てる — つまり捨てるグループの format が丸損。
+
+**修正**: format を emit まで遅延。`GroupState` に代表行 ref (`key_ref[2]`) と
+`key_done` フラグを追加。型付き高速経路は key_cols を詰めず ref を stash するだけ
+(文字列経路は従来どおり eager、`key_done=true` で無影響)。emit 側の reentrant
+`ensure_keys()` が、**キーを実際に読むグループだけ** key_view で lazy материализ:
+HAVING は述語が group 列 ordinal (<n_grp) を参照するときだけ (q18 の
+`sum>300` は集計しか読まないので発火せず 1.5M/7.5M グループを素通り)、second stage は
+group_value_ordinal<n_grp のときだけ、通常出力は生存グループのみ。**罠回避**:
+`to_string(int64)` で復元せず `key_view(ref)` を使う — ZEROFILL 等の非正準表記でも
+バイト等価を保証 (`to_string` は "007"→"7" に壊す)。代表 ref は最初にグループを作った
+行 (worker-local map の初出) で、MergeGroups は共有キーで dst の state/ref を残す =
+旧 eager 経路が dst の key_cols を残したのと同じ選択なので、任意の同値行で key_view の
+バイトが一致し不変。
+
+**検証**: SF=0.01 22/22 FORCED-vs-OFF MATCH + M2 adversarial 16/16 + 標準回帰 3 本
+(null-eq-join MATCH / string-stride round-trip MATCH / nullsafe-eq `<=>` loud REJECT)。
+SF=1 22/22 md5 が **M2 (PAX-SE-M2b) とバイト一致** (same=22 diff=0)。SF=1 wall は
+q18 の format が ASCII で軽く noise 域だが微減 (1507→1487ms、3-run が 1730/1507/1757→
+1488/1487/1507 とタイト化)、q20 は全グループ生存で恩恵なし (±noise)、RSS 6.05GB 不変。
+**SF=5 での +696 回収は M3b と併せて計測**。dual review: **Codex correctness バグなし**
+(key_cols read site 4 箇所すべて ensure_keys 前置・byte 同一性・merge 越し ref 保存を
+独立検証)、**code-reviewer も correctness バグなし** (5 不変条件 A-E を静的に全確認)。
+code-reviewer の **Important = 検証ハーネスの穴** (コードでなく): 追加した合成
+GROUP BY 回帰 (m2regr/m3zf) は optimizer が offload 前に reject (ERROR 3889) するため
+**M3a コード経路に到達せず** — 特に ZEROFILL ケース (ref-based key_view が
+`to_string(int64)` に勝つことを示す唯一の adversarial test) が未実行。**調査結果**:
+reject は ZEROFILL 固有でなく**単一小テーブルの集計プラン形状**が原因 (同テーブルの
+plain-int GROUP BY も reject、一方 lineitem/orders の GROUP BY は offload する) =
+旧 optimizer が小テーブルにマッピング不能なプランを選ぶため・本変更と直交。
+**結論**: (1) 両 reviewer が byte 同一性を構成的に証明 (key_view(ref) は旧 eager と
+同一 formatter を同一代表 ref に適用)、(2) 非正準 group key (untyped numeric) は
+TPC-H に存在しない (INT/DATE/DECIMAL は M2 で全 typed=canonical) のでこの分岐は
+そもそも TPC-H で発火しない、(3) real q18 (単一 INT + HAVING) / q20 (2 INT) / q13
+(単一 INT + 二段) が deferred 経路を実データで byte 一致検証済み。empirical ZEROFILL
+coverage は harness 制約で未取得だが risk は nil。
