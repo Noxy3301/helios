@@ -936,3 +936,34 @@ per-worker フラグ集約で hardening 余地、(B) 再順序の md5 安全性�
 unstable `std::sort` 下で全順序であることに依存 (M3b 以前から load-bearing = E8/E15/E16/
 M3a の unordered_map 順も任意だった。q10 の tie 境界 flaky として既知・ゲートに
 diff+same-rows 判定を常設済み)。両 suggestion は本コミットの scope 外として記録。
+
+### SF=5 再計測 (M3 = M1+M2+M3a+M3b, label PAX-SE-M3-sf5, 2026-07-04)
+
+M2 の SF=5 (30.96s / q18 9782 / q20 2726) との比較。fresh load・1 warm+3 timed・
+min-of-3。**FORCED wall total 30.96→24.53s (−21%)**、**RSS 18.97GB (M2 18.95GB と
+同等=radix の wc² ローカルマップは transient で常駐無増)**。
+
+| 指標 | M2 (sf5) | **M3 (sf5)** | 差 | 要因 |
+|---|---|---|---|---|
+| 合計 | 30.96s | **24.53s** | **−6.43s (−21%)** | radix 並列集計 |
+| **q18** | 9782 | **5909** | **−3873 (−40%)** | M2 退行 (+696) を回収し pre-M2 baseline 9086 も大きく下回る (並列 HAVING が 7.5M group スキャンを分割) |
+| **q20** | 2726 | **1507** | **−1219 (−45%)** | (partkey,suppkey) 高 card group の並列マージ+build |
+| q21 | 5131 | 4555 | −576 | l_orderkey 集計並列化 |
+| q10 | 1464 | 1231 | −233 | |
+| q4 | 1679 | 1530 | −149 | |
+| q16 | 445 | 322 | −123 | COUNT(DISTINCT) group 並列 |
+| q11 | 266 | 184 | −82 | |
+| **q13** | 1330 | **1465** | **+135 (+10%)** | 二段目集計は単一スレッド維持 + 750k group で radix wc² マップ確保コスト (許容トレードオフ; task 指示どおり second-stage/ORDER BY は並列化せず) |
+
+**md5 検証 (flake-proof)**: spot-check の FORCED-vs-OFF は q18 で **OFF が空 md5
+(`d41d8cd9…`)** = **primary (LineairDB 行エンジン) の重 join ハング**(既知 flake、
+timeout 空 PRI、secondary 経路と直交)。**wall tsv の FORCED md5 を M2-sf5 と直接比較
+→ 22/22 バイト一致** (q18 も `5818aa11…` で SAME) = 意味論完全保存を flake なしで実証。
+q1/q6/q17/q20 の spot-check は FORCED-vs-OFF MATCH。**M3 = DuckDB 1.31s の 18.7×**
+(M2 の 23.6× から縮小)。
+
+**M3 総括**: 集計フェーズ着地。M2 の唯一の SF=5 退行 (q18 +696) を M3a が原因除去、
+M3b が radix 並列化で q18/q20 を SF=5 で −40/−45%・SF=1 で −35/−36%、全 SF で md5
+バイト一致。TPC-C は不要 (集計は OLAP-only 経路・書込パス無変更)。次の本丸は
+**型付きセルのストレージ形式化** (scatter 経路 = OLTP 接触の大工事、SIMD スパイクの
+「型付けは効く」の受け皿・per-query build/shadow 不要化)。
