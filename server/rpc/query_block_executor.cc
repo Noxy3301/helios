@@ -4,6 +4,7 @@
 #include <atomic>
 #include <charconv>
 #include <cmath>
+#include <cstdio>
 #include <cstring>
 #include <functional>
 #include <memory>
@@ -217,6 +218,125 @@ inline std::string_view cell_of(const PaxStore* store, uint64_t ref,
                    static_cast<uint32_t>(ref % PaxGroup::kRows));
 }
 
+// ---------------------------------------------------------------------------
+// Typed cell decoding (M2). A cell view from a typed column holds fixed-width
+// LE binary; these decode it to the numeric domain. Schema-driven: the caller
+// always knows the column kind (never sniffs the bytes — a typed int whose LE
+// bytes happen to be ASCII digits would otherwise mis-parse), so every typed
+// read is exact. UNTYPED falls back to the ASCII parse (byte-identical to pre-M2).
+// ---------------------------------------------------------------------------
+namespace fk = LineairDB::Pax;  // FK_UNTYPED / FK_INT32 / ...
+
+inline bool decode_cell_i64(std::string_view v, uint8_t kind, int64_t* out) {
+    if (v.empty()) return false;  // SQL NULL
+    switch (kind) {
+        case fk::FK_INT32: {
+            int32_t x;
+            std::memcpy(&x, v.data(), 4);
+            *out = x;
+            return true;
+        }
+        case fk::FK_INT64: {
+            int64_t x;
+            std::memcpy(&x, v.data(), 8);
+            *out = x;
+            return true;
+        }
+        case fk::FK_UNTYPED:
+            return parse_i64(v, out);  // UNTYPED ASCII integer
+        default:
+            // FK_DATE / FK_DEC64 are NOT int-key material: their canonical
+            // ASCII ("YYYY-MM-DD", "1.50") does not parse_i64, so an UNTYPED
+            // (derived/ASCII) copy of the same value would take the string
+            // key_view path. Returning false here forces the typed cell down
+            // the SAME string path — keeping hash-join build/probe int-ness
+            // decisions symmetric (review finding 1: a typed-DATE build side
+            // vs an ASCII-DATE probe side would otherwise drop matches). This
+            // also covers M2b's DEC64 before it is activated.
+            return false;
+    }
+}
+
+// Append the exact val_str ASCII of a typed cell view to *out. Must match the
+// engine's FormatTyped byte-for-byte (round-trip / md5 contract).
+inline void format_typed_view(uint8_t kind, int scale, std::string_view v,
+                              std::string* out) {
+    switch (kind) {
+        case fk::FK_INT32: {
+            int32_t x;
+            std::memcpy(&x, v.data(), 4);
+            out->append(std::to_string(x));
+            break;
+        }
+        case fk::FK_INT64: {
+            int64_t x;
+            std::memcpy(&x, v.data(), 8);
+            out->append(std::to_string(x));
+            break;
+        }
+        case fk::FK_DATE: {
+            int32_t x;
+            std::memcpy(&x, v.data(), 4);
+            char b[16];
+            int n = std::snprintf(b, sizeof(b), "%04d-%02d-%02d", x / 10000,
+                                  (x / 100) % 100, x % 100);
+            if (n > 0) out->append(b, static_cast<size_t>(n));
+            break;
+        }
+        case fk::FK_DEC64: {
+            int64_t x;
+            std::memcpy(&x, v.data(), 8);
+            Dec d;
+            d.m = x;
+            d.s = scale;
+            d.null = false;
+            out->append(dec_format(d));
+            break;
+        }
+        default:
+            out->append(v.data(), v.size());
+            break;
+    }
+}
+
+// Decode any numeric cell to an exact Dec (typed int/date -> scale 0; DEC64 ->
+// scaled int + `scale`; UNTYPED -> dec_parse of the ASCII).
+inline Dec decode_cell_dec(std::string_view v, uint8_t kind, int scale) {
+    if (v.empty()) return {};  // NULL
+    switch (kind) {
+        case fk::FK_INT32:
+        case fk::FK_DATE: {
+            int32_t x;
+            std::memcpy(&x, v.data(), 4);
+            Dec d;
+            d.m = x;
+            d.s = 0;
+            d.null = false;
+            return d;
+        }
+        case fk::FK_INT64: {
+            int64_t x;
+            std::memcpy(&x, v.data(), 8);
+            Dec d;
+            d.m = x;
+            d.s = 0;
+            d.null = false;
+            return d;
+        }
+        case fk::FK_DEC64: {
+            int64_t x;
+            std::memcpy(&x, v.data(), 8);
+            Dec d;
+            d.m = x;
+            d.s = scale;
+            d.null = false;
+            return d;
+        }
+        default:
+            return dec_parse(v);  // UNTYPED ASCII
+    }
+}
+
 // Evaluate a FilterExpr arithmetic tree (COLUMN_REF/CONST/ADD/SUB/MUL/NEG).
 // `store`/`ref` address the default table; a COLUMN_REF may target another
 // table via (table_idx << 16 | column) when `ctx` row context is given.
@@ -234,14 +354,19 @@ Dec eval_arith(const pb::FilterExpr& e, const PaxStore* store, uint64_t ref,
         case FE::COLUMN_REF: {
             const uint32_t enc = e.column_index();
             if (enc < (1u << 16) || ctx == nullptr)
-                return dec_parse(cell_of(store, ref, enc));
+                return decode_cell_dec(cell_of(store, ref, enc),
+                                       store->schema().kind_of(enc + 1),
+                                       store->schema().scale_of(enc + 1));
             const uint32_t t = enc >> 16;
             const uint32_t col = enc & 0xFFFF;
             for (size_t i = 0; i < ctx->tables->size(); ++i) {
                 if ((*ctx->tables)[i] == t) {
                     const uint64_t r = (*ctx->refs)[i][ctx->row];
                     if (r == kNullRef) return {};
-                    return dec_parse(cell_of((*ctx->stores)[t], r, col));
+                    const PaxStore* s = (*ctx->stores)[t];
+                    return decode_cell_dec(cell_of(s, r, col),
+                                           s->schema().kind_of(col + 1),
+                                           s->schema().scale_of(col + 1));
                 }
             }
             return {};
@@ -619,13 +744,14 @@ struct Executor {
         const NodeResult& src = results[semi.source_node()];
         const int pos = src.table_pos(semi.source_column().table_idx());
         if (pos < 0) return fail("semi source table");
+        const uint32_t tbl = semi.source_column().table_idx();
+        const uint32_t col = semi.source_column().column();
         out->reserve(src.rows());
+        std::string buf;  // typed -> canonical ASCII
         for (size_t r = 0; r < src.rows(); ++r) {
             const uint64_t ref = src.refs[pos][r];
             if (ref == kNullRef) continue;
-            std::string_view v =
-                value_of(semi.source_column().table_idx(), ref,
-                         semi.source_column().column());
+            std::string_view v = key_view(tbl, ref, col, buf);
             if (!v.empty()) out->emplace(v);
         }
         return true;
@@ -652,17 +778,21 @@ struct Executor {
         const uint32_t col = semi.source_column().column();
         const int pos = src.table_pos(tbl);
         if (pos < 0) return fail("semi source table");
+        const uint8_t kind = column_kind(tbl, col);
+        const int scale = column_scale(tbl, col);
         iout->reserve(src.rows());
         *is_int = true;
+        std::string buf;
         for (size_t r = 0; r < src.rows(); ++r) {
             const uint64_t ref = src.refs[pos][r];
             if (ref == kNullRef) continue;
             const std::string_view v = value_of(tbl, ref, col);
             if (v.empty()) continue;
             int64_t iv;
-            if (!parse_i64(v, &iv)) {
+            if (!decode_cell_i64(v, kind, &iv)) {
                 // Non-INT key column: abandon the int set and re-collect as
-                // owned strings (matches the byte-comparison probe path).
+                // owned canonical-ASCII strings (matches the byte-comparison
+                // probe path; typed cells are formatted, not raw binary).
                 *is_int = false;
                 iout->clear();
                 sout->reserve(src.rows());
@@ -670,7 +800,14 @@ struct Executor {
                     const uint64_t ref2 = src.refs[pos][r2];
                     if (ref2 == kNullRef) continue;
                     const std::string_view v2 = value_of(tbl, ref2, col);
-                    if (!v2.empty()) sout->emplace(v2);
+                    if (v2.empty()) continue;
+                    if (kind == fk::FK_UNTYPED) {
+                        sout->emplace(v2);
+                    } else {
+                        buf.clear();
+                        format_typed_view(kind, scale, v2, &buf);
+                        sout->emplace(buf);
+                    }
                 }
                 return true;
             }
@@ -700,6 +837,39 @@ struct Executor {
         if (ref >= vt.nulls.size() || column >= vt.nulls[ref].size())
             return true;
         return vt.nulls[ref][column];
+    }
+
+    // ----- Typed cell access (M2) ------------------------------------------
+    // Storage kind / DECIMAL scale of a real-table column (virtual/derived
+    // tables carry ASCII, so UNTYPED). `column` is 0-based; field index = +1.
+    uint8_t column_kind(uint32_t t, uint32_t col) const {
+        if (is_virtual(t)) return fk::FK_UNTYPED;
+        return stores[t]->schema().kind_of(static_cast<size_t>(col) + 1);
+    }
+    int column_scale(uint32_t t, uint32_t col) const {
+        if (is_virtual(t)) return 0;
+        return stores[t]->schema().scale_of(static_cast<size_t>(col) + 1);
+    }
+    // Read an int/date column (or an UNTYPED ASCII integer) to int64. Returns
+    // false for SQL NULL or a non-integer UNTYPED cell.
+    bool read_i64(uint32_t t, uint64_t ref, uint32_t col, int64_t* out) const {
+        return decode_cell_i64(value_of(t, ref, col), column_kind(t, col), out);
+    }
+    // Read any numeric column as an exact Dec.
+    Dec read_dec(uint32_t t, uint64_t ref, uint32_t col) const {
+        return decode_cell_dec(value_of(t, ref, col), column_kind(t, col),
+                               column_scale(t, col));
+    }
+    // Canonical ASCII (== val_str) of a cell: verbatim for UNTYPED, formatted
+    // for typed. `buf` backs the view for typed cells (own storage per call).
+    std::string_view key_view(uint32_t t, uint64_t ref, uint32_t col,
+                              std::string& buf) const {
+        const std::string_view v = value_of(t, ref, col);
+        const uint8_t k = column_kind(t, col);
+        if (k == fk::FK_UNTYPED || v.empty()) return v;
+        buf.clear();
+        format_typed_view(k, column_scale(t, col), v, &buf);
+        return buf;
     }
 
     unsigned workers() const {
@@ -781,6 +951,10 @@ struct Executor {
         bool semi_active = false;
         bool semi_int = false;
         uint32_t semi_col = 0;
+        // Typed kind/scale of the probed column (M2): the probe decodes typed
+        // cells directly, and formats them to canonical ASCII for a string set.
+        uint8_t semi_col_kind = fk::FK_UNTYPED;
+        int semi_col_scale = 0;
         if (scan.has_semi()) {
             bool is_int = false;
             if (!collect_keys_typed(scan.semi(), &semi_ikeys, &semi_keys,
@@ -794,12 +968,19 @@ struct Executor {
                 semi_int = is_int;
                 if (!is_int) semi_set = &semi_keys;
                 semi_col = scan.semi().my_column();
+                semi_col_kind = column_kind(scan.table_idx(), semi_col);
+                semi_col_scale = column_scale(scan.table_idx(), semi_col);
             }
         }
         const bool use_ext = ext_keys != nullptr &&
                              ext_filter_table == scan.table_idx();
         // Typed-key probes (E13): int64 set when every injected key converts.
         const bool ext_int = use_ext && to_int_set(*ext_keys, &ext_ikeys);
+        const uint8_t ext_col_kind =
+            use_ext ? column_kind(scan.table_idx(), ext_filter_column)
+                    : fk::FK_UNTYPED;
+        const int ext_col_scale =
+            use_ext ? column_scale(scan.table_idx(), ext_filter_column) : 0;
 
         const bool has_filter =
             scan.has_filter() && scan.filter().has_expr();
@@ -881,11 +1062,18 @@ struct Executor {
                                     grp->cell(semi_col + 1, slot);
                                 if (semi_int) {
                                     int64_t v;
-                                    if (!parse_i64(kv, &v) ||
+                                    if (!decode_cell_i64(kv, semi_col_kind,
+                                                         &v) ||
                                         semi_ikeys.count(v) == 0)
                                         continue;
                                 } else {
-                                    probe.assign(kv.data(), kv.size());
+                                    probe.clear();
+                                    if (semi_col_kind == fk::FK_UNTYPED)
+                                        probe.assign(kv.data(), kv.size());
+                                    else if (!kv.empty())
+                                        format_typed_view(semi_col_kind,
+                                                          semi_col_scale, kv,
+                                                          &probe);
                                     if (semi_set->count(probe) == 0)
                                         continue;
                                 }
@@ -895,11 +1083,18 @@ struct Executor {
                                     ext_filter_column + 1, slot);
                                 if (ext_int) {
                                     int64_t v;
-                                    if (!parse_i64(kv, &v) ||
+                                    if (!decode_cell_i64(kv, ext_col_kind,
+                                                         &v) ||
                                         ext_ikeys.count(v) == 0)
                                         continue;
                                 } else {
-                                    probe.assign(kv.data(), kv.size());
+                                    probe.clear();
+                                    if (ext_col_kind == fk::FK_UNTYPED)
+                                        probe.assign(kv.data(), kv.size());
+                                    else if (!kv.empty())
+                                        format_typed_view(ext_col_kind,
+                                                          ext_col_scale, kv,
+                                                          &probe);
                                     if (ext_keys->count(probe) == 0)
                                         continue;
                                 }
@@ -1005,6 +1200,10 @@ struct Executor {
         std::vector<int> pos;            // per filter column: ref column pos
         std::vector<std::string_view> cells;
         std::vector<bool> nulls;
+        // Per-column backing storage for typed cells materialized to canonical
+        // ASCII (the flattened multi-table view is fed to the evaluator, which
+        // expects ASCII, so typed cells are formatted once here).
+        std::vector<std::string> bufs;
     };
 
     bool prep_tuple_filter(const pb::QbTupleFilter& tf, const NodeResult& nr,
@@ -1016,6 +1215,7 @@ struct Executor {
         }
         ctx->cells.resize(tf.columns_size());
         ctx->nulls.resize(tf.columns_size());
+        ctx->bufs.resize(tf.columns_size());
         return true;
     }
 
@@ -1028,8 +1228,8 @@ struct Executor {
                 ctx->cells[i] = {};
                 ctx->nulls[i] = true;
             } else {
-                ctx->cells[i] = value_of(tf.columns(i).table_idx(), ref,
-                                         tf.columns(i).column());
+                ctx->cells[i] = key_view(tf.columns(i).table_idx(), ref,
+                                         tf.columns(i).column(), ctx->bufs[i]);
                 ctx->nulls[i] =
                     null_of(tf.columns(i).table_idx(), ref,
                             tf.columns(i).column());
@@ -1169,9 +1369,8 @@ struct Executor {
             iht.reserve(build.rows());
             for (size_t r = 0; r < build.rows(); ++r) {
                 int64_t v;
-                const std::string_view kv = value_of(
-                    bk[0].table_idx, build.refs[bk[0].pos][r], bk[0].column);
-                if (!parse_i64(kv, &v)) {
+                if (!read_i64(bk[0].table_idx, build.refs[bk[0].pos][r],
+                              bk[0].column, &v)) {
                     int_join = false;
                     iht.clear();
                     break;
@@ -1181,13 +1380,16 @@ struct Executor {
         }
         if (!int_join) {
             ht.reserve(build.rows());
-            std::string key;
+            std::string key, kbuf;
             for (size_t r = 0; r < build.rows(); ++r) {
                 key.clear();
                 bool null_key = false;
                 for (const auto& k : bk) {
-                    const std::string_view kv = value_of(
-                        k.table_idx, build.refs[k.pos][r], k.column);
+                    // Canonical ASCII so typed/UNTYPED columns join
+                    // consistently (a typed int and an ASCII int with the same
+                    // value share the same key bytes).
+                    const std::string_view kv = key_view(
+                        k.table_idx, build.refs[k.pos][r], k.column, kbuf);
                     // SQL equijoin: NULL (empty cell) never matches —
                     // mirror MySQL's null-rejecting hash join (review I1;
                     // byte keys used to match empty==empty, diverging
@@ -1226,10 +1428,11 @@ struct Executor {
             pool.emplace_back([&, w] {
                 auto& mine = chunks[w].refs;
                 mine.assign(out->tables.size(), {});
-                std::string key;
+                std::string key, kbuf;
                 PredicateEvaluator ev;
                 std::vector<std::string_view> rcells(residual_cols.size());
                 std::vector<bool> rnulls(residual_cols.size(), false);
+                std::vector<std::string> rbufs(residual_cols.size());
                 // True when build row `br` passes the residual predicate
                 // against probe row `r`.
                 auto residual_ok = [&](size_t r, uint32_t br) {
@@ -1239,7 +1442,8 @@ struct Executor {
                         const uint64_t ref = rc.from_build
                                                  ? build.refs[rc.pos][br]
                                                  : probe.refs[rc.pos][r];
-                        rcells[i] = value_of(rc.table_idx, ref, rc.column);
+                        rcells[i] =
+                            key_view(rc.table_idx, ref, rc.column, rbufs[i]);
                         rnulls[i] = null_of(rc.table_idx, ref, rc.column);
                     }
                     ev.set_row_from_views(rcells, rnulls);
@@ -1251,10 +1455,9 @@ struct Executor {
                     const std::vector<uint32_t>* mrows = nullptr;
                     if (int_join) {
                         int64_t v;
-                        const std::string_view kv =
-                            value_of(pk[0].table_idx,
-                                     probe.refs[pk[0].pos][r], pk[0].column);
-                        if (parse_i64(kv, &v)) {
+                        if (read_i64(pk[0].table_idx,
+                                     probe.refs[pk[0].pos][r], pk[0].column,
+                                     &v)) {
                             const auto iit = iht.find(v);
                             if (iit != iht.end()) mrows = &iit->second;
                         }
@@ -1263,8 +1466,8 @@ struct Executor {
                         bool null_key = false;
                         for (const auto& k : pk) {
                             const std::string_view kv =
-                                value_of(k.table_idx, probe.refs[k.pos][r],
-                                         k.column);
+                                key_view(k.table_idx, probe.refs[k.pos][r],
+                                         k.column, kbuf);
                             if (kv.empty()) {  // NULL never matches (I1)
                                 null_key = true;
                                 break;
@@ -1439,19 +1642,19 @@ struct Executor {
         }
         PredicateEvaluator ev;
         [[maybe_unused]] std::string keybuf;
+        [[maybe_unused]] std::string kdisp;  // typed -> canonical ASCII (key_cols)
+        std::string aggbuf;  // typed -> canonical ASCII (agg arg values)
         [[maybe_unused]] std::vector<std::string_view> gv(n_grp);
+        [[maybe_unused]] std::vector<std::string> gbufs(n_grp);
         for (size_t r = begin; r < end; ++r) {
             GroupState* gs;
             if constexpr (IntKey) {
                 // Single group column, prefix_len==0 (enforced by caller).
                 const auto& c = agg.group_columns(0);
                 const uint64_t ref = in.refs[gpos[0]][r];
-                const std::string_view cell =
-                    ref == kNullRef
-                        ? std::string_view()
-                        : value_of(c.table_idx(), ref, c.column());
                 int64_t iv;
-                if (!parse_i64(cell, &iv)) {
+                if (ref == kNullRef ||
+                    !read_i64(c.table_idx(), ref, c.column(), &iv)) {
                     // Non-INT (or NULL) key: abandon the int path; the
                     // caller re-runs this aggregation over string keys.
                     parse_fail->store(true, std::memory_order_relaxed);
@@ -1461,7 +1664,8 @@ struct Executor {
                 if (it == groups.end()) {
                     GroupState st;
                     st.key_cols.resize(1);
-                    st.key_cols[0] = std::string(cell);  // HAVING/output
+                    st.key_cols[0] = std::string(  // canonical ASCII (HAVING/out)
+                        key_view(c.table_idx(), ref, c.column(), kdisp));
                     st.aggs.resize(n_agg);
                     gs = &groups.emplace(iv, std::move(st)).first->second;
                 } else {
@@ -1475,14 +1679,11 @@ struct Executor {
                 const auto& c1 = agg.group_columns(1);
                 const uint64_t r0 = in.refs[gpos[0]][r];
                 const uint64_t r1 = in.refs[gpos[1]][r];
-                const std::string_view cell0 =
-                    r0 == kNullRef ? std::string_view()
-                                   : value_of(c0.table_idx(), r0, c0.column());
-                const std::string_view cell1 =
-                    r1 == kNullRef ? std::string_view()
-                                   : value_of(c1.table_idx(), r1, c1.column());
                 Int2Key key;
-                if (!parse_i64(cell0, &key.a) || !parse_i64(cell1, &key.b)) {
+                if (r0 == kNullRef ||
+                    !read_i64(c0.table_idx(), r0, c0.column(), &key.a) ||
+                    r1 == kNullRef ||
+                    !read_i64(c1.table_idx(), r1, c1.column(), &key.b)) {
                     parse_fail->store(true, std::memory_order_relaxed);
                     return false;
                 }
@@ -1490,8 +1691,10 @@ struct Executor {
                 if (it == groups.end()) {
                     GroupState st;
                     st.key_cols.resize(2);
-                    st.key_cols[0] = std::string(cell0);  // HAVING/output
-                    st.key_cols[1] = std::string(cell1);
+                    st.key_cols[0] = std::string(
+                        key_view(c0.table_idx(), r0, c0.column(), kdisp));
+                    st.key_cols[1] = std::string(
+                        key_view(c1.table_idx(), r1, c1.column(), kdisp));
                     st.aggs.resize(n_agg);
                     gs = &groups.emplace(key, std::move(st)).first->second;
                 } else {
@@ -1502,9 +1705,12 @@ struct Executor {
                 for (int g = 0; g < n_grp; ++g) {
                     const auto& c = agg.group_columns(g);
                     const uint64_t ref = in.refs[gpos[g]][r];
+                    // Canonical ASCII so grouping, HAVING and output all see
+                    // the val_str text (typed cells formatted once here).
                     gv[g] = ref == kNullRef
                                 ? std::string_view()
-                                : value_of(c.table_idx(), ref, c.column());
+                                : key_view(c.table_idx(), ref, c.column(),
+                                           gbufs[g]);
                     if (c.prefix_len() > 0 && gv[g].size() > c.prefix_len())
                         gv[g] = gv[g].substr(0, c.prefix_len());
                     const uint32_t l = static_cast<uint32_t>(gv[g].size());
@@ -1553,9 +1759,11 @@ struct Executor {
                 switch (af.kind()) {
                     case pb::QbAggFunc::COUNT:
                         if (af.distinct()) {
-                            const std::string_view dv = value_of(
+                            // Canonical ASCII so DISTINCT counts by value
+                            // (typed cells formatted; distinct-by-value).
+                            const std::string_view dv = key_view(
                                 af.arg_table(), ref,
-                                af.arg().column_index());
+                                af.arg().column_index(), aggbuf);
                             if (!dv.empty())
                                 gs->aggs[a].dset.emplace(dv);
                             break;
@@ -1566,9 +1774,8 @@ struct Executor {
                     case pb::QbAggFunc::AVG: {
                         Dec v =
                             arg_virtual
-                                ? dec_parse(value_of(
-                                      af.arg_table(), ref,
-                                      af.arg().column_index()))
+                                ? read_dec(af.arg_table(), ref,
+                                           af.arg().column_index())
                                 : eval_arith(af.arg(),
                                              stores[af.arg_table()], ref,
                                              &arith_ctx);
@@ -1585,9 +1792,11 @@ struct Executor {
                         const bool want_max =
                             af.kind() == pb::QbAggFunc::MAX;
                         if (af.cmp_kind() == 1) {
-                            std::string_view cv = value_of(
+                            // Canonical ASCII: string order == value order for
+                            // strings and (via YYYY-MM-DD) for typed DATE.
+                            std::string_view cv = key_view(
                                 af.arg_table(), ref,
-                                af.arg().column_index());
+                                af.arg().column_index(), aggbuf);
                             if (cv.empty()) break;
                             if (!gs->aggs[a].has ||
                                 (want_max ? cv > std::string_view(gs->aggs[a].sval)
@@ -1596,9 +1805,8 @@ struct Executor {
                             gs->aggs[a].has = true;
                         } else {
                             Dec v = arg_virtual
-                                        ? dec_parse(value_of(
-                                              af.arg_table(), ref,
-                                              af.arg().column_index()))
+                                        ? read_dec(af.arg_table(), ref,
+                                                   af.arg().column_index())
                                         : eval_arith(af.arg(),
                                                      stores[af.arg_table()],
                                                      ref);
@@ -1817,6 +2025,7 @@ struct Executor {
             pos[i] = in.table_pos(oe.column().table_idx());
             if (pos[i] < 0) return fail("row output table");
         }
+        std::string vbuf;  // typed cell -> canonical ASCII for output
         for (size_t r = 0; r < in.rows(); ++r) {
             OutRow row;
             row.vals.reserve(req.output_size());
@@ -1831,8 +2040,8 @@ struct Executor {
                     row.nulls.push_back(true);
                     continue;
                 }
-                std::string_view v = value_of(oe.column().table_idx(), ref,
-                                              oe.column().column());
+                std::string_view v = key_view(oe.column().table_idx(), ref,
+                                              oe.column().column(), vbuf);
                 if (oe.column().prefix_len() > 0 &&
                     v.size() > oe.column().prefix_len())
                     v = v.substr(0, oe.column().prefix_len());

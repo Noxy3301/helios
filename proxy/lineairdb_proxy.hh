@@ -337,8 +337,12 @@ public:
     // pax_field_max_bytes: PAX cell widths per row-format field (index 0 =
     // null-flags field, then columns in field order); empty keeps the
     // row-store layout. The server ignores it unless HELIOS_PAX_STORAGE=1.
+    // pax_field_kind/pax_field_scale: PAX typed-cell metadata (M2), one entry
+    // per pax_field_max_bytes entry; empty keeps the ASCII byte layout.
     bool db_create_table(const std::string& table_name,
-                         const std::vector<uint32_t>& pax_field_max_bytes = {});
+                         const std::vector<uint32_t>& pax_field_max_bytes = {},
+                         const std::vector<uint32_t>& pax_field_kind = {},
+                         const std::vector<int32_t>& pax_field_scale = {});
     bool db_set_table(int64_t tx_id, const std::string& table_name);
     bool db_create_secondary_index(const std::string& table_name,
                                    const std::string& index_name,

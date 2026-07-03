@@ -484,6 +484,16 @@ message DbCreateTable {
         // additionally gates on HELIOS_PAX_STORAGE=1; proxies may always
         // send this.
         repeated uint32 pax_field_max_bytes = 2 [packed = true];
+        // PAX typed cells (M2): per-field storage kind, one entry per
+        // pax_field_max_bytes entry (index 0 = null-flags field). Values match
+        // LineairDB::Pax::FieldKind (0=UNTYPED, 1=INT32, 2=INT64, 3=DATE,
+        // 4=DEC64). Empty or length-mismatched => every field UNTYPED (the
+        // pre-M2 byte layout). The server additionally gates typed install on
+        // HELIOS_PAX_TYPED (default on); proxies may always send this.
+        repeated uint32 pax_field_kind = 3 [packed = true];
+        // DECIMAL scale per field for FK_DEC64 (else 0). Same length as
+        // pax_field_kind when present.
+        repeated int32 pax_field_scale = 4 [packed = true];
     }
     message Response {
         bool success = 1;

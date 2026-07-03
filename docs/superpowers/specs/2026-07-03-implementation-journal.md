@@ -622,3 +622,83 @@ quiesce プロトコルの overflow_count 再検査欠落の閉塞。次段: **c
 セル** (INT/DATE/DECIMAL の ASCII テキスト格納を native 化、arena さらに −6.9GB +
 ASCII パース税 [q1/q6 の 25-52%] 消滅、scatter 経路接触の本丸 = SIMD スパイクの結論
 「型付けは効く」の受け皿)。
+
+### M2a: 型付き数値セル (INT ファミリ + DATE) — big-bang ストレージ形式変更 (2026-07-03)
+
+**動機 (candidate #2, stage a).** PAX cell は数値も ASCII val_str テキストで格納 →
+スキャンの度に再パース (q1/q6 の 25-52% が dec_parse/strtod/extract_value) + 21/32B
+の幅浪費。M2a は INT ファミリと DATE を **native 固定幅バイナリ**にし (DECIMAL は M2b)、
+メモリと速度を両取りする。
+
+**設計 (M1 の proxy-computes/engine-stores パターン踏襲).** proxy `compute_pax_field_widths`
+が幅に加え **kind** (FK_UNTYPED/INT32/INT64/DATE、+ M2b の DEC64) と DECIMAL scale を
+`Field` 型から計算し protobuf (DbCreateTable の pax_field_kind/scale) で送信 → server が
+`Pax::TableSchema.field_kind/field_scale` に格納 (env `HELIOS_PAX_TYPED` default on)。
+格納: INT→int32/int64 LE、DATE→int32 YYYYMMDD、cell 幅 = binary width (4/8)。
+**NULL 表現**: cell の u16 len prefix が 0=NULL・=width=present — 既存の「empty cell =
+null」を型付きセルでもそのまま使い、専用 validity strip 不要。
+- **ScatterRow (書込パス)**: ASCII val_str を一度だけパースして binary 化。2-pass
+  (全 field を検証してから write_counter bump) で、parse/範囲失敗 = M1 と同じ per-row
+  heap fallback (BumpOverflow → strip scan 無効化・never wrong)。int32 範囲検査、
+  BIGINT UNSIGNED / ZEROFILL は型付けせず ASCII 維持。
+- **GatherRow/Projected/Sparse (読出/OLTP)**: binary → **元の val_str を byte-exact に
+  再構成**。DataBuffer::size が元 ASCII サイズを保持する契約なので byte 一致は必須
+  (md5 ゲートが強制)。recovery/copy は toString()/Reset 経由 = 同じ scatter/gather を
+  通るので正しさを継承 (data_buffer.hpp:159 の PAX→PAX copy 含め検証済み)。
+
+**致命的な罠 = byte-sniff mis-parse.** 型付き int の LE バイトが偶然すべて ASCII 数字に
+なる値 (例 808464432 = 0x30303030 = "0000"、858927408 → "0123") は、いずれかの reader が
+raw バイトに `parse_i64`/`strtoll` を掛けると**特定値だけ静かに誤読** (md5 ゲートは運が
+良ければ通ってしまう)。従って全 reader を **schema-driven** に (バイトを sniff せず kind
+で decode)。対応した reader: 両 executor (query_block_executor / lineairdb_rpc の 集計・
+semi 経路)、predicate_evaluator (scan/agg filter)、zone_map (**型付き列は prune せず** —
+ClassifyCell が binary を ASCII 誤分類し誤 prune するため)。正規化規則: 数値キー/フィルタ
+= `read_i64`/`decode_cell_i64` で int64 化、文字列キー/出力/group 表示 = `key_view` で
+canonical ASCII 化。これで typed 列と UNTYPED(derived ASCII) 列が混在しても一貫。
+**専用回帰**: 全 LE バイトが ASCII 数字の値を持つ表で `WHERE k=0`/`k=123` が該当行を
+拾わない (0 行) ことを FORCED-vs-OFF で確認 → 確率的ハザードを決定的テスト化。
+
+**罠 (DATE compare の format 落とし穴 — 実測で発見).** 初版は predicate evaluator で
+DATE セルを毎行 "YYYY-MM-DD" に format して string 比較 → q6 が 73→165ms (2.3x 悪化)、
+DATE フィルタ系全滅 (q4/q12/q14/q15/q3/q20)。修正: `ValType::DATE` を追加し
+**YYYYMMDD int で直接比較** (string 順序 == int 順序、SIMD スパイクの DATE 手法)。const
+'YYYY-MM-DD' は compare() で int 化、非日付文字列との比較のみ format fallback (稀)。
+LIKE on DATE も canonical form で match。→ q6 76ms 復帰、DATE 系全て改善 (q4 -42, q7 -42)。
+
+**実測 (SF=1, clean, 同一 jemalloc).**
+| | M1 (f75270b) | M2a | 差 |
+|---|---|---|---|
+| lineairdb-server VmRSS | 7.33 GB | **6.32 GB** | **−1.01 GB (−13.8%)** |
+| SF=1 FORCED wall (min-of-3) | 6.04 s | **5.88 s** | −0.15 s |
+主な改善 (typed INT キー): q21 823→713, q4 352→310, q7 225→183, q8 136→112, q13 239→204,
+q17 53→42。q1/q6 は横ばい (DECIMAL 律速 = M2b)。q18 は noise 域 (±100ms、変更コード殆ど
+不通過)。
+
+**検証**: SF=0.01 22/22 FORCED-vs-OFF ALL-MATCH + 型付き回帰 12/12 (INT/DATE/負値/NULL/
+mis-sniff/UNSIGNED)、SF=1 22/22 md5 が **M1 とバイト一致** (意味論保存)、overflow_count=0。
+TPC-C 1/8/32/64t = **415.5/1505.7/3603.3/5086.3 req/s、全点 Unexpected Errors=0** (M1
+420/1553/3663/5032 比 ±3% 内、型付き INT 書込パス影響なし)。変更 = 14 ファイル
+(proto/proxy/server 9 + LineairDB submodule 5 — M1 と違い engine 変更が必要な本丸)。
+
+**dual review (code-reviewer + Codex、両者バグ検出).**
+- **[code-reviewer, CONFIRMED] DATE hash-join キー非対称** → 修正済み。`decode_cell_i64`
+  が FK_DATE を int(YYYYMMDD) 扱いだが、hash join の int_join 判定は build 側のみ →
+  typed-DATE build 側 vs ASCII-DATE(derived) probe 側で probe の parse_i64 が失敗し行
+  脱落 (build/probe 逆なら string 経路で正)。修正: `decode_cell_i64` は FK_DATE/FK_DEC64
+  で false を返し、DATE キーは常に string(key_view) 経路 = UNTYPED/semi 経路/pre-M2 と一貫。
+  TPC-H は DATE をキーにしないので影響なし。
+- **[code-reviewer, hardening] FK_DEC64 (M2b 前の dead code) が decode_cell_i64 で
+  parse_i64 に落ちる** → 上の修正で同時解決 (M2b 有効化前に閉塞)。
+- **[Codex, CONFIRMED] typed UNSIGNED INT 述語が巨大 CONST_UINT で反転** → 修正済み。
+  predicate evaluator が typed INT を compare_type によらず ValType::INT 化 → UNSIGNED
+  列 vs INT64_MAX 超リテラルで mixed compare が uint を負 int64 にキャストし `0 <
+  UINT64_MAX` が false 化。修正: compare_type==1 は ValType::UINT を返す(pre-M2 ASCII
+  経路と一致、typed unsigned 値は正 int64 に収まるので reinterpret 正確)。回帰 3 本追加。
+- **[code-reviewer, hardening/自発検出] YEAR** → force UNTYPED 済み。**副産物の発見**:
+  YEAR=0 は row engine が "0000"、secondary engine は生 val_str "0" を emit する
+  **pre-existing な表示差** (UNTYPED でも発火、typed 由来でない・TPC-H/C に YEAR 無)。
+  M2a は YEAR を UNTYPED に保ち pre-M2 とバイト一致 (byte-exact round trip 保護)。この
+  secondary/row の YEAR 表示差は別課題として記録 (M2a scope 外)。
+両修正後に再ゲート **22/22 + 回帰 12/12 ALL-MATCH**。**教訓**: 型付き列の全 reader は
+schema-driven 必須 (byte-sniff は特定値だけ静かに壊れ md5 が運で通る) — 決定的回帰
+(all-digit-byte 値・UNSIGNED・DATE キー・YEAR round-trip) で網羅。

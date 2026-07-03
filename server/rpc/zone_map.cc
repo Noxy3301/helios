@@ -201,6 +201,15 @@ int64_t DecUpper(double c, int scale) {
 bool GetColumnZones(PaxStore* store, uint32_t column, size_t n_groups,
                     std::vector<StripZone>* out, ZKind* kind, int* scale) {
     if (!Enabled() || n_groups == 0) return false;
+    // Typed cells (M2) hold fixed-width LE binary that ClassifyCell would
+    // mis-read as ASCII (e.g. a typed int whose bytes are digit characters),
+    // yielding a bogus min/max and an incorrect prune. Zone maps are
+    // perf-neutral on TPC-H, so typed columns are simply never pruned (skipping
+    // a prune is always correct). Field index for MySQL column c is c+1.
+    const auto& fkinds = store->schema().field_kind;
+    if (static_cast<size_t>(column) + 1 < fkinds.size() &&
+        fkinds[column + 1] != LineairDB::Pax::FK_UNTYPED)
+        return false;
     ZoneColumn* zc = get_col(store, column);
     std::lock_guard<std::mutex> lk(zc->mu);
 

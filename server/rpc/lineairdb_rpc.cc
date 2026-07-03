@@ -5,10 +5,12 @@
 
 #include <iostream>
 #include <vector>
+#include <cstdio>
 #include <cstring>
 #include <algorithm>
 #include <cstdlib>
 #include <limits>
+#include <string>
 #include <unordered_set>
 
 #include "lineairdb.pb.h"
@@ -218,6 +220,35 @@ static inline std::string_view row_column(const PaxRowRef& row, uint32_t idx) {
     return row.group->cell(idx + 1, row.slot);  // field 0 = null flags
 }
 
+// Typed cell (M2) -> exact Dec. Materialized rows are ASCII (dec_parse); a PAX
+// row reads the fixed-width binary via the group's schema kind. UNTYPED falls
+// back to dec_parse so pre-M2 behavior is byte-identical.
+static inline Dec dec_column(const std::string& row, uint32_t idx) {
+    return dec_parse(extract_value_column(row, idx));
+}
+static inline Dec dec_column(const PaxRowRef& row, uint32_t idx) {
+    const std::string_view v = row.group->cell(idx + 1, row.slot);
+    if (v.empty()) { Dec d; d.null = true; return d; }
+    const auto& sch = row.group->schema();
+    switch (sch.kind_of(idx + 1)) {
+        case LineairDB::Pax::FK_INT32:
+        case LineairDB::Pax::FK_DATE: {
+            int32_t x; std::memcpy(&x, v.data(), 4);
+            Dec d; d.m = x; d.s = 0; return d;
+        }
+        case LineairDB::Pax::FK_INT64: {
+            int64_t x; std::memcpy(&x, v.data(), 8);
+            Dec d; d.m = x; d.s = 0; return d;
+        }
+        case LineairDB::Pax::FK_DEC64: {
+            int64_t x; std::memcpy(&x, v.data(), 8);
+            Dec d; d.m = x; d.s = sch.scale_of(idx + 1); return d;
+        }
+        default:
+            return dec_parse(v);
+    }
+}
+
 /**
  * @brief Evaluate an aggregate argument expression against one base row.
  */
@@ -226,7 +257,7 @@ static Dec dec_eval(const LineairDB::Protocol::FilterExpr& e, const Row& row) {
     using FE = LineairDB::Protocol::FilterExpr;
     switch (e.op()) {
         case FE::COLUMN_REF:
-            return dec_parse(row_column(row, e.column_index()));
+            return dec_column(row, e.column_index());
         case FE::CONST_INT:  { Dec d; d.m = e.int_val();  d.s = 0; return d; }
         case FE::CONST_UINT: { Dec d; d.m = (__int128)e.uint_val(); d.s = 0; return d; }
         case FE::OP_ADD: {
@@ -272,6 +303,53 @@ static std::string dec_format(const Dec& d) {
     const size_t ip = digits.size() - d.s;
     out.append(digits, 0, ip); out.push_back('.'); out.append(digits, ip, std::string::npos);
     return out;
+}
+
+// Canonical val_str ASCII of a typed cell into *out (mirror the engine's
+// FormatTyped; the md5 gates enforce byte-identity).
+static void format_typed_pax(uint8_t kind, int scale, std::string_view v,
+                             std::string* out) {
+    switch (kind) {
+        case LineairDB::Pax::FK_INT32: {
+            int32_t x; std::memcpy(&x, v.data(), 4);
+            out->append(std::to_string(x));
+            break;
+        }
+        case LineairDB::Pax::FK_INT64: {
+            int64_t x; std::memcpy(&x, v.data(), 8);
+            out->append(std::to_string(x));
+            break;
+        }
+        case LineairDB::Pax::FK_DATE: {
+            int32_t x; std::memcpy(&x, v.data(), 4);
+            char b[16];
+            int n = std::snprintf(b, sizeof(b), "%04d-%02d-%02d", x / 10000,
+                                  (x / 100) % 100, x % 100);
+            if (n > 0) out->append(b, static_cast<size_t>(n));
+            break;
+        }
+        case LineairDB::Pax::FK_DEC64: {
+            int64_t x; std::memcpy(&x, v.data(), 8);
+            Dec d; d.m = x; d.s = scale; d.null = false;
+            out->append(dec_format(d));
+            break;
+        }
+        default:
+            out->append(v.data(), v.size());
+            break;
+    }
+}
+// Canonical ASCII of a group cell (verbatim for UNTYPED). `buf` backs the view
+// for typed cells.
+static std::string_view pax_key_view(const LineairDB::Pax::PaxGroup& g,
+                                     uint32_t idx, uint32_t slot,
+                                     std::string& buf) {
+    const std::string_view v = g.cell(idx + 1, slot);
+    const uint8_t kind = g.schema().kind_of(idx + 1);
+    if (kind == LineairDB::Pax::FK_UNTYPED || v.empty()) return v;
+    buf.clear();
+    format_typed_pax(kind, g.schema().scale_of(idx + 1), v, &buf);
+    return buf;
 }
 
 static constexpr uint32_t kAggregateHavingFilterColumns =
@@ -615,6 +693,7 @@ static bool aggregate_pax_group(
     PredicateEvaluator evaluator;
     std::string keybuf;
     std::vector<std::string_view> gv(n_grp);
+    std::vector<std::string> gbufs(n_grp);  // typed -> canonical ASCII backing
     for (uint32_t base = 0; base < LineairDB::Pax::PaxGroup::kRows;
          base += 64) {
         // Visibility is checked per 64-slot word so fully-empty regions
@@ -637,7 +716,10 @@ static bool aggregate_pax_group(
             const PaxRowRef row{&group, slot};
             keybuf.clear();
             for (int g = 0; g < n_grp; ++g) {
-                gv[g] = row_column(row, spec.group_columns(g));
+                // Canonical ASCII so grouping/output see val_str text, not the
+                // typed binary (mixed typed/UNTYPED group columns stay consistent).
+                gv[g] = pax_key_view(group, spec.group_columns(g), slot,
+                                     gbufs[g]);
                 const uint32_t l = static_cast<uint32_t>(gv[g].size());
                 keybuf.append(reinterpret_cast<const char*>(&l), sizeof(l));
                 keybuf.append(gv[g].data(), gv[g].size());
@@ -824,6 +906,7 @@ static bool pax_ref_scan_emit(
             return;
         }
         PredicateEvaluator evaluator;
+        std::string sjbuf;  // typed probe cell -> canonical ASCII
         for (auto& r : refs.rows) {
             const auto* grp =
                 static_cast<const LineairDB::Pax::PaxGroup*>(r.group);
@@ -842,8 +925,11 @@ static bool pax_ref_scan_emit(
             bool sj_drop = false;
             if (pass && !fe_semijoins.empty()) {
                 for (const auto& fsj : fe_semijoins) {
-                    const std::string_view col =
-                        grp->cell(fsj.probe_column + 1, r.slot);
+                    // Canonical ASCII: fsj.keys is built from materialized
+                    // (ASCII) source rows, so a typed probe cell must be
+                    // formatted to match.
+                    const std::string_view col = pax_key_view(
+                        *grp, fsj.probe_column, r.slot, sjbuf);
                     if (fsj.keys.find(std::string(col)) == fsj.keys.end()) {
                         sj_drop = true;
                         break;
@@ -3394,10 +3480,31 @@ void LineairDBRpc::handleDbCreateTable(const std::string& message, std::string& 
     if (pax_storage_enabled && request.pax_field_max_bytes_size() > 0) {
         std::vector<uint32_t> widths(request.pax_field_max_bytes().begin(),
                                      request.pax_field_max_bytes().end());
+        // Typed cells (M2): gate on HELIOS_PAX_TYPED (default on). When off, or
+        // when the proxy sent no/mismatched kinds, install an UNTYPED schema
+        // (byte-identical to the pre-M2 ASCII layout).
+        static const bool pax_typed_enabled = []() {
+            const char* v = std::getenv("HELIOS_PAX_TYPED");
+            return !(v != nullptr && v[0] == '0' && v[1] == '\0');
+        }();
+        std::vector<uint8_t> kinds;
+        std::vector<int8_t> scales;
+        if (pax_typed_enabled &&
+            request.pax_field_kind_size() == request.pax_field_max_bytes_size()) {
+            kinds.assign(request.pax_field_kind().begin(),
+                         request.pax_field_kind().end());
+            if (request.pax_field_scale_size() ==
+                request.pax_field_max_bytes_size()) {
+                scales.reserve(request.pax_field_scale_size());
+                for (int s : request.pax_field_scale())
+                    scales.push_back(static_cast<int8_t>(s));
+            }
+        }
         const bool installed = db_manager_->get_database()->InstallPaxSchema(
-            request.table_name(), widths);
-        LOG_INFO("PAX schema for '%s': %zu fields, %s",
+            request.table_name(), widths, kinds, scales);
+        LOG_INFO("PAX schema for '%s': %zu fields, typed=%s, %s",
                  request.table_name().c_str(), widths.size(),
+                 kinds.empty() ? "no" : "yes",
                  installed ? "installed" : "skipped (exists or unsupported)");
     }
 

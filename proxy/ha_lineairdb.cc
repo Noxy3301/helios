@@ -3648,20 +3648,63 @@ ha_rows ha_lineairdb::records_in_range(uint inx, key_range *min_key,
   ha_create_table() in handle.cc
 */
 
+// PAX typed-cell kinds (mirror LineairDB::Pax::FieldKind in pax_store.h; the
+// proxy is PAX-oblivious so the values are duplicated by design, kept in sync).
+namespace pax_kind {
+constexpr uint32_t UNTYPED = 0;
+constexpr uint32_t INT32 = 1;   // 4-byte LE signed int
+constexpr uint32_t INT64 = 2;   // 8-byte LE signed int
+constexpr uint32_t DATE = 3;    // 4-byte LE YYYYMMDD
+[[maybe_unused]] constexpr uint32_t DEC64 = 4;  // 8-byte LE scaled int (M2b)
+}  // namespace pax_kind
+
 // PAX single-copy storage: per-field cell widths shipped at CREATE TABLE.
-// Each width is a safe upper bound on the bytes Field::val_str() can render
-// (the row format stores val_str strings, see LineairDBField). Widths are
-// only a performance hint — a row that outgrows its cell falls back to the
-// server's heap path — but a table containing any oversized field skips PAX
-// entirely (empty result) to avoid pathological padding.
-static std::vector<uint32_t> compute_pax_field_widths(TABLE *table) {
+// For UNTYPED fields each width is a safe upper bound on the bytes
+// Field::val_str() can render (the row format stores val_str strings). For a
+// typed field (M2) the width is the fixed binary payload width (4/8) and the
+// kind tells the engine to parse val_str once at scatter and reformat it at
+// gather. Widths are only a hint — a row that outgrows / fails to parse its
+// cell falls back to the server's heap path — but a table with any field wider
+// than kMaxCellBytes skips PAX entirely (empty result) to avoid pathological
+// padding. `kinds`/`scales` are filled in lockstep with the returned widths.
+static std::vector<uint32_t> compute_pax_field_widths(
+    TABLE *table, std::vector<uint32_t> *kinds = nullptr,
+    std::vector<int32_t> *scales = nullptr) {
   constexpr uint32_t kMaxCellBytes = 2048;
   std::vector<uint32_t> widths;
   widths.reserve(table->s->fields + 1);
+  if (kinds) {
+    kinds->clear();
+    kinds->reserve(table->s->fields + 1);
+    kinds->push_back(pax_kind::UNTYPED);  // field #0: null flags, verbatim
+  }
+  if (scales) {
+    scales->clear();
+    scales->reserve(table->s->fields + 1);
+    scales->push_back(0);
+  }
   widths.push_back(table->s->null_bytes);  // field #0: null flags, verbatim
   for (uint i = 0; i < table->s->fields; i++) {
     Field *f = table->field[i];
     uint32_t w = f->field_length;
+    uint32_t kind = pax_kind::UNTYPED;
+    int32_t scale = 0;
+    // A ZEROFILL integer left-pads val_str to its display width, so the value
+    // alone cannot reproduce the exact bytes — keep such columns UNTYPED.
+    // MYSQL_TYPE_YEAR renders zero-filled to its display width ("0000" for 0)
+    // REGARDLESS of the Field_num::zerofill member (which is observed false at
+    // runtime), so relying on that flag mis-types YEAR and gathers "0" != "0000"
+    // (caught by the YEAR round-trip regression) — force YEAR UNTYPED explicitly.
+    const bool zerofill =
+        (f->type() == MYSQL_TYPE_YEAR)
+            ? true
+            : ((f->type() == MYSQL_TYPE_TINY || f->type() == MYSQL_TYPE_SHORT ||
+                f->type() == MYSQL_TYPE_INT24 || f->type() == MYSQL_TYPE_LONG ||
+                f->type() == MYSQL_TYPE_LONGLONG ||
+                f->type() == MYSQL_TYPE_DECIMAL ||
+                f->type() == MYSQL_TYPE_NEWDECIMAL)
+                   ? down_cast<const Field_num *>(f)->zerofill
+                   : false);
     switch (f->type()) {
       case MYSQL_TYPE_TINY:
       case MYSQL_TYPE_SHORT:
@@ -3672,6 +3715,19 @@ static std::vector<uint32_t> compute_pax_field_widths(TABLE *table) {
         // field_length is a display width; val_str can render up to 20
         // digits + sign regardless.
         w = std::max<uint32_t>(w, 21);
+        if (!zerofill) {
+          const bool is_ll = f->type() == MYSQL_TYPE_LONGLONG;
+          const bool is_long = f->type() == MYSQL_TYPE_LONG;
+          if (is_ll && f->is_unsigned()) {
+            // BIGINT UNSIGNED can exceed int64 range: keep ASCII.
+          } else if (is_ll || (is_long && f->is_unsigned())) {
+            kind = pax_kind::INT64;  // 8-byte range
+            w = 8;
+          } else {
+            kind = pax_kind::INT32;  // TINY/SHORT/INT24/LONG(signed)/YEAR
+            w = 4;
+          }
+        }
         break;
       case MYSQL_TYPE_FLOAT:
       case MYSQL_TYPE_DOUBLE:
@@ -3679,10 +3735,18 @@ static std::vector<uint32_t> compute_pax_field_widths(TABLE *table) {
         break;
       case MYSQL_TYPE_DECIMAL:
       case MYSQL_TYPE_NEWDECIMAL:
-        w += 2;  // sign + decimal point slack
+        w += 2;  // sign + decimal point slack (UNTYPED bound)
+        // [M2b] A fixed-scale DECIMAL(p,s) whose value fits a scaled int64
+        // becomes an 8-byte FK_DEC64 cell here; DISABLED in M2a (DECIMAL stays
+        // ASCII UNTYPED) — enabled in the M2b stage together with the server's
+        // typed-decimal filter/agg path (strtod-double boundary semantics).
         break;
       case MYSQL_TYPE_DATE:
       case MYSQL_TYPE_NEWDATE:
+        // DATE val_str is always "YYYY-MM-DD" -> YYYYMMDD int (fits int32).
+        kind = pax_kind::DATE;
+        w = 4;
+        break;
       case MYSQL_TYPE_TIME:
       case MYSQL_TYPE_TIME2:
       case MYSQL_TYPE_DATETIME:
@@ -3713,6 +3777,8 @@ static std::vector<uint32_t> compute_pax_field_widths(TABLE *table) {
     }
     if (w > kMaxCellBytes) return {};  // e.g. TEXT/BLOB: keep row-store
     widths.push_back(w);
+    if (kinds) kinds->push_back(kind);
+    if (scales) scales->push_back(scale);
   }
   return widths;
 }
@@ -3731,7 +3797,15 @@ int ha_lineairdb::create(const char *table_name, TABLE *table, HA_CREATE_INFO *,
   // storage. The table may already exist from another node's CREATE TABLE.
   // Ignore "already exists" — MySQL-side metadata still needs to be created.
   auto proxy = get_proxy();
-  proxy->db_create_table(db_table_name, compute_pax_field_widths(table));
+  std::vector<uint32_t> pax_kinds;
+  std::vector<int32_t> pax_scales;
+  std::vector<uint32_t> pax_widths =
+      compute_pax_field_widths(table, &pax_kinds, &pax_scales);
+  if (pax_widths.empty()) {  // table skips PAX: send nothing typed
+    pax_kinds.clear();
+    pax_scales.clear();
+  }
+  proxy->db_create_table(db_table_name, pax_widths, pax_kinds, pax_scales);
 
   // Create secondary indexes (also ignore "already exists")
   for (uint i = 0; i < table->s->keys; i++) {

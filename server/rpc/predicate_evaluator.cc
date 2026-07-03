@@ -3,8 +3,10 @@
 #include <algorithm>
 #include <cerrno>
 #include <climits>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <string>
 
 using FilterExpr = LineairDB::Protocol::FilterExpr;
 
@@ -16,6 +18,7 @@ bool PredicateEvaluator::parse_row(const char* data, size_t length,
                                    uint32_t num_columns) {
   columns_.clear();
   null_flags_.clear();
+  schema_ = nullptr;  // materialized rows carry ASCII val_str bytes
 
   // Row format produced by ha_lineairdb (via LineairDBField):
   //   [null_flags_field] [col_0] [col_1] ... [col_N-1]
@@ -89,6 +92,7 @@ bool PredicateEvaluator::set_row_from_pax(const LineairDB::Pax::PaxGroup& group,
   for (uint32_t i = 0; i < num_columns; i++) {
     columns_.push_back(group.cell(i + 1, slot));
   }
+  schema_ = &group.schema();  // typed-cell decode (M2)
   return true;
 }
 
@@ -104,6 +108,7 @@ bool PredicateEvaluator::set_row_from_pax_cols(
   for (uint32_t c : cols) {
     if (c < num_columns) columns_[c] = group.cell(c + 1, slot);
   }
+  schema_ = &group.schema();  // typed-cell decode (M2)
   return true;
 }
 
@@ -119,6 +124,7 @@ void PredicateEvaluator::collect_columns(const FilterExpr& expr,
 void PredicateEvaluator::set_row_from_views(
     const std::vector<std::string_view>& cells,
     const std::vector<bool>& nulls) {
+  schema_ = nullptr;  // synthesized rows are already canonical ASCII
   columns_.assign(cells.begin(), cells.end());
   null_flags_.assign((cells.size() + 7) / 8, 0);
   for (size_t i = 0; i < nulls.size() && i < cells.size(); ++i) {
@@ -177,6 +183,63 @@ PredicateEvaluator::Val PredicateEvaluator::extract_value(
         v.s = col;
         break;
       }
+      // Typed cell (M2): decode the fixed-width binary directly. `col` here is
+      // the raw binary (non-empty => present). DATE formats to "YYYY-MM-DD" so
+      // the existing string comparison keeps date order; INT decodes to a
+      // native integer (exact — no re-parse). This is the scan/agg-filter fast
+      // path; the ASCII branch below is untouched for UNTYPED columns.
+      if (schema_ != nullptr) {
+        const uint8_t kind = schema_->kind_of(static_cast<size_t>(idx) + 1);
+        if (kind == LineairDB::Pax::FK_DATE) {
+          // YYYYMMDD int — compare() pairs it with a 'YYYY-MM-DD' literal or
+          // another DATE without formatting on the per-row hot path.
+          int32_t x;
+          std::memcpy(&x, col.data(), 4);
+          v.type = ValType::DATE;
+          v.i = x;
+          break;
+        }
+        if (kind == LineairDB::Pax::FK_INT32 ||
+            kind == LineairDB::Pax::FK_INT64) {
+          int64_t x;
+          if (kind == LineairDB::Pax::FK_INT32) {
+            int32_t t;
+            std::memcpy(&t, col.data(), 4);
+            x = t;
+          } else {
+            std::memcpy(&x, col.data(), 8);
+          }
+          switch (expr.compare_type()) {
+            case 1:  // UNSIGNED_INT — must stay UINT so a mixed compare with a
+                     // CONST_UINT literal > INT64_MAX is not cast to a negative
+                     // int64 (review: typed unsigned column vs huge uint literal
+                     // otherwise flips). A typed unsigned column's stored value
+                     // fits a positive int64 (LONG UNSIGNED <= 4.29e9; BIGINT
+                     // UNSIGNED stays UNTYPED), so this reinterpret is exact.
+              v.type = ValType::UINT;
+              v.u = static_cast<uint64_t>(x);
+              break;
+            case 2:  // DOUBLE
+              v.type = ValType::DOUBLE;
+              v.d = static_cast<double>(x);
+              break;
+            case 3: {  // STRING (compare against a string constant)
+              std::string& b = next_fmtbuf();
+              b = std::to_string(x);
+              v.type = ValType::STRING;
+              v.s = b;
+              break;
+            }
+            default:  // SIGNED_INT
+              v.type = ValType::INT;
+              v.i = x;
+              break;
+          }
+          break;
+        }
+        // FK_DEC64 is introduced in M2b (DECIMAL); until then decimals are
+        // UNTYPED, so a typed DEC64 cell never reaches here.
+      }
       // Convert column string to typed value based on compare_type hint.
       switch (expr.compare_type()) {
         case 0: {  // SIGNED_INT
@@ -231,8 +294,69 @@ PredicateEvaluator::Val PredicateEvaluator::extract_value(
 // Comparison
 // ---------------------------------------------------------------------------
 
+// A DATE operand -> YYYYMMDD int. A 'YYYY-MM-DD' string literal parses to the
+// same domain (string order == int order), so a typed DATE column and a date
+// literal compare as integers. Returns false for a non-date string.
+bool PredicateEvaluator::date_operand_to_int(const Val& v, int64_t* out) {
+  if (v.type == ValType::DATE || v.type == ValType::INT) {
+    *out = v.i;
+    return true;
+  }
+  if (v.type == ValType::UINT) {
+    *out = static_cast<int64_t>(v.u);
+    return true;
+  }
+  if (v.type == ValType::STRING) {
+    const std::string_view s = v.s;
+    if (s.size() == 10 && s[4] == '-' && s[7] == '-') {
+      int64_t y = 0, m = 0, d = 0;
+      auto dig = [](const char* p, int n, int64_t* o) {
+        for (int i = 0; i < n; i++) {
+          if (p[i] < '0' || p[i] > '9') return false;
+          *o = *o * 10 + (p[i] - '0');
+        }
+        return true;
+      };
+      if (dig(s.data(), 4, &y) && dig(s.data() + 5, 2, &m) &&
+          dig(s.data() + 8, 2, &d)) {
+        *out = y * 10000 + m * 100 + d;
+        return true;
+      }
+    }
+    return false;
+  }
+  return false;
+}
+// Canonical "YYYY-MM-DD" of a DATE Val into buf (for the rare fallback where a
+// DATE is compared to a non-date string); a STRING Val returns its own view.
+std::string_view PredicateEvaluator::date_operand_to_sv(const Val& v, char* buf,
+                                                        size_t n) {
+  if (v.type == ValType::DATE) {
+    const int32_t x = static_cast<int32_t>(v.i);
+    int len = std::snprintf(buf, n, "%04d-%02d-%02d", x / 10000,
+                            (x / 100) % 100, x % 100);
+    return std::string_view(buf, len > 0 ? static_cast<size_t>(len) : 0);
+  }
+  return v.s;
+}
+
 int PredicateEvaluator::compare(const Val& lhs, const Val& rhs) {
   if (lhs.type == ValType::NONE || rhs.type == ValType::NONE) return -2;
+
+  // DATE pairing (typed DATE column vs date literal / another DATE): compare
+  // YYYYMMDD ints. Falls back to string comparison of the canonical form only
+  // when the other operand is not a date literal (rare; preserves the pre-M2
+  // string-compare semantics exactly).
+  if (lhs.type == ValType::DATE || rhs.type == ValType::DATE) {
+    int64_t li, ri;
+    if (date_operand_to_int(lhs, &li) && date_operand_to_int(rhs, &ri))
+      return (li < ri) ? -1 : (li > ri) ? 1 : 0;
+    char lb[16], rb[16];
+    const std::string_view ls = date_operand_to_sv(lhs, lb, sizeof(lb));
+    const std::string_view rs = date_operand_to_sv(rhs, rb, sizeof(rb));
+    const int c = ls.compare(rs);
+    return (c < 0) ? -1 : (c > 0) ? 1 : 0;
+  }
 
   // Promote to common type for comparison
   // INT vs UINT → both to INT (safe for typical DB values)
@@ -388,13 +512,17 @@ bool PredicateEvaluator::evaluate(const FilterExpr& expr) const {
       Val val = extract_value(expr.children(0));
       Val pat = extract_value(expr.children(1));
       if (val.type == ValType::NONE || pat.type == ValType::NONE) return false;
-      // Use string representation for LIKE matching
-      std::string_view text = (val.type == ValType::STRING) ? val.s : val.s;
-      std::string_view pattern = (pat.type == ValType::STRING) ? pat.s : pat.s;
-      // For non-string columns, extract_value already stored in s for STRING type
-      // For numeric columns with compare_type != STRING, get the raw column string
-      if (val.type != ValType::STRING) {
-        // LIKE on non-string is unusual; include row (safe fallback)
+      std::string_view pattern = pat.s;
+      // A typed DATE column LIKE-matches on its canonical "YYYY-MM-DD" form
+      // (pre-M2 the cell was that ASCII string).
+      char db[16];
+      std::string_view text;
+      if (val.type == ValType::DATE) {
+        text = date_operand_to_sv(val, db, sizeof(db));
+      } else if (val.type == ValType::STRING) {
+        text = val.s;
+      } else {
+        // LIKE on a numeric column is unusual; include row (safe fallback)
         return true;
       }
       return like_match(text, pattern);
