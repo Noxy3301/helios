@@ -2096,6 +2096,16 @@ bool build_block(THD *thd, Query_block *qb,
       uint32_t src_table = 0, src_col = 0;
       uint32_t my_col = 0;  // column on the filtered side (vt or scan)
     };
+    // Effective post-semi cardinalities (E10): once a scan acquires a key
+    // filter its expected output shrinks, and downstream ratio checks and
+    // source ranking must see the chained value — judged by its raw size,
+    // a reduced source is rejected (q9: partsupp carrying only the green
+    // parts' keys was refused as an 800k-row table and lineitem scanned
+    // its full 6M rows). The per-key fanout comes from the secondary
+    // table's rec_per_key (synced from the primary).
+    std::vector<double> eff(n_tabs);
+    for (size_t t = 0; t < n_tabs; ++t)
+      eff[t] = static_cast<double>(tabs[t].records);
     // Collect the best (smallest-estimate) source for filtering `tab`
     // (real table or virtual) at IR node `ni`. `my_col_ok` rejects
     // filtered-side columns the target cannot apply a key filter to.
@@ -2136,9 +2146,7 @@ bool build_block(THD *thd, Query_block *qb,
             if (best.source_node < 0 || est < best.est)
               best = {est, node, oti, ocol, my_col};
           };
-          if (oti < n_real)
-            consider(scan_node_of[oti],
-                     static_cast<double>(tabs[oti].records));
+          if (oti < n_real) consider(scan_node_of[oti], eff[oti]);
           consider(partner, node_rows.count(partner) != 0
                                 ? node_rows[partner]
                                 : 1e30);
@@ -2148,13 +2156,19 @@ bool build_block(THD *thd, Query_block *qb,
     };
     // Scans: reduce large scans from already-issued selective ones (the
     // chain forms because scans are pre-issued most-selective-first).
-    for (size_t t = 0; t < n_real; ++t) {
+    // Processed in issue order so eff[] chains through the sequence.
+    std::vector<size_t> scan_order;
+    for (size_t t = 0; t < n_real; ++t)
+      if (scan_node_of[t] >= 0) scan_order.push_back(t);
+    std::sort(scan_order.begin(), scan_order.end(),
+              [&](size_t a, size_t b) {
+                return scan_node_of[a] < scan_node_of[b];
+              });
+    for (size_t t : scan_order) {
       const int ni = scan_node_of[t];
-      if (ni < 0 || !req.nodes(ni).has_scan() ||
-          req.nodes(ni).scan().has_semi())
+      if (!req.nodes(ni).has_scan() || req.nodes(ni).scan().has_semi())
         continue;
-      SemiCand c = best_source(static_cast<uint32_t>(t), ni,
-                               static_cast<double>(tabs[t].records),
+      SemiCand c = best_source(static_cast<uint32_t>(t), ni, eff[t],
                                /*need_ratio=*/true,
                                [](uint32_t) { return true; });
       if (c.source_node < 0) continue;
@@ -2164,6 +2178,18 @@ bool build_block(THD *thd, Query_block *qb,
       sc->set_table_idx(c.src_table);
       sc->set_column(c.src_col);
       sm->set_my_column(c.my_col);
+      // Chained estimate: output ≈ source keys × per-key fanout from an
+      // index leading on the filtered column (skip when absent).
+      const TABLE *tb = tabs[t].table;
+      for (uint k = 0; k < tb->s->keys; ++k) {
+        const KEY &ki = tb->key_info[k];
+        if (ki.key_part[0].field->field_index() == c.my_col &&
+            ki.has_records_per_key(0)) {
+          eff[t] = std::max(
+              1.0, std::min(eff[t], c.est * ki.records_per_key(0)));
+          break;
+        }
+      }
     }
     // Derived sub-blocks: aggregate only the key domain that can join.
     for (int ni = 0; ni < req.nodes_size(); ++ni) {
@@ -3417,6 +3443,12 @@ bool CompareJoinCost(THD *thd, const JOIN &join, double optimizer_cost,
                      bool *use_best_so_far, bool *cheaper,
                      double *secondary_engine_cost) {
   *use_best_so_far = false;
+  // Pass-through: with rec_per_key synced onto the secondary tables
+  // (info()), the traditional planner's own condition filtering prices
+  // equijoins correctly (Item_equal consumes index statistics), so its
+  // cost already ranks orders well. An earlier re-ranking hook here (E9)
+  // corrected the 0.1-floored estimates — once the floors disappeared it
+  // double-applied selectivities and picked worse orders (q9); retired.
   *secondary_engine_cost = optimizer_cost;
   *cheaper = down_cast<Columnar_execution_context *>(
                  thd->lex->secondary_engine_execution_context())
@@ -3457,7 +3489,11 @@ int ha_lineairdb_columnar::info(unsigned int flags) {
   // is what actually picks the exploding join orders (q5/q21).
   // handler::table is protected, so the primary TABLE is recovered from
   // the session's open-table list by handler identity.
-  if ((flags & HA_STATUS_CONST) != 0 && table != nullptr) {
+  // Not gated on HA_STATUS_CONST: the primary handler is linked only
+  // AFTER the secondary table is opened (open_secondary_engine_tables),
+  // so the open-time CONST pass runs before it exists — copy on the
+  // planner's later (VARIABLE) refreshes instead.
+  if (table != nullptr) {
     const TABLE *ptab = nullptr;
     THD *thd = ha_thd();
     for (TABLE *t = thd != nullptr ? thd->open_tables : nullptr;

@@ -215,3 +215,72 @@ hash/memcmp) が合計 **~31%**。
 **E8b 合計: 11.0s** (E7c 12.0s → -1.0s、全 md5 MATCH)。InnoDB champion 42.2s
 の **3.8 倍**。残: q18 2.38s (hash map 本体 — compact GroupState + int64 キー
 特化が次)、q5 2.24s (REF アクセス貸与)、q4 693ms、q13 498ms。
+
+**TPC-C 回帰 (E8 サーバ変更後)**: 1/8/32/64t = 426.5/1546.3/3646.5/4892.0
+req/s、Unexpected Errors 全点 0 — 導入前 (432.7/1543.9/3675.1/5098.1) と同等。
+E8 の変更は TX_EXECUTE_QUERY_BLOCK 経路のみで OLTP 経路に触れない (構造どおり)。
+
+### E9: secondary 統計によるプラン再ランク (2026-07-03, 検証中)
+
+q5 の残り 2.2s は M:N 先行の join 順そのもの。REF アクセス貸与 (index_flags
+開放 + REF/EQ_REF 葉の写像) は全 22 本のプラン形状を变える big-bang なので後回し
+にし、**旧 optimizer の `compare_secondary_engine_cost` フック** (完全 join 順
+ごとに呼ばれる — トレースの `secondary_engine_cost` で実証済み) で再ランク:
+- 各 position の実効行数 = rows_fetched × filter_effect (optimizer 見積もり) に
+  「prefix で束縛される各等値」の補正 (rec_per_key 選択率 / 0.1) を掛ける —
+  0.1 フロアだけを実統計に差し替える外科的補正
+- コスト = 全中間結果の体積和。等値の同定は keyuse_array (leading keypart のみ、
+  (列, 束縛式) で重複排除)。rec_per_key は info() が primary から転写済みのもの
+- **転写した rec_per_key が初めて load-bearing になる** — 「借り物オプティマイザ
+  には統計を貸すだけでは不足」(E6) の续き: 統計が効く場所 (完全プラン比較) を
+  フック側に自作した
+
+### E9 結果と決定的バグの発見 (2026-07-03)
+
+| 試行 | 観測 | 判断 |
+|---|---|---|
+| E9 (再ランクフック) | 合計 10.8s (q8 268→164 で E7c 退行回復、q20 757、q21 1193)。**q5 は 2.2s のまま** | q5 の trace で `secondary_engine_cost` が **1 回しか出ない** — 探索の境界枝刈り (0.1 フロアの prefix_cost ≥ best_read) が FK-first 順を完走前に刈り、フックに代替案が届かない。prune_level=0 でも境界枝刈りは残るため無効と判断 |
+| ソース精読 | `Item_equal::get_filtering_effect` は**元々 rec_per_key を使う設計** (key_start + has_records_per_key → rpk/rows)。等値伝播で WHERE 等値は Item_equal 化される — つまり **rec_per_key 転写さえ効いていれば旧 optimizer は正しく見積もれるはず** | probe 再実行 → **依然 900e9 = 転写が一度も発火していない**ことが判明 |
+| 転写バグの特定 | `ha_set_primary_handler` は **open_table の後**に呼ばれる (sql_base.cc:6712) — open 時の info(HA_STATUS_CONST) では primary handler が nullptr で copy が空振り | **HA_STATUS_CONST ゲートを外し、後続の (VARIABLE) 呼び出しで転写** (E9b) |
+
+### E9b 結果 (2026-07-03, SF=1, 全 md5 MATCH): **q5 2154→216ms (10 倍)**
+
+統計転写の発火で旧 optimizer が FK-first 順を選択。合計 **10.39s**。
+ただしプラン変化の副作用: **q9 335→1431ms** — 新プランで lineitem の scan-semi
+源候補 partsupp (raw 800k 行) が「6M/8=750k」の比率規則に僅差で弾かれ、6M 行
+中間結果が発生 (partsupp 自身は part の green キーで 43k 行まで縮むのに、
+判定が縮む前のサイズを見ていた)。q3/q7/q18/q20 も 100-300ms 級の微退行。
+
+### E10: 有効カーディナリティの連鎖 (2026-07-03)
+
+scan semi の割当を発行順に処理し、割当のたびに
+`eff[t] = min(eff[t], eff[source] × rec_per_key(t, filtered_col))` を伝播。
+比率判定と源ランキングは raw 行数でなく eff を見る (LIP のカスケードを見積もり
+にも適用)。誤見積もり時の保険としてサーバ scan semi にも 4M キーガードを追加
+(sub_block 側と同じ)。
+
+結果: 合計 10.71s — **q9 は 1616ms で未回復** (q20 -104ms, q21 +188ms は
+ノイズ域)。q9 の scan 連鎖は理屈上 ~400ms 圏になるはずで、悪化の主因は
+join 順序側と再判断。
+
+### E11: E9 再ランクフックの引退 (2026-07-03, 検証中)
+
+**E9 の自己矛盾に気づく**: E9 の補正 (sel/0.1) は「0.1 フロア前提」の設計だが、
+E9b で rec_per_key が探索自体に効くようになった後は**フロアの無い見積もりに
+二重適用**され、順位付けを壊す (q9 悪化の有力原因)。フックをパススルーに戻し、
+「統計同期だけで旧 optimizer のプランが直る」構成を検証。教訓:
+**補正レイヤは補正対象のバグが直った瞬間に自分がバグになる** — 根本 (統計) を
+直したら上物 (補正) は撤去する。
+
+### E11 結果 (2026-07-03, ゲート 22/22 + 回帰 2 + hot md5 全 MATCH)
+
+**合計 8.97s** (InnoDB champion 42.2s の **4.7 倍**)。読みが的中:
+q9 1616→**269ms** (歴代最良、E9 の二重補正が真犯人)、q5 216→**142ms**
+(素の統計ベースコストがさらに良い順序を選択)、q8 225ms。
+
+**本日の推移**: E4 24.6s → E6 19.6s → E7c 12.0s → E8b 11.0s → **E11 8.97s**
+(2.7 倍)。決定打は「統計同期の完成 (E9b の 1 行: 転写を CONST ゲートから外す)
++ 補正レイヤの撤去 (E11)」— 旧 optimizer は正しい統計さえ与えれば TPC-H の
+join 順を自力で当てる (Item_equal の rec_per_key 経路)。
+残: q18 2.41s (集計 hash map — compact GroupState/int64 キーが未着手の最終
+レバー)、q21 1.35s、q4 697ms、q20 757ms。

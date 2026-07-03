@@ -417,8 +417,12 @@ struct Executor {
         uint32_t semi_col = 0;
         if (scan.has_semi()) {
             if (!collect_keys(scan.semi(), &semi_keys)) return false;
-            semi_set = &semi_keys;
-            semi_col = scan.semi().my_column();
+            // A huge key set costs more to probe than it prunes (the
+            // proxy's chained estimates can be wrong in either direction).
+            if (semi_keys.size() <= (size_t{4} << 20)) {
+                semi_set = &semi_keys;
+                semi_col = scan.semi().my_column();
+            }
         }
         const bool use_ext = ext_keys != nullptr &&
                              ext_filter_table == scan.table_idx();
