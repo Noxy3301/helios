@@ -97,3 +97,33 @@ Birler&Neumann CIDR2026 (mark join 線形時間)、Spark SPARK-32290/32494。
 | 19 | **scan 間の実行時キーフィルタ連鎖** (selective scan 先行発行 → 後続 scan が実行済みノードの実キー集合で strip probe)。join 型/側の安全規則: build 側=常に可、probe 側=INNER/SEMI のみ | Sideways Information Passing / LIP (Zhu et al., SIGMOD 2017 "Looking Ahead Makes Query Plans Robust")、DuckDB dynamic filter pushdown、Redshift/Spark AQE runtime filter。安全規則は semi-join reduction の保存則 (Bernstein-Chiu 1981 semijoin program) | q2 q5 q7 q9 q20 q22 (E6 で合計 24.5→19.6s) |
 | 20 | **DuplicateWeedout プランの hash SEMI への逆写像** (WEEDOUT(FILTER*(INNER)) で dedup rowid 集合=join 片側 → SEMI+残差)。旧 optimizer の物理戦略を論理 semijoin に戻して自前実行 | weedout ≡ semijoin は MySQL 自身の sj 戦略定義 (WL#3985 DuplicateWeedout)。hash semi 実行は HyPer/DuckDB 標準 | q20 q21 (E7) |
 | 21 | **「借り物オプティマイザ」の統計限界の実証**: 旧 optimizer は field=field 等値を COND_FILTER_EQUALITY=0.1 でハードフロア (ヒストグラム不発・rec_per_key は REF 専用) — secondary へ統計を貸すだけでは不足で、プラン品質は実行時ルール (#19/#20) で回収する設計に | MySQL ソース読解 (item_cmpfunc.cc get_filtering_effect / item.cc get_cond_filter_default_probability)。HeatWave が index metadata を secondary に保持する設計との対比 | 論文 discussion |
+
+## 追記 4: E17 zone maps の採用判断と負の結果 (2026-07-03)
+
+| # | 採用判断 | 系譜・出典 | 対象 |
+|---|---|---|---|
+| 22 | **ゾーンマップ (strip min/max プルーニング)** を sorted projection でなく**遅延・write_counter キーの side-info** として実装 (1-copy 制約: 2 つ目のソート copy を OLTP が維持しない)。compare_type ゲートで byte-path 等価、DECIMAL は境界 ±1 拡幅で保守プルーニング、静止検査 (write_counter) を correctness backstop に | Small Materialized Aggregates (Moerkotte, VLDB1998)、Netezza zone maps、MonetDB imprints (Sidirourgos & Kersten, SIGMOD2013)。**1-copy 下の遅延 side-info 化 + 静止検査 backstop が新規** | (負の結果: TPC-H 効果無) |
+
+**負の結果 (論文 discussion 用)**: TPC-H の o_orderdate/l_shipdate は order ごとの
+一様乱数で load 順 (orderkey) と無相関 — 全 8192 行 strip が date domain 全域 (1992-01〜
+1998-11) を張り、日付範囲述語は **0 strip** しかプルーニングしない (実測: orderkey の
+低位/高位窓の日付範囲が同一)。zone map が効くのは filter 列が物理クラスタされる場合で、
+TPC-H の唯一のクラスタ列 (orderkey) はどのクエリも範囲 filter しない (join キー専用で
+semi filter 経路が担当)。機構自体はクラスタ列で検証済み (`l_orderkey<60000` で ~99%
+strip skip、9ms vs 非クラスタ同選択率 `l_quantity<2` 39ms vs 無 filter 45ms)。**「zone
+maps ⊥ TPC-H」は Netezza/BRIN が data clustering (CLUSTER BY / append-ordered) を前提に
+するのと整合** — 機構の欠陥でなくデータの性質。SF=1 全 22 本 md5 は E16b と byte-identical
+(プルーニングは結果を変えない)。dual review (Codex + code-reviewer) で「wrong-result
+バグ無し」を確認、INT×CONST_DOUBLE/STRING の byte-path 乖離ほか全指摘対応済み。
+
+## 追記 5: E18 shared scans の見送り (2026-07-03)
+
+| # | 判断 | 系譜・出典 | 対象 |
+|---|---|---|---|
+| 23 | **共有 scan (fused shared scans) は見送り** — 適用条件不成立を明記 | Crescando (Unterbrunner et al., VLDB2009) / SharedDB (Giannikis et al., VLDB2012): 同一表を複数述語で同時走査する前提 | (適用クエリ無) |
+
+crescando/SharedDB 系の共有 scan は「同一大表を 1 request 内で複数の独立述語で同時走査」
+する前提。TPC-H で同一大表を 1 request 内に複数 scan するのは q21 (lineitem×3) のみで、
+l2/l3 は `semi.source_node=l1` の依存を持ち l1 と融合不可・相互の {l2,l3} も l1 の orderkey
+semi filter 後は極小。nation 自己結合 (q7/q8、派生ブロック内) は独立だが 25 行で利益無視可。
+**独立な大表複数 scan を持つ TPC-H クエリが無い**ため実装せず (前提不成立を記録)。

@@ -439,3 +439,99 @@ OFF (q20/q18/q13/q1) MATCH。**罠**: 検証中に primary (LineairDB 行エン�
 MISMATCH を出す (secondary 経路と直交・前段の foreground timeout 巻き添え
 が誘発)。対策として semantics 検証は **md5-vs-E16 比較** (E16 は primary
 検証済み) に切替 — flake-proof。残: q18 1.5s、q21 0.9s、q10 0.37s。
+
+
+### E17: ゾーンマップ (strip min/max プルーニング) — 1-copy 設計と TPC-H の非クラスタ性 (2026-07-03)
+
+**設計判断: sorted projection ではなく zone map (side info)。** 日付範囲述語を
+速くする古典手法は (a) 該当列でソートした second copy か (b) strip ごとの min/max
+補助情報。(a) は OLTP 書込パスが維持すべき **2 つ目の copy** になり 1-copy 原則に
+反する (scatter のたびにソート維持 = 書込増幅)。(b) を採用: PaxGroup (8192 行) ごとに
+列の min/max を持つだけ (2×int64/strip/列、lineitem SF=1 で ~733 strip × 数列 = 数十 KB)。
+
+**遅延・write_counter キーのキャッシュ (OLTP 書込パス不可侵)。** min/max は **最初の
+scan 時に遅延構築**し、プロセス wide な (PaxStore*, 列) キャッシュに格納。strip ごとに
+**write_counter スナップショットをキー**にし、counter が変われば再構築。write_counter は
+変更の開始と終了で bump され単調増加なので counter 不変 ⟺ strip のセル不変。stale/torn
+zone が誤プルーニングを起こし得るのは counter が違うときだけで、その差分は同じ executor の
+Prepare/Quiesced 検査を失敗させ結果を破棄する — つまり **プルーニングはクエリ結果を一切
+変えない** (既存の静止検査が correctness backstop)。書込パス (ScatterRow) には一切触れない
+= 1-copy 維持。scope は server/rpc のみ (新規 zone_map.{hh,cc} + RunScan)。
+
+**byte-path 等価の compare_type ゲート。** byte 経路は compare_type で比較モードを選ぶ
+(0/1 = strtoll/strtoull 数値、2 = strtod double、3 = 文字列)。数値 zone は byte 経路も
+数値比較するときだけ使う (INT↔ct{0,1}、DECIMAL↔ct2、DATE↔ct3)。数値文字列を持つ VARCHAR
+列 (ct3、文字列順 ≠ 数値順) は数値 zone で絶対にプルーニングしない — これが over-prune
+防止の要 (回帰 regr-zone で検証: `v > '5'` は文字列比較のまま MATCH)。
+
+**型付け規則 (E13/SIMD spike の classify を保守的に再利用)。** INT (full parse)、
+DATE (YYYY-MM-DD→YYYYMMDD、int 順 = 固定長文字列順)、DECIMAL (一様 scale、scaled int)。
+strip 内で 1 つでも型不一致/非数値セルがあれば当該 strip は非プルーニング。DECIMAL は
+byte 経路の strtod double 意味論に合わせ、spike の dec_lower/dec_upper (正確な整数境界) を
+**±1 拡幅** (widen) して保守側に倒す (double 丸めに対して over-prune を不可能に)。NULL/空
+セルは min/max から除外 (NULL cmp X → byte 経路も除外なので安全)。
+
+**プルーニング判定。** filter の top-level AND 各 conjunct (col CMP const / BETWEEN /
+col CMP col) を strip の [min,max] 範囲に対し評価。**いずれか 1 つの conjunct が「この
+strip に一致行なし」を証明したら strip 全体を skip** (AND なので 1 つ空なら全体空)。
+col-vs-col (q12/q4 の l_receiptdate > l_commitdate 等) は同 kind/scale の両 zone が
+あるとき max(lhs) ≤ min(rhs) 等でプルーニング。判定は request-local snapshot (不変) に
+対し並列 scan worker が lock なしで読む。env `LDBC_ZONEMAP=0` で無効化可 (A/B 用)。
+
+| 指標 | E16b | E17 |
+|---|---|---|
+| SF=1 FORCED 合計 (min-of-3) | 6.10s | **6.07s (flat)** |
+| SF=1 全 22 本 md5 | — | **E16b と byte-identical (same=22 diff=0)** |
+
+**決定的な負の結果: TPC-H は日付列でクラスタされていない。** 期待した q6/q1/q12/q14/
+q4/q20 の日付範囲プルーニングは **1 strip も発火しなかった**。実測で確認: orderkey の
+低位窓 (1..8192) と高位窓 (3M..3M+8192) の o_orderdate は**両方とも 1992-01-01 〜
+1998-08-02 の全域**を張る (l_shipdate も 1992-01 〜 1998-11 で同様)。TPC-H の
+o_orderdate は order ごとに一様乱数で orderkey と無相関なので、どの 8192 行 strip の
+日付 zone も全 date domain を覆い、日付範囲述語はどの strip とも overlap する →
+プルーニング 0。**クラスタされている列 (orderkey = ロード順) はどのクエリも範囲述語で
+filter しない** (semi/equi-join キーとしてのみ使われ、これは semi filter 経路が担当) ため、
+TPC-H では zone map が原理的に効かない。
+
+**機構は正しく動く (クラスタ列で検証)。** l_orderkey (ロード順 = クラスタ) への範囲
+述語でプルーニング発火を実証 — `l_orderkey < 60000` (0.25% 選択, クラスタ) は **9ms** で
+~99% の strip を skip、対して同形の非クラスタ列 `l_quantity < 2` (~2% 選択) は **39ms** で
+全 strip 走査 (無 filter の 45ms とほぼ同じ)。zone map は「filter 列が物理的にクラスタ
+されていれば効く」— append-ordered な time-series や TPC-C の order 表では成立するが、
+TPC-H の乱数日付では成立しない、という**データの性質の話であって機構の欠陥ではない**。
+
+**Dual review (Codex + code-reviewer) 完了・全指摘対応済み。** 両者とも「TPC-H 到達
+可能な wrong-result バグ無し・1-copy 制約遵守・スレッド安全・OOB 無し」で一致。対応
+した指摘: (I1, High) INT 列 × CONST_DOUBLE は byte 経路が列を double 昇格させ 2^53
+超で乖離、× CONST_STRING は byte 経路が文字列比較 — どちらも整数 zone で mirror 不可
+なので **INT 列は CONST_INT/UINT のみプルーニング**に限定 (TPC-H の INT filter は全て
+整数リテラル = CONST_INT で影響なし)。(S1) 極大 decimal 定数での DecLower/DecUpper
+発散/overflow を `zone_dec_ok` (c×10^scale < 9e18) で防止。(overflow) ClassifyCell の
+桁数上限をループ内に前倒し (19 桁目の乗算前に reject、int64 signed overflow 回避)。
+(consistency) strip build に write_counter の二度読みを追加し torn build を非
+プルーニング化 (Prepare/Quiesced の厳密な補完)、empty-numeric⇒NULL 不変条件と
+PaxStore* 生存期間の依存をコメント明記。全指摘が「プルーニングを減らす方向 (より
+保守的)」なので md5 は E16b と byte-identical のまま。
+
+**設計系譜**: Small Materialized Aggregates (Moerkotte, VLDB1998)、Netezza zone maps、
+MonetDB imprints (Sidirourgos & Kersten, SIGMOD2013)。新規性は 1-copy 制約下での
+**遅延・write_counter キーの side-info** 化 (sorted copy を作らず OLTP 書込を一切増分
+維持しない) と、静止検査を correctness backstop にした点。
+
+### E18: fused shared scans — 依存解析の結果 SKIP (2026-07-03)
+
+同一 request 内で同じ PAX 表 (同 table_name/PaxStore) を複数回 scan するケースを静的解析
+(proxy build_block の table_idx 割当。self-join の alias は別 table_idx だが normalized_path が
+同一なのでサーバでは同一 PaxStore に解決)。結論: **大表の独立複数 scan を 1 request 内に
+持つクエリは存在しない**ため E18 は SKIP。
+
+| クエリ | 同一表複数 scan | 依存 | 判定 |
+|---|---|---|---|
+| q21 | lineitem ×3 (l1 主 + l2 EXISTS→SEMI + l3 NOT EXISTS→ANTI) | l2/l3 の semi.source_node が両方 l1 → l1 と融合不可。{l2,l3} は相互独立だが両者とも l1 の orderkey semi filter で既に極小 | 融合利益ほぼ無 |
+| q7/q8 | nation ×2 (派生ブロック内の n1,n2 自己結合) | 相互独立 (構造的には最も綺麗な候補) | nation = 25 行、利益無視可 |
+| その他 | 各表 ≤1 scan/request (q2/q11/q17/q20/q22 等の重複は別 QbSubBlock = 別 request) | — | 対象外 |
+
+大表の独立複数 scan が無い以上、共有 scan パスの利益は無い (q21 の l2/l3 は semi 後極小、
+nation は自明) → **E18 は実装しない**。visibility/strip パスの共有は将来「大表を複数の
+独立述語で同時集計する」ワークロードが現れたら再検討 (Crescando: Unterbrunner et al.
+VLDB2009 / SharedDB: Giannikis et al. VLDB2012 の系譜)。

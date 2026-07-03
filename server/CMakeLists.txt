@@ -52,6 +52,8 @@ set(SOURCES
     rpc/lineairdb_rpc.hh
     rpc/predicate_evaluator.cc
     rpc/predicate_evaluator.hh
+    rpc/zone_map.cc
+    rpc/zone_map.hh
     rpc/query_block_executor.cc
     rpc/query_block_executor.hh
     
