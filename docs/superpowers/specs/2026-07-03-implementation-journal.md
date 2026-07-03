@@ -361,3 +361,43 @@ IntGroupMap 型、共有 atomic の parse_fail で文字列経路再実行をト
 null-eq-join MATCH) + SF=1 hot-5 md5 全 MATCH。SF=1 の 22 本 md5 は E14 と
 **全一致** (same=22 diff=0) — 置換の意味論不変を実証。InnoDB champion 42.2s の
 **6.1 倍**、本日 24.6→6.88s (3.6 倍)。残: q21 1.17s、q20 640ms、q10 495ms。
+
+### E16: semi キー集合を型付きで直接収集 (2026-07-03)
+
+perf 再計測 (q21/q20/q10): semi-join のキー集合構築が支配項の一つ —
+`collect_keys` が `unordered_set<std::string>` を組み (q21 5.35% + string
+hashtable 1.51% + 一時 string 確保)、その後 `to_int_set` が全要素を
+int64 へ**再パース** (q21 1.78% + from_chars 7.81%)。同じ二段が q10 でも
+collect_keys 6.05% + to_int_set 2.41% を占めた。sideways information
+passing (semi filter) を多用する q5/q7/q8 も同じ税を払っていた。
+
+E16 = **型付き直接収集** `collect_keys_typed`: semi source 列を最初から
+int64 セットへ 1 パスで積む。非 NULL・非空セルを 1 度だけ `parse_i64`
+(full-length `from_chars`) し、最初に変換失敗したセル (DECIMAL/非正準) が
+出た時だけ owned-string セットへ再走査フォールバック (非 INT キー列でのみ
+発生・稀)。中間 string セット + `to_int_set` 再パスが丸ごと消える。canonical
+INT セルは値↔バイト 1:1 (E13/E15 と同じ不変条件) なので probe 意味論は
+byte-for-byte 不変。RunScan は `semi_set!=nullptr` 判定を
+`semi_active`/`semi_int` フラグに分離 (int パスは string セットを持たない)。
+
+| 指標 | E15 | E16 | 要因 |
+|---|---|---|---|
+| **合計 (min-of-3)** | 6.88s | **6.25s (-9.2%)** | semi キーの型付き直接収集 |
+| q21 | 1168ms | **901ms (-23%)** | l_orderkey/l_suppkey 集合 |
+| q10 | 495ms | **341ms (-31%)** | o_orderkey semi + LEFT group |
+| q8 | 246ms | **133ms (-46%)** | 多段 semi 連鎖 |
+| q7 | 323ms | **223ms (-31%)** | 多段 semi 連鎖 |
+| q5 | 160ms | **106ms (-34%)** | 多段 semi 連鎖 |
+| q20 | 640ms | 668ms | ノイズ域 (sub_block ext は未変更) |
+
+ゲート 22/22 MATCH + 回帰 3 本 (two-derived MATCH / nullsafe-eq REJECT /
+null-eq-join MATCH) + SF=1 hot-5 md5 全 MATCH。SF=1 の 22 本 md5 は E15 と
+**全一致** — 意味論不変を実証。InnoDB champion 42.2s の **6.75 倍**。
+**Codex review**: 4M サイズガードが旧 `semi_keys.size()`(distinct string)
+→ 新 `semi_ikeys.size()`(distinct int64) になった点を指摘。実害なし —
+(1) semi filter は LIP の冗長 pre-filter で、適用/スキップは純粋に性能選択
+(後段 equijoin が同じ行を落とすので結果不変)、(2) canonical INT は
+値↔バイト全単射で distinct int 数 = distinct string 数 (崩壊しない)、
+(3) md5 全一致で実証。SF=1 では最大 semi source ≤1.5M で 4M 境界に届かない。
+残: q18 1.5-1.7s (集計)、q20 640ms (sub_block ext の型付き化が残レバー)、
+q21 901ms。

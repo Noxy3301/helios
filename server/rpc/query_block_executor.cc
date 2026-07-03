@@ -362,6 +362,54 @@ struct Executor {
         return true;
     }
 
+    // Typed key collection (E16): build the semi source's key set directly
+    // in the int64 representation, skipping the intermediate
+    // unordered_set<std::string> + separate to_int_set() re-parse that
+    // dominated collect_keys in the semi-heavy queries (perf: q21/q10).
+    // Every non-null cell is parsed once; the first cell that does not
+    // convert (DECIMAL/non-canonical) makes the collection fall back to an
+    // owned-string set (a second pass, rare — only for non-INT key columns),
+    // so the probe semantics are byte-for-byte identical to collect_keys +
+    // to_int_set. On success exactly one of *iout (when *is_int) or *sout is
+    // populated.
+    bool collect_keys_typed(const pb::QbSemiFilter& semi,
+                            std::unordered_set<int64_t>* iout,
+                            std::unordered_set<std::string>* sout,
+                            bool* is_int) {
+        if (semi.source_node() >= results.size())
+            return fail("semi source out of range");
+        const NodeResult& src = results[semi.source_node()];
+        const uint32_t tbl = semi.source_column().table_idx();
+        const uint32_t col = semi.source_column().column();
+        const int pos = src.table_pos(tbl);
+        if (pos < 0) return fail("semi source table");
+        iout->reserve(src.rows());
+        *is_int = true;
+        for (size_t r = 0; r < src.rows(); ++r) {
+            const uint64_t ref = src.refs[pos][r];
+            if (ref == kNullRef) continue;
+            const std::string_view v = value_of(tbl, ref, col);
+            if (v.empty()) continue;
+            int64_t iv;
+            if (!parse_i64(v, &iv)) {
+                // Non-INT key column: abandon the int set and re-collect as
+                // owned strings (matches the byte-comparison probe path).
+                *is_int = false;
+                iout->clear();
+                sout->reserve(src.rows());
+                for (size_t r2 = 0; r2 < src.rows(); ++r2) {
+                    const uint64_t ref2 = src.refs[pos][r2];
+                    if (ref2 == kNullRef) continue;
+                    const std::string_view v2 = value_of(tbl, ref2, col);
+                    if (!v2.empty()) sout->emplace(v2);
+                }
+                return true;
+            }
+            iout->insert(iv);
+        }
+        return true;
+    }
+
     bool is_virtual(uint32_t table_idx) const {
         return table_idx >= static_cast<uint32_t>(req.tables_size());
     }
@@ -442,24 +490,32 @@ struct Executor {
 
         // Semi-join key filters: from the plan (earlier node's keys) and/or
         // injected by a parent executor (sub-block domain restriction).
+        // The plan-side set is collected directly in its typed form (E16):
+        // int64 when every key parses (semi_int), else an owned-string set.
         std::unordered_set<std::string> semi_keys;
+        std::unordered_set<int64_t> semi_ikeys, ext_ikeys;
         const std::unordered_set<std::string>* semi_set = nullptr;
+        bool semi_active = false;
+        bool semi_int = false;
         uint32_t semi_col = 0;
         if (scan.has_semi()) {
-            if (!collect_keys(scan.semi(), &semi_keys)) return false;
+            bool is_int = false;
+            if (!collect_keys_typed(scan.semi(), &semi_ikeys, &semi_keys,
+                                    &is_int))
+                return false;
             // A huge key set costs more to probe than it prunes (the
             // proxy's chained estimates can be wrong in either direction).
-            if (semi_keys.size() <= (size_t{4} << 20)) {
-                semi_set = &semi_keys;
+            const size_t ksz = is_int ? semi_ikeys.size() : semi_keys.size();
+            if (ksz <= (size_t{4} << 20)) {
+                semi_active = true;
+                semi_int = is_int;
+                if (!is_int) semi_set = &semi_keys;
                 semi_col = scan.semi().my_column();
             }
         }
         const bool use_ext = ext_keys != nullptr &&
                              ext_filter_table == scan.table_idx();
-        // Typed-key probes (E13): int64 sets when every key converts.
-        std::unordered_set<int64_t> semi_ikeys, ext_ikeys;
-        const bool semi_int =
-            semi_set != nullptr && to_int_set(*semi_set, &semi_ikeys);
+        // Typed-key probes (E13): int64 set when every injected key converts.
         const bool ext_int = use_ext && to_int_set(*ext_keys, &ext_ikeys);
 
         const bool has_filter =
@@ -495,7 +551,7 @@ struct Executor {
                                 __builtin_ctzll(bits));
                             bits &= bits - 1;
                             const uint32_t slot = base + s;
-                            if (semi_set != nullptr) {
+                            if (semi_active) {
                                 const std::string_view kv =
                                     grp->cell(semi_col + 1, slot);
                                 if (semi_int) {
