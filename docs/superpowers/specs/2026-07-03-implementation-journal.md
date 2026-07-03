@@ -866,3 +866,73 @@ TPC-H に存在しない (INT/DATE/DECIMAL は M2 で全 typed=canonical) ので
 そもそも TPC-H で発火しない、(3) real q18 (単一 INT + HAVING) / q20 (2 INT) / q13
 (単一 INT + 二段) が deferred 経路を実データで byte 一致検証済み。empirical ZEROFILL
 coverage は harness 制約で未取得だが risk は nil。
+
+### M3b: radix 並列集計 (2026-07-04)
+
+SF=5 敗因 ②「高カーディナリティ group-by を直列でこなす (DuckDB は radix 並列で
+~85×)」の本丸。旧構成: `wc` ワーカーが各自 row-range を **フル 1 マップ** に集約 →
+**単一スレッドの MergeGroups チェーン**で全 local を 1 個の巨大マップに畳み込み →
+emit も単一スレッド。1.5M グループ (q18 `GROUP BY l_orderkey` / q20
+`GROUP BY l_partkey,l_suppkey`) では**直列マージ + 巨大最終マップ**が律速。
+
+**再設計 (radix partition)**: P=wc パーティション。`part_of_i64/i2/str` が
+`mix64` (キーの純関数) でキー→パーティションを決めるので、全ワーカーが同じキーを
+同じパーティションに置く=**パーティション同士はキー素**。
+(1) **Phase1 accumulate**: 各ワーカーが自 row-range を**自分の** P 個ローカル
+パーティション (`locals[w]`) に fan-out (`AccumulateRangeT` が `parts[part_of(key)]`
+を選択)。(2) **Phase2 merge**: パーティション p ごとに 1 スレッドが `locals[0..wc][p]`
+を `parts[p]` に畳む — キー素なので競合ゼロ・P 並列 (空パーティションはスレッド無し、
+最初の非空マージ後に 1 回だけ reserve=E8b)。(3) **emit**: P 個のキー素マップを走査。
+**HAVING は per-partition 並列** (各スレッド自前 evaluator/scratch で自マップから
+erase — q18 の 1.5M スキャンが並列化=最大の勝ち筋)。出力 ordinal を先に 1 度検証して
+から**通常出力行を per-partition 並列生成**しパーティション順に連結。**second stage
+再集計 (q13) と ORDER BY/LIMIT/serialize は単一スレッド維持** (別キーへの reshuffle /
+全順序が必要)。P==1 (小入力・`n<65536`) は旧単一マップ経路に縮退=emit 順も不変。
+
+**md5 保存の根拠**: 唯一の挙動差は「top-level ORDER BY 無しクエリの emit 行順」。
+22 本すべて top-level GROUP BY は ORDER BY 付き or scalar (n_grp==0=1 行) と確認。
+derived サブブロック (q13/q16/q18/q20 の内側) は ORDER BY 無しだが hash join /
+semijoin / value_of で消費され**行順非依存** (value_of(virtual, ref) は join が
+キー一致させた論理行を指すので ref 番号が変わっても正しい行を読む; derived の
+group key は一意なので重複非決定性も無し)。→ radix 再順序は全 22 本で md5 不変。
+
+**実測 SF=1 (min-of-3, FORCED)**: **22/22 md5 が M2 (PAX-SE-M2b) とバイト一致**、
+RSS 6.05GB 不変 (wc²≤1024 ローカルマップは transient・O(rows) 爆発なし)。
+| 指標 | M2b | M3a | **M3b** | 要因 |
+|---|---|---|---|---|
+| **合計** | 5.79s | 5.78s | **4.89s** | radix 並列マージ + 並列 HAVING/build |
+| q18 | 1507 | 1487 | **973 (-35%)** | 1.5M group 並列マージ + 並列 HAVING |
+| q20 | 555 | — | **354 (-36%)** | (partkey,suppkey) 800k group 並列 |
+| q21 | 768 | — | **680 (-11%)** | l_orderkey 集計の並列化 |
+| q10 | 350 | — | 333 (-5%) | |
+| q13 | 212 | — | 223 (+11) | 二段目は単一スレッド維持 = radix オーバヘッド微増 (mid-card) |
+q18 は目標 1486ms を大きく下回り (1s 割れ)、q20 も 550ms を大きく下回った。q13 の
++11ms は 150k group で radix の wc² マップ確保コストが second-stage 単一化の利得を
+僅かに上回る mid-card ケース (許容; SF=5 で高 card 化すると Phase2 並列の利得が拡大)。
+
+**検証**: SF=0.01 22/22 FORCED-vs-OFF MATCH + M2 adversarial 16/16 + 標準回帰 3 本
+(null-eq-join / string-stride / nullsafe-eq REJECT) + M3A 合成 GROUP BY は
+optimizer-reject を loud 報告 (offloadability tripwire、コード経路非到達)。
+**TPC-C は不要**: 集計は OLAP-only 経路で書込パス (scatter/gather/OLTP) に一切
+触れないため — proto/proxy/engine 無変更、server の集計関数のみ。
+dual review (Part B): **Codex = data race 無し** (Phase2 merge/並列 HAVING/並列 build は
+各スレッドが自 `parts[p]`/`prows[p]` のみ書込・共有 req/agg/in/stores/virtuals は
+read-only、`ensure_keys`/`AggValue`/`EvalOutExpr`/`key_view` は共有 Executor 状態を
+変更せず、fail() は並列ラムダに出現しない)、partition 決定論的 (mix64(0)==0 の不動点は
+無害・同一キー素性は成立)、P==1/空パーティションスキップ/parse fallback/メモリ境界
+(wc*P≤1024) すべて OK。**指摘 1 件 CONFIRMED (修正済み)**: 出力 ordinal の事前検証を
+second-stage の**前**に置いたため、second-stage 出力 (別 ordinal 空間=gvals) で
+`GROUP ordinal>=n_grp` の正当なクエリを誤 reject し得る (`SELECT c_custkey,c_count,
+COUNT(*) ... GROUP BY c_custkey,c_count` 形)。TPC-H では潜在 (q13 の出力 GROUP ord=0
+なので 22/22 一致は保たれた) だが offload coverage の回帰 → **事前検証を
+`if(!agg.has_second())` で囲い、second-stage は従来の inline `gvals.size()` 検証を維持**。
+**code-reviewer = 並列領域に新規 correctness/data-race バグ無し** (Phase2/HAVING/build の
+各スレッドは disjoint メモリのみ書込・emit 中の共有状態は immutable と独立確認)。**同じ
+Important (D) を独立検出** (= Codex と同一の second-stage 検証問題、修正済みを確認)。
+Suggestion 2 件はいずれも **pre-existing で M3b の回帰ではない**: (A) Phase1
+`AccumulateRangeT` 内 `fail()` が worker から `this->error` を並列書込 (旧コードの
+worker pool でも同様・malformed plan 時のみ発火・valid TPC-H では到達不能) — 将来
+per-worker フラグ集約で hardening 余地、(B) 再順序の md5 安全性は top-level ORDER BY が
+unstable `std::sort` 下で全順序であることに依存 (M3b 以前から load-bearing = E8/E15/E16/
+M3a の unordered_map 順も任意だった。q10 の tie 境界 flaky として既知・ゲートに
+diff+same-rows 判定を常設済み)。両 suggestion は本コミットの scope 外として記録。

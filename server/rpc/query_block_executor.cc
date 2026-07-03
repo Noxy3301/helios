@@ -1612,18 +1612,48 @@ struct Executor {
     };
     using Int2GroupMap = std::unordered_map<Int2Key, GroupState, Int2Hash>;
 
-    // Accumulates rows [begin,end) into `groups`. Generic over the map key:
-    // the string-keyed GroupMap builds length-prefixed byte keys as before,
-    // while the int64-keyed IntGroupMap (E15) parses the single group cell
-    // as int64. In the int path the first cell that does not parse
-    // full-length sets *parse_fail and returns false, so the caller discards
-    // the partial result and re-runs the whole aggregation on the string
-    // path — semantics stay identical (only pure-INT single group columns
-    // ever take the fast path; canonical INT cells have value==byte equality,
-    // mirroring the E13 join-key convention).
+    // Radix partition index for a group key (M3b). A well-mixed finalizer keeps
+    // partition sizes balanced even for sequentially-clustered keys (l_orderkey
+    // runs 1..N with gaps), which libstdc++'s identity std::hash<int64_t> would
+    // otherwise bucket unevenly. Pure function of the key, so every worker maps
+    // a given key to the same partition — that disjointness is what lets the P
+    // merge tasks run without cross-partition contention.
+    static inline uint64_t mix64(uint64_t x) {
+        x ^= x >> 33;
+        x *= 0xff51afd7ed558ccdULL;
+        x ^= x >> 33;
+        x *= 0xc4ceb9fe1a85ec53ULL;
+        x ^= x >> 33;
+        return x;
+    }
+    static inline unsigned part_of_i64(int64_t v, unsigned P) {
+        return static_cast<unsigned>(mix64(static_cast<uint64_t>(v)) % P);
+    }
+    static inline unsigned part_of_i2(const Int2Key& k, unsigned P) {
+        return static_cast<unsigned>(
+            mix64(static_cast<uint64_t>(k.a) * 0x9e3779b97f4a7c15ULL +
+                  static_cast<uint64_t>(k.b)) % P);
+    }
+    static inline unsigned part_of_str(std::string_view k, unsigned P) {
+        return static_cast<unsigned>(
+            std::hash<std::string_view>{}(k) % P);
+    }
+
+    // Accumulates rows [begin,end) into `parts` — a radix fan-out of P group
+    // maps keyed by part_of_*(key) (M3b). Generic over the map key: the
+    // string-keyed GroupMap builds length-prefixed byte keys as before, while
+    // the int64-keyed IntGroupMap (E15) parses the single group cell as int64.
+    // In the int path the first cell that does not parse full-length sets
+    // *parse_fail and returns false, so the caller discards the partial result
+    // and re-runs the whole aggregation on the string path — semantics stay
+    // identical (only pure-INT single group columns ever take the fast path;
+    // canonical INT cells have value==byte equality, mirroring the E13 join-key
+    // convention). P==1 collapses to a single map (small inputs, and the
+    // per-worker range is a strict row subset either way).
     template <typename MapT>
     bool AccumulateRangeT(const pb::QbAggregate& agg, const NodeResult& in,
-                          size_t begin, size_t end, MapT& groups,
+                          size_t begin, size_t end,
+                          std::vector<MapT>& parts, unsigned P,
                           std::atomic<bool>* parse_fail) {
         constexpr bool IntKey =
             std::is_same_v<typename MapT::key_type, int64_t>;
@@ -1672,6 +1702,7 @@ struct Executor {
                     parse_fail->store(true, std::memory_order_relaxed);
                     return false;
                 }
+                MapT& groups = parts[P == 1 ? 0 : part_of_i64(iv, P)];
                 auto it = groups.find(iv);
                 if (it == groups.end()) {
                     GroupState st;
@@ -1701,6 +1732,7 @@ struct Executor {
                     parse_fail->store(true, std::memory_order_relaxed);
                     return false;
                 }
+                MapT& groups = parts[P == 1 ? 0 : part_of_i2(key, P)];
                 auto it = groups.find(key);
                 if (it == groups.end()) {
                     GroupState st;
@@ -1731,6 +1763,7 @@ struct Executor {
                                   sizeof(l));
                     keybuf.append(gv[g].data(), gv[g].size());
                 }
+                MapT& groups = parts[P == 1 ? 0 : part_of_str(keybuf, P)];
                 auto it = groups.find(keybuf);
                 if (it == groups.end()) {
                     GroupState st;
@@ -2110,6 +2143,15 @@ struct Executor {
         const size_t n = in.rows();
         const unsigned wc = static_cast<unsigned>(std::min<size_t>(
             workers(), std::max<size_t>(n / 65536, 1)));
+        // Radix partitions (M3b) = worker count. Each accumulate worker fans
+        // its groups into P partitions by part_of_*(key); P merge tasks then
+        // fold partition p from every worker in parallel (disjoint keys → no
+        // contention), replacing the single-threaded MergeGroups chain into one
+        // giant map that bottlenecked q18/q20 at ~1.5M groups. HAVING and the
+        // output row build also run per-partition in parallel; the second stage
+        // and ORDER BY/LIMIT stay single-threaded. P==1 (small inputs) collapses
+        // to the pre-M3b single-map path with identical emit order.
+        const unsigned P = wc;
 
         // Post-accumulation pipeline (HAVING → second stage / output →
         // ORDER BY / LIMIT / serialize), generic over the map key type so
@@ -2133,15 +2175,31 @@ struct Executor {
             gs.key_done = true;
         };
 
-        auto emit = [&](auto& groups) -> bool {
-        using KeyT = typename std::decay_t<decltype(groups)>::key_type;
-        // Implicit grouping emits one row over zero input. Reachable only
-        // for the string map — the int path always has one group column.
+        // Output rows: one per surviving group. Hoisted above emit so the
+        // per-partition parallel builders below can produce vectors of it.
+        struct OutRow {
+            std::vector<std::string> vals;
+            std::vector<bool> nulls;
+        };
+
+        auto emit = [&](auto& parts) -> bool {
+        using MapT = typename std::decay_t<decltype(parts)>::value_type;
+        using KeyT = typename MapT::key_type;
+        const unsigned np = static_cast<unsigned>(parts.size());
+
+        // Implicit grouping emits one row over zero input. Reachable only for
+        // the string map — the int paths always have >=1 group column. Inject
+        // into partition 0 when every partition is empty.
         if constexpr (std::is_same_v<KeyT, std::string>) {
-            if (n_grp == 0 && groups.empty()) {
-                GroupState st;
-                st.aggs.resize(agg.aggs_size());
-                groups.emplace(std::string(), std::move(st));
+            if (n_grp == 0) {
+                bool any = false;
+                for (auto& pt : parts)
+                    if (!pt.empty()) { any = true; break; }
+                if (!any) {
+                    GroupState st;
+                    st.aggs.resize(agg.aggs_size());
+                    parts[0].emplace(std::string(), std::move(st));
+                }
             }
         }
 
@@ -2160,58 +2218,96 @@ struct Executor {
                 }
         }
 
-        // HAVING: drop groups failing the predicate over the stage-1
-        // value layout [group values..., aggregate values...].
+        // HAVING: drop groups failing the predicate over the stage-1 value
+        // layout [group values..., aggregate values...]. Partitions hold
+        // disjoint keys, so each is pruned independently — this is q18's
+        // dominant post-merge cost (a 1.5M-group scan), so run it per-partition
+        // in parallel (M3b), each thread with its own evaluator/scratch.
         if (agg.has_having() && agg.having().has_expr()) {
-            PredicateEvaluator hev;
-            std::vector<std::string> hv;
-            std::vector<std::string_view> hcells;
-            std::vector<bool> hnulls;
-            for (auto it = groups.begin(); it != groups.end();) {
-                GroupState& gs = it->second;
-                if (having_uses_group) ensure_keys(gs);
-                hv.clear();
-                hnulls.clear();
-                for (int g = 0; g < n_grp; ++g) {
-                    // Placeholder when HAVING never reads group columns; the
-                    // evaluator only touches ordinals the expression names.
-                    hv.push_back(having_uses_group ? gs.key_cols[g]
-                                                   : std::string());
-                    hnulls.push_back(false);
+            auto do_having = [&](MapT& groups) {
+                PredicateEvaluator hev;
+                std::vector<std::string> hv;
+                std::vector<std::string_view> hcells;
+                std::vector<bool> hnulls;
+                for (auto it = groups.begin(); it != groups.end();) {
+                    GroupState& gs = it->second;
+                    if (having_uses_group) ensure_keys(gs);
+                    hv.clear();
+                    hnulls.clear();
+                    for (int g = 0; g < n_grp; ++g) {
+                        // Placeholder when HAVING never reads group columns;
+                        // the evaluator only touches ordinals it names.
+                        hv.push_back(having_uses_group ? gs.key_cols[g]
+                                                       : std::string());
+                        hnulls.push_back(false);
+                    }
+                    for (int a = 0; a < agg.aggs_size(); ++a) {
+                        bool is_null = false;
+                        hv.push_back(AggValue(agg.aggs(a), gs, a, &is_null));
+                        hnulls.push_back(is_null);
+                    }
+                    hcells.assign(hv.begin(), hv.end());
+                    hev.set_row_from_views(hcells, hnulls);
+                    if (hev.evaluate(agg.having().expr()))
+                        ++it;
+                    else
+                        it = groups.erase(it);
                 }
-                for (int a = 0; a < agg.aggs_size(); ++a) {
-                    bool is_null = false;
-                    hv.push_back(AggValue(agg.aggs(a), gs, a, &is_null));
-                    hnulls.push_back(is_null);
+            };
+            if (np <= 1) {
+                do_having(parts[0]);
+            } else {
+                std::vector<std::thread> pool;
+                pool.reserve(np);
+                for (unsigned p = 0; p < np; ++p) {
+                    if (parts[p].empty()) continue;  // no work, no thread
+                    pool.emplace_back([&, p] { do_having(parts[p]); });
                 }
-                hcells.assign(hv.begin(), hv.end());
-                hev.set_row_from_views(hcells, hnulls);
-                if (hev.evaluate(agg.having().expr()))
-                    ++it;
-                else
-                    it = groups.erase(it);
+                for (auto& t : pool) t.join();
             }
         }
 
-        // Build output rows: value strings per output expression.
-        struct OutRow {
-            std::vector<std::string> vals;
-            std::vector<bool> nulls;
-        };
+        // Validate the NON-second output ordinals once (data-independent) so
+        // the parallel row builder below has no failure path. The second-stage
+        // path is single-threaded and its output ordinals live in a different
+        // space (the composite gvals, sized by group_value_ordinals, checked
+        // inline against gvals.size()), so it keeps its own inline validation
+        // and is skipped here — validating it against n_grp/aggs_size would
+        // spuriously reject a valid `GROUP ordinal >= n_grp` second-stage
+        // output (Codex M3b review).
+        if (!agg.has_second()) {
+            for (const auto& oe : req.output()) {
+                switch (oe.source()) {
+                    case pb::QbOutputExpr::GROUP:
+                        if (oe.ordinal() >= static_cast<uint32_t>(n_grp))
+                            return fail("group ordinal out of range");
+                        break;
+                    case pb::QbOutputExpr::AGG:
+                        if (oe.ordinal() >=
+                            static_cast<uint32_t>(agg.aggs_size()))
+                            return fail("agg ordinal out of range");
+                        break;
+                    case pb::QbOutputExpr::EXPR:
+                        break;
+                    default:
+                        return fail("unsupported output source");
+                }
+            }
+        }
+
         std::vector<OutRow> rows;
         if (agg.has_second()) {
-            // Second-stage re-aggregation (q13 shape): re-group stage-1
-            // values and COUNT(*) per group. Stage-1 value ordinal space:
-            // [group columns..., aggregates...].
+            // Second-stage re-aggregation (q13 shape): re-group stage-1 values
+            // and COUNT(*) per group. Inherently single-threaded — it folds
+            // every group (across all partitions) into one shared `second` map.
             if (!agg.second().count_star())
                 return fail("second stage must count");
             std::unordered_map<std::string, uint64_t> second;
             std::string key;
-            std::vector<std::string> kvals;
-            for (auto& kv : groups) {
+            for (auto& part : parts) {
+              for (auto& kv : part) {
                 GroupState& gs = kv.second;
                 key.clear();
-                kvals.clear();
                 for (uint32_t ord : agg.second().group_value_ordinals()) {
                     std::string v;
                     bool is_null = false;
@@ -2227,10 +2323,9 @@ struct Executor {
                     const uint32_t l = static_cast<uint32_t>(v.size());
                     key.append(reinterpret_cast<const char*>(&l), sizeof(l));
                     key.append(v);
-                    kvals.push_back(std::move(v));
                 }
-                auto ins = second.emplace(key, 0);
-                ins.first->second += 1;
+                second.emplace(key, 0).first->second += 1;
+              }
             }
             rows.reserve(second.size());
             for (auto& kv : second) {
@@ -2257,8 +2352,7 @@ struct Executor {
                             row.nulls.push_back(false);
                             break;
                         case pb::QbOutputExpr::AGG:
-                            row.vals.push_back(
-                                std::to_string(kv.second));
+                            row.vals.push_back(std::to_string(kv.second));
                             row.nulls.push_back(false);
                             break;
                         default:
@@ -2268,59 +2362,78 @@ struct Executor {
                 rows.push_back(std::move(row));
             }
         } else {
-        rows.reserve(groups.size());
-        for (auto& kv : groups) {
-            GroupState& gs = kv.second;
-            ensure_keys(gs);  // survivors only (M3a): GROUP/EXPR read key_cols
-            OutRow row;
-            row.vals.reserve(req.output_size());
-            row.nulls.reserve(req.output_size());
-            for (const auto& oe : req.output()) {
-                switch (oe.source()) {
-                    case pb::QbOutputExpr::GROUP: {
-                        if (oe.ordinal() >=
-                            static_cast<uint32_t>(n_grp))
-                            return fail("group ordinal out of range");
-                        row.vals.push_back(gs.key_cols[oe.ordinal()]);
-                        row.nulls.push_back(false);
-                        break;
-                    }
-                    case pb::QbOutputExpr::AGG: {
-                        if (oe.ordinal() >=
-                            static_cast<uint32_t>(agg.aggs_size()))
-                            return fail("agg ordinal out of range");
-                        bool is_null = false;
-                        row.vals.push_back(
-                            AggValue(agg.aggs(oe.ordinal()), gs,
-                                     static_cast<int>(oe.ordinal()),
-                                     &is_null));
-                        row.nulls.push_back(is_null);
-                        break;
-                    }
-                    case pb::QbOutputExpr::EXPR: {
-                        Dec v = EvalOutExpr(oe.expr(), agg, gs);
-                        if (!v.null && v.s > static_cast<int>(
-                                                 oe.result_scale())) {
-                            // Round to the declared output scale.
-                            const int drop = v.s - oe.result_scale();
-                            __int128 m = v.m;
-                            const bool neg = m < 0;
-                            if (neg) m = -m;
-                            m = (m + dec_pow10(drop) / 2) / dec_pow10(drop);
-                            v.m = neg ? -m : m;
-                            v.s = oe.result_scale();
+            // Normal output: build each partition's rows independently, then
+            // concatenate in partition order (M3b). Ordinals were validated
+            // above, so this path cannot fail — safe to run per-partition in
+            // parallel. The concatenation order differs from the pre-M3b single
+            // map, but every final result is ORDER BY-sorted or a scalar row and
+            // derived blocks feed order-independent joins, so md5 is preserved.
+            auto build_part = [&](MapT& groups, std::vector<OutRow>& out) {
+                out.reserve(groups.size());
+                for (auto& kv : groups) {
+                    GroupState& gs = kv.second;
+                    ensure_keys(gs);  // survivors only (M3a)
+                    OutRow row;
+                    row.vals.reserve(req.output_size());
+                    row.nulls.reserve(req.output_size());
+                    for (const auto& oe : req.output()) {
+                        switch (oe.source()) {
+                            case pb::QbOutputExpr::GROUP:
+                                row.vals.push_back(gs.key_cols[oe.ordinal()]);
+                                row.nulls.push_back(false);
+                                break;
+                            case pb::QbOutputExpr::AGG: {
+                                bool is_null = false;
+                                row.vals.push_back(AggValue(
+                                    agg.aggs(oe.ordinal()), gs,
+                                    static_cast<int>(oe.ordinal()), &is_null));
+                                row.nulls.push_back(is_null);
+                                break;
+                            }
+                            case pb::QbOutputExpr::EXPR: {
+                                Dec v = EvalOutExpr(oe.expr(), agg, gs);
+                                if (!v.null && v.s > static_cast<int>(
+                                                         oe.result_scale())) {
+                                    // Round to the declared output scale.
+                                    const int drop = v.s - oe.result_scale();
+                                    __int128 m = v.m;
+                                    const bool neg = m < 0;
+                                    if (neg) m = -m;
+                                    m = (m + dec_pow10(drop) / 2) /
+                                        dec_pow10(drop);
+                                    v.m = neg ? -m : m;
+                                    v.s = oe.result_scale();
+                                }
+                                row.vals.push_back(v.null ? std::string()
+                                                          : dec_format(v));
+                                row.nulls.push_back(v.null);
+                                break;
+                            }
+                            default:
+                                break;  // validated above; unreachable
                         }
-                        row.vals.push_back(v.null ? std::string()
-                                                  : dec_format(v));
-                        row.nulls.push_back(v.null);
-                        break;
                     }
-                    default:
-                        return fail("unsupported output source");
+                    out.push_back(std::move(row));
                 }
+            };
+            if (np <= 1) {
+                build_part(parts[0], rows);
+            } else {
+                std::vector<std::vector<OutRow>> prows(np);
+                std::vector<std::thread> pool;
+                pool.reserve(np);
+                for (unsigned p = 0; p < np; ++p) {
+                    if (parts[p].empty()) continue;
+                    pool.emplace_back(
+                        [&, p] { build_part(parts[p], prows[p]); });
+                }
+                for (auto& t : pool) t.join();
+                size_t tot = 0;
+                for (auto& pr : prows) tot += pr.size();
+                rows.reserve(tot);
+                for (auto& pr : prows)
+                    for (auto& r : pr) rows.push_back(std::move(r));
             }
-            rows.push_back(std::move(row));
-        }
         }
 
         // ORDER BY over output ordinals.
@@ -2366,52 +2479,62 @@ struct Executor {
         return true;
         };  // emit
 
-        // Typed group-key fast paths: a single INT group column (E15) or two
-        // INT group columns packed into a POD key (E16b), both prefix_len==0.
-        // Accumulate into a fresh map of the given type; a parse failure
-        // discards the partial result and the caller falls through to the
-        // string path (reached only for non-INT columns, so the re-scan is
-        // rare). Returns 0 on success (map ready to emit), 1 on parse
-        // fallback, 2 on structural failure.
-        auto run_typed = [&](auto& groups) -> int {
-            using MapT = std::decay_t<decltype(groups)>;
+        // Radix accumulate + parallel P-way merge into `parts` (pre-sized to
+        // P). Phase 1: each worker fans its row range into its own P local
+        // partitions. Phase 2: one merge task per partition folds that
+        // partition from every worker — disjoint keys, so no contention, which
+        // replaces the single-threaded MergeGroups chain into one giant map
+        // that dominated high-cardinality aggregation (q18/q20). Returns 0 on
+        // success (parts ready to emit), 1 on parse fallback (int paths only —
+        // a non-INT cell was seen), 2 on structural failure.
+        auto run_typed = [&](auto& parts) -> int {
+            using MapT = typename std::decay_t<decltype(parts)>::value_type;
             std::atomic<bool> parse_fail{false};
-            bool ok;
-            if (wc <= 1) {
-                ok = AccumulateRangeT(agg, in, 0, n, groups, &parse_fail);
-            } else {
-                std::vector<MapT> locals(wc);
-                std::vector<char> failed(wc, 0);
+            if (P <= 1) {
+                if (!AccumulateRangeT(agg, in, 0, n, parts, 1u, &parse_fail))
+                    return parse_fail.load() ? 1 : 2;
+                return 0;
+            }
+            std::vector<std::vector<MapT>> locals(wc);
+            std::vector<char> failed(wc, 0);
+            {
                 std::vector<std::thread> pool;
                 pool.reserve(wc);
                 for (unsigned w = 0; w < wc; ++w) {
                     pool.emplace_back([&, w] {
+                        locals[w].resize(P);
                         if (!AccumulateRangeT(agg, in, n * w / wc,
-                                              n * (w + 1) / wc, locals[w],
+                                              n * (w + 1) / wc, locals[w], P,
                                               &parse_fail))
                             failed[w] = 1;
                     });
                 }
                 for (auto& t : pool) t.join();
-                ok = true;
-                for (char f : failed)
-                    if (f) { ok = false; break; }
-                if (ok) {
-                    // One up-front rehash to the merged size (E8b).
-                    size_t total = 0;
-                    for (auto& l : locals) total += l.size();
-                    bool first = true;
-                    for (auto& l : locals) {
-                        MergeGroups(groups, l, agg);
-                        if (first && !groups.empty()) {
-                            groups.reserve(total);
-                            first = false;
-                        }
-                    }
-                }
             }
-            if (ok) return 0;
-            return parse_fail.load() ? 1 : 2;
+            for (char f : failed)
+                if (f) return parse_fail.load() ? 1 : 2;
+            {
+                std::vector<std::thread> pool;
+                pool.reserve(P);
+                for (unsigned p = 0; p < P; ++p) {
+                    size_t ptotal = 0;
+                    for (unsigned w = 0; w < wc; ++w)
+                        ptotal += locals[w][p].size();
+                    if (ptotal == 0) continue;  // empty partition, no thread
+                    pool.emplace_back([&, p, ptotal] {
+                        bool first = true;
+                        for (unsigned w = 0; w < wc; ++w) {
+                            MergeGroups(parts[p], locals[w][p], agg);
+                            if (first && !parts[p].empty()) {
+                                parts[p].reserve(ptotal);  // one rehash (E8b)
+                                first = false;
+                            }
+                        }
+                    });
+                }
+                for (auto& t : pool) t.join();
+            }
+            return 0;
         };
 
         // The int fast paths only take numeric group columns (cmp_kind==0):
@@ -2427,53 +2550,23 @@ struct Executor {
                               agg.group_columns(1).prefix_len() == 0 &&
                               agg.group_columns(1).cmp_kind() == 0;
         if (n_grp == 1 && grp0_int) {
-            IntGroupMap igroups;
-            const int st = run_typed(igroups);
-            if (st == 0) return emit(igroups);   // every key was int64
+            std::vector<IntGroupMap> parts(P);
+            const int st = run_typed(parts);
+            if (st == 0) return emit(parts);     // every key was int64
             if (st == 2) return false;           // structural failure
             // st == 1: a cell did not parse → fall through to string path.
         } else if (n_grp == 2 && grp0_int && grp1_int) {
-            Int2GroupMap i2groups;
-            const int st = run_typed(i2groups);
-            if (st == 0) return emit(i2groups);  // both keys were int64
+            std::vector<Int2GroupMap> parts(P);
+            const int st = run_typed(parts);
+            if (st == 0) return emit(parts);     // both keys were int64
             if (st == 2) return false;
             // st == 1: fall through to the string path.
         }
 
-        GroupMap groups;
-        if (wc <= 1) {
-            if (!AccumulateRangeT(agg, in, 0, n, groups, nullptr))
-                return false;
-        } else {
-            std::vector<GroupMap> locals(wc);
-            std::vector<char> failed(wc, 0);
-            std::vector<std::thread> pool;
-            pool.reserve(wc);
-            for (unsigned w = 0; w < wc; ++w) {
-                pool.emplace_back([&, w] {
-                    if (!AccumulateRangeT(agg, in, n * w / wc,
-                                          n * (w + 1) / wc, locals[w],
-                                          nullptr))
-                        failed[w] = 1;
-                });
-            }
-            for (auto& t : pool) t.join();
-            for (char f : failed)
-                if (f) return false;
-            // One up-front rehash to the merged size; per-step growth
-            // would rehash the (large) destination once per local.
-            size_t total = 0;
-            for (auto& l : locals) total += l.size();
-            bool first = true;
-            for (auto& l : locals) {
-                MergeGroups(groups, l, agg);
-                if (first && !groups.empty()) {
-                    groups.reserve(total);
-                    first = false;
-                }
-            }
-        }
-        return emit(groups);
+        std::vector<GroupMap> parts(P);
+        const int st = run_typed(parts);  // string keys never set parse_fail
+        if (st != 0) return false;
+        return emit(parts);
     }
 
     bool Run(pb::TxExecuteQueryBlock::Response* response) {
