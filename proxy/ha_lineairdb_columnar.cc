@@ -1545,6 +1545,21 @@ bool build_block(THD *thd, Query_block *qb,
       return true;
     };
 
+    // Pre-issue every real scan, most selective first: any scan can then
+    // serve as a semi-filter source for later nodes regardless of where
+    // the plan placed its join.
+    {
+      std::vector<size_t> pre;
+      for (size_t i = 0; i < n_real; ++i) pre.push_back(i);
+      std::stable_sort(pre.begin(), pre.end(), [&](size_t a, size_t b) {
+        return tabs[a].records < tabs[b].records;
+      });
+      for (size_t t : pre) {
+        if (!emit_scan(t)) LDB_COL_REJECT("filter not pushable");
+        node_tabs[scan_node_of[t]] = {static_cast<int>(t)};
+      }
+    }
+
     std::function<int(AccessPath *)> map_path =
         [&](AccessPath *p) -> int {
       if (p == nullptr) {
@@ -1708,39 +1723,6 @@ bool build_block(THD *thd, Query_block *qb,
               return -1;
             }
           }
-          // Rule (E2): a derived build side gets a domain filter from the
-          // probe side — the sub-block aggregates only the keys that can
-          // actually join (sideways information passing on the mapped plan).
-          if (jn->build_keys_size() > 0 &&
-              req.nodes(build).has_sub_block()) {
-            auto *sub = req.mutable_nodes(build)->mutable_sub_block();
-            if (!sub->has_semi()) {
-              const auto &bk0 = jn->build_keys(0);
-              const auto &pk0 = jn->probe_keys(0);
-              const auto &sreq = sub->block();
-              const uint32_t ordinal = bk0.column();
-              if (ordinal < static_cast<uint32_t>(sreq.output_size()) &&
-                  sreq.output(ordinal).source() ==
-                      LineairDB::Protocol::QbOutputExpr::GROUP &&
-                  sreq.nodes_size() > 0 &&
-                  sreq.nodes(sreq.nodes_size() - 1).has_aggregate()) {
-                const auto &sagg =
-                    sreq.nodes(sreq.nodes_size() - 1).aggregate();
-                const uint32_t g = sreq.output(ordinal).ordinal();
-                if (g < static_cast<uint32_t>(
-                            sagg.group_columns_size()) &&
-                    sagg.group_columns(g).prefix_len() == 0) {
-                  auto *sm = sub->mutable_semi();
-                  sm->set_source_node(probe);
-                  auto *sc = sm->mutable_source_column();
-                  sc->set_table_idx(pk0.table_idx());
-                  sc->set_column(pk0.column());
-                  sub->set_target_table(sagg.group_columns(g).table_idx());
-                  sub->set_target_column(sagg.group_columns(g).column());
-                }
-              }
-            }
-          }
           std::set<int> united = node_tabs[probe];
           if (jt == LineairDB::Protocol::QbJoin::INNER ||
               jt == LineairDB::Protocol::QbJoin::LEFT)
@@ -1798,6 +1780,72 @@ bool build_block(THD *thd, Query_block *qb,
     };
     current_node = map_path(plan);
     if (current_node < 0) return false;
+
+    // Rule (E2/E4): each derived sub-block aggregates only the key domain
+    // that can actually join. Collect, from every mapped join, the real
+    // columns equi-joined with the sub-block's group output, and inject
+    // the most selective scan's key set (sideways information passing).
+    for (int ni = 0; ni < req.nodes_size(); ++ni) {
+      if (!req.nodes(ni).has_sub_block()) continue;
+      // Which virtual table is this node?
+      int vt = -1;
+      for (size_t t = n_real; t < n_tabs; ++t)
+        if (scan_node_of[t] == ni) vt = static_cast<int>(t);
+      if (vt < 0) continue;
+      int best_tab = -1;
+      uint32_t best_src_col = 0;
+      uint32_t derived_ordinal = 0;
+      for (int j = 0; j < req.nodes_size(); ++j) {
+        if (!req.nodes(j).has_join()) continue;
+        const auto &jn = req.nodes(j).join();
+        for (int k = 0; k < jn.build_keys_size(); ++k) {
+          const auto &bk = jn.build_keys(k);
+          const auto &pk = jn.probe_keys(k);
+          uint32_t vcol = 0;
+          uint32_t oti = 0, ocol = 0;
+          if (bk.table_idx() == static_cast<uint32_t>(vt)) {
+            vcol = bk.column();
+            oti = pk.table_idx();
+            ocol = pk.column();
+          } else if (pk.table_idx() == static_cast<uint32_t>(vt)) {
+            vcol = pk.column();
+            oti = bk.table_idx();
+            ocol = bk.column();
+          } else {
+            continue;
+          }
+          if (oti >= n_real) continue;  // real-table sources only
+          if (best_tab < 0 ||
+              tabs[oti].records < tabs[best_tab].records) {
+            best_tab = static_cast<int>(oti);
+            derived_ordinal = vcol;
+            best_src_col = ocol;
+          }
+        }
+      }
+      if (best_tab < 0) continue;
+      const uint32_t src_col = best_src_col;
+      auto *sub = req.mutable_nodes(ni)->mutable_sub_block();
+      const auto &sreq = sub->block();
+      if (derived_ordinal >= static_cast<uint32_t>(sreq.output_size()) ||
+          sreq.output(derived_ordinal).source() !=
+              LineairDB::Protocol::QbOutputExpr::GROUP ||
+          sreq.nodes_size() == 0 ||
+          !sreq.nodes(sreq.nodes_size() - 1).has_aggregate())
+        continue;
+      const auto &sagg = sreq.nodes(sreq.nodes_size() - 1).aggregate();
+      const uint32_t g = sreq.output(derived_ordinal).ordinal();
+      if (g >= static_cast<uint32_t>(sagg.group_columns_size()) ||
+          sagg.group_columns(g).prefix_len() != 0)
+        continue;
+      auto *sm = sub->mutable_semi();
+      sm->set_source_node(scan_node_of[best_tab]);
+      auto *sc = sm->mutable_source_column();
+      sc->set_table_idx(best_tab);
+      sc->set_column(src_col);
+      sub->set_target_table(sagg.group_columns(g).table_idx());
+      sub->set_target_column(sagg.group_columns(g).column());
+    }
   } else {
   // Node issue order follows the optimizer's cardinality estimates: the
   // most selective tables execute first, and each later scan/sub-block
@@ -2936,9 +2984,10 @@ static bool ModifyAccessPathCost(THD *thd [[maybe_unused]],
           std::max(1.0, path->hash_join().inner->num_output_rows());
       const double probe =
           std::max(1.0, path->hash_join().outer->num_output_rows());
+      const double out_rows = std::max(1.0, path->num_output_rows());
       const double cost = path->hash_join().outer->cost +
                           path->hash_join().inner->cost +
-                          0.05 * (build + probe);
+                          0.05 * (build + probe) + 0.01 * out_rows;
       path->cost = cost;
       path->cost_before_filter = cost;
       path->init_cost = path->hash_join().inner->cost + 0.05 * build;

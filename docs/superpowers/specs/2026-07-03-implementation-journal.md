@@ -89,3 +89,10 @@ secondary 向けコストを注入し、オプティマイザに hash 実行前�
 | E3 コストフック (NLJ/index reject + hash/scan 線形価格) | 22/22 MATCH 維持。q22 431→77ms。**しかし q5 3.96s / q9 0.96s は残存** — プラン順序が変わっていないように見える | 要診断: フックが実際に呼ばれているか (fprintf 確認)、reject 後に hypergraph が代替順序を探索できているか、hash 線形モデルでも M:N 先行が最安と評価されていないか |
 | E2 semi rule on mapped plan | **q17 3.06s — 不発** (D3 構文経路では 95ms) | 要診断: 発火条件 `req.nodes(build).has_sub_block()` は build が MATERIALIZE 直下の場合のみ真。プランで FILTER が sub_block の上に挟まると不発 (有力)。build 側の中間ノードを透過して sub_block を探す必要 |
 | 合計 | 26.6s (D3=21.0s が依然最良) | 正しさは全構成で維持。性能デバッグは E4 として継続 |
+
+### E4 診断 (2026-07-03, SF=1 プランダンプ)
+
+| 対象 | 観測 | 対策 |
+|---|---|---|
+| q17 semi 不発 | プランは (lineitem⋈derived)⋈part — E2 は発火するが semi source が lineitem(6M) で絞り込み効果ゼロ。D3 が速かったのは source=part(20行) だったから。derived の rows=0 見積もりがこの順序を作っている | sub_block の semi source を「join の直接相手」でなく「group キーと equi-join される最小の実表 scan」に。scan を先行発行 (records 昇順) して任意 scan を source にできるノード順を確保 |
+| q5 3.96s | プランの中間 join 見積もりが rows=13.7e9 / 82.5e15 と大破綻。それでも hash 線形コスト (入力行数のみ) では M:N 順が最安評価 | HASH_JOIN コストに出力行数項 (+0.01*output_rows) を追加 — M:N 爆発プランが正しく高コスト化される |
