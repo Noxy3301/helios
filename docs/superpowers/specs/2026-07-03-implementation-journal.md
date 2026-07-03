@@ -284,3 +284,12 @@ q9 1616→**269ms** (歴代最良、E9 の二重補正が真犯人)、q5 216→*
 join 順を自力で当てる (Item_equal の rec_per_key 経路)。
 残: q18 2.41s (集計 hash map — compact GroupState/int64 キーが未着手の最終
 レバー)、q21 1.35s、q4 697ms、q20 757ms。
+
+### E12: compact GroupState (2026-07-03)
+
+集計の GroupState を「フィールドごとに 1 vector (計 5 本)」から「aggregate
+ごとに 1 スロット (AggSlot: count/acc/sval/has/dset を連続配置) の 1 vector」
+に変更 — 群あたりのヒープ確保 7→3 ブロック + 局所性改善。
+結果 (SF=1, 全 md5 MATCH): **q18 2413→1903ms (-21%)**、q13 441ms、q20 655ms。
+**合計 8.04s = InnoDB champion 42.2s の 5.2 倍。本日: 24.6s → 8.04s (3.1 倍)**。
+残: q18 1.9s (次は int64 キー特化 or radix 並列マージ)、q21 1.29s、q4 694ms。

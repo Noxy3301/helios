@@ -877,15 +877,21 @@ struct Executor {
     }
 
     // ----- Aggregate + output ---------------------------------------------
+    // One contiguous slot per aggregate: the previous
+    // one-vector-per-field layout cost five heap blocks per group, which
+    // dominated high-cardinality aggregation (q18: 1.5M groups).
+    struct AggSlot {
+        uint64_t count = 0;
+        Dec acc{};          // SUM/AVG accumulator or MIN/MAX (numeric)
+        std::string sval;   // MIN/MAX (binary string)
+        bool has = false;   // MIN/MAX seen any
+        // COUNT(DISTINCT): distinct value set (small groups at TPC-H
+        // scale; lineage log #16). Empty std::set holds no heap.
+        std::set<std::string> dset;
+    };
     struct GroupState {
         std::vector<std::string> key_cols;
-        std::vector<uint64_t> count;   // per agg
-        std::vector<Dec> acc;          // SUM/AVG accumulator or MIN/MAX (numeric)
-        std::vector<std::string> sval; // MIN/MAX (binary string)
-        std::vector<bool> has;         // MIN/MAX seen any
-        // COUNT(DISTINCT): per-agg distinct value sets (small groups at
-        // TPC-H scale; lineage log #16).
-        std::vector<std::set<std::string>> dset;
+        std::vector<AggSlot> aggs;
     };
     using GroupMap = std::unordered_map<std::string, GroupState>;
 
@@ -939,11 +945,7 @@ struct Executor {
                 st.key_cols.resize(n_grp);
                 for (int g = 0; g < n_grp; ++g)
                     st.key_cols[g] = std::string(gv[g]);
-                st.count.assign(n_agg, 0);
-                st.acc.assign(n_agg, Dec{});
-                st.sval.assign(n_agg, {});
-                st.has.assign(n_agg, false);
-                st.dset.resize(n_agg);
+                st.aggs.resize(n_agg);
                 gs = &groups.emplace(std::move(keybuf), std::move(st))
                           .first->second;
                 keybuf.clear();
@@ -981,10 +983,10 @@ struct Executor {
                                 af.arg_table(), ref,
                                 af.arg().column_index());
                             if (!dv.empty())
-                                gs->dset[a].emplace(dv);
+                                gs->aggs[a].dset.emplace(dv);
                             break;
                         }
-                        gs->count[a] += 1;
+                        gs->aggs[a].count += 1;
                         break;
                     case pb::QbAggFunc::SUM:
                     case pb::QbAggFunc::AVG: {
@@ -997,11 +999,11 @@ struct Executor {
                                              stores[af.arg_table()], ref,
                                              &arith_ctx);
                         if (v.null) break;  // NULL input skipped
-                        if (gs->count[a] == 0)
-                            gs->acc[a] = v;
+                        if (gs->aggs[a].count == 0)
+                            gs->aggs[a].acc = v;
                         else
-                            dec_addsub(gs->acc[a], v, false);
-                        gs->count[a] += 1;
+                            dec_addsub(gs->aggs[a].acc, v, false);
+                        gs->aggs[a].count += 1;
                         break;
                     }
                     case pb::QbAggFunc::MIN:
@@ -1013,11 +1015,11 @@ struct Executor {
                                 af.arg_table(), ref,
                                 af.arg().column_index());
                             if (cv.empty()) break;
-                            if (!gs->has[a] ||
-                                (want_max ? cv > std::string_view(gs->sval[a])
-                                          : cv < std::string_view(gs->sval[a])))
-                                gs->sval[a] = std::string(cv);
-                            gs->has[a] = true;
+                            if (!gs->aggs[a].has ||
+                                (want_max ? cv > std::string_view(gs->aggs[a].sval)
+                                          : cv < std::string_view(gs->aggs[a].sval)))
+                                gs->aggs[a].sval = std::string(cv);
+                            gs->aggs[a].has = true;
                         } else {
                             Dec v = arg_virtual
                                         ? dec_parse(value_of(
@@ -1027,15 +1029,15 @@ struct Executor {
                                                      stores[af.arg_table()],
                                                      ref);
                             if (v.null) break;
-                            if (!gs->has[a]) {
-                                gs->acc[a] = v;
+                            if (!gs->aggs[a].has) {
+                                gs->aggs[a].acc = v;
                             } else {
                                 Dec diff = v;  // diff = v - acc
-                                dec_addsub(diff, gs->acc[a], true);
+                                dec_addsub(diff, gs->aggs[a].acc, true);
                                 if (want_max ? diff.m > 0 : diff.m < 0)
-                                    gs->acc[a] = v;
+                                    gs->aggs[a].acc = v;
                             }
-                            gs->has[a] = true;
+                            gs->aggs[a].has = true;
                         }
                         break;
                     }
@@ -1066,43 +1068,43 @@ struct Executor {
                 switch (agg.aggs(a).kind()) {
                     case pb::QbAggFunc::COUNT:
                         if (agg.aggs(a).distinct()) {
-                            d.dset[a].merge(s.dset[a]);
+                            d.aggs[a].dset.merge(s.aggs[a].dset);
                             break;
                         }
-                        d.count[a] += s.count[a];
+                        d.aggs[a].count += s.aggs[a].count;
                         break;
                     case pb::QbAggFunc::SUM:
                     case pb::QbAggFunc::AVG:
-                        if (s.count[a] > 0) {
-                            if (d.count[a] == 0)
-                                d.acc[a] = s.acc[a];
+                        if (s.aggs[a].count > 0) {
+                            if (d.aggs[a].count == 0)
+                                d.aggs[a].acc = s.aggs[a].acc;
                             else
-                                dec_addsub(d.acc[a], s.acc[a], false);
-                            d.count[a] += s.count[a];
+                                dec_addsub(d.aggs[a].acc, s.aggs[a].acc, false);
+                            d.aggs[a].count += s.aggs[a].count;
                         }
                         break;
                     case pb::QbAggFunc::MIN:
                     case pb::QbAggFunc::MAX: {
-                        if (!s.has[a]) break;
+                        if (!s.aggs[a].has) break;
                         const bool want_max =
                             agg.aggs(a).kind() == pb::QbAggFunc::MAX;
                         if (agg.aggs(a).cmp_kind() == 1) {
-                            if (!d.has[a] ||
-                                (want_max ? s.sval[a] > d.sval[a]
-                                          : s.sval[a] < d.sval[a]))
-                                d.sval[a] = std::move(s.sval[a]);
+                            if (!d.aggs[a].has ||
+                                (want_max ? s.aggs[a].sval > d.aggs[a].sval
+                                          : s.aggs[a].sval < d.aggs[a].sval))
+                                d.aggs[a].sval = std::move(s.aggs[a].sval);
                         } else {
-                            if (!d.has[a]) {
-                                d.acc[a] = s.acc[a];
+                            if (!d.aggs[a].has) {
+                                d.aggs[a].acc = s.aggs[a].acc;
                             } else {
-                                Dec diff = d.acc[a];
-                                dec_addsub(diff, s.acc[a], true);
+                                Dec diff = d.aggs[a].acc;
+                                dec_addsub(diff, s.aggs[a].acc, true);
                                 const bool s_bigger = diff.m < 0;
                                 if (want_max ? s_bigger : diff.m > 0)
-                                    d.acc[a] = s.acc[a];
+                                    d.aggs[a].acc = s.aggs[a].acc;
                             }
                         }
-                        d.has[a] = true;
+                        d.aggs[a].has = true;
                         break;
                     }
                     default:
@@ -1183,10 +1185,10 @@ struct Executor {
         *is_null = false;
         switch (af.kind()) {
             case pb::QbAggFunc::COUNT:
-                return std::to_string(af.distinct() ? gs.dset[a].size()
-                                                    : gs.count[a]);
+                return std::to_string(af.distinct() ? gs.aggs[a].dset.size()
+                                                    : gs.aggs[a].count);
             case pb::QbAggFunc::SUM:
-                if (gs.count[a] == 0) {
+                if (gs.aggs[a].count == 0) {
                     if (af.zero_if_empty()) {
                         Dec z;
                         z.m = 0;
@@ -1197,25 +1199,25 @@ struct Executor {
                     *is_null = true;
                     return {};
                 }
-                return dec_format(gs.acc[a]);
+                return dec_format(gs.aggs[a].acc);
             case pb::QbAggFunc::AVG: {
-                if (gs.count[a] == 0) {
+                if (gs.aggs[a].count == 0) {
                     *is_null = true;
                     return {};
                 }
                 const int out_scale =
                     static_cast<int>(af.arg_scale()) + 4;
                 return dec_format(
-                    dec_divide(gs.acc[a], gs.count[a], out_scale));
+                    dec_divide(gs.aggs[a].acc, gs.aggs[a].count, out_scale));
             }
             case pb::QbAggFunc::MIN:
             case pb::QbAggFunc::MAX:
-                if (!gs.has[a]) {
+                if (!gs.aggs[a].has) {
                     *is_null = true;
                     return {};
                 }
-                return af.cmp_kind() == 1 ? gs.sval[a]
-                                          : dec_format(gs.acc[a]);
+                return af.cmp_kind() == 1 ? gs.aggs[a].sval
+                                          : dec_format(gs.aggs[a].acc);
             default:
                 *is_null = true;
                 return {};
@@ -1347,11 +1349,7 @@ struct Executor {
         // Implicit grouping emits one row over zero input.
         if (n_grp == 0 && groups.empty()) {
             GroupState st;
-            st.count.assign(agg.aggs_size(), 0);
-            st.acc.assign(agg.aggs_size(), Dec{});
-            st.sval.assign(agg.aggs_size(), {});
-            st.has.assign(agg.aggs_size(), false);
-            st.dset.resize(agg.aggs_size());
+            st.aggs.resize(agg.aggs_size());
             groups.emplace(std::string(), std::move(st));
         }
 
