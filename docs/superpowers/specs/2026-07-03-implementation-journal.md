@@ -967,3 +967,92 @@ M3b が radix 並列化で q18/q20 を SF=5 で −40/−45%・SF=1 で −35/�
 バイト一致。TPC-C は不要 (集計は OLAP-only 経路・書込パス無変更)。次の本丸は
 **型付きセルのストレージ形式化** (scatter 経路 = OLTP 接触の大工事、SIMD スパイクの
 「型付けは効く」の受け皿・per-query build/shadow 不要化)。
+
+## F5: 自律最適化フェーズ (2026-07-04, goal=論文/OSS/perf/RPCトレース駆動でTPC-H/TPC-C両面をさらに削る)
+
+### 計測基盤の再確立と発見 (フェーズA/B)
+
+- baseline 再現: SF=1 FORCED 4.88s (md5 全一致、RSS 6.35GB でクエリ中増分 7MB=中間表現健全)。
+- **罠発見: `use_secondary_engine` は SESSION 専用変数** — 歴代スクリプトの `SET GLOBAL use_secondary_engine=FORCED` は ERROR 1228 で黙って失敗しており、実測は「ON (自動振り分け)」だった。SF=1 ではコスト閾値超えで 22 本全てオフロードされるため歴代数値は有効 (md5 が secondary 系列と一致)。SF=0.01 の floor 測定だけが primary prefetch 経路を測っていた (resp 9.2MB@q18 の over-transfer シグネチャで発覚)。以降の floor 測定は per-query の `SET SESSION` で実施。
+- **固定床 ≈ 17-20ms/query** (q2 min 17.0ms @SF=1; SESSION FORCED @SF=0.01 でも wall 22-47ms)。22 本で ~370ms = 全体の 7.6%。mysqld 側 perf: `HashJoinChunk` move ctor 4.3% + page fault 1.8% が `Query_expression::optimize` → `CreateIteratorFromAccessPath` 配下 — **使われない primary 用 iterator 構築**が床の主成分の一つ (join_buffer_size=1GB でチャンク配列がスケール)。`THD::send_result_set_row` 5.95% は正当な結果送出。
+- **columnar RPC (TX_EXECUTE_QUERY_BLOCK) は TxRpcTrace に乗らない** (current_trace_ は行エンジン tx 紐付け、FORCED の autocommit SELECT はトレース行ゼロ)。
+- server 側 perf (hot-6): q4/q10/q21/q20 は行単位 FilterExpr 解釈 (`RunScan` lambda + `set_row_from_pax_cols` + `extract_value` + `evaluate`) が 20-51%。q19 は結合後 tuple filter 31% + **`format_typed_view`+`dec_format` 12%** (typed→ASCII→再パース往復が濾過ホットパスに居た)。q18 は `unordered_map<int64,GroupState>::find` 12.3% + マージ 9.4%。
+- **TPC-C トレース (ENABLE_RPC_TRACE=1, 1t)**: NewOrder/Payment は 2 RPC/tx (READ_PLAN+VALIDATE_AND_COMMIT)、RPC 時間 p50 255/149µs vs tx wall p50 3.56/0.99ms — **レイテンシの ~90% は mysqld 側**。分散化の税は既に最小。**StockLevel 系で over-prefetch 実証**: READ_PLAN resp 94KB/tx (order_line ~215 行 + stock ~215 行を全列転送; 必要は s_i_id/s_quantity 程度) → prefetch read plan への射影プッシュダウンが TPC-C 転送量レバー。64t は TP 5073 vs GP 1197 (リトライ 77%) — GP はホット warehouse の OCC 競合律速。
+
+### SOTA 調査ワークフロー (5 系統 50 候補 → 統合ランキング)
+
+exec-engine / disagg-HTAP / oltp-latency / mysql-floor / query-shape の 5 並列調査 → 統合。
+TPC-H 上位: (1) dense-key bitmap/array プローブ (LIP 系 SIP、S 工数)、(2) クラスタ run ストリーミング集計 (PG AGG_SORTED 系、S)、(3) NUMA morsel (要実測)、(4) q21 witness summaries (Moerkotte-Neumann groupjoin 系譜)、(5) per-strip live counter で all-visible 密スキャン、(7) POD 集計状態+dense tier、(8) 並列 second-stage+Top-N ヒープ、(9) q19 OR factoring (proxy 書き換え)、(13) 辞書 (L, OLTP 接触)、(16) selection-vector 実行 (XL, 基盤)。
+TPC-C 上位: (1) RPC trace 拡張で abort 帰属 (計測が先)、(2) backoff+jitter (Cicada 系)、(3) server-side prepared statements (bench 設定 1 行)、(4) Payment W_YTD/D_YTD の可換 delta 書き込みプッシュダウン (escrow 系)、(5) UDS+spin recv 輸送削減。
+Rejected: FaRM 型 one-sided read 領域 (= 2nd copy、制約 b 違反)。
+
+### F5-1: typed views (tuple filter / join residual の ASCII 往復排除) — コミット対象
+
+predicate_evaluator に `set_row_from_views_typed(cells,nulls,kinds,scales)` を追加、
+extract_value の typed デコードブロック (M2 実証済み) の kind/scale ソースを schema_ または per-column 配列に一般化。eval_tuple_filter / RunJoin residual_ok は key_view (typed→canonical ASCII 整形) をやめ raw cell + kind/scale を渡す。UNTYPED/virtual は従来通り。
+NULL 順序も同一 (col.empty() チェックが typed ブロックより先 = 旧 key_view の v.empty() passthrough と一致)。
+効果: q19 343→286ms (-17%, 単独計測)。
+
+### F5-2: FlatGroupMap (int64/Int2Key 集計の open-addressing 化) — コミット対象
+
+IntGroupMap/Int2GroupMap を DuckDB GroupedAggregateHashTable 形の index-map に置換:
+pow2 の 16B {hash|1, payload_idx} プローブ表 (linear probing, load≤0.625) + 密 payload
+vector<pair<K,GroupState>> + dead tombstone。erase は HAVING のみ (全 insert 後) なので
+tombstone で probe chain 不変。明示 move (mask_/dead_n_ リセット)。群あたりの map node
+malloc 消滅、HAVING/emit は密走査化。iteration 順は挿入順に変わるが下流は ORDER BY
+か順序無関係 (join/second-stage)。
+ゲート: SF=0.01 22/22 + M2 敵対 16/16 + 回帰 3/3 (×2 回、move 修正後再ゲート含む)。
+
+**SF=1 (F5-1+F5-2, label PAX-SE-F5c2-sf1): 4.89 → 4.64s、md5 全一致、RSS 増分なし**
+q18 973→878 (-95) / q19 340→273 (-67) / q20 354→295 (-59) / q21 680→624 (-56) / q13 -15。
+
+### F5-3 (検証中): run-cache + dense bitmap プローブ
+
+- AccumulateRangeT の int/int2 経路に last-key キャッシュ (クラスタ run tier1、SOTA #2):
+  lineitem は l_orderkey クラスタ (run 長 ~4) → 連続同キー行の find/emplace をスキップ。
+  同キー→同 radix partition (part_of は純関数) + キャッシュは毎 lookup 後に更新なので
+  dangling しない。
+- RunScan の semi/ext int プローブに exact bitmap (SOTA #1, LIP 系): キー集合の [min,max]
+  span ≤ 2^28 bits (32MB) なら bitset を構築し range check + bit test で membership。
+  span 超過は従来 hash set にフォールバック。
+
+### F5-3/4 の計測と修正 (dual review + perf 攻防)
+
+- SF=1 c3 (run-cache+bitmap 無ゲート): **q18 回帰 {1016,1112,1113} vs c2 {878,941,1022}、q10 +25ms**。
+  perf: bitmap シンボルは目立たないが q10 は int-group 経路を通らない (7 列 string group) =
+  接点は bitmap のみ → **疎セットで bitmap が負ける**と断定。q18/q10 のセミ集合は前段
+  フィルタ済みで疎 (57 キー/span 6M, fill 0.001%): L1 常駐の 57 エントリ hash set を
+  L2 サイズ 750KB のランダム bit probe に置換して損。**調査候補 #1 の想定 (dense キー)
+  と我々のセミ集合 (選択済み=疎) の食い違い**が教訓。
+- **密度ゲート**: fill ≥ 1/64 のときだけ bitmap 構築 (SF≥10 の 4M キー崖対策の価値は温存)。
+  c4 で q18 877ms に回復、TOTAL 4.62s。run-cache は SF=1 では中立 (メモリ律速; SF=5 期待)。
+- perf 新顔: `vector<pair<long,GroupState>>` realloc move 3.55% + `clear_page_erms` 2.1%
+  (FlatGroupMap payload 倍々成長で 100MB 級 memmove+ページゼロ化) → **次の改善=payload の
+  80KB ブロックチャンク化** (realloc 移動ゼロ + glibc アリーナ再利用で mmap/ゼロ化回避)。
+
+### F5 dual review (Claude reviewer + Codex one-shot) — 指摘と対応
+
+- **F1/Codex CONFIRMED: OP_IN の fmtbuf 4 枠ローテーション**で、typed 列×compare_type==3 の
+  IN 項目が 4 つ以上あると左辺 val.s の背後 string が再代入され dangling/自己比較。
+  TPC-H 到達不能 (IN リストは定数) だが views 経路拡大で露出増 → **修正: OP_IN で左辺
+  STRING val を local pin (vpin)**。
+- **S1: パーティションと probe 表の hash 下位ビット相関** — part_of_i64 = mix64(k)%P (P=2^5)
+  と hv = mix64(k)|1 が同じ mix を共有 → 1 パーティション内の全キーが下位 5bit 同一で
+  probe 開始スロットが P 間隔にクラスタ (レビュー実測 avg probe 6.72 vs 1.41)。
+  **修正: hv = mix64(HashF(k))|1 の二重 mix で無相関化**。
+- **F2 再評価: LIKE-on-DECIMAL の views 経路変化は「無し」** — 旧 views 経路も ct=2 で
+  DOUBLE Val 化して include-row fallback に落ちていた (M2 以前からの全経路潜在乖離)。
+  ただし include-row はこの executor では最終結果 = 行エンジンと乖離し得る **既存バグ** →
+  **proxy 硬化: serialize_item の LIKE で非 STRING_RESULT フィールドを reject** (temporal は
+  STRING_RESULT なので既存 DATE-LIKE 経路は無傷)。
+- **Codex POSSIBLE: GROUP BY + LIMIT (ORDER BY 無し)** を proxy が受理 — 順序不定 SQL で
+  行エンジンとも旧 map 順とも一致し得ない (map 反復順は実装詳細) → **proxy 硬化: 4 箇所の
+  LIMIT シリアライズ全てで ORDER BY 無し LIMIT を loud reject**。
+- レビュー確認済み ✓: KeyBitmap 境界 (負キー/wrap/パディング語)、run-cache のポインタ安定性
+  論証、tombstone が probe chain を壊さない (erase は HAVING のみ=全 insert 後)、
+  explicit move の mask_/dead_n_ リセット、vkinds_ の setter 間クリア、kinds/scales の
+  ordinal 整合。
+- 未対応 (記録のみ): S2 uint32 payload idx の 2^32 崖 (今日は到達不能)、S3 run-cache 不変量が
+  コメント頼み (debug 世代カウンタ案)、ゲート提案「>1M int group + HAVING 半減の
+  オフロード可能マイクロテスト」(FlatGroupMap の rehash/tombstone を SF=0.01 ゲートが
+  ほぼ運動させない穴)。
