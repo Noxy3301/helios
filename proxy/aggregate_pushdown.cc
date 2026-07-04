@@ -11,6 +11,15 @@
 
 // Handler-side bridge used by the aggregate pushdown executor.
 
+extern handlerton *lineairdb_hton;
+
+/**
+ * @brief Expose the engine-pushdown hook to MySQL's optimizer.
+ */
+const handlerton *ha_lineairdb::hton_supporting_engine_pushdown() {
+  return lineairdb_hton;
+}
+
 /**
  * @brief Attach an aggregate spec and its server-side WHERE filter to the tx.
  *

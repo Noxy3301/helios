@@ -914,13 +914,6 @@ static int lineairdb_push_to_engine(THD *thd, AccessPath *root_path,
   return 0;
 }
 
-/**
- * @brief Expose the engine-pushdown hook to MySQL's optimizer.
- */
-const handlerton *ha_lineairdb::hton_supporting_engine_pushdown() {
-  return lineairdb_hton;
-}
-
 static int lineairdb_init_func(void *p) {
   DBUG_TRACE;
 
