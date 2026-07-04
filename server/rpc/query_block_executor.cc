@@ -1418,13 +1418,87 @@ struct Executor {
             }
         }
 
+        // Witness summaries (F5, Moerkotte/Neumann groupjoin lineage): a
+        // SEMI/ANTI join whose entire residual is one integer `a <> b`
+        // between a build column and a probe column only needs, per key,
+        // whether ANY build row's value differs from the probe value —
+        // which {count, min, max} answers exactly: exists differing value
+        // <=> count>0 && !(min==max==probe_value). Replaces the per-key
+        // build-row vectors AND the per-candidate evaluator walk with one
+        // integer test (q21: l2/l3 self-joins on l_orderkey with
+        // l_suppkey <> l1.l_suppkey). NULL semantics match the generic
+        // path: a NULL build value never satisfies `<>` (excluded from the
+        // summary), a NULL probe value satisfies nothing (matched=false).
+        // Gated to typed INT columns compared as signed ints (ct==0), where
+        // the evaluator's compare is exactly int64 inequality.
+        struct Wit {
+            uint32_t cnt = 0;
+            int64_t mn = 0, mx = 0;
+        };
+        std::unordered_map<int64_t, Wit> iwit;
+        int wit_b = -1, wit_p = -1;  // residual_cols ordinals per side
+        bool witness = false;
+        if ((join.type() == pb::QbJoin::SEMI ||
+             join.type() == pb::QbJoin::ANTI) &&
+            has_residual && bk.size() == 1) {
+            const auto& e = join.residual().pred().expr();
+            if (e.op() == pb::FilterExpr::OP_NE && e.children_size() == 2 &&
+                e.children(0).op() == pb::FilterExpr::COLUMN_REF &&
+                e.children(1).op() == pb::FilterExpr::COLUMN_REF &&
+                e.children(0).compare_type() == 0 &&
+                e.children(1).compare_type() == 0) {
+                const uint32_t o0 = e.children(0).column_index();
+                const uint32_t o1 = e.children(1).column_index();
+                if (o0 < residual_cols.size() && o1 < residual_cols.size() &&
+                    residual_cols[o0].from_build !=
+                        residual_cols[o1].from_build) {
+                    wit_b = residual_cols[o0].from_build ? o0 : o1;
+                    wit_p = residual_cols[o0].from_build ? o1 : o0;
+                    const uint8_t kb =
+                        column_kind(residual_cols[wit_b].table_idx,
+                                    residual_cols[wit_b].column);
+                    const uint8_t kp =
+                        column_kind(residual_cols[wit_p].table_idx,
+                                    residual_cols[wit_p].column);
+                    witness = (kb == fk::FK_INT32 || kb == fk::FK_INT64) &&
+                              (kp == fk::FK_INT32 || kp == fk::FK_INT64);
+                }
+            }
+        }
+
         // Build hash table: key bytes -> build row indexes. Single-column
         // INT keys switch to an int64 table (E13); one non-converting key
         // falls back to byte keys, so match semantics are unchanged.
         std::unordered_map<std::string, std::vector<uint32_t>> ht;
         std::unordered_map<int64_t, std::vector<uint32_t>> iht;
         bool int_join = bk.size() == 1;
-        if (int_join) {
+        if (int_join && witness) {
+            iwit.reserve(build.rows());
+            for (size_t r = 0; r < build.rows(); ++r) {
+                int64_t v;
+                if (!read_i64(bk[0].table_idx, build.refs[bk[0].pos][r],
+                              bk[0].column, &v)) {
+                    int_join = false;
+                    witness = false;
+                    iwit.clear();
+                    break;
+                }
+                int64_t wv;
+                const auto& rc = residual_cols[wit_b];
+                if (!read_i64(rc.table_idx, build.refs[rc.pos][r], rc.column,
+                              &wv))
+                    continue;  // NULL witness value never satisfies `<>`
+                Wit& w = iwit[v];
+                if (w.cnt == 0) {
+                    w.mn = w.mx = wv;
+                } else {
+                    w.mn = std::min(w.mn, wv);
+                    w.mx = std::max(w.mx, wv);
+                }
+                ++w.cnt;
+            }
+        }
+        if (int_join && !witness) {
             iht.reserve(build.rows());
             for (size_t r = 0; r < build.rows(); ++r) {
                 int64_t v;
@@ -1520,6 +1594,32 @@ struct Executor {
                 const size_t begin = n * w / wc;
                 const size_t end = n * (w + 1) / wc;
                 for (size_t r = begin; r < end; ++r) {
+                    if (witness) {
+                        // Summary probe: one map find + one integer test
+                        // replaces the candidate walk (semantics proof at
+                        // the Wit declaration).
+                        bool wmatched = false;
+                        int64_t v;
+                        if (read_i64(pk[0].table_idx,
+                                     probe.refs[pk[0].pos][r], pk[0].column,
+                                     &v)) {
+                            const auto wit = iwit.find(v);
+                            if (wit != iwit.end() && wit->second.cnt > 0) {
+                                const auto& rc = residual_cols[wit_p];
+                                int64_t pv;
+                                if (read_i64(rc.table_idx,
+                                             probe.refs[rc.pos][r], rc.column,
+                                             &pv))
+                                    wmatched = !(wit->second.mn == pv &&
+                                                 wit->second.mx == pv);
+                            }
+                        }
+                        if (join.type() == pb::QbJoin::SEMI ? wmatched
+                                                            : !wmatched)
+                            for (size_t c = 0; c < probe.tables.size(); ++c)
+                                mine[c].push_back(probe.refs[c][r]);
+                        continue;
+                    }
                     const std::vector<uint32_t>* mrows = nullptr;
                     if (int_join) {
                         int64_t v;
@@ -1693,6 +1793,13 @@ struct Executor {
         using key_type = K;
         using value_type = std::pair<K, GroupState>;
 
+        // Payload is one dense vector. A blocked layout (1024-entry chunks,
+        // zero growth moves) was tried and REVERTED: the extra dependent
+        // block-pointer load on every payload access (find hits, merge,
+        // HAVING, emit) cost q18 ~100ms — more than the ~55ms the avoided
+        // realloc moves and page zeroing saved. Callers that know their row
+        // count instead pre-size via reserve_payload (virtual memory only;
+        // untouched pages never materialize).
         std::vector<value_type> payload_;
         std::vector<uint8_t> dead_;  // parallel to payload_
         struct Ent {
@@ -1704,7 +1811,7 @@ struct Executor {
         size_t dead_n_ = 0;
 
         FlatGroupMap() = default;
-        // Explicit moves: the defaults would leave the source's mask_/dead_n_
+        // Explicit moves: the defaults would leave the source's scalars
         // behind, making a moved-from map (MergeGroups dst=move(src)) report
         // empty()==false with zero payload.
         FlatGroupMap(FlatGroupMap&& o) noexcept
@@ -1782,6 +1889,14 @@ struct Executor {
         }
         void reserve(size_t n) {
             if (n * 16 > table_.size() * 10) rehash(n);
+            payload_.reserve(n);
+            dead_.reserve(n);
+        }
+        // Payload-only pre-size: kills growth moves without inflating the
+        // probe table (an upper bound like the caller's row count would make
+        // the table 4x+ oversized and hurt probe locality; virtual memory
+        // for the vector is free until touched).
+        void reserve_payload(size_t n) {
             payload_.reserve(n);
             dead_.reserve(n);
         }
@@ -1917,6 +2032,14 @@ struct Executor {
         std::string aggbuf;  // typed -> canonical ASCII (agg arg values)
         [[maybe_unused]] std::vector<std::string_view> gv(n_grp);
         [[maybe_unused]] std::vector<std::string> gbufs(n_grp);
+        // Pre-size flat-map payloads to this worker's row share (upper
+        // bound; duplicates make it an over-estimate, but reserve is
+        // virtual-only until touched). Kills payload growth moves without
+        // touching the probe-table sizing.
+        if constexpr (IntKey || Int2) {
+            const size_t hint = (end - begin) / parts.size() + 16;
+            for (auto& m : parts) m.reserve_payload(hint);
+        }
         // Run cache (F5, clustered-run streaming aggregation tier 1): rows
         // arrive in physical order and lineitem is clustered by l_orderkey
         // (run length ~4 at TPC-H scale), so consecutive rows usually hit the
