@@ -1892,14 +1892,11 @@ struct Executor {
             payload_.reserve(n);
             dead_.reserve(n);
         }
-        // Payload-only pre-size: kills growth moves without inflating the
-        // probe table (an upper bound like the caller's row count would make
-        // the table 4x+ oversized and hurt probe locality; virtual memory
-        // for the vector is free until touched).
-        void reserve_payload(size_t n) {
-            payload_.reserve(n);
-            dead_.reserve(n);
-        }
+        // NOTE(F5): a payload-only pre-size from the caller's row share was
+        // tried and REVERTED — at SF=5 the 1024 per-worker-per-partition
+        // reservations (2.3MB each, mostly untouched) turned into mmap/
+        // munmap churn and lock contention that cost q18 +336ms, far more
+        // than the growth moves saved. Geometric growth stays.
         iterator find(const K& k) {
             if (table_.empty()) return end();
             const uint64_t h = hv(k);
@@ -2032,14 +2029,6 @@ struct Executor {
         std::string aggbuf;  // typed -> canonical ASCII (agg arg values)
         [[maybe_unused]] std::vector<std::string_view> gv(n_grp);
         [[maybe_unused]] std::vector<std::string> gbufs(n_grp);
-        // Pre-size flat-map payloads to this worker's row share (upper
-        // bound; duplicates make it an over-estimate, but reserve is
-        // virtual-only until touched). Kills payload growth moves without
-        // touching the probe-table sizing.
-        if constexpr (IntKey || Int2) {
-            const size_t hint = (end - begin) / parts.size() + 16;
-            for (auto& m : parts) m.reserve_payload(hint);
-        }
         // Run cache (F5, clustered-run streaming aggregation tier 1): rows
         // arrive in physical order and lineitem is clustered by l_orderkey
         // (run length ~4 at TPC-H scale), so consecutive rows usually hit the
@@ -2673,70 +2662,130 @@ struct Executor {
 
         std::vector<OutRow> rows;
         if (agg.has_second()) {
-            // Second-stage re-aggregation (q13 shape): re-group stage-1 values
-            // and COUNT(*) per group. Inherently single-threaded — it folds
-            // every group (across all partitions) into one shared `second` map.
+            // Second-stage re-aggregation (q13 shape): re-group stage-1
+            // values and COUNT(*) per group. Parallel since F5: stage-1
+            // partitions hold disjoint groups, so each is folded into a
+            // radix fan-out of partial second maps (part_of_str on the
+            // composite value key), and the np2 second partitions merge and
+            // emit concurrently — the same M3b pattern as stage 1. Ordinal
+            // validation is hoisted (data-independent) so workers have no
+            // failure path. ensure_keys mutates only this partition's
+            // groups (disjoint; reentrant per M3a).
             if (!agg.second().count_star())
                 return fail("second stage must count");
-            std::unordered_map<std::string, uint64_t> second;
-            std::string key;
-            for (auto& part : parts) {
-              for (auto& kv : part) {
-                GroupState& gs = kv.second;
-                key.clear();
-                for (uint32_t ord : agg.second().group_value_ordinals()) {
-                    std::string v;
-                    bool is_null = false;
-                    if (ord < static_cast<uint32_t>(n_grp)) {
-                        ensure_keys(gs);
-                        v = gs.key_cols[ord];
-                    } else {
-                        const int a = static_cast<int>(ord) - n_grp;
-                        if (a >= agg.aggs_size())
-                            return fail("second stage ordinal");
-                        v = AggValue(agg.aggs(a), gs, a, &is_null);
-                    }
-                    const uint32_t l = static_cast<uint32_t>(v.size());
-                    key.append(reinterpret_cast<const char*>(&l), sizeof(l));
-                    key.append(v);
+            for (uint32_t ord : agg.second().group_value_ordinals())
+                if (ord >= static_cast<uint32_t>(n_grp) &&
+                    static_cast<int>(ord) - n_grp >= agg.aggs_size())
+                    return fail("second stage ordinal");
+            for (const auto& oe : req.output()) {
+                if (oe.source() == pb::QbOutputExpr::GROUP) {
+                    if (oe.ordinal() >= static_cast<uint32_t>(
+                                            agg.second()
+                                                .group_value_ordinals_size()))
+                        return fail("second output ordinal");
+                } else if (oe.source() != pb::QbOutputExpr::AGG) {
+                    return fail("second output source");
                 }
-                second.emplace(key, 0).first->second += 1;
-              }
             }
-            rows.reserve(second.size());
-            for (auto& kv : second) {
-                // Re-split the composite key back into values.
-                OutRow row;
-                std::vector<std::string> gvals;
-                {
-                    const std::string& k = kv.first;
-                    size_t off = 0;
-                    while (off + 4 <= k.size()) {
-                        uint32_t l;
-                        std::memcpy(&l, k.data() + off, 4);
-                        off += 4;
-                        gvals.emplace_back(k.data() + off, l);
-                        off += l;
+            using SecondMap = std::unordered_map<std::string, uint64_t>;
+            const unsigned np2 = np;
+            // [stage1 partition][second partition] partial counts.
+            std::vector<std::vector<SecondMap>> sl(
+                np, std::vector<SecondMap>(np2));
+            auto fold_part = [&](unsigned p) {
+                std::string key;
+                for (auto& kv : parts[p]) {
+                    GroupState& gs = kv.second;
+                    key.clear();
+                    for (uint32_t ord : agg.second().group_value_ordinals()) {
+                        std::string v;
+                        bool is_null = false;
+                        if (ord < static_cast<uint32_t>(n_grp)) {
+                            ensure_keys(gs);
+                            v = gs.key_cols[ord];
+                        } else {
+                            const int a = static_cast<int>(ord) - n_grp;
+                            v = AggValue(agg.aggs(a), gs, a, &is_null);
+                        }
+                        const uint32_t l = static_cast<uint32_t>(v.size());
+                        key.append(reinterpret_cast<const char*>(&l),
+                                   sizeof(l));
+                        key.append(v);
                     }
+                    sl[p][np2 == 1 ? 0 : part_of_str(key, np2)]
+                        .emplace(key, 0)
+                        .first->second += 1;
                 }
-                for (const auto& oe : req.output()) {
-                    switch (oe.source()) {
-                        case pb::QbOutputExpr::GROUP:
-                            if (oe.ordinal() >= gvals.size())
-                                return fail("second output ordinal");
-                            row.vals.push_back(gvals[oe.ordinal()]);
+            };
+            // Merge second partition s across stage-1 partials, then emit
+            // its rows (order within/across partitions is arbitrary — the
+            // final result is ORDER BY-sorted or order-free, same contract
+            // as the stage-1 emit concatenation).
+            std::vector<std::vector<OutRow>> prows(np2);
+            auto emit_second = [&](unsigned s) {
+                SecondMap merged;
+                for (unsigned p = 0; p < np; ++p) {
+                    if (merged.empty()) {
+                        merged = std::move(sl[p][s]);
+                        continue;
+                    }
+                    for (auto& kv : sl[p][s])
+                        merged.emplace(kv.first, 0).first->second +=
+                            kv.second;
+                }
+                auto& out = prows[s];
+                out.reserve(merged.size());
+                for (auto& kv : merged) {
+                    // Re-split the composite key back into values.
+                    OutRow row;
+                    std::vector<std::string> gvals;
+                    {
+                        const std::string& k = kv.first;
+                        size_t off = 0;
+                        while (off + 4 <= k.size()) {
+                            uint32_t l;
+                            std::memcpy(&l, k.data() + off, 4);
+                            off += 4;
+                            gvals.emplace_back(k.data() + off, l);
+                            off += l;
+                        }
+                    }
+                    for (const auto& oe : req.output()) {
+                        if (oe.source() == pb::QbOutputExpr::GROUP) {
+                            row.vals.push_back(
+                                oe.ordinal() < gvals.size()
+                                    ? gvals[oe.ordinal()]
+                                    : std::string());
                             row.nulls.push_back(false);
-                            break;
-                        case pb::QbOutputExpr::AGG:
+                        } else {  // AGG (validated above)
                             row.vals.push_back(std::to_string(kv.second));
                             row.nulls.push_back(false);
-                            break;
-                        default:
-                            return fail("second output source");
+                        }
                     }
+                    out.push_back(std::move(row));
                 }
-                rows.push_back(std::move(row));
+            };
+            if (np <= 1) {
+                fold_part(0);
+                emit_second(0);
+            } else {
+                std::vector<std::thread> pool;
+                pool.reserve(np);
+                for (unsigned p = 0; p < np; ++p) {
+                    if (parts[p].empty()) continue;
+                    pool.emplace_back([&, p] { fold_part(p); });
+                }
+                for (auto& t : pool) t.join();
+                pool.clear();
+                for (unsigned s = 0; s < np2; ++s)
+                    pool.emplace_back([&, s] { emit_second(s); });
+                for (auto& t : pool) t.join();
             }
+            size_t tot = 0;
+            for (auto& pr : prows) tot += pr.size();
+            rows.reserve(tot);
+            for (auto& pr : prows)
+                for (auto& r : pr) rows.push_back(std::move(r));
         } else {
             // Normal output: build each partition's rows independently, then
             // concatenate in partition order (M3b). Ordinals were validated
