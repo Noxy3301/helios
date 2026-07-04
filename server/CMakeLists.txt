@@ -50,6 +50,8 @@ set(SOURCES
     # RPC layer
     rpc/lineairdb_rpc.cc
     rpc/lineairdb_rpc.hh
+    rpc/aggregate_executor.cc
+    rpc/aggregate_executor.hh
     rpc/decimal_arith.cc
     rpc/decimal_arith.hh
     rpc/row_codec.cc
