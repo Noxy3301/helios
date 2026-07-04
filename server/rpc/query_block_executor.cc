@@ -982,6 +982,53 @@ struct Executor {
         const int ext_col_scale =
             use_ext ? column_scale(scan.table_idx(), ext_filter_column) : 0;
 
+        // Dense bitmap probes (F5): TPC-H int keys (orderkey/partkey/suppkey)
+        // are dense in [min,max], so an exact bitset answers membership with
+        // one range check + one bit test instead of a hash probe (LIP-style
+        // sideways information passing, exact rather than Bloom). Falls back
+        // to the hash set when the span exceeds the cap (32MB of bits).
+        struct KeyBitmap {
+            std::vector<uint64_t> bits;
+            int64_t base = 0;
+            bool ok = false;
+            void build(const std::unordered_set<int64_t>& s) {
+                if (s.empty()) return;
+                int64_t kmin = INT64_MAX, kmax = INT64_MIN;
+                for (int64_t v : s) {
+                    kmin = std::min(kmin, v);
+                    kmax = std::max(kmax, v);
+                }
+                const uint64_t span =
+                    static_cast<uint64_t>(kmax) - static_cast<uint64_t>(kmin);
+                if (span >= (uint64_t{256} << 20)) return;  // > 2^28 bits
+                // Density gate (F5c3 regression lesson): semi key sets are
+                // usually PRE-FILTERED and sparse (q18: 57 keys over a 6M
+                // span). A sparse bitmap trades an L1-resident hash set for
+                // L2-sized random bit probes and loses (+100ms on q18). Only
+                // build when fill >= 1/64 — where the bitmap is at least as
+                // compact as the set and probe locality wins (and where the
+                // 4M-key SIP cap would otherwise bite at SF>=10).
+                if (span > s.size() * 64) return;
+                bits.assign((span + 64) / 64, 0);
+                base = kmin;
+                for (int64_t v : s) {
+                    const uint64_t o = static_cast<uint64_t>(v) -
+                                       static_cast<uint64_t>(base);
+                    bits[o >> 6] |= uint64_t{1} << (o & 63);
+                }
+                ok = true;
+            }
+            bool test(int64_t v) const {
+                const uint64_t o =
+                    static_cast<uint64_t>(v) - static_cast<uint64_t>(base);
+                return o < bits.size() * 64 &&
+                       (bits[o >> 6] >> (o & 63)) & 1;
+            }
+        };
+        KeyBitmap semi_bm, ext_bm;
+        if (semi_active && semi_int) semi_bm.build(semi_ikeys);
+        if (use_ext && ext_int) ext_bm.build(ext_ikeys);
+
         const bool has_filter =
             scan.has_filter() && scan.filter().has_expr();
         // Fetch only the cells the filter actually references — a wide
@@ -1063,8 +1110,10 @@ struct Executor {
                                 if (semi_int) {
                                     int64_t v;
                                     if (!decode_cell_i64(kv, semi_col_kind,
-                                                         &v) ||
-                                        semi_ikeys.count(v) == 0)
+                                                         &v))
+                                        continue;
+                                    if (semi_bm.ok ? !semi_bm.test(v)
+                                                   : semi_ikeys.count(v) == 0)
                                         continue;
                                 } else {
                                     probe.clear();
@@ -1084,8 +1133,10 @@ struct Executor {
                                 if (ext_int) {
                                     int64_t v;
                                     if (!decode_cell_i64(kv, ext_col_kind,
-                                                         &v) ||
-                                        ext_ikeys.count(v) == 0)
+                                                         &v))
+                                        continue;
+                                    if (ext_bm.ok ? !ext_bm.test(v)
+                                                  : ext_ikeys.count(v) == 0)
                                         continue;
                                 } else {
                                     probe.clear();
@@ -1200,22 +1251,29 @@ struct Executor {
         std::vector<int> pos;            // per filter column: ref column pos
         std::vector<std::string_view> cells;
         std::vector<bool> nulls;
-        // Per-column backing storage for typed cells materialized to canonical
-        // ASCII (the flattened multi-table view is fed to the evaluator, which
-        // expects ASCII, so typed cells are formatted once here).
-        std::vector<std::string> bufs;
+        // Per-column storage kind/scale: raw typed cells go straight to the
+        // evaluator (same decode as the PAX schema_ path), skipping the old
+        // format-to-ASCII/re-parse round trip (perf: q19). Virtual tables are
+        // FK_UNTYPED (canonical ASCII), matching the previous behavior.
+        std::vector<uint8_t> kinds;
+        std::vector<int> scales;
     };
 
     bool prep_tuple_filter(const pb::QbTupleFilter& tf, const NodeResult& nr,
                            TupleFilterCtx* ctx) {
         ctx->pos.resize(tf.columns_size());
+        ctx->kinds.resize(tf.columns_size());
+        ctx->scales.resize(tf.columns_size());
         for (int i = 0; i < tf.columns_size(); ++i) {
             ctx->pos[i] = nr.table_pos(tf.columns(i).table_idx());
             if (ctx->pos[i] < 0) return fail("tuple filter table");
+            ctx->kinds[i] =
+                column_kind(tf.columns(i).table_idx(), tf.columns(i).column());
+            ctx->scales[i] =
+                column_scale(tf.columns(i).table_idx(), tf.columns(i).column());
         }
         ctx->cells.resize(tf.columns_size());
         ctx->nulls.resize(tf.columns_size());
-        ctx->bufs.resize(tf.columns_size());
         return true;
     }
 
@@ -1228,14 +1286,15 @@ struct Executor {
                 ctx->cells[i] = {};
                 ctx->nulls[i] = true;
             } else {
-                ctx->cells[i] = key_view(tf.columns(i).table_idx(), ref,
-                                         tf.columns(i).column(), ctx->bufs[i]);
+                ctx->cells[i] = value_of(tf.columns(i).table_idx(), ref,
+                                         tf.columns(i).column());
                 ctx->nulls[i] =
                     null_of(tf.columns(i).table_idx(), ref,
                             tf.columns(i).column());
             }
         }
-        ev->set_row_from_views(ctx->cells, ctx->nulls);
+        ev->set_row_from_views_typed(ctx->cells, ctx->nulls, ctx->kinds,
+                                     ctx->scales);
         return ev->evaluate(tf.pred().expr());
     }
 
@@ -1432,7 +1491,16 @@ struct Executor {
                 PredicateEvaluator ev;
                 std::vector<std::string_view> rcells(residual_cols.size());
                 std::vector<bool> rnulls(residual_cols.size(), false);
-                std::vector<std::string> rbufs(residual_cols.size());
+                // Raw typed cells + per-column kind/scale (same decode as the
+                // PAX schema_ path) — no per-row ASCII format/re-parse.
+                std::vector<uint8_t> rkinds(residual_cols.size());
+                std::vector<int> rscales(residual_cols.size());
+                for (size_t i = 0; i < residual_cols.size(); ++i) {
+                    rkinds[i] = column_kind(residual_cols[i].table_idx,
+                                            residual_cols[i].column);
+                    rscales[i] = column_scale(residual_cols[i].table_idx,
+                                              residual_cols[i].column);
+                }
                 // True when build row `br` passes the residual predicate
                 // against probe row `r`.
                 auto residual_ok = [&](size_t r, uint32_t br) {
@@ -1442,11 +1510,11 @@ struct Executor {
                         const uint64_t ref = rc.from_build
                                                  ? build.refs[rc.pos][br]
                                                  : probe.refs[rc.pos][r];
-                        rcells[i] =
-                            key_view(rc.table_idx, ref, rc.column, rbufs[i]);
+                        rcells[i] = value_of(rc.table_idx, ref, rc.column);
                         rnulls[i] = null_of(rc.table_idx, ref, rc.column);
                     }
-                    ev.set_row_from_views(rcells, rnulls);
+                    ev.set_row_from_views_typed(rcells, rnulls, rkinds,
+                                                rscales);
                     return ev.evaluate(join.residual().pred().expr());
                 };
                 const size_t begin = n * w / wc;
@@ -1590,8 +1658,6 @@ struct Executor {
         bool key_done = true;
     };
     using GroupMap = std::unordered_map<std::string, GroupState>;
-    // E15: int64-keyed variant for the single-INT-group-column fast path.
-    using IntGroupMap = std::unordered_map<int64_t, GroupState>;
     // E16b: two INT group columns packed into a POD 128-bit key — the
     // two-column analogue of the E15 fast path (perf: q20 groups by
     // (l_partkey, l_suppkey), both INT). Same value<->byte 1:1 invariant,
@@ -1610,7 +1676,170 @@ struct Executor {
             return h;
         }
     };
-    using Int2GroupMap = std::unordered_map<Int2Key, GroupState, Int2Hash>;
+
+    // Flat open-addressing group map for POD keys (F5). Layout follows the
+    // DuckDB GroupedAggregateHashTable shape: a power-of-2 probe table of
+    // 16-byte {hash, payload index} entries plus a dense payload vector of
+    // (key, GroupState). Compared to std::unordered_map this removes the
+    // per-group node allocation (q18 inserts 1.5M groups per execution), makes
+    // probes touch one cache line of entries where the stored hash filters
+    // almost all non-matches before the payload is read, and turns the
+    // HAVING/emit scans into dense sequential walks. Interface is the subset
+    // of unordered_map the aggregation templates use. erase() tombstones the
+    // payload slot (probe chains stay intact; only HAVING erases, after all
+    // inserts). Not thread-safe; each radix partition owns one instance.
+    template <typename K, typename HashF>
+    struct FlatGroupMap {
+        using key_type = K;
+        using value_type = std::pair<K, GroupState>;
+
+        std::vector<value_type> payload_;
+        std::vector<uint8_t> dead_;  // parallel to payload_
+        struct Ent {
+            uint64_t h;    // 0 = empty (hashes are forced odd)
+            uint32_t idx;  // payload index
+        };
+        std::vector<Ent> table_;
+        size_t mask_ = 0;
+        size_t dead_n_ = 0;
+
+        FlatGroupMap() = default;
+        // Explicit moves: the defaults would leave the source's mask_/dead_n_
+        // behind, making a moved-from map (MergeGroups dst=move(src)) report
+        // empty()==false with zero payload.
+        FlatGroupMap(FlatGroupMap&& o) noexcept
+            : payload_(std::move(o.payload_)),
+              dead_(std::move(o.dead_)),
+              table_(std::move(o.table_)),
+              mask_(o.mask_),
+              dead_n_(o.dead_n_) {
+            o.mask_ = 0;
+            o.dead_n_ = 0;
+        }
+        FlatGroupMap& operator=(FlatGroupMap&& o) noexcept {
+            payload_ = std::move(o.payload_);
+            dead_ = std::move(o.dead_);
+            table_ = std::move(o.table_);
+            mask_ = o.mask_;
+            dead_n_ = o.dead_n_;
+            o.mask_ = 0;
+            o.dead_n_ = 0;
+            return *this;
+        }
+
+        struct iterator {
+            FlatGroupMap* m;
+            size_t i;
+            void skip() {
+                while (i < m->payload_.size() && m->dead_[i]) ++i;
+            }
+            iterator& operator++() {
+                ++i;
+                skip();
+                return *this;
+            }
+            value_type& operator*() const { return m->payload_[i]; }
+            value_type* operator->() const { return &m->payload_[i]; }
+            bool operator==(const iterator& o) const { return i == o.i; }
+            bool operator!=(const iterator& o) const { return i != o.i; }
+        };
+        iterator begin() {
+            iterator it{this, 0};
+            it.skip();
+            return it;
+        }
+        iterator end() { return {this, payload_.size()}; }
+        bool empty() const { return payload_.size() == dead_n_; }
+        size_t size() const { return payload_.size() - dead_n_; }
+
+        // Deliberately SHARES the mix with the radix partitioner: within one
+        // partition every key then has identical low log2(P) bits, so probe
+        // starts cluster on a stride-P subset of slots. A reviewer flagged
+        // this as a probe-length pathology (simulated 6.7 vs 1.4 average
+        // probes) and we tried decorrelating with a second mix64 — it made
+        // q18 ~80ms WORSE at SF=1: the clustered starts keep the probe
+        // working set L1-resident (cap/P distinct lines) and the +1 linear
+        // chain walks adjacent lines, while decorrelated starts turn every
+        // probe into a random L2 miss across the whole table. Probe length
+        // is bounded by the 0.625 load cap either way. Measured, not
+        // guessed — do not "fix" without re-measuring q18.
+        // |1 keeps the stored hash nonzero (0 marks an empty entry).
+        static uint64_t hv(const K& k) { return HashF{}(k) | 1; }
+
+        // Rebuild the probe table for ~`want` live entries (load <= 0.625).
+        void rehash(size_t want) {
+            size_t cap = 16;
+            while (cap * 10 < want * 16) cap <<= 1;
+            table_.assign(cap, {0, 0});
+            mask_ = cap - 1;
+            for (size_t i = 0; i < payload_.size(); ++i) {
+                if (dead_[i]) continue;
+                const uint64_t h = hv(payload_[i].first);
+                size_t j = h & mask_;
+                while (table_[j].h != 0) j = (j + 1) & mask_;
+                table_[j] = {h, static_cast<uint32_t>(i)};
+            }
+        }
+        void reserve(size_t n) {
+            if (n * 16 > table_.size() * 10) rehash(n);
+            payload_.reserve(n);
+            dead_.reserve(n);
+        }
+        iterator find(const K& k) {
+            if (table_.empty()) return end();
+            const uint64_t h = hv(k);
+            size_t j = h & mask_;
+            while (table_[j].h != 0) {
+                if (table_[j].h == h) {
+                    const uint32_t idx = table_[j].idx;
+                    if (!dead_[idx] && payload_[idx].first == k)
+                        return {this, idx};
+                }
+                j = (j + 1) & mask_;
+            }
+            return end();
+        }
+        std::pair<iterator, bool> emplace(K k, GroupState&& v) {
+            if (table_.empty() ||
+                (payload_.size() + 1) * 16 > table_.size() * 10)
+                rehash(std::max<size_t>((payload_.size() + 1) * 2, 16));
+            const uint64_t h = hv(k);
+            size_t j = h & mask_;
+            while (table_[j].h != 0) {
+                if (table_[j].h == h) {
+                    const uint32_t idx = table_[j].idx;
+                    if (!dead_[idx] && payload_[idx].first == k)
+                        return {{this, idx}, false};
+                }
+                j = (j + 1) & mask_;
+            }
+            payload_.emplace_back(std::move(k), std::move(v));
+            dead_.push_back(0);
+            table_[j] = {h, static_cast<uint32_t>(payload_.size() - 1)};
+            return {{this, payload_.size() - 1}, true};
+        }
+        iterator erase(iterator it) {
+            dead_[it.i] = 1;
+            ++dead_n_;
+            iterator nx{this, it.i + 1};
+            nx.skip();
+            return nx;
+        }
+    };
+    struct I64Mix {
+        size_t operator()(int64_t v) const {
+            return mix64(static_cast<uint64_t>(v));
+        }
+    };
+    struct I2Mix {
+        size_t operator()(const Int2Key& k) const {
+            return mix64(static_cast<uint64_t>(k.a) * 0x9e3779b97f4a7c15ULL +
+                         static_cast<uint64_t>(k.b));
+        }
+    };
+    // E15: int64-keyed variant for the single-INT-group-column fast path.
+    using IntGroupMap = FlatGroupMap<int64_t, I64Mix>;
+    using Int2GroupMap = FlatGroupMap<Int2Key, I2Mix>;
 
     // Radix partition index for a group key (M3b). A well-mixed finalizer keeps
     // partition sizes balanced even for sequentially-clustered keys (l_orderkey
@@ -1688,6 +1917,16 @@ struct Executor {
         std::string aggbuf;  // typed -> canonical ASCII (agg arg values)
         [[maybe_unused]] std::vector<std::string_view> gv(n_grp);
         [[maybe_unused]] std::vector<std::string> gbufs(n_grp);
+        // Run cache (F5, clustered-run streaming aggregation tier 1): rows
+        // arrive in physical order and lineitem is clustered by l_orderkey
+        // (run length ~4 at TPC-H scale), so consecutive rows usually hit the
+        // same group. Equal key => same radix partition (part_of_* is a pure
+        // key function), and the pointer is refreshed on every row, so no
+        // emplace into this partition can intervene between set and reuse —
+        // the pointer is never stale when it is actually dereferenced.
+        [[maybe_unused]] int64_t last_key = 0;
+        [[maybe_unused]] Int2Key last_key2{0, 0};
+        GroupState* last_gs = nullptr;
         for (size_t r = begin; r < end; ++r) {
             GroupState* gs;
             if constexpr (IntKey) {
@@ -1702,19 +1941,26 @@ struct Executor {
                     parse_fail->store(true, std::memory_order_relaxed);
                     return false;
                 }
-                MapT& groups = parts[P == 1 ? 0 : part_of_i64(iv, P)];
-                auto it = groups.find(iv);
-                if (it == groups.end()) {
-                    GroupState st;
-                    // Defer the canonical-ASCII format to emit (M3a): stash
-                    // the representative ref; key_cols is built lazily only
-                    // for groups that survive HAVING/second-stage/output.
-                    st.key_ref[0] = ref;
-                    st.key_done = false;
-                    st.aggs.resize(n_agg);
-                    gs = &groups.emplace(iv, std::move(st)).first->second;
+                if (last_gs != nullptr && iv == last_key) {
+                    gs = last_gs;
                 } else {
-                    gs = &it->second;
+                    MapT& groups = parts[P == 1 ? 0 : part_of_i64(iv, P)];
+                    auto it = groups.find(iv);
+                    if (it == groups.end()) {
+                        GroupState st;
+                        // Defer the canonical-ASCII format to emit (M3a):
+                        // stash the representative ref; key_cols is built
+                        // lazily only for groups that survive
+                        // HAVING/second-stage/output.
+                        st.key_ref[0] = ref;
+                        st.key_done = false;
+                        st.aggs.resize(n_agg);
+                        gs = &groups.emplace(iv, std::move(st)).first->second;
+                    } else {
+                        gs = &it->second;
+                    }
+                    last_key = iv;
+                    last_gs = gs;
                 }
             } else if constexpr (Int2) {
                 // Two group columns, both prefix_len==0 (enforced by
@@ -1732,18 +1978,25 @@ struct Executor {
                     parse_fail->store(true, std::memory_order_relaxed);
                     return false;
                 }
-                MapT& groups = parts[P == 1 ? 0 : part_of_i2(key, P)];
-                auto it = groups.find(key);
-                if (it == groups.end()) {
-                    GroupState st;
-                    // Defer both cells' canonical-ASCII format to emit (M3a).
-                    st.key_ref[0] = r0;
-                    st.key_ref[1] = r1;
-                    st.key_done = false;
-                    st.aggs.resize(n_agg);
-                    gs = &groups.emplace(key, std::move(st)).first->second;
+                if (last_gs != nullptr && key == last_key2) {
+                    gs = last_gs;
                 } else {
-                    gs = &it->second;
+                    MapT& groups = parts[P == 1 ? 0 : part_of_i2(key, P)];
+                    auto it = groups.find(key);
+                    if (it == groups.end()) {
+                        GroupState st;
+                        // Defer both cells' canonical-ASCII format to emit
+                        // (M3a).
+                        st.key_ref[0] = r0;
+                        st.key_ref[1] = r1;
+                        st.key_done = false;
+                        st.aggs.resize(n_agg);
+                        gs = &groups.emplace(key, std::move(st)).first->second;
+                    } else {
+                        gs = &it->second;
+                    }
+                    last_key2 = key;
+                    last_gs = gs;
                 }
             } else {
                 keybuf.clear();
