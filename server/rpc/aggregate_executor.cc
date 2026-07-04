@@ -50,7 +50,7 @@ void aggregate_rows_range(
             s.key_cols.resize(n_grp);
             for (int g = 0; g < n_grp; ++g) s.key_cols[g] = std::string(gv[g]);
             s.count.assign(n_agg, 0);
-            s.sum.assign(n_agg, Dec{});
+            s.sum.assign(n_agg, DecimalValue{});
             gs = &groups.emplace(std::move(keybuf), std::move(s)).first->second;
             keybuf.clear();
         } else {
@@ -62,8 +62,12 @@ void aggregate_rows_range(
             const auto& af = spec.aggs(a);
             if (af.kind() == AF::AGG_COUNT) { gs->count[a] += 1; continue; }
             // SUM / AVG: evaluate the exact decimal arg, accumulate non-nulls.
-            Dec v = dec_eval(af.arg(), row.value);
-            if (!v.null) { dec_addsub(gs->sum[a], v, false); gs->count[a] += 1; }
+            DecimalValue value =
+                evaluate_decimal_expression(af.arg(), row.value);
+            if (!value.is_null) {
+                add_decimal_value(gs->sum[a], value);
+                gs->count[a] += 1;
+            }
         }
     }
 }
@@ -87,7 +91,7 @@ void merge_agg_groups(
         AggGroupState& s = kv.second;
         for (int a = 0; a < n_agg; ++a) {
             d.count[a] += s.count[a];
-            dec_addsub(d.sum[a], s.sum[a], false);
+            add_decimal_value(d.sum[a], s.sum[a]);
         }
     }
 }
@@ -105,7 +109,7 @@ void emit_agg_groups(
     if (n_grp == 0 && groups.empty()) {
         AggGroupState s;
         s.count.assign(n_agg, 0);
-        s.sum.assign(n_agg, Dec{});
+        s.sum.assign(n_agg, DecimalValue{});
         groups.emplace(std::string(), std::move(s));
     }
 
@@ -123,7 +127,7 @@ void emit_agg_groups(
                 agg_emit_field(row, cnt, false);
             } else {  // SUM / AVG: (exact decimal sum | null) , non-null count
                 if (s.count[a] == 0) agg_emit_field(row, std::string_view(), true);
-                else agg_emit_field(row, dec_format(s.sum[a]), false);
+                else agg_emit_field(row, format_decimal_value(s.sum[a]), false);
                 agg_emit_field(row, cnt, false);
             }
         }

@@ -9,7 +9,7 @@
 #include "lineairdb.pb.h"
 #include "lineairdb/stateless.h"
 
-#include "decimal_arith.hh"
+#include "decimal_arithmetic.hh"
 
 // Server-side aggregate execution helpers. These functions build per-group
 // partials from scan rows and serialize the partials back into synthetic rows
@@ -21,7 +21,7 @@
 struct AggGroupState {
     std::vector<std::string> key_cols;   // captured group-by column values
     std::vector<uint64_t> count;         // per agg: COUNT / non-null counter
-    std::vector<Dec> sum;                // per agg: SUM/AVG accumulator
+    std::vector<DecimalValue> sum;       // per agg: SUM/AVG accumulator
 };
 
 /**

@@ -52,8 +52,8 @@ set(SOURCES
     rpc/lineairdb_rpc.hh
     rpc/aggregate_executor.cc
     rpc/aggregate_executor.hh
-    rpc/decimal_arith.cc
-    rpc/decimal_arith.hh
+    rpc/decimal_arithmetic.cc
+    rpc/decimal_arithmetic.hh
     rpc/flat_plan_encode.cc
     rpc/flat_plan_encode.hh
     rpc/parallel_scan.cc
