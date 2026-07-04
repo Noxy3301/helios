@@ -50,6 +50,8 @@ set(SOURCES
     # RPC layer
     rpc/lineairdb_rpc.cc
     rpc/lineairdb_rpc.hh
+    rpc/decimal_arith.cc
+    rpc/decimal_arith.hh
     rpc/row_codec.cc
     rpc/row_codec.hh
     rpc/predicate_evaluator.cc
