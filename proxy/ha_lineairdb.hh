@@ -598,16 +598,31 @@ public:
    */
   ha_rows records_in_range(uint inx, key_range *min_key,
                            key_range *max_key) override;
+  /**
+   * @brief Handle MySQL's DROP TABLE cleanup hook.
+   */
   int delete_table(const char *from, const dd::Table *table_def) override;
+  /**
+   * @brief Report that table rename is not supported.
+   */
   int rename_table(const char *from, const char *to,
                    const dd::Table *from_table_def,
                    dd::Table *to_table_def) override;
+  /**
+   * @brief Create the table and its secondary indexes in LineairDB storage.
+   */
   int create(const char *name, TABLE *form, HA_CREATE_INFO *create_info,
              dd::Table *table_def) override; ///< required
 
+  /**
+   * @brief Advertise which ADD/DROP INDEX operations this handler can perform.
+   */
   enum_alter_inplace_result check_if_supported_inplace_alter(
       TABLE *altered_table, Alter_inplace_info *ha_alter_info) override;
 
+  /**
+   * @brief Execute an accepted in-place ALTER TABLE operation.
+   */
   bool inplace_alter_table(TABLE *altered_table,
                            Alter_inplace_info *ha_alter_info,
                            const dd::Table *old_table_def,
@@ -674,6 +689,9 @@ private:
   size_t mrr_buffer_pos_ = 0;
   bool mrr_use_batch_ = false;
   static bool predict_prefetch_mode(THD *thd);
+  static std::string server_connection_host();
+  static int server_connection_port();
+  LineairDBTransaction *new_transaction(THD *thd, bool fence);
   LineairDBTransaction *active_transaction(THD *thd) const;
   LineairDBTransaction *&
   get_transaction(THD *thd);
