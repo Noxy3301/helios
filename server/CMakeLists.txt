@@ -60,6 +60,7 @@ set(SOURCES
     rpc/parallel_scan.cc
     rpc/parallel_scan.hh
     rpc/primary_key_operations.cc
+    rpc/primary_key_scan_operations.cc
     rpc/read_plan_executor.cc
     rpc/row_codec.cc
     rpc/row_codec.hh
