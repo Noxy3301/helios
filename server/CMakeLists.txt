@@ -61,6 +61,7 @@ set(SOURCES
     rpc/read_plan_executor.cc
     rpc/row_codec.cc
     rpc/row_codec.hh
+    rpc/stateless_operations.cc
     rpc/table_stats.cc
     rpc/predicate_evaluator.cc
     rpc/predicate_evaluator.hh
