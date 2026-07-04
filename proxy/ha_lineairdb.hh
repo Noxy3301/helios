@@ -20,22 +20,19 @@
   along with this program; if not, write to the Free Software
   Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301  USA */
 
-/** @file ha_lineairdb.h
+/** @file ha_lineairdb.hh
 
     @brief
-  The ha_lineairdb engine is a stubbed storage engine for lineairdb purposes
-  only; it does nothing at this point. Its purpose is to provide a source code
-  illustration of how to begin writing new storage engines; see also
-  /storage/lineairdb/ha_lineairdb.cc.
+  The LineairDB storage engine handler declaration.
 
     @note
-  Please read ha_lineairdb.cc before reading this file.
-  Reminder: The lineairdb storage engine implements all methods that are
-  *required* to be implemented. For a full list of all methods that you can
-  implement, see handler.h.
+  The handler implementation is split across the storage/lineairdb translation
+  units. The LineairDB storage engine implements all methods that are *required*
+  to be implemented. For a full list of all methods that you can implement, see
+  handler.h.
 
    @see
-  /sql/handler.h and /storage/lineairdb/ha_lineairdb.cc
+  /sql/handler.h
 */
 
 #ifndef HA_LINEAIRDB_H
@@ -451,92 +448,34 @@ public:
   }
 
   /*
-    Everything below are methods that we implement in ha_lineairdb.cc.
+    Handler method declarations. Implementations are split by behavior across
+    the storage/lineairdb translation units.
 
-    Most of these methods are not obligatory, skip them and
-    MySQL will treat them as not implemented
-  */
-  /** @brief
-    We implement this in ha_lineairdb.cc; it's a required method.
+    Most of these methods are not obligatory; if an override is omitted, MySQL
+    treats the capability as not implemented.
   */
   int open(const char *name, int mode, uint test_if_locked,
            const dd::Table *table_def) override; // required
 
-  /** @brief
-    We implement this in ha_lineairdb.cc; it's a required method.
-  */
   int close(void) override; // required
 
   int change_active_index(uint keynr);
 
-  /** @brief
-    We implement this in ha_lineairdb.cc. It's not an obligatory method;
-    skip it and and MySQL will treat it as not implemented.
-  */
+  // Optional index and DML entry points.
   int index_init(uint idx, bool sorted [[maybe_unused]]) override;
-
-  /** @brief
-    We implement this in ha_lineairdb.cc. It's not an obligatory method;
-    skip it and and MySQL will treat it as not implemented.
-  */
   int index_end() override;
-
-  /** @brief
-    We implement this in ha_lineairdb.cc. It's not an obligatory method;
-    skip it and and MySQL will treat it as not implemented.
-  */
   int index_read(uchar *buf, const uchar *key, uint key_len, enum ha_rkey_function find_flag) override;
   int index_read_last(uchar *buf, const uchar *key, uint key_len) override;
-
-  /** @brief
-    We implement this in ha_lineairdb.cc. It's not an obligatory method;
-    skip it and and MySQL will treat it as not implemented.
-  */
   int write_row(uchar *buf) override;
-
-  /** @brief
-    We implement this in ha_lineairdb.cc. It's not an obligatory method;
-    skip it and and MySQL will treat it as not implemented.
-  */
   int update_row(const uchar *old_data, uchar *new_data) override;
-
-  /** @brief
-    We implement this in ha_lineairdb.cc. It's not an obligatory method;
-    skip it and and MySQL will treat it as not implemented.
-  */
   int delete_row(const uchar *buf) override;
-
-  /** @brief
-    We implement this in ha_lineairdb.cc. It's not an obligatory method;
-    skip it and and MySQL will treat it as not implemented.
-  */
   int index_read_map(uchar *buf, const uchar *key, key_part_map keypart_map,
                      enum ha_rkey_function find_flag) override;
-
-  /** @brief
-    We implement this in ha_lineairdb.cc. It's not an obligatory method;
-    skip it and and MySQL will treat it as not implemented.
-  */
   int index_next(uchar *buf) override;
 
   int index_next_same(uchar *buf, const uchar *key, uint key_len) override;
-
-  /** @brief
-    We implement this in ha_lineairdb.cc. It's not an obligatory method;
-    skip it and and MySQL will treat it as not implemented.
-  */
   int index_prev(uchar *buf) override;
-
-  /** @brief
-    We implement this in ha_lineairdb.cc. It's not an obligatory method;
-    skip it and and MySQL will treat it as not implemented.
-  */
   int index_first(uchar *buf) override;
-
-  /** @brief
-    We implement this in ha_lineairdb.cc. It's not an obligatory method;
-    skip it and and MySQL will treat it as not implemented.
-  */
   int index_last(uchar *buf) override;
 
   /** @brief
