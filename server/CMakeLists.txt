@@ -58,6 +58,7 @@ set(SOURCES
     rpc/flat_plan_encode.hh
     rpc/parallel_scan.cc
     rpc/parallel_scan.hh
+    rpc/read_plan_executor.cc
     rpc/row_codec.cc
     rpc/row_codec.hh
     rpc/predicate_evaluator.cc
