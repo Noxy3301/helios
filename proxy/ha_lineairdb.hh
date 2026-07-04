@@ -403,7 +403,7 @@ public:
    * for bulk-prefetched grouped single-table SELECTs, where rows are not fetched
    * one-by-one by a secondary-key-to-PK lookup.
    */
-  bool helios_charge_materialise(uint index, double rows) const;
+  bool should_charge_materialization_cost(uint index, double rows) const;
 
   double helios_row_bytes() const {
     // stats.mean_rec_length is set in info() from table->s->reclength (>=100).
@@ -437,7 +437,7 @@ public:
 
     // read_cost() is the non-covering path: the index narrows keys, then each
     // matching base row is fetched by PK. Covering scans use index_scan_cost().
-    if (helios_charge_materialise(index, rows)) {
+    if (should_charge_materialization_cost(index, rows)) {
       c.add_io(std::ceil(rows / kEffBatch()) * kC_rpc());
       c.add_cpu(rows * kC_materialise());
     }
@@ -580,13 +580,22 @@ public:
 
   int rnd_pos(uchar *buf, uchar *pos) override; ///< required
   void position(const uchar *record) override;  ///< required
+  /**
+   * @brief Refresh table and index cardinality estimates for the optimizer.
+   */
   int info(uint flag) override;                 ///< required
+  /**
+   * @brief Force a row-count, NDV, and histogram refresh for ANALYZE TABLE.
+   */
   int analyze(THD *thd, HA_CHECK_OPT *check_opt) override;
   int extra(enum ha_extra_function operation) override;
   int external_lock(THD *thd, int lock_type) override; ///< required
   int start_stmt(THD *thd, thr_lock_type lock_type) override;
   int delete_all_rows(void) override;
 
+  /**
+   * @brief Estimate rows in an index range using rec_per_key and histograms.
+   */
   ha_rows records_in_range(uint inx, key_range *min_key,
                            key_range *max_key) override;
   int delete_table(const char *from, const dd::Table *table_def) override;
@@ -665,6 +674,7 @@ private:
   size_t mrr_buffer_pos_ = 0;
   bool mrr_use_batch_ = false;
   static bool predict_prefetch_mode(THD *thd);
+  LineairDBTransaction *active_transaction(THD *thd) const;
   LineairDBTransaction *&
   get_transaction(THD *thd);
   /**
