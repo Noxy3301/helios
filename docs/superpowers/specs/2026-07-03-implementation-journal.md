@@ -1056,3 +1056,83 @@ q18 973→878 (-95) / q19 340→273 (-67) / q20 354→295 (-59) / q21 680→624 
   コメント頼み (debug 世代カウンタ案)、ゲート提案「>1M int group + HAVING 半減の
   オフロード可能マイクロテスト」(FlatGroupMap の rehash/tombstone を SF=0.01 ゲートが
   ほぼ運動させない穴)。
+
+### F5 SF=5 検証 (label PAX-SE-F5-sf5, コミット 7435c58 時点)
+
+**FORCED wall 24.53 → 22.66s (−7.6%)、22/22 md5 が M3 検証済み値と完全一致、RSS 18.96GB (不変)**。
+q18 5909→5386 (−523) / q19 1877→1525 (−352) / q20 1507→1160 (−347) / q21 4555→4247 (−308) /
+q13 1465→1280 (−185) / q15 689→502 (−187) / q22 199→141。q10 +74 は SF=1 同様の分散帯。
+スポット md5 の q18 OFF 側 d41d8cd...(空) は行エンジン q18 が SF=5 で timeout 400s 超えの
+既知偽 MISMATCH (secondary md5 は M3 検証値一致で無罪証明)。
+歴代: M2 30.96s → M3 24.53s → **F5 22.66s**。DuckDB 同箱 1.31s (17.3x)。
+
+### F5-5/6 実装 (検証中): payload チャンク化 + witness summaries
+
+- FlatGroupMap payload を 1024 エントリ (80KB) 固定ブロック列に: 成長時の pair<K,GroupState>
+  move 消滅 + glibc mmap 閾値 (128KB) 未満でブロックがアリーナ再利用されページゼロ化
+  (clear_page_erms 2.1%) も消える。インデックス安定はブロック構造で自明化。
+- witness summaries (Moerkotte/Neumann groupjoin 系譜, SOTA #4 tier1): SEMI/ANTI の残差が
+  「build 列 <> probe 列」単独 (両側 typed INT, ct==0) のとき、キー毎 {cnt,min,max} で
+  ∃違値 ⟺ cnt>0 ∧ ¬(min==max==probe値)。build 側の per-key 行ベクタ構築と per-candidate
+  evaluator 走査が両方消える (q21 の l2 SEMI / l3 ANTI)。NULL 意味論: build NULL は
+  summary 非計上 (<> を満たせない)、probe NULL は不成立 — evaluator の cmp==-2→false と一致。
+
+### F5c の SF=5 検証と reserve_payload の敗北 (実測が理論を殺した 4 件目)
+
+- SF=5 (label PAX-SE-F5c-sf5, コミット 5f6d8b3): TOTAL 22.66→23.06s (+0.4)。**q21 4247→4101
+  (witness -146ms 有効)** だが **q18 +336ms / q13 +83ms = reserve_payload が原因**:
+  worker×partition の 1024 マップ × 2.3MB 仮想 reserve (実使用 ~25%) が mmap/munmap churn
+  + mmap_lock 競合に化けた。「仮想 reserve はタダ」はマップ個数 × サイズが mmap 閾値を
+  超える regime では嘘。SF=1 では中立 (c7 4.60s) — スケールで割れる典型。
+  → reserve_payload 除去 (幾何成長に戻す)、witness は保持。NOTE コメントで実測を固定。
+- チャンク化 (c6) も同様に q18 +100ms で棄却済み。**F5 のデータ構造系で生き残ったのは
+  flat map 本体と witness summaries だけ** — bitmap 疎ゲート/hash 無相関化/チャンク化/
+  reserve と、理論・レビュー・調査由来の「改善」4 件を全て実測が棄却。教訓:
+  このホットパスは L1/L2 局所性と mmap 挙動が支配し、операция数の議論は当てにならない。
+
+### 固定床 A/B (join_buffer_size, SF=5 live stack, 20x p50)
+
+- q2 (5-way join) 44.9→41.6ms (-3.3ms/-7%)、q17 -1.3ms、q6 (単表) ±0 —
+  champion 設定 join_buffer_size=1GB が FORCED 経路の死んだ HashJoinIterator 構築
+  (チャンク配列) で払う税は join 形状で ~1-3ms/query。恒久解は mysql-core の
+  「override_executor_func 設定時に CreateIteratorFromAccessPath をスキップ」(~2% 全体)。
+  保留 (mysql-core 接触の割に小粒)。
+
+### F5 最終 SF=5 (F5d = 085fc4d, label PAX-SE-F5d-sf5)
+
+TOTAL 23.03s / md5 22/22 M3 検証値一致 / RSS 18.94GB。本日 3 回の SF=5 走行 (F5 22.66 /
+F5c 23.06 / F5d 23.03) から **run 間分散 ±0.4s (±1.5%)** を確認 — q1/q3/q9/q10/q18 が
+±30-110ms で同時に揺れる (環境要因; ページキャッシュ/断片化状態)。一貫して動いたのは
+q21 (witness -94〜-146ms) と F5c の reserve 起因 q18 +336 (F5d で +228 回収)。
+**確定サマリ: M3 24.53s → F5 22.66-23.03s (-6〜-7.6%)、SF=1 4.89 → 4.60-4.66s**。
+q13 並列 second-stage は SF=1 で -31ms 確定、SF=5 ではノイズ帯に埋没 (期待 -150ms 未達 —
+stage-1 支配の可能性、SF=5 での二段目単独プロファイルは未取得)。
+
+### TPC-C server-side prepared statements A/B — 棄却
+
+JDBC URL に useServerPrepStmts+cachePrepStmts を追加して 1/8/32/64t スイープ (xml は実験後復元):
+**棄却**。(1) 新規エラークラス: 1t で 1130 件 (ベースライン 0)、64t で 16891 件 —
+COM_STMT_EXECUTE (バイナリプロトコル) で prefetch/autogen 経路が失敗する形。(2) レイテンシ
+利得なし: NewOrder p50 3.45ms (text 3.48/3.56) — SQL パース税は Helios の TPC-C レイテンシ
+では支配的でない (RPC 0.26ms 同様、残り ~3ms は mysqld の実行系)。(3) Goodput 全点悪化
+(64t 984 vs 1197)。調査候補 TPC-C #3 の前提 (パース 0.2-1.0ms) は不成立。
+バイナリプロトコル対応自体は将来の互換性課題としてのみ残す (エラーの根本原因は未診断)。
+
+### F6: ベクトル化 strip filter (selection-vector 実行、実装=委任エージェント+dual review)
+
+RunScan の行単位 FilterExpr 解釈 (set_row_from_pax_cols + evaluate ツリー走査、perf で
+q1/q4/q6/q10/q19/q20/q21 の 25-50%) を、スキャン毎に 1 回コンパイルした Node 木 +
+strip 毎 selection vector (uint16 昇順) のカラム至上評価に置換。**正しさの構成**: 各ノードは
+(a) extract_value+compare+evaluate を写像だと証明できる特化ループ、または (b) 同じ proto
+部分木を参照 PredicateEvaluator で per-slot 評価するフォールバック — 未対応形状は構成的に
+同一。compare()/DATE ヘルパは参照の逐語複製 (drift 禁止コメント付き)。特化: INT32/64
+(ct 0/1/2)、DATE、DEC64 ((double)m/10^s の式順一致=bit parity)、UNTYPED ct3 文字列、
+IS_NULL 系。フォールバック: LIKE、col-op-col、UNTYPED 数値 (strtoll 非終端 cell)、INT ct3。
+セマンティクス写像 7 項目 (空セル/null-bit 順序、cmp -2 規則、BETWEEN/IN の negated×NULL、
+INT/UINT 昇格、FK_INT32 符号拡張、failed[] のスキーマ専依存性) をエージェント報告+独立
+レビューの両方で確認。統合: [semi→ext→filter] の行単位 interleave を「選択収集→一括濾過」
+に再構成 (フィルタは副作用なし・failed はスキーマ形状のみ依存で行順無関係)。LDBC_VEC=0 で
+参照経路 (A/B 用)。
+**SF=1 (c10): 4.58 → 4.28s (-6.6%、対 baseline -12.5%)、md5 22/22、RSS 不変。**
+q21 567 (-113) / q18 862 (-111) / q19 259 (-81、F5e の事前刈り込みがベクトル化で増幅) /
+q20 284 / q1 161 (-20%) / q13 182 / q7 151 / q15 111 / q6 52ms。

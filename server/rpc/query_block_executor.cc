@@ -5,6 +5,7 @@
 #include <charconv>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <functional>
 #include <memory>
@@ -697,6 +698,600 @@ inline bool zone_strip_pruned(
     return false;
 }
 
+// ===========================================================================
+// Vectorized scan filter (F6). The per-row scan path calls
+// set_row_from_pax_cols (assigns num_columns string-views + copies the null
+// flags for EVERY visible row of a wide table) and then walks the FilterExpr
+// proto tree in PredicateEvaluator::evaluate, boxing a Val per node; perf
+// attributes 25-50% of q1/q4/q6/q10/q19/q20/q21 to that chain. This compiles
+// the pushed FilterExpr ONCE per scan into a plain struct tree with constants
+// pre-decoded, then evaluates it column-at-a-time over a selection vector of
+// slots (better strip locality; no per-row set_row / proto access).
+//
+// Correctness contract: byte-identical to the per-row path for EVERY pushable
+// expression. Each compiled node is either (a) a specialized typed loop that
+// PROVABLY mirrors extract_value + compare + evaluate for its exact shape, or
+// (b) a per-slot FALLBACK that calls the reference PredicateEvaluator on the
+// SAME proto subtree — so any unsupported shape stays identical by
+// construction. When in doubt the compiler emits a FALLBACK; specialization is
+// a pure optimization (a prior spike showed the typed loop cuts q6 by 42%).
+//
+// The compare()/date-helper logic below is a line-for-line DUPLICATE of
+// PredicateEvaluator (predicate_evaluator.cc). It MUST stay in sync — any
+// divergence in the promotion / NULL / DATE rules would break the contract.
+// ===========================================================================
+namespace vf {
+
+using LineairDB::Pax::TableSchema;
+
+enum class VT { NONE, INT, UINT, DOUBLE, STRING, DATE };
+// Mirror of PredicateEvaluator::Val (same fields; STRING/const views point at
+// the group cell arena or the persistent proto, both stable for the scan).
+struct VVal {
+    VT type = VT::NONE;
+    int64_t i = 0;
+    uint64_t u = 0;
+    double d = 0.0;
+    std::string_view s;
+};
+
+// --- DATE helpers: exact copies of PredicateEvaluator's. ---
+inline bool date_operand_to_int(const VVal& v, int64_t* out) {
+    if (v.type == VT::DATE || v.type == VT::INT) { *out = v.i; return true; }
+    if (v.type == VT::UINT) { *out = static_cast<int64_t>(v.u); return true; }
+    if (v.type == VT::STRING) {
+        const std::string_view s = v.s;
+        if (s.size() == 10 && s[4] == '-' && s[7] == '-') {
+            int64_t y = 0, m = 0, d = 0;
+            auto dig = [](const char* p, int n, int64_t* o) {
+                for (int i = 0; i < n; i++) {
+                    if (p[i] < '0' || p[i] > '9') return false;
+                    *o = *o * 10 + (p[i] - '0');
+                }
+                return true;
+            };
+            if (dig(s.data(), 4, &y) && dig(s.data() + 5, 2, &m) &&
+                dig(s.data() + 8, 2, &d)) {
+                *out = y * 10000 + m * 100 + d;
+                return true;
+            }
+        }
+        return false;
+    }
+    return false;
+}
+inline std::string_view date_operand_to_sv(const VVal& v, char* buf, size_t n) {
+    if (v.type == VT::DATE) {
+        const int32_t x = static_cast<int32_t>(v.i);
+        int len = std::snprintf(buf, n, "%04d-%02d-%02d", x / 10000,
+                                (x / 100) % 100, x % 100);
+        return std::string_view(buf, len > 0 ? static_cast<size_t>(len) : 0);
+    }
+    return v.s;
+}
+
+// --- compare(): exact copy of PredicateEvaluator::compare. -1/0/1 for </==/>,
+// -2 when either operand is NONE (NULL cmp X -> unknown). ---
+inline int compare(const VVal& lhs, const VVal& rhs) {
+    if (lhs.type == VT::NONE || rhs.type == VT::NONE) return -2;
+
+    if (lhs.type == VT::DATE || rhs.type == VT::DATE) {
+        int64_t li, ri;
+        if (date_operand_to_int(lhs, &li) && date_operand_to_int(rhs, &ri))
+            return (li < ri) ? -1 : (li > ri) ? 1 : 0;
+        char lb[16], rb[16];
+        const std::string_view ls = date_operand_to_sv(lhs, lb, sizeof(lb));
+        const std::string_view rs = date_operand_to_sv(rhs, rb, sizeof(rb));
+        const int c = ls.compare(rs);
+        return (c < 0) ? -1 : (c > 0) ? 1 : 0;
+    }
+
+    if (lhs.type == VT::STRING || rhs.type == VT::STRING) {
+        std::string_view ls = lhs.s, rs = rhs.s;
+        if (lhs.type == VT::STRING && rhs.type == VT::STRING) {
+            int r = ls.compare(rs);
+            return (r < 0) ? -1 : (r > 0) ? 1 : 0;
+        }
+        return ls.compare(rs) < 0 ? -1 : ls.compare(rs) > 0 ? 1 : 0;
+    }
+
+    double dl, dr;
+    if (lhs.type == VT::DOUBLE || rhs.type == VT::DOUBLE) {
+        dl = (lhs.type == VT::DOUBLE) ? lhs.d
+             : (lhs.type == VT::INT)  ? static_cast<double>(lhs.i)
+                                      : static_cast<double>(lhs.u);
+        dr = (rhs.type == VT::DOUBLE) ? rhs.d
+             : (rhs.type == VT::INT)  ? static_cast<double>(rhs.i)
+                                      : static_cast<double>(rhs.u);
+        return (dl < dr) ? -1 : (dl > dr) ? 1 : 0;
+    }
+
+    if (lhs.type == VT::INT && rhs.type == VT::INT)
+        return (lhs.i < rhs.i) ? -1 : (lhs.i > rhs.i) ? 1 : 0;
+    if (lhs.type == VT::UINT && rhs.type == VT::UINT)
+        return (lhs.u < rhs.u) ? -1 : (lhs.u > rhs.u) ? 1 : 0;
+    int64_t li = (lhs.type == VT::INT) ? lhs.i : static_cast<int64_t>(lhs.u);
+    int64_t ri = (rhs.type == VT::INT) ? rhs.i : static_cast<int64_t>(rhs.u);
+    return (li < ri) ? -1 : (li > ri) ? 1 : 0;
+}
+
+// ---------------------------------------------------------------------------
+// Compiled node tree. AND/OR/NOT recurse; the leaves are either a specialized
+// column op (col vs pre-decoded const[s]) or a FALLBACK subtree pointer.
+// ---------------------------------------------------------------------------
+struct Node {
+    enum K { AND, OR, NOT, CMP, BETWEEN, IN, IS_NULL, IS_NOT_NULL, FALLBACK };
+    K kind = FALLBACK;
+    // Specialized-column metadata (CMP/BETWEEN/IN/IS_NULL/IS_NOT_NULL):
+    uint32_t col = 0;                 // 0-based column ordinal; cell field = +1
+    uint8_t colkind = fk::FK_UNTYPED; // FK_* storage kind of the column
+    int scale = 0;                    // DEC64 scale
+    uint32_t ctype = 0;               // COLUMN_REF compare_type hint
+    int op = 0;                       // pb::FilterExpr::Op (CMP only)
+    bool negated = false;             // BETWEEN / IN
+    std::vector<VVal> consts;         // CMP:1 (rhs) BETWEEN:2 (lo,hi) IN:N
+    std::vector<Node> children;       // AND/OR/NOT
+    const pb::FilterExpr* fb = nullptr;  // FALLBACK subtree (stable proto ref)
+};
+
+inline bool is_const(const pb::FilterExpr& e) {
+    switch (e.op()) {
+        case pb::FilterExpr::CONST_INT:
+        case pb::FilterExpr::CONST_UINT:
+        case pb::FilterExpr::CONST_DOUBLE:
+        case pb::FilterExpr::CONST_STRING:
+        case pb::FilterExpr::CONST_NULL:
+            return true;
+        default:
+            return false;
+    }
+}
+
+// Pre-decode a CONST_* node exactly as extract_value would (STRING view points
+// into the persistent proto's string_val, stable for the scan's lifetime).
+inline VVal const_val(const pb::FilterExpr& e) {
+    VVal v;
+    switch (e.op()) {
+        case pb::FilterExpr::CONST_INT:
+            v.type = VT::INT;
+            v.i = e.int_val();
+            break;
+        case pb::FilterExpr::CONST_UINT:
+            v.type = VT::UINT;
+            v.u = e.uint_val();
+            break;
+        case pb::FilterExpr::CONST_DOUBLE:
+            v.type = VT::DOUBLE;
+            v.d = e.double_val();
+            break;
+        case pb::FilterExpr::CONST_STRING:
+            v.type = VT::STRING;
+            v.s = std::string_view(
+                reinterpret_cast<const char*>(e.string_val().data()),
+                e.string_val().size());
+            break;
+        default:  // CONST_NULL
+            v.type = VT::NONE;
+            break;
+    }
+    return v;
+}
+
+// Can extract_value's COLUMN_REF decode for (kind, compare_type) be reproduced
+// by col_val() below? INT32/INT64 with compare_type==3 boxes a to_string(x)
+// STRING (rotating fmtbuf) -> fall back. UNTYPED numeric (ct 0/1/2) runs
+// strtoll/strtod on a non-terminated cell -> fall back. DATE/DEC64 ignore
+// compare_type. UNTYPED string compare (ct 3) is a plain byte compare.
+inline bool specializable(uint8_t kind, uint32_t ct) {
+    switch (kind) {
+        case fk::FK_INT32:
+        case fk::FK_INT64:
+            return ct != 3;
+        case fk::FK_DATE:
+        case fk::FK_DEC64:
+            return true;
+        case fk::FK_UNTYPED:
+            return ct == 3;
+        default:
+            return false;
+    }
+}
+
+// Decode one column cell into a VVal, mirroring extract_value(COLUMN_REF)
+// exactly for the specialized shapes. Empty-cell handling is kind-independent
+// (matches extract_value): null bit set -> NONE, else empty STRING.
+inline VVal col_val(const Node& n, const PaxGroup& grp, uint32_t slot) {
+    VVal v;
+    const std::string_view col = grp.cell(n.col + 1, slot);
+    if (col.empty()) {
+        const std::string_view nf = grp.cell(0, slot);
+        const uint32_t bp = n.col >> 3, bit = n.col & 7;
+        if (bp < nf.size() &&
+            (static_cast<uint8_t>(nf[bp]) & (1u << bit))) {
+            v.type = VT::NONE;  // NULL
+            return v;
+        }
+        v.type = VT::STRING;  // empty but not null
+        v.s = col;
+        return v;
+    }
+    switch (n.colkind) {
+        case fk::FK_DATE: {
+            int32_t x;
+            std::memcpy(&x, col.data(), 4);
+            v.type = VT::DATE;
+            v.i = x;
+            return v;
+        }
+        case fk::FK_INT32:
+        case fk::FK_INT64: {
+            int64_t x;
+            if (n.colkind == fk::FK_INT32) {
+                int32_t t;
+                std::memcpy(&t, col.data(), 4);
+                x = t;
+            } else {
+                std::memcpy(&x, col.data(), 8);
+            }
+            switch (n.ctype) {  // ct==3 is never compiled here (see specializable)
+                case 1:
+                    v.type = VT::UINT;
+                    v.u = static_cast<uint64_t>(x);
+                    return v;
+                case 2:
+                    v.type = VT::DOUBLE;
+                    v.d = static_cast<double>(x);
+                    return v;
+                default:  // SIGNED_INT
+                    v.type = VT::INT;
+                    v.i = x;
+                    return v;
+            }
+        }
+        case fk::FK_DEC64: {
+            int64_t m;
+            std::memcpy(&m, col.data(), 8);
+            double p = 1.0;  // same repeated-multiply loop as extract_value
+            for (int k = 0; k < n.scale; ++k) p *= 10.0;
+            v.type = VT::DOUBLE;
+            v.d = static_cast<double>(m) / p;
+            return v;
+        }
+        default:  // FK_UNTYPED, ct==3: raw-cell byte string compare
+            v.type = VT::STRING;
+            v.s = col;
+            return v;
+    }
+}
+
+// Per-call evaluation context (thread-local; the Node tree is read-only shared).
+struct EvalCtx {
+    const PaxGroup* grp;
+    PredicateEvaluator* ev;
+    uint32_t num_columns;
+    const std::vector<uint32_t>* filter_cols;
+    bool failed = false;
+};
+
+// Ascending sorted union of two ascending unique selections.
+inline std::vector<uint16_t> merge_union(const std::vector<uint16_t>& a,
+                                         const std::vector<uint16_t>& b) {
+    if (a.empty()) return b;
+    if (b.empty()) return a;
+    std::vector<uint16_t> out;
+    out.reserve(a.size() + b.size());
+    size_t i = 0, j = 0;
+    while (i < a.size() && j < b.size()) {
+        if (a[i] < b[j]) out.push_back(a[i++]);
+        else if (b[j] < a[i]) out.push_back(b[j++]);
+        else { out.push_back(a[i++]); ++j; }
+    }
+    while (i < a.size()) out.push_back(a[i++]);
+    while (j < b.size()) out.push_back(b[j++]);
+    return out;
+}
+
+// Evaluate a node over the ascending selection `sel`; return the ascending
+// subset that satisfies it (output order == input order, preserved exactly).
+std::vector<uint16_t> eval_node(const Node& n, std::vector<uint16_t> sel,
+                                EvalCtx& ctx) {
+    switch (n.kind) {
+        case Node::AND: {
+            // Fold sequentially over the shrinking selection (short-circuits
+            // the same rows as evaluate()'s per-row AND).
+            for (const Node& c : n.children) {
+                sel = eval_node(c, std::move(sel), ctx);
+                if (ctx.failed || sel.empty()) return sel;
+            }
+            return sel;
+        }
+        case Node::OR: {
+            // A row matches if ANY child matches -> union of per-child matches
+            // over the input selection (ascending preserved by merge_union).
+            std::vector<uint16_t> acc;
+            for (const Node& c : n.children) {
+                std::vector<uint16_t> m = eval_node(c, sel, ctx);
+                if (ctx.failed) return sel;
+                acc = merge_union(acc, m);
+            }
+            return acc;
+        }
+        case Node::NOT: {
+            // sel_out = sel_in \ eval(child, sel_in): mirrors !evaluate(child)
+            // exactly because the child evaluation is itself mirrored.
+            std::vector<uint16_t> m = eval_node(n.children[0], sel, ctx);
+            if (ctx.failed) return sel;
+            size_t w = 0, j = 0;
+            for (size_t r = 0; r < sel.size(); ++r) {
+                while (j < m.size() && m[j] < sel[r]) ++j;
+                if (j < m.size() && m[j] == sel[r]) { ++j; continue; }
+                sel[w++] = sel[r];
+            }
+            sel.resize(w);
+            return sel;
+        }
+        case Node::CMP: {
+            const VVal& rhs = n.consts[0];
+            size_t w = 0;
+            for (size_t r = 0; r < sel.size(); ++r) {
+                const VVal lhs = col_val(n, *ctx.grp, sel[r]);
+                const int cmp = compare(lhs, rhs);
+                bool keep;
+                if (cmp == -2) {
+                    keep = false;  // NULL -> unknown -> exclude
+                } else {
+                    switch (n.op) {
+                        case pb::FilterExpr::OP_EQ: keep = cmp == 0; break;
+                        case pb::FilterExpr::OP_NE: keep = cmp != 0; break;
+                        case pb::FilterExpr::OP_LT: keep = cmp < 0; break;
+                        case pb::FilterExpr::OP_LE: keep = cmp <= 0; break;
+                        case pb::FilterExpr::OP_GT: keep = cmp > 0; break;
+                        default: keep = cmp >= 0; break;  // OP_GE
+                    }
+                }
+                if (keep) sel[w++] = sel[r];
+            }
+            sel.resize(w);
+            return sel;
+        }
+        case Node::BETWEEN: {
+            size_t w = 0;
+            for (size_t r = 0; r < sel.size(); ++r) {
+                const VVal v = col_val(n, *ctx.grp, sel[r]);
+                const int cl = compare(v, n.consts[0]);
+                const int ch = compare(v, n.consts[1]);
+                bool keep;
+                if (cl == -2 || ch == -2) {
+                    keep = false;  // NULL -> false REGARDLESS of negated
+                } else {
+                    const bool res = (cl >= 0 && ch <= 0);
+                    keep = n.negated ? !res : res;
+                }
+                if (keep) sel[w++] = sel[r];
+            }
+            sel.resize(w);
+            return sel;
+        }
+        case Node::IN: {
+            size_t w = 0;
+            for (size_t r = 0; r < sel.size(); ++r) {
+                const VVal v = col_val(n, *ctx.grp, sel[r]);
+                bool keep;
+                if (v.type == VT::NONE) {
+                    keep = false;  // NULL IN (...) -> false (even if negated)
+                } else {
+                    bool matched = false;
+                    for (const VVal& it : n.consts)
+                        if (compare(v, it) == 0) { matched = true; break; }
+                    keep = matched ? !n.negated : n.negated;
+                }
+                if (keep) sel[w++] = sel[r];
+            }
+            sel.resize(w);
+            return sel;
+        }
+        case Node::IS_NULL:
+        case Node::IS_NOT_NULL: {
+            // NONE <=> empty cell AND null bit set (col < num_columns, so the
+            // idx-out-of-range NONE case never applies) -> kind-independent.
+            const bool want_null = (n.kind == Node::IS_NULL);
+            size_t w = 0;
+            for (size_t r = 0; r < sel.size(); ++r) {
+                const std::string_view c = ctx.grp->cell(n.col + 1, sel[r]);
+                bool isnull = false;
+                if (c.empty()) {
+                    const std::string_view nf = ctx.grp->cell(0, sel[r]);
+                    const uint32_t bp = n.col >> 3, bit = n.col & 7;
+                    isnull = bp < nf.size() &&
+                             (static_cast<uint8_t>(nf[bp]) & (1u << bit));
+                }
+                if (isnull == want_null) sel[w++] = sel[r];
+            }
+            sel.resize(w);
+            return sel;
+        }
+        case Node::FALLBACK: {
+            // Reference path on the exact proto subtree: byte-identical by
+            // construction. set_row false == schema mismatch -> fail the scan
+            // (preserves the per-row path's failed[] semantics).
+            size_t w = 0;
+            for (size_t r = 0; r < sel.size(); ++r) {
+                if (!ctx.ev->set_row_from_pax_cols(*ctx.grp, sel[r],
+                                                   ctx.num_columns,
+                                                   *ctx.filter_cols)) {
+                    ctx.failed = true;
+                    return sel;
+                }
+                if (ctx.ev->evaluate(*n.fb)) sel[w++] = sel[r];
+            }
+            sel.resize(w);
+            return sel;
+        }
+    }
+    return sel;
+}
+
+// Compile a FilterExpr subtree into a Node. `ncols` == filter num_columns
+// (columns >= ncols decode to NONE in extract_value, so they can't be a
+// specialized column -> FALLBACK reproduces that). Any shape not provably
+// mirrored becomes a FALLBACK over its own proto node.
+Node compile(const pb::FilterExpr& e, uint32_t ncols, const TableSchema& sch) {
+    using FE = pb::FilterExpr;
+    Node n;
+    auto fallback = [&]() {
+        Node f;
+        f.kind = Node::FALLBACK;
+        f.fb = &e;
+        return f;
+    };
+    switch (e.op()) {
+        case FE::OP_AND: {
+            if (e.children_size() < 1) return fallback();
+            n.kind = Node::AND;
+            for (const auto& c : e.children())
+                n.children.push_back(compile(c, ncols, sch));
+            return n;
+        }
+        case FE::OP_OR: {
+            if (e.children_size() < 1) return fallback();
+            n.kind = Node::OR;
+            for (const auto& c : e.children())
+                n.children.push_back(compile(c, ncols, sch));
+            return n;
+        }
+        case FE::OP_NOT: {
+            if (e.children_size() < 1) return fallback();
+            n.kind = Node::NOT;
+            n.children.push_back(compile(e.children(0), ncols, sch));
+            return n;
+        }
+        case FE::OP_EQ:
+        case FE::OP_NE:
+        case FE::OP_LT:
+        case FE::OP_LE:
+        case FE::OP_GT:
+        case FE::OP_GE: {
+            if (e.children_size() < 2) return fallback();
+            const auto& c0 = e.children(0);
+            if (c0.op() != FE::COLUMN_REF || !is_const(e.children(1)))
+                return fallback();
+            if (c0.column_index() >= ncols) return fallback();
+            const uint32_t col = c0.column_index();
+            const uint8_t kind = sch.kind_of(col + 1);
+            const uint32_t ct = c0.compare_type();
+            if (!specializable(kind, ct)) return fallback();
+            n.kind = Node::CMP;
+            n.col = col;
+            n.colkind = kind;
+            n.scale = sch.scale_of(col + 1);
+            n.ctype = ct;
+            n.op = e.op();
+            n.consts.push_back(const_val(e.children(1)));
+            return n;
+        }
+        case FE::OP_BETWEEN: {
+            if (e.children_size() < 3) return fallback();
+            const auto& c0 = e.children(0);
+            if (c0.op() != FE::COLUMN_REF || !is_const(e.children(1)) ||
+                !is_const(e.children(2)))
+                return fallback();
+            if (c0.column_index() >= ncols) return fallback();
+            const uint32_t col = c0.column_index();
+            const uint8_t kind = sch.kind_of(col + 1);
+            const uint32_t ct = c0.compare_type();
+            if (!specializable(kind, ct)) return fallback();
+            n.kind = Node::BETWEEN;
+            n.col = col;
+            n.colkind = kind;
+            n.scale = sch.scale_of(col + 1);
+            n.ctype = ct;
+            n.negated = e.negated();
+            n.consts.push_back(const_val(e.children(1)));
+            n.consts.push_back(const_val(e.children(2)));
+            return n;
+        }
+        case FE::OP_IN: {
+            if (e.children_size() < 2) return fallback();
+            const auto& c0 = e.children(0);
+            if (c0.op() != FE::COLUMN_REF) return fallback();
+            if (c0.column_index() >= ncols) return fallback();
+            for (int i = 1; i < e.children_size(); ++i)
+                if (!is_const(e.children(i))) return fallback();
+            const uint32_t col = c0.column_index();
+            const uint8_t kind = sch.kind_of(col + 1);
+            const uint32_t ct = c0.compare_type();
+            if (!specializable(kind, ct)) return fallback();
+            n.kind = Node::IN;
+            n.col = col;
+            n.colkind = kind;
+            n.scale = sch.scale_of(col + 1);
+            n.ctype = ct;
+            n.negated = e.negated();
+            for (int i = 1; i < e.children_size(); ++i)
+                n.consts.push_back(const_val(e.children(i)));
+            return n;
+        }
+        case FE::OP_IS_NULL:
+        case FE::OP_IS_NOT_NULL: {
+            if (e.children_size() < 1) return fallback();
+            const auto& c0 = e.children(0);
+            if (c0.op() != FE::COLUMN_REF) return fallback();
+            if (c0.column_index() >= ncols) return fallback();
+            n.kind = (e.op() == FE::OP_IS_NULL) ? Node::IS_NULL
+                                                : Node::IS_NOT_NULL;
+            n.col = c0.column_index();  // null check is kind-independent
+            return n;
+        }
+        default:
+            // OP_LIKE, column-on-RHS / column-op-column comparisons, arithmetic.
+            return fallback();
+    }
+}
+
+// A compiled filter program, built once per RunScan and shared read-only.
+struct Program {
+    Node root;
+    uint32_t num_columns = 0;
+
+    void build(const pb::FilterExpr& e, uint32_t ncols,
+               const TableSchema& sch) {
+        num_columns = ncols;
+        // A schema too small for the filter fails the per-row path
+        // (set_row_from_pax_cols returns false). Route the WHOLE expr to a
+        // single FALLBACK so run() reproduces that failure AND never lets a
+        // specialized loop read an out-of-range cell strip.
+        if (sch.field_count() < static_cast<size_t>(ncols) + 1) {
+            root.kind = Node::FALLBACK;
+            root.fb = &e;
+            return;
+        }
+        root = compile(e, ncols, sch);
+    }
+
+    // Filter `sel` (ascending slots). *failed set on a schema mismatch in a
+    // fallback node (mirrors the per-row path's failed[w] on set_row false).
+    std::vector<uint16_t> run(std::vector<uint16_t> sel, const PaxGroup& grp,
+                              PredicateEvaluator& ev,
+                              const std::vector<uint32_t>& fcols,
+                              bool* failed) const {
+        EvalCtx ctx{&grp, &ev, num_columns, &fcols, false};
+        sel = eval_node(root, std::move(sel), ctx);
+        *failed = ctx.failed;
+        return sel;
+    }
+};
+
+// Kill switch (read once): LDBC_VEC=0 forces the reference per-row scan path.
+inline bool enabled() {
+    static const bool on = [] {
+        const char* e = std::getenv("LDBC_VEC");
+        return !(e != nullptr && e[0] == '0' && e[1] == '\0');
+    }();
+    return on;
+}
+
+}  // namespace vf
+
 // ---------------------------------------------------------------------------
 // Executor state.
 // ---------------------------------------------------------------------------
@@ -1076,6 +1671,17 @@ struct Executor {
             };
             zone_lower_clauses(scan.filter().expr(), getz, &prune);
         }
+
+        // F6: compile the pushed filter ONCE into a vectorized program shared
+        // read-only by the workers (per-slot fallback covers any shape it can't
+        // specialize, so this is always safe). LDBC_VEC=0 keeps the per-row
+        // path. store->schema() is the shape every group in this table shares.
+        const bool vec_active = has_filter && vf::enabled();
+        vf::Program vprog;
+        if (vec_active)
+            vprog.build(scan.filter().expr(), scan.filter().num_columns(),
+                        store->schema());
+
         const unsigned wc =
             static_cast<unsigned>(std::min<size_t>(workers(), n_groups));
         std::vector<std::vector<uint64_t>> locals(wc);
@@ -1087,12 +1693,19 @@ struct Executor {
                 PredicateEvaluator ev;
                 auto& mine = locals[w];
                 std::string probe;  // reused key buffer: no per-row alloc
+                // F6: collect the visible + semi/ext-passing slots of a strip
+                // into an ascending selection, then run the filter over it
+                // column-at-a-time. Slots stay ascending within the strip, so
+                // the emitted refs keep the exact per-row-path order.
+                std::vector<uint16_t> sel;
+                sel.reserve(PaxGroup::kRows);
                 for (size_t g = w; g < n_groups; g += wc) {
                     PaxGroup* grp = store->group(g);
                     if (grp == nullptr) continue;
                     if (!prune.empty() &&
                         zone_strip_pruned(g, prune, zsnaps))
                         continue;  // E17: strip provably has no matching row
+                    sel.clear();
                     for (uint32_t base = 0; base < PaxGroup::kRows;
                          base += 64) {
                         uint64_t bits = 0;
@@ -1150,7 +1763,24 @@ struct Executor {
                                         continue;
                                 }
                             }
-                            if (has_filter) {
+                            sel.push_back(static_cast<uint16_t>(slot));
+                        }
+                    }
+                    if (has_filter) {
+                        if (vec_active) {
+                            bool fail_flag = false;
+                            sel = vprog.run(std::move(sel), *grp, ev,
+                                            filter_cols, &fail_flag);
+                            if (fail_flag) {  // schema mismatch (set_row false)
+                                failed[w] = 1;
+                                return;
+                            }
+                        } else {
+                            // Reference per-row path (LDBC_VEC=0) over the
+                            // collected selection — identical to the pre-F6
+                            // inline test, order preserved.
+                            size_t keep = 0;
+                            for (uint16_t slot : sel) {
                                 if (!ev.set_row_from_pax_cols(
                                         *grp, slot,
                                         scan.filter().num_columns(),
@@ -1158,12 +1788,14 @@ struct Executor {
                                     failed[w] = 1;
                                     return;
                                 }
-                                if (!ev.evaluate(scan.filter().expr()))
-                                    continue;
+                                if (ev.evaluate(scan.filter().expr()))
+                                    sel[keep++] = slot;
                             }
-                            mine.push_back(g * PaxGroup::kRows + slot);
+                            sel.resize(keep);
                         }
                     }
+                    for (uint16_t slot : sel)
+                        mine.push_back(g * PaxGroup::kRows + slot);
                 }
             });
         }
