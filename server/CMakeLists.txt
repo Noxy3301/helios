@@ -65,6 +65,7 @@ set(SOURCES
     rpc/row_codec.cc
     rpc/row_codec.hh
     rpc/secondary_index_operations.cc
+    rpc/secondary_index_scan_operations.cc
     rpc/stateless_operations.cc
     rpc/table_stats.cc
     rpc/transaction_control.cc

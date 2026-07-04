@@ -1,0 +1,265 @@
+#include "lineairdb_rpc.hh"
+
+#include <cstdint>
+#include <optional>
+#include <string>
+#include <string_view>
+#include <vector>
+
+#include "../../common/log.h"
+#include "lineairdb.pb.h"
+
+// Secondary-index range and prefix scan RPC handlers. These handlers return
+// primary-key sets or the last ordered secondary-index entry in a scan range.
+
+void LineairDBRpc::handleTxGetMatchingPrimaryKeysInRange(
+    const std::string& message, std::string& result) {
+    LOG_DEBUG("Handling TxGetMatchingPrimaryKeysInRange");
+
+    LineairDB::Protocol::TxGetMatchingPrimaryKeysInRange::Request request;
+    LineairDB::Protocol::TxGetMatchingPrimaryKeysInRange::Response response;
+
+    request.ParseFromString(message);
+
+    const int64_t tx_id = request.transaction_id();
+    auto* tx = tx_manager_->get_transaction(tx_id);
+    if (tx) {
+        if (!request.table_name().empty()) {
+            tx->SetTable(request.table_name());
+        }
+        std::string index_name = request.index_name();
+        std::string start_key = request.start_key();
+        std::string end_key = request.end_key();
+
+        std::optional<std::string_view> end_opt;
+        if (!end_key.empty()) {
+            end_opt = end_key;
+        }
+
+        auto scan_result = tx->ScanSecondaryIndex(
+            index_name, start_key, end_opt,
+            [&response]([[maybe_unused]] std::string_view secondary_key,
+                        const std::vector<std::string>& primary_keys) {
+                for (const auto& pk : primary_keys) {
+                    response.add_primary_keys(pk);
+                }
+                return false;
+            });
+
+        // Phantom detection: ScanSecondaryIndex returns nullopt if aborted.
+        if (!scan_result.has_value()) {
+            tx->Abort();
+            response.set_is_aborted(true);
+        } else {
+            response.set_is_aborted(tx->IsAborted());
+        }
+        LOG_DEBUG("GetMatchingPrimaryKeysInRange tx=%ld index='%s': %d keys",
+                  tx_id, index_name.c_str(), response.primary_keys_size());
+    } else {
+        response.set_is_aborted(true);
+        LOG_WARNING(
+            "Transaction not found for get_matching_primary_keys_in_range: "
+            "%ld",
+            tx_id);
+    }
+
+    result = response.SerializeAsString();
+}
+
+void LineairDBRpc::handleTxGetMatchingPrimaryKeysFromPrefix(
+    const std::string& message, std::string& result) {
+    LOG_DEBUG("Handling TxGetMatchingPrimaryKeysFromPrefix");
+
+    LineairDB::Protocol::TxGetMatchingPrimaryKeysFromPrefix::Request request;
+    LineairDB::Protocol::TxGetMatchingPrimaryKeysFromPrefix::Response response;
+
+    request.ParseFromString(message);
+
+    const int64_t tx_id = request.transaction_id();
+    auto* tx = tx_manager_->get_transaction(tx_id);
+    if (tx) {
+        if (!request.table_name().empty()) {
+            tx->SetTable(request.table_name());
+        }
+        std::string index_name = request.index_name();
+        std::string prefix = request.prefix();
+        bool first_key_checked = false;
+        bool prefix_miss = false;
+
+        auto scan_result = tx->ScanSecondaryIndex(
+            index_name, prefix, std::nullopt,
+            [&response, &first_key_checked, &prefix_miss, &prefix, this](
+                std::string_view secondary_key,
+                const std::vector<std::string>& primary_keys) {
+                if (!first_key_checked) {
+                    first_key_checked = true;
+                    std::string key_str(secondary_key);
+                    if (!key_prefix_is_matching(prefix, key_str)) {
+                        prefix_miss = true;
+                        return true;
+                    }
+                }
+                for (const auto& pk : primary_keys) {
+                    response.add_primary_keys(pk);
+                }
+                return false;
+            });
+
+        // Phantom detection: ScanSecondaryIndex returns nullopt if aborted.
+        if (!scan_result.has_value()) {
+            tx->Abort();
+            response.set_is_aborted(true);
+        } else {
+            response.set_is_aborted(tx->IsAborted());
+            if (prefix_miss) {
+                response.clear_primary_keys();
+            }
+        }
+        LOG_DEBUG(
+            "GetMatchingPrimaryKeysFromPrefix tx=%ld index='%s' prefix='%s': "
+            "%d keys",
+            tx_id, index_name.c_str(), prefix.c_str(),
+            response.primary_keys_size());
+    } else {
+        response.set_is_aborted(true);
+        LOG_WARNING(
+            "Transaction not found for get_matching_primary_keys_from_prefix: "
+            "%ld",
+            tx_id);
+    }
+
+    result = response.SerializeAsString();
+}
+
+void LineairDBRpc::handleTxFetchLastPrimaryKeyInSecondaryRange(
+    const std::string& message, std::string& result) {
+    LOG_DEBUG("Handling TxFetchLastPrimaryKeyInSecondaryRange");
+
+    LineairDB::Protocol::TxFetchLastPrimaryKeyInSecondaryRange::Request request;
+    LineairDB::Protocol::TxFetchLastPrimaryKeyInSecondaryRange::Response response;
+
+    request.ParseFromString(message);
+
+    const int64_t tx_id = request.transaction_id();
+    auto* tx = tx_manager_->get_transaction(tx_id);
+    if (tx) {
+        if (!request.table_name().empty()) {
+            tx->SetTable(request.table_name());
+        }
+        std::string index_name = request.index_name();
+        std::string start_key = request.start_key();
+        std::string end_key = request.end_key();
+
+        std::optional<std::string_view> end_opt;
+        if (!end_key.empty()) {
+            end_opt = end_key;
+        }
+
+        std::optional<std::string> last_primary_key;
+        auto scan_result = tx->ScanSecondaryIndexReverse(
+            index_name, start_key, end_opt,
+            [&last_primary_key](
+                [[maybe_unused]] std::string_view secondary_key,
+                const std::vector<std::string>& primary_keys) {
+                if (primary_keys.empty()) {
+                    return false;
+                }
+                last_primary_key = primary_keys.back();
+                return true;
+            });
+
+        // Phantom detection: ScanSecondaryIndexReverse returns nullopt if
+        // aborted.
+        if (!scan_result.has_value()) {
+            tx->Abort();
+            response.set_is_aborted(true);
+            response.set_found(false);
+        } else {
+            response.set_is_aborted(tx->IsAborted());
+            if (last_primary_key.has_value()) {
+                response.set_found(true);
+                response.set_primary_key(last_primary_key.value());
+            } else {
+                response.set_found(false);
+            }
+        }
+        LOG_DEBUG(
+            "FetchLastPrimaryKeyInSecondaryRange tx=%ld index='%s': found=%s",
+            tx_id, index_name.c_str(),
+            last_primary_key.has_value() ? "true" : "false");
+    } else {
+        response.set_is_aborted(true);
+        response.set_found(false);
+        LOG_WARNING(
+            "Transaction not found for fetch_last_primary_key_in_secondary_range: "
+            "%ld",
+            tx_id);
+    }
+
+    result = response.SerializeAsString();
+}
+
+void LineairDBRpc::handleTxFetchLastSecondaryEntryInRange(
+    const std::string& message, std::string& result) {
+    LOG_DEBUG("Handling TxFetchLastSecondaryEntryInRange");
+
+    LineairDB::Protocol::TxFetchLastSecondaryEntryInRange::Request request;
+    LineairDB::Protocol::TxFetchLastSecondaryEntryInRange::Response response;
+
+    request.ParseFromString(message);
+
+    const int64_t tx_id = request.transaction_id();
+    auto* tx = tx_manager_->get_transaction(tx_id);
+    if (tx) {
+        if (!request.table_name().empty()) {
+            tx->SetTable(request.table_name());
+        }
+        std::string index_name = request.index_name();
+        std::string start_key = request.start_key();
+        std::string end_key = request.end_key();
+
+        std::optional<std::string_view> end_opt;
+        if (!end_key.empty()) {
+            end_opt = end_key;
+        }
+
+        bool found = false;
+        auto scan_result = tx->ScanSecondaryIndexReverse(
+            index_name, start_key, end_opt,
+            [&response, &found](std::string_view secondary_key,
+                                const std::vector<std::string>& primary_keys) {
+                if (primary_keys.empty()) {
+                    return false;
+                }
+                found = true;
+                auto* entry = response.mutable_entry();
+                entry->set_secondary_key(std::string(secondary_key));
+                for (const auto& pk : primary_keys) {
+                    entry->add_primary_keys(pk);
+                }
+                return true;
+            });
+
+        // Phantom detection: ScanSecondaryIndexReverse returns nullopt if
+        // aborted.
+        if (!scan_result.has_value()) {
+            tx->Abort();
+            response.set_is_aborted(true);
+            response.set_found(false);
+        } else {
+            response.set_is_aborted(tx->IsAborted());
+            response.set_found(found);
+        }
+        LOG_DEBUG("FetchLastSecondaryEntryInRange tx=%ld index='%s': found=%s",
+                  tx_id, index_name.c_str(), found ? "true" : "false");
+    } else {
+        response.set_is_aborted(true);
+        response.set_found(false);
+        LOG_WARNING(
+            "Transaction not found for fetch_last_secondary_entry_in_range: "
+            "%ld",
+            tx_id);
+    }
+
+    result = response.SerializeAsString();
+}
