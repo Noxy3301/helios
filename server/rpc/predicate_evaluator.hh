@@ -52,6 +52,17 @@ class PredicateEvaluator {
   void set_row_from_views(const std::vector<std::string_view>& cells,
                           const std::vector<bool>& nulls);
 
+  // Typed synthesized-row variant: cells hold RAW storage bytes and
+  // kinds/scales give the per-column storage kind (FK_*), so extract_value
+  // decodes typed binary cells directly — the same decode as the PAX schema_
+  // path — instead of the caller formatting to ASCII and this evaluator
+  // re-parsing it per row (perf: q19 tuple filter, q21 join residual).
+  // kinds[i] == FK_UNTYPED marks a canonical-ASCII cell (virtual tables).
+  void set_row_from_views_typed(const std::vector<std::string_view>& cells,
+                                const std::vector<bool>& nulls,
+                                const std::vector<uint8_t>& kinds,
+                                const std::vector<int>& scales);
+
   // Recursively evaluate a FilterExpr tree against the parsed row.
   // Returns true if the row satisfies the predicate.
   bool evaluate(const LineairDB::Protocol::FilterExpr& expr) const;
@@ -69,6 +80,10 @@ class PredicateEvaluator {
   // "YYYY-MM-DD" string so string order == date order); UNTYPED keeps the
   // existing strtoll/strtod ASCII path. Field index for column c is c+1.
   const LineairDB::Pax::TableSchema* schema_ = nullptr;
+  // Per-column kinds/scales for the typed views path (empty = all UNTYPED;
+  // ignored while schema_ is set — the two sources are mutually exclusive).
+  std::vector<uint8_t> vkinds_;
+  std::vector<int> vscales_;
   // Rotating scratch backing the formatted-string Vals a single comparison may
   // hold at once (BETWEEN = 3 operands; two DATE columns in one predicate,
   // e.g. l_commitdate < l_receiptdate, = 2). 4 is safely above both.
