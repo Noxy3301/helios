@@ -994,23 +994,6 @@ ha_lineairdb::ha_lineairdb(handlerton *hton, TABLE_SHARE *table_arg)
       buffer_position_(0), last_batch_key_(), scan_exhausted_(false),
       blobroot(csv_key_memory_blobroot, BLOB_MEMROOT_ALLOC_SIZE) {}
 
-const Item *ha_lineairdb::cond_push(const Item *cond) {
-  DBUG_TRACE;
-  pushed_filter_serialized_.clear();
-  has_unpushed_filter_ = false;
-  if (!cond || !table) return cond;
-
-  LineairDB::Protocol::PushedPredicate predicate;
-  predicate.set_num_columns(table->s->fields);
-  if (!serialize_item(cond, predicate.mutable_expr())) {
-    // Serialization failed → no PP, MySQL evaluates everything
-    has_unpushed_filter_ = true;
-    return cond;
-  }
-  predicate.SerializeToString(&pushed_filter_serialized_);
-  return cond;  // Always return cond: MySQL re-evaluates (safety net)
-}
-
 /**
  * @brief Attach an aggregate spec and its server-side WHERE filter to the tx.
  *

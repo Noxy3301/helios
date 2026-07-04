@@ -36,6 +36,23 @@
 // Predicate Pushdown: serialize MySQL Item tree → FilterExpr protobuf
 // ---------------------------------------------------------------------------
 
+const Item *ha_lineairdb::cond_push(const Item *cond) {
+  DBUG_TRACE;
+  pushed_filter_serialized_.clear();
+  has_unpushed_filter_ = false;
+  if (!cond || !table) return cond;
+
+  LineairDB::Protocol::PushedPredicate predicate;
+  predicate.set_num_columns(table->s->fields);
+  if (!serialize_item(cond, predicate.mutable_expr())) {
+    // Serialization failed: keep the full predicate for MySQL evaluation.
+    has_unpushed_filter_ = true;
+    return cond;
+  }
+  predicate.SerializeToString(&pushed_filter_serialized_);
+  return cond;  // MySQL re-evaluates the predicate as a safety net.
+}
+
 /**
  * @brief Serialize a MySQL Item expression into a FilterExpr protobuf.
  *
