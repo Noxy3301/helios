@@ -474,6 +474,12 @@ message TxUpdateSecondaryIndex {
 message DbCreateTable {
     message Request {
         string table_name = 1;
+        // PAX storage cell widths per encoded row field. Entry 0 is the
+        // null-flags field; later entries follow TABLE::field order. Empty
+        // means the table uses the ordinary row layout. Proxies may send this
+        // unconditionally because the server enables it only under its PAX
+        // storage gate.
+        repeated uint32 pax_field_max_bytes = 2 [packed = true];
     }
     message Response {
         bool success = 1;

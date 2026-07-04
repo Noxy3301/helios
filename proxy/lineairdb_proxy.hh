@@ -326,7 +326,11 @@ public:
                                                                                const std::string& end_key);
 
     // table/index management (non-transactional)
-    bool db_create_table(const std::string& table_name);
+    // Optional PAX storage cell widths. Entry 0 is the null-flags field; later
+    // entries follow TABLE::field order. Empty keeps the ordinary row layout.
+    bool db_create_table(
+        const std::string& table_name,
+        const std::vector<uint32_t>& pax_field_max_bytes = {});
     bool db_set_table(int64_t tx_id, const std::string& table_name);
     bool db_create_secondary_index(const std::string& table_name,
                                    const std::string& index_name,

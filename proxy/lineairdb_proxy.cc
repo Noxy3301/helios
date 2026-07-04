@@ -1277,7 +1277,9 @@ std::optional<SecondaryIndexEntry> LineairDBProxy::tx_fetch_last_secondary_entry
     return std::nullopt;
 }
 
-bool LineairDBProxy::db_create_table(const std::string& table_name) {
+bool LineairDBProxy::db_create_table(
+    const std::string& table_name,
+    const std::vector<uint32_t>& pax_field_max_bytes) {
     LOG_DEBUG("CLIENT: db_create_table called with table=%s", table_name.c_str());
     if (!connected_) {
         LOG_ERROR("RPC failed: Not connected to server");
@@ -1288,6 +1290,9 @@ bool LineairDBProxy::db_create_table(const std::string& table_name) {
     LineairDB::Protocol::DbCreateTable::Response response;
 
     request.set_table_name(table_name);
+    for (const uint32_t width : pax_field_max_bytes) {
+        request.add_pax_field_max_bytes(width);
+    }
 
     if (!send_protobuf_message(request, response, MessageType::DB_CREATE_TABLE)) {
         LOG_ERROR("RPC failed: Failed to send message to server");
