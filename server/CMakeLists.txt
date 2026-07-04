@@ -50,6 +50,25 @@ set(SOURCES
     # RPC layer
     rpc/lineairdb_rpc.cc
     rpc/lineairdb_rpc.hh
+    rpc/aggregate_executor.cc
+    rpc/aggregate_executor.hh
+    rpc/database_operations.cc
+    rpc/decimal_arithmetic.cc
+    rpc/decimal_arithmetic.hh
+    rpc/flat_plan_encode.cc
+    rpc/flat_plan_encode.hh
+    rpc/parallel_scan.cc
+    rpc/parallel_scan.hh
+    rpc/primary_key_operations.cc
+    rpc/primary_key_scan_operations.cc
+    rpc/read_plan_executor.cc
+    rpc/row_codec.cc
+    rpc/row_codec.hh
+    rpc/secondary_index_operations.cc
+    rpc/secondary_index_scan_operations.cc
+    rpc/stateless_operations.cc
+    rpc/table_stats.cc
+    rpc/transaction_control.cc
     rpc/predicate_evaluator.cc
     rpc/predicate_evaluator.hh
     

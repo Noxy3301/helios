@@ -39,10 +39,18 @@ set(LINEAIRDB_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/LineairDB")
 add_subdirectory(${LINEAIRDB_DIR} ${CMAKE_CURRENT_BINARY_DIR}/LineairDB)
 set(LINEAIRDB_PLUGIN_DYNAMIC "ha_lineairdb")
 set(LINEAIRDB_SOURCES ha_lineairdb.cc ha_lineairdb.hh
+                      aggregate_pushdown.cc aggregate_pushdown.hh
+                      ddl.cc
+                      dml.cc
+                      index_scan.cc
+                      table_scan.cc
+                      multi_range_read.cc
+                      optimizer_stats.cc
                       lineairdb_field.cc lineairdb_field.hh
                       lineairdb_transaction.cc lineairdb_transaction.hh
                       lineairdb_proxy.cc lineairdb_proxy.hh
                       lineairdb_keyenc.cc lineairdb_keyenc.hh
+                      row_codec.cc
                       lineairdb_pushdown.cc lineairdb_pushdown.hh
                       lineairdb_index_search.cc lineairdb_index_search.hh
                       lineairdb_prefetch.cc lineairdb_prefetch.hh

@@ -20,22 +20,19 @@
   along with this program; if not, write to the Free Software
   Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301  USA */
 
-/** @file ha_lineairdb.h
+/** @file ha_lineairdb.hh
 
     @brief
-  The ha_lineairdb engine is a stubbed storage engine for lineairdb purposes
-  only; it does nothing at this point. Its purpose is to provide a source code
-  illustration of how to begin writing new storage engines; see also
-  /storage/lineairdb/ha_lineairdb.cc.
+  The LineairDB storage engine handler declaration.
 
     @note
-  Please read ha_lineairdb.cc before reading this file.
-  Reminder: The lineairdb storage engine implements all methods that are
-  *required* to be implemented. For a full list of all methods that you can
-  implement, see handler.h.
+  The handler implementation is split across the storage/lineairdb translation
+  units. The LineairDB storage engine implements all methods that are *required*
+  to be implemented. For a full list of all methods that you can implement, see
+  handler.h.
 
    @see
-  /sql/handler.h and /storage/lineairdb/ha_lineairdb.cc
+  /sql/handler.h
 */
 
 #ifndef HA_LINEAIRDB_H
@@ -403,7 +400,7 @@ public:
    * for bulk-prefetched grouped single-table SELECTs, where rows are not fetched
    * one-by-one by a secondary-key-to-PK lookup.
    */
-  bool helios_charge_materialise(uint index, double rows) const;
+  bool should_charge_materialization_cost(uint index, double rows) const;
 
   double helios_row_bytes() const {
     // stats.mean_rec_length is set in info() from table->s->reclength (>=100).
@@ -437,7 +434,7 @@ public:
 
     // read_cost() is the non-covering path: the index narrows keys, then each
     // matching base row is fetched by PK. Covering scans use index_scan_cost().
-    if (helios_charge_materialise(index, rows)) {
+    if (should_charge_materialization_cost(index, rows)) {
       c.add_io(std::ceil(rows / kEffBatch()) * kC_rpc());
       c.add_cpu(rows * kC_materialise());
     }
@@ -451,92 +448,34 @@ public:
   }
 
   /*
-    Everything below are methods that we implement in ha_lineairdb.cc.
+    Handler method declarations. Implementations are split by behavior across
+    the storage/lineairdb translation units.
 
-    Most of these methods are not obligatory, skip them and
-    MySQL will treat them as not implemented
-  */
-  /** @brief
-    We implement this in ha_lineairdb.cc; it's a required method.
+    Most of these methods are not obligatory; if an override is omitted, MySQL
+    treats the capability as not implemented.
   */
   int open(const char *name, int mode, uint test_if_locked,
            const dd::Table *table_def) override; // required
 
-  /** @brief
-    We implement this in ha_lineairdb.cc; it's a required method.
-  */
   int close(void) override; // required
 
   int change_active_index(uint keynr);
 
-  /** @brief
-    We implement this in ha_lineairdb.cc. It's not an obligatory method;
-    skip it and and MySQL will treat it as not implemented.
-  */
+  // Optional index and DML entry points.
   int index_init(uint idx, bool sorted [[maybe_unused]]) override;
-
-  /** @brief
-    We implement this in ha_lineairdb.cc. It's not an obligatory method;
-    skip it and and MySQL will treat it as not implemented.
-  */
   int index_end() override;
-
-  /** @brief
-    We implement this in ha_lineairdb.cc. It's not an obligatory method;
-    skip it and and MySQL will treat it as not implemented.
-  */
   int index_read(uchar *buf, const uchar *key, uint key_len, enum ha_rkey_function find_flag) override;
   int index_read_last(uchar *buf, const uchar *key, uint key_len) override;
-
-  /** @brief
-    We implement this in ha_lineairdb.cc. It's not an obligatory method;
-    skip it and and MySQL will treat it as not implemented.
-  */
   int write_row(uchar *buf) override;
-
-  /** @brief
-    We implement this in ha_lineairdb.cc. It's not an obligatory method;
-    skip it and and MySQL will treat it as not implemented.
-  */
   int update_row(const uchar *old_data, uchar *new_data) override;
-
-  /** @brief
-    We implement this in ha_lineairdb.cc. It's not an obligatory method;
-    skip it and and MySQL will treat it as not implemented.
-  */
   int delete_row(const uchar *buf) override;
-
-  /** @brief
-    We implement this in ha_lineairdb.cc. It's not an obligatory method;
-    skip it and and MySQL will treat it as not implemented.
-  */
   int index_read_map(uchar *buf, const uchar *key, key_part_map keypart_map,
                      enum ha_rkey_function find_flag) override;
-
-  /** @brief
-    We implement this in ha_lineairdb.cc. It's not an obligatory method;
-    skip it and and MySQL will treat it as not implemented.
-  */
   int index_next(uchar *buf) override;
 
   int index_next_same(uchar *buf, const uchar *key, uint key_len) override;
-
-  /** @brief
-    We implement this in ha_lineairdb.cc. It's not an obligatory method;
-    skip it and and MySQL will treat it as not implemented.
-  */
   int index_prev(uchar *buf) override;
-
-  /** @brief
-    We implement this in ha_lineairdb.cc. It's not an obligatory method;
-    skip it and and MySQL will treat it as not implemented.
-  */
   int index_first(uchar *buf) override;
-
-  /** @brief
-    We implement this in ha_lineairdb.cc. It's not an obligatory method;
-    skip it and and MySQL will treat it as not implemented.
-  */
   int index_last(uchar *buf) override;
 
   /** @brief
@@ -580,25 +519,49 @@ public:
 
   int rnd_pos(uchar *buf, uchar *pos) override; ///< required
   void position(const uchar *record) override;  ///< required
+  /**
+   * @brief Refresh table and index cardinality estimates for the optimizer.
+   */
   int info(uint flag) override;                 ///< required
+  /**
+   * @brief Force a row-count, NDV, and histogram refresh for ANALYZE TABLE.
+   */
   int analyze(THD *thd, HA_CHECK_OPT *check_opt) override;
   int extra(enum ha_extra_function operation) override;
   int external_lock(THD *thd, int lock_type) override; ///< required
   int start_stmt(THD *thd, thr_lock_type lock_type) override;
   int delete_all_rows(void) override;
 
+  /**
+   * @brief Estimate rows in an index range using rec_per_key and histograms.
+   */
   ha_rows records_in_range(uint inx, key_range *min_key,
                            key_range *max_key) override;
+  /**
+   * @brief Handle MySQL's DROP TABLE cleanup hook.
+   */
   int delete_table(const char *from, const dd::Table *table_def) override;
+  /**
+   * @brief Report that table rename is not supported.
+   */
   int rename_table(const char *from, const char *to,
                    const dd::Table *from_table_def,
                    dd::Table *to_table_def) override;
+  /**
+   * @brief Create the table and its secondary indexes in LineairDB storage.
+   */
   int create(const char *name, TABLE *form, HA_CREATE_INFO *create_info,
              dd::Table *table_def) override; ///< required
 
+  /**
+   * @brief Advertise which ADD/DROP INDEX operations this handler can perform.
+   */
   enum_alter_inplace_result check_if_supported_inplace_alter(
       TABLE *altered_table, Alter_inplace_info *ha_alter_info) override;
 
+  /**
+   * @brief Execute an accepted in-place ALTER TABLE operation.
+   */
   bool inplace_alter_table(TABLE *altered_table,
                            Alter_inplace_info *ha_alter_info,
                            const dd::Table *old_table_def,
@@ -608,13 +571,29 @@ public:
       THD *thd, THR_LOCK_DATA **to,
       enum thr_lock_type lock_type) override; ///< required
 
-  ha_rows multi_range_read_info_const(uint keyno, RANGE_SEQ_IF *seq,
-                                      void *seq_init_param, uint n_ranges,
-                                      uint *bufsz, uint *flags, bool *force_default_mrr,
-                                      Cost_estimate *cost) override;
+  /**
+   * @brief Advertise custom batched MRR for primary-key point lookups.
+   *
+   * In non-prefetch mode, these methods clear HA_MRR_USE_DEFAULT_IMPL for
+   * primary-key lookup ranges so multi_range_read_init() can batch all keys into
+   * one LineairDB RPC. Prefetch mode keeps MySQL's default DS-MRR path because
+   * reads are already staged in the transaction cache.
+   */
+  ha_rows multi_range_read_info_const(
+      uint keyno, RANGE_SEQ_IF *seq, void *seq_init_param, uint n_ranges,
+      uint *bufsz, uint *flags, bool *force_default_mrr,
+      Cost_estimate *cost) override;
   ha_rows multi_range_read_info(uint keyno, uint n_ranges, uint keys,
                                 uint *bufsz, uint *flags,
                                 Cost_estimate *cost) override;
+
+  /**
+   * @brief Batch full primary-key point ranges or delegate to MySQL DS-MRR.
+   *
+   * Only exact full-key ranges can use LineairDBTransaction::batch_read().
+   * Partial-key and inequality ranges fall back to the default MRR
+   * implementation.
+   */
   int multi_range_read_init(RANGE_SEQ_IF *seq, void *seq_init_param,
                             uint n_ranges, uint mode,
                             HANDLER_BUFFER *buf) override;
@@ -637,10 +616,10 @@ private:
   std::string pushed_filter_serialized_;
   // True when cond_push() cannot build a server-side filter
   bool has_unpushed_filter_{false};
-  /** The multi range read session object */
+  // MySQL DS-MRR session object.
   DsMrr_impl m_ds_mrr;
 
-  // MRR batch state
+  // Custom MRR batch state.
   struct MrrBufferedRow {
     std::string value;
     char *range_info;
@@ -648,6 +627,11 @@ private:
   std::vector<MrrBufferedRow> mrr_buffer_;
   size_t mrr_buffer_pos_ = 0;
   bool mrr_use_batch_ = false;
+  static bool predict_prefetch_mode(THD *thd);
+  static std::string server_connection_host();
+  static int server_connection_port();
+  LineairDBTransaction *new_transaction(THD *thd, bool fence);
+  LineairDBTransaction *active_transaction(THD *thd) const;
   LineairDBTransaction *&
   get_transaction(THD *thd);
   /**
