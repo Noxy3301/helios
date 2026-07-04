@@ -1136,3 +1136,19 @@ INT/UINT 昇格、FK_INT32 符号拡張、failed[] のスキーマ専依存性) 
 **SF=1 (c10): 4.58 → 4.28s (-6.6%、対 baseline -12.5%)、md5 22/22、RSS 不変。**
 q21 567 (-113) / q18 862 (-111) / q19 259 (-81、F5e の事前刈り込みがベクトル化で増幅) /
 q20 284 / q1 161 (-20%) / q13 182 / q7 151 / q15 111 / q6 52ms。
+
+### F6 SF=5 最終 (02a2558, label PAX-SE-F6-sf5) — F5 セッション確定値
+
+**TOTAL 21.73s (M3 24.53 比 -11.4%)、md5 22/22 M3 検証値一致、RSS 18.94GB 不変。**
+q21 3887 (-360) / q1 749 (-213) / q3 630 (-153) / q15 387 / q13 1181 / q6 108 (-42%) /
+q7 795 / q12 212 / q14 183。q18 5565 / q19 1685 は本日の run 間ノイズ帯 (±8%) 内だが
+q19 は直近 band (1525-1560) 上限超えのため要経過観察 (SF=1 では -81ms 明確改善)。
+**セッション確定: SF=1 4.89→4.28s (-12.5%, InnoDB 42.2s の 9.9 倍) / SF=5 24.53→21.73s。**
+コミット 8 件 (F5a typed views / F5b flat map+run cache+bitmap / fix proxy loud-reject /
+F5c witness / F5d 並列 second-stage / F5e OR factoring / F6 ベクトル化 / docs)。
+全件 SF=0.01 ゲート (22 本 + M2 敵対 16 + 回帰 3) ×7 ラウンド + dual review。
+TPC-C は read-path 専接触のため初回スイープ (411/1538/3644/5073、基準一致) のみで確認。
+残レバー (優先順): q18 の集計そのもの (サブブロック 7.5M group、dense tier / sink-side
+radix scatter)、q19 SF=5 経過観察、StockLevel 射影プッシュダウン (over-prefetch 94KB/tx)、
+TPC-C abort 帰属 trace → backoff/delta-write、per-strip live counter、NUMA 実測、
+固定床 (override 時の iterator 構築スキップ、~2%)。
