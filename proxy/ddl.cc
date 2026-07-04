@@ -1,5 +1,6 @@
 #include "storage/lineairdb/ha_lineairdb.hh"
 
+#include <algorithm>
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
@@ -29,6 +30,72 @@ constexpr uint kUniqueSecondaryIndex = 1u;
 constexpr bool kFence = false;
 constexpr uint64_t kBackfillWriteChunkRows = 2000;
 constexpr size_t kBackfillParallelWorkers = 16;
+
+/**
+  @brief Computes PAX cell widths for the encoded row fields of `table`.
+
+  @details LineairDB rows store each MySQL field as the string payload produced
+  by Field::val_str(). The returned vector contains one maximum payload width
+  per encoded row field: entry 0 is the row null-flags field, and the remaining
+  entries follow TABLE::field order. A table with any field wider than the PAX
+  cell cap returns an empty vector so CREATE TABLE keeps the ordinary row
+  layout instead of reserving very wide cells for every row.
+
+  @return Per-field maximum payload widths, or an empty vector when the table
+  should not use PAX storage.
+*/
+std::vector<uint32_t> compute_pax_field_widths(TABLE *table) {
+  // Keep fixed-width cells bounded for variable-width columns such as TEXT.
+  constexpr uint32_t kMaxCellBytes = 2048;
+
+  std::vector<uint32_t> widths;
+  widths.reserve(table->s->fields + 1);
+  widths.push_back(table->s->null_bytes);
+
+  for (uint i = 0; i < table->s->fields; i++) {
+    Field *field = table->field[i];
+    uint32_t width = field->field_length;
+
+    switch (field->type()) {
+      case MYSQL_TYPE_TINY:
+      case MYSQL_TYPE_SHORT:
+      case MYSQL_TYPE_INT24:
+      case MYSQL_TYPE_LONG:
+      case MYSQL_TYPE_LONGLONG:
+      case MYSQL_TYPE_YEAR:
+        // Integer display width is not a payload bound for signed 64-bit text.
+        width = std::max<uint32_t>(width, 21);
+        break;
+      case MYSQL_TYPE_FLOAT:
+      case MYSQL_TYPE_DOUBLE:
+        width = std::max<uint32_t>(width, 40);
+        break;
+      case MYSQL_TYPE_DECIMAL:
+      case MYSQL_TYPE_NEWDECIMAL:
+        // Reserve slack for a sign and decimal point when Field::val_str()
+        // renders a base-10 fixed-point value.
+        width += 2;
+        break;
+      case MYSQL_TYPE_DATE:
+      case MYSQL_TYPE_NEWDATE:
+      case MYSQL_TYPE_TIME:
+      case MYSQL_TYPE_TIME2:
+      case MYSQL_TYPE_DATETIME:
+      case MYSQL_TYPE_DATETIME2:
+      case MYSQL_TYPE_TIMESTAMP:
+      case MYSQL_TYPE_TIMESTAMP2:
+        width = std::max<uint32_t>(width, 32);
+        break;
+      default:
+        break;
+    }
+
+    if (width > kMaxCellBytes) return {};
+    widths.push_back(width);
+  }
+
+  return widths;
+}
 
 }  // namespace
 
@@ -119,7 +186,7 @@ int ha_lineairdb::create(const char *table_name, TABLE *table, HA_CREATE_INFO *,
   // storage. The table/index may already exist from another node's CREATE
   // TABLE; MySQL-side metadata still needs to be created.
   auto proxy = get_proxy();
-  proxy->db_create_table(db_table_name);
+  proxy->db_create_table(db_table_name, compute_pax_field_widths(table));
 
   for (uint i = 0; i < table->s->keys; i++) {
     auto key_info = table->key_info[i];
