@@ -1288,6 +1288,13 @@ bool build_block(THD *thd, Query_block *qb,
     const Field *f1, *f2;
   };
   std::vector<std::vector<Item *>> table_filters(n_tabs);
+  // Table-local NECESSARY conditions derived from cross-table ORs (F5,
+  // q19/q7 shape): pre-serialized FilterExprs ANDed into the scan filter.
+  // Implied by the OR, so the exact cross-table predicate downstream (plan
+  // FILTER / tuple filter) is unchanged — this only stops rows that could
+  // never satisfy any branch from entering the joins.
+  std::vector<std::vector<LineairDB::Protocol::FilterExpr>>
+      table_extra_filters(n_tabs);
   std::vector<JoinEdge> edges;
   std::vector<Item *> tuple_conjuncts;  // cross-table non-equi (q7/q19 ORs)
   {
@@ -1300,6 +1307,15 @@ bool build_block(THD *thd, Query_block *qb,
       if (single >= 0 && !tab_virtual[single]) {
         table_filters[single].push_back(c);
         continue;
+      }
+      if (single < 0 && c->type() == Item::COND_ITEM &&
+          down_cast<Item_cond *>(c)->functype() == Item_func::COND_OR_FUNC) {
+        for (size_t t = 0; t < tabs.size(); ++t) {
+          if (tab_virtual[t] || !(used & tabs[t].map)) continue;
+          LineairDB::Protocol::FilterExpr fe;
+          if (serialize_or_necessary_condition(c, tabs[t].map, &fe))
+            table_extra_filters[t].push_back(std::move(fe));
+        }
       }
       // Plan mapping: join edges, nest residuals and cross-table filters
       // all come from the AccessPath tree, not the WHERE decomposition.
@@ -1506,18 +1522,22 @@ bool build_block(THD *thd, Query_block *qb,
     auto *scan = req.add_nodes()->mutable_scan();
     scan->set_table_idx(static_cast<uint32_t>(t));
     scan_node_of[t] = req.nodes_size() - 1;
-    if (!table_filters[t].empty()) {
+    const auto& extras = table_extra_filters[t];
+    if (!table_filters[t].empty() || !extras.empty()) {
       auto *pred = scan->mutable_filter();
       pred->set_num_columns(tabs[t].table->s->fields);
-      if (table_filters[t].size() == 1) {
+      if (table_filters[t].size() == 1 && extras.empty()) {
         if (!serialize_scan_conjunct(table_filters[t][0],
                                      pred->mutable_expr()))
           return false;
+      } else if (table_filters[t].empty() && extras.size() == 1) {
+        *pred->mutable_expr() = extras[0];
       } else {
         auto *root = pred->mutable_expr();
         root->set_op(LineairDB::Protocol::FilterExpr::OP_AND);
         for (Item *c : table_filters[t])
           if (!serialize_scan_conjunct(c, root->add_children())) return false;
+        for (const auto& fe : extras) *root->add_children() = fe;
       }
     }
     return true;
