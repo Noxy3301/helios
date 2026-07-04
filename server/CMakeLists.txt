@@ -54,6 +54,8 @@ set(SOURCES
     rpc/aggregate_executor.hh
     rpc/decimal_arith.cc
     rpc/decimal_arith.hh
+    rpc/flat_plan_encode.cc
+    rpc/flat_plan_encode.hh
     rpc/parallel_scan.cc
     rpc/parallel_scan.hh
     rpc/row_codec.cc
