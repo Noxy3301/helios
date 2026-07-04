@@ -52,6 +52,7 @@ set(SOURCES
     rpc/lineairdb_rpc.hh
     rpc/aggregate_executor.cc
     rpc/aggregate_executor.hh
+    rpc/database_operations.cc
     rpc/decimal_arithmetic.cc
     rpc/decimal_arithmetic.hh
     rpc/flat_plan_encode.cc
