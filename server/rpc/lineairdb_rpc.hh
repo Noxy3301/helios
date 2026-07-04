@@ -61,10 +61,11 @@ private:
     };
     static std::unordered_map<std::string, HistEntry> hist_cache_;
 
-    // Transaction lifecycle
+    // Transaction control
     void handleTxBeginTransaction(const std::string& message, std::string& result);
-    void handleTxGetTableStats(const std::string& message, std::string& result);
     void handleTxAbort(const std::string& message, std::string& result);
+    void handleDbEndTransaction(const std::string& message, std::string& result);
+    void handleDbSetTable(const std::string& message, std::string& result);
 
     // Primary key operations
     void handleTxRead(const std::string& message, std::string& result);
@@ -97,11 +98,12 @@ private:
     void handleTxFetchLastPrimaryKeyInSecondaryRange(const std::string& message, std::string& result);
     void handleTxFetchLastSecondaryEntryInRange(const std::string& message, std::string& result);
 
+    // Table statistics
+    void handleTxGetTableStats(const std::string& message, std::string& result);
+
     // Database operations
     void handleDbFence(const std::string& message, std::string& result);
-    void handleDbEndTransaction(const std::string& message, std::string& result);
     void handleDbCreateTable(const std::string& message, std::string& result);
-    void handleDbSetTable(const std::string& message, std::string& result);
     void handleDbCreateSecondaryIndex(const std::string& message, std::string& result);
 
     // utility

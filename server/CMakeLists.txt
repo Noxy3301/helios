@@ -64,6 +64,7 @@ set(SOURCES
     rpc/row_codec.hh
     rpc/stateless_operations.cc
     rpc/table_stats.cc
+    rpc/transaction_control.cc
     rpc/predicate_evaluator.cc
     rpc/predicate_evaluator.hh
     
