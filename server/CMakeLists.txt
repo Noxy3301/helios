@@ -54,6 +54,8 @@ set(SOURCES
     rpc/aggregate_executor.hh
     rpc/decimal_arith.cc
     rpc/decimal_arith.hh
+    rpc/parallel_scan.cc
+    rpc/parallel_scan.hh
     rpc/row_codec.cc
     rpc/row_codec.hh
     rpc/predicate_evaluator.cc
