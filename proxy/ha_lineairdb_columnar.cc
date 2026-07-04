@@ -781,6 +781,13 @@ bool recognize_double_aggregate(THD *thd, JOIN *join, Query_block *qb,
   }
   Query_expression *unit = qb->master_query_expression();
   if (qb->has_limit()) {
+    // LIMIT without ORDER BY picks arbitrary rows: the row engine and this
+    // executor (and even two runs of this executor, since group-map
+    // iteration order is an implementation detail) may legally differ —
+    // reject loudly instead of silently diverging (F5 dual review).
+    if (qb->order_list.first == nullptr &&
+        unit->select_limit_cnt != HA_POS_ERROR)
+      LDB_COL_REJECT("LIMIT without ORDER BY");
     if (unit->select_limit_cnt != HA_POS_ERROR)
       req.set_limit(unit->select_limit_cnt);
     if (unit->offset_limit_cnt > 0) {
@@ -1085,6 +1092,13 @@ bool recognize_flattened_agg(THD *thd, JOIN *join, Query_block *qb,
   }
   Query_expression *unit = qb->master_query_expression();
   if (qb->has_limit()) {
+    // LIMIT without ORDER BY picks arbitrary rows: the row engine and this
+    // executor (and even two runs of this executor, since group-map
+    // iteration order is an implementation detail) may legally differ —
+    // reject loudly instead of silently diverging (F5 dual review).
+    if (qb->order_list.first == nullptr &&
+        unit->select_limit_cnt != HA_POS_ERROR)
+      LDB_COL_REJECT("LIMIT without ORDER BY");
     if (unit->select_limit_cnt != HA_POS_ERROR)
       req.set_limit(unit->select_limit_cnt);
     if (unit->offset_limit_cnt > 0) {
@@ -2750,6 +2764,10 @@ bool build_block(THD *thd, Query_block *qb,
       k->set_cmp_kind(oi->result_type() == STRING_RESULT ? 1 : 0);
     }
     if (qb->has_limit()) {
+      // Same LIMIT-without-ORDER-BY loud reject as the other builders (F5).
+      if (qb->order_list.first == nullptr &&
+          unit->select_limit_cnt != HA_POS_ERROR)
+        LDB_COL_REJECT("LIMIT without ORDER BY");
       if (unit->select_limit_cnt != HA_POS_ERROR)
         req.set_limit(unit->select_limit_cnt);
       if (unit->offset_limit_cnt > 0) {
@@ -3227,6 +3245,13 @@ bool build_block(THD *thd, Query_block *qb,
 
   // LIMIT/OFFSET (values were resolved during optimize).
   if (qb->has_limit()) {
+    // LIMIT without ORDER BY picks arbitrary rows: the row engine and this
+    // executor (and even two runs of this executor, since group-map
+    // iteration order is an implementation detail) may legally differ —
+    // reject loudly instead of silently diverging (F5 dual review).
+    if (qb->order_list.first == nullptr &&
+        unit->select_limit_cnt != HA_POS_ERROR)
+      LDB_COL_REJECT("LIMIT without ORDER BY");
     if (unit->select_limit_cnt != HA_POS_ERROR)
       req.set_limit(unit->select_limit_cnt);
     if (unit->offset_limit_cnt > 0) {
