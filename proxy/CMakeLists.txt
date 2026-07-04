@@ -42,6 +42,7 @@ set(LINEAIRDB_SOURCES ha_lineairdb.cc ha_lineairdb.hh
                       dml.cc
                       index_scan.cc
                       table_scan.cc
+                      multi_range_read.cc
                       lineairdb_field.cc lineairdb_field.hh
                       lineairdb_transaction.cc lineairdb_transaction.hh
                       lineairdb_proxy.cc lineairdb_proxy.hh

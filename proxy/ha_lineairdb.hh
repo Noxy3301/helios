@@ -608,13 +608,29 @@ public:
       THD *thd, THR_LOCK_DATA **to,
       enum thr_lock_type lock_type) override; ///< required
 
-  ha_rows multi_range_read_info_const(uint keyno, RANGE_SEQ_IF *seq,
-                                      void *seq_init_param, uint n_ranges,
-                                      uint *bufsz, uint *flags, bool *force_default_mrr,
-                                      Cost_estimate *cost) override;
+  /**
+   * @brief Advertise custom batched MRR for primary-key point lookups.
+   *
+   * In non-prefetch mode, these methods clear HA_MRR_USE_DEFAULT_IMPL for
+   * primary-key lookup ranges so multi_range_read_init() can batch all keys into
+   * one LineairDB RPC. Prefetch mode keeps MySQL's default DS-MRR path because
+   * reads are already staged in the transaction cache.
+   */
+  ha_rows multi_range_read_info_const(
+      uint keyno, RANGE_SEQ_IF *seq, void *seq_init_param, uint n_ranges,
+      uint *bufsz, uint *flags, bool *force_default_mrr,
+      Cost_estimate *cost) override;
   ha_rows multi_range_read_info(uint keyno, uint n_ranges, uint keys,
                                 uint *bufsz, uint *flags,
                                 Cost_estimate *cost) override;
+
+  /**
+   * @brief Batch full primary-key point ranges or delegate to MySQL DS-MRR.
+   *
+   * Only exact full-key ranges can use LineairDBTransaction::batch_read().
+   * Partial-key and inequality ranges fall back to the default MRR
+   * implementation.
+   */
   int multi_range_read_init(RANGE_SEQ_IF *seq, void *seq_init_param,
                             uint n_ranges, uint mode,
                             HANDLER_BUFFER *buf) override;
@@ -637,10 +653,10 @@ private:
   std::string pushed_filter_serialized_;
   // True when cond_push() cannot build a server-side filter
   bool has_unpushed_filter_{false};
-  /** The multi range read session object */
+  // MySQL DS-MRR session object.
   DsMrr_impl m_ds_mrr;
 
-  // MRR batch state
+  // Custom MRR batch state.
   struct MrrBufferedRow {
     std::string value;
     char *range_info;
@@ -648,6 +664,7 @@ private:
   std::vector<MrrBufferedRow> mrr_buffer_;
   size_t mrr_buffer_pos_ = 0;
   bool mrr_use_batch_ = false;
+  static bool predict_prefetch_mode(THD *thd);
   LineairDBTransaction *&
   get_transaction(THD *thd);
   /**
