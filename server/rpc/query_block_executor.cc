@@ -27,6 +27,8 @@ using LineairDB::Pax::PaxGroup;
 using LineairDB::Pax::PaxStore;
 
 constexpr uint64_t kNullRowRef = std::numeric_limits<uint64_t>::max();
+constexpr uint32_t kTaggedColumnShift = 16;
+constexpr uint32_t kTaggedColumnMask = (uint32_t{1} << kTaggedColumnShift) - 1;
 
 void set_failure(pb::TxExecuteQueryBlock::Response* response,
                  const std::string& message) {
@@ -103,6 +105,11 @@ struct NodeResult {
         }
         return -1;
     }
+};
+
+struct DecodedColumnRef {
+    uint32_t table_idx = 0;
+    uint32_t column = 0;
 };
 
 class Executor {
@@ -201,6 +208,149 @@ class Executor {
             store->group(ref / PaxGroup::kRows),
             static_cast<uint32_t>(ref % PaxGroup::kRows),
         };
+    }
+
+    PaxRowRef RowRefForTable(const NodeResult& input, size_t row_idx,
+                             uint32_t table_idx) const {
+        const int position = input.table_pos(table_idx);
+        if (position < 0) return PaxRowRef{};
+        return ToRowRef(table_idx, input.refs[position][row_idx]);
+    }
+
+    static DecodedColumnRef DecodeAggregateColumnRef(
+        uint32_t default_table_idx, uint32_t encoded_column) {
+        if ((encoded_column >> kTaggedColumnShift) == 0) {
+            return DecodedColumnRef{default_table_idx, encoded_column};
+        }
+        return DecodedColumnRef{
+            encoded_column >> kTaggedColumnShift,
+            encoded_column & kTaggedColumnMask,
+        };
+    }
+
+    bool ValidateAggregateExpressionTables(
+        const pb::FilterExpr& expression, const NodeResult& input,
+        uint32_t default_table_idx) {
+        if (expression.op() == pb::FilterExpr::COLUMN_REF) {
+            const DecodedColumnRef column = DecodeAggregateColumnRef(
+                default_table_idx, expression.column_index());
+            if (input.table_pos(column.table_idx) < 0) {
+                return fail("aggregate expression table is not in input");
+            }
+        }
+        for (const pb::FilterExpr& child : expression.children()) {
+            if (!ValidateAggregateExpressionTables(child, input,
+                                                   default_table_idx)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    std::string_view GroupColumnValue(
+        const pb::QueryBlockColumnRef& column, uint64_t ref) const {
+        std::string_view value = extract_value_column(
+            ToRowRef(column.table_idx(), ref), column.column());
+        if (column.prefix_len() > 0 && value.size() > column.prefix_len()) {
+            value = value.substr(0, column.prefix_len());
+        }
+        return value;
+    }
+
+    bool ReadAggregateColumn(const pb::FilterExpr& expression,
+                             const NodeResult& input, size_t row_idx,
+                             uint32_t default_table_idx,
+                             std::string_view* value) const {
+        if (expression.op() != pb::FilterExpr::COLUMN_REF) return false;
+        const DecodedColumnRef column = DecodeAggregateColumnRef(
+            default_table_idx, expression.column_index());
+        PaxRowRef row = RowRefForTable(input, row_idx, column.table_idx);
+        if (row.group == nullptr) return false;
+        *value = extract_value_column(row, column.column);
+        return true;
+    }
+
+    DecimalValue EvaluateAggregateExpression(
+        const pb::FilterExpr& expression, const NodeResult& input,
+        size_t row_idx, uint32_t default_table_idx) const {
+        using FE = pb::FilterExpr;
+        switch (expression.op()) {
+            case FE::COLUMN_REF: {
+                std::string_view value;
+                if (!ReadAggregateColumn(expression, input, row_idx,
+                                         default_table_idx, &value)) {
+                    DecimalValue result;
+                    result.is_null = true;
+                    return result;
+                }
+                return parse_decimal_value(value);
+            }
+            case FE::CONST_INT: {
+                DecimalValue result;
+                result.mantissa = expression.int_val();
+                return result;
+            }
+            case FE::CONST_UINT: {
+                DecimalValue result;
+                result.mantissa =
+                    static_cast<__int128>(expression.uint_val());
+                return result;
+            }
+            case FE::OP_ADD:
+            case FE::OP_SUB: {
+                if (expression.children_size() != 2) {
+                    DecimalValue result;
+                    result.is_null = true;
+                    return result;
+                }
+                DecimalValue lhs = EvaluateAggregateExpression(
+                    expression.children(0), input, row_idx,
+                    default_table_idx);
+                DecimalValue rhs = EvaluateAggregateExpression(
+                    expression.children(1), input, row_idx,
+                    default_table_idx);
+                if (expression.op() == FE::OP_SUB) {
+                    rhs.mantissa = -rhs.mantissa;
+                }
+                add_decimal_value(lhs, rhs);
+                return lhs;
+            }
+            case FE::OP_MUL: {
+                if (expression.children_size() != 2) {
+                    DecimalValue result;
+                    result.is_null = true;
+                    return result;
+                }
+                DecimalValue lhs = EvaluateAggregateExpression(
+                    expression.children(0), input, row_idx,
+                    default_table_idx);
+                DecimalValue rhs = EvaluateAggregateExpression(
+                    expression.children(1), input, row_idx,
+                    default_table_idx);
+                DecimalValue result;
+                result.mantissa = lhs.mantissa * rhs.mantissa;
+                result.scale = lhs.scale + rhs.scale;
+                result.is_null = lhs.is_null || rhs.is_null;
+                return result;
+            }
+            case FE::OP_NEG: {
+                if (expression.children_size() != 1) {
+                    DecimalValue result;
+                    result.is_null = true;
+                    return result;
+                }
+                DecimalValue result = EvaluateAggregateExpression(
+                    expression.children(0), input, row_idx,
+                    default_table_idx);
+                result.mantissa = -result.mantissa;
+                return result;
+            }
+            default: {
+                DecimalValue result;
+                result.is_null = true;
+                return result;
+            }
+        }
     }
 
     bool RunScan(const pb::QueryBlockScan& scan, NodeResult* output) {
@@ -501,6 +651,11 @@ class Executor {
                     return fail("aggregate table is not in aggregate input");
                 }
             }
+            if (function.has_arg() &&
+                !ValidateAggregateExpressionTables(
+                    function.arg(), input, function.arg_table())) {
+                return false;
+            }
         }
 
         PredicateEvaluator evaluator;
@@ -513,9 +668,7 @@ class Executor {
                     aggregate.group_columns(group_idx);
                 const uint64_t ref =
                     input.refs[group_positions[group_idx]][row_idx];
-                group_values[group_idx] =
-                    extract_value_column(ToRowRef(column.table_idx(), ref),
-                                         column.column());
+                group_values[group_idx] = GroupColumnValue(column, ref);
                 const uint32_t length =
                     static_cast<uint32_t>(group_values[group_idx].size());
                 key_buffer.append(reinterpret_cast<const char*>(&length),
@@ -576,9 +729,9 @@ class Executor {
                         break;
                     case pb::QueryBlockAggFunc::SUM:
                     case pb::QueryBlockAggFunc::AVG: {
-                        DecimalValue value = evaluate_decimal_expression(
-                            function.arg(),
-                            ToRowRef(function.arg_table(), ref));
+                        DecimalValue value = EvaluateAggregateExpression(
+                            function.arg(), input, row_idx,
+                            function.arg_table());
                         if (value.is_null) break;
                         add_decimal_value(state->decimals[aggregate_idx],
                                           value);
@@ -590,9 +743,13 @@ class Executor {
                         const bool wants_max =
                             function.kind() == pb::QueryBlockAggFunc::MAX;
                         if (function.cmp_kind() == 1) {
-                            std::string_view value = extract_value_column(
-                                ToRowRef(function.arg_table(), ref),
-                                function.arg().column_index());
+                            std::string_view value;
+                            if (!ReadAggregateColumn(function.arg(), input,
+                                                     row_idx,
+                                                     function.arg_table(),
+                                                     &value)) {
+                                break;
+                            }
                             if (!state->has_value[aggregate_idx] ||
                                 (wants_max
                                      ? value >
@@ -605,9 +762,9 @@ class Executor {
                                     std::string(value);
                             }
                         } else {
-                            DecimalValue value = evaluate_decimal_expression(
-                                function.arg(),
-                                ToRowRef(function.arg_table(), ref));
+                            DecimalValue value = EvaluateAggregateExpression(
+                                function.arg(), input, row_idx,
+                                function.arg_table());
                             if (value.is_null) break;
                             if (!state->has_value[aggregate_idx] ||
                                 (wants_max
