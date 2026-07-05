@@ -517,6 +517,23 @@ public:
    */
   bool tx_is_aborted();
 
+  /**
+   * @brief Register a grouped aggregate leaf for synthetic summary-row serving.
+   */
+  void tx_register_grouped_summary(
+      LineairDBTransaction::GroupedSummaryRegistration registration);
+
+  /**
+   * @brief Register a grouped semijoin reduction for this statement.
+   */
+  void tx_register_grouped_semijoin(
+      LineairDBTransaction::GroupedSemijoin grouped_semijoin);
+
+  /**
+   * @brief Return true if this statement already has grouped-semijoin state.
+   */
+  bool tx_has_grouped_semijoin();
+
   int rnd_pos(uchar *buf, uchar *pos) override; ///< required
   void position(const uchar *record) override;  ///< required
   /**

@@ -5,6 +5,7 @@
 #include <map>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 #include "lineairdb.pb.h"
@@ -735,6 +736,56 @@ bool ha_lineairdb::tx_set_pushed_aggregate(const std::string &s) {
 bool ha_lineairdb::tx_is_aborted() {
   auto tx = get_transaction(ha_thd());
   return tx == nullptr || tx->is_aborted();
+}
+
+/**
+ * @brief Register a grouped aggregate leaf for synthetic summary-row serving.
+ */
+void ha_lineairdb::tx_register_grouped_summary(
+    LineairDBTransaction::GroupedSummaryRegistration registration) {
+  auto tx = get_transaction(ha_thd());
+  if (tx == nullptr) return;
+
+  THD *thd = ha_thd();
+  const uint64_t query_id =
+      thd != nullptr ? static_cast<uint64_t>(thd->query_id) : 0;
+  if (tx->autogen_query_id() != query_id) {
+    tx->reset_autogen_for_statement(query_id);
+  }
+  tx->register_grouped_summary(table, std::move(registration));
+}
+
+/**
+ * @brief Register a grouped semijoin reduction for this statement.
+ */
+void ha_lineairdb::tx_register_grouped_semijoin(
+    LineairDBTransaction::GroupedSemijoin grouped_semijoin) {
+  auto tx = get_transaction(ha_thd());
+  if (tx == nullptr) return;
+
+  THD *thd = ha_thd();
+  const uint64_t query_id =
+      thd != nullptr ? static_cast<uint64_t>(thd->query_id) : 0;
+  if (tx->autogen_query_id() != query_id) {
+    tx->reset_autogen_for_statement(query_id);
+  }
+  tx->register_grouped_semijoin(std::move(grouped_semijoin));
+}
+
+/**
+ * @brief Return true if this statement already has grouped-semijoin state.
+ */
+bool ha_lineairdb::tx_has_grouped_semijoin() {
+  auto tx = get_transaction(ha_thd());
+  if (tx == nullptr) return false;
+
+  THD *thd = ha_thd();
+  const uint64_t query_id =
+      thd != nullptr ? static_cast<uint64_t>(thd->query_id) : 0;
+  if (tx->autogen_query_id() != query_id) return false;
+
+  return tx->has_grouped_summary_registrations() ||
+         !tx->grouped_semijoins().empty();
 }
 
 /**
