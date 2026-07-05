@@ -195,6 +195,7 @@ private:
   std::string serialize_hidden_primary_key(uint64_t row_id) const;
   bool fetch_next_batch();
   void reset_index_search_buffers();
+  int fill_grouped_summary_buffers(LineairDBTransaction *tx);
 
 public:
   ha_lineairdb(handlerton *hton, TABLE_SHARE *table_arg);

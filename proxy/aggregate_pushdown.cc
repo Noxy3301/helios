@@ -9,6 +9,7 @@
 #include <vector>
 
 #include "lineairdb.pb.h"
+#include "lineairdb_keyenc.hh"
 #include "lineairdb_pushdown.hh"
 #include "storage/lineairdb/ha_lineairdb.hh"
 #include "sql/field.h"
@@ -793,6 +794,133 @@ bool ha_lineairdb::tx_has_grouped_semijoin() {
  */
 LineairDBTransaction *ha_lineairdb::tx_for_autogen() {
   return get_transaction(ha_thd());
+}
+
+/**
+ * @brief Materialize a skipped grouped summary leaf as synthetic handler rows.
+ *
+ * Autogen removes the base full-table scan for a recognized grouped summary
+ * leaf, then this helper serves the server-produced group rows through the
+ * normal handler cursor buffers that rnd_next() and index_next() consume.
+ */
+int ha_lineairdb::fill_grouped_summary_buffers(LineairDBTransaction *tx) {
+  const LineairDBTransaction::GroupedSummaryRegistration *registration =
+      tx->grouped_summary_registration(table);
+  if (registration == nullptr) {
+    my_error(ER_INTERNAL_ERROR, MYF(0),
+             "grouped summary scan skipped without registration");
+    return HA_ERR_INTERNAL_ERROR;
+  }
+
+  std::vector<std::string> group_rows;
+  if (const std::vector<std::string> *cached =
+          tx->grouped_semijoin_group_rows(db_table_name)) {
+    group_rows = *cached;
+  } else {
+    LineairDBProxy::ReadPlanStep step;
+    step.table_name = db_table_name;
+    step.is_scan = true;
+    step.end_key_prefix = lineairdb_keyenc::scan_end_sentinel();
+    step.aggregate_serialized = registration->spec;
+    step.serialized_filter = registration->filter;
+    if (!tx->execute_read_plan_raw({step}, &group_rows)) {
+      my_error(ER_LOCK_DEADLOCK, MYF(0));
+      return HA_ERR_LOCK_DEADLOCK;
+    }
+    tx->cache_grouped_semijoin_group_rows(db_table_name, group_rows);
+  }
+
+  reset_index_search_buffers();
+  scanned_keys_.clear();
+  scanned_values_.clear();
+  scan_cache_.clear();
+  buffer_position_ = 0;
+  scan_exhausted_ = true;
+
+  secondary_index_results_.reserve(group_rows.size());
+  secondary_index_payloads_.reserve(group_rows.size());
+  scanned_keys_.reserve(group_rows.size());
+  scanned_values_.reserve(group_rows.size());
+
+  const uint field_count = table->s->fields;
+  if (registration->template_cols.size() != field_count ||
+      registration->group_col >= field_count ||
+      registration->col_a >= field_count ||
+      (!registration->single_sum && registration->col_b >= field_count)) {
+    my_error(ER_INTERNAL_ERROR, MYF(0),
+             "grouped summary registration does not match table shape");
+    return HA_ERR_INTERNAL_ERROR;
+  }
+
+  std::vector<uchar> null_flags(table->s->null_bytes, 0);
+  LineairDBField encoder;
+  LineairDBField group_decoder;
+  const size_t synthetic_key_size =
+      ref_length > sizeof(uint16_t) ? ref_length - sizeof(uint16_t) : 0;
+  if (synthetic_key_size < 2) {
+    my_error(ER_INTERNAL_ERROR, MYF(0),
+             "grouped summary cursor ref is too small");
+    return HA_ERR_INTERNAL_ERROR;
+  }
+
+  for (const std::string &group_row : group_rows) {
+    group_decoder.make_mysql_table_row(
+        reinterpret_cast<const std::byte *>(group_row.data()),
+        group_row.size());
+    if (group_decoder.get_row_size() < (registration->single_sum ? 2 : 3)) {
+      my_error(ER_INTERNAL_ERROR, MYF(0), "malformed grouped summary row");
+      return HA_ERR_INTERNAL_ERROR;
+    }
+
+    std::vector<std::string> row = registration->template_cols;
+    row[registration->group_col] =
+        std::string(group_decoder.get_column_of_row(0));
+    row[registration->col_a] = std::string(group_decoder.get_column_of_row(1));
+    if (!registration->single_sum) {
+      row[registration->col_b] =
+          std::string(group_decoder.get_column_of_row(2));
+    }
+
+    encoder.set_null_field(null_flags.data(), null_flags.size());
+    std::string encoded_row = encoder.get_null_field();
+    for (const std::string &field : row) {
+      encoder.set_lineairdb_field(field.data(), field.size());
+      encoded_row += encoder.get_lineairdb_field();
+    }
+
+    const size_t row_index = scanned_values_.size();
+    const size_t ordinal_bytes = synthetic_key_size - 1;
+    if (ordinal_bytes < sizeof(size_t) &&
+        (row_index >> (ordinal_bytes * 8)) != 0) {
+      my_error(ER_INTERNAL_ERROR, MYF(0),
+               "grouped summary cursor key space exhausted");
+      return HA_ERR_INTERNAL_ERROR;
+    }
+
+    // Grouped summary rows are aggregate output, so they have no storage
+    // primary key. The handler cursor still needs a key for position(),
+    // rnd_pos(), and scan_cache_; keep it within ref_length because MySQL
+    // copies this value through the handler ref buffer.
+    std::string synthetic_key(synthetic_key_size, '\0');
+    synthetic_key[0] = '\x01';
+    for (size_t byte = 1; byte < synthetic_key.size() &&
+                          byte <= sizeof(size_t);
+         ++byte) {
+      synthetic_key[byte] =
+          static_cast<char>((row_index >> ((byte - 1) * 8)) & 0xff);
+    }
+
+    scanned_keys_.push_back(synthetic_key);
+    secondary_index_results_.push_back(synthetic_key);
+    secondary_index_payloads_.push_back(encoded_row);
+    scan_cache_[synthetic_key] = row_index;
+    scanned_values_.emplace_back(
+        reinterpret_cast<const std::byte *>(encoded_row.data()),
+        reinterpret_cast<const std::byte *>(encoded_row.data()) +
+            encoded_row.size());
+  }
+
+  return 0;
 }
 
 /**
