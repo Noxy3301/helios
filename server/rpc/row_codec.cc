@@ -86,6 +86,17 @@ std::string_view extract_value_column(const std::string& row,
     return {};
 }
 
+std::string_view extract_value_column(const PaxRowRef& row, int column_index) {
+    if (row.group == nullptr || column_index < 0 ||
+        row.slot >= LineairDB::Pax::PaxGroup::kRows) {
+        return {};
+    }
+
+    const size_t field_index = static_cast<size_t>(column_index) + 1;
+    if (field_index >= row.group->schema().field_count()) return {};
+    return row.group->cell(field_index, row.slot);
+}
+
 std::string encode_int_key_part(int64_t value) {
     const auto encoded = static_cast<uint32_t>(static_cast<int32_t>(value)) ^
                          0x80000000U;

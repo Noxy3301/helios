@@ -5,6 +5,7 @@
 #include <string_view>
 
 #include <google/protobuf/repeated_field.h>
+#include <lineairdb/pax_store.h>
 
 // Byte-level encode/decode helpers shared across the RPC handlers:
 // LineairDBField-format row access plus the int-keyed primary-key layout
@@ -12,6 +13,17 @@
 
 // Bump the byte string to its lexicographic successor; returns empty on overflow.
 std::string next_lexicographic_key(std::string key);
+
+/**
+ * @brief Borrowed view of one row stored in a PAX group.
+ *
+ * Server-side evaluators use this to read column values from PAX strips without
+ * materializing a full LineairDBField-format row.
+ */
+struct PaxRowRef {
+    const LineairDB::Pax::PaxGroup* group = nullptr;
+    uint32_t slot = 0;
+};
 
 /**
  * @brief Trim a serialized row value to the projected columns.
@@ -26,9 +38,16 @@ bool trim_row_value(const std::string& full,
                     const google::protobuf::RepeatedField<uint32_t>& kept,
                     uint32_t num_columns, std::string& out);
 
-// Return the bytes of column `column_index` from a serialized MySQL row payload.
+/**
+ * @brief Return the bytes of a column from a serialized MySQL row payload.
+ */
 std::string_view extract_value_column(const std::string& row,
                                       int column_index);
+
+/**
+ * @brief Return the bytes of a column from a PAX row slot.
+ */
+std::string_view extract_value_column(const PaxRowRef& row, int column_index);
 
 /**
  * @brief Build an int-keyed primary-key part in LineairDB's byte layout.

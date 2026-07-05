@@ -72,15 +72,11 @@ void combine_decimal_values(DecimalValue& a, const DecimalValue& b,
     a.is_null = a.is_null || b.is_null;
 }
 
-}  // namespace
-
-void add_decimal_value(DecimalValue& total, const DecimalValue& value) {
-    combine_decimal_values(total, value, DecimalOperation::kAdd);
-}
-
-DecimalValue evaluate_decimal_expression(
-    const LineairDB::Protocol::FilterExpr& expression,
-    const std::string& row) {
+template <typename Row>
+DecimalValue evaluate_decimal_expression_impl(
+    const LineairDB::Protocol::FilterExpr& expression, const Row& row) {
+    // FilterExpr is reused here as a scalar-expression tree, not as a boolean
+    // row filter.
     using FE = LineairDB::Protocol::FilterExpr;
     switch (expression.op()) {
         case FE::COLUMN_REF:
@@ -104,10 +100,11 @@ DecimalValue evaluate_decimal_expression(
                 d.is_null = true;
                 return d;
             }
-            DecimalValue a = evaluate_decimal_expression(
+            DecimalValue a = evaluate_decimal_expression_impl(
                 expression.children(0), row);
             combine_decimal_values(
-                a, evaluate_decimal_expression(expression.children(1), row),
+                a,
+                evaluate_decimal_expression_impl(expression.children(1), row),
                 DecimalOperation::kAdd);
             return a;
         }
@@ -117,10 +114,11 @@ DecimalValue evaluate_decimal_expression(
                 d.is_null = true;
                 return d;
             }
-            DecimalValue a = evaluate_decimal_expression(
+            DecimalValue a = evaluate_decimal_expression_impl(
                 expression.children(0), row);
             combine_decimal_values(
-                a, evaluate_decimal_expression(expression.children(1), row),
+                a,
+                evaluate_decimal_expression_impl(expression.children(1), row),
                 DecimalOperation::kSubtract);
             return a;
         }
@@ -130,9 +128,9 @@ DecimalValue evaluate_decimal_expression(
                 d.is_null = true;
                 return d;
             }
-            DecimalValue a = evaluate_decimal_expression(
+            DecimalValue a = evaluate_decimal_expression_impl(
                 expression.children(0), row);
-            DecimalValue b = evaluate_decimal_expression(
+            DecimalValue b = evaluate_decimal_expression_impl(
                 expression.children(1), row);
             DecimalValue r;
             r.mantissa = a.mantissa * b.mantissa;
@@ -146,7 +144,7 @@ DecimalValue evaluate_decimal_expression(
                 d.is_null = true;
                 return d;
             }
-            DecimalValue a = evaluate_decimal_expression(
+            DecimalValue a = evaluate_decimal_expression_impl(
                 expression.children(0), row);
             a.mantissa = -a.mantissa;
             return a;
@@ -157,6 +155,24 @@ DecimalValue evaluate_decimal_expression(
             return d;
         }
     }
+}
+
+}  // namespace
+
+void add_decimal_value(DecimalValue& total, const DecimalValue& value) {
+    combine_decimal_values(total, value, DecimalOperation::kAdd);
+}
+
+DecimalValue evaluate_decimal_expression(
+    const LineairDB::Protocol::FilterExpr& expression,
+    const std::string& row) {
+    return evaluate_decimal_expression_impl(expression, row);
+}
+
+DecimalValue evaluate_decimal_expression(
+    const LineairDB::Protocol::FilterExpr& expression,
+    const PaxRowRef& row) {
+    return evaluate_decimal_expression_impl(expression, row);
 }
 
 std::string format_decimal_value(const DecimalValue& value) {
