@@ -14,6 +14,7 @@
 #include "storage/lineairdb/ha_lineairdb.hh"
 #include "sql/field.h"
 #include "sql/item.h"
+#include "sql/item_cmpfunc.h"
 #include "sql/item_func.h"
 #include "sql/item_sum.h"
 #include "sql/join_optimizer/access_path.h"
@@ -55,6 +56,20 @@ struct LineairDBAggAccumulator {
   my_decimal p_dec;
   String p_str;            // owns a copy
 };
+
+// HAVING predicate form supported by grouped-semijoin pushdown.
+struct LineairDBHavingPredicate {
+  Item_sum *aggregate = nullptr;
+  LineairDBAggKind kind = LineairDBAggKind::kCount;
+  Item *arg = nullptr;
+  Item_result result_type = INT_RESULT;
+  Item_func::Functype op = Item_func::EQ_FUNC;
+  Item *constant = nullptr;
+};
+
+// Keep aggregate decimal inputs inside the server's __int128 accumulator.
+constexpr uint kLineairDBAggregateDecimalPrecisionMax = 18;
+
 }  // namespace
 
 /**
@@ -184,6 +199,44 @@ static bool is_aggregate_pushdown_shape(THD *thd, JOIN *join) {
 }
 
 /**
+ * @brief Return true if a Field::val_str() value is safe decimal input.
+ *
+ * The server parses aggregate arguments from raw column bytes, so accepted
+ * fields must serialize to decimal text with the same meaning SQL gives them.
+ * Temporal text and wide DECIMAL values are rejected here rather than relying
+ * on server-side overflow checks.
+ */
+static bool is_safe_decimal_aggregate_field(const Field *field) {
+  if (field == nullptr || field->is_array()) return false;
+  switch (field->real_type()) {
+    case MYSQL_TYPE_TINY:
+    case MYSQL_TYPE_SHORT:
+    case MYSQL_TYPE_INT24:
+    case MYSQL_TYPE_LONG:
+    case MYSQL_TYPE_LONGLONG:
+      return field->result_type() == INT_RESULT;
+    case MYSQL_TYPE_NEWDECIMAL:
+      return field->result_type() == DECIMAL_RESULT &&
+             down_cast<const Field_new_decimal *>(field)->precision <=
+                 kLineairDBAggregateDecimalPrecisionMax;
+    default:
+      return false;
+  }
+}
+
+/**
+ * @brief Return a bare field item if it is valid decimal aggregate input.
+ */
+static Item_field *safe_bare_decimal_aggregate_arg(Item *arg) {
+  if (arg == nullptr) return nullptr;
+  Item *real = arg->real_item();
+  if (real == nullptr || real->type() != Item::FIELD_ITEM) return nullptr;
+  Item_field *field_arg = down_cast<Item_field *>(real);
+  return is_safe_decimal_aggregate_field(field_arg->field) ? field_arg
+                                                          : nullptr;
+}
+
+/**
  * @brief Allocate writable Item_cache cells for the already-described output.
  */
 static bool make_aggregate_output_caches(JOIN *join,
@@ -244,6 +297,155 @@ static bool serialize_aggregate_expression(
     default:
       return false;
   }
+}
+
+/**
+ * @brief Classify COUNT/SUM/AVG used by a supported HAVING predicate.
+ */
+static bool classify_having_aggregate(Item_sum *sum,
+                                      LineairDBHavingPredicate *out) {
+  if (sum == nullptr || out == nullptr) return false;
+  if (sum->has_wf() || sum->has_subquery()) return false;
+  switch (sum->sum_func()) {
+    case Item_sum::COUNT_FUNC:
+      out->kind = LineairDBAggKind::kCount;
+      if (sum->argument_count() > 0) {
+        Item *arg0 = sum->arguments()[0];
+        if (!arg0->const_item() || arg0->is_nullable() || arg0->is_null()) {
+          return false;
+        }
+      }
+      break;
+    case Item_sum::SUM_FUNC:
+      out->kind = LineairDBAggKind::kSum;
+      break;
+    case Item_sum::AVG_FUNC:
+      out->kind = LineairDBAggKind::kAvg;
+      break;
+    default:
+      return false;
+  }
+
+  out->result_type = sum->result_type();
+  if (out->kind != LineairDBAggKind::kCount &&
+      out->result_type != DECIMAL_RESULT && out->result_type != INT_RESULT) {
+    return false;
+  }
+  out->arg = sum->argument_count() > 0 ? sum->arguments()[0] : nullptr;
+  if (out->arg != nullptr &&
+      (out->arg->has_subquery() || out->arg->has_aggregation() ||
+       out->arg->is_non_deterministic())) {
+    return false;
+  }
+  if (out->kind != LineairDBAggKind::kCount) {
+    Item_field *field_arg = safe_bare_decimal_aggregate_arg(out->arg);
+    if (field_arg == nullptr) return false;
+    out->arg = field_arg;
+  }
+  out->aggregate = sum;
+  return true;
+}
+
+/**
+ * @brief Parse HAVING of the form aggregate(column) compare constant.
+ *
+ * MySQL can add in2exists helper predicates to HAVING during subquery
+ * optimization. Those generated predicates are ignored; any user-written
+ * HAVING must be a single supported aggregate comparison.
+ */
+static bool parse_aggregate_having(Query_block *query_block,
+                                   LineairDBHavingPredicate *out) {
+  if (query_block == nullptr || out == nullptr) return false;
+  *out = LineairDBHavingPredicate();
+  Item *having = query_block->having_cond();
+  if (having == nullptr) return true;
+
+  if (having->type() == Item::COND_ITEM &&
+      down_cast<Item_cond *>(having)->functype() ==
+          Item_func::COND_AND_FUNC) {
+    Item *user_having = nullptr;
+    for (Item &condition : *down_cast<Item_cond *>(having)->argument_list()) {
+      if (condition.created_by_in2exists()) continue;
+      if (user_having != nullptr) return false;
+      user_having = &condition;
+    }
+    if (user_having == nullptr) return true;
+    having = user_having;
+  } else if (having->created_by_in2exists()) {
+    return true;
+  }
+
+  if (having->type() != Item::FUNC_ITEM) return false;
+  Item_func *func = down_cast<Item_func *>(having);
+  Item_func::Functype op = func->functype();
+  switch (op) {
+    case Item_func::EQ_FUNC:
+    case Item_func::NE_FUNC:
+    case Item_func::LT_FUNC:
+    case Item_func::LE_FUNC:
+    case Item_func::GT_FUNC:
+    case Item_func::GE_FUNC:
+      break;
+    default:
+      return false;
+  }
+  if (func->argument_count() != 2) return false;
+
+  Item *lhs = func->arguments()[0]->real_item();
+  Item *rhs = func->arguments()[1]->real_item();
+  Item *aggregate_side = nullptr;
+  Item *constant_side = nullptr;
+  bool aggregate_on_left = false;
+  if (lhs->type() == Item::SUM_FUNC_ITEM && rhs->const_item()) {
+    aggregate_side = lhs;
+    constant_side = rhs;
+    aggregate_on_left = true;
+  } else if (rhs->type() == Item::SUM_FUNC_ITEM && lhs->const_item()) {
+    aggregate_side = rhs;
+    constant_side = lhs;
+  } else {
+    return false;
+  }
+  if (constant_side->has_subquery() ||
+      constant_side->is_non_deterministic()) {
+    return false;
+  }
+  const Item_result constant_type = constant_side->result_type();
+  if (constant_type != INT_RESULT && constant_type != DECIMAL_RESULT) {
+    return false;
+  }
+  if (constant_type == DECIMAL_RESULT &&
+      constant_side->decimal_precision() >
+          kLineairDBAggregateDecimalPrecisionMax) {
+    return false;
+  }
+  if (!classify_having_aggregate(down_cast<Item_sum *>(aggregate_side), out)) {
+    return false;
+  }
+
+  if (aggregate_on_left) {
+    out->op = op;
+  } else {
+    switch (op) {
+      case Item_func::LT_FUNC:
+        out->op = Item_func::GT_FUNC;
+        break;
+      case Item_func::LE_FUNC:
+        out->op = Item_func::GE_FUNC;
+        break;
+      case Item_func::GT_FUNC:
+        out->op = Item_func::LT_FUNC;
+        break;
+      case Item_func::GE_FUNC:
+        out->op = Item_func::LE_FUNC;
+        break;
+      default:
+        out->op = op;
+        break;
+    }
+  }
+  out->constant = constant_side;
+  return true;
 }
 
 /**
