@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cassert>
 #include <cstdint>
+#include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -1427,8 +1428,306 @@ bool RecognizeQueryBlock(JOIN *join, ColumnarExecutionContext *ctx,
   std::vector<Item *> output_items;
   for (Item *item : VisibleFields(qb->fields)) output_items.push_back(item);
 
+  const char *aggregate_error = nullptr;
+  auto register_aggregate = [&](Item_sum *sum) -> int {
+    if (sum->argument_count() > 1) {
+      aggregate_error = "aggregate arg count";
+      return -1;
+    }
+
+    auto *function = aggregate->add_aggs();
+    switch (sum->sum_func()) {
+      case Item_sum::COUNT_FUNC: {
+        function->set_arg_table(0);
+        if (sum->argument_count() > 0) {
+          Item *arg = sum->get_arg(0)->real_item();
+          if (arg->const_item()) {
+            if (arg->is_nullable() || arg->is_null()) {
+              aggregate_error = "COUNT const nullable";
+              return -1;
+            }
+          } else {
+            if (arg->type() != Item::FIELD_ITEM) {
+              aggregate_error = "COUNT arg shape";
+              return -1;
+            }
+            const Field *raw_count_field =
+                down_cast<Item_field *>(arg)->field;
+            const int count_table = TableIndexOfField(raw_count_field, tables);
+            const Field *count_field =
+                count_table >= 0
+                    ? ResolveBaseField(raw_count_field,
+                                       tables[count_table].table)
+                    : nullptr;
+            if (count_field == nullptr || count_field->is_nullable()) {
+              aggregate_error = "COUNT arg nullable";
+              return -1;
+            }
+            function->set_arg_table(static_cast<uint32_t>(count_table));
+            auto *ref = function->mutable_arg();
+            ref->set_op(LineairDB::Protocol::FilterExpr::COLUMN_REF);
+            ref->set_column_index(count_field->field_index());
+          }
+        }
+
+        function->set_kind(LineairDB::Protocol::QueryBlockAggFunc::COUNT);
+        return aggregate->aggs_size() - 1;
+      }
+
+      case Item_sum::SUM_FUNC:
+      case Item_sum::AVG_FUNC: {
+        if (sum->argument_count() != 1) {
+          aggregate_error = "aggregate arg count";
+          return -1;
+        }
+        Item *arg = sum->get_arg(0)->real_item();
+        if (sum->sum_func() == Item_sum::SUM_FUNC) {
+          if (Item *filter = CaseToCountFilter(arg)) {
+            const int filter_table = SingleTableOf(
+                filter->used_tables() & ~PSEUDO_TABLE_BITS, tables);
+            if (filter_table < 0) {
+              aggregate_error = "CASE filter tables";
+              return -1;
+            }
+            auto *predicate = function->mutable_filter();
+            predicate->set_num_columns(tables[filter_table].table->s->fields);
+            if (!serialize_item(filter, predicate->mutable_expr())) {
+              aggregate_error = "CASE filter not pushable";
+              return -1;
+            }
+            function->set_arg_table(static_cast<uint32_t>(filter_table));
+            function->set_kind(LineairDB::Protocol::QueryBlockAggFunc::COUNT);
+            return aggregate->aggs_size() - 1;
+          }
+
+          Item *filter = nullptr;
+          Item *then_expr = nullptr;
+          if (CaseToFilteredSum(arg, &filter, &then_expr)) {
+            if (then_expr->result_type() != DECIMAL_RESULT &&
+                then_expr->result_type() != INT_RESULT) {
+              aggregate_error = "CASE expression type";
+              return -1;
+            }
+
+            const int filter_table = SingleTableOf(
+                filter->used_tables() & ~PSEUDO_TABLE_BITS, tables);
+            if (filter_table < 0) {
+              aggregate_error = "CASE filter tables";
+              return -1;
+            }
+            auto *predicate = function->mutable_filter();
+            predicate->set_num_columns(tables[filter_table].table->s->fields);
+            if (!serialize_item(filter, predicate->mutable_expr())) {
+              aggregate_error = "CASE filter not pushable";
+              return -1;
+            }
+
+            int argument_table = SingleTableOf(
+                then_expr->used_tables() & ~PSEUDO_TABLE_BITS, tables);
+            if (argument_table >= 0 &&
+                then_expr->real_item()->type() == Item::FIELD_ITEM) {
+              const Field *raw_argument_field =
+                  down_cast<Item_field *>(then_expr->real_item())->field;
+              const Field *argument_field = ResolveBaseField(
+                  raw_argument_field, tables[argument_table].table);
+              if (argument_field == nullptr) {
+                aggregate_error = "CASE expression unresolvable";
+                return -1;
+              }
+
+              auto *ref = function->mutable_arg();
+              ref->set_op(LineairDB::Protocol::FilterExpr::COLUMN_REF);
+              ref->set_column_index(argument_field->field_index());
+            } else if (argument_table >= 0) {
+              if (!lineairdb::serialize_aggregate_expression(
+                      then_expr->real_item(), function->mutable_arg())) {
+                aggregate_error = "CASE expression not pushable";
+                return -1;
+              }
+            } else {
+              argument_table = 0;
+              if (!SerializeAggregateExpressionForTables(
+                      then_expr->real_item(), tables,
+                      static_cast<uint32_t>(argument_table),
+                      function->mutable_arg())) {
+                aggregate_error = "CASE expression not pushable";
+                return -1;
+              }
+            }
+
+            function->set_arg_table(static_cast<uint32_t>(argument_table));
+            function->set_filter_table(static_cast<uint32_t>(filter_table));
+            function->set_kind(LineairDB::Protocol::QueryBlockAggFunc::SUM);
+            function->set_arg_scale(then_expr->decimals);
+            function->set_zero_if_empty(true);
+            return aggregate->aggs_size() - 1;
+          }
+        }
+        if (arg->result_type() != DECIMAL_RESULT &&
+            arg->result_type() != INT_RESULT) {
+          aggregate_error = "aggregate arg type";
+          return -1;
+        }
+
+        int argument_table =
+            SingleTableOf(arg->used_tables() & ~PSEUDO_TABLE_BITS, tables);
+        if (argument_table >= 0 && arg->type() == Item::FIELD_ITEM) {
+          const Field *raw_argument_field =
+              down_cast<Item_field *>(arg)->field;
+          const Field *argument_field = ResolveBaseField(
+              raw_argument_field, tables[argument_table].table);
+          if (argument_field == nullptr) {
+            aggregate_error = "aggregate arg unresolvable";
+            return -1;
+          }
+
+          auto *ref = function->mutable_arg();
+          ref->set_op(LineairDB::Protocol::FilterExpr::COLUMN_REF);
+          ref->set_column_index(argument_field->field_index());
+        } else if (argument_table >= 0) {
+          if (!lineairdb::serialize_aggregate_expression(
+                  arg, function->mutable_arg())) {
+            aggregate_error = "aggregate expr not pushable";
+            return -1;
+          }
+        } else {
+          argument_table = 0;
+          if (!SerializeAggregateExpressionForTables(
+                  arg, tables, static_cast<uint32_t>(argument_table),
+                  function->mutable_arg())) {
+            aggregate_error = "aggregate expr not pushable";
+            return -1;
+          }
+        }
+
+        function->set_arg_table(static_cast<uint32_t>(argument_table));
+        function->set_kind(
+            sum->sum_func() == Item_sum::SUM_FUNC
+                ? LineairDB::Protocol::QueryBlockAggFunc::SUM
+                : LineairDB::Protocol::QueryBlockAggFunc::AVG);
+        function->set_arg_scale(arg->decimals);
+        return aggregate->aggs_size() - 1;
+      }
+
+      case Item_sum::MIN_FUNC:
+      case Item_sum::MAX_FUNC: {
+        if (sum->argument_count() != 1) {
+          aggregate_error = "aggregate arg count";
+          return -1;
+        }
+        Item *arg = sum->get_arg(0)->real_item();
+        if (arg->type() != Item::FIELD_ITEM) {
+          aggregate_error = "minmax arg";
+          return -1;
+        }
+        const Field *raw_argument_field =
+            down_cast<Item_field *>(arg)->field;
+        const int argument_table =
+            TableIndexOfField(raw_argument_field, tables);
+        const Field *argument_field =
+            argument_table >= 0
+                ? ResolveBaseField(raw_argument_field,
+                                   tables[argument_table].table)
+                : nullptr;
+        if (argument_field == nullptr) {
+          aggregate_error = "minmax unresolvable";
+          return -1;
+        }
+        if (argument_field->is_nullable()) {
+          aggregate_error = "minmax nullable";
+          return -1;
+        }
+        if (argument_field->result_type() == STRING_RESULT &&
+            !argument_field->binary()) {
+          aggregate_error = "minmax collation";
+          return -1;
+        }
+
+        auto *ref = function->mutable_arg();
+        ref->set_op(LineairDB::Protocol::FilterExpr::COLUMN_REF);
+        ref->set_column_index(argument_field->field_index());
+        function->set_arg_table(static_cast<uint32_t>(argument_table));
+        function->set_kind(
+            sum->sum_func() == Item_sum::MIN_FUNC
+                ? LineairDB::Protocol::QueryBlockAggFunc::MIN
+                : LineairDB::Protocol::QueryBlockAggFunc::MAX);
+        function->set_cmp_kind(argument_field->result_type() == STRING_RESULT
+                                   ? 1
+                                   : 0);
+        return aggregate->aggs_size() - 1;
+      }
+
+      default:
+        aggregate_error = "aggregate kind unsupported";
+        return -1;
+    }
+  };
+
+  const uint32_t aggregate_output_base = aggregate->group_columns_size();
+  std::function<bool(Item *, LineairDB::Protocol::FilterExpr *)>
+      serialize_output_expression =
+          [&](Item *item, LineairDB::Protocol::FilterExpr *expr) -> bool {
+    item = item->real_item();
+    if (item->type() == Item::SUM_FUNC_ITEM) {
+      const int ordinal = register_aggregate(down_cast<Item_sum *>(item));
+      if (ordinal < 0) return false;
+      expr->set_op(LineairDB::Protocol::FilterExpr::COLUMN_REF);
+      expr->set_column_index(aggregate_output_base +
+                             static_cast<uint32_t>(ordinal));
+      return true;
+    }
+    if (item->type() == Item::INT_ITEM) {
+      expr->set_op(LineairDB::Protocol::FilterExpr::CONST_INT);
+      expr->set_int_val(item->val_int());
+      return true;
+    }
+    if (item->const_item() && (item->result_type() == DECIMAL_RESULT ||
+                               item->result_type() == REAL_RESULT)) {
+      String buffer;
+      String *value = item->val_str(&buffer);
+      if (value == nullptr) return false;
+      expr->set_op(LineairDB::Protocol::FilterExpr::CONST_STRING);
+      expr->set_string_val(value->ptr(), value->length());
+      return true;
+    }
+    if (item->type() != Item::FUNC_ITEM) return false;
+
+    auto *function = down_cast<Item_func *>(item);
+    using FilterExpr = LineairDB::Protocol::FilterExpr;
+    FilterExpr::Op op;
+    switch (function->functype()) {
+      case Item_func::PLUS_FUNC:
+        op = FilterExpr::OP_ADD;
+        break;
+      case Item_func::MINUS_FUNC:
+        op = FilterExpr::OP_SUB;
+        break;
+      case Item_func::MUL_FUNC:
+        op = FilterExpr::OP_MUL;
+        break;
+      case Item_func::DIV_FUNC:
+        op = FilterExpr::OP_DIV;
+        break;
+      case Item_func::NEG_FUNC:
+        op = FilterExpr::OP_NEG;
+        break;
+      default:
+        return false;
+    }
+
+    expr->set_op(op);
+    for (uint arg_idx = 0; arg_idx < function->argument_count(); arg_idx++) {
+      if (!serialize_output_expression(function->arguments()[arg_idx],
+                                       expr->add_children())) {
+        return false;
+      }
+    }
+    return true;
+  };
+
   // The response must match MySQL's visible SELECT list exactly: grouped
-  // columns refer back to group keys, aggregate items refer to aggregate slots.
+  // columns refer back to group keys, aggregate items refer to aggregate slots,
+  // and arithmetic over aggregate items becomes an output expression.
   for (Item *item : output_items) {
     Item *real = item->real_item();
     auto *output = request.add_output();
@@ -1460,7 +1759,19 @@ bool RecognizeQueryBlock(JOIN *join, ColumnarExecutionContext *ctx,
       continue;
     }
 
-    if (real->type() != Item::SUM_FUNC_ITEM) {
+    if (real->type() == Item::SUM_FUNC_ITEM) {
+      const int aggregate_ordinal =
+          register_aggregate(down_cast<Item_sum *>(real));
+      if (aggregate_ordinal < 0) {
+        LDB_COL_REJECT(aggregate_error != nullptr ? aggregate_error
+                                                  : "aggregate");
+      }
+      output->set_source(LineairDB::Protocol::QueryBlockOutputExpr::AGG);
+      output->set_ordinal(static_cast<uint32_t>(aggregate_ordinal));
+      continue;
+    }
+
+    {
       int group_position = -1;
       for (size_t group_idx = 0; group_idx < group_items.size();
            group_idx++) {
@@ -1470,201 +1781,19 @@ bool RecognizeQueryBlock(JOIN *join, ColumnarExecutionContext *ctx,
           break;
         }
       }
-      if (group_position < 0) LDB_COL_REJECT("output not aggregate");
-      output->set_source(LineairDB::Protocol::QueryBlockOutputExpr::GROUP);
-      output->set_ordinal(group_position);
-      continue;
+      if (group_position >= 0) {
+        output->set_source(LineairDB::Protocol::QueryBlockOutputExpr::GROUP);
+        output->set_ordinal(group_position);
+        continue;
+      }
     }
 
-    Item_sum *sum = down_cast<Item_sum *>(real);
-    if (sum->argument_count() > 1) LDB_COL_REJECT("aggregate arg count");
-
-    auto *function = aggregate->add_aggs();
-    switch (sum->sum_func()) {
-      case Item_sum::COUNT_FUNC: {
-        function->set_arg_table(0);
-        if (sum->argument_count() > 0) {
-          Item *arg = sum->get_arg(0)->real_item();
-          if (arg->const_item()) {
-            if (arg->is_nullable() || arg->is_null())
-              LDB_COL_REJECT("COUNT const nullable");
-          } else {
-            if (arg->type() != Item::FIELD_ITEM)
-              LDB_COL_REJECT("COUNT arg shape");
-            const Field *raw_count_field =
-                down_cast<Item_field *>(arg)->field;
-            const int count_table = TableIndexOfField(raw_count_field, tables);
-            const Field *count_field =
-                count_table >= 0
-                    ? ResolveBaseField(raw_count_field,
-                                       tables[count_table].table)
-                    : nullptr;
-            if (count_field == nullptr || count_field->is_nullable())
-              LDB_COL_REJECT("COUNT arg nullable");
-            function->set_arg_table(static_cast<uint32_t>(count_table));
-            auto *ref = function->mutable_arg();
-            ref->set_op(LineairDB::Protocol::FilterExpr::COLUMN_REF);
-            ref->set_column_index(count_field->field_index());
-          }
-        }
-
-        function->set_kind(LineairDB::Protocol::QueryBlockAggFunc::COUNT);
-        break;
-      }
-
-      case Item_sum::SUM_FUNC:
-      case Item_sum::AVG_FUNC: {
-        if (sum->argument_count() != 1) LDB_COL_REJECT("aggregate arg count");
-        Item *arg = sum->get_arg(0)->real_item();
-        if (sum->sum_func() == Item_sum::SUM_FUNC) {
-          if (Item *filter = CaseToCountFilter(arg)) {
-            const int filter_table = SingleTableOf(
-                filter->used_tables() & ~PSEUDO_TABLE_BITS, tables);
-            if (filter_table < 0) LDB_COL_REJECT("CASE filter tables");
-            auto *predicate = function->mutable_filter();
-            predicate->set_num_columns(tables[filter_table].table->s->fields);
-            if (!serialize_item(filter, predicate->mutable_expr()))
-              LDB_COL_REJECT("CASE filter not pushable");
-            function->set_arg_table(static_cast<uint32_t>(filter_table));
-            function->set_kind(LineairDB::Protocol::QueryBlockAggFunc::COUNT);
-            break;
-          }
-
-          Item *filter = nullptr;
-          Item *then_expr = nullptr;
-          if (CaseToFilteredSum(arg, &filter, &then_expr)) {
-            if (then_expr->result_type() != DECIMAL_RESULT &&
-                then_expr->result_type() != INT_RESULT) {
-              LDB_COL_REJECT("CASE expression type");
-            }
-
-            const int filter_table = SingleTableOf(
-                filter->used_tables() & ~PSEUDO_TABLE_BITS, tables);
-            if (filter_table < 0) LDB_COL_REJECT("CASE filter tables");
-            auto *predicate = function->mutable_filter();
-            predicate->set_num_columns(tables[filter_table].table->s->fields);
-            if (!serialize_item(filter, predicate->mutable_expr()))
-              LDB_COL_REJECT("CASE filter not pushable");
-
-            int argument_table = SingleTableOf(
-                then_expr->used_tables() & ~PSEUDO_TABLE_BITS, tables);
-            if (argument_table >= 0 &&
-                then_expr->real_item()->type() == Item::FIELD_ITEM) {
-              const Field *raw_argument_field =
-                  down_cast<Item_field *>(then_expr->real_item())->field;
-              const Field *argument_field = ResolveBaseField(
-                  raw_argument_field, tables[argument_table].table);
-              if (argument_field == nullptr)
-                LDB_COL_REJECT("CASE expression unresolvable");
-
-              auto *ref = function->mutable_arg();
-              ref->set_op(LineairDB::Protocol::FilterExpr::COLUMN_REF);
-              ref->set_column_index(argument_field->field_index());
-            } else if (argument_table >= 0) {
-              if (!lineairdb::serialize_aggregate_expression(
-                      then_expr->real_item(), function->mutable_arg())) {
-                LDB_COL_REJECT("CASE expression not pushable");
-              }
-            } else {
-              argument_table = 0;
-              if (!SerializeAggregateExpressionForTables(
-                      then_expr->real_item(), tables,
-                      static_cast<uint32_t>(argument_table),
-                      function->mutable_arg())) {
-                LDB_COL_REJECT("CASE expression not pushable");
-              }
-            }
-
-            function->set_arg_table(static_cast<uint32_t>(argument_table));
-            function->set_filter_table(static_cast<uint32_t>(filter_table));
-            function->set_kind(LineairDB::Protocol::QueryBlockAggFunc::SUM);
-            function->set_arg_scale(then_expr->decimals);
-            function->set_zero_if_empty(true);
-            break;
-          }
-        }
-        if (arg->result_type() != DECIMAL_RESULT &&
-            arg->result_type() != INT_RESULT) {
-          LDB_COL_REJECT("aggregate arg type");
-        }
-
-        int argument_table =
-            SingleTableOf(arg->used_tables() & ~PSEUDO_TABLE_BITS, tables);
-        if (argument_table >= 0 && arg->type() == Item::FIELD_ITEM) {
-          const Field *raw_argument_field =
-              down_cast<Item_field *>(arg)->field;
-          const Field *argument_field = ResolveBaseField(
-              raw_argument_field, tables[argument_table].table);
-          if (argument_field == nullptr)
-            LDB_COL_REJECT("aggregate arg unresolvable");
-
-          auto *ref = function->mutable_arg();
-          ref->set_op(LineairDB::Protocol::FilterExpr::COLUMN_REF);
-          ref->set_column_index(argument_field->field_index());
-        } else if (argument_table >= 0) {
-          if (!lineairdb::serialize_aggregate_expression(
-                  arg, function->mutable_arg())) {
-            LDB_COL_REJECT("aggregate expr not pushable");
-          }
-        } else {
-          argument_table = 0;
-          if (!SerializeAggregateExpressionForTables(
-                  arg, tables, static_cast<uint32_t>(argument_table),
-                  function->mutable_arg())) {
-            LDB_COL_REJECT("aggregate expr not pushable");
-          }
-        }
-
-        function->set_arg_table(static_cast<uint32_t>(argument_table));
-        function->set_kind(
-            sum->sum_func() == Item_sum::SUM_FUNC
-                ? LineairDB::Protocol::QueryBlockAggFunc::SUM
-                : LineairDB::Protocol::QueryBlockAggFunc::AVG);
-        function->set_arg_scale(arg->decimals);
-        break;
-      }
-
-      case Item_sum::MIN_FUNC:
-      case Item_sum::MAX_FUNC: {
-        if (sum->argument_count() != 1) LDB_COL_REJECT("aggregate arg count");
-        Item *arg = sum->get_arg(0)->real_item();
-        if (arg->type() != Item::FIELD_ITEM) LDB_COL_REJECT("minmax arg");
-        const Field *raw_argument_field =
-            down_cast<Item_field *>(arg)->field;
-        const int argument_table =
-            TableIndexOfField(raw_argument_field, tables);
-        const Field *argument_field =
-            argument_table >= 0
-                ? ResolveBaseField(raw_argument_field,
-                                   tables[argument_table].table)
-                : nullptr;
-        if (argument_field == nullptr) LDB_COL_REJECT("minmax unresolvable");
-        if (argument_field->is_nullable()) LDB_COL_REJECT("minmax nullable");
-        if (argument_field->result_type() == STRING_RESULT &&
-            !argument_field->binary()) {
-          LDB_COL_REJECT("minmax collation");
-        }
-
-        auto *ref = function->mutable_arg();
-        ref->set_op(LineairDB::Protocol::FilterExpr::COLUMN_REF);
-        ref->set_column_index(argument_field->field_index());
-        function->set_arg_table(static_cast<uint32_t>(argument_table));
-        function->set_kind(
-            sum->sum_func() == Item_sum::MIN_FUNC
-                ? LineairDB::Protocol::QueryBlockAggFunc::MIN
-                : LineairDB::Protocol::QueryBlockAggFunc::MAX);
-        function->set_cmp_kind(argument_field->result_type() == STRING_RESULT
-                                   ? 1
-                                   : 0);
-        break;
-      }
-
-      default:
-        LDB_COL_REJECT("aggregate kind unsupported");
+    if (!serialize_output_expression(real, output->mutable_expr())) {
+      LDB_COL_REJECT(aggregate_error != nullptr ? aggregate_error
+                                                : "output expression");
     }
-
-    output->set_source(LineairDB::Protocol::QueryBlockOutputExpr::AGG);
-    output->set_ordinal(aggregate->aggs_size() - 1);
+    output->set_source(LineairDB::Protocol::QueryBlockOutputExpr::EXPR);
+    output->set_result_scale(real->decimals);
   }
 
   if (aggregate->aggs_size() == 0) LDB_COL_REJECT("no aggregates");
