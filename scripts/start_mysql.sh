@@ -76,6 +76,8 @@ done
 echo "Step 4/5: Installing LineairDB plugin..."
 ./runtime_output_directory/mysql -u root --socket="$SOCKET" --port="$MYSQLD_PORT" \
   -e "INSTALL PLUGIN lineairdb SONAME 'ha_lineairdb_storage_engine.so';" 2>/dev/null || true
+./runtime_output_directory/mysql -u root --socket="$SOCKET" --port="$MYSQLD_PORT" \
+  -e "INSTALL PLUGIN lineairdb_columnar SONAME 'ha_lineairdb_storage_engine.so';" 2>/dev/null || true
 
 echo "Step 5/5: Stopping MySQL and restarting with LineairDB as default..."
 kill "$BOOT_PID" 2>/dev/null || true

@@ -777,6 +777,10 @@ static SHOW_VAR func_status[] = {
      SHOW_SCOPE_GLOBAL},
     {nullptr, nullptr, SHOW_UNDEF, SHOW_SCOPE_UNDEF}};
 
+extern struct st_mysql_storage_engine lineairdb_columnar_storage_engine;
+extern int lineairdb_columnar_init(void *p);
+extern int lineairdb_columnar_deinit(void *p);
+
 mysql_declare_plugin(lineairdb){
     MYSQL_STORAGE_ENGINE_PLUGIN,
     &lineairdb_storage_engine,
@@ -792,4 +796,20 @@ mysql_declare_plugin(lineairdb){
     lineairdb_system_variables, /* system variables */
     nullptr,                    /* config options */
     0,                          /* flags */
+},
+{
+    MYSQL_STORAGE_ENGINE_PLUGIN,
+    &lineairdb_columnar_storage_engine,
+    "LINEAIRDB_COLUMNAR",
+    PLUGIN_AUTHOR_ORACLE,
+    "LineairDB columnar secondary engine",
+    PLUGIN_LICENSE_GPL,
+    lineairdb_columnar_init,   /* Plugin Init */
+    nullptr,                   /* Plugin check uninstall */
+    lineairdb_columnar_deinit, /* Plugin Deinit */
+    0x0001 /* 0.1 */,
+    nullptr, /* status variables */
+    nullptr, /* system variables */
+    nullptr, /* config options */
+    0,       /* flags */
 } mysql_declare_plugin_end;
