@@ -166,10 +166,39 @@ struct DecodedField {
   return true;
 }
 
-bool RejectSecondaryExecution(THD *, LEX *) {
+bool PrepareSecondaryEngine(THD *thd, LEX *lex) {
+  lex->add_statement_options(OPTION_NO_CONST_TABLES |
+                             OPTION_NO_SUBQUERY_DURING_OPTIMIZATION);
+
+  auto *ctx = new (thd->mem_root) ColumnarExecutionContext;
+  if (ctx == nullptr) return true;
+  lex->set_secondary_engine_execution_context(ctx);
+  return false;
+}
+
+bool OptimizeSecondaryEngine(THD *, LEX *lex) {
+  if (lex->secondary_engine_execution_context() == nullptr) {
+    my_error(ER_SECONDARY_ENGINE_PLUGIN, MYF(0),
+             "LINEAIRDB_COLUMNAR statement context is not available");
+    return true;
+  }
+
   my_error(ER_SECONDARY_ENGINE_PLUGIN, MYF(0),
            "LINEAIRDB_COLUMNAR executor is not available yet");
   return true;
+}
+
+bool CompareJoinCost(THD *thd, const JOIN &join, double optimizer_cost,
+                     bool *use_best_so_far, bool *cheaper,
+                     double *secondary_engine_cost) {
+  *use_best_so_far = false;
+  *secondary_engine_cost = optimizer_cost;
+
+  auto *ctx = static_cast<ColumnarExecutionContext *>(
+      thd->lex->secondary_engine_execution_context());
+  if (ctx == nullptr) return true;
+  *cheaper = ctx->BestPlanSoFar(join, optimizer_cost);
+  return false;
 }
 
 handler *CreateColumnarHandler(handlerton *hton, TABLE_SHARE *table_share,
@@ -266,7 +295,9 @@ int lineairdb_columnar_init(void *p) {
   hton->state = SHOW_OPTION_YES;
   hton->flags = HTON_IS_SECONDARY_ENGINE;
   hton->db_type = DB_TYPE_UNKNOWN;
-  hton->prepare_secondary_engine = lineairdb_columnar::RejectSecondaryExecution;
+  hton->prepare_secondary_engine = lineairdb_columnar::PrepareSecondaryEngine;
+  hton->optimize_secondary_engine = lineairdb_columnar::OptimizeSecondaryEngine;
+  hton->compare_secondary_engine_cost = lineairdb_columnar::CompareJoinCost;
   hton->secondary_engine_flags =
       MakeSecondaryEngineFlags(SecondaryEngineFlag::USE_EXTERNAL_EXECUTOR);
   return 0;
