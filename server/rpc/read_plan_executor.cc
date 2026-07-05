@@ -132,7 +132,8 @@ const std::vector<uint32_t>* selected_columns_for_materialization(
     }
     selected_columns.assign(step.projection().field_indexes().begin(),
                             step.projection().field_indexes().end());
-    if (step.has_filter() && step.filter().has_expr()) {
+    if (step.has_filter() && step.filter().has_expr() &&
+        !is_aggregate_having_filter(step)) {
         collect_filter_columns(step.filter().expr(), selected_columns);
     }
     for (const auto& semijoin : step.semijoins()) {
@@ -181,8 +182,10 @@ void LineairDBRpc::handleTxExecuteReadPlan(const std::string& message,
 
         // Step-level row filter: parseable non-matches are dropped; rows the
         // evaluator cannot parse are returned for MySQL to re-check.
+        const bool step_has_group_having = is_aggregate_having_filter(step);
         const bool step_has_filter =
-            step.has_filter() && step.filter().has_expr();
+            step.has_filter() && step.filter().has_expr() &&
+            !step_has_group_having;
         const auto* step_filter =
             step_has_filter ? &step.filter().expr() : nullptr;
         const uint32_t step_filter_cols =
@@ -625,8 +628,7 @@ void LineairDBRpc::handleTxExecuteReadPlan(const std::string& message,
             }
 
             // With a pushed filter, LIMIT must apply after filter evaluation.
-            const bool limit_after_filter =
-                step.has_filter() && step.filter().has_expr();
+            const bool limit_after_filter = step_has_filter;
             const uint64_t scan_limit_for_lineairdb =
                 limit_after_filter ? 0 : step.scan_limit();
             auto scan_result =
@@ -666,8 +668,9 @@ void LineairDBRpc::handleTxExecuteReadPlan(const std::string& message,
                     }
                     scan_result.rows = std::move(filtered);
                 }
-                aggregated = server_aggregate_scan(step.aggregate(),
-                                                   scan_result.rows, step_result);
+                aggregated = server_aggregate_scan(
+                    step.aggregate(), scan_result.rows, step_result,
+                    step_has_group_having ? &step.filter() : nullptr);
             }
             if (!aggregated) {
                 uint64_t emitted = 0;
