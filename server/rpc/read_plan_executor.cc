@@ -222,6 +222,49 @@ void LineairDBRpc::handleTxExecuteReadPlan(const std::string& message,
             return std::move(v);
         };
 
+        // Build membership sets from earlier source steps, then drop probe
+        // rows whose join key is absent. This is a plan-local reduction, not a
+        // row predicate, so rejected rows are not negative-cache material.
+        std::vector<SemijoinReduction> semijoin_reductions;
+        const int this_step_idx =
+            static_cast<int>(previous_results.size()) - 1;
+        for (const auto& sj : step.semijoins()) {
+            const int source_step = static_cast<int>(sj.source_step());
+            if (source_step < 0 || source_step >= this_step_idx) continue;
+            SemijoinReduction reduction;
+            reduction.probe_column = sj.probe_column();
+            const bool source_filter_on =
+                sj.has_source_filter() && sj.source_filter().has_expr();
+            const uint32_t source_filter_columns =
+                source_filter_on ? sj.source_filter().num_columns() : 0;
+            for (const auto& value :
+                 previous_results[source_step]->scan_values()) {
+                if (value.empty()) continue;
+                if (source_filter_on) {
+                    PredicateEvaluator evaluator;
+                    if (evaluator.parse_row(value.data(), value.size(),
+                                            source_filter_columns) &&
+                        !evaluator.evaluate(sj.source_filter().expr())) {
+                        continue;
+                    }
+                }
+                auto column = extract_value_column(value, sj.source_column());
+                if (!column.empty()) reduction.keys.emplace(column);
+            }
+            semijoin_reductions.push_back(std::move(reduction));
+        }
+        auto semijoin_rejects = [&](const std::string& value) -> bool {
+            for (const auto& reduction : semijoin_reductions) {
+                auto column =
+                    extract_value_column(value, reduction.probe_column);
+                if (reduction.keys.find(std::string(column)) ==
+                    reduction.keys.end()) {
+                    return true;
+                }
+            }
+            return false;
+        };
+
         if (step.for_each()) {
             // Anti-join probe: it only needs a match to exist. Stop after the
             // first surviving row. No scan_limit -- index_next reports a clean
@@ -235,44 +278,6 @@ void LineairDBRpc::handleTxExecuteReadPlan(const std::string& message,
                 source_step >= static_cast<int>(previous_results.size()) - 1) {
                 continue;
             }
-
-            // Build membership sets from earlier source steps, then drop
-            // probe rows whose join key is absent.
-            std::vector<SemijoinReduction> semijoin_reductions;
-            const int this_step_idx =
-                static_cast<int>(previous_results.size()) - 1;
-            for (const auto& sj : step.semijoins()) {
-                const int ss = static_cast<int>(sj.source_step());
-                if (ss < 0 || ss >= this_step_idx) continue;
-                SemijoinReduction reduction;
-                reduction.probe_column = sj.probe_column();
-                const bool sf_on =
-                    sj.has_source_filter() && sj.source_filter().has_expr();
-                const uint32_t sf_cols =
-                    sf_on ? sj.source_filter().num_columns() : 0;
-                for (const auto& v : previous_results[ss]->scan_values()) {
-                    if (v.empty()) continue;
-                    if (sf_on) {
-                        PredicateEvaluator se;
-                        if (se.parse_row(v.data(), v.size(), sf_cols) &&
-                            !se.evaluate(sj.source_filter().expr()))
-                            continue;
-                    }
-                    auto col = extract_value_column(v, sj.source_column());
-                    if (!col.empty()) reduction.keys.emplace(col);
-                }
-                semijoin_reductions.push_back(std::move(reduction));
-            }
-            auto sj_reject = [&](const std::string& value) -> bool {
-                for (const auto& reduction : semijoin_reductions) {
-                    auto col =
-                        extract_value_column(value, reduction.probe_column);
-                    if (reduction.keys.find(std::string(col)) ==
-                        reduction.keys.end())
-                        return true;  // no join partner -> drop
-                }
-                return false;
-            };
 
             const auto* source = previous_results[source_step];
             const int row_count =
@@ -377,7 +382,7 @@ void LineairDBRpc::handleTxExecuteReadPlan(const std::string& message,
                                         if (!worker_row_passes(r.value))
                                             continue;
                                         if (!semijoin_reductions.empty() &&
-                                            sj_reject(r.value))
+                                            semijoin_rejects(r.value))
                                             continue;
                                         out.keys.push_back(std::move(r.key));
                                         out.values.push_back(worker_project(
@@ -402,7 +407,7 @@ void LineairDBRpc::handleTxExecuteReadPlan(const std::string& message,
                                         if (!worker_row_passes(r.value))
                                             continue;
                                         if (!semijoin_reductions.empty() &&
-                                            sj_reject(r.value))
+                                            semijoin_rejects(r.value))
                                             continue;
                                         out.secondary_keys.push_back(
                                             std::move(r.secondary_key));
@@ -425,7 +430,7 @@ void LineairDBRpc::handleTxExecuteReadPlan(const std::string& message,
                                 out.tids.push_back(read_result.tid);
                                 if (read_result.found &&
                                     !(!semijoin_reductions.empty() &&
-                                      sj_reject(read_result.value))) {
+                                      semijoin_rejects(read_result.value))) {
                                     out.values.push_back(worker_project(
                                         std::move(read_result.value)));
                                 } else {
@@ -500,7 +505,7 @@ void LineairDBRpc::handleTxExecuteReadPlan(const std::string& message,
                         for (auto& r : scan_result.rows) {
                             if (!row_passes(r.value)) continue;
                             if (!semijoin_reductions.empty() &&
-                                sj_reject(r.value))
+                                semijoin_rejects(r.value))
                                 continue;
                             step_result->add_scan_keys(std::move(r.key));
                             step_result->add_scan_values(
@@ -525,7 +530,7 @@ void LineairDBRpc::handleTxExecuteReadPlan(const std::string& message,
                         for (auto& r : scan_result.rows) {
                             if (!row_passes(r.value)) continue;
                             if (!semijoin_reductions.empty() &&
-                                sj_reject(r.value))
+                                semijoin_rejects(r.value))
                                 continue;
                             step_result->add_secondary_keys(
                                 std::move(r.secondary_key));
@@ -552,7 +557,7 @@ void LineairDBRpc::handleTxExecuteReadPlan(const std::string& message,
                 step_result->add_scan_tids(read_result.tid);
                 if (read_result.found &&
                     !(!semijoin_reductions.empty() &&
-                      sj_reject(read_result.value))) {
+                      semijoin_rejects(read_result.value))) {
                     step_result->add_scan_values(
                         project_value(std::move(read_result.value)));
                 } else {
@@ -607,7 +612,8 @@ void LineairDBRpc::handleTxExecuteReadPlan(const std::string& message,
             if (!(step.has_aggregate() && step.aggregate().aggs_size() > 0)) {
                 if (parallel_primary_pax_row_ref_scan(
                         db_manager_->get_database().get(), step, start_key,
-                        end_key, step_result, projection_failed)) {
+                        end_key, step_result, projection_failed,
+                        semijoin_reductions)) {
                     if (projection_failed) {
                         response.set_ok(false);
                         flat_plan::encode_to_string(response, result);
@@ -619,6 +625,7 @@ void LineairDBRpc::handleTxExecuteReadPlan(const std::string& message,
             if (!step.for_each() && step.scan_limit() == 0 &&
                 !step.reverse_scan() &&
                 !(step.has_aggregate() && step.aggregate().aggs_size() > 0) &&
+                semijoin_reductions.empty() &&
                 step.has_filter() && step.filter().has_expr()) {
                 if (parallel_primary_filter_scan(
                         db_manager_->get_database().get(), step, start_key,
@@ -680,6 +687,10 @@ void LineairDBRpc::handleTxExecuteReadPlan(const std::string& message,
                         step_result->add_filtered_keys(std::move(row.key));
                         continue;
                     }
+                    if (!semijoin_reductions.empty() &&
+                        semijoin_rejects(row.value)) {
+                        continue;
+                    }
                     step_result->add_scan_keys(std::move(row.key));
                     step_result->add_scan_values(project_value(std::move(row.value)));
                     step_result->add_scan_tids(row.tid);
@@ -706,6 +717,10 @@ void LineairDBRpc::handleTxExecuteReadPlan(const std::string& message,
                 if (!row_passes(row.value)) {
                     // Secondary scans report rejected rows by primary key.
                     step_result->add_filtered_keys(std::move(row.primary_key));
+                    continue;
+                }
+                if (!semijoin_reductions.empty() &&
+                    semijoin_rejects(row.value)) {
                     continue;
                 }
                 step_result->add_secondary_keys(std::move(row.secondary_key));

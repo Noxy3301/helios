@@ -37,6 +37,36 @@ void sort_unique_columns(std::vector<uint32_t>& columns) {
     columns.erase(std::unique(columns.begin(), columns.end()), columns.end());
 }
 
+bool semijoin_rejects_value(
+    const std::vector<SemijoinReduction>& semijoin_reductions,
+    const std::string& value) {
+    for (const auto& reduction : semijoin_reductions) {
+        auto column = extract_value_column(value, reduction.probe_column);
+        if (reduction.keys.find(std::string(column)) == reduction.keys.end()) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool semijoin_rejects_pax_slot(
+    const std::vector<SemijoinReduction>& semijoin_reductions,
+    const LineairDB::Pax::PaxGroup& group, uint32_t slot,
+    bool& schema_mismatch) {
+    for (const auto& reduction : semijoin_reductions) {
+        const size_t field = static_cast<size_t>(reduction.probe_column) + 1;
+        if (field >= group.schema().field_count()) {
+            schema_mismatch = true;
+            return false;
+        }
+        const std::string_view column = group.cell(field, slot);
+        if (reduction.keys.find(std::string(column)) == reduction.keys.end()) {
+            return true;
+        }
+    }
+    return false;
+}
+
 const std::vector<uint32_t>* selected_columns_for_projected_read(
     const LineairDB::Protocol::TxExecuteReadPlan::PlanStep& step,
     std::vector<uint32_t>& selected_columns) {
@@ -50,6 +80,9 @@ const std::vector<uint32_t>* selected_columns_for_projected_read(
     if (step.has_filter() && step.filter().has_expr() &&
         !is_aggregate_having_filter(step)) {
         collect_filter_columns(step.filter().expr(), selected_columns);
+    }
+    for (const auto& semijoin : step.semijoins()) {
+        selected_columns.push_back(semijoin.probe_column());
     }
     sort_unique_columns(selected_columns);
     if (step.projection().num_columns() > 0 &&
@@ -275,7 +308,8 @@ bool parallel_primary_pax_row_ref_scan(
     const LineairDB::Protocol::TxExecuteReadPlan::PlanStep& step,
     const std::string& start_key, const std::string& end_key,
     LineairDB::Protocol::TxExecuteReadPlan::StepResult* step_result,
-    bool& projection_failed) {
+    bool& projection_failed,
+    const std::vector<SemijoinReduction>& semijoin_reductions) {
     if (db == nullptr) return false;
 
     const bool has_filter = step.has_filter() && step.filter().has_expr();
@@ -336,8 +370,20 @@ bool parallel_primary_pax_row_ref_scan(
                 pass = evaluator.evaluate(step.filter().expr());
             }
 
+            bool semijoin_rejected = false;
+            if (pass && !semijoin_reductions.empty()) {
+                bool schema_mismatch = false;
+                semijoin_rejected = semijoin_rejects_pax_slot(
+                    semijoin_reductions, *group, row_ref.slot,
+                    schema_mismatch);
+                if (schema_mismatch) {
+                    out.materialized_path_required = true;
+                    break;
+                }
+            }
+
             std::string value;
-            if (pass) {
+            if (pass && !semijoin_rejected) {
                 if (has_projection) {
                     if (!group->GatherRowProjected(row_ref.slot,
                                                    kept_columns.data(),
@@ -380,6 +426,12 @@ bool parallel_primary_pax_row_ref_scan(
                     continue;
                 }
 
+                if (!semijoin_reductions.empty() &&
+                    semijoin_rejects_value(semijoin_reductions,
+                                           reread.value)) {
+                    continue;
+                }
+
                 std::string reread_value;
                 if (has_projection) {
                     if (!trim_row_value(reread.value,
@@ -404,6 +456,7 @@ bool parallel_primary_pax_row_ref_scan(
                 out.filtered_keys.push_back(std::move(row_ref.key));
                 continue;
             }
+            if (semijoin_rejected) continue;
             out.events.push_back({false, out.scan_keys.size()});
             out.scan_keys.push_back(std::move(row_ref.key));
             out.scan_values.push_back(std::move(value));

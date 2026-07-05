@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <string>
 #include <unordered_set>
+#include <vector>
 
 #include "lineairdb.pb.h"
 #include "lineairdb/lineairdb.h"
@@ -42,7 +43,8 @@ bool parallel_primary_pax_row_ref_scan(
     const LineairDB::Protocol::TxExecuteReadPlan::PlanStep& step,
     const std::string& start_key, const std::string& end_key,
     LineairDB::Protocol::TxExecuteReadPlan::StepResult* step_result,
-    bool& projection_failed);
+    bool& projection_failed,
+    const std::vector<SemijoinReduction>& semijoin_reductions);
 
 /**
  * @brief Scan integer primary-key slices in parallel and aggregate locally.
