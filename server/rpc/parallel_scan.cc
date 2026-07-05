@@ -413,10 +413,13 @@ bool parallel_primary_pax_row_ref_scan(
     if (step.scan_limit() == 0 && !step.reverse_scan()) {
         const unsigned nproc = std::thread::hardware_concurrency();
         const unsigned max_threads = std::min<unsigned>(nproc ? nproc : 4, 8);
+        const std::vector<uint32_t> key_only_columns;
         auto first = db->StatelessRangeScan(step.table_name(), start_key,
-                                            end_key, 1, false);
+                                            end_key, 1, false,
+                                            &key_only_columns);
         auto last = db->StatelessRangeScan(step.table_name(), start_key,
-                                           end_key, 1, true);
+                                           end_key, 1, true,
+                                           &key_only_columns);
         int64_t lo = 0;
         int64_t hi = 0;
         if (max_threads > 1 && first.ok && !first.rows.empty() && last.ok &&
@@ -515,11 +518,12 @@ bool parallel_primary_aggregate_scan(
     if (max_threads <= 1) return false;
 
     // Probe the actual key span before creating split boundaries.
+    const std::vector<uint32_t> key_only_columns;
     auto first = db->StatelessRangeScan(step.table_name(), start_key, end_key,
-                                        1, false);
+                                        1, false, &key_only_columns);
     if (!first.ok || first.rows.empty()) return false;
     auto last = db->StatelessRangeScan(step.table_name(), start_key, end_key,
-                                       1, true);
+                                       1, true, &key_only_columns);
     if (!last.ok || last.rows.empty()) return false;
 
     int64_t lo = 0;
@@ -630,11 +634,12 @@ bool parallel_primary_filter_scan(
     if (max_threads <= 1) return false;
 
     // Probe the actual key span before creating split boundaries.
+    const std::vector<uint32_t> key_only_columns;
     auto first = db->StatelessRangeScan(step.table_name(), start_key, end_key,
-                                        1, false);
+                                        1, false, &key_only_columns);
     if (!first.ok || first.rows.empty()) return false;
     auto last = db->StatelessRangeScan(step.table_name(), start_key, end_key,
-                                       1, true);
+                                       1, true, &key_only_columns);
     if (!last.ok || last.rows.empty()) return false;
 
     int64_t lo = 0;
