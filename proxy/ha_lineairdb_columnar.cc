@@ -648,7 +648,8 @@ int lineairdb_columnar_init(void *p) {
   hton->optimize_secondary_engine = lineairdb_columnar::OptimizeSecondaryEngine;
   hton->compare_secondary_engine_cost = lineairdb_columnar::CompareJoinCost;
   hton->secondary_engine_flags =
-      MakeSecondaryEngineFlags(SecondaryEngineFlag::USE_EXTERNAL_EXECUTOR);
+      MakeSecondaryEngineFlags(SecondaryEngineFlag::SUPPORTS_HASH_JOIN,
+                               SecondaryEngineFlag::SUPPORTS_NESTED_LOOP_JOIN);
   return 0;
 }
 
