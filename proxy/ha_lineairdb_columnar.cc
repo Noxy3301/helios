@@ -18,6 +18,8 @@
 #include "sql/handler.h"
 #include "sql/item.h"
 #include "sql/item_sum.h"
+#include "sql/mem_root_array.h"
+#include "sql/query_result.h"
 #include "sql/sql_const.h"
 #include "sql/sql_class.h"
 #include "sql/sql_lex.h"
@@ -28,8 +30,14 @@
 #include "thr_lock.h"
 
 #include "aggregate_pushdown.hh"
+#include "lineairdb_keyenc.hh"
 #include "lineairdb.pb.h"
+#include "lineairdb_proxy.hh"
 #include "lineairdb_pushdown.hh"
+
+namespace lineairdb {
+std::shared_ptr<LineairDBProxy> acquire_shared_proxy(THD *thd);
+}  // namespace lineairdb
 
 namespace lineairdb_columnar {
 
@@ -397,6 +405,104 @@ bool RecognizeSingleTableAggregate(JOIN *join, ColumnarExecutionContext *ctx,
 #undef LDB_COL_REJECT
 }
 
+/**
+ * @brief Execute a recognized aggregate block through LineairDB.
+ *
+ * MySQL has already sent result-set metadata for the original SELECT list. This
+ * override runs one aggregate read-plan step and sends value-only Item carriers
+ * that match that already-described metadata.
+ */
+bool ExecuteColumnarAggregate(JOIN *join, Query_result *result) {
+  THD *thd = current_thd;
+  auto *ctx = static_cast<ColumnarExecutionContext *>(
+      thd->lex->secondary_engine_execution_context());
+  if (ctx == nullptr || ctx->serialized_aggregate.empty()) {
+    my_error(ER_SECONDARY_ENGINE_PLUGIN, MYF(0),
+             "LINEAIRDB_COLUMNAR: no offload plan");
+    return true;
+  }
+
+  std::shared_ptr<LineairDBProxy> proxy = lineairdb::acquire_shared_proxy(thd);
+  if (!proxy) {
+    my_error(ER_SECONDARY_ENGINE_PLUGIN, MYF(0),
+             "LINEAIRDB_COLUMNAR: no server connection");
+    return true;
+  }
+
+  LineairDBProxy::ReadPlanStep step;
+  step.table_name = ctx->table_name;
+  step.is_scan = true;
+  step.end_key_prefix = lineairdb_keyenc::scan_end_sentinel();
+  step.serialized_filter = ctx->serialized_filter;
+  step.aggregate_serialized = ctx->serialized_aggregate;
+
+  LineairDBProxy::ReadPlanResult rpc = proxy->tx_execute_read_plan({step});
+  if (!rpc.ok || rpc.steps.size() != 1) {
+    my_error(ER_SECONDARY_ENGINE_PLUGIN, MYF(0),
+             "LINEAIRDB_COLUMNAR: aggregate scan RPC failed");
+    return true;
+  }
+
+  mem_root_deque<Item *> output_items(thd->mem_root);
+  std::vector<ItemColumnarValue *> values;
+  values.reserve(ctx->bindings.size());
+  for (Item *item : VisibleFields(join->query_block->fields)) {
+    auto *value = new (thd->mem_root) ItemColumnarValue(item);
+    if (value == nullptr) return true;
+    values.push_back(value);
+    output_items.push_back(value);
+  }
+  if (values.size() != ctx->bindings.size()) {
+    my_error(ER_SECONDARY_ENGINE_PLUGIN, MYF(0),
+             "LINEAIRDB_COLUMNAR: output binding mismatch");
+    return true;
+  }
+
+  std::vector<DecodedField> fields;
+  for (const std::string &row : rpc.steps[0].scan_values) {
+    if (!DecodeRowFields(row, &fields)) {
+      my_error(ER_SECONDARY_ENGINE_PLUGIN, MYF(0),
+               "LINEAIRDB_COLUMNAR: malformed group row");
+      return true;
+    }
+
+    // Server aggregate rows are [null_flags][group cols][value,count per agg].
+    const size_t expected = 1 + static_cast<size_t>(ctx->group_column_count) +
+                            2 * static_cast<size_t>(ctx->aggregate_count);
+    if (fields.size() != expected) {
+      my_error(ER_SECONDARY_ENGINE_PLUGIN, MYF(0),
+               "LINEAIRDB_COLUMNAR: unexpected group row shape");
+      return true;
+    }
+
+    for (size_t i = 0; i < ctx->bindings.size(); i++) {
+      const OutBinding &binding = ctx->bindings[i];
+      const DecodedField &field =
+          binding.is_aggregate
+              ? fields[1 + ctx->group_column_count + 2 * binding.index]
+              : fields[1 + binding.index];
+
+      if (!field.empty) {
+        values[i]->set_value(field.ptr, field.len);
+        continue;
+      }
+
+      // Empty aggregate fields are SQL NULL, while GROUP BY fields are
+      // non-nullable by recognition and represent an empty byte string.
+      if (binding.is_aggregate) {
+        values[i]->set_null_value();
+      } else {
+        values[i]->set_value("", 0);
+      }
+    }
+
+    if (result->send_data(thd, output_items)) return true;
+    ++join->send_records;
+  }
+
+  return false;
+}
+
 bool PrepareSecondaryEngine(THD *thd, LEX *lex) {
   lex->add_statement_options(OPTION_NO_CONST_TABLES |
                              OPTION_NO_SUBQUERY_DURING_OPTIMIZATION);
@@ -427,9 +533,8 @@ bool OptimizeSecondaryEngine(THD *, LEX *lex) {
     return true;
   }
 
-  my_error(ER_SECONDARY_ENGINE_PLUGIN, MYF(0),
-           "LINEAIRDB_COLUMNAR executor is not available yet");
-  return true;
+  join->override_executor_func = ExecuteColumnarAggregate;
+  return false;
 }
 
 bool CompareJoinCost(THD *thd, const JOIN &join, double optimizer_cost,
