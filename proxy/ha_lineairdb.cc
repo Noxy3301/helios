@@ -250,7 +250,11 @@ static int lineairdb_init_func(void *p) {
   lineairdb_hton = (handlerton *)p;
   lineairdb_hton->state = SHOW_OPTION_YES;
   lineairdb_hton->create = lineairdb_create_handler;
-  lineairdb_hton->flags = HTON_CAN_RECREATE;
+  lineairdb_hton->flags =
+      HTON_CAN_RECREATE | HTON_SUPPORTS_SECONDARY_ENGINE;
+  // SECONDARY_LOAD/UNLOAD cleanup calls the primary engine's post_ddl hook.
+  // LineairDB has no post-DDL storage work here, but the hook must be present.
+  lineairdb_hton->post_ddl = [](THD *) {};
   lineairdb_hton->is_supported_system_table =
       lineairdb_is_supported_system_table;
   lineairdb_hton->db_type = DB_TYPE_UNKNOWN;

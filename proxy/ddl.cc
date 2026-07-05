@@ -212,6 +212,17 @@ enum_alter_inplace_result ha_lineairdb::check_if_supported_inplace_alter(
       Alter_inplace_info::ADD_UNIQUE_INDEX |
       Alter_inplace_info::DROP_UNIQUE_INDEX;
 
+  // ALTER TABLE ... SECONDARY_ENGINE = x|NULL only changes DD metadata.
+  if (ha_alter_info->handler_flags ==
+          Alter_inplace_info::CHANGE_CREATE_OPTION &&
+      ha_alter_info->create_info != nullptr &&
+      (ha_alter_info->create_info->used_fields &
+       HA_CREATE_USED_SECONDARY_ENGINE) != 0 &&
+      (ha_alter_info->create_info->used_fields &
+       ~HA_CREATE_USED_SECONDARY_ENGINE) == 0) {
+    return HA_ALTER_INPLACE_INSTANT;
+  }
+
   if (ha_alter_info->handler_flags & ~dominated_flags) {
     return HA_ALTER_INPLACE_NOT_SUPPORTED;
   }
