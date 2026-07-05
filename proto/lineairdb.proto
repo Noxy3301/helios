@@ -696,7 +696,10 @@ message QueryBlockAggFunc {
     Kind kind = 1;
     // Table the argument reads from, as an index into Request.tables.
     uint32 arg_table = 2;
-    // Argument expression over that table's columns. Unset for COUNT(*).
+    // Argument expression over that table's columns. COLUMN_REF nodes may
+    // address another request table by encoding (table_idx << 16) | column in
+    // column_index; arg_table remains the default table for untagged refs.
+    // Unset for COUNT(*).
     FilterExpr arg = 3;
     // Optional per-row predicate, for conditional aggregates.
     PushedPredicate filter = 4;
@@ -710,6 +713,8 @@ message QueryBlockColumnRef {
     uint32 table_idx = 1;
     uint32 column = 2;      // 0-based TABLE::field index.
     uint32 cmp_kind = 3;    // 0=int64, 1=binary string, 2=decimal-as-number.
+    // When nonzero, grouping and output use only the first N cell bytes.
+    uint32 prefix_len = 4;
 }
 
 message QueryBlockScan {
