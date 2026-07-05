@@ -6,13 +6,16 @@
 #include <exception>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
 #include <lineairdb/database.h>
 #include <lineairdb/pax_store.h>
 
+#include "decimal_arithmetic.hh"
 #include "predicate_evaluator.hh"
+#include "row_codec.hh"
 
 namespace query_block {
 namespace {
@@ -134,6 +137,14 @@ class Executor {
         return true;
     }
 
+    PaxRowRef ToRowRef(uint32_t table_idx, uint64_t ref) const {
+        PaxStore* store = stores_[table_idx];
+        return PaxRowRef{
+            store->group(ref / PaxGroup::kRows),
+            static_cast<uint32_t>(ref % PaxGroup::kRows),
+        };
+    }
+
     bool RunScan(const pb::QueryBlockScan& scan, NodeResult* output) {
         if (scan.table_idx() >= static_cast<uint32_t>(request_.tables_size())) {
             return fail("scan table out of range");
@@ -213,6 +224,245 @@ class Executor {
         return true;
     }
 
+    struct GroupState {
+        std::vector<std::string> keys;
+        std::vector<uint64_t> counts;
+        std::vector<DecimalValue> decimals;
+        std::vector<std::string> strings;
+        std::vector<bool> has_value;
+    };
+
+    using GroupMap = std::unordered_map<std::string, GroupState>;
+
+    bool AccumulateRange(const pb::QueryBlockAggregate& aggregate,
+                         const NodeResult& input, size_t begin, size_t end,
+                         GroupMap* groups) {
+        const int group_count = aggregate.group_columns_size();
+        const int aggregate_count = aggregate.aggs_size();
+
+        std::vector<int> group_positions(group_count, -1);
+        for (int group_idx = 0; group_idx < group_count; ++group_idx) {
+            group_positions[group_idx] =
+                input.table_pos(aggregate.group_columns(group_idx).table_idx());
+            if (group_positions[group_idx] < 0) {
+                return fail("group table is not in aggregate input");
+            }
+        }
+
+        std::vector<int> aggregate_positions(aggregate_count, -1);
+        for (int aggregate_idx = 0; aggregate_idx < aggregate_count;
+             ++aggregate_idx) {
+            const pb::QueryBlockAggFunc& function =
+                aggregate.aggs(aggregate_idx);
+            if (function.has_arg() || function.has_filter()) {
+                aggregate_positions[aggregate_idx] =
+                    input.table_pos(function.arg_table());
+                if (aggregate_positions[aggregate_idx] < 0) {
+                    return fail("aggregate table is not in aggregate input");
+                }
+            }
+        }
+
+        PredicateEvaluator evaluator;
+        std::string key_buffer;
+        std::vector<std::string_view> group_values(group_count);
+        for (size_t row_idx = begin; row_idx < end; ++row_idx) {
+            key_buffer.clear();
+            for (int group_idx = 0; group_idx < group_count; ++group_idx) {
+                const pb::QueryBlockColumnRef& column =
+                    aggregate.group_columns(group_idx);
+                const uint64_t ref =
+                    input.refs[group_positions[group_idx]][row_idx];
+                group_values[group_idx] =
+                    extract_value_column(ToRowRef(column.table_idx(), ref),
+                                         column.column());
+                const uint32_t length =
+                    static_cast<uint32_t>(group_values[group_idx].size());
+                key_buffer.append(reinterpret_cast<const char*>(&length),
+                                  sizeof(length));
+                key_buffer.append(group_values[group_idx].data(),
+                                  group_values[group_idx].size());
+            }
+
+            auto group_it = groups->find(key_buffer);
+            GroupState* state = nullptr;
+            if (group_it == groups->end()) {
+                GroupState new_state;
+                new_state.keys.resize(group_count);
+                for (int group_idx = 0; group_idx < group_count; ++group_idx) {
+                    new_state.keys[group_idx] =
+                        std::string(group_values[group_idx]);
+                }
+                new_state.counts.assign(aggregate_count, 0);
+                new_state.decimals.assign(aggregate_count, DecimalValue{});
+                new_state.strings.assign(aggregate_count, {});
+                new_state.has_value.assign(aggregate_count, false);
+                state = &groups->emplace(std::move(key_buffer),
+                                         std::move(new_state))
+                             .first->second;
+                key_buffer.clear();
+            } else {
+                state = &group_it->second;
+            }
+
+            for (int aggregate_idx = 0; aggregate_idx < aggregate_count;
+                 ++aggregate_idx) {
+                const pb::QueryBlockAggFunc& function =
+                    aggregate.aggs(aggregate_idx);
+                const int input_pos = aggregate_positions[aggregate_idx];
+                const uint64_t ref =
+                    input_pos >= 0 ? input.refs[input_pos][row_idx] : 0;
+
+                if (function.has_filter() && function.filter().has_expr()) {
+                    PaxRowRef row = ToRowRef(function.arg_table(), ref);
+                    if (row.group == nullptr ||
+                        !evaluator.set_row_from_pax(
+                            *row.group, row.slot,
+                            function.filter().num_columns())) {
+                        return fail("aggregate filter cannot read PAX columns");
+                    }
+                    if (!evaluator.evaluate(function.filter().expr())) {
+                        continue;
+                    }
+                }
+
+                switch (function.kind()) {
+                    case pb::QueryBlockAggFunc::COUNT:
+                        state->counts[aggregate_idx] += 1;
+                        break;
+                    case pb::QueryBlockAggFunc::SUM:
+                    case pb::QueryBlockAggFunc::AVG: {
+                        DecimalValue value = evaluate_decimal_expression(
+                            function.arg(),
+                            ToRowRef(function.arg_table(), ref));
+                        if (value.is_null) break;
+                        add_decimal_value(state->decimals[aggregate_idx],
+                                          value);
+                        state->counts[aggregate_idx] += 1;
+                        break;
+                    }
+                    case pb::QueryBlockAggFunc::MIN:
+                    case pb::QueryBlockAggFunc::MAX: {
+                        const bool wants_max =
+                            function.kind() == pb::QueryBlockAggFunc::MAX;
+                        if (function.cmp_kind() == 1) {
+                            std::string_view value = extract_value_column(
+                                ToRowRef(function.arg_table(), ref),
+                                function.arg().column_index());
+                            if (!state->has_value[aggregate_idx] ||
+                                (wants_max
+                                     ? value >
+                                           std::string_view(
+                                               state->strings[aggregate_idx])
+                                     : value <
+                                           std::string_view(
+                                               state->strings[aggregate_idx]))) {
+                                state->strings[aggregate_idx] =
+                                    std::string(value);
+                            }
+                        } else {
+                            DecimalValue value = evaluate_decimal_expression(
+                                function.arg(),
+                                ToRowRef(function.arg_table(), ref));
+                            if (value.is_null) break;
+                            if (!state->has_value[aggregate_idx] ||
+                                (wants_max
+                                     ? compare_decimal_values(
+                                           value,
+                                           state->decimals[aggregate_idx]) > 0
+                                     : compare_decimal_values(
+                                           value,
+                                           state->decimals[aggregate_idx]) < 0)) {
+                                state->decimals[aggregate_idx] = value;
+                            }
+                        }
+                        state->has_value[aggregate_idx] = true;
+                        break;
+                    }
+                    default:
+                        return fail("unsupported aggregate function");
+                }
+            }
+        }
+        return true;
+    }
+
+    static void MergeGroups(GroupMap* destination, GroupMap* source,
+                            const pb::QueryBlockAggregate& aggregate) {
+        if (destination->empty()) {
+            *destination = std::move(*source);
+            return;
+        }
+
+        for (auto& entry : *source) {
+            auto destination_it = destination->find(entry.first);
+            if (destination_it == destination->end()) {
+                destination->emplace(entry.first, std::move(entry.second));
+                continue;
+            }
+
+            GroupState& destination_state = destination_it->second;
+            GroupState& source_state = entry.second;
+            for (int aggregate_idx = 0;
+                 aggregate_idx < aggregate.aggs_size(); ++aggregate_idx) {
+                const pb::QueryBlockAggFunc& function =
+                    aggregate.aggs(aggregate_idx);
+                switch (function.kind()) {
+                    case pb::QueryBlockAggFunc::COUNT:
+                        destination_state.counts[aggregate_idx] +=
+                            source_state.counts[aggregate_idx];
+                        break;
+                    case pb::QueryBlockAggFunc::SUM:
+                    case pb::QueryBlockAggFunc::AVG:
+                        if (source_state.counts[aggregate_idx] > 0) {
+                            add_decimal_value(
+                                destination_state.decimals[aggregate_idx],
+                                source_state.decimals[aggregate_idx]);
+                            destination_state.counts[aggregate_idx] +=
+                                source_state.counts[aggregate_idx];
+                        }
+                        break;
+                    case pb::QueryBlockAggFunc::MIN:
+                    case pb::QueryBlockAggFunc::MAX: {
+                        if (!source_state.has_value[aggregate_idx]) break;
+                        const bool wants_max =
+                            function.kind() == pb::QueryBlockAggFunc::MAX;
+                        if (function.cmp_kind() == 1) {
+                            if (!destination_state.has_value[aggregate_idx] ||
+                                (wants_max
+                                     ? source_state.strings[aggregate_idx] >
+                                           destination_state
+                                               .strings[aggregate_idx]
+                                     : source_state.strings[aggregate_idx] <
+                                           destination_state
+                                               .strings[aggregate_idx])) {
+                                destination_state.strings[aggregate_idx] =
+                                    std::move(
+                                        source_state.strings[aggregate_idx]);
+                            }
+                        } else if (
+                            !destination_state.has_value[aggregate_idx] ||
+                            (wants_max
+                                 ? compare_decimal_values(
+                                       source_state.decimals[aggregate_idx],
+                                       destination_state
+                                           .decimals[aggregate_idx]) > 0
+                                 : compare_decimal_values(
+                                       source_state.decimals[aggregate_idx],
+                                       destination_state
+                                           .decimals[aggregate_idx]) < 0)) {
+                            destination_state.decimals[aggregate_idx] =
+                                source_state.decimals[aggregate_idx];
+                        }
+                        destination_state.has_value[aggregate_idx] = true;
+                        break;
+                    }
+                    default:
+                        break;
+                }
+            }
+        }
+    }
     bool RunNodes() {
         results_.resize(request_.nodes_size());
         for (int node_idx = 0; node_idx < request_.nodes_size(); ++node_idx) {
