@@ -80,7 +80,10 @@ enum class MessageType : uint32_t {
     TX_STATELESS_BATCH_READ = 28,
     TX_VALIDATE_AND_COMMIT = 29,
     TX_EXECUTE_READ_PLAN = 30,
-    TX_GET_TABLE_STATS = 31
+    TX_GET_TABLE_STATS = 31,
+
+    // Secondary-engine computation pushdown.
+    TX_EXECUTE_QUERY_BLOCK = 36
 };
 
 /**

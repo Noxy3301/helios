@@ -52,6 +52,10 @@ enum OpCode {
     TX_VALIDATE_AND_COMMIT = 29;
     TX_EXECUTE_READ_PLAN = 30;
     TX_GET_TABLE_STATS = 31;
+
+    // Secondary-engine computation pushdown.
+    // Executes a query-block operator tree on the LineairDB server.
+    TX_EXECUTE_QUERY_BLOCK = 36;
 }
 
 enum BatchOpType {
@@ -675,6 +679,101 @@ message TxFetchLastSecondaryEntryInRange {
         bool found = 1;
         SecondaryIndexEntry entry = 2;
         bool is_aborted = 3;
+    }
+}
+
+// Secondary-engine query-block request representation.
+//
+// A query block is represented as a tree of scan, join, and aggregate
+// operators over base tables. This is not SQL text, MySQL's AccessPath, or a
+// MySQL Query Execution Plan object; the proxy lowers supported query shapes
+// into this RPC form so the LineairDB server can execute them. Server execution
+// keeps rows as table row references until an expression needs a column value.
+// The response carries final rows in the proxy row format, one field per output
+// expression.
+message QueryBlockAggFunc {
+    enum Kind { COUNT = 0; SUM = 1; AVG = 2; MIN = 3; MAX = 4; }
+    Kind kind = 1;
+    // Table the argument reads from, as an index into Request.tables.
+    uint32 arg_table = 2;
+    // Argument expression over that table's columns. Unset for COUNT(*).
+    FilterExpr arg = 3;
+    // Optional per-row predicate, for conditional aggregates.
+    PushedPredicate filter = 4;
+    // Decimal scale of the argument for result formatting.
+    uint32 arg_scale = 5;
+    // MIN/MAX comparison semantics: 0=numeric decimal, 1=binary string.
+    uint32 cmp_kind = 6;
+}
+
+message QueryBlockColumnRef {
+    uint32 table_idx = 1;
+    uint32 column = 2;      // 0-based TABLE::field index.
+    uint32 cmp_kind = 3;    // 0=int64, 1=binary string, 2=decimal-as-number.
+}
+
+message QueryBlockScan {
+    uint32 table_idx = 1;
+    // Fully pushed single-table predicates for this scan.
+    PushedPredicate filter = 2;
+}
+
+message QueryBlockJoin {
+    uint32 build = 1;  // Node index into TxExecuteQueryBlock.Request.nodes.
+    uint32 probe = 2;
+    // Equi-key pairs, stored as parallel arrays.
+    repeated QueryBlockColumnRef build_keys = 3;
+    repeated QueryBlockColumnRef probe_keys = 4;
+    enum Type { INNER = 0; LEFT = 1; SEMI = 2; ANTI = 3; }
+    Type type = 5;
+}
+
+message QueryBlockAggregate {
+    uint32 input = 1;                       // Node index.
+    repeated QueryBlockColumnRef group_columns = 2; // Byte-equality grouping keys.
+    repeated QueryBlockAggFunc aggs = 3;
+    // Optional predicate over the emitted group row.
+    PushedPredicate having = 4;
+}
+
+message QueryBlockSortKey {
+    uint32 output_ordinal = 1;
+    bool descending = 2;
+    uint32 cmp_kind = 3;  // 0=int64 numeric, 1=binary string, 2=decimal numeric.
+}
+
+message QueryBlockNode {
+    oneof op {
+        QueryBlockScan scan = 1;
+        QueryBlockJoin join = 2;
+        QueryBlockAggregate aggregate = 3;
+    }
+}
+
+message QueryBlockOutputExpr {
+    enum Source { GROUP = 0; AGG = 1; COLUMN = 2; }
+    Source source = 1;
+    uint32 ordinal = 2;      // GROUP: group key index; AGG: aggregate index.
+    QueryBlockColumnRef column = 3;  // Used when source is COLUMN.
+}
+
+message TxExecuteQueryBlock {
+    message TableDesc {
+        string table_name = 1;
+    }
+    message Request {
+        repeated TableDesc tables = 1;
+        // Topological order; the last node is the root.
+        repeated QueryBlockNode nodes = 2;
+        repeated QueryBlockOutputExpr output = 3;
+        repeated QueryBlockSortKey order_by = 4;
+        uint64 limit = 5;  // 0 means no limit.
+        uint64 offset = 6;
+    }
+    message Response {
+        bool ok = 1;
+        string error = 2;
+        repeated bytes rows = 3;  // Proxy row format, output order.
     }
 }
 
