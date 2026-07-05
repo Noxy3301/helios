@@ -201,6 +201,237 @@ bool parallel_primary_pax_aggregate_scan(
     return true;
 }
 
+bool parallel_primary_pax_row_ref_scan(
+    LineairDB::Database* db,
+    const LineairDB::Protocol::TxExecuteReadPlan::PlanStep& step,
+    const std::string& start_key, const std::string& end_key,
+    LineairDB::Protocol::TxExecuteReadPlan::StepResult* step_result,
+    bool& projection_failed) {
+    if (db == nullptr) return false;
+
+    const bool has_filter = step.has_filter() && step.filter().has_expr();
+    const bool has_projection = step.has_projection();
+    // With a pushed filter, LIMIT applies after filter evaluation.
+    const uint64_t ref_scan_limit = has_filter ? 0 : step.scan_limit();
+
+    std::vector<uint32_t> kept_columns;
+    if (has_projection) {
+        kept_columns.assign(step.projection().field_indexes().begin(),
+                            step.projection().field_indexes().end());
+    }
+
+    struct RefChunkOut {
+        struct Event {
+            bool filtered_key = false;
+            size_t index = 0;
+        };
+
+        // Preserve the scan observation order between accepted rows and
+        // filtered keys. LIMIT is applied while replaying this event stream,
+        // matching the materialized-row path's key-set coverage.
+        std::vector<std::string> scan_keys;
+        std::vector<std::string> scan_values;
+        std::vector<std::string> filtered_keys;
+        std::vector<uint64_t> tids;
+        std::vector<Event> events;
+        bool materialized_path_required = false;
+        bool projection_failed = false;
+    };
+
+    auto run_range = [&](const std::string& chunk_start,
+                         const std::string& chunk_end, RefChunkOut& out,
+                         bool release_epoch) {
+        auto refs = db->StatelessPaxRowRefScan(
+            step.table_name(), chunk_start, chunk_end, ref_scan_limit,
+            step.reverse_scan());
+        if (!refs.ok) {
+            out.materialized_path_required = true;
+            if (release_epoch) db->ReleaseMasstreeThreadEpoch();
+            return;
+        }
+
+        PredicateEvaluator evaluator;
+        for (auto& row_ref : refs.rows) {
+            const auto* group =
+                static_cast<const LineairDB::Pax::PaxGroup*>(row_ref.group);
+            bool pass = true;
+            if (has_filter) {
+                if (!evaluator.set_row_from_pax(
+                        *group, row_ref.slot, step.filter().num_columns())) {
+                    out.materialized_path_required = true;
+                    break;
+                }
+                pass = evaluator.evaluate(step.filter().expr());
+            }
+
+            std::string value;
+            if (pass) {
+                if (has_projection) {
+                    if (!group->GatherRowProjected(row_ref.slot,
+                                                   kept_columns.data(),
+                                                   kept_columns.size(),
+                                                   value)) {
+                        out.materialized_path_required = true;
+                        break;
+                    }
+                } else {
+                    value.resize(row_ref.row_size);
+                    const size_t gathered = group->GatherRow(
+                        row_ref.slot,
+                        reinterpret_cast<std::byte*>(value.data()),
+                        row_ref.row_size);
+                    if (gathered != row_ref.row_size) value.resize(gathered);
+                }
+            }
+
+            // The cells just read are valid only if the row TID still matches
+            // the ref-scan observation. Otherwise re-read a stable row copy.
+            if (LineairDB::PaxRowRefCurrentTid(row_ref) != row_ref.tid) {
+                auto reread =
+                    db->StatelessRead(step.table_name(), row_ref.key);
+                if (!reread.found) continue;
+
+                bool reread_pass = true;
+                if (has_filter) {
+                    PredicateEvaluator reread_eval;
+                    if (reread_eval.parse_row(reread.value.data(),
+                                              reread.value.size(),
+                                              step.filter().num_columns())) {
+                        reread_pass =
+                            reread_eval.evaluate(step.filter().expr());
+                    }
+                }
+                if (!reread_pass) {
+                    out.events.push_back({true, out.filtered_keys.size()});
+                    out.filtered_keys.push_back(std::move(row_ref.key));
+                    continue;
+                }
+
+                std::string reread_value;
+                if (has_projection) {
+                    if (!trim_row_value(reread.value,
+                                        step.projection().field_indexes(),
+                                        step.projection().num_columns(),
+                                        reread_value)) {
+                        out.projection_failed = true;
+                        reread_value = std::move(reread.value);
+                    }
+                } else {
+                    reread_value = std::move(reread.value);
+                }
+                out.events.push_back({false, out.scan_keys.size()});
+                out.scan_keys.push_back(std::move(row_ref.key));
+                out.scan_values.push_back(std::move(reread_value));
+                out.tids.push_back(reread.tid);
+                continue;
+            }
+
+            if (!pass) {
+                out.events.push_back({true, out.filtered_keys.size()});
+                out.filtered_keys.push_back(std::move(row_ref.key));
+                continue;
+            }
+            out.events.push_back({false, out.scan_keys.size()});
+            out.scan_keys.push_back(std::move(row_ref.key));
+            out.scan_values.push_back(std::move(value));
+            out.tids.push_back(row_ref.tid);
+        }
+
+        if (release_epoch) db->ReleaseMasstreeThreadEpoch();
+    };
+
+    std::vector<RefChunkOut> chunks;
+    bool ran_parallel = false;
+    if (step.scan_limit() == 0 && !step.reverse_scan()) {
+        const unsigned nproc = std::thread::hardware_concurrency();
+        const unsigned max_threads = std::min<unsigned>(nproc ? nproc : 4, 8);
+        auto first = db->StatelessRangeScan(step.table_name(), start_key,
+                                            end_key, 1, false);
+        auto last = db->StatelessRangeScan(step.table_name(), start_key,
+                                           end_key, 1, true);
+        int64_t lo = 0;
+        int64_t hi = 0;
+        if (max_threads > 1 && first.ok && !first.rows.empty() && last.ok &&
+            !last.rows.empty() &&
+            decode_leading_int_key(first.rows.front().key, lo) &&
+            decode_leading_int_key(last.rows.front().key, hi) && hi > lo) {
+            const uint64_t span = static_cast<uint64_t>(hi - lo) + 1;
+            constexpr uint64_t kMinParallelRows = 500000;
+            constexpr uint64_t kMorselRows = 128000;
+            if (span >= kMinParallelRows) {
+                const unsigned worker_count = static_cast<unsigned>(
+                    std::min<uint64_t>(
+                        (span + kMorselRows - 1) / kMorselRows,
+                        max_threads));
+                if (worker_count > 1) {
+                    std::vector<std::string> starts(worker_count);
+                    std::vector<std::string> ends(worker_count);
+                    for (unsigned i = 0; i < worker_count; ++i) {
+                        const int64_t begin_value =
+                            lo + static_cast<int64_t>((span * i) /
+                                                      worker_count);
+                        const int64_t end_value =
+                            (i + 1 == worker_count)
+                                ? hi + 1
+                                : lo + static_cast<int64_t>(
+                                           (span * (i + 1)) / worker_count);
+                        starts[i] = i == 0 ? start_key
+                                           : encode_int_key_part(begin_value);
+                        ends[i] = i + 1 == worker_count
+                                      ? end_key
+                                      : encode_int_key_part(end_value);
+                    }
+
+                    chunks = std::vector<RefChunkOut>(worker_count);
+                    std::vector<std::thread> workers;
+                    workers.reserve(worker_count);
+                    for (unsigned worker_index = 0;
+                         worker_index < worker_count; ++worker_index) {
+                        workers.emplace_back([&, worker_index] {
+                            run_range(starts[worker_index],
+                                      ends[worker_index],
+                                      chunks[worker_index], true);
+                        });
+                    }
+                    for (auto& worker : workers) worker.join();
+                    ran_parallel = true;
+                }
+            }
+        }
+    }
+    if (!ran_parallel) {
+        chunks = std::vector<RefChunkOut>(1);
+        run_range(start_key, end_key, chunks[0], false);
+    }
+
+    for (const auto& chunk : chunks) {
+        if (chunk.materialized_path_required) return false;
+        if (chunk.projection_failed) projection_failed = true;
+    }
+
+    uint64_t emitted = 0;
+    for (auto& chunk : chunks) {
+        // Replay the mixed stream in scan order so filtered keys observed
+        // before LIMIT cutoff remain visible to range validation.
+        for (const auto& event : chunk.events) {
+            if (event.filtered_key) {
+                step_result->add_filtered_keys(
+                    std::move(chunk.filtered_keys[event.index]));
+                continue;
+            }
+            step_result->add_scan_keys(
+                std::move(chunk.scan_keys[event.index]));
+            step_result->add_scan_values(
+                std::move(chunk.scan_values[event.index]));
+            step_result->add_scan_tids(chunk.tids[event.index]);
+            if (step.scan_limit() > 0 && ++emitted >= step.scan_limit()) {
+                return true;
+            }
+        }
+    }
+    return true;
+}
+
 bool parallel_primary_aggregate_scan(
     LineairDB::Database* db,
     const LineairDB::Protocol::TxExecuteReadPlan::PlanStep& step,

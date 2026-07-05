@@ -551,6 +551,18 @@ void LineairDBRpc::handleTxExecuteReadPlan(const std::string& message,
                     continue;
                 }
             }
+            if (!(step.has_aggregate() && step.aggregate().aggs_size() > 0)) {
+                if (parallel_primary_pax_row_ref_scan(
+                        db_manager_->get_database().get(), step, start_key,
+                        end_key, step_result, projection_failed)) {
+                    if (projection_failed) {
+                        response.set_ok(false);
+                        flat_plan::encode_to_string(response, result);
+                        return;
+                    }
+                    continue;
+                }
+            }
             if (!step.for_each() && step.scan_limit() == 0 &&
                 !step.reverse_scan() &&
                 !(step.has_aggregate() && step.aggregate().aggs_size() > 0) &&

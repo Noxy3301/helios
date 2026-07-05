@@ -5,7 +5,7 @@
 #include "lineairdb.pb.h"
 #include "lineairdb/lineairdb.h"
 
-// Parallel scan helpers for primary ranges and PAX full-scan aggregates. These
+// Parallel scan helpers for primary ranges and PAX strip-direct scans. These
 // functions fall back to the serial path when the table, key shape, or row
 // count is not suitable for the specialized path.
 
@@ -20,6 +20,19 @@ bool parallel_primary_pax_aggregate_scan(
     const LineairDB::Protocol::TxExecuteReadPlan::PlanStep& step,
     const std::string& start_key, const std::string& end_key,
     LineairDB::Protocol::TxExecuteReadPlan::StepResult* step_result);
+
+/**
+ * @brief Scan primary rows through PAX row references and gather survivors.
+ *
+ * @return true when rows were emitted; false lets the caller use the
+ * materialized-row path.
+ */
+bool parallel_primary_pax_row_ref_scan(
+    LineairDB::Database* db,
+    const LineairDB::Protocol::TxExecuteReadPlan::PlanStep& step,
+    const std::string& start_key, const std::string& end_key,
+    LineairDB::Protocol::TxExecuteReadPlan::StepResult* step_result,
+    bool& projection_failed);
 
 /**
  * @brief Scan integer primary-key slices in parallel and aggregate locally.
