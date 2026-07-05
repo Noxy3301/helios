@@ -18,6 +18,7 @@
 #include "sql/handler.h"
 #include "sql/item.h"
 #include "sql/item_sum.h"
+#include "sql/item_timefunc.h"
 #include "sql/mem_root_array.h"
 #include "sql/query_result.h"
 #include "sql/sql_const.h"
@@ -337,6 +338,114 @@ int TableIndexOfField(const Field *field,
     }
   }
   return found;
+}
+
+/**
+ * @brief Encode a column reference inside an aggregate expression.
+ *
+ * Untagged column refs read from the aggregate function's default table. Tagged
+ * refs use the upper bits for the query-block table index, allowing one SUM
+ * expression to read columns from multiple joined tables.
+ */
+uint32_t EncodeAggregateColumnRef(uint32_t default_table_idx,
+                                  uint32_t table_idx, uint32_t column_idx) {
+  if (table_idx == default_table_idx) return column_idx;
+  return (table_idx << 16) | column_idx;
+}
+
+/**
+ * @brief Serialize arithmetic aggregate arguments with table-aware column refs.
+ *
+ * Supports column refs, integer constants, and +, -, *, and unary minus. This
+ * is used only when the expression may read more than one joined table; single
+ * table aggregate expressions keep using the shared serializer.
+ */
+bool SerializeAggregateExpressionForTables(
+    Item *item, const std::vector<QueryBlockTable> &tables,
+    uint32_t default_table_idx, LineairDB::Protocol::FilterExpr *out) {
+  item = item->real_item();
+  switch (item->type()) {
+    case Item::FIELD_ITEM: {
+      const Field *raw_field = down_cast<Item_field *>(item)->field;
+      const int table_idx = TableIndexOfField(raw_field, tables);
+      if (table_idx < 0) return false;
+      const Field *field =
+          ResolveBaseField(raw_field, tables[table_idx].table);
+      if (field == nullptr) return false;
+
+      out->set_op(LineairDB::Protocol::FilterExpr::COLUMN_REF);
+      out->set_column_index(EncodeAggregateColumnRef(
+          default_table_idx, static_cast<uint32_t>(table_idx),
+          field->field_index()));
+      return true;
+    }
+    case Item::INT_ITEM: {
+      out->set_op(LineairDB::Protocol::FilterExpr::CONST_INT);
+      out->set_int_val(item->val_int());
+      return true;
+    }
+    case Item::FUNC_ITEM: {
+      auto *function = down_cast<Item_func *>(item);
+      using FilterExpr = LineairDB::Protocol::FilterExpr;
+      FilterExpr::Op op;
+      switch (function->functype()) {
+        case Item_func::PLUS_FUNC:
+          op = FilterExpr::OP_ADD;
+          break;
+        case Item_func::MINUS_FUNC:
+          op = FilterExpr::OP_SUB;
+          break;
+        case Item_func::MUL_FUNC:
+          op = FilterExpr::OP_MUL;
+          break;
+        case Item_func::NEG_FUNC:
+          op = FilterExpr::OP_NEG;
+          break;
+        default:
+          return false;
+      }
+
+      out->set_op(op);
+      if (op == FilterExpr::OP_NEG) {
+        if (function->argument_count() != 1) return false;
+        return SerializeAggregateExpressionForTables(
+            function->arguments()[0], tables, default_table_idx,
+            out->add_children());
+      }
+      if (function->argument_count() != 2) return false;
+      return SerializeAggregateExpressionForTables(
+                 function->arguments()[0], tables, default_table_idx,
+                 out->add_children()) &&
+             SerializeAggregateExpressionForTables(
+                 function->arguments()[1], tables, default_table_idx,
+                 out->add_children());
+    }
+    default:
+      return false;
+  }
+}
+
+/**
+ * @brief Return the date field inside EXTRACT(YEAR FROM field), if supported.
+ */
+const Field *ExtractYearField(Item *item) {
+  Item *real = item->real_item();
+  if (real->type() != Item::FUNC_ITEM) return nullptr;
+  auto *function = down_cast<Item_func *>(real);
+  if (function->functype() != Item_func::EXTRACT_FUNC) return nullptr;
+
+  auto *extract = down_cast<Item_extract *>(function);
+  if (extract->int_type != INTERVAL_YEAR) return nullptr;
+  Item *arg = extract->arguments()[0]->real_item();
+  if (arg->type() != Item::FIELD_ITEM) return nullptr;
+
+  const Field *field = down_cast<Item_field *>(arg)->field;
+  if (field->type() != MYSQL_TYPE_DATE &&
+      field->type() != MYSQL_TYPE_DATETIME &&
+      field->type() != MYSQL_TYPE_NEWDATE) {
+    return nullptr;
+  }
+  return field;
 }
 
 /**
@@ -796,12 +905,34 @@ bool RecognizeQueryBlock(JOIN *join, ColumnarExecutionContext *ctx,
     }
   }
 
-  // Build a left-deep INNER join tree in FROM-clause order. Each new table must
-  // have at least one equality edge to the already joined side.
+  // Build a left-deep INNER join tree by walking FROM order and retrying tables
+  // whose equality edges are not connected yet.
   int current_node = scan_nodes[0];
   std::vector<bool> joined(tables.size(), false);
   joined[0] = true;
+  std::vector<int> pending_tables;
   for (size_t table_idx = 1; table_idx < tables.size(); table_idx++) {
+    pending_tables.push_back(static_cast<int>(table_idx));
+  }
+  while (!pending_tables.empty()) {
+    int table_idx = -1;
+    size_t pending_idx = 0;
+    for (size_t idx = 0; idx < pending_tables.size(); idx++) {
+      for (const JoinEdge &edge : join_edges) {
+        if ((edge.left_table == pending_tables[idx] &&
+             joined[edge.right_table]) ||
+            (edge.right_table == pending_tables[idx] &&
+             joined[edge.left_table])) {
+          table_idx = pending_tables[idx];
+          pending_idx = idx;
+          break;
+        }
+      }
+      if (table_idx >= 0) break;
+    }
+    if (table_idx < 0) LDB_COL_REJECT("disconnected join graph");
+    pending_tables.erase(pending_tables.begin() + pending_idx);
+
     bool connected = false;
     auto *join_node = request.add_nodes()->mutable_join();
     join_node->set_type(LineairDB::Protocol::QueryBlockJoin::INNER);
@@ -848,9 +979,30 @@ bool RecognizeQueryBlock(JOIN *join, ColumnarExecutionContext *ctx,
     const Field *field = nullptr;
   };
   std::vector<GroupField> group_fields;
+  std::vector<Item *> group_items;
   for (ORDER *group = qb->group_list.first; group != nullptr;
        group = group->next) {
     Item *group_item = (*group->item)->real_item();
+    group_items.push_back(group_item);
+    if (const Field *year_field = ExtractYearField(group_item)) {
+      const int group_table = TableIndexOfField(year_field, tables);
+      const Field *group_field =
+          group_table >= 0
+              ? ResolveBaseField(year_field, tables[group_table].table)
+              : nullptr;
+      if (group_field == nullptr || group_field->is_nullable()) {
+        LDB_COL_REJECT("group year column");
+      }
+
+      auto *group_column = aggregate->add_group_columns();
+      group_column->set_table_idx(static_cast<uint32_t>(group_table));
+      group_column->set_column(group_field->field_index());
+      group_column->set_prefix_len(4);
+      group_column->set_cmp_kind(0);
+      group_fields.push_back({group_table, nullptr});
+      continue;
+    }
+
     if (group_item->type() != Item::FIELD_ITEM)
       LDB_COL_REJECT("group item not a column");
 
@@ -895,7 +1047,8 @@ bool RecognizeQueryBlock(JOIN *join, ColumnarExecutionContext *ctx,
 
       int group_position = -1;
       for (size_t i = 0; i < group_fields.size(); i++) {
-        if (group_fields[i].table == output_table &&
+        if (group_fields[i].field != nullptr &&
+            group_fields[i].table == output_table &&
             group_fields[i].field == output_field) {
           group_position = static_cast<int>(i);
           break;
@@ -909,8 +1062,21 @@ bool RecognizeQueryBlock(JOIN *join, ColumnarExecutionContext *ctx,
       continue;
     }
 
-    if (real->type() != Item::SUM_FUNC_ITEM)
-      LDB_COL_REJECT("output not aggregate");
+    if (real->type() != Item::SUM_FUNC_ITEM) {
+      int group_position = -1;
+      for (size_t group_idx = 0; group_idx < group_items.size();
+           group_idx++) {
+        if (group_items[group_idx] == real ||
+            group_items[group_idx]->eq(real, true)) {
+          group_position = static_cast<int>(group_idx);
+          break;
+        }
+      }
+      if (group_position < 0) LDB_COL_REJECT("output not aggregate");
+      output->set_source(LineairDB::Protocol::QueryBlockOutputExpr::GROUP);
+      output->set_ordinal(group_position);
+      continue;
+    }
 
     Item_sum *sum = down_cast<Item_sum *>(real);
     if (sum->argument_count() > 1) LDB_COL_REJECT("aggregate arg count");
@@ -971,10 +1137,9 @@ bool RecognizeQueryBlock(JOIN *join, ColumnarExecutionContext *ctx,
           LDB_COL_REJECT("aggregate arg type");
         }
 
-        const int argument_table =
+        int argument_table =
             SingleTableOf(arg->used_tables() & ~PSEUDO_TABLE_BITS, tables);
-        if (argument_table < 0) LDB_COL_REJECT("aggregate arg tables");
-        if (arg->type() == Item::FIELD_ITEM) {
+        if (argument_table >= 0 && arg->type() == Item::FIELD_ITEM) {
           const Field *raw_argument_field =
               down_cast<Item_field *>(arg)->field;
           const Field *argument_field = ResolveBaseField(
@@ -985,9 +1150,16 @@ bool RecognizeQueryBlock(JOIN *join, ColumnarExecutionContext *ctx,
           auto *ref = function->mutable_arg();
           ref->set_op(LineairDB::Protocol::FilterExpr::COLUMN_REF);
           ref->set_column_index(argument_field->field_index());
-        } else {
+        } else if (argument_table >= 0) {
           if (!lineairdb::serialize_aggregate_expression(
                   arg, function->mutable_arg())) {
+            LDB_COL_REJECT("aggregate expr not pushable");
+          }
+        } else {
+          argument_table = 0;
+          if (!SerializeAggregateExpressionForTables(
+                  arg, tables, static_cast<uint32_t>(argument_table),
+                  function->mutable_arg())) {
             LDB_COL_REJECT("aggregate expr not pushable");
           }
         }
