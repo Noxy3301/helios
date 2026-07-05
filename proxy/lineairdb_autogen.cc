@@ -1589,6 +1589,56 @@ bool autogen_read_plan_from_qep(
     }
   }
 
+  // Grouped semijoin: prepend the inner GROUP BY/HAVING aggregate step and use
+  // its group keys as a membership set for the plain outer scan.
+  if (allow_filter_pushdown) {
+    LineairDBTransaction *query_tx = find_tx();
+    if (query_tx != nullptr && !query_tx->grouped_semijoins().empty()) {
+      for (const auto &grouped_semijoin : query_tx->grouped_semijoins()) {
+        int outer_idx = -1;
+        for (size_t i = 0; i < steps.size(); ++i) {
+          const auto &step = steps[i];
+          if (step.is_scan && !step.for_each &&
+              step.table_name == grouped_semijoin.outer_table_key &&
+              step.aggregate_serialized.empty() && step.index_name.empty() &&
+              step.key_prefix.empty() &&
+              step.end_key_prefix == lineairdb_keyenc::scan_end_sentinel() &&
+              step.scan_limit == 0 && step.semijoins.empty()) {
+            outer_idx = static_cast<int>(i);
+            break;
+          }
+        }
+        if (outer_idx < 0) continue;
+
+        LineairDBProxy::ReadPlanStep aggregate_step;
+        aggregate_step.table_name = grouped_semijoin.inner_table_key;
+        aggregate_step.is_scan = true;
+        aggregate_step.for_each = false;
+        aggregate_step.end_key_prefix = lineairdb_keyenc::scan_end_sentinel();
+        aggregate_step.aggregate_serialized = grouped_semijoin.agg_spec;
+        aggregate_step.serialized_filter = grouped_semijoin.having_filter;
+
+        steps.insert(steps.begin(), std::move(aggregate_step));
+        step_aliases.insert(step_aliases.begin(), {});
+        for (auto &step : steps) {
+          for (auto &binding : step.bindings) ++binding.source_step;
+          for (auto &binding : step.end_bindings) ++binding.source_step;
+          for (auto &semijoin : step.semijoins) ++semijoin.source_step;
+        }
+        for (auto &kv : table_steps) {
+          if (kv.second >= 0) ++kv.second;
+        }
+
+        LineairDBProxy::ReadPlanStep::Semijoin semijoin;
+        semijoin.source_step = 0;
+        semijoin.source_column = 0;
+        semijoin.probe_column = grouped_semijoin.outer_probe_column;
+        steps[static_cast<size_t>(outer_idx + 1)].semijoins.push_back(
+            std::move(semijoin));
+      }
+    }
+  }
+
   *out = std::move(steps);
   return true;
 }
@@ -1598,6 +1648,11 @@ void plan_projection_pushdown(
     std::unordered_map<std::string, std::vector<uint32_t>> *kept_out) {
   kept_out->clear();
   if (thd == nullptr || thd->lex == nullptr || steps == nullptr) return;
+
+  const auto source_is_aggregate = [&](uint32_t source_step) -> bool {
+    return source_step < steps->size() &&
+           !(*steps)[source_step].aggregate_serialized.empty();
+  };
 
   std::unordered_map<std::string, std::vector<bool>> union_rs;
   std::unordered_map<std::string, uint32_t> fields_of;
@@ -1655,6 +1710,7 @@ void plan_projection_pushdown(
   for (const auto &s : *steps) {
     for (const auto &sj : s.semijoins) {
       if (sj.source_step >= steps->size()) continue;
+      if (source_is_aggregate(sj.source_step)) continue;
       const std::string &src = (*steps)[sj.source_step].table_name;
       auto fo = fields_of.find(src);
       if (fo == fields_of.end()) continue;
@@ -1708,6 +1764,7 @@ void plan_projection_pushdown(
   for (auto &s : *steps) {
     for (auto &sj : s.semijoins) {
       if (sj.source_step >= steps->size()) continue;
+      if (source_is_aggregate(sj.source_step)) continue;
       auto it = full_to_proj.find((*steps)[sj.source_step].table_name);
       if (it == full_to_proj.end()) continue;
       const uint32_t fi = sj.source_column;
@@ -1717,6 +1774,7 @@ void plan_projection_pushdown(
   }
 
   for (auto &s : *steps) {
+    if (!s.aggregate_serialized.empty()) continue;
     auto it = kept_out->find(s.table_name);
     if (it == kept_out->end()) continue;
     s.projection = it->second;
