@@ -894,6 +894,47 @@ static void try_register_grouped_semijoin(THD *thd, JOIN *join) {
   grouped_semijoin.outer_table_key = outer_key;
   grouped_semijoin.outer_probe_column = static_cast<uint32_t>(probe_column);
   inner_handler->tx_register_grouped_semijoin(std::move(grouped_semijoin));
+
+  if (having.kind != LineairDBAggKind::kSum || having.arg == nullptr) return;
+  Item *sum_arg = having.arg->real_item();
+  if (sum_arg->type() != Item::FIELD_ITEM || sum_arg->is_nullable()) return;
+  Field *sum_field = down_cast<Item_field *>(sum_arg)->field;
+  if (sum_field == nullptr || sum_field->table != inner_table ||
+      sum_field == group_field || sum_field->is_nullable()) {
+    return;
+  }
+
+  int sum_column = -1;
+  int group_column = -1;
+  for (uint field_index = 0; field_index < inner_table->s->fields;
+       ++field_index) {
+    if (inner_table->field[field_index] == sum_field) {
+      sum_column = static_cast<int>(field_index);
+    }
+    if (inner_table->field[field_index] == group_field) {
+      group_column = static_cast<int>(field_index);
+    }
+  }
+  if (sum_column < 0 || group_column < 0) return;
+
+  for (uint field_index = 0; field_index < inner_table->s->fields;
+       ++field_index) {
+    if (!bitmap_is_set(inner_table->read_set, field_index)) continue;
+    if (static_cast<int>(field_index) != sum_column &&
+        static_cast<int>(field_index) != group_column) {
+      return;
+    }
+  }
+
+  LineairDBTransaction::GroupedSummaryRegistration registration;
+  registration.spec = std::move(aggregate_spec);
+  registration.filter = std::move(having_filter);
+  registration.template_cols.assign(inner_table->s->fields, "0");
+  registration.group_col = static_cast<uint32_t>(group_column);
+  registration.col_a = static_cast<uint32_t>(sum_column);
+  registration.col_b = static_cast<uint32_t>(sum_column);
+  registration.single_sum = true;
+  inner_handler->tx_register_grouped_summary(std::move(registration));
 }
 
 /**
