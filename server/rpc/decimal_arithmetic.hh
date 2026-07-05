@@ -26,6 +26,18 @@ struct DecimalValue {
 void add_decimal_value(DecimalValue& total, const DecimalValue& value);
 
 /**
+ * @brief Parse an ASCII decimal string into a DecimalValue.
+ */
+DecimalValue parse_decimal_value(std::string_view value);
+
+/**
+ * @brief Compare two decimal values after aligning their scales.
+ *
+ * Returns -1, 0, or 1 for less-than, equal, or greater-than.
+ */
+int compare_decimal_values(const DecimalValue& lhs, const DecimalValue& rhs);
+
+/**
  * @brief Evaluate a decimal-valued aggregate argument tree against one
  * materialized row.
  *

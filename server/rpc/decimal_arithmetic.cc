@@ -15,10 +15,12 @@ __int128 decimal_power_of_ten(int n) {
     return r;
 }
 
+}  // namespace
+
 /**
  * @brief Parse an ASCII decimal string into DecimalValue.
  */
-DecimalValue parse_decimal(std::string_view v) {
+DecimalValue parse_decimal_value(std::string_view v) {
     DecimalValue d;
     if (v.empty()) {
         d.is_null = true;
@@ -53,6 +55,24 @@ DecimalValue parse_decimal(std::string_view v) {
     return d;
 }
 
+int compare_decimal_values(const DecimalValue& lhs,
+                           const DecimalValue& rhs) {
+    if (lhs.is_null && rhs.is_null) return 0;
+    if (lhs.is_null) return -1;
+    if (rhs.is_null) return 1;
+
+    const int scale = lhs.scale > rhs.scale ? lhs.scale : rhs.scale;
+    const __int128 lhs_mantissa =
+        lhs.mantissa * decimal_power_of_ten(scale - lhs.scale);
+    const __int128 rhs_mantissa =
+        rhs.mantissa * decimal_power_of_ten(scale - rhs.scale);
+    if (lhs_mantissa < rhs_mantissa) return -1;
+    if (lhs_mantissa > rhs_mantissa) return 1;
+    return 0;
+}
+
+namespace {
+
 enum class DecimalOperation {
     kAdd,
     kSubtract,
@@ -80,7 +100,7 @@ DecimalValue evaluate_decimal_expression_impl(
     using FE = LineairDB::Protocol::FilterExpr;
     switch (expression.op()) {
         case FE::COLUMN_REF:
-            return parse_decimal(
+            return parse_decimal_value(
                 extract_value_column(row, expression.column_index()));
         case FE::CONST_INT: {
             DecimalValue d;
