@@ -1,6 +1,8 @@
 #pragma once
 
+#include <cstdint>
 #include <string>
+#include <unordered_set>
 
 #include "lineairdb.pb.h"
 #include "lineairdb/lineairdb.h"
@@ -8,6 +10,14 @@
 // Parallel scan helpers for primary ranges and PAX strip-direct scans. These
 // functions fall back to the serial path when the table, key shape, or row
 // count is not suitable for the specialized path.
+
+/**
+ * @brief Membership set for one hoisted semijoin reduction.
+ */
+struct SemijoinReduction {
+    std::unordered_set<std::string> keys;  // accepted join-key values
+    uint32_t probe_column = 0;             // probed column in the current row
+};
 
 /**
  * @brief Aggregate a full primary scan directly from PAX row-group strips.
