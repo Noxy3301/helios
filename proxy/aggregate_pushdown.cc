@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <cstdlib>
+#include <limits>
 #include <map>
 #include <string>
 #include <string_view>
@@ -70,6 +71,9 @@ struct LineairDBHavingPredicate {
 // Keep aggregate decimal inputs inside the server's __int128 accumulator.
 constexpr uint kLineairDBAggregateDecimalPrecisionMax = 18;
 
+// Wire marker also understood by server/rpc/aggregate_executor.cc.
+constexpr uint32_t kLineairDBAggregateHavingFilterColumns =
+    std::numeric_limits<uint32_t>::max();
 }  // namespace
 
 /**
@@ -445,6 +449,153 @@ static bool parse_aggregate_having(Query_block *query_block,
     }
   }
   out->constant = constant_side;
+  return true;
+}
+
+/**
+ * @brief Build an AggregateSpec that also emits a HAVING aggregate value.
+ */
+static bool build_grouped_aggregate_spec(
+    TABLE *table, bool read_only_no_validate,
+    const std::vector<LineairDBAggOutput> &outputs,
+    const std::vector<Item *> &group_items,
+    const LineairDBHavingPredicate &having, int *having_aggregate_index,
+    std::string *serialized_spec) {
+  if (table == nullptr || having_aggregate_index == nullptr ||
+      serialized_spec == nullptr) {
+    return false;
+  }
+
+  *having_aggregate_index = -1;
+  serialized_spec->clear();
+  if (!read_only_no_validate) return false;
+  for (Item *group_item : group_items) {
+    if (group_item == nullptr || group_item->is_nullable()) return false;
+  }
+
+  const size_t output_count = outputs.size();
+  for (size_t output = 0; output < output_count; ++output) {
+    if (outputs[output].kind == LineairDBAggKind::kPass) {
+      Field *field = down_cast<Item_field *>(outputs[output].orig)->field;
+      bool found_group_column = false;
+      for (size_t group = 0; group < group_items.size(); ++group) {
+        if (down_cast<Item_field *>(group_items[group])->field == field) {
+          found_group_column = true;
+          break;
+        }
+      }
+      if (!found_group_column) return false;
+    }
+  }
+
+  LineairDB::Protocol::AggregateSpec spec;
+  spec.set_num_columns(table->s->fields);
+  for (Item *group_item : group_items) {
+    spec.add_group_columns(
+        down_cast<Item_field *>(group_item)->field->field_index());
+  }
+
+  for (size_t output = 0; output < output_count; ++output) {
+    if (outputs[output].kind == LineairDBAggKind::kPass) continue;
+    auto *aggregate = spec.add_aggs();
+    if (outputs[output].kind == LineairDBAggKind::kCount) {
+      aggregate->set_kind(LineairDB::Protocol::AggFunc::AGG_COUNT);
+    } else {
+      aggregate->set_kind(outputs[output].kind == LineairDBAggKind::kSum
+                              ? LineairDB::Protocol::AggFunc::AGG_SUM
+                              : LineairDB::Protocol::AggFunc::AGG_AVG);
+      if (outputs[output].rtype != DECIMAL_RESULT ||
+          outputs[output].arg == nullptr ||
+          !serialize_aggregate_expression(outputs[output].arg,
+                                          aggregate->mutable_arg())) {
+        return false;
+      }
+    }
+    aggregate->set_result_scale(0);
+  }
+
+  if (having.aggregate != nullptr) {
+    auto *aggregate = spec.add_aggs();
+    if (having.kind == LineairDBAggKind::kCount) {
+      aggregate->set_kind(LineairDB::Protocol::AggFunc::AGG_COUNT);
+    } else {
+      aggregate->set_kind(having.kind == LineairDBAggKind::kSum
+                              ? LineairDB::Protocol::AggFunc::AGG_SUM
+                              : LineairDB::Protocol::AggFunc::AGG_AVG);
+      if (having.result_type != DECIMAL_RESULT || having.arg == nullptr ||
+          !serialize_aggregate_expression(having.arg,
+                                          aggregate->mutable_arg())) {
+        return false;
+      }
+    }
+    aggregate->set_result_scale(0);
+    *having_aggregate_index = spec.aggs_size() - 1;
+  }
+
+  spec.SerializeToString(serialized_spec);
+  return true;
+}
+
+/**
+ * @brief Serialize HAVING as a group-row predicate for the server aggregate.
+ */
+static bool build_aggregate_having_filter(
+    const LineairDBHavingPredicate &having, uint32_t group_row_value_column,
+    std::string *out) {
+  if (out == nullptr || having.aggregate == nullptr ||
+      having.constant == nullptr) {
+    return false;
+  }
+  out->clear();
+
+  // The grouped summary bridge currently consumes SUM/COUNT result columns.
+  if (having.kind == LineairDBAggKind::kAvg) return false;
+
+  LineairDB::Protocol::FilterExpr::Op op;
+  switch (having.op) {
+    case Item_func::GT_FUNC:
+      op = LineairDB::Protocol::FilterExpr::OP_GT;
+      break;
+    case Item_func::GE_FUNC:
+      op = LineairDB::Protocol::FilterExpr::OP_GE;
+      break;
+    case Item_func::LT_FUNC:
+      op = LineairDB::Protocol::FilterExpr::OP_LT;
+      break;
+    case Item_func::LE_FUNC:
+      op = LineairDB::Protocol::FilterExpr::OP_LE;
+      break;
+    case Item_func::EQ_FUNC:
+      op = LineairDB::Protocol::FilterExpr::OP_EQ;
+      break;
+    case Item_func::NE_FUNC:
+      op = LineairDB::Protocol::FilterExpr::OP_NE;
+      break;
+    default:
+      return false;
+  }
+
+  my_decimal decimal_constant;
+  my_decimal *constant = having.constant->val_decimal(&decimal_constant);
+  if (constant == nullptr || having.constant->null_value) return false;
+  String constant_text;
+  if (my_decimal2string(E_DEC_FATAL_ERROR, constant, &constant_text) !=
+      E_DEC_OK) {
+    return false;
+  }
+
+  LineairDB::Protocol::PushedPredicate predicate;
+  predicate.set_num_columns(kLineairDBAggregateHavingFilterColumns);
+  auto *expr = predicate.mutable_expr();
+  expr->set_op(op);
+  auto *lhs = expr->add_children();
+  lhs->set_op(LineairDB::Protocol::FilterExpr::COLUMN_REF);
+  lhs->set_column_index(group_row_value_column);
+  auto *rhs = expr->add_children();
+  rhs->set_op(LineairDB::Protocol::FilterExpr::CONST_STRING);
+  rhs->set_string_val(
+      std::string(constant_text.ptr(), constant_text.length()));
+  predicate.SerializeToString(out);
   return true;
 }
 
