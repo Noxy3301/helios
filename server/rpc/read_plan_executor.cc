@@ -111,6 +111,19 @@ std::string build_plan_key(
     return key;
 }
 
+const std::vector<uint32_t>* selected_columns_for_materialization(
+    const LineairDB::Protocol::TxExecuteReadPlan::PlanStep& step,
+    std::vector<uint32_t>& selected_columns) {
+    selected_columns.clear();
+    if (!step.has_projection() ||
+        step.projection().field_indexes_size() == 0) {
+        return nullptr;
+    }
+    selected_columns.assign(step.projection().field_indexes().begin(),
+                            step.projection().field_indexes().end());
+    return &selected_columns;
+}
+
 }  // namespace
 
 void LineairDBRpc::handleTxExecuteReadPlan(const std::string& message,
@@ -159,10 +172,15 @@ void LineairDBRpc::handleTxExecuteReadPlan(const std::string& message,
             return step_eval.evaluate(*step_filter);
         };
 
-        // Filters read the full row. Projection then trims emitted VALUES to
-        // the kept columns; malformed rows fail the plan instead of mixing
-        // full and projected layouts.
         const bool step_has_projection = step.has_projection();
+        std::vector<uint32_t> selected_columns;
+        const std::vector<uint32_t>* selected_columns_for_reads =
+            selected_columns_for_materialization(step, selected_columns);
+
+        // PAX-backed reads can materialize only the selected column payloads
+        // while keeping the full row shape. Projection then trims emitted
+        // VALUES to the kept columns; malformed rows fail the plan instead of
+        // mixing full and projected layouts.
         bool projection_failed = false;
         auto project_value = [&](std::string&& v) -> std::string {
             if (!step_has_projection || v.empty()) return std::move(v);
@@ -322,7 +340,8 @@ void LineairDBRpc::handleTxExecuteReadPlan(const std::string& message,
                                         db->StatelessRangeScan(
                                             step.table_name(), row_key,
                                             row_end, step.scan_limit(),
-                                            step.reverse_scan());
+                                            step.reverse_scan(),
+                                            selected_columns_for_reads);
                                     if (!scan_result.ok) {
                                         failed[worker_index] = 1;
                                         break;
@@ -346,7 +365,8 @@ void LineairDBRpc::handleTxExecuteReadPlan(const std::string& message,
                                             step.table_name(),
                                             step.index_name(), row_key,
                                             row_end, step.scan_limit(),
-                                            step.reverse_scan());
+                                            step.reverse_scan(),
+                                            selected_columns_for_reads);
                                     if (!scan_result.ok) {
                                         failed[worker_index] = 1;
                                         break;
@@ -372,7 +392,8 @@ void LineairDBRpc::handleTxExecuteReadPlan(const std::string& message,
                             } else {
                                 auto read_result =
                                     db->StatelessRead(step.table_name(),
-                                                      row_key);
+                                                      row_key,
+                                                      selected_columns_for_reads);
                                 out.keys.push_back(row_key);
                                 out.tids.push_back(read_result.tid);
                                 if (read_result.found &&
@@ -442,7 +463,8 @@ void LineairDBRpc::handleTxExecuteReadPlan(const std::string& message,
                         auto scan_result =
                             db_manager_->get_database()->StatelessRangeScan(
                                 step.table_name(), row_key, row_end,
-                                step.scan_limit(), step.reverse_scan());
+                                step.scan_limit(), step.reverse_scan(),
+                                selected_columns_for_reads);
                         if (!scan_result.ok) {
                             response.set_ok(false);
                             flat_plan::encode_to_string(response, result);
@@ -465,7 +487,8 @@ void LineairDBRpc::handleTxExecuteReadPlan(const std::string& message,
                                 ->StatelessSecondaryRangeScan(
                                     step.table_name(), step.index_name(),
                                     row_key, row_end, step.scan_limit(),
-                                    step.reverse_scan());
+                                    step.reverse_scan(),
+                                    selected_columns_for_reads);
                         if (!scan_result.ok) {
                             response.set_ok(false);
                             flat_plan::encode_to_string(response, result);
@@ -494,7 +517,8 @@ void LineairDBRpc::handleTxExecuteReadPlan(const std::string& message,
 
                 auto read_result =
                     db_manager_->get_database()->StatelessRead(
-                        step.table_name(), row_key);
+                        step.table_name(), row_key,
+                        selected_columns_for_reads);
                 step_result->add_scan_keys(row_key);
                 step_result->add_scan_tids(read_result.tid);
                 if (read_result.found &&
@@ -518,7 +542,7 @@ void LineairDBRpc::handleTxExecuteReadPlan(const std::string& message,
         if (!step.is_scan()) {
             auto read_result =
                 db_manager_->get_database()->StatelessRead(
-                    step.table_name(), start_key);
+                    step.table_name(), start_key, selected_columns_for_reads);
             step_result->set_actual_key(start_key);
             step_result->set_actual_start_key(start_key);
             step_result->set_found(read_result.found);
@@ -582,7 +606,8 @@ void LineairDBRpc::handleTxExecuteReadPlan(const std::string& message,
             auto scan_result =
                 db_manager_->get_database()->StatelessRangeScan(
                     step.table_name(), start_key, end_key,
-                    scan_limit_for_lineairdb, step.reverse_scan());
+                    scan_limit_for_lineairdb, step.reverse_scan(),
+                    selected_columns_for_reads);
             if (!scan_result.ok) {
                 response.set_ok(false);
                 flat_plan::encode_to_string(response, result);
@@ -641,7 +666,8 @@ void LineairDBRpc::handleTxExecuteReadPlan(const std::string& message,
             auto scan_result =
                 db_manager_->get_database()->StatelessSecondaryRangeScan(
                     step.table_name(), step.index_name(), start_key, end_key,
-                    step.scan_limit(), step.reverse_scan());
+                    step.scan_limit(), step.reverse_scan(),
+                    selected_columns_for_reads);
             if (!scan_result.ok) {
                 response.set_ok(false);
                 flat_plan::encode_to_string(response, result);
