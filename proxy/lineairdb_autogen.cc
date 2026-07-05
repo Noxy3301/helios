@@ -138,20 +138,14 @@ bool is_int32_key_field(const Field *f) {
          f->pack_length() == 4 && !f->is_unsigned();
 }
 
-// Physical-table key from a TABLE's own share: "./<db>/<table>", matching the
-// path ha_lineairdb::open() stores in db_table_name.
+// Handler table key from the TABLE share path. MySQL passes the same normalized
+// path to ha_lineairdb::open(), and the handler stores it as db_table_name.
 std::string physical_table_key(const TABLE *t) {
   if (t == nullptr || t->s == nullptr) return std::string();
   const TABLE_SHARE *s = t->s;
-  std::string key = "./";
-  if (s->db.str != nullptr && s->db.length > 0) {
-    key.append(s->db.str, s->db.length);
-  }
-  key.push_back('/');
-  if (s->table_name.str != nullptr && s->table_name.length > 0) {
-    key.append(s->table_name.str, s->table_name.length);
-  }
-  return key;
+  if (s->normalized_path.str == nullptr || s->normalized_path.length == 0)
+    return std::string();
+  return std::string(s->normalized_path.str, s->normalized_path.length);
 }
 
 int qep_table_field_index(TABLE *t, Field *f) {
