@@ -47,7 +47,8 @@ const std::vector<uint32_t>* selected_columns_for_projected_read(
     }
     selected_columns.assign(step.projection().field_indexes().begin(),
                             step.projection().field_indexes().end());
-    if (step.has_filter() && step.filter().has_expr()) {
+    if (step.has_filter() && step.filter().has_expr() &&
+        !is_aggregate_having_filter(step)) {
         collect_filter_columns(step.filter().expr(), selected_columns);
     }
     sort_unique_columns(selected_columns);
@@ -65,7 +66,8 @@ const std::vector<uint32_t>* selected_columns_for_aggregate_read(
     if (!step.has_aggregate() || step.aggregate().aggs_size() == 0) {
         return nullptr;
     }
-    if (step.has_filter() && step.filter().has_expr()) {
+    if (step.has_filter() && step.filter().has_expr() &&
+        !is_aggregate_having_filter(step)) {
         collect_filter_columns(step.filter().expr(), selected_columns);
     }
     const auto& spec = step.aggregate();
@@ -92,7 +94,8 @@ bool aggregate_pax_group(
     using AF = LineairDB::Protocol::AggFunc;
 
     const auto& spec = step.aggregate();
-    const bool has_filter = step.has_filter() && step.filter().has_expr();
+    const bool has_filter = step.has_filter() && step.filter().has_expr() &&
+                            !is_aggregate_having_filter(step);
     const int n_agg = spec.aggs_size();
     const int n_grp = spec.group_columns_size();
 
@@ -261,7 +264,9 @@ bool parallel_primary_pax_aggregate_scan(
         return false;
     }
 
-    emit_agg_groups(step.aggregate(), groups, step_result);
+    emit_agg_groups(step.aggregate(), groups, step_result,
+                    is_aggregate_having_filter(step) ? &step.filter()
+                                                     : nullptr);
     return true;
 }
 
@@ -557,7 +562,9 @@ bool parallel_primary_aggregate_scan(
                                           : encode_int_key_part(end_value);
     }
 
-    const bool has_filter = step.has_filter() && step.filter().has_expr();
+    const bool group_having = is_aggregate_having_filter(step);
+    const bool has_filter =
+        step.has_filter() && step.filter().has_expr() && !group_having;
     const auto& spec = step.aggregate();
     const int n_agg = spec.aggs_size();
     std::vector<uint32_t> selected_columns;
@@ -615,7 +622,8 @@ bool parallel_primary_aggregate_scan(
 
     std::unordered_map<std::string, AggGroupState> groups;
     for (auto& local : locals) merge_agg_groups(groups, local, n_agg);
-    emit_agg_groups(spec, groups, step_result);
+    emit_agg_groups(spec, groups, step_result,
+                    group_having ? &step.filter() : nullptr);
     return true;
 }
 
