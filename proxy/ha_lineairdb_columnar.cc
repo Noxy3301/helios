@@ -85,6 +85,39 @@ class LoadedTables {
 
 LoadedTables *loaded_tables = nullptr;
 
+struct ColumnarFailReason {
+  THD *thd = nullptr;
+  query_id_t query_id = 0;
+  std::string reason;
+};
+
+thread_local ColumnarFailReason columnar_fail_reason;
+
+const char *GetColumnarFailReason(THD *thd) {
+  if (thd == nullptr || columnar_fail_reason.thd != thd ||
+      columnar_fail_reason.query_id != thd->query_id ||
+      columnar_fail_reason.reason.empty()) {
+    return nullptr;
+  }
+  return columnar_fail_reason.reason.c_str();
+}
+
+void SetColumnarFailReason(THD *thd, const char *reason) {
+  if (reason == nullptr) {
+    columnar_fail_reason = {};
+  } else {
+    columnar_fail_reason.thd = thd;
+    columnar_fail_reason.query_id = thd == nullptr ? 0 : thd->query_id;
+    columnar_fail_reason.reason.assign(reason);
+  }
+}
+
+bool RaiseColumnarError(THD *thd, const char *message) {
+  SetColumnarFailReason(thd, message);
+  my_error(ER_SECONDARY_ENGINE_PLUGIN, MYF(0), message);
+  return true;
+}
+
 // send_result_set_metadata() has already described the original SELECT fields.
 // The override executor only needs Item instances that carry computed values
 // through Query_result::send_data(), so this class mirrors the prototype type
@@ -413,20 +446,16 @@ bool RecognizeSingleTableAggregate(JOIN *join, ColumnarExecutionContext *ctx,
  * that match that already-described metadata.
  */
 bool ExecuteColumnarAggregate(JOIN *join, Query_result *result) {
-  THD *thd = current_thd;
+  THD *thd = join->thd;
   auto *ctx = static_cast<ColumnarExecutionContext *>(
       thd->lex->secondary_engine_execution_context());
   if (ctx == nullptr || ctx->serialized_aggregate.empty()) {
-    my_error(ER_SECONDARY_ENGINE_PLUGIN, MYF(0),
-             "LINEAIRDB_COLUMNAR: no offload plan");
-    return true;
+    return RaiseColumnarError(thd, "LINEAIRDB_COLUMNAR: no offload plan");
   }
 
   std::shared_ptr<LineairDBProxy> proxy = lineairdb::acquire_shared_proxy(thd);
   if (!proxy) {
-    my_error(ER_SECONDARY_ENGINE_PLUGIN, MYF(0),
-             "LINEAIRDB_COLUMNAR: no server connection");
-    return true;
+    return RaiseColumnarError(thd, "LINEAIRDB_COLUMNAR: no server connection");
   }
 
   LineairDBProxy::ReadPlanStep step;
@@ -438,9 +467,8 @@ bool ExecuteColumnarAggregate(JOIN *join, Query_result *result) {
 
   LineairDBProxy::ReadPlanResult rpc = proxy->tx_execute_read_plan({step});
   if (!rpc.ok || rpc.steps.size() != 1) {
-    my_error(ER_SECONDARY_ENGINE_PLUGIN, MYF(0),
-             "LINEAIRDB_COLUMNAR: aggregate scan RPC failed");
-    return true;
+    return RaiseColumnarError(thd,
+                              "LINEAIRDB_COLUMNAR: aggregate scan RPC failed");
   }
 
   mem_root_deque<Item *> output_items(thd->mem_root);
@@ -453,26 +481,23 @@ bool ExecuteColumnarAggregate(JOIN *join, Query_result *result) {
     output_items.push_back(value);
   }
   if (values.size() != ctx->bindings.size()) {
-    my_error(ER_SECONDARY_ENGINE_PLUGIN, MYF(0),
-             "LINEAIRDB_COLUMNAR: output binding mismatch");
-    return true;
+    return RaiseColumnarError(thd,
+                              "LINEAIRDB_COLUMNAR: output binding mismatch");
   }
 
   std::vector<DecodedField> fields;
   for (const std::string &row : rpc.steps[0].scan_values) {
     if (!DecodeRowFields(row, &fields)) {
-      my_error(ER_SECONDARY_ENGINE_PLUGIN, MYF(0),
-               "LINEAIRDB_COLUMNAR: malformed group row");
-      return true;
+      return RaiseColumnarError(thd,
+                                "LINEAIRDB_COLUMNAR: malformed group row");
     }
 
     // Server aggregate rows are [null_flags][group cols][value,count per agg].
     const size_t expected = 1 + static_cast<size_t>(ctx->group_column_count) +
                             2 * static_cast<size_t>(ctx->aggregate_count);
     if (fields.size() != expected) {
-      my_error(ER_SECONDARY_ENGINE_PLUGIN, MYF(0),
-               "LINEAIRDB_COLUMNAR: unexpected group row shape");
-      return true;
+      return RaiseColumnarError(
+          thd, "LINEAIRDB_COLUMNAR: unexpected group row shape");
     }
 
     for (size_t i = 0; i < ctx->bindings.size(); i++) {
@@ -504,6 +529,7 @@ bool ExecuteColumnarAggregate(JOIN *join, Query_result *result) {
 }
 
 bool PrepareSecondaryEngine(THD *thd, LEX *lex) {
+  SetColumnarFailReason(thd, nullptr);
   lex->add_statement_options(OPTION_NO_CONST_TABLES |
                              OPTION_NO_SUBQUERY_DURING_OPTIMIZATION);
 
@@ -514,12 +540,12 @@ bool PrepareSecondaryEngine(THD *thd, LEX *lex) {
 }
 
 bool OptimizeSecondaryEngine(THD *, LEX *lex) {
+  SetColumnarFailReason(lex->thd, nullptr);
   auto *ctx = static_cast<ColumnarExecutionContext *>(
       lex->secondary_engine_execution_context());
   if (ctx == nullptr) {
-    my_error(ER_SECONDARY_ENGINE_PLUGIN, MYF(0),
-             "LINEAIRDB_COLUMNAR statement context is not available");
-    return true;
+    return RaiseColumnarError(
+        lex->thd, "LINEAIRDB_COLUMNAR statement context is not available");
   }
 
   Query_block *query_block = lex->unit->first_query_block();
@@ -529,8 +555,7 @@ bool OptimizeSecondaryEngine(THD *, LEX *lex) {
     char message[128];
     snprintf(message, sizeof(message),
              "LINEAIRDB_COLUMNAR unsupported shape: %s", why ? why : "?");
-    my_error(ER_SECONDARY_ENGINE_PLUGIN, MYF(0), message);
-    return true;
+    return RaiseColumnarError(lex->thd, message);
   }
 
   join->override_executor_func = ExecuteColumnarAggregate;
@@ -648,6 +673,10 @@ int lineairdb_columnar_init(void *p) {
   hton->prepare_secondary_engine = lineairdb_columnar::PrepareSecondaryEngine;
   hton->optimize_secondary_engine = lineairdb_columnar::OptimizeSecondaryEngine;
   hton->compare_secondary_engine_cost = lineairdb_columnar::CompareJoinCost;
+  hton->get_secondary_engine_offload_or_exec_fail_reason =
+      lineairdb_columnar::GetColumnarFailReason;
+  hton->set_secondary_engine_offload_fail_reason =
+      lineairdb_columnar::SetColumnarFailReason;
   hton->secondary_engine_flags =
       MakeSecondaryEngineFlags(SecondaryEngineFlag::SUPPORTS_HASH_JOIN,
                                SecondaryEngineFlag::SUPPORTS_NESTED_LOOP_JOIN);
