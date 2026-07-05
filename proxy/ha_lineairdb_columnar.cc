@@ -287,6 +287,40 @@ void FlattenAnd(Item *condition, std::vector<Item *> *predicates) {
 }
 
 /**
+ * @brief Return true when an Item shape is a boolean filter predicate.
+ */
+bool IsBooleanFilterShape(Item *item) {
+  item = item == nullptr ? nullptr : item->real_item();
+  if (item == nullptr) return false;
+
+  if (item->type() == Item::COND_ITEM) {
+    const auto *condition = down_cast<const Item_cond *>(item);
+    return condition->functype() == Item_func::COND_AND_FUNC ||
+           condition->functype() == Item_func::COND_OR_FUNC;
+  }
+
+  if (item->type() != Item::FUNC_ITEM) return false;
+
+  switch (down_cast<const Item_func *>(item)->functype()) {
+    case Item_func::EQ_FUNC:
+    case Item_func::NE_FUNC:
+    case Item_func::LT_FUNC:
+    case Item_func::LE_FUNC:
+    case Item_func::GT_FUNC:
+    case Item_func::GE_FUNC:
+    case Item_func::BETWEEN:
+    case Item_func::IN_FUNC:
+    case Item_func::LIKE_FUNC:
+    case Item_func::ISNULL_FUNC:
+    case Item_func::ISNOTNULL_FUNC:
+    case Item_func::NOT_FUNC:
+      return true;
+    default:
+      return false;
+  }
+}
+
+/**
  * @brief Convert SUM(CASE WHEN pred THEN 1 ELSE 0 END) to a COUNT filter.
  */
 Item *CaseToCountFilter(Item *argument) {
@@ -300,6 +334,7 @@ Item *CaseToCountFilter(Item *argument) {
   Item *else_item = function->arguments()[2];
   if (!then_item->const_item() || !else_item->const_item()) return nullptr;
   if (then_item->val_int() != 1 || else_item->val_int() != 0) return nullptr;
+  if (!IsBooleanFilterShape(predicate)) return nullptr;
   return predicate;
 }
 
@@ -586,6 +621,9 @@ bool RecognizeDerivedRegroup(JOIN *join, ColumnarExecutionContext *ctx,
     if (preserved_key->result_type() != INT_RESULT ||
         nullable_key->result_type() != INT_RESULT) {
       LDB_COL_REJECT("inner join key type");
+    }
+    if (preserved_key->is_nullable() || nullable_key->is_nullable()) {
+      LDB_COL_REJECT("inner join key nullable");
     }
   }
   if (preserved_key == nullptr) LDB_COL_REJECT("inner join key missing");
@@ -899,6 +937,9 @@ bool RecognizeFlattenedAggregate(JOIN *join, ColumnarExecutionContext *ctx,
         ResolveBaseField(right_raw, tables[right_table].table);
     if (left_field == nullptr || right_field == nullptr) {
       LDB_COL_REJECT("inner join key unresolvable");
+    }
+    if (left_field->is_nullable() || right_field->is_nullable()) {
+      LDB_COL_REJECT("inner join key nullable");
     }
     join_edges.push_back(
         {left_table, right_table, left_field, right_field});
@@ -1218,6 +1259,9 @@ bool RecognizeQueryBlock(JOIN *join, ColumnarExecutionContext *ctx,
     if (left_field == nullptr || right_field == nullptr) {
       LDB_COL_REJECT("join key unresolvable");
     }
+    if (left_field->is_nullable() || right_field->is_nullable()) {
+      LDB_COL_REJECT("join key nullable");
+    }
     join_edges.push_back({left_table, right_table, left_field, right_field});
   }
   if (tables.size() > 1 && join_edges.empty()) LDB_COL_REJECT("cross join");
@@ -1522,6 +1566,11 @@ bool RecognizeQueryBlock(JOIN *join, ColumnarExecutionContext *ctx,
                                    tables[argument_table].table)
                 : nullptr;
         if (argument_field == nullptr) LDB_COL_REJECT("minmax unresolvable");
+        if (argument_field->is_nullable()) LDB_COL_REJECT("minmax nullable");
+        if (argument_field->result_type() == STRING_RESULT &&
+            !argument_field->binary()) {
+          LDB_COL_REJECT("minmax collation");
+        }
 
         auto *ref = function->mutable_arg();
         ref->set_op(LineairDB::Protocol::FilterExpr::COLUMN_REF);

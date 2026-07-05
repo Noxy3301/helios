@@ -142,19 +142,24 @@ class Executor {
 
         stores_.assign(request_.tables_size(), nullptr);
         write_counter_snapshots_.assign(request_.tables_size(), {});
+        slot_snapshots_.assign(request_.tables_size(), 0);
+        overflow_snapshots_.assign(request_.tables_size(), 0);
         for (int table_idx = 0; table_idx < request_.tables_size();
              ++table_idx) {
             PaxStore* store =
                 db_->GetPaxStore(request_.tables(table_idx).table_name());
             if (store == nullptr) return fail("table has no PAX store");
-            if (store->overflow_count() > 0) {
+            const uint64_t overflow_snapshot = store->overflow_count();
+            if (overflow_snapshot > 0) {
                 return fail("table has heap fallback rows");
             }
 
             stores_[table_idx] = store;
+            slot_snapshots_[table_idx] = store->slots_allocated();
+            overflow_snapshots_[table_idx] = overflow_snapshot;
 
             // Capture each allocated group's writer counter before operators
-            // read strip cells. A changed counter rejects the whole request.
+            // read strip cells. A changed or odd counter rejects the request.
             std::vector<uint64_t>& snapshot =
                 write_counter_snapshots_[table_idx];
             snapshot.resize(store->group_count());
@@ -165,6 +170,9 @@ class Executor {
                     group == nullptr
                         ? 0
                         : group->write_counter.load(std::memory_order_acquire);
+                if ((snapshot[group_idx] & 1u) != 0) {
+                    return fail("table has in-progress PAX writes");
+                }
             }
         }
         return true;
@@ -359,7 +367,8 @@ class Executor {
         }
 
         PaxStore* store = stores_[scan.table_idx()];
-        const size_t group_count = store->group_count();
+        const size_t group_count =
+            write_counter_snapshots_[scan.table_idx()].size();
         output->tables = {scan.table_idx()};
         output->refs.assign(1, {});
         if (group_count == 0) return true;
@@ -1208,6 +1217,10 @@ class Executor {
     bool TablesAreStillQuiet() const {
         for (size_t table_idx = 0; table_idx < stores_.size(); ++table_idx) {
             PaxStore* store = stores_[table_idx];
+            if (store->slots_allocated() != slot_snapshots_[table_idx] ||
+                store->overflow_count() != overflow_snapshots_[table_idx]) {
+                return false;
+            }
             const std::vector<uint64_t>& snapshot =
                 write_counter_snapshots_[table_idx];
             for (size_t group_idx = 0; group_idx < snapshot.size();
@@ -1217,7 +1230,9 @@ class Executor {
                     group == nullptr
                         ? 0
                         : group->write_counter.load(std::memory_order_acquire);
-                if (current != snapshot[group_idx]) return false;
+                if ((current & 1u) != 0 || current != snapshot[group_idx]) {
+                    return false;
+                }
             }
         }
         return true;
@@ -1234,6 +1249,8 @@ class Executor {
     std::string error_;
     std::vector<PaxStore*> stores_;
     std::vector<std::vector<uint64_t>> write_counter_snapshots_;
+    std::vector<uint64_t> slot_snapshots_;
+    std::vector<uint64_t> overflow_snapshots_;
     std::vector<NodeResult> results_;
 };
 
