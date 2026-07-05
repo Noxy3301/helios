@@ -236,10 +236,12 @@ bool parallel_primary_pax_aggregate_scan(
         std::vector<uint64_t> write_counters(n_groups, 0);
         for (size_t group_index = 0; group_index < n_groups; ++group_index) {
             auto* group = store->group(group_index);
-            write_counters[group_index] =
+            const uint64_t counter =
                 group != nullptr
                     ? group->write_counter.load(std::memory_order_acquire)
                     : 0;
+            if ((counter & 1u) != 0) return false;
+            write_counters[group_index] = counter;
         }
 
         const unsigned nproc = std::thread::hardware_concurrency();
@@ -278,15 +280,20 @@ bool parallel_primary_pax_aggregate_scan(
             if (worker_failed) return false;
         }
 
-        // A changed counter means a writer scattered or retired a slot while
-        // this scan was reading cells; retry through the TID-checked row path.
+        // PAX strip-direct scans require the same even counter before and after
+        // the fold. A changed or odd counter means a writer scattered or retired
+        // a slot while this scan was reading cells; retry through the
+        // TID-checked row path.
         for (size_t group_index = 0; group_index < n_groups; ++group_index) {
             auto* group = store->group(group_index);
             const uint64_t current_counter =
                 group != nullptr
                     ? group->write_counter.load(std::memory_order_acquire)
                     : 0;
-            if (current_counter != write_counters[group_index]) return false;
+            if ((current_counter & 1u) != 0 ||
+                current_counter != write_counters[group_index]) {
+                return false;
+            }
         }
 
         for (auto& local : locals) merge_agg_groups(groups, local, n_agg);
