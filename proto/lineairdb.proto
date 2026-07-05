@@ -734,6 +734,18 @@ message QueryBlockAggregate {
     repeated QueryBlockAggFunc aggs = 3;
     // Optional predicate over the emitted group row.
     PushedPredicate having = 4;
+    // Optional regrouping over this aggregate's output rows.
+    //
+    // Ordinals address the first-stage row layout:
+    //   0..group_columns_size-1 are group values
+    //   group_columns_size.. are aggregate values
+    // When this is present, QueryBlockOutputExpr ordinals address the regrouped
+    // layout: GROUP i is group_value_ordinals[i], AGG 0 is COUNT(*).
+    message Regroup {
+        repeated uint32 group_value_ordinals = 1;
+        bool count_star = 2;
+    }
+    Regroup regroup = 5;
 }
 
 message QueryBlockSortKey {
