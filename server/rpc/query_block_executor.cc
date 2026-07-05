@@ -278,6 +278,160 @@ class Executor {
         return true;
     }
 
+    static void AppendJoinKeyPart(std::string* key, std::string_view value) {
+        const uint32_t length = static_cast<uint32_t>(value.size());
+        key->append(reinterpret_cast<const char*>(&length), sizeof(length));
+        key->append(value.data(), value.size());
+    }
+
+    struct JoinKeyColumn {
+        int ref_position = -1;
+        uint32_t table_idx = 0;
+        uint32_t column = 0;
+    };
+
+    bool ResolveJoinKeys(
+        const NodeResult& input,
+        const google::protobuf::RepeatedPtrField<pb::QueryBlockColumnRef>& keys,
+        std::vector<JoinKeyColumn>* resolved) const {
+        resolved->clear();
+        resolved->reserve(keys.size());
+        for (const pb::QueryBlockColumnRef& key : keys) {
+            const int position = input.table_pos(key.table_idx());
+            if (position < 0) return false;
+            resolved->push_back(
+                JoinKeyColumn{position, key.table_idx(), key.column()});
+        }
+        return true;
+    }
+
+    void BuildJoinKey(const NodeResult& input,
+                      const std::vector<JoinKeyColumn>& key_columns,
+                      size_t row_idx, std::string* key) const {
+        key->clear();
+        for (const JoinKeyColumn& column : key_columns) {
+            const uint64_t ref = input.refs[column.ref_position][row_idx];
+            AppendJoinKeyPart(
+                key, extract_value_column(ToRowRef(column.table_idx, ref),
+                                          column.column));
+        }
+    }
+
+    bool RunJoin(const pb::QueryBlockJoin& join, NodeResult* output) {
+        if (join.type() != pb::QueryBlockJoin::INNER) {
+            return fail("unsupported query-block join type");
+        }
+        if (join.build_keys_size() != join.probe_keys_size() ||
+            join.build_keys_size() == 0) {
+            return fail("join key arity");
+        }
+        if (join.build() >= results_.size() || join.probe() >= results_.size()) {
+            return fail("join child out of range");
+        }
+
+        // INNER joins are symmetric; hash the smaller child at runtime even if
+        // the request named the larger child as build.
+        const bool swap =
+            results_[join.build()].rows() > results_[join.probe()].rows();
+        const NodeResult& build = results_[swap ? join.probe() : join.build()];
+        const NodeResult& probe = results_[swap ? join.build() : join.probe()];
+        const auto& build_keys = swap ? join.probe_keys() : join.build_keys();
+        const auto& probe_keys = swap ? join.build_keys() : join.probe_keys();
+
+        std::vector<JoinKeyColumn> build_key_columns;
+        std::vector<JoinKeyColumn> probe_key_columns;
+        if (!ResolveJoinKeys(build, build_keys, &build_key_columns)) {
+            return fail("build key table is not in join input");
+        }
+        if (!ResolveJoinKeys(probe, probe_keys, &probe_key_columns)) {
+            return fail("probe key table is not in join input");
+        }
+
+        // Build a composite byte-key hash table from the chosen build child.
+        std::unordered_map<std::string, std::vector<size_t>> hash_table;
+        hash_table.reserve(build.rows());
+        std::string key;
+        for (size_t row_idx = 0; row_idx < build.rows(); ++row_idx) {
+            BuildJoinKey(build, build_key_columns, row_idx, &key);
+            hash_table[key].push_back(row_idx);
+        }
+
+        // Keep only row references in the joined tuple; later operators read
+        // column values directly from each table's PAX strips.
+        output->tables = probe.tables;
+        output->tables.insert(output->tables.end(), build.tables.begin(),
+                              build.tables.end());
+        output->refs.assign(output->tables.size(), {});
+
+        struct WorkerOutput {
+            std::vector<std::vector<uint64_t>> refs;
+        };
+
+        // Probe in independent row chunks and merge per-worker ref columns at
+        // the end to avoid synchronized appends on every match.
+        const size_t probe_rows = probe.rows();
+        const unsigned worker_count = static_cast<unsigned>(std::min<size_t>(
+            WorkerCount(), std::max<size_t>(probe_rows / 16384, 1)));
+        std::vector<WorkerOutput> local_outputs(worker_count);
+        std::vector<std::thread> workers;
+        workers.reserve(worker_count);
+
+        for (unsigned worker_idx = 0; worker_idx < worker_count; ++worker_idx) {
+            workers.emplace_back([&, worker_idx] {
+                WorkerOutput& local = local_outputs[worker_idx];
+                local.refs.assign(output->tables.size(), {});
+                std::string probe_key;
+                const size_t begin = probe_rows * worker_idx / worker_count;
+                const size_t end =
+                    probe_rows * (worker_idx + 1) / worker_count;
+                for (size_t probe_idx = begin; probe_idx < end; ++probe_idx) {
+                    BuildJoinKey(probe, probe_key_columns, probe_idx,
+                                 &probe_key);
+                    const auto match = hash_table.find(probe_key);
+                    if (match == hash_table.end()) continue;
+
+                    for (const size_t build_idx : match->second) {
+                        for (size_t column_idx = 0;
+                             column_idx < probe.tables.size(); ++column_idx) {
+                            local.refs[column_idx].push_back(
+                                probe.refs[column_idx][probe_idx]);
+                        }
+                        for (size_t column_idx = 0;
+                             column_idx < build.tables.size(); ++column_idx) {
+                            local.refs[probe.tables.size() + column_idx]
+                                .push_back(build.refs[column_idx][build_idx]);
+                        }
+                    }
+                }
+            });
+        }
+
+        for (std::thread& worker : workers) worker.join();
+
+        size_t total_rows = 0;
+        for (const WorkerOutput& local : local_outputs) {
+            total_rows += local.refs.empty() ? 0 : local.refs[0].size();
+        }
+        // Fan-out safety valve: reject the offload before materializing an
+        // unbounded intermediate and let the primary path run the query.
+        if (total_rows > (size_t{64} << 20)) {
+            return fail("join intermediate too large");
+        }
+
+        for (size_t column_idx = 0; column_idx < output->refs.size();
+             ++column_idx) {
+            output->refs[column_idx].reserve(total_rows);
+            for (const WorkerOutput& local : local_outputs) {
+                if (local.refs.empty()) continue;
+                output->refs[column_idx].insert(
+                    output->refs[column_idx].end(),
+                    local.refs[column_idx].begin(),
+                    local.refs[column_idx].end());
+            }
+        }
+        return true;
+    }
+
     struct GroupState {
         std::vector<std::string> keys;
         std::vector<uint64_t> counts;
@@ -730,7 +884,8 @@ class Executor {
                 continue;
             }
             if (node.has_join()) {
-                return fail("query-block join is not implemented");
+                if (!RunJoin(node.join(), &results_[node_idx])) return false;
+                continue;
             }
             if (node.has_aggregate()) {
                 if (node_idx != request_.nodes_size() - 1) {
