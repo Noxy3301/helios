@@ -717,6 +717,113 @@ class Executor {
         }
     }
 
+    bool AggregateRowValue(const pb::QueryBlockAggregate& aggregate,
+                           int group_count, const GroupState& state,
+                           uint32_t ordinal, std::string* value,
+                           bool* is_null) {
+        value->clear();
+        *is_null = false;
+        if (ordinal < static_cast<uint32_t>(group_count)) {
+            value->assign(state.keys[ordinal]);
+            return true;
+        }
+
+        const int aggregate_idx = static_cast<int>(ordinal) - group_count;
+        if (aggregate_idx < 0 || aggregate_idx >= aggregate.aggs_size()) {
+            return fail("regroup value ordinal out of range");
+        }
+        value->assign(AggregateValue(aggregate.aggs(aggregate_idx), state,
+                                     aggregate_idx, is_null));
+        return true;
+    }
+
+    static void AppendRegroupKeyPart(std::string* key, std::string_view value,
+                                     bool is_null) {
+        key->push_back(is_null ? '\1' : '\0');
+        if (is_null) return;
+        AppendJoinKeyPart(key, value);
+    }
+
+    struct RegroupState {
+        std::vector<std::string> keys;
+        std::vector<bool> nulls;
+        uint64_t count = 0;
+    };
+
+    bool BuildRegroupedRows(const pb::QueryBlockAggregate& aggregate,
+                            int group_count, const GroupMap& groups,
+                            std::vector<OutputRow>* output_rows) {
+        const auto& regroup = aggregate.regroup();
+        if (!regroup.count_star()) return fail("regroup must count");
+
+        std::unordered_map<std::string, RegroupState> regrouped;
+        std::string key;
+        std::vector<std::string> values;
+        std::vector<bool> nulls;
+        for (const auto& entry : groups) {
+            const GroupState& state = entry.second;
+            key.clear();
+            values.clear();
+            nulls.clear();
+            values.reserve(regroup.group_value_ordinals_size());
+            nulls.reserve(regroup.group_value_ordinals_size());
+
+            for (const uint32_t ordinal : regroup.group_value_ordinals()) {
+                std::string value;
+                bool is_null = false;
+                if (!AggregateRowValue(aggregate, group_count, state, ordinal,
+                                       &value, &is_null)) {
+                    return false;
+                }
+                AppendRegroupKeyPart(&key, value, is_null);
+                values.push_back(std::move(value));
+                nulls.push_back(is_null);
+            }
+
+            auto [it, inserted] = regrouped.emplace(key, RegroupState{});
+            RegroupState& regroup_state = it->second;
+            if (inserted) {
+                regroup_state.keys = values;
+                regroup_state.nulls = nulls;
+            }
+            regroup_state.count += 1;
+        }
+
+        output_rows->clear();
+        output_rows->reserve(regrouped.size());
+        for (const auto& entry : regrouped) {
+            const RegroupState& state = entry.second;
+            OutputRow row;
+            row.values.reserve(request_.output_size());
+            row.nulls.reserve(request_.output_size());
+            for (const pb::QueryBlockOutputExpr& expression :
+                 request_.output()) {
+                switch (expression.source()) {
+                    case pb::QueryBlockOutputExpr::GROUP:
+                        if (expression.ordinal() >= state.keys.size()) {
+                            return fail("regroup output ordinal out of range");
+                        }
+                        row.values.push_back(
+                            state.keys[expression.ordinal()]);
+                        row.nulls.push_back(
+                            state.nulls[expression.ordinal()]);
+                        break;
+                    case pb::QueryBlockOutputExpr::AGG:
+                        if (expression.ordinal() != 0) {
+                            return fail("regroup aggregate ordinal out of range");
+                        }
+                        row.values.push_back(std::to_string(state.count));
+                        row.nulls.push_back(false);
+                        break;
+                    default:
+                        return fail("unsupported regroup output source");
+                }
+            }
+            output_rows->push_back(std::move(row));
+        }
+        return true;
+    }
+
     bool SortOutputRows(std::vector<OutputRow>* output_rows) {
         for (const pb::QueryBlockSortKey& key : request_.order_by()) {
             if (key.output_ordinal() >=
@@ -833,41 +940,53 @@ class Executor {
         }
 
         std::vector<OutputRow> output_rows;
-        output_rows.reserve(groups.size());
-        for (auto& entry : groups) {
-            GroupState& state = entry.second;
-            OutputRow row;
-            row.values.reserve(request_.output_size());
-            row.nulls.reserve(request_.output_size());
-            for (const pb::QueryBlockOutputExpr& expression :
-                 request_.output()) {
-                switch (expression.source()) {
-                    case pb::QueryBlockOutputExpr::GROUP:
-                        if (expression.ordinal() >=
-                            static_cast<uint32_t>(group_count)) {
-                            return fail("group output ordinal out of range");
-                        }
-                        row.values.push_back(
-                            state.keys[expression.ordinal()]);
-                        row.nulls.push_back(false);
-                        break;
-                    case pb::QueryBlockOutputExpr::AGG: {
-                        if (expression.ordinal() >=
-                            static_cast<uint32_t>(aggregate.aggs_size())) {
-                            return fail("aggregate output ordinal out of range");
-                        }
-                        bool is_null = false;
-                        row.values.push_back(AggregateValue(
-                            aggregate.aggs(expression.ordinal()), state,
-                            static_cast<int>(expression.ordinal()), &is_null));
-                        row.nulls.push_back(is_null);
-                        break;
-                    }
-                    default:
-                        return fail("unsupported query-block output source");
-                }
+        if (aggregate.has_regroup()) {
+            if (!BuildRegroupedRows(aggregate, group_count, groups,
+                                    &output_rows)) {
+                return false;
             }
-            output_rows.push_back(std::move(row));
+        } else {
+            output_rows.reserve(groups.size());
+            for (auto& entry : groups) {
+                GroupState& state = entry.second;
+                OutputRow row;
+                row.values.reserve(request_.output_size());
+                row.nulls.reserve(request_.output_size());
+                for (const pb::QueryBlockOutputExpr& expression :
+                     request_.output()) {
+                    switch (expression.source()) {
+                        case pb::QueryBlockOutputExpr::GROUP:
+                            if (expression.ordinal() >=
+                                static_cast<uint32_t>(group_count)) {
+                                return fail(
+                                    "group output ordinal out of range");
+                            }
+                            row.values.push_back(
+                                state.keys[expression.ordinal()]);
+                            row.nulls.push_back(false);
+                            break;
+                        case pb::QueryBlockOutputExpr::AGG: {
+                            if (expression.ordinal() >=
+                                static_cast<uint32_t>(
+                                    aggregate.aggs_size())) {
+                                return fail(
+                                    "aggregate output ordinal out of range");
+                            }
+                            bool is_null = false;
+                            row.values.push_back(AggregateValue(
+                                aggregate.aggs(expression.ordinal()), state,
+                                static_cast<int>(expression.ordinal()),
+                                &is_null));
+                            row.nulls.push_back(is_null);
+                            break;
+                        }
+                        default:
+                            return fail(
+                                "unsupported query-block output source");
+                    }
+                }
+                output_rows.push_back(std::move(row));
+            }
         }
 
         if (!SortOutputRows(&output_rows)) return false;
