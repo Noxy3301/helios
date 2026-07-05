@@ -4,6 +4,7 @@
 #include <atomic>
 #include <cstdint>
 #include <exception>
+#include <limits>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -24,6 +25,8 @@ namespace {
 namespace pb = LineairDB::Protocol;
 using LineairDB::Pax::PaxGroup;
 using LineairDB::Pax::PaxStore;
+
+constexpr uint64_t kNullRowRef = std::numeric_limits<uint64_t>::max();
 
 void set_failure(pb::TxExecuteQueryBlock::Response* response,
                  const std::string& message) {
@@ -192,6 +195,7 @@ class Executor {
     }
 
     PaxRowRef ToRowRef(uint32_t table_idx, uint64_t ref) const {
+        if (ref == kNullRowRef) return PaxRowRef{};
         PaxStore* store = stores_[table_idx];
         return PaxRowRef{
             store->group(ref / PaxGroup::kRows),
@@ -305,20 +309,24 @@ class Executor {
         return true;
     }
 
-    void BuildJoinKey(const NodeResult& input,
+    bool BuildJoinKey(const NodeResult& input,
                       const std::vector<JoinKeyColumn>& key_columns,
                       size_t row_idx, std::string* key) const {
         key->clear();
         for (const JoinKeyColumn& column : key_columns) {
             const uint64_t ref = input.refs[column.ref_position][row_idx];
+            if (ref == kNullRowRef) return false;
             AppendJoinKeyPart(
                 key, extract_value_column(ToRowRef(column.table_idx, ref),
                                           column.column));
         }
+        return true;
     }
 
     bool RunJoin(const pb::QueryBlockJoin& join, NodeResult* output) {
-        if (join.type() != pb::QueryBlockJoin::INNER) {
+        const bool is_inner = join.type() == pb::QueryBlockJoin::INNER;
+        const bool is_left = join.type() == pb::QueryBlockJoin::LEFT;
+        if (!is_inner && !is_left) {
             return fail("unsupported query-block join type");
         }
         if (join.build_keys_size() != join.probe_keys_size() ||
@@ -329,9 +337,11 @@ class Executor {
             return fail("join child out of range");
         }
 
-        // INNER joins are symmetric; hash the smaller child at runtime even if
-        // the request named the larger child as build.
+        // INNER joins are symmetric; hash the smaller child at runtime. LEFT
+        // joins keep the request's build/probe sides because probe rows must be
+        // preserved when the build side has no match.
         const bool swap =
+            is_inner &&
             results_[join.build()].rows() > results_[join.probe()].rows();
         const NodeResult& build = results_[swap ? join.probe() : join.build()];
         const NodeResult& probe = results_[swap ? join.build() : join.probe()];
@@ -352,7 +362,9 @@ class Executor {
         hash_table.reserve(build.rows());
         std::string key;
         for (size_t row_idx = 0; row_idx < build.rows(); ++row_idx) {
-            BuildJoinKey(build, build_key_columns, row_idx, &key);
+            if (!BuildJoinKey(build, build_key_columns, row_idx, &key)) {
+                continue;
+            }
             hash_table[key].push_back(row_idx);
         }
 
@@ -385,10 +397,25 @@ class Executor {
                 const size_t end =
                     probe_rows * (worker_idx + 1) / worker_count;
                 for (size_t probe_idx = begin; probe_idx < end; ++probe_idx) {
-                    BuildJoinKey(probe, probe_key_columns, probe_idx,
-                                 &probe_key);
-                    const auto match = hash_table.find(probe_key);
-                    if (match == hash_table.end()) continue;
+                    const bool has_probe_key = BuildJoinKey(
+                        probe, probe_key_columns, probe_idx, &probe_key);
+                    const auto match = has_probe_key
+                                           ? hash_table.find(probe_key)
+                                           : hash_table.end();
+                    if (match == hash_table.end()) {
+                        if (!is_left) continue;
+                        for (size_t column_idx = 0;
+                             column_idx < probe.tables.size(); ++column_idx) {
+                            local.refs[column_idx].push_back(
+                                probe.refs[column_idx][probe_idx]);
+                        }
+                        for (size_t column_idx = 0;
+                             column_idx < build.tables.size(); ++column_idx) {
+                            local.refs[probe.tables.size() + column_idx]
+                                .push_back(kNullRowRef);
+                        }
+                        continue;
+                    }
 
                     for (const size_t build_idx : match->second) {
                         for (size_t column_idx = 0;
@@ -525,8 +552,11 @@ class Executor {
                 const int input_pos = aggregate_positions[aggregate_idx];
                 const uint64_t ref =
                     input_pos >= 0 ? input.refs[input_pos][row_idx] : 0;
+                const bool has_arg_row =
+                    input_pos < 0 || ref != kNullRowRef;
 
                 if (function.has_filter() && function.filter().has_expr()) {
+                    if (!has_arg_row) continue;
                     PaxRowRef row = ToRowRef(function.arg_table(), ref);
                     if (row.group == nullptr ||
                         !evaluator.set_row_from_pax(
@@ -541,6 +571,7 @@ class Executor {
 
                 switch (function.kind()) {
                     case pb::QueryBlockAggFunc::COUNT:
+                        if (function.has_arg() && !has_arg_row) break;
                         state->counts[aggregate_idx] += 1;
                         break;
                     case pb::QueryBlockAggFunc::SUM:
