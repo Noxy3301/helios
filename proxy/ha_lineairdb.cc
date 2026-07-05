@@ -138,6 +138,7 @@ static ulong srv_server_port = 9999;
 static bool srv_prefetch_execution = false;
 // Non-static: read by LineairDBTransaction at begin (see lineairdb_transaction.cc)
 bool srv_prefetch_ro_novalidate = false;
+handlerton *lineairdb_hton;
 
 // THD-scoped context
 struct LineairDBThdCtx {
@@ -165,6 +166,17 @@ static void ensure_lineairdb_proxy(LineairDBThdCtx *&ctx) {
     ctx->proxy = std::make_shared<LineairDBProxy>(host, port);
   }
 }
+
+namespace lineairdb {
+
+std::shared_ptr<LineairDBProxy> acquire_shared_proxy(THD *thd) {
+  if (thd == nullptr || lineairdb_hton == nullptr) return nullptr;
+  LineairDBThdCtx *&ctx = lineairdb_thd_ctx(thd, lineairdb_hton);
+  ensure_lineairdb_proxy(ctx);
+  return ctx->proxy;
+}
+
+}  // namespace lineairdb
 
 static int lineairdb_commit(handlerton *hton, THD *thd, bool shouldCommit);
 static int lineairdb_abort(handlerton *hton, THD *thd, bool);
@@ -231,8 +243,6 @@ struct lineairdb_vars_t {
 
 static handler *lineairdb_create_handler(handlerton *hton, TABLE_SHARE *table,
                                          bool partitioned, MEM_ROOT *mem_root);
-
-handlerton *lineairdb_hton;
 
 /* Interface to mysqld, to check system tables supported by SE */
 static bool lineairdb_is_supported_system_table(const char *db,

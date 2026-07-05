@@ -3,9 +3,26 @@
 // Declares the LineairDB engine-pushdown hook installed during plugin
 // initialization.
 
+#include "lineairdb.pb.h"
+
+class Item;
 class THD;
 class JOIN;
 struct AccessPath;
+
+namespace lineairdb {
+
+/**
+ * @brief Serialize an aggregate argument expression for LineairDB.
+ *
+ * Supports field references, integer constants, and simple arithmetic over
+ * those terms. The server evaluates the serialized tree for decimal SUM/AVG
+ * aggregation.
+ */
+bool serialize_aggregate_expression(
+    const Item *item, LineairDB::Protocol::FilterExpr *out);
+
+}  // namespace lineairdb
 
 /**
  * @brief Install the aggregate executor override for supported query shapes.

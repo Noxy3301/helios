@@ -45,6 +45,7 @@
 #include <atomic>
 #include <cmath>
 #include <cstdint>
+#include <memory>
 #include <mutex>
 #include <unordered_map>
 #include <vector>
@@ -118,6 +119,18 @@ struct RangeScanLimit {
 RangeScanLimit range_scan_limit_for_order(THD *thd, const KEY *key,
                                           uint matched_prefix,
                                           bool has_mysql_only_filter);
+
+namespace lineairdb {
+
+/**
+ * @brief Return the THD-scoped RPC proxy shared by LineairDB engines.
+ *
+ * The primary handler owns the connection context. Secondary handlers use this
+ * entry point so both engines talk to the same LineairDB server for a session.
+ */
+std::shared_ptr<LineairDBProxy> acquire_shared_proxy(THD *thd);
+
+}  // namespace lineairdb
 
 /** @brief
   Class definition for the storage engine
