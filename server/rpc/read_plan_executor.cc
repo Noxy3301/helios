@@ -111,6 +111,17 @@ std::string build_plan_key(
     return key;
 }
 
+void collect_filter_columns(
+    const LineairDB::Protocol::FilterExpr& expr,
+    std::vector<uint32_t>& columns) {
+    if (expr.op() == LineairDB::Protocol::FilterExpr::COLUMN_REF) {
+        columns.push_back(expr.column_index());
+    }
+    for (const auto& child : expr.children()) {
+        collect_filter_columns(child, columns);
+    }
+}
+
 const std::vector<uint32_t>* selected_columns_for_materialization(
     const LineairDB::Protocol::TxExecuteReadPlan::PlanStep& step,
     std::vector<uint32_t>& selected_columns) {
@@ -121,6 +132,20 @@ const std::vector<uint32_t>* selected_columns_for_materialization(
     }
     selected_columns.assign(step.projection().field_indexes().begin(),
                             step.projection().field_indexes().end());
+    if (step.has_filter() && step.filter().has_expr()) {
+        collect_filter_columns(step.filter().expr(), selected_columns);
+    }
+    for (const auto& semijoin : step.semijoins()) {
+        selected_columns.push_back(semijoin.probe_column());
+    }
+    std::sort(selected_columns.begin(), selected_columns.end());
+    selected_columns.erase(
+        std::unique(selected_columns.begin(), selected_columns.end()),
+        selected_columns.end());
+    if (step.projection().num_columns() > 0 &&
+        selected_columns.size() >= step.projection().num_columns()) {
+        return nullptr;
+    }
     return &selected_columns;
 }
 
@@ -177,10 +202,11 @@ void LineairDBRpc::handleTxExecuteReadPlan(const std::string& message,
         const std::vector<uint32_t>* selected_columns_for_reads =
             selected_columns_for_materialization(step, selected_columns);
 
-        // PAX-backed reads can materialize only the selected column payloads
-        // while keeping the full row shape. Projection then trims emitted
-        // VALUES to the kept columns; malformed rows fail the plan instead of
-        // mixing full and projected layouts.
+        // PAX-backed reads can materialize only the selected payloads needed
+        // for server-side filtering and final projection while keeping the
+        // full row shape. Projection then trims emitted VALUES to the kept
+        // columns; malformed rows fail the plan instead of mixing full and
+        // projected layouts.
         bool projection_failed = false;
         auto project_value = [&](std::string&& v) -> std::string {
             if (!step_has_projection || v.empty()) return std::move(v);
