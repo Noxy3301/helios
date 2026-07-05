@@ -1,18 +1,22 @@
 #include "ha_lineairdb_columnar.hh"
 
+#include <algorithm>
 #include <cassert>
+#include <cstdint>
 #include <map>
 #include <memory>
 #include <mutex>
 #include <string>
 #include <tuple>
 #include <utility>
+#include <vector>
 
 #include "my_alloc.h"
 #include "my_dbug.h"
 #include "mysql/plugin.h"
 #include "mysqld_error.h"
 #include "sql/handler.h"
+#include "sql/item.h"
 #include "sql/sql_class.h"
 #include "sql/sql_lex.h"
 #include "sql/table.h"
@@ -63,6 +67,97 @@ class LoadedTables {
 };
 
 LoadedTables *loaded_tables = nullptr;
+
+class ItemColumnarValue final : public Item_string {
+ public:
+  explicit ItemColumnarValue(const Item *prototype)
+      : Item_string("", 0, prototype->collation.collation) {
+    set_data_type(prototype->data_type());
+    decimals = prototype->decimals;
+    max_length = prototype->max_length;
+    unsigned_flag = prototype->unsigned_flag;
+    set_nullable(true);
+  }
+
+  void set_value(const char *ptr, size_t len) {
+    str_value.copy(ptr, len, collation.collation);
+    null_value = false;
+  }
+
+  void set_null_value() { null_value = true; }
+};
+
+struct OutBinding {
+  bool is_aggregate = false;
+  int index = 0;
+};
+
+class ColumnarExecutionContext : public Secondary_engine_execution_context {
+ public:
+  bool BestPlanSoFar(const JOIN &join, double cost) {
+    if (&join != current_join_) {
+      current_join_ = &join;
+      best_cost_ = cost;
+      return true;
+    }
+
+    const bool cheaper = cost < best_cost_;
+    best_cost_ = std::min(best_cost_, cost);
+    return cheaper;
+  }
+
+  std::string table_name;
+  std::string serialized_filter;
+  std::string serialized_aggregate;
+  std::vector<OutBinding> bindings;
+  int group_column_count = 0;
+  int aggregate_count = 0;
+
+ private:
+  const JOIN *current_join_ = nullptr;
+  double best_cost_ = 0.0;
+};
+
+struct DecodedField {
+  const char *ptr = nullptr;
+  size_t len = 0;
+  bool empty = false;
+};
+
+/**
+ * @brief Decode LineairDB's row-field framing into field slices.
+ *
+ * Each field is stored as a one-byte length-width tag, that many little-endian
+ * length bytes, then the payload. A tag of 0xff represents an empty field.
+ */
+[[maybe_unused]] bool DecodeRowFields(const std::string &row,
+                                      std::vector<DecodedField> *out) {
+  out->clear();
+  size_t offset = 0;
+
+  while (offset < row.size()) {
+    const auto length_bytes = static_cast<uint8_t>(row[offset]);
+    offset += 1;
+    if (length_bytes == 0xff) {
+      out->push_back({nullptr, 0, true});
+      continue;
+    }
+    if (length_bytes > 4 || offset + length_bytes > row.size()) return false;
+
+    size_t len = 0;
+    for (uint8_t i = 0; i < length_bytes; i++) {
+      len |= static_cast<size_t>(
+                 static_cast<uint8_t>(row[offset + i])) << (8 * i);
+    }
+    offset += length_bytes;
+    if (offset + len > row.size()) return false;
+
+    out->push_back({row.data() + offset, len, false});
+    offset += len;
+  }
+
+  return true;
+}
 
 bool RejectSecondaryExecution(THD *, LEX *) {
   my_error(ER_SECONDARY_ENGINE_PLUGIN, MYF(0),
