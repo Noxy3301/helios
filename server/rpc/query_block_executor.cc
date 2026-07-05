@@ -667,6 +667,41 @@ class Executor {
             return fail("probe key table is not in join input");
         }
 
+        struct ResidualColumn {
+            bool from_build = false;
+            int ref_position = -1;
+            uint32_t table_idx = 0;
+            uint32_t column = 0;
+        };
+
+        std::vector<ResidualColumn> residual_columns;
+        const bool has_residual =
+            join.has_residual() && join.residual().has_predicate() &&
+            join.residual().predicate().has_expr();
+        if (has_residual) {
+            if (!is_inner) return fail("residual on non-inner join");
+            if (join.residual().predicate().num_columns() !=
+                static_cast<uint32_t>(join.residual().columns_size())) {
+                return fail("join residual column count");
+            }
+            residual_columns.reserve(join.residual().columns_size());
+            for (const pb::QueryBlockColumnRef& column :
+                 join.residual().columns()) {
+                int position = probe.table_pos(column.table_idx());
+                if (position >= 0) {
+                    residual_columns.push_back(
+                        ResidualColumn{false, position, column.table_idx(),
+                                       column.column()});
+                    continue;
+                }
+                position = build.table_pos(column.table_idx());
+                if (position < 0) return fail("join residual table");
+                residual_columns.push_back(
+                    ResidualColumn{true, position, column.table_idx(),
+                                   column.column()});
+            }
+        }
+
         // Build a composite byte-key hash table from the chosen build child.
         std::unordered_map<std::string, std::vector<size_t>> hash_table;
         hash_table.reserve(build.rows());
@@ -703,6 +738,42 @@ class Executor {
                 WorkerOutput& local = local_outputs[worker_idx];
                 local.refs.assign(output->tables.size(), {});
                 std::string probe_key;
+                PredicateEvaluator residual_evaluator;
+                std::vector<std::string_view> residual_cells(
+                    residual_columns.size());
+                std::vector<bool> residual_nulls(residual_columns.size());
+                auto residual_ok = [&](size_t probe_idx,
+                                       size_t build_idx) -> bool {
+                    if (!has_residual) return true;
+                    for (size_t column_idx = 0;
+                         column_idx < residual_columns.size();
+                         ++column_idx) {
+                        const ResidualColumn& column =
+                            residual_columns[column_idx];
+                        const NodeResult& source =
+                            column.from_build ? build : probe;
+                        const size_t source_row =
+                            column.from_build ? build_idx : probe_idx;
+                        const uint64_t ref =
+                            source.refs[column.ref_position][source_row];
+                        if (ref == kNullRowRef) {
+                            residual_cells[column_idx] = {};
+                            residual_nulls[column_idx] = true;
+                            continue;
+                        }
+
+                        const PaxRowRef row = ToRowRef(column.table_idx, ref);
+                        if (row.group == nullptr) return false;
+                        residual_cells[column_idx] = extract_value_column(
+                            row, static_cast<int>(column.column));
+                        residual_nulls[column_idx] =
+                            IsNullColumn(row, column.column);
+                    }
+                    residual_evaluator.set_row_from_views(residual_cells,
+                                                          residual_nulls);
+                    return residual_evaluator.evaluate(
+                        join.residual().predicate().expr());
+                };
                 const size_t begin = probe_rows * worker_idx / worker_count;
                 const size_t end =
                     probe_rows * (worker_idx + 1) / worker_count;
@@ -728,6 +799,7 @@ class Executor {
                     }
 
                     for (const size_t build_idx : match->second) {
+                        if (!residual_ok(probe_idx, build_idx)) continue;
                         for (size_t column_idx = 0;
                              column_idx < probe.tables.size(); ++column_idx) {
                             local.refs[column_idx].push_back(
