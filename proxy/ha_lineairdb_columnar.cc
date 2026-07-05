@@ -575,8 +575,9 @@ int ha_lineairdb_columnar::open(const char *, int, unsigned int,
 }
 
 int ha_lineairdb_columnar::info(unsigned int flags) {
+  // Statistics come from the primary engine when it is available.
   handler *primary = ha_get_primary_handler();
-  if (primary == nullptr) return HA_ERR_GENERIC;
+  if (primary == nullptr) return 0;
 
   const int error = primary->info(flags);
   if (error == 0) stats.records = primary->stats.records;
@@ -587,7 +588,7 @@ ha_rows ha_lineairdb_columnar::records_in_range(unsigned int index,
                                                 key_range *min_key,
                                                 key_range *max_key) {
   handler *primary = ha_get_primary_handler();
-  return primary == nullptr ? HA_POS_ERROR
+  return primary == nullptr ? handler::records_in_range(index, min_key, max_key)
                             : primary->records_in_range(index, min_key,
                                                         max_key);
 }
