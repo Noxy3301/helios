@@ -21,6 +21,70 @@ bool is_scan_end_sentinel(const std::string& key) {
            key.find_first_not_of(static_cast<char>(0xFF)) == std::string::npos;
 }
 
+void collect_filter_columns(
+    const LineairDB::Protocol::FilterExpr& expr,
+    std::vector<uint32_t>& columns) {
+    if (expr.op() == LineairDB::Protocol::FilterExpr::COLUMN_REF) {
+        columns.push_back(expr.column_index());
+    }
+    for (const auto& child : expr.children()) {
+        collect_filter_columns(child, columns);
+    }
+}
+
+void sort_unique_columns(std::vector<uint32_t>& columns) {
+    std::sort(columns.begin(), columns.end());
+    columns.erase(std::unique(columns.begin(), columns.end()), columns.end());
+}
+
+const std::vector<uint32_t>* selected_columns_for_projected_read(
+    const LineairDB::Protocol::TxExecuteReadPlan::PlanStep& step,
+    std::vector<uint32_t>& selected_columns) {
+    selected_columns.clear();
+    if (!step.has_projection() ||
+        step.projection().field_indexes_size() == 0) {
+        return nullptr;
+    }
+    selected_columns.assign(step.projection().field_indexes().begin(),
+                            step.projection().field_indexes().end());
+    if (step.has_filter() && step.filter().has_expr()) {
+        collect_filter_columns(step.filter().expr(), selected_columns);
+    }
+    sort_unique_columns(selected_columns);
+    if (step.projection().num_columns() > 0 &&
+        selected_columns.size() >= step.projection().num_columns()) {
+        return nullptr;
+    }
+    return &selected_columns;
+}
+
+const std::vector<uint32_t>* selected_columns_for_aggregate_read(
+    const LineairDB::Protocol::TxExecuteReadPlan::PlanStep& step,
+    std::vector<uint32_t>& selected_columns) {
+    selected_columns.clear();
+    if (!step.has_aggregate() || step.aggregate().aggs_size() == 0) {
+        return nullptr;
+    }
+    if (step.has_filter() && step.filter().has_expr()) {
+        collect_filter_columns(step.filter().expr(), selected_columns);
+    }
+    const auto& spec = step.aggregate();
+    for (uint32_t column : spec.group_columns()) {
+        selected_columns.push_back(column);
+    }
+    for (const auto& aggregate_func : spec.aggs()) {
+        if (aggregate_func.kind() != LineairDB::Protocol::AggFunc::AGG_COUNT) {
+            collect_filter_columns(aggregate_func.arg(), selected_columns);
+        }
+    }
+    sort_unique_columns(selected_columns);
+    if (spec.num_columns() > 0 &&
+        selected_columns.size() >= spec.num_columns()) {
+        return nullptr;
+    }
+    return &selected_columns;
+}
+
 bool aggregate_pax_group(
     const LineairDB::Protocol::TxExecuteReadPlan::PlanStep& step,
     const LineairDB::Pax::PaxGroup& group,
@@ -219,6 +283,9 @@ bool parallel_primary_pax_row_ref_scan(
         kept_columns.assign(step.projection().field_indexes().begin(),
                             step.projection().field_indexes().end());
     }
+    std::vector<uint32_t> selected_columns;
+    const std::vector<uint32_t>* selected_columns_for_reread =
+        selected_columns_for_projected_read(step, selected_columns);
 
     struct RefChunkOut {
         struct Event {
@@ -287,8 +354,9 @@ bool parallel_primary_pax_row_ref_scan(
             // The cells just read are valid only if the row TID still matches
             // the ref-scan observation. Otherwise re-read a stable row copy.
             if (LineairDB::PaxRowRefCurrentTid(row_ref) != row_ref.tid) {
-                auto reread =
-                    db->StatelessRead(step.table_name(), row_ref.key);
+                auto reread = db->StatelessRead(
+                    step.table_name(), row_ref.key,
+                    selected_columns_for_reread);
                 if (!reread.found) continue;
 
                 bool reread_pass = true;
@@ -488,6 +556,9 @@ bool parallel_primary_aggregate_scan(
     const bool has_filter = step.has_filter() && step.filter().has_expr();
     const auto& spec = step.aggregate();
     const int n_agg = spec.aggs_size();
+    std::vector<uint32_t> selected_columns;
+    const std::vector<uint32_t>* selected_columns_for_reads =
+        selected_columns_for_aggregate_read(step, selected_columns);
     std::vector<std::unordered_map<std::string, AggGroupState>> locals(
         worker_count);
     std::vector<char> failed(worker_count, 0);
@@ -499,7 +570,8 @@ bool parallel_primary_aggregate_scan(
         workers.emplace_back([&, worker_index] {
             auto scan_result =
                 db->StatelessRangeScan(step.table_name(), starts[worker_index],
-                                       ends[worker_index], 0, false);
+                                       ends[worker_index], 0, false,
+                                       selected_columns_for_reads);
             if (!scan_result.ok) {
                 failed[worker_index] = 1;
                 db->ReleaseMasstreeThreadEpoch();
@@ -605,6 +677,9 @@ bool parallel_primary_filter_scan(
     std::vector<WorkerOut> outputs(worker_count);
     std::vector<char> failed(worker_count, 0);
     const bool has_projection = step.has_projection();
+    std::vector<uint32_t> selected_columns;
+    const std::vector<uint32_t>* selected_columns_for_reads =
+        selected_columns_for_projected_read(step, selected_columns);
     std::vector<std::thread> workers;
     workers.reserve(worker_count);
 
@@ -614,7 +689,8 @@ bool parallel_primary_filter_scan(
             auto scan_result =
                 db->StatelessRangeScan(step.table_name(),
                                        starts[worker_index],
-                                       ends[worker_index], 0, false);
+                                       ends[worker_index], 0, false,
+                                       selected_columns_for_reads);
             if (!scan_result.ok) {
                 failed[worker_index] = 1;
                 db->ReleaseMasstreeThreadEpoch();
