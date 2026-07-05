@@ -789,6 +789,13 @@ bool ha_lineairdb::tx_has_grouped_semijoin() {
 }
 
 /**
+ * @brief Return the transaction used by QEP read-plan autogen.
+ */
+LineairDBTransaction *ha_lineairdb::tx_for_autogen() {
+  return get_transaction(ha_thd());
+}
+
+/**
  * @brief Clear the aggregate spec from the current transaction.
  */
 void ha_lineairdb::tx_clear_pushed_aggregate() {

@@ -534,6 +534,11 @@ public:
    */
   bool tx_has_grouped_semijoin();
 
+  /**
+   * @brief Return the transaction used by QEP read-plan autogen.
+   */
+  LineairDBTransaction *tx_for_autogen();
+
   int rnd_pos(uchar *buf, uchar *pos) override; ///< required
   void position(const uchar *record) override;  ///< required
   /**

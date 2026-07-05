@@ -26,6 +26,8 @@
 #include "sql/table.h"
 #include "storage/lineairdb/ha_lineairdb.hh"
 
+extern handlerton *lineairdb_hton;
+
 namespace {
 
 struct UnsupportedQep {
@@ -1304,6 +1306,114 @@ bool autogen_read_plan_from_qep(
       for (auto &kv : table_steps) {
         if (kv.second >= 0 && kv.second < static_cast<int>(new_index.size()))
           kv.second = static_cast<int>(new_index[kv.second]);
+      }
+    }
+  }
+
+  LineairDBTransaction *tx = nullptr;
+  const auto find_tx = [&]() -> LineairDBTransaction * {
+    if (tx != nullptr) return tx;
+    for (const auto &aliases : step_aliases) {
+      for (TABLE *t : aliases) {
+        if (t == nullptr || t->file == nullptr || t->file->ht != lineairdb_hton)
+          continue;
+        tx = down_cast<ha_lineairdb *>(t->file)->tx_for_autogen();
+        return tx;
+      }
+    }
+    return nullptr;
+  };
+
+  // If aggregate pushdown registered a grouped summary leaf, drop the base
+  // full-scan step from prefetch staging. The handler will serve that TABLE*
+  // from synthetic GROUP rows instead of base rows.
+  if (allow_filter_pushdown) {
+    LineairDBTransaction *query_tx = find_tx();
+    if (query_tx != nullptr &&
+        query_tx->has_grouped_summary_registrations()) {
+      std::vector<bool> referenced(steps.size(), false);
+      for (const auto &step : steps) {
+        for (const auto &binding : step.bindings) {
+          if (binding.source_step < referenced.size())
+            referenced[binding.source_step] = true;
+        }
+        for (const auto &binding : step.end_bindings) {
+          if (binding.source_step < referenced.size())
+            referenced[binding.source_step] = true;
+        }
+        for (const auto &semijoin : step.semijoins) {
+          if (semijoin.source_step < referenced.size())
+            referenced[semijoin.source_step] = true;
+        }
+      }
+
+      std::vector<uint32_t> new_index(steps.size(), 0);
+      std::vector<bool> dropped(steps.size(), false);
+      std::vector<LineairDBProxy::ReadPlanStep> kept;
+      std::vector<std::vector<TABLE *>> kept_aliases;
+      kept.reserve(steps.size());
+      kept_aliases.reserve(step_aliases.size());
+
+      bool any_drop = false;
+      for (size_t i = 0; i < steps.size(); ++i) {
+        bool drop = steps[i].is_scan && !steps[i].for_each &&
+                    steps[i].key_prefix.empty() &&
+                    steps[i].end_key_prefix ==
+                        lineairdb_keyenc::scan_end_sentinel() &&
+                    steps[i].serialized_filter.empty() &&
+                    steps[i].scan_limit == 0 && !referenced[i] &&
+                    i < step_aliases.size() && !step_aliases[i].empty() &&
+                    steps[i].semijoins.empty();
+        if (drop) {
+          for (TABLE *alias : step_aliases[i]) {
+            if (alias == nullptr ||
+                query_tx->grouped_summary_registration(alias) == nullptr) {
+              drop = false;
+              break;
+            }
+          }
+        }
+        if (drop) {
+          for (TABLE *alias : step_aliases[i]) {
+            query_tx->mark_grouped_summary_skipped(alias);
+          }
+          dropped[i] = true;
+          any_drop = true;
+          continue;
+        }
+        new_index[i] = static_cast<uint32_t>(kept.size());
+        kept.push_back(std::move(steps[i]));
+        kept_aliases.push_back(std::move(step_aliases[i]));
+      }
+
+      steps = std::move(kept);
+      step_aliases = std::move(kept_aliases);
+      if (any_drop) {
+        for (auto &step : steps) {
+          for (auto &binding : step.bindings) {
+            if (binding.source_step < new_index.size())
+              binding.source_step = new_index[binding.source_step];
+          }
+          for (auto &binding : step.end_bindings) {
+            if (binding.source_step < new_index.size())
+              binding.source_step = new_index[binding.source_step];
+          }
+          for (auto &semijoin : step.semijoins) {
+            if (semijoin.source_step < new_index.size())
+              semijoin.source_step = new_index[semijoin.source_step];
+          }
+        }
+        for (auto it = table_steps.begin(); it != table_steps.end();) {
+          const int idx = it->second;
+          if (idx >= 0 && idx < static_cast<int>(dropped.size()) &&
+              dropped[idx]) {
+            it = table_steps.erase(it);
+          } else {
+            if (idx >= 0 && idx < static_cast<int>(new_index.size()))
+              it->second = static_cast<int>(new_index[idx]);
+            ++it;
+          }
+        }
       }
     }
   }
