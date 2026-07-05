@@ -359,6 +359,312 @@ bool SerializeTableFilters(const std::vector<Item *> &filters, TABLE *table,
 }
 
 /**
+ * @brief Recognize a derived-table aggregate that regroups an inner aggregate.
+ *
+ * The supported shape is an outer GROUP BY over a materialized derived table
+ * whose inner query is a two-table LEFT join grouped on the preserved side.
+ * The inner block becomes scan + scan + LEFT join + aggregate; the outer block
+ * becomes QueryBlockAggregate::regroup over the inner aggregate's output row.
+ */
+bool RecognizeDerivedRegroup(JOIN *join, ColumnarExecutionContext *ctx,
+                             const char **why) {
+#define LDB_COL_REJECT(reason) \
+  do {                         \
+    *why = (reason);           \
+    return false;              \
+  } while (0)
+
+  Query_block *qb = join->query_block;
+  Table_ref *derived_ref = qb->leaf_tables;
+  if (derived_ref == nullptr || derived_ref->next_leaf != nullptr ||
+      !derived_ref->is_view_or_derived() || derived_ref->table == nullptr) {
+    LDB_COL_REJECT("not single derived table");
+  }
+
+  Query_expression *inner_unit = derived_ref->derived_query_expression();
+  if (inner_unit == nullptr || !inner_unit->is_simple())
+    LDB_COL_REJECT("derived not simple");
+  Query_block *inner_qb = inner_unit->first_query_block();
+  if (inner_qb == nullptr) LDB_COL_REJECT("no inner query block");
+
+  if (qb->having_cond() != nullptr) LDB_COL_REJECT("outer has HAVING");
+  if (qb->is_distinct()) LDB_COL_REJECT("outer has DISTINCT");
+  if (qb->has_windows()) LDB_COL_REJECT("outer has windows");
+  if (qb->olap != UNSPECIFIED_OLAP_TYPE) LDB_COL_REJECT("outer has ROLLUP");
+  if (qb->where_cond() != nullptr) LDB_COL_REJECT("outer has WHERE");
+  if (qb->group_list.elements == 0) LDB_COL_REJECT("outer not grouped");
+
+  if (inner_qb->having_cond() != nullptr) LDB_COL_REJECT("inner has HAVING");
+  if (inner_qb->is_distinct()) LDB_COL_REJECT("inner has DISTINCT");
+  if (inner_qb->has_windows()) LDB_COL_REJECT("inner has windows");
+  if (inner_qb->olap != UNSPECIFIED_OLAP_TYPE)
+    LDB_COL_REJECT("inner has ROLLUP");
+  if (inner_qb->where_cond() != nullptr) LDB_COL_REJECT("inner has WHERE");
+  if (inner_qb->order_list.elements > 0 || inner_qb->has_limit())
+    LDB_COL_REJECT("inner has order or limit");
+
+  Table_ref *left_ref = inner_qb->leaf_tables;
+  Table_ref *right_ref = left_ref != nullptr ? left_ref->next_leaf : nullptr;
+  if (left_ref == nullptr || right_ref == nullptr ||
+      right_ref->next_leaf != nullptr) {
+    LDB_COL_REJECT("inner not two tables");
+  }
+
+  Table_ref *nullable_ref = nullptr;
+  if (left_ref->outer_join && !right_ref->outer_join) {
+    nullable_ref = left_ref;
+  } else if (right_ref->outer_join && !left_ref->outer_join) {
+    nullable_ref = right_ref;
+  } else {
+    LDB_COL_REJECT("inner join shape");
+  }
+  Table_ref *preserved_ref = nullable_ref == left_ref ? right_ref : left_ref;
+  TABLE *preserved_table = preserved_ref->table;
+  TABLE *nullable_table = nullable_ref->table;
+  if (preserved_table == nullptr || preserved_table->s == nullptr ||
+      nullable_table == nullptr || nullable_table->s == nullptr) {
+    LDB_COL_REJECT("inner no TABLE");
+  }
+  if (!loaded_tables->contains(preserved_table->s->db.str,
+                               preserved_table->s->table_name.str) ||
+      !loaded_tables->contains(nullable_table->s->db.str,
+                               nullable_table->s->table_name.str)) {
+    LDB_COL_REJECT("inner not SECONDARY_LOADed");
+  }
+
+  Item *join_condition = nullable_ref->join_cond();
+  if (join_condition == nullptr) LDB_COL_REJECT("inner join has no ON");
+  std::vector<Item *> join_predicates;
+  FlattenAnd(join_condition, &join_predicates);
+
+  const Field *preserved_key = nullptr;
+  const Field *nullable_key = nullptr;
+  std::vector<Item *> nullable_filters;
+  for (Item *predicate : join_predicates) {
+    const table_map used = predicate->used_tables() & ~PSEUDO_TABLE_BITS;
+    if ((used & nullable_ref->map()) != 0 &&
+        (used & preserved_ref->map()) == 0) {
+      nullable_filters.push_back(predicate);
+      continue;
+    }
+
+    if (predicate->type() != Item::FUNC_ITEM ||
+        down_cast<Item_func *>(predicate)->functype() != Item_func::EQ_FUNC) {
+      LDB_COL_REJECT("inner join predicate not equality");
+    }
+    auto *equals = down_cast<Item_func *>(predicate);
+    Item *left = equals->arguments()[0]->real_item();
+    Item *right = equals->arguments()[1]->real_item();
+    if (left->type() != Item::FIELD_ITEM ||
+        right->type() != Item::FIELD_ITEM) {
+      LDB_COL_REJECT("inner join key not a column");
+    }
+
+    const Field *left_field = down_cast<Item_field *>(left)->field;
+    const Field *right_field = down_cast<Item_field *>(right)->field;
+    if (preserved_key != nullptr) LDB_COL_REJECT("multiple inner join keys");
+    if (left_field->table == preserved_table &&
+        right_field->table == nullable_table) {
+      preserved_key = left_field;
+      nullable_key = right_field;
+    } else if (left_field->table == nullable_table &&
+               right_field->table == preserved_table) {
+      preserved_key = right_field;
+      nullable_key = left_field;
+    } else {
+      LDB_COL_REJECT("inner join key tables");
+    }
+    if (preserved_key->result_type() != INT_RESULT ||
+        nullable_key->result_type() != INT_RESULT) {
+      LDB_COL_REJECT("inner join key type");
+    }
+  }
+  if (preserved_key == nullptr) LDB_COL_REJECT("inner join key missing");
+
+  if (inner_qb->group_list.elements != 1)
+    LDB_COL_REJECT("inner group arity");
+  Item *inner_group_item = (*inner_qb->group_list.first->item)->real_item();
+  if (inner_group_item->type() != Item::FIELD_ITEM)
+    LDB_COL_REJECT("inner group shape");
+  const Field *inner_group_field =
+      down_cast<Item_field *>(inner_group_item)->field;
+  if (inner_group_field->table != preserved_table ||
+      inner_group_field->is_nullable() ||
+      !GroupColumnIsBinarySafe(inner_group_field)) {
+    LDB_COL_REJECT("inner group column");
+  }
+
+  std::vector<Item *> inner_outputs;
+  for (Item *item : VisibleFields(inner_qb->fields)) {
+    inner_outputs.push_back(item);
+  }
+  if (inner_outputs.size() != 2) LDB_COL_REJECT("inner output arity");
+
+  std::vector<int> first_stage_ordinals(inner_outputs.size(), -1);
+  const Field *count_arg_field = nullptr;
+  bool saw_inner_count = false;
+  for (size_t output_idx = 0; output_idx < inner_outputs.size();
+       ++output_idx) {
+    Item *real = inner_outputs[output_idx]->real_item();
+    if (real->type() == Item::FIELD_ITEM &&
+        down_cast<Item_field *>(real)->field == inner_group_field) {
+      first_stage_ordinals[output_idx] = 0;
+      continue;
+    }
+
+    if (real->type() != Item::SUM_FUNC_ITEM)
+      LDB_COL_REJECT("inner output shape");
+    Item_sum *sum = down_cast<Item_sum *>(real);
+    if (sum->sum_func() != Item_sum::COUNT_FUNC ||
+        sum->argument_count() != 1) {
+      LDB_COL_REJECT("inner aggregate not COUNT");
+    }
+    Item *arg = sum->get_arg(0)->real_item();
+    if (arg->const_item()) LDB_COL_REJECT("inner COUNT(*) under LEFT");
+    if (arg->type() != Item::FIELD_ITEM) LDB_COL_REJECT("inner COUNT arg");
+    const Field *field = down_cast<Item_field *>(arg)->field;
+    if (field->table != nullable_table || field->is_nullable()) {
+      LDB_COL_REJECT("inner COUNT arg column");
+    }
+    count_arg_field = field;
+    saw_inner_count = true;
+    first_stage_ordinals[output_idx] = 1;
+  }
+  if (!saw_inner_count) LDB_COL_REJECT("inner COUNT missing");
+
+  auto &request = ctx->query_block_request;
+  request.Clear();
+  request.add_tables()->set_table_name(preserved_table->s->normalized_path.str);
+  request.add_tables()->set_table_name(nullable_table->s->normalized_path.str);
+
+  auto *preserved_scan = request.add_nodes()->mutable_scan();
+  preserved_scan->set_table_idx(0);
+  auto *nullable_scan = request.add_nodes()->mutable_scan();
+  nullable_scan->set_table_idx(1);
+  if (!nullable_filters.empty() &&
+      !SerializeTableFilters(nullable_filters, nullable_table,
+                             nullable_scan->mutable_filter())) {
+    LDB_COL_REJECT("inner ON filter not pushable");
+  }
+
+  auto *left_join = request.add_nodes()->mutable_join();
+  left_join->set_type(LineairDB::Protocol::QueryBlockJoin::LEFT);
+  left_join->set_build(1);
+  left_join->set_probe(0);
+  auto *build_key = left_join->add_build_keys();
+  build_key->set_table_idx(1);
+  build_key->set_column(nullable_key->field_index());
+  auto *probe_key = left_join->add_probe_keys();
+  probe_key->set_table_idx(0);
+  probe_key->set_column(preserved_key->field_index());
+
+  auto *aggregate = request.add_nodes()->mutable_aggregate();
+  aggregate->set_input(2);
+  auto *group_column = aggregate->add_group_columns();
+  group_column->set_table_idx(0);
+  group_column->set_column(inner_group_field->field_index());
+  group_column->set_cmp_kind(
+      inner_group_field->result_type() == STRING_RESULT ? 1 : 0);
+
+  auto *function = aggregate->add_aggs();
+  function->set_kind(LineairDB::Protocol::QueryBlockAggFunc::COUNT);
+  function->set_arg_table(1);
+  auto *count_ref = function->mutable_arg();
+  count_ref->set_op(LineairDB::Protocol::FilterExpr::COLUMN_REF);
+  count_ref->set_column_index(count_arg_field->field_index());
+
+  auto *regroup = aggregate->mutable_regroup();
+  regroup->set_count_star(true);
+
+  struct OuterGroup {
+    const Field *field = nullptr;
+    int regroup_slot = -1;
+  };
+  std::vector<OuterGroup> outer_groups;
+  for (ORDER *group = qb->group_list.first; group != nullptr;
+       group = group->next) {
+    Item *group_item = (*group->item)->real_item();
+    if (group_item->type() != Item::FIELD_ITEM)
+      LDB_COL_REJECT("outer group shape");
+    const Field *field = down_cast<Item_field *>(group_item)->field;
+    if (field->table != derived_ref->table)
+      LDB_COL_REJECT("outer group table");
+    const uint32_t inner_output_idx = field->field_index();
+    if (inner_output_idx >= first_stage_ordinals.size() ||
+        first_stage_ordinals[inner_output_idx] < 0) {
+      LDB_COL_REJECT("outer group mapping");
+    }
+    regroup->add_group_value_ordinals(
+        static_cast<uint32_t>(first_stage_ordinals[inner_output_idx]));
+    outer_groups.push_back(
+        {field, regroup->group_value_ordinals_size() - 1});
+  }
+
+  std::vector<Item *> output_items;
+  for (Item *item : VisibleFields(qb->fields)) output_items.push_back(item);
+  for (Item *item : output_items) {
+    Item *real = item->real_item();
+    auto *output = request.add_output();
+    if (real->type() == Item::FIELD_ITEM) {
+      const Field *field = down_cast<Item_field *>(real)->field;
+      int regroup_slot = -1;
+      for (const OuterGroup &group : outer_groups) {
+        if (group.field == field) {
+          regroup_slot = group.regroup_slot;
+          break;
+        }
+      }
+      if (regroup_slot < 0) LDB_COL_REJECT("outer output not grouped");
+      output->set_source(LineairDB::Protocol::QueryBlockOutputExpr::GROUP);
+      output->set_ordinal(regroup_slot);
+      continue;
+    }
+
+    if (real->type() != Item::SUM_FUNC_ITEM)
+      LDB_COL_REJECT("outer output shape");
+    Item_sum *sum = down_cast<Item_sum *>(real);
+    if (sum->sum_func() != Item_sum::COUNT_FUNC)
+      LDB_COL_REJECT("outer aggregate not COUNT");
+    if (sum->argument_count() > 0) {
+      Item *arg = sum->get_arg(0)->real_item();
+      if (!arg->const_item() || arg->is_nullable() || arg->is_null()) {
+        LDB_COL_REJECT("outer aggregate not COUNT(*)");
+      }
+    }
+    output->set_source(LineairDB::Protocol::QueryBlockOutputExpr::AGG);
+    output->set_ordinal(0);
+  }
+
+  for (ORDER *order = qb->order_list.first; order != nullptr;
+       order = order->next) {
+    const int output_ordinal = OrderOutputOrdinal(*order->item, output_items);
+    if (output_ordinal < 0) LDB_COL_REJECT("outer ORDER BY");
+    auto *sort_key = request.add_order_by();
+    sort_key->set_output_ordinal(output_ordinal);
+    sort_key->set_descending(order->direction == ORDER_DESC);
+    Item *output_item = output_items[output_ordinal]->real_item();
+    sort_key->set_cmp_kind(output_item->result_type() == STRING_RESULT ? 1 : 0);
+  }
+
+  Query_expression *outer_unit = qb->master_query_expression();
+  if (qb->has_limit()) {
+    if (outer_unit->select_limit_cnt != HA_POS_ERROR)
+      request.set_limit(outer_unit->select_limit_cnt);
+    if (outer_unit->offset_limit_cnt > 0) {
+      request.set_offset(outer_unit->offset_limit_cnt);
+      if (request.limit() > 0)
+        request.set_limit(request.limit() - outer_unit->offset_limit_cnt);
+    }
+  }
+
+  ctx->query_block_ready = true;
+  *why = nullptr;
+  return true;
+
+#undef LDB_COL_REJECT
+}
+
+/**
  * @brief Recognize aggregate query blocks supported by LINEAIRDB_COLUMNAR.
  *
  * Unsupported shapes return false and set `why`; callers convert that into a
@@ -383,6 +689,11 @@ bool RecognizeQueryBlock(JOIN *join, ColumnarExecutionContext *ctx,
   Query_expression *unit = qb->master_query_expression();
   if (unit == nullptr || !unit->is_simple())
     LDB_COL_REJECT("not simple unit");
+
+  if (qb->leaf_tables != nullptr && qb->leaf_tables->next_leaf == nullptr &&
+      qb->leaf_tables->is_view_or_derived()) {
+    return RecognizeDerivedRegroup(join, ctx, why);
+  }
 
   if (qb->having_cond() != nullptr) LDB_COL_REJECT("has HAVING");
   if (qb->is_distinct()) LDB_COL_REJECT("has DISTINCT");
