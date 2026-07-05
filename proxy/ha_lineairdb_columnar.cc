@@ -231,10 +231,14 @@ const Field *ResolveBaseField(const Field *field, TABLE *table) {
 
 /**
  * @brief Return true when raw-byte GROUP BY keys match MySQL equality.
+ *
+ * DECIMAL cells are stored as canonical base-10 text in PAX, so equal values
+ * have equal bytes within one schema.
  */
 bool GroupColumnIsBinarySafe(const Field *field) {
   switch (field->result_type()) {
     case INT_RESULT:
+    case DECIMAL_RESULT:
       return true;
     case STRING_RESULT:
       return field->binary();
