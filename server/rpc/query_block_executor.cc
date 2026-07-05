@@ -856,6 +856,16 @@ class Executor {
 
     using GroupMap = std::unordered_map<std::string, GroupState>;
 
+    static uint32_t FilterTableForAggregate(
+        const pb::QueryBlockAggFunc& function) {
+        if (!function.has_filter()) return function.arg_table();
+        if (function.kind() == pb::QueryBlockAggFunc::COUNT &&
+            !function.has_arg()) {
+            return function.arg_table();
+        }
+        return function.filter_table();
+    }
+
     bool AccumulateRange(const pb::QueryBlockAggregate& aggregate,
                          const NodeResult& input, size_t begin, size_t end,
                          GroupMap* groups) {
@@ -872,15 +882,24 @@ class Executor {
         }
 
         std::vector<int> aggregate_positions(aggregate_count, -1);
+        std::vector<int> filter_positions(aggregate_count, -1);
         for (int aggregate_idx = 0; aggregate_idx < aggregate_count;
              ++aggregate_idx) {
             const pb::QueryBlockAggFunc& function =
                 aggregate.aggs(aggregate_idx);
-            if (function.has_arg() || function.has_filter()) {
+            if (function.has_arg()) {
                 aggregate_positions[aggregate_idx] =
                     input.table_pos(function.arg_table());
                 if (aggregate_positions[aggregate_idx] < 0) {
                     return fail("aggregate table is not in aggregate input");
+                }
+            }
+            if (function.has_filter()) {
+                filter_positions[aggregate_idx] =
+                    input.table_pos(FilterTableForAggregate(function));
+                if (filter_positions[aggregate_idx] < 0) {
+                    return fail(
+                        "aggregate filter table is not in aggregate input");
                 }
             }
             if (function.has_arg() &&
@@ -941,8 +960,13 @@ class Executor {
                     input_pos < 0 || ref != kNullRowRef;
 
                 if (function.has_filter() && function.filter().has_expr()) {
-                    if (!has_arg_row) continue;
-                    PaxRowRef row = ToRowRef(function.arg_table(), ref);
+                    const int filter_pos = filter_positions[aggregate_idx];
+                    const uint64_t filter_ref =
+                        input.refs[filter_pos][row_idx];
+                    if (filter_ref == kNullRowRef) continue;
+                    const uint32_t filter_table =
+                        FilterTableForAggregate(function);
+                    PaxRowRef row = ToRowRef(filter_table, filter_ref);
                     if (row.group == nullptr ||
                         !evaluator.set_row_from_pax(
                             *row.group, row.slot,
@@ -1106,6 +1130,12 @@ class Executor {
                 return std::to_string(state.counts[aggregate_idx]);
             case pb::QueryBlockAggFunc::SUM:
                 if (state.counts[aggregate_idx] == 0) {
+                    if (function.zero_if_empty()) {
+                        DecimalValue zero;
+                        zero.scale = static_cast<int>(function.arg_scale());
+                        zero.is_null = false;
+                        return format_decimal_value(zero);
+                    }
                     *is_null = true;
                     return {};
                 }
