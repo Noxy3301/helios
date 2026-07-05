@@ -45,6 +45,8 @@ echo "== [3/4] ANALYZE =="
 "$MYSQL" -u root --socket="$SOCKET" benchbase \
   -e "ANALYZE TABLE customer, lineitem, nation, orders, part, partsupp, region, supplier;" >/dev/null
 
+"$MYSQL" -u root --socket="$SOCKET" -e "SELECT COUNT(*) AS lineitem_rows FROM benchbase.lineitem;"
+
 echo "== [4/4] measurement conditions =="
 "$MYSQL" -u root --socket="$SOCKET" -e "
   SET GLOBAL lineairdb_prefetch_execution=ON;
@@ -52,5 +54,4 @@ echo "== [4/4] measurement conditions =="
   SET GLOBAL optimizer_switch='batched_key_access=on,mrr_cost_based=off,subquery_to_derived=off';
   SET GLOBAL join_buffer_size=1073741824;"
 
-"$MYSQL" -u root --socket="$SOCKET" -e "SELECT COUNT(*) AS lineitem_rows FROM benchbase.lineitem;"
 echo "setup done"
