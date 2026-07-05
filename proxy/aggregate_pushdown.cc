@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <limits>
 #include <map>
 #include <string>
@@ -17,6 +18,7 @@
 #include "sql/item.h"
 #include "sql/item_cmpfunc.h"
 #include "sql/item_func.h"
+#include "sql/item_subselect.h"
 #include "sql/item_sum.h"
 #include "sql/join_optimizer/access_path.h"
 #include "sql/join_optimizer/walk_access_paths.h"
@@ -596,6 +598,142 @@ static bool build_aggregate_having_filter(
   rhs->set_string_val(
       std::string(constant_text.ptr(), constant_text.length()));
   predicate.SerializeToString(out);
+  return true;
+}
+
+/**
+ * @brief Return the handler table key used by read-plan steps.
+ */
+static std::string physical_table_key(const TABLE *table) {
+  if (table == nullptr || table->s == nullptr) return {};
+  const TABLE_SHARE *share = table->s;
+  if (share->normalized_path.str == nullptr ||
+      share->normalized_path.length == 0) {
+    return {};
+  }
+  return std::string(share->normalized_path.str, share->normalized_path.length);
+}
+
+/**
+ * @brief Unwrap a WHERE item when it represents an IN subquery predicate.
+ */
+static Item_in_subselect *as_where_in_subselect(Item *item) {
+  if (item == nullptr) return nullptr;
+  Item *current = item->real_item();
+  if (current == nullptr) return nullptr;
+  if (current->type() == Item::CACHE_ITEM) {
+    current = down_cast<Item_cache *>(current)->get_example();
+    if (current == nullptr) return nullptr;
+    current = current->real_item();
+    if (current == nullptr) return nullptr;
+  }
+  if (current->type() == Item::SUBSELECT_ITEM) {
+    Item_subselect *subselect = down_cast<Item_subselect *>(current);
+    if (subselect->substype() == Item_subselect::IN_SUBS) {
+      return down_cast<Item_in_subselect *>(subselect);
+    }
+  }
+
+  if (current->type() != Item::FUNC_ITEM) return nullptr;
+  Item_func *func = down_cast<Item_func *>(current);
+  if (func->argument_count() != 1 ||
+      std::strcmp(func->func_name(), "<in_optimizer>") != 0) {
+    return nullptr;
+  }
+  Item *arg = func->get_arg(0);
+  if (arg == nullptr) return nullptr;
+  arg = arg->real_item();
+  if (arg == nullptr || arg->type() != Item::SUBSELECT_ITEM) return nullptr;
+  Item_subselect *subselect = down_cast<Item_subselect *>(arg);
+  if (subselect->substype() != Item_subselect::IN_SUBS) return nullptr;
+  return down_cast<Item_in_subselect *>(subselect);
+}
+
+/**
+ * @brief Return true if the IN predicate is a top-level WHERE conjunct.
+ */
+static bool is_outer_where_top_level_in(Item *where,
+                                        const Item_in_subselect *subselect) {
+  if (where == nullptr || subselect == nullptr) return false;
+  if (as_where_in_subselect(where) == subselect) return true;
+  if (where->type() != Item::COND_ITEM ||
+      down_cast<Item_cond *>(where)->functype() !=
+          Item_func::COND_AND_FUNC) {
+    return false;
+  }
+  for (Item &arg : *down_cast<Item_cond *>(where)->argument_list()) {
+    if (as_where_in_subselect(&arg) == subselect) return true;
+  }
+  return false;
+}
+
+/**
+ * @brief Return true if table is one of the query block's leaf tables.
+ */
+static bool table_belongs_to_query_block(const Query_block *query_block,
+                                         const TABLE *table) {
+  if (query_block == nullptr || table == nullptr) return false;
+  for (const Table_ref *table_ref = query_block->leaf_tables;
+       table_ref != nullptr; table_ref = table_ref->next_leaf) {
+    if (table_ref->table == table) return true;
+  }
+  return false;
+}
+
+/**
+ * @brief Reject ambiguous physical-table matches in statement read-plan steps.
+ */
+static bool physical_table_is_unique_in_statement(THD *thd,
+                                                  const TABLE *table) {
+  if (thd == nullptr || thd->lex == nullptr || table == nullptr) return false;
+  const std::string key = physical_table_key(table);
+  if (key.empty()) return false;
+
+  int count = 0;
+  for (const Table_ref *table_ref = thd->lex->query_tables;
+       table_ref != nullptr; table_ref = table_ref->next_global) {
+    if (table_ref->table != nullptr &&
+        physical_table_key(table_ref->table) == key) {
+      if (++count > 1) return false;
+    }
+  }
+  return count == 1;
+}
+
+/**
+ * @brief Return true if a grouped-semijoin key can compare raw bytes safely.
+ */
+static bool grouped_semijoin_integer_key_type(const Field *field) {
+  if (field == nullptr || field->result_type() != INT_RESULT) return false;
+  switch (field->type()) {
+    case MYSQL_TYPE_TINY:
+    case MYSQL_TYPE_SHORT:
+    case MYSQL_TYPE_INT24:
+    case MYSQL_TYPE_LONG:
+    case MYSQL_TYPE_LONGLONG:
+      return true;
+    default:
+      return false;
+  }
+}
+
+/**
+ * @brief Return true if SQL equality matches server byte membership checks.
+ */
+static bool grouped_semijoin_key_bytes_match_sql_equality(
+    const Field *group_field, const Field *outer_field) {
+  if (!grouped_semijoin_integer_key_type(group_field) ||
+      !grouped_semijoin_integer_key_type(outer_field)) {
+    return false;
+  }
+  if (group_field->is_unsigned() != outer_field->is_unsigned()) return false;
+
+  // Field::val_str() zero-pads ZEROFILL integers to display width, so SQL-equal
+  // values from different column widths can have different bytes.
+  if (down_cast<const Field_num *>(group_field)->zerofill ||
+      down_cast<const Field_num *>(outer_field)->zerofill) {
+    return false;
+  }
   return true;
 }
 
