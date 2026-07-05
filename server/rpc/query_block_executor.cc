@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <exception>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <unordered_map>
 #include <utility>
@@ -32,6 +33,59 @@ void set_failure(pb::TxExecuteQueryBlock::Response* response,
     response->clear_rows();
 }
 
+__int128 decimal_power_of_ten(int exponent) {
+    __int128 value = 1;
+    while (exponent-- > 0) value *= 10;
+    return value;
+}
+
+// MySQL AVG uses the argument scale plus div_precision_increment, which is 4 in
+// the default configuration used by this build.
+DecimalValue divide_decimal_value(const DecimalValue& sum, uint64_t count,
+                                  int output_scale) {
+    DecimalValue result;
+    result.is_null = true;
+    if (sum.is_null || count == 0) return result;
+
+    __int128 numerator = sum.mantissa;
+    const bool negative = numerator < 0;
+    if (negative) numerator = -numerator;
+
+    // Keep one extra decimal digit for round-half-up after the divide.
+    const int extra_scale = output_scale - sum.scale + 1;
+    if (extra_scale > 0) {
+        numerator *= decimal_power_of_ten(extra_scale);
+    } else if (extra_scale < 0) {
+        numerator /= decimal_power_of_ten(-extra_scale);
+    }
+
+    __int128 quotient = numerator / static_cast<__int128>(count);
+    quotient = (quotient + 5) / 10;
+    result.mantissa = negative ? -quotient : quotient;
+    result.scale = output_scale;
+    result.is_null = false;
+    return result;
+}
+
+void append_result_field(std::string& row, std::string_view payload,
+                         bool is_null) {
+    if (is_null) {
+        row.push_back(static_cast<char>(0xFF));
+        return;
+    }
+
+    const size_t length = payload.size();
+    size_t byte_size = 1;
+    for (size_t value = length >> 8; value != 0; value >>= 8) {
+        ++byte_size;
+    }
+    row.push_back(static_cast<char>(byte_size));
+    for (size_t idx = 0; idx < byte_size; ++idx) {
+        row.push_back(static_cast<char>((length >> (8 * idx)) & 0xFF));
+    }
+    row.append(payload.data(), payload.size());
+}
+
 // Materialized operator output. Each logical tuple is represented as one PAX row
 // reference per participating table.
 struct NodeResult {
@@ -54,12 +108,12 @@ class Executor {
              const pb::TxExecuteQueryBlock::Request& request)
         : db_(db), request_(request) {}
 
-    bool Run() {
+    bool Run(pb::TxExecuteQueryBlock::Response* response) {
         if (!PrepareTables()) return false;
         if (!ValidateNodeOrder()) return false;
-        if (!RunNodes()) return false;
+        if (!RunNodes(response)) return false;
         if (!TablesAreStillQuiet()) return fail("concurrent modification");
-        return fail("query-block output is not implemented");
+        return true;
     }
 
     const std::string& error() const { return error_; }
@@ -230,6 +284,11 @@ class Executor {
         std::vector<DecimalValue> decimals;
         std::vector<std::string> strings;
         std::vector<bool> has_value;
+    };
+
+    struct OutputRow {
+        std::vector<std::string> values;
+        std::vector<bool> nulls;
     };
 
     using GroupMap = std::unordered_map<std::string, GroupState>;
@@ -463,7 +522,206 @@ class Executor {
             }
         }
     }
-    bool RunNodes() {
+
+    std::string AggregateValue(const pb::QueryBlockAggFunc& function,
+                               const GroupState& state, int aggregate_idx,
+                               bool* is_null) const {
+        *is_null = false;
+        switch (function.kind()) {
+            case pb::QueryBlockAggFunc::COUNT:
+                return std::to_string(state.counts[aggregate_idx]);
+            case pb::QueryBlockAggFunc::SUM:
+                if (state.counts[aggregate_idx] == 0) {
+                    *is_null = true;
+                    return {};
+                }
+                return format_decimal_value(state.decimals[aggregate_idx]);
+            case pb::QueryBlockAggFunc::AVG: {
+                if (state.counts[aggregate_idx] == 0) {
+                    *is_null = true;
+                    return {};
+                }
+                const int output_scale =
+                    static_cast<int>(function.arg_scale()) + 4;
+                return format_decimal_value(divide_decimal_value(
+                    state.decimals[aggregate_idx],
+                    state.counts[aggregate_idx], output_scale));
+            }
+            case pb::QueryBlockAggFunc::MIN:
+            case pb::QueryBlockAggFunc::MAX:
+                if (!state.has_value[aggregate_idx]) {
+                    *is_null = true;
+                    return {};
+                }
+                return function.cmp_kind() == 1
+                           ? state.strings[aggregate_idx]
+                           : format_decimal_value(
+                                 state.decimals[aggregate_idx]);
+            default:
+                *is_null = true;
+                return {};
+        }
+    }
+
+    bool SortOutputRows(std::vector<OutputRow>* output_rows) {
+        for (const pb::QueryBlockSortKey& key : request_.order_by()) {
+            if (key.output_ordinal() >=
+                static_cast<uint32_t>(request_.output_size())) {
+                return fail("order-by output ordinal out of range");
+            }
+        }
+
+        std::sort(output_rows->begin(), output_rows->end(),
+                  [&](const OutputRow& lhs, const OutputRow& rhs) {
+                      for (const pb::QueryBlockSortKey& key :
+                           request_.order_by()) {
+                          const uint32_t ordinal = key.output_ordinal();
+                          const bool lhs_null = lhs.nulls[ordinal];
+                          const bool rhs_null = rhs.nulls[ordinal];
+                          if (lhs_null != rhs_null) {
+                              return key.descending() ? rhs_null : lhs_null;
+                          }
+                          if (lhs_null) continue;
+
+                          int comparison = 0;
+                          if (key.cmp_kind() == 1) {
+                              comparison =
+                                  lhs.values[ordinal].compare(
+                                      rhs.values[ordinal]);
+                          } else {
+                              comparison = compare_decimal_values(
+                                  parse_decimal_value(lhs.values[ordinal]),
+                                  parse_decimal_value(rhs.values[ordinal]));
+                          }
+                          if (comparison != 0) {
+                              return key.descending() ? comparison > 0
+                                                      : comparison < 0;
+                          }
+                      }
+                      return false;
+                  });
+        return true;
+    }
+
+    void EmitOutputRows(
+        const std::vector<OutputRow>& output_rows,
+        pb::TxExecuteQueryBlock::Response* response) const {
+        const size_t begin =
+            std::min<size_t>(request_.offset(), output_rows.size());
+        const size_t end =
+            request_.limit() > 0
+                ? std::min<size_t>(begin + request_.limit(),
+                                   output_rows.size())
+                : output_rows.size();
+
+        std::string row_buffer;
+        for (size_t row_idx = begin; row_idx < end; ++row_idx) {
+            row_buffer.clear();
+            append_result_field(row_buffer, {}, false);
+            const OutputRow& row = output_rows[row_idx];
+            for (size_t column_idx = 0; column_idx < row.values.size();
+                 ++column_idx) {
+                append_result_field(row_buffer, row.values[column_idx],
+                                    row.nulls[column_idx]);
+            }
+            response->add_rows(row_buffer);
+        }
+    }
+
+    bool RunAggregateAndEmit(
+        const pb::QueryBlockAggregate& aggregate,
+        pb::TxExecuteQueryBlock::Response* response) {
+        const NodeResult& input = results_[aggregate.input()];
+        const size_t input_rows = input.rows();
+
+        GroupMap groups;
+        const unsigned worker_count = static_cast<unsigned>(std::min<size_t>(
+            WorkerCount(), std::max<size_t>(input_rows / 65536, 1)));
+        if (worker_count <= 1) {
+            if (!AccumulateRange(aggregate, input, 0, input_rows, &groups)) {
+                return false;
+            }
+        } else {
+            std::vector<GroupMap> local_groups(worker_count);
+            std::vector<char> worker_failed(worker_count, 0);
+            std::vector<std::thread> workers;
+            workers.reserve(worker_count);
+            for (unsigned worker_idx = 0; worker_idx < worker_count;
+                 ++worker_idx) {
+                workers.emplace_back([&, worker_idx] {
+                    const size_t begin =
+                        input_rows * worker_idx / worker_count;
+                    const size_t end =
+                        input_rows * (worker_idx + 1) / worker_count;
+                    if (!AccumulateRange(aggregate, input, begin, end,
+                                         &local_groups[worker_idx])) {
+                        worker_failed[worker_idx] = 1;
+                    }
+                });
+            }
+            for (std::thread& worker : workers) worker.join();
+            for (char failed : worker_failed) {
+                if (failed) return false;
+            }
+            for (GroupMap& local : local_groups) {
+                MergeGroups(&groups, &local, aggregate);
+            }
+        }
+
+        const int group_count = aggregate.group_columns_size();
+        if (group_count == 0 && groups.empty()) {
+            GroupState state;
+            state.counts.assign(aggregate.aggs_size(), 0);
+            state.decimals.assign(aggregate.aggs_size(), DecimalValue{});
+            state.strings.assign(aggregate.aggs_size(), {});
+            state.has_value.assign(aggregate.aggs_size(), false);
+            groups.emplace(std::string(), std::move(state));
+        }
+
+        std::vector<OutputRow> output_rows;
+        output_rows.reserve(groups.size());
+        for (auto& entry : groups) {
+            GroupState& state = entry.second;
+            OutputRow row;
+            row.values.reserve(request_.output_size());
+            row.nulls.reserve(request_.output_size());
+            for (const pb::QueryBlockOutputExpr& expression :
+                 request_.output()) {
+                switch (expression.source()) {
+                    case pb::QueryBlockOutputExpr::GROUP:
+                        if (expression.ordinal() >=
+                            static_cast<uint32_t>(group_count)) {
+                            return fail("group output ordinal out of range");
+                        }
+                        row.values.push_back(
+                            state.keys[expression.ordinal()]);
+                        row.nulls.push_back(false);
+                        break;
+                    case pb::QueryBlockOutputExpr::AGG: {
+                        if (expression.ordinal() >=
+                            static_cast<uint32_t>(aggregate.aggs_size())) {
+                            return fail("aggregate output ordinal out of range");
+                        }
+                        bool is_null = false;
+                        row.values.push_back(AggregateValue(
+                            aggregate.aggs(expression.ordinal()), state,
+                            static_cast<int>(expression.ordinal()), &is_null));
+                        row.nulls.push_back(is_null);
+                        break;
+                    }
+                    default:
+                        return fail("unsupported query-block output source");
+                }
+            }
+            output_rows.push_back(std::move(row));
+        }
+
+        if (!SortOutputRows(&output_rows)) return false;
+        EmitOutputRows(output_rows, response);
+        return true;
+    }
+
+    bool RunNodes(pb::TxExecuteQueryBlock::Response* response) {
         results_.resize(request_.nodes_size());
         for (int node_idx = 0; node_idx < request_.nodes_size(); ++node_idx) {
             const pb::QueryBlockNode& node = request_.nodes(node_idx);
@@ -475,11 +733,14 @@ class Executor {
                 return fail("query-block join is not implemented");
             }
             if (node.has_aggregate()) {
-                return fail("query-block aggregate is not implemented");
+                if (node_idx != request_.nodes_size() - 1) {
+                    return fail("aggregate must be the root node");
+                }
+                return RunAggregateAndEmit(node.aggregate(), response);
             }
             return fail("unknown query-block node");
         }
-        return true;
+        return fail("root must be an aggregate node");
     }
 
     bool TablesAreStillQuiet() const {
@@ -530,7 +791,7 @@ void ExecuteQueryBlock(
 
     try {
         Executor executor(db, request);
-        if (!executor.Run()) {
+        if (!executor.Run(response)) {
             set_failure(response, default_error(executor));
             return;
         }
