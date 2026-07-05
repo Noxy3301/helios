@@ -738,6 +738,165 @@ static bool grouped_semijoin_key_bytes_match_sql_equality(
 }
 
 /**
+ * @brief Register eligible grouped IN-subquery pushdown state.
+ */
+static void try_register_grouped_semijoin(THD *thd, JOIN *join) {
+  if (thd == nullptr || join == nullptr || thd->lex == nullptr) return;
+  if (thd->lex->sql_command != SQLCOM_SELECT || thd->lex->is_explain()) return;
+
+  Query_block *query_block = join->query_block;
+  if (query_block == nullptr ||
+      query_block->outer_query_block() == nullptr) {
+    return;
+  }
+  Query_block *outer_query_block = query_block->outer_query_block();
+  Query_expression *query_expression = query_block->master_query_expression();
+  if (query_expression == nullptr || !query_expression->is_simple() ||
+      query_expression->uncacheable != 0) {
+    return;
+  }
+  if (query_expression->item == nullptr ||
+      query_expression->item->substype() != Item_subselect::IN_SUBS) {
+    return;
+  }
+
+  Item_in_subselect *in_subquery =
+      down_cast<Item_in_subselect *>(query_expression->item);
+  if (in_subquery->left_expr == nullptr) return;
+  if (!is_outer_where_top_level_in(outer_query_block->where_cond(),
+                                   in_subquery)) {
+    return;
+  }
+  if (in_subquery->value_transform != Item::BOOL_IDENTITY &&
+      in_subquery->value_transform != Item::BOOL_IS_TRUE) {
+    return;
+  }
+
+  if (query_block->leaf_table_count != 1 || !query_block->is_grouped()) return;
+  if (query_block->is_distinct() || query_block->has_limit() ||
+      query_block->olap != UNSPECIFIED_OLAP_TYPE ||
+      query_block->has_windows() || query_block->group_list.elements != 1 ||
+      query_block->having_cond() == nullptr) {
+    return;
+  }
+  if (query_block->where_cond() != nullptr) return;
+
+  TABLE *inner_table = query_block->leaf_tables != nullptr
+                           ? query_block->leaf_tables->table
+                           : nullptr;
+  if (inner_table == nullptr || inner_table->file == nullptr ||
+      inner_table->file->ht != lineairdb_hton) {
+    return;
+  }
+  ha_lineairdb *inner_handler = down_cast<ha_lineairdb *>(inner_table->file);
+  if (!inner_handler->tx_ro_novalidate()) return;
+
+  Item *group_item = *query_block->group_list.first->item;
+  if (group_item->type() != Item::FIELD_ITEM || group_item->is_nullable()) {
+    return;
+  }
+  Field *group_field = down_cast<Item_field *>(group_item)->field;
+  if (group_field == nullptr || group_field->is_nullable()) return;
+
+  std::vector<LineairDBAggOutput> outputs;
+  if (!plan_aggregate_outputs(join, &outputs)) return;
+  if (outputs.size() != 1 ||
+      outputs[0].kind != LineairDBAggKind::kPass) {
+    return;
+  }
+  if (down_cast<Item_field *>(outputs[0].orig)->field != group_field) return;
+
+  LineairDBHavingPredicate having;
+  if (!parse_aggregate_having(query_block, &having) ||
+      having.aggregate == nullptr) {
+    return;
+  }
+
+  std::vector<Item *> group_items{group_item};
+  int having_aggregate_index = -1;
+  std::string aggregate_spec;
+  if (!build_grouped_aggregate_spec(
+          inner_table, inner_handler->tx_ro_novalidate(), outputs, group_items,
+          having, &having_aggregate_index, &aggregate_spec)) {
+    return;
+  }
+  if (having_aggregate_index < 0) return;
+
+  std::string having_filter;
+  const uint32_t having_value_column =
+      static_cast<uint32_t>(group_items.size() + 2 * having_aggregate_index);
+  if (!build_aggregate_having_filter(having, having_value_column,
+                                     &having_filter)) {
+    return;
+  }
+
+  Item *left = in_subquery->left_expr->real_item();
+  if (left->type() != Item::FIELD_ITEM) return;
+  Field *outer_field = down_cast<Item_field *>(left)->field;
+  if (outer_field == nullptr || outer_field->table == nullptr ||
+      outer_field->table->file == nullptr ||
+      outer_field->table->file->ht != lineairdb_hton) {
+    return;
+  }
+
+  TABLE *outer_table = outer_field->table;
+  if (outer_table == inner_table) return;
+  if (!table_belongs_to_query_block(outer_query_block, outer_table)) return;
+  if (!physical_table_is_unique_in_statement(thd, outer_table)) return;
+
+  int probe_column = -1;
+  for (uint field_index = 0; field_index < outer_table->s->fields;
+       ++field_index) {
+    if (outer_table->field[field_index] == outer_field) {
+      probe_column = static_cast<int>(field_index);
+      break;
+    }
+  }
+  if (probe_column < 0) return;
+
+  const Table_ref *outer_table_ref = outer_table->pos_in_table_list;
+  if (outer_table_ref == nullptr ||
+      outer_table_ref->is_inner_table_of_outer_join()) {
+    return;
+  }
+  for (const Table_ref *embedding = outer_table_ref->embedding;
+       embedding != nullptr; embedding = embedding->embedding) {
+    if (embedding->is_sj_or_aj_nest()) return;
+  }
+  if (outer_table_ref->query_block == nullptr ||
+      outer_table_ref->query_block->outer_query_block() != nullptr) {
+    return;
+  }
+  if (outer_field->is_nullable()) return;
+  if (group_field->type() != outer_field->type() ||
+      group_field->pack_length() != outer_field->pack_length()) {
+    return;
+  }
+  if (group_field->result_type() == STRING_RESULT &&
+      group_field->charset() != outer_field->charset()) {
+    return;
+  }
+  if (!grouped_semijoin_key_bytes_match_sql_equality(group_field,
+                                                     outer_field)) {
+    return;
+  }
+
+  const std::string inner_key = physical_table_key(inner_table);
+  const std::string outer_key = physical_table_key(outer_table);
+  if (inner_key.empty() || outer_key.empty()) return;
+
+  if (inner_handler->tx_has_grouped_semijoin()) return;
+
+  LineairDBTransaction::GroupedSemijoin grouped_semijoin;
+  grouped_semijoin.inner_table_key = inner_key;
+  grouped_semijoin.agg_spec = aggregate_spec;
+  grouped_semijoin.having_filter = having_filter;
+  grouped_semijoin.outer_table_key = outer_key;
+  grouped_semijoin.outer_probe_column = static_cast<uint32_t>(probe_column);
+  inner_handler->tx_register_grouped_semijoin(std::move(grouped_semijoin));
+}
+
+/**
  * @brief Execute a supported single-table aggregate SELECT.
  *
  * The caller owns result metadata and EOF. This function only sends data rows.
@@ -1182,6 +1341,7 @@ static bool leaf_is_full_primary_scan(AccessPath *root_path, JOIN *join) {
 }
 
 int lineairdb_push_to_engine(THD *thd, AccessPath *root_path, JOIN *join) {
+  try_register_grouped_semijoin(thd, join);
   if (!is_aggregate_pushdown_shape(thd, join)) return 0;
   // The override reads a PRIMARY full scan; install it only when the plan chose
   // that scan, else its read misses the staged secondary and prefetch aborts.
