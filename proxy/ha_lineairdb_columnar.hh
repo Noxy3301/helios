@@ -16,11 +16,17 @@ class Table;
 namespace lineairdb_columnar {
 
 /**
- * @brief Secondary engine handler for the LINEAIRDB_COLUMNAR plugin.
+ * @brief MySQL secondary engine handler for LINEAIRDB_COLUMNAR.
  *
- * The handler owns the MySQL secondary-engine lifecycle. SECONDARY_LOAD records
- * that a table may be opened through this engine; table data still lives in
- * LineairDB and is not copied into a separate store.
+ * This is the table-facing handler MySQL opens after a table is assigned to
+ * LINEAIRDB_COLUMNAR and marked with SECONDARY_LOAD. Loading only records that
+ * the table may be opened through this plugin; rows stay in LineairDB/PAX
+ * storage and are shared with the primary LineairDB handler.
+ *
+ * Row-access methods are intentionally inert. Supported SELECT blocks run
+ * through JOIN::override_executor_func after optimize_secondary_engine accepts
+ * their shape; unsupported blocks reject from the secondary path and can retry
+ * on the primary engine when use_secondary_engine=ON.
  */
 class ha_lineairdb_columnar : public handler {
  public:

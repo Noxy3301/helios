@@ -68,6 +68,10 @@ class LoadedTables {
 
 LoadedTables *loaded_tables = nullptr;
 
+// send_result_set_metadata() has already described the original SELECT fields.
+// The override executor only needs Item instances that carry computed values
+// through Query_result::send_data(), so this class mirrors the prototype type
+// metadata while storing the server-produced value as text.
 class ItemColumnarValue final : public Item_string {
  public:
   explicit ItemColumnarValue(const Item *prototype)
@@ -92,6 +96,9 @@ struct OutBinding {
   int index = 0;
 };
 
+// Statement-local state owned by LEX::secondary_engine_execution_context.
+// Recognition fills the serialized LineairDB request and output bindings;
+// execution consumes them after MySQL calls JOIN::override_executor_func.
 class ColumnarExecutionContext : public Secondary_engine_execution_context {
  public:
   bool BestPlanSoFar(const JOIN &join, double cost) {
