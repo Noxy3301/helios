@@ -255,6 +255,10 @@ public:
         const std::vector<StatelessReadKey>& keys);
     ReadPlanResult tx_execute_read_plan(
         const std::vector<ReadPlanStep>& steps);
+    // Send a prepared query-block request to the LineairDB server.
+    bool tx_execute_query_block(
+        const LineairDB::Protocol::TxExecuteQueryBlock::Request& request,
+        LineairDB::Protocol::TxExecuteQueryBlock::Response* response);
     bool tx_validate_and_commit(
         const std::vector<StatelessReadKey>& reads,
         const std::vector<uint64_t>& read_tids,
