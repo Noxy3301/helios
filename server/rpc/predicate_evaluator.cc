@@ -92,6 +92,20 @@ bool PredicateEvaluator::set_row_from_pax(
   return true;
 }
 
+void PredicateEvaluator::set_row_from_views(
+    const std::vector<std::string_view>& cells,
+    const std::vector<bool>& nulls) {
+  columns_.assign(cells.begin(), cells.end());
+  null_flags_.assign((columns_.size() + 7) / 8, 0);
+  for (size_t idx = 0; idx < nulls.size() && idx < columns_.size(); ++idx) {
+    if (nulls[idx]) {
+      null_flags_[idx / 8] =
+          static_cast<char>(static_cast<unsigned char>(null_flags_[idx / 8]) |
+                            (1u << (idx % 8)));
+    }
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Value extraction
 // ---------------------------------------------------------------------------

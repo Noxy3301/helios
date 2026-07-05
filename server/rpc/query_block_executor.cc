@@ -197,6 +197,13 @@ class Executor {
                 }
                 continue;
             }
+            if (node.has_filter()) {
+                if (node.filter().input() >=
+                    static_cast<uint32_t>(node_idx)) {
+                    return fail("tuple filter child order");
+                }
+                continue;
+            }
             if (node.has_aggregate()) {
                 if (node.aggregate().input() >=
                     static_cast<uint32_t>(node_idx)) {
@@ -223,6 +230,16 @@ class Executor {
         const int position = input.table_pos(table_idx);
         if (position < 0) return PaxRowRef{};
         return ToRowRef(table_idx, input.refs[position][row_idx]);
+    }
+
+    static bool IsNullColumn(const PaxRowRef& row, uint32_t column_idx) {
+        if (row.group == nullptr) return true;
+        const std::string_view null_flags = row.group->cell(0, row.slot);
+        const size_t byte_idx = column_idx / 8;
+        const uint32_t bit_idx = column_idx % 8;
+        return byte_idx < null_flags.size() &&
+               (static_cast<unsigned char>(null_flags[byte_idx]) &
+                (1u << bit_idx)) != 0;
     }
 
     static DecodedColumnRef DecodeAggregateColumnRef(
@@ -437,6 +454,140 @@ class Executor {
         for (const std::vector<uint64_t>& refs : local_refs) {
             output->refs[0].insert(output->refs[0].end(), refs.begin(),
                                    refs.end());
+        }
+        return true;
+    }
+
+    struct TupleFilterColumn {
+        int ref_position = -1;
+        uint32_t table_idx = 0;
+        uint32_t column = 0;
+    };
+
+    bool ResolveTupleFilterColumns(
+        const pb::QueryBlockTupleFilter& filter, const NodeResult& input,
+        std::vector<TupleFilterColumn>* columns) {
+        if (!filter.has_predicate() || !filter.predicate().has_expr()) {
+            return fail("tuple filter predicate missing");
+        }
+        if (filter.predicate().num_columns() !=
+            static_cast<uint32_t>(filter.columns_size())) {
+            return fail("tuple filter column count");
+        }
+
+        columns->clear();
+        columns->reserve(filter.columns_size());
+        for (const pb::QueryBlockColumnRef& column : filter.columns()) {
+            const int position = input.table_pos(column.table_idx());
+            if (position < 0) return fail("tuple filter table");
+            columns->push_back(
+                TupleFilterColumn{position, column.table_idx(),
+                                  column.column()});
+        }
+        return true;
+    }
+
+    bool BuildTupleFilterRow(
+        const NodeResult& input,
+        const std::vector<TupleFilterColumn>& columns, size_t row_idx,
+        std::vector<std::string_view>* cells,
+        std::vector<bool>* nulls) const {
+        cells->resize(columns.size());
+        nulls->resize(columns.size());
+        for (size_t column_idx = 0; column_idx < columns.size();
+             ++column_idx) {
+            const TupleFilterColumn& column = columns[column_idx];
+            const uint64_t ref = input.refs[column.ref_position][row_idx];
+            if (ref == kNullRowRef) {
+                (*cells)[column_idx] = {};
+                (*nulls)[column_idx] = true;
+                continue;
+            }
+
+            const PaxRowRef row = ToRowRef(column.table_idx, ref);
+            if (row.group == nullptr) return false;
+            (*cells)[column_idx] =
+                extract_value_column(row, static_cast<int>(column.column));
+            (*nulls)[column_idx] = IsNullColumn(row, column.column);
+        }
+        return true;
+    }
+
+    bool RunTupleFilter(const pb::QueryBlockTupleFilterNode& filter,
+                        NodeResult* output) {
+        if (filter.input() >= results_.size()) {
+            return fail("tuple filter child out of range");
+        }
+        const NodeResult& input = results_[filter.input()];
+
+        std::vector<TupleFilterColumn> columns;
+        if (!ResolveTupleFilterColumns(filter.filter(), input, &columns)) {
+            return false;
+        }
+
+        output->tables = input.tables;
+        output->refs.assign(input.refs.size(), {});
+        const size_t input_rows = input.rows();
+        const unsigned worker_count = static_cast<unsigned>(std::min<size_t>(
+            WorkerCount(), std::max<size_t>(input_rows / 16384, 1)));
+
+        struct WorkerOutput {
+            std::vector<std::vector<uint64_t>> refs;
+        };
+        std::vector<WorkerOutput> local_outputs(worker_count);
+        std::vector<char> worker_failed(worker_count, 0);
+        std::vector<std::thread> workers;
+        workers.reserve(worker_count);
+
+        for (unsigned worker_idx = 0; worker_idx < worker_count; ++worker_idx) {
+            workers.emplace_back([&, worker_idx] {
+                PredicateEvaluator evaluator;
+                std::vector<std::string_view> cells;
+                std::vector<bool> nulls;
+                WorkerOutput& local = local_outputs[worker_idx];
+                local.refs.assign(input.refs.size(), {});
+                const size_t begin = input_rows * worker_idx / worker_count;
+                const size_t end =
+                    input_rows * (worker_idx + 1) / worker_count;
+                for (size_t row_idx = begin; row_idx < end; ++row_idx) {
+                    if (!BuildTupleFilterRow(input, columns, row_idx, &cells,
+                                             &nulls)) {
+                        worker_failed[worker_idx] = 1;
+                        return;
+                    }
+                    evaluator.set_row_from_views(cells, nulls);
+                    if (!evaluator.evaluate(filter.filter().predicate()
+                                                .expr())) {
+                        continue;
+                    }
+                    for (size_t column_idx = 0; column_idx < input.refs.size();
+                         ++column_idx) {
+                        local.refs[column_idx].push_back(
+                            input.refs[column_idx][row_idx]);
+                    }
+                }
+            });
+        }
+
+        for (std::thread& worker : workers) worker.join();
+        for (char failed : worker_failed) {
+            if (failed) return fail("tuple filter cannot read PAX columns");
+        }
+
+        size_t total_rows = 0;
+        for (const WorkerOutput& local : local_outputs) {
+            total_rows += local.refs.empty() ? 0 : local.refs[0].size();
+        }
+        for (size_t column_idx = 0; column_idx < output->refs.size();
+             ++column_idx) {
+            output->refs[column_idx].reserve(total_rows);
+            for (const WorkerOutput& local : local_outputs) {
+                if (local.refs.empty()) continue;
+                output->refs[column_idx].insert(
+                    output->refs[column_idx].end(),
+                    local.refs[column_idx].begin(),
+                    local.refs[column_idx].end());
+            }
         }
         return true;
     }
@@ -1201,6 +1352,12 @@ class Executor {
             }
             if (node.has_join()) {
                 if (!RunJoin(node.join(), &results_[node_idx])) return false;
+                continue;
+            }
+            if (node.has_filter()) {
+                if (!RunTupleFilter(node.filter(), &results_[node_idx])) {
+                    return false;
+                }
                 continue;
             }
             if (node.has_aggregate()) {
