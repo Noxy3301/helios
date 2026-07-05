@@ -72,6 +72,56 @@ DecimalValue divide_decimal_value(const DecimalValue& sum, uint64_t count,
     return result;
 }
 
+DecimalValue divide_decimal_values(const DecimalValue& lhs,
+                                   const DecimalValue& rhs,
+                                   int output_scale) {
+    DecimalValue result;
+    result.is_null = true;
+    if (lhs.is_null || rhs.is_null || rhs.mantissa == 0) return result;
+
+    __int128 numerator = lhs.mantissa;
+    __int128 denominator = rhs.mantissa;
+    bool negative = false;
+    if (numerator < 0) {
+        numerator = -numerator;
+        negative = !negative;
+    }
+    if (denominator < 0) {
+        denominator = -denominator;
+        negative = !negative;
+    }
+
+    // Scale the numerator to keep one extra decimal digit for half-up rounding.
+    const int scale_shift = output_scale + rhs.scale - lhs.scale + 1;
+    if (scale_shift > 0) {
+        numerator *= decimal_power_of_ten(scale_shift);
+    } else if (scale_shift < 0) {
+        numerator /= decimal_power_of_ten(-scale_shift);
+    }
+
+    __int128 quotient = numerator / denominator;
+    quotient = (quotient + 5) / 10;
+    result.mantissa = negative ? -quotient : quotient;
+    result.scale = output_scale;
+    result.is_null = false;
+    return result;
+}
+
+void round_decimal_value(DecimalValue* value, int output_scale) {
+    if (value == nullptr || value->is_null || value->scale <= output_scale) {
+        return;
+    }
+
+    const int drop = value->scale - output_scale;
+    const __int128 divisor = decimal_power_of_ten(drop);
+    __int128 mantissa = value->mantissa;
+    const bool negative = mantissa < 0;
+    if (negative) mantissa = -mantissa;
+    mantissa = (mantissa + divisor / 2) / divisor;
+    value->mantissa = negative ? -mantissa : mantissa;
+    value->scale = output_scale;
+}
+
 void append_result_field(std::string& row, std::string_view payload,
                          bool is_null) {
     if (is_null) {
@@ -1167,6 +1217,128 @@ class Executor {
         }
     }
 
+    bool EvaluateOutputExpression(const pb::FilterExpr& expression,
+                                  const pb::QueryBlockAggregate& aggregate,
+                                  const GroupState& state,
+                                  DecimalValue* result) {
+        if (result == nullptr) return fail("missing output expression result");
+
+        using FE = pb::FilterExpr;
+        switch (expression.op()) {
+            case FE::COLUMN_REF: {
+                const uint32_t ordinal = expression.column_index();
+                const uint32_t group_count =
+                    static_cast<uint32_t>(aggregate.group_columns_size());
+                if (ordinal < group_count) {
+                    *result = parse_decimal_value(state.keys[ordinal]);
+                    return true;
+                }
+
+                const uint32_t aggregate_idx = ordinal - group_count;
+                if (aggregate_idx >=
+                    static_cast<uint32_t>(aggregate.aggs_size())) {
+                    return fail("output expression ordinal out of range");
+                }
+                bool is_null = false;
+                const std::string value = AggregateValue(
+                    aggregate.aggs(aggregate_idx), state,
+                    static_cast<int>(aggregate_idx), &is_null);
+                if (is_null) {
+                    *result = DecimalValue{};
+                    result->is_null = true;
+                    return true;
+                }
+                *result = parse_decimal_value(value);
+                return true;
+            }
+            case FE::CONST_INT:
+                result->mantissa = expression.int_val();
+                result->scale = 0;
+                result->is_null = false;
+                return true;
+            case FE::CONST_UINT:
+                result->mantissa =
+                    static_cast<__int128>(expression.uint_val());
+                result->scale = 0;
+                result->is_null = false;
+                return true;
+            case FE::CONST_STRING:
+                *result = parse_decimal_value(expression.string_val());
+                return true;
+            case FE::CONST_NULL:
+                *result = DecimalValue{};
+                result->is_null = true;
+                return true;
+            case FE::OP_ADD:
+            case FE::OP_SUB: {
+                if (expression.children_size() != 2) {
+                    return fail("output expression arity mismatch");
+                }
+                DecimalValue lhs;
+                DecimalValue rhs;
+                if (!EvaluateOutputExpression(expression.children(0),
+                                              aggregate, state, &lhs) ||
+                    !EvaluateOutputExpression(expression.children(1),
+                                              aggregate, state, &rhs)) {
+                    return false;
+                }
+                if (expression.op() == FE::OP_SUB) {
+                    rhs.mantissa = -rhs.mantissa;
+                }
+                add_decimal_value(lhs, rhs);
+                *result = lhs;
+                return true;
+            }
+            case FE::OP_MUL: {
+                if (expression.children_size() != 2) {
+                    return fail("output expression arity mismatch");
+                }
+                DecimalValue lhs;
+                DecimalValue rhs;
+                if (!EvaluateOutputExpression(expression.children(0),
+                                              aggregate, state, &lhs) ||
+                    !EvaluateOutputExpression(expression.children(1),
+                                              aggregate, state, &rhs)) {
+                    return false;
+                }
+                result->mantissa = lhs.mantissa * rhs.mantissa;
+                result->scale = lhs.scale + rhs.scale;
+                result->is_null = lhs.is_null || rhs.is_null;
+                return true;
+            }
+            case FE::OP_DIV: {
+                if (expression.children_size() != 2) {
+                    return fail("output expression arity mismatch");
+                }
+                DecimalValue lhs;
+                DecimalValue rhs;
+                if (!EvaluateOutputExpression(expression.children(0),
+                                              aggregate, state, &lhs) ||
+                    !EvaluateOutputExpression(expression.children(1),
+                                              aggregate, state, &rhs)) {
+                    return false;
+                }
+                // Match MySQL DECIMAL division: left operand scale plus the
+                // default div_precision_increment, rounded half up.
+                *result = divide_decimal_values(lhs, rhs, lhs.scale + 4);
+                return true;
+            }
+            case FE::OP_NEG: {
+                if (expression.children_size() != 1) {
+                    return fail("output expression arity mismatch");
+                }
+                if (!EvaluateOutputExpression(expression.children(0),
+                                              aggregate, state, result)) {
+                    return false;
+                }
+                result->mantissa = -result->mantissa;
+                return true;
+            }
+            default:
+                return fail("unsupported output expression");
+        }
+    }
+
     bool AggregateRowValue(const pb::QueryBlockAggregate& aggregate,
                            int group_count, const GroupState& state,
                            uint32_t ordinal, std::string* value,
@@ -1428,6 +1600,22 @@ class Executor {
                                 static_cast<int>(expression.ordinal()),
                                 &is_null));
                             row.nulls.push_back(is_null);
+                            break;
+                        }
+                        case pb::QueryBlockOutputExpr::EXPR: {
+                            DecimalValue value;
+                            if (!EvaluateOutputExpression(
+                                    expression.expr(), aggregate, state,
+                                    &value)) {
+                                return false;
+                            }
+                            round_decimal_value(
+                                &value,
+                                static_cast<int>(expression.result_scale()));
+                            row.values.push_back(
+                                value.is_null ? std::string()
+                                              : format_decimal_value(value));
+                            row.nulls.push_back(value.is_null);
                             break;
                         }
                         default:
