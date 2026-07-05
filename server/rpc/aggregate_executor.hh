@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -14,6 +15,15 @@
 // Server-side aggregate execution helpers. These functions build per-group
 // partials from scan rows and serialize the partials back into synthetic rows
 // consumed by the proxy.
+
+constexpr uint32_t kAggregateHavingFilterColumns =
+    std::numeric_limits<uint32_t>::max();
+
+/**
+ * @brief Return true when a plan-step filter is an aggregate HAVING carrier.
+ */
+bool is_aggregate_having_filter(
+    const LineairDB::Protocol::TxExecuteReadPlan::PlanStep& step);
 
 /**
  * @brief Accumulators for one GROUP BY key.
@@ -46,7 +56,8 @@ void merge_agg_groups(std::unordered_map<std::string, AggGroupState>& dst,
 void emit_agg_groups(
     const LineairDB::Protocol::AggregateSpec& spec,
     std::unordered_map<std::string, AggGroupState>& groups,
-    LineairDB::Protocol::TxExecuteReadPlan::StepResult* step_result);
+    LineairDB::Protocol::TxExecuteReadPlan::StepResult* step_result,
+    const LineairDB::Protocol::PushedPredicate* group_having = nullptr);
 
 /**
  * @brief Aggregate scan rows and emit one synthetic group row per group.
@@ -56,4 +67,5 @@ void emit_agg_groups(
 bool server_aggregate_scan(
     const LineairDB::Protocol::AggregateSpec& spec,
     std::vector<LineairDB::StatelessScanRow>& rows,
-    LineairDB::Protocol::TxExecuteReadPlan::StepResult* step_result);
+    LineairDB::Protocol::TxExecuteReadPlan::StepResult* step_result,
+    const LineairDB::Protocol::PushedPredicate* group_having = nullptr);

@@ -23,6 +23,82 @@ static void agg_emit_field(std::string& out, std::string_view v, bool is_null) {
     out.append(v.data(), v.size());
 }
 
+bool is_aggregate_having_filter(
+    const LineairDB::Protocol::TxExecuteReadPlan::PlanStep& step) {
+    return step.has_aggregate() && step.has_filter() &&
+           step.filter().has_expr() &&
+           step.filter().num_columns() == kAggregateHavingFilterColumns;
+}
+
+namespace {
+
+bool decimal_from_filter_constant(
+    const LineairDB::Protocol::FilterExpr& expr,
+    DecimalValue& value) {
+    using FE = LineairDB::Protocol::FilterExpr;
+    switch (expr.op()) {
+        case FE::CONST_INT:
+            value.mantissa = expr.int_val();
+            value.scale = 0;
+            value.is_null = false;
+            return true;
+        case FE::CONST_UINT:
+            value.mantissa = static_cast<__int128>(expr.uint_val());
+            value.scale = 0;
+            value.is_null = false;
+            return true;
+        case FE::CONST_STRING:
+            value = parse_decimal_value(expr.string_val());
+            return !value.is_null;
+        default:
+            return false;
+    }
+}
+
+bool aggregate_having_row_passes(
+    const LineairDB::Protocol::PushedPredicate* predicate,
+    const std::string& group_row) {
+    if (predicate == nullptr) return true;
+
+    using FE = LineairDB::Protocol::FilterExpr;
+    const auto& expr = predicate->expr();
+    switch (expr.op()) {
+        case FE::OP_GT:
+        case FE::OP_GE:
+        case FE::OP_LT:
+        case FE::OP_LE:
+        case FE::OP_EQ:
+        case FE::OP_NE:
+            break;
+        default:
+            return false;
+    }
+    if (expr.children_size() != 2 ||
+        expr.children(0).op() != FE::COLUMN_REF) {
+        return false;
+    }
+
+    const DecimalValue lhs = parse_decimal_value(
+        extract_value_column(group_row, expr.children(0).column_index()));
+    DecimalValue rhs;
+    if (lhs.is_null || !decimal_from_filter_constant(expr.children(1), rhs)) {
+        return false;
+    }
+
+    const int cmp = compare_decimal_values(lhs, rhs);
+    switch (expr.op()) {
+        case FE::OP_GT: return cmp > 0;
+        case FE::OP_GE: return cmp >= 0;
+        case FE::OP_LT: return cmp < 0;
+        case FE::OP_LE: return cmp <= 0;
+        case FE::OP_EQ: return cmp == 0;
+        case FE::OP_NE: return cmp != 0;
+        default: return false;
+    }
+}
+
+}  // namespace
+
 void aggregate_rows_range(
     const LineairDB::Protocol::AggregateSpec& spec,
     const std::vector<LineairDB::StatelessScanRow>& rows,
@@ -99,7 +175,8 @@ void merge_agg_groups(
 void emit_agg_groups(
     const LineairDB::Protocol::AggregateSpec& spec,
     std::unordered_map<std::string, AggGroupState>& groups,
-    LineairDB::Protocol::TxExecuteReadPlan::StepResult* step_result) {
+    LineairDB::Protocol::TxExecuteReadPlan::StepResult* step_result,
+    const LineairDB::Protocol::PushedPredicate* group_having) {
     using AF = LineairDB::Protocol::AggFunc;
     const int n_agg = spec.aggs_size();
     const int n_grp = spec.group_columns_size();
@@ -131,6 +208,7 @@ void emit_agg_groups(
                 agg_emit_field(row, cnt, false);
             }
         }
+        if (!aggregate_having_row_passes(group_having, row)) continue;
         step_result->add_scan_keys(std::string());
         step_result->add_scan_values(std::move(row));
         step_result->add_scan_tids(0);
@@ -140,7 +218,8 @@ void emit_agg_groups(
 bool server_aggregate_scan(
     const LineairDB::Protocol::AggregateSpec& spec,
     std::vector<LineairDB::StatelessScanRow>& rows,
-    LineairDB::Protocol::TxExecuteReadPlan::StepResult* step_result) {
+    LineairDB::Protocol::TxExecuteReadPlan::StepResult* step_result,
+    const LineairDB::Protocol::PushedPredicate* group_having) {
     const int n_agg = spec.aggs_size();
     std::unordered_map<std::string, AggGroupState> groups;
 
@@ -178,6 +257,6 @@ bool server_aggregate_scan(
         for (auto& local : locals) merge_agg_groups(groups, local, n_agg);
     }
 
-    emit_agg_groups(spec, groups, step_result);
+    emit_agg_groups(spec, groups, step_result, group_having);
     return true;
 }
