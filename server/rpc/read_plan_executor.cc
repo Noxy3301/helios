@@ -540,6 +540,11 @@ void LineairDBRpc::handleTxExecuteReadPlan(const std::string& message,
             if (!step.for_each() && step.scan_limit() == 0 &&
                 !step.reverse_scan() && step.has_aggregate() &&
                 step.aggregate().aggs_size() > 0) {
+                if (parallel_primary_pax_aggregate_scan(
+                        db_manager_->get_database().get(), step, start_key,
+                        end_key, step_result)) {
+                    continue;
+                }
                 if (parallel_primary_aggregate_scan(
                         db_manager_->get_database().get(), step, start_key,
                         end_key, step_result)) {
