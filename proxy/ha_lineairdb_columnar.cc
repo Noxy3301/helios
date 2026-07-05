@@ -17,10 +17,19 @@
 #include "mysqld_error.h"
 #include "sql/handler.h"
 #include "sql/item.h"
+#include "sql/item_sum.h"
+#include "sql/sql_const.h"
 #include "sql/sql_class.h"
 #include "sql/sql_lex.h"
+#include "sql/sql_optimizer.h"
 #include "sql/table.h"
+#include "sql/visible_fields.h"
+#include "template_utils.h"
 #include "thr_lock.h"
+
+#include "aggregate_pushdown.hh"
+#include "lineairdb.pb.h"
+#include "lineairdb_pushdown.hh"
 
 namespace lineairdb_columnar {
 
@@ -166,6 +175,228 @@ struct DecodedField {
   return true;
 }
 
+/**
+ * @brief Resolve a possibly rebound Field back to the base table Field.
+ *
+ * GROUP BY plans may replace SELECT items with temporary-table fields after
+ * optimization. The serialized LineairDB request must use base-table column
+ * indexes, so matching by name is required when the Field no longer belongs to
+ * the base TABLE.
+ */
+const Field *ResolveBaseField(const Field *field, TABLE *table) {
+  if (field == nullptr) return nullptr;
+  if (field->table == table) return field;
+
+  for (uint i = 0; i < table->s->fields; i++) {
+    if (field->field_name != nullptr &&
+        table->field[i]->field_name != nullptr &&
+        my_strcasecmp(system_charset_info, table->field[i]->field_name,
+                      field->field_name) == 0) {
+      return table->field[i];
+    }
+  }
+  return nullptr;
+}
+
+/**
+ * @brief Return true when raw-byte GROUP BY keys match MySQL equality.
+ */
+bool GroupColumnIsBinarySafe(const Field *field) {
+  switch (field->result_type()) {
+    case INT_RESULT:
+      return true;
+    case STRING_RESULT:
+      return field->binary();
+    default:
+      return false;
+  }
+}
+
+/**
+ * @brief Recognize single-table aggregate blocks supported by LINEAIRDB_COLUMNAR.
+ *
+ * Unsupported shapes return false and set `why`; callers convert that into a
+ * secondary-engine reject that may fall back to the primary engine when the
+ * session allows it.
+ */
+bool RecognizeSingleTableAggregate(JOIN *join, ColumnarExecutionContext *ctx,
+                                   const char **why) {
+#define LDB_COL_REJECT(reason) \
+  do {                         \
+    *why = (reason);           \
+    return false;              \
+  } while (0)
+
+  ctx->table_name.clear();
+  ctx->serialized_filter.clear();
+  ctx->serialized_aggregate.clear();
+  ctx->bindings.clear();
+  ctx->group_column_count = 0;
+  ctx->aggregate_count = 0;
+
+  Query_block *qb = join->query_block;
+  if (qb == nullptr || qb->outer_query_block() != nullptr)
+    LDB_COL_REJECT("not top-level");
+
+  Query_expression *unit = qb->master_query_expression();
+  if (unit == nullptr || !unit->is_simple())
+    LDB_COL_REJECT("not simple unit");
+
+  Table_ref *table_ref = qb->leaf_tables;
+  if (table_ref == nullptr || table_ref->next_leaf != nullptr)
+    LDB_COL_REJECT("not single table");
+
+  TABLE *table = table_ref->table;
+  if (table == nullptr || table->s == nullptr) LDB_COL_REJECT("no TABLE");
+
+  if (qb->having_cond() != nullptr) LDB_COL_REJECT("has HAVING");
+  if (join->order.order != nullptr || qb->order_list.elements > 0)
+    LDB_COL_REJECT("has ORDER BY");
+  if (qb->is_distinct()) LDB_COL_REJECT("has DISTINCT");
+  if (qb->has_limit()) LDB_COL_REJECT("has LIMIT");
+  if (qb->has_windows()) LDB_COL_REJECT("has windows");
+  if (qb->olap != UNSPECIFIED_OLAP_TYPE) LDB_COL_REJECT("has ROLLUP");
+  if (!join->implicit_grouping && qb->group_list.elements == 0)
+    LDB_COL_REJECT("no aggregation");
+
+  if (!loaded_tables->contains(table->s->db.str, table->s->table_name.str))
+    LDB_COL_REJECT("not SECONDARY_LOADed");
+
+  Item *where_cond =
+      qb->where_cond() != nullptr ? qb->where_cond() : join->where_cond;
+  LineairDB::Protocol::PushedPredicate predicate;
+  if (where_cond != nullptr) {
+    if (!serialize_item(where_cond, predicate.mutable_expr()))
+      LDB_COL_REJECT("WHERE not pushable");
+    predicate.set_num_columns(table->s->fields);
+  }
+
+  LineairDB::Protocol::AggregateSpec spec;
+  spec.set_num_columns(table->s->fields);
+
+  std::vector<const Field *> group_fields;
+  for (ORDER *group = qb->group_list.first; group != nullptr;
+       group = group->next) {
+    Item *group_item = (*group->item)->real_item();
+    if (group_item->type() != Item::FIELD_ITEM)
+      LDB_COL_REJECT("group item not a column");
+
+    const Field *group_field = ResolveBaseField(
+        down_cast<Item_field *>(group_item)->field, table);
+    if (group_field == nullptr) LDB_COL_REJECT("group column foreign");
+    if (group_field->is_nullable() ||
+        !GroupColumnIsBinarySafe(group_field)) {
+      LDB_COL_REJECT("group column not binary-safe");
+    }
+
+    spec.add_group_columns(group_field->field_index());
+    group_fields.push_back(group_field);
+  }
+
+  for (Item *item : VisibleFields(qb->fields)) {
+    Item *real = item->real_item();
+    if (real->type() == Item::FIELD_ITEM) {
+      const Field *output_field = ResolveBaseField(
+          down_cast<Item_field *>(real)->field, table);
+      if (output_field == nullptr)
+        LDB_COL_REJECT("output column unresolvable");
+
+      int group_position = -1;
+      for (size_t i = 0; i < group_fields.size(); i++) {
+        if (group_fields[i] == output_field) {
+          group_position = static_cast<int>(i);
+          break;
+        }
+      }
+      if (group_position < 0)
+        LDB_COL_REJECT("output field not a group column");
+
+      ctx->bindings.push_back({false, group_position});
+      continue;
+    }
+
+    if (real->type() != Item::SUM_FUNC_ITEM)
+      LDB_COL_REJECT("output not aggregate");
+
+    Item_sum *sum = down_cast<Item_sum *>(real);
+    if (sum->argument_count() > 1) LDB_COL_REJECT("aggregate arg count");
+
+    auto *aggregate = spec.add_aggs();
+    aggregate->set_result_scale(0);
+
+    switch (sum->sum_func()) {
+      case Item_sum::COUNT_FUNC: {
+        if (sum->argument_count() == 1) {
+          Item *arg = sum->get_arg(0)->real_item();
+          if (arg->const_item()) {
+            if (arg->is_nullable() || arg->is_null())
+              LDB_COL_REJECT("COUNT const nullable");
+          } else {
+            if (arg->type() != Item::FIELD_ITEM)
+              LDB_COL_REJECT("COUNT arg shape");
+            const Field *count_field = ResolveBaseField(
+                down_cast<Item_field *>(arg)->field, table);
+            if (count_field == nullptr || count_field->is_nullable())
+              LDB_COL_REJECT("COUNT arg nullable");
+          }
+        }
+
+        aggregate->set_kind(LineairDB::Protocol::AggFunc::AGG_COUNT);
+        break;
+      }
+
+      case Item_sum::SUM_FUNC: {
+        if (sum->argument_count() != 1) LDB_COL_REJECT("SUM arg count");
+        Item *arg = sum->get_arg(0)->real_item();
+        if (arg->result_type() != DECIMAL_RESULT &&
+            arg->result_type() != INT_RESULT) {
+          LDB_COL_REJECT("SUM arg type");
+        }
+
+        if (arg->type() == Item::FIELD_ITEM) {
+          const Field *sum_field = ResolveBaseField(
+              down_cast<Item_field *>(arg)->field, table);
+          if (sum_field == nullptr) LDB_COL_REJECT("SUM arg unresolvable");
+
+          auto *ref = aggregate->mutable_arg();
+          ref->set_op(LineairDB::Protocol::FilterExpr::COLUMN_REF);
+          ref->set_column_index(sum_field->field_index());
+        } else if (qb->group_list.elements == 0) {
+          if (!lineairdb::serialize_aggregate_expression(
+                  arg, aggregate->mutable_arg())) {
+            LDB_COL_REJECT("SUM expr not pushable");
+          }
+        } else {
+          LDB_COL_REJECT("SUM expr under GROUP BY");
+        }
+
+        aggregate->set_kind(LineairDB::Protocol::AggFunc::AGG_SUM);
+        break;
+      }
+
+      default:
+        LDB_COL_REJECT("aggregate kind unsupported");
+    }
+
+    ctx->bindings.push_back({true, spec.aggs_size() - 1});
+  }
+
+  if (spec.aggs_size() == 0) LDB_COL_REJECT("no aggregates");
+
+  ctx->table_name.assign(table->s->normalized_path.str);
+  ctx->group_column_count = spec.group_columns_size();
+  ctx->aggregate_count = spec.aggs_size();
+  if (where_cond != nullptr) {
+    predicate.SerializeToString(&ctx->serialized_filter);
+  }
+  spec.SerializeToString(&ctx->serialized_aggregate);
+
+  *why = nullptr;
+  return true;
+
+#undef LDB_COL_REJECT
+}
+
 bool PrepareSecondaryEngine(THD *thd, LEX *lex) {
   lex->add_statement_options(OPTION_NO_CONST_TABLES |
                              OPTION_NO_SUBQUERY_DURING_OPTIMIZATION);
@@ -177,9 +408,22 @@ bool PrepareSecondaryEngine(THD *thd, LEX *lex) {
 }
 
 bool OptimizeSecondaryEngine(THD *, LEX *lex) {
-  if (lex->secondary_engine_execution_context() == nullptr) {
+  auto *ctx = static_cast<ColumnarExecutionContext *>(
+      lex->secondary_engine_execution_context());
+  if (ctx == nullptr) {
     my_error(ER_SECONDARY_ENGINE_PLUGIN, MYF(0),
              "LINEAIRDB_COLUMNAR statement context is not available");
+    return true;
+  }
+
+  Query_block *query_block = lex->unit->first_query_block();
+  JOIN *join = query_block != nullptr ? query_block->join : nullptr;
+  const char *why = "no JOIN";
+  if (join == nullptr || !RecognizeSingleTableAggregate(join, ctx, &why)) {
+    char message[128];
+    snprintf(message, sizeof(message),
+             "LINEAIRDB_COLUMNAR unsupported shape: %s", why ? why : "?");
+    my_error(ER_SECONDARY_ENGINE_PLUGIN, MYF(0), message);
     return true;
   }
 
