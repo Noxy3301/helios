@@ -138,6 +138,7 @@ static ulong srv_server_port = 9999;
 static bool srv_prefetch_execution = false;
 // Non-static: read by LineairDBTransaction at begin (see lineairdb_transaction.cc)
 bool srv_prefetch_ro_novalidate = false;
+handlerton *lineairdb_hton;
 
 // THD-scoped context
 struct LineairDBThdCtx {
@@ -165,6 +166,17 @@ static void ensure_lineairdb_proxy(LineairDBThdCtx *&ctx) {
     ctx->proxy = std::make_shared<LineairDBProxy>(host, port);
   }
 }
+
+namespace lineairdb {
+
+std::shared_ptr<LineairDBProxy> acquire_shared_proxy(THD *thd) {
+  if (thd == nullptr || lineairdb_hton == nullptr) return nullptr;
+  LineairDBThdCtx *&ctx = lineairdb_thd_ctx(thd, lineairdb_hton);
+  ensure_lineairdb_proxy(ctx);
+  return ctx->proxy;
+}
+
+}  // namespace lineairdb
 
 static int lineairdb_commit(handlerton *hton, THD *thd, bool shouldCommit);
 static int lineairdb_abort(handlerton *hton, THD *thd, bool);
@@ -232,8 +244,6 @@ struct lineairdb_vars_t {
 static handler *lineairdb_create_handler(handlerton *hton, TABLE_SHARE *table,
                                          bool partitioned, MEM_ROOT *mem_root);
 
-handlerton *lineairdb_hton;
-
 /* Interface to mysqld, to check system tables supported by SE */
 static bool lineairdb_is_supported_system_table(const char *db,
                                                 const char *table_name,
@@ -250,7 +260,11 @@ static int lineairdb_init_func(void *p) {
   lineairdb_hton = (handlerton *)p;
   lineairdb_hton->state = SHOW_OPTION_YES;
   lineairdb_hton->create = lineairdb_create_handler;
-  lineairdb_hton->flags = HTON_CAN_RECREATE;
+  lineairdb_hton->flags =
+      HTON_CAN_RECREATE | HTON_SUPPORTS_SECONDARY_ENGINE;
+  // SECONDARY_LOAD/UNLOAD cleanup calls the primary engine's post_ddl hook.
+  // LineairDB has no post-DDL storage work here, but the hook must be present.
+  lineairdb_hton->post_ddl = [](THD *) {};
   lineairdb_hton->is_supported_system_table =
       lineairdb_is_supported_system_table;
   lineairdb_hton->db_type = DB_TYPE_UNKNOWN;
@@ -773,6 +787,10 @@ static SHOW_VAR func_status[] = {
      SHOW_SCOPE_GLOBAL},
     {nullptr, nullptr, SHOW_UNDEF, SHOW_SCOPE_UNDEF}};
 
+extern struct st_mysql_storage_engine lineairdb_columnar_storage_engine;
+extern int lineairdb_columnar_init(void *p);
+extern int lineairdb_columnar_deinit(void *p);
+
 mysql_declare_plugin(lineairdb){
     MYSQL_STORAGE_ENGINE_PLUGIN,
     &lineairdb_storage_engine,
@@ -788,4 +806,20 @@ mysql_declare_plugin(lineairdb){
     lineairdb_system_variables, /* system variables */
     nullptr,                    /* config options */
     0,                          /* flags */
+},
+{
+    MYSQL_STORAGE_ENGINE_PLUGIN,
+    &lineairdb_columnar_storage_engine,
+    "LINEAIRDB_COLUMNAR",
+    PLUGIN_AUTHOR_ORACLE,
+    "LineairDB columnar secondary engine",
+    PLUGIN_LICENSE_GPL,
+    lineairdb_columnar_init,   /* Plugin Init */
+    nullptr,                   /* Plugin check uninstall */
+    lineairdb_columnar_deinit, /* Plugin Deinit */
+    0x0001 /* 0.1 */,
+    nullptr, /* status variables */
+    nullptr, /* system variables */
+    nullptr, /* config options */
+    0,       /* flags */
 } mysql_declare_plugin_end;

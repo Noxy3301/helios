@@ -263,7 +263,9 @@ static bool make_aggregate_output_caches(JOIN *join,
  *
  * Supports column refs, integer constants, and +, -, *, and unary minus.
  */
-static bool serialize_aggregate_expression(
+namespace lineairdb {
+
+bool serialize_aggregate_expression(
     const Item *it, LineairDB::Protocol::FilterExpr *out) {
   switch (it->type()) {
     case Item::FIELD_ITEM: {
@@ -304,6 +306,8 @@ static bool serialize_aggregate_expression(
       return false;
   }
 }
+
+}  // namespace lineairdb
 
 /**
  * @brief Classify COUNT/SUM/AVG used by a supported HAVING predicate.
@@ -508,8 +512,8 @@ static bool build_grouped_aggregate_spec(
                               : LineairDB::Protocol::AggFunc::AGG_AVG);
       if (outputs[output].rtype != DECIMAL_RESULT ||
           outputs[output].arg == nullptr ||
-          !serialize_aggregate_expression(outputs[output].arg,
-                                          aggregate->mutable_arg())) {
+          !lineairdb::serialize_aggregate_expression(
+              outputs[output].arg, aggregate->mutable_arg())) {
         return false;
       }
     }
@@ -525,8 +529,8 @@ static bool build_grouped_aggregate_spec(
                               ? LineairDB::Protocol::AggFunc::AGG_SUM
                               : LineairDB::Protocol::AggFunc::AGG_AVG);
       if (having.result_type != DECIMAL_RESULT || having.arg == nullptr ||
-          !serialize_aggregate_expression(having.arg,
-                                          aggregate->mutable_arg())) {
+          !lineairdb::serialize_aggregate_expression(
+              having.arg, aggregate->mutable_arg())) {
         return false;
       }
     }
@@ -1007,7 +1011,8 @@ static bool execute_aggregate_override(JOIN *join, Query_result *query_result) {
                            : LineairDB::Protocol::AggFunc::AGG_AVG);
           // Server-side SUM/AVG supports exact decimal expressions only.
           if (outs[c].rtype != DECIMAL_RESULT || outs[c].arg == nullptr ||
-              !serialize_aggregate_expression(outs[c].arg, af->mutable_arg())) {
+              !lineairdb::serialize_aggregate_expression(outs[c].arg,
+                                                         af->mutable_arg())) {
             can_use_server_aggregation = false;
             break;
           }
