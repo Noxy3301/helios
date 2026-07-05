@@ -338,6 +338,26 @@ Item *CaseToCountFilter(Item *argument) {
   return predicate;
 }
 
+/**
+ * @brief Split SUM(CASE WHEN predicate THEN expression ELSE 0 END).
+ */
+bool CaseToFilteredSum(Item *argument, Item **predicate, Item **then_expr) {
+  if (argument->type() != Item::FUNC_ITEM) return false;
+  auto *function = down_cast<Item_func *>(argument);
+  if (function->functype() != Item_func::CASE_FUNC) return false;
+  if (function->argument_count() != 3) return false;
+
+  Item *condition = function->arguments()[0];
+  Item *value = function->arguments()[1];
+  Item *else_value = function->arguments()[2];
+  if (!IsBooleanFilterShape(condition)) return false;
+  if (!else_value->const_item() || else_value->val_int() != 0) return false;
+
+  *predicate = condition;
+  *then_expr = value;
+  return true;
+}
+
 struct QueryBlockTable {
   TABLE *table = nullptr;
   table_map map = 0;
@@ -1507,6 +1527,59 @@ bool RecognizeQueryBlock(JOIN *join, ColumnarExecutionContext *ctx,
               LDB_COL_REJECT("CASE filter not pushable");
             function->set_arg_table(static_cast<uint32_t>(filter_table));
             function->set_kind(LineairDB::Protocol::QueryBlockAggFunc::COUNT);
+            break;
+          }
+
+          Item *filter = nullptr;
+          Item *then_expr = nullptr;
+          if (CaseToFilteredSum(arg, &filter, &then_expr)) {
+            if (then_expr->result_type() != DECIMAL_RESULT &&
+                then_expr->result_type() != INT_RESULT) {
+              LDB_COL_REJECT("CASE expression type");
+            }
+
+            const int filter_table = SingleTableOf(
+                filter->used_tables() & ~PSEUDO_TABLE_BITS, tables);
+            if (filter_table < 0) LDB_COL_REJECT("CASE filter tables");
+            auto *predicate = function->mutable_filter();
+            predicate->set_num_columns(tables[filter_table].table->s->fields);
+            if (!serialize_item(filter, predicate->mutable_expr()))
+              LDB_COL_REJECT("CASE filter not pushable");
+
+            int argument_table = SingleTableOf(
+                then_expr->used_tables() & ~PSEUDO_TABLE_BITS, tables);
+            if (argument_table >= 0 &&
+                then_expr->real_item()->type() == Item::FIELD_ITEM) {
+              const Field *raw_argument_field =
+                  down_cast<Item_field *>(then_expr->real_item())->field;
+              const Field *argument_field = ResolveBaseField(
+                  raw_argument_field, tables[argument_table].table);
+              if (argument_field == nullptr)
+                LDB_COL_REJECT("CASE expression unresolvable");
+
+              auto *ref = function->mutable_arg();
+              ref->set_op(LineairDB::Protocol::FilterExpr::COLUMN_REF);
+              ref->set_column_index(argument_field->field_index());
+            } else if (argument_table >= 0) {
+              if (!lineairdb::serialize_aggregate_expression(
+                      then_expr->real_item(), function->mutable_arg())) {
+                LDB_COL_REJECT("CASE expression not pushable");
+              }
+            } else {
+              argument_table = 0;
+              if (!SerializeAggregateExpressionForTables(
+                      then_expr->real_item(), tables,
+                      static_cast<uint32_t>(argument_table),
+                      function->mutable_arg())) {
+                LDB_COL_REJECT("CASE expression not pushable");
+              }
+            }
+
+            function->set_arg_table(static_cast<uint32_t>(argument_table));
+            function->set_filter_table(static_cast<uint32_t>(filter_table));
+            function->set_kind(LineairDB::Protocol::QueryBlockAggFunc::SUM);
+            function->set_arg_scale(then_expr->decimals);
+            function->set_zero_if_empty(true);
             break;
           }
         }
