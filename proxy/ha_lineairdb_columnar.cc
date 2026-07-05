@@ -627,6 +627,9 @@ bool RecognizeQueryBlock(JOIN *join, ColumnarExecutionContext *ctx,
             if (count_field == nullptr || count_field->is_nullable())
               LDB_COL_REJECT("COUNT arg nullable");
             function->set_arg_table(static_cast<uint32_t>(count_table));
+            auto *ref = function->mutable_arg();
+            ref->set_op(LineairDB::Protocol::FilterExpr::COLUMN_REF);
+            ref->set_column_index(count_field->field_index());
           }
         }
 
