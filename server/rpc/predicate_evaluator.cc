@@ -72,6 +72,26 @@ bool PredicateEvaluator::parse_row(const char* data, size_t length,
   return field_index == total_fields;
 }
 
+bool PredicateEvaluator::set_row_from_pax(
+    const LineairDB::Pax::PaxGroup& group, uint32_t slot,
+    uint32_t num_columns) {
+  columns_.clear();
+  null_flags_.clear();
+
+  if (group.schema().field_count() < static_cast<size_t>(num_columns) + 1) {
+    return false;
+  }
+
+  const std::string_view null_flags = group.cell(0, slot);
+  null_flags_.assign(null_flags.data(), null_flags.size());
+
+  columns_.reserve(num_columns);
+  for (uint32_t i = 0; i < num_columns; ++i) {
+    columns_.push_back(group.cell(i + 1, slot));
+  }
+  return true;
+}
+
 // ---------------------------------------------------------------------------
 // Value extraction
 // ---------------------------------------------------------------------------

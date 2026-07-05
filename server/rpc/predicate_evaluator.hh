@@ -3,6 +3,8 @@
 
 #include "lineairdb.pb.h"
 
+#include <lineairdb/pax_store.h>
+
 #include <cstddef>
 #include <cstdint>
 #include <string>
@@ -25,6 +27,17 @@ class PredicateEvaluator {
   // byteSize == 0xFF means null/empty.
   // Returns false if the row is malformed.
   bool parse_row(const char* data, size_t length, uint32_t num_columns);
+
+  /**
+   * @brief Reads predicate inputs directly from a PAX row-group slot.
+   *
+   * The null-flags field is stored at PAX field 0, and MySQL column N is
+   * stored at PAX field N + 1.
+   *
+   * @return false when the PAX schema cannot contain the requested columns.
+   */
+  bool set_row_from_pax(const LineairDB::Pax::PaxGroup& group, uint32_t slot,
+                        uint32_t num_columns);
 
   // Recursively evaluate a FilterExpr tree against the parsed row.
   // Returns true if the row satisfies the predicate.
