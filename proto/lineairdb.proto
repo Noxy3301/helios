@@ -726,10 +726,19 @@ message QueryBlockColumnRef {
     uint32 prefix_len = 4;
 }
 
+// Runtime semi-filter: keep rows whose local column value appears in the key
+// set produced by an earlier query-block node.
+message QueryBlockSemiFilter {
+    uint32 source_node = 1;  // Node index, already executed.
+    QueryBlockColumnRef source_column = 2;
+    uint32 my_column = 3;    // Column of this scan's table.
+}
+
 message QueryBlockScan {
     uint32 table_idx = 1;
     // Fully pushed single-table predicates for this scan.
     PushedPredicate filter = 2;
+    QueryBlockSemiFilter semi = 3;
 }
 
 message QueryBlockTupleFilter {
@@ -788,6 +797,9 @@ message QueryBlockSortKey {
 // sub-block output ordinals, and refs are row numbers.
 message QueryBlockSubBlock {
     TxExecuteQueryBlock.Request block = 1;
+    QueryBlockSemiFilter semi = 2;
+    uint32 target_table = 3;
+    uint32 target_column = 4;
 }
 
 message QueryBlockNode {
