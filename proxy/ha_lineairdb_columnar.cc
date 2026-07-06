@@ -3513,6 +3513,54 @@ bool OptimizeSecondaryEngine(THD *, LEX *lex) {
   return false;
 }
 
+bool ModifyAccessPathCost(THD *thd [[maybe_unused]],
+                          const JoinHypergraph &hypergraph [[maybe_unused]],
+                          AccessPath *path) {
+  switch (path->type) {
+    case AccessPath::NESTED_LOOP_JOIN:
+    case AccessPath::BKA_JOIN:
+    case AccessPath::NESTED_LOOP_SEMIJOIN_WITH_DUPLICATE_REMOVAL:
+    case AccessPath::EQ_REF:
+    case AccessPath::REF:
+    case AccessPath::REF_OR_NULL:
+    case AccessPath::INDEX_SCAN:
+    case AccessPath::INDEX_RANGE_SCAN: {
+      constexpr double kPenalty = 100.0;
+      path->cost = std::max(path->cost, 0.0) * kPenalty + 1.0;
+      path->cost_before_filter = path->cost;
+      if (path->init_cost >= 0.0) path->init_cost *= kPenalty;
+      return false;
+    }
+
+    case AccessPath::HASH_JOIN: {
+      const double build =
+          std::max(1.0, path->hash_join().inner->num_output_rows());
+      const double probe =
+          std::max(1.0, path->hash_join().outer->num_output_rows());
+      const double output = std::max(1.0, path->num_output_rows());
+      const double cost = path->hash_join().outer->cost +
+                          path->hash_join().inner->cost +
+                          0.05 * (build + probe) + 0.01 * output;
+      path->cost = cost;
+      path->cost_before_filter = cost;
+      path->init_cost = path->hash_join().inner->cost + 0.05 * build;
+      return false;
+    }
+
+    case AccessPath::TABLE_SCAN: {
+      const double rows = std::max(1.0, path->num_output_rows());
+      const double cost = 0.01 * rows;
+      path->cost = cost;
+      path->cost_before_filter = cost;
+      path->init_cost = 0.0;
+      return false;
+    }
+
+    default:
+      return false;
+  }
+}
+
 bool CompareJoinCost(THD *thd, const JOIN &join, double optimizer_cost,
                      bool *use_best_so_far, bool *cheaper,
                      double *secondary_engine_cost) {
@@ -3658,6 +3706,8 @@ int lineairdb_columnar_init(void *p) {
   hton->prepare_secondary_engine = lineairdb_columnar::PrepareSecondaryEngine;
   hton->optimize_secondary_engine = lineairdb_columnar::OptimizeSecondaryEngine;
   hton->compare_secondary_engine_cost = lineairdb_columnar::CompareJoinCost;
+  hton->secondary_engine_modify_access_path_cost =
+      lineairdb_columnar::ModifyAccessPathCost;
   hton->get_secondary_engine_offload_or_exec_fail_reason =
       lineairdb_columnar::GetColumnarFailReason;
   hton->set_secondary_engine_offload_fail_reason =
