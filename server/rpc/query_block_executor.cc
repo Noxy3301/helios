@@ -338,7 +338,7 @@ class Executor {
     bool NullOf(uint32_t table_idx, uint64_t ref, uint32_t column) const {
         if (ref == kNullRowRef) return true;
         if (!IsVirtualTable(table_idx)) {
-            return IsNullColumn(ToRowRef(table_idx, ref), column);
+            return ValueOf(table_idx, ref, column).empty();
         }
 
         const VirtualTable* table = FindVirtualTable(table_idx);
@@ -364,16 +364,6 @@ class Executor {
         const int position = input.table_pos(table_idx);
         if (position < 0) return PaxRowRef{};
         return ToRowRef(table_idx, input.refs[position][row_idx]);
-    }
-
-    static bool IsNullColumn(const PaxRowRef& row, uint32_t column_idx) {
-        if (row.group == nullptr) return true;
-        const std::string_view null_flags = row.group->cell(0, row.slot);
-        const size_t byte_idx = column_idx / 8;
-        const uint32_t bit_idx = column_idx % 8;
-        return byte_idx < null_flags.size() &&
-               (static_cast<unsigned char>(null_flags[byte_idx]) &
-                (1u << bit_idx)) != 0;
     }
 
     static DecodedColumnRef DecodeAggregateColumnRef(
@@ -542,10 +532,9 @@ class Executor {
         const PaxGroup* group, uint32_t slot, uint32_t column,
         const std::unordered_set<std::string>* keys) {
         if (keys == nullptr) return true;
-        if (group == nullptr || IsNullColumn(PaxRowRef{group, slot}, column)) {
-            return false;
-        }
+        if (group == nullptr) return false;
         const std::string_view value = group->cell(column + 1, slot);
+        if (value.empty()) return false;
         return keys->find(std::string(value)) != keys->end();
     }
 
@@ -922,9 +911,9 @@ class Executor {
         key->clear();
         for (const JoinKeyColumn& column : key_columns) {
             const uint64_t ref = input.refs[column.ref_position][row_idx];
-            // SQL equijoins are null-rejecting, while an empty non-NULL string
-            // is still a valid key part. Use the null bitmap instead of the
-            // value bytes so hash joins match the scan semi-filter semantics.
+            // SQL equijoins are null-rejecting. Real PAX cells encode NULL as
+            // an empty cell, so empty key parts never match, mirroring the
+            // scan semi-filter semantics.
             if (NullOf(column.table_idx, ref, column.column)) return false;
             AppendJoinKeyPart(key,
                               ValueOf(column.table_idx, ref, column.column));
