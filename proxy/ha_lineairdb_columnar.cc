@@ -21,6 +21,7 @@
 #include "sql/handler.h"
 #include "sql/item.h"
 #include "sql/item_cmpfunc.h"
+#include "sql/item_subselect.h"
 #include "sql/item_sum.h"
 #include "sql/item_timefunc.h"
 #include "sql/join_optimizer/access_path.h"
@@ -4028,6 +4029,21 @@ bool CompareJoinCost(THD *thd, const JOIN &join, double optimizer_cost,
                      double *secondary_engine_cost) {
   *use_best_so_far = false;
   *secondary_engine_cost = optimizer_cost;
+
+  // A quantified subquery (IN/ALL/ANY) that survives to the secondary
+  // optimization pass reaches subquery-materialization costing, which
+  // crashes on plans produced for secondary tables. Antijoin and derived
+  // rewrites are unavailable on this pass for such shapes (nullable NOT IN),
+  // so reject them here, before the costing runs. EXISTS and scalar
+  // subqueries resolve to the EXISTS strategy and never reach that costing.
+  const Item_subselect *subquery_item = join.query_expression()->item;
+  if (subquery_item != nullptr &&
+      (subquery_item->substype() == Item_subselect::IN_SUBS ||
+       subquery_item->substype() == Item_subselect::ALL_SUBS ||
+       subquery_item->substype() == Item_subselect::ANY_SUBS)) {
+    return RaiseColumnarError(
+        thd, "LINEAIRDB_COLUMNAR unsupported shape: quantified subquery");
+  }
 
   auto *ctx = static_cast<ColumnarExecutionContext *>(
       thd->lex->secondary_engine_execution_context());
