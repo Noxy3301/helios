@@ -1889,6 +1889,135 @@ bool BuildQueryBlockRequest(
       return true;
     };
 
+    auto emit_mapped_join =
+        [&](LineairDB::Protocol::QueryBlockJoin::Type join_type, int probe,
+            int build, RelationalExpression *expression,
+            const std::vector<Item *> &extra_residuals,
+            double output_rows) -> int {
+      if (expression == nullptr) {
+        *why = "plan join without predicate";
+        return -1;
+      }
+
+      auto *join_node = request.add_nodes()->mutable_join();
+      const int self = request.nodes_size() - 1;
+      join_node->set_type(join_type);
+      join_node->set_build(static_cast<uint32_t>(build));
+      join_node->set_probe(static_cast<uint32_t>(probe));
+
+      for (Item_eq_base *eq : expression->equijoin_conditions) {
+        if (eq->functype() != Item_func::EQ_FUNC) {
+          *why = "plan join key null-safe eq";
+          return -1;
+        }
+
+        Item *left_item = eq->get_arg(0)->real_item();
+        Item *right_item = eq->get_arg(1)->real_item();
+        if (left_item->type() != Item::FIELD_ITEM ||
+            right_item->type() != Item::FIELD_ITEM) {
+          *why = "plan join key shape";
+          return -1;
+        }
+
+        const Field *left_raw = down_cast<Item_field *>(left_item)->field;
+        const Field *right_raw = down_cast<Item_field *>(right_item)->field;
+        int left_table = TableIndexOfField(left_raw, tables);
+        int right_table = TableIndexOfField(right_raw, tables);
+        if (left_table < 0 || right_table < 0) {
+          *why = "plan join key table";
+          return -1;
+        }
+        if (!JoinColumnsUseByteEquality(left_raw, right_raw)) {
+          *why = "plan join key type";
+          return -1;
+        }
+
+        const Field *left_field = resolve_query_field(left_raw, left_table);
+        const Field *right_field =
+            resolve_query_field(right_raw, right_table);
+        if (left_field == nullptr || right_field == nullptr) {
+          *why = "plan join key resolve";
+          return -1;
+        }
+        if ((!table_is_virtual[left_table] && left_field->is_nullable()) ||
+            (!table_is_virtual[right_table] && right_field->is_nullable())) {
+          *why = "plan join key nullable";
+          return -1;
+        }
+
+        if (node_tables[build].count(left_table) > 0 &&
+            node_tables[probe].count(right_table) > 0) {
+          // left stays on the build side and right stays on the probe side.
+        } else if (node_tables[build].count(right_table) > 0 &&
+                   node_tables[probe].count(left_table) > 0) {
+          std::swap(left_table, right_table);
+          std::swap(left_field, right_field);
+        } else {
+          *why = "plan join key sides";
+          return -1;
+        }
+
+        auto *build_key = join_node->add_build_keys();
+        build_key->set_table_idx(static_cast<uint32_t>(left_table));
+        build_key->set_column(left_field->field_index());
+        auto *probe_key = join_node->add_probe_keys();
+        probe_key->set_table_idx(static_cast<uint32_t>(right_table));
+        probe_key->set_column(right_field->field_index());
+        mapped_join_keys.push_back(
+            {join_type, build, probe, static_cast<uint32_t>(left_table),
+             left_field->field_index(), static_cast<uint32_t>(right_table),
+             right_field->field_index()});
+      }
+
+      std::vector<Item *> residuals;
+      for (Item *condition : expression->join_conditions) {
+        residuals.push_back(condition);
+      }
+      residuals.insert(residuals.end(), extra_residuals.begin(),
+                       extra_residuals.end());
+      if (!residuals.empty()) {
+        for (Item *residual : residuals) {
+          const table_map used = residual->used_tables() & ~PSEUDO_TABLE_BITS;
+          for (size_t table_idx = 0; table_idx < tables.size(); table_idx++) {
+            if ((used & tables[table_idx].map) != 0 &&
+                node_tables[probe].count(static_cast<int>(table_idx)) == 0 &&
+                node_tables[build].count(static_cast<int>(table_idx)) == 0) {
+              *why = "plan join residual out of scope";
+              return -1;
+            }
+          }
+        }
+        if (!fill_tuple_filter(residuals, join_node->mutable_residual())) {
+          *why = "plan join residual not pushable";
+          return -1;
+        }
+      }
+
+      if (join_node->build_keys_size() == 0) {
+        bool build_is_one_row = true;
+        for (int table_idx : node_tables[build]) {
+          if (!is_scalar_virtual_table(table_idx)) {
+            build_is_one_row = false;
+            break;
+          }
+        }
+        if (!build_is_one_row) {
+          *why = "plan keyless join";
+          return -1;
+        }
+      }
+
+      std::set<int> output_tables = node_tables[probe];
+      if (join_type == LineairDB::Protocol::QueryBlockJoin::INNER ||
+          join_type == LineairDB::Protocol::QueryBlockJoin::LEFT) {
+        output_tables.insert(node_tables[build].begin(),
+                             node_tables[build].end());
+      }
+      node_tables[self] = std::move(output_tables);
+      node_rows[self] = output_rows;
+      return self;
+    };
+
     std::function<int(AccessPath *, bool)> map_path =
         [&](AccessPath *path, bool root) -> int {
       if (path == nullptr) {
@@ -2045,128 +2174,9 @@ bool BuildQueryBlockRequest(
                 return -1;
             }
           }
-
-          auto *join_node = request.add_nodes()->mutable_join();
-          const int self = request.nodes_size() - 1;
-          join_node->set_type(join_type);
-          join_node->set_build(static_cast<uint32_t>(build));
-          join_node->set_probe(static_cast<uint32_t>(probe));
-
-          for (Item_eq_base *eq : expression->equijoin_conditions) {
-            if (eq->functype() != Item_func::EQ_FUNC) {
-              *why = "plan join key null-safe eq";
-              return -1;
-            }
-
-            Item *left_item = eq->get_arg(0)->real_item();
-            Item *right_item = eq->get_arg(1)->real_item();
-            if (left_item->type() != Item::FIELD_ITEM ||
-                right_item->type() != Item::FIELD_ITEM) {
-              *why = "plan join key shape";
-              return -1;
-            }
-
-            const Field *left_raw = down_cast<Item_field *>(left_item)->field;
-            const Field *right_raw = down_cast<Item_field *>(right_item)->field;
-            int left_table = TableIndexOfField(left_raw, tables);
-            int right_table = TableIndexOfField(right_raw, tables);
-            if (left_table < 0 || right_table < 0) {
-              *why = "plan join key table";
-              return -1;
-            }
-            if (!JoinColumnsUseByteEquality(left_raw, right_raw)) {
-              *why = "plan join key type";
-              return -1;
-            }
-
-            const Field *left_field =
-                resolve_query_field(left_raw, left_table);
-            const Field *right_field =
-                resolve_query_field(right_raw, right_table);
-            if (left_field == nullptr || right_field == nullptr) {
-              *why = "plan join key resolve";
-              return -1;
-            }
-            if ((!table_is_virtual[left_table] && left_field->is_nullable()) ||
-                (!table_is_virtual[right_table] &&
-                 right_field->is_nullable())) {
-              *why = "plan join key nullable";
-              return -1;
-            }
-
-            if (node_tables[build].count(left_table) > 0 &&
-                node_tables[probe].count(right_table) > 0) {
-              // left stays on the build side and right stays on the probe side.
-            } else if (node_tables[build].count(right_table) > 0 &&
-                       node_tables[probe].count(left_table) > 0) {
-              std::swap(left_table, right_table);
-              std::swap(left_field, right_field);
-            } else {
-              *why = "plan join key sides";
-              return -1;
-            }
-
-            auto *build_key = join_node->add_build_keys();
-            build_key->set_table_idx(static_cast<uint32_t>(left_table));
-            build_key->set_column(left_field->field_index());
-            auto *probe_key = join_node->add_probe_keys();
-            probe_key->set_table_idx(static_cast<uint32_t>(right_table));
-            probe_key->set_column(right_field->field_index());
-            mapped_join_keys.push_back(
-                {join_type, build, probe, static_cast<uint32_t>(left_table),
-                 left_field->field_index(), static_cast<uint32_t>(right_table),
-                 right_field->field_index()});
-          }
-
-          if (!expression->join_conditions.empty()) {
-            std::vector<Item *> residuals;
-            for (Item *condition : expression->join_conditions) {
-              residuals.push_back(condition);
-            }
-            for (Item *residual : residuals) {
-              const table_map used =
-                  residual->used_tables() & ~PSEUDO_TABLE_BITS;
-              for (size_t table_idx = 0; table_idx < tables.size();
-                   table_idx++) {
-                if ((used & tables[table_idx].map) != 0 &&
-                    node_tables[probe].count(static_cast<int>(table_idx)) ==
-                        0 &&
-                    node_tables[build].count(static_cast<int>(table_idx)) ==
-                        0) {
-                  *why = "plan join residual out of scope";
-                  return -1;
-                }
-              }
-            }
-            if (!fill_tuple_filter(residuals, join_node->mutable_residual())) {
-              *why = "plan join residual not pushable";
-              return -1;
-            }
-          }
-
-          if (join_node->build_keys_size() == 0) {
-            bool build_is_one_row = true;
-            for (int table_idx : node_tables[build]) {
-              if (!is_scalar_virtual_table(table_idx)) {
-                build_is_one_row = false;
-                break;
-              }
-            }
-            if (!build_is_one_row) {
-              *why = "plan keyless join";
-              return -1;
-            }
-          }
-
-          std::set<int> output_tables = node_tables[probe];
-          if (join_type == LineairDB::Protocol::QueryBlockJoin::INNER ||
-              join_type == LineairDB::Protocol::QueryBlockJoin::LEFT) {
-            output_tables.insert(node_tables[build].begin(),
-                                 node_tables[build].end());
-          }
-          node_tables[self] = std::move(output_tables);
-          node_rows[self] = estimated_rows(path);
-          return self;
+          return emit_mapped_join(join_type, probe, build, expression,
+                                  std::vector<Item *>{},
+                                  estimated_rows(path));
         }
 
         case AccessPath::MATERIALIZE: {
