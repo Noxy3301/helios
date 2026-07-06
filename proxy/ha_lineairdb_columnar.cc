@@ -1953,8 +1953,10 @@ bool BuildQueryBlockRequest(
       if (!is_join_key) residual_predicates.push_back(predicate);
     }
 
-    if (join_node->build_keys_size() == 0)
+    if (join_node->build_keys_size() == 0 &&
+        !is_scalar_virtual_table(table_idx)) {
       LDB_COL_REJECT("derived LEFT keyless");
+    }
 
     if (!residual_predicates.empty()) {
       TupleColumnRegistry registry;
