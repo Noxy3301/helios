@@ -24,6 +24,7 @@
 #include "sql/item_sum.h"
 #include "sql/item_timefunc.h"
 #include "sql/join_optimizer/access_path.h"
+#include "sql/join_optimizer/materialize_path_parameters.h"
 #include "sql/join_optimizer/relational_expression.h"
 #include "sql/mem_root_array.h"
 #include "sql/nested_join.h"
@@ -1817,6 +1818,8 @@ bool BuildQueryBlockRequest(
   int current_node = -1;
   if (plan_map) {
     std::map<int, std::set<int>> node_tables;
+    size_t next_virtual_table = real_table_count;
+
     std::set<const Item *> having_predicates;
     if (qb->having_cond() != nullptr) {
       std::vector<Item *> having_parts;
@@ -2123,6 +2126,56 @@ bool BuildQueryBlockRequest(
           }
           node_tables[self] = std::move(output_tables);
           return self;
+        }
+
+        case AccessPath::MATERIALIZE: {
+          if (path->materialize().param == nullptr ||
+              path->materialize().param->table == nullptr) {
+            *why = "plan derived missing table";
+            return -1;
+          }
+
+          const TABLE *table = path->materialize().param->table;
+          int table_idx = -1;
+          for (size_t i = real_table_count; i < tables.size(); i++) {
+            if (tables[i].table == table) {
+              table_idx = static_cast<int>(i);
+              break;
+            }
+          }
+          if (table_idx < 0) {
+            *why = "plan derived unknown";
+            return -1;
+          }
+
+          if (scan_nodes[table_idx] < 0) {
+            if (static_cast<size_t>(table_idx) != next_virtual_table) {
+              *why = "plan derived order";
+              return -1;
+            }
+            next_virtual_table++;
+
+            auto *sub_block = request.add_nodes()->mutable_sub_block();
+            AccessPath *sub_plan =
+                path->materialize().param->query_blocks.empty()
+                    ? nullptr
+                    : path->materialize()
+                          .param->query_blocks[0]
+                          .subquery_path;
+            if (!BuildQueryBlockRequest(
+                    nullptr,
+                    virtual_blocks[table_idx - real_table_count],
+                    sub_block->mutable_block(), why, sub_plan) &&
+                !BuildQueryBlockRequest(
+                    nullptr,
+                    virtual_blocks[table_idx - real_table_count],
+                    sub_block->mutable_block(), why, nullptr)) {
+              return -1;
+            }
+            scan_nodes[table_idx] = request.nodes_size() - 1;
+            node_tables[scan_nodes[table_idx]] = {table_idx};
+          }
+          return scan_nodes[table_idx];
         }
 
         case AccessPath::SORT:
