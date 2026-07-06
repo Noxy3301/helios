@@ -1821,6 +1821,13 @@ bool BuildQueryBlockRequest(
     std::map<int, double> node_rows;
     size_t next_virtual_table = real_table_count;
 
+    // Missing optimizer row estimates are treated as huge so they cannot pass
+    // small-side guards or win semi-filter source selection.
+    constexpr double kUnknownRowEstimate = 1e30;
+    // Keyless INNER joins are cross products. Allow them only when one side is
+    // clearly small; larger shapes stay rejected.
+    constexpr double kTinyKeylessInnerJoinRows = 100.0;
+
     struct MappedJoinKey {
       LineairDB::Protocol::QueryBlockJoin::Type join_type;
       int build_node = -1;
@@ -2001,7 +2008,16 @@ bool BuildQueryBlockRequest(
             break;
           }
         }
-        if (!build_is_one_row) {
+        const double probe_rows =
+            node_rows.count(probe) != 0 ? node_rows[probe]
+                                        : kUnknownRowEstimate;
+        const double build_rows =
+            node_rows.count(build) != 0 ? node_rows[build]
+                                        : kUnknownRowEstimate;
+        const bool tiny_inner_join =
+            join_type == LineairDB::Protocol::QueryBlockJoin::INNER &&
+            std::min(probe_rows, build_rows) <= kTinyKeylessInnerJoinRows;
+        if (!build_is_one_row && !tiny_inner_join) {
           *why = "plan keyless join";
           return -1;
         }
@@ -2357,7 +2373,8 @@ bool BuildQueryBlockRequest(
               }
               const auto rows_it = node_rows.find(partner_node);
               consider(partner_node,
-                       rows_it == node_rows.end() ? 1e30 : rows_it->second,
+                       rows_it == node_rows.end() ? kUnknownRowEstimate
+                                                  : rows_it->second,
                        key_source_table, key_source_column,
                        key_target_column);
             };

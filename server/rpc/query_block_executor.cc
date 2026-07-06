@@ -941,7 +941,7 @@ class Executor {
             return fail("join key arity");
         }
         // Keyless INNER and LEFT joins are cross products. The proxy only emits
-        // them for one-row virtual inputs, where the SQL shape is explicit.
+        // them for small INNER inputs or one-row virtual LEFT inputs.
         if (join.build_keys_size() == 0 && !is_inner && !is_left) {
             return fail("join key arity");
         }
