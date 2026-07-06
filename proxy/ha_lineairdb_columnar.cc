@@ -481,6 +481,44 @@ bool SerializeAggregateExpressionForTables(
   }
 }
 
+struct TupleColumnRegistry {
+  std::vector<std::pair<int, const Field *>> columns;
+  std::function<int(const Field *)> table_of;
+  std::function<const Field *(const Field *, int)> resolve;
+
+  int ordinal_of(const Field *raw_field) {
+    const int table_idx = table_of(raw_field);
+    if (table_idx < 0) return -1;
+
+    const Field *field = resolve(raw_field, table_idx);
+    if (field == nullptr) return -1;
+
+    for (size_t column_idx = 0; column_idx < columns.size(); column_idx++) {
+      if (columns[column_idx].first == table_idx &&
+          columns[column_idx].second == field) {
+        return static_cast<int>(column_idx);
+      }
+    }
+    columns.push_back({table_idx, field});
+    return static_cast<int>(columns.size()) - 1;
+  }
+};
+
+/**
+ * @brief Serialize a predicate over an already joined tuple.
+ */
+bool SerializeTuplePredicate(Item *item,
+                             LineairDB::Protocol::FilterExpr *expression,
+                             TupleColumnRegistry *registry) {
+  SerializeColumnEncoder encoder = [registry](const Field *field) {
+    return registry->ordinal_of(field);
+  };
+  set_serialize_column_encoder(&encoder);
+  const bool ok = serialize_item(item, expression);
+  set_serialize_column_encoder(nullptr);
+  return ok;
+}
+
 /**
  * @brief Return the date field inside EXTRACT(YEAR FROM field), if supported.
  */
@@ -1230,13 +1268,15 @@ bool RecognizeQueryBlock(JOIN *join, ColumnarExecutionContext *ctx,
 
   std::vector<std::vector<Item *>> table_filters(tables.size());
   std::vector<JoinEdge> join_edges;
+  std::vector<Item *> tuple_predicates;
   Item *where_cond =
       qb->where_cond() != nullptr ? qb->where_cond() : join->where_cond;
   std::vector<Item *> predicates;
   FlattenAnd(where_cond, &predicates);
 
   // Local predicates become scan filters. Cross-table integer equalities become
-  // join edges; other cross-table shapes stay on the primary engine path.
+  // join edges. Other cross-table predicates are evaluated after the join as
+  // tuple filters.
   for (Item *predicate : predicates) {
     const table_map used = predicate->used_tables() & ~PSEUDO_TABLE_BITS;
     const int table_idx = SingleTableOf(used, tables);
@@ -1249,9 +1289,87 @@ bool RecognizeQueryBlock(JOIN *join, ColumnarExecutionContext *ctx,
       continue;
     }
 
+    if (predicate->type() == Item::COND_ITEM &&
+        down_cast<Item_cond *>(predicate)->functype() ==
+            Item_func::COND_OR_FUNC) {
+      auto *condition = down_cast<Item_cond *>(predicate);
+      std::vector<std::vector<std::pair<const Field *, const Field *>>>
+          branch_equalities;
+      List_iterator<Item> branch_it(*condition->argument_list());
+      for (Item *branch = branch_it++; branch != nullptr;
+           branch = branch_it++) {
+        std::vector<Item *> branch_parts;
+        FlattenAnd(branch, &branch_parts);
+        branch_equalities.emplace_back();
+        for (Item *part : branch_parts) {
+          if (part->type() != Item::FUNC_ITEM ||
+              down_cast<Item_func *>(part)->functype() !=
+                  Item_func::EQ_FUNC) {
+            continue;
+          }
+          auto *equals = down_cast<Item_func *>(part);
+          Item *left = equals->arguments()[0]->real_item();
+          Item *right = equals->arguments()[1]->real_item();
+          if (left->type() != Item::FIELD_ITEM ||
+              right->type() != Item::FIELD_ITEM) {
+            continue;
+          }
+          branch_equalities.back().push_back(
+              {down_cast<Item_field *>(left)->field,
+               down_cast<Item_field *>(right)->field});
+        }
+      }
+
+      if (!branch_equalities.empty()) {
+        for (const auto &candidate : branch_equalities[0]) {
+          bool appears_in_all_branches = true;
+          for (size_t branch_idx = 1;
+               branch_idx < branch_equalities.size() &&
+               appears_in_all_branches;
+               branch_idx++) {
+            bool found = false;
+            for (const auto &other : branch_equalities[branch_idx]) {
+              if ((other.first == candidate.first &&
+                   other.second == candidate.second) ||
+                  (other.first == candidate.second &&
+                   other.second == candidate.first)) {
+                found = true;
+                break;
+              }
+            }
+            appears_in_all_branches = found;
+          }
+          if (!appears_in_all_branches) continue;
+
+          const int left_table = TableIndexOfField(candidate.first, tables);
+          const int right_table = TableIndexOfField(candidate.second, tables);
+          if (left_table < 0 || right_table < 0 ||
+              left_table == right_table) {
+            continue;
+          }
+          if (candidate.first->result_type() != INT_RESULT ||
+              candidate.second->result_type() != INT_RESULT) {
+            continue;
+          }
+
+          const Field *left_field =
+              ResolveBaseField(candidate.first, tables[left_table].table);
+          const Field *right_field =
+              ResolveBaseField(candidate.second, tables[right_table].table);
+          if (left_field == nullptr || right_field == nullptr) continue;
+          join_edges.push_back(
+              {left_table, right_table, left_field, right_field});
+        }
+      }
+
+      tuple_predicates.push_back(predicate);
+      continue;
+    }
+
     if (predicate->type() != Item::FUNC_ITEM ||
         down_cast<Item_func *>(predicate)->functype() != Item_func::EQ_FUNC) {
-      LDB_COL_REJECT("non-equi join predicate");
+      tuple_predicates.push_back(predicate);
+      continue;
     }
     auto *equals = down_cast<Item_func *>(predicate);
     Item *left = equals->arguments()[0]->real_item();
@@ -1367,6 +1485,46 @@ bool RecognizeQueryBlock(JOIN *join, ColumnarExecutionContext *ctx,
 
     if (!connected) LDB_COL_REJECT("disconnected join graph");
     joined[table_idx] = true;
+    current_node = request.nodes_size() - 1;
+  }
+
+  if (!tuple_predicates.empty()) {
+    auto *filter_node = request.add_nodes()->mutable_filter();
+    filter_node->set_input(static_cast<uint32_t>(current_node));
+    auto *tuple_filter = filter_node->mutable_filter();
+
+    TupleColumnRegistry registry;
+    registry.table_of = [&](const Field *field) {
+      return TableIndexOfField(field, tables);
+    };
+    registry.resolve = [&](const Field *field, int table_idx) {
+      return ResolveBaseField(field, tables[table_idx].table);
+    };
+
+    auto *predicate = tuple_filter->mutable_predicate();
+    auto *expression = predicate->mutable_expr();
+    if (tuple_predicates.size() == 1) {
+      if (!SerializeTuplePredicate(tuple_predicates[0], expression,
+                                   &registry)) {
+        LDB_COL_REJECT("tuple predicate not pushable");
+      }
+    } else {
+      expression->set_op(LineairDB::Protocol::FilterExpr::OP_AND);
+      for (Item *tuple_predicate : tuple_predicates) {
+        if (!SerializeTuplePredicate(tuple_predicate,
+                                     expression->add_children(),
+                                     &registry)) {
+          LDB_COL_REJECT("tuple predicate not pushable");
+        }
+      }
+    }
+
+    predicate->set_num_columns(registry.columns.size());
+    for (const auto &column_ref : registry.columns) {
+      auto *column = tuple_filter->add_columns();
+      column->set_table_idx(static_cast<uint32_t>(column_ref.first));
+      column->set_column(column_ref.second->field_index());
+    }
     current_node = request.nodes_size() - 1;
   }
 
