@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <charconv>
 #include <cstdint>
 #include <exception>
 #include <limits>
@@ -35,6 +36,30 @@ constexpr uint32_t kNoExternalFilterTable =
     std::numeric_limits<uint32_t>::max();
 constexpr uint32_t kTaggedColumnShift = 16;
 constexpr uint32_t kTaggedColumnMask = (uint32_t{1} << kTaggedColumnShift) - 1;
+
+bool parse_int64_cell(std::string_view value, int64_t* parsed) {
+    if (parsed == nullptr || value.empty()) return false;
+    const char* first = value.data();
+    const char* last = value.data() + value.size();
+    const auto result = std::from_chars(first, last, *parsed);
+    return result.ec == std::errc() && result.ptr == last;
+}
+
+bool build_int64_key_set(const std::unordered_set<std::string>& source,
+                         std::unordered_set<int64_t>* target) {
+    if (target == nullptr) return false;
+    target->clear();
+    target->reserve(source.size());
+    for (const std::string& key : source) {
+        int64_t parsed = 0;
+        if (!parse_int64_cell(key, &parsed)) {
+            target->clear();
+            return false;
+        }
+        target->insert(parsed);
+    }
+    return true;
+}
 
 void set_failure(pb::TxExecuteQueryBlock::Response* response,
                  const std::string& message) {
@@ -530,11 +555,17 @@ class Executor {
 
     static bool CellMatchesKeySet(
         const PaxGroup* group, uint32_t slot, uint32_t column,
-        const std::unordered_set<std::string>* keys) {
+        const std::unordered_set<std::string>* keys,
+        const std::unordered_set<int64_t>* int_keys) {
         if (keys == nullptr) return true;
         if (group == nullptr) return false;
         const std::string_view value = group->cell(column + 1, slot);
         if (value.empty()) return false;
+        if (int_keys != nullptr) {
+            int64_t parsed = 0;
+            return parse_int64_cell(value, &parsed) &&
+                   int_keys->find(parsed) != int_keys->end();
+        }
         return keys->find(std::string(value)) != keys->end();
     }
 
@@ -566,6 +597,18 @@ class Executor {
             external_filter_table_ == scan.table_idx() &&
             external_keys_->size() <= kMaxRuntimeFilterKeys) {
             external_keys = external_keys_;
+        }
+        std::unordered_set<int64_t> semi_int_keys_storage;
+        const std::unordered_set<int64_t>* semi_int_keys = nullptr;
+        if (semi_keys != nullptr &&
+            build_int64_key_set(*semi_keys, &semi_int_keys_storage)) {
+            semi_int_keys = &semi_int_keys_storage;
+        }
+        std::unordered_set<int64_t> external_int_keys_storage;
+        const std::unordered_set<int64_t>* external_int_keys = nullptr;
+        if (external_keys != nullptr &&
+            build_int64_key_set(*external_keys, &external_int_keys_storage)) {
+            external_int_keys = &external_int_keys_storage;
         }
 
         const bool has_filter = scan.has_filter() && scan.filter().has_expr();
@@ -603,12 +646,12 @@ class Executor {
                             const uint32_t slot = base + bit;
                             if (!CellMatchesKeySet(
                                     group, slot, scan.semi().my_column(),
-                                    semi_keys)) {
+                                    semi_keys, semi_int_keys)) {
                                 continue;
                             }
                             if (!CellMatchesKeySet(
                                     group, slot, external_filter_column_,
-                                    external_keys)) {
+                                    external_keys, external_int_keys)) {
                                 continue;
                             }
                             if (has_filter) {
