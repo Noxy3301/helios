@@ -714,6 +714,8 @@ message QueryBlockAggFunc {
     // arg_table when the filter and aggregate argument come from different
     // joined tables.
     uint32 filter_table = 8;
+    // COUNT(DISTINCT col): count distinct non-NULL cell values per group.
+    bool distinct = 9;
 }
 
 message QueryBlockColumnRef {

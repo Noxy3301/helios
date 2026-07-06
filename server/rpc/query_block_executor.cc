@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <exception>
 #include <limits>
+#include <set>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -1080,6 +1081,7 @@ class Executor {
         std::vector<DecimalValue> decimals;
         std::vector<std::string> strings;
         std::vector<bool> has_value;
+        std::vector<std::set<std::string>> distinct_values;
     };
 
     struct OutputRow {
@@ -1206,6 +1208,7 @@ class Executor {
                 new_state.decimals.assign(aggregate_count, DecimalValue{});
                 new_state.strings.assign(aggregate_count, {});
                 new_state.has_value.assign(aggregate_count, false);
+                new_state.distinct_values.resize(aggregate_count);
                 state = &groups->emplace(std::move(key_buffer),
                                          std::move(new_state))
                              .first->second;
@@ -1246,6 +1249,17 @@ class Executor {
 
                 switch (function.kind()) {
                     case pb::QueryBlockAggFunc::COUNT:
+                        if (function.distinct()) {
+                            if (!function.has_arg() || !has_arg_row) break;
+                            std::string_view value;
+                            if (ReadAggregateColumn(
+                                    function.arg(), input, row_idx,
+                                    function.arg_table(), &value)) {
+                                state->distinct_values[aggregate_idx].emplace(
+                                    value);
+                            }
+                            break;
+                        }
                         if (function.has_arg() && !has_arg_row) break;
                         state->counts[aggregate_idx] += 1;
                         break;
@@ -1332,6 +1346,12 @@ class Executor {
                     aggregate.aggs(aggregate_idx);
                 switch (function.kind()) {
                     case pb::QueryBlockAggFunc::COUNT:
+                        if (function.distinct()) {
+                            destination_state.distinct_values[aggregate_idx]
+                                .merge(source_state
+                                           .distinct_values[aggregate_idx]);
+                            break;
+                        }
                         destination_state.counts[aggregate_idx] +=
                             source_state.counts[aggregate_idx];
                         break;
@@ -1393,7 +1413,10 @@ class Executor {
         *is_null = false;
         switch (function.kind()) {
             case pb::QueryBlockAggFunc::COUNT:
-                return std::to_string(state.counts[aggregate_idx]);
+                return std::to_string(
+                    function.distinct()
+                        ? state.distinct_values[aggregate_idx].size()
+                        : state.counts[aggregate_idx]);
             case pb::QueryBlockAggFunc::SUM:
                 if (state.counts[aggregate_idx] == 0) {
                     if (function.zero_if_empty()) {
@@ -1774,7 +1797,51 @@ class Executor {
             state.decimals.assign(aggregate.aggs_size(), DecimalValue{});
             state.strings.assign(aggregate.aggs_size(), {});
             state.has_value.assign(aggregate.aggs_size(), false);
+            state.distinct_values.resize(aggregate.aggs_size());
             groups.emplace(std::string(), std::move(state));
+        }
+
+        // HAVING predicates read the first-stage aggregate row layout:
+        // group values first, then aggregate values.
+        if (aggregate.has_having() && aggregate.having().has_expr()) {
+            PredicateEvaluator evaluator;
+            std::vector<std::string> values;
+            std::vector<std::string_view> cells;
+            std::vector<bool> nulls;
+            for (auto group_it = groups.begin(); group_it != groups.end();) {
+                const GroupState& state = group_it->second;
+                values.clear();
+                cells.clear();
+                nulls.clear();
+                values.reserve(group_count + aggregate.aggs_size());
+                cells.reserve(group_count + aggregate.aggs_size());
+                nulls.reserve(group_count + aggregate.aggs_size());
+
+                for (int group_idx = 0; group_idx < group_count;
+                     ++group_idx) {
+                    values.push_back(state.keys[group_idx]);
+                    nulls.push_back(false);
+                }
+                for (int aggregate_idx = 0;
+                     aggregate_idx < aggregate.aggs_size();
+                     ++aggregate_idx) {
+                    bool is_null = false;
+                    values.push_back(AggregateValue(
+                        aggregate.aggs(aggregate_idx), state,
+                        aggregate_idx, &is_null));
+                    nulls.push_back(is_null);
+                }
+                for (const std::string& value : values) {
+                    cells.push_back(value);
+                }
+
+                evaluator.set_row_from_views(cells, nulls);
+                if (evaluator.evaluate(aggregate.having().expr())) {
+                    ++group_it;
+                } else {
+                    group_it = groups.erase(group_it);
+                }
+            }
         }
 
         std::vector<OutputRow> output_rows;

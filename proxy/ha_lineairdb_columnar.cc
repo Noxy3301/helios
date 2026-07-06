@@ -1253,7 +1253,6 @@ bool BuildQueryBlockRequest(
   if (unit == nullptr || !unit->is_simple())
     LDB_COL_REJECT("not simple unit");
 
-  if (qb->having_cond() != nullptr) LDB_COL_REJECT("has HAVING");
   if (qb->is_distinct()) LDB_COL_REJECT("has DISTINCT");
   if (qb->has_windows()) LDB_COL_REJECT("has windows");
   if (qb->olap != UNSPECIFIED_OLAP_TYPE) LDB_COL_REJECT("has ROLLUP");
@@ -1835,6 +1834,36 @@ bool BuildQueryBlockRequest(
 
     auto *function = aggregate->add_aggs();
     switch (sum->sum_func()) {
+      case Item_sum::COUNT_DISTINCT_FUNC: {
+        if (sum->argument_count() != 1) {
+          aggregate_error = "COUNT DISTINCT arg count";
+          return -1;
+        }
+        Item *arg = sum->get_arg(0)->real_item();
+        if (arg->type() != Item::FIELD_ITEM) {
+          aggregate_error = "COUNT DISTINCT arg shape";
+          return -1;
+        }
+        const Field *raw_count_field = down_cast<Item_field *>(arg)->field;
+        const int count_table = TableIndexOfField(raw_count_field, tables);
+        const Field *count_field =
+            count_table >= 0
+                ? resolve_query_field(raw_count_field, count_table)
+                : nullptr;
+        if (count_field == nullptr) {
+          aggregate_error = "COUNT DISTINCT arg unresolvable";
+          return -1;
+        }
+
+        function->set_arg_table(static_cast<uint32_t>(count_table));
+        auto *ref = function->mutable_arg();
+        ref->set_op(LineairDB::Protocol::FilterExpr::COLUMN_REF);
+        ref->set_column_index(count_field->field_index());
+        function->set_kind(LineairDB::Protocol::QueryBlockAggFunc::COUNT);
+        function->set_distinct(true);
+        return aggregate->aggs_size() - 1;
+      }
+
       case Item_sum::COUNT_FUNC: {
         function->set_arg_table(0);
         if (sum->argument_count() > 0) {
@@ -2195,7 +2224,73 @@ bool BuildQueryBlockRequest(
     output->set_result_scale(real->decimals);
   }
 
-  if (aggregate->aggs_size() == 0) LDB_COL_REJECT("no aggregates");
+  if (qb->having_cond() != nullptr) {
+    std::function<bool(Item *, LineairDB::Protocol::FilterExpr *)>
+        serialize_having;
+    serialize_having =
+        [&](Item *item, LineairDB::Protocol::FilterExpr *expr) -> bool {
+      item = item->real_item();
+      if (item->type() == Item::COND_ITEM) {
+        auto *condition = down_cast<Item_cond *>(item);
+        expr->set_op(condition->functype() == Item_func::COND_AND_FUNC
+                         ? LineairDB::Protocol::FilterExpr::OP_AND
+                         : LineairDB::Protocol::FilterExpr::OP_OR);
+        List_iterator<Item> iterator(*condition->argument_list());
+        for (Item *part = iterator++; part != nullptr; part = iterator++) {
+          if (!serialize_having(part, expr->add_children())) return false;
+        }
+        return true;
+      }
+      if (item->type() != Item::FUNC_ITEM) return false;
+
+      auto *function = down_cast<Item_func *>(item);
+      LineairDB::Protocol::FilterExpr::Op op;
+      switch (function->functype()) {
+        case Item_func::EQ_FUNC:
+          op = LineairDB::Protocol::FilterExpr::OP_EQ;
+          break;
+        case Item_func::NE_FUNC:
+          op = LineairDB::Protocol::FilterExpr::OP_NE;
+          break;
+        case Item_func::LT_FUNC:
+          op = LineairDB::Protocol::FilterExpr::OP_LT;
+          break;
+        case Item_func::LE_FUNC:
+          op = LineairDB::Protocol::FilterExpr::OP_LE;
+          break;
+        case Item_func::GT_FUNC:
+          op = LineairDB::Protocol::FilterExpr::OP_GT;
+          break;
+        case Item_func::GE_FUNC:
+          op = LineairDB::Protocol::FilterExpr::OP_GE;
+          break;
+        default:
+          return false;
+      }
+      if (function->argument_count() != 2) return false;
+
+      expr->set_op(op);
+      for (uint arg_idx = 0; arg_idx < 2; arg_idx++) {
+        auto *child = expr->add_children();
+        if (!serialize_output_expression(function->arguments()[arg_idx],
+                                         child)) {
+          return false;
+        }
+        child->set_compare_type(2);
+      }
+      return true;
+    };
+
+    auto *having = aggregate->mutable_having();
+    if (!serialize_having(qb->having_cond(), having->mutable_expr())) {
+      LDB_COL_REJECT("HAVING not pushable");
+    }
+    having->set_num_columns(aggregate->group_columns_size() +
+                            aggregate->aggs_size());
+  }
+
+  if (aggregate->aggs_size() == 0 && aggregate->group_columns_size() == 0)
+    LDB_COL_REJECT("no aggregates");
 
   for (ORDER *order = qb->order_list.first; order != nullptr;
        order = order->next) {
