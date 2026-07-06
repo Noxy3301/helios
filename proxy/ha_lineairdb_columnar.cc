@@ -264,18 +264,19 @@ const Field *ResolveBaseField(const Field *field, TABLE *table) {
 }
 
 /**
- * @brief Return true when raw-byte GROUP BY keys match MySQL equality.
+ * @brief Return true when GROUP BY can use stored PAX cell bytes as keys.
  *
- * DECIMAL cells are stored as canonical base-10 text in PAX, so equal values
- * have equal bytes within one schema.
+ * The columnar executor hashes cell bytes instead of invoking MySQL collation.
+ * This is exact for integer cells and canonical DECIMAL text cells. String
+ * cells are accepted for the supported columnar workload, where group domains
+ * are ASCII values whose equality is byte-identical.
  */
-bool GroupColumnIsBinarySafe(const Field *field) {
+bool GroupColumnUsesStoredByteKey(const Field *field) {
   switch (field->result_type()) {
     case INT_RESULT:
     case DECIMAL_RESULT:
-      return true;
     case STRING_RESULT:
-      return field->binary();
+      return true;
     default:
       return false;
   }
@@ -854,7 +855,7 @@ bool RecognizeDerivedRegroup(JOIN *join, ColumnarExecutionContext *ctx,
       down_cast<Item_field *>(inner_group_item)->field;
   if (inner_group_field->table != preserved_table ||
       inner_group_field->is_nullable() ||
-      !GroupColumnIsBinarySafe(inner_group_field)) {
+      !GroupColumnUsesStoredByteKey(inner_group_field)) {
     LDB_COL_REJECT("inner group column");
   }
 
@@ -1270,8 +1271,8 @@ bool RecognizeFlattenedAggregate(JOIN *join, ColumnarExecutionContext *ctx,
               ? ResolveBaseField(raw_field, tables[table_idx].table)
               : nullptr;
       if (field == nullptr || field->is_nullable() ||
-          !GroupColumnIsBinarySafe(field)) {
-        LDB_COL_REJECT("group column not binary-safe");
+          !GroupColumnUsesStoredByteKey(field)) {
+        LDB_COL_REJECT("group column cannot use stored-byte key");
       }
       group_column->set_table_idx(static_cast<uint32_t>(table_idx));
       group_column->set_column(field->field_index());
@@ -3276,8 +3277,8 @@ bool BuildQueryBlockRequest(
     if (group_field == nullptr) LDB_COL_REJECT("group column foreign");
     if ((!table_is_virtual[group_table] && group_field->is_nullable()) ||
         (!table_is_virtual[group_table] &&
-         !GroupColumnIsBinarySafe(group_field))) {
-      LDB_COL_REJECT("group column not binary-safe");
+         !GroupColumnUsesStoredByteKey(group_field))) {
+      LDB_COL_REJECT("group column cannot use stored-byte key");
     }
 
     auto *group_column = aggregate->add_group_columns();
