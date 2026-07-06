@@ -141,8 +141,9 @@ void append_result_field(std::string& row, std::string_view payload,
     row.append(payload.data(), payload.size());
 }
 
-// Materialized operator output. Each logical tuple is represented as one PAX row
-// reference per participating table.
+// Materialized operator output. Each logical tuple is represented as one row
+// reference per participating table. Real tables use PAX row references; virtual
+// tables produced by sub-blocks use result row numbers.
 struct NodeResult {
     std::vector<uint32_t> tables;
     std::vector<std::vector<uint64_t>> refs;
@@ -254,6 +255,9 @@ class Executor {
                 }
                 continue;
             }
+            if (node.has_sub_block()) {
+                continue;
+            }
             if (node.has_aggregate()) {
                 if (node.aggregate().input() >=
                     static_cast<uint32_t>(node_idx)) {
@@ -266,8 +270,56 @@ class Executor {
         return true;
     }
 
+    struct VirtualTable {
+        std::vector<std::vector<std::string>> values;
+        std::vector<std::vector<bool>> nulls;
+    };
+
+    bool IsVirtualTable(uint32_t table_idx) const {
+        return table_idx >= static_cast<uint32_t>(request_.tables_size());
+    }
+
+    const VirtualTable* FindVirtualTable(uint32_t table_idx) const {
+        if (!IsVirtualTable(table_idx)) return nullptr;
+        const uint32_t virtual_idx =
+            table_idx - static_cast<uint32_t>(request_.tables_size());
+        if (virtual_idx >= virtual_tables_.size()) return nullptr;
+        return &virtual_tables_[virtual_idx];
+    }
+
+    std::string_view ValueOf(uint32_t table_idx, uint64_t ref,
+                             uint32_t column) const {
+        if (ref == kNullRowRef) return {};
+        if (!IsVirtualTable(table_idx)) {
+            return extract_value_column(ToRowRef(table_idx, ref),
+                                        static_cast<int>(column));
+        }
+
+        const VirtualTable* table = FindVirtualTable(table_idx);
+        if (table == nullptr || ref >= table->values.size() ||
+            column >= table->values[ref].size()) {
+            return {};
+        }
+        return table->values[ref][column];
+    }
+
+    bool NullOf(uint32_t table_idx, uint64_t ref, uint32_t column) const {
+        if (ref == kNullRowRef) return true;
+        if (!IsVirtualTable(table_idx)) {
+            return IsNullColumn(ToRowRef(table_idx, ref), column);
+        }
+
+        const VirtualTable* table = FindVirtualTable(table_idx);
+        if (table == nullptr || ref >= table->nulls.size() ||
+            column >= table->nulls[ref].size()) {
+            return true;
+        }
+        return table->nulls[ref][column];
+    }
+
     PaxRowRef ToRowRef(uint32_t table_idx, uint64_t ref) const {
         if (ref == kNullRowRef) return PaxRowRef{};
+        if (table_idx >= stores_.size()) return PaxRowRef{};
         PaxStore* store = stores_[table_idx];
         return PaxRowRef{
             store->group(ref / PaxGroup::kRows),
@@ -324,8 +376,8 @@ class Executor {
 
     std::string_view GroupColumnValue(
         const pb::QueryBlockColumnRef& column, uint64_t ref) const {
-        std::string_view value = extract_value_column(
-            ToRowRef(column.table_idx(), ref), column.column());
+        std::string_view value =
+            ValueOf(column.table_idx(), ref, column.column());
         if (column.prefix_len() > 0 && value.size() > column.prefix_len()) {
             value = value.substr(0, column.prefix_len());
         }
@@ -339,9 +391,11 @@ class Executor {
         if (expression.op() != pb::FilterExpr::COLUMN_REF) return false;
         const DecodedColumnRef column = DecodeAggregateColumnRef(
             default_table_idx, expression.column_index());
-        PaxRowRef row = RowRefForTable(input, row_idx, column.table_idx);
-        if (row.group == nullptr) return false;
-        *value = extract_value_column(row, column.column);
+        const int position = input.table_pos(column.table_idx);
+        if (position < 0) return false;
+        const uint64_t ref = input.refs[position][row_idx];
+        if (NullOf(column.table_idx, ref, column.column)) return false;
+        *value = ValueOf(column.table_idx, ref, column.column);
         return true;
     }
 
@@ -508,6 +562,91 @@ class Executor {
         return true;
     }
 
+    bool DecodeSubBlockRow(const std::string& row,
+                           std::vector<std::string>* values,
+                           std::vector<bool>* nulls) {
+        if (values == nullptr || nulls == nullptr) {
+            return fail("sub-block row output missing");
+        }
+
+        values->clear();
+        nulls->clear();
+        size_t offset = 0;
+        bool first_field = true;
+        while (offset < row.size()) {
+            const auto byte_size =
+                static_cast<unsigned char>(row[offset]);
+            ++offset;
+
+            if (byte_size == 0xFF) {
+                if (!first_field) {
+                    values->emplace_back();
+                    nulls->push_back(true);
+                }
+                first_field = false;
+                continue;
+            }
+
+            if (offset + byte_size > row.size()) {
+                return fail("sub-block row is malformed");
+            }
+            size_t value_length = 0;
+            for (unsigned int byte_idx = 0; byte_idx < byte_size;
+                 ++byte_idx) {
+                value_length |=
+                    static_cast<size_t>(
+                        static_cast<unsigned char>(row[offset + byte_idx]))
+                    << (8 * byte_idx);
+            }
+            offset += byte_size;
+            if (offset + value_length > row.size()) {
+                return fail("sub-block row is malformed");
+            }
+
+            if (!first_field) {
+                values->emplace_back(row.data() + offset, value_length);
+                nulls->push_back(false);
+            }
+            first_field = false;
+            offset += value_length;
+        }
+        return true;
+    }
+
+    bool RunSubBlock(const pb::QueryBlockSubBlock& sub_block,
+                     NodeResult* output) {
+        pb::TxExecuteQueryBlock::Response response;
+        ExecuteQueryBlock(db_, sub_block.block(), &response);
+        if (!response.ok()) {
+            return fail(response.error().empty() ? "sub-block failed"
+                                                 : response.error());
+        }
+
+        VirtualTable table;
+        table.values.reserve(response.rows_size());
+        table.nulls.reserve(response.rows_size());
+        for (const std::string& row : response.rows()) {
+            std::vector<std::string> values;
+            std::vector<bool> nulls;
+            if (!DecodeSubBlockRow(row, &values, &nulls)) return false;
+            table.values.push_back(std::move(values));
+            table.nulls.push_back(std::move(nulls));
+        }
+
+        const uint32_t table_idx = static_cast<uint32_t>(
+            request_.tables_size() + virtual_tables_.size());
+        virtual_tables_.push_back(std::move(table));
+
+        output->tables = {table_idx};
+        output->refs.assign(1, {});
+        const size_t row_count = virtual_tables_.back().values.size();
+        output->refs[0].reserve(row_count);
+        for (size_t row_idx = 0; row_idx < row_count; ++row_idx) {
+            output->refs[0].push_back(row_idx);
+        }
+        return true;
+    }
+
     struct TupleFilterColumn {
         int ref_position = -1;
         uint32_t table_idx = 0;
@@ -554,11 +693,10 @@ class Executor {
                 continue;
             }
 
-            const PaxRowRef row = ToRowRef(column.table_idx, ref);
-            if (row.group == nullptr) return false;
             (*cells)[column_idx] =
-                extract_value_column(row, static_cast<int>(column.column));
-            (*nulls)[column_idx] = IsNullColumn(row, column.column);
+                ValueOf(column.table_idx, ref, column.column);
+            (*nulls)[column_idx] =
+                NullOf(column.table_idx, ref, column.column);
         }
         return true;
     }
@@ -675,10 +813,9 @@ class Executor {
         key->clear();
         for (const JoinKeyColumn& column : key_columns) {
             const uint64_t ref = input.refs[column.ref_position][row_idx];
-            if (ref == kNullRowRef) return false;
-            AppendJoinKeyPart(
-                key, extract_value_column(ToRowRef(column.table_idx, ref),
-                                          column.column));
+            if (NullOf(column.table_idx, ref, column.column)) return false;
+            AppendJoinKeyPart(key,
+                              ValueOf(column.table_idx, ref, column.column));
         }
         return true;
     }
@@ -817,12 +954,10 @@ class Executor {
                             continue;
                         }
 
-                        const PaxRowRef row = ToRowRef(column.table_idx, ref);
-                        if (row.group == nullptr) return false;
-                        residual_cells[column_idx] = extract_value_column(
-                            row, static_cast<int>(column.column));
+                        residual_cells[column_idx] =
+                            ValueOf(column.table_idx, ref, column.column);
                         residual_nulls[column_idx] =
-                            IsNullColumn(row, column.column);
+                            NullOf(column.table_idx, ref, column.column);
                     }
                     residual_evaluator.set_row_from_views(residual_cells,
                                                           residual_nulls);
@@ -964,6 +1099,36 @@ class Executor {
         return function.filter_table();
     }
 
+    bool BuildPredicateRowForTable(uint32_t table_idx, uint64_t ref,
+                                   uint32_t column_count,
+                                   std::vector<std::string_view>* cells,
+                                   std::vector<bool>* nulls) const {
+        if (cells == nullptr || nulls == nullptr) return false;
+        if (ref == kNullRowRef) return false;
+        if (!IsVirtualTable(table_idx)) {
+            const PaxRowRef row = ToRowRef(table_idx, ref);
+            if (row.group == nullptr ||
+                row.group->schema().field_count() <
+                    static_cast<size_t>(column_count) + 1) {
+                return false;
+            }
+        } else {
+            const VirtualTable* table = FindVirtualTable(table_idx);
+            if (table == nullptr || ref >= table->values.size()) {
+                return false;
+            }
+        }
+
+        cells->resize(column_count);
+        nulls->resize(column_count);
+        for (uint32_t column_idx = 0; column_idx < column_count;
+             ++column_idx) {
+            (*cells)[column_idx] = ValueOf(table_idx, ref, column_idx);
+            (*nulls)[column_idx] = NullOf(table_idx, ref, column_idx);
+        }
+        return true;
+    }
+
     bool AccumulateRange(const pb::QueryBlockAggregate& aggregate,
                          const NodeResult& input, size_t begin, size_t end,
                          GroupMap* groups) {
@@ -1010,6 +1175,8 @@ class Executor {
         PredicateEvaluator evaluator;
         std::string key_buffer;
         std::vector<std::string_view> group_values(group_count);
+        std::vector<std::string_view> filter_values;
+        std::vector<bool> filter_nulls;
         for (size_t row_idx = begin; row_idx < end; ++row_idx) {
             key_buffer.clear();
             for (int group_idx = 0; group_idx < group_count; ++group_idx) {
@@ -1064,13 +1231,14 @@ class Executor {
                     if (filter_ref == kNullRowRef) continue;
                     const uint32_t filter_table =
                         FilterTableForAggregate(function);
-                    PaxRowRef row = ToRowRef(filter_table, filter_ref);
-                    if (row.group == nullptr ||
-                        !evaluator.set_row_from_pax(
-                            *row.group, row.slot,
-                            function.filter().num_columns())) {
-                        return fail("aggregate filter cannot read PAX columns");
+                    if (!BuildPredicateRowForTable(
+                            filter_table, filter_ref,
+                            function.filter().num_columns(), &filter_values,
+                            &filter_nulls)) {
+                        return fail(
+                            "aggregate filter cannot read table columns");
                     }
+                    evaluator.set_row_from_views(filter_values, filter_nulls);
                     if (!evaluator.evaluate(function.filter().expr())) {
                         continue;
                     }
@@ -1698,6 +1866,12 @@ class Executor {
                 }
                 continue;
             }
+            if (node.has_sub_block()) {
+                if (!RunSubBlock(node.sub_block(), &results_[node_idx])) {
+                    return false;
+                }
+                continue;
+            }
             if (node.has_aggregate()) {
                 if (node_idx != request_.nodes_size() - 1) {
                     return fail("aggregate must be the root node");
@@ -1747,6 +1921,7 @@ class Executor {
     std::vector<uint64_t> slot_snapshots_;
     std::vector<uint64_t> overflow_snapshots_;
     std::vector<NodeResult> results_;
+    std::vector<VirtualTable> virtual_tables_;
 };
 
 const std::string& default_error(const Executor& executor) {

@@ -780,12 +780,21 @@ message QueryBlockSortKey {
     uint32 cmp_kind = 3;  // 0=int64 numeric, 1=binary string, 2=decimal numeric.
 }
 
+// A nested query block for a derived table. The server executes it recursively
+// and exposes its output rows as a virtual table. Virtual table indexes start at
+// tables_size and follow sub_block node order; virtual column refs address the
+// sub-block output ordinals, and refs are row numbers.
+message QueryBlockSubBlock {
+    TxExecuteQueryBlock.Request block = 1;
+}
+
 message QueryBlockNode {
     oneof op {
         QueryBlockScan scan = 1;
         QueryBlockJoin join = 2;
         QueryBlockAggregate aggregate = 3;
         QueryBlockTupleFilterNode filter = 4;
+        QueryBlockSubBlock sub_block = 5;
     }
 }
 
