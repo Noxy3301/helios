@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <exception>
 #include <limits>
+#include <set>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -72,6 +73,56 @@ DecimalValue divide_decimal_value(const DecimalValue& sum, uint64_t count,
     return result;
 }
 
+DecimalValue divide_decimal_values(const DecimalValue& lhs,
+                                   const DecimalValue& rhs,
+                                   int output_scale) {
+    DecimalValue result;
+    result.is_null = true;
+    if (lhs.is_null || rhs.is_null || rhs.mantissa == 0) return result;
+
+    __int128 numerator = lhs.mantissa;
+    __int128 denominator = rhs.mantissa;
+    bool negative = false;
+    if (numerator < 0) {
+        numerator = -numerator;
+        negative = !negative;
+    }
+    if (denominator < 0) {
+        denominator = -denominator;
+        negative = !negative;
+    }
+
+    // Scale the numerator to keep one extra decimal digit for half-up rounding.
+    const int scale_shift = output_scale + rhs.scale - lhs.scale + 1;
+    if (scale_shift > 0) {
+        numerator *= decimal_power_of_ten(scale_shift);
+    } else if (scale_shift < 0) {
+        numerator /= decimal_power_of_ten(-scale_shift);
+    }
+
+    __int128 quotient = numerator / denominator;
+    quotient = (quotient + 5) / 10;
+    result.mantissa = negative ? -quotient : quotient;
+    result.scale = output_scale;
+    result.is_null = false;
+    return result;
+}
+
+void round_decimal_value(DecimalValue* value, int output_scale) {
+    if (value == nullptr || value->is_null || value->scale <= output_scale) {
+        return;
+    }
+
+    const int drop = value->scale - output_scale;
+    const __int128 divisor = decimal_power_of_ten(drop);
+    __int128 mantissa = value->mantissa;
+    const bool negative = mantissa < 0;
+    if (negative) mantissa = -mantissa;
+    mantissa = (mantissa + divisor / 2) / divisor;
+    value->mantissa = negative ? -mantissa : mantissa;
+    value->scale = output_scale;
+}
+
 void append_result_field(std::string& row, std::string_view payload,
                          bool is_null) {
     if (is_null) {
@@ -91,8 +142,9 @@ void append_result_field(std::string& row, std::string_view payload,
     row.append(payload.data(), payload.size());
 }
 
-// Materialized operator output. Each logical tuple is represented as one PAX row
-// reference per participating table.
+// Materialized operator output. Each logical tuple is represented as one row
+// reference per participating table. Real tables use PAX row references; virtual
+// tables produced by sub-blocks use result row numbers.
 struct NodeResult {
     std::vector<uint32_t> tables;
     std::vector<std::vector<uint64_t>> refs;
@@ -197,6 +249,16 @@ class Executor {
                 }
                 continue;
             }
+            if (node.has_filter()) {
+                if (node.filter().input() >=
+                    static_cast<uint32_t>(node_idx)) {
+                    return fail("tuple filter child order");
+                }
+                continue;
+            }
+            if (node.has_sub_block()) {
+                continue;
+            }
             if (node.has_aggregate()) {
                 if (node.aggregate().input() >=
                     static_cast<uint32_t>(node_idx)) {
@@ -209,8 +271,56 @@ class Executor {
         return true;
     }
 
+    struct VirtualTable {
+        std::vector<std::vector<std::string>> values;
+        std::vector<std::vector<bool>> nulls;
+    };
+
+    bool IsVirtualTable(uint32_t table_idx) const {
+        return table_idx >= static_cast<uint32_t>(request_.tables_size());
+    }
+
+    const VirtualTable* FindVirtualTable(uint32_t table_idx) const {
+        if (!IsVirtualTable(table_idx)) return nullptr;
+        const uint32_t virtual_idx =
+            table_idx - static_cast<uint32_t>(request_.tables_size());
+        if (virtual_idx >= virtual_tables_.size()) return nullptr;
+        return &virtual_tables_[virtual_idx];
+    }
+
+    std::string_view ValueOf(uint32_t table_idx, uint64_t ref,
+                             uint32_t column) const {
+        if (ref == kNullRowRef) return {};
+        if (!IsVirtualTable(table_idx)) {
+            return extract_value_column(ToRowRef(table_idx, ref),
+                                        static_cast<int>(column));
+        }
+
+        const VirtualTable* table = FindVirtualTable(table_idx);
+        if (table == nullptr || ref >= table->values.size() ||
+            column >= table->values[ref].size()) {
+            return {};
+        }
+        return table->values[ref][column];
+    }
+
+    bool NullOf(uint32_t table_idx, uint64_t ref, uint32_t column) const {
+        if (ref == kNullRowRef) return true;
+        if (!IsVirtualTable(table_idx)) {
+            return IsNullColumn(ToRowRef(table_idx, ref), column);
+        }
+
+        const VirtualTable* table = FindVirtualTable(table_idx);
+        if (table == nullptr || ref >= table->nulls.size() ||
+            column >= table->nulls[ref].size()) {
+            return true;
+        }
+        return table->nulls[ref][column];
+    }
+
     PaxRowRef ToRowRef(uint32_t table_idx, uint64_t ref) const {
         if (ref == kNullRowRef) return PaxRowRef{};
+        if (table_idx >= stores_.size()) return PaxRowRef{};
         PaxStore* store = stores_[table_idx];
         return PaxRowRef{
             store->group(ref / PaxGroup::kRows),
@@ -223,6 +333,16 @@ class Executor {
         const int position = input.table_pos(table_idx);
         if (position < 0) return PaxRowRef{};
         return ToRowRef(table_idx, input.refs[position][row_idx]);
+    }
+
+    static bool IsNullColumn(const PaxRowRef& row, uint32_t column_idx) {
+        if (row.group == nullptr) return true;
+        const std::string_view null_flags = row.group->cell(0, row.slot);
+        const size_t byte_idx = column_idx / 8;
+        const uint32_t bit_idx = column_idx % 8;
+        return byte_idx < null_flags.size() &&
+               (static_cast<unsigned char>(null_flags[byte_idx]) &
+                (1u << bit_idx)) != 0;
     }
 
     static DecodedColumnRef DecodeAggregateColumnRef(
@@ -257,8 +377,8 @@ class Executor {
 
     std::string_view GroupColumnValue(
         const pb::QueryBlockColumnRef& column, uint64_t ref) const {
-        std::string_view value = extract_value_column(
-            ToRowRef(column.table_idx(), ref), column.column());
+        std::string_view value =
+            ValueOf(column.table_idx(), ref, column.column());
         if (column.prefix_len() > 0 && value.size() > column.prefix_len()) {
             value = value.substr(0, column.prefix_len());
         }
@@ -272,9 +392,11 @@ class Executor {
         if (expression.op() != pb::FilterExpr::COLUMN_REF) return false;
         const DecodedColumnRef column = DecodeAggregateColumnRef(
             default_table_idx, expression.column_index());
-        PaxRowRef row = RowRefForTable(input, row_idx, column.table_idx);
-        if (row.group == nullptr) return false;
-        *value = extract_value_column(row, column.column);
+        const int position = input.table_pos(column.table_idx);
+        if (position < 0) return false;
+        const uint64_t ref = input.refs[position][row_idx];
+        if (NullOf(column.table_idx, ref, column.column)) return false;
+        *value = ValueOf(column.table_idx, ref, column.column);
         return true;
     }
 
@@ -441,6 +563,224 @@ class Executor {
         return true;
     }
 
+    bool DecodeSubBlockRow(const std::string& row,
+                           std::vector<std::string>* values,
+                           std::vector<bool>* nulls) {
+        if (values == nullptr || nulls == nullptr) {
+            return fail("sub-block row output missing");
+        }
+
+        values->clear();
+        nulls->clear();
+        size_t offset = 0;
+        bool first_field = true;
+        while (offset < row.size()) {
+            const auto byte_size =
+                static_cast<unsigned char>(row[offset]);
+            ++offset;
+
+            if (byte_size == 0xFF) {
+                if (!first_field) {
+                    values->emplace_back();
+                    nulls->push_back(true);
+                }
+                first_field = false;
+                continue;
+            }
+
+            if (offset + byte_size > row.size()) {
+                return fail("sub-block row is malformed");
+            }
+            size_t value_length = 0;
+            for (unsigned int byte_idx = 0; byte_idx < byte_size;
+                 ++byte_idx) {
+                value_length |=
+                    static_cast<size_t>(
+                        static_cast<unsigned char>(row[offset + byte_idx]))
+                    << (8 * byte_idx);
+            }
+            offset += byte_size;
+            if (offset + value_length > row.size()) {
+                return fail("sub-block row is malformed");
+            }
+
+            if (!first_field) {
+                values->emplace_back(row.data() + offset, value_length);
+                nulls->push_back(false);
+            }
+            first_field = false;
+            offset += value_length;
+        }
+        return true;
+    }
+
+    bool RunSubBlock(const pb::QueryBlockSubBlock& sub_block,
+                     NodeResult* output) {
+        pb::TxExecuteQueryBlock::Response response;
+        ExecuteQueryBlock(db_, sub_block.block(), &response);
+        if (!response.ok()) {
+            return fail(response.error().empty() ? "sub-block failed"
+                                                 : response.error());
+        }
+
+        VirtualTable table;
+        table.values.reserve(response.rows_size());
+        table.nulls.reserve(response.rows_size());
+        for (const std::string& row : response.rows()) {
+            std::vector<std::string> values;
+            std::vector<bool> nulls;
+            if (!DecodeSubBlockRow(row, &values, &nulls)) return false;
+            table.values.push_back(std::move(values));
+            table.nulls.push_back(std::move(nulls));
+        }
+
+        const uint32_t table_idx = static_cast<uint32_t>(
+            request_.tables_size() + virtual_tables_.size());
+        virtual_tables_.push_back(std::move(table));
+
+        output->tables = {table_idx};
+        output->refs.assign(1, {});
+        const size_t row_count = virtual_tables_.back().values.size();
+        output->refs[0].reserve(row_count);
+        for (size_t row_idx = 0; row_idx < row_count; ++row_idx) {
+            output->refs[0].push_back(row_idx);
+        }
+        return true;
+    }
+
+    struct TupleFilterColumn {
+        int ref_position = -1;
+        uint32_t table_idx = 0;
+        uint32_t column = 0;
+    };
+
+    bool ResolveTupleFilterColumns(
+        const pb::QueryBlockTupleFilter& filter, const NodeResult& input,
+        std::vector<TupleFilterColumn>* columns) {
+        if (!filter.has_predicate() || !filter.predicate().has_expr()) {
+            return fail("tuple filter predicate missing");
+        }
+        if (filter.predicate().num_columns() !=
+            static_cast<uint32_t>(filter.columns_size())) {
+            return fail("tuple filter column count");
+        }
+
+        columns->clear();
+        columns->reserve(filter.columns_size());
+        for (const pb::QueryBlockColumnRef& column : filter.columns()) {
+            const int position = input.table_pos(column.table_idx());
+            if (position < 0) return fail("tuple filter table");
+            columns->push_back(
+                TupleFilterColumn{position, column.table_idx(),
+                                  column.column()});
+        }
+        return true;
+    }
+
+    bool BuildTupleFilterRow(
+        const NodeResult& input,
+        const std::vector<TupleFilterColumn>& columns, size_t row_idx,
+        std::vector<std::string_view>* cells,
+        std::vector<bool>* nulls) const {
+        cells->resize(columns.size());
+        nulls->resize(columns.size());
+        for (size_t column_idx = 0; column_idx < columns.size();
+             ++column_idx) {
+            const TupleFilterColumn& column = columns[column_idx];
+            const uint64_t ref = input.refs[column.ref_position][row_idx];
+            if (ref == kNullRowRef) {
+                (*cells)[column_idx] = {};
+                (*nulls)[column_idx] = true;
+                continue;
+            }
+
+            (*cells)[column_idx] =
+                ValueOf(column.table_idx, ref, column.column);
+            (*nulls)[column_idx] =
+                NullOf(column.table_idx, ref, column.column);
+        }
+        return true;
+    }
+
+    bool RunTupleFilter(const pb::QueryBlockTupleFilterNode& filter,
+                        NodeResult* output) {
+        if (filter.input() >= results_.size()) {
+            return fail("tuple filter child out of range");
+        }
+        const NodeResult& input = results_[filter.input()];
+
+        std::vector<TupleFilterColumn> columns;
+        if (!ResolveTupleFilterColumns(filter.filter(), input, &columns)) {
+            return false;
+        }
+
+        output->tables = input.tables;
+        output->refs.assign(input.refs.size(), {});
+        const size_t input_rows = input.rows();
+        const unsigned worker_count = static_cast<unsigned>(std::min<size_t>(
+            WorkerCount(), std::max<size_t>(input_rows / 16384, 1)));
+
+        struct WorkerOutput {
+            std::vector<std::vector<uint64_t>> refs;
+        };
+        std::vector<WorkerOutput> local_outputs(worker_count);
+        std::vector<char> worker_failed(worker_count, 0);
+        std::vector<std::thread> workers;
+        workers.reserve(worker_count);
+
+        for (unsigned worker_idx = 0; worker_idx < worker_count; ++worker_idx) {
+            workers.emplace_back([&, worker_idx] {
+                PredicateEvaluator evaluator;
+                std::vector<std::string_view> cells;
+                std::vector<bool> nulls;
+                WorkerOutput& local = local_outputs[worker_idx];
+                local.refs.assign(input.refs.size(), {});
+                const size_t begin = input_rows * worker_idx / worker_count;
+                const size_t end =
+                    input_rows * (worker_idx + 1) / worker_count;
+                for (size_t row_idx = begin; row_idx < end; ++row_idx) {
+                    if (!BuildTupleFilterRow(input, columns, row_idx, &cells,
+                                             &nulls)) {
+                        worker_failed[worker_idx] = 1;
+                        return;
+                    }
+                    evaluator.set_row_from_views(cells, nulls);
+                    if (!evaluator.evaluate(filter.filter().predicate()
+                                                .expr())) {
+                        continue;
+                    }
+                    for (size_t column_idx = 0; column_idx < input.refs.size();
+                         ++column_idx) {
+                        local.refs[column_idx].push_back(
+                            input.refs[column_idx][row_idx]);
+                    }
+                }
+            });
+        }
+
+        for (std::thread& worker : workers) worker.join();
+        for (char failed : worker_failed) {
+            if (failed) return fail("tuple filter cannot read PAX columns");
+        }
+
+        size_t total_rows = 0;
+        for (const WorkerOutput& local : local_outputs) {
+            total_rows += local.refs.empty() ? 0 : local.refs[0].size();
+        }
+        for (size_t column_idx = 0; column_idx < output->refs.size();
+             ++column_idx) {
+            output->refs[column_idx].reserve(total_rows);
+            for (const WorkerOutput& local : local_outputs) {
+                if (local.refs.empty()) continue;
+                output->refs[column_idx].insert(
+                    output->refs[column_idx].end(),
+                    local.refs[column_idx].begin(),
+                    local.refs[column_idx].end());
+            }
+        }
+        return true;
+    }
+
     static void AppendJoinKeyPart(std::string* key, std::string_view value) {
         const uint32_t length = static_cast<uint32_t>(value.size());
         key->append(reinterpret_cast<const char*>(&length), sizeof(length));
@@ -474,10 +814,9 @@ class Executor {
         key->clear();
         for (const JoinKeyColumn& column : key_columns) {
             const uint64_t ref = input.refs[column.ref_position][row_idx];
-            if (ref == kNullRowRef) return false;
-            AppendJoinKeyPart(
-                key, extract_value_column(ToRowRef(column.table_idx, ref),
-                                          column.column));
+            if (NullOf(column.table_idx, ref, column.column)) return false;
+            AppendJoinKeyPart(key,
+                              ValueOf(column.table_idx, ref, column.column));
         }
         return true;
     }
@@ -485,20 +824,26 @@ class Executor {
     bool RunJoin(const pb::QueryBlockJoin& join, NodeResult* output) {
         const bool is_inner = join.type() == pb::QueryBlockJoin::INNER;
         const bool is_left = join.type() == pb::QueryBlockJoin::LEFT;
-        if (!is_inner && !is_left) {
+        const bool is_semi = join.type() == pb::QueryBlockJoin::SEMI;
+        const bool is_anti = join.type() == pb::QueryBlockJoin::ANTI;
+        if (!is_inner && !is_left && !is_semi && !is_anti) {
             return fail("unsupported query-block join type");
         }
-        if (join.build_keys_size() != join.probe_keys_size() ||
-            join.build_keys_size() == 0) {
+        if (join.build_keys_size() != join.probe_keys_size()) {
+            return fail("join key arity");
+        }
+        // Keyless INNER and LEFT joins are cross products. The proxy only emits
+        // them for one-row virtual inputs, where the SQL shape is explicit.
+        if (join.build_keys_size() == 0 && !is_inner && !is_left) {
             return fail("join key arity");
         }
         if (join.build() >= results_.size() || join.probe() >= results_.size()) {
             return fail("join child out of range");
         }
 
-        // INNER joins are symmetric; hash the smaller child at runtime. LEFT
-        // joins keep the request's build/probe sides because probe rows must be
-        // preserved when the build side has no match.
+        // INNER joins are symmetric; hash the smaller child at runtime. LEFT,
+        // SEMI, and ANTI keep the request's build/probe sides because their
+        // output semantics are defined by the probe side.
         const bool swap =
             is_inner &&
             results_[join.build()].rows() > results_[join.probe()].rows();
@@ -516,6 +861,40 @@ class Executor {
             return fail("probe key table is not in join input");
         }
 
+        struct ResidualColumn {
+            bool from_build = false;
+            int ref_position = -1;
+            uint32_t table_idx = 0;
+            uint32_t column = 0;
+        };
+
+        std::vector<ResidualColumn> residual_columns;
+        const bool has_residual =
+            join.has_residual() && join.residual().has_predicate() &&
+            join.residual().predicate().has_expr();
+        if (has_residual) {
+            if (join.residual().predicate().num_columns() !=
+                static_cast<uint32_t>(join.residual().columns_size())) {
+                return fail("join residual column count");
+            }
+            residual_columns.reserve(join.residual().columns_size());
+            for (const pb::QueryBlockColumnRef& column :
+                 join.residual().columns()) {
+                int position = probe.table_pos(column.table_idx());
+                if (position >= 0) {
+                    residual_columns.push_back(
+                        ResidualColumn{false, position, column.table_idx(),
+                                       column.column()});
+                    continue;
+                }
+                position = build.table_pos(column.table_idx());
+                if (position < 0) return fail("join residual table");
+                residual_columns.push_back(
+                    ResidualColumn{true, position, column.table_idx(),
+                                   column.column()});
+            }
+        }
+
         // Build a composite byte-key hash table from the chosen build child.
         std::unordered_map<std::string, std::vector<size_t>> hash_table;
         hash_table.reserve(build.rows());
@@ -529,9 +908,12 @@ class Executor {
 
         // Keep only row references in the joined tuple; later operators read
         // column values directly from each table's PAX strips.
+        const bool keep_build = is_inner || is_left;
         output->tables = probe.tables;
-        output->tables.insert(output->tables.end(), build.tables.begin(),
-                              build.tables.end());
+        if (keep_build) {
+            output->tables.insert(output->tables.end(),
+                                  build.tables.begin(), build.tables.end());
+        }
         output->refs.assign(output->tables.size(), {});
 
         struct WorkerOutput {
@@ -552,6 +934,40 @@ class Executor {
                 WorkerOutput& local = local_outputs[worker_idx];
                 local.refs.assign(output->tables.size(), {});
                 std::string probe_key;
+                PredicateEvaluator residual_evaluator;
+                std::vector<std::string_view> residual_cells(
+                    residual_columns.size());
+                std::vector<bool> residual_nulls(residual_columns.size());
+                auto residual_ok = [&](size_t probe_idx,
+                                       size_t build_idx) -> bool {
+                    if (!has_residual) return true;
+                    for (size_t column_idx = 0;
+                         column_idx < residual_columns.size();
+                         ++column_idx) {
+                        const ResidualColumn& column =
+                            residual_columns[column_idx];
+                        const NodeResult& source =
+                            column.from_build ? build : probe;
+                        const size_t source_row =
+                            column.from_build ? build_idx : probe_idx;
+                        const uint64_t ref =
+                            source.refs[column.ref_position][source_row];
+                        if (ref == kNullRowRef) {
+                            residual_cells[column_idx] = {};
+                            residual_nulls[column_idx] = true;
+                            continue;
+                        }
+
+                        residual_cells[column_idx] =
+                            ValueOf(column.table_idx, ref, column.column);
+                        residual_nulls[column_idx] =
+                            NullOf(column.table_idx, ref, column.column);
+                    }
+                    residual_evaluator.set_row_from_views(residual_cells,
+                                                          residual_nulls);
+                    return residual_evaluator.evaluate(
+                        join.residual().predicate().expr());
+                };
                 const size_t begin = probe_rows * worker_idx / worker_count;
                 const size_t end =
                     probe_rows * (worker_idx + 1) / worker_count;
@@ -561,7 +977,47 @@ class Executor {
                     const auto match = has_probe_key
                                            ? hash_table.find(probe_key)
                                            : hash_table.end();
+                    bool matched =
+                        match != hash_table.end() && !match->second.empty();
+                    if (matched && has_residual) {
+                        matched = false;
+                        for (const size_t build_idx : match->second) {
+                            if (residual_ok(probe_idx, build_idx)) {
+                                matched = true;
+                                break;
+                            }
+                        }
+                    }
+
                     if (match == hash_table.end()) {
+                        if (!is_left && !is_anti) continue;
+                        for (size_t column_idx = 0;
+                             column_idx < probe.tables.size(); ++column_idx) {
+                            local.refs[column_idx].push_back(
+                                probe.refs[column_idx][probe_idx]);
+                        }
+                        if (is_anti) continue;
+                        for (size_t column_idx = 0;
+                             column_idx < build.tables.size(); ++column_idx) {
+                            local.refs[probe.tables.size() + column_idx]
+                                .push_back(kNullRowRef);
+                        }
+                        continue;
+                    }
+
+                    if (is_semi || is_anti) {
+                        if (matched == is_semi) {
+                            for (size_t column_idx = 0;
+                                 column_idx < probe.tables.size();
+                                 ++column_idx) {
+                                local.refs[column_idx].push_back(
+                                    probe.refs[column_idx][probe_idx]);
+                            }
+                        }
+                        continue;
+                    }
+
+                    if (!matched) {
                         if (!is_left) continue;
                         for (size_t column_idx = 0;
                              column_idx < probe.tables.size(); ++column_idx) {
@@ -577,6 +1033,10 @@ class Executor {
                     }
 
                     for (const size_t build_idx : match->second) {
+                        if (has_residual &&
+                            !residual_ok(probe_idx, build_idx)) {
+                            continue;
+                        }
                         for (size_t column_idx = 0;
                              column_idx < probe.tables.size(); ++column_idx) {
                             local.refs[column_idx].push_back(
@@ -624,6 +1084,7 @@ class Executor {
         std::vector<DecimalValue> decimals;
         std::vector<std::string> strings;
         std::vector<bool> has_value;
+        std::vector<std::set<std::string>> distinct_values;
     };
 
     struct OutputRow {
@@ -632,6 +1093,46 @@ class Executor {
     };
 
     using GroupMap = std::unordered_map<std::string, GroupState>;
+
+    static uint32_t FilterTableForAggregate(
+        const pb::QueryBlockAggFunc& function) {
+        if (!function.has_filter()) return function.arg_table();
+        if (function.kind() == pb::QueryBlockAggFunc::COUNT &&
+            !function.has_arg()) {
+            return function.arg_table();
+        }
+        return function.filter_table();
+    }
+
+    bool BuildPredicateRowForTable(uint32_t table_idx, uint64_t ref,
+                                   uint32_t column_count,
+                                   std::vector<std::string_view>* cells,
+                                   std::vector<bool>* nulls) const {
+        if (cells == nullptr || nulls == nullptr) return false;
+        if (ref == kNullRowRef) return false;
+        if (!IsVirtualTable(table_idx)) {
+            const PaxRowRef row = ToRowRef(table_idx, ref);
+            if (row.group == nullptr ||
+                row.group->schema().field_count() <
+                    static_cast<size_t>(column_count) + 1) {
+                return false;
+            }
+        } else {
+            const VirtualTable* table = FindVirtualTable(table_idx);
+            if (table == nullptr || ref >= table->values.size()) {
+                return false;
+            }
+        }
+
+        cells->resize(column_count);
+        nulls->resize(column_count);
+        for (uint32_t column_idx = 0; column_idx < column_count;
+             ++column_idx) {
+            (*cells)[column_idx] = ValueOf(table_idx, ref, column_idx);
+            (*nulls)[column_idx] = NullOf(table_idx, ref, column_idx);
+        }
+        return true;
+    }
 
     bool AccumulateRange(const pb::QueryBlockAggregate& aggregate,
                          const NodeResult& input, size_t begin, size_t end,
@@ -649,15 +1150,24 @@ class Executor {
         }
 
         std::vector<int> aggregate_positions(aggregate_count, -1);
+        std::vector<int> filter_positions(aggregate_count, -1);
         for (int aggregate_idx = 0; aggregate_idx < aggregate_count;
              ++aggregate_idx) {
             const pb::QueryBlockAggFunc& function =
                 aggregate.aggs(aggregate_idx);
-            if (function.has_arg() || function.has_filter()) {
+            if (function.has_arg()) {
                 aggregate_positions[aggregate_idx] =
                     input.table_pos(function.arg_table());
                 if (aggregate_positions[aggregate_idx] < 0) {
                     return fail("aggregate table is not in aggregate input");
+                }
+            }
+            if (function.has_filter()) {
+                filter_positions[aggregate_idx] =
+                    input.table_pos(FilterTableForAggregate(function));
+                if (filter_positions[aggregate_idx] < 0) {
+                    return fail(
+                        "aggregate filter table is not in aggregate input");
                 }
             }
             if (function.has_arg() &&
@@ -670,6 +1180,8 @@ class Executor {
         PredicateEvaluator evaluator;
         std::string key_buffer;
         std::vector<std::string_view> group_values(group_count);
+        std::vector<std::string_view> filter_values;
+        std::vector<bool> filter_nulls;
         for (size_t row_idx = begin; row_idx < end; ++row_idx) {
             key_buffer.clear();
             for (int group_idx = 0; group_idx < group_count; ++group_idx) {
@@ -699,6 +1211,7 @@ class Executor {
                 new_state.decimals.assign(aggregate_count, DecimalValue{});
                 new_state.strings.assign(aggregate_count, {});
                 new_state.has_value.assign(aggregate_count, false);
+                new_state.distinct_values.resize(aggregate_count);
                 state = &groups->emplace(std::move(key_buffer),
                                          std::move(new_state))
                              .first->second;
@@ -718,14 +1231,20 @@ class Executor {
                     input_pos < 0 || ref != kNullRowRef;
 
                 if (function.has_filter() && function.filter().has_expr()) {
-                    if (!has_arg_row) continue;
-                    PaxRowRef row = ToRowRef(function.arg_table(), ref);
-                    if (row.group == nullptr ||
-                        !evaluator.set_row_from_pax(
-                            *row.group, row.slot,
-                            function.filter().num_columns())) {
-                        return fail("aggregate filter cannot read PAX columns");
+                    const int filter_pos = filter_positions[aggregate_idx];
+                    const uint64_t filter_ref =
+                        input.refs[filter_pos][row_idx];
+                    if (filter_ref == kNullRowRef) continue;
+                    const uint32_t filter_table =
+                        FilterTableForAggregate(function);
+                    if (!BuildPredicateRowForTable(
+                            filter_table, filter_ref,
+                            function.filter().num_columns(), &filter_values,
+                            &filter_nulls)) {
+                        return fail(
+                            "aggregate filter cannot read table columns");
                     }
+                    evaluator.set_row_from_views(filter_values, filter_nulls);
                     if (!evaluator.evaluate(function.filter().expr())) {
                         continue;
                     }
@@ -733,6 +1252,17 @@ class Executor {
 
                 switch (function.kind()) {
                     case pb::QueryBlockAggFunc::COUNT:
+                        if (function.distinct()) {
+                            if (!function.has_arg() || !has_arg_row) break;
+                            std::string_view value;
+                            if (ReadAggregateColumn(
+                                    function.arg(), input, row_idx,
+                                    function.arg_table(), &value)) {
+                                state->distinct_values[aggregate_idx].emplace(
+                                    value);
+                            }
+                            break;
+                        }
                         if (function.has_arg() && !has_arg_row) break;
                         state->counts[aggregate_idx] += 1;
                         break;
@@ -819,6 +1349,12 @@ class Executor {
                     aggregate.aggs(aggregate_idx);
                 switch (function.kind()) {
                     case pb::QueryBlockAggFunc::COUNT:
+                        if (function.distinct()) {
+                            destination_state.distinct_values[aggregate_idx]
+                                .merge(source_state
+                                           .distinct_values[aggregate_idx]);
+                            break;
+                        }
                         destination_state.counts[aggregate_idx] +=
                             source_state.counts[aggregate_idx];
                         break;
@@ -880,9 +1416,18 @@ class Executor {
         *is_null = false;
         switch (function.kind()) {
             case pb::QueryBlockAggFunc::COUNT:
-                return std::to_string(state.counts[aggregate_idx]);
+                return std::to_string(
+                    function.distinct()
+                        ? state.distinct_values[aggregate_idx].size()
+                        : state.counts[aggregate_idx]);
             case pb::QueryBlockAggFunc::SUM:
                 if (state.counts[aggregate_idx] == 0) {
+                    if (function.zero_if_empty()) {
+                        DecimalValue zero;
+                        zero.scale = static_cast<int>(function.arg_scale());
+                        zero.is_null = false;
+                        return format_decimal_value(zero);
+                    }
                     *is_null = true;
                     return {};
                 }
@@ -911,6 +1456,128 @@ class Executor {
             default:
                 *is_null = true;
                 return {};
+        }
+    }
+
+    bool EvaluateOutputExpression(const pb::FilterExpr& expression,
+                                  const pb::QueryBlockAggregate& aggregate,
+                                  const GroupState& state,
+                                  DecimalValue* result) {
+        if (result == nullptr) return fail("missing output expression result");
+
+        using FE = pb::FilterExpr;
+        switch (expression.op()) {
+            case FE::COLUMN_REF: {
+                const uint32_t ordinal = expression.column_index();
+                const uint32_t group_count =
+                    static_cast<uint32_t>(aggregate.group_columns_size());
+                if (ordinal < group_count) {
+                    *result = parse_decimal_value(state.keys[ordinal]);
+                    return true;
+                }
+
+                const uint32_t aggregate_idx = ordinal - group_count;
+                if (aggregate_idx >=
+                    static_cast<uint32_t>(aggregate.aggs_size())) {
+                    return fail("output expression ordinal out of range");
+                }
+                bool is_null = false;
+                const std::string value = AggregateValue(
+                    aggregate.aggs(aggregate_idx), state,
+                    static_cast<int>(aggregate_idx), &is_null);
+                if (is_null) {
+                    *result = DecimalValue{};
+                    result->is_null = true;
+                    return true;
+                }
+                *result = parse_decimal_value(value);
+                return true;
+            }
+            case FE::CONST_INT:
+                result->mantissa = expression.int_val();
+                result->scale = 0;
+                result->is_null = false;
+                return true;
+            case FE::CONST_UINT:
+                result->mantissa =
+                    static_cast<__int128>(expression.uint_val());
+                result->scale = 0;
+                result->is_null = false;
+                return true;
+            case FE::CONST_STRING:
+                *result = parse_decimal_value(expression.string_val());
+                return true;
+            case FE::CONST_NULL:
+                *result = DecimalValue{};
+                result->is_null = true;
+                return true;
+            case FE::OP_ADD:
+            case FE::OP_SUB: {
+                if (expression.children_size() != 2) {
+                    return fail("output expression arity mismatch");
+                }
+                DecimalValue lhs;
+                DecimalValue rhs;
+                if (!EvaluateOutputExpression(expression.children(0),
+                                              aggregate, state, &lhs) ||
+                    !EvaluateOutputExpression(expression.children(1),
+                                              aggregate, state, &rhs)) {
+                    return false;
+                }
+                if (expression.op() == FE::OP_SUB) {
+                    rhs.mantissa = -rhs.mantissa;
+                }
+                add_decimal_value(lhs, rhs);
+                *result = lhs;
+                return true;
+            }
+            case FE::OP_MUL: {
+                if (expression.children_size() != 2) {
+                    return fail("output expression arity mismatch");
+                }
+                DecimalValue lhs;
+                DecimalValue rhs;
+                if (!EvaluateOutputExpression(expression.children(0),
+                                              aggregate, state, &lhs) ||
+                    !EvaluateOutputExpression(expression.children(1),
+                                              aggregate, state, &rhs)) {
+                    return false;
+                }
+                result->mantissa = lhs.mantissa * rhs.mantissa;
+                result->scale = lhs.scale + rhs.scale;
+                result->is_null = lhs.is_null || rhs.is_null;
+                return true;
+            }
+            case FE::OP_DIV: {
+                if (expression.children_size() != 2) {
+                    return fail("output expression arity mismatch");
+                }
+                DecimalValue lhs;
+                DecimalValue rhs;
+                if (!EvaluateOutputExpression(expression.children(0),
+                                              aggregate, state, &lhs) ||
+                    !EvaluateOutputExpression(expression.children(1),
+                                              aggregate, state, &rhs)) {
+                    return false;
+                }
+                // Match MySQL DECIMAL division: left operand scale plus the
+                // default div_precision_increment, rounded half up.
+                *result = divide_decimal_values(lhs, rhs, lhs.scale + 4);
+                return true;
+            }
+            case FE::OP_NEG: {
+                if (expression.children_size() != 1) {
+                    return fail("output expression arity mismatch");
+                }
+                if (!EvaluateOutputExpression(expression.children(0),
+                                              aggregate, state, result)) {
+                    return false;
+                }
+                result->mantissa = -result->mantissa;
+                return true;
+            }
+            default:
+                return fail("unsupported output expression");
         }
     }
 
@@ -1086,6 +1753,60 @@ class Executor {
         }
     }
 
+    bool RunEmitRows(
+        const NodeResult& input,
+        pb::TxExecuteQueryBlock::Response* response) {
+        std::vector<int> output_positions(request_.output_size(), -1);
+        for (int output_idx = 0; output_idx < request_.output_size();
+             ++output_idx) {
+            const pb::QueryBlockOutputExpr& expression =
+                request_.output(output_idx);
+            if (expression.source() != pb::QueryBlockOutputExpr::COLUMN) {
+                return fail("row output source");
+            }
+            output_positions[output_idx] =
+                input.table_pos(expression.column().table_idx());
+            if (output_positions[output_idx] < 0) {
+                return fail("row output table is not in input");
+            }
+        }
+
+        std::vector<OutputRow> output_rows;
+        output_rows.reserve(input.rows());
+        for (size_t row_idx = 0; row_idx < input.rows(); ++row_idx) {
+            OutputRow row;
+            row.values.reserve(request_.output_size());
+            row.nulls.reserve(request_.output_size());
+
+            for (int output_idx = 0; output_idx < request_.output_size();
+                 ++output_idx) {
+                const pb::QueryBlockColumnRef& column =
+                    request_.output(output_idx).column();
+                const uint64_t ref =
+                    input.refs[output_positions[output_idx]][row_idx];
+                if (NullOf(column.table_idx(), ref, column.column())) {
+                    row.values.emplace_back();
+                    row.nulls.push_back(true);
+                    continue;
+                }
+
+                std::string_view value =
+                    ValueOf(column.table_idx(), ref, column.column());
+                if (column.prefix_len() > 0 &&
+                    value.size() > column.prefix_len()) {
+                    value = value.substr(0, column.prefix_len());
+                }
+                row.values.emplace_back(value);
+                row.nulls.push_back(false);
+            }
+            output_rows.push_back(std::move(row));
+        }
+
+        if (!SortOutputRows(&output_rows)) return false;
+        EmitOutputRows(output_rows, response);
+        return true;
+    }
+
     bool RunAggregateAndEmit(
         const pb::QueryBlockAggregate& aggregate,
         pb::TxExecuteQueryBlock::Response* response) {
@@ -1133,7 +1854,51 @@ class Executor {
             state.decimals.assign(aggregate.aggs_size(), DecimalValue{});
             state.strings.assign(aggregate.aggs_size(), {});
             state.has_value.assign(aggregate.aggs_size(), false);
+            state.distinct_values.resize(aggregate.aggs_size());
             groups.emplace(std::string(), std::move(state));
+        }
+
+        // HAVING predicates read the first-stage aggregate row layout:
+        // group values first, then aggregate values.
+        if (aggregate.has_having() && aggregate.having().has_expr()) {
+            PredicateEvaluator evaluator;
+            std::vector<std::string> values;
+            std::vector<std::string_view> cells;
+            std::vector<bool> nulls;
+            for (auto group_it = groups.begin(); group_it != groups.end();) {
+                const GroupState& state = group_it->second;
+                values.clear();
+                cells.clear();
+                nulls.clear();
+                values.reserve(group_count + aggregate.aggs_size());
+                cells.reserve(group_count + aggregate.aggs_size());
+                nulls.reserve(group_count + aggregate.aggs_size());
+
+                for (int group_idx = 0; group_idx < group_count;
+                     ++group_idx) {
+                    values.push_back(state.keys[group_idx]);
+                    nulls.push_back(false);
+                }
+                for (int aggregate_idx = 0;
+                     aggregate_idx < aggregate.aggs_size();
+                     ++aggregate_idx) {
+                    bool is_null = false;
+                    values.push_back(AggregateValue(
+                        aggregate.aggs(aggregate_idx), state,
+                        aggregate_idx, &is_null));
+                    nulls.push_back(is_null);
+                }
+                for (const std::string& value : values) {
+                    cells.push_back(value);
+                }
+
+                evaluator.set_row_from_views(cells, nulls);
+                if (evaluator.evaluate(aggregate.having().expr())) {
+                    ++group_it;
+                } else {
+                    group_it = groups.erase(group_it);
+                }
+            }
         }
 
         std::vector<OutputRow> output_rows;
@@ -1177,6 +1942,22 @@ class Executor {
                             row.nulls.push_back(is_null);
                             break;
                         }
+                        case pb::QueryBlockOutputExpr::EXPR: {
+                            DecimalValue value;
+                            if (!EvaluateOutputExpression(
+                                    expression.expr(), aggregate, state,
+                                    &value)) {
+                                return false;
+                            }
+                            round_decimal_value(
+                                &value,
+                                static_cast<int>(expression.result_scale()));
+                            row.values.push_back(
+                                value.is_null ? std::string()
+                                              : format_decimal_value(value));
+                            row.nulls.push_back(value.is_null);
+                            break;
+                        }
                         default:
                             return fail(
                                 "unsupported query-block output source");
@@ -1203,6 +1984,18 @@ class Executor {
                 if (!RunJoin(node.join(), &results_[node_idx])) return false;
                 continue;
             }
+            if (node.has_filter()) {
+                if (!RunTupleFilter(node.filter(), &results_[node_idx])) {
+                    return false;
+                }
+                continue;
+            }
+            if (node.has_sub_block()) {
+                if (!RunSubBlock(node.sub_block(), &results_[node_idx])) {
+                    return false;
+                }
+                continue;
+            }
             if (node.has_aggregate()) {
                 if (node_idx != request_.nodes_size() - 1) {
                     return fail("aggregate must be the root node");
@@ -1211,7 +2004,8 @@ class Executor {
             }
             return fail("unknown query-block node");
         }
-        return fail("root must be an aggregate node");
+        if (request_.nodes_size() == 0) return fail("root node missing");
+        return RunEmitRows(results_.back(), response);
     }
 
     bool TablesAreStillQuiet() const {
@@ -1252,6 +2046,7 @@ class Executor {
     std::vector<uint64_t> slot_snapshots_;
     std::vector<uint64_t> overflow_snapshots_;
     std::vector<NodeResult> results_;
+    std::vector<VirtualTable> virtual_tables_;
 };
 
 const std::string& default_error(const Executor& executor) {

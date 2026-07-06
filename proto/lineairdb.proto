@@ -707,6 +707,15 @@ message QueryBlockAggFunc {
     uint32 arg_scale = 5;
     // MIN/MAX comparison semantics: 0=numeric decimal, 1=binary string.
     uint32 cmp_kind = 6;
+    // Conditional SUM over an ELSE 0 branch returns 0 for a group with no
+    // matching rows instead of SQL NULL.
+    bool zero_if_empty = 7;
+    // Table read by the optional per-row predicate. It may differ from
+    // arg_table when the filter and aggregate argument come from different
+    // joined tables.
+    uint32 filter_table = 8;
+    // COUNT(DISTINCT col): count distinct non-NULL cell values per group.
+    bool distinct = 9;
 }
 
 message QueryBlockColumnRef {
@@ -723,6 +732,13 @@ message QueryBlockScan {
     PushedPredicate filter = 2;
 }
 
+message QueryBlockTupleFilter {
+    // Predicate over a joined tuple. FilterExpr COLUMN_REF ordinals address
+    // the columns registry below rather than one physical table.
+    PushedPredicate predicate = 1;
+    repeated QueryBlockColumnRef columns = 2;
+}
+
 message QueryBlockJoin {
     uint32 build = 1;  // Node index into TxExecuteQueryBlock.Request.nodes.
     uint32 probe = 2;
@@ -731,6 +747,13 @@ message QueryBlockJoin {
     repeated QueryBlockColumnRef probe_keys = 4;
     enum Type { INNER = 0; LEFT = 1; SEMI = 2; ANTI = 3; }
     Type type = 5;
+    // Optional per-match predicate over the combined probe/build tuple.
+    QueryBlockTupleFilter residual = 6;
+}
+
+message QueryBlockTupleFilterNode {
+    uint32 input = 1;
+    QueryBlockTupleFilter filter = 2;
 }
 
 message QueryBlockAggregate {
@@ -759,19 +782,33 @@ message QueryBlockSortKey {
     uint32 cmp_kind = 3;  // 0=int64 numeric, 1=binary string, 2=decimal numeric.
 }
 
+// A nested query block for a derived table. The server executes it recursively
+// and exposes its output rows as a virtual table. Virtual table indexes start at
+// tables_size and follow sub_block node order; virtual column refs address the
+// sub-block output ordinals, and refs are row numbers.
+message QueryBlockSubBlock {
+    TxExecuteQueryBlock.Request block = 1;
+}
+
 message QueryBlockNode {
     oneof op {
         QueryBlockScan scan = 1;
         QueryBlockJoin join = 2;
         QueryBlockAggregate aggregate = 3;
+        QueryBlockTupleFilterNode filter = 4;
+        QueryBlockSubBlock sub_block = 5;
     }
 }
 
 message QueryBlockOutputExpr {
-    enum Source { GROUP = 0; AGG = 1; COLUMN = 2; }
+    enum Source { GROUP = 0; AGG = 1; COLUMN = 2; EXPR = 3; }
     Source source = 1;
     uint32 ordinal = 2;      // GROUP: group key index; AGG: aggregate index.
     QueryBlockColumnRef column = 3;  // Used when source is COLUMN.
+    // Arithmetic expression over emitted aggregate-row values. COLUMN_REF
+    // ordinals address [group columns..., aggregate values...].
+    FilterExpr expr = 4;
+    uint32 result_scale = 5;
 }
 
 message TxExecuteQueryBlock {

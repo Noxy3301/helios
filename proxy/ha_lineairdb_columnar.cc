@@ -3,6 +3,8 @@
 #include <algorithm>
 #include <cassert>
 #include <cstdint>
+#include <cstring>
+#include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -17,9 +19,11 @@
 #include "mysqld_error.h"
 #include "sql/handler.h"
 #include "sql/item.h"
+#include "sql/item_cmpfunc.h"
 #include "sql/item_sum.h"
 #include "sql/item_timefunc.h"
 #include "sql/mem_root_array.h"
+#include "sql/nested_join.h"
 #include "sql/query_result.h"
 #include "sql/sql_const.h"
 #include "sql/sql_class.h"
@@ -139,6 +143,30 @@ class ItemColumnarValue final : public Item_string {
   }
 
   void set_null_value() { null_value = true; }
+
+  String *val_str(String *str) override {
+    return null_value ? nullptr : Item_string::val_str(str);
+  }
+
+  double val_real() override {
+    return null_value ? 0.0 : Item_string::val_real();
+  }
+
+  longlong val_int() override {
+    return null_value ? 0 : Item_string::val_int();
+  }
+
+  my_decimal *val_decimal(my_decimal *decimal_value) override {
+    return null_value ? nullptr : Item_string::val_decimal(decimal_value);
+  }
+
+  bool get_date(MYSQL_TIME *time, my_time_flags_t flags) override {
+    return null_value ? true : Item_string::get_date(time, flags);
+  }
+
+  bool get_time(MYSQL_TIME *time) override {
+    return null_value ? true : Item_string::get_time(time);
+  }
 };
 
 // Statement-local state owned by LEX::secondary_engine_execution_context.
@@ -249,6 +277,19 @@ bool GroupColumnIsBinarySafe(const Field *field) {
 }
 
 /**
+ * @brief Return true when a join key can use byte equality on stored cells.
+ *
+ * Integer cells and canonical DECIMAL text cells compare correctly with byte
+ * equality when both sides use the same MySQL result type.
+ */
+bool JoinColumnsUseByteEquality(const Field *left, const Field *right) {
+  if (left == nullptr || right == nullptr) return false;
+  if (left->result_type() != right->result_type()) return false;
+  return left->result_type() == INT_RESULT ||
+         left->result_type() == DECIMAL_RESULT;
+}
+
+/**
  * @brief Return the visible output ordinal used by an ORDER BY item.
  */
 int OrderOutputOrdinal(Item *order_item,
@@ -338,7 +379,28 @@ Item *CaseToCountFilter(Item *argument) {
   return predicate;
 }
 
+/**
+ * @brief Split SUM(CASE WHEN predicate THEN expression ELSE 0 END).
+ */
+bool CaseToFilteredSum(Item *argument, Item **predicate, Item **then_expr) {
+  if (argument->type() != Item::FUNC_ITEM) return false;
+  auto *function = down_cast<Item_func *>(argument);
+  if (function->functype() != Item_func::CASE_FUNC) return false;
+  if (function->argument_count() != 3) return false;
+
+  Item *condition = function->arguments()[0];
+  Item *value = function->arguments()[1];
+  Item *else_value = function->arguments()[2];
+  if (!IsBooleanFilterShape(condition)) return false;
+  if (!else_value->const_item() || else_value->val_int() != 0) return false;
+
+  *predicate = condition;
+  *then_expr = value;
+  return true;
+}
+
 struct QueryBlockTable {
+  Table_ref *table_ref = nullptr;
   TABLE *table = nullptr;
   table_map map = 0;
 };
@@ -460,6 +522,157 @@ bool SerializeAggregateExpressionForTables(
   }
 }
 
+struct TupleColumnRegistry {
+  std::vector<std::pair<int, const Field *>> columns;
+  std::function<int(const Field *)> table_of;
+  std::function<const Field *(const Field *, int)> resolve;
+
+  int ordinal_of(const Field *raw_field) {
+    const int table_idx = table_of(raw_field);
+    if (table_idx < 0) return -1;
+
+    const Field *field = resolve(raw_field, table_idx);
+    if (field == nullptr) return -1;
+
+    for (size_t column_idx = 0; column_idx < columns.size(); column_idx++) {
+      if (columns[column_idx].first == table_idx &&
+          columns[column_idx].second == field) {
+        return static_cast<int>(column_idx);
+      }
+    }
+    columns.push_back({table_idx, field});
+    return static_cast<int>(columns.size()) - 1;
+  }
+};
+
+/**
+ * @brief Serialize a predicate over an already joined tuple.
+ */
+bool SerializeTuplePredicate(Item *item,
+                             LineairDB::Protocol::FilterExpr *expression,
+                             TupleColumnRegistry *registry) {
+  SerializeColumnEncoder encoder = [registry](const Field *field) {
+    return registry->ordinal_of(field);
+  };
+  set_serialize_column_encoder(&encoder);
+  const bool ok = serialize_item(item, expression);
+  set_serialize_column_encoder(nullptr);
+  return ok;
+}
+
+/**
+ * @brief Return the column and width for SUBSTRING(column, 1, width).
+ */
+const Field *SubstringPrefixField(Item *item, uint32_t *prefix_len) {
+  Item *real = item->real_item();
+  if (real->type() != Item::FUNC_ITEM) return nullptr;
+
+  auto *function = down_cast<Item_func *>(real);
+  if (std::strcmp(function->func_name(), "substr") != 0 ||
+      function->argument_count() != 3) {
+    return nullptr;
+  }
+
+  Item *column = function->arguments()[0]->real_item();
+  Item *from = function->arguments()[1];
+  Item *length = function->arguments()[2];
+  if (column->type() != Item::FIELD_ITEM) return nullptr;
+  const Field *field = down_cast<Item_field *>(column)->field;
+  if (field->result_type() != STRING_RESULT) return nullptr;
+  if (!from->const_item() || from->val_int() != 1) return nullptr;
+  if (!length->const_item() || length->val_int() <= 0) return nullptr;
+
+  *prefix_len = static_cast<uint32_t>(length->val_int());
+  return field;
+}
+
+/**
+ * @brief Serialize a scan predicate, including safe string-prefix rewrites.
+ *
+ * The shared predicate serializer does not model SUBSTRING. For the prefix form
+ * SUBSTRING(column, 1, N) = 'value' or IN (...), rewrite the predicate to
+ * column LIKE 'value%' when every constant has exactly N bytes and does not
+ * contain LIKE wildcards.
+ */
+bool SerializeScanPredicate(Item *condition,
+                            LineairDB::Protocol::FilterExpr *expression) {
+  if (serialize_item(condition, expression)) return true;
+  expression->Clear();
+
+  Item *real = condition->real_item();
+  if (real->type() != Item::FUNC_ITEM) return false;
+
+  auto *function = down_cast<Item_func *>(real);
+  uint32_t prefix_len = 0;
+  const Field *field = nullptr;
+  std::vector<std::string> values;
+  bool negated = false;
+
+  if (function->functype() == Item_func::IN_FUNC) {
+    auto *in_function = down_cast<Item_func_in *>(function);
+    negated = in_function->negated;
+    field = SubstringPrefixField(function->arguments()[0], &prefix_len);
+    if (field == nullptr) return false;
+
+    for (uint arg_idx = 1; arg_idx < function->argument_count(); arg_idx++) {
+      Item *value_item = function->arguments()[arg_idx];
+      if (!value_item->const_item()) return false;
+
+      String value_buffer;
+      String *value = value_item->val_str(&value_buffer);
+      if (value == nullptr) return false;
+      values.emplace_back(value->ptr(), value->length());
+    }
+  } else if (function->functype() == Item_func::EQ_FUNC) {
+    field = SubstringPrefixField(function->arguments()[0], &prefix_len);
+    Item *value_item = function->arguments()[1];
+    if (field == nullptr || !value_item->const_item()) return false;
+
+    String value_buffer;
+    String *value = value_item->val_str(&value_buffer);
+    if (value == nullptr) return false;
+    values.emplace_back(value->ptr(), value->length());
+  } else {
+    return false;
+  }
+
+  // Keep negated forms on the fallback path so NULL behavior remains SQL-like.
+  if (negated) return false;
+
+  for (const std::string &value : values) {
+    if (value.size() != prefix_len) return false;
+    if (value.find('%') != std::string::npos ||
+        value.find('_') != std::string::npos) {
+      return false;
+    }
+  }
+
+  auto emit_like = [&](LineairDB::Protocol::FilterExpr *target,
+                       const std::string &value) {
+    target->set_op(LineairDB::Protocol::FilterExpr::OP_LIKE);
+
+    auto *column = target->add_children();
+    column->set_op(LineairDB::Protocol::FilterExpr::COLUMN_REF);
+    column->set_column_index(field->field_index());
+    column->set_compare_type(3);
+
+    auto *pattern = target->add_children();
+    pattern->set_op(LineairDB::Protocol::FilterExpr::CONST_STRING);
+    pattern->set_string_val(value + "%");
+    pattern->set_compare_type(3);
+  };
+
+  if (values.size() == 1) {
+    emit_like(expression, values[0]);
+  } else {
+    expression->set_op(LineairDB::Protocol::FilterExpr::OP_OR);
+    for (const std::string &value : values) {
+      emit_like(expression->add_children(), value);
+    }
+  }
+  return true;
+}
+
 /**
  * @brief Return the date field inside EXTRACT(YEAR FROM field), if supported.
  */
@@ -491,13 +704,13 @@ bool SerializeTableFilters(const std::vector<Item *> &filters, TABLE *table,
   if (filters.empty()) return true;
   predicate->set_num_columns(table->s->fields);
   if (filters.size() == 1) {
-    return serialize_item(filters[0], predicate->mutable_expr());
+    return SerializeScanPredicate(filters[0], predicate->mutable_expr());
   }
 
   auto *root = predicate->mutable_expr();
   root->set_op(LineairDB::Protocol::FilterExpr::OP_AND);
   for (Item *filter : filters) {
-    if (!serialize_item(filter, root->add_children())) return false;
+    if (!SerializeScanPredicate(filter, root->add_children())) return false;
   }
   return true;
 }
@@ -618,8 +831,7 @@ bool RecognizeDerivedRegroup(JOIN *join, ColumnarExecutionContext *ctx,
     } else {
       LDB_COL_REJECT("inner join key tables");
     }
-    if (preserved_key->result_type() != INT_RESULT ||
-        nullable_key->result_type() != INT_RESULT) {
+    if (!JoinColumnsUseByteEquality(preserved_key, nullable_key)) {
       LDB_COL_REJECT("inner join key type");
     }
     if (preserved_key->is_nullable() || nullable_key->is_nullable()) {
@@ -865,7 +1077,7 @@ bool RecognizeFlattenedAggregate(JOIN *join, ColumnarExecutionContext *ctx,
     if (table_ref->outer_join) LDB_COL_REJECT("inner outer join");
     if (!loaded_tables->contains(table->s->db.str, table->s->table_name.str))
       LDB_COL_REJECT("inner not SECONDARY_LOADed");
-    tables.push_back({table, table_ref->map()});
+    tables.push_back({table_ref, table, table_ref->map()});
   }
   if (tables.size() < 2) LDB_COL_REJECT("inner too few tables");
 
@@ -926,8 +1138,7 @@ bool RecognizeFlattenedAggregate(JOIN *join, ColumnarExecutionContext *ctx,
     if (left_table < 0 || right_table < 0 || left_table == right_table) {
       LDB_COL_REJECT("inner join key tables");
     }
-    if (left_raw->result_type() != INT_RESULT ||
-        right_raw->result_type() != INT_RESULT) {
+    if (!JoinColumnsUseByteEquality(left_raw, right_raw)) {
       LDB_COL_REJECT("inner join key type");
     }
 
@@ -1148,57 +1359,150 @@ bool RecognizeFlattenedAggregate(JOIN *join, ColumnarExecutionContext *ctx,
 }
 
 /**
- * @brief Recognize aggregate query blocks supported by LINEAIRDB_COLUMNAR.
+ * @brief Build a query-block request for aggregate shapes.
  *
- * Unsupported shapes return false and set `why`; callers convert that into a
- * secondary-engine reject that may fall back to the primary engine when the
- * session allows it.
+ * Unsupported shapes return false and set `why`; callers decide whether the
+ * primary engine may run instead.
  */
-bool RecognizeQueryBlock(JOIN *join, ColumnarExecutionContext *ctx,
-                         const char **why) {
+bool BuildQueryBlockRequest(
+    JOIN *join, Query_block *qb,
+    LineairDB::Protocol::TxExecuteQueryBlock::Request *request_out,
+    const char **why) {
 #define LDB_COL_REJECT(reason) \
   do {                         \
     *why = (reason);           \
     return false;              \
   } while (0)
 
-  ctx->query_block_request.Clear();
-  ctx->query_block_ready = false;
-
-  Query_block *qb = join->query_block;
-  if (qb == nullptr || qb->outer_query_block() != nullptr)
-    LDB_COL_REJECT("not top-level");
+  if (qb == nullptr || request_out == nullptr) LDB_COL_REJECT("missing block");
 
   Query_expression *unit = qb->master_query_expression();
   if (unit == nullptr || !unit->is_simple())
     LDB_COL_REJECT("not simple unit");
 
-  if (qb->leaf_tables != nullptr && qb->leaf_tables->next_leaf == nullptr &&
-      qb->leaf_tables->is_view_or_derived()) {
-    if (RecognizeDerivedRegroup(join, ctx, why)) return true;
-    return RecognizeFlattenedAggregate(join, ctx, why);
-  }
-
-  if (qb->having_cond() != nullptr) LDB_COL_REJECT("has HAVING");
   if (qb->is_distinct()) LDB_COL_REJECT("has DISTINCT");
   if (qb->has_windows()) LDB_COL_REJECT("has windows");
   if (qb->olap != UNSPECIFIED_OLAP_TYPE) LDB_COL_REJECT("has ROLLUP");
-  if (!join->implicit_grouping && qb->group_list.elements == 0)
-    LDB_COL_REJECT("no aggregation");
+  const bool implicit_grouping =
+      join != nullptr ? join->implicit_grouping : qb->is_implicitly_grouped();
+  const bool plain_rows =
+      !implicit_grouping && qb->group_list.elements == 0;
+
+  struct SemijoinNest {
+    Table_ref *nest = nullptr;
+    bool anti = false;
+    std::vector<int> inner_tables;
+    std::vector<Item *> residual_predicates;
+  };
+
+  std::vector<SemijoinNest> semijoin_nests;
+  for (Table_ref *nest : qb->sj_nests) {
+    semijoin_nests.push_back(
+        {nest, nest->is_aj_nest(), {}, {}});
+  }
+
+  auto semijoin_nest_of = [&](Table_ref *table_ref) -> int {
+    for (Table_ref *embedding = table_ref->embedding; embedding != nullptr;
+         embedding = embedding->embedding) {
+      for (size_t nest_idx = 0; nest_idx < semijoin_nests.size();
+           nest_idx++) {
+        if (embedding == semijoin_nests[nest_idx].nest) {
+          return static_cast<int>(nest_idx);
+        }
+      }
+
+      if (embedding->is_sj_nest() || embedding->is_aj_nest()) {
+        semijoin_nests.push_back(
+            {embedding, embedding->is_aj_nest(), {}, {}});
+        return static_cast<int>(semijoin_nests.size()) - 1;
+      }
+    }
+    return -1;
+  };
 
   // The request table order is the stable numbering used by scan, join,
-  // grouping, and aggregate argument references.
+  // grouping, and aggregate argument references. Real loaded tables come
+  // first; derived tables follow them and become server-side virtual tables.
   std::vector<QueryBlockTable> tables;
+  std::vector<int> main_tables;
+  std::vector<int> table_semijoin_nest;
+  std::vector<bool> table_is_virtual;
+  std::vector<Query_block *> virtual_blocks;
+  std::vector<bool> virtual_block_is_scalar_aggregate;
+  std::vector<int> outer_derived_tables;
   for (Table_ref *table_ref = qb->leaf_tables; table_ref != nullptr;
        table_ref = table_ref->next_leaf) {
+    if (table_ref->is_view_or_derived()) continue;
     TABLE *table = table_ref->table;
     if (table == nullptr || table->s == nullptr) LDB_COL_REJECT("no TABLE");
-    if (table_ref->outer_join) LDB_COL_REJECT("outer join");
+    const int semijoin_nest = semijoin_nest_of(table_ref);
+    if (semijoin_nest < 0 && table_ref->outer_join)
+      LDB_COL_REJECT("outer join");
     if (!loaded_tables->contains(table->s->db.str, table->s->table_name.str))
       LDB_COL_REJECT("not SECONDARY_LOADed");
-    tables.push_back({table, table_ref->map()});
+    tables.push_back({table_ref, table, table_ref->map()});
+    table_semijoin_nest.push_back(semijoin_nest);
+    table_is_virtual.push_back(false);
+    if (semijoin_nest < 0) {
+      main_tables.push_back(static_cast<int>(tables.size()) - 1);
+    } else {
+      semijoin_nests[semijoin_nest].inner_tables.push_back(
+          static_cast<int>(tables.size()) - 1);
+    }
   }
-  if (tables.empty()) LDB_COL_REJECT("no tables");
+
+  const size_t real_table_count = tables.size();
+  for (Table_ref *table_ref = qb->leaf_tables; table_ref != nullptr;
+       table_ref = table_ref->next_leaf) {
+    if (!table_ref->is_view_or_derived()) continue;
+    const int semijoin_nest = semijoin_nest_of(table_ref);
+    if (table_ref->table == nullptr) LDB_COL_REJECT("derived no TABLE");
+
+    Query_expression *derived_unit = table_ref->derived_query_expression();
+    if (derived_unit == nullptr || !derived_unit->is_simple())
+      LDB_COL_REJECT("derived not simple");
+    Query_block *derived_qb = derived_unit->first_query_block();
+    if (derived_qb == nullptr) LDB_COL_REJECT("derived no query block");
+
+    tables.push_back({table_ref, table_ref->table, table_ref->map()});
+    table_semijoin_nest.push_back(semijoin_nest);
+    table_is_virtual.push_back(true);
+    virtual_blocks.push_back(derived_qb);
+    virtual_block_is_scalar_aggregate.push_back(
+        derived_qb->is_implicitly_grouped() &&
+        derived_qb->group_list.elements == 0);
+    if (semijoin_nest >= 0) {
+      semijoin_nests[semijoin_nest].inner_tables.push_back(
+          static_cast<int>(tables.size()) - 1);
+    } else if (table_ref->outer_join) {
+      outer_derived_tables.push_back(static_cast<int>(tables.size()) - 1);
+    } else {
+      main_tables.push_back(static_cast<int>(tables.size()) - 1);
+    }
+  }
+  if (main_tables.empty()) LDB_COL_REJECT("no tables");
+
+  auto resolve_query_field = [&](const Field *field,
+                                 int table_idx) -> const Field * {
+    if (table_idx < 0 ||
+        table_idx >= static_cast<int>(table_is_virtual.size())) {
+      return nullptr;
+    }
+    if (table_is_virtual[table_idx]) return field;
+    return ResolveBaseField(field, tables[table_idx].table);
+  };
+
+  auto is_scalar_virtual_table = [&](int table_idx) {
+    if (table_idx < static_cast<int>(real_table_count) ||
+        table_idx >= static_cast<int>(table_is_virtual.size()) ||
+        !table_is_virtual[table_idx]) {
+      return false;
+    }
+    const size_t virtual_idx =
+        static_cast<size_t>(table_idx) - real_table_count;
+    return virtual_idx < virtual_block_is_scalar_aggregate.size() &&
+           virtual_block_is_scalar_aggregate[virtual_idx];
+  };
 
   struct JoinEdge {
     int left_table = -1;
@@ -1207,30 +1511,233 @@ bool RecognizeQueryBlock(JOIN *join, ColumnarExecutionContext *ctx,
     const Field *right_field = nullptr;
   };
 
+  auto semijoin_outer_equivalent = [&](const Field *field) -> const Field * {
+    for (const SemijoinNest &semijoin : semijoin_nests) {
+      if (semijoin.nest == nullptr ||
+          semijoin.nest->nested_join == nullptr) {
+        continue;
+      }
+      const auto &outer_exprs =
+          semijoin.nest->nested_join->sj_outer_exprs;
+      const auto &inner_exprs =
+          semijoin.nest->nested_join->sj_inner_exprs;
+      for (size_t expr_idx = 0;
+           expr_idx < outer_exprs.size() && expr_idx < inner_exprs.size();
+           expr_idx++) {
+        Item *outer_item = outer_exprs[expr_idx]->real_item();
+        Item *inner_item = inner_exprs[expr_idx]->real_item();
+        if (outer_item->type() == Item::FIELD_ITEM &&
+            inner_item->type() == Item::FIELD_ITEM &&
+            down_cast<Item_field *>(inner_item)->field == field) {
+          return down_cast<Item_field *>(outer_item)->field;
+        }
+      }
+    }
+    return field;
+  };
+
   std::vector<std::vector<Item *>> table_filters(tables.size());
   std::vector<JoinEdge> join_edges;
+  auto add_join_edge_if_supported = [&](const Field *left_raw,
+                                        const Field *right_raw) -> bool {
+    const int left_table = TableIndexOfField(left_raw, tables);
+    const int right_table = TableIndexOfField(right_raw, tables);
+    if (left_table < 0 || right_table < 0 || left_table == right_table) {
+      return false;
+    }
+    if (table_semijoin_nest[left_table] >= 0 ||
+        table_semijoin_nest[right_table] >= 0) {
+      return false;
+    }
+    if (!JoinColumnsUseByteEquality(left_raw, right_raw)) {
+      return false;
+    }
+
+    const Field *left_field = resolve_query_field(left_raw, left_table);
+    const Field *right_field = resolve_query_field(right_raw, right_table);
+    if (left_field == nullptr || right_field == nullptr) return false;
+    if ((!table_is_virtual[left_table] && left_field->is_nullable()) ||
+        (!table_is_virtual[right_table] && right_field->is_nullable())) {
+      return false;
+    }
+    join_edges.push_back({left_table, right_table, left_field, right_field});
+    return true;
+  };
+
+  std::vector<Item *> tuple_predicates;
   Item *where_cond =
-      qb->where_cond() != nullptr ? qb->where_cond() : join->where_cond;
+      qb->where_cond() != nullptr
+          ? qb->where_cond()
+          : (join != nullptr ? join->where_cond : nullptr);
   std::vector<Item *> predicates;
   FlattenAnd(where_cond, &predicates);
 
   // Local predicates become scan filters. Cross-table integer equalities become
-  // join edges; other cross-table shapes stay on the primary engine path.
+  // join edges. Other cross-table predicates are evaluated after the join as
+  // tuple filters.
   for (Item *predicate : predicates) {
     const table_map used = predicate->used_tables() & ~PSEUDO_TABLE_BITS;
     const int table_idx = SingleTableOf(used, tables);
     if (table_idx >= 0) {
+      if (table_is_virtual[table_idx]) {
+        tuple_predicates.push_back(predicate);
+        continue;
+      }
       table_filters[table_idx].push_back(predicate);
       continue;
     }
     if (used == 0) {
-      table_filters[0].push_back(predicate);
+      auto real_filter_table =
+          std::find_if(main_tables.begin(), main_tables.end(),
+                       [&](int candidate) {
+                         return !table_is_virtual[candidate];
+                       });
+      if (real_filter_table != main_tables.end()) {
+        table_filters[*real_filter_table].push_back(predicate);
+      } else {
+        tuple_predicates.push_back(predicate);
+      }
+      continue;
+    }
+
+    int predicate_nest = -1;
+    bool spans_multiple_nests = false;
+    for (size_t table_idx = 0; table_idx < tables.size(); table_idx++) {
+      if ((used & tables[table_idx].map) == 0) continue;
+      const int table_nest = table_semijoin_nest[table_idx];
+      if (table_nest < 0) continue;
+      if (predicate_nest >= 0 && predicate_nest != table_nest) {
+        spans_multiple_nests = true;
+      }
+      predicate_nest = table_nest;
+    }
+    if (spans_multiple_nests) LDB_COL_REJECT("predicate spans semijoins");
+    if (predicate->type() == Item::FUNC_ITEM &&
+        down_cast<Item_func *>(predicate)->functype() ==
+            Item_func::MULT_EQUAL_FUNC) {
+      auto *multiple_equal = down_cast<Item_equal *>(predicate);
+      if (multiple_equal->const_arg() != nullptr) {
+        LDB_COL_REJECT("multiple equality with constant");
+      }
+      std::vector<const Field *> equal_fields;
+      for (Item_field &field_item : multiple_equal->get_fields()) {
+        equal_fields.push_back(field_item.field);
+      }
+      for (size_t left_idx = 0; left_idx < equal_fields.size(); left_idx++) {
+        for (size_t right_idx = left_idx + 1; right_idx < equal_fields.size();
+             right_idx++) {
+          add_join_edge_if_supported(equal_fields[left_idx],
+                                     equal_fields[right_idx]);
+        }
+      }
+      continue;
+    }
+    if (predicate_nest >= 0) {
+      if (predicate->type() == Item::FUNC_ITEM &&
+          down_cast<Item_func *>(predicate)->functype() ==
+              Item_func::EQ_FUNC) {
+        auto *equals = down_cast<Item_func *>(predicate);
+        Item *left = equals->arguments()[0]->real_item();
+        Item *right = equals->arguments()[1]->real_item();
+        if (left->type() == Item::FIELD_ITEM &&
+            right->type() == Item::FIELD_ITEM) {
+          const Field *left_raw = semijoin_outer_equivalent(
+              down_cast<Item_field *>(left)->field);
+          const Field *right_raw = semijoin_outer_equivalent(
+              down_cast<Item_field *>(right)->field);
+          const int left_table = TableIndexOfField(left_raw, tables);
+          const int right_table = TableIndexOfField(right_raw, tables);
+          if (left_table >= 0 && right_table >= 0 &&
+              left_table == right_table) {
+            continue;
+          }
+          if (add_join_edge_if_supported(left_raw, right_raw)) continue;
+        }
+      }
+      semijoin_nests[predicate_nest].residual_predicates.push_back(predicate);
+      continue;
+    }
+
+    if (predicate->type() == Item::COND_ITEM &&
+        down_cast<Item_cond *>(predicate)->functype() ==
+            Item_func::COND_OR_FUNC) {
+      auto *condition = down_cast<Item_cond *>(predicate);
+      std::vector<std::vector<std::pair<const Field *, const Field *>>>
+          branch_equalities;
+      List_iterator<Item> branch_it(*condition->argument_list());
+      for (Item *branch = branch_it++; branch != nullptr;
+           branch = branch_it++) {
+        std::vector<Item *> branch_parts;
+        FlattenAnd(branch, &branch_parts);
+        branch_equalities.emplace_back();
+        for (Item *part : branch_parts) {
+          if (part->type() != Item::FUNC_ITEM ||
+              down_cast<Item_func *>(part)->functype() !=
+                  Item_func::EQ_FUNC) {
+            continue;
+          }
+          auto *equals = down_cast<Item_func *>(part);
+          Item *left = equals->arguments()[0]->real_item();
+          Item *right = equals->arguments()[1]->real_item();
+          if (left->type() != Item::FIELD_ITEM ||
+              right->type() != Item::FIELD_ITEM) {
+            continue;
+          }
+          branch_equalities.back().push_back(
+              {down_cast<Item_field *>(left)->field,
+               down_cast<Item_field *>(right)->field});
+        }
+      }
+
+      if (!branch_equalities.empty()) {
+        for (const auto &candidate : branch_equalities[0]) {
+          bool appears_in_all_branches = true;
+          for (size_t branch_idx = 1;
+               branch_idx < branch_equalities.size() &&
+               appears_in_all_branches;
+               branch_idx++) {
+            bool found = false;
+            for (const auto &other : branch_equalities[branch_idx]) {
+              if ((other.first == candidate.first &&
+                   other.second == candidate.second) ||
+                  (other.first == candidate.second &&
+                   other.second == candidate.first)) {
+                found = true;
+                break;
+              }
+            }
+            appears_in_all_branches = found;
+          }
+          if (!appears_in_all_branches) continue;
+
+          const int left_table = TableIndexOfField(candidate.first, tables);
+          const int right_table = TableIndexOfField(candidate.second, tables);
+          if (left_table < 0 || right_table < 0 ||
+              left_table == right_table) {
+            continue;
+          }
+          if (!JoinColumnsUseByteEquality(candidate.first, candidate.second)) {
+            continue;
+          }
+
+          const Field *left_field =
+              resolve_query_field(candidate.first, left_table);
+          const Field *right_field =
+              resolve_query_field(candidate.second, right_table);
+          if (left_field == nullptr || right_field == nullptr) continue;
+          join_edges.push_back(
+              {left_table, right_table, left_field, right_field});
+        }
+      }
+
+      tuple_predicates.push_back(predicate);
       continue;
     }
 
     if (predicate->type() != Item::FUNC_ITEM ||
         down_cast<Item_func *>(predicate)->functype() != Item_func::EQ_FUNC) {
-      LDB_COL_REJECT("non-equi join predicate");
+      tuple_predicates.push_back(predicate);
+      continue;
     }
     auto *equals = down_cast<Item_func *>(predicate);
     Item *left = equals->arguments()[0]->real_item();
@@ -1247,29 +1754,35 @@ bool RecognizeQueryBlock(JOIN *join, ColumnarExecutionContext *ctx,
     if (left_table < 0 || right_table < 0 || left_table == right_table) {
       LDB_COL_REJECT("join key tables");
     }
-    if (left_raw->result_type() != INT_RESULT ||
-        right_raw->result_type() != INT_RESULT) {
-      LDB_COL_REJECT("non-integer join key");
+    if (!JoinColumnsUseByteEquality(left_raw, right_raw)) {
+      LDB_COL_REJECT("join key type");
     }
 
-    const Field *left_field =
-        ResolveBaseField(left_raw, tables[left_table].table);
-    const Field *right_field =
-        ResolveBaseField(right_raw, tables[right_table].table);
+    const Field *left_field = resolve_query_field(left_raw, left_table);
+    const Field *right_field = resolve_query_field(right_raw, right_table);
     if (left_field == nullptr || right_field == nullptr) {
       LDB_COL_REJECT("join key unresolvable");
     }
-    if (left_field->is_nullable() || right_field->is_nullable()) {
+    if ((!table_is_virtual[left_table] && left_field->is_nullable()) ||
+        (!table_is_virtual[right_table] && right_field->is_nullable())) {
       LDB_COL_REJECT("join key nullable");
     }
     join_edges.push_back({left_table, right_table, left_field, right_field});
   }
-  if (tables.size() > 1 && join_edges.empty()) LDB_COL_REJECT("cross join");
+  size_t main_non_scalar_tables = 0;
+  for (int table_idx : main_tables) {
+    if (!is_scalar_virtual_table(table_idx)) main_non_scalar_tables++;
+  }
+  if (main_tables.size() > 1 && join_edges.empty() &&
+      main_non_scalar_tables > 1) {
+    LDB_COL_REJECT("cross join");
+  }
 
   // Scan every table once, attaching only predicates that read that table.
-  auto &request = ctx->query_block_request;
+  auto &request = *request_out;
+  request.Clear();
   std::vector<int> scan_nodes(tables.size(), -1);
-  for (size_t table_idx = 0; table_idx < tables.size(); table_idx++) {
+  for (size_t table_idx = 0; table_idx < real_table_count; table_idx++) {
     TABLE *table = tables[table_idx].table;
     request.add_tables()->set_table_name(table->s->normalized_path.str);
     auto *scan_node = request.add_nodes();
@@ -1283,18 +1796,36 @@ bool RecognizeQueryBlock(JOIN *join, ColumnarExecutionContext *ctx,
     }
   }
 
+  for (size_t table_idx = real_table_count; table_idx < tables.size();
+       table_idx++) {
+    auto *sub_block = request.add_nodes()->mutable_sub_block();
+    if (!BuildQueryBlockRequest(
+            nullptr, virtual_blocks[table_idx - real_table_count],
+            sub_block->mutable_block(), why)) {
+      return false;
+    }
+    scan_nodes[table_idx] = request.nodes_size() - 1;
+  }
+
   // Build a left-deep INNER join tree by walking FROM order and retrying tables
   // whose equality edges are not connected yet.
-  int current_node = scan_nodes[0];
+  auto first_input =
+      std::find_if(main_tables.begin(), main_tables.end(), [&](int table_idx) {
+        return !is_scalar_virtual_table(table_idx);
+      });
+  const int first_table =
+      first_input != main_tables.end() ? *first_input : main_tables[0];
+  int current_node = scan_nodes[first_table];
   std::vector<bool> joined(tables.size(), false);
-  joined[0] = true;
+  joined[first_table] = true;
   std::vector<int> pending_tables;
-  for (size_t table_idx = 1; table_idx < tables.size(); table_idx++) {
-    pending_tables.push_back(static_cast<int>(table_idx));
+  for (int table_idx : main_tables) {
+    if (table_idx != first_table) pending_tables.push_back(table_idx);
   }
   while (!pending_tables.empty()) {
     int table_idx = -1;
     size_t pending_idx = 0;
+    bool keyless_one_row_join = false;
     for (size_t idx = 0; idx < pending_tables.size(); idx++) {
       for (const JoinEdge &edge : join_edges) {
         if ((edge.left_table == pending_tables[idx] &&
@@ -1308,10 +1839,22 @@ bool RecognizeQueryBlock(JOIN *join, ColumnarExecutionContext *ctx,
       }
       if (table_idx >= 0) break;
     }
+    if (table_idx < 0) {
+      // Scalar aggregate sub-blocks produce at most one row, so they are the
+      // only virtual inputs that can use a keyless INNER join.
+      for (size_t idx = 0; idx < pending_tables.size(); idx++) {
+        if (is_scalar_virtual_table(pending_tables[idx])) {
+          table_idx = pending_tables[idx];
+          pending_idx = idx;
+          keyless_one_row_join = true;
+          break;
+        }
+      }
+    }
     if (table_idx < 0) LDB_COL_REJECT("disconnected join graph");
     pending_tables.erase(pending_tables.begin() + pending_idx);
 
-    bool connected = false;
+    bool connected = keyless_one_row_join;
     auto *join_node = request.add_nodes()->mutable_join();
     join_node->set_type(LineairDB::Protocol::QueryBlockJoin::INNER);
     join_node->set_build(scan_nodes[table_idx]);
@@ -1349,6 +1892,451 @@ bool RecognizeQueryBlock(JOIN *join, ColumnarExecutionContext *ctx,
     current_node = request.nodes_size() - 1;
   }
 
+  // MySQL may rewrite correlated subqueries into derived tables on the
+  // nullable side of a LEFT join. Execute the derived block as a virtual table,
+  // then split the ON condition into equality keys and residual predicates.
+  for (int table_idx : outer_derived_tables) {
+    Table_ref *table_ref = tables[table_idx].table_ref;
+    Item *join_condition =
+        table_ref == nullptr ? nullptr : table_ref->join_cond();
+    if (join_condition == nullptr) LDB_COL_REJECT("derived LEFT without ON");
+
+    std::vector<Item *> join_predicates;
+    FlattenAnd(join_condition, &join_predicates);
+    std::vector<Item *> residual_predicates;
+
+    auto *join_node = request.add_nodes()->mutable_join();
+    join_node->set_type(LineairDB::Protocol::QueryBlockJoin::LEFT);
+    join_node->set_build(static_cast<uint32_t>(scan_nodes[table_idx]));
+    join_node->set_probe(static_cast<uint32_t>(current_node));
+
+    for (Item *predicate : join_predicates) {
+      bool is_join_key = false;
+      if (predicate->type() == Item::FUNC_ITEM &&
+          down_cast<Item_func *>(predicate)->functype() ==
+              Item_func::EQ_FUNC) {
+        auto *equals = down_cast<Item_func *>(predicate);
+        Item *left = equals->arguments()[0]->real_item();
+        Item *right = equals->arguments()[1]->real_item();
+        if (left->type() == Item::FIELD_ITEM &&
+            right->type() == Item::FIELD_ITEM) {
+          const Field *left_raw = semijoin_outer_equivalent(
+              down_cast<Item_field *>(left)->field);
+          const Field *right_raw = semijoin_outer_equivalent(
+              down_cast<Item_field *>(right)->field);
+          int left_table = TableIndexOfField(left_raw, tables);
+          int right_table = TableIndexOfField(right_raw, tables);
+          if (left_table == table_idx || right_table == table_idx) {
+            if (left_table != table_idx) {
+              std::swap(left_table, right_table);
+              std::swap(left_raw, right_raw);
+            }
+            if (right_table >= 0 &&
+                JoinColumnsUseByteEquality(left_raw, right_raw)) {
+              const Field *build_field =
+                  resolve_query_field(left_raw, left_table);
+              const Field *probe_field =
+                  resolve_query_field(right_raw, right_table);
+              if (build_field != nullptr && probe_field != nullptr) {
+                auto *build_key = join_node->add_build_keys();
+                build_key->set_table_idx(static_cast<uint32_t>(table_idx));
+                build_key->set_column(build_field->field_index());
+                auto *probe_key = join_node->add_probe_keys();
+                probe_key->set_table_idx(static_cast<uint32_t>(right_table));
+                probe_key->set_column(probe_field->field_index());
+                is_join_key = true;
+              }
+            }
+          }
+        }
+      }
+      if (!is_join_key) residual_predicates.push_back(predicate);
+    }
+
+    if (join_node->build_keys_size() == 0 &&
+        !is_scalar_virtual_table(table_idx)) {
+      LDB_COL_REJECT("derived LEFT keyless");
+    }
+
+    if (!residual_predicates.empty()) {
+      TupleColumnRegistry registry;
+      registry.table_of = [&](const Field *field) {
+        return TableIndexOfField(field, tables);
+      };
+      registry.resolve = [&](const Field *field, int table_idx) {
+        return resolve_query_field(field, table_idx);
+      };
+
+      auto *residual = join_node->mutable_residual();
+      auto *predicate = residual->mutable_predicate();
+      auto *expression = predicate->mutable_expr();
+      if (residual_predicates.size() == 1) {
+        if (!SerializeTuplePredicate(residual_predicates[0], expression,
+                                     &registry)) {
+          LDB_COL_REJECT("derived ON residual not pushable");
+        }
+      } else {
+        expression->set_op(LineairDB::Protocol::FilterExpr::OP_AND);
+        for (Item *residual_predicate : residual_predicates) {
+          if (!SerializeTuplePredicate(residual_predicate,
+                                       expression->add_children(),
+                                       &registry)) {
+            LDB_COL_REJECT("derived ON residual not pushable");
+          }
+        }
+      }
+
+      predicate->set_num_columns(registry.columns.size());
+      for (const auto &column_ref : registry.columns) {
+        auto *column = residual->add_columns();
+        column->set_table_idx(static_cast<uint32_t>(column_ref.first));
+        column->set_column(column_ref.second->field_index());
+      }
+    }
+
+    current_node = request.nodes_size() - 1;
+  }
+
+  if (!tuple_predicates.empty()) {
+    auto *filter_node = request.add_nodes()->mutable_filter();
+    filter_node->set_input(static_cast<uint32_t>(current_node));
+    auto *tuple_filter = filter_node->mutable_filter();
+
+    TupleColumnRegistry registry;
+    registry.table_of = [&](const Field *field) {
+      return TableIndexOfField(field, tables);
+    };
+    registry.resolve = [&](const Field *field, int table_idx) {
+      return resolve_query_field(field, table_idx);
+    };
+
+    auto *predicate = tuple_filter->mutable_predicate();
+    auto *expression = predicate->mutable_expr();
+    if (tuple_predicates.size() == 1) {
+      if (!SerializeTuplePredicate(tuple_predicates[0], expression,
+                                   &registry)) {
+        LDB_COL_REJECT("tuple predicate not pushable");
+      }
+    } else {
+      expression->set_op(LineairDB::Protocol::FilterExpr::OP_AND);
+      for (Item *tuple_predicate : tuple_predicates) {
+        if (!SerializeTuplePredicate(tuple_predicate,
+                                     expression->add_children(),
+                                     &registry)) {
+          LDB_COL_REJECT("tuple predicate not pushable");
+        }
+      }
+    }
+
+    predicate->set_num_columns(registry.columns.size());
+    for (const auto &column_ref : registry.columns) {
+      auto *column = tuple_filter->add_columns();
+      column->set_table_idx(static_cast<uint32_t>(column_ref.first));
+      column->set_column(column_ref.second->field_index());
+    }
+    current_node = request.nodes_size() - 1;
+  }
+
+  for (SemijoinNest &semijoin : semijoin_nests) {
+    if (semijoin.inner_tables.empty())
+      LDB_COL_REJECT("empty semijoin");
+    if (semijoin.nest == nullptr || semijoin.nest->nested_join == nullptr)
+      LDB_COL_REJECT("semijoin missing key metadata");
+
+    auto semijoin_has_table = [&](int table_idx) {
+      for (int inner_table : semijoin.inner_tables) {
+        if (inner_table == table_idx) return true;
+      }
+      return false;
+    };
+
+    int first_inner_table = semijoin.inner_tables[0];
+    if (semijoin.inner_tables.size() > 1) {
+      auto first_inner_input =
+          std::find_if(semijoin.inner_tables.begin(),
+                       semijoin.inner_tables.end(), [&](int table_idx) {
+                         return !is_scalar_virtual_table(table_idx);
+                       });
+      if (first_inner_input != semijoin.inner_tables.end()) {
+        first_inner_table = *first_inner_input;
+      }
+    }
+
+    // Multi-table semijoin nests become a build-side INNER-join mini tree.
+    int build_node = scan_nodes[first_inner_table];
+    if (semijoin.inner_tables.size() > 1) {
+      struct InnerJoinEdge {
+        int left_table = -1;
+        int right_table = -1;
+        const Field *left_field = nullptr;
+        const Field *right_field = nullptr;
+      };
+
+      std::vector<InnerJoinEdge> inner_edges;
+      std::vector<Item *> remaining_residuals;
+      for (Item *predicate : semijoin.residual_predicates) {
+        bool consumed = false;
+        if (predicate->type() == Item::FUNC_ITEM &&
+            down_cast<Item_func *>(predicate)->functype() ==
+                Item_func::EQ_FUNC) {
+          auto *equals = down_cast<Item_func *>(predicate);
+          Item *left = equals->arguments()[0]->real_item();
+          Item *right = equals->arguments()[1]->real_item();
+          if (left->type() == Item::FIELD_ITEM &&
+              right->type() == Item::FIELD_ITEM) {
+            const Field *left_raw = down_cast<Item_field *>(left)->field;
+            const Field *right_raw = down_cast<Item_field *>(right)->field;
+            const int left_table = TableIndexOfField(left_raw, tables);
+            const int right_table = TableIndexOfField(right_raw, tables);
+            const Field *left_field =
+                left_table >= 0 ? resolve_query_field(left_raw, left_table)
+                                : nullptr;
+            const Field *right_field =
+                right_table >= 0 ? resolve_query_field(right_raw, right_table)
+                                 : nullptr;
+            if (left_table >= 0 && right_table >= 0 &&
+                left_table != right_table && semijoin_has_table(left_table) &&
+                semijoin_has_table(right_table) &&
+                JoinColumnsUseByteEquality(left_raw, right_raw) &&
+                left_field != nullptr && right_field != nullptr &&
+                !left_field->is_nullable() && !right_field->is_nullable()) {
+              inner_edges.push_back(
+                  {left_table, right_table, left_field, right_field});
+              consumed = true;
+            }
+          }
+        }
+        if (!consumed) remaining_residuals.push_back(predicate);
+      }
+      semijoin.residual_predicates = std::move(remaining_residuals);
+
+      std::vector<bool> inner_joined(tables.size(), false);
+      inner_joined[first_inner_table] = true;
+      std::vector<int> pending_inner_tables;
+      for (int table_idx : semijoin.inner_tables) {
+        if (table_idx != first_inner_table) {
+          pending_inner_tables.push_back(table_idx);
+        }
+      }
+
+      while (!pending_inner_tables.empty()) {
+        int picked_table = -1;
+        size_t picked_idx = 0;
+        bool keyless_one_row_join = false;
+        for (size_t idx = 0; idx < pending_inner_tables.size(); idx++) {
+          for (const InnerJoinEdge &edge : inner_edges) {
+            if ((edge.left_table == pending_inner_tables[idx] &&
+                 inner_joined[edge.right_table]) ||
+                (edge.right_table == pending_inner_tables[idx] &&
+                 inner_joined[edge.left_table])) {
+              picked_table = pending_inner_tables[idx];
+              picked_idx = idx;
+              break;
+            }
+          }
+          if (picked_table >= 0) break;
+        }
+        if (picked_table < 0) {
+          // Keep keyless INNER joins limited to one-row virtual inputs.
+          for (size_t idx = 0; idx < pending_inner_tables.size(); idx++) {
+            if (is_scalar_virtual_table(pending_inner_tables[idx])) {
+              picked_table = pending_inner_tables[idx];
+              picked_idx = idx;
+              keyless_one_row_join = true;
+              break;
+            }
+          }
+        }
+        if (picked_table < 0) LDB_COL_REJECT("semijoin disconnected");
+        pending_inner_tables.erase(pending_inner_tables.begin() + picked_idx);
+
+        bool connected = keyless_one_row_join;
+        auto *inner_join = request.add_nodes()->mutable_join();
+        inner_join->set_type(LineairDB::Protocol::QueryBlockJoin::INNER);
+        inner_join->set_build(static_cast<uint32_t>(scan_nodes[picked_table]));
+        inner_join->set_probe(static_cast<uint32_t>(build_node));
+
+        for (const InnerJoinEdge &edge : inner_edges) {
+          const Field *build_field = nullptr;
+          const Field *probe_field = nullptr;
+          int probe_table = -1;
+          if (edge.left_table == picked_table &&
+              inner_joined[edge.right_table]) {
+            build_field = edge.left_field;
+            probe_field = edge.right_field;
+            probe_table = edge.right_table;
+          } else if (edge.right_table == picked_table &&
+                     inner_joined[edge.left_table]) {
+            build_field = edge.right_field;
+            probe_field = edge.left_field;
+            probe_table = edge.left_table;
+          } else {
+            continue;
+          }
+
+          auto *build_key = inner_join->add_build_keys();
+          build_key->set_table_idx(static_cast<uint32_t>(picked_table));
+          build_key->set_column(build_field->field_index());
+          auto *probe_key = inner_join->add_probe_keys();
+          probe_key->set_table_idx(static_cast<uint32_t>(probe_table));
+          probe_key->set_column(probe_field->field_index());
+          connected = true;
+        }
+
+        if (!connected) LDB_COL_REJECT("semijoin disconnected");
+        inner_joined[picked_table] = true;
+        build_node = request.nodes_size() - 1;
+      }
+    }
+
+    auto *join_node = request.add_nodes()->mutable_join();
+    join_node->set_type(semijoin.anti
+                            ? LineairDB::Protocol::QueryBlockJoin::ANTI
+                            : LineairDB::Protocol::QueryBlockJoin::SEMI);
+    join_node->set_build(static_cast<uint32_t>(build_node));
+    join_node->set_probe(static_cast<uint32_t>(current_node));
+
+    const auto &outer_exprs =
+        semijoin.nest->nested_join->sj_outer_exprs;
+    const auto &inner_exprs =
+        semijoin.nest->nested_join->sj_inner_exprs;
+    if (outer_exprs.size() != inner_exprs.size() || outer_exprs.empty()) {
+      LDB_COL_REJECT("semijoin key arity");
+    }
+
+    for (size_t key_idx = 0; key_idx < outer_exprs.size(); key_idx++) {
+      Item *outer_item = outer_exprs[key_idx]->real_item();
+      Item *inner_item = inner_exprs[key_idx]->real_item();
+      if (outer_item->type() != Item::FIELD_ITEM ||
+          inner_item->type() != Item::FIELD_ITEM) {
+        LDB_COL_REJECT("semijoin key shape");
+      }
+
+      const Field *raw_outer_field =
+          down_cast<Item_field *>(outer_item)->field;
+      const Field *raw_inner_field =
+          down_cast<Item_field *>(inner_item)->field;
+      const int outer_table = TableIndexOfField(raw_outer_field, tables);
+      const int inner_key_table = TableIndexOfField(raw_inner_field, tables);
+      if (outer_table < 0 || !semijoin_has_table(inner_key_table)) {
+        LDB_COL_REJECT("semijoin key tables");
+      }
+      if (!JoinColumnsUseByteEquality(raw_outer_field, raw_inner_field)) {
+        LDB_COL_REJECT("semijoin key type");
+      }
+
+      const Field *outer_field =
+          resolve_query_field(raw_outer_field, outer_table);
+      const Field *inner_field =
+          resolve_query_field(raw_inner_field, inner_key_table);
+      if (outer_field == nullptr || inner_field == nullptr) {
+        LDB_COL_REJECT("semijoin key unresolvable");
+      }
+
+      auto *build_key = join_node->add_build_keys();
+      build_key->set_table_idx(static_cast<uint32_t>(inner_key_table));
+      build_key->set_column(inner_field->field_index());
+      auto *probe_key = join_node->add_probe_keys();
+      probe_key->set_table_idx(static_cast<uint32_t>(outer_table));
+      probe_key->set_column(outer_field->field_index());
+    }
+
+    if (!semijoin.residual_predicates.empty()) {
+      TupleColumnRegistry registry;
+      registry.table_of = [&](const Field *field) {
+        return TableIndexOfField(field, tables);
+      };
+      registry.resolve = [&](const Field *field, int table_idx) {
+        return resolve_query_field(field, table_idx);
+      };
+
+      auto *residual = join_node->mutable_residual();
+      auto *predicate = residual->mutable_predicate();
+      auto *expression = predicate->mutable_expr();
+      if (semijoin.residual_predicates.size() == 1) {
+        if (!SerializeTuplePredicate(semijoin.residual_predicates[0],
+                                     expression, &registry)) {
+          LDB_COL_REJECT("semijoin residual not pushable");
+        }
+      } else {
+        expression->set_op(LineairDB::Protocol::FilterExpr::OP_AND);
+        for (Item *residual_predicate : semijoin.residual_predicates) {
+          if (!SerializeTuplePredicate(residual_predicate,
+                                       expression->add_children(),
+                                       &registry)) {
+            LDB_COL_REJECT("semijoin residual not pushable");
+          }
+        }
+      }
+
+      predicate->set_num_columns(registry.columns.size());
+      for (const auto &column_ref : registry.columns) {
+        auto *column = residual->add_columns();
+        column->set_table_idx(static_cast<uint32_t>(column_ref.first));
+        column->set_column(column_ref.second->field_index());
+      }
+    }
+
+    current_node = request.nodes_size() - 1;
+  }
+
+  std::vector<Item *> output_items;
+  for (Item *item : VisibleFields(qb->fields)) output_items.push_back(item);
+
+  if (plain_rows) {
+    if (qb->having_cond() != nullptr) LDB_COL_REJECT("row block has HAVING");
+    for (Item *item : output_items) {
+      Item *real = item->real_item();
+      if (real->type() != Item::FIELD_ITEM)
+        LDB_COL_REJECT("row output not a column");
+
+      const Field *raw_output_field = down_cast<Item_field *>(real)->field;
+      const int output_table = TableIndexOfField(raw_output_field, tables);
+      const Field *output_field =
+          output_table >= 0
+              ? resolve_query_field(raw_output_field, output_table)
+              : nullptr;
+      if (output_field == nullptr)
+        LDB_COL_REJECT("row output column unresolvable");
+
+      auto *output = request.add_output();
+      output->set_source(LineairDB::Protocol::QueryBlockOutputExpr::COLUMN);
+      auto *column = output->mutable_column();
+      column->set_table_idx(static_cast<uint32_t>(output_table));
+      column->set_column(output_field->field_index());
+      column->set_cmp_kind(output_field->result_type() == STRING_RESULT ? 1
+                                                                        : 2);
+    }
+
+    for (ORDER *order = qb->order_list.first; order != nullptr;
+         order = order->next) {
+      const int output_ordinal =
+          OrderOutputOrdinal(*order->item, output_items);
+      if (output_ordinal < 0)
+        LDB_COL_REJECT("row ORDER BY not an output column");
+
+      auto *sort_key = request.add_order_by();
+      sort_key->set_output_ordinal(output_ordinal);
+      sort_key->set_descending(order->direction == ORDER_DESC);
+      Item *output_item = output_items[output_ordinal]->real_item();
+      sort_key->set_cmp_kind(output_item->result_type() == STRING_RESULT ? 1
+                                                                         : 2);
+    }
+
+    if (qb->has_limit()) {
+      if (unit->select_limit_cnt != HA_POS_ERROR)
+        request.set_limit(unit->select_limit_cnt);
+      if (unit->offset_limit_cnt > 0) {
+        request.set_offset(unit->offset_limit_cnt);
+        if (request.limit() > 0)
+          request.set_limit(request.limit() - unit->offset_limit_cnt);
+      }
+    }
+
+    *why = nullptr;
+    return true;
+  }
+
   auto *aggregate_node = request.add_nodes();
   auto *aggregate = aggregate_node->mutable_aggregate();
   aggregate->set_input(current_node);
@@ -1365,10 +2353,10 @@ bool RecognizeQueryBlock(JOIN *join, ColumnarExecutionContext *ctx,
     if (const Field *year_field = ExtractYearField(group_item)) {
       const int group_table = TableIndexOfField(year_field, tables);
       const Field *group_field =
-          group_table >= 0
-              ? ResolveBaseField(year_field, tables[group_table].table)
-              : nullptr;
-      if (group_field == nullptr || group_field->is_nullable()) {
+          group_table >= 0 ? resolve_query_field(year_field, group_table)
+                           : nullptr;
+      if (group_field == nullptr ||
+          (!table_is_virtual[group_table] && group_field->is_nullable())) {
         LDB_COL_REJECT("group year column");
       }
 
@@ -1381,6 +2369,28 @@ bool RecognizeQueryBlock(JOIN *join, ColumnarExecutionContext *ctx,
       continue;
     }
 
+    uint32_t substring_prefix_len = 0;
+    if (const Field *substring_field =
+            SubstringPrefixField(group_item, &substring_prefix_len)) {
+      const int group_table = TableIndexOfField(substring_field, tables);
+      const Field *group_field =
+          group_table >= 0
+              ? resolve_query_field(substring_field, group_table)
+              : nullptr;
+      if (group_field == nullptr ||
+          (!table_is_virtual[group_table] && group_field->is_nullable())) {
+        LDB_COL_REJECT("group substring column");
+      }
+
+      auto *group_column = aggregate->add_group_columns();
+      group_column->set_table_idx(static_cast<uint32_t>(group_table));
+      group_column->set_column(group_field->field_index());
+      group_column->set_prefix_len(substring_prefix_len);
+      group_column->set_cmp_kind(1);
+      group_fields.push_back({group_table, nullptr});
+      continue;
+    }
+
     if (group_item->type() != Item::FIELD_ITEM)
       LDB_COL_REJECT("group item not a column");
 
@@ -1389,10 +2399,11 @@ bool RecognizeQueryBlock(JOIN *join, ColumnarExecutionContext *ctx,
     const int group_table = TableIndexOfField(raw_group_field, tables);
     if (group_table < 0) LDB_COL_REJECT("group column foreign");
     const Field *group_field =
-        ResolveBaseField(raw_group_field, tables[group_table].table);
+        resolve_query_field(raw_group_field, group_table);
     if (group_field == nullptr) LDB_COL_REJECT("group column foreign");
-    if (group_field->is_nullable() ||
-        !GroupColumnIsBinarySafe(group_field)) {
+    if ((!table_is_virtual[group_table] && group_field->is_nullable()) ||
+        (!table_is_virtual[group_table] &&
+         !GroupColumnIsBinarySafe(group_field))) {
       LDB_COL_REJECT("group column not binary-safe");
     }
 
@@ -1404,11 +2415,368 @@ bool RecognizeQueryBlock(JOIN *join, ColumnarExecutionContext *ctx,
     group_fields.push_back({group_table, group_field});
   }
 
-  std::vector<Item *> output_items;
-  for (Item *item : VisibleFields(qb->fields)) output_items.push_back(item);
+  const char *aggregate_error = nullptr;
+  auto register_aggregate = [&](Item_sum *sum) -> int {
+    if (sum->argument_count() > 1) {
+      aggregate_error = "aggregate arg count";
+      return -1;
+    }
+
+    auto *function = aggregate->add_aggs();
+    switch (sum->sum_func()) {
+      case Item_sum::COUNT_DISTINCT_FUNC: {
+        if (sum->argument_count() != 1) {
+          aggregate_error = "COUNT DISTINCT arg count";
+          return -1;
+        }
+        Item *arg = sum->get_arg(0)->real_item();
+        if (arg->type() != Item::FIELD_ITEM) {
+          aggregate_error = "COUNT DISTINCT arg shape";
+          return -1;
+        }
+        const Field *raw_count_field = down_cast<Item_field *>(arg)->field;
+        const int count_table = TableIndexOfField(raw_count_field, tables);
+        const Field *count_field =
+            count_table >= 0
+                ? resolve_query_field(raw_count_field, count_table)
+                : nullptr;
+        if (count_field == nullptr) {
+          aggregate_error = "COUNT DISTINCT arg unresolvable";
+          return -1;
+        }
+
+        function->set_arg_table(static_cast<uint32_t>(count_table));
+        auto *ref = function->mutable_arg();
+        ref->set_op(LineairDB::Protocol::FilterExpr::COLUMN_REF);
+        ref->set_column_index(count_field->field_index());
+        function->set_kind(LineairDB::Protocol::QueryBlockAggFunc::COUNT);
+        function->set_distinct(true);
+        return aggregate->aggs_size() - 1;
+      }
+
+      case Item_sum::COUNT_FUNC: {
+        function->set_arg_table(0);
+        if (sum->argument_count() > 0) {
+          Item *arg = sum->get_arg(0)->real_item();
+          if (arg->const_item()) {
+            if (arg->is_nullable() || arg->is_null()) {
+              aggregate_error = "COUNT const nullable";
+              return -1;
+            }
+          } else {
+            if (arg->type() != Item::FIELD_ITEM) {
+              aggregate_error = "COUNT arg shape";
+              return -1;
+            }
+            const Field *raw_count_field =
+                down_cast<Item_field *>(arg)->field;
+            const int count_table = TableIndexOfField(raw_count_field, tables);
+            const Field *count_field =
+                count_table >= 0
+                    ? resolve_query_field(raw_count_field, count_table)
+                    : nullptr;
+            if (count_field == nullptr ||
+                (!table_is_virtual[count_table] &&
+                 count_field->is_nullable())) {
+              aggregate_error = "COUNT arg nullable";
+              return -1;
+            }
+            function->set_arg_table(static_cast<uint32_t>(count_table));
+            auto *ref = function->mutable_arg();
+            ref->set_op(LineairDB::Protocol::FilterExpr::COLUMN_REF);
+            ref->set_column_index(count_field->field_index());
+          }
+        }
+
+        function->set_kind(LineairDB::Protocol::QueryBlockAggFunc::COUNT);
+        return aggregate->aggs_size() - 1;
+      }
+
+      case Item_sum::SUM_FUNC:
+      case Item_sum::AVG_FUNC: {
+        if (sum->argument_count() != 1) {
+          aggregate_error = "aggregate arg count";
+          return -1;
+        }
+        Item *arg = sum->get_arg(0)->real_item();
+        if (sum->sum_func() == Item_sum::SUM_FUNC) {
+          if (Item *filter = CaseToCountFilter(arg)) {
+            const int filter_table = SingleTableOf(
+                filter->used_tables() & ~PSEUDO_TABLE_BITS, tables);
+            if (filter_table < 0) {
+              aggregate_error = "CASE filter tables";
+              return -1;
+            }
+            auto *predicate = function->mutable_filter();
+            predicate->set_num_columns(tables[filter_table].table->s->fields);
+            if (!serialize_item(filter, predicate->mutable_expr())) {
+              aggregate_error = "CASE filter not pushable";
+              return -1;
+            }
+            function->set_arg_table(static_cast<uint32_t>(filter_table));
+            function->set_kind(LineairDB::Protocol::QueryBlockAggFunc::COUNT);
+            return aggregate->aggs_size() - 1;
+          }
+
+          Item *filter = nullptr;
+          Item *then_expr = nullptr;
+          if (CaseToFilteredSum(arg, &filter, &then_expr)) {
+            if (then_expr->result_type() != DECIMAL_RESULT &&
+                then_expr->result_type() != INT_RESULT) {
+              aggregate_error = "CASE expression type";
+              return -1;
+            }
+
+            const int filter_table = SingleTableOf(
+                filter->used_tables() & ~PSEUDO_TABLE_BITS, tables);
+            if (filter_table < 0) {
+              aggregate_error = "CASE filter tables";
+              return -1;
+            }
+            auto *predicate = function->mutable_filter();
+            predicate->set_num_columns(tables[filter_table].table->s->fields);
+            if (!serialize_item(filter, predicate->mutable_expr())) {
+              aggregate_error = "CASE filter not pushable";
+              return -1;
+            }
+
+            int argument_table = SingleTableOf(
+                then_expr->used_tables() & ~PSEUDO_TABLE_BITS, tables);
+            if (argument_table >= 0 &&
+                then_expr->real_item()->type() == Item::FIELD_ITEM) {
+              const Field *raw_argument_field =
+                  down_cast<Item_field *>(then_expr->real_item())->field;
+              const Field *argument_field =
+                  resolve_query_field(raw_argument_field, argument_table);
+              if (argument_field == nullptr) {
+                aggregate_error = "CASE expression unresolvable";
+                return -1;
+              }
+
+              auto *ref = function->mutable_arg();
+              ref->set_op(LineairDB::Protocol::FilterExpr::COLUMN_REF);
+              ref->set_column_index(argument_field->field_index());
+            } else if (argument_table >= 0) {
+              if (!lineairdb::serialize_aggregate_expression(
+                      then_expr->real_item(), function->mutable_arg())) {
+                aggregate_error = "CASE expression not pushable";
+                return -1;
+              }
+            } else {
+              argument_table = 0;
+              if (!SerializeAggregateExpressionForTables(
+                      then_expr->real_item(), tables,
+                      static_cast<uint32_t>(argument_table),
+                      function->mutable_arg())) {
+                aggregate_error = "CASE expression not pushable";
+                return -1;
+              }
+            }
+
+            function->set_arg_table(static_cast<uint32_t>(argument_table));
+            function->set_filter_table(static_cast<uint32_t>(filter_table));
+            function->set_kind(LineairDB::Protocol::QueryBlockAggFunc::SUM);
+            function->set_arg_scale(then_expr->decimals);
+            function->set_zero_if_empty(true);
+            return aggregate->aggs_size() - 1;
+          }
+        }
+        if (arg->result_type() != DECIMAL_RESULT &&
+            arg->result_type() != INT_RESULT) {
+          aggregate_error = "aggregate arg type";
+          return -1;
+        }
+
+        int argument_table =
+            SingleTableOf(arg->used_tables() & ~PSEUDO_TABLE_BITS, tables);
+        if (argument_table >= 0 && arg->type() == Item::FIELD_ITEM) {
+          const Field *raw_argument_field =
+              down_cast<Item_field *>(arg)->field;
+          const Field *argument_field =
+              resolve_query_field(raw_argument_field, argument_table);
+          if (argument_field == nullptr) {
+            aggregate_error = "aggregate arg unresolvable";
+            return -1;
+          }
+
+          auto *ref = function->mutable_arg();
+          ref->set_op(LineairDB::Protocol::FilterExpr::COLUMN_REF);
+          ref->set_column_index(argument_field->field_index());
+        } else if (argument_table >= 0) {
+          if (!lineairdb::serialize_aggregate_expression(
+                  arg, function->mutable_arg())) {
+            aggregate_error = "aggregate expr not pushable";
+            return -1;
+          }
+        } else {
+          argument_table = 0;
+          if (!SerializeAggregateExpressionForTables(
+                  arg, tables, static_cast<uint32_t>(argument_table),
+                  function->mutable_arg())) {
+            aggregate_error = "aggregate expr not pushable";
+            return -1;
+          }
+        }
+
+        function->set_arg_table(static_cast<uint32_t>(argument_table));
+        function->set_kind(
+            sum->sum_func() == Item_sum::SUM_FUNC
+                ? LineairDB::Protocol::QueryBlockAggFunc::SUM
+                : LineairDB::Protocol::QueryBlockAggFunc::AVG);
+        function->set_arg_scale(arg->decimals);
+        return aggregate->aggs_size() - 1;
+      }
+
+      case Item_sum::MIN_FUNC:
+      case Item_sum::MAX_FUNC: {
+        if (sum->argument_count() != 1) {
+          aggregate_error = "aggregate arg count";
+          return -1;
+        }
+        Item *arg = sum->get_arg(0)->real_item();
+        if (arg->type() != Item::FIELD_ITEM) {
+          aggregate_error = "minmax arg";
+          return -1;
+        }
+        const Field *raw_argument_field =
+            down_cast<Item_field *>(arg)->field;
+        const int argument_table =
+            TableIndexOfField(raw_argument_field, tables);
+        const Field *argument_field =
+            argument_table >= 0
+                ? resolve_query_field(raw_argument_field, argument_table)
+                : nullptr;
+        if (argument_field == nullptr) {
+          aggregate_error = "minmax unresolvable";
+          return -1;
+        }
+        if (!table_is_virtual[argument_table] &&
+            argument_field->is_nullable()) {
+          aggregate_error = "minmax nullable";
+          return -1;
+        }
+        if (!table_is_virtual[argument_table] &&
+            argument_field->result_type() == STRING_RESULT &&
+            !argument_field->binary()) {
+          aggregate_error = "minmax collation";
+          return -1;
+        }
+
+        auto *ref = function->mutable_arg();
+        ref->set_op(LineairDB::Protocol::FilterExpr::COLUMN_REF);
+        ref->set_column_index(argument_field->field_index());
+        function->set_arg_table(static_cast<uint32_t>(argument_table));
+        function->set_kind(
+            sum->sum_func() == Item_sum::MIN_FUNC
+                ? LineairDB::Protocol::QueryBlockAggFunc::MIN
+                : LineairDB::Protocol::QueryBlockAggFunc::MAX);
+        function->set_cmp_kind(argument_field->result_type() == STRING_RESULT
+                                   ? 1
+                                   : 0);
+        return aggregate->aggs_size() - 1;
+      }
+
+      default:
+        aggregate_error = "aggregate kind unsupported";
+        return -1;
+    }
+  };
+
+  const uint32_t aggregate_output_base = aggregate->group_columns_size();
+  std::function<bool(Item *, LineairDB::Protocol::FilterExpr *)>
+      serialize_output_expression =
+          [&](Item *item, LineairDB::Protocol::FilterExpr *expr) -> bool {
+    item = item->real_item();
+    if (item->type() == Item::SUM_FUNC_ITEM) {
+      const int ordinal = register_aggregate(down_cast<Item_sum *>(item));
+      if (ordinal < 0) return false;
+      expr->set_op(LineairDB::Protocol::FilterExpr::COLUMN_REF);
+      expr->set_column_index(aggregate_output_base +
+                             static_cast<uint32_t>(ordinal));
+      return true;
+    }
+    if (item->type() == Item::FIELD_ITEM) {
+      const Field *raw_field = down_cast<Item_field *>(item)->field;
+      const int table_idx = TableIndexOfField(raw_field, tables);
+      if (table_idx < static_cast<int>(real_table_count) ||
+          table_idx >= static_cast<int>(tables.size()) ||
+          !table_is_virtual[table_idx]) {
+        return false;
+      }
+      const size_t virtual_idx =
+          static_cast<size_t>(table_idx) - real_table_count;
+      if (virtual_idx >= virtual_block_is_scalar_aggregate.size() ||
+          !virtual_block_is_scalar_aggregate[virtual_idx]) {
+        return false;
+      }
+
+      auto *function = aggregate->add_aggs();
+      function->set_arg_table(static_cast<uint32_t>(table_idx));
+      auto *ref = function->mutable_arg();
+      ref->set_op(LineairDB::Protocol::FilterExpr::COLUMN_REF);
+      ref->set_column_index(raw_field->field_index());
+      function->set_kind(LineairDB::Protocol::QueryBlockAggFunc::MIN);
+      function->set_cmp_kind(raw_field->result_type() == STRING_RESULT ? 1
+                                                                       : 0);
+
+      expr->set_op(LineairDB::Protocol::FilterExpr::COLUMN_REF);
+      expr->set_column_index(aggregate_output_base +
+                             static_cast<uint32_t>(
+                                 aggregate->aggs_size() - 1));
+      return true;
+    }
+    if (item->type() == Item::INT_ITEM) {
+      expr->set_op(LineairDB::Protocol::FilterExpr::CONST_INT);
+      expr->set_int_val(item->val_int());
+      return true;
+    }
+    if (item->const_item() && (item->result_type() == DECIMAL_RESULT ||
+                               item->result_type() == REAL_RESULT)) {
+      String buffer;
+      String *value = item->val_str(&buffer);
+      if (value == nullptr) return false;
+      expr->set_op(LineairDB::Protocol::FilterExpr::CONST_STRING);
+      expr->set_string_val(value->ptr(), value->length());
+      return true;
+    }
+    if (item->type() != Item::FUNC_ITEM) return false;
+
+    auto *function = down_cast<Item_func *>(item);
+    using FilterExpr = LineairDB::Protocol::FilterExpr;
+    FilterExpr::Op op;
+    switch (function->functype()) {
+      case Item_func::PLUS_FUNC:
+        op = FilterExpr::OP_ADD;
+        break;
+      case Item_func::MINUS_FUNC:
+        op = FilterExpr::OP_SUB;
+        break;
+      case Item_func::MUL_FUNC:
+        op = FilterExpr::OP_MUL;
+        break;
+      case Item_func::DIV_FUNC:
+        op = FilterExpr::OP_DIV;
+        break;
+      case Item_func::NEG_FUNC:
+        op = FilterExpr::OP_NEG;
+        break;
+      default:
+        return false;
+    }
+
+    expr->set_op(op);
+    for (uint arg_idx = 0; arg_idx < function->argument_count(); arg_idx++) {
+      if (!serialize_output_expression(function->arguments()[arg_idx],
+                                       expr->add_children())) {
+        return false;
+      }
+    }
+    return true;
+  };
 
   // The response must match MySQL's visible SELECT list exactly: grouped
-  // columns refer back to group keys, aggregate items refer to aggregate slots.
+  // columns refer back to group keys, aggregate items refer to aggregate slots,
+  // and arithmetic over aggregate items becomes an output expression.
   for (Item *item : output_items) {
     Item *real = item->real_item();
     auto *output = request.add_output();
@@ -1417,8 +2785,7 @@ bool RecognizeQueryBlock(JOIN *join, ColumnarExecutionContext *ctx,
       const int output_table = TableIndexOfField(raw_output_field, tables);
       const Field *output_field =
           output_table >= 0
-              ? ResolveBaseField(raw_output_field,
-                                 tables[output_table].table)
+              ? resolve_query_field(raw_output_field, output_table)
               : nullptr;
       if (output_field == nullptr)
         LDB_COL_REJECT("output column unresolvable");
@@ -1440,7 +2807,19 @@ bool RecognizeQueryBlock(JOIN *join, ColumnarExecutionContext *ctx,
       continue;
     }
 
-    if (real->type() != Item::SUM_FUNC_ITEM) {
+    if (real->type() == Item::SUM_FUNC_ITEM) {
+      const int aggregate_ordinal =
+          register_aggregate(down_cast<Item_sum *>(real));
+      if (aggregate_ordinal < 0) {
+        LDB_COL_REJECT(aggregate_error != nullptr ? aggregate_error
+                                                  : "aggregate");
+      }
+      output->set_source(LineairDB::Protocol::QueryBlockOutputExpr::AGG);
+      output->set_ordinal(static_cast<uint32_t>(aggregate_ordinal));
+      continue;
+    }
+
+    {
       int group_position = -1;
       for (size_t group_idx = 0; group_idx < group_items.size();
            group_idx++) {
@@ -1450,151 +2829,88 @@ bool RecognizeQueryBlock(JOIN *join, ColumnarExecutionContext *ctx,
           break;
         }
       }
-      if (group_position < 0) LDB_COL_REJECT("output not aggregate");
-      output->set_source(LineairDB::Protocol::QueryBlockOutputExpr::GROUP);
-      output->set_ordinal(group_position);
-      continue;
+      if (group_position >= 0) {
+        output->set_source(LineairDB::Protocol::QueryBlockOutputExpr::GROUP);
+        output->set_ordinal(group_position);
+        continue;
+      }
     }
 
-    Item_sum *sum = down_cast<Item_sum *>(real);
-    if (sum->argument_count() > 1) LDB_COL_REJECT("aggregate arg count");
-
-    auto *function = aggregate->add_aggs();
-    switch (sum->sum_func()) {
-      case Item_sum::COUNT_FUNC: {
-        function->set_arg_table(0);
-        if (sum->argument_count() > 0) {
-          Item *arg = sum->get_arg(0)->real_item();
-          if (arg->const_item()) {
-            if (arg->is_nullable() || arg->is_null())
-              LDB_COL_REJECT("COUNT const nullable");
-          } else {
-            if (arg->type() != Item::FIELD_ITEM)
-              LDB_COL_REJECT("COUNT arg shape");
-            const Field *raw_count_field =
-                down_cast<Item_field *>(arg)->field;
-            const int count_table = TableIndexOfField(raw_count_field, tables);
-            const Field *count_field =
-                count_table >= 0
-                    ? ResolveBaseField(raw_count_field,
-                                       tables[count_table].table)
-                    : nullptr;
-            if (count_field == nullptr || count_field->is_nullable())
-              LDB_COL_REJECT("COUNT arg nullable");
-            function->set_arg_table(static_cast<uint32_t>(count_table));
-            auto *ref = function->mutable_arg();
-            ref->set_op(LineairDB::Protocol::FilterExpr::COLUMN_REF);
-            ref->set_column_index(count_field->field_index());
-          }
-        }
-
-        function->set_kind(LineairDB::Protocol::QueryBlockAggFunc::COUNT);
-        break;
-      }
-
-      case Item_sum::SUM_FUNC:
-      case Item_sum::AVG_FUNC: {
-        if (sum->argument_count() != 1) LDB_COL_REJECT("aggregate arg count");
-        Item *arg = sum->get_arg(0)->real_item();
-        if (sum->sum_func() == Item_sum::SUM_FUNC) {
-          if (Item *filter = CaseToCountFilter(arg)) {
-            const int filter_table = SingleTableOf(
-                filter->used_tables() & ~PSEUDO_TABLE_BITS, tables);
-            if (filter_table < 0) LDB_COL_REJECT("CASE filter tables");
-            auto *predicate = function->mutable_filter();
-            predicate->set_num_columns(tables[filter_table].table->s->fields);
-            if (!serialize_item(filter, predicate->mutable_expr()))
-              LDB_COL_REJECT("CASE filter not pushable");
-            function->set_arg_table(static_cast<uint32_t>(filter_table));
-            function->set_kind(LineairDB::Protocol::QueryBlockAggFunc::COUNT);
-            break;
-          }
-        }
-        if (arg->result_type() != DECIMAL_RESULT &&
-            arg->result_type() != INT_RESULT) {
-          LDB_COL_REJECT("aggregate arg type");
-        }
-
-        int argument_table =
-            SingleTableOf(arg->used_tables() & ~PSEUDO_TABLE_BITS, tables);
-        if (argument_table >= 0 && arg->type() == Item::FIELD_ITEM) {
-          const Field *raw_argument_field =
-              down_cast<Item_field *>(arg)->field;
-          const Field *argument_field = ResolveBaseField(
-              raw_argument_field, tables[argument_table].table);
-          if (argument_field == nullptr)
-            LDB_COL_REJECT("aggregate arg unresolvable");
-
-          auto *ref = function->mutable_arg();
-          ref->set_op(LineairDB::Protocol::FilterExpr::COLUMN_REF);
-          ref->set_column_index(argument_field->field_index());
-        } else if (argument_table >= 0) {
-          if (!lineairdb::serialize_aggregate_expression(
-                  arg, function->mutable_arg())) {
-            LDB_COL_REJECT("aggregate expr not pushable");
-          }
-        } else {
-          argument_table = 0;
-          if (!SerializeAggregateExpressionForTables(
-                  arg, tables, static_cast<uint32_t>(argument_table),
-                  function->mutable_arg())) {
-            LDB_COL_REJECT("aggregate expr not pushable");
-          }
-        }
-
-        function->set_arg_table(static_cast<uint32_t>(argument_table));
-        function->set_kind(
-            sum->sum_func() == Item_sum::SUM_FUNC
-                ? LineairDB::Protocol::QueryBlockAggFunc::SUM
-                : LineairDB::Protocol::QueryBlockAggFunc::AVG);
-        function->set_arg_scale(arg->decimals);
-        break;
-      }
-
-      case Item_sum::MIN_FUNC:
-      case Item_sum::MAX_FUNC: {
-        if (sum->argument_count() != 1) LDB_COL_REJECT("aggregate arg count");
-        Item *arg = sum->get_arg(0)->real_item();
-        if (arg->type() != Item::FIELD_ITEM) LDB_COL_REJECT("minmax arg");
-        const Field *raw_argument_field =
-            down_cast<Item_field *>(arg)->field;
-        const int argument_table =
-            TableIndexOfField(raw_argument_field, tables);
-        const Field *argument_field =
-            argument_table >= 0
-                ? ResolveBaseField(raw_argument_field,
-                                   tables[argument_table].table)
-                : nullptr;
-        if (argument_field == nullptr) LDB_COL_REJECT("minmax unresolvable");
-        if (argument_field->is_nullable()) LDB_COL_REJECT("minmax nullable");
-        if (argument_field->result_type() == STRING_RESULT &&
-            !argument_field->binary()) {
-          LDB_COL_REJECT("minmax collation");
-        }
-
-        auto *ref = function->mutable_arg();
-        ref->set_op(LineairDB::Protocol::FilterExpr::COLUMN_REF);
-        ref->set_column_index(argument_field->field_index());
-        function->set_arg_table(static_cast<uint32_t>(argument_table));
-        function->set_kind(
-            sum->sum_func() == Item_sum::MIN_FUNC
-                ? LineairDB::Protocol::QueryBlockAggFunc::MIN
-                : LineairDB::Protocol::QueryBlockAggFunc::MAX);
-        function->set_cmp_kind(argument_field->result_type() == STRING_RESULT
-                                   ? 1
-                                   : 0);
-        break;
-      }
-
-      default:
-        LDB_COL_REJECT("aggregate kind unsupported");
+    if (!serialize_output_expression(real, output->mutable_expr())) {
+      LDB_COL_REJECT(aggregate_error != nullptr ? aggregate_error
+                                                : "output expression");
     }
-
-    output->set_source(LineairDB::Protocol::QueryBlockOutputExpr::AGG);
-    output->set_ordinal(aggregate->aggs_size() - 1);
+    output->set_source(LineairDB::Protocol::QueryBlockOutputExpr::EXPR);
+    output->set_result_scale(real->decimals);
   }
 
-  if (aggregate->aggs_size() == 0) LDB_COL_REJECT("no aggregates");
+  if (qb->having_cond() != nullptr) {
+    std::function<bool(Item *, LineairDB::Protocol::FilterExpr *)>
+        serialize_having;
+    serialize_having =
+        [&](Item *item, LineairDB::Protocol::FilterExpr *expr) -> bool {
+      item = item->real_item();
+      if (item->type() == Item::COND_ITEM) {
+        auto *condition = down_cast<Item_cond *>(item);
+        expr->set_op(condition->functype() == Item_func::COND_AND_FUNC
+                         ? LineairDB::Protocol::FilterExpr::OP_AND
+                         : LineairDB::Protocol::FilterExpr::OP_OR);
+        List_iterator<Item> iterator(*condition->argument_list());
+        for (Item *part = iterator++; part != nullptr; part = iterator++) {
+          if (!serialize_having(part, expr->add_children())) return false;
+        }
+        return true;
+      }
+      if (item->type() != Item::FUNC_ITEM) return false;
+
+      auto *function = down_cast<Item_func *>(item);
+      LineairDB::Protocol::FilterExpr::Op op;
+      switch (function->functype()) {
+        case Item_func::EQ_FUNC:
+          op = LineairDB::Protocol::FilterExpr::OP_EQ;
+          break;
+        case Item_func::NE_FUNC:
+          op = LineairDB::Protocol::FilterExpr::OP_NE;
+          break;
+        case Item_func::LT_FUNC:
+          op = LineairDB::Protocol::FilterExpr::OP_LT;
+          break;
+        case Item_func::LE_FUNC:
+          op = LineairDB::Protocol::FilterExpr::OP_LE;
+          break;
+        case Item_func::GT_FUNC:
+          op = LineairDB::Protocol::FilterExpr::OP_GT;
+          break;
+        case Item_func::GE_FUNC:
+          op = LineairDB::Protocol::FilterExpr::OP_GE;
+          break;
+        default:
+          return false;
+      }
+      if (function->argument_count() != 2) return false;
+
+      expr->set_op(op);
+      for (uint arg_idx = 0; arg_idx < 2; arg_idx++) {
+        auto *child = expr->add_children();
+        if (!serialize_output_expression(function->arguments()[arg_idx],
+                                         child)) {
+          return false;
+        }
+        child->set_compare_type(2);
+      }
+      return true;
+    };
+
+    auto *having = aggregate->mutable_having();
+    if (!serialize_having(qb->having_cond(), having->mutable_expr())) {
+      LDB_COL_REJECT("HAVING not pushable");
+    }
+    having->set_num_columns(aggregate->group_columns_size() +
+                            aggregate->aggs_size());
+  }
+
+  if (aggregate->aggs_size() == 0 && aggregate->group_columns_size() == 0)
+    LDB_COL_REJECT("no aggregates");
 
   for (ORDER *order = qb->order_list.first; order != nullptr;
        order = order->next) {
@@ -1620,12 +2936,47 @@ bool RecognizeQueryBlock(JOIN *join, ColumnarExecutionContext *ctx,
     }
   }
 
-  ctx->query_block_ready = true;
-
   *why = nullptr;
   return true;
 
 #undef LDB_COL_REJECT
+}
+
+/**
+ * @brief Recognize aggregate query blocks supported by LINEAIRDB_COLUMNAR.
+ *
+ * Unsupported shapes return false and set `why`; callers convert that into a
+ * secondary-engine reject that may fall back to the primary engine when the
+ * session allows it.
+ */
+bool RecognizeQueryBlock(JOIN *join, ColumnarExecutionContext *ctx,
+                         const char **why) {
+  ctx->query_block_request.Clear();
+  ctx->query_block_ready = false;
+
+  Query_block *qb = join == nullptr ? nullptr : join->query_block;
+  if (qb == nullptr || qb->outer_query_block() != nullptr) {
+    *why = "not top-level";
+    return false;
+  }
+
+  Query_expression *unit = qb->master_query_expression();
+  if (unit == nullptr || !unit->is_simple()) {
+    *why = "not simple unit";
+    return false;
+  }
+
+  if (qb->leaf_tables != nullptr && qb->leaf_tables->next_leaf == nullptr &&
+      qb->leaf_tables->is_view_or_derived()) {
+    if (RecognizeDerivedRegroup(join, ctx, why)) return true;
+    if (RecognizeFlattenedAggregate(join, ctx, why)) return true;
+  }
+
+  if (!BuildQueryBlockRequest(join, qb, &ctx->query_block_request, why)) {
+    return false;
+  }
+  ctx->query_block_ready = true;
+  return true;
 }
 
 /**
