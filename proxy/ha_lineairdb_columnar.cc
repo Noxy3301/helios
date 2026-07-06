@@ -1490,6 +1490,18 @@ bool BuildQueryBlockRequest(
     return ResolveBaseField(field, tables[table_idx].table);
   };
 
+  auto is_scalar_virtual_table = [&](int table_idx) {
+    if (table_idx < static_cast<int>(real_table_count) ||
+        table_idx >= static_cast<int>(table_is_virtual.size()) ||
+        !table_is_virtual[table_idx]) {
+      return false;
+    }
+    const size_t virtual_idx =
+        static_cast<size_t>(table_idx) - real_table_count;
+    return virtual_idx < virtual_block_is_scalar_aggregate.size() &&
+           virtual_block_is_scalar_aggregate[virtual_idx];
+  };
+
   struct JoinEdge {
     int left_table = -1;
     int right_table = -1;
@@ -1755,8 +1767,14 @@ bool BuildQueryBlockRequest(
     }
     join_edges.push_back({left_table, right_table, left_field, right_field});
   }
-  if (main_tables.size() > 1 && join_edges.empty())
+  size_t main_non_scalar_tables = 0;
+  for (int table_idx : main_tables) {
+    if (!is_scalar_virtual_table(table_idx)) main_non_scalar_tables++;
+  }
+  if (main_tables.size() > 1 && join_edges.empty() &&
+      main_non_scalar_tables > 1) {
     LDB_COL_REJECT("cross join");
+  }
 
   // Scan every table once, attaching only predicates that read that table.
   auto &request = *request_out;
@@ -1789,16 +1807,23 @@ bool BuildQueryBlockRequest(
 
   // Build a left-deep INNER join tree by walking FROM order and retrying tables
   // whose equality edges are not connected yet.
-  int current_node = scan_nodes[main_tables[0]];
+  auto first_input =
+      std::find_if(main_tables.begin(), main_tables.end(), [&](int table_idx) {
+        return !is_scalar_virtual_table(table_idx);
+      });
+  const int first_table =
+      first_input != main_tables.end() ? *first_input : main_tables[0];
+  int current_node = scan_nodes[first_table];
   std::vector<bool> joined(tables.size(), false);
-  joined[main_tables[0]] = true;
+  joined[first_table] = true;
   std::vector<int> pending_tables;
-  for (size_t table_idx = 1; table_idx < main_tables.size(); table_idx++) {
-    pending_tables.push_back(main_tables[table_idx]);
+  for (int table_idx : main_tables) {
+    if (table_idx != first_table) pending_tables.push_back(table_idx);
   }
   while (!pending_tables.empty()) {
     int table_idx = -1;
     size_t pending_idx = 0;
+    bool keyless_one_row_join = false;
     for (size_t idx = 0; idx < pending_tables.size(); idx++) {
       for (const JoinEdge &edge : join_edges) {
         if ((edge.left_table == pending_tables[idx] &&
@@ -1812,10 +1837,22 @@ bool BuildQueryBlockRequest(
       }
       if (table_idx >= 0) break;
     }
+    if (table_idx < 0) {
+      // Scalar aggregate sub-blocks produce at most one row, so they are the
+      // only virtual inputs that can use a keyless INNER join.
+      for (size_t idx = 0; idx < pending_tables.size(); idx++) {
+        if (is_scalar_virtual_table(pending_tables[idx])) {
+          table_idx = pending_tables[idx];
+          pending_idx = idx;
+          keyless_one_row_join = true;
+          break;
+        }
+      }
+    }
     if (table_idx < 0) LDB_COL_REJECT("disconnected join graph");
     pending_tables.erase(pending_tables.begin() + pending_idx);
 
-    bool connected = false;
+    bool connected = keyless_one_row_join;
     auto *join_node = request.add_nodes()->mutable_join();
     join_node->set_type(LineairDB::Protocol::QueryBlockJoin::INNER);
     join_node->set_build(scan_nodes[table_idx]);
@@ -1906,8 +1943,20 @@ bool BuildQueryBlockRequest(
       return false;
     };
 
+    int first_inner_table = semijoin.inner_tables[0];
+    if (semijoin.inner_tables.size() > 1) {
+      auto first_inner_input =
+          std::find_if(semijoin.inner_tables.begin(),
+                       semijoin.inner_tables.end(), [&](int table_idx) {
+                         return !is_scalar_virtual_table(table_idx);
+                       });
+      if (first_inner_input != semijoin.inner_tables.end()) {
+        first_inner_table = *first_inner_input;
+      }
+    }
+
     // Multi-table semijoin nests become a build-side INNER-join mini tree.
-    int build_node = scan_nodes[semijoin.inner_tables[0]];
+    int build_node = scan_nodes[first_inner_table];
     if (semijoin.inner_tables.size() > 1) {
       struct InnerJoinEdge {
         int left_table = -1;
@@ -1955,14 +2004,18 @@ bool BuildQueryBlockRequest(
       semijoin.residual_predicates = std::move(remaining_residuals);
 
       std::vector<bool> inner_joined(tables.size(), false);
-      inner_joined[semijoin.inner_tables[0]] = true;
-      std::vector<int> pending_inner_tables(
-          semijoin.inner_tables.begin() + 1,
-          semijoin.inner_tables.end());
+      inner_joined[first_inner_table] = true;
+      std::vector<int> pending_inner_tables;
+      for (int table_idx : semijoin.inner_tables) {
+        if (table_idx != first_inner_table) {
+          pending_inner_tables.push_back(table_idx);
+        }
+      }
 
       while (!pending_inner_tables.empty()) {
         int picked_table = -1;
         size_t picked_idx = 0;
+        bool keyless_one_row_join = false;
         for (size_t idx = 0; idx < pending_inner_tables.size(); idx++) {
           for (const InnerJoinEdge &edge : inner_edges) {
             if ((edge.left_table == pending_inner_tables[idx] &&
@@ -1976,10 +2029,21 @@ bool BuildQueryBlockRequest(
           }
           if (picked_table >= 0) break;
         }
+        if (picked_table < 0) {
+          // Keep keyless INNER joins limited to one-row virtual inputs.
+          for (size_t idx = 0; idx < pending_inner_tables.size(); idx++) {
+            if (is_scalar_virtual_table(pending_inner_tables[idx])) {
+              picked_table = pending_inner_tables[idx];
+              picked_idx = idx;
+              keyless_one_row_join = true;
+              break;
+            }
+          }
+        }
         if (picked_table < 0) LDB_COL_REJECT("semijoin disconnected");
         pending_inner_tables.erase(pending_inner_tables.begin() + picked_idx);
 
-        bool connected = false;
+        bool connected = keyless_one_row_join;
         auto *inner_join = request.add_nodes()->mutable_join();
         inner_join->set_type(LineairDB::Protocol::QueryBlockJoin::INNER);
         inner_join->set_build(static_cast<uint32_t>(scan_nodes[picked_table]));
