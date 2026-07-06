@@ -1897,6 +1897,33 @@ bool BuildQueryBlockRequest(
       return true;
     };
 
+    // Join keys emitted below are enforced equalities. Later mapped joins may
+    // need the same column through a surviving equivalent column if the
+    // optimizer removed an intermediate table from the mapped tree.
+    using ColRef = std::pair<int, uint32_t>;
+    std::vector<std::pair<ColRef, ColRef>> enforced_equalities;
+
+    auto equivalent_columns = [&](ColRef start) {
+      std::set<ColRef> columns{start};
+      bool grew = true;
+      while (grew) {
+        grew = false;
+        for (const auto &edge : enforced_equalities) {
+          if (columns.count(edge.first) != 0 &&
+              columns.count(edge.second) == 0) {
+            columns.insert(edge.second);
+            grew = true;
+          }
+          if (columns.count(edge.second) != 0 &&
+              columns.count(edge.first) == 0) {
+            columns.insert(edge.first);
+            grew = true;
+          }
+        }
+      }
+      return columns;
+    };
+
     auto emit_mapped_join =
         [&](LineairDB::Protocol::QueryBlockJoin::Type join_type, int probe,
             int build, RelationalExpression *expression,
@@ -1953,28 +1980,65 @@ bool BuildQueryBlockRequest(
           return -1;
         }
 
+        ColRef build_ref{-1, 0};
+        ColRef probe_ref{-1, 0};
         if (node_tables[build].count(left_table) > 0 &&
             node_tables[probe].count(right_table) > 0) {
-          // left stays on the build side and right stays on the probe side.
+          build_ref = {left_table, left_field->field_index()};
+          probe_ref = {right_table, right_field->field_index()};
         } else if (node_tables[build].count(right_table) > 0 &&
                    node_tables[probe].count(left_table) > 0) {
-          std::swap(left_table, right_table);
-          std::swap(left_field, right_field);
+          build_ref = {right_table, right_field->field_index()};
+          probe_ref = {left_table, left_field->field_index()};
         } else {
+          // Rewrite through equivalence only after both direct side matches
+          // fail, so already-resolved joins keep their original columns.
+          auto pick_from_side = [](const std::set<ColRef> &columns,
+                                   const std::set<int> &side_tables) {
+            for (const ColRef &column : columns) {
+              if (side_tables.count(column.first) != 0) return column;
+            }
+            return ColRef{-1, 0};
+          };
+
+          const std::set<ColRef> left_equivalents =
+              equivalent_columns({left_table, left_field->field_index()});
+          const std::set<ColRef> right_equivalents =
+              equivalent_columns({right_table, right_field->field_index()});
+          build_ref = pick_from_side(left_equivalents, node_tables[build]);
+          probe_ref = pick_from_side(right_equivalents, node_tables[probe]);
+          if (build_ref.first < 0 || probe_ref.first < 0) {
+            build_ref = pick_from_side(right_equivalents, node_tables[build]);
+            probe_ref = pick_from_side(left_equivalents, node_tables[probe]);
+          }
+        }
+        if (build_ref.first < 0 || probe_ref.first < 0) {
           *why = "plan join key sides";
           return -1;
         }
 
         auto *build_key = join_node->add_build_keys();
-        build_key->set_table_idx(static_cast<uint32_t>(left_table));
-        build_key->set_column(left_field->field_index());
+        build_key->set_table_idx(static_cast<uint32_t>(build_ref.first));
+        build_key->set_column(build_ref.second);
         auto *probe_key = join_node->add_probe_keys();
-        probe_key->set_table_idx(static_cast<uint32_t>(right_table));
-        probe_key->set_column(right_field->field_index());
+        probe_key->set_table_idx(static_cast<uint32_t>(probe_ref.first));
+        probe_key->set_column(probe_ref.second);
         mapped_join_keys.push_back(
-            {join_type, build, probe, static_cast<uint32_t>(left_table),
-             left_field->field_index(), static_cast<uint32_t>(right_table),
-             right_field->field_index()});
+            {join_type, build, probe, static_cast<uint32_t>(build_ref.first),
+             build_ref.second, static_cast<uint32_t>(probe_ref.first),
+             probe_ref.second});
+      }
+
+      if (join_type == LineairDB::Protocol::QueryBlockJoin::INNER ||
+          join_type == LineairDB::Protocol::QueryBlockJoin::SEMI) {
+        for (int key_idx = 0; key_idx < join_node->build_keys_size();
+             key_idx++) {
+          enforced_equalities.push_back(
+              {{static_cast<int>(join_node->build_keys(key_idx).table_idx()),
+                join_node->build_keys(key_idx).column()},
+               {static_cast<int>(join_node->probe_keys(key_idx).table_idx()),
+                join_node->probe_keys(key_idx).column()}});
+        }
       }
 
       std::vector<Item *> residuals;
