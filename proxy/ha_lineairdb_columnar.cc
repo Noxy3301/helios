@@ -1576,10 +1576,6 @@ bool BuildQueryBlockRequest(
     const Field *left_field = resolve_query_field(left_raw, left_table);
     const Field *right_field = resolve_query_field(right_raw, right_table);
     if (left_field == nullptr || right_field == nullptr) return false;
-    if ((!table_is_virtual[left_table] && left_field->is_nullable()) ||
-        (!table_is_virtual[right_table] && right_field->is_nullable())) {
-      return false;
-    }
     join_edges.push_back({left_table, right_table, left_field, right_field});
     return true;
   };
@@ -1788,10 +1784,6 @@ bool BuildQueryBlockRequest(
     const Field *right_field = resolve_query_field(right_raw, right_table);
     if (left_field == nullptr || right_field == nullptr) {
       LDB_COL_REJECT("join key unresolvable");
-    }
-    if ((!table_is_virtual[left_table] && left_field->is_nullable()) ||
-        (!table_is_virtual[right_table] && right_field->is_nullable())) {
-      LDB_COL_REJECT("join key nullable");
     }
     join_edges.push_back({left_table, right_table, left_field, right_field});
   }
@@ -2002,12 +1994,6 @@ bool BuildQueryBlockRequest(
           *why = "plan join key resolve";
           return -1;
         }
-        if ((!table_is_virtual[left_table] && left_field->is_nullable()) ||
-            (!table_is_virtual[right_table] && right_field->is_nullable())) {
-          *why = "plan join key nullable";
-          return -1;
-        }
-
         ColRef build_ref{-1, 0};
         ColRef probe_ref{-1, 0};
         if (node_tables[build].count(left_table) > 0 &&
