@@ -1232,42 +1232,34 @@ bool RecognizeFlattenedAggregate(JOIN *join, ColumnarExecutionContext *ctx,
 }
 
 /**
- * @brief Recognize aggregate query blocks supported by LINEAIRDB_COLUMNAR.
+ * @brief Build a query-block request for aggregate shapes.
  *
- * Unsupported shapes return false and set `why`; callers convert that into a
- * secondary-engine reject that may fall back to the primary engine when the
- * session allows it.
+ * Unsupported shapes return false and set `why`; callers decide whether the
+ * primary engine may run instead.
  */
-bool RecognizeQueryBlock(JOIN *join, ColumnarExecutionContext *ctx,
-                         const char **why) {
+bool BuildQueryBlockRequest(
+    JOIN *join, Query_block *qb,
+    LineairDB::Protocol::TxExecuteQueryBlock::Request *request_out,
+    const char **why) {
 #define LDB_COL_REJECT(reason) \
   do {                         \
     *why = (reason);           \
     return false;              \
   } while (0)
 
-  ctx->query_block_request.Clear();
-  ctx->query_block_ready = false;
-
-  Query_block *qb = join->query_block;
-  if (qb == nullptr || qb->outer_query_block() != nullptr)
-    LDB_COL_REJECT("not top-level");
+  if (qb == nullptr || request_out == nullptr) LDB_COL_REJECT("missing block");
 
   Query_expression *unit = qb->master_query_expression();
   if (unit == nullptr || !unit->is_simple())
     LDB_COL_REJECT("not simple unit");
 
-  if (qb->leaf_tables != nullptr && qb->leaf_tables->next_leaf == nullptr &&
-      qb->leaf_tables->is_view_or_derived()) {
-    if (RecognizeDerivedRegroup(join, ctx, why)) return true;
-    return RecognizeFlattenedAggregate(join, ctx, why);
-  }
-
   if (qb->having_cond() != nullptr) LDB_COL_REJECT("has HAVING");
   if (qb->is_distinct()) LDB_COL_REJECT("has DISTINCT");
   if (qb->has_windows()) LDB_COL_REJECT("has windows");
   if (qb->olap != UNSPECIFIED_OLAP_TYPE) LDB_COL_REJECT("has ROLLUP");
-  if (!join->implicit_grouping && qb->group_list.elements == 0)
+  const bool implicit_grouping =
+      join != nullptr ? join->implicit_grouping : qb->is_implicitly_grouped();
+  if (!implicit_grouping && qb->group_list.elements == 0)
     LDB_COL_REJECT("no aggregation");
 
   struct SemijoinNest {
@@ -1338,7 +1330,9 @@ bool RecognizeQueryBlock(JOIN *join, ColumnarExecutionContext *ctx,
   std::vector<JoinEdge> join_edges;
   std::vector<Item *> tuple_predicates;
   Item *where_cond =
-      qb->where_cond() != nullptr ? qb->where_cond() : join->where_cond;
+      qb->where_cond() != nullptr
+          ? qb->where_cond()
+          : (join != nullptr ? join->where_cond : nullptr);
   std::vector<Item *> predicates;
   FlattenAnd(where_cond, &predicates);
 
@@ -1492,7 +1486,8 @@ bool RecognizeQueryBlock(JOIN *join, ColumnarExecutionContext *ctx,
     LDB_COL_REJECT("cross join");
 
   // Scan every table once, attaching only predicates that read that table.
-  auto &request = ctx->query_block_request;
+  auto &request = *request_out;
+  request.Clear();
   std::vector<int> scan_nodes(tables.size(), -1);
   for (size_t table_idx = 0; table_idx < tables.size(); table_idx++) {
     TABLE *table = tables[table_idx].table;
@@ -2165,12 +2160,47 @@ bool RecognizeQueryBlock(JOIN *join, ColumnarExecutionContext *ctx,
     }
   }
 
-  ctx->query_block_ready = true;
-
   *why = nullptr;
   return true;
 
 #undef LDB_COL_REJECT
+}
+
+/**
+ * @brief Recognize aggregate query blocks supported by LINEAIRDB_COLUMNAR.
+ *
+ * Unsupported shapes return false and set `why`; callers convert that into a
+ * secondary-engine reject that may fall back to the primary engine when the
+ * session allows it.
+ */
+bool RecognizeQueryBlock(JOIN *join, ColumnarExecutionContext *ctx,
+                         const char **why) {
+  ctx->query_block_request.Clear();
+  ctx->query_block_ready = false;
+
+  Query_block *qb = join == nullptr ? nullptr : join->query_block;
+  if (qb == nullptr || qb->outer_query_block() != nullptr) {
+    *why = "not top-level";
+    return false;
+  }
+
+  Query_expression *unit = qb->master_query_expression();
+  if (unit == nullptr || !unit->is_simple()) {
+    *why = "not simple unit";
+    return false;
+  }
+
+  if (qb->leaf_tables != nullptr && qb->leaf_tables->next_leaf == nullptr &&
+      qb->leaf_tables->is_view_or_derived()) {
+    if (RecognizeDerivedRegroup(join, ctx, why)) return true;
+    return RecognizeFlattenedAggregate(join, ctx, why);
+  }
+
+  if (!BuildQueryBlockRequest(join, qb, &ctx->query_block_request, why)) {
+    return false;
+  }
+  ctx->query_block_ready = true;
+  return true;
 }
 
 /**
