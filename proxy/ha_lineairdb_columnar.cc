@@ -277,6 +277,19 @@ bool GroupColumnIsBinarySafe(const Field *field) {
 }
 
 /**
+ * @brief Return true when a join key can use byte equality on stored cells.
+ *
+ * Integer cells and canonical DECIMAL text cells compare correctly with byte
+ * equality when both sides use the same MySQL result type.
+ */
+bool JoinColumnsUseByteEquality(const Field *left, const Field *right) {
+  if (left == nullptr || right == nullptr) return false;
+  if (left->result_type() != right->result_type()) return false;
+  return left->result_type() == INT_RESULT ||
+         left->result_type() == DECIMAL_RESULT;
+}
+
+/**
  * @brief Return the visible output ordinal used by an ORDER BY item.
  */
 int OrderOutputOrdinal(Item *order_item,
@@ -815,8 +828,7 @@ bool RecognizeDerivedRegroup(JOIN *join, ColumnarExecutionContext *ctx,
     } else {
       LDB_COL_REJECT("inner join key tables");
     }
-    if (preserved_key->result_type() != INT_RESULT ||
-        nullable_key->result_type() != INT_RESULT) {
+    if (!JoinColumnsUseByteEquality(preserved_key, nullable_key)) {
       LDB_COL_REJECT("inner join key type");
     }
     if (preserved_key->is_nullable() || nullable_key->is_nullable()) {
@@ -1123,8 +1135,7 @@ bool RecognizeFlattenedAggregate(JOIN *join, ColumnarExecutionContext *ctx,
     if (left_table < 0 || right_table < 0 || left_table == right_table) {
       LDB_COL_REJECT("inner join key tables");
     }
-    if (left_raw->result_type() != INT_RESULT ||
-        right_raw->result_type() != INT_RESULT) {
+    if (!JoinColumnsUseByteEquality(left_raw, right_raw)) {
       LDB_COL_REJECT("inner join key type");
     }
 
@@ -1516,8 +1527,7 @@ bool BuildQueryBlockRequest(
         table_semijoin_nest[right_table] >= 0) {
       return false;
     }
-    if (left_raw->result_type() != INT_RESULT ||
-        right_raw->result_type() != INT_RESULT) {
+    if (!JoinColumnsUseByteEquality(left_raw, right_raw)) {
       return false;
     }
 
@@ -1684,8 +1694,7 @@ bool BuildQueryBlockRequest(
               left_table == right_table) {
             continue;
           }
-          if (candidate.first->result_type() != INT_RESULT ||
-              candidate.second->result_type() != INT_RESULT) {
+          if (!JoinColumnsUseByteEquality(candidate.first, candidate.second)) {
             continue;
           }
 
@@ -1723,9 +1732,8 @@ bool BuildQueryBlockRequest(
     if (left_table < 0 || right_table < 0 || left_table == right_table) {
       LDB_COL_REJECT("join key tables");
     }
-    if (left_raw->result_type() != INT_RESULT ||
-        right_raw->result_type() != INT_RESULT) {
-      LDB_COL_REJECT("non-integer join key");
+    if (!JoinColumnsUseByteEquality(left_raw, right_raw)) {
+      LDB_COL_REJECT("join key type");
     }
 
     const Field *left_field = resolve_query_field(left_raw, left_table);
@@ -1916,8 +1924,7 @@ bool BuildQueryBlockRequest(
       if (outer_table < 0 || inner_key_table != inner_table) {
         LDB_COL_REJECT("semijoin key tables");
       }
-      if (raw_outer_field->result_type() != INT_RESULT ||
-          raw_inner_field->result_type() != INT_RESULT) {
+      if (!JoinColumnsUseByteEquality(raw_outer_field, raw_inner_field)) {
         LDB_COL_REJECT("semijoin key type");
       }
 
