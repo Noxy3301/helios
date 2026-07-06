@@ -1453,8 +1453,9 @@ bool BuildQueryBlockRequest(
   for (Table_ref *table_ref = qb->leaf_tables; table_ref != nullptr;
        table_ref = table_ref->next_leaf) {
     if (!table_ref->is_view_or_derived()) continue;
-    if (table_ref->outer_join) LDB_COL_REJECT("outer derived table");
-    if (semijoin_nest_of(table_ref) >= 0) LDB_COL_REJECT("derived semijoin");
+    const int semijoin_nest = semijoin_nest_of(table_ref);
+    if (semijoin_nest < 0 && table_ref->outer_join)
+      LDB_COL_REJECT("outer derived table");
     if (table_ref->table == nullptr) LDB_COL_REJECT("derived no TABLE");
 
     Query_expression *derived_unit = table_ref->derived_query_expression();
@@ -1464,13 +1465,18 @@ bool BuildQueryBlockRequest(
     if (derived_qb == nullptr) LDB_COL_REJECT("derived no query block");
 
     tables.push_back({table_ref->table, table_ref->map()});
-    table_semijoin_nest.push_back(-1);
+    table_semijoin_nest.push_back(semijoin_nest);
     table_is_virtual.push_back(true);
     virtual_blocks.push_back(derived_qb);
     virtual_block_is_scalar_aggregate.push_back(
         derived_qb->is_implicitly_grouped() &&
         derived_qb->group_list.elements == 0);
-    main_tables.push_back(static_cast<int>(tables.size()) - 1);
+    if (semijoin_nest >= 0) {
+      semijoin_nests[semijoin_nest].inner_tables.push_back(
+          static_cast<int>(tables.size()) - 1);
+    } else {
+      main_tables.push_back(static_cast<int>(tables.size()) - 1);
+    }
   }
   if (main_tables.empty()) LDB_COL_REJECT("no tables");
 
