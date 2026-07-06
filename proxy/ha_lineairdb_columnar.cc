@@ -1818,7 +1818,33 @@ bool BuildQueryBlockRequest(
   int current_node = -1;
   if (plan_map) {
     std::map<int, std::set<int>> node_tables;
+    std::map<int, double> node_rows;
     size_t next_virtual_table = real_table_count;
+
+    struct MappedJoinKey {
+      LineairDB::Protocol::QueryBlockJoin::Type join_type;
+      int build_node = -1;
+      int probe_node = -1;
+      uint32_t build_table = 0;
+      uint32_t build_column = 0;
+      uint32_t probe_table = 0;
+      uint32_t probe_column = 0;
+    };
+    std::vector<MappedJoinKey> mapped_join_keys;
+
+    auto estimated_rows = [](const AccessPath *path) {
+      return std::max(1.0, path == nullptr ? 1.0 : path->num_output_rows());
+    };
+
+    auto table_rows = [&](size_t table_idx) {
+      if (table_idx >= tables.size() || tables[table_idx].table == nullptr ||
+          tables[table_idx].table->file == nullptr) {
+        return 1.0;
+      }
+      return std::max(
+          1.0,
+          static_cast<double>(tables[table_idx].table->file->stats.records));
+    };
 
     std::set<const Item *> having_predicates;
     if (qb->having_cond() != nullptr) {
@@ -1892,8 +1918,10 @@ bool BuildQueryBlockRequest(
             *why = "filter not pushable";
             return -1;
           }
-          node_tables[scan_nodes[table_idx]] = {table_idx};
-          return scan_nodes[table_idx];
+          const int self = scan_nodes[table_idx];
+          node_tables[self] = {table_idx};
+          node_rows[self] = estimated_rows(path);
+          return self;
         }
 
         case AccessPath::FILTER: {
@@ -1916,7 +1944,14 @@ bool BuildQueryBlockRequest(
             }
             residuals.push_back(part);
           }
-          if (residuals.empty()) return input;
+          if (residuals.empty()) {
+            auto it = node_rows.find(input);
+            node_rows[input] = it == node_rows.end()
+                                   ? estimated_rows(path)
+                                   : std::min(it->second,
+                                              estimated_rows(path));
+            return input;
+          }
 
           for (Item *residual : residuals) {
             const table_map used =
@@ -1939,6 +1974,7 @@ bool BuildQueryBlockRequest(
           }
           const int self = request.nodes_size() - 1;
           node_tables[self] = node_tables[input];
+          node_rows[self] = estimated_rows(path);
           return self;
         }
 
@@ -2076,6 +2112,10 @@ bool BuildQueryBlockRequest(
             auto *probe_key = join_node->add_probe_keys();
             probe_key->set_table_idx(static_cast<uint32_t>(right_table));
             probe_key->set_column(right_field->field_index());
+            mapped_join_keys.push_back(
+                {join_type, build, probe, static_cast<uint32_t>(left_table),
+                 left_field->field_index(), static_cast<uint32_t>(right_table),
+                 right_field->field_index()});
           }
 
           if (!expression->join_conditions.empty()) {
@@ -2125,6 +2165,7 @@ bool BuildQueryBlockRequest(
                                  node_tables[build].end());
           }
           node_tables[self] = std::move(output_tables);
+          node_rows[self] = estimated_rows(path);
           return self;
         }
 
@@ -2174,6 +2215,7 @@ bool BuildQueryBlockRequest(
             }
             scan_nodes[table_idx] = request.nodes_size() - 1;
             node_tables[scan_nodes[table_idx]] = {table_idx};
+            node_rows[scan_nodes[table_idx]] = estimated_rows(path);
           }
           return scan_nodes[table_idx];
         }
@@ -2221,6 +2263,134 @@ bool BuildQueryBlockRequest(
 
     current_node = map_path(plan, true);
     if (current_node < 0) return false;
+
+    // Add scan-level semi-filters after the mapped tree is complete. A scan can
+    // only read key sets from earlier nodes, and probe-side filtering is unsafe
+    // for LEFT/ANTI joins because non-matching probe rows must survive.
+    auto join_side_filterable =
+        [](LineairDB::Protocol::QueryBlockJoin::Type join_type,
+           bool target_is_build) {
+          if (target_is_build) return true;
+          return join_type == LineairDB::Protocol::QueryBlockJoin::INNER ||
+                 join_type == LineairDB::Protocol::QueryBlockJoin::SEMI;
+        };
+
+    struct SemiSource {
+      double rows = -1.0;
+      int source_node = -1;
+      uint32_t source_table = 0;
+      uint32_t source_column = 0;
+      uint32_t target_column = 0;
+    };
+
+    // Effective cardinality is only used to choose semi-filter sources. When a
+    // scan gets filtered by a smaller key domain, later scans can use the
+    // reduced estimate rather than the table's raw row count.
+    std::vector<double> effective_rows(tables.size(), 1.0);
+    for (size_t table_idx = 0; table_idx < tables.size(); table_idx++) {
+      if (scan_nodes[table_idx] >= 0 &&
+          node_rows.count(scan_nodes[table_idx]) != 0) {
+        effective_rows[table_idx] = node_rows[scan_nodes[table_idx]];
+      } else if (table_idx < real_table_count) {
+        effective_rows[table_idx] = table_rows(table_idx);
+      }
+    }
+
+    auto leading_records_per_key = [&](size_t table_idx, uint32_t column) {
+      if (table_idx >= real_table_count ||
+          tables[table_idx].table == nullptr) {
+        return 0.0;
+      }
+      TABLE *table = tables[table_idx].table;
+      for (uint key_idx = 0; key_idx < table->s->keys; key_idx++) {
+        const KEY &key = table->key_info[key_idx];
+        if (key.actual_key_parts == 0 || key.key_part == nullptr ||
+            key.key_part[0].field == nullptr) {
+          continue;
+        }
+        if (key.key_part[0].field->field_index() == column &&
+            key.has_records_per_key(0)) {
+          return std::max(1.0, static_cast<double>(key.records_per_key(0)));
+        }
+      }
+      return 0.0;
+    };
+
+    auto best_scan_source = [&](uint32_t target_table, int target_node,
+                                double target_rows) {
+      SemiSource best;
+      auto consider = [&](int node, double rows, uint32_t source_table,
+                          uint32_t source_column,
+                          uint32_t target_column) {
+        if (node < 0 || node >= target_node) return;
+        if (rows * 8.0 > target_rows) return;
+        if (best.source_node < 0 || rows < best.rows) {
+          best = {rows, node, source_table, source_column, target_column};
+        }
+      };
+
+      for (const MappedJoinKey &key : mapped_join_keys) {
+        auto consider_side =
+            [&](bool target_is_build, uint32_t key_target_table,
+                uint32_t key_source_table, uint32_t key_target_column,
+                uint32_t key_source_column, int partner_node) {
+              if (key_target_table != target_table) return;
+              if (!join_side_filterable(key.join_type, target_is_build))
+                return;
+              if (key_source_table < scan_nodes.size()) {
+                consider(scan_nodes[key_source_table],
+                         effective_rows[key_source_table], key_source_table,
+                         key_source_column, key_target_column);
+              }
+              const auto rows_it = node_rows.find(partner_node);
+              consider(partner_node,
+                       rows_it == node_rows.end() ? 1e30 : rows_it->second,
+                       key_source_table, key_source_column,
+                       key_target_column);
+            };
+
+        consider_side(true, key.build_table, key.probe_table,
+                      key.build_column, key.probe_column, key.probe_node);
+        consider_side(false, key.probe_table, key.build_table,
+                      key.probe_column, key.build_column, key.build_node);
+      }
+      return best;
+    };
+
+    std::vector<size_t> scan_order;
+    for (size_t table_idx = 0; table_idx < real_table_count; table_idx++) {
+      if (scan_nodes[table_idx] >= 0) scan_order.push_back(table_idx);
+    }
+    std::sort(scan_order.begin(), scan_order.end(), [&](size_t left,
+                                                        size_t right) {
+      return scan_nodes[left] < scan_nodes[right];
+    });
+
+    for (size_t table_idx : scan_order) {
+      const int node = scan_nodes[table_idx];
+      if (!request.nodes(node).has_scan() ||
+          request.nodes(node).scan().has_semi()) {
+        continue;
+      }
+
+      const SemiSource source = best_scan_source(
+          static_cast<uint32_t>(table_idx), node, effective_rows[table_idx]);
+      if (source.source_node < 0) continue;
+
+      auto *semi = request.mutable_nodes(node)->mutable_scan()->mutable_semi();
+      semi->set_source_node(source.source_node);
+      auto *source_column = semi->mutable_source_column();
+      source_column->set_table_idx(source.source_table);
+      source_column->set_column(source.source_column);
+      semi->set_my_column(source.target_column);
+
+      const double fanout =
+          leading_records_per_key(table_idx, source.target_column);
+      if (fanout > 0.0) {
+        effective_rows[table_idx] = std::max(
+            1.0, std::min(effective_rows[table_idx], source.rows * fanout));
+      }
+    }
   } else {
     // Scan every table once, attaching only predicates that read that table.
     for (size_t table_idx = 0; table_idx < real_table_count; table_idx++) {
