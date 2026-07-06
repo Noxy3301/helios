@@ -228,9 +228,6 @@ class Executor {
 
     bool PrepareTables() {
         if (db_ == nullptr) return fail("database is unavailable");
-        if (request_.tables_size() == 0) {
-            return fail("query block has no tables");
-        }
 
         stores_.assign(request_.tables_size(), nullptr);
         write_counter_snapshots_.assign(request_.tables_size(), {});
