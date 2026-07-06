@@ -141,6 +141,30 @@ class ItemColumnarValue final : public Item_string {
   }
 
   void set_null_value() { null_value = true; }
+
+  String *val_str(String *str) override {
+    return null_value ? nullptr : Item_string::val_str(str);
+  }
+
+  double val_real() override {
+    return null_value ? 0.0 : Item_string::val_real();
+  }
+
+  longlong val_int() override {
+    return null_value ? 0 : Item_string::val_int();
+  }
+
+  my_decimal *val_decimal(my_decimal *decimal_value) override {
+    return null_value ? nullptr : Item_string::val_decimal(decimal_value);
+  }
+
+  bool get_date(MYSQL_TIME *time, my_time_flags_t flags) override {
+    return null_value ? true : Item_string::get_date(time, flags);
+  }
+
+  bool get_time(MYSQL_TIME *time) override {
+    return null_value ? true : Item_string::get_time(time);
+  }
 };
 
 // Statement-local state owned by LEX::secondary_engine_execution_context.
