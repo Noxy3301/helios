@@ -1750,6 +1750,60 @@ class Executor {
         }
     }
 
+    bool RunEmitRows(
+        const NodeResult& input,
+        pb::TxExecuteQueryBlock::Response* response) {
+        std::vector<int> output_positions(request_.output_size(), -1);
+        for (int output_idx = 0; output_idx < request_.output_size();
+             ++output_idx) {
+            const pb::QueryBlockOutputExpr& expression =
+                request_.output(output_idx);
+            if (expression.source() != pb::QueryBlockOutputExpr::COLUMN) {
+                return fail("row output source");
+            }
+            output_positions[output_idx] =
+                input.table_pos(expression.column().table_idx());
+            if (output_positions[output_idx] < 0) {
+                return fail("row output table is not in input");
+            }
+        }
+
+        std::vector<OutputRow> output_rows;
+        output_rows.reserve(input.rows());
+        for (size_t row_idx = 0; row_idx < input.rows(); ++row_idx) {
+            OutputRow row;
+            row.values.reserve(request_.output_size());
+            row.nulls.reserve(request_.output_size());
+
+            for (int output_idx = 0; output_idx < request_.output_size();
+                 ++output_idx) {
+                const pb::QueryBlockColumnRef& column =
+                    request_.output(output_idx).column();
+                const uint64_t ref =
+                    input.refs[output_positions[output_idx]][row_idx];
+                if (NullOf(column.table_idx(), ref, column.column())) {
+                    row.values.emplace_back();
+                    row.nulls.push_back(true);
+                    continue;
+                }
+
+                std::string_view value =
+                    ValueOf(column.table_idx(), ref, column.column());
+                if (column.prefix_len() > 0 &&
+                    value.size() > column.prefix_len()) {
+                    value = value.substr(0, column.prefix_len());
+                }
+                row.values.emplace_back(value);
+                row.nulls.push_back(false);
+            }
+            output_rows.push_back(std::move(row));
+        }
+
+        if (!SortOutputRows(&output_rows)) return false;
+        EmitOutputRows(output_rows, response);
+        return true;
+    }
+
     bool RunAggregateAndEmit(
         const pb::QueryBlockAggregate& aggregate,
         pb::TxExecuteQueryBlock::Response* response) {
@@ -1947,7 +2001,8 @@ class Executor {
             }
             return fail("unknown query-block node");
         }
-        return fail("root must be an aggregate node");
+        if (request_.nodes_size() == 0) return fail("root node missing");
+        return RunEmitRows(results_.back(), response);
     }
 
     bool TablesAreStillQuiet() const {
