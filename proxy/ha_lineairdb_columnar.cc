@@ -2316,14 +2316,16 @@ bool BuildQueryBlockRequest(
       return 0.0;
     };
 
-    auto best_scan_source = [&](uint32_t target_table, int target_node,
-                                double target_rows) {
+    auto best_semi_source = [&](uint32_t target_table, int target_node,
+                                double target_rows, bool need_ratio,
+                                const std::function<bool(uint32_t)>
+                                    &target_column_ok) {
       SemiSource best;
       auto consider = [&](int node, double rows, uint32_t source_table,
                           uint32_t source_column,
                           uint32_t target_column) {
         if (node < 0 || node >= target_node) return;
-        if (rows * 8.0 > target_rows) return;
+        if (need_ratio && rows * 8.0 > target_rows) return;
         if (best.source_node < 0 || rows < best.rows) {
           best = {rows, node, source_table, source_column, target_column};
         }
@@ -2337,6 +2339,7 @@ bool BuildQueryBlockRequest(
               if (key_target_table != target_table) return;
               if (!join_side_filterable(key.join_type, target_is_build))
                 return;
+              if (!target_column_ok(key_target_column)) return;
               if (key_source_table < scan_nodes.size()) {
                 consider(scan_nodes[key_source_table],
                          effective_rows[key_source_table], key_source_table,
@@ -2373,8 +2376,9 @@ bool BuildQueryBlockRequest(
         continue;
       }
 
-      const SemiSource source = best_scan_source(
-          static_cast<uint32_t>(table_idx), node, effective_rows[table_idx]);
+      const SemiSource source = best_semi_source(
+          static_cast<uint32_t>(table_idx), node, effective_rows[table_idx],
+          true, [](uint32_t) { return true; });
       if (source.source_node < 0) continue;
 
       auto *semi = request.mutable_nodes(node)->mutable_scan()->mutable_semi();
@@ -2390,6 +2394,66 @@ bool BuildQueryBlockRequest(
         effective_rows[table_idx] = std::max(
             1.0, std::min(effective_rows[table_idx], source.rows * fanout));
       }
+    }
+
+    // A derived aggregate can also read a smaller key domain from the parent
+    // plan. This is only valid when the joined derived column is a direct GROUP
+    // output, because the server must push the external key set down to the
+    // child scan that owns that group key.
+    for (int node_idx = 0; node_idx < request.nodes_size(); node_idx++) {
+      if (!request.nodes(node_idx).has_sub_block()) continue;
+
+      int virtual_table = -1;
+      for (size_t table_idx = real_table_count; table_idx < tables.size();
+           table_idx++) {
+        if (scan_nodes[table_idx] == node_idx) {
+          virtual_table = static_cast<int>(table_idx);
+          break;
+        }
+      }
+      if (virtual_table < 0) continue;
+
+      const auto &child_request = request.nodes(node_idx).sub_block().block();
+      auto group_output_is_filterable = [&](uint32_t output_column) {
+        if (output_column >=
+                static_cast<uint32_t>(child_request.output_size()) ||
+            child_request.output(output_column).source() !=
+                LineairDB::Protocol::QueryBlockOutputExpr::GROUP ||
+            child_request.nodes_size() == 0 ||
+            !child_request.nodes(child_request.nodes_size() - 1)
+                 .has_aggregate()) {
+          return false;
+        }
+
+        const auto &aggregate =
+            child_request.nodes(child_request.nodes_size() - 1).aggregate();
+        const uint32_t group_ordinal =
+            child_request.output(output_column).ordinal();
+        return group_ordinal <
+                   static_cast<uint32_t>(aggregate.group_columns_size()) &&
+               aggregate.group_columns(group_ordinal).prefix_len() == 0;
+      };
+
+      const SemiSource source = best_semi_source(
+          static_cast<uint32_t>(virtual_table), node_idx, 0.0, false,
+          group_output_is_filterable);
+      if (source.source_node < 0) continue;
+
+      const auto &aggregate =
+          child_request.nodes(child_request.nodes_size() - 1).aggregate();
+      const uint32_t group_ordinal =
+          child_request.output(source.target_column).ordinal();
+      auto *sub_block = request.mutable_nodes(node_idx)->mutable_sub_block();
+      auto *semi = sub_block->mutable_semi();
+      semi->set_source_node(source.source_node);
+      auto *source_column = semi->mutable_source_column();
+      source_column->set_table_idx(source.source_table);
+      source_column->set_column(source.source_column);
+      semi->set_my_column(source.target_column);
+      sub_block->set_target_table(
+          aggregate.group_columns(group_ordinal).table_idx());
+      sub_block->set_target_column(
+          aggregate.group_columns(group_ordinal).column());
     }
   } else {
     // Scan every table once, attaching only predicates that read that table.
