@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cassert>
 #include <cstdint>
+#include <cstring>
 #include <functional>
 #include <map>
 #include <memory>
@@ -546,6 +547,117 @@ bool SerializeTuplePredicate(Item *item,
 }
 
 /**
+ * @brief Return the column and width for SUBSTRING(column, 1, width).
+ */
+const Field *SubstringPrefixField(Item *item, uint32_t *prefix_len) {
+  Item *real = item->real_item();
+  if (real->type() != Item::FUNC_ITEM) return nullptr;
+
+  auto *function = down_cast<Item_func *>(real);
+  if (std::strcmp(function->func_name(), "substr") != 0 ||
+      function->argument_count() != 3) {
+    return nullptr;
+  }
+
+  Item *column = function->arguments()[0]->real_item();
+  Item *from = function->arguments()[1];
+  Item *length = function->arguments()[2];
+  if (column->type() != Item::FIELD_ITEM) return nullptr;
+  if (!from->const_item() || from->val_int() != 1) return nullptr;
+  if (!length->const_item() || length->val_int() <= 0) return nullptr;
+
+  *prefix_len = static_cast<uint32_t>(length->val_int());
+  return down_cast<Item_field *>(column)->field;
+}
+
+/**
+ * @brief Serialize a scan predicate, including safe string-prefix rewrites.
+ *
+ * The shared predicate serializer does not model SUBSTRING. For the prefix form
+ * SUBSTRING(column, 1, N) = 'value' or IN (...), rewrite the predicate to
+ * column LIKE 'value%' when every constant has exactly N bytes and does not
+ * contain LIKE wildcards.
+ */
+bool SerializeScanPredicate(Item *condition,
+                            LineairDB::Protocol::FilterExpr *expression) {
+  if (serialize_item(condition, expression)) return true;
+  expression->Clear();
+
+  Item *real = condition->real_item();
+  if (real->type() != Item::FUNC_ITEM) return false;
+
+  auto *function = down_cast<Item_func *>(real);
+  uint32_t prefix_len = 0;
+  const Field *field = nullptr;
+  std::vector<std::string> values;
+  bool negated = false;
+
+  if (function->functype() == Item_func::IN_FUNC) {
+    auto *in_function = down_cast<Item_func_in *>(function);
+    negated = in_function->negated;
+    field = SubstringPrefixField(function->arguments()[0], &prefix_len);
+    if (field == nullptr) return false;
+
+    for (uint arg_idx = 1; arg_idx < function->argument_count(); arg_idx++) {
+      Item *value_item = function->arguments()[arg_idx];
+      if (!value_item->const_item()) return false;
+
+      String value_buffer;
+      String *value = value_item->val_str(&value_buffer);
+      if (value == nullptr) return false;
+      values.emplace_back(value->ptr(), value->length());
+    }
+  } else if (function->functype() == Item_func::EQ_FUNC) {
+    field = SubstringPrefixField(function->arguments()[0], &prefix_len);
+    Item *value_item = function->arguments()[1];
+    if (field == nullptr || !value_item->const_item()) return false;
+
+    String value_buffer;
+    String *value = value_item->val_str(&value_buffer);
+    if (value == nullptr) return false;
+    values.emplace_back(value->ptr(), value->length());
+  } else {
+    return false;
+  }
+
+  // Keep negated forms on the fallback path so NULL behavior remains SQL-like.
+  if (negated) return false;
+
+  for (const std::string &value : values) {
+    if (value.size() != prefix_len) return false;
+    if (value.find('%') != std::string::npos ||
+        value.find('_') != std::string::npos) {
+      return false;
+    }
+  }
+
+  auto emit_like = [&](LineairDB::Protocol::FilterExpr *target,
+                       const std::string &value) {
+    target->set_op(LineairDB::Protocol::FilterExpr::OP_LIKE);
+
+    auto *column = target->add_children();
+    column->set_op(LineairDB::Protocol::FilterExpr::COLUMN_REF);
+    column->set_column_index(field->field_index());
+    column->set_compare_type(3);
+
+    auto *pattern = target->add_children();
+    pattern->set_op(LineairDB::Protocol::FilterExpr::CONST_STRING);
+    pattern->set_string_val(value + "%");
+    pattern->set_compare_type(3);
+  };
+
+  if (values.size() == 1) {
+    emit_like(expression, values[0]);
+  } else {
+    expression->set_op(LineairDB::Protocol::FilterExpr::OP_OR);
+    for (const std::string &value : values) {
+      emit_like(expression->add_children(), value);
+    }
+  }
+  return true;
+}
+
+/**
  * @brief Return the date field inside EXTRACT(YEAR FROM field), if supported.
  */
 const Field *ExtractYearField(Item *item) {
@@ -576,13 +688,13 @@ bool SerializeTableFilters(const std::vector<Item *> &filters, TABLE *table,
   if (filters.empty()) return true;
   predicate->set_num_columns(table->s->fields);
   if (filters.size() == 1) {
-    return serialize_item(filters[0], predicate->mutable_expr());
+    return SerializeScanPredicate(filters[0], predicate->mutable_expr());
   }
 
   auto *root = predicate->mutable_expr();
   root->set_op(LineairDB::Protocol::FilterExpr::OP_AND);
   for (Item *filter : filters) {
-    if (!serialize_item(filter, root->add_children())) return false;
+    if (!SerializeScanPredicate(filter, root->add_children())) return false;
   }
   return true;
 }
