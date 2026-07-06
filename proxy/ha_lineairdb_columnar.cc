@@ -1648,8 +1648,25 @@ bool BuildQueryBlockRequest(
       for (size_t left_idx = 0; left_idx < equal_fields.size(); left_idx++) {
         for (size_t right_idx = left_idx + 1; right_idx < equal_fields.size();
              right_idx++) {
-          add_join_edge_if_supported(equal_fields[left_idx],
-                                     equal_fields[right_idx]);
+          const int left_table =
+              TableIndexOfField(equal_fields[left_idx], tables);
+          const int right_table =
+              TableIndexOfField(equal_fields[right_idx], tables);
+          // Fields that do not resolve to this block's tables and pairs that
+          // cross a semijoin nest boundary are enforced by the semijoin key
+          // machinery, not by join edges.
+          if (left_table < 0 || right_table < 0) continue;
+          if (table_semijoin_nest[left_table] !=
+              table_semijoin_nest[right_table]) {
+            continue;
+          }
+          // A dropped same-side pair would silently lose the equality
+          // between those two columns; the join would then emit rows the
+          // predicate excludes.
+          if (!add_join_edge_if_supported(equal_fields[left_idx],
+                                          equal_fields[right_idx])) {
+            LDB_COL_REJECT("multiple equality not pushable");
+          }
         }
       }
       continue;
