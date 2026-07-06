@@ -1295,12 +1295,16 @@ bool BuildQueryBlockRequest(
   };
 
   // The request table order is the stable numbering used by scan, join,
-  // grouping, and aggregate argument references.
+  // grouping, and aggregate argument references. Real loaded tables come
+  // first; derived tables follow them and become server-side virtual tables.
   std::vector<QueryBlockTable> tables;
   std::vector<int> main_tables;
   std::vector<int> table_semijoin_nest;
+  std::vector<bool> table_is_virtual;
+  std::vector<Query_block *> virtual_blocks;
   for (Table_ref *table_ref = qb->leaf_tables; table_ref != nullptr;
        table_ref = table_ref->next_leaf) {
+    if (table_ref->is_view_or_derived()) continue;
     TABLE *table = table_ref->table;
     if (table == nullptr || table->s == nullptr) LDB_COL_REJECT("no TABLE");
     const int semijoin_nest = semijoin_nest_of(table_ref);
@@ -1310,6 +1314,7 @@ bool BuildQueryBlockRequest(
       LDB_COL_REJECT("not SECONDARY_LOADed");
     tables.push_back({table, table_ref->map()});
     table_semijoin_nest.push_back(semijoin_nest);
+    table_is_virtual.push_back(false);
     if (semijoin_nest < 0) {
       main_tables.push_back(static_cast<int>(tables.size()) - 1);
     } else {
@@ -1317,7 +1322,38 @@ bool BuildQueryBlockRequest(
           static_cast<int>(tables.size()) - 1);
     }
   }
+
+  const size_t real_table_count = tables.size();
+  for (Table_ref *table_ref = qb->leaf_tables; table_ref != nullptr;
+       table_ref = table_ref->next_leaf) {
+    if (!table_ref->is_view_or_derived()) continue;
+    if (table_ref->outer_join) LDB_COL_REJECT("outer derived table");
+    if (semijoin_nest_of(table_ref) >= 0) LDB_COL_REJECT("derived semijoin");
+    if (table_ref->table == nullptr) LDB_COL_REJECT("derived no TABLE");
+
+    Query_expression *derived_unit = table_ref->derived_query_expression();
+    if (derived_unit == nullptr || !derived_unit->is_simple())
+      LDB_COL_REJECT("derived not simple");
+    Query_block *derived_qb = derived_unit->first_query_block();
+    if (derived_qb == nullptr) LDB_COL_REJECT("derived no query block");
+
+    tables.push_back({table_ref->table, table_ref->map()});
+    table_semijoin_nest.push_back(-1);
+    table_is_virtual.push_back(true);
+    virtual_blocks.push_back(derived_qb);
+    main_tables.push_back(static_cast<int>(tables.size()) - 1);
+  }
   if (main_tables.empty()) LDB_COL_REJECT("no tables");
+
+  auto resolve_query_field = [&](const Field *field,
+                                 int table_idx) -> const Field * {
+    if (table_idx < 0 ||
+        table_idx >= static_cast<int>(table_is_virtual.size())) {
+      return nullptr;
+    }
+    if (table_is_virtual[table_idx]) return field;
+    return ResolveBaseField(field, tables[table_idx].table);
+  };
 
   struct JoinEdge {
     int left_table = -1;
@@ -1343,11 +1379,24 @@ bool BuildQueryBlockRequest(
     const table_map used = predicate->used_tables() & ~PSEUDO_TABLE_BITS;
     const int table_idx = SingleTableOf(used, tables);
     if (table_idx >= 0) {
+      if (table_is_virtual[table_idx]) {
+        tuple_predicates.push_back(predicate);
+        continue;
+      }
       table_filters[table_idx].push_back(predicate);
       continue;
     }
     if (used == 0) {
-      table_filters[main_tables[0]].push_back(predicate);
+      auto real_filter_table =
+          std::find_if(main_tables.begin(), main_tables.end(),
+                       [&](int candidate) {
+                         return !table_is_virtual[candidate];
+                       });
+      if (real_filter_table != main_tables.end()) {
+        table_filters[*real_filter_table].push_back(predicate);
+      } else {
+        tuple_predicates.push_back(predicate);
+      }
       continue;
     }
 
@@ -1432,9 +1481,9 @@ bool BuildQueryBlockRequest(
           }
 
           const Field *left_field =
-              ResolveBaseField(candidate.first, tables[left_table].table);
+              resolve_query_field(candidate.first, left_table);
           const Field *right_field =
-              ResolveBaseField(candidate.second, tables[right_table].table);
+              resolve_query_field(candidate.second, right_table);
           if (left_field == nullptr || right_field == nullptr) continue;
           join_edges.push_back(
               {left_table, right_table, left_field, right_field});
@@ -1470,14 +1519,13 @@ bool BuildQueryBlockRequest(
       LDB_COL_REJECT("non-integer join key");
     }
 
-    const Field *left_field =
-        ResolveBaseField(left_raw, tables[left_table].table);
-    const Field *right_field =
-        ResolveBaseField(right_raw, tables[right_table].table);
+    const Field *left_field = resolve_query_field(left_raw, left_table);
+    const Field *right_field = resolve_query_field(right_raw, right_table);
     if (left_field == nullptr || right_field == nullptr) {
       LDB_COL_REJECT("join key unresolvable");
     }
-    if (left_field->is_nullable() || right_field->is_nullable()) {
+    if ((!table_is_virtual[left_table] && left_field->is_nullable()) ||
+        (!table_is_virtual[right_table] && right_field->is_nullable())) {
       LDB_COL_REJECT("join key nullable");
     }
     join_edges.push_back({left_table, right_table, left_field, right_field});
@@ -1489,7 +1537,7 @@ bool BuildQueryBlockRequest(
   auto &request = *request_out;
   request.Clear();
   std::vector<int> scan_nodes(tables.size(), -1);
-  for (size_t table_idx = 0; table_idx < tables.size(); table_idx++) {
+  for (size_t table_idx = 0; table_idx < real_table_count; table_idx++) {
     TABLE *table = tables[table_idx].table;
     request.add_tables()->set_table_name(table->s->normalized_path.str);
     auto *scan_node = request.add_nodes();
@@ -1501,6 +1549,17 @@ bool BuildQueryBlockRequest(
                                scan->mutable_filter())) {
       LDB_COL_REJECT("filter not pushable");
     }
+  }
+
+  for (size_t table_idx = real_table_count; table_idx < tables.size();
+       table_idx++) {
+    auto *sub_block = request.add_nodes()->mutable_sub_block();
+    if (!BuildQueryBlockRequest(
+            nullptr, virtual_blocks[table_idx - real_table_count],
+            sub_block->mutable_block(), why)) {
+      return false;
+    }
+    scan_nodes[table_idx] = request.nodes_size() - 1;
   }
 
   // Build a left-deep INNER join tree by walking FROM order and retrying tables
@@ -1579,7 +1638,7 @@ bool BuildQueryBlockRequest(
       return TableIndexOfField(field, tables);
     };
     registry.resolve = [&](const Field *field, int table_idx) {
-      return ResolveBaseField(field, tables[table_idx].table);
+      return resolve_query_field(field, table_idx);
     };
 
     auto *predicate = tuple_filter->mutable_predicate();
@@ -1654,9 +1713,9 @@ bool BuildQueryBlockRequest(
       }
 
       const Field *outer_field =
-          ResolveBaseField(raw_outer_field, tables[outer_table].table);
+          resolve_query_field(raw_outer_field, outer_table);
       const Field *inner_field =
-          ResolveBaseField(raw_inner_field, tables[inner_key_table].table);
+          resolve_query_field(raw_inner_field, inner_key_table);
       if (outer_field == nullptr || inner_field == nullptr) {
         LDB_COL_REJECT("semijoin key unresolvable");
       }
@@ -1675,7 +1734,7 @@ bool BuildQueryBlockRequest(
         return TableIndexOfField(field, tables);
       };
       registry.resolve = [&](const Field *field, int table_idx) {
-        return ResolveBaseField(field, tables[table_idx].table);
+        return resolve_query_field(field, table_idx);
       };
 
       auto *residual = join_node->mutable_residual();
@@ -1724,10 +1783,10 @@ bool BuildQueryBlockRequest(
     if (const Field *year_field = ExtractYearField(group_item)) {
       const int group_table = TableIndexOfField(year_field, tables);
       const Field *group_field =
-          group_table >= 0
-              ? ResolveBaseField(year_field, tables[group_table].table)
-              : nullptr;
-      if (group_field == nullptr || group_field->is_nullable()) {
+          group_table >= 0 ? resolve_query_field(year_field, group_table)
+                           : nullptr;
+      if (group_field == nullptr ||
+          (!table_is_virtual[group_table] && group_field->is_nullable())) {
         LDB_COL_REJECT("group year column");
       }
 
@@ -1748,10 +1807,11 @@ bool BuildQueryBlockRequest(
     const int group_table = TableIndexOfField(raw_group_field, tables);
     if (group_table < 0) LDB_COL_REJECT("group column foreign");
     const Field *group_field =
-        ResolveBaseField(raw_group_field, tables[group_table].table);
+        resolve_query_field(raw_group_field, group_table);
     if (group_field == nullptr) LDB_COL_REJECT("group column foreign");
-    if (group_field->is_nullable() ||
-        !GroupColumnIsBinarySafe(group_field)) {
+    if ((!table_is_virtual[group_table] && group_field->is_nullable()) ||
+        (!table_is_virtual[group_table] &&
+         !GroupColumnIsBinarySafe(group_field))) {
       LDB_COL_REJECT("group column not binary-safe");
     }
 
@@ -1794,10 +1854,11 @@ bool BuildQueryBlockRequest(
             const int count_table = TableIndexOfField(raw_count_field, tables);
             const Field *count_field =
                 count_table >= 0
-                    ? ResolveBaseField(raw_count_field,
-                                       tables[count_table].table)
+                    ? resolve_query_field(raw_count_field, count_table)
                     : nullptr;
-            if (count_field == nullptr || count_field->is_nullable()) {
+            if (count_field == nullptr ||
+                (!table_is_virtual[count_table] &&
+                 count_field->is_nullable())) {
               aggregate_error = "COUNT arg nullable";
               return -1;
             }
@@ -1866,8 +1927,8 @@ bool BuildQueryBlockRequest(
                 then_expr->real_item()->type() == Item::FIELD_ITEM) {
               const Field *raw_argument_field =
                   down_cast<Item_field *>(then_expr->real_item())->field;
-              const Field *argument_field = ResolveBaseField(
-                  raw_argument_field, tables[argument_table].table);
+              const Field *argument_field =
+                  resolve_query_field(raw_argument_field, argument_table);
               if (argument_field == nullptr) {
                 aggregate_error = "CASE expression unresolvable";
                 return -1;
@@ -1912,8 +1973,8 @@ bool BuildQueryBlockRequest(
         if (argument_table >= 0 && arg->type() == Item::FIELD_ITEM) {
           const Field *raw_argument_field =
               down_cast<Item_field *>(arg)->field;
-          const Field *argument_field = ResolveBaseField(
-              raw_argument_field, tables[argument_table].table);
+          const Field *argument_field =
+              resolve_query_field(raw_argument_field, argument_table);
           if (argument_field == nullptr) {
             aggregate_error = "aggregate arg unresolvable";
             return -1;
@@ -1964,18 +2025,19 @@ bool BuildQueryBlockRequest(
             TableIndexOfField(raw_argument_field, tables);
         const Field *argument_field =
             argument_table >= 0
-                ? ResolveBaseField(raw_argument_field,
-                                   tables[argument_table].table)
+                ? resolve_query_field(raw_argument_field, argument_table)
                 : nullptr;
         if (argument_field == nullptr) {
           aggregate_error = "minmax unresolvable";
           return -1;
         }
-        if (argument_field->is_nullable()) {
+        if (!table_is_virtual[argument_table] &&
+            argument_field->is_nullable()) {
           aggregate_error = "minmax nullable";
           return -1;
         }
-        if (argument_field->result_type() == STRING_RESULT &&
+        if (!table_is_virtual[argument_table] &&
+            argument_field->result_type() == STRING_RESULT &&
             !argument_field->binary()) {
           aggregate_error = "minmax collation";
           return -1;
@@ -2074,8 +2136,7 @@ bool BuildQueryBlockRequest(
       const int output_table = TableIndexOfField(raw_output_field, tables);
       const Field *output_field =
           output_table >= 0
-              ? ResolveBaseField(raw_output_field,
-                                 tables[output_table].table)
+              ? resolve_query_field(raw_output_field, output_table)
               : nullptr;
       if (output_field == nullptr)
         LDB_COL_REJECT("output column unresolvable");
@@ -2193,7 +2254,7 @@ bool RecognizeQueryBlock(JOIN *join, ColumnarExecutionContext *ctx,
   if (qb->leaf_tables != nullptr && qb->leaf_tables->next_leaf == nullptr &&
       qb->leaf_tables->is_view_or_derived()) {
     if (RecognizeDerivedRegroup(join, ctx, why)) return true;
-    return RecognizeFlattenedAggregate(join, ctx, why);
+    if (RecognizeFlattenedAggregate(join, ctx, why)) return true;
   }
 
   if (!BuildQueryBlockRequest(join, qb, &ctx->query_block_request, why)) {
