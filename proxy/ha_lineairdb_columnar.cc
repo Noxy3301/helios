@@ -31,6 +31,7 @@
 #include "sql/query_result.h"
 #include "sql/sql_const.h"
 #include "sql/sql_class.h"
+#include "sql/sql_executor.h"
 #include "sql/sql_lex.h"
 #include "sql/sql_optimizer.h"
 #include "sql/table.h"
@@ -2193,6 +2194,99 @@ bool BuildQueryBlockRequest(
           return emit_mapped_join(join_type, probe, build, expression,
                                   std::vector<Item *>{},
                                   estimated_rows(path));
+        }
+
+        case AccessPath::WEEDOUT: {
+          AccessPath *child = path->weedout().child;
+          std::vector<Item *> residuals;
+          while (child != nullptr && child->type == AccessPath::FILTER) {
+            FlattenAnd(child->filter().condition, &residuals);
+            child = child->filter().child;
+          }
+          if (child == nullptr ||
+              (child->type != AccessPath::HASH_JOIN &&
+               child->type != AccessPath::NESTED_LOOP_JOIN)) {
+            *why = "plan weedout shape";
+            return -1;
+          }
+
+          const bool child_is_nested_loop =
+              child->type == AccessPath::NESTED_LOOP_JOIN;
+          if (child_is_nested_loop
+                  ? child->nested_loop_join().join_type != JoinType::INNER
+                  : child->hash_join().rewrite_semi_to_inner) {
+            *why = "plan weedout join type";
+            return -1;
+          }
+
+          const JoinPredicate *join_predicate =
+              child_is_nested_loop
+                  ? child->nested_loop_join().join_predicate
+                  : child->hash_join().join_predicate;
+          if (join_predicate == nullptr || join_predicate->expr == nullptr) {
+            *why = "plan weedout join predicate";
+            return -1;
+          }
+          if (!child_is_nested_loop &&
+              join_predicate->expr->type != RelationalExpression::INNER_JOIN &&
+              join_predicate->expr->type !=
+                  RelationalExpression::STRAIGHT_INNER_JOIN) {
+            *why = "plan weedout join type";
+            return -1;
+          }
+
+          const int outer = map_path(child_is_nested_loop
+                                         ? child->nested_loop_join().outer
+                                         : child->hash_join().outer,
+                                     false);
+          if (outer < 0) return -1;
+          const int inner = map_path(child_is_nested_loop
+                                         ? child->nested_loop_join().inner
+                                         : child->hash_join().inner,
+                                     false);
+          if (inner < 0) return -1;
+
+          const SJ_TMP_TABLE *weedout_table = path->weedout().weedout_table;
+          if (weedout_table == nullptr) {
+            *why = "plan weedout table";
+            return -1;
+          }
+
+          std::set<int> deduplicated_tables;
+          for (SJ_TMP_TABLE_TAB *tab = weedout_table->tabs;
+               tab != weedout_table->tabs_end; ++tab) {
+            const TABLE *table =
+                tab->qep_tab != nullptr ? tab->qep_tab->table() : nullptr;
+            int table_idx = -1;
+            for (size_t idx = 0; idx < tables.size(); idx++) {
+              if (tables[idx].table == table) {
+                table_idx = static_cast<int>(idx);
+                break;
+              }
+            }
+            if (table_idx < 0) {
+              *why = "plan weedout table";
+              return -1;
+            }
+            deduplicated_tables.insert(table_idx);
+          }
+
+          int probe = -1;
+          int build = -1;
+          if (deduplicated_tables == node_tables[outer]) {
+            probe = outer;
+            build = inner;
+          } else if (deduplicated_tables == node_tables[inner]) {
+            probe = inner;
+            build = outer;
+          } else {
+            *why = "plan weedout tables";
+            return -1;
+          }
+
+          return emit_mapped_join(LineairDB::Protocol::QueryBlockJoin::SEMI,
+                                  probe, build, join_predicate->expr,
+                                  residuals, estimated_rows(path));
         }
 
         case AccessPath::MATERIALIZE: {
