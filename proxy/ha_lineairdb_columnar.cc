@@ -400,6 +400,7 @@ bool CaseToFilteredSum(Item *argument, Item **predicate, Item **then_expr) {
 }
 
 struct QueryBlockTable {
+  Table_ref *table_ref = nullptr;
   TABLE *table = nullptr;
   table_map map = 0;
 };
@@ -1076,7 +1077,7 @@ bool RecognizeFlattenedAggregate(JOIN *join, ColumnarExecutionContext *ctx,
     if (table_ref->outer_join) LDB_COL_REJECT("inner outer join");
     if (!loaded_tables->contains(table->s->db.str, table->s->table_name.str))
       LDB_COL_REJECT("inner not SECONDARY_LOADed");
-    tables.push_back({table, table_ref->map()});
+    tables.push_back({table_ref, table, table_ref->map()});
   }
   if (tables.size() < 2) LDB_COL_REJECT("inner too few tables");
 
@@ -1428,6 +1429,7 @@ bool BuildQueryBlockRequest(
   std::vector<bool> table_is_virtual;
   std::vector<Query_block *> virtual_blocks;
   std::vector<bool> virtual_block_is_scalar_aggregate;
+  std::vector<int> outer_derived_tables;
   for (Table_ref *table_ref = qb->leaf_tables; table_ref != nullptr;
        table_ref = table_ref->next_leaf) {
     if (table_ref->is_view_or_derived()) continue;
@@ -1438,7 +1440,7 @@ bool BuildQueryBlockRequest(
       LDB_COL_REJECT("outer join");
     if (!loaded_tables->contains(table->s->db.str, table->s->table_name.str))
       LDB_COL_REJECT("not SECONDARY_LOADed");
-    tables.push_back({table, table_ref->map()});
+    tables.push_back({table_ref, table, table_ref->map()});
     table_semijoin_nest.push_back(semijoin_nest);
     table_is_virtual.push_back(false);
     if (semijoin_nest < 0) {
@@ -1454,8 +1456,6 @@ bool BuildQueryBlockRequest(
        table_ref = table_ref->next_leaf) {
     if (!table_ref->is_view_or_derived()) continue;
     const int semijoin_nest = semijoin_nest_of(table_ref);
-    if (semijoin_nest < 0 && table_ref->outer_join)
-      LDB_COL_REJECT("outer derived table");
     if (table_ref->table == nullptr) LDB_COL_REJECT("derived no TABLE");
 
     Query_expression *derived_unit = table_ref->derived_query_expression();
@@ -1464,7 +1464,7 @@ bool BuildQueryBlockRequest(
     Query_block *derived_qb = derived_unit->first_query_block();
     if (derived_qb == nullptr) LDB_COL_REJECT("derived no query block");
 
-    tables.push_back({table_ref->table, table_ref->map()});
+    tables.push_back({table_ref, table_ref->table, table_ref->map()});
     table_semijoin_nest.push_back(semijoin_nest);
     table_is_virtual.push_back(true);
     virtual_blocks.push_back(derived_qb);
@@ -1474,6 +1474,8 @@ bool BuildQueryBlockRequest(
     if (semijoin_nest >= 0) {
       semijoin_nests[semijoin_nest].inner_tables.push_back(
           static_cast<int>(tables.size()) - 1);
+    } else if (table_ref->outer_join) {
+      outer_derived_tables.push_back(static_cast<int>(tables.size()) - 1);
     } else {
       main_tables.push_back(static_cast<int>(tables.size()) - 1);
     }
@@ -1887,6 +1889,109 @@ bool BuildQueryBlockRequest(
 
     if (!connected) LDB_COL_REJECT("disconnected join graph");
     joined[table_idx] = true;
+    current_node = request.nodes_size() - 1;
+  }
+
+  // MySQL may rewrite correlated subqueries into derived tables on the
+  // nullable side of a LEFT join. Execute the derived block as a virtual table,
+  // then split the ON condition into equality keys and residual predicates.
+  for (int table_idx : outer_derived_tables) {
+    Table_ref *table_ref = tables[table_idx].table_ref;
+    Item *join_condition =
+        table_ref == nullptr ? nullptr : table_ref->join_cond();
+    if (join_condition == nullptr) LDB_COL_REJECT("derived LEFT without ON");
+
+    std::vector<Item *> join_predicates;
+    FlattenAnd(join_condition, &join_predicates);
+    std::vector<Item *> residual_predicates;
+
+    auto *join_node = request.add_nodes()->mutable_join();
+    join_node->set_type(LineairDB::Protocol::QueryBlockJoin::LEFT);
+    join_node->set_build(static_cast<uint32_t>(scan_nodes[table_idx]));
+    join_node->set_probe(static_cast<uint32_t>(current_node));
+
+    for (Item *predicate : join_predicates) {
+      bool is_join_key = false;
+      if (predicate->type() == Item::FUNC_ITEM &&
+          down_cast<Item_func *>(predicate)->functype() ==
+              Item_func::EQ_FUNC) {
+        auto *equals = down_cast<Item_func *>(predicate);
+        Item *left = equals->arguments()[0]->real_item();
+        Item *right = equals->arguments()[1]->real_item();
+        if (left->type() == Item::FIELD_ITEM &&
+            right->type() == Item::FIELD_ITEM) {
+          const Field *left_raw = semijoin_outer_equivalent(
+              down_cast<Item_field *>(left)->field);
+          const Field *right_raw = semijoin_outer_equivalent(
+              down_cast<Item_field *>(right)->field);
+          int left_table = TableIndexOfField(left_raw, tables);
+          int right_table = TableIndexOfField(right_raw, tables);
+          if (left_table == table_idx || right_table == table_idx) {
+            if (left_table != table_idx) {
+              std::swap(left_table, right_table);
+              std::swap(left_raw, right_raw);
+            }
+            if (right_table >= 0 &&
+                JoinColumnsUseByteEquality(left_raw, right_raw)) {
+              const Field *build_field =
+                  resolve_query_field(left_raw, left_table);
+              const Field *probe_field =
+                  resolve_query_field(right_raw, right_table);
+              if (build_field != nullptr && probe_field != nullptr) {
+                auto *build_key = join_node->add_build_keys();
+                build_key->set_table_idx(static_cast<uint32_t>(table_idx));
+                build_key->set_column(build_field->field_index());
+                auto *probe_key = join_node->add_probe_keys();
+                probe_key->set_table_idx(static_cast<uint32_t>(right_table));
+                probe_key->set_column(probe_field->field_index());
+                is_join_key = true;
+              }
+            }
+          }
+        }
+      }
+      if (!is_join_key) residual_predicates.push_back(predicate);
+    }
+
+    if (join_node->build_keys_size() == 0)
+      LDB_COL_REJECT("derived LEFT keyless");
+
+    if (!residual_predicates.empty()) {
+      TupleColumnRegistry registry;
+      registry.table_of = [&](const Field *field) {
+        return TableIndexOfField(field, tables);
+      };
+      registry.resolve = [&](const Field *field, int table_idx) {
+        return resolve_query_field(field, table_idx);
+      };
+
+      auto *residual = join_node->mutable_residual();
+      auto *predicate = residual->mutable_predicate();
+      auto *expression = predicate->mutable_expr();
+      if (residual_predicates.size() == 1) {
+        if (!SerializeTuplePredicate(residual_predicates[0], expression,
+                                     &registry)) {
+          LDB_COL_REJECT("derived ON residual not pushable");
+        }
+      } else {
+        expression->set_op(LineairDB::Protocol::FilterExpr::OP_AND);
+        for (Item *residual_predicate : residual_predicates) {
+          if (!SerializeTuplePredicate(residual_predicate,
+                                       expression->add_children(),
+                                       &registry)) {
+            LDB_COL_REJECT("derived ON residual not pushable");
+          }
+        }
+      }
+
+      predicate->set_num_columns(registry.columns.size());
+      for (const auto &column_ref : registry.columns) {
+        auto *column = residual->add_columns();
+        column->set_table_idx(static_cast<uint32_t>(column_ref.first));
+        column->set_column(column_ref.second->field_index());
+      }
+    }
+
     current_node = request.nodes_size() - 1;
   }
 
