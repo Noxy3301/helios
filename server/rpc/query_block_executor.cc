@@ -832,9 +832,9 @@ class Executor {
         if (join.build_keys_size() != join.probe_keys_size()) {
             return fail("join key arity");
         }
-        // A keyless INNER join is a cross product, used for one-row virtual
-        // derived inputs. Other join types need explicit keys for SQL shape.
-        if (join.build_keys_size() == 0 && !is_inner) {
+        // Keyless INNER and LEFT joins are cross products. The proxy only emits
+        // them for one-row virtual inputs, where the SQL shape is explicit.
+        if (join.build_keys_size() == 0 && !is_inner && !is_left) {
             return fail("join key arity");
         }
         if (join.build() >= results_.size() || join.probe() >= results_.size()) {
