@@ -3556,8 +3556,42 @@ int ha_lineairdb_columnar::info(unsigned int flags) {
   if (primary == nullptr) return 0;
 
   const int error = primary->info(flags);
-  if (error == 0) stats.records = primary->stats.records;
-  return error;
+  if (error != 0) return error;
+
+  stats.records = primary->stats.records;
+
+  // Join selectivity is estimated against the secondary TABLE, so copy the
+  // primary handler's refreshed index cardinality onto this TABLE instance.
+  if (table != nullptr) {
+    const TABLE *primary_table = nullptr;
+    THD *thd = ha_thd();
+    for (TABLE *candidate = thd != nullptr ? thd->open_tables : nullptr;
+         candidate != nullptr; candidate = candidate->next) {
+      if (candidate->file == primary) {
+        primary_table = candidate;
+        break;
+      }
+    }
+
+    if (primary_table != nullptr && table->s->keys == primary_table->s->keys) {
+      for (uint key_idx = 0; key_idx < table->s->keys; key_idx++) {
+        KEY &dst = table->key_info[key_idx];
+        const KEY &src = primary_table->key_info[key_idx];
+        if (dst.actual_key_parts != src.actual_key_parts) continue;
+
+        for (uint part_idx = 0; part_idx < dst.actual_key_parts; part_idx++) {
+          if (src.has_records_per_key(part_idx)) {
+            dst.set_records_per_key(part_idx,
+                                    src.records_per_key(part_idx));
+          }
+          if (dst.rec_per_key != nullptr && src.rec_per_key != nullptr) {
+            dst.rec_per_key[part_idx] = src.rec_per_key[part_idx];
+          }
+        }
+      }
+    }
+  }
+  return 0;
 }
 
 ha_rows ha_lineairdb_columnar::records_in_range(unsigned int index,
