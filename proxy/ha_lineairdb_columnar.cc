@@ -576,11 +576,13 @@ const Field *SubstringPrefixField(Item *item, uint32_t *prefix_len) {
   Item *from = function->arguments()[1];
   Item *length = function->arguments()[2];
   if (column->type() != Item::FIELD_ITEM) return nullptr;
+  const Field *field = down_cast<Item_field *>(column)->field;
+  if (field->result_type() != STRING_RESULT) return nullptr;
   if (!from->const_item() || from->val_int() != 1) return nullptr;
   if (!length->const_item() || length->val_int() <= 0) return nullptr;
 
   *prefix_len = static_cast<uint32_t>(length->val_int());
-  return down_cast<Item_field *>(column)->field;
+  return field;
 }
 
 /**
@@ -2186,6 +2188,28 @@ bool BuildQueryBlockRequest(
       group_column->set_column(group_field->field_index());
       group_column->set_prefix_len(4);
       group_column->set_cmp_kind(0);
+      group_fields.push_back({group_table, nullptr});
+      continue;
+    }
+
+    uint32_t substring_prefix_len = 0;
+    if (const Field *substring_field =
+            SubstringPrefixField(group_item, &substring_prefix_len)) {
+      const int group_table = TableIndexOfField(substring_field, tables);
+      const Field *group_field =
+          group_table >= 0
+              ? resolve_query_field(substring_field, group_table)
+              : nullptr;
+      if (group_field == nullptr ||
+          (!table_is_virtual[group_table] && group_field->is_nullable())) {
+        LDB_COL_REJECT("group substring column");
+      }
+
+      auto *group_column = aggregate->add_group_columns();
+      group_column->set_table_idx(static_cast<uint32_t>(group_table));
+      group_column->set_column(group_field->field_index());
+      group_column->set_prefix_len(substring_prefix_len);
+      group_column->set_cmp_kind(1);
       group_fields.push_back({group_table, nullptr});
       continue;
     }
