@@ -1375,6 +1375,8 @@ bool BuildQueryBlockRequest(
   } while (0)
 
   if (qb == nullptr || request_out == nullptr) LDB_COL_REJECT("missing block");
+  auto &request = *request_out;
+  request.Clear();
 
   Query_expression *unit = qb->master_query_expression();
   if (unit == nullptr || !unit->is_simple())
@@ -1503,6 +1505,11 @@ bool BuildQueryBlockRequest(
     return virtual_idx < virtual_block_is_scalar_aggregate.size() &&
            virtual_block_is_scalar_aggregate[virtual_idx];
   };
+
+  for (size_t table_idx = 0; table_idx < real_table_count; table_idx++) {
+    request.add_tables()->set_table_name(
+        tables[table_idx].table->s->normalized_path.str);
+  }
 
   struct JoinEdge {
     int left_table = -1;
@@ -1779,12 +1786,12 @@ bool BuildQueryBlockRequest(
   }
 
   // Scan every table once, attaching only predicates that read that table.
-  auto &request = *request_out;
-  request.Clear();
   std::vector<int> scan_nodes(tables.size(), -1);
-  for (size_t table_idx = 0; table_idx < real_table_count; table_idx++) {
+  auto emit_scan = [&](size_t table_idx) -> bool {
+    if (table_idx >= real_table_count) return false;
+    if (scan_nodes[table_idx] >= 0) return true;
+
     TABLE *table = tables[table_idx].table;
-    request.add_tables()->set_table_name(table->s->normalized_path.str);
     auto *scan_node = request.add_nodes();
     auto *scan = scan_node->mutable_scan();
     scan->set_table_idx(static_cast<uint32_t>(table_idx));
@@ -1792,8 +1799,13 @@ bool BuildQueryBlockRequest(
     if (!table_filters[table_idx].empty() &&
         !SerializeTableFilters(table_filters[table_idx], table,
                                scan->mutable_filter())) {
-      LDB_COL_REJECT("filter not pushable");
+      return false;
     }
+    return true;
+  };
+
+  for (size_t table_idx = 0; table_idx < real_table_count; table_idx++) {
+    if (!emit_scan(table_idx)) LDB_COL_REJECT("filter not pushable");
   }
 
   for (size_t table_idx = real_table_count; table_idx < tables.size();
