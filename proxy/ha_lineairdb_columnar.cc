@@ -18,6 +18,7 @@
 #include "mysqld_error.h"
 #include "sql/handler.h"
 #include "sql/item.h"
+#include "sql/item_cmpfunc.h"
 #include "sql/item_sum.h"
 #include "sql/item_timefunc.h"
 #include "sql/mem_root_array.h"
@@ -1301,6 +1302,7 @@ bool BuildQueryBlockRequest(
   std::vector<int> table_semijoin_nest;
   std::vector<bool> table_is_virtual;
   std::vector<Query_block *> virtual_blocks;
+  std::vector<bool> virtual_block_is_scalar_aggregate;
   for (Table_ref *table_ref = qb->leaf_tables; table_ref != nullptr;
        table_ref = table_ref->next_leaf) {
     if (table_ref->is_view_or_derived()) continue;
@@ -1340,6 +1342,9 @@ bool BuildQueryBlockRequest(
     table_semijoin_nest.push_back(-1);
     table_is_virtual.push_back(true);
     virtual_blocks.push_back(derived_qb);
+    virtual_block_is_scalar_aggregate.push_back(
+        derived_qb->is_implicitly_grouped() &&
+        derived_qb->group_list.elements == 0);
     main_tables.push_back(static_cast<int>(tables.size()) - 1);
   }
   if (main_tables.empty()) LDB_COL_REJECT("no tables");
@@ -1361,8 +1366,60 @@ bool BuildQueryBlockRequest(
     const Field *right_field = nullptr;
   };
 
+  auto semijoin_outer_equivalent = [&](const Field *field) -> const Field * {
+    for (const SemijoinNest &semijoin : semijoin_nests) {
+      if (semijoin.nest == nullptr ||
+          semijoin.nest->nested_join == nullptr) {
+        continue;
+      }
+      const auto &outer_exprs =
+          semijoin.nest->nested_join->sj_outer_exprs;
+      const auto &inner_exprs =
+          semijoin.nest->nested_join->sj_inner_exprs;
+      for (size_t expr_idx = 0;
+           expr_idx < outer_exprs.size() && expr_idx < inner_exprs.size();
+           expr_idx++) {
+        Item *outer_item = outer_exprs[expr_idx]->real_item();
+        Item *inner_item = inner_exprs[expr_idx]->real_item();
+        if (outer_item->type() == Item::FIELD_ITEM &&
+            inner_item->type() == Item::FIELD_ITEM &&
+            down_cast<Item_field *>(inner_item)->field == field) {
+          return down_cast<Item_field *>(outer_item)->field;
+        }
+      }
+    }
+    return field;
+  };
+
   std::vector<std::vector<Item *>> table_filters(tables.size());
   std::vector<JoinEdge> join_edges;
+  auto add_join_edge_if_supported = [&](const Field *left_raw,
+                                        const Field *right_raw) -> bool {
+    const int left_table = TableIndexOfField(left_raw, tables);
+    const int right_table = TableIndexOfField(right_raw, tables);
+    if (left_table < 0 || right_table < 0 || left_table == right_table) {
+      return false;
+    }
+    if (table_semijoin_nest[left_table] >= 0 ||
+        table_semijoin_nest[right_table] >= 0) {
+      return false;
+    }
+    if (left_raw->result_type() != INT_RESULT ||
+        right_raw->result_type() != INT_RESULT) {
+      return false;
+    }
+
+    const Field *left_field = resolve_query_field(left_raw, left_table);
+    const Field *right_field = resolve_query_field(right_raw, right_table);
+    if (left_field == nullptr || right_field == nullptr) return false;
+    if ((!table_is_virtual[left_table] && left_field->is_nullable()) ||
+        (!table_is_virtual[right_table] && right_field->is_nullable())) {
+      return false;
+    }
+    join_edges.push_back({left_table, right_table, left_field, right_field});
+    return true;
+  };
+
   std::vector<Item *> tuple_predicates;
   Item *where_cond =
       qb->where_cond() != nullptr
@@ -1411,7 +1468,48 @@ bool BuildQueryBlockRequest(
       predicate_nest = table_nest;
     }
     if (spans_multiple_nests) LDB_COL_REJECT("predicate spans semijoins");
+    if (predicate->type() == Item::FUNC_ITEM &&
+        down_cast<Item_func *>(predicate)->functype() ==
+            Item_func::MULT_EQUAL_FUNC) {
+      auto *multiple_equal = down_cast<Item_equal *>(predicate);
+      if (multiple_equal->const_arg() != nullptr) {
+        LDB_COL_REJECT("multiple equality with constant");
+      }
+      std::vector<const Field *> equal_fields;
+      for (Item_field &field_item : multiple_equal->get_fields()) {
+        equal_fields.push_back(field_item.field);
+      }
+      for (size_t left_idx = 0; left_idx < equal_fields.size(); left_idx++) {
+        for (size_t right_idx = left_idx + 1; right_idx < equal_fields.size();
+             right_idx++) {
+          add_join_edge_if_supported(equal_fields[left_idx],
+                                     equal_fields[right_idx]);
+        }
+      }
+      continue;
+    }
     if (predicate_nest >= 0) {
+      if (predicate->type() == Item::FUNC_ITEM &&
+          down_cast<Item_func *>(predicate)->functype() ==
+              Item_func::EQ_FUNC) {
+        auto *equals = down_cast<Item_func *>(predicate);
+        Item *left = equals->arguments()[0]->real_item();
+        Item *right = equals->arguments()[1]->real_item();
+        if (left->type() == Item::FIELD_ITEM &&
+            right->type() == Item::FIELD_ITEM) {
+          const Field *left_raw = semijoin_outer_equivalent(
+              down_cast<Item_field *>(left)->field);
+          const Field *right_raw = semijoin_outer_equivalent(
+              down_cast<Item_field *>(right)->field);
+          const int left_table = TableIndexOfField(left_raw, tables);
+          const int right_table = TableIndexOfField(right_raw, tables);
+          if (left_table >= 0 && right_table >= 0 &&
+              left_table == right_table) {
+            continue;
+          }
+          if (add_join_edge_if_supported(left_raw, right_raw)) continue;
+        }
+      }
       semijoin_nests[predicate_nest].residual_predicates.push_back(predicate);
       continue;
     }
@@ -2103,6 +2201,36 @@ bool BuildQueryBlockRequest(
       expr->set_op(LineairDB::Protocol::FilterExpr::COLUMN_REF);
       expr->set_column_index(aggregate_output_base +
                              static_cast<uint32_t>(ordinal));
+      return true;
+    }
+    if (item->type() == Item::FIELD_ITEM) {
+      const Field *raw_field = down_cast<Item_field *>(item)->field;
+      const int table_idx = TableIndexOfField(raw_field, tables);
+      if (table_idx < static_cast<int>(real_table_count) ||
+          table_idx >= static_cast<int>(tables.size()) ||
+          !table_is_virtual[table_idx]) {
+        return false;
+      }
+      const size_t virtual_idx =
+          static_cast<size_t>(table_idx) - real_table_count;
+      if (virtual_idx >= virtual_block_is_scalar_aggregate.size() ||
+          !virtual_block_is_scalar_aggregate[virtual_idx]) {
+        return false;
+      }
+
+      auto *function = aggregate->add_aggs();
+      function->set_arg_table(static_cast<uint32_t>(table_idx));
+      auto *ref = function->mutable_arg();
+      ref->set_op(LineairDB::Protocol::FilterExpr::COLUMN_REF);
+      ref->set_column_index(raw_field->field_index());
+      function->set_kind(LineairDB::Protocol::QueryBlockAggFunc::MIN);
+      function->set_cmp_kind(raw_field->result_type() == STRING_RESULT ? 1
+                                                                       : 0);
+
+      expr->set_op(LineairDB::Protocol::FilterExpr::COLUMN_REF);
+      expr->set_column_index(aggregate_output_base +
+                             static_cast<uint32_t>(
+                                 aggregate->aggs_size() - 1));
       return true;
     }
     if (item->type() == Item::INT_ITEM) {
