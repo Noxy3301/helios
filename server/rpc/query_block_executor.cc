@@ -922,6 +922,9 @@ class Executor {
         key->clear();
         for (const JoinKeyColumn& column : key_columns) {
             const uint64_t ref = input.refs[column.ref_position][row_idx];
+            // SQL equijoins are null-rejecting, while an empty non-NULL string
+            // is still a valid key part. Use the null bitmap instead of the
+            // value bytes so hash joins match the scan semi-filter semantics.
             if (NullOf(column.table_idx, ref, column.column)) return false;
             AppendJoinKeyPart(key,
                               ValueOf(column.table_idx, ref, column.column));
