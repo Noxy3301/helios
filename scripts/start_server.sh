@@ -19,6 +19,8 @@ else
   echo "WARNING: jemalloc not found, using system malloc (apt install libjemalloc2)" >&2
 fi
 
+export HELIOS_PAX_STORAGE=1
+
 if [ ! -x "$BIN" ]; then
   echo "ERROR: binary not found: $BIN" >&2
   echo "Hint: build it via: bash scripts/build.sh (or build_partial.sh)" >&2
@@ -39,4 +41,3 @@ echo $PID > "$PID_FILE"
 echo "Started lineairdb-server with PID $PID"
 echo "Logs: $LOG_FILE"
 echo "PID file: $PID_FILE"
-
