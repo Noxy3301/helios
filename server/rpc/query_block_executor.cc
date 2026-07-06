@@ -829,8 +829,12 @@ class Executor {
         if (!is_inner && !is_left && !is_semi && !is_anti) {
             return fail("unsupported query-block join type");
         }
-        if (join.build_keys_size() != join.probe_keys_size() ||
-            join.build_keys_size() == 0) {
+        if (join.build_keys_size() != join.probe_keys_size()) {
+            return fail("join key arity");
+        }
+        // A keyless INNER join is a cross product, used for one-row virtual
+        // derived inputs. Other join types need explicit keys for SQL shape.
+        if (join.build_keys_size() == 0 && !is_inner) {
             return fail("join key arity");
         }
         if (join.build() >= results_.size() || join.probe() >= results_.size()) {
