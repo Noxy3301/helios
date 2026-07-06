@@ -8,6 +8,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <string>
 #include <tuple>
 #include <utility>
@@ -22,6 +23,7 @@
 #include "sql/item_cmpfunc.h"
 #include "sql/item_sum.h"
 #include "sql/item_timefunc.h"
+#include "sql/join_optimizer/access_path.h"
 #include "sql/mem_root_array.h"
 #include "sql/nested_join.h"
 #include "sql/query_result.h"
@@ -1367,7 +1369,7 @@ bool RecognizeFlattenedAggregate(JOIN *join, ColumnarExecutionContext *ctx,
 bool BuildQueryBlockRequest(
     JOIN *join, Query_block *qb,
     LineairDB::Protocol::TxExecuteQueryBlock::Request *request_out,
-    const char **why) {
+    const char **why, AccessPath *plan = nullptr) {
 #define LDB_COL_REJECT(reason) \
   do {                         \
     *why = (reason);           \
@@ -1506,6 +1508,8 @@ bool BuildQueryBlockRequest(
            virtual_block_is_scalar_aggregate[virtual_idx];
   };
 
+  const bool plan_map = plan != nullptr;
+
   for (size_t table_idx = 0; table_idx < real_table_count; table_idx++) {
     request.add_tables()->set_table_name(
         tables[table_idx].table->s->normalized_path.str);
@@ -1586,6 +1590,7 @@ bool BuildQueryBlockRequest(
     const table_map used = predicate->used_tables() & ~PSEUDO_TABLE_BITS;
     const int table_idx = SingleTableOf(used, tables);
     if (table_idx >= 0) {
+      if (plan_map && table_is_virtual[table_idx]) continue;
       if (table_is_virtual[table_idx]) {
         tuple_predicates.push_back(predicate);
         continue;
@@ -1606,6 +1611,11 @@ bool BuildQueryBlockRequest(
       }
       continue;
     }
+
+    // Plan mapping takes cross-table joins, semijoin residuals, and derived
+    // filters from the optimizer's AccessPath tree instead of the syntactic
+    // WHERE decomposition.
+    if (plan_map) continue;
 
     int predicate_nest = -1;
     bool spans_multiple_nests = false;
@@ -1781,11 +1791,10 @@ bool BuildQueryBlockRequest(
     if (!is_scalar_virtual_table(table_idx)) main_non_scalar_tables++;
   }
   if (main_tables.size() > 1 && join_edges.empty() &&
-      main_non_scalar_tables > 1) {
+      main_non_scalar_tables > 1 && !plan_map) {
     LDB_COL_REJECT("cross join");
   }
 
-  // Scan every table once, attaching only predicates that read that table.
   std::vector<int> scan_nodes(tables.size(), -1);
   auto emit_scan = [&](size_t table_idx) -> bool {
     if (table_idx >= real_table_count) return false;
@@ -1804,105 +1813,275 @@ bool BuildQueryBlockRequest(
     return true;
   };
 
-  for (size_t table_idx = 0; table_idx < real_table_count; table_idx++) {
-    if (!emit_scan(table_idx)) LDB_COL_REJECT("filter not pushable");
-  }
-
-  for (size_t table_idx = real_table_count; table_idx < tables.size();
-       table_idx++) {
-    auto *sub_block = request.add_nodes()->mutable_sub_block();
-    if (!BuildQueryBlockRequest(
-            nullptr, virtual_blocks[table_idx - real_table_count],
-            sub_block->mutable_block(), why)) {
-      return false;
+  int current_node = -1;
+  if (plan_map) {
+    std::map<int, std::set<int>> node_tables;
+    std::set<const Item *> having_predicates;
+    if (qb->having_cond() != nullptr) {
+      std::vector<Item *> having_parts;
+      FlattenAnd(qb->having_cond(), &having_parts);
+      having_predicates.insert(having_parts.begin(), having_parts.end());
     }
-    scan_nodes[table_idx] = request.nodes_size() - 1;
-  }
 
-  // Build a left-deep INNER join tree by walking FROM order and retrying tables
-  // whose equality edges are not connected yet.
-  auto first_input =
-      std::find_if(main_tables.begin(), main_tables.end(), [&](int table_idx) {
-        return !is_scalar_virtual_table(table_idx);
-      });
-  const int first_table =
-      first_input != main_tables.end() ? *first_input : main_tables[0];
-  int current_node = scan_nodes[first_table];
-  std::vector<bool> joined(tables.size(), false);
-  joined[first_table] = true;
-  std::vector<int> pending_tables;
-  for (int table_idx : main_tables) {
-    if (table_idx != first_table) pending_tables.push_back(table_idx);
-  }
-  while (!pending_tables.empty()) {
-    int table_idx = -1;
-    size_t pending_idx = 0;
-    bool keyless_one_row_join = false;
-    for (size_t idx = 0; idx < pending_tables.size(); idx++) {
-      for (const JoinEdge &edge : join_edges) {
-        if ((edge.left_table == pending_tables[idx] &&
-             joined[edge.right_table]) ||
-            (edge.right_table == pending_tables[idx] &&
-             joined[edge.left_table])) {
-          table_idx = pending_tables[idx];
-          pending_idx = idx;
-          break;
-        }
-      }
-      if (table_idx >= 0) break;
-    }
-    if (table_idx < 0) {
-      // Scalar aggregate sub-blocks produce at most one row, so they are the
-      // only virtual inputs that can use a keyless INNER join.
-      for (size_t idx = 0; idx < pending_tables.size(); idx++) {
-        if (is_scalar_virtual_table(pending_tables[idx])) {
-          table_idx = pending_tables[idx];
-          pending_idx = idx;
-          keyless_one_row_join = true;
-          break;
-        }
-      }
-    }
-    if (table_idx < 0) LDB_COL_REJECT("disconnected join graph");
-    pending_tables.erase(pending_tables.begin() + pending_idx);
+    TupleColumnRegistry registry_template;
+    registry_template.table_of = [&](const Field *field) {
+      return TableIndexOfField(field, tables);
+    };
+    registry_template.resolve = [&](const Field *field, int table_idx) {
+      return resolve_query_field(field, table_idx);
+    };
 
-    bool connected = keyless_one_row_join;
-    auto *join_node = request.add_nodes()->mutable_join();
-    join_node->set_type(LineairDB::Protocol::QueryBlockJoin::INNER);
-    join_node->set_build(scan_nodes[table_idx]);
-    join_node->set_probe(current_node);
-
-    for (const JoinEdge &edge : join_edges) {
-      const Field *build_field = nullptr;
-      const Field *probe_field = nullptr;
-      int probe_table = -1;
-      if (edge.left_table == static_cast<int>(table_idx) &&
-          joined[edge.right_table]) {
-        build_field = edge.left_field;
-        probe_field = edge.right_field;
-        probe_table = edge.right_table;
-      } else if (edge.right_table == static_cast<int>(table_idx) &&
-                 joined[edge.left_table]) {
-        build_field = edge.right_field;
-        probe_field = edge.left_field;
-        probe_table = edge.left_table;
+    auto fill_tuple_filter =
+        [&](const std::vector<Item *> &items,
+            LineairDB::Protocol::QueryBlockTupleFilter *tuple_filter) -> bool {
+      TupleColumnRegistry registry = registry_template;
+      auto *predicate = tuple_filter->mutable_predicate();
+      auto *expression = predicate->mutable_expr();
+      if (items.size() == 1) {
+        if (!SerializeTuplePredicate(items[0], expression, &registry))
+          return false;
       } else {
-        continue;
+        expression->set_op(LineairDB::Protocol::FilterExpr::OP_AND);
+        for (Item *item : items) {
+          if (!SerializeTuplePredicate(item, expression->add_children(),
+                                       &registry)) {
+            return false;
+          }
+        }
       }
 
-      auto *build_key = join_node->add_build_keys();
-      build_key->set_table_idx(static_cast<uint32_t>(table_idx));
-      build_key->set_column(build_field->field_index());
-      auto *probe_key = join_node->add_probe_keys();
-      probe_key->set_table_idx(static_cast<uint32_t>(probe_table));
-      probe_key->set_column(probe_field->field_index());
-      connected = true;
+      predicate->set_num_columns(registry.columns.size());
+      for (const auto &column_ref : registry.columns) {
+        auto *column = tuple_filter->add_columns();
+        column->set_table_idx(static_cast<uint32_t>(column_ref.first));
+        column->set_column(column_ref.second->field_index());
+      }
+      return true;
+    };
+
+    std::function<int(AccessPath *, bool)> map_path =
+        [&](AccessPath *path, bool root) -> int {
+      if (path == nullptr) {
+        *why = "null plan node";
+        return -1;
+      }
+
+      switch (path->type) {
+        case AccessPath::TABLE_SCAN: {
+          const TABLE *table = path->table_scan().table;
+          int table_idx = -1;
+          for (size_t i = 0; i < tables.size(); i++) {
+            if (tables[i].table == table) {
+              table_idx = static_cast<int>(i);
+              break;
+            }
+          }
+          if (table_idx < 0) {
+            *why = "plan table unknown";
+            return -1;
+          }
+          if (static_cast<size_t>(table_idx) >= real_table_count) {
+            *why = "plan table scan virtual";
+            return -1;
+          }
+          if (!emit_scan(static_cast<size_t>(table_idx))) {
+            *why = "filter not pushable";
+            return -1;
+          }
+          node_tables[scan_nodes[table_idx]] = {table_idx};
+          return scan_nodes[table_idx];
+        }
+
+        case AccessPath::FILTER: {
+          const int input = map_path(path->filter().child, root);
+          if (input < 0) return -1;
+
+          std::vector<Item *> parts;
+          FlattenAnd(path->filter().condition, &parts);
+          std::vector<Item *> residuals;
+          for (Item *part : parts) {
+            if (having_predicates.count(part) != 0) continue;
+
+            const table_map used = part->used_tables() & ~PSEUDO_TABLE_BITS;
+            const int table_idx = SingleTableOf(used, tables);
+            if (table_idx >= 0 && !table_is_virtual[table_idx] &&
+                std::find(table_filters[table_idx].begin(),
+                          table_filters[table_idx].end(),
+                          part) != table_filters[table_idx].end()) {
+              continue;
+            }
+            residuals.push_back(part);
+          }
+          if (residuals.empty()) return input;
+
+          for (Item *residual : residuals) {
+            const table_map used =
+                residual->used_tables() & ~PSEUDO_TABLE_BITS;
+            for (size_t table_idx = 0; table_idx < tables.size();
+                 table_idx++) {
+              if ((used & tables[table_idx].map) != 0 &&
+                  node_tables[input].count(static_cast<int>(table_idx)) == 0) {
+                *why = "plan filter out of scope";
+                return -1;
+              }
+            }
+          }
+
+          auto *filter_node = request.add_nodes()->mutable_filter();
+          filter_node->set_input(static_cast<uint32_t>(input));
+          if (!fill_tuple_filter(residuals, filter_node->mutable_filter())) {
+            *why = "plan filter not pushable";
+            return -1;
+          }
+          const int self = request.nodes_size() - 1;
+          node_tables[self] = node_tables[input];
+          return self;
+        }
+
+        case AccessPath::SORT:
+          if (!root || path->sort().remove_duplicates) {
+            *why = "plan sort off root spine";
+            return -1;
+          }
+          return map_path(path->sort().child, true);
+
+        case AccessPath::AGGREGATE:
+          if (!root) {
+            *why = "plan aggregate off root spine";
+            return -1;
+          }
+          return map_path(path->aggregate().child, true);
+
+        case AccessPath::LIMIT_OFFSET:
+          if (!root) {
+            *why = "plan limit off root spine";
+            return -1;
+          }
+          return map_path(path->limit_offset().child, true);
+
+        case AccessPath::STREAM:
+          return map_path(path->stream().child, root);
+
+        case AccessPath::TEMPTABLE_AGGREGATE:
+          if (!root) {
+            *why = "plan temptable aggregate off root spine";
+            return -1;
+          }
+          return map_path(path->temptable_aggregate().subquery_path, true);
+
+        default: {
+          static thread_local char buffer[64];
+          snprintf(buffer, sizeof(buffer), "unmapped plan node %d",
+                   static_cast<int>(path->type));
+          *why = buffer;
+          return -1;
+        }
+      }
+    };
+
+    current_node = map_path(plan, true);
+    if (current_node < 0) return false;
+  } else {
+    // Scan every table once, attaching only predicates that read that table.
+    for (size_t table_idx = 0; table_idx < real_table_count; table_idx++) {
+      if (!emit_scan(table_idx)) LDB_COL_REJECT("filter not pushable");
     }
 
-    if (!connected) LDB_COL_REJECT("disconnected join graph");
-    joined[table_idx] = true;
-    current_node = request.nodes_size() - 1;
-  }
+    for (size_t table_idx = real_table_count; table_idx < tables.size();
+         table_idx++) {
+      auto *sub_block = request.add_nodes()->mutable_sub_block();
+      if (!BuildQueryBlockRequest(
+              nullptr, virtual_blocks[table_idx - real_table_count],
+              sub_block->mutable_block(), why)) {
+        return false;
+      }
+      scan_nodes[table_idx] = request.nodes_size() - 1;
+    }
+
+    // Build a left-deep INNER join tree by walking FROM order and retrying
+    // tables whose equality edges are not connected yet.
+    auto first_input =
+        std::find_if(main_tables.begin(), main_tables.end(), [&](int table_idx) {
+          return !is_scalar_virtual_table(table_idx);
+        });
+    const int first_table =
+        first_input != main_tables.end() ? *first_input : main_tables[0];
+    current_node = scan_nodes[first_table];
+    std::vector<bool> joined(tables.size(), false);
+    joined[first_table] = true;
+    std::vector<int> pending_tables;
+    for (int table_idx : main_tables) {
+      if (table_idx != first_table) pending_tables.push_back(table_idx);
+    }
+    while (!pending_tables.empty()) {
+      int table_idx = -1;
+      size_t pending_idx = 0;
+      bool keyless_one_row_join = false;
+      for (size_t idx = 0; idx < pending_tables.size(); idx++) {
+        for (const JoinEdge &edge : join_edges) {
+          if ((edge.left_table == pending_tables[idx] &&
+               joined[edge.right_table]) ||
+              (edge.right_table == pending_tables[idx] &&
+               joined[edge.left_table])) {
+            table_idx = pending_tables[idx];
+            pending_idx = idx;
+            break;
+          }
+        }
+        if (table_idx >= 0) break;
+      }
+      if (table_idx < 0) {
+        // Scalar aggregate sub-blocks produce at most one row, so they are the
+        // only virtual inputs that can use a keyless INNER join.
+        for (size_t idx = 0; idx < pending_tables.size(); idx++) {
+          if (is_scalar_virtual_table(pending_tables[idx])) {
+            table_idx = pending_tables[idx];
+            pending_idx = idx;
+            keyless_one_row_join = true;
+            break;
+          }
+        }
+      }
+      if (table_idx < 0) LDB_COL_REJECT("disconnected join graph");
+      pending_tables.erase(pending_tables.begin() + pending_idx);
+
+      bool connected = keyless_one_row_join;
+      auto *join_node = request.add_nodes()->mutable_join();
+      join_node->set_type(LineairDB::Protocol::QueryBlockJoin::INNER);
+      join_node->set_build(scan_nodes[table_idx]);
+      join_node->set_probe(current_node);
+
+      for (const JoinEdge &edge : join_edges) {
+        const Field *build_field = nullptr;
+        const Field *probe_field = nullptr;
+        int probe_table = -1;
+        if (edge.left_table == static_cast<int>(table_idx) &&
+            joined[edge.right_table]) {
+          build_field = edge.left_field;
+          probe_field = edge.right_field;
+          probe_table = edge.right_table;
+        } else if (edge.right_table == static_cast<int>(table_idx) &&
+                   joined[edge.left_table]) {
+          build_field = edge.right_field;
+          probe_field = edge.left_field;
+          probe_table = edge.left_table;
+        } else {
+          continue;
+        }
+
+        auto *build_key = join_node->add_build_keys();
+        build_key->set_table_idx(static_cast<uint32_t>(table_idx));
+        build_key->set_column(build_field->field_index());
+        auto *probe_key = join_node->add_probe_keys();
+        probe_key->set_table_idx(static_cast<uint32_t>(probe_table));
+        probe_key->set_column(probe_field->field_index());
+        connected = true;
+      }
+
+      if (!connected) LDB_COL_REJECT("disconnected join graph");
+      joined[table_idx] = true;
+      current_node = request.nodes_size() - 1;
+    }
 
   // MySQL may rewrite correlated subqueries into derived tables on the
   // nullable side of a LEFT join. Execute the derived block as a virtual table,
@@ -2290,6 +2469,7 @@ bool BuildQueryBlockRequest(
     }
 
     current_node = request.nodes_size() - 1;
+  }
   }
 
   std::vector<Item *> output_items;
@@ -2984,7 +3164,10 @@ bool RecognizeQueryBlock(JOIN *join, ColumnarExecutionContext *ctx,
     if (RecognizeFlattenedAggregate(join, ctx, why)) return true;
   }
 
-  if (!BuildQueryBlockRequest(join, qb, &ctx->query_block_request, why)) {
+  if (!BuildQueryBlockRequest(join, qb, &ctx->query_block_request, why,
+                              join->root_access_path()) &&
+      !BuildQueryBlockRequest(join, qb, &ctx->query_block_request, why,
+                              nullptr)) {
     return false;
   }
   ctx->query_block_ready = true;
