@@ -1259,8 +1259,8 @@ bool BuildQueryBlockRequest(
   if (qb->olap != UNSPECIFIED_OLAP_TYPE) LDB_COL_REJECT("has ROLLUP");
   const bool implicit_grouping =
       join != nullptr ? join->implicit_grouping : qb->is_implicitly_grouped();
-  if (!implicit_grouping && qb->group_list.elements == 0)
-    LDB_COL_REJECT("no aggregation");
+  const bool plain_rows =
+      !implicit_grouping && qb->group_list.elements == 0;
 
   struct SemijoinNest {
     Table_ref *nest = nullptr;
@@ -1864,6 +1864,63 @@ bool BuildQueryBlockRequest(
     current_node = request.nodes_size() - 1;
   }
 
+  std::vector<Item *> output_items;
+  for (Item *item : VisibleFields(qb->fields)) output_items.push_back(item);
+
+  if (plain_rows) {
+    if (qb->having_cond() != nullptr) LDB_COL_REJECT("row block has HAVING");
+    for (Item *item : output_items) {
+      Item *real = item->real_item();
+      if (real->type() != Item::FIELD_ITEM)
+        LDB_COL_REJECT("row output not a column");
+
+      const Field *raw_output_field = down_cast<Item_field *>(real)->field;
+      const int output_table = TableIndexOfField(raw_output_field, tables);
+      const Field *output_field =
+          output_table >= 0
+              ? resolve_query_field(raw_output_field, output_table)
+              : nullptr;
+      if (output_field == nullptr)
+        LDB_COL_REJECT("row output column unresolvable");
+
+      auto *output = request.add_output();
+      output->set_source(LineairDB::Protocol::QueryBlockOutputExpr::COLUMN);
+      auto *column = output->mutable_column();
+      column->set_table_idx(static_cast<uint32_t>(output_table));
+      column->set_column(output_field->field_index());
+      column->set_cmp_kind(output_field->result_type() == STRING_RESULT ? 1
+                                                                        : 2);
+    }
+
+    for (ORDER *order = qb->order_list.first; order != nullptr;
+         order = order->next) {
+      const int output_ordinal =
+          OrderOutputOrdinal(*order->item, output_items);
+      if (output_ordinal < 0)
+        LDB_COL_REJECT("row ORDER BY not an output column");
+
+      auto *sort_key = request.add_order_by();
+      sort_key->set_output_ordinal(output_ordinal);
+      sort_key->set_descending(order->direction == ORDER_DESC);
+      Item *output_item = output_items[output_ordinal]->real_item();
+      sort_key->set_cmp_kind(output_item->result_type() == STRING_RESULT ? 1
+                                                                         : 2);
+    }
+
+    if (qb->has_limit()) {
+      if (unit->select_limit_cnt != HA_POS_ERROR)
+        request.set_limit(unit->select_limit_cnt);
+      if (unit->offset_limit_cnt > 0) {
+        request.set_offset(unit->offset_limit_cnt);
+        if (request.limit() > 0)
+          request.set_limit(request.limit() - unit->offset_limit_cnt);
+      }
+    }
+
+    *why = nullptr;
+    return true;
+  }
+
   auto *aggregate_node = request.add_nodes();
   auto *aggregate = aggregate_node->mutable_aggregate();
   aggregate->set_input(current_node);
@@ -1919,9 +1976,6 @@ bool BuildQueryBlockRequest(
                                                                            : 0);
     group_fields.push_back({group_table, group_field});
   }
-
-  std::vector<Item *> output_items;
-  for (Item *item : VisibleFields(qb->fields)) output_items.push_back(item);
 
   const char *aggregate_error = nullptr;
   auto register_aggregate = [&](Item_sum *sum) -> int {
