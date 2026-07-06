@@ -1897,6 +1897,28 @@ bool BuildQueryBlockRequest(
       return true;
     };
 
+    // Emit real-table scans before mapping joins, ordered by current table
+    // statistics. Later scan-level semi-filters can only read key sets from
+    // nodes that execute earlier, so selective scans must be available as
+    // sources regardless of where the optimizer placed their joins.
+    {
+      std::vector<size_t> scan_issue_order;
+      scan_issue_order.reserve(real_table_count);
+      for (size_t table_idx = 0; table_idx < real_table_count; table_idx++) {
+        scan_issue_order.push_back(table_idx);
+      }
+      std::stable_sort(scan_issue_order.begin(), scan_issue_order.end(),
+                       [&](size_t left, size_t right) {
+                         return table_rows(left) < table_rows(right);
+                       });
+      for (size_t table_idx : scan_issue_order) {
+        if (!emit_scan(table_idx)) LDB_COL_REJECT("filter not pushable");
+        const int scan_node = scan_nodes[table_idx];
+        node_tables[scan_node] = {static_cast<int>(table_idx)};
+        node_rows[scan_node] = table_rows(table_idx);
+      }
+    }
+
     // Join keys emitted below are enforced equalities. Later mapped joins may
     // need the same column through a surviving equivalent column if the
     // optimizer removed an intermediate table from the mapped tree.
