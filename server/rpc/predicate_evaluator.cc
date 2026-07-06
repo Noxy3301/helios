@@ -5,8 +5,46 @@
 #include <climits>
 #include <cstdlib>
 #include <cstring>
+#include <string>
 
 using FilterExpr = LineairDB::Protocol::FilterExpr;
+
+namespace {
+
+bool parse_int_value(std::string_view value, int64_t* out) {
+  if (out == nullptr || value.empty()) return false;
+  const std::string text(value);
+  errno = 0;
+  char* end = nullptr;
+  const long long parsed = std::strtoll(text.c_str(), &end, 10);
+  if (errno != 0 || end != text.c_str() + text.size()) return false;
+  *out = static_cast<int64_t>(parsed);
+  return true;
+}
+
+bool parse_uint_value(std::string_view value, uint64_t* out) {
+  if (out == nullptr || value.empty() || value.front() == '-') return false;
+  const std::string text(value);
+  errno = 0;
+  char* end = nullptr;
+  const unsigned long long parsed = std::strtoull(text.c_str(), &end, 10);
+  if (errno != 0 || end != text.c_str() + text.size()) return false;
+  *out = static_cast<uint64_t>(parsed);
+  return true;
+}
+
+bool parse_double_value(std::string_view value, double* out) {
+  if (out == nullptr || value.empty()) return false;
+  const std::string text(value);
+  errno = 0;
+  char* end = nullptr;
+  const double parsed = std::strtod(text.c_str(), &end);
+  if (errno != 0 || end != text.c_str() + text.size()) return false;
+  *out = parsed;
+  return true;
+}
+
+}  // namespace
 
 // ---------------------------------------------------------------------------
 // Row parsing
@@ -161,10 +199,7 @@ PredicateEvaluator::Val PredicateEvaluator::extract_value(
       switch (expr.compare_type()) {
         case 0: {  // SIGNED_INT
           v.type = ValType::INT;
-          errno = 0;
-          char* end = nullptr;
-          v.i = std::strtoll(col.data(), &end, 10);
-          if (errno != 0 || end == col.data()) {
+          if (!parse_int_value(col, &v.i)) {
             // Conversion failed → fall back to string comparison
             v.type = ValType::STRING;
             v.s = col;
@@ -173,10 +208,7 @@ PredicateEvaluator::Val PredicateEvaluator::extract_value(
         }
         case 1: {  // UNSIGNED_INT
           v.type = ValType::UINT;
-          errno = 0;
-          char* end = nullptr;
-          v.u = std::strtoull(col.data(), &end, 10);
-          if (errno != 0 || end == col.data()) {
+          if (!parse_uint_value(col, &v.u)) {
             v.type = ValType::STRING;
             v.s = col;
           }
@@ -184,10 +216,7 @@ PredicateEvaluator::Val PredicateEvaluator::extract_value(
         }
         case 2: {  // DOUBLE
           v.type = ValType::DOUBLE;
-          errno = 0;
-          char* end = nullptr;
-          v.d = std::strtod(col.data(), &end);
-          if (errno != 0 || end == col.data()) {
+          if (!parse_double_value(col, &v.d)) {
             v.type = ValType::STRING;
             v.s = col;
           }

@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <charconv>
 #include <cstdint>
 #include <exception>
 #include <limits>
@@ -10,6 +11,7 @@
 #include <string_view>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -28,8 +30,36 @@ using LineairDB::Pax::PaxGroup;
 using LineairDB::Pax::PaxStore;
 
 constexpr uint64_t kNullRowRef = std::numeric_limits<uint64_t>::max();
+// Very large runtime filters are not selective enough to justify probing.
+constexpr size_t kMaxRuntimeFilterKeys = size_t{4} << 20;
+constexpr uint32_t kNoExternalFilterTable =
+    std::numeric_limits<uint32_t>::max();
 constexpr uint32_t kTaggedColumnShift = 16;
 constexpr uint32_t kTaggedColumnMask = (uint32_t{1} << kTaggedColumnShift) - 1;
+
+bool parse_int64_cell(std::string_view value, int64_t* parsed) {
+    if (parsed == nullptr || value.empty()) return false;
+    const char* first = value.data();
+    const char* last = value.data() + value.size();
+    const auto result = std::from_chars(first, last, *parsed);
+    return result.ec == std::errc() && result.ptr == last;
+}
+
+bool build_int64_key_set(const std::unordered_set<std::string>& source,
+                         std::unordered_set<int64_t>* target) {
+    if (target == nullptr) return false;
+    target->clear();
+    target->reserve(source.size());
+    for (const std::string& key : source) {
+        int64_t parsed = 0;
+        if (!parse_int64_cell(key, &parsed)) {
+            target->clear();
+            return false;
+        }
+        target->insert(parsed);
+    }
+    return true;
+}
 
 void set_failure(pb::TxExecuteQueryBlock::Response* response,
                  const std::string& message) {
@@ -170,6 +200,16 @@ class Executor {
              const pb::TxExecuteQueryBlock::Request& request)
         : db_(db), request_(request) {}
 
+    Executor(LineairDB::Database* db,
+             const pb::TxExecuteQueryBlock::Request& request,
+             const std::unordered_set<std::string>* external_keys,
+             uint32_t external_filter_table, uint32_t external_filter_column)
+        : db_(db),
+          request_(request),
+          external_keys_(external_keys),
+          external_filter_table_(external_filter_table),
+          external_filter_column_(external_filter_column) {}
+
     bool Run(pb::TxExecuteQueryBlock::Response* response) {
         if (!PrepareTables()) return false;
         if (!ValidateNodeOrder()) return false;
@@ -188,9 +228,6 @@ class Executor {
 
     bool PrepareTables() {
         if (db_ == nullptr) return fail("database is unavailable");
-        if (request_.tables_size() == 0) {
-            return fail("query block has no tables");
-        }
 
         stores_.assign(request_.tables_size(), nullptr);
         write_counter_snapshots_.assign(request_.tables_size(), {});
@@ -240,6 +277,11 @@ class Executor {
                     static_cast<uint32_t>(request_.tables_size())) {
                     return fail("scan table out of range");
                 }
+                if (node.scan().has_semi() &&
+                    node.scan().semi().source_node() >=
+                        static_cast<uint32_t>(node_idx)) {
+                    return fail("scan semi-filter source order");
+                }
                 continue;
             }
             if (node.has_join()) {
@@ -257,6 +299,17 @@ class Executor {
                 continue;
             }
             if (node.has_sub_block()) {
+                if (node.sub_block().has_semi()) {
+                    if (node.sub_block().semi().source_node() >=
+                        static_cast<uint32_t>(node_idx)) {
+                        return fail("sub-block semi-filter source order");
+                    }
+                    if (node.sub_block().target_table() >=
+                        static_cast<uint32_t>(
+                            node.sub_block().block().tables_size())) {
+                        return fail("sub-block semi-filter target table");
+                    }
+                }
                 continue;
             }
             if (node.has_aggregate()) {
@@ -307,7 +360,7 @@ class Executor {
     bool NullOf(uint32_t table_idx, uint64_t ref, uint32_t column) const {
         if (ref == kNullRowRef) return true;
         if (!IsVirtualTable(table_idx)) {
-            return IsNullColumn(ToRowRef(table_idx, ref), column);
+            return ValueOf(table_idx, ref, column).empty();
         }
 
         const VirtualTable* table = FindVirtualTable(table_idx);
@@ -333,16 +386,6 @@ class Executor {
         const int position = input.table_pos(table_idx);
         if (position < 0) return PaxRowRef{};
         return ToRowRef(table_idx, input.refs[position][row_idx]);
-    }
-
-    static bool IsNullColumn(const PaxRowRef& row, uint32_t column_idx) {
-        if (row.group == nullptr) return true;
-        const std::string_view null_flags = row.group->cell(0, row.slot);
-        const size_t byte_idx = column_idx / 8;
-        const uint32_t bit_idx = column_idx % 8;
-        return byte_idx < null_flags.size() &&
-               (static_cast<unsigned char>(null_flags[byte_idx]) &
-                (1u << bit_idx)) != 0;
     }
 
     static DecodedColumnRef DecodeAggregateColumnRef(
@@ -483,6 +526,46 @@ class Executor {
         }
     }
 
+    bool CollectSemiFilterKeys(
+        const pb::QueryBlockSemiFilter& semi,
+        std::unordered_set<std::string>* keys) {
+        if (keys == nullptr) return false;
+        if (semi.source_node() >= results_.size()) {
+            return fail("semi-filter source node out of range");
+        }
+
+        const NodeResult& source = results_[semi.source_node()];
+        const pb::QueryBlockColumnRef& column = semi.source_column();
+        const int position = source.table_pos(column.table_idx());
+        if (position < 0) return fail("semi-filter source table");
+
+        keys->clear();
+        keys->reserve(source.rows());
+        for (size_t row_idx = 0; row_idx < source.rows(); row_idx++) {
+            const uint64_t ref = source.refs[position][row_idx];
+            if (NullOf(column.table_idx(), ref, column.column())) continue;
+            std::string_view value = GroupColumnValue(column, ref);
+            keys->insert(std::string(value));
+        }
+        return true;
+    }
+
+    static bool CellMatchesKeySet(
+        const PaxGroup* group, uint32_t slot, uint32_t column,
+        const std::unordered_set<std::string>* keys,
+        const std::unordered_set<int64_t>* int_keys) {
+        if (keys == nullptr) return true;
+        if (group == nullptr) return false;
+        const std::string_view value = group->cell(column + 1, slot);
+        if (value.empty()) return false;
+        if (int_keys != nullptr) {
+            int64_t parsed = 0;
+            return parse_int64_cell(value, &parsed) &&
+                   int_keys->find(parsed) != int_keys->end();
+        }
+        return keys->find(std::string(value)) != keys->end();
+    }
+
     bool RunScan(const pb::QueryBlockScan& scan, NodeResult* output) {
         if (scan.table_idx() >= static_cast<uint32_t>(request_.tables_size())) {
             return fail("scan table out of range");
@@ -494,6 +577,36 @@ class Executor {
         output->tables = {scan.table_idx()};
         output->refs.assign(1, {});
         if (group_count == 0) return true;
+
+        std::unordered_set<std::string> semi_keys_storage;
+        const std::unordered_set<std::string>* semi_keys = nullptr;
+        if (scan.has_semi()) {
+            if (!CollectSemiFilterKeys(scan.semi(), &semi_keys_storage)) {
+                return false;
+            }
+            if (semi_keys_storage.size() <= kMaxRuntimeFilterKeys) {
+                semi_keys = &semi_keys_storage;
+            }
+        }
+
+        const std::unordered_set<std::string>* external_keys = nullptr;
+        if (external_keys_ != nullptr &&
+            external_filter_table_ == scan.table_idx() &&
+            external_keys_->size() <= kMaxRuntimeFilterKeys) {
+            external_keys = external_keys_;
+        }
+        std::unordered_set<int64_t> semi_int_keys_storage;
+        const std::unordered_set<int64_t>* semi_int_keys = nullptr;
+        if (semi_keys != nullptr &&
+            build_int64_key_set(*semi_keys, &semi_int_keys_storage)) {
+            semi_int_keys = &semi_int_keys_storage;
+        }
+        std::unordered_set<int64_t> external_int_keys_storage;
+        const std::unordered_set<int64_t>* external_int_keys = nullptr;
+        if (external_keys != nullptr &&
+            build_int64_key_set(*external_keys, &external_int_keys_storage)) {
+            external_int_keys = &external_int_keys_storage;
+        }
 
         const bool has_filter = scan.has_filter() && scan.filter().has_expr();
         const unsigned worker_count = static_cast<unsigned>(
@@ -528,6 +641,16 @@ class Executor {
                                 __builtin_ctzll(visible_bits));
                             visible_bits &= visible_bits - 1;
                             const uint32_t slot = base + bit;
+                            if (!CellMatchesKeySet(
+                                    group, slot, scan.semi().my_column(),
+                                    semi_keys, semi_int_keys)) {
+                                continue;
+                            }
+                            if (!CellMatchesKeySet(
+                                    group, slot, external_filter_column_,
+                                    external_keys, external_int_keys)) {
+                                continue;
+                            }
                             if (has_filter) {
                                 if (!evaluator.set_row_from_pax(
                                         *group, slot,
@@ -617,10 +740,24 @@ class Executor {
     bool RunSubBlock(const pb::QueryBlockSubBlock& sub_block,
                      NodeResult* output) {
         pb::TxExecuteQueryBlock::Response response;
-        ExecuteQueryBlock(db_, sub_block.block(), &response);
-        if (!response.ok()) {
-            return fail(response.error().empty() ? "sub-block failed"
-                                                 : response.error());
+        if (sub_block.has_semi()) {
+            std::unordered_set<std::string> keys;
+            if (!CollectSemiFilterKeys(sub_block.semi(), &keys)) return false;
+
+            Executor child(db_, sub_block.block(), &keys,
+                           sub_block.target_table(),
+                           sub_block.target_column());
+            if (!child.Run(&response)) {
+                return fail(child.error().empty() ? "sub-block failed"
+                                                  : child.error());
+            }
+            response.set_ok(true);
+        } else {
+            ExecuteQueryBlock(db_, sub_block.block(), &response);
+            if (!response.ok()) {
+                return fail(response.error().empty() ? "sub-block failed"
+                                                     : response.error());
+            }
         }
 
         VirtualTable table;
@@ -814,6 +951,9 @@ class Executor {
         key->clear();
         for (const JoinKeyColumn& column : key_columns) {
             const uint64_t ref = input.refs[column.ref_position][row_idx];
+            // SQL equijoins are null-rejecting. Real PAX cells encode NULL as
+            // an empty cell, so empty key parts never match, mirroring the
+            // scan semi-filter semantics.
             if (NullOf(column.table_idx, ref, column.column)) return false;
             AppendJoinKeyPart(key,
                               ValueOf(column.table_idx, ref, column.column));
@@ -833,7 +973,7 @@ class Executor {
             return fail("join key arity");
         }
         // Keyless INNER and LEFT joins are cross products. The proxy only emits
-        // them for one-row virtual inputs, where the SQL shape is explicit.
+        // them for small INNER inputs or one-row virtual LEFT inputs.
         if (join.build_keys_size() == 0 && !is_inner && !is_left) {
             return fail("join key arity");
         }
@@ -2040,6 +2180,9 @@ class Executor {
 
     LineairDB::Database* db_;
     const pb::TxExecuteQueryBlock::Request& request_;
+    const std::unordered_set<std::string>* external_keys_ = nullptr;
+    uint32_t external_filter_table_ = kNoExternalFilterTable;
+    uint32_t external_filter_column_ = 0;
     std::string error_;
     std::vector<PaxStore*> stores_;
     std::vector<std::vector<uint64_t>> write_counter_snapshots_;
