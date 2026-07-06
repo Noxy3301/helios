@@ -686,7 +686,9 @@ class Executor {
     bool RunJoin(const pb::QueryBlockJoin& join, NodeResult* output) {
         const bool is_inner = join.type() == pb::QueryBlockJoin::INNER;
         const bool is_left = join.type() == pb::QueryBlockJoin::LEFT;
-        if (!is_inner && !is_left) {
+        const bool is_semi = join.type() == pb::QueryBlockJoin::SEMI;
+        const bool is_anti = join.type() == pb::QueryBlockJoin::ANTI;
+        if (!is_inner && !is_left && !is_semi && !is_anti) {
             return fail("unsupported query-block join type");
         }
         if (join.build_keys_size() != join.probe_keys_size() ||
@@ -697,9 +699,9 @@ class Executor {
             return fail("join child out of range");
         }
 
-        // INNER joins are symmetric; hash the smaller child at runtime. LEFT
-        // joins keep the request's build/probe sides because probe rows must be
-        // preserved when the build side has no match.
+        // INNER joins are symmetric; hash the smaller child at runtime. LEFT,
+        // SEMI, and ANTI keep the request's build/probe sides because their
+        // output semantics are defined by the probe side.
         const bool swap =
             is_inner &&
             results_[join.build()].rows() > results_[join.probe()].rows();
@@ -729,7 +731,7 @@ class Executor {
             join.has_residual() && join.residual().has_predicate() &&
             join.residual().predicate().has_expr();
         if (has_residual) {
-            if (!is_inner) return fail("residual on non-inner join");
+            if (is_left) return fail("residual on LEFT join");
             if (join.residual().predicate().num_columns() !=
                 static_cast<uint32_t>(join.residual().columns_size())) {
                 return fail("join residual column count");
@@ -765,9 +767,12 @@ class Executor {
 
         // Keep only row references in the joined tuple; later operators read
         // column values directly from each table's PAX strips.
+        const bool keep_build = is_inner || is_left;
         output->tables = probe.tables;
-        output->tables.insert(output->tables.end(), build.tables.begin(),
-                              build.tables.end());
+        if (keep_build) {
+            output->tables.insert(output->tables.end(),
+                                  build.tables.begin(), build.tables.end());
+        }
         output->refs.assign(output->tables.size(), {});
 
         struct WorkerOutput {
@@ -833,7 +838,47 @@ class Executor {
                     const auto match = has_probe_key
                                            ? hash_table.find(probe_key)
                                            : hash_table.end();
+                    bool matched =
+                        match != hash_table.end() && !match->second.empty();
+                    if (matched && has_residual) {
+                        matched = false;
+                        for (const size_t build_idx : match->second) {
+                            if (residual_ok(probe_idx, build_idx)) {
+                                matched = true;
+                                break;
+                            }
+                        }
+                    }
+
                     if (match == hash_table.end()) {
+                        if (!is_left && !is_anti) continue;
+                        for (size_t column_idx = 0;
+                             column_idx < probe.tables.size(); ++column_idx) {
+                            local.refs[column_idx].push_back(
+                                probe.refs[column_idx][probe_idx]);
+                        }
+                        if (is_anti) continue;
+                        for (size_t column_idx = 0;
+                             column_idx < build.tables.size(); ++column_idx) {
+                            local.refs[probe.tables.size() + column_idx]
+                                .push_back(kNullRowRef);
+                        }
+                        continue;
+                    }
+
+                    if (is_semi || is_anti) {
+                        if (matched == is_semi) {
+                            for (size_t column_idx = 0;
+                                 column_idx < probe.tables.size();
+                                 ++column_idx) {
+                                local.refs[column_idx].push_back(
+                                    probe.refs[column_idx][probe_idx]);
+                            }
+                        }
+                        continue;
+                    }
+
+                    if (!matched) {
                         if (!is_left) continue;
                         for (size_t column_idx = 0;
                              column_idx < probe.tables.size(); ++column_idx) {
@@ -849,7 +894,10 @@ class Executor {
                     }
 
                     for (const size_t build_idx : match->second) {
-                        if (!residual_ok(probe_idx, build_idx)) continue;
+                        if (has_residual &&
+                            !residual_ok(probe_idx, build_idx)) {
+                            continue;
+                        }
                         for (size_t column_idx = 0;
                              column_idx < probe.tables.size(); ++column_idx) {
                             local.refs[column_idx].push_back(

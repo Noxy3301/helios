@@ -21,6 +21,7 @@
 #include "sql/item_sum.h"
 #include "sql/item_timefunc.h"
 #include "sql/mem_root_array.h"
+#include "sql/nested_join.h"
 #include "sql/query_result.h"
 #include "sql/sql_const.h"
 #include "sql/sql_class.h"
@@ -1245,19 +1246,62 @@ bool RecognizeQueryBlock(JOIN *join, ColumnarExecutionContext *ctx,
   if (!join->implicit_grouping && qb->group_list.elements == 0)
     LDB_COL_REJECT("no aggregation");
 
+  struct SemijoinNest {
+    Table_ref *nest = nullptr;
+    bool anti = false;
+    std::vector<int> inner_tables;
+    std::vector<Item *> residual_predicates;
+  };
+
+  std::vector<SemijoinNest> semijoin_nests;
+  for (Table_ref *nest : qb->sj_nests) {
+    semijoin_nests.push_back(
+        {nest, nest->is_aj_nest(), {}, {}});
+  }
+
+  auto semijoin_nest_of = [&](Table_ref *table_ref) -> int {
+    for (Table_ref *embedding = table_ref->embedding; embedding != nullptr;
+         embedding = embedding->embedding) {
+      for (size_t nest_idx = 0; nest_idx < semijoin_nests.size();
+           nest_idx++) {
+        if (embedding == semijoin_nests[nest_idx].nest) {
+          return static_cast<int>(nest_idx);
+        }
+      }
+
+      if (embedding->is_sj_nest() || embedding->is_aj_nest()) {
+        semijoin_nests.push_back(
+            {embedding, embedding->is_aj_nest(), {}, {}});
+        return static_cast<int>(semijoin_nests.size()) - 1;
+      }
+    }
+    return -1;
+  };
+
   // The request table order is the stable numbering used by scan, join,
   // grouping, and aggregate argument references.
   std::vector<QueryBlockTable> tables;
+  std::vector<int> main_tables;
+  std::vector<int> table_semijoin_nest;
   for (Table_ref *table_ref = qb->leaf_tables; table_ref != nullptr;
        table_ref = table_ref->next_leaf) {
     TABLE *table = table_ref->table;
     if (table == nullptr || table->s == nullptr) LDB_COL_REJECT("no TABLE");
-    if (table_ref->outer_join) LDB_COL_REJECT("outer join");
+    const int semijoin_nest = semijoin_nest_of(table_ref);
+    if (semijoin_nest < 0 && table_ref->outer_join)
+      LDB_COL_REJECT("outer join");
     if (!loaded_tables->contains(table->s->db.str, table->s->table_name.str))
       LDB_COL_REJECT("not SECONDARY_LOADed");
     tables.push_back({table, table_ref->map()});
+    table_semijoin_nest.push_back(semijoin_nest);
+    if (semijoin_nest < 0) {
+      main_tables.push_back(static_cast<int>(tables.size()) - 1);
+    } else {
+      semijoin_nests[semijoin_nest].inner_tables.push_back(
+          static_cast<int>(tables.size()) - 1);
+    }
   }
-  if (tables.empty()) LDB_COL_REJECT("no tables");
+  if (main_tables.empty()) LDB_COL_REJECT("no tables");
 
   struct JoinEdge {
     int left_table = -1;
@@ -1285,7 +1329,24 @@ bool RecognizeQueryBlock(JOIN *join, ColumnarExecutionContext *ctx,
       continue;
     }
     if (used == 0) {
-      table_filters[0].push_back(predicate);
+      table_filters[main_tables[0]].push_back(predicate);
+      continue;
+    }
+
+    int predicate_nest = -1;
+    bool spans_multiple_nests = false;
+    for (size_t table_idx = 0; table_idx < tables.size(); table_idx++) {
+      if ((used & tables[table_idx].map) == 0) continue;
+      const int table_nest = table_semijoin_nest[table_idx];
+      if (table_nest < 0) continue;
+      if (predicate_nest >= 0 && predicate_nest != table_nest) {
+        spans_multiple_nests = true;
+      }
+      predicate_nest = table_nest;
+    }
+    if (spans_multiple_nests) LDB_COL_REJECT("predicate spans semijoins");
+    if (predicate_nest >= 0) {
+      semijoin_nests[predicate_nest].residual_predicates.push_back(predicate);
       continue;
     }
 
@@ -1403,7 +1464,8 @@ bool RecognizeQueryBlock(JOIN *join, ColumnarExecutionContext *ctx,
     }
     join_edges.push_back({left_table, right_table, left_field, right_field});
   }
-  if (tables.size() > 1 && join_edges.empty()) LDB_COL_REJECT("cross join");
+  if (main_tables.size() > 1 && join_edges.empty())
+    LDB_COL_REJECT("cross join");
 
   // Scan every table once, attaching only predicates that read that table.
   auto &request = ctx->query_block_request;
@@ -1424,12 +1486,12 @@ bool RecognizeQueryBlock(JOIN *join, ColumnarExecutionContext *ctx,
 
   // Build a left-deep INNER join tree by walking FROM order and retrying tables
   // whose equality edges are not connected yet.
-  int current_node = scan_nodes[0];
+  int current_node = scan_nodes[main_tables[0]];
   std::vector<bool> joined(tables.size(), false);
-  joined[0] = true;
+  joined[main_tables[0]] = true;
   std::vector<int> pending_tables;
-  for (size_t table_idx = 1; table_idx < tables.size(); table_idx++) {
-    pending_tables.push_back(static_cast<int>(table_idx));
+  for (size_t table_idx = 1; table_idx < main_tables.size(); table_idx++) {
+    pending_tables.push_back(main_tables[table_idx]);
   }
   while (!pending_tables.empty()) {
     int table_idx = -1;
@@ -1525,6 +1587,105 @@ bool RecognizeQueryBlock(JOIN *join, ColumnarExecutionContext *ctx,
       column->set_table_idx(static_cast<uint32_t>(column_ref.first));
       column->set_column(column_ref.second->field_index());
     }
+    current_node = request.nodes_size() - 1;
+  }
+
+  for (SemijoinNest &semijoin : semijoin_nests) {
+    if (semijoin.inner_tables.size() != 1)
+      LDB_COL_REJECT("multi-table semijoin");
+    if (semijoin.nest == nullptr || semijoin.nest->nested_join == nullptr)
+      LDB_COL_REJECT("semijoin missing key metadata");
+
+    const int inner_table = semijoin.inner_tables[0];
+    auto *join_node = request.add_nodes()->mutable_join();
+    join_node->set_type(semijoin.anti
+                            ? LineairDB::Protocol::QueryBlockJoin::ANTI
+                            : LineairDB::Protocol::QueryBlockJoin::SEMI);
+    join_node->set_build(static_cast<uint32_t>(scan_nodes[inner_table]));
+    join_node->set_probe(static_cast<uint32_t>(current_node));
+
+    const auto &outer_exprs =
+        semijoin.nest->nested_join->sj_outer_exprs;
+    const auto &inner_exprs =
+        semijoin.nest->nested_join->sj_inner_exprs;
+    if (outer_exprs.size() != inner_exprs.size() || outer_exprs.empty()) {
+      LDB_COL_REJECT("semijoin key arity");
+    }
+
+    for (size_t key_idx = 0; key_idx < outer_exprs.size(); key_idx++) {
+      Item *outer_item = outer_exprs[key_idx]->real_item();
+      Item *inner_item = inner_exprs[key_idx]->real_item();
+      if (outer_item->type() != Item::FIELD_ITEM ||
+          inner_item->type() != Item::FIELD_ITEM) {
+        LDB_COL_REJECT("semijoin key shape");
+      }
+
+      const Field *raw_outer_field =
+          down_cast<Item_field *>(outer_item)->field;
+      const Field *raw_inner_field =
+          down_cast<Item_field *>(inner_item)->field;
+      const int outer_table = TableIndexOfField(raw_outer_field, tables);
+      const int inner_key_table = TableIndexOfField(raw_inner_field, tables);
+      if (outer_table < 0 || inner_key_table != inner_table) {
+        LDB_COL_REJECT("semijoin key tables");
+      }
+      if (raw_outer_field->result_type() != INT_RESULT ||
+          raw_inner_field->result_type() != INT_RESULT) {
+        LDB_COL_REJECT("semijoin key type");
+      }
+
+      const Field *outer_field =
+          ResolveBaseField(raw_outer_field, tables[outer_table].table);
+      const Field *inner_field =
+          ResolveBaseField(raw_inner_field, tables[inner_key_table].table);
+      if (outer_field == nullptr || inner_field == nullptr) {
+        LDB_COL_REJECT("semijoin key unresolvable");
+      }
+
+      auto *build_key = join_node->add_build_keys();
+      build_key->set_table_idx(static_cast<uint32_t>(inner_table));
+      build_key->set_column(inner_field->field_index());
+      auto *probe_key = join_node->add_probe_keys();
+      probe_key->set_table_idx(static_cast<uint32_t>(outer_table));
+      probe_key->set_column(outer_field->field_index());
+    }
+
+    if (!semijoin.residual_predicates.empty()) {
+      TupleColumnRegistry registry;
+      registry.table_of = [&](const Field *field) {
+        return TableIndexOfField(field, tables);
+      };
+      registry.resolve = [&](const Field *field, int table_idx) {
+        return ResolveBaseField(field, tables[table_idx].table);
+      };
+
+      auto *residual = join_node->mutable_residual();
+      auto *predicate = residual->mutable_predicate();
+      auto *expression = predicate->mutable_expr();
+      if (semijoin.residual_predicates.size() == 1) {
+        if (!SerializeTuplePredicate(semijoin.residual_predicates[0],
+                                     expression, &registry)) {
+          LDB_COL_REJECT("semijoin residual not pushable");
+        }
+      } else {
+        expression->set_op(LineairDB::Protocol::FilterExpr::OP_AND);
+        for (Item *residual_predicate : semijoin.residual_predicates) {
+          if (!SerializeTuplePredicate(residual_predicate,
+                                       expression->add_children(),
+                                       &registry)) {
+            LDB_COL_REJECT("semijoin residual not pushable");
+          }
+        }
+      }
+
+      predicate->set_num_columns(registry.columns.size());
+      for (const auto &column_ref : registry.columns) {
+        auto *column = residual->add_columns();
+        column->set_table_idx(static_cast<uint32_t>(column_ref.first));
+        column->set_column(column_ref.second->field_index());
+      }
+    }
+
     current_node = request.nodes_size() - 1;
   }
 
