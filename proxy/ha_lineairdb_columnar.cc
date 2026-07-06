@@ -1388,13 +1388,17 @@ bool BuildQueryBlockRequest(
   if (unit == nullptr || !unit->is_simple())
     LDB_COL_REJECT("not simple unit");
 
-  if (qb->is_distinct()) LDB_COL_REJECT("has DISTINCT");
   if (qb->has_windows()) LDB_COL_REJECT("has windows");
   if (qb->olap != UNSPECIFIED_OLAP_TYPE) LDB_COL_REJECT("has ROLLUP");
   const bool implicit_grouping =
       join != nullptr ? join->implicit_grouping : qb->is_implicitly_grouped();
+  const bool distinct_as_group =
+      qb->is_distinct() && !implicit_grouping && qb->group_list.elements == 0 &&
+      !qb->with_sum_func;
+  if (qb->is_distinct() && !distinct_as_group)
+    LDB_COL_REJECT("has DISTINCT");
   const bool plain_rows =
-      !implicit_grouping && qb->group_list.elements == 0;
+      !distinct_as_group && !implicit_grouping && qb->group_list.elements == 0;
 
   struct SemijoinNest {
     Table_ref *nest = nullptr;
@@ -3220,10 +3224,26 @@ bool BuildQueryBlockRequest(
   };
   std::vector<GroupField> group_fields;
   std::vector<Item *> group_items;
-  for (ORDER *group = qb->group_list.first; group != nullptr;
-       group = group->next) {
-    Item *group_item = (*group->item)->real_item();
-    group_items.push_back(group_item);
+  if (distinct_as_group) {
+    // SELECT DISTINCT without aggregates is group-by-all over the visible
+    // output expressions. Constants cannot split groups; EXISTS-style
+    // rewrites put literals in the select list.
+    for (Item *item : output_items) {
+      Item *real = item->real_item();
+      if (real->const_item()) continue;
+      group_items.push_back(real);
+    }
+    // Group-by-nothing fabricates one row from empty input, which is wrong
+    // for DISTINCT over constants only.
+    if (group_items.empty()) LDB_COL_REJECT("distinct outputs all constant");
+  } else {
+    for (ORDER *group = qb->group_list.first; group != nullptr;
+         group = group->next) {
+      group_items.push_back((*group->item)->real_item());
+    }
+  }
+
+  for (Item *group_item : group_items) {
     if (const Field *year_field = ExtractYearField(group_item)) {
       const int group_table = TableIndexOfField(year_field, tables);
       const Field *group_field =
