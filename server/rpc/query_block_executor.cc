@@ -873,7 +873,6 @@ class Executor {
             join.has_residual() && join.residual().has_predicate() &&
             join.residual().predicate().has_expr();
         if (has_residual) {
-            if (is_left) return fail("residual on LEFT join");
             if (join.residual().predicate().num_columns() !=
                 static_cast<uint32_t>(join.residual().columns_size())) {
                 return fail("join residual column count");
