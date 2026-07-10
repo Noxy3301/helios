@@ -2127,6 +2127,12 @@ class Executor {
             payload_.reserve(n);
             dead_.reserve(n);
         }
+        // A payload-only pre-size (reserving payload_/dead_ from the caller's
+        // row share while leaving the probe table geometric) was measured and
+        // rejected: at SF=5 the per-worker-per-partition reservations (~1024
+        // maps, mostly untouched) turned into mmap/munmap churn and lock
+        // contention that cost far more than the growth moves they saved.
+        // Geometric growth via reserve()/emplace() stays.
         iterator find(const K& k) {
             if (table_.empty()) return end();
             const uint64_t h = hv(k);
@@ -2973,9 +2979,17 @@ class Executor {
         uint64_t count = 0;
     };
 
-    // Second-stage re-aggregation (q13 shape): fold every group across all
-    // partitions into one shared map. Inherently single-threaded (a reshuffle
-    // to a different key), so it sweeps the disjoint partition maps in order.
+    // Second-stage re-aggregation (q13 shape): re-group the first-stage values
+    // and COUNT(*) per group. Stage-1 partitions hold disjoint groups, so each
+    // is folded into a radix fan-out of partial second maps keyed by
+    // part_of_str over the composite value key, and the second partitions
+    // merge and emit concurrently -- the same radix pattern as stage 1.
+    // Ordinal/source validation is hoisted out of the workers (it depends only
+    // on the plan) so the parallel folds and emits have no failure path. Each
+    // fold touches only its own stage-1 partition, and EnsureGroupKeys mutates
+    // only that partition's states, so the folds never race. Row order is
+    // partition-concatenation order -- the same contract as the stage-1 emit
+    // (ORDER BY-sorted or order-free downstream).
     template <typename MapT>
     bool BuildRegroupedRows(const pb::QueryBlockAggregate& aggregate,
                             int group_count, std::vector<MapT>& parts,
@@ -2983,78 +2997,158 @@ class Executor {
         const auto& regroup = aggregate.regroup();
         if (!regroup.count_star()) return fail("regroup must count");
 
-        std::unordered_map<std::string, RegroupState> regrouped;
-        std::string key;
-        std::vector<std::string> values;
-        std::vector<bool> nulls;
-        for (auto& part : parts) {
-          for (auto& entry : part) {
-            GroupState& state = entry.second;
-            key.clear();
-            values.clear();
-            nulls.clear();
-            values.reserve(regroup.group_value_ordinals_size());
-            nulls.reserve(regroup.group_value_ordinals_size());
-
-            for (const uint32_t ordinal : regroup.group_value_ordinals()) {
-                // Only a group ordinal reads the deferred key cells; an
-                // aggregate ordinal (q13 groups by the per-customer count)
-                // never materializes them.
-                if (ordinal < static_cast<uint32_t>(group_count)) {
-                    EnsureGroupKeys(aggregate, &state);
-                }
-                std::string value;
-                bool is_null = false;
-                if (!AggregateRowValue(aggregate, group_count, state, ordinal,
-                                       &value, &is_null)) {
-                    return false;
-                }
-                AppendRegroupKeyPart(&key, value, is_null);
-                values.push_back(std::move(value));
-                nulls.push_back(is_null);
+        // Plan-only validation hoisted out of the workers: a value ordinal
+        // past the group columns must name a real aggregate, and every output
+        // must be a group value in range or the COUNT(*) aggregate. state.keys
+        // always holds group_value_ordinals_size() entries, so the group-output
+        // bound below matches the per-row `ordinal >= state.keys.size()` check.
+        for (const uint32_t ordinal : regroup.group_value_ordinals()) {
+            const int aggregate_idx = static_cast<int>(ordinal) - group_count;
+            if (ordinal >= static_cast<uint32_t>(group_count) &&
+                (aggregate_idx < 0 ||
+                 aggregate_idx >= aggregate.aggs_size())) {
+                return fail("regroup value ordinal out of range");
             }
-
-            auto [it, inserted] = regrouped.emplace(key, RegroupState{});
-            RegroupState& regroup_state = it->second;
-            if (inserted) {
-                regroup_state.keys = values;
-                regroup_state.nulls = nulls;
+        }
+        for (const pb::QueryBlockOutputExpr& expression : request_.output()) {
+            switch (expression.source()) {
+                case pb::QueryBlockOutputExpr::GROUP:
+                    if (expression.ordinal() >=
+                        static_cast<uint32_t>(
+                            regroup.group_value_ordinals_size())) {
+                        return fail("regroup output ordinal out of range");
+                    }
+                    break;
+                case pb::QueryBlockOutputExpr::AGG:
+                    if (expression.ordinal() != 0) {
+                        return fail("regroup aggregate ordinal out of range");
+                    }
+                    break;
+                default:
+                    return fail("unsupported regroup output source");
             }
-            regroup_state.count += 1;
-          }
         }
 
-        output_rows->clear();
-        output_rows->reserve(regrouped.size());
-        for (const auto& entry : regrouped) {
-            const RegroupState& state = entry.second;
-            OutputRow row;
-            row.values.reserve(request_.output_size());
-            row.nulls.reserve(request_.output_size());
-            for (const pb::QueryBlockOutputExpr& expression :
-                 request_.output()) {
-                switch (expression.source()) {
-                    case pb::QueryBlockOutputExpr::GROUP:
-                        if (expression.ordinal() >= state.keys.size()) {
-                            return fail("regroup output ordinal out of range");
-                        }
+        using SecondMap = std::unordered_map<std::string, RegroupState>;
+        const unsigned np = static_cast<unsigned>(parts.size());
+        const unsigned np2 = np;
+        // [stage-1 partition][second partition] partial re-groupings.
+        std::vector<std::vector<SecondMap>> partials(
+            np, std::vector<SecondMap>(np2));
+
+        auto fold_part = [&](unsigned p) {
+            std::string key;
+            std::vector<std::string> values;
+            std::vector<bool> nulls;
+            for (auto& entry : parts[p]) {
+                GroupState& state = entry.second;
+                key.clear();
+                values.clear();
+                nulls.clear();
+                values.reserve(regroup.group_value_ordinals_size());
+                nulls.reserve(regroup.group_value_ordinals_size());
+                for (const uint32_t ordinal :
+                     regroup.group_value_ordinals()) {
+                    // Only a group ordinal reads the deferred key cells; an
+                    // aggregate ordinal (q13 groups by the per-customer count)
+                    // never materializes them.
+                    if (ordinal < static_cast<uint32_t>(group_count)) {
+                        EnsureGroupKeys(aggregate, &state);
+                    }
+                    std::string value;
+                    bool is_null = false;
+                    // Ordinals validated above, so this cannot fail.
+                    AggregateRowValue(aggregate, group_count, state, ordinal,
+                                      &value, &is_null);
+                    AppendRegroupKeyPart(&key, value, is_null);
+                    values.push_back(std::move(value));
+                    nulls.push_back(is_null);
+                }
+                SecondMap& dst =
+                    partials[p][np2 == 1 ? 0 : part_of_str(key, np2)];
+                auto [it, inserted] = dst.emplace(key, RegroupState{});
+                RegroupState& regroup_state = it->second;
+                if (inserted) {
+                    regroup_state.keys = std::move(values);
+                    regroup_state.nulls = std::move(nulls);
+                }
+                regroup_state.count += 1;
+            }
+        };
+
+        // Merge second partition s across the stage-1 partials, then emit its
+        // rows. Equal keys carry identical values/nulls (the key encodes
+        // them), so the first partial to insert a key fixes its output cells.
+        std::vector<std::vector<OutputRow>> partition_rows(np2);
+        auto emit_second = [&](unsigned s) {
+            SecondMap merged;
+            for (unsigned p = 0; p < np; ++p) {
+                if (merged.empty()) {
+                    merged = std::move(partials[p][s]);
+                    continue;
+                }
+                for (auto& kv : partials[p][s]) {
+                    auto [it, inserted] =
+                        merged.emplace(kv.first, RegroupState{});
+                    if (inserted) {
+                        it->second.keys = std::move(kv.second.keys);
+                        it->second.nulls = std::move(kv.second.nulls);
+                    }
+                    it->second.count += kv.second.count;
+                }
+            }
+            std::vector<OutputRow>& out = partition_rows[s];
+            out.reserve(merged.size());
+            for (const auto& entry : merged) {
+                const RegroupState& state = entry.second;
+                OutputRow row;
+                row.values.reserve(request_.output_size());
+                row.nulls.reserve(request_.output_size());
+                for (const pb::QueryBlockOutputExpr& expression :
+                     request_.output()) {
+                    if (expression.source() ==
+                        pb::QueryBlockOutputExpr::GROUP) {
                         row.values.push_back(
                             state.keys[expression.ordinal()]);
                         row.nulls.push_back(
                             state.nulls[expression.ordinal()]);
-                        break;
-                    case pb::QueryBlockOutputExpr::AGG:
-                        if (expression.ordinal() != 0) {
-                            return fail("regroup aggregate ordinal out of range");
-                        }
+                    } else {  // AGG (validated above)
                         row.values.push_back(std::to_string(state.count));
                         row.nulls.push_back(false);
-                        break;
-                    default:
-                        return fail("unsupported regroup output source");
+                    }
                 }
+                out.push_back(std::move(row));
             }
-            output_rows->push_back(std::move(row));
+        };
+
+        if (np <= 1) {
+            fold_part(0);
+            emit_second(0);
+        } else {
+            std::vector<std::thread> pool;
+            pool.reserve(np);
+            for (unsigned p = 0; p < np; ++p) {
+                if (parts[p].empty()) continue;  // no groups, no thread
+                pool.emplace_back([&, p] { fold_part(p); });
+            }
+            for (std::thread& worker : pool) worker.join();
+            pool.clear();
+            for (unsigned s = 0; s < np2; ++s) {
+                pool.emplace_back([&, s] { emit_second(s); });
+            }
+            for (std::thread& worker : pool) worker.join();
+        }
+
+        output_rows->clear();
+        size_t total = 0;
+        for (const std::vector<OutputRow>& pr : partition_rows) {
+            total += pr.size();
+        }
+        output_rows->reserve(total);
+        for (std::vector<OutputRow>& pr : partition_rows) {
+            for (OutputRow& row : pr) {
+                output_rows->push_back(std::move(row));
+            }
         }
         return true;
     }
