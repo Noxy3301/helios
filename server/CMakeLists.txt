@@ -11,10 +11,16 @@ find_package(PkgConfig REQUIRED)
 # LineairDB library path
 set(LINEAIRDB_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../third_party/LineairDB")
 
+# DuckDB library path (third_party submodule). The shared library is a release
+# build produced inside the submodule; scripts/build.sh builds it when absent.
+set(DUCKDB_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../third_party/duckdb")
+set(DUCKDB_LIB_DIR "${DUCKDB_ROOT}/build/release/src")
+
 # Include directories
 include_directories(${CMAKE_CURRENT_SOURCE_DIR})
 include_directories(${CMAKE_CURRENT_SOURCE_DIR}/../proto)
 include_directories(${LINEAIRDB_ROOT}/include)
+include_directories(${DUCKDB_ROOT}/src/include)
 
 # Generate protobuf files
 set(PROTO_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../proto")
@@ -98,10 +104,17 @@ target_link_libraries(lineairdb-server
     lineairdb
     ${Protobuf_LIBRARIES}
     pthread
+    ${DUCKDB_LIB_DIR}/libduckdb.so
 )
 
 # Additional include directories for generated files
 target_include_directories(lineairdb-server PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
+
+# Embed an rpath to the DuckDB shared library. start_server.sh runs the binary
+# directly, without LD_LIBRARY_PATH.
+set_target_properties(lineairdb-server PROPERTIES
+    BUILD_RPATH "${DUCKDB_LIB_DIR}"
+    INSTALL_RPATH "${DUCKDB_LIB_DIR}")
 
 # Compiler flags to suppress warnings
 target_compile_options(lineairdb-server PRIVATE -O3 -Wno-error -Wno-unused-parameter)

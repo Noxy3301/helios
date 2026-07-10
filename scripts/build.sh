@@ -33,6 +33,13 @@ mkdir -p build/data
 mkdir -p build/proxy
 mkdir -p build/server
 
+# Build DuckDB (third_party submodule) if its shared library is absent.
+# Artifacts stay inside the submodule and survive rebuilds of build/.
+if [ ! -f "third_party/duckdb/build/release/src/libduckdb.so" ]; then
+    echo "Building DuckDB (release)..."
+    (cd third_party/duckdb && GEN=ninja EXTRA_CMAKE_VARIABLES="-DBUILD_UNITTESTS=FALSE" make release)
+fi
+
 # Build configuration
 SERVER_BUILD_TYPE=${SERVER_BUILD_TYPE:-Release}
 MYSQL_BUILD_TYPE=${MYSQL_BUILD_TYPE:-Release}
