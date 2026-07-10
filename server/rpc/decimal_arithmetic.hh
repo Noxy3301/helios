@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstdint>
 #include <string>
 #include <string_view>
 
@@ -29,6 +30,16 @@ void add_decimal_value(DecimalValue& total, const DecimalValue& value);
  * @brief Parse an ASCII decimal string into a DecimalValue.
  */
 DecimalValue parse_decimal_value(std::string_view value);
+
+/**
+ * @brief Decode a numeric PAX cell to a DecimalValue by its declared kind.
+ *
+ * @details FK_INT32/FK_INT64/FK_DATE decode the native binary to an integer
+ * (scale 0); FK_DEC64 yields a scaled int with `scale`; FK_UNTYPED falls back
+ * to parse_decimal_value on the ASCII bytes. An empty cell is SQL NULL.
+ */
+DecimalValue decode_typed_decimal(std::string_view value, uint8_t kind,
+                                  int scale);
 
 /**
  * @brief Compare two decimal values after aligning their scales.

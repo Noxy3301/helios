@@ -1,6 +1,7 @@
 #include "lineairdb_rpc.hh"
 
 #include <cstdint>
+#include <cstdlib>
 #include <vector>
 
 #include "../../common/log.h"
@@ -46,10 +47,34 @@ void LineairDBRpc::handleDbCreateTable(const std::string& message,
             widths.push_back(width);
         }
 
+        // Typed cells: gate on HELIOS_PAX_TYPED (default on). When off, or when
+        // the proxy sent no/mismatched kinds, install an UNTYPED schema
+        // (byte-identical to the ASCII layout).
+        static const bool pax_typed_enabled = []() {
+            const char* v = std::getenv("HELIOS_PAX_TYPED");
+            return !(v != nullptr && v[0] == '0' && v[1] == '\0');
+        }();
+        std::vector<uint8_t> kinds;
+        std::vector<int8_t> scales;
+        if (pax_typed_enabled &&
+            request.pax_field_kind_size() ==
+                request.pax_field_max_bytes_size()) {
+            kinds.assign(request.pax_field_kind().begin(),
+                         request.pax_field_kind().end());
+            if (request.pax_field_scale_size() ==
+                request.pax_field_max_bytes_size()) {
+                scales.reserve(request.pax_field_scale_size());
+                for (const int32_t scale : request.pax_field_scale()) {
+                    scales.push_back(static_cast<int8_t>(scale));
+                }
+            }
+        }
+
         const bool installed = db_manager_->get_database()->InstallPaxSchema(
-            request.table_name(), widths);
-        LOG_INFO("PAX schema for '%s': %zu fields, %s",
+            request.table_name(), widths, kinds, scales);
+        LOG_INFO("PAX schema for '%s': %zu fields, typed=%s, %s",
                  request.table_name().c_str(), widths.size(),
+                 kinds.empty() ? "no" : "yes",
                  installed ? "installed" : "skipped");
     }
 

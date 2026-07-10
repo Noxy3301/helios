@@ -290,9 +290,19 @@ bool serialize_item(const Item *item,
           expr->set_negated(in_func->negated);
           break;
         }
-        case Item_func::LIKE_FUNC:
+        case Item_func::LIKE_FUNC: {
+          // LIKE over a non-string column hits the evaluator's "include row"
+          // fallback, which is fatal where filter results are final (the
+          // columnar executor): the row engine would match on the formatted
+          // text instead. Only string-result columns are pushable; temporal
+          // fields are STRING_RESULT and keep their canonical-text LIKE path.
+          const Item *larg = func->arguments()[0]->real_item();
+          if (larg->type() == Item::FIELD_ITEM &&
+              larg->result_type() != STRING_RESULT)
+            return false;
           expr->set_op(LineairDB::Protocol::FilterExpr::OP_LIKE);
           break;
+        }
         case Item_func::ISNULL_FUNC:
           expr->set_op(LineairDB::Protocol::FilterExpr::OP_IS_NULL);
           break;
@@ -416,8 +426,8 @@ static void collect_table_local_predicates(Item *it, table_map me,
  *
  * @return true when the OR has a safe table-local predicate.
  */
-static bool serialize_or_necessary_condition(
-    Item *or_item, table_map me, LineairDB::Protocol::FilterExpr *out) {
+bool serialize_or_necessary_condition(Item *or_item, table_map me,
+                                      LineairDB::Protocol::FilterExpr *out) {
   if (or_item == nullptr || or_item->type() != Item::COND_ITEM ||
       down_cast<Item_cond *>(or_item)->functype() != Item_func::COND_OR_FUNC)
     return false;

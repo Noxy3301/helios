@@ -3,13 +3,19 @@
 #include <algorithm>
 #include <atomic>
 #include <charconv>
+#include <cmath>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <exception>
+#include <functional>
 #include <limits>
 #include <set>
 #include <string>
 #include <string_view>
 #include <thread>
+#include <type_traits>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -18,9 +24,11 @@
 #include <lineairdb/database.h>
 #include <lineairdb/pax_store.h>
 
+#include "../../common/log.h"
 #include "decimal_arithmetic.hh"
 #include "predicate_evaluator.hh"
 #include "row_codec.hh"
+#include "zone_map.hh"
 
 namespace query_block {
 namespace {
@@ -193,6 +201,863 @@ struct DecodedColumnRef {
     uint32_t table_idx = 0;
     uint32_t column = 0;
 };
+
+// ---------------------------------------------------------------------------
+// Zone-map strip pruning.
+//
+// A prunable AND-conjunct of a scan filter is lowered into a PruneClause that
+// compares a strip's per-column [min,max] range (from zone_map) against a
+// constant (or another column's range). A strip is skipped only when a clause
+// proves NO row in it can match; when in doubt the strip is scanned. The
+// constant is converted into the column's int64 domain so the range test is
+// byte-path-equivalent (compare_type gates INT<->{0,1}, DECIMAL<->2, DATE<->3),
+// and DECIMAL bounds are widened by +/-1 scaled unit (conservative).
+// ---------------------------------------------------------------------------
+struct PruneClause {
+    int op;         // FilterExpr::OP_LT/LE/GT/GE/EQ/OP_BETWEEN
+    int zi_a;       // zone-snapshot index for column A
+    int zi_b = -1;  // zone-snapshot index for column B (col-vs-col), else -1
+    int64_t a = 0;  // const threshold(s) in the column's int64 domain
+    int64_t b = 0;
+};
+
+// compare_type must match the classified kind for the range test to mirror the
+// byte path (e.g. a string column with numeric-looking cells is compare_type 3
+// and must NOT be pruned with numeric ranges).
+inline bool zone_ct_ok(zone::ZKind k, uint32_t ct) {
+    switch (k) {
+        case zone::ZKind::INT: return ct == 0 || ct == 1;
+        case zone::ZKind::DECIMAL: return ct == 2;
+        case zone::ZKind::DATE: return ct == 3;
+        default: return false;
+    }
+}
+
+inline int zone_flip_op(int op) {
+    using FE = pb::FilterExpr;
+    switch (op) {
+        case FE::OP_LT: return FE::OP_GT;
+        case FE::OP_LE: return FE::OP_GE;
+        case FE::OP_GT: return FE::OP_LT;
+        case FE::OP_GE: return FE::OP_LE;
+        default: return op;  // EQ stays EQ
+    }
+}
+
+// Convert a constant into an INT/DATE column's exact int64 value. INT accepts
+// only exact-integer constants; DATE accepts a "YYYY-MM-DD" string constant.
+inline bool zone_const_int(const pb::FilterExpr& c, zone::ZKind kind,
+                           int64_t* out) {
+    using FE = pb::FilterExpr;
+    if (kind == zone::ZKind::INT) {
+        // Only exact-integer constants are byte-path-equivalent for an INT
+        // column. A CONST_DOUBLE makes the byte path promote the INT cell to
+        // double (losing precision above 2^53); a CONST_STRING makes the byte
+        // path compare as STRING, not numeric. Neither can be mirrored by an
+        // integer zone, so fall back to the byte path (no prune).
+        switch (c.op()) {
+            case FE::CONST_INT: *out = c.int_val(); return true;
+            case FE::CONST_UINT:
+                if (c.uint_val() > static_cast<uint64_t>(INT64_MAX))
+                    return false;
+                *out = static_cast<int64_t>(c.uint_val());
+                return true;
+            default: return false;
+        }
+    }
+    // DATE: the constant is the date's string form (temporal constants are
+    // serialized via their string value).
+    if (c.op() != FE::CONST_STRING) return false;
+    zone::ZKind ck;
+    int cs;
+    int64_t v;
+    if (!zone::ClassifyCell(std::string_view(c.string_val()), &ck, &cs, &v) ||
+        ck != zone::ZKind::DATE)
+        return false;
+    *out = v;
+    return true;
+}
+
+// Extract a DECIMAL constant as the double the byte path compares (strtod).
+inline bool zone_const_double(const pb::FilterExpr& c, double* d) {
+    using FE = pb::FilterExpr;
+    switch (c.op()) {
+        case FE::CONST_INT: *d = static_cast<double>(c.int_val()); return true;
+        case FE::CONST_UINT: *d = static_cast<double>(c.uint_val()); return true;
+        case FE::CONST_DOUBLE: *d = c.double_val(); return true;
+        default: return false;  // string on a decimal column -> byte path
+    }
+}
+
+// A DECIMAL constant is only convertible when c * 10^scale stays well inside
+// int64, so DecLower/DecUpper's llround and +/-1 widening cannot overflow or
+// diverge.
+inline bool zone_dec_ok(double c, int scale) {
+    double p = 1.0;
+    for (int i = 0; i < scale; ++i) p *= 10.0;
+    return std::isfinite(c) && std::fabs(c) * p < 9.0e18;
+}
+
+// Lower `column op const` bounds into PruneClause::a/b. For DECIMAL the exact
+// scaled-int cut points (DecLower/DecUpper) are widened outward by 1 unit so
+// pruning stays strictly conservative regardless of double rounding.
+inline bool zone_lower_cmp(int op, const pb::FilterExpr& cst, zone::ZKind kind,
+                           int scale, int64_t* a, int64_t* b) {
+    using FE = pb::FilterExpr;
+    if (kind == zone::ZKind::DECIMAL) {
+        double c;
+        if (!zone_const_double(cst, &c) || !zone_dec_ok(c, scale)) return false;
+        switch (op) {
+            case FE::OP_LT: *a = zone::DecLower(c, scale) + 1; return true;
+            case FE::OP_LE: *a = zone::DecUpper(c, scale) + 1; return true;
+            case FE::OP_GT: *a = zone::DecUpper(c, scale) - 1; return true;
+            case FE::OP_GE: *a = zone::DecLower(c, scale) - 1; return true;
+            case FE::OP_EQ:
+                *a = zone::DecLower(c, scale) - 1;
+                *b = zone::DecUpper(c, scale) + 1;
+                return true;
+            default: return false;
+        }
+    }
+    int64_t c;
+    if (!zone_const_int(cst, kind, &c)) return false;
+    *a = c;
+    if (op == FE::OP_EQ) *b = c;
+    return true;
+}
+
+// Lower `column BETWEEN lo AND hi` bounds into PruneClause::a/b.
+inline bool zone_lower_between(const pb::FilterExpr& lo,
+                               const pb::FilterExpr& hi, zone::ZKind kind,
+                               int scale, int64_t* a, int64_t* b) {
+    if (kind == zone::ZKind::DECIMAL) {
+        double dlo, dhi;
+        if (!zone_const_double(lo, &dlo) || !zone_const_double(hi, &dhi))
+            return false;
+        if (!zone_dec_ok(dlo, scale) || !zone_dec_ok(dhi, scale)) return false;
+        *a = zone::DecLower(dlo, scale) - 1;
+        *b = zone::DecUpper(dhi, scale) + 1;
+        return true;
+    }
+    return zone_const_int(lo, kind, a) && zone_const_int(hi, kind, b);
+}
+
+// Lower one comparison/BETWEEN conjunct. `getz` returns the zone-snapshot index
+// for a column (building it on demand) and its kind/scale, or -1 when the
+// column is not prunable. Returns true (and fills *pc) only for a fully
+// convertible, compare_type-compatible conjunct.
+using ZoneGetZ = std::function<int(uint32_t, zone::ZKind*, int*)>;
+inline bool zone_lower_conjunct(const pb::FilterExpr& e, const ZoneGetZ& getz,
+                                PruneClause* pc) {
+    using FE = pb::FilterExpr;
+    int op = e.op();
+    if (op == FE::OP_BETWEEN) {
+        if (e.negated() || e.children_size() != 3) return false;
+        const FE& col = e.children(0);
+        if (col.op() != FE::COLUMN_REF) return false;
+        zone::ZKind k;
+        int sc;
+        const int zi = getz(col.column_index(), &k, &sc);
+        if (zi < 0 || !zone_ct_ok(k, col.compare_type())) return false;
+        int64_t a, b;
+        if (!zone_lower_between(e.children(1), e.children(2), k, sc, &a, &b))
+            return false;
+        pc->op = FE::OP_BETWEEN;
+        pc->zi_a = zi;
+        pc->zi_b = -1;
+        pc->a = a;
+        pc->b = b;
+        return true;
+    }
+    if (op != FE::OP_LT && op != FE::OP_LE && op != FE::OP_GT &&
+        op != FE::OP_GE && op != FE::OP_EQ)
+        return false;
+    if (e.children_size() != 2) return false;
+    const FE* lhs = &e.children(0);
+    const FE* rhs = &e.children(1);
+    // Normalize `const op column` -> `column op' const`.
+    if (lhs->op() != FE::COLUMN_REF && rhs->op() == FE::COLUMN_REF) {
+        std::swap(lhs, rhs);
+        op = zone_flip_op(op);
+    }
+    if (lhs->op() != FE::COLUMN_REF) return false;
+    zone::ZKind ka;
+    int sca;
+    const int zia = getz(lhs->column_index(), &ka, &sca);
+    if (zia < 0 || !zone_ct_ok(ka, lhs->compare_type())) return false;
+
+    if (rhs->op() == FE::COLUMN_REF) {
+        // Column-vs-column: prunable only when both ranges live in the same
+        // int64 domain (same kind+scale). DECIMAL col-vs-col is left to the
+        // byte path (no widened boundary defined for a range-vs-range test).
+        zone::ZKind kb;
+        int scb;
+        const int zib = getz(rhs->column_index(), &kb, &scb);
+        if (zib < 0 || !zone_ct_ok(kb, rhs->compare_type())) return false;
+        if (ka != kb || sca != scb || ka == zone::ZKind::DECIMAL) return false;
+        pc->op = op;
+        pc->zi_a = zia;
+        pc->zi_b = zib;
+        return true;
+    }
+    int64_t a = 0, b = 0;
+    if (!zone_lower_cmp(op, *rhs, ka, sca, &a, &b)) return false;
+    pc->op = op;
+    pc->zi_a = zia;
+    pc->zi_b = -1;
+    pc->a = a;
+    pc->b = b;
+    return true;
+}
+
+// Lower the prunable conjuncts of a scan filter (a top-level AND, or a lone
+// comparison). Non-prunable conjuncts (OR/IN/LIKE/NE/IS NULL/negated BETWEEN,
+// or unconvertible ones) are simply omitted.
+inline void zone_lower_clauses(const pb::FilterExpr& expr, const ZoneGetZ& getz,
+                               std::vector<PruneClause>* out) {
+    using FE = pb::FilterExpr;
+    if (expr.op() == FE::OP_AND) {
+        for (const auto& ch : expr.children()) {
+            PruneClause pc;
+            if (zone_lower_conjunct(ch, getz, &pc)) out->push_back(pc);
+        }
+    } else {
+        PruneClause pc;
+        if (zone_lower_conjunct(expr, getz, &pc)) out->push_back(pc);
+    }
+}
+
+// True if strip `g` provably contains no row matching the filter: some clause's
+// range test is empty over the strip. Invalid (non-typed) strip zones never
+// prune. Reads immutable request-local snapshots -- safe from worker threads.
+inline bool zone_strip_pruned(
+    size_t g, const std::vector<PruneClause>& prune,
+    const std::vector<std::vector<zone::StripZone>>& zsnaps) {
+    using FE = pb::FilterExpr;
+    for (const PruneClause& c : prune) {
+        const zone::StripZone& za = zsnaps[c.zi_a][g];
+        if (za.state != zone::ZS_VALID) continue;
+        if (c.zi_b < 0) {
+            switch (c.op) {
+                case FE::OP_LT: if (za.zmin >= c.a) return true; break;
+                case FE::OP_LE: if (za.zmin > c.a) return true; break;
+                case FE::OP_GT: if (za.zmax <= c.a) return true; break;
+                case FE::OP_GE: if (za.zmax < c.a) return true; break;
+                case FE::OP_EQ:
+                    if (za.zmax < c.a || za.zmin > c.b) return true;
+                    break;
+                case FE::OP_BETWEEN:
+                    if (za.zmax < c.a || za.zmin > c.b) return true;
+                    break;
+            }
+        } else {
+            const zone::StripZone& zb = zsnaps[c.zi_b][g];
+            if (zb.state != zone::ZS_VALID) continue;
+            switch (c.op) {
+                case FE::OP_LT: if (za.zmin >= zb.zmax) return true; break;
+                case FE::OP_LE: if (za.zmin > zb.zmax) return true; break;
+                case FE::OP_GT: if (za.zmax <= zb.zmin) return true; break;
+                case FE::OP_GE: if (za.zmax < zb.zmin) return true; break;
+                case FE::OP_EQ:
+                    if (za.zmax < zb.zmin || zb.zmax < za.zmin) return true;
+                    break;
+            }
+        }
+    }
+    return false;
+}
+
+// ===========================================================================
+// Vectorized scan filter. The per-row scan path calls set_row_from_pax_cols
+// (assigns num_columns string-views + copies the null flags for EVERY visible
+// row of a wide table) and then walks the FilterExpr proto tree in
+// PredicateEvaluator::evaluate, boxing a Val per node; perf attributes 25-50%
+// of q1/q4/q6/q10/q19/q20/q21 to that chain. This compiles the pushed
+// FilterExpr ONCE per scan into a plain struct tree with constants pre-decoded,
+// then evaluates it column-at-a-time over a selection vector of slots (better
+// strip locality; no per-row set_row / proto access).
+//
+// Correctness contract: byte-identical to the per-row path for EVERY pushable
+// expression. Each compiled node is either (a) a specialized typed loop that
+// PROVABLY mirrors extract_value + compare + evaluate for its exact shape, or
+// (b) a per-slot FALLBACK that calls the reference PredicateEvaluator on the
+// SAME proto subtree -- so any unsupported shape stays identical by
+// construction. When in doubt the compiler emits a FALLBACK; specialization is
+// a pure optimization.
+//
+// The compare()/date-helper logic below is a line-for-line DUPLICATE of
+// PredicateEvaluator (predicate_evaluator.cc). It MUST stay in sync -- any
+// divergence in the promotion / NULL / DATE rules would break the contract.
+// ===========================================================================
+namespace vf {
+
+using LineairDB::Pax::TableSchema;
+namespace fk = LineairDB::Pax;  // FK_UNTYPED / FK_INT32 / ...
+
+enum class VT { NONE, INT, UINT, DOUBLE, STRING, DATE };
+// Mirror of PredicateEvaluator::Val (same fields; STRING/const views point at
+// the group cell arena or the persistent proto, both stable for the scan).
+struct VVal {
+    VT type = VT::NONE;
+    int64_t i = 0;
+    uint64_t u = 0;
+    double d = 0.0;
+    std::string_view s;
+};
+
+// --- DATE helpers: exact copies of PredicateEvaluator's. ---
+inline bool date_operand_to_int(const VVal& v, int64_t* out) {
+    if (v.type == VT::DATE || v.type == VT::INT) { *out = v.i; return true; }
+    if (v.type == VT::UINT) { *out = static_cast<int64_t>(v.u); return true; }
+    if (v.type == VT::STRING) {
+        const std::string_view s = v.s;
+        if (s.size() == 10 && s[4] == '-' && s[7] == '-') {
+            int64_t y = 0, m = 0, d = 0;
+            auto dig = [](const char* p, int n, int64_t* o) {
+                for (int i = 0; i < n; i++) {
+                    if (p[i] < '0' || p[i] > '9') return false;
+                    *o = *o * 10 + (p[i] - '0');
+                }
+                return true;
+            };
+            if (dig(s.data(), 4, &y) && dig(s.data() + 5, 2, &m) &&
+                dig(s.data() + 8, 2, &d)) {
+                *out = y * 10000 + m * 100 + d;
+                return true;
+            }
+        }
+        return false;
+    }
+    return false;
+}
+inline std::string_view date_operand_to_sv(const VVal& v, char* buf, size_t n) {
+    if (v.type == VT::DATE) {
+        const int32_t x = static_cast<int32_t>(v.i);
+        int len = std::snprintf(buf, n, "%04d-%02d-%02d", x / 10000,
+                                (x / 100) % 100, x % 100);
+        return std::string_view(buf, len > 0 ? static_cast<size_t>(len) : 0);
+    }
+    return v.s;
+}
+
+// --- compare(): exact copy of PredicateEvaluator::compare. -1/0/1 for </==/>,
+// -2 when either operand is NONE (NULL cmp X -> unknown). ---
+inline int compare(const VVal& lhs, const VVal& rhs) {
+    if (lhs.type == VT::NONE || rhs.type == VT::NONE) return -2;
+
+    if (lhs.type == VT::DATE || rhs.type == VT::DATE) {
+        int64_t li, ri;
+        if (date_operand_to_int(lhs, &li) && date_operand_to_int(rhs, &ri))
+            return (li < ri) ? -1 : (li > ri) ? 1 : 0;
+        char lb[16], rb[16];
+        const std::string_view ls = date_operand_to_sv(lhs, lb, sizeof(lb));
+        const std::string_view rs = date_operand_to_sv(rhs, rb, sizeof(rb));
+        const int c = ls.compare(rs);
+        return (c < 0) ? -1 : (c > 0) ? 1 : 0;
+    }
+
+    if (lhs.type == VT::STRING || rhs.type == VT::STRING) {
+        std::string_view ls = lhs.s, rs = rhs.s;
+        if (lhs.type == VT::STRING && rhs.type == VT::STRING) {
+            int r = ls.compare(rs);
+            return (r < 0) ? -1 : (r > 0) ? 1 : 0;
+        }
+        return ls.compare(rs) < 0 ? -1 : ls.compare(rs) > 0 ? 1 : 0;
+    }
+
+    double dl, dr;
+    if (lhs.type == VT::DOUBLE || rhs.type == VT::DOUBLE) {
+        dl = (lhs.type == VT::DOUBLE) ? lhs.d
+             : (lhs.type == VT::INT)  ? static_cast<double>(lhs.i)
+                                      : static_cast<double>(lhs.u);
+        dr = (rhs.type == VT::DOUBLE) ? rhs.d
+             : (rhs.type == VT::INT)  ? static_cast<double>(rhs.i)
+                                      : static_cast<double>(rhs.u);
+        return (dl < dr) ? -1 : (dl > dr) ? 1 : 0;
+    }
+
+    if (lhs.type == VT::INT && rhs.type == VT::INT)
+        return (lhs.i < rhs.i) ? -1 : (lhs.i > rhs.i) ? 1 : 0;
+    if (lhs.type == VT::UINT && rhs.type == VT::UINT)
+        return (lhs.u < rhs.u) ? -1 : (lhs.u > rhs.u) ? 1 : 0;
+    int64_t li = (lhs.type == VT::INT) ? lhs.i : static_cast<int64_t>(lhs.u);
+    int64_t ri = (rhs.type == VT::INT) ? rhs.i : static_cast<int64_t>(rhs.u);
+    return (li < ri) ? -1 : (li > ri) ? 1 : 0;
+}
+
+// ---------------------------------------------------------------------------
+// Compiled node tree. AND/OR/NOT recurse; the leaves are either a specialized
+// column op (col vs pre-decoded const[s]) or a FALLBACK subtree pointer.
+// ---------------------------------------------------------------------------
+struct Node {
+    enum K { AND, OR, NOT, CMP, BETWEEN, IN, IS_NULL, IS_NOT_NULL, FALLBACK };
+    K kind = FALLBACK;
+    // Specialized-column metadata (CMP/BETWEEN/IN/IS_NULL/IS_NOT_NULL):
+    uint32_t col = 0;                 // 0-based column ordinal; cell field = +1
+    uint8_t colkind = fk::FK_UNTYPED; // FK_* storage kind of the column
+    int scale = 0;                    // DEC64 scale
+    uint32_t ctype = 0;               // COLUMN_REF compare_type hint
+    int op = 0;                       // pb::FilterExpr::Op (CMP only)
+    bool negated = false;             // BETWEEN / IN
+    std::vector<VVal> consts;         // CMP:1 (rhs) BETWEEN:2 (lo,hi) IN:N
+    std::vector<Node> children;       // AND/OR/NOT
+    const pb::FilterExpr* fb = nullptr;  // FALLBACK subtree (stable proto ref)
+};
+
+inline size_t CountFallbackNodes(const Node& n) {
+    size_t count = (n.kind == Node::FALLBACK) ? 1 : 0;
+    for (const Node& child : n.children) count += CountFallbackNodes(child);
+    return count;
+}
+
+inline bool is_const(const pb::FilterExpr& e) {
+    switch (e.op()) {
+        case pb::FilterExpr::CONST_INT:
+        case pb::FilterExpr::CONST_UINT:
+        case pb::FilterExpr::CONST_DOUBLE:
+        case pb::FilterExpr::CONST_STRING:
+        case pb::FilterExpr::CONST_NULL:
+            return true;
+        default:
+            return false;
+    }
+}
+
+// Pre-decode a CONST_* node exactly as extract_value would (STRING view points
+// into the persistent proto's string_val, stable for the scan's lifetime).
+inline VVal const_val(const pb::FilterExpr& e) {
+    VVal v;
+    switch (e.op()) {
+        case pb::FilterExpr::CONST_INT:
+            v.type = VT::INT;
+            v.i = e.int_val();
+            break;
+        case pb::FilterExpr::CONST_UINT:
+            v.type = VT::UINT;
+            v.u = e.uint_val();
+            break;
+        case pb::FilterExpr::CONST_DOUBLE:
+            v.type = VT::DOUBLE;
+            v.d = e.double_val();
+            break;
+        case pb::FilterExpr::CONST_STRING:
+            v.type = VT::STRING;
+            v.s = std::string_view(
+                reinterpret_cast<const char*>(e.string_val().data()),
+                e.string_val().size());
+            break;
+        default:  // CONST_NULL
+            v.type = VT::NONE;
+            break;
+    }
+    return v;
+}
+
+// Can extract_value's COLUMN_REF decode for (kind, compare_type) be reproduced
+// by col_val() below? INT32/INT64 with compare_type==3 boxes a to_string(x)
+// STRING (rotating fmtbuf) -> fall back. UNTYPED numeric (ct 0/1/2) runs
+// strtoll/strtod on a non-terminated cell -> fall back. DATE/DEC64 ignore
+// compare_type. UNTYPED string compare (ct 3) is a plain byte compare.
+inline bool specializable(uint8_t kind, uint32_t ct) {
+    switch (kind) {
+        case fk::FK_INT32:
+        case fk::FK_INT64:
+            return ct != 3;
+        case fk::FK_DATE:
+        case fk::FK_DEC64:
+            return true;
+        case fk::FK_UNTYPED:
+            return ct == 3;
+        default:
+            return false;
+    }
+}
+
+// Decode one column cell into a VVal, mirroring extract_value(COLUMN_REF)
+// exactly for the specialized shapes. Empty-cell handling is kind-independent
+// (matches extract_value): null bit set -> NONE, else empty STRING.
+inline VVal col_val(const Node& n, const PaxGroup& grp, uint32_t slot) {
+    VVal v;
+    const std::string_view col = grp.cell(n.col + 1, slot);
+    if (col.empty()) {
+        const std::string_view nf = grp.cell(0, slot);
+        const uint32_t bp = n.col >> 3, bit = n.col & 7;
+        if (bp < nf.size() &&
+            (static_cast<uint8_t>(nf[bp]) & (1u << bit))) {
+            v.type = VT::NONE;  // NULL
+            return v;
+        }
+        v.type = VT::STRING;  // empty but not null
+        v.s = col;
+        return v;
+    }
+    switch (n.colkind) {
+        case fk::FK_DATE: {
+            int32_t x;
+            std::memcpy(&x, col.data(), 4);
+            v.type = VT::DATE;
+            v.i = x;
+            return v;
+        }
+        case fk::FK_INT32:
+        case fk::FK_INT64: {
+            int64_t x;
+            if (n.colkind == fk::FK_INT32) {
+                int32_t t;
+                std::memcpy(&t, col.data(), 4);
+                x = t;
+            } else {
+                std::memcpy(&x, col.data(), 8);
+            }
+            switch (n.ctype) {  // ct==3 is never compiled here (see specializable)
+                case 1:
+                    v.type = VT::UINT;
+                    v.u = static_cast<uint64_t>(x);
+                    return v;
+                case 2:
+                    v.type = VT::DOUBLE;
+                    v.d = static_cast<double>(x);
+                    return v;
+                default:  // SIGNED_INT
+                    v.type = VT::INT;
+                    v.i = x;
+                    return v;
+            }
+        }
+        case fk::FK_DEC64: {
+            int64_t m;
+            std::memcpy(&m, col.data(), 8);
+            double p = 1.0;  // same repeated-multiply loop as extract_value
+            for (int k = 0; k < n.scale; ++k) p *= 10.0;
+            v.type = VT::DOUBLE;
+            v.d = static_cast<double>(m) / p;
+            return v;
+        }
+        default:  // FK_UNTYPED, ct==3: raw-cell byte string compare
+            v.type = VT::STRING;
+            v.s = col;
+            return v;
+    }
+}
+
+// Per-call evaluation context (thread-local; the Node tree is read-only shared).
+struct EvalCtx {
+    const PaxGroup* grp;
+    PredicateEvaluator* ev;
+    uint32_t num_columns;
+    const std::vector<uint32_t>* filter_cols;
+    bool failed = false;
+};
+
+// Ascending sorted union of two ascending unique selections.
+inline std::vector<uint16_t> merge_union(const std::vector<uint16_t>& a,
+                                         const std::vector<uint16_t>& b) {
+    if (a.empty()) return b;
+    if (b.empty()) return a;
+    std::vector<uint16_t> out;
+    out.reserve(a.size() + b.size());
+    size_t i = 0, j = 0;
+    while (i < a.size() && j < b.size()) {
+        if (a[i] < b[j]) out.push_back(a[i++]);
+        else if (b[j] < a[i]) out.push_back(b[j++]);
+        else { out.push_back(a[i++]); ++j; }
+    }
+    while (i < a.size()) out.push_back(a[i++]);
+    while (j < b.size()) out.push_back(b[j++]);
+    return out;
+}
+
+// Evaluate a node over the ascending selection `sel`; return the ascending
+// subset that satisfies it (output order == input order, preserved exactly).
+std::vector<uint16_t> eval_node(const Node& n, std::vector<uint16_t> sel,
+                                EvalCtx& ctx) {
+    switch (n.kind) {
+        case Node::AND: {
+            // Fold sequentially over the shrinking selection (short-circuits
+            // the same rows as evaluate()'s per-row AND).
+            for (const Node& c : n.children) {
+                sel = eval_node(c, std::move(sel), ctx);
+                if (ctx.failed || sel.empty()) return sel;
+            }
+            return sel;
+        }
+        case Node::OR: {
+            // A row matches if ANY child matches -> union of per-child matches
+            // over the input selection (ascending preserved by merge_union).
+            std::vector<uint16_t> acc;
+            for (const Node& c : n.children) {
+                std::vector<uint16_t> m = eval_node(c, sel, ctx);
+                if (ctx.failed) return sel;
+                acc = merge_union(acc, m);
+            }
+            return acc;
+        }
+        case Node::NOT: {
+            // sel_out = sel_in \ eval(child, sel_in): mirrors !evaluate(child)
+            // exactly because the child evaluation is itself mirrored.
+            std::vector<uint16_t> m = eval_node(n.children[0], sel, ctx);
+            if (ctx.failed) return sel;
+            size_t w = 0, j = 0;
+            for (size_t r = 0; r < sel.size(); ++r) {
+                while (j < m.size() && m[j] < sel[r]) ++j;
+                if (j < m.size() && m[j] == sel[r]) { ++j; continue; }
+                sel[w++] = sel[r];
+            }
+            sel.resize(w);
+            return sel;
+        }
+        case Node::CMP: {
+            const VVal& rhs = n.consts[0];
+            size_t w = 0;
+            for (size_t r = 0; r < sel.size(); ++r) {
+                const VVal lhs = col_val(n, *ctx.grp, sel[r]);
+                const int cmp = compare(lhs, rhs);
+                bool keep;
+                if (cmp == -2) {
+                    keep = false;  // NULL -> unknown -> exclude
+                } else {
+                    switch (n.op) {
+                        case pb::FilterExpr::OP_EQ: keep = cmp == 0; break;
+                        case pb::FilterExpr::OP_NE: keep = cmp != 0; break;
+                        case pb::FilterExpr::OP_LT: keep = cmp < 0; break;
+                        case pb::FilterExpr::OP_LE: keep = cmp <= 0; break;
+                        case pb::FilterExpr::OP_GT: keep = cmp > 0; break;
+                        default: keep = cmp >= 0; break;  // OP_GE
+                    }
+                }
+                if (keep) sel[w++] = sel[r];
+            }
+            sel.resize(w);
+            return sel;
+        }
+        case Node::BETWEEN: {
+            size_t w = 0;
+            for (size_t r = 0; r < sel.size(); ++r) {
+                const VVal v = col_val(n, *ctx.grp, sel[r]);
+                const int cl = compare(v, n.consts[0]);
+                const int ch = compare(v, n.consts[1]);
+                bool keep;
+                if (cl == -2 || ch == -2) {
+                    keep = false;  // NULL -> false REGARDLESS of negated
+                } else {
+                    const bool res = (cl >= 0 && ch <= 0);
+                    keep = n.negated ? !res : res;
+                }
+                if (keep) sel[w++] = sel[r];
+            }
+            sel.resize(w);
+            return sel;
+        }
+        case Node::IN: {
+            size_t w = 0;
+            for (size_t r = 0; r < sel.size(); ++r) {
+                const VVal v = col_val(n, *ctx.grp, sel[r]);
+                bool keep;
+                if (v.type == VT::NONE) {
+                    keep = false;  // NULL IN (...) -> false (even if negated)
+                } else {
+                    bool matched = false;
+                    for (const VVal& it : n.consts)
+                        if (compare(v, it) == 0) { matched = true; break; }
+                    keep = matched ? !n.negated : n.negated;
+                }
+                if (keep) sel[w++] = sel[r];
+            }
+            sel.resize(w);
+            return sel;
+        }
+        case Node::IS_NULL:
+        case Node::IS_NOT_NULL: {
+            // NONE <=> empty cell AND null bit set (col < num_columns, so the
+            // idx-out-of-range NONE case never applies) -> kind-independent.
+            const bool want_null = (n.kind == Node::IS_NULL);
+            size_t w = 0;
+            for (size_t r = 0; r < sel.size(); ++r) {
+                const std::string_view c = ctx.grp->cell(n.col + 1, sel[r]);
+                bool isnull = false;
+                if (c.empty()) {
+                    const std::string_view nf = ctx.grp->cell(0, sel[r]);
+                    const uint32_t bp = n.col >> 3, bit = n.col & 7;
+                    isnull = bp < nf.size() &&
+                             (static_cast<uint8_t>(nf[bp]) & (1u << bit));
+                }
+                if (isnull == want_null) sel[w++] = sel[r];
+            }
+            sel.resize(w);
+            return sel;
+        }
+        case Node::FALLBACK: {
+            // Reference path on the exact proto subtree: byte-identical by
+            // construction. set_row false == schema mismatch -> fail the scan
+            // (preserves the per-row path's failed[] semantics).
+            size_t w = 0;
+            for (size_t r = 0; r < sel.size(); ++r) {
+                if (!ctx.ev->set_row_from_pax_cols(*ctx.grp, sel[r],
+                                                   ctx.num_columns,
+                                                   *ctx.filter_cols)) {
+                    ctx.failed = true;
+                    return sel;
+                }
+                if (ctx.ev->evaluate(*n.fb)) sel[w++] = sel[r];
+            }
+            sel.resize(w);
+            return sel;
+        }
+    }
+    return sel;
+}
+
+// Compile a FilterExpr subtree into a Node. `ncols` == filter num_columns
+// (columns >= ncols decode to NONE in extract_value, so they can't be a
+// specialized column -> FALLBACK reproduces that). Any shape not provably
+// mirrored becomes a FALLBACK over its own proto node.
+Node compile(const pb::FilterExpr& e, uint32_t ncols, const TableSchema& sch) {
+    using FE = pb::FilterExpr;
+    Node n;
+    auto fallback = [&]() {
+        Node f;
+        f.kind = Node::FALLBACK;
+        f.fb = &e;
+        return f;
+    };
+    switch (e.op()) {
+        case FE::OP_AND: {
+            if (e.children_size() < 1) return fallback();
+            n.kind = Node::AND;
+            for (const auto& c : e.children())
+                n.children.push_back(compile(c, ncols, sch));
+            return n;
+        }
+        case FE::OP_OR: {
+            if (e.children_size() < 1) return fallback();
+            n.kind = Node::OR;
+            for (const auto& c : e.children())
+                n.children.push_back(compile(c, ncols, sch));
+            return n;
+        }
+        case FE::OP_NOT: {
+            if (e.children_size() < 1) return fallback();
+            n.kind = Node::NOT;
+            n.children.push_back(compile(e.children(0), ncols, sch));
+            return n;
+        }
+        case FE::OP_EQ:
+        case FE::OP_NE:
+        case FE::OP_LT:
+        case FE::OP_LE:
+        case FE::OP_GT:
+        case FE::OP_GE: {
+            if (e.children_size() < 2) return fallback();
+            const auto& c0 = e.children(0);
+            if (c0.op() != FE::COLUMN_REF || !is_const(e.children(1)))
+                return fallback();
+            if (c0.column_index() >= ncols) return fallback();
+            const uint32_t col = c0.column_index();
+            const uint8_t kind = sch.kind_of(col + 1);
+            const uint32_t ct = c0.compare_type();
+            if (!specializable(kind, ct)) return fallback();
+            n.kind = Node::CMP;
+            n.col = col;
+            n.colkind = kind;
+            n.scale = sch.scale_of(col + 1);
+            n.ctype = ct;
+            n.op = e.op();
+            n.consts.push_back(const_val(e.children(1)));
+            return n;
+        }
+        case FE::OP_BETWEEN: {
+            if (e.children_size() < 3) return fallback();
+            const auto& c0 = e.children(0);
+            if (c0.op() != FE::COLUMN_REF || !is_const(e.children(1)) ||
+                !is_const(e.children(2)))
+                return fallback();
+            if (c0.column_index() >= ncols) return fallback();
+            const uint32_t col = c0.column_index();
+            const uint8_t kind = sch.kind_of(col + 1);
+            const uint32_t ct = c0.compare_type();
+            if (!specializable(kind, ct)) return fallback();
+            n.kind = Node::BETWEEN;
+            n.col = col;
+            n.colkind = kind;
+            n.scale = sch.scale_of(col + 1);
+            n.ctype = ct;
+            n.negated = e.negated();
+            n.consts.push_back(const_val(e.children(1)));
+            n.consts.push_back(const_val(e.children(2)));
+            return n;
+        }
+        case FE::OP_IN: {
+            if (e.children_size() < 2) return fallback();
+            const auto& c0 = e.children(0);
+            if (c0.op() != FE::COLUMN_REF) return fallback();
+            if (c0.column_index() >= ncols) return fallback();
+            for (int i = 1; i < e.children_size(); ++i)
+                if (!is_const(e.children(i))) return fallback();
+            const uint32_t col = c0.column_index();
+            const uint8_t kind = sch.kind_of(col + 1);
+            const uint32_t ct = c0.compare_type();
+            if (!specializable(kind, ct)) return fallback();
+            n.kind = Node::IN;
+            n.col = col;
+            n.colkind = kind;
+            n.scale = sch.scale_of(col + 1);
+            n.ctype = ct;
+            n.negated = e.negated();
+            for (int i = 1; i < e.children_size(); ++i)
+                n.consts.push_back(const_val(e.children(i)));
+            return n;
+        }
+        case FE::OP_IS_NULL:
+        case FE::OP_IS_NOT_NULL: {
+            if (e.children_size() < 1) return fallback();
+            const auto& c0 = e.children(0);
+            if (c0.op() != FE::COLUMN_REF) return fallback();
+            if (c0.column_index() >= ncols) return fallback();
+            n.kind = (e.op() == FE::OP_IS_NULL) ? Node::IS_NULL
+                                                : Node::IS_NOT_NULL;
+            n.col = c0.column_index();  // null check is kind-independent
+            return n;
+        }
+        default:
+            // OP_LIKE, column-on-RHS / column-op-column comparisons, arithmetic.
+            return fallback();
+    }
+}
+
+// A compiled filter program, built once per RunScan and shared read-only.
+struct Program {
+    Node root;
+    uint32_t num_columns = 0;
+
+    void build(const pb::FilterExpr& e, uint32_t ncols,
+               const TableSchema& sch) {
+        num_columns = ncols;
+        // A schema too small for the filter fails the per-row path
+        // (set_row_from_pax_cols returns false). Route the WHOLE expr to a
+        // single FALLBACK so run() reproduces that failure AND never lets a
+        // specialized loop read an out-of-range cell strip.
+        if (sch.field_count() < static_cast<size_t>(ncols) + 1) {
+            root.kind = Node::FALLBACK;
+            root.fb = &e;
+            return;
+        }
+        root = compile(e, ncols, sch);
+    }
+
+    // Filter `sel` (ascending slots). *failed set on a schema mismatch in a
+    // fallback node (mirrors the per-row path's failed[w] on set_row false).
+    std::vector<uint16_t> run(std::vector<uint16_t> sel, const PaxGroup& grp,
+                              PredicateEvaluator& ev,
+                              const std::vector<uint32_t>& fcols,
+                              bool* failed) const {
+        EvalCtx ctx{&grp, &ev, num_columns, &fcols, false};
+        sel = eval_node(root, std::move(sel), ctx);
+        *failed = ctx.failed;
+        return sel;
+    }
+};
+
+}  // namespace vf
 
 class Executor {
  public:
@@ -371,6 +1236,51 @@ class Executor {
         return table->nulls[ref][column];
     }
 
+    // ----- Typed cell access -------------------------------------------------
+    // A cell view from a real table is the raw stored bytes -- fixed-width LE
+    // binary for a typed column. These decode/render it by the column's
+    // declared kind (schema-driven, never byte-sniffed). Virtual (sub-block)
+    // tables always carry canonical ASCII, so they resolve to UNTYPED. `column`
+    // is 0-based; the PAX field index is column + 1.
+    uint8_t ColumnKind(uint32_t table_idx, uint32_t column) const {
+        if (IsVirtualTable(table_idx) || table_idx >= stores_.size() ||
+            stores_[table_idx] == nullptr) {
+            return LineairDB::Pax::FK_UNTYPED;
+        }
+        return stores_[table_idx]->schema().kind_of(
+            static_cast<size_t>(column) + 1);
+    }
+    int ColumnScale(uint32_t table_idx, uint32_t column) const {
+        if (IsVirtualTable(table_idx) || table_idx >= stores_.size() ||
+            stores_[table_idx] == nullptr) {
+            return 0;
+        }
+        return stores_[table_idx]->schema().scale_of(
+            static_cast<size_t>(column) + 1);
+    }
+    // Decode an int/int-key column (or an UNTYPED ASCII integer) to int64.
+    // False for SQL NULL, a non-integer UNTYPED cell, or a DATE/DEC64 column.
+    bool ReadI64(uint32_t table_idx, uint64_t ref, uint32_t column,
+                 int64_t* out) const {
+        return decode_typed_i64(ValueOf(table_idx, ref, column),
+                                ColumnKind(table_idx, column), out);
+    }
+    // Read any numeric column as an exact DecimalValue.
+    DecimalValue ReadDecimal(uint32_t table_idx, uint64_t ref,
+                             uint32_t column) const {
+        return decode_typed_decimal(ValueOf(table_idx, ref, column),
+                                    ColumnKind(table_idx, column),
+                                    ColumnScale(table_idx, column));
+    }
+    // Canonical val_str ASCII of a cell: verbatim for UNTYPED, formatted for a
+    // typed cell into `buf` (own storage per call, backing the returned view).
+    std::string_view KeyView(uint32_t table_idx, uint64_t ref, uint32_t column,
+                             std::string& buf) const {
+        return typed_key_view(ValueOf(table_idx, ref, column),
+                              ColumnKind(table_idx, column),
+                              ColumnScale(table_idx, column), buf);
+    }
+
     PaxRowRef ToRowRef(uint32_t table_idx, uint64_t ref) const {
         if (ref == kNullRowRef) return PaxRowRef{};
         if (table_idx >= stores_.size()) return PaxRowRef{};
@@ -428,18 +1338,56 @@ class Executor {
         return value;
     }
 
-    bool ReadAggregateColumn(const pb::FilterExpr& expression,
-                             const NodeResult& input, size_t row_idx,
-                             uint32_t default_table_idx,
-                             std::string_view* value) const {
+    // Canonical val_str ASCII of a group column (a typed cell formatted into
+    // `buf`), truncated to prefix_len. Used wherever the group column feeds a
+    // string key, group display, or output -- a raw typed cell must not appear
+    // there. `buf` backs the view for typed cells.
+    std::string_view GroupColumnCanonical(
+        const pb::QueryBlockColumnRef& column, uint64_t ref,
+        std::string& buf) const {
+        std::string_view value =
+            KeyView(column.table_idx(), ref, column.column(), buf);
+        if (column.prefix_len() > 0 && value.size() > column.prefix_len()) {
+            value = value.substr(0, column.prefix_len());
+        }
+        return value;
+    }
+
+    // Resolve a COLUMN_REF aggregate argument to its (table, column) and row
+    // ref. Returns false for a non-COLUMN_REF argument, a missing table, or SQL
+    // NULL.
+    bool ReadAggregateColumnRef(const pb::FilterExpr& expression,
+                                const NodeResult& input, size_t row_idx,
+                                uint32_t default_table_idx, uint32_t* table_idx,
+                                uint32_t* column, uint64_t* ref) const {
         if (expression.op() != pb::FilterExpr::COLUMN_REF) return false;
-        const DecodedColumnRef column = DecodeAggregateColumnRef(
+        const DecodedColumnRef decoded = DecodeAggregateColumnRef(
             default_table_idx, expression.column_index());
-        const int position = input.table_pos(column.table_idx);
+        const int position = input.table_pos(decoded.table_idx);
         if (position < 0) return false;
-        const uint64_t ref = input.refs[position][row_idx];
-        if (NullOf(column.table_idx, ref, column.column)) return false;
-        *value = ValueOf(column.table_idx, ref, column.column);
+        const uint64_t row_ref = input.refs[position][row_idx];
+        if (NullOf(decoded.table_idx, row_ref, decoded.column)) return false;
+        *table_idx = decoded.table_idx;
+        *column = decoded.column;
+        *ref = row_ref;
+        return true;
+    }
+
+    // Canonical val_str ASCII of a COLUMN_REF aggregate argument into `buf`
+    // (typed cells formatted). Returns false as ReadAggregateColumnRef does.
+    bool ReadAggregateCanonical(const pb::FilterExpr& expression,
+                                const NodeResult& input, size_t row_idx,
+                                uint32_t default_table_idx, std::string& buf,
+                                std::string_view* value) const {
+        uint32_t table_idx = 0;
+        uint32_t column = 0;
+        uint64_t ref = 0;
+        if (!ReadAggregateColumnRef(expression, input, row_idx,
+                                    default_table_idx, &table_idx, &column,
+                                    &ref)) {
+            return false;
+        }
+        *value = KeyView(table_idx, ref, column, buf);
         return true;
     }
 
@@ -449,14 +1397,19 @@ class Executor {
         using FE = pb::FilterExpr;
         switch (expression.op()) {
             case FE::COLUMN_REF: {
-                std::string_view value;
-                if (!ReadAggregateColumn(expression, input, row_idx,
-                                         default_table_idx, &value)) {
+                uint32_t table_idx = 0;
+                uint32_t column = 0;
+                uint64_t ref = 0;
+                if (!ReadAggregateColumnRef(expression, input, row_idx,
+                                            default_table_idx, &table_idx,
+                                            &column, &ref)) {
                     DecimalValue result;
                     result.is_null = true;
                     return result;
                 }
-                return parse_decimal_value(value);
+                // Schema-driven: a typed numeric cell decodes exactly rather
+                // than being re-parsed from its raw binary.
+                return ReadDecimal(table_idx, ref, column);
             }
             case FE::CONST_INT: {
                 DecimalValue result;
@@ -541,29 +1494,139 @@ class Executor {
 
         keys->clear();
         keys->reserve(source.rows());
+        std::string buf;  // typed source cell -> canonical ASCII
         for (size_t row_idx = 0; row_idx < source.rows(); row_idx++) {
             const uint64_t ref = source.refs[position][row_idx];
             if (NullOf(column.table_idx(), ref, column.column())) continue;
-            std::string_view value = GroupColumnValue(column, ref);
+            std::string_view value = GroupColumnCanonical(column, ref, buf);
             keys->insert(std::string(value));
         }
         return true;
     }
 
+    // Collects the semi-filter source's key set directly in its typed form:
+    // an int64 set when every source cell parses full-length (*is_int true),
+    // else an owned-string set. This is a single pass over the source; the
+    // first non-convertible cell (DECIMAL, empty/NULL, non-canonical) reverts
+    // to the string collection, which is byte-for-byte identical to the probe
+    // path. On success exactly one of *int_keys (when *is_int) or *string_keys
+    // is populated. Canonical INT cells are value<->byte 1:1, so the int set
+    // probes identically to the string set.
+    bool CollectSemiFilterKeysTyped(
+        const pb::QueryBlockSemiFilter& semi,
+        std::unordered_set<int64_t>* int_keys,
+        std::unordered_set<std::string>* string_keys, bool* is_int) {
+        if (int_keys == nullptr || string_keys == nullptr ||
+            is_int == nullptr) {
+            return false;
+        }
+        if (semi.source_node() >= results_.size()) {
+            return fail("semi-filter source node out of range");
+        }
+        const NodeResult& source = results_[semi.source_node()];
+        const pb::QueryBlockColumnRef& column = semi.source_column();
+        const int position = source.table_pos(column.table_idx());
+        if (position < 0) return fail("semi-filter source table");
+
+        int_keys->clear();
+        int_keys->reserve(source.rows());
+        *is_int = true;
+        const uint8_t kind = ColumnKind(column.table_idx(), column.column());
+        for (size_t row_idx = 0; row_idx < source.rows(); row_idx++) {
+            const uint64_t ref = source.refs[position][row_idx];
+            if (NullOf(column.table_idx(), ref, column.column())) continue;
+            const std::string_view value = GroupColumnValue(column, ref);
+            int64_t parsed = 0;
+            // Schema-driven decode: a typed int decodes exactly; a DATE/DEC64/
+            // non-integer cell returns false and reverts to the canonical-ASCII
+            // string set (build/probe symmetry).
+            if (!decode_typed_i64(value, kind, &parsed)) {
+                *is_int = false;
+                int_keys->clear();
+                LOG_INFO(
+                    "semi-filter key set fell back to string keys "
+                    "(non-integer cell in source column %u)",
+                    column.column());
+                return CollectSemiFilterKeys(semi, string_keys);
+            }
+            int_keys->insert(parsed);
+        }
+        return true;
+    }
+
+    // Dense exact bitmap over an int semi/external key set. TPC-H int keys
+    // (orderkey/partkey/suppkey) are dense in [min,max], so a bitset answers
+    // membership with one range check plus one bit test instead of a hash
+    // probe (sideways-information-passing, exact rather than Bloom). Only built
+    // past a density gate; see build().
+    struct KeyBitmap {
+        std::vector<uint64_t> bits;
+        int64_t base = 0;
+        bool ok = false;
+        void build(const std::unordered_set<int64_t>& s) {
+            if (s.empty()) return;
+            int64_t kmin = INT64_MAX, kmax = INT64_MIN;
+            for (int64_t v : s) {
+                kmin = std::min(kmin, v);
+                kmax = std::max(kmax, v);
+            }
+            const uint64_t span =
+                static_cast<uint64_t>(kmax) - static_cast<uint64_t>(kmin);
+            if (span >= (uint64_t{256} << 20)) return;  // > 2^28 bits
+            // Density gate: semi/external key sets are usually PRE-FILTERED and
+            // sparse (q18: 57 keys over a 6M span). A sparse bitmap trades an
+            // L1-resident hash set for L2-sized random bit probes and loses
+            // (measured q18 +100ms). Build only when fill >= 1/64 -- where the
+            // bitmap is at least as compact as the set and probe locality wins
+            // (and where the 4M-key probe cost otherwise bites at SF>=10).
+            if (span > s.size() * 64) return;
+            bits.assign((span + 64) / 64, 0);
+            base = kmin;
+            for (int64_t v : s) {
+                const uint64_t o = static_cast<uint64_t>(v) -
+                                   static_cast<uint64_t>(base);
+                bits[o >> 6] |= uint64_t{1} << (o & 63);
+            }
+            ok = true;
+        }
+        bool test(int64_t v) const {
+            const uint64_t o =
+                static_cast<uint64_t>(v) - static_cast<uint64_t>(base);
+            return o < bits.size() * 64 && ((bits[o >> 6] >> (o & 63)) & 1);
+        }
+    };
+
     static bool CellMatchesKeySet(
         const PaxGroup* group, uint32_t slot, uint32_t column,
         const std::unordered_set<std::string>* keys,
-        const std::unordered_set<int64_t>* int_keys) {
-        if (keys == nullptr) return true;
+        const std::unordered_set<int64_t>* int_keys, std::string* probe,
+        const KeyBitmap* int_bitmap = nullptr) {
+        if (keys == nullptr && int_keys == nullptr) return true;
         if (group == nullptr) return false;
-        const std::string_view value = group->cell(column + 1, slot);
+        const size_t field = static_cast<size_t>(column) + 1;
+        const std::string_view value = group->cell(field, slot);
         if (value.empty()) return false;
+        // Schema-driven: decode/format by the column's declared kind, never by
+        // sniffing the raw cell bytes.
+        const uint8_t kind = group->schema().kind_of(field);
         if (int_keys != nullptr) {
             int64_t parsed = 0;
-            return parse_int64_cell(value, &parsed) &&
-                   int_keys->find(parsed) != int_keys->end();
+            if (!decode_typed_i64(value, kind, &parsed)) return false;
+            if (int_bitmap != nullptr && int_bitmap->ok)
+                return int_bitmap->test(parsed);
+            return int_keys->find(parsed) != int_keys->end();
         }
-        return keys->find(std::string(value)) != keys->end();
+        // Reuse the caller's buffer: C++17 unordered_set has no heterogeneous
+        // lookup, so the canonical string key is rebuilt without a per-row
+        // allocation (a typed cell is formatted to match the ASCII key set).
+        if (kind == LineairDB::Pax::FK_UNTYPED) {
+            probe->assign(value.data(), value.size());
+        } else {
+            probe->clear();
+            format_typed_cell(kind, group->schema().scale_of(field), value,
+                              probe);
+        }
+        return keys->find(*probe) != keys->end();
     }
 
     bool RunScan(const pb::QueryBlockScan& scan, NodeResult* output) {
@@ -578,14 +1641,30 @@ class Executor {
         output->refs.assign(1, {});
         if (group_count == 0) return true;
 
+        // The plan-side semi keys are collected straight into their typed
+        // form: an int64 set when every source cell parses (semi_int), else an
+        // owned-string set. A single pass replaces the earlier build-string-
+        // then-reparse two-pass conversion.
         std::unordered_set<std::string> semi_keys_storage;
+        std::unordered_set<int64_t> semi_int_keys_storage;
         const std::unordered_set<std::string>* semi_keys = nullptr;
+        const std::unordered_set<int64_t>* semi_int_keys = nullptr;
         if (scan.has_semi()) {
-            if (!CollectSemiFilterKeys(scan.semi(), &semi_keys_storage)) {
+            bool semi_is_int = false;
+            if (!CollectSemiFilterKeysTyped(scan.semi(), &semi_int_keys_storage,
+                                            &semi_keys_storage, &semi_is_int)) {
                 return false;
             }
-            if (semi_keys_storage.size() <= kMaxRuntimeFilterKeys) {
-                semi_keys = &semi_keys_storage;
+            // A huge key set costs more to probe than it prunes; the counts
+            // match across representations (canonical INT is value<->byte 1:1).
+            const size_t key_count = semi_is_int ? semi_int_keys_storage.size()
+                                                 : semi_keys_storage.size();
+            if (key_count <= kMaxRuntimeFilterKeys) {
+                if (semi_is_int) {
+                    semi_int_keys = &semi_int_keys_storage;
+                } else {
+                    semi_keys = &semi_keys_storage;
+                }
             }
         }
 
@@ -595,12 +1674,6 @@ class Executor {
             external_keys_->size() <= kMaxRuntimeFilterKeys) {
             external_keys = external_keys_;
         }
-        std::unordered_set<int64_t> semi_int_keys_storage;
-        const std::unordered_set<int64_t>* semi_int_keys = nullptr;
-        if (semi_keys != nullptr &&
-            build_int64_key_set(*semi_keys, &semi_int_keys_storage)) {
-            semi_int_keys = &semi_int_keys_storage;
-        }
         std::unordered_set<int64_t> external_int_keys_storage;
         const std::unordered_set<int64_t>* external_int_keys = nullptr;
         if (external_keys != nullptr &&
@@ -608,7 +1681,79 @@ class Executor {
             external_int_keys = &external_int_keys_storage;
         }
 
+        // Density-gated dense bitmaps for the int key sets. Built once here
+        // (read-only during the parallel scan), so worker threads share them.
+        KeyBitmap semi_bitmap, external_bitmap;
+        if (semi_int_keys != nullptr) semi_bitmap.build(*semi_int_keys);
+        if (external_int_keys != nullptr)
+            external_bitmap.build(*external_int_keys);
+
         const bool has_filter = scan.has_filter() && scan.filter().has_expr();
+        // Fetch only the cells the filter references; a wide table's full-row
+        // load dominates otherwise cheap filtered scans.
+        std::vector<uint32_t> filter_cols;
+        if (has_filter) {
+            PredicateEvaluator::collect_columns(scan.filter().expr(),
+                                                &filter_cols);
+        }
+
+        // Lower prunable filter conjuncts into per-strip range tests over cached
+        // zone maps. Zone snapshots are request-local (immutable during the
+        // parallel scan below); a strip proven empty is skipped entirely.
+        std::vector<std::vector<zone::StripZone>> zsnaps;
+        std::vector<zone::ZKind> col_kind;
+        std::vector<int> col_scale;
+        std::unordered_map<uint32_t, int> col_zi;
+        std::vector<PruneClause> prune;
+        if (has_filter) {
+            ZoneGetZ getz = [&](uint32_t col, zone::ZKind* k, int* sc) -> int {
+                auto it = col_zi.find(col);
+                if (it != col_zi.end()) {
+                    if (col_kind[it->second] == zone::ZKind::UNTYPED) return -1;
+                    *k = col_kind[it->second];
+                    *sc = col_scale[it->second];
+                    return it->second;
+                }
+                const int idx = static_cast<int>(zsnaps.size());
+                std::vector<zone::StripZone> zs;
+                zone::ZKind kk;
+                int ss;
+                if (!zone::GetColumnZones(store, col, group_count, &zs, &kk,
+                                          &ss)) {
+                    zsnaps.emplace_back();  // placeholder (never indexed)
+                    col_kind.push_back(zone::ZKind::UNTYPED);
+                    col_scale.push_back(0);
+                    col_zi[col] = idx;
+                    return -1;
+                }
+                zsnaps.push_back(std::move(zs));
+                col_kind.push_back(kk);
+                col_scale.push_back(ss);
+                col_zi[col] = idx;
+                *k = kk;
+                *sc = ss;
+                return idx;
+            };
+            zone_lower_clauses(scan.filter().expr(), getz, &prune);
+        }
+
+        // Compile the pushed filter ONCE into a vectorized program shared
+        // read-only by the workers (a per-slot fallback covers any shape it
+        // cannot specialize, so this is always safe). store->schema() is the
+        // shape every group in this table shares.
+        vf::Program vprog;
+        if (has_filter) {
+            vprog.build(scan.filter().expr(), scan.filter().num_columns(),
+                        store->schema());
+            const size_t fallback_nodes = vf::CountFallbackNodes(vprog.root);
+            if (fallback_nodes > 0) {
+                LOG_INFO(
+                    "scan filter compiled with %zu fallback node(s) running "
+                    "the reference evaluator per slot",
+                    fallback_nodes);
+            }
+        }
+
         const unsigned worker_count = static_cast<unsigned>(
             std::min<size_t>(WorkerCount(), group_count));
         std::vector<std::vector<uint64_t>> local_refs(worker_count);
@@ -620,13 +1765,24 @@ class Executor {
             workers.emplace_back([&, worker_idx] {
                 PredicateEvaluator evaluator;
                 std::vector<uint64_t>& refs = local_refs[worker_idx];
+                std::string probe;  // reused key buffer: no per-row alloc
+                // Collect the visible + semi/external-passing slots of a strip
+                // into an ascending selection, then filter the selection
+                // column-at-a-time. Slots stay ascending within the strip, so
+                // the emitted refs keep the exact per-row-path order.
+                std::vector<uint16_t> sel;
+                sel.reserve(PaxGroup::kRows);
                 for (size_t group_idx = worker_idx; group_idx < group_count;
                      group_idx += worker_count) {
                     PaxGroup* group = store->group(group_idx);
                     if (group == nullptr) continue;
+                    if (!prune.empty() &&
+                        zone_strip_pruned(group_idx, prune, zsnaps))
+                        continue;  // strip provably has no matching row
+                    sel.clear();
 
-                    // Turn one 64-slot visibility word into row references for
-                    // the live slots that survive the optional predicate.
+                    // Turn one 64-slot visibility word into the ascending slots
+                    // that pass the semi/external key sets.
                     for (uint32_t base = 0; base < PaxGroup::kRows;
                          base += 64) {
                         uint64_t visible_bits = 0;
@@ -643,28 +1799,30 @@ class Executor {
                             const uint32_t slot = base + bit;
                             if (!CellMatchesKeySet(
                                     group, slot, scan.semi().my_column(),
-                                    semi_keys, semi_int_keys)) {
+                                    semi_keys, semi_int_keys, &probe,
+                                    &semi_bitmap)) {
                                 continue;
                             }
                             if (!CellMatchesKeySet(
                                     group, slot, external_filter_column_,
-                                    external_keys, external_int_keys)) {
+                                    external_keys, external_int_keys, &probe,
+                                    &external_bitmap)) {
                                 continue;
                             }
-                            if (has_filter) {
-                                if (!evaluator.set_row_from_pax(
-                                        *group, slot,
-                                        scan.filter().num_columns())) {
-                                    worker_failed[worker_idx] = 1;
-                                    return;
-                                }
-                                if (!evaluator.evaluate(scan.filter().expr())) {
-                                    continue;
-                                }
-                            }
-                            refs.push_back(group_idx * PaxGroup::kRows + slot);
+                            sel.push_back(static_cast<uint16_t>(slot));
                         }
                     }
+                    if (has_filter) {
+                        bool fail_flag = false;
+                        sel = vprog.run(std::move(sel), *group, evaluator,
+                                        filter_cols, &fail_flag);
+                        if (fail_flag) {  // schema mismatch (set_row false)
+                            worker_failed[worker_idx] = 1;
+                            return;
+                        }
+                    }
+                    for (uint16_t slot : sel)
+                        refs.push_back(group_idx * PaxGroup::kRows + slot);
                 }
             });
         }
@@ -831,6 +1989,9 @@ class Executor {
                 continue;
             }
 
+            // Raw stored bytes; the evaluator decodes by the per-column
+            // kind/scale (typed) or reads verbatim (UNTYPED), skipping the old
+            // format-to-ASCII/re-parse round trip.
             (*cells)[column_idx] =
                 ValueOf(column.table_idx, ref, column.column);
             (*nulls)[column_idx] =
@@ -849,6 +2010,18 @@ class Executor {
         std::vector<TupleFilterColumn> columns;
         if (!ResolveTupleFilterColumns(filter.filter(), input, &columns)) {
             return false;
+        }
+
+        // Per-column storage kind/scale so raw typed cells reach the evaluator
+        // directly (same decode as the PAX schema_ path); virtual/derived
+        // columns resolve to FK_UNTYPED and keep the canonical-ASCII path.
+        std::vector<uint8_t> filter_kinds(columns.size());
+        std::vector<int> filter_scales(columns.size());
+        for (size_t i = 0; i < columns.size(); ++i) {
+            filter_kinds[i] =
+                ColumnKind(columns[i].table_idx, columns[i].column);
+            filter_scales[i] =
+                ColumnScale(columns[i].table_idx, columns[i].column);
         }
 
         output->tables = input.tables;
@@ -881,7 +2054,9 @@ class Executor {
                         worker_failed[worker_idx] = 1;
                         return;
                     }
-                    evaluator.set_row_from_views(cells, nulls);
+                    evaluator.set_row_from_views_typed(cells, nulls,
+                                                       filter_kinds,
+                                                       filter_scales);
                     if (!evaluator.evaluate(filter.filter().predicate()
                                                 .expr())) {
                         continue;
@@ -949,14 +2124,17 @@ class Executor {
                       const std::vector<JoinKeyColumn>& key_columns,
                       size_t row_idx, std::string* key) const {
         key->clear();
+        std::string buf;  // typed key part -> canonical ASCII (copied on append)
         for (const JoinKeyColumn& column : key_columns) {
             const uint64_t ref = input.refs[column.ref_position][row_idx];
             // SQL equijoins are null-rejecting. Real PAX cells encode NULL as
             // an empty cell, so empty key parts never match, mirroring the
             // scan semi-filter semantics.
             if (NullOf(column.table_idx, ref, column.column)) return false;
-            AppendJoinKeyPart(key,
-                              ValueOf(column.table_idx, ref, column.column));
+            // Canonical ASCII so a typed int and an UNTYPED int with the same
+            // value share the same key bytes on both sides of the join.
+            AppendJoinKeyPart(
+                key, KeyView(column.table_idx, ref, column.column, buf));
         }
         return true;
     }
@@ -1035,15 +2213,159 @@ class Executor {
             }
         }
 
-        // Build a composite byte-key hash table from the chosen build child.
-        std::unordered_map<std::string, std::vector<size_t>> hash_table;
-        hash_table.reserve(build.rows());
-        std::string key;
-        for (size_t row_idx = 0; row_idx < build.rows(); ++row_idx) {
-            if (!BuildJoinKey(build, build_key_columns, row_idx, &key)) {
-                continue;
+        // Per-column storage kind/scale for the residual cells: raw typed cells
+        // go straight to the evaluator (same decode as the PAX schema_ path);
+        // virtual/derived columns resolve to FK_UNTYPED (canonical ASCII).
+        std::vector<uint8_t> residual_kinds(residual_columns.size());
+        std::vector<int> residual_scales(residual_columns.size());
+        for (size_t i = 0; i < residual_columns.size(); ++i) {
+            residual_kinds[i] = ColumnKind(residual_columns[i].table_idx,
+                                           residual_columns[i].column);
+            residual_scales[i] = ColumnScale(residual_columns[i].table_idx,
+                                             residual_columns[i].column);
+        }
+
+        // Witness summaries (Moerkotte/Neumann groupjoin lineage): a SEMI/ANTI
+        // join whose entire residual is one integer `a <> b` between a build
+        // column and a probe column only needs, per join key, whether ANY build
+        // row's value differs from the probe value -- which {count, min, max}
+        // answers exactly: exists differing value <=> count>0 &&
+        // !(min==max==probe_value). Replaces the per-key build-row vectors AND
+        // the per-candidate evaluator walk with one integer test (q21: l2/l3
+        // self-joins on l_orderkey with l_suppkey <> l1.l_suppkey). NULL
+        // semantics match the generic path: a NULL build value never satisfies
+        // `<>` (excluded from the summary), a NULL probe value matches nothing.
+        // Gated to typed INT columns compared as signed ints (compare_type==0),
+        // where the evaluator's compare is exactly int64 inequality; any other
+        // shape (byte keys, unsigned compare, extra conjuncts, UNTYPED columns)
+        // takes the existing path untouched.
+        struct Witness {
+            uint32_t count = 0;
+            int64_t min_value = 0;
+            int64_t max_value = 0;
+        };
+        std::unordered_map<int64_t, Witness> witness_summaries;
+        int witness_build = -1;  // residual_columns ordinal, build side
+        int witness_probe = -1;  // residual_columns ordinal, probe side
+        bool witness = false;
+        if ((is_semi || is_anti) && has_residual &&
+            build_key_columns.size() == 1) {
+            const pb::FilterExpr& expr = join.residual().predicate().expr();
+            if (expr.op() == pb::FilterExpr::OP_NE &&
+                expr.children_size() == 2 &&
+                expr.children(0).op() == pb::FilterExpr::COLUMN_REF &&
+                expr.children(1).op() == pb::FilterExpr::COLUMN_REF &&
+                expr.children(0).compare_type() == 0 &&
+                expr.children(1).compare_type() == 0) {
+                const uint32_t ordinal0 = expr.children(0).column_index();
+                const uint32_t ordinal1 = expr.children(1).column_index();
+                if (ordinal0 < residual_columns.size() &&
+                    ordinal1 < residual_columns.size() &&
+                    residual_columns[ordinal0].from_build !=
+                        residual_columns[ordinal1].from_build) {
+                    const bool zero_is_build =
+                        residual_columns[ordinal0].from_build;
+                    witness_build =
+                        static_cast<int>(zero_is_build ? ordinal0 : ordinal1);
+                    witness_probe =
+                        static_cast<int>(zero_is_build ? ordinal1 : ordinal0);
+                    const uint8_t build_kind = residual_kinds[witness_build];
+                    const uint8_t probe_kind = residual_kinds[witness_probe];
+                    witness = (build_kind == LineairDB::Pax::FK_INT32 ||
+                               build_kind == LineairDB::Pax::FK_INT64) &&
+                              (probe_kind == LineairDB::Pax::FK_INT32 ||
+                               probe_kind == LineairDB::Pax::FK_INT64);
+                }
             }
-            hash_table[key].push_back(row_idx);
+        }
+
+        // Build a hash table from the chosen build child. A single-column
+        // join keys the table by native int64 when every non-null build key
+        // parses full-length; one non-integer key reverts to the composite
+        // byte key. Canonical INT cells are value<->byte 1:1, so match
+        // semantics are unchanged (the proxy restricts these keys to
+        // INT/DECIMAL result types stored as canonical text).
+        std::unordered_map<std::string, std::vector<size_t>> hash_table;
+        std::unordered_map<int64_t, std::vector<size_t>> int_hash_table;
+        bool int_join = build_key_columns.size() == 1;
+        if (int_join && witness) {
+            // Fold the build side into {count, min, max} per join key instead
+            // of a per-key row vector. The join key is handled exactly as the
+            // generic int path (null-rejecting key, non-integer key falls back
+            // to byte keys); only the witness value differs.
+            const JoinKeyColumn& build_key = build_key_columns[0];
+            witness_summaries.reserve(build.rows());
+            const ResidualColumn& build_col = residual_columns[witness_build];
+            for (size_t row_idx = 0; row_idx < build.rows(); ++row_idx) {
+                const uint64_t ref =
+                    build.refs[build_key.ref_position][row_idx];
+                // Null-rejecting: skip null keys exactly as BuildJoinKey does.
+                if (NullOf(build_key.table_idx, ref, build_key.column)) {
+                    continue;
+                }
+                int64_t key = 0;
+                if (!ReadI64(build_key.table_idx, ref, build_key.column,
+                             &key)) {
+                    LOG_INFO(
+                        "witness summary fell back to byte keys "
+                        "(non-integer build key)");
+                    int_join = false;
+                    witness = false;
+                    witness_summaries.clear();
+                    break;
+                }
+                int64_t value = 0;
+                // A NULL build witness value never satisfies `<>`; leave it out
+                // of the summary (the witness column is a typed INT, so ReadI64
+                // returns false only for a NULL cell).
+                if (!ReadI64(build_col.table_idx,
+                             build.refs[build_col.ref_position][row_idx],
+                             build_col.column, &value)) {
+                    continue;
+                }
+                Witness& w = witness_summaries[key];
+                if (w.count == 0) {
+                    w.min_value = value;
+                    w.max_value = value;
+                } else {
+                    w.min_value = std::min(w.min_value, value);
+                    w.max_value = std::max(w.max_value, value);
+                }
+                ++w.count;
+            }
+        }
+        if (int_join && !witness) {
+            const JoinKeyColumn& build_key = build_key_columns[0];
+            int_hash_table.reserve(build.rows());
+            for (size_t row_idx = 0; row_idx < build.rows(); ++row_idx) {
+                const uint64_t ref =
+                    build.refs[build_key.ref_position][row_idx];
+                // Null-rejecting: skip null keys exactly as BuildJoinKey does.
+                if (NullOf(build_key.table_idx, ref, build_key.column)) {
+                    continue;
+                }
+                int64_t parsed = 0;
+                if (!ReadI64(build_key.table_idx, ref, build_key.column,
+                             &parsed)) {
+                    LOG_INFO(
+                        "int join hash table fell back to byte keys "
+                        "(non-integer build key)");
+                    int_join = false;
+                    int_hash_table.clear();
+                    break;
+                }
+                int_hash_table[parsed].push_back(row_idx);
+            }
+        }
+        if (!int_join) {
+            hash_table.reserve(build.rows());
+            std::string key;
+            for (size_t row_idx = 0; row_idx < build.rows(); ++row_idx) {
+                if (!BuildJoinKey(build, build_key_columns, row_idx, &key)) {
+                    continue;
+                }
+                hash_table[key].push_back(row_idx);
+            }
         }
 
         // Keep only row references in the joined tuple; later operators read
@@ -1098,13 +2420,17 @@ class Executor {
                             continue;
                         }
 
+                        // Raw stored bytes; the evaluator decodes by the
+                        // per-column kind/scale, skipping the format/re-parse
+                        // round trip.
                         residual_cells[column_idx] =
                             ValueOf(column.table_idx, ref, column.column);
                         residual_nulls[column_idx] =
                             NullOf(column.table_idx, ref, column.column);
                     }
-                    residual_evaluator.set_row_from_views(residual_cells,
-                                                          residual_nulls);
+                    residual_evaluator.set_row_from_views_typed(
+                        residual_cells, residual_nulls, residual_kinds,
+                        residual_scales);
                     return residual_evaluator.evaluate(
                         join.residual().predicate().expr());
                 };
@@ -1112,16 +2438,79 @@ class Executor {
                 const size_t end =
                     probe_rows * (worker_idx + 1) / worker_count;
                 for (size_t probe_idx = begin; probe_idx < end; ++probe_idx) {
-                    const bool has_probe_key = BuildJoinKey(
-                        probe, probe_key_columns, probe_idx, &probe_key);
-                    const auto match = has_probe_key
-                                           ? hash_table.find(probe_key)
-                                           : hash_table.end();
+                    if (witness) {
+                        // Summary probe: one map find plus one integer test
+                        // replaces the candidate walk (proof at the Witness
+                        // declaration). Join key and probe witness value are
+                        // read exactly as the generic path; emit like the
+                        // generic SEMI/ANTI branch (matched == is_semi).
+                        bool matched = false;
+                        const JoinKeyColumn& probe_key_column =
+                            probe_key_columns[0];
+                        const uint64_t ref =
+                            probe.refs[probe_key_column.ref_position]
+                                      [probe_idx];
+                        int64_t key = 0;
+                        if (!NullOf(probe_key_column.table_idx, ref,
+                                    probe_key_column.column) &&
+                            ReadI64(probe_key_column.table_idx, ref,
+                                    probe_key_column.column, &key)) {
+                            const auto it = witness_summaries.find(key);
+                            if (it != witness_summaries.end() &&
+                                it->second.count > 0) {
+                                const ResidualColumn& probe_col =
+                                    residual_columns[witness_probe];
+                                int64_t value = 0;
+                                if (ReadI64(probe_col.table_idx,
+                                            probe.refs[probe_col.ref_position]
+                                                      [probe_idx],
+                                            probe_col.column, &value)) {
+                                    matched =
+                                        !(it->second.min_value == value &&
+                                          it->second.max_value == value);
+                                }
+                            }
+                        }
+                        if (matched == is_semi) {
+                            for (size_t column_idx = 0;
+                                 column_idx < probe.tables.size();
+                                 ++column_idx) {
+                                local.refs[column_idx].push_back(
+                                    probe.refs[column_idx][probe_idx]);
+                            }
+                        }
+                        continue;
+                    }
+                    // Probe the matching table; int64 lookup when the build
+                    // side switched to native keys, else the byte key. A null
+                    // or non-integer probe cell misses, mirroring the byte
+                    // path for canonical INT columns.
+                    const std::vector<size_t>* match_rows = nullptr;
+                    if (int_join) {
+                        const JoinKeyColumn& probe_key_column =
+                            probe_key_columns[0];
+                        const uint64_t ref =
+                            probe.refs[probe_key_column.ref_position][probe_idx];
+                        int64_t parsed = 0;
+                        if (!NullOf(probe_key_column.table_idx, ref,
+                                    probe_key_column.column) &&
+                            ReadI64(probe_key_column.table_idx, ref,
+                                    probe_key_column.column, &parsed)) {
+                            const auto it = int_hash_table.find(parsed);
+                            if (it != int_hash_table.end()) {
+                                match_rows = &it->second;
+                            }
+                        }
+                    } else if (BuildJoinKey(probe, probe_key_columns, probe_idx,
+                                            &probe_key)) {
+                        const auto it = hash_table.find(probe_key);
+                        if (it != hash_table.end()) match_rows = &it->second;
+                    }
                     bool matched =
-                        match != hash_table.end() && !match->second.empty();
+                        match_rows != nullptr && !match_rows->empty();
                     if (matched && has_residual) {
                         matched = false;
-                        for (const size_t build_idx : match->second) {
+                        for (const size_t build_idx : *match_rows) {
                             if (residual_ok(probe_idx, build_idx)) {
                                 matched = true;
                                 break;
@@ -1129,7 +2518,7 @@ class Executor {
                         }
                     }
 
-                    if (match == hash_table.end()) {
+                    if (match_rows == nullptr) {
                         if (!is_left && !is_anti) continue;
                         for (size_t column_idx = 0;
                              column_idx < probe.tables.size(); ++column_idx) {
@@ -1172,7 +2561,7 @@ class Executor {
                         continue;
                     }
 
-                    for (const size_t build_idx : match->second) {
+                    for (const size_t build_idx : *match_rows) {
                         if (has_residual &&
                             !residual_ok(probe_idx, build_idx)) {
                             continue;
@@ -1218,13 +2607,28 @@ class Executor {
         return true;
     }
 
+    // One contiguous slot per aggregate holds every per-aggregate
+    // accumulator field, improving locality on group find/accumulate.
+    struct AggSlot {
+        uint64_t count = 0;
+        DecimalValue decimal{};    // SUM/AVG accumulator or MIN/MAX (numeric)
+        std::string string_value;  // MIN/MAX (binary string)
+        bool has_value = false;    // MIN/MAX has seen a value
+        std::set<std::string> distinct_values;  // COUNT(DISTINCT) value set
+    };
     struct GroupState {
         std::vector<std::string> keys;
-        std::vector<uint64_t> counts;
-        std::vector<DecimalValue> decimals;
-        std::vector<std::string> strings;
-        std::vector<bool> has_value;
-        std::vector<std::set<std::string>> distinct_values;
+        std::vector<AggSlot> aggregates;
+        // The typed group-key fast paths defer key formatting to emit: instead
+        // of building `keys` at accumulate time they stash the representative
+        // row ref per group column here and leave key_done false, so a group
+        // discarded by HAVING before any key is read never pays the ASCII
+        // format. EnsureGroupKeys reproduces the exact canonical bytes from the
+        // stored cell (not a to_string(int64) round-trip), keeping non-canonical
+        // spellings byte-identical. The string path fills `keys` eagerly, so
+        // key_done stays true there and the deferral is a no-op.
+        uint64_t key_ref[2] = {kNullRowRef, kNullRowRef};
+        bool key_done = true;
     };
 
     struct OutputRow {
@@ -1232,7 +2636,189 @@ class Executor {
         std::vector<bool> nulls;
     };
 
+    // String group keys stay in a node-based map: the keys are variable length
+    // and the length-prefixed byte key is already allocated per group.
     using GroupMap = std::unordered_map<std::string, GroupState>;
+    // Two INT group columns packed into a POD 128-bit key.
+    struct Int2Key {
+        int64_t a = 0;
+        int64_t b = 0;
+        bool operator==(const Int2Key& other) const {
+            return a == other.a && b == other.b;
+        }
+    };
+
+    // Flat open-addressing group map for POD keys. Layout follows the DuckDB
+    // GroupedAggregateHashTable shape: a power-of-2 probe table of 16-byte
+    // {hash, payload index} entries plus a dense payload vector of
+    // (key, GroupState). Compared to std::unordered_map this removes the
+    // per-group node allocation (q18 inserts ~1.5M groups per execution), makes
+    // a probe touch one cache line of entries where the stored hash rejects
+    // almost every non-match before the payload is read, and turns the
+    // HAVING/emit scans into dense sequential walks. The interface is the
+    // subset of unordered_map the aggregation templates use: find, emplace,
+    // erase (tombstone), begin/end iteration, empty/size, reserve, and move
+    // assignment. erase() only tombstones the payload slot; probe chains stay
+    // intact because the only eraser is HAVING, which runs after every insert.
+    // Not thread-safe: each radix partition owns one instance.
+    template <typename K, typename HashF>
+    struct FlatGroupMap {
+        using key_type = K;
+        using value_type = std::pair<K, GroupState>;
+
+        std::vector<value_type> payload_;
+        std::vector<uint8_t> dead_;  // parallel to payload_
+        struct Ent {
+            uint64_t h;    // 0 = empty (stored hashes are forced odd)
+            uint32_t idx;  // payload index
+        };
+        std::vector<Ent> table_;
+        size_t mask_ = 0;
+        size_t dead_n_ = 0;
+
+        FlatGroupMap() = default;
+        // Explicit moves: the defaults would leave the source's mask_/dead_n_
+        // scalars behind, so a moved-from map (MergeGroups dst = move(src))
+        // would report empty()==false over an empty payload.
+        FlatGroupMap(FlatGroupMap&& o) noexcept
+            : payload_(std::move(o.payload_)),
+              dead_(std::move(o.dead_)),
+              table_(std::move(o.table_)),
+              mask_(o.mask_),
+              dead_n_(o.dead_n_) {
+            o.mask_ = 0;
+            o.dead_n_ = 0;
+        }
+        FlatGroupMap& operator=(FlatGroupMap&& o) noexcept {
+            payload_ = std::move(o.payload_);
+            dead_ = std::move(o.dead_);
+            table_ = std::move(o.table_);
+            mask_ = o.mask_;
+            dead_n_ = o.dead_n_;
+            o.mask_ = 0;
+            o.dead_n_ = 0;
+            return *this;
+        }
+
+        struct iterator {
+            FlatGroupMap* m;
+            size_t i;
+            void skip() {
+                while (i < m->payload_.size() && m->dead_[i]) ++i;
+            }
+            iterator& operator++() {
+                ++i;
+                skip();
+                return *this;
+            }
+            value_type& operator*() const { return m->payload_[i]; }
+            value_type* operator->() const { return &m->payload_[i]; }
+            bool operator==(const iterator& o) const { return i == o.i; }
+            bool operator!=(const iterator& o) const { return i != o.i; }
+        };
+        iterator begin() {
+            iterator it{this, 0};
+            it.skip();
+            return it;
+        }
+        iterator end() { return {this, payload_.size()}; }
+        bool empty() const { return payload_.size() == dead_n_; }
+        size_t size() const { return payload_.size() - dead_n_; }
+
+        // Deliberately SHARES the mix64 finalizer with the radix partitioner:
+        // within one partition every key then has identical low log2(P) bits,
+        // so probe starts cluster on a stride-P subset of slots. A reviewer
+        // flagged this as a probe-length pathology and suggested decorrelating
+        // with a second mix64 -- it made q18 ~80ms WORSE at SF=1: the clustered
+        // starts keep the probe working set L1-resident (cap/P distinct lines)
+        // and the +1 linear chain walks adjacent lines, whereas decorrelated
+        // starts turn every probe into a random L2 miss across the whole table.
+        // Probe length is bounded by the 0.625 load cap either way. Measured,
+        // not guessed -- do not re-mix here without re-measuring q18.
+        // | 1 keeps the stored hash nonzero (0 marks an empty entry).
+        static uint64_t hv(const K& k) { return HashF{}(k) | 1; }
+
+        // Rebuild the probe table for ~`want` live entries (load <= 0.625).
+        void rehash(size_t want) {
+            size_t cap = 16;
+            while (cap * 10 < want * 16) cap <<= 1;
+            table_.assign(cap, {0, 0});
+            mask_ = cap - 1;
+            for (size_t i = 0; i < payload_.size(); ++i) {
+                if (dead_[i]) continue;
+                const uint64_t h = hv(payload_[i].first);
+                size_t j = h & mask_;
+                while (table_[j].h != 0) j = (j + 1) & mask_;
+                table_[j] = {h, static_cast<uint32_t>(i)};
+            }
+        }
+        void reserve(size_t n) {
+            if (n * 16 > table_.size() * 10) rehash(n);
+            payload_.reserve(n);
+            dead_.reserve(n);
+        }
+        // A payload-only pre-size (reserving payload_/dead_ from the caller's
+        // row share while leaving the probe table geometric) was measured and
+        // rejected: at SF=5 the per-worker-per-partition reservations (~1024
+        // maps, mostly untouched) turned into mmap/munmap churn and lock
+        // contention that cost far more than the growth moves they saved.
+        // Geometric growth via reserve()/emplace() stays.
+        iterator find(const K& k) {
+            if (table_.empty()) return end();
+            const uint64_t h = hv(k);
+            size_t j = h & mask_;
+            while (table_[j].h != 0) {
+                if (table_[j].h == h) {
+                    const uint32_t idx = table_[j].idx;
+                    if (!dead_[idx] && payload_[idx].first == k)
+                        return {this, idx};
+                }
+                j = (j + 1) & mask_;
+            }
+            return end();
+        }
+        std::pair<iterator, bool> emplace(K k, GroupState&& v) {
+            if (table_.empty() ||
+                (payload_.size() + 1) * 16 > table_.size() * 10)
+                rehash(std::max<size_t>((payload_.size() + 1) * 2, 16));
+            const uint64_t h = hv(k);
+            size_t j = h & mask_;
+            while (table_[j].h != 0) {
+                if (table_[j].h == h) {
+                    const uint32_t idx = table_[j].idx;
+                    if (!dead_[idx] && payload_[idx].first == k)
+                        return {{this, idx}, false};
+                }
+                j = (j + 1) & mask_;
+            }
+            payload_.emplace_back(std::move(k), std::move(v));
+            dead_.push_back(0);
+            table_[j] = {h, static_cast<uint32_t>(payload_.size() - 1)};
+            return {{this, payload_.size() - 1}, true};
+        }
+        iterator erase(iterator it) {
+            dead_[it.i] = 1;
+            ++dead_n_;
+            iterator nx{this, it.i + 1};
+            nx.skip();
+            return nx;
+        }
+    };
+    struct I64Mix {
+        size_t operator()(int64_t v) const {
+            return mix64(static_cast<uint64_t>(v));
+        }
+    };
+    struct I2Mix {
+        size_t operator()(const Int2Key& k) const {
+            return mix64(static_cast<uint64_t>(k.a) * 0x9e3779b97f4a7c15ULL +
+                         static_cast<uint64_t>(k.b));
+        }
+    };
+    // Single INT group column keyed by native int64 (value<->byte 1:1 for
+    // canonical numeric cells), the group analogue of the join fast path.
+    using IntGroupMap = FlatGroupMap<int64_t, I64Mix>;
+    using Int2GroupMap = FlatGroupMap<Int2Key, I2Mix>;
 
     static uint32_t FilterTableForAggregate(
         const pb::QueryBlockAggFunc& function) {
@@ -1247,8 +2833,11 @@ class Executor {
     bool BuildPredicateRowForTable(uint32_t table_idx, uint64_t ref,
                                    uint32_t column_count,
                                    std::vector<std::string_view>* cells,
-                                   std::vector<bool>* nulls) const {
-        if (cells == nullptr || nulls == nullptr) return false;
+                                   std::vector<bool>* nulls,
+                                   std::vector<std::string>* bufs) const {
+        if (cells == nullptr || nulls == nullptr || bufs == nullptr) {
+            return false;
+        }
         if (ref == kNullRowRef) return false;
         if (!IsVirtualTable(table_idx)) {
             const PaxRowRef row = ToRowRef(table_idx, ref);
@@ -1266,27 +2855,124 @@ class Executor {
 
         cells->resize(column_count);
         nulls->resize(column_count);
+        bufs->resize(column_count);
         for (uint32_t column_idx = 0; column_idx < column_count;
              ++column_idx) {
-            (*cells)[column_idx] = ValueOf(table_idx, ref, column_idx);
+            // Canonical ASCII for the ASCII filter evaluator (typed cells
+            // formatted once here).
+            (*cells)[column_idx] =
+                KeyView(table_idx, ref, column_idx, (*bufs)[column_idx]);
             (*nulls)[column_idx] = NullOf(table_idx, ref, column_idx);
         }
         return true;
     }
 
-    bool AccumulateRange(const pb::QueryBlockAggregate& aggregate,
-                         const NodeResult& input, size_t begin, size_t end,
-                         GroupMap* groups) {
+    // Radix partition index for a group key. A well-mixed finalizer keeps
+    // partition sizes balanced even for sequentially-clustered integer keys
+    // (l_orderkey runs 1..N), which the identity std::hash<int64_t> would bucket
+    // unevenly. Pure function of the key, so every worker maps a given key to
+    // the same partition -- that disjointness lets the partition merge tasks run
+    // without cross-partition contention. Strings need no extra mixing because
+    // std::hash<std::string_view> already avalanches the byte key.
+    static inline uint64_t mix64(uint64_t x) {
+        x ^= x >> 33;
+        x *= 0xff51afd7ed558ccdULL;
+        x ^= x >> 33;
+        x *= 0xc4ceb9fe1a85ec53ULL;
+        x ^= x >> 33;
+        return x;
+    }
+    static inline unsigned part_of_i64(int64_t value, unsigned partition_count) {
+        return static_cast<unsigned>(
+            mix64(static_cast<uint64_t>(value)) % partition_count);
+    }
+    static inline unsigned part_of_i2(const Int2Key& key,
+                                      unsigned partition_count) {
+        return static_cast<unsigned>(
+            mix64(static_cast<uint64_t>(key.a) * 0x9e3779b97f4a7c15ULL +
+                  static_cast<uint64_t>(key.b)) %
+            partition_count);
+    }
+    static inline unsigned part_of_str(std::string_view key,
+                                       unsigned partition_count) {
+        return static_cast<unsigned>(
+            std::hash<std::string_view>{}(key) % partition_count);
+    }
+
+    // Single-threaded validation of everything AccumulateRangeT resolves per
+    // range. Runs once before workers spawn so parallel accumulation never
+    // writes the shared error state.
+    bool ValidateAggregateInput(const pb::QueryBlockAggregate& aggregate,
+                                const NodeResult& input) {
+        for (int group_idx = 0; group_idx < aggregate.group_columns_size();
+             ++group_idx) {
+            if (input.table_pos(
+                    aggregate.group_columns(group_idx).table_idx()) < 0) {
+                return fail("group table is not in aggregate input");
+            }
+        }
+        for (int aggregate_idx = 0; aggregate_idx < aggregate.aggs_size();
+             ++aggregate_idx) {
+            const pb::QueryBlockAggFunc& function =
+                aggregate.aggs(aggregate_idx);
+            if (function.has_arg() &&
+                input.table_pos(function.arg_table()) < 0) {
+                return fail("aggregate table is not in aggregate input");
+            }
+            if (function.has_filter() &&
+                input.table_pos(FilterTableForAggregate(function)) < 0) {
+                return fail(
+                    "aggregate filter table is not in aggregate input");
+            }
+            if (function.has_arg() &&
+                !ValidateAggregateExpressionTables(
+                    function.arg(), input, function.arg_table())) {
+                return false;
+            }
+            switch (function.kind()) {
+                case pb::QueryBlockAggFunc::COUNT:
+                case pb::QueryBlockAggFunc::SUM:
+                case pb::QueryBlockAggFunc::AVG:
+                case pb::QueryBlockAggFunc::MIN:
+                case pb::QueryBlockAggFunc::MAX:
+                    break;
+                default:
+                    return fail("unsupported aggregate function");
+            }
+        }
+        return true;
+    }
+
+    // Accumulates rows [begin,end) into `parts` -- a radix fan-out of
+    // partition_count group maps, one row routed to parts[part_of_*(key)]
+    // (parts[0] when partition_count==1). Generic over the map key: the
+    // string-keyed GroupMap builds length-prefixed byte keys; the int64
+    // IntGroupMap and packed Int2GroupMap parse the group cells to int64 and
+    // key on the value. In an int path the first cell that does not parse
+    // full-length sets *parse_fail and returns false, so the caller discards
+    // the partial maps and re-runs the aggregation on the string path. Callers
+    // only take an int path for numeric group columns with prefix_len==0, and
+    // canonical numeric cells are value<->byte 1:1, so results are unchanged.
+    template <typename MapT>
+    bool AccumulateRangeT(const pb::QueryBlockAggregate& aggregate,
+                          const NodeResult& input, size_t begin, size_t end,
+                          std::vector<MapT>* parts, unsigned partition_count,
+                          std::atomic<bool>* parse_fail) {
+        constexpr bool IntKey =
+            std::is_same_v<typename MapT::key_type, int64_t>;
+        constexpr bool Int2 =
+            std::is_same_v<typename MapT::key_type, Int2Key>;
         const int group_count = aggregate.group_columns_size();
         const int aggregate_count = aggregate.aggs_size();
 
+        // Positions were validated by ValidateAggregateInput; failures here
+        // return without a message because workers run this concurrently and
+        // must not write the shared error state.
         std::vector<int> group_positions(group_count, -1);
         for (int group_idx = 0; group_idx < group_count; ++group_idx) {
             group_positions[group_idx] =
                 input.table_pos(aggregate.group_columns(group_idx).table_idx());
-            if (group_positions[group_idx] < 0) {
-                return fail("group table is not in aggregate input");
-            }
+            if (group_positions[group_idx] < 0) return false;
         }
 
         std::vector<int> aggregate_positions(aggregate_count, -1);
@@ -1298,66 +2984,166 @@ class Executor {
             if (function.has_arg()) {
                 aggregate_positions[aggregate_idx] =
                     input.table_pos(function.arg_table());
-                if (aggregate_positions[aggregate_idx] < 0) {
-                    return fail("aggregate table is not in aggregate input");
-                }
+                if (aggregate_positions[aggregate_idx] < 0) return false;
             }
             if (function.has_filter()) {
                 filter_positions[aggregate_idx] =
                     input.table_pos(FilterTableForAggregate(function));
-                if (filter_positions[aggregate_idx] < 0) {
-                    return fail(
-                        "aggregate filter table is not in aggregate input");
-                }
-            }
-            if (function.has_arg() &&
-                !ValidateAggregateExpressionTables(
-                    function.arg(), input, function.arg_table())) {
-                return false;
+                if (filter_positions[aggregate_idx] < 0) return false;
             }
         }
 
         PredicateEvaluator evaluator;
-        std::string key_buffer;
-        std::vector<std::string_view> group_values(group_count);
+        [[maybe_unused]] std::string key_buffer;
+        [[maybe_unused]] std::vector<std::string_view> group_values(
+            group_count);
+        // Canonical-ASCII backing for typed group cells (string path); one
+        // buffer per group column so the n_grp views coexist while the key is
+        // built. `agg_view_buf` backs typed DISTINCT / MIN-MAX-string reads.
+        [[maybe_unused]] std::vector<std::string> group_bufs(group_count);
+        std::string agg_view_buf;
         std::vector<std::string_view> filter_values;
         std::vector<bool> filter_nulls;
+        std::vector<std::string> filter_bufs;
+        // Clustered-run cache (int/int2 paths): rows arrive in physical order
+        // and lineitem is clustered by l_orderkey (run length ~4 at TPC-H
+        // scale), so consecutive rows usually land in the same group. A cache
+        // hit reuses last_state and skips the partition find/emplace entirely.
+        // Safety across payload reallocation: last_state is dereferenced ONLY
+        // on a cache hit, which requires the key to equal last_key; consecutive
+        // equal keys mean no emplace ran between the set and the reuse, so the
+        // payload cannot have moved. On every miss the pointer is recomputed
+        // after the emplace, never carried across it. Equal key also implies
+        // the same radix partition (part_of_* is a pure key function), so a hit
+        // never needs the partition index.
+        [[maybe_unused]] int64_t last_key = 0;
+        [[maybe_unused]] Int2Key last_key2{0, 0};
+        GroupState* last_state = nullptr;
         for (size_t row_idx = begin; row_idx < end; ++row_idx) {
-            key_buffer.clear();
-            for (int group_idx = 0; group_idx < group_count; ++group_idx) {
-                const pb::QueryBlockColumnRef& column =
-                    aggregate.group_columns(group_idx);
-                const uint64_t ref =
-                    input.refs[group_positions[group_idx]][row_idx];
-                group_values[group_idx] = GroupColumnValue(column, ref);
-                const uint32_t length =
-                    static_cast<uint32_t>(group_values[group_idx].size());
-                key_buffer.append(reinterpret_cast<const char*>(&length),
-                                  sizeof(length));
-                key_buffer.append(group_values[group_idx].data(),
-                                  group_values[group_idx].size());
-            }
-
-            auto group_it = groups->find(key_buffer);
             GroupState* state = nullptr;
-            if (group_it == groups->end()) {
-                GroupState new_state;
-                new_state.keys.resize(group_count);
-                for (int group_idx = 0; group_idx < group_count; ++group_idx) {
-                    new_state.keys[group_idx] =
-                        std::string(group_values[group_idx]);
+            if constexpr (IntKey) {
+                // Single group column, prefix_len==0 (enforced by caller).
+                const pb::QueryBlockColumnRef& column =
+                    aggregate.group_columns(0);
+                const uint64_t ref = input.refs[group_positions[0]][row_idx];
+                int64_t parsed = 0;
+                // Schema-driven: a typed int decodes exactly; NULL, a DATE/DEC64
+                // column, or a non-integer UNTYPED cell abandons the int path so
+                // the caller re-runs this aggregation over string keys.
+                if (ref == kNullRowRef ||
+                    !ReadI64(column.table_idx(), ref, column.column(),
+                             &parsed)) {
+                    parse_fail->store(true, std::memory_order_relaxed);
+                    return false;
                 }
-                new_state.counts.assign(aggregate_count, 0);
-                new_state.decimals.assign(aggregate_count, DecimalValue{});
-                new_state.strings.assign(aggregate_count, {});
-                new_state.has_value.assign(aggregate_count, false);
-                new_state.distinct_values.resize(aggregate_count);
-                state = &groups->emplace(std::move(key_buffer),
-                                         std::move(new_state))
-                             .first->second;
-                key_buffer.clear();
+                if (last_state != nullptr && parsed == last_key) {
+                    state = last_state;
+                } else {
+                    MapT& groups = (*parts)[partition_count == 1
+                                                ? 0
+                                                : part_of_i64(parsed,
+                                                              partition_count)];
+                    auto group_it = groups.find(parsed);
+                    if (group_it == groups.end()) {
+                        GroupState new_state;
+                        // Defer the canonical-ASCII format to emit: stash the
+                        // row that created the group so EnsureGroupKeys can
+                        // rebuild the exact stored bytes only if a key read
+                        // actually reaches it.
+                        new_state.key_ref[0] = ref;
+                        new_state.key_done = false;
+                        new_state.aggregates.resize(aggregate_count);
+                        state = &groups.emplace(parsed, std::move(new_state))
+                                     .first->second;
+                    } else {
+                        state = &group_it->second;
+                    }
+                    last_key = parsed;
+                    last_state = state;
+                }
+            } else if constexpr (Int2) {
+                // Two group columns, both prefix_len==0 (enforced by caller).
+                const pb::QueryBlockColumnRef& column0 =
+                    aggregate.group_columns(0);
+                const pb::QueryBlockColumnRef& column1 =
+                    aggregate.group_columns(1);
+                const uint64_t ref0 = input.refs[group_positions[0]][row_idx];
+                const uint64_t ref1 = input.refs[group_positions[1]][row_idx];
+                Int2Key key;
+                // Schema-driven int decode for both group columns (NULL or a
+                // non-integer cell abandons the int path).
+                if (ref0 == kNullRowRef ||
+                    !ReadI64(column0.table_idx(), ref0, column0.column(),
+                             &key.a) ||
+                    ref1 == kNullRowRef ||
+                    !ReadI64(column1.table_idx(), ref1, column1.column(),
+                             &key.b)) {
+                    parse_fail->store(true, std::memory_order_relaxed);
+                    return false;
+                }
+                if (last_state != nullptr && key == last_key2) {
+                    state = last_state;
+                } else {
+                    MapT& groups = (*parts)[partition_count == 1
+                                                ? 0
+                                                : part_of_i2(key,
+                                                             partition_count)];
+                    auto group_it = groups.find(key);
+                    if (group_it == groups.end()) {
+                        GroupState new_state;
+                        // Defer both cells' canonical-ASCII format to emit.
+                        new_state.key_ref[0] = ref0;
+                        new_state.key_ref[1] = ref1;
+                        new_state.key_done = false;
+                        new_state.aggregates.resize(aggregate_count);
+                        state = &groups.emplace(key, std::move(new_state))
+                                     .first->second;
+                    } else {
+                        state = &group_it->second;
+                    }
+                    last_key2 = key;
+                    last_state = state;
+                }
             } else {
-                state = &group_it->second;
+                key_buffer.clear();
+                for (int group_idx = 0; group_idx < group_count; ++group_idx) {
+                    const pb::QueryBlockColumnRef& column =
+                        aggregate.group_columns(group_idx);
+                    const uint64_t ref =
+                        input.refs[group_positions[group_idx]][row_idx];
+                    // Canonical ASCII so grouping, HAVING and output all see the
+                    // val_str text (typed cells formatted once here).
+                    group_values[group_idx] =
+                        GroupColumnCanonical(column, ref, group_bufs[group_idx]);
+                    const uint32_t length =
+                        static_cast<uint32_t>(group_values[group_idx].size());
+                    key_buffer.append(reinterpret_cast<const char*>(&length),
+                                      sizeof(length));
+                    key_buffer.append(group_values[group_idx].data(),
+                                      group_values[group_idx].size());
+                }
+
+                MapT& groups = (*parts)[partition_count == 1
+                                            ? 0
+                                            : part_of_str(key_buffer,
+                                                          partition_count)];
+                auto group_it = groups.find(key_buffer);
+                if (group_it == groups.end()) {
+                    GroupState new_state;
+                    new_state.keys.resize(group_count);
+                    for (int group_idx = 0; group_idx < group_count;
+                         ++group_idx) {
+                        new_state.keys[group_idx] =
+                            std::string(group_values[group_idx]);
+                    }
+                    new_state.aggregates.resize(aggregate_count);
+                    state = &groups.emplace(std::move(key_buffer),
+                                            std::move(new_state))
+                                 .first->second;
+                    key_buffer.clear();
+                } else {
+                    state = &group_it->second;
+                }
             }
 
             for (int aggregate_idx = 0; aggregate_idx < aggregate_count;
@@ -1380,9 +3166,10 @@ class Executor {
                     if (!BuildPredicateRowForTable(
                             filter_table, filter_ref,
                             function.filter().num_columns(), &filter_values,
-                            &filter_nulls)) {
-                        return fail(
-                            "aggregate filter cannot read table columns");
+                            &filter_nulls, &filter_bufs)) {
+                        // No message from worker context; the dispatch
+                        // reports the failure after joining.
+                        return false;
                     }
                     evaluator.set_row_from_views(filter_values, filter_nulls);
                     if (!evaluator.evaluate(function.filter().expr())) {
@@ -1394,17 +3181,20 @@ class Executor {
                     case pb::QueryBlockAggFunc::COUNT:
                         if (function.distinct()) {
                             if (!function.has_arg() || !has_arg_row) break;
+                            // Canonical ASCII so DISTINCT counts by value (typed
+                            // cells formatted; distinct-by-value).
                             std::string_view value;
-                            if (ReadAggregateColumn(
+                            if (ReadAggregateCanonical(
                                     function.arg(), input, row_idx,
-                                    function.arg_table(), &value)) {
-                                state->distinct_values[aggregate_idx].emplace(
-                                    value);
+                                    function.arg_table(), agg_view_buf,
+                                    &value)) {
+                                state->aggregates[aggregate_idx]
+                                    .distinct_values.emplace(value);
                             }
                             break;
                         }
                         if (function.has_arg() && !has_arg_row) break;
-                        state->counts[aggregate_idx] += 1;
+                        state->aggregates[aggregate_idx].count += 1;
                         break;
                     case pb::QueryBlockAggFunc::SUM:
                     case pb::QueryBlockAggFunc::AVG: {
@@ -1412,9 +3202,9 @@ class Executor {
                             function.arg(), input, row_idx,
                             function.arg_table());
                         if (value.is_null) break;
-                        add_decimal_value(state->decimals[aggregate_idx],
-                                          value);
-                        state->counts[aggregate_idx] += 1;
+                        add_decimal_value(
+                            state->aggregates[aggregate_idx].decimal, value);
+                        state->aggregates[aggregate_idx].count += 1;
                         break;
                     }
                     case pb::QueryBlockAggFunc::MIN:
@@ -1422,52 +3212,54 @@ class Executor {
                         const bool wants_max =
                             function.kind() == pb::QueryBlockAggFunc::MAX;
                         if (function.cmp_kind() == 1) {
+                            // Canonical ASCII: string order == value order for
+                            // strings and (via YYYY-MM-DD) for typed DATE.
                             std::string_view value;
-                            if (!ReadAggregateColumn(function.arg(), input,
-                                                     row_idx,
-                                                     function.arg_table(),
-                                                     &value)) {
+                            if (!ReadAggregateCanonical(function.arg(), input,
+                                                        row_idx,
+                                                        function.arg_table(),
+                                                        agg_view_buf, &value)) {
                                 break;
                             }
-                            if (!state->has_value[aggregate_idx] ||
+                            AggSlot& slot = state->aggregates[aggregate_idx];
+                            if (!slot.has_value ||
                                 (wants_max
-                                     ? value >
-                                           std::string_view(
-                                               state->strings[aggregate_idx])
-                                     : value <
-                                           std::string_view(
-                                               state->strings[aggregate_idx]))) {
-                                state->strings[aggregate_idx] =
-                                    std::string(value);
+                                     ? value > std::string_view(
+                                                   slot.string_value)
+                                     : value < std::string_view(
+                                                   slot.string_value))) {
+                                slot.string_value = std::string(value);
                             }
                         } else {
                             DecimalValue value = EvaluateAggregateExpression(
                                 function.arg(), input, row_idx,
                                 function.arg_table());
                             if (value.is_null) break;
-                            if (!state->has_value[aggregate_idx] ||
+                            AggSlot& slot = state->aggregates[aggregate_idx];
+                            if (!slot.has_value ||
                                 (wants_max
                                      ? compare_decimal_values(
-                                           value,
-                                           state->decimals[aggregate_idx]) > 0
+                                           value, slot.decimal) > 0
                                      : compare_decimal_values(
-                                           value,
-                                           state->decimals[aggregate_idx]) < 0)) {
-                                state->decimals[aggregate_idx] = value;
+                                           value, slot.decimal) < 0)) {
+                                slot.decimal = value;
                             }
                         }
-                        state->has_value[aggregate_idx] = true;
+                        state->aggregates[aggregate_idx].has_value = true;
                         break;
                     }
                     default:
-                        return fail("unsupported aggregate function");
+                        // Rejected by ValidateAggregateInput; no message from
+                        // worker context.
+                        return false;
                 }
             }
         }
         return true;
     }
 
-    static void MergeGroups(GroupMap* destination, GroupMap* source,
+    template <typename MapT>
+    static void MergeGroups(MapT* destination, MapT* source,
                             const pb::QueryBlockAggregate& aggregate) {
         if (destination->empty()) {
             *destination = std::move(*source);
@@ -1487,60 +3279,54 @@ class Executor {
                  aggregate_idx < aggregate.aggs_size(); ++aggregate_idx) {
                 const pb::QueryBlockAggFunc& function =
                     aggregate.aggs(aggregate_idx);
+                AggSlot& destination_slot =
+                    destination_state.aggregates[aggregate_idx];
+                AggSlot& source_slot =
+                    source_state.aggregates[aggregate_idx];
                 switch (function.kind()) {
                     case pb::QueryBlockAggFunc::COUNT:
                         if (function.distinct()) {
-                            destination_state.distinct_values[aggregate_idx]
-                                .merge(source_state
-                                           .distinct_values[aggregate_idx]);
+                            destination_slot.distinct_values.merge(
+                                source_slot.distinct_values);
                             break;
                         }
-                        destination_state.counts[aggregate_idx] +=
-                            source_state.counts[aggregate_idx];
+                        destination_slot.count += source_slot.count;
                         break;
                     case pb::QueryBlockAggFunc::SUM:
                     case pb::QueryBlockAggFunc::AVG:
-                        if (source_state.counts[aggregate_idx] > 0) {
-                            add_decimal_value(
-                                destination_state.decimals[aggregate_idx],
-                                source_state.decimals[aggregate_idx]);
-                            destination_state.counts[aggregate_idx] +=
-                                source_state.counts[aggregate_idx];
+                        if (source_slot.count > 0) {
+                            add_decimal_value(destination_slot.decimal,
+                                              source_slot.decimal);
+                            destination_slot.count += source_slot.count;
                         }
                         break;
                     case pb::QueryBlockAggFunc::MIN:
                     case pb::QueryBlockAggFunc::MAX: {
-                        if (!source_state.has_value[aggregate_idx]) break;
+                        if (!source_slot.has_value) break;
                         const bool wants_max =
                             function.kind() == pb::QueryBlockAggFunc::MAX;
                         if (function.cmp_kind() == 1) {
-                            if (!destination_state.has_value[aggregate_idx] ||
+                            if (!destination_slot.has_value ||
                                 (wants_max
-                                     ? source_state.strings[aggregate_idx] >
-                                           destination_state
-                                               .strings[aggregate_idx]
-                                     : source_state.strings[aggregate_idx] <
-                                           destination_state
-                                               .strings[aggregate_idx])) {
-                                destination_state.strings[aggregate_idx] =
-                                    std::move(
-                                        source_state.strings[aggregate_idx]);
+                                     ? source_slot.string_value >
+                                           destination_slot.string_value
+                                     : source_slot.string_value <
+                                           destination_slot.string_value)) {
+                                destination_slot.string_value =
+                                    std::move(source_slot.string_value);
                             }
                         } else if (
-                            !destination_state.has_value[aggregate_idx] ||
+                            !destination_slot.has_value ||
                             (wants_max
                                  ? compare_decimal_values(
-                                       source_state.decimals[aggregate_idx],
-                                       destination_state
-                                           .decimals[aggregate_idx]) > 0
+                                       source_slot.decimal,
+                                       destination_slot.decimal) > 0
                                  : compare_decimal_values(
-                                       source_state.decimals[aggregate_idx],
-                                       destination_state
-                                           .decimals[aggregate_idx]) < 0)) {
-                            destination_state.decimals[aggregate_idx] =
-                                source_state.decimals[aggregate_idx];
+                                       source_slot.decimal,
+                                       destination_slot.decimal) < 0)) {
+                            destination_slot.decimal = source_slot.decimal;
                         }
-                        destination_state.has_value[aggregate_idx] = true;
+                        destination_slot.has_value = true;
                         break;
                     }
                     default:
@@ -1550,18 +3336,41 @@ class Executor {
         }
     }
 
+    // Lazily materialize a deferred group's key cells from its representative
+    // row refs. A no-op once key_done is true (the string path fills `keys`
+    // eagerly), and on the typed fast paths for groups whose keys are never
+    // read. GroupColumnCanonical on the stored ref returns the exact canonical
+    // val_str bytes (a typed cell formatted, an UNTYPED cell verbatim), so the
+    // deferred format is byte-identical to eager formatting. Reentrant (own
+    // buffer) so per-group emit steps may call it on disjoint groups
+    // concurrently.
+    void EnsureGroupKeys(const pb::QueryBlockAggregate& aggregate,
+                         GroupState* state) const {
+        if (state->key_done) return;
+        const int group_count = aggregate.group_columns_size();
+        state->keys.resize(group_count);
+        std::string buf;  // typed key cell -> canonical ASCII (reentrant)
+        for (int group_idx = 0; group_idx < group_count; ++group_idx) {
+            const pb::QueryBlockColumnRef& column =
+                aggregate.group_columns(group_idx);
+            state->keys[group_idx] = std::string(
+                GroupColumnCanonical(column, state->key_ref[group_idx], buf));
+        }
+        state->key_done = true;
+    }
+
     std::string AggregateValue(const pb::QueryBlockAggFunc& function,
                                const GroupState& state, int aggregate_idx,
                                bool* is_null) const {
         *is_null = false;
+        const AggSlot& slot = state.aggregates[aggregate_idx];
         switch (function.kind()) {
             case pb::QueryBlockAggFunc::COUNT:
-                return std::to_string(
-                    function.distinct()
-                        ? state.distinct_values[aggregate_idx].size()
-                        : state.counts[aggregate_idx]);
+                return std::to_string(function.distinct()
+                                          ? slot.distinct_values.size()
+                                          : slot.count);
             case pb::QueryBlockAggFunc::SUM:
-                if (state.counts[aggregate_idx] == 0) {
+                if (slot.count == 0) {
                     if (function.zero_if_empty()) {
                         DecimalValue zero;
                         zero.scale = static_cast<int>(function.arg_scale());
@@ -1571,28 +3380,27 @@ class Executor {
                     *is_null = true;
                     return {};
                 }
-                return format_decimal_value(state.decimals[aggregate_idx]);
+                return format_decimal_value(slot.decimal);
             case pb::QueryBlockAggFunc::AVG: {
-                if (state.counts[aggregate_idx] == 0) {
+                if (slot.count == 0) {
                     *is_null = true;
                     return {};
                 }
                 const int output_scale =
                     static_cast<int>(function.arg_scale()) + 4;
-                return format_decimal_value(divide_decimal_value(
-                    state.decimals[aggregate_idx],
-                    state.counts[aggregate_idx], output_scale));
+                return format_decimal_value(
+                    divide_decimal_value(slot.decimal, slot.count,
+                                         output_scale));
             }
             case pb::QueryBlockAggFunc::MIN:
             case pb::QueryBlockAggFunc::MAX:
-                if (!state.has_value[aggregate_idx]) {
+                if (!slot.has_value) {
                     *is_null = true;
                     return {};
                 }
                 return function.cmp_kind() == 1
-                           ? state.strings[aggregate_idx]
-                           : format_decimal_value(
-                                 state.decimals[aggregate_idx]);
+                           ? slot.string_value
+                           : format_decimal_value(slot.decimal);
             default:
                 *is_null = true;
                 return {};
@@ -1721,6 +3529,53 @@ class Executor {
         }
     }
 
+    // Structural validation of an output EXPR tree, mirroring the fail()
+    // conditions of EvaluateOutputExpression. Data-independent (depends only on
+    // the plan, not on any group), so it is checked once up front; the
+    // per-partition output build can then evaluate EXPR outputs in parallel
+    // without reaching a fail() path.
+    bool ValidateOutputExpression(const pb::FilterExpr& expression,
+                                  const pb::QueryBlockAggregate& aggregate) {
+        using FE = pb::FilterExpr;
+        switch (expression.op()) {
+            case FE::COLUMN_REF: {
+                const uint32_t ordinal = expression.column_index();
+                const uint32_t group_count =
+                    static_cast<uint32_t>(aggregate.group_columns_size());
+                if (ordinal < group_count) return true;
+                if (ordinal - group_count >=
+                    static_cast<uint32_t>(aggregate.aggs_size())) {
+                    return fail("output expression ordinal out of range");
+                }
+                return true;
+            }
+            case FE::CONST_INT:
+            case FE::CONST_UINT:
+            case FE::CONST_STRING:
+            case FE::CONST_NULL:
+                return true;
+            case FE::OP_ADD:
+            case FE::OP_SUB:
+            case FE::OP_MUL:
+            case FE::OP_DIV:
+                if (expression.children_size() != 2) {
+                    return fail("output expression arity mismatch");
+                }
+                return ValidateOutputExpression(expression.children(0),
+                                                aggregate) &&
+                       ValidateOutputExpression(expression.children(1),
+                                                aggregate);
+            case FE::OP_NEG:
+                if (expression.children_size() != 1) {
+                    return fail("output expression arity mismatch");
+                }
+                return ValidateOutputExpression(expression.children(0),
+                                                aggregate);
+            default:
+                return fail("unsupported output expression");
+        }
+    }
+
     bool AggregateRowValue(const pb::QueryBlockAggregate& aggregate,
                            int group_count, const GroupState& state,
                            uint32_t ordinal, std::string* value,
@@ -1754,76 +3609,176 @@ class Executor {
         uint64_t count = 0;
     };
 
+    // Second-stage re-aggregation (q13 shape): re-group the first-stage values
+    // and COUNT(*) per group. Stage-1 partitions hold disjoint groups, so each
+    // is folded into a radix fan-out of partial second maps keyed by
+    // part_of_str over the composite value key, and the second partitions
+    // merge and emit concurrently -- the same radix pattern as stage 1.
+    // Ordinal/source validation is hoisted out of the workers (it depends only
+    // on the plan) so the parallel folds and emits have no failure path. Each
+    // fold touches only its own stage-1 partition, and EnsureGroupKeys mutates
+    // only that partition's states, so the folds never race. Row order is
+    // partition-concatenation order -- the same contract as the stage-1 emit
+    // (ORDER BY-sorted or order-free downstream).
+    template <typename MapT>
     bool BuildRegroupedRows(const pb::QueryBlockAggregate& aggregate,
-                            int group_count, const GroupMap& groups,
+                            int group_count, std::vector<MapT>& parts,
                             std::vector<OutputRow>* output_rows) {
         const auto& regroup = aggregate.regroup();
         if (!regroup.count_star()) return fail("regroup must count");
 
-        std::unordered_map<std::string, RegroupState> regrouped;
-        std::string key;
-        std::vector<std::string> values;
-        std::vector<bool> nulls;
-        for (const auto& entry : groups) {
-            const GroupState& state = entry.second;
-            key.clear();
-            values.clear();
-            nulls.clear();
-            values.reserve(regroup.group_value_ordinals_size());
-            nulls.reserve(regroup.group_value_ordinals_size());
-
-            for (const uint32_t ordinal : regroup.group_value_ordinals()) {
-                std::string value;
-                bool is_null = false;
-                if (!AggregateRowValue(aggregate, group_count, state, ordinal,
-                                       &value, &is_null)) {
-                    return false;
-                }
-                AppendRegroupKeyPart(&key, value, is_null);
-                values.push_back(std::move(value));
-                nulls.push_back(is_null);
+        // Plan-only validation hoisted out of the workers: a value ordinal
+        // past the group columns must name a real aggregate, and every output
+        // must be a group value in range or the COUNT(*) aggregate. state.keys
+        // always holds group_value_ordinals_size() entries, so the group-output
+        // bound below matches the per-row `ordinal >= state.keys.size()` check.
+        for (const uint32_t ordinal : regroup.group_value_ordinals()) {
+            const int aggregate_idx = static_cast<int>(ordinal) - group_count;
+            if (ordinal >= static_cast<uint32_t>(group_count) &&
+                (aggregate_idx < 0 ||
+                 aggregate_idx >= aggregate.aggs_size())) {
+                return fail("regroup value ordinal out of range");
             }
-
-            auto [it, inserted] = regrouped.emplace(key, RegroupState{});
-            RegroupState& regroup_state = it->second;
-            if (inserted) {
-                regroup_state.keys = values;
-                regroup_state.nulls = nulls;
+        }
+        for (const pb::QueryBlockOutputExpr& expression : request_.output()) {
+            switch (expression.source()) {
+                case pb::QueryBlockOutputExpr::GROUP:
+                    if (expression.ordinal() >=
+                        static_cast<uint32_t>(
+                            regroup.group_value_ordinals_size())) {
+                        return fail("regroup output ordinal out of range");
+                    }
+                    break;
+                case pb::QueryBlockOutputExpr::AGG:
+                    if (expression.ordinal() != 0) {
+                        return fail("regroup aggregate ordinal out of range");
+                    }
+                    break;
+                default:
+                    return fail("unsupported regroup output source");
             }
-            regroup_state.count += 1;
         }
 
-        output_rows->clear();
-        output_rows->reserve(regrouped.size());
-        for (const auto& entry : regrouped) {
-            const RegroupState& state = entry.second;
-            OutputRow row;
-            row.values.reserve(request_.output_size());
-            row.nulls.reserve(request_.output_size());
-            for (const pb::QueryBlockOutputExpr& expression :
-                 request_.output()) {
-                switch (expression.source()) {
-                    case pb::QueryBlockOutputExpr::GROUP:
-                        if (expression.ordinal() >= state.keys.size()) {
-                            return fail("regroup output ordinal out of range");
-                        }
+        using SecondMap = std::unordered_map<std::string, RegroupState>;
+        const unsigned np = static_cast<unsigned>(parts.size());
+        const unsigned np2 = np;
+        // [stage-1 partition][second partition] partial re-groupings.
+        std::vector<std::vector<SecondMap>> partials(
+            np, std::vector<SecondMap>(np2));
+
+        auto fold_part = [&](unsigned p) {
+            std::string key;
+            std::vector<std::string> values;
+            std::vector<bool> nulls;
+            for (auto& entry : parts[p]) {
+                GroupState& state = entry.second;
+                key.clear();
+                values.clear();
+                nulls.clear();
+                values.reserve(regroup.group_value_ordinals_size());
+                nulls.reserve(regroup.group_value_ordinals_size());
+                for (const uint32_t ordinal :
+                     regroup.group_value_ordinals()) {
+                    // Only a group ordinal reads the deferred key cells; an
+                    // aggregate ordinal (q13 groups by the per-customer count)
+                    // never materializes them.
+                    if (ordinal < static_cast<uint32_t>(group_count)) {
+                        EnsureGroupKeys(aggregate, &state);
+                    }
+                    std::string value;
+                    bool is_null = false;
+                    // Ordinals validated above, so this cannot fail.
+                    AggregateRowValue(aggregate, group_count, state, ordinal,
+                                      &value, &is_null);
+                    AppendRegroupKeyPart(&key, value, is_null);
+                    values.push_back(std::move(value));
+                    nulls.push_back(is_null);
+                }
+                SecondMap& dst =
+                    partials[p][np2 == 1 ? 0 : part_of_str(key, np2)];
+                auto [it, inserted] = dst.emplace(key, RegroupState{});
+                RegroupState& regroup_state = it->second;
+                if (inserted) {
+                    regroup_state.keys = std::move(values);
+                    regroup_state.nulls = std::move(nulls);
+                }
+                regroup_state.count += 1;
+            }
+        };
+
+        // Merge second partition s across the stage-1 partials, then emit its
+        // rows. Equal keys carry identical values/nulls (the key encodes
+        // them), so the first partial to insert a key fixes its output cells.
+        std::vector<std::vector<OutputRow>> partition_rows(np2);
+        auto emit_second = [&](unsigned s) {
+            SecondMap merged;
+            for (unsigned p = 0; p < np; ++p) {
+                if (merged.empty()) {
+                    merged = std::move(partials[p][s]);
+                    continue;
+                }
+                for (auto& kv : partials[p][s]) {
+                    auto [it, inserted] =
+                        merged.emplace(kv.first, RegroupState{});
+                    if (inserted) {
+                        it->second.keys = std::move(kv.second.keys);
+                        it->second.nulls = std::move(kv.second.nulls);
+                    }
+                    it->second.count += kv.second.count;
+                }
+            }
+            std::vector<OutputRow>& out = partition_rows[s];
+            out.reserve(merged.size());
+            for (const auto& entry : merged) {
+                const RegroupState& state = entry.second;
+                OutputRow row;
+                row.values.reserve(request_.output_size());
+                row.nulls.reserve(request_.output_size());
+                for (const pb::QueryBlockOutputExpr& expression :
+                     request_.output()) {
+                    if (expression.source() ==
+                        pb::QueryBlockOutputExpr::GROUP) {
                         row.values.push_back(
                             state.keys[expression.ordinal()]);
                         row.nulls.push_back(
                             state.nulls[expression.ordinal()]);
-                        break;
-                    case pb::QueryBlockOutputExpr::AGG:
-                        if (expression.ordinal() != 0) {
-                            return fail("regroup aggregate ordinal out of range");
-                        }
+                    } else {  // AGG (validated above)
                         row.values.push_back(std::to_string(state.count));
                         row.nulls.push_back(false);
-                        break;
-                    default:
-                        return fail("unsupported regroup output source");
+                    }
                 }
+                out.push_back(std::move(row));
             }
-            output_rows->push_back(std::move(row));
+        };
+
+        if (np <= 1) {
+            fold_part(0);
+            emit_second(0);
+        } else {
+            std::vector<std::thread> pool;
+            pool.reserve(np);
+            for (unsigned p = 0; p < np; ++p) {
+                if (parts[p].empty()) continue;  // no groups, no thread
+                pool.emplace_back([&, p] { fold_part(p); });
+            }
+            for (std::thread& worker : pool) worker.join();
+            pool.clear();
+            for (unsigned s = 0; s < np2; ++s) {
+                pool.emplace_back([&, s] { emit_second(s); });
+            }
+            for (std::thread& worker : pool) worker.join();
+        }
+
+        output_rows->clear();
+        size_t total = 0;
+        for (const std::vector<OutputRow>& pr : partition_rows) {
+            total += pr.size();
+        }
+        output_rows->reserve(total);
+        for (std::vector<OutputRow>& pr : partition_rows) {
+            for (OutputRow& row : pr) {
+                output_rows->push_back(std::move(row));
+            }
         }
         return true;
     }
@@ -1913,6 +3868,7 @@ class Executor {
 
         std::vector<OutputRow> output_rows;
         output_rows.reserve(input.rows());
+        std::string value_buf;  // typed output cell -> canonical ASCII
         for (size_t row_idx = 0; row_idx < input.rows(); ++row_idx) {
             OutputRow row;
             row.values.reserve(request_.output_size());
@@ -1930,8 +3886,11 @@ class Executor {
                     continue;
                 }
 
+                // Canonical ASCII output: a typed cell is rendered to its exact
+                // val_str, then prefix-truncated.
                 std::string_view value =
-                    ValueOf(column.table_idx(), ref, column.column());
+                    KeyView(column.table_idx(), ref, column.column(),
+                            value_buf);
                 if (column.prefix_len() > 0 &&
                     value.size() > column.prefix_len()) {
                     value = value.substr(0, column.prefix_len());
@@ -1953,163 +3912,384 @@ class Executor {
         const NodeResult& input = results_[aggregate.input()];
         const size_t input_rows = input.rows();
 
-        GroupMap groups;
         const unsigned worker_count = static_cast<unsigned>(std::min<size_t>(
             WorkerCount(), std::max<size_t>(input_rows / 65536, 1)));
-        if (worker_count <= 1) {
-            if (!AccumulateRange(aggregate, input, 0, input_rows, &groups)) {
-                return false;
-            }
-        } else {
-            std::vector<GroupMap> local_groups(worker_count);
-            std::vector<char> worker_failed(worker_count, 0);
-            std::vector<std::thread> workers;
-            workers.reserve(worker_count);
-            for (unsigned worker_idx = 0; worker_idx < worker_count;
-                 ++worker_idx) {
-                workers.emplace_back([&, worker_idx] {
-                    const size_t begin =
-                        input_rows * worker_idx / worker_count;
-                    const size_t end =
-                        input_rows * (worker_idx + 1) / worker_count;
-                    if (!AccumulateRange(aggregate, input, begin, end,
-                                         &local_groups[worker_idx])) {
-                        worker_failed[worker_idx] = 1;
-                    }
-                });
-            }
-            for (std::thread& worker : workers) worker.join();
-            for (char failed : worker_failed) {
-                if (failed) return false;
-            }
-            for (GroupMap& local : local_groups) {
-                MergeGroups(&groups, &local, aggregate);
-            }
-        }
-
+        // Radix partitions = worker count. Each accumulate worker fans its
+        // groups into partition_count maps by part_of_*(key); one merge task
+        // per partition then folds that partition from every worker in parallel
+        // (disjoint keys, no contention), replacing the single-threaded
+        // MergeGroups chain into one giant map. HAVING and the output-row build
+        // also run per-partition in parallel; the second stage and ORDER
+        // BY/LIMIT/serialize stay single-threaded. partition_count==1 (inputs
+        // below the worker threshold) collapses to the single-map path with
+        // identical emit order.
+        const unsigned partition_count = worker_count;
         const int group_count = aggregate.group_columns_size();
-        if (group_count == 0 && groups.empty()) {
-            GroupState state;
-            state.counts.assign(aggregate.aggs_size(), 0);
-            state.decimals.assign(aggregate.aggs_size(), DecimalValue{});
-            state.strings.assign(aggregate.aggs_size(), {});
-            state.has_value.assign(aggregate.aggs_size(), false);
-            state.distinct_values.resize(aggregate.aggs_size());
-            groups.emplace(std::string(), std::move(state));
+
+        // Radix accumulate plus a parallel per-partition merge into `parts`
+        // (sized to partition_count). Phase 1: each worker fans its row range
+        // into its own partition_count local maps. Phase 2: one merge task per
+        // partition folds that partition from every worker -- disjoint keys, so
+        // no contention. Returns 0 on success (parts ready to emit), 1 on parse
+        // fallback (an int path hit a non-integer cell), 2 on structural
+        // failure. Parallel workers report failure through worker_failed /
+        // parse_fail rather than fail(), which the caller resolves after join.
+        if (!ValidateAggregateInput(aggregate, input)) return false;
+        auto run_typed = [&](auto& parts) -> int {
+            using MapT = typename std::decay_t<decltype(parts)>::value_type;
+            std::atomic<bool> parse_fail{false};
+            if (partition_count <= 1) {
+                if (!AccumulateRangeT(aggregate, input, 0, input_rows, &parts,
+                                      1u, &parse_fail)) {
+                    return parse_fail.load() ? 1 : 2;
+                }
+                return 0;
+            }
+            std::vector<std::vector<MapT>> local_parts(worker_count);
+            std::vector<char> worker_failed(worker_count, 0);
+            {
+                std::vector<std::thread> workers;
+                workers.reserve(worker_count);
+                for (unsigned worker_idx = 0; worker_idx < worker_count;
+                     ++worker_idx) {
+                    workers.emplace_back([&, worker_idx] {
+                        local_parts[worker_idx].resize(partition_count);
+                        const size_t begin =
+                            input_rows * worker_idx / worker_count;
+                        const size_t end =
+                            input_rows * (worker_idx + 1) / worker_count;
+                        if (!AccumulateRangeT(aggregate, input, begin, end,
+                                              &local_parts[worker_idx],
+                                              partition_count, &parse_fail)) {
+                            worker_failed[worker_idx] = 1;
+                        }
+                    });
+                }
+                for (std::thread& worker : workers) worker.join();
+            }
+            for (char failed : worker_failed) {
+                if (failed) return parse_fail.load() ? 1 : 2;
+            }
+            {
+                std::vector<std::thread> mergers;
+                mergers.reserve(partition_count);
+                for (unsigned p = 0; p < partition_count; ++p) {
+                    size_t partition_total = 0;
+                    for (unsigned worker_idx = 0; worker_idx < worker_count;
+                         ++worker_idx) {
+                        partition_total += local_parts[worker_idx][p].size();
+                    }
+                    if (partition_total == 0) continue;  // empty, no thread
+                    mergers.emplace_back([&, p, partition_total] {
+                        // Reserve the destination once, after the first non-
+                        // empty local is moved in, sized to the summed counts.
+                        bool first = true;
+                        for (unsigned worker_idx = 0; worker_idx < worker_count;
+                             ++worker_idx) {
+                            MergeGroups(&parts[p], &local_parts[worker_idx][p],
+                                        aggregate);
+                            if (first && !parts[p].empty()) {
+                                parts[p].reserve(partition_total);
+                                first = false;
+                            }
+                        }
+                    });
+                }
+                for (std::thread& merger : mergers) merger.join();
+            }
+            return 0;
+        };
+
+        // Post-accumulation pipeline (implicit grouping fill -> HAVING ->
+        // regroup / output rows -> ORDER BY / LIMIT / serialize) over the
+        // partition_count disjoint maps. HAVING and the normal output build run
+        // per-partition in parallel; the second stage and ORDER BY/LIMIT stay
+        // single-threaded. Generic over the map key so the typed fast paths and
+        // the string path share it.
+        auto emit = [&](auto& parts) -> bool {
+            using MapT = typename std::decay_t<decltype(parts)>::value_type;
+            using KeyType = typename MapT::key_type;
+            const unsigned part_n = static_cast<unsigned>(parts.size());
+            // Implicit grouping emits one row over zero input; reachable only
+            // for the string map, since the int paths always group by a numeric
+            // column. Inject into partition 0 when every partition is empty.
+            if constexpr (std::is_same_v<KeyType, std::string>) {
+                if (group_count == 0) {
+                    bool any = false;
+                    for (auto& part : parts) {
+                        if (!part.empty()) {
+                            any = true;
+                            break;
+                        }
+                    }
+                    if (!any) {
+                        GroupState state;
+                        state.aggregates.resize(aggregate.aggs_size());
+                        parts[0].emplace(std::string(), std::move(state));
+                    }
+                }
+            }
+
+        // A HAVING predicate that reads only aggregate values (q18:
+        // sum(l_quantity) > 300) never touches the group keys, so the groups it
+        // discards keep their deferred keys unformatted -- the point of the
+        // deferral. Materialize keys here only when HAVING references a group
+        // column ordinal (< group_count).
+        bool having_uses_group = false;
+        if (aggregate.has_having() && aggregate.having().has_expr()) {
+            std::vector<uint32_t> having_cols;
+            PredicateEvaluator::collect_columns(aggregate.having().expr(),
+                                                &having_cols);
+            for (const uint32_t ordinal : having_cols) {
+                if (ordinal < static_cast<uint32_t>(group_count)) {
+                    having_uses_group = true;
+                    break;
+                }
+            }
         }
 
-        // HAVING predicates read the first-stage aggregate row layout:
-        // group values first, then aggregate values.
+        // HAVING drops groups failing the predicate over the first-stage row
+        // layout (group values, then aggregate values). Partitions hold
+        // disjoint keys, so each is pruned independently -- run it per-partition
+        // in parallel, each thread with its own evaluator/scratch, erasing from
+        // its own map.
         if (aggregate.has_having() && aggregate.having().has_expr()) {
-            PredicateEvaluator evaluator;
-            std::vector<std::string> values;
-            std::vector<std::string_view> cells;
-            std::vector<bool> nulls;
-            for (auto group_it = groups.begin(); group_it != groups.end();) {
-                const GroupState& state = group_it->second;
-                values.clear();
-                cells.clear();
-                nulls.clear();
-                values.reserve(group_count + aggregate.aggs_size());
-                cells.reserve(group_count + aggregate.aggs_size());
-                nulls.reserve(group_count + aggregate.aggs_size());
+            auto prune_partition = [&](MapT& groups) {
+                PredicateEvaluator evaluator;
+                std::vector<std::string> values;
+                std::vector<std::string_view> cells;
+                std::vector<bool> nulls;
+                for (auto group_it = groups.begin();
+                     group_it != groups.end();) {
+                    GroupState& state = group_it->second;
+                    if (having_uses_group) EnsureGroupKeys(aggregate, &state);
+                    values.clear();
+                    cells.clear();
+                    nulls.clear();
+                    values.reserve(group_count + aggregate.aggs_size());
+                    cells.reserve(group_count + aggregate.aggs_size());
+                    nulls.reserve(group_count + aggregate.aggs_size());
 
-                for (int group_idx = 0; group_idx < group_count;
-                     ++group_idx) {
-                    values.push_back(state.keys[group_idx]);
-                    nulls.push_back(false);
-                }
-                for (int aggregate_idx = 0;
-                     aggregate_idx < aggregate.aggs_size();
-                     ++aggregate_idx) {
-                    bool is_null = false;
-                    values.push_back(AggregateValue(
-                        aggregate.aggs(aggregate_idx), state,
-                        aggregate_idx, &is_null));
-                    nulls.push_back(is_null);
-                }
-                for (const std::string& value : values) {
-                    cells.push_back(value);
-                }
+                    for (int group_idx = 0; group_idx < group_count;
+                         ++group_idx) {
+                        // Placeholder when HAVING never names a group ordinal;
+                        // the evaluator reads only ordinals it references.
+                        values.push_back(having_uses_group
+                                             ? state.keys[group_idx]
+                                             : std::string());
+                        nulls.push_back(false);
+                    }
+                    for (int aggregate_idx = 0;
+                         aggregate_idx < aggregate.aggs_size();
+                         ++aggregate_idx) {
+                        bool is_null = false;
+                        values.push_back(AggregateValue(
+                            aggregate.aggs(aggregate_idx), state,
+                            aggregate_idx, &is_null));
+                        nulls.push_back(is_null);
+                    }
+                    for (const std::string& value : values) {
+                        cells.push_back(value);
+                    }
 
-                evaluator.set_row_from_views(cells, nulls);
-                if (evaluator.evaluate(aggregate.having().expr())) {
-                    ++group_it;
-                } else {
-                    group_it = groups.erase(group_it);
+                    evaluator.set_row_from_views(cells, nulls);
+                    if (evaluator.evaluate(aggregate.having().expr())) {
+                        ++group_it;
+                    } else {
+                        group_it = groups.erase(group_it);
+                    }
+                }
+            };
+            if (part_n <= 1) {
+                prune_partition(parts[0]);
+            } else {
+                std::vector<std::thread> pool;
+                pool.reserve(part_n);
+                for (unsigned p = 0; p < part_n; ++p) {
+                    if (parts[p].empty()) continue;  // no work, no thread
+                    pool.emplace_back([&, p] { prune_partition(parts[p]); });
+                }
+                for (std::thread& worker : pool) worker.join();
+            }
+        }
+
+        // Validate the normal-path output ordinals once (data-independent) so
+        // the parallel row builder has no fail() path. The second stage lives
+        // in a different ordinal space (checked inline in BuildRegroupedRows),
+        // so validating it here against group_count/aggs_size would spuriously
+        // reject a valid `GROUP ordinal >= group_count` second-stage output.
+        if (!aggregate.has_regroup()) {
+            for (const pb::QueryBlockOutputExpr& expression :
+                 request_.output()) {
+                switch (expression.source()) {
+                    case pb::QueryBlockOutputExpr::GROUP:
+                        if (expression.ordinal() >=
+                            static_cast<uint32_t>(group_count)) {
+                            return fail("group output ordinal out of range");
+                        }
+                        break;
+                    case pb::QueryBlockOutputExpr::AGG:
+                        if (expression.ordinal() >=
+                            static_cast<uint32_t>(aggregate.aggs_size())) {
+                            return fail(
+                                "aggregate output ordinal out of range");
+                        }
+                        break;
+                    case pb::QueryBlockOutputExpr::EXPR:
+                        if (!ValidateOutputExpression(expression.expr(),
+                                                      aggregate)) {
+                            return false;
+                        }
+                        break;
+                    default:
+                        return fail("unsupported query-block output source");
                 }
             }
         }
 
         std::vector<OutputRow> output_rows;
         if (aggregate.has_regroup()) {
-            if (!BuildRegroupedRows(aggregate, group_count, groups,
+            if (!BuildRegroupedRows(aggregate, group_count, parts,
                                     &output_rows)) {
                 return false;
             }
         } else {
-            output_rows.reserve(groups.size());
-            for (auto& entry : groups) {
-                GroupState& state = entry.second;
-                OutputRow row;
-                row.values.reserve(request_.output_size());
-                row.nulls.reserve(request_.output_size());
-                for (const pb::QueryBlockOutputExpr& expression :
-                     request_.output()) {
-                    switch (expression.source()) {
-                        case pb::QueryBlockOutputExpr::GROUP:
-                            if (expression.ordinal() >=
-                                static_cast<uint32_t>(group_count)) {
-                                return fail(
-                                    "group output ordinal out of range");
+            // Normal output: build each partition's rows independently, then
+            // concatenate in partition order. Ordinals are validated above, so
+            // this path cannot fail and is safe to run per-partition in
+            // parallel. The concatenation order differs from a single map, but
+            // every final result is ORDER BY-sorted or a scalar row and derived
+            // blocks feed order-independent joins, so md5 is preserved.
+            auto build_partition = [&](MapT& groups,
+                                       std::vector<OutputRow>& out) {
+                out.reserve(groups.size());
+                for (auto& entry : groups) {
+                    GroupState& state = entry.second;
+                    // Survivors only: GROUP and group-referencing EXPR outputs
+                    // read the key cells, so materialize deferred keys here.
+                    EnsureGroupKeys(aggregate, &state);
+                    OutputRow row;
+                    row.values.reserve(request_.output_size());
+                    row.nulls.reserve(request_.output_size());
+                    for (const pb::QueryBlockOutputExpr& expression :
+                         request_.output()) {
+                        switch (expression.source()) {
+                            case pb::QueryBlockOutputExpr::GROUP:
+                                row.values.push_back(
+                                    state.keys[expression.ordinal()]);
+                                row.nulls.push_back(false);
+                                break;
+                            case pb::QueryBlockOutputExpr::AGG: {
+                                bool is_null = false;
+                                row.values.push_back(AggregateValue(
+                                    aggregate.aggs(expression.ordinal()), state,
+                                    static_cast<int>(expression.ordinal()),
+                                    &is_null));
+                                row.nulls.push_back(is_null);
+                                break;
                             }
-                            row.values.push_back(
-                                state.keys[expression.ordinal()]);
-                            row.nulls.push_back(false);
-                            break;
-                        case pb::QueryBlockOutputExpr::AGG: {
-                            if (expression.ordinal() >=
-                                static_cast<uint32_t>(
-                                    aggregate.aggs_size())) {
-                                return fail(
-                                    "aggregate output ordinal out of range");
+                            case pb::QueryBlockOutputExpr::EXPR: {
+                                // Structure validated above, so this cannot
+                                // fail; ignore the bool and keep fail() off the
+                                // parallel path.
+                                DecimalValue value;
+                                EvaluateOutputExpression(expression.expr(),
+                                                         aggregate, state,
+                                                         &value);
+                                round_decimal_value(
+                                    &value, static_cast<int>(
+                                                expression.result_scale()));
+                                row.values.push_back(
+                                    value.is_null
+                                        ? std::string()
+                                        : format_decimal_value(value));
+                                row.nulls.push_back(value.is_null);
+                                break;
                             }
-                            bool is_null = false;
-                            row.values.push_back(AggregateValue(
-                                aggregate.aggs(expression.ordinal()), state,
-                                static_cast<int>(expression.ordinal()),
-                                &is_null));
-                            row.nulls.push_back(is_null);
-                            break;
+                            default:
+                                break;  // validated above; unreachable
                         }
-                        case pb::QueryBlockOutputExpr::EXPR: {
-                            DecimalValue value;
-                            if (!EvaluateOutputExpression(
-                                    expression.expr(), aggregate, state,
-                                    &value)) {
-                                return false;
-                            }
-                            round_decimal_value(
-                                &value,
-                                static_cast<int>(expression.result_scale()));
-                            row.values.push_back(
-                                value.is_null ? std::string()
-                                              : format_decimal_value(value));
-                            row.nulls.push_back(value.is_null);
-                            break;
-                        }
-                        default:
-                            return fail(
-                                "unsupported query-block output source");
+                    }
+                    out.push_back(std::move(row));
+                }
+            };
+            if (part_n <= 1) {
+                build_partition(parts[0], output_rows);
+            } else {
+                std::vector<std::vector<OutputRow>> partition_rows(part_n);
+                std::vector<std::thread> pool;
+                pool.reserve(part_n);
+                for (unsigned p = 0; p < part_n; ++p) {
+                    if (parts[p].empty()) continue;
+                    pool.emplace_back([&, p] {
+                        build_partition(parts[p], partition_rows[p]);
+                    });
+                }
+                for (std::thread& worker : pool) worker.join();
+                size_t total = 0;
+                for (const std::vector<OutputRow>& pr : partition_rows) {
+                    total += pr.size();
+                }
+                output_rows.reserve(total);
+                for (std::vector<OutputRow>& pr : partition_rows) {
+                    for (OutputRow& row : pr) {
+                        output_rows.push_back(std::move(row));
                     }
                 }
-                output_rows.push_back(std::move(row));
             }
         }
 
-        if (!SortOutputRows(&output_rows)) return false;
-        EmitOutputRows(output_rows, response);
-        return true;
+            if (!SortOutputRows(&output_rows)) return false;
+            EmitOutputRows(output_rows, response);
+            return true;
+        };  // emit
+
+        // Typed group-key fast paths gate on numeric result type (cmp_kind==0)
+        // and prefix_len==0: a STRING column can carry non-canonical numeric
+        // text ("01" vs "1") that byte-groups apart but collapses to one int64,
+        // whereas numeric columns store canonical val_str so parse-success is
+        // value<->byte 1:1. A single INT column keys an int64 map, two INT
+        // columns a packed 128-bit map. A parse fallback (status 1) re-runs the
+        // whole aggregation on the string path; a structural failure (status 2)
+        // propagates.
+        const bool group0_int =
+            group_count >= 1 &&
+            aggregate.group_columns(0).prefix_len() == 0 &&
+            aggregate.group_columns(0).cmp_kind() == 0;
+        const bool group1_int =
+            group_count >= 2 &&
+            aggregate.group_columns(1).prefix_len() == 0 &&
+            aggregate.group_columns(1).cmp_kind() == 0;
+        // Workers report structural failure without a message; attach one
+        // here if nothing more specific was recorded.
+        const auto structural = [this]() {
+            return error_.empty() ? fail("aggregate accumulation failed")
+                                  : false;
+        };
+        if (group_count == 1 && group0_int) {
+            std::vector<IntGroupMap> parts(partition_count);
+            const int status = run_typed(parts);
+            if (status == 0) return emit(parts);
+            if (status == 2) return structural();
+            // status == 1: fall through to the string path.
+            LOG_INFO(
+                "int64 group-key aggregation fell back to string keys "
+                "(non-integer group cell)");
+        } else if (group_count == 2 && group0_int && group1_int) {
+            std::vector<Int2GroupMap> parts(partition_count);
+            const int status = run_typed(parts);
+            if (status == 0) return emit(parts);
+            if (status == 2) return structural();
+            // status == 1: fall through to the string path.
+            LOG_INFO(
+                "packed 2-int group-key aggregation fell back to string keys "
+                "(non-integer group cell)");
+        }
+
+        std::vector<GroupMap> parts(partition_count);
+        const int status = run_typed(parts);
+        if (status != 0) return structural();  // string path never parse-fails
+        return emit(parts);
     }
 
     bool RunNodes(pb::TxExecuteQueryBlock::Response* response) {

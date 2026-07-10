@@ -1,6 +1,14 @@
 #include "row_codec.hh"
 
+#include <charconv>
+#include <cstdio>
 #include <cstdlib>
+#include <cstring>
+#include <string>
+
+#include "decimal_arithmetic.hh"
+
+namespace fk = LineairDB::Pax;  // FK_UNTYPED / FK_INT32 / ...
 
 std::string next_lexicographic_key(std::string key) {
     for (size_t i = key.size(); i-- > 0;) {
@@ -95,6 +103,85 @@ std::string_view extract_value_column(const PaxRowRef& row, int column_index) {
     const size_t field_index = static_cast<size_t>(column_index) + 1;
     if (field_index >= row.group->schema().field_count()) return {};
     return row.group->cell(field_index, row.slot);
+}
+
+void format_typed_cell(uint8_t kind, int scale, std::string_view value,
+                       std::string* out) {
+    switch (kind) {
+        case fk::FK_INT32: {
+            int32_t x;
+            std::memcpy(&x, value.data(), 4);
+            out->append(std::to_string(x));
+            break;
+        }
+        case fk::FK_INT64: {
+            int64_t x;
+            std::memcpy(&x, value.data(), 8);
+            out->append(std::to_string(x));
+            break;
+        }
+        case fk::FK_DATE: {
+            int32_t x;
+            std::memcpy(&x, value.data(), 4);
+            char b[16];
+            const int n = std::snprintf(b, sizeof(b), "%04d-%02d-%02d",
+                                        x / 10000, (x / 100) % 100, x % 100);
+            if (n > 0) out->append(b, static_cast<size_t>(n));
+            break;
+        }
+        case fk::FK_DEC64: {
+            int64_t x;
+            std::memcpy(&x, value.data(), 8);
+            DecimalValue d;
+            d.mantissa = x;
+            d.scale = scale;
+            d.is_null = false;
+            out->append(format_decimal_value(d));
+            break;
+        }
+        default:
+            out->append(value.data(), value.size());
+            break;
+    }
+}
+
+bool decode_typed_i64(std::string_view value, uint8_t kind, int64_t* out) {
+    if (value.empty()) return false;  // SQL NULL
+    switch (kind) {
+        case fk::FK_INT32: {
+            int32_t x;
+            std::memcpy(&x, value.data(), 4);
+            *out = x;
+            return true;
+        }
+        case fk::FK_INT64: {
+            int64_t x;
+            std::memcpy(&x, value.data(), 8);
+            *out = x;
+            return true;
+        }
+        case fk::FK_UNTYPED: {
+            const char* first = value.data();
+            const char* last = value.data() + value.size();
+            const auto result = std::from_chars(first, last, *out);
+            return result.ec == std::errc() && result.ptr == last;
+        }
+        default:
+            // FK_DATE / FK_DEC64 are not int-key material: their canonical ASCII
+            // ("YYYY-MM-DD", "1.50") does not parse as an integer, so an UNTYPED
+            // copy of the same value takes the string key path. Returning false
+            // here keeps the typed cell on the SAME string path (build/probe
+            // symmetry).
+            return false;
+    }
+}
+
+std::string_view typed_key_view(std::string_view value, uint8_t kind, int scale,
+                                std::string& buf) {
+    if (kind == fk::FK_UNTYPED || value.empty()) return value;
+    buf.clear();
+    format_typed_cell(kind, scale, value, &buf);
+    return buf;
 }
 
 std::string encode_int_key_part(int64_t value) {

@@ -335,9 +335,13 @@ public:
     // table/index management (non-transactional)
     // Optional PAX storage cell widths. Entry 0 is the null-flags field; later
     // entries follow TABLE::field order. Empty keeps the ordinary row layout.
+    // pax_field_kind/pax_field_scale carry PAX typed-cell metadata, one entry
+    // per pax_field_max_bytes entry; empty keeps the ASCII byte layout.
     bool db_create_table(
         const std::string& table_name,
-        const std::vector<uint32_t>& pax_field_max_bytes = {});
+        const std::vector<uint32_t>& pax_field_max_bytes = {},
+        const std::vector<uint32_t>& pax_field_kind = {},
+        const std::vector<int32_t>& pax_field_scale = {});
     bool db_set_table(int64_t tx_id, const std::string& table_name);
     bool db_create_secondary_index(const std::string& table_name,
                                    const std::string& index_name,

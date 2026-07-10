@@ -19,8 +19,6 @@ else
   echo "WARNING: jemalloc not found, using system malloc (apt install libjemalloc2)" >&2
 fi
 
-export HELIOS_PAX_STORAGE=1
-
 if [ ! -x "$BIN" ]; then
   echo "ERROR: binary not found: $BIN" >&2
   echo "Hint: build it via: bash scripts/build.sh (or build_partial.sh)" >&2

@@ -1,8 +1,11 @@
 #include "decimal_arithmetic.hh"
 
 #include <algorithm>
+#include <cstring>
 
 #include "row_codec.hh"
+
+namespace fk = LineairDB::Pax;  // FK_UNTYPED / FK_INT32 / ...
 
 namespace {
 
@@ -13,6 +16,26 @@ __int128 decimal_power_of_ten(int n) {
     __int128 r = 1;
     while (n-- > 0) r *= 10;
     return r;
+}
+
+// Read a COLUMN_REF leaf as a DecimalValue. A materialized (ASCII) row parses
+// the text; a PAX row decodes the cell by the column's declared kind so a typed
+// numeric cell is never re-parsed from its raw binary.
+DecimalValue decimal_from_column(const std::string& row, uint32_t column) {
+    return parse_decimal_value(
+        extract_value_column(row, static_cast<int>(column)));
+}
+DecimalValue decimal_from_column(const PaxRowRef& row, uint32_t column) {
+    const std::string_view value =
+        extract_value_column(row, static_cast<int>(column));
+    uint8_t kind = fk::FK_UNTYPED;
+    int scale = 0;
+    if (row.group != nullptr) {
+        const size_t field = static_cast<size_t>(column) + 1;
+        kind = row.group->schema().kind_of(field);
+        scale = row.group->schema().scale_of(field);
+    }
+    return decode_typed_decimal(value, kind, scale);
 }
 
 }  // namespace
@@ -53,6 +76,47 @@ DecimalValue parse_decimal_value(std::string_view v) {
     d.mantissa = neg ? -mantissa : mantissa;
     d.scale = scale;
     return d;
+}
+
+DecimalValue decode_typed_decimal(std::string_view value, uint8_t kind,
+                                  int scale) {
+    if (value.empty()) {
+        DecimalValue d;
+        d.is_null = true;
+        return d;
+    }
+    switch (kind) {
+        case fk::FK_INT32:
+        case fk::FK_DATE: {
+            int32_t x;
+            std::memcpy(&x, value.data(), 4);
+            DecimalValue d;
+            d.mantissa = x;
+            d.scale = 0;
+            d.is_null = false;
+            return d;
+        }
+        case fk::FK_INT64: {
+            int64_t x;
+            std::memcpy(&x, value.data(), 8);
+            DecimalValue d;
+            d.mantissa = x;
+            d.scale = 0;
+            d.is_null = false;
+            return d;
+        }
+        case fk::FK_DEC64: {
+            int64_t x;
+            std::memcpy(&x, value.data(), 8);
+            DecimalValue d;
+            d.mantissa = x;
+            d.scale = scale;
+            d.is_null = false;
+            return d;
+        }
+        default:
+            return parse_decimal_value(value);
+    }
 }
 
 int compare_decimal_values(const DecimalValue& lhs,
@@ -100,8 +164,7 @@ DecimalValue evaluate_decimal_expression_impl(
     using FE = LineairDB::Protocol::FilterExpr;
     switch (expression.op()) {
         case FE::COLUMN_REF:
-            return parse_decimal_value(
-                extract_value_column(row, expression.column_index()));
+            return decimal_from_column(row, expression.column_index());
         case FE::CONST_INT: {
             DecimalValue d;
             d.mantissa = expression.int_val();
