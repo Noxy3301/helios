@@ -86,6 +86,19 @@ std::vector<uint32_t> compute_pax_field_widths(TABLE *table) {
       case MYSQL_TYPE_TIMESTAMP2:
         width = std::max<uint32_t>(width, 32);
         break;
+      case MYSQL_TYPE_STRING:
+      case MYSQL_TYPE_VARCHAR:
+      case MYSQL_TYPE_VAR_STRING:
+      case MYSQL_TYPE_ENUM:
+      case MYSQL_TYPE_SET:
+        // field_length is the charset octet length: utf8mb4 reserves 4 bytes
+        // per declared character, padding a pure-ASCII VARCHAR(44) cell to 176
+        // B. Size the cell to the declared character count instead (a no-op for
+        // latin1/binary where mbmaxlen == 1). A genuine multibyte row whose
+        // bytes exceed char_length() falls back to the existing per-row heap
+        // path, which disables strip-direct scans for that table.
+        width = field->char_length();
+        break;
       default:
         break;
     }
