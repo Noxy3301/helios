@@ -1,5 +1,8 @@
 #include "lineairdb_rpc.hh"
 
+#include <cstdint>
+#include <vector>
+
 #include "../../common/log.h"
 #include "lineairdb.pb.h"
 
@@ -34,6 +37,21 @@ void LineairDBRpc::handleDbCreateTable(const std::string& message,
     response.set_success(success);
     LOG_DEBUG("CreateTable '%s': %s", request.table_name().c_str(),
               success ? "success" : "already exists");
+
+    // Non-empty widths mean the proxy wants this table to try PAX storage.
+    if (request.pax_field_max_bytes_size() > 0) {
+        std::vector<uint32_t> widths;
+        widths.reserve(request.pax_field_max_bytes_size());
+        for (const uint32_t width : request.pax_field_max_bytes()) {
+            widths.push_back(width);
+        }
+
+        const bool installed = db_manager_->get_database()->InstallPaxSchema(
+            request.table_name(), widths);
+        LOG_INFO("PAX schema for '%s': %zu fields, %s",
+                 request.table_name().c_str(), widths.size(),
+                 installed ? "installed" : "skipped");
+    }
 
     result = response.SerializeAsString();
 }

@@ -430,6 +430,25 @@ LineairDBProxy::tx_stateless_batch_read(
     return results;
 }
 
+bool LineairDBProxy::tx_execute_query_block(
+    const LineairDB::Protocol::TxExecuteQueryBlock::Request& request,
+    LineairDB::Protocol::TxExecuteQueryBlock::Response* response) {
+    if (!connected_) {
+        LOG_ERROR("RPC failed: Not connected to server");
+        return false;
+    }
+    if (response == nullptr) {
+        LOG_ERROR("RPC failed: query block response is null");
+        return false;
+    }
+    if (!send_protobuf_message(request, *response,
+                               MessageType::TX_EXECUTE_QUERY_BLOCK)) {
+        LOG_ERROR("RPC failed: query block message");
+        return false;
+    }
+    return true;
+}
+
 LineairDBProxy::ReadPlanResult LineairDBProxy::tx_execute_read_plan(
     const std::vector<ReadPlanStep>& steps) {
     ReadPlanResult result;
@@ -1277,7 +1296,9 @@ std::optional<SecondaryIndexEntry> LineairDBProxy::tx_fetch_last_secondary_entry
     return std::nullopt;
 }
 
-bool LineairDBProxy::db_create_table(const std::string& table_name) {
+bool LineairDBProxy::db_create_table(
+    const std::string& table_name,
+    const std::vector<uint32_t>& pax_field_max_bytes) {
     LOG_DEBUG("CLIENT: db_create_table called with table=%s", table_name.c_str());
     if (!connected_) {
         LOG_ERROR("RPC failed: Not connected to server");
@@ -1288,6 +1309,9 @@ bool LineairDBProxy::db_create_table(const std::string& table_name) {
     LineairDB::Protocol::DbCreateTable::Response response;
 
     request.set_table_name(table_name);
+    for (const uint32_t width : pax_field_max_bytes) {
+        request.add_pax_field_max_bytes(width);
+    }
 
     if (!send_protobuf_message(request, response, MessageType::DB_CREATE_TABLE)) {
         LOG_ERROR("RPC failed: Failed to send message to server");

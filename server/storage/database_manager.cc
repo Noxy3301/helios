@@ -23,6 +23,7 @@ DatabaseManager::DatabaseManager() {
     conf.max_thread           = 1;
     conf.concurrency_control_protocol = LineairDB::Config::ConcurrencyControl::Silo;
     conf.index_structure = LineairDB::Config::IndexStructure::Masstree;
+    conf.enable_pax_storage = true;
     database_ = std::make_shared<LineairDB::Database>(conf);
     LOG_INFO("Database manager initialized");
 }

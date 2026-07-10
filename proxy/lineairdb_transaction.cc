@@ -428,6 +428,17 @@ void LineairDBTransaction::execute_read_plan(
 
     if (step.index_name.empty()) {
       // Primary scan: cache row values and stage one primary range entry.
+      const bool aggregate_step = !step.aggregate_serialized.empty();
+      bool grouped_semijoin_aggregate_step = false;
+      if (aggregate_step) {
+        for (const auto& grouped_semijoin : grouped_semijoins_) {
+          if (grouped_semijoin.inner_table_key == step.table_name) {
+            grouped_semijoin_aggregate_step = true;
+            break;
+          }
+        }
+      }
+      std::vector<std::string> grouped_semijoin_group_rows;
       std::vector<std::pair<std::string, std::string>> rows;
       std::vector<uint64_t> row_tids;
       rows.reserve(step_result.scan_keys.size());
@@ -440,16 +451,27 @@ void LineairDBTransaction::execute_read_plan(
         const uint64_t tid =
             j < step_result.scan_tids.size() ? step_result.scan_tids[j] : 0;
         const bool found = !value.empty();
-        record_row_cache(step.table_name, key, found, value, tid, true);
+        if (!aggregate_step) {
+          record_row_cache(step.table_name, key, found, value, tid, true);
+        }
         if (found) {
+          if (grouped_semijoin_aggregate_step) {
+            grouped_semijoin_group_rows.push_back(value);
+          }
           rows.emplace_back(std::move(key), std::move(value));
           row_tids.push_back(tid);
         }
       }
-      push_range_scan_cache(
-          {step.table_name, step_result.actual_start_key,
-           step_result.actual_end_key, step.reverse_scan, step.scan_limit,
-           std::move(rows), std::move(row_tids)});
+      if (grouped_semijoin_aggregate_step) {
+        cache_grouped_semijoin_group_rows(
+            step.table_name, std::move(grouped_semijoin_group_rows));
+      }
+      LocalRangeScanEntry entry{
+          step.table_name, step_result.actual_start_key,
+          step_result.actual_end_key, step.reverse_scan, step.scan_limit,
+          std::move(rows), std::move(row_tids)};
+      entry.aggregate_rows = aggregate_step;
+      push_range_scan_cache(std::move(entry));
       // Rejected primary keys become local not-found answers for later point
       // probes into this filtered scan.
       for (auto& fk : step_result.filtered_keys) {
@@ -1284,6 +1306,23 @@ void LineairDBTransaction::abort_prefetch_cache_miss(
   thd_mark_transaction_to_rollback(thread, 1);
 }
 
+bool LineairDBTransaction::execute_read_plan_raw(
+    const std::vector<LineairDBProxy::ReadPlanStep>& steps,
+    std::vector<std::string>* values) {
+  if (values == nullptr || steps.empty()) return false;
+  if (!ro_novalidate_) return false;
+
+  LineairDBProxy::ReadPlanResult result =
+      lineairdb_proxy->tx_execute_read_plan(steps);
+  if (!result.ok || result.steps.size() != steps.size()) {
+    rpc_trace_.record_local_view("abort_read_plan_raw_rpc");
+    is_aborted_ = true;
+    return false;
+  }
+  *values = std::move(result.steps[0].scan_values);
+  return true;
+}
+
 void LineairDBTransaction::push_range_scan_cache(LocalRangeScanEntry entry) {
   range_scan_start_index_[scan_cache_index_key(entry.table_name, "",
                                                entry.start_key)]
@@ -1307,6 +1346,8 @@ LineairDBTransaction::lookup_range_scan_cache(
     bool allow_truncated) const {
   const bool pending_in_range =
       has_pending_row_ops_in_range(table_name, start_key, end_key);
+  const bool aggregate_consumer =
+      !pushed_aggregate_.empty() && pushed_aggregate_table_ == table_name;
 
   // Grouped for_each range probes are staged by exact start key. Try that
   // index before falling back to the wider range-cache scan below.
@@ -1316,6 +1357,7 @@ LineairDBTransaction::lookup_range_scan_cache(
     for (auto rit = idx_it->second.rbegin(); rit != idx_it->second.rend();
          ++rit) {
       const auto& e = range_scan_cache_[*rit];
+      if (e.aggregate_rows != aggregate_consumer) continue;
       if (e.row_limit != 0 && pending_in_range) continue;
       if (e.reverse_scan == reverse_scan && e.row_limit == row_limit &&
           end_key <= e.end_key) {
@@ -1345,6 +1387,7 @@ LineairDBTransaction::lookup_range_scan_cache(
 
   for (auto it = range_scan_cache_.rbegin();
        it != range_scan_cache_.rend(); ++it) {
+    if (it->aggregate_rows != aggregate_consumer) continue;
     if (it->row_limit != 0 && pending_in_range) continue;
     const bool same_table = it->table_name == table_name;
     const bool same_direction = it->reverse_scan == reverse_scan;
@@ -1384,6 +1427,7 @@ LineairDBTransaction::lookup_range_scan_cache(
       for (auto rit = idx_it->second.rbegin(); rit != idx_it->second.rend();
            ++rit) {
         const auto& e = range_scan_cache_[*rit];
+        if (e.aggregate_rows != aggregate_consumer) continue;
         if (e.row_limit > 0 && !e.reverse_scan && e.start_key == start_key &&
             e.end_key == end_key) {
           LocalRangeScanEntry cached = e;

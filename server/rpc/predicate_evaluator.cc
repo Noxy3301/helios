@@ -5,8 +5,46 @@
 #include <climits>
 #include <cstdlib>
 #include <cstring>
+#include <string>
 
 using FilterExpr = LineairDB::Protocol::FilterExpr;
+
+namespace {
+
+bool parse_int_value(std::string_view value, int64_t* out) {
+  if (out == nullptr || value.empty()) return false;
+  const std::string text(value);
+  errno = 0;
+  char* end = nullptr;
+  const long long parsed = std::strtoll(text.c_str(), &end, 10);
+  if (errno != 0 || end != text.c_str() + text.size()) return false;
+  *out = static_cast<int64_t>(parsed);
+  return true;
+}
+
+bool parse_uint_value(std::string_view value, uint64_t* out) {
+  if (out == nullptr || value.empty() || value.front() == '-') return false;
+  const std::string text(value);
+  errno = 0;
+  char* end = nullptr;
+  const unsigned long long parsed = std::strtoull(text.c_str(), &end, 10);
+  if (errno != 0 || end != text.c_str() + text.size()) return false;
+  *out = static_cast<uint64_t>(parsed);
+  return true;
+}
+
+bool parse_double_value(std::string_view value, double* out) {
+  if (out == nullptr || value.empty()) return false;
+  const std::string text(value);
+  errno = 0;
+  char* end = nullptr;
+  const double parsed = std::strtod(text.c_str(), &end);
+  if (errno != 0 || end != text.c_str() + text.size()) return false;
+  *out = parsed;
+  return true;
+}
+
+}  // namespace
 
 // ---------------------------------------------------------------------------
 // Row parsing
@@ -72,6 +110,40 @@ bool PredicateEvaluator::parse_row(const char* data, size_t length,
   return field_index == total_fields;
 }
 
+bool PredicateEvaluator::set_row_from_pax(
+    const LineairDB::Pax::PaxGroup& group, uint32_t slot,
+    uint32_t num_columns) {
+  columns_.clear();
+  null_flags_.clear();
+
+  if (group.schema().field_count() < static_cast<size_t>(num_columns) + 1) {
+    return false;
+  }
+
+  const std::string_view null_flags = group.cell(0, slot);
+  null_flags_.assign(null_flags.data(), null_flags.size());
+
+  columns_.reserve(num_columns);
+  for (uint32_t i = 0; i < num_columns; ++i) {
+    columns_.push_back(group.cell(i + 1, slot));
+  }
+  return true;
+}
+
+void PredicateEvaluator::set_row_from_views(
+    const std::vector<std::string_view>& cells,
+    const std::vector<bool>& nulls) {
+  columns_.assign(cells.begin(), cells.end());
+  null_flags_.assign((columns_.size() + 7) / 8, 0);
+  for (size_t idx = 0; idx < nulls.size() && idx < columns_.size(); ++idx) {
+    if (nulls[idx]) {
+      null_flags_[idx / 8] =
+          static_cast<char>(static_cast<unsigned char>(null_flags_[idx / 8]) |
+                            (1u << (idx % 8)));
+    }
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Value extraction
 // ---------------------------------------------------------------------------
@@ -127,10 +199,7 @@ PredicateEvaluator::Val PredicateEvaluator::extract_value(
       switch (expr.compare_type()) {
         case 0: {  // SIGNED_INT
           v.type = ValType::INT;
-          errno = 0;
-          char* end = nullptr;
-          v.i = std::strtoll(col.data(), &end, 10);
-          if (errno != 0 || end == col.data()) {
+          if (!parse_int_value(col, &v.i)) {
             // Conversion failed → fall back to string comparison
             v.type = ValType::STRING;
             v.s = col;
@@ -139,10 +208,7 @@ PredicateEvaluator::Val PredicateEvaluator::extract_value(
         }
         case 1: {  // UNSIGNED_INT
           v.type = ValType::UINT;
-          errno = 0;
-          char* end = nullptr;
-          v.u = std::strtoull(col.data(), &end, 10);
-          if (errno != 0 || end == col.data()) {
+          if (!parse_uint_value(col, &v.u)) {
             v.type = ValType::STRING;
             v.s = col;
           }
@@ -150,10 +216,7 @@ PredicateEvaluator::Val PredicateEvaluator::extract_value(
         }
         case 2: {  // DOUBLE
           v.type = ValType::DOUBLE;
-          errno = 0;
-          char* end = nullptr;
-          v.d = std::strtod(col.data(), &end);
-          if (errno != 0 || end == col.data()) {
+          if (!parse_double_value(col, &v.d)) {
             v.type = ValType::STRING;
             v.s = col;
           }

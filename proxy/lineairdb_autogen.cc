@@ -26,6 +26,8 @@
 #include "sql/table.h"
 #include "storage/lineairdb/ha_lineairdb.hh"
 
+extern handlerton *lineairdb_hton;
+
 namespace {
 
 struct UnsupportedQep {
@@ -136,20 +138,14 @@ bool is_int32_key_field(const Field *f) {
          f->pack_length() == 4 && !f->is_unsigned();
 }
 
-// Physical-table key from a TABLE's own share: "./<db>/<table>", matching the
-// path ha_lineairdb::open() stores in db_table_name.
+// Handler table key from the TABLE share path. MySQL passes the same normalized
+// path to ha_lineairdb::open(), and the handler stores it as db_table_name.
 std::string physical_table_key(const TABLE *t) {
   if (t == nullptr || t->s == nullptr) return std::string();
   const TABLE_SHARE *s = t->s;
-  std::string key = "./";
-  if (s->db.str != nullptr && s->db.length > 0) {
-    key.append(s->db.str, s->db.length);
-  }
-  key.push_back('/');
-  if (s->table_name.str != nullptr && s->table_name.length > 0) {
-    key.append(s->table_name.str, s->table_name.length);
-  }
-  return key;
+  if (s->normalized_path.str == nullptr || s->normalized_path.length == 0)
+    return std::string();
+  return std::string(s->normalized_path.str, s->normalized_path.length);
 }
 
 int qep_table_field_index(TABLE *t, Field *f) {
@@ -1308,6 +1304,114 @@ bool autogen_read_plan_from_qep(
     }
   }
 
+  LineairDBTransaction *tx = nullptr;
+  const auto find_tx = [&]() -> LineairDBTransaction * {
+    if (tx != nullptr) return tx;
+    for (const auto &aliases : step_aliases) {
+      for (TABLE *t : aliases) {
+        if (t == nullptr || t->file == nullptr || t->file->ht != lineairdb_hton)
+          continue;
+        tx = down_cast<ha_lineairdb *>(t->file)->tx_for_autogen();
+        return tx;
+      }
+    }
+    return nullptr;
+  };
+
+  // If aggregate pushdown registered a grouped summary leaf, drop the base
+  // full-scan step from prefetch staging. The handler will serve that TABLE*
+  // from synthetic GROUP rows instead of base rows.
+  if (allow_filter_pushdown) {
+    LineairDBTransaction *query_tx = find_tx();
+    if (query_tx != nullptr &&
+        query_tx->has_grouped_summary_registrations()) {
+      std::vector<bool> referenced(steps.size(), false);
+      for (const auto &step : steps) {
+        for (const auto &binding : step.bindings) {
+          if (binding.source_step < referenced.size())
+            referenced[binding.source_step] = true;
+        }
+        for (const auto &binding : step.end_bindings) {
+          if (binding.source_step < referenced.size())
+            referenced[binding.source_step] = true;
+        }
+        for (const auto &semijoin : step.semijoins) {
+          if (semijoin.source_step < referenced.size())
+            referenced[semijoin.source_step] = true;
+        }
+      }
+
+      std::vector<uint32_t> new_index(steps.size(), 0);
+      std::vector<bool> dropped(steps.size(), false);
+      std::vector<LineairDBProxy::ReadPlanStep> kept;
+      std::vector<std::vector<TABLE *>> kept_aliases;
+      kept.reserve(steps.size());
+      kept_aliases.reserve(step_aliases.size());
+
+      bool any_drop = false;
+      for (size_t i = 0; i < steps.size(); ++i) {
+        bool drop = steps[i].is_scan && !steps[i].for_each &&
+                    steps[i].key_prefix.empty() &&
+                    steps[i].end_key_prefix ==
+                        lineairdb_keyenc::scan_end_sentinel() &&
+                    steps[i].serialized_filter.empty() &&
+                    steps[i].scan_limit == 0 && !referenced[i] &&
+                    i < step_aliases.size() && !step_aliases[i].empty() &&
+                    steps[i].semijoins.empty();
+        if (drop) {
+          for (TABLE *alias : step_aliases[i]) {
+            if (alias == nullptr ||
+                query_tx->grouped_summary_registration(alias) == nullptr) {
+              drop = false;
+              break;
+            }
+          }
+        }
+        if (drop) {
+          for (TABLE *alias : step_aliases[i]) {
+            query_tx->mark_grouped_summary_skipped(alias);
+          }
+          dropped[i] = true;
+          any_drop = true;
+          continue;
+        }
+        new_index[i] = static_cast<uint32_t>(kept.size());
+        kept.push_back(std::move(steps[i]));
+        kept_aliases.push_back(std::move(step_aliases[i]));
+      }
+
+      steps = std::move(kept);
+      step_aliases = std::move(kept_aliases);
+      if (any_drop) {
+        for (auto &step : steps) {
+          for (auto &binding : step.bindings) {
+            if (binding.source_step < new_index.size())
+              binding.source_step = new_index[binding.source_step];
+          }
+          for (auto &binding : step.end_bindings) {
+            if (binding.source_step < new_index.size())
+              binding.source_step = new_index[binding.source_step];
+          }
+          for (auto &semijoin : step.semijoins) {
+            if (semijoin.source_step < new_index.size())
+              semijoin.source_step = new_index[semijoin.source_step];
+          }
+        }
+        for (auto it = table_steps.begin(); it != table_steps.end();) {
+          const int idx = it->second;
+          if (idx >= 0 && idx < static_cast<int>(dropped.size()) &&
+              dropped[idx]) {
+            it = table_steps.erase(it);
+          } else {
+            if (idx >= 0 && idx < static_cast<int>(new_index.size()))
+              it->second = static_cast<int>(new_index[idx]);
+            ++it;
+          }
+        }
+      }
+    }
+  }
+
   // Attach scan filters once the plan is known. A rejected key caches as a
   // table-level not-found entry shared by every step on the table, so skip a
   // multi-step table; on a folded step attach only when EVERY alias builds the
@@ -1479,6 +1583,56 @@ bool autogen_read_plan_from_qep(
     }
   }
 
+  // Grouped semijoin: prepend the inner GROUP BY/HAVING aggregate step and use
+  // its group keys as a membership set for the plain outer scan.
+  if (allow_filter_pushdown) {
+    LineairDBTransaction *query_tx = find_tx();
+    if (query_tx != nullptr && !query_tx->grouped_semijoins().empty()) {
+      for (const auto &grouped_semijoin : query_tx->grouped_semijoins()) {
+        int outer_idx = -1;
+        for (size_t i = 0; i < steps.size(); ++i) {
+          const auto &step = steps[i];
+          if (step.is_scan && !step.for_each &&
+              step.table_name == grouped_semijoin.outer_table_key &&
+              step.aggregate_serialized.empty() && step.index_name.empty() &&
+              step.key_prefix.empty() &&
+              step.end_key_prefix == lineairdb_keyenc::scan_end_sentinel() &&
+              step.scan_limit == 0 && step.semijoins.empty()) {
+            outer_idx = static_cast<int>(i);
+            break;
+          }
+        }
+        if (outer_idx < 0) continue;
+
+        LineairDBProxy::ReadPlanStep aggregate_step;
+        aggregate_step.table_name = grouped_semijoin.inner_table_key;
+        aggregate_step.is_scan = true;
+        aggregate_step.for_each = false;
+        aggregate_step.end_key_prefix = lineairdb_keyenc::scan_end_sentinel();
+        aggregate_step.aggregate_serialized = grouped_semijoin.agg_spec;
+        aggregate_step.serialized_filter = grouped_semijoin.having_filter;
+
+        steps.insert(steps.begin(), std::move(aggregate_step));
+        step_aliases.insert(step_aliases.begin(), {});
+        for (auto &step : steps) {
+          for (auto &binding : step.bindings) ++binding.source_step;
+          for (auto &binding : step.end_bindings) ++binding.source_step;
+          for (auto &semijoin : step.semijoins) ++semijoin.source_step;
+        }
+        for (auto &kv : table_steps) {
+          if (kv.second >= 0) ++kv.second;
+        }
+
+        LineairDBProxy::ReadPlanStep::Semijoin semijoin;
+        semijoin.source_step = 0;
+        semijoin.source_column = 0;
+        semijoin.probe_column = grouped_semijoin.outer_probe_column;
+        steps[static_cast<size_t>(outer_idx + 1)].semijoins.push_back(
+            std::move(semijoin));
+      }
+    }
+  }
+
   *out = std::move(steps);
   return true;
 }
@@ -1488,6 +1642,11 @@ void plan_projection_pushdown(
     std::unordered_map<std::string, std::vector<uint32_t>> *kept_out) {
   kept_out->clear();
   if (thd == nullptr || thd->lex == nullptr || steps == nullptr) return;
+
+  const auto source_is_aggregate = [&](uint32_t source_step) -> bool {
+    return source_step < steps->size() &&
+           !(*steps)[source_step].aggregate_serialized.empty();
+  };
 
   std::unordered_map<std::string, std::vector<bool>> union_rs;
   std::unordered_map<std::string, uint32_t> fields_of;
@@ -1545,6 +1704,7 @@ void plan_projection_pushdown(
   for (const auto &s : *steps) {
     for (const auto &sj : s.semijoins) {
       if (sj.source_step >= steps->size()) continue;
+      if (source_is_aggregate(sj.source_step)) continue;
       const std::string &src = (*steps)[sj.source_step].table_name;
       auto fo = fields_of.find(src);
       if (fo == fields_of.end()) continue;
@@ -1598,6 +1758,7 @@ void plan_projection_pushdown(
   for (auto &s : *steps) {
     for (auto &sj : s.semijoins) {
       if (sj.source_step >= steps->size()) continue;
+      if (source_is_aggregate(sj.source_step)) continue;
       auto it = full_to_proj.find((*steps)[sj.source_step].table_name);
       if (it == full_to_proj.end()) continue;
       const uint32_t fi = sj.source_column;
@@ -1607,6 +1768,7 @@ void plan_projection_pushdown(
   }
 
   for (auto &s : *steps) {
+    if (!s.aggregate_serialized.empty()) continue;
     auto it = kept_out->find(s.table_name);
     if (it == kept_out->end()) continue;
     s.projection = it->second;

@@ -56,6 +56,10 @@ int ha_lineairdb::rnd_init(bool) {
     DBUG_RETURN(err);
   }
 
+  if (tx->grouped_summary_skipped(table)) {
+    DBUG_RETURN(fill_grouped_summary_buffers(tx));
+  }
+
   DBUG_RETURN(0);
 }
 

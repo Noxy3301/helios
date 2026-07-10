@@ -111,6 +111,45 @@ std::string build_plan_key(
     return key;
 }
 
+void collect_filter_columns(
+    const LineairDB::Protocol::FilterExpr& expr,
+    std::vector<uint32_t>& columns) {
+    if (expr.op() == LineairDB::Protocol::FilterExpr::COLUMN_REF) {
+        columns.push_back(expr.column_index());
+    }
+    for (const auto& child : expr.children()) {
+        collect_filter_columns(child, columns);
+    }
+}
+
+const std::vector<uint32_t>* selected_columns_for_materialization(
+    const LineairDB::Protocol::TxExecuteReadPlan::PlanStep& step,
+    std::vector<uint32_t>& selected_columns) {
+    selected_columns.clear();
+    if (!step.has_projection() ||
+        step.projection().field_indexes_size() == 0) {
+        return nullptr;
+    }
+    selected_columns.assign(step.projection().field_indexes().begin(),
+                            step.projection().field_indexes().end());
+    if (step.has_filter() && step.filter().has_expr() &&
+        !is_aggregate_having_filter(step)) {
+        collect_filter_columns(step.filter().expr(), selected_columns);
+    }
+    for (const auto& semijoin : step.semijoins()) {
+        selected_columns.push_back(semijoin.probe_column());
+    }
+    std::sort(selected_columns.begin(), selected_columns.end());
+    selected_columns.erase(
+        std::unique(selected_columns.begin(), selected_columns.end()),
+        selected_columns.end());
+    if (step.projection().num_columns() > 0 &&
+        selected_columns.size() >= step.projection().num_columns()) {
+        return nullptr;
+    }
+    return &selected_columns;
+}
+
 }  // namespace
 
 void LineairDBRpc::handleTxExecuteReadPlan(const std::string& message,
@@ -143,8 +182,10 @@ void LineairDBRpc::handleTxExecuteReadPlan(const std::string& message,
 
         // Step-level row filter: parseable non-matches are dropped; rows the
         // evaluator cannot parse are returned for MySQL to re-check.
+        const bool step_has_group_having = is_aggregate_having_filter(step);
         const bool step_has_filter =
-            step.has_filter() && step.filter().has_expr();
+            step.has_filter() && step.filter().has_expr() &&
+            !step_has_group_having;
         const auto* step_filter =
             step_has_filter ? &step.filter().expr() : nullptr;
         const uint32_t step_filter_cols =
@@ -159,10 +200,16 @@ void LineairDBRpc::handleTxExecuteReadPlan(const std::string& message,
             return step_eval.evaluate(*step_filter);
         };
 
-        // Filters read the full row. Projection then trims emitted VALUES to
-        // the kept columns; malformed rows fail the plan instead of mixing
-        // full and projected layouts.
         const bool step_has_projection = step.has_projection();
+        std::vector<uint32_t> selected_columns;
+        const std::vector<uint32_t>* selected_columns_for_reads =
+            selected_columns_for_materialization(step, selected_columns);
+
+        // PAX-backed reads can materialize only the selected payloads needed
+        // for server-side filtering and final projection while keeping the
+        // full row shape. Projection then trims emitted VALUES to the kept
+        // columns; malformed rows fail the plan instead of mixing full and
+        // projected layouts.
         bool projection_failed = false;
         auto project_value = [&](std::string&& v) -> std::string {
             if (!step_has_projection || v.empty()) return std::move(v);
@@ -173,6 +220,49 @@ void LineairDBRpc::handleTxExecuteReadPlan(const std::string& message,
             }
             projection_failed = true;
             return std::move(v);
+        };
+
+        // Build membership sets from earlier source steps, then drop probe
+        // rows whose join key is absent. This is a plan-local reduction, not a
+        // row predicate, so rejected rows are not negative-cache material.
+        std::vector<SemijoinReduction> semijoin_reductions;
+        const int this_step_idx =
+            static_cast<int>(previous_results.size()) - 1;
+        for (const auto& sj : step.semijoins()) {
+            const int source_step = static_cast<int>(sj.source_step());
+            if (source_step < 0 || source_step >= this_step_idx) continue;
+            SemijoinReduction reduction;
+            reduction.probe_column = sj.probe_column();
+            const bool source_filter_on =
+                sj.has_source_filter() && sj.source_filter().has_expr();
+            const uint32_t source_filter_columns =
+                source_filter_on ? sj.source_filter().num_columns() : 0;
+            for (const auto& value :
+                 previous_results[source_step]->scan_values()) {
+                if (value.empty()) continue;
+                if (source_filter_on) {
+                    PredicateEvaluator evaluator;
+                    if (evaluator.parse_row(value.data(), value.size(),
+                                            source_filter_columns) &&
+                        !evaluator.evaluate(sj.source_filter().expr())) {
+                        continue;
+                    }
+                }
+                auto column = extract_value_column(value, sj.source_column());
+                if (!column.empty()) reduction.keys.emplace(column);
+            }
+            semijoin_reductions.push_back(std::move(reduction));
+        }
+        auto semijoin_rejects = [&](const std::string& value) -> bool {
+            for (const auto& reduction : semijoin_reductions) {
+                auto column =
+                    extract_value_column(value, reduction.probe_column);
+                if (reduction.keys.find(std::string(column)) ==
+                    reduction.keys.end()) {
+                    return true;
+                }
+            }
+            return false;
         };
 
         if (step.for_each()) {
@@ -188,46 +278,6 @@ void LineairDBRpc::handleTxExecuteReadPlan(const std::string& message,
                 source_step >= static_cast<int>(previous_results.size()) - 1) {
                 continue;
             }
-
-            // Build membership sets from earlier source steps, then drop
-            // probe rows whose join key is absent.
-            struct FeSemijoin {
-                std::unordered_set<std::string> keys;
-                uint32_t probe_column;
-            };
-            std::vector<FeSemijoin> fe_semijoins;
-            const int this_step_idx =
-                static_cast<int>(previous_results.size()) - 1;
-            for (const auto& sj : step.semijoins()) {
-                const int ss = static_cast<int>(sj.source_step());
-                if (ss < 0 || ss >= this_step_idx) continue;
-                FeSemijoin fsj;
-                fsj.probe_column = sj.probe_column();
-                const bool sf_on =
-                    sj.has_source_filter() && sj.source_filter().has_expr();
-                const uint32_t sf_cols =
-                    sf_on ? sj.source_filter().num_columns() : 0;
-                for (const auto& v : previous_results[ss]->scan_values()) {
-                    if (v.empty()) continue;
-                    if (sf_on) {
-                        PredicateEvaluator se;
-                        if (se.parse_row(v.data(), v.size(), sf_cols) &&
-                            !se.evaluate(sj.source_filter().expr()))
-                            continue;
-                    }
-                    auto col = extract_value_column(v, sj.source_column());
-                    if (!col.empty()) fsj.keys.emplace(col);
-                }
-                fe_semijoins.push_back(std::move(fsj));
-            }
-            auto sj_reject = [&](const std::string& value) -> bool {
-                for (const auto& fsj : fe_semijoins) {
-                    auto col = extract_value_column(value, fsj.probe_column);
-                    if (fsj.keys.find(std::string(col)) == fsj.keys.end())
-                        return true;  // no join partner -> drop
-                }
-                return false;
-            };
 
             const auto* source = previous_results[source_step];
             const int row_count =
@@ -322,7 +372,8 @@ void LineairDBRpc::handleTxExecuteReadPlan(const std::string& message,
                                         db->StatelessRangeScan(
                                             step.table_name(), row_key,
                                             row_end, step.scan_limit(),
-                                            step.reverse_scan());
+                                            step.reverse_scan(),
+                                            selected_columns_for_reads);
                                     if (!scan_result.ok) {
                                         failed[worker_index] = 1;
                                         break;
@@ -330,8 +381,8 @@ void LineairDBRpc::handleTxExecuteReadPlan(const std::string& message,
                                     for (auto& r : scan_result.rows) {
                                         if (!worker_row_passes(r.value))
                                             continue;
-                                        if (!fe_semijoins.empty() &&
-                                            sj_reject(r.value))
+                                        if (!semijoin_reductions.empty() &&
+                                            semijoin_rejects(r.value))
                                             continue;
                                         out.keys.push_back(std::move(r.key));
                                         out.values.push_back(worker_project(
@@ -346,7 +397,8 @@ void LineairDBRpc::handleTxExecuteReadPlan(const std::string& message,
                                             step.table_name(),
                                             step.index_name(), row_key,
                                             row_end, step.scan_limit(),
-                                            step.reverse_scan());
+                                            step.reverse_scan(),
+                                            selected_columns_for_reads);
                                     if (!scan_result.ok) {
                                         failed[worker_index] = 1;
                                         break;
@@ -354,8 +406,8 @@ void LineairDBRpc::handleTxExecuteReadPlan(const std::string& message,
                                     for (auto& r : scan_result.rows) {
                                         if (!worker_row_passes(r.value))
                                             continue;
-                                        if (!fe_semijoins.empty() &&
-                                            sj_reject(r.value))
+                                        if (!semijoin_reductions.empty() &&
+                                            semijoin_rejects(r.value))
                                             continue;
                                         out.secondary_keys.push_back(
                                             std::move(r.secondary_key));
@@ -372,12 +424,13 @@ void LineairDBRpc::handleTxExecuteReadPlan(const std::string& message,
                             } else {
                                 auto read_result =
                                     db->StatelessRead(step.table_name(),
-                                                      row_key);
+                                                      row_key,
+                                                      selected_columns_for_reads);
                                 out.keys.push_back(row_key);
                                 out.tids.push_back(read_result.tid);
                                 if (read_result.found &&
-                                    !(!fe_semijoins.empty() &&
-                                      sj_reject(read_result.value))) {
+                                    !(!semijoin_reductions.empty() &&
+                                      semijoin_rejects(read_result.value))) {
                                     out.values.push_back(worker_project(
                                         std::move(read_result.value)));
                                 } else {
@@ -442,7 +495,8 @@ void LineairDBRpc::handleTxExecuteReadPlan(const std::string& message,
                         auto scan_result =
                             db_manager_->get_database()->StatelessRangeScan(
                                 step.table_name(), row_key, row_end,
-                                step.scan_limit(), step.reverse_scan());
+                                step.scan_limit(), step.reverse_scan(),
+                                selected_columns_for_reads);
                         if (!scan_result.ok) {
                             response.set_ok(false);
                             flat_plan::encode_to_string(response, result);
@@ -450,7 +504,8 @@ void LineairDBRpc::handleTxExecuteReadPlan(const std::string& message,
                         }
                         for (auto& r : scan_result.rows) {
                             if (!row_passes(r.value)) continue;
-                            if (!fe_semijoins.empty() && sj_reject(r.value))
+                            if (!semijoin_reductions.empty() &&
+                                semijoin_rejects(r.value))
                                 continue;
                             step_result->add_scan_keys(std::move(r.key));
                             step_result->add_scan_values(
@@ -465,7 +520,8 @@ void LineairDBRpc::handleTxExecuteReadPlan(const std::string& message,
                                 ->StatelessSecondaryRangeScan(
                                     step.table_name(), step.index_name(),
                                     row_key, row_end, step.scan_limit(),
-                                    step.reverse_scan());
+                                    step.reverse_scan(),
+                                    selected_columns_for_reads);
                         if (!scan_result.ok) {
                             response.set_ok(false);
                             flat_plan::encode_to_string(response, result);
@@ -473,7 +529,8 @@ void LineairDBRpc::handleTxExecuteReadPlan(const std::string& message,
                         }
                         for (auto& r : scan_result.rows) {
                             if (!row_passes(r.value)) continue;
-                            if (!fe_semijoins.empty() && sj_reject(r.value))
+                            if (!semijoin_reductions.empty() &&
+                                semijoin_rejects(r.value))
                                 continue;
                             step_result->add_secondary_keys(
                                 std::move(r.secondary_key));
@@ -494,12 +551,13 @@ void LineairDBRpc::handleTxExecuteReadPlan(const std::string& message,
 
                 auto read_result =
                     db_manager_->get_database()->StatelessRead(
-                        step.table_name(), row_key);
+                        step.table_name(), row_key,
+                        selected_columns_for_reads);
                 step_result->add_scan_keys(row_key);
                 step_result->add_scan_tids(read_result.tid);
                 if (read_result.found &&
-                    !(!fe_semijoins.empty() &&
-                      sj_reject(read_result.value))) {
+                    !(!semijoin_reductions.empty() &&
+                      semijoin_rejects(read_result.value))) {
                     step_result->add_scan_values(
                         project_value(std::move(read_result.value)));
                 } else {
@@ -518,7 +576,7 @@ void LineairDBRpc::handleTxExecuteReadPlan(const std::string& message,
         if (!step.is_scan()) {
             auto read_result =
                 db_manager_->get_database()->StatelessRead(
-                    step.table_name(), start_key);
+                    step.table_name(), start_key, selected_columns_for_reads);
             step_result->set_actual_key(start_key);
             step_result->set_actual_start_key(start_key);
             step_result->set_found(read_result.found);
@@ -540,15 +598,34 @@ void LineairDBRpc::handleTxExecuteReadPlan(const std::string& message,
             if (!step.for_each() && step.scan_limit() == 0 &&
                 !step.reverse_scan() && step.has_aggregate() &&
                 step.aggregate().aggs_size() > 0) {
+                if (parallel_primary_pax_aggregate_scan(
+                        db_manager_->get_database().get(), step, start_key,
+                        end_key, step_result)) {
+                    continue;
+                }
                 if (parallel_primary_aggregate_scan(
                         db_manager_->get_database().get(), step, start_key,
                         end_key, step_result)) {
                     continue;
                 }
             }
+            if (!(step.has_aggregate() && step.aggregate().aggs_size() > 0)) {
+                if (parallel_primary_pax_row_ref_scan(
+                        db_manager_->get_database().get(), step, start_key,
+                        end_key, step_result, projection_failed,
+                        semijoin_reductions)) {
+                    if (projection_failed) {
+                        response.set_ok(false);
+                        flat_plan::encode_to_string(response, result);
+                        return;
+                    }
+                    continue;
+                }
+            }
             if (!step.for_each() && step.scan_limit() == 0 &&
                 !step.reverse_scan() &&
                 !(step.has_aggregate() && step.aggregate().aggs_size() > 0) &&
+                semijoin_reductions.empty() &&
                 step.has_filter() && step.filter().has_expr()) {
                 if (parallel_primary_filter_scan(
                         db_manager_->get_database().get(), step, start_key,
@@ -558,14 +635,14 @@ void LineairDBRpc::handleTxExecuteReadPlan(const std::string& message,
             }
 
             // With a pushed filter, LIMIT must apply after filter evaluation.
-            const bool limit_after_filter =
-                step.has_filter() && step.filter().has_expr();
+            const bool limit_after_filter = step_has_filter;
             const uint64_t scan_limit_for_lineairdb =
                 limit_after_filter ? 0 : step.scan_limit();
             auto scan_result =
                 db_manager_->get_database()->StatelessRangeScan(
                     step.table_name(), start_key, end_key,
-                    scan_limit_for_lineairdb, step.reverse_scan());
+                    scan_limit_for_lineairdb, step.reverse_scan(),
+                    selected_columns_for_reads);
             if (!scan_result.ok) {
                 response.set_ok(false);
                 flat_plan::encode_to_string(response, result);
@@ -598,8 +675,9 @@ void LineairDBRpc::handleTxExecuteReadPlan(const std::string& message,
                     }
                     scan_result.rows = std::move(filtered);
                 }
-                aggregated = server_aggregate_scan(step.aggregate(),
-                                                   scan_result.rows, step_result);
+                aggregated = server_aggregate_scan(
+                    step.aggregate(), scan_result.rows, step_result,
+                    step_has_group_having ? &step.filter() : nullptr);
             }
             if (!aggregated) {
                 uint64_t emitted = 0;
@@ -607,6 +685,10 @@ void LineairDBRpc::handleTxExecuteReadPlan(const std::string& message,
                     if (!row_passes(row.value)) {
                         // Negative coverage for point probes into this scan.
                         step_result->add_filtered_keys(std::move(row.key));
+                        continue;
+                    }
+                    if (!semijoin_reductions.empty() &&
+                        semijoin_rejects(row.value)) {
                         continue;
                     }
                     step_result->add_scan_keys(std::move(row.key));
@@ -624,7 +706,8 @@ void LineairDBRpc::handleTxExecuteReadPlan(const std::string& message,
             auto scan_result =
                 db_manager_->get_database()->StatelessSecondaryRangeScan(
                     step.table_name(), step.index_name(), start_key, end_key,
-                    step.scan_limit(), step.reverse_scan());
+                    step.scan_limit(), step.reverse_scan(),
+                    selected_columns_for_reads);
             if (!scan_result.ok) {
                 response.set_ok(false);
                 flat_plan::encode_to_string(response, result);
@@ -634,6 +717,10 @@ void LineairDBRpc::handleTxExecuteReadPlan(const std::string& message,
                 if (!row_passes(row.value)) {
                     // Secondary scans report rejected rows by primary key.
                     step_result->add_filtered_keys(std::move(row.primary_key));
+                    continue;
+                }
+                if (!semijoin_reductions.empty() &&
+                    semijoin_rejects(row.value)) {
                     continue;
                 }
                 step_result->add_secondary_keys(std::move(row.secondary_key));

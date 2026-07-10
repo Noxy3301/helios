@@ -82,6 +82,9 @@ private:
     // Read-plan execution
     void handleTxExecuteReadPlan(const std::string& message, std::string& result);
 
+    // Query-block execution
+    void handleTxExecuteQueryBlock(const std::string& message, std::string& result);
+
     // Secondary index operations
     void handleTxReadSecondaryIndex(const std::string& message, std::string& result);
     void handleTxWriteSecondaryIndex(const std::string& message, std::string& result);

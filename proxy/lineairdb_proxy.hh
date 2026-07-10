@@ -80,7 +80,10 @@ enum class MessageType : uint32_t {
     TX_STATELESS_BATCH_READ = 28,
     TX_VALIDATE_AND_COMMIT = 29,
     TX_EXECUTE_READ_PLAN = 30,
-    TX_GET_TABLE_STATS = 31
+    TX_GET_TABLE_STATS = 31,
+
+    // Secondary-engine computation pushdown.
+    TX_EXECUTE_QUERY_BLOCK = 36
 };
 
 /**
@@ -252,6 +255,10 @@ public:
         const std::vector<StatelessReadKey>& keys);
     ReadPlanResult tx_execute_read_plan(
         const std::vector<ReadPlanStep>& steps);
+    // Send a prepared query-block request to the LineairDB server.
+    bool tx_execute_query_block(
+        const LineairDB::Protocol::TxExecuteQueryBlock::Request& request,
+        LineairDB::Protocol::TxExecuteQueryBlock::Response* response);
     bool tx_validate_and_commit(
         const std::vector<StatelessReadKey>& reads,
         const std::vector<uint64_t>& read_tids,
@@ -326,7 +333,11 @@ public:
                                                                                const std::string& end_key);
 
     // table/index management (non-transactional)
-    bool db_create_table(const std::string& table_name);
+    // Optional PAX storage cell widths. Entry 0 is the null-flags field; later
+    // entries follow TABLE::field order. Empty keeps the ordinary row layout.
+    bool db_create_table(
+        const std::string& table_name,
+        const std::vector<uint32_t>& pax_field_max_bytes = {});
     bool db_set_table(int64_t tx_id, const std::string& table_name);
     bool db_create_secondary_index(const std::string& table_name,
                                    const std::string& index_name,

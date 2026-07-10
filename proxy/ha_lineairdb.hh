@@ -45,6 +45,7 @@
 #include <atomic>
 #include <cmath>
 #include <cstdint>
+#include <memory>
 #include <mutex>
 #include <unordered_map>
 #include <vector>
@@ -118,6 +119,18 @@ struct RangeScanLimit {
 RangeScanLimit range_scan_limit_for_order(THD *thd, const KEY *key,
                                           uint matched_prefix,
                                           bool has_mysql_only_filter);
+
+namespace lineairdb {
+
+/**
+ * @brief Return the THD-scoped RPC proxy shared by LineairDB engines.
+ *
+ * The primary handler owns the connection context. Secondary handlers use this
+ * entry point so both engines talk to the same LineairDB server for a session.
+ */
+std::shared_ptr<LineairDBProxy> acquire_shared_proxy(THD *thd);
+
+}  // namespace lineairdb
 
 /** @brief
   Class definition for the storage engine
@@ -195,6 +208,7 @@ private:
   std::string serialize_hidden_primary_key(uint64_t row_id) const;
   bool fetch_next_batch();
   void reset_index_search_buffers();
+  int fill_grouped_summary_buffers(LineairDBTransaction *tx);
 
 public:
   ha_lineairdb(handlerton *hton, TABLE_SHARE *table_arg);
@@ -516,6 +530,28 @@ public:
    * @brief Return true if aggregate staging aborted.
    */
   bool tx_is_aborted();
+
+  /**
+   * @brief Register a grouped aggregate leaf for synthetic summary-row serving.
+   */
+  void tx_register_grouped_summary(
+      LineairDBTransaction::GroupedSummaryRegistration registration);
+
+  /**
+   * @brief Register a grouped semijoin reduction for this statement.
+   */
+  void tx_register_grouped_semijoin(
+      LineairDBTransaction::GroupedSemijoin grouped_semijoin);
+
+  /**
+   * @brief Return true if this statement already has grouped-semijoin state.
+   */
+  bool tx_has_grouped_semijoin();
+
+  /**
+   * @brief Return the transaction used by QEP read-plan autogen.
+   */
+  LineairDBTransaction *tx_for_autogen();
 
   int rnd_pos(uchar *buf, uchar *pos) override; ///< required
   void position(const uchar *record) override;  ///< required
