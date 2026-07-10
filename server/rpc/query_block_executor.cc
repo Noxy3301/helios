@@ -1298,11 +1298,9 @@ class Executor {
         const NodeResult& input,
         const std::vector<TupleFilterColumn>& columns, size_t row_idx,
         std::vector<std::string_view>* cells,
-        std::vector<bool>* nulls,
-        std::vector<std::string>* bufs) const {
+        std::vector<bool>* nulls) const {
         cells->resize(columns.size());
         nulls->resize(columns.size());
-        bufs->resize(columns.size());
         for (size_t column_idx = 0; column_idx < columns.size();
              ++column_idx) {
             const TupleFilterColumn& column = columns[column_idx];
@@ -1313,12 +1311,11 @@ class Executor {
                 continue;
             }
 
-            // Canonical ASCII so a typed cell reaches the ASCII evaluator as
-            // val_str text (the evaluator gets no single schema for a flattened
-            // multi-table row).
+            // Raw stored bytes; the evaluator decodes by the per-column
+            // kind/scale (typed) or reads verbatim (UNTYPED), skipping the old
+            // format-to-ASCII/re-parse round trip.
             (*cells)[column_idx] =
-                KeyView(column.table_idx, ref, column.column,
-                        (*bufs)[column_idx]);
+                ValueOf(column.table_idx, ref, column.column);
             (*nulls)[column_idx] =
                 NullOf(column.table_idx, ref, column.column);
         }
@@ -1335,6 +1332,18 @@ class Executor {
         std::vector<TupleFilterColumn> columns;
         if (!ResolveTupleFilterColumns(filter.filter(), input, &columns)) {
             return false;
+        }
+
+        // Per-column storage kind/scale so raw typed cells reach the evaluator
+        // directly (same decode as the PAX schema_ path); virtual/derived
+        // columns resolve to FK_UNTYPED and keep the canonical-ASCII path.
+        std::vector<uint8_t> filter_kinds(columns.size());
+        std::vector<int> filter_scales(columns.size());
+        for (size_t i = 0; i < columns.size(); ++i) {
+            filter_kinds[i] =
+                ColumnKind(columns[i].table_idx, columns[i].column);
+            filter_scales[i] =
+                ColumnScale(columns[i].table_idx, columns[i].column);
         }
 
         output->tables = input.tables;
@@ -1356,7 +1365,6 @@ class Executor {
                 PredicateEvaluator evaluator;
                 std::vector<std::string_view> cells;
                 std::vector<bool> nulls;
-                std::vector<std::string> bufs;
                 WorkerOutput& local = local_outputs[worker_idx];
                 local.refs.assign(input.refs.size(), {});
                 const size_t begin = input_rows * worker_idx / worker_count;
@@ -1364,11 +1372,13 @@ class Executor {
                     input_rows * (worker_idx + 1) / worker_count;
                 for (size_t row_idx = begin; row_idx < end; ++row_idx) {
                     if (!BuildTupleFilterRow(input, columns, row_idx, &cells,
-                                             &nulls, &bufs)) {
+                                             &nulls)) {
                         worker_failed[worker_idx] = 1;
                         return;
                     }
-                    evaluator.set_row_from_views(cells, nulls);
+                    evaluator.set_row_from_views_typed(cells, nulls,
+                                                       filter_kinds,
+                                                       filter_scales);
                     if (!evaluator.evaluate(filter.filter().predicate()
                                                 .expr())) {
                         continue;
@@ -1525,6 +1535,18 @@ class Executor {
             }
         }
 
+        // Per-column storage kind/scale for the residual cells: raw typed cells
+        // go straight to the evaluator (same decode as the PAX schema_ path);
+        // virtual/derived columns resolve to FK_UNTYPED (canonical ASCII).
+        std::vector<uint8_t> residual_kinds(residual_columns.size());
+        std::vector<int> residual_scales(residual_columns.size());
+        for (size_t i = 0; i < residual_columns.size(); ++i) {
+            residual_kinds[i] = ColumnKind(residual_columns[i].table_idx,
+                                           residual_columns[i].column);
+            residual_scales[i] = ColumnScale(residual_columns[i].table_idx,
+                                             residual_columns[i].column);
+        }
+
         // Build a hash table from the chosen build child. A single-column
         // join keys the table by native int64 when every non-null build key
         // parses full-length; one non-integer key reverts to the composite
@@ -1597,10 +1619,6 @@ class Executor {
                 std::vector<std::string_view> residual_cells(
                     residual_columns.size());
                 std::vector<bool> residual_nulls(residual_columns.size());
-                // Canonical-ASCII backing for typed residual cells: the flattened
-                // multi-table view feeds the ASCII evaluator, so typed cells are
-                // formatted once here.
-                std::vector<std::string> residual_bufs(residual_columns.size());
                 auto residual_ok = [&](size_t probe_idx,
                                        size_t build_idx) -> bool {
                     if (!has_residual) return true;
@@ -1621,14 +1639,17 @@ class Executor {
                             continue;
                         }
 
+                        // Raw stored bytes; the evaluator decodes by the
+                        // per-column kind/scale, skipping the format/re-parse
+                        // round trip.
                         residual_cells[column_idx] =
-                            KeyView(column.table_idx, ref, column.column,
-                                    residual_bufs[column_idx]);
+                            ValueOf(column.table_idx, ref, column.column);
                         residual_nulls[column_idx] =
                             NullOf(column.table_idx, ref, column.column);
                     }
-                    residual_evaluator.set_row_from_views(residual_cells,
-                                                          residual_nulls);
+                    residual_evaluator.set_row_from_views_typed(
+                        residual_cells, residual_nulls, residual_kinds,
+                        residual_scales);
                     return residual_evaluator.evaluate(
                         join.residual().predicate().expr());
                 };

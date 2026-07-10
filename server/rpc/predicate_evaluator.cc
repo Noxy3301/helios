@@ -56,6 +56,8 @@ bool PredicateEvaluator::parse_row(const char* data, size_t length,
   columns_.clear();
   null_flags_.clear();
   schema_ = nullptr;  // materialized rows carry ASCII val_str bytes
+  vkinds_.clear();
+  vscales_.clear();
 
   // Row format produced by ha_lineairdb (via LineairDBField):
   //   [null_flags_field] [col_0] [col_1] ... [col_N-1]
@@ -117,6 +119,8 @@ bool PredicateEvaluator::set_row_from_pax(
     uint32_t num_columns) {
   columns_.clear();
   null_flags_.clear();
+  vkinds_.clear();
+  vscales_.clear();
 
   if (group.schema().field_count() < static_cast<size_t>(num_columns) + 1) {
     return false;
@@ -139,6 +143,8 @@ bool PredicateEvaluator::set_row_from_pax_cols(
   if (group.schema().field_count() < static_cast<size_t>(num_columns) + 1) {
     return false;
   }
+  vkinds_.clear();
+  vscales_.clear();
 
   const std::string_view null_flags = group.cell(0, slot);
   null_flags_.assign(null_flags.data(), null_flags.size());
@@ -166,6 +172,25 @@ void PredicateEvaluator::set_row_from_views(
     const std::vector<std::string_view>& cells,
     const std::vector<bool>& nulls) {
   schema_ = nullptr;  // synthesized rows are already canonical ASCII
+  vkinds_.clear();
+  vscales_.clear();
+  columns_.assign(cells.begin(), cells.end());
+  null_flags_.assign((columns_.size() + 7) / 8, 0);
+  for (size_t idx = 0; idx < nulls.size() && idx < columns_.size(); ++idx) {
+    if (nulls[idx]) {
+      null_flags_[idx / 8] =
+          static_cast<char>(static_cast<unsigned char>(null_flags_[idx / 8]) |
+                            (1u << (idx % 8)));
+    }
+  }
+}
+
+void PredicateEvaluator::set_row_from_views_typed(
+    const std::vector<std::string_view>& cells, const std::vector<bool>& nulls,
+    const std::vector<uint8_t>& kinds, const std::vector<int>& scales) {
+  schema_ = nullptr;  // per-column kinds/scales drive the typed decode instead
+  vkinds_.assign(kinds.begin(), kinds.end());
+  vscales_.assign(scales.begin(), scales.end());
   columns_.assign(cells.begin(), cells.end());
   null_flags_.assign((columns_.size() + 7) / 8, 0);
   for (size_t idx = 0; idx < nulls.size() && idx < columns_.size(); ++idx) {
@@ -233,9 +258,18 @@ PredicateEvaluator::Val PredicateEvaluator::extract_value(
       // pairs it with a 'YYYY-MM-DD' literal without a per-row format; INT
       // decodes to a native integer (exact -- no re-parse). The ASCII branch
       // below is untouched for UNTYPED columns.
-      if (schema_ != nullptr) {
-        const uint8_t kind =
-            schema_->kind_of(static_cast<size_t>(idx) + 1);
+      //
+      // Kind/scale come from the PAX schema (scan path) or the per-column
+      // vkinds_/vscales_ set by set_row_from_views_typed (joined-tuple path);
+      // the two sources are mutually exclusive (schema_ wins) and the decode
+      // below is identical for both.
+      const uint8_t vkind = schema_ != nullptr
+                                ? schema_->kind_of(static_cast<size_t>(idx) + 1)
+                                : (idx < vkinds_.size()
+                                       ? vkinds_[idx]
+                                       : LineairDB::Pax::FK_UNTYPED);
+      if (vkind != LineairDB::Pax::FK_UNTYPED) {
+        const uint8_t kind = vkind;
         if (kind == LineairDB::Pax::FK_DATE) {
           int32_t x;
           std::memcpy(&x, col.data(), 4);
@@ -290,7 +324,9 @@ PredicateEvaluator::Val PredicateEvaluator::extract_value(
           // integer boundary (q6's 0.07-excluding BETWEEN bound is preserved).
           int64_t m;
           std::memcpy(&m, col.data(), 8);
-          const int s = schema_->scale_of(static_cast<size_t>(idx) + 1);
+          const int s = schema_ != nullptr
+                            ? schema_->scale_of(static_cast<size_t>(idx) + 1)
+                            : (idx < vscales_.size() ? vscales_[idx] : 0);
           double p = 1.0;
           for (int k = 0; k < s; ++k) p *= 10.0;
           v.type = ValType::DOUBLE;
@@ -547,6 +583,14 @@ bool PredicateEvaluator::evaluate(const FilterExpr& expr) const {
       if (expr.children_size() < 2) return true;
       Val val = extract_value(expr.children(0));
       if (val.type == ValType::NONE) return false;
+      // Pin val's backing: the item extractions below may rotate fmtbuf_ past
+      // its 4 slots (typed columns formatted in string context), which would
+      // leave val.s dangling on the 4th such item.
+      std::string vpin;
+      if (val.type == ValType::STRING && !val.s.empty()) {
+        vpin.assign(val.s.data(), val.s.size());
+        val.s = vpin;
+      }
       for (int i = 1; i < expr.children_size(); i++) {
         Val item = extract_value(expr.children(i));
         if (compare(val, item) == 0) {
