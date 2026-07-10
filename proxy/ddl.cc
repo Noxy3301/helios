@@ -38,7 +38,7 @@ constexpr uint32_t UNTYPED = 0;
 constexpr uint32_t INT32 = 1;                   // 4-byte LE signed int
 constexpr uint32_t INT64 = 2;                   // 8-byte LE signed int
 constexpr uint32_t DATE = 3;                    // 4-byte LE YYYYMMDD
-[[maybe_unused]] constexpr uint32_t DEC64 = 4;  // 8-byte LE scaled int (DEC64)
+constexpr uint32_t DEC64 = 4;                   // 8-byte LE scaled int (DEC64)
 }  // namespace pax_kind
 
 /**
@@ -133,12 +133,34 @@ std::vector<uint32_t> compute_pax_field_widths(
         width = std::max<uint32_t>(width, 40);
         break;
       case MYSQL_TYPE_DECIMAL:
-      case MYSQL_TYPE_NEWDECIMAL:
-        // Reserve slack for a sign and decimal point when Field::val_str()
-        // renders a base-10 fixed-point value (UNTYPED bound; typed FK_DEC64 is
-        // a later stage, so DECIMAL stays ASCII UNTYPED here).
+        // Legacy fixed-point text; reserve sign + decimal point slack (UNTYPED
+        // bound). Not a Field_new_decimal, so it never becomes FK_DEC64.
         width += 2;
         break;
+      case MYSQL_TYPE_NEWDECIMAL: {
+        // Sign + decimal point slack for the UNTYPED bound, kept as the fallback
+        // width when the value is not encoded as a scaled int64 below.
+        width += 2;
+        // A fixed-scale DECIMAL(p,s) becomes an 8-byte FK_DEC64 cell holding
+        // value * 10^s as a scaled int64. The precision <= 15 cap has two
+        // independent exactness reasons:
+        //   (i)  the scaled int64 must hold every value: 10^15 - 1 < INT64_MAX;
+        //   (ii) the server FILTER path compares (double)m / 10^s, which must
+        //        equal strtod(val_str) EXACTLY to preserve the byte path's
+        //        double compare semantics (q6's 0.07-excluding BETWEEN bound).
+        //        That holds only while m and 10^s are both exact doubles, i.e.
+        //        m < 2^53 <=> p <= 15 (10^15 < 2^53). The AGG path stays exact
+        //        regardless via the int64 mantissa.
+        // A ZEROFILL DECIMAL left-pads val_str, so its bytes are not
+        // reproducible from the value alone -- keep it UNTYPED, as is p > 15.
+        const auto *fd = down_cast<const Field_new_decimal *>(field);
+        if (!zerofill && fd->precision <= 15) {
+          kind = pax_kind::DEC64;
+          scale = static_cast<int32_t>(field->decimals());
+          width = 8;
+        }
+        break;
+      }
       case MYSQL_TYPE_DATE:
       case MYSQL_TYPE_NEWDATE:
         // DATE val_str is always "YYYY-MM-DD" -> YYYYMMDD int (fits int32).
