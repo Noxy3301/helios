@@ -1349,6 +1349,16 @@ class Executor {
     struct GroupState {
         std::vector<std::string> keys;
         std::vector<AggSlot> aggregates;
+        // The typed group-key fast paths defer key formatting to emit: instead
+        // of building `keys` at accumulate time they stash the representative
+        // row ref per group column here and leave key_done false, so a group
+        // discarded by HAVING before any key is read never pays the ASCII
+        // format. EnsureGroupKeys reproduces the exact canonical bytes from the
+        // stored cell (not a to_string(int64) round-trip), keeping non-canonical
+        // spellings byte-identical. The string path fills `keys` eagerly, so
+        // key_done stays true there and the deferral is a no-op.
+        uint64_t key_ref[2] = {kNullRowRef, kNullRowRef};
+        bool key_done = true;
     };
 
     struct OutputRow {
@@ -1498,8 +1508,11 @@ class Executor {
                 auto group_it = groups->find(parsed);
                 if (group_it == groups->end()) {
                     GroupState new_state;
-                    new_state.keys.resize(1);
-                    new_state.keys[0] = std::string(value);  // HAVING/output
+                    // Defer the canonical-ASCII format to emit: stash the row
+                    // that created the group so EnsureGroupKeys can rebuild the
+                    // exact stored bytes only if a key read actually reaches it.
+                    new_state.key_ref[0] = ref;
+                    new_state.key_done = false;
                     new_state.aggregates.resize(aggregate_count);
                     state = &groups->emplace(parsed, std::move(new_state))
                                  .first->second;
@@ -1527,9 +1540,10 @@ class Executor {
                 auto group_it = groups->find(key);
                 if (group_it == groups->end()) {
                     GroupState new_state;
-                    new_state.keys.resize(2);
-                    new_state.keys[0] = std::string(value0);  // HAVING/output
-                    new_state.keys[1] = std::string(value1);
+                    // Defer both cells' canonical-ASCII format to emit.
+                    new_state.key_ref[0] = ref0;
+                    new_state.key_ref[1] = ref1;
+                    new_state.key_done = false;
                     new_state.aggregates.resize(aggregate_count);
                     state = &groups->emplace(key, std::move(new_state))
                                  .first->second;
@@ -1753,6 +1767,27 @@ class Executor {
         }
     }
 
+    // Lazily materialize a deferred group's key cells from its representative
+    // row refs. A no-op once key_done is true (the string path fills `keys`
+    // eagerly), and on the typed fast paths for groups whose keys are never
+    // read. GroupColumnValue on the stored ref returns the exact canonical
+    // bytes, so the deferred format is byte-identical to eager formatting.
+    // Reentrant (no shared buffer) so per-group emit steps may call it on
+    // disjoint groups concurrently.
+    void EnsureGroupKeys(const pb::QueryBlockAggregate& aggregate,
+                         GroupState* state) const {
+        if (state->key_done) return;
+        const int group_count = aggregate.group_columns_size();
+        state->keys.resize(group_count);
+        for (int group_idx = 0; group_idx < group_count; ++group_idx) {
+            const pb::QueryBlockColumnRef& column =
+                aggregate.group_columns(group_idx);
+            state->keys[group_idx] = std::string(
+                GroupColumnValue(column, state->key_ref[group_idx]));
+        }
+        state->key_done = true;
+    }
+
     std::string AggregateValue(const pb::QueryBlockAggFunc& function,
                                const GroupState& state, int aggregate_idx,
                                bool* is_null) const {
@@ -1958,7 +1993,7 @@ class Executor {
 
     template <typename MapT>
     bool BuildRegroupedRows(const pb::QueryBlockAggregate& aggregate,
-                            int group_count, const MapT& groups,
+                            int group_count, MapT& groups,
                             std::vector<OutputRow>* output_rows) {
         const auto& regroup = aggregate.regroup();
         if (!regroup.count_star()) return fail("regroup must count");
@@ -1967,8 +2002,8 @@ class Executor {
         std::string key;
         std::vector<std::string> values;
         std::vector<bool> nulls;
-        for (const auto& entry : groups) {
-            const GroupState& state = entry.second;
+        for (auto& entry : groups) {
+            GroupState& state = entry.second;
             key.clear();
             values.clear();
             nulls.clear();
@@ -1976,6 +2011,12 @@ class Executor {
             nulls.reserve(regroup.group_value_ordinals_size());
 
             for (const uint32_t ordinal : regroup.group_value_ordinals()) {
+                // Only a group ordinal reads the deferred key cells; an
+                // aggregate ordinal (q13 groups by the per-customer count)
+                // never materializes them.
+                if (ordinal < static_cast<uint32_t>(group_count)) {
+                    EnsureGroupKeys(aggregate, &state);
+                }
                 std::string value;
                 bool is_null = false;
                 if (!AggregateRowValue(aggregate, group_count, state, ordinal,
@@ -2235,6 +2276,24 @@ class Executor {
                 }
             }
 
+        // A HAVING predicate that reads only aggregate values (q18:
+        // sum(l_quantity) > 300) never touches the group keys, so the groups it
+        // discards keep their deferred keys unformatted -- the point of the
+        // deferral. Materialize keys here only when HAVING references a group
+        // column ordinal (< group_count).
+        bool having_uses_group = false;
+        if (aggregate.has_having() && aggregate.having().has_expr()) {
+            std::vector<uint32_t> having_cols;
+            PredicateEvaluator::collect_columns(aggregate.having().expr(),
+                                                &having_cols);
+            for (const uint32_t ordinal : having_cols) {
+                if (ordinal < static_cast<uint32_t>(group_count)) {
+                    having_uses_group = true;
+                    break;
+                }
+            }
+        }
+
         // HAVING predicates read the first-stage aggregate row layout:
         // group values first, then aggregate values.
         if (aggregate.has_having() && aggregate.having().has_expr()) {
@@ -2243,7 +2302,8 @@ class Executor {
             std::vector<std::string_view> cells;
             std::vector<bool> nulls;
             for (auto group_it = groups.begin(); group_it != groups.end();) {
-                const GroupState& state = group_it->second;
+                GroupState& state = group_it->second;
+                if (having_uses_group) EnsureGroupKeys(aggregate, &state);
                 values.clear();
                 cells.clear();
                 nulls.clear();
@@ -2253,7 +2313,10 @@ class Executor {
 
                 for (int group_idx = 0; group_idx < group_count;
                      ++group_idx) {
-                    values.push_back(state.keys[group_idx]);
+                    // Placeholder when HAVING never names a group ordinal; the
+                    // evaluator only reads ordinals the expression references.
+                    values.push_back(having_uses_group ? state.keys[group_idx]
+                                                        : std::string());
                     nulls.push_back(false);
                 }
                 for (int aggregate_idx = 0;
@@ -2288,6 +2351,9 @@ class Executor {
             output_rows.reserve(groups.size());
             for (auto& entry : groups) {
                 GroupState& state = entry.second;
+                // Survivors only: GROUP and group-referencing EXPR outputs read
+                // the key cells, so materialize any deferred keys once here.
+                EnsureGroupKeys(aggregate, &state);
                 OutputRow row;
                 row.values.reserve(request_.output_size());
                 row.nulls.reserve(request_.output_size());
