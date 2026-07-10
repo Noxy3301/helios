@@ -31,30 +31,79 @@ constexpr bool kFence = false;
 constexpr uint64_t kBackfillWriteChunkRows = 2000;
 constexpr size_t kBackfillParallelWorkers = 16;
 
+// PAX typed-cell kinds (mirror LineairDB::Pax::FieldKind in pax_store.h; the
+// proxy is PAX-oblivious so the values are duplicated by design, kept in sync).
+namespace pax_kind {
+constexpr uint32_t UNTYPED = 0;
+constexpr uint32_t INT32 = 1;                   // 4-byte LE signed int
+constexpr uint32_t INT64 = 2;                   // 8-byte LE signed int
+constexpr uint32_t DATE = 3;                    // 4-byte LE YYYYMMDD
+[[maybe_unused]] constexpr uint32_t DEC64 = 4;  // 8-byte LE scaled int (DEC64)
+}  // namespace pax_kind
+
 /**
-  @brief Computes PAX cell widths for the encoded row fields of `table`.
+  @brief Computes PAX cell widths, kinds, and scales for the encoded row fields
+  of `table`.
 
   @details LineairDB rows store each MySQL field as the string payload produced
   by Field::val_str(). The returned vector contains one maximum payload width
   per encoded row field: entry 0 is the row null-flags field, and the remaining
-  entries follow TABLE::field order. A table with any field wider than the PAX
-  cell cap returns an empty vector so CREATE TABLE keeps the ordinary row
-  layout instead of reserving very wide cells for every row.
+  entries follow TABLE::field order. For an UNTYPED field the width is a safe
+  upper bound on the val_str bytes; for a typed field (INT family, DATE) the
+  width is the fixed binary payload width (4/8) and the kind tells the engine to
+  parse val_str once at scatter and reformat it at gather. A table with any
+  field wider than the PAX cell cap returns an empty vector so CREATE TABLE
+  keeps the ordinary row layout instead of reserving very wide cells for every
+  row. When non-null, `kinds`/`scales` are filled in lockstep with the returned
+  widths.
 
   @return Per-field maximum payload widths, or an empty vector when the table
   should not use PAX storage.
 */
-std::vector<uint32_t> compute_pax_field_widths(TABLE *table) {
+std::vector<uint32_t> compute_pax_field_widths(
+    TABLE *table, std::vector<uint32_t> *kinds = nullptr,
+    std::vector<int32_t> *scales = nullptr) {
   // Keep fixed-width cells bounded for variable-width columns such as TEXT.
   constexpr uint32_t kMaxCellBytes = 2048;
 
   std::vector<uint32_t> widths;
   widths.reserve(table->s->fields + 1);
+  if (kinds) {
+    kinds->clear();
+    kinds->reserve(table->s->fields + 1);
+    kinds->push_back(pax_kind::UNTYPED);  // field #0: null flags, verbatim
+  }
+  if (scales) {
+    scales->clear();
+    scales->reserve(table->s->fields + 1);
+    scales->push_back(0);
+  }
   widths.push_back(table->s->null_bytes);
 
   for (uint i = 0; i < table->s->fields; i++) {
     Field *field = table->field[i];
     uint32_t width = field->field_length;
+    uint32_t kind = pax_kind::UNTYPED;
+    int32_t scale = 0;
+
+    // A ZEROFILL integer left-pads val_str to its display width, so the value
+    // alone cannot reproduce the exact bytes -- keep such columns UNTYPED.
+    // MYSQL_TYPE_YEAR renders zero-filled to its display width ("0000" for 0)
+    // REGARDLESS of the Field_num::zerofill member (which is observed false at
+    // runtime), so relying on that flag mis-types YEAR and gathers "0" != "0000"
+    // -- force YEAR UNTYPED explicitly.
+    const bool zerofill =
+        (field->type() == MYSQL_TYPE_YEAR)
+            ? true
+            : ((field->type() == MYSQL_TYPE_TINY ||
+                field->type() == MYSQL_TYPE_SHORT ||
+                field->type() == MYSQL_TYPE_INT24 ||
+                field->type() == MYSQL_TYPE_LONG ||
+                field->type() == MYSQL_TYPE_LONGLONG ||
+                field->type() == MYSQL_TYPE_DECIMAL ||
+                field->type() == MYSQL_TYPE_NEWDECIMAL)
+                   ? down_cast<const Field_num *>(field)->zerofill
+                   : false);
 
     switch (field->type()) {
       case MYSQL_TYPE_TINY:
@@ -65,6 +114,19 @@ std::vector<uint32_t> compute_pax_field_widths(TABLE *table) {
       case MYSQL_TYPE_YEAR:
         // Integer display width is not a payload bound for signed 64-bit text.
         width = std::max<uint32_t>(width, 21);
+        if (!zerofill) {
+          const bool is_ll = field->type() == MYSQL_TYPE_LONGLONG;
+          const bool is_long = field->type() == MYSQL_TYPE_LONG;
+          if (is_ll && field->is_unsigned()) {
+            // BIGINT UNSIGNED can exceed int64 range: keep ASCII.
+          } else if (is_ll || (is_long && field->is_unsigned())) {
+            kind = pax_kind::INT64;  // 8-byte range
+            width = 8;
+          } else {
+            kind = pax_kind::INT32;  // TINY/SHORT/INT24/LONG signed
+            width = 4;
+          }
+        }
         break;
       case MYSQL_TYPE_FLOAT:
       case MYSQL_TYPE_DOUBLE:
@@ -73,11 +135,16 @@ std::vector<uint32_t> compute_pax_field_widths(TABLE *table) {
       case MYSQL_TYPE_DECIMAL:
       case MYSQL_TYPE_NEWDECIMAL:
         // Reserve slack for a sign and decimal point when Field::val_str()
-        // renders a base-10 fixed-point value.
+        // renders a base-10 fixed-point value (UNTYPED bound; typed FK_DEC64 is
+        // a later stage, so DECIMAL stays ASCII UNTYPED here).
         width += 2;
         break;
       case MYSQL_TYPE_DATE:
       case MYSQL_TYPE_NEWDATE:
+        // DATE val_str is always "YYYY-MM-DD" -> YYYYMMDD int (fits int32).
+        kind = pax_kind::DATE;
+        width = 4;
+        break;
       case MYSQL_TYPE_TIME:
       case MYSQL_TYPE_TIME2:
       case MYSQL_TYPE_DATETIME:
@@ -105,6 +172,8 @@ std::vector<uint32_t> compute_pax_field_widths(TABLE *table) {
 
     if (width > kMaxCellBytes) return {};
     widths.push_back(width);
+    if (kinds) kinds->push_back(kind);
+    if (scales) scales->push_back(scale);
   }
 
   return widths;
@@ -199,7 +268,15 @@ int ha_lineairdb::create(const char *table_name, TABLE *table, HA_CREATE_INFO *,
   // storage. The table/index may already exist from another node's CREATE
   // TABLE; MySQL-side metadata still needs to be created.
   auto proxy = get_proxy();
-  proxy->db_create_table(db_table_name, compute_pax_field_widths(table));
+  std::vector<uint32_t> pax_kinds;
+  std::vector<int32_t> pax_scales;
+  std::vector<uint32_t> pax_widths =
+      compute_pax_field_widths(table, &pax_kinds, &pax_scales);
+  if (pax_widths.empty()) {  // table skips PAX: send nothing typed
+    pax_kinds.clear();
+    pax_scales.clear();
+  }
+  proxy->db_create_table(db_table_name, pax_widths, pax_kinds, pax_scales);
 
   for (uint i = 0; i < table->s->keys; i++) {
     auto key_info = table->key_info[i];

@@ -53,13 +53,19 @@ bool semijoin_rejects_pax_slot(
     const std::vector<SemijoinReduction>& semijoin_reductions,
     const LineairDB::Pax::PaxGroup& group, uint32_t slot,
     bool& schema_mismatch) {
+    std::string buf;  // typed probe cell -> canonical ASCII
     for (const auto& reduction : semijoin_reductions) {
         const size_t field = static_cast<size_t>(reduction.probe_column) + 1;
         if (field >= group.schema().field_count()) {
             schema_mismatch = true;
             return false;
         }
-        const std::string_view column = group.cell(field, slot);
+        // reduction.keys is built from materialized (ASCII) source rows, so a
+        // typed probe cell must be formatted to its canonical val_str to match.
+        const std::string_view column =
+            typed_key_view(group.cell(field, slot),
+                           group.schema().kind_of(field),
+                           group.schema().scale_of(field), buf);
         if (reduction.keys.find(std::string(column)) == reduction.keys.end()) {
             return true;
         }
@@ -135,6 +141,9 @@ bool aggregate_pax_group(
     PredicateEvaluator evaluator;
     std::string keybuf;
     std::vector<std::string_view> group_values(n_grp);
+    // Canonical-ASCII backing for typed group cells (one buffer per column so
+    // all n_grp views coexist while the key and key_cols are built).
+    std::vector<std::string> group_bufs(n_grp);
 
     for (uint32_t base = 0; base < LineairDB::Pax::PaxGroup::kRows;
          base += 64) {
@@ -164,8 +173,14 @@ bool aggregate_pax_group(
             const PaxRowRef row{&group, slot};
             keybuf.clear();
             for (int g = 0; g < n_grp; ++g) {
-                group_values[g] = extract_value_column(row,
-                                                       spec.group_columns(g));
+                // Canonical ASCII so grouping/output see val_str text, not the
+                // typed binary (mixed typed/UNTYPED columns stay consistent).
+                const uint32_t col = spec.group_columns(g);
+                const size_t field = static_cast<size_t>(col) + 1;
+                group_values[g] = typed_key_view(
+                    extract_value_column(row, col),
+                    group.schema().kind_of(field),
+                    group.schema().scale_of(field), group_bufs[g]);
                 const uint32_t length =
                     static_cast<uint32_t>(group_values[g].size());
                 keybuf.append(reinterpret_cast<const char*>(&length),

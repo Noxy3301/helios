@@ -640,6 +640,51 @@ class Executor {
         return table->nulls[ref][column];
     }
 
+    // ----- Typed cell access -------------------------------------------------
+    // A cell view from a real table is the raw stored bytes -- fixed-width LE
+    // binary for a typed column. These decode/render it by the column's
+    // declared kind (schema-driven, never byte-sniffed). Virtual (sub-block)
+    // tables always carry canonical ASCII, so they resolve to UNTYPED. `column`
+    // is 0-based; the PAX field index is column + 1.
+    uint8_t ColumnKind(uint32_t table_idx, uint32_t column) const {
+        if (IsVirtualTable(table_idx) || table_idx >= stores_.size() ||
+            stores_[table_idx] == nullptr) {
+            return LineairDB::Pax::FK_UNTYPED;
+        }
+        return stores_[table_idx]->schema().kind_of(
+            static_cast<size_t>(column) + 1);
+    }
+    int ColumnScale(uint32_t table_idx, uint32_t column) const {
+        if (IsVirtualTable(table_idx) || table_idx >= stores_.size() ||
+            stores_[table_idx] == nullptr) {
+            return 0;
+        }
+        return stores_[table_idx]->schema().scale_of(
+            static_cast<size_t>(column) + 1);
+    }
+    // Decode an int/int-key column (or an UNTYPED ASCII integer) to int64.
+    // False for SQL NULL, a non-integer UNTYPED cell, or a DATE/DEC64 column.
+    bool ReadI64(uint32_t table_idx, uint64_t ref, uint32_t column,
+                 int64_t* out) const {
+        return decode_typed_i64(ValueOf(table_idx, ref, column),
+                                ColumnKind(table_idx, column), out);
+    }
+    // Read any numeric column as an exact DecimalValue.
+    DecimalValue ReadDecimal(uint32_t table_idx, uint64_t ref,
+                             uint32_t column) const {
+        return decode_typed_decimal(ValueOf(table_idx, ref, column),
+                                    ColumnKind(table_idx, column),
+                                    ColumnScale(table_idx, column));
+    }
+    // Canonical val_str ASCII of a cell: verbatim for UNTYPED, formatted for a
+    // typed cell into `buf` (own storage per call, backing the returned view).
+    std::string_view KeyView(uint32_t table_idx, uint64_t ref, uint32_t column,
+                             std::string& buf) const {
+        return typed_key_view(ValueOf(table_idx, ref, column),
+                              ColumnKind(table_idx, column),
+                              ColumnScale(table_idx, column), buf);
+    }
+
     PaxRowRef ToRowRef(uint32_t table_idx, uint64_t ref) const {
         if (ref == kNullRowRef) return PaxRowRef{};
         if (table_idx >= stores_.size()) return PaxRowRef{};
@@ -697,18 +742,56 @@ class Executor {
         return value;
     }
 
-    bool ReadAggregateColumn(const pb::FilterExpr& expression,
-                             const NodeResult& input, size_t row_idx,
-                             uint32_t default_table_idx,
-                             std::string_view* value) const {
+    // Canonical val_str ASCII of a group column (a typed cell formatted into
+    // `buf`), truncated to prefix_len. Used wherever the group column feeds a
+    // string key, group display, or output -- a raw typed cell must not appear
+    // there. `buf` backs the view for typed cells.
+    std::string_view GroupColumnCanonical(
+        const pb::QueryBlockColumnRef& column, uint64_t ref,
+        std::string& buf) const {
+        std::string_view value =
+            KeyView(column.table_idx(), ref, column.column(), buf);
+        if (column.prefix_len() > 0 && value.size() > column.prefix_len()) {
+            value = value.substr(0, column.prefix_len());
+        }
+        return value;
+    }
+
+    // Resolve a COLUMN_REF aggregate argument to its (table, column) and row
+    // ref. Returns false for a non-COLUMN_REF argument, a missing table, or SQL
+    // NULL.
+    bool ReadAggregateColumnRef(const pb::FilterExpr& expression,
+                                const NodeResult& input, size_t row_idx,
+                                uint32_t default_table_idx, uint32_t* table_idx,
+                                uint32_t* column, uint64_t* ref) const {
         if (expression.op() != pb::FilterExpr::COLUMN_REF) return false;
-        const DecodedColumnRef column = DecodeAggregateColumnRef(
+        const DecodedColumnRef decoded = DecodeAggregateColumnRef(
             default_table_idx, expression.column_index());
-        const int position = input.table_pos(column.table_idx);
+        const int position = input.table_pos(decoded.table_idx);
         if (position < 0) return false;
-        const uint64_t ref = input.refs[position][row_idx];
-        if (NullOf(column.table_idx, ref, column.column)) return false;
-        *value = ValueOf(column.table_idx, ref, column.column);
+        const uint64_t row_ref = input.refs[position][row_idx];
+        if (NullOf(decoded.table_idx, row_ref, decoded.column)) return false;
+        *table_idx = decoded.table_idx;
+        *column = decoded.column;
+        *ref = row_ref;
+        return true;
+    }
+
+    // Canonical val_str ASCII of a COLUMN_REF aggregate argument into `buf`
+    // (typed cells formatted). Returns false as ReadAggregateColumnRef does.
+    bool ReadAggregateCanonical(const pb::FilterExpr& expression,
+                                const NodeResult& input, size_t row_idx,
+                                uint32_t default_table_idx, std::string& buf,
+                                std::string_view* value) const {
+        uint32_t table_idx = 0;
+        uint32_t column = 0;
+        uint64_t ref = 0;
+        if (!ReadAggregateColumnRef(expression, input, row_idx,
+                                    default_table_idx, &table_idx, &column,
+                                    &ref)) {
+            return false;
+        }
+        *value = KeyView(table_idx, ref, column, buf);
         return true;
     }
 
@@ -718,14 +801,19 @@ class Executor {
         using FE = pb::FilterExpr;
         switch (expression.op()) {
             case FE::COLUMN_REF: {
-                std::string_view value;
-                if (!ReadAggregateColumn(expression, input, row_idx,
-                                         default_table_idx, &value)) {
+                uint32_t table_idx = 0;
+                uint32_t column = 0;
+                uint64_t ref = 0;
+                if (!ReadAggregateColumnRef(expression, input, row_idx,
+                                            default_table_idx, &table_idx,
+                                            &column, &ref)) {
                     DecimalValue result;
                     result.is_null = true;
                     return result;
                 }
-                return parse_decimal_value(value);
+                // Schema-driven: a typed numeric cell decodes exactly rather
+                // than being re-parsed from its raw binary.
+                return ReadDecimal(table_idx, ref, column);
             }
             case FE::CONST_INT: {
                 DecimalValue result;
@@ -810,10 +898,11 @@ class Executor {
 
         keys->clear();
         keys->reserve(source.rows());
+        std::string buf;  // typed source cell -> canonical ASCII
         for (size_t row_idx = 0; row_idx < source.rows(); row_idx++) {
             const uint64_t ref = source.refs[position][row_idx];
             if (NullOf(column.table_idx(), ref, column.column())) continue;
-            std::string_view value = GroupColumnValue(column, ref);
+            std::string_view value = GroupColumnCanonical(column, ref, buf);
             keys->insert(std::string(value));
         }
         return true;
@@ -846,14 +935,16 @@ class Executor {
         int_keys->clear();
         int_keys->reserve(source.rows());
         *is_int = true;
+        const uint8_t kind = ColumnKind(column.table_idx(), column.column());
         for (size_t row_idx = 0; row_idx < source.rows(); row_idx++) {
             const uint64_t ref = source.refs[position][row_idx];
             if (NullOf(column.table_idx(), ref, column.column())) continue;
             const std::string_view value = GroupColumnValue(column, ref);
             int64_t parsed = 0;
-            if (!parse_int64_cell(value, &parsed)) {
-                // Non-INT key column: abandon the int set and re-collect the
-                // source as owned strings (the byte-comparison probe path).
+            // Schema-driven decode: a typed int decodes exactly; a DATE/DEC64/
+            // non-integer cell returns false and reverts to the canonical-ASCII
+            // string set (build/probe symmetry).
+            if (!decode_typed_i64(value, kind, &parsed)) {
                 *is_int = false;
                 int_keys->clear();
                 return CollectSemiFilterKeys(semi, string_keys);
@@ -869,16 +960,27 @@ class Executor {
         const std::unordered_set<int64_t>* int_keys, std::string* probe) {
         if (keys == nullptr && int_keys == nullptr) return true;
         if (group == nullptr) return false;
-        const std::string_view value = group->cell(column + 1, slot);
+        const size_t field = static_cast<size_t>(column) + 1;
+        const std::string_view value = group->cell(field, slot);
         if (value.empty()) return false;
+        // Schema-driven: decode/format by the column's declared kind, never by
+        // sniffing the raw cell bytes.
+        const uint8_t kind = group->schema().kind_of(field);
         if (int_keys != nullptr) {
             int64_t parsed = 0;
-            return parse_int64_cell(value, &parsed) &&
+            return decode_typed_i64(value, kind, &parsed) &&
                    int_keys->find(parsed) != int_keys->end();
         }
         // Reuse the caller's buffer: C++17 unordered_set has no heterogeneous
-        // lookup, so the string key is rebuilt without a per-row allocation.
-        probe->assign(value.data(), value.size());
+        // lookup, so the canonical string key is rebuilt without a per-row
+        // allocation (a typed cell is formatted to match the ASCII key set).
+        if (kind == LineairDB::Pax::FK_UNTYPED) {
+            probe->assign(value.data(), value.size());
+        } else {
+            probe->clear();
+            format_typed_cell(kind, group->schema().scale_of(field), value,
+                              probe);
+        }
         return keys->find(*probe) != keys->end();
     }
 
@@ -1196,9 +1298,11 @@ class Executor {
         const NodeResult& input,
         const std::vector<TupleFilterColumn>& columns, size_t row_idx,
         std::vector<std::string_view>* cells,
-        std::vector<bool>* nulls) const {
+        std::vector<bool>* nulls,
+        std::vector<std::string>* bufs) const {
         cells->resize(columns.size());
         nulls->resize(columns.size());
+        bufs->resize(columns.size());
         for (size_t column_idx = 0; column_idx < columns.size();
              ++column_idx) {
             const TupleFilterColumn& column = columns[column_idx];
@@ -1209,8 +1313,12 @@ class Executor {
                 continue;
             }
 
+            // Canonical ASCII so a typed cell reaches the ASCII evaluator as
+            // val_str text (the evaluator gets no single schema for a flattened
+            // multi-table row).
             (*cells)[column_idx] =
-                ValueOf(column.table_idx, ref, column.column);
+                KeyView(column.table_idx, ref, column.column,
+                        (*bufs)[column_idx]);
             (*nulls)[column_idx] =
                 NullOf(column.table_idx, ref, column.column);
         }
@@ -1248,6 +1356,7 @@ class Executor {
                 PredicateEvaluator evaluator;
                 std::vector<std::string_view> cells;
                 std::vector<bool> nulls;
+                std::vector<std::string> bufs;
                 WorkerOutput& local = local_outputs[worker_idx];
                 local.refs.assign(input.refs.size(), {});
                 const size_t begin = input_rows * worker_idx / worker_count;
@@ -1255,7 +1364,7 @@ class Executor {
                     input_rows * (worker_idx + 1) / worker_count;
                 for (size_t row_idx = begin; row_idx < end; ++row_idx) {
                     if (!BuildTupleFilterRow(input, columns, row_idx, &cells,
-                                             &nulls)) {
+                                             &nulls, &bufs)) {
                         worker_failed[worker_idx] = 1;
                         return;
                     }
@@ -1327,14 +1436,17 @@ class Executor {
                       const std::vector<JoinKeyColumn>& key_columns,
                       size_t row_idx, std::string* key) const {
         key->clear();
+        std::string buf;  // typed key part -> canonical ASCII (copied on append)
         for (const JoinKeyColumn& column : key_columns) {
             const uint64_t ref = input.refs[column.ref_position][row_idx];
             // SQL equijoins are null-rejecting. Real PAX cells encode NULL as
             // an empty cell, so empty key parts never match, mirroring the
             // scan semi-filter semantics.
             if (NullOf(column.table_idx, ref, column.column)) return false;
-            AppendJoinKeyPart(key,
-                              ValueOf(column.table_idx, ref, column.column));
+            // Canonical ASCII so a typed int and an UNTYPED int with the same
+            // value share the same key bytes on both sides of the join.
+            AppendJoinKeyPart(
+                key, KeyView(column.table_idx, ref, column.column, buf));
         }
         return true;
     }
@@ -1433,9 +1545,8 @@ class Executor {
                     continue;
                 }
                 int64_t parsed = 0;
-                if (!parse_int64_cell(
-                        ValueOf(build_key.table_idx, ref, build_key.column),
-                        &parsed)) {
+                if (!ReadI64(build_key.table_idx, ref, build_key.column,
+                             &parsed)) {
                     int_join = false;
                     int_hash_table.clear();
                     break;
@@ -1486,6 +1597,10 @@ class Executor {
                 std::vector<std::string_view> residual_cells(
                     residual_columns.size());
                 std::vector<bool> residual_nulls(residual_columns.size());
+                // Canonical-ASCII backing for typed residual cells: the flattened
+                // multi-table view feeds the ASCII evaluator, so typed cells are
+                // formatted once here.
+                std::vector<std::string> residual_bufs(residual_columns.size());
                 auto residual_ok = [&](size_t probe_idx,
                                        size_t build_idx) -> bool {
                     if (!has_residual) return true;
@@ -1507,7 +1622,8 @@ class Executor {
                         }
 
                         residual_cells[column_idx] =
-                            ValueOf(column.table_idx, ref, column.column);
+                            KeyView(column.table_idx, ref, column.column,
+                                    residual_bufs[column_idx]);
                         residual_nulls[column_idx] =
                             NullOf(column.table_idx, ref, column.column);
                     }
@@ -1533,10 +1649,8 @@ class Executor {
                         int64_t parsed = 0;
                         if (!NullOf(probe_key_column.table_idx, ref,
                                     probe_key_column.column) &&
-                            parse_int64_cell(
-                                ValueOf(probe_key_column.table_idx, ref,
-                                        probe_key_column.column),
-                                &parsed)) {
+                            ReadI64(probe_key_column.table_idx, ref,
+                                    probe_key_column.column, &parsed)) {
                             const auto it = int_hash_table.find(parsed);
                             if (it != int_hash_table.end()) {
                                 match_rows = &it->second;
@@ -1712,8 +1826,11 @@ class Executor {
     bool BuildPredicateRowForTable(uint32_t table_idx, uint64_t ref,
                                    uint32_t column_count,
                                    std::vector<std::string_view>* cells,
-                                   std::vector<bool>* nulls) const {
-        if (cells == nullptr || nulls == nullptr) return false;
+                                   std::vector<bool>* nulls,
+                                   std::vector<std::string>* bufs) const {
+        if (cells == nullptr || nulls == nullptr || bufs == nullptr) {
+            return false;
+        }
         if (ref == kNullRowRef) return false;
         if (!IsVirtualTable(table_idx)) {
             const PaxRowRef row = ToRowRef(table_idx, ref);
@@ -1731,9 +1848,13 @@ class Executor {
 
         cells->resize(column_count);
         nulls->resize(column_count);
+        bufs->resize(column_count);
         for (uint32_t column_idx = 0; column_idx < column_count;
              ++column_idx) {
-            (*cells)[column_idx] = ValueOf(table_idx, ref, column_idx);
+            // Canonical ASCII for the ASCII filter evaluator (typed cells
+            // formatted once here).
+            (*cells)[column_idx] =
+                KeyView(table_idx, ref, column_idx, (*bufs)[column_idx]);
             (*nulls)[column_idx] = NullOf(table_idx, ref, column_idx);
         }
         return true;
@@ -1869,8 +1990,14 @@ class Executor {
         [[maybe_unused]] std::string key_buffer;
         [[maybe_unused]] std::vector<std::string_view> group_values(
             group_count);
+        // Canonical-ASCII backing for typed group cells (string path); one
+        // buffer per group column so the n_grp views coexist while the key is
+        // built. `agg_view_buf` backs typed DISTINCT / MIN-MAX-string reads.
+        [[maybe_unused]] std::vector<std::string> group_bufs(group_count);
+        std::string agg_view_buf;
         std::vector<std::string_view> filter_values;
         std::vector<bool> filter_nulls;
+        std::vector<std::string> filter_bufs;
         for (size_t row_idx = begin; row_idx < end; ++row_idx) {
             GroupState* state = nullptr;
             if constexpr (IntKey) {
@@ -1878,11 +2005,13 @@ class Executor {
                 const pb::QueryBlockColumnRef& column =
                     aggregate.group_columns(0);
                 const uint64_t ref = input.refs[group_positions[0]][row_idx];
-                const std::string_view value = GroupColumnValue(column, ref);
                 int64_t parsed = 0;
-                if (!parse_int64_cell(value, &parsed)) {
-                    // Non-INT or NULL key: abandon the int path so the caller
-                    // re-runs this aggregation over string keys.
+                // Schema-driven: a typed int decodes exactly; NULL, a DATE/DEC64
+                // column, or a non-integer UNTYPED cell abandons the int path so
+                // the caller re-runs this aggregation over string keys.
+                if (ref == kNullRowRef ||
+                    !ReadI64(column.table_idx(), ref, column.column(),
+                             &parsed)) {
                     parse_fail->store(true, std::memory_order_relaxed);
                     return false;
                 }
@@ -1912,13 +2041,15 @@ class Executor {
                     aggregate.group_columns(1);
                 const uint64_t ref0 = input.refs[group_positions[0]][row_idx];
                 const uint64_t ref1 = input.refs[group_positions[1]][row_idx];
-                const std::string_view value0 =
-                    GroupColumnValue(column0, ref0);
-                const std::string_view value1 =
-                    GroupColumnValue(column1, ref1);
                 Int2Key key;
-                if (!parse_int64_cell(value0, &key.a) ||
-                    !parse_int64_cell(value1, &key.b)) {
+                // Schema-driven int decode for both group columns (NULL or a
+                // non-integer cell abandons the int path).
+                if (ref0 == kNullRowRef ||
+                    !ReadI64(column0.table_idx(), ref0, column0.column(),
+                             &key.a) ||
+                    ref1 == kNullRowRef ||
+                    !ReadI64(column1.table_idx(), ref1, column1.column(),
+                             &key.b)) {
                     parse_fail->store(true, std::memory_order_relaxed);
                     return false;
                 }
@@ -1946,7 +2077,10 @@ class Executor {
                         aggregate.group_columns(group_idx);
                     const uint64_t ref =
                         input.refs[group_positions[group_idx]][row_idx];
-                    group_values[group_idx] = GroupColumnValue(column, ref);
+                    // Canonical ASCII so grouping, HAVING and output all see the
+                    // val_str text (typed cells formatted once here).
+                    group_values[group_idx] =
+                        GroupColumnCanonical(column, ref, group_bufs[group_idx]);
                     const uint32_t length =
                         static_cast<uint32_t>(group_values[group_idx].size());
                     key_buffer.append(reinterpret_cast<const char*>(&length),
@@ -1998,7 +2132,7 @@ class Executor {
                     if (!BuildPredicateRowForTable(
                             filter_table, filter_ref,
                             function.filter().num_columns(), &filter_values,
-                            &filter_nulls)) {
+                            &filter_nulls, &filter_bufs)) {
                         // No message from worker context; the dispatch
                         // reports the failure after joining.
                         return false;
@@ -2013,10 +2147,13 @@ class Executor {
                     case pb::QueryBlockAggFunc::COUNT:
                         if (function.distinct()) {
                             if (!function.has_arg() || !has_arg_row) break;
+                            // Canonical ASCII so DISTINCT counts by value (typed
+                            // cells formatted; distinct-by-value).
                             std::string_view value;
-                            if (ReadAggregateColumn(
+                            if (ReadAggregateCanonical(
                                     function.arg(), input, row_idx,
-                                    function.arg_table(), &value)) {
+                                    function.arg_table(), agg_view_buf,
+                                    &value)) {
                                 state->aggregates[aggregate_idx]
                                     .distinct_values.emplace(value);
                             }
@@ -2041,11 +2178,13 @@ class Executor {
                         const bool wants_max =
                             function.kind() == pb::QueryBlockAggFunc::MAX;
                         if (function.cmp_kind() == 1) {
+                            // Canonical ASCII: string order == value order for
+                            // strings and (via YYYY-MM-DD) for typed DATE.
                             std::string_view value;
-                            if (!ReadAggregateColumn(function.arg(), input,
-                                                     row_idx,
-                                                     function.arg_table(),
-                                                     &value)) {
+                            if (!ReadAggregateCanonical(function.arg(), input,
+                                                        row_idx,
+                                                        function.arg_table(),
+                                                        agg_view_buf, &value)) {
                                 break;
                             }
                             AggSlot& slot = state->aggregates[aggregate_idx];
@@ -2166,20 +2305,22 @@ class Executor {
     // Lazily materialize a deferred group's key cells from its representative
     // row refs. A no-op once key_done is true (the string path fills `keys`
     // eagerly), and on the typed fast paths for groups whose keys are never
-    // read. GroupColumnValue on the stored ref returns the exact canonical
-    // bytes, so the deferred format is byte-identical to eager formatting.
-    // Reentrant (no shared buffer) so per-group emit steps may call it on
-    // disjoint groups concurrently.
+    // read. GroupColumnCanonical on the stored ref returns the exact canonical
+    // val_str bytes (a typed cell formatted, an UNTYPED cell verbatim), so the
+    // deferred format is byte-identical to eager formatting. Reentrant (own
+    // buffer) so per-group emit steps may call it on disjoint groups
+    // concurrently.
     void EnsureGroupKeys(const pb::QueryBlockAggregate& aggregate,
                          GroupState* state) const {
         if (state->key_done) return;
         const int group_count = aggregate.group_columns_size();
         state->keys.resize(group_count);
+        std::string buf;  // typed key cell -> canonical ASCII (reentrant)
         for (int group_idx = 0; group_idx < group_count; ++group_idx) {
             const pb::QueryBlockColumnRef& column =
                 aggregate.group_columns(group_idx);
             state->keys[group_idx] = std::string(
-                GroupColumnValue(column, state->key_ref[group_idx]));
+                GroupColumnCanonical(column, state->key_ref[group_idx], buf));
         }
         state->key_done = true;
     }
@@ -2605,6 +2746,7 @@ class Executor {
 
         std::vector<OutputRow> output_rows;
         output_rows.reserve(input.rows());
+        std::string value_buf;  // typed output cell -> canonical ASCII
         for (size_t row_idx = 0; row_idx < input.rows(); ++row_idx) {
             OutputRow row;
             row.values.reserve(request_.output_size());
@@ -2622,8 +2764,11 @@ class Executor {
                     continue;
                 }
 
+                // Canonical ASCII output: a typed cell is rendered to its exact
+                // val_str, then prefix-truncated.
                 std::string_view value =
-                    ValueOf(column.table_idx(), ref, column.column());
+                    KeyView(column.table_idx(), ref, column.column(),
+                            value_buf);
                 if (column.prefix_len() > 0 &&
                     value.size() > column.prefix_len()) {
                     value = value.substr(0, column.prefix_len());
