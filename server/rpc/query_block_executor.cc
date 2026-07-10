@@ -553,7 +553,7 @@ class Executor {
     static bool CellMatchesKeySet(
         const PaxGroup* group, uint32_t slot, uint32_t column,
         const std::unordered_set<std::string>* keys,
-        const std::unordered_set<int64_t>* int_keys) {
+        const std::unordered_set<int64_t>* int_keys, std::string* probe) {
         if (keys == nullptr) return true;
         if (group == nullptr) return false;
         const std::string_view value = group->cell(column + 1, slot);
@@ -563,7 +563,10 @@ class Executor {
             return parse_int64_cell(value, &parsed) &&
                    int_keys->find(parsed) != int_keys->end();
         }
-        return keys->find(std::string(value)) != keys->end();
+        // Reuse the caller's buffer: C++17 unordered_set has no heterogeneous
+        // lookup, so the string key is rebuilt without a per-row allocation.
+        probe->assign(value.data(), value.size());
+        return keys->find(*probe) != keys->end();
     }
 
     bool RunScan(const pb::QueryBlockScan& scan, NodeResult* output) {
@@ -609,6 +612,13 @@ class Executor {
         }
 
         const bool has_filter = scan.has_filter() && scan.filter().has_expr();
+        // Fetch only the cells the filter references; a wide table's full-row
+        // load dominates otherwise cheap filtered scans.
+        std::vector<uint32_t> filter_cols;
+        if (has_filter) {
+            PredicateEvaluator::collect_columns(scan.filter().expr(),
+                                                &filter_cols);
+        }
         const unsigned worker_count = static_cast<unsigned>(
             std::min<size_t>(WorkerCount(), group_count));
         std::vector<std::vector<uint64_t>> local_refs(worker_count);
@@ -620,6 +630,7 @@ class Executor {
             workers.emplace_back([&, worker_idx] {
                 PredicateEvaluator evaluator;
                 std::vector<uint64_t>& refs = local_refs[worker_idx];
+                std::string probe;  // reused key buffer: no per-row alloc
                 for (size_t group_idx = worker_idx; group_idx < group_count;
                      group_idx += worker_count) {
                     PaxGroup* group = store->group(group_idx);
@@ -643,18 +654,19 @@ class Executor {
                             const uint32_t slot = base + bit;
                             if (!CellMatchesKeySet(
                                     group, slot, scan.semi().my_column(),
-                                    semi_keys, semi_int_keys)) {
+                                    semi_keys, semi_int_keys, &probe)) {
                                 continue;
                             }
                             if (!CellMatchesKeySet(
                                     group, slot, external_filter_column_,
-                                    external_keys, external_int_keys)) {
+                                    external_keys, external_int_keys, &probe)) {
                                 continue;
                             }
                             if (has_filter) {
-                                if (!evaluator.set_row_from_pax(
+                                if (!evaluator.set_row_from_pax_cols(
                                         *group, slot,
-                                        scan.filter().num_columns())) {
+                                        scan.filter().num_columns(),
+                                        filter_cols)) {
                                     worker_failed[worker_idx] = 1;
                                     return;
                                 }
@@ -1982,8 +1994,20 @@ class Executor {
             for (char failed : worker_failed) {
                 if (failed) return false;
             }
+            // Reserve the destination once, after the first local is moved in,
+            // sized to the summed local counts. A per-step reserve would rehash
+            // the growing destination on every merge.
+            size_t total_groups = 0;
+            for (const GroupMap& local : local_groups) {
+                total_groups += local.size();
+            }
+            bool first = true;
             for (GroupMap& local : local_groups) {
                 MergeGroups(&groups, &local, aggregate);
+                if (first && !groups.empty()) {
+                    groups.reserve(total_groups);
+                    first = false;
+                }
             }
         }
 

@@ -130,6 +130,34 @@ bool PredicateEvaluator::set_row_from_pax(
   return true;
 }
 
+bool PredicateEvaluator::set_row_from_pax_cols(
+    const LineairDB::Pax::PaxGroup& group, uint32_t slot, uint32_t num_columns,
+    const std::vector<uint32_t>& cols) {
+  if (group.schema().field_count() < static_cast<size_t>(num_columns) + 1) {
+    return false;
+  }
+
+  const std::string_view null_flags = group.cell(0, slot);
+  null_flags_.assign(null_flags.data(), null_flags.size());
+
+  columns_.assign(num_columns, std::string_view());
+  for (uint32_t column_idx : cols) {
+    if (column_idx < num_columns) {
+      columns_[column_idx] = group.cell(column_idx + 1, slot);
+    }
+  }
+  return true;
+}
+
+void PredicateEvaluator::collect_columns(const FilterExpr& expr,
+                                         std::vector<uint32_t>* out) {
+  if (expr.op() == FilterExpr::COLUMN_REF) out->push_back(expr.column_index());
+  for (const FilterExpr& child : expr.children()) collect_columns(child, out);
+  // Callers pass the root once; normalize on the way out.
+  std::sort(out->begin(), out->end());
+  out->erase(std::unique(out->begin(), out->end()), out->end());
+}
+
 void PredicateEvaluator::set_row_from_views(
     const std::vector<std::string_view>& cells,
     const std::vector<bool>& nulls) {

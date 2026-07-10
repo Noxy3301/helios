@@ -40,6 +40,27 @@ class PredicateEvaluator {
                         uint32_t num_columns);
 
   /**
+   * @brief Like set_row_from_pax, but read only the requested column ordinals.
+   *
+   * `cols` lists the columns the filter expression references (as gathered by
+   * collect_columns). Every other column is left as an empty view and must not
+   * be read during evaluation.
+   *
+   * @return false when the PAX schema cannot contain the requested columns.
+   */
+  bool set_row_from_pax_cols(const LineairDB::Pax::PaxGroup& group,
+                             uint32_t slot, uint32_t num_columns,
+                             const std::vector<uint32_t>& cols);
+
+  /**
+   * @brief Collect the column ordinals referenced by an expression tree.
+   *
+   * The gathered ordinals are sorted and deduplicated in ascending order.
+   */
+  static void collect_columns(const LineairDB::Protocol::FilterExpr& expr,
+                              std::vector<uint32_t>* out);
+
+  /**
    * @brief Read predicate inputs from already decoded column views.
    *
    * Joined tuple filters build a compact row consisting only of the columns
