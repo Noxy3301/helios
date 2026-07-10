@@ -1601,6 +1601,60 @@ class Executor {
                                              residual_columns[i].column);
         }
 
+        // Witness summaries (Moerkotte/Neumann groupjoin lineage): a SEMI/ANTI
+        // join whose entire residual is one integer `a <> b` between a build
+        // column and a probe column only needs, per join key, whether ANY build
+        // row's value differs from the probe value -- which {count, min, max}
+        // answers exactly: exists differing value <=> count>0 &&
+        // !(min==max==probe_value). Replaces the per-key build-row vectors AND
+        // the per-candidate evaluator walk with one integer test (q21: l2/l3
+        // self-joins on l_orderkey with l_suppkey <> l1.l_suppkey). NULL
+        // semantics match the generic path: a NULL build value never satisfies
+        // `<>` (excluded from the summary), a NULL probe value matches nothing.
+        // Gated to typed INT columns compared as signed ints (compare_type==0),
+        // where the evaluator's compare is exactly int64 inequality; any other
+        // shape (byte keys, unsigned compare, extra conjuncts, UNTYPED columns)
+        // takes the existing path untouched.
+        struct Witness {
+            uint32_t count = 0;
+            int64_t min_value = 0;
+            int64_t max_value = 0;
+        };
+        std::unordered_map<int64_t, Witness> witness_summaries;
+        int witness_build = -1;  // residual_columns ordinal, build side
+        int witness_probe = -1;  // residual_columns ordinal, probe side
+        bool witness = false;
+        if ((is_semi || is_anti) && has_residual &&
+            build_key_columns.size() == 1) {
+            const pb::FilterExpr& expr = join.residual().predicate().expr();
+            if (expr.op() == pb::FilterExpr::OP_NE &&
+                expr.children_size() == 2 &&
+                expr.children(0).op() == pb::FilterExpr::COLUMN_REF &&
+                expr.children(1).op() == pb::FilterExpr::COLUMN_REF &&
+                expr.children(0).compare_type() == 0 &&
+                expr.children(1).compare_type() == 0) {
+                const uint32_t ordinal0 = expr.children(0).column_index();
+                const uint32_t ordinal1 = expr.children(1).column_index();
+                if (ordinal0 < residual_columns.size() &&
+                    ordinal1 < residual_columns.size() &&
+                    residual_columns[ordinal0].from_build !=
+                        residual_columns[ordinal1].from_build) {
+                    const bool zero_is_build =
+                        residual_columns[ordinal0].from_build;
+                    witness_build =
+                        static_cast<int>(zero_is_build ? ordinal0 : ordinal1);
+                    witness_probe =
+                        static_cast<int>(zero_is_build ? ordinal1 : ordinal0);
+                    const uint8_t build_kind = residual_kinds[witness_build];
+                    const uint8_t probe_kind = residual_kinds[witness_probe];
+                    witness = (build_kind == LineairDB::Pax::FK_INT32 ||
+                               build_kind == LineairDB::Pax::FK_INT64) &&
+                              (probe_kind == LineairDB::Pax::FK_INT32 ||
+                               probe_kind == LineairDB::Pax::FK_INT64);
+                }
+            }
+        }
+
         // Build a hash table from the chosen build child. A single-column
         // join keys the table by native int64 when every non-null build key
         // parses full-length; one non-integer key reverts to the composite
@@ -1610,7 +1664,50 @@ class Executor {
         std::unordered_map<std::string, std::vector<size_t>> hash_table;
         std::unordered_map<int64_t, std::vector<size_t>> int_hash_table;
         bool int_join = build_key_columns.size() == 1;
-        if (int_join) {
+        if (int_join && witness) {
+            // Fold the build side into {count, min, max} per join key instead
+            // of a per-key row vector. The join key is handled exactly as the
+            // generic int path (null-rejecting key, non-integer key falls back
+            // to byte keys); only the witness value differs.
+            const JoinKeyColumn& build_key = build_key_columns[0];
+            witness_summaries.reserve(build.rows());
+            const ResidualColumn& build_col = residual_columns[witness_build];
+            for (size_t row_idx = 0; row_idx < build.rows(); ++row_idx) {
+                const uint64_t ref =
+                    build.refs[build_key.ref_position][row_idx];
+                // Null-rejecting: skip null keys exactly as BuildJoinKey does.
+                if (NullOf(build_key.table_idx, ref, build_key.column)) {
+                    continue;
+                }
+                int64_t key = 0;
+                if (!ReadI64(build_key.table_idx, ref, build_key.column,
+                             &key)) {
+                    int_join = false;
+                    witness = false;
+                    witness_summaries.clear();
+                    break;
+                }
+                int64_t value = 0;
+                // A NULL build witness value never satisfies `<>`; leave it out
+                // of the summary (the witness column is a typed INT, so ReadI64
+                // returns false only for a NULL cell).
+                if (!ReadI64(build_col.table_idx,
+                             build.refs[build_col.ref_position][row_idx],
+                             build_col.column, &value)) {
+                    continue;
+                }
+                Witness& w = witness_summaries[key];
+                if (w.count == 0) {
+                    w.min_value = value;
+                    w.max_value = value;
+                } else {
+                    w.min_value = std::min(w.min_value, value);
+                    w.max_value = std::max(w.max_value, value);
+                }
+                ++w.count;
+            }
+        }
+        if (int_join && !witness) {
             const JoinKeyColumn& build_key = build_key_columns[0];
             int_hash_table.reserve(build.rows());
             for (size_t row_idx = 0; row_idx < build.rows(); ++row_idx) {
@@ -1711,6 +1808,49 @@ class Executor {
                 const size_t end =
                     probe_rows * (worker_idx + 1) / worker_count;
                 for (size_t probe_idx = begin; probe_idx < end; ++probe_idx) {
+                    if (witness) {
+                        // Summary probe: one map find plus one integer test
+                        // replaces the candidate walk (proof at the Witness
+                        // declaration). Join key and probe witness value are
+                        // read exactly as the generic path; emit like the
+                        // generic SEMI/ANTI branch (matched == is_semi).
+                        bool matched = false;
+                        const JoinKeyColumn& probe_key_column =
+                            probe_key_columns[0];
+                        const uint64_t ref =
+                            probe.refs[probe_key_column.ref_position]
+                                      [probe_idx];
+                        int64_t key = 0;
+                        if (!NullOf(probe_key_column.table_idx, ref,
+                                    probe_key_column.column) &&
+                            ReadI64(probe_key_column.table_idx, ref,
+                                    probe_key_column.column, &key)) {
+                            const auto it = witness_summaries.find(key);
+                            if (it != witness_summaries.end() &&
+                                it->second.count > 0) {
+                                const ResidualColumn& probe_col =
+                                    residual_columns[witness_probe];
+                                int64_t value = 0;
+                                if (ReadI64(probe_col.table_idx,
+                                            probe.refs[probe_col.ref_position]
+                                                      [probe_idx],
+                                            probe_col.column, &value)) {
+                                    matched =
+                                        !(it->second.min_value == value &&
+                                          it->second.max_value == value);
+                                }
+                            }
+                        }
+                        if (matched == is_semi) {
+                            for (size_t column_idx = 0;
+                                 column_idx < probe.tables.size();
+                                 ++column_idx) {
+                                local.refs[column_idx].push_back(
+                                    probe.refs[column_idx][probe_idx]);
+                            }
+                        }
+                        continue;
+                    }
                     // Probe the matching table; int64 lookup when the build
                     // side switched to native keys, else the byte key. A null
                     // or non-integer probe cell misses, mirroring the byte
