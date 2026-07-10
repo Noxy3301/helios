@@ -24,6 +24,7 @@
 #include <lineairdb/database.h>
 #include <lineairdb/pax_store.h>
 
+#include "../../common/log.h"
 #include "decimal_arithmetic.hh"
 #include "predicate_evaluator.hh"
 #include "row_codec.hh"
@@ -602,6 +603,12 @@ struct Node {
     std::vector<Node> children;       // AND/OR/NOT
     const pb::FilterExpr* fb = nullptr;  // FALLBACK subtree (stable proto ref)
 };
+
+inline size_t CountFallbackNodes(const Node& n) {
+    size_t count = (n.kind == Node::FALLBACK) ? 1 : 0;
+    for (const Node& child : n.children) count += CountFallbackNodes(child);
+    return count;
+}
 
 inline bool is_const(const pb::FilterExpr& e) {
     switch (e.op()) {
@@ -1536,6 +1543,10 @@ class Executor {
             if (!decode_typed_i64(value, kind, &parsed)) {
                 *is_int = false;
                 int_keys->clear();
+                LOG_DEBUG(
+                    "semi-filter key set fell back to string keys "
+                    "(non-integer cell in source column %u)",
+                    column.column());
                 return CollectSemiFilterKeys(semi, string_keys);
             }
             int_keys->insert(parsed);
@@ -1734,6 +1745,13 @@ class Executor {
         if (has_filter) {
             vprog.build(scan.filter().expr(), scan.filter().num_columns(),
                         store->schema());
+            const size_t fallback_nodes = vf::CountFallbackNodes(vprog.root);
+            if (fallback_nodes > 0) {
+                LOG_DEBUG(
+                    "scan filter compiled with %zu fallback node(s) running "
+                    "the reference evaluator per slot",
+                    fallback_nodes);
+            }
         }
 
         const unsigned worker_count = static_cast<unsigned>(
@@ -2288,6 +2306,9 @@ class Executor {
                 int64_t key = 0;
                 if (!ReadI64(build_key.table_idx, ref, build_key.column,
                              &key)) {
+                    LOG_DEBUG(
+                        "witness summary fell back to byte keys "
+                        "(non-integer build key)");
                     int_join = false;
                     witness = false;
                     witness_summaries.clear();
@@ -2326,6 +2347,9 @@ class Executor {
                 int64_t parsed = 0;
                 if (!ReadI64(build_key.table_idx, ref, build_key.column,
                              &parsed)) {
+                    LOG_DEBUG(
+                        "int join hash table fell back to byte keys "
+                        "(non-integer build key)");
                     int_join = false;
                     int_hash_table.clear();
                     break;
@@ -4248,12 +4272,18 @@ class Executor {
             if (status == 0) return emit(parts);
             if (status == 2) return structural();
             // status == 1: fall through to the string path.
+            LOG_DEBUG(
+                "int64 group-key aggregation fell back to string keys "
+                "(non-integer group cell)");
         } else if (group_count == 2 && group0_int && group1_int) {
             std::vector<Int2GroupMap> parts(partition_count);
             const int status = run_typed(parts);
             if (status == 0) return emit(parts);
             if (status == 2) return structural();
             // status == 1: fall through to the string path.
+            LOG_DEBUG(
+                "packed 2-int group-key aggregation fell back to string keys "
+                "(non-integer group cell)");
         }
 
         std::vector<GroupMap> parts(partition_count);
