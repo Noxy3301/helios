@@ -1543,7 +1543,7 @@ class Executor {
             if (!decode_typed_i64(value, kind, &parsed)) {
                 *is_int = false;
                 int_keys->clear();
-                LOG_DEBUG(
+                LOG_INFO(
                     "semi-filter key set fell back to string keys "
                     "(non-integer cell in source column %u)",
                     column.column());
@@ -1747,7 +1747,7 @@ class Executor {
                         store->schema());
             const size_t fallback_nodes = vf::CountFallbackNodes(vprog.root);
             if (fallback_nodes > 0) {
-                LOG_DEBUG(
+                LOG_INFO(
                     "scan filter compiled with %zu fallback node(s) running "
                     "the reference evaluator per slot",
                     fallback_nodes);
@@ -2306,7 +2306,7 @@ class Executor {
                 int64_t key = 0;
                 if (!ReadI64(build_key.table_idx, ref, build_key.column,
                              &key)) {
-                    LOG_DEBUG(
+                    LOG_INFO(
                         "witness summary fell back to byte keys "
                         "(non-integer build key)");
                     int_join = false;
@@ -2347,7 +2347,7 @@ class Executor {
                 int64_t parsed = 0;
                 if (!ReadI64(build_key.table_idx, ref, build_key.column,
                              &parsed)) {
-                    LOG_DEBUG(
+                    LOG_INFO(
                         "int join hash table fell back to byte keys "
                         "(non-integer build key)");
                     int_join = false;
@@ -4272,7 +4272,7 @@ class Executor {
             if (status == 0) return emit(parts);
             if (status == 2) return structural();
             // status == 1: fall through to the string path.
-            LOG_DEBUG(
+            LOG_INFO(
                 "int64 group-key aggregation fell back to string keys "
                 "(non-integer group cell)");
         } else if (group_count == 2 && group0_int && group1_int) {
@@ -4281,7 +4281,7 @@ class Executor {
             if (status == 0) return emit(parts);
             if (status == 2) return structural();
             // status == 1: fall through to the string path.
-            LOG_DEBUG(
+            LOG_INFO(
                 "packed 2-int group-key aggregation fell back to string keys "
                 "(non-integer group cell)");
         }
