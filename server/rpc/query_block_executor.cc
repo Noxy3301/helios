@@ -3,8 +3,10 @@
 #include <algorithm>
 #include <atomic>
 #include <charconv>
+#include <cmath>
 #include <cstdint>
 #include <exception>
+#include <functional>
 #include <limits>
 #include <set>
 #include <string>
@@ -22,6 +24,7 @@
 #include "decimal_arithmetic.hh"
 #include "predicate_evaluator.hh"
 #include "row_codec.hh"
+#include "zone_map.hh"
 
 namespace query_block {
 namespace {
@@ -194,6 +197,271 @@ struct DecodedColumnRef {
     uint32_t table_idx = 0;
     uint32_t column = 0;
 };
+
+// ---------------------------------------------------------------------------
+// Zone-map strip pruning.
+//
+// A prunable AND-conjunct of a scan filter is lowered into a PruneClause that
+// compares a strip's per-column [min,max] range (from zone_map) against a
+// constant (or another column's range). A strip is skipped only when a clause
+// proves NO row in it can match; when in doubt the strip is scanned. The
+// constant is converted into the column's int64 domain so the range test is
+// byte-path-equivalent (compare_type gates INT<->{0,1}, DECIMAL<->2, DATE<->3),
+// and DECIMAL bounds are widened by +/-1 scaled unit (conservative).
+// ---------------------------------------------------------------------------
+struct PruneClause {
+    int op;         // FilterExpr::OP_LT/LE/GT/GE/EQ/OP_BETWEEN
+    int zi_a;       // zone-snapshot index for column A
+    int zi_b = -1;  // zone-snapshot index for column B (col-vs-col), else -1
+    int64_t a = 0;  // const threshold(s) in the column's int64 domain
+    int64_t b = 0;
+};
+
+// compare_type must match the classified kind for the range test to mirror the
+// byte path (e.g. a string column with numeric-looking cells is compare_type 3
+// and must NOT be pruned with numeric ranges).
+inline bool zone_ct_ok(zone::ZKind k, uint32_t ct) {
+    switch (k) {
+        case zone::ZKind::INT: return ct == 0 || ct == 1;
+        case zone::ZKind::DECIMAL: return ct == 2;
+        case zone::ZKind::DATE: return ct == 3;
+        default: return false;
+    }
+}
+
+inline int zone_flip_op(int op) {
+    using FE = pb::FilterExpr;
+    switch (op) {
+        case FE::OP_LT: return FE::OP_GT;
+        case FE::OP_LE: return FE::OP_GE;
+        case FE::OP_GT: return FE::OP_LT;
+        case FE::OP_GE: return FE::OP_LE;
+        default: return op;  // EQ stays EQ
+    }
+}
+
+// Convert a constant into an INT/DATE column's exact int64 value. INT accepts
+// only exact-integer constants; DATE accepts a "YYYY-MM-DD" string constant.
+inline bool zone_const_int(const pb::FilterExpr& c, zone::ZKind kind,
+                           int64_t* out) {
+    using FE = pb::FilterExpr;
+    if (kind == zone::ZKind::INT) {
+        // Only exact-integer constants are byte-path-equivalent for an INT
+        // column. A CONST_DOUBLE makes the byte path promote the INT cell to
+        // double (losing precision above 2^53); a CONST_STRING makes the byte
+        // path compare as STRING, not numeric. Neither can be mirrored by an
+        // integer zone, so fall back to the byte path (no prune).
+        switch (c.op()) {
+            case FE::CONST_INT: *out = c.int_val(); return true;
+            case FE::CONST_UINT:
+                if (c.uint_val() > static_cast<uint64_t>(INT64_MAX))
+                    return false;
+                *out = static_cast<int64_t>(c.uint_val());
+                return true;
+            default: return false;
+        }
+    }
+    // DATE: the constant is the date's string form (temporal constants are
+    // serialized via their string value).
+    if (c.op() != FE::CONST_STRING) return false;
+    zone::ZKind ck;
+    int cs;
+    int64_t v;
+    if (!zone::ClassifyCell(std::string_view(c.string_val()), &ck, &cs, &v) ||
+        ck != zone::ZKind::DATE)
+        return false;
+    *out = v;
+    return true;
+}
+
+// Extract a DECIMAL constant as the double the byte path compares (strtod).
+inline bool zone_const_double(const pb::FilterExpr& c, double* d) {
+    using FE = pb::FilterExpr;
+    switch (c.op()) {
+        case FE::CONST_INT: *d = static_cast<double>(c.int_val()); return true;
+        case FE::CONST_UINT: *d = static_cast<double>(c.uint_val()); return true;
+        case FE::CONST_DOUBLE: *d = c.double_val(); return true;
+        default: return false;  // string on a decimal column -> byte path
+    }
+}
+
+// A DECIMAL constant is only convertible when c * 10^scale stays well inside
+// int64, so DecLower/DecUpper's llround and +/-1 widening cannot overflow or
+// diverge.
+inline bool zone_dec_ok(double c, int scale) {
+    double p = 1.0;
+    for (int i = 0; i < scale; ++i) p *= 10.0;
+    return std::isfinite(c) && std::fabs(c) * p < 9.0e18;
+}
+
+// Lower `column op const` bounds into PruneClause::a/b. For DECIMAL the exact
+// scaled-int cut points (DecLower/DecUpper) are widened outward by 1 unit so
+// pruning stays strictly conservative regardless of double rounding.
+inline bool zone_lower_cmp(int op, const pb::FilterExpr& cst, zone::ZKind kind,
+                           int scale, int64_t* a, int64_t* b) {
+    using FE = pb::FilterExpr;
+    if (kind == zone::ZKind::DECIMAL) {
+        double c;
+        if (!zone_const_double(cst, &c) || !zone_dec_ok(c, scale)) return false;
+        switch (op) {
+            case FE::OP_LT: *a = zone::DecLower(c, scale) + 1; return true;
+            case FE::OP_LE: *a = zone::DecUpper(c, scale) + 1; return true;
+            case FE::OP_GT: *a = zone::DecUpper(c, scale) - 1; return true;
+            case FE::OP_GE: *a = zone::DecLower(c, scale) - 1; return true;
+            case FE::OP_EQ:
+                *a = zone::DecLower(c, scale) - 1;
+                *b = zone::DecUpper(c, scale) + 1;
+                return true;
+            default: return false;
+        }
+    }
+    int64_t c;
+    if (!zone_const_int(cst, kind, &c)) return false;
+    *a = c;
+    if (op == FE::OP_EQ) *b = c;
+    return true;
+}
+
+// Lower `column BETWEEN lo AND hi` bounds into PruneClause::a/b.
+inline bool zone_lower_between(const pb::FilterExpr& lo,
+                               const pb::FilterExpr& hi, zone::ZKind kind,
+                               int scale, int64_t* a, int64_t* b) {
+    if (kind == zone::ZKind::DECIMAL) {
+        double dlo, dhi;
+        if (!zone_const_double(lo, &dlo) || !zone_const_double(hi, &dhi))
+            return false;
+        if (!zone_dec_ok(dlo, scale) || !zone_dec_ok(dhi, scale)) return false;
+        *a = zone::DecLower(dlo, scale) - 1;
+        *b = zone::DecUpper(dhi, scale) + 1;
+        return true;
+    }
+    return zone_const_int(lo, kind, a) && zone_const_int(hi, kind, b);
+}
+
+// Lower one comparison/BETWEEN conjunct. `getz` returns the zone-snapshot index
+// for a column (building it on demand) and its kind/scale, or -1 when the
+// column is not prunable. Returns true (and fills *pc) only for a fully
+// convertible, compare_type-compatible conjunct.
+using ZoneGetZ = std::function<int(uint32_t, zone::ZKind*, int*)>;
+inline bool zone_lower_conjunct(const pb::FilterExpr& e, const ZoneGetZ& getz,
+                                PruneClause* pc) {
+    using FE = pb::FilterExpr;
+    int op = e.op();
+    if (op == FE::OP_BETWEEN) {
+        if (e.negated() || e.children_size() != 3) return false;
+        const FE& col = e.children(0);
+        if (col.op() != FE::COLUMN_REF) return false;
+        zone::ZKind k;
+        int sc;
+        const int zi = getz(col.column_index(), &k, &sc);
+        if (zi < 0 || !zone_ct_ok(k, col.compare_type())) return false;
+        int64_t a, b;
+        if (!zone_lower_between(e.children(1), e.children(2), k, sc, &a, &b))
+            return false;
+        pc->op = FE::OP_BETWEEN;
+        pc->zi_a = zi;
+        pc->zi_b = -1;
+        pc->a = a;
+        pc->b = b;
+        return true;
+    }
+    if (op != FE::OP_LT && op != FE::OP_LE && op != FE::OP_GT &&
+        op != FE::OP_GE && op != FE::OP_EQ)
+        return false;
+    if (e.children_size() != 2) return false;
+    const FE* lhs = &e.children(0);
+    const FE* rhs = &e.children(1);
+    // Normalize `const op column` -> `column op' const`.
+    if (lhs->op() != FE::COLUMN_REF && rhs->op() == FE::COLUMN_REF) {
+        std::swap(lhs, rhs);
+        op = zone_flip_op(op);
+    }
+    if (lhs->op() != FE::COLUMN_REF) return false;
+    zone::ZKind ka;
+    int sca;
+    const int zia = getz(lhs->column_index(), &ka, &sca);
+    if (zia < 0 || !zone_ct_ok(ka, lhs->compare_type())) return false;
+
+    if (rhs->op() == FE::COLUMN_REF) {
+        // Column-vs-column: prunable only when both ranges live in the same
+        // int64 domain (same kind+scale). DECIMAL col-vs-col is left to the
+        // byte path (no widened boundary defined for a range-vs-range test).
+        zone::ZKind kb;
+        int scb;
+        const int zib = getz(rhs->column_index(), &kb, &scb);
+        if (zib < 0 || !zone_ct_ok(kb, rhs->compare_type())) return false;
+        if (ka != kb || sca != scb || ka == zone::ZKind::DECIMAL) return false;
+        pc->op = op;
+        pc->zi_a = zia;
+        pc->zi_b = zib;
+        return true;
+    }
+    int64_t a = 0, b = 0;
+    if (!zone_lower_cmp(op, *rhs, ka, sca, &a, &b)) return false;
+    pc->op = op;
+    pc->zi_a = zia;
+    pc->zi_b = -1;
+    pc->a = a;
+    pc->b = b;
+    return true;
+}
+
+// Lower the prunable conjuncts of a scan filter (a top-level AND, or a lone
+// comparison). Non-prunable conjuncts (OR/IN/LIKE/NE/IS NULL/negated BETWEEN,
+// or unconvertible ones) are simply omitted.
+inline void zone_lower_clauses(const pb::FilterExpr& expr, const ZoneGetZ& getz,
+                               std::vector<PruneClause>* out) {
+    using FE = pb::FilterExpr;
+    if (expr.op() == FE::OP_AND) {
+        for (const auto& ch : expr.children()) {
+            PruneClause pc;
+            if (zone_lower_conjunct(ch, getz, &pc)) out->push_back(pc);
+        }
+    } else {
+        PruneClause pc;
+        if (zone_lower_conjunct(expr, getz, &pc)) out->push_back(pc);
+    }
+}
+
+// True if strip `g` provably contains no row matching the filter: some clause's
+// range test is empty over the strip. Invalid (non-typed) strip zones never
+// prune. Reads immutable request-local snapshots -- safe from worker threads.
+inline bool zone_strip_pruned(
+    size_t g, const std::vector<PruneClause>& prune,
+    const std::vector<std::vector<zone::StripZone>>& zsnaps) {
+    using FE = pb::FilterExpr;
+    for (const PruneClause& c : prune) {
+        const zone::StripZone& za = zsnaps[c.zi_a][g];
+        if (za.state != zone::ZS_VALID) continue;
+        if (c.zi_b < 0) {
+            switch (c.op) {
+                case FE::OP_LT: if (za.zmin >= c.a) return true; break;
+                case FE::OP_LE: if (za.zmin > c.a) return true; break;
+                case FE::OP_GT: if (za.zmax <= c.a) return true; break;
+                case FE::OP_GE: if (za.zmax < c.a) return true; break;
+                case FE::OP_EQ:
+                    if (za.zmax < c.a || za.zmin > c.b) return true;
+                    break;
+                case FE::OP_BETWEEN:
+                    if (za.zmax < c.a || za.zmin > c.b) return true;
+                    break;
+            }
+        } else {
+            const zone::StripZone& zb = zsnaps[c.zi_b][g];
+            if (zb.state != zone::ZS_VALID) continue;
+            switch (c.op) {
+                case FE::OP_LT: if (za.zmin >= zb.zmax) return true; break;
+                case FE::OP_LE: if (za.zmin > zb.zmax) return true; break;
+                case FE::OP_GT: if (za.zmax <= zb.zmin) return true; break;
+                case FE::OP_GE: if (za.zmax < zb.zmin) return true; break;
+                case FE::OP_EQ:
+                    if (za.zmax < zb.zmin || zb.zmax < za.zmin) return true;
+                    break;
+            }
+        }
+    }
+    return false;
+}
 
 class Executor {
  public:
@@ -674,6 +942,46 @@ class Executor {
             PredicateEvaluator::collect_columns(scan.filter().expr(),
                                                 &filter_cols);
         }
+
+        // Lower prunable filter conjuncts into per-strip range tests over cached
+        // zone maps. Zone snapshots are request-local (immutable during the
+        // parallel scan below); a strip proven empty is skipped entirely.
+        std::vector<std::vector<zone::StripZone>> zsnaps;
+        std::vector<zone::ZKind> col_kind;
+        std::vector<int> col_scale;
+        std::unordered_map<uint32_t, int> col_zi;
+        std::vector<PruneClause> prune;
+        if (has_filter) {
+            ZoneGetZ getz = [&](uint32_t col, zone::ZKind* k, int* sc) -> int {
+                auto it = col_zi.find(col);
+                if (it != col_zi.end()) {
+                    if (col_kind[it->second] == zone::ZKind::UNTYPED) return -1;
+                    *k = col_kind[it->second];
+                    *sc = col_scale[it->second];
+                    return it->second;
+                }
+                const int idx = static_cast<int>(zsnaps.size());
+                std::vector<zone::StripZone> zs;
+                zone::ZKind kk;
+                int ss;
+                if (!zone::GetColumnZones(store, col, group_count, &zs, &kk,
+                                          &ss)) {
+                    zsnaps.emplace_back();  // placeholder (never indexed)
+                    col_kind.push_back(zone::ZKind::UNTYPED);
+                    col_scale.push_back(0);
+                    col_zi[col] = idx;
+                    return -1;
+                }
+                zsnaps.push_back(std::move(zs));
+                col_kind.push_back(kk);
+                col_scale.push_back(ss);
+                col_zi[col] = idx;
+                *k = kk;
+                *sc = ss;
+                return idx;
+            };
+            zone_lower_clauses(scan.filter().expr(), getz, &prune);
+        }
         const unsigned worker_count = static_cast<unsigned>(
             std::min<size_t>(WorkerCount(), group_count));
         std::vector<std::vector<uint64_t>> local_refs(worker_count);
@@ -690,6 +998,9 @@ class Executor {
                      group_idx += worker_count) {
                     PaxGroup* group = store->group(group_idx);
                     if (group == nullptr) continue;
+                    if (!prune.empty() &&
+                        zone_strip_pruned(group_idx, prune, zsnaps))
+                        continue;  // strip provably has no matching row
 
                     // Turn one 64-slot visibility word into row references for
                     // the live slots that survive the optional predicate.
