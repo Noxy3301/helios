@@ -1230,13 +1230,18 @@ class Executor {
         return true;
     }
 
+    // One contiguous slot per aggregate holds every per-aggregate
+    // accumulator field, improving locality on group find/accumulate.
+    struct AggSlot {
+        uint64_t count = 0;
+        DecimalValue decimal{};    // SUM/AVG accumulator or MIN/MAX (numeric)
+        std::string string_value;  // MIN/MAX (binary string)
+        bool has_value = false;    // MIN/MAX has seen a value
+        std::set<std::string> distinct_values;  // COUNT(DISTINCT) value set
+    };
     struct GroupState {
         std::vector<std::string> keys;
-        std::vector<uint64_t> counts;
-        std::vector<DecimalValue> decimals;
-        std::vector<std::string> strings;
-        std::vector<bool> has_value;
-        std::vector<std::set<std::string>> distinct_values;
+        std::vector<AggSlot> aggregates;
     };
 
     struct OutputRow {
@@ -1359,11 +1364,7 @@ class Executor {
                     new_state.keys[group_idx] =
                         std::string(group_values[group_idx]);
                 }
-                new_state.counts.assign(aggregate_count, 0);
-                new_state.decimals.assign(aggregate_count, DecimalValue{});
-                new_state.strings.assign(aggregate_count, {});
-                new_state.has_value.assign(aggregate_count, false);
-                new_state.distinct_values.resize(aggregate_count);
+                new_state.aggregates.resize(aggregate_count);
                 state = &groups->emplace(std::move(key_buffer),
                                          std::move(new_state))
                              .first->second;
@@ -1410,13 +1411,13 @@ class Executor {
                             if (ReadAggregateColumn(
                                     function.arg(), input, row_idx,
                                     function.arg_table(), &value)) {
-                                state->distinct_values[aggregate_idx].emplace(
-                                    value);
+                                state->aggregates[aggregate_idx]
+                                    .distinct_values.emplace(value);
                             }
                             break;
                         }
                         if (function.has_arg() && !has_arg_row) break;
-                        state->counts[aggregate_idx] += 1;
+                        state->aggregates[aggregate_idx].count += 1;
                         break;
                     case pb::QueryBlockAggFunc::SUM:
                     case pb::QueryBlockAggFunc::AVG: {
@@ -1424,9 +1425,9 @@ class Executor {
                             function.arg(), input, row_idx,
                             function.arg_table());
                         if (value.is_null) break;
-                        add_decimal_value(state->decimals[aggregate_idx],
-                                          value);
-                        state->counts[aggregate_idx] += 1;
+                        add_decimal_value(
+                            state->aggregates[aggregate_idx].decimal, value);
+                        state->aggregates[aggregate_idx].count += 1;
                         break;
                     }
                     case pb::QueryBlockAggFunc::MIN:
@@ -1441,34 +1442,31 @@ class Executor {
                                                      &value)) {
                                 break;
                             }
-                            if (!state->has_value[aggregate_idx] ||
+                            AggSlot& slot = state->aggregates[aggregate_idx];
+                            if (!slot.has_value ||
                                 (wants_max
-                                     ? value >
-                                           std::string_view(
-                                               state->strings[aggregate_idx])
-                                     : value <
-                                           std::string_view(
-                                               state->strings[aggregate_idx]))) {
-                                state->strings[aggregate_idx] =
-                                    std::string(value);
+                                     ? value > std::string_view(
+                                                   slot.string_value)
+                                     : value < std::string_view(
+                                                   slot.string_value))) {
+                                slot.string_value = std::string(value);
                             }
                         } else {
                             DecimalValue value = EvaluateAggregateExpression(
                                 function.arg(), input, row_idx,
                                 function.arg_table());
                             if (value.is_null) break;
-                            if (!state->has_value[aggregate_idx] ||
+                            AggSlot& slot = state->aggregates[aggregate_idx];
+                            if (!slot.has_value ||
                                 (wants_max
                                      ? compare_decimal_values(
-                                           value,
-                                           state->decimals[aggregate_idx]) > 0
+                                           value, slot.decimal) > 0
                                      : compare_decimal_values(
-                                           value,
-                                           state->decimals[aggregate_idx]) < 0)) {
-                                state->decimals[aggregate_idx] = value;
+                                           value, slot.decimal) < 0)) {
+                                slot.decimal = value;
                             }
                         }
-                        state->has_value[aggregate_idx] = true;
+                        state->aggregates[aggregate_idx].has_value = true;
                         break;
                     }
                     default:
@@ -1499,60 +1497,54 @@ class Executor {
                  aggregate_idx < aggregate.aggs_size(); ++aggregate_idx) {
                 const pb::QueryBlockAggFunc& function =
                     aggregate.aggs(aggregate_idx);
+                AggSlot& destination_slot =
+                    destination_state.aggregates[aggregate_idx];
+                AggSlot& source_slot =
+                    source_state.aggregates[aggregate_idx];
                 switch (function.kind()) {
                     case pb::QueryBlockAggFunc::COUNT:
                         if (function.distinct()) {
-                            destination_state.distinct_values[aggregate_idx]
-                                .merge(source_state
-                                           .distinct_values[aggregate_idx]);
+                            destination_slot.distinct_values.merge(
+                                source_slot.distinct_values);
                             break;
                         }
-                        destination_state.counts[aggregate_idx] +=
-                            source_state.counts[aggregate_idx];
+                        destination_slot.count += source_slot.count;
                         break;
                     case pb::QueryBlockAggFunc::SUM:
                     case pb::QueryBlockAggFunc::AVG:
-                        if (source_state.counts[aggregate_idx] > 0) {
-                            add_decimal_value(
-                                destination_state.decimals[aggregate_idx],
-                                source_state.decimals[aggregate_idx]);
-                            destination_state.counts[aggregate_idx] +=
-                                source_state.counts[aggregate_idx];
+                        if (source_slot.count > 0) {
+                            add_decimal_value(destination_slot.decimal,
+                                              source_slot.decimal);
+                            destination_slot.count += source_slot.count;
                         }
                         break;
                     case pb::QueryBlockAggFunc::MIN:
                     case pb::QueryBlockAggFunc::MAX: {
-                        if (!source_state.has_value[aggregate_idx]) break;
+                        if (!source_slot.has_value) break;
                         const bool wants_max =
                             function.kind() == pb::QueryBlockAggFunc::MAX;
                         if (function.cmp_kind() == 1) {
-                            if (!destination_state.has_value[aggregate_idx] ||
+                            if (!destination_slot.has_value ||
                                 (wants_max
-                                     ? source_state.strings[aggregate_idx] >
-                                           destination_state
-                                               .strings[aggregate_idx]
-                                     : source_state.strings[aggregate_idx] <
-                                           destination_state
-                                               .strings[aggregate_idx])) {
-                                destination_state.strings[aggregate_idx] =
-                                    std::move(
-                                        source_state.strings[aggregate_idx]);
+                                     ? source_slot.string_value >
+                                           destination_slot.string_value
+                                     : source_slot.string_value <
+                                           destination_slot.string_value)) {
+                                destination_slot.string_value =
+                                    std::move(source_slot.string_value);
                             }
                         } else if (
-                            !destination_state.has_value[aggregate_idx] ||
+                            !destination_slot.has_value ||
                             (wants_max
                                  ? compare_decimal_values(
-                                       source_state.decimals[aggregate_idx],
-                                       destination_state
-                                           .decimals[aggregate_idx]) > 0
+                                       source_slot.decimal,
+                                       destination_slot.decimal) > 0
                                  : compare_decimal_values(
-                                       source_state.decimals[aggregate_idx],
-                                       destination_state
-                                           .decimals[aggregate_idx]) < 0)) {
-                            destination_state.decimals[aggregate_idx] =
-                                source_state.decimals[aggregate_idx];
+                                       source_slot.decimal,
+                                       destination_slot.decimal) < 0)) {
+                            destination_slot.decimal = source_slot.decimal;
                         }
-                        destination_state.has_value[aggregate_idx] = true;
+                        destination_slot.has_value = true;
                         break;
                     }
                     default:
@@ -1566,14 +1558,14 @@ class Executor {
                                const GroupState& state, int aggregate_idx,
                                bool* is_null) const {
         *is_null = false;
+        const AggSlot& slot = state.aggregates[aggregate_idx];
         switch (function.kind()) {
             case pb::QueryBlockAggFunc::COUNT:
-                return std::to_string(
-                    function.distinct()
-                        ? state.distinct_values[aggregate_idx].size()
-                        : state.counts[aggregate_idx]);
+                return std::to_string(function.distinct()
+                                          ? slot.distinct_values.size()
+                                          : slot.count);
             case pb::QueryBlockAggFunc::SUM:
-                if (state.counts[aggregate_idx] == 0) {
+                if (slot.count == 0) {
                     if (function.zero_if_empty()) {
                         DecimalValue zero;
                         zero.scale = static_cast<int>(function.arg_scale());
@@ -1583,28 +1575,27 @@ class Executor {
                     *is_null = true;
                     return {};
                 }
-                return format_decimal_value(state.decimals[aggregate_idx]);
+                return format_decimal_value(slot.decimal);
             case pb::QueryBlockAggFunc::AVG: {
-                if (state.counts[aggregate_idx] == 0) {
+                if (slot.count == 0) {
                     *is_null = true;
                     return {};
                 }
                 const int output_scale =
                     static_cast<int>(function.arg_scale()) + 4;
-                return format_decimal_value(divide_decimal_value(
-                    state.decimals[aggregate_idx],
-                    state.counts[aggregate_idx], output_scale));
+                return format_decimal_value(
+                    divide_decimal_value(slot.decimal, slot.count,
+                                         output_scale));
             }
             case pb::QueryBlockAggFunc::MIN:
             case pb::QueryBlockAggFunc::MAX:
-                if (!state.has_value[aggregate_idx]) {
+                if (!slot.has_value) {
                     *is_null = true;
                     return {};
                 }
                 return function.cmp_kind() == 1
-                           ? state.strings[aggregate_idx]
-                           : format_decimal_value(
-                                 state.decimals[aggregate_idx]);
+                           ? slot.string_value
+                           : format_decimal_value(slot.decimal);
             default:
                 *is_null = true;
                 return {};
@@ -2014,11 +2005,7 @@ class Executor {
         const int group_count = aggregate.group_columns_size();
         if (group_count == 0 && groups.empty()) {
             GroupState state;
-            state.counts.assign(aggregate.aggs_size(), 0);
-            state.decimals.assign(aggregate.aggs_size(), DecimalValue{});
-            state.strings.assign(aggregate.aggs_size(), {});
-            state.has_value.assign(aggregate.aggs_size(), false);
-            state.distinct_values.resize(aggregate.aggs_size());
+            state.aggregates.resize(aggregate.aggs_size());
             groups.emplace(std::string(), std::move(state));
         }
 
