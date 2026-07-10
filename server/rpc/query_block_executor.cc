@@ -954,10 +954,53 @@ class Executor {
         return true;
     }
 
+    // Dense exact bitmap over an int semi/external key set. TPC-H int keys
+    // (orderkey/partkey/suppkey) are dense in [min,max], so a bitset answers
+    // membership with one range check plus one bit test instead of a hash
+    // probe (sideways-information-passing, exact rather than Bloom). Only built
+    // past a density gate; see build().
+    struct KeyBitmap {
+        std::vector<uint64_t> bits;
+        int64_t base = 0;
+        bool ok = false;
+        void build(const std::unordered_set<int64_t>& s) {
+            if (s.empty()) return;
+            int64_t kmin = INT64_MAX, kmax = INT64_MIN;
+            for (int64_t v : s) {
+                kmin = std::min(kmin, v);
+                kmax = std::max(kmax, v);
+            }
+            const uint64_t span =
+                static_cast<uint64_t>(kmax) - static_cast<uint64_t>(kmin);
+            if (span >= (uint64_t{256} << 20)) return;  // > 2^28 bits
+            // Density gate: semi/external key sets are usually PRE-FILTERED and
+            // sparse (q18: 57 keys over a 6M span). A sparse bitmap trades an
+            // L1-resident hash set for L2-sized random bit probes and loses
+            // (measured q18 +100ms). Build only when fill >= 1/64 -- where the
+            // bitmap is at least as compact as the set and probe locality wins
+            // (and where the 4M-key probe cost otherwise bites at SF>=10).
+            if (span > s.size() * 64) return;
+            bits.assign((span + 64) / 64, 0);
+            base = kmin;
+            for (int64_t v : s) {
+                const uint64_t o = static_cast<uint64_t>(v) -
+                                   static_cast<uint64_t>(base);
+                bits[o >> 6] |= uint64_t{1} << (o & 63);
+            }
+            ok = true;
+        }
+        bool test(int64_t v) const {
+            const uint64_t o =
+                static_cast<uint64_t>(v) - static_cast<uint64_t>(base);
+            return o < bits.size() * 64 && ((bits[o >> 6] >> (o & 63)) & 1);
+        }
+    };
+
     static bool CellMatchesKeySet(
         const PaxGroup* group, uint32_t slot, uint32_t column,
         const std::unordered_set<std::string>* keys,
-        const std::unordered_set<int64_t>* int_keys, std::string* probe) {
+        const std::unordered_set<int64_t>* int_keys, std::string* probe,
+        const KeyBitmap* int_bitmap = nullptr) {
         if (keys == nullptr && int_keys == nullptr) return true;
         if (group == nullptr) return false;
         const size_t field = static_cast<size_t>(column) + 1;
@@ -968,8 +1011,10 @@ class Executor {
         const uint8_t kind = group->schema().kind_of(field);
         if (int_keys != nullptr) {
             int64_t parsed = 0;
-            return decode_typed_i64(value, kind, &parsed) &&
-                   int_keys->find(parsed) != int_keys->end();
+            if (!decode_typed_i64(value, kind, &parsed)) return false;
+            if (int_bitmap != nullptr && int_bitmap->ok)
+                return int_bitmap->test(parsed);
+            return int_keys->find(parsed) != int_keys->end();
         }
         // Reuse the caller's buffer: C++17 unordered_set has no heterogeneous
         // lookup, so the canonical string key is rebuilt without a per-row
@@ -1035,6 +1080,13 @@ class Executor {
             build_int64_key_set(*external_keys, &external_int_keys_storage)) {
             external_int_keys = &external_int_keys_storage;
         }
+
+        // Density-gated dense bitmaps for the int key sets. Built once here
+        // (read-only during the parallel scan), so worker threads share them.
+        KeyBitmap semi_bitmap, external_bitmap;
+        if (semi_int_keys != nullptr) semi_bitmap.build(*semi_int_keys);
+        if (external_int_keys != nullptr)
+            external_bitmap.build(*external_int_keys);
 
         const bool has_filter = scan.has_filter() && scan.filter().has_expr();
         // Fetch only the cells the filter references; a wide table's full-row
@@ -1122,12 +1174,14 @@ class Executor {
                             const uint32_t slot = base + bit;
                             if (!CellMatchesKeySet(
                                     group, slot, scan.semi().my_column(),
-                                    semi_keys, semi_int_keys, &probe)) {
+                                    semi_keys, semi_int_keys, &probe,
+                                    &semi_bitmap)) {
                                 continue;
                             }
                             if (!CellMatchesKeySet(
                                     group, slot, external_filter_column_,
-                                    external_keys, external_int_keys, &probe)) {
+                                    external_keys, external_int_keys, &probe,
+                                    &external_bitmap)) {
                                 continue;
                             }
                             if (has_filter) {
@@ -1812,10 +1866,9 @@ class Executor {
         std::vector<bool> nulls;
     };
 
+    // String group keys stay in a node-based map: the keys are variable length
+    // and the length-prefixed byte key is already allocated per group.
     using GroupMap = std::unordered_map<std::string, GroupState>;
-    // Single INT group column keyed by native int64 (value<->byte 1:1 for
-    // canonical numeric cells), the group analogue of the join fast path.
-    using IntGroupMap = std::unordered_map<int64_t, GroupState>;
     // Two INT group columns packed into a POD 128-bit key.
     struct Int2Key {
         int64_t a = 0;
@@ -1824,15 +1877,172 @@ class Executor {
             return a == other.a && b == other.b;
         }
     };
-    struct Int2Hash {
-        size_t operator()(const Int2Key& key) const {
-            size_t hash = std::hash<int64_t>()(key.a);
-            hash ^= std::hash<int64_t>()(key.b) + 0x9e3779b97f4a7c15ULL +
-                    (hash << 6) + (hash >> 2);
-            return hash;
+
+    // Flat open-addressing group map for POD keys. Layout follows the DuckDB
+    // GroupedAggregateHashTable shape: a power-of-2 probe table of 16-byte
+    // {hash, payload index} entries plus a dense payload vector of
+    // (key, GroupState). Compared to std::unordered_map this removes the
+    // per-group node allocation (q18 inserts ~1.5M groups per execution), makes
+    // a probe touch one cache line of entries where the stored hash rejects
+    // almost every non-match before the payload is read, and turns the
+    // HAVING/emit scans into dense sequential walks. The interface is the
+    // subset of unordered_map the aggregation templates use: find, emplace,
+    // erase (tombstone), begin/end iteration, empty/size, reserve, and move
+    // assignment. erase() only tombstones the payload slot; probe chains stay
+    // intact because the only eraser is HAVING, which runs after every insert.
+    // Not thread-safe: each radix partition owns one instance.
+    template <typename K, typename HashF>
+    struct FlatGroupMap {
+        using key_type = K;
+        using value_type = std::pair<K, GroupState>;
+
+        std::vector<value_type> payload_;
+        std::vector<uint8_t> dead_;  // parallel to payload_
+        struct Ent {
+            uint64_t h;    // 0 = empty (stored hashes are forced odd)
+            uint32_t idx;  // payload index
+        };
+        std::vector<Ent> table_;
+        size_t mask_ = 0;
+        size_t dead_n_ = 0;
+
+        FlatGroupMap() = default;
+        // Explicit moves: the defaults would leave the source's mask_/dead_n_
+        // scalars behind, so a moved-from map (MergeGroups dst = move(src))
+        // would report empty()==false over an empty payload.
+        FlatGroupMap(FlatGroupMap&& o) noexcept
+            : payload_(std::move(o.payload_)),
+              dead_(std::move(o.dead_)),
+              table_(std::move(o.table_)),
+              mask_(o.mask_),
+              dead_n_(o.dead_n_) {
+            o.mask_ = 0;
+            o.dead_n_ = 0;
+        }
+        FlatGroupMap& operator=(FlatGroupMap&& o) noexcept {
+            payload_ = std::move(o.payload_);
+            dead_ = std::move(o.dead_);
+            table_ = std::move(o.table_);
+            mask_ = o.mask_;
+            dead_n_ = o.dead_n_;
+            o.mask_ = 0;
+            o.dead_n_ = 0;
+            return *this;
+        }
+
+        struct iterator {
+            FlatGroupMap* m;
+            size_t i;
+            void skip() {
+                while (i < m->payload_.size() && m->dead_[i]) ++i;
+            }
+            iterator& operator++() {
+                ++i;
+                skip();
+                return *this;
+            }
+            value_type& operator*() const { return m->payload_[i]; }
+            value_type* operator->() const { return &m->payload_[i]; }
+            bool operator==(const iterator& o) const { return i == o.i; }
+            bool operator!=(const iterator& o) const { return i != o.i; }
+        };
+        iterator begin() {
+            iterator it{this, 0};
+            it.skip();
+            return it;
+        }
+        iterator end() { return {this, payload_.size()}; }
+        bool empty() const { return payload_.size() == dead_n_; }
+        size_t size() const { return payload_.size() - dead_n_; }
+
+        // Deliberately SHARES the mix64 finalizer with the radix partitioner:
+        // within one partition every key then has identical low log2(P) bits,
+        // so probe starts cluster on a stride-P subset of slots. A reviewer
+        // flagged this as a probe-length pathology and suggested decorrelating
+        // with a second mix64 -- it made q18 ~80ms WORSE at SF=1: the clustered
+        // starts keep the probe working set L1-resident (cap/P distinct lines)
+        // and the +1 linear chain walks adjacent lines, whereas decorrelated
+        // starts turn every probe into a random L2 miss across the whole table.
+        // Probe length is bounded by the 0.625 load cap either way. Measured,
+        // not guessed -- do not re-mix here without re-measuring q18.
+        // | 1 keeps the stored hash nonzero (0 marks an empty entry).
+        static uint64_t hv(const K& k) { return HashF{}(k) | 1; }
+
+        // Rebuild the probe table for ~`want` live entries (load <= 0.625).
+        void rehash(size_t want) {
+            size_t cap = 16;
+            while (cap * 10 < want * 16) cap <<= 1;
+            table_.assign(cap, {0, 0});
+            mask_ = cap - 1;
+            for (size_t i = 0; i < payload_.size(); ++i) {
+                if (dead_[i]) continue;
+                const uint64_t h = hv(payload_[i].first);
+                size_t j = h & mask_;
+                while (table_[j].h != 0) j = (j + 1) & mask_;
+                table_[j] = {h, static_cast<uint32_t>(i)};
+            }
+        }
+        void reserve(size_t n) {
+            if (n * 16 > table_.size() * 10) rehash(n);
+            payload_.reserve(n);
+            dead_.reserve(n);
+        }
+        iterator find(const K& k) {
+            if (table_.empty()) return end();
+            const uint64_t h = hv(k);
+            size_t j = h & mask_;
+            while (table_[j].h != 0) {
+                if (table_[j].h == h) {
+                    const uint32_t idx = table_[j].idx;
+                    if (!dead_[idx] && payload_[idx].first == k)
+                        return {this, idx};
+                }
+                j = (j + 1) & mask_;
+            }
+            return end();
+        }
+        std::pair<iterator, bool> emplace(K k, GroupState&& v) {
+            if (table_.empty() ||
+                (payload_.size() + 1) * 16 > table_.size() * 10)
+                rehash(std::max<size_t>((payload_.size() + 1) * 2, 16));
+            const uint64_t h = hv(k);
+            size_t j = h & mask_;
+            while (table_[j].h != 0) {
+                if (table_[j].h == h) {
+                    const uint32_t idx = table_[j].idx;
+                    if (!dead_[idx] && payload_[idx].first == k)
+                        return {{this, idx}, false};
+                }
+                j = (j + 1) & mask_;
+            }
+            payload_.emplace_back(std::move(k), std::move(v));
+            dead_.push_back(0);
+            table_[j] = {h, static_cast<uint32_t>(payload_.size() - 1)};
+            return {{this, payload_.size() - 1}, true};
+        }
+        iterator erase(iterator it) {
+            dead_[it.i] = 1;
+            ++dead_n_;
+            iterator nx{this, it.i + 1};
+            nx.skip();
+            return nx;
         }
     };
-    using Int2GroupMap = std::unordered_map<Int2Key, GroupState, Int2Hash>;
+    struct I64Mix {
+        size_t operator()(int64_t v) const {
+            return mix64(static_cast<uint64_t>(v));
+        }
+    };
+    struct I2Mix {
+        size_t operator()(const Int2Key& k) const {
+            return mix64(static_cast<uint64_t>(k.a) * 0x9e3779b97f4a7c15ULL +
+                         static_cast<uint64_t>(k.b));
+        }
+    };
+    // Single INT group column keyed by native int64 (value<->byte 1:1 for
+    // canonical numeric cells), the group analogue of the join fast path.
+    using IntGroupMap = FlatGroupMap<int64_t, I64Mix>;
+    using Int2GroupMap = FlatGroupMap<Int2Key, I2Mix>;
 
     static uint32_t FilterTableForAggregate(
         const pb::QueryBlockAggFunc& function) {
@@ -2019,6 +2229,20 @@ class Executor {
         std::vector<std::string_view> filter_values;
         std::vector<bool> filter_nulls;
         std::vector<std::string> filter_bufs;
+        // Clustered-run cache (int/int2 paths): rows arrive in physical order
+        // and lineitem is clustered by l_orderkey (run length ~4 at TPC-H
+        // scale), so consecutive rows usually land in the same group. A cache
+        // hit reuses last_state and skips the partition find/emplace entirely.
+        // Safety across payload reallocation: last_state is dereferenced ONLY
+        // on a cache hit, which requires the key to equal last_key; consecutive
+        // equal keys mean no emplace ran between the set and the reuse, so the
+        // payload cannot have moved. On every miss the pointer is recomputed
+        // after the emplace, never carried across it. Equal key also implies
+        // the same radix partition (part_of_* is a pure key function), so a hit
+        // never needs the partition index.
+        [[maybe_unused]] int64_t last_key = 0;
+        [[maybe_unused]] Int2Key last_key2{0, 0};
+        GroupState* last_state = nullptr;
         for (size_t row_idx = begin; row_idx < end; ++row_idx) {
             GroupState* state = nullptr;
             if constexpr (IntKey) {
@@ -2036,23 +2260,30 @@ class Executor {
                     parse_fail->store(true, std::memory_order_relaxed);
                     return false;
                 }
-                MapT& groups = (*parts)[partition_count == 1
-                                            ? 0
-                                            : part_of_i64(parsed,
-                                                          partition_count)];
-                auto group_it = groups.find(parsed);
-                if (group_it == groups.end()) {
-                    GroupState new_state;
-                    // Defer the canonical-ASCII format to emit: stash the row
-                    // that created the group so EnsureGroupKeys can rebuild the
-                    // exact stored bytes only if a key read actually reaches it.
-                    new_state.key_ref[0] = ref;
-                    new_state.key_done = false;
-                    new_state.aggregates.resize(aggregate_count);
-                    state = &groups.emplace(parsed, std::move(new_state))
-                                 .first->second;
+                if (last_state != nullptr && parsed == last_key) {
+                    state = last_state;
                 } else {
-                    state = &group_it->second;
+                    MapT& groups = (*parts)[partition_count == 1
+                                                ? 0
+                                                : part_of_i64(parsed,
+                                                              partition_count)];
+                    auto group_it = groups.find(parsed);
+                    if (group_it == groups.end()) {
+                        GroupState new_state;
+                        // Defer the canonical-ASCII format to emit: stash the
+                        // row that created the group so EnsureGroupKeys can
+                        // rebuild the exact stored bytes only if a key read
+                        // actually reaches it.
+                        new_state.key_ref[0] = ref;
+                        new_state.key_done = false;
+                        new_state.aggregates.resize(aggregate_count);
+                        state = &groups.emplace(parsed, std::move(new_state))
+                                     .first->second;
+                    } else {
+                        state = &group_it->second;
+                    }
+                    last_key = parsed;
+                    last_state = state;
                 }
             } else if constexpr (Int2) {
                 // Two group columns, both prefix_len==0 (enforced by caller).
@@ -2074,22 +2305,28 @@ class Executor {
                     parse_fail->store(true, std::memory_order_relaxed);
                     return false;
                 }
-                MapT& groups = (*parts)[partition_count == 1
-                                            ? 0
-                                            : part_of_i2(key,
-                                                         partition_count)];
-                auto group_it = groups.find(key);
-                if (group_it == groups.end()) {
-                    GroupState new_state;
-                    // Defer both cells' canonical-ASCII format to emit.
-                    new_state.key_ref[0] = ref0;
-                    new_state.key_ref[1] = ref1;
-                    new_state.key_done = false;
-                    new_state.aggregates.resize(aggregate_count);
-                    state = &groups.emplace(key, std::move(new_state))
-                                 .first->second;
+                if (last_state != nullptr && key == last_key2) {
+                    state = last_state;
                 } else {
-                    state = &group_it->second;
+                    MapT& groups = (*parts)[partition_count == 1
+                                                ? 0
+                                                : part_of_i2(key,
+                                                             partition_count)];
+                    auto group_it = groups.find(key);
+                    if (group_it == groups.end()) {
+                        GroupState new_state;
+                        // Defer both cells' canonical-ASCII format to emit.
+                        new_state.key_ref[0] = ref0;
+                        new_state.key_ref[1] = ref1;
+                        new_state.key_done = false;
+                        new_state.aggregates.resize(aggregate_count);
+                        state = &groups.emplace(key, std::move(new_state))
+                                     .first->second;
+                    } else {
+                        state = &group_it->second;
+                    }
+                    last_key2 = key;
+                    last_state = state;
                 }
             } else {
                 key_buffer.clear();
