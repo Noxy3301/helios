@@ -1014,6 +1014,13 @@ bool RecognizeDerivedRegroup(JOIN *join, ColumnarExecutionContext *ctx,
 
   Query_expression *outer_unit = qb->master_query_expression();
   if (qb->has_limit()) {
+    // LIMIT without ORDER BY picks arbitrary rows: the row engine and this
+    // executor (whose group-map iteration order is an implementation detail)
+    // may legally return different rows, so reject loudly instead of
+    // silently diverging.
+    if (qb->order_list.first == nullptr &&
+        outer_unit->select_limit_cnt != HA_POS_ERROR)
+      LDB_COL_REJECT("LIMIT without ORDER BY");
     if (outer_unit->select_limit_cnt != HA_POS_ERROR)
       request.set_limit(outer_unit->select_limit_cnt);
     if (outer_unit->offset_limit_cnt > 0) {
@@ -1349,6 +1356,13 @@ bool RecognizeFlattenedAggregate(JOIN *join, ColumnarExecutionContext *ctx,
 
   Query_expression *outer_unit = qb->master_query_expression();
   if (qb->has_limit()) {
+    // LIMIT without ORDER BY picks arbitrary rows: the row engine and this
+    // executor (whose group-map iteration order is an implementation detail)
+    // may legally return different rows, so reject loudly instead of
+    // silently diverging.
+    if (qb->order_list.first == nullptr &&
+        outer_unit->select_limit_cnt != HA_POS_ERROR)
+      LDB_COL_REJECT("LIMIT without ORDER BY");
     if (outer_unit->select_limit_cnt != HA_POS_ERROR)
       request.set_limit(outer_unit->select_limit_cnt);
     if (outer_unit->offset_limit_cnt > 0) {
@@ -3206,6 +3220,13 @@ bool BuildQueryBlockRequest(
     }
 
     if (qb->has_limit()) {
+      // LIMIT without ORDER BY picks arbitrary rows: the row engine and this
+      // executor (whose group-map iteration order is an implementation
+      // detail) may legally return different rows, so reject loudly instead
+      // of silently diverging.
+      if (qb->order_list.first == nullptr &&
+          unit->select_limit_cnt != HA_POS_ERROR)
+        LDB_COL_REJECT("LIMIT without ORDER BY");
       if (unit->select_limit_cnt != HA_POS_ERROR)
         request.set_limit(unit->select_limit_cnt);
       if (unit->offset_limit_cnt > 0) {
@@ -3825,6 +3846,13 @@ bool BuildQueryBlockRequest(
   }
 
   if (qb->has_limit()) {
+    // LIMIT without ORDER BY picks arbitrary rows: the row engine and this
+    // executor (whose group-map iteration order is an implementation detail)
+    // may legally return different rows, so reject loudly instead of
+    // silently diverging.
+    if (qb->order_list.first == nullptr &&
+        unit->select_limit_cnt != HA_POS_ERROR)
+      LDB_COL_REJECT("LIMIT without ORDER BY");
     if (unit->select_limit_cnt != HA_POS_ERROR)
       request.set_limit(unit->select_limit_cnt);
     if (unit->offset_limit_cnt > 0) {
