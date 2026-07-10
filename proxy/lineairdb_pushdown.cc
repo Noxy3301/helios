@@ -426,8 +426,8 @@ static void collect_table_local_predicates(Item *it, table_map me,
  *
  * @return true when the OR has a safe table-local predicate.
  */
-static bool serialize_or_necessary_condition(
-    Item *or_item, table_map me, LineairDB::Protocol::FilterExpr *out) {
+bool serialize_or_necessary_condition(Item *or_item, table_map me,
+                                      LineairDB::Protocol::FilterExpr *out) {
   if (or_item == nullptr || or_item->type() != Item::COND_ITEM ||
       down_cast<Item_cond *>(or_item)->functype() != Item_func::COND_OR_FUNC)
     return false;

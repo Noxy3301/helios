@@ -5,6 +5,7 @@
 #include <string>
 
 #include "lineairdb.pb.h"
+#include "my_table_map.h"  // table_map
 
 class Item;
 class Field;
@@ -14,6 +15,24 @@ class LineairDBTransaction;
 
 bool serialize_item(const Item *item,
                     LineairDB::Protocol::FilterExpr *expr);
+
+/**
+ * @brief Serialize the table-local NECESSARY condition of a cross-table OR.
+ *
+ * @details Builds the OR over each branch's `me`-local conjuncts. This is
+ * implied by the original OR (never stricter), so it can be pushed as an
+ * extra scan pre-filter while the exact predicate still runs downstream.
+ * Every branch must constrain `me`; otherwise the derived condition would be
+ * stricter than the query and the call fails.
+ *
+ * @param or_item Candidate cross-table OR predicate.
+ * @param me Table whose scan would receive the derived condition.
+ * @param out Serialized necessary condition; left unusable when the call fails.
+ * @return false when any branch has no `me`-local conjunct or a conjunct fails
+ * to serialize.
+ */
+bool serialize_or_necessary_condition(Item *or_item, table_map me,
+                                      LineairDB::Protocol::FilterExpr *out);
 
 using SerializeColumnEncoder = std::function<int(const Field *)>;
 

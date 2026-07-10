@@ -705,19 +705,34 @@ const Field *ExtractYearField(Item *item) {
 
 /**
  * @brief Serialize one table's pushed predicates as a single PushedPredicate.
+ *
+ * @details `extras` carries pre-serialized FilterExprs (such as necessary
+ * conditions derived from cross-table ORs) that are ANDed together with the
+ * item filters. The merged predicate is exactly equivalent to the conjunction
+ * of every filter and every extra.
  */
-bool SerializeTableFilters(const std::vector<Item *> &filters, TABLE *table,
-                           LineairDB::Protocol::PushedPredicate *predicate) {
-  if (filters.empty()) return true;
+bool SerializeTableFilters(
+    const std::vector<Item *> &filters, TABLE *table,
+    LineairDB::Protocol::PushedPredicate *predicate,
+    const std::vector<LineairDB::Protocol::FilterExpr> *extras = nullptr) {
+  const size_t extra_count = (extras != nullptr) ? extras->size() : 0;
+  if (filters.empty() && extra_count == 0) return true;
   predicate->set_num_columns(table->s->fields);
-  if (filters.size() == 1) {
+  if (filters.size() == 1 && extra_count == 0) {
     return SerializeScanPredicate(filters[0], predicate->mutable_expr());
+  }
+  if (filters.empty() && extra_count == 1) {
+    *predicate->mutable_expr() = (*extras)[0];
+    return true;
   }
 
   auto *root = predicate->mutable_expr();
   root->set_op(LineairDB::Protocol::FilterExpr::OP_AND);
   for (Item *filter : filters) {
     if (!SerializeScanPredicate(filter, root->add_children())) return false;
+  }
+  for (size_t i = 0; i < extra_count; i++) {
+    *root->add_children() = (*extras)[i];
   }
   return true;
 }
@@ -1571,6 +1586,13 @@ bool BuildQueryBlockRequest(
   };
 
   std::vector<std::vector<Item *>> table_filters(tables.size());
+  // Table-local NECESSARY conditions derived from cross-table ORs (the
+  // q19/q7 OR-of-ANDs shape): pre-serialized FilterExprs ANDed into the scan
+  // filter. Each is implied by the OR, so the exact cross-table predicate
+  // still runs downstream as a tuple filter unchanged; this only stops rows
+  // that cannot satisfy any branch from entering the joins.
+  std::vector<std::vector<LineairDB::Protocol::FilterExpr>> table_extra_filters(
+      tables.size());
   std::vector<JoinEdge> join_edges;
   auto add_join_edge_if_supported = [&](const Field *left_raw,
                                         const Field *right_raw) -> bool {
@@ -1629,6 +1651,25 @@ bool BuildQueryBlockRequest(
         tuple_predicates.push_back(predicate);
       }
       continue;
+    }
+
+    // A cross-table OR yields a per-table necessary condition: the OR over
+    // that table's branch-local conjuncts. It is implied by the original OR,
+    // so ANDing it into the scan filter never drops a row the OR keeps. The
+    // derivation fails (and is skipped) for any table not constrained by
+    // every branch. This runs for plan-mapped blocks too, where the exact OR
+    // arrives from the AccessPath tree rather than this decomposition.
+    if (predicate->type() == Item::COND_ITEM &&
+        down_cast<Item_cond *>(predicate)->functype() ==
+            Item_func::COND_OR_FUNC) {
+      for (size_t t = 0; t < tables.size(); t++) {
+        if (table_is_virtual[t] || (used & tables[t].map) == 0) continue;
+        LineairDB::Protocol::FilterExpr necessary;
+        if (serialize_or_necessary_condition(predicate, tables[t].map,
+                                             &necessary)) {
+          table_extra_filters[t].push_back(std::move(necessary));
+        }
+      }
     }
 
     // Plan mapping takes cross-table joins, semijoin residuals, and derived
@@ -1837,9 +1878,10 @@ bool BuildQueryBlockRequest(
     auto *scan = scan_node->mutable_scan();
     scan->set_table_idx(static_cast<uint32_t>(table_idx));
     scan_nodes[table_idx] = request.nodes_size() - 1;
-    if (!table_filters[table_idx].empty() &&
+    const auto &extras = table_extra_filters[table_idx];
+    if ((!table_filters[table_idx].empty() || !extras.empty()) &&
         !SerializeTableFilters(table_filters[table_idx], table,
-                               scan->mutable_filter())) {
+                               scan->mutable_filter(), &extras)) {
       return false;
     }
     return true;
