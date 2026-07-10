@@ -1428,18 +1428,53 @@ class Executor {
         return true;
     }
 
-    // Accumulates rows [begin,end) into `groups`, generic over the map key.
-    // The string-keyed GroupMap builds length-prefixed byte keys; the int64
+    // Radix partition index for a group key. A well-mixed finalizer keeps
+    // partition sizes balanced even for sequentially-clustered integer keys
+    // (l_orderkey runs 1..N), which the identity std::hash<int64_t> would bucket
+    // unevenly. Pure function of the key, so every worker maps a given key to
+    // the same partition -- that disjointness lets the partition merge tasks run
+    // without cross-partition contention. Strings need no extra mixing because
+    // std::hash<std::string_view> already avalanches the byte key.
+    static inline uint64_t mix64(uint64_t x) {
+        x ^= x >> 33;
+        x *= 0xff51afd7ed558ccdULL;
+        x ^= x >> 33;
+        x *= 0xc4ceb9fe1a85ec53ULL;
+        x ^= x >> 33;
+        return x;
+    }
+    static inline unsigned part_of_i64(int64_t value, unsigned partition_count) {
+        return static_cast<unsigned>(
+            mix64(static_cast<uint64_t>(value)) % partition_count);
+    }
+    static inline unsigned part_of_i2(const Int2Key& key,
+                                      unsigned partition_count) {
+        return static_cast<unsigned>(
+            mix64(static_cast<uint64_t>(key.a) * 0x9e3779b97f4a7c15ULL +
+                  static_cast<uint64_t>(key.b)) %
+            partition_count);
+    }
+    static inline unsigned part_of_str(std::string_view key,
+                                       unsigned partition_count) {
+        return static_cast<unsigned>(
+            std::hash<std::string_view>{}(key) % partition_count);
+    }
+
+    // Accumulates rows [begin,end) into `parts` -- a radix fan-out of
+    // partition_count group maps, one row routed to parts[part_of_*(key)]
+    // (parts[0] when partition_count==1). Generic over the map key: the
+    // string-keyed GroupMap builds length-prefixed byte keys; the int64
     // IntGroupMap and packed Int2GroupMap parse the group cells to int64 and
     // key on the value. In an int path the first cell that does not parse
     // full-length sets *parse_fail and returns false, so the caller discards
-    // the partial map and re-runs the aggregation on the string path. Callers
+    // the partial maps and re-runs the aggregation on the string path. Callers
     // only take an int path for numeric group columns with prefix_len==0, and
     // canonical numeric cells are value<->byte 1:1, so results are unchanged.
     template <typename MapT>
     bool AccumulateRangeT(const pb::QueryBlockAggregate& aggregate,
                           const NodeResult& input, size_t begin, size_t end,
-                          MapT* groups, std::atomic<bool>* parse_fail) {
+                          std::vector<MapT>* parts, unsigned partition_count,
+                          std::atomic<bool>* parse_fail) {
         constexpr bool IntKey =
             std::is_same_v<typename MapT::key_type, int64_t>;
         constexpr bool Int2 =
@@ -1505,8 +1540,12 @@ class Executor {
                     parse_fail->store(true, std::memory_order_relaxed);
                     return false;
                 }
-                auto group_it = groups->find(parsed);
-                if (group_it == groups->end()) {
+                MapT& groups = (*parts)[partition_count == 1
+                                            ? 0
+                                            : part_of_i64(parsed,
+                                                          partition_count)];
+                auto group_it = groups.find(parsed);
+                if (group_it == groups.end()) {
                     GroupState new_state;
                     // Defer the canonical-ASCII format to emit: stash the row
                     // that created the group so EnsureGroupKeys can rebuild the
@@ -1514,7 +1553,7 @@ class Executor {
                     new_state.key_ref[0] = ref;
                     new_state.key_done = false;
                     new_state.aggregates.resize(aggregate_count);
-                    state = &groups->emplace(parsed, std::move(new_state))
+                    state = &groups.emplace(parsed, std::move(new_state))
                                  .first->second;
                 } else {
                     state = &group_it->second;
@@ -1537,15 +1576,19 @@ class Executor {
                     parse_fail->store(true, std::memory_order_relaxed);
                     return false;
                 }
-                auto group_it = groups->find(key);
-                if (group_it == groups->end()) {
+                MapT& groups = (*parts)[partition_count == 1
+                                            ? 0
+                                            : part_of_i2(key,
+                                                         partition_count)];
+                auto group_it = groups.find(key);
+                if (group_it == groups.end()) {
                     GroupState new_state;
                     // Defer both cells' canonical-ASCII format to emit.
                     new_state.key_ref[0] = ref0;
                     new_state.key_ref[1] = ref1;
                     new_state.key_done = false;
                     new_state.aggregates.resize(aggregate_count);
-                    state = &groups->emplace(key, std::move(new_state))
+                    state = &groups.emplace(key, std::move(new_state))
                                  .first->second;
                 } else {
                     state = &group_it->second;
@@ -1566,8 +1609,12 @@ class Executor {
                                       group_values[group_idx].size());
                 }
 
-                auto group_it = groups->find(key_buffer);
-                if (group_it == groups->end()) {
+                MapT& groups = (*parts)[partition_count == 1
+                                            ? 0
+                                            : part_of_str(key_buffer,
+                                                          partition_count)];
+                auto group_it = groups.find(key_buffer);
+                if (group_it == groups.end()) {
                     GroupState new_state;
                     new_state.keys.resize(group_count);
                     for (int group_idx = 0; group_idx < group_count;
@@ -1576,8 +1623,8 @@ class Executor {
                             std::string(group_values[group_idx]);
                     }
                     new_state.aggregates.resize(aggregate_count);
-                    state = &groups->emplace(std::move(key_buffer),
-                                             std::move(new_state))
+                    state = &groups.emplace(std::move(key_buffer),
+                                            std::move(new_state))
                                  .first->second;
                     key_buffer.clear();
                 } else {
@@ -1958,6 +2005,53 @@ class Executor {
         }
     }
 
+    // Structural validation of an output EXPR tree, mirroring the fail()
+    // conditions of EvaluateOutputExpression. Data-independent (depends only on
+    // the plan, not on any group), so it is checked once up front; the
+    // per-partition output build can then evaluate EXPR outputs in parallel
+    // without reaching a fail() path.
+    bool ValidateOutputExpression(const pb::FilterExpr& expression,
+                                  const pb::QueryBlockAggregate& aggregate) {
+        using FE = pb::FilterExpr;
+        switch (expression.op()) {
+            case FE::COLUMN_REF: {
+                const uint32_t ordinal = expression.column_index();
+                const uint32_t group_count =
+                    static_cast<uint32_t>(aggregate.group_columns_size());
+                if (ordinal < group_count) return true;
+                if (ordinal - group_count >=
+                    static_cast<uint32_t>(aggregate.aggs_size())) {
+                    return fail("output expression ordinal out of range");
+                }
+                return true;
+            }
+            case FE::CONST_INT:
+            case FE::CONST_UINT:
+            case FE::CONST_STRING:
+            case FE::CONST_NULL:
+                return true;
+            case FE::OP_ADD:
+            case FE::OP_SUB:
+            case FE::OP_MUL:
+            case FE::OP_DIV:
+                if (expression.children_size() != 2) {
+                    return fail("output expression arity mismatch");
+                }
+                return ValidateOutputExpression(expression.children(0),
+                                                aggregate) &&
+                       ValidateOutputExpression(expression.children(1),
+                                                aggregate);
+            case FE::OP_NEG:
+                if (expression.children_size() != 1) {
+                    return fail("output expression arity mismatch");
+                }
+                return ValidateOutputExpression(expression.children(0),
+                                                aggregate);
+            default:
+                return fail("unsupported output expression");
+        }
+    }
+
     bool AggregateRowValue(const pb::QueryBlockAggregate& aggregate,
                            int group_count, const GroupState& state,
                            uint32_t ordinal, std::string* value,
@@ -1991,9 +2085,12 @@ class Executor {
         uint64_t count = 0;
     };
 
+    // Second-stage re-aggregation (q13 shape): fold every group across all
+    // partitions into one shared map. Inherently single-threaded (a reshuffle
+    // to a different key), so it sweeps the disjoint partition maps in order.
     template <typename MapT>
     bool BuildRegroupedRows(const pb::QueryBlockAggregate& aggregate,
-                            int group_count, MapT& groups,
+                            int group_count, std::vector<MapT>& parts,
                             std::vector<OutputRow>* output_rows) {
         const auto& regroup = aggregate.regroup();
         if (!regroup.count_star()) return fail("regroup must count");
@@ -2002,7 +2099,8 @@ class Executor {
         std::string key;
         std::vector<std::string> values;
         std::vector<bool> nulls;
-        for (auto& entry : groups) {
+        for (auto& part : parts) {
+          for (auto& entry : part) {
             GroupState& state = entry.second;
             key.clear();
             values.clear();
@@ -2035,6 +2133,7 @@ class Executor {
                 regroup_state.nulls = nulls;
             }
             regroup_state.count += 1;
+          }
         }
 
         output_rows->clear();
@@ -2199,80 +2298,118 @@ class Executor {
 
         const unsigned worker_count = static_cast<unsigned>(std::min<size_t>(
             WorkerCount(), std::max<size_t>(input_rows / 65536, 1)));
+        // Radix partitions = worker count. Each accumulate worker fans its
+        // groups into partition_count maps by part_of_*(key); one merge task
+        // per partition then folds that partition from every worker in parallel
+        // (disjoint keys, no contention), replacing the single-threaded
+        // MergeGroups chain into one giant map. HAVING and the output-row build
+        // also run per-partition in parallel; the second stage and ORDER
+        // BY/LIMIT/serialize stay single-threaded. partition_count==1 (inputs
+        // below the worker threshold) collapses to the single-map path with
+        // identical emit order.
+        const unsigned partition_count = worker_count;
         const int group_count = aggregate.group_columns_size();
 
-        // Accumulate rows [0,input_rows) into a fresh map of the given type,
-        // single-threaded or across worker_count locals merged at the end.
-        // Returns 0 on success (map ready to emit), 1 on parse fallback (an int
-        // path hit a non-integer cell), 2 on structural failure.
-        auto run_typed = [&](auto& groups) -> int {
-            using MapT = std::decay_t<decltype(groups)>;
+        // Radix accumulate plus a parallel per-partition merge into `parts`
+        // (sized to partition_count). Phase 1: each worker fans its row range
+        // into its own partition_count local maps. Phase 2: one merge task per
+        // partition folds that partition from every worker -- disjoint keys, so
+        // no contention. Returns 0 on success (parts ready to emit), 1 on parse
+        // fallback (an int path hit a non-integer cell), 2 on structural
+        // failure. Parallel workers report failure through worker_failed /
+        // parse_fail rather than fail(), which the caller resolves after join.
+        auto run_typed = [&](auto& parts) -> int {
+            using MapT = typename std::decay_t<decltype(parts)>::value_type;
             std::atomic<bool> parse_fail{false};
-            bool ok = true;
-            if (worker_count <= 1) {
-                ok = AccumulateRangeT(aggregate, input, 0, input_rows, &groups,
-                                      &parse_fail);
-            } else {
-                std::vector<MapT> local_groups(worker_count);
-                std::vector<char> worker_failed(worker_count, 0);
+            if (partition_count <= 1) {
+                if (!AccumulateRangeT(aggregate, input, 0, input_rows, &parts,
+                                      1u, &parse_fail)) {
+                    return parse_fail.load() ? 1 : 2;
+                }
+                return 0;
+            }
+            std::vector<std::vector<MapT>> local_parts(worker_count);
+            std::vector<char> worker_failed(worker_count, 0);
+            {
                 std::vector<std::thread> workers;
                 workers.reserve(worker_count);
                 for (unsigned worker_idx = 0; worker_idx < worker_count;
                      ++worker_idx) {
                     workers.emplace_back([&, worker_idx] {
+                        local_parts[worker_idx].resize(partition_count);
                         const size_t begin =
                             input_rows * worker_idx / worker_count;
                         const size_t end =
                             input_rows * (worker_idx + 1) / worker_count;
                         if (!AccumulateRangeT(aggregate, input, begin, end,
-                                              &local_groups[worker_idx],
-                                              &parse_fail)) {
+                                              &local_parts[worker_idx],
+                                              partition_count, &parse_fail)) {
                             worker_failed[worker_idx] = 1;
                         }
                     });
                 }
                 for (std::thread& worker : workers) worker.join();
-                for (char failed : worker_failed) {
-                    if (failed) {
-                        ok = false;
-                        break;
-                    }
-                }
-                if (ok) {
-                    // Reserve the destination once, after the first local is
-                    // moved in, sized to the summed local counts. A per-step
-                    // reserve would rehash the growing destination every merge.
-                    size_t total_groups = 0;
-                    for (const MapT& local : local_groups) {
-                        total_groups += local.size();
-                    }
-                    bool first = true;
-                    for (MapT& local : local_groups) {
-                        MergeGroups(&groups, &local, aggregate);
-                        if (first && !groups.empty()) {
-                            groups.reserve(total_groups);
-                            first = false;
-                        }
-                    }
-                }
             }
-            if (ok) return 0;
-            return parse_fail.load() ? 1 : 2;
+            for (char failed : worker_failed) {
+                if (failed) return parse_fail.load() ? 1 : 2;
+            }
+            {
+                std::vector<std::thread> mergers;
+                mergers.reserve(partition_count);
+                for (unsigned p = 0; p < partition_count; ++p) {
+                    size_t partition_total = 0;
+                    for (unsigned worker_idx = 0; worker_idx < worker_count;
+                         ++worker_idx) {
+                        partition_total += local_parts[worker_idx][p].size();
+                    }
+                    if (partition_total == 0) continue;  // empty, no thread
+                    mergers.emplace_back([&, p, partition_total] {
+                        // Reserve the destination once, after the first non-
+                        // empty local is moved in, sized to the summed counts.
+                        bool first = true;
+                        for (unsigned worker_idx = 0; worker_idx < worker_count;
+                             ++worker_idx) {
+                            MergeGroups(&parts[p], &local_parts[worker_idx][p],
+                                        aggregate);
+                            if (first && !parts[p].empty()) {
+                                parts[p].reserve(partition_total);
+                                first = false;
+                            }
+                        }
+                    });
+                }
+                for (std::thread& merger : mergers) merger.join();
+            }
+            return 0;
         };
 
         // Post-accumulation pipeline (implicit grouping fill -> HAVING ->
-        // regroup / output rows -> ORDER BY / LIMIT / serialize), generic over
-        // the map key so the typed fast paths and the string path share it.
-        auto emit = [&](auto& groups) -> bool {
-            using KeyType = typename std::decay_t<decltype(groups)>::key_type;
+        // regroup / output rows -> ORDER BY / LIMIT / serialize) over the
+        // partition_count disjoint maps. HAVING and the normal output build run
+        // per-partition in parallel; the second stage and ORDER BY/LIMIT stay
+        // single-threaded. Generic over the map key so the typed fast paths and
+        // the string path share it.
+        auto emit = [&](auto& parts) -> bool {
+            using MapT = typename std::decay_t<decltype(parts)>::value_type;
+            using KeyType = typename MapT::key_type;
+            const unsigned part_n = static_cast<unsigned>(parts.size());
             // Implicit grouping emits one row over zero input; reachable only
-            // for the string map, since the int paths always group by a
-            // numeric column.
+            // for the string map, since the int paths always group by a numeric
+            // column. Inject into partition 0 when every partition is empty.
             if constexpr (std::is_same_v<KeyType, std::string>) {
-                if (group_count == 0 && groups.empty()) {
-                    GroupState state;
-                    state.aggregates.resize(aggregate.aggs_size());
-                    groups.emplace(std::string(), std::move(state));
+                if (group_count == 0) {
+                    bool any = false;
+                    for (auto& part : parts) {
+                        if (!part.empty()) {
+                            any = true;
+                            break;
+                        }
+                    }
+                    if (!any) {
+                        GroupState state;
+                        state.aggregates.resize(aggregate.aggs_size());
+                        parts[0].emplace(std::string(), std::move(state));
+                    }
                 }
             }
 
@@ -2294,119 +2431,194 @@ class Executor {
             }
         }
 
-        // HAVING predicates read the first-stage aggregate row layout:
-        // group values first, then aggregate values.
+        // HAVING drops groups failing the predicate over the first-stage row
+        // layout (group values, then aggregate values). Partitions hold
+        // disjoint keys, so each is pruned independently -- run it per-partition
+        // in parallel, each thread with its own evaluator/scratch, erasing from
+        // its own map.
         if (aggregate.has_having() && aggregate.having().has_expr()) {
-            PredicateEvaluator evaluator;
-            std::vector<std::string> values;
-            std::vector<std::string_view> cells;
-            std::vector<bool> nulls;
-            for (auto group_it = groups.begin(); group_it != groups.end();) {
-                GroupState& state = group_it->second;
-                if (having_uses_group) EnsureGroupKeys(aggregate, &state);
-                values.clear();
-                cells.clear();
-                nulls.clear();
-                values.reserve(group_count + aggregate.aggs_size());
-                cells.reserve(group_count + aggregate.aggs_size());
-                nulls.reserve(group_count + aggregate.aggs_size());
+            auto prune_partition = [&](MapT& groups) {
+                PredicateEvaluator evaluator;
+                std::vector<std::string> values;
+                std::vector<std::string_view> cells;
+                std::vector<bool> nulls;
+                for (auto group_it = groups.begin();
+                     group_it != groups.end();) {
+                    GroupState& state = group_it->second;
+                    if (having_uses_group) EnsureGroupKeys(aggregate, &state);
+                    values.clear();
+                    cells.clear();
+                    nulls.clear();
+                    values.reserve(group_count + aggregate.aggs_size());
+                    cells.reserve(group_count + aggregate.aggs_size());
+                    nulls.reserve(group_count + aggregate.aggs_size());
 
-                for (int group_idx = 0; group_idx < group_count;
-                     ++group_idx) {
-                    // Placeholder when HAVING never names a group ordinal; the
-                    // evaluator only reads ordinals the expression references.
-                    values.push_back(having_uses_group ? state.keys[group_idx]
-                                                        : std::string());
-                    nulls.push_back(false);
-                }
-                for (int aggregate_idx = 0;
-                     aggregate_idx < aggregate.aggs_size();
-                     ++aggregate_idx) {
-                    bool is_null = false;
-                    values.push_back(AggregateValue(
-                        aggregate.aggs(aggregate_idx), state,
-                        aggregate_idx, &is_null));
-                    nulls.push_back(is_null);
-                }
-                for (const std::string& value : values) {
-                    cells.push_back(value);
-                }
+                    for (int group_idx = 0; group_idx < group_count;
+                         ++group_idx) {
+                        // Placeholder when HAVING never names a group ordinal;
+                        // the evaluator reads only ordinals it references.
+                        values.push_back(having_uses_group
+                                             ? state.keys[group_idx]
+                                             : std::string());
+                        nulls.push_back(false);
+                    }
+                    for (int aggregate_idx = 0;
+                         aggregate_idx < aggregate.aggs_size();
+                         ++aggregate_idx) {
+                        bool is_null = false;
+                        values.push_back(AggregateValue(
+                            aggregate.aggs(aggregate_idx), state,
+                            aggregate_idx, &is_null));
+                        nulls.push_back(is_null);
+                    }
+                    for (const std::string& value : values) {
+                        cells.push_back(value);
+                    }
 
-                evaluator.set_row_from_views(cells, nulls);
-                if (evaluator.evaluate(aggregate.having().expr())) {
-                    ++group_it;
-                } else {
-                    group_it = groups.erase(group_it);
+                    evaluator.set_row_from_views(cells, nulls);
+                    if (evaluator.evaluate(aggregate.having().expr())) {
+                        ++group_it;
+                    } else {
+                        group_it = groups.erase(group_it);
+                    }
+                }
+            };
+            if (part_n <= 1) {
+                prune_partition(parts[0]);
+            } else {
+                std::vector<std::thread> pool;
+                pool.reserve(part_n);
+                for (unsigned p = 0; p < part_n; ++p) {
+                    if (parts[p].empty()) continue;  // no work, no thread
+                    pool.emplace_back([&, p] { prune_partition(parts[p]); });
+                }
+                for (std::thread& worker : pool) worker.join();
+            }
+        }
+
+        // Validate the normal-path output ordinals once (data-independent) so
+        // the parallel row builder has no fail() path. The second stage lives
+        // in a different ordinal space (checked inline in BuildRegroupedRows),
+        // so validating it here against group_count/aggs_size would spuriously
+        // reject a valid `GROUP ordinal >= group_count` second-stage output.
+        if (!aggregate.has_regroup()) {
+            for (const pb::QueryBlockOutputExpr& expression :
+                 request_.output()) {
+                switch (expression.source()) {
+                    case pb::QueryBlockOutputExpr::GROUP:
+                        if (expression.ordinal() >=
+                            static_cast<uint32_t>(group_count)) {
+                            return fail("group output ordinal out of range");
+                        }
+                        break;
+                    case pb::QueryBlockOutputExpr::AGG:
+                        if (expression.ordinal() >=
+                            static_cast<uint32_t>(aggregate.aggs_size())) {
+                            return fail(
+                                "aggregate output ordinal out of range");
+                        }
+                        break;
+                    case pb::QueryBlockOutputExpr::EXPR:
+                        if (!ValidateOutputExpression(expression.expr(),
+                                                      aggregate)) {
+                            return false;
+                        }
+                        break;
+                    default:
+                        return fail("unsupported query-block output source");
                 }
             }
         }
 
         std::vector<OutputRow> output_rows;
         if (aggregate.has_regroup()) {
-            if (!BuildRegroupedRows(aggregate, group_count, groups,
+            if (!BuildRegroupedRows(aggregate, group_count, parts,
                                     &output_rows)) {
                 return false;
             }
         } else {
-            output_rows.reserve(groups.size());
-            for (auto& entry : groups) {
-                GroupState& state = entry.second;
-                // Survivors only: GROUP and group-referencing EXPR outputs read
-                // the key cells, so materialize any deferred keys once here.
-                EnsureGroupKeys(aggregate, &state);
-                OutputRow row;
-                row.values.reserve(request_.output_size());
-                row.nulls.reserve(request_.output_size());
-                for (const pb::QueryBlockOutputExpr& expression :
-                     request_.output()) {
-                    switch (expression.source()) {
-                        case pb::QueryBlockOutputExpr::GROUP:
-                            if (expression.ordinal() >=
-                                static_cast<uint32_t>(group_count)) {
-                                return fail(
-                                    "group output ordinal out of range");
+            // Normal output: build each partition's rows independently, then
+            // concatenate in partition order. Ordinals are validated above, so
+            // this path cannot fail and is safe to run per-partition in
+            // parallel. The concatenation order differs from a single map, but
+            // every final result is ORDER BY-sorted or a scalar row and derived
+            // blocks feed order-independent joins, so md5 is preserved.
+            auto build_partition = [&](MapT& groups,
+                                       std::vector<OutputRow>& out) {
+                out.reserve(groups.size());
+                for (auto& entry : groups) {
+                    GroupState& state = entry.second;
+                    // Survivors only: GROUP and group-referencing EXPR outputs
+                    // read the key cells, so materialize deferred keys here.
+                    EnsureGroupKeys(aggregate, &state);
+                    OutputRow row;
+                    row.values.reserve(request_.output_size());
+                    row.nulls.reserve(request_.output_size());
+                    for (const pb::QueryBlockOutputExpr& expression :
+                         request_.output()) {
+                        switch (expression.source()) {
+                            case pb::QueryBlockOutputExpr::GROUP:
+                                row.values.push_back(
+                                    state.keys[expression.ordinal()]);
+                                row.nulls.push_back(false);
+                                break;
+                            case pb::QueryBlockOutputExpr::AGG: {
+                                bool is_null = false;
+                                row.values.push_back(AggregateValue(
+                                    aggregate.aggs(expression.ordinal()), state,
+                                    static_cast<int>(expression.ordinal()),
+                                    &is_null));
+                                row.nulls.push_back(is_null);
+                                break;
                             }
-                            row.values.push_back(
-                                state.keys[expression.ordinal()]);
-                            row.nulls.push_back(false);
-                            break;
-                        case pb::QueryBlockOutputExpr::AGG: {
-                            if (expression.ordinal() >=
-                                static_cast<uint32_t>(
-                                    aggregate.aggs_size())) {
-                                return fail(
-                                    "aggregate output ordinal out of range");
+                            case pb::QueryBlockOutputExpr::EXPR: {
+                                // Structure validated above, so this cannot
+                                // fail; ignore the bool and keep fail() off the
+                                // parallel path.
+                                DecimalValue value;
+                                EvaluateOutputExpression(expression.expr(),
+                                                         aggregate, state,
+                                                         &value);
+                                round_decimal_value(
+                                    &value, static_cast<int>(
+                                                expression.result_scale()));
+                                row.values.push_back(
+                                    value.is_null
+                                        ? std::string()
+                                        : format_decimal_value(value));
+                                row.nulls.push_back(value.is_null);
+                                break;
                             }
-                            bool is_null = false;
-                            row.values.push_back(AggregateValue(
-                                aggregate.aggs(expression.ordinal()), state,
-                                static_cast<int>(expression.ordinal()),
-                                &is_null));
-                            row.nulls.push_back(is_null);
-                            break;
+                            default:
+                                break;  // validated above; unreachable
                         }
-                        case pb::QueryBlockOutputExpr::EXPR: {
-                            DecimalValue value;
-                            if (!EvaluateOutputExpression(
-                                    expression.expr(), aggregate, state,
-                                    &value)) {
-                                return false;
-                            }
-                            round_decimal_value(
-                                &value,
-                                static_cast<int>(expression.result_scale()));
-                            row.values.push_back(
-                                value.is_null ? std::string()
-                                              : format_decimal_value(value));
-                            row.nulls.push_back(value.is_null);
-                            break;
-                        }
-                        default:
-                            return fail(
-                                "unsupported query-block output source");
+                    }
+                    out.push_back(std::move(row));
+                }
+            };
+            if (part_n <= 1) {
+                build_partition(parts[0], output_rows);
+            } else {
+                std::vector<std::vector<OutputRow>> partition_rows(part_n);
+                std::vector<std::thread> pool;
+                pool.reserve(part_n);
+                for (unsigned p = 0; p < part_n; ++p) {
+                    if (parts[p].empty()) continue;
+                    pool.emplace_back([&, p] {
+                        build_partition(parts[p], partition_rows[p]);
+                    });
+                }
+                for (std::thread& worker : pool) worker.join();
+                size_t total = 0;
+                for (const std::vector<OutputRow>& pr : partition_rows) {
+                    total += pr.size();
+                }
+                output_rows.reserve(total);
+                for (std::vector<OutputRow>& pr : partition_rows) {
+                    for (OutputRow& row : pr) {
+                        output_rows.push_back(std::move(row));
                     }
                 }
-                output_rows.push_back(std::move(row));
             }
         }
 
@@ -2432,23 +2644,23 @@ class Executor {
             aggregate.group_columns(1).prefix_len() == 0 &&
             aggregate.group_columns(1).cmp_kind() == 0;
         if (group_count == 1 && group0_int) {
-            IntGroupMap int_groups;
-            const int status = run_typed(int_groups);
-            if (status == 0) return emit(int_groups);
+            std::vector<IntGroupMap> parts(partition_count);
+            const int status = run_typed(parts);
+            if (status == 0) return emit(parts);
             if (status == 2) return false;
             // status == 1: fall through to the string path.
         } else if (group_count == 2 && group0_int && group1_int) {
-            Int2GroupMap int2_groups;
-            const int status = run_typed(int2_groups);
-            if (status == 0) return emit(int2_groups);
+            std::vector<Int2GroupMap> parts(partition_count);
+            const int status = run_typed(parts);
+            if (status == 0) return emit(parts);
             if (status == 2) return false;
             // status == 1: fall through to the string path.
         }
 
-        GroupMap groups;
-        const int status = run_typed(groups);
+        std::vector<GroupMap> parts(partition_count);
+        const int status = run_typed(parts);
         if (status != 0) return false;  // string path never parse-fails
-        return emit(groups);
+        return emit(parts);
     }
 
     bool RunNodes(pb::TxExecuteQueryBlock::Response* response) {
