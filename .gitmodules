@@ -12,3 +12,7 @@
 	url = https://github.com/Noxy3301/benchbase.git
 	branch = research/helios
 	ignore = dirty
+[submodule "third_party/duckdb"]
+	path = third_party/duckdb
+	url = https://github.com/duckdb/duckdb.git
+	ignore = dirty
