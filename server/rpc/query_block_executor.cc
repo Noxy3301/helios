@@ -1771,6 +1771,50 @@ class Executor {
             std::hash<std::string_view>{}(key) % partition_count);
     }
 
+    // Single-threaded validation of everything AccumulateRangeT resolves per
+    // range. Runs once before workers spawn so parallel accumulation never
+    // writes the shared error state.
+    bool ValidateAggregateInput(const pb::QueryBlockAggregate& aggregate,
+                                const NodeResult& input) {
+        for (int group_idx = 0; group_idx < aggregate.group_columns_size();
+             ++group_idx) {
+            if (input.table_pos(
+                    aggregate.group_columns(group_idx).table_idx()) < 0) {
+                return fail("group table is not in aggregate input");
+            }
+        }
+        for (int aggregate_idx = 0; aggregate_idx < aggregate.aggs_size();
+             ++aggregate_idx) {
+            const pb::QueryBlockAggFunc& function =
+                aggregate.aggs(aggregate_idx);
+            if (function.has_arg() &&
+                input.table_pos(function.arg_table()) < 0) {
+                return fail("aggregate table is not in aggregate input");
+            }
+            if (function.has_filter() &&
+                input.table_pos(FilterTableForAggregate(function)) < 0) {
+                return fail(
+                    "aggregate filter table is not in aggregate input");
+            }
+            if (function.has_arg() &&
+                !ValidateAggregateExpressionTables(
+                    function.arg(), input, function.arg_table())) {
+                return false;
+            }
+            switch (function.kind()) {
+                case pb::QueryBlockAggFunc::COUNT:
+                case pb::QueryBlockAggFunc::SUM:
+                case pb::QueryBlockAggFunc::AVG:
+                case pb::QueryBlockAggFunc::MIN:
+                case pb::QueryBlockAggFunc::MAX:
+                    break;
+                default:
+                    return fail("unsupported aggregate function");
+            }
+        }
+        return true;
+    }
+
     // Accumulates rows [begin,end) into `parts` -- a radix fan-out of
     // partition_count group maps, one row routed to parts[part_of_*(key)]
     // (parts[0] when partition_count==1). Generic over the map key: the
@@ -1793,13 +1837,14 @@ class Executor {
         const int group_count = aggregate.group_columns_size();
         const int aggregate_count = aggregate.aggs_size();
 
+        // Positions were validated by ValidateAggregateInput; failures here
+        // return without a message because workers run this concurrently and
+        // must not write the shared error state.
         std::vector<int> group_positions(group_count, -1);
         for (int group_idx = 0; group_idx < group_count; ++group_idx) {
             group_positions[group_idx] =
                 input.table_pos(aggregate.group_columns(group_idx).table_idx());
-            if (group_positions[group_idx] < 0) {
-                return fail("group table is not in aggregate input");
-            }
+            if (group_positions[group_idx] < 0) return false;
         }
 
         std::vector<int> aggregate_positions(aggregate_count, -1);
@@ -1811,22 +1856,12 @@ class Executor {
             if (function.has_arg()) {
                 aggregate_positions[aggregate_idx] =
                     input.table_pos(function.arg_table());
-                if (aggregate_positions[aggregate_idx] < 0) {
-                    return fail("aggregate table is not in aggregate input");
-                }
+                if (aggregate_positions[aggregate_idx] < 0) return false;
             }
             if (function.has_filter()) {
                 filter_positions[aggregate_idx] =
                     input.table_pos(FilterTableForAggregate(function));
-                if (filter_positions[aggregate_idx] < 0) {
-                    return fail(
-                        "aggregate filter table is not in aggregate input");
-                }
-            }
-            if (function.has_arg() &&
-                !ValidateAggregateExpressionTables(
-                    function.arg(), input, function.arg_table())) {
-                return false;
+                if (filter_positions[aggregate_idx] < 0) return false;
             }
         }
 
@@ -1964,8 +1999,9 @@ class Executor {
                             filter_table, filter_ref,
                             function.filter().num_columns(), &filter_values,
                             &filter_nulls)) {
-                        return fail(
-                            "aggregate filter cannot read table columns");
+                        // No message from worker context; the dispatch
+                        // reports the failure after joining.
+                        return false;
                     }
                     evaluator.set_row_from_views(filter_values, filter_nulls);
                     if (!evaluator.evaluate(function.filter().expr())) {
@@ -2040,7 +2076,9 @@ class Executor {
                         break;
                     }
                     default:
-                        return fail("unsupported aggregate function");
+                        // Rejected by ValidateAggregateInput; no message from
+                        // worker context.
+                        return false;
                 }
             }
         }
@@ -2629,6 +2667,7 @@ class Executor {
         // fallback (an int path hit a non-integer cell), 2 on structural
         // failure. Parallel workers report failure through worker_failed /
         // parse_fail rather than fail(), which the caller resolves after join.
+        if (!ValidateAggregateInput(aggregate, input)) return false;
         auto run_typed = [&](auto& parts) -> int {
             using MapT = typename std::decay_t<decltype(parts)>::value_type;
             std::atomic<bool> parse_fail{false};
@@ -2954,23 +2993,29 @@ class Executor {
             group_count >= 2 &&
             aggregate.group_columns(1).prefix_len() == 0 &&
             aggregate.group_columns(1).cmp_kind() == 0;
+        // Workers report structural failure without a message; attach one
+        // here if nothing more specific was recorded.
+        const auto structural = [this]() {
+            return error_.empty() ? fail("aggregate accumulation failed")
+                                  : false;
+        };
         if (group_count == 1 && group0_int) {
             std::vector<IntGroupMap> parts(partition_count);
             const int status = run_typed(parts);
             if (status == 0) return emit(parts);
-            if (status == 2) return false;
+            if (status == 2) return structural();
             // status == 1: fall through to the string path.
         } else if (group_count == 2 && group0_int && group1_int) {
             std::vector<Int2GroupMap> parts(partition_count);
             const int status = run_typed(parts);
             if (status == 0) return emit(parts);
-            if (status == 2) return false;
+            if (status == 2) return structural();
             // status == 1: fall through to the string path.
         }
 
         std::vector<GroupMap> parts(partition_count);
         const int status = run_typed(parts);
-        if (status != 0) return false;  // string path never parse-fails
+        if (status != 0) return structural();  // string path never parse-fails
         return emit(parts);
     }
 
