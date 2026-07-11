@@ -82,6 +82,9 @@ set(SOURCES
     rpc/query_block_dispatch.cc
     rpc/query_block_executor.cc
     rpc/query_block_executor.hh
+    rpc/duckdb_bridge_dispatch.cc
+    rpc/duckdb_bridge_executor.cc
+    rpc/duckdb_bridge_executor.hh
     
     # Storage layer
     storage/database_manager.cc
