@@ -934,12 +934,13 @@ message TxExecuteSqlDuckdb {
                                            // (TABLE_SHARE::table_name),
                                            // e.g. "lineitem"
         string db_name = 4;                // TABLE_SHARE::db, e.g. "benchbase".
-                                           // The server exposes the table both
-                                           // bare and schema-qualified
-                                           // ("db"."table"); db-qualified
-                                           // references from MySQL's view
-                                           // expansion resolve without
-                                           // rewriting.
+                                           // Informational: the server
+                                           // registers only the bare sql_name
+                                           // view, and the proxy strips
+                                           // db-qualification from table
+                                           // references in the SQL text (see
+                                           // RegisterPaxView in
+                                           // duckdb_bridge_executor.cc).
         repeated ColumnDesc columns = 2;   // TABLE::field[] order
     }
     message Request {
