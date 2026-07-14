@@ -262,6 +262,12 @@ public:
     bool tx_execute_query_block(
         const LineairDB::Protocol::TxExecuteQueryBlock::Request& request,
         LineairDB::Protocol::TxExecuteQueryBlock::Response* response);
+    // DuckDB bridge: send verbatim SQL text plus per-table PAX column
+    // metadata to the LineairDB server. Gated by HELIOS_DUCKDB_BRIDGE on the
+    // caller side; this method itself is unconditional plumbing.
+    bool tx_execute_sql_duckdb(
+        const LineairDB::Protocol::TxExecuteSqlDuckdb::Request& request,
+        LineairDB::Protocol::TxExecuteSqlDuckdb::Response* response);
     bool tx_validate_and_commit(
         const std::vector<StatelessReadKey>& reads,
         const std::vector<uint64_t>& read_tids,

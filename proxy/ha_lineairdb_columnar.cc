@@ -2,7 +2,10 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cctype>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <functional>
 #include <map>
@@ -10,6 +13,7 @@
 #include <mutex>
 #include <set>
 #include <string>
+#include <string_view>
 #include <tuple>
 #include <utility>
 #include <vector>
@@ -41,7 +45,9 @@
 #include "thr_lock.h"
 
 #include "aggregate_pushdown.hh"
+#include "duckdb_sql_rewrite.hh"
 #include "lineairdb.pb.h"
+#include "lineairdb_field_types.h"
 #include "lineairdb_proxy.hh"
 #include "lineairdb_pushdown.hh"
 
@@ -195,6 +201,11 @@ class ColumnarExecutionContext : public Secondary_engine_execution_context {
   LineairDB::Protocol::TxExecuteQueryBlock::Request query_block_request;
   bool query_block_ready = false;
 
+  // DuckDB bridge request: built in OptimizeSecondaryEngine, consumed by
+  // ExecuteDuckdbBridge. Mutually exclusive with query_block_request above.
+  LineairDB::Protocol::TxExecuteSqlDuckdb::Request duckdb_request;
+  bool duckdb_ready = false;
+
  private:
   const JOIN *current_join_ = nullptr;
   double best_cost_ = 0.0;
@@ -238,6 +249,83 @@ struct DecodedField {
     offset += len;
   }
 
+  return true;
+}
+
+/**
+ * @brief Rounds an ASCII decimal literal to exactly `target_scale`
+ * fractional digits using string/integer arithmetic only.
+ *
+ * @details DuckDB evaluates DECIMAL division (including AVG) in DOUBLE by
+ * design, so its text output does not follow MySQL's exact-decimal scale
+ * rules. `item->decimals` carries MySQL's authoritative scale for each
+ * output column; reformatting to it restores the row-format contract for
+ * any decimal-division shape. Inputs already at or below `target_scale`
+ * are only zero-padded.
+ *
+ * @return false when the input is not a plain [+-]?digits(.digits)?
+ * literal; the caller keeps the original text.
+ */
+bool RoundDecimalText(const char *ptr, size_t len, uint32_t target_scale,
+                      std::string *out) {
+  if (len == 0) return false;
+  size_t pos = 0;
+  bool negative = false;
+  if (ptr[0] == '+' || ptr[0] == '-') {
+    negative = (ptr[0] == '-');
+    pos = 1;
+  }
+  size_t dot = std::string::npos;
+  for (size_t i = pos; i < len; i++) {
+    if (ptr[i] == '.' && dot == std::string::npos) {
+      dot = i;
+    } else if (!std::isdigit(static_cast<unsigned char>(ptr[i]))) {
+      return false;  // not a plain decimal literal: leave text unchanged
+    }
+  }
+
+  std::string int_part(ptr + pos, dot == std::string::npos ? len - pos : dot - pos);
+  std::string frac_part = dot == std::string::npos
+                              ? std::string()
+                              : std::string(ptr + dot + 1, len - dot - 1);
+  if (int_part.empty()) int_part = "0";
+
+  if (frac_part.size() <= target_scale) {
+    frac_part.append(target_scale - frac_part.size(), '0');
+    *out = (negative ? "-" : "") + int_part +
+           (target_scale > 0 ? "." + frac_part : "");
+    return true;
+  }
+
+  // Round-half-up (away from zero) at position target_scale, matching
+  // MySQL's decimal display rounding convention.
+  const bool round_up = frac_part[target_scale] >= '5';
+  frac_part.resize(target_scale);
+  if (round_up) {
+    int i = static_cast<int>(frac_part.size()) - 1;
+    for (; i >= 0; i--) {
+      if (frac_part[i] == '9') {
+        frac_part[i] = '0';
+      } else {
+        frac_part[i]++;
+        break;
+      }
+    }
+    if (i < 0) {  // carried out of the fractional part into int_part
+      int j = static_cast<int>(int_part.size()) - 1;
+      for (; j >= 0; j--) {
+        if (int_part[j] == '9') {
+          int_part[j] = '0';
+        } else {
+          int_part[j]++;
+          break;
+        }
+      }
+      if (j < 0) int_part.insert(int_part.begin(), '1');
+    }
+  }
+  *out = (negative ? "-" : "") + int_part +
+         (target_scale > 0 ? "." + frac_part : "");
   return true;
 }
 
@@ -3951,6 +4039,313 @@ bool RecognizeQueryBlock(JOIN *join, ColumnarExecutionContext *ctx,
 }
 
 /**
+ * @brief HELIOS_DUCKDB_BRIDGE opt-in gate. Anything but exactly "1" leaves
+ * the query-block pushdown path in control.
+ */
+bool DuckdbBridgeEnabled() {
+  const char *v = std::getenv("HELIOS_DUCKDB_BRIDGE");
+  return v != nullptr && v[0] == '1' && v[1] == '\0';
+}
+
+/**
+ * @brief Recursively collects every real base table under `lex` into `req`,
+ * expanding each referenced SQL VIEW into a CTE appended to `cte_prefix`.
+ *
+ * @details The statement text shipped to DuckDB is thd->query(), which
+ * cannot resolve view names by itself. Each view's resolved body
+ * (Table_ref::view_body_utf8, the SHOW CREATE VIEW printout) is inlined as
+ * a WITH entry instead, after identifier rewriting
+ * (ConvertBacktickIdentifiers). Expansion recurses into the view's own LEX
+ * first, so nested CTEs appear in dependency order. Returns false on any
+ * table the bridge cannot serve.
+ *
+ * @param seen_tables Dedups base tables by PaxStore key across the whole
+ * statement (self-joins, direct plus through-view references).
+ * @param seen_views Dedups view expansions; a view referenced twice gets
+ * one CTE.
+ */
+bool CollectBaseTables(THD *thd, LEX *lex,
+                       LineairDB::Protocol::TxExecuteSqlDuckdb::Request *req,
+                       std::set<std::string> *seen_tables,
+                       std::set<std::string> *seen_views,
+                       std::string *cte_prefix, const char **why) {
+  // Expands one genuine SQL VIEW's Table_ref into a `WITH "name"(...) AS
+  // (...)` CTE fragment (dependency-ordered: nested views/tables first).
+  // Factored out because a view reaches this function's loop below in two
+  // different shapes -- see the referencing_view walk beneath it for why.
+  auto expand_view = [&](Table_ref *view_tr) -> bool {
+    const std::string view_name(view_tr->table_name);
+    if (!seen_views->insert(view_name).second) return true;  // already expanded
+
+    if (view_tr->view_body_utf8.str == nullptr ||
+        view_tr->view_body_utf8.length == 0) {
+      *why = "view has no resolved body text";
+      return false;
+    }
+
+    if (!CollectBaseTables(thd, view_tr->view_query(), req, seen_tables,
+                          seen_views, cte_prefix, why)) {
+      return false;  // nested views/tables first: dependency order
+    }
+
+    // view_body_utf8 is the pre-resolution snapshot MySQL bakes at CREATE
+    // VIEW time. Do not print the live derived_query_expression() instead:
+    // the optimized tree renders post-transform artifacts ("<cache>(expr)"
+    // wrappers, semijoin text without an ON clause) that DuckDB cannot
+    // parse and that no print flag suppresses.
+    const std::string body = ConvertBacktickIdentifiers(std::string(
+        view_tr->view_body_utf8.str, view_tr->view_body_utf8.length));
+
+    cte_prefix->append(cte_prefix->empty() ? "WITH \"" : ", \"");
+    cte_prefix->append(view_name);
+    cte_prefix->push_back('"');
+    if (const Create_col_name_list *cols = view_tr->derived_column_names()) {
+      cte_prefix->push_back('(');
+      for (size_t i = 0; i < cols->size(); i++) {
+        if (i != 0) cte_prefix->append(", ");
+        cte_prefix->push_back('"');
+        cte_prefix->append((*cols)[i].str, (*cols)[i].length);
+        cte_prefix->push_back('"');
+      }
+      cte_prefix->push_back(')');
+    }
+    cte_prefix->append(" AS (");
+    cte_prefix->append(body);
+    cte_prefix->push_back(')');
+    return true;
+  };
+
+  for (Query_block *qbi = lex->all_query_blocks_list; qbi != nullptr;
+       qbi = qbi->next_select_in_list()) {
+    for (Table_ref *tr = qbi->leaf_tables; tr != nullptr; tr = tr->next_leaf) {
+      if (tr->is_view()) {
+        if (!expand_view(tr)) return false;
+        continue;
+      }
+
+      // A merged (mergeable) view leaves no is_view() leaf: MySQL splices
+      // its base tables into the outer leaf_tables, each linking back to
+      // the view through Table_ref::referencing_view. Recover the original
+      // view Table_ref through that chain (nested views give multiple
+      // links) and expand it like a view leaf; the spliced table itself is
+      // re-found through the view's own LEX and deduped by seen_tables.
+      //
+      // The seen_views check must gate this branch: referencing_view is
+      // also set on leaves visited while expanding a NON-merged view's own
+      // body. That view is already in seen_views, and expanding it here
+      // would short-circuit and skip registering this leaf as a base table.
+      Table_ref *outer_view = nullptr;
+      for (Table_ref *anc = tr->referencing_view; anc != nullptr;
+           anc = anc->referencing_view) {
+        if (anc->is_view()) outer_view = anc;
+      }
+      if (outer_view != nullptr &&
+          seen_views->find(std::string(outer_view->table_name)) ==
+              seen_views->end()) {
+        if (!expand_view(outer_view)) return false;
+        continue;
+      }
+
+      if (tr->is_view_or_derived()) continue;  // synthetic/materialized leaf
+
+      TABLE *table = tr->table;
+      if (table == nullptr || table->s == nullptr) {
+        *why = "table has no open TABLE";
+        return false;
+      }
+
+      const std::string table_key = table->s->normalized_path.str;
+      if (!seen_tables->insert(table_key).second) {
+        continue;  // same base table already added (self-join or repeated
+                   // reference across query blocks / view expansions)
+      }
+
+      // Recomputes the identical widths/kinds/scales ha_lineairdb::create()
+      // sent to DB_CREATE_TABLE for this table (same pure function of TABLE
+      // metadata; see lineairdb_field_types.h). An empty result means the
+      // table is not PAX-eligible (falls back to ordinary row storage),
+      // which the DuckDB bridge cannot read -- reject rather than guess.
+      std::vector<uint32_t> pax_kinds;
+      std::vector<int32_t> pax_scales;
+      std::vector<uint32_t> pax_widths =
+          compute_pax_field_widths(table, &pax_kinds, &pax_scales);
+      if (pax_widths.empty()) {
+        *why = "table is not PAX-eligible";
+        return false;
+      }
+
+      auto *table_desc = req->add_tables();
+      table_desc->set_table_name(table_key);
+      table_desc->set_sql_name(table->s->table_name.str);
+      table_desc->set_db_name(table->s->db.str);
+      for (uint i = 0; i < table->s->fields; i++) {
+        Field *field = table->field[i];
+        auto *col = table_desc->add_columns();
+        col->set_name(field->field_name == nullptr ? "" : field->field_name);
+        // Index i+1: entry 0 of the widths/kinds/scales vectors is the row
+        // null-flags field, not a named column.
+        col->set_pax_kind(pax_kinds[i + 1]);
+        col->set_pax_width(pax_widths[i + 1]);
+        col->set_pax_scale(pax_scales[i + 1]);
+      }
+    }
+  }
+  return true;
+}
+
+/**
+ * @brief Build a TxExecuteSqlDuckdb request from the verbatim client SQL
+ * text plus this query block's base tables.
+ *
+ * Alternative to RecognizeQueryBlock / BuildQueryBlockRequest above:
+ * instead of lowering a recognized plan shape into the query-block IR, it
+ * forwards the client's SQL text (prefixed with view CTEs, see
+ * CollectBaseTables) for the server's embedded DuckDB to parse and execute
+ * against live PAX storage. The only shape requirement is PAX-eligible
+ * metadata for every base table.
+ */
+bool BuildDuckdbBridgeRequest(
+    THD *thd, Query_block *qb,
+    LineairDB::Protocol::TxExecuteSqlDuckdb::Request *req,
+    const char **why) {
+  req->Clear();
+  if (qb == nullptr || qb->outer_query_block() != nullptr) {
+    *why = "not top-level";
+    return false;
+  }
+
+  const LEX_CSTRING query = thd->query();
+  if (query.str == nullptr || query.length == 0) {
+    *why = "no query text";
+    return false;
+  }
+
+  // Walk every query block in the statement (all_query_blocks_list), not
+  // just qb->leaf_tables: the optimizer can hide a subquery's base tables
+  // behind a materialized/derived leaf of the outer block, while the
+  // subquery's own Query_block still lists them directly. DuckDB re-parses
+  // the raw SQL, so it needs the real base tables and never MySQL's
+  // internal materializations (those have no PAX store). SQL VIEW leaves
+  // are expanded into CTEs (CollectBaseTables).
+  std::set<std::string> seen_tables;   // dedup by normalized_path
+  std::set<std::string> seen_views;    // dedup view expansions
+  std::string cte_prefix;
+  if (!CollectBaseTables(thd, thd->lex, req, &seen_tables, &seen_views,
+                        &cte_prefix, why)) {
+    return false;
+  }
+  if (req->tables_size() == 0) {
+    *why = "no base tables";
+    return false;
+  }
+
+  std::string sql;
+  sql.reserve(cte_prefix.size() + 1 + query.length);
+  if (!cte_prefix.empty()) {
+    sql.append(cte_prefix);
+    sql.push_back(' ');
+  }
+  sql.append(query.str, query.length);
+  req->set_sql(sql);
+  // Enabled when set to anything but empty or "0", matching ENABLE_RPC_TRACE
+  const char *debug = std::getenv("ENABLE_DUCKDB_BRIDGE_DEBUG");
+  if (debug != nullptr && debug[0] != '\0' && std::string_view(debug) != "0") {
+    std::fprintf(stderr, "[duckdb_bridge] sql=[%s]\n", sql.c_str());
+  }
+
+  return true;
+}
+
+/**
+ * @brief Execute the HELIOS_DUCKDB_BRIDGE SQL text built by
+ * BuildDuckdbBridgeRequest.
+ *
+ * Mirrors ExecuteColumnarAggregate's value-carrier mechanism below: MySQL
+ * has already sent result-set metadata for the original SELECT list, so
+ * this override only needs to ship value-only Item carriers that match it.
+ * The response rows use the same "proxy row format" as
+ * TX_EXECUTE_QUERY_BLOCK's response, so the decode loop is identical.
+ */
+bool ExecuteDuckdbBridge(JOIN *join, Query_result *result) {
+  THD *thd = join->thd;
+  auto *ctx = static_cast<ColumnarExecutionContext *>(
+      thd->lex->secondary_engine_execution_context());
+  if (ctx == nullptr || !ctx->duckdb_ready) {
+    return RaiseColumnarError(thd,
+                              "LINEAIRDB_COLUMNAR: no duckdb-bridge plan");
+  }
+
+  std::shared_ptr<LineairDBProxy> proxy = lineairdb::acquire_shared_proxy(thd);
+  if (!proxy) {
+    return RaiseColumnarError(thd, "LINEAIRDB_COLUMNAR: no server connection");
+  }
+
+  LineairDB::Protocol::TxExecuteSqlDuckdb::Response rpc;
+  if (!proxy->tx_execute_sql_duckdb(ctx->duckdb_request, &rpc) || !rpc.ok()) {
+    char message[192];
+    snprintf(message, sizeof(message), "LINEAIRDB_COLUMNAR duckdb-bridge: %s",
+             rpc.error().empty() ? "duckdb bridge RPC failed"
+                                 : rpc.error().c_str());
+    return RaiseColumnarError(thd, message);
+  }
+
+  mem_root_deque<Item *> output_items(thd->mem_root);
+  std::vector<ItemColumnarValue *> values;
+  // Parallel to `values`: MySQL's authoritative decimal scale per output
+  // expression, or DECIMAL_NOT_SPECIFIED for "don't touch". DuckDB returns
+  // decimal-division results as DOUBLE text; RoundDecimalText reformats
+  // those columns back to this scale.
+  std::vector<uint32_t> target_scale;
+  for (Item *item : VisibleFields(join->query_block->fields)) {
+    auto *value = new (thd->mem_root) ItemColumnarValue(item);
+    if (value == nullptr) return true;
+    values.push_back(value);
+    output_items.push_back(value);
+
+    const Item_result rt = item->result_type();
+    const bool fixed_scale_numeric =
+        (rt == DECIMAL_RESULT || rt == REAL_RESULT) &&
+        item->decimals <= DECIMAL_MAX_SCALE;
+    target_scale.push_back(fixed_scale_numeric
+                                ? static_cast<uint32_t>(item->decimals)
+                                : static_cast<uint32_t>(DECIMAL_NOT_SPECIFIED));
+  }
+
+  std::vector<DecodedField> fields;
+  std::string rounded;
+  const size_t expected = 1 + values.size();
+  for (const std::string &row : rpc.rows()) {
+    if (!DecodeRowFields(row, &fields) || fields.size() != expected) {
+      return RaiseColumnarError(
+          thd,
+          "LINEAIRDB_COLUMNAR duckdb-bridge: malformed row (DuckDB result "
+          "column count may not match the original SELECT list)");
+    }
+
+    // Field 0 is a placeholder for the proxy row null-flags field. The
+    // server emits one following field per DuckDB output column.
+    for (size_t i = 0; i < values.size(); i++) {
+      const DecodedField &field = fields[1 + i];
+      if (!field.empty) {
+        if (target_scale[i] != static_cast<uint32_t>(DECIMAL_NOT_SPECIFIED) &&
+            RoundDecimalText(field.ptr, field.len, target_scale[i], &rounded)) {
+          values[i]->set_value(rounded.data(), rounded.size());
+        } else {
+          values[i]->set_value(field.ptr, field.len);
+        }
+        continue;
+      }
+      values[i]->set_null_value();
+    }
+
+    if (result->send_data(thd, output_items)) return true;
+    ++join->send_records;
+  }
+
+  return false;
+}
+
+/**
  * @brief Execute a recognized aggregate block through LineairDB.
  *
  * MySQL has already sent result-set metadata for the original SELECT list. This
@@ -4037,8 +4432,31 @@ bool OptimizeSecondaryEngine(THD *, LEX *lex) {
 
   Query_block *query_block = lex->unit->first_query_block();
   JOIN *join = query_block != nullptr ? query_block->join : nullptr;
+  if (join == nullptr) {
+    return RaiseColumnarError(lex->thd,
+                              "LINEAIRDB_COLUMNAR unsupported shape: no JOIN");
+  }
+
+  // HELIOS_DUCKDB_BRIDGE opt-in: route a statement that already qualified
+  // for secondary-engine offload through the DuckDB bridge instead of the
+  // query-block recognizer. Unset (the default), this branch never runs.
+  if (DuckdbBridgeEnabled()) {
+    const char *why = "?";
+    if (!BuildDuckdbBridgeRequest(lex->thd, query_block, &ctx->duckdb_request,
+                                  &why)) {
+      char message[192];
+      snprintf(message, sizeof(message),
+               "LINEAIRDB_COLUMNAR duckdb-bridge unsupported shape: %s",
+               why ? why : "?");
+      return RaiseColumnarError(lex->thd, message);
+    }
+    ctx->duckdb_ready = true;
+    join->override_executor_func = ExecuteDuckdbBridge;
+    return false;
+  }
+
   const char *why = "no JOIN";
-  if (join == nullptr || !RecognizeQueryBlock(join, ctx, &why)) {
+  if (!RecognizeQueryBlock(join, ctx, &why)) {
     char message[128];
     snprintf(message, sizeof(message),
              "LINEAIRDB_COLUMNAR unsupported shape: %s", why ? why : "?");
