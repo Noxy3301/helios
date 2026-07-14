@@ -31,38 +31,11 @@ constexpr bool kFence = false;
 constexpr uint64_t kBackfillWriteChunkRows = 2000;
 constexpr size_t kBackfillParallelWorkers = 16;
 
-// PAX typed-cell kinds (mirror LineairDB::Pax::FieldKind in pax_store.h; the
-// proxy is PAX-oblivious so the values are duplicated by design, kept in sync).
-namespace pax_kind {
-constexpr uint32_t UNTYPED = 0;
-constexpr uint32_t INT32 = 1;                   // 4-byte LE signed int
-constexpr uint32_t INT64 = 2;                   // 8-byte LE signed int
-constexpr uint32_t DATE = 3;                    // 4-byte LE YYYYMMDD
-constexpr uint32_t DEC64 = 4;                   // 8-byte LE scaled int (DEC64)
-}  // namespace pax_kind
+}  // namespace
 
-/**
-  @brief Computes PAX cell widths, kinds, and scales for the encoded row fields
-  of `table`.
-
-  @details LineairDB rows store each MySQL field as the string payload produced
-  by Field::val_str(). The returned vector contains one maximum payload width
-  per encoded row field: entry 0 is the row null-flags field, and the remaining
-  entries follow TABLE::field order. For an UNTYPED field the width is a safe
-  upper bound on the val_str bytes; for a typed field (INT family, DATE) the
-  width is the fixed binary payload width (4/8) and the kind tells the engine to
-  parse val_str once at scatter and reformat it at gather. A table with any
-  field wider than the PAX cell cap returns an empty vector so CREATE TABLE
-  keeps the ordinary row layout instead of reserving very wide cells for every
-  row. When non-null, `kinds`/`scales` are filled in lockstep with the returned
-  widths.
-
-  @return Per-field maximum payload widths, or an empty vector when the table
-  should not use PAX storage.
-*/
 std::vector<uint32_t> compute_pax_field_widths(
-    TABLE *table, std::vector<uint32_t> *kinds = nullptr,
-    std::vector<int32_t> *scales = nullptr) {
+    TABLE *table, std::vector<uint32_t> *kinds,
+    std::vector<int32_t> *scales) {
   // Keep fixed-width cells bounded for variable-width columns such as TEXT.
   constexpr uint32_t kMaxCellBytes = 2048;
 
@@ -200,8 +173,6 @@ std::vector<uint32_t> compute_pax_field_widths(
 
   return widths;
 }
-
-}  // namespace
 
 void ha_lineairdb::set_key_and_key_part_info(const TABLE *const table) {
   key_info = table->key_info;

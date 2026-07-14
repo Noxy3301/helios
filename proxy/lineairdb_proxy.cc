@@ -449,6 +449,25 @@ bool LineairDBProxy::tx_execute_query_block(
     return true;
 }
 
+bool LineairDBProxy::tx_execute_sql_duckdb(
+    const LineairDB::Protocol::TxExecuteSqlDuckdb::Request& request,
+    LineairDB::Protocol::TxExecuteSqlDuckdb::Response* response) {
+    if (!connected_) {
+        LOG_ERROR("RPC failed: Not connected to server");
+        return false;
+    }
+    if (response == nullptr) {
+        LOG_ERROR("RPC failed: duckdb bridge response is null");
+        return false;
+    }
+    if (!send_protobuf_message(request, *response,
+                               MessageType::TX_EXECUTE_SQL_DUCKDB)) {
+        LOG_ERROR("RPC failed: duckdb bridge message");
+        return false;
+    }
+    return true;
+}
+
 LineairDBProxy::ReadPlanResult LineairDBProxy::tx_execute_read_plan(
     const std::vector<ReadPlanStep>& steps) {
     ReadPlanResult result;

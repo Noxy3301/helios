@@ -56,6 +56,11 @@ enum OpCode {
     // Secondary-engine computation pushdown.
     // Executes a query-block operator tree on the LineairDB server.
     TX_EXECUTE_QUERY_BLOCK = 36;
+
+    // Executes raw SQL text on the server's embedded DuckDB executor, which
+    // reads PAX storage in place. Sent only when HELIOS_DUCKDB_BRIDGE is set
+    // on the proxy.
+    TX_EXECUTE_SQL_DUCKDB = 37;
 }
 
 enum BatchOpType {
@@ -902,4 +907,49 @@ message AggregateSpec {
     uint32 num_columns = 1;                            // table->s->fields (row parse)
     repeated uint32 group_columns = 2 [packed = true]; // 0-based field indices (GROUP BY)
     repeated AggFunc aggs = 3;
+}
+
+// DuckDB bridge: executes verbatim client SQL text on the LineairDB server
+// through the embedded DuckDB executor, which reads the server's PAX storage
+// in place. Coverage is not limited to the query shapes TX_EXECUTE_QUERY_BLOCK
+// recognizes. Sent only when HELIOS_DUCKDB_BRIDGE is set on the proxy.
+//
+// Each request carries per-table PAX cell metadata (kind/width/scale); the
+// server persists none of it. The proxy derives the metadata from
+// TABLE::field[] with the computation used at CREATE TABLE time, and it
+// matches the server-side PAX layout while the table's schema is unchanged.
+message TxExecuteSqlDuckdb {
+    // Mirrors LineairDB::Pax::FieldKind (pax_store.h): 0=UNTYPED, 1=INT32,
+    // 2=INT64, 3=DATE, 4=DEC64.
+    message ColumnDesc {
+        string name = 1;         // TABLE::field[i]->field_name
+        uint32 pax_kind = 2;
+        uint32 pax_width = 3;    // PAX cell payload width (bytes)
+        int32 pax_scale = 4;     // FK_DEC64 only
+    }
+    message TableDesc {
+        string table_name = 1;             // PaxStore lookup key
+                                           // (TABLE_SHARE::normalized_path)
+        string sql_name = 3;               // bare name the SQL text uses
+                                           // (TABLE_SHARE::table_name),
+                                           // e.g. "lineitem"
+        string db_name = 4;                // TABLE_SHARE::db, e.g. "benchbase".
+                                           // Informational: the server
+                                           // registers only the bare sql_name
+                                           // view, and the proxy strips
+                                           // db-qualification from table
+                                           // references in the SQL text (see
+                                           // RegisterPaxView in
+                                           // duckdb_bridge_executor.cc).
+        repeated ColumnDesc columns = 2;   // TABLE::field[] order
+    }
+    message Request {
+        string sql = 1;                // verbatim client SQL text (thd->query())
+        repeated TableDesc tables = 2; // every base table the query touches
+    }
+    message Response {
+        bool ok = 1;
+        string error = 2;
+        repeated bytes rows = 3;  // proxy row format, DuckDB result order
+    }
 }

@@ -73,6 +73,10 @@ void LineairDBRpc::handle_rpc(uint64_t sender_id, MessageType message_type,
             handleTxExecuteQueryBlock(message, result);
             release_masstree_thread_epoch();
             return;
+        case MessageType::TX_EXECUTE_SQL_DUCKDB:
+            handleTxExecuteSqlDuckdb(message, result);
+            release_masstree_thread_epoch();
+            return;
 
         // Table statistics
         case MessageType::TX_GET_TABLE_STATS:
