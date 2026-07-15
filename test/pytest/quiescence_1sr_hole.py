@@ -1,39 +1,45 @@
-"""Reproduce the columnar quiescence-or-abort 1SR hole (torn multi-row read).
+"""Columnar read view consistency across commit row installs (1SR regression).
 
-The columnar read contract (capture write states -> lock-free scan ->
-recheck) detects concurrent writes through per-group write counters, but a
-counter returns to even after every ROW install. A multi-row commit
-therefore has windows between two row installs where every counter is even
-and stable while the table is half-applied. A reader scheduled inside such
-a window passes the recheck and accepts a torn result.
+1SR (one-copy serializability with real-time order) requires every read to
+return a complete committed state and a read issued after a commit returns
+to see that commit. Per-group write counters cannot provide this: they
+return to even after every ROW install, so a reader scheduled between two
+row installs of a multi-row commit observes a stable-looking half-applied
+table. The bridge reads an epoch-fenced read view with before-image
+resolution instead, and this test demands consistent results.
 
-This test opens the window wide and synchronizes on it instead of racing:
-  - lineairdb-server runs with the stateless_commit.between_row_installs
-    debug sync point set to sleep, so the commit install loop stays open
-    between consecutive row installs (see LineairDB util/debug_sync.hpp)
+The test opens the install window wide and synchronizes on it instead of
+racing:
+  - lineairdb-server runs with the stateless_commit and silo_commit
+    between_row_installs debug sync points set to sleep, so either commit
+    path's install loop stays open between consecutive row installs (see
+    LineairDB util/debug_sync.hpp)
   - mysqld runs with HELIOS_DUCKDB_BRIDGE=1; FORCED SELECTs take the
-    columnar offload (bridge or query-block executor - both share the
-    write-state contract under test)
-  - a writer thread signals right before COMMIT of a two-row transaction;
-    the main thread then retries FORCED SELECTs while that COMMIT is in
-    flight and records the first torn result
+    columnar offload through the bridge
+  - a writer thread signals right before COMMIT of a two-row-install
+    transaction; the main thread then runs FORCED SELECTs while that
+    COMMIT is in flight
 
-A pass requires all of: a torn read whose SELECT completed before the
-writer's COMMIT returned, secondary-engine engagement, a COMMIT that
-actually paused (duration >= the sync-point sleep), and a fully
-committed final state.
-Exit 0 = the torn read was observed (the hole exists, current behavior).
-After the multi-version read path lands, this branch must fail; flip the
-assertion then so the test demands a consistent snapshot instead.
+Scenarios (each is one two-install transaction over a fresh table):
+  update-update    both rows change value
+  delete-update    one row disappears (a read view older than the commit
+                   must resurrect it from its before-image)
+  insert-update    a row appears (a read view older than the commit must
+                   not see the fresh slot)
+
+A pass requires, per scenario: secondary-engine engagement, a COMMIT that
+actually paused (duration >= the sync-point sleep), at least one read
+issued while COMMIT was in flight, every windowed read equal to the full
+old or the full new state (never a mix), every read issued after COMMIT
+returned equal to the new state (freshness), and primary/secondary
+agreement on the final state.
 
 Operational notes: the test assumes exclusive ownership of the local stack
 (run_tests.py convention; the stop scripts kill every local instance). It
 restarts lineairdb-server and mysqld itself because both need the special
 environment, verifies the preflight stop actually emptied the stack
 (start_server.sh treats "already running" as success), and stops the stack
-afterwards so the sync point does not survive into later runs. The
-LineairDB sync point and this file must land together: run_tests.py globs
-this directory, and the test fails without the sync point built in.
+afterwards so the sync point does not survive into later runs.
 """
 
 import argparse
@@ -49,17 +55,60 @@ from utils.connection import get_connection
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 QUIET = "> /dev/null 2>&1"
 PAUSE_MS = 1500
-SYNC_POINT_ENV = ("LINEAIRDB_DEBUG_SYNC_STATELESS_COMMIT_BETWEEN_ROW_INSTALLS"
-                  f"=sleep:{PAUSE_MS}")
+# The read-view-before-write scenario holds every bridge read open between
+# its epoch fence and its scan; shorter than PAUSE_MS so the held read
+# finishes while the writer's paused COMMIT is still in flight.
+FENCE_HOLD_MS = 1000
+# Both commit paths carry the install pause: prefetch transactions install
+# through the stateless commit, while transactions with statements outside
+# the prefetch shapes (the INSERT scenario) install through the native
+# Silo path.
+SYNC_POINT_ENV = (
+    "LINEAIRDB_DEBUG_SYNC_STATELESS_COMMIT_BETWEEN_ROW_INSTALLS"
+    f"=sleep:{PAUSE_MS} "
+    "LINEAIRDB_DEBUG_SYNC_SILO_COMMIT_BETWEEN_ROW_INSTALLS"
+    f"=sleep:{PAUSE_MS} "
+    "LINEAIRDB_DEBUG_SYNC_PAX_READ_VIEW_AFTER_FENCE"
+    f"=sleep:{FENCE_HOLD_MS}")
 
 # The bridge registers tables in DuckDB under their bare names and the
 # proxy strips qualifiers relative to the connection's default schema, so
 # queries must run with USE <db> and unqualified table references.
 DB = "ha_lineairdb_test"
-TABLE = "pause_probe"
 
 STACK_PATTERNS = ("build/server/lineairdb-server",
                   "runtime_output_directory/mysqld")
+
+# Each scenario: fresh table with BASE rows, then one transaction whose two
+# statements produce two row installs with the pause between them. Every
+# windowed read must equal `old` or `new`, nothing else.
+BASE_ROWS = {1: 0, 2: 0}
+SCENARIOS = [
+    {
+        "name": "update-update",
+        "table": "probe_update",
+        "statements": ["UPDATE {t} SET v = 1 WHERE id = 1",
+                       "UPDATE {t} SET v = 1 WHERE id = 2"],
+        "old": {1: 0, 2: 0},
+        "new": {1: 1, 2: 1},
+    },
+    {
+        "name": "delete-update",
+        "table": "probe_delete",
+        "statements": ["DELETE FROM {t} WHERE id = 1",
+                       "UPDATE {t} SET v = 1 WHERE id = 2"],
+        "old": {1: 0, 2: 0},
+        "new": {2: 1},
+    },
+    {
+        "name": "insert-update",
+        "table": "probe_insert",
+        "statements": ["INSERT INTO {t} VALUES (3, 1)",
+                       "UPDATE {t} SET v = 1 WHERE id = 2"],
+        "old": {1: 0, 2: 0},
+        "new": {1: 0, 2: 1, 3: 1},
+    },
+]
 
 
 def sh(cmd):
@@ -108,19 +157,23 @@ def secondary_execution_count(cursor):
 
 
 class Writer(threading.Thread):
-    """BEGIN; two point UPDATEs; COMMIT - one txn with two row installs.
+    """BEGIN; two point statements; COMMIT - one txn with two row installs.
 
-    Point updates keep the statements on the prefetch path (multi-range
-    shapes are rejected by autogen). commit_started is set immediately
-    before COMMIT is issued; commit_done_at is stamped when it returns.
+    UPDATE/DELETE point statements commit through the stateless (prefetch)
+    path; a transaction containing an INSERT commits through the native
+    silo path. Both install loops carry a between-row-installs sync point.
+    commit_started is set immediately before COMMIT is issued;
+    commit_done_at is stamped when it returns.
     """
 
-    def __init__(self, user, password):
+    def __init__(self, user, password, table, statements):
         # daemon: a reader failure must not leave the process hanging on a
         # writer stuck inside the paused COMMIT.
         super().__init__(daemon=True)
         self.user = user
         self.password = password
+        self.table = table
+        self.statements = statements
         self.commit_started = threading.Event()
         self.commit_issued_at = None
         self.commit_done_at = None
@@ -134,8 +187,8 @@ class Writer(threading.Thread):
             wcur = wdb.cursor()
             wcur.execute(f"USE {DB}")
             wcur.execute("BEGIN")
-            wcur.execute(f"UPDATE {TABLE} SET v = 1 WHERE id = 1")
-            wcur.execute(f"UPDATE {TABLE} SET v = 1 WHERE id = 2")
+            for statement in self.statements:
+                wcur.execute(statement.format(t=self.table))
             self.commit_issued_at = time.monotonic()
             self.commit_started.set()
             wcur.execute("COMMIT")
@@ -151,94 +204,275 @@ class Writer(threading.Thread):
                     pass
 
 
-def run_probe(user, password):
-    db = get_connection(user=user, password=password)
-    db.autocommit = True
-    writer = None
+def run_scenario(cursor, user, password, scenario):
+    """No-torn-read regression over the open install window.
+
+    Coverage note: the paused writer stays ONLINE at its commit epoch, so
+    the windowed reader's read view fence waits for the paused COMMIT to
+    finish installing and the read serializes after it (all-new). The old
+    contract returned a torn result on this exact schedule; the
+    before-image resolution itself is exercised by
+    run_read_view_before_write, where the fence completes first.
+    """
+    table = scenario["table"]
+    print(f"SCENARIO {scenario['name']}")
+    cursor.execute(
+        f"CREATE TABLE {table} (id INT PRIMARY KEY, v INT) "
+        "ENGINE=LineairDB SECONDARY_ENGINE=LINEAIRDB_COLUMNAR"
+    )
+    values = ", ".join(f"({k}, {v})" for k, v in BASE_ROWS.items())
+    cursor.execute(f"INSERT INTO {table} VALUES {values}")
+    cursor.execute(f"ALTER TABLE {table} SECONDARY_LOAD")
+
+    print("\twriter start (2-install txn, COMMIT pauses between installs)")
+    writer = Writer(user, password, table, scenario["statements"])
+    writer.start()
     try:
-        cursor = db.cursor()
-
-        print("SETUP")
-        # The sync point sits in the stateless (prefetch) commit's install
-        # loop; route writes through it, matching the TPC-H measurement
-        # conditions (tpch_setup step 4 also sets this on).
-        cursor.execute("SET GLOBAL lineairdb_prefetch_execution = ON")
-        cursor.execute(f"DROP DATABASE IF EXISTS {DB}")
-        cursor.execute(f"CREATE DATABASE {DB}")
-        cursor.execute(f"USE {DB}")
-        cursor.execute(
-            f"CREATE TABLE {TABLE} (id INT PRIMARY KEY, v INT) "
-            "ENGINE=LineairDB SECONDARY_ENGINE=LINEAIRDB_COLUMNAR"
-        )
-        cursor.execute(f"INSERT INTO {TABLE} VALUES (1, 0), (2, 0)")
-        cursor.execute(f"ALTER TABLE {TABLE} SECONDARY_LOAD")
-
-        print("WRITER START (2-row txn, COMMIT pauses between installs)")
-        writer = Writer(user, password)
-        writer.start()
         if not writer.commit_started.wait(timeout=30):
             raise RuntimeError("writer never reached COMMIT")
 
-        print("READ WHILE COMMIT IN FLIGHT (FORCED)")
         secondary_before = secondary_execution_count(cursor)
         cursor.execute("SET SESSION use_secondary_engine = FORCED")
-        torn = None
-        torn_read_done_at = None
-        attempts = 0
+        reads = []  # (issued_at, rows dict)
+        mixed = None
         while writer.is_alive():
-            cursor.execute(f"SELECT id, v FROM {TABLE} ORDER BY id")
+            issued_at = time.monotonic()
+            cursor.execute(f"SELECT id, v FROM {table} ORDER BY id")
             rows = dict(cursor.fetchall())
-            done_at = time.monotonic()
-            attempts += 1
-            if sorted(rows.values()) == [0, 1]:
-                torn = rows
-                torn_read_done_at = done_at
+            reads.append((issued_at, rows))
+            if rows != scenario["old"] and rows != scenario["new"]:
+                mixed = rows
                 break
             time.sleep(0.05)
-        secondary_after = secondary_execution_count(cursor)
-        cursor.execute("SET SESSION use_secondary_engine = ON")
 
         writer.join()
         if writer.error:
             raise writer.error
 
+        # Freshness probe: issued strictly after COMMIT returned, still on
+        # the secondary engine.
+        cursor.execute(f"SELECT id, v FROM {table} ORDER BY id")
+        fresh_rows = dict(cursor.fetchall())
+        secondary_after = secondary_execution_count(cursor)
+        # Primary probe: OFF forbids the secondary engine (ON would still
+        # allow it, and a wrong primary state could hide behind a correct
+        # bridge); the counter must not advance across it.
+        cursor.execute("SET SESSION use_secondary_engine = OFF")
+        cursor.execute(f"SELECT id, v FROM {table} ORDER BY id")
+        primary_rows = dict(cursor.fetchall())
+        primary_probe_secondary_delta = (
+            secondary_execution_count(cursor) - secondary_after)
+        cursor.execute("SET SESSION use_secondary_engine = ON")
+
         commit_took = writer.commit_done_at - writer.commit_issued_at
-        print(f"\t[DEBUG] attempts={attempts} torn={torn} "
-              f"commit_took={commit_took:.2f}s")
+        old_seen = sum(1 for _, r in reads if r == scenario["old"])
+        new_seen = sum(1 for _, r in reads if r == scenario["new"])
+        print(f"\t[DEBUG] reads={len(reads)} old={old_seen} new={new_seen} "
+              f"mixed={mixed} commit_took={commit_took:.2f}s")
         print(f"\t[DEBUG] secondary executions: "
               f"{secondary_before} -> {secondary_after}")
-
-        cursor.execute(f"SELECT id, v FROM {TABLE} ORDER BY id")
-        final_rows = dict(cursor.fetchall())
-        print(f"\t[DEBUG] rows after commit: {final_rows}")
 
         if secondary_after <= secondary_before:
             print("\tFailed: SELECTs did not execute on the secondary engine")
             return 1
         if commit_took < PAUSE_MS / 1000.0 * 0.9:
             print("\tFailed: COMMIT returned too fast; the install pause "
-                  "did not engage (writes not on the stateless path?)")
+                  "did not engage (writes not on an instrumented commit "
+                  "path?)")
             return 1
-        if final_rows != {1: 1, 2: 1}:
-            print("\tFailed: writer did not commit both rows")
+        windowed = sum(1 for issued_at, _ in reads
+                       if issued_at < writer.commit_done_at)
+        if windowed == 0:
+            print("\tFailed: no read issued while COMMIT was in flight")
             return 1
-        if torn is None:
-            print("\tFailed: no torn read observed while COMMIT was in "
-                  "flight; the hole did not reproduce")
+        if mixed is not None:
+            print(f"\tFailed: torn read {mixed}; a windowed read must see "
+                  f"the full old or the full new state")
             return 1
-        if torn_read_done_at >= writer.commit_done_at:
-            print("\tFailed: torn read finished after COMMIT returned; "
-                  "timing invalid")
+        # Strict serializability: a read issued after the writer's COMMIT
+        # returned must see the new state (no stale read).
+        for issued_at, rows in reads:
+            if issued_at > writer.commit_done_at and rows != scenario["new"]:
+                print(f"\tFailed: stale read {rows} issued after COMMIT "
+                      f"returned")
+                return 1
+        if fresh_rows != scenario["new"]:
+            print(f"\tFailed: post-commit FORCED read {fresh_rows} != "
+                  f"{scenario['new']} (stale read)")
+            return 1
+        if primary_probe_secondary_delta != 0:
+            print("\tFailed: primary probe executed on the secondary "
+                  "engine; primary/secondary agreement not established")
+            return 1
+        if primary_rows != scenario["new"]:
+            print(f"\tFailed: primary state {primary_rows} != "
+                  f"{scenario['new']} (writer did not commit)")
             return 1
 
-        print("\tTorn read observed: one row new, one row old, and the "
-              "write-state recheck accepted it while COMMIT was in flight.")
-        print("\t1SR hole reproduced. "
-              "(After the MV read path lands, this branch must FAIL.)")
+        print("\tconsistent: every windowed read was all-old or all-new, "
+              "post-commit reads are fresh")
         return 0
     finally:
-        if writer is not None and writer.is_alive():
+        if writer.is_alive():
             writer.join(timeout=PAUSE_MS / 1000.0 + 30)
+
+
+class Reader(threading.Thread):
+    """One FORCED SELECT on its own connection, with result and end stamp.
+
+    The armed pax_read_view.after_fence point holds the SELECT open between
+    its epoch fence and its scan, so writes committed meanwhile land with
+    epochs above the read view's cut.
+    """
+
+    def __init__(self, user, password, table):
+        super().__init__(daemon=True)
+        self.user = user
+        self.password = password
+        self.table = table
+        self.rows = None
+        self.done_at = None
+        self.error = None
+
+    def run(self):
+        rdb = None
+        try:
+            rdb = get_connection(user=self.user, password=self.password)
+            rdb.autocommit = True
+            rcur = rdb.cursor()
+            rcur.execute(f"USE {DB}")
+            rcur.execute("SET SESSION use_secondary_engine = FORCED")
+            rcur.execute(f"SELECT id, v FROM {self.table} ORDER BY id")
+            self.rows = dict(rcur.fetchall())
+            self.done_at = time.monotonic()
+        except Exception as e:  # surfaced after join
+            self.error = e
+        finally:
+            if rdb is not None:
+                try:
+                    rdb.close()
+                except Exception:
+                    pass
+
+
+def run_read_view_before_write(cursor, user, password, scenario):
+    """Fence first, write second: the scan must return the pre-write state.
+
+    The reader's read view fence completes before the writer goes online, so
+    the writer's commit epoch exceeds the read view cut and every row it
+    installs must resolve through the version store: updates and deletes to
+    their captured before-images (a deleted row must reappear), inserts to
+    absence (a fresh slot must stay invisible). The old quiescence contract
+    could never serve this schedule (it either returned torn bytes or
+    aborted); returning the complete old state is the multi-version read's
+    defining behavior.
+    """
+    table = "held_" + scenario["table"]
+    print(f"SCENARIO read-view-before-write/{scenario['name']}")
+    cursor.execute(
+        f"CREATE TABLE {table} (id INT PRIMARY KEY, v INT) "
+        "ENGINE=LineairDB SECONDARY_ENGINE=LINEAIRDB_COLUMNAR"
+    )
+    values = ", ".join(f"({k}, {v})" for k, v in BASE_ROWS.items())
+    cursor.execute(f"INSERT INTO {table} VALUES {values}")
+    cursor.execute(f"ALTER TABLE {table} SECONDARY_LOAD")
+
+    old_state = scenario["old"]
+    new_state = scenario["new"]
+    statements = scenario["statements"]
+
+    print("\treader start (read view held open after its fence)")
+    reader = Reader(user, password, table)
+    reader.start()
+    # Let the SELECT pass its fence and enter the hold; the writer then
+    # commits with a between-install pause that outlives the hold.
+    time.sleep(FENCE_HOLD_MS / 1000.0 * 0.4)
+    writer = Writer(user, password, table, statements)
+    writer.start()
+
+    reader.join(timeout=60)
+    writer.join(timeout=60)
+    if reader.is_alive() or writer.is_alive():
+        print("\tFailed: reader or writer did not finish")
+        return 1
+    if reader.error:
+        raise reader.error
+    if writer.error:
+        raise writer.error
+
+    commit_took = writer.commit_done_at - writer.commit_issued_at
+    print(f"\t[DEBUG] reader rows={reader.rows} commit_took={commit_took:.2f}s "
+          f"reader_before_commit_done="
+          f"{reader.done_at < writer.commit_done_at}")
+
+    if commit_took < PAUSE_MS / 1000.0 * 0.9:
+        print("\tFailed: COMMIT returned too fast; the install pause did "
+              "not engage")
+        return 1
+    if reader.done_at >= writer.commit_done_at:
+        print("\tFailed: reader finished after COMMIT returned; the hold "
+              "did not overlap the write, timing invalid")
+        return 1
+    if reader.done_at <= writer.commit_issued_at:
+        print("\tFailed: reader finished before COMMIT was issued; the "
+              "before-image path was not exercised")
+        return 1
+    if reader.rows != old_state:
+        print(f"\tFailed: read view returned {reader.rows} != pre-write state "
+              f"{old_state}; before-image resolution broken")
+        return 1
+
+    cursor.execute("SET SESSION use_secondary_engine = FORCED")
+    cursor.execute(f"SELECT id, v FROM {table} ORDER BY id")
+    fresh_rows = dict(cursor.fetchall())
+    if fresh_rows != new_state:
+        cursor.execute("SET SESSION use_secondary_engine = ON")
+        print(f"\tFailed: post-commit FORCED read {fresh_rows} != "
+              f"{new_state} (stale read)")
+        return 1
+    # Primary agreement, with the secondary engine forbidden (see
+    # run_scenario's primary probe).
+    secondary_before_primary_probe = secondary_execution_count(cursor)
+    cursor.execute("SET SESSION use_secondary_engine = OFF")
+    cursor.execute(f"SELECT id, v FROM {table} ORDER BY id")
+    primary_rows = dict(cursor.fetchall())
+    primary_probe_secondary_delta = (
+        secondary_execution_count(cursor) - secondary_before_primary_probe)
+    cursor.execute("SET SESSION use_secondary_engine = ON")
+    if primary_probe_secondary_delta != 0:
+        print("\tFailed: primary probe executed on the secondary engine")
+        return 1
+    if primary_rows != new_state:
+        print(f"\tFailed: primary state {primary_rows} != {new_state}")
+        return 1
+
+    print("\tconsistent: held read view returned the complete pre-write "
+          "state, post-commit read is fresh, primary agrees")
+    return 0
+
+
+def run_probe(user, password):
+    db = get_connection(user=user, password=password)
+    db.autocommit = True
+    try:
+        cursor = db.cursor()
+
+        print("SETUP")
+        # The sync point sits in the stateless (prefetch) commit's install
+        # loop; route writes through it.
+        cursor.execute("SET GLOBAL lineairdb_prefetch_execution = ON")
+        cursor.execute(f"DROP DATABASE IF EXISTS {DB}")
+        cursor.execute(f"CREATE DATABASE {DB}")
+        cursor.execute(f"USE {DB}")
+
+        for scenario in SCENARIOS:
+            if run_scenario(cursor, user, password, scenario):
+                return 1
+        for scenario in SCENARIOS:
+            if run_read_view_before_write(cursor, user, password, scenario):
+                return 1
+        return 0
+    finally:
         try:
             db.close()
         except Exception:
