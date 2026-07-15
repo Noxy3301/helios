@@ -77,11 +77,6 @@ set(SOURCES
     rpc/transaction_control.cc
     rpc/predicate_evaluator.cc
     rpc/predicate_evaluator.hh
-    rpc/zone_map.cc
-    rpc/zone_map.hh
-    rpc/query_block_dispatch.cc
-    rpc/query_block_executor.cc
-    rpc/query_block_executor.hh
     rpc/duckdb_bridge_dispatch.cc
     rpc/duckdb_bridge_executor.cc
     rpc/duckdb_bridge_executor.hh
