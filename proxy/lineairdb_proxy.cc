@@ -430,25 +430,6 @@ LineairDBProxy::tx_stateless_batch_read(
     return results;
 }
 
-bool LineairDBProxy::tx_execute_query_block(
-    const LineairDB::Protocol::TxExecuteQueryBlock::Request& request,
-    LineairDB::Protocol::TxExecuteQueryBlock::Response* response) {
-    if (!connected_) {
-        LOG_ERROR("RPC failed: Not connected to server");
-        return false;
-    }
-    if (response == nullptr) {
-        LOG_ERROR("RPC failed: query block response is null");
-        return false;
-    }
-    if (!send_protobuf_message(request, *response,
-                               MessageType::TX_EXECUTE_QUERY_BLOCK)) {
-        LOG_ERROR("RPC failed: query block message");
-        return false;
-    }
-    return true;
-}
-
 bool LineairDBProxy::tx_execute_sql_duckdb(
     const LineairDB::Protocol::TxExecuteSqlDuckdb::Request& request,
     LineairDB::Protocol::TxExecuteSqlDuckdb::Response* response) {

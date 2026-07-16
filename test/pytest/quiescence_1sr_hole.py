@@ -14,8 +14,8 @@ racing:
     between_row_installs debug sync points set to sleep, so either commit
     path's install loop stays open between consecutive row installs (see
     LineairDB util/debug_sync.hpp)
-  - mysqld runs with HELIOS_DUCKDB_BRIDGE=1; FORCED SELECTs take the
-    columnar offload through the bridge
+  - FORCED SELECTs take the columnar offload through the bridge, the only
+    columnar executor
   - a writer thread signals right before COMMIT of a two-row-install
     transaction; the main thread then runs FORCED SELECTs while that
     COMMIT is in flight
@@ -138,7 +138,7 @@ def start_stack_with_test_env():
     if sh(f"{SYNC_POINT_ENV} ./scripts/start_server.sh {QUIET}") != 0:
         raise RuntimeError("start_server.sh failed")
     time.sleep(2)
-    if sh(f"HELIOS_DUCKDB_BRIDGE=1 ./scripts/start_mysql.sh "
+    if sh(f"./scripts/start_mysql.sh "
           f"--mysqld-port 3307 --server-host 127.0.0.1 "
           f"--server-port 9999 {QUIET}") != 0:
         raise RuntimeError("start_mysql.sh failed")
