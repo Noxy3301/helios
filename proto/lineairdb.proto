@@ -53,14 +53,9 @@ enum OpCode {
     TX_EXECUTE_READ_PLAN = 30;
     TX_GET_TABLE_STATS = 31;
 
-    // Secondary-engine computation pushdown.
-    // Executes a query-block operator tree on the LineairDB server.
-    TX_EXECUTE_QUERY_BLOCK = 36;
-
     // Executes raw SQL text on the server's embedded DuckDB executor, which
-    // reads PAX storage in place. Sent only when HELIOS_DUCKDB_BRIDGE is set
-    // on the proxy.
-    TX_EXECUTE_SQL_DUCKDB = 37;
+    // reads PAX storage in place.
+    TX_EXECUTE_SQL_DUCKDB = 36;
 }
 
 enum BatchOpType {
@@ -697,167 +692,6 @@ message TxFetchLastSecondaryEntryInRange {
     }
 }
 
-// Secondary-engine query-block request representation.
-//
-// A query block is represented as a tree of scan, join, and aggregate
-// operators over base tables. This is not SQL text, MySQL's AccessPath, or a
-// MySQL Query Execution Plan object; the proxy lowers supported query shapes
-// into this RPC form so the LineairDB server can execute them. Server execution
-// keeps rows as table row references until an expression needs a column value.
-// The response carries final rows in the proxy row format, one field per output
-// expression.
-message QueryBlockAggFunc {
-    enum Kind { COUNT = 0; SUM = 1; AVG = 2; MIN = 3; MAX = 4; }
-    Kind kind = 1;
-    // Table the argument reads from, as an index into Request.tables.
-    uint32 arg_table = 2;
-    // Argument expression over that table's columns. COLUMN_REF nodes may
-    // address another request table by encoding (table_idx << 16) | column in
-    // column_index; arg_table remains the default table for untagged refs.
-    // Unset for COUNT(*).
-    FilterExpr arg = 3;
-    // Optional per-row predicate, for conditional aggregates.
-    PushedPredicate filter = 4;
-    // Decimal scale of the argument for result formatting.
-    uint32 arg_scale = 5;
-    // MIN/MAX comparison semantics: 0=numeric decimal, 1=binary string.
-    uint32 cmp_kind = 6;
-    // Conditional SUM over an ELSE 0 branch returns 0 for a group with no
-    // matching rows instead of SQL NULL.
-    bool zero_if_empty = 7;
-    // Table read by the optional per-row predicate. It may differ from
-    // arg_table when the filter and aggregate argument come from different
-    // joined tables.
-    uint32 filter_table = 8;
-    // COUNT(DISTINCT col): count distinct non-NULL cell values per group.
-    bool distinct = 9;
-}
-
-message QueryBlockColumnRef {
-    uint32 table_idx = 1;
-    uint32 column = 2;      // 0-based TABLE::field index.
-    uint32 cmp_kind = 3;    // 0=int64, 1=binary string, 2=decimal-as-number.
-    // When nonzero, grouping and output use only the first N cell bytes.
-    uint32 prefix_len = 4;
-}
-
-// Runtime semi-filter: keep rows whose local column value appears in the key
-// set produced by an earlier query-block node.
-message QueryBlockSemiFilter {
-    uint32 source_node = 1;  // Node index, already executed.
-    QueryBlockColumnRef source_column = 2;
-    uint32 my_column = 3;    // Column of this scan's table.
-}
-
-message QueryBlockScan {
-    uint32 table_idx = 1;
-    // Fully pushed single-table predicates for this scan.
-    PushedPredicate filter = 2;
-    QueryBlockSemiFilter semi = 3;
-}
-
-message QueryBlockTupleFilter {
-    // Predicate over a joined tuple. FilterExpr COLUMN_REF ordinals address
-    // the columns registry below rather than one physical table.
-    PushedPredicate predicate = 1;
-    repeated QueryBlockColumnRef columns = 2;
-}
-
-message QueryBlockJoin {
-    uint32 build = 1;  // Node index into TxExecuteQueryBlock.Request.nodes.
-    uint32 probe = 2;
-    // Equi-key pairs, stored as parallel arrays.
-    repeated QueryBlockColumnRef build_keys = 3;
-    repeated QueryBlockColumnRef probe_keys = 4;
-    enum Type { INNER = 0; LEFT = 1; SEMI = 2; ANTI = 3; }
-    Type type = 5;
-    // Optional per-match predicate over the combined probe/build tuple.
-    QueryBlockTupleFilter residual = 6;
-}
-
-message QueryBlockTupleFilterNode {
-    uint32 input = 1;
-    QueryBlockTupleFilter filter = 2;
-}
-
-message QueryBlockAggregate {
-    uint32 input = 1;                       // Node index.
-    repeated QueryBlockColumnRef group_columns = 2; // Byte-equality grouping keys.
-    repeated QueryBlockAggFunc aggs = 3;
-    // Optional predicate over the emitted group row.
-    PushedPredicate having = 4;
-    // Optional regrouping over this aggregate's output rows.
-    //
-    // Ordinals address the first-stage row layout:
-    //   0..group_columns_size-1 are group values
-    //   group_columns_size.. are aggregate values
-    // When this is present, QueryBlockOutputExpr ordinals address the regrouped
-    // layout: GROUP i is group_value_ordinals[i], AGG 0 is COUNT(*).
-    message Regroup {
-        repeated uint32 group_value_ordinals = 1;
-        bool count_star = 2;
-    }
-    Regroup regroup = 5;
-}
-
-message QueryBlockSortKey {
-    uint32 output_ordinal = 1;
-    bool descending = 2;
-    uint32 cmp_kind = 3;  // 0=int64 numeric, 1=binary string, 2=decimal numeric.
-}
-
-// A nested query block for a derived table. The server executes it recursively
-// and exposes its output rows as a virtual table. Virtual table indexes start at
-// tables_size and follow sub_block node order; virtual column refs address the
-// sub-block output ordinals, and refs are row numbers.
-message QueryBlockSubBlock {
-    TxExecuteQueryBlock.Request block = 1;
-    QueryBlockSemiFilter semi = 2;
-    uint32 target_table = 3;
-    uint32 target_column = 4;
-}
-
-message QueryBlockNode {
-    oneof op {
-        QueryBlockScan scan = 1;
-        QueryBlockJoin join = 2;
-        QueryBlockAggregate aggregate = 3;
-        QueryBlockTupleFilterNode filter = 4;
-        QueryBlockSubBlock sub_block = 5;
-    }
-}
-
-message QueryBlockOutputExpr {
-    enum Source { GROUP = 0; AGG = 1; COLUMN = 2; EXPR = 3; }
-    Source source = 1;
-    uint32 ordinal = 2;      // GROUP: group key index; AGG: aggregate index.
-    QueryBlockColumnRef column = 3;  // Used when source is COLUMN.
-    // Arithmetic expression over emitted aggregate-row values. COLUMN_REF
-    // ordinals address [group columns..., aggregate values...].
-    FilterExpr expr = 4;
-    uint32 result_scale = 5;
-}
-
-message TxExecuteQueryBlock {
-    message TableDesc {
-        string table_name = 1;
-    }
-    message Request {
-        repeated TableDesc tables = 1;
-        // Topological order; the last node is the root.
-        repeated QueryBlockNode nodes = 2;
-        repeated QueryBlockOutputExpr output = 3;
-        repeated QueryBlockSortKey order_by = 4;
-        uint64 limit = 5;  // 0 means no limit.
-        uint64 offset = 6;
-    }
-    message Response {
-        bool ok = 1;
-        string error = 2;
-        repeated bytes rows = 3;  // Proxy row format, output order.
-    }
-}
-
 // Predicate pushdown: recursive expression tree for server-side row filtering.
 // Server evaluates this during Scan and skips non-matching rows.
 // MySQL still re-evaluates all conditions (cond_push returns original cond).
@@ -872,7 +706,7 @@ message FilterExpr {
         OP_IS_NULL = 33; OP_IS_NOT_NULL = 34;
         // Arithmetic for aggregate-argument expressions. Decimal arithmetic is
         // evaluated server-side in exact (mantissa, scale) integer form.
-        OP_ADD = 40; OP_SUB = 41; OP_MUL = 42; OP_DIV = 43; OP_NEG = 44;
+        OP_ADD = 40; OP_SUB = 41; OP_MUL = 42; OP_NEG = 43;
     }
     Op op = 1;
     int64 int_val = 2;
@@ -911,8 +745,7 @@ message AggregateSpec {
 
 // DuckDB bridge: executes verbatim client SQL text on the LineairDB server
 // through the embedded DuckDB executor, which reads the server's PAX storage
-// in place. Coverage is not limited to the query shapes TX_EXECUTE_QUERY_BLOCK
-// recognizes. Sent only when HELIOS_DUCKDB_BRIDGE is set on the proxy.
+// in place.
 //
 // Each request carries per-table PAX cell metadata (kind/width/scale); the
 // server persists none of it. The proxy derives the metadata from

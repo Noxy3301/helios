@@ -83,7 +83,7 @@ enum class MessageType : uint32_t {
     TX_GET_TABLE_STATS = 31,
 
     // DuckDB SQL bridge (raw SQL text). See lineairdb.proto.
-    TX_EXECUTE_SQL_DUCKDB = 37
+    TX_EXECUTE_SQL_DUCKDB = 36
 };
 
 /**
