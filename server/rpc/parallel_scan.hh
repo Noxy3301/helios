@@ -21,18 +21,6 @@ struct SemijoinReduction {
 };
 
 /**
- * @brief Aggregate a full primary scan directly from PAX row-group strips.
- *
- * @return true when group rows were emitted; false lets the caller use the
- * materialized-row path.
- */
-bool parallel_primary_pax_aggregate_scan(
-    LineairDB::Database* db,
-    const LineairDB::Protocol::TxExecuteReadPlan::PlanStep& step,
-    const std::string& start_key, const std::string& end_key,
-    LineairDB::Protocol::TxExecuteReadPlan::StepResult* step_result);
-
-/**
  * @brief Scan primary rows through PAX row references and gather survivors.
  *
  * @return true when rows were emitted; false lets the caller use the

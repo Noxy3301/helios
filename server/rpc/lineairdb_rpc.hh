@@ -82,9 +82,6 @@ private:
     // Read-plan execution
     void handleTxExecuteReadPlan(const std::string& message, std::string& result);
 
-    // Query-block execution
-    void handleTxExecuteQueryBlock(const std::string& message, std::string& result);
-
     // DuckDB SQL bridge (raw SQL text over live PAX storage).
     void handleTxExecuteSqlDuckdb(const std::string& message, std::string& result);
 

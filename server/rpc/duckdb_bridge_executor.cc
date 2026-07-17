@@ -13,7 +13,6 @@
 // entry with epoch > E supplies the value the slot held at E, and
 // entry-less slots validate their in-place read against the capture
 // counter. Writers never wait for a reader to finish.
-// query_block_executor.cc retains the older write-counter contract.
 
 #include "duckdb_bridge_executor.hh"
 
@@ -77,9 +76,7 @@ uint32_t LengthPrefixBytes(uint32_t length) {
  * result) takes the normal path with length 0 -- exactly one tag byte 0x00,
  * no length bytes, no payload -- which DecodeRowFields reads as {ptr, len=0,
  * empty=false}, distinct from the {nullptr, 0, empty=true} it produces for
- * the sentinel. Nullness is never inferred from payload.empty(); this
- * mirrors query_block_executor.cc's append_result_field(), which takes the
- * same explicit `is_null` bool.
+ * the sentinel. Nullness is never inferred from payload.empty().
  *
  * @param out Destination row buffer.
  * @param payload Field bytes; ignored when is_null.

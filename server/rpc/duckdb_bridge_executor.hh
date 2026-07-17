@@ -15,10 +15,10 @@ namespace duckdb_bridge {
  * DuckDB executor. Table functions registered per request read the live
  * LineairDB::Database PAX storage in place; the request carries every base
  * table's PAX cell metadata (kind/width/scale), and the server keeps no
- * schema registry for this path. Every referenced table's write state is
- * captured before execution and re-checked after (OCC quiescence): a
- * concurrent write discards the result. Coverage is not limited to the query
- * shapes the query-block executor recognizes.
+ * schema registry for this path. The scan runs under an epoch-fenced
+ * columnar read view: rows written after the view's cut resolve to their
+ * saved before-images, and a result is accepted only through the poison and
+ * audit gates.
  *
  * @param db Live server database; source of the PaxStore instances.
  * @param request Parsed TX_EXECUTE_SQL_DUCKDB request.

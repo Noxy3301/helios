@@ -36,12 +36,6 @@
 // Predicate Pushdown: serialize MySQL Item tree → FilterExpr protobuf
 // ---------------------------------------------------------------------------
 
-static thread_local const SerializeColumnEncoder *g_column_encoder = nullptr;
-
-void set_serialize_column_encoder(const SerializeColumnEncoder *encoder) {
-  g_column_encoder = encoder;
-}
-
 const Item *ha_lineairdb::cond_push(const Item *cond) {
   DBUG_TRACE;
   pushed_filter_serialized_.clear();
@@ -206,13 +200,7 @@ bool serialize_item(const Item *item,
       Field *field = field_item->field;
       if (!field) return false;
       expr->set_op(LineairDB::Protocol::FilterExpr::COLUMN_REF);
-      if (g_column_encoder != nullptr) {
-        const int encoded = (*g_column_encoder)(field);
-        if (encoded < 0) return false;
-        expr->set_column_index(static_cast<uint32_t>(encoded));
-      } else {
-        expr->set_column_index(field->field_index());
-      }
+      expr->set_column_index(field->field_index());
 
       // Set compare_type based on MySQL field type
       switch (field->result_type()) {
