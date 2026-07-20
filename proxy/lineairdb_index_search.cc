@@ -310,12 +310,21 @@ int ha_lineairdb::execute_plan(uchar *buf, LineairDBTransaction *tx) {
 int ha_lineairdb::execute_index_first(uchar *buf, LineairDBTransaction *tx) {
   std::string start_key = "";
   std::string end_key = current_plan_.end_key_serialized.empty()
-                            ? std::string(8, '\xFF')
+                            ? lineairdb_keyenc::scan_end_sentinel()
                             : current_plan_.end_key_serialized;
 
-  if (current_plan_.is_primary) {
-    auto key_values = tx->get_matching_keys_and_values_in_range(
-        start_key, end_key);
+  if (current_plan_.is_primary && !tx->is_prefetch_mode()) {
+    index_cursor_active_ = true;
+    index_cursor_reverse_ = false;
+    index_cursor_secondary_ = false;
+    index_cursor_start_key_ = start_key;
+    index_cursor_end_key_ = end_key;
+    (void)refill_index_cursor(tx);
+  } else if (current_plan_.is_primary) {
+    // Prefetch caches are keyed by the staged full-range shape. Keep that
+    // established path until index-first can stage a bounded autogen cursor.
+    auto key_values =
+        tx->get_matching_keys_and_values_in_range(start_key, end_key);
     for (auto &kv : key_values) {
       secondary_index_results_.push_back(kv.first);
       secondary_index_payloads_.push_back(std::move(kv.second));

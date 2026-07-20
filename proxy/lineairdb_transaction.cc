@@ -702,6 +702,12 @@ LineairDBTransaction::get_matching_keys_and_values_in_range(std::string start_ke
                                                             bool *served_truncated) {
   if (served_truncated != nullptr) *served_truncated = false;
   if (table_is_not_chosen()) return {};
+  // The current Masstree reverse walk does not reliably treat an absent upper
+  // bound as +infinity. Use the same sentinel as staged scans; real encoded
+  // keys begin with a null marker and therefore sort below it.
+  if (reverse_scan && end_key.empty()) {
+    end_key = lineairdb_keyenc::scan_end_sentinel();
+  }
   if (prefetch_mode_) {
     // Unbounded-upper: map an empty end to the sentinel the scan was staged with
     // so the [start, sentinel) slice keeps every row (see scan_end_sentinel).
@@ -899,7 +905,10 @@ LineairDBTransaction::fetch_last_secondary_entry_in_range(const std::string &ind
   if (!fallback_to_normal_transaction("fetch_last_secondary_entry_in_range")) return std::nullopt;
   flush_write_buffer_for_table(db_table_key);
 
-  return lineairdb_proxy->tx_fetch_last_secondary_entry_in_range(this, index_name, start_key, end_key);
+  const std::string effective_end =
+      end_key.empty() ? lineairdb_keyenc::scan_end_sentinel() : end_key;
+  return lineairdb_proxy->tx_fetch_last_secondary_entry_in_range(
+      this, index_name, start_key, effective_end);
 }
 
 // Row count delta tracking

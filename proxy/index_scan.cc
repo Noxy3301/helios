@@ -1,5 +1,6 @@
 #include "storage/lineairdb/ha_lineairdb.hh"
 
+#include <algorithm>
 #include <string>
 #include <utility>
 
@@ -17,6 +18,71 @@ void ha_lineairdb::reset_index_search_buffers() {
   secondary_index_payloads_.clear();
   current_position_in_index_ = 0;
   materialized_scan_truncated_ = false;
+  index_cursor_active_ = false;
+  index_cursor_reverse_ = false;
+  index_cursor_secondary_ = false;
+  index_cursor_at_eof_ = false;
+  index_cursor_start_key_.clear();
+  index_cursor_end_key_.clear();
+}
+
+bool ha_lineairdb::refill_index_cursor(LineairDBTransaction *tx) {
+  secondary_index_results_.clear();
+  secondary_index_payloads_.clear();
+  current_position_in_index_ = 0;
+
+  if (index_cursor_at_eof_) return false;
+
+  if (index_cursor_secondary_) {
+    // The existing tail-entry RPC returns one complete secondary-key group.
+    // Using that group as the next exclusive end preserves the original
+    // (secondary key, primary key) order without materializing the full index.
+    auto entry = tx->fetch_last_secondary_entry_in_range(
+        current_index_name, index_cursor_start_key_, index_cursor_end_key_);
+    if (!entry.has_value()) {
+      index_cursor_at_eof_ = true;
+      return false;
+    }
+    index_cursor_end_key_ = entry->secondary_key;
+    secondary_index_results_ = std::move(entry->primary_keys);
+    batch_fetch_secondary_payloads(tx);
+  } else {
+    auto key_values = tx->get_matching_keys_and_values_in_range(
+        index_cursor_start_key_, index_cursor_end_key_,
+        INDEX_CURSOR_READ_AHEAD_SIZE, index_cursor_reverse_);
+    if (key_values.empty()) {
+      index_cursor_at_eof_ = true;
+      return false;
+    }
+
+    const size_t fetched = key_values.size();
+    if (index_cursor_reverse_) {
+      // ScanReverse returns descending rows. The handler's established
+      // index_prev() cursor consumes an ascending vector from its tail.
+      std::reverse(key_values.begin(), key_values.end());
+      index_cursor_end_key_ = key_values.front().first;  // exclusive resume
+    } else {
+      index_cursor_start_key_ = key_values.back().first;
+      // LineairDB ranges are [start,end). Appending NUL is the smallest bound
+      // strictly greater than this complete serialized index key.
+      index_cursor_start_key_.push_back('\0');
+    }
+    index_cursor_at_eof_ = fetched < INDEX_CURSOR_READ_AHEAD_SIZE;
+
+    secondary_index_results_.reserve(fetched);
+    secondary_index_payloads_.reserve(fetched);
+    for (auto &kv : key_values) {
+      secondary_index_results_.push_back(std::move(kv.first));
+      secondary_index_payloads_.push_back(std::move(kv.second));
+    }
+  }
+
+  if (tx->is_aborted() || secondary_index_results_.empty()) return false;
+  current_position_in_index_ =
+      index_cursor_reverse_
+          ? static_cast<uint>(secondary_index_results_.size() - 1)
+          : 0;
+  return true;
 }
 
 int ha_lineairdb::change_active_index(uint keynr) {
@@ -166,6 +232,13 @@ int ha_lineairdb::index_next(uchar *buf) {
   }
   tx->choose_table(db_table_name);
 
+  if (index_cursor_active_ && !index_cursor_reverse_ &&
+      current_position_in_index_ >= secondary_index_results_.size()) {
+    if (!refill_index_cursor(tx)) {
+      return tx->is_aborted() ? abort_errno(tx) : HA_ERR_END_OF_FILE;
+    }
+  }
+
   // Consume materialized index results.
   if (secondary_index_results_.empty() ||
       current_position_in_index_ >= secondary_index_results_.size()) {
@@ -210,6 +283,14 @@ int ha_lineairdb::index_prev(uchar *buf) {
     return abort_errno(tx);
   }
   tx->choose_table(db_table_name);
+
+  if (index_cursor_active_ && index_cursor_reverse_ &&
+      (secondary_index_results_.empty() || current_position_in_index_ < 2)) {
+    if (!refill_index_cursor(tx)) {
+      return tx->is_aborted() ? abort_errno(tx) : HA_ERR_END_OF_FILE;
+    }
+    return fetch_and_set_current_result(buf, tx);
+  }
 
   // Consume materialized index results.
   if (secondary_index_results_.empty() || current_position_in_index_ < 2) {
@@ -257,16 +338,16 @@ int ha_lineairdb::index_last(uchar *buf) {
   }
 
   if (active_index == table->s->primary_key) {
-    auto key_values = tx->get_matching_keys_and_values_in_range("", "");
-    for (auto &kv : key_values) {
-      secondary_index_results_.push_back(kv.first);
-      secondary_index_payloads_.push_back(std::move(kv.second));
-    }
+    index_cursor_active_ = true;
+    index_cursor_reverse_ = true;
+    index_cursor_secondary_ = false;
   } else {
-    secondary_index_results_ =
-        tx->get_matching_primary_keys_in_range(current_index_name, "", "");
-    batch_fetch_secondary_payloads(tx);
+    index_cursor_active_ = true;
+    index_cursor_reverse_ = true;
+    index_cursor_secondary_ = true;
   }
+
+  (void)refill_index_cursor(tx);
 
   if (tx->is_aborted()) {
     return abort_errno(tx);
@@ -276,8 +357,6 @@ int ha_lineairdb::index_last(uchar *buf) {
     return HA_ERR_END_OF_FILE;
   }
 
-  current_position_in_index_ =
-      static_cast<uint>(secondary_index_results_.size() - 1);
   int error = fetch_and_set_current_result(buf, tx);
   if (error == HA_ERR_KEY_NOT_FOUND) {
     error = HA_ERR_END_OF_FILE;
