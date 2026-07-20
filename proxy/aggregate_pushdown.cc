@@ -1397,13 +1397,6 @@ int lineairdb_push_to_engine(THD *thd, AccessPath *root_path, JOIN *join) {
 }
 
 /**
- * @brief Expose the engine-pushdown hook to MySQL's optimizer.
- */
-const handlerton *ha_lineairdb::hton_supporting_engine_pushdown() {
-  return lineairdb_hton;
-}
-
-/**
  * @brief Attach an aggregate spec and its server-side WHERE filter to the tx.
  *
  * Server aggregation folds base rows into group rows, so MySQL cannot recheck

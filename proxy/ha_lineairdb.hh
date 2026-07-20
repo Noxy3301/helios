@@ -241,14 +241,6 @@ public:
   const char *table_type() const override { return "LineairDB"; }
 
   /**
-   * @brief Advertise the MySQL engine-pushdown hook.
-   *
-   * The hook still checks the query shape before installing the aggregate
-   * executor override; unsupported queries keep the normal iterator path.
-   */
-  const handlerton *hton_supporting_engine_pushdown() override;
-
-  /**
     Replace key algorithm with one supported by SE, return the default key
     algorithm for SE if explicit key algorithm was not provided.
 
@@ -431,9 +423,8 @@ public:
   /**
    * @brief Return whether read_cost() should charge remote row materialization.
    *
-   * The default is true. It returns false for clustered primary-key access and
-   * for bulk-prefetched grouped single-table SELECTs, where rows are not fetched
-   * one-by-one by a secondary-key-to-PK lookup.
+   * The default is true. It returns false for clustered primary-key access,
+   * where rows are not fetched one-by-one by a secondary-key-to-PK lookup.
    */
   bool should_charge_materialization_cost(uint index, double rows) const;
 

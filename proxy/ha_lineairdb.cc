@@ -271,7 +271,6 @@ static int lineairdb_init_func(void *p) {
   lineairdb_hton->commit = lineairdb_commit;
   lineairdb_hton->rollback = lineairdb_abort;
   lineairdb_hton->close_connection = lineairdb_close_connection;
-  lineairdb_hton->push_to_engine = lineairdb_push_to_engine;
 
   return 0;
 }

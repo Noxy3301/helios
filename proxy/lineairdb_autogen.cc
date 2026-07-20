@@ -174,6 +174,12 @@ void collect_qep_leaves(AccessPath *p, std::vector<AccessPath *> *out,
       // for_each point/range probe.
       out->push_back(p);
       return;
+    case AccessPath::UNQUALIFIED_COUNT:
+      // COUNT(*) without WHERE. The node carries no table parameters (the
+      // table is implicit from the JOIN); compile_tree_leaves resolves it
+      // from the owning query block.
+      out->push_back(p);
+      return;
     case AccessPath::NESTED_LOOP_JOIN:
       collect_qep_leaves(p->nested_loop_join().outer, out, ok, unsupported);
       collect_qep_leaves(p->nested_loop_join().inner, out, ok, unsupported);
@@ -915,6 +921,130 @@ bool compile_index_search(TABLE *table, uint index,
   return false;
 }
 
+// True when `node` appears in the AccessPath tree rooted at `root`. The
+// walk reuses collect_qep_leaves; a subtree it rejects is reported as not
+// containing the node, which makes the caller fail loudly.
+bool plan_tree_contains(AccessPath *root, const AccessPath *node) {
+  if (root == nullptr || node == nullptr) return false;
+  if (root == node) return true;
+  std::vector<AccessPath *> leaves;
+  bool ok = true;
+  UnsupportedQep ignored;
+  collect_qep_leaves(root, &leaves, &ok, &ignored);
+  for (const AccessPath *collected : leaves) {
+    if (collected == node) return true;
+  }
+  return false;
+}
+
+// Find the query block whose plan contains `node`, descending from `unit`
+// through inner query expressions. The node may sit below wrapper paths
+// (FILTER for HAVING, LIMIT_OFFSET, ...), so containment is checked instead
+// of comparing against the block's plan root.
+Query_block *query_block_containing_plan_node(Query_expression *unit,
+                                              const AccessPath *node) {
+  if (unit == nullptr || node == nullptr) return nullptr;
+  for (Query_block *qb = unit->first_query_block(); qb != nullptr;
+       qb = qb->next_query_block()) {
+    if (qb->join != nullptr &&
+        plan_tree_contains(qb->join->root_access_path(), node)) {
+      return qb;
+    }
+    for (Query_expression *inner = qb->first_inner_query_expression();
+         inner != nullptr; inner = inner->next_query_expression()) {
+      if (Query_block *found =
+              query_block_containing_plan_node(inner, node)) {
+        return found;
+      }
+    }
+  }
+  return nullptr;
+}
+
+// Stage the scan behind a bare COUNT(*). The UNQUALIFIED_COUNT node has no
+// table parameters; MySQL counts through ha_records() (a primary full scan)
+// for JT_ALL plans and through ha_records(index) (an index_first/index_next
+// walk over the optimizer-chosen index) otherwise, so the staged step must
+// follow the chosen access.
+bool compile_unqualified_count(
+    THD *thd, AccessPath *leaf,
+    std::unordered_map<TABLE *, int> *table_steps,
+    std::vector<LineairDBProxy::ReadPlanStep> *steps,
+    std::vector<TABLE *> *added_tables, UnsupportedQep *unsupported) {
+  Query_block *qb =
+      (thd != nullptr && thd->lex != nullptr)
+          ? query_block_containing_plan_node(thd->lex->unit, leaf)
+          : nullptr;
+  TABLE *table = nullptr;
+  if (qb != nullptr) {
+    for (Table_ref *tr = qb->leaf_tables; tr != nullptr; tr = tr->next_leaf) {
+      if (tr->table == nullptr) continue;
+      if (table != nullptr) {
+        table = nullptr;  // more than one leaf table: not this shape
+        break;
+      }
+      table = tr->table;
+    }
+  }
+  if (table == nullptr || table->s == nullptr ||
+      table->s->tmp_table != NO_TMP_TABLE || table->file == nullptr ||
+      table->file->ht != lineairdb_hton ||
+      table->reginfo.lock_type > TL_READ) {
+    unsupported->type = leaf->type;
+    unsupported->reason = "unqualified COUNT table not stageable";
+    return false;
+  }
+  if (table_steps->find(table) != table_steps->end()) {
+    unsupported->type = leaf->type;
+    unsupported->reason = "duplicate QEP table leaf";
+    return false;
+  }
+
+  // Mirror get_exact_record_count(): JT_ALL (and a clustered-primary index
+  // choice) counts via ha_records(); any other plan counts via
+  // ha_records(qt->index()). ha_lineairdb reports a non-clustered primary,
+  // so only JT_ALL and index()==primary land on the staged primary range;
+  // a secondary index choice must stage that secondary range instead.
+  const QEP_TAB *qt = nullptr;
+  if (qb->join != nullptr && qb->join->qep_tab != nullptr &&
+      qb->join->primary_tables > 0) {
+    qt = &qb->join->qep_tab[0];
+  }
+  if (qt == nullptr || qt->table() != table) {
+    unsupported->type = leaf->type;
+    unsupported->reason = "unqualified COUNT access not resolvable";
+    return false;
+  }
+  std::string index_name;
+  if (qt->type() != JT_ALL) {
+    const uint count_index = qt->index();
+    if (count_index >= table->s->keys) {
+      unsupported->type = leaf->type;
+      unsupported->reason = "unqualified COUNT index not resolvable";
+      return false;
+    }
+    if (count_index != table->s->primary_key) {
+      index_name = table->key_info[count_index].name;
+    }
+  }
+
+  LineairDBProxy::ReadPlanStep step;
+  step.table_name = physical_table_key(table);
+  if (step.table_name.empty()) {
+    unsupported->type = leaf->type;
+    unsupported->reason = "missing leaf table name";
+    return false;
+  }
+  step.is_scan = true;
+  step.key_prefix.clear();
+  step.end_key_prefix = lineairdb_keyenc::scan_end_sentinel();
+  step.index_name = std::move(index_name);
+  (*table_steps)[table] = static_cast<int>(steps->size());
+  added_tables->push_back(table);
+  steps->push_back(std::move(step));
+  return true;
+}
+
 /**
  * @brief Compile one AccessPath tree into staged read-plan steps.
  *
@@ -947,6 +1077,13 @@ bool compile_tree_leaves(
   }
 
   for (AccessPath *leaf : leaves) {
+    if (leaf->type == AccessPath::UNQUALIFIED_COUNT) {
+      if (!compile_unqualified_count(thd, leaf, table_steps, steps,
+                                     added_tables, unsupported)) {
+        return false;
+      }
+      continue;
+    }
     TABLE *table = nullptr;
     Index_lookup *ref = nullptr;
     bool full_scan = false;

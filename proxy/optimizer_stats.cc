@@ -482,8 +482,8 @@ ha_rows ha_lineairdb::records_in_range(uint inx, key_range *min_key,
   return estimate;
 }
 
-bool ha_lineairdb::should_charge_materialization_cost(uint index,
-                                                      double rows) const {
+bool ha_lineairdb::should_charge_materialization_cost(
+    uint index, double rows [[maybe_unused]]) const {
   const TABLE *t = table;
   if (t == nullptr || t->in_use == nullptr) return true;
 
@@ -492,26 +492,5 @@ bool ha_lineairdb::should_charge_materialization_cost(uint index,
     return false;
   }
 
-  THD *thd = t->in_use;
-  if (thd->lex == nullptr) return true;
-
-  if (thd->lex->sql_command != SQLCOM_SELECT || thd->lex->is_explain())
-    return true;
-  if (t->reginfo.lock_type > TL_READ) return true;
-  if (!predict_prefetch_mode(thd)) return true;
-
-  // The grouped bulk path is recognizable before the final QEP exists.
-  Table_ref *tr = t->pos_in_table_list;
-  if (tr == nullptr || tr->query_block == nullptr) return true;
-  Query_block *qb = tr->query_block;
-  if (qb->leaf_table_count != 1 || !qb->is_grouped()) return true;
-  if (qb->is_distinct() || qb->olap != UNSPECIFIED_OLAP_TYPE ||
-      qb->has_windows()) {
-    return true;
-  }
-
-  // Large grouped aggregates should prefer the primary full-scan override;
-  // smaller aggregates can keep the selective secondary index path cheap.
-  constexpr double kSmallAggregateInputRows = 1000.0;
-  return rows >= kSmallAggregateInputRows;
+  return true;
 }
