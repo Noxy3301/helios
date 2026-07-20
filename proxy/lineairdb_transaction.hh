@@ -122,8 +122,6 @@ public:
   }
   bool autogen_stmt_resolved() const { return autogen_stmt_resolved_; }
   void mark_autogen_stmt_resolved() { autogen_stmt_resolved_ = true; }
-  // True for the read-only no-validation path; staged filters use the same gate.
-  bool ro_novalidate() const { return ro_novalidate_; }
   // Subqueries may be staged before the statement root exists. Remember each
   // root so the same subquery plan is not prefetched twice in one statement.
   bool autogen_root_staged(const void *root) const {
@@ -197,9 +195,6 @@ private:
   bool isFence;
   bool prefetch_mode_{false};
   bool prefetch_registered_{false};
-  // Autocommit single-statement SELECT with lineairdb_prefetch_ro_novalidate=ON:
-  // read sets are not accumulated and commit skips the validation RPC.
-  bool ro_novalidate_{false};
   bool tx_plan_used_{false};
   uint64_t autogen_query_id_{0};
   bool autogen_stmt_resolved_{false};

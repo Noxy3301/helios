@@ -1223,7 +1223,6 @@ void LineairDBTransaction::append_base_row_read(
   // emplace_back-only, no dedup). Repeats carry the cached value's TID, so a
   // key read N times validates that same TID N times -- redundant but never
   // wrong. Commit aborts if any entry's TID no longer matches the server.
-  if (ro_novalidate_) return;  // read-only commit skips validation
   base_row_read_set_.push_back({table_name, key, tid, found});
 }
 
@@ -1233,7 +1232,6 @@ void LineairDBTransaction::append_range_read(
   // describe the replay and result_keys is the observed key list in scan
   // order. Append, like the point and Silo read sets; a scan consumed twice
   // is revalidated twice -- redundant but never wrong.
-  if (ro_novalidate_) return;  // read-only commit skips validation
   LineairDBProxy::RangeReadEntry entry;
   entry.table_name = cached.table_name;
   entry.start_key = cached.start_key;
@@ -1249,7 +1247,6 @@ void LineairDBTransaction::append_range_read(
 
 void LineairDBTransaction::append_secondary_range_read(
     const LocalSecondaryScanEntry& cached) {
-  if (ro_novalidate_) return;  // read-only commit skips validation
   LineairDBProxy::RangeReadEntry entry;
   entry.table_name = cached.table_name;
   entry.index_name = cached.index_name;
@@ -1476,19 +1473,6 @@ bool LineairDBTransaction::prefetch_validate_and_commit(
   if (transport_error != nullptr) *transport_error = transport_error_;
   bool was_aborted = is_aborted_;
 
-  // Read-only fast path: no writes and no read validation to send.
-  // Finish locally so the SELECT uses only the read-plan RPC.
-  if (!was_aborted && ro_novalidate_ && write_buffer_ops_.empty() &&
-      rowcount_deltas_.empty()) {
-    if (rpc_trace_.active()) {
-      rpc_trace_.record_local_view("ro_novalidate_commit");
-      RpcTraceLogger::instance().log_line(rpc_trace_.finalize_jsonl(true));
-    }
-    lineairdb_proxy->set_current_trace(nullptr);
-    delete this;
-    return true;
-  }
-
   std::vector<LineairDBProxy::StatelessReadKey> reads;
   std::vector<uint64_t> read_tids;
   std::vector<bool> read_found;
@@ -1568,23 +1552,6 @@ void LineairDBTransaction::begin_transaction() {
       register_transaction_to_mysql();
     }
     else {
-      // Enable the no-validation fast path only for autocommit SELECTs whose
-      // tables use plain read locks. SELECT ... FOR UPDATE/SHARE and other
-      // stronger locks keep normal read-set validation.
-      extern bool srv_prefetch_ro_novalidate;
-      bool plain_read_only = srv_prefetch_ro_novalidate && thread != nullptr &&
-                             thd_sql_command(thread) == SQLCOM_SELECT &&
-                             thread->lex != nullptr;
-      if (plain_read_only) {
-        for (Table_ref *t = thread->lex->query_tables; t != nullptr;
-             t = t->next_global) {
-          if (t->lock_descriptor().type > TL_READ) {
-            plain_read_only = false;
-            break;
-          }
-        }
-      }
-      ro_novalidate_ = plain_read_only;
       register_single_statement_to_mysql();
     }
     return;
