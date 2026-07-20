@@ -189,14 +189,9 @@ private:
   // rows are only a LIMIT-staged window. index_next()/index_next_same() consume
   // it and abort on over-read instead of returning a false EOF.
   bool materialized_scan_truncated_{false};
-  // Per-statement memo for set_fields_from_lineairdb.
-  // Refreshed when query_id or projection registration epoch changes.
+  // Per-statement memo for set_fields_from_lineairdb, refreshed on query_id
+  // change.
   uint64_t serve_memo_query_id_{0};
-  uint64_t serve_memo_proj_epoch_{0};
-
-  // Projection layout for the table currently being decoded; nullptr means
-  // rows are full-width.
-  const std::vector<uint32_t> *serve_memo_projection_{nullptr};
 
   // True when this statement can skip Field::store outside read_set.
   bool serve_memo_can_skip_unread_fields_{false};
@@ -229,7 +224,6 @@ private:
   bool refill_index_cursor(LineairDBTransaction *tx);
 
   void reset_index_search_buffers();
-  int fill_grouped_summary_buffers(LineairDBTransaction *tx);
 
 public:
   ha_lineairdb(handlerton *hton, TABLE_SHARE *table_arg);
@@ -515,56 +509,6 @@ public:
   int rnd_init(bool scan) override; // required
   int rnd_end() override;
   int rnd_next(uchar *buf) override;            ///< required
-  /**
-   * @brief Return the next cached aggregate group row as raw VALUE bytes.
-   */
-  bool agg_next_raw(std::string_view *out_value);
-
-  /**
-   * @brief Attach a serialized AggregateSpec to this handler's transaction.
-   *
-   * @return false when the statement WHERE exists but cannot be serialized for
-   * server-side aggregation.
-   */
-  bool tx_set_pushed_aggregate(const std::string &s);
-
-  /**
-   * @brief Clear this transaction's pushed AggregateSpec.
-   */
-  void tx_clear_pushed_aggregate();
-
-  /**
-   * @brief Return whether server aggregation may use read-only no-validation.
-   */
-  bool tx_ro_novalidate();
-
-  /**
-   * @brief Return true if aggregate staging aborted.
-   */
-  bool tx_is_aborted();
-
-  /**
-   * @brief Register a grouped aggregate leaf for synthetic summary-row serving.
-   */
-  void tx_register_grouped_summary(
-      LineairDBTransaction::GroupedSummaryRegistration registration);
-
-  /**
-   * @brief Register a grouped semijoin reduction for this statement.
-   */
-  void tx_register_grouped_semijoin(
-      LineairDBTransaction::GroupedSemijoin grouped_semijoin);
-
-  /**
-   * @brief Return true if this statement already has grouped-semijoin state.
-   */
-  bool tx_has_grouped_semijoin();
-
-  /**
-   * @brief Return the transaction used by QEP read-plan autogen.
-   */
-  LineairDBTransaction *tx_for_autogen();
-
   int rnd_pos(uchar *buf, uchar *pos) override; ///< required
   void position(const uchar *record) override;  ///< required
   /**
@@ -653,11 +597,6 @@ public:
 
   /** Predicate pushdown: serialize WHERE conditions for server-side filtering */
   const Item *cond_push(const Item *cond) override;
-
-  /** Table-local filter from cond_push(), for autogen scan-step pushdown. */
-  const std::string &pushed_filter_for_autogen() const {
-    return pushed_filter_serialized_;
-  }
 
 private:
   // Serialized PushedPredicate protobuf from cond_push()

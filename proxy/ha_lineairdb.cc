@@ -111,7 +111,6 @@
 // for ::strcasecmp
 #include <strings.h>
 
-#include "aggregate_pushdown.hh"
 #include "lineairdb_field_types.h"
 #include "lineairdb_keyenc.hh"
 #include "lineairdb_prefetch.hh"
@@ -328,14 +327,6 @@ ha_lineairdb::ha_lineairdb(handlerton *hton, TABLE_SHARE *table_arg)
     : handler(hton, table_arg), m_ds_mrr(this), current_position_(0),
       buffer_position_(0), last_batch_key_(), scan_exhausted_(false),
       blobroot(csv_key_memory_blobroot, BLOB_MEMROOT_ALLOC_SIZE) {}
-
-/**
- * @brief Return whether server aggregation may use read-only no-validation.
- */
-bool ha_lineairdb::tx_ro_novalidate() {
-  // Server aggregation consumes staged group rows, so require prefetch mode.
-  return srv_prefetch_execution && srv_prefetch_ro_novalidate;
-}
 
 /**
   @brief

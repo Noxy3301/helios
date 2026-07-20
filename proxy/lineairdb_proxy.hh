@@ -181,31 +181,6 @@ public:
         std::vector<ReadPlanKeyBinding> end_bindings;
         bool for_each = false;
         bool reverse_scan = false;
-        // Serialized PushedPredicate; empty means no server-side filter.
-        std::string serialized_filter;
-        // Projection pushdown: kept 0-based TABLE::field[] ordinals (ascending,
-        // unique). Empty = ship full rows. num_columns = table->s->fields.
-        std::vector<uint32_t> projection;
-        uint32_t projection_num_columns = 0;
-        // Aggregation pushdown: serialized AggregateSpec. When set on a primary
-        // scan, the server returns grouped rows instead of base rows.
-        std::string aggregate_serialized;
-        // Semijoin reduction: keep probe rows only when their join key appears
-        // in an earlier source step.
-        struct Semijoin {
-            uint32_t source_step = 0;
-            uint32_t source_column = 0;
-            uint32_t probe_column = 0;
-            std::string source_filter;
-        };
-        std::vector<Semijoin> semijoins;
-        // Emit one row per probe key: an anti-join only needs to know a match
-        // exists. See PlanStep.existence_only in the proto for the contract.
-        bool existence_only = false;
-        // True when the probe staged every ref keypart exactly, with no dropped
-        // keypart or widening. existence_only needs it: capping a widened probe
-        // at the first row could skip the real match in a later row.
-        bool exact_keyed_probe = false;
     };
     struct ReadPlanStepResult {
         bool found = false;

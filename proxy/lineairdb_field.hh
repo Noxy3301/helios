@@ -55,8 +55,8 @@ class LineairDBField {
                             const size_t length);
   std::string_view get_null_flags() const { return nullFlagView; }
   std::string_view get_column_of_row(const size_t i) const { return row[i]; }
-  // Parsed column count: a projection-trimmed value holds only the kept
-  // columns, so decoders must size their mapping by this, not s->fields.
+  // Parsed column count of the decoded value; decoders size their mapping
+  // by this, not by s->fields.
   size_t get_row_size() const { return row.size(); }
 
   LineairDBField() = default;

@@ -177,8 +177,7 @@ int ha_lineairdb::index_read_map(uchar *buf, const uchar *key,
   tx->choose_table(db_table_name);
   if (!pushed_filter_serialized_.empty()) {
     tx->set_pushed_filter(pushed_filter_serialized_);
-  } else if (!tx->has_pushed_aggregate()) {
-    // See rnd_init: a pending aggregation pushdown owns the tx filter.
+  } else {
     tx->clear_pushed_filter();
   }
 
@@ -209,14 +208,6 @@ int ha_lineairdb::index_read_map(uchar *buf, const uchar *key,
 
   // The optimizer has run, so the SELECT/generic-DML QEP is available.
   if (int err = maybe_prefetch_for_statement(ha_thd(), tx, table)) return err;
-
-  if (tx->grouped_summary_skipped(table) && key == nullptr) {
-    reset_index_search_buffers();
-    last_fetched_primary_key_.clear();
-    if (int err = fill_grouped_summary_buffers(tx)) return err;
-    if (secondary_index_results_.empty()) return HA_ERR_END_OF_FILE;
-    return fetch_and_set_current_result(buf, tx);
-  }
 
   build_search_plan(key, keypart_map, find_flag, key_info);
 

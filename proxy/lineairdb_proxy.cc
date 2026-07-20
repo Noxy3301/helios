@@ -470,27 +470,6 @@ LineairDBProxy::ReadPlanResult LineairDBProxy::tx_execute_read_plan(
         out->set_index_name(step.index_name);
         out->set_for_each(step.for_each);
         out->set_reverse_scan(step.reverse_scan);
-        out->set_existence_only(step.existence_only);
-        if (!step.serialized_filter.empty()) {
-            out->mutable_filter()->ParseFromString(step.serialized_filter);
-        }
-        if (!step.projection.empty() && step.projection_num_columns > 0) {
-            auto* p = out->mutable_projection();
-            p->set_num_columns(step.projection_num_columns);
-            for (uint32_t f : step.projection) p->add_field_indexes(f);
-        }
-        if (!step.aggregate_serialized.empty() && step.is_scan) {
-            out->mutable_aggregate()->ParseFromString(step.aggregate_serialized);
-        }
-        for (const auto& sj : step.semijoins) {
-            auto* o = out->add_semijoins();
-            o->set_source_step(sj.source_step);
-            o->set_source_column(sj.source_column);
-            o->set_probe_column(sj.probe_column);
-            if (!sj.source_filter.empty()) {
-                o->mutable_source_filter()->ParseFromString(sj.source_filter);
-            }
-        }
         for (const auto& binding : step.bindings) {
             auto* b = out->add_bindings();
             b->set_source_step(binding.source_step);
