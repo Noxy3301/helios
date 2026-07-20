@@ -97,7 +97,7 @@ public:
 
   void begin_transaction();
   void set_status_to_abort();
-  bool end_transaction();
+  bool end_transaction(bool *transport_error = nullptr);
   void fence() const;
   void set_prefetch_mode(bool enabled) { prefetch_mode_ = enabled; }
   bool is_prefetch_mode() const { return prefetch_mode_; }
@@ -159,6 +159,12 @@ public:
   }
 
   bool aborted_by_cache_miss() const { return aborted_by_cache_miss_; }
+  bool has_transport_error() const { return transport_error_; }
+
+  inline void mark_transport_error() {
+    transport_error_ = true;
+    is_aborted_ = true;
+  }
 
   inline void set_aborted(bool aborted) {
     // Once aborted, stay aborted (matches LineairDB's irreversible Abort semantics).
@@ -301,6 +307,9 @@ private:
   // Set when the abort came from a prefetch cache miss (an unstaged read
   // surface), so the handler returns a non-retryable error, not a deadlock.
   bool aborted_by_cache_miss_{false};
+  // A lost RPC connection is not OCC contention and must never be surfaced as
+  // a retryable deadlock (or as an empty scan result).
+  bool transport_error_{false};
 
   struct RowCountDelta {
     LineairDB_share *share;
@@ -469,7 +478,7 @@ private:
       const std::string& table_name, const std::string& index_name,
       const std::string& start_key, const std::string& end_key,
       bool reverse_scan, uint64_t row_limit) const;
-  bool prefetch_validate_and_commit();
+  bool prefetch_validate_and_commit(bool *transport_error);
   bool thd_is_transaction() const;
   void register_transaction_to_mysql();
   void register_single_statement_to_mysql();

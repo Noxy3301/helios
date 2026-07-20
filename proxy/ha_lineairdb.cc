@@ -502,6 +502,10 @@ LineairDBTransaction *&ha_lineairdb::get_transaction(THD *thd) {
 }
 
 int ha_lineairdb::abort_errno(LineairDBTransaction *tx) {
+  if (tx != nullptr && tx->has_transport_error()) {
+    thd_mark_transaction_to_rollback(ha_thd(), 1);
+    return HA_ERR_NO_CONNECTION;
+  }
   // A prefetch cache miss is an unsupported access shape, not contention, so
   // reject it non-retryably -- retrying the same read cannot make it hit.
   if (tx != nullptr && tx->aborted_by_cache_miss()) {
@@ -528,12 +532,13 @@ static int lineairdb_commit(handlerton *hton, THD *thd, bool all) {
   if (!should_terminate_now)
     return 0;
 
-  const bool committed = ctx->tx->end_transaction();
+  bool transport_error = false;
+  const bool committed = ctx->tx->end_transaction(&transport_error);
   ctx->tx = nullptr;
 
   if (!committed) {
     thd_mark_transaction_to_rollback(thd, true);
-    return HA_ERR_LOCK_DEADLOCK;
+    return transport_error ? HA_ERR_NO_CONNECTION : HA_ERR_LOCK_DEADLOCK;
   }
   return 0;
 }

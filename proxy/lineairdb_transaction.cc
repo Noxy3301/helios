@@ -702,6 +702,12 @@ LineairDBTransaction::get_matching_keys_and_values_in_range(std::string start_ke
                                                             bool *served_truncated) {
   if (served_truncated != nullptr) *served_truncated = false;
   if (table_is_not_chosen()) return {};
+  // The current Masstree reverse walk does not reliably treat an absent upper
+  // bound as +infinity. Use the same sentinel as staged scans; real encoded
+  // keys begin with a null marker and therefore sort below it.
+  if (reverse_scan && end_key.empty()) {
+    end_key = lineairdb_keyenc::scan_end_sentinel();
+  }
   if (prefetch_mode_) {
     // Unbounded-upper: map an empty end to the sentinel the scan was staged with
     // so the [start, sentinel) slice keeps every row (see scan_end_sentinel).
@@ -899,7 +905,10 @@ LineairDBTransaction::fetch_last_secondary_entry_in_range(const std::string &ind
   if (!fallback_to_normal_transaction("fetch_last_secondary_entry_in_range")) return std::nullopt;
   flush_write_buffer_for_table(db_table_key);
 
-  return lineairdb_proxy->tx_fetch_last_secondary_entry_in_range(this, index_name, start_key, end_key);
+  const std::string effective_end =
+      end_key.empty() ? lineairdb_keyenc::scan_end_sentinel() : end_key;
+  return lineairdb_proxy->tx_fetch_last_secondary_entry_in_range(
+      this, index_name, start_key, effective_end);
 }
 
 // Row count delta tracking
@@ -1527,7 +1536,9 @@ bool LineairDBTransaction::fallback_to_normal_transaction(const char* reason) {
   return false;
 }
 
-bool LineairDBTransaction::prefetch_validate_and_commit() {
+bool LineairDBTransaction::prefetch_validate_and_commit(
+    bool *transport_error) {
+  if (transport_error != nullptr) *transport_error = transport_error_;
   bool was_aborted = is_aborted_;
 
   // Read-only fast path: no writes and no read validation to send.
@@ -1569,9 +1580,14 @@ bool LineairDBTransaction::prefetch_validate_and_commit() {
   bool committed = false;
   std::string abort_reason;
   if (!was_aborted) {
+    bool commit_transport_error = false;
     committed = lineairdb_proxy->tx_validate_and_commit(
         reads, read_tids, read_found, range_read_set_,
-        write_buffer_ops_, server_deltas, isFence, &abort_reason);
+        write_buffer_ops_, server_deltas, isFence, &abort_reason,
+        &commit_transport_error);
+    if (transport_error != nullptr) {
+      *transport_error = transport_error_ || commit_transport_error;
+    }
     if (!committed && !abort_reason.empty()) {
       rpc_trace_.record_local_view("abort_validate_" + abort_reason);
     }
@@ -1666,9 +1682,10 @@ void LineairDBTransaction::set_status_to_abort() {
   is_aborted_ = true;
 }
 
-bool LineairDBTransaction::end_transaction() {
+bool LineairDBTransaction::end_transaction(bool *transport_error) {
+  if (transport_error != nullptr) *transport_error = transport_error_;
   if (prefetch_mode_) {
-    return prefetch_validate_and_commit();
+    return prefetch_validate_and_commit(transport_error);
   }
 
   assert(tx_id != -1);
@@ -1685,7 +1702,12 @@ bool LineairDBTransaction::end_transaction() {
     }
   }
 
-  bool committed = lineairdb_proxy->db_end_transaction(tx_id, isFence, server_deltas);
+  bool end_rpc_transport_error = false;
+  bool committed = lineairdb_proxy->db_end_transaction(
+      tx_id, isFence, server_deltas, &end_rpc_transport_error);
+  if (transport_error != nullptr) {
+    *transport_error = transport_error_ || end_rpc_transport_error;
+  }
   if (!committed) {
     thd_mark_transaction_to_rollback(thread, 1);
   }

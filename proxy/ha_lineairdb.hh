@@ -168,6 +168,23 @@ private:
   std::unordered_map<std::string, size_t> scan_cache_;  // primary key -> index in scanned_values_
   std::vector<std::string> secondary_index_results_;
   std::vector<std::string> secondary_index_payloads_;
+
+  // MySQL uses index_first()/index_last() both for one-row endpoint lookups
+  // such as MIN()/MAX() and as the start of a continued index scan. The
+  // handler is not told whether index_next()/index_prev() will follow.
+  //
+  // Read ahead a bounded number of rows: endpoint-only queries use the first
+  // returned row, while continued scans consume the remainder and refill when
+  // the buffered rows are empty. This size trades memory for RPC frequency;
+  // it is not required for correctness.
+  static constexpr uint64_t INDEX_CURSOR_READ_AHEAD_SIZE = 1024;
+  bool index_cursor_active_{false};
+  bool index_cursor_reverse_{false};
+  bool index_cursor_secondary_{false};
+  bool index_cursor_at_eof_{false};
+  std::string index_cursor_start_key_;
+  std::string index_cursor_end_key_;
+
   // Set by get_matching_keys_and_values_in_range() when these materialized
   // rows are only a LIMIT-staged window. index_next()/index_next_same() consume
   // it and abort on over-read instead of returning a false EOF.
@@ -207,6 +224,10 @@ private:
   std::string generate_hidden_primary_key();
   std::string serialize_hidden_primary_key(uint64_t row_id) const;
   bool fetch_next_batch();
+
+  // Refill the rows buffered for index_next()/index_prev().
+  bool refill_index_cursor(LineairDBTransaction *tx);
+
   void reset_index_search_buffers();
   int fill_grouped_summary_buffers(LineairDBTransaction *tx);
 

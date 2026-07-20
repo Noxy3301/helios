@@ -268,7 +268,8 @@ public:
         const std::vector<BatchOp>& ops,
         const std::vector<std::pair<std::string, int64_t>>& row_deltas,
         bool isFence,
-        std::string* abort_reason = nullptr);
+        std::string* abort_reason = nullptr,
+        bool* transport_error = nullptr);
 
     // secondary index operations
     std::vector<std::string> tx_read_secondary_index(LineairDBTransaction* tx,
@@ -350,7 +351,8 @@ public:
 
     // database operations
     bool db_end_transaction(int64_t tx_id, bool isFence,
-                            const std::vector<std::pair<std::string, int64_t>>& row_deltas = {});
+                            const std::vector<std::pair<std::string, int64_t>>& row_deltas = {},
+                            bool *transport_error = nullptr);
     void db_fence();
 
     // statistics: cached table row counts, refreshed on BEGIN/END
