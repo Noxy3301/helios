@@ -241,14 +241,12 @@ message TxExecuteReadPlan {
         // Optional column subset for staged rows. The server keeps full null
         // flags, sends only listed column values, and filters before trimming.
         RowProjection projection = 12;
-        // Optional aggregation for a staged primary scan.
-        AggregateSpec aggregate = 13;
         // Optional membership reduction for high-fanout join probes.
-        repeated SemijoinFilter semijoins = 14;
+        repeated SemijoinFilter semijoins = 13;
         // Anti-join probe: only the existence of a match matters, never the
         // inner rows. Emit at most one row per probe key. A complete answer,
         // not a truncated window -- index_next still reports a clean EOF.
-        bool existence_only = 15;
+        bool existence_only = 14;
     }
     // Drop probe rows whose join key is absent from an earlier step's result.
     // Columns are 0-based TABLE::field[] ordinals.
@@ -704,9 +702,6 @@ message FilterExpr {
         OP_AND = 20; OP_OR = 21; OP_NOT = 22;
         OP_BETWEEN = 30; OP_IN = 31; OP_LIKE = 32;
         OP_IS_NULL = 33; OP_IS_NOT_NULL = 34;
-        // Arithmetic for aggregate-argument expressions. Decimal arithmetic is
-        // evaluated server-side in exact (mantissa, scale) integer form.
-        OP_ADD = 40; OP_SUB = 41; OP_MUL = 42; OP_NEG = 43;
     }
     Op op = 1;
     int64 int_val = 2;
@@ -722,25 +717,6 @@ message FilterExpr {
 message PushedPredicate {
     FilterExpr expr = 1;
     uint32 num_columns = 2;
-}
-
-// Aggregation pushdown. When attached to a scan step, the server groups the
-// post-filter rows and returns one synthetic row per group. Each group row uses
-// the normal row format: group columns first, then (value, count) per aggregate.
-//   COUNT: value=row count (count col unused)
-//   SUM:   value=exact decimal sum as ASCII (null/empty if 0 non-null), count=non-null count
-//   AVG:   value=exact decimal sum as ASCII, count=non-null count (proxy divides)
-// The proxy decodes positionally from the spec it built.
-message AggFunc {
-    enum Kind { AGG_COUNT = 0; AGG_SUM = 1; AGG_AVG = 2; }
-    Kind kind = 1;
-    FilterExpr arg = 2;        // argument expression (absent for COUNT(*))
-    uint32 result_scale = 3;   // decimal scale of the per-row arg value
-}
-message AggregateSpec {
-    uint32 num_columns = 1;                            // table->s->fields (row parse)
-    repeated uint32 group_columns = 2 [packed = true]; // 0-based field indices (GROUP BY)
-    repeated AggFunc aggs = 3;
 }
 
 // DuckDB bridge: executes verbatim client SQL text on the LineairDB server
