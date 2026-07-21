@@ -9,7 +9,6 @@
 #include <utility>
 #include <vector>
 
-#include "aggregate_executor.hh"
 #include "predicate_evaluator.hh"
 #include "row_codec.hh"
 
@@ -77,8 +76,7 @@ const std::vector<uint32_t>* selected_columns_for_projected_read(
     }
     selected_columns.assign(step.projection().field_indexes().begin(),
                             step.projection().field_indexes().end());
-    if (step.has_filter() && step.filter().has_expr() &&
-        !is_aggregate_having_filter(step)) {
+    if (step.has_filter() && step.filter().has_expr()) {
         collect_filter_columns(step.filter().expr(), selected_columns);
     }
     for (const auto& semijoin : step.semijoins()) {
@@ -87,34 +85,6 @@ const std::vector<uint32_t>* selected_columns_for_projected_read(
     sort_unique_columns(selected_columns);
     if (step.projection().num_columns() > 0 &&
         selected_columns.size() >= step.projection().num_columns()) {
-        return nullptr;
-    }
-    return &selected_columns;
-}
-
-const std::vector<uint32_t>* selected_columns_for_aggregate_read(
-    const LineairDB::Protocol::TxExecuteReadPlan::PlanStep& step,
-    std::vector<uint32_t>& selected_columns) {
-    selected_columns.clear();
-    if (!step.has_aggregate() || step.aggregate().aggs_size() == 0) {
-        return nullptr;
-    }
-    if (step.has_filter() && step.filter().has_expr() &&
-        !is_aggregate_having_filter(step)) {
-        collect_filter_columns(step.filter().expr(), selected_columns);
-    }
-    const auto& spec = step.aggregate();
-    for (uint32_t column : spec.group_columns()) {
-        selected_columns.push_back(column);
-    }
-    for (const auto& aggregate_func : spec.aggs()) {
-        if (aggregate_func.kind() != LineairDB::Protocol::AggFunc::AGG_COUNT) {
-            collect_filter_columns(aggregate_func.arg(), selected_columns);
-        }
-    }
-    sort_unique_columns(selected_columns);
-    if (spec.num_columns() > 0 &&
-        selected_columns.size() >= spec.num_columns()) {
         return nullptr;
     }
     return &selected_columns;
@@ -377,125 +347,6 @@ bool parallel_primary_pax_row_ref_scan(
             }
         }
     }
-    return true;
-}
-
-bool parallel_primary_aggregate_scan(
-    LineairDB::Database* db,
-    const LineairDB::Protocol::TxExecuteReadPlan::PlanStep& step,
-    const std::string& start_key, const std::string& end_key,
-    LineairDB::Protocol::TxExecuteReadPlan::StepResult* step_result) {
-    if (db == nullptr) return false;
-
-    const size_t morsel_rows = 128000;  // FIXME: make configurable
-    const size_t min_rows = 500000;     // FIXME: make configurable
-    const unsigned nproc = std::thread::hardware_concurrency();
-    const unsigned max_threads =
-        std::min<unsigned>(nproc ? nproc : 4, 8);  // FIXME: make configurable
-    if (max_threads <= 1) return false;
-
-    // Probe the actual key span before creating split boundaries.
-    const std::vector<uint32_t> key_only_columns;
-    auto first = db->StatelessRangeScan(step.table_name(), start_key, end_key,
-                                        1, false, &key_only_columns);
-    if (!first.ok || first.rows.empty()) return false;
-    auto last = db->StatelessRangeScan(step.table_name(), start_key, end_key,
-                                       1, true, &key_only_columns);
-    if (!last.ok || last.rows.empty()) return false;
-
-    int64_t lo = 0;
-    int64_t hi = 0;
-    if (!decode_leading_int_key(first.rows.front().key, lo) ||
-        !decode_leading_int_key(last.rows.front().key, hi)) {
-        return false;
-    }
-    if (hi <= lo) return false;
-
-    const uint64_t span = static_cast<uint64_t>(hi - lo) + 1;
-    if (span < min_rows) return false;
-    const size_t desired_workers =
-        morsel_rows > 0 ? (span + morsel_rows - 1) / morsel_rows : 1;
-    const unsigned worker_count =
-        static_cast<unsigned>(std::min<size_t>(desired_workers, max_threads));
-    if (worker_count <= 1) return false;
-
-    // Interior bounds are integer key prefixes; each slice is [start, end).
-    std::vector<std::string> starts(worker_count);
-    std::vector<std::string> ends(worker_count);
-    for (unsigned i = 0; i < worker_count; ++i) {
-        const int64_t begin_value =
-            lo + static_cast<int64_t>((span * i) / worker_count);
-        const int64_t end_value =
-            (i + 1 == worker_count)
-                ? hi + 1
-                : lo + static_cast<int64_t>((span * (i + 1)) / worker_count);
-        starts[i] = (i == 0) ? start_key : encode_int_key_part(begin_value);
-        ends[i] = (i + 1 == worker_count) ? end_key
-                                          : encode_int_key_part(end_value);
-    }
-
-    const bool group_having = is_aggregate_having_filter(step);
-    const bool has_filter =
-        step.has_filter() && step.filter().has_expr() && !group_having;
-    const auto& spec = step.aggregate();
-    const int n_agg = spec.aggs_size();
-    std::vector<uint32_t> selected_columns;
-    const std::vector<uint32_t>* selected_columns_for_reads =
-        selected_columns_for_aggregate_read(step, selected_columns);
-    std::vector<std::unordered_map<std::string, AggGroupState>> locals(
-        worker_count);
-    std::vector<char> failed(worker_count, 0);
-    std::vector<std::thread> workers;
-    workers.reserve(worker_count);
-
-    for (unsigned worker_index = 0; worker_index < worker_count;
-         ++worker_index) {
-        workers.emplace_back([&, worker_index] {
-            auto scan_result =
-                db->StatelessRangeScan(step.table_name(), starts[worker_index],
-                                       ends[worker_index], 0, false,
-                                       selected_columns_for_reads);
-            if (!scan_result.ok) {
-                failed[worker_index] = 1;
-                db->ReleaseMasstreeThreadEpoch();
-                return;
-            }
-
-            // Aggregate filters cannot be rechecked after rows are grouped.
-            if (has_filter && !scan_result.rows.empty()) {
-                PredicateEvaluator evaluator;
-                std::vector<LineairDB::StatelessScanRow> kept;
-                kept.reserve(scan_result.rows.size());
-                for (auto& row : scan_result.rows) {
-                    if (!evaluator.parse_row(row.value.data(),
-                                             row.value.size(),
-                                             step.filter().num_columns())) {
-                        failed[worker_index] = 1;
-                        db->ReleaseMasstreeThreadEpoch();
-                        return;
-                    }
-                    if (evaluator.evaluate(step.filter().expr())) {
-                        kept.push_back(std::move(row));
-                    }
-                }
-                scan_result.rows = std::move(kept);
-            }
-
-            aggregate_rows_range(spec, scan_result.rows, 0,
-                                 scan_result.rows.size(),
-                                 locals[worker_index]);
-            db->ReleaseMasstreeThreadEpoch();
-        });
-    }
-    for (auto& worker : workers) worker.join();
-    for (char worker_failed : failed) {
-        if (worker_failed) return false;
-    }
-
-    std::unordered_map<std::string, AggGroupState> groups;
-    for (auto& local : locals) merge_agg_groups(groups, local, n_agg);
-    emit_agg_groups(spec, groups, step_result,
-                    group_having ? &step.filter() : nullptr);
     return true;
 }
 
