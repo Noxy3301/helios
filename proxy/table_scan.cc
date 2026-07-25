@@ -35,12 +35,10 @@ int ha_lineairdb::rnd_init(bool) {
   tx->choose_table(db_table_name);
 
   // Predicate pushdown: propagate filter serialized by cond_push() to the
-  // transaction. When an aggregation pushdown is pending, the tx filter was
-  // prepared by tx_set_pushed_aggregate from the statement WHERE. Clearing it
-  // here would make the server aggregate unfiltered rows.
+  // transaction.
   if (!pushed_filter_serialized_.empty()) {
     tx->set_pushed_filter(pushed_filter_serialized_);
-  } else if (!tx->has_pushed_aggregate()) {
+  } else {
     tx->clear_pushed_filter();
   }
 
@@ -54,10 +52,6 @@ int ha_lineairdb::rnd_init(bool) {
   // statement; an unsupported QEP fails here.
   if (int err = maybe_prefetch_for_statement(ha_thd(), tx, table)) {
     DBUG_RETURN(err);
-  }
-
-  if (tx->grouped_summary_skipped(table)) {
-    DBUG_RETURN(fill_grouped_summary_buffers(tx));
   }
 
   DBUG_RETURN(0);

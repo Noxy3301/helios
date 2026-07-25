@@ -1,7 +1,6 @@
 #ifndef LINEAIRDB_TRANSACTION_HH
 #define LINEAIRDB_TRANSACTION_HH
 
-#include <atomic>
 #include <optional>
 #include <unordered_map>
 #include <unordered_set>
@@ -120,15 +119,9 @@ public:
     autogen_stmt_resolved_ = false;
     autogen_stmt_handler_deferred_ = false;
     autogen_staged_roots_.clear();
-    grouped_summary_registrations_.clear();
-    grouped_summary_skipped_.clear();
-    grouped_semijoins_.clear();
-    grouped_semijoin_group_rows_.clear();
   }
   bool autogen_stmt_resolved() const { return autogen_stmt_resolved_; }
   void mark_autogen_stmt_resolved() { autogen_stmt_resolved_ = true; }
-  // True for the read-only no-validation path; staged filters use the same gate.
-  bool ro_novalidate() const { return ro_novalidate_; }
   // Subqueries may be staged before the statement root exists. Remember each
   // root so the same subquery plan is not prefetched twice in one statement.
   bool autogen_root_staged(const void *root) const {
@@ -179,91 +172,6 @@ public:
   const std::string& get_pushed_filter() const { return pushed_filter_; }
   void clear_pushed_filter() { pushed_filter_.clear(); }
 
-  // Aggregation pushdown: serialized AggregateSpec for the primary scan.
-  void set_pushed_aggregate(const std::string& s) {
-    pushed_aggregate_ = s;
-    pushed_aggregate_table_ = db_table_key;
-  }
-  void clear_pushed_aggregate() {
-    pushed_aggregate_.clear();
-    pushed_aggregate_table_.clear();
-  }
-  bool has_pushed_aggregate() const { return !pushed_aggregate_.empty(); }
-
-  // Grouped summary registration lets a grouped aggregate leaf be served as
-  // synthetic full-width rows instead of base table rows.
-  struct GroupedSummaryRegistration {
-    std::string spec;
-    std::string filter;
-    std::vector<std::string> template_cols;
-    uint32_t group_col = 0;
-    uint32_t col_a = 0;
-    uint32_t col_b = 0;
-    bool single_sum = false;
-  };
-  void register_grouped_summary(const void* leaf,
-                                GroupedSummaryRegistration registration) {
-    grouped_summary_registrations_[leaf] = std::move(registration);
-  }
-  const GroupedSummaryRegistration* grouped_summary_registration(
-      const void* leaf) const {
-    auto it = grouped_summary_registrations_.find(leaf);
-    return it == grouped_summary_registrations_.end() ? nullptr
-                                                      : &it->second;
-  }
-  bool has_grouped_summary_registrations() const {
-    return !grouped_summary_registrations_.empty();
-  }
-  void mark_grouped_summary_skipped(const void* leaf) {
-    grouped_summary_skipped_.insert(leaf);
-  }
-  bool grouped_summary_skipped(const void* leaf) const {
-    return grouped_summary_skipped_.count(leaf) != 0;
-  }
-
-  // Grouped semijoin reduces an outer scan by membership in the inner
-  // GROUP BY/HAVING result.
-  struct GroupedSemijoin {
-    std::string inner_table_key;
-    std::string agg_spec;
-    std::string having_filter;
-    std::string outer_table_key;
-    uint32_t outer_probe_column = 0;
-  };
-  void register_grouped_semijoin(GroupedSemijoin grouped_semijoin) {
-    grouped_semijoins_.push_back(std::move(grouped_semijoin));
-  }
-  const std::vector<GroupedSemijoin>& grouped_semijoins() const {
-    return grouped_semijoins_;
-  }
-  void cache_grouped_semijoin_group_rows(const std::string& table,
-                                         std::vector<std::string> rows) {
-    grouped_semijoin_group_rows_[table] = std::move(rows);
-  }
-  const std::vector<std::string>* grouped_semijoin_group_rows(
-      const std::string& table) const {
-    auto it = grouped_semijoin_group_rows_.find(table);
-    return it == grouped_semijoin_group_rows_.end() ? nullptr : &it->second;
-  }
-  bool execute_read_plan_raw(
-      const std::vector<LineairDBProxy::ReadPlanStep>& steps,
-      std::vector<std::string>* values);
-
-  // Projection pushdown stores kept field ordinals per physical table.
-  static uint64_t load_projection_global_epoch() {
-    return projection_epoch_.load(std::memory_order_relaxed);
-  }
-  void set_table_projection(const std::string& table_name,
-                            std::vector<uint32_t> kept) {
-    table_projection_[table_name] = std::move(kept);
-    projection_epoch_.fetch_add(1, std::memory_order_relaxed);
-  }
-  const std::vector<uint32_t>* load_table_projection(
-      const std::string& table_name) const {
-    auto it = table_projection_.find(table_name);
-    return it == table_projection_.end() ? nullptr : &it->second;
-  }
-
   void add_rowcount_delta(LineairDB_share *share, const std::string &table_name, int64_t delta);
   int64_t peek_rowcount_delta(const LineairDB_share *share) const;
 
@@ -287,9 +195,6 @@ private:
   bool isFence;
   bool prefetch_mode_{false};
   bool prefetch_registered_{false};
-  // Autocommit single-statement SELECT with lineairdb_prefetch_ro_novalidate=ON:
-  // read sets are not accumulated and commit skips the validation RPC.
-  bool ro_novalidate_{false};
   bool tx_plan_used_{false};
   uint64_t autogen_query_id_{0};
   bool autogen_stmt_resolved_{false};
@@ -375,10 +280,6 @@ private:
     // Set only on lookup return copies: this entry came from a LIMIT-staged
     // window, so the handler must abort if MySQL asks past these rows.
     bool truncated = false;
-    // Aggregate steps emit synthetic GROUP rows keyed by the same physical
-    // table. They are visible only to the aggregate consumer, never to base-row
-    // scans.
-    bool aggregate_rows = false;
   };
   struct LocalSecondaryScanEntry {
     std::string table_name;
@@ -401,21 +302,6 @@ private:
 
   // Predicate pushdown: serialized PushedPredicate for scan filtering
   std::string pushed_filter_;
-  // Aggregation pushdown: serialized AggregateSpec for the primary scan
-  std::string pushed_aggregate_;
-  std::string pushed_aggregate_table_;
-
-  std::unordered_map<const void*, GroupedSummaryRegistration>
-      grouped_summary_registrations_;
-  std::unordered_set<const void*> grouped_summary_skipped_;
-  std::vector<GroupedSemijoin> grouped_semijoins_;
-  std::unordered_map<std::string, std::vector<std::string>>
-      grouped_semijoin_group_rows_;
-
-  // Physical table name -> kept field ordinals for projected staged rows.
-  std::unordered_map<std::string, std::vector<uint32_t>> table_projection_;
-  // Process-wide registration epoch for handler decode memo refresh.
-  static inline std::atomic<uint64_t> projection_epoch_{0};
 
   // Max number of buffered write/delete ops before an automatic flush
   static constexpr size_t WRITE_BATCH_SIZE = 1024;

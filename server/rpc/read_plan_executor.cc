@@ -13,14 +13,13 @@
 #include "../../common/log.h"
 #include "lineairdb.pb.h"
 
-#include "aggregate_executor.hh"
 #include "flat_plan_encode.hh"
 #include "parallel_scan.hh"
 #include "predicate_evaluator.hh"
 #include "row_codec.hh"
 
 // Read-plan execution: the TX_EXECUTE_READ_PLAN handler and its plan-key
-// binding glue. Runs staged scans, semijoin probes, and server aggregation.
+// binding glue. Runs staged scans and semijoin probes.
 
 namespace {
 
@@ -132,8 +131,7 @@ const std::vector<uint32_t>* selected_columns_for_materialization(
     }
     selected_columns.assign(step.projection().field_indexes().begin(),
                             step.projection().field_indexes().end());
-    if (step.has_filter() && step.filter().has_expr() &&
-        !is_aggregate_having_filter(step)) {
+    if (step.has_filter() && step.filter().has_expr()) {
         collect_filter_columns(step.filter().expr(), selected_columns);
     }
     for (const auto& semijoin : step.semijoins()) {
@@ -182,10 +180,8 @@ void LineairDBRpc::handleTxExecuteReadPlan(const std::string& message,
 
         // Step-level row filter: parseable non-matches are dropped; rows the
         // evaluator cannot parse are returned for MySQL to re-check.
-        const bool step_has_group_having = is_aggregate_having_filter(step);
         const bool step_has_filter =
-            step.has_filter() && step.filter().has_expr() &&
-            !step_has_group_having;
+            step.has_filter() && step.filter().has_expr();
         const auto* step_filter =
             step_has_filter ? &step.filter().expr() : nullptr;
         const uint32_t step_filter_cols =
@@ -595,32 +591,19 @@ void LineairDBRpc::handleTxExecuteReadPlan(const std::string& message,
         if (step.index_name().empty()) {
             step_result->set_actual_start_key(start_key);
             step_result->set_actual_end_key(end_key);
-            if (!step.for_each() && step.scan_limit() == 0 &&
-                !step.reverse_scan() && step.has_aggregate() &&
-                step.aggregate().aggs_size() > 0) {
-                if (parallel_primary_aggregate_scan(
-                        db_manager_->get_database().get(), step, start_key,
-                        end_key, step_result)) {
-                    continue;
+            if (parallel_primary_pax_row_ref_scan(
+                    db_manager_->get_database().get(), step, start_key,
+                    end_key, step_result, projection_failed,
+                    semijoin_reductions)) {
+                if (projection_failed) {
+                    response.set_ok(false);
+                    flat_plan::encode_to_string(response, result);
+                    return;
                 }
-            }
-            if (!(step.has_aggregate() && step.aggregate().aggs_size() > 0)) {
-                if (parallel_primary_pax_row_ref_scan(
-                        db_manager_->get_database().get(), step, start_key,
-                        end_key, step_result, projection_failed,
-                        semijoin_reductions)) {
-                    if (projection_failed) {
-                        response.set_ok(false);
-                        flat_plan::encode_to_string(response, result);
-                        return;
-                    }
-                    continue;
-                }
+                continue;
             }
             if (!step.for_each() && step.scan_limit() == 0 &&
-                !step.reverse_scan() &&
-                !(step.has_aggregate() && step.aggregate().aggs_size() > 0) &&
-                semijoin_reductions.empty() &&
+                !step.reverse_scan() && semijoin_reductions.empty() &&
                 step.has_filter() && step.filter().has_expr()) {
                 if (parallel_primary_filter_scan(
                         db_manager_->get_database().get(), step, start_key,
@@ -643,56 +626,23 @@ void LineairDBRpc::handleTxExecuteReadPlan(const std::string& message,
                 flat_plan::encode_to_string(response, result);
                 return;
             }
-            // Aggregation emits synthetic group rows instead of base rows.
-            bool aggregated = false;
-            if (step.has_aggregate() && step.aggregate().aggs_size() > 0) {
-                if (step_filter != nullptr) {
-                    // Aggregate filters fail closed: once rows are folded into
-                    // groups, MySQL cannot recheck an unparseable base row.
-                    PredicateEvaluator agg_eval;
-                    bool parse_failed = false;
-                    std::remove_reference_t<decltype(scan_result.rows)> filtered;
-                    filtered.reserve(scan_result.rows.size());
-                    for (auto& row : scan_result.rows) {
-                        if (!agg_eval.parse_row(row.value.data(),
-                                                row.value.size(),
-                                                step_filter_cols)) {
-                            parse_failed = true;
-                            break;
-                        }
-                        if (agg_eval.evaluate(*step_filter))
-                            filtered.push_back(std::move(row));
-                    }
-                    if (parse_failed) {
-                        response.set_ok(false);
-                        flat_plan::encode_to_string(response, result);
-                        return;
-                    }
-                    scan_result.rows = std::move(filtered);
+            uint64_t emitted = 0;
+            for (auto& row : scan_result.rows) {
+                if (!row_passes(row.value)) {
+                    // Negative coverage for point probes into this scan.
+                    step_result->add_filtered_keys(std::move(row.key));
+                    continue;
                 }
-                aggregated = server_aggregate_scan(
-                    step.aggregate(), scan_result.rows, step_result,
-                    step_has_group_having ? &step.filter() : nullptr);
-            }
-            if (!aggregated) {
-                uint64_t emitted = 0;
-                for (auto& row : scan_result.rows) {
-                    if (!row_passes(row.value)) {
-                        // Negative coverage for point probes into this scan.
-                        step_result->add_filtered_keys(std::move(row.key));
-                        continue;
-                    }
-                    if (!semijoin_reductions.empty() &&
-                        semijoin_rejects(row.value)) {
-                        continue;
-                    }
-                    step_result->add_scan_keys(std::move(row.key));
-                    step_result->add_scan_values(project_value(std::move(row.value)));
-                    step_result->add_scan_tids(row.tid);
-                    if (step.scan_limit() > 0 &&
-                        ++emitted >= step.scan_limit()) {
-                        break;
-                    }
+                if (!semijoin_reductions.empty() &&
+                    semijoin_rejects(row.value)) {
+                    continue;
+                }
+                step_result->add_scan_keys(std::move(row.key));
+                step_result->add_scan_values(project_value(std::move(row.value)));
+                step_result->add_scan_tids(row.tid);
+                if (step.scan_limit() > 0 &&
+                    ++emitted >= step.scan_limit()) {
+                    break;
                 }
             }
         } else {

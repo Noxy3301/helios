@@ -352,27 +352,19 @@ void maybe_prefetch_for_transaction(THD *thd,
 // Build the read plan from the given QEP root and run it in one prefetch RPC.
 static int autogen_and_execute_prefetch(THD *thd, AccessPath *root,
                                         LineairDBTransaction *tx,
-                                        bool include_inner_units = false,
-                                        bool allow_projection = false) {
+                                        bool include_inner_units = false) {
   std::vector<LineairDBProxy::ReadPlanStep> steps;
-  if (!autogen_read_plan_from_qep(thd, root, tx->ro_novalidate(), &steps,
-                                  include_inner_units)) {
+  // Staged scans push key bounds and LIMIT only. Server-side row reductions
+  // (value filters, semijoin membership, existence-only caps) are absent by
+  // design: commit-time range replay walks the physical range and carries no
+  // filter, so a scan that drops rows on the server cannot pass validation.
+  if (!autogen_read_plan_from_qep(thd, root, &steps, include_inner_units)) {
     // autogen has already raised a my_error describing the unsupported shape.
     tx->set_status_to_abort();
     thd_mark_transaction_to_rollback(thd, 1);
     return HA_ERR_UNSUPPORTED;
   }
   if (steps.empty()) return 0;
-
-  // Trim rows only for statement-root read-only prefetch; unit episodes can
-  // run before read_set is final and must ship full rows.
-  if (allow_projection && tx->ro_novalidate()) {
-    std::unordered_map<std::string, std::vector<uint32_t>> kept_of;
-    plan_projection_pushdown(thd, &steps, &kept_of);
-    for (auto &kv : kept_of) {
-      tx->set_table_projection(kv.first, std::move(kv.second));
-    }
-  }
 
   // Loads the prefetched rows into the local cache and validation sets.
   tx->execute_read_plan(steps);
@@ -491,11 +483,9 @@ int maybe_prefetch_for_statement(THD *thd, LineairDBTransaction *tx,
     }
 
     // Statement-level staging also sweeps Item-embedded subquery plan trees
-    // that are invisible to the main-tree leaf walk. This is the only episode
-    // allowed to trim rows, so each table has one projection layout per tx.
+    // that are invisible to the main-tree leaf walk.
     return autogen_and_execute_prefetch(thd, stmt_root, tx,
-                                        /*include_inner_units=*/true,
-                                        /*allow_projection=*/true);
+                                        /*include_inner_units=*/true);
   }
 
   // No statement root yet: MySQL is evaluating a subquery before the outer

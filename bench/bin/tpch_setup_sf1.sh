@@ -50,7 +50,6 @@ echo "== [3/4] ANALYZE =="
 echo "== [4/4] measurement conditions =="
 "$MYSQL" -u root --socket="$SOCKET" -e "
   SET GLOBAL lineairdb_prefetch_execution=ON;
-  SET GLOBAL lineairdb_prefetch_ro_novalidate=ON;
   SET GLOBAL optimizer_switch='batched_key_access=on,mrr_cost_based=off,subquery_to_derived=off';
   SET GLOBAL join_buffer_size=1073741824;"
 

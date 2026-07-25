@@ -244,7 +244,7 @@ void LineairDBTransaction::execute_read_plan(
   if (!prefetch_mode_ || full_steps.empty()) return;
 
   // Exact point reads already covered by the local view need no staging RPC.
-  // Referenced steps must survive because later bindings/semijoins point at
+  // Referenced steps must survive because later bindings point at
   // them by source_step index.
   std::vector<bool> referenced(full_steps.size(), false);
   for (const auto& step : full_steps) {
@@ -253,10 +253,6 @@ void LineairDBTransaction::execute_read_plan(
     }
     for (const auto& b : step.end_bindings) {
       if (b.source_step < referenced.size()) referenced[b.source_step] = true;
-    }
-    for (const auto& sj : step.semijoins) {
-      if (sj.source_step < referenced.size())
-        referenced[sj.source_step] = true;
     }
   }
 
@@ -285,27 +281,9 @@ void LineairDBTransaction::execute_read_plan(
       for (auto& b : step.bindings) b.source_step = new_index[b.source_step];
       for (auto& b : step.end_bindings)
         b.source_step = new_index[b.source_step];
-      for (auto& sj : step.semijoins)
-        sj.source_step = new_index[sj.source_step];
     }
   }
   if (steps.empty()) return;
-
-  // Attach aggregate work to the matching full primary scan.
-  if (!pushed_aggregate_.empty()) {
-    for (auto& s : steps) {
-      if (s.is_scan && !s.for_each && s.index_name.empty() &&
-          s.table_name == db_table_key) {
-        s.aggregate_serialized = pushed_aggregate_;
-        if (s.serialized_filter.empty() && !pushed_filter_.empty()) {
-          s.serialized_filter = pushed_filter_;
-        }
-        // Aggregate specs use original field indexes, so ship full rows.
-        s.projection.clear();
-        s.projection_num_columns = 0;
-      }
-    }
-  }
 
   rpc_trace_.record_local_view("plan_request:steps=" +
                                std::to_string(steps.size()));
@@ -428,17 +406,6 @@ void LineairDBTransaction::execute_read_plan(
 
     if (step.index_name.empty()) {
       // Primary scan: cache row values and stage one primary range entry.
-      const bool aggregate_step = !step.aggregate_serialized.empty();
-      bool grouped_semijoin_aggregate_step = false;
-      if (aggregate_step) {
-        for (const auto& grouped_semijoin : grouped_semijoins_) {
-          if (grouped_semijoin.inner_table_key == step.table_name) {
-            grouped_semijoin_aggregate_step = true;
-            break;
-          }
-        }
-      }
-      std::vector<std::string> grouped_semijoin_group_rows;
       std::vector<std::pair<std::string, std::string>> rows;
       std::vector<uint64_t> row_tids;
       rows.reserve(step_result.scan_keys.size());
@@ -451,26 +418,16 @@ void LineairDBTransaction::execute_read_plan(
         const uint64_t tid =
             j < step_result.scan_tids.size() ? step_result.scan_tids[j] : 0;
         const bool found = !value.empty();
-        if (!aggregate_step) {
-          record_row_cache(step.table_name, key, found, value, tid, true);
-        }
+        record_row_cache(step.table_name, key, found, value, tid, true);
         if (found) {
-          if (grouped_semijoin_aggregate_step) {
-            grouped_semijoin_group_rows.push_back(value);
-          }
           rows.emplace_back(std::move(key), std::move(value));
           row_tids.push_back(tid);
         }
-      }
-      if (grouped_semijoin_aggregate_step) {
-        cache_grouped_semijoin_group_rows(
-            step.table_name, std::move(grouped_semijoin_group_rows));
       }
       LocalRangeScanEntry entry{
           step.table_name, step_result.actual_start_key,
           step_result.actual_end_key, step.reverse_scan, step.scan_limit,
           std::move(rows), std::move(row_tids)};
-      entry.aggregate_rows = aggregate_step;
       push_range_scan_cache(std::move(entry));
       // Rejected primary keys become local not-found answers for later point
       // probes into this filtered scan.
@@ -1266,7 +1223,6 @@ void LineairDBTransaction::append_base_row_read(
   // emplace_back-only, no dedup). Repeats carry the cached value's TID, so a
   // key read N times validates that same TID N times -- redundant but never
   // wrong. Commit aborts if any entry's TID no longer matches the server.
-  if (ro_novalidate_) return;  // read-only commit skips validation
   base_row_read_set_.push_back({table_name, key, tid, found});
 }
 
@@ -1276,7 +1232,6 @@ void LineairDBTransaction::append_range_read(
   // describe the replay and result_keys is the observed key list in scan
   // order. Append, like the point and Silo read sets; a scan consumed twice
   // is revalidated twice -- redundant but never wrong.
-  if (ro_novalidate_) return;  // read-only commit skips validation
   LineairDBProxy::RangeReadEntry entry;
   entry.table_name = cached.table_name;
   entry.start_key = cached.start_key;
@@ -1292,7 +1247,6 @@ void LineairDBTransaction::append_range_read(
 
 void LineairDBTransaction::append_secondary_range_read(
     const LocalSecondaryScanEntry& cached) {
-  if (ro_novalidate_) return;  // read-only commit skips validation
   LineairDBProxy::RangeReadEntry entry;
   entry.table_name = cached.table_name;
   entry.index_name = cached.index_name;
@@ -1313,23 +1267,6 @@ void LineairDBTransaction::abort_prefetch_cache_miss(
   is_aborted_ = true;
   aborted_by_cache_miss_ = true;
   thd_mark_transaction_to_rollback(thread, 1);
-}
-
-bool LineairDBTransaction::execute_read_plan_raw(
-    const std::vector<LineairDBProxy::ReadPlanStep>& steps,
-    std::vector<std::string>* values) {
-  if (values == nullptr || steps.empty()) return false;
-  if (!ro_novalidate_) return false;
-
-  LineairDBProxy::ReadPlanResult result =
-      lineairdb_proxy->tx_execute_read_plan(steps);
-  if (!result.ok || result.steps.size() != steps.size()) {
-    rpc_trace_.record_local_view("abort_read_plan_raw_rpc");
-    is_aborted_ = true;
-    return false;
-  }
-  *values = std::move(result.steps[0].scan_values);
-  return true;
 }
 
 void LineairDBTransaction::push_range_scan_cache(LocalRangeScanEntry entry) {
@@ -1355,8 +1292,6 @@ LineairDBTransaction::lookup_range_scan_cache(
     bool allow_truncated) const {
   const bool pending_in_range =
       has_pending_row_ops_in_range(table_name, start_key, end_key);
-  const bool aggregate_consumer =
-      !pushed_aggregate_.empty() && pushed_aggregate_table_ == table_name;
 
   // Grouped for_each range probes are staged by exact start key. Try that
   // index before falling back to the wider range-cache scan below.
@@ -1366,7 +1301,6 @@ LineairDBTransaction::lookup_range_scan_cache(
     for (auto rit = idx_it->second.rbegin(); rit != idx_it->second.rend();
          ++rit) {
       const auto& e = range_scan_cache_[*rit];
-      if (e.aggregate_rows != aggregate_consumer) continue;
       if (e.row_limit != 0 && pending_in_range) continue;
       if (e.reverse_scan == reverse_scan && e.row_limit == row_limit &&
           end_key <= e.end_key) {
@@ -1396,7 +1330,6 @@ LineairDBTransaction::lookup_range_scan_cache(
 
   for (auto it = range_scan_cache_.rbegin();
        it != range_scan_cache_.rend(); ++it) {
-    if (it->aggregate_rows != aggregate_consumer) continue;
     if (it->row_limit != 0 && pending_in_range) continue;
     const bool same_table = it->table_name == table_name;
     const bool same_direction = it->reverse_scan == reverse_scan;
@@ -1436,7 +1369,6 @@ LineairDBTransaction::lookup_range_scan_cache(
       for (auto rit = idx_it->second.rbegin(); rit != idx_it->second.rend();
            ++rit) {
         const auto& e = range_scan_cache_[*rit];
-        if (e.aggregate_rows != aggregate_consumer) continue;
         if (e.row_limit > 0 && !e.reverse_scan && e.start_key == start_key &&
             e.end_key == end_key) {
           LocalRangeScanEntry cached = e;
@@ -1541,19 +1473,6 @@ bool LineairDBTransaction::prefetch_validate_and_commit(
   if (transport_error != nullptr) *transport_error = transport_error_;
   bool was_aborted = is_aborted_;
 
-  // Read-only fast path: no writes and no read validation to send.
-  // Finish locally so the SELECT uses only the read-plan RPC.
-  if (!was_aborted && ro_novalidate_ && write_buffer_ops_.empty() &&
-      rowcount_deltas_.empty()) {
-    if (rpc_trace_.active()) {
-      rpc_trace_.record_local_view("ro_novalidate_commit");
-      RpcTraceLogger::instance().log_line(rpc_trace_.finalize_jsonl(true));
-    }
-    lineairdb_proxy->set_current_trace(nullptr);
-    delete this;
-    return true;
-  }
-
   std::vector<LineairDBProxy::StatelessReadKey> reads;
   std::vector<uint64_t> read_tids;
   std::vector<bool> read_found;
@@ -1633,23 +1552,6 @@ void LineairDBTransaction::begin_transaction() {
       register_transaction_to_mysql();
     }
     else {
-      // Enable the no-validation fast path only for autocommit SELECTs whose
-      // tables use plain read locks. SELECT ... FOR UPDATE/SHARE and other
-      // stronger locks keep normal read-set validation.
-      extern bool srv_prefetch_ro_novalidate;
-      bool plain_read_only = srv_prefetch_ro_novalidate && thread != nullptr &&
-                             thd_sql_command(thread) == SQLCOM_SELECT &&
-                             thread->lex != nullptr;
-      if (plain_read_only) {
-        for (Table_ref *t = thread->lex->query_tables; t != nullptr;
-             t = t->next_global) {
-          if (t->lock_descriptor().type > TL_READ) {
-            plain_read_only = false;
-            break;
-          }
-        }
-      }
-      ro_novalidate_ = plain_read_only;
       register_single_statement_to_mysql();
     }
     return;
