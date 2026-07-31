@@ -1302,6 +1302,10 @@ LineairDBTransaction::lookup_range_scan_cache(
          ++rit) {
       const auto& e = range_scan_cache_[*rit];
       if (e.row_limit != 0 && pending_in_range) continue;
+      // A limited window holds K rows adjacent to one endpoint: forward from
+      // start_key (equal here by index key), reverse before end_key. Serving a
+      // reverse window at a different end reads as EOF over rows it never held.
+      if (e.row_limit != 0 && e.reverse_scan && end_key != e.end_key) continue;
       if (e.reverse_scan == reverse_scan && e.row_limit == row_limit &&
           end_key <= e.end_key) {
         // Copy and trim because the staged group may cover a wider range.
@@ -1334,9 +1338,15 @@ LineairDBTransaction::lookup_range_scan_cache(
     const bool same_table = it->table_name == table_name;
     const bool same_direction = it->reverse_scan == reverse_scan;
     const bool same_limit = it->row_limit == row_limit;
+    // A limited window is anchored at one endpoint and cannot serve a request
+    // that moves it. Forward needs the same start and may narrow the end,
+    // reverse the same end and may raise the start.
+    const bool anchored =
+        it->row_limit == 0 || (it->reverse_scan ? end_key == it->end_key
+                                                : start_key == it->start_key);
     const bool covers_range =
         it->start_key <= start_key && end_key <= it->end_key;
-    if (same_table && same_direction && same_limit && covers_range) {
+    if (same_table && same_direction && same_limit && anchored && covers_range) {
       LocalRangeScanEntry cached = *it;
       cached.start_key = start_key;
       cached.end_key = end_key;
