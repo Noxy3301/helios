@@ -33,6 +33,16 @@ bool ha_lineairdb::refill_index_cursor(LineairDBTransaction *tx) {
 
   if (index_cursor_at_eof_) return false;
 
+  // A reverse prefetch cursor serves exactly one staged tail window, and a
+  // refill past it asks for rows the window never held. A complete walk of
+  // exactly the window size cannot be told apart from more, and rejects too.
+  if (tx->is_prefetch_mode() && index_cursor_reverse_ &&
+      !index_cursor_end_key_.empty()) {
+    prefetch_reject_unsupported(ha_thd(), tx,
+                                "reverse cursor past the staged tail window");
+    return false;
+  }
+
   if (index_cursor_secondary_) {
     // The existing tail-entry RPC returns one complete secondary-key group.
     // Using that group as the next exclusive end preserves the original
@@ -317,15 +327,22 @@ int ha_lineairdb::index_last(uchar *buf) {
 
   tx->choose_table(db_table_name);
 
-  // index_last seeks the index tail with no search key: it does not route
-  // through index_read_map and carries no range to build an autogen plan from,
-  // and a statement-scoped plan keyed by the QEP's range cannot cover it.
-  // Reject loudly under no-fallback rather than silently miss the local view.
-  // Range-driven reverse scans (ORDER BY ... DESC LIMIT) are supported; only
-  // this key-less tail seek is not.
-  // TODO: support index_last under prefetch (autogen reverse tail-scan).
+  // A key-less tail seek carries no range for QEP autogen to cover (an
+  // unbounded MAX reaches it straight from the optimizer). Stage the last-N
+  // window on demand; tx-scoped plans and secondary tails keep the loud reject.
   if (tx->is_prefetch_mode()) {
-    return prefetch_reject_unsupported(ha_thd(), tx, "index_last access");
+    if (tx->tx_plan_used()) {
+      return prefetch_reject_unsupported(ha_thd(), tx,
+                                         "index_last access (tx-scoped plan)");
+    }
+    if (active_index != table->s->primary_key) {
+      return prefetch_reject_unsupported(ha_thd(), tx,
+                                         "secondary index tail access");
+    }
+    if (int err = maybe_prefetch_for_index_tail(ha_thd(), tx, db_table_name,
+                                                INDEX_CURSOR_READ_AHEAD_SIZE)) {
+      return err;
+    }
   }
 
   if (active_index == table->s->primary_key) {

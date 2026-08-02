@@ -555,6 +555,32 @@ int maybe_prefetch_for_legacy_dml_handler(
   return prefetch_abort_errno(thd, tx);
 }
 
+int maybe_prefetch_for_index_tail(THD *thd, LineairDBTransaction *tx,
+                                  const std::string &table_key,
+                                  uint64_t window_rows) {
+  if (tx == nullptr || !tx->is_prefetch_mode()) return 0;
+  if (tx->tx_plan_used()) return 0;
+
+  sync_autogen_statement(thd, tx);
+  if (tx->autogen_tail_staged(table_key)) return 0;
+  tx->mark_autogen_tail_staged(table_key);
+
+  // One plain primary scan step: last-N of the whole range. The server echoes
+  // the requested bounds as the staged entry's range, so the handler's
+  // ("", sentinel, reverse, N) lookup matches it exactly.
+  LineairDBProxy::ReadPlanStep step;
+  step.table_name = table_key;
+  step.is_scan = true;
+  step.reverse_scan = true;
+  step.scan_limit = window_rows;
+  step.end_key_prefix = lineairdb_keyenc::scan_end_sentinel();
+
+  std::vector<LineairDBProxy::ReadPlanStep> steps;
+  steps.push_back(std::move(step));
+  tx->execute_read_plan(steps);
+  return prefetch_abort_errno(thd, tx);
+}
+
 int prefetch_reject_unsupported(THD *thd, LineairDBTransaction *tx,
                                 const char *reason) {
   std::string msg = "LineairDB prefetch unsupported: ";

@@ -331,7 +331,7 @@ def _stop_metrics(samplers):
         fh.close()
 
 
-def setup_benchmark(benchmark, config_path, mysql_host, mysql_port):
+def setup_benchmark(benchmark, config_path, mysql_host, mysql_port, log_dir=None):
     """Reset DB, create schema, load data. Returns load_time or None on failure."""
     db_name = "benchbase"
 
@@ -345,6 +345,11 @@ def setup_benchmark(benchmark, config_path, mysql_host, mysql_port):
 
     print("  Creating schema + Loading data...")
     result = run_benchbase(benchmark, config_path, create=True, load=True, execute=False)
+    if log_dir:
+        try:
+            (Path(log_dir) / "benchbase_load.log").write_text(result.stdout + result.stderr)
+        except OSError as e:
+            print(f"  WARNING: could not save load log: {e}", file=sys.stderr)
     if result.returncode != 0:
         print(f"  ERROR during create/load:\n{result.stdout[-500:]}\n{result.stderr[-500:]}", file=sys.stderr)
         return None
@@ -840,7 +845,8 @@ def _run_bench(args, config_work, thread_list, result_base):
             print(f"  WARNING: CREATE had errors (may be OK for shared-storage)")
         load_time = 0
     else:
-        load_time = setup_benchmark(args.benchmark, config_work, args.mysql_host, args.mysql_port)
+        load_time = setup_benchmark(args.benchmark, config_work, args.mysql_host, args.mysql_port,
+                                    log_dir=result_base)
         if load_time is None:
             print("Setup failed.", file=sys.stderr)
             sys.exit(1)

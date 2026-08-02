@@ -119,6 +119,7 @@ public:
     autogen_stmt_resolved_ = false;
     autogen_stmt_handler_deferred_ = false;
     autogen_staged_roots_.clear();
+    autogen_tail_staged_.clear();
   }
   bool autogen_stmt_resolved() const { return autogen_stmt_resolved_; }
   void mark_autogen_stmt_resolved() { autogen_stmt_resolved_ = true; }
@@ -129,6 +130,13 @@ public:
   }
   void mark_autogen_root_staged(const void *root) {
     autogen_staged_roots_.insert(root);
+  }
+  // Key-less index_last tail windows staged this statement, keyed by table.
+  bool autogen_tail_staged(const std::string &table_key) const {
+    return autogen_tail_staged_.count(table_key) != 0;
+  }
+  void mark_autogen_tail_staged(const std::string &table_key) {
+    autogen_tail_staged_.insert(table_key);
   }
   bool is_autogen_stmt_handler_deferred() const {
     return autogen_stmt_handler_deferred_;
@@ -199,6 +207,7 @@ private:
   uint64_t autogen_query_id_{0};
   bool autogen_stmt_resolved_{false};
   std::unordered_set<const void*> autogen_staged_roots_;
+  std::unordered_set<std::string> autogen_tail_staged_;
   // Set when this statement's plan is built from the handler index access
   // (deferred legacy-DML path) instead of the QEP; a second handler access
   // then means an index merge the single staged range cannot serve.
