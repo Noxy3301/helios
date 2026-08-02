@@ -1,6 +1,9 @@
 #ifndef LINEAIRDB_PREFETCH_HH
 #define LINEAIRDB_PREFETCH_HH
 
+#include <cstdint>
+#include <string>
+
 class THD;
 class LineairDBTransaction;
 struct IndexSearchPlan;
@@ -64,6 +67,22 @@ bool prefetch_needs_legacy_dml_handler(THD *thd,
 int maybe_prefetch_for_legacy_dml_handler(
     THD *thd, LineairDBTransaction *tx, TABLE *table, uint index,
     const IndexSearchPlan &search);
+
+/**
+ * @brief Stage the reverse tail window for a key-less primary index_last seek
+ *        under statement-scoped prefetch, at most once per statement and table.
+ *
+ * The handler consumes the window through the ordinary staged-scan lookup,
+ * which registers the reverse+limit range for commit-time replay. `table_key`
+ * must be the key the handler passed to choose_table() so the staged entry and
+ * the lookup agree.
+ *
+ * @return 0 on success or skip (not prefetch mode / tx-scoped plan active).
+ *         Non-zero HA_ERR_* when the staging RPC aborted; propagate it.
+ */
+int maybe_prefetch_for_index_tail(THD *thd, LineairDBTransaction *tx,
+                                  const std::string &table_key,
+                                  uint64_t window_rows);
 
 /**
  * @brief Fail, loudly, a read surface or statement that prefetch mode cannot
