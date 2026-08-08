@@ -3,6 +3,7 @@
 
 #include <cstdlib>
 #include <iostream>
+#include <string_view>
 
 namespace {
 
@@ -11,15 +12,57 @@ bool env_enabled(const char* name) {
     return value != nullptr && value[0] != '\0' && value[0] != '0';
 }
 
+/**
+ * @brief Applies LINEAIRDB_COMMIT_DURABILITY (volatile|async|sync, default
+ * volatile rather than the library default). Anything else refuses startup: a
+ * mapped alias or a defaulted typo would label a measurement with a contract
+ * it did not run under.
+ */
+void configure_commit_durability(LineairDB::Config& config) {
+    config.commit_durability = LineairDB::Config::CommitDurability::Volatile;
+
+    const char* raw = std::getenv("LINEAIRDB_COMMIT_DURABILITY");
+    if (raw == nullptr) {
+        LOG_INFO("Commit durability: volatile (default)");
+        return;
+    }
+
+    const std::string_view mode(raw);
+    if (mode == "volatile") {
+        config.commit_durability = LineairDB::Config::CommitDurability::Volatile;
+    } else if (mode == "async") {
+        config.commit_durability = LineairDB::Config::CommitDurability::Async;
+    } else if (mode == "sync") {
+        config.commit_durability = LineairDB::Config::CommitDurability::Sync;
+    } else {
+        LOG_FATAL("Invalid LINEAIRDB_COMMIT_DURABILITY='%s': expected one of volatile, async, sync",
+                  raw);
+    }
+    LOG_INFO("Commit durability: %s", raw);
+}
+
+/**
+ * @brief Warns when a retired durability variable is set and ignores it:
+ * LINEAIRDB_COMMIT_DURABILITY alone decides the contract, and no combination
+ * of the retired knobs expresses Async.
+ */
+void warn_about_retired_durability_env() {
+    for (const char* name : {"LINEAIRDB_ENABLE_LOGGING", "LINEAIRDB_LOG_FSYNC"}) {
+        if (std::getenv(name) == nullptr) continue;
+        LOG_WARNING("%s is retired and ignored; use LINEAIRDB_COMMIT_DURABILITY", name);
+    }
+}
+
 }  // namespace
 
 DatabaseManager::DatabaseManager() {
     // Initialize lineairdb
     // TODO: make configurable
     LineairDB::Config conf;
+    warn_about_retired_durability_env();
+    configure_commit_durability(conf);
     conf.enable_checkpointing = false;
     conf.enable_recovery      = env_enabled("LINEAIRDB_ENABLE_RECOVERY");
-    conf.enable_logging       = env_enabled("LINEAIRDB_ENABLE_LOGGING");
     conf.max_thread           = 1;
     conf.concurrency_control_protocol = LineairDB::Config::ConcurrencyControl::Silo;
     conf.index_structure = LineairDB::Config::IndexStructure::Masstree;
