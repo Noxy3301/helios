@@ -1,15 +1,43 @@
 #include "database_manager.hh"
 #include "../../common/log.h"
 
+#include <charconv>
 #include <cstdlib>
 #include <iostream>
 #include <string_view>
 
 namespace {
 
+constexpr size_t kMinEpochDurationMs = 1;
+constexpr size_t kMaxEpochDurationMs = 10000;
+
 bool env_enabled(const char* name) {
     const char* value = std::getenv(name);
     return value != nullptr && value[0] != '\0' && value[0] != '0';
+}
+
+/**
+ * @brief Applies LINEAIRDB_EPOCH_DURATION_MS, keeping the LineairDB default
+ * when it is unset. The epoch window is the knob the durability sweep varies,
+ * so a value that does not parse exactly is a startup error rather than a
+ * silent fallback that would mislabel every measurement taken with it.
+ */
+void configure_epoch_duration(LineairDB::Config& config) {
+    const char* raw = std::getenv("LINEAIRDB_EPOCH_DURATION_MS");
+    if (raw == nullptr) return;
+
+    const std::string_view input(raw);
+    size_t parsed          = 0;
+    const auto [end, error] =
+        std::from_chars(input.data(), input.data() + input.size(), parsed, 10);
+    const bool consumed_all = end == input.data() + input.size();
+    if (input.empty() || error != std::errc{} || !consumed_all ||
+        parsed < kMinEpochDurationMs || parsed > kMaxEpochDurationMs) {
+        LOG_FATAL("Invalid LINEAIRDB_EPOCH_DURATION_MS='%s': expected an integer in [%zu,%zu]",
+                  raw, kMinEpochDurationMs, kMaxEpochDurationMs);
+    }
+    config.epoch_duration_ms = parsed;
+    LOG_INFO("Epoch duration set to %zu ms", parsed);
 }
 
 /**
@@ -60,6 +88,7 @@ DatabaseManager::DatabaseManager() {
     // TODO: make configurable
     LineairDB::Config conf;
     warn_about_retired_durability_env();
+    configure_epoch_duration(conf);
     configure_commit_durability(conf);
     conf.enable_checkpointing = false;
     conf.enable_recovery      = env_enabled("LINEAIRDB_ENABLE_RECOVERY");
