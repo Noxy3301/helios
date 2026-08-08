@@ -2,6 +2,7 @@
 #include "../../common/log.h"
 
 #include <charconv>
+#include <cstdint>
 #include <cstdlib>
 #include <iostream>
 #include <string_view>
@@ -10,6 +11,9 @@ namespace {
 
 constexpr size_t kMinEpochDurationMs = 1;
 constexpr size_t kMaxEpochDurationMs = 10000;
+// A log larger than this is a mistyped value rather than an intended reservation:
+// the space is written out at startup and occupied for the life of the process.
+constexpr uint64_t kMaxWalCapacityBytes = 64ull * 1024ull * 1024ull * 1024ull;
 
 bool env_enabled(const char* name) {
     const char* value = std::getenv(name);
@@ -70,6 +74,32 @@ void configure_commit_durability(LineairDB::Config& config) {
 }
 
 /**
+ * @brief Applies LINEAIRDB_WAL_INITIAL_CAPACITY_BYTES. The log is written out
+ * with zeroes to this size at startup and records land in it in place, which
+ * keeps a commit's fdatasync from also persisting a new file size. A run wants
+ * the whole log to fit: extending is synchronous, and the flush it stalls is
+ * one a Sync commit is waiting on.
+ */
+void configure_wal_capacity(LineairDB::Config& config) {
+    const char* raw = std::getenv("LINEAIRDB_WAL_INITIAL_CAPACITY_BYTES");
+    if (raw == nullptr) return;
+
+    const std::string_view input(raw);
+    uint64_t parsed          = 0;
+    const auto [end, error] =
+        std::from_chars(input.data(), input.data() + input.size(), parsed, 10);
+    const bool consumed_all = end == input.data() + input.size();
+    if (input.empty() || error != std::errc{} || !consumed_all ||
+        parsed > kMaxWalCapacityBytes) {
+        LOG_FATAL("Invalid LINEAIRDB_WAL_INITIAL_CAPACITY_BYTES='%s': expected an integer in [0,%llu]",
+                  raw, static_cast<unsigned long long>(kMaxWalCapacityBytes));
+    }
+    config.wal_initial_capacity_bytes = parsed;
+    LOG_INFO("WAL initial capacity set to %llu bytes",
+             static_cast<unsigned long long>(parsed));
+}
+
+/**
  * @brief Warns when a retired durability variable is set and ignores it:
  * LINEAIRDB_COMMIT_DURABILITY alone decides the contract, and no combination
  * of the retired knobs expresses Async.
@@ -90,6 +120,7 @@ DatabaseManager::DatabaseManager() {
     warn_about_retired_durability_env();
     configure_epoch_duration(conf);
     configure_commit_durability(conf);
+    configure_wal_capacity(conf);
     conf.enable_checkpointing = false;
     conf.enable_recovery      = env_enabled("LINEAIRDB_ENABLE_RECOVERY");
     conf.max_thread           = 1;
