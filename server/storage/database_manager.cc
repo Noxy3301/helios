@@ -13,7 +13,10 @@ constexpr size_t kMinEpochDurationMs = 1;
 constexpr size_t kMaxEpochDurationMs = 10000;
 // A log larger than this is a mistyped value rather than an intended reservation:
 // the space is written out at startup and occupied for the life of the process.
-constexpr uint64_t kMaxWalCapacityBytes = 64ull * 1024ull * 1024ull * 1024ull;
+constexpr uint64_t kMaxWalCapacityBytes = 64ull * 1024ull * 1024ull * 1024ull;  // 64 GiB
+// A day between images is already far past any run this serves; beyond it the
+// value is a mistyped one rather than a cadence.
+constexpr size_t kMaxCheckpointIntervalMs = 24ull * 60ull * 60ull * 1000ull;  // one day
 
 bool env_enabled(const char* name) {
     const char* value = std::getenv(name);
@@ -100,6 +103,49 @@ void configure_wal_capacity(LineairDB::Config& config) {
 }
 
 /**
+ * @brief Reads one millisecond count, refusing anything that does not parse
+ * exactly. A checkpoint knob that silently fell back to its default would
+ * leave a run labelled with a cadence it never had.
+ */
+size_t parse_milliseconds(const char* name, const char* raw) {
+    const std::string_view input(raw);
+    size_t parsed           = 0;
+    const auto [end, error] =
+        std::from_chars(input.data(), input.data() + input.size(), parsed, 10);
+    const bool consumed_all = end == input.data() + input.size();
+    if (input.empty() || error != std::errc{} || !consumed_all ||
+        parsed > kMaxCheckpointIntervalMs) {
+        LOG_FATAL("Invalid %s='%s': expected an integer in [0,%zu]", name, raw,
+                  kMaxCheckpointIntervalMs);
+    }
+    return parsed;
+}
+
+/**
+ * @brief Applies LINEAIRDB_CHECKPOINT_INTERVAL_MS and
+ * LINEAIRDB_CHECKPOINT_ONCE_AFTER_MS. The image is scanned while transactions
+ * keep running and shortens the log replay at startup; zero, the default,
+ * writes none.
+ */
+void configure_checkpoint(LineairDB::Config& config) {
+    const char* interval = std::getenv("LINEAIRDB_CHECKPOINT_INTERVAL_MS");
+    if (interval != nullptr) {
+        config.checkpoint_interval_ms =
+            parse_milliseconds("LINEAIRDB_CHECKPOINT_INTERVAL_MS", interval);
+    }
+    const char* once = std::getenv("LINEAIRDB_CHECKPOINT_ONCE_AFTER_MS");
+    if (once != nullptr) {
+        config.checkpoint_once_after_ms =
+            parse_milliseconds("LINEAIRDB_CHECKPOINT_ONCE_AFTER_MS", once);
+    }
+    if (config.checkpoint_interval_ms == 0 && config.checkpoint_once_after_ms == 0) {
+        return;
+    }
+    LOG_INFO("Checkpoint image: every %zu ms, one after %zu ms",
+             config.checkpoint_interval_ms, config.checkpoint_once_after_ms);
+}
+
+/**
  * @brief Warns when a retired durability variable is set and ignores it:
  * LINEAIRDB_COMMIT_DURABILITY alone decides the contract, and no combination
  * of the retired knobs expresses Async.
@@ -121,6 +167,7 @@ DatabaseManager::DatabaseManager() {
     configure_epoch_duration(conf);
     configure_commit_durability(conf);
     configure_wal_capacity(conf);
+    configure_checkpoint(conf);
     conf.enable_checkpointing = false;
     conf.enable_recovery      = env_enabled("LINEAIRDB_ENABLE_RECOVERY");
     conf.max_thread           = 1;
