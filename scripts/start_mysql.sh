@@ -65,6 +65,7 @@ echo "Step 2/5: Starting MySQL with InnoDB..."
   --max-connections=16384 \
   --open-files-limit=65535 \
   --table-open-cache=8192 \
+  --skip-name-resolve \
   --disable-log-bin >> "$MYSQL_LOG_FILE" 2>&1 &
 BOOT_PID=$!
 
@@ -79,6 +80,15 @@ echo "Step 4/5: Installing LineairDB plugin..."
 ./runtime_output_directory/mysql -u root --socket="$SOCKET" --port="$MYSQLD_PORT" \
   -e "INSTALL PLUGIN lineairdb_columnar SONAME 'ha_lineairdb_storage_engine.so';" 2>/dev/null || true
 
+# --skip-name-resolve makes TCP clients match accounts by IP literal only;
+# 'root'@'localhost' stays socket-only, so create loopback root accounts.
+./runtime_output_directory/mysql -u root --socket="$SOCKET" --port="$MYSQLD_PORT" \
+  -e "CREATE USER IF NOT EXISTS 'root'@'127.0.0.1' IDENTIFIED WITH mysql_native_password BY '';
+      GRANT ALL PRIVILEGES ON *.* TO 'root'@'127.0.0.1' WITH GRANT OPTION;
+      CREATE USER IF NOT EXISTS 'root'@'::1' IDENTIFIED WITH mysql_native_password BY '';
+      GRANT ALL PRIVILEGES ON *.* TO 'root'@'::1' WITH GRANT OPTION;
+      FLUSH PRIVILEGES;" 2>/dev/null || true
+
 echo "Step 5/5: Stopping MySQL and restarting with LineairDB as default..."
 kill "$BOOT_PID" 2>/dev/null || true
 wait "$BOOT_PID" 2>/dev/null || true
@@ -89,6 +99,7 @@ nohup ./runtime_output_directory/mysqld --datadir="$DATA_DIR" --socket="$SOCKET"
   --max-connections=16384 \
   --open-files-limit=65535 \
   --table-open-cache=8192 \
+  --skip-name-resolve \
   --disable-log-bin >> "$MYSQL_LOG_FILE" 2>&1 &
 MYSQL_PID=$!
 disown "$MYSQL_PID" 2>/dev/null || true
@@ -99,6 +110,11 @@ done
 
 ./runtime_output_directory/mysql -u root --socket="$SOCKET" --port="$MYSQLD_PORT" \
   -e "SET GLOBAL lineairdb_server_host='${SERVER_HOST}'; SET GLOBAL lineairdb_server_port=${SERVER_PORT};" >/dev/null
+
+# Prove the loopback root account authenticates over TCP: every check above
+# runs on the socket and would report success even if provisioning failed.
+./runtime_output_directory/mysql -u root --protocol=TCP --host=127.0.0.1 --port="$MYSQLD_PORT" \
+  -e "SELECT 1;" >/dev/null
 
 echo "MySQL running with LineairDB"
 echo "PID       : $MYSQL_PID"
