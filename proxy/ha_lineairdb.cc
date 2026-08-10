@@ -135,6 +135,7 @@
 static char *srv_server_host = nullptr;
 static ulong srv_server_port = 9999;
 static bool srv_prefetch_execution = false;
+bool srv_stats_drift_refresh = false;
 handlerton *lineairdb_hton;
 
 // THD-scoped context
@@ -714,10 +715,19 @@ static MYSQL_SYSVAR_BOOL(prefetch_execution, srv_prefetch_execution,
                          PLUGIN_VAR_OPCMDARG,
                          "Enable experimental prefetch execution.", nullptr,
                          nullptr, false);
+static MYSQL_SYSVAR_BOOL(stats_drift_refresh, srv_stats_drift_refresh,
+                         PLUGIN_VAR_OPCMDARG,
+                         "Automatically refresh index statistics before SELECT "
+                         "when the row-count difference exceeds 20% of the "
+                         "larger count. Disabled by default because the "
+                         "synchronous refresh scans every requested index on "
+                         "the server.",
+                         nullptr, nullptr, false);
 static SYS_VAR *lineairdb_system_variables[] = {
     MYSQL_SYSVAR(server_host),
     MYSQL_SYSVAR(server_port),
     MYSQL_SYSVAR(prefetch_execution),
+    MYSQL_SYSVAR(stats_drift_refresh),
     MYSQL_SYSVAR(enum_var),
     MYSQL_SYSVAR(ulong_var),
     MYSQL_SYSVAR(double_var),

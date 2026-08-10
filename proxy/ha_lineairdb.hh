@@ -120,6 +120,11 @@ RangeScanLimit range_scan_limit_for_order(THD *thd, const KEY *key,
                                           uint matched_prefix,
                                           bool has_mysql_only_filter);
 
+// Enables automatic index-statistics refresh before SELECT when the row-count
+// drift exceeds 20% of the larger count; the synchronous refresh can scan every
+// requested index. Initial loading and ANALYZE TABLE are independent of it.
+extern bool srv_stats_drift_refresh;
+
 namespace lineairdb {
 
 /**

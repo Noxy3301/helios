@@ -127,6 +127,9 @@ void ha_lineairdb::load_index_stats_from_cache(LineairDBProxy *proxy) {
 }
 
 void ha_lineairdb::mark_stale_index_ndv_for_select() {
+  if (!srv_stats_drift_refresh)
+    return;
+
   if (share == nullptr ||
       !share->index_ndv_loaded_.load(std::memory_order_relaxed))
     return;
