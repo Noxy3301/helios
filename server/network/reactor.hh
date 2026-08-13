@@ -17,18 +17,20 @@
 // (see tcp_server.cc). Each Reactor owns one epoll fd, one physical-core-
 // pinned thread, and a set of non-blocking connections.
 //
-// Per epoll wakeup: read all available bytes, parsing after every chunk so a
-// header is vetted (frame length, opcode) the instant it becomes visible.
-// Fast-path opcodes (TcpServer::is_reactor_fast_path) run inline on this
-// thread via the connection's RpcDispatcher and their responses are
-// buffered/flushed here. Any other opcode triggers a one-way migration:
-// EPOLL_CTL_DEL, restore blocking mode, hand the fd plus a byte-exact primer
-// (the triggering frame + any bytes already read after it) to a dedicated
-// legacy thread. This reactor never touches the fd again after that.
+// The wire protocol is strict request-response with in-flight <= 1 per
+// connection, enforced here: at most one complete frame is dispatched per
+// read, and any bytes trailing it (a pipelined next request, or a partial
+// tail) are a protocol violation that closes the connection. Fast-path
+// opcodes (TcpServer::is_reactor_fast_path) run inline on this thread via
+// the connection's RpcDispatcher and their responses are buffered/flushed
+// here. Any other opcode triggers a one-way migration: EPOLL_CTL_DEL,
+// restore blocking mode, hand the fd plus a byte-exact primer (exactly the
+// triggering frame -- the strictness check guarantees nothing follows it)
+// to a dedicated legacy thread. This reactor never touches the fd again
+// after that.
 //
-// There is no per-connection state machine or lane classification here; the
-// inline fast set is deliberately narrow (two stateless opcodes), so every
-// conversational opcode migrates.
+// There is no lane classification here; the inline fast set is deliberately
+// narrow (two stateless opcodes), so every conversational opcode migrates.
 class Reactor {
  public:
   // RPC dispatch surface a connection uses on the fast path. One instance is
@@ -62,8 +64,18 @@ class Reactor {
   void add_connection(int fd, std::unique_ptr<RpcDispatcher> dispatcher);
 
  private:
+  // kArmed: idle, no response owed; the only state in which inbound bytes
+  // are legal. kResponding: a response is queued and/or still flushing.
+  // kClosing: close_connection has claimed this connection (terminal).
+  enum class State { kArmed, kResponding, kClosing };
+
   struct Connection {
     int fd = -1;
+    uint64_t connection_id = 0;  // process-unique, assigned in add_connection
+    uint64_t generation = 0;     // reserved: revalidates completions against
+                                 // connection_id once work can leave this
+                                 // thread; nothing bumps it yet
+    State state = State::kArmed;
     std::string read_buf;
     std::string write_buf;
     size_t write_cursor = 0;  // bytes in write_buf[0, write_cursor) already sent
@@ -73,16 +85,19 @@ class Reactor {
 
   struct PendingConn {
     int fd;
+    uint64_t connection_id;
     std::unique_ptr<RpcDispatcher> dispatcher;
   };
 
   void run();
   void drain_pending_adds();
   void on_readable(Connection &conn);
-  // Parses+dispatches every complete, validated frame currently buffered.
-  // Returns false if the connection is no longer owned by this reactor
-  // (migrated, or closed on a validation/error) -- caller must not touch
-  // `conn` again in that case.
+  // Parses and dispatches at most one complete frame from read_buf: the
+  // wire protocol is strict request-response with in-flight <= 1, so any
+  // bytes left after that frame (a pipelined request, or even a partial
+  // tail) are a protocol violation, not more work to do. Returns false if
+  // the connection is no longer owned by this reactor (migrated or closed)
+  // -- caller must not touch `conn` again in that case.
   bool parse_and_dispatch(Connection &conn);
   // Buffers a response frame. Returns false if that would push
   // conn.write_buf over the frame-buffer cap, in which case the caller must
@@ -92,9 +107,11 @@ class Reactor {
   // false if the connection should be closed.
   bool flush_writes(Connection &conn);
   void close_connection(int fd);
-  // `frame_start` is the offset in conn.read_buf of the frame that forced
-  // migration; erases conn from this reactor and hands the fd off.
-  void migrate_connection(Connection &conn, size_t frame_start);
+  // `frame_start`/`frame_len` locate the frame that forced migration inside
+  // conn.read_buf. Erases conn from this reactor and hands the fd off --
+  // unless the handoff would not be byte-exact (undrained write_buf or
+  // trailing read_buf bytes), in which case it closes instead.
+  void migrate_connection(Connection &conn, size_t frame_start, size_t frame_len);
 
   int id_;
   int pin_to_core_;

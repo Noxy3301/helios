@@ -19,20 +19,25 @@ namespace {
 
 // Logs and returns false when a decoded frame header violates the payload
 // cap or names an undefined opcode (0, or a gap in the generated enum).
-// Shared by the per-header check inside the parse loop.
-bool frame_header_ok(int reactor_id, int fd, uint32_t payload_size, uint32_t raw_type) {
+// Shared by the per-header check in parse_and_dispatch.
+bool frame_header_ok(int reactor_id, int fd, uint64_t conn_id, uint32_t payload_size,
+                      uint32_t raw_type) {
   if (payload_size > kMaxRpcPayloadBytes) {
-    LOG_ERROR("Reactor %d: fd=%d payload_size=%u exceeds cap %u (opcode=%u); closing",
-              reactor_id, fd, payload_size, kMaxRpcPayloadBytes, raw_type);
+    LOG_ERROR("Reactor %d: fd=%d conn=%lu payload_size=%u exceeds cap %u (opcode=%u); closing",
+              reactor_id, fd, conn_id, payload_size, kMaxRpcPayloadBytes, raw_type);
     return false;
   }
   if (!LineairDB::Protocol::OpCode_IsValid(static_cast<int>(raw_type)) || raw_type == 0) {
-    LOG_ERROR("Reactor %d: fd=%d undefined opcode=%u (payload_size=%u); closing",
-              reactor_id, fd, raw_type, payload_size);
+    LOG_ERROR("Reactor %d: fd=%d conn=%lu undefined opcode=%u (payload_size=%u); closing",
+              reactor_id, fd, conn_id, raw_type, payload_size);
     return false;
   }
   return true;
 }
+
+// Process-unique connection ids, monotonically increasing across all
+// reactors and across fd reuse.
+std::atomic<uint64_t> g_next_connection_id{1};
 
 }  // namespace
 
@@ -68,9 +73,10 @@ Reactor::~Reactor() {
 
 void Reactor::add_connection(int fd, std::unique_ptr<RpcDispatcher> dispatcher) {
   conn_count_.fetch_add(1, std::memory_order_relaxed);
+  uint64_t conn_id = g_next_connection_id.fetch_add(1, std::memory_order_relaxed);
   {
     std::lock_guard<std::mutex> lock(pending_mu_);
-    pending_.push_back(PendingConn{fd, std::move(dispatcher)});
+    pending_.push_back(PendingConn{fd, conn_id, std::move(dispatcher)});
   }
   uint64_t one = 1;
   if (write(wake_fd_, &one, sizeof(one)) < 0 && errno != EAGAIN) {
@@ -87,13 +93,15 @@ void Reactor::drain_pending_adds() {
   for (auto &p : pending) {
     auto conn = std::make_unique<Connection>();
     conn->fd = p.fd;
+    conn->connection_id = p.connection_id;
     conn->dispatcher = std::move(p.dispatcher);
 
     struct epoll_event ev {};
     ev.events = EPOLLIN;
     ev.data.fd = p.fd;
     if (epoll_ctl(epoll_fd_, EPOLL_CTL_ADD, p.fd, &ev) != 0) {
-      LOG_ERROR("Reactor %d: epoll_ctl(ADD fd=%d) failed: %s", id_, p.fd, std::strerror(errno));
+      LOG_ERROR("Reactor %d: fd=%d conn=%lu epoll_ctl(ADD) failed: %s",
+                id_, p.fd, p.connection_id, std::strerror(errno));
       close(p.fd);
       conn_count_.fetch_sub(1, std::memory_order_relaxed);
       continue;
@@ -169,14 +177,22 @@ void Reactor::on_readable(Connection &conn) {
   while (true) {
     ssize_t n = recv(conn.fd, buf, sizeof(buf), 0);
     if (n > 0) {
+      // Strict request-response, in-flight <= 1: a compliant client never
+      // sends more bytes while a response is still owed.
+      if (conn.state != State::kArmed) {
+        LOG_ERROR("Reactor %d: fd=%d conn=%lu sent %zd bytes while not armed (state=%d); closing",
+                  id_, conn.fd, conn.connection_id, n, static_cast<int>(conn.state));
+        close_connection(conn.fd);
+        return;
+      }
       // Reject before appending: serving or migrating a frame that only fits
       // in the buffer because the cap was checked after the fact would let a
       // staged near-max frame plus a pipelined tail bypass the cap entirely.
       size_t current = conn.read_buf.size();
       size_t budget = current < kMaxRpcBufferBytes ? kMaxRpcBufferBytes - current : 0;
       if (static_cast<size_t>(n) > budget) {
-        LOG_ERROR("Reactor %d: fd=%d read_buf %zu + chunk %zd bytes would exceed cap %zu; closing",
-                  id_, conn.fd, current, n, kMaxRpcBufferBytes);
+        LOG_ERROR("Reactor %d: fd=%d conn=%lu read_buf %zu + chunk %zd bytes would exceed cap %zu; closing",
+                  id_, conn.fd, conn.connection_id, current, n, kMaxRpcBufferBytes);
         close_connection(conn.fd);
         return;
       }
@@ -185,8 +201,8 @@ void Reactor::on_readable(Connection &conn) {
       if (conn.read_buf.size() > kMaxRpcBufferBytes) {
         // Backstop only: the pre-append check above already rejects any
         // chunk that would cross the cap, so this can't trigger on its own.
-        LOG_ERROR("Reactor %d: fd=%d read_buf %zu bytes exceeds cap %zu; closing",
-                  id_, conn.fd, conn.read_buf.size(), kMaxRpcBufferBytes);
+        LOG_ERROR("Reactor %d: fd=%d conn=%lu read_buf %zu bytes exceeds cap %zu; closing",
+                  id_, conn.fd, conn.connection_id, conn.read_buf.size(), kMaxRpcBufferBytes);
         close_connection(conn.fd);
         return;
       }
@@ -198,7 +214,8 @@ void Reactor::on_readable(Connection &conn) {
     }
     if (errno == EAGAIN || errno == EWOULDBLOCK) break;
     if (errno == EINTR) continue;
-    LOG_ERROR("Reactor %d: recv fd=%d failed: %s", id_, conn.fd, std::strerror(errno));
+    LOG_ERROR("Reactor %d: fd=%d conn=%lu recv failed: %s",
+              id_, conn.fd, conn.connection_id, std::strerror(errno));
     close_connection(conn.fd);
     return;
   }
@@ -207,47 +224,55 @@ void Reactor::on_readable(Connection &conn) {
 }
 
 bool Reactor::parse_and_dispatch(Connection &conn) {
-  size_t cursor = 0;
+  // A dispatched frame always starts at offset 0: any earlier frame on this
+  // connection was either erased after dispatch or closed the connection,
+  // so read_buf never carries more than one request's worth of bytes across
+  // calls.
   const std::string &buf = conn.read_buf;
+  if (buf.size() < sizeof(MessageHeader)) return true;  // wait for more bytes
 
-  while (true) {
-    size_t remaining = buf.size() - cursor;
-    if (remaining < sizeof(MessageHeader)) break;
+  MessageHeader hdr{};
+  std::memcpy(&hdr, buf.data(), sizeof(hdr));
+  uint32_t payload_size = ntohl(hdr.payload_size);
+  MessageType message_type = static_cast<MessageType>(ntohl(hdr.message_type));
 
-    MessageHeader hdr{};
-    std::memcpy(&hdr, buf.data() + cursor, sizeof(hdr));
-    uint32_t payload_size = ntohl(hdr.payload_size);
-    MessageType message_type = static_cast<MessageType>(ntohl(hdr.message_type));
-
-    // Validate length and opcode as soon as the header is visible, even for
-    // a frame whose payload has not fully arrived yet.
-    if (!frame_header_ok(id_, conn.fd, payload_size, static_cast<uint32_t>(message_type))) {
-      close_connection(conn.fd);
-      return false;
-    }
-
-    size_t frame_len = sizeof(MessageHeader) + payload_size;
-    if (remaining < frame_len) break;  // wait for more bytes
-
-    uint64_t sender_id = be64toh(hdr.sender_id);
-
-    if (!is_fast_path_(message_type)) {
-      migrate_connection(conn, cursor);  // erases conn; do not touch it after this
-      return false;
-    }
-
-    std::string payload = buf.substr(cursor + sizeof(MessageHeader), payload_size);
-    std::string result;
-    conn.dispatcher->handle_rpc(sender_id, message_type, payload, result);
-    if (!queue_response(conn, message_type, result)) {
-      close_connection(conn.fd);  // erases conn; do not touch it after this
-      return false;
-    }
-
-    cursor += frame_len;
+  // Validate length and opcode as soon as the header is visible, even for a
+  // frame whose payload has not fully arrived yet.
+  if (!frame_header_ok(id_, conn.fd, conn.connection_id, payload_size,
+                        static_cast<uint32_t>(message_type))) {
+    close_connection(conn.fd);
+    return false;
   }
 
-  if (cursor > 0) conn.read_buf.erase(0, cursor);
+  size_t frame_len = sizeof(MessageHeader) + payload_size;
+  if (buf.size() < frame_len) return true;  // wait for the rest of this frame
+
+  uint64_t sender_id = be64toh(hdr.sender_id);
+
+  if (!is_fast_path_(message_type)) {
+    migrate_connection(conn, 0, frame_len);  // erases conn; do not touch it after this
+    return false;
+  }
+
+  std::string payload = buf.substr(sizeof(MessageHeader), payload_size);
+  std::string result;
+  conn.dispatcher->handle_rpc(sender_id, message_type, payload, result);
+  if (!queue_response(conn, message_type, result)) {
+    close_connection(conn.fd);  // erases conn; do not touch it after this
+    return false;
+  }
+
+  // In-flight <= 1: nothing may follow this request until its response is
+  // delivered. Any leftover bytes -- a pipelined next request, or even a
+  // partial tail -- are a protocol violation, not more work to do.
+  conn.read_buf.erase(0, frame_len);
+  if (!conn.read_buf.empty()) {
+    LOG_ERROR("Reactor %d: fd=%d conn=%lu %zu bytes follow a request before its response "
+              "was delivered (pipelining); closing",
+              id_, conn.fd, conn.connection_id, conn.read_buf.size());
+    close_connection(conn.fd);  // erases conn; do not touch it after this
+    return false;
+  }
   return true;
 }
 
@@ -256,26 +281,26 @@ bool Reactor::queue_response(Connection &conn, MessageType message_type, const s
   // never be allocated into write_buf (nor have its length narrowed into the
   // u32 header field) before the check runs.
   if (result.size() > kMaxRpcPayloadBytes) {
-    LOG_ERROR("Reactor %d: fd=%d response %zu bytes exceeds frame cap %u",
-              id_, conn.fd, result.size(), kMaxRpcPayloadBytes);
+    LOG_ERROR("Reactor %d: fd=%d conn=%lu response %zu bytes exceeds frame cap %u",
+              id_, conn.fd, conn.connection_id, result.size(), kMaxRpcPayloadBytes);
     return false;
   }
   if (conn.write_buf.size() + sizeof(MessageHeader) + result.size() > kMaxRpcBufferBytes) {
-    LOG_ERROR("Reactor %d: fd=%d write_buf %zu bytes would exceed cap %zu",
-              id_, conn.fd, conn.write_buf.size() + sizeof(MessageHeader) + result.size(),
-              kMaxRpcBufferBytes);
+    LOG_ERROR("Reactor %d: fd=%d conn=%lu write_buf %zu bytes would exceed cap %zu",
+              id_, conn.fd, conn.connection_id,
+              conn.write_buf.size() + sizeof(MessageHeader) + result.size(), kMaxRpcBufferBytes);
     return false;
   }
 
   // Same wire format as MessageHandler::send_response{,_writev} (responses
-  // always carry sender_id=0); buffered so a burst of fast-path frames from
-  // one wakeup shares a single flush.
+  // always carry sender_id=0).
   MessageHeader header{};
   header.sender_id = htobe64(0);
   header.message_type = htonl(static_cast<uint32_t>(message_type));
   header.payload_size = htonl(static_cast<uint32_t>(result.size()));
   conn.write_buf.append(reinterpret_cast<const char *>(&header), sizeof(header));
   conn.write_buf.append(result);
+  conn.state = State::kResponding;
   return true;
 }
 
@@ -298,12 +323,14 @@ bool Reactor::flush_writes(Connection &conn) {
       }
       return true;  // partial write buffered, not an error
     }
-    LOG_ERROR("Reactor %d: send fd=%d failed: %s", id_, conn.fd, std::strerror(errno));
+    LOG_ERROR("Reactor %d: fd=%d conn=%lu send failed: %s",
+              id_, conn.fd, conn.connection_id, std::strerror(errno));
     return false;
   }
 
   conn.write_buf.clear();
   conn.write_cursor = 0;
+  conn.state = State::kArmed;
   if (conn.want_epollout) {
     struct epoll_event ev {};
     ev.events = EPOLLIN;
@@ -315,46 +342,73 @@ bool Reactor::flush_writes(Connection &conn) {
 }
 
 void Reactor::close_connection(int fd) {
-  epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, fd, nullptr);
+  uint64_t conn_id = 0;
+  auto it = connections_.find(fd);
+  if (it != connections_.end()) {
+    conn_id = it->second->connection_id;
+    it->second->state = State::kClosing;
+  }
+
+  // Best-effort: this fd may already be out of the epoll set (e.g. a
+  // migration attempt that failed after its own EPOLL_CTL_DEL).
+  if (epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, fd, nullptr) != 0 && errno != EBADF && errno != ENOENT) {
+    LOG_WARNING("Reactor %d: fd=%d conn=%lu epoll_ctl(DEL) failed during close: %s",
+                id_, fd, conn_id, std::strerror(errno));
+  }
   close(fd);
   connections_.erase(fd);
   conn_count_.fetch_sub(1, std::memory_order_relaxed);
-  LOG_INFO("Reactor %d: closed connection fd=%d", id_, fd);
+  LOG_INFO("Reactor %d: closed connection fd=%d conn=%lu", id_, fd, conn_id);
 }
 
-void Reactor::migrate_connection(Connection &conn, size_t frame_start) {
+void Reactor::migrate_connection(Connection &conn, size_t frame_start, size_t frame_len) {
   int fd = conn.fd;
-  // Byte-exact handoff: the frame that forced migration plus whatever else
-  // was already read after it.
-  std::string primer = conn.read_buf.substr(frame_start);
+  uint64_t conn_id = conn.connection_id;
+
+  // Strict protocol, in-flight <= 1: the handoff primer must be exactly the
+  // triggering frame. An undrained response or any trailing bytes in
+  // read_buf (a pipelined request, or a partial tail) mean the client broke
+  // the contract -- refuse the migration and close instead.
+  if (conn.write_cursor < conn.write_buf.size() || frame_start + frame_len != conn.read_buf.size()) {
+    LOG_ERROR("Reactor %d: fd=%d conn=%lu protocol violation at migration "
+              "(write_buf undrained=%zu bytes, read_buf trailing=%zu bytes); closing",
+              id_, fd, conn_id, conn.write_buf.size() - conn.write_cursor,
+              conn.read_buf.size() - (frame_start + frame_len));
+    close_connection(fd);  // erases conn; do not touch it after this
+    return;
+  }
+
+  // Byte-exact handoff: exactly the frame that forced migration.
+  std::string primer = conn.read_buf.substr(frame_start, frame_len);
 
   // Single owner from here on: detach from this reactor's epoll set before
   // anything else touches the fd.
-  epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, fd, nullptr);
+  if (epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, fd, nullptr) != 0) {
+    LOG_ERROR("Reactor %d: fd=%d conn=%lu epoll_ctl(DEL) failed during migration: %s; closing",
+              id_, fd, conn_id, std::strerror(errno));
+    close_connection(fd);  // erases conn; do not touch it after this
+    return;
+  }
 
-  // Restore blocking mode, then best-effort flush whatever this reactor
-  // already owes for earlier frames in this same batch -- the legacy
-  // thread's first read must be the primer, not a race with our own
-  // trailing writes.
+  // Restore blocking mode for the legacy thread's synchronous read/write.
   int flags = fcntl(fd, F_GETFL, 0);
-  if (flags >= 0) fcntl(fd, F_SETFL, flags & ~O_NONBLOCK);
-
-  size_t off = conn.write_cursor;
-  while (off < conn.write_buf.size()) {
-    ssize_t n = send(fd, conn.write_buf.data() + off, conn.write_buf.size() - off, MSG_NOSIGNAL);
-    if (n > 0) {
-      off += static_cast<size_t>(n);
-      continue;
-    }
-    if (n < 0 && errno == EINTR) continue;
-    LOG_ERROR("Reactor %d: pre-migration flush failed fd=%d: %s", id_, fd, std::strerror(errno));
-    break;  // best-effort; hand off regardless, legacy loop will surface any real break on recv
+  if (flags < 0) {
+    LOG_ERROR("Reactor %d: fd=%d conn=%lu fcntl(F_GETFL) failed during migration: %s; closing",
+              id_, fd, conn_id, std::strerror(errno));
+    close_connection(fd);  // erases conn; do not touch it after this
+    return;
+  }
+  if (fcntl(fd, F_SETFL, flags & ~O_NONBLOCK) != 0) {
+    LOG_ERROR("Reactor %d: fd=%d conn=%lu fcntl(F_SETFL) failed during migration: %s; closing",
+              id_, fd, conn_id, std::strerror(errno));
+    close_connection(fd);  // erases conn; do not touch it after this
+    return;
   }
 
   connections_.erase(fd);  // destroys `conn`; nothing below may touch it
   conn_count_.fetch_sub(1, std::memory_order_relaxed);
 
-  LOG_INFO("Reactor %d: migrating fd=%d to a legacy thread (%zu primed bytes)",
-           id_, fd, primer.size());
+  LOG_INFO("Reactor %d: migrating fd=%d conn=%lu to a legacy thread (%zu primed bytes)",
+           id_, fd, conn_id, primer.size());
   migrate_(fd, std::move(primer));
 }
