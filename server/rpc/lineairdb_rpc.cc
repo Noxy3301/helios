@@ -64,13 +64,19 @@ void LineairDBRpc::handle_rpc(uint64_t sender_id, MessageType message_type,
             release_masstree_thread_epoch();
             return;
         case MessageType::TX_VALIDATE_AND_COMMIT:
-            rpc_timing::time_call(message_type, [&] { handleTxValidateAndCommit(message, result); });
+            // Variant-tagged overload (fence/entries/frame-size/response-size/
+            // stats-size), see rpc_timing.hh.
+            rpc_timing::time_call(message_type, message, result,
+                                  [&] { handleTxValidateAndCommit(message, result); });
             release_masstree_thread_epoch();
             return;
 
         // Read-plan execution
         case MessageType::TX_EXECUTE_READ_PLAN:
-            rpc_timing::time_call(message_type, [&] { handleTxExecuteReadPlan(message, result); });
+            // Variant-tagged overload (steps/scan_limit/inspected-rows/
+            // response-size), see rpc_timing.hh.
+            rpc_timing::time_call(message_type, message, result,
+                                  [&] { handleTxExecuteReadPlan(message, result); });
             release_masstree_thread_epoch();
             return;
         case MessageType::TX_EXECUTE_SQL_DUCKDB:

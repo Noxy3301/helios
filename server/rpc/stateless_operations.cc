@@ -5,6 +5,7 @@
 #include <vector>
 
 #include "lineairdb.pb.h"
+#include "rpc_timing.hh"
 
 // Stateless read and client-driven OCC commit handlers: these act on the
 // database directly and carry no server-side transaction state.
@@ -129,6 +130,15 @@ void LineairDBRpc::handleTxValidateAndCommit(const std::string& message,
         ts->set_table_name(name);
         ts->set_row_count(count);
     }
+
+    // The table-stats snapshot is currently unbounded (every table the
+    // server knows about, not just the ones this tx touched) -- measure its
+    // serialized weight for rpc_timing's per-variant breakdown.
+    uint64_t stats_bytes = 0;
+    for (const auto& ts : response.table_stats()) {
+        stats_bytes += ts.ByteSizeLong();
+    }
+    rpc_timing::note_commit_stats_bytes(stats_bytes);
 
     result = response.SerializeAsString();
 }

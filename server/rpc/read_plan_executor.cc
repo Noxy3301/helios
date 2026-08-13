@@ -1,6 +1,7 @@
 #include "lineairdb_rpc.hh"
 
 #include <algorithm>
+#include <atomic>
 #include <cstdint>
 #include <string_view>
 #include <thread>
@@ -17,11 +18,22 @@
 #include "parallel_scan.hh"
 #include "predicate_evaluator.hh"
 #include "row_codec.hh"
+#include "rpc_timing.hh"
 
 // Read-plan execution: the TX_EXECUTE_READ_PLAN handler and its plan-key
 // binding glue. Runs staged scans and semijoin probes.
 
 namespace {
+
+// Reports this call's total inspected/probed row count (server/rpc
+// boundary: rows pulled out of scan_result/read results across all steps,
+// serial and parallel-worker branches, before row_passes/semijoin
+// filtering) to rpc_timing on scope exit, regardless of which of
+// handleTxExecuteReadPlan's several return points is taken.
+struct InspectedRowsReporter {
+    std::atomic<uint64_t>* counter;
+    ~InspectedRowsReporter() { rpc_timing::note_inspected_rows(counter->load()); }
+};
 
 // Pick the source byte string for a binding (from a step's scan key, scan value, or value).
 const std::string* select_source_bytes(
@@ -156,6 +168,12 @@ void LineairDBRpc::handleTxExecuteReadPlan(const std::string& message,
     LineairDB::Protocol::TxExecuteReadPlan::Response response;
     request.ParseFromString(message);
     response.set_ok(true);
+
+    // Scoped to this call only, so concurrent calls on other threads never
+    // contaminate this count; parallel worker threads spawned below share it
+    // by reference and are joined before the reporter fires.
+    std::atomic<uint64_t> inspected_rows{0};
+    InspectedRowsReporter row_count_reporter{&inspected_rows};
 
     std::vector<LineairDB::Protocol::TxExecuteReadPlan::StepResult*>
         previous_results;
@@ -374,6 +392,9 @@ void LineairDBRpc::handleTxExecuteReadPlan(const std::string& message,
                                         failed[worker_index] = 1;
                                         break;
                                     }
+                                    inspected_rows.fetch_add(
+                                        scan_result.rows.size(),
+                                        std::memory_order_relaxed);
                                     for (auto& r : scan_result.rows) {
                                         if (!worker_row_passes(r.value))
                                             continue;
@@ -399,6 +420,9 @@ void LineairDBRpc::handleTxExecuteReadPlan(const std::string& message,
                                         failed[worker_index] = 1;
                                         break;
                                     }
+                                    inspected_rows.fetch_add(
+                                        scan_result.rows.size(),
+                                        std::memory_order_relaxed);
                                     for (auto& r : scan_result.rows) {
                                         if (!worker_row_passes(r.value))
                                             continue;
@@ -422,6 +446,8 @@ void LineairDBRpc::handleTxExecuteReadPlan(const std::string& message,
                                     db->StatelessRead(step.table_name(),
                                                       row_key,
                                                       selected_columns_for_reads);
+                                inspected_rows.fetch_add(
+                                    1, std::memory_order_relaxed);
                                 out.keys.push_back(row_key);
                                 out.tids.push_back(read_result.tid);
                                 if (read_result.found &&
@@ -498,6 +524,8 @@ void LineairDBRpc::handleTxExecuteReadPlan(const std::string& message,
                             flat_plan::encode_to_string(response, result);
                             return;
                         }
+                        inspected_rows.fetch_add(scan_result.rows.size(),
+                                                 std::memory_order_relaxed);
                         for (auto& r : scan_result.rows) {
                             if (!row_passes(r.value)) continue;
                             if (!semijoin_reductions.empty() &&
@@ -523,6 +551,8 @@ void LineairDBRpc::handleTxExecuteReadPlan(const std::string& message,
                             flat_plan::encode_to_string(response, result);
                             return;
                         }
+                        inspected_rows.fetch_add(scan_result.rows.size(),
+                                                 std::memory_order_relaxed);
                         for (auto& r : scan_result.rows) {
                             if (!row_passes(r.value)) continue;
                             if (!semijoin_reductions.empty() &&
@@ -549,6 +579,7 @@ void LineairDBRpc::handleTxExecuteReadPlan(const std::string& message,
                     db_manager_->get_database()->StatelessRead(
                         step.table_name(), row_key,
                         selected_columns_for_reads);
+                inspected_rows.fetch_add(1, std::memory_order_relaxed);
                 step_result->add_scan_keys(row_key);
                 step_result->add_scan_tids(read_result.tid);
                 if (read_result.found &&
@@ -573,6 +604,7 @@ void LineairDBRpc::handleTxExecuteReadPlan(const std::string& message,
             auto read_result =
                 db_manager_->get_database()->StatelessRead(
                     step.table_name(), start_key, selected_columns_for_reads);
+            inspected_rows.fetch_add(1, std::memory_order_relaxed);
             step_result->set_actual_key(start_key);
             step_result->set_actual_start_key(start_key);
             step_result->set_found(read_result.found);
@@ -591,10 +623,20 @@ void LineairDBRpc::handleTxExecuteReadPlan(const std::string& message,
         if (step.index_name().empty()) {
             step_result->set_actual_start_key(start_key);
             step_result->set_actual_end_key(end_key);
+            // parallel_scan.cc emits rows straight into step_result without a
+            // scan_result handle to instrument internally; a before/after
+            // emitted-row delta is used as an inspected-row proxy for these
+            // two PAX-optimized branches instead (slight undercount vs. true
+            // inspected count for filtered-out rows, since these paths push
+            // filtering down more aggressively).
+            const int64_t rows_before_pax = step_result->scan_keys_size();
             if (parallel_primary_pax_row_ref_scan(
                     db_manager_->get_database().get(), step, start_key,
                     end_key, step_result, projection_failed,
                     semijoin_reductions)) {
+                inspected_rows.fetch_add(
+                    step_result->scan_keys_size() - rows_before_pax,
+                    std::memory_order_relaxed);
                 if (projection_failed) {
                     response.set_ok(false);
                     flat_plan::encode_to_string(response, result);
@@ -605,9 +647,13 @@ void LineairDBRpc::handleTxExecuteReadPlan(const std::string& message,
             if (!step.for_each() && step.scan_limit() == 0 &&
                 !step.reverse_scan() && semijoin_reductions.empty() &&
                 step.has_filter() && step.filter().has_expr()) {
+                const int64_t rows_before_filter = step_result->scan_keys_size();
                 if (parallel_primary_filter_scan(
                         db_manager_->get_database().get(), step, start_key,
                         end_key, step_result)) {
+                    inspected_rows.fetch_add(
+                        step_result->scan_keys_size() - rows_before_filter,
+                        std::memory_order_relaxed);
                     continue;
                 }
             }
@@ -626,6 +672,8 @@ void LineairDBRpc::handleTxExecuteReadPlan(const std::string& message,
                 flat_plan::encode_to_string(response, result);
                 return;
             }
+            inspected_rows.fetch_add(scan_result.rows.size(),
+                                     std::memory_order_relaxed);
             uint64_t emitted = 0;
             for (auto& row : scan_result.rows) {
                 if (!row_passes(row.value)) {
@@ -658,6 +706,8 @@ void LineairDBRpc::handleTxExecuteReadPlan(const std::string& message,
                 flat_plan::encode_to_string(response, result);
                 return;
             }
+            inspected_rows.fetch_add(scan_result.rows.size(),
+                                     std::memory_order_relaxed);
             for (auto& row : scan_result.rows) {
                 if (!row_passes(row.value)) {
                     // Secondary scans report rejected rows by primary key.
