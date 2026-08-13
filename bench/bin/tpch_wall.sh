@@ -65,6 +65,13 @@ echo "# label=$LABEL runs=$RUNS db=$DB queries=$QDIR $(date -Is)" >> "$RESULT"
 
 QLIST=${ONLY:-$(seq 1 22)}
 for q in $QLIST; do
+  # q15 creates and drops a view; a killed run leaves it behind and every
+  # later q15 fails at CREATE. Clean up defensively before each query.
+  if ! "$MYSQL" -u root --socket="$SOCKET" "$DB" -e "DROP VIEW IF EXISTS revenue0;" \
+      2>"$OUT/${LABEL}_q${q}.err"; then
+    echo -e "q$q\tERR\tview-cleanup-failed: $(head -c 120 "$OUT/${LABEL}_q${q}.err" | tr '\t\n' '  ')" >> "$RESULT"
+    continue
+  fi
   SQL_FILE="$QDIR/q$q.sql"
   if [ ! -f "$SQL_FILE" ]; then
     echo "q$q MISSING" >> "$RESULT"
