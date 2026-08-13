@@ -20,7 +20,7 @@ WHERE
       GROUP BY
          l_orderkey
       HAVING
-         SUM(l_quantity) > 300
+         SUM(l_quantity) > 300 -- 300 is the qualification value (performance draws use 312-315)
    )
    AND c_custkey = o_custkey
    AND o_orderkey = l_orderkey
