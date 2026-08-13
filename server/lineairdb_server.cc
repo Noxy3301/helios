@@ -19,7 +19,7 @@ void LineairDBServer::init() {
 void LineairDBServer::handle_client(int client_socket) {
     LOG_INFO("Handling client connection fd=%d", client_socket);
     // Per-connection managers
-    auto tx_manager = std::make_shared<TransactionManager>();
+    auto tx_manager = std::make_shared<TransactionManager>(*db_manager_->get_database());
     auto rpc_handler = std::make_shared<LineairDBRpc>(db_manager_, tx_manager, row_counts_);
 
     while (true) {
@@ -38,4 +38,10 @@ void LineairDBServer::handle_client(int client_socket) {
             break;  // Failed to send response
         }
     }
+
+    // Must run on this thread: the epoch slot it releases is thread-local.
+    tx_manager->abort_all_and_end();
+
+    // An enrolled thread that exits pins min_active_epoch() forever.
+    db_manager_->get_database()->ReleaseMasstreeThreadEpoch();
 }
