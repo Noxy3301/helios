@@ -1,6 +1,7 @@
 #ifndef HELIOS_PROTOCOL_MESSAGE_HH
 #define HELIOS_PROTOCOL_MESSAGE_HH
 
+#include <cstddef>
 #include <cstdint>
 
 // Message header for RPC communication
@@ -64,5 +65,16 @@ enum class MessageType : uint32_t {
   // DuckDB SQL bridge (raw SQL text). See lineairdb.proto.
   TX_EXECUTE_SQL_DUCKDB = 36
 };
+
+// Hard cap on a single RPC frame's payload. Both receive paths must reject
+// this before allocating or buffering for the payload, so a corrupt or
+// hostile length field can't drive unbounded memory growth.
+inline constexpr uint32_t kMaxRpcPayloadBytes = 8u * 1024 * 1024;  // 8 MiB
+
+// Upper bound a connection's read/write buffer may reach before it's treated
+// as a protocol violation: one max-size frame plus header slack for bytes
+// already read/queued around it.
+inline constexpr size_t kMaxRpcBufferBytes =
+    static_cast<size_t>(kMaxRpcPayloadBytes) + sizeof(MessageHeader) * 2;
 
 #endif  // HELIOS_PROTOCOL_MESSAGE_HH

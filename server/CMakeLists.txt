@@ -52,7 +52,9 @@ set(SOURCES
     network/tcp_server.hh
     network/message_handler.cc
     network/message_handler.hh
-    
+    network/reactor.cc
+    network/reactor.hh
+
     # RPC layer
     rpc/lineairdb_rpc.cc
     rpc/lineairdb_rpc.hh

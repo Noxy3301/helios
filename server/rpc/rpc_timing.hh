@@ -10,16 +10,31 @@
 // than adding one-off timing hacks elsewhere.
 //
 // Each handler-executing thread accumulates into a thread_local table (no
-// locking on the hot path), merged into a global mutex-protected table when
-// the thread exits. SIGTERM/SIGINT are handled by a dedicated sigwait()
-// thread (not a signal handler, so mutex/file/log calls are safe), which
-// writes the accumulated per-opcode table to
+// locking on the hot path) and registers that table in a small global
+// registry on first use. The table is merged into a global, mutex-protected
+// table when the thread exits (removing it from the registry too) and,
+// right before the shutdown dump, a sweep additionally merges every table
+// still in the registry -- i.e. threads that are still alive. This matters
+// for HELIOS_TRANSPORT=reactor: reactor threads are long-lived (one thread
+// serves many connections over the process lifetime) and never hit the
+// exit-time merge, so without the sweep their fast-path opcodes would be
+// invisible in the dump. SIGTERM/SIGINT are handled by a dedicated
+// sigwait() thread (not a signal handler, so mutex/file/log calls are
+// safe), which writes the accumulated per-opcode table to
 // /tmp/helios_rpc_timing_<pid>.txt and logs the same table before exiting
 // the process.
 //
-// Samples from threads still alive at dump time are not included (no
-// cross-thread sweep of live thread_locals): connections must close before
-// shutdown for complete data.
+// Correctness note: the sweep reads a still-live thread's counters without
+// synchronizing with its writes, so it is only safe once RPC traffic has
+// quiesced. The measurement workflow always stops mysqld first -- which
+// closes every RPC connection, so no handler thread is mid-update -- before
+// signaling the server, so this is not a gap in practice. Concurrent thread
+// exit is handled independently of quiescence: exit finalization and the
+// sweep both hold the registry mutex for their entire decide-then-merge
+// step (registry mutex acquired before the global mutex, consistently), and
+// each table records whether the sweep already merged it, so a thread's
+// samples land in the global table exactly once whether it exits before,
+// during, or after the sweep runs.
 //
 // TX_VALIDATE_AND_COMMIT and TX_EXECUTE_READ_PLAN additionally get a variant
 // breakdown (fence/entries/frame-size/response-size/stats-size for commit;

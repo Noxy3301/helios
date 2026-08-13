@@ -201,6 +201,10 @@ struct ThreadLocalTable {
   StatsTable table{};
   VariantMap commit_variants;
   VariantMap read_plan_variants;
+  // Set under g_registry_mutex once the shutdown sweep has merged this
+  // table, so a subsequent exit-time merge knows not to repeat it.
+  bool swept = false;
+  ThreadLocalTable();
   ~ThreadLocalTable();
 };
 
@@ -222,9 +226,56 @@ void merge_into_global(ThreadLocalTable &t) {
   }
 }
 
-ThreadLocalTable::~ThreadLocalTable() { merge_into_global(*this); }
+// Live registry of every thread's table, so the shutdown dump can sweep
+// threads that are still running: HELIOS_TRANSPORT=reactor's pinned reactor
+// threads serve connections for the process lifetime and never hit the
+// exit-time merge below.
+std::mutex g_registry_mutex;
+std::vector<ThreadLocalTable *> g_registry;
+
+ThreadLocalTable::ThreadLocalTable() {
+  std::lock_guard<std::mutex> lock(g_registry_mutex);
+  g_registry.push_back(this);
+}
+
+ThreadLocalTable::~ThreadLocalTable() {
+  // Exit finalization and the shutdown sweep are mutually exclusive: both
+  // hold g_registry_mutex for their whole decide-then-merge step (registry
+  // mutex acquired before the global mutex, consistently, so nesting can't
+  // deadlock), so this thread is either removed here before the sweep can
+  // see it, or already merged-and-marked by a sweep that ran first -- never
+  // both, never neither.
+  std::lock_guard<std::mutex> lock(g_registry_mutex);
+  auto it = std::find(g_registry.begin(), g_registry.end(), this);
+  if (it != g_registry.end()) g_registry.erase(it);
+  if (!swept) merge_into_global(*this);
+}
 
 thread_local ThreadLocalTable tl_table;
+
+// Sweeps every still-registered (i.e. still-live) thread's table into the
+// global tables, for threads that will never hit the exit-time merge above
+// before the shutdown dump runs. Only safe once RPC traffic has quiesced
+// (see the correctness note in rpc_timing.hh). Does not clear the source
+// counters (a live thread keeps accumulating into them), so it marks each
+// table swept instead: a thread that exits after this runs sees the mark
+// and skips merging its already-counted samples again.
+void sweep_live_threads_into_global() {
+  std::lock_guard<std::mutex> reg_lock(g_registry_mutex);
+  std::lock_guard<std::mutex> glob_lock(g_global_mutex);
+  for (ThreadLocalTable *t : g_registry) {
+    for (size_t i = 0; i < kMaxOpcode; i++) {
+      g_global_stats[i].merge_from(t->table[i]);
+    }
+    for (auto &[key, stats] : t->commit_variants) {
+      g_global_commit_variants[key].merge_from(stats);
+    }
+    for (auto &[key, stats] : t->read_plan_variants) {
+      g_global_read_plan_variants[key].merge_from(stats);
+    }
+    t->swept = true;
+  }
+}
 
 const char *opcode_name(MessageType type) {
   switch (type) {
@@ -360,6 +411,9 @@ void dump() {
   // Merge-under-mutex at clean shutdown; in practice a no-op here, since the
   // sigwait thread itself never calls a handler (see header comment).
   merge_into_global(tl_table);
+  // Reactor-mode threads are still alive at this point; sweep their tables
+  // too (see sweep_live_threads_into_global's precondition note).
+  sweep_live_threads_into_global();
 
   StatsTable snapshot;
   VariantMap commit_snapshot;

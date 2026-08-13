@@ -5,19 +5,52 @@
 #include <sys/socket.h>
 #include <sys/uio.h>
 
+#include <algorithm>
 #include <cstring>
 #include <iostream>
 #include <vector>
 
 #include "../../common/log.h"
+#include "lineairdb.pb.h"
+
+namespace {
+
+enum class RecvOutcome { kOk, kError, kClosed };
+
+// Fills `buf[0, len)`: first drains any unconsumed bytes from
+// `*primer[*primer_offset, end)` (reactor migration primer), then recv()s
+// whatever is left with MSG_WAITALL. With primer == nullptr this is exactly
+// recv(socket, buf, len, MSG_WAITALL).
+RecvOutcome recv_exact(int socket, void *buf, size_t len, std::string *primer,
+                        size_t *primer_offset) {
+  size_t filled = 0;
+  if (primer != nullptr && primer_offset != nullptr && *primer_offset < primer->size()) {
+    size_t avail = primer->size() - *primer_offset;
+    size_t take = std::min(avail, len);
+    std::memcpy(buf, primer->data() + *primer_offset, take);
+    *primer_offset += take;
+    filled += take;
+  }
+  if (filled < len) {
+    ssize_t got = recv(socket, static_cast<char *>(buf) + filled, len - filled, MSG_WAITALL);
+    if (got != static_cast<ssize_t>(len - filled)) {
+      return got < 0 ? RecvOutcome::kError : RecvOutcome::kClosed;
+    }
+  }
+  return RecvOutcome::kOk;
+}
+
+}  // namespace
 
 bool MessageHandler::receive_message(int socket, uint64_t &sender_id,
-                                      MessageType &message_type, std::string &payload) {
+                                      MessageType &message_type, std::string &payload,
+                                      std::string *primer, size_t *primer_offset) {
   // Read fixed-size header
   MessageHeader net_header{};
-  ssize_t header_read = recv(socket, &net_header, sizeof(net_header), MSG_WAITALL);
-  if (header_read != static_cast<ssize_t>(sizeof(net_header))) {
-    if (header_read < 0) {
+  RecvOutcome header_outcome =
+      recv_exact(socket, &net_header, sizeof(net_header), primer, primer_offset);
+  if (header_outcome != RecvOutcome::kOk) {
+    if (header_outcome == RecvOutcome::kError) {
       LOG_ERROR("Failed to receive message header");
     } else {
       LOG_DEBUG("Client disconnected while receiving header");
@@ -33,13 +66,30 @@ bool MessageHandler::receive_message(int socket, uint64_t &sender_id,
   LOG_DEBUG("Received header: sender_id=%lu, message_type=%u, payload_size=%u",
             sender_id, static_cast<uint32_t>(message_type), payload_size);
 
+  // Reject an oversized frame before allocating/waiting for its payload.
+  if (payload_size > kMaxRpcPayloadBytes) {
+    LOG_ERROR("Closing fd=%d: payload_size=%u exceeds cap %u (opcode=%u)",
+              socket, payload_size, kMaxRpcPayloadBytes,
+              static_cast<uint32_t>(message_type));
+    return false;
+  }
+
+  // Reject a frame whose opcode isn't a defined protocol message.
+  int raw_type = static_cast<int>(message_type);
+  if (!LineairDB::Protocol::OpCode_IsValid(raw_type) || raw_type == 0) {
+    LOG_ERROR("Closing fd=%d: undefined opcode=%d (payload_size=%u)",
+              socket, raw_type, payload_size);
+    return false;
+  }
+
   // Read payload (if exists)
   payload.clear();
   if (payload_size > 0) {
     payload.resize(payload_size);
-    ssize_t body_read = recv(socket, &payload[0], payload_size, MSG_WAITALL);
-    if (body_read != static_cast<ssize_t>(payload_size)) {
-      if (body_read < 0) {
+    RecvOutcome body_outcome =
+        recv_exact(socket, &payload[0], payload_size, primer, primer_offset);
+    if (body_outcome != RecvOutcome::kOk) {
+      if (body_outcome == RecvOutcome::kError) {
         LOG_ERROR("Failed to receive message payload");
       } else {
         LOG_DEBUG("Client disconnected while receiving payload");
