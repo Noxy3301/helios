@@ -2,6 +2,8 @@
 # Run per-query TPC-H wall-clock timing against a running mysqld.
 # Method: single stream, one discarded warm run, N timed runs, and external
 # mysql-client wall-clock timing.
+# The md5 is over sorted output lines: it checks result multiset equality and
+# deliberately ignores row order, which the spec leaves engine-defined among ties.
 # Usage: tpch_wall.sh <label> [--runs 3] [--db benchbase] [--socket /tmp/mysql.sock]
 #        [--queries bench/queries/tpch] [--out <dir>] [--timeout 120] [--only "1 6 18"]
 #        [--sf 1]
@@ -77,7 +79,7 @@ mkdir -p "$OUT"
 
 RESULT="$OUT/${LABEL}.tsv"
 : > "$RESULT"
-echo "# label=$LABEL runs=$RUNS db=$DB queries=$QDIR $(date -Is)" >> "$RESULT"
+echo "# label=$LABEL runs=$RUNS db=$DB queries=$QDIR sf=$SF $(date -Is)" >> "$RESULT"
 
 for q in $QLIST; do
   # q15 creates and drops a view; a killed run leaves it behind and every
@@ -119,7 +121,10 @@ for q in $QLIST; do
     continue
   fi
 
-  MD5=$(md5sum "$OUT/${LABEL}_q${q}.out" | cut -d' ' -f1)
+  if ! MD5=$(LC_ALL=C sort "$OUT/${LABEL}_q${q}.out" | md5sum | cut -d' ' -f1); then
+    echo -e "q$q\tERR\thash-failed" >> "$RESULT"
+    continue
+  fi
   echo -e "q$q\t$(IFS=,; echo "${TIMES[*]}")\tmd5=$MD5" >> "$RESULT"
   echo "[$LABEL] q$q: ${TIMES[*]} ms"
 done
