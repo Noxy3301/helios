@@ -52,6 +52,20 @@ class Reactor {
     virtual ~RpcDispatcher() = default;
     virtual void handle_rpc(uint64_t sender_id, MessageType message_type,
                              const std::string &payload, std::string &result) = 0;
+
+    // kFast entry point: same request/response contract as handle_rpc, plus
+    // a runtime budget that only TX_EXECUTE_READ_PLAN installs (see
+    // LineairDBServer::Dispatcher::handle_fast_rpc). Returns false when the
+    // execution hit its budget, in which case `result` is unspecified and
+    // must not be sent to the client -- the caller re-dispatches the same
+    // request to the general helper pool instead. Default implementation
+    // just forwards to handle_rpc and always returns true, so every other
+    // dispatcher (and every other opcode) is unaffected.
+    virtual bool handle_fast_rpc(uint64_t sender_id, MessageType message_type,
+                                  const std::string &payload, std::string &result) {
+      handle_rpc(sender_id, message_type, payload, result);
+      return true;
+    }
   };
 
   using ClassifyFn = std::function<RpcLane(MessageType, std::string_view)>;
@@ -99,8 +113,7 @@ class Reactor {
   struct Connection {
     int fd = -1;
     uint64_t connection_id = 0;  // process-unique, assigned in add_connection
-    // Advances once per kSlow admission attempt that passes completion-slot
-    // reservation, including attempts the helper queue rejects;
+    // Advances once per successfully reserved helper dispatch;
     // drain_completions() checks a completion's generation against the
     // current value to discard stale results.
     uint64_t generation = 0;
@@ -137,11 +150,16 @@ class Reactor {
     uint64_t reject_slot = 0;
     uint64_t overload_sent = 0;
     uint64_t stale_discarded = 0;
+    // kFast TX_EXECUTE_READ_PLAN executions that hit their runtime budget
+    // and were re-dispatched to the general helper pool (see
+    // parse_and_dispatch's kFast branch and dispatch_to_helper()).
+    uint64_t budget_redispatched = 0;
 
     bool operator==(const Metrics &o) const {
       return dispatched == o.dispatched && completed == o.completed &&
              reject_queue == o.reject_queue && reject_slot == o.reject_slot &&
-             overload_sent == o.overload_sent && stale_discarded == o.stale_discarded;
+             overload_sent == o.overload_sent && stale_discarded == o.stale_discarded &&
+             budget_redispatched == o.budget_redispatched;
     }
     bool operator!=(const Metrics &o) const { return !(*this == o); }
   };
@@ -175,6 +193,18 @@ class Reactor {
   // partial tail) are a protocol violation, same discipline as the fast
   // path. Returns false (having closed the connection) on violation.
   bool finish_slow_frame(Connection &conn, size_t frame_len);
+  // Slot + queue reservation -> Job -> submit mechanics shared by the
+  // kSlow lane and a kFast execution that hit its runtime budget (see
+  // parse_and_dispatch); the payload is copied out of read_buf only after
+  // both reservations succeed. An admission rejection answers
+  // SERVER_OVERLOADED and returns true with the connection re-armed.
+  // `ddl_exempt` opcodes fall back to migration instead of
+  // SERVER_OVERLOADED under queue/slot pressure; a budget re-dispatch is
+  // never DDL-exempt (it is always TX_EXECUTE_READ_PLAN). Returns false if
+  // the connection is no longer owned by this reactor -- caller must not
+  // touch `conn` again in that case.
+  bool dispatch_to_helper(Connection &conn, MessageType message_type, uint64_t sender_id,
+                           size_t frame_len, RpcLane lane, bool ddl_exempt);
   // Sends a SERVER_OVERLOADED response (empty payload) through the normal
   // queue_response + flush_writes path; state round-trips kResponding ->
   // kArmed like any other response. Returns false if the connection was
@@ -212,12 +242,12 @@ class Reactor {
   std::mutex pending_mu_;
   std::vector<PendingConn> pending_;
 
-  // Upper bound on this reactor's in-flight helper results (kSlow dispatches
+  // Upper bound on this reactor's in-flight helper results (dispatches
   // whose completion hasn't been matched yet), generous versus the pool's
-  // queue depth + thread count; see reactor.cc. Reservation happens in
-  // parse_and_dispatch, release in drain_completions -- both
-  // reactor-thread-only, but atomic per the ownership rules for this
-  // counter's role as an admission gate.
+  // queue depth + thread count; see reactor.cc. Reserved in
+  // dispatch_to_helper() for kSlow and budget-re-dispatched work, released
+  // in drain_completions() -- both reactor-thread-only, but atomic per the
+  // ownership rules for this counter's role as an admission gate.
   std::atomic<int> completion_slots_used_{0};
   std::mutex completion_mu_;
   std::deque<Completion> completions_;

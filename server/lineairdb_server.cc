@@ -6,6 +6,19 @@
 #include "lineairdb.pb.h"
 #include "network/rpc_lane.hh"
 #include "rpc/lineairdb_rpc.hh"
+#include "rpc/rpc_budget.hh"
+
+namespace {
+// Installs `budget` as the thread's current budget for the guard's scope
+// and always clears it back to null on the way out, including every early
+// return inside handle_rpc.
+struct ScopedRpcBudget {
+  explicit ScopedRpcBudget(RpcExecutionBudget *budget) { set_current_rpc_budget(budget); }
+  ~ScopedRpcBudget() { set_current_rpc_budget(nullptr); }
+  ScopedRpcBudget(const ScopedRpcBudget &) = delete;
+  ScopedRpcBudget &operator=(const ScopedRpcBudget &) = delete;
+};
+}  // namespace
 
 LineairDBServer::LineairDBServer() : TcpServer(9999) {}
 
@@ -72,4 +85,22 @@ LineairDBServer::Dispatcher::Dispatcher(std::shared_ptr<DatabaseManager> db_mana
 void LineairDBServer::Dispatcher::handle_rpc(uint64_t sender_id, MessageType message_type,
                                               const std::string &payload, std::string &result) {
   rpc_->handle_rpc(sender_id, message_type, payload, result);
+}
+
+bool LineairDBServer::Dispatcher::handle_fast_rpc(uint64_t sender_id, MessageType message_type,
+                                                   const std::string &payload,
+                                                   std::string &result) {
+  if (message_type != MessageType::TX_EXECUTE_READ_PLAN) {
+    handle_rpc(sender_id, message_type, payload, result);
+    return true;
+  }
+
+  RpcExecutionBudget budget{kFastReadPlanRowBudget, kFastReadPlanByteBudget};
+  ScopedRpcBudget guard(&budget);
+  handle_rpc(sender_id, message_type, payload, result);
+  if (budget.exceeded) {
+    result.clear();  // never sent; the caller re-dispatches this request
+    return false;
+  }
+  return true;
 }

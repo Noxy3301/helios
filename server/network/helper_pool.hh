@@ -58,10 +58,13 @@ class HelperPool {
   HelperPool(const HelperPool &) = delete;
   HelperPool &operator=(const HelperPool &) = delete;
 
-  // Enqueues `job` for a worker to run. Returns false immediately (no
-  // blocking, no thread spawned) once the queue already holds queue_depth
-  // jobs.
-  bool try_submit(Job job);
+  // Two-phase admission so callers can defer the (possibly large) payload
+  // copy until capacity is guaranteed: try_reserve() takes one unit of
+  // queue capacity (false = full, nothing charged), submit() consumes a
+  // held reservation and never fails. Reservations count against
+  // queue_depth alongside queued jobs.
+  bool try_reserve();
+  void submit(Job job);
 
   Stats snapshot() const;
 
@@ -74,6 +77,7 @@ class HelperPool {
   mutable std::mutex mu_;
   std::condition_variable cv_;
   std::deque<Job> queue_;
+  size_t reserved_ = 0;  // admissions granted but not yet submitted
   bool stop_ = false;
 
   std::vector<std::thread> workers_;

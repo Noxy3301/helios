@@ -11,6 +11,7 @@
 
 #include "predicate_evaluator.hh"
 #include "row_codec.hh"
+#include "rpc_budget.hh"
 
 namespace {
 
@@ -90,6 +91,17 @@ const std::vector<uint32_t>* selected_columns_for_projected_read(
     return &selected_columns;
 }
 
+// See read_plan_executor.cc's copy of this helper for the rationale (0 =
+// LineairDB's own "unbounded" capped to the budget's remaining rows, +1 so
+// the caller can tell "fit under budget" apart from "would have exceeded
+// it"). No-op when unbudgeted.
+uint64_t budgeted_row_limit(uint64_t declared_limit) {
+    auto* budget = current_rpc_budget();
+    if (budget == nullptr) return declared_limit;
+    uint64_t cap = budget->rows_remaining + 1;
+    return declared_limit == 0 ? cap : std::min(declared_limit, cap);
+}
+
 }  // namespace
 
 bool parallel_primary_pax_row_ref_scan(
@@ -104,7 +116,7 @@ bool parallel_primary_pax_row_ref_scan(
     const bool has_filter = step.has_filter() && step.filter().has_expr();
     const bool has_projection = step.has_projection();
     // With a pushed filter, LIMIT applies after filter evaluation.
-    const uint64_t ref_scan_limit = has_filter ? 0 : step.scan_limit();
+    const uint64_t ref_scan_limit = budgeted_row_limit(has_filter ? 0 : step.scan_limit());
 
     std::vector<uint32_t> kept_columns;
     if (has_projection) {
@@ -146,7 +158,14 @@ bool parallel_primary_pax_row_ref_scan(
         }
 
         PredicateEvaluator evaluator;
+        auto* budget = current_rpc_budget();
         for (auto& row_ref : refs.rows) {
+            // Charged before anything below reads or copies this row's
+            // cells; a budgeted call always runs run_range serially (see
+            // the ran_parallel guard), so this is never touched from a
+            // worker thread. Stop the scan in place -- the caller notices
+            // budget->exceeded and discards the whole call.
+            if (budget != nullptr && !budget->charge_row()) break;
             const auto* group =
                 static_cast<const LineairDB::Pax::PaxGroup*>(row_ref.group);
             bool pass = true;
@@ -257,7 +276,9 @@ bool parallel_primary_pax_row_ref_scan(
 
     std::vector<RefChunkOut> chunks;
     bool ran_parallel = false;
-    if (step.scan_limit() == 0 && !step.reverse_scan()) {
+    // A budgeted execution must never spawn a thread (the budget is
+    // thread_local): fall straight to the single-chunk run_range call below.
+    if (step.scan_limit() == 0 && !step.reverse_scan() && current_rpc_budget() == nullptr) {
         const unsigned nproc = std::thread::hardware_concurrency();
         const unsigned max_threads = std::min<unsigned>(nproc ? nproc : 4, 8);
         const std::vector<uint32_t> key_only_columns;
@@ -328,14 +349,30 @@ bool parallel_primary_pax_row_ref_scan(
     }
 
     uint64_t emitted = 0;
+    auto* budget = current_rpc_budget();
     for (auto& chunk : chunks) {
         // Replay the mixed stream in scan order so filtered keys observed
         // before LIMIT cutoff remain visible to range validation.
         for (const auto& event : chunk.events) {
             if (event.filtered_key) {
+                if (budget != nullptr &&
+                    !budget->charge_bytes(chunk.filtered_keys[event.index].size() +
+                                          kBudgetFieldOverhead)) {
+                    return true;  // caller checks budget->exceeded and discards everything
+                }
                 step_result->add_filtered_keys(
                     std::move(chunk.filtered_keys[event.index]));
                 continue;
+            }
+            // Charged here, right before the bytes join the actual response
+            // (step_result), not when run_range first gathered them into the
+            // intermediate chunk buffer. Keys, tid, and field framing count
+            // like the value itself.
+            if (budget != nullptr &&
+                !budget->charge_bytes(chunk.scan_keys[event.index].size() +
+                                      chunk.scan_values[event.index].size() + 8 +
+                                      3 * kBudgetFieldOverhead)) {
+                return true;  // caller checks budget->exceeded and discards everything
             }
             step_result->add_scan_keys(
                 std::move(chunk.scan_keys[event.index]));
@@ -356,6 +393,11 @@ bool parallel_primary_filter_scan(
     const std::string& start_key, const std::string& end_key,
     LineairDB::Protocol::TxExecuteReadPlan::StepResult* step_result) {
     if (db == nullptr) return false;
+    // This path is parallel-only (it bails out below whenever it would run
+    // with a single worker) and has no serial fallback of its own; a
+    // budgeted call must never spawn a thread, so let the caller's existing
+    // "false = use the serial scan path" contract handle it.
+    if (current_rpc_budget() != nullptr) return false;
 
     const size_t morsel_rows = 128000;  // FIXME: make configurable
     const size_t min_rows = 500000;     // FIXME: make configurable

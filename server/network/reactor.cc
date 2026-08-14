@@ -306,61 +306,21 @@ bool Reactor::parse_and_dispatch(Connection &conn) {
     bool ddl_exempt = message_type == MessageType::DB_FENCE ||
                        message_type == MessageType::DB_CREATE_TABLE ||
                        message_type == MessageType::DB_CREATE_SECONDARY_INDEX;
-
-    // Reserve a completion slot before anything else so this reactor can't
-    // accumulate more in-flight helper results than it can ever validate
-    // (kCompletionSlots, generous vs the pool's queue depth + threads).
-    int prev_slots = completion_slots_used_.fetch_add(1, std::memory_order_relaxed);
-    if (prev_slots >= kCompletionSlots) {
-      completion_slots_used_.fetch_sub(1, std::memory_order_relaxed);
-      metrics_.reject_slot++;
-      if (ddl_exempt) {
-        fallback_migrated_++;
-        migrate_connection(conn, 0, frame_len, lane);  // erases conn; do not touch it after this
-        return false;
-      }
-      if (!respond_overloaded(conn)) return false;  // erased conn on failure
-      return finish_slow_frame(conn, frame_len);
-    }
-
-    conn.generation++;  // the completion must match this dispatch's generation
-
-    HelperPool::Job job;
-    job.connection_id = conn.connection_id;
-    job.generation = conn.generation;
-    job.type = message_type;
-    job.sender_id = sender_id;
-    job.payload = buf.substr(sizeof(MessageHeader), payload_size);
-    job.dispatcher = conn.dispatcher;  // shared_ptr copy: co-owns across the helper job
-    job.owner = this;
-
-    // DuckDB requests serialize on the executor's global catalog mutex; its
-    // dedicated lane keeps a slow query from parking the general helpers
-    // behind that lock.
-    HelperPool *pool = message_type == MessageType::TX_EXECUTE_SQL_DUCKDB
-                            ? duckdb_pool_
-                            : general_pool_;
-    if (!pool->try_submit(std::move(job))) {
-      completion_slots_used_.fetch_sub(1, std::memory_order_relaxed);
-      metrics_.reject_queue++;
-      if (ddl_exempt) {
-        fallback_migrated_++;
-        migrate_connection(conn, 0, frame_len, lane);  // erases conn; do not touch it after this
-        return false;
-      }
-      if (!respond_overloaded(conn)) return false;  // erased conn on failure
-      return finish_slow_frame(conn, frame_len);
-    }
-
-    metrics_.dispatched++;
-    if (!finish_slow_frame(conn, frame_len)) return false;  // erased conn on violation
-    conn.state = State::kInHelper;
-    return true;
+    return dispatch_to_helper(conn, message_type, sender_id, frame_len, lane, ddl_exempt);
   }
 
   std::string payload = buf.substr(sizeof(MessageHeader), payload_size);
   std::string result;
-  conn.dispatcher->handle_rpc(sender_id, message_type, payload, result);
+  if (!conn.dispatcher->handle_fast_rpc(sender_id, message_type, payload, result)) {
+    // Hit its runtime budget (TX_EXECUTE_READ_PLAN only; every other
+    // opcode's default handle_fast_rpc always returns true): discard
+    // `result` and re-dispatch the same request to the general helper
+    // pool, which runs it unbounded. No DDL exemption -- a budget hit
+    // never comes from a DDL opcode.
+    metrics_.budget_redispatched++;
+    return dispatch_to_helper(conn, message_type, sender_id, frame_len, lane,
+                               /*ddl_exempt=*/false);
+  }
   if (!queue_response(conn, message_type, result)) {
     close_connection(conn.fd);  // erases conn; do not touch it after this
     return false;
@@ -536,6 +496,63 @@ bool Reactor::finish_slow_frame(Connection &conn, size_t frame_len) {
   return true;
 }
 
+bool Reactor::dispatch_to_helper(Connection &conn, MessageType message_type, uint64_t sender_id,
+                                  size_t frame_len, RpcLane lane, bool ddl_exempt) {
+  // Reserve a completion slot before anything else so this reactor can't
+  // accumulate more in-flight helper results than it can ever validate
+  // (kCompletionSlots, generous vs the pool's queue depth + threads).
+  int prev_slots = completion_slots_used_.fetch_add(1, std::memory_order_relaxed);
+  if (prev_slots >= kCompletionSlots) {
+    completion_slots_used_.fetch_sub(1, std::memory_order_relaxed);
+    metrics_.reject_slot++;
+    if (ddl_exempt) {
+      fallback_migrated_++;
+      migrate_connection(conn, 0, frame_len, lane);  // erases conn; do not touch it after this
+      return false;
+    }
+    if (!respond_overloaded(conn)) return false;  // erased conn on failure
+    return finish_slow_frame(conn, frame_len);
+  }
+
+  // DuckDB requests serialize on the executor's global catalog mutex; its
+  // dedicated lane keeps a slow query from parking the general helpers
+  // behind that lock.
+  HelperPool *pool = message_type == MessageType::TX_EXECUTE_SQL_DUCKDB
+                          ? duckdb_pool_
+                          : general_pool_;
+  // Queue capacity is reserved before the payload copy for the same reason
+  // as the completion slot: a reactor shedding load must not pay a large
+  // allocation per rejected request.
+  if (!pool->try_reserve()) {
+    completion_slots_used_.fetch_sub(1, std::memory_order_relaxed);
+    metrics_.reject_queue++;
+    if (ddl_exempt) {
+      fallback_migrated_++;
+      migrate_connection(conn, 0, frame_len, lane);  // erases conn; do not touch it after this
+      return false;
+    }
+    if (!respond_overloaded(conn)) return false;  // erased conn on failure
+    return finish_slow_frame(conn, frame_len);
+  }
+
+  conn.generation++;  // the completion must match this dispatch's generation
+
+  HelperPool::Job job;
+  job.connection_id = conn.connection_id;
+  job.generation = conn.generation;
+  job.type = message_type;
+  job.sender_id = sender_id;
+  job.payload = conn.read_buf.substr(sizeof(MessageHeader), frame_len - sizeof(MessageHeader));
+  job.dispatcher = conn.dispatcher;  // shared_ptr copy: co-owns across the helper job
+  job.owner = this;
+  pool->submit(std::move(job));
+
+  metrics_.dispatched++;
+  if (!finish_slow_frame(conn, frame_len)) return false;  // erased conn on violation
+  conn.state = State::kInHelper;
+  return true;
+}
+
 bool Reactor::respond_overloaded(Connection &conn) {
   metrics_.overload_sent++;
   if (!queue_response(conn, MessageType::SERVER_OVERLOADED, std::string())) {
@@ -571,8 +588,8 @@ void Reactor::drain_completions() {
 
   for (auto &c : batch) {
     // Always released here: whether or not this completion matches a live
-    // connection, the slot it was reserved under becomes free (see the
-    // kSlow branch in parse_and_dispatch for the reservation).
+    // connection, the slot it was reserved under becomes free (see
+    // dispatch_to_helper() for the reservation).
     completion_slots_used_.fetch_sub(1, std::memory_order_relaxed);
 
     auto fd_it = connection_id_to_fd_.find(c.connection_id);
@@ -615,9 +632,10 @@ void Reactor::maybe_log_metrics() {
   if (now - last_metrics_log_ < kMetricsLogInterval) return;
 
   LOG_INFO("Reactor %d: helper metrics dispatched=%lu completed=%lu reject_queue=%lu "
-           "reject_slot=%lu overload_sent=%lu stale_discarded=%lu",
+           "reject_slot=%lu overload_sent=%lu stale_discarded=%lu budget_redispatched=%lu",
            id_, metrics_.dispatched, metrics_.completed, metrics_.reject_queue,
-           metrics_.reject_slot, metrics_.overload_sent, metrics_.stale_discarded);
+           metrics_.reject_slot, metrics_.overload_sent, metrics_.stale_discarded,
+           metrics_.budget_redispatched);
   last_metrics_log_ = now;
   last_logged_metrics_ = metrics_;
 }

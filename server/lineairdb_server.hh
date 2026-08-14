@@ -39,6 +39,11 @@ class LineairDBServer : public TcpServer {
                std::shared_ptr<TableRowCounts> row_counts);
     void handle_rpc(uint64_t sender_id, MessageType message_type, const std::string &payload,
                      std::string &result) override;
+    // TX_EXECUTE_READ_PLAN only: installs a runtime row/byte budget for the
+    // call (see rpc_budget.hh) and returns false, discarding `result`, when
+    // it was exceeded. Every other opcode just forwards to handle_rpc.
+    bool handle_fast_rpc(uint64_t sender_id, MessageType message_type,
+                          const std::string &payload, std::string &result) override;
 
    private:
     std::shared_ptr<TransactionManager> tx_manager_;

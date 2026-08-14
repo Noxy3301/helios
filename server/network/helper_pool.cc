@@ -27,19 +27,25 @@ HelperPool::~HelperPool() {
   }
 }
 
-bool HelperPool::try_submit(Job job) {
+bool HelperPool::try_reserve() {
+  std::lock_guard<std::mutex> lock(mu_);
+  if (queue_.size() + reserved_ >= queue_depth_) {
+    rejected_.fetch_add(1, std::memory_order_relaxed);
+    return false;
+  }
+  reserved_++;
+  return true;
+}
+
+void HelperPool::submit(Job job) {
   {
     std::lock_guard<std::mutex> lock(mu_);
-    if (queue_.size() >= queue_depth_) {
-      rejected_.fetch_add(1, std::memory_order_relaxed);
-      return false;
-    }
+    reserved_--;
     queue_.push_back(std::move(job));
     // Inside the lock so snapshot() never sees completed ahead of submitted.
     submitted_.fetch_add(1, std::memory_order_relaxed);
   }
   cv_.notify_one();
-  return true;
 }
 
 HelperPool::Stats HelperPool::snapshot() const {

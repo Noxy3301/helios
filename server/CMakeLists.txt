@@ -71,6 +71,7 @@ set(SOURCES
     rpc/flat_plan_encode.hh
     rpc/parallel_scan.cc
     rpc/parallel_scan.hh
+    rpc/rpc_budget.hh
     rpc/primary_key_operations.cc
     rpc/primary_key_scan_operations.cc
     rpc/read_plan_executor.cc

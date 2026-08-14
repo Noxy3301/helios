@@ -18,6 +18,7 @@
 #include "parallel_scan.hh"
 #include "predicate_evaluator.hh"
 #include "row_codec.hh"
+#include "rpc_budget.hh"
 #include "rpc_timing.hh"
 
 // Read-plan execution: the TX_EXECUTE_READ_PLAN handler and its plan-key
@@ -158,6 +159,22 @@ const std::vector<uint32_t>* selected_columns_for_materialization(
         return nullptr;
     }
     return &selected_columns;
+}
+
+// Caps a per-scan row_limit (0 = LineairDB's own "unbounded") by the
+// current budget's remaining row allowance, so a scan_limit=0 range can
+// never make LineairDB materialize past what a budgeted call could ever
+// charge for -- this is the row_limit early-stop StatelessRangeScan et al.
+// already implement, just driven by the budget instead of the plan step.
+// +1 lets the post-scan charge loop tell "the scan fit under budget" apart
+// from "the scan would have exceeded it" instead of silently truncating a
+// comfortably-under-budget result. No-op (returns declared_limit) when
+// unbudgeted (legacy/helper paths).
+uint64_t budgeted_row_limit(uint64_t declared_limit) {
+    auto* budget = current_rpc_budget();
+    if (budget == nullptr) return declared_limit;
+    uint64_t cap = budget->rows_remaining + 1;
+    return declared_limit == 0 ? cap : std::min(declared_limit, cap);
 }
 
 }  // namespace
@@ -319,8 +336,11 @@ void LineairDBRpc::handleTxExecuteReadPlan(const std::string& message,
             const unsigned nproc = std::thread::hardware_concurrency();
             const unsigned max_probe_threads =
                 std::min<unsigned>(nproc ? nproc : 4, 8);  // FIXME: make configurable
+            // A budgeted execution must never spawn a thread (the budget is
+            // thread_local, so a worker thread would run unbounded): take
+            // the serial probe loop below instead.
             if (probe_keys.size() >= min_parallel_probes &&
-                max_probe_threads > 1) {
+                max_probe_threads > 1 && current_rpc_budget() == nullptr) {
                 const size_t probe_count = probe_keys.size();
                 const unsigned worker_count = static_cast<unsigned>(
                     std::min<size_t>(max_probe_threads, probe_count));
@@ -517,7 +537,7 @@ void LineairDBRpc::handleTxExecuteReadPlan(const std::string& message,
                         auto scan_result =
                             db_manager_->get_database()->StatelessRangeScan(
                                 step.table_name(), row_key, row_end,
-                                step.scan_limit(), step.reverse_scan(),
+                                budgeted_row_limit(step.scan_limit()), step.reverse_scan(),
                                 selected_columns_for_reads);
                         if (!scan_result.ok) {
                             response.set_ok(false);
@@ -527,13 +547,19 @@ void LineairDBRpc::handleTxExecuteReadPlan(const std::string& message,
                         inspected_rows.fetch_add(scan_result.rows.size(),
                                                  std::memory_order_relaxed);
                         for (auto& r : scan_result.rows) {
+                            auto* budget = current_rpc_budget();
+                            if (budget != nullptr && !budget->charge_row()) return;
                             if (!row_passes(r.value)) continue;
                             if (!semijoin_reductions.empty() &&
                                 semijoin_rejects(r.value))
                                 continue;
+                            std::string v = project_value(std::move(r.value));
+                            if (budget != nullptr &&
+                                !budget->charge_bytes(r.key.size() + v.size() + 8 +
+                                                      3 * kBudgetFieldOverhead))
+                                return;
                             step_result->add_scan_keys(std::move(r.key));
-                            step_result->add_scan_values(
-                                project_value(std::move(r.value)));
+                            step_result->add_scan_values(std::move(v));
                             step_result->add_scan_tids(r.tid);
                             ++group_rows;
                             if (existence_only) break;
@@ -543,7 +569,7 @@ void LineairDBRpc::handleTxExecuteReadPlan(const std::string& message,
                             db_manager_->get_database()
                                 ->StatelessSecondaryRangeScan(
                                     step.table_name(), step.index_name(),
-                                    row_key, row_end, step.scan_limit(),
+                                    row_key, row_end, budgeted_row_limit(step.scan_limit()),
                                     step.reverse_scan(),
                                     selected_columns_for_reads);
                         if (!scan_result.ok) {
@@ -554,19 +580,35 @@ void LineairDBRpc::handleTxExecuteReadPlan(const std::string& message,
                         inspected_rows.fetch_add(scan_result.rows.size(),
                                                  std::memory_order_relaxed);
                         for (auto& r : scan_result.rows) {
+                            auto* budget = current_rpc_budget();
+                            if (budget != nullptr && !budget->charge_row()) return;
                             if (!row_passes(r.value)) continue;
                             if (!semijoin_reductions.empty() &&
                                 semijoin_rejects(r.value))
                                 continue;
+                            std::string v = project_value(std::move(r.value));
+                            if (budget != nullptr &&
+                                !budget->charge_bytes(r.secondary_key.size() +
+                                                      r.primary_key.size() + v.size() + 8 +
+                                                      4 * kBudgetFieldOverhead))
+                                return;
                             step_result->add_secondary_keys(
                                 std::move(r.secondary_key));
                             step_result->add_scan_keys(std::move(r.primary_key));
-                            step_result->add_scan_values(
-                                project_value(std::move(r.value)));
+                            step_result->add_scan_values(std::move(v));
                             step_result->add_scan_tids(r.tid);
                             ++group_rows;
                             if (existence_only) break;
                         }
+                    }
+                    // Group boundaries cost real response bytes even for an
+                    // empty probe result; uncharged they could amplify far
+                    // past the byte budget across many probe rows.
+                    if (auto* budget = current_rpc_budget();
+                        budget != nullptr &&
+                        !budget->charge_bytes(row_key.size() + row_end.size() + 4 +
+                                              3 * kBudgetFieldOverhead)) {
+                        return;
                     }
                     step_result->add_group_sizes(
                         static_cast<uint32_t>(group_rows));
@@ -580,13 +622,24 @@ void LineairDBRpc::handleTxExecuteReadPlan(const std::string& message,
                         step.table_name(), row_key,
                         selected_columns_for_reads);
                 inspected_rows.fetch_add(1, std::memory_order_relaxed);
+                if (auto* budget = current_rpc_budget();
+                    budget != nullptr &&
+                    (!budget->charge_row() ||
+                     !budget->charge_bytes(row_key.size() + 8 +
+                                           3 * kBudgetFieldOverhead))) {
+                    return;
+                }
                 step_result->add_scan_keys(row_key);
                 step_result->add_scan_tids(read_result.tid);
                 if (read_result.found &&
                     !(!semijoin_reductions.empty() &&
                       semijoin_rejects(read_result.value))) {
-                    step_result->add_scan_values(
-                        project_value(std::move(read_result.value)));
+                    std::string v = project_value(std::move(read_result.value));
+                    if (auto* budget = current_rpc_budget();
+                        budget != nullptr && !budget->charge_bytes(v.size())) {
+                        return;
+                    }
+                    step_result->add_scan_values(std::move(v));
                 } else {
                     // Semijoin-rejected point probes are covered as not-found.
                     step_result->add_scan_values("");
@@ -605,12 +658,24 @@ void LineairDBRpc::handleTxExecuteReadPlan(const std::string& message,
                 db_manager_->get_database()->StatelessRead(
                     step.table_name(), start_key, selected_columns_for_reads);
             inspected_rows.fetch_add(1, std::memory_order_relaxed);
+            if (auto* budget = current_rpc_budget();
+                budget != nullptr &&
+                (!budget->charge_row() ||
+                 !budget->charge_bytes(start_key.size() * 2 + 8 +
+                                       4 * kBudgetFieldOverhead))) {
+                return;
+            }
             step_result->set_actual_key(start_key);
             step_result->set_actual_start_key(start_key);
             step_result->set_found(read_result.found);
             step_result->set_tid(read_result.tid);
             if (read_result.found) {
-                step_result->set_value(project_value(std::move(read_result.value)));
+                std::string v = project_value(std::move(read_result.value));
+                if (auto* budget = current_rpc_budget();
+                    budget != nullptr && !budget->charge_bytes(v.size())) {
+                    return;
+                }
+                step_result->set_value(std::move(v));
             }
             if (projection_failed) {
                 response.set_ok(false);
@@ -621,6 +686,12 @@ void LineairDBRpc::handleTxExecuteReadPlan(const std::string& message,
         }
 
         if (step.index_name().empty()) {
+            if (auto* budget = current_rpc_budget();
+                budget != nullptr &&
+                !budget->charge_bytes(start_key.size() + end_key.size() +
+                                      2 * kBudgetFieldOverhead)) {
+                return;
+            }
             step_result->set_actual_start_key(start_key);
             step_result->set_actual_end_key(end_key);
             // parallel_scan.cc emits rows straight into step_result without a
@@ -630,10 +701,19 @@ void LineairDBRpc::handleTxExecuteReadPlan(const std::string& message,
             // inspected count for filtered-out rows, since these paths push
             // filtering down more aggressively).
             const int64_t rows_before_pax = step_result->scan_keys_size();
-            if (parallel_primary_pax_row_ref_scan(
-                    db_manager_->get_database().get(), step, start_key,
-                    end_key, step_result, projection_failed,
-                    semijoin_reductions)) {
+            bool pax_ref_scan_handled = parallel_primary_pax_row_ref_scan(
+                db_manager_->get_database().get(), step, start_key,
+                end_key, step_result, projection_failed,
+                semijoin_reductions);
+            // Row/byte budget is charged inside parallel_scan.cc's run_range
+            // (see rpc_budget.hh); an exceeded budget always wins over the
+            // function's own true/false result -- falling through to the
+            // materializing scan below would just redo the same work
+            // unbounded, defeating the budget.
+            if (auto* budget = current_rpc_budget(); budget != nullptr && budget->exceeded) {
+                return;
+            }
+            if (pax_ref_scan_handled) {
                 inspected_rows.fetch_add(
                     step_result->scan_keys_size() - rows_before_pax,
                     std::memory_order_relaxed);
@@ -661,7 +741,7 @@ void LineairDBRpc::handleTxExecuteReadPlan(const std::string& message,
             // With a pushed filter, LIMIT must apply after filter evaluation.
             const bool limit_after_filter = step_has_filter;
             const uint64_t scan_limit_for_lineairdb =
-                limit_after_filter ? 0 : step.scan_limit();
+                budgeted_row_limit(limit_after_filter ? 0 : step.scan_limit());
             auto scan_result =
                 db_manager_->get_database()->StatelessRangeScan(
                     step.table_name(), start_key, end_key,
@@ -676,7 +756,12 @@ void LineairDBRpc::handleTxExecuteReadPlan(const std::string& message,
                                      std::memory_order_relaxed);
             uint64_t emitted = 0;
             for (auto& row : scan_result.rows) {
+                auto* budget = current_rpc_budget();
+                if (budget != nullptr && !budget->charge_row()) return;
                 if (!row_passes(row.value)) {
+                    if (budget != nullptr &&
+                        !budget->charge_bytes(row.key.size() + kBudgetFieldOverhead))
+                        return;
                     // Negative coverage for point probes into this scan.
                     step_result->add_filtered_keys(std::move(row.key));
                     continue;
@@ -685,8 +770,13 @@ void LineairDBRpc::handleTxExecuteReadPlan(const std::string& message,
                     semijoin_rejects(row.value)) {
                     continue;
                 }
+                std::string v = project_value(std::move(row.value));
+                if (budget != nullptr &&
+                    !budget->charge_bytes(row.key.size() + v.size() + 8 +
+                                          3 * kBudgetFieldOverhead))
+                    return;
                 step_result->add_scan_keys(std::move(row.key));
-                step_result->add_scan_values(project_value(std::move(row.value)));
+                step_result->add_scan_values(std::move(v));
                 step_result->add_scan_tids(row.tid);
                 if (step.scan_limit() > 0 &&
                     ++emitted >= step.scan_limit()) {
@@ -694,12 +784,18 @@ void LineairDBRpc::handleTxExecuteReadPlan(const std::string& message,
                 }
             }
         } else {
+            if (auto* budget = current_rpc_budget();
+                budget != nullptr &&
+                !budget->charge_bytes(start_key.size() + end_key.size() +
+                                      2 * kBudgetFieldOverhead)) {
+                return;
+            }
             step_result->set_actual_start_key(start_key);
             step_result->set_actual_end_key(end_key);
             auto scan_result =
                 db_manager_->get_database()->StatelessSecondaryRangeScan(
                     step.table_name(), step.index_name(), start_key, end_key,
-                    step.scan_limit(), step.reverse_scan(),
+                    budgeted_row_limit(step.scan_limit()), step.reverse_scan(),
                     selected_columns_for_reads);
             if (!scan_result.ok) {
                 response.set_ok(false);
@@ -709,7 +805,13 @@ void LineairDBRpc::handleTxExecuteReadPlan(const std::string& message,
             inspected_rows.fetch_add(scan_result.rows.size(),
                                      std::memory_order_relaxed);
             for (auto& row : scan_result.rows) {
+                auto* budget = current_rpc_budget();
+                if (budget != nullptr && !budget->charge_row()) return;
                 if (!row_passes(row.value)) {
+                    if (budget != nullptr &&
+                        !budget->charge_bytes(row.primary_key.size() +
+                                              kBudgetFieldOverhead))
+                        return;
                     // Secondary scans report rejected rows by primary key.
                     step_result->add_filtered_keys(std::move(row.primary_key));
                     continue;
@@ -718,9 +820,15 @@ void LineairDBRpc::handleTxExecuteReadPlan(const std::string& message,
                     semijoin_rejects(row.value)) {
                     continue;
                 }
+                std::string v = project_value(std::move(row.value));
+                if (budget != nullptr &&
+                    !budget->charge_bytes(row.secondary_key.size() +
+                                          row.primary_key.size() + v.size() + 8 +
+                                          4 * kBudgetFieldOverhead))
+                    return;
                 step_result->add_secondary_keys(std::move(row.secondary_key));
                 step_result->add_scan_keys(std::move(row.primary_key));
-                step_result->add_scan_values(project_value(std::move(row.value)));
+                step_result->add_scan_values(std::move(v));
                 step_result->add_scan_tids(row.tid);
             }
         }
