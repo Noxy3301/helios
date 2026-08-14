@@ -1,7 +1,10 @@
 #ifndef HELIOS_NETWORK_RPC_LANE_HH
 #define HELIOS_NETWORK_RPC_LANE_HH
 
+#include <memory>
 #include <string_view>
+
+#include <google/protobuf/message.h>
 
 #include "../protocol/message.hh"
 
@@ -13,9 +16,19 @@ enum class RpcLane {
   kMalformed,  // a kFast candidate whose body fails to parse; protocol violation
 };
 
+// Result of classifying one request.
+struct RpcClassification {
+  RpcLane lane = RpcLane::kConv;
+  // Non-null iff lane == kFast: the request parsed during classification,
+  // handed onward so the fast path parses each request exactly once.
+  // kSlow/kConv/kMalformed never carry a parse (helpers re-parse off the
+  // reactor thread).
+  std::unique_ptr<google::protobuf::Message> parsed;
+};
+
 // Classifies one request from its opcode and full payload bytes. Pure
 // function (no logging, no global state); safe to call on the reactor
 // thread before any work is dispatched.
-RpcLane classify_rpc(MessageType type, std::string_view payload);
+RpcClassification classify_rpc(MessageType type, std::string_view payload);
 
 #endif  // HELIOS_NETWORK_RPC_LANE_HH

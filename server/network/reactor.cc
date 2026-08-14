@@ -283,8 +283,8 @@ bool Reactor::parse_and_dispatch(Connection &conn) {
   uint64_t sender_id = be64toh(hdr.sender_id);
 
   std::string_view payload_view(buf.data() + sizeof(MessageHeader), payload_size);
-  RpcLane lane = classify_(message_type, payload_view);
-  if (lane == RpcLane::kMalformed) {
+  RpcClassification cls = classify_(message_type, payload_view);
+  if (cls.lane == RpcLane::kMalformed) {
     // A kFast candidate whose body fails to parse is a protocol violation,
     // not work to hand to a legacy thread.
     LOG_ERROR("Reactor %d: fd=%d conn=%lu malformed body for opcode=%u "
@@ -293,11 +293,11 @@ bool Reactor::parse_and_dispatch(Connection &conn) {
     close_connection(conn.fd);  // erases conn; do not touch it after this
     return false;
   }
-  if (lane == RpcLane::kConv) {
-    migrate_connection(conn, 0, frame_len, lane);  // erases conn; do not touch it after this
+  if (cls.lane == RpcLane::kConv) {
+    migrate_connection(conn, 0, frame_len, cls.lane);  // erases conn; do not touch it after this
     return false;
   }
-  if (lane == RpcLane::kSlow) {
+  if (cls.lane == RpcLane::kSlow) {
     // DB_FENCE/DB_CREATE_TABLE/DB_CREATE_SECONDARY_INDEX are exempt from the
     // SERVER_OVERLOADED response below: DDL and fence admission failures
     // migrate instead, because the proxy has no failure-propagation path
@@ -306,19 +306,22 @@ bool Reactor::parse_and_dispatch(Connection &conn) {
     bool ddl_exempt = message_type == MessageType::DB_FENCE ||
                        message_type == MessageType::DB_CREATE_TABLE ||
                        message_type == MessageType::DB_CREATE_SECONDARY_INDEX;
-    return dispatch_to_helper(conn, message_type, sender_id, frame_len, lane, ddl_exempt);
+    return dispatch_to_helper(conn, message_type, sender_id, frame_len, cls.lane, ddl_exempt);
   }
 
-  std::string payload = buf.substr(sizeof(MessageHeader), payload_size);
+  // kFast: payload_view stays valid across the call (read_buf isn't touched
+  // until the erase below), so classify_rpc's parse is reused here instead
+  // of copying the frame out just to reparse it in the handler.
   std::string result;
-  if (!conn.dispatcher->handle_fast_rpc(sender_id, message_type, payload, result)) {
+  if (!conn.dispatcher->handle_fast_rpc(sender_id, message_type, payload_view, cls.parsed.get(),
+                                         result)) {
     // Hit its runtime budget (TX_EXECUTE_READ_PLAN only; every other
     // opcode's default handle_fast_rpc always returns true): discard
     // `result` and re-dispatch the same request to the general helper
     // pool, which runs it unbounded. No DDL exemption -- a budget hit
     // never comes from a DDL opcode.
     metrics_.budget_redispatched++;
-    return dispatch_to_helper(conn, message_type, sender_id, frame_len, lane,
+    return dispatch_to_helper(conn, message_type, sender_id, frame_len, cls.lane,
                                /*ddl_exempt=*/false);
   }
   if (!queue_response(conn, message_type, result)) {

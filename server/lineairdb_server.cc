@@ -73,7 +73,7 @@ std::shared_ptr<Reactor::RpcDispatcher> LineairDBServer::create_dispatcher() {
   return std::make_shared<Dispatcher>(db_manager_, row_counts_);
 }
 
-RpcLane LineairDBServer::classify_rpc(MessageType type, std::string_view payload) const {
+RpcClassification LineairDBServer::classify_rpc(MessageType type, std::string_view payload) const {
   return ::classify_rpc(type, payload);
 }
 
@@ -88,19 +88,38 @@ void LineairDBServer::Dispatcher::handle_rpc(uint64_t sender_id, MessageType mes
 }
 
 bool LineairDBServer::Dispatcher::handle_fast_rpc(uint64_t sender_id, MessageType message_type,
-                                                   const std::string &payload,
+                                                   std::string_view payload,
+                                                   const google::protobuf::Message *parsed,
                                                    std::string &result) {
-  if (message_type != MessageType::TX_EXECUTE_READ_PLAN) {
-    handle_rpc(sender_id, message_type, payload, result);
+  if (message_type == MessageType::TX_EXECUTE_READ_PLAN) {
+    RpcExecutionBudget budget{kFastReadPlanRowBudget, kFastReadPlanByteBudget};
+    ScopedRpcBudget guard(&budget);
+    if (parsed != nullptr) {
+      // classify_rpc parses exactly the request type keyed by the opcode,
+      // and the reactor passes the same opcode alongside, so this downcast
+      // is safe by construction.
+      rpc_->handle_read_plan(
+          static_cast<const LineairDB::Protocol::TxExecuteReadPlan::Request &>(*parsed),
+          payload.size(), result);
+    } else {
+      // Defensive fallback: never taken for kFast per classify_rpc's
+      // contract (parsed is always non-null there).
+      handle_rpc(sender_id, message_type, std::string(payload), result);
+    }
+    if (budget.exceeded) {
+      result.clear();  // never sent; the caller re-dispatches this request
+      return false;
+    }
     return true;
   }
 
-  RpcExecutionBudget budget{kFastReadPlanRowBudget, kFastReadPlanByteBudget};
-  ScopedRpcBudget guard(&budget);
-  handle_rpc(sender_id, message_type, payload, result);
-  if (budget.exceeded) {
-    result.clear();  // never sent; the caller re-dispatches this request
-    return false;
+  if (message_type == MessageType::TX_VALIDATE_AND_COMMIT && parsed != nullptr) {
+    rpc_->handle_validate_and_commit(
+        static_cast<const LineairDB::Protocol::TxValidateAndCommit::Request &>(*parsed),
+        payload.size(), result);
+    return true;
   }
+
+  handle_rpc(sender_id, message_type, std::string(payload), result);
   return true;
 }

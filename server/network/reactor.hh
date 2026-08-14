@@ -21,6 +21,14 @@ class HelperPool;  // helper_pool.hh; only a pointer member is needed here,
                     // avoiding a Reactor <-> HelperPool header cycle (see
                     // helper_pool.hh, which includes this header fully).
 
+namespace google {
+namespace protobuf {
+class Message;  // only a pointer parameter is named here; rpc_lane.hh (
+                 // included below) pulls in the real header, so a TU that
+                 // destroys an RpcClassification always sees the full type.
+}  // namespace protobuf
+}  // namespace google
+
 // Minimal epoll multi-reactor transport, opt-in via HELIOS_TRANSPORT=reactor
 // (see tcp_server.cc). Each Reactor owns one epoll fd, one physical-core-
 // pinned thread, and a set of non-blocking connections.
@@ -55,20 +63,25 @@ class Reactor {
 
     // kFast entry point: same request/response contract as handle_rpc, plus
     // a runtime budget that only TX_EXECUTE_READ_PLAN installs (see
-    // LineairDBServer::Dispatcher::handle_fast_rpc). Returns false when the
-    // execution hit its budget, in which case `result` is unspecified and
-    // must not be sent to the client -- the caller re-dispatches the same
-    // request to the general helper pool instead. Default implementation
-    // just forwards to handle_rpc and always returns true, so every other
-    // dispatcher (and every other opcode) is unaffected.
+    // LineairDBServer::Dispatcher::handle_fast_rpc). `parsed` is non-null
+    // for every kFast frame per classify_rpc's contract (rpc_lane.hh);
+    // `payload` is a view into the reactor's read buffer, valid only for
+    // the duration of this call. Returns false when the execution hit its
+    // budget, in which case `result` is unspecified and must not be sent to
+    // the client -- the caller re-dispatches the same request to the general
+    // helper pool instead. Default implementation just forwards to
+    // handle_rpc and always returns true, so every other dispatcher (and
+    // every other opcode) is unaffected.
     virtual bool handle_fast_rpc(uint64_t sender_id, MessageType message_type,
-                                  const std::string &payload, std::string &result) {
-      handle_rpc(sender_id, message_type, payload, result);
+                                  std::string_view payload,
+                                  const google::protobuf::Message *parsed,
+                                  std::string &result) {
+      handle_rpc(sender_id, message_type, std::string(payload), result);
       return true;
     }
   };
 
-  using ClassifyFn = std::function<RpcLane(MessageType, std::string_view)>;
+  using ClassifyFn = std::function<RpcClassification(MessageType, std::string_view)>;
   // Spawns the legacy per-connection thread for `fd`, primed with `primer`
   // bytes already read off the wire (see TcpServer::spawn_legacy_thread).
   using MigrateFn = std::function<void(int fd, std::string primer)>;

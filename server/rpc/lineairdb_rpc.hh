@@ -1,6 +1,7 @@
 #pragma once
 
 #include <string>
+#include <cstddef>
 #include <memory>
 #include <mutex>
 #include <shared_mutex>
@@ -12,6 +13,7 @@
 #include "../protocol/message.hh"
 #include "../storage/database_manager.hh"
 #include "../storage/transaction_manager.hh"
+#include "lineairdb.pb.h"
 
 // Server-wide table row count tracker, shared across all connections.
 struct TableRowCounts {
@@ -57,6 +59,15 @@ public:
     void handle_rpc(uint64_t sender_id, MessageType message_type,
                    const std::string& message, std::string& result);
 
+    // Reactor fast-path entries: same behavior as handle_rpc's
+    // TX_EXECUTE_READ_PLAN / TX_VALIDATE_AND_COMMIT arms, minus the request
+    // parse (the caller passes the request classify_rpc already parsed).
+    // request_bytes = wire payload size, used only for timing variant bins.
+    void handle_read_plan(const LineairDB::Protocol::TxExecuteReadPlan::Request& request,
+                          size_t request_bytes, std::string& result);
+    void handle_validate_and_commit(const LineairDB::Protocol::TxValidateAndCommit::Request& request,
+                                    size_t request_bytes, std::string& result);
+
 private:
     std::shared_ptr<DatabaseManager> db_manager_;
     std::shared_ptr<TransactionManager> tx_manager_;
@@ -91,10 +102,14 @@ private:
     // Stateless operations
     void handleTxStatelessRead(const std::string& message, std::string& result);
     void handleTxStatelessBatchRead(const std::string& message, std::string& result);
-    void handleTxValidateAndCommit(const std::string& message, std::string& result);
+    void handleTxValidateAndCommit(const std::string& message, std::string& result);  // parses, delegates
+    void handleTxValidateAndCommit(const LineairDB::Protocol::TxValidateAndCommit::Request& request,
+                                   std::string& result);  // core
 
     // Read-plan execution
-    void handleTxExecuteReadPlan(const std::string& message, std::string& result);
+    void handleTxExecuteReadPlan(const std::string& message, std::string& result);  // parses, delegates
+    void handleTxExecuteReadPlan(const LineairDB::Protocol::TxExecuteReadPlan::Request& request,
+                                 std::string& result);  // core
 
     // DuckDB SQL bridge (raw SQL text over live PAX storage).
     void handleTxExecuteSqlDuckdb(const std::string& message, std::string& result);

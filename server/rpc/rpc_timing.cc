@@ -127,9 +127,8 @@ thread_local uint64_t tl_last_commit_stats_bytes = 0;
 // range evidence counts too, since the range-work guard bounds evidence
 // count together with the rest of the set instead of vetoing on range
 // presence alone).
-uint32_t commit_variant_key(const std::string &message, const std::string &result) {
-  LineairDB::Protocol::TxValidateAndCommit::Request req;
-  if (!req.ParseFromString(message)) return kVariantParseFailed;
+uint32_t commit_variant_key(const LineairDB::Protocol::TxValidateAndCommit::Request &req,
+                             size_t frame_bytes, const std::string &result) {
   const bool fence = req.fence();
   const uint64_t entries = static_cast<uint64_t>(req.reads_size()) +
                            static_cast<uint64_t>(req.writes_size()) +
@@ -139,13 +138,21 @@ uint32_t commit_variant_key(const std::string &message, const std::string &resul
   const size_t entry_bin =
       ceil_bin(entries, kCommitEntriesBinEdges, kNumCommitEntriesBinEdges);
   const size_t frame_bin =
-      ceil_bin(kib_ceil(message.size()), kSizeBinEdges, kNumSizeBinEdges);
+      ceil_bin(kib_ceil(frame_bytes), kSizeBinEdges, kNumSizeBinEdges);
   const size_t resp_bin =
       ceil_bin(kib_ceil(result.size()), kSizeBinEdges, kNumSizeBinEdges);
   const size_t stats_bin =
       ceil_bin(kib_ceil(tl_last_commit_stats_bytes), kSizeBinEdges, kNumSizeBinEdges);
   return (fence ? 1u : 0u) | ((entry_bin & 0xFu) << 1) | ((frame_bin & 0xFu) << 5) |
          ((resp_bin & 0xFu) << 9) | ((stats_bin & 0xFu) << 13);
+}
+
+// String path (legacy transport / kSlow helper pool): parses then delegates
+// to the typed core above.
+uint32_t commit_variant_key(const std::string &message, const std::string &result) {
+  LineairDB::Protocol::TxValidateAndCommit::Request req;
+  if (!req.ParseFromString(message)) return kVariantParseFailed;
+  return commit_variant_key(req, message.size(), result);
 }
 
 void unpack_commit_variant(uint32_t key, bool &fence, size_t &entry_bin, size_t &frame_bin,
@@ -162,9 +169,8 @@ void unpack_commit_variant(uint32_t key, bool &fence, size_t &entry_bin, size_t 
 // has scan_limit()==0 (protobuf's unset-uint64 default is also 0, so this
 // only looks at steps where is_scan() is true; non-scan point-lookup steps
 // carry no scan_limit signal at all).
-uint32_t read_plan_variant_key(const std::string &message, const std::string &result) {
-  LineairDB::Protocol::TxExecuteReadPlan::Request req;
-  if (!req.ParseFromString(message)) return kVariantParseFailed;
+uint32_t read_plan_variant_key(const LineairDB::Protocol::TxExecuteReadPlan::Request &req,
+                                const std::string &result) {
   const size_t steps = static_cast<size_t>(req.steps_size());
   const size_t steps_bin =
       ceil_bin(steps, kReadPlanStepsBinEdges, kNumReadPlanStepsBinEdges);
@@ -180,6 +186,14 @@ uint32_t read_plan_variant_key(const std::string &message, const std::string &re
       ceil_bin(kib_ceil(result.size()), kSizeBinEdges, kNumSizeBinEdges);
   return (steps_bin & 0xFu) | ((unbounded ? 1u : 0u) << 4) | ((rows_bin & 0x7u) << 5) |
          ((resp_bin & 0xFu) << 8);
+}
+
+// String path (legacy transport / kSlow helper pool): the only use of
+// `message` was the parse, so delegate to the typed core above.
+uint32_t read_plan_variant_key(const std::string &message, const std::string &result) {
+  LineairDB::Protocol::TxExecuteReadPlan::Request req;
+  if (!req.ParseFromString(message)) return kVariantParseFailed;
+  return read_plan_variant_key(req, result);
 }
 
 void unpack_read_plan_variant(uint32_t key, size_t &steps_bin, bool &unbounded,
@@ -499,6 +513,26 @@ void record_variant(MessageType type, uint64_t elapsed_us, const std::string &me
     uint32_t key = read_plan_variant_key(message, result);
     if (key != kVariantParseFailed) tl_table.read_plan_variants[key].record(elapsed_us);
   }
+}
+
+// Reactor fast-path overloads: the request is already parsed, so the key is
+// always computable (no kVariantParseFailed case -- classify_rpc only hands
+// a parse to the kFast lane once it has already parsed successfully).
+void record_variant(MessageType type, uint64_t elapsed_us,
+                     const LineairDB::Protocol::TxValidateAndCommit::Request &request,
+                     size_t request_bytes, const std::string &result) {
+  record(type, elapsed_us);
+  uint32_t key = commit_variant_key(request, request_bytes, result);
+  tl_table.commit_variants[key].record(elapsed_us);
+}
+
+void record_variant(MessageType type, uint64_t elapsed_us,
+                     const LineairDB::Protocol::TxExecuteReadPlan::Request &request,
+                     size_t request_bytes, const std::string &result) {
+  record(type, elapsed_us);
+  (void)request_bytes;  // read-plan's variant key doesn't use frame size
+  uint32_t key = read_plan_variant_key(request, result);
+  tl_table.read_plan_variants[key].record(elapsed_us);
 }
 
 void note_inspected_rows(uint64_t rows) { tl_last_inspected_rows = rows; }

@@ -40,10 +40,13 @@
 // breakdown (fence/entries/frame-size/response-size/stats-size for commit;
 // steps/scan_limit/inspected-rows/response-size for read plan), because
 // opcode-level aggregates dilute cheap and expensive request shapes
-// together. The variant key is derived by parsing the request (and reading
-// the already-populated response) once per call, only under
-// HELIOS_RPC_TIMING=1, so the extra parse is opt-in overhead, never a
-// hot-path cost.
+// together. The string path (legacy transport and the kSlow helper pool)
+// derives the variant by parsing the request (and reading the
+// already-populated response) once per call, only under
+// HELIOS_RPC_TIMING=1, so the extra parse is opt-in overhead there. The
+// reactor fast path instead supplies the request classify_rpc already
+// parsed via time_call_parsed()/the typed record_variant() overloads below,
+// so timing adds no parse on that path.
 //
 // Two per-call facts can't be read back from the request/response bytes
 // alone, so the handlers report them explicitly via a single-shot
@@ -55,11 +58,24 @@
 //   - TX_VALIDATE_AND_COMMIT's touched-table stats response sub-size
 //     (note_commit_stats_bytes), framing included.
 
+#include <cstddef>
 #include <cstdint>
 #include <ctime>
 #include <string>
 
 #include "../protocol/message.hh"
+
+// Forward declarations only: the reactor fast-path call sites already have
+// the full generated types in scope (they hold a parsed request); this
+// header stays independent of lineairdb.pb.h. The nested `::Request` names
+// used elsewhere in this codebase (TxValidateAndCommit::Request etc.) are
+// typedefs for these same classes.
+namespace LineairDB {
+namespace Protocol {
+class TxValidateAndCommit_Request;
+class TxExecuteReadPlan_Request;
+}  // namespace Protocol
+}  // namespace LineairDB
 
 namespace rpc_timing {
 
@@ -75,6 +91,18 @@ void record(MessageType type, uint64_t elapsed_us);
 // opcode-level record() above for any other opcode.
 void record_variant(MessageType type, uint64_t elapsed_us, const std::string &message,
                      const std::string &result);
+
+// Typed overloads for the reactor fast path: same binning as the string
+// overload above, but the request is already parsed, so no call here parses
+// it again. `request_bytes` is the wire payload size (used by the commit
+// variant key's frame-size bin; the read-plan overload ignores it, kept
+// only so both call sites share one shape via time_call_parsed()).
+void record_variant(MessageType type, uint64_t elapsed_us,
+                     const LineairDB::Protocol::TxValidateAndCommit_Request &request,
+                     size_t request_bytes, const std::string &result);
+void record_variant(MessageType type, uint64_t elapsed_us,
+                     const LineairDB::Protocol::TxExecuteReadPlan_Request &request,
+                     size_t request_bytes, const std::string &result);
 
 // TX_EXECUTE_READ_PLAN: report this call's total inspected/probed row count
 // (server/rpc boundary: rows pulled from scan results across all steps and
@@ -145,6 +173,38 @@ inline void time_call(MessageType type, const std::string &message, std::string 
   uint64_t elapsed_us = static_cast<uint64_t>(sec_diff) * 1000000ULL +
                         static_cast<uint64_t>(nsec_diff) / 1000ULL;
   record_variant(type, elapsed_us, message, result);
+}
+
+// Reactor fast-path overload: `req` is the request classify_rpc already
+// parsed, so -- unlike the string time_call() overload above -- this adds no
+// parse under HELIOS_RPC_TIMING=1. Mirrors the string overload's clock
+// arithmetic and defensive note_* resets; records via the typed
+// record_variant() overload for Req's type. `request_bytes` is the wire
+// payload size; the commit variant key uses it, the read-plan one doesn't
+// (kept for a uniform call shape across both call sites).
+template <typename Req, typename Fn>
+inline void time_call_parsed(MessageType type, const Req &req, size_t request_bytes,
+                              std::string &result, Fn &&fn) {
+  if (!enabled()) {
+    fn();
+    return;
+  }
+  note_inspected_rows(0);
+  note_commit_stats_bytes(0);
+  struct timespec t0{};
+  struct timespec t1{};
+  clock_gettime(CLOCK_MONOTONIC, &t0);
+  fn();
+  clock_gettime(CLOCK_MONOTONIC, &t1);
+  int64_t sec_diff = static_cast<int64_t>(t1.tv_sec) - static_cast<int64_t>(t0.tv_sec);
+  int64_t nsec_diff = static_cast<int64_t>(t1.tv_nsec) - static_cast<int64_t>(t0.tv_nsec);
+  if (nsec_diff < 0) {
+    sec_diff -= 1;
+    nsec_diff += 1000000000LL;
+  }
+  uint64_t elapsed_us = static_cast<uint64_t>(sec_diff) * 1000000ULL +
+                        static_cast<uint64_t>(nsec_diff) / 1000ULL;
+  record_variant(type, elapsed_us, req, request_bytes, result);
 }
 
 // No-op unless timing is enabled. Blocks SIGTERM/SIGINT on the calling

@@ -22,7 +22,7 @@ class LineairDBServer : public TcpServer {
  protected:
   void handle_client(int client_socket, std::string primer = std::string()) override;
   std::shared_ptr<Reactor::RpcDispatcher> create_dispatcher() override;
-  RpcLane classify_rpc(MessageType type, std::string_view payload) const override;
+  RpcClassification classify_rpc(MessageType type, std::string_view payload) const override;
 
  private:
   // Reactor-mode dispatch surface: wraps its own LineairDBRpc +
@@ -41,9 +41,12 @@ class LineairDBServer : public TcpServer {
                      std::string &result) override;
     // TX_EXECUTE_READ_PLAN only: installs a runtime row/byte budget for the
     // call (see rpc_budget.hh) and returns false, discarding `result`, when
-    // it was exceeded. Every other opcode just forwards to handle_rpc.
-    bool handle_fast_rpc(uint64_t sender_id, MessageType message_type,
-                          const std::string &payload, std::string &result) override;
+    // it was exceeded. TX_EXECUTE_READ_PLAN / TX_VALIDATE_AND_COMMIT dispatch
+    // through LineairDBRpc's typed entries when `parsed` is non-null (the
+    // classify_rpc contract), skipping their re-parse; every other opcode
+    // (or a null `parsed`) just forwards to handle_rpc.
+    bool handle_fast_rpc(uint64_t sender_id, MessageType message_type, std::string_view payload,
+                          const google::protobuf::Message *parsed, std::string &result) override;
 
    private:
     std::shared_ptr<TransactionManager> tx_manager_;

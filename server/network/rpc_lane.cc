@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <utility>
 
 #include "lineairdb.pb.h"
@@ -58,48 +59,51 @@ bool commit_admitted(uint32_t entries_bin, uint32_t frame_kib_bin) {
   return false;
 }
 
-RpcLane classify_commit(std::string_view payload) {
+RpcClassification classify_commit(std::string_view payload) {
   // Size check first: an over-cap commit must not pay the parse on the
   // reactor thread -- it is slow regardless of content.
-  if (payload.size() > kCommitMaxPayloadBytes) return RpcLane::kSlow;
-  LineairDB::Protocol::TxValidateAndCommit::Request req;
-  if (!req.ParseFromArray(payload.data(), static_cast<int>(payload.size()))) {
-    return RpcLane::kMalformed;
+  if (payload.size() > kCommitMaxPayloadBytes) return RpcClassification{RpcLane::kSlow};
+  auto req = std::make_unique<LineairDB::Protocol::TxValidateAndCommit::Request>();
+  if (!req->ParseFromArray(payload.data(), static_cast<int>(payload.size()))) {
+    return RpcClassification{RpcLane::kMalformed};
   }
   // Range reads and fenced commits are unconditionally slow: worst-case
   // re-scan cost cannot be bounded from the request; slow regardless of
   // the bins below.
-  if (req.fence() || req.range_reads_size() != 0) return RpcLane::kSlow;
-  if (req.row_deltas_size() > kCommitMaxRowDeltas) return RpcLane::kSlow;
+  if (req->fence() || req->range_reads_size() != 0) return RpcClassification{RpcLane::kSlow};
+  if (req->row_deltas_size() > kCommitMaxRowDeltas) return RpcClassification{RpcLane::kSlow};
 
-  uint64_t entries = static_cast<uint64_t>(req.reads_size()) +
-                      static_cast<uint64_t>(req.writes_size()) +
-                      static_cast<uint64_t>(req.deletes_size()) +
-                      static_cast<uint64_t>(req.secondary_index_ops_size()) +
-                      static_cast<uint64_t>(req.range_reads_size()) +
-                      static_cast<uint64_t>(req.row_deltas_size());
+  uint64_t entries = static_cast<uint64_t>(req->reads_size()) +
+                      static_cast<uint64_t>(req->writes_size()) +
+                      static_cast<uint64_t>(req->deletes_size()) +
+                      static_cast<uint64_t>(req->secondary_index_ops_size()) +
+                      static_cast<uint64_t>(req->range_reads_size()) +
+                      static_cast<uint64_t>(req->row_deltas_size());
   uint32_t entries_bin = ceil_to_bin(entries, kCommitEntriesBins, kCommitEntriesBinsCount);
   uint32_t frame_kib_bin =
       ceil_to_bin(kib_ceil(payload.size()), kCommitFrameKibBins, kCommitFrameKibBinsCount);
-  if (entries_bin == 0 || frame_kib_bin == 0) return RpcLane::kSlow;
-  return commit_admitted(entries_bin, frame_kib_bin) ? RpcLane::kFast : RpcLane::kSlow;
+  if (entries_bin == 0 || frame_kib_bin == 0) return RpcClassification{RpcLane::kSlow};
+  if (!commit_admitted(entries_bin, frame_kib_bin)) return RpcClassification{RpcLane::kSlow};
+  return RpcClassification{RpcLane::kFast, std::move(req)};
 }
 
-RpcLane classify_read_plan(std::string_view payload) {
-  LineairDB::Protocol::TxExecuteReadPlan::Request req;
-  if (!req.ParseFromArray(payload.data(), static_cast<int>(payload.size()))) {
-    return RpcLane::kMalformed;
+RpcClassification classify_read_plan(std::string_view payload) {
+  auto req = std::make_unique<LineairDB::Protocol::TxExecuteReadPlan::Request>();
+  if (!req->ParseFromArray(payload.data(), static_cast<int>(payload.size()))) {
+    return RpcClassification{RpcLane::kMalformed};
   }
-  if (req.steps_size() > kReadPlanMaxSteps) return RpcLane::kSlow;
-  for (const auto &step : req.steps()) {
-    if (step.scan_limit() != 0 && step.scan_limit() > kReadPlanMaxScanLimit) return RpcLane::kSlow;
+  if (req->steps_size() > kReadPlanMaxSteps) return RpcClassification{RpcLane::kSlow};
+  for (const auto &step : req->steps()) {
+    if (step.scan_limit() != 0 && step.scan_limit() > kReadPlanMaxScanLimit) {
+      return RpcClassification{RpcLane::kSlow};
+    }
   }
-  return RpcLane::kFast;
+  return RpcClassification{RpcLane::kFast, std::move(req)};
 }
 
 }  // namespace
 
-RpcLane classify_rpc(MessageType type, std::string_view payload) {
+RpcClassification classify_rpc(MessageType type, std::string_view payload) {
   switch (type) {
     // kFast candidates, subject to the caps above.
     case MessageType::TX_VALIDATE_AND_COMMIT:
@@ -116,11 +120,11 @@ RpcLane classify_rpc(MessageType type, std::string_view payload) {
     case MessageType::TX_EXECUTE_SQL_DUCKDB:
     case MessageType::TX_STATELESS_READ:
     case MessageType::TX_STATELESS_BATCH_READ:
-      return RpcLane::kSlow;
+      return RpcClassification{RpcLane::kSlow};
 
     // kConv: every remaining defined opcode references cross-RPC transaction
     // state; unknown opcodes never reach here (rejected at header decode).
     default:
-      return RpcLane::kConv;
+      return RpcClassification{RpcLane::kConv};
   }
 }

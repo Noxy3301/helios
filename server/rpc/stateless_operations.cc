@@ -80,9 +80,13 @@ void LineairDBRpc::handleTxStatelessBatchRead(const std::string& message,
 void LineairDBRpc::handleTxValidateAndCommit(const std::string& message,
                                              std::string& result) {
     LineairDB::Protocol::TxValidateAndCommit::Request request;
-    LineairDB::Protocol::TxValidateAndCommit::Response response;
-
     request.ParseFromString(message);
+    handleTxValidateAndCommit(request, result);
+}
+
+void LineairDBRpc::handleTxValidateAndCommit(
+    const LineairDB::Protocol::TxValidateAndCommit::Request& request, std::string& result) {
+    LineairDB::Protocol::TxValidateAndCommit::Response response;
 
     // Tables this commit's response may name; computed before install to bound the envelope.
     std::unordered_set<std::string> touched_tables;
@@ -199,4 +203,20 @@ void LineairDBRpc::handleTxValidateAndCommit(const std::string& message,
     rpc_timing::note_commit_stats_bytes(stats_bytes);
 
     result = response.SerializeAsString();
+}
+
+// Reactor fast-path entry: request is already parsed (classify_rpc), so this
+// times/records via the typed rpc_timing overload instead of the string
+// path's parse-then-time_call.
+void LineairDBRpc::handle_validate_and_commit(
+    const LineairDB::Protocol::TxValidateAndCommit::Request& request, size_t request_bytes,
+    std::string& result) {
+    rpc_timing::time_call_parsed(MessageType::TX_VALIDATE_AND_COMMIT, request, request_bytes, result,
+                                 [&] { handleTxValidateAndCommit(request, result); });
+    // Mirrors handle_rpc's TX_VALIDATE_AND_COMMIT arm: close this thread's
+    // masstree RCU critical section after the self-contained call.
+    if (db_manager_) {
+        auto db = db_manager_->get_database();
+        if (db) db->ReleaseMasstreeThreadEpoch();
+    }
 }

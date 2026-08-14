@@ -182,8 +182,13 @@ uint64_t budgeted_row_limit(uint64_t declared_limit) {
 void LineairDBRpc::handleTxExecuteReadPlan(const std::string& message,
                                            std::string& result) {
     LineairDB::Protocol::TxExecuteReadPlan::Request request;
-    LineairDB::Protocol::TxExecuteReadPlan::Response response;
     request.ParseFromString(message);
+    handleTxExecuteReadPlan(request, result);
+}
+
+void LineairDBRpc::handleTxExecuteReadPlan(
+    const LineairDB::Protocol::TxExecuteReadPlan::Request& request, std::string& result) {
+    LineairDB::Protocol::TxExecuteReadPlan::Response response;
     response.set_ok(true);
 
     // Scoped to this call only, so concurrent calls on other threads never
@@ -840,4 +845,19 @@ void LineairDBRpc::handleTxExecuteReadPlan(const std::string& message,
     }
 
     flat_plan::encode_to_string(response, result);
+}
+
+// Reactor fast-path entry: request is already parsed (classify_rpc), so this
+// times/records via the typed rpc_timing overload instead of the string
+// path's parse-then-time_call.
+void LineairDBRpc::handle_read_plan(const LineairDB::Protocol::TxExecuteReadPlan::Request& request,
+                                    size_t request_bytes, std::string& result) {
+    rpc_timing::time_call_parsed(MessageType::TX_EXECUTE_READ_PLAN, request, request_bytes, result,
+                                 [&] { handleTxExecuteReadPlan(request, result); });
+    // Mirrors handle_rpc's TX_EXECUTE_READ_PLAN arm: close this thread's
+    // masstree RCU critical section after the self-contained call.
+    if (db_manager_) {
+        auto db = db_manager_->get_database();
+        if (db) db->ReleaseMasstreeThreadEpoch();
+    }
 }

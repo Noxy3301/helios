@@ -32,7 +32,7 @@ class TcpServer {
   virtual std::shared_ptr<Reactor::RpcDispatcher> create_dispatcher() = 0;
   // Classifies (opcode, payload) into the lane a reactor thread dispatches
   // it to; see rpc_lane.hh.
-  virtual RpcLane classify_rpc(MessageType type, std::string_view payload) const = 0;
+  virtual RpcClassification classify_rpc(MessageType type, std::string_view payload) const = 0;
 
  private:
   uint16_t port_;
