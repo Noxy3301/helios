@@ -95,6 +95,8 @@ const char* message_type_name(MessageType t) {
       return "TX_GET_TABLE_STATS";
     case MessageType::TX_EXECUTE_SQL_DUCKDB:
       return "TX_EXECUTE_SQL_DUCKDB";
+    case MessageType::SERVER_OVERLOADED:
+      return "SERVER_OVERLOADED";
   }
   return "UNDEFINED";
 }

@@ -604,5 +604,10 @@ int prefetch_abort_errno(THD *thd, LineairDBTransaction *tx) {
     return prefetch_reject_unsupported(thd, tx, "prefetch cache miss");
   }
   thd_mark_transaction_to_rollback(thd, 1);
+  // The read-plan RPC itself (not just OCC contention) can be the cause: the
+  // server rejected it under overload, which is retryable, not a deadlock.
+  if (tx->aborted_by_overload()) {
+    return HA_ERR_LOCK_WAIT_TIMEOUT;
+  }
   return HA_ERR_LOCK_DEADLOCK;
 }

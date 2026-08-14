@@ -291,6 +291,9 @@ void LineairDBTransaction::execute_read_plan(
   if (!result.ok || result.steps.size() != steps.size()) {
     rpc_trace_.record_local_view("abort_read_plan_rpc");
     is_aborted_ = true;
+    // Capture the cause now: a later RPC (e.g. optimizer stats) would reset
+    // the proxy-wide flag before the error mapping runs.
+    if (lineairdb_proxy->last_rpc_overloaded()) aborted_by_overload_ = true;
     return;
   }
 
@@ -1479,7 +1482,7 @@ bool LineairDBTransaction::fallback_to_normal_transaction(const char* reason) {
 }
 
 bool LineairDBTransaction::prefetch_validate_and_commit(
-    bool *transport_error) {
+    bool *transport_error, bool *overloaded) {
   if (transport_error != nullptr) *transport_error = transport_error_;
   bool was_aborted = is_aborted_;
 
@@ -1520,7 +1523,11 @@ bool LineairDBTransaction::prefetch_validate_and_commit(
     if (!committed && !abort_reason.empty()) {
       rpc_trace_.record_local_view("abort_validate_" + abort_reason);
     }
+    if (!committed && lineairdb_proxy->last_rpc_overloaded()) {
+      aborted_by_overload_ = true;
+    }
   }
+  if (overloaded != nullptr) *overloaded = aborted_by_overload_;
   if (!committed) {
     thd_mark_transaction_to_rollback(thread, 1);
   }
@@ -1594,10 +1601,12 @@ void LineairDBTransaction::set_status_to_abort() {
   is_aborted_ = true;
 }
 
-bool LineairDBTransaction::end_transaction(bool *transport_error) {
+bool LineairDBTransaction::end_transaction(bool *transport_error,
+                                           bool *overloaded) {
   if (transport_error != nullptr) *transport_error = transport_error_;
+  if (overloaded != nullptr) *overloaded = aborted_by_overload_;
   if (prefetch_mode_) {
-    return prefetch_validate_and_commit(transport_error);
+    return prefetch_validate_and_commit(transport_error, overloaded);
   }
 
   assert(tx_id != -1);

@@ -96,7 +96,11 @@ public:
 
   void begin_transaction();
   void set_status_to_abort();
-  bool end_transaction(bool *transport_error = nullptr);
+  // `overloaded`, when non-null, reports whether the failing commit (or an
+  // earlier read-plan RPC of this transaction) was rejected by the server
+  // under overload -- a retryable condition, not contention.
+  bool end_transaction(bool *transport_error = nullptr,
+                       bool *overloaded = nullptr);
   void fence() const;
   void set_prefetch_mode(bool enabled) { prefetch_mode_ = enabled; }
   bool is_prefetch_mode() const { return prefetch_mode_; }
@@ -161,6 +165,10 @@ public:
 
   bool aborted_by_cache_miss() const { return aborted_by_cache_miss_; }
   bool has_transport_error() const { return transport_error_; }
+  // Sticky per-transaction cause: set the moment an aborting RPC of this
+  // transaction is rejected with SERVER_OVERLOADED, so later unrelated RPCs
+  // (e.g. optimizer stats) cannot mask it before the error mapping runs.
+  bool aborted_by_overload() const { return aborted_by_overload_; }
 
   inline void mark_transport_error() {
     transport_error_ = true;
@@ -221,6 +229,9 @@ private:
   // Set when the abort came from a prefetch cache miss (an unstaged read
   // surface), so the handler returns a non-retryable error, not a deadlock.
   bool aborted_by_cache_miss_{false};
+  // Set when an aborting RPC of this transaction was rejected with
+  // SERVER_OVERLOADED (captured immediately after the failing call).
+  bool aborted_by_overload_{false};
   // A lost RPC connection is not OCC contention and must never be surfaced as
   // a retryable deadlock (or as an empty scan result).
   bool transport_error_{false};
@@ -373,7 +384,8 @@ private:
       const std::string& table_name, const std::string& index_name,
       const std::string& start_key, const std::string& end_key,
       bool reverse_scan, uint64_t row_limit) const;
-  bool prefetch_validate_and_commit(bool *transport_error);
+  bool prefetch_validate_and_commit(bool *transport_error,
+                                    bool *overloaded = nullptr);
   bool thd_is_transaction() const;
   void register_transaction_to_mysql();
   void register_single_statement_to_mysql();

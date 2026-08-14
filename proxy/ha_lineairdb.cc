@@ -500,6 +500,12 @@ int ha_lineairdb::abort_errno(LineairDBTransaction *tx) {
   if (tx != nullptr && tx->aborted_by_cache_miss()) {
     return prefetch_reject_unsupported(ha_thd(), tx, "prefetch cache miss");
   }
+  // A server overload rejection of the aborting RPC is retryable load
+  // shedding, not contention.
+  if (tx != nullptr && tx->aborted_by_overload()) {
+    thd_mark_transaction_to_rollback(ha_thd(), 1);
+    return HA_ERR_LOCK_WAIT_TIMEOUT;
+  }
   // Default: a genuine OCC/server abort is retryable contention.
   thd_mark_transaction_to_rollback(ha_thd(), 1);
   return HA_ERR_LOCK_DEADLOCK;
@@ -522,11 +528,17 @@ static int lineairdb_commit(handlerton *hton, THD *thd, bool all) {
     return 0;
 
   bool transport_error = false;
-  const bool committed = ctx->tx->end_transaction(&transport_error);
+  bool overloaded = false;
+  const bool committed = ctx->tx->end_transaction(&transport_error, &overloaded);
   ctx->tx = nullptr;
 
   if (!committed) {
     thd_mark_transaction_to_rollback(thd, true);
+    // A server overload rejection is retryable load shedding, not a lost
+    // connection or genuine deadlock.
+    if (overloaded) {
+      return HA_ERR_LOCK_WAIT_TIMEOUT;
+    }
     return transport_error ? HA_ERR_NO_CONNECTION : HA_ERR_LOCK_DEADLOCK;
   }
   return 0;

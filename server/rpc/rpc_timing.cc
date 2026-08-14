@@ -318,6 +318,7 @@ const char *opcode_name(MessageType type) {
     case MessageType::TX_EXECUTE_READ_PLAN: return "TX_EXECUTE_READ_PLAN";
     case MessageType::TX_GET_TABLE_STATS: return "TX_GET_TABLE_STATS";
     case MessageType::TX_EXECUTE_SQL_DUCKDB: return "TX_EXECUTE_SQL_DUCKDB";
+    case MessageType::SERVER_OVERLOADED: return "SERVER_OVERLOADED";
   }
   return "UNKNOWN_OPCODE";
 }

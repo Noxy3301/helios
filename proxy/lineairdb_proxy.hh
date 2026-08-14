@@ -83,7 +83,11 @@ enum class MessageType : uint32_t {
     TX_GET_TABLE_STATS = 31,
 
     // DuckDB SQL bridge (raw SQL text). See lineairdb.proto.
-    TX_EXECUTE_SQL_DUCKDB = 36
+    TX_EXECUTE_SQL_DUCKDB = 36,
+
+    // Generic response-only status: the server rejected this request under
+    // overload; the client should retry after backoff.
+    SERVER_OVERLOADED = 37
 };
 
 /**
@@ -338,6 +342,10 @@ public:
     // Route per-RPC measurements to the active transaction trace.
     void set_current_trace(TxRpcTrace* trace) { current_trace_ = trace; }
 
+    // True when the most recent send_message_with_header() failed because the
+    // server replied SERVER_OVERLOADED instead of the normal typed response.
+    bool last_rpc_overloaded() const { return last_rpc_overloaded_; }
+
 private:
     std::unordered_map<std::string, int64_t> table_stats_cache_;
     std::unordered_map<std::string, IndexNdvResult> last_index_ndv_;
@@ -362,6 +370,9 @@ private:
     std::string host_;
     int port_;
     TxRpcTrace* current_trace_ = nullptr;
+    // Set by send_message_with_header() when the server's last reply was
+    // SERVER_OVERLOADED; cleared at the top of every call.
+    bool last_rpc_overloaded_ = false;
 };
 
 #endif // LINEAIRDB_PROXY_H

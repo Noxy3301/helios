@@ -56,6 +56,10 @@ enum OpCode {
     // Executes raw SQL text on the server's embedded DuckDB executor, which
     // reads PAX storage in place.
     TX_EXECUTE_SQL_DUCKDB = 36;
+
+    // Generic response-only status: the server rejected this request under
+    // overload; the client should retry after backoff.
+    SERVER_OVERLOADED = 37;
 }
 
 enum BatchOpType {

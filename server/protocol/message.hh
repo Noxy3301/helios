@@ -63,7 +63,11 @@ enum class MessageType : uint32_t {
   TX_GET_TABLE_STATS = 31,
 
   // DuckDB SQL bridge (raw SQL text). See lineairdb.proto.
-  TX_EXECUTE_SQL_DUCKDB = 36
+  TX_EXECUTE_SQL_DUCKDB = 36,
+
+  // Generic response-only status: the server rejected this request under
+  // overload; the client should retry after backoff.
+  SERVER_OVERLOADED = 37
 };
 
 // Hard cap on a single RPC frame's payload. Both receive paths must reject

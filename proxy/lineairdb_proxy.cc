@@ -1570,6 +1570,7 @@ bool LineairDBProxy::send_message_with_header(const std::string& serialized_requ
                                               const std::string& meta) {
     auto rpc_start_ts = std::chrono::steady_clock::now();
     const uint32_t req_bytes = static_cast<uint32_t>(serialized_request.size());
+    last_rpc_overloaded_ = false;
 
     if (!connected_) {
         LOG_ERROR("SEND_MESSAGE: Not connected!");
@@ -1649,6 +1650,23 @@ bool LineairDBProxy::send_message_with_header(const std::string& serialized_requ
     } else {
         LOG_DEBUG("SEND_MESSAGE: No response payload (empty response)");
         serialized_response.clear();
+    }
+
+    // Generic overload response: the server rejected this request under
+    // load instead of running its handler. Payload is drained above
+    // (expected empty); the caller must retry after backoff.
+    if (response_message_type == static_cast<uint32_t>(MessageType::SERVER_OVERLOADED)) {
+        LOG_WARNING("SEND_MESSAGE: server overloaded, rejected request message_type=%u",
+                    static_cast<uint32_t>(message_type));
+        last_rpc_overloaded_ = true;
+        return false;
+    }
+    // The server always echoes the request's opcode in the response header;
+    // anything else is a protocol error, not a legitimate reply.
+    if (response_message_type != static_cast<uint32_t>(message_type)) {
+        LOG_ERROR("SEND_MESSAGE: response message_type mismatch: request=%u response=%u",
+                   static_cast<uint32_t>(message_type), response_message_type);
+        return false;
     }
 
     LOG_DEBUG("SEND_MESSAGE: Message exchange completed successfully");
