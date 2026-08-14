@@ -52,8 +52,8 @@
 // handlers accumulate these unconditionally (relaxed atomic adds during
 // scans/probes, one ByteSizeLong pass per commit):
 //   - TX_EXECUTE_READ_PLAN's inspected/probed row count (note_inspected_rows)
-//   - TX_VALIDATE_AND_COMMIT's table-stats-snapshot response sub-size
-//     (note_commit_stats_bytes)
+//   - TX_VALIDATE_AND_COMMIT's touched-table stats response sub-size
+//     (note_commit_stats_bytes), framing included.
 
 #include <cstdint>
 #include <ctime>
@@ -83,9 +83,9 @@ void record_variant(MessageType type, uint64_t elapsed_us, const std::string &me
 // so every return path reports. A no-op call (0) is fine when unused.
 void note_inspected_rows(uint64_t rows);
 
-// TX_VALIDATE_AND_COMMIT: report this call's table-stats-snapshot response
-// sub-size in bytes (the repeated TableRowCount field's serialized weight),
-// separate from the response's total size.
+// TX_VALIDATE_AND_COMMIT: report this call's touched-table stats response
+// sub-size in bytes (the repeated TableRowCount field's serialized weight,
+// tag and length framing included), separate from the response's total size.
 void note_commit_stats_bytes(uint64_t bytes);
 
 // Times fn() with CLOCK_MONOTONIC and records it under `type` when timing is

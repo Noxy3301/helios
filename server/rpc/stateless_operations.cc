@@ -1,11 +1,33 @@
 #include "lineairdb_rpc.hh"
 
 #include <string>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
 #include "lineairdb.pb.h"
 #include "rpc_timing.hh"
+
+namespace {
+
+// bound = kCommitResponseFixedOverheadBytes + kAbortReasonHeadroomBytes +
+//         Sum_touched(name_len + kTableStatFieldOverheadBytes + kTableStatRowCountMaxBytes)
+constexpr size_t kCommitResponseFixedOverheadBytes = 32;
+constexpr size_t kTableStatFieldOverheadBytes = 16;
+constexpr size_t kTableStatRowCountMaxBytes = 10;
+constexpr size_t kAbortReasonHeadroomBytes = 256;
+
+size_t estimate_commit_response_bytes(
+    const std::unordered_set<std::string>& touched_tables) {
+    size_t bound = kCommitResponseFixedOverheadBytes + kAbortReasonHeadroomBytes;
+    for (const auto& table_name : touched_tables) {
+        bound += table_name.size() + kTableStatFieldOverheadBytes +
+                 kTableStatRowCountMaxBytes;
+    }
+    return bound;
+}
+
+}  // namespace
 
 // Stateless read and client-driven OCC commit handlers: these act on the
 // database directly and carry no server-side transaction state.
@@ -62,6 +84,32 @@ void LineairDBRpc::handleTxValidateAndCommit(const std::string& message,
 
     request.ParseFromString(message);
 
+    // Tables this commit's response may name; computed before install to bound the envelope.
+    std::unordered_set<std::string> touched_tables;
+    for (const auto& read : request.reads()) {
+        touched_tables.insert(read.table_name());
+    }
+    for (const auto& write : request.writes()) {
+        touched_tables.insert(write.table_name());
+    }
+    for (const auto& del : request.deletes()) {
+        touched_tables.insert(del.table_name());
+    }
+    for (const auto& op : request.secondary_index_ops()) {
+        touched_tables.insert(op.table_name());
+    }
+    for (const auto& row_delta : request.row_deltas()) {
+        touched_tables.insert(row_delta.table_name());
+    }
+
+    // Rejects before install so an oversized response cannot follow a durable write.
+    if (estimate_commit_response_bytes(touched_tables) > kMaxRpcPayloadBytes) {
+        response.set_committed(false);
+        response.set_abort_reason("response envelope too large");
+        result = response.SerializeAsString();
+        return;
+    }
+
     std::vector<LineairDB::ExternalReadEntry> reads;
     reads.reserve(request.reads_size());
     for (const auto& read : request.reads()) {
@@ -115,6 +163,12 @@ void LineairDBRpc::handleTxValidateAndCommit(const std::string& message,
                                                        &abort_reason);
     response.set_committed(committed);
     if (!committed && !abort_reason.empty()) {
+        // Headroom reserved by the envelope bound above assumes at most
+        // this many bytes; truncate rather than let a storage-layer message
+        // grow the response past what was reserved.
+        if (abort_reason.size() > kAbortReasonHeadroomBytes) {
+            abort_reason.resize(kAbortReasonHeadroomBytes);
+        }
         response.set_abort_reason(abort_reason);
     }
 
@@ -125,18 +179,22 @@ void LineairDBRpc::handleTxValidateAndCommit(const std::string& message,
         db_manager_->get_database()->Fence();
     }
 
-    for (const auto& [name, count] : row_counts_->snapshot()) {
+    // Only the touched set may be attached -- this is the envelope reserved
+    // above. Tables with no known count are simply omitted.
+    for (const auto& [name, count] : row_counts_->snapshot_for(touched_tables)) {
         auto* ts = response.add_table_stats();
         ts->set_table_name(name);
         ts->set_row_count(count);
     }
 
-    // The table-stats snapshot is currently unbounded (every table the
-    // server knows about, not just the ones this tx touched) -- measure its
-    // serialized weight for rpc_timing's per-variant breakdown.
+    // Report the touched-only stats sub-size for the opt-in RPC timing dump,
+    // including each repeated-field entry's tag and length-delimiter framing.
     uint64_t stats_bytes = 0;
     for (const auto& ts : response.table_stats()) {
-        stats_bytes += ts.ByteSizeLong();
+        const uint64_t entry_bytes = ts.ByteSizeLong();
+        uint64_t len_prefix = 1;
+        for (uint64_t v = entry_bytes; v >= 0x80; v >>= 7) len_prefix++;
+        stats_bytes += 1 + len_prefix + entry_bytes;
     }
     rpc_timing::note_commit_stats_bytes(stats_bytes);
 

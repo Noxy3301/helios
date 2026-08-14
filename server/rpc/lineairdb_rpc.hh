@@ -5,6 +5,7 @@
 #include <mutex>
 #include <shared_mutex>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -30,6 +31,19 @@ struct TableRowCounts {
     std::unordered_map<std::string, int64_t> snapshot() {
         std::shared_lock<std::shared_mutex> lock(s_mutex);
         return counts;
+    }
+
+    /** @brief Copies known counts for tables under one shared lock. */
+    std::unordered_map<std::string, int64_t> snapshot_for(
+        const std::unordered_set<std::string>& tables) {
+        std::shared_lock<std::shared_mutex> lock(s_mutex);
+        std::unordered_map<std::string, int64_t> result;
+        result.reserve(tables.size());
+        for (const auto& name : tables) {
+            auto it = counts.find(name);
+            if (it != counts.end()) result.emplace(name, it->second);
+        }
+        return result;
     }
 };
 

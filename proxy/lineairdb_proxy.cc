@@ -700,7 +700,8 @@ bool LineairDBProxy::tx_validate_and_commit(
         return false;
     }
 
-    table_stats_cache_.clear();
+    // Commit responses cover touched tables only; preserve advisory
+    // estimates for entries outside the response.
     for (const auto& ts : response.table_stats()) {
         table_stats_cache_[ts.table_name()] = ts.row_count();
     }
