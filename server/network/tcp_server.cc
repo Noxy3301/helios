@@ -292,6 +292,12 @@ void TcpServer::accept_clients_reactor(int server_socket) {
   constexpr unsigned kHelperThreads = 4;
   constexpr size_t kHelperQueueDepth = 8;
   HelperPool general_pool("general", kHelperThreads, kHelperQueueDepth);
+  // TX_EXECUTE_SQL_DUCKDB serializes on the executor's global catalog mutex,
+  // so it gets its own single-thread lane instead of tying up general
+  // helpers behind that lock while one DuckDB query runs.
+  constexpr unsigned kDuckdbLaneThreads = 1;
+  constexpr size_t kDuckdbLaneQueueDepth = 2;
+  HelperPool duckdb_pool("duckdb", kDuckdbLaneThreads, kDuckdbLaneQueueDepth);
 
   ReactorPlan plan = build_reactor_plan();
   unsigned reactor_count = static_cast<unsigned>(plan.pins.size());
@@ -303,7 +309,7 @@ void TcpServer::accept_clients_reactor(int server_socket) {
         static_cast<int>(i), plan.pins[i].cpu,
         [this](MessageType t, std::string_view payload) { return classify_rpc(t, payload); },
         [this](int fd, std::string primer) { spawn_legacy_thread(fd, std::move(primer)); },
-        &general_pool));
+        &general_pool, &duckdb_pool));
   }
 
   while (true) {

@@ -66,9 +66,10 @@ const char *lane_name(RpcLane lane) {
 }  // namespace
 
 Reactor::Reactor(int id, int pin_to_core, ClassifyFn classify, MigrateFn migrate,
-                  HelperPool *general_pool)
+                  HelperPool *general_pool, HelperPool *duckdb_pool)
     : id_(id), pin_to_core_(pin_to_core), classify_(std::move(classify)),
-      migrate_(std::move(migrate)), general_pool_(general_pool) {
+      migrate_(std::move(migrate)), general_pool_(general_pool),
+      duckdb_pool_(duckdb_pool) {
   epoll_fd_ = epoll_create1(EPOLL_CLOEXEC);
   if (epoll_fd_ < 0) {
     LOG_FATAL("Reactor %d: epoll_create1 failed: %s", id_, std::strerror(errno));
@@ -333,7 +334,13 @@ bool Reactor::parse_and_dispatch(Connection &conn) {
     job.dispatcher = conn.dispatcher;  // shared_ptr copy: co-owns across the helper job
     job.owner = this;
 
-    if (!general_pool_->try_submit(std::move(job))) {
+    // DuckDB requests serialize on the executor's global catalog mutex; its
+    // dedicated lane keeps a slow query from parking the general helpers
+    // behind that lock.
+    HelperPool *pool = message_type == MessageType::TX_EXECUTE_SQL_DUCKDB
+                            ? duckdb_pool_
+                            : general_pool_;
+    if (!pool->try_submit(std::move(job))) {
       completion_slots_used_.fetch_sub(1, std::memory_order_relaxed);
       metrics_.reject_queue++;
       if (ddl_exempt) {

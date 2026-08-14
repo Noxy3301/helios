@@ -60,7 +60,7 @@ class Reactor {
   using MigrateFn = std::function<void(int fd, std::string primer)>;
 
   Reactor(int id, int pin_to_core, ClassifyFn classify, MigrateFn migrate,
-          HelperPool *general_pool);
+          HelperPool *general_pool, HelperPool *duckdb_pool);
   ~Reactor();
 
   Reactor(const Reactor &) = delete;
@@ -199,6 +199,7 @@ class Reactor {
   ClassifyFn classify_;
   MigrateFn migrate_;
   HelperPool *general_pool_ = nullptr;  // not owned; lives for the process lifetime
+  HelperPool *duckdb_pool_ = nullptr;   // not owned; dedicated TX_EXECUTE_SQL_DUCKDB lane
 
   std::atomic<int> conn_count_{0};
   // Reactor-thread-only after drain_pending_adds() inserts an entry.
