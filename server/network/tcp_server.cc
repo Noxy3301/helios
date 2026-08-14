@@ -23,6 +23,7 @@
 #include <vector>
 
 #include "../../common/log.h"
+#include "helper_pool.hh"
 
 namespace {
 
@@ -284,6 +285,14 @@ void TcpServer::accept_clients(int server_socket) {
 }
 
 void TcpServer::accept_clients_reactor(int server_socket) {
+  // General helper pool: fixed worker threads that run admitted kSlow RPCs
+  // off the reactor threads (see helper_pool.hh). Owned by this function's
+  // stack frame, which is fine because accept_clients_reactor's own accept
+  // loop below never returns.
+  constexpr unsigned kHelperThreads = 4;
+  constexpr size_t kHelperQueueDepth = 8;
+  HelperPool general_pool("general", kHelperThreads, kHelperQueueDepth);
+
   ReactorPlan plan = build_reactor_plan();
   unsigned reactor_count = static_cast<unsigned>(plan.pins.size());
 
@@ -293,7 +302,8 @@ void TcpServer::accept_clients_reactor(int server_socket) {
     reactors.push_back(std::make_unique<Reactor>(
         static_cast<int>(i), plan.pins[i].cpu,
         [this](MessageType t, std::string_view payload) { return classify_rpc(t, payload); },
-        [this](int fd, std::string primer) { spawn_legacy_thread(fd, std::move(primer)); }));
+        [this](int fd, std::string primer) { spawn_legacy_thread(fd, std::move(primer)); },
+        &general_pool));
   }
 
   while (true) {

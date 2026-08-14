@@ -56,8 +56,8 @@ void LineairDBServer::handle_client(int client_socket, std::string primer) {
   db_manager_->get_database()->ReleaseMasstreeThreadEpoch();
 }
 
-std::unique_ptr<Reactor::RpcDispatcher> LineairDBServer::create_dispatcher() {
-  return std::make_unique<Dispatcher>(db_manager_, row_counts_);
+std::shared_ptr<Reactor::RpcDispatcher> LineairDBServer::create_dispatcher() {
+  return std::make_shared<Dispatcher>(db_manager_, row_counts_);
 }
 
 RpcLane LineairDBServer::classify_rpc(MessageType type, std::string_view payload) const {

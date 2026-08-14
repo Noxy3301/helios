@@ -107,8 +107,8 @@ RpcLane classify_rpc(MessageType type, std::string_view payload) {
     case MessageType::TX_EXECUTE_READ_PLAN:
       return classify_read_plan(payload);
 
-    // kSlow: heavy or unbounded single-shot operations; currently migrates
-    // like kConv.
+    // kSlow: heavy or unbounded single-shot operations; served by the
+    // helper pool, with DDL/fence falling back to migration under overload.
     case MessageType::DB_FENCE:
     case MessageType::DB_CREATE_TABLE:
     case MessageType::DB_CREATE_SECONDARY_INDEX:

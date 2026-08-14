@@ -11,11 +11,25 @@
 
 #include <cerrno>
 #include <cstring>
+#include <utility>
 
 #include "../../common/log.h"
+#include "helper_pool.hh"
 #include "lineairdb.pb.h"
 
 namespace {
+
+// Upper bound on this reactor's in-flight helper results (see
+// completion_slots_used_'s comment in reactor.hh). Generous versus the
+// general pool's queue depth + thread count (kHelperQueueDepth=8 +
+// kHelperThreads=4 in tcp_server.cc): a reactor can have far more kSlow
+// requests dispatched-but-not-yet-completed than the pool can be actively
+// running or queuing at once, since "dispatched" also covers results still
+// in flight back through deliver_completion().
+constexpr int kCompletionSlots = 32;
+
+// How often maybe_log_metrics() may emit a summary line, at most.
+constexpr std::chrono::seconds kMetricsLogInterval{60};
 
 // Logs and returns false when a decoded frame header violates the payload
 // cap or names an undefined opcode (0, or a gap in the generated enum).
@@ -51,9 +65,10 @@ const char *lane_name(RpcLane lane) {
 
 }  // namespace
 
-Reactor::Reactor(int id, int pin_to_core, ClassifyFn classify, MigrateFn migrate)
+Reactor::Reactor(int id, int pin_to_core, ClassifyFn classify, MigrateFn migrate,
+                  HelperPool *general_pool)
     : id_(id), pin_to_core_(pin_to_core), classify_(std::move(classify)),
-      migrate_(std::move(migrate)) {
+      migrate_(std::move(migrate)), general_pool_(general_pool) {
   epoll_fd_ = epoll_create1(EPOLL_CLOEXEC);
   if (epoll_fd_ < 0) {
     LOG_FATAL("Reactor %d: epoll_create1 failed: %s", id_, std::strerror(errno));
@@ -81,7 +96,7 @@ Reactor::~Reactor() {
   if (wake_fd_ >= 0) close(wake_fd_);
 }
 
-void Reactor::add_connection(int fd, std::unique_ptr<RpcDispatcher> dispatcher) {
+void Reactor::add_connection(int fd, std::shared_ptr<RpcDispatcher> dispatcher) {
   conn_count_.fetch_add(1, std::memory_order_relaxed);
   uint64_t conn_id = g_next_connection_id.fetch_add(1, std::memory_order_relaxed);
   {
@@ -117,6 +132,7 @@ void Reactor::drain_pending_adds() {
       continue;
     }
     connections_.emplace(p.fd, std::move(conn));
+    connection_id_to_fd_.emplace(p.connection_id, p.fd);
   }
 }
 
@@ -151,6 +167,7 @@ void Reactor::run() {
         while (read(wake_fd_, &ignore, sizeof(ignore)) > 0) {
         }
         drain_pending_adds();
+        drain_completions();
         continue;
       }
 
@@ -172,6 +189,11 @@ void Reactor::run() {
         on_readable(conn);
       }
     }
+    // Piggyback on whatever just woke epoll_wait (client traffic, an accept,
+    // or a helper completion) instead of a dedicated timer fd: an idle
+    // reactor never reaches this line often enough to matter, and one
+    // that's busy checks it for free on every iteration anyway.
+    maybe_log_metrics();
   }
 }
 
@@ -270,9 +292,63 @@ bool Reactor::parse_and_dispatch(Connection &conn) {
     close_connection(conn.fd);  // erases conn; do not touch it after this
     return false;
   }
-  if (lane != RpcLane::kFast) {
+  if (lane == RpcLane::kConv) {
     migrate_connection(conn, 0, frame_len, lane);  // erases conn; do not touch it after this
     return false;
+  }
+  if (lane == RpcLane::kSlow) {
+    // DB_FENCE/DB_CREATE_TABLE/DB_CREATE_SECONDARY_INDEX are exempt from the
+    // SERVER_OVERLOADED response below: DDL and fence admission failures
+    // migrate instead, because the proxy has no failure-propagation path
+    // for these opcodes (a lost CREATE TABLE would look like a silent
+    // success).
+    bool ddl_exempt = message_type == MessageType::DB_FENCE ||
+                       message_type == MessageType::DB_CREATE_TABLE ||
+                       message_type == MessageType::DB_CREATE_SECONDARY_INDEX;
+
+    // Reserve a completion slot before anything else so this reactor can't
+    // accumulate more in-flight helper results than it can ever validate
+    // (kCompletionSlots, generous vs the pool's queue depth + threads).
+    int prev_slots = completion_slots_used_.fetch_add(1, std::memory_order_relaxed);
+    if (prev_slots >= kCompletionSlots) {
+      completion_slots_used_.fetch_sub(1, std::memory_order_relaxed);
+      metrics_.reject_slot++;
+      if (ddl_exempt) {
+        fallback_migrated_++;
+        migrate_connection(conn, 0, frame_len, lane);  // erases conn; do not touch it after this
+        return false;
+      }
+      if (!respond_overloaded(conn)) return false;  // erased conn on failure
+      return finish_slow_frame(conn, frame_len);
+    }
+
+    conn.generation++;  // the completion must match this dispatch's generation
+
+    HelperPool::Job job;
+    job.connection_id = conn.connection_id;
+    job.generation = conn.generation;
+    job.type = message_type;
+    job.sender_id = sender_id;
+    job.payload = buf.substr(sizeof(MessageHeader), payload_size);
+    job.dispatcher = conn.dispatcher;  // shared_ptr copy: co-owns across the helper job
+    job.owner = this;
+
+    if (!general_pool_->try_submit(std::move(job))) {
+      completion_slots_used_.fetch_sub(1, std::memory_order_relaxed);
+      metrics_.reject_queue++;
+      if (ddl_exempt) {
+        fallback_migrated_++;
+        migrate_connection(conn, 0, frame_len, lane);  // erases conn; do not touch it after this
+        return false;
+      }
+      if (!respond_overloaded(conn)) return false;  // erased conn on failure
+      return finish_slow_frame(conn, frame_len);
+    }
+
+    metrics_.dispatched++;
+    if (!finish_slow_frame(conn, frame_len)) return false;  // erased conn on violation
+    conn.state = State::kInHelper;
+    return true;
   }
 
   std::string payload = buf.substr(sizeof(MessageHeader), payload_size);
@@ -351,7 +427,11 @@ bool Reactor::flush_writes(Connection &conn) {
 
   conn.write_buf.clear();
   conn.write_cursor = 0;
-  conn.state = State::kArmed;
+  // Only a drained response re-arms a connection: on_readable() calls
+  // flush_writes() after every read regardless of lane, including a kSlow
+  // dispatch that queued nothing, so kResponding is the only state this
+  // may clear back to kArmed.
+  if (conn.state == State::kResponding) conn.state = State::kArmed;
   if (conn.want_epollout) {
     struct epoll_event ev {};
     ev.events = EPOLLIN;
@@ -378,6 +458,7 @@ void Reactor::close_connection(int fd) {
   }
   close(fd);
   connections_.erase(fd);
+  connection_id_to_fd_.erase(conn_id);
   conn_count_.fetch_sub(1, std::memory_order_relaxed);
   LOG_INFO("Reactor %d: closed connection fd=%d conn=%lu", id_, fd, conn_id);
 }
@@ -428,9 +509,108 @@ void Reactor::migrate_connection(Connection &conn, size_t frame_start, size_t fr
   }
 
   connections_.erase(fd);  // destroys `conn`; nothing below may touch it
+  connection_id_to_fd_.erase(conn_id);
   conn_count_.fetch_sub(1, std::memory_order_relaxed);
 
   LOG_INFO("Reactor %d: migrating fd=%d conn=%lu to a legacy thread (%zu primed bytes) lane=%s",
            id_, fd, conn_id, primer.size(), lane_name(lane));
   migrate_(fd, std::move(primer));
+}
+
+bool Reactor::finish_slow_frame(Connection &conn, size_t frame_len) {
+  conn.read_buf.erase(0, frame_len);
+  if (!conn.read_buf.empty()) {
+    LOG_ERROR("Reactor %d: fd=%d conn=%lu %zu bytes follow a slow request before "
+              "its response was delivered (pipelining); closing",
+              id_, conn.fd, conn.connection_id, conn.read_buf.size());
+    close_connection(conn.fd);  // erases conn; do not touch it after this
+    return false;
+  }
+  return true;
+}
+
+bool Reactor::respond_overloaded(Connection &conn) {
+  metrics_.overload_sent++;
+  if (!queue_response(conn, MessageType::SERVER_OVERLOADED, std::string())) {
+    close_connection(conn.fd);  // erases conn; do not touch it after this
+    return false;
+  }
+  if (!flush_writes(conn)) {
+    close_connection(conn.fd);  // erases conn; do not touch it after this
+    return false;
+  }
+  return true;
+}
+
+void Reactor::deliver_completion(uint64_t connection_id, uint64_t generation, MessageType type,
+                                  std::string result) {
+  {
+    std::lock_guard<std::mutex> lock(completion_mu_);
+    completions_.push_back(Completion{connection_id, generation, type, std::move(result)});
+  }
+  uint64_t one = 1;
+  if (write(wake_fd_, &one, sizeof(one)) < 0 && errno != EAGAIN) {
+    LOG_ERROR("Reactor %d: eventfd wake write failed (completion delivery): %s",
+              id_, std::strerror(errno));
+  }
+}
+
+void Reactor::drain_completions() {
+  std::deque<Completion> batch;
+  {
+    std::lock_guard<std::mutex> lock(completion_mu_);
+    batch.swap(completions_);
+  }
+
+  for (auto &c : batch) {
+    // Always released here: whether or not this completion matches a live
+    // connection, the slot it was reserved under becomes free (see the
+    // kSlow branch in parse_and_dispatch for the reservation).
+    completion_slots_used_.fetch_sub(1, std::memory_order_relaxed);
+
+    auto fd_it = connection_id_to_fd_.find(c.connection_id);
+    Connection *conn = nullptr;
+    if (fd_it != connection_id_to_fd_.end()) {
+      auto conn_it = connections_.find(fd_it->second);
+      if (conn_it != connections_.end()) conn = conn_it->second.get();
+    }
+
+    // A completion is honored only if it matches a live connection's
+    // identity, generation, and kInHelper state. A closed connection (fd
+    // reused or not), a migrated connection, or a generation mismatch all
+    // fall here and are discarded.
+    if (conn == nullptr || conn->connection_id != c.connection_id ||
+        conn->generation != c.generation || conn->state != State::kInHelper) {
+      metrics_.stale_discarded++;
+      LOG_INFO("Reactor %d: stale completion discarded conn=%lu generation=%lu "
+               "(connection %s)",
+               id_, c.connection_id, c.generation,
+               conn == nullptr ? "not found" : "generation/state mismatch");
+      continue;
+    }
+
+    metrics_.completed++;
+    if (!queue_response(*conn, c.type, c.result)) {
+      close_connection(conn->fd);  // erases conn; do not touch it after this
+      continue;
+    }
+    if (!flush_writes(*conn)) {
+      close_connection(conn->fd);  // erases conn; do not touch it after this
+      continue;
+    }
+  }
+}
+
+void Reactor::maybe_log_metrics() {
+  if (metrics_ == last_logged_metrics_) return;  // nothing to report
+
+  auto now = std::chrono::steady_clock::now();
+  if (now - last_metrics_log_ < kMetricsLogInterval) return;
+
+  LOG_INFO("Reactor %d: helper metrics dispatched=%lu completed=%lu reject_queue=%lu "
+           "reject_slot=%lu overload_sent=%lu stale_discarded=%lu",
+           id_, metrics_.dispatched, metrics_.completed, metrics_.reject_queue,
+           metrics_.reject_slot, metrics_.overload_sent, metrics_.stale_discarded);
+  last_metrics_log_ = now;
+  last_logged_metrics_ = metrics_;
 }

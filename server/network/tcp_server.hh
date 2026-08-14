@@ -25,9 +25,11 @@ class TcpServer {
   virtual void handle_client(int client_socket, std::string primer = std::string()) = 0;
 
   // Reactor mode (HELIOS_TRANSPORT=reactor) hooks; unused otherwise.
-  // Per-connection RPC dispatch state for the fast path (e.g. wraps the same
-  // handler + per-connection transaction manager handle_client uses).
-  virtual std::unique_ptr<Reactor::RpcDispatcher> create_dispatcher() = 0;
+  // Per-connection RPC dispatch state, used both on the fast path (this
+  // reactor thread) and the kSlow path (a helper-pool thread; see
+  // reactor.hh) -- a shared_ptr so a helper Job can co-own it. Wraps the
+  // same handler + per-connection transaction manager handle_client uses.
+  virtual std::shared_ptr<Reactor::RpcDispatcher> create_dispatcher() = 0;
   // Classifies (opcode, payload) into the lane a reactor thread dispatches
   // it to; see rpc_lane.hh.
   virtual RpcLane classify_rpc(MessageType type, std::string_view payload) const = 0;

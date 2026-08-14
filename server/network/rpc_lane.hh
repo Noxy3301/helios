@@ -8,7 +8,7 @@
 // Where a reactor thread sends one fully-buffered RPC request.
 enum class RpcLane {
   kFast,       // stateless and shape-bounded; runs inline on the reactor thread
-  kSlow,       // stateless but heavy/unbounded; migrates to a legacy thread
+  kSlow,       // stateless but heavy/unbounded; served by the helper pool
   kConv,       // references cross-RPC transaction state; always migrates
   kMalformed,  // a kFast candidate whose body fails to parse; protocol violation
 };
