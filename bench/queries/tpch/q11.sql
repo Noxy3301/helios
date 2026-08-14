@@ -15,7 +15,7 @@ GROUP BY
 HAVING
    SUM(ps_supplycost * ps_availqty) > (
    SELECT
-      SUM(ps_supplycost * ps_availqty) * 0.0001
+      SUM(ps_supplycost * ps_availqty) * 0.0001 -- FRACTION = 0.0001 / SF (this file is the SF=1 instantiation)
    FROM
       partsupp, supplier, nation
    WHERE
