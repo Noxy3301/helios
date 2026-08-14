@@ -7,11 +7,13 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <unordered_map>
 #include <vector>
 
 #include "../protocol/message.hh"
+#include "rpc_lane.hh"
 
 // Minimal epoll multi-reactor transport, opt-in via HELIOS_TRANSPORT=reactor
 // (see tcp_server.cc). Each Reactor owns one epoll fd, one physical-core-
@@ -20,17 +22,16 @@
 // The wire protocol is strict request-response with in-flight <= 1 per
 // connection, enforced here: at most one complete frame is dispatched per
 // read, and any bytes trailing it (a pipelined next request, or a partial
-// tail) are a protocol violation that closes the connection. Fast-path
-// opcodes (TcpServer::is_reactor_fast_path) run inline on this thread via
-// the connection's RpcDispatcher and their responses are buffered/flushed
-// here. Any other opcode triggers a one-way migration: EPOLL_CTL_DEL,
-// restore blocking mode, hand the fd plus a byte-exact primer (exactly the
-// triggering frame -- the strictness check guarantees nothing follows it)
-// to a dedicated legacy thread. This reactor never touches the fd again
-// after that.
-//
-// There is no lane classification here; the inline fast set is deliberately
-// narrow (two stateless opcodes), so every conversational opcode migrates.
+// tail) are a protocol violation that closes the connection. Every frame is
+// classified (TcpServer::classify_rpc, see rpc_lane.hh) once its header and
+// payload are fully buffered: kFast runs inline on this thread via the
+// connection's RpcDispatcher and its response is buffered/flushed here.
+// kSlow and kConv both currently trigger the same one-way migration:
+// EPOLL_CTL_DEL, restore blocking mode, hand the fd plus a byte-exact primer
+// (exactly the triggering frame -- the strictness check guarantees nothing
+// follows it) to a dedicated legacy thread. kMalformed (a kFast candidate
+// whose body fails to parse) closes the connection instead of migrating.
+// This reactor never touches the fd again after a migration or a close.
 class Reactor {
  public:
   // RPC dispatch surface a connection uses on the fast path. One instance is
@@ -43,12 +44,12 @@ class Reactor {
                              const std::string &payload, std::string &result) = 0;
   };
 
-  using IsFastPathFn = std::function<bool(MessageType)>;
+  using ClassifyFn = std::function<RpcLane(MessageType, std::string_view)>;
   // Spawns the legacy per-connection thread for `fd`, primed with `primer`
   // bytes already read off the wire (see TcpServer::spawn_legacy_thread).
   using MigrateFn = std::function<void(int fd, std::string primer)>;
 
-  Reactor(int id, int pin_to_core, IsFastPathFn is_fast_path, MigrateFn migrate);
+  Reactor(int id, int pin_to_core, ClassifyFn classify, MigrateFn migrate);
   ~Reactor();
 
   Reactor(const Reactor &) = delete;
@@ -108,16 +109,17 @@ class Reactor {
   bool flush_writes(Connection &conn);
   void close_connection(int fd);
   // `frame_start`/`frame_len` locate the frame that forced migration inside
-  // conn.read_buf. Erases conn from this reactor and hands the fd off --
+  // conn.read_buf; `lane` (kSlow or kConv) is logged so slow/conv routing
+  // is observable. Erases conn from this reactor and hands the fd off --
   // unless the handoff would not be byte-exact (undrained write_buf or
   // trailing read_buf bytes), in which case it closes instead.
-  void migrate_connection(Connection &conn, size_t frame_start, size_t frame_len);
+  void migrate_connection(Connection &conn, size_t frame_start, size_t frame_len, RpcLane lane);
 
   int id_;
   int pin_to_core_;
   int epoll_fd_ = -1;
   int wake_fd_ = -1;  // eventfd: accept thread nudges epoll_wait after add_connection
-  IsFastPathFn is_fast_path_;
+  ClassifyFn classify_;
   MigrateFn migrate_;
 
   std::atomic<int> conn_count_{0};

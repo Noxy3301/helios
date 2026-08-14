@@ -292,7 +292,7 @@ void TcpServer::accept_clients_reactor(int server_socket) {
   for (unsigned i = 0; i < reactor_count; i++) {
     reactors.push_back(std::make_unique<Reactor>(
         static_cast<int>(i), plan.pins[i].cpu,
-        [this](MessageType t) { return is_reactor_fast_path(t); },
+        [this](MessageType t, std::string_view payload) { return classify_rpc(t, payload); },
         [this](int fd, std::string primer) { spawn_legacy_thread(fd, std::move(primer)); }));
   }
 

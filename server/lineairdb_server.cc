@@ -4,6 +4,7 @@
 
 #include "../common/log.h"
 #include "lineairdb.pb.h"
+#include "network/rpc_lane.hh"
 #include "rpc/lineairdb_rpc.hh"
 
 LineairDBServer::LineairDBServer() : TcpServer(9999) {}
@@ -59,19 +60,8 @@ std::unique_ptr<Reactor::RpcDispatcher> LineairDBServer::create_dispatcher() {
   return std::make_unique<Dispatcher>(db_manager_, row_counts_);
 }
 
-bool LineairDBServer::is_reactor_fast_path(MessageType type) const {
-  // Only the two stateless opcodes: a storage transaction opens and closes
-  // within one handler call, so neither depends on state a prior RPC left
-  // behind. TX_WRITE_SECONDARY_INDEX and TX_GET_MATCHING_KEYS_AND_VALUES_
-  // FROM_PREFIX look self-contained but key off a stored transaction_id, so
-  // they are conversational and must migrate, like every other opcode here.
-  switch (type) {
-    case MessageType::TX_VALIDATE_AND_COMMIT:
-    case MessageType::TX_EXECUTE_READ_PLAN:
-      return true;
-    default:
-      return false;
-  }
+RpcLane LineairDBServer::classify_rpc(MessageType type, std::string_view payload) const {
+  return ::classify_rpc(type, payload);
 }
 
 LineairDBServer::Dispatcher::Dispatcher(std::shared_ptr<DatabaseManager> db_manager,

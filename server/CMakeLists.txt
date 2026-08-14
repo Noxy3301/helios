@@ -54,6 +54,8 @@ set(SOURCES
     network/message_handler.hh
     network/reactor.cc
     network/reactor.hh
+    network/rpc_lane.cc
+    network/rpc_lane.hh
 
     # RPC layer
     rpc/lineairdb_rpc.cc

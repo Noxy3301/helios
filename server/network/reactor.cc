@@ -39,10 +39,20 @@ bool frame_header_ok(int reactor_id, int fd, uint64_t conn_id, uint32_t payload_
 // reactors and across fd reuse.
 std::atomic<uint64_t> g_next_connection_id{1};
 
+const char *lane_name(RpcLane lane) {
+  switch (lane) {
+    case RpcLane::kFast: return "fast";
+    case RpcLane::kSlow: return "slow";
+    case RpcLane::kConv: return "conv";
+    case RpcLane::kMalformed: return "malformed";
+  }
+  return "unknown";
+}
+
 }  // namespace
 
-Reactor::Reactor(int id, int pin_to_core, IsFastPathFn is_fast_path, MigrateFn migrate)
-    : id_(id), pin_to_core_(pin_to_core), is_fast_path_(std::move(is_fast_path)),
+Reactor::Reactor(int id, int pin_to_core, ClassifyFn classify, MigrateFn migrate)
+    : id_(id), pin_to_core_(pin_to_core), classify_(std::move(classify)),
       migrate_(std::move(migrate)) {
   epoll_fd_ = epoll_create1(EPOLL_CLOEXEC);
   if (epoll_fd_ < 0) {
@@ -249,8 +259,19 @@ bool Reactor::parse_and_dispatch(Connection &conn) {
 
   uint64_t sender_id = be64toh(hdr.sender_id);
 
-  if (!is_fast_path_(message_type)) {
-    migrate_connection(conn, 0, frame_len);  // erases conn; do not touch it after this
+  std::string_view payload_view(buf.data() + sizeof(MessageHeader), payload_size);
+  RpcLane lane = classify_(message_type, payload_view);
+  if (lane == RpcLane::kMalformed) {
+    // A kFast candidate whose body fails to parse is a protocol violation,
+    // not work to hand to a legacy thread.
+    LOG_ERROR("Reactor %d: fd=%d conn=%lu malformed body for opcode=%u "
+              "(payload_size=%u); closing",
+              id_, conn.fd, conn.connection_id, static_cast<uint32_t>(message_type), payload_size);
+    close_connection(conn.fd);  // erases conn; do not touch it after this
+    return false;
+  }
+  if (lane != RpcLane::kFast) {
+    migrate_connection(conn, 0, frame_len, lane);  // erases conn; do not touch it after this
     return false;
   }
 
@@ -361,7 +382,8 @@ void Reactor::close_connection(int fd) {
   LOG_INFO("Reactor %d: closed connection fd=%d conn=%lu", id_, fd, conn_id);
 }
 
-void Reactor::migrate_connection(Connection &conn, size_t frame_start, size_t frame_len) {
+void Reactor::migrate_connection(Connection &conn, size_t frame_start, size_t frame_len,
+                                  RpcLane lane) {
   int fd = conn.fd;
   uint64_t conn_id = conn.connection_id;
 
@@ -408,7 +430,7 @@ void Reactor::migrate_connection(Connection &conn, size_t frame_start, size_t fr
   connections_.erase(fd);  // destroys `conn`; nothing below may touch it
   conn_count_.fetch_sub(1, std::memory_order_relaxed);
 
-  LOG_INFO("Reactor %d: migrating fd=%d conn=%lu to a legacy thread (%zu primed bytes)",
-           id_, fd, conn_id, primer.size());
+  LOG_INFO("Reactor %d: migrating fd=%d conn=%lu to a legacy thread (%zu primed bytes) lane=%s",
+           id_, fd, conn_id, primer.size(), lane_name(lane));
   migrate_(fd, std::move(primer));
 }
