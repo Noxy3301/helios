@@ -447,6 +447,19 @@ unique_ptr<FunctionData> PaxBind(ClientContext&, TableFunctionBindInput& input,
 }
 
 /**
+ * @brief Row-count estimate for the join-order optimizer.
+ *
+ * @details slots_allocated() bounds live rows from above, so the estimate
+ * is an upper bound rather than an exact count.
+ */
+unique_ptr<duckdb::NodeStatistics> PaxCardinality(
+    ClientContext&, const FunctionData* bind_data) {
+  const auto& data = bind_data->Cast<PaxBindData>();
+  const uint64_t rows = data.table->store->slots_allocated();
+  return duckdb::make_uniq<duckdb::NodeStatistics>(rows, rows);
+}
+
+/**
  * @brief Builds the shared scan state: the projected column ids and a thread
  * count of min(hardware threads, group count).
  */
@@ -939,6 +952,7 @@ std::string RegisterPaxFunction(Connection& connection,
                          PaxInitLocal);
   function.projection_pushdown = true;
   function.filter_pushdown = false;
+  function.cardinality = PaxCardinality;
   function.function_info = info;
 
   connection.context->RunFunctionInTransaction([&]() {
