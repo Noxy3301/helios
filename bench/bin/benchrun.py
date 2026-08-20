@@ -334,6 +334,25 @@ def _stop_metrics(samplers):
         fh.close()
 
 
+def run_analyze(benchmark, mysql_host, mysql_port):
+    """Refresh optimizer statistics with ANALYZE TABLE."""
+    # Tx-scoped prefetch requires MySQL's chosen plan to match the @_tx_plan
+    # DSL; without fresh stats MySQL can pick PRIMARY where the DSL expects a
+    # secondary index and retry forever, so those runs analyze automatically.
+    analyze_sql = {
+        "tpcc":   "ANALYZE TABLE customer, district, history, item, new_order, oorder, order_line, stock, warehouse;",
+        "tpcc-np": "ANALYZE TABLE customer, district, history, item, new_order, oorder, order_line, stock, warehouse;",
+        "ycsb":   "ANALYZE TABLE usertable;",
+        "tpch":   "ANALYZE TABLE customer, lineitem, nation, orders, part, partsupp, region, supplier;",
+    }.get(benchmark)
+    if not analyze_sql:
+        return
+    print("  Refreshing MySQL stats (ANALYZE TABLE)...")
+    result = mysql_cmd(mysql_port, mysql_host, f"USE benchbase; {analyze_sql}")
+    if result.returncode != 0:
+        sys.exit(f"ANALYZE TABLE failed on {mysql_host}:{mysql_port}")
+
+
 def setup_benchmark(benchmark, config_path, mysql_host, mysql_port, log_dir=None):
     """Reset DB, create schema, load data. Returns load_time or None on failure."""
     db_name = "benchbase"
@@ -361,22 +380,6 @@ def setup_benchmark(benchmark, config_path, mysql_host, mysql_port, log_dir=None
     load_time = float(load_match.group(1)) if load_match else None
     if load_time:
         print(f"  Load time: {load_time:.1f}s")
-
-    # Prefetch mode requires MySQL's chosen plan to match the @_tx_plan DSL.
-    # Without fresh stats, MySQL can pick PRIMARY for queries the DSL expects
-    # to take via a secondary index (e.g. OrderStatus customerByNameSQL),
-    # leading to plan/DSL mismatch and infinite prefetch retry. Refresh stats
-    # unconditionally so stateful and prefetch runs see the same optimizer
-    # decisions.
-    analyze_sql = {
-        "tpcc":   "ANALYZE TABLE customer, district, history, item, new_order, oorder, order_line, stock, warehouse;",
-        "tpcc-np": "ANALYZE TABLE customer, district, history, item, new_order, oorder, order_line, stock, warehouse;",
-        "ycsb":   "ANALYZE TABLE usertable;",
-        "tpch":   "ANALYZE TABLE customer, lineitem, nation, orders, part, partsupp, region, supplier;",
-    }.get(benchmark)
-    if analyze_sql:
-        print("  Refreshing MySQL stats (ANALYZE TABLE)...")
-        mysql_cmd(mysql_port, mysql_host, f"USE {db_name}; {analyze_sql}")
 
     return load_time
 
@@ -702,6 +705,8 @@ def main():
     parser.add_argument("--no-setup", action="store_true", help="Skip setup (DROP+CREATE+LOAD), assume data exists")
     parser.add_argument("--no-load", action="store_true", help="Run setup with CREATE only, skip LOAD")
     parser.add_argument("--no-exec", action="store_true", help="Run setup only, skip execute phase")
+    parser.add_argument("--analyze", action="store_true",
+                        help="Run ANALYZE TABLE after load (automatic for tx-scoped --prefetch runs)")
     parser.add_argument("--external-server", action="store_true",
                         help="Skip auto start/stop of lineairdb-server and mysqld (assume already running)")
     parser.add_argument("--keep-lineairdb-logs", action="store_true",
@@ -857,6 +862,10 @@ def _run_bench(args, config_work, thread_list, result_base):
         if load_time is None:
             print("Setup failed.", file=sys.stderr)
             sys.exit(1)
+
+    # A separate step so staged runs (--no-setup, --no-load) still get it.
+    if args.analyze or args.prefetch:
+        run_analyze(args.benchmark, args.mysql_host, args.mysql_port)
 
     if args.no_exec:
         print("  Skipping execute (--no-exec)")
