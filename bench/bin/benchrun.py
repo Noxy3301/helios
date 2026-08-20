@@ -156,7 +156,10 @@ def cleanup_lineairdb_logs():
     if not LINEAIRDB_LOG_DIR.exists():
         return
 
-    if _find_pid("/build/server/lineairdb-server"):
+    # Match start_lineairdb_server()'s reuse predicate (port) and catch a
+    # relative-path launch that is not listening yet. A launch racing the
+    # unlink below stays possible; the bench launcher does not do that.
+    if _find_pid("build/server/lineairdb-server") or _is_port_open("127.0.0.1", 9999):
         print("  Skipping lineairdb_logs cleanup: lineairdb-server is still running")
         return
 
@@ -191,6 +194,32 @@ def update_xml(config_path, **kwargs):
     for tag, value in kwargs.items():
         text = re.sub(rf"<{tag}>.*?</{tag}>", f"<{tag}>{value}</{tag}>", text)
     config_path.write_text(text)
+
+
+def _parse_mysql_endpoints(host_arg, default_port):
+    """Parse --mysql-host into [(host, port), ...].
+
+    Accepts a single host or a comma-separated list of endpoints; each
+    entry is either a bare host (uses default_port) or host:port.
+    """
+    endpoints = []
+    for entry in host_arg.split(","):
+        entry = entry.strip()
+        if not entry:
+            sys.exit(f"Empty endpoint in --mysql-host: {host_arg!r}")
+        if "[" in entry or "]" in entry:
+            sys.exit(f"Bracketed IPv6 is not supported in --mysql-host: {entry!r}")
+        host, sep, port = entry.rpartition(":")
+        if sep and ":" not in host:
+            if not host:
+                sys.exit(f"Empty host in --mysql-host entry: {entry!r}")
+            if not port.isdigit():
+                sys.exit(f"Bad port in --mysql-host entry: {entry!r}")
+            endpoints.append((host, int(port)))
+        else:
+            # No port suffix, or a bare IPv6 literal: use the default port.
+            endpoints.append((entry, default_port))
+    return endpoints
 
 
 def _benchbase_plugin(benchmark):
@@ -331,6 +360,25 @@ def _stop_metrics(samplers):
         fh.close()
 
 
+def run_analyze(benchmark, mysql_host, mysql_port):
+    """Refresh optimizer statistics with ANALYZE TABLE."""
+    # Tx-scoped prefetch requires MySQL's chosen plan to match the @_tx_plan
+    # DSL; without fresh stats MySQL can pick PRIMARY where the DSL expects a
+    # secondary index and retry forever, so those runs analyze automatically.
+    analyze_sql = {
+        "tpcc":   "ANALYZE TABLE customer, district, history, item, new_order, oorder, order_line, stock, warehouse;",
+        "tpcc-np": "ANALYZE TABLE customer, district, history, item, new_order, oorder, order_line, stock, warehouse;",
+        "ycsb":   "ANALYZE TABLE usertable;",
+        "tpch":   "ANALYZE TABLE customer, lineitem, nation, orders, part, partsupp, region, supplier;",
+    }.get(benchmark)
+    if not analyze_sql:
+        return
+    print("  Refreshing MySQL stats (ANALYZE TABLE)...")
+    result = mysql_cmd(mysql_port, mysql_host, f"USE benchbase; {analyze_sql}")
+    if result.returncode != 0:
+        sys.exit(f"ANALYZE TABLE failed on {mysql_host}:{mysql_port}")
+
+
 def setup_benchmark(benchmark, config_path, mysql_host, mysql_port, log_dir=None):
     """Reset DB, create schema, load data. Returns load_time or None on failure."""
     db_name = "benchbase"
@@ -358,22 +406,6 @@ def setup_benchmark(benchmark, config_path, mysql_host, mysql_port, log_dir=None
     load_time = float(load_match.group(1)) if load_match else None
     if load_time:
         print(f"  Load time: {load_time:.1f}s")
-
-    # Prefetch mode requires MySQL's chosen plan to match the @_tx_plan DSL.
-    # Without fresh stats, MySQL can pick PRIMARY for queries the DSL expects
-    # to take via a secondary index (e.g. OrderStatus customerByNameSQL),
-    # leading to plan/DSL mismatch and infinite prefetch retry. Refresh stats
-    # unconditionally so stateful and prefetch runs see the same optimizer
-    # decisions.
-    analyze_sql = {
-        "tpcc":   "ANALYZE TABLE customer, district, history, item, new_order, oorder, order_line, stock, warehouse;",
-        "tpcc-np": "ANALYZE TABLE customer, district, history, item, new_order, oorder, order_line, stock, warehouse;",
-        "ycsb":   "ANALYZE TABLE usertable;",
-        "tpch":   "ANALYZE TABLE customer, lineitem, nation, orders, part, partsupp, region, supplier;",
-    }.get(benchmark)
-    if analyze_sql:
-        print("  Refreshing MySQL stats (ANALYZE TABLE)...")
-        mysql_cmd(mysql_port, mysql_host, f"USE {db_name}; {analyze_sql}")
 
     return load_time
 
@@ -692,13 +724,18 @@ def main():
     parser.add_argument("--scalefactor", type=float, default=1, help="Scale factor (default: 1)")
     parser.add_argument("--time", type=int, default=60, help="Execute time in seconds (default: 60)")
     parser.add_argument("--profile", type=str, default="a", help="YCSB profile: a,b,c,e,f (default: a)")
-    parser.add_argument("--mysql-host", type=str, default="127.0.0.1")
-    parser.add_argument("--mysql-port", type=int, default=3307)
+    parser.add_argument("--mysql-host", type=str, default="127.0.0.1",
+                        help="MySQL host, or comma-separated host[:port] endpoints for BenchBase "
+                             "loadbalance (control-plane operations always target the first endpoint)")
+    parser.add_argument("--mysql-port", type=int, default=3307,
+                        help="Default port for --mysql-host entries without an explicit port (default: 3307)")
     parser.add_argument("--loader-threads", type=int, default=1, help="Number of parallel loader threads (default: 1)")
     parser.add_argument("--exclude-queries", type=str, help="TPC-H: comma-separated query numbers to exclude (e.g. 15,21)")
     parser.add_argument("--no-setup", action="store_true", help="Skip setup (DROP+CREATE+LOAD), assume data exists")
     parser.add_argument("--no-load", action="store_true", help="Run setup with CREATE only, skip LOAD")
     parser.add_argument("--no-exec", action="store_true", help="Run setup only, skip execute phase")
+    parser.add_argument("--analyze", action="store_true",
+                        help="Run ANALYZE TABLE after load (automatic for tx-scoped --prefetch runs)")
     parser.add_argument("--external-server", action="store_true",
                         help="Skip auto start/stop of lineairdb-server and mysqld (assume already running)")
     parser.add_argument("--keep-lineairdb-logs", action="store_true",
@@ -732,14 +769,32 @@ def main():
 
     # Update config: scalefactor, time, and JDBC URL (host:port)
     update_xml(config_work, scalefactor=str(args.scalefactor), time=str(args.time))
-    # Rewrite JDBC URL to match --mysql-host/--mysql-port
+    # Rewrite the JDBC URL. --mysql-host may be comma-separated endpoints;
+    # more than one switches to the loadbalance scheme for the execute phase
+    # while control-plane operations keep targeting the first endpoint.
+    endpoints = _parse_mysql_endpoints(args.mysql_host, args.mysql_port)
     text = config_work.read_text()
-    text = re.sub(
-        r"jdbc:mysql://[^/]+/",
-        f"jdbc:mysql://{args.mysql_host}:{args.mysql_port}/",
-        text,
-    )
+    if len(endpoints) > 1:
+        hostports = ",".join(f"{h}:{p}" for h, p in endpoints)
+        print(f"  Multi-endpoint MySQL: {hostports} (control-plane -> {endpoints[0][0]}:{endpoints[0][1]})")
+        text = re.sub(
+            r"jdbc:mysql://[^/]+/",
+            f"jdbc:mysql:loadbalance://{hostports}/",
+            text,
+        )
+    else:
+        host, port = endpoints[0]
+        text = re.sub(
+            r"jdbc:mysql://[^/]+/",
+            f"jdbc:mysql://{host}:{port}/",
+            text,
+        )
     config_work.write_text(text)
+    # Collapse args.mysql_host/port to the first endpoint so every downstream
+    # control-plane use (mysql_cmd calls, local-mode detection) is scoped to
+    # it automatically. No-op for the single-endpoint case.
+    args.mysql_endpoints = endpoints
+    args.mysql_host, args.mysql_port = endpoints[0]
     # TPC-H with multiple terminals needs parallel mode (serial=false + time tag)
     if args.benchmark == "tpch" and (args.sweep or args.terminals > 1):
         text = config_work.read_text()
@@ -805,8 +860,22 @@ def main():
     if managed and _is_port_open("127.0.0.1", args.mysql_port):
         print(f"  mysqld already listening on port {args.mysql_port}, switching to external mode")
         managed = False
+    # stop_mysql.sh kills every local mysqld, not just the one started here.
+    if managed and len(args.mysql_endpoints) > 1:
+        sys.exit("Multi-endpoint --mysql-host requires --external-server: "
+                 "the managed lifecycle starts one mysqld but stops them all.")
+    # Setup through the loadbalance URL spreads DDL across endpoints, and an
+    # index created on a non-loader node is silently absent elsewhere.
+    if len(args.mysql_endpoints) > 1 and not args.no_setup:
+        sys.exit("Multi-endpoint --mysql-host requires --no-setup: "
+                 "set up the loader endpoint first, then create the schema "
+                 "on each remaining endpoint, then rerun with --no-setup.")
 
     if managed:
+        # Wipe any WAL left by a previous run before starting a fresh server,
+        # so stale logs never trigger recovery. No-op if lineairdb-server is
+        # already running (reuse case, handled inside the function).
+        cleanup_lineairdb_logs()
         if not start_lineairdb_server():
             sys.exit(1)
         if not start_mysql_server(args.mysql_port, "127.0.0.1", 9999):
@@ -825,10 +894,15 @@ def main():
 def _run_bench(args, config_work, thread_list, result_base):
     """Setup + execute sweep + summary + plots. Extracted so main() can wrap it."""
     # Toggle Prefetch sysvar explicitly to avoid stale state from prior runs.
+    # The master sysvar is per-mysqld and volatile, so set it on every endpoint
+    # and fail fast: an endpoint left on the wrong mode corrupts the run.
     prefetch_value = "ON" if (args.prefetch or args.prefetch_stmt) else "OFF"
     print(f"  Setting lineairdb_prefetch_execution={prefetch_value}")
-    mysql_cmd(args.mysql_port, args.mysql_host,
-              f"SET GLOBAL lineairdb_prefetch_execution={prefetch_value};")
+    for host, port in args.mysql_endpoints:
+        result = mysql_cmd(port, host,
+                           f"SET GLOBAL lineairdb_prefetch_execution={prefetch_value};")
+        if result.returncode != 0:
+            sys.exit(f"Failed to set lineairdb_prefetch_execution on {host}:{port}")
 
     # Setup phase
     load_time = None
@@ -850,6 +924,10 @@ def _run_bench(args, config_work, thread_list, result_base):
         if load_time is None:
             print("Setup failed.", file=sys.stderr)
             sys.exit(1)
+
+    # A separate step so staged runs (--no-setup, --no-load) still get it.
+    if args.analyze or args.prefetch:
+        run_analyze(args.benchmark, args.mysql_host, args.mysql_port)
 
     if args.no_exec:
         print("  Skipping execute (--no-exec)")
