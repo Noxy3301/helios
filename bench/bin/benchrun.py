@@ -156,7 +156,10 @@ def cleanup_lineairdb_logs():
     if not LINEAIRDB_LOG_DIR.exists():
         return
 
-    if _find_pid("/build/server/lineairdb-server"):
+    # Match start_lineairdb_server()'s reuse predicate (port) and catch a
+    # relative-path launch that is not listening yet. A launch racing the
+    # unlink below stays possible; the bench launcher does not do that.
+    if _find_pid("build/server/lineairdb-server") or _is_port_open("127.0.0.1", 9999):
         print("  Skipping lineairdb_logs cleanup: lineairdb-server is still running")
         return
 
@@ -807,6 +810,10 @@ def main():
         managed = False
 
     if managed:
+        # Wipe any WAL left by a previous run before starting a fresh server,
+        # so stale logs never trigger recovery. No-op if lineairdb-server is
+        # already running (reuse case, handled inside the function).
+        cleanup_lineairdb_logs()
         if not start_lineairdb_server():
             sys.exit(1)
         if not start_mysql_server(args.mysql_port, "127.0.0.1", 9999):
