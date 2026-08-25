@@ -963,6 +963,8 @@ message TxExecuteDuckdbQuery {
         Expr having = 5;
         repeated OrderKey order_by = 6;
         bool distinct = 7;
+        optional uint64 limit = 8;  // absent means no LIMIT
+        optional uint64 offset = 9; // absent means no OFFSET
     }
 
     // Mirrors LineairDB::Pax::FieldKind (pax_store.h): 0=UNTYPED, 1=INT32,

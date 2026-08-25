@@ -1042,16 +1042,25 @@ bool SerializeNest(Serializer& s, const mem_root_deque<Table_ref*>& nest,
 bool SerializeBlock(Serializer& s, Query_block* block,
                     Resolved::QueryBlock* out, bool ignore_limit) {
     if (block == nullptr) return s.Refuse("missing query block");
-    // The EXISTS strategy injects LIMIT 1 into the subquery it rewrites;
-    // m_internal_limit marks exactly that injection. A limit the client
-    // wrote is meaning, not artifact, and stays refused. OFFSET is always
-    // the client's: the injection never adds one, but it can coexist with
-    // the injected limit, so it is checked on its own.
-    if (block->offset_limit != nullptr) {
-        return s.Refuse("OFFSET is not yet translated");
+    // FOUND_ROWS() reads the unbounded count from the executor; the bridge
+    // only reports rows DuckDB returned after applying LIMIT.
+    if (block->active_options() & OPTION_FOUND_ROWS) {
+        return s.Refuse("SQL_CALC_FOUND_ROWS is unsupported");
     }
+    // A session SQL_SELECT_LIMIT applies only without an explicit LIMIT.
+    if (block->select_limit == nullptr && block->m_use_select_limit &&
+        s.thd->variables.select_limit != HA_POS_ERROR) {
+        return s.Refuse("session sql_select_limit is unsupported");
+    }
+    // The EXISTS strategy injects LIMIT 1 into the subquery it rewrites;
+    // m_internal_limit marks exactly that injection and is dropped. A limit
+    // the client wrote is meaning and crosses the wire. OFFSET is always
+    // the client's: the injection never adds one.
     if (block->has_limit() && !(ignore_limit && block->m_internal_limit)) {
-        return s.Refuse("LIMIT is not yet translated");
+        out->set_limit(block->select_limit->val_uint());
+    }
+    if (block->offset_limit != nullptr) {
+        out->set_offset(block->offset_limit->val_uint());
     }
     if (block->is_grouped() && block->olap != UNSPECIFIED_OLAP_TYPE) {
         return s.Refuse("ROLLUP is unsupported");
