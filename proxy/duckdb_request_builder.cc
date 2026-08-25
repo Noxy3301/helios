@@ -260,6 +260,14 @@ bool SerializeArithmetic(Serializer& s, Item_func* function,
         !SerializeExpr(s, function->arguments()[1], arith->mutable_right())) {
         return false;
     }
+    // MySQL evaluates a temporal operand in arithmetic as its YYYYMMDD
+    // number; DuckDB does date arithmetic in days.
+    for (const auto* side : {&arith->left(), &arith->right()}) {
+        const auto kind = side->result_type().kind();
+        if (kind == Resolved::DATE || kind == Resolved::DATETIME) {
+            return s.Refuse("temporal operand in arithmetic is unsupported");
+        }
+    }
     *arith->mutable_result_as() = out->result_type();
     return true;
 }
