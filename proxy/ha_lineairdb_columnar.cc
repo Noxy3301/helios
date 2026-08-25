@@ -33,9 +33,9 @@
 #include "sql/visible_fields.h"
 #include "thr_lock.h"
 
-#include "duckdb_sql_rewrite.hh"
 #include "lineairdb.pb.h"
 #include "lineairdb_field_types.h"
+#include "duckdb_request_builder.hh"
 #include "lineairdb_proxy.hh"
 
 namespace lineairdb {
@@ -169,13 +169,14 @@ class ItemColumnarValue final : public Item_string {
 };
 
 // Statement-local state owned by LEX::secondary_engine_execution_context.
-// OptimizeSecondaryEngine fills the DuckDB bridge request;
-// ExecuteDuckdbBridge consumes it after MySQL calls
-// JOIN::override_executor_func.
+// external_lock records the DuckDB bridge request; ExecuteDuckdbBridge
+// consumes it after MySQL calls JOIN::override_executor_func.
 class ColumnarExecutionContext : public Secondary_engine_execution_context {
  public:
   bool BestPlanSoFar(const JOIN &join, double cost) {
-    if (&join != current_join_) {
+    // A second join-order search on the same JOIN resets join.best_read to
+    // DBL_MAX; reset the parallel best cost at the same boundary.
+    if (&join != current_join_ || join.best_read == DBL_MAX) {
       current_join_ = &join;
       best_cost_ = cost;
       return true;
@@ -186,14 +187,40 @@ class ColumnarExecutionContext : public Secondary_engine_execution_context {
     return cheaper;
   }
 
-  // DuckDB bridge request: built in OptimizeSecondaryEngine, consumed by
-  // ExecuteDuckdbBridge.
-  LineairDB::Protocol::TxExecuteSqlDuckdb::Request duckdb_request;
+  // Built by external_lock (post-resolve, pre-optimize), shipped by
+  // ExecuteDuckdbBridge. A refused or never-built statement is declined by
+  // OptimizeSecondaryEngine; the reason lives in `refusal`.
+  LineairDB::Protocol::TxExecuteDuckdbQuery::Request duckdb_request;
+  bool request_build_attempted = false;
+  std::string refusal;
   bool duckdb_ready = false;
+
+  // Semijoin flattening fuses IN/EXISTS into the outer join for MySQL's
+  // own executor. Keep the subquery Items intact; DuckDB flattens on its
+  // own. Cleared per statement, restored with the context.
+  void DisableSemijoin(THD *thd) {
+    restore_thd_ = thd;
+    saved_optimizer_switch_ = thd->variables.optimizer_switch;
+    // With only the EXISTS strategy left, no subquery reaches the costing
+    // pass that breaks on secondary plans. The derived-table rewrite is
+    // barred through the LEX flag below.
+    thd->variables.optimizer_switch &=
+        ~(OPTIMIZER_SWITCH_SEMIJOIN | OPTIMIZER_SWITCH_MATERIALIZATION |
+          OPTIMIZER_SWITCH_SUBQUERY_TO_DERIVED);
+    thd->lex->m_subquery_to_derived_is_impossible = true;
+  }
+  ~ColumnarExecutionContext() override {
+    if (restore_thd_ != nullptr) {
+      restore_thd_->variables.optimizer_switch = saved_optimizer_switch_;
+      restore_thd_->lex->m_subquery_to_derived_is_impossible = false;
+    }
+  }
 
  private:
   const JOIN *current_join_ = nullptr;
   double best_cost_ = 0.0;
+  THD *restore_thd_ = nullptr;
+  ulonglong saved_optimizer_switch_ = 0;
 };
 
 struct DecodedField {
@@ -315,214 +342,7 @@ bool RoundDecimalText(const char *ptr, size_t len, uint32_t target_scale,
 }
 
 /**
- * @brief Recursively collects every real base table under `lex` into `req`,
- * expanding each referenced SQL VIEW into a CTE appended to `cte_prefix`.
- *
- * @details The statement text shipped to DuckDB is thd->query(), which
- * cannot resolve view names by itself. Each view's resolved body
- * (Table_ref::view_body_utf8, the SHOW CREATE VIEW printout) is inlined as
- * a WITH entry instead, after identifier rewriting
- * (ConvertBacktickIdentifiers). Expansion recurses into the view's own LEX
- * first, so nested CTEs appear in dependency order. Returns false on any
- * table the bridge cannot serve.
- *
- * @param seen_tables Dedups base tables by PaxStore key across the whole
- * statement (self-joins, direct plus through-view references).
- * @param seen_views Dedups view expansions; a view referenced twice gets
- * one CTE.
- */
-bool CollectBaseTables(THD *thd, LEX *lex,
-                       LineairDB::Protocol::TxExecuteSqlDuckdb::Request *req,
-                       std::set<std::string> *seen_tables,
-                       std::set<std::string> *seen_views,
-                       std::string *cte_prefix, const char **why) {
-  // Expands one genuine SQL VIEW's Table_ref into a `WITH "name"(...) AS
-  // (...)` CTE fragment (dependency-ordered: nested views/tables first).
-  // Factored out because a view reaches this function's loop below in two
-  // different shapes -- see the referencing_view walk beneath it for why.
-  auto expand_view = [&](Table_ref *view_tr) -> bool {
-    const std::string view_name(view_tr->table_name);
-    if (!seen_views->insert(view_name).second) return true;  // already expanded
-
-    if (view_tr->view_body_utf8.str == nullptr ||
-        view_tr->view_body_utf8.length == 0) {
-      *why = "view has no resolved body text";
-      return false;
-    }
-
-    if (!CollectBaseTables(thd, view_tr->view_query(), req, seen_tables,
-                          seen_views, cte_prefix, why)) {
-      return false;  // nested views/tables first: dependency order
-    }
-
-    // view_body_utf8 is the pre-resolution snapshot MySQL bakes at CREATE
-    // VIEW time. Do not print the live derived_query_expression() instead:
-    // the optimized tree renders post-transform artifacts ("<cache>(expr)"
-    // wrappers, semijoin text without an ON clause) that DuckDB cannot
-    // parse and that no print flag suppresses.
-    const std::string body = ConvertBacktickIdentifiers(std::string(
-        view_tr->view_body_utf8.str, view_tr->view_body_utf8.length));
-
-    cte_prefix->append(cte_prefix->empty() ? "WITH \"" : ", \"");
-    cte_prefix->append(view_name);
-    cte_prefix->push_back('"');
-    if (const Create_col_name_list *cols = view_tr->derived_column_names()) {
-      cte_prefix->push_back('(');
-      for (size_t i = 0; i < cols->size(); i++) {
-        if (i != 0) cte_prefix->append(", ");
-        cte_prefix->push_back('"');
-        cte_prefix->append((*cols)[i].str, (*cols)[i].length);
-        cte_prefix->push_back('"');
-      }
-      cte_prefix->push_back(')');
-    }
-    cte_prefix->append(" AS (");
-    cte_prefix->append(body);
-    cte_prefix->push_back(')');
-    return true;
-  };
-
-  for (Query_block *qbi = lex->all_query_blocks_list; qbi != nullptr;
-       qbi = qbi->next_select_in_list()) {
-    for (Table_ref *tr = qbi->leaf_tables; tr != nullptr; tr = tr->next_leaf) {
-      if (tr->is_view()) {
-        if (!expand_view(tr)) return false;
-        continue;
-      }
-
-      // A merged (mergeable) view leaves no is_view() leaf: MySQL splices
-      // its base tables into the outer leaf_tables, each linking back to
-      // the view through Table_ref::referencing_view. Recover the original
-      // view Table_ref through that chain (nested views give multiple
-      // links) and expand it like a view leaf; the spliced table itself is
-      // re-found through the view's own LEX and deduped by seen_tables.
-      //
-      // The seen_views check must gate this branch: referencing_view is
-      // also set on leaves visited while expanding a NON-merged view's own
-      // body. That view is already in seen_views, and expanding it here
-      // would short-circuit and skip registering this leaf as a base table.
-      Table_ref *outer_view = nullptr;
-      for (Table_ref *anc = tr->referencing_view; anc != nullptr;
-           anc = anc->referencing_view) {
-        if (anc->is_view()) outer_view = anc;
-      }
-      if (outer_view != nullptr &&
-          seen_views->find(std::string(outer_view->table_name)) ==
-              seen_views->end()) {
-        if (!expand_view(outer_view)) return false;
-        continue;
-      }
-
-      if (tr->is_view_or_derived()) continue;  // synthetic/materialized leaf
-
-      TABLE *table = tr->table;
-      if (table == nullptr || table->s == nullptr) {
-        *why = "table has no open TABLE";
-        return false;
-      }
-
-      const std::string table_key = table->s->normalized_path.str;
-      if (!seen_tables->insert(table_key).second) {
-        continue;  // same base table already added (self-join or repeated
-                   // reference across query blocks / view expansions)
-      }
-
-      // Recomputes the identical widths/kinds/scales ha_lineairdb::create()
-      // sent to DB_CREATE_TABLE for this table (same pure function of TABLE
-      // metadata; see lineairdb_field_types.h). An empty result means the
-      // table is not PAX-eligible (falls back to ordinary row storage),
-      // which the DuckDB bridge cannot read -- reject rather than guess.
-      std::vector<uint32_t> pax_kinds;
-      std::vector<int32_t> pax_scales;
-      std::vector<uint32_t> pax_widths =
-          compute_pax_field_widths(table, &pax_kinds, &pax_scales);
-      if (pax_widths.empty()) {
-        *why = "table is not PAX-eligible";
-        return false;
-      }
-
-      auto *table_desc = req->add_tables();
-      table_desc->set_table_name(table_key);
-      table_desc->set_sql_name(table->s->table_name.str);
-      table_desc->set_db_name(table->s->db.str);
-      for (uint i = 0; i < table->s->fields; i++) {
-        Field *field = table->field[i];
-        auto *col = table_desc->add_columns();
-        col->set_name(field->field_name == nullptr ? "" : field->field_name);
-        // Index i+1: entry 0 of the widths/kinds/scales vectors is the row
-        // null-flags field, not a named column.
-        col->set_pax_kind(pax_kinds[i + 1]);
-        col->set_pax_width(pax_widths[i + 1]);
-        col->set_pax_scale(pax_scales[i + 1]);
-      }
-    }
-  }
-  return true;
-}
-
-/**
- * @brief Build a TxExecuteSqlDuckdb request from the verbatim client SQL
- * text plus this query block's base tables.
- *
- * Forwards the client's SQL text (prefixed with view CTEs, see
- * CollectBaseTables) for the server's embedded DuckDB to parse and execute
- * against live PAX storage. The only shape requirement is PAX-eligible
- * metadata for every base table.
- */
-bool BuildDuckdbBridgeRequest(
-    THD *thd, Query_block *qb,
-    LineairDB::Protocol::TxExecuteSqlDuckdb::Request *req,
-    const char **why) {
-  req->Clear();
-  if (qb == nullptr || qb->outer_query_block() != nullptr) {
-    *why = "not top-level";
-    return false;
-  }
-
-  const LEX_CSTRING query = thd->query();
-  if (query.str == nullptr || query.length == 0) {
-    *why = "no query text";
-    return false;
-  }
-
-  // Walk every query block in the statement (all_query_blocks_list), not
-  // just qb->leaf_tables: the optimizer can hide a subquery's base tables
-  // behind a materialized/derived leaf of the outer block, while the
-  // subquery's own Query_block still lists them directly. DuckDB re-parses
-  // the raw SQL, so it needs the real base tables and never MySQL's
-  // internal materializations (those have no PAX store). SQL VIEW leaves
-  // are expanded into CTEs (CollectBaseTables).
-  std::set<std::string> seen_tables;   // dedup by normalized_path
-  std::set<std::string> seen_views;    // dedup view expansions
-  std::string cte_prefix;
-  if (!CollectBaseTables(thd, thd->lex, req, &seen_tables, &seen_views,
-                        &cte_prefix, why)) {
-    return false;
-  }
-  if (req->tables_size() == 0) {
-    *why = "no base tables";
-    return false;
-  }
-
-  std::string sql;
-  sql.reserve(cte_prefix.size() + 1 + query.length);
-  if (!cte_prefix.empty()) {
-    sql.append(cte_prefix);
-    sql.push_back(' ');
-  }
-  sql.append(query.str, query.length);
-  req->set_sql(sql);
-  // Enabled when set to anything but empty or "0", matching ENABLE_RPC_TRACE
-  const char *debug = std::getenv("ENABLE_DUCKDB_BRIDGE_DEBUG");
-  if (debug != nullptr && debug[0] != '\0' && std::string_view(debug) != "0") {
-    std::fprintf(stderr, "[duckdb_bridge] sql=[%s]\n", sql.c_str());
-  }
-
-  return true;
-}
-
-/**
- * @brief Execute the SQL text built by BuildDuckdbBridgeRequest.
+ * @brief Execute the request recorded by BuildDuckdbQueryRequest.
  *
  * MySQL has already sent result-set metadata for the original SELECT list;
  * this override only ships value-only Item carriers that match it. The
@@ -542,8 +362,9 @@ bool ExecuteDuckdbBridge(JOIN *join, Query_result *result) {
     return RaiseColumnarError(thd, "LINEAIRDB_COLUMNAR: no server connection");
   }
 
-  LineairDB::Protocol::TxExecuteSqlDuckdb::Response rpc;
-  if (!proxy->tx_execute_sql_duckdb(ctx->duckdb_request, &rpc) || !rpc.ok()) {
+  LineairDB::Protocol::TxExecuteDuckdbQuery::Response rpc;
+  if (!proxy->tx_execute_duckdb_query(ctx->duckdb_request, &rpc) ||
+      !rpc.ok()) {
     char message[192];
     snprintf(message, sizeof(message), "LINEAIRDB_COLUMNAR duckdb-bridge: %s",
              rpc.error().empty() ? "duckdb bridge RPC failed"
@@ -614,7 +435,10 @@ bool PrepareSecondaryEngine(THD *thd, LEX *lex) {
 
   auto *ctx = new (thd->mem_root) ColumnarExecutionContext;
   if (ctx == nullptr) return true;
+  // Install first: set_... destroys any prior context, whose destructor
+  // restores the switches this call is about to save.
   lex->set_secondary_engine_execution_context(ctx);
+  ctx->DisableSemijoin(thd);
   return false;
 }
 
@@ -634,14 +458,12 @@ bool OptimizeSecondaryEngine(THD *, LEX *lex) {
                               "LINEAIRDB_COLUMNAR unsupported shape: no JOIN");
   }
 
-  const char *why = "?";
-  if (!BuildDuckdbBridgeRequest(lex->thd, query_block, &ctx->duckdb_request,
-                                &why)) {
-    char message[192];
-    snprintf(message, sizeof(message),
-             "LINEAIRDB_COLUMNAR duckdb-bridge unsupported shape: %s",
-             why ? why : "?");
-    return RaiseColumnarError(lex->thd, message);
+  if (!ctx->request_build_attempted || !ctx->refusal.empty()) {
+    std::string message = "LINEAIRDB_COLUMNAR duckdb-query: ";
+    message.append(ctx->request_build_attempted
+                       ? ctx->refusal
+                       : std::string("request was not built before optimization"));
+    return RaiseColumnarError(lex->thd, message.c_str());
   }
   ctx->duckdb_ready = true;
   join->override_executor_func = ExecuteDuckdbBridge;
@@ -702,21 +524,8 @@ bool CompareJoinCost(THD *thd, const JOIN &join, double optimizer_cost,
   *use_best_so_far = false;
   *secondary_engine_cost = optimizer_cost;
 
-  // A quantified subquery (IN/ALL/ANY) that survives to the secondary
-  // optimization pass reaches subquery-materialization costing, which
-  // crashes on plans produced for secondary tables. Antijoin and derived
-  // rewrites are unavailable on this pass for such shapes (nullable NOT IN),
-  // so reject them here, before the costing runs. EXISTS and scalar
-  // subqueries resolve to the EXISTS strategy and never reach that costing.
-  const Item_subselect *subquery_item = join.query_expression()->item;
-  if (subquery_item != nullptr &&
-      (subquery_item->substype() == Item_subselect::IN_SUBS ||
-       subquery_item->substype() == Item_subselect::ALL_SUBS ||
-       subquery_item->substype() == Item_subselect::ANY_SUBS)) {
-    return RaiseColumnarError(
-        thd, "LINEAIRDB_COLUMNAR unsupported shape: quantified subquery");
-  }
-
+  // DisableSemijoin leaves every surviving subquery on the EXISTS
+  // strategy, so its JOIN reaches this hook like any other.
   auto *ctx = static_cast<ColumnarExecutionContext *>(
       thd->lex->secondary_engine_execution_context());
   if (ctx == nullptr) return true;
@@ -810,6 +619,33 @@ unsigned long ha_lineairdb_columnar::index_flags(unsigned int index,
 
   // Indexes are available only to let the optimizer estimate primary ranges.
   return (HA_READ_RANGE | HA_KEY_SCAN_NOT_ROR) & primary_flags;
+}
+
+// Builds the request once per statement, at the only stock point after
+// resolution and before optimization. The outcome is recorded, not raised:
+// a non-zero return here reads as a lock error and aborts the statement.
+int ha_lineairdb_columnar::external_lock(THD *thd, int lock_type) {
+  if (lock_type == F_UNLCK) return 0;
+  auto *ctx = static_cast<ColumnarExecutionContext *>(
+      thd->lex->secondary_engine_execution_context());
+  if (ctx == nullptr || ctx->request_build_attempted) return 0;
+  ctx->request_build_attempted = true;
+  if (!BuildDuckdbQueryRequest(thd, thd->lex, &ctx->duckdb_request,
+                              &ctx->refusal) &&
+      ctx->refusal.empty()) {
+    ctx->refusal = "request build failed";
+  }
+  static const bool debug_resolved = [] {
+    const char *value = std::getenv("ENABLE_DUCKDB_BRIDGE_DEBUG");
+    return value != nullptr && value[0] != '\0' &&
+           std::string_view(value) != "0";
+  }();
+  if (debug_resolved) {
+    std::fprintf(stderr, "[duckdb-request] refusal='%s'\n%s\n",
+                 ctx->refusal.c_str(),
+                 ctx->duckdb_request.DebugString().c_str());
+  }
+  return 0;
 }
 
 THR_LOCK_DATA **ha_lineairdb_columnar::store_lock(THD *, THR_LOCK_DATA **to,

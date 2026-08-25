@@ -53,9 +53,9 @@ enum OpCode {
     TX_EXECUTE_READ_PLAN = 30;
     TX_GET_TABLE_STATS = 31;
 
-    // Executes raw SQL text on the server's embedded DuckDB executor, which
-    // reads PAX storage in place.
-    TX_EXECUTE_SQL_DUCKDB = 36;
+    // Executes a resolved-statement request on the server's embedded DuckDB
+    // executor, which reads PAX storage in place.
+    TX_EXECUTE_DUCKDB_QUERY = 36;
 }
 
 enum BatchOpType {
@@ -719,46 +719,278 @@ message PushedPredicate {
     uint32 num_columns = 2;
 }
 
-// DuckDB bridge: executes verbatim client SQL text on the LineairDB server
-// through the embedded DuckDB executor, which reads the server's PAX storage
-// in place.
-//
-// Each request carries per-table PAX cell metadata (kind/width/scale); the
-// server persists none of it. The proxy derives the metadata from
-// TABLE::field[] with the computation used at CREATE TABLE time, and it
-// matches the server-side PAX layout while the table's schema is unchanged.
-message TxExecuteSqlDuckdb {
+// DuckDB bridge. The proxy encodes MySQL's resolved statement
+// (Query_block + Item trees, captured after resolution and before
+// optimization) and the server constructs DuckDB's parsed AST from it.
+// No SQL text crosses the wire, so the object validated on the proxy is the
+// object executed. Every oneof is default-deny on both sides: a node the
+// serializer has no rule for is never emitted, and a node the server does
+// not recognize fails the request.
+message TxExecuteDuckdbQuery {
+    enum TypeKind {
+        TYPE_UNSPECIFIED = 0;
+        INT64 = 1;
+        DECIMAL = 2;   // DEC64: at most 15 significant digits
+        VARCHAR = 3;
+        DATE = 4;
+        DATETIME = 5;
+        BOOL = 6;
+    }
+
+    message ResolvedType {
+        TypeKind kind = 1;
+        bool nullable = 2;
+        uint32 precision = 3;    // DECIMAL only
+        uint32 scale = 4;        // DECIMAL only
+        uint32 collation_id = 5; // VARCHAR only; MySQL collation number
+    }
+
+    message DecimalLit {
+        sint64 unscaled = 1;
+        uint32 scale = 2;
+    }
+    message DateLit {
+        int32 year = 1;
+        uint32 month = 2;
+        uint32 day = 3;
+    }
+    message DatetimeLit {
+        DateLit date = 1;
+        uint32 hour = 2;
+        uint32 minute = 3;
+        uint32 second = 4;
+        uint32 microsecond = 5;
+    }
+    message Literal {
+        oneof value {
+            int64 int_value = 1;
+            DecimalLit decimal_value = 2;
+            bytes string_value = 3;
+            DateLit date_value = 4;
+            DatetimeLit datetime_value = 5;
+            bool bool_value = 6;
+            bool null_value = 7; // set true; typed by Expr.result_type
+        }
+    }
+
+    // relation_id is unique across the whole request, subqueries included,
+    // so a correlated reference names its defining relation directly.
+    message ColumnRef {
+        uint32 relation_id = 1;
+        uint32 column_ordinal = 2; // TABLE::field[] order for a base table;
+                                   // select-list position for a derived one
+    }
+
+    message Logical {
+        enum Op {
+            OP_UNSPECIFIED = 0;
+            AND = 1;
+            OR = 2;
+        }
+        Op op = 1;
+        repeated Expr args = 2;
+    }
+    message Not {
+        Expr arg = 1;
+    }
+    message IsNullTest {
+        Expr arg = 1;
+        bool negated = 2;
+    }
+    message Comparison {
+        enum Op {
+            OP_UNSPECIFIED = 0;
+            EQ = 1;
+            NE = 2;
+            LT = 3;
+            LE = 4;
+            GT = 5;
+            GE = 6;
+        }
+        Op op = 1;
+        Expr left = 2;
+        Expr right = 3;
+        // The type MySQL resolved the comparison under. The server inserts
+        // casts so DuckDB compares under the same type instead of inferring.
+        ResolvedType compare_as = 4;
+    }
+    message Arithmetic {
+        enum Op {
+            OP_UNSPECIFIED = 0;
+            ADD = 1;
+            SUB = 2;
+            MUL = 3;
+            DIV = 4;
+            MOD = 5;
+        }
+        Op op = 1;
+        Expr left = 2;
+        Expr right = 3;
+        ResolvedType result_as = 4;
+    }
+    message Between {
+        Expr value = 1;
+        Expr low = 2;
+        Expr high = 3;
+        bool negated = 4;
+        ResolvedType compare_as = 5;
+    }
+    message InList {
+        Expr value = 1;
+        repeated Expr list = 2;
+        bool negated = 3;
+    }
+    message CaseWhen {
+        message Branch {
+            Expr when = 1;
+            Expr then = 2;
+        }
+        repeated Branch branches = 1;
+        Expr else_result = 2;
+    }
+    message FunctionCall {
+        enum Fn {
+            FN_UNSPECIFIED = 0;
+            EXTRACT_YEAR = 1;
+            SUBSTRING = 2;
+            ASCII = 3;
+        }
+        Fn fn = 1;
+        repeated Expr args = 2;
+    }
+    message Aggregate {
+        enum Kind {
+            KIND_UNSPECIFIED = 0;
+            COUNT_STAR = 1;
+            COUNT = 2;
+            SUM = 3;
+            AVG = 4;
+            MIN = 5;
+            MAX = 6;
+        }
+        Kind kind = 1;
+        Expr arg = 2; // absent for COUNT_STAR
+        bool distinct = 3;
+    }
+    message LikePred {
+        Expr value = 1;
+        Expr pattern = 2;
+        sint32 escape = 3;
+        bool negated = 4;
+        uint32 collation_id = 5;
+    }
+    message Subquery {
+        enum Kind {
+            KIND_UNSPECIFIED = 0;
+            SCALAR = 1;
+            EXISTS = 2;
+            IN = 3;
+        }
+        Kind kind = 1;
+        QueryBlock query = 2;
+        Expr left = 3; // IN only
+        bool negated = 4;
+    }
+    message CastExpr {
+        Expr arg = 1;
+        ResolvedType to = 2;
+    }
+
+    message Expr {
+        ResolvedType result_type = 1;
+        oneof node {
+            Literal literal = 10;
+            ColumnRef column = 11;
+            Logical logical = 12;
+            Not not = 13;
+            IsNullTest is_null = 14;
+            Comparison comparison = 15;
+            Arithmetic arithmetic = 16;
+            Between between = 17;
+            InList in_list = 18;
+            CaseWhen case_when = 19;
+            FunctionCall function = 20;
+            Aggregate aggregate = 21;
+            LikePred like = 22;
+            Subquery subquery = 23;
+            CastExpr cast = 24;
+        }
+    }
+
+    message BaseTable {
+        uint32 relation_id = 1;
+        uint32 table_desc_index = 2; // into Request.tables
+    }
+    message DerivedTable {
+        uint32 relation_id = 1;
+        QueryBlock query = 2;
+    }
+    message JoinRel {
+        enum Kind {
+            KIND_UNSPECIFIED = 0;
+            INNER = 1;
+            LEFT = 2;
+            CROSS = 3;
+            SEMI = 4;
+            ANTI = 5;
+        }
+        Kind kind = 1;
+        Relation left = 2;
+        Relation right = 3;
+        Expr condition = 4; // absent for CROSS
+    }
+    message Relation {
+        oneof node {
+            BaseTable base = 1;
+            DerivedTable derived = 2;
+            JoinRel join = 3;
+        }
+    }
+
+    message SelectItem {
+        Expr expression = 1;
+    }
+    message OrderKey {
+        Expr expression = 1;
+        bool descending = 2;
+        bool nulls_first = 3;
+    }
+    message QueryBlock {
+        Relation from = 1;
+        repeated SelectItem select = 2;
+        Expr where = 3;
+        repeated Expr group_by = 4;
+        Expr having = 5;
+        repeated OrderKey order_by = 6;
+        bool distinct = 7;
+        optional uint64 limit = 8;  // absent means no LIMIT
+        optional uint64 offset = 9; // absent means no OFFSET
+    }
+
     // Mirrors LineairDB::Pax::FieldKind (pax_store.h): 0=UNTYPED, 1=INT32,
     // 2=INT64, 3=DATE, 4=DEC64.
     message ColumnDesc {
-        string name = 1;         // TABLE::field[i]->field_name
-        uint32 pax_kind = 2;
-        uint32 pax_width = 3;    // PAX cell payload width (bytes)
-        int32 pax_scale = 4;     // FK_DEC64 only
+        uint32 pax_kind = 1;
+        uint32 pax_width = 2;    // PAX cell payload width (bytes)
+        int32 pax_scale = 3;     // FK_DEC64 only
     }
+    // The server persists no schema; each request carries per-table PAX cell
+    // metadata derived from TABLE::field[] and validated against the store.
     message TableDesc {
         string table_name = 1;             // PaxStore lookup key
                                            // (TABLE_SHARE::normalized_path)
-        string sql_name = 3;               // bare name the SQL text uses
-                                           // (TABLE_SHARE::table_name),
-                                           // e.g. "lineitem"
-        string db_name = 4;                // TABLE_SHARE::db, e.g. "benchbase".
-                                           // Informational: the server
-                                           // registers only the bare sql_name
-                                           // view, and the proxy strips
-                                           // db-qualification from table
-                                           // references in the SQL text (see
-                                           // RegisterPaxView in
-                                           // duckdb_bridge_executor.cc).
         repeated ColumnDesc columns = 2;   // TABLE::field[] order
     }
+
     message Request {
-        string sql = 1;                // verbatim client SQL text (thd->query())
-        repeated TableDesc tables = 2; // every base table the query touches
+        uint32 format_version = 1; // exact match required
+        repeated TableDesc tables = 2;
+        QueryBlock root = 3;
+        uint32 expected_output_count = 4;
     }
     message Response {
         bool ok = 1;
         string error = 2;
-        repeated bytes rows = 3;  // proxy row format, DuckDB result order
+        repeated bytes rows = 3; // proxy row format, DuckDB result order
     }
 }

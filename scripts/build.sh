@@ -44,15 +44,6 @@ fi
 SERVER_BUILD_TYPE=${SERVER_BUILD_TYPE:-Release}
 MYSQL_BUILD_TYPE=${MYSQL_BUILD_TYPE:-Release}
 
-# Build server
-echo "Building server (CMAKE_BUILD_TYPE=${SERVER_BUILD_TYPE})..."
-cd build/server
-cmake ../../server \
-    -DCMAKE_BUILD_TYPE=${SERVER_BUILD_TYPE} \
-    -DCMAKE_EXPORT_COMPILE_COMMANDS=1
-make -j `nproc`
-cd ../..
-
 # Create proxy copy with necessary dependencies in build directory
 echo "Creating proxy build structure..."
 cp -r proxy build/
@@ -87,3 +78,15 @@ cmake ../third_party/mysql-server \
     -G Ninja
 
 ninja $1 -j `nproc`
+
+cd ..
+
+# Build server. It links the MySQL charset archives, which the MySQL build
+# above produces.
+echo "Building server (CMAKE_BUILD_TYPE=${SERVER_BUILD_TYPE})..."
+cd build/server
+cmake ../../server \
+    -DCMAKE_BUILD_TYPE=${SERVER_BUILD_TYPE} \
+    -DCMAKE_EXPORT_COMPILE_COMMANDS=1
+make -j `nproc`
+cd ../..

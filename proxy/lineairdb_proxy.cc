@@ -432,20 +432,20 @@ LineairDBProxy::tx_stateless_batch_read(
     return results;
 }
 
-bool LineairDBProxy::tx_execute_sql_duckdb(
-    const LineairDB::Protocol::TxExecuteSqlDuckdb::Request& request,
-    LineairDB::Protocol::TxExecuteSqlDuckdb::Response* response) {
+bool LineairDBProxy::tx_execute_duckdb_query(
+    const LineairDB::Protocol::TxExecuteDuckdbQuery::Request& request,
+    LineairDB::Protocol::TxExecuteDuckdbQuery::Response* response) {
     if (!connected_) {
         LOG_ERROR("RPC failed: Not connected to server");
         return false;
     }
     if (response == nullptr) {
-        LOG_ERROR("RPC failed: duckdb bridge response is null");
+        LOG_ERROR("RPC failed: resolved duckdb response is null");
         return false;
     }
     if (!send_protobuf_message(request, *response,
-                               MessageType::TX_EXECUTE_SQL_DUCKDB)) {
-        LOG_ERROR("RPC failed: duckdb bridge message");
+                               MessageType::TX_EXECUTE_DUCKDB_QUERY)) {
+        LOG_ERROR("RPC failed: resolved duckdb message");
         return false;
     }
     return true;

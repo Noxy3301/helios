@@ -39,7 +39,10 @@ set(LINEAIRDB_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/LineairDB")
 add_subdirectory(${LINEAIRDB_DIR} ${CMAKE_CURRENT_BINARY_DIR}/LineairDB)
 set(LINEAIRDB_PLUGIN_DYNAMIC "ha_lineairdb")
 set(LINEAIRDB_SOURCES ha_lineairdb.cc ha_lineairdb.hh
-                      ha_lineairdb_columnar.cc ha_lineairdb_columnar.hh
+                      ha_lineairdb_columnar.cc
+                      ha_lineairdb_columnar.hh
+                      duckdb_request_builder.cc
+                      duckdb_request_builder.hh
                       ddl.cc
                       dml.cc
                       index_scan.cc
@@ -55,7 +58,6 @@ set(LINEAIRDB_SOURCES ha_lineairdb.cc ha_lineairdb.hh
                       lineairdb_index_search.cc lineairdb_index_search.hh
                       lineairdb_prefetch.cc lineairdb_prefetch.hh
                       lineairdb_autogen.cc lineairdb_autogen.hh
-                      duckdb_sql_rewrite.cc duckdb_sql_rewrite.hh
                       rpc_trace.cc rpc_trace.hh)
 add_definitions(-DMYSQL_SERVER)
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wno-error -Wextra -mcx16 -fPIC")

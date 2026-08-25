@@ -4,11 +4,14 @@
     <!-- Connection details -->
     <type>MYSQL</type>
     <driver>com.mysql.cj.jdbc.Driver</driver>
-    <url>jdbc:mysql://localhost:3307/benchbase?rewriteBatchedStatements=true&amp;allowLoadLocalInfile=true&amp;allowPublicKeyRetrieval=true&amp;sslMode=DISABLED</url>
+    <url>jdbc:mysql://localhost:3307/benchbase?rewriteBatchedStatements=true&amp;allowLoadLocalInfile=true&amp;allowPublicKeyRetrieval=true&amp;sslMode=DISABLED&amp;sessionVariables=secondary_engine_cost_threshold=0</url>
     <username>root</username>
     <password></password>
     <reconnectOnConnectionFailure>true</reconnectOnConnectionFailure>
     <isolation>TRANSACTION_SERIALIZABLE</isolation>
+    <!-- Offload needs autocommit: MySQL refuses secondary-engine execution
+         inside a multi-statement transaction. -->
+    <autocommit>true</autocommit>
     <batchsize>1024</batchsize>
 
     <!-- Loader pool >= 3 + 5*tpch.load.shards; 128 covers up to 25 shards. -->
