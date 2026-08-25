@@ -261,7 +261,8 @@ bool SerializeArithmetic(Serializer& s, Item_func* function,
         return false;
     }
     // MySQL evaluates a temporal operand in arithmetic as its YYYYMMDD
-    // number; DuckDB does date arithmetic in days.
+    // number; DuckDB does date arithmetic in days. Constant temporal
+    // expressions fold to literals before reaching here.
     for (const auto* side : {&arith->left(), &arith->right()}) {
         const auto kind = side->result_type().kind();
         if (kind == Resolved::DATE || kind == Resolved::DATETIME) {
@@ -708,9 +709,145 @@ bool SerializeAggregate(Serializer& s, Item_sum* sum, Resolved::Expr* out) {
     return SerializeExpr(s, sum->get_arg(0), aggregate->mutable_arg());
 }
 
+// The row path emits evaluation warnings per row; a plan-time fold must not
+// leak a speculative one. Evaluation runs under an isolated diagnostics
+// area, and any raised condition refuses the fold.
+struct ScopedDiagnostics {
+    THD* thd;
+    Diagnostics_area area{false};
+    explicit ScopedDiagnostics(THD* thd_arg) : thd(thd_arg) {
+        thd->push_diagnostics_area(&area, false);
+    }
+    ~ScopedDiagnostics() { thd->pop_diagnostics_area(); }
+    bool clean() const {
+        return !area.is_error() && area.current_statement_cond_count() == 0;
+    }
+};
+
+// const_item() alone proves table independence, not purity: a constant tree
+// can still hide a side-effecting call (GET_LOCK) that must not run at plan
+// time. Only literals, temporal casts, and interval arithmetic over pure
+// arguments are evaluated.
+bool ConstTreeIsPure(Item* item) {
+    item = RealItem(item);
+    if (item == nullptr) return false;
+    if (item->basic_const_item()) return true;
+    if (item->type() != Item::FUNC_ITEM) return false;
+    auto* function = down_cast<Item_func*>(item);
+    if (function->functype() != Item_func::DATEADD_FUNC &&
+        function->functype() != Item_func::TYPECAST_FUNC) {
+        return false;
+    }
+    for (uint i = 0; i < function->argument_count(); ++i) {
+        if (!ConstTreeIsPure(function->arguments()[i])) return false;
+    }
+    return true;
+}
+
+// DATE_ADD over a string constant resolves as a character type in MySQL;
+// the folded string keeps that type and the comparison rules already treat
+// it against temporal operands.
+bool SerializeStringConst(Serializer& s, Item* item, Resolved::Expr* out) {
+    if (!TypeOf(s, item, out->mutable_result_type())) return false;
+    StringBuffer<64> buffer;
+    String* text;
+    bool clean;
+    {
+        ScopedDiagnostics diagnostics(s.thd);
+        text = item->val_str(&buffer);
+        clean = diagnostics.clean();
+    }
+    if (!clean) {
+        return s.Refuse("constant evaluation raised a condition");
+    }
+    if (item->null_value) {
+        out->mutable_literal()->set_null_value(true);
+        return true;
+    }
+    if (text == nullptr) {
+        return s.Refuse("constant string expression evaluation failed");
+    }
+    out->mutable_literal()->set_string_value(
+        std::string(text->ptr(), text->length()));
+    return true;
+}
+
+// MySQL keeps DATE'...' literals and constant temporal arithmetic (interval
+// addition) as function items; evaluating them here lets them cross as plain
+// literals instead of unsupported functions.
+bool SerializeTemporalConst(Serializer& s, Item* item, Resolved::Expr* out) {
+    if (!TypeOf(s, item, out->mutable_result_type())) return false;
+    MYSQL_TIME time;
+    auto* literal = out->mutable_literal();
+    bool failed;
+    bool clean;
+    {
+        ScopedDiagnostics diagnostics(s.thd);
+        failed = item->get_date(&time, TIME_FUZZY_DATE);
+        clean = diagnostics.clean();
+    }
+    if (!clean) {
+        return s.Refuse("constant evaluation raised a condition");
+    }
+    if (failed) {
+        if (item->null_value) {
+            literal->set_null_value(true);
+            return true;
+        }
+        return s.Refuse("constant temporal expression evaluation failed");
+    }
+    // Zero dates, year zero, and ALLOW_INVALID_DATES values ('2001-02-31')
+    // have no DuckDB equivalent.
+    auto leap_year = [](uint32_t y) {
+        return (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;
+    };
+    static constexpr uint8_t kDaysInMonth[] = {31, 28, 31, 30, 31, 30,
+                                               31, 31, 30, 31, 30, 31};
+    if (time.year == 0 || time.month == 0 || time.month > 12 ||
+        time.day == 0 ||
+        time.day > kDaysInMonth[time.month - 1] +
+                       (time.month == 2 && leap_year(time.year))) {
+        return s.Refuse("date constant outside the Gregorian calendar");
+    }
+    auto* date = out->result_type().kind() == Resolved::DATE
+                     ? literal->mutable_date_value()
+                     : literal->mutable_datetime_value()->mutable_date();
+    date->set_year(time.year);
+    date->set_month(time.month);
+    date->set_day(time.day);
+    if (out->result_type().kind() != Resolved::DATE) {
+        auto* datetime = literal->mutable_datetime_value();
+        datetime->set_hour(time.hour);
+        datetime->set_minute(time.minute);
+        datetime->set_second(time.second);
+        datetime->set_microsecond(time.second_part);
+    }
+    return true;
+}
+
 bool SerializeExpr(Serializer& s, Item* item, Resolved::Expr* out) {
     item = RealItem(item);
     if (item == nullptr) return s.Refuse("null item");
+    switch (item->data_type()) {
+        case MYSQL_TYPE_DATE:
+        case MYSQL_TYPE_NEWDATE:
+        case MYSQL_TYPE_DATETIME:
+        case MYSQL_TYPE_TIMESTAMP:
+            if (item->const_item() && ConstTreeIsPure(item)) {
+                return SerializeTemporalConst(s, item, out);
+            }
+            break;
+        case MYSQL_TYPE_VARCHAR:
+        case MYSQL_TYPE_VAR_STRING:
+        case MYSQL_TYPE_STRING:
+            if (item->type() == Item::FUNC_ITEM && item->const_item() &&
+                ConstTreeIsPure(item)) {
+                return SerializeStringConst(s, item, out);
+            }
+            break;
+        default:
+            break;
+    }
     switch (item->type()) {
         case Item::FIELD_ITEM: {
             auto* field_item = down_cast<Item_field*>(item);
