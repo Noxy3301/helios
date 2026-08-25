@@ -51,6 +51,7 @@ class ha_lineairdb_columnar : public handler {
                             bool all_parts) const override;
   THR_LOCK_DATA **store_lock(THD *thd, THR_LOCK_DATA **to,
                              thr_lock_type lock_type) override;
+  int external_lock(THD *thd, int lock_type) override;
   Table_flags table_flags() const override { return HA_NO_INDEX_ACCESS; }
   const char *table_type() const override { return "LINEAIRDB_COLUMNAR"; }
   int load_table(const TABLE &table) override;

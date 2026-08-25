@@ -36,6 +36,7 @@
 #include "duckdb_sql_rewrite.hh"
 #include "lineairdb.pb.h"
 #include "lineairdb_field_types.h"
+#include "duckdb_request_builder.hh"
 #include "lineairdb_proxy.hh"
 
 namespace lineairdb {
@@ -175,7 +176,9 @@ class ItemColumnarValue final : public Item_string {
 class ColumnarExecutionContext : public Secondary_engine_execution_context {
  public:
   bool BestPlanSoFar(const JOIN &join, double cost) {
-    if (&join != current_join_) {
+    // A second join-order search on the same JOIN resets join.best_read to
+    // DBL_MAX; reset the parallel best cost at the same boundary.
+    if (&join != current_join_ || join.best_read == DBL_MAX) {
       current_join_ = &join;
       best_cost_ = cost;
       return true;
@@ -186,14 +189,40 @@ class ColumnarExecutionContext : public Secondary_engine_execution_context {
     return cheaper;
   }
 
-  // DuckDB bridge request: built in OptimizeSecondaryEngine, consumed by
-  // ExecuteDuckdbBridge.
-  LineairDB::Protocol::TxExecuteSqlDuckdb::Request duckdb_request;
+  // Built by external_lock (post-resolve, pre-optimize), shipped by
+  // ExecuteDuckdbBridge. A refused or never-built statement is declined by
+  // OptimizeSecondaryEngine; the reason lives in `refusal`.
+  LineairDB::Protocol::TxExecuteDuckdbQuery::Request duckdb_request;
+  bool request_build_attempted = false;
+  std::string refusal;
   bool duckdb_ready = false;
+
+  // Semijoin flattening fuses IN/EXISTS into the outer join for MySQL's
+  // own executor. Keep the subquery Items intact; DuckDB flattens on its
+  // own. Cleared per statement, restored with the context.
+  void DisableSemijoin(THD *thd) {
+    restore_thd_ = thd;
+    saved_optimizer_switch_ = thd->variables.optimizer_switch;
+    // With only the EXISTS strategy left, no subquery reaches the costing
+    // pass that breaks on secondary plans. The derived-table rewrite is
+    // barred through the LEX flag below.
+    thd->variables.optimizer_switch &=
+        ~(OPTIMIZER_SWITCH_SEMIJOIN | OPTIMIZER_SWITCH_MATERIALIZATION |
+          OPTIMIZER_SWITCH_SUBQUERY_TO_DERIVED);
+    thd->lex->m_subquery_to_derived_is_impossible = true;
+  }
+  ~ColumnarExecutionContext() override {
+    if (restore_thd_ != nullptr) {
+      restore_thd_->variables.optimizer_switch = saved_optimizer_switch_;
+      restore_thd_->lex->m_subquery_to_derived_is_impossible = false;
+    }
+  }
 
  private:
   const JOIN *current_join_ = nullptr;
   double best_cost_ = 0.0;
+  THD *restore_thd_ = nullptr;
+  ulonglong saved_optimizer_switch_ = 0;
 };
 
 struct DecodedField {
@@ -542,8 +571,9 @@ bool ExecuteDuckdbBridge(JOIN *join, Query_result *result) {
     return RaiseColumnarError(thd, "LINEAIRDB_COLUMNAR: no server connection");
   }
 
-  LineairDB::Protocol::TxExecuteSqlDuckdb::Response rpc;
-  if (!proxy->tx_execute_sql_duckdb(ctx->duckdb_request, &rpc) || !rpc.ok()) {
+  LineairDB::Protocol::TxExecuteDuckdbQuery::Response rpc;
+  if (!proxy->tx_execute_duckdb_query(ctx->duckdb_request, &rpc) ||
+      !rpc.ok()) {
     char message[192];
     snprintf(message, sizeof(message), "LINEAIRDB_COLUMNAR duckdb-bridge: %s",
              rpc.error().empty() ? "duckdb bridge RPC failed"
@@ -614,7 +644,10 @@ bool PrepareSecondaryEngine(THD *thd, LEX *lex) {
 
   auto *ctx = new (thd->mem_root) ColumnarExecutionContext;
   if (ctx == nullptr) return true;
+  // Install first: set_... destroys any prior context, whose destructor
+  // restores the switches this call is about to save.
   lex->set_secondary_engine_execution_context(ctx);
+  ctx->DisableSemijoin(thd);
   return false;
 }
 
@@ -634,14 +667,12 @@ bool OptimizeSecondaryEngine(THD *, LEX *lex) {
                               "LINEAIRDB_COLUMNAR unsupported shape: no JOIN");
   }
 
-  const char *why = "?";
-  if (!BuildDuckdbBridgeRequest(lex->thd, query_block, &ctx->duckdb_request,
-                                &why)) {
-    char message[192];
-    snprintf(message, sizeof(message),
-             "LINEAIRDB_COLUMNAR duckdb-bridge unsupported shape: %s",
-             why ? why : "?");
-    return RaiseColumnarError(lex->thd, message);
+  if (!ctx->request_build_attempted || !ctx->refusal.empty()) {
+    std::string message = "LINEAIRDB_COLUMNAR duckdb-query: ";
+    message.append(ctx->request_build_attempted
+                       ? ctx->refusal
+                       : std::string("request was not built before optimization"));
+    return RaiseColumnarError(lex->thd, message.c_str());
   }
   ctx->duckdb_ready = true;
   join->override_executor_func = ExecuteDuckdbBridge;
@@ -702,21 +733,8 @@ bool CompareJoinCost(THD *thd, const JOIN &join, double optimizer_cost,
   *use_best_so_far = false;
   *secondary_engine_cost = optimizer_cost;
 
-  // A quantified subquery (IN/ALL/ANY) that survives to the secondary
-  // optimization pass reaches subquery-materialization costing, which
-  // crashes on plans produced for secondary tables. Antijoin and derived
-  // rewrites are unavailable on this pass for such shapes (nullable NOT IN),
-  // so reject them here, before the costing runs. EXISTS and scalar
-  // subqueries resolve to the EXISTS strategy and never reach that costing.
-  const Item_subselect *subquery_item = join.query_expression()->item;
-  if (subquery_item != nullptr &&
-      (subquery_item->substype() == Item_subselect::IN_SUBS ||
-       subquery_item->substype() == Item_subselect::ALL_SUBS ||
-       subquery_item->substype() == Item_subselect::ANY_SUBS)) {
-    return RaiseColumnarError(
-        thd, "LINEAIRDB_COLUMNAR unsupported shape: quantified subquery");
-  }
-
+  // DisableSemijoin leaves every surviving subquery on the EXISTS
+  // strategy, so its JOIN reaches this hook like any other.
   auto *ctx = static_cast<ColumnarExecutionContext *>(
       thd->lex->secondary_engine_execution_context());
   if (ctx == nullptr) return true;
@@ -810,6 +828,33 @@ unsigned long ha_lineairdb_columnar::index_flags(unsigned int index,
 
   // Indexes are available only to let the optimizer estimate primary ranges.
   return (HA_READ_RANGE | HA_KEY_SCAN_NOT_ROR) & primary_flags;
+}
+
+// Builds the request once per statement, at the only stock point after
+// resolution and before optimization. The outcome is recorded, not raised:
+// a non-zero return here reads as a lock error and aborts the statement.
+int ha_lineairdb_columnar::external_lock(THD *thd, int lock_type) {
+  if (lock_type == F_UNLCK) return 0;
+  auto *ctx = static_cast<ColumnarExecutionContext *>(
+      thd->lex->secondary_engine_execution_context());
+  if (ctx == nullptr || ctx->request_build_attempted) return 0;
+  ctx->request_build_attempted = true;
+  if (!BuildDuckdbQueryRequest(thd, thd->lex, &ctx->duckdb_request,
+                              &ctx->refusal) &&
+      ctx->refusal.empty()) {
+    ctx->refusal = "request build failed";
+  }
+  static const bool debug_resolved = [] {
+    const char *value = std::getenv("ENABLE_DUCKDB_BRIDGE_DEBUG");
+    return value != nullptr && value[0] != '\0' &&
+           std::string_view(value) != "0";
+  }();
+  if (debug_resolved) {
+    std::fprintf(stderr, "[duckdb-request] refusal='%s'\n%s\n",
+                 ctx->refusal.c_str(),
+                 ctx->duckdb_request.DebugString().c_str());
+  }
+  return 0;
 }
 
 THR_LOCK_DATA **ha_lineairdb_columnar::store_lock(THD *, THR_LOCK_DATA **to,
