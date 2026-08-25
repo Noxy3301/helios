@@ -5,6 +5,7 @@
 
 #include <cstdint>
 #include <cstring>
+#include <set>
 #include <unordered_map>
 #include <vector>
 
@@ -37,6 +38,9 @@ struct Serializer {
     // alias, so a self-join gets two independent scans.
     std::unordered_map<const Table_ref*, uint32_t> relation_ids;
     uint32_t next_relation_id = 0;
+    // Derived relations whose select list carries a DECIMAL AVG; a column
+    // reference into one keeps that lineage for the comparison guard.
+    std::set<uint32_t> avg_relations;
 
     bool Refuse(const std::string& reason) {
         if (why->empty()) *why = reason;
@@ -116,6 +120,47 @@ bool TypeOf(Serializer& s, Item* item, Resolved::ResolvedType* out) {
     }
 }
 
+// DuckDB computes decimal AVG through DOUBLE; a squeezed comparison must
+// not inherit that approximation, so its value tree is scanned for one.
+bool ContainsDecimalAvg(const Serializer& s, const Resolved::Expr& expr) {
+    if (expr.has_column()) {
+        return s.avg_relations.count(expr.column().relation_id()) != 0;
+    }
+    if (expr.has_aggregate()) {
+        const auto& aggregate = expr.aggregate();
+        if (aggregate.kind() == Resolved::Aggregate::AVG &&
+            expr.result_type().kind() == Resolved::DECIMAL) {
+            return true;
+        }
+        return aggregate.has_arg() && ContainsDecimalAvg(s, aggregate.arg());
+    }
+    if (expr.has_arithmetic()) {
+        return ContainsDecimalAvg(s, expr.arithmetic().left()) ||
+               ContainsDecimalAvg(s, expr.arithmetic().right());
+    }
+    if (expr.has_cast()) return ContainsDecimalAvg(s, expr.cast().arg());
+    if (expr.has_case_when()) {
+        for (const auto& branch : expr.case_when().branches()) {
+            if (ContainsDecimalAvg(s, branch.then())) return true;
+        }
+        return expr.case_when().has_else_result() &&
+               ContainsDecimalAvg(s, expr.case_when().else_result());
+    }
+    if (expr.has_function()) {
+        for (const auto& arg : expr.function().args()) {
+            if (ContainsDecimalAvg(s, arg)) return true;
+        }
+        return false;
+    }
+    if (expr.has_subquery()) {
+        for (const auto& item : expr.subquery().query().select()) {
+            if (ContainsDecimalAvg(s, item.expression())) return true;
+        }
+        return false;
+    }
+    return false;
+}
+
 // The type MySQL compares two operands under. Mirrors the numeric/temporal
 // part of MySQL's comparison-context rules; string comparison needs the
 // collation machinery and is refused until that phase.
@@ -128,13 +173,18 @@ bool CompareTypeOf(Serializer& s, const Resolved::Expr& left,
         const uint32_t scale = std::max(a.scale(), b.scale());
         const uint32_t integer =
             std::max(a.precision() - a.scale(), b.precision() - b.scale());
-        // Capping would drop integer digits the INT64 side needs; refusing
-        // here declines at plan time instead of erroring mid-execution.
-        if (integer + scale > 38) {
-            return s.Refuse("comparison precision exceeds DECIMAL(38)");
+        // Beyond DECIMAL(38), DuckDB's binder keeps the scale and squeezes
+        // the integer digits into the remaining width; the removed sql-text
+        // path ran under exactly that. The comparison stays exact whenever
+        // the values fit; a value that does not fit raises in the cast and
+        // the statement fails rather than falling back, because MySQL only
+        // retries on the primary for failures raised before execution.
+        if (integer + scale > 38 &&
+            (ContainsDecimalAvg(s, left) || ContainsDecimalAvg(s, right))) {
+            return s.Refuse("AVG operand in an over-wide decimal comparison");
         }
         out->set_kind(Resolved::DECIMAL);
-        out->set_precision(integer + scale);
+        out->set_precision(std::min<uint32_t>(integer + scale, 38));
         out->set_scale(scale);
         return true;
     };
@@ -348,20 +398,40 @@ bool SerializeFunc(Serializer& s, Item_func* function, Resolved::Expr* out) {
                     return s.Refuse("BETWEEN bound collations differ");
                 }
                 if (lk2 == Resolved::DECIMAL) {
-                    // Compose a type that holds both pairs: picking the one
-                    // with the larger scale can lose the other's integer
-                    // digits and overflow the bound casts.
+                    // Compose a type that holds both pairs; beyond
+                    // DECIMAL(38) the scale is kept and the integer digits
+                    // squeeze, as in CompareTypeOf. The AVG guard reads the
+                    // original operand widths: a pairwise squeeze already
+                    // hides behind a clamped pair type.
+                    uint32_t raw_integer = 0;
+                    uint32_t raw_scale = 0;
+                    for (const auto* operand :
+                         {&between->value(), &between->low(),
+                          &between->high()}) {
+                        const auto& type = operand->result_type();
+                        if (type.kind() == Resolved::DECIMAL) {
+                            raw_integer = std::max(
+                                raw_integer, type.precision() - type.scale());
+                            raw_scale = std::max(raw_scale, type.scale());
+                        } else {
+                            raw_integer = std::max(raw_integer, 19u);
+                        }
+                    }
+                    if (raw_integer + raw_scale > 38 &&
+                        (ContainsDecimalAvg(s, between->value()) ||
+                         ContainsDecimalAvg(s, between->low()) ||
+                         ContainsDecimalAvg(s, between->high()))) {
+                        return s.Refuse(
+                            "AVG operand in an over-wide decimal comparison");
+                    }
                     const uint32_t scale =
                         std::max(low_type.scale(), high_type.scale());
                     const uint32_t integer =
                         std::max(low_type.precision() - low_type.scale(),
                                  high_type.precision() - high_type.scale());
-                    if (integer + scale > 38) {
-                        return s.Refuse(
-                            "BETWEEN precision exceeds DECIMAL(38)");
-                    }
                     compare_as->set_kind(Resolved::DECIMAL);
-                    compare_as->set_precision(integer + scale);
+                    compare_as->set_precision(
+                        std::min<uint32_t>(integer + scale, 38));
                     compare_as->set_scale(scale);
                 } else {
                     *compare_as = low_type;
@@ -997,6 +1067,12 @@ bool SerializeNest(Serializer& s, const mem_root_deque<Table_ref*>& nest,
             if (!SerializeBlock(s, unit->first_query_block(),
                                 derived->mutable_query())) {
                 return false;
+            }
+            for (const auto& item : derived->query().select()) {
+                if (ContainsDecimalAvg(s, item.expression())) {
+                    s.avg_relations.insert(relation_id);
+                    break;
+                }
             }
         } else {
             if (!SerializeBaseTable(s, table_ref, &leaf)) return false;

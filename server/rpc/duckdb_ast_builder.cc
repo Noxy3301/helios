@@ -571,6 +571,8 @@ unique_ptr<ParsedExpression> BuildExpr(Builder& b, const Resolved::Expr& expr) {
             children.push_back(std::move(right));
             // MySQL's x/0 is NULL; DuckDB's "/" divides through. NULLIF
             // makes the divisor NULL and the division follow.
+            // DuckDB runs "/" through DOUBLE, so quotients lose exactness
+            // past 2^53; the profile's monetary values stay well below.
             if (arith.op() == Resolved::Arithmetic::DIV) {
                 duckdb::vector<unique_ptr<ParsedExpression>> nullif_args;
                 nullif_args.push_back(std::move(children[1]));
