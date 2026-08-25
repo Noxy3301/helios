@@ -16,6 +16,22 @@ set(LINEAIRDB_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../third_party/LineairDB")
 set(DUCKDB_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../third_party/duckdb")
 set(DUCKDB_LIB_DIR "${DUCKDB_ROOT}/build/release/src")
 
+# MySQL charset runtime. libstrings contains the collation descriptors and
+# handlers; libmysys contains the loader, registry, and runtime
+# initialization. The final libstrings entry resolves libmysys
+# back-references with static-link semantics.
+set(MYSQL_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../third_party/mysql-server")
+set(MYSQL_BUILD_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../build")
+set(MYSQL_ARCHIVE_DIR "${MYSQL_BUILD_ROOT}/archive_output_directory")
+set(MYSQL_CHARSET_LIBRARIES
+    ${MYSQL_ARCHIVE_DIR}/libstrings.a
+    ${MYSQL_ARCHIVE_DIR}/libmysys.a
+    ${MYSQL_ARCHIVE_DIR}/libstrings.a)
+set(MYSQL_INCLUDE_DIRS
+    ${MYSQL_ROOT}
+    ${MYSQL_ROOT}/include
+    ${MYSQL_BUILD_ROOT}/include)
+
 # Include directories
 include_directories(${CMAKE_CURRENT_SOURCE_DIR})
 include_directories(${CMAKE_CURRENT_SOURCE_DIR}/../proto)
@@ -75,6 +91,10 @@ set(SOURCES
     rpc/transaction_control.cc
     rpc/predicate_evaluator.cc
     rpc/predicate_evaluator.hh
+    mysql_charset_runtime.cc
+    mysql_charset_runtime.hh
+    rpc/duckdb_ast_builder.cc
+    rpc/duckdb_ast_builder.hh
     rpc/duckdb_bridge_dispatch.cc
     rpc/duckdb_bridge_executor.cc
     rpc/duckdb_bridge_executor.hh
@@ -101,10 +121,13 @@ target_link_libraries(lineairdb-server
     ${Protobuf_LIBRARIES}
     pthread
     ${DUCKDB_LIB_DIR}/libduckdb.so
+    ${MYSQL_CHARSET_LIBRARIES}
 )
 
 # Additional include directories for generated files
-target_include_directories(lineairdb-server PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
+target_include_directories(lineairdb-server PRIVATE
+    ${CMAKE_CURRENT_BINARY_DIR}
+    ${MYSQL_INCLUDE_DIRS})
 
 # Embed an rpath to the DuckDB shared library. start_server.sh runs the binary
 # directly, without LD_LIBRARY_PATH.

@@ -84,6 +84,8 @@ private:
 
     // DuckDB SQL bridge (raw SQL text over live PAX storage).
     void handleTxExecuteSqlDuckdb(const std::string& message, std::string& result);
+    void handleTxExecuteDuckdbQuery(const std::string& message,
+                                       std::string& result);
 
     // Secondary index operations
     void handleTxReadSecondaryIndex(const std::string& message, std::string& result);

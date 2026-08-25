@@ -10,6 +10,13 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 ROOT=$(pwd)
+
+# The server links the MySQL charset archives out of build/; build.sh
+# produces them.
+if [ ! -f "$ROOT/build/archive_output_directory/libstrings.a" ]; then
+    echo "missing build/archive_output_directory/libstrings.a; run scripts/build.sh first" >&2
+    exit 1
+fi
 ARCH=${HELIOS_PORTABLE_ARCH:-x86-64-v3}
 BUILD_DIR="$ROOT/build-v3/server"
 WRAPPER="$ROOT/build-v3/cxx_wrapper.sh"

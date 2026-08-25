@@ -16,6 +16,17 @@
 
 #include "duckdb_bridge_executor.hh"
 
+#include "duckdb_ast_builder.hh"
+
+#include <duckdb/common/vector_operations/ternary_executor.hpp>
+#include <duckdb/common/vector_operations/unary_executor.hpp>
+#include <duckdb/function/scalar_function.hpp>
+#include <duckdb/parser/parsed_data/create_collation_info.hpp>
+#include <duckdb/parser/parsed_data/create_scalar_function_info.hpp>
+
+#include "../mysql_charset_runtime.hh"
+#include "m_ctype.h"
+
 #include <lineairdb/database.h>
 #include <lineairdb/pax_store.h>
 
@@ -442,6 +453,27 @@ unique_ptr<FunctionData> PaxBind(ClientContext&, TableFunctionBindInput& input,
   for (const auto& column : info.table->columns) {
     return_types.push_back(FieldKindToLogicalType(column.kind, column.scale));
     names.push_back(column.name);
+  }
+  return std::move(bind_data);
+}
+
+/**
+ * @brief Bind for the resolved-query path: the table arrives as a POINTER
+ * argument owned by the request, not through the catalog. Columns are
+ * exposed as _c0.._cN in TABLE::field order, matching the wire ColumnRef
+ * ordinals, so no MySQL identifier ever participates in DuckDB binding.
+ */
+unique_ptr<FunctionData> PaxPointerBind(ClientContext&,
+                                        TableFunctionBindInput& input,
+                                        vector<LogicalType>& return_types,
+                                        vector<string>& names) {
+  auto bind_data = duckdb::make_uniq<PaxBindData>();
+  bind_data->table = reinterpret_cast<PaxTableView*>(
+      input.inputs[0].GetPointer());
+  size_t ordinal = 0;
+  for (const auto& column : bind_data->table->columns) {
+    return_types.push_back(FieldKindToLogicalType(column.kind, column.scale));
+    names.push_back("_c" + std::to_string(ordinal++));
   }
   return std::move(bind_data);
 }
@@ -1038,6 +1070,11 @@ void EncodeRow(duckdb::MaterializedQueryResult& result, idx_t row_index,
     // the NULL sentinel. The text is only computed in the non-null case.
     if (value.IsNull()) {
       AppendProxyField(*out, "", /*is_null=*/true);
+    } else if (value.type().id() == duckdb::LogicalTypeId::BOOLEAN) {
+      // MySQL's boolean surface is 1/0; Item_string::val_int reads both
+      // "true" and "false" as 0.
+      AppendProxyField(*out, value.GetValue<bool>() ? "1" : "0",
+                       /*is_null=*/false);
     } else {
       const std::string text = value.ToString();
       AppendProxyField(*out, text, /*is_null=*/false);
@@ -1279,6 +1316,358 @@ void ExecuteSql(LineairDB::Database* db,
           static_cast<unsigned long long>(result->RowCount()), attempts_used);
     }
 
+    response->set_ok(true);
+  } catch (const std::exception& exception) {
+    response->Clear();
+    response->set_ok(false);
+    response->set_error(exception.what());
+  } catch (...) {
+    response->Clear();
+    response->set_ok(false);
+    response->set_error("duckdb bridge execution failed");
+  }
+}
+
+
+namespace {
+
+// MySQL's collation number for utf8mb4_0900_ai_ci, as the wire IR carries it.
+constexpr uint32_t kUtf8mb40900AiCiCollationId = 255;
+// Name the collation is registered under inside DuckDB (COLLATE targets it).
+constexpr const char* kUtf8mb40900AiCiDuckdbName = "utf8mb4_0900_ai_ci";
+// DuckDB scalar functions implementing MySQL LIKE / NOT LIKE under this
+// collation; the AST builder emits calls to them by these names.
+constexpr const char* kUtf8mb40900AiCiLikeFunction =
+    "mysql_utf8mb4_0900_ai_ci_like";
+constexpr const char* kUtf8mb40900AiCiNotLikeFunction =
+    "mysql_utf8mb4_0900_ai_ci_not_like";
+
+/**
+ * @brief DuckDB collation scalar for MySQL utf8mb4_0900_ai_ci.
+ *
+ * @details DuckDB implements a collation by replacing the collated VARCHAR
+ * with this scalar's byte-comparable result wherever comparison, ordering,
+ * grouping, or ordinary DISTINCT needs a key. Returning BLOB keeps MySQL's
+ * raw strnxfrm bytes instead of hex-encoding them to twice their size.
+ */
+void Utf8mb40900AiCiSortKey(duckdb::DataChunk& args, duckdb::ExpressionState&,
+                            duckdb::Vector& result) {
+  const CHARSET_INFO* collation =
+      mysql_charset_runtime::initialize(nullptr).utf8mb4_0900_ai_ci;
+  if (collation == nullptr ||
+      collation->number != kUtf8mb40900AiCiCollationId ||
+      collation->pad_attribute != NO_PAD) {
+    throw std::runtime_error(
+        "utf8mb4_0900_ai_ci collation runtime is not ready or is not NO PAD");
+  }
+
+  duckdb::UnaryExecutor::Execute<duckdb::string_t, duckdb::string_t>(
+      args.data[0], result, args.size(), [&](duckdb::string_t input) {
+        const size_t input_size = input.GetSize();
+        if (input_size > SIZE_MAX / collation->mbmaxlen) {
+          throw std::runtime_error(
+              "utf8mb4_0900_ai_ci sort key input is too large");
+        }
+        // strnxfrmlen requires a pessimistic byte count: utf8mb4's maximum
+        // bytes per codepoint times the maximum possible codepoint count.
+        const size_t pessimistic_bytes = input_size * collation->mbmaxlen;
+        const size_t capacity =
+            collation->coll->strnxfrmlen(collation, pessimistic_bytes);
+        if ((capacity & 1) != 0 ||
+            capacity > duckdb::string_t::MAX_STRING_SIZE) {
+          throw std::runtime_error(
+              "utf8mb4_0900_ai_ci sort key is too large for DuckDB");
+        }
+        duckdb::string_t key =
+            duckdb::StringVector::EmptyString(result, capacity);
+        const size_t key_size = collation->coll->strnxfrm(
+            collation, reinterpret_cast<uchar*>(key.GetDataWriteable()),
+            capacity, /*num_codepoints=*/0,
+            reinterpret_cast<const uchar*>(input.GetData()), input_size,
+            /*flags=*/0);
+        if (key_size > capacity || key_size > UINT32_MAX) {
+          throw std::runtime_error(
+              "utf8mb4_0900_ai_ci sort key exceeded its allocation");
+        }
+        // strnxfrm can use less than its worst-case allocation. This both
+        // records the actual length and refreshes string_t's cached prefix;
+        // comparison uses the prefix while hashing reads the payload.
+        key.SetSizeAndFinalize(static_cast<uint32_t>(key_size), capacity);
+        return key;
+      });
+}
+
+template <bool Negated>
+void Utf8mb40900AiCiLike(duckdb::DataChunk& args, duckdb::ExpressionState&,
+                         duckdb::Vector& result) {
+  const CHARSET_INFO* collation =
+      mysql_charset_runtime::initialize(nullptr).utf8mb4_0900_ai_ci;
+  if (collation == nullptr ||
+      collation->number != kUtf8mb40900AiCiCollationId) {
+    throw std::runtime_error("utf8mb4_0900_ai_ci LIKE runtime is not ready");
+  }
+  duckdb::TernaryExecutor::Execute<duckdb::string_t, duckdb::string_t,
+                                   int32_t, bool>(
+      args.data[0], args.data[1], args.data[2], result, args.size(),
+      [&](duckdb::string_t text, duckdb::string_t pattern, int32_t escape) {
+        const int compared = my_wildcmp(
+            collation, text.GetData(), text.GetData() + text.GetSize(),
+            pattern.GetData(), pattern.GetData() + pattern.GetSize(), escape,
+            escape == '_' ? -1 : '_', escape == '%' ? -1 : '%');
+        const bool matched = compared == 0;
+        return Negated ? !matched : matched;
+      });
+}
+
+/**
+ * @brief MySQL's ASCII(): the first BYTE of the string, 0 for the empty
+ * string. DuckDB's own ascii() is codepoint-valued and differs on any
+ * multibyte head.
+ */
+void MysqlAsciiFunction(duckdb::DataChunk& args, duckdb::ExpressionState&,
+                        duckdb::Vector& result) {
+  duckdb::UnaryExecutor::Execute<duckdb::string_t, int32_t>(
+      args.data[0], result, args.size(), [](duckdb::string_t input) {
+        if (input.GetSize() == 0) return 0;
+        return static_cast<int32_t>(
+            static_cast<unsigned char>(input.GetData()[0]));
+      });
+}
+
+void RegisterMySqlCollationRuntime(Connection& connection) {
+  duckdb::ScalarFunction sort_key(
+      "mysql_utf8mb4_0900_ai_ci_sort_key", {duckdb::LogicalType::VARCHAR},
+      duckdb::LogicalType::BLOB, Utf8mb40900AiCiSortKey);
+  duckdb::CreateCollationInfo create_info(
+      kUtf8mb40900AiCiDuckdbName, std::move(sort_key),
+      /*combinable=*/false,
+      /*not_required_for_equality=*/false);
+  connection.context->RunFunctionInTransaction([&]() {
+    auto& catalog = duckdb::Catalog::GetSystemCatalog(*connection.context);
+    catalog.CreateCollation(*connection.context, create_info);
+  });
+  if (connection.HasActiveTransaction()) connection.Commit();
+
+  const duckdb::vector<duckdb::LogicalType> arguments = {
+      duckdb::LogicalType::VARCHAR, duckdb::LogicalType::VARCHAR,
+      duckdb::LogicalType::INTEGER};
+  duckdb::ScalarFunction like(kUtf8mb40900AiCiLikeFunction, arguments,
+                              duckdb::LogicalType::BOOLEAN,
+                              Utf8mb40900AiCiLike<false>);
+  duckdb::CreateScalarFunctionInfo like_info(std::move(like));
+  connection.context->RegisterFunction(like_info);
+  duckdb::ScalarFunction not_like(kUtf8mb40900AiCiNotLikeFunction, arguments,
+                                  duckdb::LogicalType::BOOLEAN,
+                                  Utf8mb40900AiCiLike<true>);
+  duckdb::CreateScalarFunctionInfo not_like_info(std::move(not_like));
+  connection.context->RegisterFunction(not_like_info);
+
+  // Callable form of the sort key, for aggregate-DISTINCT deduplication
+  // where DuckDB does not push a non-combinable collation into children.
+  duckdb::ScalarFunction sort_key_fn(
+      "mysql_utf8mb4_0900_ai_ci_sort_key", {duckdb::LogicalType::VARCHAR},
+      duckdb::LogicalType::BLOB, Utf8mb40900AiCiSortKey);
+  duckdb::CreateScalarFunctionInfo sort_key_info(std::move(sort_key_fn));
+  connection.context->RegisterFunction(sort_key_info);
+
+  duckdb::ScalarFunction mysql_ascii("mysql_ascii",
+                                     {duckdb::LogicalType::VARCHAR},
+                                     duckdb::LogicalType::INTEGER,
+                                     MysqlAsciiFunction);
+  duckdb::CreateScalarFunctionInfo ascii_info(std::move(mysql_ascii));
+  connection.context->RegisterFunction(ascii_info);
+}
+
+/**
+ * @brief Registers helios_pax_scan(POINTER) once for the process lifetime.
+ *
+ * @details The resolved-query path keeps no per-request catalog state: the
+ * one immutable function is registered on first use, and every request hands
+ * its stack-owned PaxTableView in as a pointer constant inside the AST.
+ */
+void EnsureDuckdbScanRegistered() {
+  static std::once_flag registered;
+  std::call_once(registered, [] {
+    std::lock_guard<std::mutex> catalog_lock(GlobalCatalogMutex());
+    Connection connection(GlobalRuntime());
+    TableFunction function("helios_pax_scan", {duckdb::LogicalType::POINTER},
+                           PaxScan, PaxPointerBind, PaxInitGlobal,
+                           PaxInitLocal);
+    function.projection_pushdown = true;
+    function.filter_pushdown = false;
+    function.cardinality = PaxCardinality;
+    connection.context->RunFunctionInTransaction([&]() {
+      auto& catalog = duckdb::Catalog::GetSystemCatalog(*connection.context);
+      duckdb::CreateTableFunctionInfo create_info(function);
+      catalog.CreateTableFunction(*connection.context, create_info);
+    });
+    connection.Query("COMMIT");
+    RegisterMySqlCollationRuntime(connection);
+  });
+}
+
+}  // namespace
+
+void ExecuteDuckdbQuery(
+    LineairDB::Database* db,
+    const pb::TxExecuteDuckdbQuery::Request& request,
+    pb::TxExecuteDuckdbQuery::Response* response) {
+  if (response == nullptr) return;
+  response->Clear();
+  if (db == nullptr) {
+    response->set_ok(false);
+    response->set_error("database is unavailable");
+    return;
+  }
+  try {
+    const LineairDB::Database::PaxReadView read_view =
+        db->AcquirePaxReadView(FenceTimeoutMs());
+    if (!read_view.valid) {
+      response->set_ok(false);
+      response->set_error(read_view.error);
+      return;
+    }
+    struct ReadViewRelease {
+      LineairDB::Database* database;
+      const LineairDB::Database::PaxReadView& handle;
+      ~ReadViewRelease() { database->ReleasePaxReadView(handle); }
+    } read_view_release{db, read_view};
+
+    std::vector<PaxTableView> table_views(
+        static_cast<size_t>(request.tables_size()));
+    std::vector<uintptr_t> handles(table_views.size());
+    for (int i = 0; i < request.tables_size(); i++) {
+      const pb::TxExecuteSqlDuckdb::TableDesc& table_desc = request.tables(i);
+      PaxTableView& table_view = table_views[static_cast<size_t>(i)];
+      PaxStore* store = db->GetPaxStore(table_desc.table_name());
+      if (store == nullptr) {
+        response->set_ok(false);
+        response->set_error("table has no PAX store: " +
+                            table_desc.table_name());
+        return;
+      }
+      if (store->overflow_count() > 0) {
+        response->set_ok(false);
+        response->set_error("table has heap fallback rows: " +
+                            table_desc.table_name());
+        return;
+      }
+      // The wire descriptor drives strip access; a shape that disagrees
+      // with the store's own schema would read out of bounds or decode a
+      // cell under the wrong width. Field 0 is the row null-flags field.
+      const auto& schema = store->schema();
+      if (schema.field_count() !=
+          static_cast<size_t>(table_desc.columns_size()) + 1) {
+        response->set_ok(false);
+        response->set_error("table descriptor does not match the store: " +
+                            table_desc.table_name());
+        return;
+      }
+      for (int c = 0; c < table_desc.columns_size(); c++) {
+        const auto& column = table_desc.columns(c);
+        const size_t f = static_cast<size_t>(c) + 1;
+        // kind_of/scale_of handle the documented empty-vector shapes
+        // (an untyped store keeps field_kind empty).
+        if (schema.kind_of(f) != column.pax_kind() ||
+            schema.field_max_bytes[f] != column.pax_width() ||
+            schema.scale_of(f) != static_cast<int>(column.pax_scale())) {
+          response->set_ok(false);
+          response->set_error(
+              "table descriptor does not match the store: " +
+              table_desc.table_name());
+          return;
+        }
+      }
+      table_view.sql_name = table_desc.sql_name();
+      table_view.store = store;
+      table_view.group_count = store->group_count();
+      table_view.cut_epoch = read_view.cut_epoch;
+      table_view.columns.reserve(
+          static_cast<size_t>(table_desc.columns_size()));
+      for (const auto& column : table_desc.columns()) {
+        ColumnSpec spec;
+        spec.name = column.name();
+        spec.kind = static_cast<uint8_t>(column.pax_kind());
+        spec.width = column.pax_width();
+        spec.scale = static_cast<int8_t>(column.pax_scale());
+        table_view.columns.push_back(std::move(spec));
+      }
+      handles[static_cast<size_t>(i)] =
+          reinterpret_cast<uintptr_t>(&table_view);
+    }
+
+    EnsureDuckdbScanRegistered();
+    Connection connection(GlobalRuntime());
+    std::unique_ptr<duckdb::MaterializedQueryResult> result;
+    bool accepted = false;
+    const int max_attempts = MaxReadViewAttempts();
+    for (int attempt = 1; attempt <= max_attempts && !accepted; attempt++) {
+      for (PaxTableView& table_view : table_views) {
+        table_view.bulk_groups.clear();
+      }
+      // The statement is consumed by execution; each attempt rebuilds it
+      // from the immutable request.
+      auto built = BuildSelectStatement(request, handles);
+      if (!built.statement) {
+        response->set_ok(false);
+        response->set_error(built.error);
+        return;
+      }
+      duckdb::unique_ptr<duckdb::SQLStatement> statement(
+          built.statement.release());
+      static const bool debug_resolved = [] {
+        const char* value = std::getenv("ENABLE_DUCKDB_BRIDGE_DEBUG");
+        return value != nullptr && value[0] != '\0' &&
+               std::string_view(value) != "0";
+      }();
+      if (debug_resolved) {
+        std::fprintf(stderr, "[duckdb-ast] %s\n",
+                     statement->ToString().c_str());
+      }
+      auto query_result = connection.Query(std::move(statement));
+      result.reset(static_cast<duckdb::MaterializedQueryResult*>(
+          query_result.release()));
+
+      if (db->PaxReadViewPoisoned(read_view)) {
+        response->set_ok(false);
+        response->set_error(
+            "columnar read view was poisoned during execution");
+        return;
+      }
+      const bool audit_clean = BulkGroupsUnchanged(table_views);
+      if (!audit_clean) {
+        for (PaxTableView& table_view : table_views) {
+          table_view.force_per_slot = true;
+        }
+      }
+      if (result->HasError()) {
+        if (audit_clean) {
+          response->set_ok(false);
+          response->set_error(result->GetError());
+          return;
+        }
+        continue;
+      }
+      if (!audit_clean) continue;
+
+      std::vector<std::string> staged_rows;
+      staged_rows.reserve(static_cast<size_t>(result->RowCount()));
+      std::string row;
+      for (idx_t row_index = 0; row_index < result->RowCount(); row_index++) {
+        EncodeRow(*result, row_index, &row);
+        staged_rows.push_back(std::move(row));
+      }
+      for (std::string& staged : staged_rows) {
+        response->add_rows(std::move(staged));
+      }
+      accepted = true;
+    }
+    if (!accepted) {
+      response->Clear();
+      response->set_ok(false);
+      response->set_error("concurrent modification");
+      return;
+    }
     response->set_ok(true);
   } catch (const std::exception& exception) {
     response->Clear();
