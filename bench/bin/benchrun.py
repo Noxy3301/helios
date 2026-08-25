@@ -410,6 +410,43 @@ def setup_benchmark(benchmark, config_path, mysql_host, mysql_port, log_dir=None
     return load_time
 
 
+def attach_secondary(benchmark, mysql_host, mysql_port):
+    """Attach and load the columnar secondary engine before execution.
+
+    Offload needs both; SECONDARY_LOAD state is process-local to mysqld, so
+    this runs before every execute phase, not only after a fresh load."""
+    if benchmark != "tpch":
+        return
+    print(f"  Attaching the columnar secondary engine ({mysql_host}:{mysql_port})...")
+    # ALTER success alone proves nothing: SECONDARY_LOAD on an unavailable
+    # engine succeeds with only a warning, and execution then silently falls
+    # back to the primary engine. Verify the plugin and the per-table state.
+    result = mysql_cmd(mysql_port, mysql_host,
+                       "SELECT PLUGIN_NAME FROM information_schema.PLUGINS "
+                       "WHERE PLUGIN_NAME='lineairdb_columnar' "
+                       "AND PLUGIN_STATUS='ACTIVE';")
+    if "lineairdb_columnar" not in result.stdout.lower():
+        sys.exit(f"lineairdb_columnar plugin is not ACTIVE on {mysql_host}:{mysql_port}")
+    for t in ("customer", "lineitem", "nation", "orders",
+              "part", "partsupp", "region", "supplier"):
+        result = mysql_cmd(mysql_port, mysql_host,
+                           f"USE benchbase; ALTER TABLE {t} SECONDARY_ENGINE=lineairdb_columnar;")
+        if result.returncode != 0 and "already has a secondary engine" not in result.stderr:
+            sys.exit(f"SECONDARY_ENGINE attach failed for {t}: {result.stderr.strip()[-300:]}")
+        result = mysql_cmd(mysql_port, mysql_host,
+                           f"USE benchbase; ALTER TABLE {t} SECONDARY_LOAD;")
+        if result.returncode != 0:
+            sys.exit(f"SECONDARY_LOAD failed for {t}: {result.stderr.strip()[-300:]}")
+        result = mysql_cmd(mysql_port, mysql_host,
+                           "SELECT CREATE_OPTIONS FROM information_schema.TABLES "
+                           f"WHERE TABLE_SCHEMA='benchbase' AND TABLE_NAME='{t}';")
+        options = result.stdout.lower()
+        if ('secondary_engine="lineairdb_columnar"' not in options or
+                'secondary_load="1"' not in options):
+            sys.exit(f"secondary engine state not verified for {t}: "
+                     f"{result.stdout.strip()[-200:]}")
+
+
 def run_execute(benchmark, config_path, terminals, result_base, prefetch=False):
     """Run execute phase with metrics collection. Returns result dict."""
     print(f"\n{'='*50}")
@@ -932,6 +969,12 @@ def _run_bench(args, config_work, thread_list, result_base):
     if args.no_exec:
         print("  Skipping execute (--no-exec)")
         return
+
+    # Every endpoint executes queries, so every endpoint needs the load.
+    # After --no-exec, so a load-only stage can still add indexes: MySQL
+    # rejects most DDL once a secondary engine is defined.
+    for host, port in args.mysql_endpoints:
+        attach_secondary(args.benchmark, host, port)
 
     # Execute: sweep terminal counts (data is reused)
     all_results = []
