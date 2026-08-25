@@ -429,7 +429,7 @@ LogicalType FieldKindToLogicalType(uint8_t kind, int8_t scale) {
 }
 
 /**
- * @brief Bind for the resolved-query path: the table arrives as a POINTER
+ * @brief Bind for the duckdb-query path: the table arrives as a POINTER
  * argument owned by the request, not through the catalog. Columns are
  * exposed as _c0.._cN in TABLE::field order, matching the wire ColumnRef
  * ordinals, so no MySQL identifier ever participates in DuckDB binding.
@@ -1153,7 +1153,7 @@ void RegisterMySqlCollationRuntime(Connection& connection) {
 /**
  * @brief Registers helios_pax_scan(POINTER) once for the process lifetime.
  *
- * @details The resolved-query path keeps no per-request catalog state: the
+ * @details The duckdb-query path keeps no per-request catalog state: the
  * one immutable function is registered on first use, and every request hands
  * its stack-owned PaxTableView in as a pointer constant inside the AST.
  */

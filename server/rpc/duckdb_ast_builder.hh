@@ -14,7 +14,7 @@ class SelectStatement;
 namespace duckdb_bridge {
 
 /**
- * @brief Constructs a DuckDB parsed AST from a resolved-query request.
+ * @brief Constructs a DuckDB parsed AST from a duckdb-query request.
  *
  * @details The request is the proxy's serialization of MySQL's resolved
  * statement; no SQL text is involved and DuckDB's parser never runs. Every

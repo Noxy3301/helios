@@ -1,4 +1,4 @@
-// Builds DuckDB's parsed AST from a resolved-query request. Every switch is
+// Builds DuckDB's parsed AST from a duckdb-query request. Every switch is
 // exhaustive with a refusing default: a node kind without a rule here fails
 // the request instead of flowing through.
 #include "duckdb_ast_builder.hh"
@@ -945,7 +945,7 @@ AstBuildResult BuildSelectStatement(const Resolved::Request& request,
                                     const std::vector<uintptr_t>& handles) {
     AstBuildResult result;
     if (request.format_version() != 1) {
-        result.error = "unsupported resolved-query format version";
+        result.error = "unsupported duckdb-query format version";
         return result;
     }
     if (static_cast<size_t>(request.tables_size()) != handles.size()) {
@@ -959,7 +959,7 @@ AstBuildResult BuildSelectStatement(const Resolved::Request& request,
     Builder builder{request, handles, {}, {}};
     auto statement = BuildBlock(builder, request.root());
     if (statement == nullptr) {
-        result.error = builder.error.empty() ? "resolved-query build failed"
+        result.error = builder.error.empty() ? "duckdb-query build failed"
                                              : builder.error;
         return result;
     }

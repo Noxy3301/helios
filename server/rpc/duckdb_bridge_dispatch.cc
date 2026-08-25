@@ -17,7 +17,7 @@ void LineairDBRpc::handleTxExecuteDuckdbQuery(const std::string& message,
 
     if (!request.ParseFromString(message)) {
         response.set_ok(false);
-        response.set_error("failed to parse resolved-query request");
+        response.set_error("failed to parse duckdb-query request");
         result = response.SerializeAsString();
         return;
     }

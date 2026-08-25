@@ -1,5 +1,5 @@
 // Serializes the resolved statement (Query_block + Item trees) into the
-// resolved-query wire format. Every switch is exhaustive with a refusing
+// duckdb-query wire format. Every switch is exhaustive with a refusing
 // default: an Item or Table_ref kind without a rule here is never emitted.
 #include "duckdb_request_builder.hh"
 
