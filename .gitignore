@@ -32,3 +32,4 @@ __pycache__/
 *.pem
 *.key
 .aws/
+ansible/helios-bundle.tar.gz
