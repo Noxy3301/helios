@@ -802,13 +802,9 @@ bool SerializeBaseTable(Serializer& s, Table_ref* table_ref,
         static_cast<uint32_t>(s.request->tables_size()));
     auto* table_desc = s.request->add_tables();
     table_desc->set_table_name(table->s->normalized_path.str);
-    table_desc->set_sql_name(table->s->table_name.str);
-    table_desc->set_db_name(table->s->db.str);
     for (uint i = 0; i < table->s->fields; i++) {
         Field* field = table->field[i];
         auto* column = table_desc->add_columns();
-        column->set_name(field->field_name == nullptr ? "" :
-                         field->field_name);
         // Entry 0 of the width/kind/scale vectors is the row null-flags
         // field, not a named column.
         column->set_pax_kind(pax_kinds[i + 1]);

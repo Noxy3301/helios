@@ -60,7 +60,7 @@ struct Builder {
     // one; derived tables carry only their select size.
     struct RelationInfo {
         size_t column_count = 0;
-        const pb::TxExecuteSqlDuckdb::TableDesc* desc = nullptr;
+        const pb::TxExecuteDuckdbQuery::TableDesc* desc = nullptr;
     };
     std::unordered_map<uint32_t, RelationInfo> relations;
     std::set<uint32_t> used_table_descs;

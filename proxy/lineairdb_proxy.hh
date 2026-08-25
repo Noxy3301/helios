@@ -82,9 +82,8 @@ enum class MessageType : uint32_t {
     TX_EXECUTE_READ_PLAN = 30,
     TX_GET_TABLE_STATS = 31,
 
-    // DuckDB SQL bridge (raw SQL text). See lineairdb.proto.
-    TX_EXECUTE_SQL_DUCKDB = 36,
-    TX_EXECUTE_DUCKDB_QUERY = 37
+    // DuckDB bridge (resolved-statement request). See lineairdb.proto.
+    TX_EXECUTE_DUCKDB_QUERY = 36
 };
 
 /**
@@ -231,12 +230,6 @@ public:
         const std::vector<StatelessReadKey>& keys);
     ReadPlanResult tx_execute_read_plan(
         const std::vector<ReadPlanStep>& steps);
-    // DuckDB bridge: send verbatim SQL text plus per-table PAX column
-    // metadata to the LineairDB server.
-    bool tx_execute_sql_duckdb(
-        const LineairDB::Protocol::TxExecuteSqlDuckdb::Request& request,
-        LineairDB::Protocol::TxExecuteSqlDuckdb::Response* response);
-
     bool tx_execute_duckdb_query(
         const LineairDB::Protocol::TxExecuteDuckdbQuery::Request& request,
         LineairDB::Protocol::TxExecuteDuckdbQuery::Response* response);

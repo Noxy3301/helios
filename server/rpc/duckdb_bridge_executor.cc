@@ -1,9 +1,10 @@
-// DuckDB bridge executor: runs a TX_EXECUTE_SQL_DUCKDB request's verbatim SQL
-// text on the embedded DuckDB executor, whose table functions read the live
-// PaxStore instances -- in place for groups without captured entries,
-// through captured before-images otherwise. DuckDB contributes its parser,
-// planner, and vectorized execution runtime; no table data ever lives inside
-// DuckDB. duckdb_bridge_dispatch.cc routes the opcode here.
+// DuckDB bridge executor: runs a TX_EXECUTE_DUCKDB_QUERY request by building
+// DuckDB's parsed AST from the wire IR and executing it on the embedded
+// runtime, whose scan function reads the live PaxStore instances -- in place
+// for groups without captured entries, through captured before-images
+// otherwise. DuckDB contributes its binder, planner, and vectorized runtime;
+// no table data ever lives inside DuckDB. duckdb_bridge_dispatch.cc routes
+// the opcode here.
 //
 // Consistency: the request runs against a columnar read view with cut epoch
 // E (Database::AcquirePaxReadView). Groups without captured entries are
@@ -281,7 +282,6 @@ bool ParseAsciiDecimalScaled(const char* s, uint32_t len, int scale,
  * @brief PAX cell metadata for one column, from the request's ColumnDesc.
  */
 struct ColumnSpec {
-  std::string name;
   uint8_t kind = FK_UNTYPED;
   uint32_t width = 0;
   int8_t scale = 0;
@@ -296,7 +296,6 @@ struct ColumnSpec {
  * stored while the schema is unchanged.
  */
 struct PaxTableView {
-  std::string sql_name;  // bare name the SQL text references, e.g. "lineitem"
   PaxStore* store = nullptr;
   std::vector<ColumnSpec> columns;
   size_t group_count = 0;   // fixed after the read view fence, not live state
@@ -363,17 +362,6 @@ using duckdb::unique_ptr;
 using duckdb::Vector;
 using duckdb::vector;
 
-/**
- * @brief Registration-time handle carrying the request's PaxTableView into
- * PaxBind.
- */
-struct PaxTableInfo : public TableFunctionInfo {
-  PaxTableView* table = nullptr;
-};
-
-/**
- * @brief Bound function data; refers to the request-owned PaxTableView.
- */
 struct PaxBindData : public FunctionData {
   PaxTableView* table = nullptr;
 
@@ -438,23 +426,6 @@ LogicalType FieldKindToLogicalType(uint8_t kind, int8_t scale) {
     default:
       return LogicalType::VARCHAR;
   }
-}
-
-/**
- * @brief Declares the table's column names and types from its ColumnSpec
- * list.
- */
-unique_ptr<FunctionData> PaxBind(ClientContext&, TableFunctionBindInput& input,
-                                 vector<LogicalType>& return_types,
-                                 vector<string>& names) {
-  auto& info = input.info->Cast<PaxTableInfo>();
-  auto bind_data = duckdb::make_uniq<PaxBindData>();
-  bind_data->table = info.table;
-  for (const auto& column : info.table->columns) {
-    return_types.push_back(FieldKindToLogicalType(column.kind, column.scale));
-    names.push_back(column.name);
-  }
-  return std::move(bind_data);
 }
 
 /**
@@ -958,82 +929,6 @@ void PaxScan(ClientContext&, TableFunctionInput& data, DataChunk& output) {
   output.SetCardinality(rows_emitted);
 }
 
-// ---------------------------------------------------------------------------
-// Per-request catalog registration. Serialized by GlobalCatalogMutex().
-// ---------------------------------------------------------------------------
-
-/**
- * @brief Registers the scan table function for one table.
- *
- * @details `nonce` disambiguates the function name across requests sharing
- * the runtime's system catalog: each request's PaxTableView objects live
- * only for that request's stack frame, and a stale function entry from a
- * prior request must never be reachable by name again.
- *
- * @return The registered function name.
- */
-std::string RegisterPaxFunction(Connection& connection,
-                                PaxTableView& table_view, size_t table_index,
-                                uint64_t nonce) {
-  auto info = duckdb::make_shared_ptr<PaxTableInfo>();
-  info->table = &table_view;
-
-  const std::string function_name =
-      "pax_scan_" + std::to_string(nonce) + "_" + std::to_string(table_index);
-  TableFunction function(function_name, {}, PaxScan, PaxBind, PaxInitGlobal,
-                         PaxInitLocal);
-  function.projection_pushdown = true;
-  function.filter_pushdown = false;
-  function.cardinality = PaxCardinality;
-  function.function_info = info;
-
-  connection.context->RunFunctionInTransaction([&]() {
-    auto& catalog = duckdb::Catalog::GetSystemCatalog(*connection.context);
-    duckdb::CreateTableFunctionInfo create_info(function);
-    catalog.CreateTableFunction(*connection.context, create_info);
-  });
-  // RunFunctionInTransaction starts a transaction when the connection is in
-  // auto-commit mode but does not commit it. Committing explicitly here,
-  // immediately after the mutation that opened it, keeps every subsequent
-  // statement in this request looking at a clean, fully-committed catalog
-  // state instead of an open transaction carried across statements.
-  if (connection.HasActiveTransaction()) connection.Commit();
-  return function_name;
-}
-
-/**
- * @brief Creates the bare view for one table's already-registered function.
- *
- * @details The view name is NOT nonce-disambiguated: it must equal the table
- * name the client SQL references, hence CREATE OR REPLACE (idempotent across
- * requests, and GlobalCatalogMutex() already serializes this section).
- *
- * Only the bare, unqualified name may be registered here. A schema-qualified
- * sibling view ("db"."table") must not be added: with two or more different
- * custom table-function-backed tables in one query, a qualified view makes
- * DuckDB's (v1.5.4) binder intermittently fail to resolve the second table
- * ("Catalog Error: Table ... does not exist"). Db-qualified table references
- * are instead stripped from the SQL text on the proxy side.
- */
-void RegisterPaxView(Connection& connection, PaxTableView& table_view,
-                     const std::string& function_name) {
-  // sql_name is a MySQL identifier straight from TABLE_SHARE, not
-  // attacker-controlled SQL text; double-quoting it is a safe-identifier
-  // quoting step, not string-built SQL from client input.
-  const std::string view_sql = "CREATE OR REPLACE VIEW \"" +
-                               table_view.sql_name + "\" AS SELECT * FROM " +
-                               function_name + "();";
-  auto view_result = connection.Query(view_sql);
-  if (view_result->HasError()) {
-    throw std::runtime_error("CREATE VIEW " + table_view.sql_name +
-                             " failed: " + view_result->GetError());
-  }
-}
-
-// ---------------------------------------------------------------------------
-// Result -> proxy row format.
-// ---------------------------------------------------------------------------
-
 /**
  * @brief Encodes one result row into the proxy row format.
  *
@@ -1089,10 +984,9 @@ void EncodeRow(duckdb::MaterializedQueryResult& result, idx_t row_index,
 /**
  * @brief Process-lifetime DuckDB runtime.
  *
- * @details The bridge borrows DuckDB's parser, planner, and vectorized
+ * @details The bridge borrows DuckDB's binder, planner, and vectorized
  * executor; the in-memory duckdb::DuckDB instance holds no table data, and
- * its system catalog only ever contains this bridge's table functions and
- * views. The function-local static gives thread-safe, exactly-once
+ * its system catalog only ever contains this bridge's scan function. The function-local static gives thread-safe, exactly-once
  * construction: the first request pays the construction cost, every later
  * request on any thread reuses the instance. This follows DuckDB's
  * documented concurrency model
@@ -1103,233 +997,6 @@ duckdb::DuckDB& GlobalRuntime() {
   static duckdb::DuckDB runtime(nullptr);  // nullptr: in-memory, no db file
   return runtime;
 }
-
-/**
- * @brief Serializes each request's register-views/run-query/encode-results
- * section against the shared system catalog.
- *
- * @details View names must equal the table names the client SQL references
- * (e.g. "lineitem"), and the runtime has one shared system catalog; two
- * concurrent requests touching the same table would race on CREATE OR
- * REPLACE VIEW. Concurrent bridge requests therefore serialize on this
- * mutex for their whole execution, and every result is still accepted
- * through the read view poison and audit gate.
- */
-std::mutex& GlobalCatalogMutex() {
-  static std::mutex mutex;
-  return mutex;
-}
-
-/**
- * @brief Disambiguates table-function names (not view names, see
- * RegisterPaxView) across requests sharing the runtime's system catalog.
- */
-std::atomic<uint64_t> g_request_nonce{0};
-
-}  // namespace
-
-void ExecuteSql(LineairDB::Database* db,
-                const pb::TxExecuteSqlDuckdb::Request& request,
-                pb::TxExecuteSqlDuckdb::Response* response) {
-  if (response == nullptr) return;
-  response->Clear();
-
-  if (db == nullptr) {
-    response->set_ok(false);
-    response->set_error("database is unavailable");
-    return;
-  }
-
-  // Stage timing, off by default: ENABLE_DUCKDB_BRIDGE_TRACE logs a
-  // one-line stderr breakdown per request (read view fence / table view build /
-  // catalog-mutex wait + registration / query / row encoding).
-  // Enabled when set to anything but empty or "0", matching ENABLE_RPC_TRACE
-  static const bool trace = [] {
-    const char* value = std::getenv("ENABLE_DUCKDB_BRIDGE_TRACE");
-    return value != nullptr && value[0] != '\0' &&
-           std::string_view(value) != "0";
-  }();
-  using Clock = std::chrono::steady_clock;
-  Clock::time_point trace_start, after_fence, after_view_build,
-      after_register, after_query, after_encode;
-
-  try {
-    if (trace) trace_start = Clock::now();
-    // The cut stays fixed for the whole request, retries included; the
-    // undo entries accumulated under it are what make retries converge.
-    const LineairDB::Database::PaxReadView read_view =
-        db->AcquirePaxReadView(FenceTimeoutMs());
-    if (!read_view.valid) {
-      response->set_ok(false);
-      response->set_error(read_view.error);
-      return;
-    }
-    // Every exit releases the read view; the last active release clears the
-    // undo maps.
-    struct ReadViewRelease {
-      LineairDB::Database* database;
-      const LineairDB::Database::PaxReadView& handle;
-      ~ReadViewRelease() { database->ReleasePaxReadView(handle); }
-    } read_view_release{db, read_view};
-    if (trace) after_fence = Clock::now();
-
-    std::vector<PaxTableView> table_views(
-        static_cast<size_t>(request.tables_size()));
-    for (int i = 0; i < request.tables_size(); i++) {
-      const pb::TxExecuteSqlDuckdb::TableDesc& table_desc = request.tables(i);
-      PaxTableView& table_view = table_views[static_cast<size_t>(i)];
-      PaxStore* store = db->GetPaxStore(table_desc.table_name());
-      if (store == nullptr) {
-        response->set_ok(false);
-        response->set_error("table has no PAX store: " +
-                            table_desc.table_name());
-        return;
-      }
-      // Rows that ever took heap fallback are invisible to the strip scan;
-      // reject the table up front. Post-fence, the check covers every
-      // commit at or below the cut; later overflow is post-cut anyway.
-      if (store->overflow_count() > 0) {
-        response->set_ok(false);
-        response->set_error("table has heap fallback rows: " +
-                            table_desc.table_name());
-        return;
-      }
-      table_view.sql_name = table_desc.sql_name();
-      table_view.store = store;
-      // Post-fence group count bounds the scan; groups allocated later can
-      // only hold post-cut rows.
-      table_view.group_count = store->group_count();
-      table_view.cut_epoch = read_view.cut_epoch;
-      table_view.columns.reserve(static_cast<size_t>(table_desc.columns_size()));
-      for (const auto& column : table_desc.columns()) {
-        ColumnSpec spec;
-        spec.name = column.name();
-        spec.kind = static_cast<uint8_t>(column.pax_kind());
-        spec.width = column.pax_width();
-        spec.scale = static_cast<int8_t>(column.pax_scale());
-        table_view.columns.push_back(std::move(spec));
-      }
-    }
-
-    if (trace) after_view_build = Clock::now();
-    const uint64_t nonce =
-        g_request_nonce.fetch_add(1, std::memory_order_relaxed);
-
-    std::unique_ptr<duckdb::MaterializedQueryResult> result;
-    int attempts_used = 0;
-    bool accepted = false;
-    {
-      // Touches the runtime's shared system catalog; see
-      // GlobalCatalogMutex. The lock spans registration and every attempt:
-      // the registered function is nonce-unique and binds this request's
-      // stack-owned views.
-      std::lock_guard<std::mutex> catalog_lock(GlobalCatalogMutex());
-      Connection connection(GlobalRuntime());
-      for (size_t i = 0; i < table_views.size(); i++) {
-        const std::string function_name =
-            RegisterPaxFunction(connection, table_views[i], i, nonce);
-        RegisterPaxView(connection, table_views[i], function_name);
-      }
-      if (trace) after_register = Clock::now();
-
-      const int max_attempts = MaxReadViewAttempts();
-      for (int attempt = 1; attempt <= max_attempts && !accepted; attempt++) {
-        attempts_used = attempt;
-        for (PaxTableView& table_view : table_views) {
-          table_view.bulk_groups.clear();
-        }
-
-        result = connection.Query(request.sql());
-        if (trace) after_query = Clock::now();
-
-        // Every attempt exit runs the same gate, error or not: poison
-        // first (the mutation that poisoned may have no entry and no
-        // counter increment, and the audit alone would pass vacuously),
-        // then the bulk-group audit.
-        if (db->PaxReadViewPoisoned(read_view)) {
-          response->set_ok(false);
-          response->set_error(
-              "columnar read view was poisoned during execution");
-          return;
-        }
-        const bool audit_clean = BulkGroupsUnchanged(table_views);
-        if (!audit_clean) {
-          // Escalate the retry to per-slot resolution everywhere; the
-          // escalated attempt has no bulk groups to audit and terminates.
-          for (PaxTableView& table_view : table_views) {
-            table_view.force_per_slot = true;
-          }
-        }
-
-        if (result->HasError()) {
-          // A concurrent capture can tear an in-flight bulk decode hard
-          // enough to throw; the error is final only when the audit is
-          // clean, otherwise retry.
-          if (audit_clean) {
-            response->set_ok(false);
-            response->set_error(result->GetError());
-            return;
-          }
-          continue;
-        }
-        if (!audit_clean) continue;  // retry, same cut
-
-        // Stage attempt-locally; only an accepted attempt reaches the
-        // response.
-        std::vector<std::string> staged_rows;
-        staged_rows.reserve(static_cast<size_t>(result->RowCount()));
-        std::string row;
-        for (idx_t row_index = 0; row_index < result->RowCount();
-             row_index++) {
-          EncodeRow(*result, row_index, &row);
-          staged_rows.push_back(std::move(row));
-        }
-        if (trace) after_encode = Clock::now();
-
-        for (std::string& staged : staged_rows) {
-          response->add_rows(std::move(staged));
-        }
-        accepted = true;
-      }
-    }
-    if (!accepted) {
-      response->Clear();
-      response->set_ok(false);
-      response->set_error("concurrent modification");
-      return;
-    }
-
-    if (trace) {
-      auto milliseconds = [](Clock::time_point from, Clock::time_point to) {
-        return std::chrono::duration<double, std::milli>(to - from).count();
-      };
-      std::fprintf(
-          stderr,
-          "[duckdb_bridge] fence=%.1fms view_build=%.1fms "
-          "lock_wait+register=%.1fms query=%.1fms encode=%.1fms rows=%llu "
-          "attempts=%d\n",
-          milliseconds(trace_start, after_fence),
-          milliseconds(after_fence, after_view_build),
-          milliseconds(after_view_build, after_register),
-          milliseconds(after_register, after_query),
-          milliseconds(after_query, after_encode),
-          static_cast<unsigned long long>(result->RowCount()), attempts_used);
-    }
-
-    response->set_ok(true);
-  } catch (const std::exception& exception) {
-    response->Clear();
-    response->set_ok(false);
-    response->set_error(exception.what());
-  } catch (...) {
-    response->Clear();
-    response->set_ok(false);
-    response->set_error("duckdb bridge execution failed");
-  }
-}
-
-
-namespace {
 
 // MySQL's collation number for utf8mb4_0900_ai_ci, as the wire IR carries it.
 constexpr uint32_t kUtf8mb40900AiCiCollationId = 255;
@@ -1442,6 +1109,7 @@ void RegisterMySqlCollationRuntime(Connection& connection) {
       kUtf8mb40900AiCiDuckdbName, std::move(sort_key),
       /*combinable=*/false,
       /*not_required_for_equality=*/false);
+  create_info.on_conflict = duckdb::OnCreateConflict::IGNORE_ON_CONFLICT;
   connection.context->RunFunctionInTransaction([&]() {
     auto& catalog = duckdb::Catalog::GetSystemCatalog(*connection.context);
     catalog.CreateCollation(*connection.context, create_info);
@@ -1455,11 +1123,13 @@ void RegisterMySqlCollationRuntime(Connection& connection) {
                               duckdb::LogicalType::BOOLEAN,
                               Utf8mb40900AiCiLike<false>);
   duckdb::CreateScalarFunctionInfo like_info(std::move(like));
+  like_info.on_conflict = duckdb::OnCreateConflict::IGNORE_ON_CONFLICT;
   connection.context->RegisterFunction(like_info);
   duckdb::ScalarFunction not_like(kUtf8mb40900AiCiNotLikeFunction, arguments,
                                   duckdb::LogicalType::BOOLEAN,
                                   Utf8mb40900AiCiLike<true>);
   duckdb::CreateScalarFunctionInfo not_like_info(std::move(not_like));
+  not_like_info.on_conflict = duckdb::OnCreateConflict::IGNORE_ON_CONFLICT;
   connection.context->RegisterFunction(not_like_info);
 
   // Callable form of the sort key, for aggregate-DISTINCT deduplication
@@ -1468,6 +1138,7 @@ void RegisterMySqlCollationRuntime(Connection& connection) {
       "mysql_utf8mb4_0900_ai_ci_sort_key", {duckdb::LogicalType::VARCHAR},
       duckdb::LogicalType::BLOB, Utf8mb40900AiCiSortKey);
   duckdb::CreateScalarFunctionInfo sort_key_info(std::move(sort_key_fn));
+  sort_key_info.on_conflict = duckdb::OnCreateConflict::IGNORE_ON_CONFLICT;
   connection.context->RegisterFunction(sort_key_info);
 
   duckdb::ScalarFunction mysql_ascii("mysql_ascii",
@@ -1475,6 +1146,7 @@ void RegisterMySqlCollationRuntime(Connection& connection) {
                                      duckdb::LogicalType::INTEGER,
                                      MysqlAsciiFunction);
   duckdb::CreateScalarFunctionInfo ascii_info(std::move(mysql_ascii));
+  ascii_info.on_conflict = duckdb::OnCreateConflict::IGNORE_ON_CONFLICT;
   connection.context->RegisterFunction(ascii_info);
 }
 
@@ -1488,7 +1160,6 @@ void RegisterMySqlCollationRuntime(Connection& connection) {
 void EnsureDuckdbScanRegistered() {
   static std::once_flag registered;
   std::call_once(registered, [] {
-    std::lock_guard<std::mutex> catalog_lock(GlobalCatalogMutex());
     Connection connection(GlobalRuntime());
     TableFunction function("helios_pax_scan", {duckdb::LogicalType::POINTER},
                            PaxScan, PaxPointerBind, PaxInitGlobal,
@@ -1499,9 +1170,9 @@ void EnsureDuckdbScanRegistered() {
     connection.context->RunFunctionInTransaction([&]() {
       auto& catalog = duckdb::Catalog::GetSystemCatalog(*connection.context);
       duckdb::CreateTableFunctionInfo create_info(function);
+      create_info.on_conflict = duckdb::OnCreateConflict::IGNORE_ON_CONFLICT;
       catalog.CreateTableFunction(*connection.context, create_info);
     });
-    connection.Query("COMMIT");
     RegisterMySqlCollationRuntime(connection);
   });
 }
@@ -1537,7 +1208,7 @@ void ExecuteDuckdbQuery(
         static_cast<size_t>(request.tables_size()));
     std::vector<uintptr_t> handles(table_views.size());
     for (int i = 0; i < request.tables_size(); i++) {
-      const pb::TxExecuteSqlDuckdb::TableDesc& table_desc = request.tables(i);
+      const pb::TxExecuteDuckdbQuery::TableDesc& table_desc = request.tables(i);
       PaxTableView& table_view = table_views[static_cast<size_t>(i)];
       PaxStore* store = db->GetPaxStore(table_desc.table_name());
       if (store == nullptr) {
@@ -1578,7 +1249,6 @@ void ExecuteDuckdbQuery(
           return;
         }
       }
-      table_view.sql_name = table_desc.sql_name();
       table_view.store = store;
       table_view.group_count = store->group_count();
       table_view.cut_epoch = read_view.cut_epoch;
@@ -1586,7 +1256,6 @@ void ExecuteDuckdbQuery(
           static_cast<size_t>(table_desc.columns_size()));
       for (const auto& column : table_desc.columns()) {
         ColumnSpec spec;
-        spec.name = column.name();
         spec.kind = static_cast<uint8_t>(column.pax_kind());
         spec.width = column.pax_width();
         spec.scale = static_cast<int8_t>(column.pax_scale());

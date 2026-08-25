@@ -93,8 +93,6 @@ const char* message_type_name(MessageType t) {
       return "TX_EXECUTE_READ_PLAN";
     case MessageType::TX_GET_TABLE_STATS:
       return "TX_GET_TABLE_STATS";
-    case MessageType::TX_EXECUTE_SQL_DUCKDB:
-      return "TX_EXECUTE_SQL_DUCKDB";
     case MessageType::TX_EXECUTE_DUCKDB_QUERY:
       return "TX_EXECUTE_DUCKDB_QUERY";
   }

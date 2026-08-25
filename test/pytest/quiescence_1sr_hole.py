@@ -71,9 +71,9 @@ SYNC_POINT_ENV = (
     "LINEAIRDB_DEBUG_SYNC_PAX_READ_VIEW_AFTER_FENCE"
     f"=sleep:{FENCE_HOLD_MS}")
 
-# The bridge registers tables in DuckDB under their bare names and the
-# proxy strips qualifiers relative to the connection's default schema, so
-# queries must run with USE <db> and unqualified table references.
+# The bridge resolves tables through the statement's own resolved
+# references, so queries here simply run with USE <db> and unqualified
+# table names.
 DB = "ha_lineairdb_test"
 
 STACK_PATTERNS = ("build/server/lineairdb-server",

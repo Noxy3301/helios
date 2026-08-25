@@ -53,10 +53,9 @@ enum OpCode {
     TX_EXECUTE_READ_PLAN = 30;
     TX_GET_TABLE_STATS = 31;
 
-    // Executes raw SQL text on the server's embedded DuckDB executor, which
-    // reads PAX storage in place.
-    TX_EXECUTE_SQL_DUCKDB = 36;
-    TX_EXECUTE_DUCKDB_QUERY = 37;
+    // Executes a resolved-statement request on the server's embedded DuckDB
+    // executor, which reads PAX storage in place.
+    TX_EXECUTE_DUCKDB_QUERY = 36;
 }
 
 enum BatchOpType {
@@ -720,51 +719,7 @@ message PushedPredicate {
     uint32 num_columns = 2;
 }
 
-// DuckDB bridge: executes verbatim client SQL text on the LineairDB server
-// through the embedded DuckDB executor, which reads the server's PAX storage
-// in place.
-//
-// Each request carries per-table PAX cell metadata (kind/width/scale); the
-// server persists none of it. The proxy derives the metadata from
-// TABLE::field[] with the computation used at CREATE TABLE time, and it
-// matches the server-side PAX layout while the table's schema is unchanged.
-message TxExecuteSqlDuckdb {
-    // Mirrors LineairDB::Pax::FieldKind (pax_store.h): 0=UNTYPED, 1=INT32,
-    // 2=INT64, 3=DATE, 4=DEC64.
-    message ColumnDesc {
-        string name = 1;         // TABLE::field[i]->field_name
-        uint32 pax_kind = 2;
-        uint32 pax_width = 3;    // PAX cell payload width (bytes)
-        int32 pax_scale = 4;     // FK_DEC64 only
-    }
-    message TableDesc {
-        string table_name = 1;             // PaxStore lookup key
-                                           // (TABLE_SHARE::normalized_path)
-        string sql_name = 3;               // bare name the SQL text uses
-                                           // (TABLE_SHARE::table_name),
-                                           // e.g. "lineitem"
-        string db_name = 4;                // TABLE_SHARE::db, e.g. "benchbase".
-                                           // Informational: the server
-                                           // registers only the bare sql_name
-                                           // view, and the proxy strips
-                                           // db-qualification from table
-                                           // references in the SQL text (see
-                                           // RegisterPaxView in
-                                           // duckdb_bridge_executor.cc).
-        repeated ColumnDesc columns = 2;   // TABLE::field[] order
-    }
-    message Request {
-        string sql = 1;                // verbatim client SQL text (thd->query())
-        repeated TableDesc tables = 2; // every base table the query touches
-    }
-    message Response {
-        bool ok = 1;
-        string error = 2;
-        repeated bytes rows = 3;  // proxy row format, DuckDB result order
-    }
-}
-
-// Resolved-query bridge. The proxy serializes MySQL's resolved statement
+// DuckDB bridge. The proxy encodes MySQL's resolved statement
 // (Query_block + Item trees, captured after resolution and before
 // optimization) and the server constructs DuckDB's parsed AST from it.
 // No SQL text crosses the wire, so the object validated on the proxy is the
@@ -1010,9 +965,24 @@ message TxExecuteDuckdbQuery {
         bool distinct = 7;
     }
 
+    // Mirrors LineairDB::Pax::FieldKind (pax_store.h): 0=UNTYPED, 1=INT32,
+    // 2=INT64, 3=DATE, 4=DEC64.
+    message ColumnDesc {
+        uint32 pax_kind = 1;
+        uint32 pax_width = 2;    // PAX cell payload width (bytes)
+        int32 pax_scale = 3;     // FK_DEC64 only
+    }
+    // The server persists no schema; each request carries per-table PAX cell
+    // metadata derived from TABLE::field[] and validated against the store.
+    message TableDesc {
+        string table_name = 1;             // PaxStore lookup key
+                                           // (TABLE_SHARE::normalized_path)
+        repeated ColumnDesc columns = 2;   // TABLE::field[] order
+    }
+
     message Request {
         uint32 format_version = 1; // exact match required
-        repeated TxExecuteSqlDuckdb.TableDesc tables = 2;
+        repeated TableDesc tables = 2;
         QueryBlock root = 3;
         uint32 expected_output_count = 4;
     }
