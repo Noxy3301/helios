@@ -7,7 +7,9 @@ public:
     TcpServer(uint16_t port = 9999);
     virtual ~TcpServer() = default;
     
-    void run();
+    // False when the listening socket could not be established: a second
+    // instance must fail rather than exit as if it had served.
+    bool run();
     
 protected:
     virtual void handle_client(int client_socket) = 0;

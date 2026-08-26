@@ -8,7 +8,10 @@ int main(int argc, char** argv) {
     
     LineairDBServer server;
     server.init();
-    server.run();  // Start listening
+    if (!server.run()) {  // Start listening
+        LOG_ERROR("The server could not listen; exiting");
+        return 1;
+    }
     
     return 0;
 }
