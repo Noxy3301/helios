@@ -336,9 +336,54 @@ ha_lineairdb::ha_lineairdb(handlerton *hton, TABLE_SHARE *table_arg)
     @see
   ha_innodb.cc
 */
-int ha_lineairdb::extra(enum ha_extra_function) {
+int ha_lineairdb::extra(enum ha_extra_function operation) {
   DBUG_TRACE;
+  switch (operation) {
+    case HA_EXTRA_WRITE_CAN_REPLACE:
+      insert_can_replace_ = true;
+      break;
+    case HA_EXTRA_WRITE_CANNOT_REPLACE:
+      insert_can_replace_ = false;
+      break;
+    // Both mean the statement resolves the duplicate itself, from the row.
+    case HA_EXTRA_IGNORE_DUP_KEY:
+    case HA_EXTRA_INSERT_WITH_UPDATE:
+      insert_peeks_duplicates_ = true;
+      break;
+    case HA_EXTRA_NO_IGNORE_DUP_KEY:
+      insert_peeks_duplicates_ = false;
+      break;
+    default:
+      break;
+  }
   return 0;
+}
+
+int ha_lineairdb::reset() {
+  DBUG_TRACE;
+  insert_can_replace_ = false;
+  insert_peeks_duplicates_ = false;
+  duplicate_key_index_ = MAX_KEY;
+  return 0;
+}
+
+int ha_lineairdb::end_bulk_insert() {
+  DBUG_TRACE;
+
+  auto *tx = active_transaction(ha_thd());
+  if (tx == nullptr) return 0;
+  // An abort a mid-statement flush already recorded is still this statement's
+  // to report, so it is not enough that nothing is left to send.
+  if (!tx->has_pending_writes() && !tx->is_aborted()) return 0;
+
+  tx->flush_write_buffer();
+  if (!tx->is_aborted()) return 0;
+
+  const int error = abort_errno(tx);
+  // Sql_cmd_load_table::execute_inner reads my_errno() rather than this return
+  // value, so a stale errno would be reported in place of the real one.
+  set_my_errno(error);
+  return error;
 }
 
 /**
@@ -490,7 +535,8 @@ LineairDBTransaction *&ha_lineairdb::get_transaction(THD *thd) {
   return ctx->tx;
 }
 
-int ha_lineairdb::abort_errno(LineairDBTransaction *tx) {
+int ha_lineairdb::abort_errno(LineairDBTransaction *tx,
+                              bool duplicate_is_conflict) {
   if (tx != nullptr && tx->has_transport_error()) {
     thd_mark_transaction_to_rollback(ha_thd(), 1);
     return HA_ERR_NO_CONNECTION;
@@ -499,6 +545,16 @@ int ha_lineairdb::abort_errno(LineairDBTransaction *tx) {
   // reject it non-retryably -- retrying the same read cannot make it hit.
   if (tx != nullptr && tx->aborted_by_cache_miss()) {
     return prefetch_reject_unsupported(ha_thd(), tx, "prefetch cache miss");
+  }
+  // A refused key is permanent; print_error asks which key through
+  // info(HA_STATUS_ERRKEY). The refusal ends the whole transaction (no
+  // statement savepoint here). A hidden key is not user-addressable, so
+  // its refusal falls through as contention below.
+  if (tx != nullptr && tx->duplicate_key_abort() && !duplicate_is_conflict &&
+      is_primary_key_exists()) {
+    thd_mark_transaction_to_rollback(ha_thd(), 1);
+    duplicate_key_index_ = table_share->primary_key;
+    return HA_ERR_FOUND_DUPP_KEY;
   }
   // Default: a genuine OCC/server abort is retryable contention.
   thd_mark_transaction_to_rollback(ha_thd(), 1);
@@ -522,12 +578,19 @@ static int lineairdb_commit(handlerton *hton, THD *thd, bool all) {
     return 0;
 
   bool transport_error = false;
-  const bool committed = ctx->tx->end_transaction(&transport_error);
+  bool duplicate_key = false;
+  const bool committed =
+      ctx->tx->end_transaction(&transport_error, &duplicate_key);
   ctx->tx = nullptr;
 
   if (!committed) {
     thd_mark_transaction_to_rollback(thd, true);
-    return transport_error ? HA_ERR_NO_CONNECTION : HA_ERR_LOCK_DEADLOCK;
+    if (transport_error) return HA_ERR_NO_CONNECTION;
+    // No handler is in scope here, so MySQL wraps this in ER_ERROR_DURING_COMMIT
+    // rather than naming the key. The code still separates a duplicate key from
+    // contention, which is the difference a client has to act on.
+    if (duplicate_key) return HA_ERR_FOUND_DUPP_KEY;
+    return HA_ERR_LOCK_DEADLOCK;
   }
   return 0;
 }

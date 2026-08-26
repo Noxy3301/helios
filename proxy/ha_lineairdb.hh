@@ -203,6 +203,14 @@ private:
 
   std::string last_fetched_primary_key_;
   std::string end_range_exclusive_key_; // For HA_READ_BEFORE_KEY: exclude this key from results
+
+  // Duplicate-key contract for the running statement, from extra(). REPLACE
+  // may overwrite the row it finds; IGNORE and ON DUPLICATE KEY UPDATE need
+  // the duplicate reported at the row, so write_row reads the key first.
+  bool insert_can_replace_{false};
+  bool insert_peeks_duplicates_{false};
+  // Key MySQL asks about through info(HA_STATUS_ERRKEY) after a duplicate.
+  uint duplicate_key_index_{MAX_KEY};
   my_off_t
       current_position_; /* Current position in the file during a file scan */
   std::string write_buffer_;
@@ -525,6 +533,17 @@ public:
    */
   int analyze(THD *thd, HA_CHECK_OPT *check_opt) override;
   int extra(enum ha_extra_function operation) override;
+  int reset() override;
+  /**
+   * @brief Send the rows of an INSERT statement and report a duplicate key.
+   *
+   * @details Row writes are buffered and normally reach the storage server at
+   * commit. An insert that a statement must answer for is flushed here, which
+   * is where MySQL still reports the failure against that statement.
+   *
+   * @return 0, or the handler error the statement should print.
+   */
+  int end_bulk_insert() override;
   int external_lock(THD *thd, int lock_type) override; ///< required
   int start_stmt(THD *thd, thr_lock_type lock_type) override;
   int delete_all_rows(void) override;
@@ -627,11 +646,14 @@ private:
   LineairDBTransaction *&
   get_transaction(THD *thd);
   /**
-   * @brief Map an aborted transaction to a handler errno: HA_ERR_UNSUPPORTED
-   * (non-retryable) for a prefetch cache miss, or HA_ERR_LOCK_DEADLOCK (MySQL's
-   * conventional retry signal) for a genuine OCC abort.
+   * @brief Map an aborted transaction to a handler errno: cache miss to
+   * non-retryable HA_ERR_UNSUPPORTED, refused duplicate key to
+   * HA_ERR_FOUND_DUPP_KEY, anything else to retryable HA_ERR_LOCK_DEADLOCK.
+   * @param duplicate_is_conflict Report a duplicate as a lost race instead,
+   *   for a statement that already gave its row-time duplicate answer.
    */
-  int abort_errno(LineairDBTransaction *tx);
+  int abort_errno(LineairDBTransaction *tx,
+                  bool duplicate_is_conflict = false);
 
   // Key conversion helpers
   static std::string encode_int_key(const uchar *data, size_t len);
