@@ -66,14 +66,25 @@ void LineairDBRpc::handleDbEndTransaction(const std::string& message,
     auto* tx = tx_manager_->get_transaction(tx_id);
     if (tx) {
         const bool fence = request.fence();
+        // The aborted callback runs before EndTransaction releases the
+        // transaction; a deferred callback only ever runs as Committed and
+        // must not touch these frame captures.
+        bool duplicate_key = false;
         const bool committed = db_manager_->get_database()->EndTransaction(
-            *tx, [fence, tx_id](LineairDB::TxStatus status) {
+            *tx, [&duplicate_key, tx, fence, tx_id](LineairDB::TxStatus status) {
+                if (status == LineairDB::TxStatus::Aborted) {
+                    duplicate_key = tx->AbortedByDuplicateKey();
+                }
                 LOG_DEBUG("Transaction %ld ended with status: %d, fence=%s",
                           tx_id, static_cast<int>(status),
                           fence ? "true" : "false");
             });
         const bool aborted = !committed;
         response.set_is_aborted(aborted);
+        if (duplicate_key) {
+            response.set_abort_reason(
+                LineairDB::Protocol::ABORT_REASON_DUPLICATE_PRIMARY_KEY);
+        }
         tx_manager_->remove_transaction(tx_id);
 
         // Apply row-count deltas on successful commit.

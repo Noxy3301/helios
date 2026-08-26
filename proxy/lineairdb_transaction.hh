@@ -78,7 +78,8 @@ public:
 
   // Write buffering for batch operations
   void buffer_write(const std::string& table_name,
-                    const std::string& key, const std::string& value);
+                    const std::string& key, const std::string& value,
+                    bool is_insert = false);
   void buffer_write_secondary_index(const std::string& table_name,
                                      const std::string& index_name,
                                      const std::string& secondary_key,
@@ -94,9 +95,14 @@ public:
   bool flush_write_buffer();
   bool flush_write_buffer_for_table(const std::string& table_name);
 
+  // True while any op is still waiting to be sent, so the statement that
+  // buffered it can flush and report a rejection itself.
+  bool has_pending_writes() const { return !write_buffer_ops_.empty(); }
+
   void begin_transaction();
   void set_status_to_abort();
-  bool end_transaction(bool *transport_error = nullptr);
+  bool end_transaction(bool *transport_error = nullptr,
+                       bool *duplicate_key = nullptr);
   void fence() const;
   void set_prefetch_mode(bool enabled) { prefetch_mode_ = enabled; }
   bool is_prefetch_mode() const { return prefetch_mode_; }
@@ -161,6 +167,9 @@ public:
 
   bool aborted_by_cache_miss() const { return aborted_by_cache_miss_; }
   bool has_transport_error() const { return transport_error_; }
+  // Set when the server refused an insert because the key already held a row.
+  bool duplicate_key_abort() const { return duplicate_key_abort_; }
+  void mark_duplicate_key_abort() { duplicate_key_abort_ = true; }
 
   inline void mark_transport_error() {
     transport_error_ = true;
@@ -224,6 +233,8 @@ private:
   // A lost RPC connection is not OCC contention and must never be surfaced as
   // a retryable deadlock (or as an empty scan result).
   bool transport_error_{false};
+  // A duplicate primary key is a permanent rejection, not contention.
+  bool duplicate_key_abort_{false};
 
   struct RowCountDelta {
     LineairDB_share *share;
@@ -373,7 +384,7 @@ private:
       const std::string& table_name, const std::string& index_name,
       const std::string& start_key, const std::string& end_key,
       bool reverse_scan, uint64_t row_limit) const;
-  bool prefetch_validate_and_commit(bool *transport_error);
+  bool prefetch_validate_and_commit(bool *transport_error, bool *duplicate_key);
   bool thd_is_transaction() const;
   void register_transaction_to_mysql();
   void register_single_statement_to_mysql();

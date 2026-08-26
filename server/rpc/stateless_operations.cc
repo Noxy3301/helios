@@ -72,10 +72,10 @@ void LineairDBRpc::handleTxValidateAndCommit(const std::string& message,
     writes.reserve(request.writes_size() + request.deletes_size());
     for (const auto& write : request.writes()) {
         writes.push_back({write.table_name(), write.key(), write.value(),
-                          write.is_delete()});
+                          write.is_delete(), write.is_insert()});
     }
     for (const auto& del : request.deletes()) {
-        writes.push_back({del.table_name(), del.key(), "", true});
+        writes.push_back({del.table_name(), del.key(), "", true, false});
     }
 
     std::vector<LineairDB::ExternalSecondaryIndexEntry> si_ops;
@@ -107,14 +107,18 @@ void LineairDBRpc::handleTxValidateAndCommit(const std::string& message,
         range_reads.push_back(std::move(entry));
     }
 
-    std::string abort_reason;
+    std::string abort_detail;
     const bool committed =
         db_manager_->get_database()->ValidateAndCommit(reads, writes, si_ops,
                                                        range_reads,
-                                                       &abort_reason);
+                                                       &abort_detail);
     response.set_committed(committed);
-    if (!committed && !abort_reason.empty()) {
-        response.set_abort_reason(abort_reason);
+    if (!committed && !abort_detail.empty()) {
+        response.set_abort_detail(abort_detail);
+        if (abort_detail == LineairDB::kDuplicateKeyAbortReason) {
+            response.set_abort_reason(
+                LineairDB::Protocol::ABORT_REASON_DUPLICATE_PRIMARY_KEY);
+        }
     }
 
     if (committed && request.row_deltas_size() > 0) {

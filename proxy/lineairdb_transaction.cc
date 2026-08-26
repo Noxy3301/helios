@@ -609,6 +609,10 @@ bool LineairDBTransaction::update_secondary_index(std::string index_name,
     return true;
   }
 
+  // Buffered writes to this table must reach the server before the immediate
+  // index update, or the update overtakes the insert it belongs to.
+  if (!flush_write_buffer_for_table(db_table_key)) return false;
+
   return lineairdb_proxy->tx_update_secondary_index(this, index_name, old_secondary_key, new_secondary_key, primary_key);
 }
 
@@ -899,12 +903,14 @@ LineairDBTransaction::peek_rowcount_delta(const LineairDB_share *share) const {
 
 void LineairDBTransaction::buffer_write(const std::string& table_name,
                                         const std::string& key,
-                                        const std::string& value) {
+                                        const std::string& value,
+                                        bool is_insert) {
   LineairDBProxy::BatchOp op;
   op.type = LineairDBProxy::BatchOp::Type::Write;
   op.key = key;
   op.value = value;
   op.table_name = table_name;
+  op.is_insert = is_insert;
   write_buffer_ops_.push_back(std::move(op));
   record_write(table_name, key, true, value);
 
@@ -1479,8 +1485,9 @@ bool LineairDBTransaction::fallback_to_normal_transaction(const char* reason) {
 }
 
 bool LineairDBTransaction::prefetch_validate_and_commit(
-    bool *transport_error) {
+    bool *transport_error, bool *duplicate_key) {
   if (transport_error != nullptr) *transport_error = transport_error_;
+  if (duplicate_key != nullptr) *duplicate_key = duplicate_key_abort_;
   bool was_aborted = is_aborted_;
 
   std::vector<LineairDBProxy::StatelessReadKey> reads;
@@ -1507,18 +1514,23 @@ bool LineairDBTransaction::prefetch_validate_and_commit(
   }
 
   bool committed = false;
-  std::string abort_reason;
+  std::string abort_detail;
   if (!was_aborted) {
     bool commit_transport_error = false;
+    bool commit_duplicate_key = false;
     committed = lineairdb_proxy->tx_validate_and_commit(
         reads, read_tids, read_found, range_read_set_,
-        write_buffer_ops_, server_deltas, isFence, &abort_reason,
-        &commit_transport_error);
+        write_buffer_ops_, server_deltas, isFence, &abort_detail,
+        &commit_duplicate_key, &commit_transport_error);
     if (transport_error != nullptr) {
       *transport_error = transport_error_ || commit_transport_error;
     }
-    if (!committed && !abort_reason.empty()) {
-      rpc_trace_.record_local_view("abort_validate_" + abort_reason);
+    if (commit_duplicate_key) {
+      duplicate_key_abort_ = true;
+      if (duplicate_key != nullptr) *duplicate_key = true;
+    }
+    if (!committed && !abort_detail.empty()) {
+      rpc_trace_.record_local_view("abort_validate_" + abort_detail);
     }
   }
   if (!committed) {
@@ -1594,14 +1606,17 @@ void LineairDBTransaction::set_status_to_abort() {
   is_aborted_ = true;
 }
 
-bool LineairDBTransaction::end_transaction(bool *transport_error) {
+bool LineairDBTransaction::end_transaction(bool *transport_error,
+                                           bool *duplicate_key) {
   if (transport_error != nullptr) *transport_error = transport_error_;
+  if (duplicate_key != nullptr) *duplicate_key = duplicate_key_abort_;
   if (prefetch_mode_) {
-    return prefetch_validate_and_commit(transport_error);
+    return prefetch_validate_and_commit(transport_error, duplicate_key);
   }
 
   assert(tx_id != -1);
   flush_write_buffer();
+  if (duplicate_key != nullptr) *duplicate_key = duplicate_key_abort_;
   bool was_aborted = is_aborted_;
 
   // Build row-delta pairs for the server (table_name, delta).
@@ -1615,10 +1630,16 @@ bool LineairDBTransaction::end_transaction(bool *transport_error) {
   }
 
   bool end_rpc_transport_error = false;
+  bool end_rpc_duplicate_key = false;
   bool committed = lineairdb_proxy->db_end_transaction(
-      tx_id, isFence, server_deltas, &end_rpc_transport_error);
+      tx_id, isFence, server_deltas, &end_rpc_duplicate_key,
+      &end_rpc_transport_error);
   if (transport_error != nullptr) {
     *transport_error = transport_error_ || end_rpc_transport_error;
+  }
+  if (end_rpc_duplicate_key) {
+    duplicate_key_abort_ = true;
+    if (duplicate_key != nullptr) *duplicate_key = true;
   }
   if (!committed) {
     thd_mark_transaction_to_rollback(thread, 1);

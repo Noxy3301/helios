@@ -220,6 +220,9 @@ public:
         std::string secondary_key;
         std::string primary_key;
         std::string table_name;
+        // Row write that must find the key free; the server refuses it
+        // otherwise. Never set on a REPLACE, which is an upsert by contract.
+        bool is_insert = false;
     };
     bool tx_batch_write(LineairDBTransaction* tx,
                         const std::string& table_name,
@@ -241,7 +244,8 @@ public:
         const std::vector<BatchOp>& ops,
         const std::vector<std::pair<std::string, int64_t>>& row_deltas,
         bool isFence,
-        std::string* abort_reason = nullptr,
+        std::string* abort_detail = nullptr,
+        bool* duplicate_key = nullptr,
         bool* transport_error = nullptr);
 
     // secondary index operations
@@ -325,6 +329,7 @@ public:
     // database operations
     bool db_end_transaction(int64_t tx_id, bool isFence,
                             const std::vector<std::pair<std::string, int64_t>>& row_deltas = {},
+                            bool *duplicate_key = nullptr,
                             bool *transport_error = nullptr);
     void db_fence();
 

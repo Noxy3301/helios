@@ -335,7 +335,9 @@ bool LineairDBProxy::tx_batch_write(LineairDBTransaction* tx,
         auto* op = request.add_ops();
         switch (batch_op.type) {
             case BatchOp::Type::Write:
-                op->set_type(LineairDB::Protocol::BATCH_OP_WRITE);
+                op->set_type(batch_op.is_insert
+                                 ? LineairDB::Protocol::BATCH_OP_INSERT
+                                 : LineairDB::Protocol::BATCH_OP_WRITE);
                 op->set_key(batch_op.key);
                 op->set_value(batch_op.value);
                 op->set_table_name(batch_op.table_name);
@@ -368,6 +370,10 @@ bool LineairDBProxy::tx_batch_write(LineairDBTransaction* tx,
     }
 
     tx->set_aborted(response.is_aborted());
+    if (response.abort_reason() ==
+        LineairDB::Protocol::ABORT_REASON_DUPLICATE_PRIMARY_KEY) {
+        tx->mark_duplicate_key_abort();
+    }
     return response.success();
 }
 
@@ -618,9 +624,11 @@ bool LineairDBProxy::tx_validate_and_commit(
     const std::vector<BatchOp>& ops,
     const std::vector<std::pair<std::string, int64_t>>& row_deltas,
     bool isFence,
-    std::string* abort_reason,
+    std::string* abort_detail,
+    bool* duplicate_key,
     bool* transport_error) {
-    if (abort_reason != nullptr) abort_reason->clear();
+    if (abort_detail != nullptr) abort_detail->clear();
+    if (duplicate_key != nullptr) *duplicate_key = false;
     if (transport_error != nullptr) *transport_error = false;
     if (!connected_) {
         LOG_ERROR("RPC failed: Not connected to server");
@@ -657,6 +665,7 @@ bool LineairDBProxy::tx_validate_and_commit(
                 write->set_key(batch_op.key);
                 write->set_value(batch_op.value);
                 write->set_is_delete(false);
+                write->set_is_insert(batch_op.is_insert);
                 break;
             }
             case BatchOp::Type::Delete: {
@@ -704,8 +713,13 @@ bool LineairDBProxy::tx_validate_and_commit(
     for (const auto& ts : response.table_stats()) {
         table_stats_cache_[ts.table_name()] = ts.row_count();
     }
-    if (!response.committed() && abort_reason != nullptr) {
-        *abort_reason = response.abort_reason();
+    if (!response.committed()) {
+        if (abort_detail != nullptr) *abort_detail = response.abort_detail();
+        if (duplicate_key != nullptr) {
+            *duplicate_key =
+                response.abort_reason() ==
+                LineairDB::Protocol::ABORT_REASON_DUPLICATE_PRIMARY_KEY;
+        }
     }
     return response.committed();
 }
@@ -1369,7 +1383,9 @@ bool LineairDBProxy::db_create_secondary_index(const std::string& table_name,
 
 bool LineairDBProxy::db_end_transaction(int64_t tx_id, bool isFence,
                                         const std::vector<std::pair<std::string, int64_t>>& row_deltas,
+                                        bool *duplicate_key,
                                         bool *transport_error) {
+    if (duplicate_key != nullptr) *duplicate_key = false;
     if (transport_error != nullptr) *transport_error = false;
     LOG_DEBUG("CLIENT: db_end_transaction (with row_deltas) called with tx_id=%ld, fence=%s, deltas=%zu",
               tx_id, isFence ? "true" : "false", row_deltas.size());
@@ -1400,6 +1416,11 @@ bool LineairDBProxy::db_end_transaction(int64_t tx_id, bool isFence,
     table_stats_cache_.clear();
     for (const auto& ts : response.table_stats()) {
         table_stats_cache_[ts.table_name()] = ts.row_count();
+    }
+
+    if (response.is_aborted() && duplicate_key != nullptr) {
+        *duplicate_key = response.abort_reason() ==
+                         LineairDB::Protocol::ABORT_REASON_DUPLICATE_PRIMARY_KEY;
     }
 
     LOG_DEBUG("CLIENT: db_end_transaction (with row_deltas) completed");

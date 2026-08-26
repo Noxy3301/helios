@@ -114,6 +114,18 @@ void LineairDBRpc::handleTxBatchWrite(const std::string& message,
                             value_str.size());
                         break;
                     }
+                    case LineairDB::Protocol::BATCH_OP_INSERT: {
+                        // Insert refuses a key that already holds a live row
+                        // and says so, so the duplicate is named where it is
+                        // found rather than guessed at here.
+                        const std::string& value_str = op.value();
+                        tx->Insert(
+                            op.key(),
+                            reinterpret_cast<const std::byte*>(
+                                value_str.c_str()),
+                            value_str.size());
+                        break;
+                    }
                     case LineairDB::Protocol::BATCH_OP_DELETE:
                         tx->Delete(op.key());
                         break;
@@ -135,6 +147,10 @@ void LineairDBRpc::handleTxBatchWrite(const std::string& message,
                     }
                     case LineairDB::Protocol::BATCH_OP_UNKNOWN:
                     default:
+                        // A proxy from a newer wire must not have its op
+                        // dropped behind a success response.
+                        LOG_ERROR("unknown batch op type %d", op.type());
+                        tx->Abort();
                         break;
                 }
                 if (tx->IsAborted()) break;
@@ -143,6 +159,10 @@ void LineairDBRpc::handleTxBatchWrite(const std::string& message,
 
         response.set_success(!tx->IsAborted());
         response.set_is_aborted(tx->IsAborted());
+        if (tx->AbortedByDuplicateKey()) {
+            response.set_abort_reason(
+                LineairDB::Protocol::ABORT_REASON_DUPLICATE_PRIMARY_KEY);
+        }
     } else {
         response.set_success(false);
         response.set_is_aborted(true);

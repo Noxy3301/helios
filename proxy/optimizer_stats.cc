@@ -211,6 +211,11 @@ int ha_lineairdb::info(uint flag) {
     return 0;
   }
 
+  // print_error asks which key a duplicate landed on through this flag.
+  if (flag & HA_STATUS_ERRKEY) {
+    errkey = duplicate_key_index_;
+  }
+
   if (flag & (HA_STATUS_VARIABLE | HA_STATUS_CONST)) {
     seed_optimizer_stats();
 
