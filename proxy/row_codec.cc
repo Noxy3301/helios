@@ -14,6 +14,37 @@
 // MySQL record <-> LineairDB row-byte conversion helpers used by DML and scan
 // paths.
 
+namespace {
+
+// Field objects address table->record[0]. Serving a row into another record
+// buffer (record[1], which INSERT ... ON DUPLICATE KEY UPDATE reads the
+// conflicting row into) means pointing them at it for the duration.
+// RAII over Field::move_field_offset (sql/field.h): shift on entry, restore on exit.
+class MoveFieldOffset {
+ public:
+  MoveFieldOffset(TABLE *table, ptrdiff_t offset)
+      : table_(table), offset_(offset) {
+    shift(offset_);
+  }
+  ~MoveFieldOffset() { shift(-offset_); }
+
+  MoveFieldOffset(const MoveFieldOffset &) = delete;
+  MoveFieldOffset &operator=(const MoveFieldOffset &) = delete;
+
+ private:
+  void shift(ptrdiff_t by) {
+    if (by == 0) return;
+    for (Field **field = table_->field; *field; field++) {
+      (*field)->move_field_offset(by);
+    }
+  }
+
+  TABLE *table_;
+  ptrdiff_t offset_;
+};
+
+}  // namespace
+
 void ha_lineairdb::set_write_buffer(uchar *buf) {
   ldbField.set_null_field(buf, table->s->null_bytes);
   write_buffer_ = ldbField.get_null_field();
@@ -56,6 +87,8 @@ bool ha_lineairdb::store_blob_to_field(Field **field) {
 int ha_lineairdb::set_fields_from_lineairdb(uchar *buf,
                                             const std::byte *const read_buf,
                                             const size_t read_buf_size) {
+  MoveFieldOffset field_offset(table, buf - table->record[0]);
+
   // Clear BLOB data from the previous row.
   blobroot.ClearForReuse();
   ldbField.make_mysql_table_row(read_buf, read_buf_size);
@@ -97,7 +130,7 @@ int ha_lineairdb::set_fields_from_lineairdb(uchar *buf,
         !bitmap_is_set(table->read_set, (*field)->field_index())) {
       continue;
     }
-    if ((*field)->is_nullable() && (*field)->is_null_in_record(buf)) {
+    if ((*field)->is_nullable() && (*field)->is_null()) {
       (*field)->set_null();
     } else {
       (*field)->store(mysqlFieldValue.data(), mysqlFieldValue.size(),
