@@ -609,6 +609,10 @@ bool LineairDBTransaction::update_secondary_index(std::string index_name,
     return true;
   }
 
+  // Buffered writes to this table must reach the server before the immediate
+  // index update, or the update overtakes the insert it belongs to.
+  if (!flush_write_buffer_for_table(db_table_key)) return false;
+
   return lineairdb_proxy->tx_update_secondary_index(this, index_name, old_secondary_key, new_secondary_key, primary_key);
 }
 

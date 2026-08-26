@@ -100,6 +100,8 @@ int ha_lineairdb::update_row(const uchar *old_data, uchar *new_data) {
     return abort_errno(tx);
   }
 
+  tx->choose_table(db_table_name);
+
   for (uint i = 0; i < table->s->keys; i++) {
     auto key_info = table->key_info[i];
 
