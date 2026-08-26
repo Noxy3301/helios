@@ -64,6 +64,15 @@ enum BatchOpType {
     BATCH_OP_DELETE = 2;
     BATCH_OP_SECONDARY_INDEX_WRITE = 3;
     BATCH_OP_SECONDARY_INDEX_DELETE = 4;
+    // Write that requires the key to be free; the server refuses it otherwise.
+    BATCH_OP_INSERT = 5;
+}
+
+// Why the server refused a transaction, where the query layer has to tell the
+// cause apart from ordinary contention.
+enum AbortReason {
+    ABORT_REASON_UNSPECIFIED = 0;
+    ABORT_REASON_DUPLICATE_PRIMARY_KEY = 1;
 }
 
 // Shared key-value pair used across scan responses.
@@ -176,6 +185,7 @@ message TxBatchWrite {
     message Response {
         bool success = 1;
         bool is_aborted = 2;
+        AbortReason abort_reason = 3;
     }
 }
 
@@ -303,6 +313,7 @@ message TxValidateAndCommit {
         bytes key = 2;
         bytes value = 3;
         bool is_delete = 4;
+        bool is_insert = 5; // Commit refuses the entry if the key holds a row.
     }
     message DeleteEntry {
         string table_name = 1;
@@ -327,7 +338,8 @@ message TxValidateAndCommit {
     message Response {
         bool committed = 1;
         repeated TableRowCount table_stats = 2;
-        string abort_reason = 3;
+        string abort_detail = 3; // Free-form cause, for tracing only.
+        AbortReason abort_reason = 4;
     }
 }
 
@@ -391,6 +403,7 @@ message DbEndTransaction {
     message Response {
         bool is_aborted = 1;
         repeated TableRowCount table_stats = 2;
+        AbortReason abort_reason = 3;
     }
 }
 
