@@ -47,7 +47,7 @@
         } > /tmp/salvage-snapshot.txt 2>&1
         tar czf /tmp/salvage.tgz --ignore-failed-read \
           /tmp/salvage-snapshot.txt /tmp/start_server.log /tmp/start_mysql.log \
-          $(ls $HOME/helios/lineairdb_logs/*.log 2>/dev/null | tail -3) \
+          $(ls $HOME/helios/lineairdb_logs/{lineairdb_server,mysqld}_*.log 2>/dev/null | tail -3) \
           $(sudo find $HOME -maxdepth 5 -name "*.err" 2>/dev/null | head -3) \
           2>/dev/null || true
       args:

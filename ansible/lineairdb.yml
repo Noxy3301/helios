@@ -6,19 +6,120 @@
   vars:
     lineairdb_nofile_limit: 1048576
     ena_rss_interface: ens5
+    helios_durability: volatile
+    helios_epoch_ms: ""
+    wal_volume: false
+    wal_mount: /mnt/wal
   tasks:
     # Before any traffic; the play itself runs unprivileged
     - import_tasks: tasks/ena_queue_tuning.yml
       become: true
 
+    - name: Check whether the WAL volume is already mounted
+      when: wal_volume | bool
+      become: true
+      command: mountpoint -q {{ wal_mount }}
+      register: wal_mounted
+      failed_when: false
+      changed_when: false
+
+    - name: Require an existing WAL mount to be an ext4 NVMe volume
+      when: (wal_volume | bool) and (wal_mounted.rc | default(1)) == 0
+      become: true
+      shell: |
+        set -euo pipefail
+        read -r src fs < <(findmnt -n -o SOURCE,FSTYPE {{ wal_mount }})
+        [ "$fs" = ext4 ] && [[ "$src" == /dev/nvme* ]] || { echo "unexpected WAL mount: $src $fs"; exit 1; }
+      args:
+        executable: /bin/bash
+      changed_when: false
+
+    - name: Configure the WAL volume
+      when: (wal_volume | bool) and (wal_mounted.rc | default(1)) != 0
+      become: true
+      block:
+        - name: Find unpartitioned, unmounted NVMe disks
+          shell: |
+            set -o pipefail
+            for d in $(lsblk -dn -o NAME,TYPE | awk '$2 == "disk" && $1 ~ /^nvme/ {print $1}'); do
+              children=$(lsblk -n -o TYPE "/dev/$d" | grep -c -v '^disk$' || true)
+              mp=$(lsblk -dn -o MOUNTPOINT "/dev/$d" | tr -d '[:space:]')
+              if [ "$children" -eq 0 ] && [ -z "$mp" ]; then echo "$d"; fi
+            done
+          args:
+            executable: /bin/bash
+          register: wal_disk_candidates
+          changed_when: false
+
+        - name: Snapshot lsblk for diagnostics
+          command: lsblk
+          register: wal_lsblk_full
+          changed_when: false
+
+        - name: Require exactly one WAL disk candidate
+          assert:
+            that:
+              - wal_disk_candidates.stdout_lines | length == 1
+            fail_msg: |-
+              Expected exactly one unpartitioned, unmounted NVMe disk for the WAL volume, got {{ wal_disk_candidates.stdout_lines }}.
+              lsblk:
+              {{ wal_lsblk_full.stdout }}
+
+        - name: Prepare and mount the WAL volume
+          shell: |
+            set -euo pipefail
+            dev=/dev/{{ wal_disk_candidates.stdout_lines[0] }}
+            mkdir -p {{ wal_mount }}
+            # No lazy init: background inode-table writes would overlap the run
+            blkid -o value -s TYPE "$dev" >/dev/null 2>&1 || \
+              mkfs.ext4 -F -E lazy_itable_init=0,lazy_journal_init=0 "$dev"
+            mount "$dev" {{ wal_mount }}
+            chown {{ ansible_user }}:{{ ansible_user }} {{ wal_mount }}
+          args:
+            executable: /bin/bash
+
+    - name: Point lineairdb_logs at the WAL volume
+      # Separate from the mount block so a re-pushed bundle (which recreates
+      # the plain directory) is re-linked even when the volume stayed mounted.
+      when: wal_volume | bool
+      become: true
+      shell: |
+        set -euo pipefail
+        mkdir -p {{ wal_mount }}/lineairdb_logs
+        chown {{ ansible_user }}:{{ ansible_user }} {{ wal_mount }}/lineairdb_logs
+        target=/home/{{ ansible_user }}/helios/lineairdb_logs
+        if [ -L "$target" ]; then
+          rm -f "$target"
+        elif [ -e "$target" ]; then
+          rm -rf "$target"
+        fi
+        ln -s {{ wal_mount }}/lineairdb_logs "$target"
+        chown -h {{ ansible_user }}:{{ ansible_user }} "$target"
+      args:
+        executable: /bin/bash
+
     - name: Start LineairDB-Server
-      # Never pipe the start scripts: log to a file and verify liveness explicitly
+      # Never pipe the start scripts: log to a file and verify liveness explicitly;
+      # lineairdb_logs is wiped first, following the WAL symlink when present, so
+      # a run never replays a previous WAL
       shell: |
         set -euo pipefail
         cd ~/helios
         ./scripts/stop_server.sh > /dev/null 2>&1 || true
-        sleep 1
+        # pgrep status 1 means no process; anything else keeps the WAL untouched
+        rc=0
+        for _ in $(seq 1 30); do
+          pgrep -f '[b]uild/server/lineairdb-server' > /dev/null && rc=0 || rc=$?
+          [ "$rc" -eq 0 ] || break
+          sleep 1
+        done
+        [ "$rc" -eq 1 ] || { echo "refusing to wipe the WAL: a previous lineairdb-server is still running or pgrep failed (status $rc)"; exit 1; }
+        find ~/helios/lineairdb_logs/ -mindepth 1 -delete
         ulimit -n {{ lineairdb_nofile_limit }}
+        export LINEAIRDB_COMMIT_DURABILITY="{{ helios_durability }}"
+        {% if helios_epoch_ms %}
+        export LINEAIRDB_EPOCH_DURATION_MS="{{ helios_epoch_ms }}"
+        {% endif %}
         ./scripts/start_server.sh > /tmp/start_server.log 2>&1
         sleep 2
         # Bracketed: the pattern kill in stop_server.sh must not match this shell
@@ -35,3 +136,22 @@
     - name: Show server start log
       debug:
         var: server_start.stdout_lines
+
+    - name: Show durability configuration
+      debug:
+        msg:
+          - "LINEAIRDB_COMMIT_DURABILITY={{ helios_durability }}"
+          - "LINEAIRDB_EPOCH_DURATION_MS={{ helios_epoch_ms if helios_epoch_ms else '(server default)' }}"
+
+    - name: Capture WAL volume disk usage
+      when: wal_volume | bool
+      shell: df -h {{ wal_mount }}
+      args:
+        executable: /bin/bash
+      register: wal_df
+      changed_when: false
+
+    - name: Show WAL volume disk usage
+      when: wal_volume | bool
+      debug:
+        var: wal_df.stdout_lines

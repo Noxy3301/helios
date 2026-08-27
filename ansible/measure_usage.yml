@@ -546,13 +546,38 @@
         executable: /bin/bash
 
     - name: Package LineairDB logs
+      # lineairdb_server_*.log only: wal.log / checkpoint*.log live in the same
+      # dir and can be tens of GB.
       when: inventory_hostname in groups['lineairdb']
       shell: |
-        if ls ~/helios/lineairdb_logs/*.log >/dev/null 2>&1; then
-          tar -czf {{ sample_dir }}/lineairdb-{{ run_id }}.tgz -C ~/helios lineairdb_logs
+        cd ~/helios/lineairdb_logs 2>/dev/null || exit 0
+        if ls lineairdb_server_*.log >/dev/null 2>&1; then
+          tar -czf {{ sample_dir }}/lineairdb-{{ run_id }}.tgz lineairdb_server_*.log
         fi
       args:
         executable: /bin/bash
+
+    - name: Capture WAL disk usage
+      # WAL growth is a sizing input
+      when: inventory_hostname in groups['lineairdb']
+      shell: |
+        {
+          echo "=== du -sh ~/helios/lineairdb_logs/ ==="
+          du -sh ~/helios/lineairdb_logs/ 2>/dev/null
+          echo "=== df -h ==="
+          df -h
+        } > {{ sample_dir }}/wal-usage-{{ run_id }}.txt
+      args:
+        executable: /bin/bash
+      failed_when: false
+
+    - name: Fetch WAL disk usage
+      when: inventory_hostname in groups['lineairdb']
+      fetch:
+        src: "{{ sample_dir }}/wal-usage-{{ run_id }}.txt"
+        dest: "{{ result_dir }}/lineairdb/{{ inventory_hostname }}/"
+        flat: yes
+      failed_when: false
 
     - name: Capture MySQL status snapshot
       when: inventory_hostname in groups['mysql']

@@ -17,7 +17,7 @@
       wait_for:
         host: "{{ hostvars['lineairdb-1'].private_ip }}"
         port: 9999
-        timeout: 180
+        timeout: 600
 
     - name: Start MySQL with LineairDB-Proxy
       # Never pipe the start scripts to a pager/tail; log to a file and

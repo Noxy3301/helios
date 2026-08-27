@@ -204,25 +204,34 @@ def _launch_role(role, cfg, args, run_id):
     user-data (self-terminate if forgotten), gp3 root with DeleteOnTermination,
     IMDSv2. On-demand happens only with --on-demand or --allow-od-fallback."""
     region = args.region
+    tags = (f"Tags=[{{Key=Name,Value={cfg['tag']}}},"
+            f"{{Key=Project,Value={args.project_tag}}},"
+            f"{{Key=Run,Value={run_id}}}]")
     tag_spec = [
         "--tag-specifications",
-        f"ResourceType=instance,Tags=["
-        f"{{Key=Name,Value={cfg['tag']}}},"
-        f"{{Key=Project,Value={args.project_tag}}},"
-        f"{{Key=Run,Value={run_id}}}"
-        f"]",
+        f"ResourceType=instance,{tags}",
+        f"ResourceType=volume,{tags}",
     ]
     deadman = (f"#!/bin/bash\n"
                f"shutdown +{args.deadman_minutes} \"helios bench dead-man\"\n")
+
+    block_device_mappings = [
+        f"DeviceName=/dev/sda1,Ebs={{VolumeSize={args.root_gib},"
+        f"VolumeType=gp3,DeleteOnTermination=true}}",
+    ]
+    if role == "lineairdb" and args.wal_gib > 0:
+        block_device_mappings.append(
+            f"DeviceName=/dev/sdf,Ebs={{VolumeSize={args.wal_gib},"
+            f"VolumeType=io2,Iops={args.wal_iops},DeleteOnTermination=true}}"
+        )
+
     base_cmd = [
         "ec2", "run-instances",
         "--image-id", args.ami_id,
         "--key-name", Path(args.ssh_key).stem,
         "--count", str(cfg["count"]),
         "--instance-type", cfg["instance_type"],
-        "--block-device-mappings",
-        f"DeviceName=/dev/sda1,Ebs={{VolumeSize={args.root_gib},"
-        f"VolumeType=gp3,DeleteOnTermination=true}}",
+        "--block-device-mappings", *block_device_mappings,
         "--metadata-options", "HttpTokens=required,HttpEndpoint=enabled",
         "--instance-initiated-shutdown-behavior", "terminate",
         "--user-data", deadman,
@@ -388,7 +397,11 @@ def deploy_infrastructure(args, bundle_path, bundle_sha256):
 
     # Start the roles in parallel
     log("Deploying infrastructure (lineairdb + mysql in parallel)...")
+    lineairdb_vars = {"helios_durability": args.durability, "wal_volume": args.wal_gib > 0}
+    if args.epoch_ms is not None:
+        lineairdb_vars["helios_epoch_ms"] = args.epoch_ms
     role_extra = {
+        "lineairdb.yml": " -e " + shlex.quote(json.dumps(lineairdb_vars)),
         "mysql.yml": " -e " + shlex.quote(json.dumps({"mysqld_extra_args": args.mysqld_extra_args})),
     }
     # Write deploy logs alongside bench_aws.log
@@ -632,6 +645,7 @@ Examples:
   python3 py/bench_aws.py --bench-type tpcc --bench-prefetch --bench-terms 1,16,64,128
   python3 py/bench_aws.py --bench-type tpch --bench-scalefactor 0.1
   python3 py/bench_aws.py --bench-type tpch --bench-serial false --bench-terms 1,2,4,8 --bench-scalefactor 0.01
+  python3 py/bench_aws.py --durability sync --epoch-ms 1 --wal-gib 300
   python3 py/bench_aws.py --cleanup-only --cleanup-all
   python3 py/bench_aws.py --dry-run
 """,
@@ -672,8 +686,18 @@ Examples:
                              "record) on the mysql and lineairdb nodes across both the load "
                              "and the sweep; degrades to a logged note if perf is unavailable")
 
+    # Durability / WAL options
+    parser.add_argument("--durability", default="volatile", choices=["volatile", "async", "sync"],
+                        help="LineairDB commit durability contract (default: volatile)")
+    parser.add_argument("--epoch-ms", type=int, default=None,
+                        help="Epoch duration in ms (default: server default)")
+    parser.add_argument("--wal-gib", type=int, default=0,
+                        help="Extra io2 WAL volume size in GiB on the lineairdb node "
+                             "(default: 0, no extra volume)")
+    parser.add_argument("--wal-iops", type=int, default=12000, help="IOPS for the io2 WAL volume")
     parser.add_argument("--mysqld-extra-args", default="--performance-schema=OFF",
                         help="Extra mysqld options, passed through MYSQLD_EXTRA_ARGS")
+
     # AWS options
     parser.add_argument("--region", default=AWS_DEFAULTS["region"])
     parser.add_argument("--project-tag", default=AWS_DEFAULTS["project_tag"])
@@ -718,6 +742,10 @@ Examples:
         parser.error("--cleanup-only requires --cleanup-run-id <run_id> or --cleanup-all")
     if (args.cleanup_all or args.cleanup_run_id) and not args.cleanup_only:
         parser.error("--cleanup-all / --cleanup-run-id are only valid with --cleanup-only")
+    if args.epoch_ms is not None and not 1 <= args.epoch_ms <= 10000:
+        parser.error("--epoch-ms must be between 1 and 10000")
+    if args.wal_gib < 0:
+        parser.error("--wal-gib must be 0 (no volume) or a positive size")
     if not re.fullmatch(r"[A-Za-z0-9_=./:,+ -]*", args.mysqld_extra_args):
         parser.error("--mysqld-extra-args accepts only letters, digits, space and _ = . / : , + -")
     if args.bundle is not None:
@@ -748,9 +776,15 @@ Examples:
         run_id += "-prefetch"
     if args.bench_ndv_drift:
         run_id += "-ndvdrift"
+    if args.durability != "volatile":
+        run_id += f"-{args.durability}"
+    if args.epoch_ms is not None:
+        run_id += f"-e{args.epoch_ms}"
     log_dir = ANSIBLE_DIR / "result" / run_id / machine_spec / "logs"
     log_dir.mkdir(parents=True, exist_ok=True)
     LOG_FILE = open(log_dir / "bench_aws.log", "w")
+    with open(log_dir / "run_config.json", "w") as f:
+        json.dump({"run_id": run_id, "args": vars(args), "cluster": CLUSTER}, f, indent=2, sort_keys=True)
     log(f"Log directory: {log_dir}")
     log(f"Machine spec: {machine_spec}")
 
@@ -771,7 +805,15 @@ Examples:
         for role, cfg in CLUSTER.items():
             log(f"  {role}: {cfg['count']}x {cfg['instance_type']} "
                 f"(tag={cfg['tag']}, ena_queues={ena_queue_count(cfg['instance_type'])})")
+        log(f"Durability: {args.durability}"
+            + (f" epoch_ms={args.epoch_ms}" if args.epoch_ms is not None else ""))
+        if args.wal_gib > 0:
+            log(f"WAL volume: {args.wal_gib}GiB io2 iops={args.wal_iops} "
+                f"on lineairdb (/dev/sdf, DeleteOnTermination=true)")
+        else:
+            log("WAL volume: none (root volume only)")
         log(f"mysqld extra args: {args.mysqld_extra_args!r}")
+        log(f"run_id: {run_id}")
         log(f"Benchmark: {args.bench_type} SF={args.bench_scalefactor or 'default'}")
         if args.bench_terms:
             log(f"Terminals: [{args.bench_terms}]")
