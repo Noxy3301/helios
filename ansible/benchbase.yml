@@ -93,6 +93,7 @@
     # Interface and queue count that bench_aws.py requests at launch.
     ena_rss_interface: ens5
     ena_rss_target_combined: 32
+    bench_analyze: false
     run_id: "run"
     machine_spec: "unknown"
     load_result_dir: "{{ playbook_dir }}/result/{{ run_id }}/{{ machine_spec }}"
@@ -292,9 +293,10 @@
       delegate_to: "{{ groups['benchbase'][0] }}"
 
     - name: "Refresh MySQL stats with ANALYZE TABLE on each MySQL ({{ bench_type | upper }})"
-      # Prefetch mode requires MySQL's plan to match the @_tx_plan DSL; stale stats
-      # can pick PRIMARY where the DSL expects a secondary index and loop the retry.
-      # The timeout bounds a hang without firing on a healthy run.
+      # stmt-prefetch and plain mode read live row counts from the storage server;
+      # only tx-prefetch needs ANALYZE, because MySQL's plan must match its
+      # @_tx_plan DSL or every prefetch attempt misses. The timeout bounds a hang here
+      when: bench_analyze | bool
       shell: |
         timeout -k 60 {{ bench_analyze_timeout | default(3600) }} \
         {{ _mysql_bin }} -u root --protocol=TCP \

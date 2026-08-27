@@ -401,6 +401,8 @@ def run_benchmarks(args, run_id):
     bench_vars = f"bench_type={args.bench_type}"
     if args.bench_scalefactor:
         bench_vars += f" bench_scalefactor={args.bench_scalefactor}"
+    if args.bench_analyze or args.bench_prefetch:
+        bench_vars += " bench_analyze=true"
 
     # run_id + machine_spec let the setup play write load-phase artifacts into
     # the same result dir the sweep uses. Observability only.
@@ -609,6 +611,10 @@ Examples:
                         help="SET GLOBAL lineairdb_stats_drift_refresh=ON "
                              "(default OFF: the NDV/histogram recompute is synchronous "
                              "on the read path)")
+    parser.add_argument("--bench-analyze", action="store_true",
+                        help="Run ANALYZE TABLE after load (on automatically for tx-prefetch; "
+                             "stmt-prefetch and plain mode read live row counts from the "
+                             "storage server)")
     parser.add_argument("--perf", action="store_true", help="Enable perf profiling on lineairdb + mysql nodes")
     parser.add_argument("--load-jstack", action="store_true",
                         help="Take one thread dump of the loader JVM mid-load (diagnostic; "
