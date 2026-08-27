@@ -1,0 +1,63 @@
+---
+# Idempotent io2 data volume mount shared by lineairdb.yml (WAL) and
+# mysql.yml (InnoDB datadir). The caller sets data_mount and data_volume
+# via vars: and puts become: true and tags: [privileged] on the import line.
+- name: Check whether the data volume is already mounted
+  when: data_volume | bool
+  command: mountpoint -q {{ data_mount }}
+  register: data_mounted
+  failed_when: false
+  changed_when: false
+
+- name: Require an existing data mount to be an ext4 NVMe volume
+  when: (data_volume | bool) and (data_mounted.rc | default(1)) == 0
+  shell: |
+    set -euo pipefail
+    read -r src fs < <(findmnt -n -o SOURCE,FSTYPE {{ data_mount }})
+    [ "$fs" = ext4 ] && [[ "$src" == /dev/nvme* ]] || { echo "unexpected data mount: $src $fs"; exit 1; }
+  args:
+    executable: /bin/bash
+  changed_when: false
+
+- name: Configure the data volume
+  when: (data_volume | bool) and (data_mounted.rc | default(1)) != 0
+  block:
+    - name: Find unpartitioned, unmounted NVMe disks
+      shell: |
+        set -o pipefail
+        for d in $(lsblk -dn -o NAME,TYPE | awk '$2 == "disk" && $1 ~ /^nvme/ {print $1}'); do
+          children=$(lsblk -n -o TYPE "/dev/$d" | grep -c -v '^disk$' || true)
+          mp=$(lsblk -dn -o MOUNTPOINT "/dev/$d" | tr -d '[:space:]')
+          if [ "$children" -eq 0 ] && [ -z "$mp" ]; then echo "$d"; fi
+        done
+      args:
+        executable: /bin/bash
+      register: data_disk_candidates
+      changed_when: false
+
+    - name: Snapshot lsblk for diagnostics
+      command: lsblk
+      register: data_lsblk_full
+      changed_when: false
+
+    - name: Require exactly one data disk candidate
+      assert:
+        that:
+          - data_disk_candidates.stdout_lines | length == 1
+        fail_msg: |-
+          Expected exactly one unpartitioned, unmounted NVMe disk for the data volume, got {{ data_disk_candidates.stdout_lines }}.
+          lsblk:
+          {{ data_lsblk_full.stdout }}
+
+    - name: Prepare and mount the data volume
+      shell: |
+        set -euo pipefail
+        dev=/dev/{{ data_disk_candidates.stdout_lines[0] }}
+        mkdir -p {{ data_mount }}
+        # No lazy init: background inode-table writes would overlap the run
+        blkid -o value -s TYPE "$dev" >/dev/null 2>&1 || \
+          mkfs.ext4 -F -E lazy_itable_init=0,lazy_journal_init=0 "$dev"
+        mount "$dev" {{ data_mount }}
+        chown {{ ansible_user }}:{{ ansible_user }} {{ data_mount }}
+      args:
+        executable: /bin/bash

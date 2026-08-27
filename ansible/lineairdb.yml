@@ -16,71 +16,12 @@
       become: true
       tags: [privileged]
 
-    - name: Check whether the WAL volume is already mounted
-      when: wal_volume | bool
+    - import_tasks: tasks/mount_data_volume.yml
       become: true
       tags: [privileged]
-      command: mountpoint -q {{ wal_mount }}
-      register: wal_mounted
-      failed_when: false
-      changed_when: false
-
-    - name: Require an existing WAL mount to be an ext4 NVMe volume
-      when: (wal_volume | bool) and (wal_mounted.rc | default(1)) == 0
-      become: true
-      tags: [privileged]
-      shell: |
-        set -euo pipefail
-        read -r src fs < <(findmnt -n -o SOURCE,FSTYPE {{ wal_mount }})
-        [ "$fs" = ext4 ] && [[ "$src" == /dev/nvme* ]] || { echo "unexpected WAL mount: $src $fs"; exit 1; }
-      args:
-        executable: /bin/bash
-      changed_when: false
-
-    - name: Configure the WAL volume
-      when: (wal_volume | bool) and (wal_mounted.rc | default(1)) != 0
-      become: true
-      tags: [privileged]
-      block:
-        - name: Find unpartitioned, unmounted NVMe disks
-          shell: |
-            set -o pipefail
-            for d in $(lsblk -dn -o NAME,TYPE | awk '$2 == "disk" && $1 ~ /^nvme/ {print $1}'); do
-              children=$(lsblk -n -o TYPE "/dev/$d" | grep -c -v '^disk$' || true)
-              mp=$(lsblk -dn -o MOUNTPOINT "/dev/$d" | tr -d '[:space:]')
-              if [ "$children" -eq 0 ] && [ -z "$mp" ]; then echo "$d"; fi
-            done
-          args:
-            executable: /bin/bash
-          register: wal_disk_candidates
-          changed_when: false
-
-        - name: Snapshot lsblk for diagnostics
-          command: lsblk
-          register: wal_lsblk_full
-          changed_when: false
-
-        - name: Require exactly one WAL disk candidate
-          assert:
-            that:
-              - wal_disk_candidates.stdout_lines | length == 1
-            fail_msg: |-
-              Expected exactly one unpartitioned, unmounted NVMe disk for the WAL volume, got {{ wal_disk_candidates.stdout_lines }}.
-              lsblk:
-              {{ wal_lsblk_full.stdout }}
-
-        - name: Prepare and mount the WAL volume
-          shell: |
-            set -euo pipefail
-            dev=/dev/{{ wal_disk_candidates.stdout_lines[0] }}
-            mkdir -p {{ wal_mount }}
-            # No lazy init: background inode-table writes would overlap the run
-            blkid -o value -s TYPE "$dev" >/dev/null 2>&1 || \
-              mkfs.ext4 -F -E lazy_itable_init=0,lazy_journal_init=0 "$dev"
-            mount "$dev" {{ wal_mount }}
-            chown {{ ansible_user }}:{{ ansible_user }} {{ wal_mount }}
-          args:
-            executable: /bin/bash
+      vars:
+        data_mount: "{{ wal_mount }}"
+        data_volume: "{{ wal_volume }}"
 
     - name: Point lineairdb_logs at the WAL volume
       # Separate from the mount block so a re-pushed bundle (which recreates

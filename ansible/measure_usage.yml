@@ -164,7 +164,7 @@
       when: inventory_hostname in groups.get('mysql', [])
       shell: |
         mkdir -p {{ sample_dir }}
-        pid=$(pgrep -f 'mysqld.*lineairdb' | head -n1 || true)
+        pid=$(pgrep -f '[r]untime_output_directory/mysqld' | head -n1 || true)
         if [ -z "$pid" ]; then
           echo "mysqld not running" > {{ sample_dir }}/pidstat-mysql-{{ run_id }}.log
           exit 0
@@ -271,7 +271,7 @@
       when: (enable_perf | bool) and inventory_hostname in groups.get('mysql', []) and (perf_bin is defined and perf_bin != '')
       shell: |
         mkdir -p {{ sample_dir }}
-        pid=$(pgrep -f 'mysqld.*lineairdb' | head -n1 || true)
+        pid=$(pgrep -f '[r]untime_output_directory/mysqld' | head -n1 || true)
         if [ -z "$pid" ]; then
           echo "mysqld not running, skipping perf" > {{ sample_dir }}/perf-proxy-{{ run_id }}.log
           exit 0
@@ -550,7 +550,7 @@
     - name: Package LineairDB logs
       # lineairdb_server_*.log only: wal.log / checkpoint*.log live in the same
       # dir and can be tens of GB.
-      when: inventory_hostname in groups['lineairdb']
+      when: inventory_hostname in groups.get('lineairdb', [])
       shell: |
         cd ~/helios/lineairdb_logs 2>/dev/null || exit 0
         if ls lineairdb_server_*.log >/dev/null 2>&1; then
@@ -561,7 +561,7 @@
 
     - name: Capture WAL disk usage
       # WAL growth is a sizing input
-      when: inventory_hostname in groups['lineairdb']
+      when: inventory_hostname in groups.get('lineairdb', [])
       shell: |
         {
           echo "=== du -sh ~/helios/lineairdb_logs/ ==="
@@ -574,7 +574,7 @@
       failed_when: false
 
     - name: Fetch WAL disk usage
-      when: inventory_hostname in groups['lineairdb']
+      when: inventory_hostname in groups.get('lineairdb', [])
       fetch:
         src: "{{ sample_dir }}/wal-usage-{{ run_id }}.txt"
         dest: "{{ result_dir }}/lineairdb/{{ inventory_hostname }}/"
@@ -587,6 +587,16 @@
         ~/helios/build/runtime_output_directory/mysql \
           -u root --protocol=TCP -h 127.0.0.1 -P 3307 \
           -e "SHOW GLOBAL STATUS" > {{ sample_dir }}/mysql-status-{{ run_id }}.txt
+      args:
+        executable: /bin/bash
+      failed_when: false
+
+    - name: Capture InnoDB engine status (post)
+      when: (mysql_engine | default('lineairdb') == 'innodb') and inventory_hostname in groups['mysql']
+      shell: |
+        ~/helios/build/runtime_output_directory/mysql \
+          -u root --protocol=TCP -h 127.0.0.1 -P 3307 \
+          -e "SHOW ENGINE INNODB STATUS\G" > {{ sample_dir }}/innodb-status-{{ run_id }}.txt
       args:
         executable: /bin/bash
       failed_when: false
@@ -663,56 +673,56 @@
         flat: yes
 
     - name: Fetch LineairDB logs
-      when: inventory_hostname in groups['lineairdb']
+      when: inventory_hostname in groups.get('lineairdb', [])
       fetch:
         src: "{{ sample_dir }}/lineairdb-{{ run_id }}.tgz"
         dest: "{{ result_dir }}/lineairdb/{{ inventory_hostname }}/"
         flat: yes
 
     - name: Fetch server pidstat logs
-      when: inventory_hostname in groups['lineairdb']
+      when: inventory_hostname in groups.get('lineairdb', [])
       fetch:
         src: "{{ sample_dir }}/pidstat-server-{{ run_id }}.log"
         dest: "{{ result_dir }}/lineairdb/{{ inventory_hostname }}/"
         flat: yes
 
     - name: Fetch server sar -w logs
-      when: inventory_hostname in groups['lineairdb']
+      when: inventory_hostname in groups.get('lineairdb', [])
       fetch:
         src: "{{ sample_dir }}/sar-w-{{ run_id }}.log"
         dest: "{{ result_dir }}/lineairdb/{{ inventory_hostname }}/"
         flat: yes
 
     - name: Fetch server sar -n DEV logs
-      when: inventory_hostname in groups['lineairdb']
+      when: inventory_hostname in groups.get('lineairdb', [])
       fetch:
         src: "{{ sample_dir }}/sar-dev-{{ run_id }}.log"
         dest: "{{ result_dir }}/lineairdb/{{ inventory_hostname }}/"
         flat: yes
 
     - name: Fetch server sar -n SOFT logs
-      when: inventory_hostname in groups['lineairdb']
+      when: inventory_hostname in groups.get('lineairdb', [])
       fetch:
         src: "{{ sample_dir }}/sar-soft-{{ run_id }}.log"
         dest: "{{ result_dir }}/lineairdb/{{ inventory_hostname }}/"
         flat: yes
 
     - name: Fetch server mpstat -I ALL logs
-      when: inventory_hostname in groups['lineairdb']
+      when: inventory_hostname in groups.get('lineairdb', [])
       fetch:
         src: "{{ sample_dir }}/mpstat-irq-{{ run_id }}.log"
         dest: "{{ result_dir }}/lineairdb/{{ inventory_hostname }}/"
         flat: yes
 
     - name: Fetch server softnet_stat logs
-      when: inventory_hostname in groups['lineairdb']
+      when: inventory_hostname in groups.get('lineairdb', [])
       fetch:
         src: "{{ sample_dir }}/softnet-{{ run_id }}.log"
         dest: "{{ result_dir }}/lineairdb/{{ inventory_hostname }}/"
         flat: yes
 
     - name: Fetch server /proc/interrupts logs
-      when: inventory_hostname in groups['lineairdb']
+      when: inventory_hostname in groups.get('lineairdb', [])
       fetch:
         src: "{{ sample_dir }}/interrupts-{{ run_id }}.log"
         dest: "{{ result_dir }}/lineairdb/{{ inventory_hostname }}/"
@@ -724,6 +734,14 @@
         src: "{{ sample_dir }}/mysql-status-{{ run_id }}.txt"
         dest: "{{ result_dir }}/mysql/{{ inventory_hostname }}/"
         flat: yes
+
+    - name: Fetch InnoDB engine status
+      when: (mysql_engine | default('lineairdb') == 'innodb') and inventory_hostname in groups['mysql']
+      fetch:
+        src: "{{ sample_dir }}/innodb-status-{{ run_id }}.txt"
+        dest: "{{ result_dir }}/mysql/{{ inventory_hostname }}/"
+        flat: yes
+      failed_when: false
 
     - name: Fetch MySQL diagnostics (pre)
       when: inventory_hostname in groups['mysql']
@@ -758,7 +776,7 @@
       failed_when: false
 
     - name: Fetch server per-thread pidstat logs
-      when: inventory_hostname in groups['lineairdb']
+      when: inventory_hostname in groups.get('lineairdb', [])
       fetch:
         src: "{{ sample_dir }}/pidstat-threads-{{ run_id }}.log"
         dest: "{{ result_dir }}/lineairdb/{{ inventory_hostname }}/"

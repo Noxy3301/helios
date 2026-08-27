@@ -86,10 +86,17 @@ def build_machine_spec():
     """Build machine_spec string from CLUSTER config (e.g. lineairdb-64x1_mysql-16x1_...)."""
     parts = []
     for role, cfg in CLUSTER.items():
+        if cfg["count"] == 0:
+            continue
         size = cfg["instance_type"].split(".")[-1]  # e.g. "16xlarge"
         vcpu = _VCPU_BY_SIZE.get(size, 0)
         parts.append(f"{role}-{vcpu}x{cfg['count']}")
     return "_".join(parts)
+
+
+def _wal_role(args):
+    """Which CLUSTER role hosts the io2 volume for this engine."""
+    return "mysql" if args.engine == "innodb" else "lineairdb"
 
 
 def log(msg):
@@ -219,7 +226,7 @@ def _launch_role(role, cfg, args, run_id):
         f"DeviceName=/dev/sda1,Ebs={{VolumeSize={args.root_gib},"
         f"VolumeType=gp3,DeleteOnTermination=true}}",
     ]
-    if role == "lineairdb" and args.wal_gib > 0:
+    if role == _wal_role(args) and args.wal_gib > 0:
         block_device_mappings.append(
             f"DeviceName=/dev/sdf,Ebs={{VolumeSize={args.wal_gib},"
             f"VolumeType=io2,Iops={args.wal_iops},DeleteOnTermination=true}}"
@@ -316,6 +323,8 @@ def launch_instances(args, run_id):
     all_instance_ids = []
 
     for role, cfg in CLUSTER.items():
+        if cfg["count"] == 0:
+            continue
         try:
             ids = _launch_role(role, cfg, args, run_id)
             all_instance_ids.extend(ids)
@@ -395,20 +404,29 @@ def deploy_infrastructure(args, bundle_path, bundle_sha256):
     run(f"ansible-playbook -i {inv} {ANSIBLE_DIR / 'push_bundle.yml'}"
         f" -e {shlex.quote(json.dumps({'bundle_path': bundle_path, 'bundle_sha256': bundle_sha256}))}")
 
-    # Start the roles in parallel
-    log("Deploying infrastructure (lineairdb + mysql in parallel)...")
+    # Start the roles in parallel; --engine innodb has no lineairdb role
+    innodb = args.engine == "innodb"
+    log("Deploying infrastructure (mysql only, InnoDB)..." if innodb
+        else "Deploying infrastructure (lineairdb + mysql in parallel)...")
     lineairdb_vars = {"helios_durability": args.durability, "wal_volume": args.wal_gib > 0}
     if args.epoch_ms is not None:
         lineairdb_vars["helios_epoch_ms"] = args.epoch_ms
+    mysql_vars = {"mysqld_extra_args": args.mysqld_extra_args}
+    if innodb:
+        mysql_vars.update({"mysql_engine": "innodb", "wal_volume": args.wal_gib > 0,
+                           "wal_iops": args.wal_iops})
+        if args.innodb_buffer_pool_gib is not None:
+            mysql_vars["innodb_buffer_pool_gib"] = args.innodb_buffer_pool_gib
     role_extra = {
         "lineairdb.yml": " -e " + shlex.quote(json.dumps(lineairdb_vars)),
-        "mysql.yml": " -e " + shlex.quote(json.dumps({"mysqld_extra_args": args.mysqld_extra_args})),
+        "mysql.yml": " -e " + shlex.quote(json.dumps(mysql_vars)),
     }
     # Write deploy logs alongside bench_aws.log
     deploy_log_dir = Path(LOG_FILE.name).parent if LOG_FILE else None
     procs = []
 
-    for playbook in ["lineairdb.yml", "mysql.yml"]:
+    playbooks = ["mysql.yml"] if innodb else ["lineairdb.yml", "mysql.yml"]
+    for playbook in playbooks:
         cmd = f"ansible-playbook -i {inv} {ANSIBLE_DIR / playbook}{role_extra.get(playbook, '')}"
         log(f"  $ {cmd}")
         if deploy_log_dir:
@@ -457,6 +475,9 @@ def run_benchmarks(args, run_id):
         bench_vars += f" bench_scalefactor={args.bench_scalefactor}"
     if args.bench_analyze or args.bench_prefetch:
         bench_vars += " bench_analyze=true"
+    if args.engine == "innodb":
+        # Reaches benchbase.yml directly and measure_usage.yml via exec_vars
+        bench_vars += " mysql_engine=innodb"
 
     # run_id + machine_spec let the setup play write load-phase artifacts into
     # the same result dir the sweep uses. Observability only.
@@ -523,7 +544,7 @@ def _plot_perf_reports(result_root):
     role_modes = {"lineairdb": "server", "mysql": "proxy"}
     for role, mode in role_modes.items():
         cfg = CLUSTER.get(role)
-        if not cfg:
+        if not cfg or cfg["count"] == 0:
             continue
         size = cfg["instance_type"].split(".")[-1]
         vcpu = _VCPU_BY_SIZE.get(size, 0)
@@ -651,6 +672,17 @@ Examples:
 """,
     )
 
+    # Engine selection
+    parser.add_argument("--engine", default="lineairdb", choices=["lineairdb", "innodb"],
+                        help="Storage engine under test (default: lineairdb, the full Helios "
+                             "stack). innodb runs the same sweep against a single stock "
+                             "MySQL/InnoDB node instead: no LineairDB storage server, "
+                             "--mysql-count fixed at 1, no prefetch/ndv-drift options; size "
+                             "its --mysql-instance-type like the Helios storage node so the "
+                             "buffer pool holds the dataset")
+    parser.add_argument("--innodb-buffer-pool-gib", type=int, default=None,
+                        help="InnoDB buffer pool size in GiB (default: 75%% of the node's memory)")
+
     # Benchmark options
     parser.add_argument("--bench-type", default="ycsb", choices=["ycsb", "tpcc", "tpch"])
     parser.add_argument("--bench-scalefactor", default=None, help="Scale factor (default: 10 for ycsb/tpcc, 0.1 for tpch)")
@@ -674,9 +706,9 @@ Examples:
                              "(default OFF: the NDV/histogram recompute is synchronous "
                              "on the read path)")
     parser.add_argument("--bench-analyze", action="store_true",
-                        help="Run ANALYZE TABLE after load (on automatically for tx-prefetch; "
-                             "stmt-prefetch and plain mode read live row counts from the "
-                             "storage server)")
+                        help="Run ANALYZE TABLE after load (on automatically for tx-prefetch "
+                             "and for --engine innodb; stmt-prefetch and plain mode read live "
+                             "row counts from the storage server)")
     parser.add_argument("--perf", action="store_true", help="Enable perf profiling on lineairdb + mysql nodes")
     parser.add_argument("--load-jstack", action="store_true",
                         help="Take one thread dump of the loader JVM mid-load (diagnostic; "
@@ -692,8 +724,8 @@ Examples:
     parser.add_argument("--epoch-ms", type=int, default=None,
                         help="Epoch duration in ms (default: server default)")
     parser.add_argument("--wal-gib", type=int, default=0,
-                        help="Extra io2 WAL volume size in GiB on the lineairdb node "
-                             "(default: 0, no extra volume)")
+                        help="Extra io2 volume size in GiB (default: 0, no extra volume); holds the "
+                             "WAL on the lineairdb node, or the datadir under --engine innodb")
     parser.add_argument("--wal-iops", type=int, default=12000, help="IOPS for the io2 WAL volume")
     parser.add_argument("--mysqld-extra-args", default="--performance-schema=OFF",
                         help="Extra mysqld options, passed through MYSQLD_EXTRA_ARGS")
@@ -748,6 +780,25 @@ Examples:
         parser.error("--wal-gib must be 0 (no volume) or a positive size")
     if not re.fullmatch(r"[A-Za-z0-9_=./:,+ -]*", args.mysqld_extra_args):
         parser.error("--mysqld-extra-args accepts only letters, digits, space and _ = . / : , + -")
+    if args.engine == "innodb":
+        if args.mysql_count is not None and args.mysql_count != 1:
+            parser.error("--engine innodb runs a single MySQL/InnoDB node; --mysql-count must be 1")
+        if args.bench_prefetch or args.bench_prefetch_stmt or args.bench_ndv_drift:
+            parser.error("--engine innodb has no LineairDB sysvars; "
+                         "--bench-prefetch, --bench-prefetch-stmt and --bench-ndv-drift are not supported")
+        if args.durability != "volatile" or args.epoch_ms is not None:
+            parser.error("--durability/--epoch-ms configure the LineairDB server; not valid with --engine innodb")
+        if args.lineairdb_instance_type is not None:
+            parser.error("--lineairdb-instance-type is meaningless with --engine innodb")
+        if args.wal_gib <= 0:
+            parser.error("--engine innodb needs --wal-gib > 0: the datadir must live on the io2 volume")
+    if args.engine != "innodb" and args.innodb_buffer_pool_gib is not None:
+        parser.error("--innodb-buffer-pool-gib is only valid with --engine innodb")
+    if args.innodb_buffer_pool_gib is not None and args.innodb_buffer_pool_gib < 1:
+        parser.error("--innodb-buffer-pool-gib must be at least 1")
+    if (args.mysql_count is not None and args.mysql_count < 1) or \
+            (args.benchbase_count is not None and args.benchbase_count < 1):
+        parser.error("--mysql-count and --benchbase-count must be at least 1")
     if args.bundle is not None:
         args.bundle = str(Path(args.bundle).resolve())
     os.chdir(ANSIBLE_DIR)
@@ -763,6 +814,10 @@ Examples:
         CLUSTER["benchbase"]["count"] = args.benchbase_count
     if args.benchbase_instance_type is not None:
         CLUSTER["benchbase"]["instance_type"] = args.benchbase_instance_type
+    if args.engine == "innodb":
+        CLUSTER["lineairdb"]["count"] = 0
+        if CLUSTER["mysql"]["count"] != 1:
+            parser.error("--engine innodb runs a single MySQL/InnoDB node; the mysql role count must be 1")
 
     machine_spec = build_machine_spec()
 
@@ -780,6 +835,8 @@ Examples:
         run_id += f"-{args.durability}"
     if args.epoch_ms is not None:
         run_id += f"-e{args.epoch_ms}"
+    if args.engine == "innodb":
+        run_id += "-innodb"
     log_dir = ANSIBLE_DIR / "result" / run_id / machine_spec / "logs"
     log_dir.mkdir(parents=True, exist_ok=True)
     LOG_FILE = open(log_dir / "bench_aws.log", "w")
@@ -801,15 +858,20 @@ Examples:
 
     # Dry run
     if args.dry_run:
+        log(f"Engine: {args.engine}")
         log("DRY RUN — would launch:")
         for role, cfg in CLUSTER.items():
+            if cfg["count"] == 0:
+                log(f"  {role}: skipped (count=0)")
+                continue
             log(f"  {role}: {cfg['count']}x {cfg['instance_type']} "
                 f"(tag={cfg['tag']}, ena_queues={ena_queue_count(cfg['instance_type'])})")
-        log(f"Durability: {args.durability}"
-            + (f" epoch_ms={args.epoch_ms}" if args.epoch_ms is not None else ""))
+        if args.engine != "innodb":
+            log(f"Durability: {args.durability}"
+                + (f" epoch_ms={args.epoch_ms}" if args.epoch_ms is not None else ""))
         if args.wal_gib > 0:
-            log(f"WAL volume: {args.wal_gib}GiB io2 iops={args.wal_iops} "
-                f"on lineairdb (/dev/sdf, DeleteOnTermination=true)")
+            log(f"{'Data' if args.engine == 'innodb' else 'WAL'} volume: {args.wal_gib}GiB io2 "
+                f"iops={args.wal_iops} on {_wal_role(args)} (/dev/sdf, DeleteOnTermination=true)")
         else:
             log("WAL volume: none (root volume only)")
         log(f"mysqld extra args: {args.mysqld_extra_args!r}")

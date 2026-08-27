@@ -93,7 +93,10 @@
     _config_dir: ~/helios/bench/config
     # Interface whose ENA queue count bench_aws.py raises at launch
     ena_rss_interface: ens5
-    bench_analyze: false
+    mysql_engine: lineairdb
+    # InnoDB persistent stats are sampled, so a post-load ANALYZE refreshes them;
+    # Helios defaults to false and bench_aws.py turns it on for tx-prefetch
+    bench_analyze: "{{ mysql_engine == 'innodb' }}"
     run_id: "run"
     machine_spec: "unknown"
     load_result_dir: "{{ playbook_dir }}/result/{{ run_id }}/{{ machine_spec }}"
@@ -160,6 +163,18 @@
       run_once: true
       delegate_to: "{{ groups['benchbase'][0] }}"
       when: load_jstack | bool
+
+    - name: "Relax InnoDB durability for the load phase (InnoDB)"
+      # Both sysvars are dynamic and are restored once the load and ANALYZE below finish
+      when: mysql_engine == 'innodb'
+      shell: |
+        {{ _mysql_bin }} -u root --protocol=TCP \
+          -h {{ hostvars[groups['mysql'][0]].private_ip }} -P 3307 \
+          -e "SET GLOBAL innodb_flush_log_at_trx_commit=2; SET GLOBAL sync_binlog=0;"
+      args:
+        executable: /bin/bash
+      run_once: true
+      delegate_to: "{{ groups['benchbase'][0] }}"
 
     - name: "Load data via first MySQL ({{ bench_type | upper }}, SF={{ bench_scalefactor }})"
       shell: |
@@ -311,6 +326,51 @@
       loop: "{{ groups['mysql'] }}"
       loop_control:
         label: "{{ item }}"
+
+    - name: "Restore InnoDB durability after the load and ANALYZE (InnoDB)"
+      # Restore =1/=1, drop the load-phase binlogs with RESET MASTER and drain the
+      # dirty pages the load and ANALYZE left behind so the first sweep point does
+      # not overlap background flushing; a drain past bench_innodb_drain_timeout fails
+      when: mysql_engine == 'innodb'
+      shell: |
+        set -euo pipefail
+        M="$HOME/helios/build/runtime_output_directory/mysql -u root --protocol=TCP -h {{ hostvars[groups['mysql'][0]].private_ip }} -P 3307"
+        $M -e "SET GLOBAL innodb_flush_log_at_trx_commit=1; SET GLOBAL sync_binlog=1;"
+        [ "$($M -N -B -e "SELECT @@innodb_flush_log_at_trx_commit=1 AND @@sync_binlog=1")" = 1 ] || { echo "durability sysvars did not restore" >&2; exit 1; }
+        $M -e "RESET MASTER;"
+        dirty_q="SHOW GLOBAL STATUS LIKE 'Innodb_buffer_pool_pages_dirty';"
+        dirty_before=$($M -N -B -e "$dirty_q" | awk '{print $2}')
+        $M -e "SET GLOBAL innodb_max_dirty_pages_pct_lwm=0; SET GLOBAL innodb_max_dirty_pages_pct=0;"
+        # 1000 pages (16 MiB) is under a second of flushing at the io capacity set in mysql.yml
+        dirty=$dirty_before
+        for i in $(seq 1 {{ (bench_innodb_drain_timeout | default(1200) | int) // 5 }}); do
+          dirty=$($M -N -B -e "$dirty_q" | awk '{print $2}')
+          [ "$dirty" -le 1000 ] && break
+          sleep 5
+        done
+        $M -e "SET GLOBAL innodb_max_dirty_pages_pct=DEFAULT; SET GLOBAL innodb_max_dirty_pages_pct_lwm=DEFAULT;"
+        [ "$dirty" -le 1000 ] || { echo "DRAIN FAIL: $dirty dirty pages left after the timeout; the sweep would overlap background flushing" >&2; exit 1; }
+        {
+          echo "# BenchBase sets TRANSACTION_SERIALIZABLE per connection (bench/config/tpcc.xml); @@transaction_isolation below is the server default only"
+          $M -e "SELECT @@innodb_flush_log_at_trx_commit, @@sync_binlog, @@log_bin, @@transaction_isolation, @@innodb_flush_method, @@innodb_buffer_pool_size;"
+          $M -e "SET SESSION information_schema_stats_expiry=0; SELECT SUM(data_length + index_length) AS benchbase_bytes FROM information_schema.TABLES WHERE table_schema='benchbase';"
+          $M -e "SHOW GLOBAL VARIABLES LIKE 'innodb%';"
+          echo "dirty_pages_before_drain=$dirty_before dirty_pages_after_drain=$dirty"
+          $M -e "SHOW GLOBAL STATUS LIKE 'Innodb_buffer_pool_pages%';"
+        } > /tmp/innodb_load_state.txt
+      args:
+        executable: /bin/bash
+      run_once: true
+      delegate_to: "{{ groups['benchbase'][0] }}"
+
+    - name: Fetch the InnoDB load-phase durability state
+      when: mysql_engine == 'innodb'
+      run_once: true
+      delegate_to: "{{ groups['benchbase'][0] }}"
+      fetch:
+        src: /tmp/innodb_load_state.txt
+        dest: "{{ load_result_dir }}/logs/innodb_load_state.txt"
+        flat: yes
 
     - name: Set TPC-H optimizer settings on each MySQL
       when: bench_type == 'tpch'

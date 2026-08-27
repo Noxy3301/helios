@@ -61,6 +61,7 @@
         label: "{{ item }}"
 
     - name: "Toggle lineairdb_prefetch_execution on each MySQL (={{ 'ON' if bench_prefetch | bool else 'OFF' }})"
+      when: mysql_engine | default('lineairdb') != 'innodb'
       shell: |
         ~/helios/build/runtime_output_directory/mysql \
           -u root --protocol=TCP \
@@ -75,6 +76,7 @@
         label: "{{ item }}"
 
     - name: "Toggle lineairdb_stats_drift_refresh on each MySQL (={{ 'ON' if bench_ndv_drift | bool else 'OFF' }})"
+      when: mysql_engine | default('lineairdb') != 'innodb'
       shell: |
         ~/helios/build/runtime_output_directory/mysql \
           -u root --protocol=TCP \
