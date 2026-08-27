@@ -8,6 +8,10 @@
     ena_rss_interface: ens5
     helios_durability: volatile
     helios_epoch_ms: ""
+    # Extra KEY=VALUE pairs exported to the server (space separated)
+    helios_server_env: ""
+    # Path prefix for the WAL flush trace; empty disables it
+    helios_flush_trace: ""
     wal_volume: false
     wal_mount: /mnt/wal
   tasks:
@@ -66,6 +70,13 @@
         {% if helios_epoch_ms %}
         export LINEAIRDB_EPOCH_DURATION_MS="{{ helios_epoch_ms }}"
         {% endif %}
+        {% for kv in helios_server_env.split() %}
+        export '{{ kv }}'
+        {% endfor %}
+        {% if helios_flush_trace %}
+        mkdir -p "$(dirname {{ helios_flush_trace }})"
+        export LINEAIRDB_FLUSH_TRACE="{{ helios_flush_trace }}"
+        {% endif %}
         ./scripts/start_server.sh > /tmp/start_server.log 2>&1
         sleep 2
         # Bracketed: the pattern kill in stop_server.sh must not match this shell
@@ -88,6 +99,8 @@
         msg:
           - "LINEAIRDB_COMMIT_DURABILITY={{ helios_durability }}"
           - "LINEAIRDB_EPOCH_DURATION_MS={{ helios_epoch_ms if helios_epoch_ms else '(server default)' }}"
+          - "extra env: {{ helios_server_env if helios_server_env else '(none)' }}"
+          - "LINEAIRDB_FLUSH_TRACE={{ helios_flush_trace if helios_flush_trace else '(off)' }}"
 
     - name: Capture WAL volume disk usage
       when: wal_volume | bool

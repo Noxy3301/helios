@@ -82,7 +82,7 @@
       when: inventory_hostname in groups.get('lineairdb', [])
       shell: |
         mkdir -p {{ sample_dir }}
-        pid=$(pgrep -f '/build/server/lineairdb-server' | head -n1 || true)
+        pid=$(pgrep -f '[/]build/server/lineairdb-server' | head -n1 || true)
         if [ -z "$pid" ]; then
           echo "lineairdb-server not running" > {{ sample_dir }}/pidstat-server-{{ run_id }}.log
           exit 0
@@ -107,6 +107,16 @@
         mkdir -p {{ sample_dir }}
         nohup sar -n DEV {{ sample_interval }} > {{ sample_dir }}/sar-dev-{{ run_id }}.log 2>&1 &
         echo $! > {{ sample_dir }}/sar-dev-{{ run_id }}.pid
+      args:
+        executable: /bin/bash
+
+    - name: Start sar -d sampling (lineairdb)
+      # Block-device await/queue/throughput: the WAL volume's view of Sync
+      when: inventory_hostname in groups.get('lineairdb', [])
+      shell: |
+        mkdir -p {{ sample_dir }}
+        nohup sar -d -p {{ sample_interval }} > {{ sample_dir }}/sar-disk-{{ run_id }}.log 2>&1 &
+        echo $! > {{ sample_dir }}/sar-disk-{{ run_id }}.pid
       args:
         executable: /bin/bash
 
@@ -195,7 +205,7 @@
       when: inventory_hostname in groups.get('lineairdb', [])
       shell: |
         mkdir -p {{ sample_dir }}
-        pid=$(pgrep -f '/build/server/lineairdb-server' | head -n1 || true)
+        pid=$(pgrep -f '[/]build/server/lineairdb-server' | head -n1 || true)
         if [ -z "$pid" ]; then
           echo "lineairdb-server not running" > {{ sample_dir }}/pidstat-threads-{{ run_id }}.log
           exit 0
@@ -255,7 +265,7 @@
       when: (enable_perf | bool) and inventory_hostname in groups.get('lineairdb', []) and (perf_bin is defined and perf_bin != '')
       shell: |
         mkdir -p {{ sample_dir }}
-        pid=$(pgrep -f '/build/server/lineairdb-server' | head -n1 || true)
+        pid=$(pgrep -f '[/]build/server/lineairdb-server' | head -n1 || true)
         if [ -z "$pid" ]; then
           echo "lineairdb-server not running, skipping perf" > {{ sample_dir }}/perf-server-{{ run_id }}.log
           exit 0
@@ -452,6 +462,39 @@
         fi
       args:
         executable: /bin/bash
+
+    - name: Stop sar -d sampling (lineairdb)
+      when: inventory_hostname in groups.get('lineairdb', [])
+      shell: |
+        if [ -f {{ sample_dir }}/sar-disk-{{ run_id }}.pid ]; then
+          kill "$(cat {{ sample_dir }}/sar-disk-{{ run_id }}.pid)" || true
+        fi
+      args:
+        executable: /bin/bash
+
+    - name: Dump and pack the WAL flush trace (lineairdb)
+      # SIGUSR1 asks the server to write <prefix>_g<gen>_*.csv and finally
+      # <prefix>_meta.csv; wait for the manifest before packing. Only a server
+      # holding <prefix>.lock has the handler; SIGUSR1 kills any other process
+      when: inventory_hostname in groups.get('lineairdb', []) and (helios_flush_trace | default('')) != ''
+      shell: |
+        set -euo pipefail
+        prefix={{ helios_flush_trace }}
+        pid=$(cat /tmp/lineairdb_server.pid)
+        tr '\0' ' ' < /proc/$pid/cmdline | grep -q 'build/server/lineairdb-server' || { echo "pid $pid is not lineairdb-server" >&2; exit 1; }
+        grep -qxF -- "${prefix}.lock" < <(readlink /proc/$pid/fd/* 2>/dev/null) || { echo "server does not hold ${prefix}.lock: tracing inactive" >&2; exit 1; }
+        rm -f "${prefix}_meta.csv"
+        kill -USR1 "$pid"
+        for i in $(seq 1 90); do
+          [ -f "${prefix}_meta.csv" ] && break
+          sleep 2
+        done
+        [ -f "${prefix}_meta.csv" ] || { echo "flush trace manifest did not appear" >&2; exit 1; }
+        tar -C "$(dirname "$prefix")" -czf {{ sample_dir }}/flush-trace-{{ run_id }}.tgz $(cd "$(dirname "$prefix")" && ls "$(basename "$prefix")"_*.csv)
+      args:
+        executable: /bin/bash
+      # A missing trace must not cost the rest of the storage node's logs
+      ignore_errors: true
 
     - name: Stop sar -n SOFT sampling (lineairdb)
       when: inventory_hostname in groups.get('lineairdb', [])
@@ -699,6 +742,22 @@
         src: "{{ sample_dir }}/sar-dev-{{ run_id }}.log"
         dest: "{{ result_dir }}/lineairdb/{{ inventory_hostname }}/"
         flat: yes
+
+    - name: Fetch server sar -d logs
+      when: inventory_hostname in groups.get('lineairdb', [])
+      fetch:
+        src: "{{ sample_dir }}/sar-disk-{{ run_id }}.log"
+        dest: "{{ result_dir }}/lineairdb/{{ inventory_hostname }}/"
+        flat: yes
+      failed_when: false
+
+    - name: Fetch the WAL flush trace
+      when: inventory_hostname in groups.get('lineairdb', []) and (helios_flush_trace | default('')) != ''
+      fetch:
+        src: "{{ sample_dir }}/flush-trace-{{ run_id }}.tgz"
+        dest: "{{ result_dir }}/lineairdb/{{ inventory_hostname }}/"
+        flat: yes
+      failed_when: false
 
     - name: Fetch server sar -n SOFT logs
       when: inventory_hostname in groups.get('lineairdb', [])

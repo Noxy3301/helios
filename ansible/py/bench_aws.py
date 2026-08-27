@@ -75,6 +75,9 @@ AWS_DEFAULTS = {
 # cleanup covers a partially launched cluster.
 LAUNCHED = {"instances": [], "spot_requests": []}
 
+# Flush trace files live on the WAL volume
+FLUSH_TRACE_PREFIX = "/mnt/wal/flush_trace/ft"
+
 # vCPU count for EC2 instance sizes (used to build machine_spec locally)
 _VCPU_BY_SIZE = {
     "medium": 1, "large": 2, "xlarge": 4, "2xlarge": 8, "4xlarge": 16, "8xlarge": 32,
@@ -411,6 +414,10 @@ def deploy_infrastructure(args, bundle_path, bundle_sha256):
     lineairdb_vars = {"helios_durability": args.durability, "wal_volume": args.wal_gib > 0}
     if args.epoch_ms is not None:
         lineairdb_vars["helios_epoch_ms"] = args.epoch_ms
+    if args.server_env:
+        lineairdb_vars["helios_server_env"] = args.server_env
+    if args.flush_trace:
+        lineairdb_vars["helios_flush_trace"] = FLUSH_TRACE_PREFIX
     mysql_vars = {"mysqld_extra_args": args.mysqld_extra_args}
     if innodb:
         mysql_vars.update({"mysql_engine": "innodb", "wal_volume": args.wal_gib > 0,
@@ -515,6 +522,8 @@ def run_benchmarks(args, run_id):
         exec_vars += " enable_perf=true"
     if args.perf_stat:
         exec_vars += " perf_stat=true"
+    if args.flush_trace:
+        exec_vars += f" helios_flush_trace={FLUSH_TRACE_PREFIX}"
 
     log(f"Running benchmark: {exec_vars}")
     run_playbook("measure_usage.yml", extra_vars=exec_vars)
@@ -729,6 +738,11 @@ Examples:
     parser.add_argument("--wal-iops", type=int, default=12000, help="IOPS for the io2 WAL volume")
     parser.add_argument("--mysqld-extra-args", default="--performance-schema=OFF",
                         help="Extra mysqld options, passed through MYSQLD_EXTRA_ARGS")
+    parser.add_argument("--server-env", default="",
+                        help="Extra KEY=VALUE pairs (space separated) exported to the storage server")
+    parser.add_argument("--flush-trace", action="store_true",
+                        help="Record the storage server's WAL flush trace on the WAL volume and fetch it "
+                             "after the sweep (needs --wal-gib)")
 
     # AWS options
     parser.add_argument("--region", default=AWS_DEFAULTS["region"])
@@ -780,18 +794,25 @@ Examples:
         parser.error("--wal-gib must be 0 (no volume) or a positive size")
     if not re.fullmatch(r"[A-Za-z0-9_=./:,+ -]*", args.mysqld_extra_args):
         parser.error("--mysqld-extra-args accepts only letters, digits, space and _ = . / : , + -")
+    for kv in args.server_env.split():
+        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=[A-Za-z0-9_./:,+-]*", kv):
+            parser.error(f"--server-env entry {kv!r} is not NAME=VALUE with NAME a shell identifier "
+                         "and VALUE made of letters, digits and _ . / : , + -")
     if args.engine == "innodb":
         if args.mysql_count is not None and args.mysql_count != 1:
             parser.error("--engine innodb runs a single MySQL/InnoDB node; --mysql-count must be 1")
         if args.bench_prefetch or args.bench_prefetch_stmt or args.bench_ndv_drift:
             parser.error("--engine innodb has no LineairDB sysvars; "
                          "--bench-prefetch, --bench-prefetch-stmt and --bench-ndv-drift are not supported")
-        if args.durability != "volatile" or args.epoch_ms is not None:
-            parser.error("--durability/--epoch-ms configure the LineairDB server; not valid with --engine innodb")
+        if args.durability != "volatile" or args.epoch_ms is not None or args.server_env or args.flush_trace:
+            parser.error("--durability/--epoch-ms/--server-env/--flush-trace configure the LineairDB server; "
+                         "not valid with --engine innodb")
         if args.lineairdb_instance_type is not None:
             parser.error("--lineairdb-instance-type is meaningless with --engine innodb")
         if args.wal_gib <= 0:
             parser.error("--engine innodb needs --wal-gib > 0: the datadir must live on the io2 volume")
+    if args.flush_trace and args.wal_gib <= 0:
+        parser.error("--flush-trace needs --wal-gib > 0 (the trace is written on the WAL volume)")
     if args.engine != "innodb" and args.innodb_buffer_pool_gib is not None:
         parser.error("--innodb-buffer-pool-gib is only valid with --engine innodb")
     if args.innodb_buffer_pool_gib is not None and args.innodb_buffer_pool_gib < 1:
@@ -835,6 +856,8 @@ Examples:
         run_id += f"-{args.durability}"
     if args.epoch_ms is not None:
         run_id += f"-e{args.epoch_ms}"
+    if args.flush_trace:
+        run_id += "-ft"
     if args.engine == "innodb":
         run_id += "-innodb"
     log_dir = ANSIBLE_DIR / "result" / run_id / machine_spec / "logs"
