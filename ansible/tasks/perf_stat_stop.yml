@@ -1,0 +1,16 @@
+---
+# Stop the perf stat counter started by tasks/perf_stat_start.yml.
+# SIGINT (not SIGKILL) so perf flushes its final interval line.
+# Caller sets: perf_stat_dir, perf_stat_label.
+- name: "perf stat ({{ perf_stat_label }}): stop counters"
+  shell: |
+    f={{ perf_stat_dir }}/perfstat-{{ perf_stat_label }}.pid
+    if [ -f "$f" ]; then
+      kill -INT "$(cat "$f")" 2>/dev/null || true
+      sleep 1
+      kill -0 "$(cat "$f")" 2>/dev/null && kill "$(cat "$f")" 2>/dev/null || true
+    fi
+    exit 0
+  args:
+    executable: /bin/bash
+  failed_when: false

@@ -1,54 +1,169 @@
 ---
+# Start mysqld + LineairDB proxy plugin from the pushed bundle
+# (push_bundle.yml runs first; no repository or build step on the node).
+#
+# mysql_engine == 'innodb' switches this node to a stock MySQL/InnoDB
+# baseline (no storage server, no proxy plugin) for comparison runs.
 - hosts: mysql
   gather_facts: false
+  vars:
+    mysqld_extra_args: ""
+    ena_rss_interface: ens5
+    mysql_engine: lineairdb
+    wal_volume: false
+    wal_mount: /mnt/wal
+    wal_iops: 12000
+    innodb_buffer_pool_gib: ""   # empty: 75% of MemTotal
   tasks:
-    - name: Sync helios repo + submodules
-      shell: |
-        set -euo pipefail
-        cd ~/helios
-        ./scripts/stop_mysql.sh || true
-        git fetch origin
-        git checkout {{ helios_branch | default('main') }}
-        git pull --ff-only
-        git submodule update --init --recursive
-        echo "=== SHAs ==="
-        echo "Helios($(git rev-parse --abbrev-ref HEAD)@$(git rev-parse --short HEAD))"
-        echo "LineairDB($(cd third_party/LineairDB && git rev-parse --abbrev-ref HEAD)@$(cd third_party/LineairDB && git rev-parse --short HEAD))"
-        echo "mysql-server($(cd third_party/mysql-server && git rev-parse --abbrev-ref HEAD)@$(cd third_party/mysql-server && git rev-parse --short HEAD))"
-        echo "benchbase($(cd third_party/benchbase && git rev-parse --abbrev-ref HEAD)@$(cd third_party/benchbase && git rev-parse --short HEAD))"
-      args:
-        executable: /bin/bash
-      register: sync_result
+    # Before any traffic; the play itself runs unprivileged
+    - import_tasks: tasks/ena_queue_tuning.yml
+      become: true
+      tags: [privileged]
 
-    - name: Show repo / submodule SHAs
-      debug:
-        var: sync_result.stdout_lines
+    - import_tasks: tasks/mount_data_volume.yml
+      when: mysql_engine == 'innodb'
+      become: true
+      tags: [privileged]
+      vars:
+        data_mount: "{{ wal_mount }}"
+        data_volume: "{{ wal_volume }}"
 
-    - name: Build server + proxy
-      shell: |
-        set -euo pipefail
-        cd ~/helios
-        ./scripts/build_partial.sh 2>&1 | tail -40
-      args:
-        executable: /bin/bash
-      register: build_result
-
-    - name: Show build tail
-      debug:
-        var: build_result.stdout_lines
+    - name: Wait for the LineairDB server port
+      # Bundle deploys start the roles in parallel, so mysqld must wait for the
+      # server's listen socket.
+      when: mysql_engine != 'innodb'
+      wait_for:
+        host: "{{ hostvars['lineairdb-1'].private_ip }}"
+        port: 9999
+        timeout: 600
 
     - name: Start MySQL with LineairDB-Proxy
+      # Never pipe the start scripts to a pager/tail; log to a file and
+      # verify the listener explicitly.
+      when: mysql_engine != 'innodb'
       shell: |
         set -euo pipefail
         cd ~/helios
-        ./scripts/start_mysql.sh \
+        ./scripts/stop_mysql.sh > /dev/null 2>&1 || true
+        sleep 1
+        export MYSQLD_EXTRA_ARGS="{{ mysqld_extra_args }}"
+        timeout -k 10 900 ./scripts/start_mysql.sh \
           --mysqld-port 3307 \
           --server-host {{ hostvars['lineairdb-1'].private_ip }} \
-          --server-port 9999
+          --server-port 9999 > /tmp/start_mysql.log 2>&1 || {
+            echo "start_mysql.sh failed:"; tail -40 /tmp/start_mysql.log; exit 1; }
+        for i in $(seq 1 30); do
+          if timeout 2 bash -c "</dev/tcp/127.0.0.1/3307" 2>/dev/null; then
+            echo "mysqld listening on 3307"; exit 0
+          fi
+          sleep 2
+        done
+        echo "mysqld never listened on 3307:"; tail -40 /tmp/start_mysql.log
+        exit 1
       args:
         executable: /bin/bash
 
+    - name: Start MySQL with InnoDB
+      # Direct mysqld start rather than start_mysql.sh, which installs the LineairDB
+      # plugin: the same option set plus binlog and InnoDB commit durability
+      # (benchbase.yml relaxes both until the load and ANALYZE finish)
+      when: mysql_engine == 'innodb'
+      shell: |
+        set -euo pipefail
+        cd ~/helios
+        ./scripts/stop_mysql.sh > /dev/null 2>&1 || true
+        sleep 1
+        source ~/helios/env.sh
+        JEMALLOC=/lib/x86_64-linux-gnu/libjemalloc.so.2
+        [ -f "$JEMALLOC" ] || { echo "jemalloc not found at $JEMALLOC"; exit 1; }
+        export LD_PRELOAD="$JEMALLOC"
+        read -r -a MYSQLD_EXTRA <<< "{{ mysqld_extra_args }}"
+        {% if wal_volume | bool %}
+        DATA={{ wal_mount }}/mysql-innodb-data
+        {% else %}
+        DATA=$HOME/mysql-innodb-data
+        {% endif %}
+        rm -rf "$DATA"
+        BIN=~/helios/build/runtime_output_directory
+        "$BIN/mysqld" --initialize-insecure --user=$USER --datadir="$DATA"
+        {% if innodb_buffer_pool_gib %}
+        BP_GIB={{ innodb_buffer_pool_gib }}
+        {% else %}
+        BP_GIB=$(awk '/MemTotal/{printf "%d", ($2/1024/1024)*0.75}' /proc/meminfo)
+        {% endif %}
+        # 8G redo keeps checkpoint age from stalling the sweep; io capacity follows the volume IOPS
+        nohup "$BIN/mysqld" --datadir="$DATA" --socket=/tmp/mysql.sock --port=3307 \
+          --pid-file=/tmp/mysql.pid \
+          --default-storage-engine=innodb --max-connections=16384 \
+          --open-files-limit=65535 --table-open-cache=8192 --skip-name-resolve \
+          --log-bin=binlog --server-id=1 --sync-binlog=1 --innodb-flush-log-at-trx-commit=1 \
+          --innodb-buffer-pool-size=${BP_GIB}G --innodb-redo-log-capacity=8G \
+          --innodb-io-capacity={{ (wal_iops | int) // 2 }} --innodb-io-capacity-max={{ wal_iops }} \
+          "${MYSQLD_EXTRA[@]}" > /tmp/start_mysql.log 2>&1 &
+        for i in $(seq 1 120); do
+          "$BIN/mysqladmin" ping -u root --socket=/tmp/mysql.sock >/dev/null 2>&1 && break
+          sleep 1
+        done
+        "$BIN/mysqladmin" ping -u root --socket=/tmp/mysql.sock >/dev/null 2>&1 || {
+          echo "mysqld never became ready:"; tail -60 /tmp/start_mysql.log; exit 1; }
+        # --skip-name-resolve makes TCP clients match accounts by IP literal only;
+        # 'root'@'localhost' stays socket-only, so create loopback root accounts
+        # (mirrors scripts/start_mysql.sh)
+        "$BIN/mysql" -u root --socket=/tmp/mysql.sock \
+          -e "CREATE USER IF NOT EXISTS 'root'@'127.0.0.1' IDENTIFIED WITH mysql_native_password BY '';
+              GRANT ALL PRIVILEGES ON *.* TO 'root'@'127.0.0.1' WITH GRANT OPTION;
+              CREATE USER IF NOT EXISTS 'root'@'::1' IDENTIFIED WITH mysql_native_password BY '';
+              GRANT ALL PRIVILEGES ON *.* TO 'root'@'::1' WITH GRANT OPTION;
+              FLUSH PRIVILEGES;"
+        echo "mysqld (InnoDB) up, pid=$(cat /tmp/mysql.pid), datadir=$DATA"
+      args:
+        executable: /bin/bash
+
+    - name: "Gate: mysqld linked jemalloc (InnoDB)"
+      when: mysql_engine == 'innodb'
+      shell: grep -q jemalloc /proc/$(cat /tmp/mysql.pid)/maps
+      args:
+        executable: /bin/bash
+      changed_when: false
+
+    - name: "Gate: InnoDB durability sysvars"
+      when: mysql_engine == 'innodb'
+      shell: |
+        ~/helios/build/runtime_output_directory/mysql \
+          -u root --protocol=TCP -h 127.0.0.1 -P 3307 -N -B \
+          -e "SELECT @@default_storage_engine='InnoDB' AND @@log_bin=1 AND @@sync_binlog=1 AND @@innodb_flush_log_at_trx_commit=1"
+      args:
+        executable: /bin/bash
+      register: innodb_durability_check
+      changed_when: false
+
+    - name: Assert InnoDB durability sysvars
+      when: mysql_engine == 'innodb'
+      assert:
+        that:
+          - innodb_durability_check.stdout | trim == '1'
+        fail_msg: "InnoDB durability sysvars not as expected: {{ innodb_durability_check.stdout }}"
+
+    - name: Capture InnoDB configuration
+      when: mysql_engine == 'innodb'
+      shell: |
+        ~/helios/build/runtime_output_directory/mysql \
+          -u root --protocol=TCP -h 127.0.0.1 -P 3307 \
+          -e "SELECT @@version, @@innodb_buffer_pool_size, @@performance_schema, @@datadir"
+      args:
+        executable: /bin/bash
+      register: innodb_config
+      changed_when: false
+
+    - name: Show InnoDB configuration
+      when: mysql_engine == 'innodb'
+      debug:
+        var: innodb_config.stdout_lines
+
     - name: apply bench/setup.sql
+      # Installs the LineairDB plugin; InnoDB has no such plugin, and the
+      # benchbase database is (re)created by benchbase.yml regardless
+      when: mysql_engine != 'innodb'
       shell: |
         set -euo pipefail
         ~/helios/build/runtime_output_directory/mysql \
@@ -57,17 +172,12 @@
       args:
         executable: /bin/bash
 
-    # Note: BenchBase connects directly to each MySQL for setup to avoid DDL sync issues via HAProxy.
-    - name: Create HAProxy and BenchBase access users
+    - name: Create BenchBase access users
       shell: |
         set -euo pipefail
         ~/helios/build/runtime_output_directory/mysql \
           -u root --protocol=TCP -h 127.0.0.1 -P 3307 \
-          -e "CREATE USER IF NOT EXISTS 'haproxy_check'@'%' IDENTIFIED WITH mysql_native_password BY '';
-              GRANT USAGE ON *.* TO 'haproxy_check'@'%';
-              CREATE USER IF NOT EXISTS 'root'@'{{ hostvars['haproxy-1'].private_ip }}' IDENTIFIED WITH mysql_native_password BY '';
-              GRANT ALL PRIVILEGES ON *.* TO 'root'@'{{ hostvars['haproxy-1'].private_ip }}' WITH GRANT OPTION;
-              {% for b in groups['benchbase'] | default([]) %}
+          -e "{% for b in groups['benchbase'] | default([]) %}
               CREATE USER IF NOT EXISTS 'root'@'{{ hostvars[b].private_ip }}' IDENTIFIED WITH mysql_native_password BY '';
               GRANT ALL PRIVILEGES ON *.* TO 'root'@'{{ hostvars[b].private_ip }}' WITH GRANT OPTION;
               {% endfor %}

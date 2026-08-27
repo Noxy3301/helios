@@ -10,6 +10,22 @@
   set_fact:
     bench_start_epoch: "{{ (lookup('pipe', 'date +%s') | int) + (bench_sync_buffer | int) }}"
 
+- name: Compute the JDBC URL for every MySQL node
+  # Single node keeps the plain scheme; N>1 switches to BenchBase's
+  # loadbalance scheme (mirrors bench/bin/benchrun.py's multi-endpoint path).
+  set_fact:
+    _jdbc_url: >-
+      {%- if groups['mysql'] | length > 1 -%}
+      jdbc:mysql:loadbalance://{% for h in groups['mysql'] %}{{ hostvars[h].private_ip }}:3307{% if not loop.last %},{% endif %}{% endfor %}/
+      {%- else -%}
+      jdbc:mysql://{{ hostvars[groups['mysql'][0]].private_ip }}:3307/
+      {%- endif -%}
+
+- name: Show rendered JDBC URL
+  run_once: true
+  debug:
+    var: _jdbc_url
+
 - name: "Execute {{ bench_type | upper }} (terminals={{ bench_term }})"
   shell: |
     {% if bench_sync | bool %}
@@ -21,8 +37,8 @@
     CFG=$(mktemp /tmp/bb-exec-XXXXX.xml)
     cp ~/helios/bench/config/{{ bench_type }}.xml "$CFG"
 
-    # JDBC URL -> HAProxy
-    sed -i 's|localhost:3307|{{ haproxy_host }}:{{ haproxy_port }}|g' "$CFG"
+    # JDBC URL -> every MySQL directly (loadbalance scheme for N>1)
+    sed -i 's|jdbc:mysql://localhost:3307/|{{ _jdbc_url }}|g' "$CFG"
 
     # Scale factor and terminals
     sed -i 's|<scalefactor>[^<]*</scalefactor>|<scalefactor>{{ bench_scalefactor }}</scalefactor>|' "$CFG"
@@ -50,10 +66,11 @@
     dest="$out_dir/execute_{{ bench_term }}"
     mkdir -p "$dest"
     java_status=0
-    {% if bench_prefetch | default(false) | bool %}
+    {% if (bench_prefetch | default(false) | bool) and (bench_prefetch_plan | default(true) | bool) %}
     export HELIOS_PREFETCH_PLAN=1
     {% endif %}
-    output=$(java -jar benchbase.jar -b {{ bench_type }} -c "$CFG" \
+    output=$(timeout -k 30 -s INT $(( {{ bench_time | default(60) }} + 300 )) \
+      java -jar benchbase.jar -b {{ bench_type }} -c "$CFG" \
       --create=false --load=false --execute=true 2>&1) || java_status=$?
     printf '%s\n' "$output" > "$dest/benchbase.out"
     echo "benchbase_exit_status=$java_status" > "$dest/benchbase.status"
@@ -64,20 +81,32 @@
     throughput=$(echo "$line" | sed -n 's/.*= \([0-9.]*\) requests\/sec (throughput).*/\1/p')
     goodput=$(echo "$line" | sed -n 's/.*, \([0-9.]*\) requests\/sec (goodput).*/\1/p')
 
-    if [ -n "$throughput" ]; then
-      if [ "$java_status" -ne 0 ]; then
-        echo "BenchBase exit status: $java_status" >&2
-        echo "$output" | tail -80 >&2
-      fi
-      echo "{{ bench_term }},$throughput,$goodput"
-    else
-      echo "PARSE_ERROR: could not extract throughput" >&2
+    # Hard gates: a nonzero java exit or a zero-throughput window is a failed
+    # measurement, never a green data point (silent zeros and timeouts both
+    # land here).
+    if [ -z "$throughput" ]; then
+      echo "PARSE_ERROR: could not extract throughput (java_status=$java_status)" >&2
       echo "$output" | tail -30 >&2
       exit 1
     fi
+    if [ "$java_status" -ne 0 ]; then
+      echo "GATE_FAIL: BenchBase exit status $java_status (timeout or crash)" >&2
+      echo "$output" | tail -80 >&2
+      exit 1
+    fi
+    if ! awk -v t="$throughput" 'BEGIN { exit !(t + 0 > 0) }'; then
+      echo "GATE_FAIL: zero throughput ($throughput req/s) — invalid point" >&2
+      echo "$output" | tail -80 >&2
+      exit 1
+    fi
+    echo "{{ bench_term }},$throughput,$goodput"
   args:
     executable: /bin/bash
   register: run_summary
+  # Gates are enforced by the "Gate verdict" task below, AFTER this point's
+  # artifacts are persisted to the controller — a failed point must not cost
+  # the artifacts of any point, including its own.
+  failed_when: false
 
 - name: "Capture bench log (terminals={{ bench_term }})"
   shell: |
@@ -88,7 +117,7 @@
     if [ -d "$bb_results" ]; then
       # Copy latest result files (csv, json, xml) and remove originals to avoid mixing with next run
       for f in "$bb_results"/*.{csv,json,xml}; do
-        [ -f "$f" ] && mv "$f" "$dest/"
+        [ -f "$f" ] && mv "$f" "$dest/" || true
       done
     fi
   args:
@@ -97,3 +126,35 @@
 - name: "Append summary (terminals={{ bench_term }})"
   set_fact:
     run_summaries: "{{ (run_summaries | default([])) + [run_summary | combine({'item': bench_term})] }}"
+
+# ---- Per-point persistence (survives any later failure + cluster teardown) ----
+- name: "Persist throughput row incrementally (terminals={{ bench_term }})"
+  delegate_to: localhost
+  shell: |
+    mkdir -p "{{ result_dir }}/throughput"
+    echo "{{ inventory_hostname }},{{ run_summary.stdout_lines | last }}" \
+      >> "{{ result_dir }}/throughput/throughput_incremental.csv"
+  args:
+    executable: /bin/bash
+  when: run_summary.rc == 0
+
+- name: "Pack point artifacts (terminals={{ bench_term }})"
+  shell: |
+    out_dir="{{ sample_dir | default('/tmp/metrics') }}/bench-{{ run_id | default('run') }}"
+    tar -C "$out_dir" -czf "/tmp/point_{{ bench_term }}.tgz" "execute_{{ bench_term }}"
+  args:
+    executable: /bin/bash
+  failed_when: false
+
+- name: "Fetch point artifacts to controller (terminals={{ bench_term }})"
+  fetch:
+    src: "/tmp/point_{{ bench_term }}.tgz"
+    dest: "{{ result_dir }}/points/{{ inventory_hostname }}-point_{{ bench_term }}.tgz"
+    flat: yes
+
+- name: "Gate verdict (terminals={{ bench_term }})"
+  fail:
+    msg: >-
+      Point terminals={{ bench_term }} failed gates (rc={{ run_summary.rc }}).
+      Its artifacts are already fetched under {{ result_dir }}/points/.
+  when: run_summary.rc != 0

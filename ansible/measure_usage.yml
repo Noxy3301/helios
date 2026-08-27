@@ -1,6 +1,6 @@
 ---
 # CPU sampling wrapper: run BenchBase and capture CPU usage from all nodes.
-- hosts: lineairdb:mysql:haproxy:benchbase
+- hosts: lineairdb:mysql:benchbase
   gather_facts: false
   vars:
     sample_interval: 1
@@ -8,14 +8,16 @@
     interrupt_interval: 5
     run_id: "run"
     sample_dir: /tmp/metrics
-    haproxy_stats_interval: 5
     enable_perf: false
     perf_freq: 99
-    haproxy_stats_auth: "admin:password"
-    haproxy_host: "{{ (groups.get('haproxy', []) | length > 0) | ternary(groups['haproxy'][0], '') }}"
+    # perf COUNTING mode (IPC / LLC), distinct from enable_perf's perf record.
+    # Default false so the sweep path is behaviourally identical when unused.
+    perf_stat: false
+    perf_stat_interval_ms: 10000
   tasks:
     - name: Ensure sysstat installed
       become: yes
+      tags: [privileged]
       apt:
         name: sysstat
         state: present
@@ -33,7 +35,7 @@
     - name: Build machine spec string (for metadata)
       set_fact:
         machine_spec: >-
-          {%- set roles = ['lineairdb', 'mysql', 'haproxy', 'benchbase'] -%}
+          {%- set roles = ['lineairdb', 'mysql', 'benchbase'] -%}
           {%- set parts = [] -%}
           {%- for role in roles -%}
             {%- set hosts = groups.get(role, []) -%}
@@ -50,6 +52,14 @@
       set_fact:
         result_dir: "{{ playbook_dir }}/result/{{ run_id }}/{{ machine_spec }}"
 
+    - name: Ensure the result directory exists on the controller
+      # copy cannot create parent directories
+      run_once: true
+      delegate_to: localhost
+      file:
+        path: "{{ result_dir }}"
+        state: directory
+
     - name: Write run metadata
       run_once: true
       delegate_to: localhost
@@ -61,18 +71,6 @@
           timestamp={{ lookup('pipe', 'date -Iseconds') }}
 
     - name: Start mpstat sampling
-      when: inventory_hostname not in groups.get('haproxy', [])
-      shell: |
-        mkdir -p {{ sample_dir }}
-        nohup mpstat -P ALL {{ sample_interval }} > {{ sample_dir }}/cpu-{{ run_id }}.log 2>&1 &
-        echo $! > {{ sample_dir }}/cpu-{{ run_id }}.pid
-      args:
-        executable: /bin/bash
-
-    - name: Start mpstat sampling (haproxy)
-      when: haproxy_host != ''
-      run_once: true
-      delegate_to: "{{ haproxy_host }}"
       shell: |
         mkdir -p {{ sample_dir }}
         nohup mpstat -P ALL {{ sample_interval }} > {{ sample_dir }}/cpu-{{ run_id }}.log 2>&1 &
@@ -84,7 +82,7 @@
       when: inventory_hostname in groups.get('lineairdb', [])
       shell: |
         mkdir -p {{ sample_dir }}
-        pid=$(pgrep -f '/build/server/lineairdb-server' | head -n1 || true)
+        pid=$(pgrep -f '[/]build/server/lineairdb-server' | head -n1 || true)
         if [ -z "$pid" ]; then
           echo "lineairdb-server not running" > {{ sample_dir }}/pidstat-server-{{ run_id }}.log
           exit 0
@@ -109,6 +107,16 @@
         mkdir -p {{ sample_dir }}
         nohup sar -n DEV {{ sample_interval }} > {{ sample_dir }}/sar-dev-{{ run_id }}.log 2>&1 &
         echo $! > {{ sample_dir }}/sar-dev-{{ run_id }}.pid
+      args:
+        executable: /bin/bash
+
+    - name: Start sar -d sampling (lineairdb)
+      # Block-device await/queue/throughput: the WAL volume's view of Sync
+      when: inventory_hostname in groups.get('lineairdb', [])
+      shell: |
+        mkdir -p {{ sample_dir }}
+        nohup sar -d -p {{ sample_interval }} > {{ sample_dir }}/sar-disk-{{ run_id }}.log 2>&1 &
+        echo $! > {{ sample_dir }}/sar-disk-{{ run_id }}.pid
       args:
         executable: /bin/bash
 
@@ -162,29 +170,11 @@
       args:
         executable: /bin/bash
 
-    - name: Start HAProxy stats sampling
-      when: haproxy_host != ''
-      run_once: true
-      delegate_to: "{{ haproxy_host }}"
-      shell: |
-        mkdir -p {{ sample_dir }}
-        nohup bash -c '
-        while true; do
-          ts=$(date +%s)
-          echo "# ts=$ts"
-          curl -s -u {{ haproxy_stats_auth }} "http://127.0.0.1:8404/stats;csv"
-          echo
-          sleep {{ haproxy_stats_interval }}
-        done' > {{ sample_dir }}/haproxy-{{ run_id }}.csv 2>&1 &
-        echo $! > {{ sample_dir }}/haproxy-{{ run_id }}.pid
-      args:
-        executable: /bin/bash
-
     - name: Start mysqld pidstat sampling (mysql)
       when: inventory_hostname in groups.get('mysql', [])
       shell: |
         mkdir -p {{ sample_dir }}
-        pid=$(pgrep -f 'mysqld.*lineairdb' | head -n1 || true)
+        pid=$(pgrep -f '[r]untime_output_directory/mysqld' | head -n1 || true)
         if [ -z "$pid" ]; then
           echo "mysqld not running" > {{ sample_dir }}/pidstat-mysql-{{ run_id }}.log
           exit 0
@@ -215,7 +205,7 @@
       when: inventory_hostname in groups.get('lineairdb', [])
       shell: |
         mkdir -p {{ sample_dir }}
-        pid=$(pgrep -f '/build/server/lineairdb-server' | head -n1 || true)
+        pid=$(pgrep -f '[/]build/server/lineairdb-server' | head -n1 || true)
         if [ -z "$pid" ]; then
           echo "lineairdb-server not running" > {{ sample_dir }}/pidstat-threads-{{ run_id }}.log
           exit 0
@@ -233,9 +223,19 @@
       args:
         executable: /bin/bash
 
+    # IPC / LLC counters for the SWEEP phase, query + storage nodes only
+    - include_tasks: tasks/perf_stat_start.yml
+      vars:
+        perf_stat_dir: "{{ sample_dir }}"
+        perf_stat_label: sweep
+      when:
+        - perf_stat | bool
+        - inventory_hostname in groups.get('lineairdb', []) + groups.get('mysql', [])
+
     - name: Install perf and configure sysctl (lineairdb + mysql)
       when: (enable_perf | bool) and (inventory_hostname in groups.get('lineairdb', []) + groups.get('mysql', []))
       become: yes
+      tags: [privileged]
       shell: |
         apt-get install -y -qq linux-tools-aws 2>/dev/null || true
         sysctl -w kernel.perf_event_paranoid=0
@@ -265,7 +265,7 @@
       when: (enable_perf | bool) and inventory_hostname in groups.get('lineairdb', []) and (perf_bin is defined and perf_bin != '')
       shell: |
         mkdir -p {{ sample_dir }}
-        pid=$(pgrep -f '/build/server/lineairdb-server' | head -n1 || true)
+        pid=$(pgrep -f '[/]build/server/lineairdb-server' | head -n1 || true)
         if [ -z "$pid" ]; then
           echo "lineairdb-server not running, skipping perf" > {{ sample_dir }}/perf-server-{{ run_id }}.log
           exit 0
@@ -281,7 +281,7 @@
       when: (enable_perf | bool) and inventory_hostname in groups.get('mysql', []) and (perf_bin is defined and perf_bin != '')
       shell: |
         mkdir -p {{ sample_dir }}
-        pid=$(pgrep -f 'mysqld.*lineairdb' | head -n1 || true)
+        pid=$(pgrep -f '[r]untime_output_directory/mysqld' | head -n1 || true)
         if [ -z "$pid" ]; then
           echo "mysqld not running, skipping perf" > {{ sample_dir }}/perf-proxy-{{ run_id }}.log
           exit 0
@@ -336,15 +336,32 @@
         executable: /bin/bash
       failed_when: false
 
+    - name: Capture MySQL status snapshot BEFORE benchmark (pre)
+      # Com_commit post-pre per node is the per-endpoint load-balance evidence
+      shell: |
+        ~/helios/build/runtime_output_directory/mysql \
+          -u root --protocol=TCP -h 127.0.0.1 -P 3307 \
+          -e "SHOW GLOBAL STATUS" > {{ sample_dir }}/mysql-status-pre-{{ run_id }}.txt
+      args:
+        executable: /bin/bash
+      failed_when: false
+
+    - name: Fetch MySQL status snapshot (pre)
+      fetch:
+        src: "{{ sample_dir }}/mysql-status-pre-{{ run_id }}.txt"
+        dest: "{{ result_dir }}/mysql/{{ inventory_hostname }}/"
+        flat: yes
+      failed_when: false
+
 - import_playbook: measure.yml
 
-- hosts: lineairdb:mysql:haproxy:benchbase
+- hosts: lineairdb:mysql:benchbase
   gather_facts: false
   vars:
     run_id: "run"
     sample_dir: /tmp/metrics
     enable_perf: false
-    haproxy_host: "{{ (groups.get('haproxy', []) | length > 0) | ternary(groups['haproxy'][0], '') }}"
+    perf_stat: false
   tasks:
     # Stop perf FIRST (before any other cleanup) to ensure the target
     # process is still alive when perf flushes its data.
@@ -404,7 +421,6 @@
       failed_when: false
 
     - name: Stop mpstat sampling
-      when: inventory_hostname not in groups.get('haproxy', [])
       shell: |
         if [ -f {{ sample_dir }}/cpu-{{ run_id }}.pid ]; then
           kill "$(cat {{ sample_dir }}/cpu-{{ run_id }}.pid)" || true
@@ -412,16 +428,13 @@
       args:
         executable: /bin/bash
 
-    - name: Stop mpstat sampling (haproxy)
-      when: haproxy_host != ''
-      run_once: true
-      delegate_to: "{{ haproxy_host }}"
-      shell: |
-        if [ -f {{ sample_dir }}/cpu-{{ run_id }}.pid ]; then
-          kill "$(cat {{ sample_dir }}/cpu-{{ run_id }}.pid)" || true
-        fi
-      args:
-        executable: /bin/bash
+    - include_tasks: tasks/perf_stat_stop.yml
+      vars:
+        perf_stat_dir: "{{ sample_dir }}"
+        perf_stat_label: sweep
+      when:
+        - perf_stat | bool
+        - inventory_hostname in groups.get('lineairdb', []) + groups.get('mysql', [])
 
     - name: Stop server pidstat sampling (lineairdb)
       when: inventory_hostname in groups.get('lineairdb', [])
@@ -449,6 +462,39 @@
         fi
       args:
         executable: /bin/bash
+
+    - name: Stop sar -d sampling (lineairdb)
+      when: inventory_hostname in groups.get('lineairdb', [])
+      shell: |
+        if [ -f {{ sample_dir }}/sar-disk-{{ run_id }}.pid ]; then
+          kill "$(cat {{ sample_dir }}/sar-disk-{{ run_id }}.pid)" || true
+        fi
+      args:
+        executable: /bin/bash
+
+    - name: Dump and pack the WAL flush trace (lineairdb)
+      # SIGUSR1 asks the server to write <prefix>_g<gen>_*.csv and finally
+      # <prefix>_meta.csv; wait for the manifest before packing. Only a server
+      # holding <prefix>.lock has the handler; SIGUSR1 kills any other process
+      when: inventory_hostname in groups.get('lineairdb', []) and (helios_flush_trace | default('')) != ''
+      shell: |
+        set -euo pipefail
+        prefix={{ helios_flush_trace }}
+        pid=$(cat /tmp/lineairdb_server.pid)
+        tr '\0' ' ' < /proc/$pid/cmdline | grep -q 'build/server/lineairdb-server' || { echo "pid $pid is not lineairdb-server" >&2; exit 1; }
+        grep -qxF -- "${prefix}.lock" < <(readlink /proc/$pid/fd/* 2>/dev/null) || { echo "server does not hold ${prefix}.lock: tracing inactive" >&2; exit 1; }
+        rm -f "${prefix}_meta.csv"
+        kill -USR1 "$pid"
+        for i in $(seq 1 90); do
+          [ -f "${prefix}_meta.csv" ] && break
+          sleep 2
+        done
+        [ -f "${prefix}_meta.csv" ] || { echo "flush trace manifest did not appear" >&2; exit 1; }
+        tar -C "$(dirname "$prefix")" -czf {{ sample_dir }}/flush-trace-{{ run_id }}.tgz $(cd "$(dirname "$prefix")" && ls "$(basename "$prefix")"_*.csv)
+      args:
+        executable: /bin/bash
+      # A missing trace must not cost the rest of the storage node's logs
+      ignore_errors: true
 
     - name: Stop sar -n SOFT sampling (lineairdb)
       when: inventory_hostname in groups.get('lineairdb', [])
@@ -482,17 +528,6 @@
       shell: |
         if [ -f {{ sample_dir }}/interrupts-{{ run_id }}.pid ]; then
           kill "$(cat {{ sample_dir }}/interrupts-{{ run_id }}.pid)" || true
-        fi
-      args:
-        executable: /bin/bash
-
-    - name: Stop HAProxy stats sampling
-      when: haproxy_host != ''
-      run_once: true
-      delegate_to: "{{ haproxy_host }}"
-      shell: |
-        if [ -f {{ sample_dir }}/haproxy-{{ run_id }}.pid ]; then
-          kill "$(cat {{ sample_dir }}/haproxy-{{ run_id }}.pid)" || true
         fi
       args:
         executable: /bin/bash
@@ -556,13 +591,38 @@
         executable: /bin/bash
 
     - name: Package LineairDB logs
-      when: inventory_hostname in groups['lineairdb']
+      # lineairdb_server_*.log only: wal.log / checkpoint*.log live in the same
+      # dir and can be tens of GB.
+      when: inventory_hostname in groups.get('lineairdb', [])
       shell: |
-        if ls ~/helios/lineairdb_logs/*.log >/dev/null 2>&1; then
-          tar -czf {{ sample_dir }}/lineairdb-{{ run_id }}.tgz -C ~/helios lineairdb_logs
+        cd ~/helios/lineairdb_logs 2>/dev/null || exit 0
+        if ls lineairdb_server_*.log >/dev/null 2>&1; then
+          tar -czf {{ sample_dir }}/lineairdb-{{ run_id }}.tgz lineairdb_server_*.log
         fi
       args:
         executable: /bin/bash
+
+    - name: Capture WAL disk usage
+      # WAL growth is a sizing input
+      when: inventory_hostname in groups.get('lineairdb', [])
+      shell: |
+        {
+          echo "=== du -sh ~/helios/lineairdb_logs/ ==="
+          du -sh ~/helios/lineairdb_logs/ 2>/dev/null
+          echo "=== df -h ==="
+          df -h
+        } > {{ sample_dir }}/wal-usage-{{ run_id }}.txt
+      args:
+        executable: /bin/bash
+      failed_when: false
+
+    - name: Fetch WAL disk usage
+      when: inventory_hostname in groups.get('lineairdb', [])
+      fetch:
+        src: "{{ sample_dir }}/wal-usage-{{ run_id }}.txt"
+        dest: "{{ result_dir }}/lineairdb/{{ inventory_hostname }}/"
+        flat: yes
+      failed_when: false
 
     - name: Capture MySQL status snapshot
       when: inventory_hostname in groups['mysql']
@@ -570,6 +630,16 @@
         ~/helios/build/runtime_output_directory/mysql \
           -u root --protocol=TCP -h 127.0.0.1 -P 3307 \
           -e "SHOW GLOBAL STATUS" > {{ sample_dir }}/mysql-status-{{ run_id }}.txt
+      args:
+        executable: /bin/bash
+      failed_when: false
+
+    - name: Capture InnoDB engine status (post)
+      when: (mysql_engine | default('lineairdb') == 'innodb') and inventory_hostname in groups['mysql']
+      shell: |
+        ~/helios/build/runtime_output_directory/mysql \
+          -u root --protocol=TCP -h 127.0.0.1 -P 3307 \
+          -e "SHOW ENGINE INNODB STATUS\G" > {{ sample_dir }}/innodb-status-{{ run_id }}.txt
       args:
         executable: /bin/bash
       failed_when: false
@@ -611,29 +681,31 @@
         executable: /bin/bash
       failed_when: false
 
+    - name: Find sweep perf stat files
+      find:
+        paths: "{{ sample_dir }}"
+        patterns: "perfstat-sweep.*"
+      register: perf_stat_files
+      when:
+        - perf_stat | bool
+        - inventory_hostname in groups.get('lineairdb', []) + groups.get('mysql', [])
+
+    - name: Fetch sweep perf stat files
+      fetch:
+        src: "{{ item.path }}"
+        dest: "{{ result_dir }}/perf_stat/{{ inventory_hostname }}/"
+        flat: yes
+      loop: "{{ perf_stat_files.files | default([]) }}"
+      loop_control:
+        label: "{{ inventory_hostname }}:{{ item.path | basename }}"
+      when:
+        - perf_stat | bool
+        - inventory_hostname in groups.get('lineairdb', []) + groups.get('mysql', [])
+
     - name: Fetch cpu logs
-      when: inventory_hostname not in groups.get('haproxy', [])
       fetch:
         src: "{{ sample_dir }}/cpu-{{ run_id }}.log"
         dest: "{{ result_dir }}/cpu/{{ inventory_hostname }}/"
-        flat: yes
-
-    - name: Fetch cpu logs (haproxy)
-      when: haproxy_host != ''
-      run_once: true
-      delegate_to: "{{ haproxy_host }}"
-      fetch:
-        src: "{{ sample_dir }}/cpu-{{ run_id }}.log"
-        dest: "{{ result_dir }}/cpu/{{ haproxy_host }}/"
-        flat: yes
-
-    - name: Fetch HAProxy stats
-      when: haproxy_host != ''
-      run_once: true
-      delegate_to: "{{ haproxy_host }}"
-      fetch:
-        src: "{{ sample_dir }}/haproxy-{{ run_id }}.csv"
-        dest: "{{ result_dir }}/haproxy/{{ haproxy_host }}/"
         flat: yes
 
     - name: Fetch bench logs
@@ -644,56 +716,72 @@
         flat: yes
 
     - name: Fetch LineairDB logs
-      when: inventory_hostname in groups['lineairdb']
+      when: inventory_hostname in groups.get('lineairdb', [])
       fetch:
         src: "{{ sample_dir }}/lineairdb-{{ run_id }}.tgz"
         dest: "{{ result_dir }}/lineairdb/{{ inventory_hostname }}/"
         flat: yes
 
     - name: Fetch server pidstat logs
-      when: inventory_hostname in groups['lineairdb']
+      when: inventory_hostname in groups.get('lineairdb', [])
       fetch:
         src: "{{ sample_dir }}/pidstat-server-{{ run_id }}.log"
         dest: "{{ result_dir }}/lineairdb/{{ inventory_hostname }}/"
         flat: yes
 
     - name: Fetch server sar -w logs
-      when: inventory_hostname in groups['lineairdb']
+      when: inventory_hostname in groups.get('lineairdb', [])
       fetch:
         src: "{{ sample_dir }}/sar-w-{{ run_id }}.log"
         dest: "{{ result_dir }}/lineairdb/{{ inventory_hostname }}/"
         flat: yes
 
     - name: Fetch server sar -n DEV logs
-      when: inventory_hostname in groups['lineairdb']
+      when: inventory_hostname in groups.get('lineairdb', [])
       fetch:
         src: "{{ sample_dir }}/sar-dev-{{ run_id }}.log"
         dest: "{{ result_dir }}/lineairdb/{{ inventory_hostname }}/"
         flat: yes
 
+    - name: Fetch server sar -d logs
+      when: inventory_hostname in groups.get('lineairdb', [])
+      fetch:
+        src: "{{ sample_dir }}/sar-disk-{{ run_id }}.log"
+        dest: "{{ result_dir }}/lineairdb/{{ inventory_hostname }}/"
+        flat: yes
+      failed_when: false
+
+    - name: Fetch the WAL flush trace
+      when: inventory_hostname in groups.get('lineairdb', []) and (helios_flush_trace | default('')) != ''
+      fetch:
+        src: "{{ sample_dir }}/flush-trace-{{ run_id }}.tgz"
+        dest: "{{ result_dir }}/lineairdb/{{ inventory_hostname }}/"
+        flat: yes
+      failed_when: false
+
     - name: Fetch server sar -n SOFT logs
-      when: inventory_hostname in groups['lineairdb']
+      when: inventory_hostname in groups.get('lineairdb', [])
       fetch:
         src: "{{ sample_dir }}/sar-soft-{{ run_id }}.log"
         dest: "{{ result_dir }}/lineairdb/{{ inventory_hostname }}/"
         flat: yes
 
     - name: Fetch server mpstat -I ALL logs
-      when: inventory_hostname in groups['lineairdb']
+      when: inventory_hostname in groups.get('lineairdb', [])
       fetch:
         src: "{{ sample_dir }}/mpstat-irq-{{ run_id }}.log"
         dest: "{{ result_dir }}/lineairdb/{{ inventory_hostname }}/"
         flat: yes
 
     - name: Fetch server softnet_stat logs
-      when: inventory_hostname in groups['lineairdb']
+      when: inventory_hostname in groups.get('lineairdb', [])
       fetch:
         src: "{{ sample_dir }}/softnet-{{ run_id }}.log"
         dest: "{{ result_dir }}/lineairdb/{{ inventory_hostname }}/"
         flat: yes
 
     - name: Fetch server /proc/interrupts logs
-      when: inventory_hostname in groups['lineairdb']
+      when: inventory_hostname in groups.get('lineairdb', [])
       fetch:
         src: "{{ sample_dir }}/interrupts-{{ run_id }}.log"
         dest: "{{ result_dir }}/lineairdb/{{ inventory_hostname }}/"
@@ -705,6 +793,14 @@
         src: "{{ sample_dir }}/mysql-status-{{ run_id }}.txt"
         dest: "{{ result_dir }}/mysql/{{ inventory_hostname }}/"
         flat: yes
+
+    - name: Fetch InnoDB engine status
+      when: (mysql_engine | default('lineairdb') == 'innodb') and inventory_hostname in groups['mysql']
+      fetch:
+        src: "{{ sample_dir }}/innodb-status-{{ run_id }}.txt"
+        dest: "{{ result_dir }}/mysql/{{ inventory_hostname }}/"
+        flat: yes
+      failed_when: false
 
     - name: Fetch MySQL diagnostics (pre)
       when: inventory_hostname in groups['mysql']
@@ -739,7 +835,7 @@
       failed_when: false
 
     - name: Fetch server per-thread pidstat logs
-      when: inventory_hostname in groups['lineairdb']
+      when: inventory_hostname in groups.get('lineairdb', [])
       fetch:
         src: "{{ sample_dir }}/pidstat-threads-{{ run_id }}.log"
         dest: "{{ result_dir }}/lineairdb/{{ inventory_hostname }}/"
@@ -774,3 +870,45 @@
         - "{{ sample_dir }}/perf-report-proxy-{{ run_id }}.txt"
         - "{{ sample_dir }}/perf-callers-proxy-{{ run_id }}.txt"
       failed_when: false
+
+    - name: "Gate: every MySQL carried its share of the commits"
+      # Connector/J silently routes around a dead endpoint, so an N-1 fleet
+      # would otherwise still produce a green sweep.
+      run_once: true
+      delegate_to: localhost
+      shell: |
+        set -euo pipefail
+        python3 - "{{ result_dir }}" "{{ run_id }}" {{ groups['mysql'] | join(' ') }} <<'PY'
+        import os
+        import re, sys
+        result_dir, run_id, hosts = sys.argv[1], sys.argv[2], sys.argv[3:]
+        def com_commit(path):
+            try:
+                text = open(path).read()
+            except OSError:
+                return None
+            m = re.search(r"^Com_commit\s+(\d+)", text, re.M)
+            return int(m.group(1)) if m else None
+        deltas = {}
+        for h in hosts:
+            pre = com_commit(f"{result_dir}/mysql/{h}/mysql-status-pre-{run_id}.txt")
+            post = com_commit(f"{result_dir}/mysql/{h}/mysql-status-{run_id}.txt")
+            deltas[h] = None if pre is None or post is None else post - pre
+        lines = [f"{h},{'missing' if d is None else d}" for h, d in deltas.items()]
+        os.makedirs(f"{result_dir}/throughput", exist_ok=True)
+        with open(f"{result_dir}/throughput/commit_distribution.csv", "w") as f:
+            f.write("host,com_commit_delta\n" + "\n".join(lines) + "\n")
+        print("\n".join(lines))
+        valid = [d for d in deltas.values() if d is not None]
+        if len(valid) != len(hosts):
+            sys.exit("GATE FAIL: missing commit counts for some MySQL nodes")
+        # The gate needs enough explicit commits; autocommit workloads such as TPC-H skip it
+        if sum(valid) < 1000:
+            print("GATE SKIPPED: fewer than 1000 commits in the sweep")
+        elif min(valid) <= 0 or min(valid) < 0.5 * max(valid):
+            sys.exit("GATE FAIL: uneven commit counts across MySQL nodes")
+        else:
+            print("GATE OK: commit counts within 2x across nodes")
+        PY
+      args:
+        executable: /bin/bash

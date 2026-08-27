@@ -22,6 +22,9 @@ Usage:
 import argparse
 import json
 import os
+import re
+import secrets
+import shlex
 import subprocess
 import sys
 import time
@@ -46,11 +49,6 @@ CLUSTER = {
         "instance_type": "c6i.4xlarge",
         "count": 1,
     },
-    "haproxy": {
-        "tag": "helios-haproxy",
-        "instance_type": "c6i.8xlarge",
-        "count": 1,
-    },
     "benchbase": {
         "tag": "helios-bench",
         "instance_type": "c6i.16xlarge",
@@ -60,19 +58,29 @@ CLUSTER = {
 
 AWS_DEFAULTS = {
     "region": "ap-southeast-2",
-    "launch_template": "lt-0f28a9f6b02e1c019",
-    "project_tag": "Helios",
-    "ssh_key": "~/.ssh/helios-aws.pem",
+    # Every launch parameter is passed explicitly, without a launch template
+    "project_tag": "HeliosPush",   # distinct from Project=Helios: neither harness touches the other's instances
+    "ssh_key": "~/.ssh/ordo-aws.pem",
     "ssh_user": "ubuntu",
-    # On-demand fallback params (extracted from launch template)
-    "ami_id": "ami-06b4ab6c66b56fbd8",
+    # env-only AMI: Ubuntu 24.04 with the runtime libraries, a Java 23 runtime,
+    # sysstat, and no Helios binaries.
+    "ami_id": "ami-01791c5dbde3b3ba1",
     "security_group": "sg-02d9a0d5948d02dbb",
-    "subnet": "subnet-0a15ff55a4cae198b",  # ap-southeast-2c (same-AZ pinning)
+    # Same-AZ pinning: every role must sit in one AZ or cross-AZ latency lands
+    # on the RPC path.
+    "subnet": "subnet-01a0d1fe432c2f92e",  # ap-southeast-2a (same-AZ pinning)
 }
+
+# Everything this run launched, appended as soon as run-instances returns, so
+# cleanup covers a partially launched cluster.
+LAUNCHED = {"instances": [], "spot_requests": []}
+
+# Flush trace files live on the WAL volume
+FLUSH_TRACE_PREFIX = "/mnt/wal/flush_trace/ft"
 
 # vCPU count for EC2 instance sizes (used to build machine_spec locally)
 _VCPU_BY_SIZE = {
-    "xlarge": 4, "2xlarge": 8, "4xlarge": 16, "8xlarge": 32,
+    "medium": 1, "large": 2, "xlarge": 4, "2xlarge": 8, "4xlarge": 16, "8xlarge": 32,
     "12xlarge": 48, "16xlarge": 64, "24xlarge": 96, "32xlarge": 128, "metal": 128,
 }
 
@@ -81,10 +89,17 @@ def build_machine_spec():
     """Build machine_spec string from CLUSTER config (e.g. lineairdb-64x1_mysql-16x1_...)."""
     parts = []
     for role, cfg in CLUSTER.items():
+        if cfg["count"] == 0:
+            continue
         size = cfg["instance_type"].split(".")[-1]  # e.g. "16xlarge"
         vcpu = _VCPU_BY_SIZE.get(size, 0)
         parts.append(f"{role}-{vcpu}x{cfg['count']}")
     return "_".join(parts)
+
+
+def _wal_role(args):
+    """Which CLUSTER role hosts the io2 volume for this engine."""
+    return "mysql" if args.engine == "innodb" else "lineairdb"
 
 
 def log(msg):
@@ -147,79 +162,174 @@ def run(cmd, check=True, **kwargs):
 SPOT_ERRORS = ("InsufficientInstanceCapacity", "SpotMaxPriceTooLow", "MaxSpotInstanceCountExceeded")
 
 
-def _launch_role(role, cfg, args):
-    """Launch instances for a single role. Try spot first, fall back to on-demand."""
-    region = args.region
-    tag_spec = [
-        "--tag-specifications",
-        f"ResourceType=instance,Tags=["
-        f"{{Key=Name,Value={cfg['tag']}}},"
-        f"{{Key=Project,Value={args.project_tag}}}"
-        f"]",
-    ]
-    base_cmd = [
-        "ec2", "run-instances",
-        "--launch-template", f"LaunchTemplateId={args.launch_template},Version=$Default",
-        "--count", str(cfg["count"]),
-        "--instance-type", cfg["instance_type"],
-    ]
-    if args.subnet:
-        base_cmd += ["--subnet-id", args.subnet]
+def _record_launch(ids, region):
+    """Register instance IDs and their spot request IDs for cleanup, first thing."""
+    LAUNCHED["instances"].extend(ids)
+    try:
+        req_ids = aws_text([
+            "ec2", "describe-instances", "--instance-ids", *ids,
+            "--query", "Reservations[].Instances[].SpotInstanceRequestId",
+        ], region=region)
+        if req_ids and req_ids != "None":
+            LAUNCHED["spot_requests"].extend(
+                r for r in req_ids.split() if r and r != "None")
+    except RuntimeError as e:
+        log(f"  Warning: spot request lookup failed for {ids}: {e}")
 
-    def _number_instances(ids, base_tag, region):
-        """Tag instances with sequential names: tag-1, tag-2, ..."""
-        for i, iid in enumerate(ids, 1):
-            name = f"{base_tag}-{i}" if len(ids) > 1 else base_tag
+
+def _number_instances(ids, base_tag, region):
+    """Tag instances with sequential names: tag-1, tag-2, ... Best-effort:
+    a tagging failure must never orphan already-launched instances."""
+    for i, iid in enumerate(ids, 1):
+        name = f"{base_tag}-{i}" if len(ids) > 1 else base_tag
+        try:
             aws(["ec2", "create-tags", "--resources", iid,
                  "--tags", f"Key=Name,Value={name}"], region=region)
+        except RuntimeError as e:
+            log(f"  Warning: tagging {iid} failed ({e}); continuing")
+
+
+def ena_queue_count(instance_type):
+    """Request min(32, vCPU/2) ENA queues at launch where that beats the EC2 default
+    of min(vCPU, 8): 32 is the per-interface maximum, vCPU/2 is one queue per
+    physical core. Values must be a power of two and at most the vCPU count (EC2
+    constraint). Sizes the default already covers and unknown sizes keep the
+    default. _VCPU_BY_SIZE describes the c6i family; a family that rejects the
+    count relaunches on the default."""
+    size = instance_type.split(".")[-1]
+    vcpu = _VCPU_BY_SIZE.get(size)
+    if vcpu is None:
+        log(f"  Warning: unknown instance size {instance_type}; launching with the default ENA queue count")
+        return 0
+    target = min(32, vcpu // 2)
+    if target <= min(vcpu, 8):
+        return 0
+    return 1 << (target.bit_length() - 1)
+
+
+def _launch_role(role, cfg, args, run_id):
+    """Launch instances for a single role, spot by default.
+
+    Fully explicit run-instances (no launch template): env AMI, dead-man
+    user-data (self-terminate if forgotten), gp3 root with DeleteOnTermination,
+    IMDSv2. On-demand happens only with --on-demand or --allow-od-fallback."""
+    region = args.region
+    tags = (f"Tags=[{{Key=Name,Value={cfg['tag']}}},"
+            f"{{Key=Project,Value={args.project_tag}}},"
+            f"{{Key=Run,Value={run_id}}}]")
+    tag_spec = [
+        "--tag-specifications",
+        f"ResourceType=instance,{tags}",
+        f"ResourceType=volume,{tags}",
+    ]
+    deadman = (f"#!/bin/bash\n"
+               f"shutdown +{args.deadman_minutes} \"helios bench dead-man\"\n")
+
+    block_device_mappings = [
+        f"DeviceName=/dev/sda1,Ebs={{VolumeSize={args.root_gib},"
+        f"VolumeType=gp3,DeleteOnTermination=true}}",
+    ]
+    if role == _wal_role(args) and args.wal_gib > 0:
+        block_device_mappings.append(
+            f"DeviceName=/dev/sdf,Ebs={{VolumeSize={args.wal_gib},"
+            f"VolumeType=io2,Iops={args.wal_iops},DeleteOnTermination=true}}"
+        )
+
+    base_cmd = [
+        "ec2", "run-instances",
+        "--image-id", args.ami_id,
+        "--key-name", Path(args.ssh_key).stem,
+        "--count", str(cfg["count"]),
+        "--instance-type", cfg["instance_type"],
+        "--block-device-mappings", *block_device_mappings,
+        "--metadata-options", "HttpTokens=required,HttpEndpoint=enabled",
+        "--instance-initiated-shutdown-behavior", "terminate",
+        "--user-data", deadman,
+    ]
+
+    # Every role requests min(32, vCPU/2) ENA queues at launch (ena_queue_count());
+    # families without flexible ENA queues reject the count, and _launch() retries
+    # once on the plain network form
+    queue_count = ena_queue_count(cfg["instance_type"])
+
+    def _network_args(with_queue_count):
+        # --network-interfaces subsumes --subnet-id/--security-group-ids;
+        # mixing both forms is rejected by the API.
+        network_interface = {
+            "DeviceIndex": 0,
+            "Groups": [args.security_group],
+            "AssociatePublicIpAddress": True,
+            "DeleteOnTermination": True,
+        }
+        if with_queue_count and queue_count > 0:
+            network_interface["EnaQueueCount"] = queue_count
+        if args.subnet:
+            network_interface["SubnetId"] = args.subnet
+        return ["--network-interfaces", json.dumps([network_interface])]
+
+    def _run_instances_raw(cmd):
+        full = ["aws"] + cmd
+        if region:
+            full.extend(["--region", region])
+        full.extend(["--no-cli-pager", "--output", "json"])
+        return subprocess.run(full, capture_output=True, text=True)
+
+    def _launch(extra_args, market_desc):
+        cmd = base_cmd + _network_args(True) + extra_args
+        result = _run_instances_raw(cmd)
+        if result.returncode != 0 and queue_count > 0 and "ena queue" in result.stderr.lower():
+            log(f"  EnaQueueCount={queue_count} rejected for {cfg['instance_type']} "
+                f"({role}, {market_desc}); retrying on the default queue count: "
+                f"{result.stderr.strip()}")
+            # The retry keeps the same interface spec minus EnaQueueCount
+            cmd = base_cmd + _network_args(False) + extra_args
+            result = _run_instances_raw(cmd)
+        if result.returncode != 0:
+            raise RuntimeError(f"aws command failed: {' '.join(cmd)}\n{result.stderr.strip()}")
+        return json.loads(result.stdout) if result.stdout.strip() else {}
 
     if not args.on_demand:
-        # Try spot first
         log(f"Launching {cfg['count']}x {cfg['instance_type']} for {role} ({cfg['tag']}) [spot]...")
         try:
-            spot_cmd = base_cmd + [
+            spot_extra = [
                 "--instance-market-options",
                 '{"MarketType":"spot","SpotOptions":{"SpotInstanceType":"one-time","InstanceInterruptionBehavior":"terminate"}}',
             ] + tag_spec
-            result = aws(spot_cmd, region=region)
+            result = _launch(spot_extra, "spot")
             ids = [inst["InstanceId"] for inst in result.get("Instances", [])]
+            _record_launch(ids, region)
             _number_instances(ids, cfg["tag"], region)
             log(f"  -> [spot] {ids}")
             return ids
         except RuntimeError as e:
             if any(err in str(e) for err in SPOT_ERRORS):
-                log(f"  Spot unavailable for {role}, falling back to on-demand...")
+                if not args.allow_od_fallback:
+                    raise RuntimeError(
+                        f"Spot unavailable for {role} ({e}); aborting. "
+                        f"Pass --allow-od-fallback to permit on-demand.")
+                log(f"  Spot unavailable for {role}, falling back to on-demand (--allow-od-fallback)...")
             else:
                 raise
 
-    # On-demand (fallback or --on-demand flag)
-    # Launch template has InstanceMarketOptions=spot, so we must launch
-    # WITHOUT the template and specify all params directly.
+    # On-demand (--on-demand flag or authorized fallback)
     log(f"Launching {cfg['count']}x {cfg['instance_type']} for {role} ({cfg['tag']}) [on-demand]...")
-    od_cmd = [
-        "ec2", "run-instances",
-        "--image-id", args.ami_id,
-        "--key-name", Path(args.ssh_key).stem,
-        "--security-group-ids", args.security_group,
-        "--count", str(cfg["count"]),
-        "--instance-type", cfg["instance_type"],
-    ]
-    if args.subnet:
-        od_cmd += ["--subnet-id", args.subnet]
-    result = aws(od_cmd + tag_spec, region=region)
+    result = _launch(tag_spec, "on-demand")
     ids = [inst["InstanceId"] for inst in result.get("Instances", [])]
+    _record_launch(ids, region)
     _number_instances(ids, cfg["tag"], region)
     log(f"  -> [on-demand] {ids}")
     return ids
 
 
-def launch_instances(args):
+def launch_instances(args, run_id):
     """Launch instances for all roles. Returns list of instance IDs, or None on failure."""
     all_instance_ids = []
 
     for role, cfg in CLUSTER.items():
+        if cfg["count"] == 0:
+            continue
         try:
-            ids = _launch_role(role, cfg, args)
+            ids = _launch_role(role, cfg, args, run_id)
             all_instance_ids.extend(ids)
         except RuntimeError as e:
             log(f"  LAUNCH FAILED for {role}: {e}")
@@ -254,8 +364,8 @@ def wait_for_instances(instance_ids, region, timeout=300):
 # ──────────────────────────────────────────────
 # Phase 3: Generate inventory + wait for SSH
 # ──────────────────────────────────────────────
-def generate_inventory(args):
-    """Run update_inventory.py to generate inventory.ini."""
+def generate_inventory(args, run_id):
+    """Run update_inventory.py to generate inventory.ini, scoped to this run."""
     log("Generating Ansible inventory...")
     run(
         f"python3 {SCRIPT_DIR / 'update_inventory.py'}"
@@ -263,6 +373,7 @@ def generate_inventory(args):
         f" --key {args.ssh_key}"
         f" --user {args.ssh_user}"
         f" --project-tag {args.project_tag}"
+        f" --run-tag {run_id}"
     )
 
 
@@ -287,17 +398,43 @@ def run_playbook(name, extra_vars=None, args=None):
     run(cmd)
 
 
-def deploy_infrastructure(branch=None):
-    """Deploy LineairDB, MySQL, HAProxy in parallel, then wait."""
-    log("Deploying infrastructure (lineairdb + mysql + haproxy in parallel)...")
+def deploy_infrastructure(args, bundle_path, bundle_sha256):
+    """Push the binary bundle to every node, then start roles in parallel."""
     inv = str(ANSIBLE_DIR / "inventory.ini")
-    extra = f' -e "helios_branch={branch}"' if branch else ""
+
+    # Push the bundle to every host before any role starts
+    log(f"Pushing bundle {bundle_path} ({bundle_sha256[:12]}...) to all nodes...")
+    run(f"ansible-playbook -i {inv} {ANSIBLE_DIR / 'push_bundle.yml'}"
+        f" -e {shlex.quote(json.dumps({'bundle_path': bundle_path, 'bundle_sha256': bundle_sha256}))}")
+
+    # Start the roles in parallel; --engine innodb has no lineairdb role
+    innodb = args.engine == "innodb"
+    log("Deploying infrastructure (mysql only, InnoDB)..." if innodb
+        else "Deploying infrastructure (lineairdb + mysql in parallel)...")
+    lineairdb_vars = {"helios_durability": args.durability, "wal_volume": args.wal_gib > 0}
+    if args.epoch_ms is not None:
+        lineairdb_vars["helios_epoch_ms"] = args.epoch_ms
+    if args.server_env:
+        lineairdb_vars["helios_server_env"] = args.server_env
+    if args.flush_trace:
+        lineairdb_vars["helios_flush_trace"] = FLUSH_TRACE_PREFIX
+    mysql_vars = {"mysqld_extra_args": args.mysqld_extra_args}
+    if innodb:
+        mysql_vars.update({"mysql_engine": "innodb", "wal_volume": args.wal_gib > 0,
+                           "wal_iops": args.wal_iops})
+        if args.innodb_buffer_pool_gib is not None:
+            mysql_vars["innodb_buffer_pool_gib"] = args.innodb_buffer_pool_gib
+    role_extra = {
+        "lineairdb.yml": " -e " + shlex.quote(json.dumps(lineairdb_vars)),
+        "mysql.yml": " -e " + shlex.quote(json.dumps(mysql_vars)),
+    }
     # Write deploy logs alongside bench_aws.log
     deploy_log_dir = Path(LOG_FILE.name).parent if LOG_FILE else None
     procs = []
 
-    for playbook in ["lineairdb.yml", "mysql.yml", "haproxy.yml"]:
-        cmd = f"ansible-playbook -i {inv} {ANSIBLE_DIR / playbook}{extra}"
+    playbooks = ["mysql.yml"] if innodb else ["lineairdb.yml", "mysql.yml"]
+    for playbook in playbooks:
+        cmd = f"ansible-playbook -i {inv} {ANSIBLE_DIR / playbook}{role_extra.get(playbook, '')}"
         log(f"  $ {cmd}")
         if deploy_log_dir:
             pb_log = open(deploy_log_dir / f"{playbook.replace('.yml', '')}.log", "w")
@@ -323,16 +460,47 @@ def deploy_infrastructure(branch=None):
     log("Infrastructure deployed.")
 
 
+def salvage_server_logs(args, run_id):
+    """Best-effort: pull liveness snapshots + service logs off the nodes
+    before cleanup destroys the evidence. Never raises."""
+    try:
+        if not LAUNCHED["instances"]:
+            return
+        log("Salvaging server logs before cleanup...")
+        run_playbook("salvage_logs.yml",
+                     extra_vars=f"run_id={run_id} machine_spec={build_machine_spec()}")
+        log("Salvage complete.")
+    except Exception as e:
+        log(f"Salvage failed (continuing to cleanup): {e}")
+
+
 def run_benchmarks(args, run_id):
     """Run benchbase setup + benchmark execution."""
 
     bench_vars = f"bench_type={args.bench_type}"
     if args.bench_scalefactor:
         bench_vars += f" bench_scalefactor={args.bench_scalefactor}"
+    if args.bench_analyze or args.bench_prefetch:
+        bench_vars += " bench_analyze=true"
+    if args.engine == "innodb":
+        # Reaches benchbase.yml directly and measure_usage.yml via exec_vars
+        bench_vars += " mysql_engine=innodb"
+
+    # run_id + machine_spec let the setup play write load-phase artifacts into
+    # the same result dir the sweep uses. Observability only.
+    obs_vars = f" run_id={run_id} machine_spec={build_machine_spec()}"
+    if args.load_jstack:
+        obs_vars += " load_jstack=true"
+    if args.perf_stat:
+        obs_vars += " perf_stat=true"
+
+    # RTT baseline: topology property, captured once before any bench traffic
+    log("Recording RTT baseline between all nodes...")
+    run_playbook("ping_baseline.yml", extra_vars=bench_vars + obs_vars)
 
     # Setup: create schema + load data
     log(f"Setting up {args.bench_type.upper()} (SF={args.bench_scalefactor or 'default'})...")
-    run_playbook("benchbase.yml", extra_vars=bench_vars)
+    run_playbook("benchbase.yml", extra_vars=bench_vars + obs_vars)
 
     # Execute: benchmark with monitoring
     exec_vars = bench_vars + f" run_id={run_id}"
@@ -344,10 +512,18 @@ def run_benchmarks(args, run_id):
         exec_vars += f" bench_serial={'true' if args.bench_serial else 'false'}"
     if args.bench_profile:
         exec_vars += f" bench_profile={args.bench_profile}"
-    if args.bench_prefetch:
+    if args.bench_prefetch or args.bench_prefetch_stmt:
         exec_vars += " bench_prefetch=true"
+    if args.bench_prefetch_stmt:
+        exec_vars += " bench_prefetch_plan=false"
+    if args.bench_ndv_drift:
+        exec_vars += " bench_ndv_drift=true"
     if args.perf:
         exec_vars += " enable_perf=true"
+    if args.perf_stat:
+        exec_vars += " perf_stat=true"
+    if args.flush_trace:
+        exec_vars += f" helios_flush_trace={FLUSH_TRACE_PREFIX}"
 
     log(f"Running benchmark: {exec_vars}")
     run_playbook("measure_usage.yml", extra_vars=exec_vars)
@@ -377,7 +553,7 @@ def _plot_perf_reports(result_root):
     role_modes = {"lineairdb": "server", "mysql": "proxy"}
     for role, mode in role_modes.items():
         cfg = CLUSTER.get(role)
-        if not cfg:
+        if not cfg or cfg["count"] == 0:
             continue
         size = cfg["instance_type"].split(".")[-1]
         vcpu = _VCPU_BY_SIZE.get(size, 0)
@@ -395,89 +571,94 @@ def _plot_perf_reports(result_root):
 # ──────────────────────────────────────────────
 # Cleanup
 # ──────────────────────────────────────────────
-def cleanup(args):
-    """Cancel spot requests first, then terminate instances."""
+def cleanup(args, run_id=None):
+    """Terminate the recorded launches and every instance carrying this run's tag.
+
+    A normal run scopes to its run_id, --cleanup-only to --cleanup-run-id, and
+    --cleanup-all to every project-tagged instance; spot requests are cancelled
+    per instance, never by key name."""
     region = args.region
     project_tag = args.project_tag
-    log(f"Cleaning up (Project={project_tag}, region={region})...")
-
-    # Step 1: Cancel ALL open/active spot requests first (prevents respawn).
-    # Spot requests may not have Project tags, so find them via launch template.
-    try:
-        spot_ids = aws_text([
-            "ec2", "describe-spot-instance-requests",
-            "--filters",
-            "Name=state,Values=open,active",
-            f"Name=launch.key-name,Values={Path(args.ssh_key).stem}",
-            "--query", "SpotInstanceRequests[].SpotInstanceRequestId",
-        ], region=region)
-    except RuntimeError:
-        spot_ids = ""
-
-    if spot_ids and spot_ids != "None":
-        ids = spot_ids.split()
-        log(f"  Cancelling {len(ids)} spot requests: {ids}")
-        try:
-            aws_text([
-                "ec2", "cancel-spot-instance-requests",
-                "--spot-instance-request-ids", *ids,
-            ], region=region)
-        except RuntimeError as e:
-            log(f"  Warning: cancel spot failed: {e}")
+    scope_run_id = run_id if run_id is not None else args.cleanup_run_id
+    scope_filter = [f"Name=tag:Project,Values={project_tag}"]
+    if args.cleanup_all:
+        log(f"Cleaning up (Project={project_tag}, ALL runs, region={region})...")
     else:
-        log("  No spot requests to cancel.")
+        scope_filter.append(f"Name=tag:Run,Values={scope_run_id}")
+        log(f"Cleaning up (Project={project_tag}, Run={scope_run_id}, region={region})...")
+    ok = True
 
-    # Step 2: Terminate instances by Project tag
+    # Collect targets: recorded launches plus tagged instances in scope
     try:
-        instance_ids = aws_text([
+        tagged = aws_text([
             "ec2", "describe-instances",
-            "--filters",
-            f"Name=tag:Project,Values={project_tag}",
+            "--filters", *scope_filter,
             "Name=instance-state-name,Values=pending,running,stopping,stopped",
             "--query", "Reservations[].Instances[].InstanceId",
         ], region=region)
-    except RuntimeError:
-        instance_ids = ""
+    except RuntimeError as e:
+        log(f"  ERROR: could not list in-scope instances: {e}")
+        tagged = ""
+        ok = False
+    ids = sorted(set(LAUNCHED["instances"]) |
+                 set(tagged.split() if tagged and tagged != "None" else []))
 
-    if instance_ids and instance_ids != "None":
-        ids = instance_ids.split()
-        log(f"  Terminating {len(ids)} tagged instances: {ids}")
+    # Cancel only our spot requests, recorded or resolved from our instances
+    spot_reqs = set(LAUNCHED["spot_requests"])
+    if ids:
+        try:
+            req_ids = aws_text([
+                "ec2", "describe-instances", "--instance-ids", *ids,
+                "--query", "Reservations[].Instances[].SpotInstanceRequestId",
+            ], region=region)
+            if req_ids and req_ids != "None":
+                spot_reqs |= {r for r in req_ids.split() if r and r != "None"}
+        except RuntimeError as e:
+            log(f"  ERROR: resolving spot requests failed: {e}")
+            ok = False
+    if spot_reqs:
+        log(f"  Cancelling {len(spot_reqs)} own spot requests: {sorted(spot_reqs)}")
         try:
             aws_text([
-                "ec2", "terminate-instances",
-                "--instance-ids", *ids,
+                "ec2", "cancel-spot-instance-requests",
+                "--spot-instance-request-ids", *sorted(spot_reqs),
             ], region=region)
         except RuntimeError as e:
-            log(f"  Warning: terminate failed: {e}")
+            log(f"  ERROR: cancel spot failed: {e}")
+            ok = False
+
+    if ids:
+        log(f"  Terminating {len(ids)} instances: {ids}")
+        try:
+            aws_text(["ec2", "terminate-instances", "--instance-ids", *ids],
+                     region=region)
+        except RuntimeError as e:
+            log(f"  ERROR: terminate failed: {e}")
+            ok = False
     else:
-        log("  No tagged instances to terminate.")
+        log("  Nothing to terminate.")
 
-    # Step 3: Also terminate any untagged instances from the same key pair
-    # (catches instances spawned by persistent spot requests after cleanup)
+    # Verify that nothing is still alive in scope
+    retry = "--cleanup-all" if args.cleanup_all else f"--cleanup-run-id {scope_run_id}"
     try:
-        untagged_ids = aws_text([
+        leftovers = aws_text([
             "ec2", "describe-instances",
-            "--filters",
-            f"Name=key-name,Values={Path(args.ssh_key).stem}",
+            "--filters", *scope_filter,
             "Name=instance-state-name,Values=pending,running,stopping,stopped",
-            "--query", "Reservations[].Instances[?!Tags].InstanceId",
+            "--query", "Reservations[].Instances[].InstanceId",
         ], region=region)
-    except RuntimeError:
-        untagged_ids = ""
+    except RuntimeError as e:
+        log(f"  ERROR: verification failed: {e}")
+        leftovers = ""
+        ok = False
+    if leftovers and leftovers != "None":
+        log(f"  ERROR: instances still not shutting down: {leftovers.split()}")
+        ok = False
+    elif ok:
+        log("  Verified: no in-scope instances left (terminating/terminated).")
 
-    if untagged_ids and untagged_ids != "None":
-        ids = [i for i in untagged_ids.split() if i not in (instance_ids or "").split()]
-        if ids:
-            log(f"  Terminating {len(ids)} untagged instances: {ids}")
-            try:
-                aws_text([
-                    "ec2", "terminate-instances",
-                    "--instance-ids", *ids,
-                ], region=region)
-            except RuntimeError as e:
-                log(f"  Warning: terminate untagged failed: {e}")
-
-    log("Cleanup done.")
+    log("Cleanup done." if ok else f"CLEANUP INCOMPLETE: re-run with --cleanup-only {retry} and check the console.")
+    return ok
 
 
 # ──────────────────────────────────────────────
@@ -494,10 +675,22 @@ Examples:
   python3 py/bench_aws.py --bench-type tpcc --bench-prefetch --bench-terms 1,16,64,128
   python3 py/bench_aws.py --bench-type tpch --bench-scalefactor 0.1
   python3 py/bench_aws.py --bench-type tpch --bench-serial false --bench-terms 1,2,4,8 --bench-scalefactor 0.01
-  python3 py/bench_aws.py --cleanup-only
+  python3 py/bench_aws.py --durability sync --epoch-ms 1 --wal-gib 300
+  python3 py/bench_aws.py --cleanup-only --cleanup-all
   python3 py/bench_aws.py --dry-run
 """,
     )
+
+    # Engine selection
+    parser.add_argument("--engine", default="lineairdb", choices=["lineairdb", "innodb"],
+                        help="Storage engine under test (default: lineairdb, the full Helios "
+                             "stack). innodb runs the same sweep against a single stock "
+                             "MySQL/InnoDB node instead: no LineairDB storage server, "
+                             "--mysql-count fixed at 1, no prefetch/ndv-drift options; size "
+                             "its --mysql-instance-type like the Helios storage node so the "
+                             "buffer pool holds the dataset")
+    parser.add_argument("--innodb-buffer-pool-gib", type=int, default=None,
+                        help="InnoDB buffer pool size in GiB (default: 75%% of the node's memory)")
 
     # Benchmark options
     parser.add_argument("--bench-type", default="ycsb", choices=["ycsb", "tpcc", "tpch"])
@@ -510,33 +703,125 @@ Examples:
     parser.add_argument("--bench-prefetch", action="store_true",
                         help="Run BenchBase in Helios prefetch mode "
                              "(SET GLOBAL lineairdb_prefetch_execution=ON on every MySQL "
-                             "and HELIOS_PREFETCH_PLAN=1 env for the executor)")
+                             "and HELIOS_PREFETCH_PLAN=1 env for the executor, so the "
+                             "TPC-C procedures inject @_tx_plan)")
+    parser.add_argument("--bench-prefetch-stmt", action="store_true",
+                        help="Statement-scoped autogen prefetch: "
+                             "SET GLOBAL lineairdb_prefetch_execution=ON WITHOUT "
+                             "HELIOS_PREFETCH_PLAN, so the proxy derives a per-statement "
+                             "read plan from the QEP instead of the injected @_tx_plan DSL")
+    parser.add_argument("--bench-ndv-drift", action="store_true",
+                        help="SET GLOBAL lineairdb_stats_drift_refresh=ON "
+                             "(default OFF: the NDV/histogram recompute is synchronous "
+                             "on the read path)")
+    parser.add_argument("--bench-analyze", action="store_true",
+                        help="Run ANALYZE TABLE after load (on automatically for tx-prefetch "
+                             "and for --engine innodb; stmt-prefetch and plain mode read live "
+                             "row counts from the storage server)")
     parser.add_argument("--perf", action="store_true", help="Enable perf profiling on lineairdb + mysql nodes")
+    parser.add_argument("--load-jstack", action="store_true",
+                        help="Take one thread dump of the loader JVM mid-load (diagnostic; "
+                             "costs a JVM safepoint pause, so it is off by default)")
+    parser.add_argument("--perf-stat", action="store_true",
+                        help="Sample IPC / LLC counters (perf stat counting mode, NOT perf "
+                             "record) on the mysql and lineairdb nodes across both the load "
+                             "and the sweep; degrades to a logged note if perf is unavailable")
+
+    # Durability / WAL options
+    parser.add_argument("--durability", default="volatile", choices=["volatile", "async", "sync"],
+                        help="LineairDB commit durability contract (default: volatile)")
+    parser.add_argument("--epoch-ms", type=int, default=None,
+                        help="Epoch duration in ms (default: server default)")
+    parser.add_argument("--wal-gib", type=int, default=0,
+                        help="Extra io2 volume size in GiB (default: 0, no extra volume); holds the "
+                             "WAL on the lineairdb node, or the datadir under --engine innodb")
+    parser.add_argument("--wal-iops", type=int, default=12000, help="IOPS for the io2 WAL volume")
+    parser.add_argument("--mysqld-extra-args", default="--performance-schema=OFF",
+                        help="Extra mysqld options, passed through MYSQLD_EXTRA_ARGS")
+    parser.add_argument("--server-env", default="",
+                        help="Extra KEY=VALUE pairs (space separated) exported to the storage server")
+    parser.add_argument("--flush-trace", action="store_true",
+                        help="Record the storage server's WAL flush trace on the WAL volume and fetch it "
+                             "after the sweep (needs --wal-gib)")
 
     # AWS options
     parser.add_argument("--region", default=AWS_DEFAULTS["region"])
-    parser.add_argument("--launch-template", default=AWS_DEFAULTS["launch_template"])
     parser.add_argument("--project-tag", default=AWS_DEFAULTS["project_tag"])
     parser.add_argument("--ssh-key", default=AWS_DEFAULTS["ssh_key"])
     parser.add_argument("--ssh-user", default=AWS_DEFAULTS["ssh_user"])
-    parser.add_argument("--ami-id", default=AWS_DEFAULTS["ami_id"], help="AMI ID for on-demand fallback")
+    parser.add_argument("--ami-id", default=AWS_DEFAULTS["ami_id"],
+                        help="env-only AMI for all roles")
     parser.add_argument("--security-group", default=AWS_DEFAULTS["security_group"])
     parser.add_argument("--subnet", default=AWS_DEFAULTS["subnet"], help="Subnet ID (for AZ pinning)")
+    parser.add_argument("--deadman-minutes", type=int, default=240,
+                        help="Instances self-terminate after this many minutes (safety net)")
+    parser.add_argument("--root-gib", type=int, default=60, help="Root gp3 volume size")
+    parser.add_argument("--allow-od-fallback", action="store_true",
+                        help="Permit on-demand fallback when spot capacity is unavailable "
+                             "(default: abort instead)")
 
     # Cluster topology overrides
     parser.add_argument("--mysql-count", type=int, default=None, help="Override MySQL node count")
     parser.add_argument("--mysql-instance-type", default=None, help="Override MySQL instance type")
-    parser.add_argument("--haproxy-instance-type", default=None, help="Override HAProxy instance type")
+    parser.add_argument("--lineairdb-instance-type", default=None, help="Override LineairDB instance type")
     parser.add_argument("--benchbase-count", type=int, default=None, help="Override BenchBase node count")
     parser.add_argument("--benchbase-instance-type", default=None, help="Override BenchBase instance type")
     # Control options
-    parser.add_argument("--branch", default=None, help="Git branch to checkout on remote nodes (default: keep current)")
+    parser.add_argument("--bundle", default=None,
+                        help="Path to helios bundle tar.gz (default: build one now via build_bundle.sh)")
     parser.add_argument("--on-demand", action="store_true", help="Skip spot, launch all instances as on-demand")
     parser.add_argument("--cleanup-only", action="store_true", help="Only terminate instances, don't launch")
+    parser.add_argument("--cleanup-run-id", default=None,
+                        help="Run tag to scope --cleanup-only to (required unless --cleanup-all)")
+    parser.add_argument("--cleanup-all", action="store_true",
+                        help="With --cleanup-only, sweep every Project-tagged instance "
+                             "instead of scoping to one run (old behaviour)")
     parser.add_argument("--skip-cleanup", action="store_true", help="Don't terminate instances after benchmark")
     parser.add_argument("--dry-run", action="store_true", help="Show what would be launched")
 
     args = parser.parse_args()
+    if args.deadman_minutes < 1:
+        parser.error("--deadman-minutes must be at least 1")
+    if args.bench_prefetch and args.bench_prefetch_stmt:
+        parser.error("--bench-prefetch and --bench-prefetch-stmt are mutually exclusive")
+    if args.cleanup_only and not args.cleanup_all and not args.cleanup_run_id:
+        parser.error("--cleanup-only requires --cleanup-run-id <run_id> or --cleanup-all")
+    if (args.cleanup_all or args.cleanup_run_id) and not args.cleanup_only:
+        parser.error("--cleanup-all / --cleanup-run-id are only valid with --cleanup-only")
+    if args.epoch_ms is not None and not 1 <= args.epoch_ms <= 10000:
+        parser.error("--epoch-ms must be between 1 and 10000")
+    if args.wal_gib < 0:
+        parser.error("--wal-gib must be 0 (no volume) or a positive size")
+    if not re.fullmatch(r"[A-Za-z0-9_=./:,+ -]*", args.mysqld_extra_args):
+        parser.error("--mysqld-extra-args accepts only letters, digits, space and _ = . / : , + -")
+    for kv in args.server_env.split():
+        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=[A-Za-z0-9_./:,+-]*", kv):
+            parser.error(f"--server-env entry {kv!r} is not NAME=VALUE with NAME a shell identifier "
+                         "and VALUE made of letters, digits and _ . / : , + -")
+    if args.engine == "innodb":
+        if args.mysql_count is not None and args.mysql_count != 1:
+            parser.error("--engine innodb runs a single MySQL/InnoDB node; --mysql-count must be 1")
+        if args.bench_prefetch or args.bench_prefetch_stmt or args.bench_ndv_drift:
+            parser.error("--engine innodb has no LineairDB sysvars; "
+                         "--bench-prefetch, --bench-prefetch-stmt and --bench-ndv-drift are not supported")
+        if args.durability != "volatile" or args.epoch_ms is not None or args.server_env or args.flush_trace:
+            parser.error("--durability/--epoch-ms/--server-env/--flush-trace configure the LineairDB server; "
+                         "not valid with --engine innodb")
+        if args.lineairdb_instance_type is not None:
+            parser.error("--lineairdb-instance-type is meaningless with --engine innodb")
+        if args.wal_gib <= 0:
+            parser.error("--engine innodb needs --wal-gib > 0: the datadir must live on the io2 volume")
+    if args.flush_trace and args.wal_gib <= 0:
+        parser.error("--flush-trace needs --wal-gib > 0 (the trace is written on the WAL volume)")
+    if args.engine != "innodb" and args.innodb_buffer_pool_gib is not None:
+        parser.error("--innodb-buffer-pool-gib is only valid with --engine innodb")
+    if args.innodb_buffer_pool_gib is not None and args.innodb_buffer_pool_gib < 1:
+        parser.error("--innodb-buffer-pool-gib must be at least 1")
+    if (args.mysql_count is not None and args.mysql_count < 1) or \
+            (args.benchbase_count is not None and args.benchbase_count < 1):
+        parser.error("--mysql-count and --benchbase-count must be at least 1")
+    if args.bundle is not None:
+        args.bundle = str(Path(args.bundle).resolve())
     os.chdir(ANSIBLE_DIR)
 
     # Apply cluster overrides before building machine_spec
@@ -544,83 +829,134 @@ Examples:
         CLUSTER["mysql"]["count"] = args.mysql_count
     if args.mysql_instance_type is not None:
         CLUSTER["mysql"]["instance_type"] = args.mysql_instance_type
-    if args.haproxy_instance_type is not None:
-        CLUSTER["haproxy"]["instance_type"] = args.haproxy_instance_type
+    if args.lineairdb_instance_type is not None:
+        CLUSTER["lineairdb"]["instance_type"] = args.lineairdb_instance_type
     if args.benchbase_count is not None:
         CLUSTER["benchbase"]["count"] = args.benchbase_count
     if args.benchbase_instance_type is not None:
         CLUSTER["benchbase"]["instance_type"] = args.benchbase_instance_type
+    if args.engine == "innodb":
+        CLUSTER["lineairdb"]["count"] = 0
+        if CLUSTER["mysql"]["count"] != 1:
+            parser.error("--engine innodb runs a single MySQL/InnoDB node; the mysql role count must be 1")
 
     machine_spec = build_machine_spec()
 
     # Setup log directory: result/<run_id>/<machine_spec>/logs/
     global LOG_FILE
-    run_id = datetime.now().strftime("%Y%m%d-%H%M%S")
-    if args.bench_prefetch:
+    # Keep concurrent invocations in distinct Run scopes
+    run_id = datetime.now().strftime("%Y%m%d-%H%M%S") + f"-{secrets.token_hex(2)}"
+    if args.bench_prefetch_stmt:
+        run_id += "-prefetch-stmt"
+    elif args.bench_prefetch:
         run_id += "-prefetch"
+    if args.bench_ndv_drift:
+        run_id += "-ndvdrift"
+    if args.durability != "volatile":
+        run_id += f"-{args.durability}"
+    if args.epoch_ms is not None:
+        run_id += f"-e{args.epoch_ms}"
+    if args.flush_trace:
+        run_id += "-ft"
+    if args.engine == "innodb":
+        run_id += "-innodb"
     log_dir = ANSIBLE_DIR / "result" / run_id / machine_spec / "logs"
     log_dir.mkdir(parents=True, exist_ok=True)
     LOG_FILE = open(log_dir / "bench_aws.log", "w")
+    with open(log_dir / "run_config.json", "w") as f:
+        json.dump({"run_id": run_id, "args": vars(args), "cluster": CLUSTER}, f, indent=2, sort_keys=True)
     log(f"Log directory: {log_dir}")
     log(f"Machine spec: {machine_spec}")
 
     # Cleanup-only mode
     if args.cleanup_only:
-        cleanup(args)
+        if args.dry_run:
+            log(f"DRY RUN: would clean up "
+                f"{'every Project-tagged instance' if args.cleanup_all else 'Run=' + args.cleanup_run_id}")
+            LOG_FILE.close()
+            return 0
+        cleanup_ok = cleanup(args, run_id=args.cleanup_run_id)
         LOG_FILE.close()
-        return 0
+        return 0 if cleanup_ok else 1
 
     # Dry run
     if args.dry_run:
+        log(f"Engine: {args.engine}")
         log("DRY RUN — would launch:")
         for role, cfg in CLUSTER.items():
-            log(f"  {role}: {cfg['count']}x {cfg['instance_type']} (tag={cfg['tag']})")
+            if cfg["count"] == 0:
+                log(f"  {role}: skipped (count=0)")
+                continue
+            log(f"  {role}: {cfg['count']}x {cfg['instance_type']} "
+                f"(tag={cfg['tag']}, ena_queues={ena_queue_count(cfg['instance_type'])})")
+        if args.engine != "innodb":
+            log(f"Durability: {args.durability}"
+                + (f" epoch_ms={args.epoch_ms}" if args.epoch_ms is not None else ""))
+        if args.wal_gib > 0:
+            log(f"{'Data' if args.engine == 'innodb' else 'WAL'} volume: {args.wal_gib}GiB io2 "
+                f"iops={args.wal_iops} on {_wal_role(args)} (/dev/sdf, DeleteOnTermination=true)")
+        else:
+            log("WAL volume: none (root volume only)")
+        log(f"mysqld extra args: {args.mysqld_extra_args!r}")
+        log(f"run_id: {run_id}")
         log(f"Benchmark: {args.bench_type} SF={args.bench_scalefactor or 'default'}")
         if args.bench_terms:
             log(f"Terminals: [{args.bench_terms}]")
         LOG_FILE.close()
         return 0
 
+    # Build or locate the bundle before launching anything
+    bundle_path = args.bundle
+    if bundle_path is None:
+        bundle_path = str(ANSIBLE_DIR / "helios-bundle.tar.gz")
+        log("Building bundle via build_bundle.sh...")
+        run(f"bash {shlex.quote(str(SCRIPT_DIR / 'build_bundle.sh'))} {shlex.quote(bundle_path)}")
+    bundle_path = str(Path(bundle_path).resolve())
+    bundle_sha256 = subprocess.run(
+        ["sha256sum", bundle_path], capture_output=True, text=True, check=True,
+    ).stdout.split()[0]
+    log(f"Bundle: {bundle_path} sha256={bundle_sha256}")
+
     # Full run
     start_time = time.time()
-    instance_ids = None
 
+    rc = 1
     try:
         # Phase 1: Launch
-        instance_ids = launch_instances(args)
+        instance_ids = launch_instances(args, run_id)
         if instance_ids is None:
-            log("SPOT UNAVAILABLE — skipping benchmark.")
-            return 1
+            log("LAUNCH FAILED: skipping benchmark.")
+        else:
+            # Phase 2: Wait
+            wait_for_instances(instance_ids, args.region)
 
-        # Phase 2: Wait
-        wait_for_instances(instance_ids, args.region)
+            # Phase 3: Inventory + SSH
+            generate_inventory(args, run_id)
+            wait_for_ssh(args)
 
-        # Phase 3: Inventory + SSH
-        generate_inventory(args)
-        wait_for_ssh(args)
+            # Phase 4: Deploy + Benchmark
+            deploy_infrastructure(args, bundle_path, bundle_sha256)
+            run_benchmarks(args, run_id)
 
-        # Phase 4: Deploy + Benchmark
-        deploy_infrastructure(branch=args.branch)
-        run_benchmarks(args, run_id)
-
-        elapsed = time.time() - start_time
-        log(f"All done in {elapsed / 60:.1f} minutes.")
-        return 0
+            elapsed = time.time() - start_time
+            log(f"All done in {elapsed / 60:.1f} minutes.")
+            rc = 0
 
     except (RuntimeError, subprocess.CalledProcessError) as e:
         log(f"ERROR: {e}")
-        return 1
+        salvage_server_logs(args, run_id)
 
     except KeyboardInterrupt:
         log("Interrupted by user.")
-        return 1
 
     finally:
-        if not args.skip_cleanup and instance_ids is not None:
-            cleanup(args)
+        # Always sweep: a launch whose response was lost has no recorded id
+        if not args.skip_cleanup and not cleanup(args, run_id=run_id):
+            rc = 1
         if LOG_FILE:
             log(f"Full log saved to: {log_dir}")
             LOG_FILE.close()
+    return rc
 
 
 if __name__ == "__main__":

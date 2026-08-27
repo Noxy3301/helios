@@ -1,49 +1,116 @@
 ---
+# Start the LineairDB server from the pushed bundle (push_bundle.yml runs first;
+# there is no repository or build step on the node).
 - hosts: lineairdb
   gather_facts: false
   vars:
     lineairdb_nofile_limit: 1048576
+    ena_rss_interface: ens5
+    helios_durability: volatile
+    helios_epoch_ms: ""
+    # Extra KEY=VALUE pairs exported to the server (space separated)
+    helios_server_env: ""
+    # Path prefix for the WAL flush trace; empty disables it
+    helios_flush_trace: ""
+    wal_volume: false
+    wal_mount: /mnt/wal
   tasks:
-    - name: Sync helios repo + submodules
+    # Before any traffic; the play itself runs unprivileged
+    - import_tasks: tasks/ena_queue_tuning.yml
+      become: true
+      tags: [privileged]
+
+    - import_tasks: tasks/mount_data_volume.yml
+      become: true
+      tags: [privileged]
+      vars:
+        data_mount: "{{ wal_mount }}"
+        data_volume: "{{ wal_volume }}"
+
+    - name: Point lineairdb_logs at the WAL volume
+      # Separate from the mount block so a re-pushed bundle (which recreates
+      # the plain directory) is re-linked even when the volume stayed mounted.
+      when: wal_volume | bool
+      become: true
+      tags: [privileged]
       shell: |
         set -euo pipefail
-        cd ~/helios
-        ./scripts/stop_server.sh || true
-        git fetch origin
-        git checkout {{ helios_branch | default('main') }}
-        git pull --ff-only
-        git submodule update --init --recursive
-        echo "=== SHAs ==="
-        echo "Helios($(git rev-parse --abbrev-ref HEAD)@$(git rev-parse --short HEAD))"
-        echo "LineairDB($(cd third_party/LineairDB && git rev-parse --abbrev-ref HEAD)@$(cd third_party/LineairDB && git rev-parse --short HEAD))"
-        echo "mysql-server($(cd third_party/mysql-server && git rev-parse --abbrev-ref HEAD)@$(cd third_party/mysql-server && git rev-parse --short HEAD))"
-        echo "benchbase($(cd third_party/benchbase && git rev-parse --abbrev-ref HEAD)@$(cd third_party/benchbase && git rev-parse --short HEAD))"
+        mkdir -p {{ wal_mount }}/lineairdb_logs
+        chown {{ ansible_user }}:{{ ansible_user }} {{ wal_mount }}/lineairdb_logs
+        target=/home/{{ ansible_user }}/helios/lineairdb_logs
+        if [ -L "$target" ]; then
+          rm -f "$target"
+        elif [ -e "$target" ]; then
+          rm -rf "$target"
+        fi
+        ln -s {{ wal_mount }}/lineairdb_logs "$target"
+        chown -h {{ ansible_user }}:{{ ansible_user }} "$target"
       args:
         executable: /bin/bash
-      register: sync_result
-
-    - name: Show repo / submodule SHAs
-      debug:
-        var: sync_result.stdout_lines
-
-    - name: Build server + proxy
-      shell: |
-        set -euo pipefail
-        cd ~/helios
-        ./scripts/build_partial.sh 2>&1 | tail -40
-      args:
-        executable: /bin/bash
-      register: build_result
-
-    - name: Show build tail
-      debug:
-        var: build_result.stdout_lines
 
     - name: Start LineairDB-Server
+      # Never pipe the start scripts: log to a file and verify liveness explicitly;
+      # lineairdb_logs is wiped first, following the WAL symlink when present, so
+      # a run never replays a previous WAL
       shell: |
         set -euo pipefail
         cd ~/helios
+        ./scripts/stop_server.sh > /dev/null 2>&1 || true
+        # pgrep status 1 means no process; anything else keeps the WAL untouched
+        rc=0
+        for _ in $(seq 1 30); do
+          pgrep -f '[b]uild/server/lineairdb-server' > /dev/null && rc=0 || rc=$?
+          [ "$rc" -eq 0 ] || break
+          sleep 1
+        done
+        [ "$rc" -eq 1 ] || { echo "refusing to wipe the WAL: a previous lineairdb-server is still running or pgrep failed (status $rc)"; exit 1; }
+        find ~/helios/lineairdb_logs/ -mindepth 1 -delete
         ulimit -n {{ lineairdb_nofile_limit }}
-        ./scripts/start_server.sh
+        export LINEAIRDB_COMMIT_DURABILITY="{{ helios_durability }}"
+        {% if helios_epoch_ms %}
+        export LINEAIRDB_EPOCH_DURATION_MS="{{ helios_epoch_ms }}"
+        {% endif %}
+        {% for kv in helios_server_env.split() %}
+        export '{{ kv }}'
+        {% endfor %}
+        {% if helios_flush_trace %}
+        mkdir -p "$(dirname {{ helios_flush_trace }})"
+        export LINEAIRDB_FLUSH_TRACE="{{ helios_flush_trace }}"
+        {% endif %}
+        ./scripts/start_server.sh > /tmp/start_server.log 2>&1
+        sleep 2
+        # Bracketed: the pattern kill in stop_server.sh must not match this shell
+        pgrep -f '[b]uild/server/lineairdb-server' > /dev/null || {
+          echo "lineairdb-server did not stay up:"; cat /tmp/start_server.log
+          tail -20 ~/helios/lineairdb_logs/lineairdb_server_*.log 2>/dev/null
+          exit 1
+        }
+        echo "lineairdb-server up (nofile=$(ulimit -n))"
       args:
         executable: /bin/bash
+      register: server_start
+
+    - name: Show server start log
+      debug:
+        var: server_start.stdout_lines
+
+    - name: Show durability configuration
+      debug:
+        msg:
+          - "LINEAIRDB_COMMIT_DURABILITY={{ helios_durability }}"
+          - "LINEAIRDB_EPOCH_DURATION_MS={{ helios_epoch_ms if helios_epoch_ms else '(server default)' }}"
+          - "extra env: {{ helios_server_env if helios_server_env else '(none)' }}"
+          - "LINEAIRDB_FLUSH_TRACE={{ helios_flush_trace if helios_flush_trace else '(off)' }}"
+
+    - name: Capture WAL volume disk usage
+      when: wal_volume | bool
+      shell: df -h {{ wal_mount }}
+      args:
+        executable: /bin/bash
+      register: wal_df
+      changed_when: false
+
+    - name: Show WAL volume disk usage
+      when: wal_volume | bool
+      debug:
+        var: wal_df.stdout_lines
