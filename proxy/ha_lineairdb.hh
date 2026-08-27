@@ -72,7 +72,18 @@ public:
   THR_LOCK lock;
   LineairDB_share();
   ~LineairDB_share() override { thr_lock_delete(&lock); }
-  std::atomic<uint64_t> next_hidden_pk{0};
+  // Hidden primary keys reserved from the storage server, handed out to every
+  // connection of this mysqld that writes to the table. next == end means the
+  // range is spent and the next row has to reserve another one.
+  struct HiddenKeyRange {
+    std::mutex mutex;
+    uint64_t next = 0;
+    uint64_t end = 0;
+    // Run of the storage server that granted it; a range from an earlier run
+    // may overlap one the restarted server has since handed to someone else.
+    uint64_t boot_token = 0;
+  };
+  HiddenKeyRange hidden_keys;
 
   // Row-count estimate for handler::info() (sum of committed deltas in shards).
   static constexpr size_t kRowCountShards = 64; // must be power-of-two
@@ -211,6 +222,10 @@ private:
   bool insert_peeks_duplicates_{false};
   // Key MySQL asks about through info(HA_STATUS_ERRKEY) after a duplicate.
   uint duplicate_key_index_{MAX_KEY};
+  // Row estimate for the running bulk insert and the hidden keys taken against
+  // it, so one reservation can cover the whole statement. 0 means no estimate.
+  ha_rows bulk_insert_rows_{0};
+  ha_rows bulk_insert_generated_{0};
   my_off_t
       current_position_; /* Current position in the file during a file scan */
   std::string write_buffer_;
@@ -228,8 +243,7 @@ private:
 
   void store_primary_key_in_ref(const std::string &primary_key);
   std::string extract_primary_key_from_ref(const uchar *pos) const;
-  bool uses_hidden_primary_key() const;
-  std::string generate_hidden_primary_key();
+  int generate_hidden_primary_key(LineairDBTransaction *tx, std::string *key);
   std::string serialize_hidden_primary_key(uint64_t row_id) const;
   bool fetch_next_batch();
 
@@ -544,6 +558,14 @@ public:
    * @return 0, or the handler error the statement should print.
    */
   int end_bulk_insert() override;
+
+  /**
+   * @brief Takes MySQL's row estimate for the statement about to run.
+   *
+   * @details Only a sizing hint: it lets one hidden-key reservation cover the
+   * whole statement. 0 (LOAD DATA) means no estimate.
+   */
+  void start_bulk_insert(ha_rows rows) override;
   int external_lock(THD *thd, int lock_type) override; ///< required
   int start_stmt(THD *thd, thr_lock_type lock_type) override;
   int delete_all_rows(void) override;
@@ -687,8 +709,16 @@ private:
   std::string convert_key_to_ldbformat(const uchar *key, key_part_map keypart_map);
   std::string serialize_key_from_field(Field *field);
   std::string build_secondary_key_from_row(const uchar *row_buffer, const KEY &key_info);
-  std::string extract_key(const uchar *buf);
-  std::string autogenerate_key();
+  /**
+   * @brief Key of the row in `buf`, reserving a hidden one from the storage
+   * server when the table declares no primary key.
+   *
+   * @return 0 when *key holds the key, else the handler error to report.
+   *   Retryable when the server could not be reached, non-retryable when it
+   *   refused. `tx` is marked aborted on failure and *key is left untouched.
+   */
+  int extract_key(const uchar *buf, LineairDBTransaction *tx, std::string *key);
+  int autogenerate_key(LineairDBTransaction *tx, std::string *key);
   std::string extract_key_from_mysql(const uchar *row_buffer);
 
   /**

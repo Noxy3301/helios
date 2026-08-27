@@ -83,7 +83,10 @@ enum class MessageType : uint32_t {
     TX_GET_TABLE_STATS = 31,
 
     // DuckDB bridge (resolved-statement request). See lineairdb.proto.
-    TX_EXECUTE_DUCKDB_QUERY = 36
+    TX_EXECUTE_DUCKDB_QUERY = 36,
+
+    // Hidden primary key allocation
+    DB_ALLOCATE_HIDDEN_KEYS = 37
 };
 
 /**
@@ -325,6 +328,22 @@ public:
     bool db_create_secondary_index(const std::string& table_name,
                                    const std::string& index_name,
                                    uint32_t index_type);
+    struct HiddenKeyReservation {
+        bool ok = false;
+        // The requested count starting here belongs to this query layer
+        uint64_t first_id = 0;
+        // The run of the storage server that granted it
+        uint64_t boot_token = 0;
+        // The server rejected the request and will reject it again
+        bool permanent = false;
+        bool transport_error = false;
+        std::string error;
+    };
+    // Reserve hidden primary keys for a table that declares none. The server
+    // owns the counter, so the range is unique across every query layer
+    // sharing this storage.
+    HiddenKeyReservation db_allocate_hidden_keys(const std::string& table_name,
+                                                 uint32_t count);
 
     // database operations
     bool db_end_transaction(int64_t tx_id, bool isFence,
@@ -341,6 +360,11 @@ public:
     // Route per-RPC measurements to the active transaction trace.
     void set_current_trace(TxRpcTrace* trace) { current_trace_ = trace; }
 
+    // Run of the storage server this connection has heard from, 0 until it
+    // hears from one and again after any transport failure. Starting at 0 is
+    // what makes a new connection re-reserve rather than trust a cached range.
+    uint64_t storage_boot_token() const { return storage_boot_token_; }
+
 private:
     std::unordered_map<std::string, int64_t> table_stats_cache_;
     std::unordered_map<std::string, IndexNdvResult> last_index_ndv_;
@@ -354,12 +378,17 @@ private:
                                    MessageType message_type, const std::string& meta = "");
     // Parse flat binary scan response: [is_aborted:1B] [entries...] [sentinel: key_len=0]
     static std::vector<KeyValue> parse_binary_kv_response(const std::string& raw, bool& is_aborted);
-    bool send_message(const std::string& serialized_request, std::string& serialized_response);
     bool send_message_with_header(const std::string& serialized_request,
                                   std::string& serialized_response,
                                   MessageType message_type,
                                   const std::string& meta = "");
+    // The exchange itself; send_message_with_header wraps it so that every
+    // transport failure invalidates the boot token.
+    bool exchange_message(const std::string& serialized_request,
+                          std::string& serialized_response,
+                          MessageType message_type, const std::string& meta);
 
+    uint64_t storage_boot_token_ = 0;
     int socket_fd_;
     bool connected_;
     std::string host_;

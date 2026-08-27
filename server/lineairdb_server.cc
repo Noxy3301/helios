@@ -48,14 +48,17 @@ void LineairDBServer::init() {
         db_manager_ = std::make_shared<DatabaseManager>();
     }
 
-    LOG_INFO("LineairDB server initialized successfully");
+    LOG_INFO("LineairDB server initialized successfully on port %u, boot token %llu",
+             static_cast<unsigned>(listen_port()),
+             static_cast<unsigned long long>(storage_boot_token()));
 }
 
 void LineairDBServer::handle_client(int client_socket) {
     LOG_INFO("Handling client connection fd=%d", client_socket);
     // Per-connection managers
     auto tx_manager = std::make_shared<TransactionManager>(*db_manager_->get_database());
-    auto rpc_handler = std::make_shared<LineairDBRpc>(db_manager_, tx_manager, row_counts_);
+    auto rpc_handler = std::make_shared<LineairDBRpc>(db_manager_, tx_manager,
+                                                      row_counts_, hidden_keys_);
 
     while (true) {
         uint64_t sender_id;

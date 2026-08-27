@@ -166,6 +166,11 @@ int64_t LineairDBProxy::tx_begin_transaction() {
         return -1;
     }
 
+    // Where a connection learns which run of the storage server it is talking
+    // to. Prefetch connections skip TX_BEGIN and learn it from their first
+    // reservation instead.
+    storage_boot_token_ = response.boot_token();
+
     // Cache table row counts from server for optimizer stats.
     table_stats_cache_.clear();
     for (const auto& ts : response.table_stats()) {
@@ -1355,6 +1360,45 @@ bool LineairDBProxy::db_set_table(int64_t tx_id, const std::string& table_name) 
     return response.success();
 }
 
+LineairDBProxy::HiddenKeyReservation LineairDBProxy::db_allocate_hidden_keys(
+    const std::string& table_name, uint32_t count) {
+    HiddenKeyReservation reservation;
+    if (!connected_) {
+        LOG_ERROR("RPC failed: Not connected to server");
+        reservation.transport_error = true;
+        reservation.error = "not connected to the storage server";
+        return reservation;
+    }
+
+    LineairDB::Protocol::DbAllocateHiddenKeys::Request request;
+    LineairDB::Protocol::DbAllocateHiddenKeys::Response response;
+
+    request.set_table_name(table_name);
+    request.set_count(count);
+
+    if (!send_protobuf_message(request, response,
+                               MessageType::DB_ALLOCATE_HIDDEN_KEYS)) {
+        LOG_ERROR("RPC failed: Failed to send message to server");
+        reservation.transport_error = true;
+        reservation.error = "the storage server did not answer";
+        return reservation;
+    }
+
+    storage_boot_token_ = response.boot_token();
+    if (!response.ok()) {
+        reservation.permanent = response.permanent();
+        reservation.error = response.error();
+        LOG_ERROR("CLIENT: db_allocate_hidden_keys for %s rejected: %s",
+                  table_name.c_str(), reservation.error.c_str());
+        return reservation;
+    }
+
+    reservation.ok = true;
+    reservation.first_id = response.first_id();
+    reservation.boot_token = response.boot_token();
+    return reservation;
+}
+
 bool LineairDBProxy::db_create_secondary_index(const std::string& table_name,
                                                 const std::string& index_name,
                                                 uint32_t index_type) {
@@ -1444,58 +1488,6 @@ void LineairDBProxy::db_fence() {
     }
 
     LOG_DEBUG("CLIENT: db_fence completed");
-}
-
-bool LineairDBProxy::send_message(const std::string& serialized_request, std::string& serialized_response) {
-    if (!connected_) {
-        LOG_ERROR("SEND_MESSAGE: Not connected to server");
-        return false;
-    }
-
-    LOG_DEBUG("SEND_MESSAGE: Sending message of size %zu bytes", serialized_request.size());
-
-    // send message size first (4 bytes)
-    uint32_t message_size = htonl(serialized_request.size());
-    LOG_DEBUG("SEND_MESSAGE: Sending size header: %zu (network order: %u)", serialized_request.size(), message_size);
-
-    ssize_t size_sent = send(socket_fd_, &message_size, sizeof(message_size), 0);
-    if (size_sent != sizeof(message_size)) {
-        LOG_ERROR("SEND_MESSAGE: Failed to send size header, sent %zd bytes instead of %zu", size_sent, sizeof(message_size));
-        return false;
-    }
-    LOG_DEBUG("SEND_MESSAGE: Size header sent successfully");
-
-    // send message body
-    LOG_DEBUG("SEND_MESSAGE: Sending message body...");
-    ssize_t body_sent = send(socket_fd_, serialized_request.data(), serialized_request.size(), 0);
-    if (body_sent != static_cast<ssize_t>(serialized_request.size())) {
-        LOG_ERROR("SEND_MESSAGE: Failed to send message body, sent %zd bytes instead of %zu", body_sent, serialized_request.size());
-        return false;
-    }
-    LOG_DEBUG("SEND_MESSAGE: Message body sent successfully");
-
-    // receive response size
-    LOG_DEBUG("SEND_MESSAGE: Waiting for response size...");
-    uint32_t response_size;
-    ssize_t size_received = recv(socket_fd_, &response_size, sizeof(response_size), MSG_WAITALL);
-    if (size_received != sizeof(response_size)) {
-        LOG_ERROR("SEND_MESSAGE: Failed to receive response size, got %zd bytes", size_received);
-        return false;
-    }
-    response_size = ntohl(response_size);
-    LOG_DEBUG("SEND_MESSAGE: Received response size: %u bytes", response_size);
-
-    // receive response body
-    LOG_DEBUG("SEND_MESSAGE: Waiting for response body...");
-    serialized_response.resize(response_size);
-    ssize_t body_received = recv(socket_fd_, &serialized_response[0], response_size, MSG_WAITALL);
-    if (body_received != static_cast<ssize_t>(response_size)) {
-        LOG_ERROR("SEND_MESSAGE: Failed to receive response body, got %zd bytes instead of %u", body_received, response_size);
-        return false;
-    }
-    LOG_DEBUG("SEND_MESSAGE: Response body received successfully");
-
-    return true;
 }
 
 template<typename RequestType, typename ResponseType>
@@ -1589,6 +1581,21 @@ bool LineairDBProxy::send_message_with_header(const std::string& serialized_requ
                                               std::string& serialized_response,
                                               MessageType message_type,
                                               const std::string& meta) {
+    if (exchange_message(serialized_request, serialized_response, message_type,
+                         meta)) {
+        return true;
+    }
+    // Every RPC funnels through here, so one reset covers them all. Nothing
+    // below reconnects or retries, so a transaction that saw a transport error
+    // must abort: this reset is what invalidates the range it has cached.
+    storage_boot_token_ = 0;
+    return false;
+}
+
+bool LineairDBProxy::exchange_message(const std::string& serialized_request,
+                                      std::string& serialized_response,
+                                      MessageType message_type,
+                                      const std::string& meta) {
     auto rpc_start_ts = std::chrono::steady_clock::now();
     const uint32_t req_bytes = static_cast<uint32_t>(serialized_request.size());
 
