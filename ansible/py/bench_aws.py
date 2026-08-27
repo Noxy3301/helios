@@ -439,8 +439,12 @@ def run_benchmarks(args, run_id):
         exec_vars += f" bench_serial={'true' if args.bench_serial else 'false'}"
     if args.bench_profile:
         exec_vars += f" bench_profile={args.bench_profile}"
-    if args.bench_prefetch:
+    if args.bench_prefetch or args.bench_prefetch_stmt:
         exec_vars += " bench_prefetch=true"
+    if args.bench_prefetch_stmt:
+        exec_vars += " bench_prefetch_plan=false"
+    if args.bench_ndv_drift:
+        exec_vars += " bench_ndv_drift=true"
     if args.perf:
         exec_vars += " enable_perf=true"
     if args.perf_stat:
@@ -605,7 +609,17 @@ Examples:
     parser.add_argument("--bench-prefetch", action="store_true",
                         help="Run BenchBase in Helios prefetch mode "
                              "(SET GLOBAL lineairdb_prefetch_execution=ON on every MySQL "
-                             "and HELIOS_PREFETCH_PLAN=1 env for the executor)")
+                             "and HELIOS_PREFETCH_PLAN=1 env for the executor, so the "
+                             "TPC-C procedures inject @_tx_plan)")
+    parser.add_argument("--bench-prefetch-stmt", action="store_true",
+                        help="Statement-scoped autogen prefetch: "
+                             "SET GLOBAL lineairdb_prefetch_execution=ON WITHOUT "
+                             "HELIOS_PREFETCH_PLAN, so the proxy derives a per-statement "
+                             "read plan from the QEP instead of the injected @_tx_plan DSL")
+    parser.add_argument("--bench-ndv-drift", action="store_true",
+                        help="SET GLOBAL lineairdb_stats_drift_refresh=ON "
+                             "(default OFF: the NDV/histogram recompute is synchronous "
+                             "on the read path)")
     parser.add_argument("--perf", action="store_true", help="Enable perf profiling on lineairdb + mysql nodes")
     parser.add_argument("--load-jstack", action="store_true",
                         help="Take one thread dump of the loader JVM mid-load (diagnostic; "
@@ -649,6 +663,8 @@ Examples:
     args = parser.parse_args()
     if args.deadman_minutes < 1:
         parser.error("--deadman-minutes must be at least 1")
+    if args.bench_prefetch and args.bench_prefetch_stmt:
+        parser.error("--bench-prefetch and --bench-prefetch-stmt are mutually exclusive")
     if args.bundle is not None:
         args.bundle = str(Path(args.bundle).resolve())
     os.chdir(ANSIBLE_DIR)
@@ -672,8 +688,12 @@ Examples:
     # Setup log directory: result/<run_id>/<machine_spec>/logs/
     global LOG_FILE
     run_id = datetime.now().strftime("%Y%m%d-%H%M%S")
-    if args.bench_prefetch:
+    if args.bench_prefetch_stmt:
+        run_id += "-prefetch-stmt"
+    elif args.bench_prefetch:
         run_id += "-prefetch"
+    if args.bench_ndv_drift:
+        run_id += "-ndvdrift"
     log_dir = ANSIBLE_DIR / "result" / run_id / machine_spec / "logs"
     log_dir.mkdir(parents=True, exist_ok=True)
     LOG_FILE = open(log_dir / "bench_aws.log", "w")

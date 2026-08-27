@@ -1,21 +1,9 @@
 ---
 # Benchmark execution orchestrator: terminal-count sweep on bench nodes.
 #
-# Usage:
-#   # YCSB profile B (default terminal sweep)
-#   ansible-playbook -i inventory.ini measure.yml -e "bench_type=ycsb bench_profile=b"
+# Usage: ansible-playbook -i inventory.ini measure.yml -e "bench_type=tpcc bench_terms=[1,16,64]"
 #
-#   # TPC-C with custom terminals
-#   ansible-playbook -i inventory.ini measure.yml -e "bench_type=tpcc bench_terms=[1,16,64]"
-#
-#   # TPC-H serial (22 queries once)
-#   ansible-playbook -i inventory.ini measure.yml -e "bench_type=tpch bench_scalefactor=0.1"
-#
-#   # TPC-H parallel scalability
-#   ansible-playbook -i inventory.ini measure.yml \
-#     -e "bench_type=tpch bench_serial=false bench_scalefactor=0.01 bench_terms=[1,2,4,8,16]"
-#
-# Typically invoked via measure_usage.yml which wraps this with CPU/network monitoring.
+# Typically invoked via measure_usage.yml, which wraps this with CPU/network monitoring.
 - hosts: benchbase
   gather_facts: false
   vars:
@@ -24,9 +12,15 @@
     bench_profile: b
     bench_serial: "{{ bench_type == 'tpch' }}"
     # Run BenchBase in Helios prefetch mode: SET GLOBAL lineairdb_prefetch_execution=ON
-    # on every MySQL once per sweep, then prefix the BenchBase java invocation with
-    # HELIOS_PREFETCH_PLAN=1 so the TPC-C procedures inject @_tx_plan hints.
+    # on every MySQL once per sweep.
     bench_prefetch: false
+    # Whether to also export HELIOS_PREFETCH_PLAN=1, which makes the TPC-C procedures
+    # inject @_tx_plan hints. Set false to measure the statement-scoped autogen path,
+    # where the proxy derives a per-statement read plan from the QEP instead.
+    bench_prefetch_plan: true
+    # Refetch index NDV and histogram when the row count drifts more than 20%.
+    # Off by default: the recompute is synchronous on the read path.
+    bench_ndv_drift: false
 
     # -- Execution parameters --
     bench_time: 60
@@ -76,6 +70,20 @@
           -u root --protocol=TCP \
           -h {{ hostvars[item].private_ip }} -P 3307 \
           -e "SET GLOBAL lineairdb_prefetch_execution={{ 'ON' if bench_prefetch | bool else 'OFF' }};"
+      args:
+        executable: /bin/bash
+      run_once: true
+      delegate_to: "{{ groups['benchbase'][0] }}"
+      loop: "{{ groups['mysql'] }}"
+      loop_control:
+        label: "{{ item }}"
+
+    - name: "Toggle lineairdb_stats_drift_refresh on each MySQL (={{ 'ON' if bench_ndv_drift | bool else 'OFF' }})"
+      shell: |
+        ~/helios/build/runtime_output_directory/mysql \
+          -u root --protocol=TCP \
+          -h {{ hostvars[item].private_ip }} -P 3307 \
+          -e "SET GLOBAL lineairdb_stats_drift_refresh={{ 'ON' if bench_ndv_drift | bool else 'OFF' }};"
       args:
         executable: /bin/bash
       run_once: true

@@ -50,7 +50,7 @@
     dest="$out_dir/execute_{{ bench_term }}"
     mkdir -p "$dest"
     java_status=0
-    {% if bench_prefetch | default(false) | bool %}
+    {% if (bench_prefetch | default(false) | bool) and (bench_prefetch_plan | default(true) | bool) %}
     export HELIOS_PREFETCH_PLAN=1
     {% endif %}
     output=$(timeout -k 30 -s INT $(( {{ bench_time | default(60) }} + 300 )) \
