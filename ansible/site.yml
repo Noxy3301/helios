@@ -2,8 +2,8 @@
 # Raise file descriptor limits on all nodes
 #
 # bench_aws.py does not run this file; it invokes lineairdb.yml, mysql.yml and
-# benchbase.yml directly, which is why ENA queue tuning is wired into
-# benchbase.yml. Kept for manual runs, which pass bundle_path and bundle_sha256.
+# benchbase.yml directly, which is why ENA queue tuning is wired into those
+# playbooks. Kept for manual runs, which pass bundle_path and bundle_sha256.
 - hosts: all
   become: true
   gather_facts: false

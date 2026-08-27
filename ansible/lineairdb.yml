@@ -5,7 +5,12 @@
   gather_facts: false
   vars:
     lineairdb_nofile_limit: 1048576
+    ena_rss_interface: ens5
   tasks:
+    # Before any traffic; the play itself runs unprivileged
+    - import_tasks: tasks/ena_queue_tuning.yml
+      become: true
+
     - name: Start LineairDB-Server
       # Never pipe the start scripts: log to a file and verify liveness explicitly
       shell: |

@@ -90,9 +90,8 @@
     _mysql_bin: ~/helios/build/runtime_output_directory/mysql
     _bb_dir: ~/helios/bench/benchbase-mysql
     _config_dir: ~/helios/bench/config
-    # Interface and queue count that bench_aws.py requests at launch.
+    # Interface whose ENA queue count bench_aws.py raises at launch
     ena_rss_interface: ens5
-    ena_rss_target_combined: 32
     bench_analyze: false
     run_id: "run"
     machine_spec: "unknown"

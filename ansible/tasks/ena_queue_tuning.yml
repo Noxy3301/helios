@@ -1,10 +1,10 @@
 ---
 # Raise ENA combined RX/TX queues before any traffic flows.
 #
-# The EC2 default queue count leaves softirq concentrated on too few cores
-# under proxy and driver load. bench_aws.py requests a higher count at launch; this task
-# verifies it landed and raises the active channel count only when the driver
-# did not start there. Callers set ena_rss_interface and ena_rss_target_combined.
+# The EC2 default leaves softirq on too few cores under load. bench_aws.py
+# requests min(32, vCPU/2) at launch where that beats the default; this task
+# computes the same target from nproc, caps it at the host's maximum, and
+# raises the active channel count only when the driver did not start there.
 - name: Configure ENA queues
   block:
     - name: Install ENA inspection and IRQ balancing tools
@@ -13,8 +13,6 @@
           - ethtool
           - irqbalance
         state: present
-        update_cache: true
-        cache_valid_time: 3600
 
     - name: Keep irqbalance enabled
       ansible.builtin.service:
@@ -72,16 +70,22 @@
         ena_rss_current_combined: >-
           {{ ena_channels_before.stdout.split()[1] | int }}
 
-    - name: Require target queues to have been allocated by EC2
-      ansible.builtin.assert:
-        that:
-          - (ena_rss_max_combined | int) >= (ena_rss_target_combined | int)
-        fail_msg: >-
-          {{ inventory_hostname }} exposes only {{ ena_rss_max_combined }}
-          ENA combined queues; target is {{ ena_rss_target_combined }}.
-          Launch the primary ENI with EnaQueueCount={{ ena_rss_target_combined }}
-          (bench_aws.py ENA_TUNED_ROLES); ethtool cannot raise the EC2-side
-          ENI allocation.
+    - name: Compute this host's target combined queue count
+      # min(32, vCPU/2) rounded down to a power of two, the same rule as
+      # ena_queue_count() in py/bench_aws.py
+      ansible.builtin.shell: |
+        set -o pipefail
+        python3 -c 'import sys; v = int(sys.argv[1]); t = min(32, v // 2); print(1 << (t.bit_length() - 1) if t > min(v, 8) else 0)' "$(nproc)"
+      args:
+        executable: /bin/bash
+      register: ena_target_result
+      changed_when: false
+
+    - name: Save target combined queue count
+      # Capped at the host's actual maximum; a host the EC2 default already covers keeps its current count
+      ansible.builtin.set_fact:
+        ena_rss_target_combined: >-
+          {% set computed = ena_target_result.stdout | trim | int %}{{ [ (computed if computed > 0 else (ena_rss_current_combined | int)), (ena_rss_max_combined | int) ] | min }}
 
     # Runs only when max >= target > current. With the queue count set at launch
     # the driver already starts at the target and this task is skipped, which

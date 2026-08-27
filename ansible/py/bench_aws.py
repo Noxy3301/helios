@@ -76,7 +76,7 @@ LAUNCHED = {"instances": [], "spot_requests": []}
 
 # vCPU count for EC2 instance sizes (used to build machine_spec locally)
 _VCPU_BY_SIZE = {
-    "xlarge": 4, "2xlarge": 8, "4xlarge": 16, "8xlarge": 32,
+    "medium": 1, "large": 2, "xlarge": 4, "2xlarge": 8, "4xlarge": 16, "8xlarge": 32,
     "12xlarge": 48, "16xlarge": 64, "24xlarge": 96, "32xlarge": 128, "metal": 128,
 }
 
@@ -178,12 +178,22 @@ def _number_instances(ids, base_tag, region):
             log(f"  Warning: tagging {iid} failed ({e}); continuing")
 
 
-
-# Roles whose primary ENI gets more than the EC2 default 8 combined queues.
-# ethtool -L cannot raise the EC2-side allocation, so it is set at
-# run-instances time; 32 is the per-ENI maximum of the instance family used.
-ENA_TUNED_ROLES = {"benchbase"}
-ENA_QUEUE_COUNT = 32
+def ena_queue_count(instance_type):
+    """Request min(32, vCPU/2) ENA queues at launch where that beats the EC2 default
+    of min(vCPU, 8): 32 is the per-interface maximum, vCPU/2 is one queue per
+    physical core. Values must be a power of two and at most the vCPU count (EC2
+    constraint). Sizes the default already covers and unknown sizes keep the
+    default. _VCPU_BY_SIZE describes the c6i family; a family that rejects the
+    count relaunches on the default."""
+    size = instance_type.split(".")[-1]
+    vcpu = _VCPU_BY_SIZE.get(size)
+    if vcpu is None:
+        log(f"  Warning: unknown instance size {instance_type}; launching with the default ENA queue count")
+        return 0
+    target = min(32, vcpu // 2)
+    if target <= min(vcpu, 8):
+        return 0
+    return 1 << (target.bit_length() - 1)
 
 
 def _launch_role(role, cfg, args, run_id):
@@ -216,7 +226,13 @@ def _launch_role(role, cfg, args, run_id):
         "--instance-initiated-shutdown-behavior", "terminate",
         "--user-data", deadman,
     ]
-    if role in ENA_TUNED_ROLES:
+
+    # Every role requests min(32, vCPU/2) ENA queues at launch (ena_queue_count());
+    # families without flexible ENA queues reject the count, and _launch() retries
+    # once on the plain network form
+    queue_count = ena_queue_count(cfg["instance_type"])
+
+    def _network_args(with_queue_count):
         # --network-interfaces subsumes --subnet-id/--security-group-ids;
         # mixing both forms is rejected by the API.
         network_interface = {
@@ -224,24 +240,42 @@ def _launch_role(role, cfg, args, run_id):
             "Groups": [args.security_group],
             "AssociatePublicIpAddress": True,
             "DeleteOnTermination": True,
-            "EnaQueueCount": ENA_QUEUE_COUNT,
         }
+        if with_queue_count and queue_count > 0:
+            network_interface["EnaQueueCount"] = queue_count
         if args.subnet:
             network_interface["SubnetId"] = args.subnet
-        base_cmd += ["--network-interfaces", json.dumps([network_interface])]
-    else:
-        base_cmd += ["--security-group-ids", args.security_group]
-        if args.subnet:
-            base_cmd += ["--subnet-id", args.subnet]
+        return ["--network-interfaces", json.dumps([network_interface])]
+
+    def _run_instances_raw(cmd):
+        full = ["aws"] + cmd
+        if region:
+            full.extend(["--region", region])
+        full.extend(["--no-cli-pager", "--output", "json"])
+        return subprocess.run(full, capture_output=True, text=True)
+
+    def _launch(extra_args, market_desc):
+        cmd = base_cmd + _network_args(True) + extra_args
+        result = _run_instances_raw(cmd)
+        if result.returncode != 0 and queue_count > 0 and "ena queue" in result.stderr.lower():
+            log(f"  EnaQueueCount={queue_count} rejected for {cfg['instance_type']} "
+                f"({role}, {market_desc}); retrying on the default queue count: "
+                f"{result.stderr.strip()}")
+            # The retry keeps the same interface spec minus EnaQueueCount
+            cmd = base_cmd + _network_args(False) + extra_args
+            result = _run_instances_raw(cmd)
+        if result.returncode != 0:
+            raise RuntimeError(f"aws command failed: {' '.join(cmd)}\n{result.stderr.strip()}")
+        return json.loads(result.stdout) if result.stdout.strip() else {}
 
     if not args.on_demand:
         log(f"Launching {cfg['count']}x {cfg['instance_type']} for {role} ({cfg['tag']}) [spot]...")
         try:
-            spot_cmd = base_cmd + [
+            spot_extra = [
                 "--instance-market-options",
                 '{"MarketType":"spot","SpotOptions":{"SpotInstanceType":"one-time","InstanceInterruptionBehavior":"terminate"}}',
             ] + tag_spec
-            result = aws(spot_cmd, region=region)
+            result = _launch(spot_extra, "spot")
             ids = [inst["InstanceId"] for inst in result.get("Instances", [])]
             _record_launch(ids, region)
             _number_instances(ids, cfg["tag"], region)
@@ -259,7 +293,7 @@ def _launch_role(role, cfg, args, run_id):
 
     # On-demand (--on-demand flag or authorized fallback)
     log(f"Launching {cfg['count']}x {cfg['instance_type']} for {role} ({cfg['tag']}) [on-demand]...")
-    result = aws(base_cmd + tag_spec, region=region)
+    result = _launch(tag_spec, "on-demand")
     ids = [inst["InstanceId"] for inst in result.get("Instances", [])]
     _record_launch(ids, region)
     _number_instances(ids, cfg["tag"], region)
@@ -727,7 +761,8 @@ Examples:
     if args.dry_run:
         log("DRY RUN — would launch:")
         for role, cfg in CLUSTER.items():
-            log(f"  {role}: {cfg['count']}x {cfg['instance_type']} (tag={cfg['tag']})")
+            log(f"  {role}: {cfg['count']}x {cfg['instance_type']} "
+                f"(tag={cfg['tag']}, ena_queues={ena_queue_count(cfg['instance_type'])})")
         log(f"Benchmark: {args.bench_type} SF={args.bench_scalefactor or 'default'}")
         if args.bench_terms:
             log(f"Terminals: [{args.bench_terms}]")
