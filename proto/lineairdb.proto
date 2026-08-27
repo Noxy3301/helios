@@ -56,6 +56,9 @@ enum OpCode {
     // Executes a resolved-statement request on the server's embedded DuckDB
     // executor, which reads PAX storage in place.
     TX_EXECUTE_DUCKDB_QUERY = 36;
+
+    // Hidden primary key allocation
+    DB_ALLOCATE_HIDDEN_KEYS = 37;
 }
 
 enum BatchOpType {
@@ -108,6 +111,8 @@ message TxBeginTransaction {
     message Response {
         int64 transaction_id = 1;
         repeated TableRowCount table_stats = 2;
+        // Identifies this run of the storage server; see DbAllocateHiddenKeys
+        uint64 boot_token = 3;
     }
 }
 
@@ -375,6 +380,25 @@ message TxWrite {
 message DbFence {
     message Request {}
     message Response {}
+}
+
+// Reserves a range of hidden primary keys for a table without a declared one
+message DbAllocateHiddenKeys {
+    message Request {
+        string table_name = 1;
+        uint32 count = 2;
+    }
+    message Response {
+        bool ok = 1;
+        uint64 first_id = 2;
+        string error = 3;
+        // The server will reject the same request again: do not retry
+        bool permanent = 4;
+        // Per-run value that increases across restarts unless the clock steps
+        // back. A range is only usable against the run that granted it, so a
+        // restart invalidates every cached range.
+        uint64 boot_token = 5;
+    }
 }
 
 // Row-count delta reported by proxy on commit (piggybacked on EndTransaction).

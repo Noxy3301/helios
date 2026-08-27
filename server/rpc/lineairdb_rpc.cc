@@ -7,8 +7,10 @@
 
 LineairDBRpc::LineairDBRpc(std::shared_ptr<DatabaseManager> db_manager,
                            std::shared_ptr<TransactionManager> tx_manager,
-                           std::shared_ptr<TableRowCounts> row_counts)
-    : db_manager_(db_manager), tx_manager_(tx_manager), row_counts_(row_counts) {
+                           std::shared_ptr<TableRowCounts> row_counts,
+                           std::shared_ptr<HiddenKeyAllocator> hidden_keys)
+    : db_manager_(db_manager), tx_manager_(tx_manager), row_counts_(row_counts),
+      hidden_keys_(hidden_keys) {
 }
 
 void LineairDBRpc::handle_rpc(uint64_t sender_id, MessageType message_type,
@@ -131,6 +133,9 @@ void LineairDBRpc::handle_rpc(uint64_t sender_id, MessageType message_type,
         // Database operations
         case MessageType::DB_FENCE:
             handleDbFence(message, result);
+            return;
+        case MessageType::DB_ALLOCATE_HIDDEN_KEYS:
+            handleDbAllocateHiddenKeys(message, result);
             return;
         case MessageType::DB_END_TRANSACTION:
             handleDbEndTransaction(message, result);

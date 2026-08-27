@@ -61,5 +61,8 @@ enum class MessageType : uint32_t {
     TX_GET_TABLE_STATS = 31,
 
     // DuckDB bridge (resolved-statement request). See lineairdb.proto.
-    TX_EXECUTE_DUCKDB_QUERY = 36
+    TX_EXECUTE_DUCKDB_QUERY = 36,
+
+    // Hidden primary key allocation
+    DB_ALLOCATE_HIDDEN_KEYS = 37
 };

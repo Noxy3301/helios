@@ -22,4 +22,6 @@ private:
     // Core components
     std::shared_ptr<DatabaseManager> db_manager_;
     std::shared_ptr<TableRowCounts> row_counts_ = std::make_shared<TableRowCounts>();
+    std::shared_ptr<HiddenKeyAllocator> hidden_keys_ =
+        std::make_shared<HiddenKeyAllocator>();
 };

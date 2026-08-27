@@ -273,10 +273,7 @@ static int lineairdb_init_func(void *p) {
   return 0;
 }
 
-LineairDB_share::LineairDB_share() {
-  thr_lock_init(&lock);
-  next_hidden_pk.store(0);
-}
+LineairDB_share::LineairDB_share() { thr_lock_init(&lock); }
 
 /**
   @brief
@@ -364,11 +361,23 @@ int ha_lineairdb::reset() {
   insert_can_replace_ = false;
   insert_peeks_duplicates_ = false;
   duplicate_key_index_ = MAX_KEY;
+  // Not every statement shape reaches end_bulk_insert, and a stale estimate
+  // would size the next statement's reservation.
+  bulk_insert_rows_ = 0;
+  bulk_insert_generated_ = 0;
   return 0;
+}
+
+void ha_lineairdb::start_bulk_insert(ha_rows rows) {
+  DBUG_TRACE;
+  bulk_insert_rows_ = rows;
+  bulk_insert_generated_ = 0;
 }
 
 int ha_lineairdb::end_bulk_insert() {
   DBUG_TRACE;
+  bulk_insert_rows_ = 0;
+  bulk_insert_generated_ = 0;
 
   auto *tx = active_transaction(ha_thd());
   if (tx == nullptr) return 0;

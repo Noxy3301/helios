@@ -28,6 +28,7 @@ void LineairDBRpc::handleTxBeginTransaction(const std::string& message,
         ts->set_row_count(count);
     }
 
+    response.set_boot_token(storage_boot_token());
     result = response.SerializeAsString();
 
     LOG_DEBUG("Created transaction: %ld", tx_id);

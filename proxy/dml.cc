@@ -13,7 +13,6 @@ int ha_lineairdb::write_row(uchar *buf) {
   DBUG_TRACE;
 
   set_write_buffer(buf);
-  auto key = extract_key(buf);
 
   auto tx = get_transaction(ha_thd());
 
@@ -21,6 +20,13 @@ int ha_lineairdb::write_row(uchar *buf) {
   // against, so a duplicate it carries must not be offered as ignorable.
   if (tx->is_aborted()) {
     return abort_errno(tx, /*duplicate_is_conflict=*/true);
+  }
+
+  // A hidden primary key is reserved from the storage server, so it can fail.
+  // Writing the row anyway would put it under a key another query layer owns.
+  std::string key;
+  if (const int error = extract_key(buf, tx, &key); error != 0) {
+    return error;
   }
 
   // REPLACE stays a blind write; IGNORE and ON DUPLICATE KEY UPDATE need the

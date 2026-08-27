@@ -13,6 +13,7 @@
 #include <iomanip>
 #include <iostream>
 #include <limits>
+#include <mutex>
 #include <optional>
 #include <sstream>
 #include <string_view>
@@ -22,12 +23,15 @@
 
 #include "lineairdb_field_types.h"
 #include "lineairdb.pb.h"
+#include "my_base.h"
 #include "my_dbug.h"
 #include "mysql/plugin.h"
+#include "mysqld_error.h"
 #include "sql/field.h"
 #include "sql/item.h"
 #include "sql/item_cmpfunc.h"
 #include "sql/item_func.h"
+#include "sql/sql_class.h"
 #include "lineairdb_keyenc.hh"
 
 namespace lineairdb_keyenc {
@@ -305,12 +309,11 @@ std::string ha_lineairdb::extract_primary_key_from_ref(const uchar *pos) const {
   return key;
 }
 
-bool ha_lineairdb::uses_hidden_primary_key() const {
-  if (table == nullptr || table->s == nullptr) {
-    return false;
-  }
-  return table->s->primary_key == MAX_KEY;
-}
+// Hidden primary keys are reserved a block at a time, sized to the statement
+// when MySQL estimates its rows. NDB Cluster prefetches the same default.
+static constexpr uint32_t kHiddenKeyRangeSize = 1000;
+// Mirrors HiddenKeyAllocator::kMaxCount, which the proxy cannot include
+static constexpr uint32_t kHiddenKeyMaxRange = 65536;
 
 std::string ha_lineairdb::serialize_hidden_primary_key(uint64_t row_id) const {
   std::ostringstream oss;
@@ -318,22 +321,74 @@ std::string ha_lineairdb::serialize_hidden_primary_key(uint64_t row_id) const {
   return oss.str();
 }
 
-std::string ha_lineairdb::generate_hidden_primary_key() {
+namespace {
+
+// A rejection the storage server will repeat: retrying can only spin on it
+int reject_hidden_key(THD *thd, LineairDBTransaction *tx,
+                      const std::string &reason) {
+  // The handler layer turns the return code into ER_AUTOINC_READ_FAILED, whose
+  // text has no room for the cause, so the cause rides along as a warning.
+  if (thd != nullptr) {
+    push_warning_printf(thd, Sql_condition::SL_WARNING, ER_AUTOINC_READ_FAILED,
+                        "LineairDB could not reserve a hidden primary key: %s",
+                        reason.c_str());
+    thd_mark_transaction_to_rollback(thd, 1);
+  }
+  if (tx != nullptr) tx->set_status_to_abort();
+  return HA_ERR_AUTOINC_READ_FAILED;
+}
+
+}  // namespace
+
+int ha_lineairdb::generate_hidden_primary_key(LineairDBTransaction *tx,
+                                              std::string *key) {
   if (share == nullptr) {
     share = get_share();
   }
-  uint64_t row_id =
-      share->next_hidden_pk.fetch_add(1, std::memory_order_relaxed);
-  std::string key = serialize_hidden_primary_key(row_id);
-  return key;
+
+  auto *proxy = get_proxy();
+  std::lock_guard<std::mutex> lock(share->hidden_keys.mutex);
+  // A range granted by an earlier run of the storage server may overlap one the
+  // restarted server has since handed out, so it is spent, not merely stale.
+  const bool from_this_run =
+      share->hidden_keys.boot_token == proxy->storage_boot_token();
+  if (!from_this_run || share->hidden_keys.next >= share->hidden_keys.end) {
+    const uint64_t remaining = bulk_insert_rows_ > bulk_insert_generated_
+                                   ? bulk_insert_rows_ - bulk_insert_generated_
+                                   : 0;
+    const uint32_t count = std::max<uint64_t>(
+        kHiddenKeyRangeSize, std::min<uint64_t>(kHiddenKeyMaxRange, remaining));
+    const auto reserved = proxy->db_allocate_hidden_keys(db_table_name, count);
+    if (!reserved.ok) {
+      if (reserved.permanent) {
+        return reject_hidden_key(ha_thd(), tx, reserved.error);
+      }
+      if (tx != nullptr) {
+        if (reserved.transport_error) {
+          tx->mark_transport_error();
+        } else {
+          tx->set_status_to_abort();
+        }
+      }
+      return abort_errno(tx);
+    }
+    share->hidden_keys.next = reserved.first_id;
+    share->hidden_keys.end = reserved.first_id + count;
+    share->hidden_keys.boot_token = reserved.boot_token;
+  }
+
+  ++bulk_insert_generated_;
+  *key = serialize_hidden_primary_key(share->hidden_keys.next++);
+  return 0;
 }
 
-std::string ha_lineairdb::extract_key(const uchar *buf) {
+int ha_lineairdb::extract_key(const uchar *buf, LineairDBTransaction *tx,
+                              std::string *key) {
   if (is_primary_key_exists()) {
-    return extract_key_from_mysql(buf);
-  } else {
-    return autogenerate_key();
+    *key = extract_key_from_mysql(buf);
+    return 0;
   }
+  return autogenerate_key(tx, key);
 }
 
 std::string ha_lineairdb::extract_key_from_mysql(const uchar *row_buffer) {
@@ -361,8 +416,9 @@ std::string ha_lineairdb::extract_key_from_mysql(const uchar *row_buffer) {
   return complete_key;
 }
 
-std::string ha_lineairdb::autogenerate_key() {
-  return generate_hidden_primary_key();
+int ha_lineairdb::autogenerate_key(LineairDBTransaction *tx,
+                                   std::string *key) {
+  return generate_hidden_primary_key(tx, key);
 }
 
 /**
