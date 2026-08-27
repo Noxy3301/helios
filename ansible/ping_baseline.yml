@@ -3,7 +3,7 @@
 # ordered pair before any benchmark traffic.
 #
 # Usage: ansible-playbook -i inventory.ini ping_baseline.yml -e "run_id=<id> machine_spec=<spec>"
-- hosts: lineairdb:mysql:haproxy:benchbase
+- hosts: lineairdb:mysql:benchbase
   gather_facts: false
   vars:
     run_id: "run"
@@ -13,7 +13,7 @@
   tasks:
     - name: Measure RTT to every other node
       shell: |
-        for h in {% for g in ['lineairdb','mysql','haproxy','benchbase'] %}{% for n in groups.get(g, []) %}{% if n != inventory_hostname %}{{ hostvars[n].private_ip }} {% endif %}{% endfor %}{% endfor %}; do
+        for h in {% for g in ['lineairdb','mysql','benchbase'] %}{% for n in groups.get(g, []) %}{% if n != inventory_hostname %}{{ hostvars[n].private_ip }} {% endif %}{% endfor %}{% endfor %}; do
           echo "=== {{ inventory_hostname }} -> $h"
           ping -c {{ ping_count }} -i 0.2 -q "$h" 2>&1 | tail -3
         done

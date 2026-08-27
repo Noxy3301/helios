@@ -10,6 +10,22 @@
   set_fact:
     bench_start_epoch: "{{ (lookup('pipe', 'date +%s') | int) + (bench_sync_buffer | int) }}"
 
+- name: Compute the JDBC URL for every MySQL node
+  # Single node keeps the plain scheme; N>1 switches to BenchBase's
+  # loadbalance scheme (mirrors bench/bin/benchrun.py's multi-endpoint path).
+  set_fact:
+    _jdbc_url: >-
+      {%- if groups['mysql'] | length > 1 -%}
+      jdbc:mysql:loadbalance://{% for h in groups['mysql'] %}{{ hostvars[h].private_ip }}:3307{% if not loop.last %},{% endif %}{% endfor %}/
+      {%- else -%}
+      jdbc:mysql://{{ hostvars[groups['mysql'][0]].private_ip }}:3307/
+      {%- endif -%}
+
+- name: Show rendered JDBC URL
+  run_once: true
+  debug:
+    var: _jdbc_url
+
 - name: "Execute {{ bench_type | upper }} (terminals={{ bench_term }})"
   shell: |
     {% if bench_sync | bool %}
@@ -21,8 +37,8 @@
     CFG=$(mktemp /tmp/bb-exec-XXXXX.xml)
     cp ~/helios/bench/config/{{ bench_type }}.xml "$CFG"
 
-    # JDBC URL -> HAProxy
-    sed -i 's|localhost:3307|{{ haproxy_host }}:{{ haproxy_port }}|g' "$CFG"
+    # JDBC URL -> every MySQL directly (loadbalance scheme for N>1)
+    sed -i 's|jdbc:mysql://localhost:3307/|{{ _jdbc_url }}|g' "$CFG"
 
     # Scale factor and terminals
     sed -i 's|<scalefactor>[^<]*</scalefactor>|<scalefactor>{{ bench_scalefactor }}</scalefactor>|' "$CFG"

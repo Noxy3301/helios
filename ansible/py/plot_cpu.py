@@ -9,11 +9,10 @@ from typing import Optional
 import matplotlib.pyplot as plt
 
 TIME_RE = re.compile(r"^(\d{1,2}:\d{2}:\d{2})(?:\s+(AM|PM))?\s+(\S+)\s+(.*)$")
-ROLE_ORDER = {"lineairdb": 0, "mysql": 1, "haproxy": 2, "benchbase": 3, "other": 4}
+ROLE_ORDER = {"lineairdb": 0, "mysql": 1, "benchbase": 2, "other": 3}
 ROLE_STYLE = {
     "lineairdb": {"label": "LineairDB", "color": "#1b9e77"},
     "mysql": {"label": "MySQL", "color": "#d95f02"},
-    "haproxy": {"label": "HAProxy", "color": "#1f78b4"},
     "benchbase": {"label": "BenchBase", "color": "#e31a1c"},
     "other": {"label": "Other", "color": "#666666"},
 }
@@ -25,8 +24,6 @@ def role_for_host(host: str) -> str:
         return "lineairdb"
     if host.startswith("mysql"):
         return "mysql"
-    if host.startswith("haproxy"):
-        return "haproxy"
     if host.startswith("bench"):
         return "benchbase"
     return "other"

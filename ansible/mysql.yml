@@ -45,17 +45,12 @@
       args:
         executable: /bin/bash
 
-    # Note: BenchBase connects directly to each MySQL for setup to avoid DDL sync issues via HAProxy.
-    - name: Create HAProxy and BenchBase access users
+    - name: Create BenchBase access users
       shell: |
         set -euo pipefail
         ~/helios/build/runtime_output_directory/mysql \
           -u root --protocol=TCP -h 127.0.0.1 -P 3307 \
-          -e "CREATE USER IF NOT EXISTS 'haproxy_check'@'%' IDENTIFIED WITH mysql_native_password BY '';
-              GRANT USAGE ON *.* TO 'haproxy_check'@'%';
-              CREATE USER IF NOT EXISTS 'root'@'{{ hostvars['haproxy-1'].private_ip }}' IDENTIFIED WITH mysql_native_password BY '';
-              GRANT ALL PRIVILEGES ON *.* TO 'root'@'{{ hostvars['haproxy-1'].private_ip }}' WITH GRANT OPTION;
-              {% for b in groups['benchbase'] | default([]) %}
+          -e "{% for b in groups['benchbase'] | default([]) %}
               CREATE USER IF NOT EXISTS 'root'@'{{ hostvars[b].private_ip }}' IDENTIFIED WITH mysql_native_password BY '';
               GRANT ALL PRIVILEGES ON *.* TO 'root'@'{{ hostvars[b].private_ip }}' WITH GRANT OPTION;
               {% endfor %}

@@ -10,7 +10,7 @@ The AMI carries the runtime environment and nothing else: no repository, no tool
 
 ```bash
 sudo apt-get update && sudo apt-get install -y \
-    libjemalloc2 libnuma1 libatomic1 libprotobuf32t64 sysstat haproxy python3 unzip curl
+    libjemalloc2 libnuma1 libatomic1 libprotobuf32t64 sysstat python3 unzip curl
 ```
 
 `push_bundle.yml` runs `ldd` against the pushed binaries and fails on any unresolved library, so a missing runtime package surfaces at deploy time rather than at first start.
@@ -31,7 +31,7 @@ echo 'source "$HOME/.sdkman/bin/sdkman-init.sh"' >> ~/.bashrc
 
 #### 3. Snapshot AMI
 
-Stop the instance and create an AMI snapshot. All nodes (lineairdb, mysql, haproxy, bench) use the same AMI.
+Stop the instance and create an AMI snapshot. All nodes (lineairdb, mysql, bench) use the same AMI.
 
 ### Ansible deploy-time (IP-dependent, runs each deployment)
 
@@ -40,8 +40,7 @@ Stop the instance and create an AMI snapshot. All nodes (lineairdb, mysql, hapro
 | --------------- | -------------------------------------------------------------- |
 | `push_bundle.yml` | Push and extract the prebuilt bundle onto every node         |
 | `lineairdb.yml` | Start the storage server from the bundle                       |
-| `mysql.yml`     | Start MySQL, create users (HAProxy health check, bench access) |
-| `haproxy.yml`   | Deploy HAProxy config with backend IPs, restart                |
+| `mysql.yml`     | Start MySQL, create users (bench access)                       |
 | `benchbase.yml` | Create schema on each MySQL, load data                         |
 
 
@@ -79,7 +78,6 @@ Cluster configuration is defined in `CLUSTER` dict at the top of `bench_aws.py`.
 |-----------|---------------|-------|
 | lineairdb | c6i.16xlarge  | 1     |
 | mysql     | c6i.4xlarge   | 8     |
-| haproxy   | c6i.4xlarge   | 1     |
 | benchbase | c6i.4xlarge   | 1     |
 
 ## Manual operation
@@ -92,13 +90,13 @@ For debugging or running individual steps, you can use Ansible playbooks directl
 python3 py/update_inventory.py --project-tag HeliosPush
 ```
 
-> Tag instances: `Name=helios-lineairdb`, `Name=helios-mysql`, `Name=helios-haproxy`, `Name=helios-bench`, `Project=HeliosPush`
+> Tag instances: `Name=helios-lineairdb`, `Name=helios-mysql`, `Name=helios-bench`, `Project=HeliosPush`
 
 ### 2. Deploy infrastructure
 
 ```bash
 ansible -i inventory.ini all -m ping           # Connectivity check
-ansible-playbook -i inventory.ini site.yml -e "bundle_path=... bundle_sha256=... deadman_required=false"  # Full deploy on hand-launched instances (push_bundle → lineairdb → mysql → haproxy → benchbase)
+ansible-playbook -i inventory.ini site.yml -e "bundle_path=... bundle_sha256=... deadman_required=false"  # Full deploy on hand-launched instances (push_bundle → lineairdb → mysql → benchbase)
 ```
 
 ### 3. Run benchmarks
@@ -179,7 +177,7 @@ Results are stored under `result/<run_id>/<machine_spec>/`:
 ```
 result/
   20260310-143000/
-    lineairdb-128x1_mysql-128x2_haproxy-48x1_benchbase-128x1/
+    lineairdb-128x1_mysql-128x2_benchbase-128x1/
       throughput/
         throughput_raw.csv       # host,terminals,throughput,goodput
       cpu/
@@ -188,8 +186,6 @@ result/
         <host>/bench-<run_id>.tgz
       lineairdb/
         <host>/{pidstat,sar-*,mpstat-irq,softnet,interrupts}-<run_id>.log
-      haproxy/
-        <host>/haproxy-<run_id>.csv
       mysql/
         <host>/mysql-status-<run_id>.txt
 ```
@@ -208,20 +204,20 @@ python3 py/plot_tpch.py          # TPC-H per-query latency (auto-called for tpch
 | Playbook            | Purpose                                                   |
 | ------------------- | --------------------------------------------------------- |
 | `push_bundle.yml`   | Push and extract the prebuilt bundle onto every node      |
-| `site.yml`          | Master: push_bundle → lineairdb → mysql → haproxy → benchbase |
+| `site.yml`          | Master: push_bundle → lineairdb → mysql → benchbase       |
 | `lineairdb.yml`     | Start the storage server from the bundle                  |
 | `mysql.yml`         | Start MySQL with LineairDB proxy, create users            |
-| `haproxy.yml`       | Deploy HAProxy config (L4 MySQL load balancing)           |
 | `benchbase.yml`     | Create schema + load data (supports ycsb/tpcc/tpch)       |
 | `measure.yml`       | Run benchmark terminal sweep                              |
 | `measure_term.yml`  | Single terminal count execution (included by measure.yml) |
 | `measure_usage.yml` | measure.yml wrapped with CPU/network monitoring           |
 
 
-> **Caution**: HAProxy stats auth is `admin:password` in [templates/haproxy.cfg.j2](templates/haproxy.cfg.j2). Change before use.
-
 ## Important notes
 
+- **Direct load-balancing**: BenchBase connects straight to every MySQL node
+  via JDBC's `loadbalance` scheme instead of a proxy; a single-MySQL run keeps
+  the plain `jdbc:mysql://` URL.
 - **DDL doesn't sync**: `benchbase.yml` runs `--create` on each MySQL node separately because Helios DDL is not replicated across MySQL instances.
 - **Data is shared**: `--load` runs once; data goes to shared LineairDB storage.
 - **TPC-H optimizer settings**: `benchbase.yml` and `measure.yml` both set hash join / subquery optimizer flags on each MySQL node. This is needed because Helios's RPC-based architecture makes hash join vastly faster than nested-loop with PK lookups.

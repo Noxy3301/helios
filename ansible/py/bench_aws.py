@@ -47,11 +47,6 @@ CLUSTER = {
         "instance_type": "c6i.4xlarge",
         "count": 1,
     },
-    "haproxy": {
-        "tag": "helios-haproxy",
-        "instance_type": "c6i.8xlarge",
-        "count": 1,
-    },
     "benchbase": {
         "tag": "helios-bench",
         "instance_type": "c6i.16xlarge",
@@ -66,7 +61,7 @@ AWS_DEFAULTS = {
     "ssh_key": "~/.ssh/ordo-aws.pem",
     "ssh_user": "ubuntu",
     # env-only AMI: Ubuntu 24.04 with the runtime libraries, a Java 23 runtime,
-    # sysstat and haproxy, and no Helios binaries.
+    # sysstat, and no Helios binaries.
     "ami_id": "ami-01791c5dbde3b3ba1",
     "security_group": "sg-02d9a0d5948d02dbb",
     # Same-AZ pinning: every role must sit in one AZ or cross-AZ latency lands
@@ -186,7 +181,7 @@ def _number_instances(ids, base_tag, region):
 # Roles whose primary ENI gets more than the EC2 default 8 combined queues.
 # ethtool -L cannot raise the EC2-side allocation, so it is set at
 # run-instances time; 32 is the per-ENI maximum of the instance family used.
-ENA_TUNED_ROLES = {"haproxy", "benchbase"}
+ENA_TUNED_ROLES = {"benchbase"}
 ENA_QUEUE_COUNT = 32
 
 
@@ -354,19 +349,13 @@ def deploy_infrastructure(args, bundle_path, bundle_sha256):
         f" -e {shlex.quote(json.dumps({'bundle_path': bundle_path, 'bundle_sha256': bundle_sha256}))}")
 
     # Start the roles in parallel
-    log("Deploying infrastructure (lineairdb + mysql + haproxy in parallel)...")
-    hap_size = CLUSTER["haproxy"]["instance_type"].split(".")[-1]
-    hap_threads = _VCPU_BY_SIZE.get(hap_size, 48)
-    role_extra = {
-        "haproxy.yml": f' -e "haproxy_nbthread={hap_threads}"',
-    }
+    log("Deploying infrastructure (lineairdb + mysql in parallel)...")
     # Write deploy logs alongside bench_aws.log
     deploy_log_dir = Path(LOG_FILE.name).parent if LOG_FILE else None
     procs = []
 
-    for playbook in ["lineairdb.yml", "mysql.yml", "haproxy.yml"]:
-        extra = role_extra.get(playbook, "")
-        cmd = f"ansible-playbook -i {inv} {ANSIBLE_DIR / playbook}{extra}"
+    for playbook in ["lineairdb.yml", "mysql.yml"]:
+        cmd = f"ansible-playbook -i {inv} {ANSIBLE_DIR / playbook}"
         log(f"  $ {cmd}")
         if deploy_log_dir:
             pb_log = open(deploy_log_dir / f"{playbook.replace('.yml', '')}.log", "w")
@@ -649,7 +638,6 @@ Examples:
     parser.add_argument("--mysql-count", type=int, default=None, help="Override MySQL node count")
     parser.add_argument("--mysql-instance-type", default=None, help="Override MySQL instance type")
     parser.add_argument("--lineairdb-instance-type", default=None, help="Override LineairDB instance type")
-    parser.add_argument("--haproxy-instance-type", default=None, help="Override HAProxy instance type")
     parser.add_argument("--benchbase-count", type=int, default=None, help="Override BenchBase node count")
     parser.add_argument("--benchbase-instance-type", default=None, help="Override BenchBase instance type")
     # Control options
@@ -676,8 +664,6 @@ Examples:
         CLUSTER["mysql"]["instance_type"] = args.mysql_instance_type
     if args.lineairdb_instance_type is not None:
         CLUSTER["lineairdb"]["instance_type"] = args.lineairdb_instance_type
-    if args.haproxy_instance_type is not None:
-        CLUSTER["haproxy"]["instance_type"] = args.haproxy_instance_type
     if args.benchbase_count is not None:
         CLUSTER["benchbase"]["count"] = args.benchbase_count
     if args.benchbase_instance_type is not None:

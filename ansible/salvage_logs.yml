@@ -5,7 +5,7 @@
 # the instance otherwise).
 # Best-effort by design: every task tolerates failure and unreachable hosts,
 # so a half-dead cluster still yields evidence for the surviving nodes.
-- hosts: lineairdb:mysql:haproxy:benchbase
+- hosts: lineairdb:mysql:benchbase
   gather_facts: false
   ignore_unreachable: true
   vars:
@@ -37,8 +37,8 @@
       shell: |
         {
           echo "== date";  date -u +%FT%T.%3NZ
-          echo "== pgrep lineairdb/mysqld/haproxy"
-          pgrep -a -f "[l]ineairdb-server|[m]ysqld|[h]aproxy" || echo "NONE ALIVE"
+          echo "== pgrep lineairdb/mysqld"
+          pgrep -a -f "[l]ineairdb-server|[m]ysqld" || echo "NONE ALIVE"
           echo "== ps top-rss"; ps -eo pid,etime,rss,comm --sort=-rss | head -20
           echo "== dmesg tail"; sudo dmesg -T 2>/dev/null | tail -80
           echo "== segv/oom in syslog"
@@ -49,7 +49,7 @@
           /tmp/salvage-snapshot.txt /tmp/start_server.log /tmp/start_mysql.log \
           $(ls $HOME/helios/lineairdb_logs/*.log 2>/dev/null | tail -3) \
           $(sudo find $HOME -maxdepth 5 -name "*.err" 2>/dev/null | head -3) \
-          $(ls /var/log/haproxy.log 2>/dev/null) 2>/dev/null || true
+          2>/dev/null || true
       args:
         executable: /bin/bash
       failed_when: false

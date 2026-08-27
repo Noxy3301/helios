@@ -1,6 +1,6 @@
 ---
 # CPU sampling wrapper: run BenchBase and capture CPU usage from all nodes.
-- hosts: lineairdb:mysql:haproxy:benchbase
+- hosts: lineairdb:mysql:benchbase
   gather_facts: false
   vars:
     sample_interval: 1
@@ -8,15 +8,12 @@
     interrupt_interval: 5
     run_id: "run"
     sample_dir: /tmp/metrics
-    haproxy_stats_interval: 5
     enable_perf: false
     perf_freq: 99
     # perf COUNTING mode (IPC / LLC), distinct from enable_perf's perf record.
     # Default false so the sweep path is behaviourally identical when unused.
     perf_stat: false
     perf_stat_interval_ms: 10000
-    haproxy_stats_auth: "admin:password"
-    haproxy_host: "{{ (groups.get('haproxy', []) | length > 0) | ternary(groups['haproxy'][0], '') }}"
   tasks:
     - name: Ensure sysstat installed
       become: yes
@@ -37,7 +34,7 @@
     - name: Build machine spec string (for metadata)
       set_fact:
         machine_spec: >-
-          {%- set roles = ['lineairdb', 'mysql', 'haproxy', 'benchbase'] -%}
+          {%- set roles = ['lineairdb', 'mysql', 'benchbase'] -%}
           {%- set parts = [] -%}
           {%- for role in roles -%}
             {%- set hosts = groups.get(role, []) -%}
@@ -73,18 +70,6 @@
           timestamp={{ lookup('pipe', 'date -Iseconds') }}
 
     - name: Start mpstat sampling
-      when: inventory_hostname not in groups.get('haproxy', [])
-      shell: |
-        mkdir -p {{ sample_dir }}
-        nohup mpstat -P ALL {{ sample_interval }} > {{ sample_dir }}/cpu-{{ run_id }}.log 2>&1 &
-        echo $! > {{ sample_dir }}/cpu-{{ run_id }}.pid
-      args:
-        executable: /bin/bash
-
-    - name: Start mpstat sampling (haproxy)
-      when: haproxy_host != ''
-      run_once: true
-      delegate_to: "{{ haproxy_host }}"
       shell: |
         mkdir -p {{ sample_dir }}
         nohup mpstat -P ALL {{ sample_interval }} > {{ sample_dir }}/cpu-{{ run_id }}.log 2>&1 &
@@ -171,24 +156,6 @@
           sleep {{ interrupt_interval }}
         done' > {{ sample_dir }}/interrupts-{{ run_id }}.log 2>&1 &
         echo $! > {{ sample_dir }}/interrupts-{{ run_id }}.pid
-      args:
-        executable: /bin/bash
-
-    - name: Start HAProxy stats sampling
-      when: haproxy_host != ''
-      run_once: true
-      delegate_to: "{{ haproxy_host }}"
-      shell: |
-        mkdir -p {{ sample_dir }}
-        nohup bash -c '
-        while true; do
-          ts=$(date +%s)
-          echo "# ts=$ts"
-          curl -s -u {{ haproxy_stats_auth }} "http://127.0.0.1:8404/stats;csv"
-          echo
-          sleep {{ haproxy_stats_interval }}
-        done' > {{ sample_dir }}/haproxy-{{ run_id }}.csv 2>&1 &
-        echo $! > {{ sample_dir }}/haproxy-{{ run_id }}.pid
       args:
         executable: /bin/bash
 
@@ -357,15 +324,31 @@
         executable: /bin/bash
       failed_when: false
 
+    - name: Capture MySQL status snapshot BEFORE benchmark (pre)
+      # Com_commit post-pre per node is the per-endpoint load-balance evidence
+      shell: |
+        ~/helios/build/runtime_output_directory/mysql \
+          -u root --protocol=TCP -h 127.0.0.1 -P 3307 \
+          -e "SHOW GLOBAL STATUS" > {{ sample_dir }}/mysql-status-pre-{{ run_id }}.txt
+      args:
+        executable: /bin/bash
+      failed_when: false
+
+    - name: Fetch MySQL status snapshot (pre)
+      fetch:
+        src: "{{ sample_dir }}/mysql-status-pre-{{ run_id }}.txt"
+        dest: "{{ result_dir }}/mysql/{{ inventory_hostname }}/"
+        flat: yes
+      failed_when: false
+
 - import_playbook: measure.yml
 
-- hosts: lineairdb:mysql:haproxy:benchbase
+- hosts: lineairdb:mysql:benchbase
   gather_facts: false
   vars:
     run_id: "run"
     sample_dir: /tmp/metrics
     enable_perf: false
-    haproxy_host: "{{ (groups.get('haproxy', []) | length > 0) | ternary(groups['haproxy'][0], '') }}"
     perf_stat: false
   tasks:
     # Stop perf FIRST (before any other cleanup) to ensure the target
@@ -426,18 +409,6 @@
       failed_when: false
 
     - name: Stop mpstat sampling
-      when: inventory_hostname not in groups.get('haproxy', [])
-      shell: |
-        if [ -f {{ sample_dir }}/cpu-{{ run_id }}.pid ]; then
-          kill "$(cat {{ sample_dir }}/cpu-{{ run_id }}.pid)" || true
-        fi
-      args:
-        executable: /bin/bash
-
-    - name: Stop mpstat sampling (haproxy)
-      when: haproxy_host != ''
-      run_once: true
-      delegate_to: "{{ haproxy_host }}"
       shell: |
         if [ -f {{ sample_dir }}/cpu-{{ run_id }}.pid ]; then
           kill "$(cat {{ sample_dir }}/cpu-{{ run_id }}.pid)" || true
@@ -512,17 +483,6 @@
       shell: |
         if [ -f {{ sample_dir }}/interrupts-{{ run_id }}.pid ]; then
           kill "$(cat {{ sample_dir }}/interrupts-{{ run_id }}.pid)" || true
-        fi
-      args:
-        executable: /bin/bash
-
-    - name: Stop HAProxy stats sampling
-      when: haproxy_host != ''
-      run_once: true
-      delegate_to: "{{ haproxy_host }}"
-      shell: |
-        if [ -f {{ sample_dir }}/haproxy-{{ run_id }}.pid ]; then
-          kill "$(cat {{ sample_dir }}/haproxy-{{ run_id }}.pid)" || true
         fi
       args:
         executable: /bin/bash
@@ -663,28 +623,9 @@
         - inventory_hostname in groups.get('lineairdb', []) + groups.get('mysql', [])
 
     - name: Fetch cpu logs
-      when: inventory_hostname not in groups.get('haproxy', [])
       fetch:
         src: "{{ sample_dir }}/cpu-{{ run_id }}.log"
         dest: "{{ result_dir }}/cpu/{{ inventory_hostname }}/"
-        flat: yes
-
-    - name: Fetch cpu logs (haproxy)
-      when: haproxy_host != ''
-      run_once: true
-      delegate_to: "{{ haproxy_host }}"
-      fetch:
-        src: "{{ sample_dir }}/cpu-{{ run_id }}.log"
-        dest: "{{ result_dir }}/cpu/{{ haproxy_host }}/"
-        flat: yes
-
-    - name: Fetch HAProxy stats
-      when: haproxy_host != ''
-      run_once: true
-      delegate_to: "{{ haproxy_host }}"
-      fetch:
-        src: "{{ sample_dir }}/haproxy-{{ run_id }}.csv"
-        dest: "{{ result_dir }}/haproxy/{{ haproxy_host }}/"
         flat: yes
 
     - name: Fetch bench logs
@@ -825,3 +766,45 @@
         - "{{ sample_dir }}/perf-report-proxy-{{ run_id }}.txt"
         - "{{ sample_dir }}/perf-callers-proxy-{{ run_id }}.txt"
       failed_when: false
+
+    - name: "Gate: every MySQL carried its share of the commits"
+      # Connector/J silently routes around a dead endpoint, so an N-1 fleet
+      # would otherwise still produce a green sweep.
+      run_once: true
+      delegate_to: localhost
+      shell: |
+        set -euo pipefail
+        python3 - "{{ result_dir }}" "{{ run_id }}" {{ groups['mysql'] | join(' ') }} <<'PY'
+        import os
+        import re, sys
+        result_dir, run_id, hosts = sys.argv[1], sys.argv[2], sys.argv[3:]
+        def com_commit(path):
+            try:
+                text = open(path).read()
+            except OSError:
+                return None
+            m = re.search(r"^Com_commit\s+(\d+)", text, re.M)
+            return int(m.group(1)) if m else None
+        deltas = {}
+        for h in hosts:
+            pre = com_commit(f"{result_dir}/mysql/{h}/mysql-status-pre-{run_id}.txt")
+            post = com_commit(f"{result_dir}/mysql/{h}/mysql-status-{run_id}.txt")
+            deltas[h] = None if pre is None or post is None else post - pre
+        lines = [f"{h},{'missing' if d is None else d}" for h, d in deltas.items()]
+        os.makedirs(f"{result_dir}/throughput", exist_ok=True)
+        with open(f"{result_dir}/throughput/commit_distribution.csv", "w") as f:
+            f.write("host,com_commit_delta\n" + "\n".join(lines) + "\n")
+        print("\n".join(lines))
+        valid = [d for d in deltas.values() if d is not None]
+        if len(valid) != len(hosts):
+            sys.exit("GATE FAIL: missing commit counts for some MySQL nodes")
+        # The gate needs enough explicit commits; autocommit workloads such as TPC-H skip it
+        if sum(valid) < 1000:
+            print("GATE SKIPPED: fewer than 1000 commits in the sweep")
+        elif min(valid) <= 0 or min(valid) < 0.5 * max(valid):
+            sys.exit("GATE FAIL: uneven commit counts across MySQL nodes")
+        else:
+            print("GATE OK: commit counts within 2x across nodes")
+        PY
+      args:
+        executable: /bin/bash

@@ -8,7 +8,6 @@ import sys
 ROLE_MAP = [
     {"tag": "helios-lineairdb", "group": "lineairdb", "prefix": "lineairdb"},
     {"tag": "helios-mysql", "group": "mysql", "prefix": "mysql"},
-    {"tag": "helios-haproxy", "group": "haproxy", "prefix": "haproxy"},
     {"tag": "helios-bench", "group": "benchbase", "prefix": "bench"},
 ]
 TEMPLATE_PATH = Path(__file__).resolve().parent.parent / "templates" / "inventory.ini.template"

@@ -35,10 +35,6 @@
     run_id: "run"
     result_dir: "{{ playbook_dir }}/result/{{ run_id }}"
 
-    # -- HAProxy connection --
-    haproxy_host: "{{ hostvars[groups['haproxy'][0]].private_ip }}"
-    haproxy_port: 3307
-
     # -- YCSB profile weights --
     _ycsb_profiles:
       a: "50,0,0,50,0,0"

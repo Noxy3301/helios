@@ -9,7 +9,7 @@
 # ── Load-phase samplers: started before any load traffic ────────────────────
 # Passive readers (mpstat, pidstat, /proc/<pid>/status) that write to /tmp and
 # are collected by the final play.
-- hosts: lineairdb:mysql:haproxy:benchbase
+- hosts: lineairdb:mysql:benchbase
   gather_facts: false
   vars:
     load_sample: true
@@ -327,7 +327,7 @@
 # ── Stop load-phase samplers and collect them ───────────────────────────────
 # Must run before measure_usage.yml so the load-phase samplers cannot overlap
 # the measurement window.
-- hosts: lineairdb:mysql:haproxy:benchbase
+- hosts: lineairdb:mysql:benchbase
   gather_facts: false
   vars:
     load_sample: true
