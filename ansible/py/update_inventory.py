@@ -107,11 +107,11 @@ def main():
     parser = argparse.ArgumentParser(description="Generate ansible/inventory.ini from AWS tags")
     parser.add_argument("--region", type=str, default="ap-southeast-2", help="AWS region")
     parser.add_argument("--profile", type=str, default=None, help="AWS profile (optional)")
-    parser.add_argument("--project-tag", type=str, default="Helios", help="Project tag value")
+    parser.add_argument("--project-tag", type=str, default="HeliosPush", help="Project tag value")
     parser.add_argument("--run-tag", type=str, default=None,
                         help="Filter to instances tagged Run=<value> (scopes one campaign)")
     parser.add_argument("--user", type=str, default="ubuntu", help="ansible_user")
-    parser.add_argument("--key", type=str, default="~/.ssh/helios-aws.pem", help="ssh private key path")
+    parser.add_argument("--key", type=str, default="~/.ssh/ordo-aws.pem", help="ssh private key path")
     parser.add_argument(
         "--ansible-host",
         choices=["public", "private"],

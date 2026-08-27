@@ -6,6 +6,7 @@
 # Caller sets perf_stat_dir and perf_stat_label.
 - name: "perf stat ({{ perf_stat_label }}): install perf and relax paranoid"
   become: yes
+  tags: [privileged]
   shell: |
     apt-get install -y -qq linux-tools-aws 2>/dev/null || true
     sysctl -w kernel.perf_event_paranoid=0 2>/dev/null || true

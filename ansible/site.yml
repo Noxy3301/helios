@@ -6,6 +6,7 @@
 # playbooks. Kept for manual runs, which pass bundle_path and bundle_sha256.
 - hosts: all
   become: true
+  tags: [privileged]
   gather_facts: false
   tasks:
     - name: Set system-wide nofile limits

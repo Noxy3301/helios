@@ -20,6 +20,7 @@
   tasks:
     - name: Ensure sysstat installed (load-phase sampling)
       become: yes
+      tags: [privileged]
       apt:
         name: sysstat
         state: present
@@ -103,6 +104,7 @@
     # Before any load or execute traffic; the play itself runs unprivileged.
     - import_tasks: tasks/ena_queue_tuning.yml
       become: true
+      tags: [privileged]
 
     - name: Reset benchbase database on each MySQL
       shell: |

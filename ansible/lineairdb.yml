@@ -14,10 +14,12 @@
     # Before any traffic; the play itself runs unprivileged
     - import_tasks: tasks/ena_queue_tuning.yml
       become: true
+      tags: [privileged]
 
     - name: Check whether the WAL volume is already mounted
       when: wal_volume | bool
       become: true
+      tags: [privileged]
       command: mountpoint -q {{ wal_mount }}
       register: wal_mounted
       failed_when: false
@@ -26,6 +28,7 @@
     - name: Require an existing WAL mount to be an ext4 NVMe volume
       when: (wal_volume | bool) and (wal_mounted.rc | default(1)) == 0
       become: true
+      tags: [privileged]
       shell: |
         set -euo pipefail
         read -r src fs < <(findmnt -n -o SOURCE,FSTYPE {{ wal_mount }})
@@ -37,6 +40,7 @@
     - name: Configure the WAL volume
       when: (wal_volume | bool) and (wal_mounted.rc | default(1)) != 0
       become: true
+      tags: [privileged]
       block:
         - name: Find unpartitioned, unmounted NVMe disks
           shell: |
@@ -83,6 +87,7 @@
       # the plain directory) is re-linked even when the volume stayed mounted.
       when: wal_volume | bool
       become: true
+      tags: [privileged]
       shell: |
         set -euo pipefail
         mkdir -p {{ wal_mount }}/lineairdb_logs

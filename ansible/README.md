@@ -87,7 +87,7 @@ For debugging or running individual steps, you can use Ansible playbooks directl
 ### 1. Generate inventory from AWS tags
 
 ```bash
-python3 py/update_inventory.py --project-tag HeliosPush --run-tag <run_id>   # only the instances of that run
+python3 py/update_inventory.py --run-tag <run_id>   # only the instances of that run
 ```
 
 > Tag instances: `Name=helios-lineairdb`, `Name=helios-mysql`, `Name=helios-bench`, `Project=HeliosPush`, `Run=<run_id>`
@@ -98,6 +98,8 @@ python3 py/update_inventory.py --project-tag HeliosPush --run-tag <run_id>   # o
 ansible -i inventory.ini all -m ping           # Connectivity check
 ansible-playbook -i inventory.ini site.yml -e "bundle_path=... bundle_sha256=... deadman_required=false"  # Full deploy on hand-launched instances (push_bundle → lineairdb → mysql → benchbase)
 ```
+
+Tasks that need root carry the `privileged` tag; add `--skip-tags privileged` to run a playbook on hosts without sudo.
 
 ### 3. Run benchmarks
 

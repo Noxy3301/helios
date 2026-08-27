@@ -10,6 +10,7 @@
     # Before any traffic; the play itself runs unprivileged
     - import_tasks: tasks/ena_queue_tuning.yml
       become: true
+      tags: [privileged]
 
     - name: Wait for the LineairDB server port
       # Bundle deploys start the roles in parallel, so mysqld must wait for the
