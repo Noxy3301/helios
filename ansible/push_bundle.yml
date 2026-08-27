@@ -1,0 +1,79 @@
+---
+# Deploy the locally-built Helios bundle to every node (the env-only AMI
+# carries no repository or toolchain). Location-independent
+# (build_bundle.sh injects cd + LD_LIBRARY_PATH), so it extracts under $HOME
+# and the playbooks' ~/helios references work as-is.
+# Required vars: bundle_path (controller-local tar.gz) and bundle_sha256
+# (deploy fails on mismatch).
+- hosts: all
+  gather_facts: false
+  vars:
+    _remote_tar: /tmp/helios-bundle.tar.gz
+  tasks:
+    - name: Copy bundle
+      copy:
+        src: "{{ bundle_path }}"
+        dest: "{{ _remote_tar }}"
+
+    - name: Verify bundle sha256
+      shell: echo "{{ bundle_sha256 }}  {{ _remote_tar }}" | sha256sum -c -
+      args:
+        executable: /bin/bash
+
+    - name: Stop any running helios services
+      # Bracketed patterns so pkill cannot match this task's own shell
+      shell: |
+        pkill -f '[r]untime_output_directory/mysqld' 2>/dev/null || true
+        pkill -f '[b]uild/server/lineairdb-server' 2>/dev/null || true
+        true
+      args:
+        executable: /bin/bash
+
+    - name: Extract bundle to $HOME (-> ~/helios)
+      shell: |
+        set -euo pipefail
+        test -e "$HOME/helios/.git" && { echo "refusing to replace a git checkout" >&2; exit 1; }
+        rm -rf "$HOME/helios"
+        tar -C "$HOME" -xzf {{ _remote_tar }}
+        # RUNPATH of lineairdb-server walks $ROOT/server/..; keep the dir real
+        # as defense-in-depth (LD_LIBRARY_PATH already covers every dep).
+        mkdir -p "$HOME/helios/server"
+      args:
+        executable: /bin/bash
+
+    - name: Gate — every shared-object dependency resolves (system or bundled)
+      shell: |
+        set -euo pipefail
+        L="$HOME/helios/build/library_output_directory"
+        rc=0
+        for f in "$HOME/helios/build/runtime_output_directory/mysqld" \
+                 "$HOME/helios/build/runtime_output_directory/mysql" \
+                 "$HOME/helios/build/runtime_output_directory/mysqladmin" \
+                 "$HOME/helios/build/plugin_output_directory/ha_lineairdb_storage_engine.so" \
+                 "$HOME/helios/build/server/lineairdb-server"; do
+          miss=$(LD_LIBRARY_PATH="$L" ldd "$f" | grep 'not found' || true)
+          if [ -n "$miss" ]; then
+            echo "UNRESOLVED DEPS in $f:"; echo "$miss"; rc=1
+          fi
+        done
+        exit $rc
+      args:
+        executable: /bin/bash
+
+    - name: Gate — hard nofile limit is high enough for the server
+      shell: |
+        h=$(ulimit -Hn)
+        [ "$h" = "unlimited" ] || [ "$h" -ge 1048576 ] || {
+          echo "hard nofile limit too low: $h"; exit 1; }
+      args:
+        executable: /bin/bash
+
+    - name: Gate — the dead-man timer is armed
+      # cloud-final schedules the shutdown from user-data after sshd is up, so
+      # wait for it; an instance launched by hand passes deadman_required=false.
+      shell: test -e /run/systemd/shutdown/scheduled
+      register: deadman
+      until: deadman.rc == 0
+      retries: 12
+      delay: 5
+      when: deadman_required | default(true) | bool

@@ -1,50 +1,38 @@
 ---
+# Start mysqld + LineairDB proxy plugin from the pushed bundle
+# (push_bundle.yml runs first; no repository or build step on the node).
 - hosts: mysql
   gather_facts: false
   tasks:
-    - name: Sync helios repo + submodules
-      shell: |
-        set -euo pipefail
-        cd ~/helios
-        ./scripts/stop_mysql.sh || true
-        git fetch origin
-        git checkout {{ helios_branch | default('main') }}
-        git pull --ff-only
-        git submodule update --init --recursive
-        echo "=== SHAs ==="
-        echo "Helios($(git rev-parse --abbrev-ref HEAD)@$(git rev-parse --short HEAD))"
-        echo "LineairDB($(cd third_party/LineairDB && git rev-parse --abbrev-ref HEAD)@$(cd third_party/LineairDB && git rev-parse --short HEAD))"
-        echo "mysql-server($(cd third_party/mysql-server && git rev-parse --abbrev-ref HEAD)@$(cd third_party/mysql-server && git rev-parse --short HEAD))"
-        echo "benchbase($(cd third_party/benchbase && git rev-parse --abbrev-ref HEAD)@$(cd third_party/benchbase && git rev-parse --short HEAD))"
-      args:
-        executable: /bin/bash
-      register: sync_result
-
-    - name: Show repo / submodule SHAs
-      debug:
-        var: sync_result.stdout_lines
-
-    - name: Build server + proxy
-      shell: |
-        set -euo pipefail
-        cd ~/helios
-        ./scripts/build_partial.sh 2>&1 | tail -40
-      args:
-        executable: /bin/bash
-      register: build_result
-
-    - name: Show build tail
-      debug:
-        var: build_result.stdout_lines
+    - name: Wait for the LineairDB server port
+      # Bundle deploys start the roles in parallel, so mysqld must wait for the
+      # server's listen socket.
+      wait_for:
+        host: "{{ hostvars['lineairdb-1'].private_ip }}"
+        port: 9999
+        timeout: 180
 
     - name: Start MySQL with LineairDB-Proxy
+      # Never pipe the start scripts to a pager/tail; log to a file and
+      # verify the listener explicitly.
       shell: |
         set -euo pipefail
         cd ~/helios
-        ./scripts/start_mysql.sh \
+        ./scripts/stop_mysql.sh > /dev/null 2>&1 || true
+        sleep 1
+        timeout -k 10 900 ./scripts/start_mysql.sh \
           --mysqld-port 3307 \
           --server-host {{ hostvars['lineairdb-1'].private_ip }} \
-          --server-port 9999
+          --server-port 9999 > /tmp/start_mysql.log 2>&1 || {
+            echo "start_mysql.sh failed:"; tail -40 /tmp/start_mysql.log; exit 1; }
+        for i in $(seq 1 30); do
+          if timeout 2 bash -c "</dev/tcp/127.0.0.1/3307" 2>/dev/null; then
+            echo "mysqld listening on 3307"; exit 0
+          fi
+          sleep 2
+        done
+        echo "mysqld never listened on 3307:"; tail -40 /tmp/start_mysql.log
+        exit 1
       args:
         executable: /bin/bash
 

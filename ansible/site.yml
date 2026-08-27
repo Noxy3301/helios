@@ -1,5 +1,9 @@
 ---
-# Raise file descriptor limits on all nodes to prevent fd exhaustion
+# Raise file descriptor limits on all nodes
+#
+# bench_aws.py does not run this file; it invokes lineairdb.yml, mysql.yml,
+# haproxy.yml and benchbase.yml directly. Kept for manual runs, which pass bundle_path and
+# bundle_sha256.
 - hosts: all
   become: true
   gather_facts: false
@@ -18,6 +22,7 @@
         value: "2097152"
         sysctl_set: true
 
+- import_playbook: push_bundle.yml
 - import_playbook: lineairdb.yml
 - import_playbook: mysql.yml
 - import_playbook: haproxy.yml

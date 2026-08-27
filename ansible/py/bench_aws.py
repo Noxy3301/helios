@@ -22,6 +22,7 @@ Usage:
 import argparse
 import json
 import os
+import shlex
 import subprocess
 import sys
 import time
@@ -60,15 +61,22 @@ CLUSTER = {
 
 AWS_DEFAULTS = {
     "region": "ap-southeast-2",
-    "launch_template": "lt-0f28a9f6b02e1c019",
-    "project_tag": "Helios",
-    "ssh_key": "~/.ssh/helios-aws.pem",
+    # Every launch parameter is passed explicitly, without a launch template
+    "project_tag": "HeliosPush",   # distinct from Project=Helios: neither harness touches the other's instances
+    "ssh_key": "~/.ssh/ordo-aws.pem",
     "ssh_user": "ubuntu",
-    # On-demand fallback params (extracted from launch template)
-    "ami_id": "ami-06b4ab6c66b56fbd8",
+    # env-only AMI: Ubuntu 24.04 with the runtime libraries, a Java 23 runtime,
+    # sysstat and haproxy, and no Helios binaries.
+    "ami_id": "ami-01791c5dbde3b3ba1",
     "security_group": "sg-02d9a0d5948d02dbb",
-    "subnet": "subnet-0a15ff55a4cae198b",  # ap-southeast-2c (same-AZ pinning)
+    # Same-AZ pinning: every role must sit in one AZ or cross-AZ latency lands
+    # on the RPC path.
+    "subnet": "subnet-01a0d1fe432c2f92e",  # ap-southeast-2a (same-AZ pinning)
 }
+
+# Everything this run launched, appended as soon as run-instances returns, so
+# cleanup covers a partially launched cluster.
+LAUNCHED = {"instances": [], "spot_requests": []}
 
 # vCPU count for EC2 instance sizes (used to build machine_spec locally)
 _VCPU_BY_SIZE = {
@@ -147,8 +155,47 @@ def run(cmd, check=True, **kwargs):
 SPOT_ERRORS = ("InsufficientInstanceCapacity", "SpotMaxPriceTooLow", "MaxSpotInstanceCountExceeded")
 
 
+def _record_launch(ids, region):
+    """Register instance IDs and their spot request IDs for cleanup, first thing."""
+    LAUNCHED["instances"].extend(ids)
+    try:
+        req_ids = aws_text([
+            "ec2", "describe-instances", "--instance-ids", *ids,
+            "--query", "Reservations[].Instances[].SpotInstanceRequestId",
+        ], region=region)
+        if req_ids and req_ids != "None":
+            LAUNCHED["spot_requests"].extend(
+                r for r in req_ids.split() if r and r != "None")
+    except RuntimeError as e:
+        log(f"  Warning: spot request lookup failed for {ids}: {e}")
+
+
+def _number_instances(ids, base_tag, region):
+    """Tag instances with sequential names: tag-1, tag-2, ... Best-effort:
+    a tagging failure must never orphan already-launched instances."""
+    for i, iid in enumerate(ids, 1):
+        name = f"{base_tag}-{i}" if len(ids) > 1 else base_tag
+        try:
+            aws(["ec2", "create-tags", "--resources", iid,
+                 "--tags", f"Key=Name,Value={name}"], region=region)
+        except RuntimeError as e:
+            log(f"  Warning: tagging {iid} failed ({e}); continuing")
+
+
+
+# Roles whose primary ENI gets more than the EC2 default 8 combined queues.
+# ethtool -L cannot raise the EC2-side allocation, so it is set at
+# run-instances time; 32 is the per-ENI maximum of the instance family used.
+ENA_TUNED_ROLES = {"haproxy", "benchbase"}
+ENA_QUEUE_COUNT = 32
+
+
 def _launch_role(role, cfg, args):
-    """Launch instances for a single role. Try spot first, fall back to on-demand."""
+    """Launch instances for a single role, spot by default.
+
+    Fully explicit run-instances (no launch template): env AMI, dead-man
+    user-data (self-terminate if forgotten), gp3 root with DeleteOnTermination,
+    IMDSv2. On-demand happens only with --on-demand or --allow-od-fallback."""
     region = args.region
     tag_spec = [
         "--tag-specifications",
@@ -157,24 +204,40 @@ def _launch_role(role, cfg, args):
         f"{{Key=Project,Value={args.project_tag}}}"
         f"]",
     ]
+    deadman = (f"#!/bin/bash\n"
+               f"shutdown +{args.deadman_minutes} \"helios bench dead-man\"\n")
     base_cmd = [
         "ec2", "run-instances",
-        "--launch-template", f"LaunchTemplateId={args.launch_template},Version=$Default",
+        "--image-id", args.ami_id,
+        "--key-name", Path(args.ssh_key).stem,
         "--count", str(cfg["count"]),
         "--instance-type", cfg["instance_type"],
+        "--block-device-mappings",
+        f"DeviceName=/dev/sda1,Ebs={{VolumeSize={args.root_gib},"
+        f"VolumeType=gp3,DeleteOnTermination=true}}",
+        "--metadata-options", "HttpTokens=required,HttpEndpoint=enabled",
+        "--instance-initiated-shutdown-behavior", "terminate",
+        "--user-data", deadman,
     ]
-    if args.subnet:
-        base_cmd += ["--subnet-id", args.subnet]
-
-    def _number_instances(ids, base_tag, region):
-        """Tag instances with sequential names: tag-1, tag-2, ..."""
-        for i, iid in enumerate(ids, 1):
-            name = f"{base_tag}-{i}" if len(ids) > 1 else base_tag
-            aws(["ec2", "create-tags", "--resources", iid,
-                 "--tags", f"Key=Name,Value={name}"], region=region)
+    if role in ENA_TUNED_ROLES:
+        # --network-interfaces subsumes --subnet-id/--security-group-ids;
+        # mixing both forms is rejected by the API.
+        network_interface = {
+            "DeviceIndex": 0,
+            "Groups": [args.security_group],
+            "AssociatePublicIpAddress": True,
+            "DeleteOnTermination": True,
+            "EnaQueueCount": ENA_QUEUE_COUNT,
+        }
+        if args.subnet:
+            network_interface["SubnetId"] = args.subnet
+        base_cmd += ["--network-interfaces", json.dumps([network_interface])]
+    else:
+        base_cmd += ["--security-group-ids", args.security_group]
+        if args.subnet:
+            base_cmd += ["--subnet-id", args.subnet]
 
     if not args.on_demand:
-        # Try spot first
         log(f"Launching {cfg['count']}x {cfg['instance_type']} for {role} ({cfg['tag']}) [spot]...")
         try:
             spot_cmd = base_cmd + [
@@ -183,31 +246,25 @@ def _launch_role(role, cfg, args):
             ] + tag_spec
             result = aws(spot_cmd, region=region)
             ids = [inst["InstanceId"] for inst in result.get("Instances", [])]
+            _record_launch(ids, region)
             _number_instances(ids, cfg["tag"], region)
             log(f"  -> [spot] {ids}")
             return ids
         except RuntimeError as e:
             if any(err in str(e) for err in SPOT_ERRORS):
-                log(f"  Spot unavailable for {role}, falling back to on-demand...")
+                if not args.allow_od_fallback:
+                    raise RuntimeError(
+                        f"Spot unavailable for {role} ({e}); aborting. "
+                        f"Pass --allow-od-fallback to permit on-demand.")
+                log(f"  Spot unavailable for {role}, falling back to on-demand (--allow-od-fallback)...")
             else:
                 raise
 
-    # On-demand (fallback or --on-demand flag)
-    # Launch template has InstanceMarketOptions=spot, so we must launch
-    # WITHOUT the template and specify all params directly.
+    # On-demand (--on-demand flag or authorized fallback)
     log(f"Launching {cfg['count']}x {cfg['instance_type']} for {role} ({cfg['tag']}) [on-demand]...")
-    od_cmd = [
-        "ec2", "run-instances",
-        "--image-id", args.ami_id,
-        "--key-name", Path(args.ssh_key).stem,
-        "--security-group-ids", args.security_group,
-        "--count", str(cfg["count"]),
-        "--instance-type", cfg["instance_type"],
-    ]
-    if args.subnet:
-        od_cmd += ["--subnet-id", args.subnet]
-    result = aws(od_cmd + tag_spec, region=region)
+    result = aws(base_cmd + tag_spec, region=region)
     ids = [inst["InstanceId"] for inst in result.get("Instances", [])]
+    _record_launch(ids, region)
     _number_instances(ids, cfg["tag"], region)
     log(f"  -> [on-demand] {ids}")
     return ids
@@ -287,16 +344,28 @@ def run_playbook(name, extra_vars=None, args=None):
     run(cmd)
 
 
-def deploy_infrastructure(branch=None):
-    """Deploy LineairDB, MySQL, HAProxy in parallel, then wait."""
-    log("Deploying infrastructure (lineairdb + mysql + haproxy in parallel)...")
+def deploy_infrastructure(args, bundle_path, bundle_sha256):
+    """Push the binary bundle to every node, then start roles in parallel."""
     inv = str(ANSIBLE_DIR / "inventory.ini")
-    extra = f' -e "helios_branch={branch}"' if branch else ""
+
+    # Push the bundle to every host before any role starts
+    log(f"Pushing bundle {bundle_path} ({bundle_sha256[:12]}...) to all nodes...")
+    run(f"ansible-playbook -i {inv} {ANSIBLE_DIR / 'push_bundle.yml'}"
+        f" -e {shlex.quote(json.dumps({'bundle_path': bundle_path, 'bundle_sha256': bundle_sha256}))}")
+
+    # Start the roles in parallel
+    log("Deploying infrastructure (lineairdb + mysql + haproxy in parallel)...")
+    hap_size = CLUSTER["haproxy"]["instance_type"].split(".")[-1]
+    hap_threads = _VCPU_BY_SIZE.get(hap_size, 48)
+    role_extra = {
+        "haproxy.yml": f' -e "haproxy_nbthread={hap_threads}"',
+    }
     # Write deploy logs alongside bench_aws.log
     deploy_log_dir = Path(LOG_FILE.name).parent if LOG_FILE else None
     procs = []
 
     for playbook in ["lineairdb.yml", "mysql.yml", "haproxy.yml"]:
+        extra = role_extra.get(playbook, "")
         cmd = f"ansible-playbook -i {inv} {ANSIBLE_DIR / playbook}{extra}"
         log(f"  $ {cmd}")
         if deploy_log_dir:
@@ -396,88 +465,86 @@ def _plot_perf_reports(result_root):
 # Cleanup
 # ──────────────────────────────────────────────
 def cleanup(args):
-    """Cancel spot requests first, then terminate instances."""
+    """Terminate the recorded launches and every instance carrying the project tag.
+
+    Spot requests are cancelled per instance, never by key name: the key pair is shared."""
     region = args.region
     project_tag = args.project_tag
     log(f"Cleaning up (Project={project_tag}, region={region})...")
+    ok = True
 
-    # Step 1: Cancel ALL open/active spot requests first (prevents respawn).
-    # Spot requests may not have Project tags, so find them via launch template.
+    # Collect targets: recorded launches plus Project-tagged instances
     try:
-        spot_ids = aws_text([
-            "ec2", "describe-spot-instance-requests",
-            "--filters",
-            "Name=state,Values=open,active",
-            f"Name=launch.key-name,Values={Path(args.ssh_key).stem}",
-            "--query", "SpotInstanceRequests[].SpotInstanceRequestId",
-        ], region=region)
-    except RuntimeError:
-        spot_ids = ""
-
-    if spot_ids and spot_ids != "None":
-        ids = spot_ids.split()
-        log(f"  Cancelling {len(ids)} spot requests: {ids}")
-        try:
-            aws_text([
-                "ec2", "cancel-spot-instance-requests",
-                "--spot-instance-request-ids", *ids,
-            ], region=region)
-        except RuntimeError as e:
-            log(f"  Warning: cancel spot failed: {e}")
-    else:
-        log("  No spot requests to cancel.")
-
-    # Step 2: Terminate instances by Project tag
-    try:
-        instance_ids = aws_text([
+        tagged = aws_text([
             "ec2", "describe-instances",
             "--filters",
             f"Name=tag:Project,Values={project_tag}",
             "Name=instance-state-name,Values=pending,running,stopping,stopped",
             "--query", "Reservations[].Instances[].InstanceId",
         ], region=region)
-    except RuntimeError:
-        instance_ids = ""
+    except RuntimeError as e:
+        log(f"  ERROR: describe-instances failed: {e}")
+        tagged = ""
+        ok = False
+    ids = sorted(set(LAUNCHED["instances"]) |
+                 set(tagged.split() if tagged and tagged != "None" else []))
 
-    if instance_ids and instance_ids != "None":
-        ids = instance_ids.split()
-        log(f"  Terminating {len(ids)} tagged instances: {ids}")
+    # Cancel only our spot requests, recorded or resolved from our instances
+    spot_reqs = set(LAUNCHED["spot_requests"])
+    if ids:
+        try:
+            req_ids = aws_text([
+                "ec2", "describe-instances", "--instance-ids", *ids,
+                "--query", "Reservations[].Instances[].SpotInstanceRequestId",
+            ], region=region)
+            if req_ids and req_ids != "None":
+                spot_reqs |= {r for r in req_ids.split() if r and r != "None"}
+        except RuntimeError as e:
+            log(f"  ERROR: resolving spot requests failed: {e}")
+            ok = False
+    if spot_reqs:
+        log(f"  Cancelling {len(spot_reqs)} own spot requests: {sorted(spot_reqs)}")
         try:
             aws_text([
-                "ec2", "terminate-instances",
-                "--instance-ids", *ids,
+                "ec2", "cancel-spot-instance-requests",
+                "--spot-instance-request-ids", *sorted(spot_reqs),
             ], region=region)
         except RuntimeError as e:
-            log(f"  Warning: terminate failed: {e}")
-    else:
-        log("  No tagged instances to terminate.")
+            log(f"  ERROR: cancel spot failed: {e}")
+            ok = False
 
-    # Step 3: Also terminate any untagged instances from the same key pair
-    # (catches instances spawned by persistent spot requests after cleanup)
+    if ids:
+        log(f"  Terminating {len(ids)} instances: {ids}")
+        try:
+            aws_text(["ec2", "terminate-instances", "--instance-ids", *ids],
+                     region=region)
+        except RuntimeError as e:
+            log(f"  ERROR: terminate failed: {e}")
+            ok = False
+    else:
+        log("  Nothing to terminate.")
+
+    # Verify that nothing is still alive under our tag
     try:
-        untagged_ids = aws_text([
+        leftovers = aws_text([
             "ec2", "describe-instances",
             "--filters",
-            f"Name=key-name,Values={Path(args.ssh_key).stem}",
+            f"Name=tag:Project,Values={project_tag}",
             "Name=instance-state-name,Values=pending,running,stopping,stopped",
-            "--query", "Reservations[].Instances[?!Tags].InstanceId",
+            "--query", "Reservations[].Instances[].InstanceId",
         ], region=region)
-    except RuntimeError:
-        untagged_ids = ""
+    except RuntimeError as e:
+        log(f"  ERROR: verification failed: {e}")
+        leftovers = ""
+        ok = False
+    if leftovers and leftovers != "None":
+        log(f"  ERROR: instances still not shutting down: {leftovers.split()}")
+        ok = False
+    elif ok:
+        log("  Verified: no Project-tagged instances left (terminating/terminated).")
 
-    if untagged_ids and untagged_ids != "None":
-        ids = [i for i in untagged_ids.split() if i not in (instance_ids or "").split()]
-        if ids:
-            log(f"  Terminating {len(ids)} untagged instances: {ids}")
-            try:
-                aws_text([
-                    "ec2", "terminate-instances",
-                    "--instance-ids", *ids,
-                ], region=region)
-            except RuntimeError as e:
-                log(f"  Warning: terminate untagged failed: {e}")
-
-    log("Cleanup done.")
+    log("Cleanup done." if ok else "CLEANUP INCOMPLETE: re-run with --cleanup-only and check the console.")
+    return ok
 
 
 # ──────────────────────────────────────────────
@@ -515,28 +582,40 @@ Examples:
 
     # AWS options
     parser.add_argument("--region", default=AWS_DEFAULTS["region"])
-    parser.add_argument("--launch-template", default=AWS_DEFAULTS["launch_template"])
     parser.add_argument("--project-tag", default=AWS_DEFAULTS["project_tag"])
     parser.add_argument("--ssh-key", default=AWS_DEFAULTS["ssh_key"])
     parser.add_argument("--ssh-user", default=AWS_DEFAULTS["ssh_user"])
-    parser.add_argument("--ami-id", default=AWS_DEFAULTS["ami_id"], help="AMI ID for on-demand fallback")
+    parser.add_argument("--ami-id", default=AWS_DEFAULTS["ami_id"],
+                        help="env-only AMI for all roles")
     parser.add_argument("--security-group", default=AWS_DEFAULTS["security_group"])
     parser.add_argument("--subnet", default=AWS_DEFAULTS["subnet"], help="Subnet ID (for AZ pinning)")
+    parser.add_argument("--deadman-minutes", type=int, default=240,
+                        help="Instances self-terminate after this many minutes (safety net)")
+    parser.add_argument("--root-gib", type=int, default=60, help="Root gp3 volume size")
+    parser.add_argument("--allow-od-fallback", action="store_true",
+                        help="Permit on-demand fallback when spot capacity is unavailable "
+                             "(default: abort instead)")
 
     # Cluster topology overrides
     parser.add_argument("--mysql-count", type=int, default=None, help="Override MySQL node count")
     parser.add_argument("--mysql-instance-type", default=None, help="Override MySQL instance type")
+    parser.add_argument("--lineairdb-instance-type", default=None, help="Override LineairDB instance type")
     parser.add_argument("--haproxy-instance-type", default=None, help="Override HAProxy instance type")
     parser.add_argument("--benchbase-count", type=int, default=None, help="Override BenchBase node count")
     parser.add_argument("--benchbase-instance-type", default=None, help="Override BenchBase instance type")
     # Control options
-    parser.add_argument("--branch", default=None, help="Git branch to checkout on remote nodes (default: keep current)")
+    parser.add_argument("--bundle", default=None,
+                        help="Path to helios bundle tar.gz (default: build one now via build_bundle.sh)")
     parser.add_argument("--on-demand", action="store_true", help="Skip spot, launch all instances as on-demand")
     parser.add_argument("--cleanup-only", action="store_true", help="Only terminate instances, don't launch")
     parser.add_argument("--skip-cleanup", action="store_true", help="Don't terminate instances after benchmark")
     parser.add_argument("--dry-run", action="store_true", help="Show what would be launched")
 
     args = parser.parse_args()
+    if args.deadman_minutes < 1:
+        parser.error("--deadman-minutes must be at least 1")
+    if args.bundle is not None:
+        args.bundle = str(Path(args.bundle).resolve())
     os.chdir(ANSIBLE_DIR)
 
     # Apply cluster overrides before building machine_spec
@@ -544,6 +623,8 @@ Examples:
         CLUSTER["mysql"]["count"] = args.mysql_count
     if args.mysql_instance_type is not None:
         CLUSTER["mysql"]["instance_type"] = args.mysql_instance_type
+    if args.lineairdb_instance_type is not None:
+        CLUSTER["lineairdb"]["instance_type"] = args.lineairdb_instance_type
     if args.haproxy_instance_type is not None:
         CLUSTER["haproxy"]["instance_type"] = args.haproxy_instance_type
     if args.benchbase_count is not None:
@@ -566,9 +647,9 @@ Examples:
 
     # Cleanup-only mode
     if args.cleanup_only:
-        cleanup(args)
+        cleanup_ok = cleanup(args)
         LOG_FILE.close()
-        return 0
+        return 0 if cleanup_ok else 1
 
     # Dry run
     if args.dry_run:
@@ -581,46 +662,57 @@ Examples:
         LOG_FILE.close()
         return 0
 
+    # Build or locate the bundle before launching anything
+    bundle_path = args.bundle
+    if bundle_path is None:
+        bundle_path = str(ANSIBLE_DIR / "helios-bundle.tar.gz")
+        log("Building bundle via build_bundle.sh...")
+        run(f"bash {shlex.quote(str(SCRIPT_DIR / 'build_bundle.sh'))} {shlex.quote(bundle_path)}")
+    bundle_path = str(Path(bundle_path).resolve())
+    bundle_sha256 = subprocess.run(
+        ["sha256sum", bundle_path], capture_output=True, text=True, check=True,
+    ).stdout.split()[0]
+    log(f"Bundle: {bundle_path} sha256={bundle_sha256}")
+
     # Full run
     start_time = time.time()
-    instance_ids = None
 
+    rc = 1
     try:
         # Phase 1: Launch
         instance_ids = launch_instances(args)
         if instance_ids is None:
-            log("SPOT UNAVAILABLE — skipping benchmark.")
-            return 1
+            log("LAUNCH FAILED: skipping benchmark.")
+        else:
+            # Phase 2: Wait
+            wait_for_instances(instance_ids, args.region)
 
-        # Phase 2: Wait
-        wait_for_instances(instance_ids, args.region)
+            # Phase 3: Inventory + SSH
+            generate_inventory(args)
+            wait_for_ssh(args)
 
-        # Phase 3: Inventory + SSH
-        generate_inventory(args)
-        wait_for_ssh(args)
+            # Phase 4: Deploy + Benchmark
+            deploy_infrastructure(args, bundle_path, bundle_sha256)
+            run_benchmarks(args, run_id)
 
-        # Phase 4: Deploy + Benchmark
-        deploy_infrastructure(branch=args.branch)
-        run_benchmarks(args, run_id)
-
-        elapsed = time.time() - start_time
-        log(f"All done in {elapsed / 60:.1f} minutes.")
-        return 0
+            elapsed = time.time() - start_time
+            log(f"All done in {elapsed / 60:.1f} minutes.")
+            rc = 0
 
     except (RuntimeError, subprocess.CalledProcessError) as e:
         log(f"ERROR: {e}")
-        return 1
 
     except KeyboardInterrupt:
         log("Interrupted by user.")
-        return 1
 
     finally:
-        if not args.skip_cleanup and instance_ids is not None:
-            cleanup(args)
+        # Always sweep: a launch whose response was lost has no recorded id
+        if not args.skip_cleanup and not cleanup(args):
+            rc = 1
         if LOG_FILE:
             log(f"Full log saved to: {log_dir}")
             LOG_FILE.close()
+    return rc
 
 
 if __name__ == "__main__":

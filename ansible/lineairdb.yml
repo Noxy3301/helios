@@ -1,49 +1,32 @@
 ---
+# Start the LineairDB server from the pushed bundle (push_bundle.yml runs first;
+# there is no repository or build step on the node).
 - hosts: lineairdb
   gather_facts: false
   vars:
     lineairdb_nofile_limit: 1048576
   tasks:
-    - name: Sync helios repo + submodules
-      shell: |
-        set -euo pipefail
-        cd ~/helios
-        ./scripts/stop_server.sh || true
-        git fetch origin
-        git checkout {{ helios_branch | default('main') }}
-        git pull --ff-only
-        git submodule update --init --recursive
-        echo "=== SHAs ==="
-        echo "Helios($(git rev-parse --abbrev-ref HEAD)@$(git rev-parse --short HEAD))"
-        echo "LineairDB($(cd third_party/LineairDB && git rev-parse --abbrev-ref HEAD)@$(cd third_party/LineairDB && git rev-parse --short HEAD))"
-        echo "mysql-server($(cd third_party/mysql-server && git rev-parse --abbrev-ref HEAD)@$(cd third_party/mysql-server && git rev-parse --short HEAD))"
-        echo "benchbase($(cd third_party/benchbase && git rev-parse --abbrev-ref HEAD)@$(cd third_party/benchbase && git rev-parse --short HEAD))"
-      args:
-        executable: /bin/bash
-      register: sync_result
-
-    - name: Show repo / submodule SHAs
-      debug:
-        var: sync_result.stdout_lines
-
-    - name: Build server + proxy
-      shell: |
-        set -euo pipefail
-        cd ~/helios
-        ./scripts/build_partial.sh 2>&1 | tail -40
-      args:
-        executable: /bin/bash
-      register: build_result
-
-    - name: Show build tail
-      debug:
-        var: build_result.stdout_lines
-
     - name: Start LineairDB-Server
+      # Never pipe the start scripts: log to a file and verify liveness explicitly
       shell: |
         set -euo pipefail
         cd ~/helios
+        ./scripts/stop_server.sh > /dev/null 2>&1 || true
+        sleep 1
         ulimit -n {{ lineairdb_nofile_limit }}
-        ./scripts/start_server.sh
+        ./scripts/start_server.sh > /tmp/start_server.log 2>&1
+        sleep 2
+        # Bracketed: the pattern kill in stop_server.sh must not match this shell
+        pgrep -f '[b]uild/server/lineairdb-server' > /dev/null || {
+          echo "lineairdb-server did not stay up:"; cat /tmp/start_server.log
+          tail -20 ~/helios/lineairdb_logs/lineairdb_server_*.log 2>/dev/null
+          exit 1
+        }
+        echo "lineairdb-server up (nofile=$(ulimit -n))"
       args:
         executable: /bin/bash
+      register: server_start
+
+    - name: Show server start log
+      debug:
+        var: server_start.stdout_lines
