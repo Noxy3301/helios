@@ -1,0 +1,74 @@
+---
+# Start system-wide perf counting on the query and storage nodes to tell
+# instruction-bound from memory-stall-bound CPU time (IPC). Counting mode
+# only, never perf record. Missing perf, unsupported cache events or a failed
+# start reduce to a logged note and never fail a run.
+# Caller sets perf_stat_dir and perf_stat_label.
+- name: "perf stat ({{ perf_stat_label }}): install perf and relax paranoid"
+  become: yes
+  shell: |
+    apt-get install -y -qq linux-tools-aws 2>/dev/null || true
+    sysctl -w kernel.perf_event_paranoid=0 2>/dev/null || true
+    sysctl -w kernel.kptr_restrict=0 2>/dev/null || true
+    exit 0
+  args:
+    executable: /bin/bash
+  failed_when: false
+
+- name: "perf stat ({{ perf_stat_label }}): detect perf binary"
+  shell: |
+    for p in $(find /usr/lib/linux-*-tools-* -name perf -type f 2>/dev/null) \
+             /usr/bin/perf; do
+      [ -x "$p" ] && { echo "$p"; exit 0; }
+    done
+    exit 0
+  args:
+    executable: /bin/bash
+  register: perf_stat_bin_result
+  changed_when: false
+  failed_when: false
+
+- name: "perf stat ({{ perf_stat_label }}): set perf binary fact"
+  set_fact:
+    perf_stat_bin: "{{ perf_stat_bin_result.stdout_lines | default([]) | first | default('') }}"
+
+- name: "perf stat ({{ perf_stat_label }}): SKIPPED — perf unavailable"
+  debug:
+    msg: >-
+      NOTE: no usable perf binary on {{ inventory_hostname }};
+      skipping perf stat ({{ perf_stat_label }}). Run continues.
+  when: perf_stat_bin == ''
+
+- name: "perf stat ({{ perf_stat_label }}): probe event support and start"
+  # Cache/TLB events are frequently unsupported under virtualisation. Probe the
+  # rich set, fall back to cycles+instructions (which is all IPC needs), and if
+  # even that fails, record why and start nothing.
+  shell: |
+    set -u
+    D={{ perf_stat_dir }}
+    mkdir -p "$D"
+    P={{ perf_stat_bin }}
+    FULL=instructions,cycles,LLC-loads,LLC-load-misses,dTLB-load-misses
+    MIN=instructions,cycles
+    pick=""
+    for set in "$FULL" "$MIN"; do
+      if $P stat -a -x, -e "$set" -- sleep 0.2 >/dev/null 2>"$D/perfstat-probe.err"; then
+        if ! grep -q "not supported\|not counted" "$D/perfstat-probe.err"; then
+          pick="$set"; break
+        fi
+      fi
+    done
+    if [ -z "$pick" ]; then
+      echo "perf stat unusable on $(hostname): $(head -3 "$D/perfstat-probe.err" 2>/dev/null)" \
+        > "$D/perfstat-{{ perf_stat_label }}.skipped"
+      exit 0
+    fi
+    echo "$pick" > "$D/perfstat-{{ perf_stat_label }}.events"
+    nohup $P stat -a -I {{ perf_stat_interval_ms | default(10000) }} -x, -e "$pick" \
+      > "$D/perfstat-{{ perf_stat_label }}.csv" 2>&1 &
+    echo $! > "$D/perfstat-{{ perf_stat_label }}.pid"
+    exit 0
+  args:
+    executable: /bin/bash
+  when: perf_stat_bin != ''
+  failed_when: false

@@ -1,0 +1,63 @@
+---
+# On-failure salvage: capture liveness, service logs and sampler output from
+# every node BEFORE cleanup terminates the instances (normal collection only runs
+# at the end of a successful sweep, so a mid-run death loses every log with
+# the instance otherwise).
+# Best-effort by design: every task tolerates failure and unreachable hosts,
+# so a half-dead cluster still yields evidence for the surviving nodes.
+- hosts: lineairdb:mysql:haproxy:benchbase
+  gather_facts: false
+  ignore_unreachable: true
+  vars:
+    run_id: "run"
+    machine_spec: "unknown"
+    load_result_dir: "{{ playbook_dir }}/result/{{ run_id }}/{{ machine_spec }}"
+  tasks:
+    - name: Stop samplers left running and keep their output
+      shell: |
+        for f in /tmp/load_metrics/*.pid /tmp/metrics/*.pid; do
+          [ -f "$f" ] && kill "$(cat "$f")" 2>/dev/null || true
+        done
+        pkill -f '[r]ss_probe.sh' 2>/dev/null || true
+        pkill -f '[j]stack_once.sh' 2>/dev/null || true
+        tar czf /tmp/salvage-metrics.tgz --ignore-failed-read /tmp/load_metrics /tmp/metrics 2>/dev/null || true
+      args:
+        executable: /bin/bash
+      failed_when: false
+      changed_when: false
+
+    - name: Fetch salvaged sampler output into the result dir
+      fetch:
+        src: /tmp/salvage-metrics.tgz
+        dest: "{{ load_result_dir }}/salvage/{{ inventory_hostname }}/"
+        flat: true
+      failed_when: false
+
+    - name: Snapshot process liveness, kernel messages, and service log tails
+      shell: |
+        {
+          echo "== date";  date -u +%FT%T.%3NZ
+          echo "== pgrep lineairdb/mysqld/haproxy"
+          pgrep -a -f "[l]ineairdb-server|[m]ysqld|[h]aproxy" || echo "NONE ALIVE"
+          echo "== ps top-rss"; ps -eo pid,etime,rss,comm --sort=-rss | head -20
+          echo "== dmesg tail"; sudo dmesg -T 2>/dev/null | tail -80
+          echo "== segv/oom in syslog"
+          sudo grep -aiE "segfault|out of memory|oom-kill|killed process" /var/log/syslog 2>/dev/null | tail -20
+          echo "== sockets"; ss -s
+        } > /tmp/salvage-snapshot.txt 2>&1
+        tar czf /tmp/salvage.tgz --ignore-failed-read \
+          /tmp/salvage-snapshot.txt /tmp/start_server.log /tmp/start_mysql.log \
+          $(ls $HOME/helios/lineairdb_logs/*.log 2>/dev/null | tail -3) \
+          $(sudo find $HOME -maxdepth 5 -name "*.err" 2>/dev/null | head -3) \
+          $(ls /var/log/haproxy.log 2>/dev/null) 2>/dev/null || true
+      args:
+        executable: /bin/bash
+      failed_when: false
+      changed_when: false
+
+    - name: Fetch salvage bundle into the result dir
+      fetch:
+        src: /tmp/salvage.tgz
+        dest: "{{ load_result_dir }}/salvage/{{ inventory_hostname }}/"
+        flat: true
+      failed_when: false

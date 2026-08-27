@@ -392,6 +392,20 @@ def deploy_infrastructure(args, bundle_path, bundle_sha256):
     log("Infrastructure deployed.")
 
 
+def salvage_server_logs(args, run_id):
+    """Best-effort: pull liveness snapshots + service logs off the nodes
+    before cleanup destroys the evidence. Never raises."""
+    try:
+        if not LAUNCHED["instances"]:
+            return
+        log("Salvaging server logs before cleanup...")
+        run_playbook("salvage_logs.yml",
+                     extra_vars=f"run_id={run_id} machine_spec={build_machine_spec()}")
+        log("Salvage complete.")
+    except Exception as e:
+        log(f"Salvage failed (continuing to cleanup): {e}")
+
+
 def run_benchmarks(args, run_id):
     """Run benchbase setup + benchmark execution."""
 
@@ -399,9 +413,21 @@ def run_benchmarks(args, run_id):
     if args.bench_scalefactor:
         bench_vars += f" bench_scalefactor={args.bench_scalefactor}"
 
+    # run_id + machine_spec let the setup play write load-phase artifacts into
+    # the same result dir the sweep uses. Observability only.
+    obs_vars = f" run_id={run_id} machine_spec={build_machine_spec()}"
+    if args.load_jstack:
+        obs_vars += " load_jstack=true"
+    if args.perf_stat:
+        obs_vars += " perf_stat=true"
+
+    # RTT baseline: topology property, captured once before any bench traffic
+    log("Recording RTT baseline between all nodes...")
+    run_playbook("ping_baseline.yml", extra_vars=bench_vars + obs_vars)
+
     # Setup: create schema + load data
     log(f"Setting up {args.bench_type.upper()} (SF={args.bench_scalefactor or 'default'})...")
-    run_playbook("benchbase.yml", extra_vars=bench_vars)
+    run_playbook("benchbase.yml", extra_vars=bench_vars + obs_vars)
 
     # Execute: benchmark with monitoring
     exec_vars = bench_vars + f" run_id={run_id}"
@@ -417,6 +443,8 @@ def run_benchmarks(args, run_id):
         exec_vars += " bench_prefetch=true"
     if args.perf:
         exec_vars += " enable_perf=true"
+    if args.perf_stat:
+        exec_vars += " perf_stat=true"
 
     log(f"Running benchmark: {exec_vars}")
     run_playbook("measure_usage.yml", extra_vars=exec_vars)
@@ -579,6 +607,13 @@ Examples:
                              "(SET GLOBAL lineairdb_prefetch_execution=ON on every MySQL "
                              "and HELIOS_PREFETCH_PLAN=1 env for the executor)")
     parser.add_argument("--perf", action="store_true", help="Enable perf profiling on lineairdb + mysql nodes")
+    parser.add_argument("--load-jstack", action="store_true",
+                        help="Take one thread dump of the loader JVM mid-load (diagnostic; "
+                             "costs a JVM safepoint pause, so it is off by default)")
+    parser.add_argument("--perf-stat", action="store_true",
+                        help="Sample IPC / LLC counters (perf stat counting mode, NOT perf "
+                             "record) on the mysql and lineairdb nodes across both the load "
+                             "and the sweep; degrades to a logged note if perf is unavailable")
 
     # AWS options
     parser.add_argument("--region", default=AWS_DEFAULTS["region"])
@@ -701,6 +736,7 @@ Examples:
 
     except (RuntimeError, subprocess.CalledProcessError) as e:
         log(f"ERROR: {e}")
+        salvage_server_logs(args, run_id)
 
     except KeyboardInterrupt:
         log("Interrupted by user.")

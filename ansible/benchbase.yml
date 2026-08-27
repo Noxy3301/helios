@@ -1,16 +1,87 @@
 ---
-# Schema setup and data loading for distributed benchmarks.
-#
-# Creates tables on each MySQL node (Helios DDL doesn't sync across nodes)
-# and loads data once (data goes to shared LineairDB storage).
-#
-# Usage:
-#   ansible-playbook -i inventory.ini benchbase.yml
-#   ansible-playbook -i inventory.ini benchbase.yml -e "bench_type=tpch bench_scalefactor=0.1"
-#
-# Variables (override with -e):
-#   bench_type:        ycsb | tpcc | tpch     (default: ycsb)
-#   bench_scalefactor: scale factor            (default: 10 for ycsb/tpcc, 0.1 for tpch)
+# Schema setup and data loading for distributed benchmarks: creates tables on
+# each MySQL node (Helios DDL doesn't sync across nodes) and loads data once
+# into shared LineairDB storage.
+# Usage: ansible-playbook -i inventory.ini benchbase.yml -e "bench_type=tpcc"
+# run_id and machine_spec place load-phase artifacts in the sweep's result
+# dir; load_jstack is opt-in because it pauses the loader JVM.
+
+# ── Load-phase samplers: started before any load traffic ────────────────────
+# Passive readers (mpstat, pidstat, /proc/<pid>/status) that write to /tmp and
+# are collected by the final play.
+- hosts: lineairdb:mysql:haproxy:benchbase
+  gather_facts: false
+  vars:
+    load_sample: true
+    load_sample_interval: 5
+    load_sample_dir: /tmp/load_metrics
+    perf_stat: false
+    perf_stat_interval_ms: 10000
+  tasks:
+    - name: Ensure sysstat installed (load-phase sampling)
+      become: yes
+      apt:
+        name: sysstat
+        state: present
+        update_cache: yes
+      when: load_sample | bool
+
+    - name: Create load-phase sample dir
+      file:
+        path: "{{ load_sample_dir }}"
+        state: directory
+      when: load_sample | bool
+
+    - name: Start load-phase mpstat (all nodes)
+      shell: |
+        nohup mpstat {{ load_sample_interval }} \
+          > {{ load_sample_dir }}/load-cpu.log 2>&1 &
+        echo $! > {{ load_sample_dir }}/load-cpu.pid
+      args:
+        executable: /bin/bash
+      when: load_sample | bool
+
+    - name: Start load-phase VmRSS + pidstat sampling for lineairdb-server
+      # VmRSS is read straight from /proc, re-resolving the pid each tick so a
+      # server restart is survived.
+      shell: |
+        cat > {{ load_sample_dir }}/rss_probe.sh <<'PROBE'
+        #!/bin/bash
+        OUT={{ load_sample_dir }}/load-vmrss.log
+        : > "$OUT"
+        while :; do
+          p=$(pgrep -f '[l]ineairdb-server' | head -1)
+          if [ -n "$p" ] && [ -r "/proc/$p/status" ]; then
+            r=$(awk '/^VmRSS:/{print $2}' "/proc/$p/status" 2>/dev/null)
+            [ -n "$r" ] && echo "$(date +%s) $r" >> "$OUT"
+          fi
+          sleep {{ load_sample_interval }}
+        done
+        PROBE
+        chmod +x {{ load_sample_dir }}/rss_probe.sh
+        nohup setsid {{ load_sample_dir }}/rss_probe.sh >/dev/null 2>&1 < /dev/null &
+        echo $! > {{ load_sample_dir }}/load-vmrss.pid
+        pid=$(pgrep -f '[l]ineairdb-server' | head -1)
+        if [ -n "$pid" ]; then
+          nohup pidstat -t -u -p "$pid" {{ load_sample_interval }} \
+            > {{ load_sample_dir }}/load-threads.log 2>&1 &
+          echo $! > {{ load_sample_dir }}/load-threads.pid
+        fi
+      args:
+        executable: /bin/bash
+      when:
+        - load_sample | bool
+        - inventory_hostname in groups.get('lineairdb', [])
+
+    # IPC / LLC counters for the LOAD phase, query + storage nodes only
+    - include_tasks: tasks/perf_stat_start.yml
+      vars:
+        perf_stat_dir: "{{ load_sample_dir }}"
+        perf_stat_label: load
+      when:
+        - perf_stat | bool
+        - inventory_hostname in groups.get('lineairdb', []) + groups.get('mysql', [])
+
 - hosts: benchbase
   gather_facts: false
   vars:
@@ -22,6 +93,12 @@
     # Interface and queue count that bench_aws.py requests at launch.
     ena_rss_interface: ens5
     ena_rss_target_combined: 32
+    run_id: "run"
+    machine_spec: "unknown"
+    load_result_dir: "{{ playbook_dir }}/result/{{ run_id }}/{{ machine_spec }}"
+    load_sample_dir: /tmp/load_metrics
+    load_jstack: false
+    load_jstack_after_seconds: 480
   tasks:
     # Before any load or execute traffic; the play itself runs unprivileged.
     - import_tasks: tasks/ena_queue_tuning.yml
@@ -59,6 +136,29 @@
       loop_control:
         label: "{{ item }}"
 
+    # Opt-in: one thread dump names the table/phase in flight. OFF by default
+    # because jstack forces a JVM safepoint pause on the loader.
+    - name: "Arm one-shot jstack on the loader JVM (t+{{ load_jstack_after_seconds }}s)"
+      shell: |
+        cat > /tmp/jstack_once.sh <<'JS'
+        #!/bin/bash
+        sleep {{ load_jstack_after_seconds }}
+        p=$(pgrep -f '^java .*benchbase\.jar' | head -1)
+        [ -z "$p" ] && exit 0
+        export SDKMAN_DIR="$HOME/.sdkman"
+        [ -s "$SDKMAN_DIR/bin/sdkman-init.sh" ] && source "$SDKMAN_DIR/bin/sdkman-init.sh"
+        jstack "$p" > {{ load_sample_dir }}/load-jstack.txt 2>&1 \
+          || kill -3 "$p"
+        JS
+        chmod +x /tmp/jstack_once.sh
+        mkdir -p {{ load_sample_dir }}
+        nohup setsid /tmp/jstack_once.sh >/dev/null 2>&1 < /dev/null &
+      args:
+        executable: /bin/bash
+      run_once: true
+      delegate_to: "{{ groups['benchbase'][0] }}"
+      when: load_jstack | bool
+
     - name: "Load data via first MySQL ({{ bench_type | upper }}, SF={{ bench_scalefactor }})"
       shell: |
         export SDKMAN_DIR="$HOME/.sdkman"
@@ -67,20 +167,136 @@
         cp {{ _config_dir }}/{{ bench_type }}.xml "$CFG"
         sed -i "s|localhost:3307|{{ hostvars[groups['mysql'][0]].private_ip }}:3307|g" "$CFG"
         sed -i 's|<scalefactor>[^<]*</scalefactor>|<scalefactor>{{ bench_scalefactor }}</scalefactor>|' "$CFG"
-        cd {{ _bb_dir }} && java -jar benchbase.jar -b {{ bench_type }} -c "$CFG" \
+        cd {{ _bb_dir }} && timeout -k 60 -s INT {{ bench_load_timeout | default(7200) }} \
+          java -jar benchbase.jar -b {{ bench_type }} -c "$CFG" \
           --create=false --load=true --execute=false
+        rc=$?
         rm -f "$CFG"
+        exit $rc
       args:
         executable: /bin/bash
       run_once: true
       delegate_to: "{{ groups['benchbase'][0] }}"
+      register: load_out
+      # The output is saved below before the exit status is judged
+      failed_when: false
+
+    # BenchBase prints per-table loader progress on stdout; capture it so the
+    # load has a timeline (mirrors bench/bin/benchrun.py's local-run capture).
+    - name: Ensure the load-log dir exists on the controller
+      # bench_aws.py already creates logs/, but `copy` cannot create parents, so
+      # be explicit — this playbook must also work when run standalone.
+      delegate_to: localhost
+      run_once: true
+      file:
+        path: "{{ load_result_dir }}/logs"
+        state: directory
+      when: load_out is defined
+
+    - name: Save the load-phase BenchBase output to the result dir
+      delegate_to: localhost
+      run_once: true
+      copy:
+        dest: "{{ load_result_dir }}/logs/benchbase_load.log"
+        content: |
+          # run_id={{ run_id }} bench_type={{ bench_type }} SF={{ bench_scalefactor }}
+          # loader={{ groups['benchbase'][0] }} elapsed={{ load_out.delta | default('unknown') }}
+          # start={{ load_out.start | default('unknown') }} end={{ load_out.end | default('unknown') }}
+          {{ load_out.stdout | default('') }}
+          {{ load_out.stderr | default('') }}
+      when: load_out is defined
+
+    - name: "Gate: the load finished successfully"
+      run_once: true
+      fail:
+        msg: "GATE_FAIL: BenchBase load exit status {{ load_out.rc }} (see benchbase_load.log)"
+      when: load_out is defined and load_out.rc != 0
+
+    - name: "Replay the loader node's table definitions onto every other MySQL"
+      # Index registration is not coordinated across nodes, so a node other than
+      # the loader would full-scan. Replaying the loader's definitions registers
+      # the same key shape everywhere; DROP+CREATE is metadata-only here.
+      shell:
+        executable: /bin/bash
+        cmd: |
+          set -euo pipefail
+          # Spell out $HOME. A tilde stored in a shell variable is not expanded
+          # when that variable is later used as a command.
+          M="$HOME/helios/build/runtime_output_directory/mysql -u root --protocol=TCP -P 3307"
+          FIRST="{{ hostvars[groups['mysql'][0]].private_ip }}"
+          NODES="{% for h in groups['mysql'][1:] %}{{ hostvars[h].private_ip }} {% endfor %}"
+          if [ -z "$(echo $NODES)" ]; then
+            echo "single query node: nothing to replay"
+            exit 0
+          fi
+          SQL=$(mktemp /tmp/schema-replay-XXXXX.sql)
+          trap 'rm -f "$SQL"' EXIT
+          # Assign first: a failed mysql inside "for t in $(...)" would only
+          # yield an empty loop.
+          TABLES=$($M -h "$FIRST" -N -B -D benchbase -e "SHOW TABLES")
+          if [ -z "$TABLES" ]; then
+            echo "no tables on loader node $FIRST"
+            exit 1
+          fi
+          echo "SET FOREIGN_KEY_CHECKS=0;" > "$SQL"
+          for t in $TABLES; do
+            echo "DROP TABLE IF EXISTS \`$t\`;" >> "$SQL"
+            # --raw keeps real newlines; batch mode would emit them as \n
+            $M -h "$FIRST" -N -B --raw -D benchbase -e "SHOW CREATE TABLE \`$t\`" \
+              | cut -f2- >> "$SQL"
+            echo ";" >> "$SQL"
+          done
+          echo "SET FOREIGN_KEY_CHECKS=1;" >> "$SQL"
+          for n in $NODES; do
+            $M -h "$n" -D benchbase < "$SQL"
+            echo "replayed onto $n"
+          done
+      run_once: true
+      delegate_to: "{{ groups['benchbase'][0] }}"
+
+    - name: "Gate: every MySQL reports the loader node's index set"
+      # Fails the run before the sweep rather than producing numbers measured
+      # against a partial index set.
+      shell:
+        executable: /bin/bash
+        cmd: |
+          set -euo pipefail
+          M="$HOME/helios/build/runtime_output_directory/mysql -u root --protocol=TCP -P 3307"
+          # Compare the full key shape, not just which columns take part: a
+          # difference in uniqueness, prefix length, order or visibility would
+          # otherwise pass.
+          Q="SELECT TABLE_NAME, INDEX_NAME, SEQ_IN_INDEX, COLUMN_NAME,
+                    NON_UNIQUE, SUB_PART, COLLATION, INDEX_TYPE,
+                    IS_VISIBLE, EXPRESSION
+               FROM information_schema.STATISTICS
+              WHERE TABLE_SCHEMA='benchbase'
+              ORDER BY TABLE_NAME, INDEX_NAME, SEQ_IN_INDEX"
+          FIRST="{{ hostvars[groups['mysql'][0]].private_ip }}"
+          REF=$($M -h "$FIRST" -N -B -e "$Q")
+          if [ -z "$REF" ]; then
+            echo "GATE FAIL: loader node $FIRST reports no indexes"
+            exit 1
+          fi
+          rc=0
+          for h in {% for h in groups['mysql'] %}{{ hostvars[h].private_ip }} {% endfor %}; do
+            CUR=$($M -h "$h" -N -B -e "$Q")
+            if [ "$CUR" != "$REF" ]; then
+              echo "GATE FAIL: index set differs on $h"
+              diff <(echo "$REF") <(echo "$CUR") || true
+              rc=1
+            fi
+          done
+          if [ "$rc" -ne 0 ]; then exit 1; fi
+          echo "GATE OK: $(echo "$REF" | wc -l) index columns match on all nodes"
+      run_once: true
+      delegate_to: "{{ groups['benchbase'][0] }}"
 
     - name: "Refresh MySQL stats with ANALYZE TABLE on each MySQL ({{ bench_type | upper }})"
-      # Prefetch mode requires MySQL's chosen plan to match the @_tx_plan DSL.
-      # Without fresh stats, MySQL can pick PRIMARY for queries the DSL expects
-      # to take via a secondary index (e.g. OrderStatus customerByNameSQL),
-      # leading to plan/DSL mismatch and infinite prefetch retry.
+      # Prefetch mode requires MySQL's plan to match the @_tx_plan DSL; stale stats
+      # can pick PRIMARY where the DSL expects a secondary index and loop the retry.
+      # The timeout bounds a hang without firing on a healthy run.
       shell: |
+        timeout -k 60 {{ bench_analyze_timeout | default(3600) }} \
         {{ _mysql_bin }} -u root --protocol=TCP \
           -h {{ hostvars[item].private_ip }} -P 3307 \
           -D benchbase \
@@ -107,3 +323,56 @@
       loop: "{{ groups['mysql'] }}"
       loop_control:
         label: "{{ item }}"
+
+# ── Stop load-phase samplers and collect them ───────────────────────────────
+# Must run before measure_usage.yml so the load-phase samplers cannot overlap
+# the measurement window.
+- hosts: lineairdb:mysql:haproxy:benchbase
+  gather_facts: false
+  vars:
+    load_sample: true
+    load_sample_dir: /tmp/load_metrics
+    run_id: "run"
+    machine_spec: "unknown"
+    load_result_dir: "{{ playbook_dir }}/result/{{ run_id }}/{{ machine_spec }}"
+    perf_stat: false
+  tasks:
+    # Stop the LOAD-phase counters here; measure_usage.yml starts its own set for
+    # the sweep, so the two phases stay in separate files.
+    - include_tasks: tasks/perf_stat_stop.yml
+      vars:
+        perf_stat_dir: "{{ load_sample_dir }}"
+        perf_stat_label: load
+      when:
+        - perf_stat | bool
+        - inventory_hostname in groups.get('lineairdb', []) + groups.get('mysql', [])
+
+    - name: Stop load-phase samplers
+      shell: |
+        for n in load-cpu load-vmrss load-threads; do
+          f={{ load_sample_dir }}/$n.pid
+          [ -f "$f" ] && kill "$(cat "$f")" 2>/dev/null || true
+        done
+        pkill -f '[r]ss_probe.sh' 2>/dev/null || true
+        pkill -f '[j]stack_once.sh' 2>/dev/null || true
+        exit 0
+      args:
+        executable: /bin/bash
+      when: load_sample | bool
+
+    - name: Find load-phase sample files
+      find:
+        paths: "{{ load_sample_dir }}"
+        patterns: "load-*.log,load-jstack.txt,perfstat-load.*"
+      register: load_samples
+      when: load_sample | bool
+
+    - name: Fetch load-phase samples to the result dir
+      fetch:
+        src: "{{ item.path }}"
+        dest: "{{ load_result_dir }}/load_phase/{{ inventory_hostname }}/"
+        flat: yes
+      loop: "{{ load_samples.files | default([]) }}"
+      loop_control:
+        label: "{{ inventory_hostname }}:{{ item.path | basename }}"
+      when: load_sample | bool

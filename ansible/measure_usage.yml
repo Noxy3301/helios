@@ -11,6 +11,10 @@
     haproxy_stats_interval: 5
     enable_perf: false
     perf_freq: 99
+    # perf COUNTING mode (IPC / LLC), distinct from enable_perf's perf record.
+    # Default false so the sweep path is behaviourally identical when unused.
+    perf_stat: false
+    perf_stat_interval_ms: 10000
     haproxy_stats_auth: "admin:password"
     haproxy_host: "{{ (groups.get('haproxy', []) | length > 0) | ternary(groups['haproxy'][0], '') }}"
   tasks:
@@ -49,6 +53,14 @@
     - name: Set result directory
       set_fact:
         result_dir: "{{ playbook_dir }}/result/{{ run_id }}/{{ machine_spec }}"
+
+    - name: Ensure the result directory exists on the controller
+      # copy cannot create parent directories
+      run_once: true
+      delegate_to: localhost
+      file:
+        path: "{{ result_dir }}"
+        state: directory
 
     - name: Write run metadata
       run_once: true
@@ -233,6 +245,15 @@
       args:
         executable: /bin/bash
 
+    # IPC / LLC counters for the SWEEP phase, query + storage nodes only
+    - include_tasks: tasks/perf_stat_start.yml
+      vars:
+        perf_stat_dir: "{{ sample_dir }}"
+        perf_stat_label: sweep
+      when:
+        - perf_stat | bool
+        - inventory_hostname in groups.get('lineairdb', []) + groups.get('mysql', [])
+
     - name: Install perf and configure sysctl (lineairdb + mysql)
       when: (enable_perf | bool) and (inventory_hostname in groups.get('lineairdb', []) + groups.get('mysql', []))
       become: yes
@@ -345,6 +366,7 @@
     sample_dir: /tmp/metrics
     enable_perf: false
     haproxy_host: "{{ (groups.get('haproxy', []) | length > 0) | ternary(groups['haproxy'][0], '') }}"
+    perf_stat: false
   tasks:
     # Stop perf FIRST (before any other cleanup) to ensure the target
     # process is still alive when perf flushes its data.
@@ -422,6 +444,14 @@
         fi
       args:
         executable: /bin/bash
+
+    - include_tasks: tasks/perf_stat_stop.yml
+      vars:
+        perf_stat_dir: "{{ sample_dir }}"
+        perf_stat_label: sweep
+      when:
+        - perf_stat | bool
+        - inventory_hostname in groups.get('lineairdb', []) + groups.get('mysql', [])
 
     - name: Stop server pidstat sampling (lineairdb)
       when: inventory_hostname in groups.get('lineairdb', [])
@@ -610,6 +640,27 @@
       args:
         executable: /bin/bash
       failed_when: false
+
+    - name: Find sweep perf stat files
+      find:
+        paths: "{{ sample_dir }}"
+        patterns: "perfstat-sweep.*"
+      register: perf_stat_files
+      when:
+        - perf_stat | bool
+        - inventory_hostname in groups.get('lineairdb', []) + groups.get('mysql', [])
+
+    - name: Fetch sweep perf stat files
+      fetch:
+        src: "{{ item.path }}"
+        dest: "{{ result_dir }}/perf_stat/{{ inventory_hostname }}/"
+        flat: yes
+      loop: "{{ perf_stat_files.files | default([]) }}"
+      loop_control:
+        label: "{{ inventory_hostname }}:{{ item.path | basename }}"
+      when:
+        - perf_stat | bool
+        - inventory_hostname in groups.get('lineairdb', []) + groups.get('mysql', [])
 
     - name: Fetch cpu logs
       when: inventory_hostname not in groups.get('haproxy', [])

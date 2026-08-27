@@ -1,0 +1,41 @@
+---
+# Same-AZ RTT baseline captured once at deploy time: 20 ICMP packets per
+# ordered pair before any benchmark traffic.
+#
+# Usage: ansible-playbook -i inventory.ini ping_baseline.yml -e "run_id=<id> machine_spec=<spec>"
+- hosts: lineairdb:mysql:haproxy:benchbase
+  gather_facts: false
+  vars:
+    run_id: "run"
+    machine_spec: "unknown"
+    ping_count: 20
+    load_result_dir: "{{ playbook_dir }}/result/{{ run_id }}/{{ machine_spec }}"
+  tasks:
+    - name: Measure RTT to every other node
+      shell: |
+        for h in {% for g in ['lineairdb','mysql','haproxy','benchbase'] %}{% for n in groups.get(g, []) %}{% if n != inventory_hostname %}{{ hostvars[n].private_ip }} {% endif %}{% endfor %}{% endfor %}; do
+          echo "=== {{ inventory_hostname }} -> $h"
+          ping -c {{ ping_count }} -i 0.2 -q "$h" 2>&1 | tail -3
+        done
+      args:
+        executable: /bin/bash
+      register: ping_out
+      changed_when: false
+
+    # `copy` does NOT create the dest's parent directories (unlike `fetch`), so
+    # this must exist first or every host fails with "Destination directory ...
+    # does not exist".
+    - name: Ensure the RTT baseline dir exists on the controller
+      delegate_to: localhost
+      run_once: true
+      file:
+        path: "{{ load_result_dir }}/rtt_baseline"
+        state: directory
+
+    - name: Save RTT baseline to the result dir
+      delegate_to: localhost
+      copy:
+        dest: "{{ load_result_dir }}/rtt_baseline/{{ inventory_hostname }}.txt"
+        content: |
+          # {{ inventory_hostname }} ({{ ping_count }} packets/pair, deploy time, pre-benchmark)
+          {{ ping_out.stdout }}
