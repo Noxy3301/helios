@@ -57,9 +57,13 @@ int ha_lineairdb::write_row(uchar *buf) {
   // needed. The actual RPC is sent at flush time.
   tx->buffer_write(db_table_name, key, write_buffer_, !insert_can_replace_);
 
-  // Write secondary index entries. Normal transactions check UNIQUE indexes
-  // immediately. Prefetch sends UNIQUE index writes to validate-and-commit with
-  // row writes.
+  // An INSERT under unique_checks=0 buffers the UNIQUE index write with its
+  // row, so the server enforces uniqueness when the buffer is written, as it
+  // does for prefetch mode's commit. update_row keeps the synchronous check.
+  const bool defer_unique_check =
+      tx->is_prefetch_mode() ||
+      ::thd_test_options(ha_thd(), OPTION_RELAXED_UNIQUE_CHECKS);
+
   for (uint i = 0; i < table->s->keys; i++) {
     auto key_info = table->key_info[i];
     if (i == table->s->primary_key) continue;
@@ -67,7 +71,7 @@ int ha_lineairdb::write_row(uchar *buf) {
     std::string secondary_key = build_secondary_key_from_row(buf, key_info);
 
     if (key_info.flags & HA_NOSAME) {
-      if (tx->is_prefetch_mode()) {
+      if (defer_unique_check) {
         tx->buffer_write_secondary_index(db_table_name, key_info.name,
                                          secondary_key, key);
       } else {
