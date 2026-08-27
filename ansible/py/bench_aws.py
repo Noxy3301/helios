@@ -22,6 +22,7 @@ Usage:
 import argparse
 import json
 import os
+import re
 import secrets
 import shlex
 import subprocess
@@ -387,12 +388,15 @@ def deploy_infrastructure(args, bundle_path, bundle_sha256):
 
     # Start the roles in parallel
     log("Deploying infrastructure (lineairdb + mysql in parallel)...")
+    role_extra = {
+        "mysql.yml": " -e " + shlex.quote(json.dumps({"mysqld_extra_args": args.mysqld_extra_args})),
+    }
     # Write deploy logs alongside bench_aws.log
     deploy_log_dir = Path(LOG_FILE.name).parent if LOG_FILE else None
     procs = []
 
     for playbook in ["lineairdb.yml", "mysql.yml"]:
-        cmd = f"ansible-playbook -i {inv} {ANSIBLE_DIR / playbook}"
+        cmd = f"ansible-playbook -i {inv} {ANSIBLE_DIR / playbook}{role_extra.get(playbook, '')}"
         log(f"  $ {cmd}")
         if deploy_log_dir:
             pb_log = open(deploy_log_dir / f"{playbook.replace('.yml', '')}.log", "w")
@@ -668,6 +672,8 @@ Examples:
                              "record) on the mysql and lineairdb nodes across both the load "
                              "and the sweep; degrades to a logged note if perf is unavailable")
 
+    parser.add_argument("--mysqld-extra-args", default="--performance-schema=OFF",
+                        help="Extra mysqld options, passed through MYSQLD_EXTRA_ARGS")
     # AWS options
     parser.add_argument("--region", default=AWS_DEFAULTS["region"])
     parser.add_argument("--project-tag", default=AWS_DEFAULTS["project_tag"])
@@ -712,6 +718,8 @@ Examples:
         parser.error("--cleanup-only requires --cleanup-run-id <run_id> or --cleanup-all")
     if (args.cleanup_all or args.cleanup_run_id) and not args.cleanup_only:
         parser.error("--cleanup-all / --cleanup-run-id are only valid with --cleanup-only")
+    if not re.fullmatch(r"[A-Za-z0-9_=./:,+ -]*", args.mysqld_extra_args):
+        parser.error("--mysqld-extra-args accepts only letters, digits, space and _ = . / : , + -")
     if args.bundle is not None:
         args.bundle = str(Path(args.bundle).resolve())
     os.chdir(ANSIBLE_DIR)
@@ -763,6 +771,7 @@ Examples:
         for role, cfg in CLUSTER.items():
             log(f"  {role}: {cfg['count']}x {cfg['instance_type']} "
                 f"(tag={cfg['tag']}, ena_queues={ena_queue_count(cfg['instance_type'])})")
+        log(f"mysqld extra args: {args.mysqld_extra_args!r}")
         log(f"Benchmark: {args.bench_type} SF={args.bench_scalefactor or 'default'}")
         if args.bench_terms:
             log(f"Terminals: [{args.bench_terms}]")
