@@ -22,6 +22,7 @@ Usage:
 import argparse
 import json
 import os
+import secrets
 import shlex
 import subprocess
 import sys
@@ -185,7 +186,7 @@ ENA_TUNED_ROLES = {"benchbase"}
 ENA_QUEUE_COUNT = 32
 
 
-def _launch_role(role, cfg, args):
+def _launch_role(role, cfg, args, run_id):
     """Launch instances for a single role, spot by default.
 
     Fully explicit run-instances (no launch template): env AMI, dead-man
@@ -196,7 +197,8 @@ def _launch_role(role, cfg, args):
         "--tag-specifications",
         f"ResourceType=instance,Tags=["
         f"{{Key=Name,Value={cfg['tag']}}},"
-        f"{{Key=Project,Value={args.project_tag}}}"
+        f"{{Key=Project,Value={args.project_tag}}},"
+        f"{{Key=Run,Value={run_id}}}"
         f"]",
     ]
     deadman = (f"#!/bin/bash\n"
@@ -265,13 +267,13 @@ def _launch_role(role, cfg, args):
     return ids
 
 
-def launch_instances(args):
+def launch_instances(args, run_id):
     """Launch instances for all roles. Returns list of instance IDs, or None on failure."""
     all_instance_ids = []
 
     for role, cfg in CLUSTER.items():
         try:
-            ids = _launch_role(role, cfg, args)
+            ids = _launch_role(role, cfg, args, run_id)
             all_instance_ids.extend(ids)
         except RuntimeError as e:
             log(f"  LAUNCH FAILED for {role}: {e}")
@@ -306,8 +308,8 @@ def wait_for_instances(instance_ids, region, timeout=300):
 # ──────────────────────────────────────────────
 # Phase 3: Generate inventory + wait for SSH
 # ──────────────────────────────────────────────
-def generate_inventory(args):
-    """Run update_inventory.py to generate inventory.ini."""
+def generate_inventory(args, run_id):
+    """Run update_inventory.py to generate inventory.ini, scoped to this run."""
     log("Generating Ansible inventory...")
     run(
         f"python3 {SCRIPT_DIR / 'update_inventory.py'}"
@@ -315,6 +317,7 @@ def generate_inventory(args):
         f" --key {args.ssh_key}"
         f" --user {args.ssh_user}"
         f" --project-tag {args.project_tag}"
+        f" --run-tag {run_id}"
     )
 
 
@@ -487,26 +490,33 @@ def _plot_perf_reports(result_root):
 # ──────────────────────────────────────────────
 # Cleanup
 # ──────────────────────────────────────────────
-def cleanup(args):
-    """Terminate the recorded launches and every instance carrying the project tag.
+def cleanup(args, run_id=None):
+    """Terminate the recorded launches and every instance carrying this run's tag.
 
-    Spot requests are cancelled per instance, never by key name: the key pair is shared."""
+    A normal run scopes to its run_id, --cleanup-only to --cleanup-run-id, and
+    --cleanup-all to every project-tagged instance; spot requests are cancelled
+    per instance, never by key name."""
     region = args.region
     project_tag = args.project_tag
-    log(f"Cleaning up (Project={project_tag}, region={region})...")
+    scope_run_id = run_id if run_id is not None else args.cleanup_run_id
+    scope_filter = [f"Name=tag:Project,Values={project_tag}"]
+    if args.cleanup_all:
+        log(f"Cleaning up (Project={project_tag}, ALL runs, region={region})...")
+    else:
+        scope_filter.append(f"Name=tag:Run,Values={scope_run_id}")
+        log(f"Cleaning up (Project={project_tag}, Run={scope_run_id}, region={region})...")
     ok = True
 
-    # Collect targets: recorded launches plus Project-tagged instances
+    # Collect targets: recorded launches plus tagged instances in scope
     try:
         tagged = aws_text([
             "ec2", "describe-instances",
-            "--filters",
-            f"Name=tag:Project,Values={project_tag}",
+            "--filters", *scope_filter,
             "Name=instance-state-name,Values=pending,running,stopping,stopped",
             "--query", "Reservations[].Instances[].InstanceId",
         ], region=region)
     except RuntimeError as e:
-        log(f"  ERROR: describe-instances failed: {e}")
+        log(f"  ERROR: could not list in-scope instances: {e}")
         tagged = ""
         ok = False
     ids = sorted(set(LAUNCHED["instances"]) |
@@ -547,12 +557,12 @@ def cleanup(args):
     else:
         log("  Nothing to terminate.")
 
-    # Verify that nothing is still alive under our tag
+    # Verify that nothing is still alive in scope
+    retry = "--cleanup-all" if args.cleanup_all else f"--cleanup-run-id {scope_run_id}"
     try:
         leftovers = aws_text([
             "ec2", "describe-instances",
-            "--filters",
-            f"Name=tag:Project,Values={project_tag}",
+            "--filters", *scope_filter,
             "Name=instance-state-name,Values=pending,running,stopping,stopped",
             "--query", "Reservations[].Instances[].InstanceId",
         ], region=region)
@@ -564,9 +574,9 @@ def cleanup(args):
         log(f"  ERROR: instances still not shutting down: {leftovers.split()}")
         ok = False
     elif ok:
-        log("  Verified: no Project-tagged instances left (terminating/terminated).")
+        log("  Verified: no in-scope instances left (terminating/terminated).")
 
-    log("Cleanup done." if ok else "CLEANUP INCOMPLETE: re-run with --cleanup-only and check the console.")
+    log("Cleanup done." if ok else f"CLEANUP INCOMPLETE: re-run with --cleanup-only {retry} and check the console.")
     return ok
 
 
@@ -584,7 +594,7 @@ Examples:
   python3 py/bench_aws.py --bench-type tpcc --bench-prefetch --bench-terms 1,16,64,128
   python3 py/bench_aws.py --bench-type tpch --bench-scalefactor 0.1
   python3 py/bench_aws.py --bench-type tpch --bench-serial false --bench-terms 1,2,4,8 --bench-scalefactor 0.01
-  python3 py/bench_aws.py --cleanup-only
+  python3 py/bench_aws.py --cleanup-only --cleanup-all
   python3 py/bench_aws.py --dry-run
 """,
     )
@@ -651,6 +661,11 @@ Examples:
                         help="Path to helios bundle tar.gz (default: build one now via build_bundle.sh)")
     parser.add_argument("--on-demand", action="store_true", help="Skip spot, launch all instances as on-demand")
     parser.add_argument("--cleanup-only", action="store_true", help="Only terminate instances, don't launch")
+    parser.add_argument("--cleanup-run-id", default=None,
+                        help="Run tag to scope --cleanup-only to (required unless --cleanup-all)")
+    parser.add_argument("--cleanup-all", action="store_true",
+                        help="With --cleanup-only, sweep every Project-tagged instance "
+                             "instead of scoping to one run (old behaviour)")
     parser.add_argument("--skip-cleanup", action="store_true", help="Don't terminate instances after benchmark")
     parser.add_argument("--dry-run", action="store_true", help="Show what would be launched")
 
@@ -659,6 +674,10 @@ Examples:
         parser.error("--deadman-minutes must be at least 1")
     if args.bench_prefetch and args.bench_prefetch_stmt:
         parser.error("--bench-prefetch and --bench-prefetch-stmt are mutually exclusive")
+    if args.cleanup_only and not args.cleanup_all and not args.cleanup_run_id:
+        parser.error("--cleanup-only requires --cleanup-run-id <run_id> or --cleanup-all")
+    if (args.cleanup_all or args.cleanup_run_id) and not args.cleanup_only:
+        parser.error("--cleanup-all / --cleanup-run-id are only valid with --cleanup-only")
     if args.bundle is not None:
         args.bundle = str(Path(args.bundle).resolve())
     os.chdir(ANSIBLE_DIR)
@@ -679,7 +698,8 @@ Examples:
 
     # Setup log directory: result/<run_id>/<machine_spec>/logs/
     global LOG_FILE
-    run_id = datetime.now().strftime("%Y%m%d-%H%M%S")
+    # Keep concurrent invocations in distinct Run scopes
+    run_id = datetime.now().strftime("%Y%m%d-%H%M%S") + f"-{secrets.token_hex(2)}"
     if args.bench_prefetch_stmt:
         run_id += "-prefetch-stmt"
     elif args.bench_prefetch:
@@ -694,7 +714,12 @@ Examples:
 
     # Cleanup-only mode
     if args.cleanup_only:
-        cleanup_ok = cleanup(args)
+        if args.dry_run:
+            log(f"DRY RUN: would clean up "
+                f"{'every Project-tagged instance' if args.cleanup_all else 'Run=' + args.cleanup_run_id}")
+            LOG_FILE.close()
+            return 0
+        cleanup_ok = cleanup(args, run_id=args.cleanup_run_id)
         LOG_FILE.close()
         return 0 if cleanup_ok else 1
 
@@ -727,7 +752,7 @@ Examples:
     rc = 1
     try:
         # Phase 1: Launch
-        instance_ids = launch_instances(args)
+        instance_ids = launch_instances(args, run_id)
         if instance_ids is None:
             log("LAUNCH FAILED: skipping benchmark.")
         else:
@@ -735,7 +760,7 @@ Examples:
             wait_for_instances(instance_ids, args.region)
 
             # Phase 3: Inventory + SSH
-            generate_inventory(args)
+            generate_inventory(args, run_id)
             wait_for_ssh(args)
 
             # Phase 4: Deploy + Benchmark
@@ -755,7 +780,7 @@ Examples:
 
     finally:
         # Always sweep: a launch whose response was lost has no recorded id
-        if not args.skip_cleanup and not cleanup(args):
+        if not args.skip_cleanup and not cleanup(args, run_id=run_id):
             rc = 1
         if LOG_FILE:
             log(f"Full log saved to: {log_dir}")

@@ -87,10 +87,10 @@ For debugging or running individual steps, you can use Ansible playbooks directl
 ### 1. Generate inventory from AWS tags
 
 ```bash
-python3 py/update_inventory.py --project-tag HeliosPush
+python3 py/update_inventory.py --project-tag HeliosPush --run-tag <run_id>   # only the instances of that run
 ```
 
-> Tag instances: `Name=helios-lineairdb`, `Name=helios-mysql`, `Name=helios-bench`, `Project=HeliosPush`
+> Tag instances: `Name=helios-lineairdb`, `Name=helios-mysql`, `Name=helios-bench`, `Project=HeliosPush`, `Run=<run_id>`
 
 ### 2. Deploy infrastructure
 
