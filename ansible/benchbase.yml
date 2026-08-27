@@ -19,7 +19,14 @@
     _mysql_bin: ~/helios/build/runtime_output_directory/mysql
     _bb_dir: ~/helios/bench/benchbase-mysql
     _config_dir: ~/helios/bench/config
+    # Interface and queue count that bench_aws.py requests at launch.
+    ena_rss_interface: ens5
+    ena_rss_target_combined: 32
   tasks:
+    # Before any load or execute traffic; the play itself runs unprivileged.
+    - import_tasks: tasks/ena_queue_tuning.yml
+      become: true
+
     - name: Reset benchbase database on each MySQL
       shell: |
         {{ _mysql_bin }} -u root --protocol=TCP \

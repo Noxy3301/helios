@@ -2,7 +2,14 @@
 - hosts: haproxy
   become: true
   gather_facts: false
+  vars:
+    # Interface and queue count that bench_aws.py requests at launch.
+    ena_rss_interface: ens5
+    ena_rss_target_combined: 32
   tasks:
+    # Raise the ENA queue count before any traffic flows through this proxy.
+    - import_tasks: tasks/ena_queue_tuning.yml
+
     - name: Install haproxy
       apt:
         name: haproxy

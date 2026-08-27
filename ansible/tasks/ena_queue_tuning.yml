@@ -1,0 +1,192 @@
+---
+# Raise ENA combined RX/TX queues before any traffic flows.
+#
+# The EC2 default queue count leaves softirq concentrated on too few cores
+# under proxy and driver load. bench_aws.py requests a higher count at launch; this task
+# verifies it landed and raises the active channel count only when the driver
+# did not start there. Callers set ena_rss_interface and ena_rss_target_combined.
+- name: Configure ENA queues
+  block:
+    - name: Install ENA inspection and IRQ balancing tools
+      ansible.builtin.apt:
+        name:
+          - ethtool
+          - irqbalance
+        state: present
+        update_cache: true
+        cache_valid_time: 3600
+
+    - name: Keep irqbalance enabled
+      ansible.builtin.service:
+        name: irqbalance
+        enabled: true
+        state: started
+
+    - name: Read NIC driver information
+      ansible.builtin.command:
+        argv:
+          - ethtool
+          - -i
+          - "{{ ena_rss_interface }}"
+      register: ena_driver_info
+      changed_when: false
+
+    - name: Require the ENA driver
+      ansible.builtin.assert:
+        that:
+          - "'driver: ena' in ena_driver_info.stdout"
+        fail_msg: >-
+          {{ ena_rss_interface }} is not using the ENA driver:
+          {{ ena_driver_info.stdout }}
+
+    - name: Read maximum and current combined channel counts
+      ansible.builtin.shell: |
+        set -o pipefail
+        ethtool -l "{{ ena_rss_interface }}" |
+          awk '
+            /Pre-set maximums:/          { section = "max"; next }
+            /Current hardware settings:/ { section = "current"; next }
+            $1 == "Combined:" && section == "max"     { max = $2 }
+            $1 == "Combined:" && section == "current" { current = $2 }
+            END {
+              if (max == "" || current == "") exit 2
+              print max, current
+            }'
+      args:
+        executable: /bin/bash
+      register: ena_channels_before
+      changed_when: false
+
+    - name: Validate parsed channel values
+      ansible.builtin.assert:
+        that:
+          - ena_channels_before.stdout.split() | length == 2
+        fail_msg: >-
+          Could not parse ethtool -l {{ ena_rss_interface }}:
+          {{ ena_channels_before.stdout }}
+
+    - name: Save channel values
+      ansible.builtin.set_fact:
+        ena_rss_max_combined: >-
+          {{ ena_channels_before.stdout.split()[0] | int }}
+        ena_rss_current_combined: >-
+          {{ ena_channels_before.stdout.split()[1] | int }}
+
+    - name: Require target queues to have been allocated by EC2
+      ansible.builtin.assert:
+        that:
+          - (ena_rss_max_combined | int) >= (ena_rss_target_combined | int)
+        fail_msg: >-
+          {{ inventory_hostname }} exposes only {{ ena_rss_max_combined }}
+          ENA combined queues; target is {{ ena_rss_target_combined }}.
+          Launch the primary ENI with EnaQueueCount={{ ena_rss_target_combined }}
+          (bench_aws.py ENA_TUNED_ROLES); ethtool cannot raise the EC2-side
+          ENI allocation.
+
+    # Runs only when max >= target > current. With the queue count set at launch
+    # the driver already starts at the target and this task is skipped, which
+    # avoids the interface close/open that ethtool -L triggers.
+    - name: Raise active ENA combined channels
+      ansible.builtin.command:
+        argv:
+          - ethtool
+          - -L
+          - "{{ ena_rss_interface }}"
+          - combined
+          - "{{ ena_rss_target_combined | string }}"
+      when: >-
+        (ena_rss_current_combined | int) <
+        (ena_rss_target_combined | int)
+      register: ena_queue_change
+
+    - name: Rebalance newly created ENA IRQs
+      ansible.builtin.service:
+        name: irqbalance
+        state: restarted
+      when: ena_queue_change.changed | default(false)
+
+    - name: Read combined channels after configuration
+      ansible.builtin.shell: |
+        set -o pipefail
+        ethtool -l "{{ ena_rss_interface }}" |
+          awk '
+            /Current hardware settings:/ { current_section = 1; next }
+            current_section && $1 == "Combined:" { print $2; exit }'
+      args:
+        executable: /bin/bash
+      register: ena_channels_after
+      changed_when: false
+
+    - name: Require target active combined channels
+      ansible.builtin.assert:
+        that:
+          - (ena_channels_after.stdout | int) >= (ena_rss_target_combined | int)
+        fail_msg: >-
+          {{ inventory_hostname }} has only {{ ena_channels_after.stdout }}
+          active combined channels.
+
+    - name: Count Linux RX queues, TX queues, and ENA I/O IRQs
+      ansible.builtin.shell: |
+        set -o pipefail
+        rx=0
+        tx=0
+        for q in /sys/class/net/"{{ ena_rss_interface }}"/queues/rx-*; do
+          [ -d "$q" ] && rx=$((rx + 1))
+        done
+        for q in /sys/class/net/"{{ ena_rss_interface }}"/queues/tx-*; do
+          [ -d "$q" ] && tx=$((tx + 1))
+        done
+        irq=$(
+          awk '/{{ ena_rss_interface }}-Tx-Rx-[0-9]+/ { n++ }
+               END { print n + 0 }' /proc/interrupts
+        )
+        printf '%s %s %s\n' "$rx" "$tx" "$irq"
+      args:
+        executable: /bin/bash
+      register: ena_kernel_counts
+      changed_when: false
+
+    - name: Require target kernel queues and I/O IRQs
+      ansible.builtin.assert:
+        that:
+          - (ena_kernel_counts.stdout.split()[0] | int) >= (ena_rss_target_combined | int)
+          - (ena_kernel_counts.stdout.split()[1] | int) >= (ena_rss_target_combined | int)
+          - (ena_kernel_counts.stdout.split()[2] | int) >= (ena_rss_target_combined | int)
+        fail_msg: >-
+          Expected at least {{ ena_rss_target_combined }} RX queues, TX
+          queues, and ENA I/O IRQs; got {{ ena_kernel_counts.stdout }}.
+
+    - name: Require RSS to reference every queue from 0 through target-1
+      ansible.builtin.shell: |
+        set -o pipefail
+        ethtool -x "{{ ena_rss_interface }}" |
+          awk -v target="{{ ena_rss_target_combined }}" '
+            /RX flow hash indirection table/ { active = 1; next }
+            /RSS hash key/                   { active = 0 }
+            active {
+              sub(/^[[:space:]]*[0-9]+:[[:space:]]*/, "")
+              for (i = 1; i <= NF; i++)
+                if ($i ~ /^[0-9]+$/) seen[$i] = 1
+            }
+            END {
+              for (i = 0; i < target; i++) {
+                if (!(i in seen)) {
+                  printf "RSS table is missing queue %d\n", i > "/dev/stderr"
+                  bad = 1
+                }
+              }
+              if (!bad) printf "RSS uses queues 0..%d\n", target - 1
+              exit bad
+            }'
+      args:
+        executable: /bin/bash
+      register: ena_rss_verify
+      changed_when: false
+
+    - name: Show final ENA configuration
+      ansible.builtin.debug:
+        msg:
+          driver: "{{ ena_driver_info.stdout_lines }}"
+          combined: "{{ ena_channels_after.stdout }}"
+          rx_tx_irq_counts: "{{ ena_kernel_counts.stdout }}"
+          rss: "{{ ena_rss_verify.stdout }}"

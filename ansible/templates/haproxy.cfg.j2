@@ -8,7 +8,7 @@ global
     group haproxy
     daemon
     maxconn 100000
-    nbthread 48
+    nbthread {{ haproxy_nbthread | default(48) }}
     ca-base /etc/ssl/certs
     crt-base /etc/ssl/private
 
