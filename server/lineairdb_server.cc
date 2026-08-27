@@ -3,9 +3,44 @@
 #include "lineairdb.pb.h"
 #include "rpc/lineairdb_rpc.hh"
 
+#include <charconv>
+#include <cstdint>
+#include <cstdlib>
 #include <iostream>
+#include <string_view>
 
-LineairDBServer::LineairDBServer() : TcpServer(9999) {}
+namespace {
+
+constexpr uint16_t kDefaultPort = 9999;
+
+/**
+ * @brief Applies LINEAIRDB_SERVER_PORT, keeping the default when it is unset.
+ * A value that is not a decimal port refuses startup: falling back would serve
+ * a caller that asked for another port.
+ */
+uint16_t listen_port() {
+    static const uint16_t port = []() -> uint16_t {
+        const char* raw = std::getenv("LINEAIRDB_SERVER_PORT");
+        if (raw == nullptr) return kDefaultPort;
+
+        const std::string_view input(raw);
+        unsigned parsed         = 0;
+        const auto [end, error] =
+            std::from_chars(input.data(), input.data() + input.size(), parsed, 10);
+        const bool consumed_all = end == input.data() + input.size();
+        if (input.empty() || error != std::errc{} || !consumed_all ||
+            parsed < 1 || parsed > 65535) {
+            LOG_FATAL("Invalid LINEAIRDB_SERVER_PORT='%s': expected an integer in [1,65535]",
+                      raw);
+        }
+        return static_cast<uint16_t>(parsed);
+    }();
+    return port;
+}
+
+}  // namespace
+
+LineairDBServer::LineairDBServer() : TcpServer(listen_port()) {}
 
 void LineairDBServer::init() {
     // Initialize components in dependency order

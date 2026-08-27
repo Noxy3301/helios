@@ -11,6 +11,7 @@ usage() {
 Usage: $0 [--mysqld-port N] [--server-host HOST] [--server-port PORT]
 Defaults: mysqld-port=3307, server=127.0.0.1:9999
 Data dir / socket are derived from mysqld-port (3307 -> data,/tmp/mysql.sock; others -> data_PORT,/tmp/mysql_PORT.sock)
+MYSQLD_EXTRA_ARGS (env, default empty, single-line whitespace-separated) is appended to both mysqld start invocations (not --initialize-insecure).
 USAGE
 }
 
@@ -46,6 +47,9 @@ if [ "$MYSQLD_PORT" != "3307" ]; then
   PID_FILE="/tmp/mysql_${MYSQLD_PORT}.pid"
 fi
 
+# Word-split MYSQLD_EXTRA_ARGS without pathname expansion.
+read -r -a MYSQLD_EXTRA <<< "${MYSQLD_EXTRA_ARGS:-}"
+
 # Per-instance log so the background mysqld does not inherit the caller's
 # stdout/stderr (otherwise subprocess.run() in benchrun.py blocks forever
 # waiting for the inherited pipe to close).
@@ -66,7 +70,8 @@ echo "Step 2/5: Starting MySQL with InnoDB..."
   --open-files-limit=65535 \
   --table-open-cache=8192 \
   --skip-name-resolve \
-  --disable-log-bin >> "$MYSQL_LOG_FILE" 2>&1 &
+  --disable-log-bin \
+  "${MYSQLD_EXTRA[@]}" >> "$MYSQL_LOG_FILE" 2>&1 &
 BOOT_PID=$!
 
 echo "Step 3/5: Waiting for MySQL to be ready..."
@@ -100,7 +105,8 @@ nohup ./runtime_output_directory/mysqld --datadir="$DATA_DIR" --socket="$SOCKET"
   --open-files-limit=65535 \
   --table-open-cache=8192 \
   --skip-name-resolve \
-  --disable-log-bin >> "$MYSQL_LOG_FILE" 2>&1 &
+  --disable-log-bin \
+  "${MYSQLD_EXTRA[@]}" >> "$MYSQL_LOG_FILE" 2>&1 &
 MYSQL_PID=$!
 disown "$MYSQL_PID" 2>/dev/null || true
 

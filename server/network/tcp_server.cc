@@ -15,17 +15,18 @@
 
 TcpServer::TcpServer(uint16_t port) : port_(port) {}
 
-void TcpServer::run() {
+bool TcpServer::run() {
     LOG_INFO("Starting server on port %d", port_);
     
     int server_socket;
     if (!setup_and_listen(server_socket)) {
-        return;
+        return false;
     }
     
     LOG_INFO("Server listening on port %d", port_);
     accept_clients(server_socket);
     close(server_socket);
+    return true;
 }
 
 bool TcpServer::setup_and_listen(int& server_socket) {
