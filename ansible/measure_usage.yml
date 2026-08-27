@@ -1,5 +1,27 @@
 ---
 # CPU sampling wrapper: run BenchBase and capture CPU usage from all nodes.
+
+- hosts: mysql
+  gather_facts: false
+  # The sweep plays that follow do not run on these hosts, so a failed gate here
+  # has to stop the whole playbook rather than just drop the host.
+  any_errors_fatal: true
+  tasks:
+    - name: "Gate: unique_checks=1 on every MySQL before the sweep"
+      # Measured connections must validate UNIQUE indexes: the load-phase
+      # relaxation is per-session and must never reach the sweep. It runs
+      # before any sampler starts, so a failure leaves nothing behind.
+      shell: |
+        val=$(~/helios/build/runtime_output_directory/mysql \
+          -u root --protocol=TCP -h 127.0.0.1 -P 3307 \
+          -N -B -e "SELECT @@global.unique_checks")
+        if [ "$val" != "1" ]; then
+          echo "GATE_FAIL: unique_checks=$val on {{ inventory_hostname }}, expected 1" >&2
+          exit 1
+        fi
+      args:
+        executable: /bin/bash
+
 - hosts: lineairdb:mysql:benchbase
   gather_facts: false
   vars:
