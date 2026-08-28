@@ -114,6 +114,36 @@ void run_reservation(LineairDB::Transaction& tx, Reservation& reservation) {
     tx.Write<uint64_t>(reservation.table_name, next + reservation.count);
 }
 
+using DurabilityRpc = LineairDB::Protocol::DbSetCommitDurability;
+
+// Bound on the durable barrier; the wait holds the switch mutex and a closed
+// socket does not cancel it
+constexpr auto kBarrierTimeout = std::chrono::hours(1);
+
+const char* durability_name(LineairDB::Config::CommitDurability mode) {
+    switch (mode) {
+        case LineairDB::Config::CommitDurability::Volatile:
+            return "VOLATILE";
+        case LineairDB::Config::CommitDurability::Async:
+            return "ASYNC";
+        case LineairDB::Config::CommitDurability::Sync:
+            return "SYNC";
+    }
+    return "UNKNOWN";
+}
+
+DurabilityRpc::Mode to_wire_mode(LineairDB::Config::CommitDurability mode) {
+    switch (mode) {
+        case LineairDB::Config::CommitDurability::Async:
+            return DurabilityRpc::ASYNC;
+        case LineairDB::Config::CommitDurability::Sync:
+            return DurabilityRpc::SYNC;
+        case LineairDB::Config::CommitDurability::Volatile:
+            return DurabilityRpc::VOLATILE;
+    }
+    return DurabilityRpc::MODE_UNSPECIFIED;
+}
+
 }  // namespace
 
 void HiddenKeyAllocator::ForgetTable(const std::string& table_name) {
@@ -242,6 +272,66 @@ void LineairDBRpc::handleDbAllocateHiddenKeys(const std::string& message,
         LOG_ERROR("AllocateHiddenKeys for '%s': %s",
                   request.table_name().c_str(), error.c_str());
     }
+
+    result = response.SerializeAsString();
+}
+
+void LineairDBRpc::handleDbSetCommitDurability(const std::string& message,
+                                               std::string& result) {
+    LineairDB::Protocol::DbSetCommitDurability::Request request;
+    LineairDB::Protocol::DbSetCommitDurability::Response response;
+
+    if (!request.ParseFromString(message)) {
+        response.set_ok(false);
+        response.set_mode(
+            to_wire_mode(db_manager_->get_database()->GetCommitDurability()));
+        response.set_error("malformed request");
+        LOG_ERROR("SetCommitDurability: malformed request");
+        result = response.SerializeAsString();
+        return;
+    }
+
+    LineairDB::Config::CommitDurability mode;
+    switch (request.mode()) {
+        case DurabilityRpc::ASYNC:
+            mode = LineairDB::Config::CommitDurability::Async;
+            break;
+        case DurabilityRpc::SYNC:
+            mode = LineairDB::Config::CommitDurability::Sync;
+            break;
+        default:
+            response.set_ok(false);
+            response.set_mode(to_wire_mode(
+                db_manager_->get_database()->GetCommitDurability()));
+            // VOLATILE lands here too: it is reportable, not requestable
+            response.set_error("commit durability mode cannot be requested");
+            LOG_ERROR("SetCommitDurability: unrequestable mode");
+            result = response.SerializeAsString();
+            return;
+    }
+
+    const bool ok =
+        db_manager_->get_database()->SetCommitDurability(mode, kBarrierTimeout);
+
+    const auto effective = db_manager_->get_database()->GetCommitDurability();
+    response.set_ok(ok);
+    response.set_mode(to_wire_mode(effective));
+    if (!ok) {
+        if (effective == LineairDB::Config::CommitDurability::Volatile) {
+            response.set_error(
+                "the database is volatile; commit durability is fixed at "
+                "startup");
+        } else {
+            response.set_error(
+                std::string("commit durability switch not confirmed; policy "
+                            "in force: ") +
+                durability_name(effective));
+        }
+    }
+
+    LOG_INFO("SetCommitDurability requested=%s result=%s effective=%s",
+             durability_name(mode), ok ? "ok" : "failed",
+             durability_name(effective));
 
     result = response.SerializeAsString();
 }

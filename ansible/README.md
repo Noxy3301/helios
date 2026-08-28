@@ -112,7 +112,7 @@ ansible-playbook -i inventory.ini benchbase.yml \
 
 # Execute with monitoring
 ansible-playbook -i inventory.ini measure_usage.yml \
-  -e "bench_type=ycsb bench_profile=b run_id=$(date +%Y%m%d-%H%M%S)"
+  -e "helios_durability=volatile bench_type=ycsb bench_profile=b run_id=$(date +%Y%m%d-%H%M%S)"
 ```
 
 #### TPC-C
@@ -124,11 +124,11 @@ ansible-playbook -i inventory.ini benchbase.yml \
 
 # Execute
 ansible-playbook -i inventory.ini measure_usage.yml \
-  -e "bench_type=tpcc bench_time=60 run_id=$(date +%Y%m%d-%H%M%S)"
+  -e "helios_durability=volatile bench_type=tpcc bench_time=60 run_id=$(date +%Y%m%d-%H%M%S)"
 
 # Custom terminal sweep
 ansible-playbook -i inventory.ini measure_usage.yml \
-  -e "bench_type=tpcc bench_terms=[1,16,64,128] run_id=$(date +%Y%m%d-%H%M%S)"
+  -e "helios_durability=volatile bench_type=tpcc bench_terms=[1,16,64,128] run_id=$(date +%Y%m%d-%H%M%S)"
 ```
 
 #### TPC-H serial (22 queries once each)
@@ -140,7 +140,7 @@ ansible-playbook -i inventory.ini benchbase.yml \
 
 # Execute (bench_serial defaults to true for tpch, bench_terms defaults to [1])
 ansible-playbook -i inventory.ini measure_usage.yml \
-  -e "bench_type=tpch run_id=$(date +%Y%m%d-%H%M%S)"
+  -e "helios_durability=volatile bench_type=tpch run_id=$(date +%Y%m%d-%H%M%S)"
 ```
 
 #### TPC-H parallel (scalability test)
@@ -152,7 +152,7 @@ ansible-playbook -i inventory.ini benchbase.yml \
 
 # Execute with terminal sweep
 ansible-playbook -i inventory.ini measure_usage.yml \
-  -e "bench_type=tpch bench_serial=false bench_scalefactor=0.01 bench_time=60 bench_terms=[1,2,4,8,16,32] run_id=$(date +%Y%m%d-%H%M%S)"
+  -e "helios_durability=volatile bench_type=tpch bench_serial=false bench_scalefactor=0.01 bench_time=60 bench_terms=[1,2,4,8,16,32] run_id=$(date +%Y%m%d-%H%M%S)"
 ```
 
 ## Variables reference
@@ -169,6 +169,8 @@ ansible-playbook -i inventory.ini measure_usage.yml \
 | `bench_sync`        | `true`                                          | Synchronize start across bench nodes        |
 | `bench_sync_buffer` | `5`                                             | Sync buffer (seconds)                       |
 | `run_id`            | `run`                                           | Identifier for log filenames                |
+| `helios_durability` | none (required for the lineairdb engine)        | Commit durability the sweep measures: `volatile`, `async`, `sync`. `measure_usage.yml` reconciles the storage server with it before sampling and refuses to sweep without it |
+| `helios_load_durability` | unset                                      | Relaxed contract for the load phase only (`async`). Passed to `lineairdb.yml` to start the server under it, and to `measure_usage.yml`, which refuses to sweep unless the storage server started under it |
 | `sample_interval`   | `1`                                             | CPU sampling interval (seconds)             |
 
 
@@ -210,7 +212,7 @@ python3 py/plot_tpch.py          # TPC-H per-query latency (auto-called for tpch
 | `lineairdb.yml`     | Start the storage server from the bundle                  |
 | `mysql.yml`         | Start MySQL with LineairDB proxy, create users            |
 | `benchbase.yml`     | Create schema + load data (supports ycsb/tpcc/tpch)       |
-| `measure.yml`       | Run benchmark terminal sweep                              |
+| `measure.yml`       | Run benchmark terminal sweep (ungated: see the notes)     |
 | `measure_term.yml`  | Single terminal count execution (included by measure.yml) |
 | `measure_usage.yml` | measure.yml wrapped with CPU/network monitoring           |
 
@@ -223,5 +225,13 @@ python3 py/plot_tpch.py          # TPC-H per-query latency (auto-called for tpch
 - **DDL doesn't sync**: `benchbase.yml` runs `--create` on each MySQL node separately because Helios DDL is not replicated across MySQL instances.
 - **Data is shared**: `--load` runs once; data goes to shared LineairDB storage.
 - **TPC-H optimizer settings**: `benchbase.yml` and `measure.yml` both set hash join / subquery optimizer flags on each MySQL node. This is needed because Helios's RPC-based architecture makes hash join vastly faster than nested-loop with PK lookups.
+- **Run the sweep through `measure_usage.yml`**: the durability contract is
+  persistent server state, so a fleet loaded under `helios_load_durability=async`
+  keeps that contract until something switches it back. Only `measure_usage.yml`
+  reconciles the server with `helios_durability`, before any sampler starts;
+  `measure.yml` on its own would report one contract and measure another. Its
+  `unique_checks=1` gate is a backstop of a different kind: that relaxation
+  (`bench_load_unique_checks_off`) lives in the loader's JDBC session, and
+  `measure_term.yml` already refuses an execute config carrying it.
 - **Server restart clears data**: LineairDB is in-memory. Restarting the Helios server loses all data. Re-run `benchbase.yml` after restart.
 

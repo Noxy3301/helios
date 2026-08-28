@@ -137,6 +137,9 @@ void LineairDBRpc::handle_rpc(uint64_t sender_id, MessageType message_type,
         case MessageType::DB_ALLOCATE_HIDDEN_KEYS:
             handleDbAllocateHiddenKeys(message, result);
             return;
+        case MessageType::DB_SET_COMMIT_DURABILITY:
+            handleDbSetCommitDurability(message, result);
+            return;
         case MessageType::DB_END_TRANSACTION:
             handleDbEndTransaction(message, result);
             release_masstree_thread_epoch();
