@@ -40,6 +40,9 @@ SCRIPTS_DIR = Path(__file__).resolve().parents[2] / "scripts"
 ROOT = Path(__file__).resolve().parents[2]
 BENCHBASE_DIR = ROOT / "bench" / "benchbase-mysql"
 MYSQL_BIN = ROOT / "build" / "runtime_output_directory" / "mysql"
+LINEAIRDB_CTL = ROOT / "build" / "server" / "lineairdb-ctl"
+# The kernel truncates the process name to 15 characters
+SERVER_COMM = "lineairdb-serve"
 LINEAIRDB_LOG_DIR = ROOT / "lineairdb_logs"
 
 YCSB_PROFILES = {
@@ -72,7 +75,7 @@ def _wait_for_port(host, port, timeout=30):
     return False
 
 
-def _run_script(argv, timeout):
+def _run_script(argv, timeout, env=None):
     """Run a launcher script with stdin closed and a hard timeout.
 
     The launcher scripts spawn long-lived background daemons that previously
@@ -88,6 +91,7 @@ def _run_script(argv, timeout):
             stderr=subprocess.STDOUT,
             text=True,
             timeout=timeout,
+            env=env,
         )
     except subprocess.TimeoutExpired as e:
         print(f"  ERROR: launcher timed out after {timeout}s: {' '.join(argv)}", file=sys.stderr)
@@ -96,13 +100,21 @@ def _run_script(argv, timeout):
         return None
 
 
-def start_lineairdb_server():
-    """Start lineairdb-server via scripts/start_server.sh and wait for port 9999."""
+def start_lineairdb_server(commit_durability=None):
+    """Start lineairdb-server via scripts/start_server.sh and wait for port 9999.
+
+    commit_durability overrides the server's startup contract for this run only;
+    it reaches the daemon through the launcher's environment.
+    """
     if _is_port_open("127.0.0.1", 9999):
         print("  lineairdb-server already running on port 9999, reusing")
         return True
     print("  Starting lineairdb-server...")
-    result = _run_script([str(SCRIPTS_DIR / "start_server.sh")], timeout=30)
+    env = None
+    if commit_durability:
+        env = dict(os.environ, LINEAIRDB_COMMIT_DURABILITY=commit_durability)
+        print(f"  LINEAIRDB_COMMIT_DURABILITY={commit_durability}")
+    result = _run_script([str(SCRIPTS_DIR / "start_server.sh")], timeout=30, env=env)
     if result is None or result.returncode != 0:
         if result is not None:
             print(f"  ERROR starting lineairdb-server:\n{result.stdout}", file=sys.stderr)
@@ -136,6 +148,37 @@ def start_mysql_server(mysqld_port=3307, server_host="127.0.0.1", server_port=99
         return False
     print(f"  mysqld ready (port {mysqld_port})")
     return True
+
+
+def server_startup_contract():
+    """Commit durability the newest server log reports at startup, or None."""
+    logs = sorted(LINEAIRDB_LOG_DIR.glob("lineairdb_server_*.log"),
+                  key=lambda p: p.stat().st_mtime, reverse=True)
+    if not logs:
+        return None
+    for line in logs[0].read_text(errors="replace").splitlines():
+        marker = "Commit durability:"
+        if marker in line:
+            return line.split(marker, 1)[1].split()[0]
+    return None
+
+
+def switch_commit_durability(mode):
+    """Move the running storage server to `mode` once everything acknowledged
+    under the previous contract is durable. Returns the elapsed seconds, or
+    None if the switch did not happen."""
+    print(f"  Switching durability to {mode}, waiting for the barrier...")
+    started = time.time()
+    result = subprocess.run(
+        [str(LINEAIRDB_CTL), "--host", "127.0.0.1", "--port", "9999",
+         "set-durability", mode],
+        capture_output=True, text=True)
+    elapsed = time.time() - started
+    if result.returncode != 0 or result.stdout.strip() != f"ok mode={mode.upper()}":
+        print(f"  ERROR: durability switch to {mode} failed: "
+              f"{(result.stdout + result.stderr).strip()}", file=sys.stderr)
+        return None
+    return elapsed
 
 
 def stop_all_servers():
@@ -287,11 +330,12 @@ def collect_results(result_dir):
     return None
 
 
-def _find_pid(pattern):
-    """Find PID of a process matching pattern."""
+def _find_pid(pattern, by_name=False):
+    """Find PID of a process matching pattern: its whole name, or its cmdline."""
     try:
         result = subprocess.run(
-            ["pgrep", "-f", pattern], capture_output=True, text=True,
+            ["pgrep", "-x" if by_name else "-f", pattern],
+            capture_output=True, text=True,
         )
         pids = result.stdout.strip().split()
         return pids[0] if pids else None
@@ -819,6 +863,10 @@ def main():
     parser.add_argument("--load-defer-unique-checks", choices=["on", "off"], default="on",
                         help="Defer UNIQUE secondary-index checks during the create and load "
                              "phases; the execute phase always keeps them on (default: on)")
+    parser.add_argument("--load-durability", choices=["same", "async"], default="same",
+                        help="Commit durability for the load phase: same keeps the server's "
+                             "startup contract, async starts it under Async and switches it "
+                             "to Sync before ANALYZE/execute (managed lifecycle only)")
     parser.add_argument("--exclude-queries", type=str, help="TPC-H: comma-separated query numbers to exclude (e.g. 15,21)")
     parser.add_argument("--no-setup", action="store_true", help="Skip setup (DROP+CREATE+LOAD), assume data exists")
     parser.add_argument("--no-load", action="store_true", help="Run setup with CREATE only, skip LOAD")
@@ -839,6 +887,16 @@ def main():
     args = parser.parse_args()
 
     # Validate
+    if args.load_durability == "async":
+        if args.external_server or args.no_setup:
+            sys.exit("--load-durability async starts the storage server under the load "
+                     "contract: not valid with --external-server or --no-setup")
+        if not LINEAIRDB_CTL.exists():
+            sys.exit(f"--load-durability async needs {LINEAIRDB_CTL} to end the load "
+                     "contract; build it first")
+        if "LINEAIRDB_COMMIT_DURABILITY" in os.environ:
+            sys.exit("--load-durability async sets LINEAIRDB_COMMIT_DURABILITY itself; "
+                     "unset it in the environment first")
     jar = BENCHBASE_DIR / "benchbase.jar"
     if not jar.exists():
         print(f"ERROR: {jar} not found.\nRun: python3 bench/bin/build_benchbase.py", file=sys.stderr)
@@ -960,12 +1018,38 @@ def main():
                  "set up the loader endpoint first, then create the schema "
                  "on each remaining endpoint, then rerun with --no-setup.")
 
+    # async only means anything for a server this run starts itself, and
+    # start_server.sh reuses one that is already up.
+    if args.load_durability == "async":
+        if not managed:
+            sys.exit("--load-durability async needs the managed server lifecycle")
+        if _is_port_open("127.0.0.1", 9999):
+            sys.exit("--load-durability async has to start lineairdb-server itself, "
+                     "but port 9999 already has a listener")
+        running = _find_pid(SERVER_COMM, by_name=True)
+        if running:
+            try:
+                cwd = os.readlink(f"/proc/{running}/cwd")
+            except OSError:
+                cwd = "unknown"
+            sys.exit("--load-durability async has to start lineairdb-server itself, "
+                     f"but pid {running} is already running (cwd {cwd})")
     if managed:
         # Wipe any WAL left by a previous run before starting a fresh server,
         # so stale logs never trigger recovery. No-op if lineairdb-server is
         # already running (reuse case, handled inside the function).
         cleanup_lineairdb_logs()
-        if not start_lineairdb_server():
+        load_durability = "async" if args.load_durability == "async" else None
+        if not start_lineairdb_server(commit_durability=load_durability):
+            sys.exit(1)
+        # A server that was already up would have been reused: the log is the
+        # only proof that the load contract is the one we asked for.
+        startup_contract = server_startup_contract() if load_durability else None
+        if load_durability and startup_contract != load_durability:
+            print(f"  ERROR: the storage server did not start under "
+                  f"{load_durability} (log says {startup_contract})",
+                  file=sys.stderr)
+            stop_all_servers()
             sys.exit(1)
         if not start_mysql_server(args.mysql_port, "127.0.0.1", 9999):
             stop_all_servers()
@@ -1014,6 +1098,14 @@ def _run_bench(args, config_work, thread_list, result_base):
         if load_time is None:
             print("Setup failed.", file=sys.stderr)
             sys.exit(1)
+
+    if args.load_durability == "async":
+        elapsed = switch_commit_durability("sync")
+        if elapsed is None:
+            sys.exit(1)
+        print(f"  Durability switch async -> sync: {elapsed:.2f}s")
+        (result_base / "durability.txt").write_text(
+            f"load_mode=async\nmeasured_mode=sync\nswitch_seconds={elapsed:.2f}\n")
 
     # A separate step so staged runs (--no-setup, --no-load) still get it.
     if args.analyze or args.prefetch:
