@@ -107,10 +107,13 @@ set(SOURCES
 
     # Protocol
     protocol/message.hh
-    
-    # Protobuf generated files
-    ${PROTO_SRCS}
 )
+
+# The generated sources belong to exactly one target: listing them in two
+# executables lets a parallel build run protoc twice over the same files.
+add_library(lineairdb-proto STATIC ${PROTO_SRCS})
+target_include_directories(lineairdb-proto PUBLIC ${CMAKE_CURRENT_BINARY_DIR})
+target_link_libraries(lineairdb-proto PUBLIC ${Protobuf_LIBRARIES})
 
 # Create executable
 add_executable(lineairdb-server ${SOURCES})
@@ -118,7 +121,7 @@ add_executable(lineairdb-server ${SOURCES})
 # Link libraries
 target_link_libraries(lineairdb-server
     lineairdb
-    ${Protobuf_LIBRARIES}
+    lineairdb-proto
     pthread
     ${DUCKDB_LIB_DIR}/libduckdb.so
     ${MYSQL_CHARSET_LIBRARIES}
@@ -137,3 +140,8 @@ set_target_properties(lineairdb-server PROPERTIES
 
 # Compiler flags to suppress warnings
 target_compile_options(lineairdb-server PRIVATE -O3 -Wno-error -Wno-unused-parameter)
+
+# Control-plane client. Speaks the same protocol; links no storage engine.
+add_executable(lineairdb-ctl tools/lineairdb_ctl.cc)
+target_link_libraries(lineairdb-ctl lineairdb-proto)
+target_compile_options(lineairdb-ctl PRIVATE -O2)
