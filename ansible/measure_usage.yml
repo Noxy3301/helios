@@ -36,61 +36,205 @@
     # Default false so the sweep path is behaviourally identical when unused.
     perf_stat: false
     perf_stat_interval_ms: 10000
+    # Commit durability contract for the sweep; required for the lineairdb engine
+    helios_durability: ""
   tasks:
-    - name: Ensure sysstat installed
-      become: yes
-      tags: [privileged]
-      apt:
-        name: sysstat
-        state: present
-        update_cache: yes
+    # A storage host that drops out before or inside the durability gate has to
+    # stop the run; the samplers below keep the ordinary per-host semantics.
+    - name: Prepare the run and reconcile the durability contract
+      any_errors_fatal: true
+      block:
+        - name: Ensure sysstat installed
+          become: yes
+          tags: [privileged]
+          apt:
+            name: sysstat
+            state: present
+            update_cache: yes
 
-    - name: Read CPU count
-      command: nproc
-      register: cpu_count_cmd
-      changed_when: false
+        - name: Read CPU count
+          command: nproc
+          register: cpu_count_cmd
+          changed_when: false
 
-    - name: Set CPU count fact
-      set_fact:
-        cpu_count: "{{ cpu_count_cmd.stdout | int }}"
+        - name: Set CPU count fact
+          set_fact:
+            cpu_count: "{{ cpu_count_cmd.stdout | int }}"
 
-    - name: Build machine spec string (for metadata)
-      set_fact:
-        machine_spec: >-
-          {%- set roles = ['lineairdb', 'mysql', 'benchbase'] -%}
-          {%- set parts = [] -%}
-          {%- for role in roles -%}
-            {%- set hosts = groups.get(role, []) -%}
-            {%- if hosts | length > 0 -%}
-              {%- set cpus = hosts | map('extract', hostvars, 'cpu_count') | list -%}
-              {%- set uniq = cpus | select('defined') | map('int') | unique | list -%}
-              {%- set cpu = ((uniq | length) > 0) | ternary(uniq[0], 'unknown') -%}
-              {%- set _ = parts.append(role ~ '-' ~ cpu ~ 'x' ~ (hosts | length)) -%}
-            {%- endif -%}
-          {%- endfor -%}
-          {{ parts | join('_') }}
+        - name: Build machine spec string (for metadata)
+          set_fact:
+            machine_spec: >-
+              {%- set roles = ['lineairdb', 'mysql', 'benchbase'] -%}
+              {%- set parts = [] -%}
+              {%- for role in roles -%}
+                {%- set hosts = groups.get(role, []) -%}
+                {%- if hosts | length > 0 -%}
+                  {%- set cpus = hosts | map('extract', hostvars, 'cpu_count') | list -%}
+                  {%- set uniq = cpus | select('defined') | map('int') | unique | list -%}
+                  {%- set cpu = ((uniq | length) > 0) | ternary(uniq[0], 'unknown') -%}
+                  {%- set _ = parts.append(role ~ '-' ~ cpu ~ 'x' ~ (hosts | length)) -%}
+                {%- endif -%}
+              {%- endfor -%}
+              {{ parts | join('_') }}
 
-    - name: Set result directory
-      set_fact:
-        result_dir: "{{ playbook_dir }}/result/{{ run_id }}/{{ machine_spec }}"
+        - name: Set result directory
+          set_fact:
+            result_dir: "{{ playbook_dir }}/result/{{ run_id }}/{{ machine_spec }}"
 
-    - name: Ensure the result directory exists on the controller
-      # copy cannot create parent directories
-      run_once: true
-      delegate_to: localhost
-      file:
-        path: "{{ result_dir }}"
-        state: directory
+        - name: Ensure the result directory exists on the controller
+          # copy cannot create parent directories
+          run_once: true
+          delegate_to: localhost
+          file:
+            path: "{{ result_dir }}"
+            state: directory
 
-    - name: Write run metadata
-      run_once: true
-      delegate_to: localhost
-      copy:
-        dest: "{{ result_dir }}/meta.txt"
-        content: |
-          run_id={{ run_id }}
-          machine_spec={{ machine_spec }}
-          timestamp={{ lookup('pipe', 'date -Iseconds') }}
+        - name: Write run metadata
+          run_once: true
+          delegate_to: localhost
+          copy:
+            dest: "{{ result_dir }}/meta.txt"
+            content: |
+              run_id={{ run_id }}
+              machine_spec={{ machine_spec }}
+              timestamp={{ lookup('pipe', 'date -Iseconds') }}
+
+        # The load may run under a relaxed contract; the sweep never does.
+        # Reconciling returns only once every write acknowledged under the load
+        # contract is durable, so it runs before the samplers start.
+        - name: Put the storage server in the measured durability contract
+          when: inventory_hostname in groups.get('lineairdb', [])
+          block:
+            - name: "Gate: the measured durability contract is declared"
+              assert:
+                that: helios_durability in ['volatile', 'async', 'sync']
+                fail_msg: >-
+                  measure_usage.yml needs helios_durability=<volatile|async|sync>:
+                  the sweep must not inherit whatever contract the load left behind
+                quiet: true
+
+            - name: Reconcile the storage server with the measured contract
+              shell: |
+                set -euo pipefail
+                measured="{{ helios_durability }}"
+                declared_load="{{ helios_load_durability | default(helios_durability) }}"
+                log=$(ls -t ~/helios/lineairdb_logs/lineairdb_server_*.log 2>/dev/null \
+                      | head -n1 || true)
+                if [ -z "$log" ]; then
+                  echo "SWITCH_FAIL: no server log under ~/helios/lineairdb_logs" >&2
+                  exit 1
+                fi
+                # What the server started under: the load always precedes any switch
+                startup_contract() {
+                  local first
+                  first=$(grep -hoE 'Commit durability: [a-z]+' "$log" | head -n1 || true)
+                  printf '%s' "${first##* }"
+                }
+                # The policy in force: the last one the server published, else the
+                # startup contract. A failed barrier still published its policy.
+                policy_in_force() {
+                  local last
+                  last=$(grep -h 'SetCommitDurability .*effective=' "$log" \
+                         | grep -oE 'effective=[A-Z]+' | tail -n1 || true)
+                  if [ -z "$last" ]; then
+                    startup_contract
+                    return
+                  fi
+                  printf '%s' "${last#effective=}" | tr 'A-Z' 'a-z'
+                }
+                # Apparent size: wal.log is preallocated, so this stays at the
+                # initial capacity until the log outgrows it.
+                wal_file_bytes() {
+                  local total
+                  total=$(du -Lbc ~/helios/lineairdb_logs/wal*.log 2>/dev/null \
+                          | tail -n1 | cut -f1 || true)
+                  echo "${total:-0}"
+                }
+                if [ ! -x ~/helios/build/server/lineairdb-ctl ]; then
+                  echo "SWITCH_FAIL: ~/helios/build/server/lineairdb-ctl is missing" >&2
+                  exit 1
+                fi
+                if [ ! -r /tmp/lineairdb_server.pid ]; then
+                  echo "SWITCH_FAIL: /tmp/lineairdb_server.pid is missing" >&2
+                  exit 1
+                fi
+                pid=$(cat /tmp/lineairdb_server.pid)
+                # The kernel truncates the process name to 15 characters
+                if [ ! -r "/proc/$pid/comm" ] || \
+                   [ "$(cat "/proc/$pid/comm")" != lineairdb-serve ]; then
+                  echo "SWITCH_FAIL: pid $pid is not a running lineairdb-server" >&2
+                  exit 1
+                fi
+                if ! ss -ltn | grep -q ':9999[[:space:]]'; then
+                  echo "SWITCH_FAIL: nothing is listening on port 9999" >&2
+                  exit 1
+                fi
+                startup=$(startup_contract)
+                if [ -z "$startup" ]; then
+                  echo "SWITCH_FAIL: cannot read the startup contract from $log" >&2
+                  exit 1
+                fi
+                mode_before=$(policy_in_force)
+                # The load ran under the startup contract whatever happened after, so a
+                # failed barrier can be retried by re-running this play.
+                if [ "$startup" != "$declared_load" ]; then
+                  echo "SWITCH_FAIL: the load ran under $startup, not the declared $declared_load" >&2
+                  exit 1
+                fi
+                rss_before=$(awk '/^VmRSS:/{print $2}' "/proc/$pid/status" || true)
+                wal_before=$(wal_file_bytes)
+                started=$(date +%s.%N)
+                if [ "$measured" = volatile ]; then
+                  if ! grep -q 'Commit durability: volatile' "$log"; then
+                    echo "SWITCH_FAIL: $log has no volatile startup line" >&2
+                    exit 1
+                  fi
+                  if grep -q 'SetCommitDurability .*result=ok .*effective=' "$log"; then
+                    echo "SWITCH_FAIL: $log records a switch under a volatile sweep" >&2
+                    exit 1
+                  fi
+                  reply="(volatile: no barrier)"
+                else
+                  expected="ok mode=$(printf '%s' "$measured" | tr 'a-z' 'A-Z')"
+                  reply=$(~/helios/build/server/lineairdb-ctl --host 127.0.0.1 --port 9999 \
+                            set-durability "$measured") || {
+                    echo "SWITCH_FAIL: lineairdb-ctl exited non-zero" >&2
+                    exit 1
+                  }
+                  if [ "$reply" != "$expected" ]; then
+                    echo "SWITCH_FAIL: expected '$expected', got '$reply'" >&2
+                    exit 1
+                  fi
+                fi
+                ended=$(date +%s.%N)
+                rss_after=$(awk '/^VmRSS:/{print $2}' "/proc/$pid/status" || true)
+                wal_after=$(wal_file_bytes)
+                echo "mode_before=$mode_before"
+                echo "mode_after=$measured"
+                echo "reply=$reply"
+                echo "elapsed_seconds=$(awk -v a="$started" -v b="$ended" \
+                                           'BEGIN { printf "%.3f", b - a }')"
+                echo "rss_kb_before=$rss_before"
+                echo "rss_kb_after=$rss_after"
+                echo "wal_file_bytes_before=$wal_before"
+                echo "wal_file_bytes_after=$wal_after"
+              args:
+                executable: /bin/bash
+              register: durability_switch
+
+            - name: Show the durability record
+              debug:
+                var: durability_switch.stdout_lines
+
+            - name: Append the durability record
+              # One block per run: re-running the sweep must not erase what the
+              # previous one recorded.
+              delegate_to: localhost
+              blockinfile:
+                path: "{{ result_dir }}/durability_switch.txt"
+                create: true
+                marker: "# {mark} durability {{ durability_switch.start }}"
+                block: "{{ durability_switch.stdout }}"
 
     - name: Start mpstat sampling
       shell: |

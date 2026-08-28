@@ -7,6 +7,9 @@
     lineairdb_nofile_limit: 1048576
     ena_rss_interface: ens5
     helios_durability: volatile
+    # helios_load_durability (optional): contract for the load phase only.
+    # measure_usage.yml switches the server to helios_durability before the
+    # sweep; left undefined, the load runs under helios_durability as well.
     helios_epoch_ms: ""
     # Extra KEY=VALUE pairs exported to the server (space separated)
     helios_server_env: ""
@@ -48,6 +51,14 @@
       args:
         executable: /bin/bash
 
+    - name: "Gate: the durability control tool is present"
+      # measure_usage.yml reconciles this server before the sweep; a bundle
+      # without the tool would only fail after the load.
+      shell: test -x ~/helios/build/server/lineairdb-ctl
+      args:
+        executable: /bin/bash
+      changed_when: false
+
     - name: Start LineairDB-Server
       # Never pipe the start scripts: log to a file and verify liveness explicitly;
       # lineairdb_logs is wiped first, following the WAL symlink when present, so
@@ -66,7 +77,7 @@
         [ "$rc" -eq 1 ] || { echo "refusing to wipe the WAL: a previous lineairdb-server is still running or pgrep failed (status $rc)"; exit 1; }
         find ~/helios/lineairdb_logs/ -mindepth 1 -delete
         ulimit -n {{ lineairdb_nofile_limit }}
-        export LINEAIRDB_COMMIT_DURABILITY="{{ helios_durability }}"
+        export LINEAIRDB_COMMIT_DURABILITY="{{ helios_load_durability | default(helios_durability) }}"
         {% if helios_epoch_ms %}
         export LINEAIRDB_EPOCH_DURATION_MS="{{ helios_epoch_ms }}"
         {% endif %}
@@ -97,7 +108,8 @@
     - name: Show durability configuration
       debug:
         msg:
-          - "LINEAIRDB_COMMIT_DURABILITY={{ helios_durability }}"
+          - "LINEAIRDB_COMMIT_DURABILITY={{ helios_load_durability | default(helios_durability) }} (load phase)"
+          - "measured contract: {{ helios_durability }}"
           - "LINEAIRDB_EPOCH_DURATION_MS={{ helios_epoch_ms if helios_epoch_ms else '(server default)' }}"
           - "extra env: {{ helios_server_env if helios_server_env else '(none)' }}"
           - "LINEAIRDB_FLUSH_TRACE={{ helios_flush_trace if helios_flush_trace else '(off)' }}"

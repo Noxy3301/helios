@@ -412,6 +412,8 @@ def deploy_infrastructure(args, bundle_path, bundle_sha256):
     log("Deploying infrastructure (mysql only, InnoDB)..." if innodb
         else "Deploying infrastructure (lineairdb + mysql in parallel)...")
     lineairdb_vars = {"helios_durability": args.durability, "wal_volume": args.wal_gib > 0}
+    if args.load_durability != "same":
+        lineairdb_vars["helios_load_durability"] = args.load_durability
     if args.epoch_ms is not None:
         lineairdb_vars["helios_epoch_ms"] = args.epoch_ms
     if args.server_env:
@@ -522,6 +524,12 @@ def run_benchmarks(args, run_id):
         exec_vars += " enable_perf=true"
     if args.perf_stat:
         exec_vars += " perf_stat=true"
+    if args.engine != "innodb":
+        # measure_usage.yml reconciles the server with the measured contract
+        # before the sweep and refuses to run without knowing what it is.
+        exec_vars += f" helios_durability={args.durability}"
+        if args.load_durability != "same":
+            exec_vars += f" helios_load_durability={args.load_durability}"
     if args.flush_trace:
         exec_vars += f" helios_flush_trace={FLUSH_TRACE_PREFIX}"
 
@@ -676,6 +684,7 @@ Examples:
   python3 py/bench_aws.py --bench-type tpch --bench-scalefactor 0.1
   python3 py/bench_aws.py --bench-type tpch --bench-serial false --bench-terms 1,2,4,8 --bench-scalefactor 0.01
   python3 py/bench_aws.py --durability sync --epoch-ms 1 --wal-gib 300
+  python3 py/bench_aws.py --durability sync --load-durability async --wal-gib 300
   python3 py/bench_aws.py --cleanup-only --cleanup-all
   python3 py/bench_aws.py --dry-run
 """,
@@ -730,6 +739,11 @@ Examples:
     # Durability / WAL options
     parser.add_argument("--durability", default="volatile", choices=["volatile", "async", "sync"],
                         help="LineairDB commit durability contract (default: volatile)")
+    parser.add_argument("--load-durability", default="same", choices=["same", "async"],
+                        help="Commit durability for the load phase only (default: same, the "
+                             "load runs under --durability). async loads under the Async "
+                             "contract and makes every acknowledged write durable before the "
+                             "sweep starts; needs --durability sync")
     parser.add_argument("--epoch-ms", type=int, default=None,
                         help="Epoch duration in ms (default: server default)")
     parser.add_argument("--wal-gib", type=int, default=0,
@@ -798,6 +812,18 @@ Examples:
         if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=[A-Za-z0-9_./:,+-]*", kv):
             parser.error(f"--server-env entry {kv!r} is not NAME=VALUE with NAME a shell identifier "
                          "and VALUE made of letters, digits and _ . / : , + -")
+        if kv.split("=", 1)[0] in ("LINEAIRDB_COMMIT_DURABILITY",
+                                   "LINEAIRDB_EPOCH_DURATION_MS"):
+            parser.error("--server-env must not set LINEAIRDB_COMMIT_DURABILITY or "
+                         "LINEAIRDB_EPOCH_DURATION_MS; they have dedicated flags "
+                         "(--durability / --load-durability / --epoch-ms)")
+    if args.load_durability == "async":
+        if args.durability != "sync":
+            parser.error("--load-durability async only relaxes a sync sweep; "
+                         "pass --durability sync")
+        if args.engine != "lineairdb":
+            parser.error("--load-durability async switches the LineairDB storage server; "
+                         "not valid with --engine innodb")
     if args.engine == "innodb":
         if args.mysql_count is not None and args.mysql_count != 1:
             parser.error("--engine innodb runs a single MySQL/InnoDB node; --mysql-count must be 1")
@@ -854,6 +880,8 @@ Examples:
         run_id += "-ndvdrift"
     if args.durability != "volatile":
         run_id += f"-{args.durability}"
+    if args.load_durability != "same":
+        run_id += f"-ld{args.load_durability}"
     if args.epoch_ms is not None:
         run_id += f"-e{args.epoch_ms}"
     if args.flush_trace:
@@ -891,6 +919,8 @@ Examples:
                 f"(tag={cfg['tag']}, ena_queues={ena_queue_count(cfg['instance_type'])})")
         if args.engine != "innodb":
             log(f"Durability: {args.durability}"
+                + (f" (load: {args.load_durability})"
+                   if args.load_durability != "same" else "")
                 + (f" epoch_ms={args.epoch_ms}" if args.epoch_ms is not None else ""))
         if args.wal_gib > 0:
             log(f"{'Data' if args.engine == 'innodb' else 'WAL'} volume: {args.wal_gib}GiB io2 "
