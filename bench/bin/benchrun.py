@@ -379,7 +379,39 @@ def run_analyze(benchmark, mysql_host, mysql_port):
         sys.exit(f"ANALYZE TABLE failed on {mysql_host}:{mysql_port}")
 
 
-def setup_benchmark(benchmark, config_path, mysql_host, mysql_port, log_dir=None):
+def url_with_unique_checks_off(text):
+    """Config text with unique_checks=0 added to the JDBC URL, or None if there
+    is no <url> element. sessionVariables is one comma-separated list, so an
+    existing one is extended to carry both variables."""
+    match = re.search(r"<url>(.*?)</url>", text, re.DOTALL)
+    if match is None:
+        return None
+    url = match.group(1)
+    if "sessionVariables=" in url:
+        url = re.sub(r"sessionVariables=[^&]*", r"\g<0>,unique_checks=0", url, count=1)
+    else:
+        url += ("&amp;" if "?" in url else "?") + "sessionVariables=unique_checks=0"
+    return text[:match.start(1)] + url + text[match.end(1):]
+
+
+def _self_check():
+    """Checks url_with_unique_checks_off on the URL shapes in bench/config"""
+    def patched(url):
+        return url_with_unique_checks_off(f"<url>{url}</url>")
+
+    short = "jdbc:mysql://127.0.0.1:3307/benchbase?rewriteBatchedStatements=true&amp;sslMode=DISABLED"
+    long_ = ("jdbc:mysql://127.0.0.1:3307/benchbase?rewriteBatchedStatements=true"
+             "&amp;allowLoadLocalInfile=true&amp;allowPublicKeyRetrieval=true&amp;sslMode=DISABLED")
+    with_vars = long_ + "&amp;sessionVariables=secondary_engine_cost_threshold=0"
+    for url in (short, long_):
+        assert patched(url) == f"<url>{url}&amp;sessionVariables=unique_checks=0</url>", url
+    assert patched(with_vars) == f"<url>{with_vars},unique_checks=0</url>", with_vars
+    bare = "jdbc:mysql://127.0.0.1:3307/benchbase"
+    assert patched(bare) == f"<url>{bare}?sessionVariables=unique_checks=0</url>", bare
+    assert url_with_unique_checks_off("<parameters/>") is None
+
+
+def setup_benchmark(benchmark, config_path, mysql_host, mysql_port, log_dir=None, unique_checks_off=True):
     """Reset DB, create schema, load data. Returns load_time or None on failure."""
     db_name = "benchbase"
 
@@ -391,8 +423,25 @@ def setup_benchmark(benchmark, config_path, mysql_host, mysql_port, log_dir=None
                   "SET GLOBAL optimizer_switch='batched_key_access=on,mrr_cost_based=off,subquery_to_derived=off';"
                   "SET GLOBAL join_buffer_size=1073741824;")
 
-    print("  Creating schema + Loading data...")
-    result = run_benchbase(benchmark, config_path, create=True, load=True, execute=False)
+    # Load through a throwaway copy so the JDBC session variable never reaches
+    # the execute phase, which keeps using config_path.
+    load_config = config_path
+    if unique_checks_off:
+        _self_check()
+        patched = url_with_unique_checks_off(config_path.read_text())
+        if patched is None:
+            sys.exit(f"--load-defer-unique-checks on: no <url> element in {config_path}")
+        load_config = config_path.with_suffix(".load.xml")
+
+    try:
+        if load_config != config_path:
+            load_config.write_text(patched)
+            print("  Load: unique_checks=0")
+        print("  Creating schema + Loading data...")
+        result = run_benchbase(benchmark, load_config, create=True, load=True, execute=False)
+    finally:
+        if load_config != config_path:
+            load_config.unlink(missing_ok=True)
     if log_dir:
         try:
             (Path(log_dir) / "benchbase_load.log").write_text(result.stdout + result.stderr)
@@ -767,6 +816,9 @@ def main():
     parser.add_argument("--mysql-port", type=int, default=3307,
                         help="Default port for --mysql-host entries without an explicit port (default: 3307)")
     parser.add_argument("--loader-threads", type=int, default=1, help="Number of parallel loader threads (default: 1)")
+    parser.add_argument("--load-defer-unique-checks", choices=["on", "off"], default="on",
+                        help="Defer UNIQUE secondary-index checks during the create and load "
+                             "phases; the execute phase always keeps them on (default: on)")
     parser.add_argument("--exclude-queries", type=str, help="TPC-H: comma-separated query numbers to exclude (e.g. 15,21)")
     parser.add_argument("--no-setup", action="store_true", help="Skip setup (DROP+CREATE+LOAD), assume data exists")
     parser.add_argument("--no-load", action="store_true", help="Run setup with CREATE only, skip LOAD")
@@ -957,7 +1009,8 @@ def _run_bench(args, config_work, thread_list, result_base):
         load_time = 0
     else:
         load_time = setup_benchmark(args.benchmark, config_work, args.mysql_host, args.mysql_port,
-                                    log_dir=result_base)
+                                    log_dir=result_base,
+                                    unique_checks_off=(args.load_defer_unique_checks == "on"))
         if load_time is None:
             print("Setup failed.", file=sys.stderr)
             sys.exit(1)

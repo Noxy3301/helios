@@ -97,6 +97,9 @@
     # InnoDB persistent stats are sampled, so a post-load ANALYZE refreshes them;
     # Helios defaults to false and bench_aws.py turns it on for tx-prefetch
     bench_analyze: "{{ mysql_engine == 'innodb' }}"
+    # Defer UNIQUE secondary-index checks during the load phase. InnoDB: false,
+    # it change-buffers the deferred inserts and merges them under the sweep.
+    bench_load_unique_checks_off: "{{ mysql_engine != 'innodb' }}"
     run_id: "run"
     machine_spec: "unknown"
     load_result_dir: "{{ playbook_dir }}/result/{{ run_id }}/{{ machine_spec }}"
@@ -184,6 +187,23 @@
         cp {{ _config_dir }}/{{ bench_type }}.xml "$CFG"
         sed -i "s|localhost:3307|{{ hostvars[groups['mysql'][0]].private_ip }}:3307|g" "$CFG"
         sed -i 's|<scalefactor>[^<]*</scalefactor>|<scalefactor>{{ bench_scalefactor }}</scalefactor>|' "$CFG"
+        {% if bench_load_unique_checks_off | bool %}
+        # sessionVariables is one comma-separated list, so an existing one is
+        # extended rather than replaced
+        if ! grep -q '<url>' "$CFG"; then
+          echo "GATE_FAIL: no <url> element in the load config" >&2
+          exit 1
+        fi
+        if grep -q '<url>.*sessionVariables=' "$CFG"; then
+          sed -i '/<url>/ s|sessionVariables=[^&<]*|&,unique_checks=0|' "$CFG"
+        else
+          sed -i '/<url>/ s|</url>|\&amp;sessionVariables=unique_checks=0</url>|' "$CFG"
+        fi
+        if ! grep -q '<url>.*sessionVariables=[^<]*unique_checks=0' "$CFG"; then
+          echo "GATE_FAIL: unique_checks=0 not applied to the load config" >&2
+          exit 1
+        fi
+        {% endif %}
         cd {{ _bb_dir }} && timeout -k 60 -s INT {{ bench_load_timeout | default(7200) }} \
           java -jar benchbase.jar -b {{ bench_type }} -c "$CFG" \
           --create=false --load=true --execute=false
@@ -217,7 +237,7 @@
         dest: "{{ load_result_dir }}/logs/benchbase_load.log"
         content: |
           # run_id={{ run_id }} bench_type={{ bench_type }} SF={{ bench_scalefactor }}
-          # loader={{ groups['benchbase'][0] }} elapsed={{ load_out.delta | default('unknown') }}
+          # loader={{ groups['benchbase'][0] }} elapsed={{ load_out.delta | default('unknown') }} unique_checks_off={{ bench_load_unique_checks_off | bool | lower }}
           # start={{ load_out.start | default('unknown') }} end={{ load_out.end | default('unknown') }}
           {{ load_out.stdout | default('') }}
           {{ load_out.stderr | default('') }}

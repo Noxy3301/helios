@@ -58,6 +58,13 @@
     sed -i '/<serial>false<\/serial>/a\            <time>{{ bench_time }}</time>' "$CFG"
     {% endif %}
 
+    # Measured connections must validate UNIQUE indexes: the load phase's
+    # relaxation must never reach the execute config
+    if grep -q 'unique_checks=0' "$CFG"; then
+      echo "GATE_FAIL: unique_checks=0 in exec config" >&2
+      exit 1
+    fi
+
     # Execute BenchBase (ensure sdkman Java is on PATH)
     export SDKMAN_DIR="$HOME/.sdkman"
     [ -s "$SDKMAN_DIR/bin/sdkman-init.sh" ] && source "$SDKMAN_DIR/bin/sdkman-init.sh"
