@@ -64,5 +64,8 @@ enum class MessageType : uint32_t {
     TX_EXECUTE_DUCKDB_QUERY = 36,
 
     // Hidden primary key allocation
-    DB_ALLOCATE_HIDDEN_KEYS = 37
+    DB_ALLOCATE_HIDDEN_KEYS = 37,
+
+    // Runtime durability control
+    DB_SET_COMMIT_DURABILITY = 38
 };

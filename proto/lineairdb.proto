@@ -59,6 +59,9 @@ enum OpCode {
 
     // Hidden primary key allocation
     DB_ALLOCATE_HIDDEN_KEYS = 37;
+
+    // Runtime durability control
+    DB_SET_COMMIT_DURABILITY = 38;
 }
 
 enum BatchOpType {
@@ -398,6 +401,29 @@ message DbAllocateHiddenKeys {
         // back. A range is only usable against the run that granted it, so a
         // restart invalidates every cached range.
         uint64 boot_token = 5;
+    }
+}
+
+// Runtime switch of the commit acknowledgement policy (see
+// Database::SetCommitDurability).
+message DbSetCommitDurability {
+    enum Mode {
+        MODE_UNSPECIFIED = 0;
+        ASYNC = 1;
+        SYNC = 2;
+        // Reportable, not requestable: it is decided at startup
+        VOLATILE = 3;
+    }
+    message Request {
+        Mode mode = 1;
+    }
+    message Response {
+        bool ok = 1;
+        // The policy in force when this reply was built. With ok = false it
+        // does not say whether this call published it: a concurrent switch to
+        // the same mode may have.
+        Mode mode = 2;
+        string error = 3;
     }
 }
 
