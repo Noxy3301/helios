@@ -98,8 +98,8 @@ struct Config {
    * @brief One image written this many milliseconds after startup; zero
    *        writes none.
    *
-   * @details Independent of checkpoint_interval_ms, which keeps its own
-   * cadence afterwards when both are set.
+   * @details When checkpoint_interval_ms is also set, its timer starts after
+   * this first checkpoint, not at startup.
    *
    * Default: 0 (no image)
    */

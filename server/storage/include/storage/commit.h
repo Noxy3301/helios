@@ -80,6 +80,11 @@ enum class CommitDurability {
 
 /**
  * @brief Secondary-index add or remove to install during Commit.
+ *
+ * @details When `is_delete` is true, `primary_key` is removed from
+ * `secondary_key`. Uniqueness belongs to the named index, not to this entry:
+ * an add that collides on a UNIQUE index aborts with a reason starting with
+ * kDuplicateSecondaryKeyAbortPrefix.
  */
 struct ExternalSecondaryIndexEntry {
   std::string table_name;
@@ -92,12 +97,11 @@ struct ExternalSecondaryIndexEntry {
 /**
  * @brief Range read to revalidate at commit.
  *
- * Assemble it from the scan request and the returned rows: the bounds
- * describe the scan to re-run, `result_keys` (plus `result_primary_keys`
- * on a secondary index) is the key set the scan returned, in scan order.
- * Commit replays the scan and aborts when the key set changed.
- * Row TIDs are not part of this entry; register every returned row as an
- * ExternalReadEntry instead.
+ * The bounds, index, row limit and direction describe the scan to re-run.
+ * `result_keys` (plus `result_primary_keys` on a secondary index) holds the
+ * keys that scan returned, in scan order; Commit replays the scan and aborts
+ * when that ordered list differs. Row TIDs are not part of this entry: each
+ * row the caller consumed is also an ExternalReadEntry.
  */
 struct ExternalRangeReadEntry {
   std::string table_name;

@@ -15,14 +15,14 @@ namespace helios::storage {
 /**
  * @brief Outcome of a single Database::Read.
  *
- * `tid` is the packed (epoch:32 | tid:32) version observed at read time.
- * Resubmit the same `tid` through Commit inside an
- * ExternalReadEntry to assert that the row did not move before commit.
+ * The caller passes the same `tid` and `found` back in an ExternalReadEntry
+ * so Commit can confirm the row did not move.
  */
 struct ReadResult {
-  bool found = false;  // True when the key existed and was non-empty.
-  std::string value;   // Row payload, valid only when `found` is true.
-  uint64_t tid = 0;    // Packed (epoch | tid) version observed at read time.
+  // True when the key holds a live, non-empty payload.
+  bool found = false;
+  std::string value;  // Row payload, valid only when `found` is true.
+  uint64_t tid = 0;   // Packed (epoch:32 | tid:32) version observed at read.
 };
 
 /**
@@ -65,9 +65,10 @@ struct ScanResult {
  * @details `group` is a `pax::PaxGroup*` and `item` is a `DataItem*`, kept
  * opaque so this public header does not expose internal storage headers.
  * Both are non-null in a returned row, are owned by the database, and stay
- * valid until the calling thread releases its epoch. Callers read the cells
- * they need, then call CurrentTid() and compare the result with `tid` to
- * reject torn reads.
+ * valid until the calling thread releases its epoch. `slot` is the row's
+ * index inside that group and `row_size` is its stored payload length in
+ * bytes. Callers read the cells they need, then call CurrentTid() and
+ * compare the result with `tid` to reject torn reads.
  */
 struct ScanPaxRow {
   std::string key;
@@ -92,7 +93,11 @@ struct ScanPaxResult {
 };
 
 /**
- * @brief Returns the current packed TID for a PAX row reference.
+ * @brief Returns the live packed TID of the row a PAX reference points at.
+ *
+ * @details Loads through `row.item`, which must be non-null. Packed as
+ * ReadResult::tid is. This is not `row.tid`: compare the two to reject a row
+ * a writer changed during the scan.
  *
  * @param row Row reference returned by Database::ScanPax.
  */

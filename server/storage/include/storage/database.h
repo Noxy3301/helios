@@ -76,24 +76,17 @@ class Database {
   Database(Database &&) = delete;
   Database &operator=(Database &&) = delete;
 
-  /**
-   * @brief Returns the configuration the instance was constructed with.
-   */
   const Config &GetConfig() const noexcept;
 
   /**
-   * @brief Ends the calling thread's masstree RCU critical section, drains
-   * the now-eligible entries from its limbo list, and drops it from the
-   * `min_active_epoch()` participant set.
+   * @brief Ends the calling thread's index reclamation section and drops it
+   *        from the participant set the index reclaims against.
    *
-   * The caller MUST guarantee that no raw DataItem* (or masstree leaf
-   * pointer) obtained inside the section is still in use past this call. A
-   * section end is a release operation in the RCU sense, after which other
-   * threads' physical deletes can free those objects.
-   *
-   * The first masstree op on the thread (after construction or after a
-   * release) implicitly re-opens a section at the then-current
-   * globalepoch; there is no separate "begin" call.
+   * @details This is the index's reclamation epoch, not the commit epoch and
+   * not a read view's cut_epoch. No row reference obtained inside the section
+   * may be used past this call: ending a section is a release, after which
+   * another thread's delete can free those rows. The next store op on the
+   * thread opens a new section; there is no separate begin call.
    */
   void ReleaseThreadEpoch();
 
@@ -107,7 +100,6 @@ class Database {
                             const std::string_view index_name,
                             IndexConstraint index_type);
 
-  // True when the dictionary holds this table.
   bool HasTable(const std::string_view table_name);
 
   /**
@@ -246,10 +238,9 @@ class Database {
    * @brief Range-scans the primary index and returns the rows observed in
    *        the range.
    *
-   * Each returned row carries its own TID. To revalidate the range at
-   * commit, assemble an ExternalRangeReadEntry from this call's arguments
-   * and the returned keys, and register every consumed row as an
-   * ExternalReadEntry.
+   * Each returned row carries its own TID. Revalidating the range at commit
+   * takes an ExternalRangeReadEntry built from this call's arguments and the
+   * returned keys, plus one ExternalReadEntry per consumed row.
    *
    * @param table_name Target table.
    * @param start_key Inclusive start of the range.
@@ -273,10 +264,10 @@ class Database {
    *
    * For every secondary key in `[start_key, end_key)`, this resolves each of
    * its primary keys, reads the base row, and reports
-   * `{secondary_key, primary_key, value, tid, found}` per result. To
-   * revalidate the range at commit, assemble an ExternalRangeReadEntry from
-   * this call's arguments and both returned key lists; each base row carries
-   * its TID for revalidation as a point read.
+   * `{secondary_key, primary_key, value, tid}` per result. Revalidating the
+   * range at commit takes an ExternalRangeReadEntry built from this call's
+   * arguments and both returned key lists; each base row carries its TID for
+   * revalidation as a point read.
    *
    * @param table_name Base table.
    * @param index_name Secondary index name.
@@ -299,14 +290,16 @@ class Database {
   /**
    * @brief Range-scans the primary index and returns PAX cell references.
    *
-   * @details The returned rows are not materialized. `ok == false` means the
-   * caller must fall back to Scan.
+   * @details The returned rows are not materialized.
    *
    * @param table_name Target table.
    * @param start_key Inclusive start of the range.
    * @param end_key Exclusive end of the range. Must be non-empty.
    * @param row_limit Maximum live rows to return. 0 means no cap.
    * @param reverse_scan When true, iterate in reverse key order.
+   * @return Result with `ok == false` when the table is missing, has no PAX
+   * table, holds rows that overflowed to the heap, or `end_key` is empty. The
+   * caller then uses Scan.
    */
   ScanPaxResult ScanPax(const std::string_view table_name,
                         const std::string_view start_key,
@@ -369,7 +362,8 @@ class Database {
    * `primary_range_result_changed`, or `unique_si_exists_after_lock`.
    *
    * @param reads Point reads to revalidate before commit.
-   * @param writes Row writes (`is_delete == true` to remove the row).
+   * @param writes Row writes; `op` says whether the entry updates, inserts
+   *                or deletes the row.
    * @param secondary_index_ops Secondary-index adds/removes to install.
    * @param range_reads Range reads assembled by the caller from earlier
    *                    scans.
@@ -377,7 +371,8 @@ class Database {
    *                    reaching the device.
    * @param abort_reason Optional out parameter. Set only when the function
    *                    returns false.
-   * @return true on commit; false on validation failure or schema mismatch.
+   * @return true on commit; false on a validation failure, or when a table
+   *         or index the entries name is missing.
    */
   bool Commit(
       const std::vector<ExternalReadEntry> &reads,

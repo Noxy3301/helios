@@ -1,7 +1,8 @@
 /**
  * @file server/storage/include/storage/pax.h
- * The PAX row format a table declares at creation, and the strips a reader
- * scans in place.
+ * The PAX row format a table declares at creation, the strips a reader scans
+ * in place, and the before-image surface that resolves a row a writer changed
+ * under an open read view.
  */
 
 #ifndef HELIOS_STORAGE_INCLUDE_STORAGE_PAX_H
@@ -23,24 +24,21 @@ namespace pax {
 /**
  * @brief Per-field storage kind for typed numeric cells.
  *
- * @details FK_UNTYPED keeps the cell verbatim (the original ASCII val_str
- * bytes the query layer wrote). The typed kinds shred the numeric value into a
- * fixed-width little-endian binary payload whose width is `field_max_bytes[f]`
- * (4 or 8). A typed cell's u16 length prefix is 0 for SQL NULL and equal to the
- * binary width for a present value, so "empty cell == NULL" still holds.
- * `ScatterRow` parses the ASCII once (the row overflows to the heap on any
- * parse/range failure); `GatherRow` reformats the binary back into the exact
- * original
- * val_str ASCII (a byte-identical round trip, which is the row-format
- * contract).
+ * @details FK_UNTYPED keeps the cell verbatim: the field bytes the query
+ * layer wrote, unchanged. A typed kind stores the value as a fixed-width
+ * little-endian binary payload of `field_max_bytes[f]` bytes (4 or 8). A
+ * typed cell's u16 length prefix is 0 for SQL NULL and the binary width for a
+ * present value, so "empty cell == NULL" still holds. ScatterRow parses that
+ * text once and returns false without touching the slot when it does not
+ * parse or does not fit; the row then overflows to the heap. GatherRow
+ * reformats a typed cell back into the exact bytes it was given.
  */
 enum FieldKind : uint8_t {
-  FK_UNTYPED =
-      0,         // verbatim bytes (default; strings, floats, DECIMAL pre-DEC64)
-  FK_INT32 = 1,  // 4-byte LE signed int   (TINY/SHORT/INT24/LONG)
-  FK_INT64 = 2,  // 8-byte LE signed int   (LONG UNSIGNED, BIGINT)
-  FK_DATE = 3,   // 4-byte LE YYYYMMDD int (DATE)
-  FK_DEC64 = 4,  // 8-byte LE scaled int   (DECIMAL(p,s); scale=field_scale)
+  FK_UNTYPED = 0,  // verbatim bytes (default; strings, floats, untyped DECIMAL)
+  FK_INT32 = 1,    // 4-byte LE signed int   (TINY/SHORT/INT24/LONG)
+  FK_INT64 = 2,    // 8-byte LE signed int   (LONG UNSIGNED, BIGINT)
+  FK_DATE = 3,     // 4-byte LE YYYYMMDD int (DATE)
+  FK_DEC64 = 4,    // 8-byte LE scaled int   (DECIMAL(p,s); scale=field_scale)
 };
 
 /**
@@ -79,13 +77,11 @@ struct TableSchema {
   // Table name, carried for diagnostics (overflow logging).
   std::string table_name;
 
-  /**
-   * @brief Returns the number of fields in a row.
-   */
   size_t field_count() const { return field_max_bytes.size(); }
 
   /**
-   * @brief Returns the storage kind of field `f` (UNTYPED when untyped).
+   * @brief Returns the storage kind of field `f`, or FK_UNTYPED when
+   *        `field_kind` does not cover it.
    *
    * @details A kind whose declared width is not the width that kind stores
    * degrades to UNTYPED, so no reader parses a cell in a shape never written.
@@ -100,7 +96,8 @@ struct TableSchema {
   }
 
   /**
-   * @brief Returns the DECIMAL scale of field `f` (0 when untyped).
+   * @brief Returns the DECIMAL scale of field `f`, or 0 when `field_scale`
+   *        does not cover it.
    */
   int scale_of(size_t f) const {
     return f < field_scale.size() ? field_scale[f] : 0;
@@ -145,8 +142,9 @@ class PaxGroup {
    * @param slot Target slot inside this group.
    * @param row Row bytes.
    * @param size Number of bytes in `row`.
-   * @return false without writing any cell when the payload does not match the
-   * schema shape or when any field exceeds its configured cell width.
+   * @return false without writing any cell when the payload does not match
+   * the schema shape, the table has more than 512 fields, an UNTYPED field
+   * exceeds its cell width, or a typed field fails its parse or range check.
    */
   bool ScatterRow(uint32_t slot, const std::byte *row, size_t size);
 
@@ -175,7 +173,8 @@ class PaxGroup {
    * @param columns Zero-based MySQL column indexes to gather.
    * @param n_columns Number of entries in `columns`.
    * @param out Destination string; gathered bytes are appended.
-   * @return false when a column index is outside this group's schema.
+   * @return false when a column index is outside this group's schema; `out`
+   * may already hold the null-flags field and the columns before it.
    */
   bool GatherRowProjected(uint32_t slot, const uint32_t *columns,
                           size_t n_columns, std::string &out) const;
@@ -213,6 +212,10 @@ class PaxGroup {
   /**
    * @brief Returns a memory-safe view of one cell payload.
    *
+   * @details Verbatim bytes for an UNTYPED cell, little-endian binary for a
+   * typed one. This does not reformat a typed cell into row-format bytes;
+   * AppendCellField does.
+   *
    * @param field Field index, where 0 is the null-flags field and MySQL column
    * i is field i + 1.
    * @param slot Slot inside this group.
@@ -227,30 +230,14 @@ class PaxGroup {
         reinterpret_cast<const char *>(base) + kCellLenBytes, len);
   }
 
-  /**
-   * @brief Returns the first cell byte for `field` in this group.
-   *
-   * @param field Field index, starting with the null-flags field.
-   */
   const std::byte *strip(size_t field) const {
     return arena_.get() + strip_offset_[field];
   }
 
-  /**
-   * @brief Returns the byte stride between adjacent cells for `field`.
-   *
-   * @param field Field index, starting with the null-flags field.
-   */
   uint32_t stride(size_t field) const { return stride_[field]; }
 
-  /**
-   * @brief Returns the schema that defines this group's strip widths.
-   */
   const TableSchema &schema() const { return schema_; }
 
-  /**
-   * @brief Returns the PaxTable that owns this group.
-   */
   PaxTable *table() const { return table_; }
 
  private:
