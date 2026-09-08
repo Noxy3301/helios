@@ -189,12 +189,7 @@ ScanPaxResult ScanPax(TableDictionary &tables, std::shared_mutex &schema_mutex,
   auto append_pax_row = [&](std::string_view key, DataItem &item_ref) {
     // Observe the same stable unlocked TID that a materialized read would use.
     // The caller re-checks this TID after reading cells from the strip.
-    TransactionId tid;
-    for (;;) {
-      tid = item_ref.transaction_id.load();
-      if (!(tid.tid & 1u)) break;
-      _mm_pause();
-    }
+    const TransactionId tid = StableTid(item_ref);
 
     const size_t size = item_ref.buffer.size;
     if (size == 0) return false;

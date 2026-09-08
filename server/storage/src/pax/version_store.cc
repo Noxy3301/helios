@@ -41,8 +41,9 @@ void VersionStore::Capture(PaxGroup *group, uint32_t slot,
   if (active_captures_.load(std::memory_order_seq_cst) == 0) return;
 
   const uint64_t added = old_row.size() + sizeof(Entry);
-  if (captured_bytes_.fetch_add(added, std::memory_order_relaxed) + added >
-      kByteBudget) {
+  const uint64_t before =
+      captured_bytes_.fetch_add(added, std::memory_order_relaxed);
+  if (before + added > kByteBudget) {
     capture_failed_.store(true, std::memory_order_seq_cst);
     SPDLOG_WARN(
         "PAX version store byte budget exceeded; the capture failed and the "

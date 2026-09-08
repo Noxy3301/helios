@@ -137,8 +137,6 @@ struct DataBuffer {
     return *this;
   }
 
-  // NOTE: the allocation only grows; consider shrink-to-fit if large records
-  // cause bloat.
   void Reset(const std::byte *row, const size_t len) {
     if (is_pax()) {
       ResetPax(row, len);
@@ -148,11 +146,7 @@ struct DataBuffer {
       size = 0;
       return;
     }
-    if (capacity_or_slot < len) {
-      delete[] value;
-      value = new std::byte[len];
-      capacity_or_slot = len;
-    }
+    EnsureHeapCapacity(len);
     size = len;
     std::memcpy(value, row, len);
   }
@@ -182,6 +176,14 @@ struct DataBuffer {
   std::string toString() const;
 
  private:
+  // The heap allocation only grows: a shorter row reuses it.
+  void EnsureHeapCapacity(size_t len) {
+    if (capacity_or_slot >= len) return;
+    delete[] value;
+    value = new std::byte[len];
+    capacity_or_slot = len;
+  }
+
   /**
    * @brief Publishes the pre-install row image while a columnar read view
    * is active.

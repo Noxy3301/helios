@@ -22,10 +22,11 @@
 #ifndef HELIOS_STORAGE_SRC_INDEX_PRIMARY_INDEX_H
 #define HELIOS_STORAGE_SRC_INDEX_PRIMARY_INDEX_H
 
+#include <cassert>
 #include <functional>
-#include <memory>
-#include <string>
+#include <optional>
 #include <string_view>
+#include <utility>
 
 #include "index/data_item.h"
 #include "index/masstree_index.h"
@@ -42,21 +43,47 @@ class PrimaryIndex {
    */
   void SetPaxTable(pax::PaxTable *store) { index_.SetPaxTable(store); }
 
-  DataItem *Get(const std::string_view key);
-  DataItem *GetOrInsert(const std::string_view key);
-  void Put(const std::string_view key, DataItem &&value);
-  void ForEach(std::function<bool(std::string_view, DataItem &)> operation);
-  size_t Scan(const std::string_view begin,
-              const std::optional<std::string_view> end,
-              std::function<bool(std::string_view)> operation);
-  size_t Scan(const std::string_view begin, const std::string_view end,
-              std::function<bool(std::string_view, DataItem &)> operation);
-  size_t ScanReverse(const std::string_view begin,
-                     const std::optional<std::string_view> end,
-                     std::function<bool(std::string_view)> operation);
+  DataItem *Get(std::string_view key) { return index_.Get(key); }
+
+  DataItem *GetOrInsert(std::string_view key) {
+    auto *item = index_.Get(key);
+    if (item == nullptr) {
+      index_.PutBlank(key);
+      item = index_.Get(key);
+      assert(item != nullptr);
+    }
+    return item;
+  }
+
+  void Put(std::string_view key, DataItem &&value) {
+    index_.Put(key, std::move(value));
+  }
+
+  void ForEach(std::function<bool(std::string_view, DataItem &)> operation) {
+    index_.ForEach(std::move(operation));
+  }
+
+  size_t Scan(std::string_view begin, std::optional<std::string_view> end,
+              std::function<bool(std::string_view)> operation) {
+    return index_.Scan(begin, end, std::move(operation));
+  }
+
+  size_t Scan(std::string_view begin, std::string_view end,
+              std::function<bool(std::string_view, DataItem &)> operation) {
+    return index_.Scan(begin, end, std::move(operation));
+  }
+
+  size_t ScanReverse(std::string_view begin,
+                     std::optional<std::string_view> end,
+                     std::function<bool(std::string_view)> operation) {
+    return index_.ScanReverse(begin, end, std::move(operation));
+  }
+
   size_t ScanReverse(
-      const std::string_view begin, const std::string_view end,
-      std::function<bool(std::string_view, DataItem &)> operation);
+      std::string_view begin, std::string_view end,
+      std::function<bool(std::string_view, DataItem &)> operation) {
+    return index_.ScanReverse(begin, end, std::move(operation));
+  }
 
   bool Purge(std::string_view key, DataItem *expected,
              TransactionId retired_tid = {}) {

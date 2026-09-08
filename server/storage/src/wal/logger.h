@@ -70,7 +70,7 @@ class Logger {
     WriteSetType recovery_set;
   };
 
-  explicit Logger(const Config &, WalIo io = WalIo::Posix());
+  explicit Logger(const Config &config, WalIo io = WalIo::Posix());
   ~Logger();
 
   /**
@@ -168,6 +168,9 @@ class Logger {
   void SetFailStop();
 
  private:
+  // Reports a scan that failed and answers Recover with kFailed.
+  RecoveryResult FailRecovery(const WalScanResult &scan);
+
   void PublishDurable(EpochNumber frontier);
   void PublishFailure(int error_number);
   void PublishStopped();

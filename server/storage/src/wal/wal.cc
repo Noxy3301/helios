@@ -36,6 +36,14 @@ namespace wal {
 
 namespace {
 
+// Frame header fields, in bytes from the start of the frame. The magic word
+// opens it at offset 0.
+constexpr size_t kOffVersion = 4;
+constexpr size_t kOffFlags = 6;
+constexpr size_t kOffPayloadSize = 8;
+constexpr size_t kOffEpoch = 12;
+constexpr size_t kOffCrc = 16;
+
 // The header bytes the checksum covers: all of them but the checksum word,
 // which sits last.
 constexpr size_t kCrcCoverage = Wal::kHeaderSize - sizeof(uint32_t);
@@ -70,8 +78,8 @@ uint32_t GetLe32(const uint8_t *in) {
 bool IsTorn(const uint8_t *header) {
   uint8_t expected[8];
   PutLe32(expected, Wal::kMagic);
-  PutLe16(expected + 4, Wal::kVersion);
-  PutLe16(expected + 6, Wal::kFlags);
+  PutLe16(expected + kOffVersion, Wal::kVersion);
+  PutLe16(expected + kOffFlags, Wal::kFlags);
 
   size_t matched = 0;
   while (matched < sizeof(expected) && header[matched] == expected[matched]) {
@@ -347,11 +355,11 @@ Wal::Probe Wal::ProbeFrameAt(off_t offset, off_t file_size, uint64_t *io_budget,
   if (!PreadAll(header, kHeaderSize, offset, error)) return Probe::kIoError;
   *io_budget += kHeaderSize;
   if (GetLe32(header) != kMagic) return Probe::kNoFrame;
-  if (GetLe16(header + 4) != kVersion) return Probe::kNoFrame;
-  if (GetLe16(header + 6) != kFlags) return Probe::kNoFrame;
-  if (GetLe32(header + 12) == 0) return Probe::kNoFrame;
+  if (GetLe16(header + kOffVersion) != kVersion) return Probe::kNoFrame;
+  if (GetLe16(header + kOffFlags) != kFlags) return Probe::kNoFrame;
+  if (GetLe32(header + kOffEpoch) == 0) return Probe::kNoFrame;
 
-  const uint32_t payload_size = GetLe32(header + 8);
+  const uint32_t payload_size = GetLe32(header + kOffPayloadSize);
   if (payload_size == 0 || payload_size > kMaxPayloadSize) {
     return Probe::kNoFrame;
   }
@@ -519,10 +527,10 @@ bool Wal::HopCoveredFrames(EpochNumber min_epoch, off_t file_size,
     uint8_t header[kHeaderSize];
     if (!PreadAll(header, kHeaderSize, at, error)) return false;
     const uint32_t magic = GetLe32(header);
-    const uint16_t version = GetLe16(header + 4);
-    const uint16_t flags = GetLe16(header + 6);
-    const uint32_t payload_size = GetLe32(header + 8);
-    const EpochNumber epoch = GetLe32(header + 12);
+    const uint16_t version = GetLe16(header + kOffVersion);
+    const uint16_t flags = GetLe16(header + kOffFlags);
+    const uint32_t payload_size = GetLe32(header + kOffPayloadSize);
+    const EpochNumber epoch = GetLe32(header + kOffEpoch);
     if (magic != kMagic || version != kVersion || flags != kFlags ||
         payload_size > kMaxPayloadSize) {
       // Unwritten capacity's zeroes read exactly like a torn header; that is
@@ -655,10 +663,10 @@ WalScanResult Wal::ScanAndRepair(EpochNumber min_epoch) {
     }
 
     const uint32_t magic = GetLe32(header);
-    const uint16_t version = GetLe16(header + 4);
-    const uint16_t flags = GetLe16(header + 6);
-    const uint32_t payload_size = GetLe32(header + 8);
-    const EpochNumber epoch = GetLe32(header + 12);
+    const uint16_t version = GetLe16(header + kOffVersion);
+    const uint16_t flags = GetLe16(header + kOffFlags);
+    const uint32_t payload_size = GetLe32(header + kOffPayloadSize);
+    const EpochNumber epoch = GetLe32(header + kOffEpoch);
     const uint32_t stored_crc = GetLe32(header + kCrcCoverage);
 
     const char *header_anomaly = nullptr;
@@ -845,16 +853,16 @@ WalAppendResult Wal::AppendGroup(
     group.resize(frame_offset + kHeaderSize + payload.size());
     uint8_t *frame = group.data() + frame_offset;
     PutLe32(frame, kMagic);
-    PutLe16(frame + 4, kVersion);
-    PutLe16(frame + 6, kFlags);
-    PutLe32(frame + 8, static_cast<uint32_t>(payload.size()));
-    PutLe32(frame + 12, epoch);
+    PutLe16(frame + kOffVersion, kVersion);
+    PutLe16(frame + kOffFlags, kFlags);
+    PutLe32(frame + kOffPayloadSize, static_cast<uint32_t>(payload.size()));
+    PutLe32(frame + kOffEpoch, epoch);
     std::memcpy(frame + kHeaderSize, payload.data(), payload.size());
 
     Crc32c crc;
     crc.Update(frame, kCrcCoverage);
     crc.Update(payload.data(), payload.size());
-    PutLe32(frame + 16, crc.Finish());
+    PutLe32(frame + kOffCrc, crc.Finish());
   }
 
   if (traced) {

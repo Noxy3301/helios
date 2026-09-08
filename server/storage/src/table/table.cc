@@ -51,15 +51,16 @@ index::SecondaryIndex *Table::GetSecondaryIndex(
 
 index::SecondaryIndex *Table::GetOrCreateSecondaryIndex(
     const std::string_view index_name, const IndexConstraint index_type) {
+  const std::string name(index_name);
   std::unique_lock<std::shared_mutex> lk(table_lock_);
-  auto it = secondary_indices_.find(std::string(index_name));
+  auto it = secondary_indices_.find(name);
   if (it != secondary_indices_.end()) {
     const bool same = it->second->GetIndexType() == index_type;
     return same ? it->second.get() : nullptr;
   }
   auto new_index = std::make_unique<index::SecondaryIndex>(index_type);
   auto *created = new_index.get();
-  secondary_indices_[std::string(index_name)] = std::move(new_index);
+  secondary_indices_[name] = std::move(new_index);
   return created;
 }
 

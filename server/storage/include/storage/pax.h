@@ -218,13 +218,13 @@ class PaxGroup {
    * @param slot Slot inside this group.
    */
   std::string_view cell(size_t field, uint32_t slot) const {
-    const std::byte *cell = arena_.get() + strip_offset_[field] +
+    const std::byte *base = arena_.get() + strip_offset_[field] +
                             static_cast<size_t>(stride_[field]) * slot;
     uint16_t len;
-    std::memcpy(&len, cell, sizeof(len));
+    std::memcpy(&len, base, sizeof(len));
     if (len > schema_.field_max_bytes[field]) len = 0;
     return std::string_view(
-        reinterpret_cast<const char *>(cell) + kCellLenBytes, len);
+        reinterpret_cast<const char *>(base) + kCellLenBytes, len);
   }
 
   /**

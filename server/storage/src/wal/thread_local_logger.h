@@ -56,7 +56,8 @@ class ThreadLocalLogger final {
   using PublishFailure = std::function<void(int)>;
   using ReadDurable = std::function<EpochNumber()>;
 
-  ThreadLocalLogger(const Config &, PublishDurable, PublishFailure, ReadDurable,
+  ThreadLocalLogger(const Config &config, PublishDurable publish_durable,
+                    PublishFailure publish_failure, ReadDurable read_durable,
                     WalIo io = WalIo::Posix());
   ~ThreadLocalLogger();
 
@@ -65,7 +66,7 @@ class ThreadLocalLogger final {
    * @return Whether anything was buffered: a write set producing no
    * key-value pair has nothing to make durable.
    */
-  bool Enqueue(const WriteSetType &ws_ref, EpochNumber epoch);
+  bool Enqueue(const WriteSetType &ws, EpochNumber epoch);
 
   /**
    * @brief Reads and repairs the log. Completes before the flusher starts.
@@ -75,7 +76,7 @@ class ThreadLocalLogger final {
   /**
    * @brief The epoch of the last frame actually written to the log.
    */
-  EpochNumber WalFrontier() const;
+  EpochNumber GetWalFrontier() const;
 
   /**
    * @brief Starts the flusher. Called once, after the log has been scanned.
@@ -108,6 +109,11 @@ class ThreadLocalLogger final {
   };
 
   void FlusherLoop();
+
+  // Whether a closed epoch is still waiting for the device. Called with
+  // state_mutex_ held.
+  bool ClosedAheadOfDurable() const { return closed_ > read_durable_(); }
+
   /**
    * @brief Swaps every node's buffer, buckets by epoch, writes buckets at or
    *        below `target`.

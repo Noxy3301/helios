@@ -7,11 +7,11 @@
 #ifndef HELIOS_STORAGE_SRC_INDEX_SECONDARY_INDEX_H
 #define HELIOS_STORAGE_SRC_INDEX_SECONDARY_INDEX_H
 
+#include <cassert>
 #include <string_view>
 #include <utility>
 
 #include "index/masstree_index.h"
-#include "silo/stable_read.h"
 #include "storage/index.h"
 
 namespace helios::storage {
@@ -27,18 +27,6 @@ class SecondaryIndex {
   DataItem *GetOrInsert(std::string_view key) {
     auto *item = index_.Get(key);
     if (item == nullptr) {
-      index_.PutBlank(key);
-      item = index_.Get(key);
-      assert(item != nullptr);
-    }
-    return item;
-  }
-
-  DataItem *GetOrInsertIfNoLiveKeys(std::string_view key) {
-    // OCC guards existing entries. A key whose slot carries no live PK list
-    // still needs a blank entry the write can fill in.
-    auto *item = index_.Get(key);
-    if (item == nullptr || !silo::StableReadKeys(*item).found) {
       index_.PutBlank(key);
       item = index_.Get(key);
       assert(item != nullptr);
@@ -66,7 +54,7 @@ class SecondaryIndex {
     index_.ForEach(f);
   }
 
-  void Put(const std::string_view key, DataItem &&value) {
+  void Put(std::string_view key, DataItem &&value) {
     index_.Put(key, std::move(value));
   }
 

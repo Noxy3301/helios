@@ -12,6 +12,7 @@
 #include "index/masstree_index.h"
 #include "index/primary_index.h"
 #include "index/secondary_index.h"
+#include "silo/stable_read.h"
 
 namespace helios::storage {
 namespace index {
@@ -26,7 +27,7 @@ void Reaper::Enqueue(PrimaryIndex *primary_index,
   tombstone.item = item;
   tombstone.delete_commit_tid = delete_commit_tid;
 
-  std::lock_guard<std::mutex> lk(mtx_);
+  std::lock_guard<std::mutex> lk(mutex_);
   tombstones_.emplace_back(std::move(tombstone));
 }
 
@@ -49,7 +50,7 @@ bool Reaper::Purge(const Tombstone &tombstone, TransactionId retired_tid) {
 void Reaper::Reap(EpochNumber published_epoch) {
   std::vector<Tombstone> ready;
   {
-    std::lock_guard<std::mutex> lk(mtx_);
+    std::lock_guard<std::mutex> lk(mutex_);
     std::vector<Tombstone> pending;
     pending.reserve(tombstones_.size());
     for (auto &tombstone : tombstones_) {
@@ -75,16 +76,17 @@ void Reaper::Reap(EpochNumber published_epoch) {
     if (item != tombstone.item) continue;
 
     TransactionId observed = item->transaction_id.load();
-    if (observed.tid & 1u) {
+    if (observed.tid & silo::kLockBit) {
       requeue.emplace_back(std::move(tombstone));
       continue;
     }
     if (observed != tombstone.delete_commit_tid) continue;
 
     TransactionId locked = observed;
-    locked.tid |= 1u;
+    locked.tid |= silo::kLockBit;
     if (!item->transaction_id.compare_exchange_strong(observed, locked)) {
-      if (observed.tid & 1u) requeue.emplace_back(std::move(tombstone));
+      if (observed.tid & silo::kLockBit)
+        requeue.emplace_back(std::move(tombstone));
       continue;
     }
 
@@ -109,12 +111,12 @@ void Reaper::Reap(EpochNumber published_epoch) {
     }
 
     TransactionId retired = tombstone.delete_commit_tid;
-    retired.tid = (retired.tid + 2u) & ~1u;
+    retired.tid = (retired.tid + 2u) & ~silo::kLockBit;
     if (!Purge(tombstone, retired)) unlock();
   }
 
   {
-    std::lock_guard<std::mutex> lk(mtx_);
+    std::lock_guard<std::mutex> lk(mutex_);
     tombstones_.insert(tombstones_.end(),
                        std::make_move_iterator(requeue.begin()),
                        std::make_move_iterator(requeue.end()));

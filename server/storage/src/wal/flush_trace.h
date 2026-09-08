@@ -227,10 +227,10 @@ class FlushTrace {
     Slot &slot = slots_[slot_index];
     const uint64_t index = slot.count.load(std::memory_order_relaxed);
     if (index < kCommitCapacity) {
+      const uint64_t seq = slot.next_seq++;
       slot.rows[index] = CommitRow{
-          slot_index,     slot.next_seq++,
-          required_epoch, enter,
-          exit,           static_cast<uint8_t>(not_durable_at_enter ? 1 : 0)};
+          slot_index, seq,  required_epoch,
+          enter,      exit, static_cast<uint8_t>(not_durable_at_enter ? 1 : 0)};
       slot.count.store(index + 1, std::memory_order_release);
     } else {
       slot.drops.fetch_add(1, std::memory_order_relaxed);

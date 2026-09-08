@@ -87,7 +87,7 @@ struct PackedPrimaryKeys {
       const Record record = Record::Unpack(cursor, src_end);
       const std::string_view value(record.value, record.length);
       if (value == key) return keys;
-      if (!(value < key)) {
+      if (key < value) {
         insert_pos = record.start;
         break;
       }
@@ -159,7 +159,7 @@ struct PackedPrimaryKeys {
         assert(out == next->MutableRecords() + next->bytes);
         return next;
       }
-      if (!(value < key)) return keys;
+      if (key < value) return keys;
       cursor = record.next;
     }
 

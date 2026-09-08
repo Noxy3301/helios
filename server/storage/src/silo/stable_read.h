@@ -38,17 +38,27 @@ struct StablePrimaryKeys {
   }
 };
 
+// Bit 0 of a transaction id: set while a committer holds the row.
+inline constexpr uint32_t kLockBit = 1u;
+
+/**
+ * @brief Reads the transaction id once no committer holds the row (Silo's
+ * stable version): spins while the lock bit is set.
+ */
+inline TransactionId StableTid(const DataItem &item) {
+  for (;;) {
+    const TransactionId tid = item.transaction_id.load();
+    if (!(tid.tid & kLockBit)) return tid;
+    _mm_pause();
+  }
+}
+
 /**
  * @brief Stable read of a base row's liveness, without copying its payload.
  */
 inline bool StableLive(const DataItem &item) {
   for (;;) {
-    TransactionId tid = item.transaction_id.load();
-    if (tid.tid & 1u) {
-      _mm_pause();
-      continue;
-    }
-
+    const TransactionId tid = StableTid(item);
     const bool live = item.HasRow();
     if (item.transaction_id.load() == tid) return live;
   }
@@ -61,12 +71,7 @@ inline bool StableLive(const DataItem &item) {
  */
 inline StableValue StableReadValue(const DataItem &item) {
   for (;;) {
-    TransactionId tid = item.transaction_id.load();
-    if (tid.tid & 1u) {
-      _mm_pause();
-      continue;
-    }
-
+    const TransactionId tid = StableTid(item);
     const bool found = item.HasRow();
     std::string value;
     if (found) {
@@ -103,12 +108,7 @@ inline StableValue StableReadValueMasked(const DataItem &item,
                                          const uint32_t *columns,
                                          size_t n_columns) {
   for (;;) {
-    TransactionId tid = item.transaction_id.load();
-    if (tid.tid & 1u) {
-      _mm_pause();
-      continue;
-    }
-
+    const TransactionId tid = StableTid(item);
     const bool found = item.HasRow();
     std::string value;
     if (found) {
@@ -134,12 +134,7 @@ inline StableValue StableReadValueMasked(const DataItem &item,
  */
 inline StablePrimaryKeys StableReadKeys(const DataItem &item) {
   for (;;) {
-    TransactionId tid = item.transaction_id.load();
-    if (tid.tid & 1u) {
-      _mm_pause();
-      continue;
-    }
-
+    const TransactionId tid = StableTid(item);
     auto primary_keys = std::atomic_load(&item.primary_keys_);
     const bool found = primary_keys && primary_keys->count != 0;
 

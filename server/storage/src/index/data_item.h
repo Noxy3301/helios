@@ -31,7 +31,6 @@
 #include <cstring>
 #include <memory>
 #include <string>
-#include <type_traits>
 #include <vector>
 
 #include "index/data_buffer.h"
@@ -112,13 +111,13 @@ struct DataItem {
     return *this;
   }
 
-  void Reset(const std::byte *v, const size_t s, TransactionId tid = {}) {
-    buffer.Reset(v, s);
+  void Reset(const std::byte *row, size_t len, TransactionId tid = {}) {
+    buffer.Reset(row, len);
     if (!tid.IsEmpty()) transaction_id.store(tid);
   }
 
-  void InsertPrimaryKey(const std::byte *v, size_t s) {
-    const std::string_view new_key(reinterpret_cast<const char *>(v), s);
+  void InsertPrimaryKey(const std::byte *key, size_t len) {
+    const std::string_view new_key(reinterpret_cast<const char *>(key), len);
     auto current = std::atomic_load(&primary_keys_);
     auto next = PackedPrimaryKeys::Insert(current, new_key);
     if (next != current) {
@@ -126,8 +125,8 @@ struct DataItem {
     }
   }
 
-  void DeletePrimaryKey(const std::byte *v, size_t s) {
-    std::string_view target(reinterpret_cast<const char *>(v), s);
+  void DeletePrimaryKey(const std::byte *key, size_t len) {
+    std::string_view target(reinterpret_cast<const char *>(key), len);
     auto current = std::atomic_load(&primary_keys_);
     auto next = PackedPrimaryKeys::Delete(current, target);
     if (next != current) {
@@ -145,7 +144,6 @@ struct DataItem {
   }
 };
 
-static_assert(sizeof(DataItem) == 48,
-              "DataItem must remain 48 bytes in the slim layout");
+static_assert(sizeof(DataItem) == 48, "DataItem must remain 48 bytes");
 }  // namespace helios::storage
 #endif  // HELIOS_STORAGE_SRC_INDEX_DATA_ITEM_H

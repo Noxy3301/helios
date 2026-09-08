@@ -47,7 +47,7 @@ class TableDictionary {
    * @return false when a table of that name already exists.
    */
   bool CreateTable(std::string_view table_name) {
-    std::lock_guard<std::mutex> lk(create_mtx_);
+    std::lock_guard<std::mutex> lk(create_mutex_);
     if (Find(table_name) != nullptr) return false;
     auto *node = new Node(table_name, head_.load(std::memory_order_relaxed));
     head_.store(node, std::memory_order_release);
@@ -57,7 +57,7 @@ class TableDictionary {
   /**
    * @brief Returns the table of that name, or nullptr.
    */
-  Table *GetTable(const std::string_view table_name) const {
+  Table *GetTable(std::string_view table_name) const {
     Node *node = Find(table_name);
     if (node == nullptr) return nullptr;
     return &node->table;
@@ -76,7 +76,8 @@ class TableDictionary {
     Table table;
     Node *next;
 
-    Node(std::string_view n, Node *next) : name(n), table(n), next(next) {}
+    Node(std::string_view table_name, Node *next)
+        : name(table_name), table(table_name), next(next) {}
   };
 
   Node *Find(std::string_view table_name) const {
@@ -88,7 +89,7 @@ class TableDictionary {
   }
 
   std::atomic<Node *> head_{nullptr};
-  std::mutex create_mtx_;
+  std::mutex create_mutex_;
 };
 
 }  // namespace helios::storage

@@ -23,6 +23,7 @@
 #include "index/secondary_index.h"
 #include "pax/version_store.h"
 #include "silo/packed_transaction_id.h"
+#include "silo/stable_read.h"
 #include "table/table.h"
 #include "table/table_dictionary.h"
 #include "util/debug_sync.h"
@@ -117,7 +118,7 @@ struct CommitCtx {
     if (abort_reason != nullptr) *abort_reason = reason;
     for (auto &entry : locked) {
       TransactionId current = entry.item->transaction_id.load();
-      if (current.tid & 1u) {
+      if (current.tid & kLockBit) {
         current.tid--;
         entry.item->transaction_id.store(current);
       }
@@ -140,7 +141,7 @@ struct CommitCtx {
   // edges validators introduce.
   bool LockedByOther(DataItem *item) const {
     TransactionId tid = item->transaction_id.load();
-    if (!(tid.tid & 1u)) return false;
+    if (!(tid.tid & kLockBit)) return false;
     return !IsOwnLocked(item);
   }
 };
@@ -232,13 +233,9 @@ bool Resolve(CommitCtx &ctx, std::shared_mutex &schema_mutex) {
       }
     }
 
-    DataItem *item = nullptr;
-    if (op.is_delete) {
-      item = index->GetOrInsert(op.secondary_key);
-    } else {
-      item = index->GetOrInsertIfNoLiveKeys(op.secondary_key);
-    }
-    assert(item != nullptr);  // both paths materialize a blank slot
+    // Locking needs a slot, so an entry whose secondary key has none seeds a
+    // blank one here.
+    DataItem *item = index->GetOrInsert(op.secondary_key);
 
     ctx.si_ops.push_back({op.table_name, op.index_name, op.secondary_key,
                           op.primary_key, op.is_delete, item, index,
@@ -279,12 +276,12 @@ bool Lock(CommitCtx &ctx) {
   for (auto *item : ctx.items) {
     for (;;) {
       TransactionId current = item->transaction_id.load();
-      if (current.tid & 1u) {
+      if (current.tid & kLockBit) {
         _mm_pause();
         continue;
       }
       TransactionId locked = current;
-      locked.tid |= 1u;
+      locked.tid |= kLockBit;
       if (item->transaction_id.compare_exchange_weak(current, locked)) {
         ctx.locked.push_back({item, current, locked});
         if (!attached(item)) {
@@ -439,7 +436,7 @@ bool ReplayIndexRange(CommitCtx &ctx, const ExternalRangeReadEntry &range) {
     // the staging scan. A committer publishes a new list under its lock;
     // the TID stays constant while own-locked, so re-check after loading.
     const TransactionId observed = item->transaction_id.load();
-    if ((observed.tid & 1u) && !ctx.IsOwnLocked(item)) {
+    if ((observed.tid & kLockBit) && !ctx.IsOwnLocked(item)) {
       aborted = true;
       return true;
     }
@@ -667,9 +664,8 @@ void Publish(CommitCtx &ctx, index::Reaper &reaper, WriteSetType &log_set) {
  *
  * @return true when the caller must wait for the device.
  */
-bool NeedsDurabilityWait(wal::Logger &logger, WriteSetType &log_set,
-                         EpochNumber commit_epoch,
-                         CommitDurability durability) {
+bool EnqueueLogSet(wal::Logger &logger, WriteSetType &log_set,
+                   EpochNumber commit_epoch, CommitDurability durability) {
   if (log_set.empty()) return false;
   return logger.Enqueue(log_set, commit_epoch) &&
          durability == CommitDurability::kSync;
@@ -728,7 +724,7 @@ bool Commit(TableDictionary &tables, std::shared_mutex &schema_mutex,
   WriteSetType log_set = BuildLog(ctx);
   Publish(ctx, reaper, log_set);
   const bool awaits_durability =
-      NeedsDurabilityWait(logger, log_set, ctx.commit_epoch, durability);
+      EnqueueLogSet(logger, log_set, ctx.commit_epoch, durability);
 
   HELIOS_DEBUG_SYNC("silo_commit.before_offline");
   epoch_framework.Leave();

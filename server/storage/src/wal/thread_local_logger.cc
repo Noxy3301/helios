@@ -49,11 +49,11 @@ ThreadLocalLogger::ThreadLocalLogger(const Config &config,
 
 ThreadLocalLogger::~ThreadLocalLogger() { StopFlusher(); }
 
-bool ThreadLocalLogger::Enqueue(const WriteSetType &ws_ref, EpochNumber epoch) {
+bool ThreadLocalLogger::Enqueue(const WriteSetType &ws, EpochNumber epoch) {
   LogRecord record;
   record.epoch = epoch;
 
-  for (auto &snapshot : ws_ref) {
+  for (auto &snapshot : ws) {
     if (snapshot.index_name.empty()) {
       LogRecord::Write write;
       write.key = snapshot.key;
@@ -98,7 +98,9 @@ WalScanResult ThreadLocalLogger::ScanAndRepair(EpochNumber min_epoch) {
   return wal_.ScanAndRepair(min_epoch);
 }
 
-EpochNumber ThreadLocalLogger::WalFrontier() const { return wal_.frontier(); }
+EpochNumber ThreadLocalLogger::GetWalFrontier() const {
+  return wal_.frontier();
+}
 
 void ThreadLocalLogger::StartFlusher() {
   assert(!flusher_.joinable());
@@ -123,7 +125,7 @@ void ThreadLocalLogger::ScheduleFlush(EpochNumber closed) {
 
 bool ThreadLocalLogger::IsQuiescent() {
   std::lock_guard<std::mutex> lock(state_mutex_);
-  return failed_ || closed_ <= read_durable_();
+  return failed_ || !ClosedAheadOfDurable();
 }
 
 void ThreadLocalLogger::StopFlusher() {
@@ -141,11 +143,11 @@ void ThreadLocalLogger::FlusherLoop() {
     {
       std::unique_lock<std::mutex> lock(state_mutex_);
       work_cv_.wait(lock, [this] {
-        return stop_requested_ || failed_ || closed_ > read_durable_();
+        return stop_requested_ || failed_ || ClosedAheadOfDurable();
       });
       if (failed_) return;
       target = closed_;
-      const bool nothing_to_do = target <= read_durable_();
+      const bool nothing_to_do = !ClosedAheadOfDurable();
       // Stop only once everything already closed is on the device, so a clean
       // shutdown does not drop records the tick had handed over.
       if (stop_requested_ && nothing_to_do) return;

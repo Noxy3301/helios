@@ -150,7 +150,7 @@ class Framework {
     for (;;) {
       auto current_epoch = global_epoch_.load();
       {
-        std::unique_lock<std::mutex> lk(epoch_mtx_);
+        std::unique_lock<std::mutex> lk(epoch_mutex_);
         epoch_cv_.wait(lk, [&] {
           return stop_.load() || (global_epoch_.load() != current_epoch);
         });
@@ -179,7 +179,7 @@ class Framework {
   void RequestEpochAdvance() {
     if (global_epoch_.load() >= kEpochHighWater) return;
     {
-      std::lock_guard<std::mutex> lk(epoch_mtx_);
+      std::lock_guard<std::mutex> lk(epoch_mutex_);
       advance_requested_.store(true);
     }
     worker_cv_.notify_one();
@@ -200,7 +200,7 @@ class Framework {
     assert(ThreadEpoch() == kThreadOffline);
     if (global_epoch_.load() >= target) return true;
     if (target > kEpochHighWater) return false;
-    std::unique_lock<std::mutex> lk(epoch_mtx_);
+    std::unique_lock<std::mutex> lk(epoch_mutex_);
     for (;;) {
       if (global_epoch_.load() >= target) return true;
       if (stop_.load()) return false;
@@ -214,14 +214,14 @@ class Framework {
 
   void Start() {
     {
-      std::lock_guard<std::mutex> lk(epoch_mtx_);
+      std::lock_guard<std::mutex> lk(epoch_mutex_);
       start_.store(true);
     }
     epoch_cv_.notify_all();
   }
   void Stop() {
     {
-      std::lock_guard<std::mutex> lk(epoch_mtx_);
+      std::lock_guard<std::mutex> lk(epoch_mutex_);
       stop_.store(true);
     }
     epoch_cv_.notify_all();
@@ -259,7 +259,7 @@ class Framework {
         std::chrono::duration_cast<std::chrono::nanoseconds>(
             std::chrono::milliseconds(epoch_duration_ms));
     {
-      std::unique_lock<std::mutex> lk(epoch_mtx_);
+      std::unique_lock<std::mutex> lk(epoch_mutex_);
       epoch_cv_.wait(lk, [&] { return start_.load(); });
     }
 
@@ -272,7 +272,7 @@ class Framework {
       } else {
         // Forced requests wake the writer early; the advance condition
         // below still gates
-        std::unique_lock<std::mutex> lk(epoch_mtx_);
+        std::unique_lock<std::mutex> lk(epoch_mutex_);
         forced_wake = worker_cv_.wait_for(lk, epoch_duration, [&] {
           return advance_requested_.load() || stop_.load();
         });
@@ -298,9 +298,9 @@ class Framework {
           std::abort();
         }
         {
-          // fetch_add is atomic, but epoch_mtx_ is held here so that
+          // fetch_add is atomic, but epoch_mutex_ is held here so that
           // Sync()'s cv.wait cannot miss the notify_all that follows.
-          std::lock_guard<std::mutex> lk(epoch_mtx_);
+          std::lock_guard<std::mutex> lk(epoch_mutex_);
           global_epoch_.fetch_add(1);
         }
         EpochNumber updated = global_epoch_.load();
@@ -315,7 +315,7 @@ class Framework {
   std::atomic<bool> stop_;
   std::atomic<bool> advance_requested_{false};
   std::atomic<EpochNumber> global_epoch_;
-  std::mutex epoch_mtx_;
+  std::mutex epoch_mutex_;
   std::condition_variable epoch_cv_;
   std::condition_variable worker_cv_;
   const std::function<void(EpochNumber)> epoch_hook_;

@@ -276,6 +276,17 @@ bool Logger::Enqueue(const WriteSetType &ws, EpochNumber epoch) {
   return thread_local_logger_->Enqueue(ws, epoch);
 }
 
+Logger::RecoveryResult Logger::FailRecovery(const WalScanResult &scan) {
+  SPDLOG_CRITICAL(
+      "Durability Error: {0} ({1}), errno {2}", scan.detail,
+      scan.status == WalScanResult::Status::kCorrupt ? "corrupt" : "I/O error",
+      scan.error_number);
+  PublishFailure(scan.error_number != 0 ? scan.error_number : EIO);
+  RecoveryResult result;
+  result.status = RecoveryStatus::kFailed;
+  return result;
+}
+
 Logger::RecoveryResult Logger::Recover() {
   // Only a replay reads the image. A startup that scans the log without
   // replaying it does so to find the end of the log, which the image says
@@ -296,16 +307,7 @@ Logger::RecoveryResult Logger::Recover() {
 
   auto scan = thread_local_logger_->ScanAndRepair(image.cut_epoch);
   RecoveryResult result;
-  if (scan.status != WalScanResult::Status::kOk) {
-    SPDLOG_CRITICAL("Durability Error: {0} ({1}), errno {2}", scan.detail,
-                    scan.status == WalScanResult::Status::kCorrupt
-                        ? "corrupt"
-                        : "I/O error",
-                    scan.error_number);
-    PublishFailure(scan.error_number != 0 ? scan.error_number : EIO);
-    result.status = RecoveryStatus::kFailed;
-    return result;
-  }
+  if (scan.status != WalScanResult::Status::kOk) return FailRecovery(scan);
 
   if (image.status == EpochScanCheckpoint::Image::Status::kOk) {
     // An image is honoured only when the log is at least as durable now as it
@@ -319,16 +321,7 @@ Logger::RecoveryResult Logger::Recover() {
           image.wal_frontier_at_publish, scan.frontier);
       image.records.clear();
       scan = thread_local_logger_->ScanAndRepair(0);
-      if (scan.status != WalScanResult::Status::kOk) {
-        SPDLOG_CRITICAL("Durability Error: {0} ({1}), errno {2}", scan.detail,
-                        scan.status == WalScanResult::Status::kCorrupt
-                            ? "corrupt"
-                            : "I/O error",
-                        scan.error_number);
-        PublishFailure(scan.error_number != 0 ? scan.error_number : EIO);
-        result.status = RecoveryStatus::kFailed;
-        return result;
-      }
+      if (scan.status != WalScanResult::Status::kOk) return FailRecovery(scan);
     } else {
       SPDLOG_INFO(
           "Recovering from the checkpoint image of epoch {0}: {1} frames of "
@@ -350,7 +343,7 @@ void Logger::ScheduleFlush(EpochNumber closed) {
 }
 
 EpochNumber Logger::GetWalFrontier() const {
-  return thread_local_logger_->WalFrontier();
+  return thread_local_logger_->GetWalFrontier();
 }
 
 bool Logger::IsQuiescent() { return thread_local_logger_->IsQuiescent(); }
@@ -379,25 +372,25 @@ void Logger::PublishDurable(EpochNumber frontier) {
 }
 
 void Logger::PublishFailure(int error_number) {
-  bool fail_stop = false;
+  bool abort_process = false;
   {
     std::lock_guard<std::mutex> lock(durability_mutex_);
-    fail_stop = process_fail_stop_;
+    abort_process = process_fail_stop_;
+    const bool first_failure = state_ != State::kFailed;
     // A repeated failure has nothing new to publish, but arming still turns
     // it into an abort: a failure that predates the arming must not exempt
     // the process afterwards.
-    if (state_ != State::kFailed) {
+    if (!first_failure && !abort_process) return;
+    if (first_failure) {
       state_ = State::kFailed;
       SPDLOG_CRITICAL(
           "Durability Error: the log cannot be written (errno {0}); no "
           "further commit is acknowledged as durable",
           error_number);
-    } else if (!fail_stop) {
-      return;
     }
   }
   durability_cv_.notify_all();
-  if (fail_stop) std::abort();
+  if (abort_process) std::abort();
 }
 
 void Logger::SetFailStop() {

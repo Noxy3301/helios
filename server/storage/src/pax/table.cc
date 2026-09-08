@@ -65,7 +65,7 @@ inline bool ParseDecScaled(const char *s, size_t len, int scale, int64_t *out) {
   } else if (s[0] == '+') {
     i = 1;
   }
-  __int128 m = 0;
+  __int128 mant = 0;
   int frac_digits = 0;
   bool seen_dot = false, any = false;
   for (; i < len; i++) {
@@ -76,7 +76,7 @@ inline bool ParseDecScaled(const char *s, size_t len, int scale, int64_t *out) {
       continue;
     }
     if (c < '0' || c > '9') return false;
-    m = m * 10 + (c - '0');
+    mant = mant * 10 + (c - '0');
     if (seen_dot) frac_digits++;
     any = true;
   }
@@ -85,12 +85,12 @@ inline bool ParseDecScaled(const char *s, size_t len, int scale, int64_t *out) {
   // digits, fewer are padded, and more are refused rather than rounded.
   if (frac_digits > scale) return false;
   while (frac_digits < scale) {
-    m *= 10;
+    mant *= 10;
     frac_digits++;
   }
-  if (neg) m = -m;
-  if (m > INT64_MAX || m < INT64_MIN) return false;
-  *out = static_cast<int64_t>(m);
+  if (neg) mant = -mant;
+  if (mant > INT64_MAX || mant < INT64_MIN) return false;
+  *out = static_cast<int64_t>(mant);
   return true;
 }
 
@@ -168,17 +168,17 @@ void FormatTyped(FieldKind kind, int scale, const std::byte *cell,
       break;
     }
     case FK_DEC64: {
-      int64_t m;
-      std::memcpy(&m, cell, 8);
-      const bool neg = m < 0;
-      __int128 mm = neg ? -static_cast<__int128>(m) : m;
+      int64_t mant;
+      std::memcpy(&mant, cell, 8);
+      const bool neg = mant < 0;
+      __int128 rest = neg ? -static_cast<__int128>(mant) : mant;
       std::string digits;
-      if (mm == 0) {
+      if (rest == 0) {
         digits = "0";
       } else {
-        while (mm) {
-          digits.push_back(static_cast<char>('0' + int(mm % 10)));
-          mm /= 10;
+        while (rest) {
+          digits.push_back(static_cast<char>('0' + int(rest % 10)));
+          rest /= 10;
         }
         std::reverse(digits.begin(), digits.end());
       }
@@ -461,12 +461,6 @@ std::pair<PaxGroup *, uint32_t> PaxTable::AllocateSlot() {
   }
   return {grp, static_cast<uint32_t>(idx % PaxGroup::kRows)};
 }
-
-}  // namespace pax
-}  // namespace helios::storage
-
-namespace helios::storage {
-namespace pax {
 
 const TableSchema &Schema(const PaxTable *store) { return store->schema(); }
 

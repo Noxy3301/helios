@@ -171,7 +171,7 @@ EpochNumber Database::Impl::ResumeEpochAbove(EpochNumber frontier) {
 Database::Impl::Impl(const Config &config)
     : config_(config),
       logger_(config_),
-      epoch_framework_(config_.epoch_duration_ms, EpochHook()),
+      epoch_framework_(config_.epoch_duration_ms, MakeEpochHook()),
       scan_checkpoint_(config_, table_dictionary_, epoch_framework_, logger_) {
   if (Database::Impl::instance_ == nullptr) {
     Database::Impl::instance_ = this;
@@ -238,7 +238,7 @@ Database::Impl::~Impl() {
 
 const Config &Database::Impl::GetConfig() const { return config_; }
 
-std::function<void(EpochNumber)> Database::Impl::EpochHook() {
+std::function<void(EpochNumber)> Database::Impl::MakeEpochHook() {
   return [&](EpochNumber updated_epoch) {
     // Logging. The global epoch advances from U-1 to U while threads may
     // still be online in U-1, so U-2 is the newest epoch that is certainly
@@ -364,46 +364,43 @@ void Database::Impl::Recover() {
   epoch_framework_.Join();
   epoch_framework_.SetThreadEpoch(durable_epoch);
 
-  auto &&recovery_sets = std::move(recovered.recovery_set);
-
-  for (auto &recovery_set : recovery_sets) {
+  for (auto &entry : recovered.recovery_set) {
     // Skip deleted entries.
-    const bool live = recovery_set.index_name.empty()
-                          ? recovery_set.data_item_copy.HasRow()
-                          : recovery_set.data_item_copy.IsInitialized();
+    const bool live = entry.index_name.empty()
+                          ? entry.data_item_copy.HasRow()
+                          : entry.data_item_copy.IsInitialized();
     if (!live) continue;
-    CreateTable(recovery_set.table_name);
-    auto table = GetTable(recovery_set.table_name);
+    CreateTable(entry.table_name);
+    auto table = GetTable(entry.table_name);
     if (table == nullptr) {
       SPDLOG_CRITICAL(
           "Recovery failed: Table {0} could not be found or created.",
-          recovery_set.table_name);
+          entry.table_name);
       exit(EXIT_FAILURE);
     }
 
-    highest_epoch = std::max(
-        highest_epoch, recovery_set.data_item_copy.transaction_id.load().epoch);
+    highest_epoch = std::max(highest_epoch,
+                             entry.data_item_copy.transaction_id.load().epoch);
 
-    if (recovery_set.index_name.empty()) {
+    if (entry.index_name.empty()) {
       // Primary Index recovery
-      table->GetPrimaryIndex().Put(recovery_set.key,
-                                   std::move(recovery_set.data_item_copy));
+      table->GetPrimaryIndex().Put(entry.key, std::move(entry.data_item_copy));
     } else {
       // Secondary Index recovery
-      index::SecondaryIndex *idx = table->GetOrCreateSecondaryIndex(
-          recovery_set.index_name, recovery_set.index_type);
+      index::SecondaryIndex *idx =
+          table->GetOrCreateSecondaryIndex(entry.index_name, entry.index_type);
       if (idx != nullptr) {
         SPDLOG_DEBUG(
             "  Recovery: Secondary index '{0}' restoring key '{1}' with {2} "
             "primary keys",
-            recovery_set.index_name, recovery_set.key,
-            recovery_set.data_item_copy.primary_keys_view().size());
-        idx->Put(recovery_set.key, std::move(recovery_set.data_item_copy));
+            entry.index_name, entry.key,
+            entry.data_item_copy.primary_keys_view().size());
+        idx->Put(entry.key, std::move(entry.data_item_copy));
       } else {
         SPDLOG_CRITICAL(
-            "Recovery failed: the log declares secondary index {0} of table "
-            "{1} with two different constraints",
-            recovery_set.index_name, recovery_set.table_name);
+            "Recovery failed: secondary index {0} of table {1} is declared "
+            "with a different constraint than the record restores",
+            entry.index_name, entry.table_name);
         exit(EXIT_FAILURE);
       }
     }

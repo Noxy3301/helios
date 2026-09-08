@@ -37,11 +37,7 @@ void DataBuffer::Reset(const DataBuffer &rhs) {
     return;
   }
   // Gather straight into the heap array for a transaction-local snapshot.
-  if (capacity_or_slot < rhs.size) {
-    delete[] value;
-    value = new std::byte[rhs.size];
-    capacity_or_slot = rhs.size;
-  }
+  EnsureHeapCapacity(rhs.size);
   size = rhs.GatherInto(value);
 }
 

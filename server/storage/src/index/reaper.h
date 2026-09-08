@@ -94,7 +94,7 @@ class Reaper {
   bool Purge(const Tombstone &tombstone, TransactionId retired_tid);
 
   // Guards the queue: Enqueue runs on committers, Reap on the epoch thread.
-  std::mutex mtx_;
+  std::mutex mutex_;
   std::vector<Tombstone> tombstones_;
 };
 

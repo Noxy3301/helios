@@ -167,7 +167,7 @@ class Database::Impl {
       2;
 
   // Called by a thread the epoch framework owns.
-  std::function<void(EpochNumber)> EpochHook();
+  std::function<void(EpochNumber)> MakeEpochHook();
 
   void Recover();
 
