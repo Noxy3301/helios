@@ -1,6 +1,6 @@
 /**
  * @file server/storage/tests/pax_table_test.cc
- * Typed PAX cells whose declared width does not match their kind.
+ * Typed PAX cells whose declared width does not match their type.
  */
 
 #include <string>
@@ -13,8 +13,7 @@
 
 namespace {
 
-using helios::storage::pax::FK_INT32;
-using helios::storage::pax::FK_UNTYPED;
+using helios::storage::pax::FieldType;
 using helios::storage::pax::PaxGroup;
 using helios::storage::pax::TableSchema;
 
@@ -54,20 +53,21 @@ std::string Gather(const PaxGroup &group, uint32_t slot, size_t expected_size) {
 }
 
 TableSchema MakeSchema(std::vector<uint32_t> widths,
-                       std::vector<uint8_t> kinds) {
+                       std::vector<FieldType> types) {
   TableSchema schema;
   schema.table_name = "t";
   schema.field_max_bytes = std::move(widths);
-  schema.field_kind = std::move(kinds);
-  schema.field_scale.assign(schema.field_kind.size(), 0);
+  schema.field_type = std::move(types);
+  schema.field_scale.assign(schema.field_type.size(), 0);
   return schema;
 }
 
-// A kind whose declared width is not the width that kind stores would be
+// A type whose declared width is not the width that type stores would be
 // gathered by reading past the cell, into the next slot's length prefix.
 TEST(PaxTableTest, TooNarrowTypedFieldStaysVerbatim) {
-  const TableSchema schema = MakeSchema({1, 2}, {FK_UNTYPED, FK_INT32});
-  EXPECT_EQ(schema.kind_of(1), FK_UNTYPED);
+  const TableSchema schema =
+      MakeSchema({1, 2}, {FieldType::kUntyped, FieldType::kInt32});
+  EXPECT_EQ(schema.type_of(1), FieldType::kUntyped);
 
   PaxGroup group(schema, nullptr);
   const std::string first = PackRow({std::string(1, '\0'), "42"});
@@ -79,11 +79,11 @@ TEST(PaxTableTest, TooNarrowTypedFieldStaysVerbatim) {
   EXPECT_EQ(Gather(group, 1, second.size()), second);
 }
 
-// field_kind is allowed to be shorter than the field count; the fields it
+// field_type is allowed to be shorter than the field count; the fields it
 // does not reach are untyped rather than read past its end.
-TEST(PaxTableTest, ShortKindVectorLeavesTheRestUntyped) {
-  const TableSchema schema = MakeSchema({1, 4}, {FK_UNTYPED});
-  EXPECT_EQ(schema.kind_of(1), FK_UNTYPED);
+TEST(PaxTableTest, ShortTypeVectorLeavesTheRestUntyped) {
+  const TableSchema schema = MakeSchema({1, 4}, {FieldType::kUntyped});
+  EXPECT_EQ(schema.type_of(1), FieldType::kUntyped);
 
   PaxGroup group(schema, nullptr);
   const std::string row = PackRow({std::string(1, '\0'), "7"});

@@ -97,7 +97,7 @@ bool Database::Impl::PaxViewValid(const Database::PaxReadView &view) const {
 bool Database::Impl::InstallPaxSchema(
     const std::string_view table_name,
     const std::vector<uint32_t> &field_max_bytes,
-    const std::vector<uint8_t> &field_kind,
+    const std::vector<pax::FieldType> &field_type,
     const std::vector<int8_t> &field_scale) {
   if (field_max_bytes.empty()) return false;
   // A definition change, like CreateSecondaryIndex: every request holds this
@@ -108,12 +108,12 @@ bool Database::Impl::InstallPaxSchema(
   pax::TableSchema schema;
   schema.table_name = std::string(table_name);
   schema.field_max_bytes = field_max_bytes;
-  // Typed cells only when the kinds vector matches the field count; otherwise
+  // Typed cells only when the types vector matches the field count; otherwise
   // every field stays UNTYPED (byte-identical to the untyped layout). When
-  // the kinds match, a scale vector of any other length is replaced with
+  // the types match, a scale vector of any other length is replaced with
   // zeros.
-  if (field_kind.size() == field_max_bytes.size()) {
-    schema.field_kind = field_kind;
+  if (field_type.size() == field_max_bytes.size()) {
+    schema.field_type = field_type;
     if (field_scale.size() == field_max_bytes.size())
       schema.field_scale = field_scale;
     else

@@ -40,7 +40,8 @@ namespace helios::storage {
 
 namespace pax {
 class PaxTable;
-}
+enum class FieldType : uint8_t;
+}  // namespace pax
 
 /**
  * @brief One storage instance: its tables, its epoch framework and its log.
@@ -123,18 +124,18 @@ class Database {
    *
    * @param[in] table_name The table that should use PAX storage.
    * @param[in] field_max_bytes Maximum packed bytes for each row field.
-   * @param[in] field_kind Per-field storage kind (see pax::FieldKind). Empty
+   * @param[in] field_type Per-field storage type (see pax::FieldType). Empty
    * leaves every field untyped, as does a length that does not match
-   * `field_max_bytes`, or a width that is not the one that kind stores.
-   * @param[in] field_scale Per-field DECIMAL scale, used by the typed decimal
-   * kind. Empty, or a length that does not match, means a scale of zero.
+   * `field_max_bytes`, or a width that is not the one that type stores.
+   * @param[in] field_scale Per-field DECIMAL scale, used by kDecimal64. Empty,
+   * or a length that does not match, means a scale of zero.
    * @return true when the schema is installed for the table.
    * @return false when the schema is empty, the table is missing, or a
    * schema is already installed.
    */
   bool InstallPaxSchema(const std::string_view table_name,
                         const std::vector<uint32_t> &field_max_bytes,
-                        const std::vector<uint8_t> &field_kind = {},
+                        const std::vector<pax::FieldType> &field_type = {},
                         const std::vector<int8_t> &field_scale = {});
 
   /**
@@ -332,7 +333,7 @@ class Database {
                 const KeyPartEnds &parts, std::vector<uint64_t> &out_ndv);
 
   /**
-   * @brief Builds an equi-depth histogram for one index's leading key part.
+   * @brief Builds an equi-height histogram for one index's leading key part.
    *
    * @details `out_bounds[i]` is the raw packed leading-key prefix for a
    * bucket boundary, in ascending order. `out_cum[i]` is the cumulative row

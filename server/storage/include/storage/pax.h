@@ -22,10 +22,10 @@ namespace helios::storage {
 namespace pax {
 
 /**
- * @brief Per-field storage kind for typed numeric cells.
+ * @brief How a PAX cell stores a field: its storage type, not its SQL type.
  *
- * @details FK_UNTYPED keeps the cell verbatim: the field bytes the query
- * layer wrote, unchanged. A typed kind stores the value as a fixed-width
+ * @details kUntyped keeps the cell verbatim: the field bytes the query
+ * layer wrote, unchanged. A typed field stores the value as a fixed-width
  * little-endian binary payload of `field_max_bytes[f]` bytes (4 or 8). A
  * typed cell's u16 length prefix is 0 for SQL NULL and the binary width for a
  * present value, so "empty cell == NULL" still holds. ScatterRow parses that
@@ -33,24 +33,24 @@ namespace pax {
  * parse or does not fit; the row then overflows to the heap. GatherRow
  * reformats a typed cell back into the exact bytes it was given.
  */
-enum FieldKind : uint8_t {
-  FK_UNTYPED = 0,  // verbatim bytes (default; strings, floats, untyped DECIMAL)
-  FK_INT32 = 1,    // 4-byte LE signed int   (TINY/SHORT/INT24/LONG)
-  FK_INT64 = 2,    // 8-byte LE signed int   (LONG UNSIGNED, BIGINT)
-  FK_DATE = 3,     // 4-byte LE YYYYMMDD int (DATE)
-  FK_DEC64 = 4,    // 8-byte LE scaled int   (DECIMAL(p,s); scale=field_scale)
+enum class FieldType : uint8_t {
+  kUntyped = 0,    // verbatim bytes (default; strings, floats, untyped DECIMAL)
+  kInt32 = 1,      // 4-byte LE signed int   (TINY/SHORT/INT24/LONG)
+  kInt64 = 2,      // 8-byte LE signed int   (LONG UNSIGNED, BIGINT)
+  kDate = 3,       // 4-byte LE YYYYMMDD int (DATE)
+  kDecimal64 = 4,  // 8-byte LE scaled int   (DECIMAL(p,s); scale=field_scale)
 };
 
 /**
- * @brief Returns the fixed binary width of a typed cell, 0 for FK_UNTYPED.
+ * @brief Returns the fixed binary width of a typed cell, 0 for kUntyped.
  */
-inline uint32_t FieldKindWidth(uint8_t kind) {
-  switch (kind) {
-    case FK_INT32:
-    case FK_DATE:
+inline uint32_t PackLength(FieldType type) {
+  switch (type) {
+    case FieldType::kInt32:
+    case FieldType::kDate:
       return 4;
-    case FK_INT64:
-    case FK_DEC64:
+    case FieldType::kInt64:
+    case FieldType::kDecimal64:
       return 8;
     default:
       return 0;
@@ -69,10 +69,10 @@ inline uint32_t FieldKindWidth(uint8_t kind) {
 struct TableSchema {
   // Max payload bytes per field, starting with the null-flags field.
   std::vector<uint32_t> field_max_bytes;
-  // Per-field storage kind (see FieldKind). Empty => every field UNTYPED
+  // Per-field storage type (see FieldType). Empty => every field untyped
   // (byte-identical to the untyped layout). Same length as field_max_bytes.
-  std::vector<uint8_t> field_kind;
-  // Per-field DECIMAL scale for FK_DEC64 (else 0). Same length when present.
+  std::vector<FieldType> field_type;
+  // Per-field DECIMAL scale for kDecimal64 (else 0). Same length when present.
   std::vector<int8_t> field_scale;
   // Table name, carried for diagnostics (overflow logging).
   std::string table_name;
@@ -80,19 +80,19 @@ struct TableSchema {
   size_t field_count() const { return field_max_bytes.size(); }
 
   /**
-   * @brief Returns the storage kind of field `f`, or FK_UNTYPED when
-   *        `field_kind` does not cover it.
+   * @brief Returns the storage type of field `f`, or kUntyped when
+   *        `field_type` does not cover it.
    *
-   * @details A kind whose declared width is not the width that kind stores
-   * degrades to UNTYPED, so no reader parses a cell in a shape never written.
+   * @details A type whose declared width is not the width that type stores
+   * degrades to kUntyped, so no reader parses a cell in a shape never written.
    */
-  uint8_t kind_of(size_t f) const {
-    const uint8_t kind = f < field_kind.size() ? field_kind[f] : FK_UNTYPED;
-    if (kind == FK_UNTYPED) return FK_UNTYPED;
-    return f < field_max_bytes.size() &&
-                   field_max_bytes[f] == FieldKindWidth(kind)
-               ? kind
-               : FK_UNTYPED;
+  FieldType type_of(size_t f) const {
+    const FieldType type =
+        f < field_type.size() ? field_type[f] : FieldType::kUntyped;
+    if (type == FieldType::kUntyped) return FieldType::kUntyped;
+    return f < field_max_bytes.size() && field_max_bytes[f] == PackLength(type)
+               ? type
+               : FieldType::kUntyped;
   }
 
   /**

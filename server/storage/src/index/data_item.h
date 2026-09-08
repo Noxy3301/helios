@@ -45,7 +45,7 @@ namespace helios::storage {
  * @details A primary-index slot keeps the row payload in buffer; a
  * secondary-index slot keeps the primary keys that key points at in
  * primary_keys, published with atomic load and store. transaction_id is the
- * Silo version word both kinds carry. value() is valid only while buffer is
+ * Silo version word both carry. value() is valid only while buffer is
  * not in PAX mode.
  */
 struct DataItem {

@@ -86,7 +86,7 @@ class Database::Impl {
 
   bool InstallPaxSchema(const std::string_view table_name,
                         const std::vector<uint32_t> &field_max_bytes,
-                        const std::vector<uint8_t> &field_kind = {},
+                        const std::vector<pax::FieldType> &field_type = {},
                         const std::vector<int8_t> &field_scale = {});
 
   bool CreateSecondaryIndex(const std::string_view table_name,
@@ -128,7 +128,7 @@ class Database::Impl {
                 const KeyPartEnds &parts, std::vector<uint64_t> &out_ndv);
 
   /**
-   * @brief Builds an equi-depth histogram for one index's leading key part.
+   * @brief Builds an equi-height histogram for one index's leading key part.
    *
    * @details The query layer uses the returned boundaries to estimate
    * one-column range cardinality locally. The scan is independent of

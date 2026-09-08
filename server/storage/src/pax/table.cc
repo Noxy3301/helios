@@ -100,29 +100,29 @@ inline bool ParseDecScaled(const char *s, size_t len, int scale, int64_t *out) {
 
 // Parse one field's ASCII into the low bytes of *out. Returns false on any
 // failure, and the caller overflows the row to the heap.
-inline bool ParseTyped(FieldKind kind, int scale, const std::byte *payload,
+inline bool ParseTyped(FieldType type, int scale, const std::byte *payload,
                        uint32_t len, uint64_t *out) {
   const char *s = reinterpret_cast<const char *>(payload);
-  switch (kind) {
-    case FK_INT32: {
+  switch (type) {
+    case FieldType::kInt32: {
       int64_t v;
       if (!ParseI64(s, len, &v) || v < INT32_MIN || v > INT32_MAX) return false;
       *out = static_cast<uint64_t>(v);
       return true;
     }
-    case FK_INT64: {
+    case FieldType::kInt64: {
       int64_t v;
       if (!ParseI64(s, len, &v)) return false;
       *out = static_cast<uint64_t>(v);
       return true;
     }
-    case FK_DATE: {
+    case FieldType::kDate: {
       int64_t ymd;
       if (!ParseDate(s, len, &ymd)) return false;
       *out = static_cast<uint64_t>(ymd);
       return true;
     }
-    case FK_DEC64: {
+    case FieldType::kDecimal64: {
       int64_t m;
       if (!ParseDecScaled(s, len, scale, &m)) return false;
       *out = static_cast<uint64_t>(m);
@@ -143,23 +143,23 @@ inline void AppendI64(std::string &out, int64_t v) {
 // `cell` points at the payload (at least `width` bytes are readable because
 // the cell stride reserves them, so this is memory-safe even under a torn
 // read).
-void FormatTyped(FieldKind kind, int scale, const std::byte *cell,
+void FormatTyped(FieldType type, int scale, const std::byte *cell,
                  uint32_t width, std::string &out) {
   (void)width;
-  switch (kind) {
-    case FK_INT32: {
+  switch (type) {
+    case FieldType::kInt32: {
       int32_t v;
       std::memcpy(&v, cell, 4);
       AppendI64(out, v);
       break;
     }
-    case FK_INT64: {
+    case FieldType::kInt64: {
       int64_t v;
       std::memcpy(&v, cell, 8);
       AppendI64(out, v);
       break;
     }
-    case FK_DATE: {
+    case FieldType::kDate: {
       int32_t v;
       std::memcpy(&v, cell, 4);
       const int64_t y = v / 10000, m = (v / 100) % 100, d = v % 100;
@@ -171,7 +171,7 @@ void FormatTyped(FieldKind kind, int scale, const std::byte *cell,
       if (n > 0) out.append(buf, static_cast<size_t>(n));
       break;
     }
-    case FK_DEC64: {
+    case FieldType::kDecimal64: {
       int64_t mant;
       std::memcpy(&mant, cell, 8);
       const bool neg = mant < 0;
@@ -316,12 +316,12 @@ bool PaxGroup::ScatterRow(uint32_t slot, const std::byte *row, size_t size) {
   // untouched.
   uint64_t typed_bin[kMaxFields];  // low field_max_bytes[f] bytes = LE payload
   for (size_t f = 0; f < fields; f++) {
-    const auto k = static_cast<FieldKind>(schema_.kind_of(f));
-    if (k == FK_UNTYPED) {
+    const FieldType type = schema_.type_of(f);
+    if (type == FieldType::kUntyped) {
       if (refs[f].len > schema_.field_max_bytes[f]) return false;
       if (refs[f].len > 0xFFFF) return false;
     } else if (refs[f].len != 0) {  // typed present value
-      if (!ParseTyped(k, schema_.scale_of(f), refs[f].payload, refs[f].len,
+      if (!ParseTyped(type, schema_.scale_of(f), refs[f].payload, refs[f].len,
                       &typed_bin[f]))
         return false;
     }
@@ -329,8 +329,8 @@ bool PaxGroup::ScatterRow(uint32_t slot, const std::byte *row, size_t size) {
   for (size_t f = 0; f < fields; f++) {
     std::byte *cell = arena_.get() + strip_offset_[f] +
                       static_cast<size_t>(stride_[f]) * slot;
-    const auto k = static_cast<FieldKind>(schema_.kind_of(f));
-    if (k != FK_UNTYPED && refs[f].len != 0) {
+    const FieldType type = schema_.type_of(f);
+    if (type != FieldType::kUntyped && refs[f].len != 0) {
       const uint16_t len = static_cast<uint16_t>(schema_.field_max_bytes[f]);
       std::memcpy(cell, &len, sizeof(len));
       std::memcpy(cell + kCellLenBytes, &typed_bin[f], len);  // low `len` = LE
@@ -376,12 +376,12 @@ size_t PaxGroup::GatherRow(uint32_t slot, std::byte *dst,
       continue;
     }
     // Resolve the payload: typed ASCII, or the untyped bytes.
-    const auto k = static_cast<FieldKind>(schema_.kind_of(f));
+    const FieldType type = schema_.type_of(f);
     const char *src;
     uint32_t vlen;
-    if (k != FK_UNTYPED) {
+    if (type != FieldType::kUntyped) {
       scratch.clear();
-      FormatTyped(k, schema_.scale_of(f), cell + kCellLenBytes,
+      FormatTyped(type, schema_.scale_of(f), cell + kCellLenBytes,
                   schema_.field_max_bytes[f], scratch);
       src = scratch.data();
       vlen = static_cast<uint32_t>(scratch.size());
@@ -405,15 +405,15 @@ size_t PaxGroup::GatherRow(uint32_t slot, std::byte *dst,
 void PaxGroup::AppendCellField(size_t field, uint32_t slot,
                                std::string &out) const {
   const std::string_view cv = cell(field, slot);
-  const auto k = static_cast<FieldKind>(schema_.kind_of(field));
-  if (k == FK_UNTYPED || cv.empty()) {
+  const FieldType type = schema_.type_of(field);
+  if (type == FieldType::kUntyped || cv.empty()) {
     AppendField(out, cv);
     return;
   }
   const std::byte *c = arena_.get() + strip_offset_[field] +
                        static_cast<size_t>(stride_[field]) * slot;
   std::string tmp;
-  FormatTyped(k, schema_.scale_of(field), c + kCellLenBytes,
+  FormatTyped(type, schema_.scale_of(field), c + kCellLenBytes,
               schema_.field_max_bytes[field], tmp);
   AppendField(out, tmp);
 }

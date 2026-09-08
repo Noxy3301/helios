@@ -58,9 +58,9 @@ bool Database::CreateTable(const std::string_view table_name) {
 
 bool Database::InstallPaxSchema(const std::string_view table_name,
                                 const std::vector<uint32_t> &field_max_bytes,
-                                const std::vector<uint8_t> &field_kind,
+                                const std::vector<pax::FieldType> &field_type,
                                 const std::vector<int8_t> &field_scale) {
-  return db_pimpl_->InstallPaxSchema(table_name, field_max_bytes, field_kind,
+  return db_pimpl_->InstallPaxSchema(table_name, field_max_bytes, field_type,
                                      field_scale);
 }
 
