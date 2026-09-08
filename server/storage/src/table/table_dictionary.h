@@ -23,8 +23,7 @@ namespace helios::storage {
  * @details Append-only, since a table is never removed while the database
  * lives. Creation serializes on a mutex and publishes the new node with a
  * release store; a lookup walks the chain with an acquire load and takes no
- * lock of its own. Tables are few and created only by DDL, so the walk stays
- * short.
+ * lock of its own. Tables are few and created only by DDL.
  */
 class TableDictionary {
  public:

@@ -149,9 +149,9 @@ struct CommitCtx {
 // Resolve (R1-R3): map reads, writes, and SI ops to their DataItems.
 bool Resolve(CommitCtx &ctx, std::shared_mutex &schema_mutex) {
   std::unordered_set<std::string> unique_si_adds;
-  // Liveness a key reached through the entries already resolved in this
-  // request; absent means the request has not touched the key yet. Only an
-  // insert consults it, so a request without one does not pay for it.
+  // Whether a key is live after the entries this request has already
+  // resolved; absent means the request has not touched it. Only an insert
+  // consults it, so a request without one does not pay for it.
   std::unordered_map<std::string, bool> live_in_request;
 
   std::shared_lock<std::shared_mutex> lk(schema_mutex);
@@ -246,7 +246,8 @@ bool Resolve(CommitCtx &ctx, std::shared_mutex &schema_mutex) {
   return true;
 }
 
-// Phase 1.1: address-sort and CAS-lock every write target. One global lock
+// Phase 1.1: address-sort and CAS-lock every primary and secondary write
+// target. One global lock
 // order keeps concurrent committers free of write-write deadlock; the
 // pre-lock TID is kept because validation must compare reads against it, not
 // against the TID this transaction has just dirtied.
@@ -256,6 +257,8 @@ bool Lock(CommitCtx &ctx) {
                   ctx.items.end());
   ctx.locked.reserve(ctx.items.size());
 
+  // True while every index key this attempt locked the item under still
+  // resolves to it.
   auto attached = [&](DataItem *item) {
     for (const auto &target : ctx.targets) {
       if (target.item != item) continue;
@@ -394,8 +397,8 @@ bool ReplayRange(CommitCtx &ctx, const ExternalRangeReadEntry &range) {
   return matches && result_pos == range.result_keys.size();
 }
 
-// Replay one secondary range scan: compare the secondary keys and the base
-// rows they reach.
+// Replay one secondary range scan and compare the secondary keys and their
+// primary keys, in scan order.
 bool ReplayIndexRange(CommitCtx &ctx, const ExternalRangeReadEntry &range) {
   auto table = ctx.tables.GetTable(range.table_name);
   if (table == nullptr) return false;
@@ -432,8 +435,8 @@ bool ReplayIndexRange(CommitCtx &ctx, const ExternalRangeReadEntry &range) {
     const std::string secondary_key(key);
     DataItem *item = index->Get(key);
     if (item == nullptr) return false;
-    // Pin the immutable primary-key list under a double-TID read, as in
-    // the staging scan. A committer publishes a new list under its lock;
+    // Pin the immutable primary-key list under a stable read, as
+    // silo::ScanIndex does. A committer publishes a new list under its lock;
     // the TID stays constant while own-locked, so re-check after loading.
     const TransactionId observed = item->transaction_id.load();
     if ((observed.tid & kLockBit) && !ctx.IsOwnLocked(item)) {
@@ -627,7 +630,7 @@ void Publish(CommitCtx &ctx, index::Reaper &reaper, WriteSetType &log_set) {
   // The log snapshot was captured under the lock and still carries the
   // locked TID; recovery would install it verbatim, and every later access
   // to the key would spin on a lock nobody owns. Publish the unlocked TID
-  // into the snapshot, as the native commit path does.
+  // into the snapshot.
   for (auto &snapshot : log_set) {
     const auto tid_it = published.find(snapshot.item);
     if (tid_it == published.end()) continue;
@@ -698,9 +701,8 @@ bool Commit(TableDictionary &tables, std::shared_mutex &schema_mutex,
 
   if (!Resolve(ctx, schema_mutex)) return false;
 
-  // Outside the schema lock: a test parks a committer here to race an insert
-  // against another connection, and holding a shared lock on the schema would
-  // block that connection's DDL rather than only its insert.
+  // Outside the schema lock: holding it here would block a concurrent
+  // connection's DDL, not only its insert.
   if (ctx.has_insert) {
     HELIOS_DEBUG_SYNC("silo_commit.after_index_claim");
   }

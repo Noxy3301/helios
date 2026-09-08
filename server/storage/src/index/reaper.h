@@ -29,11 +29,9 @@ class SecondaryIndex;
  *
  * A committed delete leaves its DataItem in the index as a tombstone so the
  * slot keeps its TID continuity for validation; the physical Purge runs
- * here, at least one full epoch after the delete committed. Committers
- * Enqueue candidates while still holding their commit lock, and the epoch
- * hook drives Reap: enqueue now, execute on epoch advance. The shape
- * mirrors the garbage collection subsystem of the Silo reference
- * implementation (its reaper queue and last-reaped-epoch bookkeeping).
+ * here. Committers Enqueue a tombstone after publishing the unlocked delete
+ * tid. Reap runs on the epoch-framework thread and purges a tombstone only
+ * once published_epoch is more than one epoch past that tid's epoch.
  */
 class Reaper {
  public:
@@ -51,8 +49,10 @@ class Reaper {
    * @brief Purges every tombstone whose delete epoch lies more than one full
    * epoch behind `published_epoch`.
    *
-   * Candidates whose slot is locked are requeued; candidates whose slot was
-   * reused or republished are dropped. Runs on the epoch-framework thread.
+   * Tombstones whose slot is locked are requeued. A tombstone is dropped when
+   * the key resolves to a different item, the tid no longer matches the
+   * delete, the slot is live again, or Purge fails. Runs on the
+   * epoch-framework thread.
    */
   void Reap(EpochNumber published_epoch);
 
@@ -90,6 +90,8 @@ class Reaper {
    * `retired_tid` (delete TID + 2, lock bit clear) is stamped on the erased
    * slot so an in-place reuse continues the slot's TID sequence instead of
    * restarting below the delete TID.
+   *
+   * @return True when the owning index removed the slot.
    */
   bool Purge(const Tombstone &tombstone, TransactionId retired_tid);
 

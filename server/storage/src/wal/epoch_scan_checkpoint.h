@@ -49,7 +49,11 @@ class EpochScanCheckpoint {
    */
   struct Stats {
     uint64_t generation{0};
+    // Global epoch sampled before the barrier; recovery replays the log above
+    // it.
     EpochNumber cut_epoch{0};
+    // Global epoch sampled after the walk; the publish waits for the log
+    // through it.
     EpochNumber end_epoch{0};
     // The epoch of the log's last frame once the durability wait returned.
     // Unlike the durable epoch it moves only when a frame is written, and it
@@ -70,7 +74,7 @@ class EpochScanCheckpoint {
    *
    * `Absent` and `Unusable` are both answered with a full replay of the log;
    * they are distinguished so that a damaged image is reported rather than
-   * passed over in silence.
+   * ignored.
    */
   struct Image {
     enum class Status { kOk, kAbsent, kUnusable };
@@ -93,7 +97,7 @@ class EpochScanCheckpoint {
   /**
    * @brief Starts the thread that captures on the configured interval.
    * A zero interval and no one-shot delay leaves the thread unstarted, which
-   * is the default.
+   * is the default, and so does a durability contract that writes no log.
    * @pre epoch::Framework::Start has been called.
    */
   void Start();
@@ -116,8 +120,8 @@ class EpochScanCheckpoint {
   /**
    * @brief Reads the published image of `work_dir`, if there is a usable one.
    * @param[in] work_dir The directory the database logs into.
-   * @return The image with its status; Absent and Unusable are both answered
-   * with a full replay of the log.
+   * @return The file's status and, when Ok, the records and epoch bounds it
+   * held.
    */
   static Image Load(const std::string &work_dir);
 
@@ -131,8 +135,8 @@ class EpochScanCheckpoint {
   static const char *WorkingFileName();
 
   static constexpr uint32_t kMagic = 0x504b434c;  // "LCKP"
-  // v2 adds wal_frontier_at_publish; a v1 image lacks it and is refused
-  // rather than read with a guessed bound.
+  // Load refuses any other version, so a missing wal_frontier_at_publish is
+  // never filled with a guessed bound.
   static constexpr uint16_t kVersion = 2;
   static constexpr uint16_t kFlags = 0;
   static constexpr size_t kHeaderSize = 56;
@@ -140,6 +144,11 @@ class EpochScanCheckpoint {
  private:
   /**
    * @brief What one attempt at one row produced.
+   *
+   * @details kTaken: a stable version was copied. kSkipped: the slot was
+   * blank or a tombstone under a stable read. kUnstable: the lock bit stayed
+   * set for the whole spin budget, so the row goes to the retry pass and, if
+   * it never settles, the capture is abandoned.
    */
   enum class CaptureResult { kTaken, kSkipped, kUnstable };
 
@@ -155,7 +164,11 @@ class EpochScanCheckpoint {
   bool CaptureTable(Table &table, LogRecord *record, Stats *stats);
   bool Publish(const LogRecords &records, Stats *stats);
   void Loop();
-  /** @return Whether the loop may continue, i.e. no stop was requested. */
+  /**
+   * @brief Waits for the interval, or for a stop.
+   *
+   * @return Whether the loop may continue, i.e. no stop was requested.
+   */
   bool ContinueAfter(uint64_t milliseconds);
 
   const Config &config_;

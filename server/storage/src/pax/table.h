@@ -22,9 +22,8 @@ namespace pax {
 /**
  * @brief Owns all PAX row groups for one Helios table.
  *
- * @details `PaxTable` assigns append-only `(group, slot)` locations. It does
- * not publish rows to indexes and does not decide transaction visibility; those
- * remain in the existing Helios `DataItem`, Silo, and Masstree layers.
+ * @details `PaxTable` assigns append-only `(group, slot)` locations;
+ * transaction visibility and index publication stay in the row path.
  */
 class PaxTable {
  public:

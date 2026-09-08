@@ -48,6 +48,7 @@ bool Reaper::Purge(const Tombstone &tombstone, TransactionId retired_tid) {
 }
 
 void Reaper::Reap(EpochNumber published_epoch) {
+  // Split the queue into the tombstones whose grace has elapsed and the rest.
   std::vector<Tombstone> ready;
   {
     std::lock_guard<std::mutex> lk(mutex_);
@@ -66,13 +67,17 @@ void Reaper::Reap(EpochNumber published_epoch) {
     tombstones_.swap(pending);
   }
 
+  // Nothing is due this epoch.
   if (ready.empty()) return;
 
+  // Lock, re-verify and purge each tombstone that is due.
   std::vector<Tombstone> requeue;
   requeue.reserve(ready.size());
 
   for (auto &tombstone : ready) {
     DataItem *item = Get(tombstone);
+    // A different DataItem under the key means the tombstone was already
+    // replaced.
     if (item != tombstone.item) continue;
 
     TransactionId observed = item->transaction_id.load();
@@ -94,6 +99,8 @@ void Reaper::Reap(EpochNumber published_epoch) {
       item->transaction_id.store(tombstone.delete_commit_tid);
     };
 
+    // A row, or a non-empty key list, means a later transaction reused this
+    // slot in place.
     const bool live =
         tombstone.primary_index != nullptr ? item->HasRow() : item->IsLive();
     if (live) {
@@ -121,6 +128,8 @@ void Reaper::Reap(EpochNumber published_epoch) {
                        std::make_move_iterator(requeue.end()));
   }
 
+  // Get and Purge enrolled this thread in masstree's RCU epoch; release it
+  // before returning to the epoch hook.
   MasstreeReleaseThreadEpoch();
 }
 

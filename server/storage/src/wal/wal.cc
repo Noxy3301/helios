@@ -167,6 +167,7 @@ WalIo WalIo::Posix() {
 
 Wal::Wal(const std::string &work_dir, WalIo io, uint64_t initial_capacity_bytes)
     : io_(std::move(io)), initial_capacity_bytes_(initial_capacity_bytes) {
+  // Resolve the path and create the directory.
   // Strip a trailing separator first; parent_path() below must name the
   // true parent, not the directory itself.
   std::filesystem::path directory(work_dir);
@@ -179,6 +180,7 @@ Wal::Wal(const std::string &work_dir, WalIo io, uint64_t initial_capacity_bytes)
     throw std::system_error(ec, "create_directory " + work_dir);
   }
 
+  // Open or create, then take the exclusive lock.
   // O_TRUNC is never used: an existing log is the only record of what was
   // acknowledged as durable. O_APPEND is never used either, and cannot be:
   // under it a pwrite ignores the offset it is given and lands at the end
@@ -202,6 +204,7 @@ Wal::Wal(const std::string &work_dir, WalIo io, uint64_t initial_capacity_bytes)
                             "lock " + path_ + " exclusively");
   }
 
+  // Fsync the file and its parents.
   // Every name on the way to the log is made durable here, whether or not
   // this process is the one that created it. Two processes can race to
   // create the directory or the file, and the one that loses a create can
@@ -233,6 +236,7 @@ Wal::Wal(const std::string &work_dir, WalIo io, uint64_t initial_capacity_bytes)
     fd_ = -1;
     throw std::system_error(error, std::generic_category(), "fstat " + path_);
   }
+  // fstat into initialised_size_.
   // The file's size stands in for how far an earlier incarnation got with
   // writing zeroes. That needs one filesystem ordering: a size that
   // survives a crash must not run ahead of the zeroes it covers (ext4
@@ -498,11 +502,17 @@ WalScanResult Wal::FinishScan(WalScanResult &&result, off_t end_of_log) {
 }
 
 /**
- * @brief Hops frames at or below `min_epoch` by header alone, leaving
- * `offset` at the first frame above it (or `file_size` if all qualify).
- * @note A header only locates the next frame; it is not proof the frame is
- * undamaged. Returns false, untouched, if a header fails to parse, so the
- * caller can fall back to a full scan instead of guessing.
+ * @brief Advances `offset` through frames at or below `min_epoch` by header
+ * alone, without reading payloads.
+ *
+ * @details On success `offset` is the first frame above `min_epoch`, or the
+ * end of the log, which lies before `file_size` when capacity is reserved.
+ * The last hopped frame is left in the boundary out-params for the caller to
+ * checksum. A header only locates the next frame; it is not proof the frame
+ * is undamaged. Every out-param is written only on success.
+ *
+ * @return False on a header that does not parse or on I/O failure (`*error`
+ * set); the caller then scans from offset 0.
  */
 bool Wal::HopCoveredFrames(EpochNumber min_epoch, off_t file_size,
                            off_t *offset, EpochNumber *frontier,
@@ -571,10 +581,12 @@ bool Wal::HopCoveredFrames(EpochNumber min_epoch, off_t file_size,
 }
 
 WalScanResult Wal::ScanAndRepair(EpochNumber min_epoch) {
+  // Refuse a scan on an instance that already failed.
   if (state_ == State::kFailed) {
     return IoFailure("scan " + path_ + " after a failure", EIO);
   }
 
+  // Bound the scan by the file size fstat reports.
   struct stat file_stat {};
   if (::fstat(fd_, &file_stat) < 0) {
     return IoFailure("fstat " + path_, errno);
@@ -598,9 +610,8 @@ WalScanResult Wal::ScanAndRepair(EpochNumber min_epoch) {
     bytes_skipped = 0;
   };
 
-  // Hop the covered region by header alone when min_epoch != 0. An
-  // unparsable header or a failed boundary checksum falls back to offset 0,
-  // as if no hop had been attempted; an I/O error fails the scan instead.
+  // Hop the frames the caller already holds, rewinding to 0 if the hop or
+  // the boundary checksum fails. An I/O error fails the scan instead.
   if (min_epoch != 0) {
     off_t boundary_offset = 0;
     uint32_t boundary_payload_size = 0;
@@ -643,6 +654,7 @@ WalScanResult Wal::ScanAndRepair(EpochNumber min_epoch) {
     }
   }
 
+  // Walk frames: parse the header, checksum, then skip or read.
   uint8_t header[kHeaderSize];
   std::vector<uint8_t> payload;
   // Empty while frames keep parsing; otherwise why the one at `offset` did
@@ -759,6 +771,7 @@ WalScanResult Wal::ScanAndRepair(EpochNumber min_epoch) {
   result.frames_skipped = frames_skipped;
   result.bytes_skipped = bytes_skipped;
 
+  // Classify the tail that stopped the walk: repair it, or fail-stop.
   if (!anomaly.empty()) {
     int error = 0;
     off_t last_non_zero = 0;
@@ -807,6 +820,7 @@ WalScanResult Wal::ScanAndRepair(EpochNumber min_epoch) {
     }
   }
 
+  // Publish the end of the log.
   result.records = std::move(records);
   return FinishScan(std::move(result), offset);
 }
@@ -824,6 +838,7 @@ WalAppendResult Wal::AppendGroup(
     std::abort();
   }
 
+  // Pack the buckets at or below target into one group.
   auto &trace = FlushTrace::Instance();
   const bool traced = trace.Enabled();
   const int64_t pack_begin = traced ? FlushTrace::Now() : 0;
@@ -871,6 +886,7 @@ WalAppendResult Wal::AppendGroup(
 
   if (group.empty()) return {true, 0};
 
+  // Extend the zeroed region if the group does not fit.
   int error = 0;
   const off_t initialised_before = initialised_size_;
   if (!EnsureCapacityFor(write_offset_, group.size(), &error)) {
@@ -883,6 +899,7 @@ WalAppendResult Wal::AppendGroup(
                 static_cast<long long>(initialised_size_), extension_count_);
   }
 
+  // Write, fdatasync, then publish the offset and the frontier.
   const int64_t write_begin = traced ? FlushTrace::Now() : 0;
   if (!WriteAllAt(group.data(), group.size(), write_offset_, &error)) {
     state_ = State::kFailed;

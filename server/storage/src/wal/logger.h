@@ -66,6 +66,8 @@ class Logger {
 
   struct RecoveryResult {
     RecoveryStatus status{RecoveryStatus::kOk};
+    // The epoch of the last intact frame, which after a successful scan is
+    // also the durable epoch.
     EpochNumber frontier{0};
     WriteSetType recovery_set;
   };
@@ -82,8 +84,11 @@ class Logger {
   bool Enqueue(const WriteSetType &ws, EpochNumber epoch);
 
   /**
-   * @brief Reads the log, repairs an interrupted tail, initializes the
-   * frontier, and returns the write set to replay.
+   * @brief Scans the log and, when the scan allows it, repairs a torn tail.
+   * @details On success it sets the durable epoch from the last intact frame
+   * and returns that epoch together with the folded write set, the
+   * checkpoint image first when one was loaded, then the log. On kFailed,
+   * frontier is 0 and recovery_set is empty.
    * @note Runs before the flusher starts and before the database accepts
    * work.
    */
@@ -109,7 +114,7 @@ class Logger {
 
   /**
    * @brief The epoch of the last frame actually written to the log. Safe to
-   * call from a thread other than the flusher's; see Wal::frontier for what
+   * call from a thread other than the flusher's; see Wal::Frontier for what
    * makes that safe and why it is not the same question as GetDurableEpoch.
    */
   EpochNumber GetWalFrontier() const;
@@ -155,15 +160,12 @@ class Logger {
   void StopFlusher();
 
   /**
-   * @brief Makes an I/O failure stop the process, once the log is the
-   * durability contract's foundation rather than a component under test.
-   * @details A logger that cannot write has no way to make later commits
-   * durable, and under Async nobody waits to be told: the process would keep
-   * acknowledging commits that are only in memory, and a measurement taken
-   * after that point would describe a contract the run was no longer
-   * honouring.
-   * @note Armed explicitly, so a test that constructs a Logger directly can
-   * still observe the failure state instead of dying with it.
+   * @brief Makes a later log I/O failure terminate the process.
+   * @details Without it a write failure only wakes waiters as Failed, and
+   * under the async commit ack nobody waits: the process would keep
+   * acknowledging commits that exist only in memory.
+   * @note Left unarmed when a test constructs a Logger directly, so Failed
+   * can be observed.
    */
   void SetFailStop();
 

@@ -1,6 +1,7 @@
 /**
  * @file server/storage/src/wal/flush_trace.cc
- * Timing census of the log's flush groups.
+ * Publishes the census as generation-stamped CSV files, with the manifest
+ * replaced last.
  */
 
 #include "wal/flush_trace.h"
@@ -29,9 +30,12 @@ void OnDumpSignal(int) { FlushTrace::RequestDump(); }
 /**
  * @brief Writes one file, and gives it its final name only if nothing failed.
  *
- * A reader decides a file is complete by its name, so a partial write must not
- * reach that name. Every step is checked: a formatting error, a full
- * filesystem, or a failure inside fclose all leave the final name absent.
+ * @details A file under `path` is either absent or a complete write; the
+ * partial write never reaches that name. Dump-level completeness is the
+ * manifest, not the existence of a data file.
+ *
+ * @param emit Writes the contents; false discards the file.
+ * @return Whether `path` now names a complete file.
  */
 bool WriteFile(const std::string &path,
                const std::function<bool(FILE *)> &emit) {
@@ -99,8 +103,8 @@ FlushTrace::FlushTrace() {
   slots_.reset(new Slot[kMaxSlots]);
   for (size_t i = 0; i < kMaxSlots; ++i) slots_[i].rows.resize(kCommitCapacity);
   InstallDumpSignal();
-  // The request arrives as a flag from a signal handler; a thread outside
-  // every measured path is what turns it into files.
+  // The request arrives as a flag from a signal handler; a dedicated thread
+  // is what turns it into files.
   dumper_ = std::thread([this] {
     while (!dumper_stop_.load(std::memory_order_relaxed)) {
       if (dump_requested_.exchange(false, std::memory_order_relaxed)) Dump();
@@ -251,6 +255,7 @@ void FlushTrace::Dump() {
     return true;
   });
 
+  // Leave the manifest alone if a data file failed.
   if (!complete) {
     // The manifest is what a reader follows; leaving it pointing at the
     // previous generation is how an incomplete census reports itself.
@@ -281,6 +286,7 @@ void FlushTrace::Dump() {
   if (!published) return;
   ++dump_generation_;
 
+  // Report the truncated streams.
   if (group_drops != 0 || close_drops != 0 || commit_drops != 0 ||
       unslotted != 0) {
     std::fprintf(stderr,

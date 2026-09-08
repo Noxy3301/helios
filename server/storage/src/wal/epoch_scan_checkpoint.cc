@@ -40,9 +40,9 @@ namespace {
 
 using Clock = std::chrono::steady_clock;
 
-// How long one row is spun on before it is set aside for the retry pass: a
-// short spin covers a writer's install, and a longer wait belongs to the
-// pass that runs without holding up the rest of the table.
+// How many times one row is re-read before it is set aside for the retry
+// pass: a short spin covers a writer's install, and a longer wait belongs to
+// the pass that runs without holding up the rest of the table.
 constexpr unsigned kSpinAttempts = 64;
 // The retry pass gives up eventually rather than scanning forever, because a
 // row that never settles means the image cannot be written at all.
@@ -188,6 +188,9 @@ const char *EpochScanCheckpoint::WorkingFileName() {
  * then confirm the version did not move. A row locked for the whole budget is
  * unstable rather than skipped, since its holder may abort and leave no record
  * of the value.
+ *
+ * @param retries Incremented once per rejected attempt.
+ * @return kTaken, kSkipped for a blank slot or a tombstone, or kUnstable.
  */
 EpochScanCheckpoint::CaptureResult EpochScanCheckpoint::CapturePrimaryRow(
     const std::string &table_name, std::string_view key, const DataItem &item,
@@ -228,8 +231,12 @@ EpochScanCheckpoint::CaptureResult EpochScanCheckpoint::CapturePrimaryRow(
  * @brief Copies one secondary key's whole primary-key list under the same
  *        protocol.
  *
- * @details The list is a complete posting list rather than a delta, so a later
- * delta in the log composes with it the way one delta composes with another.
+ * @details The list is a complete posting list rather than a delta: recovery
+ * expands it into adds and then applies the log's own adds and removes by
+ * transaction id.
+ *
+ * @param retries Incremented once per rejected attempt.
+ * @return kTaken, kSkipped for an empty list, or kUnstable.
  */
 EpochScanCheckpoint::CaptureResult EpochScanCheckpoint::CaptureSecondaryEntry(
     const std::string &table_name, const std::string &index_name,
@@ -324,6 +331,8 @@ bool EpochScanCheckpoint::RunOnce(Stats *out_stats) {
   Stats stats;
   stats.generation = ++generation_;
 
+  // Sample the cut, then barrier until every commit at or below it has
+  // installed.
   const auto barrier_begin = Clock::now();
   // The cut is read before the barrier: once Sync returns, every commit at or
   // below it has installed its values. A cut taken after the scan started
@@ -336,6 +345,7 @@ bool EpochScanCheckpoint::RunOnce(Stats *out_stats) {
   epoch_framework_.Sync();
   stats.barrier_ms = ElapsedMs(barrier_begin);
 
+  // Walk every table.
   const auto scan_begin = Clock::now();
   LogRecords records;
   bool abandoned = false;
@@ -352,9 +362,10 @@ bool EpochScanCheckpoint::RunOnce(Stats *out_stats) {
     }
   });
 
-  // Ends the reclamation critical section the pass held open from its first
-  // walk, so a row retired during it could not be freed under the copy; no
-  // index reclaims anything while a thread is inside one.
+  // Drop the epoch pin the walk held; record the scan time and the end
+  // epoch. Ending the reclamation critical section the pass held open from
+  // its first walk is what lets a row retired during it be freed: no index
+  // reclaims anything while a thread is inside a Masstree RCU enrolment.
   index::MasstreeReleaseThreadEpoch();
 
   stats.scan_ms = ElapsedMs(scan_begin);
@@ -362,6 +373,7 @@ bool EpochScanCheckpoint::RunOnce(Stats *out_stats) {
   // what the durability gate below is asked about.
   stats.end_epoch = epoch_framework_.GetGlobalEpoch();
 
+  // Keep the previous checkpoint when the scan could not settle.
   if (abandoned) {
     ::unlink(working_path_.c_str());
     const bool stopping = [&] {
@@ -380,6 +392,7 @@ bool EpochScanCheckpoint::RunOnce(Stats *out_stats) {
     return false;
   }
 
+  // Wait for durability, write, and rename.
   const bool published = Publish(records, &stats);
   if (out_stats != nullptr) *out_stats = stats;
   if (!published) return false;
@@ -401,9 +414,9 @@ bool EpochScanCheckpoint::CaptureTable(Table &table, LogRecord *record,
   std::vector<std::string> unstable_rows;
   std::vector<std::pair<std::string, std::string>> unstable_entries;
 
-  // The walk's callback returns whether to stop, which is the Masstree
-  // backend's reading of it and the opposite of the hash backend's; startup
-  // refuses any other index structure rather than write a one-row image.
+  // Capture every primary slot; defer the keys that stayed locked. The
+  // walk's callback returns true to stop, so a capture that wants every row
+  // returns false.
   table.GetPrimaryIndex().ForEach([&](std::string_view key, DataItem &item) {
     LogRecord::Write write;
     switch (CapturePrimaryRow(table_name, key, item, write,
@@ -421,6 +434,7 @@ bool EpochScanCheckpoint::CaptureTable(Table &table, LogRecord *record,
     return false;
   });
 
+  // Capture every secondary posting list the same way.
   table.ForEachSecondaryIndex(
       [&](const std::string &index_name, index::SecondaryIndex &index) {
         const uint32_t index_type = static_cast<uint32_t>(index.GetIndexType());
@@ -443,6 +457,7 @@ bool EpochScanCheckpoint::CaptureTable(Table &table, LogRecord *record,
         });
       });
 
+  // Retry pass: resolve the deferred keys again and copy what has settled.
   // Rows held by a writer for the whole spin are resolved again by key: the
   // slot they were in may have been purged and replaced meanwhile, and a
   // pointer kept across the pass would name the old one.
@@ -628,8 +643,8 @@ EpochScanCheckpoint::Image EpochScanCheckpoint::Load(
   const EpochNumber cut_epoch = GetLe32(header + kOffCutEpoch);
   const EpochNumber end_epoch = GetLe32(header + kOffEndEpoch);
   const EpochNumber wal_frontier_at_publish = GetLe32(header + kOffWalFrontier);
-  // The scan ends no earlier than it began, and an image that claims
-  // otherwise describes a history no run produced.
+  // Epoch 0 is not a cut any writer produces, and a scan never ends before
+  // its cut.
   if (cut_epoch == 0 || end_epoch < cut_epoch) {
     return unusable("the image epochs are not in order");
   }

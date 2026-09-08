@@ -37,7 +37,7 @@ namespace wal {
  * construction: no recording path allocates, locks, or writes to a file.
  *
  * The trace observes; it never decides. No recording call alters control flow,
- * and none is placed between the durable watermark's store and the
+ * and none is placed between the durability frontier's store and the
  * notification that releases waiters.
  *
  * @par Output contract
@@ -91,7 +91,8 @@ class FlushTrace {
   /**
    * @brief One sampled commit's wait for its epoch to become durable.
    *
-   * `not_durable_at_enter` reports what the watermark said when the commit
+   * `not_durable_at_enter` reports what the durability frontier said when the
+   * commit
    * reached the wait, which is not the same as having slept: publication can
    * land between that reading and the wait's own check.
    */
@@ -240,13 +241,13 @@ class FlushTrace {
   /**
    * @brief Writes the census out.
    *
-   * Reached either from the instance's destruction or from a dump request
-   * raised by SIGUSR1. The server is stopped with SIGKILL, which runs no
-   * destructor, so a measurement asks for the census while the process is still
-   * alive. Calls are serialised, and every count is taken before any file is
-   * opened, so one dump reports one cut of the counters even though the
-   * recording threads keep running. Rows written after that cut belong to the
-   * next dump.
+   * Reached from the dumper thread, which turns a SIGUSR1 request into a
+   * call, and from the database's own teardown. This class's destructor
+   * writes no file, so a process killed with SIGKILL must ask for the census
+   * while it is still alive. Calls are serialised, and every count is taken
+   * before any file is opened, so one dump reports one cut of the counters
+   * even though the recording threads keep running. Rows written after that
+   * cut belong to the next dump.
    */
   void Dump();
 
@@ -260,15 +261,14 @@ class FlushTrace {
   }
 
  private:
-  // One row per group. The flusher wakes once per closed epoch, so a 1 ms epoch
-  // produces about a thousand rows a second for the whole life of the process,
-  // which spans loading as well as the measured run. A million rows covers a
-  // thousand seconds.
+  // One row per group. The flusher wakes once per closed epoch, so a 1 ms
+  // epoch produces about a thousand rows a second for the life of the
+  // process. A million rows covers a thousand seconds.
   static constexpr size_t kGroupCapacity = 1048576;
   static constexpr size_t kCloseCapacity = 1048576;
-  // Connection threads come and go across loading and the measured run, and a
-  // thread that finds no slot free records nothing. Every buffer is reserved at
-  // construction, which keeps the first sampled commit off an allocator.
+  // Connection threads come and go, and a thread that finds no slot free
+  // records nothing. Every buffer is reserved at construction, which keeps the
+  // first sampled commit off an allocator.
   static constexpr size_t kMaxSlots = 1024;
   static constexpr size_t kCommitCapacity = 2048;
   // A power of two, so the sampling test is a mask rather than a division.

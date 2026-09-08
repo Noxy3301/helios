@@ -43,12 +43,12 @@ namespace wal {
  * dedicated flusher thread.
  *
  * @details Producers never touch the file: a committing thread appends to
- * its own thread-local vector under a short lock and leaves. The flusher
+ * its own thread-local vector under a short lock and returns. The flusher
  * swaps those vectors, buckets the records by epoch, and writes one group
  * per fdatasync.
  *
- * @note The flusher owns a thread of its own: the fdatasync it blocks on
- * must not sit on a thread that serves requests.
+ * @note The flusher owns a thread of its own so that the fdatasync it blocks
+ * on does not block a thread that serves requests.
  */
 class ThreadLocalLogger final {
  public:
@@ -56,6 +56,17 @@ class ThreadLocalLogger final {
   using PublishFailure = std::function<void(int)>;
   using ReadDurable = std::function<EpochNumber()>;
 
+  /**
+   * @brief Opens the log and retains the callbacks. Does not start the
+   *        flusher.
+   *
+   * @details publish_durable and publish_failure both run on the flusher
+   * thread, the first with the closed epoch just made durable, including a
+   * range that held no record, the second with the errno of a failed group
+   * write. read_durable returns the last epoch already published as durable.
+   * None of the three may be empty, and all three must stay valid until
+   * StopFlusher joins.
+   */
   ThreadLocalLogger(const Config &config, PublishDurable publish_durable,
                     PublishFailure publish_failure, ReadDurable read_durable,
                     WalIo io = WalIo::Posix());

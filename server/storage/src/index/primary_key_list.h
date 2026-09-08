@@ -29,12 +29,16 @@ namespace helios::storage {
 /**
  * @brief Immutable, sorted, deduplicated, length-prefixed primary-key list
  *        held as `std::shared_ptr<const PrimaryKeyList>` in one allocation.
+ *
+ * @details Each record is an unsigned LEB128 length followed by that many key
+ * bytes. A null Ptr and count == 0 are both empty.
  */
 struct PrimaryKeyList {
   using Ptr = std::shared_ptr<const PrimaryKeyList>;
   class View;
 
   uint32_t count;
+  // Byte length of the records after this header, not the allocation size.
   uint32_t bytes;
 
   /**
@@ -167,7 +171,7 @@ struct PrimaryKeyList {
 
   /**
    * @brief Returns the record payload after the fixed header.
-   * @return Pointer to `bytes` length-prefixed primary-key records.
+   * @return Pointer to the `count` records that occupy `bytes` bytes.
    */
   const char *Records() const {
     return reinterpret_cast<const char *>(this) + sizeof(PrimaryKeyList);
@@ -239,6 +243,7 @@ struct PrimaryKeyList {
     return static_cast<uint32_t>(value);
   }
 
+  // Unsigned LEB128: seven bits a byte, high bit continues.
   static size_t VarintSize(size_t value) {
     size_t size = 1;
     while (value >= 0x80) {
@@ -285,6 +290,10 @@ static_assert(std::is_standard_layout<PrimaryKeyList>::value,
 
 /**
  * @brief Zero-copy view over a PrimaryKeyList.
+ *
+ * @details Holds no reference count: it stores the raw pointer of the list it
+ * was made from. The list, and every string_view taken from the view, stay
+ * valid only while the caller keeps its own Ptr alive.
  */
 class PrimaryKeyList::View {
  public:
@@ -301,19 +310,11 @@ class PrimaryKeyList::View {
 
     iterator() = default;
 
-    /**
-     * @brief Returns the current primary key.
-     * @return `std::string_view` into the viewed primary-key list.
-     */
     reference operator*() const {
       const auto record = PrimaryKeyList::Record::Unpack(cursor_, limit_);
       return std::string_view(record.value, record.length);
     }
 
-    /**
-     * @brief Advances to the next primary key.
-     * @return Reference to this iterator.
-     */
     iterator &operator++() {
       assert(remaining_ != 0);
       const auto record = PrimaryKeyList::Record::Unpack(cursor_, limit_);
@@ -322,30 +323,16 @@ class PrimaryKeyList::View {
       return *this;
     }
 
-    /**
-     * @brief Advances to the next primary key.
-     * @return Iterator value before the increment.
-     */
     iterator operator++(int) {
       iterator previous = *this;
       ++*this;
       return previous;
     }
 
-    /**
-     * @brief Compares iterator position and remaining record count.
-     * @param rhs Iterator to compare with.
-     * @return True when both iterators refer to the same position.
-     */
     bool operator==(const iterator &rhs) const {
       return cursor_ == rhs.cursor_ && remaining_ == rhs.remaining_;
     }
 
-    /**
-     * @brief Compares iterator position and remaining record count.
-     * @param rhs Iterator to compare with.
-     * @return True when the iterators differ.
-     */
     bool operator!=(const iterator &rhs) const { return !(*this == rhs); }
 
    private:
@@ -371,36 +358,16 @@ class PrimaryKeyList::View {
    */
   explicit View(const PrimaryKeyList::Ptr &keys) : keys_(keys.get()) {}
 
-  /**
-   * @brief Checks whether the view contains no keys.
-   * @return True when `size() == 0`.
-   *
-   * Runs in O(1).
-   */
   bool empty() const { return size() == 0; }
 
-  /**
-   * @brief Returns the number of keys in the view.
-   * @return Key count.
-   *
-   * Runs in O(1).
-   */
   size_t size() const { return keys_ ? keys_->count : 0; }
 
-  /**
-   * @brief Returns an iterator to the first key.
-   * @return Iterator whose dereference yields `std::string_view` into the list.
-   */
   iterator begin() const {
     if (!keys_) return iterator();
     const char *const start = keys_->Records();
     return iterator(start, start + keys_->bytes, keys_->count);
   }
 
-  /**
-   * @brief Returns the past-the-end iterator.
-   * @return Iterator marking the end of the viewed primary-key list.
-   */
   iterator end() const {
     if (!keys_) return iterator();
     const char *const limit = keys_->Records() + keys_->bytes;
@@ -409,6 +376,10 @@ class PrimaryKeyList::View {
 
   /**
    * @brief Finds the first key not less than `key`.
+   *
+   * @details Linear in the list length: the records are variable-length, so
+   * there is no random access.
+   *
    * @param key Primary key to search for.
    * @return Iterator to the first matching or greater key, or `end()`.
    */

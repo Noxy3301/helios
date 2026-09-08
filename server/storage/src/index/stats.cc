@@ -42,17 +42,18 @@ bool Database::Impl::IndexNdv(const std::string_view table_name,
   auto table = GetTable(table_name);
   if (table == nullptr) return false;
 
-  bool ok = true;
+  bool failed = false;
   bool first = true;
   // Index scans are key-ordered, so one previous key is enough for NDV.
   std::string prev_key;
   std::vector<size_t> prev_part_ends(num_parts, 0);
 
-  // NDV counts prefixes, so only a key the caller accepts counts.
+  // A key parts refuses fails the whole NDV: the scan stops and the caller
+  // keeps its previous estimate.
   auto count_key = [&](std::string_view key) -> bool {
     std::vector<size_t> part_ends(num_parts, 0);
     if (!parts(key, num_parts, part_ends.data())) {
-      ok = false;
+      failed = true;
       return true;
     }
 
@@ -112,8 +113,8 @@ bool Database::Impl::IndexNdv(const std::string_view table_name,
                 });
   }
 
-  if (!ok) {
-    // Fail closed: caller keeps the old optimizer estimate.
+  if (failed) {
+    // The caller keeps the old optimizer estimate.
     out_ndv.assign(num_parts, 0);
     return false;
   }
@@ -145,7 +146,9 @@ bool Database::Impl::IndexHistogram(const std::string_view table_name,
     const auto keys = silo::StableReadKeys(item);
     return keys.found ? keys.primary_keys->count : 0;
   };
-  // Walk one index in key order and expose each live key with its row weight.
+  // Walks one index in key order and hands fn each counted key with its row
+  // weight: 1 for a live primary row, or the primary-key list length for a
+  // secondary entry, whose base rows are not re-checked here.
   // A key the caller refuses ends the pass, so `fn` never sees one.
   bool failed = false;
   auto walk = [&](auto &&fn) {
@@ -181,7 +184,7 @@ bool Database::Impl::IndexHistogram(const std::string_view table_name,
     }
   };
 
-  // Pass 1: count total rows represented by the index.
+  // Pass 1 sums the row weight the index represents.
   uint64_t total = 0;
   walk([&](std::string_view, uint64_t w) -> bool {
     total += w;
@@ -189,7 +192,7 @@ bool Database::Impl::IndexHistogram(const std::string_view table_name,
   });
   if (failed || total == 0) return false;
 
-  // Pass 2: record a boundary at each stride-th row.
+  // Pass 2 records a bound every stride rows.
   const uint64_t stride = std::max<uint64_t>(1, total / buckets);
   uint64_t seen = 0;
   uint64_t next = stride;
@@ -212,7 +215,8 @@ bool Database::Impl::IndexHistogram(const std::string_view table_name,
     return false;
   }
   if (out_bounds.empty() || out_cum.back() != total) {
-    // Close the histogram at the max key so the high end is exact.
+    // The last bound closes the histogram at the maximum key so the high end
+    // is exact.
     out_bounds.push_back(last_bound);
     out_cum.push_back(total);
   }

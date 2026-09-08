@@ -19,12 +19,20 @@
 
 namespace helios::storage {
 
+/**
+ * @brief One table: its primary index, its named secondary indexes, and its
+ *        optional PAX store.
+ *
+ * @details table_lock_ covers the secondary-index map and the PAX install
+ * only; the primary index is reached without it. A secondary index is never
+ * removed, so a pointer to one stays valid for the table's lifetime.
+ */
 class Table {
  public:
   explicit Table(std::string_view table_name);
 
   /**
-   * @brief Creates a secondary index of that name.
+   * @brief Declares a secondary index on this table.
    *
    * @return false when an index of that name already exists.
    */
@@ -53,7 +61,9 @@ class Table {
 
   index::PrimaryIndex &GetPrimaryIndex();
 
-  /** The index of that name, or nullptr. */
+  /**
+   * @brief Returns the index of that name, or nullptr.
+   */
   index::SecondaryIndex *GetSecondaryIndex(const std::string_view index_name);
 
   /**

@@ -57,18 +57,16 @@ namespace wal {
 struct WalScanResult {
   enum class Status { kOk, kCorrupt, kIoError };
 
+  // kIoError means a syscall the scan needs failed; error_number and detail
+  // describe it, and nothing is zeroed.
   Status status{Status::kOk};
   EpochNumber frontier{0};
   LogRecords records;
   bool tail_zeroed{false};
   int error_number{0};
   std::string detail;
-  /**
-   * @brief Frames the scan did not read, and what they held.
-   *
-   * @details Verified by checksum unless the scan hopped over it by header
-   * alone; see ScanAndRepair.
-   */
+  // Frames not read because they are at or below min_epoch, and their
+  // on-disk size. Hopped by header alone except the boundary frame.
   size_t frames_skipped{0};
   uint64_t bytes_skipped{0};
 };
@@ -130,15 +128,14 @@ struct WalIo {
  * which refuses them rather than skipping them.
  *
  * @note An exclusive flock keeps out a second process; it does not make a
- * second concurrent appender inside this process defined.
+ * second flusher inside this process defined.
  */
 class Wal {
  public:
   /**
    * @brief Opens the log and takes an exclusive lock on it.
-   * @details Nothing is allocated and nothing is read yet: ScanAndRepair
-   * does both, in that order, because the region to initialise is the one
-   * the scan finds to be past the log.
+   * @details The constructor neither preallocates nor reads. ScanAndRepair
+   * locates the end of the log first, then initialises the region past it.
    * @param[in] initial_capacity_bytes How much is made writable in place at
    * a time. It is a granularity rather than a limit: a log that outgrows it
    * is extended by the same amount again, at the price of one synchronous
@@ -155,6 +152,7 @@ class Wal {
   /**
    * @brief Reads the log from the beginning, repairs an interrupted tail,
    * and initialises the capacity beyond it.
+   * @param[in] min_epoch Frames at or below this are counted but not read.
    * @return See WalScanResult; `Ok` carries the frontier and the records.
    * @note Must succeed before the first append: it is what locates the end
    * of the log, and until the bytes of an interrupted write are overwritten
@@ -162,11 +160,10 @@ class Wal {
    * the next scan cannot place. A scan run after this instance has already
    * failed does not retry; it reports the failure again.
    *
-   * A frame at or below `min_epoch` is counted but not read, for a caller
-   * that already holds the state it would rebuild; the frontier and log end
-   * still come from every frame. Such a frame is hopped by header alone,
-   * except the boundary frame, which is read and checksummed in full. A
-   * header that fails to parse falls back to a full scan from offset 0.
+   * A hopped frame still contributes the frontier and the log end. Such a
+   * frame is hopped by header alone, except the boundary frame, which is
+   * read and checksummed in full. A header that fails to parse falls back to
+   * a full scan from offset 0.
    */
   WalScanResult ScanAndRepair(EpochNumber min_epoch = 0);
 
@@ -198,10 +195,9 @@ class Wal {
   off_t write_offset() const { return write_offset_; }
 
   /**
-   * @brief The epoch of the last frame actually on disk, safe to read from a
-   * thread other than the one that owns this instance between StartFlusher
-   * and the join.
-   * @details This moves only when a frame is written: an epoch that closed
+   * @brief The epoch of the last frame actually on disk.
+   * @details Safe to load from a thread that does not own this instance.
+   * This moves only when a frame is written: an epoch that closed
    * without a record advances the durable epoch a commit waits on, but it
    * advances this not at all, which is what a caller needs from it when the
    * question is what the log itself can be trusted to still hold after a
@@ -213,9 +209,8 @@ class Wal {
 
   /**
    * @brief How many times capacity had to be extended.
-   * @details Extension is synchronous and writes out a whole new region, so
-   * a measurement that means to see the cost of a group flush alone has to
-   * report this as zero.
+   * @details Each extension synchronously writes out a whole new zeroed
+   * region before the group that needed it.
    */
   size_t extension_count() const { return extension_count_; }
 
@@ -272,10 +267,8 @@ class Wal {
   off_t write_offset_{0};
   std::atomic<EpochNumber> frontier_{
       0};  // read cross-thread through frontier()
-  /**
-   * @brief The file's size, which under preallocation is also the offset
-   * below which every block is allocated and holds written-out zeroes.
-   */
+  // The file's size, which under preallocation is also the offset below
+  // which every block is allocated and holds written-out zeroes.
   off_t initialised_size_{0};
   size_t extension_count_{0};
 };

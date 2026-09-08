@@ -52,6 +52,8 @@ namespace epoch {
  */
 class Framework {
  public:
+  // Sentinel for a thread that participates in no epoch; not a reachable
+  // epoch value.
   static constexpr EpochNumber kThreadOffline = UINT32_MAX;
 
   Framework(size_t epoch_duration_ms = 40)
@@ -59,6 +61,13 @@ class Framework {
         stop_(false),
         global_epoch_(1),
         epoch_writer_([=]() { EpochWriterJob(epoch_duration_ms); }) {}
+  /**
+   * @brief Starts the epoch writer, parked until Start().
+   *
+   * @param epoch_duration_ms Writer poll period.
+   * @param hook Invoked on the writer thread after each successful advance,
+   * with the new global epoch. May be empty.
+   */
   Framework(size_t epoch_duration_ms, std::function<void(EpochNumber)> &&hook)
       : start_(false),
         stop_(false),
@@ -85,7 +94,7 @@ class Framework {
   }
 
   /**
-   * @brief Overwrites this thread's epoch with a replayed one.
+   * @brief Overwrites this thread's already-online slot.
    *
    * @details Valid only before #Start(), where the epoch writer has not begun
    * scanning slots.
@@ -185,7 +194,7 @@ class Framework {
     worker_cv_.notify_one();
   }
 
-  // Blocks the OFFLINE caller until it observes global_epoch >= target.
+  // Blocks the kThreadOffline caller until it observes global_epoch >= target.
   // Already-reached targets succeed even after Stop() or above the
   // high-water mark; otherwise false on timeout, Stop(), or a target
   // beyond the mark.
@@ -231,16 +240,15 @@ class Framework {
 
  private:
   /**
-   * @brief This thread's epoch slot, created offline on first use.
+   * @brief Returns this thread's epoch slot, created offline on first use.
    */
   std::atomic<EpochNumber> *ThreadSlot() {
     return thread_epochs_.Get<EpochNumber>([]() { return kThreadOffline; });
   }
 
   /**
-
-   * @brief The lowest epoch any online thread holds, or kThreadOffline.
-
+   * @brief Returns the lowest epoch any online thread holds, or
+   *        kThreadOffline.
    */
   EpochNumber GetSmallestEpoch() {
     EpochNumber min_epoch = kThreadOffline;
@@ -258,6 +266,7 @@ class Framework {
     const auto epoch_duration =
         std::chrono::duration_cast<std::chrono::nanoseconds>(
             std::chrono::milliseconds(epoch_duration_ms));
+    // Block until Start().
     {
       std::unique_lock<std::mutex> lk(epoch_mutex_);
       epoch_cv_.wait(lk, [&] { return start_.load(); });
@@ -278,6 +287,7 @@ class Framework {
         });
         advance_requested_.store(false);
       }
+      // Sample the smallest online epoch and the current global one.
       EpochNumber min_epoch = GetSmallestEpoch();
       EpochNumber old_epoch = global_epoch_;
       if (forced_wake && !stop_.load() && old_epoch >= kEpochHighWater) {
@@ -319,6 +329,8 @@ class Framework {
   std::condition_variable epoch_cv_;
   std::condition_variable worker_cv_;
   const std::function<void(EpochNumber)> epoch_hook_;
+  // Started by the constructor but parked on epoch_cv_ until Start(), so it
+  // cannot reach thread_epochs_ before that member is constructed.
   std::thread epoch_writer_;
   ThreadKeyStorage<std::atomic<EpochNumber>> thread_epochs_;
 };

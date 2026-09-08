@@ -24,10 +24,11 @@ namespace pax {
 /**
  * @brief Before-image store that keeps a columnar read view consistent.
  *
- * @details While at least one read view is active (capture_active > 0), every
- * PAX install publishes the replaced row image before its first strip-cell
- * or visibility-bit mutation; a first install publishes an empty
- * was_visible=false entry. An install that cannot publish (byte budget
+ * @details A generation is the interval during which at least one read view
+ * holds a registration. While one is active (active_captures_ > 0), every
+ * PAX install captures the replaced row image before its first strip-cell
+ * or visibility-bit mutation; a first install captures an empty
+ * was_visible=false entry. An install that cannot capture (byte budget
  * exceeded, or no commit epoch) fails the capture for the active generation
  * instead, and every result produced under it is discarded. A reader
  * with cut epoch E resolves a slot to the before-image of the oldest entry
@@ -41,12 +42,12 @@ class VersionStore {
   using Entry = UndoEntry;
 
   /**
-   * @brief Per-group undo state: the captured entries and their publish
+   * @brief Per-group undo state: the captured entries and their capture
    * counter.
    */
   struct GroupUndo {
     mutable std::mutex mutex;
-    // Monotonic publish counter, incremented after the entry is appended
+    // Monotonic capture counter, incremented after the entry is appended
     // and before the writer's first strip mutation; readers sample it to
     // detect concurrent writers.
     std::atomic<uint64_t> capture_count{0};
@@ -68,11 +69,15 @@ class VersionStore {
   }
 
   /**
-   * @brief Publishes a before-image for (group, slot).
+   * @brief Captures a before-image for (group, slot).
    *
    * @details Must run before the install's first strip-cell or
    * visibility-bit mutation. A first install into a fresh slot passes
-   * was_visible=false and an empty row.
+   * was_visible=false and an empty row. With no read view active this
+   * returns without capturing, and a capture that would take the store past
+   * its byte budget fails the capture instead of appending.
+   *
+   * @param writer_epoch The commit epoch of the install being made.
    */
   void Capture(PaxGroup *group, uint32_t slot, uint32_t writer_epoch,
                bool was_visible, std::string old_row);
@@ -89,6 +94,9 @@ class VersionStore {
 
   /**
    * @brief Arms capturing; the caller performs the epoch fence itself.
+   *
+   * @return A token whose valid is false when a failed capture still
+   * has registrations.
    */
   ReadViewToken BeginCapture();
 
@@ -111,7 +119,7 @@ class VersionStore {
    * @brief Fails every active read view and rejects new ones until the last
    * active read view releases.
    *
-   * @details Callers must publish the failure before mutating any cell the
+   * @details Callers must fail the capture before mutating any cell the
    * failed capture should have covered. A failure racing the last release
    * may land on the next generation, whose results are then discarded;
    * both orderings fail closed.

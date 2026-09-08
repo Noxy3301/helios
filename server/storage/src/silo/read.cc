@@ -214,7 +214,7 @@ ScanPaxResult ScanPax(TableDictionary &tables, std::shared_mutex &schema_mutex,
     table->GetPrimaryIndex().Scan(start_key, end_key, append_pax_row);
   }
   if (saw_non_pax) {
-    // Keep the fallback contract simple: no partial refs escape on failure.
+    // A heap row appeared, so no partial set of references escapes.
     result.ok = false;
     result.rows.clear();
   }

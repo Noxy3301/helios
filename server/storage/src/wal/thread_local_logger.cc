@@ -139,6 +139,7 @@ void ThreadLocalLogger::StopFlusher() {
 
 void ThreadLocalLogger::FlusherLoop() {
   for (;;) {
+    // Wait for a closed epoch past durable, or for shutdown or failure.
     EpochNumber target = 0;
     {
       std::unique_lock<std::mutex> lock(state_mutex_);
@@ -148,8 +149,8 @@ void ThreadLocalLogger::FlusherLoop() {
       if (failed_) return;
       target = closed_;
       const bool nothing_to_do = !ClosedAheadOfDurable();
-      // Stop only once everything already closed is on the device, so a clean
-      // shutdown does not drop records the tick had handed over.
+      // Stop only once everything already closed is on the device, so a
+      // clean shutdown does not drop records already handed over as closed.
       if (stop_requested_ && nothing_to_do) return;
       if (nothing_to_do) continue;
     }
@@ -157,6 +158,7 @@ void ThreadLocalLogger::FlusherLoop() {
     // Packing and file I/O run without state_mutex_; a committing thread
     // contends only for its own node's short buffer lock, never behind
     // packing or fdatasync.
+    // Write the group without holding state_mutex_.
     WalAppendResult result;
     try {
       result = FlushThrough(target);
@@ -168,6 +170,7 @@ void ThreadLocalLogger::FlusherLoop() {
       result = {false, EIO};
     }
 
+    // Freeze the flusher and publish the I/O error.
     if (!result.ok) {
       {
         std::lock_guard<std::mutex> lock(state_mutex_);
@@ -176,9 +179,9 @@ void ThreadLocalLogger::FlusherLoop() {
       publish_failure_(result.error_number);
       return;
     }
-    // An empty eligible range publishes without an append: the skipped
-    // epochs carry no record, and an epoch with nothing to persist is
-    // durable by definition.
+    // Publish the group as durable. An empty eligible range publishes
+    // without an append: the skipped epochs carry no record, and an epoch
+    // with nothing to persist is durable by definition.
     auto &trace = FlushTrace::Instance();
     const bool traced = trace.Enabled();
     const int64_t publish_enter = traced ? FlushTrace::Now() : 0;
@@ -201,8 +204,9 @@ WalAppendResult ThreadLocalLogger::FlushThrough(EpochNumber target) {
     }
     for (auto &record : swapped) {
       if (record.epoch <= durable_before) {
-        // A producer publishes OFFLINE only after Enqueue returns, so an epoch
-        // the writer has already closed cannot gain a record afterwards.
+        // A producer leaves its epoch only after Enqueue returns, so an
+        // epoch the writer has already closed cannot gain a record
+        // afterwards.
         // Reaching here means the closure the durability contract rests on is
         // broken, and continuing would acknowledge a record that is not on the
         // device.

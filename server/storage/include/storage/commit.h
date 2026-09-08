@@ -16,10 +16,9 @@ namespace helios::storage {
 /**
  * @brief Point read to revalidate at commit.
  *
- * `tid` and `found` come from an earlier read or scan row, and `tid` is the
- * packed `(epoch:32 | tid:32)` word that read returned; it is ignored when
- * `found` is false. Commit aborts when the row's TID moved; `found == false`
- * asserts the key was absent and aborts when a row appeared.
+ * `tid` and `found` come from an earlier read or scan row. Commit
+ * aborts when the row's TID moved; `found == false` asserts the key was
+ * absent and aborts when a row appeared.
  */
 struct ExternalReadEntry {
   std::string table_name;
@@ -60,6 +59,12 @@ inline constexpr char kDuplicatePrimaryKeyAbortReason[] =
     "duplicate_primary_key";
 
 /**
+ * @brief Every abort reason for a refused UNIQUE secondary key starts with
+ * this.
+ */
+inline constexpr char kDuplicateSecondaryKeyAbortPrefix[] = "unique_si_";
+
+/**
  * @brief When a commit is acknowledged, relative to its record reaching
  * stable storage. Carried per commit.
  *
@@ -83,12 +88,6 @@ struct ExternalSecondaryIndexEntry {
   std::string primary_key;
   bool is_delete = false;
 };
-
-/**
- * @brief Every abort reason for a refused UNIQUE secondary key starts with
- * this.
- */
-inline constexpr char kDuplicateSecondaryKeyAbortPrefix[] = "unique_si_";
 
 /**
  * @brief Range read to revalidate at commit.

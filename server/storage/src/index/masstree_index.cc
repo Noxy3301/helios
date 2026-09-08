@@ -161,6 +161,7 @@ struct ScanAdapter {
   }
 };
 
+// Same walk as ScanAdapter, with the DataItem handed to the callback.
 struct ScanValueAdapter {
   const char *begin_ptr;
   size_t begin_len;

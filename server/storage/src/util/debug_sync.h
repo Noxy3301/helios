@@ -34,11 +34,12 @@
 //     Writes one byte to the first descriptor and blocks until one byte can be
 //     read from the second. The observer therefore knows the process is inside
 //     the point, and the process stays there until the observer says otherwise,
-//     which is what an ordering assertion needs. The descriptors are inherited
-//     from the process that started this one (Python: os.pipe() plus Popen's
-//     pass_fds). A descriptor that cannot be used, or an action that does not
-//     parse, is a broken test rather than a production condition, and stops the
-//     process instead of continuing unsynchronized.
+//     which is what an ordering assertion needs. Both integers are descriptors
+//     the process already holds, whether it opened them itself or inherited
+//     them from the process that started it. A descriptor that cannot be used,
+//     or an action that does not parse, is a broken test rather than a
+//     production condition, and stops the process instead of continuing
+//     unsynchronized.
 
 #include <signal.h>
 #include <unistd.h>
@@ -184,6 +185,10 @@ inline void DebugSyncPoint(const char *point_name) {
 }  // namespace util
 }  // namespace helios::storage
 
+/**
+ * @brief Marks a named synchronization point whose action comes from the
+ *        environment.
+ */
 #define HELIOS_DEBUG_SYNC(point_name)                      \
   do {                                                     \
     if (::helios::storage::util::DebugSyncArmed()) {       \

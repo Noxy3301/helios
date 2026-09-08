@@ -81,11 +81,10 @@ struct ScanPaxRow {
 /**
  * @brief Outcome of a PAX primary-index range scan.
  *
- * @details `ok == false` for a scan that was refused outright, which the
- * caller must treat as an abort (the table is missing, or the exclusive end
- * bound is empty), and for a table strip-direct references cannot serve
- * (no PAX table, or some row overflowed to the heap), where the materializing
- * Scan path answers the same range.
+ * @details `ok == false` means the caller must use the materializing Scan
+ * path instead. This happens when the end bound is empty, the table is
+ * missing, it has no PAX table, or it contains rows that overflowed to the
+ * heap.
  */
 struct ScanPaxResult {
   bool ok = false;
@@ -101,10 +100,6 @@ uint64_t CurrentTid(const ScanPaxRow &row);
 
 /**
  * @brief Outcome of Database::ScanIndex.
- *
- * @details `ok == false` is the abort signal, as in ScanResult: the table
- * does not exist, the index does not exist, or the exclusive end bound is
- * empty.
  */
 struct ScanIndexResult {
   bool ok = false;

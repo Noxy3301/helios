@@ -57,9 +57,10 @@ void VersionStore::Capture(PaxGroup *group, uint32_t slot,
     undo->entries[slot].push_back(
         Entry{writer_epoch, was_visible, std::move(old_row)});
   }
-  // Capture after the append and before the caller mutates any strip
-  // cell: a reader whose count recheck still passes finished its in-place
-  // reads before this writer's first cell write.
+  // Capture after the append and before the caller mutates any strip cell.
+  // Readers that sample capture_count, read the strip cells, then sample
+  // again finished their in-place reads before this writer's first cell
+  // write.
   undo->capture_count.fetch_add(1, std::memory_order_release);
 }
 
@@ -129,7 +130,7 @@ void VersionStore::ClearAllLocked() {
     // The reset cannot alias two generations: counter comparisons happen
     // between samples under one active read view and this clear runs only
     // while none is active. Without it a once-captured group would lose
-    // the bulk read path for the rest of the process lifetime.
+    // in-place strip reads for the rest of the process lifetime.
     undo->capture_count.store(0, std::memory_order_release);
   }
   captured_bytes_.store(0, std::memory_order_relaxed);

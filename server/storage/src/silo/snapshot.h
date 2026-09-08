@@ -36,10 +36,10 @@
 namespace helios::storage {
 
 enum class SecondaryIndexOp : uint8_t {
-  kNone = 0,
-  kAdd = 1,
-  kRemove = 2,
-  kFull = 3,
+  kNone = 0,    // a primary row, which names no secondary index
+  kAdd = 1,     // one primary key joins the key's list
+  kRemove = 2,  // one primary key leaves it
+  kFull = 3,    // the whole list, as a checkpoint image carries it
 };
 
 /**
@@ -79,11 +79,13 @@ struct Snapshot {
   Snapshot(const Snapshot &) = default;
   Snapshot &operator=(const Snapshot &) = default;
   // Declaring copy ctor/assign above suppresses implicit move generation;
-  // an emplace_back(std::move(snapshot)) would otherwise silently fall back
-  // to the deep copy path
+  // an emplace_back(std::move(snapshot)) would otherwise fall back to the
+  // deep copy path.
   Snapshot(Snapshot &&) = default;
   Snapshot &operator=(Snapshot &&) = default;
 
+  // A later call for the same primary key replaces op; Add and Remove do not
+  // compose.
   void RecordSecondaryDelta(const std::string_view primary_key,
                             SecondaryIndexOp op) {
     for (auto &delta : secondary_index_deltas) {

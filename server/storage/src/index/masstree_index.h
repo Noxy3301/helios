@@ -35,7 +35,8 @@ class MasstreeIndex final {
    * @brief Routes future blank primary rows through a table's PaxTable.
    *
    * @details Secondary indexes never set a PaxTable: they store index
-   * metadata rather than table row payloads.
+   * metadata rather than table row payloads. The table is not owned, and a
+   * null table leaves later blank rows on the heap.
    */
   void SetPaxTable(pax::PaxTable *store);
 
@@ -49,7 +50,15 @@ class MasstreeIndex final {
    */
   void PutBlank(std::string_view key);
 
-  // Range operations. Return the number of keys the walk emitted.
+  /**
+   * @brief Walks the keys in [begin, end), or to the last key when end is
+   *        absent; the reverse forms walk the same range downward.
+   *
+   * @details operation returns true to stop the walk, the opposite of
+   * masstree's own visitor. ForEach walks every key.
+   * @return The number of keys handed to operation, including the one that
+   * stopped it.
+   */
   size_t Scan(std::string_view begin, std::optional<std::string_view> end,
               std::function<bool(std::string_view)> operation);
   size_t Scan(std::string_view begin, std::string_view end,
@@ -70,6 +79,11 @@ class MasstreeIndex final {
    * `expected`, verified the delete transaction id and confirmed the key
    * still resolves to the same DataItem. `retired_tid` is published on the
    * removed item before it is retired to RCU.
+   *
+   * @param expected Slot pointer captured at enqueue; a null pointer skips
+   * the identity check.
+   * @return True when the slot was removed; false when the key is gone or a
+   * replacement holds it.
    */
   bool Purge(std::string_view key, DataItem *expected,
              TransactionId retired_tid = {});

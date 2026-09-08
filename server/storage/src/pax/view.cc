@@ -61,7 +61,8 @@ Database::PaxReadView Database::Impl::AcquirePaxView(
         "holding the epoch";
     return view;
   }
-  // Test hook: holds the read view open between the fence and the scan.
+  // Test hook: a wait point after the fence and before the handle is marked
+  // valid.
   HELIOS_DEBUG_SYNC("pax_read_view.after_fence");
   // A capture failure landing during acquisition must fail it here; callers
   // treat a valid view as a serviceable read view.
@@ -108,7 +109,9 @@ bool Database::Impl::InstallPaxSchema(
   schema.table_name = std::string(table_name);
   schema.field_max_bytes = field_max_bytes;
   // Typed cells only when the kinds vector matches the field count; otherwise
-  // every field stays UNTYPED (byte-identical to the untyped layout).
+  // every field stays UNTYPED (byte-identical to the untyped layout). When
+  // the kinds match, a scale vector of any other length is replaced with
+  // zeros.
   if (field_kind.size() == field_max_bytes.size()) {
     schema.field_kind = field_kind;
     if (field_scale.size() == field_max_bytes.size())

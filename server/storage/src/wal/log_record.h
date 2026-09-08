@@ -1,6 +1,7 @@
 /**
  * @file server/storage/src/wal/log_record.h
- * The epoch-tagged group of writes a commit appends to the log.
+ * The epoch-tagged group of writes persisted on the log and inside a
+ * checkpoint.
  */
 
 #ifndef HELIOS_STORAGE_SRC_WAL_LOG_RECORD_H
@@ -44,7 +45,7 @@ struct LogRecord {
     TransactionId transaction_id;
     std::string table_name;
     std::string index_name;
-    uint32_t index_type = 0;
+    uint32_t index_type = 0;  // IndexConstraint, as a msgpack-stable integer.
     std::vector<std::string> primary_keys;
     SecondaryIndexOp secondary_op = SecondaryIndexOp::kNone;
     std::string secondary_primary_key;

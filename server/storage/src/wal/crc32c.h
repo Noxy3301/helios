@@ -24,6 +24,12 @@ namespace wal {
  */
 class Crc32c {
  public:
+  /**
+   * @brief Extends the checksum so that successive calls equal one call on
+   *        the concatenation.
+   *
+   * @param data Null only when size is 0.
+   */
   void Update(const void *data, size_t size);
   uint32_t Finish() const { return state_ ^ 0xffffffffu; }
 

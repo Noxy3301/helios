@@ -16,8 +16,9 @@
 
 /**
  * @file server/storage/src/wal/logger.cc
- * The write-ahead log and the durability frontier a synchronous commit
- * waits on.
+ * The write-ahead log and the durability frontier a synchronous commit waits
+ * on. Folds the checkpoint and the log tail into the write set recovery
+ * replays.
  */
 
 #include "wal/logger.h"
@@ -44,9 +45,7 @@ namespace {
  * @brief Folds one more field's hash into a seed.
  * @note The constant is 2^32 divided by the golden ratio, boost's
  * hash_combine mixer; with the shifts it spreads each field's bits before
- * the fold. Chosen over hashing a delimited concatenation, which would
- * build a temporary string for every lookup on the recovery fold's hot
- * path; combining folds the fields' std::hash values allocation-free.
+ * the fold.
  */
 size_t HashCombine(size_t seed, size_t value) {
   constexpr size_t kGoldenRatioMix = 0x9e3779b9u;
@@ -151,8 +150,8 @@ void FoldSecondary(const Write &write, SecondaryOps &ops) {
   }
 }
 
-// Keep the newest version per row. Folded through an index rather than a
-// rescan of the set: the fold runs once per logged write, and a linear
+// Keep the newest version per row. Folded through a position map rather than
+// a rescan of the set: the fold runs once per logged write, and a linear
 // rescan makes recovery quadratic in the log size.
 void FoldPrimary(const Write &write, WriteSetType &recovery_set,
                  PrimaryPos &positions) {
@@ -301,6 +300,7 @@ Logger::RecoveryResult Logger::Recover() {
       // the log alone still holds everything the image would have supplied.
       SPDLOG_WARN("Ignoring the checkpoint image: {0}", image.detail);
       image.records.clear();
+      // The cut is cleared with it so the scan hops nothing.
       image.cut_epoch = 0;
     }
   }
@@ -310,9 +310,9 @@ Logger::RecoveryResult Logger::Recover() {
   if (scan.status != WalScanResult::Status::kOk) return FailRecovery(scan);
 
   if (image.status == EpochScanCheckpoint::Image::Status::kOk) {
-    // An image is honoured only when the log is at least as durable now as it
-    // was when this image was published, since durability only advances and a
-    // shorter log cannot be the one the image came from (see the FIXME above).
+    // The image is honoured only when this log's last written epoch is at
+    // least the one recorded at publish; a shorter log cannot be the file
+    // that image named (see the FIXME above).
     if (scan.frontier < image.wal_frontier_at_publish) {
       SPDLOG_WARN(
           "Ignoring the checkpoint image: it was published when the log was "
@@ -320,6 +320,8 @@ Logger::RecoveryResult Logger::Recover() {
           "holds",
           image.wal_frontier_at_publish, scan.frontier);
       image.records.clear();
+      // The frames the first scan hopped have to be read now that the image
+      // is gone.
       scan = thread_local_logger_->ScanAndRepair(0);
       if (scan.status != WalScanResult::Status::kOk) return FailRecovery(scan);
     } else {
@@ -436,7 +438,7 @@ void Logger::AwaitCommitDurability(EpochNumber commit_epoch,
   if (!awaits_durability) return;
 
   // The sample is drawn before the wait, so a commit whose epoch is already
-  // durable is represented alongside one that waits. The watermark reading is
+  // durable is represented alongside one that waits. The frontier reading is
   // what the commit saw on arrival; publication can land before the wait makes
   // its own check, which is why the recorded field says only that.
   auto &trace = FlushTrace::Instance();
@@ -445,8 +447,8 @@ void Logger::AwaitCommitDurability(EpochNumber commit_epoch,
   const bool not_durable_at_enter =
       sampled && durable_epoch_.load(std::memory_order_seq_cst) < commit_epoch;
 
-  // TimedOut cannot arrive from an infinite deadline; treating it as a failure
-  // keeps a later finite deadline from turning into a silent acknowledgement.
+  // Deadline::max() cannot time out, so any result other than Durable is a
+  // stop or an I/O failure and must not be acknowledged.
   const auto result = WaitUntilDurable(commit_epoch, Deadline::max());
   if (sampled) {
     trace.RecordCommit(commit_epoch, wait_enter, FlushTrace::Now(),

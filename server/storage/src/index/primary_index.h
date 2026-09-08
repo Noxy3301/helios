@@ -45,6 +45,12 @@ class PrimaryIndex {
 
   DataItem *Get(std::string_view key) { return index_.Get(key); }
 
+  /**
+   * @brief Returns the slot for key, inserting a blank DataItem when it is
+   *        absent.
+   *
+   * @return Non-null.
+   */
   DataItem *GetOrInsert(std::string_view key) {
     auto *item = index_.Get(key);
     if (item == nullptr) {

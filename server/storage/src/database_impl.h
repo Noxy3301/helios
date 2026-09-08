@@ -60,13 +60,13 @@ class Database::Impl {
    * durability frontier.
    * @details Strictly above the frontier: a transaction joining the
    * frontier's own epoch could return a Sync acknowledgement before its
-   * record was written. Refuses when even the resumed epoch would reach the
-   * high-water mark; past it the epoch no longer orders against the
-   * frontier, and resuming exactly at the mark would only abort on the
-   * writer's first tick instead of failing diagnosably here.
+   * record was written. Terminates the process when even the resumed epoch
+   * would reach the high-water mark; past it the epoch no longer orders
+   * against the frontier, and resuming exactly at the mark would only abort
+   * on the writer's first tick instead of failing diagnosably here.
    * @note Compared before the addition: the scanner accepts a frontier of
    * UINT32_MAX by design, and `frontier + 1` would wrap to zero, the value
-   * that means "no participant".
+   * MinEpoch skips.
    */
   static EpochNumber ResumeEpochAbove(EpochNumber frontier);
 
@@ -120,8 +120,8 @@ class Database::Impl {
    * @brief Computes exact NDV for each integer key-part prefix of one index.
    *
    * @details The query layer uses this to set MySQL `rec_per_key`. The scan
-   * counts live index entries only. If `parts` refuses a live key, the method
-   * returns false so the caller keeps its old estimate.
+   * counts live index entries only; storage/database.h states when it
+   * answers false.
    */
   bool IndexNdv(const std::string_view table_name,
                 const std::string_view index_name, uint32_t num_parts,
@@ -134,9 +134,8 @@ class Database::Impl {
    * one-column range cardinality locally. The scan is independent of
    * NDV/rec_per_key: pass 1 counts row weight, and pass 2 records the
    * leading-key prefix at each bucket boundary. Secondary-index entries are
-   * weighted by their PK list size so bucket depth tracks rows, not distinct
-   * secondary keys. A key `parts` refuses returns false, letting the caller
-   * keep its heuristic.
+   * weighted by their primary-key list size so bucket depth tracks rows, not
+   * distinct secondary keys. storage/database.h states when it answers false.
    */
   bool IndexHistogram(const std::string_view table_name,
                       const std::string_view index_name, uint32_t buckets,
@@ -166,9 +165,16 @@ class Database::Impl {
        epoch::Framework::kEpochHighWater) /
       2;
 
-  // Called by a thread the epoch framework owns.
+  // Builds the callback the epoch writer thread runs after each advance.
   std::function<void(EpochNumber)> MakeEpochHook();
 
+  /**
+   * @brief Replays the log into the indexes and resumes the global epoch
+   *        above the recovered frontier.
+   *
+   * @details Terminates the process when a table cannot be created or a
+   * secondary index was declared with another constraint.
+   */
   void Recover();
 
   Config config_;
@@ -176,6 +182,8 @@ class Database::Impl {
   epoch::Framework epoch_framework_;
   TableDictionary table_dictionary_;
   wal::EpochScanCheckpoint scan_checkpoint_;
+  // Held shared for the whole of every read, commit and statistics call,
+  // exclusive for a definition change.
   std::shared_mutex schema_mutex_;
   index::Reaper reaper_;
 };

@@ -93,7 +93,7 @@ inline StableValue StableReadValue(const DataItem &item) {
 }
 
 /**
- * @brief Stable-read a row while masking unselected PAX columns.
+ * @brief Stable read of a row with the unselected PAX columns masked.
  *
  * @details PAX-resident rows keep their full field shape, but unlisted columns
  * are emitted as one-byte empty fields. Heap rows are returned in full, so

@@ -18,7 +18,7 @@
 /**
  * @file server/storage/src/index/data_item.h
  * What the index maps a key to: the Silo transaction id word and the row
- * payload behind it.
+ * payload behind it, or the primary keys a secondary key points at.
  */
 
 #ifndef HELIOS_STORAGE_SRC_INDEX_DATA_ITEM_H
@@ -39,6 +39,15 @@
 
 namespace helios::storage {
 
+/**
+ * @brief What one index key maps to.
+ *
+ * @details A primary-index slot keeps the row payload in buffer; a
+ * secondary-index slot keeps the primary keys that key points at in
+ * primary_keys, published with atomic load and store. transaction_id is the
+ * Silo version word both kinds carry. value() is valid only while buffer is
+ * not in PAX mode.
+ */
 struct DataItem {
   std::atomic<TransactionId> transaction_id;
   DataBuffer buffer;

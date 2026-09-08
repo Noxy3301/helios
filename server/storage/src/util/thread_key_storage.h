@@ -34,6 +34,14 @@
 
 namespace helios::storage {
 
+/**
+ * @brief Holds one T per calling thread, and links every T created so far so
+ *        another thread can walk them.
+ *
+ * @details Get() stores the node in pthread TLS and prepends it to
+ * head_node_. Destroying this object deletes every node, so no thread may
+ * call Get afterwards.
+ */
 template <class T>
 class ThreadKeyStorage {
   struct TlsNode {
@@ -74,17 +82,20 @@ class ThreadKeyStorage {
    */
   template <class U>
   T *Get(std::function<U()> &&func) {
-    void *ptr = pthread_getspecific(key_);
+    void *ptr = ::pthread_getspecific(key_);
     if (ptr == nullptr) ptr = Install(new TlsNode(std::move(func)));
     return &reinterpret_cast<TlsNode *>(ptr)->payload;
   }
 
   T *Get() {
-    void *ptr = pthread_getspecific(key_);
+    void *ptr = ::pthread_getspecific(key_);
     if (ptr == nullptr) ptr = Install(new TlsNode());
     return &reinterpret_cast<TlsNode *>(ptr)->payload;
   }
 
+  /**
+   * @brief Invokes `f` on every published per-thread T, newest first.
+   */
   void ForEach(std::function<void(T *)> &&f) {
     TlsNode *ptr = head_node_.load();
     while (ptr != nullptr) {
@@ -111,6 +122,8 @@ class ThreadKeyStorage {
   }
 
   pthread_key_t key_;
+  // pthread TLS cannot be iterated from another thread, so every node is
+  // linked here too.
   std::atomic<TlsNode *> head_node_;
 };
 

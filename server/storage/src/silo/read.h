@@ -1,8 +1,8 @@
 /**
  * @file server/storage/src/silo/read.h
  * The read side of the store: point reads and range scans. Each call takes a
- * shared lock on the schema, copies rows with the Silo-style stable read, and
- * returns the packed TIDs a later commit validates as read-set evidence.
+ * shared lock on the schema, reads rows with the stable read, and returns the
+ * packed TIDs a later commit validates as read-set evidence.
  */
 
 #ifndef HELIOS_STORAGE_SRC_SILO_READ_H
@@ -27,10 +27,10 @@ namespace silo {
  * @brief Reads one row.
  *
  * Takes a shared lock on the schema, resolves the primary-index slot, and
- * performs a Silo-style double TID read on the DataItem: load the TID,
- * yield while the lock bit (LSB) is set, copy the value, then re-load the
- * TID and only return it if it has not moved. The caller keeps the
- * returned `tid` and submits it through Commit later.
+ * performs a stable read on the DataItem: load the TID, yield while the lock
+ * bit (LSB) is set, copy the value, then re-load the TID and retry until it
+ * has not moved. The caller keeps the returned `tid` and submits it through
+ * Commit later.
  *
  * A miss, a tombstone and a table that does not exist all return a result
  * with `found == false`.
@@ -60,7 +60,7 @@ std::vector<ReadResult> BatchRead(
  *        the range.
  *
  * Drives index::Scan / index::ScanReverse with a callback that, for each
- * hit, performs the same double-TID read used by the point read. The caller
+ * hit, performs the same stable read used by the point read. The caller
  * assembles the commit-time ExternalRangeReadEntry from its own scan
  * arguments and the returned keys. Tombstones are skipped: key-list
  * validation catches any reuse of their slots without a per-entry TID.
@@ -83,7 +83,7 @@ ScanResult Scan(TableDictionary &tables, std::shared_mutex &schema_mutex,
  *        row.
  *
  * For every secondary key in `[start_key, end_key)`, pins its immutable
- * primary-key list and, for each key in the view, performs the same double-TID
+ * primary-key list and, for each key in the view, performs the same stable
  * base read as the point read. The caller assembles the commit-time
  * ExternalRangeReadEntry from its own scan arguments and both returned
  * key lists. `ok == false` is the abort signal, as in the primary range read,

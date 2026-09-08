@@ -305,7 +305,7 @@ uint64_t OverflowCount(const PaxTable *store);
 // Columnar read view surface.
 //
 // While a read view acquired through Database::AcquirePaxView is active,
-// every PAX install publishes the replaced row image into a per-group undo
+// every PAX install captures the replaced row image into a per-group undo
 // map before its first strip mutation, or fails the capture for the active
 // generation when it cannot (src/pax/version_store.h holds the full
 // contract). A reader with cut epoch E resolves a slot to the before-image
@@ -315,10 +315,10 @@ uint64_t OverflowCount(const PaxTable *store);
 // ---------------------------------------------------------------------------
 
 /**
- * @brief One published before-image for a (group, slot).
+ * @brief One captured before-image for a (group, slot).
  */
 struct UndoEntry {
-  uint32_t writer_epoch;  // commit epoch of the install that published this
+  uint32_t writer_epoch;  // commit epoch of the install that captured this
   bool was_visible;       // false: the slot held no visible row before it
   std::string old_row;    // the row it held; empty when !was_visible
 };
@@ -346,7 +346,7 @@ uint64_t UndoCount(const PaxGroup *group);
 /**
  * @brief Copies every undo entry recorded for `group`, keyed by slot.
  *
- * @details Entries per slot are ordered as published, and per-slot install
+ * @details Entries per slot are ordered as captured, and per-slot install
  * order is epoch-non-decreasing. The copy is immune to concurrent capture.
  */
 std::unordered_map<uint32_t, std::vector<UndoEntry>> UndoGroupEntries(
@@ -355,7 +355,7 @@ std::unordered_map<uint32_t, std::vector<UndoEntry>> UndoGroupEntries(
 /**
  * @brief Copies the undo entries recorded for one (group, slot).
  *
- * @details Ordered as published and epoch-non-decreasing, and immune to a
+ * @details Ordered as captured and epoch-non-decreasing, and immune to a
  * concurrent capture, as UndoGroupEntries is.
  */
 std::vector<UndoEntry> UndoSlotEntries(const PaxGroup *group, uint32_t slot);

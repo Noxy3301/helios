@@ -19,13 +19,17 @@ namespace pax {
 namespace {
 
 // ---------------------------------------------------------------------------
-// Typed cells. Parses the query layer's ASCII val_str into a fixed-width LE
-// binary at scatter time, and reformats the binary back into the *exact*
-// original val_str ASCII at gather time. The round trip must be byte-identical:
-// DataBuffer::size tracks the original ASCII payload size, so a gather that
-// renders a different length would corrupt the row. Any parse/range failure
-// returns false so the row overflows to the heap (never wrong, just
-// unaccelerated), exactly like an over-wide UNTYPED cell.
+// Row format. helios::row (common/pack/row.h) owns it: a field is one width
+// byte, that many little-endian length bytes, then the payload, and the width
+// byte 0xFF marks a NULL field. This file reads and writes the same shape
+// without depending on that header, because the strips store the payloads
+// alone.
+//
+// Typed cells. A typed field's ASCII is parsed into a fixed-width LE binary at
+// scatter time and reformatted at gather time. The round trip is
+// byte-identical except in one case the query layer does not produce: a field
+// written with width byte 0x00 comes back as the 0xFF marker. Any parse or
+// range failure returns false so the row overflows to the heap.
 // ---------------------------------------------------------------------------
 
 // int64 from a full ASCII integer (from_chars, whole span consumed).
@@ -358,18 +362,20 @@ size_t PaxGroup::GatherRow(uint32_t slot, std::byte *dst,
   std::string scratch;  // reused typed->ASCII buffer (no per-field alloc)
   size_t off = 0;
   for (size_t f = 0; f < fields; f++) {
+    // Load and clamp the cell length: a torn read can produce garbage but
+    // must stay memory-safe. The caller's TID re-check rejects torn rows.
     const std::byte *cell = arena_.get() + strip_offset_[f] +
                             static_cast<size_t>(stride_[f]) * slot;
     uint16_t len;
     std::memcpy(&len, cell, sizeof(len));
-    // Clamp against the cell width: a torn read can produce garbage but must
-    // stay memory-safe. The caller's TID re-check rejects torn rows.
     if (len > schema_.field_max_bytes[f]) len = 0;
+    // Emit the empty-field marker.
     if (len == 0) {
       if (off + 1 > expected_size) return off;
       dst[off++] = kNoValue;
       continue;
     }
+    // Resolve the payload: typed ASCII, or the untyped bytes.
     const auto k = static_cast<FieldKind>(schema_.kind_of(f));
     const char *src;
     uint32_t vlen;
@@ -383,6 +389,7 @@ size_t PaxGroup::GatherRow(uint32_t slot, std::byte *dst,
       src = reinterpret_cast<const char *>(cell + kCellLenBytes);
       vlen = len;
     }
+    // Write the length prefix and the payload.
     const uint32_t prefix = LengthPrefixBytes(vlen);
     if (off + 1 + prefix + vlen > expected_size) return off;
     dst[off++] = static_cast<std::byte>(prefix);
@@ -430,6 +437,8 @@ void PaxGroup::GatherRowMasked(uint32_t slot, const uint32_t *columns,
   const size_t fields = schema_.field_count();
   AppendCellField(0, slot, out);  // null-flags field (always UNTYPED)
 
+  // Merge the ascending MySQL column numbers onto fields 1..n; mark the rest
+  // empty.
   size_t column_index = 0;
   for (size_t field = 1; field < fields; ++field) {
     if (column_index < n_columns &&

@@ -22,6 +22,8 @@
 #ifndef HELIOS_STORAGE_SRC_UTIL_SPDLOG_H
 #define HELIOS_STORAGE_SRC_UTIL_SPDLOG_H
 
+// spdlog snapshots SPDLOG_ACTIVE_LEVEL at include time, so this precedes the
+// include below. NDEBUG compiles SPDLOG_DEBUG out of the binary.
 #ifdef NDEBUG
 #define SPDLOG_ACTIVE_LEVEL SPDLOG_LEVEL_INFO
 #else

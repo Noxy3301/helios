@@ -229,7 +229,7 @@ Database::Impl::~Impl() {
       "respectively.",
       epoch_framework_.GetGlobalEpoch(), logger_.GetDurableEpoch());
   // Written once every thread that records has joined, so the census reaches
-  // the filesystem without any of its cost landing on a measured path.
+  // the filesystem off the commit and flush paths.
   wal::FlushTrace::Instance().Dump();
   SPDLOG_INFO("Storage instance has been destructed.");
   assert(Database::Impl::instance_ == this);
@@ -250,11 +250,13 @@ std::function<void(EpochNumber)> Database::Impl::MakeEpochHook() {
       logger_.ScheduleFlush(updated_epoch - 2);
     }
 
-    // Tick masstree's globalepoch so RCU can free retired leaves and
-    // DataItem* limbo once min_active_epoch() catches up. Workers
-    // release their epoch at tx/RPC boundaries via
-    // ReleaseThreadEpoch; this call only moves the watermark.
+    // Physically purge the tombstones whose grace epoch has passed.
     reaper_.Reap(updated_epoch);
+
+    // Tick masstree's globalepoch so RCU can free retired leaves and
+    // DataItem limbo once min_active_epoch() catches up. Workers release
+    // their epoch at RPC boundaries through ReleaseThreadEpoch; this call
+    // only moves active_epoch.
     index::MasstreeAdvanceEpoch();
   };
 }
@@ -365,7 +367,7 @@ void Database::Impl::Recover() {
   epoch_framework_.SetThreadEpoch(durable_epoch);
 
   for (auto &entry : recovered.recovery_set) {
-    // Skip deleted entries.
+    // A tombstone carries an empty row and must not be re-inserted.
     const bool live = entry.index_name.empty() ? entry.data_item_copy.HasRow()
                                                : entry.data_item_copy.IsLive();
     if (!live) continue;
@@ -382,7 +384,6 @@ void Database::Impl::Recover() {
                              entry.data_item_copy.transaction_id.load().epoch);
 
     if (entry.index_name.empty()) {
-      // Primary Index recovery
       table->GetPrimaryIndex().Put(entry.key, std::move(entry.data_item_copy));
     } else {
       // Secondary Index recovery

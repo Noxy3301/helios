@@ -36,10 +36,10 @@ namespace helios::storage {
 /**
  * @brief Owns or references the row payload stored in a DataItem.
  *
- * @details Heap mode is the original layout: `value` owns a new[] byte array
- * of `size` bytes, with `capacity_or_slot` tracking the allocation. It is used
- * for transaction-local copies, non-PAX tables, and rows that overflowed
- * from PAX storage.
+ * @details Heap mode: `value` owns a new[] byte array of `size` bytes and
+ * `capacity_or_slot` tracks that allocation. It is used for
+ * transaction-local copies, non-PAX tables, and rows that overflowed from
+ * PAX storage.
  *
  * PAX mode: the payload bytes live in a PaxGroup's column strips; this
  * buffer only references them. `value` carries a tagged pointer
@@ -50,8 +50,9 @@ namespace helios::storage {
  * unchanged in both modes.
  *
  * Mode transitions are one-way per row: index layers create blank items in
- * PAX mode for PAX tables; a row whose bytes don't fit the declared cell
- * widths overflows to heap mode for good.
+ * PAX mode for PAX tables. A row overflows to heap mode for good when the
+ * table has no free slot, or when its bytes do not fit the declared cell
+ * widths.
  *
  * Copy semantics do the storage conversion implicitly: copying FROM a
  * PAX-mode buffer gathers the row into heap bytes (transaction-local
@@ -137,6 +138,14 @@ struct DataBuffer {
     return *this;
   }
 
+  /**
+   * @brief Copies len bytes of row into this buffer.
+   *
+   * @details Does not take ownership of row. A null pointer or a zero length
+   * empties the row without releasing the heap allocation, which is kept so a
+   * similar-sized row does not reallocate. A PAX-mode buffer installs or
+   * tombstones through ResetPax.
+   */
   void Reset(const std::byte *row, const size_t len) {
     if (is_pax()) {
       ResetPax(row, len);
@@ -185,7 +194,7 @@ struct DataBuffer {
   }
 
   /**
-   * @brief Publishes the pre-install row image while a columnar read view
+   * @brief Captures the pre-install row image while a columnar read view
    * is active.
    *
    * @details Must run before the first strip mutation of this install
@@ -196,10 +205,12 @@ struct DataBuffer {
   void CaptureBeforeImage();
 
   /**
-   * @brief Installs payload bytes into this PAX-mode buffer.
+   * @brief Installs payload bytes into this PAX-mode buffer, or tombstones
+   *        it.
    *
-   * @details The caller holds the row's TID lock. If the row does not fit its
-   * declared cell widths, this buffer permanently switches to heap storage.
+   * @details The caller holds the row's TID lock. This buffer permanently
+   * switches to heap storage when the table has no free slot, or when the
+   * row does not fit its declared cell widths.
    */
   void ResetPax(const std::byte *row, const size_t len);
 

@@ -55,19 +55,20 @@ struct CommitPayload {
  *   - SI ops:      (secondary key, primary key, add | remove)
  *   - range reads: scan bounds plus the returned key list
  *
- * The protocol is Silo's commit protocol (paper §4.4), bracketed by an
- * epoch join and leave; [added] marks steps beyond the paper, for by-key
- * inputs and SQL insert / UNIQUE semantics:
+ * The protocol is Silo's commit protocol (paper §4.4), with a join at the
+ * start, a leave and re-join at 1.2, and a leave after enqueue; [added]
+ * marks steps beyond the paper, for by-key inputs and SQL insert / UNIQUE
+ * semantics:
  *
  *   Resolve   R1  [added] map every key to its DataItem
  *             R2  [added] materialize blank slots for fresh write keys
  *             R3  [added] reject in-request UNIQUE duplicates
  *   Phase 1   1.1 [paper] lock the write set in address order
  *             1.2 [paper] re-read the global epoch (serialization point)
- *   Phase 2   2.1 [paper] exact reads: observed TIDs unmoved
- *             2.2 [added] ranges: replay the scans, compare key lists
- *                         (membership only; row TIDs are validated
- *                         at 2.1)
+ *   Phase 2   2.1 [paper] exact reads: observed presence and TIDs unchanged
+ *             2.2 [added] ranges: replay the scans, compare the key lists
+ *                         in scan order and by count (row TIDs are
+ *                         validated at 2.1)
  *             2.3 [added] inserts: the claimed key still holds no row
  *             2.4 [added] UNIQUE recheck after the lock wait
  *   Phase 3   3.1 [paper] install values; deletes become tombstones
