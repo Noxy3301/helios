@@ -366,9 +366,8 @@ void Database::Impl::Recover() {
 
   for (auto &entry : recovered.recovery_set) {
     // Skip deleted entries.
-    const bool live = entry.index_name.empty()
-                          ? entry.data_item_copy.HasRow()
-                          : entry.data_item_copy.IsInitialized();
+    const bool live = entry.index_name.empty() ? entry.data_item_copy.HasRow()
+                                               : entry.data_item_copy.IsLive();
     if (!live) continue;
     CreateTable(entry.table_name);
     auto table = GetTable(entry.table_name);

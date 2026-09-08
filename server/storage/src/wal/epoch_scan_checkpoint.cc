@@ -247,7 +247,7 @@ EpochScanCheckpoint::CaptureResult EpochScanCheckpoint::CaptureSecondaryEntry(
       ++*retries;
       continue;
     }
-    const PackedPrimaryKeysView keys(primary_keys);
+    const PrimaryKeyList::View keys(primary_keys);
     if (keys.empty()) return EpochScanCheckpoint::CaptureResult::kSkipped;
     out.key.assign(key.data(), key.size());
     out.transaction_id = observed;

@@ -34,7 +34,7 @@
 #include <vector>
 
 #include "index/data_buffer.h"
-#include "index/packed_primary_keys.h"
+#include "index/primary_key_list.h"
 #include "silo/transaction_id.h"
 
 namespace helios::storage {
@@ -42,7 +42,7 @@ namespace helios::storage {
 struct DataItem {
   std::atomic<TransactionId> transaction_id;
   DataBuffer buffer;
-  std::shared_ptr<const PackedPrimaryKeys> primary_keys_;
+  std::shared_ptr<const PrimaryKeyList> primary_keys_;
 
   // Direct byte access is invalid for PAX-resident rows (no contiguous
   // bytes); those callers must go through DataBuffer::GatherInto / copies.
@@ -55,22 +55,22 @@ struct DataItem {
     return buffer.value;
   }
   size_t size() const { return buffer.size; }
-  bool IsInitialized() const {
+  bool IsLive() const {
     if (buffer.size != 0) return true;
     const auto primary_keys = std::atomic_load(&primary_keys_);
     return primary_keys && primary_keys->count != 0;
   }
   bool HasRow() const { return buffer.size != 0; }
 
-  PackedPrimaryKeysView primary_keys_view() const {
-    return PackedPrimaryKeysView(std::atomic_load(&primary_keys_));
+  PrimaryKeyList::View primary_keys_view() const {
+    return PrimaryKeyList::View(std::atomic_load(&primary_keys_));
   }
 
   std::vector<std::string> primary_keys_vector() const {
     // Holds the list for the walk: the view is a pointer, and a writer may
     // publish a replacement over the member at any point.
     const auto primary_keys = std::atomic_load(&primary_keys_);
-    const PackedPrimaryKeysView view(primary_keys);
+    const PrimaryKeyList::View view(primary_keys);
     std::vector<std::string> keys;
     keys.reserve(view.size());
     for (std::string_view key : view) {
@@ -81,7 +81,7 @@ struct DataItem {
 
   void SetPrimaryKeys(const std::vector<std::string> &primary_keys) {
     assert(IsSortedDeduped(primary_keys));
-    auto packed = PackedPrimaryKeys::FromSortedDeduped(primary_keys);
+    auto packed = PrimaryKeyList::FromSortedDeduped(primary_keys);
     std::atomic_store(&primary_keys_, std::move(packed));
   }
 
@@ -119,7 +119,7 @@ struct DataItem {
   void InsertPrimaryKey(const std::byte *key, size_t len) {
     const std::string_view new_key(reinterpret_cast<const char *>(key), len);
     auto current = std::atomic_load(&primary_keys_);
-    auto next = PackedPrimaryKeys::Insert(current, new_key);
+    auto next = PrimaryKeyList::Insert(current, new_key);
     if (next != current) {
       std::atomic_store(&primary_keys_, std::move(next));
     }
@@ -128,7 +128,7 @@ struct DataItem {
   void DeletePrimaryKey(const std::byte *key, size_t len) {
     std::string_view target(reinterpret_cast<const char *>(key), len);
     auto current = std::atomic_load(&primary_keys_);
-    auto next = PackedPrimaryKeys::Delete(current, target);
+    auto next = PrimaryKeyList::Delete(current, target);
     if (next != current) {
       std::atomic_store(&primary_keys_, std::move(next));
     }

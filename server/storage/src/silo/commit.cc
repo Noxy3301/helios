@@ -449,7 +449,7 @@ bool ReplayIndexRange(CommitCtx &ctx, const ExternalRangeReadEntry &range) {
     if (!secondary_live) {
       return false;
     }
-    for (std::string_view primary_key : PackedPrimaryKeysView(primary_keys)) {
+    for (std::string_view primary_key : PrimaryKeyList::View(primary_keys)) {
       if (collect_base_row(secondary_key, primary_key)) return true;
     }
     return false;
@@ -500,17 +500,17 @@ bool ValidateInserts(CommitCtx &ctx) {
 // same secondary key during the wait on the write lock, so the
 // resolve-time dedup (R3) is not enough on its own.
 bool ValidateUnique(CommitCtx &ctx) {
-  std::unordered_map<DataItem *, PackedPrimaryKeys::Ptr> si_primary_keys;
+  std::unordered_map<DataItem *, PrimaryKeyList::Ptr> si_primary_keys;
   for (const auto &op : ctx.si_ops) {
     if (op.index_type != IndexConstraint::kUnique) continue;
 
     auto [state_it, inserted] =
-        si_primary_keys.emplace(op.item, PackedPrimaryKeys::Ptr{});
+        si_primary_keys.emplace(op.item, PrimaryKeyList::Ptr{});
     if (inserted) {
       state_it->second = std::atomic_load(&op.item->primary_keys_);
     }
     auto &primary_keys = state_it->second;
-    const PackedPrimaryKeysView keys(primary_keys);
+    const PrimaryKeyList::View keys(primary_keys);
 
     auto key_it = keys.lower_bound(op.primary_key);
     const bool key_exists =
@@ -518,7 +518,7 @@ bool ValidateUnique(CommitCtx &ctx) {
 
     if (op.is_delete) {
       if (key_exists) {
-        primary_keys = PackedPrimaryKeys::Delete(primary_keys, op.primary_key);
+        primary_keys = PrimaryKeyList::Delete(primary_keys, op.primary_key);
       }
       continue;
     }
@@ -527,7 +527,7 @@ bool ValidateUnique(CommitCtx &ctx) {
       return ctx.AbortLocked(std::string(kDuplicateSecondaryKeyAbortPrefix) +
                              "exists_after_lock");
     }
-    primary_keys = PackedPrimaryKeys::Insert(primary_keys, op.primary_key);
+    primary_keys = PrimaryKeyList::Insert(primary_keys, op.primary_key);
   }
   return true;
 }
@@ -576,7 +576,7 @@ void Install(CommitCtx &ctx) {
   for (const auto &op : ctx.si_ops) {
     if (!op.is_delete) continue;
     const auto primary_keys = std::atomic_load(&op.item->primary_keys_);
-    ctx.si_empty[op.item] = PackedPrimaryKeysView(primary_keys).empty();
+    ctx.si_empty[op.item] = PrimaryKeyList::View(primary_keys).empty();
   }
 }
 

@@ -1,10 +1,10 @@
 /**
- * @file server/storage/tests/packed_primary_keys_test.cc
+ * @file server/storage/tests/primary_key_list_test.cc
  * The packed primary-key list against a vector oracle: insert, erase, and
  * randomized operations in lockstep.
  */
 
-#include "index/packed_primary_keys.h"
+#include "index/primary_key_list.h"
 
 #include <algorithm>
 #include <random>
@@ -16,8 +16,8 @@
 
 namespace {
 
-using helios::storage::PackedPrimaryKeys;
-using helios::storage::PackedPrimaryKeysView;
+using helios::storage::PrimaryKeyList;
+using View = helios::storage::PrimaryKeyList::View;
 
 auto LowerBound(std::vector<std::string> &keys, std::string_view key) {
   auto cmp = [](const std::string &a, std::string_view b) { return a < b; };
@@ -43,7 +43,7 @@ bool OracleErase(std::vector<std::string> &keys, std::string_view key) {
   return true;
 }
 
-std::vector<std::string> ToVector(PackedPrimaryKeysView view) {
+std::vector<std::string> ToVector(PrimaryKeyList::View view) {
   std::vector<std::string> values;
   for (std::string_view value : view) {
     values.emplace_back(value);
@@ -51,10 +51,10 @@ std::vector<std::string> ToVector(PackedPrimaryKeysView view) {
   return values;
 }
 
-void AssertMatchesOracle(const PackedPrimaryKeys::Ptr &primary_keys,
+void AssertMatchesOracle(const PrimaryKeyList::Ptr &primary_keys,
                          const std::vector<std::string> &oracle,
                          const std::vector<std::string> &probes) {
-  const PackedPrimaryKeysView view(primary_keys);
+  const PrimaryKeyList::View view(primary_keys);
   ASSERT_EQ(view.size(), oracle.size());
   ASSERT_EQ(view.empty(), oracle.empty());
 
@@ -134,42 +134,42 @@ std::vector<std::string> BuildKeyUniverse() {
 
 }  // namespace
 
-TEST(PackedPrimaryKeysTest, DedupInsertAndEraseMissingReturnSameInstance) {
+TEST(PrimaryKeyListTest, DedupInsertAndEraseMissingReturnSameInstance) {
   const std::vector<std::string> seed = {"a", "b", std::string(128, 'x')};
-  auto primary_keys = PackedPrimaryKeys::FromSortedDeduped(seed);
+  auto primary_keys = PrimaryKeyList::FromSortedDeduped(seed);
 
-  const auto duplicate = PackedPrimaryKeys::Insert(primary_keys, "b");
+  const auto duplicate = PrimaryKeyList::Insert(primary_keys, "b");
   EXPECT_EQ(duplicate.get(), primary_keys.get());
-  EXPECT_TRUE(PackedPrimaryKeysView(duplicate).equals(
-      PackedPrimaryKeysView(primary_keys)));
+  EXPECT_TRUE(PrimaryKeyList::View(duplicate).equals(
+      PrimaryKeyList::View(primary_keys)));
 
-  const auto missing = PackedPrimaryKeys::Delete(primary_keys, "missing");
+  const auto missing = PrimaryKeyList::Delete(primary_keys, "missing");
   EXPECT_EQ(missing.get(), primary_keys.get());
-  EXPECT_TRUE(PackedPrimaryKeysView(missing).equals(
-      PackedPrimaryKeysView(primary_keys)));
+  EXPECT_TRUE(
+      PrimaryKeyList::View(missing).equals(PrimaryKeyList::View(primary_keys)));
 }
 
-TEST(PackedPrimaryKeysTest, SortedFactoryEqualsIncrementalInsertions) {
+TEST(PrimaryKeyListTest, SortedFactoryEqualsIncrementalInsertions) {
   std::vector<std::string> sorted = {
       "", "a", "ab", "b", "zz", std::string(128, 'x'), std::string(300, 'y'),
   };
   std::sort(sorted.begin(), sorted.end());
   sorted.erase(std::unique(sorted.begin(), sorted.end()), sorted.end());
 
-  auto from_factory = PackedPrimaryKeys::FromSortedDeduped(sorted);
-  auto incremental = PackedPrimaryKeys::FromSortedDeduped({});
+  auto from_factory = PrimaryKeyList::FromSortedDeduped(sorted);
+  auto incremental = PrimaryKeyList::FromSortedDeduped({});
   for (const auto &key : sorted) {
-    incremental = PackedPrimaryKeys::Insert(incremental, key);
+    incremental = PrimaryKeyList::Insert(incremental, key);
   }
 
-  EXPECT_TRUE(PackedPrimaryKeysView(from_factory)
-                  .equals(PackedPrimaryKeysView(incremental)));
-  EXPECT_EQ(ToVector(PackedPrimaryKeysView(incremental)), sorted);
+  EXPECT_TRUE(PrimaryKeyList::View(from_factory)
+                  .equals(PrimaryKeyList::View(incremental)));
+  EXPECT_EQ(ToVector(PrimaryKeyList::View(incremental)), sorted);
 }
 
-TEST(PackedPrimaryKeysTest, RandomizedOperationsLockstepWithVectorOracle) {
+TEST(PrimaryKeyListTest, RandomizedOperationsLockstepWithVectorOracle) {
   const auto universe = BuildKeyUniverse();
-  auto primary_keys = PackedPrimaryKeys::FromSortedDeduped({});
+  auto primary_keys = PrimaryKeyList::FromSortedDeduped({});
   std::vector<std::string> oracle;
   std::mt19937 rng(0x51b10b);
   std::uniform_int_distribution<size_t> key_dist(0, universe.size() - 1);
@@ -180,14 +180,14 @@ TEST(PackedPrimaryKeysTest, RandomizedOperationsLockstepWithVectorOracle) {
     if (insert_dist(rng)) {
       const bool changed = OracleInsert(oracle, key);
       const auto previous = primary_keys;
-      primary_keys = PackedPrimaryKeys::Insert(primary_keys, key);
+      primary_keys = PrimaryKeyList::Insert(primary_keys, key);
       if (!changed) {
         EXPECT_EQ(primary_keys.get(), previous.get()) << "step " << step;
       }
     } else {
       const bool changed = OracleErase(oracle, key);
       const auto previous = primary_keys;
-      primary_keys = PackedPrimaryKeys::Delete(primary_keys, key);
+      primary_keys = PrimaryKeyList::Delete(primary_keys, key);
       if (!changed) {
         EXPECT_EQ(primary_keys.get(), previous.get()) << "step " << step;
       }

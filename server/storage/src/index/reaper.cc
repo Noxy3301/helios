@@ -94,9 +94,8 @@ void Reaper::Reap(EpochNumber published_epoch) {
       item->transaction_id.store(tombstone.delete_commit_tid);
     };
 
-    const bool live = tombstone.primary_index != nullptr
-                          ? item->HasRow()
-                          : item->IsInitialized();
+    const bool live =
+        tombstone.primary_index != nullptr ? item->HasRow() : item->IsLive();
     if (live) {
       unlock();
       continue;

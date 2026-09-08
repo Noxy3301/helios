@@ -1,11 +1,11 @@
 /**
- * @file server/storage/src/index/packed_primary_keys.h
+ * @file server/storage/src/index/primary_key_list.h
  * The primary keys one secondary key points at, packed into a single
  * shared allocation.
  */
 
-#ifndef HELIOS_STORAGE_SRC_INDEX_PACKED_PRIMARY_KEYS_H
-#define HELIOS_STORAGE_SRC_INDEX_PACKED_PRIMARY_KEYS_H
+#ifndef HELIOS_STORAGE_SRC_INDEX_PRIMARY_KEY_LIST_H
+#define HELIOS_STORAGE_SRC_INDEX_PRIMARY_KEY_LIST_H
 
 #include <algorithm>
 #include <cassert>
@@ -26,14 +26,13 @@
 
 namespace helios::storage {
 
-class PackedPrimaryKeysView;
-
 /**
  * @brief Immutable, sorted, deduplicated, length-prefixed primary-key list
- *        held as `std::shared_ptr<const PackedPrimaryKeys>` in one allocation.
+ *        held as `std::shared_ptr<const PrimaryKeyList>` in one allocation.
  */
-struct PackedPrimaryKeys {
-  using Ptr = std::shared_ptr<const PackedPrimaryKeys>;
+struct PrimaryKeyList {
+  using Ptr = std::shared_ptr<const PrimaryKeyList>;
+  class View;
 
   uint32_t count;
   uint32_t bytes;
@@ -171,12 +170,10 @@ struct PackedPrimaryKeys {
    * @return Pointer to `bytes` length-prefixed primary-key records.
    */
   const char *Records() const {
-    return reinterpret_cast<const char *>(this) + sizeof(PackedPrimaryKeys);
+    return reinterpret_cast<const char *>(this) + sizeof(PrimaryKeyList);
   }
 
  private:
-  friend class PackedPrimaryKeysView;
-
   struct Record {
     const char *start;
     const char *value;
@@ -206,23 +203,23 @@ struct PackedPrimaryKeys {
   };
 
   struct Deleter {
-    void operator()(PackedPrimaryKeys *keys) const noexcept {
-      keys->~PackedPrimaryKeys();
+    void operator()(PrimaryKeyList *keys) const noexcept {
+      keys->~PrimaryKeyList();
       delete[] reinterpret_cast<std::byte *>(keys);
     }
   };
 
-  using MutablePtr = std::shared_ptr<PackedPrimaryKeys>;
+  using MutablePtr = std::shared_ptr<PrimaryKeyList>;
 
-  PackedPrimaryKeys(uint32_t record_count, uint32_t payload_bytes)
+  PrimaryKeyList(uint32_t record_count, uint32_t payload_bytes)
       : count(record_count), bytes(payload_bytes) {}
 
   static MutablePtr AllocateMutable(uint32_t record_count,
                                     uint32_t payload_bytes) {
     const size_t allocation_size =
-        sizeof(PackedPrimaryKeys) + static_cast<size_t>(payload_bytes);
+        sizeof(PrimaryKeyList) + static_cast<size_t>(payload_bytes);
     std::byte *raw = new std::byte[allocation_size];
-    auto *packed = new (raw) PackedPrimaryKeys(record_count, payload_bytes);
+    auto *packed = new (raw) PrimaryKeyList(record_count, payload_bytes);
     return MutablePtr(packed, Deleter{});
   }
 
@@ -277,19 +274,19 @@ struct PackedPrimaryKeys {
   }
 
   char *MutableRecords() {
-    return reinterpret_cast<char *>(this) + sizeof(PackedPrimaryKeys);
+    return reinterpret_cast<char *>(this) + sizeof(PrimaryKeyList);
   }
 };
 
-static_assert(sizeof(PackedPrimaryKeys) == sizeof(uint32_t) * 2,
-              "PackedPrimaryKeys must remain a two-field header");
-static_assert(std::is_standard_layout<PackedPrimaryKeys>::value,
-              "PackedPrimaryKeys must remain a standard-layout header");
+static_assert(sizeof(PrimaryKeyList) == sizeof(uint32_t) * 2,
+              "PrimaryKeyList must remain a two-field header");
+static_assert(std::is_standard_layout<PrimaryKeyList>::value,
+              "PrimaryKeyList must remain a standard-layout header");
 
 /**
- * @brief Zero-copy view over a `PackedPrimaryKeys` primary-key list.
+ * @brief Zero-copy view over a PrimaryKeyList.
  */
-class PackedPrimaryKeysView {
+class PrimaryKeyList::View {
  public:
   /**
    * @brief Forward iterator yielding `std::string_view` values into the list.
@@ -309,7 +306,7 @@ class PackedPrimaryKeysView {
      * @return `std::string_view` into the viewed primary-key list.
      */
     reference operator*() const {
-      const auto record = PackedPrimaryKeys::Record::Unpack(cursor_, limit_);
+      const auto record = PrimaryKeyList::Record::Unpack(cursor_, limit_);
       return std::string_view(record.value, record.length);
     }
 
@@ -319,7 +316,7 @@ class PackedPrimaryKeysView {
      */
     iterator &operator++() {
       assert(remaining_ != 0);
-      const auto record = PackedPrimaryKeys::Record::Unpack(cursor_, limit_);
+      const auto record = PrimaryKeyList::Record::Unpack(cursor_, limit_);
       cursor_ = record.next;
       --remaining_;
       return *this;
@@ -352,7 +349,7 @@ class PackedPrimaryKeysView {
     bool operator!=(const iterator &rhs) const { return !(*this == rhs); }
 
    private:
-    friend class PackedPrimaryKeysView;
+    friend class View;
 
     iterator(const char *cursor, const char *limit, uint32_t remaining)
         : cursor_(cursor), limit_(limit), remaining_(remaining) {}
@@ -366,15 +363,13 @@ class PackedPrimaryKeysView {
    * @brief Constructs a view over a raw primary-key list pointer.
    * @param keys Primary-key list to view, or null for an empty view.
    */
-  explicit PackedPrimaryKeysView(const PackedPrimaryKeys *keys = nullptr)
-      : keys_(keys) {}
+  explicit View(const PrimaryKeyList *keys = nullptr) : keys_(keys) {}
 
   /**
    * @brief Constructs a view over a shared primary-key list.
    * @param keys Primary-key list to view, or null for an empty view.
    */
-  explicit PackedPrimaryKeysView(const PackedPrimaryKeys::Ptr &keys)
-      : keys_(keys.get()) {}
+  explicit View(const PrimaryKeyList::Ptr &keys) : keys_(keys.get()) {}
 
   /**
    * @brief Checks whether the view contains no keys.
@@ -439,7 +434,7 @@ class PackedPrimaryKeysView {
    * @param rhs View to compare with.
    * @return True when both views contain the same keys in the same order.
    */
-  bool equals(PackedPrimaryKeysView rhs) const {
+  bool equals(View rhs) const {
     if (size() != rhs.size()) return false;
     auto lhs_it = begin();
     auto rhs_it = rhs.begin();
@@ -450,9 +445,9 @@ class PackedPrimaryKeysView {
   }
 
  private:
-  const PackedPrimaryKeys *keys_;
+  const PrimaryKeyList *keys_;
 };
 
 }  // namespace helios::storage
 
-#endif  // HELIOS_STORAGE_SRC_INDEX_PACKED_PRIMARY_KEYS_H
+#endif  // HELIOS_STORAGE_SRC_INDEX_PRIMARY_KEY_LIST_H

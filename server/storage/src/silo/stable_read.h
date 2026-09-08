@@ -29,12 +29,12 @@ struct StableValue {
 
 struct StablePrimaryKeys {
   bool found = false;
-  PackedPrimaryKeys::Ptr primary_keys;
+  PrimaryKeyList::Ptr primary_keys;
   TransactionId tid;
 
   // Valid while this struct lives: the view points into the list it pins.
-  PackedPrimaryKeysView primary_keys_view() const {
-    return PackedPrimaryKeysView(primary_keys);
+  PrimaryKeyList::View primary_keys_view() const {
+    return PrimaryKeyList::View(primary_keys);
   }
 };
 
