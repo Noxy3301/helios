@@ -36,7 +36,7 @@ void DataBuffer::Reset(const DataBuffer &rhs) {
     Reset(tmp.data(), rhs.size);
     return;
   }
-  // Gather straight into the heap array for a transaction-local snapshot.
+  // Gather straight into the heap array for a transaction-local copy.
   EnsureHeapCapacity(rhs.size);
   size = rhs.GatherInto(value);
 }

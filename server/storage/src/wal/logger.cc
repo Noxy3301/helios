@@ -137,7 +137,7 @@ void FoldSecondary(const Write &write, SecondaryOps &ops) {
                             write.index_type, write.key, pk};
       auto it = ops.find(op_key);
       if (it == ops.end() || it->second.tid < write.transaction_id) {
-        ops[op_key] = {write.transaction_id, SecondaryIndexOp::kAdd};
+        ops[op_key] = {write.transaction_id, SecondaryIndexOp::kInsert};
       }
     }
   } else if (!write.secondary_primary_key.empty()) {
@@ -153,7 +153,7 @@ void FoldSecondary(const Write &write, SecondaryOps &ops) {
 // Keep the newest version per row. Folded through a position map rather than
 // a rescan of the set: the fold runs once per logged write, and a linear
 // rescan makes recovery quadratic in the log size.
-void FoldPrimary(const Write &write, WriteSetType &recovery_set,
+void FoldPrimary(const Write &write, WriteSet &recovery_set,
                  PrimaryPos &positions) {
   const std::byte *value_ptr =
       write.buffer.empty()
@@ -174,7 +174,7 @@ void FoldPrimary(const Write &write, WriteSetType &recovery_set,
 
   positions.emplace(std::make_pair(write.table_name, write.key),
                     recovery_set.size());
-  Snapshot snapshot = {
+  LogEntry entry = {
       write.key,
       reinterpret_cast<const std::byte *>(write.buffer.data()),
       write.buffer.size(),
@@ -184,17 +184,17 @@ void FoldPrimary(const Write &write, WriteSetType &recovery_set,
       write.transaction_id,
       static_cast<IndexConstraint>(write.index_type),
   };
-  recovery_set.emplace_back(std::move(snapshot));
+  recovery_set.emplace_back(std::move(entry));
 }
 
 // Regroup the surviving adds into one entry per secondary key, so a key
 // deleted after being added does not come back.
-void GroupSecondary(const SecondaryOps &ops, WriteSetType &recovery_set) {
+void GroupSecondary(const SecondaryOps &ops, WriteSet &recovery_set) {
   std::unordered_map<SecondaryGroupKey, SecondaryGroupValue,
                      SecondaryGroupKeyHash>
       grouped;
   for (const auto &[op_key, state] : ops) {
-    if (state.op != SecondaryIndexOp::kAdd) continue;
+    if (state.op != SecondaryIndexOp::kInsert) continue;
     SecondaryGroupKey group_key{op_key.table_name, op_key.index_name,
                                 op_key.index_type, op_key.secondary_key};
     auto &entry = grouped[group_key];
@@ -208,17 +208,17 @@ void GroupSecondary(const SecondaryOps &ops, WriteSetType &recovery_set) {
     entry.primary_keys.erase(
         std::unique(entry.primary_keys.begin(), entry.primary_keys.end()),
         entry.primary_keys.end());
-    Snapshot snapshot = {group_key.secondary_key,
-                         nullptr,
-                         0,
-                         nullptr,
-                         group_key.table_name,
-                         group_key.index_name,
-                         entry.max_tid,
-                         static_cast<IndexConstraint>(group_key.index_type)};
-    snapshot.data_item_copy.SetPrimaryKeys(std::move(entry.primary_keys));
-    snapshot.data_item_copy.Reset(nullptr, 0, entry.max_tid);
-    recovery_set.emplace_back(std::move(snapshot));
+    LogEntry log_entry = {group_key.secondary_key,
+                          nullptr,
+                          0,
+                          nullptr,
+                          group_key.table_name,
+                          group_key.index_name,
+                          entry.max_tid,
+                          static_cast<IndexConstraint>(group_key.index_type)};
+    log_entry.data_item_copy.SetPrimaryKeys(std::move(entry.primary_keys));
+    log_entry.data_item_copy.Reset(nullptr, 0, entry.max_tid);
+    recovery_set.emplace_back(std::move(log_entry));
   }
 }
 
@@ -233,10 +233,10 @@ void GroupSecondary(const SecondaryOps &ops, WriteSetType &recovery_set) {
  * The checkpoint image is folded in ahead of the log's tail as ordinary
  * records, under the same rule that resolves two epochs of the log.
  */
-WriteSetType BuildRecoverySet(const LogRecords &image, const LogRecords &tail) {
+WriteSet BuildRecoverySet(const LogRecords &image, const LogRecords &tail) {
   SecondaryOps secondary_latest;
   PrimaryPos primary_position;
-  WriteSetType recovery_set;
+  WriteSet recovery_set;
 
   const LogRecords *sources[] = {&image, &tail};
   for (const auto *source : sources) {
@@ -271,7 +271,7 @@ Logger::~Logger() {
   thread_local_logger_.reset();
 }
 
-bool Logger::Enqueue(const WriteSetType &ws, EpochNumber epoch) {
+bool Logger::Enqueue(const WriteSet &ws, EpochNumber epoch) {
   return thread_local_logger_->Enqueue(ws, epoch);
 }
 

@@ -56,7 +56,7 @@ namespace helios::storage {
  *
  * Copy semantics do the storage conversion implicitly: copying FROM a
  * PAX-mode buffer gathers the row into heap bytes (transaction-local
- * snapshots), assigning INTO a PAX-mode buffer scatters the bytes into the
+ * copies), assigning INTO a PAX-mode buffer scatters the bytes into the
  * strips (commit install under the row's TID lock).
  */
 struct DataBuffer {

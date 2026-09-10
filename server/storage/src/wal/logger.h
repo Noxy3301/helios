@@ -31,9 +31,9 @@
 #include <string>
 
 #include "index/data_buffer.h"
-#include "silo/snapshot.h"
 #include "storage/config.h"
 #include "util/epoch.h"
+#include "wal/log_entry.h"
 #include "wal/log_record.h"
 #include "wal/wal.h"
 
@@ -69,7 +69,7 @@ class Logger {
     // The epoch of the last intact frame, which after a successful scan is
     // also the durable epoch.
     EpochNumber frontier{0};
-    WriteSetType recovery_set;
+    WriteSet recovery_set;
   };
 
   explicit Logger(const Config &config, WalIo io = WalIo::Posix());
@@ -81,7 +81,7 @@ class Logger {
    * produces no write has nothing to make durable, and the commit
    * path must not wait for it.
    */
-  bool Enqueue(const WriteSetType &ws, EpochNumber epoch);
+  bool Enqueue(const WriteSet &ws, EpochNumber epoch);
 
   /**
    * @brief Scans the log and, when the scan allows it, repairs a torn tail.

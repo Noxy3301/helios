@@ -49,48 +49,48 @@ ThreadLocalLogger::ThreadLocalLogger(const Config &config,
 
 ThreadLocalLogger::~ThreadLocalLogger() { StopFlusher(); }
 
-bool ThreadLocalLogger::Enqueue(const WriteSetType &ws, EpochNumber epoch) {
-  LogRecord record;
-  record.epoch = epoch;
+bool ThreadLocalLogger::Enqueue(const WriteSet &ws, EpochNumber epoch) {
+  LogRecord log_record;
+  log_record.epoch = epoch;
 
-  for (auto &snapshot : ws) {
-    if (snapshot.index_name.empty()) {
+  for (auto &entry : ws) {
+    if (entry.index_name.empty()) {
       LogRecord::Write write;
-      write.key = snapshot.key;
-      write.buffer = snapshot.data_item_copy.buffer.toString();
-      write.transaction_id = snapshot.data_item_copy.transaction_id.load();
-      write.table_name = snapshot.table_name;
-      write.index_name = snapshot.index_name;
-      write.index_type = static_cast<uint32_t>(snapshot.index_type);
-      write.primary_keys = snapshot.data_item_copy.primary_keys_vector();
+      write.key = entry.key;
+      write.buffer = entry.data_item_copy.buffer.toString();
+      write.transaction_id = entry.data_item_copy.transaction_id.load();
+      write.table_name = entry.table_name;
+      write.index_name = entry.index_name;
+      write.index_type = static_cast<uint32_t>(entry.index_type);
+      write.primary_keys = entry.data_item_copy.primary_keys_vector();
       write.secondary_op = SecondaryIndexOp::kNone;
-      record.writes.emplace_back(std::move(write));
+      log_record.writes.emplace_back(std::move(write));
       continue;
     }
 
-    if (snapshot.secondary_index_deltas.empty()) continue;
-    for (const auto &delta : snapshot.secondary_index_deltas) {
+    if (entry.secondary_index_deltas.empty()) continue;
+    for (const auto &delta : entry.secondary_index_deltas) {
       LogRecord::Write write;
-      write.key = snapshot.key;
-      write.buffer = snapshot.data_item_copy.buffer.toString();
-      write.transaction_id = snapshot.data_item_copy.transaction_id.load();
-      write.table_name = snapshot.table_name;
-      write.index_name = snapshot.index_name;
-      write.index_type = static_cast<uint32_t>(snapshot.index_type);
+      write.key = entry.key;
+      write.buffer = entry.data_item_copy.buffer.toString();
+      write.transaction_id = entry.data_item_copy.transaction_id.load();
+      write.table_name = entry.table_name;
+      write.index_name = entry.index_name;
+      write.index_type = static_cast<uint32_t>(entry.index_type);
       write.secondary_op = delta.op;
       write.secondary_primary_key = delta.primary_key;
-      record.writes.emplace_back(std::move(write));
+      log_record.writes.emplace_back(std::move(write));
     }
   }
 
   // Decided after building the record, not from the input write set: a write
-  // set of secondary snapshots that carry no delta produces nothing to persist,
+  // set of secondary entries that carry no delta produces nothing to persist,
   // and the commit path must not wait for a record that was never buffered.
-  if (record.writes.empty()) return false;
+  if (log_record.writes.empty()) return false;
 
   auto *node = nodes_.Get();
   std::lock_guard<std::mutex> lock(node->log_records_mutex);
-  node->log_records.emplace_back(std::move(record));
+  node->log_records.emplace_back(std::move(log_record));
   return true;
 }
 

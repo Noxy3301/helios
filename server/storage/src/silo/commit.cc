@@ -583,32 +583,33 @@ void Install(CommitCtx &ctx) {
   }
 }
 
-// Phase 3.2: build the log snapshot before unlock so a later transaction
+// Phase 3.2: build the log entries before unlock so a later transaction
 // cannot overwrite the values just logged.
-WriteSetType BuildLog(CommitCtx &ctx) {
-  WriteSetType log_set;
+wal::WriteSet BuildLog(CommitCtx &ctx) {
+  wal::WriteSet log_set;
 
   log_set.reserve(ctx.writes.size() + ctx.si_ops.size());
   for (const auto &write : ctx.writes) {
-    Snapshot snapshot(write.key, nullptr, 0, write.item, write.table_name, "");
-    snapshot.data_item_copy = *write.item;
-    log_set.emplace_back(std::move(snapshot));
+    wal::LogEntry entry(write.key, nullptr, 0, write.item, write.table_name,
+                        "");
+    entry.data_item_copy = *write.item;
+    log_set.emplace_back(std::move(entry));
   }
   for (const auto &op : ctx.si_ops) {
-    Snapshot snapshot(op.secondary_key, nullptr, 0, op.item, op.table_name,
-                      op.index_name, {}, op.index_type);
-    snapshot.data_item_copy = *op.item;
-    snapshot.RecordSecondaryDelta(
-        op.primary_key,
-        op.is_delete ? SecondaryIndexOp::kRemove : SecondaryIndexOp::kAdd);
-    log_set.emplace_back(std::move(snapshot));
+    wal::LogEntry entry(op.secondary_key, nullptr, 0, op.item, op.table_name,
+                        op.index_name, {}, op.index_type);
+    entry.data_item_copy = *op.item;
+    entry.RecordSecondaryDelta(op.primary_key,
+                               op.is_delete ? wal::SecondaryIndexOp::kDelete
+                                            : wal::SecondaryIndexOp::kInsert);
+    log_set.emplace_back(std::move(entry));
   }
   return log_set;
 }
 
-// Phase 3.3-3.4: publish the new TIDs, stamp them into the log snapshot, and
+// Phase 3.3-3.4: publish the new TIDs, stamp them into the log entries, and
 // hand slots this transaction left empty to the reaper.
-void Publish(CommitCtx &ctx, index::Reaper &reaper, WriteSetType &log_set) {
+void Publish(CommitCtx &ctx, index::Reaper &reaper, wal::WriteSet &log_set) {
   // Unlock by writing the new TID. Carry the epoch forward when the captured
   // TID is from an earlier epoch.
   ctx.commit_epoch = ctx.epoch.ThreadEpoch();
@@ -627,14 +628,14 @@ void Publish(CommitCtx &ctx, index::Reaper &reaper, WriteSetType &log_set) {
     published.emplace(item, unlocked);
   }
 
-  // The log snapshot was captured under the lock and still carries the
-  // locked TID; recovery would install it verbatim, and every later access
-  // to the key would spin on a lock nobody owns. Publish the unlocked TID
-  // into the snapshot.
-  for (auto &snapshot : log_set) {
-    const auto tid_it = published.find(snapshot.item);
+  // The log entries were captured under the lock and carry the locked TID;
+  // recovery would install it verbatim, and every later access to the key
+  // would spin on a lock nobody owns. Publish the unlocked TID into the
+  // entries.
+  for (auto &entry : log_set) {
+    const auto tid_it = published.find(entry.item);
     if (tid_it == published.end()) continue;
-    snapshot.data_item_copy.transaction_id.store(tid_it->second);
+    entry.data_item_copy.transaction_id.store(tid_it->second);
   }
 
   // Register slots left empty by this transaction for deferred physical
@@ -667,7 +668,7 @@ void Publish(CommitCtx &ctx, index::Reaper &reaper, WriteSetType &log_set) {
  *
  * @return true when the caller must wait for the device.
  */
-bool EnqueueLogSet(wal::Logger &logger, WriteSetType &log_set,
+bool EnqueueLogSet(wal::Logger &logger, wal::WriteSet &log_set,
                    EpochNumber commit_epoch, CommitDurability durability) {
   if (log_set.empty()) return false;
   return logger.Enqueue(log_set, commit_epoch) &&
@@ -723,7 +724,7 @@ bool Commit(TableDictionary &tables, std::shared_mutex &schema_mutex,
   if (!ValidateUnique(ctx)) return false;
 
   Install(ctx);
-  WriteSetType log_set = BuildLog(ctx);
+  wal::WriteSet log_set = BuildLog(ctx);
   Publish(ctx, reaper, log_set);
   const bool awaits_durability =
       EnqueueLogSet(logger, log_set, ctx.commit_epoch, durability);

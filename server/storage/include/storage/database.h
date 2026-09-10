@@ -195,11 +195,10 @@ class Database {
   // ----------------------------------------------------------------------
   // Reads, scans and the commit.
   //
-  // The methods below hold no state between calls. Each returns the snapshot
-  // the caller needs (value, packed TID) so that the caller can keep its own
-  // read set across independent RPCs. The collected snapshot is replayed
-  // through Commit when the logical transaction is ready to
-  // commit.
+  // The methods below hold no state between calls. Each returns what the
+  // caller needs (value, packed TID) to keep its own read set across
+  // independent RPCs. Commit revalidates the collected read set when the
+  // logical transaction is ready to commit.
   // See @ref read.h for the supporting types.
   // ----------------------------------------------------------------------
 

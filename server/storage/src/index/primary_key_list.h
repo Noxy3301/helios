@@ -30,8 +30,8 @@ namespace helios::storage {
  * @brief Immutable, sorted, deduplicated, length-prefixed primary-key list
  *        held as `std::shared_ptr<const PrimaryKeyList>` in one allocation.
  *
- * @details Each record is an unsigned LEB128 length followed by that many key
- * bytes. A null Ptr and count == 0 are both empty.
+ * @details Each key is stored packed: an unsigned LEB128 length followed by
+ * that many key bytes. A null Ptr and count == 0 are both empty.
  */
 struct PrimaryKeyList {
   using Ptr = std::shared_ptr<const PrimaryKeyList>;
@@ -52,18 +52,18 @@ struct PrimaryKeyList {
   static Ptr FromSortedDeduped(const std::vector<std::string> &keys) {
     size_t payload_bytes = 0;
     for (const auto &key : keys) {
-      payload_bytes += Record::PackedSize(key);
+      payload_bytes += PackedKey::PackedSize(key);
       CheckFitsUint32(payload_bytes, "packed primary-key list bytes");
     }
 
     auto packed = AllocateMutable(
         CheckFitsUint32(keys.size(), "packed primary-key list count"),
         static_cast<uint32_t>(payload_bytes));
-    char *out = packed->MutableRecords();
+    char *out = packed->MutablePackedKeys();
     for (const auto &key : keys) {
-      out = WriteRecord(out, key);
+      out = PackedKey::Pack(out, key);
     }
-    assert(out == packed->MutableRecords() + packed->bytes);
+    assert(out == packed->MutablePackedKeys() + packed->bytes);
     return packed;
   }
 
@@ -82,41 +82,41 @@ struct PrimaryKeyList {
       return FromOne(key);
     }
 
-    const char *const src_begin = keys->Records();
+    const char *const src_begin = keys->PackedKeys();
     const char *const src_end = src_begin + keys->bytes;
     const char *insert_pos = src_end;
 
     for (const char *cursor = src_begin; cursor != src_end;) {
-      const Record record = Record::Unpack(cursor, src_end);
-      const std::string_view value(record.value, record.length);
+      const PackedKey packed = PackedKey::Unpack(cursor, src_end);
+      const std::string_view value(packed.value, packed.length);
       if (value == key) return keys;
       if (key < value) {
-        insert_pos = record.start;
+        insert_pos = packed.start;
         break;
       }
-      cursor = record.next;
+      cursor = packed.next;
     }
 
-    const size_t added_bytes = Record::PackedSize(key);
+    const size_t added_bytes = PackedKey::PackedSize(key);
     const size_t new_bytes = static_cast<size_t>(keys->bytes) + added_bytes;
     auto next = AllocateMutable(
         CheckFitsUint32(static_cast<size_t>(keys->count) + 1,
                         "packed primary-key list count"),
         CheckFitsUint32(new_bytes, "packed primary-key list bytes"));
 
-    char *out = next->MutableRecords();
+    char *out = next->MutablePackedKeys();
     const size_t prefix_bytes = static_cast<size_t>(insert_pos - src_begin);
     if (prefix_bytes != 0) {
       std::memcpy(out, src_begin, prefix_bytes);
       out += prefix_bytes;
     }
-    out = WriteRecord(out, key);
+    out = PackedKey::Pack(out, key);
     const size_t suffix_bytes = static_cast<size_t>(src_end - insert_pos);
     if (suffix_bytes != 0) {
       std::memcpy(out, insert_pos, suffix_bytes);
       out += suffix_bytes;
     }
-    assert(out == next->MutableRecords() + next->bytes);
+    assert(out == next->MutablePackedKeys() + next->bytes);
     return next;
   }
 
@@ -131,15 +131,15 @@ struct PrimaryKeyList {
   static Ptr Delete(const Ptr &keys, std::string_view key) {
     if (!keys || keys->count == 0) return keys;
 
-    const char *const src_begin = keys->Records();
+    const char *const src_begin = keys->PackedKeys();
     const char *const src_end = src_begin + keys->bytes;
 
     for (const char *cursor = src_begin; cursor != src_end;) {
-      const Record record = Record::Unpack(cursor, src_end);
-      const std::string_view value(record.value, record.length);
+      const PackedKey packed = PackedKey::Unpack(cursor, src_end);
+      const std::string_view value(packed.value, packed.length);
       if (value == key) {
         const size_t removed_bytes =
-            static_cast<size_t>(record.next - record.start);
+            static_cast<size_t>(packed.next - packed.start);
         const size_t new_bytes =
             static_cast<size_t>(keys->bytes) - removed_bytes;
         auto next = AllocateMutable(
@@ -147,38 +147,45 @@ struct PrimaryKeyList {
                             "packed primary-key list count"),
             static_cast<uint32_t>(new_bytes));
 
-        char *out = next->MutableRecords();
+        char *out = next->MutablePackedKeys();
         const size_t prefix_bytes =
-            static_cast<size_t>(record.start - src_begin);
+            static_cast<size_t>(packed.start - src_begin);
         if (prefix_bytes != 0) {
           std::memcpy(out, src_begin, prefix_bytes);
           out += prefix_bytes;
         }
-        const size_t suffix_bytes = static_cast<size_t>(src_end - record.next);
+        const size_t suffix_bytes = static_cast<size_t>(src_end - packed.next);
         if (suffix_bytes != 0) {
-          std::memcpy(out, record.next, suffix_bytes);
+          std::memcpy(out, packed.next, suffix_bytes);
           out += suffix_bytes;
         }
-        assert(out == next->MutableRecords() + next->bytes);
+        assert(out == next->MutablePackedKeys() + next->bytes);
         return next;
       }
       if (key < value) return keys;
-      cursor = record.next;
+      cursor = packed.next;
     }
 
     return keys;
   }
 
   /**
-   * @brief Returns the record payload after the fixed header.
+   * @brief Returns the packed keys after the fixed header.
    * @return Pointer to the `count` records that occupy `bytes` bytes.
    */
-  const char *Records() const {
+  const char *PackedKeys() const {
     return reinterpret_cast<const char *>(this) + sizeof(PrimaryKeyList);
   }
 
  private:
-  struct Record {
+  /**
+   * @brief One primary key as the list stores it: an unsigned LEB128 length,
+   *        then the key bytes.
+   *
+   * @details Unpack locates the key at `start` and Pack writes one; neither
+   * has anything to do with a table row.
+   */
+  struct PackedKey {
     const char *start;
     const char *value;
     const char *next;
@@ -188,7 +195,17 @@ struct PrimaryKeyList {
       return VarintSize(key.size()) + key.size();
     }
 
-    static Record Unpack(const char *start, const char *limit) {
+    // Writes one packed key at `out` and returns the byte after it.
+    static char *Pack(char *out, std::string_view key) {
+      out = WriteVarint(out, key.size());
+      if (!key.empty()) {
+        std::memcpy(out, key.data(), key.size());
+        out += key.size();
+      }
+      return out;
+    }
+
+    static PackedKey Unpack(const char *start, const char *limit) {
       const char *cursor = start;
       size_t length = 0;
       unsigned shift = 0;
@@ -196,13 +213,13 @@ struct PrimaryKeyList {
         const unsigned char byte = static_cast<unsigned char>(*cursor++);
         length |= static_cast<size_t>(byte & 0x7f) << shift;
         if ((byte & 0x80) == 0) {
-          if (static_cast<size_t>(limit - cursor) < length) RecordCorrupt();
-          return Record{start, cursor, cursor + length, length};
+          if (static_cast<size_t>(limit - cursor) < length) ListCorrupt();
+          return PackedKey{start, cursor, cursor + length, length};
         }
         shift += 7;
-        if (shift >= sizeof(size_t) * 8) RecordCorrupt();
+        if (shift >= sizeof(size_t) * 8) ListCorrupt();
       }
-      RecordCorrupt();
+      ListCorrupt();
     }
   };
 
@@ -228,11 +245,12 @@ struct PrimaryKeyList {
   }
 
   static Ptr FromOne(std::string_view key) {
-    const size_t payload_bytes = Record::PackedSize(key);
+    const size_t payload_bytes = PackedKey::PackedSize(key);
     auto packed = AllocateMutable(
         1, CheckFitsUint32(payload_bytes, "packed primary-key list bytes"));
-    [[maybe_unused]] char *out = WriteRecord(packed->MutableRecords(), key);
-    assert(out == packed->MutableRecords() + packed->bytes);
+    [[maybe_unused]] char *out =
+        PackedKey::Pack(packed->MutablePackedKeys(), key);
+    assert(out == packed->MutablePackedKeys() + packed->bytes);
     return packed;
   }
 
@@ -262,23 +280,14 @@ struct PrimaryKeyList {
     return out;
   }
 
-  static char *WriteRecord(char *out, std::string_view key) {
-    out = WriteVarint(out, key.size());
-    if (!key.empty()) {
-      std::memcpy(out, key.data(), key.size());
-      out += key.size();
-    }
-    return out;
-  }
-
-  // Only this class writes the list, so a record that does not unpack is a
+  // Only this class writes the list, so a key that does not unpack is a
   // corrupt allocation, and any key returned would reach past it.
-  [[noreturn]] static void RecordCorrupt() {
+  [[noreturn]] static void ListCorrupt() {
     std::fputs("corrupt packed primary-key list\n", stderr);
     std::abort();
   }
 
-  char *MutableRecords() {
+  char *MutablePackedKeys() {
     return reinterpret_cast<char *>(this) + sizeof(PrimaryKeyList);
   }
 };
@@ -311,14 +320,14 @@ class PrimaryKeyList::View {
     iterator() = default;
 
     reference operator*() const {
-      const auto record = PrimaryKeyList::Record::Unpack(cursor_, limit_);
-      return std::string_view(record.value, record.length);
+      const auto packed = PrimaryKeyList::PackedKey::Unpack(cursor_, limit_);
+      return std::string_view(packed.value, packed.length);
     }
 
     iterator &operator++() {
       assert(remaining_ != 0);
-      const auto record = PrimaryKeyList::Record::Unpack(cursor_, limit_);
-      cursor_ = record.next;
+      const auto packed = PrimaryKeyList::PackedKey::Unpack(cursor_, limit_);
+      cursor_ = packed.next;
       --remaining_;
       return *this;
     }
@@ -364,13 +373,13 @@ class PrimaryKeyList::View {
 
   iterator begin() const {
     if (!keys_) return iterator();
-    const char *const start = keys_->Records();
+    const char *const start = keys_->PackedKeys();
     return iterator(start, start + keys_->bytes, keys_->count);
   }
 
   iterator end() const {
     if (!keys_) return iterator();
-    const char *const limit = keys_->Records() + keys_->bytes;
+    const char *const limit = keys_->PackedKeys() + keys_->bytes;
     return iterator(limit, limit, 0);
   }
 

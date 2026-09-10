@@ -16,13 +16,13 @@
  */
 
 /**
- * @file server/storage/src/silo/snapshot.h
- * One entry of a transaction's write set, and what it does to the
- * secondary indexes.
+ * @file server/storage/src/wal/log_entry.h
+ * One entry of the write set a commit hands to the log: the row it wrote,
+ * and what it does to the secondary indexes.
  */
 
-#ifndef HELIOS_STORAGE_SRC_SILO_SNAPSHOT_H
-#define HELIOS_STORAGE_SRC_SILO_SNAPSHOT_H
+#ifndef HELIOS_STORAGE_SRC_WAL_LOG_ENTRY_H
+#define HELIOS_STORAGE_SRC_WAL_LOG_ENTRY_H
 
 #include <cstdint>
 #include <string>
@@ -34,12 +34,13 @@
 #include "util/epoch.h"
 
 namespace helios::storage {
+namespace wal {
 
 enum class SecondaryIndexOp : uint8_t {
   kNone = 0,    // a primary row, which names no secondary index
-  kAdd = 1,     // one primary key joins the key's list
-  kRemove = 2,  // one primary key leaves it
-  kFull = 3,    // the whole list, as a checkpoint image carries it
+  kInsert = 1,  // one primary key joins the key's list
+  kDelete = 2,  // one primary key leaves it
+  kFull = 3,    // the whole list, as a checkpoint carries it
 };
 
 /**
@@ -52,7 +53,7 @@ enum class SecondaryIndexOp : uint8_t {
  * path resolved, borrowed until the commit publishes its TIDs, and null on
  * the recovery path, which has no slots yet.
  */
-struct Snapshot {
+struct LogEntry {
   std::string key;
   DataItem data_item_copy;
   DataItem *item;
@@ -65,7 +66,7 @@ struct Snapshot {
   };
   std::vector<SecondaryIndexDelta> secondary_index_deltas;
 
-  Snapshot(const std::string_view key, const std::byte row[], const size_t len,
+  LogEntry(const std::string_view key, const std::byte row[], const size_t len,
            DataItem *const item, std::string_view table_name,
            std::string_view index_name, const TransactionId tid = {},
            IndexConstraint index_type = IndexConstraint::kNone)
@@ -76,16 +77,16 @@ struct Snapshot {
         index_type(index_type) {
     if (row != nullptr) data_item_copy.Reset(row, len, tid);
   }
-  Snapshot(const Snapshot &) = default;
-  Snapshot &operator=(const Snapshot &) = default;
+  LogEntry(const LogEntry &) = default;
+  LogEntry &operator=(const LogEntry &) = default;
   // Declaring copy ctor/assign above suppresses implicit move generation;
-  // an emplace_back(std::move(snapshot)) would otherwise fall back to the
+  // an emplace_back(std::move(entry)) would otherwise fall back to the
   // deep copy path.
-  Snapshot(Snapshot &&) = default;
-  Snapshot &operator=(Snapshot &&) = default;
+  LogEntry(LogEntry &&) = default;
+  LogEntry &operator=(LogEntry &&) = default;
 
-  // A later call for the same primary key replaces op; Add and Remove do not
-  // compose.
+  // A later call for the same primary key replaces op; Insert and Delete do
+  // not compose.
   void RecordSecondaryDelta(const std::string_view primary_key,
                             SecondaryIndexOp op) {
     for (auto &delta : secondary_index_deltas) {
@@ -98,8 +99,9 @@ struct Snapshot {
   }
 };
 
-using WriteSetType = std::vector<Snapshot>;
+using WriteSet = std::vector<LogEntry>;
 
+}  // namespace wal
 }  // namespace helios::storage
 
-#endif  // HELIOS_STORAGE_SRC_SILO_SNAPSHOT_H
+#endif  // HELIOS_STORAGE_SRC_WAL_LOG_ENTRY_H

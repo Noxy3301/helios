@@ -20,17 +20,17 @@
 #include <thread>
 #include <vector>
 
-#include "silo/snapshot.h"
+#include "wal/log_entry.h"
 #include "wal/logger.h"
 #include "wal/wal.h"
 
 namespace {
 
 using helios::storage::EpochNumber;
-using helios::storage::Snapshot;
-using helios::storage::WriteSetType;
+using helios::storage::wal::LogEntry;
 using helios::storage::wal::Logger;
 using helios::storage::wal::WalIo;
+using helios::storage::wal::WriteSet;
 
 constexpr auto kTestTimeout = std::chrono::seconds(5);
 
@@ -58,18 +58,18 @@ class LoggerDurabilityTest : public ::testing::Test {
     std::filesystem::remove_all(root_, ec);
   }
 
-  static WriteSetType MakePrimaryWriteSet(const std::string &key) {
-    Snapshot snapshot(key, nullptr, 0, nullptr, "t", "");
-    WriteSetType write_set;
-    write_set.emplace_back(std::move(snapshot));
+  static WriteSet MakePrimaryWriteSet(const std::string &key) {
+    LogEntry entry(key, nullptr, 0, nullptr, "t", "");
+    WriteSet write_set;
+    write_set.emplace_back(std::move(entry));
     return write_set;
   }
 
-  // A write set of secondary snapshots with no delta persists nothing.
-  static WriteSetType MakeEmptySecondaryWriteSet(const std::string &key) {
-    Snapshot snapshot(key, nullptr, 0, nullptr, "t", "idx");
-    WriteSetType write_set;
-    write_set.emplace_back(std::move(snapshot));
+  // A write set of secondary entries with no delta persists nothing.
+  static WriteSet MakeEmptySecondaryWriteSet(const std::string &key) {
+    LogEntry entry(key, nullptr, 0, nullptr, "t", "idx");
+    WriteSet write_set;
+    write_set.emplace_back(std::move(entry));
     return write_set;
   }
 
@@ -80,7 +80,7 @@ class LoggerDurabilityTest : public ::testing::Test {
 TEST_F(LoggerDurabilityTest, EnqueueReportsOnlyWhatItPersists) {
   Logger logger(config_);
   EXPECT_TRUE(logger.Enqueue(MakePrimaryWriteSet("alice"), 5));
-  EXPECT_FALSE(logger.Enqueue(WriteSetType{}, 5));
+  EXPECT_FALSE(logger.Enqueue(WriteSet{}, 5));
   EXPECT_FALSE(logger.Enqueue(MakeEmptySecondaryWriteSet("bob"), 5));
 }
 

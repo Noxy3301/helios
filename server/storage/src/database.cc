@@ -31,10 +31,10 @@
 #include "index/secondary_index.h"
 #include "silo/commit.h"
 #include "silo/read.h"
-#include "silo/snapshot.h"
 #include "storage/config.h"
 #include "util/spdlog.h"
 #include "wal/flush_trace.h"
+#include "wal/log_entry.h"
 namespace helios::storage {
 
 Database::Database() : db_pimpl_(std::make_unique<Impl>()) {

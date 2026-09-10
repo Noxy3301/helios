@@ -12,9 +12,9 @@
 #include <string>
 #include <vector>
 
-#include "silo/snapshot.h"
 #include "silo/transaction_id.h"
 #include "util/epoch.h"
+#include "wal/log_entry.h"
 
 namespace helios::storage {
 namespace wal {
@@ -35,8 +35,8 @@ struct LogRecord {
    *
    * @details An empty `index_name` marks a primary row, whose payload is
    * `buffer`. Otherwise the write belongs to that secondary index, and
-   * `secondary_op` says how to read it: kFull carries the whole posting list
-   * in `primary_keys`, kAdd and kRemove carry one key in
+   * `secondary_op` says how to read it: kFull carries the whole primary-key
+   * list in `primary_keys`, kInsert and kDelete carry one key in
    * `secondary_primary_key`.
    */
   struct Write {
@@ -64,6 +64,6 @@ using LogRecords = std::vector<LogRecord>;
 }  // namespace wal
 }  // namespace helios::storage
 
-MSGPACK_ADD_ENUM(helios::storage::SecondaryIndexOp);
+MSGPACK_ADD_ENUM(helios::storage::wal::SecondaryIndexOp);
 
 #endif  // HELIOS_STORAGE_SRC_WAL_LOG_RECORD_H

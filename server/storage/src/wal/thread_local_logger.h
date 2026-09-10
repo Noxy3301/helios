@@ -28,10 +28,10 @@
 #include <mutex>
 #include <thread>
 
-#include "silo/snapshot.h"
 #include "storage/config.h"
 #include "util/epoch.h"
 #include "util/thread_key_storage.h"
+#include "wal/log_entry.h"
 #include "wal/log_record.h"
 #include "wal/wal.h"
 
@@ -77,7 +77,7 @@ class ThreadLocalLogger final {
    * @return Whether anything was buffered: a write set producing no
    * key-value pair has nothing to make durable.
    */
-  bool Enqueue(const WriteSetType &ws, EpochNumber epoch);
+  bool Enqueue(const WriteSet &ws, EpochNumber epoch);
 
   /**
    * @brief Reads and repairs the log. Completes before the flusher starts.

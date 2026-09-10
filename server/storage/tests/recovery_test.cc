@@ -120,7 +120,7 @@ TEST_F(RecoveryTest, ALoggedWriteCarriesTheUnlockedTid) {
       // writer of the key waits on it forever.
       EXPECT_EQ(write.transaction_id.tid % 2, 0u);
       EXPECT_NE(write.transaction_id.tid, 0u);
-      // The snapshot is taken before the unlock, so an epoch that advanced
+      // The log entry is taken before the unlock, so an epoch that advanced
       // under the lock would be recorded one epoch behind the frame.
       EXPECT_EQ(write.transaction_id.epoch, record.epoch);
     }

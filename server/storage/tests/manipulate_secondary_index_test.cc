@@ -146,7 +146,7 @@ TEST_F(ManipulateSecondaryIndexTest, ReAddExistingIndexEntryIsIdempotent) {
   EXPECT_EQ(moved[0], "user1");
 }
 
-TEST_F(ManipulateSecondaryIndexTest, MissingRemoveDoesNotBlockAdd) {
+TEST_F(ManipulateSecondaryIndexTest, MissingDeleteDoesNotBlockInsert) {
   ASSERT_TRUE(db_->CreateTable("users"));
   ASSERT_TRUE(
       db_->CreateSecondaryIndex("users", "age_index", IndexConstraint::kNone));

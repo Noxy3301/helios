@@ -72,7 +72,7 @@ struct CommitPayload {
  *             2.3 [added] inserts: the claimed key still holds no row
  *             2.4 [added] UNIQUE recheck after the lock wait
  *   Phase 3   3.1 [paper] install values; deletes become tombstones
- *             3.2 [paper] log snapshot before unlock (when logging)
+ *             3.2 [paper] log entries before unlock (when logging)
  *             3.3 [paper] publish even TIDs stamped with the 1.2 epoch
  *             3.4 [added] hand slots left empty to the reaper for
  *                         deferred physical purge

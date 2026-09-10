@@ -22,8 +22,8 @@ helios::storage::Config MakeConfig() {
   return config;
 }
 
-// A write captures its log snapshot while the row lock is held.
-// A snapshot persisted with the locked TID poisons recovery: the recovered
+// A write captures its log entry while the row lock is held.
+// An entry persisted with the locked TID breaks recovery: the recovered
 // row looks locked by a transaction that no longer exists, and every later
 // access to the key spins or aborts forever.
 TEST(RecoveryTidTest, ARecoveredKeyAcceptsTheNextWrite) {
