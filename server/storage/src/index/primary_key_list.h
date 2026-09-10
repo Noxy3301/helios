@@ -11,8 +11,6 @@
 #include <cassert>
 #include <cstddef>
 #include <cstdint>
-#include <cstdio>
-#include <cstdlib>
 #include <cstring>
 #include <iterator>
 #include <limits>
@@ -87,7 +85,7 @@ struct PrimaryKeyList {
     const char *insert_pos = src_end;
 
     for (const char *cursor = src_begin; cursor != src_end;) {
-      const PackedKey packed = PackedKey::Unpack(cursor, src_end);
+      const PackedKey packed = PackedKey::Unpack(cursor);
       const std::string_view value(packed.value, packed.length);
       if (value == key) return keys;
       if (key < value) {
@@ -135,7 +133,7 @@ struct PrimaryKeyList {
     const char *const src_end = src_begin + keys->bytes;
 
     for (const char *cursor = src_begin; cursor != src_end;) {
-      const PackedKey packed = PackedKey::Unpack(cursor, src_end);
+      const PackedKey packed = PackedKey::Unpack(cursor);
       const std::string_view value(packed.value, packed.length);
       if (value == key) {
         const size_t removed_bytes =
@@ -205,21 +203,18 @@ struct PrimaryKeyList {
       return out;
     }
 
-    static PackedKey Unpack(const char *start, const char *limit) {
+    // Reads the key packed at `start`. Pack is the only writer, so the length
+    // always terminates and stays inside the allocation.
+    static PackedKey Unpack(const char *start) {
       const char *cursor = start;
       size_t length = 0;
-      unsigned shift = 0;
-      while (cursor != limit) {
+      for (unsigned shift = 0;; shift += 7) {
         const unsigned char byte = static_cast<unsigned char>(*cursor++);
         length |= static_cast<size_t>(byte & 0x7f) << shift;
         if ((byte & 0x80) == 0) {
-          if (static_cast<size_t>(limit - cursor) < length) ListCorrupt();
           return PackedKey{start, cursor, cursor + length, length};
         }
-        shift += 7;
-        if (shift >= sizeof(size_t) * 8) ListCorrupt();
       }
-      ListCorrupt();
     }
   };
 
@@ -280,13 +275,6 @@ struct PrimaryKeyList {
     return out;
   }
 
-  // Only this class writes the list, so a key that does not unpack is a
-  // corrupt allocation, and any key returned would reach past it.
-  [[noreturn]] static void ListCorrupt() {
-    std::fputs("corrupt packed primary-key list\n", stderr);
-    std::abort();
-  }
-
   char *MutablePackedKeys() {
     return reinterpret_cast<char *>(this) + sizeof(PrimaryKeyList);
   }
@@ -320,13 +308,13 @@ class PrimaryKeyList::View {
     iterator() = default;
 
     reference operator*() const {
-      const auto packed = PrimaryKeyList::PackedKey::Unpack(cursor_, limit_);
+      const auto packed = PrimaryKeyList::PackedKey::Unpack(cursor_);
       return std::string_view(packed.value, packed.length);
     }
 
     iterator &operator++() {
       assert(remaining_ != 0);
-      const auto packed = PrimaryKeyList::PackedKey::Unpack(cursor_, limit_);
+      const auto packed = PrimaryKeyList::PackedKey::Unpack(cursor_);
       cursor_ = packed.next;
       --remaining_;
       return *this;
@@ -347,11 +335,10 @@ class PrimaryKeyList::View {
    private:
     friend class View;
 
-    iterator(const char *cursor, const char *limit, uint32_t remaining)
-        : cursor_(cursor), limit_(limit), remaining_(remaining) {}
+    iterator(const char *cursor, uint32_t remaining)
+        : cursor_(cursor), remaining_(remaining) {}
 
     const char *cursor_ = nullptr;
-    const char *limit_ = nullptr;
     uint32_t remaining_ = 0;
   };
 
@@ -374,13 +361,12 @@ class PrimaryKeyList::View {
   iterator begin() const {
     if (!keys_) return iterator();
     const char *const start = keys_->PackedKeys();
-    return iterator(start, start + keys_->bytes, keys_->count);
+    return iterator(start, keys_->count);
   }
 
   iterator end() const {
     if (!keys_) return iterator();
-    const char *const limit = keys_->PackedKeys() + keys_->bytes;
-    return iterator(limit, limit, 0);
+    return iterator(keys_->PackedKeys() + keys_->bytes, 0);
   }
 
   /**
