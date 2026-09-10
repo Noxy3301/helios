@@ -1,6 +1,6 @@
 /**
  * @file server/storage/tests/epoch_scan_checkpoint_test.cc
- * The row image: what a scan captures, what recovery does with a damaged
+ * The checkpoint: what a scan captures, what recovery does with a damaged
  * or absent one, and that the log tail wins over it.
  */
 
@@ -182,10 +182,11 @@ class EpochScanCheckpointTest : public ::testing::Test {
     return hits;
   }
 
-  // The row value the image holds for `key`, if it holds one.
-  static std::optional<std::string> RowInImage(
-      const EpochScanCheckpoint::Image &image, const std::string &key) {
-    for (const auto &record : image.records) {
+  // The row value the checkpoint holds for `key`, if it holds one.
+  static std::optional<std::string> RowInCheckpoint(
+      const EpochScanCheckpoint::LoadResult &checkpoint,
+      const std::string &key) {
+    for (const auto &record : checkpoint.records) {
       for (const auto &write : record.writes) {
         if (!write.index_name.empty() || write.key != key) continue;
         return write.buffer;
@@ -194,10 +195,11 @@ class EpochScanCheckpointTest : public ::testing::Test {
     return std::nullopt;
   }
 
-  // The primary keys the image lists under a secondary key.
-  static std::vector<std::string> IndexEntryInImage(
-      const EpochScanCheckpoint::Image &image, const std::string &key) {
-    for (const auto &record : image.records) {
+  // The primary keys the checkpoint lists under a secondary key.
+  static std::vector<std::string> IndexEntryInCheckpoint(
+      const EpochScanCheckpoint::LoadResult &checkpoint,
+      const std::string &key) {
+    for (const auto &record : checkpoint.records) {
       for (const auto &write : record.writes) {
         if (write.index_name != kIndex || write.key != key) continue;
         return write.primary_keys;
@@ -206,9 +208,9 @@ class EpochScanCheckpointTest : public ::testing::Test {
     return {};
   }
 
-  std::string image_path() const {
+  std::string checkpoint_path() const {
     return (std::filesystem::path(work_dir_) /
-            EpochScanCheckpoint::ImageFileName())
+            EpochScanCheckpoint::CheckpointFileName())
         .string();
   }
 
@@ -226,7 +228,7 @@ class EpochScanCheckpointTest : public ::testing::Test {
   std::vector<std::string> armed_;
 };
 
-TEST_F(EpochScanCheckpointTest, AnImageHoldsWhatTheScanFound) {
+TEST_F(EpochScanCheckpointTest, ACheckpointHoldsWhatTheScanFound) {
   {
     auto config = MakeConfig(false);
     helios::storage::Database db(config);
@@ -235,18 +237,18 @@ TEST_F(EpochScanCheckpointTest, AnImageHoldsWhatTheScanFound) {
         kTable, kIndex, helios::storage::IndexConstraint::kNone));
     ASSERT_TRUE(CommitIndexedWrite(db, "alice", "one", "s"));
     ASSERT_TRUE(CommitIndexedWrite(db, "bob", "two", "s"));
-    ASSERT_TRUE(db.WriteCheckpointImage());
+    ASSERT_TRUE(db.WriteCheckpoint());
   }
 
-  auto image = EpochScanCheckpoint::Load(work_dir_);
-  ASSERT_EQ(image.status, EpochScanCheckpoint::Image::Status::kOk);
-  EXPECT_EQ(RowInImage(image, "alice"), "one");
-  EXPECT_EQ(RowInImage(image, "bob"), "two");
-  auto primary_keys = IndexEntryInImage(image, "s");
+  auto checkpoint = EpochScanCheckpoint::Load(work_dir_);
+  ASSERT_EQ(checkpoint.status, EpochScanCheckpoint::LoadResult::Status::kOk);
+  EXPECT_EQ(RowInCheckpoint(checkpoint, "alice"), "one");
+  EXPECT_EQ(RowInCheckpoint(checkpoint, "bob"), "two");
+  auto primary_keys = IndexEntryInCheckpoint(checkpoint, "s");
   std::sort(primary_keys.begin(), primary_keys.end());
   EXPECT_EQ(primary_keys, (std::vector<std::string>{"alice", "bob"}));
-  EXPECT_NE(image.cut_epoch, 0u);
-  EXPECT_GE(image.end_epoch, image.cut_epoch);
+  EXPECT_NE(checkpoint.cut_epoch, 0u);
+  EXPECT_GE(checkpoint.end_epoch, checkpoint.cut_epoch);
   // The working file is renamed rather than left behind.
   EXPECT_FALSE(std::filesystem::exists(working_path()));
 }
@@ -259,32 +261,33 @@ TEST_F(EpochScanCheckpointTest, ADeletedRowLeavesNoEntry) {
     ASSERT_TRUE(CommitWrite(db, "alice", "one"));
     ASSERT_TRUE(CommitWrite(db, "bob", "two"));
     ASSERT_TRUE(CommitDelete(db, "alice"));
-    ASSERT_TRUE(db.WriteCheckpointImage());
+    ASSERT_TRUE(db.WriteCheckpoint());
   }
 
-  auto image = EpochScanCheckpoint::Load(work_dir_);
-  ASSERT_EQ(image.status, EpochScanCheckpoint::Image::Status::kOk);
-  EXPECT_EQ(RowInImage(image, "alice"), std::nullopt);
-  EXPECT_EQ(RowInImage(image, "bob"), "two");
+  auto checkpoint = EpochScanCheckpoint::Load(work_dir_);
+  ASSERT_EQ(checkpoint.status, EpochScanCheckpoint::LoadResult::Status::kOk);
+  EXPECT_EQ(RowInCheckpoint(checkpoint, "alice"), std::nullopt);
+  EXPECT_EQ(RowInCheckpoint(checkpoint, "bob"), "two");
 }
 
-TEST_F(EpochScanCheckpointTest, AnAbsentImageIsNotAFailure) {
-  auto image = EpochScanCheckpoint::Load(work_dir_ + "/nowhere");
-  EXPECT_EQ(image.status, EpochScanCheckpoint::Image::Status::kAbsent);
+TEST_F(EpochScanCheckpointTest, AnAbsentCheckpointIsNotAFailure) {
+  auto checkpoint = EpochScanCheckpoint::Load(work_dir_ + "/nowhere");
+  EXPECT_EQ(checkpoint.status,
+            EpochScanCheckpoint::LoadResult::Status::kAbsent);
 }
 
-TEST_F(EpochScanCheckpointTest, ADamagedImageIsRefused) {
+TEST_F(EpochScanCheckpointTest, ADamagedCheckpointIsRefused) {
   {
     auto config = MakeConfig(false);
     helios::storage::Database db(config);
     db.CreateTable(kTable);
     ASSERT_TRUE(CommitWrite(db, "alice", "one"));
-    ASSERT_TRUE(db.WriteCheckpointImage());
+    ASSERT_TRUE(db.WriteCheckpoint());
   }
 
   // One byte inside the payload, which the checksum covers.
   {
-    std::fstream file(image_path(),
+    std::fstream file(checkpoint_path(),
                       std::ios::in | std::ios::out | std::ios::binary);
     ASSERT_TRUE(file.is_open());
     file.seekp(static_cast<std::streamoff>(EpochScanCheckpoint::kHeaderSize));
@@ -292,12 +295,13 @@ TEST_F(EpochScanCheckpointTest, ADamagedImageIsRefused) {
     file.write(&flipped, 1);
   }
 
-  auto image = EpochScanCheckpoint::Load(work_dir_);
-  EXPECT_EQ(image.status, EpochScanCheckpoint::Image::Status::kUnusable);
-  EXPECT_TRUE(image.records.empty());
+  auto checkpoint = EpochScanCheckpoint::Load(work_dir_);
+  EXPECT_EQ(checkpoint.status,
+            EpochScanCheckpoint::LoadResult::Status::kUnusable);
+  EXPECT_TRUE(checkpoint.records.empty());
 }
 
-TEST_F(EpochScanCheckpointTest, TheLogTailWinsOverTheImage) {
+TEST_F(EpochScanCheckpointTest, TheLogTailWinsOverTheCheckpoint) {
   {
     auto config = MakeConfig(false);
     helios::storage::Database db(config);
@@ -305,9 +309,9 @@ TEST_F(EpochScanCheckpointTest, TheLogTailWinsOverTheImage) {
     ASSERT_TRUE(CommitWrite(db, "alice", "one"));
     ASSERT_TRUE(CommitWrite(db, "bob", "one"));
     ASSERT_TRUE(CommitWrite(db, "carol", "one"));
-    ASSERT_TRUE(db.WriteCheckpointImage());
-    // Written after the cut: the image holds the old version of alice and no
-    // version of dave, and the tail has to supply both.
+    ASSERT_TRUE(db.WriteCheckpoint());
+    // Written after the cut: the checkpoint holds the old version of alice and
+    // no version of dave, and the tail has to supply both.
     ASSERT_TRUE(CommitWrite(db, "alice", "two"));
     ASSERT_TRUE(CommitDelete(db, "carol"));
     ASSERT_TRUE(CommitWrite(db, "dave", "two"));
@@ -317,13 +321,15 @@ TEST_F(EpochScanCheckpointTest, TheLogTailWinsOverTheImage) {
   helios::storage::Database db(config);
   db.CreateTable(kTable);
   EXPECT_EQ(Read(db, "alice").value, "two");
-  // Only the image holds this one: its record is in a frame the replay skips.
+  // Only the checkpoint holds this one: its record is in a frame the replay
+  // skips.
   EXPECT_EQ(Read(db, "bob").value, "one");
   EXPECT_FALSE(Read(db, "carol").found);
   EXPECT_EQ(Read(db, "dave").value, "two");
 }
 
-TEST_F(EpochScanCheckpointTest, RecoveryWithTheImageMatchesRecoveryWithout) {
+TEST_F(EpochScanCheckpointTest,
+       RecoveryWithTheCheckpointMatchesRecoveryWithout) {
   {
     auto config = MakeConfig(false);
     helios::storage::Database db(config);
@@ -332,14 +338,14 @@ TEST_F(EpochScanCheckpointTest, RecoveryWithTheImageMatchesRecoveryWithout) {
         kTable, kIndex, helios::storage::IndexConstraint::kNone));
     ASSERT_TRUE(CommitIndexedWrite(db, "alice", "one", "s"));
     ASSERT_TRUE(CommitIndexedWrite(db, "bob", "one", "t"));
-    ASSERT_TRUE(db.WriteCheckpointImage());
+    ASSERT_TRUE(db.WriteCheckpoint());
     ASSERT_TRUE(CommitWrite(db, "alice", "two"));
     ASSERT_TRUE(CommitDelete(db, "bob"));
     ASSERT_TRUE(CommitIndexedWrite(db, "carol", "two", "s"));
   }
 
-  const auto image = EpochScanCheckpoint::Load(work_dir_);
-  ASSERT_EQ(image.status, EpochScanCheckpoint::Image::Status::kOk);
+  const auto checkpoint = EpochScanCheckpoint::Load(work_dir_);
+  ASSERT_EQ(checkpoint.status, EpochScanCheckpoint::LoadResult::Status::kOk);
 
   // What the replay leaves out, and that it leaves out something at all.
   {
@@ -351,50 +357,50 @@ TEST_F(EpochScanCheckpointTest, RecoveryWithTheImageMatchesRecoveryWithout) {
   }
   {
     Wal wal(work_dir_, helios::storage::wal::WalIo::Posix(), 1ull << 20);
-    auto filtered = wal.ScanAndRepair(image.cut_epoch);
+    auto filtered = wal.ScanAndRepair(checkpoint.cut_epoch);
     ASSERT_EQ(filtered.status, WalScanResult::Status::kOk);
     EXPECT_GT(filtered.frames_skipped, 0u);
     EXPECT_GT(filtered.bytes_skipped, 0u);
     // The end of the log and how far it is durable come from every frame.
     EXPECT_EQ(filtered.frontier, frontier_);
     for (const auto &record : filtered.records) {
-      EXPECT_GT(record.epoch, image.cut_epoch);
+      EXPECT_GT(record.epoch, checkpoint.cut_epoch);
     }
   }
 
-  std::vector<std::string> with_image;
-  std::vector<std::string> index_with_image;
+  std::vector<std::string> with_checkpoint;
+  std::vector<std::string> index_with_checkpoint;
   {
     auto config = MakeConfig(true);
     helios::storage::Database db(config);
     db.CreateTable(kTable);
-    with_image = ReadAliceBobCarol(db);
-    index_with_image = ReadIndex(db);
+    with_checkpoint = ReadAliceBobCarol(db);
+    index_with_checkpoint = ReadIndex(db);
   }
 
   std::error_code ec;
-  ASSERT_TRUE(std::filesystem::remove(image_path(), ec)) << ec.message();
-  std::vector<std::string> without_image;
-  std::vector<std::string> index_without_image;
+  ASSERT_TRUE(std::filesystem::remove(checkpoint_path(), ec)) << ec.message();
+  std::vector<std::string> without_checkpoint;
+  std::vector<std::string> index_without_checkpoint;
   {
     auto config = MakeConfig(true);
     helios::storage::Database db(config);
     db.CreateTable(kTable);
-    without_image = ReadAliceBobCarol(db);
-    index_without_image = ReadIndex(db);
+    without_checkpoint = ReadAliceBobCarol(db);
+    index_without_checkpoint = ReadIndex(db);
   }
 
-  EXPECT_EQ(with_image, without_image);
-  EXPECT_EQ(with_image,
+  EXPECT_EQ(with_checkpoint, without_checkpoint);
+  EXPECT_EQ(with_checkpoint,
             (std::vector<std::string>{"alice=two", "bob=", "carol=two"}));
-  EXPECT_EQ(index_with_image, index_without_image);
+  EXPECT_EQ(index_with_checkpoint, index_without_checkpoint);
   // The index reaches the row the tail rewrote and the one it added, and no
   // longer reaches the row the tail deleted.
-  EXPECT_EQ(index_with_image,
+  EXPECT_EQ(index_with_checkpoint,
             (std::vector<std::string>{"s/alice=two", "s/carol=two"}));
 }
 
-TEST_F(EpochScanCheckpointTest, AQuietTailAfterTheImageIsAccepted) {
+TEST_F(EpochScanCheckpointTest, AQuietTailAfterTheCheckpointIsAccepted) {
   {
     auto config = MakeConfig(false);
     helios::storage::Database db(config);
@@ -402,23 +408,24 @@ TEST_F(EpochScanCheckpointTest, AQuietTailAfterTheImageIsAccepted) {
     ASSERT_TRUE(CommitWrite(db, "alice", "one"));
     ASSERT_TRUE(CommitWrite(db, "bob", "one"));
     // Nothing is written afterwards, so the scan ends past the epoch of the
-    // last frame the log holds: the database went quiet before the image did.
-    ASSERT_TRUE(db.WriteCheckpointImage());
+    // last frame the log holds: the database went quiet before the checkpoint
+    // did.
+    ASSERT_TRUE(db.WriteCheckpoint());
   }
 
-  const auto image = EpochScanCheckpoint::Load(work_dir_);
-  ASSERT_EQ(image.status, EpochScanCheckpoint::Image::Status::kOk);
+  const auto checkpoint = EpochScanCheckpoint::Load(work_dir_);
+  ASSERT_EQ(checkpoint.status, EpochScanCheckpoint::LoadResult::Status::kOk);
   {
     Wal wal(work_dir_, helios::storage::wal::WalIo::Posix(), 1ull << 20);
     auto scan = wal.ScanAndRepair(0);
     ASSERT_EQ(scan.status, WalScanResult::Status::kOk);
     // The quiet tail this test is named for: the log's frontier never
     // reaches the epoch the scan ended at, which is what made the v1 gate
-    // refuse a legitimate image.
-    ASSERT_LT(scan.frontier, image.end_epoch);
+    // refuse a legitimate checkpoint.
+    ASSERT_LT(scan.frontier, checkpoint.end_epoch);
     // The v2 gate asks a question this log still answers: it reaches at
-    // least as far as the log was durable when the image was published.
-    ASSERT_GE(scan.frontier, image.wal_frontier_at_publish);
+    // least as far as the log was durable when the checkpoint was published.
+    ASSERT_GE(scan.frontier, checkpoint.wal_frontier_at_publish);
   }
 
   auto config = MakeConfig(true);
@@ -436,29 +443,29 @@ TEST_F(EpochScanCheckpointTest, ALogShorterThanThePublishFrontierIsRejected) {
     db.CreateTable(kTable);
     ASSERT_TRUE(CommitWrite(db, "alice", "one"));
     ASSERT_TRUE(CommitWrite(db, "bob", "one"));
-    // A copy of the log as it stands here, before the commits the image
+    // A copy of the log as it stands here, before the commits the checkpoint
     // published below will require the log to reach.
     std::filesystem::copy_file(work_dir_ + "/wal.log", short_log_copy);
     ASSERT_TRUE(CommitWrite(db, "carol", "one"));
     ASSERT_TRUE(CommitWrite(db, "dave", "one"));
-    ASSERT_TRUE(db.WriteCheckpointImage());
+    ASSERT_TRUE(db.WriteCheckpoint());
   }
 
-  const auto image = EpochScanCheckpoint::Load(work_dir_);
-  ASSERT_EQ(image.status, EpochScanCheckpoint::Image::Status::kOk);
+  const auto checkpoint = EpochScanCheckpoint::Load(work_dir_);
+  ASSERT_EQ(checkpoint.status, EpochScanCheckpoint::LoadResult::Status::kOk);
 
-  // Stand in for a log genuinely truncated, or substituted, after the image
-  // was published: put the earlier, shorter log back in its place.
+  // Stand in for a log genuinely truncated, or substituted, after the
+  // checkpoint was published: put the earlier, shorter log back in its place.
   std::filesystem::copy_file(short_log_copy, work_dir_ + "/wal.log",
                              std::filesystem::copy_options::overwrite_existing);
   {
     Wal wal(work_dir_, helios::storage::wal::WalIo::Posix(), 1ull << 20);
     const auto scan = wal.ScanAndRepair(0);
     ASSERT_EQ(scan.status, WalScanResult::Status::kOk);
-    ASSERT_LT(scan.frontier, image.wal_frontier_at_publish);
+    ASSERT_LT(scan.frontier, checkpoint.wal_frontier_at_publish);
   }
 
-  // The refusal is only real if recovery acts on it: rows the image alone
+  // The refusal is only real if recovery acts on it: rows the checkpoint alone
   // holds must not come back from a log that never carried them.
   auto config = MakeConfig(true);
   helios::storage::Database db(config);
@@ -469,19 +476,19 @@ TEST_F(EpochScanCheckpointTest, ALogShorterThanThePublishFrontierIsRejected) {
   EXPECT_FALSE(Read(db, "dave").found);
 }
 
-TEST_F(EpochScanCheckpointTest, V1FormatImageIsRefused) {
+TEST_F(EpochScanCheckpointTest, V1FormatCheckpointIsRefused) {
   {
     auto config = MakeConfig(false);
     helios::storage::Database db(config);
     db.CreateTable(kTable);
     ASSERT_TRUE(CommitWrite(db, "alice", "one"));
-    ASSERT_TRUE(db.WriteCheckpointImage());
+    ASSERT_TRUE(db.WriteCheckpoint());
   }
 
   // Downgrade the version field to what a v1 writer would have left. There is
   // no migration for it: v1 has no wal_frontier_at_publish field to read.
   {
-    std::fstream file(image_path(),
+    std::fstream file(checkpoint_path(),
                       std::ios::in | std::ios::out | std::ios::binary);
     ASSERT_TRUE(file.is_open());
     file.seekp(sizeof(uint32_t));
@@ -489,9 +496,10 @@ TEST_F(EpochScanCheckpointTest, V1FormatImageIsRefused) {
     file.write(reinterpret_cast<const char *>(v1_version), sizeof(v1_version));
   }
 
-  auto image = EpochScanCheckpoint::Load(work_dir_);
-  EXPECT_EQ(image.status, EpochScanCheckpoint::Image::Status::kUnusable);
-  EXPECT_TRUE(image.records.empty());
+  auto checkpoint = EpochScanCheckpoint::Load(work_dir_);
+  EXPECT_EQ(checkpoint.status,
+            EpochScanCheckpoint::LoadResult::Status::kUnusable);
+  EXPECT_TRUE(checkpoint.records.empty());
 }
 
 TEST_F(EpochScanCheckpointTest, ARowLockedDuringTheScanIsRetried) {
@@ -515,7 +523,7 @@ TEST_F(EpochScanCheckpointTest, ARowLockedDuringTheScanIsRetried) {
 
   uint64_t version_retries = 0;
   auto scan = std::async(std::launch::async, [&db, &version_retries] {
-    return db.WriteCheckpointImage(&version_retries);
+    return db.WriteCheckpoint(&version_retries);
   });
   // See ReleaseOnExit: unblocks a scan parked at its current wait before
   // `scan`'s own destructor would otherwise join it forever.
@@ -576,12 +584,12 @@ TEST_F(EpochScanCheckpointTest, ARowLockedDuringTheScanIsRetried) {
   ASSERT_EQ(releaser.wait_for(kTestTimeout), std::future_status::ready);
   releaser.get();
 
-  auto image = EpochScanCheckpoint::Load(work_dir_);
-  ASSERT_EQ(image.status, EpochScanCheckpoint::Image::Status::kOk);
+  auto checkpoint = EpochScanCheckpoint::Load(work_dir_);
+  ASSERT_EQ(checkpoint.status, EpochScanCheckpoint::LoadResult::Status::kOk);
   // Either version is a correct answer for a scan that runs alongside a
   // writer. A mixture of the two is not.
   for (const char *key : {"alice", "bob"}) {
-    const auto value = RowInImage(image, key);
+    const auto value = RowInCheckpoint(checkpoint, key);
     ASSERT_TRUE(value.has_value()) << key;
     EXPECT_TRUE(*value == std::string(64, 'a') ||
                 *value == std::string(64, 'b'))
@@ -595,19 +603,19 @@ TEST_F(EpochScanCheckpointTest, ALeftoverWorkingFileIsNotRead) {
     helios::storage::Database db(config);
     db.CreateTable(kTable);
     ASSERT_TRUE(CommitWrite(db, "alice", "one"));
-    ASSERT_TRUE(db.WriteCheckpointImage());
+    ASSERT_TRUE(db.WriteCheckpoint());
   }
 
   // What a crash between the write and the rename leaves behind.
   {
     std::ofstream file(working_path(), std::ios::binary);
     ASSERT_TRUE(file.is_open());
-    file << "half of an image";
+    file << "half of a checkpoint";
   }
 
-  auto image = EpochScanCheckpoint::Load(work_dir_);
-  ASSERT_EQ(image.status, EpochScanCheckpoint::Image::Status::kOk);
-  EXPECT_EQ(RowInImage(image, "alice"), "one");
+  auto checkpoint = EpochScanCheckpoint::Load(work_dir_);
+  ASSERT_EQ(checkpoint.status, EpochScanCheckpoint::LoadResult::Status::kOk);
+  EXPECT_EQ(RowInCheckpoint(checkpoint, "alice"), "one");
 }
 
 }  // namespace

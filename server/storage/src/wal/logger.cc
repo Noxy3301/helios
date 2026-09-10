@@ -230,15 +230,16 @@ void GroupSecondary(const SecondaryOps &ops, WriteSet &recovery_set) {
  * index entries arrive as per-primary-key deltas and are regrouped into one
  * entry per secondary key.
  *
- * The checkpoint image is folded in ahead of the log's tail as ordinary
+ * The checkpoint is folded in ahead of the log's tail as ordinary
  * records, under the same rule that resolves two epochs of the log.
  */
-WriteSet BuildRecoverySet(const LogRecords &image, const LogRecords &tail) {
+WriteSet BuildRecoverySet(const LogRecords &checkpoint,
+                          const LogRecords &tail) {
   SecondaryOps secondary_latest;
   PrimaryPos primary_position;
   WriteSet recovery_set;
 
-  const LogRecords *sources[] = {&image, &tail};
+  const LogRecords *sources[] = {&checkpoint, &tail};
   for (const auto *source : sources) {
     for (const auto &log_record : *source) {
       for (const auto &write : log_record.writes) {
@@ -287,54 +288,56 @@ Logger::RecoveryResult Logger::FailRecovery(const WalScanResult &scan) {
 }
 
 Logger::RecoveryResult Logger::Recover() {
-  // Only a replay reads the image. A startup that scans the log without
-  // replaying it does so to find the end of the log, which the image says
+  // Only a replay reads the checkpoint. A startup that scans the log without
+  // replaying it does so to find the end of the log, which the checkpoint says
   // nothing about.
-  // FIXME: an image is bound to a log by sharing a directory with it, and
+  // FIXME: a checkpoint is bound to a log by sharing a directory with it, and
   // neither file names the database it came from
-  EpochScanCheckpoint::Image image;
+  EpochScanCheckpoint::LoadResult checkpoint;
   if (loads_checkpoint_) {
-    image = EpochScanCheckpoint::Load(work_dir_);
-    if (image.status == EpochScanCheckpoint::Image::Status::kUnusable) {
-      // An image that cannot be trusted is not a reason to refuse to start:
-      // the log alone still holds everything the image would have supplied.
-      SPDLOG_WARN("Ignoring the checkpoint image: {0}", image.detail);
-      image.records.clear();
+    checkpoint = EpochScanCheckpoint::Load(work_dir_);
+    if (checkpoint.status ==
+        EpochScanCheckpoint::LoadResult::Status::kUnusable) {
+      // A checkpoint that cannot be trusted is not a reason to refuse to start:
+      // the log alone still holds everything the checkpoint would have
+      // supplied.
+      SPDLOG_WARN("Ignoring the checkpoint: {0}", checkpoint.detail);
+      checkpoint.records.clear();
       // The cut is cleared with it so the scan hops nothing.
-      image.cut_epoch = 0;
+      checkpoint.cut_epoch = 0;
     }
   }
 
-  auto scan = thread_local_logger_->ScanAndRepair(image.cut_epoch);
+  auto scan = thread_local_logger_->ScanAndRepair(checkpoint.cut_epoch);
   RecoveryResult result;
   if (scan.status != WalScanResult::Status::kOk) return FailRecovery(scan);
 
-  if (image.status == EpochScanCheckpoint::Image::Status::kOk) {
-    // The image is honoured only when this log's last written epoch is at
+  if (checkpoint.status == EpochScanCheckpoint::LoadResult::Status::kOk) {
+    // The checkpoint is honoured only when this log's last written epoch is at
     // least the one recorded at publish; a shorter log cannot be the file
-    // that image named (see the FIXME above).
-    if (scan.frontier < image.wal_frontier_at_publish) {
+    // that checkpoint named (see the FIXME above).
+    if (scan.frontier < checkpoint.wal_frontier_at_publish) {
       SPDLOG_WARN(
-          "Ignoring the checkpoint image: it was published when the log was "
+          "Ignoring the checkpoint: it was published when the log was "
           "durable through epoch {0}, past the last epoch {1} this log "
           "holds",
-          image.wal_frontier_at_publish, scan.frontier);
-      image.records.clear();
-      // The frames the first scan hopped have to be read now that the image
-      // is gone.
+          checkpoint.wal_frontier_at_publish, scan.frontier);
+      checkpoint.records.clear();
+      // The frames the first scan hopped have to be read now that the
+      // checkpoint is gone.
       scan = thread_local_logger_->ScanAndRepair(0);
       if (scan.status != WalScanResult::Status::kOk) return FailRecovery(scan);
     } else {
       SPDLOG_INFO(
-          "Recovering from the checkpoint image of epoch {0}: {1} frames of "
+          "Recovering from the checkpoint of epoch {0}: {1} frames of "
           "{2} bytes are covered by it and are not replayed",
-          image.cut_epoch, scan.frames_skipped, scan.bytes_skipped);
+          checkpoint.cut_epoch, scan.frames_skipped, scan.bytes_skipped);
     }
   }
 
   durable_epoch_.store(scan.frontier, std::memory_order_seq_cst);
   result.frontier = scan.frontier;
-  result.recovery_set = BuildRecoverySet(image.records, scan.records);
+  result.recovery_set = BuildRecoverySet(checkpoint.records, scan.records);
   return result;
 }
 

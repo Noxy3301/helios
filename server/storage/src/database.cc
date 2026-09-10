@@ -153,8 +153,8 @@ bool Database::Commit(
                            durability, abort_reason);
 }
 
-bool Database::WriteCheckpointImage(uint64_t *out_version_retries) {
-  return db_pimpl_->WriteCheckpointImage(out_version_retries);
+bool Database::WriteCheckpoint(uint64_t *out_version_retries) {
+  return db_pimpl_->WriteCheckpoint(out_version_retries);
 }
 
 EpochNumber Database::Impl::ResumeEpochAbove(EpochNumber frontier) {
@@ -337,7 +337,7 @@ Table *Database::Impl::GetTable(const std::string_view table_name) const {
   return table_dictionary_.GetTable(table_name);
 }
 
-bool Database::Impl::WriteCheckpointImage(uint64_t *out_version_retries) {
+bool Database::Impl::WriteCheckpoint(uint64_t *out_version_retries) {
   wal::EpochScanCheckpoint::Stats stats;
   const bool published = scan_checkpoint_.RunOnce(&stats);
   if (out_version_retries != nullptr)

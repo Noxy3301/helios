@@ -1,6 +1,6 @@
 /**
  * @file server/storage/src/wal/epoch_scan_checkpoint.cc
- * The image of the live rows, scanned while transactions keep running and
+ * The checkpoint of the live rows, scanned while transactions keep running and
  * merged with the log at recovery.
  */
 
@@ -45,14 +45,14 @@ using Clock = std::chrono::steady_clock;
 // the pass that runs without holding up the rest of the table.
 constexpr unsigned kSpinAttempts = 64;
 // The retry pass gives up eventually rather than scanning forever, because a
-// row that never settles means the image cannot be written at all.
+// row that never settles means the checkpoint cannot be written at all.
 constexpr unsigned kRetryRounds = 200;
 constexpr auto kRetryPause = std::chrono::milliseconds(25);
 // The frontier advances once per epoch, so a wait beyond this means the
 // flusher is not running rather than that the epoch is slow.
 constexpr auto kDurabilityWait = std::chrono::seconds(60);
 
-// Image header fields, in bytes from the start of the file. The magic word
+// Checkpoint header fields, in bytes from the start of the file. The magic word
 // opens it at offset 0 and the checksum closes it at kHeaderSize - 4.
 constexpr size_t kOffVersion = 4;
 constexpr size_t kOffFlags = 6;
@@ -176,7 +176,7 @@ bool FsyncDirectory(const std::string &directory) {
 
 }  // namespace
 
-const char *EpochScanCheckpoint::ImageFileName() { return "checkpoint.img"; }
+const char *EpochScanCheckpoint::CheckpointFileName() { return "checkpoint"; }
 const char *EpochScanCheckpoint::WorkingFileName() {
   return "checkpoint.working";
 }
@@ -279,8 +279,9 @@ EpochScanCheckpoint::EpochScanCheckpoint(const Config &config,
       tables_(tables),
       epoch_framework_(epoch_framework),
       logger_(logger),
-      image_path_(
-          (std::filesystem::path(config.work_dir) / ImageFileName()).string()),
+      checkpoint_path_(
+          (std::filesystem::path(config.work_dir) / CheckpointFileName())
+              .string()),
       working_path_((std::filesystem::path(config.work_dir) / WorkingFileName())
                         .string()) {}
 
@@ -324,7 +325,7 @@ void EpochScanCheckpoint::Loop() {
 bool EpochScanCheckpoint::RunOnce(Stats *out_stats) {
   std::unique_lock<std::mutex> guard(capture_mutex_, std::try_to_lock);
   if (!guard.owns_lock()) {
-    SPDLOG_WARN("A checkpoint image is already being written");
+    SPDLOG_WARN("A checkpoint is already being written");
     return false;
   }
 
@@ -369,8 +370,8 @@ bool EpochScanCheckpoint::RunOnce(Stats *out_stats) {
   index::MasstreeReleaseThreadEpoch();
 
   stats.scan_ms = ElapsedMs(scan_begin);
-  // Every version in the image was published at or below this epoch, which is
-  // what the durability gate below is asked about.
+  // Every version in the checkpoint was published at or below this epoch, which
+  // is what the durability gate below is asked about.
   stats.end_epoch = epoch_framework_.GetGlobalEpoch();
 
   // Keep the previous checkpoint when the scan could not settle.
@@ -402,8 +403,8 @@ bool EpochScanCheckpoint::RunOnce(Stats *out_stats) {
       "epoch {4}, end epoch {5}, {6} ms at the barrier, {7} ms scanning, {8} "
       "ms writing, {9} ms waiting for the log, {10} version retries",
       stats.generation, stats.primary_rows, stats.secondary_entries,
-      stats.image_bytes, stats.cut_epoch, stats.end_epoch, stats.barrier_ms,
-      stats.scan_ms, stats.write_ms, stats.durability_ms,
+      stats.checkpoint_bytes, stats.cut_epoch, stats.end_epoch,
+      stats.barrier_ms, stats.scan_ms, stats.write_ms, stats.durability_ms,
       stats.version_retries);
   return true;
 }
@@ -558,7 +559,7 @@ bool EpochScanCheckpoint::Publish(const LogRecords &records, Stats *stats) {
   crc.Update(header, kHeaderSize - sizeof(uint32_t));
   crc.Update(payload.data(), payload.size());
   PutLe32(header + kHeaderSize - sizeof(uint32_t), crc.Finish());
-  stats->image_bytes = kHeaderSize + payload.size();
+  stats->checkpoint_bytes = kHeaderSize + payload.size();
 
   const int fd = ::open(working_path_.c_str(),
                         O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
@@ -580,11 +581,11 @@ bool EpochScanCheckpoint::Publish(const LogRecords &records, Stats *stats) {
   }
   stats->write_ms = ElapsedMs(write_begin);
 
-  if (::rename(working_path_.c_str(), image_path_.c_str()) != 0) {
+  if (::rename(working_path_.c_str(), checkpoint_path_.c_str()) != 0) {
     const int rename_errno = errno;
     ::unlink(working_path_.c_str());
     SPDLOG_WARN("Checkpoint {0} could not be published as {1} (errno {2})",
-                stats->generation, image_path_, rename_errno);
+                stats->generation, checkpoint_path_, rename_errno);
     return false;
   }
   if (!FsyncDirectory(config_.work_dir)) {
@@ -597,47 +598,50 @@ bool EpochScanCheckpoint::Publish(const LogRecords &records, Stats *stats) {
   return true;
 }
 
-EpochScanCheckpoint::Image EpochScanCheckpoint::Load(
+EpochScanCheckpoint::LoadResult EpochScanCheckpoint::Load(
     const std::string &work_dir) {
-  Image image;
+  LoadResult checkpoint;
   const std::string path =
-      (std::filesystem::path(work_dir) / ImageFileName()).string();
+      (std::filesystem::path(work_dir) / CheckpointFileName()).string();
   const ScopedFd file(::open(path.c_str(), O_RDONLY | O_CLOEXEC));
   if (file.fd < 0) {
-    image.status =
-        errno == ENOENT ? Image::Status::kAbsent : Image::Status::kUnusable;
-    image.detail = "open " + path + " (errno " + std::to_string(errno) + ")";
-    return image;
+    checkpoint.status = errno == ENOENT ? LoadResult::Status::kAbsent
+                                        : LoadResult::Status::kUnusable;
+    checkpoint.detail =
+        "open " + path + " (errno " + std::to_string(errno) + ")";
+    return checkpoint;
   }
   const int fd = file.fd;
 
   auto unusable = [&](const std::string &detail) {
-    image.status = Image::Status::kUnusable;
-    image.detail = detail;
-    image.records.clear();
-    return image;
+    checkpoint.status = LoadResult::Status::kUnusable;
+    checkpoint.detail = detail;
+    checkpoint.records.clear();
+    return checkpoint;
   };
 
   struct stat file_stat {};
-  if (::fstat(fd, &file_stat) < 0) return unusable("the image cannot be sized");
+  if (::fstat(fd, &file_stat) < 0)
+    return unusable("the checkpoint cannot be sized");
   if (file_stat.st_size < static_cast<off_t>(kHeaderSize)) {
-    return unusable("the image is shorter than its header");
+    return unusable("the checkpoint is shorter than its header");
   }
 
   uint8_t header[kHeaderSize];
   if (!ReadAll(fd, header, sizeof(header), 0)) {
-    return unusable("the image header cannot be read");
+    return unusable("the checkpoint header cannot be read");
   }
-  if (GetLe32(header) != kMagic) return unusable("the image magic disagrees");
+  if (GetLe32(header) != kMagic)
+    return unusable("the checkpoint magic disagrees");
   if (GetLe16(header + kOffVersion) != kVersion) {
-    return unusable("the image version is not supported");
+    return unusable("the checkpoint version is not supported");
   }
   if (GetLe16(header + kOffFlags) != kFlags) {
-    return unusable("the image carries unknown flags");
+    return unusable("the checkpoint carries unknown flags");
   }
   const uint64_t payload_size = GetLe64(header + kOffPayloadSize);
   if (payload_size != static_cast<uint64_t>(file_stat.st_size) - kHeaderSize) {
-    return unusable("the image length disagrees with its header");
+    return unusable("the checkpoint length disagrees with its header");
   }
 
   const EpochNumber cut_epoch = GetLe32(header + kOffCutEpoch);
@@ -646,7 +650,7 @@ EpochScanCheckpoint::Image EpochScanCheckpoint::Load(
   // Epoch 0 is not a cut any writer produces, and a scan never ends before
   // its cut.
   if (cut_epoch == 0 || end_epoch < cut_epoch) {
-    return unusable("the image epochs are not in order");
+    return unusable("the checkpoint epochs are not in order");
   }
 
   // Everything from here allocates in proportion to the file, and a file that
@@ -655,35 +659,35 @@ EpochScanCheckpoint::Image EpochScanCheckpoint::Load(
     std::vector<uint8_t> payload(payload_size);
     if (payload_size != 0 &&
         !ReadAll(fd, payload.data(), payload.size(), kHeaderSize)) {
-      return unusable("the image payload cannot be read");
+      return unusable("the checkpoint payload cannot be read");
     }
     Crc32c crc;
     crc.Update(header, kHeaderSize - sizeof(uint32_t));
     crc.Update(payload.data(), payload.size());
     if (crc.Finish() != GetLe32(header + kHeaderSize - sizeof(uint32_t))) {
-      return unusable("the image checksum does not hold");
+      return unusable("the checkpoint checksum does not hold");
     }
 
     size_t consumed = 0;
     auto handle =
         msgpack::unpack(reinterpret_cast<const char *>(payload.data()),
                         payload.size(), consumed);
-    handle.get().convert(image.records);
+    handle.get().convert(checkpoint.records);
     if (consumed != payload.size()) {
-      return unusable("the image payload has trailing bytes");
+      return unusable("the checkpoint payload has trailing bytes");
     }
   } catch (const std::exception &e) {
-    return unusable(std::string("the image payload does not unpack: ") +
+    return unusable(std::string("the checkpoint payload does not unpack: ") +
                     e.what());
   } catch (...) {
-    return unusable("the image payload does not unpack");
+    return unusable("the checkpoint payload does not unpack");
   }
 
-  image.status = Image::Status::kOk;
-  image.cut_epoch = cut_epoch;
-  image.end_epoch = end_epoch;
-  image.wal_frontier_at_publish = wal_frontier_at_publish;
-  return image;
+  checkpoint.status = LoadResult::Status::kOk;
+  checkpoint.cut_epoch = cut_epoch;
+  checkpoint.end_epoch = end_epoch;
+  checkpoint.wal_frontier_at_publish = wal_frontier_at_publish;
+  return checkpoint;
 }
 
 }  // namespace wal

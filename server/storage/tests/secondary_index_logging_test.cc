@@ -17,7 +17,7 @@
 
 /**
  * @file server/storage/tests/secondary_index_logging_test.cc
- * That secondary index entries survive recovery without an image, and the
+ * That secondary index entries survive recovery without a checkpoint, and the
  * timing the log records for them.
  */
 

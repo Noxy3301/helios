@@ -80,28 +80,28 @@ struct Config {
   uint64_t wal_initial_capacity_bytes = 64ull * 1024ull * 1024ull;
 
   /**
-   * @brief How often, in milliseconds, an image of the live rows is
+   * @brief How often, in milliseconds, a checkpoint of the live rows is
    *        written; zero writes none.
    *
-   * The image is scanned while transactions keep running and is merged with
-   * the log at recovery, which is what bounds the part of the log that has to
-   * be replayed. It does not bound the log on disk: nothing is truncated.
+   * The checkpoint is scanned while transactions keep running and is merged
+   * with the log at recovery, which is what bounds the part of the log that has
+   * to be replayed. It does not bound the log on disk: nothing is truncated.
    *
-   * Requires a durability contract that writes a log, since the image alone is
-   * not a recoverable state.
+   * Requires a durability contract that writes a log, since the checkpoint
+   * alone is not a recoverable state.
    *
-   * Default: 0 (no image)
+   * Default: 0 (no checkpoint)
    */
   size_t checkpoint_interval_ms = 0;
 
   /**
-   * @brief One image written this many milliseconds after startup; zero
+   * @brief One checkpoint written this many milliseconds after startup; zero
    *        writes none.
    *
    * @details When checkpoint_interval_ms is also set, its timer starts after
    * this first checkpoint, not at startup.
    *
-   * Default: 0 (no image)
+   * Default: 0 (no checkpoint)
    */
   size_t checkpoint_once_after_ms = 0;
 

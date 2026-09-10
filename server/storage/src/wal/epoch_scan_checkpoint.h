@@ -1,6 +1,6 @@
 /**
  * @file server/storage/src/wal/epoch_scan_checkpoint.h
- * The image of the live rows, scanned while transactions keep running and
+ * The checkpoint of the live rows, scanned while transactions keep running and
  * merged with the log at recovery.
  */
 
@@ -32,15 +32,17 @@ namespace wal {
 class Logger;
 
 /**
- * @brief An image of the live rows, written while transactions keep running.
+ * @brief A checkpoint of the live rows, written while transactions keep
+ * running.
  *
  * The scan starts after a barrier, so every commit at or below the cut is
  * already in memory; rows committed during the scan may be captured too, and
- * recovery resolves that mixture by folding the image under the log's own
+ * recovery resolves that mixture by folding the checkpoint under the log's own
  * newest-transaction-id-wins rule and replaying everything above the cut.
  * Each row's copy is torn-free under the read path's version protocol, and
- * the image is published only once the log covers every epoch the scan could
- * have observed. What the image bounds is the replay, not the log on disk.
+ * the checkpoint is published only once the log covers every epoch the scan
+ * could have observed. What the checkpoint bounds is the replay, not the log on
+ * disk.
  */
 class EpochScanCheckpoint {
  public:
@@ -61,7 +63,7 @@ class EpochScanCheckpoint {
     EpochNumber wal_frontier_at_publish{0};
     uint64_t primary_rows{0};
     uint64_t secondary_entries{0};
-    uint64_t image_bytes{0};
+    uint64_t checkpoint_bytes{0};
     uint64_t version_retries{0};
     int64_t barrier_ms{0};
     int64_t scan_ms{0};
@@ -70,13 +72,13 @@ class EpochScanCheckpoint {
   };
 
   /**
-   * @brief A published image as recovery receives it.
+   * @brief A published checkpoint as recovery receives it.
    *
    * `Absent` and `Unusable` are both answered with a full replay of the log;
-   * they are distinguished so that a damaged image is reported rather than
+   * they are distinguished so that a damaged checkpoint is reported rather than
    * ignored.
    */
-  struct Image {
+  struct LoadResult {
     enum class Status { kOk, kAbsent, kUnusable };
 
     Status status{Status::kAbsent};
@@ -108,27 +110,28 @@ class EpochScanCheckpoint {
   void Stop();
 
   /**
-   * @brief Captures one image and publishes it, or abandons the attempt.
-   * An abandoned attempt leaves the image published before it in place; only
-   * a directory-sync failure after the atomic rename can report failure with
-   * the new image already in place.
+   * @brief Captures one checkpoint and publishes it, or abandons the attempt.
+   * An abandoned attempt leaves the checkpoint published before it in place;
+   * only a directory-sync failure after the atomic rename can report failure
+   * with the new checkpoint already in place.
    * @param[out] out_stats What the capture did, when non-null.
    * @return Whether it published durably.
    */
   bool RunOnce(Stats *out_stats = nullptr);
 
   /**
-   * @brief Reads the published image of `work_dir`, if there is a usable one.
+   * @brief Reads the published checkpoint of `work_dir`, if there is a usable
+   * one.
    * @param[in] work_dir The directory the database logs into.
    * @return The file's status and, when Ok, the records and epoch bounds it
    * held.
    */
-  static Image Load(const std::string &work_dir);
+  static LoadResult Load(const std::string &work_dir);
 
   /**
-   * @brief Name of the published image inside the working directory.
+   * @brief Name of the published checkpoint inside the working directory.
    */
-  static const char *ImageFileName();
+  static const char *CheckpointFileName();
   /**
    * @brief Name of the file a capture writes before it publishes.
    */
@@ -175,7 +178,7 @@ class EpochScanCheckpoint {
   TableDictionary &tables_;
   epoch::Framework &epoch_framework_;
   Logger &logger_;
-  const std::string image_path_;
+  const std::string checkpoint_path_;
   const std::string working_path_;
 
   uint64_t generation_{0};

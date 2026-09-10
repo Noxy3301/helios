@@ -15,7 +15,7 @@ namespace wal {
 /**
  * @brief CRC-32C (Castagnoli): reflected polynomial 0x82F63B78, initial
  * value 0xFFFFFFFF, final xor 0xFFFFFFFF.
- * @details The checksum the WAL frames and the checkpoint images carry. Bytes
+ * @details The checksum the WAL frames and the checkpoints carry. Bytes
  * are fed incrementally; Finish() may be read more than once. The check value
  * for "123456789" is 0xE3069283.
  * @note The polynomial is pinned because "crc32" names two different

@@ -87,7 +87,7 @@ class Logger {
    * @brief Scans the log and, when the scan allows it, repairs a torn tail.
    * @details On success it sets the durable epoch from the last intact frame
    * and returns that epoch together with the folded write set, the
-   * checkpoint image first when one was loaded, then the log. On kFailed,
+   * checkpoint first when one was loaded, then the log. On kFailed,
    * frontier is 0 and recovery_set is empty.
    * @note Runs before the flusher starts and before the database accepts
    * work.

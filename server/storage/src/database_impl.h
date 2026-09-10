@@ -152,7 +152,7 @@ class Database::Impl {
 
   Table *GetTable(const std::string_view table_name) const;
 
-  bool WriteCheckpointImage(uint64_t *out_version_retries);
+  bool WriteCheckpoint(uint64_t *out_version_retries);
 
  private:
   // Read view expiry, half the high-water margin. Enforces the wrap-free
