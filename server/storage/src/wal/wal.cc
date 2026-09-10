@@ -242,7 +242,7 @@ Wal::Wal(const std::string &work_dir, WalIo io, uint64_t initial_capacity_bytes)
   // survives a crash must not run ahead of the zeroes it covers (ext4
   // data=ordered, the supported configuration). Capacity is not extended
   // here: the region to initialise begins where the log ends, which is
-  // what ScanAndRepair establishes.
+  // what Scan establishes.
   initialised_size_ = file_stat.st_size;
 }
 
@@ -580,7 +580,7 @@ bool Wal::HopCoveredFrames(EpochNumber min_epoch, off_t file_size,
   return true;
 }
 
-WalScanResult Wal::ScanAndRepair(EpochNumber min_epoch) {
+WalScanResult Wal::Scan(EpochNumber min_epoch) {
   // Refuse a scan on an instance that already failed.
   if (state_ == State::kFailed) {
     return IoFailure("scan " + path_ + " after a failure", EIO);

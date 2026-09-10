@@ -112,7 +112,7 @@ struct WalIo {
  *
  * Two consequences run through the rest of this class. The end of the log
  * is not the end of the file: it is where the zeroes begin, which is why
- * nothing may be written before ScanAndRepair has found it. And the zeroes
+ * nothing may be written before Scan has found it. And the zeroes
  * ahead of the log are an invariant, not an accident: they are what makes
  * an interrupted write recognisable, so a repair restores them.
  *
@@ -134,7 +134,7 @@ class Wal {
  public:
   /**
    * @brief Opens the log and takes an exclusive lock on it.
-   * @details The constructor neither preallocates nor reads. ScanAndRepair
+   * @details The constructor neither preallocates nor reads. Scan
    * locates the end of the log first, then initialises the region past it.
    * @param[in] initial_capacity_bytes How much is made writable in place at
    * a time. It is a granularity rather than a limit: a log that outgrows it
@@ -165,7 +165,7 @@ class Wal {
    * read and checksummed in full. A header that fails to parse falls back to
    * a full scan from offset 0.
    */
-  WalScanResult ScanAndRepair(EpochNumber min_epoch = 0);
+  WalScanResult Scan(EpochNumber min_epoch = 0);
 
   /**
    * @brief Appends one frame per bucket whose epoch is at or below `target`,

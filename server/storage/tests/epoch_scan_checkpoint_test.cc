@@ -350,14 +350,14 @@ TEST_F(EpochScanCheckpointTest,
   // What the replay leaves out, and that it leaves out something at all.
   {
     Wal wal(work_dir_, helios::storage::wal::WalIo::Posix(), 1ull << 20);
-    auto full = wal.ScanAndRepair(0);
+    auto full = wal.Scan(0);
     ASSERT_EQ(full.status, WalScanResult::Status::kOk);
     EXPECT_EQ(full.frames_skipped, 0u);
     frontier_ = full.frontier;
   }
   {
     Wal wal(work_dir_, helios::storage::wal::WalIo::Posix(), 1ull << 20);
-    auto filtered = wal.ScanAndRepair(checkpoint.cut_epoch);
+    auto filtered = wal.Scan(checkpoint.cut_epoch);
     ASSERT_EQ(filtered.status, WalScanResult::Status::kOk);
     EXPECT_GT(filtered.frames_skipped, 0u);
     EXPECT_GT(filtered.bytes_skipped, 0u);
@@ -417,7 +417,7 @@ TEST_F(EpochScanCheckpointTest, AQuietTailAfterTheCheckpointIsAccepted) {
   ASSERT_EQ(checkpoint.status, EpochScanCheckpoint::LoadResult::Status::kOk);
   {
     Wal wal(work_dir_, helios::storage::wal::WalIo::Posix(), 1ull << 20);
-    auto scan = wal.ScanAndRepair(0);
+    auto scan = wal.Scan(0);
     ASSERT_EQ(scan.status, WalScanResult::Status::kOk);
     // The quiet tail this test is named for: the log's frontier never
     // reaches the epoch the scan ended at, which is what made the v1 gate
@@ -460,7 +460,7 @@ TEST_F(EpochScanCheckpointTest, ALogShorterThanThePublishFrontierIsRejected) {
                              std::filesystem::copy_options::overwrite_existing);
   {
     Wal wal(work_dir_, helios::storage::wal::WalIo::Posix(), 1ull << 20);
-    const auto scan = wal.ScanAndRepair(0);
+    const auto scan = wal.Scan(0);
     ASSERT_EQ(scan.status, WalScanResult::Status::kOk);
     ASSERT_LT(scan.frontier, checkpoint.wal_frontier_at_publish);
   }

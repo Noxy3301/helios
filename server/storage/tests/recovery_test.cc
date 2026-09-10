@@ -99,7 +99,7 @@ TEST_F(RecoveryTest, ALoggedWriteCarriesTheUnlockedTid) {
   }
 
   Wal wal(work_dir_, helios::storage::wal::WalIo::Posix(), kWalCapacityBytes);
-  auto scan = wal.ScanAndRepair();
+  auto scan = wal.Scan();
   ASSERT_EQ(scan.status, WalScanResult::Status::kOk);
 
   bool seen_row = false;
@@ -141,7 +141,7 @@ TEST_F(RecoveryTest, ARecoveredKeyAcceptsAFurtherWrite) {
   // and the write below spin rather than fail.
   {
     Wal wal(work_dir_, helios::storage::wal::WalIo::Posix(), kWalCapacityBytes);
-    auto scan = wal.ScanAndRepair();
+    auto scan = wal.Scan();
     ASSERT_EQ(scan.status, WalScanResult::Status::kOk);
     bool seen = false;
     for (const auto &record : scan.records) {

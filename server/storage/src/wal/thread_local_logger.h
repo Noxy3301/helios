@@ -80,9 +80,10 @@ class ThreadLocalLogger final {
   bool Enqueue(const WriteSet &ws, EpochNumber epoch);
 
   /**
-   * @brief Reads and repairs the log. Completes before the flusher starts.
+   * @brief Scans the log and zeroes a torn tail. Completes before the
+   * flusher starts.
    */
-  WalScanResult ScanAndRepair(EpochNumber min_epoch);
+  WalScanResult Scan(EpochNumber min_epoch);
 
   /**
    * @brief The epoch of the last frame actually written to the log.

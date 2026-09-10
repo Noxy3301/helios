@@ -79,7 +79,7 @@ SecondaryLogStats GetSecondaryIndexLogStatsForLatestEpoch(
   // Read the log through the writer's own format rather than re-deriving the
   // frame format here.
   helios::storage::wal::Wal wal(conf.work_dir);
-  const auto scan = wal.ScanAndRepair();
+  const auto scan = wal.Scan();
   EXPECT_EQ(scan.status, helios::storage::wal::WalScanResult::Status::kOk);
   if (scan.status != helios::storage::wal::WalScanResult::Status::kOk) {
     return stats;

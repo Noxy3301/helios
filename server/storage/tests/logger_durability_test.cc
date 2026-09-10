@@ -290,7 +290,7 @@ TEST_F(LoggerDurabilityTest, RecordsAboveTheTargetAreCarriedForward) {
   helios::storage::wal::Wal wal(config_.work_dir,
                                 helios::storage::wal::WalIo::Posix(),
                                 config_.wal_initial_capacity_bytes);
-  const auto scan = wal.ScanAndRepair();
+  const auto scan = wal.Scan();
   ASSERT_EQ(scan.status, helios::storage::wal::WalScanResult::Status::kOk);
   EXPECT_EQ(scan.frontier, 9u);
   ASSERT_EQ(scan.records.size(), 2u);
@@ -400,7 +400,7 @@ TEST_F(LoggerDurabilityTest, StopDrainsWhatWasAlreadyClosed) {
   helios::storage::wal::Wal wal(config_.work_dir,
                                 helios::storage::wal::WalIo::Posix(),
                                 config_.wal_initial_capacity_bytes);
-  const auto scan = wal.ScanAndRepair();
+  const auto scan = wal.Scan();
   ASSERT_EQ(scan.status, helios::storage::wal::WalScanResult::Status::kOk);
   EXPECT_EQ(scan.frontier, 6u);
 }

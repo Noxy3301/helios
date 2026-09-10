@@ -308,7 +308,7 @@ Logger::RecoveryResult Logger::Recover() {
     }
   }
 
-  auto scan = thread_local_logger_->ScanAndRepair(checkpoint.cut_epoch);
+  auto scan = thread_local_logger_->Scan(checkpoint.cut_epoch);
   RecoveryResult result;
   if (scan.status != WalScanResult::Status::kOk) return FailRecovery(scan);
 
@@ -325,7 +325,7 @@ Logger::RecoveryResult Logger::Recover() {
       checkpoint.records.clear();
       // The frames the first scan hopped have to be read now that the
       // checkpoint is gone.
-      scan = thread_local_logger_->ScanAndRepair(0);
+      scan = thread_local_logger_->Scan(0);
       if (scan.status != WalScanResult::Status::kOk) return FailRecovery(scan);
     } else {
       SPDLOG_INFO(
