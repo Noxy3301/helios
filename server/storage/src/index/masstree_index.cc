@@ -224,12 +224,12 @@ struct MasstreeIndex::Impl {
     return nullptr;
   }
 
-  // Blank rows created after SetPaxTable are initialized in PAX mode so their
+  // Absent rows created after SetPaxTable are initialized in PAX mode so their
   // first committed payload scatters into the table's strips.
   pax::PaxTable *pax_table_ = nullptr;
-  DataItem *NewBlankItem() {
+  DataItem *NewAbsentItem() {
     auto *item = new DataItem();
-    if (pax_table_ != nullptr) item->buffer.InitPaxBlank(pax_table_);
+    if (pax_table_ != nullptr) item->buffer.InitPaxAbsent(pax_table_);
     return item;
   }
 
@@ -283,13 +283,13 @@ struct MasstreeIndex::Impl {
     return true;
   }
 
-  // Idempotent blank insert: never removes, just ensures a slot exists.
-  void PutBlank(std::string_view key) {
+  // Idempotent absent insert: never removes, just ensures a slot exists.
+  void PutAbsent(std::string_view key) {
     ensure_thread_active();
     cursor_type lp(table_, key.data(), key.size());
     bool found = lp.find_insert(*tls_ti);
     if (!found) {
-      lp.value() = NewBlankItem();
+      lp.value() = NewAbsentItem();
     }
     fence();
     lp.finish(found ? 0 : 1, *tls_ti);
@@ -372,7 +372,7 @@ void MasstreeIndex::Put(std::string_view key, DataItem &&value) {
   impl_->Put(key, std::move(value));
 }
 
-void MasstreeIndex::PutBlank(std::string_view key) { impl_->PutBlank(key); }
+void MasstreeIndex::PutAbsent(std::string_view key) { impl_->PutAbsent(key); }
 
 size_t MasstreeIndex::Scan(std::string_view begin,
                            std::optional<std::string_view> end,

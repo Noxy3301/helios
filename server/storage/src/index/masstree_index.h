@@ -32,11 +32,11 @@ class MasstreeIndex final {
   ~MasstreeIndex();
 
   /**
-   * @brief Routes future blank primary rows through a table's PaxTable.
+   * @brief Routes future absent primary rows through a table's PaxTable.
    *
    * @details Secondary indexes never set a PaxTable: they store index
    * metadata rather than table row payloads. The table is not owned, and a
-   * null table leaves later blank rows on the heap.
+   * null table leaves later absent rows on the heap.
    */
   void SetPaxTable(pax::PaxTable *store);
 
@@ -44,11 +44,11 @@ class MasstreeIndex final {
   void Put(std::string_view key, DataItem &&value);
 
   /**
-   * @brief Seeds a blank entry for a key that later writes fill in.
+   * @brief Seeds an absent entry for a key that later writes fill in.
    *
    * @details Idempotent on a key that already exists.
    */
-  void PutBlank(std::string_view key);
+  void PutAbsent(std::string_view key);
 
   /**
    * @brief Walks the keys in [begin, end), or to the last key when end is

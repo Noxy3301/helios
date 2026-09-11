@@ -173,7 +173,7 @@ bool Resolve(CommitCtx &ctx, std::shared_mutex &schema_mutex) {
 
   // Resolve row writes and deletes to the primary-index entries to lock.
   // R2: a key with no DataItem yet cannot be locked, so GetOrInsert
-  // materializes a blank slot (uninitialized, TID 0); this mutates the tree
+  // materializes an absent slot (uninitialized, TID 0); this mutates the tree
   // but takes no row lock (Silo's native insert stages an "absent" record the
   // same way).
   ctx.writes.reserve(ctx.payload.writes.size());
@@ -184,7 +184,7 @@ bool Resolve(CommitCtx &ctx, std::shared_mutex &schema_mutex) {
     }
 
     DataItem *item = table->GetPrimaryIndex().GetOrInsert(write.key);
-    assert(item != nullptr);  // GetOrInsert materializes a blank slot
+    assert(item != nullptr);  // GetOrInsert materializes an absent slot
 
     // An insert onto a key an earlier entry of this request already made
     // live is a duplicate the committed state cannot excuse.
@@ -234,7 +234,7 @@ bool Resolve(CommitCtx &ctx, std::shared_mutex &schema_mutex) {
     }
 
     // Locking needs a slot, so an entry whose secondary key has none seeds a
-    // blank one here.
+    // absent one here.
     DataItem *item = index->GetOrInsert(op.secondary_key);
 
     ctx.si_ops.push_back({op.table_name, op.index_name, op.secondary_key,

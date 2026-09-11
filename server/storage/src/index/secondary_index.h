@@ -27,7 +27,7 @@ class SecondaryIndex {
   DataItem *GetOrInsert(std::string_view key) {
     auto *item = index_.Get(key);
     if (item == nullptr) {
-      index_.PutBlank(key);
+      index_.PutAbsent(key);
       item = index_.Get(key);
       assert(item != nullptr);
     }

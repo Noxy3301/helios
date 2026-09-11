@@ -46,10 +46,10 @@ namespace helios::storage {
  * (bit0 = PAX, bit1 = slot allocated): before the first install it points
  * to the table's PaxTable, afterwards to the owning PaxGroup with
  * `capacity_or_slot` = slot index. `size` keeps its meaning (payload byte size,
- * 0 = tombstone/blank), so every liveness check (`size != 0`) works
+ * 0 = tombstone/absent), so every liveness check (`size != 0`) works
  * unchanged in both modes.
  *
- * Mode transitions are one-way per row: index layers create blank items in
+ * Mode transitions are one-way per row: index layers create absent items in
  * PAX mode for PAX tables. A row overflows to heap mode for good when the
  * table has no free slot, or when its bytes do not fit the declared cell
  * widths.
@@ -91,12 +91,12 @@ struct DataBuffer {
   uint32_t pax_slot() const { return static_cast<uint32_t>(capacity_or_slot); }
 
   /**
-   * @brief Initializes a fresh blank item as a PAX-resident row reference.
+   * @brief Initializes a fresh absent item as a PAX-resident row reference.
    *
    * @param store PaxTable that will allocate the concrete row slot on the
    * first non-empty install.
    */
-  void InitPaxBlank(pax::PaxTable *store) {
+  void InitPaxAbsent(pax::PaxTable *store) {
     assert((reinterpret_cast<uintptr_t>(store) & kPaxMask) == 0);
     value = reinterpret_cast<std::byte *>(reinterpret_cast<uintptr_t>(store) |
                                           kPaxTag);

@@ -88,7 +88,7 @@ void SeedRows(helios::storage::Database &db) {
 
 // Materializes a key without ever initializing it. Resolving a write inserts
 // the slot before validation runs, and an aborted commit leaves it behind.
-void LeaveBlankSlot(helios::storage::Database &db, const std::string &key) {
+void LeaveAbsentSlot(helios::storage::Database &db, const std::string &key) {
   std::string reason;
   const bool committed =
       db.Commit({{kTable, "k1", 0, true}}, {{kTable, key, "v"}}, {}, {},
@@ -188,14 +188,14 @@ TEST(RangeValidationTest, ALimitedRangeIgnoresChangesPastItsCap) {
   EXPECT_TRUE(Revalidate(db, range, &reason)) << reason;
 }
 
-TEST(RangeValidationTest, ABlankSlotDoesNotConsumeTheCap) {
-  // The cap counts live rows. A blank slot between the first two of them must
+TEST(RangeValidationTest, AnAbsentSlotDoesNotConsumeTheCap) {
+  // The cap counts live rows. An absent slot between the first two of them must
   // leave the replay room to reach the second.
   auto config = MakeConfig();
   helios::storage::Database db(config);
   ASSERT_TRUE(db.CreateTable(kTable));
   SeedRows(db);
-  LeaveBlankSlot(db, "k15");
+  LeaveAbsentSlot(db, "k15");
 
   const auto range = ScanRange(db, "k1", "k5", 2);
   ASSERT_EQ(range.result_keys, (std::vector<std::string>{"k1", "k2"}));

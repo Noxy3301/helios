@@ -61,7 +61,7 @@ struct CommitPayload {
  * semantics:
  *
  *   Resolve   R1  [added] map every key to its DataItem
- *             R2  [added] materialize blank slots for fresh write keys
+ *             R2  [added] materialize absent slots for fresh write keys
  *             R3  [added] reject in-request UNIQUE duplicates
  *   Phase 1   1.1 [paper] lock the write set in address order
  *             1.2 [paper] re-read the global epoch (serialization point)

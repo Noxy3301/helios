@@ -101,7 +101,7 @@ bool Database::Impl::InstallPaxSchema(
     const std::vector<int8_t> &field_scale) {
   if (field_max_bytes.empty()) return false;
   // A definition change, like CreateSecondaryIndex: every request holds this
-  // lock shared, and the blank rows it creates read the store pointer.
+  // lock shared, and the absent rows it creates read the store pointer.
   std::unique_lock<std::shared_mutex> lk(schema_mutex_);
   Table *table = GetTable(table_name);
   if (table == nullptr) return false;

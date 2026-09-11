@@ -190,7 +190,7 @@ const char *EpochScanCheckpoint::WorkingFileName() {
  * of the value.
  *
  * @param retries Incremented once per rejected attempt.
- * @return kTaken, kSkipped for a blank slot or a tombstone, or kUnstable.
+ * @return kTaken, kSkipped for an absent slot or a tombstone, or kUnstable.
  */
 EpochScanCheckpoint::CaptureResult EpochScanCheckpoint::CapturePrimaryRow(
     const std::string &table_name, std::string_view key, const DataItem &item,
@@ -204,7 +204,7 @@ EpochScanCheckpoint::CaptureResult EpochScanCheckpoint::CapturePrimaryRow(
     }
     HELIOS_DEBUG_SYNC("checkpoint.before_row_copy");
     if (!item.HasRow()) {
-      // A blank slot or a tombstone, once the version confirms the emptiness
+      // An absent slot or a tombstone, once the version confirms the emptiness
       // is not the middle of an install.
       if (item.transaction_id.load() == observed) {
         return EpochScanCheckpoint::CaptureResult::kSkipped;
