@@ -88,7 +88,7 @@ class ThreadLocalLogger final {
   /**
    * @brief The epoch of the last frame actually written to the log.
    */
-  EpochNumber GetWalFrontier() const;
+  EpochNumber GetWalLastEpoch() const;
 
   /**
    * @brief Starts the flusher. Called once, after the log has been scanned.

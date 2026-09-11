@@ -157,15 +157,15 @@ bool Database::WriteCheckpoint(uint64_t *out_version_retries) {
   return db_pimpl_->WriteCheckpoint(out_version_retries);
 }
 
-EpochNumber Database::Impl::ResumeEpochAbove(EpochNumber frontier) {
-  if (frontier >= epoch::Framework::kEpochHighWater - 1) {
+EpochNumber Database::Impl::ResumeEpochAbove(EpochNumber durable_epoch) {
+  if (durable_epoch >= epoch::Framework::kEpochHighWater - 1) {
     SPDLOG_CRITICAL(
         "Startup failed: resuming above the recovered epoch {0} would reach "
         "the epoch high-water mark {1}",
-        frontier, epoch::Framework::kEpochHighWater);
+        durable_epoch, epoch::Framework::kEpochHighWater);
     exit(EXIT_FAILURE);
   }
-  return frontier + 1;
+  return durable_epoch + 1;
 }
 
 Database::Impl::Impl(const Config &config)
@@ -196,10 +196,10 @@ Database::Impl::Impl(const Config &config)
           "start with an unknown durable state");
       exit(EXIT_FAILURE);
     }
-    if (scanned.frontier != 0) {
+    if (scanned.durable_epoch != 0) {
       // Records exist that this instance will not replay; resuming at or
-      // below their epoch would let a Sync commit inherit their frontier.
-      epoch_framework_.SetGlobalEpoch(ResumeEpochAbove(scanned.frontier));
+      // below their epoch would let a Sync commit inherit their durable epoch.
+      epoch_framework_.SetGlobalEpoch(ResumeEpochAbove(scanned.durable_epoch));
     }
   }
   // Armed after recovery, which reports its own failures by refusing to
@@ -355,10 +355,10 @@ void Database::Impl::Recover() {
     exit(EXIT_FAILURE);
   }
 
-  const EpochNumber durable_epoch = recovered.frontier;
-  // Refuse before stamping the frontier on this thread: the scanner accepts a
-  // frontier of UINT32_MAX, which is the registry's offline sentinel. The
-  // epochs the records carry are checked again at the end.
+  const EpochNumber durable_epoch = recovered.durable_epoch;
+  // Refuse before stamping the durable epoch on this thread: the scanner
+  // accepts a last epoch of UINT32_MAX, which is the registry's offline
+  // sentinel. The epochs the records carry are checked again at the end.
   ResumeEpochAbove(durable_epoch);
   EpochNumber highest_epoch = std::max<EpochNumber>(1, durable_epoch);
   SPDLOG_DEBUG("  Durable epoch is resumed from {0}", durable_epoch);

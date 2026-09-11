@@ -60,7 +60,7 @@ class EpochScanCheckpoint {
     // The epoch of the log's last frame once the durability wait returned.
     // Unlike the durable epoch it moves only when a frame is written, and it
     // is what recovery's acceptance gate compares the rescanned log against.
-    EpochNumber wal_frontier_at_publish{0};
+    EpochNumber wal_last_epoch_at_publish{0};
     uint64_t primary_rows{0};
     uint64_t secondary_entries{0};
     uint64_t checkpoint_bytes{0};
@@ -84,7 +84,7 @@ class EpochScanCheckpoint {
     Status status{Status::kAbsent};
     EpochNumber cut_epoch{0};
     EpochNumber end_epoch{0};
-    EpochNumber wal_frontier_at_publish{0};
+    EpochNumber wal_last_epoch_at_publish{0};
     LogRecords records;
     std::string detail;
   };
@@ -138,7 +138,7 @@ class EpochScanCheckpoint {
   static const char *WorkingFileName();
 
   static constexpr uint32_t kMagic = 0x504b434c;  // "LCKP"
-  // Load refuses any other version, so a missing wal_frontier_at_publish is
+  // Load refuses any other version, so a missing wal_last_epoch_at_publish is
   // never filled with a guessed bound.
   static constexpr uint16_t kVersion = 2;
   static constexpr uint16_t kFlags = 0;

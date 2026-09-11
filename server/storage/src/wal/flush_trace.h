@@ -37,7 +37,7 @@ namespace wal {
  * construction: no recording path allocates, locks, or writes to a file.
  *
  * The trace observes; it never decides. No recording call alters control flow,
- * and none is placed between the durability frontier's store and the
+ * and none is placed between the durable epoch's store and the
  * notification that releases waiters.
  *
  * @par Output contract
@@ -91,7 +91,7 @@ class FlushTrace {
   /**
    * @brief One sampled commit's wait for its epoch to become durable.
    *
-   * `not_durable_at_enter` reports what the durability frontier said when the
+   * `not_durable_at_enter` reports what the durable epoch said when the
    * commit
    * reached the wait, which is not the same as having slept: publication can
    * land between that reading and the wait's own check.

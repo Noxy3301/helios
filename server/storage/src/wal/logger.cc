@@ -16,9 +16,8 @@
 
 /**
  * @file server/storage/src/wal/logger.cc
- * The write-ahead log and the durability frontier a synchronous commit waits
- * on. Folds the checkpoint and the log tail into the write set recovery
- * replays.
+ * The write-ahead log and the durable epoch a synchronous commit waits on.
+ * Folds the checkpoint and the log tail into the write set recovery replays.
  */
 
 #include "wal/logger.h"
@@ -262,7 +261,8 @@ Logger::Logger(const Config &config, WalIo io)
     : work_dir_(config.work_dir), loads_checkpoint_(config.enable_recovery) {
   helios::storage::util::InitDebugLog();
   thread_local_logger_ = std::make_unique<ThreadLocalLogger>(
-      config, [this](EpochNumber frontier) { PublishDurable(frontier); },
+      config,
+      [this](EpochNumber durable_epoch) { PublishDurable(durable_epoch); },
       [this](int error_number) { PublishFailure(error_number); },
       [this]() { return GetDurableEpoch(); }, std::move(io));
 }
@@ -316,12 +316,12 @@ Logger::RecoveryResult Logger::Recover() {
     // The checkpoint is honoured only when this log's last written epoch is at
     // least the one recorded at publish; a shorter log cannot be the file
     // that checkpoint named (see the FIXME above).
-    if (scan.frontier < checkpoint.wal_frontier_at_publish) {
+    if (scan.last_epoch < checkpoint.wal_last_epoch_at_publish) {
       SPDLOG_WARN(
           "Ignoring the checkpoint: it was published when the log was "
           "durable through epoch {0}, past the last epoch {1} this log "
           "holds",
-          checkpoint.wal_frontier_at_publish, scan.frontier);
+          checkpoint.wal_last_epoch_at_publish, scan.last_epoch);
       checkpoint.records.clear();
       // The frames the first scan hopped have to be read now that the
       // checkpoint is gone.
@@ -335,8 +335,8 @@ Logger::RecoveryResult Logger::Recover() {
     }
   }
 
-  durable_epoch_.store(scan.frontier, std::memory_order_seq_cst);
-  result.frontier = scan.frontier;
+  durable_epoch_.store(scan.last_epoch, std::memory_order_seq_cst);
+  result.durable_epoch = scan.last_epoch;
   result.recovery_set = BuildRecoverySet(checkpoint.records, scan.records);
   return result;
 }
@@ -347,8 +347,8 @@ void Logger::ScheduleFlush(EpochNumber closed) {
   thread_local_logger_->ScheduleFlush(closed);
 }
 
-EpochNumber Logger::GetWalFrontier() const {
-  return thread_local_logger_->GetWalFrontier();
+EpochNumber Logger::GetWalLastEpoch() const {
+  return thread_local_logger_->GetWalLastEpoch();
 }
 
 bool Logger::IsQuiescent() { return thread_local_logger_->IsQuiescent(); }
@@ -358,20 +358,20 @@ void Logger::StopFlusher() {
   PublishStopped();
 }
 
-void Logger::PublishDurable(EpochNumber frontier) {
+void Logger::PublishDurable(EpochNumber durable_epoch) {
   {
     std::lock_guard<std::mutex> lock(durability_mutex_);
     const EpochNumber previous = durable_epoch_.load(std::memory_order_seq_cst);
-    if (frontier < previous) {
-      // The frontier is the promise the commit path hands to callers; moving it
-      // backwards would retract an acknowledgement.
+    if (durable_epoch < previous) {
+      // The durable epoch is the promise the commit path hands to callers;
+      // moving it backwards would retract an acknowledgement.
       SPDLOG_CRITICAL(
           "Durability Error: the durable epoch moved backwards, {0} to {1}",
-          previous, frontier);
+          previous, durable_epoch);
       std::abort();
     }
     if (state_ != State::kRunning) return;
-    durable_epoch_.store(frontier, std::memory_order_seq_cst);
+    durable_epoch_.store(durable_epoch, std::memory_order_seq_cst);
   }
   durability_cv_.notify_all();
 }
@@ -428,7 +428,7 @@ Logger::WaitResult Logger::WaitUntilDurable(EpochNumber commit_epoch,
     return WaitResult::kTimedOut;
   }
 
-  // A frontier that already covers this epoch outranks a terminal state: the
+  // A durable epoch that already covers this one outranks a terminal state: the
   // records are on the device regardless of what happened afterwards.
   if (durable_epoch_.load(std::memory_order_seq_cst) >= commit_epoch) {
     return WaitResult::kDurable;
@@ -441,9 +441,9 @@ void Logger::AwaitCommitDurability(EpochNumber commit_epoch,
   if (!awaits_durability) return;
 
   // The sample is drawn before the wait, so a commit whose epoch is already
-  // durable is represented alongside one that waits. The frontier reading is
-  // what the commit saw on arrival; publication can land before the wait makes
-  // its own check, which is why the recorded field says only that.
+  // durable is represented alongside one that waits. The durable epoch reading
+  // is what the commit saw on arrival; publication can land before the wait
+  // makes its own check, which is why the recorded field says only that.
   auto &trace = FlushTrace::Instance();
   const bool sampled = trace.SampleThisCommit();
   const int64_t wait_enter = sampled ? FlushTrace::Now() : 0;

@@ -35,7 +35,7 @@ using helios::storage::wal::WriteSet;
 constexpr auto kTestTimeout = std::chrono::seconds(5);
 
 // Exercises the logger without constructing a Database: the WAL and the
-// durability frontier are the units under test here, and a Database would
+// durable epoch are the units under test here, and a Database would
 // drag in the epoch framework.
 class LoggerDurabilityTest : public ::testing::Test {
  protected:
@@ -95,7 +95,7 @@ TEST_F(LoggerDurabilityTest, AlreadyDurableReturnsImmediately) {
   EXPECT_EQ(logger.WaitUntilDurable(5, Logger::Deadline::max()),
             Logger::WaitResult::kDurable);
   EXPECT_EQ(logger.GetDurableEpoch(), 5u);
-  // A second wait on a frontier already reached must not block at all.
+  // A second wait on an epoch already durable must not block at all.
   EXPECT_EQ(logger.WaitUntilDurable(5, std::chrono::steady_clock::now()),
             Logger::WaitResult::kDurable);
   logger.StopFlusher();
@@ -239,8 +239,8 @@ TEST_F(LoggerDurabilityTest, AsyncAndUnloggedCommitsDoNotWait) {
 }
 
 // With the fail-stop armed, a write failure ends the process by abort: under
-// Async nobody waits on the frontier, and a process that carried on would keep
-// acknowledging commits that exist only in memory. The rest of this file
+// Async nobody waits on the durable epoch, and a process that carried on would
+// keep acknowledging commits that exist only in memory. The rest of this file
 // constructs loggers without arming: there an I/O failure surfaces as
 // WaitResult::kFailed instead of ending the process.
 TEST_F(LoggerDurabilityTest, ArmedFailStopEndsTheProcessOnFdatasyncFailure) {
@@ -292,7 +292,7 @@ TEST_F(LoggerDurabilityTest, RecordsAboveTheTargetAreCarriedForward) {
                                 config_.wal_initial_capacity_bytes);
   const auto scan = wal.Scan();
   ASSERT_EQ(scan.status, helios::storage::wal::WalScanResult::Status::kOk);
-  EXPECT_EQ(scan.frontier, 9u);
+  EXPECT_EQ(scan.last_epoch, 9u);
   ASSERT_EQ(scan.records.size(), 2u);
   EXPECT_EQ(scan.records[0].epoch, 4u);
   EXPECT_EQ(scan.records[1].epoch, 9u);
@@ -323,7 +323,8 @@ TEST_F(LoggerDurabilityTest, StopWakesEveryWaiter) {
   EXPECT_EQ(second.get(), Logger::WaitResult::kStopped);
 }
 
-TEST_F(LoggerDurabilityTest, FdatasyncFailureHoldsTheFrontierAndFailsWaiters) {
+TEST_F(LoggerDurabilityTest,
+       FdatasyncFailureHoldsTheDurableEpochAndFailsWaiters) {
   WalIo io = WalIo::Posix();
   io.fdatasync = [](int) {
     errno = EIO;
@@ -344,7 +345,7 @@ TEST_F(LoggerDurabilityTest, FdatasyncFailureHoldsTheFrontierAndFailsWaiters) {
   logger.ScheduleFlush(3);
   ASSERT_EQ(waiting.wait_for(kTestTimeout), std::future_status::ready);
   EXPECT_EQ(waiting.get(), Logger::WaitResult::kFailed);
-  // The frontier must not move: durability was never confirmed, whatever
+  // The durable epoch must not move: durability was never confirmed, whatever
   // bytes may have landed.
   EXPECT_EQ(logger.GetDurableEpoch(), 0u);
 
@@ -402,10 +403,10 @@ TEST_F(LoggerDurabilityTest, StopDrainsWhatWasAlreadyClosed) {
                                 config_.wal_initial_capacity_bytes);
   const auto scan = wal.Scan();
   ASSERT_EQ(scan.status, helios::storage::wal::WalScanResult::Status::kOk);
-  EXPECT_EQ(scan.frontier, 6u);
+  EXPECT_EQ(scan.last_epoch, 6u);
 }
 
-TEST_F(LoggerDurabilityTest, RecoverReportsTheFrontierOfAnExistingLog) {
+TEST_F(LoggerDurabilityTest, RecoverReportsTheDurableEpochOfAnExistingLog) {
   {
     Logger logger(config_);
     ASSERT_EQ(logger.Recover().status, Logger::RecoveryStatus::kOk);
@@ -420,7 +421,7 @@ TEST_F(LoggerDurabilityTest, RecoverReportsTheFrontierOfAnExistingLog) {
   Logger reopened(config_);
   const auto recovered = reopened.Recover();
   ASSERT_EQ(recovered.status, Logger::RecoveryStatus::kOk);
-  EXPECT_EQ(recovered.frontier, 8u);
+  EXPECT_EQ(recovered.durable_epoch, 8u);
   EXPECT_EQ(reopened.GetDurableEpoch(), 8u);
   ASSERT_EQ(recovered.recovery_set.size(), 1u);
   EXPECT_EQ(recovered.recovery_set[0].key, "alice");

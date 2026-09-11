@@ -496,7 +496,7 @@ WalScanResult Wal::FinishScan(WalScanResult &&result, off_t end_of_log) {
   // Published together with Ready: a scan that could not finish leaves no
   // offset behind to be mistaken for the end of the log.
   write_offset_ = end_of_log;
-  frontier_ = result.frontier;
+  last_epoch_ = result.last_epoch;
   state_ = State::kReady;
   return std::move(result);
 }
@@ -515,13 +515,13 @@ WalScanResult Wal::FinishScan(WalScanResult &&result, off_t end_of_log) {
  * set); the caller then scans from offset 0.
  */
 bool Wal::HopCoveredFrames(EpochNumber min_epoch, off_t file_size,
-                           off_t *offset, EpochNumber *frontier,
+                           off_t *offset, EpochNumber *last_epoch,
                            bool *have_frame, size_t *frames_skipped,
                            uint64_t *bytes_skipped, off_t *boundary_offset,
                            uint32_t *boundary_payload_size,
                            uint8_t *boundary_header, int *error) const {
   off_t at = 0;
-  EpochNumber local_frontier = 0;
+  EpochNumber local_last_epoch = 0;
   bool local_have_frame = false;
   size_t local_frames_skipped = 0;
   uint64_t local_bytes_skipped = 0;
@@ -552,7 +552,7 @@ bool Wal::HopCoveredFrames(EpochNumber min_epoch, off_t file_size,
     const uint64_t frame_end =
         static_cast<uint64_t>(at) + kHeaderSize + payload_size;
     if (frame_end > static_cast<uint64_t>(file_size)) return false;
-    if (local_have_frame && epoch < local_frontier) return false;
+    if (local_have_frame && epoch < local_last_epoch) return false;
     if (epoch == 0) return false;
     if (epoch > min_epoch) break;
 
@@ -560,7 +560,7 @@ bool Wal::HopCoveredFrames(EpochNumber min_epoch, off_t file_size,
     local_boundary_payload_size = payload_size;
     std::memcpy(local_boundary_header, header, kHeaderSize);
 
-    local_frontier = epoch;
+    local_last_epoch = epoch;
     local_have_frame = true;
     ++local_frames_skipped;
     local_bytes_skipped += kHeaderSize + payload_size;
@@ -568,7 +568,7 @@ bool Wal::HopCoveredFrames(EpochNumber min_epoch, off_t file_size,
   }
 
   *offset = at;
-  *frontier = local_frontier;
+  *last_epoch = local_last_epoch;
   *have_frame = local_have_frame;
   *frames_skipped = local_frames_skipped;
   *bytes_skipped = local_bytes_skipped;
@@ -595,7 +595,7 @@ WalScanResult Wal::Scan(EpochNumber min_epoch) {
   initialised_size_ = std::max(initialised_size_, file_size);
 
   LogRecords records;
-  EpochNumber frontier = 0;
+  EpochNumber last_epoch = 0;
   bool have_frame = false;
   size_t frames_skipped = 0;
   uint64_t bytes_skipped = 0;
@@ -604,7 +604,7 @@ WalScanResult Wal::Scan(EpochNumber min_epoch) {
   // Everything the hop below established, given up.
   auto restart_from_zero = [&]() {
     offset = 0;
-    frontier = 0;
+    last_epoch = 0;
     have_frame = false;
     frames_skipped = 0;
     bytes_skipped = 0;
@@ -617,10 +617,10 @@ WalScanResult Wal::Scan(EpochNumber min_epoch) {
     uint32_t boundary_payload_size = 0;
     uint8_t boundary_header[kHeaderSize];
     int error = 0;
-    const bool hopped =
-        HopCoveredFrames(min_epoch, file_size, &offset, &frontier, &have_frame,
-                         &frames_skipped, &bytes_skipped, &boundary_offset,
-                         &boundary_payload_size, boundary_header, &error);
+    const bool hopped = HopCoveredFrames(
+        min_epoch, file_size, &offset, &last_epoch, &have_frame,
+        &frames_skipped, &bytes_skipped, &boundary_offset,
+        &boundary_payload_size, boundary_header, &error);
     if (!hopped && error != 0) {
       return IoFailure("pread header of " + path_, error);
     }
@@ -721,7 +721,8 @@ WalScanResult Wal::Scan(EpochNumber min_epoch) {
 
     // A frame that satisfies its own checksum was written whole. Anything
     // wrong with it from here on cannot be blamed on an interrupted write.
-    if (have_frame && epoch < frontier) return Corrupt("frame epoch regressed");
+    if (have_frame && epoch < last_epoch)
+      return Corrupt("frame epoch regressed");
     if (epoch == 0) return Corrupt("frame epoch is zero");
 
     // The records of a frame the caller already holds are not rebuilt, but the
@@ -730,7 +731,7 @@ WalScanResult Wal::Scan(EpochNumber min_epoch) {
     if (epoch <= min_epoch) {
       ++frames_skipped;
       bytes_skipped += kHeaderSize + payload_size;
-      frontier = epoch;
+      last_epoch = epoch;
       have_frame = true;
       offset = static_cast<off_t>(frame_end);
       continue;
@@ -760,14 +761,14 @@ WalScanResult Wal::Scan(EpochNumber min_epoch) {
 
     records.insert(records.end(), std::make_move_iterator(unpacked.begin()),
                    std::make_move_iterator(unpacked.end()));
-    frontier = epoch;
+    last_epoch = epoch;
     have_frame = true;
     offset = static_cast<off_t>(frame_end);
   }
 
   WalScanResult result;
   result.status = WalScanResult::Status::kOk;
-  result.frontier = frontier;
+  result.last_epoch = last_epoch;
   result.frames_skipped = frames_skipped;
   result.bytes_skipped = bytes_skipped;
 
@@ -814,8 +815,8 @@ WalScanResult Wal::Scan(EpochNumber min_epoch) {
       }
       SPDLOG_WARN(
           "Discarded an incomplete tail of {0} at offset {1} ({2}); the "
-          "frontier is {3}",
-          path_, static_cast<long long>(offset), anomaly, frontier);
+          "last epoch is {3}",
+          path_, static_cast<long long>(offset), anomaly, last_epoch);
       result.tail_zeroed = true;
     }
   }
@@ -844,14 +845,14 @@ WalAppendResult Wal::AppendGroup(
   const int64_t pack_begin = traced ? FlushTrace::Now() : 0;
   uint32_t packed_epochs = 0;
   std::vector<uint8_t> group;
-  EpochNumber last_packed = frontier_;
+  EpochNumber last_packed = last_epoch_;
   for (const auto &[epoch, records] : buckets) {
     if (epoch > target) break;
     ++packed_epochs;
     // A bucket the scan would reject is refused before anything is
     // written, which leaves the log's end known and this instance usable.
     if (records.empty() || epoch == 0) return {false, EINVAL};
-    if (epoch < frontier_) return {false, EINVAL};
+    if (epoch < last_epoch_) return {false, EINVAL};
     for (const auto &record : records) {
       if (record.epoch != epoch) return {false, EINVAL};
     }
@@ -899,7 +900,7 @@ WalAppendResult Wal::AppendGroup(
                 static_cast<long long>(initialised_size_), extension_count_);
   }
 
-  // Write, fdatasync, then publish the offset and the frontier.
+  // Write, fdatasync, then publish the offset and the last epoch.
   const int64_t write_begin = traced ? FlushTrace::Now() : 0;
   if (!WriteAllAt(group.data(), group.size(), write_offset_, &error)) {
     state_ = State::kFailed;
@@ -926,7 +927,7 @@ WalAppendResult Wal::AppendGroup(
   write_offset_ += static_cast<off_t>(group.size());
   // Without preallocation the group carried the file's size with it.
   initialised_size_ = std::max(initialised_size_, write_offset_);
-  frontier_ = last_packed;
+  last_epoch_ = last_packed;
   return {true, 0};
 }
 

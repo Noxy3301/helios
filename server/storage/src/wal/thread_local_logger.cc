@@ -98,8 +98,8 @@ WalScanResult ThreadLocalLogger::Scan(EpochNumber min_epoch) {
   return wal_.Scan(min_epoch);
 }
 
-EpochNumber ThreadLocalLogger::GetWalFrontier() const {
-  return wal_.frontier();
+EpochNumber ThreadLocalLogger::GetWalLastEpoch() const {
+  return wal_.last_epoch();
 }
 
 void ThreadLocalLogger::StartFlusher() {

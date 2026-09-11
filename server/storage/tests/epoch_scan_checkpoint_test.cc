@@ -222,7 +222,7 @@ class EpochScanCheckpointTest : public ::testing::Test {
 
   std::string root_;
   std::string work_dir_;
-  helios::storage::EpochNumber frontier_ = 0;
+  helios::storage::EpochNumber last_epoch_ = 0;
 
  private:
   std::vector<std::string> armed_;
@@ -353,7 +353,7 @@ TEST_F(EpochScanCheckpointTest,
     auto full = wal.Scan(0);
     ASSERT_EQ(full.status, WalScanResult::Status::kOk);
     EXPECT_EQ(full.frames_skipped, 0u);
-    frontier_ = full.frontier;
+    last_epoch_ = full.last_epoch;
   }
   {
     Wal wal(work_dir_, helios::storage::wal::WalIo::Posix(), 1ull << 20);
@@ -362,7 +362,7 @@ TEST_F(EpochScanCheckpointTest,
     EXPECT_GT(filtered.frames_skipped, 0u);
     EXPECT_GT(filtered.bytes_skipped, 0u);
     // The end of the log and how far it is durable come from every frame.
-    EXPECT_EQ(filtered.frontier, frontier_);
+    EXPECT_EQ(filtered.last_epoch, last_epoch_);
     for (const auto &record : filtered.records) {
       EXPECT_GT(record.epoch, checkpoint.cut_epoch);
     }
@@ -419,13 +419,13 @@ TEST_F(EpochScanCheckpointTest, AQuietTailAfterTheCheckpointIsAccepted) {
     Wal wal(work_dir_, helios::storage::wal::WalIo::Posix(), 1ull << 20);
     auto scan = wal.Scan(0);
     ASSERT_EQ(scan.status, WalScanResult::Status::kOk);
-    // The quiet tail this test is named for: the log's frontier never
+    // The quiet tail this test is named for: the log's last epoch never
     // reaches the epoch the scan ended at, which is what made the v1 gate
     // refuse a legitimate checkpoint.
-    ASSERT_LT(scan.frontier, checkpoint.end_epoch);
+    ASSERT_LT(scan.last_epoch, checkpoint.end_epoch);
     // The v2 gate asks a question this log still answers: it reaches at
     // least as far as the log was durable when the checkpoint was published.
-    ASSERT_GE(scan.frontier, checkpoint.wal_frontier_at_publish);
+    ASSERT_GE(scan.last_epoch, checkpoint.wal_last_epoch_at_publish);
   }
 
   auto config = MakeConfig(true);
@@ -435,7 +435,7 @@ TEST_F(EpochScanCheckpointTest, AQuietTailAfterTheCheckpointIsAccepted) {
   EXPECT_EQ(Read(db, "bob").value, "one");
 }
 
-TEST_F(EpochScanCheckpointTest, ALogShorterThanThePublishFrontierIsRejected) {
+TEST_F(EpochScanCheckpointTest, ALogEndingBelowThePublishEpochIsRejected) {
   const std::string short_log_copy = root_ + "/short_wal.log";
   {
     auto config = MakeConfig(false);
@@ -462,7 +462,7 @@ TEST_F(EpochScanCheckpointTest, ALogShorterThanThePublishFrontierIsRejected) {
     Wal wal(work_dir_, helios::storage::wal::WalIo::Posix(), 1ull << 20);
     const auto scan = wal.Scan(0);
     ASSERT_EQ(scan.status, WalScanResult::Status::kOk);
-    ASSERT_LT(scan.frontier, checkpoint.wal_frontier_at_publish);
+    ASSERT_LT(scan.last_epoch, checkpoint.wal_last_epoch_at_publish);
   }
 
   // The refusal is only real if recovery acts on it: rows the checkpoint alone
@@ -486,7 +486,7 @@ TEST_F(EpochScanCheckpointTest, V1FormatCheckpointIsRefused) {
   }
 
   // Downgrade the version field to what a v1 writer would have left. There is
-  // no migration for it: v1 has no wal_frontier_at_publish field to read.
+  // no migration for it: v1 has no wal_last_epoch_at_publish field to read.
   {
     std::fstream file(checkpoint_path(),
                       std::ios::in | std::ios::out | std::ios::binary);

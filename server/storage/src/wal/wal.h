@@ -26,8 +26,8 @@ namespace wal {
  *
  * @details
  * `Ok` means every frame up to the end of the log was complete and
- * consistent, and `frontier` is the epoch of the last one; a log with no
- * frames yields frontier 0. An incomplete or checksum-broken frame at the
+ * consistent, and `last_epoch` is the epoch of the last one; a log with no
+ * frames yields last_epoch 0. An incomplete or checksum-broken frame at the
  * end of the log is repaired rather than reported: the bytes it left behind
  * are overwritten with zeroes, `tail_zeroed` is set, and the scan still
  * succeeds. Repair requires that no intact frame survives beyond the
@@ -60,7 +60,7 @@ struct WalScanResult {
   // kIoError means a syscall the scan needs failed; error_number and detail
   // describe it, and nothing is zeroed.
   Status status{Status::kOk};
-  EpochNumber frontier{0};
+  EpochNumber last_epoch{0};
   LogRecords records;
   bool tail_zeroed{false};
   int error_number{0};
@@ -153,14 +153,14 @@ class Wal {
    * @brief Reads the log from the beginning, repairs an interrupted tail,
    * and initialises the capacity beyond it.
    * @param[in] min_epoch Frames at or below this are counted but not read.
-   * @return See WalScanResult; `Ok` carries the frontier and the records.
+   * @return See WalScanResult; `Ok` carries the last epoch and the records.
    * @note Must succeed before the first append: it is what locates the end
    * of the log, and until the bytes of an interrupted write are overwritten
    * with zeroes a later shorter group would leave them behind as a frame
    * the next scan cannot place. A scan run after this instance has already
    * failed does not retry; it reports the failure again.
    *
-   * A hopped frame still contributes the frontier and the log end. Such a
+   * A hopped frame still contributes the last epoch and the log end. Such a
    * frame is hopped by header alone, except the boundary frame, which is
    * read and checksummed in full. A header that fails to parse falls back to
    * a full scan from offset 0.
@@ -175,7 +175,7 @@ class Wal {
    * @param[in] target The highest epoch this call may write.
    * @return Failure is returned without having advanced anything the caller
    * may publish. A bucket that would produce a frame the scan rejects
-   * (empty, epoch zero, an epoch below the log's frontier, a record epoch
+   * (empty, epoch zero, an epoch below the log's last epoch, a record epoch
    * disagreeing with its bucket) fails with EINVAL before anything is
    * written, as does a payload too large to be framed with EOVERFLOW; both
    * leave the instance usable.
@@ -203,8 +203,8 @@ class Wal {
    * question is what the log itself can be trusted to still hold after a
    * crash.
    */
-  EpochNumber frontier() const {
-    return frontier_.load(std::memory_order_seq_cst);
+  EpochNumber last_epoch() const {
+    return last_epoch_.load(std::memory_order_seq_cst);
   }
 
   /**
@@ -238,7 +238,7 @@ class Wal {
   WalScanResult IoFailure(const std::string &operation, int error);
   WalScanResult FinishScan(WalScanResult &&result, off_t end_of_log);
   bool HopCoveredFrames(EpochNumber min_epoch, off_t file_size, off_t *offset,
-                        EpochNumber *frontier, bool *have_frame,
+                        EpochNumber *last_epoch, bool *have_frame,
                         size_t *frames_skipped, uint64_t *bytes_skipped,
                         off_t *boundary_offset, uint32_t *boundary_payload_size,
                         uint8_t *boundary_header, int *error) const;
@@ -265,8 +265,8 @@ class Wal {
   uint64_t initial_capacity_bytes_;
   State state_{State::kUnscanned};
   off_t write_offset_{0};
-  std::atomic<EpochNumber> frontier_{
-      0};  // read cross-thread through frontier()
+  std::atomic<EpochNumber> last_epoch_{
+      0};  // read cross-thread through last_epoch()
   // The file's size, which under preallocation is also the offset below
   // which every block is allocated and holds written-out zeroes.
   off_t initialised_size_{0};

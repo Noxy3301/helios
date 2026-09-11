@@ -57,18 +57,18 @@ class Database::Impl {
 
   /**
    * @brief The first epoch it is safe to resume at, given a recovered
-   * durability frontier.
-   * @details Strictly above the frontier: a transaction joining the
-   * frontier's own epoch could return a Sync acknowledgement before its
-   * record was written. Terminates the process when even the resumed epoch
-   * would reach the high-water mark; past it the epoch no longer orders
-   * against the frontier, and resuming exactly at the mark would only abort
-   * on the writer's first tick instead of failing diagnosably here.
-   * @note Compared before the addition: the scanner accepts a frontier of
-   * UINT32_MAX by design, and `frontier + 1` would wrap to zero, the value
-   * MinEpoch skips.
+   * durable epoch.
+   * @details Strictly above the durable epoch: a transaction joining that
+   * epoch could return a Sync acknowledgement before its record was written.
+   * Terminates the process when even the resumed epoch would reach the
+   * high-water mark; past it the epoch no longer orders against the durable
+   * epoch, and resuming exactly at the mark would only abort on the writer's
+   * first tick instead of failing diagnosably here.
+   * @note Compared before the addition: the scanner accepts a last epoch of
+   * UINT32_MAX by design, and `durable_epoch + 1` would wrap to zero, the
+   * value MinEpoch skips.
    */
-  static EpochNumber ResumeEpochAbove(EpochNumber frontier);
+  static EpochNumber ResumeEpochAbove(EpochNumber durable_epoch);
 
  public:
   Impl(const Config &config = Config());
@@ -170,7 +170,7 @@ class Database::Impl {
 
   /**
    * @brief Replays the log into the indexes and resumes the global epoch
-   *        above the recovered frontier.
+   *        above the recovered durable epoch.
    *
    * @details Terminates the process when a table cannot be created or a
    * secondary index was declared with another constraint.
