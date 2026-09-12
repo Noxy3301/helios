@@ -507,19 +507,19 @@ WalScanResult Wal::FinishScan(WalScanResult &&result, off_t end_of_log) {
  *
  * @details On success `offset` is the first frame above `min_epoch`, or the
  * end of the log, which lies before `file_size` when capacity is reserved.
- * The last hopped frame is left in the boundary out-params for the caller to
+ * The last skipped frame is left in the boundary out-params for the caller to
  * checksum. A header only locates the next frame; it is not proof the frame
  * is undamaged. Every out-param is written only on success.
  *
  * @return False on a header that does not parse or on I/O failure (`*error`
  * set); the caller then scans from offset 0.
  */
-bool Wal::HopCoveredFrames(EpochNumber min_epoch, off_t file_size,
-                           off_t *offset, EpochNumber *last_epoch,
-                           bool *have_frame, size_t *frames_skipped,
-                           uint64_t *bytes_skipped, off_t *boundary_offset,
-                           uint32_t *boundary_payload_size,
-                           uint8_t *boundary_header, int *error) const {
+bool Wal::SkipCoveredFrames(EpochNumber min_epoch, off_t file_size,
+                            off_t *offset, EpochNumber *last_epoch,
+                            bool *have_frame, size_t *frames_skipped,
+                            uint64_t *bytes_skipped, off_t *boundary_offset,
+                            uint32_t *boundary_payload_size,
+                            uint8_t *boundary_header, int *error) const {
   off_t at = 0;
   EpochNumber local_last_epoch = 0;
   bool local_have_frame = false;
@@ -531,7 +531,7 @@ bool Wal::HopCoveredFrames(EpochNumber min_epoch, off_t file_size,
 
   // Every out-param is written here in one place, on the single successful
   // return below, so a `false` return never leaves a caller trusting a
-  // partial hop.
+  // partial skip.
   while (at < file_size) {
     if (file_size - at < static_cast<off_t>(kHeaderSize)) return false;
     uint8_t header[kHeaderSize];
@@ -544,7 +544,7 @@ bool Wal::HopCoveredFrames(EpochNumber min_epoch, off_t file_size,
     if (magic != kMagic || version != kVersion || flags != kFlags ||
         payload_size > kMaxPayloadSize) {
       // Unwritten capacity's zeroes read exactly like a torn header; that is
-      // not a lie to fall back over, just the hop reaching the true end of
+      // not a lie to fall back over, just the skip reaching the true end of
       // the log, which the caller's own torn-tail handling already covers.
       if (IsTorn(header)) break;
       return false;
@@ -601,7 +601,7 @@ WalScanResult Wal::Scan(EpochNumber min_epoch) {
   uint64_t bytes_skipped = 0;
   off_t offset = 0;
 
-  // Everything the hop below established, given up.
+  // Everything the skip below established, given up.
   auto restart_from_zero = [&]() {
     offset = 0;
     last_epoch = 0;
@@ -610,21 +610,21 @@ WalScanResult Wal::Scan(EpochNumber min_epoch) {
     bytes_skipped = 0;
   };
 
-  // Hop the frames the caller already holds, rewinding to 0 if the hop or
+  // Skip the frames the caller already holds, rewinding to 0 if the skip or
   // the boundary checksum fails. An I/O error fails the scan instead.
   if (min_epoch != 0) {
     off_t boundary_offset = 0;
     uint32_t boundary_payload_size = 0;
     uint8_t boundary_header[kHeaderSize];
     int error = 0;
-    const bool hopped = HopCoveredFrames(
+    const bool skipped = SkipCoveredFrames(
         min_epoch, file_size, &offset, &last_epoch, &have_frame,
         &frames_skipped, &bytes_skipped, &boundary_offset,
         &boundary_payload_size, boundary_header, &error);
-    if (!hopped && error != 0) {
+    if (!skipped && error != 0) {
       return IoFailure("pread header of " + path_, error);
     }
-    if (hopped && have_frame) {
+    if (skipped && have_frame) {
       std::vector<uint8_t> payload(boundary_payload_size);
       if (!PreadAll(payload.data(), boundary_payload_size,
                     boundary_offset + static_cast<off_t>(kHeaderSize),
@@ -639,15 +639,15 @@ WalScanResult Wal::Scan(EpochNumber min_epoch) {
         // landed, so a checksum failure here is treated like an unparsable
         // header: rediscovered and diagnosed by the full scan below.
         SPDLOG_WARN(
-            "The header hop through {0} left a frame at offset {1} whose "
+            "The header skip through {0} left a frame at offset {1} whose "
             "checksum does not hold; falling back to a full scan from "
             "offset 0",
             path_, static_cast<long long>(boundary_offset));
         restart_from_zero();
       }
-    } else if (!hopped) {
+    } else if (!skipped) {
       SPDLOG_WARN(
-          "The header hop through {0} landed on bytes that do not parse as a "
+          "The header skip through {0} landed on bytes that do not parse as a "
           "frame; falling back to a full scan from offset 0",
           path_);
       restart_from_zero();

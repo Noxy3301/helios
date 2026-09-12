@@ -303,7 +303,7 @@ Logger::RecoveryResult Logger::Recover() {
       // supplied.
       SPDLOG_WARN("Ignoring the checkpoint: {0}", checkpoint.detail);
       checkpoint.records.clear();
-      // The start epoch is cleared with it so the scan hops nothing.
+      // The start epoch is cleared with it so the scan skips nothing.
       checkpoint.start_epoch = 0;
     }
   }
@@ -323,7 +323,7 @@ Logger::RecoveryResult Logger::Recover() {
           "holds",
           checkpoint.wal_last_epoch_at_publish, scan.last_epoch);
       checkpoint.records.clear();
-      // The frames the first scan hopped have to be read now that the
+      // The frames the first scan skipped have to be read now that the
       // checkpoint is gone.
       scan = thread_local_logger_->Scan(0);
       if (scan.status != WalScanResult::Status::kOk) return FailRecovery(scan);

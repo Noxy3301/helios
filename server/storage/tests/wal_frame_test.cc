@@ -1257,10 +1257,10 @@ TEST_F(WalFrameTest, EmptyGroupNeitherWritesNorSyncs) {
   EXPECT_EQ(wal.write_offset(), 0);
 }
 
-// The hop's whole point: a covered frame costs one header read and nothing
+// The skip's whole point: a covered frame costs one header read and nothing
 // else, except the one frame right before the tail, which is read in full as
 // a guard on the boundary the caller is trusting.
-TEST_F(WalFrameTest, HopReadsOnlyTheGuardAndTailPayloads) {
+TEST_F(WalFrameTest, SkipReadsOnlyTheGuardAndTailPayloads) {
   AppendEpochs({1, 2, 3, 4, 5});
 
   helios::storage::wal::WalIo io = helios::storage::wal::WalIo::Posix();
@@ -1280,39 +1280,39 @@ TEST_F(WalFrameTest, HopReadsOnlyTheGuardAndTailPayloads) {
     return real_pread(fd, data, size, offset);
   };
 
-  WalScanResult hopped;
+  WalScanResult skipped;
   {
     Wal wal(work_dir_, io, kCapacity);
-    hopped = wal.Scan(3);
+    skipped = wal.Scan(3);
   }
-  ASSERT_EQ(hopped.status, WalScanResult::Status::kOk) << hopped.detail;
-  EXPECT_EQ(hopped.frames_skipped, 3u);
-  EXPECT_FALSE(hopped.tail_zeroed);
-  ASSERT_EQ(hopped.records.size(), 2u);
-  EXPECT_EQ(hopped.records[0].epoch, 4u);
-  EXPECT_EQ(hopped.records[1].epoch, 5u);
+  ASSERT_EQ(skipped.status, WalScanResult::Status::kOk) << skipped.detail;
+  EXPECT_EQ(skipped.frames_skipped, 3u);
+  EXPECT_FALSE(skipped.tail_zeroed);
+  ASSERT_EQ(skipped.records.size(), 2u);
+  EXPECT_EQ(skipped.records[0].epoch, 4u);
+  EXPECT_EQ(skipped.records[1].epoch, 5u);
 
-  // Header reads: 3 hopped frames, +1 to see the frame after them is past
+  // Header reads: 3 skipped frames, +1 to see the frame after them is past
   // min_epoch, +3 more as the resuming scan re-reads that frame, the tail,
   // and the all-zero header ending the log. 4 + 3 = 7.
   EXPECT_EQ(*header_reads, 7);
-  // One payload read per frame that is not a pure hop: the guard at epoch 3
+  // One payload read per frame that is not a pure skip: the guard at epoch 3
   // plus the two tail frames.
   EXPECT_EQ(*payload_reads, 3);
 
   Wal full_wal(work_dir_, helios::storage::wal::WalIo::Posix(), kCapacity);
   const auto full = full_wal.Scan(0);
   ASSERT_EQ(full.status, WalScanResult::Status::kOk);
-  EXPECT_EQ(hopped.last_epoch, full.last_epoch);
-  // bytes_skipped covers exactly the three hopped frames: the offset one past
+  EXPECT_EQ(skipped.last_epoch, full.last_epoch);
+  // bytes_skipped covers exactly the three skipped frames: the offset one past
   // the third is where the first replayed frame, epoch 4, begins.
   const off_t third_frame_end = FrameEnd(FrameEnd(FrameEnd(0)));
-  EXPECT_EQ(hopped.bytes_skipped, static_cast<uint64_t>(third_frame_end));
+  EXPECT_EQ(skipped.bytes_skipped, static_cast<uint64_t>(third_frame_end));
 }
 
 // The whole log at or below min_epoch: the guard is the true last frame, and
-// end-of-log handling has to run exactly as it would without a hop.
-TEST_F(WalFrameTest, HopOfTheWholeLogStillFinishesTheScan) {
+// end-of-log handling has to run exactly as it would without a skip.
+TEST_F(WalFrameTest, SkippingTheWholeLogStillFinishesTheScan) {
   AppendEpochs({1, 2, 3});
   const off_t log_end = EndOfLog();
 
@@ -1340,20 +1340,20 @@ TEST_F(WalFrameTest, HopOfTheWholeLogStillFinishesTheScan) {
   EXPECT_EQ(*payload_reads, 1);
 }
 
-// A corrupted length inside the covered region lands the hop's next header
+// A corrupted length inside the covered region lands the skip's next header
 // read on bytes that don't parse; it can't tell that apart from a lie only
 // in the last covered frame, so it falls back to a full scan from offset 0.
 TEST_F(WalFrameTest,
        ACorruptedLengthInTheCoveredRegionFallsBackAndStaysCorrect) {
   AppendEpochs({1, 2, 3, 4, 5});
-  // Frame 1's declared length, shrunk so the hop's blind trust in it lands
+  // Frame 1's declared length, shrunk so the skip's blind trust in it lands
   // mid-frame-1's own real payload rather than on frame 2's header.
   SetPayloadLengthAt(0, 4);
 
-  WalScanResult hop_result;
+  WalScanResult skip_result;
   {
     Wal wal(work_dir_, helios::storage::wal::WalIo::Posix(), kCapacity);
-    hop_result = wal.Scan(4);
+    skip_result = wal.Scan(4);
   }
   WalScanResult full_result;
   {
@@ -1362,9 +1362,9 @@ TEST_F(WalFrameTest,
   }
 
   EXPECT_EQ(full_result.status, WalScanResult::Status::kCorrupt);
-  EXPECT_EQ(hop_result.status, full_result.status);
-  EXPECT_EQ(hop_result.detail, full_result.detail);
-  EXPECT_FALSE(hop_result.tail_zeroed);
+  EXPECT_EQ(skip_result.status, full_result.status);
+  EXPECT_EQ(skip_result.detail, full_result.detail);
+  EXPECT_FALSE(skip_result.tail_zeroed);
 }
 
 TEST_F(WalFrameTest, InjectedFdatasyncFailsAfterTheAllowedCalls) {
