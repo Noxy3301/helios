@@ -303,12 +303,12 @@ Logger::RecoveryResult Logger::Recover() {
       // supplied.
       SPDLOG_WARN("Ignoring the checkpoint: {0}", checkpoint.detail);
       checkpoint.records.clear();
-      // The cut is cleared with it so the scan hops nothing.
-      checkpoint.cut_epoch = 0;
+      // The start epoch is cleared with it so the scan hops nothing.
+      checkpoint.start_epoch = 0;
     }
   }
 
-  auto scan = thread_local_logger_->Scan(checkpoint.cut_epoch);
+  auto scan = thread_local_logger_->Scan(checkpoint.start_epoch);
   RecoveryResult result;
   if (scan.status != WalScanResult::Status::kOk) return FailRecovery(scan);
 
@@ -331,7 +331,7 @@ Logger::RecoveryResult Logger::Recover() {
       SPDLOG_INFO(
           "Recovering from the checkpoint of epoch {0}: {1} frames of "
           "{2} bytes are covered by it and are not replayed",
-          checkpoint.cut_epoch, scan.frames_skipped, scan.bytes_skipped);
+          checkpoint.start_epoch, scan.frames_skipped, scan.bytes_skipped);
     }
   }
 

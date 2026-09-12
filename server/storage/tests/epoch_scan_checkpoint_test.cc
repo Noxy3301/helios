@@ -247,8 +247,8 @@ TEST_F(EpochScanCheckpointTest, ACheckpointHoldsWhatTheScanFound) {
   auto primary_keys = IndexEntryInCheckpoint(checkpoint, "s");
   std::sort(primary_keys.begin(), primary_keys.end());
   EXPECT_EQ(primary_keys, (std::vector<std::string>{"alice", "bob"}));
-  EXPECT_NE(checkpoint.cut_epoch, 0u);
-  EXPECT_GE(checkpoint.end_epoch, checkpoint.cut_epoch);
+  EXPECT_NE(checkpoint.start_epoch, 0u);
+  EXPECT_GE(checkpoint.end_epoch, checkpoint.start_epoch);
   // The working file is renamed rather than left behind.
   EXPECT_FALSE(std::filesystem::exists(working_path()));
 }
@@ -310,8 +310,8 @@ TEST_F(EpochScanCheckpointTest, TheLogTailWinsOverTheCheckpoint) {
     ASSERT_TRUE(CommitWrite(db, "bob", "one"));
     ASSERT_TRUE(CommitWrite(db, "carol", "one"));
     ASSERT_TRUE(db.WriteCheckpoint());
-    // Written after the cut: the checkpoint holds the old version of alice and
-    // no version of dave, and the tail has to supply both.
+    // Written after the start epoch: the checkpoint holds the old version of
+    // alice and no version of dave, and the tail has to supply both.
     ASSERT_TRUE(CommitWrite(db, "alice", "two"));
     ASSERT_TRUE(CommitDelete(db, "carol"));
     ASSERT_TRUE(CommitWrite(db, "dave", "two"));
@@ -357,14 +357,14 @@ TEST_F(EpochScanCheckpointTest,
   }
   {
     Wal wal(work_dir_, helios::storage::wal::WalIo::Posix(), 1ull << 20);
-    auto filtered = wal.Scan(checkpoint.cut_epoch);
+    auto filtered = wal.Scan(checkpoint.start_epoch);
     ASSERT_EQ(filtered.status, WalScanResult::Status::kOk);
     EXPECT_GT(filtered.frames_skipped, 0u);
     EXPECT_GT(filtered.bytes_skipped, 0u);
     // The end of the log and how far it is durable come from every frame.
     EXPECT_EQ(filtered.last_epoch, last_epoch_);
     for (const auto &record : filtered.records) {
-      EXPECT_GT(record.epoch, checkpoint.cut_epoch);
+      EXPECT_GT(record.epoch, checkpoint.start_epoch);
     }
   }
 

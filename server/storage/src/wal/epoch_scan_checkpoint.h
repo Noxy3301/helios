@@ -35,12 +35,12 @@ class Logger;
  * @brief A checkpoint of the live rows, written while transactions keep
  * running.
  *
- * The scan starts after a barrier, so every commit at or below the cut is
- * already in memory; rows committed during the scan may be captured too, and
+ * The scan starts after a barrier, so every commit at or below the start epoch
+ * is already in memory; rows committed during the scan may be captured too, and
  * recovery resolves that mixture by folding the checkpoint under the log's own
- * newest-transaction-id-wins rule and replaying everything above the cut.
- * Each row's copy is torn-free under the read path's version protocol, and
- * the checkpoint is published only once the log covers every epoch the scan
+ * newest-transaction-id-wins rule and replaying everything above the start
+ * epoch. Each row's copy is torn-free under the read path's version protocol,
+ * and the checkpoint is published only once the log covers every epoch the scan
  * could have observed. What the checkpoint bounds is the replay, not the log on
  * disk.
  */
@@ -53,7 +53,7 @@ class EpochScanCheckpoint {
     uint64_t generation{0};
     // Global epoch sampled before the barrier; recovery replays the log above
     // it.
-    EpochNumber cut_epoch{0};
+    EpochNumber start_epoch{0};
     // Global epoch sampled after the walk; the publish waits for the log
     // through it.
     EpochNumber end_epoch{0};
@@ -82,7 +82,7 @@ class EpochScanCheckpoint {
     enum class Status { kOk, kAbsent, kUnusable };
 
     Status status{Status::kAbsent};
-    EpochNumber cut_epoch{0};
+    EpochNumber start_epoch{0};
     EpochNumber end_epoch{0};
     EpochNumber wal_last_epoch_at_publish{0};
     LogRecords records;

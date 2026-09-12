@@ -57,7 +57,7 @@ constexpr auto kDurabilityWait = std::chrono::seconds(60);
 constexpr size_t kOffVersion = 4;
 constexpr size_t kOffFlags = 6;
 constexpr size_t kOffGeneration = 8;
-constexpr size_t kOffCutEpoch = 16;
+constexpr size_t kOffStartEpoch = 16;
 constexpr size_t kOffEndEpoch = 20;
 constexpr size_t kOffWalLastEpoch = 24;
 constexpr size_t kOffPrimaryRows = 28;
@@ -332,13 +332,13 @@ bool EpochScanCheckpoint::RunOnce(Stats *out_stats) {
   Stats stats;
   stats.generation = ++generation_;
 
-  // Sample the cut, then barrier until every commit at or below it has
+  // Sample the start epoch, then barrier until every commit at or below it has
   // installed.
   const auto barrier_begin = Clock::now();
-  // The cut is read before the barrier: once Sync returns, every commit at or
-  // below it has installed its values. A cut taken after the scan started
-  // would drop the commits still in flight at that moment.
-  stats.cut_epoch = epoch_framework_.GetGlobalEpoch();
+  // The start epoch is read before the barrier: once Sync returns, every commit
+  // at or below it has installed its values. A start epoch taken after the scan
+  // started would drop the commits still in flight at that moment.
+  stats.start_epoch = epoch_framework_.GetGlobalEpoch();
   // A conservative default; the durable epoch can pass closed empty epochs
   // that wrote no frame, and Publish overwrites this with the frame-backed
   // last epoch once the durability gate has returned.
@@ -353,7 +353,7 @@ bool EpochScanCheckpoint::RunOnce(Stats *out_stats) {
   tables_.ForEachTable([&](Table &table) {
     if (abandoned) return;
     LogRecord record;
-    record.epoch = stats.cut_epoch;
+    record.epoch = stats.start_epoch;
     if (!CaptureTable(table, &record, &stats)) {
       abandoned = true;
       return;
@@ -399,11 +399,11 @@ bool EpochScanCheckpoint::RunOnce(Stats *out_stats) {
   if (!published) return false;
 
   SPDLOG_INFO(
-      "Checkpoint {0} written: {1} rows, {2} index entries, {3} bytes, cut "
+      "Checkpoint {0} written: {1} rows, {2} index entries, {3} bytes, start "
       "epoch {4}, end epoch {5}, {6} ms at the barrier, {7} ms scanning, {8} "
       "ms writing, {9} ms waiting for the log, {10} version retries",
       stats.generation, stats.primary_rows, stats.secondary_entries,
-      stats.checkpoint_bytes, stats.cut_epoch, stats.end_epoch,
+      stats.checkpoint_bytes, stats.start_epoch, stats.end_epoch,
       stats.barrier_ms, stats.scan_ms, stats.write_ms, stats.durability_ms,
       stats.version_retries);
   return true;
@@ -550,7 +550,7 @@ bool EpochScanCheckpoint::Publish(const LogRecords &records, Stats *stats) {
   PutLe16(header + kOffVersion, kVersion);
   PutLe16(header + kOffFlags, kFlags);
   PutLe64(header + kOffGeneration, stats->generation);
-  PutLe32(header + kOffCutEpoch, stats->cut_epoch);
+  PutLe32(header + kOffStartEpoch, stats->start_epoch);
   PutLe32(header + kOffEndEpoch, stats->end_epoch);
   PutLe32(header + kOffWalLastEpoch, stats->wal_last_epoch_at_publish);
   PutLe64(header + kOffPrimaryRows, stats->primary_rows);
@@ -645,13 +645,13 @@ EpochScanCheckpoint::LoadResult EpochScanCheckpoint::Load(
     return unusable("the checkpoint length disagrees with its header");
   }
 
-  const EpochNumber cut_epoch = GetLe32(header + kOffCutEpoch);
+  const EpochNumber start_epoch = GetLe32(header + kOffStartEpoch);
   const EpochNumber end_epoch = GetLe32(header + kOffEndEpoch);
   const EpochNumber wal_last_epoch_at_publish =
       GetLe32(header + kOffWalLastEpoch);
-  // Epoch 0 is not a cut any writer produces, and a scan never ends before
-  // its cut.
-  if (cut_epoch == 0 || end_epoch < cut_epoch) {
+  // Epoch 0 is not a start epoch any writer produces, and a scan never ends
+  // before its start.
+  if (start_epoch == 0 || end_epoch < start_epoch) {
     return unusable("the checkpoint epochs are not in order");
   }
 
@@ -686,7 +686,7 @@ EpochScanCheckpoint::LoadResult EpochScanCheckpoint::Load(
   }
 
   checkpoint.status = LoadResult::Status::kOk;
-  checkpoint.cut_epoch = cut_epoch;
+  checkpoint.start_epoch = start_epoch;
   checkpoint.end_epoch = end_epoch;
   checkpoint.wal_last_epoch_at_publish = wal_last_epoch_at_publish;
   return checkpoint;
