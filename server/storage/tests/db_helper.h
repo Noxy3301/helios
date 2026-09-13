@@ -15,10 +15,11 @@
 #include <utility>
 #include <vector>
 
+#include "lineairdb/commit.h"
+#include "lineairdb/database.h"
+#include "lineairdb/read.h"
+
 #include "gtest/gtest.h"
-#include "storage/commit.h"
-#include "storage/database.h"
-#include "storage/read.h"
 
 // Drives the read and commit API the way the query layer does: observe, then
 // submit the observations as evidence along with the writes. Every call hands

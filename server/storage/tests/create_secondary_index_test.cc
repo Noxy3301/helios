@@ -14,6 +14,8 @@
  *   limitations under the License.
  */
 
+// Modified for Helios.
+
 /**
  * @file server/storage/tests/create_secondary_index_test.cc
  * Declaring secondary indexes: key types, several per table, duplicates,
@@ -23,11 +25,12 @@
 #include <filesystem>
 #include <memory>
 
+#include "lineairdb/config.h"
+#include "lineairdb/database.h"
+#include "lineairdb/index.h"
+
 #include "db_helper.h"
 #include "gtest/gtest.h"
-#include "storage/config.h"
-#include "storage/database.h"
-#include "storage/index.h"
 #include "table/table.h"
 
 namespace {

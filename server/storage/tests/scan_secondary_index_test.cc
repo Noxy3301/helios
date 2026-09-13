@@ -1,3 +1,5 @@
+// Modified for Helios.
+
 /**
  * @file server/storage/tests/scan_secondary_index_test.cc
  * Scanning a secondary index: order, bounds, and the keys an insert or a
@@ -10,11 +12,12 @@
 #include <utility>
 #include <vector>
 
+#include "lineairdb/config.h"
+#include "lineairdb/database.h"
+#include "lineairdb/index.h"
+
 #include "db_helper.h"
 #include "gtest/gtest.h"
-#include "storage/config.h"
-#include "storage/database.h"
-#include "storage/index.h"
 
 namespace {
 using helios::storage::IndexConstraint;

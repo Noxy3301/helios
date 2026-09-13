@@ -14,6 +14,8 @@
  *   limitations under the License.
  */
 
+// Modified for Helios.
+
 /**
  * @file server/storage/tests/durability_test.cc
  * Recovery from the log, and the difference the commit acknowledgement
@@ -27,10 +29,11 @@
 #include <thread>
 #include <vector>
 
+#include "lineairdb/config.h"
+#include "lineairdb/database.h"
+
 #include "db_helper.h"
 #include "gtest/gtest.h"
-#include "storage/config.h"
-#include "storage/database.h"
 #include "util/spdlog.h"
 
 namespace {

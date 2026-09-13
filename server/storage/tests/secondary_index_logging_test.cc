@@ -15,6 +15,8 @@
  *   limitations under the License.
  */
 
+// Modified for Helios.
+
 /**
  * @file server/storage/tests/secondary_index_logging_test.cc
  * That secondary index entries survive recovery without a checkpoint, and the
@@ -33,11 +35,12 @@
 #include <string>
 #include <vector>
 
+#include "lineairdb/config.h"
+#include "lineairdb/database.h"
+
 #include "db_helper.h"
 #include "gtest/gtest.h"
 #include "spdlog/spdlog.h"
-#include "storage/config.h"
-#include "storage/database.h"
 #include "wal/logger.h"
 #include "wal/wal.h"
 

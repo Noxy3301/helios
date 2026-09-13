@@ -7,10 +7,11 @@
 #include <string_view>
 #include <vector>
 
+#include "lineairdb/pax.h"
+
 #include "gtest/gtest.h"
 #include "index/data_item.h"
 #include "pax/table.h"
-#include "storage/pax.h"
 
 namespace {
 

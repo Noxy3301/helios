@@ -1,3 +1,5 @@
+// Modified for Helios.
+
 /**
  * @file server/storage/src/index/secondary_index.h
  * A secondary index: the secondary key to primary-key-list map, and the
@@ -11,8 +13,9 @@
 #include <string_view>
 #include <utility>
 
+#include "lineairdb/index.h"
+
 #include "index/masstree_index.h"
-#include "storage/index.h"
 
 namespace helios::storage {
 namespace index {

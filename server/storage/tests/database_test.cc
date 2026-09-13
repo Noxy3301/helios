@@ -14,13 +14,15 @@
  *   limitations under the License.
  */
 
+// Modified for Helios.
+
 /**
  * @file server/storage/tests/database_test.cc
  * The store as a whole: construction, reads and writes, scans, deletes,
  * and concurrent insertions.
  */
 
-#include "storage/database.h"
+#include "lineairdb/database.h"
 
 #include <filesystem>
 #include <memory>
@@ -28,9 +30,10 @@
 #include <thread>
 #include <vector>
 
+#include "lineairdb/config.h"
+
 #include "db_helper.h"
 #include "gtest/gtest.h"
-#include "storage/config.h"
 
 namespace {
 constexpr const char *kTable = "users";

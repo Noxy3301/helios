@@ -14,6 +14,8 @@
  *   limitations under the License.
  */
 
+// Modified for Helios.
+
 /**
  * @file server/storage/tests/index_test.cc
  * Scanning the primary index: ordering, early stop, open upper bound, and
@@ -23,10 +25,11 @@
 #include <filesystem>
 #include <memory>
 
+#include "lineairdb/config.h"
+#include "lineairdb/database.h"
+
 #include "db_helper.h"
 #include "gtest/gtest.h"
-#include "storage/config.h"
-#include "storage/database.h"
 
 namespace {
 constexpr const char *kTable = "users";

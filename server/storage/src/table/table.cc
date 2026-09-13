@@ -1,3 +1,5 @@
+// Modified for Helios.
+
 /**
  * @file server/storage/src/table/table.cc
  * Table construction, and the definition changes and lookups the table lock

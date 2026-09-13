@@ -6,10 +6,11 @@
 #include <filesystem>
 #include <string>
 
+#include "lineairdb/config.h"
+#include "lineairdb/database.h"
+
 #include "db_helper.h"
 #include "gtest/gtest.h"
-#include "storage/config.h"
-#include "storage/database.h"
 
 namespace {
 

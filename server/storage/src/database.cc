@@ -14,23 +14,26 @@
  *   limitations under the License.
  */
 
+// Modified for Helios.
+
 /**
  * @file server/storage/src/database.cc
  * Database operations and the startup and shutdown order of its epoch
  * framework, WAL, checkpoint worker and reaper.
  */
 
-#include "storage/database.h"
+#include "lineairdb/database.h"
 
 #include <algorithm>
 #include <shared_mutex>
+
+#include "lineairdb/config.h"
 
 #include "index/masstree_index.h"
 #include "index/secondary_index.h"
 #include "pax/catalog.h"
 #include "silo/commit.h"
 #include "silo/read.h"
-#include "storage/config.h"
 #include "util/spdlog.h"
 #include "wal/flush_trace.h"
 #include "wal/log_entry.h"

@@ -14,14 +14,16 @@
  *   limitations under the License.
  */
 
+// Modified for Helios.
+
 /**
- * @file server/storage/include/storage/database.h
+ * @file server/storage/include/lineairdb/database.h
  * The public face of the store: table and index definition, the read ops,
  * the commit, and the epoch handshake every calling thread performs.
  */
 
-#ifndef HELIOS_STORAGE_INCLUDE_STORAGE_DATABASE_H
-#define HELIOS_STORAGE_INCLUDE_STORAGE_DATABASE_H
+#ifndef HELIOS_STORAGE_INCLUDE_LINEAIRDB_DATABASE_H
+#define HELIOS_STORAGE_INCLUDE_LINEAIRDB_DATABASE_H
 
 #include <cstdint>
 #include <functional>
@@ -32,11 +34,12 @@
 #include <utility>
 #include <vector>
 
+#include "lineairdb/commit.h"
+#include "lineairdb/config.h"
+#include "lineairdb/index.h"
+#include "lineairdb/read.h"
+
 #include "index/reaper.h"
-#include "storage/commit.h"
-#include "storage/config.h"
-#include "storage/index.h"
-#include "storage/read.h"
 #include "table/table_dictionary.h"
 #include "util/epoch_framework.h"
 #include "wal/epoch_scan_checkpoint.h"
@@ -445,4 +448,4 @@ class Database {
 };
 }  // namespace helios::storage
 
-#endif  // HELIOS_STORAGE_INCLUDE_STORAGE_DATABASE_H
+#endif  // HELIOS_STORAGE_INCLUDE_LINEAIRDB_DATABASE_H

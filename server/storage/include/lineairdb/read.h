@@ -1,10 +1,10 @@
 /**
- * @file server/storage/include/storage/read.h
+ * @file server/storage/include/lineairdb/read.h
  * What a read observes: the outcome of a point read and of every scan.
  */
 
-#ifndef HELIOS_STORAGE_INCLUDE_STORAGE_READ_H
-#define HELIOS_STORAGE_INCLUDE_STORAGE_READ_H
+#ifndef HELIOS_STORAGE_INCLUDE_LINEAIRDB_READ_H
+#define HELIOS_STORAGE_INCLUDE_LINEAIRDB_READ_H
 
 #include <cstdint>
 #include <string>
@@ -111,4 +111,4 @@ struct ScanIndexResult {
 
 }  // namespace helios::storage
 
-#endif  // HELIOS_STORAGE_INCLUDE_STORAGE_READ_H
+#endif  // HELIOS_STORAGE_INCLUDE_LINEAIRDB_READ_H

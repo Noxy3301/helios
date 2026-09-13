@@ -1,9 +1,19 @@
-# Helios storage
+# LineairDB for Helios
 
-The storage layer of Helios: an embedded transactional key-value engine with
-strict serializability, linked into the storage server one directory up. One
-process runs one of these, and the query layers reach it only through the RPC
-the server exposes.
+Modified for Helios.
+
+Helios's storage engine is derived from
+[LineairDB](https://github.com/LineairDB/LineairDB), adapted for Helios's
+research goals with Silo concurrency control and PAX storage. The public
+headers keep the LineairDB name:
+
+```cpp
+#include "lineairdb/database.h"
+```
+
+The API uses the `helios::storage` namespace and the `helios_storage` CMake
+target. The API is tailored to Helios; upstream LineairDB examples require
+adaptation to use this engine.
 
 ## Building
 
@@ -23,5 +33,5 @@ Nippon Telegraph and Telephone Corporation), by way of the frozen fork at
 `LICENSE-3RD-PARTY.md` and `NOTICE` are kept here. The research paper the
 engine grew out of is at <https://arxiv.org/abs/1904.08119>.
 
-This tree is an independently pruned derivative, not LineairDB itself. The
-upstream API and documentation do not describe this code.
+The implementation builds on that foundation, with substantial reductions
+and changes to the API and storage layout for Helios.

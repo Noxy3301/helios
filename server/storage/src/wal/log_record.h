@@ -1,3 +1,5 @@
+// Modified for Helios.
+
 /**
  * @file server/storage/src/wal/log_record.h
  * The epoch-tagged group of writes persisted on the log and inside a

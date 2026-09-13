@@ -12,7 +12,8 @@
 #include <utility>
 #include <vector>
 
-#include "storage/database.h"
+#include "lineairdb/database.h"
+
 #include "index/data_item.h"
 #include "index/secondary_index.h"
 #include "silo/stable_read.h"

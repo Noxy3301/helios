@@ -8,11 +8,12 @@
 #include <string>
 #include <vector>
 
+#include "lineairdb/config.h"
+#include "lineairdb/database.h"
+#include "lineairdb/read.h"
+
 #include "db_helper.h"
 #include "gtest/gtest.h"
-#include "storage/config.h"
-#include "storage/database.h"
-#include "storage/read.h"
 
 namespace {
 

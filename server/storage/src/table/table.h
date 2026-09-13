@@ -1,3 +1,5 @@
+// Modified for Helios.
+
 /**
  * @file server/storage/src/table/table.h
  * One table: its primary index, its secondary indexes, and the lock that
@@ -12,10 +14,11 @@
 #include <string>
 #include <unordered_map>
 
+#include "lineairdb/pax.h"
+
 #include "index/primary_index.h"
 #include "index/secondary_index.h"
 #include "pax/table.h"
-#include "storage/pax.h"
 
 namespace helios::storage {
 

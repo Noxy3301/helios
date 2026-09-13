@@ -14,6 +14,8 @@
  *   limitations under the License.
  */
 
+// Modified for Helios.
+
 /**
  * @file server/storage/tests/manipulate_secondary_index_test.cc
  * Reading and writing through secondary indexes, including the moves and
@@ -26,11 +28,12 @@
 #include <string>
 #include <vector>
 
+#include "lineairdb/config.h"
+#include "lineairdb/database.h"
+#include "lineairdb/index.h"
+
 #include "db_helper.h"
 #include "gtest/gtest.h"
-#include "storage/config.h"
-#include "storage/database.h"
-#include "storage/index.h"
 
 namespace {
 using helios::storage::IndexConstraint;

@@ -15,6 +15,8 @@
  *   limitations under the License.
  */
 
+// Modified for Helios.
+
 /**
  * @file server/storage/src/index/data_item.h
  * What the index maps a key to: the Silo transaction id word and the row
@@ -34,9 +36,10 @@
 #include <utility>
 #include <vector>
 
+#include "lineairdb/pax.h"
+
 #include "index/primary_key_list.h"
 #include "silo/transaction_id.h"
-#include "storage/pax.h"
 
 namespace helios::storage {
 

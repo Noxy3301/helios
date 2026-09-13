@@ -9,10 +9,11 @@
 #include <string>
 #include <vector>
 
+#include "lineairdb/database.h"
+#include "lineairdb/pax.h"
+
 #include "db_helper.h"
 #include "gtest/gtest.h"
-#include "storage/database.h"
-#include "storage/pax.h"
 #include "pax/catalog.h"
 
 namespace {

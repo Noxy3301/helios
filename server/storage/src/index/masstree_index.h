@@ -12,8 +12,9 @@
 #include <optional>
 #include <string_view>
 
+#include "lineairdb/pax.h"
+
 #include "index/data_item.h"
-#include "storage/pax.h"
 
 namespace helios::storage {
 namespace index {

@@ -14,6 +14,8 @@
  *   limitations under the License.
  */
 
+// Modified for Helios.
+
 /**
  * @file server/storage/tests/data_definition_test.cc
  * Tables as units of naming and of concurrency control: the same key in
@@ -25,10 +27,11 @@
 #include <memory>
 #include <thread>
 
+#include "lineairdb/config.h"
+#include "lineairdb/database.h"
+
 #include "db_helper.h"
 #include "gtest/gtest.h"
-#include "storage/config.h"
-#include "storage/database.h"
 
 class DataDefinitionTest : public ::testing::Test {
  protected:

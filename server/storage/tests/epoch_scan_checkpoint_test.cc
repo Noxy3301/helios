@@ -21,10 +21,11 @@
 #include <thread>
 #include <vector>
 
+#include "lineairdb/config.h"
+#include "lineairdb/database.h"
+#include "lineairdb/read.h"
+
 #include "db_helper.h"
-#include "storage/config.h"
-#include "storage/database.h"
-#include "storage/read.h"
 #include "wal/crc32c.h"
 #include "wal/wal.h"
 

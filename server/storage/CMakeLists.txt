@@ -1,3 +1,5 @@
+# Modified for Helios.
+
 #
 # Copyright (C) 2020 Nippon Telegraph and Telephone Corporation.
 #
@@ -20,7 +22,7 @@ project(
   helios_storage
   VERSION 0.1.0
   DESCRIPTION
-    "Transactional key-value storage with linearizability and linear-scale performance."
+    "Storage engine for Helios based on LineairDB."
   LANGUAGES CXX)
 
 # Build Options

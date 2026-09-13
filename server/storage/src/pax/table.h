@@ -15,7 +15,7 @@
 #include <utility>
 #include <vector>
 
-#include "storage/pax.h"
+#include "lineairdb/pax.h"
 
 namespace helios::storage {
 namespace pax {

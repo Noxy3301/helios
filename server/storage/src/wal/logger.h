@@ -14,6 +14,8 @@
  *   limitations under the License.
  */
 
+// Modified for Helios.
+
 /**
  * @file server/storage/src/wal/logger.h
  * Producer log buffers, their background writer and the durable epoch.
@@ -30,7 +32,8 @@
 #include <string>
 #include <thread>
 
-#include "storage/config.h"
+#include "lineairdb/config.h"
+
 #include "util/epoch.h"
 #include "util/thread_key_storage.h"
 #include "wal/log_entry.h"

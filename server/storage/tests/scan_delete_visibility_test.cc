@@ -1,3 +1,5 @@
+// Modified for Helios.
+
 /**
  * @file server/storage/tests/scan_delete_visibility_test.cc
  * That a scan does not return a key deleted in an earlier transaction.
@@ -8,10 +10,11 @@
 #include <string>
 #include <vector>
 
+#include "lineairdb/config.h"
+#include "lineairdb/database.h"
+
 #include "db_helper.h"
 #include "gtest/gtest.h"
-#include "storage/config.h"
-#include "storage/database.h"
 
 namespace {
 constexpr const char *kTable = "users";

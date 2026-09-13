@@ -1,3 +1,5 @@
+// Modified for Helios.
+
 /**
  * @file server/storage/src/table/table_dictionary.h
  * The tables of one database, published by data definition and read

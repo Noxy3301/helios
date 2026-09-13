@@ -14,6 +14,8 @@
  *   limitations under the License.
  */
 
+// Modified for Helios.
+
 /**
  * @file server/storage/tests/concurrent_create_table_test.cc
  * Table creation from several threads, across an epoch boundary.
@@ -28,9 +30,10 @@
 #include <thread>
 #include <vector>
 
+#include "lineairdb/config.h"
+#include "lineairdb/database.h"
+
 #include "gtest/gtest.h"
-#include "storage/config.h"
-#include "storage/database.h"
 
 class ConcurrentCreateTableTest : public ::testing::Test {
  protected:

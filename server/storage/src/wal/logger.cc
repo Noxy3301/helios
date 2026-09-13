@@ -14,6 +14,8 @@
  *   limitations under the License.
  */
 
+// Modified for Helios.
+
 /**
  * @file server/storage/src/wal/logger.cc
  * The write-ahead log and the durable epoch a synchronous commit waits on.
@@ -31,7 +33,8 @@
 #include <unordered_map>
 #include <utility>
 
-#include "storage/config.h"
+#include "lineairdb/config.h"
+
 #include "util/epoch.h"
 #include "util/spdlog.h"
 #include "wal/epoch_scan_checkpoint.h"

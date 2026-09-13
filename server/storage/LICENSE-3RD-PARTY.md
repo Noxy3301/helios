@@ -1,6 +1,8 @@
 Licenses of 3rd party libraries
 ===
 
+Modified for Helios.
+
 ## 3-Clause BSD
 
 | Name       | Copyright                   | URL                                  |
@@ -18,6 +20,13 @@ Licenses of 3rd party libraries
 | Name      | Copyright                                  | URL                                  |
 | --------- | ------------------------------------------ | ------------------------------------ |
 | msgpack-c | Copyright (C) 2008-2015 FURUHASHI Sadayuki | https://github.com/msgpack/msgpack-c |
+
+## Masstree
+
+[Masstree](https://github.com/kohler/masstree-beta) uses an MIT license with an
+additional restriction on the use of copyright holders' names and trademarks
+in advertising or publicity. Its complete notice is reproduced below from
+[third_party/masstree/LICENSE](third_party/masstree/LICENSE).
 
 Terms of the 2-clause BSD license:
 ===
@@ -89,3 +98,42 @@ SHALL THE COPYRIGHT HOLDERS OR ANYONE DISTRIBUTING THE SOFTWARE BE LIABLE
 FOR ANY DAMAGES OR OTHER LIABILITY, WHETHER IN CONTRACT, TORT OR OTHERWISE,
 ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
+
+## Masstree license and copyright notice
+
+```text
+This software is subject to the license below, which is referenced
+elsewhere using the phrase "the Masstree LICENSE file". This license
+is an MIT license, plus a clause (taken from the W3C license)
+requiring prior written permission to use our names in publicity. The
+AUTHORS file lists the people who have contributed to this software.
+
+===========================================================================
+
+(c) 2011-2019 President and Fellows of Harvard College
+(c) 2010-2011 Regents of the University of California
+(c) 2010-2013 Massachusetts Institute of Technology
+
+Permission is hereby granted, free of charge, to any person obtaining a
+copy of this software and associated documentation files (the "Software"),
+to deal in the Software without restriction, including without limitation
+the rights to use, copy, modify, merge, publish, distribute, sublicense,
+and/or sell copies of the Software, and to permit persons to whom the
+Software is furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in
+all copies or substantial portions of the Software.
+
+The name and trademarks of copyright holders may NOT be used in advertising
+or publicity pertaining to the Software without specific, written prior
+permission. Title to copyright in this Software and any associated
+documentation will at all times remain with copyright holders.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+DEALINGS IN THE SOFTWARE.
+```

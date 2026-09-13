@@ -1,11 +1,11 @@
 /**
- * @file server/storage/include/storage/commit.h
+ * @file server/storage/include/lineairdb/commit.h
  * What a commit is assembled from: the evidence a transaction observed, the
  * writes it installs, and when it is acknowledged.
  */
 
-#ifndef HELIOS_STORAGE_INCLUDE_STORAGE_COMMIT_H
-#define HELIOS_STORAGE_INCLUDE_STORAGE_COMMIT_H
+#ifndef HELIOS_STORAGE_INCLUDE_LINEAIRDB_COMMIT_H
+#define HELIOS_STORAGE_INCLUDE_LINEAIRDB_COMMIT_H
 
 #include <cstdint>
 #include <string>
@@ -120,4 +120,4 @@ struct ExternalRangeReadEntry {
 
 }  // namespace helios::storage
 
-#endif  // HELIOS_STORAGE_INCLUDE_STORAGE_COMMIT_H
+#endif  // HELIOS_STORAGE_INCLUDE_LINEAIRDB_COMMIT_H

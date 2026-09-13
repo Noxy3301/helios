@@ -14,6 +14,8 @@
  *   limitations under the License.
  */
 
+// Modified for Helios.
+
 /**
  * @file server/storage/src/util/epoch_framework.h
  * The epoch counter and the thread registry behind it: what advances an

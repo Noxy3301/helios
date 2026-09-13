@@ -1,3 +1,5 @@
+// Modified for Helios.
+
 /**
  * @file server/storage/tests/unique_secondary_index_test.cc
  * That a unique secondary index rejects a duplicate secondary key.
@@ -7,11 +9,12 @@
 #include <memory>
 #include <string>
 
+#include "lineairdb/config.h"
+#include "lineairdb/database.h"
+#include "lineairdb/index.h"
+
 #include "db_helper.h"
 #include "gtest/gtest.h"
-#include "storage/config.h"
-#include "storage/database.h"
-#include "storage/index.h"
 
 namespace {
 

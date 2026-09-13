@@ -15,6 +15,8 @@
  *   limitations under the License.
  */
 
+// Modified for Helios.
+
 /**
  * @file server/storage/src/wal/log_entry.h
  * One entry of the write set a commit hands to the log: the row it wrote,
@@ -29,8 +31,9 @@
 #include <string_view>
 #include <vector>
 
+#include "lineairdb/index.h"
+
 #include "index/data_item.h"
-#include "storage/index.h"
 #include "util/epoch.h"
 
 namespace helios::storage {

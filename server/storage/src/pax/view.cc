@@ -10,9 +10,10 @@
 #include <string>
 #include <utility>
 
+#include "lineairdb/database.h"
+
 #include "pax/table.h"
 #include "pax/version_store.h"
-#include "storage/database.h"
 #include "pax/catalog.h"
 #include "util/debug_sync.h"
 #include "util/spdlog.h"

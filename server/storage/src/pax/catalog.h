@@ -9,7 +9,7 @@
 #include <map>
 #include <string>
 
-#include "storage/pax.h"
+#include "lineairdb/pax.h"
 
 namespace helios::storage::pax {
 

@@ -14,7 +14,8 @@
 #include <string_view>
 #include <thread>
 
-#include "storage/config.h"
+#include "lineairdb/config.h"
+
 #include "util/epoch.h"
 #include "wal/log_record.h"
 

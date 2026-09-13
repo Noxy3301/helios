@@ -14,6 +14,8 @@
  *   limitations under the License.
  */
 
+// Modified for Helios.
+
 /**
  * @file server/storage/src/util/thread_key_storage.h
  * Per-thread slots addressed by a key, with an enumeration over the live
