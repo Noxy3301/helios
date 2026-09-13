@@ -193,11 +193,11 @@ const char *EpochScanCheckpoint::WorkingFileName() {
  */
 EpochScanCheckpoint::CaptureResult EpochScanCheckpoint::CapturePrimaryRow(
     const std::string &table_name, std::string_view key, const DataItem &item,
-    LogRecord::Write &out, uint64_t *retries) {
+    LogRecord::Write &out, uint64_t &retries) {
   for (unsigned attempt = 0; attempt < kSpinAttempts; ++attempt) {
     const TransactionId observed = item.transaction_id.load();
     if (observed.tid & silo::kLockBit) {
-      ++*retries;
+      ++retries;
       _mm_pause();
       continue;
     }
@@ -208,12 +208,12 @@ EpochScanCheckpoint::CaptureResult EpochScanCheckpoint::CapturePrimaryRow(
       if (item.transaction_id.load() == observed) {
         return EpochScanCheckpoint::CaptureResult::kSkipped;
       }
-      ++*retries;
+      ++retries;
       continue;
     }
-    std::string bytes = item.buffer.toString();
+    std::string bytes = item.CopyValue();
     if (item.transaction_id.load() != observed) {
-      ++*retries;
+      ++retries;
       continue;
     }
     out.key.assign(key.data(), key.size());
@@ -240,17 +240,17 @@ EpochScanCheckpoint::CaptureResult EpochScanCheckpoint::CapturePrimaryRow(
 EpochScanCheckpoint::CaptureResult EpochScanCheckpoint::CaptureSecondaryEntry(
     const std::string &table_name, const std::string &index_name,
     uint32_t index_type, std::string_view key, const DataItem &item,
-    LogRecord::Write &out, uint64_t *retries) {
+    LogRecord::Write &out, uint64_t &retries) {
   for (unsigned attempt = 0; attempt < kSpinAttempts; ++attempt) {
     const TransactionId observed = item.transaction_id.load();
     if (observed.tid & silo::kLockBit) {
-      ++*retries;
+      ++retries;
       _mm_pause();
       continue;
     }
     auto primary_keys = std::atomic_load(&item.primary_keys_);
     if (item.transaction_id.load() != observed) {
-      ++*retries;
+      ++retries;
       continue;
     }
     const PrimaryKeyList::View keys(primary_keys);
@@ -349,7 +349,7 @@ bool EpochScanCheckpoint::RunOnce(Stats *out_stats) {
     if (abandoned) return;
     LogRecord record;
     record.epoch = stats.start_epoch;
-    if (!CaptureTable(table, &record, &stats)) {
+    if (!CaptureTable(table, record, stats)) {
       abandoned = true;
       return;
     }
@@ -389,7 +389,7 @@ bool EpochScanCheckpoint::RunOnce(Stats *out_stats) {
   }
 
   // Wait for durability, write, and rename.
-  const bool published = Publish(records, &stats);
+  const bool published = Publish(records, stats);
   if (out_stats != nullptr) *out_stats = stats;
   if (!published) return false;
 
@@ -404,8 +404,8 @@ bool EpochScanCheckpoint::RunOnce(Stats *out_stats) {
   return true;
 }
 
-bool EpochScanCheckpoint::CaptureTable(Table &table, LogRecord *record,
-                                       Stats *stats) {
+bool EpochScanCheckpoint::CaptureTable(Table &table, LogRecord &record,
+                                       Stats &stats) {
   const std::string &table_name = table.Name();
   std::vector<std::string> unstable_rows;
   std::vector<std::pair<std::string, std::string>> unstable_entries;
@@ -416,10 +416,10 @@ bool EpochScanCheckpoint::CaptureTable(Table &table, LogRecord *record,
   table.GetPrimaryIndex().ForEach([&](std::string_view key, DataItem &item) {
     LogRecord::Write write;
     switch (CapturePrimaryRow(table_name, key, item, write,
-                              &stats->version_retries)) {
+                              stats.version_retries)) {
       case CaptureResult::kTaken:
-        ++stats->primary_rows;
-        record->writes.emplace_back(std::move(write));
+        ++stats.primary_rows;
+        record.writes.emplace_back(std::move(write));
         break;
       case CaptureResult::kSkipped:
         break;
@@ -437,10 +437,10 @@ bool EpochScanCheckpoint::CaptureTable(Table &table, LogRecord *record,
         index.ForEach([&](std::string_view key, DataItem &item) {
           LogRecord::Write write;
           switch (CaptureSecondaryEntry(table_name, index_name, index_type, key,
-                                        item, write, &stats->version_retries)) {
+                                        item, write, stats.version_retries)) {
             case CaptureResult::kTaken:
-              ++stats->secondary_entries;
-              record->writes.emplace_back(std::move(write));
+              ++stats.secondary_entries;
+              record.writes.emplace_back(std::move(write));
               break;
             case CaptureResult::kSkipped:
               break;
@@ -473,10 +473,10 @@ bool EpochScanCheckpoint::CaptureTable(Table &table, LogRecord *record,
       if (item == nullptr) continue;
       LogRecord::Write write;
       switch (CapturePrimaryRow(table_name, key, *item, write,
-                                &stats->version_retries)) {
+                                stats.version_retries)) {
         case CaptureResult::kTaken:
-          ++stats->primary_rows;
-          record->writes.emplace_back(std::move(write));
+          ++stats.primary_rows;
+          record.writes.emplace_back(std::move(write));
           break;
         case CaptureResult::kSkipped:
           break;
@@ -496,10 +496,10 @@ bool EpochScanCheckpoint::CaptureTable(Table &table, LogRecord *record,
       LogRecord::Write write;
       switch (CaptureSecondaryEntry(
           table_name, index_name, static_cast<uint32_t>(index->GetIndexType()),
-          key, *item, write, &stats->version_retries)) {
+          key, *item, write, stats.version_retries)) {
         case CaptureResult::kTaken:
-          ++stats->secondary_entries;
-          record->writes.emplace_back(std::move(write));
+          ++stats.secondary_entries;
+          record.writes.emplace_back(std::move(write));
           break;
         case CaptureResult::kSkipped:
           break;
@@ -514,15 +514,15 @@ bool EpochScanCheckpoint::CaptureTable(Table &table, LogRecord *record,
   return !stopped && unstable_rows.empty() && unstable_entries.empty();
 }
 
-bool EpochScanCheckpoint::Publish(const LogRecords &records, Stats *stats) {
+bool EpochScanCheckpoint::Publish(const LogRecords &records, Stats &stats) {
   msgpack::sbuffer payload;
   msgpack::pack(payload, records);
 
   // Publishing before the log covers the last epoch the scan could have
   // observed would let a version come back without its transaction.
   const auto gate_begin = Clock::now();
-  const auto result = logger_.WaitUntilDurable(stats->end_epoch,
-                                               Clock::now() + kDurabilityWait);
+  const auto result =
+      logger_.WaitUntilDurable(stats.end_epoch, Clock::now() + kDurabilityWait);
   if (result != Logger::WaitResult::kDurable) {
     // Nothing was written this round; drop any working file an earlier
     // failed attempt left behind.
@@ -530,10 +530,10 @@ bool EpochScanCheckpoint::Publish(const LogRecords &records, Stats *stats) {
     SPDLOG_WARN(
         "Checkpoint {0} discarded: the log did not become durable through "
         "epoch {1}",
-        stats->generation, stats->end_epoch);
+        stats.generation, stats.end_epoch);
     return false;
   }
-  stats->durability_ms = ElapsedMs(gate_begin);
+  stats.durability_ms = ElapsedMs(gate_begin);
 
   const auto write_begin = Clock::now();
   uint8_t header[kHeaderSize];
@@ -541,23 +541,23 @@ bool EpochScanCheckpoint::Publish(const LogRecords &records, Stats *stats) {
   PutLe32(header, kMagic);
   PutLe16(header + kOffVersion, kVersion);
   PutLe16(header + kOffFlags, kFlags);
-  PutLe64(header + kOffGeneration, stats->generation);
-  PutLe32(header + kOffStartEpoch, stats->start_epoch);
-  PutLe32(header + kOffEndEpoch, stats->end_epoch);
-  PutLe64(header + kOffPrimaryRows, stats->primary_rows);
-  PutLe64(header + kOffSecondaryEntries, stats->secondary_entries);
+  PutLe64(header + kOffGeneration, stats.generation);
+  PutLe32(header + kOffStartEpoch, stats.start_epoch);
+  PutLe32(header + kOffEndEpoch, stats.end_epoch);
+  PutLe64(header + kOffPrimaryRows, stats.primary_rows);
+  PutLe64(header + kOffSecondaryEntries, stats.secondary_entries);
   PutLe64(header + kOffPayloadSize, static_cast<uint64_t>(payload.size()));
   Crc32c crc;
   crc.Update(header, kHeaderSize - sizeof(uint32_t));
   crc.Update(payload.data(), payload.size());
   PutLe32(header + kHeaderSize - sizeof(uint32_t), crc.Finish());
-  stats->checkpoint_bytes = kHeaderSize + payload.size();
+  stats.checkpoint_bytes = kHeaderSize + payload.size();
 
   const int fd = ::open(working_path_.c_str(),
                         O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
   if (fd < 0) {
     SPDLOG_WARN("Checkpoint {0} could not open {1} (errno {2})",
-                stats->generation, working_path_, errno);
+                stats.generation, working_path_, errno);
     return false;
   }
   const bool written = WriteAll(fd, header, sizeof(header)) &&
@@ -568,23 +568,23 @@ bool EpochScanCheckpoint::Publish(const LogRecords &records, Stats *stats) {
   if (!written) {
     ::unlink(working_path_.c_str());
     SPDLOG_WARN("Checkpoint {0} could not be written to {1} (errno {2})",
-                stats->generation, working_path_, write_errno);
+                stats.generation, working_path_, write_errno);
     return false;
   }
-  stats->write_ms = ElapsedMs(write_begin);
+  stats.write_ms = ElapsedMs(write_begin);
 
   if (::rename(working_path_.c_str(), checkpoint_path_.c_str()) != 0) {
     const int rename_errno = errno;
     ::unlink(working_path_.c_str());
     SPDLOG_WARN("Checkpoint {0} could not be published as {1} (errno {2})",
-                stats->generation, checkpoint_path_, rename_errno);
+                stats.generation, checkpoint_path_, rename_errno);
     return false;
   }
   if (!FsyncDirectory(config_.work_dir)) {
     SPDLOG_WARN(
         "Checkpoint {0} was renamed but its directory entry is not durable "
         "(errno {1})",
-        stats->generation, errno);
+        stats.generation, errno);
     return false;
   }
   return true;

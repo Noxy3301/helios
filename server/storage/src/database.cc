@@ -23,9 +23,11 @@
 #include "storage/database.h"
 
 #include <algorithm>
+#include <shared_mutex>
 
 #include "index/masstree_index.h"
 #include "index/secondary_index.h"
+#include "pax/catalog.h"
 #include "silo/commit.h"
 #include "silo/read.h"
 #include "storage/config.h"
@@ -59,6 +61,21 @@ Database::Database(const Config &config)
       epoch_framework_(config_.epoch_duration_ms, MakeEpochHook()),
       scan_checkpoint_(config_, table_dictionary_, epoch_framework_, logger_) {
   SPDLOG_INFO("Storage instance has been constructed.");
+
+  // Restore column definitions before any recovered value is installed.
+  auto catalog = pax::LoadCatalog(config_.work_dir);
+  if (catalog.status == pax::Catalog::Status::kUnusable) {
+    SPDLOG_CRITICAL("Cannot recover the PAX schema catalog: {}",
+                    catalog.detail);
+    exit(EXIT_FAILURE);
+  }
+  for (auto &[name, schema] : catalog.entries) {
+    CreateTable(name);
+    if (!GetTable(name)->InstallPaxSchema(std::move(schema))) {
+      SPDLOG_CRITICAL("Cannot restore PAX schema for table {}", name);
+      exit(EXIT_FAILURE);
+    }
+  }
   // Always scan the log, even without recovery: an interrupted tail has to be
   // removed before the first append lands behind it, and recovery only
   // controls whether the records the scan read are replayed.
@@ -199,8 +216,37 @@ bool Database::Commit(
     const std::vector<ExternalWriteEntry> &writes,
     const std::vector<ExternalSecondaryIndexEntry> &secondary_index_ops,
     const std::vector<ExternalRangeReadEntry> &range_reads,
-    CommitDurability durability, std::string *abort_reason) {
-  const silo::CommitPayload payload{reads, writes, secondary_index_ops,
+    CommitDurability durability, std::string &abort_reason) {
+  abort_reason.clear();
+
+  // Convert input bytes before the commit protocol acquires any row locks.
+  std::vector<silo::Write> write_set;
+  write_set.reserve(writes.size());
+  // GetPaxTable synchronizes lookup; its schema remains valid and unchanged
+  // until shutdown, so decoding needs no schema lock.
+  for (const auto &write : writes) {
+    auto *table = GetTable(write.table_name);
+    if (table == nullptr) {
+      abort_reason = "write_table_missing";
+      return false;
+    }
+    const auto *store = table->GetPaxTable();
+    if (store == nullptr) {
+      abort_reason = "pax_schema_missing";
+      return false;
+    }
+    silo::Write entry{write.table_name, write.key, {}, write.op};
+    if (write.op != RowOp::kDelete &&
+        !pax::DecodeRow(
+            store->schema(),
+            reinterpret_cast<const std::byte *>(write.value.data()),
+            write.value.size(), entry.value)) {
+      abort_reason = "pax_row_decode_failed";
+      return false;
+    }
+    write_set.emplace_back(std::move(entry));
+  }
+  const silo::CommitPayload payload{reads, write_set, secondary_index_ops,
                                     range_reads};
   return silo::Commit(table_dictionary_, schema_mutex_, epoch_framework_,
                       reaper_, logger_, payload, durability, abort_reason);
@@ -241,23 +287,37 @@ void Database::Recover() {
 
   for (auto &entry : recovered.recovery_set) {
     // A tombstone carries an empty row and must not be re-inserted.
-    const bool live = entry.index_name.empty() ? entry.data_item_copy.HasRow()
-                                               : entry.data_item_copy.IsLive();
+    const bool live = entry.index_name.empty() ? !entry.value.empty()
+                                               : !entry.primary_keys.empty();
     if (!live) continue;
-    CreateTable(entry.table_name);
     auto table = GetTable(entry.table_name);
-    if (table == nullptr) {
-      SPDLOG_CRITICAL(
-          "Recovery failed: Table {0} could not be found or created.",
-          entry.table_name);
+    if (table == nullptr || table->GetPaxTable() == nullptr) {
+      SPDLOG_CRITICAL("Recovery failed: PAX schema for table {0} is missing.",
+                      entry.table_name);
       exit(EXIT_FAILURE);
     }
 
-    highest_epoch = std::max(highest_epoch,
-                             entry.data_item_copy.transaction_id.load().epoch);
+    highest_epoch = std::max(highest_epoch, entry.tid.epoch);
 
     if (entry.index_name.empty()) {
-      table->GetPrimaryIndex().Put(entry.key, std::move(entry.data_item_copy));
+      DataItem item(*table->GetPaxTable());
+      const auto *bytes =
+          reinterpret_cast<const std::byte *>(entry.value.data());
+      pax::Row row;
+      if (!pax::DecodeRow(table->GetPaxTable()->schema(), bytes,
+                          entry.value.size(), row)) {
+        SPDLOG_CRITICAL("Recovery failed: value of {} in {} does not fit PAX",
+                        entry.key, entry.table_name);
+        exit(EXIT_FAILURE);
+      }
+      if (!item.AllocateSlot()) {
+        SPDLOG_CRITICAL("Recovery failed: no PAX slot for {} in {}",
+                        entry.key, entry.table_name);
+        exit(EXIT_FAILURE);
+      }
+      item.Write(row);
+      item.transaction_id.store(entry.tid);
+      table->GetPrimaryIndex().Put(entry.key, std::move(item));
     } else {
       // Secondary Index recovery
       index::SecondaryIndex *idx =
@@ -266,9 +326,11 @@ void Database::Recover() {
         SPDLOG_DEBUG(
             "  Recovery: Secondary index '{0}' restoring key '{1}' with {2} "
             "primary keys",
-            entry.index_name, entry.key,
-            entry.data_item_copy.primary_keys_view().size());
-        idx->Put(entry.key, std::move(entry.data_item_copy));
+            entry.index_name, entry.key, entry.primary_keys.size());
+        DataItem item;
+        item.transaction_id.store(entry.tid);
+        item.SetPrimaryKeys(entry.primary_keys);
+        idx->Put(entry.key, std::move(item));
       } else {
         SPDLOG_CRITICAL(
             "Recovery failed: secondary index {0} of table {1} is declared "

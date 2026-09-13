@@ -47,7 +47,7 @@ class ManipulateSecondaryIndexTest : public ::testing::Test {
 };
 
 TEST_F(ManipulateSecondaryIndexTest, ReadWriteSecondaryIndex) {
-  ASSERT_TRUE(db_->CreateTable("users"));
+  ASSERT_TRUE(TestHelper::CreateTable(*db_, "users"));
   ASSERT_TRUE(
       db_->CreateSecondaryIndex("users", "age_index", IndexConstraint::kNone));
 
@@ -61,7 +61,7 @@ TEST_F(ManipulateSecondaryIndexTest, ReadWriteSecondaryIndex) {
 }
 
 TEST_F(ManipulateSecondaryIndexTest, DuplicateAddDoesNotDuplicatePrimaryKey) {
-  ASSERT_TRUE(db_->CreateTable("users"));
+  ASSERT_TRUE(TestHelper::CreateTable(*db_, "users"));
   ASSERT_TRUE(
       db_->CreateSecondaryIndex("users", "age_index", IndexConstraint::kNone));
 
@@ -81,7 +81,7 @@ TEST_F(ManipulateSecondaryIndexTest, DuplicateAddDoesNotDuplicatePrimaryKey) {
 }
 
 TEST_F(ManipulateSecondaryIndexTest, ReadDataViaSecondaryIndex) {
-  ASSERT_TRUE(db_->CreateTable("users"));
+  ASSERT_TRUE(TestHelper::CreateTable(*db_, "users"));
   ASSERT_TRUE(
       db_->CreateSecondaryIndex("users", "age_index", IndexConstraint::kNone));
 
@@ -104,7 +104,7 @@ TEST_F(ManipulateSecondaryIndexTest, ReadDataViaSecondaryIndex) {
 }
 
 TEST_F(ManipulateSecondaryIndexTest, RemoveThenAddRelocatesMapping) {
-  ASSERT_TRUE(db_->CreateTable("users"));
+  ASSERT_TRUE(TestHelper::CreateTable(*db_, "users"));
   ASSERT_TRUE(
       db_->CreateSecondaryIndex("users", "age_index", IndexConstraint::kNone));
 
@@ -126,7 +126,7 @@ TEST_F(ManipulateSecondaryIndexTest, RemoveThenAddRelocatesMapping) {
 }
 
 TEST_F(ManipulateSecondaryIndexTest, ReAddExistingIndexEntryIsIdempotent) {
-  ASSERT_TRUE(db_->CreateTable("users"));
+  ASSERT_TRUE(TestHelper::CreateTable(*db_, "users"));
   ASSERT_TRUE(
       db_->CreateSecondaryIndex("users", "age_index", IndexConstraint::kNone));
 
@@ -147,7 +147,7 @@ TEST_F(ManipulateSecondaryIndexTest, ReAddExistingIndexEntryIsIdempotent) {
 }
 
 TEST_F(ManipulateSecondaryIndexTest, MissingDeleteDoesNotBlockInsert) {
-  ASSERT_TRUE(db_->CreateTable("users"));
+  ASSERT_TRUE(TestHelper::CreateTable(*db_, "users"));
   ASSERT_TRUE(
       db_->CreateSecondaryIndex("users", "age_index", IndexConstraint::kNone));
 
@@ -166,7 +166,7 @@ TEST_F(ManipulateSecondaryIndexTest, MissingDeleteDoesNotBlockInsert) {
 }
 
 TEST_F(ManipulateSecondaryIndexTest, DeleteSecondaryIndexRemovesPrimaryKey) {
-  ASSERT_TRUE(db_->CreateTable("users"));
+  ASSERT_TRUE(TestHelper::CreateTable(*db_, "users"));
   ASSERT_TRUE(
       db_->CreateSecondaryIndex("users", "age_index", IndexConstraint::kNone));
 
@@ -182,7 +182,7 @@ TEST_F(ManipulateSecondaryIndexTest, DeleteSecondaryIndexRemovesPrimaryKey) {
 }
 
 TEST_F(ManipulateSecondaryIndexTest, RemoveIndexEntryLeavesOtherPrimaryKeys) {
-  ASSERT_TRUE(db_->CreateTable("users"));
+  ASSERT_TRUE(TestHelper::CreateTable(*db_, "users"));
   ASSERT_TRUE(
       db_->CreateSecondaryIndex("users", "age_index", IndexConstraint::kNone));
 
@@ -207,7 +207,7 @@ TEST_F(ManipulateSecondaryIndexTest, RemoveIndexEntryLeavesOtherPrimaryKeys) {
 
 TEST_F(ManipulateSecondaryIndexTest,
        MultipleUpdatesInSingleTransactionMaintainConsistency) {
-  ASSERT_TRUE(db_->CreateTable("users"));
+  ASSERT_TRUE(TestHelper::CreateTable(*db_, "users"));
   ASSERT_TRUE(
       db_->CreateSecondaryIndex("users", "age_index", IndexConstraint::kNone));
 

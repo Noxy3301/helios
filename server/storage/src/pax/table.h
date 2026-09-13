@@ -13,11 +13,35 @@
 #include <memory>
 #include <mutex>
 #include <utility>
+#include <vector>
 
 #include "storage/pax.h"
 
 namespace helios::storage {
 namespace pax {
+
+/**
+ * @brief One row's values in PAX cell representation.
+ * @details Typed fields hold binary values; other fields borrow the input
+ * bytes. The write set owns this row until commit finishes. Input bytes and
+ * the schema used by DecodeRow must remain unchanged until ScatterRow ends.
+ */
+struct Row {
+  struct Field {
+    const std::byte *payload = nullptr;
+    uint32_t len = 0;
+    uint64_t typed_value = 0;
+  };
+  std::vector<Field> fields;
+  size_t size = 0;
+};
+
+/**
+ * @brief Decodes input row bytes into the cell values used by the write set.
+ * @return False if the input cannot be represented by the schema; discard out.
+ */
+bool DecodeRow(const TableSchema &schema, const std::byte *value, size_t size,
+               Row &out);
 
 /**
  * @brief Owns all PAX row groups for one Helios table.
@@ -37,14 +61,14 @@ class PaxTable {
    * @param schema Schema copied into the store and referenced by its groups.
    */
   explicit PaxTable(TableSchema schema);
+  ~PaxTable();
 
   /**
    * @brief Allocates the next append-only PAX slot.
    *
    * @details Slots are append-only and are not reused.
    *
-   * @return `{nullptr, 0}` when the table has exhausted the fixed directory, so
-   * the caller overflows the row to the heap without losing correctness.
+   * @return `{nullptr, 0}` when the table has exhausted its slot directory.
    */
   std::pair<PaxGroup *, uint32_t> AllocateSlot();
 
@@ -64,8 +88,7 @@ class PaxTable {
   }
 
   /**
-   * @brief Returns slots handed out, an upper bound on populated rows: a slot
-   * whose row later overflowed to the heap is still counted.
+   * @brief Returns reserved slots, including absent rows and aborted writes.
    */
   uint64_t slots_allocated() const {
     return next_slot_.load(std::memory_order_acquire);
@@ -81,32 +104,12 @@ class PaxTable {
     return static_cast<size_t>(std::min<uint64_t>(groups, kMaxGroups));
   }
 
-  /**
-   * @brief Records one row that overflowed to the heap.
-   */
-  void RecordOverflow() {
-    overflow_count_.fetch_add(1, std::memory_order_relaxed);
-  }
-
-  /**
-   * @brief Returns the number of rows that live on the heap instead of in
-   * the strips.
-   *
-   * @details Non-zero means this table's strips are no longer the complete
-   * set of its rows, so a strip-direct scan of it would miss some: readers
-   * must take the row-shaped path instead.
-   */
-  uint64_t overflow_count() const {
-    return overflow_count_.load(std::memory_order_relaxed);
-  }
-
  private:
   TableSchema schema_;
   // Fixed at kMaxGroups entries; the groups it points at are owned here and
   // are freed only when the store is.
   std::unique_ptr<std::atomic<PaxGroup *>[]> dir_;
   std::atomic<uint64_t> next_slot_{0};
-  std::atomic<uint64_t> overflow_count_{0};
   // Serializes the first touch of a directory entry, not the directory
   // itself, which never grows.
   std::mutex alloc_mutex_;

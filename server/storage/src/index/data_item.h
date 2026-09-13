@@ -28,65 +28,36 @@
 #include <atomic>
 #include <cassert>
 #include <cstddef>
-#include <cstring>
+#include <cstdint>
 #include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
-#include "index/data_buffer.h"
 #include "index/primary_key_list.h"
 #include "silo/transaction_id.h"
+#include "storage/pax.h"
 
 namespace helios::storage {
 
 /**
  * @brief What one index key maps to.
  *
- * @details A primary-index slot keeps the row payload in buffer; a
- * secondary-index slot keeps the primary keys that key points at in
- * primary_keys, published with atomic load and store. transaction_id is the
- * Silo version word both carry. value() is valid only while buffer is
- * not in PAX mode.
+ * @details A primary-index item refers to a PAX slot owned by its table.
+ * A secondary-index item owns the primary-key list published with atomic
+ * load and store. Both use transaction_id as their Silo version word.
  */
 struct DataItem {
   std::atomic<TransactionId> transaction_id;
-  DataBuffer buffer;
   std::shared_ptr<const PrimaryKeyList> primary_keys_;
 
-  // Direct byte access is invalid for PAX-resident rows (no contiguous
-  // bytes); those callers must go through DataBuffer::GatherInto / copies.
-  std::byte *value() {
-    assert(!buffer.is_pax());
-    return buffer.value;
-  }
-  const std::byte *value() const {
-    assert(!buffer.is_pax());
-    return buffer.value;
-  }
-  size_t size() const { return buffer.size; }
+  size_t size() const { return size_; }
   bool IsLive() const {
-    if (buffer.size != 0) return true;
+    if (size_ != 0) return true;
     const auto primary_keys = std::atomic_load(&primary_keys_);
     return primary_keys && primary_keys->count != 0;
   }
-  bool HasRow() const { return buffer.size != 0; }
-
-  PrimaryKeyList::View primary_keys_view() const {
-    return PrimaryKeyList::View(std::atomic_load(&primary_keys_));
-  }
-
-  std::vector<std::string> primary_keys_vector() const {
-    // Holds the list for the walk: the view is a pointer, and a writer may
-    // publish a replacement over the member at any point.
-    const auto primary_keys = std::atomic_load(&primary_keys_);
-    const PrimaryKeyList::View view(primary_keys);
-    std::vector<std::string> keys;
-    keys.reserve(view.size());
-    for (std::string_view key : view) {
-      keys.emplace_back(key.data(), key.size());
-    }
-    return keys;
-  }
+  bool HasRow() const { return size_ != 0; }
 
   void SetPrimaryKeys(const std::vector<std::string> &primary_keys) {
     assert(IsSortedDeduped(primary_keys));
@@ -95,35 +66,71 @@ struct DataItem {
   }
 
   DataItem() : transaction_id(TransactionId()) {}
-  DataItem(const DataItem &rhs)
-      : transaction_id(rhs.transaction_id.load()),
-        primary_keys_(std::atomic_load(&rhs.primary_keys_)) {
-    buffer.Reset(rhs.buffer);
+
+  /**
+   * @brief Creates an empty item whose payload will be stored in table's PAX
+   * slots.
+   */
+  explicit DataItem(pax::PaxTable &table) : DataItem() {
+    location_ = reinterpret_cast<uintptr_t>(&table);
+    assert((location_ & kAllocated) == 0);
   }
 
-  DataItem &operator=(const DataItem &rhs) {
-    transaction_id.store(rhs.transaction_id.load());
-    buffer.Reset(rhs.buffer);
-    std::atomic_store(&primary_keys_, std::atomic_load(&rhs.primary_keys_));
-    return *this;
-  }
+  DataItem(const DataItem &) = delete;
+  DataItem &operator=(const DataItem &) = delete;
 
   DataItem(DataItem &&rhs) noexcept
       : transaction_id(rhs.transaction_id.load()),
-        buffer(std::move(rhs.buffer)),
-        primary_keys_(std::move(rhs.primary_keys_)) {}
+        primary_keys_(std::move(rhs.primary_keys_)),
+        location_(std::exchange(rhs.location_, 0)),
+        size_(std::exchange(rhs.size_, 0)),
+        slot_(std::exchange(rhs.slot_, 0)) {}
 
   DataItem &operator=(DataItem &&rhs) noexcept {
     transaction_id.store(rhs.transaction_id.load());
-    buffer = std::move(rhs.buffer);
+    location_ = std::exchange(rhs.location_, 0);
+    size_ = std::exchange(rhs.size_, 0);
+    slot_ = std::exchange(rhs.slot_, 0);
     std::atomic_store(&primary_keys_, std::move(rhs.primary_keys_));
     return *this;
   }
 
-  void Reset(const std::byte *row, size_t len, TransactionId tid = {}) {
-    buffer.Reset(row, len);
-    if (!tid.IsEmpty()) transaction_id.store(tid);
+  bool pax_allocated() const { return (location_ & kAllocated) != 0; }
+  pax::PaxGroup *pax_group() const {
+    return reinterpret_cast<pax::PaxGroup *>(location_ & ~kAllocated);
   }
+  uint32_t pax_slot() const { return slot_; }
+
+  /**
+   * @brief Reserves a PAX slot if this item does not already have one.
+   * @return False if no table is bound or its slot directory is full.
+   */
+  bool AllocateSlot();
+
+  /**
+   * @brief Writes a decoded row into this item's PAX slot.
+   * @note The caller holds the TID lock and has allocated every write's slot.
+   * Recovery calls this before readers start.
+   */
+  void Write(const pax::Row &row);
+
+  /**
+   * @brief Hides this item's row, retaining its slot for a later write.
+   * @note The caller holds the TID lock; publishing the new TID is separate.
+   */
+  void Delete();
+
+  // A concurrent update may change size_; use the reader's buffer capacity.
+  size_t GatherInto(std::byte *out, size_t capacity) const {
+    assert(pax_allocated());
+    return pax_group()->GatherRow(slot_, out, capacity);
+  }
+
+  /**
+   * @brief Copies the PAX value into owned bytes; an absent item returns empty.
+   * @note The caller holds the TID lock or rechecks the TID after copying.
+   */
+  std::string CopyValue() const;
 
   void InsertPrimaryKey(const std::byte *key, size_t len) {
     const std::string_view new_key(reinterpret_cast<const char *>(key), len);
@@ -144,6 +151,14 @@ struct DataItem {
   }
 
  private:
+  static constexpr uintptr_t kAllocated = 1;
+  // Before allocation this points to the table; afterwards to its tagged group.
+  uintptr_t location_ = 0;
+  size_t size_ = 0;  // Zero denotes an absent or deleted row.
+  uint32_t slot_ = 0;
+
+  void CaptureBeforeImage();
+
   static bool IsSortedDeduped(const std::vector<std::string> &keys) {
     return std::adjacent_find(
                keys.begin(), keys.end(),

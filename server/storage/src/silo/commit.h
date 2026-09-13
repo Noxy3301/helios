@@ -9,8 +9,10 @@
 
 #include <shared_mutex>
 #include <string>
+#include <string_view>
 #include <vector>
 
+#include "pax/table.h"
 #include "storage/commit.h"
 #include "storage/config.h"
 #include "storage/read.h"
@@ -33,12 +35,24 @@ class Reaper;
 namespace silo {
 
 /**
+ * @brief One row change, decoded before entering the commit protocol.
+ * @details Names and untyped field bytes borrow the caller's request.
+ * Deletes use only the table name, key and operation.
+ */
+struct Write {
+  std::string_view table_name;
+  std::string_view key;
+  pax::Row value;
+  RowOp op = RowOp::kUpdate;
+};
+
+/**
  * @brief One transaction's request: what it observed and what it wants
  * installed. A call-site view; it does not own the vectors.
  */
 struct CommitPayload {
   const std::vector<ExternalReadEntry> &reads;
-  const std::vector<ExternalWriteEntry> &writes;
+  const std::vector<Write> &writes;
   const std::vector<ExternalSecondaryIndexEntry> &secondary_index_ops;
   const std::vector<ExternalRangeReadEntry> &range_reads;
 };
@@ -48,7 +62,8 @@ struct CommitPayload {
  * write sets were assembled by the caller through the read API.
  *
  * @details
- * The entries carry values only; nothing in them points into storage
+ * Writes already contain PAX cell values; this protocol does not decode
+ * input bytes. Nothing in the entries points into storage
  * memory:
  *   - reads:       (key, observed TID, found)
  *   - writes:      (key, value | delete)
@@ -71,7 +86,8 @@ struct CommitPayload {
  *                         validated at 2.1)
  *             2.3 [added] inserts: the claimed key still holds no row
  *             2.4 [added] UNIQUE recheck after the lock wait
- *   Phase 3   3.1 [paper] install values; deletes become tombstones
+ *   Phase 3   3.0 [added] reserve PAX slots for all row writes
+ *             3.1 [paper] write values; deletes become tombstones
  *             3.2 [paper] log entries before unlock (when logging)
  *             3.3 [paper] publish even TIDs stamped with the 1.2 epoch
  *             3.4 [added] hand slots left empty to the reaper for
@@ -89,7 +105,7 @@ struct CommitPayload {
  * @param durability Whether this commit's acknowledgement waits for its epoch
  * to reach the device. A logger that writes no records ignores it: step 3.5
  * has nothing to wait for.
- * @param[out] abort_reason When non-null and the attempt aborts,
+ * @param[out] abort_reason When the attempt aborts,
  * receives a short label naming the failed check, such as
  * `exact_read_tid_moved`, `primary_range_result_changed`,
  * `duplicate_primary_key`, or `unique_si_exists_after_lock`.
@@ -99,7 +115,7 @@ struct CommitPayload {
 bool Commit(TableDictionary &tables, std::shared_mutex &schema_mutex,
             epoch::Framework &epoch_framework, index::Reaper &reaper,
             wal::Logger &logger, const CommitPayload &payload,
-            CommitDurability durability, std::string *abort_reason);
+            CommitDurability durability, std::string &abort_reason);
 
 }  // namespace silo
 }  // namespace helios::storage

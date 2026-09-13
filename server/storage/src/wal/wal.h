@@ -188,11 +188,11 @@ class Wal {
   enum class State { kUnscanned, kReady, kFailed };
   WalScanResult IoFailure(const std::string &operation, int error);
   WalScanResult FinishScan(WalScanResult &&result, off_t end_of_log);
-  bool FindLastNonZero(off_t from, off_t to, off_t *last_non_zero,
-                       int *error) const;
-  bool EnsureCapacityFor(off_t end_of_log, size_t group_size, int *error);
-  bool WriteZeroesAndSync(off_t from, off_t to, int *error);
-  bool WriteAllAt(const uint8_t *data, size_t size, off_t offset, int *error);
+  bool FindLastNonZero(off_t from, off_t to, off_t &last_non_zero,
+                       int &error) const;
+  bool EnsureCapacityFor(off_t end_of_log, size_t group_size, int &error);
+  bool WriteZeroesAndSync(off_t from, off_t to, int &error);
+  bool WriteAllAt(const uint8_t *data, size_t size, off_t offset, int &error);
 
   /**
    * @brief Reads exactly size bytes from the WAL at offset into out.
@@ -205,7 +205,7 @@ class Wal {
    * @param[out] error Receives errno on failure, or EIO on unexpected EOF.
    * @return True when all requested bytes were read.
    */
-  bool PreadAll(uint8_t *out, size_t size, off_t offset, int *error) const;
+  bool PreadAll(uint8_t *out, size_t size, off_t offset, int &error) const;
 
   std::string path_;
   WalIo io_;

@@ -28,10 +28,9 @@ namespace pax {
  * layer wrote, unchanged. A typed field stores the value as a fixed-width
  * little-endian binary payload of `field_max_bytes[f]` bytes (4 or 8). A
  * typed cell's u16 length prefix is 0 for SQL NULL and the binary width for a
- * present value, so `empty cell == NULL` still holds. ScatterRow parses that
- * text once and returns false without touching the slot when it does not
- * parse or does not fit; the row then overflows to the heap. GatherRow
- * reformats a typed cell back into the exact bytes it was given.
+ * present value. DecodeRow converts input bytes before the commit protocol;
+ * ScatterRow writes the decoded cells without reparsing.
+ * GatherRow reconstructs the original field bytes from the typed cells.
  */
 enum class FieldType : uint8_t {
   kUntyped = 0,    // verbatim bytes (default; strings, floats, untyped DECIMAL)
@@ -74,8 +73,6 @@ struct TableSchema {
   std::vector<FieldType> field_type;
   // Per-field DECIMAL scale for kDecimal64 (else 0). Same length when present.
   std::vector<int8_t> field_scale;
-  // Table name, carried for diagnostics (overflow logging).
-  std::string table_name;
 
   size_t field_count() const { return field_max_bytes.size(); }
 
@@ -105,6 +102,7 @@ struct TableSchema {
 };
 
 class PaxTable;
+struct Row;
 
 /**
  * @brief Stores a fixed-size row group as per-field PAX strips.
@@ -134,19 +132,15 @@ class PaxGroup {
    *
    * @param schema Table schema owned by `PaxTable`; must outlive this group.
    */
-  PaxGroup(const TableSchema &schema, PaxTable *store);
+  explicit PaxGroup(const TableSchema &schema);
 
   /**
-   * @brief Scatters one row into this group's strip cells.
-   *
+   * @brief Writes a decoded row into this group's strip cells.
    * @param slot Target slot inside this group.
-   * @param row Row bytes.
-   * @param size Number of bytes in `row`.
-   * @return false without writing any cell when the payload does not match
-   * the schema shape, the table has more than 512 fields, an UNTYPED field
-   * exceeds its cell width, or a typed field fails its parse or range check.
+   * @param row Decoded using this group's schema; its input
+   * bytes must remain unchanged until the call finishes.
    */
-  bool ScatterRow(uint32_t slot, const std::byte *row, size_t size);
+  void ScatterRow(uint32_t slot, const Row &row);
 
   /**
    * @brief Marks one slot as invisible to strip-direct readers.
@@ -160,7 +154,7 @@ class PaxGroup {
    *
    * @param slot Source slot inside this group.
    * @param dst Destination buffer with room for `expected_size` bytes.
-   * @param expected_size Row payload length tracked in `DataBuffer::size`.
+   * @param expected_size Row payload length tracked in `DataItem::size()`.
    * @return Number of bytes written, equal to `expected_size` when the slot is
    * quiet and the stored row is intact.
    */
@@ -238,8 +232,6 @@ class PaxGroup {
 
   const TableSchema &schema() const { return schema_; }
 
-  PaxTable *table() const { return table_; }
-
  private:
   /**
    * @brief Appends one field's row-format value into `out`.
@@ -255,7 +247,6 @@ class PaxGroup {
   void AppendCellField(size_t field, uint32_t slot, std::string &out) const;
 
   const TableSchema &schema_;  // Owned by PaxTable; outlives all groups.
-  PaxTable *table_;
   std::vector<uint32_t> stride_;
   std::vector<size_t> strip_offset_;
   std::unique_ptr<std::byte[]> arena_;
@@ -282,11 +273,6 @@ uint64_t SlotsAllocated(const PaxTable *store);
  * @brief Returns the number of row groups that may contain allocated slots.
  */
 size_t GroupCount(const PaxTable *store);
-
-/**
- * @brief Returns the number of rows that overflowed to the heap.
- */
-uint64_t OverflowCount(const PaxTable *store);
 
 // ---------------------------------------------------------------------------
 // Columnar read view surface.

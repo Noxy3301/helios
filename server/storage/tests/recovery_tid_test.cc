@@ -6,6 +6,7 @@
 #include <filesystem>
 #include <string>
 
+#include "db_helper.h"
 #include "gtest/gtest.h"
 #include "storage/config.h"
 #include "storage/database.h"
@@ -32,11 +33,11 @@ TEST(RecoveryTidTest, ARecoveredKeyAcceptsTheNextWrite) {
 
   {
     helios::storage::Database db(config);
-    db.CreateTable(kTable);
+    TestHelper::CreateTable(db, kTable);
     std::string reason;
     const bool committed =
-        db.Commit({}, {{kTable, "alice", "v1"}}, {}, {},
-                  helios::storage::CommitDurability::kSync, &reason);
+        db.Commit({}, {{kTable, "alice", TestHelper::Row("v1")}}, {}, {},
+                  helios::storage::CommitDurability::kSync, reason);
     db.ReleaseThreadEpoch();
     ASSERT_TRUE(committed) << reason;
   }
@@ -44,7 +45,7 @@ TEST(RecoveryTidTest, ARecoveredKeyAcceptsTheNextWrite) {
   {
     helios::storage::Database db(config);
     // Recovery re-created the table, so this call is expected to find it.
-    db.CreateTable(kTable);
+    TestHelper::CreateTable(db, kTable);
 
     auto recovered = db.Read(kTable, "alice");
     db.ReleaseThreadEpoch();
@@ -54,8 +55,8 @@ TEST(RecoveryTidTest, ARecoveredKeyAcceptsTheNextWrite) {
 
     std::string reason;
     const bool committed =
-        db.Commit({}, {{kTable, "alice", "v2"}}, {}, {},
-                  helios::storage::CommitDurability::kSync, &reason);
+        db.Commit({}, {{kTable, "alice", TestHelper::Row("v2")}}, {}, {},
+                  helios::storage::CommitDurability::kSync, reason);
     db.ReleaseThreadEpoch();
     EXPECT_TRUE(committed) << reason;
   }

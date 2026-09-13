@@ -81,15 +81,15 @@ int Fsync(int fd) {
 
 // Persists a directory entry: a file's own fsync does not make its name
 // durable.
-bool FsyncDirectory(const std::string &directory, int *error) {
+bool FsyncDirectory(const std::string &directory, int &error) {
   const int dir_fd =
       ::open(directory.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
   if (dir_fd < 0) {
-    *error = errno;
+    error = errno;
     return false;
   }
   const bool ok = Fsync(dir_fd) == 0;
-  if (!ok) *error = errno;
+  if (!ok) error = errno;
   ::close(dir_fd);
   return ok;
 }
@@ -199,8 +199,8 @@ Wal::Wal(const std::string &work_dir, WalIo io, uint64_t initial_capacity_bytes)
     const std::string parent =
         directory.has_parent_path() ? directory.parent_path().string() : ".";
     int error = 0;
-    if (!FsyncDirectory(directory.string(), &error) ||
-        !FsyncDirectory(parent, &error)) {
+    if (!FsyncDirectory(directory.string(), error) ||
+        !FsyncDirectory(parent, error)) {
       ::close(fd_);
       fd_ = -1;
       throw std::system_error(error, std::generic_category(),
@@ -239,7 +239,7 @@ WalScanResult Wal::IoFailure(const std::string &operation, int error) {
 }
 
 bool Wal::WriteAllAt(const uint8_t *data, size_t size, off_t offset,
-                     int *error) {
+                     int &error) {
   while (size != 0) {
     const size_t chunk = std::min<size_t>(size, SSIZE_MAX);
     const ssize_t written = io_.pwrite(fd_, data, chunk, offset);
@@ -250,13 +250,13 @@ bool Wal::WriteAllAt(const uint8_t *data, size_t size, off_t offset,
       continue;
     }
     if (written < 0 && errno == EINTR) continue;
-    *error = written == 0 ? EIO : errno;
+    error = written == 0 ? EIO : errno;
     return false;
   }
   return true;
 }
 
-bool Wal::PreadAll(uint8_t *out, size_t size, off_t offset, int *error) const {
+bool Wal::PreadAll(uint8_t *out, size_t size, off_t offset, int &error) const {
   while (size != 0) {
     const ssize_t got = io_.pread(fd_, out, size, offset);
     if (got > 0) {
@@ -268,7 +268,7 @@ bool Wal::PreadAll(uint8_t *out, size_t size, off_t offset, int *error) const {
     if (got < 0 && errno == EINTR) continue;
     // A short read below the size fstat reported means the file changed
     // under the reader, which this design does not allow.
-    *error = got == 0 ? EIO : errno;
+    error = got == 0 ? EIO : errno;
     return false;
   }
   return true;
@@ -280,7 +280,7 @@ bool Wal::PreadAll(uint8_t *out, size_t size, off_t offset, int *error) const {
 // mark a region that holds no frame, which is what lets the scan find the
 // end of the log. Both capacity initialisation and tail repair are this
 // one operation.
-bool Wal::WriteZeroesAndSync(off_t from, off_t to, int *error) {
+bool Wal::WriteZeroesAndSync(off_t from, off_t to, int &error) {
   if (to <= from) return true;
 
   constexpr size_t kChunkSize = 1ull << 20;
@@ -300,7 +300,7 @@ bool Wal::WriteZeroesAndSync(off_t from, off_t to, int *error) {
         continue;
       }
       if (written < 0 && errno == EINTR) continue;
-      *error = written == 0 ? EIO : errno;
+      error = written == 0 ? EIO : errno;
       return false;
     }
   }
@@ -308,7 +308,7 @@ bool Wal::WriteZeroesAndSync(off_t from, off_t to, int *error) {
   // The size and the blocks have to reach the device here, so that none of
   // this initialisation work lands on a group's own fdatasync.
   if (Fsync(fd_) != 0) {
-    *error = errno;
+    error = errno;
     return false;
   }
   return true;
@@ -316,11 +316,11 @@ bool Wal::WriteZeroesAndSync(off_t from, off_t to, int *error) {
 
 // Reports the offset of the last byte in `[from, to)` that is not zero, or
 // `from - 1` when every byte is.
-bool Wal::FindLastNonZero(off_t from, off_t to, off_t *last_non_zero,
-                          int *error) const {
+bool Wal::FindLastNonZero(off_t from, off_t to, off_t &last_non_zero,
+                          int &error) const {
   constexpr size_t kChunkSize = 1ull << 20;
   std::vector<uint8_t> chunk(kChunkSize);
-  *last_non_zero = from - 1;
+  last_non_zero = from - 1;
 
   for (off_t at = from; at < to; at += kChunkSize) {
     const size_t size =
@@ -328,7 +328,7 @@ bool Wal::FindLastNonZero(off_t from, off_t to, off_t *last_non_zero,
     if (!PreadAll(chunk.data(), size, at, error)) return false;
     for (size_t i = size; i > 0; --i) {
       if (chunk[i - 1] != 0) {
-        *last_non_zero = at + static_cast<off_t>(i) - 1;
+        last_non_zero = at + static_cast<off_t>(i) - 1;
         break;
       }
     }
@@ -336,12 +336,12 @@ bool Wal::FindLastNonZero(off_t from, off_t to, off_t *last_non_zero,
   return true;
 }
 
-bool Wal::EnsureCapacityFor(off_t end_of_log, size_t group_size, int *error) {
+bool Wal::EnsureCapacityFor(off_t end_of_log, size_t group_size, int &error) {
   const uint64_t limit =
       static_cast<uint64_t>(std::numeric_limits<off_t>::max());
   if (static_cast<uint64_t>(group_size) >
       limit - static_cast<uint64_t>(end_of_log)) {
-    *error = EFBIG;
+    error = EFBIG;
     return false;
   }
   // Without preallocation the group's own write is what extends the file,
@@ -363,7 +363,7 @@ bool Wal::EnsureCapacityFor(off_t end_of_log, size_t group_size, int *error) {
       1, needed / initial_capacity_bytes_ +
              (needed % initial_capacity_bytes_ != 0 ? 1 : 0));
   if (units > limit / initial_capacity_bytes_) {
-    *error = EFBIG;
+    error = EFBIG;
     return false;
   }
   const uint64_t target = units * initial_capacity_bytes_;
@@ -381,7 +381,7 @@ bool Wal::EnsureCapacityFor(off_t end_of_log, size_t group_size, int *error) {
 // last step of a successful scan, after which groups may be written.
 WalScanResult Wal::FinishScan(WalScanResult &&result, off_t end_of_log) {
   int error = 0;
-  if (!EnsureCapacityFor(end_of_log, 0, &error)) {
+  if (!EnsureCapacityFor(end_of_log, 0, error)) {
     return IoFailure("initialise the capacity of " + path_, error);
   }
   // Published together with Ready: a scan that could not finish leaves no
@@ -429,7 +429,7 @@ WalScanResult Wal::Scan(EpochNumber min_epoch) {
         break;
       }
       uint8_t header[kHeaderSize];
-      if (!PreadAll(header, kHeaderSize, offset, &error)) {
+      if (!PreadAll(header, kHeaderSize, offset, error)) {
         return IoFailure("pread header of " + path_, error);
       }
       const uint32_t magic = GetLe32(header);
@@ -468,8 +468,7 @@ WalScanResult Wal::Scan(EpochNumber min_epoch) {
     if (!retry_full_scan && have_frame) {
       std::vector<uint8_t> payload(boundary_payload_size);
       if (!PreadAll(payload.data(), boundary_payload_size,
-                    boundary_offset + static_cast<off_t>(kHeaderSize),
-                    &error)) {
+                    boundary_offset + static_cast<off_t>(kHeaderSize), error)) {
         return IoFailure("pread payload of " + path_, error);
       }
       Crc32c crc;
@@ -505,7 +504,7 @@ WalScanResult Wal::Scan(EpochNumber min_epoch) {
       break;
     }
     int error = 0;
-    if (!PreadAll(header, kHeaderSize, offset, &error)) {
+    if (!PreadAll(header, kHeaderSize, offset, error)) {
       return IoFailure("pread header of " + path_, error);
     }
 
@@ -537,7 +536,7 @@ WalScanResult Wal::Scan(EpochNumber min_epoch) {
     // Read the payload and verify the frame's checksum and epoch.
     payload.resize(payload_size);
     if (payload_size != 0 &&
-        !PreadAll(payload.data(), payload_size, offset + kHeaderSize, &error)) {
+        !PreadAll(payload.data(), payload_size, offset + kHeaderSize, error)) {
       return IoFailure("pread payload of " + path_, error);
     }
 
@@ -613,11 +612,11 @@ WalScanResult Wal::Scan(EpochNumber min_epoch) {
   if (!stop_reason.empty()) {
     int error = 0;
     off_t last_non_zero = 0;
-    if (!FindLastNonZero(offset, file_size, &last_non_zero, &error)) {
+    if (!FindLastNonZero(offset, file_size, last_non_zero, error)) {
       return IoFailure("pread the tail of " + path_, error);
     }
     if (last_non_zero >= offset) {
-      if (!WriteZeroesAndSync(offset, last_non_zero + 1, &error)) {
+      if (!WriteZeroesAndSync(offset, last_non_zero + 1, error)) {
         return IoFailure("zero the tail of " + path_, error);
       }
       SPDLOG_WARN(
@@ -697,7 +696,7 @@ WalAppendResult Wal::AppendGroup(
   // Extend the zeroed region if the group does not fit.
   int error = 0;
   const off_t initialised_before = initialised_size_;
-  if (!EnsureCapacityFor(write_offset_, group.size(), &error)) {
+  if (!EnsureCapacityFor(write_offset_, group.size(), error)) {
     state_ = State::kFailed;
     return {false, error};
   }
@@ -709,7 +708,7 @@ WalAppendResult Wal::AppendGroup(
 
   // Write, fdatasync, then publish the offset and the last epoch.
   const int64_t write_begin = traced ? FlushTrace::Now() : 0;
-  if (!WriteAllAt(group.data(), group.size(), write_offset_, &error)) {
+  if (!WriteAllAt(group.data(), group.size(), write_offset_, error)) {
     state_ = State::kFailed;
     return {false, error};
   }

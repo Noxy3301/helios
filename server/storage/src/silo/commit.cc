@@ -21,6 +21,7 @@
 #include "index/primary_index.h"
 #include "index/reaper.h"
 #include "index/secondary_index.h"
+#include "pax/table.h"
 #include "pax/version_store.h"
 #include "silo/packed_transaction_id.h"
 #include "silo/stable_read.h"
@@ -49,7 +50,7 @@ struct WriteEntry {
   std::string table_name;
   std::string key;
   // Into the payload the caller submitted, which outlives this attempt.
-  std::string_view value;
+  const pax::Row *value = nullptr;
   bool is_delete = false;
   DataItem *item = nullptr;
   index::PrimaryIndex *index = nullptr;
@@ -94,7 +95,7 @@ struct CommitCtx {
   TableDictionary &tables;
   epoch::Framework &epoch;
   const CommitPayload &payload;
-  std::string *abort_reason;
+  std::string &abort_reason;
 
   std::vector<ReadEntry> reads;
   std::vector<WriteEntry> writes;
@@ -108,14 +109,14 @@ struct CommitCtx {
 
   // Abort before the lock loop: nothing to release.
   bool Abort(const std::string &reason) {
-    if (abort_reason != nullptr) *abort_reason = reason;
+    abort_reason = reason;
     epoch.Leave();
     return false;
   }
 
   // Abort after the lock loop: release every lock this attempt took.
   bool AbortLocked(const std::string &reason) {
-    if (abort_reason != nullptr) *abort_reason = reason;
+    abort_reason = reason;
     for (auto &entry : locked) {
       TransactionId current = entry.item->transaction_id.load();
       if (current.tid & kLockBit) {
@@ -183,6 +184,8 @@ bool Resolve(CommitCtx &ctx, std::shared_mutex &schema_mutex) {
       return ctx.Abort("write_table_missing");
     }
 
+    if (table->GetPaxTable() == nullptr) return ctx.Abort("pax_schema_missing");
+
     DataItem *item = table->GetPrimaryIndex().GetOrInsert(write.key);
     assert(item != nullptr);  // GetOrInsert materializes an absent slot
 
@@ -190,7 +193,8 @@ bool Resolve(CommitCtx &ctx, std::shared_mutex &schema_mutex) {
     // live is a duplicate the committed state cannot excuse.
     bool check_committed_row = false;
     if (ctx.has_insert) {
-      const std::string request_key = write.table_name + '\0' + write.key;
+      const std::string request_key =
+          std::string(write.table_name) + '\0' + std::string(write.key);
       auto live_it = live_in_request.find(request_key);
       if (write.op == RowOp::kInsert) {
         if (live_it == live_in_request.end()) {
@@ -203,11 +207,12 @@ bool Resolve(CommitCtx &ctx, std::shared_mutex &schema_mutex) {
     }
 
     auto *primary_index = &table->GetPrimaryIndex();
-    ctx.writes.push_back({write.table_name, write.key, write.value,
-                          write.op == RowOp::kDelete, item, primary_index,
-                          check_committed_row});
+    ctx.writes.push_back({std::string(write.table_name), std::string(write.key),
+                          &write.value, write.op == RowOp::kDelete, item,
+                          primary_index, check_committed_row});
     ctx.items.push_back(item);
-    ctx.targets.push_back({item, primary_index, nullptr, write.key});
+    ctx.targets.push_back(
+        {item, primary_index, nullptr, std::string(write.key)});
   }
 
   // Resolve secondary-index updates to the secondary-index entries to lock
@@ -217,6 +222,8 @@ bool Resolve(CommitCtx &ctx, std::shared_mutex &schema_mutex) {
     if (table == nullptr) {
       return ctx.Abort("si_table_missing");
     }
+
+    if (table->GetPaxTable() == nullptr) return ctx.Abort("pax_schema_missing");
 
     index::SecondaryIndex *index = table->GetSecondaryIndex(op.index_name);
     if (index == nullptr) {
@@ -535,32 +542,27 @@ bool ValidateUnique(CommitCtx &ctx) {
   return true;
 }
 
-// Phase 3.1: install row writes/deletes and SI add/remove. Deletes leave
-// tombstones in the tree; physical removal is deferred until a later epoch so
-// same-key reinserts reuse the slot and advance its TID chain.
-void Install(CommitCtx &ctx) {
+// Phase 3.1: apply row and secondary-index changes.
+// Deleted entries remain as tombstones until a later epoch reclaims them.
+void ApplyWrites(CommitCtx &ctx) {
   {
-    // Tags the install region with the commit epoch so the PAX
-    // before-image capture can label its entries.
+    // Label captured before-images with this transaction's commit epoch.
     pax::ScopedCommitEpoch commit_epoch_scope(ctx.epoch.ThreadEpoch());
-    size_t installed = 0;
+    size_t applied = 0;
     for (auto &write : ctx.writes) {
-      if (installed > 0) {
+      if (applied > 0) {
         HELIOS_DEBUG_SYNC("silo_commit.between_row_installs");
       }
       if (write.is_delete) {
-        write.item->Reset(nullptr, 0);
+        write.item->Delete();
       } else {
-        write.item->Reset(
-            reinterpret_cast<const std::byte *>(write.value.data()),
-            write.value.size());
+        write.item->Write(*write.value);
       }
-      ++installed;
+      ++applied;
     }
   }
 
-  // Install secondary-index add/remove. Empty SI slots are tombstones too;
-  // their physical removal is deferred with primary rows.
+  // Apply secondary-index changes; defer removal of empty entries.
   for (auto &op : ctx.si_ops) {
     const auto *primary_key =
         reinterpret_cast<const std::byte *>(op.primary_key.data());
@@ -574,7 +576,7 @@ void Install(CommitCtx &ctx) {
   // Capture SI tombstone state while the slots are still locked. The live
   // primary-key list pointer must not be read after unlock: a concurrent
   // committer can publish a replacement under its own lock.
-  // Computed after the whole install loop so a delete-then-add sequence on
+  // Computed after the whole update loop so a delete-then-add sequence on
   // the same slot within this transaction reads the final state.
   for (const auto &op : ctx.si_ops) {
     if (!op.is_delete) continue;
@@ -592,13 +594,14 @@ wal::WriteSet BuildLog(CommitCtx &ctx) {
   for (const auto &write : ctx.writes) {
     wal::LogEntry entry(write.key, nullptr, 0, write.item, write.table_name,
                         "");
-    entry.data_item_copy = *write.item;
+    entry.value = write.item->CopyValue();
+    entry.tid = write.item->transaction_id.load();
     log_set.emplace_back(std::move(entry));
   }
   for (const auto &op : ctx.si_ops) {
     wal::LogEntry entry(op.secondary_key, nullptr, 0, op.item, op.table_name,
                         op.index_name, {}, op.index_type);
-    entry.data_item_copy = *op.item;
+    entry.tid = op.item->transaction_id.load();
     entry.RecordSecondaryDelta(op.primary_key,
                                op.is_delete ? wal::SecondaryIndexOp::kDelete
                                             : wal::SecondaryIndexOp::kInsert);
@@ -635,7 +638,7 @@ void Publish(CommitCtx &ctx, index::Reaper &reaper, wal::WriteSet &log_set) {
   for (auto &entry : log_set) {
     const auto tid_it = published.find(entry.item);
     if (tid_it == published.end()) continue;
-    entry.data_item_copy.transaction_id.store(tid_it->second);
+    entry.tid = tid_it->second;
   }
 
   // Register slots left empty by this transaction for deferred physical
@@ -680,17 +683,15 @@ bool EnqueueLogSet(wal::Logger &logger, wal::WriteSet &log_set,
 bool Commit(TableDictionary &tables, std::shared_mutex &schema_mutex,
             epoch::Framework &epoch_framework, index::Reaper &reaper,
             wal::Logger &logger, const CommitPayload &payload,
-            CommitDurability durability, std::string *abort_reason) {
+            CommitDurability durability, std::string &abort_reason) {
   CommitCtx ctx{tables, epoch_framework, payload, abort_reason};
 
   // Epoch join.
   epoch_framework.Join();
-  if (abort_reason != nullptr) abort_reason->clear();
 
-  ctx.has_insert = std::any_of(payload.writes.begin(), payload.writes.end(),
-                               [](const ExternalWriteEntry &entry) {
-                                 return entry.op == RowOp::kInsert;
-                               });
+  ctx.has_insert = std::any_of(
+      payload.writes.begin(), payload.writes.end(),
+      [](const Write &entry) { return entry.op == RowOp::kInsert; });
 
   // A range entry without its exclusive end bound cannot be replayed;
   // abort instead of skipping the validation.
@@ -723,7 +724,14 @@ bool Commit(TableDictionary &tables, std::shared_mutex &schema_mutex,
   if (!ValidateInserts(ctx)) return false;
   if (!ValidateUnique(ctx)) return false;
 
-  Install(ctx);
+  // Reserve all destinations before changing the first stored value.
+  for (const auto &write : ctx.writes) {
+    if (!write.is_delete && !write.item->AllocateSlot()) {
+      return ctx.AbortLocked("pax_slots_exhausted");
+    }
+  }
+
+  ApplyWrites(ctx);
   wal::WriteSet log_set = BuildLog(ctx);
   Publish(ctx, reaper, log_set);
   const bool awaits_durability =

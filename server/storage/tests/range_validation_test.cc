@@ -8,6 +8,7 @@
 #include <string>
 #include <vector>
 
+#include "db_helper.h"
 #include "gtest/gtest.h"
 #include "storage/config.h"
 #include "storage/database.h"
@@ -29,8 +30,8 @@ bool CommitWrite(helios::storage::Database &db, const std::string &key,
                  const std::string &value) {
   std::string reason;
   const bool committed =
-      db.Commit({}, {{kTable, key, value}}, {}, {},
-                helios::storage::CommitDurability::kSync, &reason);
+      db.Commit({}, {{kTable, key, TestHelper::Row(value)}}, {}, {},
+                helios::storage::CommitDurability::kSync, reason);
   db.ReleaseThreadEpoch();
   EXPECT_TRUE(committed) << "write " << key << " aborted: " << reason;
   return committed;
@@ -40,7 +41,7 @@ bool CommitDelete(helios::storage::Database &db, const std::string &key) {
   std::string reason;
   const bool committed =
       db.Commit({}, {{kTable, key, "", helios::storage::RowOp::kDelete}}, {},
-                {}, helios::storage::CommitDurability::kSync, &reason);
+                {}, helios::storage::CommitDurability::kSync, reason);
   db.ReleaseThreadEpoch();
   EXPECT_TRUE(committed) << "delete " << key << " aborted: " << reason;
   return committed;
@@ -73,7 +74,7 @@ helios::storage::ExternalRangeReadEntry ScanRange(helios::storage::Database &db,
 
 bool Revalidate(helios::storage::Database &db,
                 const helios::storage::ExternalRangeReadEntry &range,
-                std::string *reason) {
+                std::string &reason) {
   const bool committed = db.Commit(
       {}, {}, {}, {range}, helios::storage::CommitDurability::kSync, reason);
   db.ReleaseThreadEpoch();
@@ -90,9 +91,9 @@ void SeedRows(helios::storage::Database &db) {
 // the slot before validation runs, and an aborted commit leaves it behind.
 void LeaveAbsentSlot(helios::storage::Database &db, const std::string &key) {
   std::string reason;
-  const bool committed =
-      db.Commit({{kTable, "k1", 0, true}}, {{kTable, key, "v"}}, {}, {},
-                helios::storage::CommitDurability::kSync, &reason);
+  const bool committed = db.Commit(
+      {{kTable, "k1", 0, true}}, {{kTable, key, TestHelper::Row("v")}}, {}, {},
+      helios::storage::CommitDurability::kSync, reason);
   db.ReleaseThreadEpoch();
   ASSERT_FALSE(committed) << "the write was supposed to abort";
   EXPECT_FALSE(reason.empty()) << "an abort names its reason";
@@ -103,7 +104,7 @@ void LeaveAbsentSlot(helios::storage::Database &db, const std::string &key) {
 TEST(RangeValidationTest, AnUnchangedRangeCommits) {
   auto config = MakeConfig();
   helios::storage::Database db(config);
-  ASSERT_TRUE(db.CreateTable(kTable));
+  ASSERT_TRUE(TestHelper::CreateTable(db, kTable));
   SeedRows(db);
 
   const auto range = ScanRange(db, "k1", "k5");
@@ -111,20 +112,20 @@ TEST(RangeValidationTest, AnUnchangedRangeCommits) {
             (std::vector<std::string>{"k1", "k2", "k3", "k4"}));
 
   std::string reason;
-  EXPECT_TRUE(Revalidate(db, range, &reason)) << reason;
+  EXPECT_TRUE(Revalidate(db, range, reason)) << reason;
 }
 
 TEST(RangeValidationTest, ARowDeletedInsideTheRangeAborts) {
   auto config = MakeConfig();
   helios::storage::Database db(config);
-  ASSERT_TRUE(db.CreateTable(kTable));
+  ASSERT_TRUE(TestHelper::CreateTable(db, kTable));
   SeedRows(db);
 
   const auto range = ScanRange(db, "k1", "k5");
   ASSERT_TRUE(CommitDelete(db, "k2"));
 
   std::string reason;
-  EXPECT_FALSE(Revalidate(db, range, &reason));
+  EXPECT_FALSE(Revalidate(db, range, reason));
   EXPECT_EQ(reason, "primary_range_result_changed");
 }
 
@@ -133,28 +134,28 @@ TEST(RangeValidationTest, ARowDeletedAtTheEndOfTheRangeAborts) {
   // positionally and only the length check rejects it.
   auto config = MakeConfig();
   helios::storage::Database db(config);
-  ASSERT_TRUE(db.CreateTable(kTable));
+  ASSERT_TRUE(TestHelper::CreateTable(db, kTable));
   SeedRows(db);
 
   const auto range = ScanRange(db, "k1", "k5");
   ASSERT_TRUE(CommitDelete(db, "k4"));
 
   std::string reason;
-  EXPECT_FALSE(Revalidate(db, range, &reason));
+  EXPECT_FALSE(Revalidate(db, range, reason));
   EXPECT_EQ(reason, "primary_range_result_changed");
 }
 
 TEST(RangeValidationTest, ARowInsertedInsideTheRangeAborts) {
   auto config = MakeConfig();
   helios::storage::Database db(config);
-  ASSERT_TRUE(db.CreateTable(kTable));
+  ASSERT_TRUE(TestHelper::CreateTable(db, kTable));
   SeedRows(db);
 
   const auto range = ScanRange(db, "k1", "k5");
   ASSERT_TRUE(CommitWrite(db, "k25", "v"));
 
   std::string reason;
-  EXPECT_FALSE(Revalidate(db, range, &reason));
+  EXPECT_FALSE(Revalidate(db, range, reason));
   EXPECT_EQ(reason, "primary_range_result_changed");
 }
 
@@ -163,21 +164,21 @@ TEST(RangeValidationTest, ARowInsertedAtTheEndOfTheRangeAborts) {
   // first live row past the evidence.
   auto config = MakeConfig();
   helios::storage::Database db(config);
-  ASSERT_TRUE(db.CreateTable(kTable));
+  ASSERT_TRUE(TestHelper::CreateTable(db, kTable));
   SeedRows(db);
 
   const auto range = ScanRange(db, "k1", "k5");
   ASSERT_TRUE(CommitWrite(db, "k45", "v"));
 
   std::string reason;
-  EXPECT_FALSE(Revalidate(db, range, &reason));
+  EXPECT_FALSE(Revalidate(db, range, reason));
   EXPECT_EQ(reason, "primary_range_result_changed");
 }
 
 TEST(RangeValidationTest, ALimitedRangeIgnoresChangesPastItsCap) {
   auto config = MakeConfig();
   helios::storage::Database db(config);
-  ASSERT_TRUE(db.CreateTable(kTable));
+  ASSERT_TRUE(TestHelper::CreateTable(db, kTable));
   SeedRows(db);
 
   const auto range = ScanRange(db, "k1", "k5", 2);
@@ -185,7 +186,7 @@ TEST(RangeValidationTest, ALimitedRangeIgnoresChangesPastItsCap) {
   ASSERT_TRUE(CommitWrite(db, "k45", "v"));
 
   std::string reason;
-  EXPECT_TRUE(Revalidate(db, range, &reason)) << reason;
+  EXPECT_TRUE(Revalidate(db, range, reason)) << reason;
 }
 
 TEST(RangeValidationTest, AnAbsentSlotDoesNotConsumeTheCap) {
@@ -193,7 +194,7 @@ TEST(RangeValidationTest, AnAbsentSlotDoesNotConsumeTheCap) {
   // leave the replay room to reach the second.
   auto config = MakeConfig();
   helios::storage::Database db(config);
-  ASSERT_TRUE(db.CreateTable(kTable));
+  ASSERT_TRUE(TestHelper::CreateTable(db, kTable));
   SeedRows(db);
   LeaveAbsentSlot(db, "k15");
 
@@ -201,26 +202,26 @@ TEST(RangeValidationTest, AnAbsentSlotDoesNotConsumeTheCap) {
   ASSERT_EQ(range.result_keys, (std::vector<std::string>{"k1", "k2"}));
 
   std::string reason;
-  EXPECT_TRUE(Revalidate(db, range, &reason)) << reason;
+  EXPECT_TRUE(Revalidate(db, range, reason)) << reason;
 }
 
 TEST(RangeValidationTest, AnEmptyRangeCommits) {
   auto config = MakeConfig();
   helios::storage::Database db(config);
-  ASSERT_TRUE(db.CreateTable(kTable));
+  ASSERT_TRUE(TestHelper::CreateTable(db, kTable));
   SeedRows(db);
 
   const auto range = ScanRange(db, "m1", "m9");
   ASSERT_TRUE(range.result_keys.empty());
 
   std::string reason;
-  EXPECT_TRUE(Revalidate(db, range, &reason)) << reason;
+  EXPECT_TRUE(Revalidate(db, range, reason)) << reason;
 }
 
 TEST(RangeValidationTest, ARowAppearingInAnEmptyRangeAborts) {
   auto config = MakeConfig();
   helios::storage::Database db(config);
-  ASSERT_TRUE(db.CreateTable(kTable));
+  ASSERT_TRUE(TestHelper::CreateTable(db, kTable));
   SeedRows(db);
 
   const auto range = ScanRange(db, "m1", "m9");
@@ -228,7 +229,7 @@ TEST(RangeValidationTest, ARowAppearingInAnEmptyRangeAborts) {
   ASSERT_TRUE(CommitWrite(db, "m5", "v"));
 
   std::string reason;
-  EXPECT_FALSE(Revalidate(db, range, &reason));
+  EXPECT_FALSE(Revalidate(db, range, reason));
   EXPECT_EQ(reason, "primary_range_result_changed");
 }
 
@@ -237,21 +238,21 @@ TEST(RangeValidationTest, EvidenceRepeatingAKeyAborts) {
   // is rejected rather than matched by the positional walk.
   auto config = MakeConfig();
   helios::storage::Database db(config);
-  ASSERT_TRUE(db.CreateTable(kTable));
+  ASSERT_TRUE(TestHelper::CreateTable(db, kTable));
   SeedRows(db);
 
   auto range = ScanRange(db, "k1", "k5");
   range.result_keys.insert(range.result_keys.begin(), "k1");
 
   std::string reason;
-  EXPECT_FALSE(Revalidate(db, range, &reason));
+  EXPECT_FALSE(Revalidate(db, range, reason));
   EXPECT_EQ(reason, "primary_range_result_changed");
 }
 
 TEST(RangeValidationTest, AReverseRangeAbortsOnTheSameChange) {
   auto config = MakeConfig();
   helios::storage::Database db(config);
-  ASSERT_TRUE(db.CreateTable(kTable));
+  ASSERT_TRUE(TestHelper::CreateTable(db, kTable));
   SeedRows(db);
 
   const auto range = ScanRange(db, "k1", "k5", 0, true);
@@ -260,6 +261,6 @@ TEST(RangeValidationTest, AReverseRangeAbortsOnTheSameChange) {
   ASSERT_TRUE(CommitDelete(db, "k2"));
 
   std::string reason;
-  EXPECT_FALSE(Revalidate(db, range, &reason));
+  EXPECT_FALSE(Revalidate(db, range, reason));
   EXPECT_EQ(reason, "primary_range_result_changed");
 }

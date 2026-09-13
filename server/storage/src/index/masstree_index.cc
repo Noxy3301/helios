@@ -224,24 +224,19 @@ struct MasstreeIndex::Impl {
     return nullptr;
   }
 
-  // Absent rows created after SetPaxTable are initialized in PAX mode so their
-  // first committed payload scatters into the table's strips.
+  // The primary index binds its table here; secondary indexes hold only key
+  // lists.
   pax::PaxTable *pax_table_ = nullptr;
-  DataItem *NewAbsentItem() {
-    auto *item = new DataItem();
-    if (pax_table_ != nullptr) item->buffer.InitPaxAbsent(pax_table_);
-    return item;
-  }
 
   // Upsert with a freshly-allocated DataItem.
   void Put(std::string_view key, DataItem &&value) {
     ensure_thread_active();
-    auto *fresh = new DataItem(std::move(value));
+    auto *item = new DataItem(std::move(value));
     cursor_type lp(table_, key.data(), key.size());
     bool found = lp.find_insert(*tls_ti);
     // On an overwrite the previous DataItem is leaked: a concurrent reader
     // may still hold the raw pointer Get() returned.
-    lp.value() = fresh;  // FIXME: retire the old item through RCU
+    lp.value() = item;  // FIXME: retire the old item through RCU
     fence();
     // 1 means structural insert (bumps the leaf's vinsert counter), 0 means in-place
     // overwrite. Claiming an insert on overwrite would falsely trigger phantom
@@ -289,7 +284,11 @@ struct MasstreeIndex::Impl {
     cursor_type lp(table_, key.data(), key.size());
     bool found = lp.find_insert(*tls_ti);
     if (!found) {
-      lp.value() = NewAbsentItem();
+      if (pax_table_ != nullptr) {
+        lp.value() = new DataItem(*pax_table_);
+      } else {
+        lp.value() = new DataItem();
+      }
     }
     fence();
     lp.finish(found ? 0 : 1, *tls_ti);

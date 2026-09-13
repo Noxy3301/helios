@@ -52,7 +52,7 @@ class DurabilityTest : public ::testing::Test {
     std::filesystem::remove_all(config_.work_dir);
     config_.enable_recovery = true;
     db_ = std::make_unique<helios::storage::Database>(config_);
-    ASSERT_TRUE(db_->CreateTable(kTable));
+    ASSERT_TRUE(TestHelper::CreateTable(*db_, kTable));
   }
 };
 
@@ -136,7 +136,7 @@ TEST_F(DurabilityTest, RecoveryWithNamedTable) {
   const int value = 12345;
 
   // 1. Create a table and write to it
-  ASSERT_TRUE(db_->CreateTable(table_name));
+  ASSERT_TRUE(TestHelper::CreateTable(*db_, table_name));
   ASSERT_TRUE(TestHelper::Write<int>(*db_, table_name, key, value));
 
   // 2. Restart DB to trigger recovery
@@ -164,13 +164,15 @@ TEST(CommitDurabilityTest, AsyncDoesNotWaitForTheDevice) {
 
   {
     helios::storage::Database db(config);
-    ASSERT_TRUE(db.CreateTable(kTable));
+    ASSERT_TRUE(TestHelper::CreateTable(db, kTable));
 
     const auto commit = [&db](const std::string &key,
                               helios::storage::CommitDurability durability) {
+      std::string commit_reason;
       const auto started = std::chrono::steady_clock::now();
       const bool committed =
-          db.Commit({}, {{kTable, key, "v"}}, {}, {}, durability, nullptr);
+          db.Commit({}, {{kTable, key, TestHelper::Row("v")}}, {}, {},
+                    durability, commit_reason);
       db.ReleaseThreadEpoch();
       EXPECT_TRUE(committed);
       return std::chrono::duration_cast<std::chrono::milliseconds>(

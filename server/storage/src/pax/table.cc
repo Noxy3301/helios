@@ -19,48 +19,44 @@ namespace pax {
 namespace {
 
 // ---------------------------------------------------------------------------
-// Row format. helios::row (common/pack/row.h) owns it: a field is one width
-// byte, that many little-endian length bytes, then the payload, and the width
-// byte 0xFF marks a NULL field. This file reads and writes the same shape
-// without depending on that header, because the strips store the payloads
-// alone.
+// Row bytes follow proxy/lineairdb_field.cc: a width byte, that many
+// little-endian length bytes, then the payload. Width 0xFF marks an empty
+// field; the first field carries the row's SQL NULL flags.
 //
-// Typed cells. A typed field's ASCII is parsed into a fixed-width LE binary at
-// scatter time and reformatted at gather time. The round trip is
-// byte-identical except in one case the query layer does not produce: a field
-// written with width byte 0x00 comes back as the 0xFF marker. Any parse or
-// range failure returns false so the row overflows to the heap.
+// DecodeRow converts typed fields from text to fixed-width binary values.
+// ScatterRow copies those values into PAX; GatherRow restores the input bytes.
+// Values are rejected if parsing fails, they exceed the supported range, or
+// gathering would change their bytes.
 // ---------------------------------------------------------------------------
 
 // int64 from a full ASCII integer (from_chars, whole span consumed).
-inline bool ParseI64(const char *s, size_t len, int64_t *out) {
+inline bool ParseI64(const char *s, size_t len, int64_t &out) {
   if (len == 0) return false;
-  const auto res = std::from_chars(s, s + len, *out);
+  const auto res = std::from_chars(s, s + len, out);
   return res.ec == std::errc() && res.ptr == s + len;
 }
 
 // "YYYY-MM-DD" -> YYYYMMDD (fits int32; `string order == int order`).
-inline bool ParseDate(const char *s, size_t len, int64_t *out) {
+inline bool ParseDate(const char *s, size_t len, int64_t &out) {
   if (len != 10 || s[4] != '-' || s[7] != '-') return false;
   int64_t y = 0, m = 0, d = 0;
-  auto digs = [](const char *p, int n, int64_t *o) {
+  auto digs = [](const char *p, int n, int64_t &o) {
     for (int i = 0; i < n; i++) {
       if (p[i] < '0' || p[i] > '9') return false;
-      *o = *o * 10 + (p[i] - '0');
+      o = o * 10 + (p[i] - '0');
     }
     return true;
   };
-  if (!digs(s, 4, &y) || !digs(s + 5, 2, &m) || !digs(s + 8, 2, &d))
-    return false;
-  *out = y * 10000 + m * 100 + d;
+  if (!digs(s, 4, y) || !digs(s + 5, 2, m) || !digs(s + 8, 2, d)) return false;
+  out = y * 10000 + m * 100 + d;
   return true;
 }
 
 // Exact DECIMAL(p,s) val_str -> scaled int64 (`value * 10^scale`). The input has
 // the column's declared scale of fractional digits (MySQL pads), so scaling is
 // exact and no double is involved.
-inline bool ParseDecScaled(const char *s, size_t len, int scale, int64_t *out) {
-  if (len == 0) return false;
+inline bool ParseDecScaled(const char *s, size_t len, int scale, int64_t &out) {
+  if (len == 0 || scale < 0 || scale > 18) return false;
   size_t i = 0;
   bool neg = false;
   if (s[0] == '-') {
@@ -80,52 +76,49 @@ inline bool ParseDecScaled(const char *s, size_t len, int scale, int64_t *out) {
       continue;
     }
     if (c < '0' || c > '9') return false;
+    const __int128 limit = static_cast<__int128>(INT64_MAX) + 1;
+    if (mant > (limit - (c - '0')) / 10) return false;
     mant = mant * 10 + (c - '0');
     if (seen_dot) frac_digits++;
     any = true;
   }
   if (!any) return false;
-  // Normalize to the declared scale: val_str emits exactly `scale` fractional
-  // digits, fewer are padded, and more are refused rather than rounded.
-  if (frac_digits > scale) return false;
-  while (frac_digits < scale) {
-    mant *= 10;
-    frac_digits++;
-  }
+  // A different scale would change the bytes and size when gathered.
+  if (frac_digits != scale) return false;
   if (neg) mant = -mant;
   if (mant > INT64_MAX || mant < INT64_MIN) return false;
-  *out = static_cast<int64_t>(mant);
+  out = static_cast<int64_t>(mant);
   return true;
 }
 
-// Parse one field's ASCII into the low bytes of *out. Returns false on any
-// failure, and the caller overflows the row to the heap.
+// Parse one field's ASCII into the low bytes of out. Returns false on any
+// failure, so commit can reject the value before installing any write.
 inline bool ParseTyped(FieldType type, int scale, const std::byte *payload,
-                       uint32_t len, uint64_t *out) {
+                       uint32_t len, uint64_t &out) {
   const char *s = reinterpret_cast<const char *>(payload);
   switch (type) {
     case FieldType::kInt32: {
       int64_t v;
-      if (!ParseI64(s, len, &v) || v < INT32_MIN || v > INT32_MAX) return false;
-      *out = static_cast<uint64_t>(v);
+      if (!ParseI64(s, len, v) || v < INT32_MIN || v > INT32_MAX) return false;
+      out = static_cast<uint64_t>(v);
       return true;
     }
     case FieldType::kInt64: {
       int64_t v;
-      if (!ParseI64(s, len, &v)) return false;
-      *out = static_cast<uint64_t>(v);
+      if (!ParseI64(s, len, v)) return false;
+      out = static_cast<uint64_t>(v);
       return true;
     }
     case FieldType::kDate: {
       int64_t ymd;
-      if (!ParseDate(s, len, &ymd)) return false;
-      *out = static_cast<uint64_t>(ymd);
+      if (!ParseDate(s, len, ymd)) return false;
+      out = static_cast<uint64_t>(ymd);
       return true;
     }
     case FieldType::kDecimal64: {
       int64_t m;
-      if (!ParseDecScaled(s, len, scale, &m)) return false;
-      *out = static_cast<uint64_t>(m);
+      if (!ParseDecScaled(s, len, scale, m)) return false;
+      out = static_cast<uint64_t>(m);
       return true;
     }
     default:
@@ -240,12 +233,6 @@ void AppendField(std::string &out, std::string_view payload) {
   out.append(payload.data(), payload.size());
 }
 
-// Reference to one field payload inside a row.
-struct FieldRef {
-  const std::byte *payload;
-  uint32_t len;
-};
-
 /**
  * @brief Parses row bytes into per-field payload references.
  *
@@ -256,7 +243,7 @@ struct FieldRef {
  * @return Number of fields read, or `SIZE_MAX` when the input is malformed
  * or contains more than `max_fields` fields.
  */
-size_t UnpackRow(const std::byte *row, size_t size, FieldRef *out,
+size_t UnpackRow(const std::byte *row, size_t size, Row::Field *out,
                  size_t max_fields) {
   size_t off = 0;
   size_t n = 0;
@@ -272,6 +259,7 @@ size_t UnpackRow(const std::byte *row, size_t size, FieldRef *out,
                << (8 * i);
       }
       off += prefix;
+      if (len == 0 || prefix != LengthPrefixBytes(len)) return SIZE_MAX;
       if (off + len > size) return SIZE_MAX;
     }
     out[n].payload = row + off;
@@ -281,10 +269,42 @@ size_t UnpackRow(const std::byte *row, size_t size, FieldRef *out,
   }
   return (off == size) ? n : SIZE_MAX;
 }
+
 }  // namespace
 
-PaxGroup::PaxGroup(const TableSchema &schema, PaxTable *store)
-    : schema_(schema), table_(store) {
+bool DecodeRow(const TableSchema &schema, const std::byte *value, size_t size,
+               Row &out) {
+  const size_t fields = schema.field_count();
+  if (fields == 0) return false;
+  out.fields.resize(fields);
+  if (UnpackRow(value, size, out.fields.data(), fields) != fields) return false;
+
+  // Keep the conversion result so installation only copies prepared cells.
+  for (size_t f = 0; f < fields; ++f) {
+    auto &field = out.fields[f];
+    const FieldType type = schema.type_of(f);
+    if (type == FieldType::kUntyped) {
+      if (field.len > schema.field_max_bytes[f] || field.len > UINT16_MAX)
+        return false;
+    } else if (field.len != 0) {
+      if (!ParseTyped(type, schema.scale_of(f), field.payload, field.len,
+                      field.typed_value))
+        return false;
+      std::string restored;
+      FormatTyped(type, schema.scale_of(f),
+                  reinterpret_cast<const std::byte *>(&field.typed_value),
+                  schema.field_max_bytes[f], restored);
+      if (restored !=
+          std::string_view(reinterpret_cast<const char *>(field.payload),
+                           field.len))
+        return false;
+    }
+  }
+  out.size = size;
+  return true;
+}
+
+PaxGroup::PaxGroup(const TableSchema &schema) : schema_(schema) {
   const size_t fields = schema.field_count();
   stride_.resize(fields);
   strip_offset_.resize(fields);
@@ -300,51 +320,29 @@ PaxGroup::PaxGroup(const TableSchema &schema, PaxTable *store)
   visible_.reset(new std::atomic<uint64_t>[kRows / kVisibilityWordBits]());
 }
 
-bool PaxGroup::ScatterRow(uint32_t slot, const std::byte *row, size_t size) {
+void PaxGroup::ScatterRow(uint32_t slot, const Row &row) {
   assert(slot < kRows);
   const size_t fields = schema_.field_count();
-  // Stack refs keep typical rows allocation-free; an unusually wide table
-  // overflows its rows to the heap instead.
-  constexpr size_t kMaxFields = 512;
-  if (fields > kMaxFields) return false;
-  FieldRef refs[kMaxFields];
-  const size_t parsed = UnpackRow(row, size, refs, fields);
-  if (parsed != fields) return false;
-  // Validate every field before any cell write. UNTYPED fields must fit their
-  // cell width; typed non-null fields are parsed into a fixed-width LE binary
-  // scratch. Any failure overflows the row to the heap with the slot
-  // untouched.
-  uint64_t typed_bin[kMaxFields];  // low field_max_bytes[f] bytes = LE payload
+  assert(row.fields.size() == fields);
   for (size_t f = 0; f < fields; f++) {
-    const FieldType type = schema_.type_of(f);
-    if (type == FieldType::kUntyped) {
-      if (refs[f].len > schema_.field_max_bytes[f]) return false;
-      if (refs[f].len > 0xFFFF) return false;
-    } else if (refs[f].len != 0) {  // typed present value
-      if (!ParseTyped(type, schema_.scale_of(f), refs[f].payload, refs[f].len,
-                      &typed_bin[f]))
-        return false;
-    }
-  }
-  for (size_t f = 0; f < fields; f++) {
+    const auto &field = row.fields[f];
     std::byte *cell = arena_.get() + strip_offset_[f] +
                       static_cast<size_t>(stride_[f]) * slot;
     const FieldType type = schema_.type_of(f);
-    if (type != FieldType::kUntyped && refs[f].len != 0) {
+    if (type != FieldType::kUntyped && field.len != 0) {
       const uint16_t len = static_cast<uint16_t>(schema_.field_max_bytes[f]);
       std::memcpy(cell, &len, sizeof(len));
-      std::memcpy(cell + kCellLenBytes, &typed_bin[f], len);  // low `len` = LE
+      std::memcpy(cell + kCellLenBytes, &field.typed_value, len);
       continue;
     }
-    // UNTYPED, or a typed NULL (len 0): store verbatim (`0 => empty == NULL`).
-    const uint16_t len = static_cast<uint16_t>(refs[f].len);
+    // Untyped bytes and NULL markers need no numeric conversion.
+    const uint16_t len = static_cast<uint16_t>(field.len);
     std::memcpy(cell, &len, sizeof(len));
-    if (len > 0) std::memcpy(cell + kCellLenBytes, refs[f].payload, len);
+    if (len > 0) std::memcpy(cell + kCellLenBytes, field.payload, len);
   }
   // Publish this slot to strip-direct readers after the cells are written.
   visible_[slot / kVisibilityWordBits].fetch_or(
       uint64_t{1} << (slot % kVisibilityWordBits), std::memory_order_release);
-  return true;
 }
 
 void PaxGroup::RetireSlot(uint32_t slot) {
@@ -455,6 +453,10 @@ PaxTable::PaxTable(TableSchema schema) : schema_(std::move(schema)) {
   dir_.reset(new std::atomic<PaxGroup *>[kMaxGroups]());
 }
 
+PaxTable::~PaxTable() {
+  for (size_t i = 0; i < group_count(); ++i) delete group(i);
+}
+
 std::pair<PaxGroup *, uint32_t> PaxTable::AllocateSlot() {
   const uint64_t idx = next_slot_.fetch_add(1, std::memory_order_relaxed);
   const uint64_t group_idx = idx / PaxGroup::kRows;
@@ -464,7 +466,7 @@ std::pair<PaxGroup *, uint32_t> PaxTable::AllocateSlot() {
     std::lock_guard<std::mutex> lk(alloc_mutex_);
     grp = dir_[group_idx].load(std::memory_order_acquire);
     if (grp == nullptr) {
-      grp = new PaxGroup(schema_, this);
+      grp = new PaxGroup(schema_);
       dir_[group_idx].store(grp, std::memory_order_release);
     }
   }
@@ -481,9 +483,6 @@ uint64_t SlotsAllocated(const PaxTable *store) {
 
 size_t GroupCount(const PaxTable *store) { return store->group_count(); }
 
-uint64_t OverflowCount(const PaxTable *store) {
-  return store->overflow_count();
-}
 
 }  // namespace pax
 }  // namespace helios::storage

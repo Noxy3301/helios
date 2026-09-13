@@ -82,10 +82,8 @@ struct ScanPaxRow {
 /**
  * @brief Outcome of a PAX primary-index range scan.
  *
- * @details `ok == false` means the caller must use the materializing Scan
- * path instead. This happens when the end bound is empty, the table is
- * missing, it has no PAX table, or it contains rows that overflowed to the
- * heap.
+ * @details `ok == false` means the scan cannot run: the end bound is empty,
+ * the table is missing, or its PAX schema has not been installed.
  */
 struct ScanPaxResult {
   bool ok = false;

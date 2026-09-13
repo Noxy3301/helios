@@ -69,8 +69,7 @@ inline bool StableLive(const DataItem &item) {
  * ascending zero-based MySQL column numbers. nullptr selects all columns;
  * an empty list selects no data columns. Null flags are always retained.
  * @details PAX copies the selected columns and leaves empty markers in the
- * others. The current non-PAX path ignores the selection and copies the
- * whole value.
+ * others. Every stored value is read from its PAX slot.
  * @return The value and its TID, with `found == false` if the slot has no live
  * value.
  */
@@ -83,18 +82,12 @@ inline StableValue StableRead(
     const bool found = item.HasRow();
     std::string value;
     if (found) {
-      if (item.buffer.is_pax()) {
-        // Gather either all fields or the requested columns from PAX strips.
-        if (selected_columns == nullptr) {
-          value.resize(item.size());
-          item.buffer.GatherInto(reinterpret_cast<std::byte *>(value.data()));
-        } else {
-          item.buffer.pax_group()->GatherRowMasked(
-              item.buffer.pax_slot(), selected_columns->data(),
-              selected_columns->size(), value);
-        }
+      if (selected_columns == nullptr) {
+        value = item.CopyValue();
       } else {
-        value.assign(reinterpret_cast<const char *>(item.value()), item.size());
+        item.pax_group()->GatherRowMasked(item.pax_slot(),
+                                          selected_columns->data(),
+                                          selected_columns->size(), value);
       }
     }
 

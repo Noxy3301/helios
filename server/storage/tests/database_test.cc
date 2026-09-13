@@ -44,7 +44,7 @@ class DatabaseTest : public ::testing::Test {
     std::filesystem::remove_all(config_.work_dir);
     config_.epoch_duration_ms = 100;
     db_ = std::make_unique<helios::storage::Database>(config_);
-    ASSERT_TRUE(db_->CreateTable(kTable));
+    ASSERT_TRUE(TestHelper::CreateTable(*db_, kTable));
   }
 };
 
@@ -126,7 +126,10 @@ TEST_F(DatabaseTest, ThreadSafetyWrites) {
   }
 }
 
-TEST_F(DatabaseTest, PaxColumnSelectionPreservesNullEmptyAndHeapReads) {
+TEST_F(DatabaseTest, PaxColumnSelectionPreservesNullAndEmptyReads) {
+  std::string commit_reason;
+  const char *kTable = "projected";
+  ASSERT_TRUE(db_->CreateTable(kTable));
   ASSERT_TRUE(db_->InstallPaxSchema(kTable, {1, 3, 3}));
   ASSERT_TRUE(db_->CreateSecondaryIndex(
       kTable, "name", helios::storage::IndexConstraint::kNone));
@@ -134,8 +137,9 @@ TEST_F(DatabaseTest, PaxColumnSelectionPreservesNullEmptyAndHeapReads) {
   // Row format: null flags, then two length-prefixed three-byte fields.
   const std::string null_flags("\1\1\0", 3);
   const std::string row = null_flags + "\1\3abc\1\3def";
-  ASSERT_TRUE(TestHelper::CommitWrites(
-      *db_, {{kTable, "alice", row}}, {{kTable, "name", "a", "alice"}}));
+  ASSERT_TRUE(TestHelper::CommitRows(*db_, {}, {{kTable, "alice", row}},
+                                     {{kTable, "name", "a", "alice"}}, {},
+                                     commit_reason));
 
   const std::vector<uint32_t> no_columns;
   const std::vector<uint32_t> second_column{1};
@@ -165,13 +169,8 @@ TEST_F(DatabaseTest, PaxColumnSelectionPreservesNullEmptyAndHeapReads) {
     EXPECT_EQ(secondary.rows[0].tid, point.tid);
   }
 
-  // A field wider than its PAX cell falls back to a whole heap row.
-  const std::string overflow = null_flags + "\1\4abcd\1\3def";
-  ASSERT_TRUE(TestHelper::Write(*db_, kTable, "alice", overflow));
-  for (const auto *columns : selections) {
-    const auto point = db_->Read(kTable, "alice", columns);
-    db_->ReleaseThreadEpoch();
-    ASSERT_TRUE(point.found);
-    EXPECT_EQ(point.value, overflow);
-  }
+  // An oversized field is rejected; the earlier value remains in PAX.
+  const std::string oversized = null_flags + "\1\4abcd\1\3def";
+  EXPECT_FALSE(TestHelper::WriteRow(*db_, kTable, "alice", oversized));
+  EXPECT_EQ(TestHelper::ReadRow(*db_, kTable, "alice").value(), row);
 }

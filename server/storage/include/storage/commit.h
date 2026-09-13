@@ -43,7 +43,10 @@ enum class RowOp {
 /**
  * @brief Row write or delete to install during Commit.
  *
- * `value` is ignored for a kDelete, which removes the row.
+ * value contains a packed row matching the table's installed PAX schema.
+ * Database::Commit decodes value before the Silo protocol starts.
+ * Unrepresentable input is rejected without changing any stored value.
+ * value is ignored for a kDelete, which removes the row.
  */
 struct ExternalWriteEntry {
   std::string table_name;

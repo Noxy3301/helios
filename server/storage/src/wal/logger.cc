@@ -156,16 +156,12 @@ void FoldSecondary(const Write &write, SecondaryOps &ops) {
 // rescan makes recovery quadratic in the log size.
 void FoldPrimary(const Write &write, WriteSet &recovery_set,
                  PrimaryPos &positions) {
-  const std::byte *value_ptr =
-      write.buffer.empty()
-          ? nullptr
-          : reinterpret_cast<const std::byte *>(write.buffer.data());
   const auto it = positions.find({write.table_name, write.key});
   if (it != positions.end()) {
     auto &item = recovery_set[it->second];
-    if (item.data_item_copy.transaction_id.load() < write.transaction_id) {
-      item.data_item_copy.Reset(value_ptr, write.buffer.size(),
-                                write.transaction_id);
+    if (item.tid < write.transaction_id) {
+      item.value = write.buffer;
+      item.tid = write.transaction_id;
       item.table_name = write.table_name;
       item.index_name = write.index_name;
       item.index_type = static_cast<IndexConstraint>(write.index_type);
@@ -217,8 +213,7 @@ void GroupSecondary(const SecondaryOps &ops, WriteSet &recovery_set) {
                           group_key.index_name,
                           entry.max_tid,
                           static_cast<IndexConstraint>(group_key.index_type)};
-    log_entry.data_item_copy.SetPrimaryKeys(std::move(entry.primary_keys));
-    log_entry.data_item_copy.Reset(nullptr, 0, entry.max_tid);
+    log_entry.primary_keys = std::move(entry.primary_keys);
     recovery_set.emplace_back(std::move(log_entry));
   }
 }
@@ -277,12 +272,12 @@ bool Logger::Enqueue(const WriteSet &ws, EpochNumber epoch) {
     if (entry.index_name.empty()) {
       LogRecord::Write write;
       write.key = entry.key;
-      write.buffer = entry.data_item_copy.buffer.toString();
-      write.transaction_id = entry.data_item_copy.transaction_id.load();
+      write.buffer = entry.value;
+      write.transaction_id = entry.tid;
       write.table_name = entry.table_name;
       write.index_name = entry.index_name;
       write.index_type = static_cast<uint32_t>(entry.index_type);
-      write.primary_keys = entry.data_item_copy.primary_keys_vector();
+      write.primary_keys = entry.primary_keys;
       write.secondary_op = SecondaryIndexOp::kNone;
       log_record.writes.emplace_back(std::move(write));
       continue;
@@ -292,8 +287,8 @@ bool Logger::Enqueue(const WriteSet &ws, EpochNumber epoch) {
     for (const auto &delta : entry.secondary_index_deltas) {
       LogRecord::Write write;
       write.key = entry.key;
-      write.buffer = entry.data_item_copy.buffer.toString();
-      write.transaction_id = entry.data_item_copy.transaction_id.load();
+      write.buffer = entry.value;
+      write.transaction_id = entry.tid;
       write.table_name = entry.table_name;
       write.index_name = entry.index_name;
       write.index_type = static_cast<uint32_t>(entry.index_type);

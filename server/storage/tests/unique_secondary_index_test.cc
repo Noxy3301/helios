@@ -48,7 +48,7 @@ TEST_F(UniqueSecondaryIndexTest, DictUniqueFlagRejectsDuplicateSecondaryKey) {
   config_.enable_recovery = false;
 
   helios::storage::Database db(config_);
-  ASSERT_TRUE(db.CreateTable("users"));
+  ASSERT_TRUE(TestHelper::CreateTable(db, "users"));
   ASSERT_TRUE(
       db.CreateSecondaryIndex("users", "email_idx", IndexConstraint::kUnique));
 
@@ -64,7 +64,7 @@ TEST_F(UniqueSecondaryIndexTest,
 
   {
     helios::storage::Database db(config_);
-    ASSERT_TRUE(db.CreateTable("users"));
+    ASSERT_TRUE(TestHelper::CreateTable(db, "users"));
     ASSERT_TRUE(db.CreateSecondaryIndex("users", "email_idx",
                                         IndexConstraint::kUnique));
 

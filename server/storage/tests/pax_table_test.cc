@@ -8,6 +8,7 @@
 #include <vector>
 
 #include "gtest/gtest.h"
+#include "index/data_item.h"
 #include "pax/table.h"
 #include "storage/pax.h"
 
@@ -40,8 +41,13 @@ std::string PackRow(const std::vector<std::string> &fields) {
 }
 
 bool Scatter(PaxGroup &group, uint32_t slot, const std::string &row) {
-  return group.ScatterRow(slot, reinterpret_cast<const std::byte *>(row.data()),
-                          row.size());
+  helios::storage::pax::Row decoded;
+  if (!helios::storage::pax::DecodeRow(
+          group.schema(), reinterpret_cast<const std::byte *>(row.data()),
+          row.size(), decoded))
+    return false;
+  group.ScatterRow(slot, decoded);
+  return true;
 }
 
 std::string Gather(const PaxGroup &group, uint32_t slot, size_t expected_size) {
@@ -55,7 +61,7 @@ std::string Gather(const PaxGroup &group, uint32_t slot, size_t expected_size) {
 TableSchema MakeSchema(std::vector<uint32_t> widths,
                        std::vector<FieldType> types) {
   TableSchema schema;
-  schema.table_name = "t";
+
   schema.field_max_bytes = std::move(widths);
   schema.field_type = std::move(types);
   schema.field_scale.assign(schema.field_type.size(), 0);
@@ -69,7 +75,7 @@ TEST(PaxTableTest, TooNarrowTypedFieldStaysVerbatim) {
       MakeSchema({1, 2}, {FieldType::kUntyped, FieldType::kInt32});
   EXPECT_EQ(schema.type_of(1), FieldType::kUntyped);
 
-  PaxGroup group(schema, nullptr);
+  PaxGroup group(schema);
   const std::string first = PackRow({std::string(1, '\0'), "42"});
   const std::string second = PackRow({std::string(1, '\0'), "99"});
   ASSERT_TRUE(Scatter(group, 0, first));
@@ -85,10 +91,56 @@ TEST(PaxTableTest, ShortTypeVectorLeavesTheRestUntyped) {
   const TableSchema schema = MakeSchema({1, 4}, {FieldType::kUntyped});
   EXPECT_EQ(schema.type_of(1), FieldType::kUntyped);
 
-  PaxGroup group(schema, nullptr);
+  PaxGroup group(schema);
   const std::string row = PackRow({std::string(1, '\0'), "7"});
   ASSERT_TRUE(Scatter(group, 0, row));
   EXPECT_EQ(Gather(group, 0, row.size()), row);
+}
+
+TEST(PaxTableTest, Stores512DataColumns) {
+  std::vector<uint32_t> widths(513, 1);
+  widths[0] = 64;  // Null flags for 512 nullable data columns.
+  const TableSchema schema = MakeSchema(widths, {});
+  PaxGroup group(schema);
+  std::vector<std::string> fields(513, "x");
+  fields[0] = std::string(64, '\0');
+  const auto row = PackRow(fields);
+  ASSERT_TRUE(Scatter(group, 0, row));
+  EXPECT_EQ(Gather(group, 0, row.size()), row);
+}
+
+TEST(PaxTableTest, CopyStaysWithinTheReadersBufferAfterRowGrowth) {
+  const TableSchema schema = MakeSchema({1, 64}, {});
+  helios::storage::pax::PaxTable store(schema);
+  helios::storage::DataItem item(store);
+  helios::storage::pax::Row decoded;
+  const auto small = PackRow({std::string(1, '\0'), "a"});
+  const auto large = PackRow({std::string(1, '\0'), std::string(64, 'b')});
+  ASSERT_TRUE(helios::storage::pax::DecodeRow(
+      schema, reinterpret_cast<const std::byte *>(small.data()), small.size(),
+      decoded));
+  ASSERT_TRUE(item.AllocateSlot());
+  item.Write(decoded);
+
+  // A reader sizes its output, then a writer grows the row before the copy.
+  const size_t capacity = item.size();
+  const std::byte marker{0x5a};
+  std::vector<std::byte> buffer(large.size() + 8, marker);
+  ASSERT_TRUE(helios::storage::pax::DecodeRow(
+      schema, reinterpret_cast<const std::byte *>(large.data()), large.size(),
+      decoded));
+  item.Write(decoded);
+  const size_t copied = item.GatherInto(buffer.data(), capacity);
+  EXPECT_LE(copied, capacity);
+  bool guard_intact = true;
+  for (size_t i = capacity; i < buffer.size(); ++i) {
+    if (buffer[i] != marker) guard_intact = false;
+  }
+  EXPECT_TRUE(guard_intact);
+
+  // Deletion between allocation and copying also keeps the same bound.
+  item.Delete();
+  EXPECT_LE(item.GatherInto(buffer.data(), capacity), capacity);
 }
 
 }  // namespace

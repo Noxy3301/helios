@@ -23,6 +23,7 @@
 #include <filesystem>
 #include <memory>
 
+#include "db_helper.h"
 #include "gtest/gtest.h"
 #include "storage/config.h"
 #include "storage/database.h"
@@ -44,13 +45,13 @@ class CreateSecondaryIndexTest : public ::testing::Test {
 };
 
 TEST_F(CreateSecondaryIndexTest, CreateNonUniqueIndex) {
-  ASSERT_TRUE(db_->CreateTable("users"));
+  ASSERT_TRUE(TestHelper::CreateTable(*db_, "users"));
   ASSERT_TRUE(
       db_->CreateSecondaryIndex("users", "age_index", IndexConstraint::kNone));
 }
 
 TEST_F(CreateSecondaryIndexTest, CreateMultipleSecondaryIndexes) {
-  ASSERT_TRUE(db_->CreateTable("users"));
+  ASSERT_TRUE(TestHelper::CreateTable(*db_, "users"));
   ASSERT_TRUE(
       db_->CreateSecondaryIndex("users", "age_index", IndexConstraint::kNone));
   ASSERT_TRUE(
@@ -60,7 +61,7 @@ TEST_F(CreateSecondaryIndexTest, CreateMultipleSecondaryIndexes) {
 }
 
 TEST_F(CreateSecondaryIndexTest, CreateDuplicateSecondaryIndex) {
-  ASSERT_TRUE(db_->CreateTable("users"));
+  ASSERT_TRUE(TestHelper::CreateTable(*db_, "users"));
   ASSERT_TRUE(
       db_->CreateSecondaryIndex("users", "age_index", IndexConstraint::kNone));
   ASSERT_FALSE(

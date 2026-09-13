@@ -152,13 +152,13 @@ class EpochScanCheckpoint {
                                          std::string_view key,
                                          const DataItem &item,
                                          LogRecord::Write &out,
-                                         uint64_t *retries);
+                                         uint64_t &retries);
   static CaptureResult CaptureSecondaryEntry(
       const std::string &table_name, const std::string &index_name,
       uint32_t index_type, std::string_view key, const DataItem &item,
-      LogRecord::Write &out, uint64_t *retries);
-  bool CaptureTable(Table &table, LogRecord *record, Stats *stats);
-  bool Publish(const LogRecords &records, Stats *stats);
+      LogRecord::Write &out, uint64_t &retries);
+  bool CaptureTable(Table &table, LogRecord &record, Stats &stats);
+  bool Publish(const LogRecords &records, Stats &stats);
   void Loop();
   /**
    * @brief Waits for the interval, or for a stop.

@@ -64,8 +64,8 @@ ScanResult Scan(TableDictionary &tables, std::shared_mutex &schema_mutex,
 
   // The value-yielding Scan/ScanReverse overloads pass the DataItem the leaf
   // walk already resolved, so read it directly instead of re-fetching by key.
-  auto append_scan_entry = [&](std::string_view key, DataItem &item_ref) {
-    auto row = StableRead(item_ref, selected_columns);
+  auto append_scan_entry = [&](std::string_view key, DataItem &item) {
+    auto row = StableRead(item, selected_columns);
     if (row.found) {
       result.rows.push_back(
           {std::string(key), std::move(row.value), PackTransactionId(row.tid)});
@@ -169,34 +169,23 @@ ScanPaxResult ScanPax(TableDictionary &tables, std::shared_mutex &schema_mutex,
   Table *table = tables.GetTable(table_name);
   if (table == nullptr) return result;
 
-  // PAX row references are only valid when every live row is in PAX strips.
-  // A row that overflowed to the heap is invisible to strip-only readers, so
-  // refuse and let the caller take the Scan path.
   auto *store = table->GetPaxTable();
-  if (store == nullptr || store->overflow_count() > 0) return result;
+  if (store == nullptr) return result;
   result.ok = true;
 
   uint64_t returned_rows = 0;
-  bool saw_non_pax = false;
 
-  auto append_pax_row = [&](std::string_view key, DataItem &item_ref) {
+  auto append_pax_row = [&](std::string_view key, DataItem &item) {
     // Observe the same stable unlocked TID that a materialized read would use.
     // The caller re-checks this TID after reading cells from the strip.
-    const TransactionId tid = StableTid(item_ref);
+    const TransactionId tid = StableTid(item);
 
-    const size_t size = item_ref.buffer.size;
+    const size_t size = item.size();
     if (size == 0) return false;
-    // Mixed PAX/heap storage makes strip-only row references incomplete.
-    if (!item_ref.buffer.is_pax() || !item_ref.buffer.pax_allocated()) {
-      saw_non_pax = true;
-      return true;
-    }
-
     // Return a reference to the PAX location instead of gathering row bytes.
-    result.rows.push_back({std::string(key), item_ref.buffer.pax_group(),
-                           item_ref.buffer.pax_slot(),
-                           static_cast<uint32_t>(size), PackTransactionId(tid),
-                           &item_ref});
+    result.rows.push_back({std::string(key), item.pax_group(),
+                           item.pax_slot(), static_cast<uint32_t>(size),
+                           PackTransactionId(tid), &item});
     ++returned_rows;
     return row_limit > 0 && returned_rows >= row_limit;
   };
@@ -205,11 +194,6 @@ ScanPaxResult ScanPax(TableDictionary &tables, std::shared_mutex &schema_mutex,
     table->GetPrimaryIndex().ScanReverse(start_key, end_key, append_pax_row);
   } else {
     table->GetPrimaryIndex().Scan(start_key, end_key, append_pax_row);
-  }
-  if (saw_non_pax) {
-    // A heap row appeared, so no partial set of references escapes.
-    result.ok = false;
-    result.rows.clear();
   }
   return result;
 }

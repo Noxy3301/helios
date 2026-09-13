@@ -21,6 +21,7 @@
 #include <thread>
 #include <vector>
 
+#include "db_helper.h"
 #include "storage/config.h"
 #include "storage/database.h"
 #include "storage/read.h"
@@ -48,14 +49,14 @@ class Pipe {
   }
   int read_fd() const { return fds_[0]; }
   int write_fd() const { return fds_[1]; }
-  void CloseRead() { Close(&fds_[0]); }
-  void CloseWrite() { Close(&fds_[1]); }
+  void CloseRead() { Close(fds_[0]); }
+  void CloseWrite() { Close(fds_[1]); }
 
  private:
-  static void Close(int *fd) {
-    if (*fd >= 0) {
-      ::close(*fd);
-      *fd = -1;
+  static void Close(int &fd) {
+    if (fd >= 0) {
+      ::close(fd);
+      fd = -1;
     }
   }
   int fds_[2] = {-1, -1};
@@ -127,17 +128,20 @@ class EpochScanCheckpointTest : public ::testing::Test {
 
   static bool CommitWrite(helios::storage::Database &db, const std::string &key,
                           const std::string &value) {
-    const bool committed = db.Commit({}, {{kTable, key, value}}, {}, {},
-                                     helios::storage::CommitDurability::kSync);
+    std::string commit_reason;
+    const bool committed =
+        db.Commit({}, {{kTable, key, TestHelper::Row(value)}}, {}, {},
+                  helios::storage::CommitDurability::kSync, commit_reason);
     db.ReleaseThreadEpoch();
     return committed;
   }
 
   static bool CommitDelete(helios::storage::Database &db,
                            const std::string &key) {
+    std::string commit_reason;
     const bool committed =
         db.Commit({}, {{kTable, key, "", helios::storage::RowOp::kDelete}}, {},
-                  {}, helios::storage::CommitDurability::kSync);
+                  {}, helios::storage::CommitDurability::kSync, commit_reason);
     db.ReleaseThreadEpoch();
     return committed;
   }
@@ -146,9 +150,11 @@ class EpochScanCheckpointTest : public ::testing::Test {
                                  const std::string &key,
                                  const std::string &value,
                                  const std::string &secondary_key) {
-    const bool committed = db.Commit({}, {{kTable, key, value}},
-                                     {{kTable, kIndex, secondary_key, key}}, {},
-                                     helios::storage::CommitDurability::kSync);
+    std::string commit_reason;
+    const bool committed =
+        db.Commit({}, {{kTable, key, TestHelper::Row(value)}},
+                  {{kTable, kIndex, secondary_key, key}}, {},
+                  helios::storage::CommitDurability::kSync, commit_reason);
     db.ReleaseThreadEpoch();
     return committed;
   }
@@ -157,6 +163,7 @@ class EpochScanCheckpointTest : public ::testing::Test {
                                           const std::string &key) {
     auto result = db.Read(kTable, key);
     db.ReleaseThreadEpoch();
+    if (result.found) result.value = TestHelper::RowPayload(result.value);
     return result;
   }
 
@@ -178,7 +185,7 @@ class EpochScanCheckpointTest : public ::testing::Test {
     std::vector<std::string> hits;
     for (const auto &row : result.rows) {
       hits.emplace_back(row.secondary_key + "/" + row.primary_key + "=" +
-                        row.value);
+                        TestHelper::RowPayload(row.value));
     }
     std::sort(hits.begin(), hits.end());
     return hits;
@@ -191,7 +198,7 @@ class EpochScanCheckpointTest : public ::testing::Test {
     for (const auto &record : checkpoint.records) {
       for (const auto &write : record.writes) {
         if (!write.index_name.empty() || write.key != key) continue;
-        return write.buffer;
+        return TestHelper::RowPayload(write.buffer);
       }
     }
     return std::nullopt;
@@ -234,7 +241,7 @@ TEST_F(EpochScanCheckpointTest, ACheckpointHoldsWhatTheScanFound) {
   {
     auto config = MakeConfig(false);
     helios::storage::Database db(config);
-    db.CreateTable(kTable);
+    TestHelper::CreateTable(db, kTable);
     ASSERT_TRUE(db.CreateSecondaryIndex(
         kTable, kIndex, helios::storage::IndexConstraint::kNone));
     ASSERT_TRUE(CommitIndexedWrite(db, "alice", "one", "s"));
@@ -259,7 +266,7 @@ TEST_F(EpochScanCheckpointTest, ADeletedRowLeavesNoEntry) {
   {
     auto config = MakeConfig(false);
     helios::storage::Database db(config);
-    db.CreateTable(kTable);
+    TestHelper::CreateTable(db, kTable);
     ASSERT_TRUE(CommitWrite(db, "alice", "one"));
     ASSERT_TRUE(CommitWrite(db, "bob", "two"));
     ASSERT_TRUE(CommitDelete(db, "alice"));
@@ -282,7 +289,7 @@ TEST_F(EpochScanCheckpointTest, ADamagedCheckpointIsRefused) {
   {
     auto config = MakeConfig(false);
     helios::storage::Database db(config);
-    db.CreateTable(kTable);
+    TestHelper::CreateTable(db, kTable);
     ASSERT_TRUE(CommitWrite(db, "alice", "one"));
     ASSERT_TRUE(db.WriteCheckpoint());
   }
@@ -307,7 +314,7 @@ TEST_F(EpochScanCheckpointTest, TheLogTailWinsOverTheCheckpoint) {
   {
     auto config = MakeConfig(false);
     helios::storage::Database db(config);
-    db.CreateTable(kTable);
+    TestHelper::CreateTable(db, kTable);
     ASSERT_TRUE(CommitWrite(db, "alice", "one"));
     ASSERT_TRUE(CommitWrite(db, "bob", "one"));
     ASSERT_TRUE(CommitWrite(db, "carol", "one"));
@@ -321,7 +328,7 @@ TEST_F(EpochScanCheckpointTest, TheLogTailWinsOverTheCheckpoint) {
 
   auto config = MakeConfig(true);
   helios::storage::Database db(config);
-  db.CreateTable(kTable);
+  TestHelper::CreateTable(db, kTable);
   EXPECT_EQ(Read(db, "alice").value, "two");
   // Only the checkpoint holds this one: its record is in a frame the replay
   // skips.
@@ -335,7 +342,7 @@ TEST_F(EpochScanCheckpointTest,
   {
     auto config = MakeConfig(false);
     helios::storage::Database db(config);
-    db.CreateTable(kTable);
+    TestHelper::CreateTable(db, kTable);
     ASSERT_TRUE(db.CreateSecondaryIndex(
         kTable, kIndex, helios::storage::IndexConstraint::kNone));
     ASSERT_TRUE(CommitIndexedWrite(db, "alice", "one", "s"));
@@ -375,7 +382,7 @@ TEST_F(EpochScanCheckpointTest,
   {
     auto config = MakeConfig(true);
     helios::storage::Database db(config);
-    db.CreateTable(kTable);
+    TestHelper::CreateTable(db, kTable);
     with_checkpoint = ReadAliceBobCarol(db);
     index_with_checkpoint = ReadIndex(db);
   }
@@ -387,7 +394,7 @@ TEST_F(EpochScanCheckpointTest,
   {
     auto config = MakeConfig(true);
     helios::storage::Database db(config);
-    db.CreateTable(kTable);
+    TestHelper::CreateTable(db, kTable);
     without_checkpoint = ReadAliceBobCarol(db);
     index_without_checkpoint = ReadIndex(db);
   }
@@ -406,7 +413,7 @@ TEST_F(EpochScanCheckpointTest, AQuietTailAfterTheCheckpointIsAccepted) {
   {
     auto config = MakeConfig(false);
     helios::storage::Database db(config);
-    db.CreateTable(kTable);
+    TestHelper::CreateTable(db, kTable);
     ASSERT_TRUE(CommitWrite(db, "alice", "one"));
     ASSERT_TRUE(CommitWrite(db, "bob", "one"));
     // Nothing is written afterwards, so the scan ends past the epoch of the
@@ -445,7 +452,7 @@ TEST_F(EpochScanCheckpointTest, V2CheckpointIsIgnoredAndTheLogIsReplayed) {
   {
     auto config = MakeConfig(false);
     helios::storage::Database db(config);
-    db.CreateTable(kTable);
+    TestHelper::CreateTable(db, kTable);
     ASSERT_TRUE(CommitWrite(db, "alice", "one"));
     ASSERT_TRUE(db.WriteCheckpoint());
   }
@@ -511,7 +518,7 @@ TEST_F(EpochScanCheckpointTest, ARowLockedDuringTheScanIsRetried) {
 
   auto config = MakeConfig(false);
   helios::storage::Database db(config);
-  db.CreateTable(kTable);
+  TestHelper::CreateTable(db, kTable);
   ASSERT_TRUE(CommitWrite(db, "alice", std::string(64, 'a')));
   ASSERT_TRUE(CommitWrite(db, "bob", std::string(64, 'a')));
 
@@ -541,11 +548,12 @@ TEST_F(EpochScanCheckpointTest, ARowLockedDuringTheScanIsRetried) {
   ASSERT_EQ(::read(scan_arrived.read_fd(), &announcement, 1), 1);
 
   auto writer = std::async(std::launch::async, [&db] {
-    const bool committed =
-        db.Commit({},
-                  {{kTable, "alice", std::string(64, 'b')},
-                   {kTable, "bob", std::string(64, 'b')}},
-                  {}, {}, helios::storage::CommitDurability::kSync);
+    std::string commit_reason;
+    const bool committed = db.Commit(
+        {},
+        {{kTable, "alice", TestHelper::Row(std::string(64, 'b'))},
+         {kTable, "bob", TestHelper::Row(std::string(64, 'b'))}},
+        {}, {}, helios::storage::CommitDurability::kSync, commit_reason);
     db.ReleaseThreadEpoch();
     return committed;
   });
@@ -602,7 +610,7 @@ TEST_F(EpochScanCheckpointTest, ALeftoverWorkingFileIsNotRead) {
   {
     auto config = MakeConfig(false);
     helios::storage::Database db(config);
-    db.CreateTable(kTable);
+    TestHelper::CreateTable(db, kTable);
     ASSERT_TRUE(CommitWrite(db, "alice", "one"));
     ASSERT_TRUE(db.WriteCheckpoint());
   }

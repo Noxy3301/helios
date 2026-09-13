@@ -42,9 +42,8 @@ class Table {
   /**
    * @brief Installs PAX storage metadata for rows created after the call.
    *
-   * @details The schema records per-field maximum cell widths. Existing rows
-   * remain on the heap-backed DataBuffer layout; future rows are initialized
-   * with the table's PaxTable. A table accepts only one PAX schema.
+   * @details The schema records per-field maximum cell widths and must be
+   * installed before values are written. A table accepts only one PAX schema.
    *
    * @return true when the schema is installed for this table.
    * @return false when a schema has already been installed.

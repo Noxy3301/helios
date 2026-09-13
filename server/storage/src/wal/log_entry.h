@@ -49,13 +49,15 @@ enum class SecondaryIndexOp : uint8_t {
  *
  * @details An empty `index_name` marks a primary row; otherwise the entry
  * belongs to that secondary index and `secondary_index_deltas` says what it
- * does to it. `data_item_copy` is owned. `item` is the live slot the commit
- * path resolved, borrowed until the commit publishes its TIDs, and null on
- * the recovery path, which has no slots yet.
+ * does to it. The value and primary-key list are owned. `item` is the live
+ * slot the commit path resolved, borrowed until it publishes its TIDs, and null
+ * on the recovery path, which has no slots yet.
  */
 struct LogEntry {
   std::string key;
-  DataItem data_item_copy;
+  std::string value;
+  TransactionId tid{};
+  std::vector<std::string> primary_keys;
   DataItem *item;
   std::string table_name;
   std::string index_name;
@@ -71,11 +73,12 @@ struct LogEntry {
            std::string_view index_name, const TransactionId tid = {},
            IndexConstraint index_type = IndexConstraint::kNone)
       : key(key),
+        tid(tid),
         item(item),
         table_name(table_name),
         index_name(index_name),
         index_type(index_type) {
-    if (row != nullptr) data_item_copy.Reset(row, len, tid);
+    if (row != nullptr) value.assign(reinterpret_cast<const char *>(row), len);
   }
   LogEntry(const LogEntry &) = default;
   LogEntry &operator=(const LogEntry &) = default;

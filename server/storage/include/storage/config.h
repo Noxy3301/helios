@@ -51,6 +51,7 @@ struct Config {
    * since that tail has to go before the first append lands behind it. This
    * decides only whether the records the scan read are replayed, and whether
    * a published checkpoint is loaded at all.
+   * PAX column definitions are always restored before the database starts.
    *
    * Default: true
    */

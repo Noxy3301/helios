@@ -9,6 +9,7 @@
 
 #include <cstring>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <type_traits>
 #include <utility>
@@ -27,6 +28,46 @@ namespace TestHelper {
 // Sorts above any key a test writes, for scans that mean "to the end".
 inline const std::string kMaxKey = "\xff\xff\xff\xff";
 
+// Most tests use one binary payload column; PAX-specific tests supply their
+// complete row format through CommitRows/WriteRow/ReadRow instead.
+inline std::string Row(std::string_view value) {
+  std::string row("\1\1\0", 3);
+  if (value.empty()) {
+    row.push_back(static_cast<char>(0xff));
+    return row;
+  }
+  size_t width = 0;
+  for (size_t n = value.size(); n != 0; n >>= 8) ++width;
+  row.push_back(static_cast<char>(width));
+  for (size_t i = 0; i < width; ++i)
+    row.push_back(static_cast<char>((value.size() >> (i * 8)) & 0xff));
+  row.append(value);
+  return row;
+}
+
+inline std::string RowPayload(const std::string &row) {
+  if (row.size() < 4 || row.substr(0, 3) != std::string("\1\1\0", 3))
+    throw std::runtime_error("invalid test row");
+  const auto width = static_cast<uint8_t>(row[3]);
+  if (width == 0xff && row.size() == 4) return {};
+  if (width == 0 || width > 4 || row.size() < 4u + width)
+    throw std::runtime_error("invalid test field");
+  size_t size = 0;
+  for (size_t i = 0; i < width; ++i)
+    size |= static_cast<size_t>(static_cast<uint8_t>(row[4 + i])) << (i * 8);
+  if (row.size() != 4 + width + size)
+    throw std::runtime_error("test row length disagrees");
+  return row.substr(4 + width, size);
+}
+
+inline bool CreateTable(helios::storage::Database &db, std::string_view name,
+                        uint32_t payload_width = 4096) {
+  if (!db.CreateTable(name)) return false;
+  const bool installed = db.InstallPaxSchema(name, {1, payload_width});
+  db.ReleaseThreadEpoch();
+  return installed;
+}
+
 // The host bytes of a scalar, as a test row payload.
 template <typename T>
 std::string Pack(const T &value) {
@@ -44,14 +85,13 @@ T Unpack(const std::string &value) {
   return buf;
 }
 
-inline bool Commit(
+inline bool CommitRows(
     helios::storage::Database &db,
     const std::vector<helios::storage::ExternalReadEntry> &reads,
     const std::vector<helios::storage::ExternalWriteEntry> &writes,
-    const std::vector<helios::storage::ExternalSecondaryIndexEntry> &index_ops =
-        {},
-    const std::vector<helios::storage::ExternalRangeReadEntry> &ranges = {},
-    std::string *abort_reason = nullptr) {
+    const std::vector<helios::storage::ExternalSecondaryIndexEntry> &index_ops,
+    const std::vector<helios::storage::ExternalRangeReadEntry> &ranges,
+    std::string &abort_reason) {
   const bool committed =
       db.Commit(reads, writes, index_ops, ranges,
                 helios::storage::CommitDurability::kSync, abort_reason);
@@ -59,12 +99,34 @@ inline bool Commit(
   return committed;
 }
 
+inline bool Commit(
+    helios::storage::Database &db,
+    const std::vector<helios::storage::ExternalReadEntry> &reads,
+    const std::vector<helios::storage::ExternalWriteEntry> &writes,
+    const std::vector<helios::storage::ExternalSecondaryIndexEntry> &index_ops,
+    const std::vector<helios::storage::ExternalRangeReadEntry> &ranges,
+    std::string &abort_reason) {
+  auto rows = writes;
+  for (auto &write : rows) {
+    if (write.op != helios::storage::RowOp::kDelete)
+      write.value = Row(write.value);
+  }
+  return CommitRows(db, reads, rows, index_ops, ranges, abort_reason);
+}
+
+inline bool WriteRow(helios::storage::Database &db, const std::string &table,
+                     const std::string &key, const std::string &row) {
+  std::string commit_reason;
+  return CommitRows(db, {}, {{table, key, row}}, {}, {}, commit_reason);
+}
+
 inline bool CommitWrites(
     helios::storage::Database &db,
     const std::vector<helios::storage::ExternalWriteEntry> &writes,
     const std::vector<helios::storage::ExternalSecondaryIndexEntry> &index_ops =
         {}) {
-  return Commit(db, {}, writes, index_ops);
+  std::string commit_reason;
+  return Commit(db, {}, writes, index_ops, {}, commit_reason);
 }
 
 inline bool Write(helios::storage::Database &db, const std::string &table,
@@ -83,13 +145,21 @@ inline bool Delete(helios::storage::Database &db, const std::string &table,
   return CommitWrites(db, {{table, key, "", helios::storage::RowOp::kDelete}});
 }
 
-inline std::optional<std::string> Read(helios::storage::Database &db,
-                                       const std::string &table,
-                                       const std::string &key) {
+inline std::optional<std::string> ReadRow(helios::storage::Database &db,
+                                          const std::string &table,
+                                          const std::string &key) {
   auto result = db.Read(table, key);
   db.ReleaseThreadEpoch();
   if (!result.found) return std::nullopt;
   return std::move(result.value);
+}
+
+inline std::optional<std::string> Read(helios::storage::Database &db,
+                                       const std::string &table,
+                                       const std::string &key) {
+  auto row = ReadRow(db, table, key);
+  if (!row) return std::nullopt;
+  return RowPayload(*row);
 }
 
 template <typename T>
@@ -111,7 +181,7 @@ inline std::vector<std::pair<std::string, std::string>> Scan(
   EXPECT_TRUE(scan.ok);
   if (!scan.ok) return rows;
   for (auto &row : scan.rows) {
-    rows.emplace_back(std::move(row.key), std::move(row.value));
+    rows.emplace_back(std::move(row.key), RowPayload(row.value));
   }
   return rows;
 }

@@ -31,14 +31,14 @@ class Pipe {
   }
   int read_fd() const { return fds_[0]; }
   int write_fd() const { return fds_[1]; }
-  void CloseRead() { Close(&fds_[0]); }
-  void CloseWrite() { Close(&fds_[1]); }
+  void CloseRead() { Close(fds_[0]); }
+  void CloseWrite() { Close(fds_[1]); }
 
  private:
-  static void Close(int *fd) {
-    if (*fd >= 0) {
-      ::close(*fd);
-      *fd = -1;
+  static void Close(int &fd) {
+    if (fd >= 0) {
+      ::close(fd);
+      fd = -1;
     }
   }
   int fds_[2] = {-1, -1};

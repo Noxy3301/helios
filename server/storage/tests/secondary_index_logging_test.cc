@@ -132,7 +132,7 @@ class SecondaryIndexLoggingTest : public ::testing::Test {
     std::filesystem::remove_all("helios_wal");
     config_.enable_recovery = true;
     db_ = std::make_unique<helios::storage::Database>(config_);
-    db_->CreateTable("users");
+    TestHelper::CreateTable(*db_, "users");
     spdlog::set_level(spdlog::level::info);
   }
 };
@@ -156,7 +156,7 @@ TEST_F(SecondaryIndexLoggingTest,
     index_keys.emplace_back("age:" + std::to_string(30 + i));
   }
 
-  db_->CreateTable(table_name);
+  TestHelper::CreateTable(*db_, table_name);
   ASSERT_TRUE(db_->CreateSecondaryIndex(
       table_name, index_name, helios::storage::IndexConstraint::kNone));
 
@@ -218,7 +218,7 @@ TEST_F(SecondaryIndexLoggingTest, RecoveryWithSecondaryIndexWithoutCheckpoint) {
   const size_t primary_key_count = 300;
   const auto primary_keys = MakePrimaryKeys(primary_key_count);
 
-  db_->CreateTable(table_name);
+  TestHelper::CreateTable(*db_, table_name);
   ASSERT_TRUE(db_->CreateSecondaryIndex(
       table_name, index_name, helios::storage::IndexConstraint::kNone));
 
@@ -264,7 +264,7 @@ TEST_F(SecondaryIndexLoggingTest, SecondaryIndexAddTimingRecorded) {
   const size_t initial_primary_keys = 300;
   const size_t iterations = 10;
 
-  db_->CreateTable(table_name);
+  TestHelper::CreateTable(*db_, table_name);
   ASSERT_TRUE(db_->CreateSecondaryIndex(
       table_name, index_name, helios::storage::IndexConstraint::kNone));
 
@@ -288,16 +288,17 @@ TEST_F(SecondaryIndexLoggingTest, SecondaryIndexAddTimingRecorded) {
 
   // Measure adding one primary key to the same secondary key.
   for (size_t i = 0; i < iterations; ++i) {
+    std::string commit_reason;
     const std::string primary_key =
         MakeFixedPrimaryKey(initial_primary_keys + i);
     const std::string value = "val_" + primary_key;
     const auto size_before = GetLogDirectorySize(config);
 
     const auto start = std::chrono::steady_clock::now();
-    const bool committed =
-        db_->Commit({}, {{table_name, primary_key, value}},
-                    {{table_name, index_name, index_key, primary_key, false}},
-                    {}, helios::storage::CommitDurability::kSync);
+    const bool committed = db_->Commit(
+        {}, {{table_name, primary_key, TestHelper::Row(value)}},
+        {{table_name, index_name, index_key, primary_key, false}}, {},
+        helios::storage::CommitDurability::kSync, commit_reason);
     const auto end = std::chrono::steady_clock::now();
     db_->ReleaseThreadEpoch();
     ASSERT_TRUE(committed);

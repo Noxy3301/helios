@@ -34,7 +34,7 @@ class ScanSecondaryIndexTest : public ::testing::Test {
 };
 
 TEST_F(ScanSecondaryIndexTest, DeleteAndScan) {
-  ASSERT_TRUE(db_->CreateTable("users"));
+  ASSERT_TRUE(TestHelper::CreateTable(*db_, "users"));
   ASSERT_TRUE(db_->CreateSecondaryIndex("users", "alpha_index",
                                         IndexConstraint::kNone));
 
@@ -60,7 +60,7 @@ TEST_F(ScanSecondaryIndexTest, DeleteAndScan) {
 }
 
 TEST_F(ScanSecondaryIndexTest, IncludeInsertedKeys) {
-  ASSERT_TRUE(db_->CreateTable("users"));
+  ASSERT_TRUE(TestHelper::CreateTable(*db_, "users"));
   ASSERT_TRUE(
       db_->CreateSecondaryIndex("users", "name_index", IndexConstraint::kNone));
 
@@ -84,7 +84,7 @@ TEST_F(ScanSecondaryIndexTest, IncludeInsertedKeys) {
 }
 
 TEST_F(ScanSecondaryIndexTest, KeyOrder) {
-  ASSERT_TRUE(db_->CreateTable("users"));
+  ASSERT_TRUE(TestHelper::CreateTable(*db_, "users"));
   ASSERT_TRUE(
       db_->CreateSecondaryIndex("users", "name_index", IndexConstraint::kNone));
 
@@ -110,7 +110,7 @@ TEST_F(ScanSecondaryIndexTest, KeyOrder) {
 }
 
 TEST_F(ScanSecondaryIndexTest, ReverseScan) {
-  ASSERT_TRUE(db_->CreateTable("users"));
+  ASSERT_TRUE(TestHelper::CreateTable(*db_, "users"));
   ASSERT_TRUE(db_->CreateSecondaryIndex("users", "group_index",
                                         IndexConstraint::kNone));
 
@@ -131,7 +131,7 @@ TEST_F(ScanSecondaryIndexTest, ReverseScan) {
 }
 
 TEST_F(ScanSecondaryIndexTest, StopScanning) {
-  ASSERT_TRUE(db_->CreateTable("users"));
+  ASSERT_TRUE(TestHelper::CreateTable(*db_, "users"));
   ASSERT_TRUE(
       db_->CreateSecondaryIndex("users", "name_index", IndexConstraint::kNone));
 
@@ -161,7 +161,7 @@ TEST_F(ScanSecondaryIndexTest, StopScanning) {
 }
 
 TEST_F(ScanSecondaryIndexTest, ExcludeDeletedKeys) {
-  ASSERT_TRUE(db_->CreateTable("users"));
+  ASSERT_TRUE(TestHelper::CreateTable(*db_, "users"));
   ASSERT_TRUE(
       db_->CreateSecondaryIndex("users", "name_index", IndexConstraint::kNone));
 

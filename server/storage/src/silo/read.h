@@ -107,10 +107,8 @@ ScanIndexResult ScanIndex(
  * until this thread releases its epoch, so the caller must finish with them
  * before Database::ReleaseThreadEpoch.
  *
- * `ok == false` either refuses the scan outright (the table does not exist,
- * `end_key` is empty) or reports that strip-direct references cannot serve
- * this table because some row lives on the heap; a caller that can fall back
- * to the row-shaped range read should do so.
+ * `ok == false` refuses the scan when the table or its PAX schema is missing,
+ * or when `end_key` is empty.
  */
 ScanPaxResult ScanPax(TableDictionary &tables, std::shared_mutex &schema_mutex,
                       std::string_view table_name, std::string_view start_key,

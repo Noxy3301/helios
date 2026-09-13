@@ -10,10 +10,12 @@
 #include <string>
 #include <utility>
 
-#include "storage/database.h"
 #include "pax/table.h"
 #include "pax/version_store.h"
+#include "storage/database.h"
+#include "pax/catalog.h"
 #include "util/debug_sync.h"
+#include "util/spdlog.h"
 
 namespace helios::storage {
 
@@ -100,7 +102,7 @@ bool Database::InstallPaxSchema(const std::string_view table_name,
   Table *table = GetTable(table_name);
   if (table == nullptr) return false;
   pax::TableSchema schema;
-  schema.table_name = std::string(table_name);
+
   schema.field_max_bytes = field_max_bytes;
   // Typed cells only when the types vector matches the field count; otherwise
   // every field stays UNTYPED (byte-identical to the untyped layout). When
@@ -113,6 +115,25 @@ bool Database::InstallPaxSchema(const std::string_view table_name,
     else
       schema.field_scale.assign(field_max_bytes.size(), 0);
   }
+
+  // Reattaching with the recovered definition is allowed; changing it is not.
+  if (const auto *store = table->GetPaxTable()) {
+    const auto &current = store->schema();
+    return current.field_max_bytes == schema.field_max_bytes &&
+           current.field_type == schema.field_type &&
+           current.field_scale == schema.field_scale;
+  }
+
+  // Rewrite all definitions under schema_mutex_, then make this schema
+  // writable.
+  pax::CatalogEntries entries;
+  table_dictionary_.ForEachTable([&entries](Table &entry) {
+    if (const auto *store = entry.GetPaxTable()) {
+      entries.emplace(entry.Name(), store->schema());
+    }
+  });
+  entries.emplace(std::string(table_name), schema);
+  if (!pax::StoreCatalog(config_.work_dir, entries)) return false;
   return table->InstallPaxSchema(std::move(schema));
 }
 

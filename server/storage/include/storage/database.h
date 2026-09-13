@@ -106,6 +106,7 @@ class Database {
   /**
    * @brief Creates a new table.
    * @param[in] table_name The name of the table to create.
+   * @details InstallPaxSchema must succeed before values can be written.
    * @return true when a new table is created (the name was not previously
    * used).
    * @return false when no table is created because the table name already
@@ -114,13 +115,15 @@ class Database {
   bool CreateTable(const std::string_view table_name);
 
   /**
-   * @brief Enables PAX storage for rows created after the call.
+   * @brief Saves a PAX schema and enables it before the first write.
    *
    * @details Installs the per-field maximum cell widths: index 0 is the row
    * format's null-flags field, followed by one entry per column in field order.
-   * Rows written after installation are stored in per-column strips when they
-   * fit the configured cell widths; oversize rows overflow to the heap.
-   * Call once after CreateTable and before loading rows.
+   * Values are stored in per-column strips. A value that does not fit or
+   * cannot be represented exactly is rejected before any write is installed.
+   * Call after CreateTable and before loading rows. The schema is restored
+   * at startup, even when value replay is disabled. Repeating the same
+   * definition succeeds; changing an existing definition is refused.
    *
    * @param[in] table_name The table that should use PAX storage.
    * @param[in] field_max_bytes Maximum packed bytes for each row field.
@@ -130,8 +133,8 @@ class Database {
    * @param[in] field_scale Per-field DECIMAL scale, used by kDecimal64. Empty,
    * or a length that does not match, means a scale of zero.
    * @return true when the schema is installed for the table.
-   * @return false when the schema is empty, the table is missing, or a
-   * schema is already installed.
+   * @return false if the table is missing, the definition is empty or
+   * conflicts, or the catalog cannot be saved.
    */
   bool InstallPaxSchema(const std::string_view table_name,
                         const std::vector<uint32_t> &field_max_bytes,
@@ -215,7 +218,7 @@ class Database {
    * @param selected_columns Optional zero-based MySQL columns to materialize
    * for PAX-resident rows. Null selects the whole row; an empty list selects
    * no data columns. Unselected PAX fields become empty markers; null flags
-   * remain, and heap rows are always returned whole.
+   * remain in every result.
    * @return Result with `found` set when the key exists and was non-empty.
    *         When the table does not exist, `found` is false and `tid` is 0.
    */
@@ -251,7 +254,7 @@ class Database {
    * @param selected_columns Optional zero-based MySQL columns to materialize
    * for PAX-resident rows. Null selects the whole row; an empty list selects
    * no data columns. Unselected PAX fields become empty markers; null flags
-   * remain, and heap rows are always returned whole.
+   * remain in every result.
    * @return Result with `ok == false` if the table is missing or `end_key`
    *         is empty. Callers should treat `!ok` as an abort signal.
    */
@@ -300,9 +303,8 @@ class Database {
    * @param end_key Exclusive end of the range. Must be non-empty.
    * @param row_limit Maximum live rows to return. 0 means no cap.
    * @param reverse_scan When true, iterate in reverse key order.
-   * @return Result with `ok == false` when the table is missing, has no PAX
-   * table, holds rows that overflowed to the heap, or `end_key` is empty. The
-   * caller then uses Scan.
+   * @return Result with `ok == false` when the table is missing, its PAX
+   * schema is not installed, or `end_key` is empty.
    */
   ScanPaxResult ScanPax(const std::string_view table_name,
                         const std::string_view start_key,
@@ -360,7 +362,12 @@ class Database {
    * append the log set, and unlock with a new TID. The full contract
    * lives with silo::Commit.
    *
-   * Aborts return false. The optional `abort_reason` is set to a short
+   * Input values are decoded using their PAX schemas before entering Silo.
+   * Conversion failures return false with pax_row_decode_failed; they are
+   * input errors, not concurrency conflicts. Slot exhaustion is detected
+   * before any value is changed.
+   *
+   * Aborts return false. `abort_reason` is set to a short
    * machine-readable label such as `exact_read_tid_moved`,
    * `primary_range_result_changed`, or `unique_si_exists_after_lock`.
    *
@@ -372,8 +379,7 @@ class Database {
    *                    scans.
    * @param durability When this commit is acknowledged, relative to its record
    *                    reaching the device.
-   * @param abort_reason Optional out parameter. Set only when the function
-   *                    returns false.
+   * @param abort_reason Receives the failure reason; cleared on success.
    * @return true on commit; false on a validation failure, or when a table
    *         or index the entries name is missing.
    */
@@ -382,7 +388,7 @@ class Database {
       const std::vector<ExternalWriteEntry> &writes,
       const std::vector<ExternalSecondaryIndexEntry> &secondary_index_ops,
       const std::vector<ExternalRangeReadEntry> &range_reads,
-      CommitDurability durability, std::string *abort_reason = nullptr);
+      CommitDurability durability, std::string &abort_reason);
 
   /**
    * @brief Writes one checkpoint of the live rows, on the calling thread.

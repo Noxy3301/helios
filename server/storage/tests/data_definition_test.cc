@@ -42,14 +42,14 @@ class DataDefinitionTest : public ::testing::Test {
 };
 
 TEST_F(DataDefinitionTest, CreateTable) {
-  bool success = db_->CreateTable("users");
+  bool success = TestHelper::CreateTable(*db_, "users");
   ASSERT_TRUE(success);
-  bool created = db_->CreateTable("users");
+  bool created = TestHelper::CreateTable(*db_, "users");
   ASSERT_FALSE(created);
 }
 
 TEST_F(DataDefinitionTest, ReadWrite) {
-  ASSERT_TRUE(db_->CreateTable("users"));
+  ASSERT_TRUE(TestHelper::CreateTable(*db_, "users"));
 
   ASSERT_TRUE(TestHelper::Write<int>(*db_, "users", "user1", 42));
 
@@ -59,8 +59,8 @@ TEST_F(DataDefinitionTest, ReadWrite) {
 }
 
 TEST_F(DataDefinitionTest, SeparateTableKeySpaces) {
-  ASSERT_TRUE(db_->CreateTable("users"));
-  ASSERT_TRUE(db_->CreateTable("accounts"));
+  ASSERT_TRUE(TestHelper::CreateTable(*db_, "users"));
+  ASSERT_TRUE(TestHelper::CreateTable(*db_, "accounts"));
 
   std::atomic<bool> tx1_ready = false;
   std::atomic<bool> tx2_ready = false;
@@ -96,8 +96,8 @@ TEST_F(DataDefinitionTest, SeparateTableKeySpaces) {
 }
 
 TEST_F(DataDefinitionTest, WriteSameKeyIntoTwoTables) {
-  ASSERT_TRUE(db_->CreateTable("users"));
-  ASSERT_TRUE(db_->CreateTable("accounts"));
+  ASSERT_TRUE(TestHelper::CreateTable(*db_, "users"));
+  ASSERT_TRUE(TestHelper::CreateTable(*db_, "accounts"));
 
   ASSERT_TRUE(TestHelper::CommitWrites(
       *db_, {{"users", "user1", TestHelper::Pack<int>(42)},

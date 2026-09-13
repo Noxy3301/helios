@@ -36,7 +36,7 @@ class MasstreeIndex final {
    *
    * @details Secondary indexes never set a PaxTable: they store index
    * metadata rather than table row payloads. The table is not owned, and a
-   * null table leaves later absent rows on the heap.
+   * null table is used for secondary-index entries without a row payload.
    */
   void SetPaxTable(pax::PaxTable *store);
 

@@ -11,6 +11,7 @@
 #include <string>
 #include <vector>
 
+#include "db_helper.h"
 #include "storage/config.h"
 #include "storage/database.h"
 #include "storage/read.h"
@@ -60,8 +61,10 @@ class RecoveryTest : public ::testing::Test {
 
   static bool CommitWrite(helios::storage::Database &db, const std::string &key,
                           const std::string &value) {
-    const bool committed = db.Commit({}, {{kTable, key, value}}, {}, {},
-                                     helios::storage::CommitDurability::kSync);
+    std::string commit_reason;
+    const bool committed =
+        db.Commit({}, {{kTable, key, TestHelper::Row(value)}}, {}, {},
+                  helios::storage::CommitDurability::kSync, commit_reason);
     db.ReleaseThreadEpoch();
     return committed;
   }
@@ -70,9 +73,11 @@ class RecoveryTest : public ::testing::Test {
                                         const std::string &key,
                                         const std::string &value,
                                         const std::string &secondary_key) {
-    const bool committed = db.Commit({}, {{kTable, key, value}},
-                                     {{kTable, kIndex, secondary_key, key}}, {},
-                                     helios::storage::CommitDurability::kSync);
+    std::string commit_reason;
+    const bool committed =
+        db.Commit({}, {{kTable, key, TestHelper::Row(value)}},
+                  {{kTable, kIndex, secondary_key, key}}, {},
+                  helios::storage::CommitDurability::kSync, commit_reason);
     db.ReleaseThreadEpoch();
     return committed;
   }
@@ -81,6 +86,7 @@ class RecoveryTest : public ::testing::Test {
                                           const std::string &key) {
     auto result = db.Read(kTable, key);
     db.ReleaseThreadEpoch();
+    if (result.found) result.value = TestHelper::RowPayload(result.value);
     return result;
   }
 
@@ -92,7 +98,7 @@ TEST_F(RecoveryTest, ALoggedWriteCarriesTheUnlockedTid) {
   {
     auto config = MakeConfig(Recovery::kOff);
     helios::storage::Database db(config);
-    db.CreateTable(kTable);
+    TestHelper::CreateTable(db, kTable);
     ASSERT_TRUE(db.CreateSecondaryIndex(
         kTable, kIndex, helios::storage::IndexConstraint::kNone));
     ASSERT_TRUE(CommitWriteWithIndexEntry(db, "k", "v1", "s"));
@@ -109,7 +115,7 @@ TEST_F(RecoveryTest, ALoggedWriteCarriesTheUnlockedTid) {
       if (write.index_name.empty()) {
         if (write.key != "k") continue;
         seen_row = true;
-        EXPECT_EQ(write.buffer, "v1");
+        EXPECT_EQ(write.buffer, TestHelper::Row("v1"));
       } else {
         if (write.key != "s") continue;
         seen_index_entry = true;
@@ -133,7 +139,7 @@ TEST_F(RecoveryTest, ARecoveredKeyAcceptsAFurtherWrite) {
   {
     auto config = MakeConfig(Recovery::kOff);
     helios::storage::Database db(config);
-    db.CreateTable(kTable);
+    TestHelper::CreateTable(db, kTable);
     ASSERT_TRUE(CommitWrite(db, "k", "v1"));
   }
 
@@ -156,7 +162,7 @@ TEST_F(RecoveryTest, ARecoveredKeyAcceptsAFurtherWrite) {
 
   auto config = MakeConfig(Recovery::kOn);
   helios::storage::Database db(config);
-  db.CreateTable(kTable);
+  TestHelper::CreateTable(db, kTable);
   const auto recovered = Read(db, "k");
   EXPECT_TRUE(recovered.found);
   EXPECT_EQ(recovered.value, "v1");
