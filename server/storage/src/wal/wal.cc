@@ -71,27 +71,6 @@ uint32_t GetLe32(const uint8_t *in) {
          (static_cast<uint32_t>(in[3]) << 24);
 }
 
-// Whether these header bytes read as an interrupted write of this build's
-// own frame: a prefix of the constant fields followed by zeroes. Anything
-// else was not produced by writing a frame. A write that stops after the
-// constants is left to the checksum to catch.
-bool IsTorn(const uint8_t *header) {
-  uint8_t expected[8];
-  PutLe32(expected, Wal::kMagic);
-  PutLe16(expected + kOffVersion, Wal::kVersion);
-  PutLe16(expected + kOffFlags, Wal::kFlags);
-
-  size_t matched = 0;
-  while (matched < sizeof(expected) && header[matched] == expected[matched]) {
-    ++matched;
-  }
-  if (matched == sizeof(expected)) return false;
-  for (size_t i = matched; i < Wal::kHeaderSize; ++i) {
-    if (header[i] != 0) return false;
-  }
-  return true;
-}
-
 int Fsync(int fd) {
   int rc;
   do {
@@ -250,14 +229,6 @@ Wal::~Wal() {
   if (fd_ >= 0) ::close(fd_);
 }
 
-WalScanResult Wal::Corrupt(const std::string &detail) {
-  state_ = State::kFailed;
-  WalScanResult result;
-  result.status = WalScanResult::Status::kCorrupt;
-  result.detail = detail;
-  return result;
-}
-
 WalScanResult Wal::IoFailure(const std::string &operation, int error) {
   state_ = State::kFailed;
   WalScanResult result;
@@ -343,86 +314,6 @@ bool Wal::WriteZeroesAndSync(off_t from, off_t to, int *error) {
   return true;
 }
 
-// Looks for a complete frame whose checksum holds at `offset`, and answers
-// only that: a frame that satisfies its own checksum may already have been
-// acknowledged. Empty payloads and zero epochs are excluded as forgeries
-// the write path never produces. Every byte read is charged against the
-// shared `io_budget`; a read that would exceed it is refused.
-Wal::Probe Wal::ProbeFrameAt(off_t offset, off_t file_size, uint64_t *io_budget,
-                             int *error) const {
-  if (file_size - offset < static_cast<off_t>(kHeaderSize)) {
-    return Probe::kNoFrame;
-  }
-
-  uint8_t header[kHeaderSize];
-  if (*io_budget + kHeaderSize > kProbeBudget) return Probe::kUndecidable;
-  if (!PreadAll(header, kHeaderSize, offset, error)) return Probe::kIoError;
-  *io_budget += kHeaderSize;
-  if (GetLe32(header) != kMagic) return Probe::kNoFrame;
-  if (GetLe16(header + kOffVersion) != kVersion) return Probe::kNoFrame;
-  if (GetLe16(header + kOffFlags) != kFlags) return Probe::kNoFrame;
-  if (GetLe32(header + kOffEpoch) == 0) return Probe::kNoFrame;
-
-  const uint32_t payload_size = GetLe32(header + kOffPayloadSize);
-  if (payload_size == 0 || payload_size > kMaxPayloadSize) {
-    return Probe::kNoFrame;
-  }
-  const uint64_t frame_end =
-      static_cast<uint64_t>(offset) + kHeaderSize + payload_size;
-  if (frame_end > static_cast<uint64_t>(file_size)) return Probe::kNoFrame;
-
-  Crc32c crc;
-  crc.Update(header, kCrcCoverage);
-  constexpr size_t kChunkSize = 1ull << 20;
-  std::vector<uint8_t> chunk(std::min<size_t>(kChunkSize, payload_size));
-  off_t at = offset + static_cast<off_t>(kHeaderSize);
-  size_t remaining = payload_size;
-  while (remaining != 0) {
-    const size_t size = std::min(chunk.size(), remaining);
-    if (*io_budget + size > kProbeBudget) return Probe::kUndecidable;
-    if (!PreadAll(chunk.data(), size, at, error)) return Probe::kIoError;
-    *io_budget += size;
-    crc.Update(chunk.data(), size);
-    at += static_cast<off_t>(size);
-    remaining -= size;
-  }
-  return crc.Finish() == GetLe32(header + kCrcCoverage) ? Probe::kFrame
-                                                        : Probe::kNoFrame;
-}
-
-// Looks for a frame beginning anywhere in (offset, search_end). Finding
-// one stops the repair: it may be acknowledged data, or an out-of-order
-// remnant of the same unfinished group, and nothing in the log tells the
-// two apart. The search trusts no length field: `search_end` bounds where
-// a frame may begin (a magic cannot begin among the zeroes), `file_size`
-// bounds where one may end. Reads stop at `kProbeBudget` bytes and report
-// Undecidable rather than continuing unboundedly.
-Wal::Probe Wal::FindFrameAfter(off_t offset, off_t search_end, off_t file_size,
-                               int *error) const {
-  constexpr size_t kChunkSize = 1ull << 20;
-  constexpr size_t kOverlap = sizeof(uint32_t) - 1;
-  std::vector<uint8_t> chunk(kChunkSize);
-  uint64_t io_budget = 0;
-
-  for (off_t at = offset + 1; at < search_end;) {
-    const size_t size =
-        static_cast<size_t>(std::min<off_t>(kChunkSize, search_end - at));
-    if (io_budget + size > kProbeBudget) return Probe::kUndecidable;
-    if (!PreadAll(chunk.data(), size, at, error)) return Probe::kIoError;
-    io_budget += size;
-    for (size_t i = 0; i + sizeof(uint32_t) <= size; ++i) {
-      if (GetLe32(chunk.data() + i) != kMagic) continue;
-      const Probe probe = ProbeFrameAt(at + static_cast<off_t>(i), file_size,
-                                       &io_budget, error);
-      if (probe != Probe::kNoFrame) return probe;
-    }
-    if (size <= kOverlap) break;
-    // A magic that straddles two chunks has to be whole in one of them.
-    at += static_cast<off_t>(size - kOverlap);
-  }
-  return Probe::kNoFrame;
-}
-
 // Reports the offset of the last byte in [from, to) that is not zero, or
 // from - 1 when every byte is.
 bool Wal::FindLastNonZero(off_t from, off_t to, off_t *last_non_zero,
@@ -501,90 +392,12 @@ WalScanResult Wal::FinishScan(WalScanResult &&result, off_t end_of_log) {
   return std::move(result);
 }
 
-/**
- * @brief Advances `offset` through frames at or below `min_epoch` by header
- * alone, without reading payloads.
- *
- * @details On success `offset` is the first frame above `min_epoch`, or the
- * end of the log, which lies before `file_size` when capacity is reserved.
- * The last skipped frame is left in the boundary out-params for the caller to
- * checksum. A header only locates the next frame; it is not proof the frame
- * is undamaged. Every out-param is written only on success.
- *
- * @return False on a header that does not parse or on I/O failure (`*error`
- * set); the caller then scans from offset 0.
- */
-bool Wal::SkipCoveredFrames(EpochNumber min_epoch, off_t file_size,
-                            off_t *offset, EpochNumber *last_epoch,
-                            bool *have_frame, size_t *frames_skipped,
-                            uint64_t *bytes_skipped, off_t *boundary_offset,
-                            uint32_t *boundary_payload_size,
-                            uint8_t *boundary_header, int *error) const {
-  off_t at = 0;
-  EpochNumber local_last_epoch = 0;
-  bool local_have_frame = false;
-  size_t local_frames_skipped = 0;
-  uint64_t local_bytes_skipped = 0;
-  off_t local_boundary_offset = 0;
-  uint32_t local_boundary_payload_size = 0;
-  uint8_t local_boundary_header[kHeaderSize];
-
-  // Every out-param is written here in one place, on the single successful
-  // return below, so a `false` return never leaves a caller trusting a
-  // partial skip.
-  while (at < file_size) {
-    if (file_size - at < static_cast<off_t>(kHeaderSize)) return false;
-    uint8_t header[kHeaderSize];
-    if (!PreadAll(header, kHeaderSize, at, error)) return false;
-    const uint32_t magic = GetLe32(header);
-    const uint16_t version = GetLe16(header + kOffVersion);
-    const uint16_t flags = GetLe16(header + kOffFlags);
-    const uint32_t payload_size = GetLe32(header + kOffPayloadSize);
-    const EpochNumber epoch = GetLe32(header + kOffEpoch);
-    if (magic != kMagic || version != kVersion || flags != kFlags ||
-        payload_size > kMaxPayloadSize) {
-      // Unwritten capacity's zeroes read exactly like a torn header; that is
-      // not a lie to fall back over, just the skip reaching the true end of
-      // the log, which the caller's own torn-tail handling already covers.
-      if (IsTorn(header)) break;
-      return false;
-    }
-    const uint64_t frame_end =
-        static_cast<uint64_t>(at) + kHeaderSize + payload_size;
-    if (frame_end > static_cast<uint64_t>(file_size)) return false;
-    if (local_have_frame && epoch < local_last_epoch) return false;
-    if (epoch == 0) return false;
-    if (epoch > min_epoch) break;
-
-    local_boundary_offset = at;
-    local_boundary_payload_size = payload_size;
-    std::memcpy(local_boundary_header, header, kHeaderSize);
-
-    local_last_epoch = epoch;
-    local_have_frame = true;
-    ++local_frames_skipped;
-    local_bytes_skipped += kHeaderSize + payload_size;
-    at = static_cast<off_t>(frame_end);
-  }
-
-  *offset = at;
-  *last_epoch = local_last_epoch;
-  *have_frame = local_have_frame;
-  *frames_skipped = local_frames_skipped;
-  *bytes_skipped = local_bytes_skipped;
-  *boundary_offset = local_boundary_offset;
-  *boundary_payload_size = local_boundary_payload_size;
-  if (local_have_frame) {
-    std::memcpy(boundary_header, local_boundary_header, kHeaderSize);
-  }
-  return true;
-}
-
 WalScanResult Wal::Scan(EpochNumber min_epoch) {
   // Refuse a scan on an instance that already failed.
   if (state_ == State::kFailed) {
     return IoFailure("scan " + path_ + " after a failure", EIO);
   }
+  state_ = State::kUnscanned;
 
   // Bound the scan by the file size fstat reports.
   struct stat file_stat {};
@@ -601,30 +414,58 @@ WalScanResult Wal::Scan(EpochNumber min_epoch) {
   uint64_t bytes_skipped = 0;
   off_t offset = 0;
 
-  // Everything the skip below established, given up.
-  auto restart_from_zero = [&]() {
-    offset = 0;
-    last_epoch = 0;
-    have_frame = false;
-    frames_skipped = 0;
-    bytes_skipped = 0;
-  };
-
-  // Skip the frames the caller already holds, rewinding to 0 if the skip or
-  // the boundary checksum fails. An I/O error fails the scan instead.
+  // Skip checkpoint-covered frames before reading the remaining records.
   if (min_epoch != 0) {
     off_t boundary_offset = 0;
     uint32_t boundary_payload_size = 0;
     uint8_t boundary_header[kHeaderSize];
+    bool retry_full_scan = false;
     int error = 0;
-    const bool skipped = SkipCoveredFrames(
-        min_epoch, file_size, &offset, &last_epoch, &have_frame,
-        &frames_skipped, &bytes_skipped, &boundary_offset,
-        &boundary_payload_size, boundary_header, &error);
-    if (!skipped && error != 0) {
-      return IoFailure("pread header of " + path_, error);
+
+    // Follow frame headers to the first epoch after the checkpoint.
+    while (offset < file_size) {
+      if (file_size - offset < static_cast<off_t>(kHeaderSize)) {
+        retry_full_scan = true;
+        break;
+      }
+      uint8_t header[kHeaderSize];
+      if (!PreadAll(header, kHeaderSize, offset, &error)) {
+        return IoFailure("pread header of " + path_, error);
+      }
+      const uint32_t magic = GetLe32(header);
+      const uint16_t version = GetLe16(header + kOffVersion);
+      const uint16_t flags = GetLe16(header + kOffFlags);
+      const uint32_t payload_size = GetLe32(header + kOffPayloadSize);
+      const EpochNumber epoch = GetLe32(header + kOffEpoch);
+      if (magic != kMagic || version != kVersion || flags != kFlags ||
+          payload_size > kMaxPayloadSize) {
+        const bool empty_header =
+            std::all_of(header, header + kHeaderSize,
+                        [](uint8_t byte) { return byte == 0; });
+        if (!empty_header) retry_full_scan = true;
+        break;
+      }
+      const uint64_t frame_end =
+          static_cast<uint64_t>(offset) + kHeaderSize + payload_size;
+      if (frame_end > static_cast<uint64_t>(file_size) || epoch == 0 ||
+          (have_frame && epoch < last_epoch)) {
+        retry_full_scan = true;
+        break;
+      }
+      if (epoch > min_epoch) break;
+
+      boundary_offset = offset;
+      boundary_payload_size = payload_size;
+      std::memcpy(boundary_header, header, kHeaderSize);
+      last_epoch = epoch;
+      have_frame = true;
+      ++frames_skipped;
+      bytes_skipped += kHeaderSize + payload_size;
+      offset = static_cast<off_t>(frame_end);
     }
-    if (skipped && have_frame) {
+
+    // Verify the last skipped frame before trusting the resume offset.
+    if (!retry_full_scan && have_frame) {
       std::vector<uint8_t> payload(boundary_payload_size);
       if (!PreadAll(payload.data(), boundary_payload_size,
                     boundary_offset + static_cast<off_t>(kHeaderSize),
@@ -635,38 +476,32 @@ WalScanResult Wal::Scan(EpochNumber min_epoch) {
       crc.Update(boundary_header, kCrcCoverage);
       crc.Update(payload.data(), payload.size());
       if (crc.Finish() != GetLe32(boundary_header + kCrcCoverage)) {
-        // The boundary could be exactly where an earlier lie coincidentally
-        // landed, so a checksum failure here is treated like an unparsable
-        // header: rediscovered and diagnosed by the full scan below.
-        SPDLOG_WARN(
-            "The header skip through {0} left a frame at offset {1} whose "
-            "checksum does not hold; falling back to a full scan from "
-            "offset 0",
-            path_, static_cast<long long>(boundary_offset));
-        restart_from_zero();
+        retry_full_scan = true;
       }
-    } else if (!skipped) {
+    }
+
+    // Retry from offset zero if the header skip could not be verified.
+    if (retry_full_scan) {
       SPDLOG_WARN(
-          "The header skip through {0} landed on bytes that do not parse as a "
-          "frame; falling back to a full scan from offset 0",
+          "Could not skip checkpointed frames in {0}; scanning from offset 0",
           path_);
-      restart_from_zero();
+      offset = 0;
+      last_epoch = 0;
+      have_frame = false;
+      frames_skipped = 0;
+      bytes_skipped = 0;
     }
   }
 
-  // Walk frames: parse the header, checksum, then skip or read.
   uint8_t header[kHeaderSize];
   std::vector<uint8_t> payload;
-  // Empty while frames keep parsing; otherwise why the one at `offset` did
-  // not.
-  std::string anomaly;
-  // Set only for a checksum-mismatch anomaly, to the complete frame's own
-  // declared end: the one anomaly whose extent is otherwise trustworthy.
-  off_t checksum_broken_frame_end = -1;
+  std::string stop_reason;
 
+  // Read complete frames until the first invalid frame.
   while (offset < file_size) {
+    // Validate the header before trusting its payload length.
     if (file_size - offset < static_cast<off_t>(kHeaderSize)) {
-      anomaly = "the file ends inside a frame header";
+      stop_reason = "the file ends inside a frame header";
       break;
     }
     int error = 0;
@@ -681,29 +516,25 @@ WalScanResult Wal::Scan(EpochNumber min_epoch) {
     const EpochNumber epoch = GetLe32(header + kOffEpoch);
     const uint32_t stored_crc = GetLe32(header + kCrcCoverage);
 
-    const char *header_anomaly = nullptr;
     if (magic != kMagic) {
-      header_anomaly = "frame magic mismatch";
+      stop_reason = "frame magic mismatch";
     } else if (version != kVersion) {
-      header_anomaly = "unsupported frame version";
+      stop_reason = "unsupported frame version";
     } else if (flags != kFlags) {
-      header_anomaly = "unknown frame flags";
+      stop_reason = "unknown frame flags";
     } else if (payload_size > kMaxPayloadSize) {
-      header_anomaly = "payload too large";
+      stop_reason = "payload too large";
     }
-    if (header_anomaly != nullptr) {
-      if (!IsTorn(header)) return Corrupt(header_anomaly);
-      anomaly = header_anomaly;
-      break;
-    }
+    if (!stop_reason.empty()) break;
 
     const uint64_t frame_end =
         static_cast<uint64_t>(offset) + kHeaderSize + payload_size;
     if (frame_end > static_cast<uint64_t>(file_size)) {
-      anomaly = "the file ends inside a frame payload";
+      stop_reason = "the file ends inside a frame payload";
       break;
     }
 
+    // Read the payload and verify the frame's checksum and epoch.
     payload.resize(payload_size);
     if (payload_size != 0 &&
         !PreadAll(payload.data(), payload_size, offset + kHeaderSize, &error)) {
@@ -714,20 +545,16 @@ WalScanResult Wal::Scan(EpochNumber min_epoch) {
     crc.Update(header, kCrcCoverage);
     crc.Update(payload.data(), payload.size());
     if (crc.Finish() != stored_crc) {
-      anomaly = "frame checksum mismatch";
-      checksum_broken_frame_end = static_cast<off_t>(frame_end);
+      stop_reason = "frame checksum mismatch";
       break;
     }
 
-    // A frame that satisfies its own checksum was written whole. Anything
-    // wrong with it from here on cannot be blamed on an interrupted write.
-    if (have_frame && epoch < last_epoch)
-      return Corrupt("frame epoch regressed");
-    if (epoch == 0) return Corrupt("frame epoch is zero");
+    if (epoch == 0 || (have_frame && epoch < last_epoch)) {
+      stop_reason = "frame epoch is zero or regressed";
+      break;
+    }
 
-    // The records of a frame the caller already holds are not rebuilt, but the
-    // frame still counts: where the log ends and how far it is durable are
-    // properties of every frame in it.
+    // A full-scan fallback still omits records covered by the checkpoint.
     if (epoch <= min_epoch) {
       ++frames_skipped;
       bytes_skipped += kHeaderSize + payload_size;
@@ -737,6 +564,7 @@ WalScanResult Wal::Scan(EpochNumber min_epoch) {
       continue;
     }
 
+    // Unpack the records and require them to match the frame's epoch.
     LogRecords unpacked;
     try {
       size_t consumed = 0;
@@ -745,20 +573,29 @@ WalScanResult Wal::Scan(EpochNumber min_epoch) {
                           payload.size(), consumed);
       handle.get().convert(unpacked);
       if (consumed != payload.size()) {
-        return Corrupt("frame payload has trailing bytes");
+        stop_reason = "frame payload has trailing bytes";
+        break;
       }
-    } catch (const std::exception &e) {
-      return Corrupt(std::string("frame payload does not unpack: ") + e.what());
-    } catch (...) {
-      return Corrupt("frame payload does not unpack");
+    } catch (const msgpack::unpack_error &e) {
+      stop_reason = std::string("frame payload does not unpack: ") + e.what();
+      break;
+    } catch (const msgpack::type_error &) {
+      stop_reason = "frame payload has the wrong type";
+      break;
     }
-    if (unpacked.empty()) return Corrupt("frame carries no record");
-    for (const auto &record : unpacked) {
-      if (record.epoch != epoch) {
-        return Corrupt("record epoch disagrees with its frame");
-      }
+    if (unpacked.empty()) {
+      stop_reason = "frame carries no record";
+      break;
+    }
+    const bool epoch_mismatch = std::any_of(
+        unpacked.begin(), unpacked.end(),
+        [epoch](const LogRecord &record) { return record.epoch != epoch; });
+    if (epoch_mismatch) {
+      stop_reason = "record epoch disagrees with its frame";
+      break;
     }
 
+    // Keep this frame and advance the recovery boundary.
     records.insert(records.end(), std::make_move_iterator(unpacked.begin()),
                    std::make_move_iterator(unpacked.end()));
     last_epoch = epoch;
@@ -772,56 +609,26 @@ WalScanResult Wal::Scan(EpochNumber min_epoch) {
   result.frames_skipped = frames_skipped;
   result.bytes_skipped = bytes_skipped;
 
-  // Classify the tail that stopped the walk: repair it, or fail-stop.
-  if (!anomaly.empty()) {
+  // Zero only the written suffix after the first invalid frame.
+  if (!stop_reason.empty()) {
     int error = 0;
     off_t last_non_zero = 0;
     if (!FindLastNonZero(offset, file_size, &last_non_zero, &error)) {
       return IoFailure("pread the tail of " + path_, error);
     }
-    // What settles whether the bytes at `offset` end the log is whether any
-    // frame survives beyond them, and that question is asked of the file
-    // rather than of the broken frame's own length: a length corrupted
-    // upwards would otherwise place the frames that follow inside the
-    // region a repair may erase.
     if (last_non_zero >= offset) {
-      // A complete frame that fails its checksum can be the interrupted
-      // tail only if it is also the last thing written: data beyond its
-      // own end means the damage sits among frames older appends already
-      // synced.
-      if (checksum_broken_frame_end >= 0 &&
-          last_non_zero >= checksum_broken_frame_end) {
-        return Corrupt(anomaly + " at offset " + std::to_string(offset) +
-                       ", with data beyond the frame");
-      }
-      switch (FindFrameAfter(offset, last_non_zero + 1, file_size, &error)) {
-        case Probe::kFrame:
-          return Corrupt(anomaly + " at offset " + std::to_string(offset) +
-                         ", with a frame surviving beyond it");
-        case Probe::kUndecidable:
-          return Corrupt(anomaly + " at offset " + std::to_string(offset) +
-                         ", and the tail cannot be classified within its "
-                         "I/O budget");
-        case Probe::kIoError:
-          // Repairing is destructive, so an unreadable candidate is a
-          // reason to stop rather than a reason to believe there is
-          // nothing there.
-          return IoFailure("pread past the tail of " + path_, error);
-        case Probe::kNoFrame:
-          break;
-      }
       if (!WriteZeroesAndSync(offset, last_non_zero + 1, &error)) {
         return IoFailure("zero the tail of " + path_, error);
       }
       SPDLOG_WARN(
-          "Discarded an incomplete tail of {0} at offset {1} ({2}); the "
+          "Discarded the tail of {0} at offset {1} ({2}); the "
           "last epoch is {3}",
-          path_, static_cast<long long>(offset), anomaly, last_epoch);
+          path_, static_cast<long long>(offset), stop_reason, last_epoch);
       result.tail_zeroed = true;
     }
   }
 
-  // Publish the end of the log.
+  // Publish the recovered prefix and its append position.
   result.records = std::move(records);
   return FinishScan(std::move(result), offset);
 }

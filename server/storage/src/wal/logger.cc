@@ -276,12 +276,10 @@ bool Logger::Enqueue(const WriteSet &ws, EpochNumber epoch) {
   return thread_local_logger_->Enqueue(ws, epoch);
 }
 
-Logger::RecoveryResult Logger::FailRecovery(const WalScanResult &scan) {
-  SPDLOG_CRITICAL(
-      "Durability Error: {0} ({1}), errno {2}", scan.detail,
-      scan.status == WalScanResult::Status::kCorrupt ? "corrupt" : "I/O error",
-      scan.error_number);
-  PublishFailure(scan.error_number != 0 ? scan.error_number : EIO);
+Logger::RecoveryResult Logger::FailRecovery(const WalScanResult &wal) {
+  SPDLOG_CRITICAL("Durability Error: {0}, errno {1}",
+                  wal.detail, wal.error_number);
+  PublishFailure(wal.error_number != 0 ? wal.error_number : EIO);
   RecoveryResult result;
   result.status = RecoveryStatus::kFailed;
   return result;
@@ -291,8 +289,6 @@ Logger::RecoveryResult Logger::Recover() {
   // Only a replay reads the checkpoint. A startup that scans the log without
   // replaying it does so to find the end of the log, which the checkpoint says
   // nothing about.
-  // FIXME: a checkpoint is bound to a log by sharing a directory with it, and
-  // neither file names the database it came from
   EpochScanCheckpoint::LoadResult checkpoint;
   if (loads_checkpoint_) {
     checkpoint = EpochScanCheckpoint::Load(work_dir_);
@@ -308,36 +304,25 @@ Logger::RecoveryResult Logger::Recover() {
     }
   }
 
-  auto scan = thread_local_logger_->Scan(checkpoint.start_epoch);
+  const auto wal = thread_local_logger_->Scan(checkpoint.start_epoch);
   RecoveryResult result;
-  if (scan.status != WalScanResult::Status::kOk) return FailRecovery(scan);
+  if (wal.status != WalScanResult::Status::kOk) return FailRecovery(wal);
 
   if (checkpoint.status == EpochScanCheckpoint::LoadResult::Status::kOk) {
-    // The checkpoint is honoured only when this log's last written epoch is at
-    // least the one recorded at publish; a shorter log cannot be the file
-    // that checkpoint named (see the FIXME above).
-    if (scan.last_epoch < checkpoint.wal_last_epoch_at_publish) {
-      SPDLOG_WARN(
-          "Ignoring the checkpoint: it was published when the log was "
-          "durable through epoch {0}, past the last epoch {1} this log "
-          "holds",
-          checkpoint.wal_last_epoch_at_publish, scan.last_epoch);
-      checkpoint.records.clear();
-      // The frames the first scan skipped have to be read now that the
-      // checkpoint is gone.
-      scan = thread_local_logger_->Scan(0);
-      if (scan.status != WalScanResult::Status::kOk) return FailRecovery(scan);
-    } else {
-      SPDLOG_INFO(
-          "Recovering from the checkpoint of epoch {0}: {1} frames of "
-          "{2} bytes are covered by it and are not replayed",
-          checkpoint.start_epoch, scan.frames_skipped, scan.bytes_skipped);
-    }
+    SPDLOG_INFO(
+        "Recovering from the checkpoint of epoch {0}: {1} frames of "
+        "{2} bytes are covered by it and are not replayed",
+        checkpoint.start_epoch, wal.frames_skipped, wal.bytes_skipped);
   }
 
-  durable_epoch_.store(scan.last_epoch, std::memory_order_seq_cst);
-  result.durable_epoch = scan.last_epoch;
-  result.recovery_set = BuildRecoverySet(checkpoint.records, scan.records);
+  // A quiet log can end before the checkpoint's end epoch. Publication
+  // waited for that epoch, so recovery must also resume above it.
+  result.durable_epoch = wal.last_epoch;
+  if (checkpoint.status == EpochScanCheckpoint::LoadResult::Status::kOk) {
+    result.durable_epoch = std::max(wal.last_epoch, checkpoint.end_epoch);
+  }
+  durable_epoch_.store(result.durable_epoch, std::memory_order_seq_cst);
+  result.recovery_set = BuildRecoverySet(checkpoint.records, wal.records);
   return result;
 }
 
@@ -345,10 +330,6 @@ void Logger::StartFlusher() { thread_local_logger_->StartFlusher(); }
 
 void Logger::ScheduleFlush(EpochNumber closed) {
   thread_local_logger_->ScheduleFlush(closed);
-}
-
-EpochNumber Logger::GetWalLastEpoch() const {
-  return thread_local_logger_->GetWalLastEpoch();
 }
 
 bool Logger::IsQuiescent() { return thread_local_logger_->IsQuiescent(); }

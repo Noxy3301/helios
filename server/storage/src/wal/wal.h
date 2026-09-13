@@ -9,7 +9,6 @@
 
 #include <sys/types.h>
 
-#include <atomic>
 #include <cstdint>
 #include <functional>
 #include <map>
@@ -22,43 +21,19 @@ namespace helios::storage {
 namespace wal {
 
 /**
- * @brief Result of scanning the WAL at startup.
+ * @brief The complete WAL prefix recovered at startup.
  *
- * @details
- * `Ok` means every frame up to the end of the log was complete and
- * consistent, and `last_epoch` is the epoch of the last one; a log with no
- * frames yields last_epoch 0. An incomplete or checksum-broken frame at the
- * end of the log is repaired rather than reported: the bytes it left behind
- * are overwritten with zeroes, `tail_zeroed` is set, and the scan still
- * succeeds. Repair requires that no intact frame survives beyond the
- * damage: one that does is taken as evidence that the damage sits in a
- * region older appends already synced.
- *
- * `Corrupt` means damage the scan will not repair:
- *   - a checksum-broken complete frame that is not the last bytes of the
- *     log, whatever follows it;
- *   - a damaged tail with an intact frame surviving beyond it, or one the
- *     search cannot classify within its I/O budget;
- *   - a magic, version, flags or length anomaly whose header does not read
- *     as a torn prefix of the frame constants (one that does is treated as
- *     an interrupted write and repaired instead);
- *   - and, in a complete checksum-valid frame, a regressed or zero epoch or
- *     a payload anomaly.
- * Nothing is zeroed and the caller must fail-stop: the log may be missing
- * records that were already acknowledged as durable.
- *
- * @note Ambiguity is resolved toward fail-stop: a torn group whose pages
- * persisted out of order, or torn user data that embeds a byte-exact intact
- * frame, can fail-stop a repairable log, and manually zeroing the damaged
- * tail then recovers it. The reverse never happens: repair never discards a
- * frame that another intact frame vouches for, and a tail the search cannot
- * classify within its I/O budget also fail-stops.
+ * @details The scan stops at the first invalid frame, zeroes the remaining
+ * written bytes and succeeds with the preceding frames. Recovery assumes
+ * process crashes; media corruption and files from another database are
+ * outside this contract. I/O failures stop recovery without allowing an
+ * append at an unknown offset.
  */
 struct WalScanResult {
-  enum class Status { kOk, kCorrupt, kIoError };
+  enum class Status { kOk, kIoError };
 
-  // kIoError means a syscall the scan needs failed; error_number and detail
-  // describe it, and nothing is zeroed.
+  // On kIoError, error_number and detail name the failed syscall. A failed
+  // repair may have zeroed part of the suffix; its prefix is never erased.
   Status status{Status::kOk};
   EpochNumber last_epoch{0};
   LogRecords records;
@@ -82,7 +57,7 @@ struct WalAppendResult {
  * @details `pwrite` and `fdatasync` carry a group; `initialise_pwrite`
  * carries the zeroes that reserve capacity, kept separate so a capacity
  * failure cannot consume an injection aimed at a group; `pread` is what
- * the scan and the tail search read through.
+ * the scan and the repair-range check read through.
  * @note Everything else (open, flock, fstat, and the fsync that follows a
  * zero write) is always the real syscall.
  * @note HELIOS_WAL_FDATASYNC_FAIL_AFTER=<count> makes the fdatasync that
@@ -195,19 +170,6 @@ class Wal {
   off_t write_offset() const { return write_offset_; }
 
   /**
-   * @brief The epoch of the last frame actually on disk.
-   * @details Safe to load from a thread that does not own this instance.
-   * This moves only when a frame is written: an epoch that closed
-   * without a record advances the durable epoch a commit waits on, but it
-   * advances this not at all, which is what a caller needs from it when the
-   * question is what the log itself can be trusted to still hold after a
-   * crash.
-   */
-  EpochNumber last_epoch() const {
-    return last_epoch_.load(std::memory_order_seq_cst);
-  }
-
-  /**
    * @brief How many times capacity had to be extended.
    * @details Each extension synchronously writes out a whole new zeroed
    * region before the group that needed it.
@@ -224,41 +186,26 @@ class Wal {
 
  private:
   enum class State { kUnscanned, kReady, kFailed };
-  /**
-   * @brief Outcome of looking for a frame at one offset.
-   * @details A read that fails is its own answer and never a "no": what
-   * follows a negative answer is a repair that erases bytes, so an
-   * unreadable candidate has to stop the scan instead. Exhausting the
-   * probe's I/O budget is the same kind of non-answer: the search stops
-   * rather than guessing that nothing was there.
-   */
-  enum class Probe { kNoFrame, kFrame, kIoError, kUndecidable };
-
-  WalScanResult Corrupt(const std::string &detail);
   WalScanResult IoFailure(const std::string &operation, int error);
   WalScanResult FinishScan(WalScanResult &&result, off_t end_of_log);
-  bool SkipCoveredFrames(EpochNumber min_epoch, off_t file_size, off_t *offset,
-                         EpochNumber *last_epoch, bool *have_frame,
-                         size_t *frames_skipped, uint64_t *bytes_skipped,
-                         off_t *boundary_offset,
-                         uint32_t *boundary_payload_size,
-                         uint8_t *boundary_header, int *error) const;
-  Probe ProbeFrameAt(off_t offset, off_t file_size, uint64_t *io_budget,
-                     int *error) const;
-  Probe FindFrameAfter(off_t offset, off_t search_end, off_t file_size,
-                       int *error) const;
   bool FindLastNonZero(off_t from, off_t to, off_t *last_non_zero,
                        int *error) const;
   bool EnsureCapacityFor(off_t end_of_log, size_t group_size, int *error);
   bool WriteZeroesAndSync(off_t from, off_t to, int *error);
   bool WriteAllAt(const uint8_t *data, size_t size, off_t offset, int *error);
-  bool PreadAll(uint8_t *out, size_t size, off_t offset, int *error) const;
 
-  // Cumulative bytes FindFrameAfter and the ProbeFrameAt calls it makes
-  // may read while looking for a survivor past one damaged tail. Bounds the
-  // search: each false-positive magic match costs a fresh checksum re-read,
-  // and without a bound that cost is unbounded in the number of candidates.
-  static constexpr uint64_t kProbeBudget = 1024ull * 1024ull * 1024ull;
+  /**
+   * @brief Reads exactly size bytes from the WAL at offset into out.
+   *
+   * @details Retries short reads and EINTR without changing the file's
+   * current position.
+   *
+   * @param[out] out Buffer with room for size bytes; may be partly filled
+   * on failure.
+   * @param[out] error Receives errno on failure, or EIO on unexpected EOF.
+   * @return True when all requested bytes were read.
+   */
+  bool PreadAll(uint8_t *out, size_t size, off_t offset, int *error) const;
 
   std::string path_;
   WalIo io_;
@@ -266,8 +213,7 @@ class Wal {
   uint64_t initial_capacity_bytes_;
   State state_{State::kUnscanned};
   off_t write_offset_{0};
-  std::atomic<EpochNumber> last_epoch_{
-      0};  // read cross-thread through last_epoch()
+  EpochNumber last_epoch_{0};
   // The file's size, which under preallocation is also the offset below
   // which every block is allocated and holds written-out zeroes.
   off_t initialised_size_{0};

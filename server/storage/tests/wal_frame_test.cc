@@ -25,7 +25,6 @@ namespace {
 // Offsets inside a frame header (magic, version, flags, payload length,
 // epoch, checksum).
 constexpr off_t kFlagsOffset = 6;
-constexpr off_t kPayloadLenOffset = 8;
 
 using helios::storage::EpochNumber;
 using helios::storage::wal::Crc32c;
@@ -115,26 +114,6 @@ class WalFrameTest : public ::testing::Test {
     ASSERT_EQ(::close(fd), 0);
   }
 
-  /**
-   * @brief Rewrites the payload length of the frame at `frame_offset`, leaving
-   *        the checksum stale.
-   *
-   * @details Stands in for damage to the one field that says how far the frame
-   * reaches, which is the field a repair must not take on trust.
-   */
-  void SetPayloadLengthAt(off_t frame_offset, uint32_t length) {
-    const int fd = ::open(WalPath().c_str(), O_WRONLY);
-    ASSERT_GE(fd, 0);
-    const uint8_t bytes[4] = {static_cast<uint8_t>(length & 0xffu),
-                              static_cast<uint8_t>((length >> 8) & 0xffu),
-                              static_cast<uint8_t>((length >> 16) & 0xffu),
-                              static_cast<uint8_t>((length >> 24) & 0xffu)};
-    ASSERT_EQ(
-        ::pwrite(fd, bytes, sizeof(bytes), frame_offset + kPayloadLenOffset),
-        4);
-    ASSERT_EQ(::close(fd), 0);
-  }
-
   /** Offset one past the frame at `frame_offset`, taken from its own
    * length. */
   off_t FrameEnd(off_t frame_offset) {
@@ -203,19 +182,13 @@ class WalFrameTest : public ::testing::Test {
     return header;
   }
 
-  // A complete frame with a correct checksum over an arbitrary payload,
-  // standing in for on-disk bytes that damage or an append produced. The
-  // header fields default to valid values and can be overridden to build
-  // frames the scan must reject on the field alone.
+  // A complete frame with a correct checksum over an arbitrary payload.
   std::vector<uint8_t> MakeFrame(EpochNumber epoch,
-                                 const std::vector<uint8_t> &payload,
-                                 uint32_t magic = Wal::kMagic,
-                                 uint16_t version = Wal::kVersion,
-                                 uint16_t flags = Wal::kFlags) {
+                                 const std::vector<uint8_t> &payload) {
     std::vector<uint8_t> frame;
-    PutLe32(frame, magic);
-    PutLe16(frame, version);
-    PutLe16(frame, flags);
+    PutLe32(frame, Wal::kMagic);
+    PutLe16(frame, Wal::kVersion);
+    PutLe16(frame, Wal::kFlags);
     PutLe32(frame, static_cast<uint32_t>(payload.size()));
     PutLe32(frame, epoch);
     Crc32c crc;
@@ -252,16 +225,20 @@ TEST_F(WalFrameTest, ScanOfAFreshLogHasNoLastEpoch) {
 
 TEST_F(WalFrameTest, ScanReturnsTheLastCompleteEpoch) {
   AppendEpochs({1, 3});
+  // Frames may share an epoch, and empty epochs leave gaps in the log.
+  WriteRawBytesAt(EndOfLog(), MakeFrame(3, PackRecords(MakeRecords(3, "again"))));
 
   Wal wal(work_dir_, helios::storage::wal::WalIo::Posix(), kCapacity);
   const auto result = wal.Scan();
   ASSERT_EQ(result.status, WalScanResult::Status::kOk);
   EXPECT_EQ(result.last_epoch, 3u);
   EXPECT_FALSE(result.tail_zeroed);
-  ASSERT_EQ(result.records.size(), 2u);
+  ASSERT_EQ(result.records.size(), 3u);
   EXPECT_EQ(result.records[0].epoch, 1u);
   EXPECT_EQ(result.records[1].epoch, 3u);
+  EXPECT_EQ(result.records[2].epoch, 3u);
   EXPECT_EQ(result.records[0].writes.at(0).key, "k1");
+  EXPECT_EQ(result.records[2].writes.at(0).key, "again");
 }
 
 TEST_F(WalFrameTest, AGroupIsOneWriteAndOneSync) {
@@ -304,49 +281,47 @@ TEST_F(WalFrameTest, GroupSkipsBucketsAboveTheTarget) {
   EXPECT_EQ(result.records.size(), 2u);
 }
 
-TEST_F(WalFrameTest, TailCorruptionIsRepairedAndLaterGroupsRecover) {
+TEST_F(WalFrameTest, TheFirstInvalidFrameEndsThePrefixAndAppendResumesThere) {
   AppendEpochs({1, 2, 3});
-  const off_t full_end = EndOfLog();
+  const off_t damaged = FrameEnd(0);
+  const off_t file_size = FileSize();
 
-  // Damage the checksum of the last frame only.
-  FlipByteAt(full_end - 1);
-
-  off_t repaired_end = 0;
+  // A complete third frame does not license reading past the broken second.
+  FlipByteAt(damaged + static_cast<off_t>(Wal::kHeaderSize) + 1);
   {
     Wal wal(work_dir_, helios::storage::wal::WalIo::Posix(), kCapacity);
     const auto result = wal.Scan();
     ASSERT_EQ(result.status, WalScanResult::Status::kOk) << result.detail;
     EXPECT_TRUE(result.tail_zeroed);
-    EXPECT_EQ(result.last_epoch, 2u);
-    ASSERT_EQ(result.records.size(), 2u);
-    repaired_end = wal.write_offset();
-    EXPECT_LT(repaired_end, full_end);
+    EXPECT_EQ(result.last_epoch, 1u);
+    ASSERT_EQ(result.records.size(), 1u);
+    EXPECT_EQ(result.records[0].writes.at(0).key, "k1");
+    EXPECT_EQ(wal.write_offset(), damaged);
   }
+  AssertRangeIsZero(damaged, file_size);
+  EXPECT_EQ(FileSize(), file_size);
 
-  // The repaired log must accept further groups and read back cleanly, and
-  // its file size must not have moved: repair zeroes bytes, it never
-  // shrinks the file.
-  const off_t file_size_before = FileSize();
-  {
-    Wal wal(work_dir_, helios::storage::wal::WalIo::Posix(), kCapacity);
-    ASSERT_EQ(wal.Scan().status, WalScanResult::Status::kOk);
-    ASSERT_EQ(wal.write_offset(), repaired_end);
-    EXPECT_EQ(FileSize(), file_size_before);
-    std::map<EpochNumber, LogRecords> buckets;
-    buckets[4] = MakeRecords(4, "k4");
-    ASSERT_TRUE(wal.AppendGroup(buckets, 4).ok);
-    EXPECT_GT(wal.write_offset(), repaired_end);
-    EXPECT_EQ(FileSize(), file_size_before);
-  }
+  // Repair keeps the reservation and restores the offset used by the next
+  // process, even when its new group is shorter than the discarded suffix.
   {
     Wal wal(work_dir_, helios::storage::wal::WalIo::Posix(), kCapacity);
     const auto result = wal.Scan();
-    ASSERT_EQ(result.status, WalScanResult::Status::kOk) << result.detail;
+    ASSERT_EQ(result.status, WalScanResult::Status::kOk);
     EXPECT_FALSE(result.tail_zeroed);
-    EXPECT_EQ(result.last_epoch, 4u);
-    ASSERT_EQ(result.records.size(), 3u);
-    EXPECT_EQ(result.records[2].epoch, 4u);
+    ASSERT_EQ(wal.write_offset(), damaged);
+    std::map<EpochNumber, LogRecords> buckets;
+    buckets[4] = MakeRecords(4, "k4");
+    ASSERT_TRUE(wal.AppendGroup(buckets, 4).ok);
+    EXPECT_EQ(FileSize(), file_size);
   }
+  Wal wal(work_dir_, helios::storage::wal::WalIo::Posix(), kCapacity);
+  const auto result = wal.Scan();
+  ASSERT_EQ(result.status, WalScanResult::Status::kOk) << result.detail;
+  EXPECT_FALSE(result.tail_zeroed);
+  EXPECT_EQ(result.last_epoch, 4u);
+  ASSERT_EQ(result.records.size(), 2u);
+  EXPECT_EQ(result.records[0].writes.at(0).key, "k1");
+  EXPECT_EQ(result.records[1].writes.at(0).key, "k4");
 }
 
 TEST_F(WalFrameTest, PartialHeaderIsRepaired) {
@@ -383,188 +358,171 @@ TEST_F(WalFrameTest, PartialHeaderIsRepaired) {
 
 TEST_F(WalFrameTest, PartialPayloadIsRepaired) {
   AppendEpochs({1, 2});
-  const off_t full_end = EndOfLog();
-  const off_t full_size = FileSize();
+  const off_t log_end = EndOfLog();
+  const off_t file_size = FileSize();
 
-  // A torn group write landed a full header claiming fifty payload bytes and
-  // only ten of them; the rest read back as the zeroes of unused capacity.
-  auto torn = MakeHeaderClaimingPayload(3, 50);
-  torn.insert(torn.end(), 10, 0xab);
-  WriteRawBytesAt(full_end, torn);
+  // A full header with only ten payload bytes. The declared end may lie in
+  // the reservation or beyond the file; both leave the same valid prefix.
+  for (const uint32_t length : {50u, static_cast<uint32_t>(kCapacity)}) {
+    SCOPED_TRACE(length);
+    auto torn = MakeHeaderClaimingPayload(3, length);
+    torn.insert(torn.end(), 10, 0xab);
+    WriteRawBytesAt(log_end, torn);
+
+    Wal wal(work_dir_, helios::storage::wal::WalIo::Posix(), kCapacity);
+    const auto result = wal.Scan();
+    ASSERT_EQ(result.status, WalScanResult::Status::kOk) << result.detail;
+    EXPECT_TRUE(result.tail_zeroed);
+    EXPECT_EQ(result.last_epoch, 2u);
+    EXPECT_EQ(result.records.size(), 2u);
+    EXPECT_EQ(wal.write_offset(), log_end);
+    AssertRangeIsZero(log_end, file_size);
+    EXPECT_EQ(FileSize(), file_size);
+  }
+}
+
+TEST_F(WalFrameTest, AnInvalidHeaderEndsTheRecoveredPrefix) {
+  AppendEpochs({1, 2});
+  const off_t damaged = FrameEnd(0);
+  WriteRawBytesAt(damaged + kFlagsOffset, {0x07, 0x00});
 
   Wal wal(work_dir_, helios::storage::wal::WalIo::Posix(), kCapacity);
   const auto result = wal.Scan();
   ASSERT_EQ(result.status, WalScanResult::Status::kOk) << result.detail;
   EXPECT_TRUE(result.tail_zeroed);
-  EXPECT_EQ(result.last_epoch, 2u);
-  EXPECT_EQ(wal.write_offset(), full_end);
-  EXPECT_EQ(FileSize(), full_size);
+  EXPECT_EQ(result.last_epoch, 1u);
+  ASSERT_EQ(result.records.size(), 1u);
+  EXPECT_EQ(wal.write_offset(), damaged);
+  AssertRangeIsZero(damaged, FileSize());
 }
 
-// A header whose constant fields arrived whole cannot be the remains of a
-// write that stopped partway, so it is damage even with nothing written
-// after it. Put at the end of the log, where an interrupted write would
-// have left its bytes.
-TEST_F(WalFrameTest, WholeHeaderWithUnknownFlagsAtTheLogEndFails) {
+TEST_F(WalFrameTest, AnEmbeddedFrameDoesNotSurviveTheTornTail) {
   AppendEpochs({1});
   const off_t log_end = EndOfLog();
-
-  const std::vector<uint8_t> header = {0x4c, 0x41, 0x57, 0x4c,
-                                       0x01, 0x00, 0x07, 0x00};
-  WriteRawBytesAt(log_end, header);
+  const auto embedded = MakeFrame(5, PackRecords(MakeRecords(5, "k5")));
+  auto torn = MakeHeaderClaimingPayload(6, 4096);
+  torn.insert(torn.end(), embedded.begin(), embedded.end());
+  WriteRawBytesAt(log_end, torn);
 
   Wal wal(work_dir_, helios::storage::wal::WalIo::Posix(), kCapacity);
   const auto result = wal.Scan();
-  EXPECT_EQ(result.status, WalScanResult::Status::kCorrupt);
-  EXPECT_FALSE(result.tail_zeroed);
+  ASSERT_EQ(result.status, WalScanResult::Status::kOk) << result.detail;
+  EXPECT_TRUE(result.tail_zeroed);
+  EXPECT_EQ(result.last_epoch, 1u);
+  ASSERT_EQ(result.records.size(), 1u);
+  EXPECT_EQ(wal.write_offset(), log_end);
+  AssertRangeIsZero(log_end, FileSize());
 }
 
-// The same header inside the log rather than at its end.
-TEST_F(WalFrameTest, UnknownFlagsInAnExistingFrameFail) {
+TEST_F(WalFrameTest, MalformedPayloadsEndTheRecoveredPrefix) {
   AppendEpochs({1});
-
-  // The flags field of the frame the log opens with.
-  WriteRawBytesAt(kFlagsOffset, {0x07, 0x00});
-
-  Wal wal(work_dir_, helios::storage::wal::WalIo::Posix(), kCapacity);
-  const auto result = wal.Scan();
-  EXPECT_EQ(result.status, WalScanResult::Status::kCorrupt);
-  EXPECT_FALSE(result.tail_zeroed);
-}
-
-/**
- * @brief A length corrupted upwards must not be allowed to define the region a
- *        repair may erase.
- *
- * The frame at offset 0 claims to run to the end of the log, so every frame
- * that follows falls inside its declared extent and the bytes after that
- * extent are the zeroes of unused capacity. A repair judged by "is anything
- * written past where this frame ends" would accept it and zero the whole
- * log; the frames that follow were acknowledged as durable.
- */
-TEST_F(WalFrameTest, ALengthThatSwallowsLaterFramesFails) {
-  AppendEpochs({1, 2, 3});
   const off_t log_end = EndOfLog();
-  const off_t file_size = FileSize();
-
-  SetPayloadLengthAt(0, static_cast<uint32_t>(log_end - Wal::kHeaderSize));
-
-  Wal wal(work_dir_, helios::storage::wal::WalIo::Posix(), kCapacity);
-  const auto result = wal.Scan();
-  EXPECT_EQ(result.status, WalScanResult::Status::kCorrupt) << result.detail;
-  EXPECT_FALSE(result.tail_zeroed);
-  EXPECT_EQ(result.last_epoch, 0u);
-  EXPECT_EQ(wal.write_offset(), 0);
-  EXPECT_EQ(FileSize(), file_size);
-}
-
-// The same corruption taken past the end of the file, where no bound
-// derived from the length can reject anything at all.
-TEST_F(WalFrameTest, ALengthPastTheFileWithLaterFramesFails) {
-  AppendEpochs({1, 2, 3});
-  const off_t file_size = FileSize();
-
-  SetPayloadLengthAt(0, static_cast<uint32_t>(file_size + 4096));
-
-  Wal wal(work_dir_, helios::storage::wal::WalIo::Posix(), kCapacity);
-  const auto result = wal.Scan();
-  EXPECT_EQ(result.status, WalScanResult::Status::kCorrupt) << result.detail;
-  EXPECT_FALSE(result.tail_zeroed);
-  EXPECT_EQ(FileSize(), file_size);
-}
-
-// The last frame's length corrupted upwards, with nothing surviving beyond
-// it, is indistinguishable from a write that stopped inside a large frame.
-TEST_F(WalFrameTest, ALengthCorruptedOnTheLastFrameIsRepaired) {
-  AppendEpochs({1, 2});
-  const off_t log_end = EndOfLog();
-  ASSERT_GT(log_end, static_cast<off_t>(Wal::kHeaderSize) * 2);
-
-  const off_t second = FrameEnd(0);
-  SetPayloadLengthAt(second, 4096);
-
-  {
+  auto trailing = PackRecords(MakeRecords(2, "k2"));
+  trailing.push_back(0x00);
+  const std::vector<std::vector<uint8_t>> payloads = {
+      {0xc1},                            // invalid MessagePack
+      trailing,                          // bytes after the record list
+      PackRecords(LogRecords{}),         // empty record list
+      PackRecords(MakeRecords(7, "k7")),  // disagrees with frame epoch 2
+  };
+  for (const auto &payload : payloads) {
+    // Recompute the checksum so the decoder, not CRC, rejects the frame.
+    WriteRawBytesAt(log_end, MakeFrame(2, payload));
     Wal wal(work_dir_, helios::storage::wal::WalIo::Posix(), kCapacity);
     const auto result = wal.Scan();
     ASSERT_EQ(result.status, WalScanResult::Status::kOk) << result.detail;
     EXPECT_TRUE(result.tail_zeroed);
     EXPECT_EQ(result.last_epoch, 1u);
-    EXPECT_EQ(wal.write_offset(), second);
+    ASSERT_EQ(result.records.size(), 1u);
+    EXPECT_EQ(result.records[0].writes.at(0).key, "k1");
+    EXPECT_EQ(wal.write_offset(), log_end);
+    AssertRangeIsZero(log_end, FileSize());
   }
-  // The second frame's real bytes, not just its now-disowned length claim,
-  // are restored to zero.
-  AssertRangeIsZero(second, log_end);
+}
 
-  // A later scan finds nothing left to repair.
+TEST_F(WalFrameTest, ZeroOrRegressedEpochEndsTheRecoveredPrefix) {
+  AppendEpochs({3});
+  const off_t log_end = EndOfLog();
+  for (const EpochNumber epoch : {0u, 2u}) {
+    SCOPED_TRACE(epoch);
+    WriteRawBytesAt(
+        log_end, MakeFrame(epoch, PackRecords(MakeRecords(epoch, "k"))));
+    Wal wal(work_dir_, helios::storage::wal::WalIo::Posix(), kCapacity);
+    const auto result = wal.Scan();
+    ASSERT_EQ(result.status, WalScanResult::Status::kOk) << result.detail;
+    EXPECT_TRUE(result.tail_zeroed);
+    EXPECT_EQ(result.last_epoch, 3u);
+    EXPECT_EQ(result.records.size(), 1u);
+    EXPECT_EQ(wal.write_offset(), log_end);
+    AssertRangeIsZero(log_end, FileSize());
+  }
+}
+
+TEST_F(WalFrameTest, AZeroHeaderBeforeNonzeroBytesEndsTheRecoveredPrefix) {
+  AppendEpochs({1});
+  const off_t log_end = EndOfLog();
+  // Frame-like bytes after the reserved-zero header are outside the prefix.
+  WriteRawBytesAt(log_end + 128, MakeFrame(2, PackRecords(MakeRecords(2, "k2"))));
+
   Wal wal(work_dir_, helios::storage::wal::WalIo::Posix(), kCapacity);
   const auto result = wal.Scan();
   ASSERT_EQ(result.status, WalScanResult::Status::kOk) << result.detail;
+  EXPECT_TRUE(result.tail_zeroed);
+  EXPECT_EQ(result.last_epoch, 1u);
+  EXPECT_EQ(result.records.size(), 1u);
+  EXPECT_EQ(wal.write_offset(), log_end);
+  AssertRangeIsZero(log_end, FileSize());
+}
+
+TEST_F(WalFrameTest, AReadFailureDoesNotRepairTheLog) {
+  AppendEpochs({1, 2});
+  const off_t payload_offset = FrameEnd(0) + Wal::kHeaderSize;
+  const off_t log_end = EndOfLog();
+  const off_t file_size = FileSize();
+  auto io = helios::storage::wal::WalIo::Posix();
+  const auto real_pread = io.pread;
+  io.pread = [real_pread, payload_offset](int fd, void *data, size_t size,
+                                        off_t offset) -> ssize_t {
+    if (offset == payload_offset) {
+      errno = EIO;
+      return -1;
+    }
+    return real_pread(fd, data, size, offset);
+  };
+  {
+    Wal wal(work_dir_, io, kCapacity);
+    const auto result = wal.Scan();
+    EXPECT_EQ(result.status, WalScanResult::Status::kIoError);
+    EXPECT_EQ(result.error_number, EIO);
+    EXPECT_FALSE(result.tail_zeroed);
+    EXPECT_EQ(wal.write_offset(), 0);
+  }
+  Wal wal(work_dir_, helios::storage::wal::WalIo::Posix(), kCapacity);
+  const auto result = wal.Scan();
+  ASSERT_EQ(result.status, WalScanResult::Status::kOk);
   EXPECT_FALSE(result.tail_zeroed);
-  EXPECT_EQ(wal.write_offset(), second);
+  EXPECT_EQ(result.records.size(), 2u);
+  EXPECT_EQ(result.last_epoch, 2u);
+  EXPECT_EQ(wal.write_offset(), log_end);
+  EXPECT_EQ(FileSize(), file_size);
 }
 
-// A complete frame that fails its checksum is the interrupted tail only if
-// it is also the last thing written. Non-frame junk sitting past its own
-// declared end proves something was written after it, so the damage sits
-// among frames older appends already synced, and repair must not zero over
-// it just because no intact frame happens to be findable there either.
-TEST_F(WalFrameTest, AChecksumBrokenFrameFollowedByJunkFailsWithoutRepairing) {
-  AppendEpochs({1});
-  const off_t frame_end = FrameEnd(0);
+TEST_F(WalFrameTest, ARepairWriteFailureDoesNotReturnARecoveredPrefix) {
+  AppendEpochs({1, 2});
+  const off_t damaged = FrameEnd(0);
+  FlipByteAt(damaged + Wal::kHeaderSize + 1);
+  auto io = helios::storage::wal::WalIo::Posix();
+  io.initialise_pwrite = [](int, const void *, size_t, off_t) -> ssize_t {
+    errno = ENOSPC;
+    return -1;
+  };
 
-  // Break the checksum without changing the frame's declared length.
-  FlipByteAt(static_cast<off_t>(Wal::kHeaderSize) + 1);
-  // Junk that is neither a frame nor zero, placed right at the frame's own
-  // end.
-  const std::vector<uint8_t> junk(4, 0x55);
-  WriteRawBytesAt(frame_end, junk);
-  const off_t full_size = FileSize();
-
-  Wal wal(work_dir_, helios::storage::wal::WalIo::Posix(), kCapacity);
+  Wal wal(work_dir_, io, kCapacity);
   const auto result = wal.Scan();
-  EXPECT_EQ(result.status, WalScanResult::Status::kCorrupt);
-  EXPECT_NE(result.detail.find("with data beyond the frame"), std::string::npos)
-      << result.detail;
-  EXPECT_EQ(FileSize(), full_size);
-
-  // The failed scan must not have touched the file: the junk reads back
-  // unchanged.
-  const int fd = ::open(WalPath().c_str(), O_RDONLY);
-  ASSERT_GE(fd, 0);
-  uint8_t readback[4] = {0, 0, 0, 0};
-  ASSERT_EQ(::pread(fd, readback, sizeof(readback), frame_end),
-            static_cast<ssize_t>(sizeof(readback)));
-  ASSERT_EQ(::close(fd), 0);
-  EXPECT_EQ(std::memcmp(readback, junk.data(), junk.size()), 0);
-}
-
-TEST_F(WalFrameTest, MidLogCorruptionFailsWithoutRepairing) {
-  AppendEpochs({1, 2, 3});
-  const off_t full_size = FileSize();
-
-  // Damage the first frame's payload, leaving valid frames after it.
-  FlipByteAt(static_cast<off_t>(Wal::kHeaderSize) + 1);
-
-  Wal wal(work_dir_, helios::storage::wal::WalIo::Posix(), kCapacity);
-  const auto result = wal.Scan();
-  EXPECT_EQ(result.status, WalScanResult::Status::kCorrupt);
+  EXPECT_EQ(result.status, WalScanResult::Status::kIoError);
+  EXPECT_EQ(result.error_number, ENOSPC);
   EXPECT_FALSE(result.tail_zeroed);
-  EXPECT_EQ(result.last_epoch, 0u);
-  EXPECT_EQ(FileSize(), full_size);
-}
-
-TEST_F(WalFrameTest, OversizedPayloadLengthFailsWithoutRepairing) {
-  AppendEpochs({1});
-  const off_t full_size = FileSize();
-
-  // payload_len sits at offset 8 and is rejected above 256 MiB.
-  const uint8_t oversized[4] = {0x01, 0x00, 0x00, 0x20};  // 0x20000001
-  WriteRawBytesAt(8, std::vector<uint8_t>(oversized, oversized + 4));
-
-  Wal wal(work_dir_, helios::storage::wal::WalIo::Posix(), kCapacity);
-  const auto result = wal.Scan();
-  EXPECT_EQ(result.status, WalScanResult::Status::kCorrupt);
-  EXPECT_EQ(FileSize(), full_size);
+  EXPECT_EQ(wal.write_offset(), 0);
 }
 
 TEST_F(WalFrameTest, AnAppendBelowTheLastEpochIsRefused) {
@@ -591,246 +549,6 @@ TEST_F(WalFrameTest, AnAppendBeforeTheScanIsRefused) {
   std::map<EpochNumber, LogRecords> buckets;
   buckets[1] = MakeRecords(1, "k1");
   EXPECT_DEATH(wal.AppendGroup(buckets, 1), "");
-}
-
-TEST_F(WalFrameTest, EpochRegressionOnDiskFailsWithoutRepairing) {
-  AppendEpochs({3});
-  const off_t log_end = EndOfLog();
-  // A legitimate AppendGroup call can no longer produce this: the last epoch
-  // check refuses a regressed epoch before any write. Forged directly on
-  // disk, standing in for a build without that check, or for corruption.
-  WriteRawBytesAt(log_end, MakeFrame(2, PackRecords(MakeRecords(2, "k2"))));
-  const off_t full_size = FileSize();
-
-  Wal wal(work_dir_, helios::storage::wal::WalIo::Posix(), kCapacity);
-  const auto result = wal.Scan();
-  EXPECT_EQ(result.status, WalScanResult::Status::kCorrupt);
-  EXPECT_EQ(FileSize(), full_size);
-}
-
-TEST_F(WalFrameTest, AZeroEpochFrameFailsWithoutRepairing) {
-  const off_t log_end = EndOfLog();  // creates the file and its capacity
-  WriteRawBytesAt(log_end, MakeFrame(0, PackRecords(MakeRecords(0, "k0"))));
-  const off_t full_size = FileSize();
-
-  Wal wal(work_dir_, helios::storage::wal::WalIo::Posix(), kCapacity);
-  const auto result = wal.Scan();
-  EXPECT_EQ(result.status, WalScanResult::Status::kCorrupt);
-  EXPECT_EQ(FileSize(), full_size);
-}
-
-TEST_F(WalFrameTest, ARecordDisagreeingWithItsFrameFailsWithoutRepairing) {
-  AppendEpochs({1});
-  const off_t log_end = EndOfLog();
-  // The frame says epoch 2; the record inside says epoch 7.
-  WriteRawBytesAt(log_end, MakeFrame(2, PackRecords(MakeRecords(7, "k7"))));
-  const off_t full_size = FileSize();
-
-  Wal wal(work_dir_, helios::storage::wal::WalIo::Posix(), kCapacity);
-  const auto result = wal.Scan();
-  EXPECT_EQ(result.status, WalScanResult::Status::kCorrupt);
-  EXPECT_EQ(FileSize(), full_size);
-}
-
-TEST_F(WalFrameTest, ATornTailEmbeddingAFrameImageFailsStop) {
-  AppendEpochs({1});
-  const off_t log_end = EndOfLog();
-
-  // A torn frame whose recorded payload embeds a byte-exact intact frame,
-  // records and all. The search cannot tell it from damage in an
-  // already-synced region, and ambiguity resolves toward fail-stop, never
-  // toward repair.
-  const auto embedded = MakeFrame(5, PackRecords(MakeRecords(5, "k5")));
-  auto torn = MakeHeaderClaimingPayload(6, 4096);
-  torn.insert(torn.end(), embedded.begin(), embedded.end());
-  WriteRawBytesAt(log_end, torn);
-  const off_t full_size = FileSize();
-
-  Wal wal(work_dir_, helios::storage::wal::WalIo::Posix(), kCapacity);
-  const auto result = wal.Scan();
-  EXPECT_EQ(result.status, WalScanResult::Status::kCorrupt);
-  EXPECT_EQ(FileSize(), full_size);
-}
-
-/**
- * @brief A record's value may hold anything, including the bytes of a frame
- *        that would pass its own checksum.
- *
- * @details Inside the payload of a frame that is itself broken, such bytes are
- * indistinguishable from a frame that survived the damage.
- *
- * The choice made here is to fail-stop: refusing to start is recoverable by
- * hand, whereas erasing what might be an acknowledged frame is not.
- */
-TEST_F(WalFrameTest, AFrameForgedInsideAPayloadIsFailedOn) {
-  const auto frame = MakeFrame(9, PackRecords(MakeRecords(9, "forged")));
-  const std::string forged(frame.begin(), frame.end());
-
-  // Committed as the value of a record, then the frame that carries it is
-  // broken.
-  {
-    Wal wal(work_dir_, helios::storage::wal::WalIo::Posix(), kCapacity);
-    ASSERT_EQ(wal.Scan().status, WalScanResult::Status::kOk);
-    LogRecords records = MakeRecords(1, "carrier");
-    records[0].writes[0].buffer = forged;
-    std::map<EpochNumber, LogRecords> buckets;
-    buckets[1] = std::move(records);
-    ASSERT_TRUE(wal.AppendGroup(buckets, 1).ok);
-  }
-  FlipByteAt(static_cast<off_t>(Wal::kHeaderSize) + 1);
-
-  Wal wal(work_dir_, helios::storage::wal::WalIo::Posix(), kCapacity);
-  const auto result = wal.Scan();
-  EXPECT_EQ(result.status, WalScanResult::Status::kCorrupt) << result.detail;
-  EXPECT_FALSE(result.tail_zeroed);
-}
-
-TEST_F(WalFrameTest, AFramePayloadThatDoesNotUnpackFailsWithoutRepairing) {
-  AppendEpochs({1});
-  const off_t log_end = EndOfLog();
-  // Checksum-valid, but the payload is not a record list. The reject fires
-  // on the frame content, even for the final frame of the file.
-  WriteRawBytesAt(log_end, MakeFrame(2, {0x01, 0x02, 0x03}));
-  const off_t full_size = FileSize();
-
-  Wal wal(work_dir_, helios::storage::wal::WalIo::Posix(), kCapacity);
-  const auto result = wal.Scan();
-  EXPECT_EQ(result.status, WalScanResult::Status::kCorrupt);
-  EXPECT_EQ(FileSize(), full_size);
-}
-
-TEST_F(WalFrameTest, AFrameWithTrailingPayloadBytesFailsWithoutRepairing) {
-  AppendEpochs({1});
-  const off_t log_end = EndOfLog();
-  auto padded = PackRecords(MakeRecords(2, "k2"));
-  padded.push_back(0x00);
-  WriteRawBytesAt(log_end, MakeFrame(2, padded));
-  const off_t full_size = FileSize();
-
-  Wal wal(work_dir_, helios::storage::wal::WalIo::Posix(), kCapacity);
-  const auto result = wal.Scan();
-  EXPECT_EQ(result.status, WalScanResult::Status::kCorrupt);
-  EXPECT_EQ(FileSize(), full_size);
-}
-
-TEST_F(WalFrameTest, AFrameCarryingNoRecordFailsWithoutRepairing) {
-  AppendEpochs({1});
-  const off_t log_end = EndOfLog();
-  WriteRawBytesAt(log_end, MakeFrame(2, PackRecords(LogRecords{})));
-  const off_t full_size = FileSize();
-
-  Wal wal(work_dir_, helios::storage::wal::WalIo::Posix(), kCapacity);
-  const auto result = wal.Scan();
-  EXPECT_EQ(result.status, WalScanResult::Status::kCorrupt);
-  EXPECT_EQ(FileSize(), full_size);
-}
-
-TEST_F(WalFrameTest, AHeaderFieldAnomalyFailsWithoutRepairing) {
-  const auto payload = PackRecords(MakeRecords(1, "k1"));
-  const struct {
-    uint32_t magic;
-    uint16_t version;
-    uint16_t flags;
-  } cases[] = {
-      {0x4c414c57u, Wal::kVersion, Wal::kFlags},  // wrong magic
-      {Wal::kMagic, 2, Wal::kFlags},              // unsupported version
-      {Wal::kMagic, Wal::kVersion, 1},            // unknown flags
-  };
-  for (const auto &anomaly : cases) {
-    TearDown();  // fresh directory per case; the fixture removes the last one
-    SetUp();
-    const off_t log_end = EndOfLog();
-    WriteRawBytesAt(log_end, MakeFrame(1, payload, anomaly.magic,
-                                       anomaly.version, anomaly.flags));
-    const off_t full_size = FileSize();
-
-    Wal wal(work_dir_, helios::storage::wal::WalIo::Posix(), kCapacity);
-    const auto result = wal.Scan();
-    EXPECT_EQ(result.status, WalScanResult::Status::kCorrupt);
-    EXPECT_EQ(FileSize(), full_size);
-  }
-}
-
-// The search reads in 1 MiB chunks starting one byte past the damage, so its
-// first chunk covers [1, 1 + 1 MiB) and the boundary sits at 1 + 1 MiB. A
-// magic that begins two bytes before that has its last two bytes in the next
-// chunk, and is found only because the chunks overlap by the length of a
-// magic less one. Nothing valid is placed before it, so a search that missed
-// it would find nothing and repair.
-TEST_F(WalFrameTest, AFrameStraddlingTheProbeWindowBoundaryIsFound) {
-  constexpr uint64_t kWideCapacity = 4ull << 20;
-  constexpr off_t kBoundary = 1 + (1 << 20);
-
-  // One frame long enough to carry the boundary inside its own payload, so
-  // that the log ends past it and the reservation covers what follows.
-  {
-    Wal wal(work_dir_, helios::storage::wal::WalIo::Posix(), kWideCapacity);
-    ASSERT_EQ(wal.Scan().status, WalScanResult::Status::kOk);
-    std::map<EpochNumber, LogRecords> buckets;
-    buckets[1] = MakeRecords(1, std::string(2 << 20, 'x'));
-    ASSERT_TRUE(wal.AppendGroup(buckets, 1).ok);
-    ASSERT_GT(wal.write_offset(), kBoundary + 64);
-  }
-
-  // Break that frame, then place a whole frame with its magic across the
-  // boundary.
-  FlipByteAt(static_cast<off_t>(Wal::kHeaderSize) + 1);
-  const auto survivor = MakeFrame(7, PackRecords(MakeRecords(7, "survivor")));
-  const off_t placed = kBoundary - 2;
-  WriteRawBytesAt(placed, survivor);
-
-  Wal wal(work_dir_, helios::storage::wal::WalIo::Posix(), kWideCapacity);
-  const auto result = wal.Scan();
-  EXPECT_EQ(result.status, WalScanResult::Status::kCorrupt) << result.detail;
-  EXPECT_FALSE(result.tail_zeroed);
-}
-
-/**
- * @brief A read that fails while checking whether a frame survives beyond the
- *        damage must stop the scan.
- *
- * Treating it as "no frame there" would license the repair, and the repair
- * erases the bytes it was asking about. A transient read failure is not
- * evidence that the frames it could not read are absent.
- *
- * The candidate is placed inside the broken frame's own claimed extent
- * rather than past it: data past the extent is now settled by its mere
- * presence (AChecksumBrokenFrameFollowedByJunkFailsWithoutRepairing), so a
- * search only remains reachable, and its own read failures only remain
- * observable, for a candidate the frame's length claims as its own.
- */
-TEST_F(WalFrameTest, AReadFailureWhileLookingForSurvivorsStopsTheScan) {
-  AppendEpochs({1});
-  const off_t log_end = EndOfLog();
-
-  // A torn header claiming a payload large enough to hold a whole frame
-  // image within its own extent, with that image placed a few bytes in.
-  const auto embedded = MakeFrame(5, PackRecords(MakeRecords(5, "k5")));
-  const off_t embedded_at = log_end + static_cast<off_t>(Wal::kHeaderSize) + 8;
-  auto torn = MakeHeaderClaimingPayload(6, 4096);
-  torn.resize(static_cast<size_t>(embedded_at - log_end), 0x00);
-  torn.insert(torn.end(), embedded.begin(), embedded.end());
-  WriteRawBytesAt(log_end, torn);
-  const off_t file_size = FileSize();
-
-  helios::storage::wal::WalIo io = helios::storage::wal::WalIo::Posix();
-  auto real_pread = io.pread;
-  io.pread = [real_pread, embedded_at](int fd, void *data, size_t size,
-                                       off_t offset) -> ssize_t {
-    if (offset == embedded_at && size == Wal::kHeaderSize) {
-      errno = EIO;
-      return -1;
-    }
-    return real_pread(fd, data, size, offset);
-  };
-
-  Wal wal(work_dir_, io, kCapacity);
-  const auto result = wal.Scan();
-  EXPECT_EQ(result.status, WalScanResult::Status::kIoError) << result.detail;
-  EXPECT_EQ(result.error_number, EIO);
-  EXPECT_FALSE(result.tail_zeroed);
-  EXPECT_EQ(wal.write_offset(), 0);
-  EXPECT_EQ(FileSize(), file_size);
 }
 
 TEST_F(WalFrameTest, ShortWritesAreRetriedUntilTheGroupIsComplete) {
@@ -1319,9 +1037,8 @@ TEST_F(WalFrameTest, SkippingTheWholeLogStillFinishesTheScan) {
   helios::storage::wal::WalIo io = helios::storage::wal::WalIo::Posix();
   auto payload_reads = std::make_shared<int>(0);
   auto real_pread = io.pread;
-  // The end-of-log check reads the whole capacity looking for a surviving
-  // frame once it finds the all-zero header past the last one; that read is
-  // far larger than any frame's payload here and is not what this counts.
+  // Locating the last nonzero byte can read reservation-sized chunks;
+  // those reads are not frame payloads.
   io.pread = [real_pread, payload_reads](int fd, void *data, size_t size,
                                          off_t offset) -> ssize_t {
     if (size > Wal::kHeaderSize && size < 4096) ++*payload_reads;
@@ -1340,6 +1057,34 @@ TEST_F(WalFrameTest, SkippingTheWholeLogStillFinishesTheScan) {
   EXPECT_EQ(*payload_reads, 1);
 }
 
+TEST_F(WalFrameTest, ATornEpochAtTheSkipBoundaryFallsBackToTheValidPrefix) {
+  AppendEpochs({1, 2, 3});
+  const off_t third = FrameEnd(FrameEnd(0));
+  // Epoch 3 now looks covered by the checkpoint, but its checksum is stale.
+  WriteRawBytesAt(third + 12, {2, 0, 0, 0});
+  {
+    Wal wal(work_dir_, helios::storage::wal::WalIo::Posix(), kCapacity);
+    const auto result = wal.Scan(2);
+    ASSERT_EQ(result.status, WalScanResult::Status::kOk) << result.detail;
+    EXPECT_EQ(result.last_epoch, 2u);
+    EXPECT_EQ(result.frames_skipped, 2u);
+    EXPECT_TRUE(result.records.empty());
+    EXPECT_TRUE(result.tail_zeroed);
+    EXPECT_EQ(wal.write_offset(), third);
+  }
+  AssertRangeIsZero(third, FileSize());
+
+  Wal wal(work_dir_, helios::storage::wal::WalIo::Posix(), kCapacity);
+  const auto result = wal.Scan();
+  ASSERT_EQ(result.status, WalScanResult::Status::kOk) << result.detail;
+  EXPECT_FALSE(result.tail_zeroed);
+  EXPECT_EQ(result.last_epoch, 2u);
+  ASSERT_EQ(result.records.size(), 2u);
+  EXPECT_EQ(result.records[0].writes.at(0).key, "k1");
+  EXPECT_EQ(result.records[1].writes.at(0).key, "k2");
+  EXPECT_EQ(wal.write_offset(), third);
+}
+
 // A corrupted length inside the covered region lands the skip's next header
 // read on bytes that don't parse; it can't tell that apart from a lie only
 // in the last covered frame, so it falls back to a full scan from offset 0.
@@ -1348,7 +1093,7 @@ TEST_F(WalFrameTest,
   AppendEpochs({1, 2, 3, 4, 5});
   // Frame 1's declared length, shrunk so the skip's blind trust in it lands
   // mid-frame-1's own real payload rather than on frame 2's header.
-  SetPayloadLengthAt(0, 4);
+  WriteRawBytesAt(8, {4, 0, 0, 0});
 
   WalScanResult skip_result;
   {
@@ -1361,10 +1106,15 @@ TEST_F(WalFrameTest,
     full_result = wal.Scan(0);
   }
 
-  EXPECT_EQ(full_result.status, WalScanResult::Status::kCorrupt);
-  EXPECT_EQ(skip_result.status, full_result.status);
-  EXPECT_EQ(skip_result.detail, full_result.detail);
-  EXPECT_FALSE(skip_result.tail_zeroed);
+  ASSERT_EQ(skip_result.status, WalScanResult::Status::kOk) << skip_result.detail;
+  EXPECT_TRUE(skip_result.tail_zeroed);
+  EXPECT_EQ(skip_result.last_epoch, 0u);
+  EXPECT_TRUE(skip_result.records.empty());
+  ASSERT_EQ(full_result.status, WalScanResult::Status::kOk) << full_result.detail;
+  EXPECT_FALSE(full_result.tail_zeroed);
+  EXPECT_EQ(full_result.last_epoch, 0u);
+  EXPECT_TRUE(full_result.records.empty());
+  AssertRangeIsZero(0, FileSize());
 }
 
 TEST_F(WalFrameTest, InjectedFdatasyncFailsAfterTheAllowedCalls) {

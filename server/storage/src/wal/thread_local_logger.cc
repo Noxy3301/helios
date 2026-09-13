@@ -98,10 +98,6 @@ WalScanResult ThreadLocalLogger::Scan(EpochNumber min_epoch) {
   return wal_.Scan(min_epoch);
 }
 
-EpochNumber ThreadLocalLogger::GetWalLastEpoch() const {
-  return wal_.last_epoch();
-}
-
 void ThreadLocalLogger::StartFlusher() {
   assert(!flusher_.joinable());
   flusher_ = std::thread([this]() { FlusherLoop(); });

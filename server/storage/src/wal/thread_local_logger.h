@@ -86,11 +86,6 @@ class ThreadLocalLogger final {
   WalScanResult Scan(EpochNumber min_epoch);
 
   /**
-   * @brief The epoch of the last frame actually written to the log.
-   */
-  EpochNumber GetWalLastEpoch() const;
-
-  /**
    * @brief Starts the flusher. Called once, after the log has been scanned.
    */
   void StartFlusher();

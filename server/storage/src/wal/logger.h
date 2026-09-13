@@ -66,8 +66,7 @@ class Logger {
 
   struct RecoveryResult {
     RecoveryStatus status{RecoveryStatus::kOk};
-    // The epoch of the last intact frame, which after a successful scan is
-    // also the durable epoch.
+    // Durable through the log's last frame and the checkpoint's end epoch.
     EpochNumber durable_epoch{0};
     WriteSet recovery_set;
   };
@@ -84,10 +83,10 @@ class Logger {
   bool Enqueue(const WriteSet &ws, EpochNumber epoch);
 
   /**
-   * @brief Scans the log and, when the scan allows it, repairs a torn tail.
-   * @details On success it sets the durable epoch from the last intact frame
-   * and returns that epoch together with the folded write set, the
-   * checkpoint first when one was loaded, then the log. On kFailed,
+   * @brief Scans the log and zeroes the tail at its first invalid frame.
+   * @details On success it sets the durable epoch from the log and any
+   * published checkpoint, and returns it together with the folded write set,
+   * the checkpoint first when one was loaded, then the log. On kFailed,
    * durable_epoch is 0 and recovery_set is empty.
    * @note Runs before the flusher starts and before the database accepts
    * work.
@@ -111,13 +110,6 @@ class Logger {
   EpochNumber GetDurableEpoch() const {
     return durable_epoch_.load(std::memory_order_seq_cst);
   }
-
-  /**
-   * @brief The epoch of the last frame actually written to the log. Safe to
-   * call from a thread other than the flusher's; see Wal::last_epoch for what
-   * makes that safe and why it is not the same question as GetDurableEpoch.
-   */
-  EpochNumber GetWalLastEpoch() const;
 
   /**
    * @brief Blocks until the durable epoch reaches `commit_epoch`.
@@ -171,7 +163,7 @@ class Logger {
 
  private:
   // Reports a scan that failed and answers Recover with kFailed.
-  RecoveryResult FailRecovery(const WalScanResult &scan);
+  RecoveryResult FailRecovery(const WalScanResult &wal);
 
   void PublishDurable(EpochNumber durable_epoch);
   void PublishFailure(int error_number);

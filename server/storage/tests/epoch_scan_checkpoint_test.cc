@@ -15,6 +15,7 @@
 #include <filesystem>
 #include <fstream>
 #include <future>
+#include <iterator>
 #include <optional>
 #include <string>
 #include <thread>
@@ -23,6 +24,7 @@
 #include "storage/config.h"
 #include "storage/database.h"
 #include "storage/read.h"
+#include "wal/crc32c.h"
 #include "wal/wal.h"
 
 namespace {
@@ -419,87 +421,86 @@ TEST_F(EpochScanCheckpointTest, AQuietTailAfterTheCheckpointIsAccepted) {
     Wal wal(work_dir_, helios::storage::wal::WalIo::Posix(), 1ull << 20);
     auto scan = wal.Scan(0);
     ASSERT_EQ(scan.status, WalScanResult::Status::kOk);
-    // The quiet tail this test is named for: the log's last epoch never
-    // reaches the epoch the scan ended at, which is what made the v1 gate
-    // refuse a legitimate checkpoint.
+    // Closed epochs with no writes need no frames of their own.
     ASSERT_LT(scan.last_epoch, checkpoint.end_epoch);
-    // The v2 gate asks a question this log still answers: it reaches at
-    // least as far as the log was durable when the checkpoint was published.
-    ASSERT_GE(scan.last_epoch, checkpoint.wal_last_epoch_at_publish);
   }
 
+  {
+    auto config = MakeConfig(true);
+    helios::storage::Database db(config);
+    EXPECT_EQ(Read(db, "alice").value, "one");
+    EXPECT_EQ(Read(db, "bob").value, "one");
+    ASSERT_TRUE(CommitWrite(db, "alice", "two"));
+  }
+
+  // The new write must be newer than the recovered checkpoint, so its next
+  // replay cannot skip it as a frame the checkpoint already covers.
   auto config = MakeConfig(true);
   helios::storage::Database db(config);
-  db.CreateTable(kTable);
-  EXPECT_EQ(Read(db, "alice").value, "one");
+  EXPECT_EQ(Read(db, "alice").value, "two");
   EXPECT_EQ(Read(db, "bob").value, "one");
 }
 
-TEST_F(EpochScanCheckpointTest, ALogEndingBelowThePublishEpochIsRejected) {
-  const std::string short_log_copy = root_ + "/short_wal.log";
+TEST_F(EpochScanCheckpointTest, V2CheckpointIsIgnoredAndTheLogIsReplayed) {
   {
     auto config = MakeConfig(false);
     helios::storage::Database db(config);
     db.CreateTable(kTable);
     ASSERT_TRUE(CommitWrite(db, "alice", "one"));
-    ASSERT_TRUE(CommitWrite(db, "bob", "one"));
-    // A copy of the log as it stands here, before the commits the checkpoint
-    // published below will require the log to reach.
-    std::filesystem::copy_file(work_dir_ + "/wal.log", short_log_copy);
-    ASSERT_TRUE(CommitWrite(db, "carol", "one"));
-    ASSERT_TRUE(CommitWrite(db, "dave", "one"));
     ASSERT_TRUE(db.WriteCheckpoint());
+  }
+
+  helios::storage::EpochNumber last_epoch = 0;
+  {
+    Wal wal(work_dir_, helios::storage::wal::WalIo::Posix(), 1ull << 20);
+    const auto scan = wal.Scan();
+    ASSERT_EQ(scan.status, WalScanResult::Status::kOk);
+    last_epoch = scan.last_epoch;
+  }
+
+  // Restore the v2 field at offset 24 and its 56-byte header. Recompute the
+  // checksum so the old format is rejected even though its bytes are intact.
+  std::string bytes;
+  {
+    std::ifstream file(checkpoint_path(), std::ios::binary);
+    ASSERT_TRUE(file.is_open());
+    bytes.assign(std::istreambuf_iterator<char>(file),
+                 std::istreambuf_iterator<char>());
+  }
+  ASSERT_GE(bytes.size(), EpochScanCheckpoint::kHeaderSize);
+  bytes.insert(24, sizeof(uint32_t), '\0');
+  bytes[4] = 2;
+  bytes[5] = 0;
+  for (size_t i = 0; i < sizeof(last_epoch); ++i) {
+    bytes[24 + i] = static_cast<char>(last_epoch >> (8 * i));
+  }
+  constexpr size_t kV2HeaderSize = 56;
+  constexpr size_t kV2ChecksumOffset = kV2HeaderSize - sizeof(uint32_t);
+  helios::storage::wal::Crc32c crc;
+  crc.Update(bytes.data(), kV2ChecksumOffset);
+  crc.Update(bytes.data() + kV2HeaderSize, bytes.size() - kV2HeaderSize);
+  const uint32_t checksum = crc.Finish();
+  for (size_t i = 0; i < sizeof(checksum); ++i) {
+    bytes[kV2ChecksumOffset + i] = static_cast<char>(checksum >> (8 * i));
+  }
+  {
+    std::ofstream file(checkpoint_path(), std::ios::binary | std::ios::trunc);
+    ASSERT_TRUE(file.is_open());
+    file.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+    file.close();
+    ASSERT_TRUE(file.good());
   }
 
   const auto checkpoint = EpochScanCheckpoint::Load(work_dir_);
-  ASSERT_EQ(checkpoint.status, EpochScanCheckpoint::LoadResult::Status::kOk);
-
-  // Stand in for a log genuinely truncated, or substituted, after the
-  // checkpoint was published: put the earlier, shorter log back in its place.
-  std::filesystem::copy_file(short_log_copy, work_dir_ + "/wal.log",
-                             std::filesystem::copy_options::overwrite_existing);
-  {
-    Wal wal(work_dir_, helios::storage::wal::WalIo::Posix(), 1ull << 20);
-    const auto scan = wal.Scan(0);
-    ASSERT_EQ(scan.status, WalScanResult::Status::kOk);
-    ASSERT_LT(scan.last_epoch, checkpoint.wal_last_epoch_at_publish);
-  }
-
-  // The refusal is only real if recovery acts on it: rows the checkpoint alone
-  // holds must not come back from a log that never carried them.
-  auto config = MakeConfig(true);
-  helios::storage::Database db(config);
-  db.CreateTable(kTable);
-  EXPECT_EQ(Read(db, "alice").value, "one");
-  EXPECT_EQ(Read(db, "bob").value, "one");
-  EXPECT_FALSE(Read(db, "carol").found);
-  EXPECT_FALSE(Read(db, "dave").found);
-}
-
-TEST_F(EpochScanCheckpointTest, V1FormatCheckpointIsRefused) {
-  {
-    auto config = MakeConfig(false);
-    helios::storage::Database db(config);
-    db.CreateTable(kTable);
-    ASSERT_TRUE(CommitWrite(db, "alice", "one"));
-    ASSERT_TRUE(db.WriteCheckpoint());
-  }
-
-  // Downgrade the version field to what a v1 writer would have left. There is
-  // no migration for it: v1 has no wal_last_epoch_at_publish field to read.
-  {
-    std::fstream file(checkpoint_path(),
-                      std::ios::in | std::ios::out | std::ios::binary);
-    ASSERT_TRUE(file.is_open());
-    file.seekp(sizeof(uint32_t));
-    const uint8_t v1_version[2] = {0x01, 0x00};
-    file.write(reinterpret_cast<const char *>(v1_version), sizeof(v1_version));
-  }
-
-  auto checkpoint = EpochScanCheckpoint::Load(work_dir_);
   EXPECT_EQ(checkpoint.status,
             EpochScanCheckpoint::LoadResult::Status::kUnusable);
   EXPECT_TRUE(checkpoint.records.empty());
+
+  auto config = MakeConfig(true);
+  helios::storage::Database db(config);
+  const auto row = Read(db, "alice");
+  ASSERT_TRUE(row.found);
+  EXPECT_EQ(row.value, "one");
 }
 
 TEST_F(EpochScanCheckpointTest, ARowLockedDuringTheScanIsRetried) {

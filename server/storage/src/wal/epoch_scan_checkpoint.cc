@@ -59,10 +59,9 @@ constexpr size_t kOffFlags = 6;
 constexpr size_t kOffGeneration = 8;
 constexpr size_t kOffStartEpoch = 16;
 constexpr size_t kOffEndEpoch = 20;
-constexpr size_t kOffWalLastEpoch = 24;
-constexpr size_t kOffPrimaryRows = 28;
-constexpr size_t kOffSecondaryEntries = 36;
-constexpr size_t kOffPayloadSize = 44;
+constexpr size_t kOffPrimaryRows = 24;
+constexpr size_t kOffSecondaryEntries = 32;
+constexpr size_t kOffPayloadSize = 40;
 
 void PutLe16(uint8_t *out, uint16_t value) {
   out[0] = static_cast<uint8_t>(value & 0xffu);
@@ -339,10 +338,6 @@ bool EpochScanCheckpoint::RunOnce(Stats *out_stats) {
   // at or below it has installed its values. A start epoch taken after the scan
   // started would drop the commits still in flight at that moment.
   stats.start_epoch = epoch_framework_.GetGlobalEpoch();
-  // A conservative default; the durable epoch can pass closed empty epochs
-  // that wrote no frame, and Publish overwrites this with the frame-backed
-  // last epoch once the durability gate has returned.
-  stats.wal_last_epoch_at_publish = logger_.GetDurableEpoch();
   epoch_framework_.Sync();
   stats.barrier_ms = ElapsedMs(barrier_begin);
 
@@ -524,9 +519,7 @@ bool EpochScanCheckpoint::Publish(const LogRecords &records, Stats *stats) {
   msgpack::pack(payload, records);
 
   // Publishing before the log covers the last epoch the scan could have
-  // observed would let a version come back without its transaction. The wait
-  // precedes the header build, which embeds the last epoch read once it
-  // returns.
+  // observed would let a version come back without its transaction.
   const auto gate_begin = Clock::now();
   const auto result = logger_.WaitUntilDurable(stats->end_epoch,
                                                Clock::now() + kDurabilityWait);
@@ -540,7 +533,6 @@ bool EpochScanCheckpoint::Publish(const LogRecords &records, Stats *stats) {
         stats->generation, stats->end_epoch);
     return false;
   }
-  stats->wal_last_epoch_at_publish = logger_.GetWalLastEpoch();
   stats->durability_ms = ElapsedMs(gate_begin);
 
   const auto write_begin = Clock::now();
@@ -552,7 +544,6 @@ bool EpochScanCheckpoint::Publish(const LogRecords &records, Stats *stats) {
   PutLe64(header + kOffGeneration, stats->generation);
   PutLe32(header + kOffStartEpoch, stats->start_epoch);
   PutLe32(header + kOffEndEpoch, stats->end_epoch);
-  PutLe32(header + kOffWalLastEpoch, stats->wal_last_epoch_at_publish);
   PutLe64(header + kOffPrimaryRows, stats->primary_rows);
   PutLe64(header + kOffSecondaryEntries, stats->secondary_entries);
   PutLe64(header + kOffPayloadSize, static_cast<uint64_t>(payload.size()));
@@ -647,8 +638,6 @@ EpochScanCheckpoint::LoadResult EpochScanCheckpoint::Load(
 
   const EpochNumber start_epoch = GetLe32(header + kOffStartEpoch);
   const EpochNumber end_epoch = GetLe32(header + kOffEndEpoch);
-  const EpochNumber wal_last_epoch_at_publish =
-      GetLe32(header + kOffWalLastEpoch);
   // Epoch 0 is not a start epoch any writer produces, and a scan never ends
   // before its start.
   if (start_epoch == 0 || end_epoch < start_epoch) {
@@ -688,7 +677,6 @@ EpochScanCheckpoint::LoadResult EpochScanCheckpoint::Load(
   checkpoint.status = LoadResult::Status::kOk;
   checkpoint.start_epoch = start_epoch;
   checkpoint.end_epoch = end_epoch;
-  checkpoint.wal_last_epoch_at_publish = wal_last_epoch_at_publish;
   return checkpoint;
 }
 
