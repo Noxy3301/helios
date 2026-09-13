@@ -125,3 +125,53 @@ TEST_F(DatabaseTest, ThreadSafetyWrites) {
     ASSERT_EQ(kValue, alice.value());
   }
 }
+
+TEST_F(DatabaseTest, PaxColumnSelectionPreservesNullEmptyAndHeapReads) {
+  ASSERT_TRUE(db_->InstallPaxSchema(kTable, {1, 3, 3}));
+  ASSERT_TRUE(db_->CreateSecondaryIndex(
+      kTable, "name", helios::storage::IndexConstraint::kNone));
+
+  // Row format: null flags, then two length-prefixed three-byte fields.
+  const std::string null_flags("\1\1\0", 3);
+  const std::string row = null_flags + "\1\3abc\1\3def";
+  ASSERT_TRUE(TestHelper::CommitWrites(
+      *db_, {{kTable, "alice", row}}, {{kTable, "name", "a", "alice"}}));
+
+  const std::vector<uint32_t> no_columns;
+  const std::vector<uint32_t> second_column{1};
+  const std::vector<const std::vector<uint32_t> *> selections{
+      nullptr, &no_columns, &second_column};
+  const std::vector<std::string> expected{
+      row, null_flags + "\xff\xff", null_flags + "\xff\1\3def"};
+
+  // Point, primary-range and secondary-range reads share column semantics.
+  for (size_t i = 0; i < selections.size(); ++i) {
+    const auto point = db_->Read(kTable, "alice", selections[i]);
+    const auto primary =
+        db_->Scan(kTable, "alice", "bob", 0, false, selections[i]);
+    const auto secondary =
+        db_->ScanIndex(kTable, "name", "a", "b", 0, false, selections[i]);
+    db_->ReleaseThreadEpoch();
+
+    ASSERT_TRUE(point.found);
+    EXPECT_EQ(point.value, expected[i]);
+    ASSERT_TRUE(primary.ok);
+    ASSERT_EQ(primary.rows.size(), 1u);
+    EXPECT_EQ(primary.rows[0].value, expected[i]);
+    EXPECT_EQ(primary.rows[0].tid, point.tid);
+    ASSERT_TRUE(secondary.ok);
+    ASSERT_EQ(secondary.rows.size(), 1u);
+    EXPECT_EQ(secondary.rows[0].value, expected[i]);
+    EXPECT_EQ(secondary.rows[0].tid, point.tid);
+  }
+
+  // A field wider than its PAX cell falls back to a whole heap row.
+  const std::string overflow = null_flags + "\1\4abcd\1\3def";
+  ASSERT_TRUE(TestHelper::Write(*db_, kTable, "alice", overflow));
+  for (const auto *columns : selections) {
+    const auto point = db_->Read(kTable, "alice", columns);
+    db_->ReleaseThreadEpoch();
+    ASSERT_TRUE(point.found);
+    EXPECT_EQ(point.value, overflow);
+  }
+}

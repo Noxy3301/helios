@@ -213,7 +213,9 @@ class Database {
    * @param table_name Target table.
    * @param key Primary key to look up.
    * @param selected_columns Optional zero-based MySQL columns to materialize
-   * for PAX-resident rows. Unselected PAX columns are returned as empty fields.
+   * for PAX-resident rows. Null selects the whole row; an empty list selects
+   * no data columns. Unselected PAX fields become empty markers; null flags
+   * remain, and heap rows are always returned whole.
    * @return Result with `found` set when the key exists and was non-empty.
    *         When the table does not exist, `found` is false and `tid` is 0.
    */
@@ -247,7 +249,9 @@ class Database {
    * @param row_limit Maximum rows to return. 0 means no cap.
    * @param reverse_scan When true, iterate from `end_key` toward `start_key`.
    * @param selected_columns Optional zero-based MySQL columns to materialize
-   * for PAX-resident rows. Unselected PAX columns are returned as empty fields.
+   * for PAX-resident rows. Null selects the whole row; an empty list selects
+   * no data columns. Unselected PAX fields become empty markers; null flags
+   * remain, and heap rows are always returned whole.
    * @return Result with `ok == false` if the table is missing or `end_key`
    *         is empty. Callers should treat `!ok` as an abort signal.
    */
@@ -275,8 +279,8 @@ class Database {
    * @param row_limit Maximum rows to return. 0 means no cap.
    * @param reverse_scan When true, iterate in reverse secondary-key order.
    * @param selected_columns Optional zero-based MySQL columns to materialize
-   * for PAX-resident base rows. Unselected PAX columns are returned as empty
-   * fields.
+   * for PAX-resident base rows, with the same null/empty rules as Read.
+   * Unselected PAX columns are returned as empty fields.
    * @return Result with `ok == false` if the table or the index is missing,
    *         or `end_key` is empty.
    */

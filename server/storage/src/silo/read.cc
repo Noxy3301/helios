@@ -19,22 +19,10 @@
 namespace helios::storage {
 namespace silo {
 
-namespace {
-
-// A null column list means the whole row; a non-null one, even an empty one,
-// blanks the PAX fields it does not name.
-StableValue ReadRow(const DataItem &item,
-                    const std::vector<uint32_t> *selected_columns) {
-  if (selected_columns == nullptr) return StableReadValue(item);
-  return StableReadValueMasked(item, selected_columns->data(),
-                               selected_columns->size());
-}
-
-}  // namespace
-
 ReadResult Read(TableDictionary &tables, std::shared_mutex &schema_mutex,
                 const std::string_view table_name, const std::string_view key,
                 const std::vector<uint32_t> *selected_columns) {
+  // Keep the schema fixed while resolving slots and reading their values.
   std::shared_lock<std::shared_mutex> lk(schema_mutex);
   auto table = tables.GetTable(table_name);
   if (table == nullptr) return {};
@@ -42,7 +30,7 @@ ReadResult Read(TableDictionary &tables, std::shared_mutex &schema_mutex,
   DataItem *item = table->GetPrimaryIndex().Get(key);
   if (item == nullptr) return {};
 
-  auto row = ReadRow(*item, selected_columns);
+  auto row = StableRead(*item, selected_columns);
   return {row.found, std::move(row.value), PackTransactionId(row.tid)};
 }
 
@@ -66,6 +54,7 @@ ScanResult Scan(TableDictionary &tables, std::shared_mutex &schema_mutex,
   ScanResult result;
   if (end_key.empty()) return result;
 
+  // Keep the schema fixed while resolving slots and reading their values.
   std::shared_lock<std::shared_mutex> lk(schema_mutex);
   auto table = tables.GetTable(table_name);
   if (table == nullptr) return result;
@@ -76,7 +65,7 @@ ScanResult Scan(TableDictionary &tables, std::shared_mutex &schema_mutex,
   // The value-yielding Scan/ScanReverse overloads pass the DataItem the leaf
   // walk already resolved, so read it directly instead of re-fetching by key.
   auto append_scan_entry = [&](std::string_view key, DataItem &item_ref) {
-    auto row = ReadRow(item_ref, selected_columns);
+    auto row = StableRead(item_ref, selected_columns);
     if (row.found) {
       result.rows.push_back(
           {std::string(key), std::move(row.value), PackTransactionId(row.tid)});
@@ -115,6 +104,7 @@ ScanIndexResult ScanIndex(TableDictionary &tables,
   ScanIndexResult result;
   if (end_key.empty()) return result;
 
+  // Keep the schema fixed while resolving slots and reading their values.
   std::shared_lock<std::shared_mutex> lk(schema_mutex);
   auto table = tables.GetTable(table_name);
   if (table == nullptr) return result;
@@ -125,6 +115,7 @@ ScanIndexResult ScanIndex(TableDictionary &tables,
 
   uint64_t returned_rows = 0;
 
+  // Resolve each secondary hit to a stable copy of its primary row.
   auto append_base_row = [&](std::string_view secondary_key,
                              std::string_view primary_key) {
     DataItem *item = table->GetPrimaryIndex().Get(primary_key);
@@ -132,7 +123,7 @@ ScanIndexResult ScanIndex(TableDictionary &tables,
       return false;
     }
 
-    auto row = ReadRow(*item, selected_columns);
+    auto row = StableRead(*item, selected_columns);
     if (row.found) {
       result.rows.push_back({std::string(secondary_key),
                              std::string(primary_key), std::move(row.value),
@@ -142,6 +133,7 @@ ScanIndexResult ScanIndex(TableDictionary &tables,
     return row_limit > 0 && returned_rows >= row_limit;
   };
 
+  // Pin the immutable key list until all its primary keys have been read.
   auto append_secondary_entry = [&](std::string_view key) {
     const std::string secondary_key(key);
     DataItem *item = index->Get(key);
@@ -172,6 +164,7 @@ ScanPaxResult ScanPax(TableDictionary &tables, std::shared_mutex &schema_mutex,
   ScanPaxResult result;
   if (end_key.empty()) return result;
 
+  // Keep the schema fixed while resolving slots and reading their values.
   std::shared_lock<std::shared_mutex> lk(schema_mutex);
   Table *table = tables.GetTable(table_name);
   if (table == nullptr) return result;

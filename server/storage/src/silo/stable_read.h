@@ -30,7 +30,6 @@ struct StableValue {
 struct StablePrimaryKeys {
   bool found = false;
   PrimaryKeyList::Ptr primary_keys;
-  TransactionId tid;
 
   // Valid while this struct lives: the view points into the list it pins.
   PrimaryKeyList::View primary_keys_view() const {
@@ -65,61 +64,41 @@ inline bool StableLive(const DataItem &item) {
 }
 
 /**
- * @brief Stable read of a base-row DataItem.
- *
- * `found` is false for tombstones and uninitialized slots.
+ * @brief Reads a value, retrying if its TID changes during the copy.
+ * @param selected_columns Columns needed for projection pushdown, given as
+ * ascending zero-based MySQL column numbers. nullptr selects all columns;
+ * an empty list selects no data columns. Null flags are always retained.
+ * @details PAX copies the selected columns and leaves empty markers in the
+ * others. The current non-PAX path ignores the selection and copies the
+ * whole value.
+ * @return The value and its TID, with found == false if the slot has no live
+ * value.
  */
-inline StableValue StableReadValue(const DataItem &item) {
+inline StableValue StableRead(
+    const DataItem &item,
+    const std::vector<uint32_t> *selected_columns = nullptr) {
   for (;;) {
+    // Observe an unlocked version before copying its live row.
     const TransactionId tid = StableTid(item);
     const bool found = item.HasRow();
     std::string value;
     if (found) {
       if (item.buffer.is_pax()) {
-        // Gather the row from its PAX strips; a torn gather (concurrent
-        // install) is rejected by the TID re-check below, same as a torn
-        // pointer copy would be.
-        value.resize(item.size());
-        item.buffer.GatherInto(reinterpret_cast<std::byte *>(value.data()));
+        // Gather either all fields or the requested columns from PAX strips.
+        if (selected_columns == nullptr) {
+          value.resize(item.size());
+          item.buffer.GatherInto(reinterpret_cast<std::byte *>(value.data()));
+        } else {
+          item.buffer.pax_group()->GatherRowMasked(
+              item.buffer.pax_slot(), selected_columns->data(),
+              selected_columns->size(), value);
+        }
       } else {
         value.assign(reinterpret_cast<const char *>(item.value()), item.size());
       }
     }
 
-    if (item.transaction_id.load() == tid) {
-      return {found, std::move(value), tid};
-    }
-  }
-}
-
-/**
- * @brief Stable read of a row with the unselected PAX columns masked.
- *
- * @details PAX-resident rows keep their full field shape, but unlisted columns
- * are emitted as one-byte empty fields. Heap rows are returned in full, so
- * masked reads remain an optimization and do not change row semantics.
- *
- * @param item Primary row slot.
- * @param columns Zero-based MySQL column indexes to materialize, in ascending
- * order.
- * @param n_columns Number of entries in `columns`.
- */
-inline StableValue StableReadValueMasked(const DataItem &item,
-                                         const uint32_t *columns,
-                                         size_t n_columns) {
-  for (;;) {
-    const TransactionId tid = StableTid(item);
-    const bool found = item.HasRow();
-    std::string value;
-    if (found) {
-      if (item.buffer.is_pax()) {
-        item.buffer.pax_group()->GatherRowMasked(item.buffer.pax_slot(),
-                                                 columns, n_columns, value);
-      } else {
-        value.assign(reinterpret_cast<const char *>(item.value()), item.size());
-      }
-    }
-
+    // Accept the copy only if the same version is still current.
     if (item.transaction_id.load() == tid) {
       return {found, std::move(value), tid};
     }
@@ -139,7 +118,7 @@ inline StablePrimaryKeys StableReadKeys(const DataItem &item) {
     const bool found = primary_keys && primary_keys->count != 0;
 
     if (item.transaction_id.load() == tid) {
-      return {found, std::move(primary_keys), tid};
+      return {found, std::move(primary_keys)};
     }
   }
 }
