@@ -23,33 +23,33 @@
 #ifndef HELIOS_STORAGE_INCLUDE_STORAGE_DATABASE_H
 #define HELIOS_STORAGE_INCLUDE_STORAGE_DATABASE_H
 
-#include <chrono>
+#include <cstdint>
 #include <functional>
-#include <memory>
-#include <optional>
+#include <limits>
+#include <shared_mutex>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
+#include "index/reaper.h"
 #include "storage/commit.h"
 #include "storage/config.h"
 #include "storage/index.h"
 #include "storage/read.h"
+#include "table/table_dictionary.h"
+#include "util/epoch_framework.h"
+#include "wal/epoch_scan_checkpoint.h"
+#include "wal/logger.h"
 
 namespace helios::storage {
-
-namespace pax {
-class PaxTable;
-enum class FieldType : uint8_t;
-}  // namespace pax
 
 /**
  * @brief One storage instance: its tables, its epoch framework and its log.
  *
- * @details One per process. Constructing a second one ends the process, as
- * does a log the constructor cannot read or replay; the working directory is
- * the one failure the caller is given a chance to handle. Every method below
- * is safe to call from several threads at once.
+ * @details The server creates one instance and shares it between requests.
+ * @note Multiple concurrent instances are unsupported: index reclamation
+ * and PAX read-view state are shared within the process.
  */
 class Database {
  public:
@@ -150,9 +150,9 @@ class Database {
   /**
    * @brief Handle for one columnar read view.
    *
-   * @details `snapshot_epoch` (se) is the read view's serialization point:
-   * commits with epoch <= se are visible; later ones resolve to before-images.
-   * `token` must be passed back to ReleasePaxView exactly once.
+   * @details snapshot_epoch `se` is the read view's serialization point:
+   * commits with `epoch <= se` are visible; later ones resolve to before-images.
+   * token must be passed back to ReleasePaxView exactly once.
    */
   struct PaxReadView {
     bool valid = false;
@@ -162,9 +162,9 @@ class Database {
   };
 
   /**
-   * @brief Arms capture and waits for global epoch E >= se + 2.
+   * @brief Arms capture and waits for global epoch `E >= se + 2`.
    *
-   * @details On return every commit through snapshot_epoch (se) has finished
+   * @details On return every commit through snapshot_epoch `se` has finished
    * installing, and every later commit captures the rows it overwrites or
    * invalidates the read view. The calling thread must not hold an epoch (it
    * must be outside any transaction). Fails instead of falling back on
@@ -402,10 +402,40 @@ class Database {
    */
   bool WriteCheckpoint(uint64_t *out_version_retries = nullptr);
 
-  class Impl;
-
  private:
-  const std::unique_ptr<Impl> db_pimpl_;
+  // Declared in dependency order
+  Config config_;
+  wal::Logger logger_;
+  epoch::Framework epoch_framework_;
+  TableDictionary table_dictionary_;
+  wal::EpochScanCheckpoint scan_checkpoint_;
+  // Shared for reads, statistics and commit slot resolution; exclusive for DDL.
+  std::shared_mutex schema_mutex_;
+  index::Reaper reaper_;
+
+  // Bound the lifetime of a read view so `E - se` stays in the wrap-free window.
+  static constexpr EpochNumber kPaxReadViewEpochLifetime =
+      (std::numeric_limits<EpochNumber>::max() -
+       epoch::Framework::kEpochHighWater) /
+      2;
+
+  Table *GetTable(std::string_view table_name) const;
+
+  /**
+   * @brief Chooses an epoch strictly above the recovered durable epoch.
+   * @note Refuses startup if that epoch would reach the high-water mark.
+   * Compares before adding, since the recovered epoch may be UINT32_MAX.
+   */
+  static EpochNumber ResumeEpochAbove(EpochNumber durable_epoch);
+
+  // Builds the callback the epoch writer runs after each advance.
+  std::function<void(EpochNumber)> MakeEpochHook();
+
+  /**
+   * @brief Replays WAL records into the indexes and resumes the global epoch.
+   * @note Refuses startup if a table or secondary index cannot be restored.
+   */
+  void Recover();
 };
 }  // namespace helios::storage
 

@@ -44,7 +44,7 @@ namespace {
 
 /**
  * @brief Folds one more field's hash into a seed.
- * @note The constant is 2^32 divided by the golden ratio, boost's
+ * @note The constant is `2^32` divided by the golden ratio, boost's
  * hash_combine mixer; with the shifts it spreads each field's bits before
  * the fold.
  */

@@ -43,10 +43,10 @@ namespace helios::storage {
  *
  * PAX mode: the payload bytes live in a PaxGroup's column strips; this
  * buffer only references them. `value` carries a tagged pointer
- * (bit0 = PAX, bit1 = slot allocated): before the first install it points
+ * (`bit0 = PAX`, `bit1 = slot allocated`): before the first install it points
  * to the table's PaxTable, afterwards to the owning PaxGroup with
  * `capacity_or_slot` = slot index. `size` keeps its meaning (payload byte size,
- * 0 = tombstone/absent), so every liveness check (`size != 0`) works
+ * `0 = tombstone/absent`), so every liveness check (`size != 0`) works
  * unchanged in both modes.
  *
  * Mode transitions are one-way per row: index layers create absent items in

@@ -53,7 +53,7 @@ constexpr auto kRetryPause = std::chrono::milliseconds(25);
 constexpr auto kDurabilityWait = std::chrono::seconds(60);
 
 // Checkpoint header fields, in bytes from the start of the file. The magic word
-// opens it at offset 0 and the checksum closes it at kHeaderSize - 4.
+// opens it at offset 0 and the checksum closes it at `kHeaderSize - 4`.
 constexpr size_t kOffVersion = 4;
 constexpr size_t kOffFlags = 6;
 constexpr size_t kOffGeneration = 8;

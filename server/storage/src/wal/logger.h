@@ -44,7 +44,7 @@ namespace wal {
  * @brief Owns the WAL, per-producer buffers and the worker that persists them.
  *
  * @details Each producer appends to its own buffer. The worker collects the
- * records and writes closed epochs, then publishes durable epoch D to
+ * records and writes closed epochs, then publishes durable epoch `D` to
  * waiting commits. An epoch with no records advances without a file write.
  * The destructor joins the worker before destroying the WAL and buffers.
  */
@@ -99,7 +99,7 @@ class Logger {
    * @brief Requests WAL persistence without waiting for I/O.
    * @param max_epoch Highest epoch to persist, inclusive.
    * @note The caller must ensure no producer can add records at or below
-   * max_epoch. Durable epoch D advances only after those records are synced.
+   * max_epoch. Durable epoch `D` advances only after those records are synced.
    */
   void RequestFlush(EpochNumber max_epoch);
 
@@ -172,7 +172,7 @@ class Logger {
 
   // Protects the result reported to commit and checkpoint waiters.
   enum class State { kRunning, kStopped, kFailed };
-  // D: the highest epoch known to be durable.
+  // `D`: the highest epoch known to be durable.
   std::atomic<EpochNumber> durable_epoch_{0};
   std::mutex durability_mutex_;
   std::condition_variable durability_cv_;

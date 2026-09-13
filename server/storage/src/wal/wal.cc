@@ -274,7 +274,7 @@ bool Wal::PreadAll(uint8_t *out, size_t size, off_t offset, int *error) const {
   return true;
 }
 
-// Writes out zeroes over [from, to) and persists them. The zeroes move any
+// Writes out zeroes over `[from, to)` and persists them. The zeroes move any
 // size, allocation, or extent-state metadata work out of the group-flush
 // path (how much exists depends on the filesystem and device), and they
 // mark a region that holds no frame, which is what lets the scan find the
@@ -314,8 +314,8 @@ bool Wal::WriteZeroesAndSync(off_t from, off_t to, int *error) {
   return true;
 }
 
-// Reports the offset of the last byte in [from, to) that is not zero, or
-// from - 1 when every byte is.
+// Reports the offset of the last byte in `[from, to)` that is not zero, or
+// `from - 1` when every byte is.
 bool Wal::FindLastNonZero(off_t from, off_t to, off_t *last_non_zero,
                           int *error) const {
   constexpr size_t kChunkSize = 1ull << 20;

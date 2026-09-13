@@ -25,14 +25,14 @@ namespace pax {
  * @brief Before-image store that keeps a columnar read view consistent.
  *
  * @details A generation is the interval during which at least one read view
- * holds a registration. While one is active (active_captures_ > 0), every
+ * holds a registration. While one is active (`active_captures_ > 0`), every
  * PAX install captures the replaced row image before its first strip-cell
  * or visibility-bit mutation; a first install captures an empty
  * was_visible=false entry. An install that cannot capture (byte budget
  * exceeded, or no commit epoch) fails the capture for the active generation
  * instead, and every result produced under it is discarded. A reader
- * at snapshot epoch se uses the oldest before-image whose writer epoch
- * exceeds se and reads the strip in place when no entry
+ * at snapshot epoch `se` uses the oldest before-image whose writer epoch
+ * exceeds `se` and reads the strip in place when no entry
  * qualifies. With no read view active the writer side pays one atomic load
  * per installed row.
  */

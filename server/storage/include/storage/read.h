@@ -22,7 +22,7 @@ struct ReadResult {
   // True when the key holds a live, non-empty payload.
   bool found = false;
   std::string value;  // Row payload, valid only when `found` is true.
-  uint64_t tid = 0;   // Packed (epoch:32 | tid:32) version observed at read.
+  uint64_t tid = 0;   // Packed (`epoch:32 | tid:32`) version observed at read.
 };
 
 /**

@@ -16,7 +16,7 @@ namespace helios::storage {
 namespace silo {
 
 /**
- * @brief Packs a {epoch, tid} pair into one uint64_t so it can travel over
+ * @brief Packs a `{epoch, tid}` pair into one uint64_t so it can travel over
  * the RPC as an opaque version token.
  */
 inline uint64_t PackTransactionId(const TransactionId &tid) {

@@ -27,7 +27,7 @@ namespace pax {
  */
 class PaxTable {
  public:
-  // 262,144 groups x 8,192 rows = 2^31 slots per table.
+  // `262,144 groups x 8,192 rows = 2^31 slots` per table.
   static constexpr size_t kMaxGroups = 1u << 18;
 
   /**

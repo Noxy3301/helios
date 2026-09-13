@@ -28,7 +28,7 @@ namespace pax {
  * layer wrote, unchanged. A typed field stores the value as a fixed-width
  * little-endian binary payload of `field_max_bytes[f]` bytes (4 or 8). A
  * typed cell's u16 length prefix is 0 for SQL NULL and the binary width for a
- * present value, so "empty cell == NULL" still holds. ScatterRow parses that
+ * present value, so `empty cell == NULL` still holds. ScatterRow parses that
  * text once and returns false without touching the slot when it does not
  * parse or does not fit; the row then overflows to the heap. GatherRow
  * reformats a typed cell back into the exact bytes it was given.
@@ -217,7 +217,7 @@ class PaxGroup {
    * AppendCellField does.
    *
    * @param field Field index, where 0 is the null-flags field and MySQL column
-   * i is field i + 1.
+   * i is field `i + 1`.
    * @param slot Slot inside this group.
    */
   std::string_view cell(size_t field, uint32_t slot) const {
@@ -248,7 +248,7 @@ class PaxGroup {
    * ASCII for a typed present cell. An empty cell is emitted as a NULL field.
    *
    * @param field Field index, where 0 is the null-flags field and MySQL column
-   * i is field i + 1.
+   * i is field `i + 1`.
    * @param slot Slot inside this group.
    * @param out Destination string; the packed field is appended.
    */
@@ -295,8 +295,8 @@ uint64_t OverflowCount(const PaxTable *store);
 // every PAX install captures the replaced row image into a per-group undo
 // map before its first strip mutation, or fails the capture for the active
 // generation when it cannot (src/pax/version_store.h holds the full
-// contract). A reader at snapshot epoch se uses the oldest before-image
-// whose writer epoch exceeds se. was_visible == false means the slot held
+// contract). A reader at snapshot epoch `se` uses the oldest before-image
+// whose writer epoch exceeds `se`. `was_visible == false` means the slot held
 // no row. With no such entry, the reader uses the strip in place.
 // ---------------------------------------------------------------------------
 
@@ -310,12 +310,12 @@ struct UndoEntry {
 };
 
 /**
- * @brief Tests whether writer_epoch is after snapshot epoch se.
+ * @brief Tests whether writer_epoch is after snapshot epoch `se`.
  *
  * @details Plain unsigned comparison on purpose: acquisition refuses near
  * the epoch high-water mark and read views expire well inside that margin,
  * so both operands lie in one wrap-free window. A modular comparison would
- * misread old entries as newer than se once a view outlives half the range.
+ * misread old entries as newer than `se` once a view outlives half the range.
  */
 inline bool EpochAfterSnapshot(uint32_t writer_epoch, uint32_t snapshot_epoch) {
   return writer_epoch > snapshot_epoch;

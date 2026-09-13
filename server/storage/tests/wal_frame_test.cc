@@ -95,7 +95,7 @@ class WalFrameTest : public ::testing::Test {
     ASSERT_TRUE(write_ok);
   }
 
-  // Asserts every byte in [from, to) reads back zero: repair is expected to
+  // Asserts every byte in `[from, to)` reads back zero: repair is expected to
   // have overwritten this range, not merely to have stopped trusting it.
   void AssertRangeIsZero(off_t from, off_t to) {
     const int fd = ::open(WalPath().c_str(), O_RDONLY);
@@ -1012,7 +1012,7 @@ TEST_F(WalFrameTest, SkipReadsOnlyTheGuardAndTailPayloads) {
 
   // Header reads: 3 skipped frames, +1 to see the frame after them is past
   // min_epoch, +3 more as the resuming scan re-reads that frame, the tail,
-  // and the all-zero header ending the log. 4 + 3 = 7.
+  // and the all-zero header ending the log. `4 + 3 = 7`.
   EXPECT_EQ(*header_reads, 7);
   // One payload read per frame that is not a pure skip: the guard at epoch 3
   // plus the two tail frames.

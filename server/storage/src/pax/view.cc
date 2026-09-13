@@ -10,23 +10,22 @@
 #include <string>
 #include <utility>
 
-#include "database_impl.h"
+#include "storage/database.h"
 #include "pax/table.h"
 #include "pax/version_store.h"
 #include "util/debug_sync.h"
 
 namespace helios::storage {
 
-// Wait for global epoch E >= se + 2 to drain installs that missed capture.
+// Wait for global epoch `E >= se + 2` to drain installs that missed capture.
 constexpr EpochNumber kInstallDrainEpochs = 2;
 
-pax::PaxTable *Database::Impl::GetPaxTable(const std::string_view table_name) {
+pax::PaxTable *Database::GetPaxTable(const std::string_view table_name) {
   Table *table = GetTable(table_name);
   return table == nullptr ? nullptr : table->GetPaxTable();
 }
 
-Database::PaxReadView Database::Impl::AcquirePaxView(
-    uint32_t fence_timeout_ms) {
+Database::PaxReadView Database::AcquirePaxView(uint32_t fence_timeout_ms) {
   Database::PaxReadView view;
   auto token = pax::VersionStore::Global().BeginCapture();
   if (!token.valid) {
@@ -35,10 +34,10 @@ Database::PaxReadView Database::Impl::AcquirePaxView(
         "generation";
     return view;
   }
-  // Enable capture (seq_cst in BeginCapture), then sample E as snapshot se.
-  // An install that missed capture belongs to a commit at or below se.
-  // Its worker epoch e_w keeps E < e_w + 2 until it leaves, so waiting for
-  // E >= se + 2 drains those installs. Check the high-water bound before
+  // Enable capture (seq_cst in BeginCapture), then sample `E` as snapshot `se`.
+  // An install that missed capture belongs to a commit at or below `se`.
+  // Its worker epoch `e_w` keeps `E < e_w + 2` until it leaves, so waiting for
+  // `E >= se + 2` drains those installs. Check the high-water bound before
   // adding the wait interval, so the calculation cannot wrap.
   const EpochNumber snapshot_epoch = epoch_framework_.GetGlobalEpoch();
   if (snapshot_epoch >= epoch::Framework::kEpochHighWater - kInstallDrainEpochs) {
@@ -73,7 +72,7 @@ Database::PaxReadView Database::Impl::AcquirePaxView(
   return view;
 }
 
-void Database::Impl::ReleasePaxView(const Database::PaxReadView &view) {
+void Database::ReleasePaxView(const PaxReadView &view) {
   if (!view.valid) return;
   pax::VersionStore::ReadViewToken token;
   token.id = view.token;
@@ -81,7 +80,7 @@ void Database::Impl::ReleasePaxView(const Database::PaxReadView &view) {
   pax::VersionStore::Global().EndCapture(token);
 }
 
-bool Database::Impl::PaxViewValid(const Database::PaxReadView &view) const {
+bool Database::PaxViewValid(const PaxReadView &view) const {
   if (!view.valid) return false;
   if (epoch_framework_.GetGlobalEpoch() - view.snapshot_epoch >=
       kPaxReadViewEpochLifetime) {
@@ -90,11 +89,10 @@ bool Database::Impl::PaxViewValid(const Database::PaxReadView &view) const {
   return !pax::VersionStore::Global().CaptureFailed();
 }
 
-bool Database::Impl::InstallPaxSchema(
-    const std::string_view table_name,
-    const std::vector<uint32_t> &field_max_bytes,
-    const std::vector<pax::FieldType> &field_type,
-    const std::vector<int8_t> &field_scale) {
+bool Database::InstallPaxSchema(const std::string_view table_name,
+                                const std::vector<uint32_t> &field_max_bytes,
+                                const std::vector<pax::FieldType> &field_type,
+                                const std::vector<int8_t> &field_scale) {
   if (field_max_bytes.empty()) return false;
   // A definition change, like CreateSecondaryIndex: every request holds this
   // lock shared, and the absent rows it creates read the store pointer.

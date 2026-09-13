@@ -34,6 +34,7 @@
 #include <mutex>
 #include <thread>
 
+#include "util/epoch.h"
 #include "util/thread_key_storage.h"
 
 namespace helios::storage {
@@ -113,10 +114,10 @@ class Framework {
    * @details The caller must not enqueue log records, and must not take its
    * commit epoch, before this returns.
    *
-   * Once this returns worker epoch e_w, global epoch E cannot reach e_w + 2
-   * while the slot still reads e_w: only one writer scan that missed the
-   * publication can be outstanding, and the next one reads e_w. This assumes
-   * e_w stays clear of wraparound: the epoch writer stops at #kEpochHighWater
+   * Once this returns worker epoch `e_w`, global epoch `E` cannot reach `e_w + 2`
+   * while the slot still reads `e_w`: only one writer scan that missed the
+   * publication can be outstanding, and the next one reads `e_w`. This assumes
+   * `e_w` stays clear of wraparound: the epoch writer stops at #kEpochHighWater
    * rather than wrapping, and a counter seeded at or past the mark before
    * #Start() fail-stops on the writer's first eligible advance. A thread
    * still inside the loop carries no such guarantee, which is why the
@@ -194,7 +195,7 @@ class Framework {
     worker_cv_.notify_one();
   }
 
-  // Blocks the kThreadOffline caller until it observes global_epoch >= target.
+  // Blocks the kThreadOffline caller until it observes `global_epoch >= target`.
   // Already-reached targets succeed even after Stop() or above the
   // high-water mark; otherwise false on timeout, Stop(), or a target
   // beyond the mark.
@@ -325,7 +326,7 @@ class Framework {
   std::atomic<bool> start_;
   std::atomic<bool> stop_;
   std::atomic<bool> advance_requested_{false};
-  // E: the global epoch shared by all participants.
+  // `E`: the global epoch shared by all participants.
   std::atomic<EpochNumber> global_epoch_;
   std::mutex epoch_mutex_;
   std::condition_variable epoch_cv_;
@@ -334,7 +335,7 @@ class Framework {
   // Started by the constructor but parked on epoch_cv_ until Start(), so it
   // cannot reach thread_epochs_ before that member is constructed.
   std::thread epoch_writer_;
-  // e_w: the epoch published by each participating worker.
+  // `e_w`: the epoch published by each participating worker.
   ThreadKeyStorage<std::atomic<EpochNumber>> thread_epochs_;
 };
 

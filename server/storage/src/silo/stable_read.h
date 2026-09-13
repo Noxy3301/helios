@@ -71,7 +71,7 @@ inline bool StableLive(const DataItem &item) {
  * @details PAX copies the selected columns and leaves empty markers in the
  * others. The current non-PAX path ignores the selection and copies the
  * whole value.
- * @return The value and its TID, with found == false if the slot has no live
+ * @return The value and its TID, with `found == false` if the slot has no live
  * value.
  */
 inline StableValue StableRead(

@@ -87,7 +87,7 @@ class Reaper {
   /**
    * @brief Physically erases the slot through the owning index's Purge.
    *
-   * `retired_tid` (delete TID + 2, lock bit clear) is stamped on the erased
+   * `retired_tid` (`delete TID + 2`, lock bit clear) is stamped on the erased
    * slot so an in-place reuse continues the slot's TID sequence instead of
    * restarting below the delete TID.
    *

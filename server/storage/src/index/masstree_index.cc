@@ -243,7 +243,7 @@ struct MasstreeIndex::Impl {
     // may still hold the raw pointer Get() returned.
     lp.value() = fresh;  // FIXME: retire the old item through RCU
     fence();
-    // 1 == structural insert (bumps the leaf's vinsert counter), 0 == in-place
+    // 1 means structural insert (bumps the leaf's vinsert counter), 0 means in-place
     // overwrite. Claiming an insert on overwrite would falsely trigger phantom
     // retries on concurrent scanners watching this leaf.
     lp.finish(found ? 0 : 1, *tls_ti);
@@ -325,8 +325,8 @@ struct MasstreeIndex::Impl {
                      std::optional<std::string_view> end,
                      std::function<bool(std::string_view)> op) {
     ensure_thread_active();
-    // Reverse scan walks downward from `end - 1`, stopping once key < begin.
-    // Range is [begin, end) just like forward Scan.
+    // Reverse scan walks downward from `end - 1`, stopping once `key < begin`.
+    // Range is `[begin, end)` just like forward Scan.
     ScanAdapter adapter{begin.data(), begin.size(), true, nullptr, 0,
                         false,        std::move(op)};
     if (end.has_value()) {

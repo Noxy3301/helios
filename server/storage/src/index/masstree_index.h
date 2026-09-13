@@ -51,7 +51,7 @@ class MasstreeIndex final {
   void PutAbsent(std::string_view key);
 
   /**
-   * @brief Walks the keys in [begin, end), or to the last key when end is
+   * @brief Walks the keys in `[begin, end)`, or to the last key when end is
    *        absent; the reverse forms walk the same range downward.
    *
    * @details operation returns true to stop the walk, the opposite of

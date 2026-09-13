@@ -29,7 +29,7 @@ namespace helios::storage {
  *        held as `std::shared_ptr<const PrimaryKeyList>` in one allocation.
  *
  * @details Each key is stored packed: an unsigned LEB128 length followed by
- * that many key bytes. A null Ptr and count == 0 are both empty.
+ * that many key bytes. A null Ptr and `count == 0` are both empty.
  */
 struct PrimaryKeyList {
   using Ptr = std::shared_ptr<const PrimaryKeyList>;

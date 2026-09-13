@@ -39,7 +39,7 @@ inline bool ParseI64(const char *s, size_t len, int64_t *out) {
   return res.ec == std::errc() && res.ptr == s + len;
 }
 
-// "YYYY-MM-DD" -> YYYYMMDD (fits int32; string order == int order).
+// "YYYY-MM-DD" -> YYYYMMDD (fits int32; `string order == int order`).
 inline bool ParseDate(const char *s, size_t len, int64_t *out) {
   if (len != 10 || s[4] != '-' || s[7] != '-') return false;
   int64_t y = 0, m = 0, d = 0;
@@ -56,7 +56,7 @@ inline bool ParseDate(const char *s, size_t len, int64_t *out) {
   return true;
 }
 
-// Exact DECIMAL(p,s) val_str -> scaled int64 (value * 10^scale). The input has
+// Exact DECIMAL(p,s) val_str -> scaled int64 (`value * 10^scale`). The input has
 // the column's declared scale of fractional digits (MySQL pads), so scaling is
 // exact and no double is involved.
 inline bool ParseDecScaled(const char *s, size_t len, int scale, int64_t *out) {
@@ -336,7 +336,7 @@ bool PaxGroup::ScatterRow(uint32_t slot, const std::byte *row, size_t size) {
       std::memcpy(cell + kCellLenBytes, &typed_bin[f], len);  // low `len` = LE
       continue;
     }
-    // UNTYPED, or a typed NULL (len 0): store verbatim (0 => empty == NULL).
+    // UNTYPED, or a typed NULL (len 0): store verbatim (`0 => empty == NULL`).
     const uint16_t len = static_cast<uint16_t>(refs[f].len);
     std::memcpy(cell, &len, sizeof(len));
     if (len > 0) std::memcpy(cell + kCellLenBytes, refs[f].payload, len);
@@ -437,7 +437,7 @@ void PaxGroup::GatherRowMasked(uint32_t slot, const uint32_t *columns,
   const size_t fields = schema_.field_count();
   AppendCellField(0, slot, out);  // null-flags field (always UNTYPED)
 
-  // Merge the ascending MySQL column numbers onto fields 1..n; mark the rest
+  // Merge the ascending MySQL column numbers onto fields `1..n`; mark the rest
   // empty.
   size_t column_index = 0;
   for (size_t field = 1; field < fields; ++field) {

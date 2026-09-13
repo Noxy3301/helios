@@ -87,11 +87,11 @@ target_compile_options(${PROJECT_NAME} PRIVATE -Wno-error -Wno-error=extra-semi 
 
 find_package(Boost QUIET)
 if(Boost_FOUND)
-  target_include_directories(${PROJECT_NAME} PRIVATE
+  target_include_directories(${PROJECT_NAME} PUBLIC
     ${Boost_INCLUDE_DIRS}
   )
 else()
-  add_compile_definitions(MSGPACK_NO_BOOST=ON)
+  target_compile_definitions(${PROJECT_NAME} PUBLIC MSGPACK_NO_BOOST=ON)
 endif()
 
 find_package(jemalloc QUIET)
@@ -121,13 +121,13 @@ else()
   target_link_libraries(${PROJECT_NAME} pthread)
 endif()
 
+# Database directly owns storage components declared in the source headers.
 target_include_directories(
-  ${PROJECT_NAME} PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
-                         $<INSTALL_INTERFACE:include>)
-target_include_directories(
-  ${PROJECT_NAME} PRIVATE $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src>)
+  ${PROJECT_NAME} PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include
+                         ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_compile_features(${PROJECT_NAME} PUBLIC cxx_std_17)
 
-# Third-party libraries. No public header names either one, so they stop here.
+# MessagePack is also included by the types Database owns.
 target_include_directories(
   ${PROJECT_NAME} SYSTEM
   PUBLIC
@@ -164,25 +164,6 @@ add_dependencies(masstree masstree_build)
 
 target_link_libraries(${PROJECT_NAME} masstree)
 target_include_directories(${PROJECT_NAME} SYSTEM PRIVATE ${MASSTREE_DIR})
-
-# Export as cmake library
-file(GLOB_RECURSE PUBLIC_HEADERS include/storage/*.h)
-message(STATUS "${PUBLIC_HEADERS}")
-set_target_properties(${PROJECT_NAME} PROPERTIES PUBLIC_HEADER
-                                                 "${PUBLIC_HEADERS}")
-install(
-  TARGETS ${PROJECT_NAME}
-  EXPORT ${PROJECT_NAME}-config
-  ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
-  LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
-  INCLUDES
-  DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
-  PUBLIC_HEADER DESTINATION include/${PROJECT_NAME})
-install(
-  EXPORT ${PROJECT_NAME}-config
-  NAMESPACE ${PROJECT_NAME}::
-  DESTINATION lib/cmake/${PROJECT_NAME}
-  EXPORT_LINK_INTERFACE_LIBRARIES)
 
 # Tests
 if(IS_TOPLEVEL_PROJECT AND BUILD_TESTS)

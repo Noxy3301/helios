@@ -304,12 +304,12 @@ class FlushTrace {
   static std::optional<uint64_t> FirstFreeGeneration(const std::string &prefix);
 
   uint64_t &SampleRng() {
-    // 2^64 / golden ratio, odd, so multiplying by it is a bijection.
+    // `2^64 / golden ratio`, odd, so multiplying by it is a bijection.
     constexpr uint64_t kGoldenRatioMix = 0x9e3779b97f4a7c15ull;
     // Zero marks "not yet seeded" and is a value xorshift cannot produce.
     // The seed comes from a process-wide counter, distinct for every thread
     // lifetime (a TLS address alone is reused after a thread exits), and the
-    // odd multiplier is a bijection on 2^64, so no two seeds collide and a
+    // odd multiplier is a bijection on `2^64`, so no two seeds collide and a
     // nonzero count cannot map to zero.
     static thread_local uint64_t rng = 0;
     if (rng == 0) {
