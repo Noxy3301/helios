@@ -87,10 +87,10 @@ TEST_F(LoggerDurabilityTest, EnqueueReportsOnlyWhatItPersists) {
 TEST_F(LoggerDurabilityTest, AlreadyDurableReturnsImmediately) {
   Logger logger(config_);
   ASSERT_EQ(logger.Recover().status, Logger::RecoveryStatus::kOk);
-  logger.StartFlusher();
+  logger.Start();
 
   ASSERT_TRUE(logger.Enqueue(MakePrimaryWriteSet("alice"), 5));
-  logger.ScheduleFlush(5);
+  logger.RequestFlush(5);
 
   EXPECT_EQ(logger.WaitUntilDurable(5, Logger::Deadline::max()),
             Logger::WaitResult::kDurable);
@@ -98,13 +98,13 @@ TEST_F(LoggerDurabilityTest, AlreadyDurableReturnsImmediately) {
   // A second wait on an epoch already durable must not block at all.
   EXPECT_EQ(logger.WaitUntilDurable(5, std::chrono::steady_clock::now()),
             Logger::WaitResult::kDurable);
-  logger.StopFlusher();
+  logger.Stop();
 }
 
 TEST_F(LoggerDurabilityTest, WaitersWakeAtEpochGranularity) {
   Logger logger(config_);
   ASSERT_EQ(logger.Recover().status, Logger::RecoveryStatus::kOk);
-  logger.StartFlusher();
+  logger.Start();
 
   ASSERT_TRUE(logger.Enqueue(MakePrimaryWriteSet("alice"), 5));
   ASSERT_TRUE(logger.Enqueue(MakePrimaryWriteSet("bob"), 7));
@@ -118,7 +118,7 @@ TEST_F(LoggerDurabilityTest, WaitersWakeAtEpochGranularity) {
   auto second = spawn_waiter(5);
   auto later = spawn_waiter(7);
 
-  logger.ScheduleFlush(5);
+  logger.RequestFlush(5);
   ASSERT_EQ(first.wait_for(kTestTimeout), std::future_status::ready);
   ASSERT_EQ(second.wait_for(kTestTimeout), std::future_status::ready);
   EXPECT_EQ(first.get(), Logger::WaitResult::kDurable);
@@ -127,10 +127,10 @@ TEST_F(LoggerDurabilityTest, WaitersWakeAtEpochGranularity) {
   EXPECT_EQ(later.wait_for(std::chrono::milliseconds(200)),
             std::future_status::timeout);
 
-  logger.ScheduleFlush(7);
+  logger.RequestFlush(7);
   ASSERT_EQ(later.wait_for(kTestTimeout), std::future_status::ready);
   EXPECT_EQ(later.get(), Logger::WaitResult::kDurable);
-  logger.StopFlusher();
+  logger.Stop();
 }
 
 // The acknowledgement a Sync commit waits for cannot be given while the
@@ -157,8 +157,8 @@ TEST_F(LoggerDurabilityTest, SyncAcknowledgementFollowsTheFdatasync) {
   std::atomic<bool> committer_started{false};
   std::future<void> committer;
 
-  // Releases a held fdatasync and drains the flusher on every exit path: an
-  // assertion failure would otherwise leave the committer waiting forever,
+  // Releases a held fdatasync and drains the logger worker on every exit:
+  // an assertion failure would otherwise leave the committer waiting forever,
   // and the future's destructor would block before ~Logger could wake it.
   // Declared after the future so unwinding runs the guard first; the drain
   // wakes the committer with either the durable epoch or the stopped state.
@@ -173,12 +173,12 @@ TEST_F(LoggerDurabilityTest, SyncAcknowledgementFollowsTheFdatasync) {
         released = true;
       }
       held.notify_all();
-      logger.StopFlusher();
+      logger.Stop();
     }
   } release_on_exit{logger, mutex, held, released};
 
   ASSERT_EQ(logger.Recover().status, Logger::RecoveryStatus::kOk);
-  logger.StartFlusher();
+  logger.Start();
 
   ASSERT_TRUE(logger.Enqueue(MakePrimaryWriteSet("alice"), 3));
   committer = std::async(std::launch::async, [&logger, &committer_started] {
@@ -188,7 +188,7 @@ TEST_F(LoggerDurabilityTest, SyncAcknowledgementFollowsTheFdatasync) {
   // The timeout probe below measures the wait, not thread startup: flush only
   // once the committer thread is provably running.
   while (!committer_started.load()) std::this_thread::yield();
-  logger.ScheduleFlush(3);
+  logger.RequestFlush(3);
 
   {
     std::unique_lock<std::mutex> lock(mutex);
@@ -208,7 +208,7 @@ TEST_F(LoggerDurabilityTest, SyncAcknowledgementFollowsTheFdatasync) {
   ASSERT_EQ(committer.wait_for(kTestTimeout), std::future_status::ready);
   committer.get();
   EXPECT_EQ(logger.GetDurableEpoch(), 3u);
-  logger.StopFlusher();
+  logger.Stop();
 }
 
 // A caller that decided not to wait returns at once, whether because the
@@ -217,25 +217,25 @@ TEST_F(LoggerDurabilityTest, AsyncAndUnloggedCommitsDoNotWait) {
   {
     Logger logger(config_);
     ASSERT_EQ(logger.Recover().status, Logger::RecoveryStatus::kOk);
-    logger.StartFlusher();
+    logger.Start();
 
     // Async: the commit path decided not to wait, and an epoch that will
     // never be flushed still returns at once.
     logger.AwaitCommitDurability(99, false);
     EXPECT_EQ(logger.GetDurableEpoch(), 0u);
-    logger.StopFlusher();
+    logger.Stop();
   }
 
   // The log is held exclusively for as long as a logger owns it, so the
   // second logger gets its own scope rather than overlapping with the first.
   Logger logger(config_);
   ASSERT_EQ(logger.Recover().status, Logger::RecoveryStatus::kOk);
-  logger.StartFlusher();
+  logger.Start();
 
   // Sync, but nothing was enqueued: there is no record to wait for.
   logger.AwaitCommitDurability(99, false);
   EXPECT_EQ(logger.GetDurableEpoch(), 0u);
-  logger.StopFlusher();
+  logger.Stop();
 }
 
 // With the fail-stop armed, a write failure ends the process by abort: under
@@ -252,9 +252,8 @@ TEST_F(LoggerDurabilityTest, ArmedFailStopEndsTheProcessOnFdatasyncFailure) {
     return -1;
   };
 
-  // Everything lives inside the child: a flusher started in the parent would
-  // not survive the fork the death test performs. Armed before the flusher
-  // starts, in the database's order.
+  // A worker started in the parent would not survive the death-test fork.
+  // Create and arm the logger in the child, as Database does before Start.
   EXPECT_EXIT(
       {
         Logger logger(config_, io);
@@ -262,9 +261,9 @@ TEST_F(LoggerDurabilityTest, ArmedFailStopEndsTheProcessOnFdatasyncFailure) {
         // reports, rather than passing on a failure of the setup.
         if (logger.Recover().status != Logger::RecoveryStatus::kOk) return;
         logger.SetFailStop();
-        logger.StartFlusher();
+        logger.Start();
         if (!logger.Enqueue(MakePrimaryWriteSet("alice"), 3)) return;
-        logger.ScheduleFlush(3);
+        logger.RequestFlush(3);
         std::this_thread::sleep_for(kTestTimeout);
       },
       ::testing::KilledBySignal(SIGABRT), "");
@@ -274,16 +273,16 @@ TEST_F(LoggerDurabilityTest, RecordsAboveTheTargetAreCarriedForward) {
   {
     Logger logger(config_);
     ASSERT_EQ(logger.Recover().status, Logger::RecoveryStatus::kOk);
-    logger.StartFlusher();
+    logger.Start();
     ASSERT_TRUE(logger.Enqueue(MakePrimaryWriteSet("alice"), 4));
     ASSERT_TRUE(logger.Enqueue(MakePrimaryWriteSet("bob"), 9));
-    logger.ScheduleFlush(4);
+    logger.RequestFlush(4);
     ASSERT_EQ(logger.WaitUntilDurable(4, Logger::Deadline::max()),
               Logger::WaitResult::kDurable);
-    logger.ScheduleFlush(9);
+    logger.RequestFlush(9);
     ASSERT_EQ(logger.WaitUntilDurable(9, Logger::Deadline::max()),
               Logger::WaitResult::kDurable);
-    logger.StopFlusher();
+    logger.Stop();
   }
 
   // Both epochs must be present, in order, after reopening.
@@ -301,7 +300,7 @@ TEST_F(LoggerDurabilityTest, RecordsAboveTheTargetAreCarriedForward) {
 TEST_F(LoggerDurabilityTest, StopWakesEveryWaiter) {
   Logger logger(config_);
   ASSERT_EQ(logger.Recover().status, Logger::RecoveryStatus::kOk);
-  logger.StartFlusher();
+  logger.Start();
 
   auto first = std::async(std::launch::async, [&logger] {
     return logger.WaitUntilDurable(11, Logger::Deadline::max());
@@ -316,7 +315,7 @@ TEST_F(LoggerDurabilityTest, StopWakesEveryWaiter) {
   ASSERT_EQ(second.wait_for(std::chrono::milliseconds(50)),
             std::future_status::timeout);
 
-  logger.StopFlusher();
+  logger.Stop();
   ASSERT_EQ(first.wait_for(kTestTimeout), std::future_status::ready);
   ASSERT_EQ(second.wait_for(kTestTimeout), std::future_status::ready);
   EXPECT_EQ(first.get(), Logger::WaitResult::kStopped);
@@ -333,7 +332,7 @@ TEST_F(LoggerDurabilityTest,
 
   Logger logger(config_, io);
   ASSERT_EQ(logger.Recover().status, Logger::RecoveryStatus::kOk);
-  logger.StartFlusher();
+  logger.Start();
 
   ASSERT_TRUE(logger.Enqueue(MakePrimaryWriteSet("alice"), 3));
   auto waiting = std::async(std::launch::async, [&logger] {
@@ -342,7 +341,7 @@ TEST_F(LoggerDurabilityTest,
   ASSERT_EQ(waiting.wait_for(std::chrono::milliseconds(50)),
             std::future_status::timeout);
 
-  logger.ScheduleFlush(3);
+  logger.RequestFlush(3);
   ASSERT_EQ(waiting.wait_for(kTestTimeout), std::future_status::ready);
   EXPECT_EQ(waiting.get(), Logger::WaitResult::kFailed);
   // The durable epoch must not move: durability was never confirmed, whatever
@@ -352,7 +351,7 @@ TEST_F(LoggerDurabilityTest,
   // A waiter arriving after the failure learns of it rather than blocking.
   EXPECT_EQ(logger.WaitUntilDurable(3, Logger::Deadline::max()),
             Logger::WaitResult::kFailed);
-  logger.StopFlusher();
+  logger.Stop();
 }
 
 TEST_F(LoggerDurabilityTest, WriteFailureFailsWaiters) {
@@ -364,37 +363,37 @@ TEST_F(LoggerDurabilityTest, WriteFailureFailsWaiters) {
 
   Logger logger(config_, io);
   ASSERT_EQ(logger.Recover().status, Logger::RecoveryStatus::kOk);
-  logger.StartFlusher();
+  logger.Start();
 
   ASSERT_TRUE(logger.Enqueue(MakePrimaryWriteSet("alice"), 3));
-  logger.ScheduleFlush(3);
+  logger.RequestFlush(3);
   EXPECT_EQ(logger.WaitUntilDurable(3, Logger::Deadline::max()),
             Logger::WaitResult::kFailed);
   EXPECT_EQ(logger.GetDurableEpoch(), 0u);
-  logger.StopFlusher();
+  logger.Stop();
 }
 
 TEST_F(LoggerDurabilityTest, TimeoutIsReportedWhenNothingIsScheduled) {
   Logger logger(config_);
   ASSERT_EQ(logger.Recover().status, Logger::RecoveryStatus::kOk);
-  logger.StartFlusher();
+  logger.Start();
 
   const auto deadline =
       std::chrono::steady_clock::now() + std::chrono::milliseconds(100);
   EXPECT_EQ(logger.WaitUntilDurable(42, deadline),
             Logger::WaitResult::kTimedOut);
-  logger.StopFlusher();
+  logger.Stop();
 }
 
 TEST_F(LoggerDurabilityTest, StopDrainsWhatWasAlreadyClosed) {
   {
     Logger logger(config_);
     ASSERT_EQ(logger.Recover().status, Logger::RecoveryStatus::kOk);
-    logger.StartFlusher();
+    logger.Start();
     ASSERT_TRUE(logger.Enqueue(MakePrimaryWriteSet("alice"), 6));
-    logger.ScheduleFlush(6);
+    logger.RequestFlush(6);
     // Stop without waiting: the drain must still write epoch 6.
-    logger.StopFlusher();
+    logger.Stop();
     EXPECT_EQ(logger.GetDurableEpoch(), 6u);
   }
 
@@ -410,12 +409,12 @@ TEST_F(LoggerDurabilityTest, RecoverReportsTheDurableEpochOfAnExistingLog) {
   {
     Logger logger(config_);
     ASSERT_EQ(logger.Recover().status, Logger::RecoveryStatus::kOk);
-    logger.StartFlusher();
+    logger.Start();
     ASSERT_TRUE(logger.Enqueue(MakePrimaryWriteSet("alice"), 8));
-    logger.ScheduleFlush(8);
+    logger.RequestFlush(8);
     ASSERT_EQ(logger.WaitUntilDurable(8, Logger::Deadline::max()),
               Logger::WaitResult::kDurable);
-    logger.StopFlusher();
+    logger.Stop();
   }
 
   Logger reopened(config_);

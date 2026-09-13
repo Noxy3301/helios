@@ -17,8 +17,7 @@
 
 namespace helios::storage {
 
-// How far the global epoch must move past the cut before every install that
-// could have missed the capture flag has drained.
+// Wait for global epoch E >= se + 2 to drain installs that missed capture.
 constexpr EpochNumber kInstallDrainEpochs = 2;
 
 pax::PaxTable *Database::Impl::GetPaxTable(const std::string_view table_name) {
@@ -36,16 +35,13 @@ Database::PaxReadView Database::Impl::AcquirePaxView(
         "generation";
     return view;
   }
-  // Fence order (do not reorder): arm the capture flag (seq_cst
-  // increment in BeginCapture), then load the cut epoch. An install
-  // whose flag check missed the capture belongs to a commit at or below the
-  // cut, and a thread online in epoch e keeps the global epoch at or below
-  // e + 1; once the global epoch has moved kInstallDrainEpochs on, those
-  // installs have drained. Refuse when the fence target would reach or cross
-  // the high-water mark, compared without addition to stay exact at
-  // the numeric limit.
-  const EpochNumber cut_epoch = epoch_framework_.GetGlobalEpoch();
-  if (cut_epoch >= epoch::Framework::kEpochHighWater - kInstallDrainEpochs) {
+  // Enable capture (seq_cst in BeginCapture), then sample E as snapshot se.
+  // An install that missed capture belongs to a commit at or below se.
+  // Its worker epoch e_w keeps E < e_w + 2 until it leaves, so waiting for
+  // E >= se + 2 drains those installs. Check the high-water bound before
+  // adding the wait interval, so the calculation cannot wrap.
+  const EpochNumber snapshot_epoch = epoch_framework_.GetGlobalEpoch();
+  if (snapshot_epoch >= epoch::Framework::kEpochHighWater - kInstallDrainEpochs) {
     pax::VersionStore::Global().EndCapture(token);
     view.error =
         "columnar read view rejected: epoch space is near its wrap "
@@ -53,7 +49,7 @@ Database::PaxReadView Database::Impl::AcquirePaxView(
     return view;
   }
   if (!epoch_framework_.WaitEpoch(
-          cut_epoch + kInstallDrainEpochs,
+          snapshot_epoch + kInstallDrainEpochs,
           std::chrono::milliseconds(fence_timeout_ms))) {
     pax::VersionStore::Global().EndCapture(token);
     view.error =
@@ -72,7 +68,7 @@ Database::PaxReadView Database::Impl::AcquirePaxView(
     return view;
   }
   view.valid = true;
-  view.cut_epoch = cut_epoch;
+  view.snapshot_epoch = snapshot_epoch;
   view.token = token.id;
   return view;
 }
@@ -87,7 +83,7 @@ void Database::Impl::ReleasePaxView(const Database::PaxReadView &view) {
 
 bool Database::Impl::PaxViewValid(const Database::PaxReadView &view) const {
   if (!view.valid) return false;
-  if (epoch_framework_.GetGlobalEpoch() - view.cut_epoch >=
+  if (epoch_framework_.GetGlobalEpoch() - view.snapshot_epoch >=
       kPaxReadViewEpochLifetime) {
     return false;  // expired: comparisons could leave the wrap-free window
   }

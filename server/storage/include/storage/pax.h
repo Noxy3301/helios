@@ -295,10 +295,9 @@ uint64_t OverflowCount(const PaxTable *store);
 // every PAX install captures the replaced row image into a per-group undo
 // map before its first strip mutation, or fails the capture for the active
 // generation when it cannot (src/pax/version_store.h holds the full
-// contract). A reader with cut epoch E resolves a slot to the before-image
-// of the oldest entry whose writer epoch exceeds E (was_visible == false:
-// the slot held no row) and reads the strip in place when no entry
-// qualifies.
+// contract). A reader at snapshot epoch se uses the oldest before-image
+// whose writer epoch exceeds se. was_visible == false means the slot held
+// no row. With no such entry, the reader uses the strip in place.
 // ---------------------------------------------------------------------------
 
 /**
@@ -311,14 +310,16 @@ struct UndoEntry {
 };
 
 /**
- * @brief Tests whether a writer epoch is after the read view cut.
+ * @brief Tests whether writer_epoch is after snapshot epoch se.
  *
  * @details Plain unsigned comparison on purpose: acquisition refuses near
  * the epoch high-water mark and read views expire well inside that margin,
  * so both operands lie in one wrap-free window. A modular comparison would
- * misread old entries as post-cut once a read view outlives half the range.
+ * misread old entries as newer than se once a view outlives half the range.
  */
-inline bool EpochAfterCut(uint32_t epoch, uint32_t cut) { return epoch > cut; }
+inline bool EpochAfterSnapshot(uint32_t writer_epoch, uint32_t snapshot_epoch) {
+  return writer_epoch > snapshot_epoch;
+}
 
 /**
  * @brief Returns the monotonic capture counter of `group`'s undo map.

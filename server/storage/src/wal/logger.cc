@@ -23,7 +23,10 @@
 #include "wal/logger.h"
 
 #include <algorithm>
+#include <cassert>
+#include <cerrno>
 #include <cstdlib>
+#include <exception>
 #include <functional>
 #include <unordered_map>
 #include <utility>
@@ -33,7 +36,6 @@
 #include "util/spdlog.h"
 #include "wal/epoch_scan_checkpoint.h"
 #include "wal/flush_trace.h"
-#include "wal/thread_local_logger.h"
 
 namespace helios::storage {
 namespace wal {
@@ -258,22 +260,59 @@ WriteSet BuildRecoverySet(const LogRecords &checkpoint,
 }  // namespace
 
 Logger::Logger(const Config &config, WalIo io)
-    : work_dir_(config.work_dir), loads_checkpoint_(config.enable_recovery) {
+    : work_dir_(config.work_dir),
+      loads_checkpoint_(config.enable_recovery),
+      wal_(config.work_dir, std::move(io), config.wal_initial_capacity_bytes) {
   helios::storage::util::InitDebugLog();
-  thread_local_logger_ = std::make_unique<ThreadLocalLogger>(
-      config,
-      [this](EpochNumber durable_epoch) { PublishDurable(durable_epoch); },
-      [this](int error_number) { PublishFailure(error_number); },
-      [this]() { return GetDurableEpoch(); }, std::move(io));
 }
 
-Logger::~Logger() {
-  StopFlusher();
-  thread_local_logger_.reset();
-}
+Logger::~Logger() { Stop(); }
 
 bool Logger::Enqueue(const WriteSet &ws, EpochNumber epoch) {
-  return thread_local_logger_->Enqueue(ws, epoch);
+  // Build the record before taking this producer's buffer lock.
+  LogRecord log_record;
+  log_record.epoch = epoch;
+
+  for (auto &entry : ws) {
+    if (entry.index_name.empty()) {
+      LogRecord::Write write;
+      write.key = entry.key;
+      write.buffer = entry.data_item_copy.buffer.toString();
+      write.transaction_id = entry.data_item_copy.transaction_id.load();
+      write.table_name = entry.table_name;
+      write.index_name = entry.index_name;
+      write.index_type = static_cast<uint32_t>(entry.index_type);
+      write.primary_keys = entry.data_item_copy.primary_keys_vector();
+      write.secondary_op = SecondaryIndexOp::kNone;
+      log_record.writes.emplace_back(std::move(write));
+      continue;
+    }
+
+    if (entry.secondary_index_deltas.empty()) continue;
+    for (const auto &delta : entry.secondary_index_deltas) {
+      LogRecord::Write write;
+      write.key = entry.key;
+      write.buffer = entry.data_item_copy.buffer.toString();
+      write.transaction_id = entry.data_item_copy.transaction_id.load();
+      write.table_name = entry.table_name;
+      write.index_name = entry.index_name;
+      write.index_type = static_cast<uint32_t>(entry.index_type);
+      write.secondary_op = delta.op;
+      write.secondary_primary_key = delta.primary_key;
+      log_record.writes.emplace_back(std::move(write));
+    }
+  }
+
+  // Decided after building the record, not from the input write set: a write
+  // set of secondary entries that carry no delta produces nothing to persist,
+  // and the commit path must not wait for a record that was never buffered.
+  if (log_record.writes.empty()) return false;
+
+  // Append to this thread's buffer; the worker collects it later.
+  auto *buffer = buffers_.Get();
+  std::lock_guard<std::mutex> lock(buffer->mutex);
+  buffer->records.emplace_back(std::move(log_record));
+  return true;
 }
 
 Logger::RecoveryResult Logger::FailRecovery(const WalScanResult &wal) {
@@ -304,7 +343,7 @@ Logger::RecoveryResult Logger::Recover() {
     }
   }
 
-  const auto wal = thread_local_logger_->Scan(checkpoint.start_epoch);
+  const auto wal = wal_.Scan(checkpoint.start_epoch);
   RecoveryResult result;
   if (wal.status != WalScanResult::Status::kOk) return FailRecovery(wal);
 
@@ -326,16 +365,35 @@ Logger::RecoveryResult Logger::Recover() {
   return result;
 }
 
-void Logger::StartFlusher() { thread_local_logger_->StartFlusher(); }
-
-void Logger::ScheduleFlush(EpochNumber closed) {
-  thread_local_logger_->ScheduleFlush(closed);
+void Logger::Start() {
+  assert(!worker_.joinable());
+  worker_ = std::thread(&Logger::Worker, this);
 }
 
-bool Logger::IsQuiescent() { return thread_local_logger_->IsQuiescent(); }
+void Logger::RequestFlush(EpochNumber max_epoch) {
+  auto &trace = FlushTrace::Instance();
+  const bool traced = trace.Enabled();
+  const int64_t close_enter = traced ? FlushTrace::Now() : 0;
 
-void Logger::StopFlusher() {
-  if (thread_local_logger_) thread_local_logger_->StopFlusher();
+  // Raise the requested flush limit before waking the worker.
+  {
+    std::lock_guard<std::mutex> lock(work_mutex_);
+    if (stop_requested_) return;
+    if (max_epoch > flush_epoch_) flush_epoch_ = max_epoch;
+  }
+  const int64_t close_exit = traced ? FlushTrace::Now() : 0;
+  work_cv_.notify_one();
+  if (traced) trace.EpochClosed(max_epoch, close_enter, close_exit);
+}
+
+void Logger::Stop() {
+  // Let the worker finish closed epochs before releasing its WAL and buffers.
+  {
+    std::lock_guard<std::mutex> lock(work_mutex_);
+    stop_requested_ = true;
+  }
+  work_cv_.notify_all();
+  if (worker_.joinable()) worker_.join();
   PublishStopped();
 }
 
@@ -445,6 +503,91 @@ void Logger::AwaitCommitDurability(EpochNumber commit_epoch,
       "transaction that committed in it cannot be acknowledged",
       commit_epoch);
   std::abort();
+}
+
+WalAppendResult Logger::FlushThrough(EpochNumber target) {
+  const EpochNumber durable_before = GetDurableEpoch();
+  auto &trace = FlushTrace::Instance();
+  const bool traced = trace.Enabled();
+  if (traced) trace.GroupCollectBegin(durable_before);
+
+  // Take each producer's records without holding its lock during file I/O.
+  buffers_.ForEach([&](LogBuffer *buffer) {
+    LogRecords swapped;
+    {
+      std::lock_guard<std::mutex> lock(buffer->mutex);
+      swapped.swap(buffer->records);
+    }
+    for (auto &record : swapped) {
+      if (record.epoch <= durable_before) {
+        // Enqueue precedes epoch departure, so a durable epoch cannot gain
+        // another record.
+        SPDLOG_CRITICAL(
+            "Durability Error: a record for epoch {0} arrived after {1} was "
+            "reported durable",
+            record.epoch, durable_before);
+        std::abort();
+      }
+      pending_records_[record.epoch].emplace_back(std::move(record));
+    }
+  });
+
+  if (traced) trace.GroupCollectEnd();
+
+  // Write closed epochs; future epochs remain pending for the next batch.
+  const auto result = wal_.AppendGroup(pending_records_, target);
+  if (!result.ok) return result;
+  pending_records_.erase(pending_records_.begin(),
+                         pending_records_.upper_bound(target));
+  return result;
+}
+
+void Logger::Worker() {
+  for (;;) {
+    // Wait for a flush request, or finish draining on shutdown.
+    EpochNumber target = 0;
+    {
+      std::unique_lock<std::mutex> lock(work_mutex_);
+      work_cv_.wait(lock, [this] {
+        return stop_requested_ || flush_epoch_ > GetDurableEpoch();
+      });
+      target = flush_epoch_;
+      if (target <= GetDurableEpoch()) {
+        if (stop_requested_) return;
+        continue;
+      }
+    }
+
+    // Collect and write without holding the notification mutex.
+    WalAppendResult result;
+    try {
+      result = FlushThrough(target);
+    } catch (const std::exception &e) {
+      SPDLOG_CRITICAL("Durability Error: the logger worker threw: {0}",
+                      e.what());
+      result = {false, EIO};
+    } catch (...) {
+      SPDLOG_CRITICAL("Durability Error: the logger worker threw");
+      result = {false, EIO};
+    }
+
+    // Stop accepting epoch notifications and report the failed write.
+    if (!result.ok) {
+      {
+        std::lock_guard<std::mutex> lock(work_mutex_);
+        stop_requested_ = true;
+      }
+      PublishFailure(result.error_number);
+      return;
+    }
+
+    // Publish the closed range after syncing its records, if any.
+    auto &trace = FlushTrace::Instance();
+    const bool traced = trace.Enabled();
+    const int64_t publish_enter = traced ? FlushTrace::Now() : 0;
+    PublishDurable(target);
+    if (traced) trace.GroupPublish(target, publish_enter, FlushTrace::Now());
+  }
 }
 
 }  // namespace wal

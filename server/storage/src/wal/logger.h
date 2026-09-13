@@ -16,8 +16,7 @@
 
 /**
  * @file server/storage/src/wal/logger.h
- * The write-ahead log and the durable epoch a synchronous commit waits
- * on.
+ * Producer log buffers, their background writer and the durable epoch.
  */
 
 #ifndef HELIOS_STORAGE_SRC_WAL_LOGGER_H
@@ -26,13 +25,14 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
-#include <memory>
+#include <map>
 #include <mutex>
 #include <string>
+#include <thread>
 
-#include "index/data_buffer.h"
 #include "storage/config.h"
 #include "util/epoch.h"
+#include "util/thread_key_storage.h"
 #include "wal/log_entry.h"
 #include "wal/log_record.h"
 #include "wal/wal.h"
@@ -40,16 +40,13 @@
 namespace helios::storage {
 namespace wal {
 
-class ThreadLocalLogger;
-
 /**
- * @brief Owns the write-ahead log and the durable epoch.
+ * @brief Owns the WAL, per-producer buffers and the worker that persists them.
  *
- * @details The durable epoch is the highest epoch whose records are on the
- * device. It only ever advances, and only after the fdatasync that made
- * those records durable returned successfully (an epoch with no records
- * advances it without one); a commit that waits on its own epoch therefore
- * learns the truth rather than an intention.
+ * @details Each producer appends to its own buffer. The worker collects the
+ * records and writes closed epochs, then publishes durable epoch D to
+ * waiting commits. An epoch with no records advances without a file write.
+ * The destructor joins the worker before destroying the WAL and buffers.
  */
 class Logger {
  public:
@@ -88,24 +85,23 @@ class Logger {
    * published checkpoint, and returns it together with the folded write set,
    * the checkpoint first when one was loaded, then the log. On kFailed,
    * durable_epoch is 0 and recovery_set is empty.
-   * @note Runs before the flusher starts and before the database accepts
+   * @note Runs before the worker starts and before the database accepts
    * work.
    */
   RecoveryResult Recover();
 
   /**
-   * @brief Starts the flusher. Must follow Recover() and precede the first
-   * tick.
+   * @brief Starts the logger worker after recovery, before epoch notifications.
    */
-  void StartFlusher();
+  void Start();
 
   /**
-   * @brief Publishes a new closed epoch.
-   * @note Called from the epoch writer thread; only records at or below
-   * `closed` may be written, because a later epoch can still gain
-   * participants.
+   * @brief Requests WAL persistence without waiting for I/O.
+   * @param max_epoch Highest epoch to persist, inclusive.
+   * @note The caller must ensure no producer can add records at or below
+   * max_epoch. Durable epoch D advances only after those records are synced.
    */
-  void ScheduleFlush(EpochNumber closed);
+  void RequestFlush(EpochNumber max_epoch);
 
   EpochNumber GetDurableEpoch() const {
     return durable_epoch_.load(std::memory_order_seq_cst);
@@ -137,19 +133,11 @@ class Logger {
   void AwaitCommitDurability(EpochNumber commit_epoch, bool awaits_durability);
 
   /**
-   * @brief True while every closed epoch handed to the flusher is durable,
-   * and unconditionally after a write failure: nothing further will be
-   * written. Records buffered for epochs that have not closed yet do not
-   * count.
+   * @brief Drains closed epochs, joins the worker and wakes remaining waiters.
+   * @details After a write failure, no further records are written. Calling
+   * Stop again, or before Start, is safe.
    */
-  bool IsQuiescent();
-
-  /**
-   * @brief Flushes everything already closed, then stops and joins the
-   * flusher. After a write failure nothing more is flushed and the join is
-   * immediate.
-   */
-  void StopFlusher();
+  void Stop();
 
   /**
    * @brief Makes a later log I/O failure terminate the process.
@@ -162,28 +150,52 @@ class Logger {
   void SetFailStop();
 
  private:
-  // Reports a scan that failed and answers Recover with kFailed.
-  RecoveryResult FailRecovery(const WalScanResult &wal);
-
-  void PublishDurable(EpochNumber durable_epoch);
-  void PublishFailure(int error_number);
-  void PublishStopped();
+  struct LogBuffer {
+    std::mutex mutex;
+    LogRecords records;
+  };
 
   const std::string work_dir_;
-  // Whether a published checkpoint is loaded at all. The log itself is always
-  // scanned and its interrupted tail truncated.
   const bool loads_checkpoint_;
-  std::atomic<EpochNumber> durable_epoch_{0};
+  Wal wal_;
 
+  // One buffer per producer, also retained after that producer exits.
+  ThreadKeyStorage<LogBuffer> buffers_;
+  // Owned by the worker; records beyond the requested flush epoch stay here.
+  std::map<EpochNumber, LogRecords> pending_records_;
+
+  // Protects the flush request and the request to stop the worker.
+  std::mutex work_mutex_;
+  std::condition_variable work_cv_;
+  EpochNumber flush_epoch_{0};
+  bool stop_requested_{false};
+
+  // Protects the result reported to commit and checkpoint waiters.
   enum class State { kRunning, kStopped, kFailed };
+  // D: the highest epoch known to be durable.
+  std::atomic<EpochNumber> durable_epoch_{0};
   std::mutex durability_mutex_;
   std::condition_variable durability_cv_;
   State state_{State::kRunning};
   bool process_fail_stop_{false};
 
-  // Declared last: the backend's flusher publishes through the members above,
-  // so it must be destroyed before them.
-  std::unique_ptr<ThreadLocalLogger> thread_local_logger_;
+  std::thread worker_;
+
+  /**
+   * @brief Collects producer buffers and persists records through target.
+   * @note Called only by the worker, without holding work_mutex_.
+   */
+  WalAppendResult FlushThrough(EpochNumber target);
+
+  /**
+   * @brief Writes closed epochs until stopped or a batch fails.
+   */
+  void Worker();
+
+  RecoveryResult FailRecovery(const WalScanResult &wal);
+  void PublishDurable(EpochNumber durable_epoch);
+  void PublishFailure(int error_number);
+  void PublishStopped();
 };
 
 }  // namespace wal

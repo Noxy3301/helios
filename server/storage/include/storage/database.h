@@ -84,9 +84,9 @@ class Database {
    *        from the participant set the index reclaims against.
    *
    * @details This is the index's reclamation epoch, not the commit epoch and
-   * not a read view's cut_epoch. No row reference obtained inside the section
-   * may be used past this call: ending a section is a release, after which
-   * another thread's delete can free those rows. The next store op on the
+   * not a read view's snapshot_epoch. No row reference obtained inside the
+   * section may be used past this call: ending a section is a release, after
+   * which another thread's delete can free those rows. The next store op on the
    * thread opens a new section; there is no separate begin call.
    */
   void ReleaseThreadEpoch();
@@ -150,22 +150,21 @@ class Database {
   /**
    * @brief Handle for one columnar read view.
    *
-   * @details `cut_epoch` is the read view's serialization point: commits
-   * with epoch <= cut are visible, later ones resolve to before-images.
+   * @details `snapshot_epoch` (se) is the read view's serialization point:
+   * commits with epoch <= se are visible; later ones resolve to before-images.
    * `token` must be passed back to ReleasePaxView exactly once.
    */
   struct PaxReadView {
     bool valid = false;
-    uint32_t cut_epoch = 0;
+    uint32_t snapshot_epoch = 0;
     uint64_t token = 0;
     std::string error;  // rejection reason when !valid
   };
 
   /**
-   * @brief Arms before-image capture and fences the epoch so `cut_epoch`
-   * is a sound serialization point.
+   * @brief Arms capture and waits for global epoch E >= se + 2.
    *
-   * @details On return every commit with epoch <= cut_epoch has finished
+   * @details On return every commit through snapshot_epoch (se) has finished
    * installing, and every later commit captures the rows it overwrites or
    * invalidates the read view. The calling thread must not hold an epoch (it
    * must be outside any transaction). Fails instead of falling back on

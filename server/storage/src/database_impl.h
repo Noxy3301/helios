@@ -157,7 +157,7 @@ class Database::Impl {
  private:
   // Read view expiry, half the high-water margin. Enforces the wrap-free
   // window behind plain epoch comparisons: readers gate every attempt on
-  // PaxViewValid, and the cut-to-global distance grows monotonically over
+  // PaxViewValid, and the global-to-snapshot distance E - se grows over
   // any practical read view lifetime, keeping accepted results inside the
   // bound.
   static constexpr EpochNumber kPaxReadViewEpochLifetime =

@@ -113,10 +113,10 @@ class Framework {
    * @details The caller must not enqueue log records, and must not take its
    * commit epoch, before this returns.
    *
-   * Once this has returned an epoch E, the global epoch cannot reach E+2 while
-   * the slot still reads E: only one writer scan that missed the publication
-   * can be outstanding, and the next one reads E. This assumes E stays clear
-   * of wraparound: the epoch writer stops the process at #kEpochHighWater
+   * Once this returns worker epoch e_w, global epoch E cannot reach e_w + 2
+   * while the slot still reads e_w: only one writer scan that missed the
+   * publication can be outstanding, and the next one reads e_w. This assumes
+   * e_w stays clear of wraparound: the epoch writer stops at #kEpochHighWater
    * rather than wrapping, and a counter seeded at or past the mark before
    * #Start() fail-stops on the writer's first eligible advance. A thread
    * still inside the loop carries no such guarantee, which is why the
@@ -253,9 +253,10 @@ class Framework {
   EpochNumber GetSmallestEpoch() {
     EpochNumber min_epoch = kThreadOffline;
     thread_epochs_.ForEach([&](const std::atomic<EpochNumber> *local_epoch) {
-      const EpochNumber e = local_epoch->load(std::memory_order_seq_cst);
-      if (0 < e && e < min_epoch) {
-        min_epoch = e;
+      const EpochNumber worker_epoch =
+          local_epoch->load(std::memory_order_seq_cst);
+      if (0 < worker_epoch && worker_epoch < min_epoch) {
+        min_epoch = worker_epoch;
       }
     });
 
@@ -313,9 +314,9 @@ class Framework {
           std::lock_guard<std::mutex> lk(epoch_mutex_);
           global_epoch_.fetch_add(1);
         }
-        EpochNumber updated = global_epoch_.load();
+        const EpochNumber global_epoch = global_epoch_.load();
         epoch_cv_.notify_all();
-        if (epoch_hook_) epoch_hook_(updated);
+        if (epoch_hook_) epoch_hook_(global_epoch);
       }
       if (stop_.load() && min_epoch == kThreadOffline) break;
     }
@@ -324,6 +325,7 @@ class Framework {
   std::atomic<bool> start_;
   std::atomic<bool> stop_;
   std::atomic<bool> advance_requested_{false};
+  // E: the global epoch shared by all participants.
   std::atomic<EpochNumber> global_epoch_;
   std::mutex epoch_mutex_;
   std::condition_variable epoch_cv_;
@@ -332,6 +334,7 @@ class Framework {
   // Started by the constructor but parked on epoch_cv_ until Start(), so it
   // cannot reach thread_epochs_ before that member is constructed.
   std::thread epoch_writer_;
+  // e_w: the epoch published by each participating worker.
   ThreadKeyStorage<std::atomic<EpochNumber>> thread_epochs_;
 };
 

@@ -31,8 +31,8 @@ namespace pax {
  * was_visible=false entry. An install that cannot capture (byte budget
  * exceeded, or no commit epoch) fails the capture for the active generation
  * instead, and every result produced under it is discarded. A reader
- * with cut epoch E resolves a slot to the before-image of the oldest entry
- * whose writer epoch exceeds E and reads the strip in place when no entry
+ * at snapshot epoch se uses the oldest before-image whose writer epoch
+ * exceeds se and reads the strip in place when no entry
  * qualifies. With no read view active the writer side pays one atomic load
  * per installed row.
  */

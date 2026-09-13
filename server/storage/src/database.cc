@@ -202,35 +202,37 @@ Database::Impl::Impl(const Config &config)
       epoch_framework_.SetGlobalEpoch(ResumeEpochAbove(scanned.durable_epoch));
     }
   }
-  // Armed after recovery, which reports its own failures by refusing to
-  // start, and before the flusher that can raise one at run time.
+
+  // Abort the process if the running logger cannot persist its records.
   logger_.SetFailStop();
-  // Built before any thread records, so its storage and its dump signal are
-  // in place rather than raised by whichever path happens to reach it first.
+
+  // Initialise optional WAL timing before the logger can record events.
   wal::FlushTrace::Instance();
-  logger_.StartFlusher();
+
+  // Checkpointing needs both WAL persistence and epoch advancement running.
+  logger_.Start();
   epoch_framework_.Start();
-  // Last: its scan waits on the epoch it starts.
   scan_checkpoint_.Start();
 }
 
 Database::Impl::~Impl() {
+  // Wait for two epoch advances before shutting down background work.
   epoch_framework_.Sync();
-  // Before the epoch writer stops, since a capture in progress waits for the
-  // epoch to advance.
+
+  // Finish checkpoint work while its epoch and WAL waits can still complete.
   scan_checkpoint_.Stop();
+
+  // Stop epoch notifications, then drain closed epochs and join the logger.
   epoch_framework_.Stop();
-  // After the epoch writer has joined no further closed epoch arrives, so the
-  // flusher can drain what it already owns and be joined before the log is
-  // closed.
-  logger_.StopFlusher();
+  logger_.Stop();
+
+  // Report final epochs and write the optional WAL timing output.
   SPDLOG_DEBUG(
       "Epoch number and Durable epoch number are ended at {0}, and {1}, "
       "respectively.",
       epoch_framework_.GetGlobalEpoch(), logger_.GetDurableEpoch());
-  // Written once every thread that records has joined, so the census reaches
-  // the filesystem off the commit and flush paths.
   wal::FlushTrace::Instance().Dump();
+
   SPDLOG_INFO("Storage instance has been destructed.");
   assert(Database::Impl::instance_ == this);
   Database::Impl::instance_ = nullptr;
@@ -239,19 +241,16 @@ Database::Impl::~Impl() {
 const Config &Database::Impl::GetConfig() const { return config_; }
 
 std::function<void(EpochNumber)> Database::Impl::MakeEpochHook() {
-  return [&](EpochNumber updated_epoch) {
-    // Logging. The global epoch advances from U-1 to U while threads may
-    // still be online in U-1, so U-2 is the newest epoch that is certainly
-    // closed and safe to write. Handing the target to the logger's own
-    // flusher keeps the durability fdatasync off this pool.
-    // updated_epoch - 2 is the newest epoch no thread can still be in: a
-    // joiner that read E keeps the global epoch below E + 2 (Framework::Join).
-    if (updated_epoch >= 3) {
-      logger_.ScheduleFlush(updated_epoch - 2);
+  // The epoch writer calls this with the global epoch it just published.
+  return [this](const EpochNumber global_epoch) {
+    // An online worker in e_w keeps global epoch E below e_w + 2.
+    // With E = global_epoch, the logger may persist records through E - 2.
+    if (global_epoch >= 3) {
+      logger_.RequestFlush(global_epoch - 2);
     }
 
     // Physically purge the tombstones whose grace epoch has passed.
-    reaper_.Reap(updated_epoch);
+    reaper_.Reap(global_epoch);
 
     // Tick masstree's globalepoch so RCU can free retired leaves and
     // DataItem limbo once min_active_epoch() catches up. Workers release
