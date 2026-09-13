@@ -333,7 +333,7 @@ void Database::Recover() {
         DataItem item;
         item.transaction_id.store(entry.tid);
         item.SetPrimaryKeys(entry.primary_keys);
-        idx->Put(entry.key, std::move(item));
+        idx->tree.Put(entry.key, std::move(item));
       } else {
         SPDLOG_CRITICAL(
             "Recovery failed: secondary index {0} of table {1} is declared "

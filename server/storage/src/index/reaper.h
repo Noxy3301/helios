@@ -20,8 +20,7 @@
 namespace helios::storage {
 namespace index {
 
-class PrimaryIndex;
-class SecondaryIndex;
+class MasstreeIndex;
 
 /**
  * @brief Physically erases logically deleted index slots after a grace
@@ -38,11 +37,9 @@ class Reaper {
   /**
    * @brief Registers one logically deleted slot for a later physical purge.
    *
-   * The committer passes the already resolved owning index, exactly one of
-   * primary_index / secondary_index.
+   * The committer passes the tree owning the already resolved slot.
    */
-  void Enqueue(PrimaryIndex *primary_index, SecondaryIndex *secondary_index,
-               std::string_view key, DataItem *item,
+  void Enqueue(MasstreeIndex &index, std::string_view key, DataItem &item,
                TransactionId delete_commit_tid);
 
   /**
@@ -60,40 +57,18 @@ class Reaper {
   /**
    * @brief One logically deleted slot awaiting its physical purge.
    *
-   * Exactly one of primary_index / secondary_index is set, and which one
-   * says where the slot lives. `item` is the slot pointer observed at
+   * index is the tree owning the slot. item is the slot pointer observed at
    * enqueue time and serves as an identity check at reap time.
    * `delete_commit_tid` is the TID the deleting commit published on the
    * slot; it acts both as the grace-period clock and as evidence that the
    * slot still holds the deleted version.
    */
   struct Tombstone {
-    PrimaryIndex *primary_index = nullptr;
-    SecondaryIndex *secondary_index = nullptr;
+    MasstreeIndex *index = nullptr;
     std::string key;
     DataItem *item = nullptr;
     TransactionId delete_commit_tid;
   };
-
-  /**
-   * @brief Re-resolves the tombstone's key in its owning index.
-   *
-   * Returns the DataItem currently installed under the key, or nullptr.
-   * Reap compares the result with `tombstone.item`: a mismatch means the
-   * slot was already purged and re-created, so the tombstone is stale.
-   */
-  DataItem *Get(const Tombstone &tombstone);
-
-  /**
-   * @brief Physically erases the slot through the owning index's Purge.
-   *
-   * `retired_tid` (`delete TID + 2`, lock bit clear) is stamped on the erased
-   * slot so an in-place reuse continues the slot's TID sequence instead of
-   * restarting below the delete TID.
-   *
-   * @return True when the owning index removed the slot.
-   */
-  bool Purge(const Tombstone &tombstone, TransactionId retired_tid);
 
   // Guards the queue: Enqueue runs on committers, Reap on the epoch thread.
   std::mutex mutex_;

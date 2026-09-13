@@ -16,7 +16,7 @@
 
 #include "lineairdb/pax.h"
 
-#include "index/primary_index.h"
+#include "index/masstree_index.h"
 #include "index/secondary_index.h"
 #include "pax/table.h"
 
@@ -61,7 +61,7 @@ class Table {
 
   const std::string &Name() const;
 
-  index::PrimaryIndex &GetPrimaryIndex();
+  index::MasstreeIndex &GetPrimaryIndex();
 
   /**
    * @brief Returns the index of that name, or nullptr.
@@ -92,7 +92,7 @@ class Table {
       const std::string_view index_name, const IndexConstraint index_type);
 
  private:
-  index::PrimaryIndex primary_index_;
+  index::MasstreeIndex primary_index_;
   std::unique_ptr<pax::PaxTable> pax_table_;
   mutable std::shared_mutex table_lock_;
   std::unordered_map<std::string, std::unique_ptr<index::SecondaryIndex>>

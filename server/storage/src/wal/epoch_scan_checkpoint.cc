@@ -22,7 +22,6 @@
 
 #include "index/data_item.h"
 #include "index/masstree_index.h"
-#include "index/primary_index.h"
 #include "index/secondary_index.h"
 #include "silo/stable_read.h"
 #include "table/table.h"
@@ -433,8 +432,8 @@ bool EpochScanCheckpoint::CaptureTable(Table &table, LogRecord &record,
   // Capture every secondary posting list the same way.
   table.ForEachSecondaryIndex(
       [&](const std::string &index_name, index::SecondaryIndex &index) {
-        const uint32_t index_type = static_cast<uint32_t>(index.GetIndexType());
-        index.ForEach([&](std::string_view key, DataItem &item) {
+        const uint32_t index_type = static_cast<uint32_t>(index.constraint);
+        index.tree.ForEach([&](std::string_view key, DataItem &item) {
           LogRecord::Write write;
           switch (CaptureSecondaryEntry(table_name, index_name, index_type, key,
                                         item, write, stats.version_retries)) {
@@ -491,12 +490,12 @@ bool EpochScanCheckpoint::CaptureTable(Table &table, LogRecord &record,
     for (const auto &[index_name, key] : unstable_entries) {
       index::SecondaryIndex *index = table.GetSecondaryIndex(index_name);
       if (index == nullptr) continue;
-      DataItem *item = index->Get(key);
+      DataItem *item = index->tree.Get(key);
       if (item == nullptr) continue;
       LogRecord::Write write;
-      switch (CaptureSecondaryEntry(
-          table_name, index_name, static_cast<uint32_t>(index->GetIndexType()),
-          key, *item, write, stats.version_retries)) {
+      switch (CaptureSecondaryEntry(table_name, index_name,
+                                    static_cast<uint32_t>(index->constraint),
+                                    key, *item, write, stats.version_retries)) {
         case CaptureResult::kTaken:
           ++stats.secondary_entries;
           record.writes.emplace_back(std::move(write));

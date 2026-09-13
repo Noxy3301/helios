@@ -248,7 +248,7 @@ struct MasstreeIndex::Impl {
   // after it has CAS-locked the DataItem and verified the tombstone TID.
   // Returns true if the key was physically removed; false if the slot is
   // already gone or a racing replacement won the position.
-  bool Purge(std::string_view key, DataItem *expected,
+  bool Purge(std::string_view key, DataItem &expected,
              TransactionId retired_tid) {
     ensure_thread_active();
     cursor_type lp(table_, key.data(), key.size());
@@ -258,7 +258,7 @@ struct MasstreeIndex::Impl {
       return false;
     }
     DataItem *current = lp.value();
-    if (expected != nullptr && current != expected) {
+    if (current != &expected) {
       // Another writer replaced the slot between the commit-time decision
       // and this erase. Leave the new occupant alone.
       lp.finish(0, *tls_ti);
@@ -271,16 +271,16 @@ struct MasstreeIndex::Impl {
     // RCU-frees the leaf if it becomes empty. The DataItem* itself rides on
     // a separate RCU callback below.
     lp.finish(-1, *tls_ti);
-    if (!retired_tid.IsEmpty()) {
-      current->transaction_id.store(retired_tid);
-    }
+    current->transaction_id.store(retired_tid);
     RcuFree(current);
     return true;
   }
 
-  // Idempotent absent insert: never removes, just ensures a slot exists.
-  void PutAbsent(std::string_view key) {
-    ensure_thread_active();
+  DataItem *GetOrInsert(std::string_view key) {
+    // Existing entries need only the optimistic lookup.
+    if (auto *item = Get(key)) return item;
+
+    // Recheck under the leaf lock before publishing a new absent entry.
     cursor_type lp(table_, key.data(), key.size());
     bool found = lp.find_insert(*tls_ti);
     if (!found) {
@@ -290,8 +290,10 @@ struct MasstreeIndex::Impl {
         lp.value() = new DataItem();
       }
     }
+    DataItem *item = lp.value();
     fence();
     lp.finish(found ? 0 : 1, *tls_ti);
+    return item;
   }
 
   size_t Scan(std::string_view begin, std::optional<std::string_view> end,
@@ -371,7 +373,9 @@ void MasstreeIndex::Put(std::string_view key, DataItem &&value) {
   impl_->Put(key, std::move(value));
 }
 
-void MasstreeIndex::PutAbsent(std::string_view key) { impl_->PutAbsent(key); }
+DataItem *MasstreeIndex::GetOrInsert(std::string_view key) {
+  return impl_->GetOrInsert(key);
+}
 
 size_t MasstreeIndex::Scan(std::string_view begin,
                            std::optional<std::string_view> end,
@@ -402,7 +406,7 @@ void MasstreeIndex::ForEach(
   impl_->ForEach(std::move(operation));
 }
 
-bool MasstreeIndex::Purge(std::string_view key, DataItem *expected,
+bool MasstreeIndex::Purge(std::string_view key, DataItem &expected,
                           TransactionId retired_tid) {
   return impl_->Purge(key, expected, retired_tid);
 }

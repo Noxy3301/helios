@@ -45,11 +45,14 @@ class MasstreeIndex final {
   void Put(std::string_view key, DataItem &&value);
 
   /**
-   * @brief Seeds an absent entry for a key that later writes fill in.
+   * @brief Returns the entry for key, creating an absent DataItem if needed.
    *
-   * @details Idempotent on a key that already exists.
+   * @details Concurrent insertions of the same key reuse the existing entry.
+   * The returned pointer is protected by the caller's Masstree epoch; commit
+   * must still re-resolve the key after locking the DataItem.
+   * @return Non-null. Allocation failures propagate as exceptions.
    */
-  void PutAbsent(std::string_view key);
+  DataItem *GetOrInsert(std::string_view key);
 
   /**
    * @brief Walks the keys in `[begin, end)`, or to the last key when end is
@@ -81,13 +84,12 @@ class MasstreeIndex final {
    * still resolves to the same DataItem. `retired_tid` is published on the
    * removed item before it is retired to RCU.
    *
-   * @param expected Slot pointer captured at enqueue; a null pointer skips
-   * the identity check.
+   * @param expected The locked slot that must still be stored under key.
    * @return True when the slot was removed; false when the key is gone or a
    * replacement holds it.
    */
-  bool Purge(std::string_view key, DataItem *expected,
-             TransactionId retired_tid = {});
+  bool Purge(std::string_view key, DataItem &expected,
+             TransactionId retired_tid);
 
  private:
   struct Impl;

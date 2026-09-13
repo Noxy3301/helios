@@ -104,14 +104,15 @@ bool Database::IndexNdv(const std::string_view table_name,
       return false;
     };
 
-    index->Scan(std::string_view(), std::string_view(kSupremum),
-                [&](std::string_view key) -> bool {
-                  DataItem *item = index->Get(key);
-                  if (item == nullptr || !stable_live_secondary(*item)) {
-                    return false;
-                  }
-                  return count_key(key);
-                });
+    index->tree.Scan(
+        std::string_view(), std::string_view(kSupremum),
+        [&](std::string_view key) -> bool {
+          DataItem *item = index->tree.Get(key);
+          if (item == nullptr || !stable_live_secondary(*item)) {
+            return false;
+          }
+          return count_key(key);
+        });
   }
 
   if (failed) {
@@ -170,18 +171,18 @@ bool Database::IndexHistogram(const std::string_view table_name,
         failed = true;
         return;
       }
-      index->Scan(std::string_view(), std::string_view(kSupremum),
-                  [&](std::string_view key) -> bool {
-                    DataItem *item = index->Get(key);
-                    if (item == nullptr) return false;
-                    const uint64_t w = stable_pk_count(*item);
-                    if (w == 0) return false;  // dead/empty secondary entry
-                    if (leading_end(key) == 0) {
-                      failed = true;
-                      return true;
-                    }
-                    return fn(key, w);
-                  });
+      index->tree.Scan(std::string_view(), std::string_view(kSupremum),
+                          [&](std::string_view key) -> bool {
+                            DataItem *item = index->tree.Get(key);
+                            if (item == nullptr) return false;
+                            const uint64_t w = stable_pk_count(*item);
+                            if (w == 0) return false;  // dead/empty secondary entry
+                            if (leading_end(key) == 0) {
+                              failed = true;
+                              return true;
+                            }
+                            return fn(key, w);
+                          });
     }
   };
 

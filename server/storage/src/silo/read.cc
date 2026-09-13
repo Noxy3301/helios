@@ -136,7 +136,7 @@ ScanIndexResult ScanIndex(TableDictionary &tables,
   // Pin the immutable key list until all its primary keys have been read.
   auto append_secondary_entry = [&](std::string_view key) {
     const std::string secondary_key(key);
-    DataItem *item = index->Get(key);
+    DataItem *item = index->tree.Get(key);
     if (item == nullptr) {
       return false;
     }
@@ -149,9 +149,9 @@ ScanIndexResult ScanIndex(TableDictionary &tables,
   };
 
   if (reverse_scan) {
-    index->ScanReverse(start_key, end_key, append_secondary_entry);
+    index->tree.ScanReverse(start_key, end_key, append_secondary_entry);
   } else {
-    index->Scan(start_key, end_key, append_secondary_entry);
+    index->tree.Scan(start_key, end_key, append_secondary_entry);
   }
   return result;
 }

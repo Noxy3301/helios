@@ -18,7 +18,7 @@
 #include <vector>
 
 #include "index/data_item.h"
-#include "index/primary_index.h"
+#include "index/masstree_index.h"
 #include "index/reaper.h"
 #include "index/secondary_index.h"
 #include "pax/table.h"
@@ -53,7 +53,7 @@ struct WriteEntry {
   const pax::Row *value = nullptr;
   bool is_delete = false;
   DataItem *item = nullptr;
-  index::PrimaryIndex *index = nullptr;
+  index::MasstreeIndex *index = nullptr;
   // Insert entry that is the first entry for its key in this request, so
   // the committed row is what decides whether the key is free.
   bool check_committed_row = false;
@@ -67,15 +67,14 @@ struct SecondaryIndexEntry {
   std::string primary_key;
   bool is_delete = false;
   DataItem *item = nullptr;
-  index::SecondaryIndex *index = nullptr;
+  index::MasstreeIndex *index = nullptr;
   IndexConstraint index_type;
 };
 
 // The index entry a locked item must still be reachable through.
 struct LockTarget {
   DataItem *item = nullptr;
-  index::PrimaryIndex *primary_index = nullptr;
-  index::SecondaryIndex *secondary_index = nullptr;
+  index::MasstreeIndex *index = nullptr;
   std::string key;
 };
 
@@ -187,7 +186,6 @@ bool Resolve(CommitCtx &ctx, std::shared_mutex &schema_mutex) {
     if (table->GetPaxTable() == nullptr) return ctx.Abort("pax_schema_missing");
 
     DataItem *item = table->GetPrimaryIndex().GetOrInsert(write.key);
-    assert(item != nullptr);  // GetOrInsert materializes an absent slot
 
     // An insert onto a key an earlier entry of this request already made
     // live is a duplicate the committed state cannot excuse.
@@ -211,8 +209,7 @@ bool Resolve(CommitCtx &ctx, std::shared_mutex &schema_mutex) {
                           &write.value, write.op == RowOp::kDelete, item,
                           primary_index, check_committed_row});
     ctx.items.push_back(item);
-    ctx.targets.push_back(
-        {item, primary_index, nullptr, std::string(write.key)});
+    ctx.targets.push_back({item, primary_index, std::string(write.key)});
   }
 
   // Resolve secondary-index updates to the secondary-index entries to lock
@@ -231,7 +228,7 @@ bool Resolve(CommitCtx &ctx, std::shared_mutex &schema_mutex) {
     }
 
     // R3: reject the same UNIQUE SI key appearing twice in this request.
-    if (!op.is_delete && index->IsUnique()) {
+    if (!op.is_delete && index->constraint == IndexConstraint::kUnique) {
       const std::string unique_key =
           op.table_name + '\0' + op.index_name + '\0' + op.secondary_key;
       if (!unique_si_adds.insert(unique_key).second) {
@@ -240,15 +237,14 @@ bool Resolve(CommitCtx &ctx, std::shared_mutex &schema_mutex) {
       }
     }
 
-    // Locking needs a slot, so an entry whose secondary key has none seeds a
-    // absent one here.
-    DataItem *item = index->GetOrInsert(op.secondary_key);
+    // Create an absent entry if this secondary key has no slot to lock.
+    DataItem *item = index->tree.GetOrInsert(op.secondary_key);
 
     ctx.si_ops.push_back({op.table_name, op.index_name, op.secondary_key,
-                          op.primary_key, op.is_delete, item, index,
-                          index->GetIndexType()});
+                          op.primary_key, op.is_delete, item, &index->tree,
+                          index->constraint});
     ctx.items.push_back(item);
-    ctx.targets.push_back({item, nullptr, index, op.secondary_key});
+    ctx.targets.push_back({item, &index->tree, op.secondary_key});
   }
   return true;
 }
@@ -269,14 +265,7 @@ bool Lock(CommitCtx &ctx) {
   auto attached = [&](DataItem *item) {
     for (const auto &target : ctx.targets) {
       if (target.item != item) continue;
-      DataItem *current = nullptr;
-      if (target.primary_index != nullptr) {
-        current = target.primary_index->Get(target.key);
-      } else if (target.secondary_index != nullptr) {
-        current = target.secondary_index->Get(target.key);
-      } else {
-        continue;
-      }
+      DataItem *current = target.index->Get(target.key);
       if (current != item) return false;
     }
     return true;
@@ -440,7 +429,7 @@ bool ReplayIndexRange(CommitCtx &ctx, const ExternalRangeReadEntry &range) {
 
   auto collect_secondary_key = [&](std::string_view key) {
     const std::string secondary_key(key);
-    DataItem *item = index->Get(key);
+    DataItem *item = index->tree.Get(key);
     if (item == nullptr) return false;
     // Pin the immutable primary-key list under a stable read, as
     // silo::ScanIndex does. A committer publishes a new list under its lock;
@@ -466,9 +455,10 @@ bool ReplayIndexRange(CommitCtx &ctx, const ExternalRangeReadEntry &range) {
   };
 
   if (range.reverse_scan) {
-    index->ScanReverse(range.start_key, range.end_key, collect_secondary_key);
+    index->tree.ScanReverse(range.start_key, range.end_key,
+                               collect_secondary_key);
   } else {
-    index->Scan(range.start_key, range.end_key, collect_secondary_key);
+    index->tree.Scan(range.start_key, range.end_key, collect_secondary_key);
   }
   if (aborted) return false;
   return matches && result_pos == range.result_keys.size() &&
@@ -648,7 +638,7 @@ void Publish(CommitCtx &ctx, index::Reaper &reaper, wal::WriteSet &log_set) {
     if (!write.is_delete) continue;
     auto tid_it = published.find(write.item);
     if (tid_it == published.end()) continue;
-    reaper.Enqueue(write.index, nullptr, write.key, write.item, tid_it->second);
+    reaper.Enqueue(*write.index, write.key, *write.item, tid_it->second);
   }
 
   std::unordered_set<DataItem *> registered_si_purges;
@@ -661,8 +651,7 @@ void Publish(CommitCtx &ctx, index::Reaper &reaper, wal::WriteSet &log_set) {
     if (!registered_si_purges.insert(op.item).second) continue;
     auto tid_it = published.find(op.item);
     if (tid_it == published.end()) continue;
-    reaper.Enqueue(nullptr, op.index, op.secondary_key, op.item,
-                   tid_it->second);
+    reaper.Enqueue(*op.index, op.secondary_key, *op.item, tid_it->second);
   }
 }
 

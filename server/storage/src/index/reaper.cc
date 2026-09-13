@@ -10,41 +10,21 @@
 #include <utility>
 
 #include "index/masstree_index.h"
-#include "index/primary_index.h"
-#include "index/secondary_index.h"
 #include "silo/stable_read.h"
 
 namespace helios::storage {
 namespace index {
 
-void Reaper::Enqueue(PrimaryIndex *primary_index,
-                     SecondaryIndex *secondary_index, std::string_view key,
-                     DataItem *item, TransactionId delete_commit_tid) {
+void Reaper::Enqueue(MasstreeIndex &index, std::string_view key, DataItem &item,
+                     TransactionId delete_commit_tid) {
   Tombstone tombstone;
-  tombstone.primary_index = primary_index;
-  tombstone.secondary_index = secondary_index;
+  tombstone.index = &index;
   tombstone.key = std::string(key);
-  tombstone.item = item;
+  tombstone.item = &item;
   tombstone.delete_commit_tid = delete_commit_tid;
 
   std::lock_guard<std::mutex> lk(mutex_);
   tombstones_.emplace_back(std::move(tombstone));
-}
-
-DataItem *Reaper::Get(const Tombstone &tombstone) {
-  if (tombstone.primary_index != nullptr) {
-    return tombstone.primary_index->Get(tombstone.key);
-  }
-  return tombstone.secondary_index->Get(tombstone.key);
-}
-
-bool Reaper::Purge(const Tombstone &tombstone, TransactionId retired_tid) {
-  if (tombstone.primary_index != nullptr) {
-    return tombstone.primary_index->Purge(tombstone.key, tombstone.item,
-                                          retired_tid);
-  }
-  return tombstone.secondary_index->Purge(tombstone.key, tombstone.item,
-                                          retired_tid);
 }
 
 void Reaper::Reap(EpochNumber published_epoch) {
@@ -75,7 +55,7 @@ void Reaper::Reap(EpochNumber published_epoch) {
   requeue.reserve(ready.size());
 
   for (auto &tombstone : ready) {
-    DataItem *item = Get(tombstone);
+    DataItem *item = tombstone.index->Get(tombstone.key);
     // A different DataItem under the key means the tombstone was already
     // replaced.
     if (item != tombstone.item) continue;
@@ -101,13 +81,11 @@ void Reaper::Reap(EpochNumber published_epoch) {
 
     // A row, or a non-empty key list, means a later transaction reused this
     // slot in place.
-    const bool live =
-        tombstone.primary_index != nullptr ? item->HasRow() : item->IsLive();
-    if (live) {
+    if (item->IsLive()) {
       unlock();
       continue;
     }
-    if (Get(tombstone) != item) {
+    if (tombstone.index->Get(tombstone.key) != item) {
       unlock();
       continue;
     }
@@ -118,7 +96,8 @@ void Reaper::Reap(EpochNumber published_epoch) {
 
     TransactionId retired = tombstone.delete_commit_tid;
     retired.tid = (retired.tid + 2u) & ~silo::kLockBit;
-    if (!Purge(tombstone, retired)) unlock();
+    // Publish the next unlocked TID before the removed item is retired to RCU.
+    if (!tombstone.index->Purge(tombstone.key, *item, retired)) unlock();
   }
 
   {

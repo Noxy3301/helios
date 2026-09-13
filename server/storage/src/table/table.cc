@@ -15,7 +15,7 @@
 #include <string_view>
 #include <utility>
 
-#include "index/primary_index.h"
+#include "index/masstree_index.h"
 
 namespace helios::storage {
 Table::Table(std::string_view table_name) : table_name_(table_name) {}
@@ -57,7 +57,7 @@ index::SecondaryIndex *Table::GetOrCreateSecondaryIndex(
   std::unique_lock<std::shared_mutex> lk(table_lock_);
   auto it = secondary_indices_.find(name);
   if (it != secondary_indices_.end()) {
-    const bool same = it->second->GetIndexType() == index_type;
+    const bool same = it->second->constraint == index_type;
     return same ? it->second.get() : nullptr;
   }
   auto new_index = std::make_unique<index::SecondaryIndex>(index_type);
@@ -67,6 +67,6 @@ index::SecondaryIndex *Table::GetOrCreateSecondaryIndex(
 }
 
 const std::string &Table::Name() const { return table_name_; }
-index::PrimaryIndex &Table::GetPrimaryIndex() { return primary_index_; }
+index::MasstreeIndex &Table::GetPrimaryIndex() { return primary_index_; }
 
 }  // namespace helios::storage
