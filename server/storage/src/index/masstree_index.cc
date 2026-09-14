@@ -1,22 +1,18 @@
 /**
  * @file server/storage/src/index/masstree_index.cc
- * The masstree-beta instantiation: the only translation unit that includes
- * masstree headers, and the RCU handshake its readers require.
+ * Masstree operations and RCU lifetime management.
  */
 
 #include "index/masstree_index.h"
 
+#include <array>
 #include <atomic>
-#include <cstring>
 #include <mutex>
 #include <utility>
 
 #include "util/debug_sync.h"
 
-// Masstree headers. They come after the header guard so no other storage
-// source sees them; masstree's include path is PRIVATE to storage and is
-// unreachable from the public headers and the tests. config.h defines the
-// macros compiler.hh reads, so this block is not sortable.
+// Keep this order: compiler.hh needs the macros from config.h.
 // clang-format off
 #include "config.h"
 #include "compiler.hh"
@@ -29,12 +25,7 @@
 #include "string.hh"
 // clang-format on
 
-// Globals masstree-beta requires: kvthread.hh declares them extern, so
-// exactly one translation unit must define them, with the types declared
-// there. MasstreeAdvanceEpoch moves globalepoch and recomputes active_epoch,
-// once per storage epoch from the epoch hook; between those ticks nodeversion
-// bits alone serialize tree access. `recovering` stays false: this wrapper
-// has no masstree-level recovery.
+// Globals required by Masstree. Storage recovery does not use recovering.
 relaxed_atomic<mrcu_epoch_type> globalepoch{1};
 relaxed_atomic<mrcu_epoch_type> active_epoch{1};
 volatile bool recovering = false;
@@ -65,19 +56,12 @@ using unlocked_cursor_type = Masstree::unlocked_tcursor<table_params>;
 using cursor_type = Masstree::tcursor<table_params>;
 
 thread_local threadinfo *tls_ti = nullptr;
-// True while this thread has called rcu_start without a matching rcu_stop.
-// Re-stamping gc_epoch_ on every op would advance the thread past the epoch
-// that protects a raw DataItem * an earlier Get returned, so the thread stays
-// at the epoch of its first access until it releases at a safe boundary.
+// Keep the first access epoch pinned until the caller releases its pointers.
 thread_local bool tls_enrolled = false;
 std::atomic<int> next_thread_id{0};
 std::mutex thread_init_mutex;
 
-// threadinfo::make prepends to masstree's allthreads list without
-// synchronization, so the first use on each thread is serialized here.
-// Registration does not enrol the thread in the RCU epoch (that is
-// ensure_thread_active's job), which lets a thread between operations leave
-// gc_epoch_ at 0 and not pin min_active_epoch.
+// Serialize registration: Masstree's thread list has no internal lock.
 inline void ensure_thread_init() {
   if (__builtin_expect(tls_ti == nullptr, 0)) {
     std::lock_guard<std::mutex> lg(thread_init_mutex);
@@ -89,10 +73,7 @@ inline void ensure_thread_init() {
   }
 }
 
-// Registers the thread and enrols it at the current masstree epoch, unless
-// it is enrolled already: a caller may still hold a raw DataItem * an earlier
-// Get returned, and re-enrolling mid-transaction would let RCU reclaim it.
-// The enrolment ends at MasstreeReleaseThreadEpoch.
+// Keep the original epoch while the caller still uses its DataItems.
 inline void ensure_thread_active() {
   ensure_thread_init();
   if (!tls_enrolled) {
@@ -101,13 +82,7 @@ inline void ensure_thread_active() {
   }
 }
 
-/**
- * @brief Deletes one DataItem once RCU says no reader can reach it.
- *
- * @details Allocated through threadinfo::allocate so it lives in masstree's
- * accounting pool, and frees itself after deleting the item, the same shape
- * as masstree's own gc_layer_rcu_callback.
- */
+// Delete the item after the RCU grace period, then free this callback.
 struct RcuFreeCallback : public threadinfo::mrcu_callback {
   DataItem *item;
   explicit RcuFreeCallback(DataItem *it) : item(it) {}
@@ -124,63 +99,23 @@ inline void RcuFree(DataItem *item) {
   tls_ti->rcu_register(operation);
 }
 
-// Three-way comparison of a range bound with a scanned key, memcmp style.
-inline int KeyCmp(const char *bound, size_t bound_len, Masstree::Str key) {
-  const size_t key_len = static_cast<size_t>(key.len);
-  const int cmp = std::memcmp(bound, key.s, std::min(bound_len, key_len));
-  if (cmp != 0) return cmp;
-  if (bound_len == key_len) return 0;
-  return bound_len > key_len ? 1 : -1;
-}
-
-/**
- * @brief Drives masstree's forward and reverse scan into the callback shape
- *        used here, where returning `true` cancels the scan.
- */
-struct ScanAdapter {
-  const char *begin_ptr;
-  size_t begin_len;
-  bool has_begin;
-  const char *end_ptr;
-  size_t end_len;
-  bool has_end;
-  std::function<bool(std::string_view)> operation;
-  size_t count = 0;
-
-  template <typename SS, typename K>
-  void visit_leaf(const SS &, const K &, threadinfo &) {}
-
-  // Returns true to keep scanning, false to stop (masstree convention).
-  bool visit_value(Masstree::Str key, DataItem * /*val*/, threadinfo &) {
-    if (has_end && KeyCmp(end_ptr, end_len, key) <= 0) return false;
-    if (has_begin && KeyCmp(begin_ptr, begin_len, key) > 0) return false;
-    ++count;
-    if (operation(std::string_view(key.s, key.len)))
-      return false;  // caller cancel
-    return true;
-  }
-};
-
-// Same walk as ScanAdapter, with the DataItem handed to the callback.
-struct ScanValueAdapter {
-  const char *begin_ptr;
-  size_t begin_len;
-  bool has_begin;
-  const char *end_ptr;
-  size_t end_len;
-  bool has_end;
+// Pass matching entries to the callback and count visits.
+struct Scanner {
+  std::optional<std::string_view> begin;
+  std::optional<std::string_view> end;
   std::function<bool(std::string_view, DataItem &)> operation;
   size_t count = 0;
 
   template <typename SS, typename K>
   void visit_leaf(const SS &, const K &, threadinfo &) {}
 
-  bool visit_value(Masstree::Str key, DataItem *val, threadinfo &) {
-    if (has_end && KeyCmp(end_ptr, end_len, key) <= 0) return false;
-    if (has_begin && KeyCmp(begin_ptr, begin_len, key) > 0) return false;
+  // Masstree returns true to continue; our callback returns true to stop.
+  bool visit_value(Masstree::Str key, DataItem *item, threadinfo &) {
+    const std::string_view scanned_key(key.s, key.len);
+    if (end && scanned_key >= *end) return false;
+    if (begin && scanned_key < *begin) return false;
     ++count;
-    if (operation(std::string_view(key.s, key.len), *val)) return false;
-    return true;
+    return !operation(scanned_key, *item);
   }
 };
 
@@ -190,16 +125,7 @@ struct MasstreeIndex::Impl {
   table_type table_;
 
   Impl() {
-    // Enrol briefly so table_.initialize can allocate the root node through
-    // the threadinfo's RCU-aware allocator, then leave the epoch so the
-    // construction thread does not pin min_active_epoch at the initial
-    // value forever. If the same thread later does masstree ops, each op
-    // path goes through ensure_thread_active and re-enrols.
-    //
-    // A caller already inside an RCU critical section keeps its enrolment:
-    // rcu_stop() would clear gc_epoch_ while raw DataItem* pointers it still
-    // holds could be scheduled for RCU free by another thread's physical
-    // delete. The existing rcu_start covers the initialize.
+    // Initialize inside an RCU epoch; preserve any epoch the caller already holds.
     ensure_thread_init();
     const bool was_enrolled = tls_enrolled;
     if (!was_enrolled) {
@@ -212,9 +138,8 @@ struct MasstreeIndex::Impl {
   }
 
   ~Impl() {
-    // table_.destroy() is not called: it only registers an RCU callback, and
-    // nothing drains this thread's limbo afterwards. The live tree and the
-    // DataItem pointers it holds are left to the process exit.
+    // Tree and live items remain until process exit.
+    // destroy() only queues cleanup; this destructor does not run it.
   }
 
   DataItem *Get(std::string_view key) {
@@ -224,30 +149,23 @@ struct MasstreeIndex::Impl {
     return nullptr;
   }
 
-  // The primary index binds its table here; secondary indexes hold only key
-  // lists.
+  // Primary rows use PAX; secondary entries hold primary-key lists.
   pax::PaxTable *pax_table_ = nullptr;
 
-  // Upsert with a freshly-allocated DataItem.
+  // Insert or replace the entry with an owned DataItem.
   void Put(std::string_view key, DataItem &&value) {
     ensure_thread_active();
     auto *item = new DataItem(std::move(value));
     cursor_type lp(table_, key.data(), key.size());
     bool found = lp.find_insert(*tls_ti);
-    // On an overwrite the previous DataItem is leaked: a concurrent reader
-    // may still hold the raw pointer Get() returned.
+    // Keep the old item alive for readers that still hold its pointer.
     lp.value() = item;  // FIXME: retire the old item through RCU
     fence();
-    // 1 means structural insert (bumps the leaf's vinsert counter), 0 means in-place
-    // overwrite. Claiming an insert on overwrite would falsely trigger phantom
-    // retries on concurrent scanners watching this leaf.
+    // Report 1 for a new key, 0 for replacement, to keep leaf versions correct.
     lp.finish(found ? 0 : 1, *tls_ti);
   }
 
-  // Structural removal of a committed delete. Invoked by the deferred reaper
-  // after it has CAS-locked the DataItem and verified the tombstone TID.
-  // Returns true if the key was physically removed; false if the slot is
-  // already gone or a racing replacement won the position.
+  // The reaper has locked the item and checked its delete TID.
   bool Purge(std::string_view key, DataItem &expected,
              TransactionId retired_tid) {
     ensure_thread_active();
@@ -259,17 +177,13 @@ struct MasstreeIndex::Impl {
     }
     DataItem *current = lp.value();
     if (current != &expected) {
-      // Another writer replaced the slot between the commit-time decision
-      // and this erase. Leave the new occupant alone.
+      // Do not remove a replacement stored under the same key.
       lp.finish(0, *tls_ti);
       return false;
     }
-    // A reader that resolved this entry parks on its lock bit until the
-    // retired TID is published below.
+    // Readers wait on the lock bit until we publish retired_tid below.
     HELIOS_DEBUG_SYNC("reaper.purge_locked_window");
-    // finish(-1) calls finish_remove which removes the permutation slot and
-    // RCU-frees the leaf if it becomes empty. The DataItem* itself rides on
-    // a separate RCU callback below.
+    // Remove the tree entry, publish its TID, then queue the item for RCU deletion.
     lp.finish(-1, *tls_ti);
     current->transaction_id.store(retired_tid);
     RcuFree(current);
@@ -297,65 +211,32 @@ struct MasstreeIndex::Impl {
   }
 
   size_t Scan(std::string_view begin, std::optional<std::string_view> end,
-              std::function<bool(std::string_view)> op) {
-    ensure_thread_active();
-    ScanAdapter adapter{nullptr,
-                        0,
-                        false,
-                        end.has_value() ? end->data() : nullptr,
-                        end.has_value() ? end->size() : 0,
-                        end.has_value(),
-                        std::move(op),
-                        0};
-    Masstree::Str firstkey(begin.data(), begin.size());
-    table_.scan(firstkey, /*emit_firstkey=*/true, adapter, *tls_ti);
-    return adapter.count;
-  }
-
-  size_t Scan(std::string_view begin, std::string_view end,
               std::function<bool(std::string_view, DataItem &)> op) {
     ensure_thread_active();
-    ScanValueAdapter adapter{nullptr,    0,    false,        end.data(),
-                             end.size(), true, std::move(op)};
+    // Start at begin; the scanner stops before end.
+    Scanner scanner{std::nullopt, end, std::move(op)};
     Masstree::Str firstkey(begin.data(), begin.size());
-    table_.scan(firstkey, /*emit_firstkey=*/true, adapter, *tls_ti);
-    return adapter.count;
+    table_.scan(firstkey, /*emit_firstkey=*/true, scanner, *tls_ti);
+    return scanner.count;
   }
 
   size_t ScanReverse(std::string_view begin,
                      std::optional<std::string_view> end,
-                     std::function<bool(std::string_view)> op) {
-    ensure_thread_active();
-    // Reverse scan walks downward from `end - 1`, stopping once `key < begin`.
-    // Range is `[begin, end)` just like forward Scan.
-    ScanAdapter adapter{begin.data(), begin.size(), true, nullptr, 0,
-                        false,        std::move(op)};
-    if (end.has_value()) {
-      Masstree::Str firstkey(end->data(), end->size());
-      table_.rscan(firstkey, /*emit_firstkey=*/false, adapter, *tls_ti);
-    } else {
-      // rscan from infinity: use an empty firstkey with emit=true to
-      // walk the tail backwards.
-      table_.rscan(Masstree::Str(), /*emit_firstkey=*/true, adapter, *tls_ti);
-    }
-    return adapter.count;
-  }
-
-  size_t ScanReverse(std::string_view begin, std::string_view end,
                      std::function<bool(std::string_view, DataItem &)> op) {
     ensure_thread_active();
-    ScanValueAdapter adapter{begin.data(), begin.size(), true, nullptr, 0,
-                             false,        std::move(op)};
-    Masstree::Str firstkey(end.data(), end.size());
-    table_.rscan(firstkey, /*emit_firstkey=*/false, adapter, *tls_ti);
-    return adapter.count;
-  }
-
-  void ForEach(std::function<bool(std::string_view, DataItem &)> op) {
-    ensure_thread_active();
-    ScanValueAdapter adapter{nullptr, 0,     false,        nullptr,
-                             0,       false, std::move(op)};
-    table_.scan(Masstree::Str(), /*emit_firstkey=*/true, adapter, *tls_ti);
+    // Start below end and stop when a key is smaller than begin.
+    Scanner scanner{begin, std::nullopt, std::move(op)};
+    if (end) {
+      Masstree::Str firstkey(end->data(), end->size());
+      table_.rscan(firstkey, /*emit_firstkey=*/false, scanner, *tls_ti);
+    } else {
+      // Start at the largest supported key, including that key itself.
+      std::array<char, MASSTREE_MAXKEYLEN> last_key;
+      last_key.fill(static_cast<char>(0xff));
+      table_.rscan(Masstree::Str(last_key.data(), last_key.size()),
+                   /*emit_firstkey=*/true, scanner, *tls_ti);
+    }
+    return scanner.count;
   }
 };
 
@@ -377,33 +258,21 @@ DataItem *MasstreeIndex::GetOrInsert(std::string_view key) {
   return impl_->GetOrInsert(key);
 }
 
-size_t MasstreeIndex::Scan(std::string_view begin,
-                           std::optional<std::string_view> end,
-                           std::function<bool(std::string_view)> operation) {
-  return impl_->Scan(begin, end, std::move(operation));
-}
-
 size_t MasstreeIndex::Scan(
-    std::string_view begin, std::string_view end,
+    std::string_view begin, std::optional<std::string_view> end,
     std::function<bool(std::string_view, DataItem &)> operation) {
   return impl_->Scan(begin, end, std::move(operation));
 }
 
 size_t MasstreeIndex::ScanReverse(
     std::string_view begin, std::optional<std::string_view> end,
-    std::function<bool(std::string_view)> operation) {
-  return impl_->ScanReverse(begin, end, std::move(operation));
-}
-
-size_t MasstreeIndex::ScanReverse(
-    std::string_view begin, std::string_view end,
     std::function<bool(std::string_view, DataItem &)> operation) {
   return impl_->ScanReverse(begin, end, std::move(operation));
 }
 
 void MasstreeIndex::ForEach(
     std::function<bool(std::string_view, DataItem &)> operation) {
-  impl_->ForEach(std::move(operation));
+  impl_->Scan(std::string_view(), std::nullopt, std::move(operation));
 }
 
 bool MasstreeIndex::Purge(std::string_view key, DataItem &expected,
@@ -412,17 +281,14 @@ bool MasstreeIndex::Purge(std::string_view key, DataItem &expected,
 }
 
 void MasstreeAdvanceEpoch() {
-  // Bump masstree's global epoch and recompute active_epoch. The mutex
-  // serialises with ensure_thread_init's threadinfo::make, which prepends to
-  // the unsynchronised allthreads list that min_active_epoch walks.
+  // Hold the thread-list lock while reading active epochs.
   std::lock_guard<std::mutex> lg(thread_init_mutex);
   globalepoch.store(globalepoch.load() + 1);
   active_epoch.store(threadinfo::min_active_epoch());
 }
 
 void MasstreeReleaseThreadEpoch() {
-  // One rcu_stop pass: it frees what active_epoch already covers and leaves
-  // the rest of this thread's limbo for its next release.
+  // Release the epoch and reclaim items whose RCU grace period has passed.
   if (tls_ti == nullptr) return;
   tls_ti->rcu_stop();
   tls_enrolled = false;

@@ -1,7 +1,6 @@
 /**
  * @file server/storage/src/index/stats.cc
- * Index statistics a query layer turns into optimizer estimates: exact NDV
- * per key-part prefix and an equi-height histogram of the leading key part.
+ * Distinct-key counts and histograms for the query optimizer.
  */
 
 #include <xmmintrin.h>
@@ -22,9 +21,7 @@ namespace helios::storage {
 
 namespace {
 
-// Exclusive end of a whole-index scan: a stored key opens with the null
-// marker of its first part, never with 0xFF. Longer than any key prefix a
-// caller can pack into one part.
+// Encoded SQL keys start with a null marker below 0xff, so this bounds them.
 constexpr size_t kSupremumSize = 16;
 const std::string kSupremum(kSupremumSize, '\xff');
 
@@ -49,8 +46,7 @@ bool Database::IndexNdv(const std::string_view table_name,
   std::string prev_key;
   std::vector<size_t> prev_part_ends(num_parts, 0);
 
-  // A key parts refuses fails the whole NDV: the scan stops and the caller
-  // keeps its previous estimate.
+  // Stop if the key parser cannot locate every requested part.
   auto count_key = [&](std::string_view key) -> bool {
     std::vector<size_t> part_ends(num_parts, 0);
     if (!parts(key, num_parts, part_ends.data())) {
@@ -59,12 +55,11 @@ bool Database::IndexNdv(const std::string_view table_name,
     }
 
     if (first) {
-      // The first live key starts one distinct prefix at every depth.
+      // The first key contributes one distinct value for each prefix length.
       for (uint32_t part = 0; part < num_parts; ++part) out_ndv[part] = 1;
       first = false;
     } else {
-      // Count a new prefix whenever bytes up to that key-part boundary
-      // differ.
+      // Count each prefix that differs from the previous key.
       const std::string_view prev(prev_key);
       for (uint32_t part = 0; part < num_parts; ++part) {
         if (part_ends[part] != prev_part_ends[part] ||
@@ -104,19 +99,17 @@ bool Database::IndexNdv(const std::string_view table_name,
       return false;
     };
 
-    index->tree.Scan(
-        std::string_view(), std::string_view(kSupremum),
-        [&](std::string_view key) -> bool {
-          DataItem *item = index->tree.Get(key);
-          if (item == nullptr || !stable_live_secondary(*item)) {
-            return false;
-          }
-          return count_key(key);
-        });
+    index->tree.Scan(std::string_view(), std::string_view(kSupremum),
+                     [&](std::string_view key, DataItem &item) -> bool {
+                       if (!stable_live_secondary(item)) {
+                         return false;
+                       }
+                       return count_key(key);
+                     });
   }
 
   if (failed) {
-    // The caller keeps the old optimizer estimate.
+    // Discard partial counts after a key-parsing failure.
     out_ndv.assign(num_parts, 0);
     return false;
   }
@@ -135,23 +128,19 @@ bool Database::IndexHistogram(const std::string_view table_name,
   auto table = GetTable(table_name);
   if (table == nullptr) return false;
 
-  // Histogram bounds are compared as bytes, so a key the caller refuses ends
-  // the pass.
+  // Find the end of the first key part; zero means parsing failed.
   auto leading_end = [&parts](std::string_view key) -> size_t {
     size_t end = 0;
     return parts(key, 1, &end) ? end : 0;
   };
 
-  // Secondary scans visit one entry per key, but the histogram is over rows.
-  // Use the PK-list length as that key's row weight.
+  // Weight each secondary key by the number of primary keys it references.
   const auto stable_pk_count = [](const DataItem &item) -> uint64_t {
     const auto keys = silo::StableReadKeys(item);
     return keys.found ? keys.primary_keys->count : 0;
   };
-  // Walks one index in key order and hands fn each counted key with its row
-  // weight: 1 for a live primary row, or the primary-key list length for a
-  // secondary entry, whose base rows are not re-checked here.
-  // A key the caller refuses ends the pass, so `fn` never sees one.
+  // Visit keys with weight 1 for primary rows, or the list size for secondary keys.
+  // Secondary weights do not recheck whether the referenced rows are live.
   bool failed = false;
   auto walk = [&](auto &&fn) {
     if (index_name.empty()) {
@@ -172,21 +161,19 @@ bool Database::IndexHistogram(const std::string_view table_name,
         return;
       }
       index->tree.Scan(std::string_view(), std::string_view(kSupremum),
-                          [&](std::string_view key) -> bool {
-                            DataItem *item = index->tree.Get(key);
-                            if (item == nullptr) return false;
-                            const uint64_t w = stable_pk_count(*item);
-                            if (w == 0) return false;  // dead/empty secondary entry
-                            if (leading_end(key) == 0) {
-                              failed = true;
-                              return true;
-                            }
-                            return fn(key, w);
-                          });
+                       [&](std::string_view key, DataItem &item) -> bool {
+                         const uint64_t w = stable_pk_count(item);
+                         if (w == 0) return false;  // dead/empty secondary entry
+                         if (leading_end(key) == 0) {
+                           failed = true;
+                           return true;
+                         }
+                         return fn(key, w);
+                       });
     }
   };
 
-  // Pass 1 sums the row weight the index represents.
+  // First pass: sum the row weights.
   uint64_t total = 0;
   walk([&](std::string_view, uint64_t w) -> bool {
     total += w;
@@ -194,11 +181,11 @@ bool Database::IndexHistogram(const std::string_view table_name,
   });
   if (failed || total == 0) return false;
 
-  // Pass 2 records a bound every stride rows.
+  // Second pass: add a boundary when the row count reaches the next stride.
   const uint64_t stride = std::max<uint64_t>(1, total / buckets);
   uint64_t seen = 0;
   uint64_t next = stride;
-  // Only the leading part of the last key walked, which is what a bound is.
+  // Keep the last key's first part for the final boundary.
   std::string last_bound;
   walk([&](std::string_view key, uint64_t w) -> bool {
     const size_t end = leading_end(key);
@@ -217,8 +204,7 @@ bool Database::IndexHistogram(const std::string_view table_name,
     return false;
   }
   if (out_bounds.empty() || out_cum.back() != total) {
-    // The last bound closes the histogram at the maximum key so the high end
-    // is exact.
+    // Include the last visited key as the final histogram boundary.
     out_bounds.push_back(last_bound);
     out_cum.push_back(total);
   }

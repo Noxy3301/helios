@@ -1,7 +1,6 @@
 /**
  * @file server/storage/src/silo/read.cc
- * Index slot resolution and the row copies behind the point read and the
- * three scans.
+ * Point and range reads from primary and secondary indexes.
  */
 
 #include "silo/read.h"
@@ -62,8 +61,7 @@ ScanResult Scan(TableDictionary &tables, std::shared_mutex &schema_mutex,
 
   uint64_t returned_rows = 0;
 
-  // The value-yielding Scan/ScanReverse overloads pass the DataItem the leaf
-  // walk already resolved, so read it directly instead of re-fetching by key.
+  // Copy each live row from the DataItem found by the scan.
   auto append_scan_entry = [&](std::string_view key, DataItem &item) {
     auto row = StableRead(item, selected_columns);
     if (row.found) {
@@ -71,8 +69,7 @@ ScanResult Scan(TableDictionary &tables, std::shared_mutex &schema_mutex,
           {std::string(key), std::move(row.value), PackTransactionId(row.tid)});
       ++returned_rows;
     }
-    // Tombstones are skipped here: a commit leaves them in place, and the
-    // reaper removes them an epoch later.
+    // Count only live rows toward the limit; tombstones stay for later cleanup.
     return row_limit > 0 && returned_rows >= row_limit;
   };
 
@@ -133,15 +130,10 @@ ScanIndexResult ScanIndex(TableDictionary &tables,
     return row_limit > 0 && returned_rows >= row_limit;
   };
 
-  // Pin the immutable key list until all its primary keys have been read.
-  auto append_secondary_entry = [&](std::string_view key) {
+  // Keep the key list alive while reading the referenced rows.
+  auto append_secondary_entry = [&](std::string_view key, DataItem &item) {
     const std::string secondary_key(key);
-    DataItem *item = index->tree.Get(key);
-    if (item == nullptr) {
-      return false;
-    }
-
-    const auto keys = StableReadKeys(*item);
+    const auto keys = StableReadKeys(item);
     for (std::string_view primary_key : keys.primary_keys_view()) {
       if (append_base_row(secondary_key, primary_key)) return true;
     }
@@ -176,13 +168,12 @@ ScanPaxResult ScanPax(TableDictionary &tables, std::shared_mutex &schema_mutex,
   uint64_t returned_rows = 0;
 
   auto append_pax_row = [&](std::string_view key, DataItem &item) {
-    // Observe the same stable unlocked TID that a materialized read would use.
-    // The caller re-checks this TID after reading cells from the strip.
+    // Read an unlocked TID; the caller must recheck it after reading the cells.
     const TransactionId tid = StableTid(item);
 
     const size_t size = item.size();
     if (size == 0) return false;
-    // Return a reference to the PAX location instead of gathering row bytes.
+    // Return the PAX location for the caller to read directly.
     result.rows.push_back({std::string(key), item.pax_group(),
                            item.pax_slot(), static_cast<uint32_t>(size),
                            PackTransactionId(tid), &item});

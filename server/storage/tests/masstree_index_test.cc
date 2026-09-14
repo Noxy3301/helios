@@ -18,8 +18,7 @@
 
 /**
  * @file server/storage/tests/masstree_index_test.cc
- * The shared index tree on its own: put, get, insert-if-absent, and
- * concurrent inserters of the same key.
+ * Masstree insertion, scans, PAX slots, and deferred deletion.
  */
 
 #include "index/masstree_index.h"
@@ -101,9 +100,10 @@ TEST(MasstreeIndexTest, Scan) {
 
   // Scan is half-open: carol is the exclusive upper bound.
   ASSERT_EQ(size_t(2),
-            table.Scan("alice", "carol", [](auto) { return false; }));
+            table.Scan("alice", "carol", [](auto, auto &) { return false; }));
   // A callback that cancels stops the walk at the first key.
-  ASSERT_EQ(size_t(1), table.Scan("alice", "carol", [](auto) { return true; }));
+  ASSERT_EQ(size_t(1),
+            table.Scan("alice", "carol", [](auto, auto &) { return true; }));
 }
 
 TEST(MasstreeIndexTest, TremendousPut) {
@@ -148,11 +148,12 @@ TEST(MasstreeIndexTest, ReverseScanCountsOnlyTheKeysItEmits) {
   for (const char *key : {"a", "b", "c", "d"}) table.Put(key, {});
 
   std::vector<std::string> seen;
-  const size_t count = table.ScanReverse(
-      "b", std::optional<std::string_view>("d"), [&](std::string_view key) {
-        seen.emplace_back(key);
-        return false;
-      });
+  const size_t count =
+      table.ScanReverse("b", std::optional<std::string_view>("d"),
+                        [&](std::string_view key, helios::storage::DataItem &) {
+                          seen.emplace_back(key);
+                          return false;
+                        });
   EXPECT_EQ(std::vector<std::string>({"c", "b"}), seen);
   EXPECT_EQ(seen.size(), count);
 }
@@ -243,5 +244,91 @@ TEST(MasstreeIndexTest, PurgeRejectsAReplacementEntry) {
 
   EXPECT_FALSE(tree.Purge("key", *old_item, TransactionId{10, 4}));
   EXPECT_EQ(replacement, tree.Get("key"));
+  index::MasstreeReleaseThreadEpoch();
+}
+
+TEST(MasstreeIndexTest, UnboundedReverseScanIncludesEveryKey) {
+  using namespace helios::storage;
+  index::MasstreeIndex tree;
+  for (const char *key : {"", "a", "b"}) tree.GetOrInsert(key);
+  std::vector<std::string> keys;
+  const size_t count = tree.ScanReverse(
+      "", std::nullopt, [&](std::string_view key, helios::storage::DataItem &) {
+        keys.emplace_back(key);
+        return false;
+      });
+  EXPECT_EQ(std::vector<std::string>({"b", "a", ""}), keys);
+  EXPECT_EQ(3u, count);
+  index::MasstreeReleaseThreadEpoch();
+}
+
+TEST(MasstreeIndexTest, ScanReturnsMatchingItemsInByteOrder) {
+  using namespace helios::storage;
+  index::MasstreeIndex tree;
+  // Include empty, binary, prefix-related and maximum-length Masstree keys.
+  const std::vector<std::string> keys = {"",
+                                         std::string("\0", 1),
+                                         "a",
+                                         std::string("a\0", 2),
+                                         std::string("a\xff", 2),
+                                         "long-prefix-shared-a",
+                                         "long-prefix-shared-b",
+                                         std::string(1, '\xff'),
+                                         std::string(255, '\xff')};
+  for (const auto &key : keys) tree.GetOrInsert(key);
+
+  std::vector<std::string> seen;
+  auto collect = [&](std::string_view key, DataItem &item) {
+    EXPECT_EQ(tree.Get(key), &item);
+    seen.emplace_back(key);
+    return false;
+  };
+  EXPECT_EQ(keys.size(), tree.Scan("", std::nullopt, collect));
+  EXPECT_EQ(keys, seen);
+
+  seen.clear();
+  EXPECT_EQ(keys.size(), tree.ScanReverse("", std::nullopt, collect));
+  EXPECT_EQ(std::vector<std::string>(keys.rbegin(), keys.rend()), seen);
+
+  seen.clear();
+  tree.ForEach(collect);
+  EXPECT_EQ(keys, seen);
+  index::MasstreeReleaseThreadEpoch();
+}
+
+TEST(MasstreeIndexTest, EmptyUpperBoundIsNotAnUnboundedScan) {
+  using namespace helios::storage;
+  index::MasstreeIndex tree;
+  for (const char *key : {"", "a", "b"}) tree.GetOrInsert(key);
+  auto unexpected = [](std::string_view, DataItem &) {
+    ADD_FAILURE() << "An empty range must not invoke the callback";
+    return true;
+  };
+
+  EXPECT_EQ(0u, tree.Scan("", std::string_view(), unexpected));
+  EXPECT_EQ(0u, tree.ScanReverse("", std::string_view(), unexpected));
+  EXPECT_EQ(0u, tree.Scan("a", "a", unexpected));
+  EXPECT_EQ(0u, tree.ScanReverse("a", "a", unexpected));
+  EXPECT_EQ(0u, tree.Scan("b", "a", unexpected));
+  EXPECT_EQ(0u, tree.ScanReverse("b", "a", unexpected));
+  index::MasstreeReleaseThreadEpoch();
+}
+
+TEST(MasstreeIndexTest, BoundedValueScanCountsTheCallbackThatStopsIt) {
+  using namespace helios::storage;
+  index::MasstreeIndex tree;
+  for (const char *key : {"a", "b", "c", "d"}) tree.GetOrInsert(key);
+  std::vector<std::string> seen;
+  auto stop_after_two = [&](std::string_view key, DataItem &item) {
+    EXPECT_EQ(tree.Get(key), &item);
+    seen.emplace_back(key);
+    return seen.size() == 2;
+  };
+
+  EXPECT_EQ(2u, tree.Scan("a", "d", stop_after_two));
+  EXPECT_EQ(std::vector<std::string>({"a", "b"}), seen);
+  seen.clear();
+  EXPECT_EQ(2u, tree.ScanReverse("a", "d", stop_after_two));
+  EXPECT_EQ(std::vector<std::string>({"c", "b"}), seen);
   index::MasstreeReleaseThreadEpoch();
 }
