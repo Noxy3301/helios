@@ -40,6 +40,8 @@ class MasstreeIndex final {
   /**
    * @brief Gets the entry for key, creating an absent DataItem if needed.
    * @details Commit must recheck the key after locking the item.
+   * @pre On a primary index the caller has observed the table's PAX store
+   * through Table::GetPaxTable, which orders it before the store read here.
    * @return Non-null; allocation failure throws.
    */
   DataItem *GetOrInsert(std::string_view key);

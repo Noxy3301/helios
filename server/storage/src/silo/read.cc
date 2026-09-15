@@ -5,8 +5,6 @@
 
 #include "silo/read.h"
 
-#include <mutex>
-
 #include "index/data_item.h"
 #include "index/secondary_index.h"
 #include "pax/table.h"
@@ -17,11 +15,9 @@
 namespace helios::storage {
 namespace silo {
 
-ReadResult Read(TableDictionary &tables, std::shared_mutex &schema_mutex,
-                const std::string_view table_name, const std::string_view key,
+ReadResult Read(TableDictionary &tables, const std::string_view table_name,
+                const std::string_view key,
                 const std::vector<uint32_t> *selected_columns) {
-  // Keep the schema fixed while resolving slots and reading their values.
-  std::shared_lock<std::shared_mutex> lk(schema_mutex);
   auto table = tables.GetTable(table_name);
   if (table == nullptr) return {};
 
@@ -33,18 +29,17 @@ ReadResult Read(TableDictionary &tables, std::shared_mutex &schema_mutex,
 }
 
 std::vector<ReadResult> BatchRead(
-    TableDictionary &tables, std::shared_mutex &schema_mutex,
+    TableDictionary &tables,
     const std::vector<std::pair<std::string, std::string>> &keys) {
   std::vector<ReadResult> results;
   results.reserve(keys.size());
   for (const auto &[table_name, key] : keys) {
-    results.emplace_back(Read(tables, schema_mutex, table_name, key));
+    results.emplace_back(Read(tables, table_name, key));
   }
   return results;
 }
 
-ScanResult Scan(TableDictionary &tables, std::shared_mutex &schema_mutex,
-                const std::string_view table_name,
+ScanResult Scan(TableDictionary &tables, const std::string_view table_name,
                 const std::string_view start_key,
                 const std::string_view end_key, uint64_t row_limit,
                 bool reverse_scan,
@@ -52,8 +47,6 @@ ScanResult Scan(TableDictionary &tables, std::shared_mutex &schema_mutex,
   ScanResult result;
   if (end_key.empty()) return result;
 
-  // Keep the schema fixed while resolving slots and reading their values.
-  std::shared_lock<std::shared_mutex> lk(schema_mutex);
   auto table = tables.GetTable(table_name);
   if (table == nullptr) return result;
   result.ok = true;
@@ -90,7 +83,6 @@ uint64_t CurrentTid(const ScanPaxRow &row) {
 namespace silo {
 
 ScanIndexResult ScanIndex(TableDictionary &tables,
-                          std::shared_mutex &schema_mutex,
                           const std::string_view table_name,
                           const std::string_view index_name,
                           const std::string_view start_key,
@@ -100,8 +92,6 @@ ScanIndexResult ScanIndex(TableDictionary &tables,
   ScanIndexResult result;
   if (end_key.empty()) return result;
 
-  // Keep the schema fixed while resolving slots and reading their values.
-  std::shared_lock<std::shared_mutex> lk(schema_mutex);
   auto table = tables.GetTable(table_name);
   if (table == nullptr) return result;
 
@@ -147,7 +137,7 @@ ScanIndexResult ScanIndex(TableDictionary &tables,
   return result;
 }
 
-ScanPaxResult ScanPax(TableDictionary &tables, std::shared_mutex &schema_mutex,
+ScanPaxResult ScanPax(TableDictionary &tables,
                       const std::string_view table_name,
                       const std::string_view start_key,
                       const std::string_view end_key, uint64_t row_limit,
@@ -155,8 +145,6 @@ ScanPaxResult ScanPax(TableDictionary &tables, std::shared_mutex &schema_mutex,
   ScanPaxResult result;
   if (end_key.empty()) return result;
 
-  // Keep the schema fixed while resolving slots and reading their values.
-  std::shared_lock<std::shared_mutex> lk(schema_mutex);
   Table *table = tables.GetTable(table_name);
   if (table == nullptr) return result;
 

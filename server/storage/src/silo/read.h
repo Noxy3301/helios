@@ -1,15 +1,15 @@
 /**
  * @file server/storage/src/silo/read.h
- * The read side of the store: point reads and range scans. Each call takes a
- * shared lock on the schema, reads rows with the stable read, and returns the
- * TID words a later commit validates as read-set evidence.
+ * The read side of the store: point reads and range scans. Each call returns
+ * the TID words a later commit validates as read-set evidence. Row reads copy
+ * rows with the stable read; ScanPax returns cell references and leaves the
+ * TID recheck to the caller.
  */
 
 #ifndef HELIOS_STORAGE_SRC_SILO_READ_H
 #define HELIOS_STORAGE_SRC_SILO_READ_H
 
 #include <cstdint>
-#include <shared_mutex>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -26,11 +26,10 @@ namespace silo {
 /**
  * @brief Reads one row.
  *
- * Takes a shared lock on the schema, resolves the primary-index slot, and
- * performs a stable read on the DataItem: load the TID, yield while the lock
- * bit (LSB) is set, copy the value, then re-load the TID and retry until it
- * has not moved. The caller keeps the returned `tid` and submits it through
- * Commit later.
+ * Resolves the primary-index slot and performs a stable read on the DataItem:
+ * load the TID, yield while the lock bit is set, copy the value, then
+ * re-load the TID and retry until it has not moved. The caller keeps the
+ * returned `tid` and submits it through Commit later.
  *
  * A miss, a tombstone and a table that does not exist all return
  * `found == false`, with the absent word, the delete's word and zero
@@ -39,8 +38,8 @@ namespace silo {
  * @param selected_columns Null for the whole row; non-null, even when empty,
  * blanks every PAX field it does not name.
  */
-ReadResult Read(TableDictionary &tables, std::shared_mutex &schema_mutex,
-                std::string_view table_name, std::string_view key,
+ReadResult Read(TableDictionary &tables, std::string_view table_name,
+                std::string_view key,
                 const std::vector<uint32_t> *selected_columns = nullptr);
 
 /**
@@ -53,7 +52,7 @@ ReadResult Read(TableDictionary &tables, std::shared_mutex &schema_mutex,
  * @param keys One (table name, primary key) pair per read, answered in order.
  */
 std::vector<ReadResult> BatchRead(
-    TableDictionary &tables, std::shared_mutex &schema_mutex,
+    TableDictionary &tables,
     const std::vector<std::pair<std::string, std::string>> &keys);
 
 /**
@@ -74,9 +73,9 @@ std::vector<ReadResult> BatchRead(
  * @param selected_columns Null for whole rows; non-null, even when empty,
  * blanks every PAX field it does not name.
  */
-ScanResult Scan(TableDictionary &tables, std::shared_mutex &schema_mutex,
-                std::string_view table_name, std::string_view start_key,
-                std::string_view end_key, uint64_t row_limit, bool reverse_scan,
+ScanResult Scan(TableDictionary &tables, std::string_view table_name,
+                std::string_view start_key, std::string_view end_key,
+                uint64_t row_limit, bool reverse_scan,
                 const std::vector<uint32_t> *selected_columns = nullptr);
 
 /**
@@ -95,10 +94,10 @@ ScanResult Scan(TableDictionary &tables, std::shared_mutex &schema_mutex,
  * blanks every PAX field it does not name.
  */
 ScanIndexResult ScanIndex(
-    TableDictionary &tables, std::shared_mutex &schema_mutex,
-    std::string_view table_name, std::string_view index_name,
-    std::string_view start_key, std::string_view end_key, uint64_t row_limit,
-    bool reverse_scan, const std::vector<uint32_t> *selected_columns = nullptr);
+    TableDictionary &tables, std::string_view table_name,
+    std::string_view index_name, std::string_view start_key,
+    std::string_view end_key, uint64_t row_limit, bool reverse_scan,
+    const std::vector<uint32_t> *selected_columns = nullptr);
 
 /**
  * @brief Range-scans the primary index and returns PAX cell references.
@@ -111,10 +110,9 @@ ScanIndexResult ScanIndex(
  * `ok == false` refuses the scan when the table or its PAX schema is missing,
  * or when `end_key` is empty.
  */
-ScanPaxResult ScanPax(TableDictionary &tables, std::shared_mutex &schema_mutex,
-                      std::string_view table_name, std::string_view start_key,
-                      std::string_view end_key, uint64_t row_limit,
-                      bool reverse_scan);
+ScanPaxResult ScanPax(TableDictionary &tables, std::string_view table_name,
+                      std::string_view start_key, std::string_view end_key,
+                      uint64_t row_limit, bool reverse_scan);
 
 }  // namespace silo
 }  // namespace helios::storage

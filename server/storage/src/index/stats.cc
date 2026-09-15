@@ -6,7 +6,6 @@
 #include <xmmintrin.h>
 
 #include <algorithm>
-#include <mutex>
 #include <string>
 #include <utility>
 #include <vector>
@@ -34,7 +33,6 @@ bool Database::IndexNdv(const std::string_view table_name,
   out_ndv.assign(num_parts, 0);
   if (num_parts == 0) return false;
 
-  std::shared_lock<std::shared_mutex> lk(schema_mutex_);
   auto table = GetTable(table_name);
   if (table == nullptr) return false;
 
@@ -126,7 +124,6 @@ bool Database::IndexHistogram(const std::string_view table_name,
   out_bounds.clear();
   out_cum.clear();
   if (buckets == 0) return false;
-  std::shared_lock<std::shared_mutex> lk(schema_mutex_);
   auto table = GetTable(table_name);
   if (table == nullptr) return false;
 

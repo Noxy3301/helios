@@ -3,7 +3,7 @@
 /**
  * @file server/storage/src/table/table.h
  * One table: its primary index, its secondary indexes, and the lock that
- * keeps a definition change apart from the reads.
+ * keeps a definition change apart from definition lookups.
  */
 
 #ifndef HELIOS_STORAGE_SRC_TABLE_TABLE_H

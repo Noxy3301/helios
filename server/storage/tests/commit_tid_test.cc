@@ -6,7 +6,6 @@
 #include <algorithm>
 #include <filesystem>
 #include <memory>
-#include <shared_mutex>
 #include <string>
 #include <thread>
 #include <vector>
@@ -50,7 +49,6 @@ class CommitTidTest : public ::testing::Test {
  protected:
   Config config_;
   TableDictionary tables_;
-  std::shared_mutex schema_mutex_;
   epoch::Framework epoch_;
   index::Reaper reaper_;
   std::unique_ptr<wal::Logger> logger_;
@@ -132,39 +130,36 @@ class CommitTidTest : public ::testing::Test {
       reason_ = "range_end_key_missing";
       return fail_preparation();
     }
-    {
-      std::shared_lock<std::shared_mutex> lock(schema_mutex_);
-      for (const auto &write : decoded) {
-        auto *table = tables_.GetTable(write.table_name);
-        if (!table) {
-          reason_ = "write_table_missing";
-          return fail_preparation();
-        }
-        if (!table->GetPaxTable()) {
-          reason_ = "pax_schema_missing";
-          return fail_preparation();
-        }
-        if (!write_set.AddRow(table->GetPrimaryIndex(), write, reason_))
-          return fail_preparation();
+    for (const auto &write : decoded) {
+      auto *table = tables_.GetTable(write.table_name);
+      if (!table) {
+        reason_ = "write_table_missing";
+        return fail_preparation();
       }
-      for (const auto &change : index_ops) {
-        auto *table = tables_.GetTable(change.table_name);
-        if (!table) {
-          reason_ = "si_table_missing";
-          return fail_preparation();
-        }
-        if (!table->GetPaxTable()) {
-          reason_ = "pax_schema_missing";
-          return fail_preparation();
-        }
-        auto *index = table->GetSecondaryIndex(change.index_name);
-        if (!index) {
-          reason_ = "si_index_missing";
-          return fail_preparation();
-        }
-        if (!write_set.AddIndex(index->tree, index->constraint, change, reason_))
-          return fail_preparation();
+      if (!table->GetPaxTable()) {
+        reason_ = "pax_schema_missing";
+        return fail_preparation();
       }
+      if (!write_set.AddRow(table->GetPrimaryIndex(), write, reason_))
+        return fail_preparation();
+    }
+    for (const auto &change : index_ops) {
+      auto *table = tables_.GetTable(change.table_name);
+      if (!table) {
+        reason_ = "si_table_missing";
+        return fail_preparation();
+      }
+      if (!table->GetPaxTable()) {
+        reason_ = "pax_schema_missing";
+        return fail_preparation();
+      }
+      auto *index = table->GetSecondaryIndex(change.index_name);
+      if (!index) {
+        reason_ = "si_index_missing";
+        return fail_preparation();
+      }
+      if (!write_set.AddIndex(index->tree, index->constraint, change, reason_))
+        return fail_preparation();
     }
     const silo::CommitExecutor executor(tables_, epoch_, reaper_);
     wal::LogEntries log_entries;

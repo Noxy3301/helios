@@ -28,7 +28,7 @@
 #include <cstdint>
 #include <functional>
 #include <limits>
-#include <shared_mutex>
+#include <mutex>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -421,8 +421,8 @@ class Database {
   epoch::Framework epoch_framework_;
   TableDictionary table_dictionary_;
   wal::EpochScanCheckpoint scan_checkpoint_;
-  // Shared for reads, statistics and commit slot resolution; exclusive for DDL.
-  std::shared_mutex schema_mutex_;
+  // Serializes definition changes: index creation and the catalog rewrite
+  std::mutex ddl_mutex_;
   index::Reaper reaper_;
   // Each worker remembers the last TID it chose for this database.
   ThreadKeyStorage<Tidword> last_commit_tids_;
@@ -436,7 +436,6 @@ class Database {
 
   /**
    * @brief Resolves input writes to their target records.
-   * @details Holds the schema mutex in shared mode while building the entries.
    * @pre The caller has joined an epoch.
    * @return false with an input error; no row locks are acquired here.
    */

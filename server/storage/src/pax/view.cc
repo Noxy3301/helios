@@ -6,7 +6,6 @@
 
 #include <chrono>
 #include <mutex>
-#include <shared_mutex>
 #include <string>
 #include <utility>
 
@@ -97,9 +96,9 @@ bool Database::InstallPaxSchema(const std::string_view table_name,
                                 const std::vector<pax::FieldType> &field_type,
                                 const std::vector<int8_t> &field_scale) {
   if (field_max_bytes.empty()) return false;
-  // A definition change, like CreateSecondaryIndex: every request holds this
-  // lock shared, and the absent rows it creates read the store pointer.
-  std::unique_lock<std::shared_mutex> lk(schema_mutex_);
+  // The catalog is rewritten from a snapshot of every installed schema, so
+  // two installs must not interleave.
+  std::lock_guard<std::mutex> lk(ddl_mutex_);
   Table *table = GetTable(table_name);
   if (table == nullptr) return false;
   pax::TableSchema schema;
@@ -125,8 +124,8 @@ bool Database::InstallPaxSchema(const std::string_view table_name,
            current.field_scale == schema.field_scale;
   }
 
-  // Rewrite all definitions under schema_mutex_, then make this schema
-  // writable.
+  // Rewrite the catalog from every installed definition, then make this
+  // schema writable.
   pax::CatalogEntries entries;
   table_dictionary_.ForEachTable([&entries](Table &entry) {
     if (const auto *store = entry.GetPaxTable()) {

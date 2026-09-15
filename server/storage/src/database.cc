@@ -25,7 +25,7 @@
 #include "lineairdb/database.h"
 
 #include <algorithm>
-#include <shared_mutex>
+#include <mutex>
 
 #include "lineairdb/config.h"
 
@@ -173,9 +173,8 @@ bool Database::CreateSecondaryIndex(const std::string_view table_name,
       index_type != IndexConstraint::kUnique) {
     return false;
   }
-  // Exclusive: every reader of the definition holds this lock shared, so a
-  // shared one here would let a request resolve half of a schema change.
-  std::unique_lock<std::shared_mutex> lk(schema_mutex_);
+  // Serialized with the other definition changes.
+  std::lock_guard<std::mutex> lk(ddl_mutex_);
   Table *table = GetTable(table_name);
   if (table == nullptr) return false;
   return table->CreateSecondaryIndex(index_name, index_type);
@@ -184,13 +183,12 @@ bool Database::CreateSecondaryIndex(const std::string_view table_name,
 ReadResult Database::Read(const std::string_view table_name,
                           const std::string_view key,
                           const std::vector<uint32_t> *selected_columns) {
-  return silo::Read(table_dictionary_, schema_mutex_, table_name, key,
-                    selected_columns);
+  return silo::Read(table_dictionary_, table_name, key, selected_columns);
 }
 
 std::vector<ReadResult> Database::BatchRead(
     const std::vector<std::pair<std::string, std::string>> &keys) {
-  return silo::BatchRead(table_dictionary_, schema_mutex_, keys);
+  return silo::BatchRead(table_dictionary_, keys);
 }
 
 ScanResult Database::Scan(const std::string_view table_name,
@@ -198,8 +196,8 @@ ScanResult Database::Scan(const std::string_view table_name,
                           const std::string_view end_key, uint64_t row_limit,
                           bool reverse_scan,
                           const std::vector<uint32_t> *selected_columns) {
-  return silo::Scan(table_dictionary_, schema_mutex_, table_name, start_key,
-                    end_key, row_limit, reverse_scan, selected_columns);
+  return silo::Scan(table_dictionary_, table_name, start_key, end_key,
+                    row_limit, reverse_scan, selected_columns);
 }
 
 ScanIndexResult Database::ScanIndex(
@@ -207,25 +205,22 @@ ScanIndexResult Database::ScanIndex(
     const std::string_view start_key, const std::string_view end_key,
     uint64_t row_limit, bool reverse_scan,
     const std::vector<uint32_t> *selected_columns) {
-  return silo::ScanIndex(table_dictionary_, schema_mutex_, table_name,
-                         index_name, start_key, end_key, row_limit,
-                         reverse_scan, selected_columns);
+  return silo::ScanIndex(table_dictionary_, table_name, index_name, start_key,
+                         end_key, row_limit, reverse_scan, selected_columns);
 }
 
 ScanPaxResult Database::ScanPax(const std::string_view table_name,
                                 const std::string_view start_key,
                                 const std::string_view end_key,
                                 uint64_t row_limit, bool reverse_scan) {
-  return silo::ScanPax(table_dictionary_, schema_mutex_, table_name, start_key,
-                       end_key, row_limit, reverse_scan);
+  return silo::ScanPax(table_dictionary_, table_name, start_key, end_key,
+                       row_limit, reverse_scan);
 }
 
 bool Database::ResolveWrites(
     const std::vector<silo::Write> &writes,
     const std::vector<ExternalSecondaryIndexEntry> &secondary_index_ops,
     silo::WriteSet &write_set, std::string &abort_reason) {
-  std::shared_lock<std::shared_mutex> lock(schema_mutex_);
-
   for (const auto &write : writes) {
     auto *table = GetTable(write.table_name);
     if (!table) {
@@ -279,7 +274,7 @@ bool Database::Commit(
   std::vector<silo::Write> decoded_writes;
   decoded_writes.reserve(writes.size());
   // GetPaxTable synchronizes lookup; its schema remains valid and unchanged
-  // until shutdown, so decoding needs no schema lock.
+  // until shutdown.
   for (const auto &write : writes) {
     auto *table = GetTable(write.table_name);
     if (table == nullptr) {
@@ -316,7 +311,7 @@ bool Database::Commit(
     return false;
   }
 
-  // The schema lock is released before the test hook can pause this thread.
+  // Test hook after every write target is claimed in its index.
   if (std::any_of(decoded_writes.begin(), decoded_writes.end(),
                   [](const auto &write) { return write.op == RowOp::kInsert; }))
     HELIOS_DEBUG_SYNC("silo_commit.after_index_claim");
