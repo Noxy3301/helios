@@ -229,13 +229,13 @@ TEST(MasstreeIndexTest, ReaperPreservesReusedSecondaryEntry) {
   reaper.Enqueue(tree, "secondary", *item, deleted);
 
   // A delete cannot be purged until a full epoch has elapsed.
-  reaper.Reap(11);
+  reaper.Purge(9);
   EXPECT_EQ(item, tree.Get("secondary"));
 
   // A later insertion reuses the slot and publishes a newer TID.
   item->SetPrimaryKeys({"primary"});
   item->transaction_id.store(Word(10, 4, /*absent=*/false));
-  reaper.Reap(12);
+  reaper.Purge(10);
   EXPECT_EQ(item, tree.Get("secondary"));
   EXPECT_TRUE(item->IsLive());
 
@@ -244,7 +244,7 @@ TEST(MasstreeIndexTest, ReaperPreservesReusedSecondaryEntry) {
   const Tidword deleted_again = Word(12, 6, /*absent=*/true);
   item->transaction_id.store(deleted_again);
   reaper.Enqueue(tree, "secondary", *item, deleted_again);
-  reaper.Reap(14);
+  reaper.Purge(12);
   EXPECT_EQ(nullptr, tree.Get("secondary"));
   index::MasstreeReleaseThreadEpoch();
 }

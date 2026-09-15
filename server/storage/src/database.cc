@@ -137,14 +137,16 @@ const Config &Database::GetConfig() const noexcept { return config_; }
 std::function<void(EpochNumber)> Database::MakeEpochHook() {
   // The epoch writer calls this with the global epoch it just published.
   return [this](const EpochNumber global_epoch) {
-    // An online worker in `e_w` keeps global epoch `E` below `e_w + 2`.
-    // With `E = global_epoch`, the logger may persist records through `E - 2`.
+    // Workers lag E by at most one epoch, so none remain in epochs <= E - 2.
+    // Flushing and reclamation have different roles but currently share this bound.
+    // Commit epochs are positive, so E - 2 must be at least 1.
     if (global_epoch >= 3) {
-      logger_.RequestFlush(global_epoch - 2);
-    }
+      const EpochNumber flush_epoch = global_epoch - 2;
+      logger_.RequestFlush(flush_epoch);
 
-    // Physically purge the tombstones whose grace epoch has passed.
-    reaper_.Reap(global_epoch);
+      const EpochNumber reclamation_epoch = global_epoch - 2;
+      reaper_.Purge(reclamation_epoch);
+    }
 
     // Tick masstree's globalepoch so RCU can free retired leaves and
     // DataItem limbo once min_active_epoch() catches up. Workers release

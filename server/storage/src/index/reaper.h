@@ -1,13 +1,13 @@
 /**
  * @file server/storage/src/index/reaper.h
- * Physical removal of the slots a commit left empty, deferred until no
- * reader can still hold a pointer to them.
+ * Physical removal of deleted records after an epoch grace period.
  */
 
 #ifndef HELIOS_STORAGE_SRC_INDEX_REAPER_H
 #define HELIOS_STORAGE_SRC_INDEX_REAPER_H
 
 #include <cstdint>
+#include <map>
 #include <mutex>
 #include <string>
 #include <string_view>
@@ -23,15 +23,8 @@ namespace index {
 class MasstreeIndex;
 
 /**
- * @brief Physically erases logically deleted index slots after a grace
- * period.
- *
- * A committed delete leaves its DataItem in the index showing an absent word
- * with the delete's TID, so a read of the key observes the delete's word until
- * the purge; the physical Purge runs here. Committers Enqueue a tombstone after
- * publishing that word. Reap runs on the epoch-framework thread and purges a
- * tombstone only once published_epoch is more than one epoch past that word's
- * epoch.
+ * @brief Holds deleted records by epoch until they can be physically removed.
+ * Writers may reuse a queued record, so purging must still check its delete TID.
  */
 class Reaper {
  public:
@@ -44,24 +37,22 @@ class Reaper {
                Tidword delete_commit_tid);
 
   /**
-   * @brief Purges every tombstone whose delete epoch lies more than one full
-   * epoch behind `published_epoch`.
-   *
-   * Tombstones whose slot is locked are requeued. A tombstone is dropped when
-   * the key resolves to a different item, the word no longer shows the
-   * delete, or Purge fails. Runs on the epoch-framework thread.
+   * @brief Purges candidates deleted at or before reclamation_epoch.
+   * @details reclamation_epoch is the latest delete epoch whose grace has passed.
+   * Unlinking is separate from freeing memory, which remains deferred by RCU.
+   * Locked records remain queued for the next call; newer epochs are untouched.
+   * Called by the epoch thread, never concurrently with another Purge.
    */
-  void Reap(EpochNumber published_epoch);
+  void Purge(EpochNumber reclamation_epoch);
 
  private:
   /**
    * @brief One logically deleted slot awaiting its physical purge.
    *
    * index is the tree owning the slot. item is the slot pointer observed at
-   * enqueue time and serves as an identity check at reap time.
-   * `delete_commit_tid` is the absent word the deleting commit published on
-   * the slot; it acts both as the grace-period clock and as evidence that the
-   * slot still holds the deleted version.
+   * enqueue time and serves as an identity check at purge time.
+   * `delete_commit_tid` identifies the deletion; a newer version cancels
+   * this candidate.
    */
   struct Tombstone {
     MasstreeIndex *index = nullptr;
@@ -70,9 +61,9 @@ class Reaper {
     Tidword delete_commit_tid;
   };
 
-  // Guards the queue: Enqueue runs on committers, Reap on the epoch thread.
+  // Guards the queue shared by committers and the epoch thread.
   std::mutex mutex_;
-  std::vector<Tombstone> tombstones_;
+  std::map<EpochNumber, std::vector<Tombstone>> tombstones_;
 };
 
 }  // namespace index

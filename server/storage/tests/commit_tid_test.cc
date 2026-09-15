@@ -239,7 +239,7 @@ TEST_F(CommitTidTest, FullTidRangeAllowsPurgeAndRejectsCommitWrap) {
   // This thread pins the old item while another thread purges it.
   auto *retained = tree.Get("key");
   ASSERT_EQ(item, retained);
-  std::thread reap([&] { reaper_.Reap(12); });
+  std::thread reap([&] { reaper_.Purge(10); });
   reap.join();
 
   Tidword retired = Deleted(10, max_commit);
@@ -351,7 +351,7 @@ TEST_F(CommitTidTest, AbsentEvidenceAbortsAfterThePurge) {
   const uint64_t deleted = item->transaction_id.load().obj;
 
   auto &tree = tables_.GetTable(kTable)->GetPrimaryIndex();
-  reaper_.Reap(12);
+  reaper_.Purge(10);
   ASSERT_EQ(nullptr, tree.Get("k"));
 
   // The purged key reads as the absent word, not the delete's.
@@ -367,12 +367,12 @@ TEST_F(CommitTidTest, ReaperRequeuesALockedRecord) {
   held->transaction_id.store(word);
 
   auto &tree = tables_.GetTable(kTable)->GetPrimaryIndex();
-  reaper_.Reap(12);
+  reaper_.Purge(10);
   EXPECT_EQ(held, tree.Get("held"));
 
   word.lock = false;
   held->transaction_id.store(word);
-  reaper_.Reap(12);
+  reaper_.Purge(10);
   EXPECT_EQ(nullptr, tree.Get("held"));
 
 }
@@ -452,7 +452,7 @@ TEST_F(CommitTidTest,
   range.end_key = "t";
   ASSERT_TRUE(Commit({}, {{kTable, "other", "value"}}, {}, {range})) << reason_;
 
-  reaper_.Reap(12);
+  reaper_.Purge(10);
   EXPECT_EQ(nullptr, index->tree.Get("s"));
 }
 
