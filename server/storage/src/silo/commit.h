@@ -7,7 +7,6 @@
 #ifndef HELIOS_STORAGE_SRC_SILO_COMMIT_H
 #define HELIOS_STORAGE_SRC_SILO_COMMIT_H
 
-#include <shared_mutex>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -35,6 +34,8 @@ class Reaper;
 }
 
 namespace silo {
+class ReadSet;
+class WriteSet;
 
 // Maximum tid within one epoch; Tidword reserves 29 bits for it.
 inline constexpr uint32_t kMaxTid = (1u << 29) - 1;
@@ -52,41 +53,29 @@ struct Write {
 };
 
 /**
- * @brief One transaction's request: what it observed and what it wants
- * installed. A call-site view; it does not own the vectors.
- */
-struct CommitPayload {
-  const std::vector<ExternalReadEntry> &reads;
-  const std::vector<Write> &writes;
-  const std::vector<ExternalSecondaryIndexEntry> &secondary_index_ops;
-  const std::vector<ExternalRangeReadEntry> &range_reads;
-};
-
-/**
  * @brief Executes commits using one database's shared storage components.
  * @details The database owns this executor and outlives every Commit call.
- * Each call keeps its read/write sets and other attempt state locally, so
- * concurrent callers share only the storage components bound here.
+ * Callers prepare their read/write sets. Each call keeps its intermediate TIDs
+ * locally, so concurrent callers share only the storage components bound here.
  */
 class CommitExecutor {
  public:
-  /** @brief Binds components that must outlive this executor. */
-  CommitExecutor(TableDictionary &tables, std::shared_mutex &schema_mutex,
-                 epoch::Framework &epoch_framework, index::Reaper &reaper,
-                 wal::Logger &logger);
+  /**
+   * @brief Binds components that must outlive this executor.
+   */
+  CommitExecutor(TableDictionary &tables, epoch::Framework &epoch_framework,
+                 index::Reaper &reaper, wal::Logger &logger);
 
   /**
-   * @brief Runs the Silo commit protocol for a transaction whose read and
-   * write sets were assembled by the caller through the read API.
-   *
-   * @details
-   * Writes already contain PAX cell values; this protocol does not decode
-   * input bytes. Nothing in the entries points into storage
-   * memory:
-   *   - reads:       (key, observed TID word)
-   *   - writes:      (key, value | delete)
-   *   - SI ops:      (secondary key, primary key, add | remove)
-   *   - range reads: scan bounds plus the returned key list
+   * @brief Runs the Silo commit protocol on the caller's prepared sets.
+   * @pre The same thread has joined this executor's epoch framework. Range
+   * bounds are checked; write targets are resolved and this attempt holds no
+   * row locks yet.
+   * @details This call takes over the active epoch: it leaves on success or
+   * abort, and performs the existing Leave/Join refresh after taking locks.
+   * The caller must not call Leave again after this method returns.
+   * Input observations and decoded rows borrowed by the sets stay valid until
+   * return. Durability is awaited only after leaving the epoch.
    *
    * The protocol locks the write set and reads the epoch, validates read
    * observations, then chooses one commit TID (Silo §4.2–4.4). Write constraints
@@ -109,12 +98,12 @@ class CommitExecutor {
    * @return true when the transaction committed; false on abort, after
    * every lock this attempt acquired has been released.
    */
-  bool Commit(const CommitPayload &payload, Tidword &last_commit_tid,
-              CommitDurability durability, std::string &abort_reason) const;
+  bool Commit(const ReadSet &read_set, WriteSet &write_set,
+              Tidword &last_commit_tid, CommitDurability durability,
+              std::string &abort_reason) const;
 
  private:
   TableDictionary &tables_;
-  std::shared_mutex &schema_mutex_;
   epoch::Framework &epoch_framework_;
   index::Reaper &reaper_;
   wal::Logger &logger_;

@@ -19,6 +19,8 @@
 #include "index/reaper.h"
 #include "pax/version_store.h"
 #include "silo/commit.h"
+#include "silo/read_set.h"
+#include "silo/write_set.h"
 #include "silo/stable_read.h"
 #include "table/table_dictionary.h"
 #include "util/epoch_framework.h"
@@ -118,10 +120,54 @@ class CommitTidTest : public ::testing::Test {
       decoded.push_back(std::move(entry));
     }
     reason_.clear();
-    const silo::CommitPayload payload{reads, decoded, index_ops, ranges};
-    const silo::CommitExecutor executor(tables_, schema_mutex_, epoch_, reaper_,
-                                         *logger_);
-    const bool committed = executor.Commit(payload, last_tid_,
+    const silo::ReadSet read_set{reads, ranges};
+    silo::WriteSet write_set;
+    epoch_.Join();
+    auto fail_preparation = [&] {
+      epoch_.Leave();
+      index::MasstreeReleaseThreadEpoch();
+      return false;
+    };
+    if (!read_set.CheckRangeBounds()) {
+      reason_ = "range_end_key_missing";
+      return fail_preparation();
+    }
+    {
+      std::shared_lock<std::shared_mutex> lock(schema_mutex_);
+      for (const auto &write : decoded) {
+        auto *table = tables_.GetTable(write.table_name);
+        if (!table) {
+          reason_ = "write_table_missing";
+          return fail_preparation();
+        }
+        if (!table->GetPaxTable()) {
+          reason_ = "pax_schema_missing";
+          return fail_preparation();
+        }
+        if (!write_set.AddRow(table->GetPrimaryIndex(), write, reason_))
+          return fail_preparation();
+      }
+      for (const auto &change : index_ops) {
+        auto *table = tables_.GetTable(change.table_name);
+        if (!table) {
+          reason_ = "si_table_missing";
+          return fail_preparation();
+        }
+        if (!table->GetPaxTable()) {
+          reason_ = "pax_schema_missing";
+          return fail_preparation();
+        }
+        auto *index = table->GetSecondaryIndex(change.index_name);
+        if (!index) {
+          reason_ = "si_index_missing";
+          return fail_preparation();
+        }
+        if (!write_set.AddIndex(index->tree, index->constraint, change, reason_))
+          return fail_preparation();
+      }
+    }
+    const silo::CommitExecutor executor(tables_, epoch_, reaper_, *logger_);
+    const bool committed = executor.Commit(read_set, write_set, last_tid_,
                                            CommitDurability::kAsync, reason_);
     index::MasstreeReleaseThreadEpoch();
     return committed;

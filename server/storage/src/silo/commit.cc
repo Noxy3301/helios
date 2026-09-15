@@ -1,20 +1,16 @@
 /**
  * @file server/storage/src/silo/commit.cc
- * Resolve targets, lock, validate, apply writes, and publish the commit.
+ * Run the commit protocol on prepared read and write sets.
  */
 
 #include "silo/commit.h"
 
 #include <algorithm>
-#include <mutex>
 #include <string>
 
-#include "index/secondary_index.h"
 #include "pax/version_store.h"
 #include "silo/read_set.h"
 #include "silo/write_set.h"
-#include "table/table.h"
-#include "table/table_dictionary.h"
 #include "util/debug_sync.h"
 #include "util/epoch_framework.h"
 #include "wal/logger.h"
@@ -26,19 +22,15 @@ namespace {
 
 // State shared by the steps of one commit attempt.
 struct CommitCtx {
-  TableDictionary &tables;
   epoch::Framework &epoch;
-  const CommitPayload &payload;
+  const ReadSet &read_set;
+  WriteSet &write_set;
   std::string &abort_reason;
-
-  ReadSet read_set{payload.reads, payload.range_reads};
-  WriteSet write_set;
   EpochNumber commit_epoch = 0;
   Tidword commit_tid{};
   // The largest word this attempt read, and the largest it found under a lock.
   Tidword max_read_tid{};
   Tidword max_write_tid{};
-  bool has_insert = false;
 
   // Values are still unpublished; release any locks this attempt acquired.
   bool Abort(const std::string &reason) {
@@ -48,29 +40,6 @@ struct CommitCtx {
     return false;
   }
 };
-
-// Resolve the indexes; WriteSet manages records and duplicate updates.
-bool ResolveWrites(CommitCtx &ctx, std::shared_mutex &schema_mutex) {
-  std::shared_lock<std::shared_mutex> lk(schema_mutex);
-  for (const auto &write : ctx.payload.writes) {
-    auto *table = ctx.tables.GetTable(write.table_name);
-    if (!table) return ctx.Abort("write_table_missing");
-    if (!table->GetPaxTable()) return ctx.Abort("pax_schema_missing");
-    if (!ctx.write_set.AddRow(table->GetPrimaryIndex(), write, ctx.abort_reason))
-      return ctx.Abort(ctx.abort_reason);
-  }
-  for (const auto &change : ctx.payload.secondary_index_ops) {
-    auto *table = ctx.tables.GetTable(change.table_name);
-    if (!table) return ctx.Abort("si_table_missing");
-    if (!table->GetPaxTable()) return ctx.Abort("pax_schema_missing");
-    auto *index = table->GetSecondaryIndex(change.index_name);
-    if (!index) return ctx.Abort("si_index_missing");
-    if (!ctx.write_set.AddIndex(index->tree, index->constraint, change,
-                               ctx.abort_reason))
-      return ctx.Abort(ctx.abort_reason);
-  }
-  return true;
-}
 
 // Pick the TID this transaction publishes on every record it touches.
 bool GenerateCommitTid(CommitCtx &ctx, const Tidword &last_commit_tid) {
@@ -107,37 +76,18 @@ bool EnqueueLogEntries(wal::Logger &logger, wal::LogEntries &log_entries,
 }  // namespace
 
 CommitExecutor::CommitExecutor(TableDictionary &tables,
-                               std::shared_mutex &schema_mutex,
                                epoch::Framework &epoch_framework,
                                index::Reaper &reaper, wal::Logger &logger)
     : tables_(tables),
-      schema_mutex_(schema_mutex),
       epoch_framework_(epoch_framework),
       reaper_(reaper),
       logger_(logger) {}
 
-bool CommitExecutor::Commit(const CommitPayload &payload,
+bool CommitExecutor::Commit(const ReadSet &read_set, WriteSet &write_set,
                             Tidword &last_commit_tid,
                             CommitDurability durability,
                             std::string &abort_reason) const {
-  CommitCtx ctx{tables_, epoch_framework_, payload, abort_reason};
-
-  // Enter the storage epoch before resolving and locking targets.
-  epoch_framework_.Join();
-
-  ctx.has_insert = std::any_of(
-      payload.writes.begin(), payload.writes.end(),
-      [](const Write &entry) { return entry.op == RowOp::kInsert; });
-
-  if (!ctx.read_set.CheckRangeBounds())
-    return ctx.Abort("range_end_key_missing");
-
-  if (!ResolveWrites(ctx, schema_mutex_)) return false;
-
-  // Test hook outside the schema lock so concurrent DDL can proceed.
-  if (ctx.has_insert) {
-    HELIOS_DEBUG_SYNC("silo_commit.after_index_claim");
-  }
+  CommitCtx ctx{epoch_framework_, read_set, write_set, abort_reason};
 
   // Phase 1: lock the write set, then read the global epoch.
   for (auto &[item, entry] : ctx.write_set) {

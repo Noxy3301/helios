@@ -34,6 +34,9 @@
 #include "pax/catalog.h"
 #include "silo/commit.h"
 #include "silo/read.h"
+#include "silo/read_set.h"
+#include "silo/write_set.h"
+#include "util/debug_sync.h"
 #include "util/spdlog.h"
 #include "wal/flush_trace.h"
 #include "wal/log_entry.h"
@@ -63,8 +66,7 @@ Database::Database(const Config &config)
       logger_(config_),
       epoch_framework_(config_.epoch_duration_ms, MakeEpochHook()),
       scan_checkpoint_(config_, table_dictionary_, epoch_framework_, logger_),
-      commit_executor_(table_dictionary_, schema_mutex_, epoch_framework_,
-                       reaper_, logger_) {
+      commit_executor_(table_dictionary_, epoch_framework_, reaper_, logger_) {
   SPDLOG_INFO("Storage instance has been constructed.");
 
   // Restore column definitions before any recovered value is installed.
@@ -218,6 +220,53 @@ ScanPaxResult Database::ScanPax(const std::string_view table_name,
                        end_key, row_limit, reverse_scan);
 }
 
+bool Database::ResolveWrites(
+    const std::vector<silo::Write> &writes,
+    const std::vector<ExternalSecondaryIndexEntry> &secondary_index_ops,
+    silo::WriteSet &write_set, std::string &abort_reason) {
+  std::shared_lock<std::shared_mutex> lock(schema_mutex_);
+
+  for (const auto &write : writes) {
+    auto *table = GetTable(write.table_name);
+    if (!table) {
+      abort_reason = "write_table_missing";
+      return false;
+    }
+
+    if (!table->GetPaxTable()) {
+      abort_reason = "pax_schema_missing";
+      return false;
+    }
+
+    if (!write_set.AddRow(table->GetPrimaryIndex(), write, abort_reason))
+      return false;
+  }
+
+  for (const auto &change : secondary_index_ops) {
+    auto *table = GetTable(change.table_name);
+    if (!table) {
+      abort_reason = "si_table_missing";
+      return false;
+    }
+
+    if (!table->GetPaxTable()) {
+      abort_reason = "pax_schema_missing";
+      return false;
+    }
+
+    auto *index = table->GetSecondaryIndex(change.index_name);
+    if (!index) {
+      abort_reason = "si_index_missing";
+      return false;
+    }
+
+    if (!write_set.AddIndex(index->tree, index->constraint, change, abort_reason))
+      return false;
+  }
+
+  return true;
+}
+
 bool Database::Commit(
     const std::vector<ExternalReadEntry> &reads,
     const std::vector<ExternalWriteEntry> &writes,
@@ -227,8 +276,8 @@ bool Database::Commit(
   abort_reason.clear();
 
   // Convert input bytes before the commit protocol acquires any row locks.
-  std::vector<silo::Write> write_set;
-  write_set.reserve(writes.size());
+  std::vector<silo::Write> decoded_writes;
+  decoded_writes.reserve(writes.size());
   // GetPaxTable synchronizes lookup; its schema remains valid and unchanged
   // until shutdown, so decoding needs no schema lock.
   for (const auto &write : writes) {
@@ -250,13 +299,31 @@ bool Database::Commit(
       abort_reason = "pax_row_decode_failed";
       return false;
     }
-    write_set.emplace_back(std::move(entry));
+    decoded_writes.emplace_back(std::move(entry));
   }
-  const silo::CommitPayload payload{reads, write_set, secondary_index_ops,
-                                    range_reads};
   Tidword &last_commit_tid = *last_commit_tids_.Get();
-  return commit_executor_.Commit(payload, last_commit_tid, durability,
-                                abort_reason);
+  silo::ReadSet read_set{reads, range_reads};
+  silo::WriteSet write_set;
+  epoch_framework_.Join();
+  if (!read_set.CheckRangeBounds()) {
+    abort_reason = "range_end_key_missing";
+    epoch_framework_.Leave();
+    return false;
+  }
+  if (!ResolveWrites(decoded_writes, secondary_index_ops, write_set,
+                     abort_reason)) {
+    epoch_framework_.Leave();
+    return false;
+  }
+
+  // The schema lock is released before the test hook can pause this thread.
+  if (std::any_of(decoded_writes.begin(), decoded_writes.end(),
+                  [](const auto &write) { return write.op == RowOp::kInsert; }))
+    HELIOS_DEBUG_SYNC("silo_commit.after_index_claim");
+
+  // The executor takes over the active epoch and leaves before durability waits.
+  return commit_executor_.Commit(read_set, write_set, last_commit_tid,
+                                 durability, abort_reason);
 }
 
 Table *Database::GetTable(const std::string_view table_name) const {

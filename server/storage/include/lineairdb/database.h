@@ -362,9 +362,9 @@ class Database {
    * @brief Validates caller-supplied read and write sets and installs the
    *        writes atomically.
    *
-   * Runs the Silo commit protocol against external inputs: resolve each
-   * key to its record, lock the write set, validate read observations,
-   * then prepare updates and check write constraints. Each record is updated,
+   * Prepares read/write sets from external inputs, then passes them and its
+   * active epoch to the Silo commit protocol. The protocol locks the write set,
+   * validates read observations, and prepares updates. Each record is updated,
    * copied to the log, and unlocked with its new TID. The full contract
    * lives with silo::CommitExecutor::Commit.
    *
@@ -433,6 +433,17 @@ class Database {
       (std::numeric_limits<EpochNumber>::max() -
        epoch::Framework::kEpochHighWater) /
       2;
+
+  /**
+   * @brief Resolves input writes to their target records.
+   * @details Holds the schema mutex in shared mode while building the entries.
+   * @pre The caller has joined an epoch.
+   * @return false with an input error; no row locks are acquired here.
+   */
+  bool ResolveWrites(
+      const std::vector<silo::Write> &writes,
+      const std::vector<ExternalSecondaryIndexEntry> &secondary_index_ops,
+      silo::WriteSet &write_set, std::string &abort_reason);
 
   Table *GetTable(std::string_view table_name) const;
 

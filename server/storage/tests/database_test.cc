@@ -99,6 +99,34 @@ TEST_F(DatabaseTest, DeleteRemovesKeyAcrossTransactions) {
   ASSERT_FALSE(TestHelper::Read<int>(*db_, kTable, "alice").has_value());
 }
 
+TEST_F(DatabaseTest, FailedSetPreparationLeavesItsEpoch) {
+  using namespace helios::storage;
+  const std::vector<ExternalWriteEntry> writes = {
+      {kTable, "new", TestHelper::Row("value")}};
+  auto check_epoch_released = [&] {
+    const auto view = db_->AcquirePaxView(1000);
+    EXPECT_TRUE(view.valid) << view.error;
+    db_->ReleasePaxView(view);
+  };
+
+  ExternalRangeReadEntry invalid_range;
+  invalid_range.table_name = kTable;
+  std::string reason;
+  EXPECT_FALSE(db_->Commit({}, writes, {}, {invalid_range},
+                           CommitDurability::kAsync, reason));
+  EXPECT_EQ("range_end_key_missing", reason);
+  db_->ReleaseThreadEpoch();
+  check_epoch_released();
+
+  EXPECT_FALSE(db_->Commit({}, writes, {{kTable, "missing_index", "s", "new"}},
+                           {}, CommitDurability::kAsync, reason));
+  EXPECT_EQ("si_index_missing", reason);
+  db_->ReleaseThreadEpoch();
+  check_epoch_released();
+  EXPECT_FALSE(TestHelper::ReadRow(*db_, kTable, "new").has_value());
+  EXPECT_TRUE(TestHelper::WriteRow(*db_, kTable, "new", TestHelper::Row("next")));
+}
+
 TEST_F(DatabaseTest, ThreadSafetyWrites) {
   constexpr int kValue = 0xBEEF;
   constexpr size_t kKeys = 11;
