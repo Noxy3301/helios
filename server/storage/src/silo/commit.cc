@@ -8,14 +8,10 @@
 #include <algorithm>
 #include <mutex>
 #include <string>
-#include <string_view>
-#include <vector>
 
-#include "index/data_item.h"
-#include "index/masstree_index.h"
 #include "index/secondary_index.h"
 #include "pax/version_store.h"
-#include "silo/stable_read.h"
+#include "silo/read_set.h"
 #include "silo/write_set.h"
 #include "table/table.h"
 #include "table/table_dictionary.h"
@@ -35,8 +31,7 @@ struct CommitCtx {
   const CommitPayload &payload;
   std::string &abort_reason;
 
-  // Use the caller's observations directly, including repeated reads.
-  const std::vector<ExternalReadEntry> &read_set = payload.reads;
+  ReadSet read_set{payload.reads, payload.range_reads};
   WriteSet write_set;
   EpochNumber commit_epoch = 0;
   Tidword commit_tid{};
@@ -73,176 +68,6 @@ bool ResolveWrites(CommitCtx &ctx, std::shared_mutex &schema_mutex) {
     if (!ctx.write_set.AddIndex(index->tree, index->constraint, change,
                                ctx.abort_reason))
       return ctx.Abort(ctx.abort_reason);
-  }
-  return true;
-}
-
-std::string KeyHex(const std::string &key) {
-  static constexpr char kHex[] = "0123456789abcdef";
-  std::string out;
-  out.reserve(key.size() * 2);
-  for (unsigned char byte : key) {
-    out.push_back(kHex[byte >> 4]);
-    out.push_back(kHex[byte & 0x0F]);
-  }
-  return out;
-}
-
-std::string FormatReadAbortReason(const char *reason,
-                                 const ExternalReadEntry &read) {
-  std::string out(reason);
-  out += ':';
-  out += read.table_name;
-  out += ":key=";
-  out += KeyHex(read.key);
-  return out;
-}
-
-// Check that every record a point read observed still shows the same word.
-bool ValidateReads(CommitCtx &ctx) {
-  for (const auto &read : ctx.read_set) {
-    auto *table = ctx.tables.GetTable(read.table_name);
-    if (table == nullptr) {
-      if (read.tid != 0) return ctx.Abort("read_table_missing");
-      continue;
-    }
-    const Tidword observed(read.tid);
-    DataItem *item = table->GetPrimaryIndex().Get(read.key);
-    // A key with no record reads as the absent word.
-    const Tidword current =
-        item ? item->transaction_id.load() : Tidword::Absent();
-    // Only our own lock may differ from the word the read observed.
-    Tidword expected = observed;
-    if (item != nullptr && ctx.write_set.OwnsLock(item)) expected.lock = true;
-    if (current != expected) {
-      return ctx.Abort(
-          FormatReadAbortReason("exact_read_tid_moved", read));
-    }
-    ctx.max_read_tid = std::max(ctx.max_read_tid, observed);
-  }
-  return true;
-}
-
-// Rescan a primary range; stop at the first difference in live keys.
-bool ReplayRange(CommitCtx &ctx, const ExternalRangeReadEntry &range) {
-  auto table = ctx.tables.GetTable(range.table_name);
-  if (table == nullptr) return false;
-
-  size_t result_pos = 0;
-  bool aborted = false;
-  bool matches = true;
-  auto collect_key = [&](std::string_view key, DataItem &item) {
-    const Tidword tid = item.transaction_id.load();
-    if (tid.lock && !ctx.write_set.OwnsLock(&item)) {
-      aborted = true;
-      return true;
-    }
-    // Include tombstones too: their delete TIDs determine the state we saw.
-    ctx.max_read_tid = std::max(ctx.max_read_tid, tid);
-    if (!tid.absent) {
-      if (result_pos >= range.result_keys.size() ||
-          std::string_view(range.result_keys[result_pos]) != key) {
-        matches = false;
-        return true;
-      }
-      ++result_pos;
-    }
-    return range.row_limit > 0 && result_pos >= range.row_limit;
-  };
-
-  if (range.reverse_scan) {
-    table->GetPrimaryIndex().ScanReverse(range.start_key, range.end_key,
-                                         collect_key);
-  } else {
-    table->GetPrimaryIndex().Scan(range.start_key, range.end_key, collect_key);
-  }
-  if (aborted) return false;
-  return matches && result_pos == range.result_keys.size();
-}
-
-// Rescan a secondary range and compare secondary/primary key pairs in order.
-bool ReplayIndexRange(CommitCtx &ctx, const ExternalRangeReadEntry &range) {
-  auto table = ctx.tables.GetTable(range.table_name);
-  if (table == nullptr) return false;
-  auto *index = table->GetSecondaryIndex(range.index_name);
-  if (index == nullptr) return false;
-
-  size_t result_pos = 0;
-  bool aborted = false;
-  bool matches = true;
-  auto collect_base_row = [&](const std::string &secondary_key,
-                              std::string_view primary_key) {
-    DataItem *item = table->GetPrimaryIndex().Get(primary_key);
-    if (item == nullptr) return false;
-    const Tidword tid = item->transaction_id.load();
-    if (tid.lock && !ctx.write_set.OwnsLock(item)) {
-      aborted = true;
-      return true;
-    }
-    ctx.max_read_tid = std::max(ctx.max_read_tid, tid);
-    if (!tid.absent) {
-      if (result_pos >= range.result_keys.size() ||
-          result_pos >= range.result_primary_keys.size() ||
-          std::string_view(range.result_keys[result_pos]) !=
-              std::string_view(secondary_key) ||
-          std::string_view(range.result_primary_keys[result_pos]) !=
-              primary_key) {
-        matches = false;
-        return true;
-      }
-      ++result_pos;
-    }
-    return range.row_limit > 0 && result_pos >= range.row_limit;
-  };
-
-  auto collect_secondary_key = [&](std::string_view key, DataItem &) {
-    // Find the current entry; the item supplied by the scan may be stale.
-    const std::string secondary_key(key);
-    DataItem *item = index->tree.Get(key);
-    if (item == nullptr) return false;
-
-    const Tidword tid = item->transaction_id.load();
-    if (tid.lock && !ctx.write_set.OwnsLock(item)) {
-      aborted = true;
-      return true;
-    }
-
-    // The key list is a separate load; abort if the word moved around it.
-    auto primary_keys = std::atomic_load(&item->primary_keys_);
-    if (item->transaction_id.load() != tid) {
-      aborted = true;
-      return true;
-    }
-    ctx.max_read_tid = std::max(ctx.max_read_tid, tid);
-
-    for (std::string_view primary_key : PrimaryKeyList::View(primary_keys)) {
-      if (collect_base_row(secondary_key, primary_key)) return true;
-    }
-    return false;
-  };
-
-  if (range.reverse_scan) {
-    index->tree.ScanReverse(range.start_key, range.end_key,
-                            collect_secondary_key);
-  } else {
-    index->tree.Scan(range.start_key, range.end_key, collect_secondary_key);
-  }
-  if (aborted) return false;
-  return matches && result_pos == range.result_keys.size() &&
-         result_pos == range.result_primary_keys.size();
-}
-
-// Replay ranges and compare keys, order, and count.
-// ValidateReads checks the point-read evidence submitted by the caller.
-bool ValidateRanges(CommitCtx &ctx) {
-  for (const auto &range : ctx.payload.range_reads) {
-    const bool ok = range.index_name.empty() ? ReplayRange(ctx, range)
-                                             : ReplayIndexRange(ctx, range);
-    if (!ok) {
-      return ctx.Abort(range.index_name.empty()
-                                 ? "primary_range_result_changed"
-                                 : "secondary_range_result_changed");
-    }
   }
   return true;
 }
@@ -304,12 +129,7 @@ bool CommitExecutor::Commit(const CommitPayload &payload,
       payload.writes.begin(), payload.writes.end(),
       [](const Write &entry) { return entry.op == RowOp::kInsert; });
 
-  // Reject range evidence that omits the required exclusive end key.
-  for (const auto &range : payload.range_reads) {
-    if (range.end_key.empty()) {
-      return ctx.Abort("range_end_key_missing");
-    }
-  }
+  if (!ctx.read_set.CheckRangeBounds(abort_reason)) return ctx.Abort(abort_reason);
 
   if (!ResolveWrites(ctx, schema_mutex_)) return false;
 
@@ -332,8 +152,9 @@ bool CommitExecutor::Commit(const CommitPayload &payload,
   ctx.commit_epoch = epoch_framework_.Join();
 
   // Phase 2: validate read observations and assign the commit TID.
-  if (!ValidateReads(ctx)) return false;
-  if (!ValidateRanges(ctx)) return false;
+  if (!ctx.read_set.Validate(tables_, ctx.write_set, ctx.max_read_tid,
+                             abort_reason))
+    return ctx.Abort(abort_reason);
   if (!GenerateCommitTid(ctx, last_commit_tid)) return false;
 
   // Storage preparation: enforce INSERT/UNIQUE and build final SI lists.
