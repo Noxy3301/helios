@@ -148,7 +148,7 @@ void FoldSecondary(const Write &write, SecondaryOps &ops) {
     SecondaryOpKey op_key{write.table_name, write.index_name, write.index_type,
                           write.key, write.secondary_primary_key};
     auto it = ops.find(op_key);
-    if (it == ops.end() || it->second.tid < write.transaction_id) {
+    if (it == ops.end() || !(write.transaction_id < it->second.tid)) {
       ops[op_key] = {write.transaction_id, op};
     }
   }

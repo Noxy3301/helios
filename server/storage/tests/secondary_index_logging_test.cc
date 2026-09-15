@@ -207,6 +207,34 @@ TEST_F(SecondaryIndexLoggingTest,
             << " secondary_pk_bytes=" << stats.primary_keys_bytes << std::endl;
 }
 
+TEST_F(SecondaryIndexLoggingTest, RecoveryKeepsLastSecondaryDeltaWithSameTid) {
+  ASSERT_TRUE(db_->CreateSecondaryIndex(
+      "users", "idx", helios::storage::IndexConstraint::kNone));
+  ASSERT_TRUE(TestHelper::CommitWrites(
+      *db_, {{"users", "a", "value_a"}, {"users", "b", "value_b"}},
+      {{"users", "idx", "keep", "a", false},
+       {"users", "idx", "drop", "b", false}}));
+
+  // Changes to the same secondary entry in one commit share a TID.
+  ASSERT_TRUE(TestHelper::CommitWrites(
+      *db_, {},
+      {{"users", "idx", "drop", "a", false},
+       {"users", "idx", "drop", "a", true},
+       {"users", "idx", "keep", "a", true},
+       {"users", "idx", "keep", "a", false}}));
+  EXPECT_EQ(std::vector<std::string>({"b"}),
+            TestHelper::ReadIndex(*db_, "users", "idx", "drop"));
+  EXPECT_EQ(std::vector<std::string>({"a"}),
+            TestHelper::ReadIndex(*db_, "users", "idx", "keep"));
+
+  db_.reset();
+  db_ = std::make_unique<helios::storage::Database>(config_);
+  EXPECT_EQ(std::vector<std::string>({"b"}),
+            TestHelper::ReadIndex(*db_, "users", "idx", "drop"));
+  EXPECT_EQ(std::vector<std::string>({"a"}),
+            TestHelper::ReadIndex(*db_, "users", "idx", "keep"));
+}
+
 TEST_F(SecondaryIndexLoggingTest, RecoveryWithSecondaryIndexWithoutCheckpoint) {
   helios::storage::Config config = db_->GetConfig();
   config.enable_recovery = true;
