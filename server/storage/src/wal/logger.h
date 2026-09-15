@@ -68,26 +68,25 @@ class Logger {
     RecoveryStatus status{RecoveryStatus::kOk};
     // Durable through the log's last frame and the checkpoint's end epoch.
     EpochNumber durable_epoch{0};
-    WriteSet recovery_set;
+    LogEntries recovery_entries;
   };
 
   explicit Logger(const Config &config, WalIo io = WalIo::Posix());
   ~Logger();
 
   /**
-   * @brief Buffers one committed transaction's write set.
-   * @return Whether anything was buffered: a transaction whose write set
-   * produces no write has nothing to make durable, and the commit
-   * path must not wait for it.
+   * @brief Buffers one committed transaction's log entries.
+   * @return Whether anything was buffered: entries that produce no logged
+   * writes have nothing to make durable, and the commit path must not wait.
    */
-  bool Enqueue(const WriteSet &ws, EpochNumber epoch);
+  bool Enqueue(const LogEntries &log_entries, EpochNumber epoch);
 
   /**
    * @brief Scans the log and zeroes the tail at its first invalid frame.
    * @details On success it sets the durable epoch from the log and any
-   * published checkpoint, and returns it together with the folded write set,
+   * published checkpoint, and returns it together with the folded log entries,
    * the checkpoint first when one was loaded, then the log. On kFailed,
-   * durable_epoch is 0 and recovery_set is empty.
+   * durable_epoch is 0 and recovery_entries is empty.
    * @note Runs before the worker starts and before the database accepts
    * work.
    */

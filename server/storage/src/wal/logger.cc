@@ -19,7 +19,7 @@
 /**
  * @file server/storage/src/wal/logger.cc
  * The write-ahead log and the durable epoch a synchronous commit waits on.
- * Folds the checkpoint and the log tail into the write set recovery replays.
+ * Folds the checkpoint and the log tail into the entries recovery replays.
  */
 
 #include "wal/logger.h"
@@ -122,7 +122,7 @@ struct PrimaryKeyHash {
 
 using SecondaryOps =
     std::unordered_map<SecondaryOpKey, SecondaryOpState, SecondaryOpKeyHash>;
-// (table_name, key) -> position in the recovery set. Only the primary path
+// (table_name, key) -> position in the recovery entries. Only the primary path
 // uses it; a primary write always carries an empty index_name.
 using PrimaryPos = std::unordered_map<std::pair<std::string, std::string>,
                                       size_t, PrimaryKeyHash>;
@@ -155,13 +155,13 @@ void FoldSecondary(const Write &write, SecondaryOps &ops) {
 }
 
 // Keep the newest version per row. Folded through a position map rather than
-// a rescan of the set: the fold runs once per logged write, and a linear
+// a rescan of the entries: the fold runs once per logged write, and a linear
 // rescan makes recovery quadratic in the log size.
-void FoldPrimary(const Write &write, WriteSet &recovery_set,
+void FoldPrimary(const Write &write, LogEntries &recovery_entries,
                  PrimaryPos &positions) {
   const auto it = positions.find({write.table_name, write.key});
   if (it != positions.end()) {
-    auto &item = recovery_set[it->second];
+    auto &item = recovery_entries[it->second];
     if (item.tid < write.transaction_id) {
       item.value = write.buffer;
       item.tid = write.transaction_id;
@@ -173,7 +173,7 @@ void FoldPrimary(const Write &write, WriteSet &recovery_set,
   }
 
   positions.emplace(std::make_pair(write.table_name, write.key),
-                    recovery_set.size());
+                    recovery_entries.size());
   LogEntry entry = {
       write.key,
       reinterpret_cast<const std::byte *>(write.buffer.data()),
@@ -184,12 +184,12 @@ void FoldPrimary(const Write &write, WriteSet &recovery_set,
       write.transaction_id,
       static_cast<IndexConstraint>(write.index_type),
   };
-  recovery_set.emplace_back(std::move(entry));
+  recovery_entries.emplace_back(std::move(entry));
 }
 
 // Regroup the surviving adds into one entry per secondary key, so a key
 // deleted after being added does not come back.
-void GroupSecondary(const SecondaryOps &ops, WriteSet &recovery_set) {
+void GroupSecondary(const SecondaryOps &ops, LogEntries &recovery_entries) {
   std::unordered_map<SecondaryGroupKey, SecondaryGroupValue,
                      SecondaryGroupKeyHash>
       grouped;
@@ -217,13 +217,12 @@ void GroupSecondary(const SecondaryOps &ops, WriteSet &recovery_set) {
                           entry.max_tid,
                           static_cast<IndexConstraint>(group_key.index_type)};
     log_entry.primary_keys = std::move(entry.primary_keys);
-    recovery_set.emplace_back(std::move(log_entry));
+    recovery_entries.emplace_back(std::move(log_entry));
   }
 }
 
 /**
- * @brief Folds the records read from the log into the write set the
- *        database replays.
+ * @brief Folds log records into the entries the database replays.
  *
  * A key may appear in several epochs; the newest transaction id wins. Secondary
  * index entries arrive as per-primary-key deltas and are regrouped into one
@@ -232,11 +231,11 @@ void GroupSecondary(const SecondaryOps &ops, WriteSet &recovery_set) {
  * The checkpoint is folded in ahead of the log's tail as ordinary
  * records, under the same rule that resolves two epochs of the log.
  */
-WriteSet BuildRecoverySet(const LogRecords &checkpoint,
-                          const LogRecords &tail) {
+LogEntries BuildRecoveryEntries(const LogRecords &checkpoint,
+                                const LogRecords &tail) {
   SecondaryOps secondary_latest;
   PrimaryPos primary_position;
-  WriteSet recovery_set;
+  LogEntries recovery_entries;
 
   const LogRecords *sources[] = {&checkpoint, &tail};
   for (const auto *source : sources) {
@@ -245,14 +244,14 @@ WriteSet BuildRecoverySet(const LogRecords &checkpoint,
         if (IsSecondary(write)) {
           FoldSecondary(write, secondary_latest);
         } else {
-          FoldPrimary(write, recovery_set, primary_position);
+          FoldPrimary(write, recovery_entries, primary_position);
         }
       }
     }
   }
 
-  GroupSecondary(secondary_latest, recovery_set);
-  return recovery_set;
+  GroupSecondary(secondary_latest, recovery_entries);
+  return recovery_entries;
 }
 
 }  // namespace
@@ -266,12 +265,12 @@ Logger::Logger(const Config &config, WalIo io)
 
 Logger::~Logger() { Stop(); }
 
-bool Logger::Enqueue(const WriteSet &ws, EpochNumber epoch) {
+bool Logger::Enqueue(const LogEntries &log_entries, EpochNumber epoch) {
   // Build the record before taking this producer's buffer lock.
   LogRecord log_record;
   log_record.epoch = epoch;
 
-  for (auto &entry : ws) {
+  for (auto &entry : log_entries) {
     if (entry.index_name.empty()) {
       LogRecord::Write write;
       write.key = entry.key;
@@ -301,9 +300,9 @@ bool Logger::Enqueue(const WriteSet &ws, EpochNumber epoch) {
     }
   }
 
-  // Decided after building the record, not from the input write set: a write
-  // set of secondary entries that carry no delta produces nothing to persist,
-  // and the commit path must not wait for a record that was never buffered.
+  // Decided after building the record: secondary log entries without deltas
+  // produce nothing to persist, and the commit path must not wait for a record
+  // that was never buffered.
   if (log_record.writes.empty()) return false;
 
   // Append to this thread's buffer; the worker collects it later.
@@ -359,7 +358,7 @@ Logger::RecoveryResult Logger::Recover() {
     result.durable_epoch = std::max(wal.last_epoch, checkpoint.end_epoch);
   }
   durable_epoch_.store(result.durable_epoch, std::memory_order_seq_cst);
-  result.recovery_set = BuildRecoverySet(checkpoint.records, wal.records);
+  result.recovery_entries = BuildRecoveryEntries(checkpoint.records, wal.records);
   return result;
 }
 

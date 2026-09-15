@@ -19,8 +19,7 @@
 
 /**
  * @file server/storage/src/wal/log_entry.h
- * One entry of the write set a commit hands to the log: the row it wrote,
- * and what it does to the secondary indexes.
+ * The row values and secondary-index changes passed to the logger or replayed.
  */
 
 #ifndef HELIOS_STORAGE_SRC_WAL_LOG_ENTRY_H
@@ -47,12 +46,12 @@ enum class SecondaryIndexOp : uint8_t {
 };
 
 /**
- * @brief One entry of a write set: the row this transaction wrote, and the
- *        index it belongs to.
+ * @brief A row value or secondary-index changes to log or replay.
  *
  * @details An empty `index_name` marks a primary row; otherwise the entry
- * belongs to that secondary index and `secondary_index_deltas` says what it
- * does to it. The value and primary-key list are owned. `item` is the live
+ * belongs to that secondary index. Commit logs use `secondary_index_deltas`;
+ * recovery entries use the final `primary_keys` list. Values and lists are owned.
+ * `item` is the live
  * slot the commit path resolved, borrowed until it publishes its TIDs, and null
  * on the recovery path, which has no slots yet.
  */
@@ -105,7 +104,8 @@ struct LogEntry {
   }
 };
 
-using WriteSet = std::vector<LogEntry>;
+/** @brief Log entries passed to the logger or returned for recovery. */
+using LogEntries = std::vector<LogEntry>;
 
 }  // namespace wal
 }  // namespace helios::storage

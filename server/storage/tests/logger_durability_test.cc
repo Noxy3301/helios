@@ -30,7 +30,7 @@ using helios::storage::EpochNumber;
 using helios::storage::wal::LogEntry;
 using helios::storage::wal::Logger;
 using helios::storage::wal::WalIo;
-using helios::storage::wal::WriteSet;
+using helios::storage::wal::LogEntries;
 
 constexpr auto kTestTimeout = std::chrono::seconds(5);
 
@@ -58,19 +58,19 @@ class LoggerDurabilityTest : public ::testing::Test {
     std::filesystem::remove_all(root_, ec);
   }
 
-  static WriteSet MakePrimaryWriteSet(const std::string &key) {
+  static LogEntries MakePrimaryLogEntries(const std::string &key) {
     LogEntry entry(key, nullptr, 0, nullptr, "t", "");
-    WriteSet write_set;
-    write_set.emplace_back(std::move(entry));
-    return write_set;
+    LogEntries log_entries;
+    log_entries.emplace_back(std::move(entry));
+    return log_entries;
   }
 
-  // A write set of secondary entries with no delta persists nothing.
-  static WriteSet MakeEmptySecondaryWriteSet(const std::string &key) {
+  // Secondary log entries with no delta persist nothing.
+  static LogEntries MakeEmptySecondaryLogEntries(const std::string &key) {
     LogEntry entry(key, nullptr, 0, nullptr, "t", "idx");
-    WriteSet write_set;
-    write_set.emplace_back(std::move(entry));
-    return write_set;
+    LogEntries log_entries;
+    log_entries.emplace_back(std::move(entry));
+    return log_entries;
   }
 
   std::string root_;
@@ -79,9 +79,9 @@ class LoggerDurabilityTest : public ::testing::Test {
 
 TEST_F(LoggerDurabilityTest, EnqueueReportsOnlyWhatItPersists) {
   Logger logger(config_);
-  EXPECT_TRUE(logger.Enqueue(MakePrimaryWriteSet("alice"), 5));
-  EXPECT_FALSE(logger.Enqueue(WriteSet{}, 5));
-  EXPECT_FALSE(logger.Enqueue(MakeEmptySecondaryWriteSet("bob"), 5));
+  EXPECT_TRUE(logger.Enqueue(MakePrimaryLogEntries("alice"), 5));
+  EXPECT_FALSE(logger.Enqueue(LogEntries{}, 5));
+  EXPECT_FALSE(logger.Enqueue(MakeEmptySecondaryLogEntries("bob"), 5));
 }
 
 TEST_F(LoggerDurabilityTest, AlreadyDurableReturnsImmediately) {
@@ -89,7 +89,7 @@ TEST_F(LoggerDurabilityTest, AlreadyDurableReturnsImmediately) {
   ASSERT_EQ(logger.Recover().status, Logger::RecoveryStatus::kOk);
   logger.Start();
 
-  ASSERT_TRUE(logger.Enqueue(MakePrimaryWriteSet("alice"), 5));
+  ASSERT_TRUE(logger.Enqueue(MakePrimaryLogEntries("alice"), 5));
   logger.RequestFlush(5);
 
   EXPECT_EQ(logger.WaitUntilDurable(5, Logger::Deadline::max()),
@@ -106,8 +106,8 @@ TEST_F(LoggerDurabilityTest, WaitersWakeAtEpochGranularity) {
   ASSERT_EQ(logger.Recover().status, Logger::RecoveryStatus::kOk);
   logger.Start();
 
-  ASSERT_TRUE(logger.Enqueue(MakePrimaryWriteSet("alice"), 5));
-  ASSERT_TRUE(logger.Enqueue(MakePrimaryWriteSet("bob"), 7));
+  ASSERT_TRUE(logger.Enqueue(MakePrimaryLogEntries("alice"), 5));
+  ASSERT_TRUE(logger.Enqueue(MakePrimaryLogEntries("bob"), 7));
 
   auto spawn_waiter = [&logger](EpochNumber epoch) {
     return std::async(std::launch::async, [&logger, epoch] {
@@ -180,7 +180,7 @@ TEST_F(LoggerDurabilityTest, SyncAcknowledgementFollowsTheFdatasync) {
   ASSERT_EQ(logger.Recover().status, Logger::RecoveryStatus::kOk);
   logger.Start();
 
-  ASSERT_TRUE(logger.Enqueue(MakePrimaryWriteSet("alice"), 3));
+  ASSERT_TRUE(logger.Enqueue(MakePrimaryLogEntries("alice"), 3));
   committer = std::async(std::launch::async, [&logger, &committer_started] {
     committer_started.store(true);
     logger.AwaitCommitDurability(3, true);
@@ -262,7 +262,7 @@ TEST_F(LoggerDurabilityTest, ArmedFailStopEndsTheProcessOnFdatasyncFailure) {
         if (logger.Recover().status != Logger::RecoveryStatus::kOk) return;
         logger.SetFailStop();
         logger.Start();
-        if (!logger.Enqueue(MakePrimaryWriteSet("alice"), 3)) return;
+        if (!logger.Enqueue(MakePrimaryLogEntries("alice"), 3)) return;
         logger.RequestFlush(3);
         std::this_thread::sleep_for(kTestTimeout);
       },
@@ -274,8 +274,8 @@ TEST_F(LoggerDurabilityTest, RecordsAboveTheTargetAreCarriedForward) {
     Logger logger(config_);
     ASSERT_EQ(logger.Recover().status, Logger::RecoveryStatus::kOk);
     logger.Start();
-    ASSERT_TRUE(logger.Enqueue(MakePrimaryWriteSet("alice"), 4));
-    ASSERT_TRUE(logger.Enqueue(MakePrimaryWriteSet("bob"), 9));
+    ASSERT_TRUE(logger.Enqueue(MakePrimaryLogEntries("alice"), 4));
+    ASSERT_TRUE(logger.Enqueue(MakePrimaryLogEntries("bob"), 9));
     logger.RequestFlush(4);
     ASSERT_EQ(logger.WaitUntilDurable(4, Logger::Deadline::max()),
               Logger::WaitResult::kDurable);
@@ -334,7 +334,7 @@ TEST_F(LoggerDurabilityTest,
   ASSERT_EQ(logger.Recover().status, Logger::RecoveryStatus::kOk);
   logger.Start();
 
-  ASSERT_TRUE(logger.Enqueue(MakePrimaryWriteSet("alice"), 3));
+  ASSERT_TRUE(logger.Enqueue(MakePrimaryLogEntries("alice"), 3));
   auto waiting = std::async(std::launch::async, [&logger] {
     return logger.WaitUntilDurable(3, Logger::Deadline::max());
   });
@@ -365,7 +365,7 @@ TEST_F(LoggerDurabilityTest, WriteFailureFailsWaiters) {
   ASSERT_EQ(logger.Recover().status, Logger::RecoveryStatus::kOk);
   logger.Start();
 
-  ASSERT_TRUE(logger.Enqueue(MakePrimaryWriteSet("alice"), 3));
+  ASSERT_TRUE(logger.Enqueue(MakePrimaryLogEntries("alice"), 3));
   logger.RequestFlush(3);
   EXPECT_EQ(logger.WaitUntilDurable(3, Logger::Deadline::max()),
             Logger::WaitResult::kFailed);
@@ -390,7 +390,7 @@ TEST_F(LoggerDurabilityTest, StopDrainsWhatWasAlreadyClosed) {
     Logger logger(config_);
     ASSERT_EQ(logger.Recover().status, Logger::RecoveryStatus::kOk);
     logger.Start();
-    ASSERT_TRUE(logger.Enqueue(MakePrimaryWriteSet("alice"), 6));
+    ASSERT_TRUE(logger.Enqueue(MakePrimaryLogEntries("alice"), 6));
     logger.RequestFlush(6);
     // Stop without waiting: the drain must still write epoch 6.
     logger.Stop();
@@ -410,7 +410,7 @@ TEST_F(LoggerDurabilityTest, RecoverReportsTheDurableEpochOfAnExistingLog) {
     Logger logger(config_);
     ASSERT_EQ(logger.Recover().status, Logger::RecoveryStatus::kOk);
     logger.Start();
-    ASSERT_TRUE(logger.Enqueue(MakePrimaryWriteSet("alice"), 8));
+    ASSERT_TRUE(logger.Enqueue(MakePrimaryLogEntries("alice"), 8));
     logger.RequestFlush(8);
     ASSERT_EQ(logger.WaitUntilDurable(8, Logger::Deadline::max()),
               Logger::WaitResult::kDurable);
@@ -422,8 +422,8 @@ TEST_F(LoggerDurabilityTest, RecoverReportsTheDurableEpochOfAnExistingLog) {
   ASSERT_EQ(recovered.status, Logger::RecoveryStatus::kOk);
   EXPECT_EQ(recovered.durable_epoch, 8u);
   EXPECT_EQ(reopened.GetDurableEpoch(), 8u);
-  ASSERT_EQ(recovered.recovery_set.size(), 1u);
-  EXPECT_EQ(recovered.recovery_set[0].key, "alice");
+  ASSERT_EQ(recovered.recovery_entries.size(), 1u);
+  EXPECT_EQ(recovered.recovery_entries[0].key, "alice");
 }
 
 }  // namespace

@@ -272,10 +272,10 @@ bool GenerateCommitTid(CommitCtx &ctx, const Tidword &last_commit_tid) {
 }
 
 // Queue the log and report whether this commit must wait for durability.
-bool EnqueueLogSet(wal::Logger &logger, wal::WriteSet &log_set,
-                   EpochNumber commit_epoch, CommitDurability durability) {
-  if (log_set.empty()) return false;
-  return logger.Enqueue(log_set, commit_epoch) &&
+bool EnqueueLogEntries(wal::Logger &logger, wal::LogEntries &log_entries,
+                      EpochNumber commit_epoch, CommitDurability durability) {
+  if (log_entries.empty()) return false;
+  return logger.Enqueue(log_entries, commit_epoch) &&
          durability == CommitDurability::kSync;
 }
 
@@ -339,8 +339,8 @@ bool Commit(TableDictionary &tables, std::shared_mutex &schema_mutex,
   }
 
   // Phase 3: install each record, copy its log, then publish and unlock it.
-  wal::WriteSet log_set;
-  log_set.reserve(ctx.write_set.size());
+  wal::LogEntries log_entries;
+  log_entries.reserve(ctx.write_set.size());
   last_commit_tid = ctx.commit_tid;
   bool row_applied = false;
   for (auto &[item, entry] : ctx.write_set) {
@@ -350,12 +350,12 @@ bool Commit(TableDictionary &tables, std::shared_mutex &schema_mutex,
       HELIOS_DEBUG_SYNC("silo_commit.between_row_installs");
     entry.Apply(*item);
     // Once unlocked, another writer may replace this record immediately.
-    log_set.emplace_back(entry.BuildLog(*item, ctx.commit_tid));
+    log_entries.emplace_back(entry.BuildLog(*item, ctx.commit_tid));
     entry.Publish(*item, ctx.commit_tid, reaper);
     row_applied = row_applied || entry.IsRow();
   }
   const bool awaits_durability =
-      EnqueueLogSet(logger, log_set, ctx.commit_epoch, durability);
+      EnqueueLogEntries(logger, log_entries, ctx.commit_epoch, durability);
 
   HELIOS_DEBUG_SYNC("silo_commit.before_offline");
   epoch_framework.Leave();

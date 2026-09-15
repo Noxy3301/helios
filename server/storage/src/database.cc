@@ -291,7 +291,7 @@ void Database::Recover() {
   epoch_framework_.Join();
   epoch_framework_.SetThreadEpoch(durable_epoch);
 
-  for (auto &entry : recovered.recovery_set) {
+  for (auto &entry : recovered.recovery_entries) {
     // A delete is logged with absent set and must not be re-inserted; a
     // secondary entry survives the fold only with inserts.
     if (entry.tid.absent) continue;
