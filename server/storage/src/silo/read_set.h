@@ -6,7 +6,6 @@
 #ifndef HELIOS_STORAGE_SRC_SILO_READ_SET_H
 #define HELIOS_STORAGE_SRC_SILO_READ_SET_H
 
-#include <string>
 #include <vector>
 
 #include "lineairdb/commit.h"
@@ -27,6 +26,15 @@ class WriteSet;
  */
 class ReadSet {
  public:
+  /** @brief The outcome of validating the submitted read observations. */
+  enum class Status {
+    kValid,
+    kTableMissing,
+    kPointChanged,
+    kPrimaryRangeChanged,
+    kSecondaryRangeChanged,
+  };
+
   /** @brief Borrows the observations supplied by the caller. */
   ReadSet(const std::vector<ExternalReadEntry> &point_reads,
           const std::vector<ExternalRangeReadEntry> &range_reads)
@@ -34,9 +42,9 @@ class ReadSet {
 
   /**
    * @brief Checks that every range has its required exclusive end bound.
-   * @return false with reason set if a bound is missing.
+   * @return false if a bound is missing; the caller chooses the abort reason.
    */
-  bool CheckRangeBounds(std::string &reason) const;
+  bool CheckRangeBounds() const;
 
   /**
    * @brief Checks every point TID and replays ranges to compare their results.
@@ -46,12 +54,11 @@ class ReadSet {
    * epoch.
    * @param[in,out] max_tid Raised to the largest version observed by
    * validation.
-   * @param[out] reason The failed check's label, when validation returns false.
-   * @return true if all observations validate. On false, the caller handles
-   * abort.
+   * @return kValid or the first validation failure. The caller chooses the
+   * abort reason and handles abort.
    */
-  bool Validate(TableDictionary &tables, const WriteSet &write_set,
-                Tidword &max_tid, std::string &reason) const;
+  Status Validate(TableDictionary &tables, const WriteSet &write_set,
+                  Tidword &max_tid) const;
 
  private:
   const std::vector<ExternalReadEntry> &point_reads_;

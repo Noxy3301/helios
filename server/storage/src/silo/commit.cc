@@ -129,7 +129,8 @@ bool CommitExecutor::Commit(const CommitPayload &payload,
       payload.writes.begin(), payload.writes.end(),
       [](const Write &entry) { return entry.op == RowOp::kInsert; });
 
-  if (!ctx.read_set.CheckRangeBounds(abort_reason)) return ctx.Abort(abort_reason);
+  if (!ctx.read_set.CheckRangeBounds())
+    return ctx.Abort("range_end_key_missing");
 
   if (!ResolveWrites(ctx, schema_mutex_)) return false;
 
@@ -152,9 +153,20 @@ bool CommitExecutor::Commit(const CommitPayload &payload,
   ctx.commit_epoch = epoch_framework_.Join();
 
   // Phase 2: validate read observations and assign the commit TID.
-  if (!ctx.read_set.Validate(tables_, ctx.write_set, ctx.max_read_tid,
-                             abort_reason))
-    return ctx.Abort(abort_reason);
+  const auto validation_result =
+      ctx.read_set.Validate(tables_, ctx.write_set, ctx.max_read_tid);
+  switch (validation_result) {
+    case ReadSet::Status::kValid:
+      break;
+    case ReadSet::Status::kTableMissing:
+      return ctx.Abort("read_table_missing");
+    case ReadSet::Status::kPointChanged:
+      return ctx.Abort("exact_read_tid_moved");
+    case ReadSet::Status::kPrimaryRangeChanged:
+      return ctx.Abort("primary_range_result_changed");
+    case ReadSet::Status::kSecondaryRangeChanged:
+      return ctx.Abort("secondary_range_result_changed");
+  }
   if (!GenerateCommitTid(ctx, last_commit_tid)) return false;
 
   // Storage preparation: enforce INSERT/UNIQUE and build final SI lists.

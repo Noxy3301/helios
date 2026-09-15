@@ -6,6 +6,7 @@
 #include "silo/read_set.h"
 
 #include <algorithm>
+#include <string>
 #include <string_view>
 
 #include "index/data_item.h"
@@ -16,27 +17,6 @@
 
 namespace helios::storage::silo {
 namespace {
-
-std::string KeyHex(const std::string &key) {
-  static constexpr char kHex[] = "0123456789abcdef";
-  std::string out;
-  out.reserve(key.size() * 2);
-  for (unsigned char byte : key) {
-    out.push_back(kHex[byte >> 4]);
-    out.push_back(kHex[byte & 0x0F]);
-  }
-  return out;
-}
-
-std::string FormatReadAbortReason(const char *reason,
-                                  const ExternalReadEntry &read) {
-  std::string out(reason);
-  out += ':';
-  out += read.table_name;
-  out += ":key=";
-  out += KeyHex(read.key);
-  return out;
-}
 
 // Rescan a primary range; stop at the first difference in live keys.
 bool ReplayRange(TableDictionary &tables, const WriteSet &write_set,
@@ -151,25 +131,20 @@ bool ReplayIndexRange(TableDictionary &tables, const WriteSet &write_set,
 
 }  // namespace
 
-bool ReadSet::CheckRangeBounds(std::string &reason) const {
+bool ReadSet::CheckRangeBounds() const {
   for (const auto &range : range_reads_) {
-    if (range.end_key.empty()) {
-      reason = "range_end_key_missing";
-      return false;
-    }
+    if (range.end_key.empty()) return false;
   }
   return true;
 }
 
-bool ReadSet::Validate(TableDictionary &tables, const WriteSet &write_set,
-                       Tidword &max_tid, std::string &reason) const {
+ReadSet::Status ReadSet::Validate(TableDictionary &tables,
+                                  const WriteSet &write_set,
+                                  Tidword &max_tid) const {
   for (const auto &read : point_reads_) {
     auto *table = tables.GetTable(read.table_name);
     if (table == nullptr) {
-      if (read.tid != 0) {
-        reason = "read_table_missing";
-        return false;
-      }
+      if (read.tid != 0) return Status::kTableMissing;
       continue;
     }
     const Tidword observed(read.tid);
@@ -181,8 +156,7 @@ bool ReadSet::Validate(TableDictionary &tables, const WriteSet &write_set,
     Tidword expected = observed;
     if (item != nullptr && write_set.OwnsLock(item)) expected.lock = true;
     if (current != expected) {
-      reason = FormatReadAbortReason("exact_read_tid_moved", read);
-      return false;
+      return Status::kPointChanged;
     }
     max_tid = std::max(max_tid, observed);
   }
@@ -191,12 +165,11 @@ bool ReadSet::Validate(TableDictionary &tables, const WriteSet &write_set,
                         ? ReplayRange(tables, write_set, range, max_tid)
                         : ReplayIndexRange(tables, write_set, range, max_tid);
     if (!ok) {
-      reason = range.index_name.empty() ? "primary_range_result_changed"
-                                        : "secondary_range_result_changed";
-      return false;
+      return range.index_name.empty() ? Status::kPrimaryRangeChanged
+                                      : Status::kSecondaryRangeChanged;
     }
   }
-  return true;
+  return Status::kValid;
 }
 
 }  // namespace helios::storage::silo

@@ -250,6 +250,37 @@ TEST_F(CommitTidTest, WrittenRowsAndIndexesContributeTheirPreviousVersions) {
   EXPECT_EQ(last_tid_, posting->transaction_id.load());
 }
 
+TEST_F(CommitTidTest, MissingRangeEndAbortsBeforeResolvingWrites) {
+  ExternalRangeReadEntry range;
+  range.table_name = kTable;
+  EXPECT_FALSE(Commit({}, {{kTable, "new", "value"}}, {}, {range}));
+  EXPECT_EQ("range_end_key_missing", reason_);
+  EXPECT_EQ(nullptr, tables_.GetTable(kTable)->GetPrimaryIndex().Get("new"));
+  EXPECT_EQ(epoch::Framework::kThreadOffline, epoch_.ThreadEpoch());
+}
+
+TEST_F(CommitTidTest, PointReadFailureUsesFixedReasonForBinaryKey) {
+  const std::string key("a\0\xff", 3);
+  auto *item = SeedRow(key, Version(10, 20));
+  EXPECT_FALSE(Commit({{kTable, key, Version(10, 19).obj}},
+                      {{kTable, key, "next"}}));
+  EXPECT_EQ("exact_read_tid_moved", reason_);
+  EXPECT_EQ(Version(10, 20), item->transaction_id.load());
+  EXPECT_EQ(TestHelper::Row(key), item->CopyValue());
+}
+
+TEST_F(CommitTidTest, SecondaryRangeFailureKeepsItsAbortReason) {
+  ExternalRangeReadEntry range;
+  range.table_name = kTable;
+  range.index_name = "idx";
+  range.end_key = "z";
+  range.result_keys = {"missing"};
+  range.result_primary_keys = {"key"};
+  EXPECT_FALSE(Commit({}, {}, {}, {range}));
+  EXPECT_EQ("secondary_range_result_changed", reason_);
+  EXPECT_EQ(epoch::Framework::kThreadOffline, epoch_.ThreadEpoch());
+}
+
 TEST_F(CommitTidTest, MissingTableReadAcceptsOnlyZeroTid) {
   EXPECT_TRUE(Commit({{"missing", "key", 0}}, {})) << reason_;
   EXPECT_FALSE(Commit({{"missing", "key", Tidword::Absent().obj}}, {}));
@@ -265,7 +296,7 @@ TEST_F(CommitTidTest, MissingTableReadAcceptsOnlyZeroTid) {
 TEST_F(CommitTidTest, MissingTableReadAbortsAfterTableCreation) {
   ASSERT_TRUE(tables_.CreateTable("created"));
   EXPECT_FALSE(Commit({{"created", "key", 0}}, {}));
-  EXPECT_EQ(reason_, "exact_read_tid_moved:created:key=6b6579");
+  EXPECT_EQ(reason_, "exact_read_tid_moved");
 }
 
 TEST_F(CommitTidTest, DuplicateReadsOfTheSameVersionValidate) {
