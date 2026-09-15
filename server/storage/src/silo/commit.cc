@@ -14,6 +14,7 @@
 #include "index/data_item.h"
 #include "index/masstree_index.h"
 #include "index/secondary_index.h"
+#include "pax/version_store.h"
 #include "silo/stable_read.h"
 #include "silo/write_set.h"
 #include "table/table.h"
@@ -47,7 +48,7 @@ struct CommitCtx {
   // Values are still unpublished; release any locks this attempt acquired.
   bool Abort(const std::string &reason) {
     abort_reason = reason;
-    write_set.Unlock();
+    for (auto &[item, entry] : write_set) entry.Unlock(*item);
     epoch.Leave();
     return false;
   }
@@ -309,29 +310,50 @@ bool Commit(TableDictionary &tables, std::shared_mutex &schema_mutex,
   }
 
   // Phase 1: lock the write set, then read the global epoch.
-  if (!ctx.write_set.Lock(ctx.max_write_tid, abort_reason))
-    return ctx.Abort(abort_reason);
+  for (auto &[item, entry] : ctx.write_set) {
+    Tidword observed_tid;
+    if (!entry.Lock(*item, observed_tid, abort_reason))
+      return ctx.Abort(abort_reason);
+    ctx.max_write_tid = std::max(ctx.max_write_tid, observed_tid);
+  }
 
   // Sample the epoch after lock waits so this commit cannot get an older epoch
   // than the writers it waited for. Masstree's RCU protection stays active.
   epoch_framework.Leave();
   ctx.commit_epoch = epoch_framework.Join();
 
-  // Phase 2: validate and assign one TID to the transaction.
+  // Phase 2: validate read observations and assign the commit TID.
   if (!ValidateReads(ctx)) return false;
   if (!ValidateRanges(ctx)) return false;
-  if (!ctx.write_set.Validate(abort_reason)) return ctx.Abort(abort_reason);
-
   if (!GenerateCommitTid(ctx, last_commit_tid)) return false;
 
-  // Reserve all destinations before changing the first stored value.
-  if (!ctx.write_set.AllocateSlots(abort_reason)) return ctx.Abort(abort_reason);
+  // Storage preparation: enforce INSERT/UNIQUE and build final SI lists.
+  // These checks run under write locks, before any stored value is changed.
+  for (auto &[item, entry] : ctx.write_set) {
+    if (!entry.PrepareUpdate(*item, abort_reason)) return ctx.Abort(abort_reason);
+  }
 
-  // Phase 3: write, copy the WAL, and publish the same TID on every record.
+  // Reserve all destinations before changing the first stored value.
+  for (auto &[item, entry] : ctx.write_set) {
+    if (!entry.AllocateSlot(*item, abort_reason)) return ctx.Abort(abort_reason);
+  }
+
+  // Phase 3: install each record, copy its log, then publish and unlock it.
+  wal::WriteSet log_set;
+  log_set.reserve(ctx.write_set.size());
   last_commit_tid = ctx.commit_tid;
-  ctx.write_set.Apply(ctx.commit_epoch);
-  wal::WriteSet log_set = ctx.write_set.BuildLog(ctx.commit_tid);
-  ctx.write_set.Publish(ctx.commit_tid, reaper);
+  bool row_applied = false;
+  for (auto &[item, entry] : ctx.write_set) {
+    // Tag this install's before-image and restore the tag on leaving the loop body.
+    pax::ScopedCommitEpoch scope(ctx.commit_epoch);
+    if (entry.IsRow() && row_applied)
+      HELIOS_DEBUG_SYNC("silo_commit.between_row_installs");
+    entry.Apply(*item);
+    // Once unlocked, another writer may replace this record immediately.
+    log_set.emplace_back(entry.BuildLog(*item, ctx.commit_tid));
+    entry.Publish(*item, ctx.commit_tid, reaper);
+    row_applied = row_applied || entry.IsRow();
+  }
   const bool awaits_durability =
       EnqueueLogSet(logger, log_set, ctx.commit_epoch, durability);
 

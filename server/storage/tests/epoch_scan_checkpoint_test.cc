@@ -560,7 +560,7 @@ TEST_F(EpochScanCheckpointTest, ARowLockedDuringTheScanIsRetried) {
   });
   ReleaseOnExit release_write_on_exit{write_release.write_fd()};
 
-  // The writer holds both rows: one is installed, the other is not.
+  // One row is installed and published; the other remains locked.
   ASSERT_TRUE(WaitReadable(write_arrived.read_fd(), kTestTimeout));
   ASSERT_EQ(::read(write_arrived.read_fd(), &announcement, 1), 1);
   // Releasing the scan here makes it copy bytes the writer is changing, which
@@ -587,8 +587,8 @@ TEST_F(EpochScanCheckpointTest, ARowLockedDuringTheScanIsRetried) {
 
   ASSERT_EQ(scan.wait_for(kTestTimeout), std::future_status::ready);
   EXPECT_TRUE(scan.get());
-  // The writer held both rows for the whole of its park, so a scan that
-  // reported no retry did not read them while they were held.
+  // The scan's old version must be rejected whether the row is already
+  // published or is still locked by the writer.
   EXPECT_GT(version_retries, 0u);
   scan_arrived.CloseWrite();
   ASSERT_EQ(releaser.wait_for(kTestTimeout), std::future_status::ready);
@@ -605,6 +605,81 @@ TEST_F(EpochScanCheckpointTest, ARowLockedDuringTheScanIsRetried) {
                 *value == std::string(64, 'b'))
         << key << " holds " << *value;
   }
+}
+
+TEST_F(EpochScanCheckpointTest, EarlyPublicationKeepsTheOriginalWalValue) {
+  using namespace helios::storage;
+  Pipe arrived;
+  Pipe release;
+  std::string first_key;
+  Tidword first_commit_tid;
+  {
+    Database db(MakeConfig(false));
+    TestHelper::CreateTable(db, kTable);
+    ASSERT_TRUE(CommitWrite(db, "alice", "old"));
+    ASSERT_TRUE(CommitWrite(db, "bob", "old"));
+    const auto rows = db.ScanPax(kTable, "", "\xff", 0, false);
+    db.ReleaseThreadEpoch();
+    ASSERT_TRUE(rows.ok);
+    ASSERT_EQ(2u, rows.rows.size());
+
+    Arm("HELIOS_DEBUG_SYNC_SILO_COMMIT_BETWEEN_ROW_INSTALLS",
+        "arrive_and_wait:" + std::to_string(arrived.write_fd()) + ":" +
+            std::to_string(release.read_fd()));
+    auto writer = std::async(std::launch::async, [&] {
+      std::string reason;
+      const bool ok = db.Commit({}, {{kTable, "alice", TestHelper::Row("batch")},
+                                    {kTable, "bob", TestHelper::Row("batch")}},
+                                {}, {}, CommitDurability::kSync, reason);
+      db.ReleaseThreadEpoch();
+      return ok;
+    });
+    ReleaseOnExit release_writer{release.write_fd()};
+    char announcement;
+    ASSERT_TRUE(WaitReadable(arrived.read_fd(), kTestTimeout));
+    ASSERT_EQ(::read(arrived.read_fd(), &announcement, 1), 1);
+
+    // The map's pointer order is unspecified; locate the published row by its lock.
+    const Tidword left(CurrentTid(rows.rows[0]));
+    const Tidword right(CurrentTid(rows.rows[1]));
+    ASSERT_NE(left.lock, right.lock);
+    const auto &published = left.lock ? rows.rows[1] : rows.rows[0];
+    first_key = published.key;
+    first_commit_tid = Tidword(CurrentTid(published));
+
+    auto overwrite = std::async(std::launch::async, [&] {
+      std::string reason;
+      const bool ok = db.Commit({}, {{kTable, first_key, TestHelper::Row("later")}},
+                                {}, {}, CommitDurability::kAsync, reason);
+      db.ReleaseThreadEpoch();
+      return ok;
+    });
+    ReleaseOnExit release_before_overwrite_join{release.write_fd()};
+    ASSERT_EQ(overwrite.wait_for(kTestTimeout), std::future_status::ready);
+    EXPECT_TRUE(overwrite.get());
+    EXPECT_EQ(Read(db, first_key).value, "later");
+
+    ASSERT_EQ(::write(release.write_fd(), "r", 1), 1);
+    ASSERT_EQ(writer.wait_for(kTestTimeout), std::future_status::ready);
+    EXPECT_TRUE(writer.get());
+  }
+
+  const auto scan = Wal(work_dir_).Scan();
+  ASSERT_EQ(scan.status, WalScanResult::Status::kOk);
+  size_t batch_values = 0;
+  bool found_later = false;
+  for (const auto &record : scan.records) {
+    for (const auto &write : record.writes) {
+      if (write.transaction_id == first_commit_tid) {
+        EXPECT_EQ(write.buffer, TestHelper::Row("batch"));
+        ++batch_values;
+      }
+      if (write.key == first_key && write.buffer == TestHelper::Row("later"))
+        found_later = true;
+    }
+  }
+  EXPECT_EQ(batch_values, 2u);
+  EXPECT_TRUE(found_later);
 }
 
 TEST_F(EpochScanCheckpointTest, ALeftoverWorkingFileIsNotRead) {

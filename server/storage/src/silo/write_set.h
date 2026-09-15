@@ -1,6 +1,6 @@
 /**
  * @file server/storage/src/silo/write_set.h
- * Pending updates and locks, with one entry per record.
+ * Pending record updates, indexed by the record to be written.
  */
 
 #ifndef HELIOS_STORAGE_SRC_SILO_WRITE_SET_H
@@ -25,114 +25,129 @@ namespace helios::storage::silo {
 struct Write;  // Decoded row input defined in silo/commit.h.
 
 /**
- * @brief Pending updates and acquired locks, with one Entry per DataItem.
- *
- * AddRow and AddIndex register updates in the same map. The caller controls
- * the protocol: register, lock, validate, allocate, apply, log, then publish.
- * On failure the caller releases acquired locks with Unlock.
- * Decoded rows are borrowed and must remain valid until the commit returns.
+ * @brief Registers pending updates, with one Entry per DataItem.
+ * @details Entries are visited in pointer order. The caller runs each commit
+ * phase over the entries; the set manages registration and duplicate updates.
+ * Decoded rows are borrowed until the commit call returns.
  */
 class WriteSet {
  public:
   /**
+   * @brief One record's pending update and lock ownership.
+   * @details Each operation acts on the DataItem held as this entry's map key.
+   * The caller determines the order of locking, preparation and publication.
+   */
+  class Entry {
+   public:
+    /**
+     * @brief Locks the record and checks that its index still points to it.
+     * @param[out] observed_tid The version observed when acquiring the lock.
+     * @return false with reason set on detachment; Unlock must still be called.
+     */
+    bool Lock(DataItem &item, Tidword &observed_tid, std::string &reason);
+
+    /** @brief Releases this entry's lock, if it holds one. */
+    void Unlock(DataItem &item);
+
+    /**
+     * @brief Prepares the update, checking INSERT or UNIQUE constraints.
+     * @details Builds the final SI list without changing stored values.
+     * Read-set version validation is handled separately by the caller.
+     * @pre The record is locked.
+     * @return false with reason set if the INSERT or UNIQUE constraint fails.
+     */
+    bool PrepareUpdate(DataItem &item, std::string &reason);
+
+    /**
+     * @brief Allocates the final row's PAX slot; deletes and SI need no slot.
+     * @pre The record is locked.
+     * @return false with reason set if allocation fails.
+     */
+    bool AllocateSlot(DataItem &item, std::string &reason) const;
+
+    /**
+     * @brief Installs the final value while retaining the record's lock.
+     * @details The caller sets the commit epoch scope for row before-images.
+     * @pre Read validation, update preparation and allocation all succeeded.
+     */
+    void Apply(DataItem &item) const;
+
+    /**
+     * @brief Copies the final row or ordered SI changes into one WAL entry.
+     * @pre Apply completed and the record remains locked.
+     */
+    wal::LogEntry BuildLog(DataItem &item, Tidword commit_tid) const;
+
+    /**
+     * @brief Publishes the TID, unlocks, and queues the record if it is empty.
+     * @pre This record is applied and its WAL entry copied; all entries were
+     * prepared and allocated before the first record was applied.
+     */
+    void Publish(DataItem &item, Tidword commit_tid, index::Reaper &reaper);
+
+    /** @brief Reports a row update, including DELETE, rather than an SI change.
+     */
+    bool IsRow() const;
+
+   private:
+    friend class WriteSet;
+
+    /** @brief A final row value and its initial INSERT requirement. */
+    struct RowUpdate {
+      const pax::Row *value;  ///< Borrowed decoded row; unused for DELETE.
+      RowOp op;
+      /// The first operation was INSERT and requires an absent committed row.
+      bool check_committed_row;
+    };
+
+    /** @brief Ordered SI changes and the final list prepared by PrepareUpdate. */
+    struct IndexUpdate {
+      IndexConstraint constraint;
+      std::vector<wal::LogEntry::SecondaryIndexDelta> changes;
+      PrimaryKeyList::Ptr primary_keys;
+    };
+
+    Entry(std::string table_name, std::string index_name, std::string key,
+          index::MasstreeIndex &index,
+          std::variant<RowUpdate, IndexUpdate> update);
+
+    std::string table_name_;
+    std::string index_name_;  ///< Empty for a primary-index record.
+    std::string key_;
+    index::MasstreeIndex &index_;
+    bool owns_lock_ = false;
+    /// Holds either the row update or the secondary-index update.
+    std::variant<RowUpdate, IndexUpdate> update_;
+  };
+
+  /**
    * @brief Registers a row update, replacing that record's pending value.
-   * @details If the first operation is INSERT, later updates keep its absence check.
-   * @return false, with reason set, if INSERT follows a pending live row.
+   * @details If the first operation is INSERT, later updates keep its absence
+   * check.
+   * @return false with reason set if INSERT follows a pending live row.
    */
   bool AddRow(index::MasstreeIndex &index, const Write &write,
               std::string &reason);
 
   /**
-   * @brief Registers a primary-key addition or removal for a secondary record.
-   * @details Changes to the same record share one Entry and keep input order.
-   * @return false, with reason set, on repeated additions to a UNIQUE key.
+   * @brief Appends a primary-key addition or removal to a secondary entry.
+   * @return false with reason set on repeated additions to a UNIQUE key.
    */
   bool AddIndex(index::MasstreeIndex &index, IndexConstraint constraint,
                 const ExternalSecondaryIndexEntry &change, std::string &reason);
 
-  /**
-   * @brief Locks each record in pointer order and checks its index mapping.
-   * @param[in,out] max_tid Raised to the largest TID observed under a lock.
-   * @details Acquired locks remain held on failure; the caller must call Unlock.
-   * @return false, with reason set, if a record was detached from its index.
+  /** @brief Returns whether this set's entry currently holds the record's lock.
    */
-  bool Lock(Tidword &max_tid, std::string &reason);
-
-  /** @brief Releases only the locks acquired by this WriteSet. */
-  void Unlock();
-
-  /** @brief Returns whether this WriteSet currently holds the record's lock. */
   bool OwnsLock(DataItem *item) const;
 
-  /**
-   * @brief Checks INSERT and UNIQUE constraints and prepares final SI lists.
-   * @details Stored values remain unchanged.
-   * @pre All records are locked.
-   * @return false, with reason set, if a constraint fails.
-   */
-  bool Validate(std::string &reason);
+  /** @brief Iterates entries in the common pointer order used for locking. */
+  auto begin() { return entries_.begin(); }
+  auto end() { return entries_.end(); }
 
-  /**
-   * @brief Reserves PAX slots for final row values before any values are applied.
-   * @pre All records are locked.
-   * @return false, with reason set, if a required slot cannot be allocated.
-   */
-  bool AllocateSlots(std::string &reason);
-
-  /**
-   * @brief Installs each record's final value while retaining its lock.
-   * @pre Validate and AllocateSlots succeeded; all records remain locked.
-   * @param commit_epoch Epoch used to label captured row before-images.
-   */
-  void Apply(EpochNumber commit_epoch);
-
-  /**
-   * @brief Copies final rows and ordered SI changes into owned WAL entries.
-   * @pre Apply completed and all records remain locked.
-   */
-  wal::WriteSet BuildLog(Tidword commit_tid) const;
-
-  /**
-   * @brief Publishes TIDs, unlocks records and queues empty records for reaping.
-   * @pre Values have been applied and their WAL entries copied.
-   */
-  void Publish(Tidword commit_tid, index::Reaper &reaper);
+  /** @brief Returns the number of distinct records to update. */
+  size_t size() const { return entries_.size(); }
 
  private:
-  /** @brief A row's final value and the INSERT condition retained from input. */
-  struct RowUpdate {
-    const pax::Row *value;  ///< Borrowed decoded row; unused for DELETE.
-    RowOp op;
-    /// The first operation on this record was INSERT and requires an absent row.
-    bool check_committed_row;
-  };
-
-  /**
-   * @brief Ordered changes to one secondary record and its prepared final list.
-   * @details Validate builds the list; Apply installs it; BuildLog copies changes.
-   */
-  struct IndexUpdate {
-    IndexConstraint constraint;
-    // The same ordered changes produce the final list and the recovery log.
-    std::vector<wal::LogEntry::SecondaryIndexDelta> changes;
-    PrimaryKeyList::Ptr primary_keys;  ///< Final list prepared under the lock.
-  };
-
-  /**
-   * @brief One record's index identity, lock ownership and pending update.
-   * @details The DataItem pointer is held as the map key, not duplicated here.
-   */
-  struct Entry {
-    std::string table_name;
-    std::string index_name;  ///< Empty for a primary-index record.
-    std::string key;
-    index::MasstreeIndex *index;
-    bool owns_lock;
-    /// Holds either RowUpdate or IndexUpdate, depending on the record kind.
-    std::variant<RowUpdate, IndexUpdate> update;
-  };
-
-  /** @brief Unique record entries, ordered by pointer for lock acquisition. */
   std::map<DataItem *, Entry> entries_;
 };
 

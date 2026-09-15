@@ -1,6 +1,6 @@
 /**
  * @file server/storage/src/silo/write_set.cc
- * Registration, validation and installation of pending record updates.
+ * Registration of pending updates and operations on individual records.
  */
 
 #include "silo/write_set.h"
@@ -11,9 +11,7 @@
 
 #include "index/masstree_index.h"
 #include "index/reaper.h"
-#include "pax/version_store.h"
 #include "silo/commit.h"
-#include "util/debug_sync.h"
 
 namespace helios::storage::silo {
 
@@ -24,18 +22,26 @@ Tidword PublishedTid(Tidword commit_tid, const DataItem &item) {
 }
 }  // namespace
 
+WriteSet::Entry::Entry(std::string table_name, std::string index_name,
+                       std::string key, index::MasstreeIndex &index,
+                       std::variant<RowUpdate, IndexUpdate> update)
+    : table_name_(std::move(table_name)),
+      index_name_(std::move(index_name)),
+      key_(std::move(key)),
+      index_(index),
+      update_(std::move(update)) {}
+
 bool WriteSet::AddRow(index::MasstreeIndex &index, const Write &write,
                       std::string &reason) {
   DataItem *item = index.GetOrInsert(write.key);
   auto [entry, inserted] = entries_.try_emplace(
-      item,
-      Entry{std::string(write.table_name),
-            {},
-            std::string(write.key),
-            &index,
-            false,
-            RowUpdate{&write.value, write.op, write.op == RowOp::kInsert}});
-  auto &row = std::get<RowUpdate>(entry->second.update);
+      item, Entry{std::string(write.table_name),
+                  {},
+                  std::string(write.key),
+                  index,
+                  Entry::RowUpdate{&write.value, write.op,
+                                   write.op == RowOp::kInsert}});
+  auto &row = std::get<Entry::RowUpdate>(entry->second.update_);
   if (!inserted && write.op == RowOp::kInsert && row.op != RowOp::kDelete) {
     reason = kDuplicatePrimaryKeyAbortReason;
     return false;
@@ -52,10 +58,10 @@ bool WriteSet::AddIndex(index::MasstreeIndex &index, IndexConstraint constraint,
   auto entry =
       entries_
           .try_emplace(item, Entry{change.table_name, change.index_name,
-                                   change.secondary_key, &index, false,
-                                   IndexUpdate{constraint, {}, {}}})
+                                   change.secondary_key, index,
+                                   Entry::IndexUpdate{constraint, {}, {}}})
           .first;
-  auto &update = std::get<IndexUpdate>(entry->second.update);
+  auto &update = std::get<Entry::IndexUpdate>(entry->second.update_);
   if (!change.is_delete && constraint == IndexConstraint::kUnique &&
       std::any_of(update.changes.begin(), update.changes.end(),
                   [](const auto &previous) {
@@ -71,132 +77,116 @@ bool WriteSet::AddIndex(index::MasstreeIndex &index, IndexConstraint constraint,
   return true;
 }
 
-bool WriteSet::Lock(Tidword &max_tid, std::string &reason) {
-  for (auto &[item, entry] : entries_) {
-    for (;;) {
-      Tidword current = item->transaction_id.load();
-      if (current.lock) {
-        _mm_pause();
-        continue;
-      }
-      Tidword locked = current;
-      locked.lock = true;
-      if (item->transaction_id.compare_exchange_weak(current, locked)) {
-        entry.owns_lock = true;
-        max_tid = std::max(max_tid, current);
-        // A purge may detach the record while we wait for its lock.
-        if (entry.index->Get(entry.key) != item) {
-          reason = "write_target_detached";
-          return false;
-        }
-        break;
-      }
-    }
-  }
-  return true;
-}
-
-void WriteSet::Unlock() {
-  for (auto &[item, entry] : entries_) {
-    if (!entry.owns_lock) continue;
-    Tidword tid = item->transaction_id.load();
-    tid.lock = false;
-    item->transaction_id.store(tid);
-    entry.owns_lock = false;
-  }
-}
-
 bool WriteSet::OwnsLock(DataItem *item) const {
   const auto entry = entries_.find(item);
-  return entry != entries_.end() && entry->second.owns_lock;
+  return entry != entries_.end() && entry->second.owns_lock_;
 }
 
-bool WriteSet::Validate(std::string &reason) {
-  for (auto &[item, entry] : entries_) {
-    if (const auto *row = std::get_if<RowUpdate>(&entry.update)) {
-      if (row->check_committed_row && !item->transaction_id.load().absent) {
-        reason = kDuplicatePrimaryKeyAbortReason;
+bool WriteSet::Entry::Lock(DataItem &item, Tidword &observed_tid,
+                           std::string &reason) {
+  for (;;) {
+    Tidword current = item.transaction_id.load();
+    if (current.lock) {
+      _mm_pause();
+      continue;
+    }
+    Tidword locked = current;
+    locked.lock = true;
+    if (item.transaction_id.compare_exchange_weak(current, locked)) {
+      owns_lock_ = true;
+      observed_tid = current;
+      // A purge may detach the record while we wait for its lock.
+      if (index_.Get(key_) != &item) {
+        reason = "write_target_detached";
         return false;
       }
-    } else {
-      auto &index = std::get<IndexUpdate>(entry.update);
-      index.primary_keys = std::atomic_load(&item->primary_keys_);
-      for (const auto &change : index.changes) {
-        if (change.op == wal::SecondaryIndexOp::kDelete) {
-          index.primary_keys =
-              PrimaryKeyList::Delete(index.primary_keys, change.primary_key);
-        } else {
-          if (index.constraint == IndexConstraint::kUnique &&
-              !PrimaryKeyList::View(index.primary_keys).empty()) {
-            reason = std::string(kDuplicateSecondaryKeyAbortPrefix) +
-                     "exists_after_lock";
-            return false;
-          }
-          index.primary_keys =
-              PrimaryKeyList::Insert(index.primary_keys, change.primary_key);
+      return true;
+    }
+  }
+}
+
+void WriteSet::Entry::Unlock(DataItem &item) {
+  if (!owns_lock_) return;
+  Tidword tid = item.transaction_id.load();
+  tid.lock = false;
+  item.transaction_id.store(tid);
+  owns_lock_ = false;
+}
+
+bool WriteSet::Entry::PrepareUpdate(DataItem &item, std::string &reason) {
+  if (const auto *row = std::get_if<RowUpdate>(&update_)) {
+    if (row->check_committed_row && !item.transaction_id.load().absent) {
+      reason = kDuplicatePrimaryKeyAbortReason;
+      return false;
+    }
+  } else {
+    auto &index = std::get<IndexUpdate>(update_);
+    index.primary_keys = std::atomic_load(&item.primary_keys_);
+    for (const auto &change : index.changes) {
+      if (change.op == wal::SecondaryIndexOp::kDelete) {
+        index.primary_keys =
+            PrimaryKeyList::Delete(index.primary_keys, change.primary_key);
+      } else {
+        if (index.constraint == IndexConstraint::kUnique &&
+            !PrimaryKeyList::View(index.primary_keys).empty()) {
+          reason = std::string(kDuplicateSecondaryKeyAbortPrefix) +
+                   "exists_after_lock";
+          return false;
         }
+        index.primary_keys =
+            PrimaryKeyList::Insert(index.primary_keys, change.primary_key);
       }
     }
   }
   return true;
 }
 
-bool WriteSet::AllocateSlots(std::string &reason) {
-  for (const auto &[item, entry] : entries_) {
-    const auto *row = std::get_if<RowUpdate>(&entry.update);
-    if (row && row->op != RowOp::kDelete && !item->AllocateSlot()) {
-      reason = "pax_slots_exhausted";
-      return false;
-    }
+bool WriteSet::Entry::AllocateSlot(DataItem &item, std::string &reason) const {
+  const auto *row = std::get_if<RowUpdate>(&update_);
+  if (row && row->op != RowOp::kDelete && !item.AllocateSlot()) {
+    reason = "pax_slots_exhausted";
+    return false;
   }
   return true;
 }
 
-void WriteSet::Apply(EpochNumber commit_epoch) {
-  // Capture the row's before-image once, before its final value is installed.
-  pax::ScopedCommitEpoch scope(commit_epoch);
-  bool row_applied = false;
-  for (const auto &[item, entry] : entries_) {
-    if (const auto *row = std::get_if<RowUpdate>(&entry.update)) {
-      if (row_applied) HELIOS_DEBUG_SYNC("silo_commit.between_row_installs");
-      if (row->op == RowOp::kDelete)
-        item->Delete();
-      else
-        item->Write(*row->value);
-      row_applied = true;
-    } else {
-      const auto &index = std::get<IndexUpdate>(entry.update);
-      std::atomic_store(&item->primary_keys_, index.primary_keys);
-    }
+void WriteSet::Entry::Apply(DataItem &item) const {
+  if (const auto *row = std::get_if<RowUpdate>(&update_)) {
+    if (row->op == RowOp::kDelete)
+      item.Delete();
+    else
+      item.Write(*row->value);
+  } else {
+    const auto &index = std::get<IndexUpdate>(update_);
+    std::atomic_store(&item.primary_keys_, index.primary_keys);
   }
 }
 
-wal::WriteSet WriteSet::BuildLog(Tidword commit_tid) const {
-  wal::WriteSet log;
-  log.reserve(entries_.size());
-  for (const auto &[item, entry] : entries_) {
-    wal::LogEntry record(entry.key, nullptr, 0, item, entry.table_name,
-                         entry.index_name, PublishedTid(commit_tid, *item));
-    if (std::holds_alternative<RowUpdate>(entry.update)) {
-      record.value = item->CopyValue();
-    } else {
-      const auto &index = std::get<IndexUpdate>(entry.update);
-      record.index_type = index.constraint;
-      // Preserve all changes in order, including repeated primary keys.
-      record.secondary_index_deltas = index.changes;
-    }
-    log.emplace_back(std::move(record));
+wal::LogEntry WriteSet::Entry::BuildLog(DataItem &item,
+                                        Tidword commit_tid) const {
+  wal::LogEntry record(key_, nullptr, 0, &item, table_name_, index_name_,
+                       PublishedTid(commit_tid, item));
+  if (IsRow()) {
+    record.value = item.CopyValue();
+  } else {
+    const auto &index = std::get<IndexUpdate>(update_);
+    record.index_type = index.constraint;
+    // Preserve all changes in order, including repeated primary keys.
+    record.secondary_index_deltas = index.changes;
   }
-  return log;
+  return record;
 }
 
-void WriteSet::Publish(Tidword commit_tid, index::Reaper &reaper) {
-  for (auto &[item, entry] : entries_) {
-    const Tidword tid = PublishedTid(commit_tid, *item);
-    item->transaction_id.store(tid);
-    entry.owns_lock = false;
-    if (tid.absent) reaper.Enqueue(*entry.index, entry.key, *item, tid);
-  }
+void WriteSet::Entry::Publish(DataItem &item, Tidword commit_tid,
+                              index::Reaper &reaper) {
+  const Tidword tid = PublishedTid(commit_tid, item);
+  item.transaction_id.store(tid);
+  owns_lock_ = false;
+  if (tid.absent) reaper.Enqueue(index_, key_, item, tid);
+}
+
+bool WriteSet::Entry::IsRow() const {
+  return std::holds_alternative<RowUpdate>(update_);
 }
 
 }  // namespace helios::storage::silo

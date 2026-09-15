@@ -75,10 +75,11 @@ struct CommitPayload {
  *   - SI ops:      (secondary key, primary key, add | remove)
  *   - range reads: scan bounds plus the returned key list
  *
- * The protocol locks the write set and reads the epoch, validates reads and
- * constraints, then chooses one commit TID (Silo §4.2–4.4). It reserves PAX
- * slots before installing values, copies WAL entries while locked, and
- * publishes the TID to unlock each record. Empty records go to the reaper.
+ * The protocol locks the write set and reads the epoch, validates read
+ * observations, then chooses one commit TID (Silo §4.2–4.4). Write constraints
+ * and PAX slot allocation are completed before applying any values.
+ * Each record is then updated, copied into the WAL, and unlocked by publishing
+ * its TID. Empty records go to the reaper.
  *
  * Point reads are revalidated by key and TID. Ranges are rescanned to compare
  * their returned key lists; the caller also submits consumed rows as point

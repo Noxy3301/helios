@@ -132,6 +132,7 @@ TEST_F(CommitTidTest, FinalRowKeepsTheFirstInsertRequirement) {
   EXPECT_FALSE(Commit({}, {{kTable, "key", "new", RowOp::kInsert},
                           {kTable, "key", "", RowOp::kDelete}}));
   EXPECT_EQ(kDuplicatePrimaryKeyAbortReason, reason_);
+  EXPECT_EQ(Tidword{}, last_tid_);
   EXPECT_EQ(Version(10, 5), item->transaction_id.load());
   EXPECT_EQ(TestHelper::Row("key"), item->CopyValue());
 
