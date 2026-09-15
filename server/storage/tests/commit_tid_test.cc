@@ -3,6 +3,7 @@
  * Transaction-wide TIDs and worker ordering.
  */
 
+#include <algorithm>
 #include <filesystem>
 #include <memory>
 #include <shared_mutex>
@@ -16,6 +17,7 @@
 #include "db_helper.h"
 #include "gtest/gtest.h"
 #include "index/reaper.h"
+#include "pax/version_store.h"
 #include "silo/commit.h"
 #include "silo/stable_read.h"
 #include "table/table_dictionary.h"
@@ -124,6 +126,73 @@ class CommitTidTest : public ::testing::Test {
     return committed;
   }
 };
+
+TEST_F(CommitTidTest, FinalRowKeepsTheFirstInsertRequirement) {
+  auto *item = SeedRow("key", Version(10, 5));
+  EXPECT_FALSE(Commit({}, {{kTable, "key", "new", RowOp::kInsert},
+                          {kTable, "key", "", RowOp::kDelete}}));
+  EXPECT_EQ(kDuplicatePrimaryKeyAbortReason, reason_);
+  EXPECT_EQ(Version(10, 5), item->transaction_id.load());
+  EXPECT_EQ(TestHelper::Row("key"), item->CopyValue());
+
+  ASSERT_TRUE(Commit({}, {{kTable, "key", "", RowOp::kDelete},
+                         {kTable, "key", "final", RowOp::kInsert}}))
+      << reason_;
+  EXPECT_EQ(TestHelper::Row("final"), item->CopyValue());
+}
+
+TEST_F(CommitTidTest, RepeatedRowWritesLogOnlyTheFinalValue) {
+  ASSERT_TRUE(Commit({}, {{kTable, "a", "first"}, {kTable, "b", "second"},
+                         {kTable, "a", "", RowOp::kDelete},
+                         {kTable, "a", "last", RowOp::kInsert}}))
+      << reason_;
+  logger_->RequestFlush(10);
+  logger_.reset();
+  wal::Wal log(config_.work_dir);
+  const auto scan = log.Scan();
+  ASSERT_EQ(wal::WalScanResult::Status::kOk, scan.status);
+  ASSERT_EQ(1u, scan.records.size());
+  ASSERT_EQ(2u, scan.records.front().writes.size());
+  const auto &writes = scan.records.front().writes;
+  for (const auto &key : {"a", "b"}) {
+    const auto write =
+        std::find_if(writes.begin(), writes.end(),
+                     [&](const auto &entry) { return entry.key == key; });
+    ASSERT_NE(writes.end(), write);
+    EXPECT_EQ(TestHelper::Row(std::string(key) == "a" ? "last" : "second"),
+              write->buffer);
+  }
+}
+
+TEST_F(CommitTidTest, RepeatedRowWritesKeepTheBeforeImageFromBeforeTheCommit) {
+  auto *item = SeedRow("key", Version(10, 5));
+  auto &versions = pax::VersionStore::Global();
+  const auto token = versions.BeginCapture();
+  ASSERT_TRUE(token.valid);
+  const bool committed = Commit({}, {{kTable, "key", "intermediate"},
+                                    {kTable, "key", "", RowOp::kDelete},
+                                    {kTable, "key", "final"}});
+  const auto entries = versions.SlotEntries(item->pax_group(), item->pax_slot());
+  versions.EndCapture(token);
+  ASSERT_TRUE(committed) << reason_;
+  ASSERT_EQ(1u, entries.size());
+  EXPECT_TRUE(entries.front().was_visible);
+  EXPECT_EQ(TestHelper::Row("key"), entries.front().old_row);
+  EXPECT_EQ(TestHelper::Row("final"), item->CopyValue());
+}
+
+TEST_F(CommitTidTest, FinalDeleteDoesNotAllocateAnIntermediateRow) {
+  const auto *store = tables_.GetTable(kTable)->GetPaxTable();
+  const auto allocated = pax::SlotsAllocated(store);
+  ASSERT_TRUE(Commit({}, {{kTable, "new", "temporary"},
+                         {kTable, "new", "", RowOp::kDelete}}))
+      << reason_;
+  EXPECT_EQ(allocated, pax::SlotsAllocated(store));
+  auto *item = tables_.GetTable(kTable)->GetPrimaryIndex().Get("new");
+  ASSERT_NE(nullptr, item);
+  EXPECT_TRUE(item->transaction_id.load().absent);
+  EXPECT_FALSE(item->transaction_id.load().lock);
+}
 
 TEST_F(CommitTidTest, OneTidCoversReadsRowsIndexesAndTheWorker) {
   auto *a = SeedRow("a", Version(10, 8));
