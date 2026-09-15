@@ -35,14 +35,6 @@ namespace silo {
 
 namespace {
 
-// A point read and the word it observed, saved for validation.
-struct ReadEntry {
-  Table *table = nullptr;
-  std::string table_name;
-  std::string key;
-  Tidword tid;
-};
-
 // A row write resolved to the primary-index entry it locks.
 struct WriteEntry {
   std::string table_name;
@@ -82,7 +74,8 @@ struct CommitCtx {
   const CommitPayload &payload;
   std::string &abort_reason;
 
-  std::vector<ReadEntry> reads;
+  // Use the caller's observations directly, including repeated reads.
+  const std::vector<ExternalReadEntry> &read_set = payload.reads;
   std::vector<WriteEntry> writes;
   std::vector<SecondaryIndexEntry> si_ops;
   std::vector<DataItem *> items;  // lock set: address-sorted and unique
@@ -123,27 +116,13 @@ struct CommitCtx {
   }
 };
 
-// Save read evidence and find the DataItems to lock for writes.
-bool Resolve(CommitCtx &ctx, std::shared_mutex &schema_mutex) {
+// Find the DataItems to lock for writes.
+bool ResolveWrites(CommitCtx &ctx, std::shared_mutex &schema_mutex) {
   std::unordered_set<std::string> unique_si_adds;
   // Track earlier writes to each key when the request includes an INSERT.
   std::unordered_map<std::string, bool> live_in_request;
 
   std::shared_lock<std::shared_mutex> lk(schema_mutex);
-
-  // Save each read's table, key, and observed word for validation.
-  ctx.reads.reserve(ctx.payload.reads.size());
-  for (const auto &read : ctx.payload.reads) {
-    auto table = ctx.tables.GetTable(read.table_name);
-    if (table == nullptr) {
-      // A read that found the table reports a non-zero word.
-      if (read.tid != 0) return ctx.Abort("read_table_missing");
-      continue;
-    }
-
-    ctx.reads.push_back(
-        {table, read.table_name, read.key, Tidword(read.tid)});
-  }
 
   // Find each row's lock target, creating an absent DataItem for a new key.
   ctx.writes.reserve(ctx.payload.writes.size());
@@ -271,7 +250,8 @@ std::string KeyHex(const std::string &key) {
   return out;
 }
 
-std::string ReadReason(const char *reason, const ReadEntry &read) {
+std::string FormatReadAbortReason(const char *reason,
+                                 const ExternalReadEntry &read) {
   std::string out(reason);
   out += ':';
   out += read.table_name;
@@ -282,18 +262,25 @@ std::string ReadReason(const char *reason, const ReadEntry &read) {
 
 // Check that every record a point read observed still shows the same word.
 bool ValidateReads(CommitCtx &ctx) {
-  for (const auto &read : ctx.reads) {
-    DataItem *item = read.table->GetPrimaryIndex().Get(read.key);
+  for (const auto &read : ctx.read_set) {
+    auto *table = ctx.tables.GetTable(read.table_name);
+    if (table == nullptr) {
+      if (read.tid != 0) return ctx.AbortLocked("read_table_missing");
+      continue;
+    }
+    const Tidword observed(read.tid);
+    DataItem *item = table->GetPrimaryIndex().Get(read.key);
     // A key with no record reads as the absent word.
     const Tidword current =
         item ? item->transaction_id.load() : Tidword::Absent();
     // Only our own lock may differ from the word the read observed.
-    Tidword expected = read.tid;
+    Tidword expected = observed;
     if (item != nullptr && ctx.IsOwnLocked(item)) expected.lock = true;
     if (current != expected) {
-      return ctx.AbortLocked(ReadReason("exact_read_tid_moved", read));
+      return ctx.AbortLocked(
+          FormatReadAbortReason("exact_read_tid_moved", read));
     }
-    ctx.max_read_tid = std::max(ctx.max_read_tid, read.tid);
+    ctx.max_read_tid = std::max(ctx.max_read_tid, observed);
   }
   return true;
 }
@@ -601,7 +588,7 @@ bool Commit(TableDictionary &tables, std::shared_mutex &schema_mutex,
     }
   }
 
-  if (!Resolve(ctx, schema_mutex)) return false;
+  if (!ResolveWrites(ctx, schema_mutex)) return false;
 
   // Test hook outside the schema lock so concurrent DDL can proceed.
   if (ctx.has_insert) {

@@ -179,6 +179,57 @@ TEST_F(CommitTidTest, WrittenRowsAndIndexesContributeTheirPreviousVersions) {
   EXPECT_EQ(last_tid_, posting->transaction_id.load());
 }
 
+TEST_F(CommitTidTest, MissingTableReadAcceptsOnlyZeroTid) {
+  EXPECT_TRUE(Commit({{"missing", "key", 0}}, {})) << reason_;
+  EXPECT_FALSE(Commit({{"missing", "key", Tidword::Absent().obj}}, {}));
+  EXPECT_EQ(reason_, "read_table_missing");
+  auto *item = SeedRow("key", Version(10, 20));
+  EXPECT_FALSE(Commit({{"missing", "key", Tidword::Absent().obj}},
+                      {{kTable, "key", "next"}}));
+  EXPECT_EQ(reason_, "read_table_missing");
+  EXPECT_EQ(Version(10, 20), item->transaction_id.load());
+  EXPECT_EQ(TestHelper::Row("key"), item->CopyValue());
+}
+
+TEST_F(CommitTidTest, MissingTableReadAbortsAfterTableCreation) {
+  ASSERT_TRUE(tables_.CreateTable("created"));
+  EXPECT_FALSE(Commit({{"created", "key", 0}}, {}));
+  EXPECT_EQ(reason_, "exact_read_tid_moved:created:key=6b6579");
+}
+
+TEST_F(CommitTidTest, DuplicateReadsOfTheSameVersionValidate) {
+  const auto tid = Version(10, 20);
+  SeedRow("key", tid);
+  EXPECT_TRUE(Commit({{kTable, "key", tid.obj}, {kTable, "key", tid.obj}}, {}))
+      << reason_;
+}
+
+TEST_F(CommitTidTest, DuplicateReadsValidateThroughOwnWriteLock) {
+  const auto tid = Version(10, 20);
+  auto *item = SeedRow("key", tid);
+  ASSERT_TRUE(Commit({{kTable, "key", tid.obj}, {kTable, "key", tid.obj}},
+                     {{kTable, "key", "next"}}))
+      << reason_;
+  EXPECT_EQ(TestHelper::Row("next"), item->CopyValue());
+  EXPECT_FALSE(item->transaction_id.load().lock);
+}
+
+TEST_F(CommitTidTest, DifferentReadVersionsAbortInEitherInputOrder) {
+  const auto old_tid = Version(10, 19);
+  const auto current_tid = Version(10, 20);
+  auto *item = SeedRow("key", current_tid);
+  for (bool reverse : {false, true}) {
+    const auto first = reverse ? current_tid : old_tid;
+    const auto second = reverse ? old_tid : current_tid;
+    const std::vector<ExternalReadEntry> reads = {
+        {kTable, "key", first.obj}, {kTable, "key", second.obj}};
+    EXPECT_FALSE(Commit(reads, {}));
+    EXPECT_FALSE(Commit(reads, {{kTable, "key", "next"}}));
+    EXPECT_EQ(current_tid, item->transaction_id.load());
+    EXPECT_EQ(TestHelper::Row("key"), item->CopyValue());
+  }
+}
+
 TEST_F(CommitTidTest, ReadOnlyCommitAdvancesWorkerOrdering) {
   SeedRow("high", Version(10, 200));
   ASSERT_TRUE(Commit({{kTable, "high", Version(10, 200).obj}}, {})) << reason_;
