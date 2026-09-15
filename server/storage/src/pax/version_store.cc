@@ -137,11 +137,6 @@ void VersionStore::ClearAllLocked() {
   capture_failed_.store(false, std::memory_order_seq_cst);
 }
 
-uint32_t &CurrentCommitEpoch::Get() {
-  thread_local uint32_t epoch = 0;
-  return epoch;
-}
-
 uint64_t UndoCount(const PaxGroup *group) {
   return VersionStore::Global().GroupCaptureCount(group);
 }

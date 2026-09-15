@@ -63,11 +63,8 @@ class RecoveryTest : public ::testing::Test {
   static bool CommitWrite(helios::storage::Database &db, const std::string &key,
                           const std::string &value) {
     std::string commit_reason;
-    const bool committed =
-        db.Commit({}, {{kTable, key, TestHelper::Row(value)}}, {}, {},
-                  helios::storage::CommitDurability::kSync, commit_reason);
-    db.ReleaseThreadEpoch();
-    return committed;
+    return TestHelper::CommitRows(
+        db, {}, {{kTable, key, TestHelper::Row(value)}}, {}, {}, commit_reason);
   }
 
   static bool CommitWriteWithIndexEntry(helios::storage::Database &db,
@@ -75,12 +72,9 @@ class RecoveryTest : public ::testing::Test {
                                         const std::string &value,
                                         const std::string &secondary_key) {
     std::string commit_reason;
-    const bool committed =
-        db.Commit({}, {{kTable, key, TestHelper::Row(value)}},
-                  {{kTable, kIndex, secondary_key, key}}, {},
-                  helios::storage::CommitDurability::kSync, commit_reason);
-    db.ReleaseThreadEpoch();
-    return committed;
+    return TestHelper::CommitRows(
+        db, {}, {{kTable, key, TestHelper::Row(value)}},
+        {{kTable, kIndex, secondary_key, key}}, {}, commit_reason);
   }
 
   static helios::storage::ReadResult Read(helios::storage::Database &db,

@@ -15,8 +15,8 @@ namespace helios::storage {
 /**
  * @brief Outcome of a single Database::Read.
  *
- * The caller passes the same `tid` back in an ExternalReadEntry so Commit can
- * confirm the record did not move.
+ * The caller passes the same `tid` back to silo::Transaction::Read so the
+ * commit can confirm the record did not move.
  */
 struct ReadResult {
   // True when the table exists and the observed word has its absent bit

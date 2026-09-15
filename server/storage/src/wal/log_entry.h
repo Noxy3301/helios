@@ -19,7 +19,7 @@
 
 /**
  * @file server/storage/src/wal/log_entry.h
- * The row values and secondary-index changes passed to the logger or replayed.
+ * The row values and secondary-index lists that recovery replays.
  */
 
 #ifndef HELIOS_STORAGE_SRC_WAL_LOG_ENTRY_H
@@ -27,13 +27,11 @@
 
 #include <cstdint>
 #include <string>
-#include <string_view>
 #include <vector>
 
 #include "lineairdb/index.h"
 
-#include "index/data_item.h"
-#include "util/epoch.h"
+#include "silo/tidword.h"
 
 namespace helios::storage {
 namespace wal {
@@ -46,65 +44,23 @@ enum class SecondaryIndexOp : uint8_t {
 };
 
 /**
- * @brief A row value or secondary-index changes to log or replay.
+ * @brief One row value or secondary-index entry to replay.
  *
- * @details An empty `index_name` marks a primary row; otherwise the entry
- * belongs to that secondary index. Commit logs use `secondary_index_deltas`;
- * recovery entries use the final `primary_keys` list. Values and lists are owned.
- * `item` is the live
- * slot the commit path resolved, borrowed until it publishes its TIDs, and null
- * on the recovery path, which has no slots yet.
+ * @details An empty `index_name` marks a primary row, whose payload is
+ * `value`; otherwise the entry belongs to that secondary index and carries
+ * the final `primary_keys` list the fold produced. Values and lists are
+ * owned.
  */
 struct LogEntry {
   std::string key;
   std::string value;
   Tidword tid{};
   std::vector<std::string> primary_keys;
-  DataItem *item;
   std::string table_name;
   std::string index_name;
-  IndexConstraint index_type;
-  struct SecondaryIndexDelta {
-    std::string primary_key;
-    SecondaryIndexOp op;
-  };
-  std::vector<SecondaryIndexDelta> secondary_index_deltas;
-
-  LogEntry(const std::string_view key, const std::byte row[], const size_t len,
-           DataItem *const item, std::string_view table_name,
-           std::string_view index_name, const Tidword tid = {},
-           IndexConstraint index_type = IndexConstraint::kNone)
-      : key(key),
-        tid(tid),
-        item(item),
-        table_name(table_name),
-        index_name(index_name),
-        index_type(index_type) {
-    if (row != nullptr) value.assign(reinterpret_cast<const char *>(row), len);
-  }
-  LogEntry(const LogEntry &) = default;
-  LogEntry &operator=(const LogEntry &) = default;
-  // Declaring copy ctor/assign above suppresses implicit move generation;
-  // an emplace_back(std::move(entry)) would otherwise fall back to the
-  // deep copy path.
-  LogEntry(LogEntry &&) = default;
-  LogEntry &operator=(LogEntry &&) = default;
-
-  // A later call for the same primary key replaces op; Insert and Delete do
-  // not compose.
-  void RecordSecondaryDelta(const std::string_view primary_key,
-                            SecondaryIndexOp op) {
-    for (auto &delta : secondary_index_deltas) {
-      if (delta.primary_key == primary_key) {
-        delta.op = op;
-        return;
-      }
-    }
-    secondary_index_deltas.push_back({std::string(primary_key), op});
-  }
+  IndexConstraint index_type = IndexConstraint::kNone;
 };
 
-/** @brief Log entries passed to the logger or returned for recovery. */
 using LogEntries = std::vector<LogEntry>;
 
 }  // namespace wal

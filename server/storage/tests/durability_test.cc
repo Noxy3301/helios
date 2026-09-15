@@ -18,8 +18,8 @@
 
 /**
  * @file server/storage/tests/durability_test.cc
- * Recovery from the log, and the difference the commit acknowledgement
- * makes to when a write is on the device.
+ * Recovery from the log, and the difference the commit durability makes to
+ * when a write is on the device.
  */
 
 #include <chrono>
@@ -151,7 +151,7 @@ TEST_F(DurabilityTest, RecoveryWithNamedTable) {
   ASSERT_EQ(data.value(), value);
 }
 
-// A commit that asked for Async is acknowledged at precommit, so it returns
+// A commit that asked for Async is reported at precommit, so it returns
 // without the epoch it committed in having reached the device. The epoch
 // window is the clock here: an epoch this long cannot close, let alone be
 // flushed, inside the time an Async commit is allowed to take, so a return
@@ -174,9 +174,8 @@ TEST(CommitDurabilityTest, AsyncDoesNotWaitForTheDevice) {
       std::string commit_reason;
       const auto started = std::chrono::steady_clock::now();
       const bool committed =
-          db.Commit({}, {{kTable, key, TestHelper::Row("v")}}, {}, {},
-                    durability, commit_reason);
-      db.ReleaseThreadEpoch();
+          TestHelper::CommitRows(db, {}, {{kTable, key, TestHelper::Row("v")}},
+                                 {}, {}, commit_reason, durability);
       EXPECT_TRUE(committed);
       return std::chrono::duration_cast<std::chrono::milliseconds>(
                  std::chrono::steady_clock::now() - started)

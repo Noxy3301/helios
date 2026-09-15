@@ -165,8 +165,8 @@ TEST_F(SecondaryIndexLoggingTest,
 
   // Preload 9 secondary keys, each with 300 primary keys (16 bytes each).
   {
-    std::vector<helios::storage::ExternalWriteEntry> writes;
-    std::vector<helios::storage::ExternalSecondaryIndexEntry> index_ops;
+    std::vector<TestHelper::RowWrite> writes;
+    std::vector<TestHelper::IndexOp> index_ops;
     for (size_t s = 0; s < secondary_keys; ++s) {
       for (size_t i = 0; i < primary_keys_per_secondary; ++i) {
         const size_t pk_index = s * primary_keys_per_secondary + i;
@@ -181,8 +181,8 @@ TEST_F(SecondaryIndexLoggingTest,
 
   // Trigger a single transaction that updates all 9 secondary keys.
   {
-    std::vector<helios::storage::ExternalWriteEntry> writes;
-    std::vector<helios::storage::ExternalSecondaryIndexEntry> index_ops;
+    std::vector<TestHelper::RowWrite> writes;
+    std::vector<TestHelper::IndexOp> index_ops;
     for (size_t s = 0; s < secondary_keys; ++s) {
       const size_t pk_index = secondary_keys * primary_keys_per_secondary + s;
       const std::string primary_key = MakeFixedPrimaryKey(pk_index);
@@ -254,8 +254,8 @@ TEST_F(SecondaryIndexLoggingTest, RecoveryWithSecondaryIndexWithoutCheckpoint) {
       table_name, index_name, helios::storage::IndexConstraint::kNone));
 
   {
-    std::vector<helios::storage::ExternalWriteEntry> writes;
-    std::vector<helios::storage::ExternalSecondaryIndexEntry> index_ops;
+    std::vector<TestHelper::RowWrite> writes;
+    std::vector<TestHelper::IndexOp> index_ops;
     for (const auto &primary_key : primary_keys) {
       writes.push_back({table_name, primary_key, "value_" + primary_key});
       index_ops.push_back(
@@ -301,8 +301,8 @@ TEST_F(SecondaryIndexLoggingTest, SecondaryIndexAddTimingRecorded) {
 
   // Preload 300 primary keys for the same secondary key.
   {
-    std::vector<helios::storage::ExternalWriteEntry> writes;
-    std::vector<helios::storage::ExternalSecondaryIndexEntry> index_ops;
+    std::vector<TestHelper::RowWrite> writes;
+    std::vector<TestHelper::IndexOp> index_ops;
     for (size_t i = 0; i < initial_primary_keys; ++i) {
       const std::string primary_key = MakeFixedPrimaryKey(i);
       writes.push_back({table_name, primary_key, "val_" + primary_key});
@@ -326,12 +326,11 @@ TEST_F(SecondaryIndexLoggingTest, SecondaryIndexAddTimingRecorded) {
     const auto size_before = GetLogDirectorySize(config);
 
     const auto start = std::chrono::steady_clock::now();
-    const bool committed = db_->Commit(
-        {}, {{table_name, primary_key, TestHelper::Row(value)}},
+    const bool committed = TestHelper::CommitRows(
+        *db_, {}, {{table_name, primary_key, TestHelper::Row(value)}},
         {{table_name, index_name, index_key, primary_key, false}}, {},
-        helios::storage::CommitDurability::kSync, commit_reason);
+        commit_reason);
     const auto end = std::chrono::steady_clock::now();
-    db_->ReleaseThreadEpoch();
     ASSERT_TRUE(committed);
 
     const auto elapsed =

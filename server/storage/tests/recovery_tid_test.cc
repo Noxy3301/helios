@@ -36,10 +36,8 @@ TEST(RecoveryTidTest, ARecoveredKeyAcceptsTheNextWrite) {
     helios::storage::Database db(config);
     TestHelper::CreateTable(db, kTable);
     std::string reason;
-    const bool committed =
-        db.Commit({}, {{kTable, "alice", TestHelper::Row("v1")}}, {}, {},
-                  helios::storage::CommitDurability::kSync, reason);
-    db.ReleaseThreadEpoch();
+    const bool committed = TestHelper::CommitRows(
+        db, {}, {{kTable, "alice", TestHelper::Row("v1")}}, {}, {}, reason);
     ASSERT_TRUE(committed) << reason;
   }
 
@@ -55,10 +53,8 @@ TEST(RecoveryTidTest, ARecoveredKeyAcceptsTheNextWrite) {
         << "the recovered TID still carries the lock bit";
 
     std::string reason;
-    const bool committed =
-        db.Commit({}, {{kTable, "alice", TestHelper::Row("v2")}}, {}, {},
-                  helios::storage::CommitDurability::kSync, reason);
-    db.ReleaseThreadEpoch();
+    const bool committed = TestHelper::CommitRows(
+        db, {}, {{kTable, "alice", TestHelper::Row("v2")}}, {}, {}, reason);
     EXPECT_TRUE(committed) << reason;
   }
 

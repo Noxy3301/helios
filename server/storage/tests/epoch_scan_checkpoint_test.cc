@@ -130,21 +130,16 @@ class EpochScanCheckpointTest : public ::testing::Test {
   static bool CommitWrite(helios::storage::Database &db, const std::string &key,
                           const std::string &value) {
     std::string commit_reason;
-    const bool committed =
-        db.Commit({}, {{kTable, key, TestHelper::Row(value)}}, {}, {},
-                  helios::storage::CommitDurability::kSync, commit_reason);
-    db.ReleaseThreadEpoch();
-    return committed;
+    return TestHelper::CommitRows(
+        db, {}, {{kTable, key, TestHelper::Row(value)}}, {}, {}, commit_reason);
   }
 
   static bool CommitDelete(helios::storage::Database &db,
                            const std::string &key) {
     std::string commit_reason;
-    const bool committed =
-        db.Commit({}, {{kTable, key, "", helios::storage::RowOp::kDelete}}, {},
-                  {}, helios::storage::CommitDurability::kSync, commit_reason);
-    db.ReleaseThreadEpoch();
-    return committed;
+    return TestHelper::CommitRows(
+        db, {}, {{kTable, key, "", helios::storage::RowOp::kDelete}}, {}, {},
+        commit_reason);
   }
 
   static bool CommitIndexedWrite(helios::storage::Database &db,
@@ -152,12 +147,9 @@ class EpochScanCheckpointTest : public ::testing::Test {
                                  const std::string &value,
                                  const std::string &secondary_key) {
     std::string commit_reason;
-    const bool committed =
-        db.Commit({}, {{kTable, key, TestHelper::Row(value)}},
-                  {{kTable, kIndex, secondary_key, key}}, {},
-                  helios::storage::CommitDurability::kSync, commit_reason);
-    db.ReleaseThreadEpoch();
-    return committed;
+    return TestHelper::CommitRows(
+        db, {}, {{kTable, key, TestHelper::Row(value)}},
+        {{kTable, kIndex, secondary_key, key}}, {}, commit_reason);
   }
 
   static helios::storage::ReadResult Read(helios::storage::Database &db,
@@ -550,13 +542,11 @@ TEST_F(EpochScanCheckpointTest, ARowLockedDuringTheScanIsRetried) {
 
   auto writer = std::async(std::launch::async, [&db] {
     std::string commit_reason;
-    const bool committed = db.Commit(
-        {},
+    return TestHelper::CommitRows(
+        db, {},
         {{kTable, "alice", TestHelper::Row(std::string(64, 'b'))},
          {kTable, "bob", TestHelper::Row(std::string(64, 'b'))}},
-        {}, {}, helios::storage::CommitDurability::kSync, commit_reason);
-    db.ReleaseThreadEpoch();
-    return committed;
+        {}, {}, commit_reason);
   });
   ReleaseOnExit release_write_on_exit{write_release.write_fd()};
 
@@ -628,11 +618,11 @@ TEST_F(EpochScanCheckpointTest, EarlyPublicationKeepsTheOriginalWalValue) {
             std::to_string(release.read_fd()));
     auto writer = std::async(std::launch::async, [&] {
       std::string reason;
-      const bool ok = db.Commit({}, {{kTable, "alice", TestHelper::Row("batch")},
-                                    {kTable, "bob", TestHelper::Row("batch")}},
-                                {}, {}, CommitDurability::kSync, reason);
-      db.ReleaseThreadEpoch();
-      return ok;
+      return TestHelper::CommitRows(
+          db, {},
+          {{kTable, "alice", TestHelper::Row("batch")},
+           {kTable, "bob", TestHelper::Row("batch")}},
+          {}, {}, reason);
     });
     ReleaseOnExit release_writer{release.write_fd()};
     char announcement;
@@ -649,10 +639,9 @@ TEST_F(EpochScanCheckpointTest, EarlyPublicationKeepsTheOriginalWalValue) {
 
     auto overwrite = std::async(std::launch::async, [&] {
       std::string reason;
-      const bool ok = db.Commit({}, {{kTable, first_key, TestHelper::Row("later")}},
-                                {}, {}, CommitDurability::kAsync, reason);
-      db.ReleaseThreadEpoch();
-      return ok;
+      return TestHelper::CommitRows(
+          db, {}, {{kTable, first_key, TestHelper::Row("later")}}, {}, {},
+          reason, CommitDurability::kAsync);
     });
     ReleaseOnExit release_before_overwrite_join{release.write_fd()};
     ASSERT_EQ(overwrite.wait_for(kTestTimeout), std::future_status::ready);

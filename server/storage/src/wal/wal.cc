@@ -161,7 +161,7 @@ Wal::Wal(const std::string &work_dir, WalIo io, uint64_t initial_capacity_bytes)
 
   // Open or create, then take the exclusive lock.
   // O_TRUNC is never used: an existing log is the only record of what was
-  // acknowledged as durable. O_APPEND is never used either, and cannot be:
+  // reported durable. O_APPEND is never used either, and cannot be:
   // under it a pwrite ignores the offset it is given and lands at the end
   // of the file.
   fd_ = ::open(path_.c_str(), O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC, 0644);
@@ -714,7 +714,7 @@ WalAppendResult Wal::AppendGroup(
   }
   if (traced) trace.GroupWrite(write_begin, FlushTrace::Now());
   // The records are written but not yet known durable: a Sync commit
-  // waiting on this group must not have been acknowledged when this point
+  // waiting on this group must not have been reported when this point
   // is reached.
   HELIOS_DEBUG_SYNC("wal.before_fdatasync");
 

@@ -18,21 +18,18 @@ std::string DataItem::CopyValue() const {
   return out;
 }
 
-bool DataItem::AllocateSlot() {
+bool DataItem::AllocateSlot(pax::PaxTable &table) {
   if (pax_allocated()) return true;
-  if (location_ == 0) return false;
-  auto *table = reinterpret_cast<pax::PaxTable *>(location_);
-  const auto [group, slot] = table->AllocateSlot();
+  const auto [group, slot] = table.AllocateSlot();
   if (group == nullptr) return false;
-  location_ = reinterpret_cast<uintptr_t>(group) | kAllocated;
+  group_ = group;
   slot_ = slot;
   return true;
 }
 
-void DataItem::CaptureBeforeImage() {
+void DataItem::CaptureBeforeImage(EpochNumber epoch) {
   auto &version_store = pax::VersionStore::Global();
   if (!version_store.CaptureActive()) return;
-  const uint32_t epoch = pax::CurrentCommitEpoch::Get();
   if (epoch == 0) {
     // Fail closed: skipping silently would let cells change with no
     // entry and no count advance, and the reader's end recheck would
@@ -46,16 +43,16 @@ void DataItem::CaptureBeforeImage() {
                         visible ? CopyValue() : std::string());
 }
 
-void DataItem::Write(const pax::Row &row) {
+void DataItem::InstallRow(const pax::Row &row, EpochNumber epoch) {
   assert(pax_allocated() && row.size != 0);
-  CaptureBeforeImage();
+  CaptureBeforeImage(epoch);
   pax_group()->ScatterRow(slot_, row);
   size_ = row.size;
 }
 
-void DataItem::Delete() {
+void DataItem::DeleteRow(EpochNumber epoch) {
   if (pax_allocated() && size_ != 0) {
-    CaptureBeforeImage();
+    CaptureBeforeImage(epoch);
     pax_group()->RetireSlot(slot_);
   }
   size_ = 0;

@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <filesystem>
+#include <functional>
 #include <memory>
 #include <string>
 #include <thread>
@@ -17,10 +18,8 @@
 #include "gtest/gtest.h"
 #include "index/reaper.h"
 #include "pax/version_store.h"
-#include "silo/commit.h"
-#include "silo/read_set.h"
-#include "silo/write_set.h"
 #include "silo/stable_read.h"
+#include "lineairdb/transaction.h"
 #include "table/table_dictionary.h"
 #include "util/epoch_framework.h"
 #include "wal/logger.h"
@@ -91,130 +90,108 @@ class CommitTidTest : public ::testing::Test {
     EXPECT_TRUE(pax::DecodeRow(
         table->GetPaxTable()->schema(),
         reinterpret_cast<const std::byte *>(bytes.data()), bytes.size(), row));
-    EXPECT_TRUE(item->AllocateSlot());
-    item->Write(row);
+    EXPECT_TRUE(item->AllocateSlot(*table->GetPaxTable()));
+    item->InstallRow(row, tid.epoch);
     item->transaction_id.store(tid);
     return item;
   }
 
-  bool Commit(const std::vector<ExternalReadEntry> &reads,
-              const std::vector<ExternalWriteEntry> &writes,
-              const std::vector<ExternalSecondaryIndexEntry> &index_ops = {},
-              const std::vector<ExternalRangeReadEntry> &ranges = {}) {
-    std::vector<std::string> bytes;
-    bytes.reserve(writes.size());
-    std::vector<silo::Write> decoded;
-    for (const auto &write : writes) {
-      bytes.push_back(TestHelper::Row(write.value));
-      silo::Write entry{write.table_name, write.key, {}, write.op};
-      if (write.op != RowOp::kDelete) {
-        const auto &schema = tables_.GetTable(kTable)->GetPaxTable()->schema();
-        if (!pax::DecodeRow(
-                schema,
-                reinterpret_cast<const std::byte *>(bytes.back().data()),
-                bytes.back().size(), entry.value))
-          return false;
-      }
-      decoded.push_back(std::move(entry));
-    }
+  bool Commit(const std::vector<TestHelper::PointRead> &reads,
+              const std::vector<TestHelper::RowWrite> &writes,
+              const std::vector<TestHelper::IndexOp> &index_ops = {},
+              const std::vector<TestHelper::Range> &ranges = {}) {
     reason_.clear();
-    const silo::ReadSet read_set{reads, ranges};
-    silo::WriteSet write_set;
-    epoch_.Join();
-    auto fail_preparation = [&] {
-      epoch_.Leave();
-      index::MasstreeReleaseThreadEpoch();
-      return false;
-    };
-    if (!read_set.CheckRangeBounds()) {
-      reason_ = "range_end_key_missing";
-      return fail_preparation();
-    }
-    for (const auto &write : decoded) {
-      auto *table = tables_.GetTable(write.table_name);
-      if (!table) {
-        reason_ = "write_table_missing";
-        return fail_preparation();
-      }
-      if (!table->GetPaxTable()) {
-        reason_ = "pax_schema_missing";
-        return fail_preparation();
-      }
-      if (!write_set.AddRow(table->GetPrimaryIndex(), write, reason_))
-        return fail_preparation();
-    }
-    for (const auto &change : index_ops) {
-      auto *table = tables_.GetTable(change.table_name);
-      if (!table) {
-        reason_ = "si_table_missing";
-        return fail_preparation();
-      }
-      if (!table->GetPaxTable()) {
-        reason_ = "pax_schema_missing";
-        return fail_preparation();
-      }
-      auto *index = table->GetSecondaryIndex(change.index_name);
-      if (!index) {
-        reason_ = "si_index_missing";
-        return fail_preparation();
-      }
-      if (!write_set.AddIndex(index->tree, index->constraint, change, reason_))
-        return fail_preparation();
-    }
-    const silo::CommitExecutor executor(tables_, epoch_, reaper_);
-    wal::LogEntries log_entries;
-    const bool committed = executor.Commit(read_set, write_set, last_tid_,
-                                           log_entries, reason_);
-    if (committed && !log_entries.empty())
-      logger_->Enqueue(log_entries, last_tid_.epoch);
-    epoch_.Leave();
+    // The packed rows outlive the attempt; the transaction borrows their bytes.
+    std::vector<TestHelper::RowWrite> rows = writes;
+    for (auto &row : rows) row.value = TestHelper::Row(row.value);
+    silo::Transaction tx(tables_, epoch_, reaper_, *logger_, last_tid_);
+    const bool committed =
+        TestHelper::Feed(tx, reads, ranges, rows, index_ops, reason_) &&
+        tx.Commit(CommitDurability::kAsync, reason_);
     index::MasstreeReleaseThreadEpoch();
     return committed;
   }
 };
 
-TEST_F(CommitTidTest, ProtocolRefreshesEpochAndReturnsItActiveToCaller) {
+TEST_F(CommitTidTest, CommitReadsTheEpochAfterTheWriteSetIsFed) {
   auto *item = SeedRow("key", Version(10, 5));
-  auto *table = tables_.GetTable(kTable);
   const std::string bytes = TestHelper::Row("next");
-  silo::Write write{kTable, "key", {}, RowOp::kUpdate};
-  ASSERT_TRUE(pax::DecodeRow(table->GetPaxTable()->schema(),
-                            reinterpret_cast<const std::byte *>(bytes.data()),
-                            bytes.size(), write.value));
-  const std::vector<ExternalReadEntry> reads;
-  const std::vector<ExternalRangeReadEntry> ranges;
-  const silo::ReadSet read_set{reads, ranges};
-  silo::WriteSet write_set;
-  const silo::CommitExecutor executor(tables_, epoch_, reaper_);
-  wal::LogEntries log_entries;
 
-  epoch_.Join();
-  const bool prepared = write_set.AddRow(table->GetPrimaryIndex(), write, reason_);
+  silo::Transaction tx(tables_, epoch_, reaper_, *logger_, last_tid_);
+  ASSERT_TRUE(tx.Write(kTable, "key", bytes, RowOp::kUpdate, reason_))
+      << reason_;
   epoch_.SetGlobalEpoch(11);
-  const bool committed = prepared && executor.Commit(
-      read_set, write_set, last_tid_, log_entries, reason_);
-  const auto committed_tid = last_tid_;
-  const auto epoch_after_commit = epoch_.ThreadEpoch();
-  const auto committed_log_count = log_entries.size();
-  if (committed) logger_->Enqueue(log_entries, committed_tid.epoch);
+  ASSERT_TRUE(tx.Commit(CommitDurability::kAsync, reason_)) << reason_;
+  EXPECT_EQ(11u, last_tid_.epoch);
+  EXPECT_EQ(epoch::Framework::kThreadOffline, epoch_.ThreadEpoch());
+  EXPECT_EQ(last_tid_, item->transaction_id.load());
+  EXPECT_EQ(bytes, item->CopyValue());
 
+  // A worker TID from a later epoch cannot be ordered by this one.
+  const auto published = last_tid_;
   last_tid_ = Version(12, 0);
-  const bool second_committed = executor.Commit(
-      read_set, write_set, last_tid_, log_entries, reason_);
-  const auto epoch_after_abort = epoch_.ThreadEpoch();
-  epoch_.Leave();
-
-  EXPECT_TRUE(committed);
-  EXPECT_EQ(11u, epoch_after_commit);
-  EXPECT_EQ(11u, committed_tid.epoch);
-  EXPECT_EQ(1u, committed_log_count);
-  EXPECT_FALSE(second_committed);
+  silo::Transaction stale(tables_, epoch_, reaper_, *logger_, last_tid_);
+  ASSERT_TRUE(stale.Write(kTable, "key", bytes, RowOp::kUpdate, reason_))
+      << reason_;
+  EXPECT_FALSE(stale.Commit(CommitDurability::kAsync, reason_));
   EXPECT_EQ("commit_epoch_stale", reason_);
   EXPECT_EQ(Version(12, 0), last_tid_);
-  EXPECT_EQ(11u, epoch_after_abort);
-  EXPECT_TRUE(log_entries.empty());
-  EXPECT_EQ(committed_tid, item->transaction_id.load());
-  EXPECT_EQ(bytes, item->CopyValue());
+  EXPECT_EQ(epoch::Framework::kThreadOffline, epoch_.ThreadEpoch());
+  EXPECT_EQ(published, item->transaction_id.load());
+  EXPECT_FALSE(item->transaction_id.load().lock);
+  index::MasstreeReleaseThreadEpoch();
+
+  // Only the first commit reached the log; the stale attempt logged nothing.
+  logger_->RequestFlush(11);
+  logger_.reset();
+  wal::Wal log(config_.work_dir);
+  const auto scan = log.Scan();
+  ASSERT_EQ(wal::WalScanResult::Status::kOk, scan.status);
+  ASSERT_EQ(1u, scan.records.size());
+  ASSERT_EQ(1u, scan.records.front().writes.size());
+  EXPECT_EQ(published, scan.records.front().writes.front().transaction_id);
+}
+
+TEST_F(CommitTidTest, CommitJoinsTheEpochAfterItsLocksAreHeld) {
+  auto *a = SeedRow("a", Version(10, 5));
+  auto *b = SeedRow("b", Version(10, 5));
+  const std::string bytes_a = TestHelper::Row("next_a");
+  const std::string bytes_b = TestHelper::Row("next_b");
+  // The write set locks in DataItem pointer order, so the committer takes
+  // this one first and then waits for the other.
+  DataItem *first = std::less<DataItem *>{}(a, b) ? a : b;
+  DataItem *second = first == a ? b : a;
+
+  // Another committer holds the record this attempt locks second.
+  Tidword held = Version(10, 5);
+  held.lock = true;
+  second->transaction_id.store(held);
+
+  bool committed = false;
+  std::thread committer([&] {
+    silo::Transaction tx(tables_, epoch_, reaper_, *logger_, last_tid_);
+    EXPECT_TRUE(tx.Write(kTable, "a", bytes_a, RowOp::kUpdate, reason_))
+        << reason_;
+    EXPECT_TRUE(tx.Write(kTable, "b", bytes_b, RowOp::kUpdate, reason_))
+        << reason_;
+    EXPECT_EQ(epoch::Framework::kThreadOffline, epoch_.ThreadEpoch());
+    committed = tx.Commit(CommitDurability::kAsync, reason_);
+    EXPECT_EQ(epoch::Framework::kThreadOffline, epoch_.ThreadEpoch());
+    index::MasstreeReleaseThreadEpoch();
+  });
+
+  // The committer holds the first record and is waiting on the second
+  while (!first->transaction_id.load().lock) std::this_thread::yield();
+  epoch_.SetGlobalEpoch(11);
+  second->transaction_id.store(Version(10, 5));
+  committer.join();
+
+  ASSERT_TRUE(committed) << reason_;
+  EXPECT_EQ(11u, last_tid_.epoch);
+  EXPECT_EQ(last_tid_, a->transaction_id.load());
+  EXPECT_EQ(last_tid_, b->transaction_id.load());
+  EXPECT_FALSE(a->transaction_id.load().lock);
+  EXPECT_FALSE(b->transaction_id.load().lock);
 }
 
 TEST_F(CommitTidTest, FinalRowKeepsTheFirstInsertRequirement) {
@@ -339,13 +316,34 @@ TEST_F(CommitTidTest, WrittenRowsAndIndexesContributeTheirPreviousVersions) {
   EXPECT_EQ(last_tid_, posting->transaction_id.load());
 }
 
-TEST_F(CommitTidTest, MissingRangeEndAbortsBeforeResolvingWrites) {
-  ExternalRangeReadEntry range;
+TEST_F(CommitTidTest, MissingRangeEndAbortsBeforeLocking) {
+  TestHelper::Range range;
   range.table_name = kTable;
   EXPECT_FALSE(Commit({}, {{kTable, "new", "value"}}, {}, {range}));
   EXPECT_EQ("range_end_key_missing", reason_);
-  EXPECT_EQ(nullptr, tables_.GetTable(kTable)->GetPrimaryIndex().Get("new"));
+  EXPECT_EQ(Tidword{}, last_tid_);
   EXPECT_EQ(epoch::Framework::kThreadOffline, epoch_.ThreadEpoch());
+
+  // The write claimed its record before the range was checked; it stays
+  // absent and unlocked, as after any abort.
+  auto *item = tables_.GetTable(kTable)->GetPrimaryIndex().Get("new");
+  ASSERT_NE(nullptr, item);
+  EXPECT_EQ(Tidword::Absent(), item->transaction_id.load());
+}
+
+TEST_F(CommitTidTest, UniqueIndexRefusesASecondAdditionInOneRequest) {
+  ASSERT_TRUE(tables_.GetTable(kTable)->CreateSecondaryIndex(
+      "uidx", IndexConstraint::kUnique));
+  silo::Transaction tx(tables_, epoch_, reaper_, *logger_, last_tid_);
+  EXPECT_TRUE(tx.IndexWrite(kTable, "uidx", "s", "a", false, reason_))
+      << reason_;
+  EXPECT_TRUE(tx.IndexWrite(kTable, "uidx", "s", "a", true, reason_))
+      << reason_;
+  EXPECT_FALSE(tx.IndexWrite(kTable, "uidx", "s", "b", false, reason_));
+  EXPECT_EQ(
+      std::string(kDuplicateSecondaryKeyAbortPrefix) + "duplicate_in_request",
+      reason_);
+  index::MasstreeReleaseThreadEpoch();
 }
 
 TEST_F(CommitTidTest, PointReadFailureUsesFixedReasonForBinaryKey) {
@@ -359,7 +357,7 @@ TEST_F(CommitTidTest, PointReadFailureUsesFixedReasonForBinaryKey) {
 }
 
 TEST_F(CommitTidTest, SecondaryRangeFailureKeepsItsAbortReason) {
-  ExternalRangeReadEntry range;
+  TestHelper::Range range;
   range.table_name = kTable;
   range.index_name = "idx";
   range.end_key = "z";
@@ -412,7 +410,7 @@ TEST_F(CommitTidTest, DifferentReadVersionsAbortInEitherInputOrder) {
   for (bool reverse : {false, true}) {
     const auto first = reverse ? current_tid : old_tid;
     const auto second = reverse ? old_tid : current_tid;
-    const std::vector<ExternalReadEntry> reads = {
+    const std::vector<TestHelper::PointRead> reads = {
         {kTable, "key", first.obj}, {kTable, "key", second.obj}};
     EXPECT_FALSE(Commit(reads, {}));
     EXPECT_FALSE(Commit(reads, {{kTable, "key", "next"}}));
@@ -427,6 +425,15 @@ TEST_F(CommitTidTest, ReadOnlyCommitAdvancesWorkerOrdering) {
   EXPECT_EQ(Version(10, 201), last_tid_);
   ASSERT_TRUE(Commit({}, {{kTable, "new", "value"}})) << reason_;
   EXPECT_EQ(Version(10, 202), last_tid_);
+
+  // The read-only commit buffered nothing; only the write reached the log.
+  logger_->RequestFlush(10);
+  logger_.reset();
+  wal::Wal log(config_.work_dir);
+  const auto scan = log.Scan();
+  ASSERT_EQ(wal::WalScanResult::Status::kOk, scan.status);
+  ASSERT_EQ(1u, scan.records.size());
+  EXPECT_EQ(1u, scan.records.front().writes.size());
 }
 
 TEST_F(CommitTidTest, SecondaryRangeReadContributesIndexAndRowVersions) {
@@ -435,7 +442,7 @@ TEST_F(CommitTidTest, SecondaryRangeReadContributesIndexAndRowVersions) {
   auto *posting = index->tree.GetOrInsert("group");
   posting->SetPrimaryKeys({"a"});
   posting->transaction_id.store(Version(10, 300));
-  ExternalRangeReadEntry range;
+  TestHelper::Range range;
   range.table_name = kTable;
   range.index_name = "idx";
   range.start_key = "group";
@@ -455,7 +462,7 @@ TEST_F(CommitTidTest, SecondaryRangeReadContributesIndexAndRowVersions) {
 
 TEST_F(CommitTidTest, PrimaryRangeReadContributesItsVersionWithoutPointReads) {
   SeedRow("high", Version(10, 400));
-  ExternalRangeReadEntry range;
+  TestHelper::Range range;
   range.table_name = kTable;
   range.start_key = "high";
   range.end_key = "higi";
@@ -560,12 +567,12 @@ TEST_F(CommitTidTest, RangeReplayAllowsOwnLockOnPrimaryAndSecondary) {
   posting->SetPrimaryKeys({"k"});
   posting->transaction_id.store(Version(10, 12));
 
-  ExternalRangeReadEntry rows;
+  TestHelper::Range rows;
   rows.table_name = kTable;
   rows.start_key = "k";
   rows.end_key = "l";
   rows.result_keys = {"k"};
-  ExternalRangeReadEntry postings;
+  TestHelper::Range postings;
   postings.table_name = kTable;
   postings.index_name = "idx";
   postings.start_key = "s";
@@ -622,7 +629,7 @@ TEST_F(CommitTidTest, ReaperRequeuesALockedRecord) {
 TEST_F(CommitTidTest, EmptyPrimaryRangeAbortsWhenAnAbsentRowIsFromALaterEpoch) {
   auto &tree = tables_.GetTable(kTable)->GetPrimaryIndex();
   tree.GetOrInsert("x")->transaction_id.store(Deleted(11, 5));
-  ExternalRangeReadEntry range;
+  TestHelper::Range range;
   range.table_name = kTable;
   range.start_key = "x";
   range.end_key = "y";
@@ -641,7 +648,7 @@ TEST_F(CommitTidTest,
        EmptySecondaryRangeAbortsWhenAnAbsentEntryIsFromALaterEpoch) {
   auto *index = tables_.GetTable(kTable)->GetSecondaryIndex("idx");
   index->tree.GetOrInsert("s")->transaction_id.store(Deleted(11, 5));
-  ExternalRangeReadEntry range;
+  TestHelper::Range range;
   range.table_name = kTable;
   range.index_name = "idx";
   range.start_key = "s";
@@ -665,7 +672,7 @@ TEST_F(CommitTidTest,
   auto *posting = index->tree.GetOrInsert("group");
   posting->SetPrimaryKeys({"a"});
   posting->transaction_id.store(Version(10, 30));
-  ExternalRangeReadEntry range;
+  TestHelper::Range range;
   range.table_name = kTable;
   range.index_name = "idx";
   range.start_key = "group";
@@ -687,7 +694,7 @@ TEST_F(CommitTidTest,
   EXPECT_EQ(Deleted(10, 5), posting->transaction_id.load());
 
   // The emptied entry replays as absent until the reaper removes it.
-  ExternalRangeReadEntry range;
+  TestHelper::Range range;
   range.table_name = kTable;
   range.index_name = "idx";
   range.start_key = "s";
@@ -714,9 +721,9 @@ TEST(CommonTidWorkerTest, LastTidBelongsToEachWorkerAndDatabase) {
     ASSERT_TRUE(TestHelper::CreateTable(db, kTable));
     std::string reason;
     for (int n = 0; n < 3; ++n) {
-      ASSERT_TRUE(db.Commit({},
-                            {{kTable, std::to_string(n), TestHelper::Row("v")}},
-                            {}, {}, CommitDurability::kAsync, reason))
+      ASSERT_TRUE(TestHelper::CommitRows(
+          db, {}, {{kTable, std::to_string(n), TestHelper::Row("v")}}, {}, {},
+          reason, CommitDurability::kAsync))
           << reason;
       const auto row = db.Read(kTable, std::to_string(n));
       db.ReleaseThreadEpoch();
@@ -729,10 +736,9 @@ TEST(CommonTidWorkerTest, LastTidBelongsToEachWorkerAndDatabase) {
     bool worker_committed = false;
     std::thread worker([&]() {
       std::string worker_reason;
-      worker_committed =
-          db.Commit({}, {{kTable, "worker", TestHelper::Row("v")}}, {}, {},
-                    CommitDurability::kAsync, worker_reason);
-      db.ReleaseThreadEpoch();
+      worker_committed = TestHelper::CommitRows(
+          db, {}, {{kTable, "worker", TestHelper::Row("v")}}, {}, {},
+          worker_reason, CommitDurability::kAsync);
     });
     worker.join();
     ASSERT_TRUE(worker_committed);

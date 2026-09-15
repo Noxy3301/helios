@@ -29,7 +29,7 @@ namespace pax {
  * PAX install captures the replaced row image before its first strip-cell
  * or visibility-bit mutation; a first install captures an empty
  * was_visible=false entry. An install that cannot capture (byte budget
- * exceeded, or no commit epoch) fails the capture for the active generation
+ * exceeded, or epoch 0) fails the capture for the active generation
  * instead, and every result produced under it is discarded. A reader
  * at snapshot epoch `se` uses the oldest before-image whose writer epoch
  * exceeds `se` and reads the strip in place when no entry
@@ -172,35 +172,6 @@ class VersionStore {
   GroupUndo *GetOrCreateUndo(const PaxGroup *group);
   const GroupUndo *FindUndo(const PaxGroup *group) const;
   void ClearAllLocked();
-};
-
-/**
- * @brief Thread-local commit epoch of the install region in progress; zero
- * outside one (e.g. recovery replay).
- *
- * @details The capture hook tags entries with it and fails the capture for
- * the active generation on a zero-epoch install.
- */
-struct CurrentCommitEpoch {
-  static uint32_t &Get();
-};
-
-/**
- * @brief RAII bracket for an install region; restores the previous value so
- * nested installs cannot leak a tag past their scope.
- */
-class ScopedCommitEpoch {
- public:
-  explicit ScopedCommitEpoch(uint32_t epoch)
-      : previous_(CurrentCommitEpoch::Get()) {
-    CurrentCommitEpoch::Get() = epoch;
-  }
-  ~ScopedCommitEpoch() { CurrentCommitEpoch::Get() = previous_; }
-  ScopedCommitEpoch(const ScopedCommitEpoch &) = delete;
-  ScopedCommitEpoch &operator=(const ScopedCommitEpoch &) = delete;
-
- private:
-  const uint32_t previous_;
 };
 
 }  // namespace pax

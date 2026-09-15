@@ -181,7 +181,7 @@ class Framework {
   // wrap-free window where plain unsigned ordering is exact. The timer-driven
   // advance stops the process at the mark rather than wrapping: past the wrap,
   // the epoch no longer orders against the durable epoch, so a commit
-  // could be acknowledged as durable against a comparison that has lost its
+  // could be reported durable against a comparison that has lost its
   // meaning.
   static constexpr EpochNumber kEpochHighWater = UINT32_MAX - (1u << 20);
 

@@ -1,7 +1,7 @@
 /**
  * @file server/storage/tests/logger_durability_test.cc
- * What the log reports as persisted, when a waiter wakes, and what a
- * synchronous acknowledgement waits for.
+ * What the log reports as persisted, when a waiter wakes, and what a Sync
+ * commit waits for.
  */
 
 #include <errno.h>
@@ -20,17 +20,16 @@
 #include <thread>
 #include <vector>
 
-#include "wal/log_entry.h"
+#include "wal/log_record.h"
 #include "wal/logger.h"
 #include "wal/wal.h"
 
 namespace {
 
 using helios::storage::EpochNumber;
-using helios::storage::wal::LogEntry;
 using helios::storage::wal::Logger;
+using helios::storage::wal::LogRecord;
 using helios::storage::wal::WalIo;
-using helios::storage::wal::LogEntries;
 
 constexpr auto kTestTimeout = std::chrono::seconds(5);
 
@@ -58,38 +57,27 @@ class LoggerDurabilityTest : public ::testing::Test {
     std::filesystem::remove_all(root_, ec);
   }
 
-  static LogEntries MakePrimaryLogEntries(const std::string &key) {
-    LogEntry entry(key, nullptr, 0, nullptr, "t", "");
-    LogEntries log_entries;
-    log_entries.emplace_back(std::move(entry));
-    return log_entries;
-  }
-
-  // Secondary log entries with no delta persist nothing.
-  static LogEntries MakeEmptySecondaryLogEntries(const std::string &key) {
-    LogEntry entry(key, nullptr, 0, nullptr, "t", "idx");
-    LogEntries log_entries;
-    log_entries.emplace_back(std::move(entry));
-    return log_entries;
+  static LogRecord MakePrimaryRecord(const std::string &key,
+                                     EpochNumber epoch) {
+    LogRecord record;
+    record.epoch = epoch;
+    LogRecord::Write write;
+    write.key = key;
+    write.table_name = "t";
+    record.writes.emplace_back(std::move(write));
+    return record;
   }
 
   std::string root_;
   helios::storage::Config config_;
 };
 
-TEST_F(LoggerDurabilityTest, EnqueueReportsOnlyWhatItPersists) {
-  Logger logger(config_);
-  EXPECT_TRUE(logger.Enqueue(MakePrimaryLogEntries("alice"), 5));
-  EXPECT_FALSE(logger.Enqueue(LogEntries{}, 5));
-  EXPECT_FALSE(logger.Enqueue(MakeEmptySecondaryLogEntries("bob"), 5));
-}
-
 TEST_F(LoggerDurabilityTest, AlreadyDurableReturnsImmediately) {
   Logger logger(config_);
   ASSERT_EQ(logger.Recover().status, Logger::RecoveryStatus::kOk);
   logger.Start();
 
-  ASSERT_TRUE(logger.Enqueue(MakePrimaryLogEntries("alice"), 5));
+  logger.Enqueue(MakePrimaryRecord("alice", 5));
   logger.RequestFlush(5);
 
   EXPECT_EQ(logger.WaitUntilDurable(5, Logger::Deadline::max()),
@@ -106,8 +94,8 @@ TEST_F(LoggerDurabilityTest, WaitersWakeAtEpochGranularity) {
   ASSERT_EQ(logger.Recover().status, Logger::RecoveryStatus::kOk);
   logger.Start();
 
-  ASSERT_TRUE(logger.Enqueue(MakePrimaryLogEntries("alice"), 5));
-  ASSERT_TRUE(logger.Enqueue(MakePrimaryLogEntries("bob"), 7));
+  logger.Enqueue(MakePrimaryRecord("alice", 5));
+  logger.Enqueue(MakePrimaryRecord("bob", 7));
 
   auto spawn_waiter = [&logger](EpochNumber epoch) {
     return std::async(std::launch::async, [&logger, epoch] {
@@ -133,10 +121,10 @@ TEST_F(LoggerDurabilityTest, WaitersWakeAtEpochGranularity) {
   logger.Stop();
 }
 
-// The acknowledgement a Sync commit waits for cannot be given while the
+// The report a Sync commit waits for cannot be given while the
 // fdatasync that would earn it is still running. Holding the syscall makes the
 // order observable rather than merely likely.
-TEST_F(LoggerDurabilityTest, SyncAcknowledgementFollowsTheFdatasync) {
+TEST_F(LoggerDurabilityTest, SyncReportFollowsTheFdatasync) {
   std::mutex mutex;
   std::condition_variable held;
   bool inside_fdatasync = false;
@@ -180,7 +168,7 @@ TEST_F(LoggerDurabilityTest, SyncAcknowledgementFollowsTheFdatasync) {
   ASSERT_EQ(logger.Recover().status, Logger::RecoveryStatus::kOk);
   logger.Start();
 
-  ASSERT_TRUE(logger.Enqueue(MakePrimaryLogEntries("alice"), 3));
+  logger.Enqueue(MakePrimaryRecord("alice", 3));
   committer = std::async(std::launch::async, [&logger, &committer_started] {
     committer_started.store(true);
     logger.AwaitCommitDurability(3, true);
@@ -240,7 +228,7 @@ TEST_F(LoggerDurabilityTest, AsyncAndUnloggedCommitsDoNotWait) {
 
 // With the fail-stop armed, a write failure ends the process by abort: under
 // Async nobody waits on the durable epoch, and a process that carried on would
-// keep acknowledging commits that exist only in memory. The rest of this file
+// keep reporting commits that exist only in memory. The rest of this file
 // constructs loggers without arming: there an I/O failure surfaces as
 // WaitResult::kFailed instead of ending the process.
 TEST_F(LoggerDurabilityTest, ArmedFailStopEndsTheProcessOnFdatasyncFailure) {
@@ -262,7 +250,7 @@ TEST_F(LoggerDurabilityTest, ArmedFailStopEndsTheProcessOnFdatasyncFailure) {
         if (logger.Recover().status != Logger::RecoveryStatus::kOk) return;
         logger.SetFailStop();
         logger.Start();
-        if (!logger.Enqueue(MakePrimaryLogEntries("alice"), 3)) return;
+        logger.Enqueue(MakePrimaryRecord("alice", 3));
         logger.RequestFlush(3);
         std::this_thread::sleep_for(kTestTimeout);
       },
@@ -274,8 +262,8 @@ TEST_F(LoggerDurabilityTest, RecordsAboveTheTargetAreCarriedForward) {
     Logger logger(config_);
     ASSERT_EQ(logger.Recover().status, Logger::RecoveryStatus::kOk);
     logger.Start();
-    ASSERT_TRUE(logger.Enqueue(MakePrimaryLogEntries("alice"), 4));
-    ASSERT_TRUE(logger.Enqueue(MakePrimaryLogEntries("bob"), 9));
+    logger.Enqueue(MakePrimaryRecord("alice", 4));
+    logger.Enqueue(MakePrimaryRecord("bob", 9));
     logger.RequestFlush(4);
     ASSERT_EQ(logger.WaitUntilDurable(4, Logger::Deadline::max()),
               Logger::WaitResult::kDurable);
@@ -334,7 +322,7 @@ TEST_F(LoggerDurabilityTest,
   ASSERT_EQ(logger.Recover().status, Logger::RecoveryStatus::kOk);
   logger.Start();
 
-  ASSERT_TRUE(logger.Enqueue(MakePrimaryLogEntries("alice"), 3));
+  logger.Enqueue(MakePrimaryRecord("alice", 3));
   auto waiting = std::async(std::launch::async, [&logger] {
     return logger.WaitUntilDurable(3, Logger::Deadline::max());
   });
@@ -365,7 +353,7 @@ TEST_F(LoggerDurabilityTest, WriteFailureFailsWaiters) {
   ASSERT_EQ(logger.Recover().status, Logger::RecoveryStatus::kOk);
   logger.Start();
 
-  ASSERT_TRUE(logger.Enqueue(MakePrimaryLogEntries("alice"), 3));
+  logger.Enqueue(MakePrimaryRecord("alice", 3));
   logger.RequestFlush(3);
   EXPECT_EQ(logger.WaitUntilDurable(3, Logger::Deadline::max()),
             Logger::WaitResult::kFailed);
@@ -390,7 +378,7 @@ TEST_F(LoggerDurabilityTest, StopDrainsWhatWasAlreadyClosed) {
     Logger logger(config_);
     ASSERT_EQ(logger.Recover().status, Logger::RecoveryStatus::kOk);
     logger.Start();
-    ASSERT_TRUE(logger.Enqueue(MakePrimaryLogEntries("alice"), 6));
+    logger.Enqueue(MakePrimaryRecord("alice", 6));
     logger.RequestFlush(6);
     // Stop without waiting: the drain must still write epoch 6.
     logger.Stop();
@@ -410,7 +398,7 @@ TEST_F(LoggerDurabilityTest, RecoverReportsTheDurableEpochOfAnExistingLog) {
     Logger logger(config_);
     ASSERT_EQ(logger.Recover().status, Logger::RecoveryStatus::kOk);
     logger.Start();
-    ASSERT_TRUE(logger.Enqueue(MakePrimaryLogEntries("alice"), 8));
+    logger.Enqueue(MakePrimaryRecord("alice", 8));
     logger.RequestFlush(8);
     ASSERT_EQ(logger.WaitUntilDurable(8, Logger::Deadline::max()),
               Logger::WaitResult::kDurable);

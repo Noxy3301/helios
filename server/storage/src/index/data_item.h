@@ -40,13 +40,15 @@
 
 #include "index/primary_key_list.h"
 #include "silo/tidword.h"
+#include "util/epoch.h"
 
 namespace helios::storage {
 
 /**
  * @brief What one index key maps to.
  *
- * @details A primary-index item refers to a PAX slot owned by its table.
+ * @details A primary-index item refers to a PAX slot its table hands out on
+ * the item's first install.
  * A secondary-index item owns the primary-key list published with atomic
  * load and store. Both use transaction_id as their Silo version word.
  */
@@ -71,58 +73,54 @@ struct DataItem {
 
   DataItem() : transaction_id(Tidword::Absent()) {}
 
-  /**
-   * @brief Creates an empty item whose payload will be stored in table's PAX
-   * slots.
-   */
-  explicit DataItem(pax::PaxTable &table) : DataItem() {
-    location_ = reinterpret_cast<uintptr_t>(&table);
-    assert((location_ & kAllocated) == 0);
-  }
-
   DataItem(const DataItem &) = delete;
   DataItem &operator=(const DataItem &) = delete;
 
   DataItem(DataItem &&rhs) noexcept
       : transaction_id(rhs.transaction_id.load()),
         primary_keys_(std::move(rhs.primary_keys_)),
-        location_(std::exchange(rhs.location_, 0)),
-        size_(std::exchange(rhs.size_, 0)),
-        slot_(std::exchange(rhs.slot_, 0)) {}
+        group_(std::exchange(rhs.group_, nullptr)),
+        slot_(std::exchange(rhs.slot_, 0)),
+        size_(std::exchange(rhs.size_, 0)) {}
 
   DataItem &operator=(DataItem &&rhs) noexcept {
     transaction_id.store(rhs.transaction_id.load());
-    location_ = std::exchange(rhs.location_, 0);
-    size_ = std::exchange(rhs.size_, 0);
+    group_ = std::exchange(rhs.group_, nullptr);
     slot_ = std::exchange(rhs.slot_, 0);
+    size_ = std::exchange(rhs.size_, 0);
     std::atomic_store(&primary_keys_, std::move(rhs.primary_keys_));
     return *this;
   }
 
-  bool pax_allocated() const { return (location_ & kAllocated) != 0; }
-  pax::PaxGroup *pax_group() const {
-    return reinterpret_cast<pax::PaxGroup *>(location_ & ~kAllocated);
-  }
+  bool pax_allocated() const { return group_ != nullptr; }
+  pax::PaxGroup *pax_group() const { return group_; }
   uint32_t pax_slot() const { return slot_; }
 
   /**
-   * @brief Reserves a PAX slot if this item does not already have one.
-   * @return False if no table is bound or its slot directory is full.
+   * @brief Reserves a slot in `table` if this item does not already have one.
+   * @return true once the item holds a slot, including one it already had;
+   * false when the table's slot directory is full.
    */
-  bool AllocateSlot();
+  bool AllocateSlot(pax::PaxTable &table);
 
   /**
-   * @brief Writes a decoded row into this item's PAX slot.
+   * @brief Installs a decoded row into this item's PAX slot.
    * @note The caller holds the TID lock and has allocated every write's slot.
    * Recovery calls this before readers start.
+   * @param epoch Commit epoch of this install; before-images are tagged with
+   * it.
    */
-  void Write(const pax::Row &row);
+  void InstallRow(const pax::Row &row, EpochNumber epoch);
 
   /**
-   * @brief Hides this item's row, retaining its slot for a later write.
-   * @note The caller holds the TID lock; publishing the new TID is separate.
+   * @brief Hides this item's row: retires the slot from strip scans and
+   * captures its before-image for an active read view. The slot stays
+   * reserved for a later write.
+   * @note The caller holds the TID lock; publishing the absent word is
+   * separate.
+   * @param epoch Commit epoch of this delete, the before-image's writer epoch.
    */
-  void Delete();
+  void DeleteRow(EpochNumber epoch);
 
   // A concurrent update may change size_; use the reader's buffer capacity.
   size_t GatherInto(std::byte *out, size_t capacity) const {
@@ -155,13 +153,11 @@ struct DataItem {
   }
 
  private:
-  static constexpr uintptr_t kAllocated = 1;
-  // Before allocation this points to the table; afterwards to its tagged group.
-  uintptr_t location_ = 0;
+  pax::PaxGroup *group_ = nullptr;  // The group holding this item's slot.
+  uint32_t slot_ = 0;               // Slot inside group_.
   size_t size_ = 0;  // Row length in bytes; zero once deleted.
-  uint32_t slot_ = 0;
 
-  void CaptureBeforeImage();
+  void CaptureBeforeImage(EpochNumber epoch);
 
   static bool IsSortedDeduped(const std::vector<std::string> &keys) {
     return std::adjacent_find(

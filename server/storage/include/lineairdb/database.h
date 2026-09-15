@@ -19,7 +19,7 @@
 /**
  * @file server/storage/include/lineairdb/database.h
  * The public face of the store: table and index definition, the read ops,
- * the commit, and the epoch handshake every calling thread performs.
+ * the commit attempt, and the epoch handshake every calling thread performs.
  */
 
 #ifndef HELIOS_STORAGE_INCLUDE_LINEAIRDB_DATABASE_H
@@ -34,13 +34,12 @@
 #include <utility>
 #include <vector>
 
-#include "lineairdb/commit.h"
+#include "lineairdb/transaction.h"
 #include "lineairdb/config.h"
 #include "lineairdb/index.h"
 #include "lineairdb/read.h"
 
 #include "index/reaper.h"
-#include "silo/commit.h"
 #include "silo/tidword.h"
 #include "table/table_dictionary.h"
 #include "util/epoch_framework.h"
@@ -200,24 +199,13 @@ class Database {
    */
   bool PaxViewValid(const PaxReadView &view) const;
 
-  // ----------------------------------------------------------------------
-  // Reads, scans and the commit.
-  //
-  // The methods below hold no state between calls. Each returns what the
-  // caller needs (value, TID word) to keep its own read set across
-  // independent RPCs. Commit revalidates the collected read set when the
-  // logical transaction is ready to commit.
-  // See @ref read.h for the supporting types.
-  // ----------------------------------------------------------------------
-
   /**
    * @brief Reads one row without opening a server-side transaction.
    *
    * Looks the key up in the primary index of `table_name` and returns the
    * current value together with the TID word observed at read time. The
-   * caller should later pass the same TID back inside an ExternalReadEntry
-   * so that Commit can confirm the row was not modified
-   * concurrently.
+   * caller should later pass the same TID back to silo::Transaction::Read so
+   * that the commit can confirm the row was not modified concurrently.
    *
    * @param table_name Target table.
    * @param key Primary key to look up.
@@ -249,8 +237,8 @@ class Database {
    *        the range.
    *
    * Each returned row carries its own TID. Revalidating the range at commit
-   * takes an ExternalRangeReadEntry built from this call's arguments and the
-   * returned keys, plus one ExternalReadEntry per consumed row.
+   * is a silo::Transaction::RangeRead call with this call's arguments and the
+   * returned keys, plus one silo::Transaction::Read call per consumed row.
    *
    * @param table_name Target table.
    * @param start_key Inclusive start of the range.
@@ -277,7 +265,7 @@ class Database {
    * For every secondary key in `[start_key, end_key)`, this resolves each of
    * its primary keys, reads the base row, and reports
    * `{secondary_key, primary_key, value, tid}` per result. Revalidating the
-   * range at commit takes an ExternalRangeReadEntry built from this call's
+   * range at commit is a silo::Transaction::RangeRead call with this call's
    * arguments and both returned key lists; each base row carries its TID for
    * revalidation as a point read.
    *
@@ -359,44 +347,6 @@ class Database {
                       std::vector<uint64_t> &out_cum);
 
   /**
-   * @brief Validates caller-supplied read and write sets and installs the
-   *        writes atomically.
-   *
-   * Prepares read/write sets and runs the Silo protocol in an active epoch.
-   * The protocol locks, validates and publishes records, returning their log
-   * entries. This method enqueues those entries before leaving the epoch, then
-   * waits for durability when requested. The protocol contract lives with
-   * silo::CommitExecutor::Commit.
-   *
-   * Input values are decoded using their PAX schemas before entering Silo.
-   * Conversion failures return false with pax_row_decode_failed; they are
-   * input errors, not concurrency conflicts. Slot exhaustion is detected
-   * before any value is changed.
-   *
-   * Aborts return false. `abort_reason` is set to a short
-   * machine-readable label such as `exact_read_tid_moved`,
-   * `primary_range_result_changed`, or `unique_si_exists_after_lock`.
-   *
-   * @param reads Point reads to revalidate before commit.
-   * @param writes Row writes; `op` says whether the entry updates, inserts
-   *                or deletes the row.
-   * @param secondary_index_ops Secondary-index adds/removes to install.
-   * @param range_reads Range reads assembled by the caller from earlier
-   *                    scans.
-   * @param durability When this commit is acknowledged, relative to its record
-   *                    reaching the device.
-   * @param abort_reason Receives the failure reason; cleared on success.
-   * @return true on commit; false on a validation failure, or when a table
-   *         or index the entries name is missing.
-   */
-  bool Commit(
-      const std::vector<ExternalReadEntry> &reads,
-      const std::vector<ExternalWriteEntry> &writes,
-      const std::vector<ExternalSecondaryIndexEntry> &secondary_index_ops,
-      const std::vector<ExternalRangeReadEntry> &range_reads,
-      CommitDurability durability, std::string &abort_reason);
-
-  /**
    * @brief Writes one checkpoint of the live rows, on the calling thread.
    *
    * Does what the configured checkpoint interval does, at a moment the caller
@@ -415,6 +365,9 @@ class Database {
   bool WriteCheckpoint(uint64_t *out_version_retries = nullptr);
 
  private:
+  // Reads the tables, epoch framework, reaper, logger and last-TID slots.
+  friend class silo::Transaction;
+
   // Declared in dependency order
   Config config_;
   wal::Logger logger_;
@@ -426,23 +379,12 @@ class Database {
   index::Reaper reaper_;
   // Each worker remembers the last TID it chose for this database.
   ThreadKeyStorage<Tidword> last_commit_tids_;
-  silo::CommitExecutor commit_executor_;
 
   // Bound the lifetime of a read view so `E - se` stays in the wrap-free window.
   static constexpr EpochNumber kPaxReadViewEpochLifetime =
       (std::numeric_limits<EpochNumber>::max() -
        epoch::Framework::kEpochHighWater) /
       2;
-
-  /**
-   * @brief Resolves input writes to their target records.
-   * @pre The caller has joined an epoch.
-   * @return false with an input error; no row locks are acquired here.
-   */
-  bool ResolveWrites(
-      const std::vector<silo::Write> &writes,
-      const std::vector<ExternalSecondaryIndexEntry> &secondary_index_ops,
-      silo::WriteSet &write_set, std::string &abort_reason);
 
   Table *GetTable(std::string_view table_name) const;
 

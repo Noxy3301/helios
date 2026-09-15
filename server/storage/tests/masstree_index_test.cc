@@ -201,18 +201,17 @@ TEST(MasstreeIndexTest, ConcurrentGetOrInsertReturnsTheSameEntry) {
   index::MasstreeReleaseThreadEpoch();
 }
 
-TEST(MasstreeIndexTest, PrimaryEntryKeepsItsPaxTable) {
+TEST(MasstreeIndexTest, PrimaryEntryTakesItsPaxSlotOnAllocation) {
   using namespace helios::storage;
   pax::TableSchema schema;
   schema.field_max_bytes = {1, 32};
   pax::PaxTable store(schema);
   index::MasstreeIndex tree;
-  tree.SetPaxTable(&store);
 
   DataItem *item = tree.GetOrInsert("row");
   ASSERT_NE(nullptr, item);
   EXPECT_FALSE(item->IsLive());
-  ASSERT_TRUE(item->AllocateSlot());
+  ASSERT_TRUE(item->AllocateSlot(store));
   EXPECT_EQ(1u, store.slots_allocated());
   EXPECT_EQ(store.group(0), item->pax_group());
   EXPECT_EQ(item, tree.GetOrInsert("row"));

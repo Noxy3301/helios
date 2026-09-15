@@ -30,35 +30,31 @@ helios::storage::Config MakeConfig() {
 bool CommitWrite(helios::storage::Database &db, const std::string &key,
                  const std::string &value) {
   std::string reason;
-  const bool committed =
-      db.Commit({}, {{kTable, key, TestHelper::Row(value)}}, {}, {},
-                helios::storage::CommitDurability::kSync, reason);
-  db.ReleaseThreadEpoch();
+  const bool committed = TestHelper::CommitRows(
+      db, {}, {{kTable, key, TestHelper::Row(value)}}, {}, {}, reason);
   EXPECT_TRUE(committed) << "write " << key << " aborted: " << reason;
   return committed;
 }
 
 bool CommitDelete(helios::storage::Database &db, const std::string &key) {
   std::string reason;
-  const bool committed =
-      db.Commit({}, {{kTable, key, "", helios::storage::RowOp::kDelete}}, {},
-                {}, helios::storage::CommitDurability::kSync, reason);
-  db.ReleaseThreadEpoch();
+  const bool committed = TestHelper::CommitRows(
+      db, {}, {{kTable, key, "", helios::storage::RowOp::kDelete}}, {}, {},
+      reason);
   EXPECT_TRUE(committed) << "delete " << key << " aborted: " << reason;
   return committed;
 }
 
 // Scans the range and assembles the evidence a caller submits at commit.
-helios::storage::ExternalRangeReadEntry ScanRange(helios::storage::Database &db,
-                                                  const std::string &start_key,
-                                                  const std::string &end_key,
-                                                  uint64_t row_limit = 0,
-                                                  bool reverse_scan = false) {
+TestHelper::Range ScanRange(helios::storage::Database &db,
+                            const std::string &start_key,
+                            const std::string &end_key, uint64_t row_limit = 0,
+                            bool reverse_scan = false) {
   auto scan = db.Scan(kTable, start_key, end_key, row_limit, reverse_scan);
   db.ReleaseThreadEpoch();
   EXPECT_TRUE(scan.ok) << "scan [" << start_key << ", " << end_key << ")";
 
-  helios::storage::ExternalRangeReadEntry range;
+  TestHelper::Range range;
   range.table_name = kTable;
   range.start_key = start_key;
   range.end_key = end_key;
@@ -73,13 +69,9 @@ helios::storage::ExternalRangeReadEntry ScanRange(helios::storage::Database &db,
   return range;
 }
 
-bool Revalidate(helios::storage::Database &db,
-                const helios::storage::ExternalRangeReadEntry &range,
+bool Revalidate(helios::storage::Database &db, const TestHelper::Range &range,
                 std::string &reason) {
-  const bool committed = db.Commit(
-      {}, {}, {}, {range}, helios::storage::CommitDurability::kSync, reason);
-  db.ReleaseThreadEpoch();
-  return committed;
+  return TestHelper::CommitRows(db, {}, {}, {}, {range}, reason);
 }
 
 void SeedRows(helios::storage::Database &db) {
@@ -92,10 +84,9 @@ void SeedRows(helios::storage::Database &db) {
 // the slot before validation runs, and an aborted commit leaves it behind.
 void LeaveAbsentSlot(helios::storage::Database &db, const std::string &key) {
   std::string reason;
-  const bool committed =
-      db.Commit({{kTable, "k1", 0}}, {{kTable, key, TestHelper::Row("v")}}, {},
-                {}, helios::storage::CommitDurability::kSync, reason);
-  db.ReleaseThreadEpoch();
+  const bool committed = TestHelper::CommitRows(
+      db, {{kTable, "k1", 0}}, {{kTable, key, TestHelper::Row("v")}}, {}, {},
+      reason);
   ASSERT_FALSE(committed) << "the write was supposed to abort";
   EXPECT_FALSE(reason.empty()) << "an abort names its reason";
 }

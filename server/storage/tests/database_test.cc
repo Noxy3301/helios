@@ -101,7 +101,7 @@ TEST_F(DatabaseTest, DeleteRemovesKeyAcrossTransactions) {
 
 TEST_F(DatabaseTest, FailedCommitLeavesItsEpoch) {
   using namespace helios::storage;
-  const std::vector<ExternalWriteEntry> writes = {
+  const std::vector<TestHelper::RowWrite> writes = {
       {kTable, "new", TestHelper::Row("value")}};
   auto check_epoch_released = [&] {
     const auto view = db_->AcquirePaxView(1000);
@@ -109,28 +109,26 @@ TEST_F(DatabaseTest, FailedCommitLeavesItsEpoch) {
     db_->ReleasePaxView(view);
   };
 
-  ExternalRangeReadEntry invalid_range;
+  TestHelper::Range invalid_range;
   invalid_range.table_name = kTable;
   std::string reason;
-  EXPECT_FALSE(db_->Commit({}, writes, {}, {invalid_range},
-                           CommitDurability::kAsync, reason));
+  EXPECT_FALSE(TestHelper::CommitRows(*db_, {}, writes, {}, {invalid_range},
+                                      reason, CommitDurability::kAsync));
   EXPECT_EQ("range_end_key_missing", reason);
-  db_->ReleaseThreadEpoch();
   check_epoch_released();
 
-  EXPECT_FALSE(db_->Commit({}, writes, {{kTable, "missing_index", "s", "new"}},
-                           {}, CommitDurability::kAsync, reason));
+  EXPECT_FALSE(TestHelper::CommitRows(*db_, {}, writes,
+                                      {{kTable, "missing_index", "s", "new"}},
+                                      {}, reason, CommitDurability::kAsync));
   EXPECT_EQ("si_index_missing", reason);
-  db_->ReleaseThreadEpoch();
   check_epoch_released();
   EXPECT_FALSE(TestHelper::ReadRow(*db_, kTable, "new").has_value());
   EXPECT_TRUE(TestHelper::WriteRow(*db_, kTable, "new", TestHelper::Row("next")));
 
-  EXPECT_FALSE(db_->Commit(
-      {}, {{kTable, "new", TestHelper::Row("duplicate"), RowOp::kInsert}},
-      {}, {}, CommitDurability::kAsync, reason));
+  EXPECT_FALSE(TestHelper::CommitRows(
+      *db_, {}, {{kTable, "new", TestHelper::Row("duplicate"), RowOp::kInsert}},
+      {}, {}, reason, CommitDurability::kAsync));
   EXPECT_EQ("duplicate_primary_key", reason);
-  db_->ReleaseThreadEpoch();
   check_epoch_released();
   EXPECT_EQ(TestHelper::Row("next"), TestHelper::ReadRow(*db_, kTable, "new").value());
 }
@@ -139,7 +137,7 @@ TEST_F(DatabaseTest, ThreadSafetyWrites) {
   constexpr int kValue = 0xBEEF;
   constexpr size_t kKeys = 11;
 
-  std::vector<helios::storage::ExternalWriteEntry> writes;
+  std::vector<TestHelper::RowWrite> writes;
   for (size_t idx = 0; idx < kKeys; idx++) {
     writes.push_back(
         {kTable, "alice" + std::to_string(idx), TestHelper::Pack<int>(kValue)});

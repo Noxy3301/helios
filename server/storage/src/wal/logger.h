@@ -75,11 +75,10 @@ class Logger {
   ~Logger();
 
   /**
-   * @brief Buffers one committed transaction's log entries.
-   * @return Whether anything was buffered: entries that produce no logged
-   * writes have nothing to make durable, and the commit path must not wait.
+   * @brief Buffers one committed transaction's record.
+   * @note The caller passes only records that hold writes.
    */
-  bool Enqueue(const LogEntries &log_entries, EpochNumber epoch);
+  void Enqueue(LogRecord record);
 
   /**
    * @brief Scans the log and zeroes the tail at its first invalid frame.
@@ -122,13 +121,13 @@ class Logger {
 
   /**
    * @brief Returns once the transaction that committed in `commit_epoch` may
-   * be acknowledged: at once when `awaits_durability` is false, and after
+   * be reported: at once when `awaits_durability` is false, and after
    * `commit_epoch` is durable when it is true.
-   * @details The decision is the caller's, not this method's, so that a
-   * durability switch cannot land between the caller's callback placement and
-   * this wait and make the two disagree. A commit whose record cannot be made
+   * @details The decision is the caller's, not this method's, so a switch of
+   * the setting cannot land between the caller's enqueue and this wait and
+   * make the two disagree. A commit whose record cannot be made
    * durable stops the process: it has passed its serialization point, so an
-   * abort would be a lie and an acknowledgement would be the lie the contract
+   * abort would be a lie and a report would be the lie the contract
    * exists to prevent.
    * @note The caller must have left its epoch, as WaitUntilDurable requires.
    */
@@ -144,8 +143,8 @@ class Logger {
   /**
    * @brief Makes a later log I/O failure terminate the process.
    * @details Without it a write failure only wakes waiters as Failed, and
-   * under the async commit ack nobody waits: the process would keep
-   * acknowledging commits that exist only in memory.
+   * under Async nobody waits: the process would keep reporting commits that
+   * exist only in memory.
    * @note Left unarmed when a test constructs a Logger directly, so Failed
    * can be observed.
    */

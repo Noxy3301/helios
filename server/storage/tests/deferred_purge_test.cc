@@ -33,30 +33,23 @@ helios::storage::Config MakeConfig(size_t epoch_duration_ms) {
 bool CommitWrite(helios::storage::Database &db, const std::string &key,
                  const std::string &value) {
   std::string commit_reason;
-  const bool committed =
-      db.Commit({}, {{kTable, key, TestHelper::Row(value)}}, {}, {},
-                helios::storage::CommitDurability::kSync, commit_reason);
-  db.ReleaseThreadEpoch();
-  return committed;
+  return TestHelper::CommitRows(db, {}, {{kTable, key, TestHelper::Row(value)}},
+                                {}, {}, commit_reason);
 }
 
 bool CommitInsert(helios::storage::Database &db, const std::string &key,
                   const std::string &value, std::string &reason) {
-  const bool committed = db.Commit(
-      {},
+  return TestHelper::CommitRows(
+      db, {},
       {{kTable, key, TestHelper::Row(value), helios::storage::RowOp::kInsert}},
-      {}, {}, helios::storage::CommitDurability::kSync, reason);
-  db.ReleaseThreadEpoch();
-  return committed;
+      {}, {}, reason);
 }
 
 bool CommitDelete(helios::storage::Database &db, const std::string &key) {
   std::string commit_reason;
-  const bool committed =
-      db.Commit({}, {{kTable, key, "", helios::storage::RowOp::kDelete}}, {},
-                {}, helios::storage::CommitDurability::kSync, commit_reason);
-  db.ReleaseThreadEpoch();
-  return committed;
+  return TestHelper::CommitRows(
+      db, {}, {{kTable, key, "", helios::storage::RowOp::kDelete}}, {}, {},
+      commit_reason);
 }
 
 helios::storage::ReadResult Read(helios::storage::Database &db,
@@ -70,11 +63,8 @@ helios::storage::ReadResult Read(helios::storage::Database &db,
 bool ValidateRead(helios::storage::Database &db,
                   const helios::storage::ReadResult &read,
                   const std::string &key, std::string &reason) {
-  const bool committed =
-      db.Commit({{kTable, key, read.tid}}, {}, {}, {},
-                helios::storage::CommitDurability::kSync, reason);
-  db.ReleaseThreadEpoch();
-  return committed;
+  return TestHelper::CommitRows(db, {{kTable, key, read.tid}}, {}, {}, {},
+                                reason);
 }
 
 bool StartsWith(const std::string &value, const std::string &prefix) {
@@ -192,24 +182,22 @@ TEST(DeferredPurgeTest, TwoInsertsOfOneKeyInARequestAreRefused) {
 
   const std::string key = "twice_inserted_key";
   std::string reason;
-  EXPECT_FALSE(db.Commit(
-      {},
+  EXPECT_FALSE(TestHelper::CommitRows(
+      db, {},
       {{kTable, key, TestHelper::Row("v1"), helios::storage::RowOp::kInsert},
        {kTable, key, TestHelper::Row("v2"), helios::storage::RowOp::kInsert}},
-      {}, {}, helios::storage::CommitDurability::kSync, reason));
-  db.ReleaseThreadEpoch();
+      {}, {}, reason));
   EXPECT_EQ(reason, helios::storage::kDuplicatePrimaryKeyAbortReason);
   EXPECT_FALSE(Read(db, key).found);
 
   // Deleted in between, the second insert is not a duplicate.
   reason.clear();
-  EXPECT_TRUE(db.Commit(
-      {},
+  EXPECT_TRUE(TestHelper::CommitRows(
+      db, {},
       {{kTable, key, TestHelper::Row("v1"), helios::storage::RowOp::kInsert},
        {kTable, key, "", helios::storage::RowOp::kDelete},
        {kTable, key, TestHelper::Row("v2"), helios::storage::RowOp::kInsert}},
-      {}, {}, helios::storage::CommitDurability::kSync, reason));
-  db.ReleaseThreadEpoch();
+      {}, {}, reason));
   const auto live = Read(db, key);
   EXPECT_TRUE(live.found);
   EXPECT_EQ(live.value, "v2");

@@ -174,16 +174,13 @@ void FoldPrimary(const Write &write, LogEntries &recovery_entries,
 
   positions.emplace(std::make_pair(write.table_name, write.key),
                     recovery_entries.size());
-  LogEntry entry = {
-      write.key,
-      reinterpret_cast<const std::byte *>(write.buffer.data()),
-      write.buffer.size(),
-      nullptr,
-      write.table_name,
-      write.index_name,
-      write.transaction_id,
-      static_cast<IndexConstraint>(write.index_type),
-  };
+  LogEntry entry;
+  entry.key = write.key;
+  entry.value = write.buffer;
+  entry.tid = write.transaction_id;
+  entry.table_name = write.table_name;
+  entry.index_name = write.index_name;
+  entry.index_type = static_cast<IndexConstraint>(write.index_type);
   recovery_entries.emplace_back(std::move(entry));
 }
 
@@ -208,15 +205,13 @@ void GroupSecondary(const SecondaryOps &ops, LogEntries &recovery_entries) {
     entry.primary_keys.erase(
         std::unique(entry.primary_keys.begin(), entry.primary_keys.end()),
         entry.primary_keys.end());
-    LogEntry log_entry = {group_key.secondary_key,
-                          nullptr,
-                          0,
-                          nullptr,
-                          group_key.table_name,
-                          group_key.index_name,
-                          entry.max_tid,
-                          static_cast<IndexConstraint>(group_key.index_type)};
+    LogEntry log_entry;
+    log_entry.key = group_key.secondary_key;
+    log_entry.tid = entry.max_tid;
     log_entry.primary_keys = std::move(entry.primary_keys);
+    log_entry.table_name = group_key.table_name;
+    log_entry.index_name = group_key.index_name;
+    log_entry.index_type = static_cast<IndexConstraint>(group_key.index_type);
     recovery_entries.emplace_back(std::move(log_entry));
   }
 }
@@ -265,51 +260,11 @@ Logger::Logger(const Config &config, WalIo io)
 
 Logger::~Logger() { Stop(); }
 
-bool Logger::Enqueue(const LogEntries &log_entries, EpochNumber epoch) {
-  // Build the record before taking this producer's buffer lock.
-  LogRecord log_record;
-  log_record.epoch = epoch;
-
-  for (auto &entry : log_entries) {
-    if (entry.index_name.empty()) {
-      LogRecord::Write write;
-      write.key = entry.key;
-      write.buffer = entry.value;
-      write.transaction_id = entry.tid;
-      write.table_name = entry.table_name;
-      write.index_name = entry.index_name;
-      write.index_type = static_cast<uint32_t>(entry.index_type);
-      write.primary_keys = entry.primary_keys;
-      write.secondary_op = SecondaryIndexOp::kNone;
-      log_record.writes.emplace_back(std::move(write));
-      continue;
-    }
-
-    if (entry.secondary_index_deltas.empty()) continue;
-    for (const auto &delta : entry.secondary_index_deltas) {
-      LogRecord::Write write;
-      write.key = entry.key;
-      write.buffer = entry.value;
-      write.transaction_id = entry.tid;
-      write.table_name = entry.table_name;
-      write.index_name = entry.index_name;
-      write.index_type = static_cast<uint32_t>(entry.index_type);
-      write.secondary_op = delta.op;
-      write.secondary_primary_key = delta.primary_key;
-      log_record.writes.emplace_back(std::move(write));
-    }
-  }
-
-  // Decided after building the record: secondary log entries without deltas
-  // produce nothing to persist, and the commit path must not wait for a record
-  // that was never buffered.
-  if (log_record.writes.empty()) return false;
-
+void Logger::Enqueue(LogRecord record) {
   // Append to this thread's buffer; the worker collects it later.
   auto *buffer = buffers_.Get();
   std::lock_guard<std::mutex> lock(buffer->mutex);
-  buffer->records.emplace_back(std::move(log_record));
-  return true;
+  buffer->records.emplace_back(std::move(record));
 }
 
 Logger::RecoveryResult Logger::FailRecovery(const WalScanResult &wal) {
@@ -400,7 +355,7 @@ void Logger::PublishDurable(EpochNumber durable_epoch) {
     const EpochNumber previous = durable_epoch_.load(std::memory_order_seq_cst);
     if (durable_epoch < previous) {
       // The durable epoch is the promise the commit path hands to callers;
-      // moving it backwards would retract an acknowledgement.
+      // moving it backwards would retract a commit already reported.
       SPDLOG_CRITICAL(
           "Durability Error: the durable epoch moved backwards, {0} to {1}",
           previous, durable_epoch);
@@ -426,7 +381,7 @@ void Logger::PublishFailure(int error_number) {
       state_ = State::kFailed;
       SPDLOG_CRITICAL(
           "Durability Error: the log cannot be written (errno {0}); no "
-          "further commit is acknowledged as durable",
+          "further commit is reported durable",
           error_number);
     }
   }
@@ -487,7 +442,7 @@ void Logger::AwaitCommitDurability(EpochNumber commit_epoch,
       sampled && durable_epoch_.load(std::memory_order_seq_cst) < commit_epoch;
 
   // Deadline::max() cannot time out, so any result other than Durable is a
-  // stop or an I/O failure and must not be acknowledged.
+  // stop or an I/O failure and must not be reported.
   const auto result = WaitUntilDurable(commit_epoch, Deadline::max());
   if (sampled) {
     trace.RecordCommit(commit_epoch, wait_enter, FlushTrace::Now(),
@@ -497,7 +452,7 @@ void Logger::AwaitCommitDurability(EpochNumber commit_epoch,
 
   SPDLOG_CRITICAL(
       "Durability Error: the log for epoch {0} did not become durable, and the "
-      "transaction that committed in it cannot be acknowledged",
+      "transaction that committed in it cannot be reported",
       commit_epoch);
   std::abort();
 }

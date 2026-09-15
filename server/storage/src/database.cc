@@ -32,11 +32,6 @@
 #include "index/masstree_index.h"
 #include "index/secondary_index.h"
 #include "pax/catalog.h"
-#include "silo/commit.h"
-#include "silo/read.h"
-#include "silo/read_set.h"
-#include "silo/write_set.h"
-#include "util/debug_sync.h"
 #include "util/spdlog.h"
 #include "wal/flush_trace.h"
 #include "wal/log_entry.h"
@@ -65,8 +60,7 @@ Database::Database(const Config &config)
     : config_(config),
       logger_(config_),
       epoch_framework_(config_.epoch_duration_ms, MakeEpochHook()),
-      scan_checkpoint_(config_, table_dictionary_, epoch_framework_, logger_),
-      commit_executor_(table_dictionary_, epoch_framework_, reaper_) {
+      scan_checkpoint_(config_, table_dictionary_, epoch_framework_, logger_) {
   SPDLOG_INFO("Storage instance has been constructed.");
 
   // Restore column definitions before any recovered value is installed.
@@ -180,164 +174,6 @@ bool Database::CreateSecondaryIndex(const std::string_view table_name,
   return table->CreateSecondaryIndex(index_name, index_type);
 }
 
-ReadResult Database::Read(const std::string_view table_name,
-                          const std::string_view key,
-                          const std::vector<uint32_t> *selected_columns) {
-  return silo::Read(table_dictionary_, table_name, key, selected_columns);
-}
-
-std::vector<ReadResult> Database::BatchRead(
-    const std::vector<std::pair<std::string, std::string>> &keys) {
-  return silo::BatchRead(table_dictionary_, keys);
-}
-
-ScanResult Database::Scan(const std::string_view table_name,
-                          const std::string_view start_key,
-                          const std::string_view end_key, uint64_t row_limit,
-                          bool reverse_scan,
-                          const std::vector<uint32_t> *selected_columns) {
-  return silo::Scan(table_dictionary_, table_name, start_key, end_key,
-                    row_limit, reverse_scan, selected_columns);
-}
-
-ScanIndexResult Database::ScanIndex(
-    const std::string_view table_name, const std::string_view index_name,
-    const std::string_view start_key, const std::string_view end_key,
-    uint64_t row_limit, bool reverse_scan,
-    const std::vector<uint32_t> *selected_columns) {
-  return silo::ScanIndex(table_dictionary_, table_name, index_name, start_key,
-                         end_key, row_limit, reverse_scan, selected_columns);
-}
-
-ScanPaxResult Database::ScanPax(const std::string_view table_name,
-                                const std::string_view start_key,
-                                const std::string_view end_key,
-                                uint64_t row_limit, bool reverse_scan) {
-  return silo::ScanPax(table_dictionary_, table_name, start_key, end_key,
-                       row_limit, reverse_scan);
-}
-
-bool Database::ResolveWrites(
-    const std::vector<silo::Write> &writes,
-    const std::vector<ExternalSecondaryIndexEntry> &secondary_index_ops,
-    silo::WriteSet &write_set, std::string &abort_reason) {
-  for (const auto &write : writes) {
-    auto *table = GetTable(write.table_name);
-    if (!table) {
-      abort_reason = "write_table_missing";
-      return false;
-    }
-
-    if (!table->GetPaxTable()) {
-      abort_reason = "pax_schema_missing";
-      return false;
-    }
-
-    if (!write_set.AddRow(table->GetPrimaryIndex(), write, abort_reason))
-      return false;
-  }
-
-  for (const auto &change : secondary_index_ops) {
-    auto *table = GetTable(change.table_name);
-    if (!table) {
-      abort_reason = "si_table_missing";
-      return false;
-    }
-
-    if (!table->GetPaxTable()) {
-      abort_reason = "pax_schema_missing";
-      return false;
-    }
-
-    auto *index = table->GetSecondaryIndex(change.index_name);
-    if (!index) {
-      abort_reason = "si_index_missing";
-      return false;
-    }
-
-    if (!write_set.AddIndex(index->tree, index->constraint, change, abort_reason))
-      return false;
-  }
-
-  return true;
-}
-
-bool Database::Commit(
-    const std::vector<ExternalReadEntry> &reads,
-    const std::vector<ExternalWriteEntry> &writes,
-    const std::vector<ExternalSecondaryIndexEntry> &secondary_index_ops,
-    const std::vector<ExternalRangeReadEntry> &range_reads,
-    CommitDurability durability, std::string &abort_reason) {
-  abort_reason.clear();
-
-  // Convert input bytes before the commit protocol acquires any row locks.
-  std::vector<silo::Write> decoded_writes;
-  decoded_writes.reserve(writes.size());
-  // GetPaxTable synchronizes lookup; its schema remains valid and unchanged
-  // until shutdown.
-  for (const auto &write : writes) {
-    auto *table = GetTable(write.table_name);
-    if (table == nullptr) {
-      abort_reason = "write_table_missing";
-      return false;
-    }
-    const auto *store = table->GetPaxTable();
-    if (store == nullptr) {
-      abort_reason = "pax_schema_missing";
-      return false;
-    }
-    silo::Write entry{write.table_name, write.key, {}, write.op};
-    if (write.op != RowOp::kDelete &&
-        !pax::DecodeRow(store->schema(),
-                        reinterpret_cast<const std::byte *>(write.value.data()),
-                        write.value.size(), entry.value)) {
-      abort_reason = "pax_row_decode_failed";
-      return false;
-    }
-    decoded_writes.emplace_back(std::move(entry));
-  }
-  Tidword &last_commit_tid = *last_commit_tids_.Get();
-  silo::ReadSet read_set{reads, range_reads};
-  silo::WriteSet write_set;
-  epoch_framework_.Join();
-  if (!read_set.CheckRangeBounds()) {
-    abort_reason = "range_end_key_missing";
-    epoch_framework_.Leave();
-    return false;
-  }
-  if (!ResolveWrites(decoded_writes, secondary_index_ops, write_set,
-                     abort_reason)) {
-    epoch_framework_.Leave();
-    return false;
-  }
-
-  // Test hook after every write target is claimed in its index.
-  if (std::any_of(decoded_writes.begin(), decoded_writes.end(),
-                  [](const auto &write) { return write.op == RowOp::kInsert; }))
-    HELIOS_DEBUG_SYNC("silo_commit.after_index_claim");
-
-  // Run the Silo commit protocol and collect logs for the committed updates.
-  wal::LogEntries log_entries;
-  const bool committed = commit_executor_.Commit(
-      read_set, write_set, last_commit_tid, log_entries, abort_reason);
-
-  // Buffer logs before leaving the epoch so flushing cannot pass this commit.
-  bool awaits_durability = false;
-  if (committed) {
-    awaits_durability = !log_entries.empty() &&
-                       logger_.Enqueue(log_entries, last_commit_tid.epoch) &&
-                       durability == CommitDurability::kSync;
-    HELIOS_DEBUG_SYNC("silo_commit.before_offline");
-  }
-
-  epoch_framework_.Leave();
-  if (!committed) return false;
-
-  // Leave before waiting so this worker does not hold back epoch advancement.
-  logger_.AwaitCommitDurability(last_commit_tid.epoch, awaits_durability);
-  return true;
-}
-
 Table *Database::GetTable(const std::string_view table_name) const {
   return table_dictionary_.GetTable(table_name);
 }
@@ -385,7 +221,7 @@ void Database::Recover() {
     highest_epoch = std::max<EpochNumber>(highest_epoch, entry.tid.epoch);
 
     if (entry.index_name.empty()) {
-      DataItem item(*table->GetPaxTable());
+      DataItem item;
       const auto *bytes =
           reinterpret_cast<const std::byte *>(entry.value.data());
       pax::Row row;
@@ -395,12 +231,12 @@ void Database::Recover() {
                         entry.key, entry.table_name);
         exit(EXIT_FAILURE);
       }
-      if (!item.AllocateSlot()) {
+      if (!item.AllocateSlot(*table->GetPaxTable())) {
         SPDLOG_CRITICAL("Recovery failed: no PAX slot for {} in {}", entry.key,
                         entry.table_name);
         exit(EXIT_FAILURE);
       }
-      item.Write(row);
+      item.InstallRow(row, entry.tid.epoch);
       item.transaction_id.store(entry.tid);
       table->GetPrimaryIndex().Put(entry.key, std::move(item));
     } else {

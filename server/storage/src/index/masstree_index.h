@@ -11,8 +11,6 @@
 #include <optional>
 #include <string_view>
 
-#include "lineairdb/pax.h"
-
 #include "index/data_item.h"
 
 namespace helios::storage {
@@ -28,20 +26,12 @@ class MasstreeIndex final {
   MasstreeIndex();
   ~MasstreeIndex();
 
-  /**
-   * @brief Sets the PAX table for new primary entries; does not own it.
-   * @details Secondary indexes leave this null and store primary-key lists.
-   */
-  void SetPaxTable(pax::PaxTable *store);
-
   DataItem *Get(std::string_view key);
   void Put(std::string_view key, DataItem &&value);
 
   /**
    * @brief Gets the entry for key, creating an absent DataItem if needed.
    * @details Commit must recheck the key after locking the item.
-   * @pre On a primary index the caller has observed the table's PAX store
-   * through Table::GetPaxTable, which orders it before the store read here.
    * @return Non-null; allocation failure throws.
    */
   DataItem *GetOrInsert(std::string_view key);

@@ -30,7 +30,6 @@ bool Table::InstallPaxSchema(pax::TableSchema schema) {
   std::unique_lock<std::shared_mutex> lk(table_lock_);
   if (pax_table_ != nullptr) return false;
   pax_table_ = std::make_unique<pax::PaxTable>(std::move(schema));
-  primary_index_.SetPaxTable(pax_table_.get());
   return true;
 }
 

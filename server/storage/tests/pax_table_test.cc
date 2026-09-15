@@ -113,15 +113,15 @@ TEST(PaxTableTest, Stores512DataColumns) {
 TEST(PaxTableTest, CopyStaysWithinTheReadersBufferAfterRowGrowth) {
   const TableSchema schema = MakeSchema({1, 64}, {});
   helios::storage::pax::PaxTable store(schema);
-  helios::storage::DataItem item(store);
+  helios::storage::DataItem item;
   helios::storage::pax::Row decoded;
   const auto small = PackRow({std::string(1, '\0'), "a"});
   const auto large = PackRow({std::string(1, '\0'), std::string(64, 'b')});
   ASSERT_TRUE(helios::storage::pax::DecodeRow(
       schema, reinterpret_cast<const std::byte *>(small.data()), small.size(),
       decoded));
-  ASSERT_TRUE(item.AllocateSlot());
-  item.Write(decoded);
+  ASSERT_TRUE(item.AllocateSlot(store));
+  item.InstallRow(decoded, 1);
 
   // A reader sizes its output, then a writer grows the row before the copy.
   const size_t capacity = item.size();
@@ -130,7 +130,7 @@ TEST(PaxTableTest, CopyStaysWithinTheReadersBufferAfterRowGrowth) {
   ASSERT_TRUE(helios::storage::pax::DecodeRow(
       schema, reinterpret_cast<const std::byte *>(large.data()), large.size(),
       decoded));
-  item.Write(decoded);
+  item.InstallRow(decoded, 1);
   const size_t copied = item.GatherInto(buffer.data(), capacity);
   EXPECT_LE(copied, capacity);
   bool guard_intact = true;
@@ -140,7 +140,7 @@ TEST(PaxTableTest, CopyStaysWithinTheReadersBufferAfterRowGrowth) {
   EXPECT_TRUE(guard_intact);
 
   // Deletion between allocation and copying also keeps the same bound.
-  item.Delete();
+  item.DeleteRow(1);
   EXPECT_LE(item.GatherInto(buffer.data(), capacity), capacity);
 }
 

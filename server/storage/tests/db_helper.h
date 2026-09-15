@@ -11,11 +11,12 @@
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <type_traits>
 #include <utility>
 #include <vector>
 
-#include "lineairdb/commit.h"
+#include "lineairdb/transaction.h"
 #include "lineairdb/database.h"
 #include "lineairdb/read.h"
 
@@ -28,6 +29,58 @@ namespace TestHelper {
 
 // Sorts above any key a test writes, for scans that mean "to the end".
 inline const std::string kMaxKey = "\xff\xff\xff\xff";
+
+// One batch of each kind of input, owned by the caller so the transaction can
+// borrow the bytes until it commits.
+struct PointRead {
+  std::string table, key;
+  uint64_t tid = 0;
+};
+
+struct RowWrite {
+  std::string table, key, value;
+  helios::storage::RowOp op = helios::storage::RowOp::kUpdate;
+};
+
+struct IndexOp {
+  std::string table, index, secondary_key, primary_key;
+  bool remove = false;
+};
+
+struct Range {
+  std::string table_name, index_name, start_key, end_key;
+  uint64_t row_limit = 0;
+  bool reverse_scan = false;
+  std::vector<std::string> result_keys, result_primary_keys;
+};
+
+// Feeds reads, ranges, writes and index ops in that order; false with reason
+// on the first refusal.
+inline bool Feed(helios::storage::silo::Transaction &tx,
+                 const std::vector<PointRead> &reads,
+                 const std::vector<Range> &ranges,
+                 const std::vector<RowWrite> &writes,
+                 const std::vector<IndexOp> &index_ops, std::string &reason) {
+  for (const auto &read : reads)
+    tx.Read(read.table, read.key, helios::storage::Tidword(read.tid));
+  for (const auto &range : ranges) {
+    const std::vector<std::string_view> keys(range.result_keys.begin(),
+                                             range.result_keys.end());
+    const std::vector<std::string_view> primary_keys(
+        range.result_primary_keys.begin(), range.result_primary_keys.end());
+    tx.RangeRead(range.table_name, range.index_name, range.start_key,
+                 range.end_key, range.row_limit, range.reverse_scan, keys,
+                 primary_keys);
+  }
+  for (const auto &write : writes)
+    if (!tx.Write(write.table, write.key, write.value, write.op, reason))
+      return false;
+  for (const auto &op : index_ops)
+    if (!tx.IndexWrite(op.table, op.index, op.secondary_key, op.primary_key,
+                       op.remove, reason))
+      return false;
+  return true;
+}
 
 // Most tests use one binary payload column; PAX-specific tests supply their
 // complete row format through CommitRows/WriteRow/ReadRow instead.
@@ -86,27 +139,30 @@ T Unpack(const std::string &value) {
   return buf;
 }
 
-inline bool CommitRows(
-    helios::storage::Database &db,
-    const std::vector<helios::storage::ExternalReadEntry> &reads,
-    const std::vector<helios::storage::ExternalWriteEntry> &writes,
-    const std::vector<helios::storage::ExternalSecondaryIndexEntry> &index_ops,
-    const std::vector<helios::storage::ExternalRangeReadEntry> &ranges,
-    std::string &abort_reason) {
-  const bool committed =
-      db.Commit(reads, writes, index_ops, ranges,
-                helios::storage::CommitDurability::kSync, abort_reason);
+inline bool CommitRows(helios::storage::Database &db,
+                       const std::vector<PointRead> &reads,
+                       const std::vector<RowWrite> &writes,
+                       const std::vector<IndexOp> &index_ops,
+                       const std::vector<Range> &ranges,
+                       std::string &abort_reason,
+                       helios::storage::CommitDurability durability =
+                           helios::storage::CommitDurability::kSync) {
+  helios::storage::silo::Transaction tx(db);
+  if (!Feed(tx, reads, ranges, writes, index_ops, abort_reason)) {
+    db.ReleaseThreadEpoch();
+    return false;
+  }
+  const bool committed = tx.Commit(durability, abort_reason);
   db.ReleaseThreadEpoch();
   return committed;
 }
 
-inline bool Commit(
-    helios::storage::Database &db,
-    const std::vector<helios::storage::ExternalReadEntry> &reads,
-    const std::vector<helios::storage::ExternalWriteEntry> &writes,
-    const std::vector<helios::storage::ExternalSecondaryIndexEntry> &index_ops,
-    const std::vector<helios::storage::ExternalRangeReadEntry> &ranges,
-    std::string &abort_reason) {
+inline bool Commit(helios::storage::Database &db,
+                   const std::vector<PointRead> &reads,
+                   const std::vector<RowWrite> &writes,
+                   const std::vector<IndexOp> &index_ops,
+                   const std::vector<Range> &ranges,
+                   std::string &abort_reason) {
   auto rows = writes;
   for (auto &write : rows) {
     if (write.op != helios::storage::RowOp::kDelete)
@@ -121,11 +177,9 @@ inline bool WriteRow(helios::storage::Database &db, const std::string &table,
   return CommitRows(db, {}, {{table, key, row}}, {}, {}, commit_reason);
 }
 
-inline bool CommitWrites(
-    helios::storage::Database &db,
-    const std::vector<helios::storage::ExternalWriteEntry> &writes,
-    const std::vector<helios::storage::ExternalSecondaryIndexEntry> &index_ops =
-        {}) {
+inline bool CommitWrites(helios::storage::Database &db,
+                         const std::vector<RowWrite> &writes,
+                         const std::vector<IndexOp> &index_ops = {}) {
   std::string commit_reason;
   return Commit(db, {}, writes, index_ops, {}, commit_reason);
 }

@@ -1,9 +1,10 @@
 /**
  * @file server/storage/src/silo/read.cc
- * Point and range reads from primary and secondary indexes.
+ * The read side of Database: point reads and range scans over the primary
+ * and secondary indexes.
  */
 
-#include "silo/read.h"
+#include "lineairdb/database.h"
 
 #include "index/data_item.h"
 #include "index/secondary_index.h"
@@ -13,41 +14,39 @@
 #include "table/table_dictionary.h"
 
 namespace helios::storage {
-namespace silo {
 
-ReadResult Read(TableDictionary &tables, const std::string_view table_name,
-                const std::string_view key,
-                const std::vector<uint32_t> *selected_columns) {
-  auto table = tables.GetTable(table_name);
+ReadResult Database::Read(const std::string_view table_name,
+                          const std::string_view key,
+                          const std::vector<uint32_t> *selected_columns) {
+  auto table = GetTable(table_name);
   if (table == nullptr) return {};
 
   DataItem *item = table->GetPrimaryIndex().Get(key);
   if (item == nullptr) return {false, {}, Tidword::Absent().obj};
 
-  auto row = StableRead(*item, selected_columns);
+  auto row = silo::StableRead(*item, selected_columns);
   return {row.found, std::move(row.value), row.tid.obj};
 }
 
-std::vector<ReadResult> BatchRead(
-    TableDictionary &tables,
+std::vector<ReadResult> Database::BatchRead(
     const std::vector<std::pair<std::string, std::string>> &keys) {
   std::vector<ReadResult> results;
   results.reserve(keys.size());
   for (const auto &[table_name, key] : keys) {
-    results.emplace_back(Read(tables, table_name, key));
+    results.emplace_back(Read(table_name, key));
   }
   return results;
 }
 
-ScanResult Scan(TableDictionary &tables, const std::string_view table_name,
-                const std::string_view start_key,
-                const std::string_view end_key, uint64_t row_limit,
-                bool reverse_scan,
-                const std::vector<uint32_t> *selected_columns) {
+ScanResult Database::Scan(const std::string_view table_name,
+                          const std::string_view start_key,
+                          const std::string_view end_key, uint64_t row_limit,
+                          bool reverse_scan,
+                          const std::vector<uint32_t> *selected_columns) {
   ScanResult result;
   if (end_key.empty()) return result;
 
-  auto table = tables.GetTable(table_name);
+  auto table = GetTable(table_name);
   if (table == nullptr) return result;
   result.ok = true;
 
@@ -55,7 +54,7 @@ ScanResult Scan(TableDictionary &tables, const std::string_view table_name,
 
   // Copy each live row from the DataItem found by the scan.
   auto append_scan_entry = [&](std::string_view key, DataItem &item) {
-    auto row = StableRead(item, selected_columns);
+    auto row = silo::StableRead(item, selected_columns);
     if (row.found) {
       result.rows.push_back(
           {std::string(key), std::move(row.value), row.tid.obj});
@@ -73,26 +72,20 @@ ScanResult Scan(TableDictionary &tables, const std::string_view table_name,
   return result;
 }
 
-}  // namespace silo
-
 uint64_t CurrentTid(const ScanPaxRow &row) {
   const auto *item = static_cast<const DataItem *>(row.item);
   return item->transaction_id.load().obj;
 }
 
-namespace silo {
-
-ScanIndexResult ScanIndex(TableDictionary &tables,
-                          const std::string_view table_name,
-                          const std::string_view index_name,
-                          const std::string_view start_key,
-                          const std::string_view end_key, uint64_t row_limit,
-                          bool reverse_scan,
-                          const std::vector<uint32_t> *selected_columns) {
+ScanIndexResult Database::ScanIndex(
+    const std::string_view table_name, const std::string_view index_name,
+    const std::string_view start_key, const std::string_view end_key,
+    uint64_t row_limit, bool reverse_scan,
+    const std::vector<uint32_t> *selected_columns) {
   ScanIndexResult result;
   if (end_key.empty()) return result;
 
-  auto table = tables.GetTable(table_name);
+  auto table = GetTable(table_name);
   if (table == nullptr) return result;
 
   index::SecondaryIndex *index = table->GetSecondaryIndex(index_name);
@@ -109,7 +102,7 @@ ScanIndexResult ScanIndex(TableDictionary &tables,
       return false;
     }
 
-    auto row = StableRead(*item, selected_columns);
+    auto row = silo::StableRead(*item, selected_columns);
     if (row.found) {
       result.rows.push_back({std::string(secondary_key),
                              std::string(primary_key), std::move(row.value),
@@ -122,7 +115,7 @@ ScanIndexResult ScanIndex(TableDictionary &tables,
   // Keep the key list alive while reading the referenced rows.
   auto append_secondary_entry = [&](std::string_view key, DataItem &item) {
     const std::string secondary_key(key);
-    const auto keys = StableReadKeys(item);
+    const auto keys = silo::StableReadKeys(item);
     for (std::string_view primary_key : keys.primary_keys_view()) {
       if (append_base_row(secondary_key, primary_key)) return true;
     }
@@ -137,15 +130,14 @@ ScanIndexResult ScanIndex(TableDictionary &tables,
   return result;
 }
 
-ScanPaxResult ScanPax(TableDictionary &tables,
-                      const std::string_view table_name,
-                      const std::string_view start_key,
-                      const std::string_view end_key, uint64_t row_limit,
-                      bool reverse_scan) {
+ScanPaxResult Database::ScanPax(const std::string_view table_name,
+                                const std::string_view start_key,
+                                const std::string_view end_key,
+                                uint64_t row_limit, bool reverse_scan) {
   ScanPaxResult result;
   if (end_key.empty()) return result;
 
-  Table *table = tables.GetTable(table_name);
+  Table *table = GetTable(table_name);
   if (table == nullptr) return result;
 
   auto *store = table->GetPaxTable();
@@ -156,7 +148,7 @@ ScanPaxResult ScanPax(TableDictionary &tables,
 
   auto append_pax_row = [&](std::string_view key, DataItem &item) {
     // Read an unlocked TID; the caller must recheck it after reading the cells.
-    const Tidword tid = StableTid(item);
+    const Tidword tid = silo::StableTid(item);
     if (tid.absent) return false;
 
     // Return the PAX location for the caller to read directly.
@@ -174,5 +166,4 @@ ScanPaxResult ScanPax(TableDictionary &tables,
   return result;
 }
 
-}  // namespace silo
 }  // namespace helios::storage

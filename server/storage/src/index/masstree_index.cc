@@ -149,9 +149,6 @@ struct MasstreeIndex::Impl {
     return nullptr;
   }
 
-  // Primary rows use PAX; secondary entries hold primary-key lists.
-  pax::PaxTable *pax_table_ = nullptr;
-
   // Insert or replace the entry with an owned DataItem.
   void Put(std::string_view key, DataItem &&value) {
     ensure_thread_active();
@@ -198,13 +195,7 @@ struct MasstreeIndex::Impl {
     // Recheck under the leaf lock before publishing a new absent entry.
     cursor_type lp(table_, key.data(), key.size());
     bool found = lp.find_insert(*tls_ti);
-    if (!found) {
-      if (pax_table_ != nullptr) {
-        lp.value() = new DataItem(*pax_table_);
-      } else {
-        lp.value() = new DataItem();
-      }
-    }
+    if (!found) lp.value() = new DataItem();
     DataItem *item = lp.value();
     fence();
     lp.finish(found ? 0 : 1, *tls_ti);
@@ -244,10 +235,6 @@ struct MasstreeIndex::Impl {
 MasstreeIndex::MasstreeIndex() : impl_(std::make_unique<Impl>()) {}
 
 MasstreeIndex::~MasstreeIndex() = default;
-
-void MasstreeIndex::SetPaxTable(pax::PaxTable *store) {
-  impl_->pax_table_ = store;
-}
 
 DataItem *MasstreeIndex::Get(std::string_view key) { return impl_->Get(key); }
 
