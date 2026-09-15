@@ -167,6 +167,8 @@ bool Database::CreateSecondaryIndex(const std::string_view table_name,
       index_type != IndexConstraint::kUnique) {
     return false;
   }
+  // An empty index name marks a primary record in the WAL
+  if (index_name.empty()) return false;
   // Serialized with the other definition changes.
   std::lock_guard<std::mutex> lk(ddl_mutex_);
   Table *table = GetTable(table_name);

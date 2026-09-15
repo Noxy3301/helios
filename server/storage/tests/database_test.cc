@@ -59,6 +59,13 @@ TEST_F(DatabaseTest, InstantiateWithConfig) {
   ASSERT_NO_THROW(db_ = std::make_unique<helios::storage::Database>(conf));
 }
 
+TEST_F(DatabaseTest, EmptySecondaryIndexNameIsRefused) {
+  EXPECT_FALSE(db_->CreateSecondaryIndex(
+      kTable, "", helios::storage::IndexConstraint::kNone));
+  EXPECT_TRUE(db_->CreateSecondaryIndex(
+      kTable, "idx", helios::storage::IndexConstraint::kNone));
+}
+
 TEST_F(DatabaseTest, LargeSizeBuffer) {
   const std::string alice(2048, '\1');
   ASSERT_TRUE(TestHelper::Write(*db_, kTable, "alice", alice));
