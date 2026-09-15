@@ -13,7 +13,6 @@
 #include "silo/write_set.h"
 #include "util/debug_sync.h"
 #include "util/epoch_framework.h"
-#include "wal/logger.h"
 
 namespace helios::storage {
 namespace silo {
@@ -22,7 +21,6 @@ namespace {
 
 // State shared by the steps of one commit attempt.
 struct CommitCtx {
-  epoch::Framework &epoch;
   const ReadSet &read_set;
   WriteSet &write_set;
   std::string &abort_reason;
@@ -36,7 +34,6 @@ struct CommitCtx {
   bool Abort(const std::string &reason) {
     abort_reason = reason;
     for (auto &[item, entry] : write_set) entry.Unlock(*item);
-    epoch.Leave();
     return false;
   }
 };
@@ -65,29 +62,21 @@ bool GenerateCommitTid(CommitCtx &ctx, const Tidword &last_commit_tid) {
   return true;
 }
 
-// Queue the log and report whether this commit must wait for durability.
-bool EnqueueLogEntries(wal::Logger &logger, wal::LogEntries &log_entries,
-                      EpochNumber commit_epoch, CommitDurability durability) {
-  if (log_entries.empty()) return false;
-  return logger.Enqueue(log_entries, commit_epoch) &&
-         durability == CommitDurability::kSync;
-}
-
 }  // namespace
 
 CommitExecutor::CommitExecutor(TableDictionary &tables,
                                epoch::Framework &epoch_framework,
-                               index::Reaper &reaper, wal::Logger &logger)
+                               index::Reaper &reaper)
     : tables_(tables),
       epoch_framework_(epoch_framework),
-      reaper_(reaper),
-      logger_(logger) {}
+      reaper_(reaper) {}
 
 bool CommitExecutor::Commit(const ReadSet &read_set, WriteSet &write_set,
                             Tidword &last_commit_tid,
-                            CommitDurability durability,
+                            wal::LogEntries &log_entries,
                             std::string &abort_reason) const {
-  CommitCtx ctx{epoch_framework_, read_set, write_set, abort_reason};
+  log_entries.clear();
+  CommitCtx ctx{read_set, write_set, abort_reason};
 
   // Phase 1: lock the write set, then read the global epoch.
   for (auto &[item, entry] : ctx.write_set) {
@@ -131,7 +120,6 @@ bool CommitExecutor::Commit(const ReadSet &read_set, WriteSet &write_set,
   }
 
   // Phase 3: install each record, copy its log, then publish and unlock it.
-  wal::LogEntries log_entries;
   log_entries.reserve(ctx.write_set.size());
   last_commit_tid = ctx.commit_tid;
   bool row_applied = false;
@@ -146,13 +134,6 @@ bool CommitExecutor::Commit(const ReadSet &read_set, WriteSet &write_set,
     entry.Publish(*item, ctx.commit_tid, reaper_);
     row_applied = row_applied || entry.IsRow();
   }
-  const bool awaits_durability =
-      EnqueueLogEntries(logger_, log_entries, ctx.commit_epoch, durability);
-
-  HELIOS_DEBUG_SYNC("silo_commit.before_offline");
-  epoch_framework_.Leave();
-
-  logger_.AwaitCommitDurability(ctx.commit_epoch, awaits_durability);
   return true;
 }
 

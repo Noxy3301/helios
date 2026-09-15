@@ -66,7 +66,7 @@ Database::Database(const Config &config)
       logger_(config_),
       epoch_framework_(config_.epoch_duration_ms, MakeEpochHook()),
       scan_checkpoint_(config_, table_dictionary_, epoch_framework_, logger_),
-      commit_executor_(table_dictionary_, epoch_framework_, reaper_, logger_) {
+      commit_executor_(table_dictionary_, epoch_framework_, reaper_) {
   SPDLOG_INFO("Storage instance has been constructed.");
 
   // Restore column definitions before any recovered value is installed.
@@ -321,9 +321,26 @@ bool Database::Commit(
                   [](const auto &write) { return write.op == RowOp::kInsert; }))
     HELIOS_DEBUG_SYNC("silo_commit.after_index_claim");
 
-  // The executor takes over the active epoch and leaves before durability waits.
-  return commit_executor_.Commit(read_set, write_set, last_commit_tid,
-                                 durability, abort_reason);
+  // Run the Silo commit protocol and collect logs for the committed updates.
+  wal::LogEntries log_entries;
+  const bool committed = commit_executor_.Commit(
+      read_set, write_set, last_commit_tid, log_entries, abort_reason);
+
+  // Buffer logs before leaving the epoch so flushing cannot pass this commit.
+  bool awaits_durability = false;
+  if (committed) {
+    awaits_durability = !log_entries.empty() &&
+                       logger_.Enqueue(log_entries, last_commit_tid.epoch) &&
+                       durability == CommitDurability::kSync;
+    HELIOS_DEBUG_SYNC("silo_commit.before_offline");
+  }
+
+  epoch_framework_.Leave();
+  if (!committed) return false;
+
+  // Leave before waiting so this worker does not hold back epoch advancement.
+  logger_.AwaitCommitDurability(last_commit_tid.epoch, awaits_durability);
+  return true;
 }
 
 Table *Database::GetTable(const std::string_view table_name) const {

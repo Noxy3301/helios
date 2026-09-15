@@ -99,7 +99,7 @@ TEST_F(DatabaseTest, DeleteRemovesKeyAcrossTransactions) {
   ASSERT_FALSE(TestHelper::Read<int>(*db_, kTable, "alice").has_value());
 }
 
-TEST_F(DatabaseTest, FailedSetPreparationLeavesItsEpoch) {
+TEST_F(DatabaseTest, FailedCommitLeavesItsEpoch) {
   using namespace helios::storage;
   const std::vector<ExternalWriteEntry> writes = {
       {kTable, "new", TestHelper::Row("value")}};
@@ -125,6 +125,14 @@ TEST_F(DatabaseTest, FailedSetPreparationLeavesItsEpoch) {
   check_epoch_released();
   EXPECT_FALSE(TestHelper::ReadRow(*db_, kTable, "new").has_value());
   EXPECT_TRUE(TestHelper::WriteRow(*db_, kTable, "new", TestHelper::Row("next")));
+
+  EXPECT_FALSE(db_->Commit(
+      {}, {{kTable, "new", TestHelper::Row("duplicate"), RowOp::kInsert}},
+      {}, {}, CommitDurability::kAsync, reason));
+  EXPECT_EQ("duplicate_primary_key", reason);
+  db_->ReleaseThreadEpoch();
+  check_epoch_released();
+  EXPECT_EQ(TestHelper::Row("next"), TestHelper::ReadRow(*db_, kTable, "new").value());
 }
 
 TEST_F(DatabaseTest, ThreadSafetyWrites) {

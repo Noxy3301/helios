@@ -16,6 +16,7 @@
 #include "lineairdb/read.h"
 
 #include "pax/table.h"
+#include "wal/log_entry.h"
 
 namespace helios::storage {
 
@@ -24,10 +25,6 @@ struct Tidword;
 namespace epoch {
 class Framework;
 }  // namespace epoch
-
-namespace wal {
-class Logger;
-}
 
 namespace index {
 class Reaper;
@@ -64,23 +61,23 @@ class CommitExecutor {
    * @brief Binds components that must outlive this executor.
    */
   CommitExecutor(TableDictionary &tables, epoch::Framework &epoch_framework,
-                 index::Reaper &reaper, wal::Logger &logger);
+                 index::Reaper &reaper);
 
   /**
    * @brief Runs the Silo commit protocol on the caller's prepared sets.
    * @pre The same thread has joined this executor's epoch framework. Range
    * bounds are checked; write targets are resolved and this attempt holds no
    * row locks yet.
-   * @details This call takes over the active epoch: it leaves on success or
-   * abort, and performs the existing Leave/Join refresh after taking locks.
-   * The caller must not call Leave again after this method returns.
-   * Input observations and decoded rows borrowed by the sets stay valid until
-   * return. Durability is awaited only after leaving the epoch.
+   * @details Refreshes the active epoch with Leave/Join after taking locks,
+   * then returns with the caller still participating on success or abort.
+   * The caller must enqueue successful logs before Leave, and leave before
+   * waiting for durability. Input observations and decoded rows borrowed by
+   * the sets stay valid until return.
    *
    * The protocol locks the write set and reads the epoch, validates read
    * observations, then chooses one commit TID (Silo §4.2–4.4). Write constraints
    * and PAX slot allocation are completed before applying any values.
-   * Each record is then updated, copied into the WAL, and unlocked by publishing
+   * Each record is updated, copied into log_entries, and unlocked by publishing
    * its TID. Empty records go to the reaper.
    *
    * Point reads are revalidated by key and TID. Ranges are rescanned to compare
@@ -89,24 +86,24 @@ class CommitExecutor {
    *
    * @param last_commit_tid Last TID chosen by this worker for this database.
    * Updated when the transaction proceeds to write publication.
-   * @param durability Whether acknowledgement waits for this commit's epoch
-   * to become durable. Commits that enqueue no log records do not wait.
+   * @param[out] log_entries Cleared at entry; receives owned log entries on
+   * success and remains empty on abort. The caller registers them using the
+   * successful last_commit_tid's epoch.
    * @param[out] abort_reason When the attempt aborts,
    * receives a short label naming the failed check, such as
    * `exact_read_tid_moved`, `primary_range_result_changed`,
    * `duplicate_primary_key`, or `unique_si_exists_after_lock`.
-   * @return true when the transaction committed; false on abort, after
-   * every lock this attempt acquired has been released.
+   * @return true after publishing updates; false on abort, after every acquired
+   * lock has been released. This method does not enqueue logs or wait for I/O.
    */
   bool Commit(const ReadSet &read_set, WriteSet &write_set,
-              Tidword &last_commit_tid, CommitDurability durability,
+              Tidword &last_commit_tid, wal::LogEntries &log_entries,
               std::string &abort_reason) const;
 
  private:
   TableDictionary &tables_;
   epoch::Framework &epoch_framework_;
   index::Reaper &reaper_;
-  wal::Logger &logger_;
 };
 
 }  // namespace silo

@@ -166,13 +166,61 @@ class CommitTidTest : public ::testing::Test {
           return fail_preparation();
       }
     }
-    const silo::CommitExecutor executor(tables_, epoch_, reaper_, *logger_);
+    const silo::CommitExecutor executor(tables_, epoch_, reaper_);
+    wal::LogEntries log_entries;
     const bool committed = executor.Commit(read_set, write_set, last_tid_,
-                                           CommitDurability::kAsync, reason_);
+                                           log_entries, reason_);
+    if (committed && !log_entries.empty())
+      logger_->Enqueue(log_entries, last_tid_.epoch);
+    epoch_.Leave();
     index::MasstreeReleaseThreadEpoch();
     return committed;
   }
 };
+
+TEST_F(CommitTidTest, ProtocolRefreshesEpochAndReturnsItActiveToCaller) {
+  auto *item = SeedRow("key", Version(10, 5));
+  auto *table = tables_.GetTable(kTable);
+  const std::string bytes = TestHelper::Row("next");
+  silo::Write write{kTable, "key", {}, RowOp::kUpdate};
+  ASSERT_TRUE(pax::DecodeRow(table->GetPaxTable()->schema(),
+                            reinterpret_cast<const std::byte *>(bytes.data()),
+                            bytes.size(), write.value));
+  const std::vector<ExternalReadEntry> reads;
+  const std::vector<ExternalRangeReadEntry> ranges;
+  const silo::ReadSet read_set{reads, ranges};
+  silo::WriteSet write_set;
+  const silo::CommitExecutor executor(tables_, epoch_, reaper_);
+  wal::LogEntries log_entries;
+
+  epoch_.Join();
+  const bool prepared = write_set.AddRow(table->GetPrimaryIndex(), write, reason_);
+  epoch_.SetGlobalEpoch(11);
+  const bool committed = prepared && executor.Commit(
+      read_set, write_set, last_tid_, log_entries, reason_);
+  const auto committed_tid = last_tid_;
+  const auto epoch_after_commit = epoch_.ThreadEpoch();
+  const auto committed_log_count = log_entries.size();
+  if (committed) logger_->Enqueue(log_entries, committed_tid.epoch);
+
+  last_tid_ = Version(12, 0);
+  const bool second_committed = executor.Commit(
+      read_set, write_set, last_tid_, log_entries, reason_);
+  const auto epoch_after_abort = epoch_.ThreadEpoch();
+  epoch_.Leave();
+
+  EXPECT_TRUE(committed);
+  EXPECT_EQ(11u, epoch_after_commit);
+  EXPECT_EQ(11u, committed_tid.epoch);
+  EXPECT_EQ(1u, committed_log_count);
+  EXPECT_FALSE(second_committed);
+  EXPECT_EQ("commit_epoch_stale", reason_);
+  EXPECT_EQ(Version(12, 0), last_tid_);
+  EXPECT_EQ(11u, epoch_after_abort);
+  EXPECT_TRUE(log_entries.empty());
+  EXPECT_EQ(committed_tid, item->transaction_id.load());
+  EXPECT_EQ(bytes, item->CopyValue());
+}
 
 TEST_F(CommitTidTest, FinalRowKeepsTheFirstInsertRequirement) {
   auto *item = SeedRow("key", Version(10, 5));

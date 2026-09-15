@@ -362,11 +362,11 @@ class Database {
    * @brief Validates caller-supplied read and write sets and installs the
    *        writes atomically.
    *
-   * Prepares read/write sets from external inputs, then passes them and its
-   * active epoch to the Silo commit protocol. The protocol locks the write set,
-   * validates read observations, and prepares updates. Each record is updated,
-   * copied to the log, and unlocked with its new TID. The full contract
-   * lives with silo::CommitExecutor::Commit.
+   * Prepares read/write sets and runs the Silo protocol in an active epoch.
+   * The protocol locks, validates and publishes records, returning their log
+   * entries. This method enqueues those entries before leaving the epoch, then
+   * waits for durability when requested. The protocol contract lives with
+   * silo::CommitExecutor::Commit.
    *
    * Input values are decoded using their PAX schemas before entering Silo.
    * Conversion failures return false with pax_row_decode_failed; they are
