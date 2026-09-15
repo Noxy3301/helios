@@ -65,7 +65,7 @@ class MasstreeIndex final {
    * @return False if key no longer points to expected; true after removal.
    */
   bool Purge(std::string_view key, DataItem &expected,
-             TransactionId retired_tid);
+             Tidword retired_tid);
 
  private:
   // Keep Masstree headers out of callers.

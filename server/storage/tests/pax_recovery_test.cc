@@ -187,9 +187,8 @@ TEST_F(PaxRecoveryTest, RejectsBadInputBeforeConflictChecksAndSlotAllocation) {
 
   // Bad row bytes must be rejected before Silo sees the stale read evidence.
   std::string reason;
-  EXPECT_FALSE(TestHelper::CommitRows(db, {{"t", "a", 0, true}},
-                                      {{"t", "b", Row("2", "2.0")}}, {}, {},
-                                      reason));
+  EXPECT_FALSE(TestHelper::CommitRows(
+      db, {{"t", "a", 0}}, {{"t", "b", Row("2", "2.0")}}, {}, {}, reason));
   EXPECT_EQ(reason, "pax_row_decode_failed");
   EXPECT_EQ(pax::SlotsAllocated(db.GetPaxTable("t")), slots);
   EXPECT_EQ(TestHelper::ReadRow(db, "t", "a").value(), original);

@@ -25,8 +25,6 @@ namespace {
 constexpr size_t kSupremumSize = 16;
 const std::string kSupremum(kSupremumSize, '\xff');
 
-using silo::StableLive;
-
 }  // namespace
 
 bool Database::IndexNdv(const std::string_view table_name,
@@ -81,7 +79,10 @@ bool Database::IndexNdv(const std::string_view table_name,
     // Primary index entries are base rows, so count live rows directly.
     primary_index.Scan(std::string_view(), std::string_view(kSupremum),
                        [&](std::string_view key, DataItem &item) -> bool {
-                         if (!StableLive(item)) return false;
+                         // The absent bit changes only when a commit
+                         // publishes, so a locked word still shows the last
+                         // committed state.
+                         if (item.transaction_id.load().absent) return false;
                          return count_key(key);
                        });
   } else {
@@ -94,7 +95,8 @@ bool Database::IndexNdv(const std::string_view table_name,
       if (!keys.found) return false;
       for (std::string_view primary_key : keys.primary_keys_view()) {
         DataItem *base_item = primary_index.Get(primary_key);
-        if (base_item != nullptr && StableLive(*base_item)) return true;
+        if (base_item != nullptr && !base_item->transaction_id.load().absent)
+          return true;
       }
       return false;
     };
@@ -147,7 +149,7 @@ bool Database::IndexHistogram(const std::string_view table_name,
       table->GetPrimaryIndex().Scan(
           std::string_view(), std::string_view(kSupremum),
           [&](std::string_view key, DataItem &item) -> bool {
-            if (!StableLive(item)) return false;
+            if (item.transaction_id.load().absent) return false;
             if (leading_end(key) == 0) {
               failed = true;
               return true;

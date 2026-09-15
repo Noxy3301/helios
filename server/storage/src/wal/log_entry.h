@@ -59,7 +59,7 @@ enum class SecondaryIndexOp : uint8_t {
 struct LogEntry {
   std::string key;
   std::string value;
-  TransactionId tid{};
+  Tidword tid{};
   std::vector<std::string> primary_keys;
   DataItem *item;
   std::string table_name;
@@ -73,7 +73,7 @@ struct LogEntry {
 
   LogEntry(const std::string_view key, const std::byte row[], const size_t len,
            DataItem *const item, std::string_view table_name,
-           std::string_view index_name, const TransactionId tid = {},
+           std::string_view index_name, const Tidword tid = {},
            IndexConstraint index_type = IndexConstraint::kNone)
       : key(key),
         tid(tid),

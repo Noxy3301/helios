@@ -16,7 +16,7 @@
 #include <vector>
 
 #include "index/data_item.h"
-#include "silo/transaction_id.h"
+#include "silo/tidword.h"
 
 namespace helios::storage {
 namespace silo {
@@ -24,7 +24,7 @@ namespace silo {
 struct StableValue {
   bool found = false;
   std::string value;
-  TransactionId tid;
+  Tidword tid;
 };
 
 struct StablePrimaryKeys {
@@ -37,29 +37,15 @@ struct StablePrimaryKeys {
   }
 };
 
-// Bit 0 of a transaction id: set while a committer holds the row.
-inline constexpr uint32_t kLockBit = 1u;
-
 /**
  * @brief Reads the transaction id once no committer holds the row (Silo's
  * stable version): spins while the lock bit is set.
  */
-inline TransactionId StableTid(const DataItem &item) {
+inline Tidword StableTid(const DataItem &item) {
   for (;;) {
-    const TransactionId tid = item.transaction_id.load();
-    if (!(tid.tid & kLockBit)) return tid;
+    const Tidword tid = item.transaction_id.load();
+    if (!tid.lock) return tid;
     _mm_pause();
-  }
-}
-
-/**
- * @brief Stable read of a base row's liveness, without copying its payload.
- */
-inline bool StableLive(const DataItem &item) {
-  for (;;) {
-    const TransactionId tid = StableTid(item);
-    const bool live = item.HasRow();
-    if (item.transaction_id.load() == tid) return live;
   }
 }
 
@@ -78,8 +64,8 @@ inline StableValue StableRead(
     const std::vector<uint32_t> *selected_columns = nullptr) {
   for (;;) {
     // Observe an unlocked version before copying its live row.
-    const TransactionId tid = StableTid(item);
-    const bool found = item.HasRow();
+    const Tidword tid = StableTid(item);
+    const bool found = !tid.absent;
     std::string value;
     if (found) {
       if (selected_columns == nullptr) {
@@ -102,13 +88,15 @@ inline StableValue StableRead(
  * @brief Stable read of a secondary-index DataItem, pinning its immutable
  * primary-key list.
  *
- * `found` is false when the slot is uninitialized or the list is empty.
+ * `found` is false when the word's absent bit is set, which the committer
+ * publishes for an emptied list.
  */
 inline StablePrimaryKeys StableReadKeys(const DataItem &item) {
   for (;;) {
-    const TransactionId tid = StableTid(item);
+    const Tidword tid = StableTid(item);
+    // Keep this immutable list alive even if a writer replaces it.
     auto primary_keys = std::atomic_load(&item.primary_keys_);
-    const bool found = primary_keys && primary_keys->count != 0;
+    const bool found = !tid.absent;
 
     if (item.transaction_id.load() == tid) {
       return {found, std::move(primary_keys)};

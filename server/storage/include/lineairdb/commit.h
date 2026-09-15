@@ -16,15 +16,14 @@ namespace helios::storage {
 /**
  * @brief Point read to revalidate at commit.
  *
- * `tid` and `found` come from an earlier read or scan row. Commit
- * aborts when the row's TID moved; `found == false` asserts the key was
- * absent and aborts when a row appeared.
+ * `tid` is the word the read or scan row returned; a key that had no record
+ * carries the absent word. Commit aborts when the record's word moved: a new
+ * version, a row that appeared or disappeared, or another committer's lock.
  */
 struct ExternalReadEntry {
   std::string table_name;
   std::string key;
   uint64_t tid = 0;
-  bool found = false;
 };
 
 /**

@@ -240,10 +240,9 @@ bool Database::Commit(
     }
     silo::Write entry{write.table_name, write.key, {}, write.op};
     if (write.op != RowOp::kDelete &&
-        !pax::DecodeRow(
-            store->schema(),
-            reinterpret_cast<const std::byte *>(write.value.data()),
-            write.value.size(), entry.value)) {
+        !pax::DecodeRow(store->schema(),
+                        reinterpret_cast<const std::byte *>(write.value.data()),
+                        write.value.size(), entry.value)) {
       abort_reason = "pax_row_decode_failed";
       return false;
     }
@@ -251,8 +250,10 @@ bool Database::Commit(
   }
   const silo::CommitPayload payload{reads, write_set, secondary_index_ops,
                                     range_reads};
+  Tidword &last_commit_tid = *last_commit_tids_.Get();
   return silo::Commit(table_dictionary_, schema_mutex_, epoch_framework_,
-                      reaper_, logger_, payload, durability, abort_reason);
+                      reaper_, logger_, payload, last_commit_tid, durability,
+                      abort_reason);
 }
 
 Table *Database::GetTable(const std::string_view table_name) const {
@@ -289,10 +290,9 @@ void Database::Recover() {
   epoch_framework_.SetThreadEpoch(durable_epoch);
 
   for (auto &entry : recovered.recovery_set) {
-    // A tombstone carries an empty row and must not be re-inserted.
-    const bool live = entry.index_name.empty() ? !entry.value.empty()
-                                               : !entry.primary_keys.empty();
-    if (!live) continue;
+    // A delete is logged with absent set and must not be re-inserted; a
+    // secondary entry survives the fold only with inserts.
+    if (entry.tid.absent) continue;
     auto table = GetTable(entry.table_name);
     if (table == nullptr || table->GetPaxTable() == nullptr) {
       SPDLOG_CRITICAL("Recovery failed: PAX schema for table {0} is missing.",
@@ -300,7 +300,7 @@ void Database::Recover() {
       exit(EXIT_FAILURE);
     }
 
-    highest_epoch = std::max(highest_epoch, entry.tid.epoch);
+    highest_epoch = std::max<EpochNumber>(highest_epoch, entry.tid.epoch);
 
     if (entry.index_name.empty()) {
       DataItem item(*table->GetPaxTable());
@@ -314,8 +314,8 @@ void Database::Recover() {
         exit(EXIT_FAILURE);
       }
       if (!item.AllocateSlot()) {
-        SPDLOG_CRITICAL("Recovery failed: no PAX slot for {} in {}",
-                        entry.key, entry.table_name);
+        SPDLOG_CRITICAL("Recovery failed: no PAX slot for {} in {}", entry.key,
+                        entry.table_name);
         exit(EXIT_FAILURE);
       }
       item.Write(row);

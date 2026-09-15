@@ -2,7 +2,7 @@
  * @file server/storage/src/silo/read.h
  * The read side of the store: point reads and range scans. Each call takes a
  * shared lock on the schema, reads rows with the stable read, and returns the
- * packed TIDs a later commit validates as read-set evidence.
+ * TID words a later commit validates as read-set evidence.
  */
 
 #ifndef HELIOS_STORAGE_SRC_SILO_READ_H
@@ -32,8 +32,9 @@ namespace silo {
  * has not moved. The caller keeps the returned `tid` and submits it through
  * Commit later.
  *
- * A miss, a tombstone and a table that does not exist all return a result
- * with `found == false`.
+ * A miss, a tombstone and a table that does not exist all return
+ * `found == false`, with the absent word, the delete's word and zero
+ * respectively.
  *
  * @param selected_columns Null for the whole row; non-null, even when empty,
  * blanks every PAX field it does not name.

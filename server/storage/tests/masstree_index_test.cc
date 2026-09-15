@@ -37,6 +37,21 @@
 #include "util/epoch_framework.h"
 #include "util/spdlog.h"
 
+namespace {
+
+// A word a commit publishes: epoch, tid, and the absent bit.
+helios::storage::Tidword Word(helios::storage::EpochNumber epoch,
+                                    uint32_t tid, bool absent) {
+  helios::storage::Tidword word;
+  word.epoch = epoch;
+  word.tid = tid;
+  word.latest = true;
+  word.absent = absent;
+  return word;
+}
+
+}  // namespace
+
 TEST(MasstreeIndexTest, Instantiate) {
   ASSERT_NO_THROW(helios::storage::index::MasstreeIndex table);
 }
@@ -196,7 +211,7 @@ TEST(MasstreeIndexTest, PrimaryEntryKeepsItsPaxTable) {
 
   DataItem *item = tree.GetOrInsert("row");
   ASSERT_NE(nullptr, item);
-  EXPECT_FALSE(item->HasRow());
+  EXPECT_FALSE(item->IsLive());
   ASSERT_TRUE(item->AllocateSlot());
   EXPECT_EQ(1u, store.slots_allocated());
   EXPECT_EQ(store.group(0), item->pax_group());
@@ -208,7 +223,7 @@ TEST(MasstreeIndexTest, ReaperPreservesReusedSecondaryEntry) {
   using namespace helios::storage;
   index::MasstreeIndex tree;
   index::Reaper reaper;
-  const TransactionId deleted{10, 2};
+  const Tidword deleted = Word(10, 2, /*absent=*/true);
   DataItem *item = tree.GetOrInsert("secondary");
   item->transaction_id.store(deleted);
   reaper.Enqueue(tree, "secondary", *item, deleted);
@@ -219,14 +234,14 @@ TEST(MasstreeIndexTest, ReaperPreservesReusedSecondaryEntry) {
 
   // A later insertion reuses the slot and publishes a newer TID.
   item->SetPrimaryKeys({"primary"});
-  item->transaction_id.store(TransactionId{10, 4});
+  item->transaction_id.store(Word(10, 4, /*absent=*/false));
   reaper.Reap(12);
   EXPECT_EQ(item, tree.Get("secondary"));
   EXPECT_TRUE(item->IsLive());
 
   // Deleting that last posting allows the same tree to purge the slot.
   item->SetPrimaryKeys({});
-  const TransactionId deleted_again{12, 6};
+  const Tidword deleted_again = Word(12, 6, /*absent=*/true);
   item->transaction_id.store(deleted_again);
   reaper.Enqueue(tree, "secondary", *item, deleted_again);
   reaper.Reap(14);
@@ -242,7 +257,7 @@ TEST(MasstreeIndexTest, PurgeRejectsAReplacementEntry) {
   DataItem *replacement = tree.Get("key");
   ASSERT_NE(old_item, replacement);
 
-  EXPECT_FALSE(tree.Purge("key", *old_item, TransactionId{10, 4}));
+  EXPECT_FALSE(tree.Purge("key", *old_item, Word(10, 4, /*absent=*/true)));
   EXPECT_EQ(replacement, tree.Get("key"));
   index::MasstreeReleaseThreadEpoch();
 }

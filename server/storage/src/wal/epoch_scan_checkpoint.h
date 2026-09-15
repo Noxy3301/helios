@@ -142,10 +142,9 @@ class EpochScanCheckpoint {
   /**
    * @brief What one attempt at one row produced.
    *
-   * @details kTaken: a stable version was copied. kSkipped: the slot was
-   * absent or a tombstone under a stable read. kUnstable: the lock bit stayed
-   * set for the whole spin budget, so the row goes to the retry pass and, if
-   * it never settles, the capture is abandoned.
+   * @details kTaken: a stable version was copied.
+   * kSkipped: the absent flag was set.
+   * kUnstable: no stable version was obtained within the retry limit.
    */
   enum class CaptureResult { kTaken, kSkipped, kUnstable };
 

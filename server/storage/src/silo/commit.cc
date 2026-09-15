@@ -23,7 +23,6 @@
 #include "index/secondary_index.h"
 #include "pax/table.h"
 #include "pax/version_store.h"
-#include "silo/packed_transaction_id.h"
 #include "silo/stable_read.h"
 #include "table/table.h"
 #include "table/table_dictionary.h"
@@ -36,13 +35,12 @@ namespace silo {
 
 namespace {
 
-// A point read and its observed version, saved for validation.
+// A point read and the word it observed, saved for validation.
 struct ReadEntry {
   Table *table = nullptr;
   std::string table_name;
   std::string key;
-  TransactionId captured_tid;
-  bool found = false;
+  Tidword tid;
 };
 
 // A row write resolved to the primary-index entry it locks.
@@ -77,12 +75,6 @@ struct LockTarget {
   std::string key;
 };
 
-struct LockedTid {
-  DataItem *item = nullptr;
-  TransactionId before_lock;
-  TransactionId locked;
-};
-
 // State shared by the steps of one commit attempt.
 struct CommitCtx {
   TableDictionary &tables;
@@ -95,9 +87,13 @@ struct CommitCtx {
   std::vector<SecondaryIndexEntry> si_ops;
   std::vector<DataItem *> items;  // lock set: address-sorted and unique
   std::vector<LockTarget> targets;
-  std::vector<LockedTid> locked;
-  std::unordered_map<DataItem *, bool> si_empty;
+  // The items whose lock this attempt holds.
+  std::vector<DataItem *> locked;
   EpochNumber commit_epoch = 0;
+  Tidword commit_tid{};
+  // The largest word this attempt read, and the largest it found under a lock.
+  Tidword max_read_tid{};
+  Tidword max_write_tid{};
   bool has_insert = false;
 
   // Abort before taking any row locks.
@@ -107,32 +103,23 @@ struct CommitCtx {
     return false;
   }
 
-  // Release all locks acquired so far, then abort.
+  // No values have been installed on an abort path; only release our locks.
   bool AbortLocked(const std::string &reason) {
     abort_reason = reason;
-    for (auto &entry : locked) {
-      TransactionId current = entry.item->transaction_id.load();
-      if (current.tid & kLockBit) {
-        current.tid--;
-        entry.item->transaction_id.store(current);
-      }
+    for (auto *item : locked) {
+      Tidword tid = item->transaction_id.load();
+      tid.lock = false;
+      item->transaction_id.store(tid);
     }
     epoch.Leave();
     return false;
   }
 
   bool IsOwnLocked(DataItem *item) const {
-    for (const auto &entry : locked) {
-      if (entry.item == item) return true;
+    for (auto *entry : locked) {
+      if (entry == item) return true;
     }
     return false;
-  }
-
-  // Abort on another transaction's lock instead of waiting while holding ours.
-  bool LockedByOther(DataItem *item) const {
-    TransactionId tid = item->transaction_id.load();
-    if (!(tid.tid & kLockBit)) return false;
-    return !IsOwnLocked(item);
   }
 };
 
@@ -144,19 +131,18 @@ bool Resolve(CommitCtx &ctx, std::shared_mutex &schema_mutex) {
 
   std::shared_lock<std::shared_mutex> lk(schema_mutex);
 
-  // Save each read's table, key, and observed version for validation.
+  // Save each read's table, key, and observed word for validation.
   ctx.reads.reserve(ctx.payload.reads.size());
   for (const auto &read : ctx.payload.reads) {
     auto table = ctx.tables.GetTable(read.table_name);
     if (table == nullptr) {
-      if (read.found || read.tid != 0) {
-        return ctx.Abort("read_table_missing");
-      }
+      // A read that found the table reports a non-zero word.
+      if (read.tid != 0) return ctx.Abort("read_table_missing");
       continue;
     }
 
-    ctx.reads.push_back({table, read.table_name, read.key,
-                         UnpackTransactionId(read.tid), read.found});
+    ctx.reads.push_back(
+        {table, read.table_name, read.key, Tidword(read.tid)});
   }
 
   // Find each row's lock target, creating an absent DataItem for a new key.
@@ -171,7 +157,8 @@ bool Resolve(CommitCtx &ctx, std::shared_mutex &schema_mutex) {
 
     DataItem *item = table->GetPrimaryIndex().GetOrInsert(write.key);
 
-    // Reject INSERT if an earlier write in this request already made the key live.
+    // Reject INSERT if an earlier write in this request already made the key
+    // live.
     bool check_committed_row = false;
     if (ctx.has_insert) {
       const std::string request_key =
@@ -233,14 +220,14 @@ bool Resolve(CommitCtx &ctx, std::shared_mutex &schema_mutex) {
 }
 
 // Lock write targets in address order to avoid write-write deadlocks.
-// Keep their previous TIDs for read validation.
+// Keep the largest word found under a lock for the commit TID.
 bool Lock(CommitCtx &ctx) {
   std::sort(ctx.items.begin(), ctx.items.end());
   ctx.items.erase(std::unique(ctx.items.begin(), ctx.items.end()),
                   ctx.items.end());
   ctx.locked.reserve(ctx.items.size());
 
-  // Recheck that each key still points to the item we locked.
+  // A purge may detach an item while we wait for its lock.
   auto attached = [&](DataItem *item) {
     for (const auto &target : ctx.targets) {
       if (target.item != item) continue;
@@ -250,18 +237,19 @@ bool Lock(CommitCtx &ctx) {
     return true;
   };
 
-  // Wait for each target, then set its TID lock bit with CAS.
+  // Wait for each target, then set the lock bit of its word with CAS.
   for (auto *item : ctx.items) {
     for (;;) {
-      TransactionId current = item->transaction_id.load();
-      if (current.tid & kLockBit) {
+      Tidword current = item->transaction_id.load();
+      if (current.lock) {
         _mm_pause();
         continue;
       }
-      TransactionId locked = current;
-      locked.tid |= kLockBit;
+      Tidword locked = current;
+      locked.lock = true;
       if (item->transaction_id.compare_exchange_weak(current, locked)) {
-        ctx.locked.push_back({item, current, locked});
+        ctx.locked.push_back(item);
+        ctx.max_write_tid = std::max(ctx.max_write_tid, current);
         if (!attached(item)) {
           return ctx.AbortLocked("write_target_detached");
         }
@@ -292,43 +280,20 @@ std::string ReadReason(const char *reason, const ReadEntry &read) {
   return out;
 }
 
-// Check that point reads still match their recorded presence and version.
+// Check that every record a point read observed still shows the same word.
 bool ValidateReads(CommitCtx &ctx) {
   for (const auto &read : ctx.reads) {
     DataItem *item = read.table->GetPrimaryIndex().Get(read.key);
-    if (item == nullptr) {
-      // A row that was present must not disappear before validation.
-      if (read.found) {
-        return ctx.AbortLocked(ReadReason("exact_read_disappeared", read));
-      }
-      continue;
-    }
-
-    if (!read.found) {
-      if (!item->HasRow()) {
-        continue;
-      }
-      return ctx.AbortLocked(ReadReason("exact_read_appeared", read));
-    }
-
-    TransactionId expected = read.captured_tid;
-    for (const auto &locked : ctx.locked) {
-      if (locked.item == item) {
-        if (locked.before_lock.epoch != read.captured_tid.epoch ||
-            locked.before_lock.tid != read.captured_tid.tid) {
-          return ctx.AbortLocked(ReadReason("exact_read_tid_moved", read));
-        }
-        expected = locked.locked;
-        break;
-      }
-    }
-
-    if (item->transaction_id.load() != expected) {
+    // A key with no record reads as the absent word.
+    const Tidword current =
+        item ? item->transaction_id.load() : Tidword::Absent();
+    // Only our own lock may differ from the word the read observed.
+    Tidword expected = read.tid;
+    if (item != nullptr && ctx.IsOwnLocked(item)) expected.lock = true;
+    if (current != expected) {
       return ctx.AbortLocked(ReadReason("exact_read_tid_moved", read));
     }
-    if (!item->HasRow()) {
-      return ctx.AbortLocked(ReadReason("exact_read_deleted", read));
-    }
+    ctx.max_read_tid = std::max(ctx.max_read_tid, read.tid);
   }
   return true;
 }
@@ -342,11 +307,14 @@ bool ReplayRange(CommitCtx &ctx, const ExternalRangeReadEntry &range) {
   bool aborted = false;
   bool matches = true;
   auto collect_key = [&](std::string_view key, DataItem &item) {
-    if (ctx.LockedByOther(&item)) {
+    const Tidword tid = item.transaction_id.load();
+    if (tid.lock && !ctx.IsOwnLocked(&item)) {
       aborted = true;
       return true;
     }
-    if (item.HasRow()) {
+    // Include tombstones too: their delete TIDs determine the state we saw.
+    ctx.max_read_tid = std::max(ctx.max_read_tid, tid);
+    if (!tid.absent) {
       if (result_pos >= range.result_keys.size() ||
           std::string_view(range.result_keys[result_pos]) != key) {
         matches = false;
@@ -381,11 +349,13 @@ bool ReplayIndexRange(CommitCtx &ctx, const ExternalRangeReadEntry &range) {
                               std::string_view primary_key) {
     DataItem *item = table->GetPrimaryIndex().Get(primary_key);
     if (item == nullptr) return false;
-    if (ctx.LockedByOther(item)) {
+    const Tidword tid = item->transaction_id.load();
+    if (tid.lock && !ctx.IsOwnLocked(item)) {
       aborted = true;
       return true;
     }
-    if (item->HasRow()) {
+    ctx.max_read_tid = std::max(ctx.max_read_tid, tid);
+    if (!tid.absent) {
       if (result_pos >= range.result_keys.size() ||
           result_pos >= range.result_primary_keys.size() ||
           std::string_view(range.result_keys[result_pos]) !=
@@ -400,27 +370,26 @@ bool ReplayIndexRange(CommitCtx &ctx, const ExternalRangeReadEntry &range) {
     return range.row_limit > 0 && result_pos >= range.row_limit;
   };
 
-  // Validation re-resolves the current entry even if the scan saw an older one.
   auto collect_secondary_key = [&](std::string_view key, DataItem &) {
+    // Find the current entry; the item supplied by the scan may be stale.
     const std::string secondary_key(key);
     DataItem *item = index->tree.Get(key);
     if (item == nullptr) return false;
-    // Pin the key list; allow our own lock, but abort on another lock
-    // or a TID change during the load.
-    const TransactionId observed = item->transaction_id.load();
-    if ((observed.tid & kLockBit) && !ctx.IsOwnLocked(item)) {
+
+    const Tidword tid = item->transaction_id.load();
+    if (tid.lock && !ctx.IsOwnLocked(item)) {
       aborted = true;
       return true;
     }
+
+    // The key list is a separate load; abort if the word moved around it.
     auto primary_keys = std::atomic_load(&item->primary_keys_);
-    const bool secondary_live = primary_keys && primary_keys->count != 0;
-    if (item->transaction_id.load() != observed) {
+    if (item->transaction_id.load() != tid) {
       aborted = true;
       return true;
     }
-    if (!secondary_live) {
-      return false;
-    }
+    ctx.max_read_tid = std::max(ctx.max_read_tid, tid);
+
     for (std::string_view primary_key : PrimaryKeyList::View(primary_keys)) {
       if (collect_base_row(secondary_key, primary_key)) return true;
     }
@@ -429,7 +398,7 @@ bool ReplayIndexRange(CommitCtx &ctx, const ExternalRangeReadEntry &range) {
 
   if (range.reverse_scan) {
     index->tree.ScanReverse(range.start_key, range.end_key,
-                               collect_secondary_key);
+                            collect_secondary_key);
   } else {
     index->tree.Scan(range.start_key, range.end_key, collect_secondary_key);
   }
@@ -457,7 +426,7 @@ bool ValidateRanges(CommitCtx &ctx) {
 bool ValidateInserts(CommitCtx &ctx) {
   for (const auto &write : ctx.writes) {
     if (!write.check_committed_row) continue;
-    if (write.item->HasRow()) {
+    if (!write.item->transaction_id.load().absent) {
       return ctx.AbortLocked(kDuplicatePrimaryKeyAbortReason);
     }
   }
@@ -498,6 +467,38 @@ bool ValidateUnique(CommitCtx &ctx) {
   return true;
 }
 
+// Pick the TID this transaction publishes on every record it touches.
+bool GenerateCommitTid(CommitCtx &ctx, const Tidword &last_commit_tid) {
+  // Silo §4.2: exceed the read/write TIDs and the worker's previous TID,
+  // using the epoch read after locking.
+  const Tidword max_tid =
+      std::max({ctx.max_read_tid, ctx.max_write_tid, last_commit_tid});
+  // Recovery must not retain our commit while dropping the later state it read.
+  if (max_tid.epoch > ctx.commit_epoch) {
+    return ctx.AbortLocked("commit_epoch_stale");
+  }
+  // A newer epoch already orders after the observed TIDs; its tid starts at 0.
+  Tidword tid;
+  tid.epoch = ctx.commit_epoch;
+  if (max_tid.epoch == ctx.commit_epoch) {
+    if (max_tid.tid >= kMaxTid) {
+      return ctx.AbortLocked("commit_tid_exhausted");
+    }
+    tid.tid = max_tid.tid + 1;
+  }
+  tid.latest = true;
+  ctx.commit_tid = tid;
+  return true;
+}
+
+// Records share the commit TID, but each has its own absent bit.
+// Read the final row state while its write lock is still held.
+Tidword PublishedTid(const CommitCtx &ctx, const DataItem &item) {
+  Tidword tid = ctx.commit_tid;
+  tid.absent = !item.IsLive();
+  return tid;
+}
+
 // Apply writes under lock; leave deleted entries for the reaper.
 void ApplyWrites(CommitCtx &ctx) {
   {
@@ -527,14 +528,6 @@ void ApplyWrites(CommitCtx &ctx) {
       op.item->InsertPrimaryKey(primary_key, op.primary_key.size());
     }
   }
-
-  // Record which secondary entries are empty after all changes, before unlock.
-  // Later writers may replace these lists, so Publish uses this saved state.
-  for (const auto &op : ctx.si_ops) {
-    if (!op.is_delete) continue;
-    const auto primary_keys = std::atomic_load(&op.item->primary_keys_);
-    ctx.si_empty[op.item] = PrimaryKeyList::View(primary_keys).empty();
-  }
 }
 
 // Copy final values into the log while row locks still protect them.
@@ -546,13 +539,13 @@ wal::WriteSet BuildLog(CommitCtx &ctx) {
     wal::LogEntry entry(write.key, nullptr, 0, write.item, write.table_name,
                         "");
     entry.value = write.item->CopyValue();
-    entry.tid = write.item->transaction_id.load();
+    entry.tid = PublishedTid(ctx, *write.item);
     log_set.emplace_back(std::move(entry));
   }
   for (const auto &op : ctx.si_ops) {
     wal::LogEntry entry(op.secondary_key, nullptr, 0, op.item, op.table_name,
                         op.index_name, {}, op.index_type);
-    entry.tid = op.item->transaction_id.load();
+    entry.tid = PublishedTid(ctx, *op.item);
     entry.RecordSecondaryDelta(op.primary_key,
                                op.is_delete ? wal::SecondaryIndexOp::kDelete
                                             : wal::SecondaryIndexOp::kInsert);
@@ -561,51 +554,19 @@ wal::WriteSet BuildLog(CommitCtx &ctx) {
   return log_set;
 }
 
-// Publish unlocked TIDs, update the log, and queue deletions for the reaper.
-void Publish(CommitCtx &ctx, index::Reaper &reaper, wal::WriteSet &log_set) {
-  // Unlock each item with a new TID in this transaction's commit epoch.
-  ctx.commit_epoch = ctx.epoch.ThreadEpoch();
-  std::unordered_map<DataItem *, TransactionId> published;
-  published.reserve(ctx.items.size());
-  for (auto *item : ctx.items) {
-    // Start a new epoch at 2; odd sequence numbers have the lock bit set.
-    constexpr uint32_t kFirstTidOfEpoch = 2;
-    TransactionId current = item->transaction_id.load();
-    const TransactionId unlocked =
-        current.epoch == ctx.commit_epoch
-            ? TransactionId{ctx.commit_epoch, current.tid + 1}
-            : TransactionId{ctx.commit_epoch, kFirstTidOfEpoch};
-    item->transaction_id.store(unlocked);
-    published.emplace(item, unlocked);
-  }
-
-  // Replace locked TIDs in the log so recovery never restores a held lock.
-  for (auto &entry : log_set) {
-    const auto tid_it = published.find(entry.item);
-    if (tid_it == published.end()) continue;
-    entry.tid = tid_it->second;
-  }
-
-  // Queue row deletions with their published TIDs; the reaper checks them again.
-  for (const auto &write : ctx.writes) {
-    if (!write.is_delete) continue;
-    auto tid_it = published.find(write.item);
-    if (tid_it == published.end()) continue;
-    reaper.Enqueue(*write.index, write.key, *write.item, tid_it->second);
-  }
-
-  // Queue each emptied secondary entry once, using its state before unlock.
-  std::unordered_set<DataItem *> registered_si_purges;
-  for (const auto &op : ctx.si_ops) {
-    if (!op.is_delete) continue;
-    auto empty_it = ctx.si_empty.find(op.item);
-    if (empty_it == ctx.si_empty.end() || !empty_it->second) {
-      continue;
+// Publish the commit word on every record and queue the emptied ones.
+void Publish(CommitCtx &ctx, index::Reaper &reaper) {
+  std::unordered_set<DataItem *> published;
+  published.reserve(ctx.targets.size());
+  for (const auto &target : ctx.targets) {
+    // A duplicate target may already be unlocked and changed by another writer.
+    if (!published.insert(target.item).second) continue;
+    const Tidword tid = PublishedTid(ctx, *target.item);
+    target.item->transaction_id.store(tid);
+    // The reaper checks the word again before it removes the key.
+    if (tid.absent) {
+      reaper.Enqueue(*target.index, target.key, *target.item, tid);
     }
-    if (!registered_si_purges.insert(op.item).second) continue;
-    auto tid_it = published.find(op.item);
-    if (tid_it == published.end()) continue;
-    reaper.Enqueue(*op.index, op.secondary_key, *op.item, tid_it->second);
   }
 }
 
@@ -622,7 +583,8 @@ bool EnqueueLogSet(wal::Logger &logger, wal::WriteSet &log_set,
 bool Commit(TableDictionary &tables, std::shared_mutex &schema_mutex,
             epoch::Framework &epoch_framework, index::Reaper &reaper,
             wal::Logger &logger, const CommitPayload &payload,
-            CommitDurability durability, std::string &abort_reason) {
+            Tidword &last_commit_tid, CommitDurability durability,
+            std::string &abort_reason) {
   CommitCtx ctx{tables, epoch_framework, payload, abort_reason};
 
   // Enter the storage epoch before resolving and locking targets.
@@ -646,18 +608,21 @@ bool Commit(TableDictionary &tables, std::shared_mutex &schema_mutex,
     HELIOS_DEBUG_SYNC("silo_commit.after_index_claim");
   }
 
+  // Phase 1: lock the write set, then read the global epoch.
   if (!Lock(ctx)) return false;
 
-  // Refresh the commit epoch after acquiring all write locks.
-  // ThreadEpoch() keeps the epoch chosen by Join(), so leave and rejoin.
-  // The separate Masstree RCU epoch stays active.
+  // Sample the epoch after lock waits so this commit cannot get an older epoch
+  // than the writers it waited for. Masstree's RCU protection stays active.
   epoch_framework.Leave();
-  epoch_framework.Join();
+  ctx.commit_epoch = epoch_framework.Join();
 
+  // Phase 2: validate and assign one TID to the transaction.
   if (!ValidateReads(ctx)) return false;
   if (!ValidateRanges(ctx)) return false;
   if (!ValidateInserts(ctx)) return false;
   if (!ValidateUnique(ctx)) return false;
+
+  if (!GenerateCommitTid(ctx, last_commit_tid)) return false;
 
   // Reserve all destinations before changing the first stored value.
   for (const auto &write : ctx.writes) {
@@ -666,9 +631,11 @@ bool Commit(TableDictionary &tables, std::shared_mutex &schema_mutex,
     }
   }
 
+  // Phase 3: write, copy the WAL, and publish the same TID on every record.
+  last_commit_tid = ctx.commit_tid;
   ApplyWrites(ctx);
   wal::WriteSet log_set = BuildLog(ctx);
-  Publish(ctx, reaper, log_set);
+  Publish(ctx, reaper);
   const bool awaits_durability =
       EnqueueLogSet(logger, log_set, ctx.commit_epoch, durability);
 

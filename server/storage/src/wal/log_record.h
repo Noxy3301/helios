@@ -14,7 +14,7 @@
 #include <string>
 #include <vector>
 
-#include "silo/transaction_id.h"
+#include "silo/tidword.h"
 #include "util/epoch.h"
 #include "wal/log_entry.h"
 
@@ -44,7 +44,7 @@ struct LogRecord {
   struct Write {
     std::string key;
     std::string buffer;
-    TransactionId transaction_id;
+    Tidword transaction_id;
     std::string table_name;
     std::string index_name;
     uint32_t index_type = 0;  // IndexConstraint, as a msgpack-stable integer.

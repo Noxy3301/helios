@@ -39,7 +39,7 @@
 #include "lineairdb/pax.h"
 
 #include "index/primary_key_list.h"
-#include "silo/transaction_id.h"
+#include "silo/tidword.h"
 
 namespace helios::storage {
 
@@ -51,7 +51,9 @@ namespace helios::storage {
  * load and store. Both use transaction_id as their Silo version word.
  */
 struct DataItem {
-  std::atomic<TransactionId> transaction_id;
+  // Readers take `absent` from this word; the committer sets it from IsLive()
+  // at publish.
+  std::atomic<Tidword> transaction_id;
   std::shared_ptr<const PrimaryKeyList> primary_keys_;
 
   size_t size() const { return size_; }
@@ -60,7 +62,6 @@ struct DataItem {
     const auto primary_keys = std::atomic_load(&primary_keys_);
     return primary_keys && primary_keys->count != 0;
   }
-  bool HasRow() const { return size_ != 0; }
 
   void SetPrimaryKeys(const std::vector<std::string> &primary_keys) {
     assert(IsSortedDeduped(primary_keys));
@@ -68,7 +69,7 @@ struct DataItem {
     std::atomic_store(&primary_keys_, std::move(packed));
   }
 
-  DataItem() : transaction_id(TransactionId()) {}
+  DataItem() : transaction_id(Tidword::Absent()) {}
 
   /**
    * @brief Creates an empty item whose payload will be stored in table's PAX
@@ -157,7 +158,7 @@ struct DataItem {
   static constexpr uintptr_t kAllocated = 1;
   // Before allocation this points to the table; afterwards to its tagged group.
   uintptr_t location_ = 0;
-  size_t size_ = 0;  // Zero denotes an absent or deleted row.
+  size_t size_ = 0;  // Row length in bytes; zero once deleted.
   uint32_t slot_ = 0;
 
   void CaptureBeforeImage();

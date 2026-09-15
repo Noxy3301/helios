@@ -10,13 +10,12 @@
 #include <utility>
 
 #include "index/masstree_index.h"
-#include "silo/stable_read.h"
 
 namespace helios::storage {
 namespace index {
 
 void Reaper::Enqueue(MasstreeIndex &index, std::string_view key, DataItem &item,
-                     TransactionId delete_commit_tid) {
+                     Tidword delete_commit_tid) {
   Tombstone tombstone;
   tombstone.index = &index;
   tombstone.key = std::string(key);
@@ -28,7 +27,7 @@ void Reaper::Enqueue(MasstreeIndex &index, std::string_view key, DataItem &item,
 }
 
 void Reaper::Reap(EpochNumber published_epoch) {
-  // Split the queue into the tombstones whose grace has elapsed and the rest.
+  // Keep deleted slots until transactions in the delete epoch have left.
   std::vector<Tombstone> ready;
   {
     std::lock_guard<std::mutex> lk(mutex_);
@@ -56,48 +55,25 @@ void Reaper::Reap(EpochNumber published_epoch) {
 
   for (auto &tombstone : ready) {
     DataItem *item = tombstone.index->Get(tombstone.key);
-    // A different DataItem under the key means the tombstone was already
-    // replaced.
+    // A different item under the key means the tombstone was already replaced.
     if (item != tombstone.item) continue;
 
-    TransactionId observed = item->transaction_id.load();
-    if (observed.tid & silo::kLockBit) {
-      requeue.emplace_back(std::move(tombstone));
-      continue;
-    }
-    if (observed != tombstone.delete_commit_tid) continue;
-
-    TransactionId locked = observed;
-    locked.tid |= silo::kLockBit;
-    if (!item->transaction_id.compare_exchange_strong(observed, locked)) {
-      if (observed.tid & silo::kLockBit)
-        requeue.emplace_back(std::move(tombstone));
+    // Lock only if the delete TID is still current.
+    Tidword expected = tombstone.delete_commit_tid;
+    Tidword locked = expected;
+    locked.lock = true;
+    if (!item->transaction_id.compare_exchange_strong(expected, locked)) {
+      if (expected.lock) requeue.emplace_back(std::move(tombstone));
       continue;
     }
 
-    auto unlock = [&]() {
+    // Mark removal so readers holding the old pointer see the change.
+    Tidword retired = tombstone.delete_commit_tid;
+    retired.latest = false;
+    if (!tombstone.index->Purge(tombstone.key, *item, retired)) {
+      // A failed purge still leaves this item locked; release it.
       item->transaction_id.store(tombstone.delete_commit_tid);
-    };
-
-    // A row, or a non-empty key list, means a later transaction reused this
-    // slot in place.
-    if (item->IsLive()) {
-      unlock();
-      continue;
     }
-    if (tombstone.index->Get(tombstone.key) != item) {
-      unlock();
-      continue;
-    }
-    if (item->transaction_id.load() != locked) {
-      unlock();
-      continue;
-    }
-
-    TransactionId retired = tombstone.delete_commit_tid;
-    retired.tid = (retired.tid + 2u) & ~silo::kLockBit;
-    // Publish the next unlocked TID before the removed item is retired to RCU.
-    if (!tombstone.index->Purge(tombstone.key, *item, retired)) unlock();
   }
 
   {

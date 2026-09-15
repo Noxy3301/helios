@@ -10,7 +10,6 @@
 #include "index/data_item.h"
 #include "index/secondary_index.h"
 #include "pax/table.h"
-#include "silo/packed_transaction_id.h"
 #include "silo/stable_read.h"
 #include "table/table.h"
 #include "table/table_dictionary.h"
@@ -27,10 +26,10 @@ ReadResult Read(TableDictionary &tables, std::shared_mutex &schema_mutex,
   if (table == nullptr) return {};
 
   DataItem *item = table->GetPrimaryIndex().Get(key);
-  if (item == nullptr) return {};
+  if (item == nullptr) return {false, {}, Tidword::Absent().obj};
 
   auto row = StableRead(*item, selected_columns);
-  return {row.found, std::move(row.value), PackTransactionId(row.tid)};
+  return {row.found, std::move(row.value), row.tid.obj};
 }
 
 std::vector<ReadResult> BatchRead(
@@ -66,7 +65,7 @@ ScanResult Scan(TableDictionary &tables, std::shared_mutex &schema_mutex,
     auto row = StableRead(item, selected_columns);
     if (row.found) {
       result.rows.push_back(
-          {std::string(key), std::move(row.value), PackTransactionId(row.tid)});
+          {std::string(key), std::move(row.value), row.tid.obj});
       ++returned_rows;
     }
     // Count only live rows toward the limit; tombstones stay for later cleanup.
@@ -85,7 +84,7 @@ ScanResult Scan(TableDictionary &tables, std::shared_mutex &schema_mutex,
 
 uint64_t CurrentTid(const ScanPaxRow &row) {
   const auto *item = static_cast<const DataItem *>(row.item);
-  return silo::PackTransactionId(item->transaction_id.load());
+  return item->transaction_id.load().obj;
 }
 
 namespace silo {
@@ -124,7 +123,7 @@ ScanIndexResult ScanIndex(TableDictionary &tables,
     if (row.found) {
       result.rows.push_back({std::string(secondary_key),
                              std::string(primary_key), std::move(row.value),
-                             PackTransactionId(row.tid)});
+                             row.tid.obj});
       ++returned_rows;
     }
     return row_limit > 0 && returned_rows >= row_limit;
@@ -169,14 +168,12 @@ ScanPaxResult ScanPax(TableDictionary &tables, std::shared_mutex &schema_mutex,
 
   auto append_pax_row = [&](std::string_view key, DataItem &item) {
     // Read an unlocked TID; the caller must recheck it after reading the cells.
-    const TransactionId tid = StableTid(item);
+    const Tidword tid = StableTid(item);
+    if (tid.absent) return false;
 
-    const size_t size = item.size();
-    if (size == 0) return false;
     // Return the PAX location for the caller to read directly.
-    result.rows.push_back({std::string(key), item.pax_group(),
-                           item.pax_slot(), static_cast<uint32_t>(size),
-                           PackTransactionId(tid), &item});
+    result.rows.push_back({std::string(key), item.pax_group(), item.pax_slot(),
+                           static_cast<uint32_t>(item.size()), tid.obj, &item});
     ++returned_rows;
     return row_limit > 0 && returned_rows >= row_limit;
   };

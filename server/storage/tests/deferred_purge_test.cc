@@ -71,7 +71,7 @@ bool ValidateRead(helios::storage::Database &db,
                   const helios::storage::ReadResult &read,
                   const std::string &key, std::string &reason) {
   const bool committed =
-      db.Commit({{kTable, key, read.tid, read.found}}, {}, {}, {},
+      db.Commit({{kTable, key, read.tid}}, {}, {}, {},
                 helios::storage::CommitDurability::kSync, reason);
   db.ReleaseThreadEpoch();
   return committed;
@@ -120,13 +120,18 @@ TEST(DeferredPurgeTest, FoundReadAbortsAfterDeferredPurgeRemovesSlot) {
 
   ASSERT_TRUE(CommitDelete(db, "k"));
 
-  std::string reason;
-  for (int i = 0; i < 200; ++i) {
-    ASSERT_FALSE(ValidateRead(db, stale, "k", reason));
-    if (StartsWith(reason, "exact_read_disappeared")) break;
-    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  // Wait for the record itself to go: a purged key reads as the absent word,
+  // while the delete's word is still there beforehand.
+  bool purged = false;
+  for (int i = 0; i < 200 && !purged; ++i) {
+    purged = Read(db, "k").tid == helios::storage::Tidword::Absent().obj;
+    if (!purged) std::this_thread::sleep_for(std::chrono::milliseconds(5));
   }
-  EXPECT_TRUE(StartsWith(reason, "exact_read_disappeared")) << reason;
+  ASSERT_TRUE(purged) << "the reaper never purged the deleted key";
+
+  std::string reason;
+  EXPECT_FALSE(ValidateRead(db, stale, "k", reason));
+  EXPECT_TRUE(StartsWith(reason, "exact_read_tid_moved")) << reason;
 }
 
 TEST(DeferredPurgeTest, ReinsertBeforeReaperKeepsLiveRow) {
@@ -157,7 +162,7 @@ TEST(DeferredPurgeTest, AbsentReadStillAbortsWhenRowAppears) {
 
   std::string reason;
   EXPECT_FALSE(ValidateRead(db, absent, "k", reason));
-  EXPECT_TRUE(StartsWith(reason, "exact_read_appeared")) << reason;
+  EXPECT_TRUE(StartsWith(reason, "exact_read_tid_moved")) << reason;
 }
 
 TEST(DeferredPurgeTest, InsertAfterPurgeWaitSeesLiveRow) {

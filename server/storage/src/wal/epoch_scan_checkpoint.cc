@@ -23,7 +23,6 @@
 #include "index/data_item.h"
 #include "index/masstree_index.h"
 #include "index/secondary_index.h"
-#include "silo/stable_read.h"
 #include "table/table.h"
 #include "table/table_dictionary.h"
 #include "util/debug_sync.h"
@@ -188,28 +187,20 @@ const char *EpochScanCheckpoint::WorkingFileName() {
  * of the value.
  *
  * @param retries Incremented once per rejected attempt.
- * @return kTaken, kSkipped for an absent slot or a tombstone, or kUnstable.
+ * @return kTaken, kSkipped when the absent flag is set, or kUnstable.
  */
 EpochScanCheckpoint::CaptureResult EpochScanCheckpoint::CapturePrimaryRow(
     const std::string &table_name, std::string_view key, const DataItem &item,
     LogRecord::Write &out, uint64_t &retries) {
   for (unsigned attempt = 0; attempt < kSpinAttempts; ++attempt) {
-    const TransactionId observed = item.transaction_id.load();
-    if (observed.tid & silo::kLockBit) {
+    const Tidword observed = item.transaction_id.load();
+    if (observed.lock) {
       ++retries;
       _mm_pause();
       continue;
     }
     HELIOS_DEBUG_SYNC("checkpoint.before_row_copy");
-    if (!item.HasRow()) {
-      // An absent slot or a tombstone, once the version confirms the emptiness
-      // is not the middle of an install.
-      if (item.transaction_id.load() == observed) {
-        return EpochScanCheckpoint::CaptureResult::kSkipped;
-      }
-      ++retries;
-      continue;
-    }
+    if (observed.absent) return EpochScanCheckpoint::CaptureResult::kSkipped;
     std::string bytes = item.CopyValue();
     if (item.transaction_id.load() != observed) {
       ++retries;
@@ -234,26 +225,26 @@ EpochScanCheckpoint::CaptureResult EpochScanCheckpoint::CapturePrimaryRow(
  * transaction id.
  *
  * @param retries Incremented once per rejected attempt.
- * @return kTaken, kSkipped for an empty list, or kUnstable.
+ * @return kTaken, kSkipped when the absent flag is set, or kUnstable.
  */
 EpochScanCheckpoint::CaptureResult EpochScanCheckpoint::CaptureSecondaryEntry(
     const std::string &table_name, const std::string &index_name,
     uint32_t index_type, std::string_view key, const DataItem &item,
     LogRecord::Write &out, uint64_t &retries) {
   for (unsigned attempt = 0; attempt < kSpinAttempts; ++attempt) {
-    const TransactionId observed = item.transaction_id.load();
-    if (observed.tid & silo::kLockBit) {
+    const Tidword observed = item.transaction_id.load();
+    if (observed.lock) {
       ++retries;
       _mm_pause();
       continue;
     }
+    if (observed.absent) return EpochScanCheckpoint::CaptureResult::kSkipped;
     auto primary_keys = std::atomic_load(&item.primary_keys_);
     if (item.transaction_id.load() != observed) {
       ++retries;
       continue;
     }
     const PrimaryKeyList::View keys(primary_keys);
-    if (keys.empty()) return EpochScanCheckpoint::CaptureResult::kSkipped;
     out.key.assign(key.data(), key.size());
     out.transaction_id = observed;
     out.table_name = table_name;

@@ -21,6 +21,7 @@
 namespace helios::storage {
 
 class TableDictionary;
+struct Tidword;
 namespace epoch {
 class Framework;
 }  // namespace epoch
@@ -34,6 +35,9 @@ class Reaper;
 }
 
 namespace silo {
+
+// Maximum tid within one epoch; Tidword reserves 29 bits for it.
+inline constexpr uint32_t kMaxTid = (1u << 29) - 1;
 
 /**
  * @brief One row change, decoded before entering the commit protocol.
@@ -66,46 +70,24 @@ struct CommitPayload {
  * Writes already contain PAX cell values; this protocol does not decode
  * input bytes. Nothing in the entries points into storage
  * memory:
- *   - reads:       (key, observed TID, found)
+ *   - reads:       (key, observed TID word)
  *   - writes:      (key, value | delete)
  *   - SI ops:      (secondary key, primary key, add | remove)
  *   - range reads: scan bounds plus the returned key list
  *
- * The protocol is Silo's commit protocol (paper §4.4), with a join at the
- * start, a leave and re-join at 1.2, and a leave after enqueue; [added]
- * marks steps beyond the paper, for by-key inputs and SQL insert / UNIQUE
- * semantics:
+ * The protocol locks the write set and reads the epoch, validates reads and
+ * constraints, then chooses one commit TID (Silo §4.2–4.4). It reserves PAX
+ * slots before installing values, copies WAL entries while locked, and
+ * publishes the TID to unlock each record. Empty records go to the reaper.
  *
- *   Resolve   R1  [added] map every key to its DataItem
- *             R2  [added] materialize absent slots for fresh write keys
- *             R3  [added] reject in-request UNIQUE duplicates
- *   Phase 1   1.1 [paper] lock the write set in address order
- *             1.2 [paper] re-read the global epoch (serialization point)
- *   Phase 2   2.1 [paper] exact reads: observed presence and TIDs unchanged
- *             2.2 [added] ranges: replay the scans, compare the key lists
- *                         in scan order and by count (row TIDs are
- *                         validated at 2.1)
- *             2.3 [added] inserts: the claimed key still holds no row
- *             2.4 [added] UNIQUE recheck after the lock wait
- *   Phase 3   3.0 [added] reserve PAX slots for all row writes
- *             3.1 [paper] write values; deletes become tombstones
- *             3.2 [paper] log entries before unlock (when logging)
- *             3.3 [paper] publish even TIDs stamped with the 1.2 epoch
- *             3.4 [added] hand slots left empty to the reaper for
- *                         deferred physical purge
- *             3.5 [paper] enqueue the log set, leave the epoch
+ * Point reads are revalidated by key and TID. Ranges are rescanned to compare
+ * their returned key lists; the caller also submits consumed rows as point
+ * reads.
  *
- * @note Read validation is logical: Phase 2 re-reads every key and
- * replays every scan, then requires the observed TIDs and the result
- * key lists to be unchanged. Silo instead guards ranges with Masstree
- * node versions (physical validation), but a node version is bound to a
- * node pointer, and this server keeps no per-transaction state that could
- * pin such a pointer across the RPC boundary, so its lifetime cannot be
- * guaranteed.
- *
- * @param durability Whether this commit's acknowledgement waits for its epoch
- * to reach the device. A logger that writes no records ignores it: step 3.5
- * has nothing to wait for.
+ * @param last_commit_tid Last TID chosen by this worker for this database.
+ * Updated when the transaction proceeds to write publication.
+ * @param durability Whether acknowledgement waits for this commit's epoch
+ * to become durable. Commits that enqueue no log records do not wait.
  * @param[out] abort_reason When the attempt aborts,
  * receives a short label naming the failed check, such as
  * `exact_read_tid_moved`, `primary_range_result_changed`,
@@ -116,7 +98,8 @@ struct CommitPayload {
 bool Commit(TableDictionary &tables, std::shared_mutex &schema_mutex,
             epoch::Framework &epoch_framework, index::Reaper &reaper,
             wal::Logger &logger, const CommitPayload &payload,
-            CommitDurability durability, std::string &abort_reason);
+            Tidword &last_commit_tid, CommitDurability durability,
+            std::string &abort_reason);
 
 }  // namespace silo
 }  // namespace helios::storage

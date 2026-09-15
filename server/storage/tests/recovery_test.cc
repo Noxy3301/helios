@@ -122,11 +122,12 @@ TEST_F(RecoveryTest, ALoggedWriteCarriesTheUnlockedTid) {
         seen_index_entry = true;
         EXPECT_EQ(write.secondary_primary_key, "k");
       }
-      // An odd tid is a write lock held by a transaction that no longer
-      // exists; recovery installs it verbatim and every later reader and
-      // writer of the key waits on it forever.
-      EXPECT_EQ(write.transaction_id.tid % 2, 0u);
-      EXPECT_NE(write.transaction_id.tid, 0u);
+      // A word with the lock bit is a write lock held by a transaction that
+      // no longer exists; recovery installs it verbatim and every later reader
+      // and writer of the key waits on it forever.
+      EXPECT_FALSE(write.transaction_id.lock);
+      // A published word always sets latest; the zero word never reaches here.
+      EXPECT_TRUE(write.transaction_id.latest);
       // The log entry is taken before the unlock, so an epoch that advanced
       // under the lock would be recorded one epoch behind the frame.
       EXPECT_EQ(write.transaction_id.epoch, record.epoch);
@@ -155,7 +156,7 @@ TEST_F(RecoveryTest, ARecoveredKeyAcceptsAFurtherWrite) {
       for (const auto &write : record.writes) {
         if (write.key != "k") continue;
         seen = true;
-        ASSERT_EQ(write.transaction_id.tid % 2, 0u);
+        ASSERT_FALSE(write.transaction_id.lock);
       }
     }
     ASSERT_TRUE(seen) << "the log holds no record of the key";

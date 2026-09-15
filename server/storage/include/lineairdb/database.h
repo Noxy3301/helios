@@ -40,8 +40,10 @@
 #include "lineairdb/read.h"
 
 #include "index/reaper.h"
+#include "silo/tidword.h"
 #include "table/table_dictionary.h"
 #include "util/epoch_framework.h"
+#include "util/thread_key_storage.h"
 #include "wal/epoch_scan_checkpoint.h"
 #include "wal/logger.h"
 
@@ -201,7 +203,7 @@ class Database {
   // Reads, scans and the commit.
   //
   // The methods below hold no state between calls. Each returns what the
-  // caller needs (value, packed TID) to keep its own read set across
+  // caller needs (value, TID word) to keep its own read set across
   // independent RPCs. Commit revalidates the collected read set when the
   // logical transaction is ready to commit.
   // See @ref read.h for the supporting types.
@@ -211,7 +213,7 @@ class Database {
    * @brief Reads one row without opening a server-side transaction.
    *
    * Looks the key up in the primary index of `table_name` and returns the
-   * current value together with the packed TID observed at read time. The
+   * current value together with the TID word observed at read time. The
    * caller should later pass the same TID back inside an ExternalReadEntry
    * so that Commit can confirm the row was not modified
    * concurrently.
@@ -421,6 +423,8 @@ class Database {
   // Shared for reads, statistics and commit slot resolution; exclusive for DDL.
   std::shared_mutex schema_mutex_;
   index::Reaper reaper_;
+  // Each worker remembers the last TID it chose for this database.
+  ThreadKeyStorage<Tidword> last_commit_tids_;
 
   // Bound the lifetime of a read view so `E - se` stays in the wrap-free window.
   static constexpr EpochNumber kPaxReadViewEpochLifetime =

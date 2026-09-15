@@ -15,14 +15,17 @@ namespace helios::storage {
 /**
  * @brief Outcome of a single Database::Read.
  *
- * The caller passes the same `tid` and `found` back in an ExternalReadEntry
- * so Commit can confirm the row did not move.
+ * The caller passes the same `tid` back in an ExternalReadEntry so Commit can
+ * confirm the record did not move.
  */
 struct ReadResult {
-  // True when the key holds a live, non-empty payload.
+  // True when the table exists and the observed word has its absent bit
+  // clear.
   bool found = false;
   std::string value;  // Row payload, valid only when `found` is true.
-  uint64_t tid = 0;   // Packed (`epoch:32 | tid:32`) version observed at read.
+  // Observed TID word. Missing keys return the absent word;
+  // missing tables return zero.
+  uint64_t tid = 0;
 };
 
 /**
@@ -31,7 +34,7 @@ struct ReadResult {
 struct ScanRow {
   std::string key;
   std::string value;
-  uint64_t tid = 0;  // Packed version observed for this row.
+  uint64_t tid = 0;  // The TID word observed for this row.
 };
 
 /**
@@ -44,7 +47,7 @@ struct ScanIndexRow {
   std::string secondary_key;
   std::string primary_key;
   std::string value;
-  uint64_t tid = 0;  // Packed version of the base row.
+  uint64_t tid = 0;  // The TID word of the base row.
 };
 
 /**
@@ -91,11 +94,11 @@ struct ScanPaxResult {
 };
 
 /**
- * @brief Returns the live packed TID of the row a PAX reference points at.
+ * @brief Returns the live TID word of the row a PAX reference points at.
  *
- * @details Loads through `row.item`, which must be non-null. Packed as
- * ReadResult::tid is. This is not `row.tid`: compare the two to reject a row
- * a writer changed during the scan.
+ * @details Loads through `row.item`, which must be non-null. The same word
+ * ReadResult::tid carries. This is not `row.tid`: compare the two to reject a
+ * row a writer changed during the scan.
  *
  * @param row Row reference returned by Database::ScanPax.
  */

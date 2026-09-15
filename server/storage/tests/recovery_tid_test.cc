@@ -51,7 +51,7 @@ TEST(RecoveryTidTest, ARecoveredKeyAcceptsTheNextWrite) {
     auto recovered = db.Read(kTable, "alice");
     db.ReleaseThreadEpoch();
     ASSERT_TRUE(recovered.found);
-    EXPECT_EQ(recovered.tid % 2, 0u)
+    EXPECT_FALSE(helios::storage::Tidword(recovered.tid).lock)
         << "the recovered TID still carries the lock bit";
 
     std::string reason;

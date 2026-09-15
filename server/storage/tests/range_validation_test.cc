@@ -92,9 +92,9 @@ void SeedRows(helios::storage::Database &db) {
 // the slot before validation runs, and an aborted commit leaves it behind.
 void LeaveAbsentSlot(helios::storage::Database &db, const std::string &key) {
   std::string reason;
-  const bool committed = db.Commit(
-      {{kTable, "k1", 0, true}}, {{kTable, key, TestHelper::Row("v")}}, {}, {},
-      helios::storage::CommitDurability::kSync, reason);
+  const bool committed =
+      db.Commit({{kTable, "k1", 0}}, {{kTable, key, TestHelper::Row("v")}}, {},
+                {}, helios::storage::CommitDurability::kSync, reason);
   db.ReleaseThreadEpoch();
   ASSERT_FALSE(committed) << "the write was supposed to abort";
   EXPECT_FALSE(reason.empty()) << "an abort names its reason";

@@ -167,7 +167,7 @@ struct MasstreeIndex::Impl {
 
   // The reaper has locked the item and checked its delete TID.
   bool Purge(std::string_view key, DataItem &expected,
-             TransactionId retired_tid) {
+             Tidword retired_tid) {
     ensure_thread_active();
     cursor_type lp(table_, key.data(), key.size());
     const bool found = lp.find_locked(*tls_ti);
@@ -183,7 +183,8 @@ struct MasstreeIndex::Impl {
     }
     // Readers wait on the lock bit until we publish retired_tid below.
     HELIOS_DEBUG_SYNC("reaper.purge_locked_window");
-    // Remove the tree entry, publish its TID, then queue the item for RCU deletion.
+    // Change the old item's TID word after unlinking it; RCU keeps it alive for
+    // readers that still hold its pointer.
     lp.finish(-1, *tls_ti);
     current->transaction_id.store(retired_tid);
     RcuFree(current);
@@ -276,7 +277,7 @@ void MasstreeIndex::ForEach(
 }
 
 bool MasstreeIndex::Purge(std::string_view key, DataItem &expected,
-                          TransactionId retired_tid) {
+                          Tidword retired_tid) {
   return impl_->Purge(key, expected, retired_tid);
 }
 

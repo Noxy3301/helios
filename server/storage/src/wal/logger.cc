@@ -83,7 +83,7 @@ struct SecondaryOpKeyHash {
   }
 };
 struct SecondaryOpState {
-  TransactionId tid;
+  Tidword tid;
   SecondaryIndexOp op;
 };
 
@@ -109,7 +109,7 @@ struct SecondaryGroupKeyHash {
   }
 };
 struct SecondaryGroupValue {
-  TransactionId max_tid{};
+  Tidword max_tid{};
   std::vector<std::string> primary_keys;
 };
 
