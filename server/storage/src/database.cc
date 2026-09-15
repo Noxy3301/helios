@@ -62,7 +62,9 @@ Database::Database(const Config &config)
     : config_(config),
       logger_(config_),
       epoch_framework_(config_.epoch_duration_ms, MakeEpochHook()),
-      scan_checkpoint_(config_, table_dictionary_, epoch_framework_, logger_) {
+      scan_checkpoint_(config_, table_dictionary_, epoch_framework_, logger_),
+      commit_executor_(table_dictionary_, schema_mutex_, epoch_framework_,
+                       reaper_, logger_) {
   SPDLOG_INFO("Storage instance has been constructed.");
 
   // Restore column definitions before any recovered value is installed.
@@ -253,9 +255,8 @@ bool Database::Commit(
   const silo::CommitPayload payload{reads, write_set, secondary_index_ops,
                                     range_reads};
   Tidword &last_commit_tid = *last_commit_tids_.Get();
-  return silo::Commit(table_dictionary_, schema_mutex_, epoch_framework_,
-                      reaper_, logger_, payload, last_commit_tid, durability,
-                      abort_reason);
+  return commit_executor_.Commit(payload, last_commit_tid, durability,
+                                abort_reason);
 }
 
 Table *Database::GetTable(const std::string_view table_name) const {

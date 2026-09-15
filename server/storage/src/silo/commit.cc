@@ -281,15 +281,24 @@ bool EnqueueLogEntries(wal::Logger &logger, wal::LogEntries &log_entries,
 
 }  // namespace
 
-bool Commit(TableDictionary &tables, std::shared_mutex &schema_mutex,
-            epoch::Framework &epoch_framework, index::Reaper &reaper,
-            wal::Logger &logger, const CommitPayload &payload,
-            Tidword &last_commit_tid, CommitDurability durability,
-            std::string &abort_reason) {
-  CommitCtx ctx{tables, epoch_framework, payload, abort_reason};
+CommitExecutor::CommitExecutor(TableDictionary &tables,
+                               std::shared_mutex &schema_mutex,
+                               epoch::Framework &epoch_framework,
+                               index::Reaper &reaper, wal::Logger &logger)
+    : tables_(tables),
+      schema_mutex_(schema_mutex),
+      epoch_framework_(epoch_framework),
+      reaper_(reaper),
+      logger_(logger) {}
+
+bool CommitExecutor::Commit(const CommitPayload &payload,
+                            Tidword &last_commit_tid,
+                            CommitDurability durability,
+                            std::string &abort_reason) const {
+  CommitCtx ctx{tables_, epoch_framework_, payload, abort_reason};
 
   // Enter the storage epoch before resolving and locking targets.
-  epoch_framework.Join();
+  epoch_framework_.Join();
 
   ctx.has_insert = std::any_of(
       payload.writes.begin(), payload.writes.end(),
@@ -302,7 +311,7 @@ bool Commit(TableDictionary &tables, std::shared_mutex &schema_mutex,
     }
   }
 
-  if (!ResolveWrites(ctx, schema_mutex)) return false;
+  if (!ResolveWrites(ctx, schema_mutex_)) return false;
 
   // Test hook outside the schema lock so concurrent DDL can proceed.
   if (ctx.has_insert) {
@@ -319,8 +328,8 @@ bool Commit(TableDictionary &tables, std::shared_mutex &schema_mutex,
 
   // Sample the epoch after lock waits so this commit cannot get an older epoch
   // than the writers it waited for. Masstree's RCU protection stays active.
-  epoch_framework.Leave();
-  ctx.commit_epoch = epoch_framework.Join();
+  epoch_framework_.Leave();
+  ctx.commit_epoch = epoch_framework_.Join();
 
   // Phase 2: validate read observations and assign the commit TID.
   if (!ValidateReads(ctx)) return false;
@@ -351,16 +360,16 @@ bool Commit(TableDictionary &tables, std::shared_mutex &schema_mutex,
     entry.Apply(*item);
     // Once unlocked, another writer may replace this record immediately.
     log_entries.emplace_back(entry.BuildLog(*item, ctx.commit_tid));
-    entry.Publish(*item, ctx.commit_tid, reaper);
+    entry.Publish(*item, ctx.commit_tid, reaper_);
     row_applied = row_applied || entry.IsRow();
   }
   const bool awaits_durability =
-      EnqueueLogEntries(logger, log_entries, ctx.commit_epoch, durability);
+      EnqueueLogEntries(logger_, log_entries, ctx.commit_epoch, durability);
 
   HELIOS_DEBUG_SYNC("silo_commit.before_offline");
-  epoch_framework.Leave();
+  epoch_framework_.Leave();
 
-  logger.AwaitCommitDurability(ctx.commit_epoch, awaits_durability);
+  logger_.AwaitCommitDurability(ctx.commit_epoch, awaits_durability);
   return true;
 }
 

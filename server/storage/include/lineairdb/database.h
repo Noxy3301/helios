@@ -40,6 +40,7 @@
 #include "lineairdb/read.h"
 
 #include "index/reaper.h"
+#include "silo/commit.h"
 #include "silo/tidword.h"
 #include "table/table_dictionary.h"
 #include "util/epoch_framework.h"
@@ -362,10 +363,10 @@ class Database {
    *        writes atomically.
    *
    * Runs the Silo commit protocol against external inputs: resolve each
-   * key to its record, lock the write set, validate the reads (point
-   * TIDs, range replays, UNIQUE rechecks), then install the writes,
-   * append the log set, and unlock with a new TID. The full contract
-   * lives with silo::Commit.
+   * key to its record, lock the write set, validate read observations,
+   * then prepare updates and check write constraints. Each record is updated,
+   * copied to the log, and unlocked with its new TID. The full contract
+   * lives with silo::CommitExecutor::Commit.
    *
    * Input values are decoded using their PAX schemas before entering Silo.
    * Conversion failures return false with pax_row_decode_failed; they are
@@ -425,6 +426,7 @@ class Database {
   index::Reaper reaper_;
   // Each worker remembers the last TID it chose for this database.
   ThreadKeyStorage<Tidword> last_commit_tids_;
+  silo::CommitExecutor commit_executor_;
 
   // Bound the lifetime of a read view so `E - se` stays in the wrap-free window.
   static constexpr EpochNumber kPaxReadViewEpochLifetime =

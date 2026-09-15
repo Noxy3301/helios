@@ -63,44 +63,62 @@ struct CommitPayload {
 };
 
 /**
- * @brief Runs the Silo commit protocol for a transaction whose read and
- * write sets were assembled by the caller through the read API.
- *
- * @details
- * Writes already contain PAX cell values; this protocol does not decode
- * input bytes. Nothing in the entries points into storage
- * memory:
- *   - reads:       (key, observed TID word)
- *   - writes:      (key, value | delete)
- *   - SI ops:      (secondary key, primary key, add | remove)
- *   - range reads: scan bounds plus the returned key list
- *
- * The protocol locks the write set and reads the epoch, validates read
- * observations, then chooses one commit TID (Silo §4.2–4.4). Write constraints
- * and PAX slot allocation are completed before applying any values.
- * Each record is then updated, copied into the WAL, and unlocked by publishing
- * its TID. Empty records go to the reaper.
- *
- * Point reads are revalidated by key and TID. Ranges are rescanned to compare
- * their returned key lists; the caller also submits consumed rows as point
- * reads.
- *
- * @param last_commit_tid Last TID chosen by this worker for this database.
- * Updated when the transaction proceeds to write publication.
- * @param durability Whether acknowledgement waits for this commit's epoch
- * to become durable. Commits that enqueue no log records do not wait.
- * @param[out] abort_reason When the attempt aborts,
- * receives a short label naming the failed check, such as
- * `exact_read_tid_moved`, `primary_range_result_changed`,
- * `duplicate_primary_key`, or `unique_si_exists_after_lock`.
- * @return true when the transaction committed; false on abort, after
- * every lock this attempt acquired has been released.
+ * @brief Executes commits using one database's shared storage components.
+ * @details The database owns this executor and outlives every Commit call.
+ * Each call keeps its read/write sets and other attempt state locally, so
+ * concurrent callers share only the storage components bound here.
  */
-bool Commit(TableDictionary &tables, std::shared_mutex &schema_mutex,
-            epoch::Framework &epoch_framework, index::Reaper &reaper,
-            wal::Logger &logger, const CommitPayload &payload,
-            Tidword &last_commit_tid, CommitDurability durability,
-            std::string &abort_reason);
+class CommitExecutor {
+ public:
+  /** @brief Binds components that must outlive this executor. */
+  CommitExecutor(TableDictionary &tables, std::shared_mutex &schema_mutex,
+                 epoch::Framework &epoch_framework, index::Reaper &reaper,
+                 wal::Logger &logger);
+
+  /**
+   * @brief Runs the Silo commit protocol for a transaction whose read and
+   * write sets were assembled by the caller through the read API.
+   *
+   * @details
+   * Writes already contain PAX cell values; this protocol does not decode
+   * input bytes. Nothing in the entries points into storage
+   * memory:
+   *   - reads:       (key, observed TID word)
+   *   - writes:      (key, value | delete)
+   *   - SI ops:      (secondary key, primary key, add | remove)
+   *   - range reads: scan bounds plus the returned key list
+   *
+   * The protocol locks the write set and reads the epoch, validates read
+   * observations, then chooses one commit TID (Silo §4.2–4.4). Write constraints
+   * and PAX slot allocation are completed before applying any values.
+   * Each record is then updated, copied into the WAL, and unlocked by publishing
+   * its TID. Empty records go to the reaper.
+   *
+   * Point reads are revalidated by key and TID. Ranges are rescanned to compare
+   * their returned key lists; the caller also submits consumed rows as point
+   * reads.
+   *
+   * @param last_commit_tid Last TID chosen by this worker for this database.
+   * Updated when the transaction proceeds to write publication.
+   * @param durability Whether acknowledgement waits for this commit's epoch
+   * to become durable. Commits that enqueue no log records do not wait.
+   * @param[out] abort_reason When the attempt aborts,
+   * receives a short label naming the failed check, such as
+   * `exact_read_tid_moved`, `primary_range_result_changed`,
+   * `duplicate_primary_key`, or `unique_si_exists_after_lock`.
+   * @return true when the transaction committed; false on abort, after
+   * every lock this attempt acquired has been released.
+   */
+  bool Commit(const CommitPayload &payload, Tidword &last_commit_tid,
+              CommitDurability durability, std::string &abort_reason) const;
+
+ private:
+  TableDictionary &tables_;
+  std::shared_mutex &schema_mutex_;
+  epoch::Framework &epoch_framework_;
+  index::Reaper &reaper_;
+  wal::Logger &logger_;
+};
 
 }  // namespace silo
 }  // namespace helios::storage

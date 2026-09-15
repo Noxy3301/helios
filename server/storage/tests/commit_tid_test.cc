@@ -119,9 +119,10 @@ class CommitTidTest : public ::testing::Test {
     }
     reason_.clear();
     const silo::CommitPayload payload{reads, decoded, index_ops, ranges};
-    const bool committed =
-        silo::Commit(tables_, schema_mutex_, epoch_, reaper_, *logger_, payload,
-                     last_tid_, CommitDurability::kAsync, reason_);
+    const silo::CommitExecutor executor(tables_, schema_mutex_, epoch_, reaper_,
+                                         *logger_);
+    const bool committed = executor.Commit(payload, last_tid_,
+                                           CommitDurability::kAsync, reason_);
     index::MasstreeReleaseThreadEpoch();
     return committed;
   }
