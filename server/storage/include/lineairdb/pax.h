@@ -113,8 +113,8 @@ struct Row;
  * storage class. Callers invoke `ScatterRow()` only while holding the row's
  * existing Silo TID lock. `GatherRow()` is memory-safe under a concurrent
  * scatter to the same slot, and callers reject torn rows with the normal TID
- * re-check. Strip-direct readers resolve concurrent writers through the
- * columnar read view surface below.
+ * re-check. Strip-direct readers resolve a concurrent writer through the
+ * entries and the capture counter declared below.
  */
 class PaxGroup {
  public:
@@ -274,20 +274,12 @@ uint64_t SlotsAllocated(const PaxTable *store);
  */
 size_t GroupCount(const PaxTable *store);
 
-// ---------------------------------------------------------------------------
-// Columnar read view surface.
-//
-// While a read view acquired through Database::AcquirePaxView is active,
-// every PAX install captures the replaced row image into a per-group undo
-// map before its first strip mutation, or fails the capture for the active
-// generation when it cannot (src/pax/version_store.h holds the full
-// contract). A reader at snapshot epoch `se` uses the oldest before-image
-// whose writer epoch exceeds `se`. `was_visible == false` means the slot held
-// no row. With no such entry, the reader uses the strip in place.
-// ---------------------------------------------------------------------------
-
 /**
  * @brief One captured before-image for a (group, slot).
+ *
+ * @details A reader at snapshot epoch `se` uses the oldest entry whose writer
+ * epoch exceeds `se`, and the strip in place when no entry qualifies.
+ * `was_visible == false` means the slot held no row.
  */
 struct UndoEntry {
   uint32_t writer_epoch;  // commit epoch of the install that captured this
@@ -310,7 +302,7 @@ inline bool EpochAfterSnapshot(uint32_t writer_epoch, uint32_t snapshot_epoch) {
 /**
  * @brief Returns the monotonic capture counter of `group`'s undo map.
  *
- * @details 0 when nothing captured into the group this generation. The
+ * @details 0 when nothing captured into the group since the last clear. The
  * counter increments after an entry is appended and before the writer's
  * first strip mutation; an unchanged value across an in-place read means
  * no concurrent capture.

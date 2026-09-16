@@ -1,12 +1,10 @@
 /**
  * @file server/storage/src/pax/version_store.cc
- * Capture and lookup of the before-images, and the generation whose read
- * views are invalid once a capture cannot be kept.
+ * Capture of a before-image, lookup of the images a reader resolves against,
+ * and the clear the last read view release performs.
  */
 
 #include "pax/version_store.h"
-
-#include "util/spdlog.h"
 
 namespace helios::storage {
 namespace pax {
@@ -40,17 +38,6 @@ void VersionStore::Capture(PaxGroup *group, uint32_t slot,
   std::shared_lock<std::shared_mutex> lk(registry_mutex_);
   if (active_captures_.load(std::memory_order_seq_cst) == 0) return;
 
-  const uint64_t added = old_row.size() + sizeof(Entry);
-  const uint64_t before =
-      captured_bytes_.fetch_add(added, std::memory_order_relaxed);
-  if (before + added > kByteBudget) {
-    capture_failed_.store(true, std::memory_order_seq_cst);
-    SPDLOG_WARN(
-        "PAX version store byte budget exceeded; the capture failed and the "
-        "active generation's results will be discarded");
-    return;
-  }
-
   GroupUndo *undo = GetOrCreateUndo(group);
   {
     std::lock_guard<std::mutex> glk(undo->mutex);
@@ -67,13 +54,6 @@ void VersionStore::Capture(PaxGroup *group, uint32_t slot,
 VersionStore::ReadViewToken VersionStore::BeginCapture() {
   std::unique_lock<std::shared_mutex> lk(registry_mutex_);
   ReadViewToken token;
-  // A generation whose capture failed may contain mutations with no entry and
-  // no count advance; a joining read view could trust a window it must not.
-  // Reject until the last member releases.
-  if (active_captures_.load(std::memory_order_seq_cst) > 0 &&
-      capture_failed_.load(std::memory_order_seq_cst)) {
-    return token;
-  }
   token.id = next_view_id_++;
   token.valid = true;
   // seq_cst is load-bearing for the read view fence; do not weaken.
@@ -87,15 +67,6 @@ void VersionStore::EndCapture(const ReadViewToken &token) {
   const auto remaining =
       active_captures_.fetch_sub(1, std::memory_order_seq_cst) - 1;
   if (remaining == 0) ClearAllLocked();
-}
-
-bool VersionStore::CaptureFailed() const {
-  return capture_failed_.load(std::memory_order_seq_cst);
-}
-
-void VersionStore::FailCapture(const char *reason) {
-  capture_failed_.store(true, std::memory_order_seq_cst);
-  SPDLOG_WARN("PAX version store capture failed: {}", reason);
 }
 
 uint64_t VersionStore::GroupCaptureCount(const PaxGroup *group) const {
@@ -127,14 +98,12 @@ void VersionStore::ClearAllLocked() {
   for (auto &[group, undo] : groups_) {
     std::lock_guard<std::mutex> glk(undo->mutex);
     undo->entries.clear();
-    // The reset cannot alias two generations: counter comparisons happen
+    // The reset cannot confuse two read views: counter comparisons happen
     // between samples under one active read view and this clear runs only
     // while none is active. Without it a once-captured group would lose
     // in-place strip reads for the rest of the process lifetime.
     undo->capture_count.store(0, std::memory_order_release);
   }
-  captured_bytes_.store(0, std::memory_order_relaxed);
-  capture_failed_.store(false, std::memory_order_seq_cst);
 }
 
 uint64_t UndoCount(const PaxGroup *group) {

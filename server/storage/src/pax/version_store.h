@@ -24,17 +24,13 @@ namespace pax {
 /**
  * @brief Before-image store that keeps a columnar read view consistent.
  *
- * @details A generation is the interval during which at least one read view
- * holds a registration. While one is active (`active_captures_ > 0`), every
- * PAX install captures the replaced row image before its first strip-cell
- * or visibility-bit mutation; a first install captures an empty
- * was_visible=false entry. An install that cannot capture (byte budget
- * exceeded, or epoch 0) fails the capture for the active generation
- * instead, and every result produced under it is discarded. A reader
- * at snapshot epoch `se` uses the oldest before-image whose writer epoch
- * exceeds `se` and reads the strip in place when no entry
- * qualifies. With no read view active the writer side pays one atomic load
- * per installed row.
+ * @details While at least one read view holds a registration
+ * (`active_captures_ > 0`), every PAX install captures the replaced row
+ * image before its first strip-cell or visibility-bit mutation; a first
+ * install captures an empty was_visible=false entry. A reader at snapshot
+ * epoch `se` uses the oldest before-image whose writer epoch exceeds `se`
+ * and reads the strip in place when no entry qualifies. With no read view
+ * active the writer side pays one atomic load per installed row.
  */
 class VersionStore {
  public:
@@ -74,8 +70,7 @@ class VersionStore {
    * @details Must run before the install's first strip-cell or
    * visibility-bit mutation. A first install into a fresh slot passes
    * was_visible=false and an empty row. With no read view active this
-   * returns without capturing, and a capture that would take the store past
-   * its byte budget fails the capture instead of appending.
+   * returns without capturing.
    *
    * @param writer_epoch The commit epoch of the install being made.
    */
@@ -95,8 +90,7 @@ class VersionStore {
   /**
    * @brief Arms capturing; the caller performs the epoch fence itself.
    *
-   * @return A token whose valid is false when a failed capture still
-   * has registrations.
+   * @return The registration to pass to EndCapture.
    */
   ReadViewToken BeginCapture();
 
@@ -104,27 +98,10 @@ class VersionStore {
    * @brief Releases one registration; call exactly once per valid token.
    *
    * @details The release of the last active registration clears every
-   * group's entries and clears the capture failure. Token ids are diagnostic;
-   * a double or stale release is not detected.
+   * group's entries. Token ids are diagnostic; a double or stale release is
+   * not detected.
    */
   void EndCapture(const ReadViewToken &token);
-
-  /**
-   * @brief Returns whether the capture failed for the active generation;
-   * every result that generation produced must be discarded.
-   */
-  bool CaptureFailed() const;
-
-  /**
-   * @brief Fails every active read view and rejects new ones until the last
-   * active read view releases.
-   *
-   * @details Callers must fail the capture before mutating any cell the
-   * failed capture should have covered. A failure racing the last release
-   * may land on the next generation, whose results are then discarded;
-   * both orderings fail closed.
-   */
-  void FailCapture(const char *reason);
 
   /**
    * @brief Returns the capture_count of the group's undo map, 0 if the
@@ -149,14 +126,6 @@ class VersionStore {
   // seq_cst on both sides is load-bearing for the fence proof; do not
   // weaken.
   std::atomic<uint64_t> active_captures_{0};
-  // Byte budget for captured before-images. Exceeding it fails the capture,
-  // and with it every active read view, instead of growing writer-side
-  // memory without bound.
-  static constexpr uint64_t kByteBudget = 256ull << 20;
-  std::atomic<uint64_t> captured_bytes_{0};
-  // Covers the whole active generation; resets when the last read view
-  // releases.
-  std::atomic<bool> capture_failed_{false};
 
   // shared: Capture; exclusive: BeginCapture, EndCapture and the clear the
   // last release performs. Const readers take neither.

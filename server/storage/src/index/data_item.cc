@@ -30,14 +30,7 @@ bool DataItem::AllocateSlot(pax::PaxTable &table) {
 void DataItem::CaptureBeforeImage(EpochNumber epoch) {
   auto &version_store = pax::VersionStore::Global();
   if (!version_store.CaptureActive()) return;
-  if (epoch == 0) {
-    // Fail closed: skipping silently would let cells change with no
-    // entry and no count advance, and the reader's end recheck would
-    // pass on a torn result. The writer proceeds.
-    version_store.FailCapture(
-        "PAX install without a commit epoch while a read view is active");
-    return;
-  }
+  assert(epoch != 0);
   const bool visible = size_ != 0;
   version_store.Capture(pax_group(), pax_slot(), epoch, visible,
                         visible ? CopyValue() : std::string());

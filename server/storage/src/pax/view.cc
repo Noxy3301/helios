@@ -14,7 +14,6 @@
 #include "pax/table.h"
 #include "pax/version_store.h"
 #include "pax/catalog.h"
-#include "util/debug_sync.h"
 #include "util/spdlog.h"
 
 namespace helios::storage {
@@ -30,12 +29,6 @@ pax::PaxTable *Database::GetPaxTable(const std::string_view table_name) {
 Database::PaxReadView Database::AcquirePaxView(uint32_t fence_timeout_ms) {
   Database::PaxReadView view;
   auto token = pax::VersionStore::Global().BeginCapture();
-  if (!token.valid) {
-    view.error =
-        "columnar read view rejected: the capture failed for the active "
-        "generation";
-    return view;
-  }
   // Enable capture (seq_cst in BeginCapture), then sample `E` as snapshot `se`.
   // An install that missed capture belongs to a commit at or below `se`.
   // Its worker epoch `e_w` keeps `E < e_w + 2` until it leaves, so waiting for
@@ -58,16 +51,6 @@ Database::PaxReadView Database::AcquirePaxView(uint32_t fence_timeout_ms) {
         "holding the epoch";
     return view;
   }
-  // Test hook: a wait point after the fence and before the handle is marked
-  // valid.
-  HELIOS_DEBUG_SYNC("pax_read_view.after_fence");
-  // A capture failure landing during acquisition must fail it here; callers
-  // treat a valid view as a serviceable read view.
-  if (pax::VersionStore::Global().CaptureFailed()) {
-    pax::VersionStore::Global().EndCapture(token);
-    view.error = "columnar read view invalidated during acquisition";
-    return view;
-  }
   view.valid = true;
   view.snapshot_epoch = snapshot_epoch;
   view.token = token.id;
@@ -88,7 +71,7 @@ bool Database::PaxViewValid(const PaxReadView &view) const {
       kPaxReadViewEpochLifetime) {
     return false;  // expired: comparisons could leave the wrap-free window
   }
-  return !pax::VersionStore::Global().CaptureFailed();
+  return true;
 }
 
 bool Database::InstallPaxSchema(const std::string_view table_name,

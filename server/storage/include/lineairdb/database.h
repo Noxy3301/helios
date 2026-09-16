@@ -174,11 +174,10 @@ class Database {
    * @brief Arms capture and waits for global epoch `E >= se + 2`.
    *
    * @details On return every commit through snapshot_epoch `se` has finished
-   * installing, and every later commit captures the rows it overwrites or
-   * invalidates the read view. The calling thread must not hold an epoch (it
-   * must be outside any transaction). Fails instead of falling back on
-   * fence timeout, near the epoch high-water mark, or when the capture fails
-   * during acquisition.
+   * installing, and every later commit captures the rows it overwrites. The
+   * calling thread must not hold an epoch (it must be outside any
+   * transaction). Fails instead of falling back on fence timeout or near the
+   * epoch high-water mark.
    *
    * @param fence_timeout_ms Upper bound on the fence wait.
    * @return A valid handle, or an invalid one carrying the reason.
@@ -194,9 +193,9 @@ class Database {
   /**
    * @brief Returns whether this read view's results may be used.
    *
-   * @details False for an invalid view, for one whose generation's capture
-   * failed, and for one that outlived its epoch-lifetime bound. Callers
-   * gate every result on this before accepting it.
+   * @details False for an invalid view and for one that outlived its
+   * epoch-lifetime bound. Callers gate every result on this before accepting
+   * it.
    */
   bool PaxViewValid(const PaxReadView &view) const;
 
