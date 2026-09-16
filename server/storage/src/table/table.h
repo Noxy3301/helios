@@ -2,17 +2,15 @@
 
 /**
  * @file server/storage/src/table/table.h
- * One table: its primary index, its secondary indexes, and the lock that
- * keeps a definition change apart from definition lookups.
+ * One table: its primary index, its secondary indexes and its PAX store,
+ * published for lock-free lookup.
  */
 
 #ifndef HELIOS_STORAGE_SRC_TABLE_TABLE_H
 #define HELIOS_STORAGE_SRC_TABLE_TABLE_H
 
-#include <memory>
-#include <shared_mutex>
+#include <atomic>
 #include <string>
-#include <unordered_map>
 
 #include "lineairdb/pax.h"
 
@@ -26,13 +24,15 @@ namespace helios::storage {
  * @brief One table: its primary index, its named secondary indexes, and its
  *        optional PAX store.
  *
- * @details table_lock_ covers the secondary-index map and the PAX install
- * only; the primary index is reached without it. A secondary index is never
- * removed, so a pointer to one stays valid for the table's lifetime.
+ * @details A definition change publishes with a release store and a lookup
+ * takes no lock; the caller serializes definition changes (Database's DDL
+ * mutex, or recovery on one thread). An index is never removed, and a
+ * pointer to one stays valid for the table's lifetime.
  */
 class Table {
  public:
   explicit Table(std::string_view table_name);
+  ~Table();
 
   /**
    * @brief Declares a secondary index on this table.
@@ -70,15 +70,12 @@ class Table {
 
   /**
    * @brief Calls `f(name, index)` for each secondary index of this table.
-   *
-   * @details Runs under the table lock, so `f` must not call back into a
-   * method that changes the table's definition.
    */
   template <typename Func>
   void ForEachSecondaryIndex(Func &&f) {
-    std::shared_lock<std::shared_mutex> lk(table_lock_);
-    for (auto &[index_name, index_ptr] : secondary_indices_) {
-      f(index_name, *index_ptr);
+    for (IndexNode *node = indexes_.load(std::memory_order_acquire);
+         node != nullptr; node = node->next) {
+      f(node->name, node->index);
     }
   }
 
@@ -92,12 +89,24 @@ class Table {
       const std::string_view index_name, const IndexConstraint index_type);
 
  private:
+  struct IndexNode {
+    std::string name;
+    index::SecondaryIndex index;
+    IndexNode *next;
+
+    IndexNode(std::string_view index_name, IndexConstraint index_type,
+              IndexNode *next)
+        : name(index_name), index(index_type), next(next) {}
+  };
+
   index::MasstreeIndex primary_index_;
-  std::unique_ptr<pax::PaxTable> pax_table_;
-  mutable std::shared_mutex table_lock_;
-  std::unordered_map<std::string, std::unique_ptr<index::SecondaryIndex>>
-      secondary_indices_;
+  // Set once by InstallPaxSchema; the destructor deletes it.
+  std::atomic<pax::PaxTable *> pax_table_{nullptr};
+  // Append-only chain, newest first.
+  std::atomic<IndexNode *> indexes_{nullptr};
   std::string table_name_;
+
+  IndexNode *FindIndex(std::string_view index_name) const;
 };
 }  // namespace helios::storage
 
