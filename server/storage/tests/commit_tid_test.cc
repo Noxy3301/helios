@@ -571,18 +571,28 @@ TEST_F(CommitTidTest, MissingRangeEndAbortsBeforeLocking) {
   EXPECT_EQ(Tidword::Absent(), item->transaction_id.load());
 }
 
-TEST_F(CommitTidTest, UniqueIndexRefusesASecondAdditionInOneRequest) {
+TEST_F(CommitTidTest, UniqueIndexTakesASecondAdditionThatFollowsARemoval) {
   ASSERT_TRUE(tables_.GetTable(kTable)->CreateSecondaryIndex(
       "uidx", IndexConstraint::kUnique));
-  silo::Transaction tx(tables_, epoch_, reaper_, *logger_, last_tid_);
-  EXPECT_TRUE(tx.IndexWrite(kTable, "uidx", "s", "a", false, reason_))
+  SeedRow("a", Version(10, 2));
+  SeedRow("b", Version(10, 3));
+
+  // The deltas apply in order under the record lock, so the removal makes
+  // room for the addition that follows it.
+  ASSERT_TRUE(Commit({}, {},
+                     {{kTable, "uidx", "s", "a", false},
+                      {kTable, "uidx", "s", "a", true},
+                      {kTable, "uidx", "s", "b", false}}))
       << reason_;
-  EXPECT_TRUE(tx.IndexWrite(kTable, "uidx", "s", "a", true, reason_))
-      << reason_;
-  EXPECT_FALSE(tx.IndexWrite(kTable, "uidx", "s", "b", false, reason_));
-  EXPECT_EQ(
-      std::string(kDuplicateSecondaryKeyAbortPrefix) + "duplicate_in_request",
-      reason_);
+
+  auto *posting =
+      tables_.GetTable(kTable)->GetSecondaryIndex("uidx")->tree.Get("s");
+  ASSERT_NE(nullptr, posting);
+  const auto keys = silo::StableReadKeys(*posting);
+  EXPECT_TRUE(keys.found);
+  const auto view = keys.primary_keys_view();
+  ASSERT_EQ(1u, view.size());
+  EXPECT_EQ("b", *view.begin());
   index::MasstreeReleaseThreadEpoch();
 }
 

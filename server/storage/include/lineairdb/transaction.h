@@ -158,9 +158,8 @@ class Transaction {
    * @details With `remove` true, `primary_key` leaves the secondary key's
    * list; otherwise it joins it. Uniqueness belongs to the named index, not to
    * this call.
-   * @return false with reason `si_table_missing`, `pax_schema_missing`,
-   * `si_index_missing`, or `unique_si_duplicate_in_request` for a second
-   * addition to a UNIQUE key in one request.
+   * @return false with reason `si_table_missing`, `pax_schema_missing`, or
+   * `si_index_missing`.
    */
   bool IndexWrite(std::string_view table_name, std::string_view index_name,
                   std::string_view secondary_key, std::string_view primary_key,
@@ -172,12 +171,12 @@ class Transaction {
    * @details The storage epoch is offline on entry and again on return. A
    * range with no end bound is refused before anything is locked.
    *
-   * - Phase 1: lock every record in pointer order and check INSERT and
-   *   UNIQUE under the locks. Then join the epoch, as Silo reads it after
-   *   locking.
+   * - Phase 1: lock every record in pointer order. Then join the epoch, as
+   *   Silo reads it after locking.
    * - Phase 2: validate every point read by word, replay every range and
-   *   compare its key list, then choose the commit TID. Reserve every PAX
-   *   slot before the first value changes.
+   *   compare its key list, check INSERT and UNIQUE under the locks, then
+   *   choose the commit TID. Reserve every PAX slot before the first value
+   *   changes.
    * - Phase 3: install each record, append its WAL write, and publish its
    *   TID, which unlocks it.
    *

@@ -135,15 +135,6 @@ bool Transaction::IndexWrite(std::string_view table_name,
                                false, IndexUpdate{index->constraint, {}, {}}})
           .first;
   auto &update = std::get<IndexUpdate>(entry->second.update);
-  if (!remove && update.constraint == IndexConstraint::kUnique &&
-      std::any_of(update.deltas.begin(), update.deltas.end(),
-                  [](const auto &previous) {
-                    return previous.op == wal::SecondaryIndexOp::kInsert;
-                  })) {
-    reason =
-        std::string(kDuplicateSecondaryKeyAbortPrefix) + "duplicate_in_request";
-    return false;
-  }
   update.deltas.push_back({primary_key, remove
                                             ? wal::SecondaryIndexOp::kDelete
                                             : wal::SecondaryIndexOp::kInsert});
@@ -174,20 +165,17 @@ bool Transaction::Commit(CommitDurability durability, std::string &reason) {
       return false;
     }
   }
-  // Constraints run under the locks, before any stored value changes.
-  for (auto &[item, entry] : write_set_) {
-    if (!Prepare(*item, entry, reason)) {
-      UnlockAll();
-      return false;
-    }
-  }
-
   // Silo reads the epoch after the write locks. Nothing before this point
   // changes a stored value, and a lock failure returns before the join.
   const EpochNumber commit_epoch = epoch_.Join();
 
   // Phase 2: validate the read set, then choose the commit TID.
   if (!ValidateReads(max_tid, reason)) return Abort();
+  // Constraints run under the locks after the reads, so a stale read is
+  // reported as a conflict and not as a duplicate.
+  for (auto &[item, entry] : write_set_) {
+    if (!Prepare(*item, entry, reason)) return Abort();
+  }
 
   const Tidword highest = std::max(max_tid, last_commit_tid_);
   // Recovery must not retain this commit while dropping the later state it
@@ -306,8 +294,11 @@ bool Transaction::Prepare(DataItem &item, WriteEntry &entry,
           PrimaryKeyList::Delete(index.primary_keys, delta.primary_key);
       continue;
     }
-    if (index.constraint == IndexConstraint::kUnique &&
-        !PrimaryKeyList::View(index.primary_keys).empty()) {
+    // A UNIQUE key holds one primary key; adding that same key again is not
+    // a second one.
+    const PrimaryKeyList::View keys(index.primary_keys);
+    if (index.constraint == IndexConstraint::kUnique && !keys.empty() &&
+        !(keys.size() == 1 && keys.contains(delta.primary_key))) {
       reason =
           std::string(kDuplicateSecondaryKeyAbortPrefix) + "exists_after_lock";
       return false;
