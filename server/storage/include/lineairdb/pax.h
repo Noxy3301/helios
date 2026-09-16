@@ -302,8 +302,8 @@ inline bool EpochAfterSnapshot(uint32_t writer_epoch, uint32_t snapshot_epoch) {
 /**
  * @brief Returns the monotonic preserve counter of `group`.
  *
- * @details 0 when no image has been preserved for the group since the last
- * clear. The counter increments after an image is appended and before the
+ * @details 0 until the first install a view reads; the counter never resets.
+ * It increments after an image is appended or skipped and before the
  * writer's first strip mutation; an unchanged value across an in-place read
  * means no concurrent preserve.
  */

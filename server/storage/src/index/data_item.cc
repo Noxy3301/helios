@@ -28,12 +28,16 @@ bool DataItem::AllocateSlot(pax::PaxTable &table) {
 }
 
 void DataItem::PreserveImage(EpochNumber epoch) {
-  auto &buffer = pax::EpochImageBuffer::Global();
-  if (!buffer.HasOpenView()) return;
   assert(epoch != 0);
+  auto &image_buffer = pax::EpochImageBuffer::Global();
+  if (!image_buffer.HasOpenView()) return;
   const bool visible = size_ != 0;
-  buffer.Preserve(pax_group(), pax_slot(), epoch, visible,
-                  visible ? CopyValue() : std::string());
+  // The old row's epoch is its word's epoch. A slot without a row counts
+  // from epoch 0: a delete moves the word without touching the slot.
+  const EpochNumber old_epoch = visible ? transaction_id.load().epoch : 0;
+  if (!image_buffer.NeedsImage(old_epoch, epoch)) return;
+  image_buffer.Preserve(pax_group(), pax_slot(), old_epoch, epoch, visible,
+                        visible ? CopyValue() : std::string());
 }
 
 void DataItem::InstallRow(const pax::Row &row, EpochNumber epoch) {

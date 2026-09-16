@@ -29,15 +29,16 @@ pax::PaxTable *Database::GetPaxTable(const std::string_view table_name) {
 
 Database::PaxReadView Database::OpenPaxView(uint32_t fence_timeout_ms) {
   Database::PaxReadView view;
-  auto token = pax::EpochImageBuffer::Global().Open();
-  // Open the view (seq_cst in Open), then sample `E` as snapshot `se`. An
-  // install that preserved no image belongs to a commit at or below `se`.
-  // Its worker epoch `e_w` keeps `E < e_w + 2` until it leaves, so waiting for
-  // `E >= se + 2` drains those installs. Check the high-water bound before
-  // adding the wait interval, so the calculation cannot wrap.
-  const EpochNumber snapshot_epoch = epoch_framework_.GetGlobalEpoch();
+  auto &image_buffer = pax::EpochImageBuffer::Global();
+  // Open registers the view and samples `E` as snapshot `se` under the
+  // registry lock. An install that did not see this registration belongs to a
+  // commit at or below `se`, and every such commit has left before the wait
+  // ends. Its worker epoch `e_w` keeps `E < e_w + 2` until it leaves, so
+  // waiting for `E >= se + 2` drains those installs. Check the high-water
+  // bound before adding the wait interval, so the calculation cannot wrap.
+  const EpochNumber snapshot_epoch = image_buffer.Open(epoch_framework_);
   if (snapshot_epoch >= epoch::Framework::kEpochHighWater - kInstallDrainEpochs) {
-    pax::EpochImageBuffer::Global().Close(token);
+    image_buffer.Close(snapshot_epoch);
     view.error =
         "columnar read view rejected: epoch space is near its wrap "
         "high-water mark, restart the server";
@@ -46,7 +47,7 @@ Database::PaxReadView Database::OpenPaxView(uint32_t fence_timeout_ms) {
   if (!epoch_framework_.WaitEpoch(
           snapshot_epoch + kInstallDrainEpochs,
           std::chrono::milliseconds(fence_timeout_ms))) {
-    pax::EpochImageBuffer::Global().Close(token);
+    image_buffer.Close(snapshot_epoch);
     view.error =
         "columnar read view fence timed out; a long-running transaction is "
         "holding the epoch";
@@ -54,16 +55,12 @@ Database::PaxReadView Database::OpenPaxView(uint32_t fence_timeout_ms) {
   }
   view.valid = true;
   view.snapshot_epoch = snapshot_epoch;
-  view.token = token.id;
   return view;
 }
 
 void Database::ClosePaxView(const PaxReadView &view) {
   if (!view.valid) return;
-  pax::EpochImageBuffer::ReadViewToken token;
-  token.id = view.token;
-  token.valid = true;
-  pax::EpochImageBuffer::Global().Close(token);
+  pax::EpochImageBuffer::Global().Close(view.snapshot_epoch);
 }
 
 bool Database::PaxViewValid(const PaxReadView &view) const {

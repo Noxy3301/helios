@@ -161,12 +161,12 @@ class Database {
    *
    * @details snapshot_epoch `se` is the read view's serialization point:
    * commits with `epoch <= se` are visible; later ones resolve to epoch images.
-   * token must be passed back to ClosePaxView exactly once.
+   * ClosePaxView closes the registration OpenPaxView made, exactly once per
+   * valid handle.
    */
   struct PaxReadView {
     bool valid = false;
     uint32_t snapshot_epoch = 0;
-    uint64_t token = 0;
     std::string error;  // rejection reason when !valid
   };
 
@@ -174,10 +174,10 @@ class Database {
    * @brief Opens a read view and waits for global epoch `E >= se + 2`.
    *
    * @details On return every commit through snapshot_epoch `se` has finished
-   * installing, and every later commit preserves the rows it overwrites. The
-   * calling thread must not hold an epoch (it must be outside any
-   * transaction). Fails instead of falling back on fence timeout or near the
-   * epoch high-water mark.
+   * installing, and every later commit preserves the row it replaces when this
+   * view reads it. The calling thread must not hold an epoch (it must be
+   * outside any transaction). Fails instead of falling back on fence timeout
+   * or near the epoch high-water mark.
    *
    * @param fence_timeout_ms Upper bound on the fence wait.
    * @return A valid handle, or an invalid one carrying the reason.
