@@ -111,9 +111,9 @@ TEST_F(DatabaseTest, FailedCommitLeavesItsEpoch) {
   const std::vector<TestHelper::RowWrite> writes = {
       {kTable, "new", TestHelper::Row("value")}};
   auto check_epoch_released = [&] {
-    const auto view = db_->AcquirePaxView(1000);
+    const auto view = db_->OpenPaxView(1000);
     EXPECT_TRUE(view.valid) << view.error;
-    db_->ReleasePaxView(view);
+    db_->ClosePaxView(view);
   };
 
   TestHelper::Range invalid_range;

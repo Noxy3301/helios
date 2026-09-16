@@ -11,14 +11,15 @@
 
 #include "lineairdb/database.h"
 
-#include "pax/table.h"
-#include "pax/version_store.h"
 #include "pax/catalog.h"
+#include "pax/epoch_image_buffer.h"
+#include "pax/table.h"
 #include "util/spdlog.h"
 
 namespace helios::storage {
 
-// Wait for global epoch `E >= se + 2` to drain installs that missed capture.
+// Wait for global epoch `E >= se + 2` to drain installs that preserved no
+// image.
 constexpr EpochNumber kInstallDrainEpochs = 2;
 
 pax::PaxTable *Database::GetPaxTable(const std::string_view table_name) {
@@ -26,17 +27,17 @@ pax::PaxTable *Database::GetPaxTable(const std::string_view table_name) {
   return table == nullptr ? nullptr : table->GetPaxTable();
 }
 
-Database::PaxReadView Database::AcquirePaxView(uint32_t fence_timeout_ms) {
+Database::PaxReadView Database::OpenPaxView(uint32_t fence_timeout_ms) {
   Database::PaxReadView view;
-  auto token = pax::VersionStore::Global().BeginCapture();
-  // Enable capture (seq_cst in BeginCapture), then sample `E` as snapshot `se`.
-  // An install that missed capture belongs to a commit at or below `se`.
+  auto token = pax::EpochImageBuffer::Global().Open();
+  // Open the view (seq_cst in Open), then sample `E` as snapshot `se`. An
+  // install that preserved no image belongs to a commit at or below `se`.
   // Its worker epoch `e_w` keeps `E < e_w + 2` until it leaves, so waiting for
   // `E >= se + 2` drains those installs. Check the high-water bound before
   // adding the wait interval, so the calculation cannot wrap.
   const EpochNumber snapshot_epoch = epoch_framework_.GetGlobalEpoch();
   if (snapshot_epoch >= epoch::Framework::kEpochHighWater - kInstallDrainEpochs) {
-    pax::VersionStore::Global().EndCapture(token);
+    pax::EpochImageBuffer::Global().Close(token);
     view.error =
         "columnar read view rejected: epoch space is near its wrap "
         "high-water mark, restart the server";
@@ -45,7 +46,7 @@ Database::PaxReadView Database::AcquirePaxView(uint32_t fence_timeout_ms) {
   if (!epoch_framework_.WaitEpoch(
           snapshot_epoch + kInstallDrainEpochs,
           std::chrono::milliseconds(fence_timeout_ms))) {
-    pax::VersionStore::Global().EndCapture(token);
+    pax::EpochImageBuffer::Global().Close(token);
     view.error =
         "columnar read view fence timed out; a long-running transaction is "
         "holding the epoch";
@@ -57,12 +58,12 @@ Database::PaxReadView Database::AcquirePaxView(uint32_t fence_timeout_ms) {
   return view;
 }
 
-void Database::ReleasePaxView(const PaxReadView &view) {
+void Database::ClosePaxView(const PaxReadView &view) {
   if (!view.valid) return;
-  pax::VersionStore::ReadViewToken token;
+  pax::EpochImageBuffer::ReadViewToken token;
   token.id = view.token;
   token.valid = true;
-  pax::VersionStore::Global().EndCapture(token);
+  pax::EpochImageBuffer::Global().Close(token);
 }
 
 bool Database::PaxViewValid(const PaxReadView &view) const {

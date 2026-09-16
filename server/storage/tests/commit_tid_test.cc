@@ -17,7 +17,7 @@
 #include "db_helper.h"
 #include "gtest/gtest.h"
 #include "index/reaper.h"
-#include "pax/version_store.h"
+#include "pax/epoch_image_buffer.h"
 #include "silo/stable_read.h"
 #include "lineairdb/transaction.h"
 #include "table/table_dictionary.h"
@@ -232,20 +232,20 @@ TEST_F(CommitTidTest, RepeatedRowWritesLogOnlyTheFinalValue) {
   }
 }
 
-TEST_F(CommitTidTest, RepeatedRowWritesKeepTheBeforeImageFromBeforeTheCommit) {
+TEST_F(CommitTidTest, RepeatedRowWritesKeepTheEpochImageFromBeforeTheCommit) {
   auto *item = SeedRow("key", Version(10, 5));
-  auto &versions = pax::VersionStore::Global();
-  const auto token = versions.BeginCapture();
+  auto &buffer = pax::EpochImageBuffer::Global();
+  const auto token = buffer.Open();
   ASSERT_TRUE(token.valid);
   const bool committed = Commit({}, {{kTable, "key", "intermediate"},
                                     {kTable, "key", "", RowOp::kDelete},
                                     {kTable, "key", "final"}});
-  const auto entries = versions.SlotEntries(item->pax_group(), item->pax_slot());
-  versions.EndCapture(token);
+  const auto images = buffer.SlotImages(item->pax_group(), item->pax_slot());
+  buffer.Close(token);
   ASSERT_TRUE(committed) << reason_;
-  ASSERT_EQ(1u, entries.size());
-  EXPECT_TRUE(entries.front().was_visible);
-  EXPECT_EQ(TestHelper::Row("key"), entries.front().old_row);
+  ASSERT_EQ(1u, images.size());
+  EXPECT_TRUE(images.front().was_visible);
+  EXPECT_EQ(TestHelper::Row("key"), images.front().old_row);
   EXPECT_EQ(TestHelper::Row("final"), item->CopyValue());
 }
 

@@ -107,18 +107,18 @@ struct DataItem {
    * @brief Installs a decoded row into this item's PAX slot.
    * @note The caller holds the TID lock and has allocated every write's slot.
    * Recovery calls this before readers start.
-   * @param epoch Commit epoch of this install; before-images are tagged with
+   * @param epoch Commit epoch of this install; epoch images are tagged with
    * it.
    */
   void InstallRow(const pax::Row &row, EpochNumber epoch);
 
   /**
    * @brief Hides this item's row: retires the slot from strip scans and
-   * captures its before-image for an active read view. The slot stays
+   * preserves its epoch image for an open read view. The slot stays
    * reserved for a later write.
    * @note The caller holds the TID lock; publishing the absent word is
    * separate.
-   * @param epoch Commit epoch of this delete, the before-image's writer epoch.
+   * @param epoch Commit epoch of this delete, the epoch image's writer epoch.
    */
   void DeleteRow(EpochNumber epoch);
 
@@ -157,7 +157,7 @@ struct DataItem {
   uint32_t slot_ = 0;               // Slot inside group_.
   size_t size_ = 0;  // Row length in bytes; zero once deleted.
 
-  void CaptureBeforeImage(EpochNumber epoch);
+  void PreserveImage(EpochNumber epoch);
 
   static bool IsSortedDeduped(const std::vector<std::string> &keys) {
     return std::adjacent_find(

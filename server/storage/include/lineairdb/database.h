@@ -160,8 +160,8 @@ class Database {
    * @brief Handle for one columnar read view.
    *
    * @details snapshot_epoch `se` is the read view's serialization point:
-   * commits with `epoch <= se` are visible; later ones resolve to before-images.
-   * token must be passed back to ReleasePaxView exactly once.
+   * commits with `epoch <= se` are visible; later ones resolve to epoch images.
+   * token must be passed back to ClosePaxView exactly once.
    */
   struct PaxReadView {
     bool valid = false;
@@ -171,10 +171,10 @@ class Database {
   };
 
   /**
-   * @brief Arms capture and waits for global epoch `E >= se + 2`.
+   * @brief Opens a read view and waits for global epoch `E >= se + 2`.
    *
    * @details On return every commit through snapshot_epoch `se` has finished
-   * installing, and every later commit captures the rows it overwrites. The
+   * installing, and every later commit preserves the rows it overwrites. The
    * calling thread must not hold an epoch (it must be outside any
    * transaction). Fails instead of falling back on fence timeout or near the
    * epoch high-water mark.
@@ -182,13 +182,13 @@ class Database {
    * @param fence_timeout_ms Upper bound on the fence wait.
    * @return A valid handle, or an invalid one carrying the reason.
    */
-  PaxReadView AcquirePaxView(uint32_t fence_timeout_ms);
+  PaxReadView OpenPaxView(uint32_t fence_timeout_ms);
 
   /**
-   * @brief Releases a read view; the last active release clears the undo
-   * maps. Safe to call with an invalid handle (no-op).
+   * @brief Closes a read view; the last close clears the epoch images. Safe
+   * to call with an invalid handle (no-op).
    */
-  void ReleasePaxView(const PaxReadView &view);
+  void ClosePaxView(const PaxReadView &view);
 
   /**
    * @brief Returns whether this read view's results may be used.

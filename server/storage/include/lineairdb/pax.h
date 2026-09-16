@@ -1,7 +1,7 @@
 /**
  * @file server/storage/include/lineairdb/pax.h
  * The PAX row format a table declares at creation, the strips a reader scans
- * in place, and the before-image surface that resolves a row a writer changed
+ * in place, and the epoch image surface that resolves a row a writer changed
  * under an open read view.
  */
 
@@ -114,7 +114,7 @@ struct Row;
  * existing Silo TID lock. `GatherRow()` is memory-safe under a concurrent
  * scatter to the same slot, and callers reject torn rows with the normal TID
  * re-check. Strip-direct readers resolve a concurrent writer through the
- * entries and the capture counter declared below.
+ * images and the preserve counter declared below.
  */
 class PaxGroup {
  public:
@@ -275,14 +275,14 @@ uint64_t SlotsAllocated(const PaxTable *store);
 size_t GroupCount(const PaxTable *store);
 
 /**
- * @brief One captured before-image for a (group, slot).
+ * @brief One epoch image of a (group, slot).
  *
- * @details A reader at snapshot epoch `se` uses the oldest entry whose writer
- * epoch exceeds `se`, and the strip in place when no entry qualifies.
+ * @details A reader at snapshot epoch `se` uses the oldest image whose writer
+ * epoch exceeds `se`, and the strip in place when no image qualifies.
  * `was_visible == false` means the slot held no row.
  */
-struct UndoEntry {
-  uint32_t writer_epoch;  // commit epoch of the install that captured this
+struct EpochImage {
+  uint32_t writer_epoch;  // commit epoch of the install that preserved this
   bool was_visible;       // false: the slot held no visible row before it
   std::string old_row;    // the row it held; empty when !was_visible
 };
@@ -293,38 +293,39 @@ struct UndoEntry {
  * @details Plain unsigned comparison on purpose: acquisition refuses near
  * the epoch high-water mark and read views expire well inside that margin,
  * so both operands lie in one wrap-free window. A modular comparison would
- * misread old entries as newer than `se` once a view outlives half the range.
+ * misread old images as newer than `se` once a view outlives half the range.
  */
 inline bool EpochAfterSnapshot(uint32_t writer_epoch, uint32_t snapshot_epoch) {
   return writer_epoch > snapshot_epoch;
 }
 
 /**
- * @brief Returns the monotonic capture counter of `group`'s undo map.
+ * @brief Returns the monotonic preserve counter of `group`.
  *
- * @details 0 when nothing captured into the group since the last clear. The
- * counter increments after an entry is appended and before the writer's
- * first strip mutation; an unchanged value across an in-place read means
- * no concurrent capture.
+ * @details 0 when no image has been preserved for the group since the last
+ * clear. The counter increments after an image is appended and before the
+ * writer's first strip mutation; an unchanged value across an in-place read
+ * means no concurrent preserve.
  */
-uint64_t UndoCount(const PaxGroup *group);
+uint64_t GroupPreserveCount(const PaxGroup *group);
 
 /**
- * @brief Copies every undo entry recorded for `group`, keyed by slot.
+ * @brief Copies every epoch image recorded for `group`, keyed by slot.
  *
- * @details Entries per slot are ordered as captured, and per-slot install
- * order is epoch-non-decreasing. The copy is immune to concurrent capture.
+ * @details Images per slot are ordered as preserved, and per-slot install
+ * order is epoch-non-decreasing. The copy is immune to a concurrent Preserve
+ * call.
  */
-std::unordered_map<uint32_t, std::vector<UndoEntry>> UndoGroupEntries(
+std::unordered_map<uint32_t, std::vector<EpochImage>> GroupImages(
     const PaxGroup *group);
 
 /**
- * @brief Copies the undo entries recorded for one (group, slot).
+ * @brief Copies the epoch images recorded for one (group, slot).
  *
- * @details Ordered as captured and epoch-non-decreasing, and immune to a
- * concurrent capture, as UndoGroupEntries is.
+ * @details Ordered as preserved and epoch-non-decreasing, and immune to a
+ * concurrent Preserve call, as GroupImages is.
  */
-std::vector<UndoEntry> UndoSlotEntries(const PaxGroup *group, uint32_t slot);
+std::vector<EpochImage> SlotImages(const PaxGroup *group, uint32_t slot);
 
 }  // namespace pax
 }  // namespace helios::storage

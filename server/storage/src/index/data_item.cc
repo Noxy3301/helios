@@ -5,8 +5,8 @@
 
 #include "index/data_item.h"
 
+#include "pax/epoch_image_buffer.h"
 #include "pax/table.h"
-#include "pax/version_store.h"
 
 namespace helios::storage {
 
@@ -27,25 +27,25 @@ bool DataItem::AllocateSlot(pax::PaxTable &table) {
   return true;
 }
 
-void DataItem::CaptureBeforeImage(EpochNumber epoch) {
-  auto &version_store = pax::VersionStore::Global();
-  if (!version_store.CaptureActive()) return;
+void DataItem::PreserveImage(EpochNumber epoch) {
+  auto &buffer = pax::EpochImageBuffer::Global();
+  if (!buffer.HasOpenView()) return;
   assert(epoch != 0);
   const bool visible = size_ != 0;
-  version_store.Capture(pax_group(), pax_slot(), epoch, visible,
-                        visible ? CopyValue() : std::string());
+  buffer.Preserve(pax_group(), pax_slot(), epoch, visible,
+                  visible ? CopyValue() : std::string());
 }
 
 void DataItem::InstallRow(const pax::Row &row, EpochNumber epoch) {
   assert(pax_allocated() && row.size != 0);
-  CaptureBeforeImage(epoch);
+  PreserveImage(epoch);
   pax_group()->ScatterRow(slot_, row);
   size_ = row.size;
 }
 
 void DataItem::DeleteRow(EpochNumber epoch) {
   if (pax_allocated() && size_ != 0) {
-    CaptureBeforeImage(epoch);
+    PreserveImage(epoch);
     pax_group()->RetireSlot(slot_);
   }
   size_ = 0;
