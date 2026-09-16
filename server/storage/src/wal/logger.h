@@ -41,6 +41,11 @@
 #include "wal/wal.h"
 
 namespace helios::storage {
+
+namespace epoch {
+class Framework;
+}
+
 namespace wal {
 
 /**
@@ -49,6 +54,8 @@ namespace wal {
  * @details Each producer appends to its own buffer. The worker collects the
  * records and writes closed epochs, then publishes durable epoch `D` to
  * waiting commits. An epoch with no records advances without a file write.
+ * A producer with writes waits at the start of its commit while `D` trails
+ * `E` by more than kEpochDiff.
  * The destructor joins the worker before destroying the WAL and buffers.
  */
 class Logger {
@@ -118,6 +125,20 @@ class Logger {
    * would hold the epoch that has to close before the wait can end.
    */
   WaitResult WaitUntilDurable(EpochNumber commit_epoch, Deadline deadline);
+
+  // Epochs a producer may run ahead of the durable epoch, Silo's
+  // g_max_lag_epochs. The flush trails E by two.
+  static constexpr EpochNumber kEpochDiff = 128;
+
+  /**
+   * @brief Blocks while the durable epoch trails the global epoch by more
+   * than kEpochDiff.
+   * @details An admission check: the lag can grow again after it returns.
+   * Shutdown and a log failure end the wait, as in WaitUntilDurable.
+   * @note The caller must have left the storage epoch: a producer that waits
+   * online holds the epoch the logger has to close.
+   */
+  void WaitEpochDiff(epoch::Framework &epoch);
 
   /**
    * @brief Returns once the transaction that committed in `commit_epoch` may

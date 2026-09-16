@@ -36,6 +36,7 @@
 #include "lineairdb/config.h"
 
 #include "util/epoch.h"
+#include "util/epoch_framework.h"
 #include "util/spdlog.h"
 #include "wal/epoch_scan_checkpoint.h"
 #include "wal/flush_trace.h"
@@ -425,6 +426,21 @@ Logger::WaitResult Logger::WaitUntilDurable(EpochNumber commit_epoch,
     return WaitResult::kDurable;
   }
   return state_ == State::kStopped ? WaitResult::kStopped : WaitResult::kFailed;
+}
+
+void Logger::WaitEpochDiff(epoch::Framework &epoch) {
+  assert(epoch.ThreadEpoch() == epoch::Framework::kThreadOffline);
+  // D before E: D only grows, and a pass then held when E was read.
+  const auto within = [&] {
+    const EpochNumber durable_epoch = GetDurableEpoch();
+    const EpochNumber global_epoch = epoch.GetGlobalEpoch();
+    return global_epoch <= kEpochDiff ||
+           durable_epoch >= global_epoch - kEpochDiff;
+  };
+  if (within()) return;
+  std::unique_lock<std::mutex> lock(durability_mutex_);
+  durability_cv_.wait(lock,
+                      [&] { return state_ != State::kRunning || within(); });
 }
 
 void Logger::AwaitCommitDurability(EpochNumber commit_epoch,

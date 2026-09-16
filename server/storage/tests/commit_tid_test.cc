@@ -4,6 +4,8 @@
  */
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <filesystem>
 #include <functional>
 #include <memory>
@@ -64,11 +66,20 @@ class CommitTidTest : public ::testing::Test {
     ASSERT_TRUE(tables_.GetTable(kTable)->InstallPaxSchema(schema));
     ASSERT_TRUE(tables_.GetTable(kTable)->CreateSecondaryIndex(
         "idx", IndexConstraint::kNone));
-    // Leave the ticker parked so tests control epoch boundaries exactly.
-    epoch_.SetGlobalEpoch(10);
     logger_ = std::make_unique<wal::Logger>(config_);
     ASSERT_EQ(wal::Logger::RecoveryStatus::kOk, logger_->Recover().status);
     logger_->Start();
+    // Leave the ticker parked so tests control epoch boundaries exactly.
+    SetEpoch(10);
+  }
+
+  // Moves E and lets the logger publish D = E - 2, as the epoch hook does.
+  void SetEpoch(EpochNumber epoch) {
+    epoch_.SetGlobalEpoch(epoch);
+    logger_->RequestFlush(epoch - 2);
+    ASSERT_EQ(
+        wal::Logger::WaitResult::kDurable,
+        logger_->WaitUntilDurable(epoch - 2, wal::Logger::Deadline::max()));
   }
 
   void TearDown() override {
@@ -121,7 +132,7 @@ TEST_F(CommitTidTest, CommitReadsTheEpochAfterTheWriteSetIsFed) {
   silo::Transaction tx(tables_, epoch_, reaper_, *logger_, last_tid_);
   ASSERT_TRUE(tx.Write(kTable, "key", bytes, RowOp::kUpdate, reason_))
       << reason_;
-  epoch_.SetGlobalEpoch(11);
+  SetEpoch(11);
   ASSERT_TRUE(tx.Commit(CommitDurability::kAsync, reason_)) << reason_;
   EXPECT_EQ(11u, last_tid_.epoch);
   EXPECT_EQ(epoch::Framework::kThreadOffline, epoch_.ThreadEpoch());
@@ -183,7 +194,7 @@ TEST_F(CommitTidTest, CommitJoinsTheEpochAfterItsLocksAreHeld) {
 
   // The committer holds the first record and is waiting on the second
   while (!first->transaction_id.load().lock) std::this_thread::yield();
-  epoch_.SetGlobalEpoch(11);
+  SetEpoch(11);
   second->transaction_id.store(Version(10, 5));
   committer.join();
 
@@ -193,6 +204,38 @@ TEST_F(CommitTidTest, CommitJoinsTheEpochAfterItsLocksAreHeld) {
   EXPECT_EQ(last_tid_, b->transaction_id.load());
   EXPECT_FALSE(a->transaction_id.load().lock);
   EXPECT_FALSE(b->transaction_id.load().lock);
+}
+
+TEST_F(CommitTidTest, CommitWithWritesWaitsForTheDurableEpoch) {
+  auto *item = SeedRow("key", Version(10, 5));
+  // A raw move puts E exactly kEpochDiff + 1 epochs ahead of D.
+  const EpochNumber durable = logger_->GetDurableEpoch();
+  epoch_.SetGlobalEpoch(durable + wal::Logger::kEpochDiff + 1);
+
+  // The sleep gives the commit time to reach the wait; the durable epoch it
+  // sees on return shows it completed only once the flush closed the lag.
+  std::atomic<bool> entered{false};
+  std::atomic<int> result{-1};
+  std::atomic<EpochNumber> durable_at_return{0};
+  std::thread committer([&] {
+    entered = true;
+    result = Commit({}, {{kTable, "key", "next"}}) ? 1 : 0;
+    durable_at_return = logger_->GetDurableEpoch();
+  });
+  while (!entered.load()) std::this_thread::yield();
+  std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+  logger_->RequestFlush(durable + 1);
+  committer.join();
+  EXPECT_EQ(1, result.load());
+  EXPECT_GE(durable_at_return.load(), durable + 1);
+  EXPECT_EQ(TestHelper::Row("next"), item->CopyValue());
+
+  // A read-only commit runs at a lag above the bound without waiting.
+  epoch_.SetGlobalEpoch(logger_->GetDurableEpoch() + wal::Logger::kEpochDiff +
+                        1);
+  EXPECT_TRUE(Commit({{kTable, "key", item->transaction_id.load().obj}}, {}))
+      << reason_;
 }
 
 TEST_F(CommitTidTest, FinalRowKeepsTheFirstInsertRequirement) {
@@ -237,7 +280,7 @@ TEST_F(CommitTidTest, RepeatedRowWritesKeepTheEpochImageFromBeforeTheCommit) {
   auto *item = SeedRow("key", Version(10, 5));
   auto &image_buffer = pax::EpochImageBuffer::Global();
   const EpochNumber se = image_buffer.Open(epoch_);
-  epoch_.SetGlobalEpoch(11);
+  SetEpoch(11);
   const bool committed = Commit({}, {{kTable, "key", "intermediate"},
                                     {kTable, "key", "", RowOp::kDelete},
                                     {kTable, "key", "final"}});
@@ -255,14 +298,14 @@ TEST_F(CommitTidTest, SecondInstallAfterTheSnapshotPreservesNothing) {
   auto *item = SeedRow("key", Version(10, 5));
   auto &image_buffer = pax::EpochImageBuffer::Global();
   const EpochNumber se = image_buffer.Open(epoch_);
-  epoch_.SetGlobalEpoch(12);
+  SetEpoch(12);
   const bool first = Commit({}, {{kTable, "key", "second"}});
   const auto after_first =
       image_buffer.SlotImages(item->pax_group(), item->pax_slot());
   const bool second = Commit({}, {{kTable, "key", "third"}});
   const auto after_second =
       image_buffer.SlotImages(item->pax_group(), item->pax_slot());
-  epoch_.SetGlobalEpoch(13);
+  SetEpoch(13);
   const bool third = Commit({}, {{kTable, "key", "fourth"}});
   const auto after_third =
       image_buffer.SlotImages(item->pax_group(), item->pax_slot());
@@ -285,22 +328,22 @@ TEST_F(CommitTidTest, ClosingTheOldestViewDropsItsImagesOnTheNextPreserve) {
   auto &image_buffer = pax::EpochImageBuffer::Global();
   const uint64_t preserved = image_buffer.GroupPreserveCount(item->pax_group());
   const EpochNumber v1 = image_buffer.Open(epoch_);
-  epoch_.SetGlobalEpoch(12);
+  SetEpoch(12);
   const bool first = Commit({}, {{kTable, "key", "a"}});
   const auto after_first =
       image_buffer.SlotImages(item->pax_group(), item->pax_slot());
-  epoch_.SetGlobalEpoch(14);
+  SetEpoch(14);
   const EpochNumber v2 = image_buffer.Open(epoch_);
-  epoch_.SetGlobalEpoch(16);
+  SetEpoch(16);
   const bool second = Commit({}, {{kTable, "key", "b"}});
   const auto after_second =
       image_buffer.SlotImages(item->pax_group(), item->pax_slot());
   image_buffer.Close(v1);
   const auto after_close =
       image_buffer.SlotImages(item->pax_group(), item->pax_slot());
-  epoch_.SetGlobalEpoch(18);
+  SetEpoch(18);
   const EpochNumber v3 = image_buffer.Open(epoch_);
-  epoch_.SetGlobalEpoch(20);
+  SetEpoch(20);
   const bool third = Commit({}, {{kTable, "key", "c"}});
   const auto after_third =
       image_buffer.SlotImages(item->pax_group(), item->pax_slot());
@@ -338,7 +381,7 @@ TEST_F(CommitTidTest, TwoViewsAtOneSnapshotCloseOneAtATime) {
   const uint64_t preserved = image_buffer.GroupPreserveCount(item->pax_group());
   const EpochNumber a = image_buffer.Open(epoch_);
   const EpochNumber b = image_buffer.Open(epoch_);
-  epoch_.SetGlobalEpoch(11);
+  SetEpoch(11);
   const bool committed = Commit({}, {{kTable, "key", "next"}});
   const auto after_commit =
       image_buffer.SlotImages(item->pax_group(), item->pax_slot());
@@ -366,7 +409,7 @@ TEST_F(CommitTidTest, InsertAndReinsertAfterTheSnapshotPreserveAbsence) {
   auto &index = tables_.GetTable(kTable)->GetPrimaryIndex();
   auto &image_buffer = pax::EpochImageBuffer::Global();
   const EpochNumber se = image_buffer.Open(epoch_);
-  epoch_.SetGlobalEpoch(11);
+  SetEpoch(11);
   const bool inserted = Commit({}, {{kTable, "new", "value", RowOp::kInsert}});
   auto *item = index.GetOrInsert("new");
   const auto after_insert =
@@ -374,9 +417,9 @@ TEST_F(CommitTidTest, InsertAndReinsertAfterTheSnapshotPreserveAbsence) {
   const bool deleted = Commit({}, {{kTable, "new", "", RowOp::kDelete}});
   const auto after_delete =
       image_buffer.SlotImages(item->pax_group(), item->pax_slot());
-  epoch_.SetGlobalEpoch(12);
+  SetEpoch(12);
   const EpochNumber v2 = image_buffer.Open(epoch_);
-  epoch_.SetGlobalEpoch(13);
+  SetEpoch(13);
   const bool reinserted =
       Commit({}, {{kTable, "new", "again", RowOp::kInsert}});
   const auto after_reinsert =
@@ -403,7 +446,7 @@ TEST_F(CommitTidTest, ReinsertingUnderOneViewKeepsOneAbsenceImage) {
   auto *seed = SeedRow("seed", Version(10, 1));
   const uint64_t preserved = image_buffer.GroupPreserveCount(seed->pax_group());
   const EpochNumber se = image_buffer.Open(epoch_);
-  epoch_.SetGlobalEpoch(11);
+  SetEpoch(11);
   bool churned = true;
   for (int cycle = 0; cycle < 3; ++cycle) {
     churned = churned &&
@@ -429,7 +472,7 @@ TEST_F(CommitTidTest, DeletingAMissingKeyThenInsertingPreservesAbsence) {
   auto &index = tables_.GetTable(kTable)->GetPrimaryIndex();
   auto &image_buffer = pax::EpochImageBuffer::Global();
   const EpochNumber se = image_buffer.Open(epoch_);
-  epoch_.SetGlobalEpoch(11);
+  SetEpoch(11);
   // The delete allocates no slot; it moves the word of a blank record.
   const bool deleted = Commit({}, {{kTable, "ghost", "", RowOp::kDelete}});
   const bool inserted =
@@ -696,7 +739,7 @@ TEST_F(CommitTidTest, FullTidRangeAllowsPurgeAndRejectsCommitWrap) {
   EXPECT_FALSE(read.found);
   EXPECT_EQ(retired, read.tid);
   EXPECT_EQ(nullptr, tree.Get("key"));
-  epoch_.SetGlobalEpoch(12);
+  SetEpoch(12);
   ASSERT_TRUE(Commit({}, {{kTable, "blocked", "value"}})) << reason_;
   EXPECT_EQ(Version(12, 0), last_tid_);
 }
@@ -707,7 +750,7 @@ TEST_F(CommitTidTest, FutureEpochAbortsAndReleasesTheWriteLock) {
   EXPECT_EQ("commit_epoch_stale", reason_);
   EXPECT_EQ(Version(11, 50), item->transaction_id.load());
   EXPECT_EQ(Tidword(), last_tid_);
-  epoch_.SetGlobalEpoch(11);
+  SetEpoch(11);
   ASSERT_TRUE(Commit({}, {{kTable, "key", "value"}})) << reason_;
   EXPECT_EQ(Version(11, 51), last_tid_);
 }
@@ -837,7 +880,7 @@ TEST_F(CommitTidTest, EmptyPrimaryRangeAbortsWhenAnAbsentRowIsFromALaterEpoch) {
   ASSERT_NE(nullptr, w);
   EXPECT_FALSE(w->transaction_id.load().lock);
 
-  epoch_.SetGlobalEpoch(11);
+  SetEpoch(11);
   ASSERT_TRUE(Commit({}, {{kTable, "w", "value"}}, {}, {range})) << reason_;
 }
 
@@ -857,7 +900,7 @@ TEST_F(CommitTidTest,
   ASSERT_NE(nullptr, w);
   EXPECT_FALSE(w->transaction_id.load().lock);
 
-  epoch_.SetGlobalEpoch(11);
+  SetEpoch(11);
   ASSERT_TRUE(Commit({}, {{kTable, "w", "value"}}, {}, {range})) << reason_;
 }
 

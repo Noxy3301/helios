@@ -20,6 +20,7 @@
 #include <thread>
 #include <vector>
 
+#include "util/epoch_framework.h"
 #include "wal/log_record.h"
 #include "wal/logger.h"
 #include "wal/wal.h"
@@ -32,6 +33,16 @@ using helios::storage::wal::LogRecord;
 using helios::storage::wal::WalIo;
 
 constexpr auto kTestTimeout = std::chrono::seconds(5);
+
+// The epoch writer parks until Start(), and the destructor joins it, on
+// every exit.
+struct Joiner {
+  helios::storage::epoch::Framework &framework;
+  ~Joiner() {
+    framework.Start();
+    framework.Stop();
+  }
+};
 
 // Exercises the logger without constructing a Database: the WAL and the
 // durable epoch are the units under test here, and a Database would
@@ -87,6 +98,87 @@ TEST_F(LoggerDurabilityTest, AlreadyDurableReturnsImmediately) {
   EXPECT_EQ(logger.WaitUntilDurable(5, std::chrono::steady_clock::now()),
             Logger::WaitResult::kDurable);
   logger.Stop();
+}
+
+TEST_F(LoggerDurabilityTest, WaitEpochDiffReturnsWhenTheDurableEpochIsClose) {
+  Logger logger(config_);
+  ASSERT_EQ(logger.Recover().status, Logger::RecoveryStatus::kOk);
+  logger.Start();
+  // The ticker stays parked; SetGlobalEpoch moves E by hand.
+  helios::storage::epoch::Framework framework;
+  Joiner joiner{framework};
+
+  // An epoch below the bound is the guard against unsigned underflow.
+  framework.SetGlobalEpoch(1);
+  logger.WaitEpochDiff(framework);
+
+  // D is 0 and the lag equals the bound: nothing is waited for.
+  framework.SetGlobalEpoch(Logger::kEpochDiff);
+  logger.WaitEpochDiff(framework);
+
+  logger.RequestFlush(5);
+  ASSERT_EQ(logger.WaitUntilDurable(5, Logger::Deadline::max()),
+            Logger::WaitResult::kDurable);
+  framework.SetGlobalEpoch(5 + Logger::kEpochDiff);
+  logger.WaitEpochDiff(framework);
+
+  logger.Stop();
+  // A stopped logger ends the wait, as it does in WaitUntilDurable.
+  framework.SetGlobalEpoch(1000);
+  logger.WaitEpochDiff(framework);
+}
+
+TEST_F(LoggerDurabilityTest, WaitEpochDiffFollowsTheGlobalEpochWhileWaiting) {
+  Logger logger(config_);
+  ASSERT_EQ(logger.Recover().status, Logger::RecoveryStatus::kOk);
+  logger.Start();
+  // The ticker stays parked; SetGlobalEpoch moves E by hand.
+  helios::storage::epoch::Framework framework;
+  Joiner joiner{framework};
+
+  // D is 0 and the lag is one epoch over the bound.
+  framework.SetGlobalEpoch(Logger::kEpochDiff + 1);
+  std::atomic<bool> entered{false};
+  std::atomic<EpochNumber> durable_at_return{0};
+  std::thread waiter([&] {
+    entered = true;
+    logger.WaitEpochDiff(framework);
+    durable_at_return = logger.GetDurableEpoch();
+  });
+
+  // E moves only once the waiter is parked, which is what the sleep buys.
+  while (!entered.load()) std::this_thread::yield();
+  std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+  // The floor the waiter entered on no longer releases it: D reaches 1 while
+  // the bound now asks for 3.
+  framework.SetGlobalEpoch(Logger::kEpochDiff + 3);
+  logger.RequestFlush(1);
+  ASSERT_EQ(logger.WaitUntilDurable(1, Logger::Deadline::max()),
+            Logger::WaitResult::kDurable);
+  logger.RequestFlush(3);
+  waiter.join();
+  EXPECT_GE(durable_at_return.load(), 3u);
+
+  logger.Stop();
+}
+
+TEST_F(LoggerDurabilityTest, WaitEpochDiffEndsWhenTheLoggerStops) {
+  Logger logger(config_);
+  ASSERT_EQ(logger.Recover().status, Logger::RecoveryStatus::kOk);
+  logger.Start();
+  // The ticker stays parked; SetGlobalEpoch moves E by hand.
+  helios::storage::epoch::Framework framework;
+  Joiner joiner{framework};
+
+  // D is 0 and the lag is one epoch over the bound: the waiter blocks.
+  framework.SetGlobalEpoch(Logger::kEpochDiff + 1);
+  std::thread waiter([&] { logger.WaitEpochDiff(framework); });
+  logger.Stop();
+  waiter.join();
+
+  // A later wait on a stopped logger does not block either.
+  logger.WaitEpochDiff(framework);
 }
 
 TEST_F(LoggerDurabilityTest, WaitersWakeAtEpochGranularity) {

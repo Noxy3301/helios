@@ -160,6 +160,10 @@ bool Transaction::Commit(CommitDurability durability, std::string &reason) {
     }
   }
 
+  // A writer stays within kEpochDiff of the durable epoch; wait here, before
+  // any lock and before joining the epoch.
+  if (!write_set_.empty()) logger_.WaitEpochDiff(epoch_);
+
   // The largest word this attempt read or found under a lock (Silo §4.2).
   Tidword max_tid;
 
