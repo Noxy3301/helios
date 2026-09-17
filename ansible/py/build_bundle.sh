@@ -103,7 +103,7 @@ EOF
   echo "built_at: $(date -Iseconds)"
   echo "built_on: $(hostname) ($(uname -sr), glibc $(ldd --version | head -1 | awk '{print $NF}'))"
   echo "helios:   $(git -C "$HELIOS" rev-parse --abbrev-ref HEAD)@$(git -C "$HELIOS" rev-parse --short HEAD)"
-  for sub in third_party/LineairDB third_party/mysql-server third_party/duckdb third_party/benchbase; do
+  for sub in third_party/mysql-server third_party/duckdb third_party/benchbase; do
     [ -d "$HELIOS/$sub/.git" ] || [ -f "$HELIOS/$sub/.git" ] || continue
     echo "$(basename "$sub"): $(git -C "$HELIOS/$sub" rev-parse --short HEAD)"
   done
