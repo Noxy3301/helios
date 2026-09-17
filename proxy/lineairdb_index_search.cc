@@ -32,6 +32,20 @@
 #include "sql/table.h"
 #include "typelib.h"
 
+// The query block a table is read in. A table inside a derived table or a
+// subquery is governed by that block's own WHERE and LIMIT, not the
+// statement's outermost block.
+static Query_block *owning_query_block(THD *thd, const TABLE *table) {
+  if (table != nullptr && table->pos_in_table_list != nullptr &&
+      table->pos_in_table_list->query_block != nullptr) {
+    return table->pos_in_table_list->query_block;
+  }
+  if (thd == nullptr || thd->lex == nullptr || thd->lex->unit == nullptr) {
+    return nullptr;
+  }
+  return thd->lex->unit->global_parameters();
+}
+
 // A storage scan carries no predicate, so every row MySQL drops above the
 // handler would have come out of a pushed LIMIT. Only a SELECT with no WHERE
 // left for this table's rows may push one.
@@ -41,7 +55,7 @@ static bool select_scan_limit_is_safe(THD *thd, TABLE *table) {
   }
   if (table == nullptr || table->s == nullptr) return false;
 
-  Query_block *qb = thd->lex->unit->global_parameters();
+  Query_block *qb = owning_query_block(thd, table);
   if (qb == nullptr) return false;
   return qb->where_cond() == nullptr;
 }
@@ -118,9 +132,14 @@ RangeScanLimit range_scan_limit_for_order(
   if (!is_select) return scan_limit;                   // Not SELECT
 
   // LIMIT is only safe for one-table, non-aggregate reads
-  Query_expression *unit = thd->lex->unit;
-  Query_block *qb = unit->global_parameters();
+  const TABLE *scanned = (key != nullptr && key->key_part != nullptr &&
+                          key->key_part[0].field != nullptr)
+                             ? key->key_part[0].field->table
+                             : nullptr;
+  Query_block *qb = owning_query_block(thd, scanned);
   if (qb == nullptr) return scan_limit;                // Missing query block
+  Query_expression *unit = qb->master_query_expression();
+  if (unit == nullptr) return scan_limit;              // Missing query unit
   if (qb->leaf_table_count != 1) return scan_limit;    // Join needs root LIMIT
   if (qb->is_explicitly_grouped()) return scan_limit;  // GROUP BY changes rows
   if (qb->is_implicitly_grouped()) return scan_limit;  // Aggregate changes rows
@@ -713,10 +732,10 @@ int ha_lineairdb::fetch_and_set_current_result(uchar *buf,
     const std::string &inline_value =
         secondary_index_payloads_[current_position_in_index_];
     if (inline_value.empty()) {
-      // An empty payload means the base row was deleted between the index walk
-      // and the row fetch; a real row encoding is never empty. The absence is
-      // in the read set with its TID, so the commit revalidates it.
-      return HA_ERR_KEY_NOT_FOUND;
+      // The base row vanished under a concurrent commit between the index walk
+      // and the row fetch; the recorded range no longer replays at commit.
+      tx->set_status_to_abort();
+      return abort_errno(tx);
     }
     value_ptr = reinterpret_cast<const std::byte *>(inline_value.data());
     value_size = inline_value.size();

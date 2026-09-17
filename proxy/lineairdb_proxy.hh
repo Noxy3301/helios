@@ -300,6 +300,10 @@ private:
                           std::string& serialized_response,
                           MessageType message_type, const std::string& meta);
 
+    // Connect on demand so a channel closed by a transport error is reopened
+    // by the next RPC.
+    bool ensure_connected();
+
     uint64_t storage_boot_token_ = 0;
     int socket_fd_;
     bool connected_;

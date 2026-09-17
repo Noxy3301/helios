@@ -35,22 +35,31 @@ bool ha_lineairdb::refill_index_cursor(LineairDBTransaction *tx) {
   if (index_cursor_at_eof_) return false;
 
   if (index_cursor_secondary_) {
-    // One complete secondary-key group at a time. Using that group as the next
-    // exclusive end preserves the original (secondary key, primary key) order
-    // without materializing the full index.
-    auto entry = tx->fetch_last_secondary_entry_in_range(
-        current_index_name, index_cursor_start_key_, index_cursor_end_key_);
-    if (!entry.has_value()) {
+    // One batch of complete secondary-key groups at a time. The lowest group
+    // in it is the next exclusive end, which preserves the original
+    // (secondary key, primary key) order without materializing the full index.
+    auto batch = tx->fetch_secondary_batch_below(
+        current_index_name, index_cursor_start_key_, index_cursor_end_key_,
+        INDEX_CURSOR_BATCH_SIZE);
+    if (!batch.has_value()) {
       index_cursor_at_eof_ = true;
       return false;
     }
-    index_cursor_end_key_ = entry->secondary_key;
-    secondary_index_results_ = std::move(entry->primary_keys);
+    // The cursor consumes the vector from its tail, so flatten the groups the
+    // other way round: ascending by secondary key, ascending within a group.
+    index_cursor_end_key_ = batch->groups.back().secondary_key;
+    index_cursor_at_eof_ = !batch->more_below;
+    for (auto group = batch->groups.rbegin(); group != batch->groups.rend();
+         ++group) {
+      for (auto &primary_key : group->primary_keys) {
+        secondary_index_results_.push_back(std::move(primary_key));
+      }
+    }
     batch_fetch_secondary_payloads(tx);
   } else {
     auto key_values = tx->get_matching_keys_and_values_in_range(
         index_cursor_start_key_, index_cursor_end_key_,
-        INDEX_CURSOR_READ_AHEAD_SIZE, index_cursor_reverse_);
+        INDEX_CURSOR_BATCH_SIZE, index_cursor_reverse_);
     if (key_values.empty()) {
       index_cursor_at_eof_ = true;
       return false;
@@ -68,7 +77,7 @@ bool ha_lineairdb::refill_index_cursor(LineairDBTransaction *tx) {
       // strictly greater than this complete serialized index key.
       index_cursor_start_key_.push_back('\0');
     }
-    index_cursor_at_eof_ = fetched < INDEX_CURSOR_READ_AHEAD_SIZE;
+    index_cursor_at_eof_ = fetched < INDEX_CURSOR_BATCH_SIZE;
 
     secondary_index_results_.reserve(fetched);
     secondary_index_payloads_.reserve(fetched);
@@ -335,7 +344,7 @@ int ha_lineairdb::index_last(uchar *buf) {
   // last-N window on demand. A secondary tail walks the index cursor instead.
   if (active_index == table->s->primary_key) {
     if (int err = maybe_prefetch_for_index_tail(ha_thd(), tx, db_table_name,
-                                                INDEX_CURSOR_READ_AHEAD_SIZE)) {
+                                                INDEX_CURSOR_BATCH_SIZE)) {
       return err;
     }
   }

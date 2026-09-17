@@ -1072,9 +1072,10 @@ bool compile_tree_leaves(
       unsupported->reason = "unsupported QEP leaf";
       return false;
     }
-    if (table->s != nullptr && table->s->tmp_table != NO_TMP_TABLE) {
-      // Local MySQL temp tables are not stored in LineairDB, so there is
-      // nothing to prefetch for this leaf.
+    if ((table->s != nullptr && table->s->tmp_table != NO_TMP_TABLE) ||
+        table->file == nullptr || table->file->ht != lineairdb_hton) {
+      // Only LineairDB base tables hold staged rows; MySQL temp tables and
+      // tables of another engine have nothing to prefetch for this leaf.
       continue;
     }
     if (table_steps->find(table) != table_steps->end()) {

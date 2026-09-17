@@ -20,6 +20,37 @@ int ha_lineairdb::duplicate_or_conflict(LineairDBTransaction *tx, uint index) {
   return HA_ERR_FOUND_DUPP_KEY;
 }
 
+bool ha_lineairdb::checks_unique_keys() {
+  return !::thd_test_options(ha_thd(), OPTION_RELAXED_UNIQUE_CHECKS);
+}
+
+int ha_lineairdb::check_unique_secondary_key(
+    LineairDBTransaction *tx, uint index, const KEY &key_info,
+    const std::string &secondary_key, const std::string &primary_key) {
+  // An index entry this transaction wrote itself is a duplicate whatever
+  // unique_checks says: no request settles it.
+  if (tx->index_key_taken_by_own_write(db_table_name, key_info.name,
+                                       secondary_key, primary_key)) {
+    duplicate_key_index_ = index;
+    return HA_ERR_FOUND_DUPP_KEY;
+  }
+  if (!checks_unique_keys()) return 0;
+
+  // The probe records its range, so a duplicate another transaction installs
+  // after it still fails this transaction at commit.
+  const auto owners =
+      tx->read_secondary_index(key_info.name, secondary_key, true);
+  if (tx->is_aborted()) {
+    return abort_errno(tx);
+  }
+  for (const auto &owner : owners) {
+    if (owner != primary_key) {
+      return duplicate_or_conflict(tx, index);
+    }
+  }
+  return 0;
+}
+
 int ha_lineairdb::flush_insert_probe(LineairDBTransaction *tx) {
   if (insert_probe_keys_.empty()) return 0;
   std::vector<std::string> keys;
@@ -49,9 +80,6 @@ int ha_lineairdb::write_row(uchar *buf) {
   }
 
   tx->choose_table(db_table_name);
-
-  const bool checks_unique_keys =
-      !::thd_test_options(ha_thd(), OPTION_RELAXED_UNIQUE_CHECKS);
 
   // REPLACE overwrites whatever the key holds, so the entries the old row put
   // in the secondary indexes leave with it and the row count does not change.
@@ -96,11 +124,9 @@ int ha_lineairdb::write_row(uchar *buf) {
       case LineairDBTransaction::KeyState::Free:
         break;
       case LineairDBTransaction::KeyState::Unknown:
-        // Under unique_checks the statement owes ER_DUP_ENTRY, so the keys it
-        // inserts are resolved before it returns: in one batch at
-        // end_bulk_insert, or at this row without that bracket. Without it the
-        // commit is what refuses the key.
-        if (checks_unique_keys) {
+        // Under unique_checks the statement owes ER_DUP_ENTRY: probe keys
+        // resolve at end_bulk_insert, or here without that bracket.
+        if (checks_unique_keys()) {
           insert_probe_keys_.push_back(key);
           if (!bulk_insert_active_ ||
               insert_probe_keys_.size() >= kInsertProbeBatch) {
@@ -116,52 +142,45 @@ int ha_lineairdb::write_row(uchar *buf) {
     }
   }
 
+  // A rejected statement keeps what the handler staged, so every UNIQUE key is
+  // probed before the first write of the row is buffered.
+  std::vector<std::string> secondary_keys(table->s->keys);
+  for (uint i = 0; i < table->s->keys; i++) {
+    if (i == table->s->primary_key) continue;
+    const auto &key_info = table->key_info[i];
+
+    secondary_keys[i] = build_secondary_key_from_row(buf, key_info);
+
+    // A UNIQUE secondary key is the statement's to report, like the primary.
+    if (key_info.flags & HA_NOSAME) {
+      if (const int error =
+              check_unique_secondary_key(tx, i, key_info, secondary_keys[i],
+                                         key);
+          error != 0) {
+        return error;
+      }
+    }
+  }
+
   // The commit installs the row and refuses an INSERT whose key is taken.
   tx->buffer_write(db_table_name, key, write_buffer_,
                    !insert_can_replace_ || !replaced_existing_row);
 
   for (uint i = 0; i < table->s->keys; i++) {
-    auto key_info = table->key_info[i];
     if (i == table->s->primary_key) continue;
-
-    std::string secondary_key = build_secondary_key_from_row(buf, key_info);
+    const auto &key_info = table->key_info[i];
 
     if (replaced_existing_row) {
       const std::string old_secondary_key =
           build_secondary_key_from_row(table->record[1], key_info);
-      if (old_secondary_key != secondary_key) {
+      if (old_secondary_key != secondary_keys[i]) {
         tx->buffer_delete_secondary_index(db_table_name, key_info.name,
                                           old_secondary_key, key);
       }
     }
 
-    if (key_info.flags & HA_NOSAME) {
-      // An index entry this transaction wrote itself is a duplicate whatever
-      // unique_checks says: no request settles it.
-      if (tx->index_key_taken_by_own_write(db_table_name, key_info.name,
-                                           secondary_key, key)) {
-        duplicate_key_index_ = i;
-        return HA_ERR_FOUND_DUPP_KEY;
-      }
-      // A UNIQUE secondary key is the statement's to report too. The probe
-      // records its range, so a duplicate another transaction installs after
-      // it still fails this transaction at commit.
-      if (checks_unique_keys) {
-        const auto owners =
-            tx->read_secondary_index(key_info.name, secondary_key, true);
-        if (tx->is_aborted()) {
-          return abort_errno(tx, resolve_duplicate_at_row);
-        }
-        for (const auto &owner : owners) {
-          if (owner != key) {
-            return duplicate_or_conflict(tx, i);
-          }
-        }
-      }
-    }
-
     tx->buffer_write_secondary_index(db_table_name, key_info.name,
-                                     secondary_key, key);
+                                     secondary_keys[i], key);
   }
 
   if (tx->is_aborted()) {
@@ -204,6 +223,36 @@ int ha_lineairdb::update_row(const uchar *old_data, uchar *new_data) {
     return abort_errno(tx);
   }
 
+  tx->choose_table(db_table_name);
+
+  // A rejected statement keeps what the handler staged, so every UNIQUE key is
+  // probed before the first write of the row is buffered.
+  std::vector<std::string> old_keys(table->s->keys);
+  std::vector<std::string> new_keys(table->s->keys);
+  for (uint i = 0; i < table->s->keys; i++) {
+    if (i == table->s->primary_key) {
+      continue;
+    }
+    const auto &key_info = table->key_info[i];
+
+    old_keys[i] = build_secondary_key_from_row(old_data, key_info);
+    new_keys[i] = build_secondary_key_from_row(new_data, key_info);
+
+    if (old_keys[i] == new_keys[i]) {
+      continue;
+    }
+
+    // Moving a row onto a UNIQUE key another row holds is the statement's to
+    // report, as it is for an INSERT.
+    if (key_info.flags & HA_NOSAME) {
+      if (const int error =
+              check_unique_secondary_key(tx, i, key_info, new_keys[i], key);
+          error != 0) {
+        return error;
+      }
+    }
+  }
+
   // Buffer the base-row update; the commit installs it.
   tx->buffer_write(db_table_name, key, write_buffer_);
 
@@ -211,26 +260,13 @@ int ha_lineairdb::update_row(const uchar *old_data, uchar *new_data) {
     return abort_errno(tx);
   }
 
-  tx->choose_table(db_table_name);
-
   for (uint i = 0; i < table->s->keys; i++) {
-    auto key_info = table->key_info[i];
-
-    if (i == table->s->primary_key) {
+    if (old_keys[i] == new_keys[i]) {
       continue;
     }
 
-    std::string old_secondary_key =
-        build_secondary_key_from_row(old_data, key_info);
-    std::string new_secondary_key =
-        build_secondary_key_from_row(new_data, key_info);
-
-    if (old_secondary_key == new_secondary_key) {
-      continue;
-    }
-
-    tx->update_secondary_index(key_info.name, old_secondary_key,
-                               new_secondary_key, key);
+    tx->update_secondary_index(table->key_info[i].name, old_keys[i],
+                               new_keys[i], key);
 
     if (tx->is_aborted()) {
       return abort_errno(tx);

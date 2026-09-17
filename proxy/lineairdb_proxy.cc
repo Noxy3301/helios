@@ -85,11 +85,16 @@ bool LineairDBProxy::is_connected() const {
     return connected_;
 }
 
+// A transport failure closes the channel; the next RPC opens a new one.
+bool LineairDBProxy::ensure_connected() {
+    return connected_ || connect(host_, port_);
+}
+
 bool LineairDBProxy::fetch_table_stats(
     const std::string& ndv_table,
     const std::vector<std::pair<std::string, uint32_t>>& ndv_indexes,
     bool force_ndv) {
-    if (!connected_) return false;
+    if (!ensure_connected()) return false;
 
     LineairDB::Protocol::GetTableStats::Request request;
     LineairDB::Protocol::GetTableStats::Response response;
@@ -136,7 +141,7 @@ bool LineairDBProxy::fetch_table_stats(
 LineairDBProxy::ReadResult LineairDBProxy::tx_read(
     const std::string& table_name, const std::string& key) {
     ReadResult result;
-    if (!connected_) {
+    if (!ensure_connected()) {
         LOG_ERROR("RPC failed: Not connected to server");
         return result;
     }
@@ -160,7 +165,7 @@ LineairDBProxy::ReadResult LineairDBProxy::tx_read(
 
 std::vector<LineairDBProxy::ReadResult> LineairDBProxy::tx_batch_read(
     const std::vector<ReadKey>& keys) {
-    if (!connected_) {
+    if (!ensure_connected()) {
         LOG_ERROR("RPC failed: Not connected to server");
         return {};
     }
@@ -197,7 +202,7 @@ LineairDBProxy::ScanResult LineairDBProxy::tx_scan(
     const std::string& end_key, uint64_t row_limit, bool reverse_scan,
     bool keys_only) {
     ScanResult result;
-    if (!connected_) {
+    if (!ensure_connected()) {
         LOG_ERROR("RPC failed: Not connected to server");
         result.transport_error = true;
         return result;
@@ -236,7 +241,7 @@ LineairDBProxy::ScanIndexResult LineairDBProxy::tx_scan_index(
     const std::string& start_key, const std::string& end_key,
     uint64_t row_limit, bool reverse_scan, bool keys_only) {
     ScanIndexResult result;
-    if (!connected_) {
+    if (!ensure_connected()) {
         LOG_ERROR("RPC failed: Not connected to server");
         result.transport_error = true;
         return result;
@@ -284,7 +289,7 @@ bool LineairDBProxy::tx_commit(
     if (abort_detail != nullptr) abort_detail->clear();
     if (duplicate_key != nullptr) *duplicate_key = false;
     if (transport_error != nullptr) *transport_error = false;
-    if (!connected_) {
+    if (!ensure_connected()) {
         LOG_ERROR("RPC failed: Not connected to server");
         if (transport_error != nullptr) *transport_error = true;
         return false;
@@ -400,7 +405,7 @@ void fill_bindings(
 LineairDBProxy::ReadPlanResult LineairDBProxy::tx_execute_read_plan(
     const std::vector<ReadPlanStep>& steps) {
     ReadPlanResult result;
-    if (!connected_) {
+    if (!ensure_connected()) {
         LOG_ERROR("RPC failed: Not connected to server");
         result.transport_error = true;
         return result;
@@ -540,7 +545,7 @@ LineairDBProxy::ReadPlanResult LineairDBProxy::tx_execute_read_plan(
 bool LineairDBProxy::tx_execute_duckdb_query(
     const LineairDB::Protocol::TxExecuteDuckdbQuery::Request& request,
     LineairDB::Protocol::TxExecuteDuckdbQuery::Response* response) {
-    if (!connected_) {
+    if (!ensure_connected()) {
         LOG_ERROR("RPC failed: Not connected to server");
         return false;
     }
@@ -562,7 +567,7 @@ bool LineairDBProxy::db_create_table(
     const std::vector<uint32_t>& pax_field_kind,
     const std::vector<int32_t>& pax_field_scale) {
     LOG_DEBUG("CLIENT: db_create_table called with table=%s", table_name.c_str());
-    if (!connected_) {
+    if (!ensure_connected()) {
         LOG_ERROR("RPC failed: Not connected to server");
         return false;
     }
@@ -593,7 +598,7 @@ bool LineairDBProxy::db_create_table(
 LineairDBProxy::HiddenKeyReservation LineairDBProxy::db_allocate_hidden_keys(
     const std::string& table_name, uint32_t count) {
     HiddenKeyReservation reservation;
-    if (!connected_) {
+    if (!ensure_connected()) {
         LOG_ERROR("RPC failed: Not connected to server");
         reservation.transport_error = true;
         reservation.error = "not connected to the storage server";
@@ -634,7 +639,7 @@ bool LineairDBProxy::db_create_secondary_index(const std::string& table_name,
                                                 uint32_t index_type) {
     LOG_DEBUG("CLIENT: db_create_secondary_index called with table=%s, index=%s, type=%u",
               table_name.c_str(), index_name.c_str(), index_type);
-    if (!connected_) {
+    if (!ensure_connected()) {
         LOG_ERROR("RPC failed: Not connected to server");
         return false;
     }
@@ -699,10 +704,11 @@ bool LineairDBProxy::send_message_with_header(const std::string& serialized_requ
                          meta)) {
         return true;
     }
-    // Every RPC funnels through here, so one reset covers them all. Nothing
-    // below reconnects or retries, so a transaction that saw a transport error
-    // must abort: this reset is what invalidates the range it has cached.
+    // A transport error ends the transaction and the channel: the reset
+    // invalidates the ranges this connection cached, and the close drops a
+    // partially consumed response. The next transaction opens a new channel.
     storage_boot_token_ = 0;
+    disconnect();
     return false;
 }
 
@@ -713,7 +719,7 @@ bool LineairDBProxy::exchange_message(const std::string& serialized_request,
     auto rpc_start_ts = std::chrono::steady_clock::now();
     const uint32_t req_bytes = static_cast<uint32_t>(serialized_request.size());
 
-    if (!connected_) {
+    if (!ensure_connected()) {
         LOG_ERROR("SEND_MESSAGE: Not connected!");
         return false;
     }
@@ -752,7 +758,7 @@ bool LineairDBProxy::exchange_message(const std::string& serialized_request,
         total_sent += bytes_sent;
     }
 
-    LOG_DEBUG("SEND_MESSAGE: Successfully sent %zd bytes", bytes_sent);
+    LOG_DEBUG("SEND_MESSAGE: Successfully sent %zu bytes", total_sent);
 
     // receive response header
     MessageHeader response_header;

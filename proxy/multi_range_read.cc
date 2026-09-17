@@ -127,7 +127,8 @@ int ha_lineairdb::multi_range_read_init(RANGE_SEQ_IF *seq, void *seq_init_param,
 
   for (size_t i = 0; i < results.size(); i++) {
     if (results[i].first) {
-      mrr_buffer_.push_back({std::move(results[i].second), range_infos[i]});
+      mrr_buffer_.push_back({std::move(batch_keys[i]),
+                             std::move(results[i].second), range_infos[i]});
     }
   }
 
@@ -149,6 +150,9 @@ int ha_lineairdb::multi_range_read_next(char **range_info) {
   if (set_fields_from_lineairdb(table->record[0], ptr, row.value.size())) {
     return HA_ERR_OUT_OF_MEM;
   }
+  // position() stores this member into ref, so rowid reads of a batched row
+  // need it too.
+  last_fetched_primary_key_ = row.key;
 
   *range_info = row.range_info;
   return 0;

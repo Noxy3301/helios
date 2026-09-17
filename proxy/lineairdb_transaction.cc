@@ -779,26 +779,44 @@ LineairDBTransaction::SecondaryScan LineairDBTransaction::merge_index_scan(
   return out;
 }
 
-std::optional<LineairDBTransaction::SecondaryEntry>
-LineairDBTransaction::fetch_last_secondary_entry_in_range(const std::string &index_name,
-                                                          const std::string &start_key,
-                                                          const std::string &end_key) {
+std::optional<LineairDBTransaction::SecondaryBatch>
+LineairDBTransaction::fetch_secondary_batch_below(
+    const std::string &index_name, const std::string &start_key,
+    const std::string &end_key, uint64_t batch_entries) {
   if (table_is_not_chosen()) return std::nullopt;
 
   const std::string effective_end =
       end_key.empty() ? lineairdb_keyenc::scan_end_sentinel() : end_key;
-  auto scan = scan_index_range(index_name, start_key, effective_end, 0,
-                               /*reverse_scan=*/true, /*keys_only=*/true);
-  if (!scan.ok || scan.secondary_keys.empty()) return std::nullopt;
 
-  // A reverse scan puts the highest secondary key first; take its whole group.
-  SecondaryEntry entry;
-  entry.secondary_key = scan.secondary_keys.front();
+  // A reverse scan puts the highest secondary key first, so batch_entries
+  // entries hold the top of the range. The lowest group in them may be cut
+  // in the middle, so it is dropped unless the scan reached start_key.
+  auto scan = scan_index_range(index_name, start_key, effective_end,
+                               batch_entries, /*reverse_scan=*/true,
+                               /*keys_only=*/true);
+  if (!scan.ok) return std::nullopt;
+
+  SecondaryBatch batch;
+  batch.more_below =
+      batch_entries != 0 && scan.secondary_keys.size() >= batch_entries;
   for (size_t i = 0; i < scan.secondary_keys.size(); ++i) {
-    if (scan.secondary_keys[i] != entry.secondary_key) break;
-    entry.primary_keys.push_back(scan.primary_keys[i]);
+    if (batch.groups.empty() ||
+        batch.groups.back().secondary_key != scan.secondary_keys[i]) {
+      batch.groups.push_back(SecondaryEntry{scan.secondary_keys[i], {}});
+    }
+    batch.groups.back().primary_keys.push_back(scan.primary_keys[i]);
   }
-  return entry;
+  if (batch.more_below && !batch.groups.empty()) {
+    batch.groups.pop_back();
+  }
+
+  if (batch.groups.empty()) {
+    if (!batch.more_below) return std::nullopt;  // the range is spent
+    // One secondary key holds more entries than the batch: the whole range
+    // is the only way to get that group complete.
+    return fetch_secondary_batch_below(index_name, start_key, end_key, 0);
+  }
+  return batch;
 }
 
 // Row count delta tracking

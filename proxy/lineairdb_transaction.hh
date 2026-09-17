@@ -56,15 +56,24 @@ public:
   std::vector<std::string> get_matching_primary_keys_in_range(
       std::string index_name, std::string start_key, std::string end_key,
       uint64_t row_limit = 0, bool reverse_scan = false);
-  // The highest secondary key in the range and its primary keys, for the
-  // reverse index cursor.
+  // One secondary key of the index and the primary keys under it, in key
+  // order.
   struct SecondaryEntry {
     std::string secondary_key;
     std::vector<std::string> primary_keys;
   };
-  std::optional<SecondaryEntry> fetch_last_secondary_entry_in_range(
+  // One fetch of the reverse index cursor: the highest secondary keys of the
+  // range, in descending order, each with its primary keys. A batch holds
+  // only whole groups, so a limited scan that cut the lowest one in the
+  // middle drops it.
+  struct SecondaryBatch {
+    std::vector<SecondaryEntry> groups;
+    // The range holds entries below the lowest group returned.
+    bool more_below = false;
+  };
+  std::optional<SecondaryBatch> fetch_secondary_batch_below(
       const std::string &index_name, const std::string &start_key,
-      const std::string &end_key);
+      const std::string &end_key, uint64_t batch_entries);
   void update_secondary_index(
       std::string index_name,
       std::string old_secondary_key,

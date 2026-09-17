@@ -185,10 +185,10 @@ private:
   std::vector<std::string> secondary_index_results_;
   std::vector<std::string> secondary_index_payloads_;
 
-  // Bounded read-ahead for index_first/index_last: the handler is not told
-  // whether index_next/index_prev will follow. The size trades memory for RPC
-  // frequency and is not required for correctness.
-  static constexpr uint64_t INDEX_CURSOR_READ_AHEAD_SIZE = 1024;
+  // Entries the index cursor fetches per RPC for index_first/index_last: the
+  // handler is not told whether index_next/index_prev will follow. The size
+  // trades memory for RPC frequency and is not required for correctness.
+  static constexpr uint64_t INDEX_CURSOR_BATCH_SIZE = 1024;
   bool index_cursor_active_{false};
   bool index_cursor_reverse_{false};
   bool index_cursor_secondary_{false};
@@ -234,16 +234,21 @@ private:
   // The error for a duplicate the storage reported: the client's to fix only
   // when every read this transaction took still holds, else a lost race.
   int duplicate_or_conflict(LineairDBTransaction *tx, uint index);
-  my_off_t
-      current_position_; /* Current position in the file during a file scan */
+  // True while the session wants UNIQUE keys resolved by the statement.
+  bool checks_unique_keys();
+  // Refuse a UNIQUE secondary key another row already holds: this
+  // transaction's own write settles it with no request, the storage with one
+  // probe. 0 when the key is free for primary_key.
+  int check_unique_secondary_key(LineairDBTransaction *tx, uint index,
+                                 const KEY &key_info,
+                                 const std::string &secondary_key,
+                                 const std::string &primary_key);
   std::string write_buffer_;
   LineairDBField ldbField;
   MEM_ROOT blobroot;
 
   // State for buffer fetching
-  static constexpr size_t SCAN_BATCH_SIZE = 100;
   size_t buffer_position_{0};
-  std::string last_batch_key_;
   bool scan_exhausted_{false};
 
   // Search plan
@@ -643,6 +648,7 @@ private:
 
   // Custom MRR batch state.
   struct MrrBufferedRow {
+    std::string key;
     std::string value;
     char *range_info;
   };

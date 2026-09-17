@@ -141,12 +141,17 @@ void LineairDBRpc::handleTxCommit(const std::string& message,
     std::string reason;
     bool fed = true;
     for (const auto& write : request.writes()) {
-        helios::storage::RowOp op = helios::storage::RowOp::kUpdate;
-        if (write.op() == LineairDB::Protocol::TxCommit::INSERT) {
-            op = helios::storage::RowOp::kInsert;
-        } else if (write.op() == LineairDB::Protocol::TxCommit::DELETE) {
-            op = helios::storage::RowOp::kDelete;
+        helios::storage::RowOp op;
+        switch (write.op()) {
+            case LineairDB::Protocol::TxCommit::UPDATE: op = helios::storage::RowOp::kUpdate; break;
+            case LineairDB::Protocol::TxCommit::INSERT: op = helios::storage::RowOp::kInsert; break;
+            case LineairDB::Protocol::TxCommit::DELETE: op = helios::storage::RowOp::kDelete; break;
+            default:
+                reason = "unknown row op";
+                fed = false;
+                break;
         }
+        if (!fed) break;
         if (!tx.Write(write.table_name(), write.key(), write.value(), op, reason)) {
             fed = false;
             break;
