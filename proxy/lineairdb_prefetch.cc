@@ -36,7 +36,8 @@
 #include "sql/table_trigger_dispatcher.h"
 #include "typelib.h"
 
-// Enable Prefetch only for DML; DDL must keep the normal transaction path
+// A read plan is generated only for these statements; every other one reads
+// row by row.
 bool thd_can_use_prefetch(THD *thd) {
   if (thd == nullptr) return false;                  // Missing session
   if (thd->lex == nullptr) return false;             // Missing SQL state
@@ -112,15 +113,6 @@ static bool try_parse_plan_int(const std::string& text, int64_t *value) {
   char *end = nullptr;
   *value = std::strtoll(text.c_str(), &end, 10);
   return end == text.c_str() + text.size();
-}
-
-bool thd_has_tx_plan(THD *thd) {
-  if (thd == nullptr) return false;
-  auto it = thd->user_vars.find("_tx_plan");
-  if (it == thd->user_vars.end()) return false;
-
-  auto *entry = it->second.get();
-  return entry != nullptr && entry->ptr() != nullptr && entry->length() > 0;
 }
 
 // Encode one DSL segment: 42=INT, 42t=TINYINT, 42s=SMALLINT, 42l=BIGINT
@@ -338,7 +330,7 @@ static std::string read_and_clear_tx_plan(THD *thd) {
 
 void maybe_prefetch_for_transaction(THD *thd,
                                             LineairDBTransaction *tx) {
-  if (tx == nullptr || !tx->is_prefetch_mode()) return;
+  if (tx == nullptr || srv_read_path != kReadPathPlan) return;
 
   const std::string plan_text = read_and_clear_tx_plan(thd);
   if (plan_text.empty()) return;
@@ -358,11 +350,10 @@ static int autogen_and_execute_prefetch(THD *thd, AccessPath *root,
   // (value filters, semijoin membership, existence-only caps) are absent by
   // design: commit-time range replay walks the physical range and carries no
   // filter, so a scan that drops rows on the server cannot pass validation.
+  // A shape autogen cannot stage is not an error: those reads take the row
+  // path, one request each.
   if (!autogen_read_plan_from_qep(thd, root, &steps, include_inner_units)) {
-    // autogen has already raised a my_error describing the unsupported shape.
-    tx->set_status_to_abort();
-    thd_mark_transaction_to_rollback(thd, 1);
-    return HA_ERR_UNSUPPORTED;
+    return 0;
   }
   if (steps.empty()) return 0;
 
@@ -464,8 +455,8 @@ static const char *legacy_dml_shape_rejection(THD *thd, TABLE *table) {
 
 int maybe_prefetch_for_statement(THD *thd, LineairDBTransaction *tx,
                                  TABLE *table) {
-  if (tx == nullptr || !tx->is_prefetch_mode()) return 0;  // not prefetch protocol
-  if (tx->tx_plan_used()) return 0;                        // tx-scoped plan covers it
+  if (tx == nullptr || srv_read_path != kReadPathPlan) return 0;
+  if (tx->tx_plan_used()) return 0;  // tx-scoped plan covers it
 
   sync_autogen_statement(thd, tx);
 
@@ -474,13 +465,7 @@ int maybe_prefetch_for_statement(THD *thd, LineairDBTransaction *tx,
     if (tx->autogen_stmt_resolved()) return 0;  // already done this statement
     tx->mark_autogen_stmt_resolved();
 
-    // A read is imminent (called from rnd_init / index_read_map / ...). A
-    // command whose read side cannot be prefetched (e.g. INSERT ... SELECT)
-    // would miss and abort silently in prefetch mode, so fail loudly instead.
-    if (!thd_can_use_prefetch(thd)) {
-      return prefetch_reject_unsupported(
-          thd, tx, "read-bearing statement is not prefetch-eligible");
-    }
+    if (!thd_can_use_prefetch(thd)) return 0;
 
     // Statement-level staging also sweeps Item-embedded subquery plan trees
     // that are invisible to the main-tree leaf walk.
@@ -495,16 +480,12 @@ int maybe_prefetch_for_statement(THD *thd, LineairDBTransaction *tx,
   if (unit_root == nullptr) {
     if (tx->autogen_stmt_resolved()) return 0;
     tx->mark_autogen_stmt_resolved();
-    return prefetch_reject_unsupported(thd, tx,
-                                       "missing JOIN root_access_path");
+    return 0;
   }
   if (tx->autogen_root_staged(unit_root)) return 0;
   tx->mark_autogen_root_staged(unit_root);
 
-  if (!thd_can_use_prefetch(thd)) {
-    return prefetch_reject_unsupported(
-        thd, tx, "read-bearing statement is not prefetch-eligible");
-  }
+  if (!thd_can_use_prefetch(thd)) return 0;
 
   return autogen_and_execute_prefetch(thd, unit_root, tx);
 }
@@ -513,7 +494,7 @@ int maybe_prefetch_for_statement(THD *thd, LineairDBTransaction *tx,
 // handler index access, marking it handler-deferred on the first call.
 bool prefetch_needs_legacy_dml_handler(THD *thd,
                                       LineairDBTransaction *tx) {
-  if (tx == nullptr || !tx->is_prefetch_mode() || tx->tx_plan_used()) {
+  if (tx == nullptr || srv_read_path != kReadPathPlan || tx->tx_plan_used()) {
     return false;
   }
   sync_autogen_statement(thd, tx);
@@ -524,31 +505,27 @@ bool prefetch_needs_legacy_dml_handler(THD *thd,
   return true;
 }
 
-// Build, stage, and serve a legacy single-table UPDATE/DELETE plan from its
-// first handler index access, once per statement; reject unsupported shapes.
+// Build and stage a legacy single-table UPDATE/DELETE plan from its first
+// handler index access, once per statement. A shape one staged range cannot
+// cover is left to the row path.
 int maybe_prefetch_for_legacy_dml_handler(
     THD *thd, LineairDBTransaction *tx, TABLE *table, uint index,
     const IndexSearchPlan &search) {
-  if (tx == nullptr || !tx->is_prefetch_mode() || tx->tx_plan_used()) return 0;
+  if (tx == nullptr || srv_read_path != kReadPathPlan || tx->tx_plan_used()) {
+    return 0;
+  }
 
   sync_autogen_statement(thd, tx);
   if (tx->autogen_stmt_resolved()) return 0;
   tx->mark_autogen_stmt_handler_deferred();
   tx->mark_autogen_stmt_resolved();
 
-  if (!is_legacy_single_table_dml(thd)) {
-    return prefetch_reject_unsupported(
-        thd, tx, "handler-derived plan requested for non-legacy DML");
-  }
-  if (const char *reason = legacy_dml_shape_rejection(thd, table)) {
-    return prefetch_reject_unsupported(thd, tx, reason);
-  }
+  if (!is_legacy_single_table_dml(thd)) return 0;
+  if (legacy_dml_shape_rejection(thd, table) != nullptr) return 0;
 
   std::vector<LineairDBProxy::ReadPlanStep> steps;
   if (!autogen_read_plan_from_index_search(thd, table, index, search, &steps)) {
-    tx->set_status_to_abort();
-    thd_mark_transaction_to_rollback(thd, 1);
-    return HA_ERR_UNSUPPORTED;
+    return 0;
   }
 
   tx->execute_read_plan(steps);
@@ -558,7 +535,7 @@ int maybe_prefetch_for_legacy_dml_handler(
 int maybe_prefetch_for_index_tail(THD *thd, LineairDBTransaction *tx,
                                   const std::string &table_key,
                                   uint64_t window_rows) {
-  if (tx == nullptr || !tx->is_prefetch_mode()) return 0;
+  if (tx == nullptr || srv_read_path != kReadPathPlan) return 0;
   if (tx->tx_plan_used()) return 0;
 
   sync_autogen_statement(thd, tx);
@@ -581,9 +558,9 @@ int maybe_prefetch_for_index_tail(THD *thd, LineairDBTransaction *tx,
   return prefetch_abort_errno(thd, tx);
 }
 
-int prefetch_reject_unsupported(THD *thd, LineairDBTransaction *tx,
-                                const char *reason) {
-  std::string msg = "LineairDB prefetch unsupported: ";
+int reject_unsupported_statement(THD *thd, LineairDBTransaction *tx,
+                                 const char *reason) {
+  std::string msg = "LineairDB unsupported: ";
   msg += reason != nullptr ? reason : "unsupported access shape";
   if (thd != nullptr) {
     const LEX_CSTRING query = thd->query();
@@ -600,9 +577,7 @@ int prefetch_reject_unsupported(THD *thd, LineairDBTransaction *tx,
 
 int prefetch_abort_errno(THD *thd, LineairDBTransaction *tx) {
   if (tx == nullptr || !tx->is_aborted()) return 0;
-  if (tx->aborted_by_cache_miss()) {
-    return prefetch_reject_unsupported(thd, tx, "prefetch cache miss");
-  }
   thd_mark_transaction_to_rollback(thd, 1);
+  if (tx->has_transport_error()) return HA_ERR_NO_CONNECTION;
   return HA_ERR_LOCK_DEADLOCK;
 }

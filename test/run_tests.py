@@ -2,6 +2,7 @@ import os
 import sys
 import glob
 import argparse
+import shutil
 import time
 
 SERVER_HOST = "127.0.0.1"
@@ -22,13 +23,15 @@ def restart_services():
   """LineairDB Server + MySQL を再起動してクリーンな状態にする"""
   os.system(f"./scripts/stop_mysql.sh {QUIET}")
   os.system(f"./scripts/stop_server.sh {QUIET}")
+  # The storage keeps its PAX catalog and log across restarts even with
+  # recovery off, and the suite re-creates tables with different columns.
+  shutil.rmtree("helios_wal", ignore_errors=True)
   time.sleep(1)
   os.system(f"./scripts/start_server.sh {QUIET}")
   time.sleep(2)
   os.system(f"./scripts/start_mysql.sh --mysqld-port {MYSQLD_PORT} --server-host {SERVER_HOST} --server-port {SERVER_PORT} {QUIET}")
 
 def run_tests(test_files):
-  os.system("sed -i \"s/#define FENCE.*/#define FENCE true/\" proxy/ha_lineairdb.cc")
   os.system(f"./scripts/build_partial.sh {QUIET}")
   exit_value = 0
   for f in test_files:

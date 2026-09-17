@@ -335,57 +335,6 @@ bool serialize_item(const Item *item,
   }
 }
 
-// True when one predicate operand is an integer field or integer constant
-static bool item_is_limit_safe_scalar(const Item *item) {
-  // Accept only expression shapes the server can compare exactly for LIMIT.
-  if (item == nullptr) return false;                 // Missing expression
-  if (item->type() == Item::INT_ITEM) return true;   // Integer constant
-
-  // Field operands must be integer columns to avoid string/collation mismatch.
-  if (item->type() != Item::FIELD_ITEM) return false; // Not a field
-  const Item_field *field_item = down_cast<const Item_field *>(item);
-  if (field_item->field == nullptr) return false;    // Missing field metadata
-  return field_item->field->result_type() == INT_RESULT;
-}
-
-// True when WHERE is an AND tree of simple integer comparisons
-static bool item_is_limit_safe_filter(const Item *item) {
-  if (item == nullptr) return true;                  // No WHERE to check
-
-  // AND is safe to recurse; OR is kept local until we add stricter tests.
-  if (item->type() == Item::COND_ITEM) {
-    // Keep LIMIT filters to AND trees; OR can be added after stricter tests.
-    auto *cond_item =
-        const_cast<Item_cond *>(down_cast<const Item_cond *>(item));
-    if (cond_item->functype() != Item_func::COND_AND_FUNC) return false;
-    for (Item &child : *cond_item->argument_list()) {
-      if (!item_is_limit_safe_filter(&child)) return false;
-    }
-    return true;
-  }
-
-  // Leaf predicates must be binary comparisons.
-  if (item->type() != Item::FUNC_ITEM) return false; // Not a comparison
-  const Item_func *func = down_cast<const Item_func *>(item);
-  switch (func->functype()) {
-    case Item_func::EQ_FUNC:
-    case Item_func::NE_FUNC:
-    case Item_func::LT_FUNC:
-    case Item_func::LE_FUNC:
-    case Item_func::GT_FUNC:
-    case Item_func::GE_FUNC:
-      break;
-    default:
-      return false;                                  // Complex predicate
-  }
-
-  // Both sides must be safe scalar operands.
-  if (func->argument_count() != 2) return false;     // Binary compare only
-  Item **args = func->arguments();
-  return item_is_limit_safe_scalar(args[0]) &&
-         item_is_limit_safe_scalar(args[1]);
-}
-
 /**
  * @brief Collect predicates that reference only one table from an AND tree.
  *
@@ -501,45 +450,16 @@ bool build_single_table_filter(THD *thd, TABLE *table,
   return !out_serialized->empty();
 }
 
-// Push the SELECT WHERE into this transaction if LIMIT will depend on it.
-bool prepare_select_filter_for_tx(THD *thd, TABLE *table,
-                                  LineairDBTransaction *tx,
-                                  std::string *serialized_filter) {
-  // Check the handler state needed to inspect the current SELECT.
-  if (tx == nullptr) return false;                   // Missing transaction
-  if (thd == nullptr) return false;                  // Missing session
-  const bool has_table = (table != nullptr && table->s != nullptr);
-  if (!has_table) return false;                      // Missing table
-  if (thd->lex == nullptr) return false;             // Missing SQL state
-  if (thd->lex->unit == nullptr) return false;       // Missing query unit
+// A storage scan carries no predicate, so every row MySQL drops above the
+// handler would have come out of a pushed LIMIT. Only a SELECT with no WHERE
+// left for this table's rows may push one.
+bool select_scan_limit_is_safe(THD *thd, TABLE *table) {
+  if (thd == nullptr || thd->lex == nullptr || thd->lex->unit == nullptr) {
+    return false;
+  }
+  if (table == nullptr || table->s == nullptr) return false;
 
-  // Read the current SELECT WHERE from MySQL's query block.
   Query_block *qb = thd->lex->unit->global_parameters();
-  if (qb == nullptr) return false;                   // Missing query block
-
-  const Item *where = qb->where_cond();
-  if (where == nullptr) {
-    if (serialized_filter != nullptr) serialized_filter->clear();
-    tx->clear_pushed_filter();
-    return true;                                     // No WHERE to push
-  }
-
-  // Push only predicates that can be evaluated on this table's rows.
-  std::string encoded;
-  if (!build_single_table_filter(thd, table, &encoded) || encoded.empty()) {
-    if (serialized_filter != nullptr) serialized_filter->clear();
-    tx->clear_pushed_filter();
-    return false;                                    // MySQL must filter
-  }
-
-  // Attach the encoded filter to the transaction for the next scan RPC.
-  if (serialized_filter != nullptr) {
-    *serialized_filter = encoded;
-  }
-  tx->set_pushed_filter(encoded);
-
-  // LIMIT pushdown is safe only when the table-local filter is the whole WHERE.
-  if (table->pos_in_table_list == nullptr) return false;
-  const table_map me = table->pos_in_table_list->map();
-  return where->used_tables() == me && item_is_limit_safe_filter(where);
+  if (qb == nullptr) return false;
+  return qb->where_cond() == nullptr;
 }

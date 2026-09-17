@@ -1,3 +1,5 @@
+// The RPC surface of the storage server: the handler for every OpCode, plus
+// the server-wide row counts, boot token and hidden-key allocator they use.
 #pragma once
 
 #include <string>
@@ -11,7 +13,6 @@
 
 #include "../protocol/message.hh"
 #include "../database_manager.hh"
-#include "../transaction_manager.hh"
 
 // Server-wide table row count tracker, shared across all connections.
 struct TableRowCounts {
@@ -57,7 +58,7 @@ public:
      *   missing key table, an exhausted space. Thread-safe.
      * @return false when nothing was reserved.
      */
-    bool Allocate(LineairDB::Database& database, const std::string& table_name,
+    bool Allocate(helios::storage::Database& database, const std::string& table_name,
                   uint32_t count, uint64_t* first_id, std::string* error,
                   bool* permanent);
 
@@ -84,7 +85,6 @@ private:
 class LineairDBRpc {
 public:
     LineairDBRpc(std::shared_ptr<DatabaseManager> db_manager,
-                 std::shared_ptr<TransactionManager> tx_manager,
                  std::shared_ptr<TableRowCounts> row_counts,
                  std::shared_ptr<HiddenKeyAllocator> hidden_keys);
     ~LineairDBRpc() = default;
@@ -94,7 +94,6 @@ public:
 
 private:
     std::shared_ptr<DatabaseManager> db_manager_;
-    std::shared_ptr<TransactionManager> tx_manager_;
     std::shared_ptr<TableRowCounts> row_counts_;
     std::shared_ptr<HiddenKeyAllocator> hidden_keys_;
 
@@ -111,23 +110,12 @@ private:
     };
     static std::unordered_map<std::string, HistEntry> hist_cache_;
 
-    // Transaction control
-    void handleTxBeginTransaction(const std::string& message, std::string& result);
-    void handleTxAbort(const std::string& message, std::string& result);
-    void handleDbEndTransaction(const std::string& message, std::string& result);
-    void handleDbSetTable(const std::string& message, std::string& result);
-
-    // Primary key operations
+    // Reads, scans and the commit of a transaction
     void handleTxRead(const std::string& message, std::string& result);
     void handleTxBatchRead(const std::string& message, std::string& result);
-    void handleTxBatchWrite(const std::string& message, std::string& result);
-    void handleTxWrite(const std::string& message, std::string& result);
-    void handleTxDelete(const std::string& message, std::string& result);
-
-    // Stateless operations
-    void handleTxStatelessRead(const std::string& message, std::string& result);
-    void handleTxStatelessBatchRead(const std::string& message, std::string& result);
-    void handleTxValidateAndCommit(const std::string& message, std::string& result);
+    void handleTxScan(const std::string& message, std::string& result);
+    void handleTxScanIndex(const std::string& message, std::string& result);
+    void handleTxCommit(const std::string& message, std::string& result);
 
     // Read-plan execution
     void handleTxExecuteReadPlan(const std::string& message, std::string& result);
@@ -136,37 +124,13 @@ private:
     void handleTxExecuteDuckdbQuery(const std::string& message,
                                     std::string& result);
 
-    // Secondary index operations
-    void handleTxReadSecondaryIndex(const std::string& message, std::string& result);
-    void handleTxWriteSecondaryIndex(const std::string& message, std::string& result);
-    void handleTxDeleteSecondaryIndex(const std::string& message, std::string& result);
-    void handleTxUpdateSecondaryIndex(const std::string& message, std::string& result);
-
-    // Primary key scan operations
-    void handleTxGetMatchingKeysInRange(const std::string& message, std::string& result);
-    void handleTxGetMatchingKeysAndValuesInRange(const std::string& message, std::string& result);
-    void handleTxGetMatchingKeysAndValuesFromPrefix(const std::string& message, std::string& result);
-    void handleTxFetchLastKeyInRange(const std::string& message, std::string& result);
-    void handleTxFetchFirstKeyWithPrefix(const std::string& message, std::string& result);
-    void handleTxFetchNextKeyWithPrefix(const std::string& message, std::string& result);
-
-    // Secondary index scan operations
-    void handleTxGetMatchingPrimaryKeysInRange(const std::string& message, std::string& result);
-    void handleTxGetMatchingPrimaryKeysFromPrefix(const std::string& message, std::string& result);
-    void handleTxFetchLastPrimaryKeyInSecondaryRange(const std::string& message, std::string& result);
-    void handleTxFetchLastSecondaryEntryInRange(const std::string& message, std::string& result);
-
     // Table statistics
     void handleTxGetTableStats(const std::string& message, std::string& result);
 
     // Database operations
-    void handleDbFence(const std::string& message, std::string& result);
     void handleDbCreateTable(const std::string& message, std::string& result);
     void handleDbCreateSecondaryIndex(const std::string& message, std::string& result);
     void handleDbAllocateHiddenKeys(const std::string& message, std::string& result);
     void handleDbSetCommitDurability(const std::string& message,
                                      std::string& result);
-
-    // utility
-    bool key_prefix_is_matching(const std::string& key_prefix, const std::string& key);
 };

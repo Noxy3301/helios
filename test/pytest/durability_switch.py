@@ -3,33 +3,18 @@ Switching a running server from Async to Sync, observed from outside.
 
 A load runs faster under Async, and the load is not part of a measurement, so
 the run wants Async while it populates and Sync from the first measured
-transaction onwards. `lineairdb-ctl set-durability sync` may therefore return
-only once everything acknowledged under Async is on the device. Four
-scenarios; the first three prove both halves of that, and the fourth checks
-the refusal on a volatile server. The positive half is an order: release the
-held sync point and the command returns. The negative half is a bounded wait:
-nothing may return during NOT_ANSWERED_SECONDS while the point is held.
+transaction onwards. One scenario: after `lineairdb-ctl set-durability sync`,
+a commit behaves as it does on a server that started Sync, which is a bounded
+wait plus an order. The wait is that nothing may be acknowledged during
+NOT_ANSWERED_SECONDS while that commit's fdatasync is held at a sync point;
+the order is that releasing the point lets it return, and a replay of the log
+finds every row that returned.
 
-  A. A commit whose fdatasync is stopped. The barrier is entered (proved by its
-     own sync point) and then must not return while that fdatasync is held.
-     The server is killed right after the reply is checked, so recovery sees
-     exactly what was durable at that moment and nothing later.
-
-  B. A commit that captured Async and has not left its epoch yet. The barrier
-     must not return while that transaction is parked, because its record is
-     enqueued but its epoch cannot close. Once it returns, the record is in
-     the log on disk and a replay of that log finds it.
-
-  C. After the switch, a commit behaves as it does on a server that started
-     Sync: it is not acknowledged while its fdatasync is stopped.
-
-  D. A Volatile server refuses the switch instead of accepting it silently.
-
-The server is started by these tests rather than by the runner: the debug sync
-handshakes pass pipe descriptors to it, and its working directory is a
-temporary one so the log under test is the only log involved. They still use
-9999 and 3307 and stop whatever stack holds them, so nothing else may run
-beside them; the runner restarts the stack around each file.
+The server is started by this test rather than by the runner: the debug sync
+handshake passes pipe descriptors to it, and its working directory is a
+temporary one so the log under test is the only log involved. It still uses
+9999 and 3307 and stops whatever stack holds them, so nothing else may run
+beside it; the runner restarts the stack around each file.
 """
 import os
 import select
@@ -56,9 +41,7 @@ ARRIVAL_WAIT_SECONDS = 20
 # is not waiting has certainly returned by the time this elapses.
 NOT_ANSWERED_SECONDS = 1.5
 
-WAL_POINT = "LINEAIRDB_DEBUG_SYNC_WAL_BEFORE_FDATASYNC"
-BARRIER_POINT = "LINEAIRDB_DEBUG_SYNC_DATABASE_BEFORE_DURABILITY_BARRIER"
-COMMIT_POINT = "LINEAIRDB_DEBUG_SYNC_DATABASE_END_TRANSACTION_BEFORE_OFFLINE"
+WAL_POINT = "HELIOS_DEBUG_SYNC_WAL_BEFORE_FDATASYNC"
 
 
 def log(message):
@@ -106,32 +89,6 @@ class SyncPoint:
                 os.close(fd)
             except OSError:
                 pass
-
-
-class Drainer(threading.Thread):
-    """Releases arrivals at a point continuously.
-
-    Startup and DDL commit through the points this test arms, and a commit
-    parked inside its epoch stalls the whole server, so setup runs with the
-    point drained rather than observed.
-    """
-
-    def __init__(self, point):
-        super().__init__(daemon=True)
-        self.point = point
-        self.done = threading.Event()
-        self.released = 0
-
-    def run(self):
-        while not self.done.is_set():
-            if self.point.wait(0.1):
-                self.point.release()
-                self.released += 1
-
-    def stop(self):
-        self.done.set()
-        self.join(10)
-        return self.released
 
 
 def env_for(points):
@@ -329,200 +286,8 @@ def recovered_rows(work_dir, table):
     return server, rows
 
 
-def test_the_barrier_waits_for_a_held_fdatasync(work_dir):
-    log("A: the barrier must not return while the async commits' fdatasync "
-        "is stopped")
-    wal = SyncPoint(WAL_POINT)
-    barrier = SyncPoint(BARRIER_POINT)
-    points = (wal, barrier)
-    server = None
-    switch = None
-    try:
-        server = start_server(work_dir, "async", extra_env=env_for(points),
-                              pass_fds=fds_for(points))
-        start_mysqld()
-        create_table("held")
-        time.sleep(1.0)
-        log(f"released {wal.drain()} flush(es) from startup and DDL")
-
-        expected = {}
-        for row in (1, 2, 3):
-            sql(f"USE dur; INSERT INTO held VALUES ({row}, {row * 10});")
-            expected[row] = row * 10
-        log(f"acknowledged under async without a device write: "
-            f"{sorted(expected)}")
-
-        # Stop the flush that carries them, and keep it stopped.
-        if not wal.wait(ARRIVAL_WAIT_SECONDS):
-            log("FAIL: no flush reached the point after the async inserts")
-            return 1
-
-        switch = start_switch("sync")
-        if not barrier.wait(ARRIVAL_WAIT_SECONDS):
-            log("FAIL: the switch never reached the barrier")
-            return 1
-        log("the switch stored Sync and entered the barrier")
-        barrier.release()
-
-        time.sleep(NOT_ANSWERED_SECONDS)
-        if switch.poll() is not None:
-            stdout, stderr = switch.communicate()
-            log(f"FAIL: the switch returned while the fdatasync that would "
-                f"make the async rows durable was still stopped: "
-                f"{stdout.strip()}{stderr.strip()}")
-            return 1
-        log("the switch held while the fdatasync was stopped")
-
-        if not release_until(wal, lambda: switch.poll() is not None,
-                             ARRIVAL_WAIT_SECONDS, parked=True):
-            log("FAIL: the switch never returned after the fdatasync was "
-                "released")
-            return 1
-        stdout, stderr = switch.communicate()
-        returncode, switch = switch.returncode, None
-        if returncode != 0 or stdout.strip() != "ok mode=SYNC":
-            log(f"FAIL: the switch reported rc={returncode} "
-                f"stdout={stdout.strip()!r} stderr={stderr.strip()!r}")
-            return 1
-        log("the switch returned ok mode=SYNC")
-
-        # Killed here, with no commit in between: what recovery finds is what
-        # the barrier itself made durable, not a later Sync flush.
-        kill_now(server)
-        log("killed the server with no commit after the switch")
-        server, rows = recovered_rows(work_dir, "held")
-        if rows != expected:
-            log(f"FAIL: recovered {rows}, expected {expected}")
-            return 1
-        log(f"recovered every row the barrier covered: {rows}")
-        log("PASS")
-        return 0
-    finally:
-        if switch is not None:
-            switch.kill()
-        for point in points:
-            try:
-                point.drain(0.2)
-            except OSError:
-                pass
-        stop_stack()
-        if server is not None:
-            server.poll()
-        for point in points:
-            point.close()
-
-
-def test_the_barrier_waits_for_an_in_flight_async_commit(work_dir):
-    log("B: the barrier must not return while a commit that captured async "
-        "is still in its epoch")
-    commit = SyncPoint(COMMIT_POINT)
-    barrier = SyncPoint(BARRIER_POINT)
-    points = (commit, barrier)
-    server = None
-    switch = None
-    drainer = None
-    try:
-        server = start_server(work_dir, "async", extra_env=env_for(points),
-                              pass_fds=fds_for(points))
-        # Every commit stops at this point, and one parked inside its epoch
-        # stalls the server, so setup runs behind a drainer.
-        drainer = Drainer(commit)
-        drainer.start()
-        start_mysqld()
-        create_table("inflight")
-        released = drainer.stop()
-        drainer = None
-        log(f"released {released} commit(s) from startup and DDL")
-
-        committer = Committer("USE dur; INSERT INTO inflight VALUES (1, 10);")
-        committer.start()
-        if not commit.wait(ARRIVAL_WAIT_SECONDS):
-            log("FAIL: the INSERT never reached the point before it left its "
-                "epoch")
-            return 1
-        log("the INSERT captured async, enqueued its record, and is still "
-            "online")
-
-        switch = start_switch("sync")
-        if not barrier.wait(ARRIVAL_WAIT_SECONDS):
-            log("FAIL: the switch never reached the barrier")
-            return 1
-        barrier.release()
-
-        time.sleep(NOT_ANSWERED_SECONDS)
-        if switch.poll() is not None:
-            stdout, stderr = switch.communicate()
-            log(f"FAIL: the switch returned while a commit that captured "
-                f"async was still in its epoch: "
-                f"{stdout.strip()}{stderr.strip()}")
-            return 1
-        log("the switch held while the transaction was parked")
-
-        if not release_until(commit, lambda: switch.poll() is not None,
-                             ARRIVAL_WAIT_SECONDS, parked=True):
-            log("FAIL: the switch never returned after the transaction was "
-                "released")
-            return 1
-        stdout, stderr = switch.communicate()
-        returncode, switch = switch.returncode, None
-        if returncode != 0 or stdout.strip() != "ok mode=SYNC":
-            log(f"FAIL: the switch reported rc={returncode} "
-                f"stdout={stdout.strip()!r} stderr={stderr.strip()!r}")
-            return 1
-        committer.join(ARRIVAL_WAIT_SECONDS)
-        if committer.error is not None:
-            log(f"FAIL: the INSERT failed: {committer.error}")
-            return 1
-        if committer.returned_at is None:
-            log("FAIL: the INSERT never returned after the release")
-            return 1
-        log("the switch returned ok mode=SYNC and the INSERT was acknowledged")
-
-        # The read commits too, so it needs the point drained while it runs.
-        reader = Drainer(commit)
-        reader.start()
-        live = sql("SELECT id, v FROM dur.inflight;").strip()
-        reader.stop()
-        if live != "1\t10":
-            log(f"FAIL: the acknowledged row is not readable: {live!r}")
-            return 1
-
-        # Both halves of what the barrier promised: the record is written,
-        # and a replay of that log finds it.
-        kill_now(server)
-        wal = open(os.path.join(work_dir, "lineairdb_logs", "wal.log"),
-                   "rb").read()
-        if b"./dur/inflight" not in wal:
-            log("FAIL: the barrier returned but the record is not in the log")
-            return 1
-        log("the record the barrier waited for is on the device")
-
-        server, rows = recovered_rows(work_dir, "inflight")
-        if rows != {1: 10}:
-            log(f"FAIL: recovered {rows}, expected {{1: 10}}")
-            return 1
-        log(f"recovered the row the barrier waited for: {rows}")
-        log("PASS")
-        return 0
-    finally:
-        if drainer is not None:
-            drainer.stop()
-        if switch is not None:
-            switch.kill()
-        for point in points:
-            try:
-                point.drain(0.2)
-            except OSError:
-                pass
-        stop_stack()
-        if server is not None:
-            server.poll()
-        for point in points:
-            point.close()
-
-
 def test_the_sync_contract_applies_after_the_switch(work_dir):
-    log("C: after the switch a commit must wait for its own fdatasync")
+    log("after the switch a commit must wait for its own fdatasync")
     wal = SyncPoint(WAL_POINT)
     points = (wal,)
     server = None
@@ -602,33 +367,6 @@ def test_the_sync_contract_applies_after_the_switch(work_dir):
             point.close()
 
 
-def test_a_volatile_server_refuses_the_switch(work_dir):
-    log("D: a volatile server must refuse the switch, not accept it silently")
-    server = None
-    try:
-        server = start_server(work_dir, "volatile")
-        done = subprocess.run(
-            [CTL, "--host", "127.0.0.1", "--port", "9999",
-             "set-durability", "sync"],
-            cwd=ROOT, capture_output=True, text=True, timeout=60)
-        if done.returncode == 0:
-            log(f"FAIL: the switch reported success on a volatile server: "
-                f"{done.stdout.strip()!r}")
-            return 1
-        refusal = ("the database is volatile; commit durability is fixed "
-                   "at startup")
-        if refusal not in done.stderr or "mode=VOLATILE" not in done.stderr:
-            log(f"FAIL: not the volatile refusal: {done.stderr.strip()!r}")
-            return 1
-        log(f"refused: {done.stderr.strip()}")
-        log("PASS")
-        return 0
-    finally:
-        stop_stack()
-        if server is not None:
-            server.poll()
-
-
 def main():
     print("TEST: the runtime switch from async to sync durability")
     for binary in (SERVER, CTL):
@@ -639,15 +377,12 @@ def main():
         print("FAIL: ss is required to detect listening ports")
         return 1
 
-    # The runner starts a stack before every test file; these scenarios need
-    # servers they configured themselves, so that one goes first.
+    # The runner starts a stack before every test file; this scenario needs a
+    # server it configured itself, so that one goes first.
     stop_stack()
 
     failures = 0
-    for scenario in (test_the_barrier_waits_for_a_held_fdatasync,
-                     test_the_barrier_waits_for_an_in_flight_async_commit,
-                     test_the_sync_contract_applies_after_the_switch,
-                     test_a_volatile_server_refuses_the_switch):
+    for scenario in (test_the_sync_contract_applies_after_the_switch,):
         work_dir = tempfile.mkdtemp(prefix="helios_durability_switch_")
         try:
             failures += scenario(work_dir)

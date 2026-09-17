@@ -6,7 +6,7 @@
 #include <vector>
 
 #include "lineairdb.pb.h"
-#include "lineairdb/lineairdb.h"
+#include "lineairdb/database.h"
 
 // Parallel scan helpers for primary ranges and PAX strip-direct scans. These
 // functions fall back to the serial path when the table, key shape, or row
@@ -27,7 +27,7 @@ struct SemijoinReduction {
  * materialized-row path.
  */
 bool parallel_primary_pax_row_ref_scan(
-    LineairDB::Database* db,
+    helios::storage::Database* db,
     const LineairDB::Protocol::TxExecuteReadPlan::PlanStep& step,
     const std::string& start_key, const std::string& end_key,
     LineairDB::Protocol::TxExecuteReadPlan::StepResult* step_result,
@@ -41,7 +41,7 @@ bool parallel_primary_pax_row_ref_scan(
  * scan path.
  */
 bool parallel_primary_filter_scan(
-    LineairDB::Database* db,
+    helios::storage::Database* db,
     const LineairDB::Protocol::TxExecuteReadPlan::PlanStep& step,
     const std::string& start_key, const std::string& end_key,
     LineairDB::Protocol::TxExecuteReadPlan::StepResult* step_result);

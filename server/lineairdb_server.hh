@@ -6,7 +6,6 @@
 #include "network/message_handler.hh"
 #include "rpc/lineairdb_rpc.hh"
 #include "database_manager.hh"
-#include "transaction_manager.hh"
 
 class LineairDBServer : public TcpServer {
 public:

@@ -136,6 +136,12 @@ RangeScanLimit range_scan_limit_for_order(THD *thd, const KEY *key,
 // requested index. Initial loading and ANALYZE TABLE are independent of it.
 extern bool srv_stats_drift_refresh;
 
+// Where a statement's reads come from: kReadPathRow sends one request per
+// handler read, kReadPathPlan stages what it can through TX_EXECUTE_READ_PLAN
+// and sends the rest as they happen.
+enum ReadPath { kReadPathRow = 0, kReadPathPlan = 1 };
+extern ulong srv_read_path;
+
 namespace lineairdb {
 
 /**
@@ -201,10 +207,13 @@ private:
   std::string index_cursor_start_key_;
   std::string index_cursor_end_key_;
 
-  // Set by get_matching_keys_and_values_in_range() when these materialized
-  // rows are only a LIMIT-staged window. index_next()/index_next_same() consume
-  // it and abort on over-read instead of returning a false EOF.
+  // Set when a materialized scan was served from a staged window that holds
+  // only the first rows of its range. index_next()/index_next_same() fetch
+  // the rest from the storage instead of reporting a short result; the end
+  // bound the statement asked for is kept to bound that fetch.
   bool materialized_scan_truncated_{false};
+  std::string truncated_scan_end_;
+
   // Per-statement memo for set_fields_from_lineairdb, refreshed on query_id
   // change.
   uint64_t serve_memo_query_id_{0};
@@ -226,6 +235,21 @@ private:
   // it, so one reservation can cover the whole statement. 0 means no estimate.
   ha_rows bulk_insert_rows_{0};
   ha_rows bulk_insert_generated_{0};
+  // Primary keys the running INSERT statement inserts and has not resolved
+  // against the storage yet. MySQL brackets most INSERT statements with
+  // start_bulk_insert / end_bulk_insert, so they are probed in one RPC there;
+  // a statement without the bracket probes at the row.
+  bool bulk_insert_active_{false};
+  std::vector<std::string> insert_probe_keys_;
+  // Bound on one probe request, so a LOAD DATA or INSERT ... SELECT does not
+  // grow one message per row of the statement.
+  static constexpr size_t kInsertProbeBatch = 1024;
+  // Resolve the queued keys against the storage. Returns the error for a key
+  // that already holds a row, 0 when every one of them is free.
+  int flush_insert_probe(LineairDBTransaction *tx);
+  // The error for a duplicate the storage reported: the client's to fix only
+  // when every read this transaction took still holds, else a lost race.
+  int duplicate_or_conflict(LineairDBTransaction *tx, uint index);
   my_off_t
       current_position_; /* Current position in the file during a file scan */
   std::string write_buffer_;
@@ -249,6 +273,9 @@ private:
 
   // Refill the rows buffered for index_next()/index_prev().
   bool refill_index_cursor(LineairDBTransaction *tx);
+  // Materialize the rest of a range whose staged window ran out. False when
+  // the range really ended (or the transaction is gone).
+  bool refill_truncated_scan(LineairDBTransaction *tx);
 
   void reset_index_search_buffers();
 
@@ -283,7 +310,7 @@ public:
   // HA_BLOCK_CONST_TABLE keeps the optimizer from const-folding equality
   // lookups on this engine. A const-table read happens during JOIN::optimize
   // (read_const), before the QEP root_access_path exists, so the statement-
-  // scoped autogen prefetch hook cannot see it and would issue a per-row RPC
+  // scoped autogen hook cannot see it and would issue a per-row RPC
   // or abort. Blocking const-table demotes such lookups to JT_EQ_REF, moving
   // the read into the execution phase where autogen batches it into one RPC.
   ulonglong table_flags() const override {
@@ -434,7 +461,7 @@ public:
 
   // C_materialise: one remote PK row fetch after a non-covering secondary scan.
   // 8.0 is an inflated steering value: it makes large row-by-row materialization
-  // lose to bulk full-scan+prefetch even when cardinality is underestimated.
+  // lose to a bulk full scan even when cardinality is underestimated.
   static double kC_materialise() {
     static const double v =
         helios_cost_param("HELIOS_C_MATERIALISE", 8.0);
@@ -458,7 +485,7 @@ public:
   Cost_estimate helios_ref_cost(double ranges, double rows) const {
     Cost_estimate c;
     const double bytes = rows * helios_row_bytes();
-    // per-lookup RPC amortized over the prefetch batch size.
+    // per-lookup RPC amortized over the batch size.
     const double rpc = (ranges > 0 ? ranges : 1.0) * (kC_rpc() / kEffBatch());
     c.add_io(rpc + bytes * kC_byte());
     c.add_cpu(rows * (kC_probe() + kC_row()));
@@ -612,10 +639,10 @@ public:
   /**
    * @brief Advertise custom batched MRR for primary-key point lookups.
    *
-   * In non-prefetch mode, these methods clear HA_MRR_USE_DEFAULT_IMPL for
-   * primary-key lookup ranges so multi_range_read_init() can batch all keys into
-   * one LineairDB RPC. Prefetch mode keeps MySQL's default DS-MRR path because
-   * reads are already staged in the transaction cache.
+   * On the row read path, these methods clear HA_MRR_USE_DEFAULT_IMPL for
+   * primary-key lookup ranges so multi_range_read_init() can batch all keys
+   * into one LineairDB RPC. The plan path keeps MySQL's default DS-MRR path,
+   * where a staged window serves the rows.
    */
   ha_rows multi_range_read_info_const(
       uint keyno, RANGE_SEQ_IF *seq, void *seq_init_param, uint n_ranges,
@@ -660,10 +687,12 @@ private:
   std::vector<MrrBufferedRow> mrr_buffer_;
   size_t mrr_buffer_pos_ = 0;
   bool mrr_use_batch_ = false;
-  static bool predict_prefetch_mode(THD *thd);
+  // True when this statement's reads are staged through a read plan, so
+  // the handler's own batched MRR is not the path the rows arrive on.
+  static bool statement_uses_read_plan(THD *thd);
   static std::string server_connection_host();
   static int server_connection_port();
-  LineairDBTransaction *new_transaction(THD *thd, bool fence);
+  LineairDBTransaction *new_transaction(THD *thd);
   LineairDBTransaction *active_transaction(THD *thd) const;
   LineairDBTransaction *&
   get_transaction(THD *thd);
@@ -728,7 +757,7 @@ private:
    * transaction bounded while preserving the normal secondary-index write path.
    * `ops` is cleared before return.
    */
-  bool backfill_commit_chunk(std::vector<LineairDBProxy::BatchOp> &ops);
+  bool backfill_commit_chunk(std::vector<LineairDBProxy::WriteOp> &ops);
 
   /**
    * @brief Backfill one or more non-unique secondary indexes in parallel.

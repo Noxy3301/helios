@@ -14,6 +14,7 @@
 #include "pax/catalog.h"
 #include "pax/epoch_image_buffer.h"
 #include "pax/table.h"
+#include "util/debug_sync.h"
 #include "util/spdlog.h"
 
 namespace helios::storage {
@@ -53,6 +54,7 @@ Database::PaxReadView Database::OpenPaxView(uint32_t fence_timeout_ms) {
         "holding the epoch";
     return view;
   }
+  HELIOS_DEBUG_SYNC("pax_view.after_fence");
   view.valid = true;
   view.snapshot_epoch = snapshot_epoch;
   return view;

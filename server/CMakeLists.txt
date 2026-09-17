@@ -8,9 +8,6 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 find_package(Protobuf REQUIRED)
 find_package(PkgConfig REQUIRED)
 
-# LineairDB library path
-set(LINEAIRDB_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../third_party/LineairDB")
-
 # DuckDB library path (third_party submodule). The shared library is a release
 # build produced inside the submodule; scripts/build.sh builds it when absent.
 set(DUCKDB_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../third_party/duckdb")
@@ -35,7 +32,6 @@ set(MYSQL_INCLUDE_DIRS
 # Include directories
 include_directories(${CMAKE_CURRENT_SOURCE_DIR})
 include_directories(${CMAKE_CURRENT_SOURCE_DIR}/../proto)
-include_directories(${LINEAIRDB_ROOT}/include)
 include_directories(${DUCKDB_ROOT}/src/include)
 
 # Generate protobuf files
@@ -53,8 +49,8 @@ add_custom_command(
     COMMENT "Generating protobuf files"
 )
 
-# Add LineairDB as subdirectory
-add_subdirectory(${LINEAIRDB_ROOT} ${CMAKE_CURRENT_BINARY_DIR}/LineairDB)
+# The storage engine; it exports its include and src directories.
+add_subdirectory(storage)
 
 # Source files
 set(SOURCES
@@ -79,16 +75,11 @@ set(SOURCES
     rpc/flat_plan_encode.hh
     rpc/parallel_scan.cc
     rpc/parallel_scan.hh
-    rpc/primary_key_operations.cc
-    rpc/primary_key_scan_operations.cc
     rpc/read_plan_executor.cc
     rpc/row_codec.cc
     rpc/row_codec.hh
-    rpc/secondary_index_operations.cc
-    rpc/secondary_index_scan_operations.cc
-    rpc/stateless_operations.cc
+    rpc/transaction_operations.cc
     rpc/table_stats.cc
-    rpc/transaction_control.cc
     rpc/predicate_evaluator.cc
     rpc/predicate_evaluator.hh
     mysql_charset_runtime.cc
@@ -102,8 +93,6 @@ set(SOURCES
     # Storage layer
     database_manager.cc
     database_manager.hh
-    transaction_manager.cc
-    transaction_manager.hh
 
     # Protocol
     protocol/message.hh
@@ -120,7 +109,7 @@ add_executable(lineairdb-server ${SOURCES})
 
 # Link libraries
 target_link_libraries(lineairdb-server
-    lineairdb
+    helios_storage
     lineairdb-proto
     pthread
     ${DUCKDB_LIB_DIR}/libduckdb.so

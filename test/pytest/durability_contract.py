@@ -165,7 +165,7 @@ def test_acknowledgement_follows_the_fdatasync(work_dir):
         point = f"arrive_and_wait:{arrived_w}:{release_r}"
         server = start_server(
             work_dir, "sync",
-            extra_env={"LINEAIRDB_DEBUG_SYNC_WAL_BEFORE_FDATASYNC": point},
+            extra_env={"HELIOS_DEBUG_SYNC_WAL_BEFORE_FDATASYNC": point},
             pass_fds=(arrived_w, release_r))
         start_mysqld()
 
@@ -263,7 +263,7 @@ def test_acknowledged_rows_survive_a_process_crash(work_dir):
             acknowledged.append(row)
         log(f"acknowledged rows: {acknowledged}")
 
-        wal = os.path.join(work_dir, "lineairdb_logs", "wal.log")
+        wal = os.path.join(work_dir, "helios_wal", "wal.log")
         size_before = os.path.getsize(wal)
 
         # SIGKILL, not shutdown: a clean stop would flush and prove nothing.
@@ -304,7 +304,7 @@ def test_a_failed_fdatasync_is_never_acknowledged(work_dir):
         # first group is the one the INSERT below produces.
         server = start_server(
             work_dir, "sync",
-            extra_env={"LINEAIRDB_WAL_FDATASYNC_FAIL_AFTER": "0"})
+            extra_env={"HELIOS_WAL_FDATASYNC_FAIL_AFTER": "0"})
         start_mysqld()
         sql("CREATE DATABASE IF NOT EXISTS dur;")
         sql("USE dur; DROP TABLE IF EXISTS failed_sync;"

@@ -7,7 +7,7 @@ import mysql.connector
 from utils.connection import get_connection
 
 
-DBNAME = f"ha_lineairdb_prefetch_index_tail_{int(time.time())}"
+DBNAME = f"ha_lineairdb_index_tail_{int(time.time())}"
 
 # The staged tail window is INDEX_CURSOR_READ_AHEAD_SIZE (1024) rows; use a
 # table larger than one window so window-boundary behavior is exercised.
@@ -46,14 +46,14 @@ def load_rows(cursor, db, n):
     return name
 
 
-def stmt_prefetch_on(cursor):
-    # Statement-scoped autogen prefetch: prefetch ON, no @_tx_plan.
-    cursor.execute("SET GLOBAL lineairdb_prefetch_execution=ON")
+def read_path_plan(cursor):
+    # Statement-scoped autogen: plan read path, no @_tx_plan.
+    cursor.execute("SET GLOBAL lineairdb_read_path='plan'")
     cursor.execute("SET @_tx_plan=NULL")
 
 
-def prefetch_off(cursor):
-    cursor.execute("SET GLOBAL lineairdb_prefetch_execution=OFF")
+def read_path_row(cursor):
+    cursor.execute("SET GLOBAL lineairdb_read_path='row'")
 
 
 def recover(cursor):
@@ -63,10 +63,10 @@ def recover(cursor):
         pass
 
 
-def test_max_under_stmt_prefetch(cursor, db):
-    print("PREFETCH INDEX TAIL: MAX under stmt-scoped prefetch")
+def test_max_under_stmt_plan(cursor, db):
+    print("INDEX TAIL: MAX under a statement-scoped plan")
     t = load_rows(cursor, db, ROWS)
-    stmt_prefetch_on(cursor)
+    read_path_plan(cursor)
     cursor.execute(f"SELECT MAX(id) FROM {t}")
     got = cursor.fetchone()[0]
     if got != ROWS:
@@ -85,8 +85,8 @@ def test_max_under_stmt_prefetch(cursor, db):
 
 
 def test_max_small_and_empty(cursor, db):
-    print("PREFETCH INDEX TAIL: MAX on small and empty tables")
-    stmt_prefetch_on(cursor)
+    print("INDEX TAIL: MAX on small and empty tables")
+    read_path_plan(cursor)
     t = load_rows(cursor, db, 0)
     cursor.execute(f"SELECT MAX(id) FROM {t}")
     if cursor.fetchone()[0] is not None:
@@ -104,9 +104,9 @@ def test_max_small_and_empty(cursor, db):
 
 def test_desc_limit_within_window(cursor, db):
     # This shape works under the staged tail window and must succeed.
-    print("PREFETCH INDEX TAIL: ORDER BY pk DESC LIMIT within window")
+    print("INDEX TAIL: ORDER BY pk DESC LIMIT within window")
     t = load_rows(cursor, db, ROWS)
-    stmt_prefetch_on(cursor)
+    read_path_plan(cursor)
     cursor.execute(f"SELECT id FROM {t} ORDER BY id DESC LIMIT 5")
     got = [r[0] for r in cursor.fetchall()]
     want = list(range(ROWS, ROWS - 5, -1))
@@ -117,54 +117,34 @@ def test_desc_limit_within_window(cursor, db):
     return 0
 
 
-ER_NOT_SUPPORTED_YET = 1235
 
-
-def test_desc_walk_past_window_never_silent(cursor, db):
+def test_desc_walk_past_window(cursor, db):
     # A derived-table COUNT would let the optimizer drop the ORDER BY and
     # bypass index_last; force the backward index walk so the read really
-    # runs off the staged tail window.
-    print("PREFETCH INDEX TAIL: full DESC walk past window is loud or correct")
+    # runs off the staged tail window and continues from the server.
+    print("INDEX TAIL: full DESC walk past the staged window")
     t = load_rows(cursor, db, ROWS)
-    stmt_prefetch_on(cursor)
-    try:
-        cursor.execute(f"SELECT id FROM {t} FORCE INDEX(PRIMARY) "
-                       "ORDER BY id DESC")
-        got = [r[0] for r in cursor.fetchall()]
-    except mysql.connector.Error as e:
-        recover(cursor)
-        if e.errno != ER_NOT_SUPPORTED_YET:
-            print(f"\tFAILED: unexpected error {e.errno}: {e}")
-            return 1
-        print(f"\tPassed (loud reject: {e.errno})")
-        return 0
+    read_path_plan(cursor)
+    cursor.execute(f"SELECT id FROM {t} FORCE INDEX(PRIMARY) ORDER BY id DESC")
+    got = [r[0] for r in cursor.fetchall()]
     if got != list(range(ROWS, 0, -1)):
-        print(f"\tFAILED: silent truncation, got {len(got)} rows, want {ROWS}")
+        print(f"\tFAILED: got {len(got)} rows, want {ROWS}")
         return 1
     print("\tPassed!")
     return 0
 
 
 def test_own_write_then_max_never_stale(cursor, db):
-    print("PREFETCH INDEX TAIL: in-tx INSERT then MAX is loud or correct")
+    print("INDEX TAIL: in-tx INSERT then MAX sees the new row")
     t = load_rows(cursor, db, ROWS)
-    stmt_prefetch_on(cursor)
+    read_path_plan(cursor)
     cursor.execute("START TRANSACTION")
     cursor.execute(f"INSERT INTO {t} VALUES ({ROWS + 1},0)")
-    failed = None
-    try:
-        cursor.execute(f"SELECT MAX(id) FROM {t}")
-        got = cursor.fetchone()[0]
-        if got != ROWS + 1:
-            failed = f"stale MAX(id) = {got}, want {ROWS + 1} or a loud reject"
-    except mysql.connector.Error as e:
-        if e.errno != ER_NOT_SUPPORTED_YET:
-            failed = f"unexpected error {e.errno}: {e}"
-        else:
-            print(f"\tloud reject mid-tx: {e.errno}")
+    cursor.execute(f"SELECT MAX(id) FROM {t}")
+    got = cursor.fetchone()[0]
     recover(cursor)
-    if failed is not None:
-        print(f"\tFAILED: {failed}")
+    if got != ROWS + 1:
+        print(f"\tFAILED: MAX(id) = {got}, want {ROWS + 1}")
         return 1
     print("\tPassed!")
     return 0
@@ -172,8 +152,8 @@ def test_own_write_then_max_never_stale(cursor, db):
 
 def test_window_boundaries(cursor, db):
     # INDEX_CURSOR_READ_AHEAD_SIZE is 1024; MAX must be right at 1, K-1, K, K+1.
-    print("PREFETCH INDEX TAIL: MAX at window-size boundaries")
-    stmt_prefetch_on(cursor)
+    print("INDEX TAIL: MAX at window-size boundaries")
+    read_path_plan(cursor)
     for n in (1, 1023, 1024, 1025):
         t = load_rows(cursor, db, n)
         cursor.execute(f"SELECT MAX(id) FROM {t}")
@@ -187,14 +167,11 @@ def test_window_boundaries(cursor, db):
 
 def test_all_tombstone(cursor, db):
     # The staged tail scan skips tombstones server-side; MAX must be NULL.
-    print("PREFETCH INDEX TAIL: MAX after deleting every row")
+    print("INDEX TAIL: MAX after deleting every row")
     t = load_rows(cursor, db, 200)
-    # A key-less DELETE is a full table scan, which stmt-prefetch rejects by
-    # design; run the cleanup in baseline mode, then query under prefetch.
-    prefetch_off(cursor)
+    read_path_plan(cursor)
     cursor.execute(f"DELETE FROM {t}")
     db.commit()
-    stmt_prefetch_on(cursor)
     cursor.execute(f"SELECT MAX(id) FROM {t}")
     got = cursor.fetchone()[0]
     if got is not None:
@@ -205,34 +182,24 @@ def test_all_tombstone(cursor, db):
 
 
 def test_exact_window_full_desc_walk(cursor, db):
-    # Exactly K live rows: a full backward walk cannot distinguish true EOF
-    # from window overrun (documented limitation), so a loud reject is
-    # acceptable; silent truncation is not.
-    print("PREFETCH INDEX TAIL: exactly-K full DESC walk is loud or correct")
+    # Exactly one window of live rows: the walk continues past it and ends at
+    # a true EOF.
+    print("INDEX TAIL: exactly-K full DESC walk")
     t = load_rows(cursor, db, 1024)
-    stmt_prefetch_on(cursor)
-    try:
-        cursor.execute(f"SELECT id FROM {t} FORCE INDEX(PRIMARY) "
-                       "ORDER BY id DESC")
-        got = [r[0] for r in cursor.fetchall()]
-    except mysql.connector.Error as e:
-        recover(cursor)
-        if e.errno != ER_NOT_SUPPORTED_YET:
-            print(f"\tFAILED: unexpected error {e.errno}: {e}")
-            return 1
-        print(f"\tPassed (loud reject: {e.errno})")
-        return 0
+    read_path_plan(cursor)
+    cursor.execute(f"SELECT id FROM {t} FORCE INDEX(PRIMARY) ORDER BY id DESC")
+    got = [r[0] for r in cursor.fetchall()]
     if got != list(range(1024, 0, -1)):
-        print(f"\tFAILED: silent truncation, got {len(got)} rows, want 1024")
+        print(f"\tFAILED: got {len(got)} rows, want 1024")
         return 1
     print("\tPassed!")
     return 0
 
 
 def test_baseline_regression(cursor, db):
-    print("PREFETCH INDEX TAIL: baseline (prefetch OFF) MAX still works")
+    print("INDEX TAIL: MAX on the row read path")
     t = load_rows(cursor, db, ROWS)
-    prefetch_off(cursor)
+    read_path_row(cursor)
     cursor.execute(f"SELECT MAX(id) FROM {t}")
     got = cursor.fetchone()[0]
     if got != ROWS:
@@ -243,10 +210,10 @@ def test_baseline_regression(cursor, db):
 
 
 TESTS = [
-    test_max_under_stmt_prefetch,
+    test_max_under_stmt_plan,
     test_max_small_and_empty,
     test_desc_limit_within_window,
-    test_desc_walk_past_window_never_silent,
+    test_desc_walk_past_window,
     test_own_write_then_max_never_stale,
     test_window_boundaries,
     test_all_tombstone,
@@ -283,7 +250,7 @@ def main():
     try:
         db2 = get_connection(user=args.user, password=args.password)
         c2 = db2.cursor()
-        c2.execute("SET GLOBAL lineairdb_prefetch_execution=OFF")
+        c2.execute("SET GLOBAL lineairdb_read_path='plan'")
         c2.execute(f"DROP DATABASE IF EXISTS {DBNAME}")
         db2.commit()
         db2.close()

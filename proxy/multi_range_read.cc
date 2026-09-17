@@ -11,13 +11,6 @@
 // point lookups into one LineairDB RPC; unsupported ranges fall back to MySQL's
 // default DS-MRR implementation.
 
-// True only for MySQL's standard forward index-range sequence. Reverse ranges
-// and BKA callbacks do not match the forward-staged prefetch cache.
-static bool lineairdb_is_forward_index_range_sequence(RANGE_SEQ_IF *seq) {
-  extern range_seq_t quick_range_seq_init(void *, uint, uint);
-  return seq != nullptr && seq->init == quick_range_seq_init;
-}
-
 ha_rows ha_lineairdb::multi_range_read_info_const(
     uint keyno, RANGE_SEQ_IF *seq, void *seq_init_param, uint n_ranges,
     uint *bufsz, uint *flags, bool *force_default_mrr, Cost_estimate *cost) {
@@ -26,8 +19,8 @@ ha_rows ha_lineairdb::multi_range_read_info_const(
       cost);
   if (rows == HA_POS_ERROR) return rows;
 
-  // Custom batch MRR only in batched mode; prefetch serves reads from the cache.
-  if (!predict_prefetch_mode(ha_thd()) && keyno == table->s->primary_key) {
+  // Custom batch MRR only on the row path; a staged plan already holds the rows.
+  if (!statement_uses_read_plan(ha_thd()) && keyno == table->s->primary_key) {
     *flags &= ~HA_MRR_USE_DEFAULT_IMPL;
     *bufsz = 0;
     if (cost) {
@@ -44,8 +37,8 @@ ha_rows ha_lineairdb::multi_range_read_info(uint keyno, uint n_ranges,
                                             Cost_estimate *cost) {
   ha_rows rows = handler::multi_range_read_info(keyno, n_ranges, keys, bufsz,
                                                 flags, cost);
-  // Custom batch MRR only in batched mode; prefetch serves reads from the cache.
-  if (!predict_prefetch_mode(ha_thd()) && keyno == table->s->primary_key) {
+  // Custom batch MRR only on the row path; a staged plan already holds the rows.
+  if (!statement_uses_read_plan(ha_thd()) && keyno == table->s->primary_key) {
     *flags &= ~HA_MRR_USE_DEFAULT_IMPL;
     *bufsz = 0;
     if (cost) {
@@ -64,29 +57,13 @@ int ha_lineairdb::multi_range_read_init(RANGE_SEQ_IF *seq, void *seq_init_param,
     return abort_errno(tx);
   }
 
-  // Prefetch never uses the custom batch path: the staging RPC already holds the
-  // rows, so default MRR (read_range_first -> index_read_map) consumes the cache.
-  if (tx->is_prefetch_mode()) {
-    if (!(mode & HA_MRR_USE_DEFAULT_IMPL)) {
-      // Custom MRR is not advertised under prefetch, so native MRR reaching here
-      // is a shape the staged cache cannot serve.
-      return prefetch_reject_unsupported(ha_thd(), tx,
-                                         "native MRR under prefetch");
-    }
-    const bool legacy_dml = prefetch_needs_legacy_dml_handler(ha_thd(), tx);
-    // Statement-scoped autogen stages a single forward range per statement.
-    if (!tx->tx_plan_used()) {
-      if (n_ranges != 1) {
-        return prefetch_reject_unsupported(ha_thd(), tx, "MRR multi-range scan");
-      }
-      if (!lineairdb_is_forward_index_range_sequence(seq)) {
-        return prefetch_reject_unsupported(ha_thd(), tx,
-                                           "MRR reverse or non-standard range");
-      }
-    }
+  // The plan path does not use the custom batch path: default MRR
+  // (read_range_first -> index_read_map) consumes the staged rows, and a range
+  // no plan covers goes to the storage server there.
+  if (statement_uses_read_plan(ha_thd())) {
     // Legacy single-table DML has no QEP plan. Default DS-MRR reaches
     // read_range_first()->index_read_map(), where the complete bounds exist.
-    if (!legacy_dml) {
+    if (!prefetch_needs_legacy_dml_handler(ha_thd(), tx)) {
       if (int err = maybe_prefetch_for_statement(ha_thd(), tx, table))
         return err;
     }

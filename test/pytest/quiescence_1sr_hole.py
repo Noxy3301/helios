@@ -10,10 +10,10 @@ resolution instead, and this test demands consistent results.
 
 The test opens the install window wide and synchronizes on it instead of
 racing:
-  - lineairdb-server runs with the stateless_commit and silo_commit
-    between_row_installs debug sync points set to sleep, so either commit
-    path's install loop stays open between consecutive row installs (see
-    LineairDB util/debug_sync.hpp)
+  - lineairdb-server runs with the silo_commit between_row_installs debug
+    sync point set to sleep, so the install loop stays open between
+    consecutive row installs; every commit path goes through it (see
+    server/storage/src/util/debug_sync.h)
   - FORCED SELECTs take the columnar offload through the bridge, the only
     columnar executor
   - a writer thread signals right before COMMIT of a two-row-install
@@ -59,16 +59,12 @@ PAUSE_MS = 1500
 # its epoch fence and its scan; shorter than PAUSE_MS so the held read
 # finishes while the writer's paused COMMIT is still in flight.
 FENCE_HOLD_MS = 1000
-# Both commit paths carry the install pause: prefetch transactions install
-# through the stateless commit, while transactions with statements outside
-# the prefetch shapes (the INSERT scenario) install through the native
-# Silo path.
+# One point carries the install pause: every transaction installs through the
+# same silo commit.
 SYNC_POINT_ENV = (
-    "LINEAIRDB_DEBUG_SYNC_STATELESS_COMMIT_BETWEEN_ROW_INSTALLS"
+    "HELIOS_DEBUG_SYNC_SILO_COMMIT_BETWEEN_ROW_INSTALLS"
     f"=sleep:{PAUSE_MS} "
-    "LINEAIRDB_DEBUG_SYNC_SILO_COMMIT_BETWEEN_ROW_INSTALLS"
-    f"=sleep:{PAUSE_MS} "
-    "LINEAIRDB_DEBUG_SYNC_PAX_READ_VIEW_AFTER_FENCE"
+    "HELIOS_DEBUG_SYNC_PAX_VIEW_AFTER_FENCE"
     f"=sleep:{FENCE_HOLD_MS}")
 
 # The bridge resolves tables through the statement's own resolved
@@ -159,9 +155,8 @@ def secondary_execution_count(cursor):
 class Writer(threading.Thread):
     """BEGIN; two point statements; COMMIT - one txn with two row installs.
 
-    UPDATE/DELETE point statements commit through the stateless (prefetch)
-    path; a transaction containing an INSERT commits through the native
-    silo path. Both install loops carry a between-row-installs sync point.
+    Every transaction installs through the silo commit, whose install loop
+    carries the between-row-installs sync point.
     commit_started is set immediately before COMMIT is issued;
     commit_done_at is stamped when it returns.
     """
@@ -320,7 +315,7 @@ def run_scenario(cursor, user, password, scenario):
 class Reader(threading.Thread):
     """One FORCED SELECT on its own connection, with result and end stamp.
 
-    The armed pax_read_view.after_fence point holds the SELECT open between
+    The armed pax_view.after_fence point holds the SELECT open between
     its epoch fence and its scan, so writes committed meanwhile land with
     epochs above the read view's cut.
     """
@@ -458,9 +453,7 @@ def run_probe(user, password):
         cursor = db.cursor()
 
         print("SETUP")
-        # The sync point sits in the stateless (prefetch) commit's install
-        # loop; route writes through it.
-        cursor.execute("SET GLOBAL lineairdb_prefetch_execution = ON")
+        cursor.execute("SET GLOBAL lineairdb_read_path = 'plan'")
         cursor.execute(f"DROP DATABASE IF EXISTS {DB}")
         cursor.execute(f"CREATE DATABASE {DB}")
         cursor.execute(f"USE {DB}")

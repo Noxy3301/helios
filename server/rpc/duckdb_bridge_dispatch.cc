@@ -22,7 +22,7 @@ void LineairDBRpc::handleTxExecuteDuckdbQuery(const std::string& message,
         return;
     }
 
-    std::shared_ptr<LineairDB::Database> db =
+    std::shared_ptr<helios::storage::Database> db =
         db_manager_ ? db_manager_->get_database() : nullptr;
     if (!db) {
         response.set_ok(false);

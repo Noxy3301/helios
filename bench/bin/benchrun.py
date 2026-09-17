@@ -44,6 +44,7 @@ LINEAIRDB_CTL = ROOT / "build" / "server" / "lineairdb-ctl"
 # The kernel truncates the process name to 15 characters
 SERVER_COMM = "lineairdb-serve"
 LINEAIRDB_LOG_DIR = ROOT / "lineairdb_logs"
+HELIOS_WAL_DIR = ROOT / "helios_wal"  # the storage's work directory
 
 YCSB_PROFILES = {
     "a": "50,0,0,50,0,0",
@@ -195,8 +196,8 @@ def stop_all_servers():
 
 
 def cleanup_lineairdb_logs():
-    """Remove local LineairDB log files after managed benchmark runs."""
-    if not LINEAIRDB_LOG_DIR.exists():
+    """Remove the server logs and the storage's work directory after managed benchmark runs."""
+    if not LINEAIRDB_LOG_DIR.exists() and not HELIOS_WAL_DIR.exists():
         return
 
     # Match start_lineairdb_server()'s reuse predicate (port) and catch a
@@ -207,7 +208,10 @@ def cleanup_lineairdb_logs():
         return
 
     removed = 0
-    for path in LINEAIRDB_LOG_DIR.iterdir():
+    if HELIOS_WAL_DIR.exists():
+        shutil.rmtree(HELIOS_WAL_DIR)
+        removed += 1
+    for path in LINEAIRDB_LOG_DIR.iterdir() if LINEAIRDB_LOG_DIR.exists() else []:
         try:
             if path.is_dir() and not path.is_symlink():
                 shutil.rmtree(path)
@@ -274,7 +278,7 @@ def _benchbase_plugin(benchmark):
     return "tpcc" if benchmark == "tpcc-np" else benchmark
 
 
-def run_benchbase(benchmark, config_path, create=False, load=False, execute=False, prefetch=False):
+def run_benchbase(benchmark, config_path, create=False, load=False, execute=False, tx_plan=False):
     """Run BenchBase with given phases."""
     jar = BENCHBASE_DIR / "benchbase.jar"
     if not jar.exists():
@@ -284,7 +288,7 @@ def run_benchbase(benchmark, config_path, create=False, load=False, execute=Fals
     flags = f"--create={'true' if create else 'false'} --load={'true' if load else 'false'} --execute={'true' if execute else 'false'}"
     cmd = f"java -jar {jar} -b {_benchbase_plugin(benchmark)} -c {config_path} {flags}"
 
-    env = {**os.environ, "HELIOS_PREFETCH_PLAN": "1"} if prefetch else None
+    env = {**os.environ, "HELIOS_PREFETCH_PLAN": "1"} if tx_plan else None
     result = subprocess.run(
         cmd, shell=True, cwd=BENCHBASE_DIR,
         capture_output=True, text=True, env=env,
@@ -406,9 +410,9 @@ def _stop_metrics(samplers):
 
 def run_analyze(benchmark, mysql_host, mysql_port):
     """Refresh optimizer statistics with ANALYZE TABLE."""
-    # Tx-scoped prefetch requires MySQL's chosen plan to match the @_tx_plan
-    # DSL; without fresh stats MySQL can pick PRIMARY where the DSL expects a
-    # secondary index and retry forever, so those runs analyze automatically.
+    # The @_tx_plan DSL requires MySQL's chosen plan to match it; without fresh
+    # stats MySQL can pick PRIMARY where the DSL expects a secondary index and
+    # retry forever, so those runs analyze automatically.
     analyze_sql = {
         "tpcc":   "ANALYZE TABLE customer, district, history, item, new_order, oorder, order_line, stock, warehouse;",
         "tpcc-np": "ANALYZE TABLE customer, district, history, item, new_order, oorder, order_line, stock, warehouse;",
@@ -540,7 +544,7 @@ def attach_secondary(benchmark, mysql_host, mysql_port):
                      f"{result.stdout.strip()[-200:]}")
 
 
-def run_execute(benchmark, config_path, terminals, result_base, prefetch=False):
+def run_execute(benchmark, config_path, terminals, result_base, tx_plan=False):
     """Run execute phase with metrics collection. Returns result dict."""
     print(f"\n{'='*50}")
     print(f"  {benchmark.upper()} | Terminals: {terminals}")
@@ -565,7 +569,7 @@ def run_execute(benchmark, config_path, terminals, result_base, prefetch=False):
     jar = BENCHBASE_DIR / "benchbase.jar"
     bb_cmd = ["java", "-jar", str(jar), "-b", _benchbase_plugin(benchmark), "-c", str(config_path),
               "--create=false", "--load=false", "--execute=true"]
-    env = {**os.environ, "HELIOS_PREFETCH_PLAN": "1"} if prefetch else None
+    env = {**os.environ, "HELIOS_PREFETCH_PLAN": "1"} if tx_plan else None
     bb_proc = subprocess.Popen(bb_cmd, cwd=BENCHBASE_DIR, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env)
     # bb_proc.pid IS the java process (no shell wrapper)
     f = open(metrics_dir / "pidstat-bench.log", "w")
@@ -872,18 +876,18 @@ def main():
     parser.add_argument("--no-load", action="store_true", help="Run setup with CREATE only, skip LOAD")
     parser.add_argument("--no-exec", action="store_true", help="Run setup only, skip execute phase")
     parser.add_argument("--analyze", action="store_true",
-                        help="Run ANALYZE TABLE after load (automatic for tx-scoped --prefetch runs)")
+                        help="Run ANALYZE TABLE after load (automatic for --tx-plan runs)")
     parser.add_argument("--external-server", action="store_true",
                         help="Skip auto start/stop of lineairdb-server and mysqld (assume already running)")
     parser.add_argument("--keep-lineairdb-logs", action="store_true",
                         help="Keep lineairdb_logs after the benchmark")
-    parser.add_argument("--prefetch", action="store_true",
-                        help="Enable Prefetch path: SET GLOBAL lineairdb_prefetch_execution=ON and "
-                             "pass HELIOS_PREFETCH_PLAN=1 to BenchBase (TPC-C procedures inject @_tx_plan)")
-    parser.add_argument("--prefetch-stmt", action="store_true",
-                        help="Statement-scoped autogen prefetch: SET GLOBAL lineairdb_prefetch_execution=ON "
-                             "WITHOUT HELIOS_PREFETCH_PLAN, so the proxy derives a per-statement read plan "
-                             "from the QEP instead of the injected @_tx_plan DSL")
+    parser.add_argument("--read-path", choices=["row", "plan"], default="plan",
+                        help="SET GLOBAL lineairdb_read_path: row sends one request per handler "
+                             "read, plan stages what it can in one request (default)")
+    parser.add_argument("--tx-plan", action="store_true",
+                        help="Pass HELIOS_PREFETCH_PLAN=1 to BenchBase so the TPC-C procedures "
+                             "inject @_tx_plan, instead of the per-statement plan the proxy "
+                             "derives from the QEP")
     args = parser.parse_args()
 
     # Validate
@@ -1066,16 +1070,15 @@ def main():
 
 def _run_bench(args, config_work, thread_list, result_base):
     """Setup + execute sweep + summary + plots. Extracted so main() can wrap it."""
-    # Toggle Prefetch sysvar explicitly to avoid stale state from prior runs.
-    # The master sysvar is per-mysqld and volatile, so set it on every endpoint
-    # and fail fast: an endpoint left on the wrong mode corrupts the run.
-    prefetch_value = "ON" if (args.prefetch or args.prefetch_stmt) else "OFF"
-    print(f"  Setting lineairdb_prefetch_execution={prefetch_value}")
+    # Set the read path explicitly to avoid stale state from prior runs. The
+    # sysvar is per-mysqld and volatile, so set it on every endpoint and fail
+    # fast: an endpoint left on the wrong path corrupts the run.
+    print(f"  Setting lineairdb_read_path={args.read_path}")
     for host, port in args.mysql_endpoints:
         result = mysql_cmd(port, host,
-                           f"SET GLOBAL lineairdb_prefetch_execution={prefetch_value};")
+                           f"SET GLOBAL lineairdb_read_path='{args.read_path}';")
         if result.returncode != 0:
-            sys.exit(f"Failed to set lineairdb_prefetch_execution on {host}:{port}")
+            sys.exit(f"Failed to set lineairdb_read_path on {host}:{port}")
 
     # Setup phase
     load_time = None
@@ -1108,7 +1111,7 @@ def _run_bench(args, config_work, thread_list, result_base):
             f"load_mode=async\nmeasured_mode=sync\nswitch_seconds={elapsed:.2f}\n")
 
     # A separate step so staged runs (--no-setup, --no-load) still get it.
-    if args.analyze or args.prefetch:
+    if args.analyze or args.tx_plan:
         run_analyze(args.benchmark, args.mysql_host, args.mysql_port)
 
     if args.no_exec:
@@ -1124,7 +1127,7 @@ def _run_bench(args, config_work, thread_list, result_base):
     # Execute: sweep terminal counts (data is reused)
     all_results = []
     for terminals in thread_list:
-        result = run_execute(args.benchmark, config_work, terminals, result_base, prefetch=args.prefetch)
+        result = run_execute(args.benchmark, config_work, terminals, result_base, tx_plan=args.tx_plan)
         if result:
             result["load_time"] = load_time
             all_results.append(result)

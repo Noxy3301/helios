@@ -1,5 +1,7 @@
 #include "lineairdb_autogen.hh"
 
+#include "../common/log.h"
+
 #include <algorithm>
 #include <cstdint>
 #include <limits>
@@ -89,8 +91,10 @@ const char *access_path_type_name(AccessPath::Type type) {
   return "UNKNOWN";
 }
 
-bool raise_unsupported(THD *thd, const char *type_name,
-                       const std::string &reason) {
+// Report a shape with no read plan. Not an error: the statement's reads take
+// the row path instead. Always returns false so callers can return it.
+bool plan_not_staged(THD *thd, const char *type_name,
+                     const std::string &reason) {
   const LEX_CSTRING query = thd != nullptr ? thd->query() : LEX_CSTRING();
   const std::string sql =
       query.str != nullptr && query.length > 0
@@ -98,22 +102,15 @@ bool raise_unsupported(THD *thd, const char *type_name,
           : std::string();
   const long long query_id = thd != nullptr ? thd->query_id : 0;
 
-  std::string msg = "LineairDB autogen read plan unsupported: type=";
-  msg += type_name != nullptr ? type_name : "UNKNOWN";
-  msg += " reason=";
-  msg += reason;
-  msg += " query_id=";
-  msg += std::to_string(query_id);
-  msg += " sql=";
-  msg += sql;
-
-  my_error(ER_NOT_SUPPORTED_YET, MYF(0), msg.c_str());
+  LOG_DEBUG("autogen read plan not staged: type=%s reason=%s query_id=%lld sql=%s",
+            type_name != nullptr ? type_name : "UNKNOWN", reason.c_str(),
+            query_id, sql.c_str());
   return false;
 }
 
-bool raise_unsupported(THD *thd, AccessPath::Type type,
-                       const std::string &reason) {
-  return raise_unsupported(thd, access_path_type_name(type), reason);
+bool plan_not_staged(THD *thd, AccessPath::Type type,
+                     const std::string &reason) {
+  return plan_not_staged(thd, access_path_type_name(type), reason);
 }
 
 void set_unsupported(AccessPath *p, const char *reason, bool *ok,
@@ -1168,12 +1165,12 @@ bool autogen_read_plan_from_qep(
     std::vector<LineairDBProxy::ReadPlanStep> *out,
     bool include_inner_units) {
   if (out == nullptr) {
-    return raise_unsupported(thd, "NONE", "null output vector");
+    return plan_not_staged(thd, "NONE", "null output vector");
   }
   out->clear();
 
   if (root == nullptr) {
-    return raise_unsupported(thd, "NONE", "missing JOIN root_access_path");
+    return plan_not_staged(thd, "NONE", "missing JOIN root_access_path");
   }
 
   std::unordered_map<TABLE *, int> table_steps;
@@ -1184,7 +1181,7 @@ bool autogen_read_plan_from_qep(
   if (!compile_tree_leaves(thd, root, /*allow_limit_pushdown=*/true,
                            &table_steps, &steps,
                            &added_tables, &unsupported)) {
-    return raise_unsupported(thd, unsupported.type, unsupported.reason);
+    return plan_not_staged(thd, unsupported.type, unsupported.reason);
   }
 
   if (include_inner_units && thd != nullptr && thd->lex != nullptr) {
@@ -1212,7 +1209,7 @@ bool autogen_read_plan_from_qep(
   }
 
   if (steps.empty()) {
-    return raise_unsupported(thd, root->type, "QEP has no stageable leaves");
+    return plan_not_staged(thd, root->type, "QEP has no stageable leaves");
   }
 
   // SharedScan dedup: fold byte-identical staged steps into one -- (a)
@@ -1299,20 +1296,20 @@ bool autogen_read_plan_from_qep(
   return true;
 }
 
-// Produce a one-step prefetch plan from the handler access, raising
-// ER_NOT_SUPPORTED on an unsupported shape.
+// Produce a one-step read plan from the handler access; a shape it cannot
+// stage returns false and its reads take the row path.
 bool autogen_read_plan_from_index_search(
     THD *thd, TABLE *table, uint index, const IndexSearchPlan &search,
     std::vector<LineairDBProxy::ReadPlanStep> *out) {
   if (out == nullptr) {
-    return raise_unsupported(thd, "HANDLER", "null output vector");
+    return plan_not_staged(thd, "HANDLER", "null output vector");
   }
   out->clear();
 
   LineairDBProxy::ReadPlanStep step;
   std::string reason;
   if (!compile_index_search(table, index, search, &step, &reason)) {
-    return raise_unsupported(thd, "HANDLER", reason);
+    return plan_not_staged(thd, "HANDLER", reason);
   }
 
   out->push_back(std::move(step));

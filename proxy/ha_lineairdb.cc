@@ -129,12 +129,11 @@
 #include "typelib.h"
 
 #define BLOB_MEMROOT_ALLOC_SIZE (8192)
-#define FENCE false
 
 // LineairDB server connection target (GLOBAL sysvars backing storage)
 static char *srv_server_host = nullptr;
 static ulong srv_server_port = 9999;
-static bool srv_prefetch_execution = false;
+ulong srv_read_path = kReadPathPlan;
 bool srv_stats_drift_refresh = false;
 handlerton *lineairdb_hton;
 
@@ -365,6 +364,8 @@ int ha_lineairdb::reset() {
   // would size the next statement's reservation.
   bulk_insert_rows_ = 0;
   bulk_insert_generated_ = 0;
+  bulk_insert_active_ = false;
+  insert_probe_keys_.clear();
   return 0;
 }
 
@@ -372,20 +373,30 @@ void ha_lineairdb::start_bulk_insert(ha_rows rows) {
   DBUG_TRACE;
   bulk_insert_rows_ = rows;
   bulk_insert_generated_ = 0;
+  bulk_insert_active_ = true;
+  insert_probe_keys_.clear();
 }
 
 int ha_lineairdb::end_bulk_insert() {
   DBUG_TRACE;
   bulk_insert_rows_ = 0;
   bulk_insert_generated_ = 0;
+  bulk_insert_active_ = false;
 
   auto *tx = active_transaction(ha_thd());
-  if (tx == nullptr) return 0;
-  // An abort a mid-statement flush already recorded is still this statement's
-  // to report, so it is not enough that nothing is left to send.
-  if (!tx->has_pending_writes() && !tx->is_aborted()) return 0;
+  if (tx == nullptr) {
+    insert_probe_keys_.clear();
+    return 0;
+  }
 
-  tx->flush_write_buffer();
+  // ER_DUP_ENTRY is the statement's to report, and this is its last chance.
+  if (!tx->is_aborted()) {
+    if (const int error = flush_insert_probe(tx); error != 0) {
+      set_my_errno(error);
+      return error;
+    }
+  }
+  insert_probe_keys_.clear();
   if (!tx->is_aborted()) return 0;
 
   const int error = abort_errno(tx);
@@ -447,12 +458,6 @@ int ha_lineairdb::external_lock(THD *thd, int lock_type) {
     // Drop the predicate pushed by cond_push() so the next statement starts clean.
     pushed_filter_serialized_.clear();
     has_unpushed_filter_ = false;
-    LineairDBThdCtx **ctx_slot = reinterpret_cast<LineairDBThdCtx **>(
-        thd_ha_data(thd, lineairdb_hton));
-    if (ctx_slot != nullptr && *ctx_slot != nullptr &&
-        (*ctx_slot)->tx != nullptr) {
-      (*ctx_slot)->tx->clear_pushed_filter();
-    }
     return 0;
   }
 
@@ -500,10 +505,10 @@ LineairDBTransaction *ha_lineairdb::active_transaction(THD *thd) const {
   return (ctx != nullptr) ? ctx->tx : nullptr;
 }
 
-LineairDBTransaction *ha_lineairdb::new_transaction(THD *thd, bool fence) {
+LineairDBTransaction *ha_lineairdb::new_transaction(THD *thd) {
   if (thd == nullptr) return nullptr;
   userThread = thd;
-  return new LineairDBTransaction(thd, get_proxy(), lineairdb_hton, fence);
+  return new LineairDBTransaction(thd, get_proxy(), lineairdb_hton);
 }
 
 /**
@@ -526,16 +531,7 @@ LineairDBTransaction *&ha_lineairdb::get_transaction(THD *thd) {
   LineairDBThdCtx *&ctx = lineairdb_thd_ctx(thd, lineairdb_hton);
   ensure_lineairdb_proxy(ctx);
   if (ctx->tx == nullptr) {
-    ctx->tx =
-        new LineairDBTransaction(thd, ctx->proxy.get(), lineairdb_hton, FENCE);
-    // Prefetch protocol is fixed for the transaction: enabled whenever the
-    // sysvar is on and the first statement is prefetch-eligible. Whether a plan
-    // is actually staged is decided per statement: an injected @_tx_plan
-    // at begin (tx-scoped), else statement-scoped autogen at
-    // rnd_init / index_read.
-    const bool can_use_prefetch =
-        (srv_prefetch_execution && thd_can_use_prefetch(thd));
-    ctx->tx->set_prefetch_mode(can_use_prefetch);
+    ctx->tx = new LineairDBTransaction(thd, ctx->proxy.get(), lineairdb_hton);
   }
   if (ctx->tx->is_not_started()) {
     ctx->tx->begin_transaction();
@@ -549,11 +545,6 @@ int ha_lineairdb::abort_errno(LineairDBTransaction *tx,
   if (tx != nullptr && tx->has_transport_error()) {
     thd_mark_transaction_to_rollback(ha_thd(), 1);
     return HA_ERR_NO_CONNECTION;
-  }
-  // A prefetch cache miss is an unsupported access shape, not contention, so
-  // reject it non-retryably -- retrying the same read cannot make it hit.
-  if (tx != nullptr && tx->aborted_by_cache_miss()) {
-    return prefetch_reject_unsupported(ha_thd(), tx, "prefetch cache miss");
   }
   // A refused key is permanent; print_error asks which key through
   // info(HA_STATUS_ERRKEY). The refusal ends the whole transaction (no
@@ -577,7 +568,7 @@ static int lineairdb_commit(handlerton *hton, THD *thd, bool all) {
   LineairDBThdCtx *&ctx =
       *reinterpret_cast<LineairDBThdCtx **>(thd_ha_data(thd, hton));
 
-  // 参加していない（このエンジンのトランザクションが無い）場合は noop
+  // Nothing to commit when this engine took no part in the transaction.
   if (ctx == nullptr || ctx->tx == nullptr)
     return 0;
 
@@ -611,7 +602,7 @@ static int lineairdb_abort(handlerton *hton, THD *thd, bool) {
   LineairDBThdCtx *&ctx =
       *reinterpret_cast<LineairDBThdCtx **>(thd_ha_data(thd, hton));
 
-  // 参加していない場合は noop
+  // Nothing to roll back when this engine took no part in the transaction.
   if (ctx == nullptr || ctx->tx == nullptr)
     return 0;
 
@@ -702,17 +693,14 @@ THR_LOCK_DATA **ha_lineairdb::store_lock(THD *, THR_LOCK_DATA **to,
 }
 
 /**
- * @brief Predict prefetch mode without starting a transaction.
+ * @brief Whether this statement's reads are staged through a read plan.
  *
  * MRR cost estimation must stay side-effect-free, so it cannot call
- * get_transaction() (which allocates and may emit RPCs). Reuse an existing
- * transaction's fixed mode, else predict from the session as get_transaction will.
+ * get_transaction() (which allocates and may emit RPCs). Read the session
+ * instead.
  */
-bool ha_lineairdb::predict_prefetch_mode(THD *thd) {
-  auto *ctx =
-      *reinterpret_cast<LineairDBThdCtx **>(thd_ha_data(thd, lineairdb_hton));
-  if (ctx != nullptr && ctx->tx != nullptr) return ctx->tx->is_prefetch_mode();
-  return srv_prefetch_execution && thd_can_use_prefetch(thd);
+bool ha_lineairdb::statement_uses_read_plan(THD *thd) {
+  return srv_read_path == kReadPathPlan && thd_can_use_prefetch(thd);
 }
 
 struct st_mysql_storage_engine lineairdb_storage_engine = {
@@ -783,10 +771,15 @@ static MYSQL_SYSVAR_STR(server_host, srv_server_host,
 static MYSQL_SYSVAR_ULONG(server_port, srv_server_port, PLUGIN_VAR_RQCMDARG,
                           "LineairDB server TCP port.", nullptr, nullptr, 9999,
                           1, 65535, 0);
-static MYSQL_SYSVAR_BOOL(prefetch_execution, srv_prefetch_execution,
-                         PLUGIN_VAR_OPCMDARG,
-                         "Enable experimental prefetch execution.", nullptr,
-                         nullptr, false);
+static const char *read_path_names[] = {"row", "plan", NullS};
+static TYPELIB read_path_typelib = {array_elements(read_path_names) - 1,
+                                    "read_path_typelib", read_path_names,
+                                    nullptr};
+static MYSQL_SYSVAR_ENUM(read_path, srv_read_path, PLUGIN_VAR_RQCMDARG,
+                         "Where a statement's reads come from: row sends one "
+                         "request per handler read, plan stages what it can in "
+                         "one request and sends the rest as they happen.",
+                         nullptr, nullptr, kReadPathPlan, &read_path_typelib);
 static MYSQL_SYSVAR_BOOL(stats_drift_refresh, srv_stats_drift_refresh,
                          PLUGIN_VAR_OPCMDARG,
                          "Automatically refresh index statistics before SELECT "
@@ -798,7 +791,7 @@ static MYSQL_SYSVAR_BOOL(stats_drift_refresh, srv_stats_drift_refresh,
 static SYS_VAR *lineairdb_system_variables[] = {
     MYSQL_SYSVAR(server_host),
     MYSQL_SYSVAR(server_port),
-    MYSQL_SYSVAR(prefetch_execution),
+    MYSQL_SYSVAR(read_path),
     MYSQL_SYSVAR(stats_drift_refresh),
     MYSQL_SYSVAR(enum_var),
     MYSQL_SYSVAR(ulong_var),

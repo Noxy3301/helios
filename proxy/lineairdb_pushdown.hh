@@ -9,7 +9,6 @@
 class Item;
 class THD;
 struct TABLE;
-class LineairDBTransaction;
 
 bool serialize_item(const Item *item,
                     LineairDB::Protocol::FilterExpr *expr);
@@ -32,9 +31,14 @@ bool serialize_item(const Item *item,
 bool serialize_or_necessary_condition(Item *or_item, table_map me,
                                       LineairDB::Protocol::FilterExpr *out);
 
-bool prepare_select_filter_for_tx(THD *thd, TABLE *table,
-                                  LineairDBTransaction *tx,
-                                  std::string *serialized_filter);
+/**
+ * @brief True when a LIMIT may be pushed into this SELECT's storage scan.
+ *
+ * @details A scan RPC carries no predicate, so a row MySQL drops above the
+ * handler would come out of a pushed LIMIT. Only a SELECT with no WHERE for
+ * this table's rows may push one.
+ */
+bool select_scan_limit_is_safe(THD *thd, TABLE *table);
 
 /**
  * @brief Build a predicate that is safe to run on one table's staged scan.

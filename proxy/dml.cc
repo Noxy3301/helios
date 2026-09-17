@@ -1,6 +1,8 @@
 #include "storage/lineairdb/ha_lineairdb.hh"
 
 #include <string>
+#include <utility>
+#include <vector>
 
 #include "lineairdb_prefetch.hh"
 #include "my_dbug.h"
@@ -8,6 +10,23 @@
 
 // Handler DML entry points. These methods stage base-row mutations and their
 // secondary-index side effects in the current LineairDB transaction.
+
+int ha_lineairdb::duplicate_or_conflict(LineairDBTransaction *tx, uint index) {
+  if (!tx->reads_still_valid()) {
+    tx->set_status_to_abort();
+    return abort_errno(tx);
+  }
+  duplicate_key_index_ = index;
+  return HA_ERR_FOUND_DUPP_KEY;
+}
+
+int ha_lineairdb::flush_insert_probe(LineairDBTransaction *tx) {
+  if (insert_probe_keys_.empty()) return 0;
+  std::vector<std::string> keys;
+  keys.swap(insert_probe_keys_);
+  if (!tx->probe_insert_keys(db_table_name, keys)) return 0;
+  return duplicate_or_conflict(tx, table_share->primary_key);
+}
 
 int ha_lineairdb::write_row(uchar *buf) {
   DBUG_TRACE;
@@ -29,20 +48,36 @@ int ha_lineairdb::write_row(uchar *buf) {
     return error;
   }
 
-  // REPLACE stays a blind write; IGNORE and ON DUPLICATE KEY UPDATE need the
-  // answer at this row, so read the key here. A plain INSERT is refused by
-  // the storage server when the buffer is sent.
+  tx->choose_table(db_table_name);
+
+  const bool checks_unique_keys =
+      !::thd_test_options(ha_thd(), OPTION_RELAXED_UNIQUE_CHECKS);
+
+  // REPLACE overwrites whatever the key holds, so the entries the old row put
+  // in the secondary indexes leave with it and the row count does not change.
+  // The read is recorded, so a row that appears after it fails the commit.
+  bool replaced_existing_row = false;
+  if (insert_can_replace_ && is_primary_key_exists()) {
+    const auto old_row = tx->read(key);
+    if (tx->is_aborted()) {
+      return abort_errno(tx);
+    }
+    if (old_row.first != nullptr && old_row.second != 0) {
+      // record[1] is MySQL's buffer for the row being replaced.
+      if (set_fields_from_lineairdb(table->record[1], old_row.first,
+                                    old_row.second)) {
+        return HA_ERR_OUT_OF_MEM;
+      }
+      replaced_existing_row = true;
+    }
+  }
+
+  // IGNORE and ON DUPLICATE KEY UPDATE need the answer at this row, so read
+  // the key here.
   const bool resolve_duplicate_at_row =
       !insert_can_replace_ && insert_peeks_duplicates_ &&
       is_primary_key_exists();
   if (resolve_duplicate_at_row) {
-    tx->choose_table(db_table_name);
-    if (tx->is_prefetch_mode()) {
-      tx->prefetch_stateless_reads({{db_table_name, key}});
-    }
-    if (tx->is_aborted()) {
-      return abort_errno(tx);
-    }
     const bool key_taken = tx->read(key).first != nullptr;
     if (tx->is_aborted()) {
       return abort_errno(tx);
@@ -51,18 +86,39 @@ int ha_lineairdb::write_row(uchar *buf) {
       duplicate_key_index_ = table_share->primary_key;
       return HA_ERR_FOUND_DUPP_KEY;
     }
+  } else if (!insert_can_replace_ && is_primary_key_exists()) {
+    switch (tx->insert_key_state(db_table_name, key)) {
+      case LineairDBTransaction::KeyState::Taken:
+        // A row this transaction wrote itself: no request settles it, and
+        // unique_checks does not make it acceptable either.
+        duplicate_key_index_ = table_share->primary_key;
+        return HA_ERR_FOUND_DUPP_KEY;
+      case LineairDBTransaction::KeyState::Free:
+        break;
+      case LineairDBTransaction::KeyState::Unknown:
+        // Under unique_checks the statement owes ER_DUP_ENTRY, so the keys it
+        // inserts are resolved before it returns: in one batch at
+        // end_bulk_insert, or at this row without that bracket. Without it the
+        // commit is what refuses the key.
+        if (checks_unique_keys) {
+          insert_probe_keys_.push_back(key);
+          if (!bulk_insert_active_ ||
+              insert_probe_keys_.size() >= kInsertProbeBatch) {
+            if (const int error = flush_insert_probe(tx); error != 0) {
+              return error;
+            }
+          }
+        }
+        break;
+    }
+    if (tx->is_aborted()) {
+      return abort_errno(tx);
+    }
   }
 
-  // buffer_write appends to a local buffer (no RPC yet), so no error check
-  // needed. The actual RPC is sent at flush time.
-  tx->buffer_write(db_table_name, key, write_buffer_, !insert_can_replace_);
-
-  // An INSERT under unique_checks=0 buffers the UNIQUE index write with its
-  // row, so the server enforces uniqueness when the buffer is written, as it
-  // does for prefetch mode's commit. update_row keeps the synchronous check.
-  const bool defer_unique_check =
-      tx->is_prefetch_mode() ||
-      ::thd_test_options(ha_thd(), OPTION_RELAXED_UNIQUE_CHECKS);
+  // The commit installs the row and refuses an INSERT whose key is taken.
+  tx->buffer_write(db_table_name, key, write_buffer_,
+                   !insert_can_replace_ || !replaced_existing_row);
 
   for (uint i = 0; i < table->s->keys; i++) {
     auto key_info = table->key_info[i];
@@ -70,44 +126,51 @@ int ha_lineairdb::write_row(uchar *buf) {
 
     std::string secondary_key = build_secondary_key_from_row(buf, key_info);
 
+    if (replaced_existing_row) {
+      const std::string old_secondary_key =
+          build_secondary_key_from_row(table->record[1], key_info);
+      if (old_secondary_key != secondary_key) {
+        tx->buffer_delete_secondary_index(db_table_name, key_info.name,
+                                          old_secondary_key, key);
+      }
+    }
+
     if (key_info.flags & HA_NOSAME) {
-      if (defer_unique_check) {
-        tx->buffer_write_secondary_index(db_table_name, key_info.name,
-                                         secondary_key, key);
-      } else {
-        tx->flush_write_buffer();
-        tx->choose_table(db_table_name);
-        bool ok = tx->write_secondary_index(key_info.name, secondary_key, key);
-        if (!ok || tx->is_aborted()) {
-          // A duplicate this flush surfaces is a lost race for a statement
-          // that already gave its row-time answer.
+      // An index entry this transaction wrote itself is a duplicate whatever
+      // unique_checks says: no request settles it.
+      if (tx->index_key_taken_by_own_write(db_table_name, key_info.name,
+                                           secondary_key, key)) {
+        duplicate_key_index_ = i;
+        return HA_ERR_FOUND_DUPP_KEY;
+      }
+      // A UNIQUE secondary key is the statement's to report too. The probe
+      // records its range, so a duplicate another transaction installs after
+      // it still fails this transaction at commit.
+      if (checks_unique_keys) {
+        const auto owners =
+            tx->read_secondary_index(key_info.name, secondary_key, true);
+        if (tx->is_aborted()) {
           return abort_errno(tx, resolve_duplicate_at_row);
         }
+        for (const auto &owner : owners) {
+          if (owner != key) {
+            return duplicate_or_conflict(tx, i);
+          }
+        }
       }
-    } else {
-      tx->buffer_write_secondary_index(db_table_name, key_info.name,
-                                       secondary_key, key);
     }
+
+    tx->buffer_write_secondary_index(db_table_name, key_info.name,
+                                     secondary_key, key);
   }
 
   if (tx->is_aborted()) {
     return abort_errno(tx, resolve_duplicate_at_row);
   }
 
-  // Such a statement cannot wait for the statement-end flush: by then MySQL
-  // has moved past this row. Send it now, as NDB does by turning batching
-  // off for these statements; prefetch defers everything to its commit.
-  if (resolve_duplicate_at_row) {
-    tx->flush_write_buffer();
-    if (tx->is_aborted()) {
-      // The key was taken between the read above and this flush, so this
-      // transaction is gone and the statement's own duplicate handling can no
-      // longer run. A retry sees the row and resolves it.
-      return abort_errno(tx, /*duplicate_is_conflict=*/true);
-    }
+  if (!replaced_existing_row) {
+    tx->add_rowcount_delta(share, db_table_name, +1);
   }
-
-  tx->add_rowcount_delta(share, db_table_name, +1);
 
   return 0;
 }
@@ -124,7 +187,7 @@ int ha_lineairdb::update_row(const uchar *old_data, uchar *new_data) {
   // the old key with nothing at the new key -- silent corruption. A real move
   // (delete old + insert new + secondary-index rewrite) is not implemented.
   if (key != new_key) {
-    return prefetch_reject_unsupported(ha_thd(), tx,
+    return reject_unsupported_statement(ha_thd(), tx,
                                        "primary-key-changing UPDATE");
   }
 
@@ -144,7 +207,7 @@ int ha_lineairdb::update_row(const uchar *old_data, uchar *new_data) {
     return abort_errno(tx);
   }
 
-  // Buffer the base-row update; read/scan paths and commit flush it later.
+  // Buffer the base-row update; the commit installs it.
   tx->buffer_write(db_table_name, key, write_buffer_);
 
   if (tx->is_aborted()) {
@@ -201,7 +264,7 @@ int ha_lineairdb::delete_row(const uchar *buf) {
     return abort_errno(tx);
   }
 
-  // Buffer the base-row delete; read/scan paths and commit flush it later.
+  // Buffer the base-row delete; the commit installs it.
   tx->buffer_delete(db_table_name, key);
 
   if (tx->is_aborted()) {

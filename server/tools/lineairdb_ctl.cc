@@ -24,8 +24,8 @@ namespace {
 using DurabilityRpc = LineairDB::Protocol::DbSetCommitDurability;
 
 constexpr unsigned long kMaxPort = 65535;
-// Outlasts the server's fixed one-hour barrier
-constexpr long kReceiveTimeoutSeconds = 60 * 60 + 30;
+// The switch is a store on the server, so a reply is immediate or never
+constexpr long kReceiveTimeoutSeconds = 30;
 
 int fail(const std::string &text) {
   std::fprintf(stderr, "error: %s\n", text.c_str());

@@ -6,6 +6,7 @@
 #include <cstdlib>
 #include <iostream>
 #include <string_view>
+#include <system_error>
 
 namespace {
 
@@ -24,12 +25,10 @@ bool env_enabled(const char* name) {
 }
 
 /**
- * @brief Applies LINEAIRDB_EPOCH_DURATION_MS, keeping the LineairDB default
- * when it is unset. The epoch window is the knob the durability sweep varies,
- * so a value that does not parse exactly is a startup error rather than a
- * silent fallback that would mislabel every measurement taken with it.
+ * @brief Applies LINEAIRDB_EPOCH_DURATION_MS, keeping the storage default
+ * when it is unset.
  */
-void configure_epoch_duration(LineairDB::Config& config) {
+void configure_epoch_duration(helios::storage::Config& config) {
     const char* raw = std::getenv("LINEAIRDB_EPOCH_DURATION_MS");
     if (raw == nullptr) return;
 
@@ -48,42 +47,32 @@ void configure_epoch_duration(LineairDB::Config& config) {
 }
 
 /**
- * @brief Applies LINEAIRDB_COMMIT_DURABILITY (volatile|async|sync, default
- * volatile rather than the library default). Anything else refuses startup: a
- * mapped alias or a defaulted typo would label a measurement with a contract
- * it did not run under.
+ * @brief Reads LINEAIRDB_COMMIT_DURABILITY (async|sync, default sync) into
+ * the mode the server passes to every commit.
  */
-void configure_commit_durability(LineairDB::Config& config) {
-    config.commit_durability = LineairDB::Config::CommitDurability::Volatile;
-
+helios::storage::CommitDurability configure_commit_durability() {
     const char* raw = std::getenv("LINEAIRDB_COMMIT_DURABILITY");
     if (raw == nullptr) {
-        LOG_INFO("Commit durability: volatile (default)");
-        return;
+        LOG_INFO("Commit durability: sync (default)");
+        return helios::storage::CommitDurability::kSync;
     }
 
     const std::string_view mode(raw);
-    if (mode == "volatile") {
-        config.commit_durability = LineairDB::Config::CommitDurability::Volatile;
-    } else if (mode == "async") {
-        config.commit_durability = LineairDB::Config::CommitDurability::Async;
-    } else if (mode == "sync") {
-        config.commit_durability = LineairDB::Config::CommitDurability::Sync;
-    } else {
-        LOG_FATAL("Invalid LINEAIRDB_COMMIT_DURABILITY='%s': expected one of volatile, async, sync",
-                  raw);
+    auto durability = helios::storage::CommitDurability::kSync;
+    if (mode == "async") {
+        durability = helios::storage::CommitDurability::kAsync;
+    } else if (mode != "sync") {
+        LOG_FATAL("Invalid LINEAIRDB_COMMIT_DURABILITY='%s': expected async or sync", raw);
     }
     LOG_INFO("Commit durability: %s", raw);
+    return durability;
 }
 
 /**
- * @brief Applies LINEAIRDB_WAL_INITIAL_CAPACITY_BYTES. The log is written out
- * with zeroes to this size at startup and records land in it in place, which
- * keeps a commit's fdatasync from also persisting a new file size. A run wants
- * the whole log to fit: extending is synchronous, and the flush it stalls is
- * one a Sync commit is waiting on.
+ * @brief Applies LINEAIRDB_WAL_INITIAL_CAPACITY_BYTES, the size the log is
+ * written out to before records land in it in place.
  */
-void configure_wal_capacity(LineairDB::Config& config) {
+void configure_wal_capacity(helios::storage::Config& config) {
     const char* raw = std::getenv("LINEAIRDB_WAL_INITIAL_CAPACITY_BYTES");
     if (raw == nullptr) return;
 
@@ -104,8 +93,7 @@ void configure_wal_capacity(LineairDB::Config& config) {
 
 /**
  * @brief Reads one millisecond count, refusing anything that does not parse
- * exactly. A checkpoint knob that silently fell back to its default would
- * leave a run labelled with a cadence it never had.
+ * exactly.
  */
 size_t parse_milliseconds(const char* name, const char* raw) {
     const std::string_view input(raw);
@@ -123,11 +111,9 @@ size_t parse_milliseconds(const char* name, const char* raw) {
 
 /**
  * @brief Applies LINEAIRDB_CHECKPOINT_INTERVAL_MS and
- * LINEAIRDB_CHECKPOINT_ONCE_AFTER_MS. The image is scanned while transactions
- * keep running and shortens the log replay at startup; zero, the default,
- * writes none.
+ * LINEAIRDB_CHECKPOINT_ONCE_AFTER_MS; zero, the default, writes no image.
  */
-void configure_checkpoint(LineairDB::Config& config) {
+void configure_checkpoint(helios::storage::Config& config) {
     const char* interval = std::getenv("LINEAIRDB_CHECKPOINT_INTERVAL_MS");
     if (interval != nullptr) {
         config.checkpoint_interval_ms =
@@ -145,35 +131,20 @@ void configure_checkpoint(LineairDB::Config& config) {
              config.checkpoint_interval_ms, config.checkpoint_once_after_ms);
 }
 
-/**
- * @brief Warns when a retired durability variable is set and ignores it:
- * LINEAIRDB_COMMIT_DURABILITY alone decides the contract, and no combination
- * of the retired knobs expresses Async.
- */
-void warn_about_retired_durability_env() {
-    for (const char* name : {"LINEAIRDB_ENABLE_LOGGING", "LINEAIRDB_LOG_FSYNC"}) {
-        if (std::getenv(name) == nullptr) continue;
-        LOG_WARNING("%s is retired and ignored; use LINEAIRDB_COMMIT_DURABILITY", name);
-    }
-}
-
 }  // namespace
 
 DatabaseManager::DatabaseManager() {
-    // Initialize lineairdb
-    // TODO: make configurable
-    LineairDB::Config conf;
-    warn_about_retired_durability_env();
+    helios::storage::Config conf;
     configure_epoch_duration(conf);
-    configure_commit_durability(conf);
     configure_wal_capacity(conf);
     configure_checkpoint(conf);
-    conf.enable_checkpointing = false;
-    conf.enable_recovery      = env_enabled("LINEAIRDB_ENABLE_RECOVERY");
-    conf.max_thread           = 1;
-    conf.concurrency_control_protocol = LineairDB::Config::ConcurrencyControl::Silo;
-    conf.index_structure = LineairDB::Config::IndexStructure::Masstree;
-    conf.enable_pax_storage = true;
-    database_ = std::make_shared<LineairDB::Database>(conf);
+    conf.enable_recovery = env_enabled("LINEAIRDB_ENABLE_RECOVERY");
+    set_commit_durability(configure_commit_durability());
+    try {
+        database_ = std::make_shared<helios::storage::Database>(conf);
+    } catch (const std::system_error& err) {
+        LOG_FATAL("Could not open the working directory '%s': %s",
+                  conf.work_dir.c_str(), err.what());
+    }
     LOG_INFO("Database manager initialized");
 }

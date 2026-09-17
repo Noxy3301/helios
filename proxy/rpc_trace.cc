@@ -31,72 +31,30 @@ const char* message_type_name(MessageType t) {
   switch (t) {
     case MessageType::UNKNOWN:
       return "UNKNOWN";
-    case MessageType::TX_BEGIN_TRANSACTION:
-      return "TX_BEGIN_TRANSACTION";
-    case MessageType::TX_ABORT:
-      return "TX_ABORT";
     case MessageType::TX_READ:
       return "TX_READ";
-    case MessageType::TX_WRITE:
-      return "TX_WRITE";
-    case MessageType::TX_DELETE:
-      return "TX_DELETE";
-    case MessageType::TX_READ_SECONDARY_INDEX:
-      return "TX_READ_SECONDARY_INDEX";
-    case MessageType::TX_WRITE_SECONDARY_INDEX:
-      return "TX_WRITE_SECONDARY_INDEX";
-    case MessageType::TX_DELETE_SECONDARY_INDEX:
-      return "TX_DELETE_SECONDARY_INDEX";
-    case MessageType::TX_UPDATE_SECONDARY_INDEX:
-      return "TX_UPDATE_SECONDARY_INDEX";
-    case MessageType::TX_GET_MATCHING_KEYS_IN_RANGE:
-      return "TX_GET_MATCHING_KEYS_IN_RANGE";
-    case MessageType::TX_GET_MATCHING_KEYS_AND_VALUES_IN_RANGE:
-      return "TX_GET_MATCHING_KEYS_AND_VALUES_IN_RANGE";
-    case MessageType::TX_GET_MATCHING_KEYS_AND_VALUES_FROM_PREFIX:
-      return "TX_GET_MATCHING_KEYS_AND_VALUES_FROM_PREFIX";
-    case MessageType::TX_FETCH_LAST_KEY_IN_RANGE:
-      return "TX_FETCH_LAST_KEY_IN_RANGE";
-    case MessageType::TX_FETCH_FIRST_KEY_WITH_PREFIX:
-      return "TX_FETCH_FIRST_KEY_WITH_PREFIX";
-    case MessageType::TX_FETCH_NEXT_KEY_WITH_PREFIX:
-      return "TX_FETCH_NEXT_KEY_WITH_PREFIX";
-    case MessageType::TX_GET_MATCHING_PRIMARY_KEYS_IN_RANGE:
-      return "TX_GET_MATCHING_PRIMARY_KEYS_IN_RANGE";
-    case MessageType::TX_GET_MATCHING_PRIMARY_KEYS_FROM_PREFIX:
-      return "TX_GET_MATCHING_PRIMARY_KEYS_FROM_PREFIX";
-    case MessageType::TX_FETCH_LAST_PRIMARY_KEY_IN_SECONDARY_RANGE:
-      return "TX_FETCH_LAST_PRIMARY_KEY_IN_SECONDARY_RANGE";
-    case MessageType::TX_FETCH_LAST_SECONDARY_ENTRY_IN_RANGE:
-      return "TX_FETCH_LAST_SECONDARY_ENTRY_IN_RANGE";
-    case MessageType::DB_FENCE:
-      return "DB_FENCE";
-    case MessageType::DB_END_TRANSACTION:
-      return "DB_END_TRANSACTION";
-    case MessageType::DB_CREATE_TABLE:
-      return "DB_CREATE_TABLE";
-    case MessageType::DB_SET_TABLE:
-      return "DB_SET_TABLE";
-    case MessageType::DB_CREATE_SECONDARY_INDEX:
-      return "DB_CREATE_SECONDARY_INDEX";
     case MessageType::TX_BATCH_READ:
       return "TX_BATCH_READ";
-    case MessageType::TX_BATCH_WRITE:
-      return "TX_BATCH_WRITE";
-    case MessageType::TX_STATELESS_READ:
-      return "TX_STATELESS_READ";
-    case MessageType::TX_STATELESS_BATCH_READ:
-      return "TX_STATELESS_BATCH_READ";
-    case MessageType::TX_VALIDATE_AND_COMMIT:
-      return "TX_VALIDATE_AND_COMMIT";
+    case MessageType::TX_SCAN:
+      return "TX_SCAN";
+    case MessageType::TX_SCAN_INDEX:
+      return "TX_SCAN_INDEX";
     case MessageType::TX_EXECUTE_READ_PLAN:
       return "TX_EXECUTE_READ_PLAN";
+    case MessageType::TX_COMMIT:
+      return "TX_COMMIT";
     case MessageType::TX_GET_TABLE_STATS:
       return "TX_GET_TABLE_STATS";
     case MessageType::TX_EXECUTE_DUCKDB_QUERY:
       return "TX_EXECUTE_DUCKDB_QUERY";
+    case MessageType::DB_CREATE_TABLE:
+      return "DB_CREATE_TABLE";
+    case MessageType::DB_CREATE_SECONDARY_INDEX:
+      return "DB_CREATE_SECONDARY_INDEX";
     case MessageType::DB_ALLOCATE_HIDDEN_KEYS:
       return "DB_ALLOCATE_HIDDEN_KEYS";
+    case MessageType::DB_SET_COMMIT_DURABILITY:
+      return "DB_SET_COMMIT_DURABILITY";
   }
   return "UNDEFINED";
 }
@@ -137,13 +95,12 @@ std::string json_escape(const std::string& s, size_t max_len) {
   return out;
 }
 
-void TxRpcTrace::start(int64_t tx_id, std::thread::id tid) {
+void TxRpcTrace::start(std::thread::id tid) {
   if (!RpcTraceLogger::instance().enabled()) {
     active_ = false;
     return;
   }
   active_ = true;
-  tx_id_ = tx_id;
   tid_ = tid;
   started_ = std::chrono::steady_clock::now();
   started_wall_ = std::chrono::system_clock::now();
@@ -225,8 +182,7 @@ std::string TxRpcTrace::finalize_jsonl(bool committed) {
   tid_os << tid_;
 
   os << '{'
-     << "\"tx_id\":" << tx_id_
-     << ",\"thread_id\":\"" << tid_os.str() << '"'
+     << "\"thread_id\":\"" << tid_os.str() << '"'
      << ",\"started_at\":\"" << format_iso(started_wall_) << '"'
      << ",\"duration_us\":" << total_us
      << ",\"status\":\"" << (committed ? "committed" : "aborted") << '"'

@@ -5,15 +5,15 @@ def reset (db, cursor) :
     cursor.execute('CREATE DATABASE ha_lineairdb_test')
     cursor.execute('CREATE TABLE ha_lineairdb_test.items (\
         title VARCHAR(50) NOT NULL,\
-        content TEXT,\
-        content2 TEXT,\
-        content3 TEXT,\
-        content4 TEXT,\
-        content5 TEXT,\
-        content6 TEXT,\
-        content7 TEXT,\
-        content8 TEXT,\
-        content9 TEXT,\
+        content VARCHAR(255),\
+        content2 VARCHAR(255),\
+        content3 VARCHAR(255),\
+        content4 VARCHAR(255),\
+        content5 VARCHAR(255),\
+        content6 VARCHAR(255),\
+        content7 VARCHAR(255),\
+        content8 VARCHAR(255),\
+        content9 VARCHAR(255),\
         INDEX title_idx (title)\
     )ENGINE = LineairDB')
     db.commit()

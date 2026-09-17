@@ -90,7 +90,7 @@ def run_server(work_dir, extra_env):
 
 def with_crafted_log(frontier, extra_env):
     with tempfile.TemporaryDirectory(prefix="helios_high_water_") as work_dir:
-        log_dir = os.path.join(work_dir, "lineairdb_logs")
+        log_dir = os.path.join(work_dir, "helios_wal")
         os.makedirs(log_dir)
         with open(os.path.join(log_dir, "wal.log"), "wb") as wal:
             wal.write(make_frame(frontier))

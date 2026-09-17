@@ -2,76 +2,30 @@ syntax = "proto3";
 
 package LineairDB.Protocol;
 
-// Identifies which RPC is being invoked.
+// Identifies which RPC is being invoked. Every read answers from the
+// storage's current state and leaves nothing behind; the query layer keeps
+// what it read and commits once.
 enum OpCode {
     UNKNOWN = 0;
 
-    // Transaction lifecycle
-    TX_BEGIN_TRANSACTION = 1;
-    TX_ABORT = 2;
+    // Reads
+    TX_READ = 1;
+    TX_BATCH_READ = 2;
+    TX_SCAN = 3;
+    TX_SCAN_INDEX = 4;
+    TX_EXECUTE_READ_PLAN = 5;
 
-    // Primary key operations
-    TX_READ = 3;
-    TX_WRITE = 4;
-    TX_DELETE = 5;
+    // The one commit of a transaction
+    TX_COMMIT = 6;
 
-    // Secondary index operations
-    TX_READ_SECONDARY_INDEX = 6;
-    TX_WRITE_SECONDARY_INDEX = 7;
-    TX_DELETE_SECONDARY_INDEX = 8;
-    TX_UPDATE_SECONDARY_INDEX = 9;
+    TX_GET_TABLE_STATS = 7;
+    TX_EXECUTE_DUCKDB_QUERY = 8;
 
-    // Primary key scan operations
-    TX_GET_MATCHING_KEYS_IN_RANGE = 10;
-    TX_GET_MATCHING_KEYS_AND_VALUES_IN_RANGE = 11;
-    TX_GET_MATCHING_KEYS_AND_VALUES_FROM_PREFIX = 12;
-    TX_FETCH_LAST_KEY_IN_RANGE = 13;
-    TX_FETCH_FIRST_KEY_WITH_PREFIX = 14;
-    TX_FETCH_NEXT_KEY_WITH_PREFIX = 15;
-
-    // Secondary index scan operations
-    TX_GET_MATCHING_PRIMARY_KEYS_IN_RANGE = 16;
-    TX_GET_MATCHING_PRIMARY_KEYS_FROM_PREFIX = 17;
-    TX_FETCH_LAST_PRIMARY_KEY_IN_SECONDARY_RANGE = 18;
-    TX_FETCH_LAST_SECONDARY_ENTRY_IN_RANGE = 19;
-
-    // Database operations
-    DB_FENCE = 20;
-    DB_END_TRANSACTION = 21;
-    DB_CREATE_TABLE = 22;
-    DB_SET_TABLE = 23;
-    DB_CREATE_SECONDARY_INDEX = 24;
-
-    // Batch operations
-    TX_BATCH_READ = 25;
-    TX_BATCH_WRITE = 26;
-
-    // Experimental prefetch operations
-    TX_STATELESS_READ = 27;
-    TX_STATELESS_BATCH_READ = 28;
-    TX_VALIDATE_AND_COMMIT = 29;
-    TX_EXECUTE_READ_PLAN = 30;
-    TX_GET_TABLE_STATS = 31;
-
-    // Executes a resolved-statement request on the server's embedded DuckDB
-    // executor, which reads PAX storage in place.
-    TX_EXECUTE_DUCKDB_QUERY = 36;
-
-    // Hidden primary key allocation
-    DB_ALLOCATE_HIDDEN_KEYS = 37;
-
-    // Runtime durability control
-    DB_SET_COMMIT_DURABILITY = 38;
-}
-
-enum BatchOpType {
-    BATCH_OP_UNKNOWN = 0;
-    BATCH_OP_WRITE = 1;
-    BATCH_OP_DELETE = 2;
-    BATCH_OP_SECONDARY_INDEX_WRITE = 3;
-    BATCH_OP_SECONDARY_INDEX_DELETE = 4;
-    // Write that requires the key to be free; the server refuses it otherwise.
-    BATCH_OP_INSERT = 5;
+    // Definitions and server state
+    DB_CREATE_TABLE = 9;
+    DB_CREATE_SECONDARY_INDEX = 10;
+    DB_ALLOCATE_HIDDEN_KEYS = 11;
+    DB_SET_COMMIT_DURABILITY = 12;
 }
 
 // Why the server refused a transaction, where the query layer has to tell the
@@ -79,16 +33,11 @@ enum BatchOpType {
 enum AbortReason {
     ABORT_REASON_UNSPECIFIED = 0;
     ABORT_REASON_DUPLICATE_PRIMARY_KEY = 1;
+    ABORT_REASON_DUPLICATE_SECONDARY_KEY = 2;
 }
 
-// Shared key-value pair used across scan responses.
-message KeyValue {
-    bytes key = 1;
-    bytes value = 2;
-}
-
-// Range read observed by a stateless scan. The commit re-runs the scan
-// described by the bounds and asserts the observed key set is unchanged.
+// A range this transaction scanned. The commit re-runs the scan described
+// by the bounds and requires the same key list.
 message RangeReadEntry {
     string table_name = 1;
     string index_name = 2; // Empty means primary index.
@@ -100,26 +49,7 @@ message RangeReadEntry {
     repeated bytes result_primary_keys = 8; // SI scan only.
 }
 
-// Secondary index entry: a secondary key and its associated primary keys.
-message SecondaryIndexEntry {
-    bytes secondary_key = 1;
-    repeated bytes primary_keys = 2;
-}
-
-// Begin a new transaction. Returns a server-assigned transaction ID.
-// Response includes current row counts for all tables so proxies can
-// feed accurate cardinalities to the MySQL optimizer.
-message TxBeginTransaction {
-    message Request {}
-    message Response {
-        int64 transaction_id = 1;
-        repeated TableRowCount table_stats = 2;
-        // Identifies this run of the storage server; see DbAllocateHiddenKeys
-        uint64 boot_token = 3;
-    }
-}
-
-// Fetch optimizer stats before the proxy opens a LineairDB transaction.
+// Optimizer statistics: row counts and index NDV.
 message GetTableStats {
     message IndexDesc {
         string index_name = 1; // Empty means primary index.
@@ -144,62 +74,15 @@ message GetTableStats {
     message Response {
         repeated TableRowCount table_stats = 1;
         repeated IndexNdv index_ndv = 2;
+        // The run of the storage server that answered, as in
+        // DbAllocateHiddenKeys.Response. A connection learns it here, so a
+        // hidden-key range the query layer already holds stays usable.
+        uint64 boot_token = 3;
     }
 }
 
-// Abort a transaction.
-message TxAbort {
-    message Request {
-        int64 transaction_id = 1;
-    }
-    message Response {}
-}
-
-// Read multiple values by primary key in a single round-trip.
-// Used by MRR (Multi-Range Read) to batch JOIN lookups.
-message TxBatchRead {
-    message Request {
-        int64 transaction_id = 1;
-        repeated bytes keys = 2;
-        string table_name = 3;
-    }
-    message ReadResult {
-        bool found = 1;
-        bytes value = 2;
-    }
-    message Response {
-        repeated ReadResult results = 1;
-        bool is_aborted = 2;
-    }
-}
-
-// Flush writes and deletes in the same order MySQL issued them.
-message TxBatchWrite {
-    message BatchOp {
-        BatchOpType type = 1;
-        bytes key = 2;
-        bytes value = 3;
-        string index_name = 4;
-        bytes secondary_key = 5;
-        bytes primary_key = 6;
-        string table_name = 7;
-    }
-    message Request {
-        int64 transaction_id = 1;
-        string table_name = 2;
-        // Operations are applied in the same order as MySQL issued them.
-        repeated BatchOp ops = 3;
-    }
-    message Response {
-        bool success = 1;
-        bool is_aborted = 2;
-        AbortReason abort_reason = 3;
-    }
-}
-
-// Read a primary-key value without opening a server-side transaction.
-// The returned TID is validated later by TxValidateAndCommit.
-message TxStatelessRead {
+// One row by primary key. The commit validates the returned TID.
+message TxRead {
     message Request {
         string table_name = 1;
         bytes key = 2;
@@ -211,8 +94,8 @@ message TxStatelessRead {
     }
 }
 
-// Read multiple primary-key values without opening a server-side transaction.
-message TxStatelessBatchRead {
+// Several rows by primary key in one round trip.
+message TxBatchRead {
     message ReadOp {
         string table_name = 1;
         bytes key = 2;
@@ -227,6 +110,56 @@ message TxStatelessBatchRead {
     }
     message Response {
         repeated ReadResult results = 1;
+    }
+}
+
+// Rows of the primary index in [start_key, end_key), in key order (reverse
+// when reverse_scan). row_limit 0 means every row; a limit counts live rows.
+// With keys_only the values are left empty. ok is false when the table is
+// missing.
+message TxScan {
+    message Request {
+        string table_name = 1;
+        bytes start_key = 2;
+        bytes end_key = 3;
+        uint64 row_limit = 4;
+        bool reverse_scan = 5;
+        bool keys_only = 6;
+    }
+    message Row {
+        bytes key = 1;
+        bytes value = 2;
+        uint64 tid = 3;
+    }
+    message Response {
+        bool ok = 1;
+        repeated Row rows = 2;
+    }
+}
+
+// Rows reached through a secondary index in [start_key, end_key) of the
+// secondary key. Within one secondary key the primary keys come in key order
+// whichever the direction. Parameters as in TxScan; ok is false when the
+// table or the index is missing.
+message TxScanIndex {
+    message Request {
+        string table_name = 1;
+        string index_name = 2;
+        bytes start_key = 3;
+        bytes end_key = 4;
+        uint64 row_limit = 5;
+        bool reverse_scan = 6;
+        bool keys_only = 7;
+    }
+    message Row {
+        bytes secondary_key = 1;
+        bytes primary_key = 2;
+        bytes value = 3;
+        uint64 tid = 4;  // the base row's TID
+    }
+    message Response {
+        bool ok = 1;
+        repeated Row rows = 2;
     }
 }
 
@@ -308,24 +241,24 @@ message TxExecuteReadPlan {
     }
 }
 
-// Validate stateless reads and install buffered writes in one RPC.
-message TxValidateAndCommit {
+// The one commit of a transaction: validates every row and range it read,
+// then installs its writes and index changes under the Silo protocol.
+message TxCommit {
     message ReadEntry {
         string table_name = 1;
         bytes key = 2;
-        uint64 tid = 3;
-        bool found = 4;
+        uint64 tid = 3;  // as returned by the read; an absent row has a TID too
+    }
+    enum RowOp {
+        UPDATE = 0;
+        INSERT = 1;  // refused when the key holds a row
+        DELETE = 2;
     }
     message WriteEntry {
         string table_name = 1;
         bytes key = 2;
         bytes value = 3;
-        bool is_delete = 4;
-        bool is_insert = 5; // Commit refuses the entry if the key holds a row.
-    }
-    message DeleteEntry {
-        string table_name = 1;
-        bytes key = 2;
+        RowOp op = 4;
     }
     message SecondaryIndexEntry {
         string table_name = 1;
@@ -336,12 +269,10 @@ message TxValidateAndCommit {
     }
     message Request {
         repeated ReadEntry reads = 1;
-        repeated WriteEntry writes = 2;
-        repeated DeleteEntry deletes = 3;
+        repeated RangeReadEntry range_reads = 2;
+        repeated WriteEntry writes = 3;  // in the order the query layer issued them
         repeated SecondaryIndexEntry secondary_index_ops = 4;
         repeated TableRowDelta row_deltas = 5;
-        bool fence = 6;
-        repeated RangeReadEntry range_reads = 7;
     }
     message Response {
         bool committed = 1;
@@ -349,40 +280,6 @@ message TxValidateAndCommit {
         string abort_detail = 3; // Free-form cause, for tracing only.
         AbortReason abort_reason = 4;
     }
-}
-
-// Read a single value by primary key.
-message TxRead {
-    message Request {
-        int64 transaction_id = 1;
-        bytes key = 2;
-        string table_name = 4;
-    }
-    message Response {
-        bool found = 1;
-        bytes value = 2;
-        bool is_aborted = 3;
-    }
-}
-
-// Write a value by primary key.
-message TxWrite {
-    message Request {
-        int64 transaction_id = 1;
-        bytes key = 2;
-        bytes value = 3;
-        string table_name = 5;
-    }
-    message Response {
-        bool success = 1;
-        bool is_aborted = 2;
-    }
-}
-
-// Wait for all pending transactions to be durably committed.
-message DbFence {
-    message Request {}
-    message Response {}
 }
 
 // Reserves a range of hidden primary keys for a table without a declared one
@@ -405,14 +302,12 @@ message DbAllocateHiddenKeys {
 }
 
 // Runtime switch of the commit acknowledgement policy (see
-// Database::SetCommitDurability).
+// DatabaseManager::set_commit_durability).
 message DbSetCommitDurability {
     enum Mode {
         MODE_UNSPECIFIED = 0;
         ASYNC = 1;
         SYNC = 2;
-        // Reportable, not requestable: it is decided at startup
-        VOLATILE = 3;
     }
     message Request {
         Mode mode = 1;
@@ -427,115 +322,19 @@ message DbSetCommitDurability {
     }
 }
 
-// Row-count delta reported by proxy on commit (piggybacked on EndTransaction).
+// Row-count delta the query layer reports with its commit.
 message TableRowDelta {
     string table_name = 1;
     int64 delta = 2;
 }
 
-// Snapshot of a single table's row count, returned by server in BEGIN/END.
+// Snapshot of a single table's row count, returned with a commit and with the table stats.
 message TableRowCount {
     string table_name = 1;
     int64 row_count = 2;
 }
 
-// Commit or abort a transaction.
-// @param fence  If true, block until the transaction is durably committed.
-// @param row_deltas  Row-count changes accumulated during this transaction.
-//   Server applies these only on successful commit and returns updated
-//   table_stats in the response for the proxy's next transaction.
-message DbEndTransaction {
-    message Request {
-        int64 transaction_id = 1;
-        bool fence = 2;
-        repeated TableRowDelta row_deltas = 3;
-    }
-    message Response {
-        bool is_aborted = 1;
-        repeated TableRowCount table_stats = 2;
-        AbortReason abort_reason = 3;
-    }
-}
-
-// Delete a value by primary key.
-message TxDelete {
-    message Request {
-        int64 transaction_id = 1;
-        bytes key = 2;
-        string table_name = 4;
-    }
-    message Response {
-        bool success = 1;
-        bool is_aborted = 2;
-    }
-}
-
-// Read primary-key values associated with a secondary key.
-// @see LineairDBTransaction::read_secondary_index()
-message TxReadSecondaryIndex {
-    message Request {
-        int64 transaction_id = 1;
-        string index_name = 2;
-        bytes secondary_key = 3;
-        string table_name = 4;
-    }
-    message Response {
-        repeated bytes values = 1;
-        bool is_aborted = 2;
-    }
-}
-
-// Write a primary-key entry into a secondary index.
-// @see LineairDBTransaction::write_secondary_index()
-message TxWriteSecondaryIndex {
-    message Request {
-        int64 transaction_id = 1;
-        string index_name = 2;
-        bytes secondary_key = 3;
-        bytes primary_key = 4;
-        string table_name = 5;
-    }
-    message Response {
-        bool success = 1;
-        bool is_aborted = 2;
-    }
-}
-
-// Remove a primary-key entry from a secondary index.
-// @see LineairDBTransaction::delete_secondary_index()
-message TxDeleteSecondaryIndex {
-    message Request {
-        int64 transaction_id = 1;
-        string index_name = 2;
-        bytes secondary_key = 3;
-        bytes primary_key = 4;
-        string table_name = 5;
-    }
-    message Response {
-        bool success = 1;
-        bool is_aborted = 2;
-    }
-}
-
-// Atomically move a primary key from one secondary key to another.
-// @see LineairDBTransaction::update_secondary_index()
-message TxUpdateSecondaryIndex {
-    message Request {
-        int64 transaction_id = 1;
-        string index_name = 2;
-        bytes old_secondary_key = 3;
-        bytes new_secondary_key = 4;
-        bytes primary_key = 5;
-        string table_name = 6;
-    }
-    message Response {
-        bool success = 1;
-        bool is_aborted = 2;
-    }
-}
-
 // Create a new table in the database.
-// @see LineairDB::Database::CreateTable()
 message DbCreateTable {
     message Request {
         string table_name = 1;
@@ -547,12 +346,12 @@ message DbCreateTable {
         repeated uint32 pax_field_max_bytes = 2 [packed = true];
         // PAX typed cells: per-field storage kind, one entry per
         // pax_field_max_bytes entry (index 0 = null-flags field). Values match
-        // LineairDB::Pax::FieldKind (0=UNTYPED, 1=INT32, 2=INT64, 3=DATE,
+        // pax::FieldType (0=UNTYPED, 1=INT32, 2=INT64, 3=DATE,
         // 4=DEC64). Empty or length-mismatched => every field UNTYPED (the
         // untyped byte layout). The server additionally gates typed install on
         // HELIOS_PAX_TYPED (default on); proxies may always send this.
         repeated uint32 pax_field_kind = 3 [packed = true];
-        // DECIMAL scale per field for FK_DEC64 (else 0). Same length as
+        // DECIMAL scale per field for DEC64 (else 0). Same length as
         // pax_field_kind when present.
         repeated int32 pax_field_scale = 4 [packed = true];
     }
@@ -561,22 +360,8 @@ message DbCreateTable {
     }
 }
 
-// Set the table context for a transaction. Subsequent operations
-// within this transaction will be scoped to the specified table.
-// @see LineairDB::Transaction::SetTable()
-message DbSetTable {
-    message Request {
-        int64 transaction_id = 1;
-        string table_name = 2;
-    }
-    message Response {
-        bool success = 1;
-    }
-}
-
 // Create a secondary index on a table.
-// @see LineairDB::Database::CreateSecondaryIndex()
-// @param index_type  0=kNone, 2=kDictUnique (LineairDB::Index::SecondaryIndexType)
+// @param index_type  0 = IndexConstraint::kNone, 1 = IndexConstraint::kUnique
 message DbCreateSecondaryIndex {
     message Request {
         string table_name = 1;
@@ -585,171 +370,6 @@ message DbCreateSecondaryIndex {
     }
     message Response {
         bool success = 1;
-    }
-}
-
-// Scan keys in [start_key, end_key) range.
-// @see LineairDBTransaction::get_matching_keys_in_range()
-message TxGetMatchingKeysInRange {
-    message Request {
-        int64 transaction_id = 1;
-        bytes start_key = 2;
-        bytes end_key = 3;
-        string table_name = 5;
-    }
-    message Response {
-        repeated bytes keys = 1;
-        bool is_aborted = 2;
-    }
-}
-
-// Scan key-value pairs in [start_key, end_key) range.
-// Skips tombstones (null/zero-length values).
-// @see LineairDBTransaction::get_matching_keys_and_values_in_range()
-message TxGetMatchingKeysAndValuesInRange {
-    message Request {
-        int64 transaction_id = 1;
-        bytes start_key = 2;
-        bytes end_key = 3;
-        PushedPredicate filter = 5;
-        string table_name = 6;
-        uint64 row_limit = 7; // 0 means no limit.
-        bool reverse_scan = 8; // true means scan in descending key order.
-    }
-    message Response {
-        repeated KeyValue results = 1;
-        bool is_aborted = 2;
-    }
-}
-
-// Scan key-value pairs matching a prefix.
-// Skips tombstones (null/zero-length values).
-// @see LineairDBTransaction::get_matching_keys_and_values_from_prefix()
-message TxGetMatchingKeysAndValuesFromPrefix {
-    message Request {
-        int64 transaction_id = 1;
-        bytes prefix = 2;
-        PushedPredicate filter = 3;
-        string table_name = 4;
-    }
-    message Response {
-        repeated KeyValue results = 1;
-        bool is_aborted = 2;
-    }
-}
-
-// Reverse scan to find the last key in [start_key, end_key) range.
-// @see LineairDBTransaction::fetch_last_key_in_range()
-message TxFetchLastKeyInRange {
-    message Request {
-        int64 transaction_id = 1;
-        bytes start_key = 2;
-        bytes end_key = 3;
-        string table_name = 5;
-    }
-    message Response {
-        bool found = 1;
-        bytes key = 2;
-        bool is_aborted = 3;
-    }
-}
-
-// Find the first non-tombstone key in [prefix, prefix_end) range.
-// @see LineairDBTransaction::fetch_first_key_with_prefix()
-message TxFetchFirstKeyWithPrefix {
-    message Request {
-        int64 transaction_id = 1;
-        bytes prefix = 2;
-        bytes prefix_end = 3;
-        string table_name = 4;
-    }
-    message Response {
-        bool found = 1;
-        bytes key = 2;
-        bool is_aborted = 3;
-    }
-}
-
-// Find the next non-tombstone key after last_key in [last_key, prefix_end) range.
-// @see LineairDBTransaction::fetch_next_key_with_prefix()
-message TxFetchNextKeyWithPrefix {
-    message Request {
-        int64 transaction_id = 1;
-        bytes last_key = 2;
-        bytes prefix_end = 3;
-        string table_name = 4;
-    }
-    message Response {
-        bool found = 1;
-        bytes key = 2;
-        bool is_aborted = 3;
-    }
-}
-
-// Scan primary keys from a secondary index in [start_key, end_key) range.
-// @see LineairDBTransaction::get_matching_primary_keys_in_range()
-message TxGetMatchingPrimaryKeysInRange {
-    message Request {
-        int64 transaction_id = 1;
-        string index_name = 2;
-        bytes start_key = 3;
-        bytes end_key = 4;
-        string table_name = 6;
-    }
-    message Response {
-        repeated bytes primary_keys = 1;
-        bool is_aborted = 2;
-    }
-}
-
-// Scan primary keys from a secondary index matching a prefix.
-// @see LineairDBTransaction::get_matching_primary_keys_from_prefix()
-message TxGetMatchingPrimaryKeysFromPrefix {
-    message Request {
-        int64 transaction_id = 1;
-        string index_name = 2;
-        bytes prefix = 3;
-        string table_name = 4;
-    }
-    message Response {
-        repeated bytes primary_keys = 1;
-        bool is_aborted = 2;
-    }
-}
-
-// Reverse scan to find the last primary key in a secondary index range
-// [start_key, end_key).
-// @see LineairDBTransaction::fetch_last_primary_key_in_secondary_range()
-message TxFetchLastPrimaryKeyInSecondaryRange {
-    message Request {
-        int64 transaction_id = 1;
-        string index_name = 2;
-        bytes start_key = 3;
-        bytes end_key = 4;
-        string table_name = 6;
-    }
-    message Response {
-        bool found = 1;
-        bytes primary_key = 2;
-        bool is_aborted = 3;
-    }
-}
-
-// Reverse scan to find the last secondary index entry (secondary key + primary keys)
-// in [start_key, end_key) range.
-// @see LineairDBTransaction::fetch_last_secondary_entry_in_range()
-message TxFetchLastSecondaryEntryInRange {
-    message Request {
-        int64 transaction_id = 1;
-        string index_name = 2;
-        bytes start_key = 3;
-        bytes end_key = 4;
-        string table_name = 6;
-    }
-    message Response {
-        bool found = 1;
-        SecondaryIndexEntry entry = 2;
-        bool is_aborted = 3;
     }
 }
 
@@ -1030,12 +650,12 @@ message TxExecuteDuckdbQuery {
         optional uint64 offset = 9; // absent means no OFFSET
     }
 
-    // Mirrors LineairDB::Pax::FieldKind (pax_store.h): 0=UNTYPED, 1=INT32,
+    // Mirrors pax::FieldType: 0=UNTYPED, 1=INT32,
     // 2=INT64, 3=DATE, 4=DEC64.
     message ColumnDesc {
         uint32 pax_kind = 1;
         uint32 pax_width = 2;    // PAX cell payload width (bytes)
-        int32 pax_scale = 3;     // FK_DEC64 only
+        int32 pax_scale = 3;     // DEC64 only
     }
     // The server persists no schema; each request carries per-table PAX cell
     // metadata derived from TABLE::field[] and validated against the store.

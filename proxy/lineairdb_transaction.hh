@@ -1,6 +1,7 @@
 #ifndef LINEAIRDB_TRANSACTION_HH
 #define LINEAIRDB_TRANSACTION_HH
 
+#include <map>
 #include <optional>
 #include <unordered_map>
 #include <unordered_set>
@@ -16,10 +17,13 @@
 class LineairDB_share;
 
 /**
- * @brief 
- * Wrapper of LineairDB::Transaction
- * Takes care of registering a transaction to MySQL core
- * 
+ * @brief The transaction, kept by the query layer.
+ *
+ * It holds what it read (rows with their TIDs, ranges with their key lists),
+ * what it wrote, and the row-count deltas, and installs all of it with one
+ * TX_COMMIT. Reads a staged plan did not cover go to the storage server as
+ * they happen.
+ *
  * Lifetime of this class equals the lifetime of the transaction.
  * The instance of this class is deleted in end_transaction.
  * Set the pointer to this class to nullptr after end_transaction
@@ -28,55 +32,46 @@ class LineairDB_share;
 class LineairDBTransaction
 {
 public:
-  std::string get_selected_table_name();
   void choose_table(std::string db_table_name);
   bool table_is_not_chosen();
 
   const std::pair<const std::byte *const, const size_t> read(std::string key);
   std::vector<std::pair<bool, std::string>> batch_read(const std::vector<std::string>& keys);
-  bool batch_write(const std::string& table_name,
-                   const std::vector<LineairDBProxy::BatchOp>& ops);
-  std::vector<std::string> get_all_keys();
-  std::vector<std::string> get_matching_keys(std::string key);
-  std::vector<std::string> get_matching_keys_in_range(std::string start_key, std::string end_key);
-  // Optional out: set when this call is served from a LIMIT-staged cache
-  // entry. The handler must not treat exhausting the returned rows as EOF.
-  // TODO: replace this out-param with a small result struct when scan-cache
-  // serving is split out of LineairDBTransaction.
+  // Buffer ops built elsewhere (the DDL backfill); the commit installs them.
+  void buffer_writes(const std::string& table_name,
+                     const std::vector<LineairDBProxy::WriteOp>& ops);
+  // served_truncated, when given, lets a staged window that holds only the
+  // first rows of the range serve an unlimited request; it is set when the
+  // result stops at the window and the caller has to fetch the rest.
   std::vector<std::pair<std::string, std::string>> get_matching_keys_and_values_in_range(
       std::string start_key, std::string end_key, uint64_t row_limit = 0,
       bool reverse_scan = false, bool *served_truncated = nullptr);
   std::vector<std::pair<std::string, std::string>> get_matching_keys_and_values_from_prefix(
       std::string prefix);
-  bool write(std::string key, const std::string value);
-  bool write_secondary_index(std::string index_name, std::string secondary_key, const std::string primary_key);
-  std::vector<std::string> read_secondary_index(std::string index_name, std::string secondary_key);
+  // Primary keys reached through index_name for the exact secondary key.
+  // keys_only skips the base rows, for a probe that only needs the keys.
+  std::vector<std::string> read_secondary_index(std::string index_name,
+                                                std::string secondary_key,
+                                                bool keys_only = false);
   std::vector<std::string> get_matching_primary_keys_in_range(
       std::string index_name, std::string start_key, std::string end_key,
       uint64_t row_limit = 0, bool reverse_scan = false);
-  std::vector<std::string> get_matching_primary_keys_from_prefix(
-      std::string index_name, std::string prefix);
-  std::optional<std::string> fetch_last_key_in_range(
-      const std::string &start_key, const std::string &end_key);
-  std::optional<std::string> fetch_last_primary_key_in_secondary_range(
+  // The highest secondary key in the range and its primary keys, for the
+  // reverse index cursor.
+  struct SecondaryEntry {
+    std::string secondary_key;
+    std::vector<std::string> primary_keys;
+  };
+  std::optional<SecondaryEntry> fetch_last_secondary_entry_in_range(
       const std::string &index_name, const std::string &start_key,
       const std::string &end_key);
-  std::optional<SecondaryIndexEntry> fetch_last_secondary_entry_in_range(
-      const std::string &index_name, const std::string &start_key,
-      const std::string &end_key);
-  std::optional<std::string> fetch_first_key_with_prefix(
-      const std::string &prefix, const std::string &prefix_end);
-  std::optional<std::string> fetch_next_key_with_prefix(
-      const std::string &last_key, const std::string &prefix_end);
   bool update_secondary_index(
       std::string index_name,
       std::string old_secondary_key,
       std::string new_secondary_key,
       const std::string primary_key);
-  bool delete_value(std::string key);
-  bool delete_secondary_index(std::string index_name, std::string secondary_key, const std::string primary_key);
 
-  // Write buffering for batch operations
+  // Buffered writes, installed by the commit in the order they were issued.
   void buffer_write(const std::string& table_name,
                     const std::string& key, const std::string& value,
                     bool is_insert = false);
@@ -90,24 +85,34 @@ public:
                                      const std::string& index_name,
                                      const std::string& secondary_key,
                                      const std::string& primary_key);
-  // Flush buffered row/index ops before reads can observe the same table.
-  // Must be called before read/scan RPCs to ensure read-your-own-writes.
-  bool flush_write_buffer();
-  bool flush_write_buffer_for_table(const std::string& table_name);
 
-  // True while any op is still waiting to be sent, so the statement that
-  // buffered it can flush and report a rejection itself.
-  bool has_pending_writes() const { return !write_buffer_ops_.empty(); }
+  // What this transaction's own writes say about a key an INSERT wants free.
+  // Unknown means only the storage can answer.
+  enum class KeyState { Free, Taken, Unknown };
+  KeyState insert_key_state(const std::string& table_name,
+                            const std::string& key) const;
+  // True when this transaction's own index writes already put another row
+  // under secondary_key.
+  bool index_key_taken_by_own_write(const std::string& table_name,
+                                    const std::string& index_name,
+                                    const std::string& secondary_key,
+                                    const std::string& primary_key) const;
+  // True when every row and range this transaction read still reads the same
+  // way. A duplicate found after one of them moved is a lost race, not a
+  // constraint the client can fix. Sends one batch read and one keys-only
+  // replay per recorded range; records nothing.
+  bool reads_still_valid();
+  // Probe the storage for keys an INSERT statement inserts, in one RPC. Every
+  // answer enters the read set, so the commit revalidates an absence. Call it
+  // only for keys insert_key_state reported Unknown: it does not consult the
+  // write set, which by then holds the statement's own rows.
+  bool probe_insert_keys(const std::string& table_name,
+                         const std::vector<std::string>& keys);
 
   void begin_transaction();
   void set_status_to_abort();
   bool end_transaction(bool *transport_error = nullptr,
                        bool *duplicate_key = nullptr);
-  void fence() const;
-  void set_prefetch_mode(bool enabled) { prefetch_mode_ = enabled; }
-  bool is_prefetch_mode() const { return prefetch_mode_; }
-  void prefetch_stateless_reads(
-      const std::vector<LineairDBProxy::StatelessReadKey>& reads);
   void execute_read_plan(const std::vector<LineairDBProxy::ReadPlanStep>& steps);
 
   // Set when an injected tx-scoped plan (@_tx_plan / DSL) ran at begin, so the
@@ -130,7 +135,7 @@ public:
   bool autogen_stmt_resolved() const { return autogen_stmt_resolved_; }
   void mark_autogen_stmt_resolved() { autogen_stmt_resolved_ = true; }
   // Subqueries may be staged before the statement root exists. Remember each
-  // root so the same subquery plan is not prefetched twice in one statement.
+  // root so the same subquery plan is not staged twice in one statement.
   bool autogen_root_staged(const void *root) const {
     return autogen_staged_roots_.count(root) != 0;
   }
@@ -151,67 +156,41 @@ public:
     autogen_stmt_handler_deferred_ = true;
   }
 
-  inline bool is_not_started() const {
-    if (prefetch_mode_) return !prefetch_registered_;
-    if (tx_id == -1) return true;
-    return false;
-  }
+  inline bool is_not_started() const { return !registered_; }
 
-  inline int64_t get_tx_id() const {
-    return tx_id;
-  }
-
-  inline bool is_aborted() const { 
+  inline bool is_aborted() const {
     return is_aborted_;
   }
 
-  bool aborted_by_cache_miss() const { return aborted_by_cache_miss_; }
   bool has_transport_error() const { return transport_error_; }
   // Set when the server refused an insert because the key already held a row.
   bool duplicate_key_abort() const { return duplicate_key_abort_; }
-  void mark_duplicate_key_abort() { duplicate_key_abort_ = true; }
 
   inline void mark_transport_error() {
     transport_error_ = true;
     is_aborted_ = true;
   }
 
-  inline void set_aborted(bool aborted) {
-    // Once aborted, stay aborted (matches LineairDB's irreversible Abort semantics).
-    // Prevents subsequent RPC responses from accidentally clearing the flag.
-    if (aborted) is_aborted_ = true;
-  }
-
   inline bool is_a_single_statement() const { return !isTransaction; }
-
-  // Predicate pushdown: serialized PushedPredicate protobuf
-  void set_pushed_filter(const std::string& s) { pushed_filter_ = s; }
-  const std::string& get_pushed_filter() const { return pushed_filter_; }
-  void clear_pushed_filter() { pushed_filter_.clear(); }
 
   void add_rowcount_delta(LineairDB_share *share, const std::string &table_name, int64_t delta);
   int64_t peek_rowcount_delta(const LineairDB_share *share) const;
 
   // RPC trace statement boundary; TxRpcTrace dedupes repeated SQL strings.
   void on_stmt_boundary(const std::string& sql) { rpc_trace_.on_stmt(sql); }
-  bool fallback_to_normal_transaction(const char* reason);
 
-  LineairDBTransaction(THD* thd, 
-                       LineairDBProxy* lineairdb_proxy, 
-                       handlerton* lineairdb_hton,
-                       bool isFence);
+  LineairDBTransaction(THD* thd,
+                       LineairDBProxy* lineairdb_proxy,
+                       handlerton* lineairdb_hton);
   ~LineairDBTransaction() = default;
 
 private:
-  int64_t tx_id;  // transaction id (instead of tx pointer), -1 means tx is not started
   LineairDBProxy* lineairdb_proxy;
   std::string db_table_key;
   THD* thread;
   bool isTransaction;
   handlerton* hton;
-  bool isFence;
-  bool prefetch_mode_{false};
-  bool prefetch_registered_{false};
+  bool registered_{false};
   bool tx_plan_used_{false};
   uint64_t autogen_query_id_{0};
   bool autogen_stmt_resolved_{false};
@@ -227,13 +206,10 @@ private:
 
   // transaction abort status (updated by RPC responses)
   bool is_aborted_;
-  // Set when the abort came from a prefetch cache miss (an unstaged read
-  // surface), so the handler returns a non-retryable error, not a deadlock.
-  bool aborted_by_cache_miss_{false};
   // A lost RPC connection is not OCC contention and must never be surfaced as
   // a retryable deadlock (or as an empty scan result).
   bool transport_error_{false};
-  // A duplicate primary key is a permanent rejection, not contention.
+  // A duplicate key is a permanent rejection, not contention.
   bool duplicate_key_abort_{false};
 
   struct RowCountDelta {
@@ -249,16 +225,17 @@ private:
     bool found;
     std::string value;
     uint64_t tid = 0;
-    bool validate_on_use = false;
   };
   // These sets live only inside one LineairDBTransaction.
-  // commit/abort deletes the object, so prefetched rows never cross txs.
+  // commit/abort deletes the object, so cached rows never cross txs.
 
-  // Proxy-side value cache for exact primary-key reads: serves a row to the
-  // statement without an RPC. NOT a validation set -- the TID it carries feeds
+  // Value cache for exact primary-key reads: serves a row to the statement
+  // without an RPC. NOT a validation set -- the TID it carries feeds
   // base_row_read_set_ only when a cached row is actually consumed (the
-  // cache-hit paths in read()/batch_read() append it). Overwritten when a
-  // statement re-stages the key. Keyed by (table_name + '\0' + key) for O(1) lookup.
+  // cache-hit paths in read()/batch_read() append it). Every entry comes from
+  // the storage, so every consume of one is an observation to validate.
+  // Overwritten when a statement re-stages the key. Keyed by
+  // (table_name + '\0' + key).
   std::unordered_map<std::string, LocalRowEntry> row_cache_;
   static std::string make_row_cache_key(const std::string& table,
                                          const std::string& key) {
@@ -269,7 +246,7 @@ private:
     k.append(key);
     return k;
   }
-  // Proxy-side write set for exact primary-key writes/deletes
+  // Write set for exact primary-key writes/deletes
   std::vector<LocalRowEntry> own_writes_;
   // Dedup/lookup index into own_writes_, keyed like row_cache_. own_writes_ only
   // ever grows by push_back, so a stored index never moves and stays valid.
@@ -280,13 +257,7 @@ private:
   //   base_row_read_set_  per-key TID of base rows -> value changes
   //   range_read_set_     observed range membership (result key-list),
   //                       re-validated by logical replay -> phantoms
-  struct StatelessReadEntry {
-    std::string table_name;
-    std::string key;
-    uint64_t tid;
-    bool found;
-  };
-  std::vector<StatelessReadEntry> base_row_read_set_;
+  std::vector<LineairDBProxy::ReadEntry> base_row_read_set_;
   std::vector<LineairDBProxy::RangeReadEntry> range_read_set_;
 
   struct LocalRangeScanEntry {
@@ -297,8 +268,8 @@ private:
     uint64_t row_limit = 0;
     std::vector<std::pair<std::string, std::string>> rows;
     std::vector<uint64_t> row_tids;
-    // Set only on lookup return copies: this entry came from a LIMIT-staged
-    // window, so the handler must abort if MySQL asks past these rows.
+    // Set only on a lookup return copy: this window holds the first rows of
+    // the range, not all of them.
     bool truncated = false;
   };
   struct LocalSecondaryScanEntry {
@@ -311,6 +282,8 @@ private:
     std::vector<std::string> secondary_keys;
     std::vector<std::string> primary_keys;
   };
+  // Windows a read plan staged for this statement. A request a window covers
+  // is served from it; anything else goes to the storage server.
   std::vector<LocalRangeScanEntry> range_scan_cache_;
   std::vector<LocalSecondaryScanEntry> secondary_scan_cache_;
   // Exact-start indexes for grouped range scans. Without these, each runtime
@@ -319,14 +292,26 @@ private:
   std::unordered_map<std::string, std::vector<size_t>> secondary_scan_start_index_;
   void push_range_scan_cache(LocalRangeScanEntry entry);
   void push_secondary_scan_cache(LocalSecondaryScanEntry entry);
+  // Keep the rows (pairs) the request's bounds cover. The parallel arrays are
+  // appended together at every push site, so they are the same length.
+  static void trim_range_entry(LocalRangeScanEntry& entry,
+                               const std::string& start_key,
+                               const std::string& end_key);
+  static void trim_secondary_entry(LocalSecondaryScanEntry& entry,
+                                   const std::string& start_key,
+                                   const std::string& end_key);
 
-  // Predicate pushdown: serialized PushedPredicate for scan filtering
-  std::string pushed_filter_;
-
-  // Max number of buffered write/delete ops before an automatic flush
-  static constexpr size_t WRITE_BATCH_SIZE = 1024;
-  // Pending RPC flush queue for row and secondary-index ops in MySQL order
-  std::vector<LineairDBProxy::BatchOp> write_buffer_ops_;
+  // Row and secondary-index ops in the order MySQL issued them
+  std::vector<LineairDBProxy::WriteOp> write_buffer_ops_;
+  // The index entries those ops leave behind: table\x01index -> secondary key
+  // -> primary key -> still there. Ordered by secondary key so a probe or a
+  // scan asks for one key or one range of it, instead of the walk of the whole
+  // write buffer per row that made a bulk INSERT quadratic.
+  std::unordered_map<
+      std::string,
+      std::map<std::string, std::unordered_map<std::string, bool>>>
+      pending_index_entries_;
+  void record_index_op(const LineairDBProxy::WriteOp& op);
 
   TxRpcTrace rpc_trace_;
 
@@ -339,8 +324,6 @@ private:
   bool key_is_in_range(const std::string& key,
                        const std::string& start_key,
                        const std::string& end_key) const;
-  bool key_starts_with(const std::string& key,
-                       const std::string& prefix) const;
   void remove_scan_row(std::vector<std::pair<std::string, std::string>>& rows,
                        const std::string& key) const;
   void insert_scan_row_in_order(
@@ -351,40 +334,59 @@ private:
       std::vector<std::pair<std::string, std::string>>& rows,
       const std::string& start_key, const std::string& end_key,
       bool reverse_scan) const;
-  void merge_pending_rows_into_prefix_scan(
-      std::vector<std::pair<std::string, std::string>>& rows,
-      const std::string& prefix) const;
-  bool has_pending_ops_for_table(const std::string& table_name) const;
   bool has_pending_row_ops_in_range(const std::string& table_name,
                                     const std::string& start_key,
                                     const std::string& end_key) const;
-  bool has_pending_secondary_ops_for_index(
-      const std::string& table_name,
-      const std::string& index_name) const;
-  void drop_secondary_scan_cache(const std::string& table_name,
-                                  const std::string& index_name);
+  bool has_pending_secondary_ops_in_range(const std::string& table_name,
+                                          const std::string& index_name,
+                                          const std::string& start_key,
+                                          const std::string& end_key) const;
+  void merge_pending_index_ops(
+      const std::string& index_name, const std::string& start_key,
+      const std::string& end_key,
+      std::map<std::string, std::vector<std::string>>& groups) const;
   void record_write(const std::string& table_name,
                           const std::string& key, bool found,
                           const std::string& value);
   void record_row_cache(const std::string& table_name,
                                const std::string& key, bool found,
-                               const std::string& value, uint64_t tid = 0,
-                               bool validate_on_use = false);
+                               const std::string& value, uint64_t tid = 0);
   void append_base_row_read(const std::string& table_name,
-                                    const std::string& key, bool found,
-                                    uint64_t tid);
-  void append_range_read(const LocalRangeScanEntry& cached);
-  void append_secondary_range_read(const LocalSecondaryScanEntry& cached);
-  void abort_prefetch_cache_miss(const std::string& reason);
+                                    const std::string& key, uint64_t tid);
+  void append_range_read(const LocalRangeScanEntry& scanned);
+  void append_secondary_range_read(const LocalSecondaryScanEntry& scanned);
+  // The storage server refused the request (a missing table or index). Not
+  // contention, but the statement cannot go on either.
+  void abort_server_refused(const char* what);
   std::optional<LocalRangeScanEntry> lookup_range_scan_cache(
       const std::string& table_name, const std::string& start_key,
       const std::string& end_key, bool reverse_scan, uint64_t row_limit,
-      bool allow_truncated = false) const;
+      bool allow_truncated) const;
   std::optional<LocalSecondaryScanEntry> lookup_secondary_scan_cache(
       const std::string& table_name, const std::string& index_name,
       const std::string& start_key, const std::string& end_key,
       bool reverse_scan, uint64_t row_limit) const;
-  bool prefetch_validate_and_commit(bool *transport_error, bool *duplicate_key);
+  // Scan the storage server and record what it returned.
+  std::vector<std::pair<std::string, std::string>> scan_range(
+      const std::string& start_key, const std::string& end_key,
+      uint64_t row_limit, bool reverse_scan);
+  struct SecondaryScan {
+    bool ok = false;
+    std::vector<std::string> secondary_keys;
+    std::vector<std::string> primary_keys;
+  };
+  SecondaryScan scan_index_range(const std::string& index_name,
+                                 const std::string& start_key,
+                                 const std::string& end_key,
+                                 uint64_t row_limit, bool reverse_scan,
+                                 bool keys_only);
+  // Traversal order of one secondary scan: merge this transaction's own index
+  // ops into the groups, drop what is left empty, and apply the caller's
+  // limit.
+  SecondaryScan merge_index_scan(
+      const std::string& index_name, const std::string& start_key,
+      const std::string& end_key, uint64_t row_limit, bool reverse_scan,
+      std::map<std::string, std::vector<std::string>>& groups) const;
   bool thd_is_transaction() const;
   void register_transaction_to_mysql();
   void register_single_statement_to_mysql();

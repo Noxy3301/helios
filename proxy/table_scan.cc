@@ -34,22 +34,9 @@ int ha_lineairdb::rnd_init(bool) {
 
   tx->choose_table(db_table_name);
 
-  // Predicate pushdown: propagate filter serialized by cond_push() to the
-  // transaction.
-  if (!pushed_filter_serialized_.empty()) {
-    tx->set_pushed_filter(pushed_filter_serialized_);
-  } else {
-    tx->clear_pushed_filter();
-  }
-
-  if (prefetch_needs_legacy_dml_handler(ha_thd(), tx)) {
-    DBUG_RETURN(prefetch_reject_unsupported(
-        ha_thd(), tx, "legacy DML full/reverse table scan"));
-  }
-
-  // The optimizer has run, so the QEP is available.
-  // Statement-scoped autogen stages and executes the prefetch plan once per
-  // statement; an unsupported QEP fails here.
+  // The optimizer has run, so the QEP is available. Statement-scoped autogen
+  // stages the read plan once per statement; a shape it cannot stage reads
+  // from the storage server row by row.
   if (int err = maybe_prefetch_for_statement(ha_thd(), tx, table)) {
     DBUG_RETURN(err);
   }
@@ -185,8 +172,8 @@ int ha_lineairdb::rnd_pos(uchar *buf, uchar *pos) {
   tx->choose_table(db_table_name);
   auto result = tx->read(primary_key);
 
-  // read() aborts the tx on a prefetch cache miss; catch it before the empty
-  // result below reads as a missing key.
+  // read() aborts the tx when the request did not reach the server; catch it
+  // before the empty result below reads as a missing key.
   if (tx->is_aborted()) {
     return abort_errno(tx);
   }

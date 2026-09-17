@@ -350,9 +350,12 @@ int ha_lineairdb::generate_hidden_primary_key(LineairDBTransaction *tx,
   std::lock_guard<std::mutex> lock(share->hidden_keys.mutex);
   // A range granted by an earlier run of the storage server may overlap one the
   // restarted server has since handed out, so it is spent, not merely stale.
-  const bool from_this_run =
-      share->hidden_keys.boot_token == proxy->storage_boot_token();
-  if (!from_this_run || share->hidden_keys.next >= share->hidden_keys.end) {
+  // The run rides on the reservation response, so a connection that has not
+  // reserved yet (token 0, and again after a transport failure) has to ask
+  // before it may hand out what the share holds.
+  const uint64_t token = proxy->storage_boot_token();
+  const bool spent = share->hidden_keys.next >= share->hidden_keys.end;
+  if (spent || token == 0 || token != share->hidden_keys.boot_token) {
     const uint64_t remaining = bulk_insert_rows_ > bulk_insert_generated_
                                    ? bulk_insert_rows_ - bulk_insert_generated_
                                    : 0;
@@ -372,9 +375,14 @@ int ha_lineairdb::generate_hidden_primary_key(LineairDBTransaction *tx,
       }
       return abort_errno(tx);
     }
-    share->hidden_keys.next = reserved.first_id;
-    share->hidden_keys.end = reserved.first_id + count;
-    share->hidden_keys.boot_token = reserved.boot_token;
+    // A live range of the same run keeps serving until it is spent: this
+    // reservation was only needed to learn which run answered.
+    if (share->hidden_keys.next >= share->hidden_keys.end ||
+        reserved.boot_token != share->hidden_keys.boot_token) {
+      share->hidden_keys.next = reserved.first_id;
+      share->hidden_keys.end = reserved.first_id + count;
+      share->hidden_keys.boot_token = reserved.boot_token;
+    }
   }
 
   ++bulk_insert_generated_;

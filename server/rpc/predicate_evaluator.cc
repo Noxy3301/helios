@@ -1,6 +1,5 @@
 #include "predicate_evaluator.hh"
 
-#include <algorithm>
 #include <cerrno>
 #include <climits>
 #include <cstdio>
@@ -9,6 +8,7 @@
 #include <string>
 
 using FilterExpr = LineairDB::Protocol::FilterExpr;
+namespace pax = helios::storage::pax;
 
 namespace {
 
@@ -56,8 +56,6 @@ bool PredicateEvaluator::parse_row(const char* data, size_t length,
   columns_.clear();
   null_flags_.clear();
   schema_ = nullptr;  // materialized rows carry ASCII val_str bytes
-  vkinds_.clear();
-  vscales_.clear();
 
   // Row format produced by ha_lineairdb (via LineairDBField):
   //   [null_flags_field] [col_0] [col_1] ... [col_N-1]
@@ -115,12 +113,10 @@ bool PredicateEvaluator::parse_row(const char* data, size_t length,
 }
 
 bool PredicateEvaluator::set_row_from_pax(
-    const LineairDB::Pax::PaxGroup& group, uint32_t slot,
+    const helios::storage::pax::PaxGroup& group, uint32_t slot,
     uint32_t num_columns) {
   columns_.clear();
   null_flags_.clear();
-  vkinds_.clear();
-  vscales_.clear();
 
   if (group.schema().field_count() < static_cast<size_t>(num_columns) + 1) {
     return false;
@@ -135,71 +131,6 @@ bool PredicateEvaluator::set_row_from_pax(
   }
   schema_ = &group.schema();  // typed-cell decode
   return true;
-}
-
-bool PredicateEvaluator::set_row_from_pax_cols(
-    const LineairDB::Pax::PaxGroup& group, uint32_t slot, uint32_t num_columns,
-    const std::vector<uint32_t>& cols) {
-  if (group.schema().field_count() < static_cast<size_t>(num_columns) + 1) {
-    return false;
-  }
-  vkinds_.clear();
-  vscales_.clear();
-
-  const std::string_view null_flags = group.cell(0, slot);
-  null_flags_.assign(null_flags.data(), null_flags.size());
-
-  columns_.assign(num_columns, std::string_view());
-  for (uint32_t column_idx : cols) {
-    if (column_idx < num_columns) {
-      columns_[column_idx] = group.cell(column_idx + 1, slot);
-    }
-  }
-  schema_ = &group.schema();  // typed-cell decode
-  return true;
-}
-
-void PredicateEvaluator::collect_columns(const FilterExpr& expr,
-                                         std::vector<uint32_t>* out) {
-  if (expr.op() == FilterExpr::COLUMN_REF) out->push_back(expr.column_index());
-  for (const FilterExpr& child : expr.children()) collect_columns(child, out);
-  // Callers pass the root once; normalize on the way out.
-  std::sort(out->begin(), out->end());
-  out->erase(std::unique(out->begin(), out->end()), out->end());
-}
-
-void PredicateEvaluator::set_row_from_views(
-    const std::vector<std::string_view>& cells,
-    const std::vector<bool>& nulls) {
-  schema_ = nullptr;  // synthesized rows are already canonical ASCII
-  vkinds_.clear();
-  vscales_.clear();
-  columns_.assign(cells.begin(), cells.end());
-  null_flags_.assign((columns_.size() + 7) / 8, 0);
-  for (size_t idx = 0; idx < nulls.size() && idx < columns_.size(); ++idx) {
-    if (nulls[idx]) {
-      null_flags_[idx / 8] =
-          static_cast<char>(static_cast<unsigned char>(null_flags_[idx / 8]) |
-                            (1u << (idx % 8)));
-    }
-  }
-}
-
-void PredicateEvaluator::set_row_from_views_typed(
-    const std::vector<std::string_view>& cells, const std::vector<bool>& nulls,
-    const std::vector<uint8_t>& kinds, const std::vector<int>& scales) {
-  schema_ = nullptr;  // per-column kinds/scales drive the typed decode instead
-  vkinds_.assign(kinds.begin(), kinds.end());
-  vscales_.assign(scales.begin(), scales.end());
-  columns_.assign(cells.begin(), cells.end());
-  null_flags_.assign((columns_.size() + 7) / 8, 0);
-  for (size_t idx = 0; idx < nulls.size() && idx < columns_.size(); ++idx) {
-    if (nulls[idx]) {
-      null_flags_[idx / 8] =
-          static_cast<char>(static_cast<unsigned char>(null_flags_[idx / 8]) |
-                            (1u << (idx % 8)));
-    }
-  }
 }
 
 // ---------------------------------------------------------------------------
@@ -257,30 +188,25 @@ PredicateEvaluator::Val PredicateEvaluator::extract_value(
       // raw binary (non-empty => present). DATE keeps a YYYYMMDD int so compare()
       // pairs it with a 'YYYY-MM-DD' literal without a per-row format; INT
       // decodes to a native integer (exact -- no re-parse). The ASCII branch
-      // below is untouched for UNTYPED columns.
+      // below is untouched for untyped columns.
       //
-      // Kind/scale come from the PAX schema (scan path) or the per-column
-      // vkinds_/vscales_ set by set_row_from_views_typed (joined-tuple path);
-      // the two sources are mutually exclusive (schema_ wins) and the decode
-      // below is identical for both.
-      const uint8_t vkind = schema_ != nullptr
-                                ? schema_->kind_of(static_cast<size_t>(idx) + 1)
-                                : (idx < vkinds_.size()
-                                       ? vkinds_[idx]
-                                       : LineairDB::Pax::FK_UNTYPED);
-      if (vkind != LineairDB::Pax::FK_UNTYPED) {
-        const uint8_t kind = vkind;
-        if (kind == LineairDB::Pax::FK_DATE) {
+      // Type and scale come from the PAX schema of the group the cells point
+      // into; a synthesized row has none and takes the ASCII path below.
+      const pax::FieldType type =
+          schema_ != nullptr ? schema_->type_of(static_cast<size_t>(idx) + 1)
+                             : pax::FieldType::kUntyped;
+      if (type != pax::FieldType::kUntyped) {
+        if (type == pax::FieldType::kDate) {
           int32_t x;
           std::memcpy(&x, col.data(), 4);
           v.type = ValType::DATE;
           v.i = x;
           break;
         }
-        if (kind == LineairDB::Pax::FK_INT32 ||
-            kind == LineairDB::Pax::FK_INT64) {
+        if (type == pax::FieldType::kInt32 ||
+            type == pax::FieldType::kInt64) {
           int64_t x;
-          if (kind == LineairDB::Pax::FK_INT32) {
+          if (type == pax::FieldType::kInt32) {
             int32_t t;
             std::memcpy(&t, col.data(), 4);
             x = t;
@@ -288,11 +214,11 @@ PredicateEvaluator::Val PredicateEvaluator::extract_value(
             std::memcpy(&x, col.data(), 8);
           }
           switch (expr.compare_type()) {
-            case 1:  // UNSIGNED_INT -- stay UINT so a mixed compare with a
+            case 1:  // UNSIGNED_INT: stay UINT so a mixed compare with a
                      // CONST_UINT literal > INT64_MAX is not cast to a negative
                      // int64. A typed unsigned column's value fits a positive
                      // int64 (LONG UNSIGNED <= 4.29e9; BIGINT UNSIGNED stays
-                     // UNTYPED), so this reinterpret is exact.
+                     // untyped), so this reinterpret is exact.
               v.type = ValType::UINT;
               v.u = static_cast<uint64_t>(x);
               break;
@@ -314,7 +240,7 @@ PredicateEvaluator::Val PredicateEvaluator::extract_value(
           }
           break;
         }
-        if (kind == LineairDB::Pax::FK_DEC64) {
+        if (type == pax::FieldType::kDecimal64) {
           // Reproduce the byte path's DECIMAL compare, which folds the cell to a
           // double via strtod(val_str). For a scaled int64 m with scale s,
           // (double)m / 10^s is bit-identical to strtod of the same value: the
@@ -324,9 +250,7 @@ PredicateEvaluator::Val PredicateEvaluator::extract_value(
           // integer boundary (q6's 0.07-excluding BETWEEN bound is preserved).
           int64_t m;
           std::memcpy(&m, col.data(), 8);
-          const int s = schema_ != nullptr
-                            ? schema_->scale_of(static_cast<size_t>(idx) + 1)
-                            : (idx < vscales_.size() ? vscales_[idx] : 0);
+          const int s = schema_->scale_of(static_cast<size_t>(idx) + 1);
           double p = 1.0;
           for (int k = 0; k < s; ++k) p *= 10.0;
           v.type = ValType::DOUBLE;

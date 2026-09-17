@@ -44,7 +44,7 @@ bool semijoin_rejects_value(
 
 bool semijoin_rejects_pax_slot(
     const std::vector<SemijoinReduction>& semijoin_reductions,
-    const LineairDB::Pax::PaxGroup& group, uint32_t slot,
+    const helios::storage::pax::PaxGroup& group, uint32_t slot,
     bool& schema_mismatch) {
     std::string buf;  // typed probe cell -> canonical ASCII
     for (const auto& reduction : semijoin_reductions) {
@@ -57,7 +57,7 @@ bool semijoin_rejects_pax_slot(
         // typed probe cell must be formatted to its canonical val_str to match.
         const std::string_view column =
             typed_key_view(group.cell(field, slot),
-                           group.schema().kind_of(field),
+                           group.schema().type_of(field),
                            group.schema().scale_of(field), buf);
         if (reduction.keys.find(std::string(column)) == reduction.keys.end()) {
             return true;
@@ -93,7 +93,7 @@ const std::vector<uint32_t>* selected_columns_for_projected_read(
 }  // namespace
 
 bool parallel_primary_pax_row_ref_scan(
-    LineairDB::Database* db,
+    helios::storage::Database* db,
     const LineairDB::Protocol::TxExecuteReadPlan::PlanStep& step,
     const std::string& start_key, const std::string& end_key,
     LineairDB::Protocol::TxExecuteReadPlan::StepResult* step_result,
@@ -136,19 +136,19 @@ bool parallel_primary_pax_row_ref_scan(
     auto run_range = [&](const std::string& chunk_start,
                          const std::string& chunk_end, RefChunkOut& out,
                          bool release_epoch) {
-        auto refs = db->StatelessPaxRowRefScan(
+        auto refs = db->ScanPax(
             step.table_name(), chunk_start, chunk_end, ref_scan_limit,
             step.reverse_scan());
         if (!refs.ok) {
             out.materialized_path_required = true;
-            if (release_epoch) db->ReleaseMasstreeThreadEpoch();
+            if (release_epoch) db->ReleaseThreadEpoch();
             return;
         }
 
         PredicateEvaluator evaluator;
         for (auto& row_ref : refs.rows) {
             const auto* group =
-                static_cast<const LineairDB::Pax::PaxGroup*>(row_ref.group);
+                static_cast<const helios::storage::pax::PaxGroup*>(row_ref.group);
             bool pass = true;
             if (has_filter) {
                 if (!evaluator.set_row_from_pax(
@@ -193,8 +193,8 @@ bool parallel_primary_pax_row_ref_scan(
 
             // The cells just read are valid only if the row TID still matches
             // the ref-scan observation. Otherwise re-read a stable row copy.
-            if (LineairDB::PaxRowRefCurrentTid(row_ref) != row_ref.tid) {
-                auto reread = db->StatelessRead(
+            if (helios::storage::CurrentTid(row_ref) != row_ref.tid) {
+                auto reread = db->Read(
                     step.table_name(), row_ref.key,
                     selected_columns_for_reread);
                 if (!reread.found) continue;
@@ -252,7 +252,7 @@ bool parallel_primary_pax_row_ref_scan(
             out.tids.push_back(row_ref.tid);
         }
 
-        if (release_epoch) db->ReleaseMasstreeThreadEpoch();
+        if (release_epoch) db->ReleaseThreadEpoch();
     };
 
     std::vector<RefChunkOut> chunks;
@@ -261,60 +261,55 @@ bool parallel_primary_pax_row_ref_scan(
         const unsigned nproc = std::thread::hardware_concurrency();
         const unsigned max_threads = std::min<unsigned>(nproc ? nproc : 4, 8);
         const std::vector<uint32_t> key_only_columns;
-        auto first = db->StatelessRangeScan(step.table_name(), start_key,
-                                            end_key, 1, false,
-                                            &key_only_columns);
-        auto last = db->StatelessRangeScan(step.table_name(), start_key,
-                                           end_key, 1, true,
-                                           &key_only_columns);
+        auto first = db->Scan(step.table_name(), start_key, end_key, 1, false,
+                              &key_only_columns);
+        auto last = db->Scan(step.table_name(), start_key, end_key, 1, true,
+                             &key_only_columns);
         int64_t lo = 0;
         int64_t hi = 0;
         if (max_threads > 1 && first.ok && !first.rows.empty() && last.ok &&
             !last.rows.empty() &&
             decode_leading_int_key(first.rows.front().key, lo) &&
             decode_leading_int_key(last.rows.front().key, hi) && hi > lo) {
-            const uint64_t span = static_cast<uint64_t>(hi - lo) + 1;
-            constexpr uint64_t kMinParallelRows = 500000;
-            constexpr uint64_t kMorselRows = 128000;
-            if (span >= kMinParallelRows) {
-                const unsigned worker_count = static_cast<unsigned>(
-                    std::min<uint64_t>(
-                        (span + kMorselRows - 1) / kMorselRows,
-                        max_threads));
-                if (worker_count > 1) {
-                    std::vector<std::string> starts(worker_count);
-                    std::vector<std::string> ends(worker_count);
-                    for (unsigned i = 0; i < worker_count; ++i) {
-                        const int64_t begin_value =
-                            lo + static_cast<int64_t>((span * i) /
-                                                      worker_count);
-                        const int64_t end_value =
-                            (i + 1 == worker_count)
-                                ? hi + 1
-                                : lo + static_cast<int64_t>(
-                                           (span * (i + 1)) / worker_count);
-                        starts[i] = i == 0 ? start_key
-                                           : encode_int_key_part(begin_value);
-                        ends[i] = i + 1 == worker_count
-                                      ? end_key
-                                      : encode_int_key_part(end_value);
-                    }
+          const uint64_t span = static_cast<uint64_t>(hi - lo) + 1;
+          constexpr uint64_t kMinParallelRows = 500000;
+          constexpr uint64_t kMorselRows = 128000;
+          if (span >= kMinParallelRows) {
+            const unsigned worker_count =
+                static_cast<unsigned>(std::min<uint64_t>(
+                    (span + kMorselRows - 1) / kMorselRows, max_threads));
+            if (worker_count > 1) {
+              std::vector<std::string> starts(worker_count);
+              std::vector<std::string> ends(worker_count);
+              for (unsigned i = 0; i < worker_count; ++i) {
+                const int64_t begin_value =
+                    lo + static_cast<int64_t>((span * i) / worker_count);
+                const int64_t end_value =
+                    (i + 1 == worker_count)
+                        ? hi + 1
+                        : lo + static_cast<int64_t>((span * (i + 1)) /
+                                                    worker_count);
+                starts[i] =
+                    i == 0 ? start_key : encode_int_key_part(begin_value);
+                ends[i] = i + 1 == worker_count
+                              ? end_key
+                              : encode_int_key_part(end_value);
+              }
 
-                    chunks = std::vector<RefChunkOut>(worker_count);
-                    std::vector<std::thread> workers;
-                    workers.reserve(worker_count);
-                    for (unsigned worker_index = 0;
-                         worker_index < worker_count; ++worker_index) {
-                        workers.emplace_back([&, worker_index] {
-                            run_range(starts[worker_index],
-                                      ends[worker_index],
-                                      chunks[worker_index], true);
-                        });
-                    }
-                    for (auto& worker : workers) worker.join();
-                    ran_parallel = true;
-                }
+              chunks = std::vector<RefChunkOut>(worker_count);
+              std::vector<std::thread> workers;
+              workers.reserve(worker_count);
+              for (unsigned worker_index = 0; worker_index < worker_count;
+                   ++worker_index) {
+                workers.emplace_back([&, worker_index] {
+                  run_range(starts[worker_index], ends[worker_index],
+                            chunks[worker_index], true);
+                });
+              }
+              for (auto &worker : workers) worker.join();
+              ran_parallel = true;
             }
+          }
         }
     }
     if (!ran_parallel) {
@@ -351,7 +346,7 @@ bool parallel_primary_pax_row_ref_scan(
 }
 
 bool parallel_primary_filter_scan(
-    LineairDB::Database* db,
+    helios::storage::Database* db,
     const LineairDB::Protocol::TxExecuteReadPlan::PlanStep& step,
     const std::string& start_key, const std::string& end_key,
     LineairDB::Protocol::TxExecuteReadPlan::StepResult* step_result) {
@@ -366,11 +361,11 @@ bool parallel_primary_filter_scan(
 
     // Probe the actual key span before creating split boundaries.
     const std::vector<uint32_t> key_only_columns;
-    auto first = db->StatelessRangeScan(step.table_name(), start_key, end_key,
-                                        1, false, &key_only_columns);
+    auto first = db->Scan(step.table_name(), start_key, end_key, 1, false,
+                          &key_only_columns);
     if (!first.ok || first.rows.empty()) return false;
-    auto last = db->StatelessRangeScan(step.table_name(), start_key, end_key,
-                                       1, true, &key_only_columns);
+    auto last = db->Scan(step.table_name(), start_key, end_key, 1, true,
+                         &key_only_columns);
     if (!last.ok || last.rows.empty()) return false;
 
     int64_t lo = 0;
@@ -423,13 +418,13 @@ bool parallel_primary_filter_scan(
          ++worker_index) {
         workers.emplace_back([&, worker_index] {
             auto scan_result =
-                db->StatelessRangeScan(step.table_name(),
+                db->Scan(step.table_name(),
                                        starts[worker_index],
                                        ends[worker_index], 0, false,
                                        selected_columns_for_reads);
             if (!scan_result.ok) {
                 failed[worker_index] = 1;
-                db->ReleaseMasstreeThreadEpoch();
+                db->ReleaseThreadEpoch();
                 return;
             }
 
@@ -463,7 +458,7 @@ bool parallel_primary_filter_scan(
                 out.values.push_back(std::move(row.value));
                 out.tids.push_back(row.tid);
             }
-            db->ReleaseMasstreeThreadEpoch();
+            db->ReleaseThreadEpoch();
         });
     }
     for (auto& worker : workers) worker.join();
