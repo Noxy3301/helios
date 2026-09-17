@@ -346,12 +346,8 @@ static int autogen_and_execute_prefetch(THD *thd, AccessPath *root,
                                         LineairDBTransaction *tx,
                                         bool include_inner_units = false) {
   std::vector<LineairDBProxy::ReadPlanStep> steps;
-  // Staged scans push key bounds and LIMIT only. Server-side row reductions
-  // (value filters, semijoin membership, existence-only caps) are absent by
-  // design: commit-time range replay walks the physical range and carries no
-  // filter, so a scan that drops rows on the server cannot pass validation.
-  // A shape autogen cannot stage is not an error: those reads take the row
-  // path, one request each.
+  // A staged scan carries key bounds and a LIMIT; the commit replays the range
+  // without a filter. A shape autogen cannot stage takes the row path.
   if (!autogen_read_plan_from_qep(thd, root, &steps, include_inner_units)) {
     return 0;
   }

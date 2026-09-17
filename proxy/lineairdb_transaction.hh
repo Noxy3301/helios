@@ -65,7 +65,7 @@ public:
   std::optional<SecondaryEntry> fetch_last_secondary_entry_in_range(
       const std::string &index_name, const std::string &start_key,
       const std::string &end_key);
-  bool update_secondary_index(
+  void update_secondary_index(
       std::string index_name,
       std::string old_secondary_key,
       std::string new_secondary_key,
@@ -229,13 +229,9 @@ private:
   // These sets live only inside one LineairDBTransaction.
   // commit/abort deletes the object, so cached rows never cross txs.
 
-  // Value cache for exact primary-key reads: serves a row to the statement
-  // without an RPC. NOT a validation set -- the TID it carries feeds
-  // base_row_read_set_ only when a cached row is actually consumed (the
-  // cache-hit paths in read()/batch_read() append it). Every entry comes from
-  // the storage, so every consume of one is an observation to validate.
-  // Overwritten when a statement re-stages the key. Keyed by
-  // (table_name + '\0' + key).
+  // Served-row cache for point reads, keyed by (table_name + '\0' + key).
+  // Not a validation set: an entry's TID joins base_row_read_set_ only when a
+  // cached row is actually consumed. Re-staging a key overwrites it.
   std::unordered_map<std::string, LocalRowEntry> row_cache_;
   static std::string make_row_cache_key(const std::string& table,
                                          const std::string& key) {
@@ -252,11 +248,8 @@ private:
   // ever grows by push_back, so a stored index never moves and stays valid.
   std::unordered_map<std::string, size_t> own_writes_index_;
 
-  // OCC commit-time read validation, two append-only sets (Silo read_set
-  // style); the server re-checks each at commit and aborts on a mismatch:
-  //   base_row_read_set_  per-key TID of base rows -> value changes
-  //   range_read_set_     observed range membership (result key-list),
-  //                       re-validated by logical replay -> phantoms
+  // Append-only read sets the commit re-validates: per-key TIDs of base rows,
+  // and per-range key lists replayed to catch phantoms.
   std::vector<LineairDBProxy::ReadEntry> base_row_read_set_;
   std::vector<LineairDBProxy::RangeReadEntry> range_read_set_;
 

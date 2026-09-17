@@ -90,17 +90,8 @@ void append_key_part_encoding(std::string &out, bool is_null,
 }
 
 /**
- * @brief Generate the end key of a prefix range (the next lexicographic key)
- *
- * By returning the next lexicographic key, all keys that start with the prefix
- * are covered precisely in the form [prefix, end).
- *
- * Example:
- *   prefix = 01 02 FF -> end = 01 03
- *
- * If all bytes are 0xFF, there is no valid next lexicographic key. In that
- * case we return an empty string as a sentinel for "no upper bound", which the
- * caller treats as an open-ended range (e.g., converted to std::nullopt).
+ * @brief The end key of the prefix range [prefix, end): the next lexicographic
+ * key, or empty when every byte is 0xFF and the range is unbounded above.
  */
 std::string build_prefix_range_end(const std::string &prefix) {
   std::string end = prefix;
@@ -132,16 +123,6 @@ std::string ha_lineairdb::build_prefix_range_end(const std::string &prefix) {
   return lineairdb_keyenc::build_prefix_range_end(prefix);
 }
 
-/**
- * @brief Serialize a single field value to LineairDB key format
- *
- * This helper function converts a MySQL Field to LineairDB's sortable key
- * format based on its type. This eliminates code duplication across different
- * key handling functions.
- *
- * @param field MySQL Field object
- * @return Serialized key string
- */
 std::string ha_lineairdb::serialize_key_from_field(Field *field) {
   const bool is_null = field->is_null();
   enum_field_types mysql_type = field->type();
@@ -348,11 +329,9 @@ int ha_lineairdb::generate_hidden_primary_key(LineairDBTransaction *tx,
 
   auto *proxy = get_proxy();
   std::lock_guard<std::mutex> lock(share->hidden_keys.mutex);
-  // A range granted by an earlier run of the storage server may overlap one the
-  // restarted server has since handed out, so it is spent, not merely stale.
-  // The run rides on the reservation response, so a connection that has not
-  // reserved yet (token 0, and again after a transport failure) has to ask
-  // before it may hand out what the share holds.
+  // A range from an earlier server run may overlap what the restarted server
+  // hands out. A connection that does not know the run (token 0) or whose run
+  // differs from the range's reserves again.
   const uint64_t token = proxy->storage_boot_token();
   const bool spent = share->hidden_keys.next >= share->hidden_keys.end;
   if (spent || token == 0 || token != share->hidden_keys.boot_token) {
@@ -430,14 +409,10 @@ int ha_lineairdb::autogenerate_key(LineairDBTransaction *tx,
 }
 
 /**
- * @brief Encode INT key from MySQL format to LineairDB sortable format
+ * @brief Encode a 1, 2, 4 or 8 byte integer key part.
  *
- * Converts little-endian integer to big-endian with sign bit flipped.
- * This ensures correct lexicographic ordering: negative < 0 < positive
- *
- * @param data MySQL key data (little-endian)
- * @param len Key length (1, 2, 4, or 8 bytes)
- * @return Big-endian binary string with sign bit flipped
+ * @details Little-endian to big-endian with the sign bit flipped, so
+ * lexicographic order matches signed integer order.
  */
 namespace lineairdb_keyenc {
 
@@ -491,11 +466,10 @@ std::string encode_int_key(const uchar *data, size_t len) {
 }
 
 /**
- * @brief Encode DATETIME key from MySQL format to LineairDB format
+ * @brief Encode a temporal key part.
  *
- * MYSQL_TYPE_DATE / MYSQL_TYPE_NEWDATE: 3 bytes stored in little-endian.
- * Must be converted to big-endian for correct lexicographic sorting.
- * DATETIME2, TIMESTAMP2, TIME2: already in big-endian sortable format.
+ * @details DATE and NEWDATE are 3 little-endian bytes and get reversed;
+ * DATETIME2, TIMESTAMP2 and TIME2 are already big-endian sortable.
  */
 std::string encode_datetime_key(const uchar *data, size_t len,
                                 enum_field_types mysql_type) {
@@ -510,14 +484,8 @@ std::string encode_datetime_key(const uchar *data, size_t len,
 }
 
 /**
- * @brief Encode VARCHAR key from MySQL format to LineairDB format
- *
- * MySQL stores VARCHAR keys with a 2-byte length prefix (little-endian).
- * We extract the actual string data without padding.
- *
- * @param data MySQL VARCHAR key data (length prefix + string + padding)
- * @param len Total key length
- * @return Actual string data without prefix or padding
+ * @brief Encode a VARCHAR key part: the string without MySQL's 2-byte
+ * little-endian length prefix and without padding.
  */
 std::string encode_string_key(const uchar *data, size_t len) {
   if (len < 2)
@@ -552,23 +520,8 @@ std::string ha_lineairdb::encode_string_key(const uchar *data, size_t len) {
 }
 
 /**
- * @brief Convert MySQL binary composite key format to LineairDB sortable key
- * format
- *
- * This function handles composite keys by processing each key part
- * sequentially:
- * - Reads key_part_map to determine which parts are used
- * - Converts each part to sortable format based on its type
- * - Concatenates all parts into a single sortable string
- *
- * Key formats by type:
- * - INT: Little-endian to big-endian + sign bit flip (for correct sorting)
- * - DATETIME: Pass through as-is (already sortable)
- * - STRING (VARCHAR): Extract actual data (remove length prefix and padding)
- *
- * @param key MySQL binary key data (concatenated byte array)
- * @param keypart_map Bitmap indicating which key parts are used
- * @return LineairDB formatted key string (concatenated sortable format)
+ * @brief Convert a MySQL composite key into the sortable key format: the key
+ * parts named by keypart_map, each encoded by its type, concatenated.
  */
 namespace lineairdb_keyenc {
 
@@ -654,20 +607,3 @@ std::string ha_lineairdb::convert_key_to_ldbformat(const uchar *key,
                                                     keypart_map);
 }
 
-/**
- * @brief This function only extracts the type of key for
- *        tables that have single key
- *
- * @return bytes Key type is int
- * @return 0 Key type is not int
- */
-bool ha_lineairdb::is_primary_key_type_int() {
-  ha_base_keytype integer_types[] = {
-      HA_KEYTYPE_SHORT_INT, HA_KEYTYPE_USHORT_INT, HA_KEYTYPE_LONG_INT,
-      HA_KEYTYPE_ULONG_INT, HA_KEYTYPE_LONGLONG,   HA_KEYTYPE_ULONGLONG,
-      HA_KEYTYPE_INT24,     HA_KEYTYPE_UINT24,     HA_KEYTYPE_INT8};
-  assert(table->s->keys == 1);
-  ha_base_keytype key_type = primary_key_type;
-  return std::find(std::begin(integer_types), std::end(integer_types),
-                   key_type) != std::end(integer_types);
-}

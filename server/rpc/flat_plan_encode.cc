@@ -57,8 +57,6 @@ void encode_step(
     for (const auto& k : s.group_start_keys()) w_bytes(out, k);
     w_u64(out, static_cast<uint64_t>(s.group_end_keys_size()));
     for (const auto& k : s.group_end_keys()) w_bytes(out, k);
-    w_u64(out, static_cast<uint64_t>(s.filtered_keys_size()));
-    for (const auto& k : s.filtered_keys()) w_bytes(out, k);
 }
 }  // namespace
 

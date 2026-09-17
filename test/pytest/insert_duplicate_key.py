@@ -407,11 +407,8 @@ def test_concurrent_sessions(cursor, user, password):
 
 
 def test_conflicting_read_outranks_the_duplicate(cursor, user, password):
-    # The TPC-C shape: two sessions take the same next order id, the first
-    # commits its increment and its order, and the second's insert then lands
-    # on a key that exists. Its district read is already stale, so this is a
-    # conflict to retry, not a duplicate to report -- BenchBase retries 1213
-    # and commit-time 1180, never 1062.
+    # The second session's insert lands on a key that exists and its earlier
+    # district read is stale, so this is a conflict to retry, not a duplicate.
     print("A STALE READ OUTRANKS THE DUPLICATE IT CAUSED TEST")
     district = create_table(cursor)
     orders = create_table(cursor)

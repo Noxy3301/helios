@@ -18,10 +18,8 @@ int ha_lineairdb::rnd_init(bool) {
   scanned_values_.clear();
   scan_cache_.clear();
   buffer_position_ = 0;
-  last_batch_key_.clear();
   scan_exhausted_ = false;
   last_fetched_primary_key_.clear();
-  current_position_ = 0;
   stats.records = 0;
 
   change_active_index(table->s->primary_key);
@@ -50,14 +48,13 @@ int ha_lineairdb::rnd_end() {
   // after scanning and then call rnd_pos() to re-read rows in sorted order.
   // Clear them at the start of the next rnd_init() instead.
   buffer_position_ = 0;
-  last_batch_key_.clear();
   scan_exhausted_ = false;
   blobroot.Clear();
   return 0;
 }
 
-bool ha_lineairdb::fetch_next_batch() {
-  DBUG_ENTER("ha_lineairdb::fetch_next_batch");
+bool ha_lineairdb::materialize_scan() {
+  DBUG_ENTER("ha_lineairdb::materialize_scan");
 
   auto tx = get_transaction(ha_thd());
   if (tx->is_aborted()) {
@@ -110,7 +107,7 @@ int ha_lineairdb::rnd_next(uchar *buf) {
       DBUG_RETURN(HA_ERR_END_OF_FILE);
     }
 
-    if (!fetch_next_batch()) {
+    if (!materialize_scan()) {
       auto tx = get_transaction(ha_thd());
       if (tx->is_aborted()) {
         DBUG_RETURN(abort_errno(tx));
@@ -128,7 +125,6 @@ int ha_lineairdb::rnd_next(uchar *buf) {
   if (error == 0) {
     last_fetched_primary_key_ = key;
   }
-  current_position_++;
   DBUG_RETURN(error);
 }
 

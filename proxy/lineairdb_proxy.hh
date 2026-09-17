@@ -12,9 +12,9 @@
 
 class TxRpcTrace;
 
-// Message header for RPC communication (matching server implementation)
+// Frame header of one request or response (the server's message.hh), both
+// fields in network order.
 struct MessageHeader {
-    uint64_t sender_id;      // sender ID
     uint32_t message_type;   // OpCode from protobuf
     uint32_t payload_size;   // size of the protobuf payload
 };
@@ -193,8 +193,6 @@ public:
         std::vector<uint32_t> group_sizes;
         std::vector<std::string> group_start_keys;
         std::vector<std::string> group_end_keys;
-        // Keys the step filter rejected (plain scans): negative coverage.
-        std::vector<std::string> filtered_keys;
     };
     struct ReadPlanResult {
         bool ok = false;
@@ -241,10 +239,9 @@ public:
         bool* transport_error = nullptr);
 
     // table/index management (non-transactional)
-    // Optional PAX storage cell widths. Entry 0 is the null-flags field; later
-    // entries follow TABLE::field order. Empty keeps the ordinary row layout.
-    // pax_field_kind/pax_field_scale carry PAX typed-cell metadata, one entry
-    // per pax_field_max_bytes entry; empty keeps the ASCII byte layout.
+    // Optional PAX cell widths (entry 0 = null flags, then TABLE::field
+    // order); empty keeps the row layout. kind/scale carry typed cells, one
+    // entry per width.
     bool db_create_table(
         const std::string& table_name,
         const std::vector<uint32_t>& pax_field_max_bytes = {},
@@ -278,11 +275,8 @@ public:
     // Route per-RPC measurements to the active transaction trace.
     void set_current_trace(TxRpcTrace* trace) { current_trace_ = trace; }
 
-    // Run of the storage server this connection has heard from, 0 until it
-    // hears from one and again after any transport failure. Learned from the
-    // table stats every connection fetches when it opens a table, and from a
-    // hidden-key reservation. Starting at 0 is what makes a connection that
-    // has heard nothing re-reserve rather than trust a cached range.
+    // Run of the storage server this connection has heard from; 0 until heard
+    // and after any transport failure, which forces re-reservation.
     uint64_t storage_boot_token() const { return storage_boot_token_; }
 
 private:

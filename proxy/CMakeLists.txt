@@ -54,7 +54,6 @@ set(LINEAIRDB_SOURCES ha_lineairdb.cc ha_lineairdb.hh
                       lineairdb_proxy.cc lineairdb_proxy.hh
                       lineairdb_keyenc.cc lineairdb_keyenc.hh
                       row_codec.cc
-                      lineairdb_pushdown.cc lineairdb_pushdown.hh
                       lineairdb_index_search.cc lineairdb_index_search.hh
                       lineairdb_prefetch.cc lineairdb_prefetch.hh
                       lineairdb_autogen.cc lineairdb_autogen.hh

@@ -182,11 +182,8 @@ int ha_lineairdb::update_row(const uchar *old_data, uchar *new_data) {
   auto key = extract_key_from_mysql(old_data);
   const auto new_key = extract_key_from_mysql(new_data);
 
-  // FIXME: reject a PK-changing UPDATE. update_row overwrites in place at the
-  // old key and cannot move a row, so executing one would store new_data under
-  // the old key with nothing at the new key -- silent corruption. A real move
-  // (delete old + insert new + secondary-index rewrite) is not implemented.
-  if (key != new_key) {
+  // update_row overwrites in place at the old key and cannot move a row.
+  if (key != new_key) {  // FIXME: implement the move (delete+insert+index)
     return reject_unsupported_statement(ha_thd(), tx,
                                        "primary-key-changing UPDATE");
   }

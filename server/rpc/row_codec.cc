@@ -1,13 +1,7 @@
 #include "row_codec.hh"
 
-#include <cstdio>
 #include <cstdlib>
-#include <cstring>
 #include <string>
-
-#include "decimal_arithmetic.hh"
-
-using helios::storage::pax::FieldType;
 
 std::string next_lexicographic_key(std::string key) {
     for (size_t i = key.size(); i-- > 0;) {
@@ -19,45 +13,6 @@ std::string next_lexicographic_key(std::string key) {
         }
     }
     return {};
-}
-
-bool trim_row_value(const std::string& full,
-                    const google::protobuf::RepeatedField<uint32_t>& kept,
-                    uint32_t num_columns, std::string& out) {
-    out.clear();
-    const char* end = full.data() + full.size();
-    auto read_field = [&](const char*& q, const char*& fstart,
-                          size_t& flen) -> bool {
-        fstart = q;
-        if (q >= end) return false;
-        uint8_t bs = static_cast<uint8_t>(*q);
-        if (bs == 0xFF) { flen = 1; q += 1; return true; }
-        if (q + 1 + bs > end) return false;
-        size_t len = 0;
-        for (uint8_t i = 0; i < bs; i++)
-            len |= static_cast<size_t>(static_cast<uint8_t>(q[1 + i])) << (8 * i);
-        if (q + 1 + bs + len > end) return false;
-        flen = 1 + bs + len;
-        q += flen;
-        return true;
-    };
-    const char* q = full.data();
-    const char* fs;
-    size_t fl;
-    if (!read_field(q, fs, fl)) return false;  // field 0 = null_flags
-    out.append(fs, fl);
-    int ki = 0;
-    for (uint32_t c = 0; c < num_columns; c++) {  // column c is field index c+1
-        const char* cs;
-        size_t cl;
-        if (!read_field(q, cs, cl)) return false;
-        if (ki < kept.size() &&
-            kept.Get(ki) == static_cast<uint32_t>(c)) {
-            out.append(cs, cl);
-            ki++;
-        }
-    }
-    return ki == kept.size();  // every requested column was present
 }
 
 std::string_view extract_value_column(const std::string& row,
@@ -91,54 +46,6 @@ std::string_view extract_value_column(const std::string& row,
         ++field_index;
     }
     return {};
-}
-
-void format_typed_cell(FieldType type, int scale, std::string_view value,
-                       std::string* out) {
-    switch (type) {
-        case FieldType::kInt32: {
-            int32_t x;
-            std::memcpy(&x, value.data(), 4);
-            out->append(std::to_string(x));
-            break;
-        }
-        case FieldType::kInt64: {
-            int64_t x;
-            std::memcpy(&x, value.data(), 8);
-            out->append(std::to_string(x));
-            break;
-        }
-        case FieldType::kDate: {
-            int32_t x;
-            std::memcpy(&x, value.data(), 4);
-            char b[16];
-            const int n = std::snprintf(b, sizeof(b), "%04d-%02d-%02d",
-                                        x / 10000, (x / 100) % 100, x % 100);
-            if (n > 0) out->append(b, static_cast<size_t>(n));
-            break;
-        }
-        case FieldType::kDecimal64: {
-            int64_t x;
-            std::memcpy(&x, value.data(), 8);
-            DecimalValue d;
-            d.mantissa = x;
-            d.scale = scale;
-            d.is_null = false;
-            out->append(format_decimal_value(d));
-            break;
-        }
-        default:
-            out->append(value.data(), value.size());
-            break;
-    }
-}
-
-std::string_view typed_key_view(std::string_view value, FieldType type,
-                                int scale, std::string& buf) {
-    if (type == FieldType::kUntyped || value.empty()) return value;
-    buf.clear();
-    format_typed_cell(type, scale, value, &buf);
-    return buf;
 }
 
 std::string encode_int_key_part(int64_t value) {

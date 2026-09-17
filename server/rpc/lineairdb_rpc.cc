@@ -15,8 +15,9 @@ LineairDBRpc::LineairDBRpc(std::shared_ptr<DatabaseManager> db_manager,
       hidden_keys_(hidden_keys) {
 }
 
-void LineairDBRpc::handle_rpc(uint64_t sender_id, MessageType message_type,
-                             const std::string& message, std::string& result) {
+void LineairDBRpc::handle_rpc(MessageType message_type,
+                              const std::string& message,
+                              std::string& result) {
     LOG_DEBUG("Handling RPC: message_type=%u", static_cast<uint32_t>(message_type));
 
     switch(message_type) {

@@ -2,9 +2,8 @@
 
 #include <cstdint>
 
-// Message header for RPC communication
+// Frame header of one request or response, both fields in network order.
 struct MessageHeader {
-    uint64_t sender_id;      // sender ID (not used in LineairDB but keeping for consistency)
     uint32_t message_type;   // OpCode from protobuf
     uint32_t payload_size;   // size of the protobuf payload
 };

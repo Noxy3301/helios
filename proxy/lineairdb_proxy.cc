@@ -377,6 +377,26 @@ bool LineairDBProxy::tx_commit(
     return response.committed();
 }
 
+namespace {
+void fill_bindings(
+    const std::vector<LineairDBProxy::ReadPlanKeyBinding>& bindings,
+    google::protobuf::RepeatedPtrField<
+        LineairDB::Protocol::TxExecuteReadPlan::KeyBinding>* out) {
+    for (const auto& binding : bindings) {
+        auto* b = out->Add();
+        b->set_source_step(binding.source_step);
+        b->set_source_row(binding.source_row);
+        b->set_source_offset(binding.source_offset);
+        b->set_source_length(binding.source_length);
+        b->set_use_midpoint(binding.use_midpoint);
+        b->set_from_key(binding.from_key);
+        b->set_source_column(binding.source_column);
+        b->set_column_as_int_key(binding.column_as_int_key);
+        b->set_int_delta(binding.int_delta);
+    }
+}
+}  // namespace
+
 LineairDBProxy::ReadPlanResult LineairDBProxy::tx_execute_read_plan(
     const std::vector<ReadPlanStep>& steps) {
     ReadPlanResult result;
@@ -397,30 +417,8 @@ LineairDBProxy::ReadPlanResult LineairDBProxy::tx_execute_read_plan(
         out->set_index_name(step.index_name);
         out->set_for_each(step.for_each);
         out->set_reverse_scan(step.reverse_scan);
-        for (const auto& binding : step.bindings) {
-            auto* b = out->add_bindings();
-            b->set_source_step(binding.source_step);
-            b->set_source_row(binding.source_row);
-            b->set_source_offset(binding.source_offset);
-            b->set_source_length(binding.source_length);
-            b->set_use_midpoint(binding.use_midpoint);
-            b->set_from_key(binding.from_key);
-            b->set_source_column(binding.source_column);
-            b->set_column_as_int_key(binding.column_as_int_key);
-            b->set_int_delta(binding.int_delta);
-        }
-        for (const auto& binding : step.end_bindings) {
-            auto* b = out->add_end_bindings();
-            b->set_source_step(binding.source_step);
-            b->set_source_row(binding.source_row);
-            b->set_source_offset(binding.source_offset);
-            b->set_source_length(binding.source_length);
-            b->set_use_midpoint(binding.use_midpoint);
-            b->set_from_key(binding.from_key);
-            b->set_source_column(binding.source_column);
-            b->set_column_as_int_key(binding.column_as_int_key);
-            b->set_int_delta(binding.int_delta);
-        }
+        fill_bindings(step.bindings, out->mutable_bindings());
+        fill_bindings(step.end_bindings, out->mutable_end_bindings());
     }
 
     // TxExecuteReadPlan responses can exceed protobuf's ~2GB message limit, so
@@ -527,10 +525,6 @@ LineairDBProxy::ReadPlanResult LineairDBProxy::tx_execute_read_plan(
         out.group_end_keys.reserve(cap(n));
         for (uint64_t j = 0; j < n && r.ok; ++j)
             out.group_end_keys.push_back(r.bytes());
-        n = r.u64();
-        out.filtered_keys.reserve(cap(n));
-        for (uint64_t j = 0; j < n && r.ok; ++j)
-            out.filtered_keys.push_back(r.bytes());
         result.steps.push_back(std::move(out));
     }
     if (!r.ok) {
@@ -734,11 +728,10 @@ bool LineairDBProxy::exchange_message(const std::string& serialized_request,
 
     // prepare message header
     MessageHeader header;
-    header.sender_id = htobe64(1);  // TODO: replace with actual sender ID
     header.message_type = htonl(static_cast<uint32_t>(message_type));
     header.payload_size = htonl(static_cast<uint32_t>(serialized_request.size()));
 
-    LOG_DEBUG("SEND_MESSAGE: Prepared header: sender_id=1, message_type=%u, payload_size=%zu", 
+    LOG_DEBUG("SEND_MESSAGE: Prepared header: message_type=%u, payload_size=%zu",
               static_cast<uint32_t>(message_type), serialized_request.size());
 
     // combine header and payload
@@ -770,12 +763,11 @@ bool LineairDBProxy::exchange_message(const std::string& serialized_request,
     }
 
     // convert from network byte order to host byte order
-    uint64_t response_sender_id = be64toh(response_header.sender_id);
     uint32_t response_message_type = ntohl(response_header.message_type);
     uint32_t response_payload_size = ntohl(response_header.payload_size);
 
-    LOG_DEBUG("SEND_MESSAGE: Received response header: sender_id=%lu, message_type=%u, payload_size=%u", 
-              response_sender_id, response_message_type, response_payload_size);
+    LOG_DEBUG("SEND_MESSAGE: Received response header: message_type=%u, payload_size=%u",
+              response_message_type, response_payload_size);
 
     // Receive the response payload. recv(MSG_WAITALL) still caps one call near
     // 2GB, so large read-plan responses must be drained in a loop.

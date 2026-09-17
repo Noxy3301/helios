@@ -165,10 +165,10 @@ def server_startup_contract():
 
 
 def switch_commit_durability(mode):
-    """Move the running storage server to `mode` once everything acknowledged
-    under the previous contract is durable. Returns the elapsed seconds, or
-    None if the switch did not happen."""
-    print(f"  Switching durability to {mode}, waiting for the barrier...")
+    """Set the running storage server's commit durability to `mode`. The switch
+    publishes the new contract and does not wait for commits acknowledged under
+    the old one. Returns the elapsed seconds, or None if it did not happen."""
+    print(f"  Switching durability to {mode}...")
     started = time.time()
     result = subprocess.run(
         [str(LINEAIRDB_CTL), "--host", "127.0.0.1", "--port", "9999",
@@ -870,7 +870,9 @@ def main():
     parser.add_argument("--load-durability", choices=["same", "async"], default="same",
                         help="Commit durability for the load phase: same keeps the server's "
                              "startup contract, async starts it under Async and switches it "
-                             "to Sync before ANALYZE/execute (managed lifecycle only)")
+                             "to Sync before ANALYZE/execute. The switch is a plain mode "
+                             "change with no barrier, so loaded rows are not known durable "
+                             "at that point (managed lifecycle only)")
     parser.add_argument("--exclude-queries", type=str, help="TPC-H: comma-separated query numbers to exclude (e.g. 15,21)")
     parser.add_argument("--no-setup", action="store_true", help="Skip setup (DROP+CREATE+LOAD), assume data exists")
     parser.add_argument("--no-load", action="store_true", help="Run setup with CREATE only, skip LOAD")
@@ -1000,10 +1002,8 @@ def main():
     print(f"SF={args.scalefactor}, Time={args.time}s, MySQL={args.mysql_host}:{args.mysql_port}")
     print(f"Results:   {result_base}")
 
-    # Decide whether to manage server lifecycle.
-    # Skip management when --external-server is set, when targeting a remote
-    # mysqld (--mysql-host != localhost), or when something is already
-    # listening on the configured mysql port.
+    # Manage the server lifecycle unless --external-server, a remote mysqld,
+    # or an occupied port says otherwise.
     managed = not args.external_server
     if managed and args.mysql_host not in ("127.0.0.1", "localhost"):
         print(f"  --mysql-host={args.mysql_host} is not local, switching to external mode")
@@ -1106,7 +1106,7 @@ def _run_bench(args, config_work, thread_list, result_base):
         elapsed = switch_commit_durability("sync")
         if elapsed is None:
             sys.exit(1)
-        print(f"  Durability switch async -> sync: {elapsed:.2f}s")
+        print(f"  Durability switch async -> sync took {elapsed:.2f}s (no barrier)")
         (result_base / "durability.txt").write_text(
             f"load_mode=async\nmeasured_mode=sync\nswitch_seconds={elapsed:.2f}\n")
 

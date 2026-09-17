@@ -16,7 +16,7 @@
 struct RpcEntry {
   MessageType type;
   uint64_t us;          // duration microseconds
-  uint64_t off_us;      // offset from tx_begin in microseconds
+  uint64_t off_us;      // offset from the transaction start in microseconds
   uint32_t req_b;       // serialized request bytes
   uint32_t resp_b;      // serialized response bytes
   uint32_t stmt_idx;    // index into statements_; UINT32_MAX if pre-stmt

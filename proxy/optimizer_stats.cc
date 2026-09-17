@@ -180,7 +180,7 @@ void ha_lineairdb::seed_optimizer_stats() {
   // Existing path: use BEGIN/END piggyback stats when available.
   const bool seeded = seed_row_count_from_cache(proxy);
 
-  // Cold optimizer paths can reach info() before tx_begin.
+  // Cold optimizer paths can reach info() before the transaction starts.
   if (!seeded || need_ndv || force_ndv) {
     bool fetched = false;
     bool requested_ndv = false;

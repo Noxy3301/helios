@@ -200,10 +200,8 @@ def test_acknowledgement_follows_the_fdatasync(work_dir):
 
         released_at = time.monotonic()
         os.write(release_w, b"r")
-        # The row's record may sit in a later group than the one that was held,
-        # and each group stops at the point. Keep releasing until the commit is
-        # acknowledged: what the assertion above established is that it was not
-        # acknowledged while a flush was stopped.
+        # Each group stops at the pause point; keep releasing until the
+        # commit is acknowledged.
         deadline = released_at + ARRIVAL_WAIT_SECONDS
         while (committer.returned_at is None and committer.error is None
                and time.monotonic() < deadline):

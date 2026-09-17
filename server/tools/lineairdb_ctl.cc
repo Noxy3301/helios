@@ -90,7 +90,6 @@ int connect_to(const sockaddr_in &address) {
 bool exchange(int fd, MessageType type, const std::string &request,
               std::string &response) {
   MessageHeader header{};
-  header.sender_id = htobe64(1);
   header.message_type = htonl(static_cast<uint32_t>(type));
   header.payload_size = htonl(static_cast<uint32_t>(request.size()));
 

@@ -69,8 +69,6 @@ set(SOURCES
     rpc/lineairdb_rpc.cc
     rpc/lineairdb_rpc.hh
     rpc/database_operations.cc
-    rpc/decimal_arithmetic.cc
-    rpc/decimal_arithmetic.hh
     rpc/flat_plan_encode.cc
     rpc/flat_plan_encode.hh
     rpc/parallel_scan.cc
@@ -80,8 +78,6 @@ set(SOURCES
     rpc/row_codec.hh
     rpc/transaction_operations.cc
     rpc/table_stats.cc
-    rpc/predicate_evaluator.cc
-    rpc/predicate_evaluator.hh
     mysql_charset_runtime.cc
     mysql_charset_runtime.hh
     rpc/duckdb_ast_builder.cc

@@ -89,7 +89,7 @@ public:
                  std::shared_ptr<HiddenKeyAllocator> hidden_keys);
     ~LineairDBRpc() = default;
 
-    void handle_rpc(uint64_t sender_id, MessageType message_type,
+    void handle_rpc(MessageType message_type,
                    const std::string& message, std::string& result);
 
 private:

@@ -58,12 +58,9 @@ std::vector<uint32_t> compute_pax_field_widths(
     uint32_t kind = pax_kind::UNTYPED;
     int32_t scale = 0;
 
-    // A ZEROFILL integer left-pads val_str to its display width, so the value
-    // alone cannot reproduce the exact bytes -- keep such columns UNTYPED.
-    // MYSQL_TYPE_YEAR renders zero-filled to its display width ("0000" for 0)
-    // REGARDLESS of the Field_num::zerofill member (which is observed false at
-    // runtime), so relying on that flag mis-types YEAR and gathers "0" != "0000"
-    // -- force YEAR UNTYPED explicitly.
+    // ZEROFILL and YEAR render zero-padded bytes the value alone cannot
+    // reproduce (YEAR does so whatever Field_num::zerofill says), so both
+    // stay UNTYPED.
     const bool zerofill =
         (field->type() == MYSQL_TYPE_YEAR)
             ? true
@@ -113,18 +110,9 @@ std::vector<uint32_t> compute_pax_field_widths(
         // Sign + decimal point slack for the UNTYPED bound, kept as the fallback
         // width when the value is not encoded as a scaled int64 below.
         width += 2;
-        // A fixed-scale DECIMAL(p,s) becomes an 8-byte FK_DEC64 cell holding
-        // value * 10^s as a scaled int64. The precision <= 15 cap has two
-        // independent exactness reasons:
-        //   (i)  the scaled int64 must hold every value: 10^15 - 1 < INT64_MAX;
-        //   (ii) the server FILTER path compares (double)m / 10^s, which must
-        //        equal strtod(val_str) EXACTLY to preserve the byte path's
-        //        double compare semantics (q6's 0.07-excluding BETWEEN bound).
-        //        That holds only while m and 10^s are both exact doubles, i.e.
-        //        m < 2^53 <=> p <= 15 (10^15 < 2^53). The AGG path stays exact
-        //        regardless via the int64 mantissa.
-        // A ZEROFILL DECIMAL left-pads val_str, so its bytes are not
-        // reproducible from the value alone -- keep it UNTYPED, as is p > 15.
+        // A fixed-scale DECIMAL(p,s) becomes an 8-byte decimal cell holding
+        // value * 10^s. Precision <= 15 keeps the scaled int64 and both 10^s
+        // and the mantissa exact as doubles; p > 15 and ZEROFILL stay UNTYPED.
         const auto *fd = down_cast<const Field_new_decimal *>(field);
         if (!zerofill && fd->precision <= 15) {
           kind = pax_kind::DEC64;
@@ -152,12 +140,9 @@ std::vector<uint32_t> compute_pax_field_widths(
       case MYSQL_TYPE_VAR_STRING:
       case MYSQL_TYPE_ENUM:
       case MYSQL_TYPE_SET:
-        // field_length is the charset octet length: utf8mb4 reserves 4 bytes
-        // per declared character, padding a pure-ASCII VARCHAR(44) cell to 176
-        // B. Size the cell to the declared character count instead (a no-op for
-        // latin1/binary where mbmaxlen == 1). A genuine multibyte row whose
-        // bytes exceed char_length() falls back to the existing per-row heap
-        // path, which disables strip-direct scans for that table.
+        // Size the cell to the declared character count, not the charset
+        // octet length; a row whose bytes exceed it takes the per-row heap
+        // path, which disables strip-direct scans for the table.
         width = field->char_length();
         break;
       default:
@@ -178,14 +163,10 @@ void ha_lineairdb::set_key_and_key_part_info(const TABLE *const table) {
   uint pk_index = table->s->primary_key;
 
   if (pk_index != MAX_KEY) {
-    primary_key_type = static_cast<ha_base_keytype>(
-        table->key_info[pk_index].key_part[0].type);
-
     key_part = table->key_info[pk_index].key_part;
     indexed_key_part = key_part[0];
     num_key_parts = table->key_info[pk_index].user_defined_key_parts;
   } else {
-    primary_key_type = HA_KEYTYPE_END;
     key_part = nullptr;
     num_key_parts = 0;
   }
@@ -203,10 +184,8 @@ int ha_lineairdb::open(const char *table_name, int, uint, const dd::Table *) {
     set_key_and_key_part_info(table);
 
   if (table->s->primary_key != MAX_KEY) {
-    // Calculate LineairDBField-encoded PK size. Each key part is encoded as:
-    //   1 (null marker) + 1 (type tag) + 2 (length field) + payload
-    // For STRING types, an extra terminator byte is added (+5 total overhead).
-    // MySQL's key_length only counts raw column bytes, which is smaller.
+    // A key part carries 4 bytes of overhead (null marker, type tag, 2-byte
+    // length) and STRING one more terminator; key_length counts neither.
     uint pk_index = table->s->primary_key;
     KEY *pk = &table->key_info[pk_index];
     size_t encoded_pk_size = 0;
@@ -372,12 +351,9 @@ bool ha_lineairdb::backfill_indexes_parallel(
   blobroot.Clear();
   if (decode_failed) return false;
 
-  // Phase B: one worker per partition, each on its own connection. The hash
-  // partition commits every op for a secondary key on one worker, so no two
-  // workers mutate the same index DataItem; distinct keys are distinct
-  // DataItems committed through the normal concurrent path LineairDB serves for
-  // multiple query layers. Workers touch no MySQL state; a failure sets the
-  // shared flag for the caller to report.
+  // Phase B: one worker per key-hash partition on its own connection, so no
+  // two workers mutate the same index entry. Workers touch no MySQL state; a
+  // failure sets the shared flag for the caller to report.
   std::atomic<bool> failed{false};
   const std::string host = server_connection_host();
   const int port = server_connection_port();
