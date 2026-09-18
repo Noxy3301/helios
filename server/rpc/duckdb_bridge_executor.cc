@@ -84,18 +84,16 @@ uint32_t LengthPrefixBytes(uint32_t length) {
  * @brief Appends one field in the proxy row format (matches
  * proxy/ha_lineairdb_columnar.cc's DecodeRowFields).
  *
- * @details One byte length-width tag (0xFF = SQL NULL), then that many
- * little-endian length bytes, then the payload. NULL and empty string are
- * distinct and must not be conflated: `is_null` is the only signal for the
- * 0xFF sentinel. An empty-but-non-null payload (e.g. a genuine VARCHAR ''
- * result) takes the normal path with length 0 -- exactly one tag byte 0x00,
- * no length bytes, no payload -- which DecodeRowFields reads as {ptr, len=0,
- * empty=false}, distinct from the {nullptr, 0, empty=true} it produces for
- * the sentinel. Nullness is never inferred from payload.empty().
+ * @details One byte length-width tag (0xFF for a field with no payload),
+ * then that many little-endian length bytes, then the payload. A zero-length
+ * payload takes the normal path: one tag byte 0x00, no length bytes, no
+ * payload, which reads back as a zero-length slice like the 0xFF tag does.
+ * The framing carries no nullness of its own; the null bitmap in field 0 of
+ * the row marks the NULL columns.
  *
  * @param out Destination row buffer.
  * @param payload Field bytes; ignored when is_null.
- * @param is_null True encodes the SQL NULL sentinel.
+ * @param is_null True writes the payload-free tag.
  */
 void AppendProxyField(std::string& out, std::string_view payload,
                       bool is_null) {
@@ -151,8 +149,8 @@ uint32_t FenceTimeoutMs() {
  * @brief Splits one proxy row payload into per-field {pointer, length} refs.
  *
  * @details Field 0 is the null-flags field; MySQL column i is field i + 1. A
- * 0xFF width tag (no value) and a zero-length payload both yield length 0,
- * matching the strip-cell convention "empty == SQL NULL".
+ * 0xFF width tag and a zero-length payload both yield length 0, and the
+ * null-flags field is what separates a NULL column from an empty value.
  */
 void SplitProxyRow(const std::string& row,
                    std::vector<std::pair<const char*, uint32_t>>* fields) {
@@ -285,6 +283,8 @@ struct ColumnSpec {
   FieldType type = FieldType::kUntyped;
   uint32_t width = 0;
   int8_t scale = 0;
+  uint32_t null_byte = 0;  // byte of the row null-flags field
+  uint8_t null_mask = 0;   // 0 when the column is not nullable
 };
 
 /**
@@ -756,16 +756,19 @@ void BulkDecodeTyped(FieldType type, const PaxGroup& group, size_t field,
 /**
  * @brief Decodes one untyped cell into a VARCHAR vector slot.
  *
- * @details An empty untyped cell is SQL NULL; short payloads inline into
- * string_t, longer ones copy into the vector's string heap.
+ * @details A zero-length cell is SQL NULL only when the row's null-flags
+ * field marks the column so, and the empty string otherwise; short payloads
+ * inline into string_t, longer ones copy into the vector's string heap.
  */
 inline void DecodeUntypedCell(const PaxGroup& group, size_t field,
-                              uint32_t slot, Vector& output_vector,
-                              idx_t out_row) {
-  const std::string_view cell_value = group.cell(field, slot);
-  if (cell_value.empty()) {
+                              uint32_t slot, bool is_null,
+                              Vector& output_vector, idx_t out_row) {
+  if (is_null) {
     FlatVector::SetNull(output_vector, out_row, true);
-  } else if (cell_value.size() <= duckdb::string_t::INLINE_LENGTH) {
+    return;
+  }
+  const std::string_view cell_value = group.cell(field, slot);
+  if (cell_value.size() <= duckdb::string_t::INLINE_LENGTH) {
     FlatVector::GetData<duckdb::string_t>(output_vector)[out_row] =
         duckdb::string_t(cell_value.data(),
                          static_cast<uint32_t>(cell_value.size()));
@@ -785,7 +788,19 @@ struct ColumnContext {
   uint32_t width;
   int8_t scale;
   PhysicalType decimal_physical_type;
+  uint32_t null_byte;  // byte of the null-flags field holding this column
+  uint8_t null_mask;   // 0 when the column is not nullable
 };
+
+/**
+ * @brief Returns whether a row's null-flags field marks `column` NULL.
+ */
+inline bool CellIsNull(std::string_view null_flags,
+                       const ColumnContext& column) {
+  return column.null_mask != 0 && column.null_byte < null_flags.size() &&
+         (static_cast<uint8_t>(null_flags[column.null_byte]) &
+          column.null_mask) != 0;
+}
 
 /**
  * @brief Decodes one slot's projected columns from the strip cells into
@@ -799,11 +814,14 @@ void EmitInPlaceRow(const PaxGroup& group,
                     const std::vector<ColumnContext>& scan_columns,
                     uint32_t slot, DataChunk& output, idx_t out_row,
                     std::vector<InvalidDate>* invalid_dates) {
+  const std::string_view null_flags = group.cell(0, slot);
   for (idx_t i = 0; i < scan_columns.size(); i++) {
     const ColumnContext& column = scan_columns[i];
     FlatVector::SetNull(output.data[i], out_row, false);
     if (column.type == FieldType::kUntyped) {
-      DecodeUntypedCell(group, column.field, slot, output.data[i], out_row);
+      DecodeUntypedCell(group, column.field, slot,
+                        CellIsNull(null_flags, column), output.data[i],
+                        out_row);
     } else {
       BulkDecodeTyped(column.type, group, column.field, column.width, slot, 1,
                       output.data[i], out_row, column.decimal_physical_type,
@@ -825,6 +843,10 @@ void EmitImageRow(const std::string& old_row,
                   std::vector<std::pair<const char*, uint32_t>>& refs,
                   DataChunk& output, idx_t out_row) {
   SplitProxyRow(old_row, &refs);
+  if (refs.empty()) {
+    throw std::runtime_error("epoch image row is missing the null-flags field");
+  }
+  const std::string_view null_flags(refs[0].first, refs[0].second);
   for (idx_t i = 0; i < scan_columns.size(); i++) {
     const ColumnContext& column = scan_columns[i];
     Vector& output_vector = output.data[i];
@@ -833,7 +855,10 @@ void EmitImageRow(const std::string& old_row,
     }
     const char* payload = refs[column.field].first;
     const uint32_t length = refs[column.field].second;
-    if (length == 0) {  // empty == SQL NULL, as in the strip cells
+    // A typed field is zero-length only for SQL NULL; an untyped one needs
+    // the null-flags bit to tell '' from NULL.
+    if (column.type == FieldType::kUntyped ? CellIsNull(null_flags, column)
+                                           : length == 0) {
       FlatVector::SetNull(output_vector, out_row, true);
       continue;
     }
@@ -921,6 +946,8 @@ void PaxScan(ClientContext&, TableFunctionInput& data, DataChunk& output) {
     scan_columns[i].field = static_cast<size_t>(column) + 1;  // field 0 is null flags
     scan_columns[i].width = spec.width;
     scan_columns[i].scale = spec.scale;
+    scan_columns[i].null_byte = spec.null_byte;
+    scan_columns[i].null_mask = spec.null_mask;
     scan_columns[i].decimal_physical_type =
         (spec.type == FieldType::kDecimal64)
             ? output.data[i].GetType().InternalType()
@@ -1108,8 +1135,9 @@ void PaxScan(ClientContext&, TableFunctionInput& data, DataChunk& output) {
         const ColumnContext& column = scan_columns[i];
         if (column.type == FieldType::kUntyped) {
           for (uint32_t row = 0; row < run_length; row++) {
-            DecodeUntypedCell(*group, column.field, slot + row, output.data[i],
-                              rows_emitted + row);
+            DecodeUntypedCell(*group, column.field, slot + row,
+                              CellIsNull(group->cell(0, slot + row), column),
+                              output.data[i], rows_emitted + row);
           }
         } else {
           BulkDecodeTyped(column.type, *group, column.field, column.width, slot,
@@ -1153,28 +1181,34 @@ void PaxScan(ClientContext&, TableFunctionInput& data, DataChunk& output) {
  */
 void EncodeRow(duckdb::MaterializedQueryResult& result, idx_t row_index,
                std::string* out) {
-  out->clear();
-  // Field 0 mirrors the row null-flags field of the proxy row format; the
-  // proxy does not read it for bridge results.
-  AppendProxyField(*out, "", /*is_null=*/true);
-  for (idx_t column_index = 0; column_index < result.ColumnCount();
-       column_index++) {
+  // Field 0 is the row null-flags field: bit i of byte i / 8 marks output
+  // column i NULL. A NULL and an empty string are both zero-length fields,
+  // so this bitmap is what separates them.
+  const idx_t columns = result.ColumnCount();
+  std::string null_flags(static_cast<size_t>((columns + 7) / 8), '\0');
+  std::string body;
+  for (idx_t column_index = 0; column_index < columns; column_index++) {
     const duckdb::Value value = result.GetValue(column_index, row_index);
     // Check is_null BEFORE looking at the text: a genuine empty-string result
     // (value.ToString() == "") is a valid non-null value, not a signal for
     // the NULL sentinel. The text is only computed in the non-null case.
     if (value.IsNull()) {
-      AppendProxyField(*out, "", /*is_null=*/true);
+      null_flags[column_index / 8] |=
+          static_cast<char>(1u << (column_index % 8));
+      AppendProxyField(body, "", /*is_null=*/true);
     } else if (value.type().id() == duckdb::LogicalTypeId::BOOLEAN) {
       // MySQL's boolean surface is 1/0; Item_string::val_int reads both
       // "true" and "false" as 0.
-      AppendProxyField(*out, value.GetValue<bool>() ? "1" : "0",
+      AppendProxyField(body, value.GetValue<bool>() ? "1" : "0",
                        /*is_null=*/false);
     } else {
       const std::string text = value.ToString();
-      AppendProxyField(*out, text, /*is_null=*/false);
+      AppendProxyField(body, text, /*is_null=*/false);
     }
   }
+  out->clear();
+  AppendProxyField(*out, null_flags, /*is_null=*/false);
+  out->append(body);
 }
 
 // ---------------------------------------------------------------------------
@@ -1562,7 +1596,9 @@ void ExecuteDuckdbQuery(
         // (an untyped store keeps field_type empty).
         if (schema.type_of(f) != static_cast<FieldType>(column.pax_kind()) ||
             schema.field_max_bytes[f] != column.pax_width() ||
-            schema.scale_of(f) != static_cast<int>(column.pax_scale())) {
+            schema.scale_of(f) != static_cast<int>(column.pax_scale()) ||
+            (column.null_bit() != 0 &&
+             (column.null_bit() - 1) / 8 >= schema.field_max_bytes[0])) {
           response->set_ok(false);
           response->set_error(
               "table descriptor does not match the store: " +
@@ -1580,6 +1616,11 @@ void ExecuteDuckdbQuery(
         spec.type = static_cast<FieldType>(column.pax_kind());
         spec.width = column.pax_width();
         spec.scale = static_cast<int8_t>(column.pax_scale());
+        if (column.null_bit() != 0) {
+          const uint32_t bit = column.null_bit() - 1;
+          spec.null_byte = bit / 8;
+          spec.null_mask = static_cast<uint8_t>(1u << (bit % 8));
+        }
         table_view.columns.push_back(std::move(spec));
       }
       handles[static_cast<size_t>(i)] =

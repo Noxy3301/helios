@@ -1025,6 +1025,12 @@ bool SerializeBaseTable(Serializer& s, Table_ref* table_ref,
         column->set_pax_kind(pax_kinds[i + 1]);
         column->set_pax_width(pax_widths[i + 1]);
         column->set_pax_scale(pax_scales[i + 1]);
+        // A zero-length field is '' or NULL; only this bit tells them apart.
+        column->set_null_bit(
+            field->is_nullable()
+                ? 1 + field->null_offset() * 8 +
+                      static_cast<uint32_t>(__builtin_ctz(field->null_bit))
+                : 0);
     }
     return true;
 }
