@@ -809,6 +809,8 @@ void PaxScan(ClientContext&, TableFunctionInput& data, DataChunk& output) {
   PaxTableView& table_view = *bind_data.table;
   PaxTable* table = table_view.table;
   const uint32_t snapshot_epoch = table_view.snapshot_epoch;
+  // The chunk DuckDB hands in holds STANDARD_VECTOR_SIZE rows (2048 in the
+  // default build); the audit below runs once per chunk, before it is returned.
   const idx_t max_rows = output.GetCapacity();
   idx_t rows_emitted = 0;
 
@@ -1003,6 +1005,7 @@ void PaxScan(ClientContext&, TableFunctionInput& data, DataChunk& output) {
     audit();
     if (rows_emitted > 0 || groups_exhausted) break;
   }
+  // Past this line the chunk is DuckDB's; every group that fed it is audited.
   output.SetCardinality(rows_emitted);
 }
 
