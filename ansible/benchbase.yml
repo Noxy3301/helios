@@ -51,7 +51,7 @@
         OUT={{ load_sample_dir }}/load-vmrss.log
         : > "$OUT"
         while :; do
-          p=$(pgrep -f '[h]elios_server' | head -1)
+          p=$(pgrep -f '[h]elios-storage' | head -1)
           if [ -n "$p" ] && [ -r "/proc/$p/status" ]; then
             r=$(awk '/^VmRSS:/{print $2}' "/proc/$p/status" 2>/dev/null)
             [ -n "$r" ] && echo "$(date +%s) $r" >> "$OUT"
@@ -62,7 +62,7 @@
         chmod +x {{ load_sample_dir }}/rss_probe.sh
         nohup setsid {{ load_sample_dir }}/rss_probe.sh >/dev/null 2>&1 < /dev/null &
         echo $! > {{ load_sample_dir }}/load-vmrss.pid
-        pid=$(pgrep -f '[h]elios_server' | head -1)
+        pid=$(pgrep -f '[h]elios-storage' | head -1)
         if [ -n "$pid" ]; then
           nohup pidstat -t -u -p "$pid" {{ load_sample_interval }} \
             > {{ load_sample_dir }}/load-threads.log 2>&1 &

@@ -38,7 +38,7 @@
         {
           echo "== date";  date -u +%FT%T.%3NZ
           echo "== pgrep helios-storage/mysqld"
-          pgrep -a -f "[h]elios_server|[m]ysqld" || echo "NONE ALIVE"
+          pgrep -a -f "[h]elios-storage|[m]ysqld" || echo "NONE ALIVE"
           echo "== ps top-rss"; ps -eo pid,etime,rss,comm --sort=-rss | head -20
           echo "== dmesg tail"; sudo dmesg -T 2>/dev/null | tail -80
           echo "== segv/oom in syslog"
