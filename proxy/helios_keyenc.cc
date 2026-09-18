@@ -22,7 +22,7 @@
 #include <strings.h>
 
 #include "helios_field_types.h"
-#include "lineairdb.pb.h"
+#include "helios.pb.h"
 #include "my_base.h"
 #include "my_dbug.h"
 #include "mysql/plugin.h"

@@ -2,7 +2,7 @@
 
 #include <string>
 
-#include "lineairdb.pb.h"
+#include "helios.pb.h"
 
 class THD;
 struct LEX;
@@ -27,7 +27,7 @@ namespace helios_columnar {
  */
 bool BuildDuckdbQueryRequest(
     THD* thd, LEX* lex,
-    LineairDB::Protocol::TxExecuteDuckdbQuery::Request* request,
+    Helios::Protocol::TxExecuteDuckdbQuery::Request* request,
     std::string* why);
 
 }  // namespace helios_columnar

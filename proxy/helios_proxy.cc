@@ -96,8 +96,8 @@ bool HeliosProxy::fetch_table_stats(
     bool force_ndv) {
     if (!ensure_connected()) return false;
 
-    LineairDB::Protocol::GetTableStats::Request request;
-    LineairDB::Protocol::GetTableStats::Response response;
+    Helios::Protocol::GetTableStats::Request request;
+    Helios::Protocol::GetTableStats::Response response;
     if (!ndv_table.empty()) {
         request.set_ndv_table(ndv_table);
         request.set_ndv_force_recompute(force_ndv);
@@ -146,8 +146,8 @@ HeliosProxy::ReadResult HeliosProxy::tx_read(
         return result;
     }
 
-    LineairDB::Protocol::TxRead::Request request;
-    LineairDB::Protocol::TxRead::Response response;
+    Helios::Protocol::TxRead::Request request;
+    Helios::Protocol::TxRead::Response response;
     request.set_table_name(table_name);
     request.set_key(key);
 
@@ -170,8 +170,8 @@ std::vector<HeliosProxy::ReadResult> HeliosProxy::tx_batch_read(
         return {};
     }
 
-    LineairDB::Protocol::TxBatchRead::Request request;
-    LineairDB::Protocol::TxBatchRead::Response response;
+    Helios::Protocol::TxBatchRead::Request request;
+    Helios::Protocol::TxBatchRead::Response response;
     for (const auto& key : keys) {
         auto* op = request.add_ops();
         op->set_table_name(key.table_name);
@@ -208,8 +208,8 @@ HeliosProxy::ScanResult HeliosProxy::tx_scan(
         return result;
     }
 
-    LineairDB::Protocol::TxScan::Request request;
-    LineairDB::Protocol::TxScan::Response response;
+    Helios::Protocol::TxScan::Request request;
+    Helios::Protocol::TxScan::Response response;
     request.set_table_name(table_name);
     request.set_start_key(start_key);
     request.set_end_key(end_key);
@@ -247,8 +247,8 @@ HeliosProxy::ScanIndexResult HeliosProxy::tx_scan_index(
         return result;
     }
 
-    LineairDB::Protocol::TxScanIndex::Request request;
-    LineairDB::Protocol::TxScanIndex::Response response;
+    Helios::Protocol::TxScanIndex::Request request;
+    Helios::Protocol::TxScanIndex::Response response;
     request.set_table_name(table_name);
     request.set_index_name(index_name);
     request.set_start_key(start_key);
@@ -295,8 +295,8 @@ bool HeliosProxy::tx_commit(
         return false;
     }
 
-    LineairDB::Protocol::TxCommit::Request request;
-    LineairDB::Protocol::TxCommit::Response response;
+    Helios::Protocol::TxCommit::Request request;
+    Helios::Protocol::TxCommit::Response response;
 
     for (const auto& entry : reads) {
         auto* read = request.add_reads();
@@ -327,15 +327,15 @@ bool HeliosProxy::tx_commit(
                 write->set_key(op.key);
                 write->set_value(op.value);
                 write->set_op(op.is_insert
-                                  ? LineairDB::Protocol::TxCommit::INSERT
-                                  : LineairDB::Protocol::TxCommit::UPDATE);
+                                  ? Helios::Protocol::TxCommit::INSERT
+                                  : Helios::Protocol::TxCommit::UPDATE);
                 break;
             }
             case WriteOp::Type::Delete: {
                 auto* write = request.add_writes();
                 write->set_table_name(op.table_name);
                 write->set_key(op.key);
-                write->set_op(LineairDB::Protocol::TxCommit::DELETE);
+                write->set_op(Helios::Protocol::TxCommit::DELETE);
                 break;
             }
             case WriteOp::Type::SecondaryIndexWrite:
@@ -374,9 +374,9 @@ bool HeliosProxy::tx_commit(
             const auto reason = response.abort_reason();
             *duplicate_key =
                 reason ==
-                    LineairDB::Protocol::ABORT_REASON_DUPLICATE_PRIMARY_KEY ||
+                    Helios::Protocol::ABORT_REASON_DUPLICATE_PRIMARY_KEY ||
                 reason ==
-                    LineairDB::Protocol::ABORT_REASON_DUPLICATE_SECONDARY_KEY;
+                    Helios::Protocol::ABORT_REASON_DUPLICATE_SECONDARY_KEY;
         }
     }
     return response.committed();
@@ -386,7 +386,7 @@ namespace {
 void fill_bindings(
     const std::vector<HeliosProxy::ReadPlanKeyBinding>& bindings,
     google::protobuf::RepeatedPtrField<
-        LineairDB::Protocol::TxExecuteReadPlan::KeyBinding>* out) {
+        Helios::Protocol::TxExecuteReadPlan::KeyBinding>* out) {
     for (const auto& binding : bindings) {
         auto* b = out->Add();
         b->set_source_step(binding.source_step);
@@ -411,7 +411,7 @@ HeliosProxy::ReadPlanResult HeliosProxy::tx_execute_read_plan(
         return result;
     }
 
-    LineairDB::Protocol::TxExecuteReadPlan::Request request;
+    Helios::Protocol::TxExecuteReadPlan::Request request;
     for (const auto& step : steps) {
         auto* out = request.add_steps();
         out->set_table_name(step.table_name);
@@ -470,8 +470,8 @@ HeliosProxy::ReadPlanResult HeliosProxy::tx_execute_read_plan(
         }
     };
 
-    // Native-endian bytes spell "LDBFLATP" (LineairDB flat payload).
-    static constexpr uint64_t kFlatMagic = 0x5054414C4642444Cull;
+    // Native-endian bytes spell "HELIOSRP" (Helios read plan response).
+    static constexpr uint64_t kFlatMagic = 0x5052534F494C4548ull;
     Reader r(raw.data(), raw.size());
     if (r.u64() != kFlatMagic) {
         LOG_ERROR("RPC failed: bad flat read-plan response header");
@@ -542,8 +542,8 @@ HeliosProxy::ReadPlanResult HeliosProxy::tx_execute_read_plan(
 }
 
 bool HeliosProxy::tx_execute_duckdb_query(
-    const LineairDB::Protocol::TxExecuteDuckdbQuery::Request& request,
-    LineairDB::Protocol::TxExecuteDuckdbQuery::Response* response) {
+    const Helios::Protocol::TxExecuteDuckdbQuery::Request& request,
+    Helios::Protocol::TxExecuteDuckdbQuery::Response* response) {
     if (!ensure_connected()) {
         LOG_ERROR("RPC failed: Not connected to server");
         return false;
@@ -571,8 +571,8 @@ bool HeliosProxy::db_create_table(
         return false;
     }
 
-    LineairDB::Protocol::DbCreateTable::Request request;
-    LineairDB::Protocol::DbCreateTable::Response response;
+    Helios::Protocol::DbCreateTable::Request request;
+    Helios::Protocol::DbCreateTable::Response response;
 
     request.set_table_name(table_name);
     for (const uint32_t width : pax_field_max_bytes) {
@@ -604,8 +604,8 @@ HeliosProxy::HiddenKeyReservation HeliosProxy::db_allocate_hidden_keys(
         return reservation;
     }
 
-    LineairDB::Protocol::DbAllocateHiddenKeys::Request request;
-    LineairDB::Protocol::DbAllocateHiddenKeys::Response response;
+    Helios::Protocol::DbAllocateHiddenKeys::Request request;
+    Helios::Protocol::DbAllocateHiddenKeys::Response response;
 
     request.set_table_name(table_name);
     request.set_count(count);
@@ -643,8 +643,8 @@ bool HeliosProxy::db_create_secondary_index(const std::string& table_name,
         return false;
     }
 
-    LineairDB::Protocol::DbCreateSecondaryIndex::Request request;
-    LineairDB::Protocol::DbCreateSecondaryIndex::Response response;
+    Helios::Protocol::DbCreateSecondaryIndex::Request request;
+    Helios::Protocol::DbCreateSecondaryIndex::Response response;
 
     request.set_table_name(table_name);
     request.set_index_name(index_name);

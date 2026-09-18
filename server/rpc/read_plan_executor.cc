@@ -11,7 +11,7 @@
 #include <utility>
 #include <vector>
 
-#include "lineairdb.pb.h"
+#include "helios.pb.h"
 
 #include "flat_plan_encode.hh"
 #include "parallel_scan.hh"
@@ -24,8 +24,8 @@ namespace {
 
 // Pick the source byte string for a binding (from a step's scan key, scan value, or value).
 const std::string* select_source_bytes(
-    const LineairDB::Protocol::TxExecuteReadPlan::StepResult& source,
-    const LineairDB::Protocol::TxExecuteReadPlan::KeyBinding& binding,
+    const Helios::Protocol::TxExecuteReadPlan::StepResult& source,
+    const Helios::Protocol::TxExecuteReadPlan::KeyBinding& binding,
     bool from_key, int row_override) {
     if (from_key) {
         if (source.scan_keys_size() == 0) return nullptr;
@@ -48,8 +48,8 @@ const std::string* select_source_bytes(
 std::string build_plan_key(
     const std::string& prefix,
     const google::protobuf::RepeatedPtrField<
-        LineairDB::Protocol::TxExecuteReadPlan::KeyBinding>& bindings,
-    const std::vector<LineairDB::Protocol::TxExecuteReadPlan::StepResult*>&
+        Helios::Protocol::TxExecuteReadPlan::KeyBinding>& bindings,
+    const std::vector<Helios::Protocol::TxExecuteReadPlan::StepResult*>&
         previous_results,
     int row_override = -1,
     bool *complete = nullptr) {
@@ -113,12 +113,12 @@ std::string build_plan_key(
 
 void HeliosRpc::handleTxExecuteReadPlan(const std::string& message,
                                            std::string& result) {
-    LineairDB::Protocol::TxExecuteReadPlan::Request request;
-    LineairDB::Protocol::TxExecuteReadPlan::Response response;
+    Helios::Protocol::TxExecuteReadPlan::Request request;
+    Helios::Protocol::TxExecuteReadPlan::Response response;
     request.ParseFromString(message);
     response.set_ok(true);
 
-    std::vector<LineairDB::Protocol::TxExecuteReadPlan::StepResult*>
+    std::vector<Helios::Protocol::TxExecuteReadPlan::StepResult*>
         previous_results;
     previous_results.reserve(request.steps_size());
 

@@ -61,7 +61,7 @@
 namespace duckdb_bridge {
 namespace {
 
-namespace pb = LineairDB::Protocol;
+namespace pb = Helios::Protocol;
 namespace pax = helios::storage::pax;
 using pax::FieldType;
 using pax::PaxGroup;

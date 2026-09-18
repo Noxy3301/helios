@@ -19,7 +19,7 @@
 #include "helios_field_types.h"
 #include "helios_index_search.hh"
 #include "helios_keyenc.hh"
-#include "lineairdb.pb.h"
+#include "helios.pb.h"
 #include "my_dbug.h"
 #include "mysql/plugin.h"
 #include "sql/field.h"

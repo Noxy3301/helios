@@ -2,7 +2,7 @@
 
 #include <string>
 
-#include "lineairdb.pb.h"
+#include "helios.pb.h"
 #include "lineairdb/database.h"
 
 /**
@@ -15,6 +15,6 @@
  */
 bool parallel_primary_pax_row_ref_scan(
     helios::storage::Database* db,
-    const LineairDB::Protocol::TxExecuteReadPlan::PlanStep& step,
+    const Helios::Protocol::TxExecuteReadPlan::PlanStep& step,
     const std::string& start_key, const std::string& end_key,
-    LineairDB::Protocol::TxExecuteReadPlan::StepResult* step_result);
+    Helios::Protocol::TxExecuteReadPlan::StepResult* step_result);

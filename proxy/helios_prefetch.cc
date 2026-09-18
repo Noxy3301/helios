@@ -18,7 +18,7 @@
 #include "helios_field_types.h"
 #include "helios_keyenc.hh"
 #include "helios_prefetch.hh"
-#include "lineairdb.pb.h"
+#include "helios.pb.h"
 #include "my_base.h"
 #include "my_dbug.h"
 #include "my_sys.h"

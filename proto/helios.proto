@@ -1,6 +1,6 @@
 syntax = "proto3";
 
-package LineairDB.Protocol;
+package Helios.Protocol;
 
 // Identifies which RPC is being invoked. Every read answers from the
 // storage's current state and leaves nothing behind; the query layer keeps

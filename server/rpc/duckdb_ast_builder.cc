@@ -31,7 +31,7 @@
 namespace duckdb_bridge {
 namespace {
 
-namespace pb = LineairDB::Protocol;
+namespace pb = Helios::Protocol;
 using Resolved = pb::TxExecuteDuckdbQuery;
 using duckdb::ExpressionType;
 using duckdb::LogicalType;

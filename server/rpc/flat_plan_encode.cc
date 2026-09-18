@@ -6,8 +6,8 @@
 
 namespace flat_plan {
 namespace {
-// Native-endian bytes spell "LDBFLATP" (LineairDB flat payload).
-constexpr uint64_t kMagic = 0x5054414C4642444Cull;
+// Native-endian bytes spell "HELIOSRP" (Helios read plan response).
+constexpr uint64_t kMagic = 0x5052534F494C4548ull;
 
 template <class Sink>
 void w_u8(Sink& out, uint8_t v) {
@@ -35,7 +35,7 @@ struct CountSink {
 
 template <class Sink>
 void encode_step(
-    const LineairDB::Protocol::TxExecuteReadPlan::StepResult& s, Sink& out) {
+    const Helios::Protocol::TxExecuteReadPlan::StepResult& s, Sink& out) {
     w_u8(out, s.found() ? 1 : 0);
     w_u64(out, s.tid());
     w_bytes(out, s.value());
@@ -59,7 +59,7 @@ void encode_step(
 }
 }  // namespace
 
-void encode_to_string(LineairDB::Protocol::TxExecuteReadPlan::Response& r,
+void encode_to_string(Helios::Protocol::TxExecuteReadPlan::Response& r,
                       std::string& out) {
     CountSink count;
     count.n = 8 + 1 + 8;  // magic + ok + result count

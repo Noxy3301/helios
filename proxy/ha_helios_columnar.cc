@@ -33,7 +33,7 @@
 #include "sql/visible_fields.h"
 #include "thr_lock.h"
 
-#include "lineairdb.pb.h"
+#include "helios.pb.h"
 #include "helios_field_types.h"
 #include "duckdb_request_builder.hh"
 #include "helios_proxy.hh"
@@ -190,7 +190,7 @@ class ColumnarExecutionContext : public Secondary_engine_execution_context {
   // Built by external_lock (post-resolve, pre-optimize), shipped by
   // ExecuteDuckdbBridge. A refused or never-built statement is declined by
   // OptimizeSecondaryEngine; the reason lives in `refusal`.
-  LineairDB::Protocol::TxExecuteDuckdbQuery::Request duckdb_request;
+  Helios::Protocol::TxExecuteDuckdbQuery::Request duckdb_request;
   bool request_build_attempted = false;
   std::string refusal;
   bool duckdb_ready = false;
@@ -363,7 +363,7 @@ bool ExecuteDuckdbBridge(JOIN *join, Query_result *result) {
     return RaiseColumnarError(thd, "HELIOS_COLUMNAR: no server connection");
   }
 
-  LineairDB::Protocol::TxExecuteDuckdbQuery::Response rpc;
+  Helios::Protocol::TxExecuteDuckdbQuery::Response rpc;
   if (!proxy->tx_execute_duckdb_query(ctx->duckdb_request, &rpc) ||
       !rpc.ok()) {
     char message[192];

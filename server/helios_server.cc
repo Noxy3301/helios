@@ -1,6 +1,6 @@
 #include "helios_server.hh"
 #include "../common/log.h"
-#include "lineairdb.pb.h"
+#include "helios.pb.h"
 #include "rpc/helios_rpc.hh"
 
 #include <charconv>

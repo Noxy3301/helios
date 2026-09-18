@@ -16,12 +16,12 @@
 #include <cstring>
 #include <string>
 
-#include "lineairdb.pb.h"
+#include "helios.pb.h"
 #include "protocol/message.hh"
 
 namespace {
 
-using DurabilityRpc = LineairDB::Protocol::DbSetCommitDurability;
+using DurabilityRpc = Helios::Protocol::DbSetCommitDurability;
 
 constexpr unsigned long kMaxPort = 65535;
 // The switch is a store on the server, so a reply is immediate or never

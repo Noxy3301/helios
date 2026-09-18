@@ -9,7 +9,7 @@
 #include <utility>
 #include <vector>
 
-#include "lineairdb.pb.h"
+#include "helios.pb.h"
 
 // Table statistics handler: row counts plus the process-wide NDV and
 // range-histogram caches consumed by the proxy cost model.
@@ -56,9 +56,9 @@ std::unordered_map<std::string, HeliosRpc::HistEntry>
 
 void HeliosRpc::handleTxGetTableStats(const std::string& message,
                                          std::string& result) {
-    LineairDB::Protocol::GetTableStats::Request request;
+    Helios::Protocol::GetTableStats::Request request;
     request.ParseFromString(message);
-    LineairDB::Protocol::GetTableStats::Response response;
+    Helios::Protocol::GetTableStats::Response response;
     // Every connection asks for stats when it opens a table, so this is where
     // it learns which run of this server it is talking to.
     response.set_boot_token(storage_boot_token());

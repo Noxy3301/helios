@@ -5,7 +5,7 @@
 #include <string>
 #include <vector>
 
-#include "lineairdb.pb.h"
+#include "helios.pb.h"
 
 namespace duckdb {
 class SelectStatement;
@@ -30,7 +30,7 @@ struct AstBuildResult {
 };
 
 AstBuildResult BuildSelectStatement(
-    const LineairDB::Protocol::TxExecuteDuckdbQuery::Request& request,
+    const Helios::Protocol::TxExecuteDuckdbQuery::Request& request,
     const std::vector<uintptr_t>& table_handles);
 
 }  // namespace duckdb_bridge

@@ -36,9 +36,9 @@ include_directories(${DUCKDB_ROOT}/src/include)
 
 # Generate protobuf files
 set(PROTO_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../proto")
-set(PROTO_FILE "${PROTO_DIR}/lineairdb.proto")
-set(PROTO_SRCS "${CMAKE_CURRENT_BINARY_DIR}/lineairdb.pb.cc")
-set(PROTO_HDRS "${CMAKE_CURRENT_BINARY_DIR}/lineairdb.pb.h")
+set(PROTO_FILE "${PROTO_DIR}/helios.proto")
+set(PROTO_SRCS "${CMAKE_CURRENT_BINARY_DIR}/helios.pb.cc")
+set(PROTO_HDRS "${CMAKE_CURRENT_BINARY_DIR}/helios.pb.h")
 
 # Custom command to generate protobuf files
 add_custom_command(

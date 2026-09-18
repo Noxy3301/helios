@@ -8,7 +8,7 @@
 #include <vector>
 #include <memory>
 
-#include "lineairdb.pb.h"
+#include "helios.pb.h"
 
 class TxRpcTrace;
 
@@ -204,8 +204,8 @@ public:
     ReadPlanResult tx_execute_read_plan(
         const std::vector<ReadPlanStep>& steps);
     bool tx_execute_duckdb_query(
-        const LineairDB::Protocol::TxExecuteDuckdbQuery::Request& request,
-        LineairDB::Protocol::TxExecuteDuckdbQuery::Response* response);
+        const Helios::Protocol::TxExecuteDuckdbQuery::Request& request,
+        Helios::Protocol::TxExecuteDuckdbQuery::Response* response);
 
     // One row or secondary-index change the transaction installs at commit,
     // kept in the order the query layer issued it.
