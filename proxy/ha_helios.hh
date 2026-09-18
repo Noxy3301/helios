@@ -683,7 +683,7 @@ private:
 
   // Key conversion helpers
   static std::string pack_int_key(const uchar *data, size_t len);
-  static std::string encode_datetime_key(const uchar *data, size_t len,
+  static std::string pack_datetime_key(const uchar *data, size_t len,
                                           enum_field_types mysql_type);
   static std::string pack_string_key(const uchar *data, size_t len);
 

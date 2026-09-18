@@ -58,7 +58,7 @@ void append_key_part_encoding(std::string &out, bool is_null,
   size_t copy_length = std::min(payload.size(), max_payload_length);
 
   if (payload.size() > max_payload_length) {
-    std::cerr << "[Helios][encode_key_part] payload truncated: length="
+    std::cerr << "[Helios][pack_key] payload truncated: length="
               << payload.size() << std::endl;
   }
 
@@ -168,7 +168,7 @@ std::string ha_helios::serialize_key_from_field(Field *field) {
       std::string raw(field_len, '\0');
       field->get_key_image(reinterpret_cast<uchar *>(raw.data()), field_len,
                            Field::itRAW);
-      payload = encode_datetime_key(reinterpret_cast<const uchar *>(raw.data()),
+      payload = pack_datetime_key(reinterpret_cast<const uchar *>(raw.data()),
                                     field_len, mysql_type);
       break;
     }
@@ -471,7 +471,7 @@ std::string pack_int_key(const uchar *data, size_t len) {
  * @details DATE and NEWDATE are 3 little-endian bytes and get reversed;
  * DATETIME2, TIMESTAMP2 and TIME2 are already big-endian sortable.
  */
-std::string encode_datetime_key(const uchar *data, size_t len,
+std::string pack_datetime_key(const uchar *data, size_t len,
                                 enum_field_types mysql_type) {
   if (mysql_type == MYSQL_TYPE_DATE || mysql_type == MYSQL_TYPE_NEWDATE) {
     char buf[3];
@@ -510,9 +510,9 @@ std::string ha_helios::pack_int_key(const uchar *data, size_t len) {
   return key_pack::pack_int_key(data, len);
 }
 
-std::string ha_helios::encode_datetime_key(const uchar *data, size_t len,
+std::string ha_helios::pack_datetime_key(const uchar *data, size_t len,
                                               enum_field_types mysql_type) {
-  return key_pack::encode_datetime_key(data, len, mysql_type);
+  return key_pack::pack_datetime_key(data, len, mysql_type);
 }
 
 std::string ha_helios::pack_string_key(const uchar *data, size_t len) {
@@ -573,7 +573,7 @@ std::string pack_key(TABLE *table, uint key_index, const uchar *key,
       break;
 
     case HeliosFieldType::HELIOS_DATETIME:
-      payload = encode_datetime_key(data_ptr, data_len, mysql_type);
+      payload = pack_datetime_key(data_ptr, data_len, mysql_type);
       break;
 
     case HeliosFieldType::HELIOS_STRING:

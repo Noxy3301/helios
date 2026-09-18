@@ -26,7 +26,7 @@ constexpr unsigned char kKeyTypeOther = 0xF0;
 namespace key_pack {
 
 std::string pack_int_key(const uchar *data, size_t len);
-std::string encode_datetime_key(const uchar *data, size_t len,
+std::string pack_datetime_key(const uchar *data, size_t len,
                                 enum_field_types mysql_type);
 std::string pack_string_key(const uchar *data, size_t len);
 
