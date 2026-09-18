@@ -226,14 +226,15 @@ class ColumnarExecutionContext : public Secondary_engine_execution_context {
 struct DecodedField {
   const char *ptr = nullptr;
   size_t len = 0;
-  bool empty = false;
 };
 
 /**
  * @brief Decode LineairDB's row-field framing into field slices.
  *
  * Each field is stored as a one-byte length-width tag, that many little-endian
- * length bytes, then the payload. A tag of 0xff represents an empty field.
+ * length bytes, then the payload. A tag of 0xff carries no payload and yields
+ * a zero-length slice, as a payload of length 0 does; the null bitmap in field
+ * 0 of the row marks the NULL columns.
  */
 [[maybe_unused]] bool DecodeRowFields(const std::string &row,
                                       std::vector<DecodedField> *out) {
@@ -244,7 +245,7 @@ struct DecodedField {
     const auto length_bytes = static_cast<uint8_t>(row[offset]);
     offset += 1;
     if (length_bytes == 0xff) {
-      out->push_back({nullptr, 0, true});
+      out->push_back({nullptr, 0});
       continue;
     }
     if (length_bytes > 4 || offset + length_bytes > row.size()) return false;
@@ -257,7 +258,7 @@ struct DecodedField {
     offset += length_bytes;
     if (offset + len > row.size()) return false;
 
-    out->push_back({row.data() + offset, len, false});
+    out->push_back({row.data() + offset, len});
     offset += len;
   }
 
@@ -405,20 +406,23 @@ bool ExecuteDuckdbBridge(JOIN *join, Query_result *result) {
           "column count may not match the original SELECT list)");
     }
 
-    // Field 0 is a placeholder for the proxy row null-flags field. The
-    // server emits one following field per DuckDB output column.
+    // Field 0 is the row null-flags field: bit i of byte i / 8 marks output
+    // column i NULL. A zero-length field is '' unless that bit is set.
+    const DecodedField &null_flags = fields[0];
     for (size_t i = 0; i < values.size(); i++) {
-      const DecodedField &field = fields[1 + i];
-      if (!field.empty) {
-        if (target_scale[i] != static_cast<uint32_t>(DECIMAL_NOT_SPECIFIED) &&
-            RoundDecimalText(field.ptr, field.len, target_scale[i], &rounded)) {
-          values[i]->set_value(rounded.data(), rounded.size());
-        } else {
-          values[i]->set_value(field.ptr, field.len);
-        }
+      if (i / 8 < null_flags.len &&
+          (static_cast<uint8_t>(null_flags.ptr[i / 8]) & (1u << (i % 8)))) {
+        values[i]->set_null_value();
         continue;
       }
-      values[i]->set_null_value();
+      const DecodedField &field = fields[1 + i];
+      const char *text = field.ptr == nullptr ? "" : field.ptr;
+      if (target_scale[i] != static_cast<uint32_t>(DECIMAL_NOT_SPECIFIED) &&
+          RoundDecimalText(text, field.len, target_scale[i], &rounded)) {
+        values[i]->set_value(rounded.data(), rounded.size());
+      } else {
+        values[i]->set_value(text, field.len);
+      }
     }
 
     if (result->send_data(thd, output_items)) return true;

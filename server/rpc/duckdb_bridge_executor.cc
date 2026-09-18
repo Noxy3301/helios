@@ -4,26 +4,32 @@
 // groups without epoch images and through those images otherwise. DuckDB
 // contributes its binder, planner, and vectorized runtime; no table data ever
 // lives inside DuckDB. duckdb_bridge_dispatch.cc routes the opcode here.
+// HELIOS_BRIDGE_THREADS bounds the analytical thread pool; unset is a quarter
+// of the hardware threads, which leaves the OLTP side its cores in a mixed run.
+// HELIOS_BRIDGE_MEM_LIMIT bounds DuckDB's operator memory (a byte count, K/M/G
+// accepted); unset is DuckDB's own default.
 //
 // Consistency: the request runs against a columnar read view with snapshot
-// epoch se (Database::OpenPaxView). Groups without epoch images are
-// bulk-decoded in place and audited against their preserve counters after the
-// result set is produced; a dirty audit retries the whole query under the same
-// snapshot epoch. Groups with epoch images resolve per slot: the oldest image
-// with epoch > se supplies the value the slot held at se, and image-less slots
-// validate their in-place read against the preserve counter. Writers never
-// wait for a reader to finish.
+// epoch se (Database::OpenPaxView). A slot that holds an epoch image resolves
+// through it (the oldest image with epoch > se is the value the slot held at
+// se); every other slot is bulk-decoded in place. Before each output chunk is
+// released, the preserve counter of every group that contributed in-place rows
+// to it is re-read; a counter that moved rewinds that group's rows of this
+// chunk and re-reads its slots one at a time from a fresh image copy. The
+// statement runs once. Writers never wait for a reader to finish.
 
 #include "duckdb_bridge_executor.hh"
 
 #include "duckdb_ast_builder.hh"
 
+#include <duckdb/common/exception/conversion_exception.hpp>
 #include <duckdb/common/vector_operations/ternary_executor.hpp>
 #include <duckdb/common/vector_operations/unary_executor.hpp>
 #include <duckdb/function/scalar_function.hpp>
 #include <duckdb/parser/parsed_data/create_collation_info.hpp>
 #include <duckdb/parser/parsed_data/create_scalar_function_info.hpp>
 
+#include "../../common/log.h"
 #include "../mysql_charset_runtime.hh"
 #include "m_ctype.h"
 
@@ -32,6 +38,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <charconv>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
@@ -42,6 +49,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <system_error>
 #include <thread>
 #include <unordered_map>
 #include <utility>
@@ -76,18 +84,16 @@ uint32_t LengthPrefixBytes(uint32_t length) {
  * @brief Appends one field in the proxy row format (matches
  * proxy/ha_lineairdb_columnar.cc's DecodeRowFields).
  *
- * @details One byte length-width tag (0xFF = SQL NULL), then that many
- * little-endian length bytes, then the payload. NULL and empty string are
- * distinct and must not be conflated: `is_null` is the only signal for the
- * 0xFF sentinel. An empty-but-non-null payload (e.g. a genuine VARCHAR ''
- * result) takes the normal path with length 0 -- exactly one tag byte 0x00,
- * no length bytes, no payload -- which DecodeRowFields reads as {ptr, len=0,
- * empty=false}, distinct from the {nullptr, 0, empty=true} it produces for
- * the sentinel. Nullness is never inferred from payload.empty().
+ * @details One byte length-width tag (0xFF for a field with no payload),
+ * then that many little-endian length bytes, then the payload. A zero-length
+ * payload takes the normal path: one tag byte 0x00, no length bytes, no
+ * payload, which reads back as a zero-length slice like the 0xFF tag does.
+ * The framing carries no nullness of its own; the null bitmap in field 0 of
+ * the row marks the NULL columns.
  *
  * @param out Destination row buffer.
  * @param payload Field bytes; ignored when is_null.
- * @param is_null True encodes the SQL NULL sentinel.
+ * @param is_null True writes the payload-free tag.
  */
 void AppendProxyField(std::string& out, std::string_view payload,
                       bool is_null) {
@@ -109,6 +115,18 @@ void AppendProxyField(std::string& out, std::string_view payload,
 // ---------------------------------------------------------------------------
 
 /**
+ * @brief Whether ENABLE_DUCKDB_BRIDGE_DEBUG asks for the bridge's trace lines.
+ */
+bool BridgeDebugEnabled() {
+  static const bool enabled = [] {
+    const char* value = std::getenv("ENABLE_DUCKDB_BRIDGE_DEBUG");
+    return value != nullptr && value[0] != '\0' &&
+           std::string_view(value) != "0";
+  }();
+  return enabled;
+}
+
+/**
  * @brief Upper bound on the read view's epoch-fence wait.
  */
 uint32_t FenceTimeoutMs() {
@@ -121,20 +139,6 @@ uint32_t FenceTimeoutMs() {
   return timeout_ms;
 }
 
-/**
- * @brief Number of whole-query attempts before giving up with "concurrent
- * modification". Retries reuse the same read view cut.
- */
-int MaxReadViewAttempts() {
-  static const int attempts = [] {
-    const char* value = std::getenv("HELIOS_READ_VIEW_MAX_ATTEMPTS");
-    if (value == nullptr) return 3;
-    const long parsed = std::strtol(value, nullptr, 10);
-    return parsed > 0 ? static_cast<int>(parsed) : 3;
-  }();
-  return attempts;
-}
-
 // ---------------------------------------------------------------------------
 // Proxy row-format decoding, for epoch images. A preserved old_row is a proxy
 // row payload whose typed fields carry val_str ASCII; the parsers mirror the
@@ -145,8 +149,8 @@ int MaxReadViewAttempts() {
  * @brief Splits one proxy row payload into per-field {pointer, length} refs.
  *
  * @details Field 0 is the null-flags field; MySQL column i is field i + 1. A
- * 0xFF width tag (no value) and a zero-length payload both yield length 0,
- * matching the strip-cell convention "empty == SQL NULL".
+ * 0xFF width tag and a zero-length payload both yield length 0, and the
+ * null-flags field is what separates a NULL column from an empty value.
  */
 void SplitProxyRow(const std::string& row,
                    std::vector<std::pair<const char*, uint32_t>>* fields) {
@@ -279,6 +283,8 @@ struct ColumnSpec {
   FieldType type = FieldType::kUntyped;
   uint32_t width = 0;
   int8_t scale = 0;
+  uint32_t null_byte = 0;  // byte of the row null-flags field
+  uint8_t null_mask = 0;   // 0 when the column is not nullable
 };
 
 /**
@@ -295,38 +301,12 @@ struct PaxTableView {
   size_t group_count = 0;  // fixed after the read view fence, not live state
   uint32_t snapshot_epoch = 0;  // read view serialization point se
 
-  // Set after a dirty bulk audit: the retry escalates every group to the
-  // per-slot path, which needs no audit and therefore terminates.
-  bool force_per_slot = false;
-
-  // Groups read via the bulk in-place path this attempt, with the preserve
-  // count each carried when it was claimed; the result is accepted only if
-  // every listed group's counter still equals that value. Scan workers append
-  // under the mutex.
-  std::mutex bulk_mutex;
-  std::vector<std::pair<uint32_t, uint64_t>> bulk_groups;
+  // Scan tallies for one request, reported under ENABLE_DUCKDB_BRIDGE_DEBUG.
+  std::atomic<uint64_t> groups_scanned{0};
+  std::atomic<uint64_t> groups_with_images{0};
+  std::atomic<uint64_t> chunk_audits_redone{0};
+  std::atomic<uint64_t> slots_from_images{0};
 };
-
-/**
- * @brief Returns whether every bulk-read group still carries the preserve
- * count it was claimed with.
- *
- * @details Runs after the attempt's result set is fully produced. A moved
- * counter means bulk-read cells may be torn; the attempt is discarded and the
- * retry resolves the group through epoch images.
- */
-bool BulkGroupsUnchanged(const std::vector<PaxTableView>& table_views) {
-  for (const PaxTableView& table_view : table_views) {
-    for (const auto& [group_index, count_at_claim] : table_view.bulk_groups) {
-      PaxGroup* group = pax::Group(table_view.table, group_index);
-      if (group != nullptr &&
-          pax::GroupPreserveCount(group) != count_at_claim) {
-        return false;
-      }
-    }
-  }
-  return true;
-}
 
 // ---------------------------------------------------------------------------
 // DuckDB table function over PaxTableView: parallel scan, projection
@@ -337,7 +317,6 @@ using duckdb::ClientContext;
 using duckdb::column_t;
 using duckdb::Connection;
 using duckdb::DataChunk;
-using duckdb::Date;
 using duckdb::date_t;
 using duckdb::ExecutionContext;
 using duckdb::FlatVector;
@@ -388,22 +367,92 @@ struct PaxGlobalState : public GlobalTableFunctionState {
 /**
  * @brief Per-thread scan cursor over the currently claimed group.
  *
- * @details `resolve_per_slot` is chosen at claim time: a group with epoch
- * images resolves slot-by-slot against `images` (a copy of the group's image
- * map sampled after `count_at_claim`; a preserve landing between the two
- * samples trips the counter revalidation); a group with none takes the bulk
- * in-place path and is audited at attempt end instead.
+ * @details Claim time samples `count_at_claim` and then copies the group's
+ * image map and its imaged-slot bits; a preserve landing between the two
+ * bumps a value the chunk audit compares against. `image_state` is the
+ * group's image state as of the claim, null while the group has none.
  */
 struct PaxLocalState : public LocalTableFunctionState {
-  uint32_t current_group = UINT32_MAX;
   uint32_t current_slot = 0;
   PaxGroup* group_ptr = nullptr;
-  bool resolve_per_slot = false;
+  pax::GroupImageState* image_state = nullptr;
   uint64_t count_at_claim = 0;
+  bool has_images = false;
+  uint64_t imaged[PaxGroup::kRows / PaxGroup::kVisibilityWordBits] = {};
   std::unordered_map<uint32_t, std::vector<pax::EpochImage>> images;
   // Scratch for decoding one epoch image row into output vectors.
   std::vector<std::pair<const char*, uint32_t>> field_refs;
 };
+
+/**
+ * @brief Returns the claimed group's image state, reloading it once when the
+ * group had none when it was claimed.
+ */
+inline pax::GroupImageState* GroupState(PaxLocalState& state,
+                                        const PaxGroup* group) {
+  if (state.image_state == nullptr) state.image_state = pax::ImageState(group);
+  return state.image_state;
+}
+
+/**
+ * @brief Returns the oldest image whose writer epoch is after the snapshot
+ * epoch, or nullptr.
+ *
+ * @details Images are published in install order, which is
+ * epoch-non-decreasing per slot, so the first match is the oldest one and it
+ * holds the value the slot had at se.
+ */
+const pax::EpochImage* OldestImageAfterSnapshot(
+    const std::vector<pax::EpochImage>& images, uint32_t snapshot_epoch) {
+  for (const pax::EpochImage& image : images) {
+    if (pax::EpochAfterSnapshot(image.writer_epoch, snapshot_epoch)) {
+      return &image;
+    }
+  }
+  return nullptr;
+}
+
+/**
+ * @brief Copies the group's images and keeps in the imaged-slot bitset only
+ * the slots holding an image this snapshot epoch resolves through.
+ *
+ * @details A slot whose images all lie at or before the snapshot holds its
+ * value at se in its cells, so it stays out of the bitset and joins the bulk
+ * visible runs.
+ */
+inline void CopyGroupImages(PaxLocalState& state, uint32_t snapshot_epoch) {
+  constexpr uint32_t kWordBits = PaxGroup::kVisibilityWordBits;
+  state.images = pax::GroupImages(state.image_state, state.imaged);
+  state.has_images = false;
+  for (const auto& [slot, images] : state.images) {
+    if (slot >= PaxGroup::kRows) continue;
+    if (OldestImageAfterSnapshot(images, snapshot_epoch) != nullptr) {
+      state.has_images = true;
+    } else {
+      state.imaged[slot / kWordBits] &= ~(uint64_t{1} << (slot % kWordBits));
+    }
+  }
+}
+
+/**
+ * @brief Samples the group's preserve counter, then copies its images and
+ * imaged-slot bits. The counter first, so a preserve in between is caught.
+ */
+inline void ClaimGroupImages(PaxLocalState& state, const PaxGroup* group,
+                             uint32_t snapshot_epoch) {
+  state.image_state = pax::ImageState(group);
+  state.count_at_claim = pax::PreserveCount(state.image_state);
+  CopyGroupImages(state, snapshot_epoch);
+}
+
+/**
+ * @brief Returns whether the claimed copy resolves `slot` through an image.
+ */
+inline bool SlotImaged(const PaxLocalState& state, uint32_t slot) {
+  constexpr uint32_t kWordBits = PaxGroup::kVisibilityWordBits;
+  return state.has_images &&
+         ((state.imaged[slot / kWordBits] >> (slot % kWordBits)) & 1u) != 0;
+}
 
 /**
  * @brief Maps a PAX FieldType to the DuckDB column type.
@@ -507,6 +556,62 @@ unique_ptr<LocalTableFunctionState> PaxInitLocal(ExecutionContext&,
 }
 
 /**
+ * @brief One output row whose in-place DATE cell names no calendar day.
+ *
+ * @details A cell a concurrent writer tore reads this way, and so does a
+ * date stored under a relaxed sql_mode. The chunk audit tells them apart: a
+ * group whose preserve counter moved has the row re-read, and a group whose
+ * counter held stored the value.
+ */
+struct InvalidDate {
+  idx_t row;
+  int32_t ymd;
+};
+
+/**
+ * @brief Converts a year/month/day into a date_t (days since the epoch),
+ * false when the parts name no calendar day.
+ *
+ * @details A rejected date leaves the epoch in `out` as a placeholder, which
+ * reaches the result only for a row the audit confirms, and the audit raises
+ * on that row.
+ */
+inline bool TryCanonicalDate(int32_t year, int32_t month, int32_t day,
+                             date_t* out) {
+  if (month < 1 || month > 12 || day < 1 || day > 31 ||
+      !duckdb::Date::TryFromDate(year, month, day, *out)) {
+    *out = date_t(0);
+    return false;
+  }
+  return true;
+}
+
+/**
+ * @brief Converts a year/month/day into a date_t and raises when the parts
+ * name no calendar day.
+ *
+ * @details For a value no audit covers: an epoch image carries the ASCII a
+ * writer formatted under a lock, which no reader can tear.
+ */
+inline date_t CanonicalDate(int32_t year, int32_t month, int32_t day) {
+  date_t result;
+  if (!TryCanonicalDate(year, month, day, &result)) {
+    throw duckdb::ConversionException("Date out of range: %d-%d-%d", year,
+                                      month, day);
+  }
+  return result;
+}
+
+/**
+ * @brief Raises the conversion `bad` failed.
+ */
+[[noreturn]] void RaiseInvalidDate(const InvalidDate& bad) {
+  throw duckdb::ConversionException("Date out of range: %d-%d-%d",
+                                    bad.ymd / 10000, (bad.ymd / 100) % 100,
+                                    bad.ymd % 100);
+}
+
+/**
  * @brief Writes a scaled DEC64 mantissa through the vector's physical type.
  *
  * @details DuckDB stores DECIMAL(p, s) in the narrowest integer type that
@@ -534,17 +639,43 @@ inline void WriteDecimalPhysical(Vector& output_vector, idx_t row,
 }
 
 /**
+ * @brief Decodes a run of DEC64 cells into the vector's physical type.
+ *
+ * @details The data pointer is fetched once per run; DuckDB's GetData checks
+ * the vector type on every call.
+ */
+template <class T>
+void DecodeDecimalRun(const std::byte* src, uint32_t stride, uint32_t width,
+                      uint32_t count, Vector& output_vector, idx_t out_base) {
+  T* dst = FlatVector::GetData<T>(output_vector) + out_base;
+  for (uint32_t i = 0; i < count; i++, src += stride) {
+    uint16_t cell_length;
+    std::memcpy(&cell_length, src, sizeof(cell_length));
+    if (cell_length == width) {
+      int64_t mantissa;
+      std::memcpy(&mantissa, src + PaxGroup::kCellLenBytes, sizeof(mantissa));
+      dst[i] = T(mantissa);
+    } else {
+      dst[i] = T(0);
+      FlatVector::SetNull(output_vector, out_base + i, true);
+    }
+  }
+}
+
+/**
  * @brief Bulk-decodes one typed (non-UNTYPED) column across a contiguous run
  * of visible slots.
  *
  * @details A typed cell is [u16 len][fixed-width LE payload]; a length equal
  * to the column width means the payload is present, any other length (an
- * empty cell) is SQL NULL.
+ * empty cell) is SQL NULL. A DATE cell naming no calendar day appends to
+ * `invalid_dates` rather than raising, leaving the verdict to the audit.
  */
 void BulkDecodeTyped(FieldType type, const PaxGroup& group, size_t field,
                      uint32_t width, uint32_t slot_start, uint32_t count,
                      Vector& output_vector, idx_t out_base,
-                     PhysicalType decimal_physical_type) {
+                     PhysicalType decimal_physical_type,
+                     std::vector<InvalidDate>* invalid_dates) {
   const std::byte* strip_base = group.strip(field);
   const uint32_t stride = group.stride(field);
   const std::byte* src = strip_base + static_cast<size_t>(stride) * slot_start;
@@ -587,28 +718,36 @@ void BulkDecodeTyped(FieldType type, const PaxGroup& group, size_t field,
         if (cell_length == width) {
           int32_t ymd;
           std::memcpy(&ymd, src + kCellLenBytes, sizeof(ymd));
-          dst[i] = Date::FromDate(ymd / 10000, (ymd / 100) % 100, ymd % 100);
+          if (!TryCanonicalDate(ymd / 10000, (ymd / 100) % 100, ymd % 100,
+                                &dst[i])) {
+            invalid_dates->push_back({out_base + i, ymd});
+          }
         } else {
           FlatVector::SetNull(output_vector, out_base + i, true);
         }
       }
       break;
     }
-    case FieldType::kDecimal64: {
-      for (uint32_t i = 0; i < count; i++, src += stride) {
-        uint16_t cell_length;
-        std::memcpy(&cell_length, src, sizeof(cell_length));
-        if (cell_length == width) {
-          int64_t mantissa;
-          std::memcpy(&mantissa, src + kCellLenBytes, sizeof(mantissa));
-          WriteDecimalPhysical(output_vector, out_base + i, mantissa,
-                               decimal_physical_type);
-        } else {
-          FlatVector::SetNull(output_vector, out_base + i, true);
-        }
+    case FieldType::kDecimal64:
+      switch (decimal_physical_type) {
+        case PhysicalType::INT16:
+          DecodeDecimalRun<int16_t>(src, stride, width, count, output_vector,
+                                    out_base);
+          break;
+        case PhysicalType::INT32:
+          DecodeDecimalRun<int32_t>(src, stride, width, count, output_vector,
+                                    out_base);
+          break;
+        case PhysicalType::INT64:
+          DecodeDecimalRun<int64_t>(src, stride, width, count, output_vector,
+                                    out_base);
+          break;
+        default:
+          DecodeDecimalRun<hugeint_t>(src, stride, width, count, output_vector,
+                                      out_base);
+          break;
       }
       break;
-    }
     default:
       break;  // kUntyped never reaches here
   }
@@ -617,16 +756,19 @@ void BulkDecodeTyped(FieldType type, const PaxGroup& group, size_t field,
 /**
  * @brief Decodes one untyped cell into a VARCHAR vector slot.
  *
- * @details An empty untyped cell is SQL NULL; short payloads inline into
- * string_t, longer ones copy into the vector's string heap.
+ * @details A zero-length cell is SQL NULL only when the row's null-flags
+ * field marks the column so, and the empty string otherwise; short payloads
+ * inline into string_t, longer ones copy into the vector's string heap.
  */
 inline void DecodeUntypedCell(const PaxGroup& group, size_t field,
-                              uint32_t slot, Vector& output_vector,
-                              idx_t out_row) {
-  const std::string_view cell_value = group.cell(field, slot);
-  if (cell_value.empty()) {
+                              uint32_t slot, bool is_null,
+                              Vector& output_vector, idx_t out_row) {
+  if (is_null) {
     FlatVector::SetNull(output_vector, out_row, true);
-  } else if (cell_value.size() <= duckdb::string_t::INLINE_LENGTH) {
+    return;
+  }
+  const std::string_view cell_value = group.cell(field, slot);
+  if (cell_value.size() <= duckdb::string_t::INLINE_LENGTH) {
     FlatVector::GetData<duckdb::string_t>(output_vector)[out_row] =
         duckdb::string_t(cell_value.data(),
                          static_cast<uint32_t>(cell_value.size()));
@@ -646,7 +788,19 @@ struct ColumnContext {
   uint32_t width;
   int8_t scale;
   PhysicalType decimal_physical_type;
+  uint32_t null_byte;  // byte of the null-flags field holding this column
+  uint8_t null_mask;   // 0 when the column is not nullable
 };
+
+/**
+ * @brief Returns whether a row's null-flags field marks `column` NULL.
+ */
+inline bool CellIsNull(std::string_view null_flags,
+                       const ColumnContext& column) {
+  return column.null_mask != 0 && column.null_byte < null_flags.size() &&
+         (static_cast<uint8_t>(null_flags[column.null_byte]) &
+          column.null_mask) != 0;
+}
 
 /**
  * @brief Decodes one slot's projected columns from the strip cells into
@@ -658,15 +812,20 @@ struct ColumnContext {
  */
 void EmitInPlaceRow(const PaxGroup& group,
                     const std::vector<ColumnContext>& scan_columns,
-                    uint32_t slot, DataChunk& output, idx_t out_row) {
+                    uint32_t slot, DataChunk& output, idx_t out_row,
+                    std::vector<InvalidDate>* invalid_dates) {
+  const std::string_view null_flags = group.cell(0, slot);
   for (idx_t i = 0; i < scan_columns.size(); i++) {
     const ColumnContext& column = scan_columns[i];
     FlatVector::SetNull(output.data[i], out_row, false);
     if (column.type == FieldType::kUntyped) {
-      DecodeUntypedCell(group, column.field, slot, output.data[i], out_row);
+      DecodeUntypedCell(group, column.field, slot,
+                        CellIsNull(null_flags, column), output.data[i],
+                        out_row);
     } else {
       BulkDecodeTyped(column.type, group, column.field, column.width, slot, 1,
-                      output.data[i], out_row, column.decimal_physical_type);
+                      output.data[i], out_row, column.decimal_physical_type,
+                      invalid_dates);
     }
   }
 }
@@ -684,6 +843,10 @@ void EmitImageRow(const std::string& old_row,
                   std::vector<std::pair<const char*, uint32_t>>& refs,
                   DataChunk& output, idx_t out_row) {
   SplitProxyRow(old_row, &refs);
+  if (refs.empty()) {
+    throw std::runtime_error("epoch image row is missing the null-flags field");
+  }
+  const std::string_view null_flags(refs[0].first, refs[0].second);
   for (idx_t i = 0; i < scan_columns.size(); i++) {
     const ColumnContext& column = scan_columns[i];
     Vector& output_vector = output.data[i];
@@ -692,7 +855,10 @@ void EmitImageRow(const std::string& old_row,
     }
     const char* payload = refs[column.field].first;
     const uint32_t length = refs[column.field].second;
-    if (length == 0) {  // empty == SQL NULL, as in the strip cells
+    // A typed field is zero-length only for SQL NULL; an untyped one needs
+    // the null-flags bit to tell '' from NULL.
+    if (column.type == FieldType::kUntyped ? CellIsNull(null_flags, column)
+                                           : length == 0) {
       FlatVector::SetNull(output_vector, out_row, true);
       continue;
     }
@@ -722,7 +888,7 @@ void EmitImageRow(const std::string& old_row,
           throw std::runtime_error("epoch image DATE field does not parse");
         }
         FlatVector::GetData<date_t>(output_vector)[out_row] =
-            Date::FromDate(year, month, day);
+            CanonicalDate(year, month, day);
         break;
       }
       case FieldType::kDecimal64: {
@@ -750,30 +916,14 @@ void EmitImageRow(const std::string& old_row,
 }
 
 /**
- * @brief Returns the oldest image whose writer epoch is after the snapshot
- * epoch, or nullptr.
- *
- * @details Images are published in install order, which is
- * epoch-non-decreasing per slot, so the first match is the oldest one and it
- * holds the value the slot had at se.
- */
-const pax::EpochImage* OldestImageAfterSnapshot(
-    const std::vector<pax::EpochImage>& images, uint32_t snapshot_epoch) {
-  for (const pax::EpochImage& image : images) {
-    if (pax::EpochAfterSnapshot(image.writer_epoch, snapshot_epoch)) {
-      return &image;
-    }
-  }
-  return nullptr;
-}
-
-/**
  * @brief Scan worker: fills one output chunk from claimed PAX groups.
  *
  * @details Threads claim whole groups from the shared next_group counter.
- * Groups with no epoch image decode contiguous visible-slot runs
- * column-at-a-time (bulk path, audited at attempt end); groups with images
- * resolve per slot against the snapshot epoch (see the file header).
+ * Slots the claimed image copy marks emit their image for the snapshot epoch;
+ * the rest decode contiguous visible-slot runs column-at-a-time. The group's
+ * preserve counter is re-read before the chunk is released, and a counter
+ * that moved rewinds this call's rows of that group and re-reads its slots
+ * one at a time (see the file header).
  */
 void PaxScan(ClientContext&, TableFunctionInput& data, DataChunk& output) {
   const auto& bind_data = data.bind_data->Cast<PaxBindData>();
@@ -782,6 +932,9 @@ void PaxScan(ClientContext&, TableFunctionInput& data, DataChunk& output) {
 
   PaxTableView& table_view = *bind_data.table;
   PaxTable* table = table_view.table;
+  const uint32_t snapshot_epoch = table_view.snapshot_epoch;
+  // The chunk DuckDB hands in holds STANDARD_VECTOR_SIZE rows (2048 in the
+  // default build); the audit below runs once per chunk, before it is returned.
   const idx_t max_rows = output.GetCapacity();
   idx_t rows_emitted = 0;
 
@@ -793,61 +946,187 @@ void PaxScan(ClientContext&, TableFunctionInput& data, DataChunk& output) {
     scan_columns[i].field = static_cast<size_t>(column) + 1;  // field 0 is null flags
     scan_columns[i].width = spec.width;
     scan_columns[i].scale = spec.scale;
+    scan_columns[i].null_byte = spec.null_byte;
+    scan_columns[i].null_mask = spec.null_mask;
     scan_columns[i].decimal_physical_type =
         (spec.type == FieldType::kDecimal64)
             ? output.data[i].GetType().InternalType()
             : PhysicalType::INVALID;
   }
 
-  while (rows_emitted < max_rows) {
-    if (local_state.group_ptr == nullptr ||
-        local_state.current_slot >= PaxGroup::kRows) {
-      uint32_t claimed = UINT32_MAX;
-      const uint64_t next =
-          global_state.next_group.fetch_add(1, std::memory_order_relaxed);
-      if (next < global_state.group_count) {
-        claimed = static_cast<uint32_t>(next);
-      }
-      if (claimed == UINT32_MAX) break;
-      local_state.group_ptr = pax::Group(table, claimed);
-      local_state.current_group = claimed;
-      local_state.current_slot = 0;
-      if (local_state.group_ptr == nullptr) continue;
-      // A group with epoch images resolves per slot; one with none takes the
-      // bulk path and is recorded for the attempt-end audit.
-      // The counter is read before the images: a preserve that lands between
-      // the two bumps a value the audit compares against.
-      local_state.count_at_claim =
-          pax::GroupPreserveCount(local_state.group_ptr);
-      local_state.images = pax::GroupImages(local_state.group_ptr);
-      local_state.resolve_per_slot =
-          table_view.force_per_slot || !local_state.images.empty();
-      if (!local_state.resolve_per_slot) {
-        std::lock_guard<std::mutex> lk(table_view.bulk_mutex);
-        table_view.bulk_groups.emplace_back(claimed, local_state.count_at_claim);
-      }
-    }
+  // The current group's in-place reads in this call: the slot they started at
+  // and the output row the group's rows begin at, which a dirty audit rewinds
+  // to. A group carried over from an earlier call resumes at its cursor.
+  bool audit_pending = local_state.group_ptr != nullptr &&
+                       local_state.current_slot < PaxGroup::kRows;
+  uint32_t entry_slot = local_state.current_slot;
+  idx_t entry_row = 0;
 
+  // In-place DATE cells of the open audit window that name no calendar day,
+  // in output row order. The audit empties the list, either by dropping the
+  // rows its redo replaces or by raising, so it is empty whenever no window
+  // is open.
+  std::vector<InvalidDate> invalid_dates;
+  // Forgets the records of output rows a rewind or a redo overwrites.
+  auto drop_invalid_dates_from = [&](idx_t row) {
+    while (!invalid_dates.empty() && invalid_dates.back().row >= row) {
+      invalid_dates.pop_back();
+    }
+  };
+
+  auto emit_image = [&](const pax::EpochImage& image) {
+    table_view.slots_from_images.fetch_add(1, std::memory_order_relaxed);
+    if (!image.was_visible) return;  // the slot held no row at se
+    EmitImageRow(image.old_row, scan_columns, local_state.field_refs, output,
+                 rows_emitted);
+    rows_emitted++;
+  };
+
+  // Re-reads [from, to) of the claimed group against a fresh image copy,
+  // revalidating the counter per row, and stops when the chunk fills: the
+  // group stays claimed and the next call resumes at current_slot.
+  auto redo_slots = [&](uint32_t from, uint32_t to) {
     PaxGroup* group = local_state.group_ptr;
-    const uint32_t slot = local_state.current_slot;
-    if (slot >= PaxGroup::kRows) {
-      local_state.group_ptr = nullptr;
-      continue;
+    ClaimGroupImages(local_state, group, snapshot_epoch);
+    for (uint32_t slot = from; slot < to; slot++) {
+      if (rows_emitted >= max_rows) {
+        local_state.current_slot = slot;
+        return;
+      }
+      const auto images_it = local_state.images.find(slot);
+      if (images_it != local_state.images.end()) {
+        const pax::EpochImage* image =
+            OldestImageAfterSnapshot(images_it->second, snapshot_epoch);
+        if (image != nullptr) {
+          emit_image(*image);
+          continue;
+        }
+      }
+      const bool visible_now = group->IsVisible(slot);
+      if (visible_now) {
+        EmitInPlaceRow(*group, scan_columns, slot, output, rows_emitted,
+                       &invalid_dates);
+      }
+      // The fence orders the cell reads above before the closing sample; an
+      // acquire load alone leaves them free to sink past it.
+      std::atomic_thread_fence(std::memory_order_acquire);
+      const uint64_t count_now =
+          pax::PreserveCount(GroupState(local_state, group));
+      if (count_now != local_state.count_at_claim) {
+        // A preserve landed after the copy; re-resolve this slot from a fresh
+        // lookup, then refresh the copy for the slots after it.
+        const auto fresh = pax::SlotImages(local_state.image_state, slot);
+        const pax::EpochImage* late =
+            OldestImageAfterSnapshot(fresh, snapshot_epoch);
+        local_state.count_at_claim = count_now;
+        CopyGroupImages(local_state, snapshot_epoch);
+        if (late != nullptr) {
+          drop_invalid_dates_from(rows_emitted);
+          emit_image(*late);
+          continue;
+        }
+      }
+      if (visible_now) rows_emitted++;
     }
+    local_state.current_slot = to;
+  };
 
-    if (!local_state.resolve_per_slot) {
-      // Bulk path: no epoch image when claimed, so the visibility bitmap and
-      // cells are the values at se unless a preserve lands mid-attempt, which
-      // the attempt-end audit catches.
+  // A preserve bumps the counter before the writer's first strip mutation, so
+  // an unchanged counter means no in-place row of this group was read torn.
+  // The audit runs before the chunk reaches DuckDB, which cannot give one back.
+  auto audit = [&]() {
+    if (!audit_pending) return;
+    audit_pending = false;
+    PaxGroup* group = local_state.group_ptr;
+    const uint32_t read_through = local_state.current_slot;
+    // The fence orders this call's cell reads before the closing sample; an
+    // acquire load alone leaves them free to sink past it.
+    std::atomic_thread_fence(std::memory_order_acquire);
+    if (pax::PreserveCount(GroupState(local_state, group)) ==
+        local_state.count_at_claim) {
+      // The counter held, so every cell read in this window is what the
+      // group stores, an unconvertible DATE among them.
+      if (!invalid_dates.empty()) RaiseInvalidDate(invalid_dates.front());
+      return;
+    }
+    table_view.chunk_audits_redone.fetch_add(1, std::memory_order_relaxed);
+    const idx_t high_water = rows_emitted;
+    rows_emitted = entry_row;
+    drop_invalid_dates_from(rows_emitted);
+    redo_slots(entry_slot, read_through);
+    // A redo resolves each slot against its own counter sample, so a record
+    // it leaves behind is a stored value.
+    if (!invalid_dates.empty()) RaiseInvalidDate(invalid_dates.front());
+    // The rows the redo abandons keep the validity bits the rewound pass
+    // wrote, and the bulk run that fills those rows next writes cells only,
+    // so their columns are marked valid again.
+    for (idx_t column = 0; column < scan_columns.size(); column++) {
+      for (idx_t row = rows_emitted; row < high_water; row++) {
+        FlatVector::SetNull(output.data[column], row, false);
+      }
+    }
+    // The redo's fresh copy and counter are the baseline of the window any
+    // further in-place read of this group in this call belongs to.
+    audit_pending = local_state.current_slot < PaxGroup::kRows;
+    entry_slot = local_state.current_slot;
+    entry_row = rows_emitted;
+  };
+
+  // An empty chunk ends this thread's scan, and a redo can empty one, so a
+  // call that has groups left to claim claims them rather than returning
+  // cardinality 0.
+  bool groups_exhausted = false;
+  for (;;) {
+    while (rows_emitted < max_rows) {
+      if (local_state.group_ptr != nullptr &&
+          local_state.current_slot >= PaxGroup::kRows) {
+        audit();
+        // A redo that fills the chunk leaves the group unfinished.
+        if (local_state.current_slot < PaxGroup::kRows) continue;
+        local_state.group_ptr = nullptr;
+        // A redo can fill the chunk on the group's last slot.
+        if (rows_emitted >= max_rows) break;
+      }
+      if (local_state.group_ptr == nullptr) {
+        const uint64_t next =
+            global_state.next_group.fetch_add(1, std::memory_order_relaxed);
+        if (next >= global_state.group_count) {
+          groups_exhausted = true;
+          break;
+        }
+        local_state.group_ptr = pax::Group(table, static_cast<uint32_t>(next));
+        local_state.current_slot = 0;
+        if (local_state.group_ptr == nullptr) continue;
+        table_view.groups_scanned.fetch_add(1, std::memory_order_relaxed);
+        ClaimGroupImages(local_state, local_state.group_ptr, snapshot_epoch);
+        if (local_state.has_images) {
+          table_view.groups_with_images.fetch_add(1, std::memory_order_relaxed);
+        }
+        audit_pending = true;
+        entry_slot = 0;
+        entry_row = rows_emitted;
+      }
+
+      PaxGroup* group = local_state.group_ptr;
+      const uint32_t slot = local_state.current_slot;
+
+      if (SlotImaged(local_state, slot)) {
+        local_state.current_slot = slot + 1;
+        emit_image(*OldestImageAfterSnapshot(
+            local_state.images.find(slot)->second, snapshot_epoch));
+        continue;
+      }
+
       if (!group->IsVisible(slot)) {
         local_state.current_slot = slot + 1;
         continue;
       }
-      const uint32_t max_run_length = std::min<uint32_t>(
-          PaxGroup::kRows - slot,
-          static_cast<uint32_t>(max_rows - rows_emitted));
+      const uint32_t max_run_length =
+          std::min<uint32_t>(PaxGroup::kRows - slot,
+                             static_cast<uint32_t>(max_rows - rows_emitted));
       uint32_t run_length = 1;
       while (run_length < max_run_length &&
+             !SlotImaged(local_state, slot + run_length) &&
              group->IsVisible(slot + run_length)) {
         run_length++;
       }
@@ -856,69 +1135,25 @@ void PaxScan(ClientContext&, TableFunctionInput& data, DataChunk& output) {
         const ColumnContext& column = scan_columns[i];
         if (column.type == FieldType::kUntyped) {
           for (uint32_t row = 0; row < run_length; row++) {
-            DecodeUntypedCell(*group, column.field, slot + row, output.data[i],
-                              rows_emitted + row);
+            DecodeUntypedCell(*group, column.field, slot + row,
+                              CellIsNull(group->cell(0, slot + row), column),
+                              output.data[i], rows_emitted + row);
           }
         } else {
-          BulkDecodeTyped(column.type, *group, column.field, column.width,
-                          slot, run_length, output.data[i], rows_emitted,
-                          column.decimal_physical_type);
+          BulkDecodeTyped(column.type, *group, column.field, column.width, slot,
+                          run_length, output.data[i], rows_emitted,
+                          column.decimal_physical_type, &invalid_dates);
         }
       }
 
       rows_emitted += run_length;
       local_state.current_slot = slot + run_length;
-      continue;
     }
 
-    // Per-slot resolution path.
-    local_state.current_slot = slot + 1;
-    const pax::EpochImage* image = nullptr;
-    const auto images_it = local_state.images.find(slot);
-    if (images_it != local_state.images.end()) {
-      image = OldestImageAfterSnapshot(images_it->second,
-                                       table_view.snapshot_epoch);
-    }
-    if (image != nullptr) {
-      // The slot was installed into after se; the image is the value at se
-      // (or the slot held no row then).
-      if (!image->was_visible) continue;
-      EmitImageRow(image->old_row, scan_columns, local_state.field_refs, output,
-                   rows_emitted);
-      rows_emitted++;
-      continue;
-    }
-    // No post-se image in the copy: the in-place bit and cells carry the
-    // state at se. Read them, then revalidate the preserve counter (a writer
-    // bumps it before its first mutation, so a torn read cannot pass).
-    // Invisible slots revalidate too: a post-se delete landing after the map
-    // copy cleared the bit, and its image is the row this read view owes.
-    const bool visible_now = group->IsVisible(slot);
-    if (visible_now) {
-      EmitInPlaceRow(*group, scan_columns, slot, output, rows_emitted);
-    }
-    const uint64_t count_now = pax::GroupPreserveCount(group);
-    if (count_now != local_state.count_at_claim) {
-      // A preserve landed after the map copy; re-resolve this slot from a
-      // fresh lookup.
-      const auto fresh = pax::SlotImages(group, slot);
-      const pax::EpochImage* late =
-          OldestImageAfterSnapshot(fresh, table_view.snapshot_epoch);
-      local_state.count_at_claim = count_now;
-      local_state.images = pax::GroupImages(group);
-      if (late != nullptr) {
-        // Image resolution is final: emit it, or drop the slot (a row index
-        // already written in place is reused by the next row).
-        if (!late->was_visible) continue;
-        EmitImageRow(late->old_row, scan_columns, local_state.field_refs,
-                     output, rows_emitted);
-        rows_emitted++;
-        continue;
-      }
-    }
-    if (visible_now) rows_emitted++;
+    audit();
+    if (rows_emitted > 0 || groups_exhausted) break;
   }
-
+  // Past this line the chunk is DuckDB's; every group that fed it is audited.
   output.SetCardinality(rows_emitted);
 }
 
@@ -946,28 +1181,34 @@ void PaxScan(ClientContext&, TableFunctionInput& data, DataChunk& output) {
  */
 void EncodeRow(duckdb::MaterializedQueryResult& result, idx_t row_index,
                std::string* out) {
-  out->clear();
-  // Field 0 mirrors the row null-flags field of the proxy row format; the
-  // proxy does not read it for bridge results.
-  AppendProxyField(*out, "", /*is_null=*/true);
-  for (idx_t column_index = 0; column_index < result.ColumnCount();
-       column_index++) {
+  // Field 0 is the row null-flags field: bit i of byte i / 8 marks output
+  // column i NULL. A NULL and an empty string are both zero-length fields,
+  // so this bitmap is what separates them.
+  const idx_t columns = result.ColumnCount();
+  std::string null_flags(static_cast<size_t>((columns + 7) / 8), '\0');
+  std::string body;
+  for (idx_t column_index = 0; column_index < columns; column_index++) {
     const duckdb::Value value = result.GetValue(column_index, row_index);
     // Check is_null BEFORE looking at the text: a genuine empty-string result
     // (value.ToString() == "") is a valid non-null value, not a signal for
     // the NULL sentinel. The text is only computed in the non-null case.
     if (value.IsNull()) {
-      AppendProxyField(*out, "", /*is_null=*/true);
+      null_flags[column_index / 8] |=
+          static_cast<char>(1u << (column_index % 8));
+      AppendProxyField(body, "", /*is_null=*/true);
     } else if (value.type().id() == duckdb::LogicalTypeId::BOOLEAN) {
       // MySQL's boolean surface is 1/0; Item_string::val_int reads both
       // "true" and "false" as 0.
-      AppendProxyField(*out, value.GetValue<bool>() ? "1" : "0",
+      AppendProxyField(body, value.GetValue<bool>() ? "1" : "0",
                        /*is_null=*/false);
     } else {
       const std::string text = value.ToString();
-      AppendProxyField(*out, text, /*is_null=*/false);
+      AppendProxyField(body, text, /*is_null=*/false);
     }
   }
+  out->clear();
+  AppendProxyField(*out, null_flags, /*is_null=*/false);
+  out->append(body);
 }
 
 // ---------------------------------------------------------------------------
@@ -975,19 +1216,98 @@ void EncodeRow(duckdb::MaterializedQueryResult& result, idx_t row_index,
 // ---------------------------------------------------------------------------
 
 /**
+ * @brief Parses a positive integer that spans the whole token.
+ *
+ * @details False for an empty token, a non-digit anywhere in it, or a value
+ * past uint64_t. `tail` takes the one suffix letter a byte count allows; a
+ * caller that wants none passes nullptr.
+ */
+bool ParseWholeNumber(const char* value, uint64_t* out, char* tail) {
+  const std::string_view input(value);
+  if (input.empty()) return false;
+  const char* const last = input.data() + input.size();
+  const auto [end, error] = std::from_chars(input.data(), last, *out, 10);
+  if (error != std::errc{} || *out == 0) return false;
+  if (end == last) {
+    if (tail != nullptr) *tail = '\0';
+    return true;
+  }
+  if (tail == nullptr || end + 1 != last) return false;
+  *tail = *end;
+  return true;
+}
+
+/**
+ * @brief Parses a byte count with an optional K, M or G suffix.
+ *
+ * @details False for a token the count does not span, a suffix outside
+ * K/M/G, a count past uint64_t, or a count the suffix takes past it.
+ */
+bool ParseByteSize(const char* value, uint64_t* out) {
+  char suffix = '\0';
+  if (!ParseWholeNumber(value, out, &suffix)) return false;
+  uint64_t scale = 1;
+  switch (suffix) {
+    case 'g':
+    case 'G':
+      scale = 1ull << 30;
+      break;
+    case 'm':
+    case 'M':
+      scale = 1ull << 20;
+      break;
+    case 'k':
+    case 'K':
+      scale = 1ull << 10;
+      break;
+    case '\0':
+      break;
+    default:
+      return false;
+  }
+  if (*out > UINT64_MAX / scale) return false;
+  *out *= scale;
+  return true;
+}
+
+// The bounds ConfigureLimits read, 0 while the environment sets neither.
+idx_t bridge_threads = 0;
+idx_t bridge_memory = 0;
+
+/**
+ * @brief Applies the bridge's thread and memory bounds to `config`.
+ *
+ * @details The thread pool defaults to a quarter of the hardware threads, so
+ * an analytical stream does not take the cores the OLTP side runs on; a pure
+ * analytical run sets HELIOS_BRIDGE_THREADS itself. An unset memory bound is
+ * DuckDB's own default.
+ */
+duckdb::DBConfig* ConfigureBridgeLimits(duckdb::DBConfig* config) {
+  config->options.maximum_threads =
+      bridge_threads != 0
+          ? bridge_threads
+          : std::max<idx_t>(1, std::thread::hardware_concurrency() / 4);
+  if (bridge_memory != 0) config->options.maximum_memory = bridge_memory;
+  return config;
+}
+
+/**
  * @brief Process-lifetime DuckDB runtime.
  *
  * @details The bridge borrows DuckDB's binder, planner, and vectorized
  * executor; the in-memory duckdb::DuckDB instance holds no table data, and
- * its system catalog only ever contains this bridge's scan function. The function-local static gives thread-safe, exactly-once
- * construction: the first request pays the construction cost, every later
- * request on any thread reuses the instance. This follows DuckDB's
- * documented concurrency model
- * (https://duckdb.org/docs/stable/connect/concurrency): one shared instance,
- * one fresh Connection per request/thread.
+ * its system catalog only ever contains this bridge's scan function. The
+ * function-local static gives thread-safe, exactly-once construction: the
+ * first request pays the construction cost, every later request on any
+ * thread reuses the instance. This follows DuckDB's documented concurrency
+ * model (https://duckdb.org/docs/stable/connect/concurrency): one shared
+ * instance, one fresh Connection per request/thread.
  */
 duckdb::DuckDB& GlobalRuntime() {
-  static duckdb::DuckDB runtime(nullptr);  // nullptr: in-memory, no db file
+  // Function-local statics initialize in order, so the config is complete
+  // before the instance reads it. nullptr: in-memory, no db file.
+  static duckdb::DBConfig config;
+  static duckdb::DuckDB runtime(nullptr, ConfigureBridgeLimits(&config));
   return runtime;
 }
 
@@ -1021,9 +1341,23 @@ void Utf8mb40900AiCiSortKey(duckdb::DataChunk& args, duckdb::ExpressionState&,
         "utf8mb4_0900_ai_ci collation runtime is not ready or is not NO PAD");
   }
 
+  // Contract: the key bytes are what a direct strnxfrm call produces under
+  // this CHARSET_INFO with these flags. Memoization and the exact-size
+  // reservation change only how often it runs and how much heap it takes.
+  // The collated columns of an analytical scan have few distinct values, so
+  // one map per call collapses a chunk to that many strnxfrm calls.
+  //
+  // The map owns its key bytes: an inlined string_t carries them inside the
+  // by-value argument, which dies with the call.
+  std::unordered_map<std::string, duckdb::string_t> memo;
+  static thread_local std::vector<unsigned char> scratch;
+
   duckdb::UnaryExecutor::Execute<duckdb::string_t, duckdb::string_t>(
       args.data[0], result, args.size(), [&](duckdb::string_t input) {
         const size_t input_size = input.GetSize();
+        std::string value(input.GetData(), input_size);
+        const auto hit = memo.find(value);
+        if (hit != memo.end()) return hit->second;
         if (input_size > SIZE_MAX / collation->mbmaxlen) {
           throw std::runtime_error(
               "utf8mb4_0900_ai_ci sort key input is too large");
@@ -1038,21 +1372,20 @@ void Utf8mb40900AiCiSortKey(duckdb::DataChunk& args, duckdb::ExpressionState&,
           throw std::runtime_error(
               "utf8mb4_0900_ai_ci sort key is too large for DuckDB");
         }
-        duckdb::string_t key =
-            duckdb::StringVector::EmptyString(result, capacity);
+        if (scratch.size() < capacity) scratch.resize(capacity);
         const size_t key_size = collation->coll->strnxfrm(
-            collation, reinterpret_cast<uchar*>(key.GetDataWriteable()),
-            capacity, /*num_codepoints=*/0,
+            collation, scratch.data(), capacity, /*num_codepoints=*/0,
             reinterpret_cast<const uchar*>(input.GetData()), input_size,
             /*flags=*/0);
         if (key_size > capacity || key_size > UINT32_MAX) {
           throw std::runtime_error(
               "utf8mb4_0900_ai_ci sort key exceeded its allocation");
         }
-        // strnxfrm can use less than its worst-case allocation. This both
-        // records the actual length and refreshes string_t's cached prefix;
-        // comparison uses the prefix while hashing reads the payload.
-        key.SetSizeAndFinalize(static_cast<uint32_t>(key_size), capacity);
+        // strnxfrm can use less than its worst-case bound, so the string heap
+        // takes the produced length, not the bound.
+        const duckdb::string_t key = duckdb::StringVector::AddStringOrBlob(
+            result, reinterpret_cast<const char*>(scratch.data()), key_size);
+        memo.emplace(std::move(value), key);
         return key;
       });
 }
@@ -1172,6 +1505,30 @@ void EnsureDuckdbScanRegistered() {
 
 }  // namespace
 
+void ConfigureLimits() {
+  const char* threads = std::getenv("HELIOS_BRIDGE_THREADS");
+  if (threads != nullptr) {
+    uint64_t parsed = 0;
+    if (!ParseWholeNumber(threads, &parsed, nullptr)) {
+      LOG_FATAL(
+          "Invalid HELIOS_BRIDGE_THREADS='%s': expected a positive integer",
+          threads);
+    }
+    bridge_threads = static_cast<idx_t>(parsed);
+  }
+  const char* memory = std::getenv("HELIOS_BRIDGE_MEM_LIMIT");
+  if (memory != nullptr) {
+    uint64_t bytes = 0;
+    if (!ParseByteSize(memory, &bytes)) {
+      LOG_FATAL(
+          "Invalid HELIOS_BRIDGE_MEM_LIMIT='%s': expected a positive byte "
+          "count with an optional K, M or G suffix",
+          memory);
+    }
+    bridge_memory = static_cast<idx_t>(bytes);
+  }
+}
+
 void ExecuteDuckdbQuery(
     helios::storage::Database* db,
     const pb::TxExecuteDuckdbQuery::Request& request,
@@ -1194,7 +1551,18 @@ void ExecuteDuckdbQuery(
     struct ReadViewRelease {
       helios::storage::Database* database;
       const helios::storage::Database::PaxReadView& handle;
-      ~ReadViewRelease() { database->ClosePaxView(handle); }
+      ~ReadViewRelease() {
+        // Sampled before the close, so the line reports what this view was
+        // holding rather than what survives it.
+        const pax::ImageBufferStats stats =
+            BridgeDebugEnabled() ? pax::ImageStats() : pax::ImageBufferStats{};
+        database->ClosePaxView(handle);
+        if (BridgeDebugEnabled()) {
+          std::fprintf(stderr,
+                       "[epoch-images] images=%lu bytes=%lu open_views=%lu\n",
+                       stats.images, stats.bytes, stats.open_views);
+        }
+      }
     } read_view_release{db, read_view};
 
     std::vector<PaxTableView> table_views(
@@ -1228,7 +1596,9 @@ void ExecuteDuckdbQuery(
         // (an untyped store keeps field_type empty).
         if (schema.type_of(f) != static_cast<FieldType>(column.pax_kind()) ||
             schema.field_max_bytes[f] != column.pax_width() ||
-            schema.scale_of(f) != static_cast<int>(column.pax_scale())) {
+            schema.scale_of(f) != static_cast<int>(column.pax_scale()) ||
+            (column.null_bit() != 0 &&
+             (column.null_bit() - 1) / 8 >= schema.field_max_bytes[0])) {
           response->set_ok(false);
           response->set_error(
               "table descriptor does not match the store: " +
@@ -1246,6 +1616,11 @@ void ExecuteDuckdbQuery(
         spec.type = static_cast<FieldType>(column.pax_kind());
         spec.width = column.pax_width();
         spec.scale = static_cast<int8_t>(column.pax_scale());
+        if (column.null_bit() != 0) {
+          const uint32_t bit = column.null_bit() - 1;
+          spec.null_byte = bit / 8;
+          spec.null_mask = static_cast<uint8_t>(1u << (bit % 8));
+        }
         table_view.columns.push_back(std::move(spec));
       }
       handles[static_cast<size_t>(i)] =
@@ -1254,74 +1629,50 @@ void ExecuteDuckdbQuery(
 
     EnsureDuckdbScanRegistered();
     Connection connection(GlobalRuntime());
-    std::unique_ptr<duckdb::MaterializedQueryResult> result;
-    bool accepted = false;
-    const int max_attempts = MaxReadViewAttempts();
-    for (int attempt = 1; attempt <= max_attempts && !accepted; attempt++) {
-      for (PaxTableView& table_view : table_views) {
-        table_view.bulk_groups.clear();
-      }
-      // The statement is consumed by execution; each attempt rebuilds it
-      // from the immutable request.
-      auto built = BuildSelectStatement(request, handles);
-      if (!built.statement) {
-        response->set_ok(false);
-        response->set_error(built.error);
-        return;
-      }
-      duckdb::unique_ptr<duckdb::SQLStatement> statement(
-          built.statement.release());
-      static const bool debug_resolved = [] {
-        const char* value = std::getenv("ENABLE_DUCKDB_BRIDGE_DEBUG");
-        return value != nullptr && value[0] != '\0' &&
-               std::string_view(value) != "0";
-      }();
-      if (debug_resolved) {
-        std::fprintf(stderr, "[duckdb-ast] %s\n",
-                     statement->ToString().c_str());
-      }
-      auto query_result = connection.Query(std::move(statement));
-      result.reset(static_cast<duckdb::MaterializedQueryResult*>(
-          query_result.release()));
-
-      if (!db->PaxViewValid(read_view)) {
-        response->set_ok(false);
-        response->set_error("columnar read view expired during execution");
-        return;
-      }
-      const bool audit_clean = BulkGroupsUnchanged(table_views);
-      if (!audit_clean) {
-        for (PaxTableView& table_view : table_views) {
-          table_view.force_per_slot = true;
-        }
-      }
-      if (result->HasError()) {
-        if (audit_clean) {
-          response->set_ok(false);
-          response->set_error(result->GetError());
-          return;
-        }
-        continue;
-      }
-      if (!audit_clean) continue;
-
-      std::vector<std::string> staged_rows;
-      staged_rows.reserve(static_cast<size_t>(result->RowCount()));
-      std::string row;
-      for (idx_t row_index = 0; row_index < result->RowCount(); row_index++) {
-        EncodeRow(*result, row_index, &row);
-        staged_rows.push_back(std::move(row));
-      }
-      for (std::string& staged : staged_rows) {
-        response->add_rows(std::move(staged));
-      }
-      accepted = true;
-    }
-    if (!accepted) {
-      response->Clear();
+    auto built = BuildSelectStatement(request, handles);
+    if (!built.statement) {
       response->set_ok(false);
-      response->set_error("concurrent modification");
+      response->set_error(built.error);
       return;
+    }
+    duckdb::unique_ptr<duckdb::SQLStatement> statement(
+        built.statement.release());
+    const bool debug_resolved = BridgeDebugEnabled();
+    if (debug_resolved) {
+      std::fprintf(stderr, "[duckdb-ast] %s\n", statement->ToString().c_str());
+    }
+    auto query_result = connection.Query(std::move(statement));
+    std::unique_ptr<duckdb::MaterializedQueryResult> result(
+        static_cast<duckdb::MaterializedQueryResult*>(query_result.release()));
+
+    if (!db->PaxViewValid(read_view)) {
+      response->set_ok(false);
+      response->set_error("columnar read view expired during execution");
+      return;
+    }
+    if (debug_resolved) {
+      for (size_t i = 0; i < table_views.size(); i++) {
+        const PaxTableView& table_view = table_views[i];
+        std::fprintf(stderr,
+                     "[duckdb-scan] %s groups=%lu imaged_groups=%lu "
+                     "chunk_redos=%lu image_slots=%lu\n",
+                     request.tables(static_cast<int>(i)).table_name().c_str(),
+                     table_view.groups_scanned.load(),
+                     table_view.groups_with_images.load(),
+                     table_view.chunk_audits_redone.load(),
+                     table_view.slots_from_images.load());
+      }
+    }
+    if (result->HasError()) {
+      response->set_ok(false);
+      response->set_error(result->GetError());
+      return;
+    }
+
+    std::string row;
+    for (idx_t row_index = 0; row_index < result->RowCount(); row_index++) {
+      EncodeRow(*result, row_index, &row);
+      response->add_rows(std::move(row));
     }
     response->set_ok(true);
   } catch (const std::exception& exception) {

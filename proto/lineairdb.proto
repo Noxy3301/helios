@@ -586,6 +586,9 @@ message TxExecuteDuckdbQuery {
         uint32 pax_kind = 1;
         uint32 pax_width = 2;    // PAX cell payload width (bytes)
         int32 pax_scale = 3;     // DEC64 only
+        // Null bit of the column in the row null-flags field: 0 when the
+        // column is not nullable, else 1 + null byte offset * 8 + bit index.
+        uint32 null_bit = 4;
     }
     // The server keeps the PAX schema in its catalog; each request carries
     // the per-table cell metadata derived from TABLE::field[], and the

@@ -15,23 +15,51 @@ namespace helios::storage {
 namespace pax {
 
 EpochImageBuffer &EpochImageBuffer::Global() {
-  static EpochImageBuffer instance;
-  return instance;
+  // Never destroyed: a PaxGroup destructor reaches the buffer, and group
+  // lifetimes are not ordered against static destruction.
+  static EpochImageBuffer *instance = new EpochImageBuffer();
+  return *instance;
 }
 
-EpochImageBuffer::GroupState *EpochImageBuffer::GetOrCreateGroup(
-    const PaxGroup *group) {
+GroupImageState *EpochImageBuffer::GetOrCreateGroup(const PaxGroup *group) {
+  // The state pointer is published once and stays until Forget.
+  if (auto *s = group->image_state.load(std::memory_order_acquire)) return s;
   std::lock_guard<std::mutex> lk(groups_mutex_);
   auto &state = groups_[group];
-  if (!state) state = std::make_unique<GroupState>();
+  if (!state) state = std::make_unique<GroupImageState>();
+  // Publish the built state; readers reach it with an acquire load.
+  group->image_state.store(state.get(), std::memory_order_release);
   return state.get();
 }
 
-const EpochImageBuffer::GroupState *EpochImageBuffer::FindGroup(
-    const PaxGroup *group) const {
+namespace {
+
+// An image costs its row bytes plus the record that holds them.
+uint64_t ImageBytes(const EpochImage &image) {
+  return sizeof(EpochImage) + image.old_row.size();
+}
+
+}  // namespace
+
+void EpochImageBuffer::Forget(const PaxGroup *group) {
   std::lock_guard<std::mutex> lk(groups_mutex_);
+  group->image_state.store(nullptr, std::memory_order_release);
   auto it = groups_.find(group);
-  return it == groups_.end() ? nullptr : it->second.get();
+  if (it == groups_.end()) return;
+  std::lock_guard<std::mutex> glk(it->second->mutex);
+  // Take the group's images out of the held counters.
+  uint64_t count = 0, bytes = 0;
+  for (const auto &[slot, slot_images] : it->second->images) {
+    count += slot_images.size();
+    for (const EpochImage &image : slot_images) bytes += ImageBytes(image);
+  }
+  images_held_.fetch_sub(count, std::memory_order_relaxed);
+  bytes_held_.fetch_sub(bytes, std::memory_order_relaxed);
+  // The map entry keeps the state object: a scan holds it by raw pointer for
+  // the length of its read. Clearing it leaves a PaxGroup allocated at this
+  // address no image of the group that held the address before it.
+  it->second->images.clear();
+  it->second->preserve_count.store(0, std::memory_order_release);
 }
 
 bool EpochImageBuffer::NeedsImage(EpochNumber old_epoch,
@@ -55,7 +83,7 @@ void EpochImageBuffer::Preserve(PaxGroup *group, uint32_t slot,
   }
   const EpochNumber min_se = *open_views_.begin();
 
-  GroupState *state = GetOrCreateGroup(group);
+  GroupImageState *state = GetOrCreateGroup(group);
   {
     std::lock_guard<std::mutex> glk(state->mutex);
     auto &images = state->images[slot];
@@ -65,6 +93,13 @@ void EpochImageBuffer::Preserve(PaxGroup *group, uint32_t slot,
         images.begin(), images.end(), [min_se](const EpochImage &image) {
           return EpochAfterSnapshot(image.writer_epoch, min_se);
         });
+    uint64_t trimmed_bytes = 0;
+    for (auto it = images.begin(); it != kept; ++it) {
+      trimmed_bytes += ImageBytes(*it);
+    }
+    images_held_.fetch_sub(static_cast<uint64_t>(kept - images.begin()),
+                           std::memory_order_relaxed);
+    bytes_held_.fetch_sub(trimmed_bytes, std::memory_order_relaxed);
     images.erase(images.begin(), kept);
     // A view an existing image already serves does not need this one.
     const EpochNumber uncovered =
@@ -74,16 +109,20 @@ void EpochImageBuffer::Preserve(PaxGroup *group, uint32_t slot,
     if (view != open_views_.end() && EpochAfterSnapshot(writer_epoch, *view)) {
       images.push_back(
           EpochImage{writer_epoch, was_visible, std::move(old_row)});
+      images_held_.fetch_add(1, std::memory_order_relaxed);
+      bytes_held_.fetch_add(ImageBytes(images.back()),
+                            std::memory_order_relaxed);
     } else if (images.empty()) {
       state->images.erase(slot);
     }
   }
   // Count after the append, or the skip, and before the caller mutates any
-  // strip cell.
-  // Readers that sample preserve_count, read the strip cells, then sample
-  // again finished their in-place reads before this writer's first cell
-  // write.
-  state->preserve_count.fetch_add(1, std::memory_order_release);
+  // strip cell. acq_rel: the release half publishes the append, the acquire
+  // half keeps the caller's cell writes from becoming visible ahead of the
+  // bump. A reader that samples preserve_count, reads the strip cells, then
+  // samples again finished its in-place reads before this writer's first
+  // cell write.
+  state->preserve_count.fetch_add(1, std::memory_order_acq_rel);
 }
 
 EpochNumber EpochImageBuffer::Open(const epoch::Framework &epoch) {
@@ -107,28 +146,12 @@ void EpochImageBuffer::Close(EpochNumber se) {
 }
 
 uint64_t EpochImageBuffer::GroupPreserveCount(const PaxGroup *group) const {
-  const GroupState *state = FindGroup(group);
-  return state == nullptr
-             ? 0
-             : state->preserve_count.load(std::memory_order_acquire);
+  return pax::PreserveCount(ImageState(group));
 }
 
 std::vector<EpochImage> EpochImageBuffer::SlotImages(const PaxGroup *group,
                                                      uint32_t slot) const {
-  const GroupState *state = FindGroup(group);
-  if (state == nullptr) return {};
-  std::lock_guard<std::mutex> glk(state->mutex);
-  auto it = state->images.find(slot);
-  if (it == state->images.end()) return {};
-  return it->second;
-}
-
-std::unordered_map<uint32_t, std::vector<EpochImage>>
-EpochImageBuffer::GroupImages(const PaxGroup *group) const {
-  const GroupState *state = FindGroup(group);
-  if (state == nullptr) return {};
-  std::lock_guard<std::mutex> glk(state->mutex);
-  return state->images;
+  return pax::SlotImages(ImageState(group), slot);
 }
 
 void EpochImageBuffer::ClearAllLocked() {
@@ -137,20 +160,55 @@ void EpochImageBuffer::ClearAllLocked() {
     std::lock_guard<std::mutex> glk(state->mutex);
     state->images.clear();
   }
+  // Every group is cleared under the exclusive registry lock, so no Preserve
+  // is in flight to have counted an image this misses.
+  images_held_.store(0, std::memory_order_relaxed);
+  bytes_held_.store(0, std::memory_order_relaxed);
 }
 
-uint64_t GroupPreserveCount(const PaxGroup *group) {
-  return EpochImageBuffer::Global().GroupPreserveCount(group);
+ImageBufferStats EpochImageBuffer::Stats() const {
+  std::shared_lock<std::shared_mutex> lk(registry_mutex_);
+  return ImageBufferStats{images_held_.load(std::memory_order_relaxed),
+                          bytes_held_.load(std::memory_order_relaxed),
+                          static_cast<uint64_t>(open_views_.size())};
+}
+
+uint64_t PreserveCount(const GroupImageState *state) {
+  return state == nullptr
+             ? 0
+             : state->preserve_count.load(std::memory_order_acquire);
 }
 
 std::unordered_map<uint32_t, std::vector<EpochImage>> GroupImages(
-    const PaxGroup *group) {
-  return EpochImageBuffer::Global().GroupImages(group);
+    const GroupImageState *state, uint64_t *imaged) {
+  constexpr uint32_t kWordBits = PaxGroup::kVisibilityWordBits;
+  std::fill_n(imaged, PaxGroup::kRows / kWordBits, uint64_t{0});
+  if (state == nullptr) return {};
+  std::lock_guard<std::mutex> glk(state->mutex);
+  // A slot keeps its entry only while it holds an image, so the map keys are
+  // the imaged slots.
+  for (const auto &[slot, images] : state->images) {
+    if (slot < PaxGroup::kRows) {
+      imaged[slot / kWordBits] |= uint64_t{1} << (slot % kWordBits);
+    }
+  }
+  return state->images;
 }
 
-std::vector<EpochImage> SlotImages(const PaxGroup *group, uint32_t slot) {
-  return EpochImageBuffer::Global().SlotImages(group, slot);
+std::vector<EpochImage> SlotImages(const GroupImageState *state,
+                                   uint32_t slot) {
+  if (state == nullptr) return {};
+  std::lock_guard<std::mutex> glk(state->mutex);
+  auto it = state->images.find(slot);
+  if (it == state->images.end()) return {};
+  return it->second;
 }
+
+void ForgetGroup(const PaxGroup *group) {
+  EpochImageBuffer::Global().Forget(group);
+}
+
+ImageBufferStats ImageStats() { return EpochImageBuffer::Global().Stats(); }
 
 }  // namespace pax
 }  // namespace helios::storage
