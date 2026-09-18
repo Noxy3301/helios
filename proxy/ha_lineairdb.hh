@@ -125,8 +125,8 @@ struct RangeScanLimit {
 };
 
 // Returns LIMIT and scan direction to push, or row_limit=0 to keep it local.
-// Safe only when the server scan sees every WHERE predicate that can affect
-// which rows belong before the LIMIT.
+// The storage scan carries no predicate, so the LIMIT is pushed only when
+// MySQL keeps no WHERE for this table above the handler.
 RangeScanLimit range_scan_limit_for_order(THD *thd, const KEY *key,
                                           uint matched_prefix,
                                           bool has_mysql_only_filter);
