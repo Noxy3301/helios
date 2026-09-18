@@ -103,6 +103,7 @@ struct TableSchema {
 
 class PaxTable;
 struct Row;
+struct GroupImageState;  // pax/epoch_image_buffer.h
 
 /**
  * @brief Stores a fixed-size row group as per-field PAX strips.
@@ -133,6 +134,11 @@ class PaxGroup {
    * @param schema Table schema owned by `PaxTable`; must outlive this group.
    */
   explicit PaxGroup(const TableSchema &schema);
+
+  /**
+   * @brief Drops the epoch image state this group published, if any.
+   */
+  ~PaxGroup();
 
   /**
    * @brief Writes a decoded row into this group's strip cells.
@@ -232,6 +238,11 @@ class PaxGroup {
 
   const TableSchema &schema() const { return schema_; }
 
+  // This group's epoch image state, published by the first preserve and never
+  // replaced. Readers load it once and reach the preserve counter and the
+  // images without the image buffer's group map lock.
+  mutable std::atomic<GroupImageState *> image_state{nullptr};
+
  private:
   /**
    * @brief Appends one field's row-format value into `out`.
@@ -300,30 +311,77 @@ inline bool EpochAfterSnapshot(uint32_t writer_epoch, uint32_t snapshot_epoch) {
 }
 
 /**
- * @brief Returns the monotonic preserve counter of `group`.
+ * @brief What the epoch image buffer holds.
+ */
+struct ImageBufferStats {
+  uint64_t images;      // preserved rows the buffer holds
+  uint64_t bytes;       // their row bytes plus the per-image record
+  uint64_t open_views;  // read views registered
+};
+
+/**
+ * @brief Returns what the process-wide epoch image buffer holds.
+ */
+ImageBufferStats ImageStats();
+
+/**
+ * @brief Forgets the epoch image state of a group being destroyed.
  *
- * @details 0 until the first install a view reads; the counter never resets.
- * It increments after an image is appended or skipped and before the
- * writer's first strip mutation; an unchanged value across an in-place read
- * means no concurrent preserve.
+ * @details Groups are addressed by pointer, so a state left behind would be
+ * inherited by whatever group is allocated at that address next.
+ */
+void ForgetGroup(const PaxGroup *group);
+
+/**
+ * @brief Returns the epoch image state of `group`, nullptr while it has none.
+ */
+inline GroupImageState *ImageState(const PaxGroup *group) {
+  return group->image_state.load(std::memory_order_acquire);
+}
+
+/**
+ * @brief Returns the monotonic preserve counter of `state`, 0 for nullptr.
+ *
+ * @details 0 until the first install a view reads, and 0 again once the
+ * group is forgotten. It increments after an image is appended or skipped
+ * and before the writer's first strip mutation; an unchanged value across an
+ * in-place read means no concurrent preserve, given an acquire fence before
+ * the closing sample.
+ */
+uint64_t PreserveCount(const GroupImageState *state);
+
+/**
+ * @brief Copies every epoch image the group holds, keyed by slot, and marks
+ * the slots that hold one in `imaged` in the same locked pass.
+ *
+ * @details Images per slot are ordered as preserved, and per-slot install
+ * order is epoch-non-decreasing. The copy is immune to a concurrent Preserve
+ * call. `imaged` holds PaxGroup::kRows bits, cleared first.
+ */
+std::unordered_map<uint32_t, std::vector<EpochImage>> GroupImages(
+    const GroupImageState *state, uint64_t *imaged);
+
+/**
+ * @brief Copies the epoch images recorded for one slot.
+ *
+ * @details Ordered as preserved and epoch-non-decreasing, and immune to a
+ * concurrent Preserve call, as GroupImages is.
+ */
+std::vector<EpochImage> SlotImages(const GroupImageState *state, uint32_t slot);
+
+/**
+ * @brief Returns the monotonic preserve counter of `group`.
  */
 uint64_t GroupPreserveCount(const PaxGroup *group);
 
 /**
  * @brief Copies every epoch image recorded for `group`, keyed by slot.
- *
- * @details Images per slot are ordered as preserved, and per-slot install
- * order is epoch-non-decreasing. The copy is immune to a concurrent Preserve
- * call.
  */
 std::unordered_map<uint32_t, std::vector<EpochImage>> GroupImages(
     const PaxGroup *group);
 
 /**
  * @brief Copies the epoch images recorded for one (group, slot).
- *
- * @details Ordered as preserved and epoch-non-decreasing, and immune to a
- * concurrent Preserve call, as GroupImages is.
  */
 std::vector<EpochImage> SlotImages(const PaxGroup *group, uint32_t slot);
 

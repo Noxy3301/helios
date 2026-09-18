@@ -40,6 +40,14 @@ Tidword Version(EpochNumber epoch, uint32_t tid) {
   return word;
 }
 
+using pax::PaxGroup;
+
+// Reads one slot's bit out of the imaged-slot words GroupImages fills.
+bool SlotBit(const uint64_t *imaged, uint32_t slot) {
+  constexpr uint32_t kWordBits = PaxGroup::kVisibilityWordBits;
+  return ((imaged[slot / kWordBits] >> (slot % kWordBits)) & 1u) != 0;
+}
+
 Tidword Deleted(EpochNumber epoch, uint32_t tid) {
   Tidword word = Version(epoch, tid);
   word.absent = true;
@@ -466,6 +474,85 @@ TEST_F(CommitTidTest, ReinsertingUnderOneViewKeepsOneAbsenceImage) {
   EXPECT_FALSE(images.front().was_visible);
   EXPECT_TRUE(images.front().old_row.empty());
   EXPECT_EQ(preserved + 3, count);
+}
+
+TEST_F(CommitTidTest, TheGroupPublishesItsImageStateOnTheFirstPreserve) {
+  auto *item = SeedRow("key", Version(10, 5));
+  auto &image_buffer = pax::EpochImageBuffer::Global();
+  EXPECT_EQ(nullptr, pax::ImageState(item->pax_group()));
+  EXPECT_EQ(0u, pax::PreserveCount(nullptr));
+
+  const EpochNumber se = image_buffer.Open(epoch_);
+  SetEpoch(12);
+  const bool first = Commit({}, {{kTable, "key", "second"}});
+  pax::GroupImageState *state = pax::ImageState(item->pax_group());
+  const uint64_t after_first = pax::PreserveCount(state);
+  SetEpoch(14);
+  const EpochNumber later = image_buffer.Open(epoch_);
+  SetEpoch(16);
+  const bool second = Commit({}, {{kTable, "key", "third"}});
+  image_buffer.Close(se);
+  image_buffer.Close(later);
+
+  ASSERT_TRUE(first && second) << reason_;
+  ASSERT_NE(nullptr, state);
+  // The published pointer is the one every later lookup returns, and reading
+  // the counter through it matches the buffer's own lookup.
+  EXPECT_EQ(state, pax::ImageState(item->pax_group()));
+  EXPECT_EQ(1u, after_first);
+  EXPECT_EQ(2u, pax::PreserveCount(state));
+  EXPECT_EQ(image_buffer.GroupPreserveCount(item->pax_group()),
+            pax::PreserveCount(state));
+}
+
+TEST_F(CommitTidTest, TheBufferAccountsForTheBytesItHolds) {
+  SeedRow("key", Version(10, 5));
+  auto &image_buffer = pax::EpochImageBuffer::Global();
+  const pax::ImageBufferStats before = pax::ImageStats();
+  const EpochNumber se = image_buffer.Open(epoch_);
+  SetEpoch(12);
+  const bool committed = Commit({}, {{kTable, "key", "second"}});
+  const pax::ImageBufferStats held = pax::ImageStats();
+  image_buffer.Close(se);
+  const pax::ImageBufferStats after = pax::ImageStats();
+
+  ASSERT_TRUE(committed) << reason_;
+  EXPECT_EQ(0u, before.images);
+  EXPECT_EQ(0u, before.bytes);
+  EXPECT_EQ(1u, held.images);
+  EXPECT_EQ(1u, held.open_views);
+  EXPECT_GT(held.bytes, sizeof(pax::EpochImage));
+  // The last close clears every image, and the counters with them.
+  EXPECT_EQ(0u, after.images);
+  EXPECT_EQ(0u, after.bytes);
+  EXPECT_EQ(0u, after.open_views);
+}
+
+TEST_F(CommitTidTest, TheImagedSlotBitsMirrorTheImageMapKeys) {
+  auto *first = SeedRow("a", Version(10, 1));
+  auto *second = SeedRow("b", Version(10, 2));
+  auto &image_buffer = pax::EpochImageBuffer::Global();
+  uint64_t imaged[PaxGroup::kRows / PaxGroup::kVisibilityWordBits];
+  uint64_t imaged_after_close[PaxGroup::kRows / PaxGroup::kVisibilityWordBits];
+
+  const EpochNumber se = image_buffer.Open(epoch_);
+  SetEpoch(12);
+  const bool committed = Commit({}, {{kTable, "a", "later"}});
+  pax::GroupImageState *state = pax::ImageState(first->pax_group());
+  const auto images = pax::GroupImages(state, imaged);
+  image_buffer.Close(se);
+  const auto after_close = pax::GroupImages(state, imaged_after_close);
+
+  ASSERT_TRUE(committed) << reason_;
+  ASSERT_EQ(first->pax_group(), second->pax_group());
+  ASSERT_EQ(1u, images.size());
+  EXPECT_EQ(1u, images.count(first->pax_slot()));
+  // The bits the same locked pass filled name exactly the imaged slots.
+  EXPECT_TRUE(SlotBit(imaged, first->pax_slot()));
+  EXPECT_FALSE(SlotBit(imaged, second->pax_slot()));
+  // The last close clears the images, and with them the bits.
+  EXPECT_TRUE(after_close.empty());
+  EXPECT_FALSE(SlotBit(imaged_after_close, first->pax_slot()));
 }
 
 TEST_F(CommitTidTest, DeletingAMissingKeyThenInsertingPreservesAbsence) {

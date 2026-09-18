@@ -30,6 +30,23 @@ class Framework;
 namespace pax {
 
 /**
+ * @brief Per-group epoch image state: the images the group's slots hold and
+ * the preserve counter a reader compares its in-place reads against.
+ *
+ * @details Created by the group's first preserve and published into
+ * PaxGroup::image_state, so every later lookup is one acquire load. One
+ * state per group address, allocated once and never freed (see Forget).
+ */
+struct GroupImageState {
+  mutable std::mutex mutex;
+  // Preserve counter, incremented after the image is appended or skipped
+  // and before the writer's first strip mutation. Readers compare it with
+  // the value they sampled; only Forget resets it.
+  std::atomic<uint64_t> preserve_count{0};
+  std::unordered_map<uint32_t, std::vector<EpochImage>> images;
+};
+
+/**
  * @brief The epoch images that keep a columnar read view consistent.
  *
  * @details An epoch image is the row a slot held before an install made
@@ -45,18 +62,6 @@ namespace pax {
  */
 class EpochImageBuffer {
  public:
-  /**
-   * @brief Per-group state: the preserved images and their preserve counter.
-   */
-  struct GroupState {
-    mutable std::mutex mutex;
-    // Preserve counter, incremented after the image is appended or skipped
-    // and before the writer's first strip mutation. It never resets; readers
-    // compare it with the value they sampled.
-    std::atomic<uint64_t> preserve_count{0};
-    std::unordered_map<uint32_t, std::vector<EpochImage>> images;
-  };
-
   /**
    * @brief Returns the process-wide buffer instance.
    */
@@ -99,6 +104,17 @@ class EpochImageBuffer {
                 EpochNumber writer_epoch, bool was_visible,
                 std::string old_row);
 
+  /**
+   * @brief Clears the state of a group being destroyed (see ForgetGroup).
+   *
+   * @details The group's images and its preserve counter reset, and the
+   * GroupImageState object stays allocated for the life of the process: a
+   * running scan reaches it by raw pointer, which no scan-shutdown barrier
+   * bounds, so no state is ever freed. Groups die only with their table,
+   * when no view is open and no commit is in flight.
+   */
+  void Forget(const PaxGroup *group);
+
   // Reader side ------------------------------------------------------
 
   /**
@@ -120,6 +136,11 @@ class EpochImageBuffer {
   void Close(EpochNumber se);
 
   /**
+   * @brief Returns the images and bytes held and the open view count.
+   */
+  ImageBufferStats Stats() const;
+
+  /**
    * @brief Returns the group's preserve counter, 0 when the buffer holds no
    * state for the group.
    */
@@ -133,30 +154,29 @@ class EpochImageBuffer {
   std::vector<EpochImage> SlotImages(const PaxGroup *group,
                                      uint32_t slot) const;
 
-  /**
-   * @brief Copies the group's whole slot->images map in one locking pass.
-   */
-  std::unordered_map<uint32_t, std::vector<EpochImage>> GroupImages(
-      const PaxGroup *group) const;
-
  private:
   // seq_cst on both sides is load-bearing for the fence proof; do not
   // weaken.
   std::atomic<uint64_t> open_count_{0};
+  // What the buffer holds, for attributing the process's memory. Moved
+  // wherever an image is appended, trimmed or dropped.
+  std::atomic<uint64_t> images_held_{0};
+  std::atomic<uint64_t> bytes_held_{0};
 
   // shared: NeedsImage, Preserve; exclusive: Open, Close and the clear the
   // last close performs. Const readers take neither.
   mutable std::shared_mutex registry_mutex_;
   // Snapshot epochs of the open views, guarded by registry_mutex_.
   std::multiset<EpochNumber> open_views_;
-  // Lock order: registry_mutex_, then this, then GroupState::mutex.
+  // Creation and the last close's enumeration only; every lookup goes
+  // through PaxGroup::image_state. Lock order: registry_mutex_, then this,
+  // then GroupImageState::mutex.
   mutable std::mutex groups_mutex_;
-  std::unordered_map<const PaxGroup *, std::unique_ptr<GroupState>> groups_;
+  std::unordered_map<const PaxGroup *, std::unique_ptr<GroupImageState>>
+      groups_;
 
   EpochImageBuffer() = default;
-  // The group pointer is a key here and is never dereferenced.
-  GroupState *GetOrCreateGroup(const PaxGroup *group);
-  const GroupState *FindGroup(const PaxGroup *group) const;
+  GroupImageState *GetOrCreateGroup(const PaxGroup *group);
   void ClearAllLocked();
 };
 

@@ -320,6 +320,8 @@ PaxGroup::PaxGroup(const TableSchema &schema) : schema_(schema) {
   visible_.reset(new std::atomic<uint64_t>[kRows / kVisibilityWordBits]());
 }
 
+PaxGroup::~PaxGroup() { ForgetGroup(this); }
+
 void PaxGroup::ScatterRow(uint32_t slot, const Row &row) {
   assert(slot < kRows);
   const size_t fields = schema_.field_count();
