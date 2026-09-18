@@ -108,6 +108,10 @@ Database::Database(const Config &config)
     }
   }
 
+  // The replay enrolled this thread in the Masstree epoch; leaving it lets
+  // the nodes the replay retired be reclaimed.
+  index::MasstreeReleaseThreadEpoch();
+
   // Abort the process if the running logger cannot persist its records.
   logger_.SetFailStop();
 
