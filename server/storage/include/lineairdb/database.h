@@ -100,9 +100,11 @@ class Database {
   /**
    * @brief Declares a secondary index on a table.
    *
-   * @return false when the table does not exist, an index of that name
-   * already exists, the name is empty, or `index_type` is not one of the
-   * declared values.
+   * @return true when the index exists with `index_type` afterwards, whether
+   * this call declared it or an earlier one did; false when the table does
+   * not exist, the name is empty, an index of that name holds another
+   * constraint, `index_type` is not one of the declared values, or the
+   * catalog write of a new declaration fails.
    */
   bool CreateSecondaryIndex(const std::string_view table_name,
                             const std::string_view index_name,

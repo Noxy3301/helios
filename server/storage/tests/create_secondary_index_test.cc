@@ -67,8 +67,10 @@ TEST_F(CreateSecondaryIndexTest, CreateDuplicateSecondaryIndex) {
   ASSERT_TRUE(TestHelper::CreateTable(*db_, "users"));
   ASSERT_TRUE(
       db_->CreateSecondaryIndex("users", "age_index", IndexConstraint::kNone));
-  ASSERT_FALSE(
+  ASSERT_TRUE(
       db_->CreateSecondaryIndex("users", "age_index", IndexConstraint::kNone));
+  ASSERT_FALSE(db_->CreateSecondaryIndex("users", "age_index",
+                                         IndexConstraint::kUnique));
 }
 
 TEST_F(CreateSecondaryIndexTest, CreateSecondaryIndexOnNonExistentTable) {

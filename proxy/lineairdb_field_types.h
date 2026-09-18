@@ -34,8 +34,7 @@ constexpr uint32_t DEC64 = 4;                   // 8-byte LE scaled int (DEC64)
  * (INT family, DATE) the width is the fixed binary payload width (4/8) and
  * the kind tells the engine to parse val_str once at scatter and reformat it
  * at gather. A table with any field wider than the PAX cell cap returns an
- * empty vector; CREATE TABLE then keeps the ordinary row layout instead of
- * reserving very wide cells for every row.
+ * empty vector, and CREATE TABLE refuses the table.
  *
  * The computation is a pure function of TABLE metadata: any two calls under
  * an unchanged schema yield identical widths/kinds/scales. CREATE TABLE
@@ -47,12 +46,14 @@ constexpr uint32_t DEC64 = 4;                   // 8-byte LE scaled int (DEC64)
  * @param kinds When non-null, receives one pax_kind value per returned width.
  * @param scales When non-null, receives one decimal scale per returned width
  * (nonzero only for DEC64).
- * @return Per-field maximum payload widths, or an empty vector when the table
- * should not use PAX storage.
+ * @param wide_field When non-null, receives the index of the column whose
+ * payload exceeds the PAX cell limit, set only when the result is empty.
+ * @return Per-field maximum payload widths, or an empty vector when a column
+ * is too wide for a PAX cell.
  */
 std::vector<uint32_t> compute_pax_field_widths(
     TABLE *table, std::vector<uint32_t> *kinds = nullptr,
-    std::vector<int32_t> *scales = nullptr);
+    std::vector<int32_t> *scales = nullptr, uint *wide_field = nullptr);
 
 /**
  * @brief LineairDB-internal classification of MySQL field types.

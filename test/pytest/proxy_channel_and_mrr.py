@@ -16,7 +16,7 @@ from utils.connection import get_connection
 DATABASE = "ha_lineairdb_test"
 MRR_ROWS = 50
 DELETE_ROWS = 5
-WIDE_COLUMN = 2000
+WIDE_COLUMN = 512  # the utf8mb4 width at the PAX cell limit
 
 
 def channel_table(cursor, table):

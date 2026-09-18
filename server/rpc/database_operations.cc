@@ -248,33 +248,25 @@ void LineairDBRpc::handleDbCreateTable(const std::string& message,
 
     request.ParseFromString(message);
 
-    const bool success =
-        db_manager_->get_database()->CreateTable(request.table_name());
-    response.set_success(success);
+    // A table another query node created is the same table; its schema
+    // install answers whether the definition matches the one in place.
+    auto db = db_manager_->get_database();
+    const bool created =
+        db->CreateTable(request.table_name()) || db->HasTable(request.table_name());
     hidden_keys_->ForgetTable(request.table_name());
-    LOG_DEBUG("CreateTable '%s': %s", request.table_name().c_str(),
-              success ? "success" : "already exists");
 
-    // Non-empty widths mean the proxy wants this table to try PAX storage.
-    if (request.pax_field_max_bytes_size() > 0) {
+    bool installed = false;
+    if (created) {
         std::vector<uint32_t> widths;
         widths.reserve(request.pax_field_max_bytes_size());
         for (const uint32_t width : request.pax_field_max_bytes()) {
             widths.push_back(width);
         }
 
-        // Typed cells: gate on HELIOS_PAX_TYPED (default on). When off, or when
-        // the proxy sent no/mismatched kinds, install an UNTYPED schema
-        // (byte-identical to the ASCII layout).
-        static const bool pax_typed_enabled = []() {
-            const char* v = std::getenv("HELIOS_PAX_TYPED");
-            return !(v != nullptr && v[0] == '0' && v[1] == '\0');
-        }();
+        // Every schema is typed: the request carries one kind per width.
         std::vector<helios::storage::pax::FieldType> types;
         std::vector<int8_t> scales;
-        if (pax_typed_enabled &&
-            request.pax_field_kind_size() ==
-                request.pax_field_max_bytes_size()) {
+        {
             types.reserve(request.pax_field_kind_size());
             for (const uint32_t kind : request.pax_field_kind()) {
                 types.push_back(
@@ -289,13 +281,16 @@ void LineairDBRpc::handleDbCreateTable(const std::string& message,
             }
         }
 
-        const bool installed = db_manager_->get_database()->InstallPaxSchema(
-            request.table_name(), widths, types, scales);
+        installed = db->InstallPaxSchema(request.table_name(), widths, types,
+                                         scales);
         LOG_INFO("PAX schema for '%s': %zu fields, typed=%s, %s",
                  request.table_name().c_str(), widths.size(),
                  types.empty() ? "no" : "yes",
-                 installed ? "installed" : "skipped");
+                 installed ? "installed" : "refused");
     }
+    response.set_success(created && installed);
+    LOG_DEBUG("CreateTable '%s': %s", request.table_name().c_str(),
+              response.success() ? "success" : "refused");
 
     result = response.SerializeAsString();
 }

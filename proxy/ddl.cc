@@ -11,7 +11,10 @@
 #include <vector>
 
 #include "lineairdb_field_types.h"
+#include "my_base.h"
 #include "my_dbug.h"
+#include "my_sys.h"
+#include "mysqld_error.h"
 #include "sql/field.h"
 #include "sql/key.h"
 #include "sql/sql_class.h"
@@ -23,21 +26,21 @@
 
 namespace {
 
-// LineairDB SecondaryIndexOption::Constraint wire bit for UNIQUE.
+// helios::storage::IndexConstraint::kUnique, the wire value of a UNIQUE index.
 constexpr uint kUniqueSecondaryIndex = 1u;
 
 // Backfill batching bounds each OCC write set while keeping connection reuse.
 constexpr uint64_t kBackfillWriteChunkRows = 2000;
 constexpr size_t kBackfillParallelWorkers = 16;
 
+// Widest payload a PAX cell holds. A column needing more has no home.
+constexpr uint32_t kMaxCellBytes = 2048;
+
 }  // namespace
 
 std::vector<uint32_t> compute_pax_field_widths(
     TABLE *table, std::vector<uint32_t> *kinds,
-    std::vector<int32_t> *scales) {
-  // Keep fixed-width cells bounded for variable-width columns such as TEXT.
-  constexpr uint32_t kMaxCellBytes = 2048;
-
+    std::vector<int32_t> *scales, uint *wide_field) {
   std::vector<uint32_t> widths;
   widths.reserve(table->s->fields + 1);
   if (kinds) {
@@ -140,16 +143,18 @@ std::vector<uint32_t> compute_pax_field_widths(
       case MYSQL_TYPE_VAR_STRING:
       case MYSQL_TYPE_ENUM:
       case MYSQL_TYPE_SET:
-        // Size the cell to the declared character count, not the charset
-        // octet length; a row whose bytes exceed it takes the per-row heap
-        // path, which disables strip-direct scans for the table.
-        width = field->char_length();
+        // The cell holds the encoded bytes, so the width is the charset's
+        // octet length of the declared characters.
+        width = field->field_length;
         break;
       default:
         break;
     }
 
-    if (width > kMaxCellBytes) return {};
+    if (width > kMaxCellBytes) {
+      if (wide_field) *wide_field = i;
+      return {};
+    }
     widths.push_back(width);
     if (kinds) kinds->push_back(kind);
     if (scales) scales->push_back(scale);
@@ -241,21 +246,40 @@ int ha_lineairdb::create(const char *table_name, TABLE *table, HA_CREATE_INFO *,
   auto proxy = get_proxy();
   std::vector<uint32_t> pax_kinds;
   std::vector<int32_t> pax_scales;
+  uint wide_field = 0;
   std::vector<uint32_t> pax_widths =
-      compute_pax_field_widths(table, &pax_kinds, &pax_scales);
-  if (pax_widths.empty()) {  // table skips PAX: send nothing typed
-    pax_kinds.clear();
-    pax_scales.clear();
+      compute_pax_field_widths(table, &pax_kinds, &pax_scales, &wide_field);
+  // The storage keeps no row outside PAX, so a table the PAX store cannot
+  // hold is refused here and nothing is created on the server.
+  if (pax_widths.empty()) {
+    const Field *field = table->field[wide_field];
+    char buf[128];
+    String sql_type(buf, sizeof(buf), field->charset());
+    field->sql_type(sql_type);
+    std::string msg = "LineairDB: column ";
+    msg += field->field_name;
+    msg += " (";
+    msg.append(sql_type.ptr(), sql_type.length());
+    msg += ") exceeds the PAX cell limit of " + std::to_string(kMaxCellBytes) +
+           " bytes";
+    my_error(ER_NOT_SUPPORTED_YET, MYF(0), msg.c_str());
+    return HA_ERR_UNSUPPORTED;
   }
-  proxy->db_create_table(db_table_name, pax_widths, pax_kinds, pax_scales);
+  if (!proxy->db_create_table(db_table_name, pax_widths, pax_kinds,
+                              pax_scales)) {
+    return HA_ERR_GENERIC;
+  }
 
+  // The server keeps each declared index in its catalog; a refused
+  // declaration fails the statement.
   for (uint i = 0; i < table->s->keys; i++) {
     auto key_info = table->key_info[i];
     uint index_type =
         (key_info.flags & HA_NOSAME) ? kUniqueSecondaryIndex : 0;
-    if (i != table->s->primary_key) {
-      proxy->db_create_secondary_index(
-          db_table_name, std::string(key_info.name), index_type);
+    if (i != table->s->primary_key &&
+        !proxy->db_create_secondary_index(
+            db_table_name, std::string(key_info.name), index_type)) {
+      return HA_ERR_GENERIC;
     }
   }
   return 0;

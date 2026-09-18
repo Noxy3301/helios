@@ -239,14 +239,12 @@ public:
         bool* transport_error = nullptr);
 
     // table/index management (non-transactional)
-    // Optional PAX cell widths (entry 0 = null flags, then TABLE::field
-    // order); empty keeps the row layout. kind/scale carry typed cells, one
-    // entry per width.
-    bool db_create_table(
-        const std::string& table_name,
-        const std::vector<uint32_t>& pax_field_max_bytes = {},
-        const std::vector<uint32_t>& pax_field_kind = {},
-        const std::vector<int32_t>& pax_field_scale = {});
+    // PAX cell widths in bytes (entry 0 = null flags, then TABLE::field
+    // order); kind/scale carry typed cells, one entry per width.
+    bool db_create_table(const std::string& table_name,
+                         const std::vector<uint32_t>& pax_field_max_bytes,
+                         const std::vector<uint32_t>& pax_field_kind,
+                         const std::vector<int32_t>& pax_field_scale);
     bool db_create_secondary_index(const std::string& table_name,
                                    const std::string& index_name,
                                    uint32_t index_type);

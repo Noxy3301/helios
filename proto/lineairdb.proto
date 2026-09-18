@@ -310,11 +310,10 @@ message TableRowCount {
 message DbCreateTable {
     message Request {
         string table_name = 1;
-        // PAX cell widths, entry 0 = null flags, later entries in
-        // TABLE::field order; empty keeps the ordinary row layout.
+        // PAX cell widths in bytes, entry 0 = null flags, later entries in
+        // TABLE::field order; kind and scale carry one entry per width.
         repeated uint32 pax_field_max_bytes = 2 [packed = true];
-        // Typed-cell kind per width entry, matching pax::FieldType; empty or
-        // length-mismatched means every field untyped.
+        // Typed-cell kind per width entry, matching pax::FieldType.
         repeated uint32 pax_field_kind = 3 [packed = true];
         // DECIMAL scale per typed field, 0 elsewhere.
         repeated int32 pax_field_scale = 4 [packed = true];
@@ -588,8 +587,9 @@ message TxExecuteDuckdbQuery {
         uint32 pax_width = 2;    // PAX cell payload width (bytes)
         int32 pax_scale = 3;     // DEC64 only
     }
-    // The server persists no schema; each request carries per-table PAX cell
-    // metadata derived from TABLE::field[] and validated against the store.
+    // The server keeps the PAX schema in its catalog; each request carries
+    // the per-table cell metadata derived from TABLE::field[], and the
+    // server validates it against the store.
     message TableDesc {
         string table_name = 1;             // PaxStore lookup key
                                            // (TABLE_SHARE::normalized_path)

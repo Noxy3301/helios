@@ -184,6 +184,11 @@ bool Database::CreateSecondaryIndex(const std::string_view table_name,
   std::lock_guard<std::mutex> lk(ddl_mutex_);
   Table *table = GetTable(table_name);
   if (table == nullptr) return false;
+  // A query node that declares an index the storage already holds gets the
+  // answer the declaration deserves: the same constraint, or a refusal.
+  if (auto *existing = table->GetSecondaryIndex(index_name)) {
+    return existing->constraint == index_type;
+  }
   if (!table->CreateSecondaryIndex(index_name, index_type)) return false;
   // A catalog the definition did not reach would lose the index at the next
   // startup; the index stays in memory and the caller is refused.
