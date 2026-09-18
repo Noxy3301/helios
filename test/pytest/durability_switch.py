@@ -3,12 +3,12 @@ Switching a running server from Async to Sync, observed from outside.
 
 A load runs faster under Async, and the load is not part of a measurement, so
 the run wants Async while it populates and Sync from the first measured
-transaction onwards. One scenario: after `helios-ctl set-durability sync`,
-a commit behaves as it does on a server that started Sync, which is a bounded
-wait plus an order. The wait is that nothing may be acknowledged during
-NOT_ANSWERED_SECONDS while that commit's fdatasync is held at a sync point;
-the order is that releasing the point lets it return, and a replay of the log
-finds every row that returned.
+transaction onwards. One scenario: after
+`SET GLOBAL helios_commit_durability = 'sync'`, a commit behaves as it does on
+a server that started Sync, which is a bounded wait plus an order. The wait is
+that nothing may be acknowledged during NOT_ANSWERED_SECONDS while that
+commit's fdatasync is held at a sync point; the order is that releasing the
+point lets it return, and a replay of the log finds every row that returned.
 
 The server is started by this test rather than by the runner: the debug sync
 handshake passes pipe descriptors to it, and its working directory is a
@@ -31,7 +31,6 @@ from utils.server_conf import write_conf
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 SERVER = os.path.join(ROOT, "build", "server", "helios-storage")
-CTL = os.path.join(ROOT, "build", "server", "helios-ctl")
 MYSQL_SOCKET = "/tmp/mysql.sock"
 MYSQLD_PORT = "3307"
 
@@ -220,10 +219,12 @@ def create_table(name):
 
 
 def start_switch(mode):
-    """Runs the control client without waiting for it."""
+    """Runs the switch statement without waiting for it."""
+    client = os.path.join(ROOT, "build", "runtime_output_directory", "mysql")
     return subprocess.Popen(
-        [CTL, "--host", "127.0.0.1", "--port", "9999",
-         "set-durability", mode],
+        [client, "-u", "root", "--protocol=TCP", "-h", "127.0.0.1",
+         "-P", MYSQLD_PORT, "-e",
+         f"SET GLOBAL helios_commit_durability = '{mode}'"],
         cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
 
 
@@ -311,7 +312,7 @@ def test_the_sync_contract_applies_after_the_switch(work_dir):
             log("FAIL: the switch never returned")
             return 1
         stdout, stderr = switch.communicate()
-        if switch.returncode != 0 or stdout.strip() != "ok mode=SYNC":
+        if switch.returncode != 0:
             log(f"FAIL: the switch reported rc={switch.returncode} "
                 f"stdout={stdout.strip()!r} stderr={stderr.strip()!r}")
             return 1
@@ -371,10 +372,9 @@ def test_the_sync_contract_applies_after_the_switch(work_dir):
 
 def main():
     print("TEST: the runtime switch from async to sync durability")
-    for binary in (SERVER, CTL):
-        if not os.path.exists(binary):
-            print(f"FAIL: binary not found at {binary}")
-            return 1
+    if not os.path.exists(SERVER):
+        print(f"FAIL: binary not found at {SERVER}")
+        return 1
     if shutil.which("ss") is None:
         print("FAIL: ss is required to detect listening ports")
         return 1

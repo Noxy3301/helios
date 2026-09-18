@@ -133,7 +133,3 @@ target_compile_options(helios-storage PRIVATE -O3 -Wno-error -Wno-unused-paramet
 target_compile_definitions(helios-storage PRIVATE
     SPDLOG_ACTIVE_LEVEL=SPDLOG_LEVEL_DEBUG)
 
-# Control-plane client. Speaks the same protocol; links no storage engine.
-add_executable(helios-ctl tools/helios_ctl.cc)
-target_link_libraries(helios-ctl helios_proto)
-target_compile_options(helios-ctl PRIVATE -O2)

@@ -51,14 +51,6 @@
       args:
         executable: /bin/bash
 
-    - name: "Gate: the durability control tool is present"
-      # measure_usage.yml reconciles this server before the sweep; a bundle
-      # without the tool would only fail after the load.
-      shell: test -x ~/helios/build/server/helios-ctl
-      args:
-        executable: /bin/bash
-      changed_when: false
-
     - name: Start the Helios server
       # Never pipe the start scripts: log to a file and verify liveness explicitly;
       # helios_wal is wiped first, following the WAL symlink when present, so

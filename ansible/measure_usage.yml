@@ -113,7 +113,7 @@
                   the sweep must not inherit whatever contract the load left behind
                 quiet: true
 
-            - name: Reconcile the storage server with the measured contract
+            - name: Read the storage server before the switch
               shell: |
                 set -euo pipefail
                 measured="{{ helios_durability }}"
@@ -150,10 +150,6 @@
                           | tail -n1 | cut -f1 || true)
                   echo "${total:-0}"
                 }
-                if [ ! -x ~/helios/build/server/helios-ctl ]; then
-                  echo "SWITCH_FAIL: ~/helios/build/server/helios-ctl is missing" >&2
-                  exit 1
-                fi
                 if [ ! -r /tmp/helios_storage.pid ]; then
                   echo "SWITCH_FAIL: /tmp/helios_storage.pid is missing" >&2
                   exit 1
@@ -174,45 +170,56 @@
                   echo "SWITCH_FAIL: cannot read the startup contract from $log" >&2
                   exit 1
                 fi
-                mode_before=$(policy_in_force)
                 # The load ran under the startup contract whatever happened after; a
                 # failed switch is retried by re-running this play.
                 if [ "$startup" != "$declared_load" ]; then
                   echo "SWITCH_FAIL: the load ran under $startup, not the declared $declared_load" >&2
                   exit 1
                 fi
-                rss_before=$(awk '/^VmRSS:/{print $2}' "/proc/$pid/status" || true)
-                wal_before=$(wal_file_bytes)
+                echo "mode_before=$(policy_in_force)"
+                echo "mode_after=$measured"
+                echo "rss_kb_before=$(awk '/^VmRSS:/{print $2}' "/proc/$pid/status" || true)"
+                echo "wal_file_bytes_before=$(wal_file_bytes)"
+              args:
+                executable: /bin/bash
+              register: durability_before
+
+            - name: Switch the commit durability from a query node
+              # The switch is a statement now, so it goes through a query node.
+              delegate_to: "{{ groups['mysql'][0] }}"
+              shell: |
+                set -euo pipefail
                 started=$(date +%s.%N)
-                expected="ok mode=$(printf '%s' "$measured" | tr 'a-z' 'A-Z')"
-                reply=$(~/helios/build/server/helios-ctl --host 127.0.0.1 --port 9999 \
-                          set-durability "$measured") || {
-                  echo "SWITCH_FAIL: helios-ctl exited non-zero" >&2
+                ~/helios/build/runtime_output_directory/mysql \
+                  -u root --protocol=TCP -h 127.0.0.1 -P 3307 \
+                  -e "SET GLOBAL helios_commit_durability = '{{ helios_durability }}'" || {
+                  echo "SWITCH_FAIL: SET GLOBAL helios_commit_durability exited non-zero" >&2
                   exit 1
                 }
-                if [ "$reply" != "$expected" ]; then
-                  echo "SWITCH_FAIL: expected '$expected', got '$reply'" >&2
-                  exit 1
-                fi
                 ended=$(date +%s.%N)
-                rss_after=$(awk '/^VmRSS:/{print $2}' "/proc/$pid/status" || true)
-                wal_after=$(wal_file_bytes)
-                echo "mode_before=$mode_before"
-                echo "mode_after=$measured"
-                echo "reply=$reply"
                 echo "elapsed_seconds=$(awk -v a="$started" -v b="$ended" \
                                            'BEGIN { printf "%.3f", b - a }')"
-                echo "rss_kb_before=$rss_before"
-                echo "rss_kb_after=$rss_after"
-                echo "wal_file_bytes_before=$wal_before"
-                echo "wal_file_bytes_after=$wal_after"
               args:
                 executable: /bin/bash
               register: durability_switch
 
+            - name: Read the storage server after the switch
+              shell: |
+                set -euo pipefail
+                pid=$(cat /tmp/helios_storage.pid)
+                total=$(du -Lbc ~/helios/helios_wal/wal*.log 2>/dev/null \
+                        | tail -n1 | cut -f1 || true)
+                echo "rss_kb_after=$(awk '/^VmRSS:/{print $2}' "/proc/$pid/status" || true)"
+                echo "wal_file_bytes_after=${total:-0}"
+              args:
+                executable: /bin/bash
+              register: durability_after
+
             - name: Show the durability record
               debug:
-                var: durability_switch.stdout_lines
+                msg: "{{ durability_before.stdout_lines
+                         + durability_switch.stdout_lines
+                         + durability_after.stdout_lines }}"
 
             - name: Append the durability record
               # One block per run: re-running the sweep must not erase what the
@@ -222,7 +229,10 @@
                 path: "{{ result_dir }}/durability_switch.txt"
                 create: true
                 marker: "# {mark} durability {{ durability_switch.start }}"
-                block: "{{ durability_switch.stdout }}"
+                block: |
+                  {{ durability_before.stdout }}
+                  {{ durability_switch.stdout }}
+                  {{ durability_after.stdout }}
 
     - name: Start mpstat sampling
       shell: |

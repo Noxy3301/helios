@@ -52,7 +52,9 @@
 #include "helios_prefetch.hh"
 #include "helios.pb.h"
 #include "my_dbug.h"
+#include "my_sys.h"
 #include "mysql/plugin.h"
+#include "mysqld_error.h"
 #include "sql/field.h"
 #include "sql/item.h"
 #include "sql/item_cmpfunc.h"
@@ -70,6 +72,10 @@
 static char *srv_server_host = nullptr;
 static ulong srv_server_port = 9999;
 ulong srv_read_path = kReadPathPlan;
+enum CommitDurability { kCommitDurabilityAsync = 0, kCommitDurabilitySync = 1 };
+// The mode this node last set on the storage server. The server starts
+// under the contract helios.cnf gives it, which no query node observes.
+static ulong srv_commit_durability = kCommitDurabilitySync;
 bool srv_stats_drift_refresh = false;
 bool srv_rpc_trace = false;
 char *srv_rpc_trace_path = nullptr;
@@ -480,6 +486,54 @@ static MYSQL_SYSVAR_ENUM(read_path, srv_read_path, PLUGIN_VAR_RQCMDARG,
                          "request per handler read, plan stages what it can in "
                          "one request and sends the rest as they happen.",
                          nullptr, nullptr, kReadPathPlan, &read_path_typelib);
+static const char *commit_durability_names[] = {"async", "sync", NullS};
+static TYPELIB commit_durability_typelib = {
+    array_elements(commit_durability_names) - 1, "commit_durability_typelib",
+    commit_durability_names, nullptr};
+
+// Publishes the requested mode on the storage server before the assignment,
+// so a switch the server refuses fails the SET GLOBAL.
+static int check_commit_durability(THD *, SYS_VAR *, void *save,
+                                   struct st_mysql_value *value) {
+  char buf[16];
+  int len = sizeof(buf);
+  const char *name = value->val_str(value, buf, &len);
+  const int mode = name != nullptr
+                       ? find_type(name, &commit_durability_typelib,
+                                   FIND_TYPE_BASIC) - 1
+                       : -1;
+  if (mode < 0) {
+    my_error(ER_WRONG_VALUE_FOR_VAR, MYF(0), "helios_commit_durability",
+             name != nullptr ? name : "");
+    return 1;
+  }
+
+  const std::string host =
+      srv_server_host ? srv_server_host : std::string("127.0.0.1");
+  HeliosProxy proxy(host, static_cast<int>(srv_server_port));
+  std::string error;
+  if (!proxy.db_set_commit_durability(
+          mode == kCommitDurabilitySync
+              ? Helios::Protocol::DbSetCommitDurability::SYNC
+              : Helios::Protocol::DbSetCommitDurability::ASYNC,
+          &error)) {
+    my_printf_error(ER_WRONG_VALUE_FOR_VAR, "helios_commit_durability: %s",
+                    MYF(0), error.c_str());
+    return 1;
+  }
+
+  *static_cast<long *>(save) = mode;
+  return 0;
+}
+
+static MYSQL_SYSVAR_ENUM(commit_durability, srv_commit_durability,
+                         PLUGIN_VAR_RQCMDARG,
+                         "Commit acknowledgement contract of the storage "
+                         "server: async returns before the log is on disk, "
+                         "sync waits for it. Setting it switches the running "
+                         "server.",
+                         check_commit_durability, nullptr,
+                         kCommitDurabilitySync, &commit_durability_typelib);
 static MYSQL_SYSVAR_BOOL(stats_drift_refresh, srv_stats_drift_refresh,
                          PLUGIN_VAR_OPCMDARG,
                          "Automatically refresh index statistics before SELECT "
@@ -502,6 +556,7 @@ static SYS_VAR *helios_system_variables[] = {
     MYSQL_SYSVAR(server_host),
     MYSQL_SYSVAR(server_port),
     MYSQL_SYSVAR(read_path),
+    MYSQL_SYSVAR(commit_durability),
     MYSQL_SYSVAR(stats_drift_refresh),
     MYSQL_SYSVAR(rpc_trace),
     MYSQL_SYSVAR(rpc_trace_path),

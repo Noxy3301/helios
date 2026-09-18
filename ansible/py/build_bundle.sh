@@ -21,7 +21,6 @@ req "$HELIOS/build/library_output_directory/libprotobuf-lite.so.24.4.0"
 req "$HELIOS/build/library_output_directory/libprotobuf.so.24.4.0"
 req "$HELIOS/build/share/english/errmsg.sys"
 req "$HELIOS/build/server/helios-storage"
-req "$HELIOS/build/server/helios-ctl"
 req "$HELIOS/third_party/duckdb/build/release/src/libduckdb.so"
 req "$HELIOS/bench/benchbase-mysql/benchbase.jar"
 req "$HELIOS/bench/benchbase-mysql/config/plugin.xml"
@@ -62,7 +61,7 @@ fi
 ln -s ../plugin_output_directory "$B/build/lib/plugin"
 
 # --- helios-storage (storage node) -----------------------------------------
-cp "$HELIOS/build/server/"{helios-storage,helios-ctl} "$B/build/server/"
+cp "$HELIOS/build/server/helios-storage" "$B/build/server/"
 # Its RUNPATH (…/third_party/duckdb/build/release/src) doesn't exist remotely;
 # co-locate libduckdb.so in library_output_directory so one LD_LIBRARY_PATH
 # entry covers it too.

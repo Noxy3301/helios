@@ -248,6 +248,12 @@ public:
     bool db_create_secondary_index(const std::string& table_name,
                                    const std::string& index_name,
                                    uint32_t index_type);
+    // Switch the commit acknowledgement policy of the running server. Returns
+    // false when the exchange fails or the server refuses, with the reason in
+    // error.
+    bool db_set_commit_durability(
+        Helios::Protocol::DbSetCommitDurability::Mode mode,
+        std::string* error);
     struct HiddenKeyReservation {
         bool ok = false;
         // The requested count starting here belongs to this query layer

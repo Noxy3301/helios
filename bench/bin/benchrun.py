@@ -40,7 +40,6 @@ SCRIPTS_DIR = Path(__file__).resolve().parents[2] / "scripts"
 ROOT = Path(__file__).resolve().parents[2]
 BENCHBASE_DIR = ROOT / "bench" / "benchbase-mysql"
 MYSQL_BIN = ROOT / "build" / "runtime_output_directory" / "mysql"
-HELIOS_CTL = ROOT / "build" / "server" / "helios-ctl"
 # The kernel truncates the process name to 15 characters
 SERVER_COMM = "helios-storage"
 HELIOS_LOG_DIR = ROOT / "helios_logs"
@@ -176,12 +175,10 @@ def switch_commit_durability(mode):
     the old one. Returns the elapsed seconds, or None if it did not happen."""
     print(f"  Switching durability to {mode}...")
     started = time.time()
-    result = subprocess.run(
-        [str(HELIOS_CTL), "--host", "127.0.0.1", "--port", "9999",
-         "set-durability", mode],
-        capture_output=True, text=True)
+    result = mysql_cmd(3307, "127.0.0.1",
+                       f"SET GLOBAL helios_commit_durability = '{mode}'")
     elapsed = time.time() - started
-    if result.returncode != 0 or result.stdout.strip() != f"ok mode={mode.upper()}":
+    if result.returncode != 0:
         print(f"  ERROR: durability switch to {mode} failed: "
               f"{(result.stdout + result.stderr).strip()}", file=sys.stderr)
         return None
@@ -911,9 +908,6 @@ def main():
         if args.external_server or args.no_setup:
             sys.exit("--load-durability async starts the storage server under the load "
                      "contract: not valid with --external-server or --no-setup")
-        if not HELIOS_CTL.exists():
-            sys.exit(f"--load-durability async needs {HELIOS_CTL} to end the load "
-                     "contract; build it first")
     jar = BENCHBASE_DIR / "benchbase.jar"
     if not jar.exists():
         print(f"ERROR: {jar} not found.\nRun: python3 bench/bin/build_benchbase.py", file=sys.stderr)

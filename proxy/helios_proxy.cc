@@ -654,6 +654,32 @@ bool HeliosProxy::db_create_secondary_index(const std::string& table_name,
     return response.success();
 }
 
+bool HeliosProxy::db_set_commit_durability(
+    Helios::Protocol::DbSetCommitDurability::Mode mode, std::string* error) {
+    if (!ensure_connected()) {
+        *error = "cannot reach the storage server";
+        return false;
+    }
+
+    Helios::Protocol::DbSetCommitDurability::Request request;
+    Helios::Protocol::DbSetCommitDurability::Response response;
+
+    request.set_mode(mode);
+
+    if (!send_protobuf_message(request, response,
+                               MessageType::DB_SET_COMMIT_DURABILITY)) {
+        *error = "the storage server did not answer";
+        return false;
+    }
+
+    if (!response.ok()) {
+        *error = response.error().empty() ? "the server refused the switch"
+                                          : response.error();
+        return false;
+    }
+    return true;
+}
+
 template<typename RequestType, typename ResponseType>
 bool HeliosProxy::send_protobuf_message(const RequestType& request,
                                            ResponseType& response,
