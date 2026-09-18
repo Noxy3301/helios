@@ -27,13 +27,12 @@ namespace key_pack {
 
 std::string pack_int_key(const uchar *data, size_t len);
 std::string pack_datetime_key(const uchar *data, size_t len,
-                                enum_field_types mysql_type);
+                              enum_field_types mysql_type);
 std::string pack_string_key(const uchar *data, size_t len);
 
 unsigned char key_part_type_tag(HeliosFieldType type);
-void append_key_part_encoding(std::string &out, bool is_null,
-                              HeliosFieldType type,
-                              const std::string &payload);
+void append_key_part(std::string &out, bool is_null, HeliosFieldType type,
+                     const std::string &payload);
 std::string build_prefix_range_end(const std::string &prefix);
 
 // "+infinity" end for an unbounded-upper range scan. 16 0xFF bytes sort after
@@ -46,7 +45,7 @@ inline std::string scan_end_sentinel() {
 }
 
 std::string pack_key(TABLE *table, uint key_index, const uchar *key,
-                       key_part_map keypart_map);
+                     key_part_map keypart_map);
 
 }  // namespace key_pack
 

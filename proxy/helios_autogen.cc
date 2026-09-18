@@ -430,7 +430,7 @@ bool compile_index_range_scan(AccessPath *leaf, TABLE *table,
     step->key_prefix = key_pack::pack_key(
         table, range_scan.index, range->min_key, range->min_keypart_map);
     if (range->min_keypart_map != 0 && step->key_prefix.empty()) {
-      if (reason != nullptr) *reason = "failed to encode range start key";
+      if (reason != nullptr) *reason = "failed to pack range start key";
       return false;
     }
     // NEAR_MIN (exclusive lower): append one '\0' as the handler does for
@@ -445,7 +445,7 @@ bool compile_index_range_scan(AccessPath *leaf, TABLE *table,
     step->end_key_prefix = key_pack::pack_key(
         table, range_scan.index, range->max_key, range->max_keypart_map);
     if (range->max_keypart_map != 0 && step->end_key_prefix.empty()) {
-      if (reason != nullptr) *reason = "failed to encode range end key";
+      if (reason != nullptr) *reason = "failed to pack range end key";
       return false;
     }
     if (!(range->flag & NEAR_MAX)) {
@@ -697,9 +697,9 @@ bool compile_ref_lookup(
   if (leading_constant_parts > 0) {
     step->key_prefix =
         key_pack::pack_key(table, ref->key, ref->key_buff,
-                                  first_n_keyparts_map(leading_constant_parts));
+                           first_n_keyparts_map(leading_constant_parts));
     if (step->key_prefix.empty()) {
-      if (reason != nullptr) *reason = "failed to encode constant key prefix";
+      if (reason != nullptr) *reason = "failed to pack constant key prefix";
       return false;
     }
   }
@@ -735,7 +735,7 @@ bool compile_ref_lookup(
   step->key_prefix = key_pack::pack_key(
       table, ref->key, ref->key_buff, first_n_keyparts_map(used_key_parts));
   if (step->key_prefix.empty()) {
-    if (reason != nullptr) *reason = "failed to encode constant key";
+    if (reason != nullptr) *reason = "failed to pack constant key";
     return false;
   }
 

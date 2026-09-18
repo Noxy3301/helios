@@ -684,13 +684,12 @@ private:
   // Key conversion helpers
   static std::string pack_int_key(const uchar *data, size_t len);
   static std::string pack_datetime_key(const uchar *data, size_t len,
-                                          enum_field_types mysql_type);
+                                       enum_field_types mysql_type);
   static std::string pack_string_key(const uchar *data, size_t len);
 
   static unsigned char key_part_type_tag(HeliosFieldType type);
-  static void append_key_part_encoding(std::string &out, bool is_null,
-                                       HeliosFieldType type,
-                                       const std::string &payload);
+  static void append_key_part(std::string &out, bool is_null,
+                              HeliosFieldType type, const std::string &payload);
   static std::string build_prefix_range_end(const std::string &prefix);
   static uint count_used_key_parts(const KEY *key_info, key_part_map keypart_map);
 

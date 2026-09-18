@@ -50,9 +50,8 @@ unsigned char key_part_type_tag(HeliosFieldType type) {
   }
 }
 
-void append_key_part_encoding(std::string &out, bool is_null,
-                              HeliosFieldType type,
-                              const std::string &payload) {
+void append_key_part(std::string &out, bool is_null, HeliosFieldType type,
+                     const std::string &payload) {
   constexpr size_t kLengthFieldSize = 2;
   const size_t max_payload_length = std::numeric_limits<uint16_t>::max();
   size_t copy_length = std::min(payload.size(), max_payload_length);
@@ -113,10 +112,10 @@ unsigned char ha_helios::key_part_type_tag(HeliosFieldType type) {
   return key_pack::key_part_type_tag(type);
 }
 
-void ha_helios::append_key_part_encoding(std::string &out, bool is_null,
-                                            HeliosFieldType type,
-                                            const std::string &payload) {
-  key_pack::append_key_part_encoding(out, is_null, type, payload);
+void ha_helios::append_key_part(std::string &out, bool is_null,
+                                HeliosFieldType type,
+                                const std::string &payload) {
+  key_pack::append_key_part(out, is_null, type, payload);
 }
 
 std::string ha_helios::build_prefix_range_end(const std::string &prefix) {
@@ -169,7 +168,7 @@ std::string ha_helios::serialize_key_from_field(Field *field) {
       field->get_key_image(reinterpret_cast<uchar *>(raw.data()), field_len,
                            Field::itRAW);
       payload = pack_datetime_key(reinterpret_cast<const uchar *>(raw.data()),
-                                    field_len, mysql_type);
+                                  field_len, mysql_type);
       break;
     }
 
@@ -190,9 +189,9 @@ std::string ha_helios::serialize_key_from_field(Field *field) {
     }
   }
 
-  std::string encoded;
-  append_key_part_encoding(encoded, is_null, helios_type, payload);
-  return encoded;
+  std::string packed;
+  append_key_part(packed, is_null, helios_type, payload);
+  return packed;
 }
 
 std::string ha_helios::build_secondary_key_from_row(const uchar *row_buffer,
@@ -409,7 +408,7 @@ int ha_helios::autogenerate_key(HeliosTransaction *tx,
 }
 
 /**
- * @brief Encode a 1, 2, 4 or 8 byte integer key part.
+ * @brief Pack a 1, 2, 4 or 8 byte integer key part.
  *
  * @details Little-endian to big-endian with the sign bit flipped, so
  * lexicographic order matches signed integer order.
@@ -466,13 +465,13 @@ std::string pack_int_key(const uchar *data, size_t len) {
 }
 
 /**
- * @brief Encode a temporal key part.
+ * @brief Pack a temporal key part.
  *
  * @details DATE and NEWDATE are 3 little-endian bytes and get reversed;
  * DATETIME2, TIMESTAMP2 and TIME2 are already big-endian sortable.
  */
 std::string pack_datetime_key(const uchar *data, size_t len,
-                                enum_field_types mysql_type) {
+                              enum_field_types mysql_type) {
   if (mysql_type == MYSQL_TYPE_DATE || mysql_type == MYSQL_TYPE_NEWDATE) {
     char buf[3];
     buf[0] = static_cast<char>(data[2]);
@@ -484,7 +483,7 @@ std::string pack_datetime_key(const uchar *data, size_t len,
 }
 
 /**
- * @brief Encode a VARCHAR key part: the string without MySQL's 2-byte
+ * @brief Pack a VARCHAR key part: the string without MySQL's 2-byte
  * little-endian length prefix and without padding.
  */
 std::string pack_string_key(const uchar *data, size_t len) {
@@ -511,7 +510,7 @@ std::string ha_helios::pack_int_key(const uchar *data, size_t len) {
 }
 
 std::string ha_helios::pack_datetime_key(const uchar *data, size_t len,
-                                              enum_field_types mysql_type) {
+                                         enum_field_types mysql_type) {
   return key_pack::pack_datetime_key(data, len, mysql_type);
 }
 
@@ -521,12 +520,12 @@ std::string ha_helios::pack_string_key(const uchar *data, size_t len) {
 
 /**
  * @brief Convert a MySQL composite key into the sortable key format: the key
- * parts named by keypart_map, each encoded by its type, concatenated.
+ * parts named by keypart_map, each packed by its type, concatenated.
  */
 namespace key_pack {
 
 std::string pack_key(TABLE *table, uint key_index, const uchar *key,
-                       key_part_map keypart_map) {
+                     key_part_map keypart_map) {
   KEY *key_info = &table->key_info[key_index];
   std::string result;
   const uchar *key_ptr = key;
@@ -547,9 +546,9 @@ std::string pack_key(TABLE *table, uint key_index, const uchar *key,
 
       if (is_null) {
         key_ptr += (kp->store_length - 1);
-        append_key_part_encoding(result, true,
-                                 convert_mysql_type_to_helios(field->type()),
-                                 std::string());
+        append_key_part(result, true,
+                        convert_mysql_type_to_helios(field->type()),
+                        std::string());
         continue;
       }
     }
@@ -586,7 +585,7 @@ std::string pack_key(TABLE *table, uint key_index, const uchar *key,
       break;
     }
 
-    append_key_part_encoding(result, false, helios_type, payload);
+    append_key_part(result, false, helios_type, payload);
 
     if (kp->key_part_flag & HA_VAR_LENGTH_PART) {
       key_ptr += kp->length;
