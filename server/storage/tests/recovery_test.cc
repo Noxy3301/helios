@@ -77,6 +77,17 @@ class RecoveryTest : public ::testing::Test {
         {{kTable, kIndex, secondary_key, key}}, {}, commit_reason);
   }
 
+  // Two primary keys under one secondary key: refused only by a UNIQUE index.
+  static std::string DuplicateSecondaryKeyReason(
+      helios::storage::Database &db) {
+    std::string reason;
+    EXPECT_FALSE(TestHelper::Commit(
+        db, {}, {{kTable, "k1", "v1"}, {kTable, "k2", "v2"}},
+        {{kTable, kIndex, "s", "k1"}, {kTable, kIndex, "s", "k2"}}, {},
+        reason));
+    return reason;
+  }
+
   static helios::storage::ReadResult Read(helios::storage::Database &db,
                                           const std::string &key) {
     auto result = db.Read(kTable, key);
@@ -167,6 +178,44 @@ TEST_F(RecoveryTest, ARecoveredKeyAcceptsAFurtherWrite) {
   const auto rewritten = Read(db, "k");
   EXPECT_TRUE(rewritten.found);
   EXPECT_EQ(rewritten.value, "v2");
+}
+
+TEST_F(RecoveryTest, AnIndexWithoutARecordKeepsItsConstraint) {
+  {
+    auto config = MakeConfig(Recovery::kOn);
+    helios::storage::Database db(config);
+    ASSERT_TRUE(TestHelper::CreateTable(db, kTable));
+    ASSERT_TRUE(db.CreateSecondaryIndex(
+        kTable, kIndex, helios::storage::IndexConstraint::kUnique));
+  }
+
+  // Nothing was written under the index, so only the catalog can restore it.
+  auto config = MakeConfig(Recovery::kOn);
+  helios::storage::Database db(config);
+  const std::string reason = DuplicateSecondaryKeyReason(db);
+  EXPECT_EQ(reason.rfind(helios::storage::kDuplicateSecondaryKeyAbortPrefix, 0),
+            0u)
+      << "abort reason: " << reason;
+}
+
+TEST_F(RecoveryTest, AnIndexDeclaredBeforeTheSchemaSurvives) {
+  {
+    auto config = MakeConfig(Recovery::kOn);
+    helios::storage::Database db(config);
+    ASSERT_TRUE(db.CreateTable(kTable));
+    ASSERT_TRUE(db.CreateSecondaryIndex(
+        kTable, kIndex, helios::storage::IndexConstraint::kUnique));
+    ASSERT_TRUE(db.InstallPaxSchema(kTable, {1, 4096}));
+    db.ReleaseThreadEpoch();
+  }
+
+  // The install is what writes the table's first catalog entry.
+  auto config = MakeConfig(Recovery::kOn);
+  helios::storage::Database db(config);
+  const std::string reason = DuplicateSecondaryKeyReason(db);
+  EXPECT_EQ(reason.rfind(helios::storage::kDuplicateSecondaryKeyAbortPrefix, 0),
+            0u)
+      << "abort reason: " << reason;
 }
 
 }  // namespace

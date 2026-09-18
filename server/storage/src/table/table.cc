@@ -57,6 +57,15 @@ index::SecondaryIndex *Table::GetSecondaryIndex(
   return node == nullptr ? nullptr : &node->index;
 }
 
+std::vector<pax::IndexDefinition> Table::IndexDefinitions() {
+  std::vector<pax::IndexDefinition> definitions;
+  ForEachSecondaryIndex([&definitions](const std::string &name,
+                                       const index::SecondaryIndex &index) {
+    definitions.push_back({name, index.constraint});
+  });
+  return definitions;
+}
+
 index::SecondaryIndex *Table::GetOrCreateSecondaryIndex(
     const std::string_view index_name, const IndexConstraint index_type) {
   if (IndexNode *node = FindIndex(index_name)) {

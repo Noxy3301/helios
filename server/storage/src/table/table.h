@@ -11,11 +11,13 @@
 
 #include <atomic>
 #include <string>
+#include <vector>
 
 #include "lineairdb/pax.h"
 
 #include "index/masstree_index.h"
 #include "index/secondary_index.h"
+#include "pax/catalog.h"
 #include "pax/table.h"
 
 namespace helios::storage {
@@ -78,6 +80,12 @@ class Table {
       f(node->name, node->index);
     }
   }
+
+  /**
+   * @brief Returns the name and constraint of every secondary index, as the
+   * catalog stores them.
+   */
+  std::vector<pax::IndexDefinition> IndexDefinitions();
 
   /**
    * @brief Returns the index of that name, creating it when there is none.

@@ -63,18 +63,29 @@ Database::Database(const Config &config)
       scan_checkpoint_(config_, table_dictionary_, epoch_framework_, logger_) {
   SPDLOG_INFO("Storage instance has been constructed.");
 
-  // Restore column definitions before any recovered value is installed.
+  // Restore column and index definitions before any recovered value is
+  // installed.
   auto catalog = pax::LoadCatalog(config_.work_dir);
   if (catalog.status == pax::Catalog::Status::kUnusable) {
     SPDLOG_CRITICAL("Cannot recover the PAX schema catalog: {}",
                     catalog.detail);
     exit(EXIT_FAILURE);
   }
-  for (auto &[name, schema] : catalog.entries) {
+  for (auto &[name, definition] : catalog.entries) {
     CreateTable(name);
-    if (!GetTable(name)->InstallPaxSchema(std::move(schema))) {
+    Table *table = GetTable(name);
+    if (!table->InstallPaxSchema(std::move(definition.schema))) {
       SPDLOG_CRITICAL("Cannot restore PAX schema for table {}", name);
       exit(EXIT_FAILURE);
+    }
+    // Declare the indexes before replay: one with no surviving record has to
+    // carry its constraint too.
+    for (const auto &index : definition.indexes) {
+      if (!table->CreateSecondaryIndex(index.name, index.constraint)) {
+        SPDLOG_CRITICAL("Cannot restore secondary index {} of table {}",
+                        index.name, name);
+        exit(EXIT_FAILURE);
+      }
     }
   }
   // Always scan the log, even without recovery: an interrupted tail has to be
@@ -173,11 +184,26 @@ bool Database::CreateSecondaryIndex(const std::string_view table_name,
   std::lock_guard<std::mutex> lk(ddl_mutex_);
   Table *table = GetTable(table_name);
   if (table == nullptr) return false;
-  return table->CreateSecondaryIndex(index_name, index_type);
+  if (!table->CreateSecondaryIndex(index_name, index_type)) return false;
+  // A catalog the definition did not reach would lose the index at the next
+  // startup; the index stays in memory and the caller is refused.
+  return pax::StoreCatalog(config_.work_dir, CatalogSnapshot());
 }
 
 Table *Database::GetTable(const std::string_view table_name) const {
   return table_dictionary_.GetTable(table_name);
+}
+
+pax::CatalogEntries Database::CatalogSnapshot() {
+  pax::CatalogEntries entries;
+  table_dictionary_.ForEachTable([&entries](Table &table) {
+    const auto *store = table.GetPaxTable();
+    if (store == nullptr) return;
+    auto &definition = entries[table.Name()];
+    definition.schema = store->schema();
+    definition.indexes = table.IndexDefinitions();
+  });
+  return entries;
 }
 
 bool Database::WriteCheckpoint(uint64_t *out_version_retries) {

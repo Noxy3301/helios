@@ -40,6 +40,7 @@
 #include "lineairdb/read.h"
 
 #include "index/reaper.h"
+#include "pax/catalog.h"
 #include "silo/tidword.h"
 #include "table/table_dictionary.h"
 #include "util/epoch_framework.h"
@@ -387,6 +388,14 @@ class Database {
       2;
 
   Table *GetTable(std::string_view table_name) const;
+
+  /**
+   * @brief Collects the definitions of every table that has a PAX schema.
+   * @details The catalog is rewritten whole, so both writers of it take this
+   * snapshot under ddl_mutex_. A table without a schema holds no rows and has
+   * no entry.
+   */
+  pax::CatalogEntries CatalogSnapshot();
 
   /**
    * @brief Chooses an epoch strictly above the recovered durable epoch.

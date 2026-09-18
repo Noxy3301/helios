@@ -109,13 +109,12 @@ bool Database::InstallPaxSchema(const std::string_view table_name,
 
   // Rewrite the catalog from every installed definition, then make this
   // schema writable.
-  pax::CatalogEntries entries;
-  table_dictionary_.ForEachTable([&entries](Table &entry) {
-    if (const auto *store = entry.GetPaxTable()) {
-      entries.emplace(entry.Name(), store->schema());
-    }
-  });
-  entries.emplace(std::string(table_name), schema);
+  pax::CatalogEntries entries = CatalogSnapshot();
+  // This table has no entry yet: an index declared before the schema is
+  // persisted by this install.
+  auto &definition = entries[std::string(table_name)];
+  definition.schema = schema;
+  definition.indexes = table->IndexDefinitions();
   if (!pax::StoreCatalog(config_.work_dir, entries)) return false;
   return table->InstallPaxSchema(std::move(schema));
 }
