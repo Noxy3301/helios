@@ -961,10 +961,6 @@ duckdb::unique_ptr<duckdb::SelectStatement> BuildBlock(
 AstBuildResult BuildSelectStatement(const Resolved::Request& request,
                                     const std::vector<uintptr_t>& handles) {
     AstBuildResult result;
-    if (request.format_version() != 1) {
-        result.error = "unsupported duckdb-query format version";
-        return result;
-    }
     if (static_cast<size_t>(request.tables_size()) != handles.size()) {
         result.error = "table handle count does not match the request";
         return result;

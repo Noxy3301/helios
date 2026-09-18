@@ -597,10 +597,9 @@ message TxExecuteDuckdbQuery {
     }
 
     message Request {
-        uint32 format_version = 1; // exact match required
-        repeated TableDesc tables = 2;
-        QueryBlock root = 3;
-        uint32 expected_output_count = 4;
+        repeated TableDesc tables = 1;
+        QueryBlock root = 2;
+        uint32 expected_output_count = 3;
     }
     message Response {
         bool ok = 1;

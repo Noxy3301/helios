@@ -38,11 +38,10 @@ namespace {
 
 // Frame header fields, in bytes from the start of the frame. The magic word
 // opens it at offset 0.
-constexpr size_t kOffVersion = 4;
-constexpr size_t kOffFlags = 6;
-constexpr size_t kOffPayloadSize = 8;
-constexpr size_t kOffEpoch = 12;
-constexpr size_t kOffCrc = 16;
+constexpr size_t kOffFlags = 4;
+constexpr size_t kOffPayloadSize = 6;
+constexpr size_t kOffEpoch = 10;
+constexpr size_t kOffCrc = 14;
 
 // The header bytes the checksum covers: all of them but the checksum word,
 // which sits last.
@@ -433,11 +432,10 @@ WalScanResult Wal::Scan(EpochNumber min_epoch) {
         return IoFailure("pread header of " + path_, error);
       }
       const uint32_t magic = GetLe32(header);
-      const uint16_t version = GetLe16(header + kOffVersion);
       const uint16_t flags = GetLe16(header + kOffFlags);
       const uint32_t payload_size = GetLe32(header + kOffPayloadSize);
       const EpochNumber epoch = GetLe32(header + kOffEpoch);
-      if (magic != kMagic || version != kVersion || flags != kFlags ||
+      if (magic != kMagic || flags != kFlags ||
           payload_size > kMaxPayloadSize) {
         const bool empty_header =
             std::all_of(header, header + kHeaderSize,
@@ -509,7 +507,6 @@ WalScanResult Wal::Scan(EpochNumber min_epoch) {
     }
 
     const uint32_t magic = GetLe32(header);
-    const uint16_t version = GetLe16(header + kOffVersion);
     const uint16_t flags = GetLe16(header + kOffFlags);
     const uint32_t payload_size = GetLe32(header + kOffPayloadSize);
     const EpochNumber epoch = GetLe32(header + kOffEpoch);
@@ -517,8 +514,6 @@ WalScanResult Wal::Scan(EpochNumber min_epoch) {
 
     if (magic != kMagic) {
       stop_reason = "frame magic mismatch";
-    } else if (version != kVersion) {
-      stop_reason = "unsupported frame version";
     } else if (flags != kFlags) {
       stop_reason = "unknown frame flags";
     } else if (payload_size > kMaxPayloadSize) {
@@ -675,7 +670,6 @@ WalAppendResult Wal::AppendGroup(
     group.resize(frame_offset + kHeaderSize + payload.size());
     uint8_t *frame = group.data() + frame_offset;
     PutLe32(frame, kMagic);
-    PutLe16(frame + kOffVersion, kVersion);
     PutLe16(frame + kOffFlags, kFlags);
     PutLe32(frame + kOffPayloadSize, static_cast<uint32_t>(payload.size()));
     PutLe32(frame + kOffEpoch, epoch);

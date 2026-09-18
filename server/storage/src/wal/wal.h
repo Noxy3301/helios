@@ -92,7 +92,7 @@ struct WalIo {
  * an interrupted write recognisable, so a repair restores them.
  *
  * Frame layout, little-endian:
- *   magic(u32) version(u16) flags(u16) payload_len(u32) epoch(u32) crc32c(u32)
+ *   magic(u32) flags(u16) payload_len(u32) epoch(u32) crc32c(u32)
  *   payload
  *
  * The checksum covers the header up to but excluding the crc field, plus
@@ -177,9 +177,8 @@ class Wal {
   size_t extension_count() const { return extension_count_; }
 
   static constexpr uint32_t kMagic = 0x4c57414c;  // "LAWL"
-  static constexpr uint16_t kVersion = 1;
   static constexpr uint16_t kFlags = 0;
-  static constexpr size_t kHeaderSize = 20;
+  static constexpr size_t kHeaderSize = 18;
   static constexpr uint32_t kMaxPayloadSize = 256u * 1024u * 1024u;
   static constexpr uint64_t kDefaultCapacityBytes = 64ull * 1024ull * 1024ull;
   static constexpr uint64_t kNoPreallocation = 0;

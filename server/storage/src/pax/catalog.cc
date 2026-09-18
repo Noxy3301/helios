@@ -22,7 +22,6 @@
 namespace helios::storage::pax {
 namespace {
 
-constexpr uint32_t kCatalogVersion = 2;
 constexpr const char *kCatalogFile = "pax_schema.catalog";
 constexpr const char *kWorkingFile = "pax_schema.working";
 using File = std::unique_ptr<FILE, int (*)(FILE *)>;
@@ -39,9 +38,8 @@ struct Entry {
 };
 
 struct PackedCatalog {
-  uint32_t version = kCatalogVersion;
   std::map<std::string, Entry> entries;
-  MSGPACK_DEFINE(version, entries);
+  MSGPACK_DEFINE(entries);
 };
 
 bool Sync(int fd) {
@@ -151,14 +149,14 @@ Catalog LoadCatalog(const std::string &work_dir) {
     size_t consumed = 0;
     const auto object = msgpack::unpack(bytes.data(), bytes.size(), consumed);
     if (object.get().type != msgpack::type::ARRAY ||
-        object.get().via.array.size != 2) {
+        object.get().via.array.size != 1) {
       result.detail = "invalid PAX catalog header";
       return result;
     }
     PackedCatalog catalog;
     object.get().convert(catalog);
-    if (consumed != bytes.size() || catalog.version != kCatalogVersion) {
-      result.detail = "unsupported PAX catalog format";
+    if (consumed != bytes.size()) {
+      result.detail = "the PAX catalog has trailing bytes";
       return result;
     }
     for (auto &[name, entry] : catalog.entries) {

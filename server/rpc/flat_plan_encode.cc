@@ -8,7 +8,6 @@ namespace flat_plan {
 namespace {
 // Native-endian bytes spell "LDBFLATP" (LineairDB flat payload).
 constexpr uint64_t kMagic = 0x5054414C4642444Cull;
-constexpr uint8_t kVersion = 2;
 
 template <class Sink>
 void w_u8(Sink& out, uint8_t v) {
@@ -63,13 +62,12 @@ void encode_step(
 void encode_to_string(LineairDB::Protocol::TxExecuteReadPlan::Response& r,
                       std::string& out) {
     CountSink count;
-    count.n = 8 + 1 + 1 + 8;  // magic + version + ok + result count
+    count.n = 8 + 1 + 8;  // magic + ok + result count
     for (const auto& s : r.results()) encode_step(s, count);
 
     out.clear();
     out.reserve(count.n);
     w_u64(out, kMagic);
-    w_u8(out, kVersion);
     w_u8(out, r.ok() ? 1 : 0);
     w_u64(out, static_cast<uint64_t>(r.results_size()));
     for (int i = 0; i < r.results_size(); ++i) {

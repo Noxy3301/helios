@@ -52,14 +52,13 @@ constexpr auto kDurabilityWait = std::chrono::seconds(60);
 
 // Checkpoint header fields, in bytes from the start of the file. The magic word
 // opens it at offset 0 and the checksum closes it at `kHeaderSize - 4`.
-constexpr size_t kOffVersion = 4;
-constexpr size_t kOffFlags = 6;
-constexpr size_t kOffGeneration = 8;
-constexpr size_t kOffStartEpoch = 16;
-constexpr size_t kOffEndEpoch = 20;
-constexpr size_t kOffPrimaryRows = 24;
-constexpr size_t kOffSecondaryEntries = 32;
-constexpr size_t kOffPayloadSize = 40;
+constexpr size_t kOffFlags = 4;
+constexpr size_t kOffGeneration = 6;
+constexpr size_t kOffStartEpoch = 14;
+constexpr size_t kOffEndEpoch = 18;
+constexpr size_t kOffPrimaryRows = 22;
+constexpr size_t kOffSecondaryEntries = 30;
+constexpr size_t kOffPayloadSize = 38;
 
 void PutLe16(uint8_t *out, uint16_t value) {
   out[0] = static_cast<uint8_t>(value & 0xffu);
@@ -529,7 +528,6 @@ bool EpochScanCheckpoint::Publish(const LogRecords &records, Stats &stats) {
   uint8_t header[kHeaderSize];
   std::memset(header, 0, sizeof(header));
   PutLe32(header, kMagic);
-  PutLe16(header + kOffVersion, kVersion);
   PutLe16(header + kOffFlags, kFlags);
   PutLe64(header + kOffGeneration, stats.generation);
   PutLe32(header + kOffStartEpoch, stats.start_epoch);
@@ -615,9 +613,6 @@ EpochScanCheckpoint::LoadResult EpochScanCheckpoint::Load(
   }
   if (GetLe32(header) != kMagic)
     return unusable("the checkpoint magic disagrees");
-  if (GetLe16(header + kOffVersion) != kVersion) {
-    return unusable("the checkpoint version is not supported");
-  }
   if (GetLe16(header + kOffFlags) != kFlags) {
     return unusable("the checkpoint carries unknown flags");
   }

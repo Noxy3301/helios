@@ -15,7 +15,6 @@
 #include <filesystem>
 #include <fstream>
 #include <future>
-#include <iterator>
 #include <optional>
 #include <string>
 #include <thread>
@@ -26,7 +25,6 @@
 #include "lineairdb/read.h"
 
 #include "db_helper.h"
-#include "wal/crc32c.h"
 #include "wal/wal.h"
 
 namespace {
@@ -439,68 +437,6 @@ TEST_F(EpochScanCheckpointTest, AQuietTailAfterTheCheckpointIsAccepted) {
   helios::storage::Database db(config);
   EXPECT_EQ(Read(db, "alice").value, "two");
   EXPECT_EQ(Read(db, "bob").value, "one");
-}
-
-TEST_F(EpochScanCheckpointTest, V2CheckpointIsIgnoredAndTheLogIsReplayed) {
-  {
-    auto config = MakeConfig(false);
-    helios::storage::Database db(config);
-    TestHelper::CreateTable(db, kTable);
-    ASSERT_TRUE(CommitWrite(db, "alice", "one"));
-    ASSERT_TRUE(db.WriteCheckpoint());
-  }
-
-  helios::storage::EpochNumber last_epoch = 0;
-  {
-    Wal wal(work_dir_, helios::storage::wal::WalIo::Posix(), 1ull << 20);
-    const auto scan = wal.Scan();
-    ASSERT_EQ(scan.status, WalScanResult::Status::kOk);
-    last_epoch = scan.last_epoch;
-  }
-
-  // Restore the v2 field at offset 24 and its 56-byte header. Recompute the
-  // checksum so the old format is rejected even though its bytes are intact.
-  std::string bytes;
-  {
-    std::ifstream file(checkpoint_path(), std::ios::binary);
-    ASSERT_TRUE(file.is_open());
-    bytes.assign(std::istreambuf_iterator<char>(file),
-                 std::istreambuf_iterator<char>());
-  }
-  ASSERT_GE(bytes.size(), EpochScanCheckpoint::kHeaderSize);
-  bytes.insert(24, sizeof(uint32_t), '\0');
-  bytes[4] = 2;
-  bytes[5] = 0;
-  for (size_t i = 0; i < sizeof(last_epoch); ++i) {
-    bytes[24 + i] = static_cast<char>(last_epoch >> (8 * i));
-  }
-  constexpr size_t kV2HeaderSize = 56;
-  constexpr size_t kV2ChecksumOffset = kV2HeaderSize - sizeof(uint32_t);
-  helios::storage::wal::Crc32c crc;
-  crc.Update(bytes.data(), kV2ChecksumOffset);
-  crc.Update(bytes.data() + kV2HeaderSize, bytes.size() - kV2HeaderSize);
-  const uint32_t checksum = crc.Finish();
-  for (size_t i = 0; i < sizeof(checksum); ++i) {
-    bytes[kV2ChecksumOffset + i] = static_cast<char>(checksum >> (8 * i));
-  }
-  {
-    std::ofstream file(checkpoint_path(), std::ios::binary | std::ios::trunc);
-    ASSERT_TRUE(file.is_open());
-    file.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
-    file.close();
-    ASSERT_TRUE(file.good());
-  }
-
-  const auto checkpoint = EpochScanCheckpoint::Load(work_dir_);
-  EXPECT_EQ(checkpoint.status,
-            EpochScanCheckpoint::LoadResult::Status::kUnusable);
-  EXPECT_TRUE(checkpoint.records.empty());
-
-  auto config = MakeConfig(true);
-  helios::storage::Database db(config);
-  const auto row = Read(db, "alice");
-  ASSERT_TRUE(row.found);
-  EXPECT_EQ(row.value, "one");
 }
 
 TEST_F(EpochScanCheckpointTest, ARowLockedDuringTheScanIsRetried) {

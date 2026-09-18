@@ -22,9 +22,9 @@
 
 namespace {
 
-// Offsets inside a frame header (magic, version, flags, payload length,
-// epoch, checksum).
-constexpr off_t kFlagsOffset = 6;
+// Offsets inside a frame header (magic, flags, payload length, epoch,
+// checksum).
+constexpr off_t kFlagsOffset = 4;
 
 using helios::storage::EpochNumber;
 using helios::storage::wal::Crc32c;
@@ -123,10 +123,10 @@ class WalFrameTest : public ::testing::Test {
     EXPECT_EQ(::pread(fd, header, sizeof(header), frame_offset),
               static_cast<ssize_t>(sizeof(header)));
     EXPECT_EQ(::close(fd), 0);
-    const uint32_t length = static_cast<uint32_t>(header[8]) |
-                            (static_cast<uint32_t>(header[9]) << 8) |
-                            (static_cast<uint32_t>(header[10]) << 16) |
-                            (static_cast<uint32_t>(header[11]) << 24);
+    const uint32_t length = static_cast<uint32_t>(header[6]) |
+                            (static_cast<uint32_t>(header[7]) << 8) |
+                            (static_cast<uint32_t>(header[8]) << 16) |
+                            (static_cast<uint32_t>(header[9]) << 24);
     return frame_offset + static_cast<off_t>(Wal::kHeaderSize) + length;
   }
 
@@ -174,7 +174,6 @@ class WalFrameTest : public ::testing::Test {
                                                  uint32_t payload_len) {
     std::vector<uint8_t> header;
     PutLe32(header, Wal::kMagic);
-    PutLe16(header, Wal::kVersion);
     PutLe16(header, Wal::kFlags);
     PutLe32(header, payload_len);
     PutLe32(header, epoch);
@@ -187,12 +186,11 @@ class WalFrameTest : public ::testing::Test {
                                  const std::vector<uint8_t> &payload) {
     std::vector<uint8_t> frame;
     PutLe32(frame, Wal::kMagic);
-    PutLe16(frame, Wal::kVersion);
     PutLe16(frame, Wal::kFlags);
     PutLe32(frame, static_cast<uint32_t>(payload.size()));
     PutLe32(frame, epoch);
     Crc32c crc;
-    crc.Update(frame.data(), 16);
+    crc.Update(frame.data(), Wal::kHeaderSize - sizeof(uint32_t));
     crc.Update(payload.data(), payload.size());
     PutLe32(frame, crc.Finish());
     frame.insert(frame.end(), payload.begin(), payload.end());
