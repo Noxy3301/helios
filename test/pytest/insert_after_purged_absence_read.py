@@ -23,7 +23,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from utils.connection import get_connection  # noqa: E402
 
-SERVER = os.path.join(ROOT, "build", "server", "lineairdb-server")
+SERVER = os.path.join(ROOT, "build", "server", "helios-storage")
 MYSQLD_PORT = "3307"
 DBNAME = "ha_lineairdb_purge_race"
 SYNC_ENV = "HELIOS_DEBUG_SYNC_REAPER_PURGE_LOCKED_WINDOW"

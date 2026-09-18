@@ -82,12 +82,12 @@ private:
     std::unordered_set<std::string> announced_;
 };
 
-class LineairDBRpc {
+class HeliosRpc {
 public:
-    LineairDBRpc(std::shared_ptr<DatabaseManager> db_manager,
+    HeliosRpc(std::shared_ptr<DatabaseManager> db_manager,
                  std::shared_ptr<TableRowCounts> row_counts,
                  std::shared_ptr<HiddenKeyAllocator> hidden_keys);
-    ~LineairDBRpc() = default;
+    ~HeliosRpc() = default;
 
     void handle_rpc(MessageType message_type,
                    const std::string& message, std::string& result);

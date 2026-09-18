@@ -85,14 +85,14 @@ SERVER_ENV = (
     "ENABLE_DUCKDB_BRIDGE_DEBUG=1 "
     # The table is loaded one row per transaction, because the install pause
     # fires between the row installs of any larger one.
-    "LINEAIRDB_COMMIT_DURABILITY=async")
+    "HELIOS_COMMIT_DURABILITY=async")
 # A fence takes one to two epochs; the writer delay allows for it.
 FENCE_S = 0.06
 # Where the second install should land inside the scan.
 INSTALL_AT = 0.45
 
 DB = "ha_lineairdb_test"
-STACK_PATTERNS = ("build/server/lineairdb-server",
+STACK_PATTERNS = ("build/server/helios-storage",
                   "runtime_output_directory/mysqld")
 
 # A per-row LIKE over a wide column costs about 1.4us, so this is a scan of
@@ -279,7 +279,7 @@ def last_scan_tally():
     lines after the last statement belong to the read just finished.
     """
     logs = sorted(glob.glob(
-        os.path.join(ROOT, "lineairdb_logs", "lineairdb_server_*.log")))
+        os.path.join(ROOT, "helios_logs", "helios_storage_*.log")))
     if not logs:
         return {}
     tally = {}

@@ -10,7 +10,7 @@ resolution instead, and this test demands consistent results.
 
 The test opens the install window wide and synchronizes on it instead of
 racing:
-  - lineairdb-server runs with the silo_commit between_row_installs debug
+  - helios-storage runs with the silo_commit between_row_installs debug
     sync point set to sleep, so the install loop stays open between
     consecutive row installs; every commit path goes through it (see
     server/storage/src/util/debug_sync.h)
@@ -36,7 +36,7 @@ agreement on the final state.
 
 Operational notes: the test assumes exclusive ownership of the local stack
 (run_tests.py convention; the stop scripts kill every local instance). It
-restarts lineairdb-server and mysqld itself because both need the special
+restarts helios-storage and mysqld itself because both need the special
 environment, verifies the preflight stop actually emptied the stack
 (start_server.sh treats "already running" as success), and stops the stack
 afterwards so the sync point does not survive into later runs.
@@ -72,7 +72,7 @@ SYNC_POINT_ENV = (
 # table names.
 DB = "ha_lineairdb_test"
 
-STACK_PATTERNS = ("build/server/lineairdb-server",
+STACK_PATTERNS = ("build/server/helios-storage",
                   "runtime_output_directory/mysqld")
 
 # Each scenario: fresh table with BASE rows, then one transaction whose two

@@ -31,17 +31,17 @@ echo 'source "$HOME/.sdkman/bin/sdkman-init.sh"' >> ~/.bashrc
 
 #### 3. Snapshot AMI
 
-Stop the instance and create an AMI snapshot. All nodes (lineairdb, mysql, bench) use the same AMI.
+Stop the instance and create an AMI snapshot. All nodes (storage, mysql, bench) use the same AMI.
 
 ### Ansible deploy-time (IP-dependent, runs each deployment)
 
 
-| Playbook        | What it does                                                   |
-| --------------- | -------------------------------------------------------------- |
-| `push_bundle.yml` | Push and extract the prebuilt bundle onto every node         |
-| `lineairdb.yml` | Start the storage server from the bundle                       |
-| `mysql.yml`     | Start MySQL, create users (bench access)                       |
-| `benchbase.yml` | Create schema on each MySQL, load data                         |
+| Playbook          | What it does                                         |
+| ----------------- | ---------------------------------------------------- |
+| `push_bundle.yml` | Push and extract the prebuilt bundle onto every node |
+| `storage.yml`     | Start the storage server from the bundle             |
+| `mysql.yml`       | Start MySQL, create users (bench access)             |
+| `benchbase.yml`   | Create schema on each MySQL, load data               |
 
 
 ## Quick start (bench_aws.py)
@@ -74,9 +74,9 @@ Logs are saved to `logs/<timestamp>/`. Results and plots go to `result/<run_id>/
 
 Cluster configuration is defined in `CLUSTER` dict at the top of `bench_aws.py`. Default:
 
-| Role      | Instance type  | Count |
-|-----------|---------------|-------|
-| lineairdb | c6i.16xlarge  | 1     |
+| Role      | Instance type | Count |
+| --------- | ------------- | ----- |
+| storage   | c6i.16xlarge  | 1     |
 | mysql     | c6i.4xlarge   | 8     |
 | benchbase | c6i.4xlarge   | 1     |
 
@@ -90,13 +90,13 @@ For debugging or running individual steps, you can use Ansible playbooks directl
 python3 py/update_inventory.py --run-tag <run_id>   # only the instances of that run
 ```
 
-> Tag instances: `Name=helios-lineairdb`, `Name=helios-mysql`, `Name=helios-bench`, `Project=HeliosPush`, `Run=<run_id>`
+> Tag instances: `Name=helios-storage`, `Name=helios-mysql`, `Name=helios-bench`, `Project=HeliosPush`, `Run=<run_id>`
 
 ### 2. Deploy infrastructure
 
 ```bash
 ansible -i inventory.ini all -m ping           # Connectivity check
-ansible-playbook -i inventory.ini site.yml -e "bundle_path=... bundle_sha256=... deadman_required=false"  # Full deploy on hand-launched instances (push_bundle → lineairdb → mysql → benchbase)
+ansible-playbook -i inventory.ini site.yml -e "bundle_path=... bundle_sha256=... deadman_required=false"  # Full deploy on hand-launched instances (push_bundle → storage → mysql → benchbase)
 ```
 
 Tasks that need root carry the `privileged` tag; add `--skip-tags privileged` to run a playbook on hosts without sudo.
@@ -158,22 +158,22 @@ ansible-playbook -i inventory.ini measure_usage.yml \
 ## Variables reference
 
 
-| Variable            | Default                                         | Description                                 |
-| ------------------- | ----------------------------------------------- | ------------------------------------------- |
-| `bench_type`        | `ycsb`                                          | Benchmark: `ycsb`, `tpcc`, `tpch`           |
-| `bench_scalefactor` | `10` (ycsb/tpcc) / `0.1` (tpch)                 | Scale factor                                |
-| `bench_profile`     | `b`                                             | YCSB profile: `a`, `b`, `c`, `e`, `f`       |
-| `bench_serial`      | `true` for tpch                                 | TPC-H: serial (22 queries once) vs parallel |
-| `bench_time`        | `60`                                            | Execution time in seconds                   |
-| `bench_terms`       | `[1]` (tpch serial) / `[1,32,...,256]` (others) | Terminal counts to sweep                    |
-| `bench_sync`        | `true`                                          | Synchronize start across bench nodes        |
-| `bench_read_path`   | `plan`                                          | `SET GLOBAL lineairdb_read_path`: `plan` or `row` |
-| `bench_tx_plan`     | `false`                                         | Export `HELIOS_PREFETCH_PLAN=1` so TPC-C injects `@_tx_plan` |
-| `bench_sync_buffer` | `5`                                             | Sync buffer (seconds)                       |
-| `run_id`            | `run`                                           | Identifier for log filenames                |
-| `helios_durability` | `async` (`lineairdb.yml`); `measure_usage.yml` requires it explicitly | Commit durability the sweep measures: `async` or `sync`. `measure_usage.yml` reconciles the storage server with it before sampling and refuses to sweep without it |
-| `helios_load_durability` | unset                                      | Relaxed contract for the load phase only (`async`). Passed to `lineairdb.yml` to start the server under it, and to `measure_usage.yml`, which refuses to sweep unless the storage server started under it |
-| `sample_interval`   | `1`                                             | CPU sampling interval (seconds)             |
+| Variable                 | Default                                                             | Description                                                                                                                                                                                             |
+| ------------------------ | ------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `bench_type`             | `ycsb`                                                              | Benchmark: `ycsb`, `tpcc`, `tpch`                                                                                                                                                                       |
+| `bench_scalefactor`      | `10` (ycsb/tpcc) / `0.1` (tpch)                                     | Scale factor                                                                                                                                                                                            |
+| `bench_profile`          | `b`                                                                 | YCSB profile: `a`, `b`, `c`, `e`, `f`                                                                                                                                                                   |
+| `bench_serial`           | `true` for tpch                                                     | TPC-H: serial (22 queries once) vs parallel                                                                                                                                                             |
+| `bench_time`             | `60`                                                                | Execution time in seconds                                                                                                                                                                               |
+| `bench_terms`            | `[1]` (tpch serial) / `[1,32,...,256]` (others)                     | Terminal counts to sweep                                                                                                                                                                                |
+| `bench_sync`             | `true`                                                              | Synchronize start across bench nodes                                                                                                                                                                    |
+| `bench_read_path`        | `plan`                                                              | `SET GLOBAL lineairdb_read_path`: `plan` or `row`                                                                                                                                                       |
+| `bench_tx_plan`          | `false`                                                             | Export `HELIOS_PREFETCH_PLAN=1` so TPC-C injects `@_tx_plan`                                                                                                                                            |
+| `bench_sync_buffer`      | `5`                                                                 | Sync buffer (seconds)                                                                                                                                                                                   |
+| `run_id`                 | `run`                                                               | Identifier for log filenames                                                                                                                                                                            |
+| `helios_durability`      | `async` (`storage.yml`); `measure_usage.yml` requires it explicitly | Commit durability the sweep measures: `async` or `sync`. `measure_usage.yml` reconciles the storage server with it before sampling and refuses to sweep without it                                      |
+| `helios_load_durability` | unset                                                               | Relaxed contract for the load phase only (`async`). Passed to `storage.yml` to start the server under it, and to `measure_usage.yml`, which refuses to sweep unless the storage server started under it |
+| `sample_interval`        | `1`                                                                 | CPU sampling interval (seconds)                                                                                                                                                                         |
 
 
 ## Results
@@ -183,14 +183,14 @@ Results are stored under `result/<run_id>/<machine_spec>/`:
 ```
 result/
   20260310-143000/
-    lineairdb-128x1_mysql-128x2_benchbase-128x1/
+    storage-128x1_mysql-128x2_benchbase-128x1/
       throughput/
         throughput_raw.csv       # host,terminals,throughput,goodput
       cpu/
         <host>/cpu-<run_id>.log
       bench/
         <host>/bench-<run_id>.tgz
-      lineairdb/
+      storage/
         <host>/{pidstat,sar-*,mpstat-irq,softnet,interrupts}-<run_id>.log
       mysql/
         <host>/mysql-status-<run_id>.txt
@@ -210,9 +210,9 @@ python3 py/plot_tpch.py          # TPC-H per-query latency (auto-called for tpch
 | Playbook            | Purpose                                                   |
 | ------------------- | --------------------------------------------------------- |
 | `push_bundle.yml`   | Push and extract the prebuilt bundle onto every node      |
-| `site.yml`          | Master: push_bundle → lineairdb → mysql → benchbase       |
-| `lineairdb.yml`     | Start the storage server from the bundle                  |
-| `mysql.yml`         | Start MySQL with LineairDB proxy, create users            |
+| `site.yml`          | Master: push_bundle → storage → mysql → benchbase         |
+| `storage.yml`       | Start the storage server from the bundle                  |
+| `mysql.yml`         | Start MySQL with Helios proxy, create users               |
 | `benchbase.yml`     | Create schema + load data (supports ycsb/tpcc/tpch)       |
 | `measure.yml`       | Run benchmark terminal sweep (ungated: see the notes)     |
 | `measure_term.yml`  | Single terminal count execution (included by measure.yml) |
@@ -225,7 +225,7 @@ python3 py/plot_tpch.py          # TPC-H per-query latency (auto-called for tpch
   via JDBC's `loadbalance` scheme instead of a proxy; a single-MySQL run keeps
   the plain `jdbc:mysql://` URL.
 - **DDL doesn't sync**: `benchbase.yml` runs `--create` on each MySQL node separately because Helios DDL is not replicated across MySQL instances.
-- **Data is shared**: `--load` runs once; data goes to shared LineairDB storage.
+- **Data is shared**: `--load` runs once; data goes to shared Helios storage.
 - **TPC-H optimizer settings**: `benchbase.yml` and `measure.yml` both set hash join / subquery optimizer flags on each MySQL node. This is needed because Helios's RPC-based architecture makes hash join vastly faster than nested-loop with PK lookups.
 - **Run the sweep through `measure_usage.yml`**: the durability contract is
   persistent server state, so a fleet loaded under `helios_load_durability=async`
@@ -235,5 +235,5 @@ python3 py/plot_tpch.py          # TPC-H per-query latency (auto-called for tpch
   `unique_checks=1` gate is a backstop of a different kind: that relaxation
   (`bench_load_unique_checks_off`) lives in the loader's JDBC session, and
   `measure_term.yml` already refuses an execute config carrying it.
-- **Server restart clears data**: `lineairdb.yml` wipes `helios_wal` before it starts the server, so a redeploy starts empty. Re-run `benchbase.yml` after restart.
+- **Server restart clears data**: `storage.yml` wipes `helios_wal` before it starts the server, so a redeploy starts empty. Re-run `benchbase.yml` after restart.
 

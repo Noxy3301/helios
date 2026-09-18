@@ -24,7 +24,7 @@ from utils.connection import get_connection
 
 ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 SCRIPTS_DIR = os.path.join(ROOT_DIR, "scripts")
-SERVER_BIN = os.path.join(ROOT_DIR, "build", "server", "lineairdb-server")
+SERVER_BIN = os.path.join(ROOT_DIR, "build", "server", "helios-storage")
 
 SECOND_PORT = 3308
 # The first start of an instance initializes its data directory
@@ -154,13 +154,13 @@ def start_storage_server(work_dir, recovery=True):
     which is what the reserved-but-not-durable window needs.
     """
     env = dict(os.environ)
-    env["LINEAIRDB_SERVER_PORT"] = str(RESTART_SERVER_PORT)
+    env["HELIOS_SERVER_PORT"] = str(RESTART_SERVER_PORT)
     if recovery:
-        env["LINEAIRDB_ENABLE_RECOVERY"] = "1"
-        env["LINEAIRDB_COMMIT_DURABILITY"] = "sync"
+        env["HELIOS_ENABLE_RECOVERY"] = "1"
+        env["HELIOS_COMMIT_DURABILITY"] = "sync"
     else:
-        env.pop("LINEAIRDB_ENABLE_RECOVERY", None)
-        env.pop("LINEAIRDB_COMMIT_DURABILITY", None)
+        env.pop("HELIOS_ENABLE_RECOVERY", None)
+        env.pop("HELIOS_COMMIT_DURABILITY", None)
     jemalloc = "/lib/x86_64-linux-gnu/libjemalloc.so.2"
     if os.path.exists(jemalloc):
         env["LD_PRELOAD"] = jemalloc

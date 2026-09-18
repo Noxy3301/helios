@@ -5,7 +5,7 @@
 # the instance otherwise).
 # Best-effort by design: every task tolerates failure and unreachable hosts,
 # so a half-dead cluster still yields evidence for the surviving nodes.
-- hosts: lineairdb:mysql:benchbase
+- hosts: storage:mysql:benchbase
   gather_facts: false
   ignore_unreachable: true
   vars:
@@ -37,8 +37,8 @@
       shell: |
         {
           echo "== date";  date -u +%FT%T.%3NZ
-          echo "== pgrep lineairdb/mysqld"
-          pgrep -a -f "[l]ineairdb-server|[m]ysqld" || echo "NONE ALIVE"
+          echo "== pgrep helios-storage/mysqld"
+          pgrep -a -f "[h]elios_server|[m]ysqld" || echo "NONE ALIVE"
           echo "== ps top-rss"; ps -eo pid,etime,rss,comm --sort=-rss | head -20
           echo "== dmesg tail"; sudo dmesg -T 2>/dev/null | tail -80
           echo "== segv/oom in syslog"
@@ -47,7 +47,7 @@
         } > /tmp/salvage-snapshot.txt 2>&1
         tar czf /tmp/salvage.tgz --ignore-failed-read \
           /tmp/salvage-snapshot.txt /tmp/start_server.log /tmp/start_mysql.log \
-          $(ls $HOME/helios/lineairdb_logs/{lineairdb_server,mysqld}_*.log 2>/dev/null | tail -3) \
+          $(ls $HOME/helios/helios_logs/{helios_storage,mysqld}_*.log 2>/dev/null | tail -3) \
           $(sudo find $HOME -maxdepth 5 -name "*.err" 2>/dev/null | head -3) \
           2>/dev/null || true
       args:

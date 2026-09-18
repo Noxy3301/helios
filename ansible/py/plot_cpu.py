@@ -9,9 +9,9 @@ from typing import Optional
 import matplotlib.pyplot as plt
 
 TIME_RE = re.compile(r"^(\d{1,2}:\d{2}:\d{2})(?:\s+(AM|PM))?\s+(\S+)\s+(.*)$")
-ROLE_ORDER = {"lineairdb": 0, "mysql": 1, "benchbase": 2, "other": 3}
+ROLE_ORDER = {"storage": 0, "mysql": 1, "benchbase": 2, "other": 3}
 ROLE_STYLE = {
-    "lineairdb": {"label": "LineairDB", "color": "#1b9e77"},
+    "storage": {"label": "Helios", "color": "#1b9e77"},
     "mysql": {"label": "MySQL", "color": "#d95f02"},
     "benchbase": {"label": "BenchBase", "color": "#e31a1c"},
     "other": {"label": "Other", "color": "#666666"},
@@ -20,8 +20,8 @@ LINESTYLES = ["-", "--", ":", "-."]
 
 
 def role_for_host(host: str) -> str:
-    if host.startswith("lineairdb"):
-        return "lineairdb"
+    if host.startswith("storage"):
+        return "storage"
     if host.startswith("mysql"):
         return "mysql"
     if host.startswith("bench"):

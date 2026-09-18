@@ -53,7 +53,7 @@ read -r -a MYSQLD_EXTRA <<< "${MYSQLD_EXTRA_ARGS:-}"
 # Per-instance log so the background mysqld does not inherit the caller's
 # stdout/stderr (otherwise subprocess.run() in benchrun.py blocks forever
 # waiting for the inherited pipe to close).
-MYSQL_LOG_DIR="$ROOT_DIR/lineairdb_logs"
+MYSQL_LOG_DIR="$ROOT_DIR/helios_logs"
 mkdir -p "$MYSQL_LOG_DIR"
 MYSQL_LOG_FILE="$MYSQL_LOG_DIR/mysqld_${MYSQLD_PORT}_$(date +%Y%m%d_%H%M%S).log"
 

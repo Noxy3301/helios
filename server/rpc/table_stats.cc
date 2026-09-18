@@ -1,4 +1,4 @@
-#include "lineairdb_rpc.hh"
+#include "helios_rpc.hh"
 
 #include <cstddef>
 #include <cstdint>
@@ -48,13 +48,13 @@ bool hist_key_parts(std::string_view key, uint32_t n, size_t* ends) {
 
 }  // namespace
 
-std::mutex LineairDBRpc::ndv_cache_mu_;
+std::mutex HeliosRpc::ndv_cache_mu_;
 std::unordered_map<std::string, std::pair<bool, std::vector<uint64_t>>>
-    LineairDBRpc::ndv_cache_;
-std::unordered_map<std::string, LineairDBRpc::HistEntry>
-    LineairDBRpc::hist_cache_;
+    HeliosRpc::ndv_cache_;
+std::unordered_map<std::string, HeliosRpc::HistEntry>
+    HeliosRpc::hist_cache_;
 
-void LineairDBRpc::handleTxGetTableStats(const std::string& message,
+void HeliosRpc::handleTxGetTableStats(const std::string& message,
                                          std::string& result) {
     LineairDB::Protocol::GetTableStats::Request request;
     request.ParseFromString(message);

@@ -1,6 +1,6 @@
 #! /bin/bash
 
-# Build the server for a machine whose CPU is older than this one. LineairDB
+# Build the server for a machine whose CPU is older than this one. The storage
 # compiles its release build with -march=native, so a binary built on a host
 # with AVX-512 dies with SIGILL elsewhere. This swaps that flag for a baseline
 # and keeps the result out of build/ so the native build stays intact.
@@ -43,6 +43,6 @@ cmake "$ROOT/server" \
 make -j "$(nproc)"
 
 echo
-echo "Binary: $BUILD_DIR/lineairdb-server"
+echo "Binary: $BUILD_DIR/helios-storage"
 echo "Copy it together with the libraries it does not find on the target:"
-ldd "$BUILD_DIR/lineairdb-server" | awk '/libduckdb|libprotobuf|libjemalloc/ {print "  " $3}'
+ldd "$BUILD_DIR/helios-storage" | awk '/libduckdb|libprotobuf|libjemalloc/ {print "  " $3}'

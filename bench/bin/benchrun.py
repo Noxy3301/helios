@@ -16,7 +16,7 @@ Prerequisites:
   - BenchBase built (bench/bin/build_benchbase.py)
 
 Server lifecycle:
-  By default, this script auto-starts lineairdb-server + mysqld at the
+  By default, this script auto-starts helios-storage + mysqld at the
   beginning and stops them at the end. Pass --external-server to opt out
   (e.g. when running against a remote MySQL or when servers are already
   managed externally). Auto-detection: if mysqld is already listening on
@@ -40,10 +40,10 @@ SCRIPTS_DIR = Path(__file__).resolve().parents[2] / "scripts"
 ROOT = Path(__file__).resolve().parents[2]
 BENCHBASE_DIR = ROOT / "bench" / "benchbase-mysql"
 MYSQL_BIN = ROOT / "build" / "runtime_output_directory" / "mysql"
-LINEAIRDB_CTL = ROOT / "build" / "server" / "lineairdb-ctl"
+HELIOS_CTL = ROOT / "build" / "server" / "helios-ctl"
 # The kernel truncates the process name to 15 characters
-SERVER_COMM = "lineairdb-serve"
-LINEAIRDB_LOG_DIR = ROOT / "lineairdb_logs"
+SERVER_COMM = "helios-storage"
+HELIOS_LOG_DIR = ROOT / "helios_logs"
 HELIOS_WAL_DIR = ROOT / "helios_wal"  # the storage's work directory
 
 YCSB_PROFILES = {
@@ -101,29 +101,29 @@ def _run_script(argv, timeout, env=None):
         return None
 
 
-def start_lineairdb_server(commit_durability=None):
-    """Start lineairdb-server via scripts/start_server.sh and wait for port 9999.
+def start_helios_storage(commit_durability=None):
+    """Start helios-storage via scripts/start_server.sh and wait for port 9999.
 
     commit_durability overrides the server's startup contract for this run only;
     it reaches the daemon through the launcher's environment.
     """
     if _is_port_open("127.0.0.1", 9999):
-        print("  lineairdb-server already running on port 9999, reusing")
+        print("  helios-storage already running on port 9999, reusing")
         return True
-    print("  Starting lineairdb-server...")
+    print("  Starting helios-storage...")
     env = None
     if commit_durability:
-        env = dict(os.environ, LINEAIRDB_COMMIT_DURABILITY=commit_durability)
-        print(f"  LINEAIRDB_COMMIT_DURABILITY={commit_durability}")
+        env = dict(os.environ, HELIOS_COMMIT_DURABILITY=commit_durability)
+        print(f"  HELIOS_COMMIT_DURABILITY={commit_durability}")
     result = _run_script([str(SCRIPTS_DIR / "start_server.sh")], timeout=30, env=env)
     if result is None or result.returncode != 0:
         if result is not None:
-            print(f"  ERROR starting lineairdb-server:\n{result.stdout}", file=sys.stderr)
+            print(f"  ERROR starting helios-storage:\n{result.stdout}", file=sys.stderr)
         return False
     if not _wait_for_port("127.0.0.1", 9999, timeout=30):
-        print("  ERROR: lineairdb-server did not become ready within 30s", file=sys.stderr)
+        print("  ERROR: helios-storage did not become ready within 30s", file=sys.stderr)
         return False
-    print("  lineairdb-server ready (port 9999)")
+    print("  helios-storage ready (port 9999)")
     return True
 
 
@@ -153,7 +153,7 @@ def start_mysql_server(mysqld_port=3307, server_host="127.0.0.1", server_port=99
 
 def server_startup_contract():
     """Commit durability the newest server log reports at startup, or None."""
-    logs = sorted(LINEAIRDB_LOG_DIR.glob("lineairdb_server_*.log"),
+    logs = sorted(HELIOS_LOG_DIR.glob("helios_storage_*.log"),
                   key=lambda p: p.stat().st_mtime, reverse=True)
     if not logs:
         return None
@@ -171,7 +171,7 @@ def switch_commit_durability(mode):
     print(f"  Switching durability to {mode}...")
     started = time.time()
     result = subprocess.run(
-        [str(LINEAIRDB_CTL), "--host", "127.0.0.1", "--port", "9999",
+        [str(HELIOS_CTL), "--host", "127.0.0.1", "--port", "9999",
          "set-durability", mode],
         capture_output=True, text=True)
     elapsed = time.time() - started
@@ -183,28 +183,28 @@ def switch_commit_durability(mode):
 
 
 def stop_all_servers():
-    """Stop mysqld and lineairdb-server via the stop scripts."""
-    print("  Stopping mysqld + lineairdb-server...")
+    """Stop mysqld and helios-storage via the stop scripts."""
+    print("  Stopping mysqld + helios-storage...")
     subprocess.run([str(SCRIPTS_DIR / "stop_mysql.sh")], capture_output=True)
     subprocess.run([str(SCRIPTS_DIR / "stop_server.sh")], capture_output=True)
     time.sleep(2)
-    for f in ["/tmp/lineairdb_server.pid", "/tmp/mysql.pid"]:
+    for f in ["/tmp/helios_storage.pid", "/tmp/mysql.pid"]:
         try:
             Path(f).unlink()
         except FileNotFoundError:
             pass
 
 
-def cleanup_lineairdb_logs():
+def cleanup_helios_logs():
     """Remove the server logs and the storage's work directory after managed benchmark runs."""
-    if not LINEAIRDB_LOG_DIR.exists() and not HELIOS_WAL_DIR.exists():
+    if not HELIOS_LOG_DIR.exists() and not HELIOS_WAL_DIR.exists():
         return
 
-    # Match start_lineairdb_server()'s reuse predicate (port) and catch a
+    # Match start_helios_storage()'s reuse predicate (port) and catch a
     # relative-path launch that is not listening yet. A launch racing the
     # unlink below stays possible; the bench launcher does not do that.
-    if _find_pid("build/server/lineairdb-server") or _is_port_open("127.0.0.1", 9999):
-        print("  Skipping lineairdb_logs cleanup: lineairdb-server is still running")
+    if _find_pid("build/server/helios-storage") or _is_port_open("127.0.0.1", 9999):
+        print("  Skipping helios_logs cleanup: helios-storage is still running")
         return
 
     removed = 0
@@ -217,7 +217,7 @@ def cleanup_lineairdb_logs():
     elif HELIOS_WAL_DIR.exists():
         shutil.rmtree(HELIOS_WAL_DIR)
         removed += 1
-    for path in LINEAIRDB_LOG_DIR.iterdir() if LINEAIRDB_LOG_DIR.exists() else []:
+    for path in HELIOS_LOG_DIR.iterdir() if HELIOS_LOG_DIR.exists() else []:
         try:
             if path.is_dir() and not path.is_symlink():
                 shutil.rmtree(path)
@@ -228,7 +228,7 @@ def cleanup_lineairdb_logs():
             continue
 
     if removed:
-        print(f"  Cleaned lineairdb_logs ({removed} entries)")
+        print(f"  Cleaned helios_logs ({removed} entries)")
 
 
 def mysql_cmd(port, host, sql):
@@ -374,8 +374,8 @@ def _start_metrics(metrics_dir):
     p = subprocess.Popen(["sar", "-w", interval], stdout=f, stderr=subprocess.DEVNULL)
     samplers.append(("sar-w", p, f))
 
-    # pidstat for lineairdb-server
-    server_pid = _find_pid("/build/server/lineairdb-server")
+    # pidstat for helios-storage
+    server_pid = _find_pid("/build/server/helios-storage")
     if server_pid:
         f = open(metrics_dir / "pidstat-server.log", "w")
         p = subprocess.Popen(["pidstat", "-u", "-w", "-p", server_pid, interval], stdout=f, stderr=subprocess.DEVNULL)
@@ -829,7 +829,7 @@ def _plot_metrics(result_base, plot_dir):
             y1 = sv
             y2 = [a + b for a, b in zip(sv, mv)]
             y3 = [a + b for a, b in zip(y2, bv)]
-            ax.fill_between(x, 0, y1, alpha=0.3, color="#1f78b4", label="LineairDB")
+            ax.fill_between(x, 0, y1, alpha=0.3, color="#1f78b4", label="Helios")
             ax.fill_between(x, y1, y2, alpha=0.3, color="#e31a1c", label="MySQL")
             ax.fill_between(x, y2, y3, alpha=0.3, color="#ff7f0e", label="BenchBase")
         ax.set_ylim(0, cpu_max)
@@ -886,9 +886,9 @@ def main():
     parser.add_argument("--analyze", action="store_true",
                         help="Run ANALYZE TABLE after load (automatic for --tx-plan runs)")
     parser.add_argument("--external-server", action="store_true",
-                        help="Skip auto start/stop of lineairdb-server and mysqld (assume already running)")
-    parser.add_argument("--keep-lineairdb-logs", action="store_true",
-                        help="Keep lineairdb_logs and helios_wal after the benchmark")
+                        help="Skip auto start/stop of helios-storage and mysqld (assume already running)")
+    parser.add_argument("--keep-helios-logs", action="store_true",
+                        help="Keep helios_logs and helios_wal after the benchmark")
     parser.add_argument("--read-path", choices=["row", "plan"], default="plan",
                         help="SET GLOBAL lineairdb_read_path: row sends one request per handler "
                              "read, plan stages what it can in one request (default)")
@@ -905,11 +905,11 @@ def main():
         if args.external_server or args.no_setup:
             sys.exit("--load-durability async starts the storage server under the load "
                      "contract: not valid with --external-server or --no-setup")
-        if not LINEAIRDB_CTL.exists():
-            sys.exit(f"--load-durability async needs {LINEAIRDB_CTL} to end the load "
+        if not HELIOS_CTL.exists():
+            sys.exit(f"--load-durability async needs {HELIOS_CTL} to end the load "
                      "contract; build it first")
-        if "LINEAIRDB_COMMIT_DURABILITY" in os.environ:
-            sys.exit("--load-durability async sets LINEAIRDB_COMMIT_DURABILITY itself; "
+        if "HELIOS_COMMIT_DURABILITY" in os.environ:
+            sys.exit("--load-durability async sets HELIOS_COMMIT_DURABILITY itself; "
                      "unset it in the environment first")
     jar = BENCHBASE_DIR / "benchbase.jar"
     if not jar.exists():
@@ -1036,7 +1036,7 @@ def main():
         if not managed:
             sys.exit("--load-durability async needs the managed server lifecycle")
         if _is_port_open("127.0.0.1", 9999):
-            sys.exit("--load-durability async has to start lineairdb-server itself, "
+            sys.exit("--load-durability async has to start helios-storage itself, "
                      "but port 9999 already has a listener")
         running = _find_pid(SERVER_COMM, by_name=True)
         if running:
@@ -1044,15 +1044,15 @@ def main():
                 cwd = os.readlink(f"/proc/{running}/cwd")
             except OSError:
                 cwd = "unknown"
-            sys.exit("--load-durability async has to start lineairdb-server itself, "
+            sys.exit("--load-durability async has to start helios-storage itself, "
                      f"but pid {running} is already running (cwd {cwd})")
     if managed:
         # Wipe any WAL left by a previous run before starting a fresh server,
-        # so stale logs never trigger recovery. No-op if lineairdb-server is
+        # so stale logs never trigger recovery. No-op if helios-storage is
         # already running (reuse case, handled inside the function).
-        cleanup_lineairdb_logs()
+        cleanup_helios_logs()
         load_durability = "async" if args.load_durability == "async" else None
-        if not start_lineairdb_server(commit_durability=load_durability):
+        if not start_helios_storage(commit_durability=load_durability):
             sys.exit(1)
         # A server that was already up would have been reused: the log is the
         # only proof that the load contract is the one we asked for.
@@ -1072,8 +1072,8 @@ def main():
     finally:
         if managed:
             stop_all_servers()
-        if not args.keep_lineairdb_logs:
-            cleanup_lineairdb_logs()
+        if not args.keep_helios_logs:
+            cleanup_helios_logs()
 
 
 def _run_bench(args, config_work, thread_list, result_base):

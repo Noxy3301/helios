@@ -32,7 +32,7 @@ import threading
 import time
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-SERVER = os.path.join(ROOT, "build", "server", "lineairdb-server")
+SERVER = os.path.join(ROOT, "build", "server", "helios-storage")
 MYSQL_SOCKET = "/tmp/mysql.sock"
 MYSQLD_PORT = "3307"
 
@@ -77,9 +77,9 @@ def start_server(work_dir, mode, extra_env=None, pass_fds=()):
     """Starts the server directly, so its log directory and inherited
     descriptors are the test's to choose."""
     env = dict(os.environ)
-    env["LINEAIRDB_COMMIT_DURABILITY"] = mode
-    env["LINEAIRDB_EPOCH_DURATION_MS"] = "40"
-    env.pop("LINEAIRDB_ENABLE_RECOVERY", None)
+    env["HELIOS_COMMIT_DURABILITY"] = mode
+    env["HELIOS_EPOCH_DURATION_MS"] = "40"
+    env.pop("HELIOS_ENABLE_RECOVERY", None)
     if extra_env:
         env.update(extra_env)
     out = open(os.path.join(work_dir, "server.out"), "wb")
@@ -274,7 +274,7 @@ def test_acknowledged_rows_survive_a_process_crash(work_dir):
         log(f"killed the server; wal.log is {size_before} bytes")
 
         server = start_server(work_dir, "sync",
-                              extra_env={"LINEAIRDB_ENABLE_RECOVERY": "1"})
+                              extra_env={"HELIOS_ENABLE_RECOVERY": "1"})
         start_mysqld()
         rows = sql("SELECT id, v FROM dur.crash ORDER BY id;")
         recovered = {}

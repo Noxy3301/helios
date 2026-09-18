@@ -1,4 +1,4 @@
-#include "lineairdb_rpc.hh"
+#include "helios_rpc.hh"
 
 #include <string>
 #include <string_view>
@@ -19,7 +19,7 @@ const std::vector<uint32_t> kNoColumns;
 
 }  // namespace
 
-void LineairDBRpc::handleTxRead(const std::string& message,
+void HeliosRpc::handleTxRead(const std::string& message,
                                 std::string& result) {
     LineairDB::Protocol::TxRead::Request request;
     LineairDB::Protocol::TxRead::Response response;
@@ -37,7 +37,7 @@ void LineairDBRpc::handleTxRead(const std::string& message,
     result = response.SerializeAsString();
 }
 
-void LineairDBRpc::handleTxBatchRead(const std::string& message,
+void HeliosRpc::handleTxBatchRead(const std::string& message,
                                      std::string& result) {
     LineairDB::Protocol::TxBatchRead::Request request;
     LineairDB::Protocol::TxBatchRead::Response response;
@@ -63,7 +63,7 @@ void LineairDBRpc::handleTxBatchRead(const std::string& message,
     result = response.SerializeAsString();
 }
 
-void LineairDBRpc::handleTxScan(const std::string& message,
+void HeliosRpc::handleTxScan(const std::string& message,
                                 std::string& result) {
     LineairDB::Protocol::TxScan::Request request;
     LineairDB::Protocol::TxScan::Response response;
@@ -86,7 +86,7 @@ void LineairDBRpc::handleTxScan(const std::string& message,
     result = response.SerializeAsString();
 }
 
-void LineairDBRpc::handleTxScanIndex(const std::string& message,
+void HeliosRpc::handleTxScanIndex(const std::string& message,
                                      std::string& result) {
     LineairDB::Protocol::TxScanIndex::Request request;
     LineairDB::Protocol::TxScanIndex::Response response;
@@ -110,7 +110,7 @@ void LineairDBRpc::handleTxScanIndex(const std::string& message,
     result = response.SerializeAsString();
 }
 
-void LineairDBRpc::handleTxCommit(const std::string& message,
+void HeliosRpc::handleTxCommit(const std::string& message,
                                   std::string& result) {
     LineairDB::Protocol::TxCommit::Request request;
     LineairDB::Protocol::TxCommit::Response response;

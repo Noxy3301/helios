@@ -39,8 +39,8 @@ LOG_FILE = None  # set in main()
 # Cluster topology — edit these to change sizes
 # ──────────────────────────────────────────────
 CLUSTER = {
-    "lineairdb": {
-        "tag": "helios-lineairdb",
+    "storage": {
+        "tag": "helios-storage",
         "instance_type": "c6i.16xlarge",
         "count": 1,
     },
@@ -86,7 +86,7 @@ _VCPU_BY_SIZE = {
 
 
 def build_machine_spec():
-    """Build machine_spec string from CLUSTER config (e.g. lineairdb-64x1_mysql-16x1_...)."""
+    """Build machine_spec string from CLUSTER config (e.g. storage-64x1_mysql-16x1_...)."""
     parts = []
     for role, cfg in CLUSTER.items():
         if cfg["count"] == 0:
@@ -99,7 +99,7 @@ def build_machine_spec():
 
 def _wal_role(args):
     """Which CLUSTER role hosts the io2 volume for this engine."""
-    return "mysql" if args.engine == "innodb" else "lineairdb"
+    return "mysql" if args.engine == "innodb" else "storage"
 
 
 def log(msg):
@@ -407,19 +407,19 @@ def deploy_infrastructure(args, bundle_path, bundle_sha256):
     run(f"ansible-playbook -i {inv} {ANSIBLE_DIR / 'push_bundle.yml'}"
         f" -e {shlex.quote(json.dumps({'bundle_path': bundle_path, 'bundle_sha256': bundle_sha256}))}")
 
-    # Start the roles in parallel; --engine innodb has no lineairdb role
+    # Start the roles in parallel; --engine innodb has no storage role
     innodb = args.engine == "innodb"
     log("Deploying infrastructure (mysql only, InnoDB)..." if innodb
-        else "Deploying infrastructure (lineairdb + mysql in parallel)...")
-    lineairdb_vars = {"helios_durability": args.durability, "wal_volume": args.wal_gib > 0}
+        else "Deploying infrastructure (storage + mysql in parallel)...")
+    storage_vars = {"helios_durability": args.durability, "wal_volume": args.wal_gib > 0}
     if args.load_durability != "same":
-        lineairdb_vars["helios_load_durability"] = args.load_durability
+        storage_vars["helios_load_durability"] = args.load_durability
     if args.epoch_ms is not None:
-        lineairdb_vars["helios_epoch_ms"] = args.epoch_ms
+        storage_vars["helios_epoch_ms"] = args.epoch_ms
     if args.server_env:
-        lineairdb_vars["helios_server_env"] = args.server_env
+        storage_vars["helios_storage_env"] = args.server_env
     if args.flush_trace:
-        lineairdb_vars["helios_flush_trace"] = FLUSH_TRACE_PREFIX
+        storage_vars["helios_flush_trace"] = FLUSH_TRACE_PREFIX
     mysql_vars = {"mysqld_extra_args": args.mysqld_extra_args}
     if innodb:
         mysql_vars.update({"mysql_engine": "innodb", "wal_volume": args.wal_gib > 0,
@@ -427,14 +427,14 @@ def deploy_infrastructure(args, bundle_path, bundle_sha256):
         if args.innodb_buffer_pool_gib is not None:
             mysql_vars["innodb_buffer_pool_gib"] = args.innodb_buffer_pool_gib
     role_extra = {
-        "lineairdb.yml": " -e " + shlex.quote(json.dumps(lineairdb_vars)),
+        "storage.yml": " -e " + shlex.quote(json.dumps(storage_vars)),
         "mysql.yml": " -e " + shlex.quote(json.dumps(mysql_vars)),
     }
     # Write deploy logs alongside bench_aws.log
     deploy_log_dir = Path(LOG_FILE.name).parent if LOG_FILE else None
     procs = []
 
-    playbooks = ["mysql.yml"] if innodb else ["lineairdb.yml", "mysql.yml"]
+    playbooks = ["mysql.yml"] if innodb else ["storage.yml", "mysql.yml"]
     for playbook in playbooks:
         cmd = f"ansible-playbook -i {inv} {ANSIBLE_DIR / playbook}{role_extra.get(playbook, '')}"
         log(f"  $ {cmd}")
@@ -557,7 +557,7 @@ def _plot_perf_reports(result_root):
     plot_dir = config_root / "_plot"
     plot_dir.mkdir(parents=True, exist_ok=True)
 
-    role_modes = {"lineairdb": "server", "mysql": "proxy"}
+    role_modes = {"storage": "server", "mysql": "proxy"}
     for role, mode in role_modes.items():
         cfg = CLUSTER.get(role)
         if not cfg or cfg["count"] == 0:
@@ -691,10 +691,10 @@ Examples:
     )
 
     # Engine selection
-    parser.add_argument("--engine", default="lineairdb", choices=["lineairdb", "innodb"],
-                        help="Storage engine under test (default: lineairdb, the full Helios "
+    parser.add_argument("--engine", default="storage", choices=["storage", "innodb"],
+                        help="Storage engine under test (default: storage, the full Helios "
                              "stack). innodb runs the same sweep against a single stock "
-                             "MySQL/InnoDB node instead: no LineairDB storage server, "
+                             "MySQL/InnoDB node instead: no Helios storage server, "
                              "--mysql-count fixed at 1, no read-path/ndv-drift options; size "
                              "its --mysql-instance-type like the Helios storage node so the "
                              "buffer pool holds the dataset")
@@ -725,18 +725,18 @@ Examples:
                         help="Run ANALYZE TABLE after load (on automatically for --tx-plan "
                              "and for --engine innodb; the statement-scoped read plan reads "
                              "live row counts from the storage server)")
-    parser.add_argument("--perf", action="store_true", help="Enable perf profiling on lineairdb + mysql nodes")
+    parser.add_argument("--perf", action="store_true", help="Enable perf profiling on storage + mysql nodes")
     parser.add_argument("--load-jstack", action="store_true",
                         help="Take one thread dump of the loader JVM mid-load (diagnostic; "
                              "costs a JVM safepoint pause, so it is off by default)")
     parser.add_argument("--perf-stat", action="store_true",
                         help="Sample IPC / LLC counters (perf stat counting mode, NOT perf "
-                             "record) on the mysql and lineairdb nodes across both the load "
+                             "record) on the mysql and storage nodes across both the load "
                              "and the sweep; degrades to a logged note if perf is unavailable")
 
     # Durability / WAL options
     parser.add_argument("--durability", default="sync", choices=["async", "sync"],
-                        help="LineairDB commit durability contract (default: sync)")
+                        help="Helios commit durability contract (default: sync)")
     parser.add_argument("--load-durability", default="same", choices=["same", "async"],
                         help="Commit durability for the load phase only (default: same, the "
                              "load runs under --durability). async loads under the Async "
@@ -747,7 +747,7 @@ Examples:
                         help="Epoch duration in ms (default: server default)")
     parser.add_argument("--wal-gib", type=int, default=0,
                         help="Extra io2 volume size in GiB (default: 0, no extra volume); holds the "
-                             "WAL on the lineairdb node, or the datadir under --engine innodb")
+                             "WAL on the storage node, or the datadir under --engine innodb")
     parser.add_argument("--wal-iops", type=int, default=12000, help="IOPS for the io2 WAL volume")
     parser.add_argument("--mysqld-extra-args", default="--performance-schema=OFF",
                         help="Extra mysqld options, passed through MYSQLD_EXTRA_ARGS")
@@ -776,7 +776,7 @@ Examples:
     # Cluster topology overrides
     parser.add_argument("--mysql-count", type=int, default=None, help="Override MySQL node count")
     parser.add_argument("--mysql-instance-type", default=None, help="Override MySQL instance type")
-    parser.add_argument("--lineairdb-instance-type", default=None, help="Override LineairDB instance type")
+    parser.add_argument("--storage-instance-type", default=None, help="Override the storage instance type")
     parser.add_argument("--benchbase-count", type=int, default=None, help="Override BenchBase node count")
     parser.add_argument("--benchbase-instance-type", default=None, help="Override BenchBase instance type")
     # Control options
@@ -811,29 +811,29 @@ Examples:
         if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=[A-Za-z0-9_./:,+-]*", kv):
             parser.error(f"--server-env entry {kv!r} is not NAME=VALUE with NAME a shell identifier "
                          "and VALUE made of letters, digits and _ . / : , + -")
-        if kv.split("=", 1)[0] in ("LINEAIRDB_COMMIT_DURABILITY",
-                                   "LINEAIRDB_EPOCH_DURATION_MS"):
-            parser.error("--server-env must not set LINEAIRDB_COMMIT_DURABILITY or "
-                         "LINEAIRDB_EPOCH_DURATION_MS; they have dedicated flags "
+        if kv.split("=", 1)[0] in ("HELIOS_COMMIT_DURABILITY",
+                                   "HELIOS_EPOCH_DURATION_MS"):
+            parser.error("--server-env must not set HELIOS_COMMIT_DURABILITY or "
+                         "HELIOS_EPOCH_DURATION_MS; they have dedicated flags "
                          "(--durability / --load-durability / --epoch-ms)")
     if args.load_durability == "async":
         if args.durability != "sync":
             parser.error("--load-durability async only relaxes a sync sweep; "
                          "pass --durability sync")
-        if args.engine != "lineairdb":
-            parser.error("--load-durability async switches the LineairDB storage server; "
+        if args.engine != "storage":
+            parser.error("--load-durability async switches the Helios storage server; "
                          "not valid with --engine innodb")
     if args.engine == "innodb":
         if args.mysql_count is not None and args.mysql_count != 1:
             parser.error("--engine innodb runs a single MySQL/InnoDB node; --mysql-count must be 1")
         if args.read_path != "plan" or args.tx_plan or args.bench_ndv_drift:
-            parser.error("--engine innodb has no LineairDB sysvars; "
+            parser.error("--engine innodb has no Helios sysvars; "
                          "--read-path, --tx-plan and --bench-ndv-drift are not supported")
         if args.durability != "sync" or args.epoch_ms is not None or args.server_env or args.flush_trace:
-            parser.error("--durability/--epoch-ms/--server-env/--flush-trace configure the LineairDB server; "
+            parser.error("--durability/--epoch-ms/--server-env/--flush-trace configure the Helios server; "
                          "not valid with --engine innodb")
-        if args.lineairdb_instance_type is not None:
-            parser.error("--lineairdb-instance-type is meaningless with --engine innodb")
+        if args.storage_instance_type is not None:
+            parser.error("--storage-instance-type is meaningless with --engine innodb")
         if args.wal_gib <= 0:
             parser.error("--engine innodb needs --wal-gib > 0: the datadir must live on the io2 volume")
     if args.flush_trace and args.wal_gib <= 0:
@@ -854,14 +854,14 @@ Examples:
         CLUSTER["mysql"]["count"] = args.mysql_count
     if args.mysql_instance_type is not None:
         CLUSTER["mysql"]["instance_type"] = args.mysql_instance_type
-    if args.lineairdb_instance_type is not None:
-        CLUSTER["lineairdb"]["instance_type"] = args.lineairdb_instance_type
+    if args.storage_instance_type is not None:
+        CLUSTER["storage"]["instance_type"] = args.storage_instance_type
     if args.benchbase_count is not None:
         CLUSTER["benchbase"]["count"] = args.benchbase_count
     if args.benchbase_instance_type is not None:
         CLUSTER["benchbase"]["instance_type"] = args.benchbase_instance_type
     if args.engine == "innodb":
-        CLUSTER["lineairdb"]["count"] = 0
+        CLUSTER["storage"]["count"] = 0
         if CLUSTER["mysql"]["count"] != 1:
             parser.error("--engine innodb runs a single MySQL/InnoDB node; the mysql role count must be 1")
 

@@ -9,7 +9,7 @@ build
 build-v3
 boost
 
-lineairdb_logs
+helios_logs
 helios_wal
 .related_work
 

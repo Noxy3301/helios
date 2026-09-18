@@ -21,8 +21,8 @@ req "$HELIOS/build/plugin_output_directory/ha_lineairdb_storage_engine.so"
 req "$HELIOS/build/library_output_directory/libprotobuf-lite.so.24.4.0"
 req "$HELIOS/build/library_output_directory/libprotobuf.so.24.4.0"
 req "$HELIOS/build/share/english/errmsg.sys"
-req "$HELIOS/build/server/lineairdb-server"
-req "$HELIOS/build/server/lineairdb-ctl"
+req "$HELIOS/build/server/helios-storage"
+req "$HELIOS/build/server/helios-ctl"
 req "$HELIOS/third_party/duckdb/build/release/src/libduckdb.so"
 req "$HELIOS/bench/benchbase-mysql/benchbase.jar"
 req "$HELIOS/bench/benchbase-mysql/config/plugin.xml"
@@ -42,7 +42,7 @@ mkdir -p \
   "$B/build/lib" \
   "$B/bench/config" \
   "$B/bench/benchbase-mysql/results" \
-  "$B/lineairdb_logs" \
+  "$B/helios_logs" \
   "$B/helios_wal"
 
 # --- mysqld / client (query node) ------------------------------------------------
@@ -62,8 +62,8 @@ fi
 # relative symlink.
 ln -s ../plugin_output_directory "$B/build/lib/plugin"
 
-# --- lineairdb-server (storage node) ------------------------------------------
-cp "$HELIOS/build/server/"{lineairdb-server,lineairdb-ctl} "$B/build/server/"
+# --- helios-storage (storage node) -----------------------------------------
+cp "$HELIOS/build/server/"{helios-storage,helios-ctl} "$B/build/server/"
 # Its RUNPATH (…/third_party/duckdb/build/release/src) doesn't exist remotely;
 # co-locate libduckdb.so in library_output_directory so one LD_LIBRARY_PATH
 # entry covers it too.
@@ -82,8 +82,8 @@ cp "$HELIOS/scripts/"{start_mysql.sh,stop_mysql.sh,start_server.sh,stop_server.s
    "$B/scripts/"
 
 # Inject a cd to the bundle root and an LD_LIBRARY_PATH export into the start
-# scripts: lineairdb-server writes ./helios_wal and its own log under
-# ./lineairdb_logs relative to cwd, and the library path replaces the build
+# scripts: helios-storage writes ./helios_wal and its own log under
+# ./helios_logs relative to cwd, and the library path replaces the build
 # machine's absolute RUNPATH
 for s in start_mysql.sh start_server.sh; do
   sed -i '1a\
@@ -124,7 +124,7 @@ check_ldd() {
 }
 check_ldd "$B/build/runtime_output_directory/mysqld"
 check_ldd "$B/build/plugin_output_directory/ha_lineairdb_storage_engine.so"
-check_ldd "$B/build/server/lineairdb-server"
+check_ldd "$B/build/server/helios-storage"
 
 # --- tar -----------------------------------------------------------------------
 # No -h: keep the build/lib/plugin symlink as a symlink

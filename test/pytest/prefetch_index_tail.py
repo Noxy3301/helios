@@ -24,7 +24,7 @@ def reset(cursor, db):
 
 
 def load_rows(cursor, db, n):
-    # DROP TABLE / DROP DATABASE do not purge LineairDB storage rows (known
+    # DROP TABLE / DROP DATABASE do not purge Helios storage rows (known
     # upstream bug): a same-name recreate still sees the old rows. Use a fresh
     # table name per load so shrinking loads are not masked.
     global _table_seq

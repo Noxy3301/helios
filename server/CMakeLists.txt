@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(lineairdb-server)
+project(helios)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -56,8 +56,8 @@ add_subdirectory(storage)
 set(SOURCES
     # Core
     main.cc
-    lineairdb_server.cc
-    lineairdb_server.hh
+    helios_server.cc
+    helios_server.hh
     
     # Network layer
     network/tcp_server.cc
@@ -66,8 +66,8 @@ set(SOURCES
     network/message_handler.hh
     
     # RPC layer
-    rpc/lineairdb_rpc.cc
-    rpc/lineairdb_rpc.hh
+    rpc/helios_rpc.cc
+    rpc/helios_rpc.hh
     rpc/database_operations.cc
     rpc/flat_plan_encode.cc
     rpc/flat_plan_encode.hh
@@ -96,37 +96,37 @@ set(SOURCES
 
 # The generated sources belong to exactly one target: listing them in two
 # executables lets a parallel build run protoc twice over the same files.
-add_library(lineairdb-proto STATIC ${PROTO_SRCS})
-target_include_directories(lineairdb-proto PUBLIC ${CMAKE_CURRENT_BINARY_DIR})
-target_link_libraries(lineairdb-proto PUBLIC ${Protobuf_LIBRARIES})
+add_library(helios_proto STATIC ${PROTO_SRCS})
+target_include_directories(helios_proto PUBLIC ${CMAKE_CURRENT_BINARY_DIR})
+target_link_libraries(helios_proto PUBLIC ${Protobuf_LIBRARIES})
 
 # Create executable
-add_executable(lineairdb-server ${SOURCES})
+add_executable(helios-storage ${SOURCES})
 
 # Link libraries
-target_link_libraries(lineairdb-server
+target_link_libraries(helios-storage
     helios_storage
-    lineairdb-proto
+    helios_proto
     pthread
     ${DUCKDB_LIB_DIR}/libduckdb.so
     ${MYSQL_CHARSET_LIBRARIES}
 )
 
 # Additional include directories for generated files
-target_include_directories(lineairdb-server PRIVATE
+target_include_directories(helios-storage PRIVATE
     ${CMAKE_CURRENT_BINARY_DIR}
     ${MYSQL_INCLUDE_DIRS})
 
 # Embed an rpath to the DuckDB shared library. start_server.sh runs the binary
 # directly, without LD_LIBRARY_PATH.
-set_target_properties(lineairdb-server PROPERTIES
+set_target_properties(helios-storage PROPERTIES
     BUILD_RPATH "${DUCKDB_LIB_DIR}"
     INSTALL_RPATH "${DUCKDB_LIB_DIR}")
 
 # Compiler flags to suppress warnings
-target_compile_options(lineairdb-server PRIVATE -O3 -Wno-error -Wno-unused-parameter)
+target_compile_options(helios-storage PRIVATE -O3 -Wno-error -Wno-unused-parameter)
 
 # Control-plane client. Speaks the same protocol; links no storage engine.
-add_executable(lineairdb-ctl tools/lineairdb_ctl.cc)
-target_link_libraries(lineairdb-ctl lineairdb-proto)
-target_compile_options(lineairdb-ctl PRIVATE -O2)
+add_executable(helios-ctl tools/helios_ctl.cc)
+target_link_libraries(helios-ctl helios_proto)
+target_compile_options(helios-ctl PRIVATE -O2)

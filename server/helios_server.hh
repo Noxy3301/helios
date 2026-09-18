@@ -4,13 +4,13 @@
 
 #include "network/tcp_server.hh"
 #include "network/message_handler.hh"
-#include "rpc/lineairdb_rpc.hh"
+#include "rpc/helios_rpc.hh"
 #include "database_manager.hh"
 
-class LineairDBServer : public TcpServer {
+class HeliosServer : public TcpServer {
 public:
-    LineairDBServer();
-    ~LineairDBServer() = default;
+    HeliosServer();
+    ~HeliosServer() = default;
 
     void init();
 

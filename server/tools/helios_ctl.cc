@@ -1,4 +1,4 @@
-// lineairdb_ctl.cc
+// helios_ctl.cc
 // Command-line client for the storage server's control RPCs
 
 #include <arpa/inet.h>
@@ -35,7 +35,7 @@ int fail(const std::string &text) {
 int usage(const char *problem = nullptr) {
   if (problem != nullptr) std::fprintf(stderr, "error: %s\n", problem);
   std::fprintf(stderr,
-               "usage: lineairdb-ctl [--host <dotted IPv4>] [--port 1-65535] "
+               "usage: helios-ctl [--host <dotted IPv4>] [--port 1-65535] "
                "set-durability <async|sync>\n");
   return 1;
 }

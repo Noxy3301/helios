@@ -1,10 +1,10 @@
 ---
-# Start the LineairDB server from the pushed bundle (push_bundle.yml runs first;
+# Start the Helios server from the pushed bundle (push_bundle.yml runs first;
 # there is no repository or build step on the node).
-- hosts: lineairdb
+- hosts: storage
   gather_facts: false
   vars:
-    lineairdb_nofile_limit: 1048576
+    storage_nofile_limit: 1048576
     ena_rss_interface: ens5
     helios_durability: async
     # helios_load_durability (optional): contract for the load phase only.
@@ -12,7 +12,7 @@
     # sweep; left undefined, the load runs under helios_durability as well.
     helios_epoch_ms: ""
     # Extra KEY=VALUE pairs exported to the server (space separated)
-    helios_server_env: ""
+    helios_storage_env: ""
     # Path prefix for the WAL flush trace; empty disables it
     helios_flush_trace: ""
     wal_volume: false
@@ -54,15 +54,15 @@
     - name: "Gate: the durability control tool is present"
       # measure_usage.yml reconciles this server before the sweep; a bundle
       # without the tool would only fail after the load.
-      shell: test -x ~/helios/build/server/lineairdb-ctl
+      shell: test -x ~/helios/build/server/helios-ctl
       args:
         executable: /bin/bash
       changed_when: false
 
-    - name: Start LineairDB-Server
+    - name: Start the Helios server
       # Never pipe the start scripts: log to a file and verify liveness explicitly;
       # helios_wal is wiped first, following the WAL symlink when present, so
-      # a run never replays a previous WAL; lineairdb_logs holds the process
+      # a run never replays a previous WAL; helios_logs holds the process
       # logs and is wiped so a sweep's archive carries only its own run
       shell: |
         set -euo pipefail
@@ -71,34 +71,34 @@
         # pgrep status 1 means no process; anything else keeps the WAL untouched
         rc=0
         for _ in $(seq 1 30); do
-          pgrep -f '[b]uild/server/lineairdb-server' > /dev/null && rc=0 || rc=$?
+          pgrep -f '[b]uild/server/helios-storage' > /dev/null && rc=0 || rc=$?
           [ "$rc" -eq 0 ] || break
           sleep 1
         done
-        [ "$rc" -eq 1 ] || { echo "refusing to wipe the WAL: a previous lineairdb-server is still running or pgrep failed (status $rc)"; exit 1; }
-        mkdir -p ~/helios/helios_wal ~/helios/lineairdb_logs
-        find ~/helios/helios_wal/ ~/helios/lineairdb_logs/ -mindepth 1 -delete
-        ulimit -n {{ lineairdb_nofile_limit }}
-        export LINEAIRDB_COMMIT_DURABILITY="{{ helios_load_durability | default(helios_durability) }}"
+        [ "$rc" -eq 1 ] || { echo "refusing to wipe the WAL: a previous helios-storage is still running or pgrep failed (status $rc)"; exit 1; }
+        mkdir -p ~/helios/helios_wal ~/helios/helios_logs
+        find ~/helios/helios_wal/ ~/helios/helios_logs/ -mindepth 1 -delete
+        ulimit -n {{ storage_nofile_limit }}
+        export HELIOS_COMMIT_DURABILITY="{{ helios_load_durability | default(helios_durability) }}"
         {% if helios_epoch_ms %}
-        export LINEAIRDB_EPOCH_DURATION_MS="{{ helios_epoch_ms }}"
+        export HELIOS_EPOCH_DURATION_MS="{{ helios_epoch_ms }}"
         {% endif %}
-        {% for kv in helios_server_env.split() %}
+        {% for kv in helios_storage_env.split() %}
         export '{{ kv }}'
         {% endfor %}
         {% if helios_flush_trace %}
         mkdir -p "$(dirname {{ helios_flush_trace }})"
-        export LINEAIRDB_FLUSH_TRACE="{{ helios_flush_trace }}"
+        export HELIOS_FLUSH_TRACE="{{ helios_flush_trace }}"
         {% endif %}
         ./scripts/start_server.sh > /tmp/start_server.log 2>&1
         sleep 2
         # Bracketed: the pattern kill in stop_server.sh must not match this shell
-        pgrep -f '[b]uild/server/lineairdb-server' > /dev/null || {
-          echo "lineairdb-server did not stay up:"; cat /tmp/start_server.log
-          tail -20 ~/helios/lineairdb_logs/lineairdb_server_*.log 2>/dev/null
+        pgrep -f '[b]uild/server/helios-storage' > /dev/null || {
+          echo "helios-storage did not stay up:"; cat /tmp/start_server.log
+          tail -20 ~/helios/helios_logs/helios_storage_*.log 2>/dev/null
           exit 1
         }
-        echo "lineairdb-server up (nofile=$(ulimit -n))"
+        echo "helios-storage up (nofile=$(ulimit -n))"
       args:
         executable: /bin/bash
       register: server_start
@@ -110,11 +110,11 @@
     - name: Show durability configuration
       debug:
         msg:
-          - "LINEAIRDB_COMMIT_DURABILITY={{ helios_load_durability | default(helios_durability) }} (load phase)"
+          - "HELIOS_COMMIT_DURABILITY={{ helios_load_durability | default(helios_durability) }} (load phase)"
           - "measured contract: {{ helios_durability }}"
-          - "LINEAIRDB_EPOCH_DURATION_MS={{ helios_epoch_ms if helios_epoch_ms else '(server default)' }}"
-          - "extra env: {{ helios_server_env if helios_server_env else '(none)' }}"
-          - "LINEAIRDB_FLUSH_TRACE={{ helios_flush_trace if helios_flush_trace else '(off)' }}"
+          - "HELIOS_EPOCH_DURATION_MS={{ helios_epoch_ms if helios_epoch_ms else '(server default)' }}"
+          - "extra env: {{ helios_storage_env if helios_storage_env else '(none)' }}"
+          - "HELIOS_FLUSH_TRACE={{ helios_flush_trace if helios_flush_trace else '(off)' }}"
 
     - name: Capture WAL volume disk usage
       when: wal_volume | bool

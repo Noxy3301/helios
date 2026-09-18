@@ -1,21 +1,21 @@
 // Dispatch of one request: decodes nothing itself, routes the OpCode to its
 // handler and releases the thread's epoch once the reply is built.
 
-#include "lineairdb_rpc.hh"
+#include "helios_rpc.hh"
 
 #include <cstdint>
 #include <string>
 
 #include "../../common/log.h"
 
-LineairDBRpc::LineairDBRpc(std::shared_ptr<DatabaseManager> db_manager,
+HeliosRpc::HeliosRpc(std::shared_ptr<DatabaseManager> db_manager,
                            std::shared_ptr<TableRowCounts> row_counts,
                            std::shared_ptr<HiddenKeyAllocator> hidden_keys)
     : db_manager_(db_manager), row_counts_(row_counts),
       hidden_keys_(hidden_keys) {
 }
 
-void LineairDBRpc::handle_rpc(MessageType message_type,
+void HeliosRpc::handle_rpc(MessageType message_type,
                               const std::string& message,
                               std::string& result) {
     LOG_DEBUG("Handling RPC: message_type=%u", static_cast<uint32_t>(message_type));

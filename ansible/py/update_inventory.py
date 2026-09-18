@@ -6,7 +6,7 @@ import subprocess
 import sys
 
 ROLE_MAP = [
-    {"tag": "helios-lineairdb", "group": "lineairdb", "prefix": "lineairdb"},
+    {"tag": "helios-storage", "group": "storage", "prefix": "storage"},
     {"tag": "helios-mysql", "group": "mysql", "prefix": "mysql"},
     {"tag": "helios-bench", "group": "benchbase", "prefix": "bench"},
 ]

@@ -123,8 +123,8 @@ def classify(symbol, lib, kind):
         return "alloc"
     if "protobuf" in lib:
         return "protobuf"
-    if lib == "lineairdb-server":
-        return "lineairdb"
+    if lib == "helios-storage":
+        return "storage"
     if "libstdc++" in lib:
         return "libstdcpp"
     return "other_user"
@@ -200,7 +200,7 @@ CATEGORY_LABELS = {
     "sched_yield": "sched_yield (EpochFramework Sync)",
     "network": "Network (TCP + ENA)",
     "kernel_other": "Kernel (other)",
-    "lineairdb": "LineairDB processing",
+    "storage": "Helios processing",
     "alloc": "Allocator (jemalloc)",
     "protobuf": "Protobuf",
     "libstdcpp": "libstdc++",
@@ -220,7 +220,7 @@ CATEGORY_COLORS = {
     "sched_yield": "#e74c3c",
     "network": "#3498db",
     "kernel_other": "#95a5a6",
-    "lineairdb": "#2ecc71",
+    "storage": "#2ecc71",
     "alloc": "#f39c12",
     "protobuf": "#9b59b6",
     "libstdcpp": "#1abc9c",
@@ -254,7 +254,7 @@ def main():
     parser.add_argument("--output", "-o", default=None, help="Output PNG path")
     parser.add_argument("--vcpu", type=int, default=64, help="vCPU count")
     parser.add_argument("--mode", default="server", choices=["server", "proxy"],
-                        help="server (lineairdb) or proxy (mysqld)")
+                        help="server (storage) or proxy (mysqld)")
     args = parser.parse_args()
 
     entries = parse_perf_report(args.input)
@@ -329,7 +329,7 @@ def main():
     ax_pie.legend(wedges, [f"{l} ({s:.1f}%)" for l, s in zip(labels, sizes)],
                   loc="center left", bbox_to_anchor=(-0.45, 0.5), fontsize=7.5)
 
-    mode_label = "LineairDB Server" if args.mode == "server" else "MySQL Proxy"
+    mode_label = "Helios server" if args.mode == "server" else "MySQL Proxy"
     ax_pie.set_title(f"{mode_label}\nCPU Breakdown ({args.vcpu} vCPU)", fontsize=12)
 
     # Panel 2: Top functions bar chart (all categories)

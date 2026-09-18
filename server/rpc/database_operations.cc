@@ -1,4 +1,4 @@
-#include "lineairdb_rpc.hh"
+#include "helios_rpc.hh"
 
 #include <chrono>
 #include <cstdint>
@@ -164,7 +164,7 @@ bool HiddenKeyAllocator::Allocate(helios::storage::Database& database,
     return true;
 }
 
-void LineairDBRpc::handleDbAllocateHiddenKeys(const std::string& message,
+void HeliosRpc::handleDbAllocateHiddenKeys(const std::string& message,
                                               std::string& result) {
     LineairDB::Protocol::DbAllocateHiddenKeys::Request request;
     LineairDB::Protocol::DbAllocateHiddenKeys::Response response;
@@ -199,7 +199,7 @@ void LineairDBRpc::handleDbAllocateHiddenKeys(const std::string& message,
     result = response.SerializeAsString();
 }
 
-void LineairDBRpc::handleDbSetCommitDurability(const std::string& message,
+void HeliosRpc::handleDbSetCommitDurability(const std::string& message,
                                                std::string& result) {
     LineairDB::Protocol::DbSetCommitDurability::Request request;
     LineairDB::Protocol::DbSetCommitDurability::Response response;
@@ -239,7 +239,7 @@ void LineairDBRpc::handleDbSetCommitDurability(const std::string& message,
     result = response.SerializeAsString();
 }
 
-void LineairDBRpc::handleDbCreateTable(const std::string& message,
+void HeliosRpc::handleDbCreateTable(const std::string& message,
                                        std::string& result) {
     LOG_DEBUG("Handling DbCreateTable");
 
@@ -295,7 +295,7 @@ void LineairDBRpc::handleDbCreateTable(const std::string& message,
     result = response.SerializeAsString();
 }
 
-void LineairDBRpc::handleDbCreateSecondaryIndex(const std::string& message,
+void HeliosRpc::handleDbCreateSecondaryIndex(const std::string& message,
                                                 std::string& result) {
     LOG_DEBUG("Handling DbCreateSecondaryIndex");
 

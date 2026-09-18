@@ -1,7 +1,7 @@
 // Executes a read plan: one RPC runs a statement's staged point reads and
 // scans, where a later step builds its keys from what an earlier one read.
 
-#include "lineairdb_rpc.hh"
+#include "helios_rpc.hh"
 
 #include <algorithm>
 #include <cstdint>
@@ -111,7 +111,7 @@ std::string build_plan_key(
 
 }  // namespace
 
-void LineairDBRpc::handleTxExecuteReadPlan(const std::string& message,
+void HeliosRpc::handleTxExecuteReadPlan(const std::string& message,
                                            std::string& result) {
     LineairDB::Protocol::TxExecuteReadPlan::Request request;
     LineairDB::Protocol::TxExecuteReadPlan::Response response;
