@@ -25,6 +25,15 @@ def expect_commit_error(cursor):
         return True
 
 
+def commit_error(cursor):
+    """Run COMMIT; return (errno, message), or (None, "") when it succeeded."""
+    try:
+        cursor.execute("COMMIT")
+        return None, ""
+    except mysql.connector.Error as err:
+        return err.errno, str(err)
+
+
 def test_prefetch_scope(cursor, db):
     print("PREFETCH PLAN PREFETCH SCOPE TEST")
     cursor.execute(
@@ -34,7 +43,7 @@ def test_prefetch_scope(cursor, db):
     cursor.execute("INSERT INTO t VALUES (1,100),(2,200),(3,300)")
     db.commit()
 
-    cursor.execute("SET GLOBAL lineairdb_prefetch_execution=ON")
+    cursor.execute("SET GLOBAL lineairdb_read_path='plan'")
     cursor.execute("SET @_tx_plan='R:t:1;R:t:2;R:t:3'")
     cursor.execute("START TRANSACTION")
     cursor.execute("SELECT v FROM t WHERE id=1")
@@ -66,7 +75,7 @@ def test_conflict_abort():
     try:
         ca.execute(f"USE {DBNAME}")
         cb.execute(f"USE {DBNAME}")
-        ca.execute("SET GLOBAL lineairdb_prefetch_execution=ON")
+        ca.execute("SET GLOBAL lineairdb_read_path='plan'")
         ca.execute("SET @_tx_plan='R:t:1'")
         ca.execute("START TRANSACTION")
         ca.execute("SELECT v FROM t WHERE id=1")
@@ -103,13 +112,28 @@ def test_unique_commit_check(cursor, db):
     cursor.execute("INSERT INTO unique_c VALUES (1,10)")
     db.commit()
 
-    cursor.execute("SET GLOBAL lineairdb_prefetch_execution=ON")
+    cursor.execute("SET GLOBAL lineairdb_read_path='plan'")
     cursor.execute("SET @_tx_plan='R:t:2'")
-    cursor.execute("START TRANSACTION")
-    cursor.execute("SELECT v FROM t WHERE id=2")
-    cursor.fetchone()
-    cursor.execute("INSERT INTO unique_c VALUES (2,10)")
-    if not expect_commit_error(cursor):
+    # unique_checks=1 refuses the duplicate at the INSERT, which is what MySQL
+    # does; turn it off so the commit is the one that refuses the UNIQUE key.
+    cursor.execute("SET SESSION unique_checks = 0")
+    try:
+        cursor.execute("START TRANSACTION")
+        cursor.execute("SELECT v FROM t WHERE id=2")
+        cursor.fetchone()
+        cursor.execute("INSERT INTO unique_c VALUES (2,10)")
+        errno, message = commit_error(cursor)
+    finally:
+        try:
+            cursor.execute("ROLLBACK")
+        except mysql.connector.Error:
+            pass
+        cursor.execute("SET SESSION unique_checks = 1")
+
+    # A commit has no handler in scope, so MySQL wraps handler error 121.
+    if errno != 1180 or "Got error 121" not in message:
+        print(f"\tFailed: expected the commit duplicate (1180 wrapping 121), "
+              f"got {errno} ({message})")
         return 1
 
     cursor.execute("SELECT COUNT(*) FROM unique_c")
@@ -128,7 +152,7 @@ def test_range_clean_commit(cursor, db):
     cursor.execute("INSERT INTO range_clean_t VALUES (1,1),(10,10),(20,20)")
     db.commit()
 
-    cursor.execute("SET GLOBAL lineairdb_prefetch_execution=ON")
+    cursor.execute("SET GLOBAL lineairdb_read_path='plan'")
     cursor.execute("SET @_tx_plan='S:range_clean_t:10:E:30'")
     cursor.execute("START TRANSACTION")
     cursor.execute(
@@ -158,7 +182,7 @@ def test_range_phantom_abort():
         ca.execute("INSERT INTO range_t VALUES (1,1),(10,10),(20,20),(30,30)")
         a.commit()
 
-        ca.execute("SET GLOBAL lineairdb_prefetch_execution=ON")
+        ca.execute("SET GLOBAL lineairdb_read_path='plan'")
         ca.execute("SET @_tx_plan='S:range_t:10:E:30'")
         ca.execute("START TRANSACTION")
         ca.execute(
@@ -204,7 +228,7 @@ def test_range_tombstone_reinsert_abort():
         ca.execute("DELETE FROM tombstone_t WHERE id=15")
         a.commit()
 
-        ca.execute("SET GLOBAL lineairdb_prefetch_execution=ON")
+        ca.execute("SET GLOBAL lineairdb_read_path='plan'")
         ca.execute("SET @_tx_plan='S:tombstone_t:10:E:30'")
         ca.execute("START TRANSACTION")
         ca.execute(
@@ -246,7 +270,7 @@ def test_secondary_range_clean_commit(cursor, db):
     )
     db.commit()
 
-    cursor.execute("SET GLOBAL lineairdb_prefetch_execution=ON")
+    cursor.execute("SET GLOBAL lineairdb_read_path='plan'")
     cursor.execute("SET @_tx_plan='SI:si_range_clean_t:c_idx:10'")
     cursor.execute("START TRANSACTION")
     cursor.execute(
@@ -282,7 +306,7 @@ def test_secondary_range_phantom_abort():
         )
         a.commit()
 
-        ca.execute("SET GLOBAL lineairdb_prefetch_execution=ON")
+        ca.execute("SET GLOBAL lineairdb_read_path='plan'")
         ca.execute("SET @_tx_plan='SI:si_range_t:c_idx:10'")
         ca.execute("START TRANSACTION")
         ca.execute(

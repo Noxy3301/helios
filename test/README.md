@@ -1,48 +1,20 @@
-# How To Test
+# Tests
 
-At first, you must build mysql-server in the `build` directory.
+`test/pytest/` holds the SQL tests; each file is a script that connects to a
+running MySQL on port 3307 and exits non-zero on failure. `test/pytest/tpc-c/`
+holds the TPC-C procedure tests and `test/pytest/utils/` the shared fixtures.
 
-```bash
-./build.sh
-```
-
-Then you have the following executables;
-
-* build/bin/mysqld # server
-* build/bin/mysql  # client
-Before executing testing, you must launch with the initialization of mysql-server as the following:
+Build the tree and run every test, or a named subset, with the runner, which
+starts and stops the storage server and MySQL itself:
 
 ```bash
-# initialize
-mkdir -p build/data
-build/bin/mysqld --defaults-file=tests/my.cnf --initialize
-
-# run mysql-server
-build/bin/mysqld --defaults-file=tests/my.cnf
+./scripts/build.sh
+python3 test/run_tests.py            # every test
+python3 test/run_tests.py insert.py select   # named tests
 ```
 
-Next, see `build/my/error.log` and get the initial password of `root` user.
-To testing, you should change the password to empty string:
+The tests need `mysql-connector-python`:
 
 ```bash
-mysqladmin -uroot -p'oldpassword' password ''
+pip3 install -r test/pytest/requirements.txt
 ```
-
-Then, install the generated plugin of this repository into mysql-server:
-
-```mysql
-mysql> install plugin lineairdb soname 'ha_lineairdb_storage_engine.so';
-Query OK, 0 rows affected (0.80 sec)
-```
-
-At this time you can do testing.
-To check all tests, execute the following command.
-```
-find tests/pytest/*.py | xargs -n 1 sh -c 'python3 $0'
-```
-
-For python tests, install mysql-connector-python. 
-```
-pip3 install -r tests/pytest/requirements.txt
-```
-

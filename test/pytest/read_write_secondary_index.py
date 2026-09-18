@@ -12,7 +12,7 @@ def test_write_operation(db, cursor):
     
     cursor.execute(f'''CREATE TABLE ha_lineairdb_test.{table_name} (
         title VARCHAR(50) NOT NULL,
-        content TEXT,
+        content VARCHAR(255),
         INDEX title_idx (title)
     ) ENGINE = LineairDB''')
     db.commit()
@@ -41,7 +41,7 @@ def test_read_operation(db, cursor):
     
     cursor.execute(f'''CREATE TABLE ha_lineairdb_test.{table_name} (
         title VARCHAR(50) NOT NULL,
-        content TEXT,
+        content VARCHAR(255),
         INDEX title_idx (title)
     ) ENGINE = LineairDB''')
     db.commit()

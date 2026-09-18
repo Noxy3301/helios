@@ -482,7 +482,7 @@ def run_benchmarks(args, run_id):
     bench_vars = f"bench_type={args.bench_type}"
     if args.bench_scalefactor:
         bench_vars += f" bench_scalefactor={args.bench_scalefactor}"
-    if args.bench_analyze or args.bench_prefetch:
+    if args.bench_analyze or args.tx_plan:
         bench_vars += " bench_analyze=true"
     if args.engine == "innodb":
         # Reaches benchbase.yml directly and measure_usage.yml via exec_vars
@@ -514,10 +514,9 @@ def run_benchmarks(args, run_id):
         exec_vars += f" bench_serial={'true' if args.bench_serial else 'false'}"
     if args.bench_profile:
         exec_vars += f" bench_profile={args.bench_profile}"
-    if args.bench_prefetch or args.bench_prefetch_stmt:
-        exec_vars += " bench_prefetch=true"
-    if args.bench_prefetch_stmt:
-        exec_vars += " bench_prefetch_plan=false"
+    exec_vars += f" bench_read_path={args.read_path}"
+    if args.tx_plan:
+        exec_vars += " bench_tx_plan=true"
     if args.bench_ndv_drift:
         exec_vars += " bench_ndv_drift=true"
     if args.perf:
@@ -680,7 +679,8 @@ def main():
 Examples:
   python3 py/bench_aws.py --bench-type ycsb --bench-profile b
   python3 py/bench_aws.py --bench-type tpcc --bench-terms 1,16,64,128
-  python3 py/bench_aws.py --bench-type tpcc --bench-prefetch --bench-terms 1,16,64,128
+  python3 py/bench_aws.py --bench-type tpcc --tx-plan --bench-terms 1,16,64,128
+  python3 py/bench_aws.py --bench-type tpcc --read-path row --bench-terms 1,16,64,128
   python3 py/bench_aws.py --bench-type tpch --bench-scalefactor 0.1
   python3 py/bench_aws.py --bench-type tpch --bench-serial false --bench-terms 1,2,4,8 --bench-scalefactor 0.01
   python3 py/bench_aws.py --durability sync --epoch-ms 1 --wal-gib 300
@@ -695,7 +695,7 @@ Examples:
                         help="Storage engine under test (default: lineairdb, the full Helios "
                              "stack). innodb runs the same sweep against a single stock "
                              "MySQL/InnoDB node instead: no LineairDB storage server, "
-                             "--mysql-count fixed at 1, no prefetch/ndv-drift options; size "
+                             "--mysql-count fixed at 1, no read-path/ndv-drift options; size "
                              "its --mysql-instance-type like the Helios storage node so the "
                              "buffer pool holds the dataset")
     parser.add_argument("--innodb-buffer-pool-gib", type=int, default=None,
@@ -709,24 +709,22 @@ Examples:
     parser.add_argument("--bench-profile", default=None, help="YCSB profile: a,b,c,e,f")
     parser.add_argument("--bench-serial", default=None, type=lambda x: x.lower() == "true",
                         help="TPC-H serial mode (true/false)")
-    parser.add_argument("--bench-prefetch", action="store_true",
-                        help="Run BenchBase in Helios prefetch mode "
-                             "(SET GLOBAL lineairdb_prefetch_execution=ON on every MySQL "
-                             "and HELIOS_PREFETCH_PLAN=1 env for the executor, so the "
-                             "TPC-C procedures inject @_tx_plan)")
-    parser.add_argument("--bench-prefetch-stmt", action="store_true",
-                        help="Statement-scoped autogen prefetch: "
-                             "SET GLOBAL lineairdb_prefetch_execution=ON WITHOUT "
-                             "HELIOS_PREFETCH_PLAN, so the proxy derives a per-statement "
-                             "read plan from the QEP instead of the injected @_tx_plan DSL")
+    parser.add_argument("--read-path", choices=["row", "plan"], default="plan",
+                        help="SET GLOBAL lineairdb_read_path on every MySQL: row sends one "
+                             "request per handler call, plan stages a read plan per "
+                             "statement (default: plan)")
+    parser.add_argument("--tx-plan", action="store_true",
+                        help="Pass HELIOS_PREFETCH_PLAN=1 to BenchBase so the TPC-C "
+                             "procedures inject @_tx_plan, instead of the per-statement "
+                             "plan the proxy derives from the QEP")
     parser.add_argument("--bench-ndv-drift", action="store_true",
                         help="SET GLOBAL lineairdb_stats_drift_refresh=ON "
                              "(default OFF: the NDV/histogram recompute is synchronous "
                              "on the read path)")
     parser.add_argument("--bench-analyze", action="store_true",
-                        help="Run ANALYZE TABLE after load (on automatically for tx-prefetch "
-                             "and for --engine innodb; stmt-prefetch and plain mode read live "
-                             "row counts from the storage server)")
+                        help="Run ANALYZE TABLE after load (on automatically for --tx-plan "
+                             "and for --engine innodb; the statement-scoped read plan reads "
+                             "live row counts from the storage server)")
     parser.add_argument("--perf", action="store_true", help="Enable perf profiling on lineairdb + mysql nodes")
     parser.add_argument("--load-jstack", action="store_true",
                         help="Take one thread dump of the loader JVM mid-load (diagnostic; "
@@ -737,13 +735,14 @@ Examples:
                              "and the sweep; degrades to a logged note if perf is unavailable")
 
     # Durability / WAL options
-    parser.add_argument("--durability", default="volatile", choices=["volatile", "async", "sync"],
-                        help="LineairDB commit durability contract (default: volatile)")
+    parser.add_argument("--durability", default="sync", choices=["async", "sync"],
+                        help="LineairDB commit durability contract (default: sync)")
     parser.add_argument("--load-durability", default="same", choices=["same", "async"],
                         help="Commit durability for the load phase only (default: same, the "
                              "load runs under --durability). async loads under the Async "
-                             "contract and makes every acknowledged write durable before the "
-                             "sweep starts; needs --durability sync")
+                             "contract and switches the server to Sync before the sweep; the "
+                             "switch waits for no barrier and makes no earlier write durable; "
+                             "needs --durability sync")
     parser.add_argument("--epoch-ms", type=int, default=None,
                         help="Epoch duration in ms (default: server default)")
     parser.add_argument("--wal-gib", type=int, default=0,
@@ -796,8 +795,8 @@ Examples:
     args = parser.parse_args()
     if args.deadman_minutes < 1:
         parser.error("--deadman-minutes must be at least 1")
-    if args.bench_prefetch and args.bench_prefetch_stmt:
-        parser.error("--bench-prefetch and --bench-prefetch-stmt are mutually exclusive")
+    if args.read_path == "row" and args.tx_plan:
+        parser.error("--read-path row and --tx-plan are mutually exclusive")
     if args.cleanup_only and not args.cleanup_all and not args.cleanup_run_id:
         parser.error("--cleanup-only requires --cleanup-run-id <run_id> or --cleanup-all")
     if (args.cleanup_all or args.cleanup_run_id) and not args.cleanup_only:
@@ -827,10 +826,10 @@ Examples:
     if args.engine == "innodb":
         if args.mysql_count is not None and args.mysql_count != 1:
             parser.error("--engine innodb runs a single MySQL/InnoDB node; --mysql-count must be 1")
-        if args.bench_prefetch or args.bench_prefetch_stmt or args.bench_ndv_drift:
+        if args.read_path != "plan" or args.tx_plan or args.bench_ndv_drift:
             parser.error("--engine innodb has no LineairDB sysvars; "
-                         "--bench-prefetch, --bench-prefetch-stmt and --bench-ndv-drift are not supported")
-        if args.durability != "volatile" or args.epoch_ms is not None or args.server_env or args.flush_trace:
+                         "--read-path, --tx-plan and --bench-ndv-drift are not supported")
+        if args.durability != "sync" or args.epoch_ms is not None or args.server_env or args.flush_trace:
             parser.error("--durability/--epoch-ms/--server-env/--flush-trace configure the LineairDB server; "
                          "not valid with --engine innodb")
         if args.lineairdb_instance_type is not None:
@@ -872,14 +871,13 @@ Examples:
     global LOG_FILE
     # Keep concurrent invocations in distinct Run scopes
     run_id = datetime.now().strftime("%Y%m%d-%H%M%S") + f"-{secrets.token_hex(2)}"
-    if args.bench_prefetch_stmt:
-        run_id += "-prefetch-stmt"
-    elif args.bench_prefetch:
-        run_id += "-prefetch"
+    if args.read_path != "plan":
+        run_id += f"-{args.read_path}"
+    if args.tx_plan:
+        run_id += "-txplan"
     if args.bench_ndv_drift:
         run_id += "-ndvdrift"
-    if args.durability != "volatile":
-        run_id += f"-{args.durability}"
+    run_id += f"-{args.durability}"
     if args.load_durability != "same":
         run_id += f"-ld{args.load_durability}"
     if args.epoch_ms is not None:

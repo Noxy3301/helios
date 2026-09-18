@@ -18,6 +18,7 @@ void ha_lineairdb::reset_index_search_buffers() {
   secondary_index_payloads_.clear();
   current_position_in_index_ = 0;
   materialized_scan_truncated_ = false;
+  truncated_scan_end_.clear();
   index_cursor_active_ = false;
   index_cursor_reverse_ = false;
   index_cursor_secondary_ = false;
@@ -33,33 +34,32 @@ bool ha_lineairdb::refill_index_cursor(LineairDBTransaction *tx) {
 
   if (index_cursor_at_eof_) return false;
 
-  // A reverse prefetch cursor serves exactly one staged tail window, and a
-  // refill past it asks for rows the window never held. A complete walk of
-  // exactly the window size cannot be told apart from more, and rejects too.
-  if (tx->is_prefetch_mode() && index_cursor_reverse_ &&
-      !index_cursor_end_key_.empty()) {
-    prefetch_reject_unsupported(ha_thd(), tx,
-                                "reverse cursor past the staged tail window");
-    return false;
-  }
-
   if (index_cursor_secondary_) {
-    // The existing tail-entry RPC returns one complete secondary-key group.
-    // Using that group as the next exclusive end preserves the original
+    // One batch of complete secondary-key groups at a time. The lowest group
+    // in it is the next exclusive end, which preserves the original
     // (secondary key, primary key) order without materializing the full index.
-    auto entry = tx->fetch_last_secondary_entry_in_range(
-        current_index_name, index_cursor_start_key_, index_cursor_end_key_);
-    if (!entry.has_value()) {
+    auto batch = tx->fetch_secondary_batch_below(
+        current_index_name, index_cursor_start_key_, index_cursor_end_key_,
+        INDEX_CURSOR_BATCH_SIZE);
+    if (!batch.has_value()) {
       index_cursor_at_eof_ = true;
       return false;
     }
-    index_cursor_end_key_ = entry->secondary_key;
-    secondary_index_results_ = std::move(entry->primary_keys);
+    // The cursor consumes the vector from its tail, so flatten the groups the
+    // other way round: ascending by secondary key, ascending within a group.
+    index_cursor_end_key_ = batch->groups.back().secondary_key;
+    index_cursor_at_eof_ = !batch->more_below;
+    for (auto group = batch->groups.rbegin(); group != batch->groups.rend();
+         ++group) {
+      for (auto &primary_key : group->primary_keys) {
+        secondary_index_results_.push_back(std::move(primary_key));
+      }
+    }
     batch_fetch_secondary_payloads(tx);
   } else {
     auto key_values = tx->get_matching_keys_and_values_in_range(
         index_cursor_start_key_, index_cursor_end_key_,
-        INDEX_CURSOR_READ_AHEAD_SIZE, index_cursor_reverse_);
+        INDEX_CURSOR_BATCH_SIZE, index_cursor_reverse_);
     if (key_values.empty()) {
       index_cursor_at_eof_ = true;
       return false;
@@ -77,7 +77,7 @@ bool ha_lineairdb::refill_index_cursor(LineairDBTransaction *tx) {
       // strictly greater than this complete serialized index key.
       index_cursor_start_key_.push_back('\0');
     }
-    index_cursor_at_eof_ = fetched < INDEX_CURSOR_READ_AHEAD_SIZE;
+    index_cursor_at_eof_ = fetched < INDEX_CURSOR_BATCH_SIZE;
 
     secondary_index_results_.reserve(fetched);
     secondary_index_payloads_.reserve(fetched);
@@ -92,6 +92,32 @@ bool ha_lineairdb::refill_index_cursor(LineairDBTransaction *tx) {
       index_cursor_reverse_
           ? static_cast<uint>(secondary_index_results_.size() - 1)
           : 0;
+  return true;
+}
+
+bool ha_lineairdb::refill_truncated_scan(LineairDBTransaction *tx) {
+  materialized_scan_truncated_ = false;
+  if (secondary_index_results_.empty()) return false;
+
+  // The window stopped at its last key; ask the storage for the rest of the
+  // range the statement wanted. LineairDB ranges are [start, end), so the
+  // smallest key above a complete serialized key is that key plus NUL.
+  std::string start_key = secondary_index_results_.back();
+  start_key.push_back('\0');
+
+  auto key_values =
+      tx->get_matching_keys_and_values_in_range(start_key, truncated_scan_end_);
+  if (tx->is_aborted() || key_values.empty()) return false;
+
+  secondary_index_results_.clear();
+  secondary_index_payloads_.clear();
+  current_position_in_index_ = 0;
+  secondary_index_results_.reserve(key_values.size());
+  secondary_index_payloads_.reserve(key_values.size());
+  for (auto &kv : key_values) {
+    secondary_index_results_.push_back(std::move(kv.first));
+    secondary_index_payloads_.push_back(std::move(kv.second));
+  }
   return true;
 }
 
@@ -185,11 +211,6 @@ int ha_lineairdb::index_read_map(uchar *buf, const uchar *key,
   }
 
   tx->choose_table(db_table_name);
-  if (!pushed_filter_serialized_.empty()) {
-    tx->set_pushed_filter(pushed_filter_serialized_);
-  } else {
-    tx->clear_pushed_filter();
-  }
 
   KEY *key_info = &table->key_info[active_index];
 
@@ -203,17 +224,6 @@ int ha_lineairdb::index_read_map(uchar *buf, const uchar *key,
       return err;
     }
     return execute_plan(buf, tx);
-  }
-
-  // A legacy single-table DML staged its plan on the first handler access; a
-  // second handler access here means the statement spans multiple index ranges
-  // (e.g. index merge over different indexes), which the single staged plan
-  // cannot cover. Reject loudly (no-fallback) rather than let the read miss the
-  // cache and surface as a retryable deadlock, which would livelock on retry.
-  if (tx->is_prefetch_mode() && !tx->tx_plan_used() &&
-      tx->is_autogen_stmt_handler_deferred()) {
-    return prefetch_reject_unsupported(
-        ha_thd(), tx, "legacy DML multi-index access (index merge)");
   }
 
   // The optimizer has run, so the SELECT/generic-DML QEP is available.
@@ -243,11 +253,12 @@ int ha_lineairdb::index_next(uchar *buf) {
   // Consume materialized index results.
   if (secondary_index_results_.empty() ||
       current_position_in_index_ >= secondary_index_results_.size()) {
-    if (materialized_scan_truncated_ && !secondary_index_results_.empty()) {
-      tx->fallback_to_normal_transaction("read past limit-staged scan");
-      return abort_errno(tx);
+    if (materialized_scan_truncated_ && !refill_truncated_scan(tx)) {
+      return tx->is_aborted() ? abort_errno(tx) : HA_ERR_END_OF_FILE;
     }
-    return HA_ERR_END_OF_FILE;
+    if (current_position_in_index_ >= secondary_index_results_.size()) {
+      return HA_ERR_END_OF_FILE;
+    }
   }
 
   return fetch_and_set_current_result(buf, tx);
@@ -266,11 +277,12 @@ int ha_lineairdb::index_next_same(uchar *buf, const uchar *key [[maybe_unused]],
   // Consume materialized index results.
   if (secondary_index_results_.empty() ||
       current_position_in_index_ >= secondary_index_results_.size()) {
-    if (materialized_scan_truncated_ && !secondary_index_results_.empty()) {
-      tx->fallback_to_normal_transaction("read past limit-staged scan");
-      return abort_errno(tx);
+    if (materialized_scan_truncated_ && !refill_truncated_scan(tx)) {
+      return tx->is_aborted() ? abort_errno(tx) : HA_ERR_END_OF_FILE;
     }
-    return HA_ERR_END_OF_FILE;
+    if (current_position_in_index_ >= secondary_index_results_.size()) {
+      return HA_ERR_END_OF_FILE;
+    }
   }
 
   return fetch_and_set_current_result(buf, tx);
@@ -328,19 +340,11 @@ int ha_lineairdb::index_last(uchar *buf) {
   tx->choose_table(db_table_name);
 
   // A key-less tail seek carries no range for QEP autogen to cover (an
-  // unbounded MAX reaches it straight from the optimizer). Stage the last-N
-  // window on demand; tx-scoped plans and secondary tails keep the loud reject.
-  if (tx->is_prefetch_mode()) {
-    if (tx->tx_plan_used()) {
-      return prefetch_reject_unsupported(ha_thd(), tx,
-                                         "index_last access (tx-scoped plan)");
-    }
-    if (active_index != table->s->primary_key) {
-      return prefetch_reject_unsupported(ha_thd(), tx,
-                                         "secondary index tail access");
-    }
+  // unbounded MAX reaches it straight from the optimizer), so stage the
+  // last-N window on demand. A secondary tail walks the index cursor instead.
+  if (active_index == table->s->primary_key) {
     if (int err = maybe_prefetch_for_index_tail(ha_thd(), tx, db_table_name,
-                                                INDEX_CURSOR_READ_AHEAD_SIZE)) {
+                                                INDEX_CURSOR_BATCH_SIZE)) {
       return err;
     }
   }

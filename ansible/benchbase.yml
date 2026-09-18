@@ -95,7 +95,7 @@
     ena_rss_interface: ens5
     mysql_engine: lineairdb
     # InnoDB persistent stats are sampled, so a post-load ANALYZE refreshes them;
-    # Helios defaults to false and bench_aws.py turns it on for tx-prefetch
+    # Helios defaults to false and bench_aws.py turns it on for --tx-plan runs
     bench_analyze: "{{ mysql_engine == 'innodb' }}"
     # Defer UNIQUE secondary-index checks during the load phase. InnoDB: false,
     # it change-buffers the deferred inserts and merges them under the sweep.
@@ -329,9 +329,10 @@
       delegate_to: "{{ groups['benchbase'][0] }}"
 
     - name: "Refresh MySQL stats with ANALYZE TABLE on each MySQL ({{ bench_type | upper }})"
-      # stmt-prefetch and plain mode read live row counts from the storage server;
-      # only tx-prefetch needs ANALYZE, because MySQL's plan must match its
-      # @_tx_plan DSL or every prefetch attempt misses. The timeout bounds a hang here
+      # The statement-scoped read plan reads live row counts from the storage
+      # server; only an injected @_tx_plan needs ANALYZE, because MySQL's chosen
+      # plan must match the DSL or every staged read misses. The timeout bounds a
+      # hang here
       when: bench_analyze | bool
       shell: |
         timeout -k 60 {{ bench_analyze_timeout | default(3600) }} \

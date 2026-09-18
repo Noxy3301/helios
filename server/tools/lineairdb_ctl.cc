@@ -24,8 +24,8 @@ namespace {
 using DurabilityRpc = LineairDB::Protocol::DbSetCommitDurability;
 
 constexpr unsigned long kMaxPort = 65535;
-// Outlasts the server's fixed one-hour barrier
-constexpr long kReceiveTimeoutSeconds = 60 * 60 + 30;
+// The switch is a store on the server, so a reply is immediate or never
+constexpr long kReceiveTimeoutSeconds = 30;
 
 int fail(const std::string &text) {
   std::fprintf(stderr, "error: %s\n", text.c_str());
@@ -90,7 +90,6 @@ int connect_to(const sockaddr_in &address) {
 bool exchange(int fd, MessageType type, const std::string &request,
               std::string &response) {
   MessageHeader header{};
-  header.sender_id = htobe64(1);
   header.message_type = htonl(static_cast<uint32_t>(type));
   header.payload_size = htonl(static_cast<uint32_t>(request.size()));
 

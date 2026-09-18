@@ -10,6 +10,8 @@ build-v3
 boost
 
 lineairdb_logs
+helios_wal
+.related_work
 
 bench/benchbase-mysql/
 bench/results

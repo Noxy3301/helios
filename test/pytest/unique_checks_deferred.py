@@ -1,9 +1,13 @@
-"""UNIQUE secondary index behaviour under unique_checks=0.
+"""UNIQUE secondary index behaviour under unique_checks.
 
-The index write is buffered with the row instead of taking a synchronous RPC,
-so the server enforces uniqueness when the buffer is written. These cases check
-that a duplicate is still refused: within a statement, across the auto-flush
-batch boundary, across sessions, and on the losing side of a commit race.
+The contract:
+  - unique_checks=1: the statement probes each UNIQUE key it adds and reports
+    ER_DUP_ENTRY (1062) itself, or 1213 when one of the transaction's earlier
+    reads went stale first, which makes the duplicate a lost race.
+  - unique_checks=0: no probe. The INSERT succeeds and the commit refuses the
+    key, arriving as 1180 wrapping handler error 121.
+  - Either way, a duplicate of an index entry this transaction wrote itself is
+    1062 at the statement: no request settles it.
 """
 import argparse
 import json
@@ -29,21 +33,19 @@ ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)
 # The RPC-shape case runs its own traced mysqld so the shared one is untouched
 RPC_TRACE_PORT = 3308
 RPC_TRACE_ROWS = 5
-# write_row's synchronous branch issues one of these per row; the deferred
-# branch issues none and leaves the index write to the batched write.
-SYNC_INDEX_RPC = "TX_WRITE_SECONDARY_INDEX"
-BATCHED_WRITE_RPC = "TX_BATCH_WRITE"
+# write_row probes one of these per row it adds a UNIQUE key for; without
+# unique_checks it probes nothing and the commit carries the index write.
+UNIQUE_PROBE_RPC = "TX_SCAN_INDEX"
+COMMIT_RPC = "TX_COMMIT"
 
 _table_seq = 0
 _last_error_message = ""
 
 
-def is_conflict(errno):
-    """A duplicate unique key is an OCC abort: 1213 when a statement's own
-    flush reports it, or 1180 wrapping handler error 149 when the commit does,
-    which has no handler in scope."""
-    return errno == 1213 or (errno == 1180 and
-                             "Got error 149" in _last_error_message)
+def is_commit_duplicate(errno):
+    """A commit has no handler in scope, so a duplicate it refuses can only
+    arrive wrapped; a bare 1062 there would mean detection moved phases."""
+    return errno == 1180 and "Got error 121" in _last_error_message
 
 
 def reset(db, cursor):
@@ -72,11 +74,11 @@ def create_table(cursor, unique_index=True, second_index=False):
     return table
 
 
-# One row buffers two ops (row write + index write), so a statement of this many
-# rows crosses WRITE_BATCH_SIZE and the buffer auto-flushes mid-statement.
-# This and the 1024/1025 boundary probes below assume WRITE_BATCH_SIZE = 1024
-# (proxy/lineairdb_transaction.hh).
-AUTO_FLUSH_ROWS = 1100
+# Enough rows that one statement carries more than the 1024-key probe batch
+# (proxy/ha_lineairdb.hh kInsertProbeBatch). Only a unique_checks=1 statement
+# probes, so the cases below that turn it off just exercise one commit
+# carrying more than 1024 writes.
+BULK_ROWS = 1100
 
 
 def bulk_rows(count, duplicate_of=None, duplicate_at=None):
@@ -155,14 +157,16 @@ def test_distinct_rows_commit(cursor):
 
 
 def test_duplicate_within_statement(cursor):
+    # Row 2 duplicates an index entry row 1 of the same statement wrote, so it
+    # is 1062 at the statement even without unique_checks.
     print("UNIQUE_CHECKS=0: DUPLICATE WITHIN ONE STATEMENT TEST")
     cursor.execute("SET SESSION unique_checks = 0")
     table = create_table(cursor)
 
     errno = run(cursor, insert_sql(
         table, [(1, 'dup@example.com', 'first'), (2, 'dup@example.com', 'second')]))
-    if errno != 1213:
-        print(f"\tFailed: expected 1213 on the statement, got {errno}")
+    if errno != 1062:
+        print(f"\tFailed: expected 1062 on the statement, got {errno}")
         return 1
 
     total = row_count(cursor, table)
@@ -176,6 +180,8 @@ def test_duplicate_within_statement(cursor):
 
 
 def test_duplicate_of_committed_row(cursor):
+    # Nothing local answers for the committed row, and no probe runs, so the
+    # commit of the autocommit statement is what refuses it.
     print("UNIQUE_CHECKS=0: DUPLICATE OF COMMITTED ROW TEST")
     cursor.execute("SET SESSION unique_checks = 0")
     table = create_table(cursor)
@@ -186,8 +192,9 @@ def test_duplicate_of_committed_row(cursor):
         return 1
 
     errno = run(cursor, insert_sql(table, [(2, 'taken@example.com', 'second')]))
-    if errno != 1213:
-        print(f"\tFailed: expected 1213 on the statement, got {errno}")
+    if not is_commit_duplicate(errno):
+        print(f"\tFailed: expected the commit duplicate, got {errno} "
+              f"({_last_error_message})")
         return 1
 
     total = row_count(cursor, table)
@@ -201,8 +208,8 @@ def test_duplicate_of_committed_row(cursor):
 
 
 def test_duplicate_within_transaction(cursor):
-    # The deferral is within a statement: an INSERT sends its own rows before
-    # it returns, so the second one is rejected then, not on the COMMIT.
+    # The first INSERT's index entry is this transaction's own write, so the
+    # second statement reports it without asking the storage.
     print("UNIQUE_CHECKS=0: DUPLICATE INSIDE ONE TRANSACTION TEST")
     cursor.execute("SET SESSION unique_checks = 0")
     table = create_table(cursor)
@@ -219,8 +226,8 @@ def test_duplicate_within_transaction(cursor):
     if errno is None:
         print("\tFailed: the second INSERT was accepted, expected a duplicate")
         return 1
-    if errno != 1213:
-        print(f"\tFailed: expected 1213 on the second INSERT, got {errno}")
+    if errno != 1062:
+        print(f"\tFailed: expected 1062 on the second INSERT, got {errno}")
         return 1
 
     total = row_count(cursor, table)
@@ -233,15 +240,15 @@ def test_duplicate_within_transaction(cursor):
     return 0
 
 
-def test_unique_checks_on_is_unchanged(cursor):
-    print("UNIQUE_CHECKS=1: BASELINE UNCHANGED TEST")
+def test_unique_checks_on_reports_at_the_statement(cursor):
+    print("UNIQUE_CHECKS=1: DUPLICATE AT THE STATEMENT TEST")
     cursor.execute("SET SESSION unique_checks = 1")
     table = create_table(cursor)
 
     errno = run(cursor, insert_sql(
         table, [(1, 'strict@example.com', 'first'), (2, 'strict@example.com', 'second')]))
-    if errno != 1213:
-        print(f"\tFailed: expected 1213 on the statement, got {errno}")
+    if errno != 1062:
+        print(f"\tFailed: expected 1062 on the statement, got {errno}")
         return 1
 
     errno = run(cursor, insert_sql(table, [(3, 'strict@example.com', 'third')]))
@@ -250,8 +257,8 @@ def test_unique_checks_on_is_unchanged(cursor):
         return 1
 
     errno = run(cursor, insert_sql(table, [(4, 'strict@example.com', 'fourth')]))
-    if errno != 1213:
-        print(f"\tFailed: expected 1213 on the statement, got {errno}")
+    if errno != 1062:
+        print(f"\tFailed: expected 1062 on the statement, got {errno}")
         return 1
 
     duplicate_sql = insert_sql(table, [(6, 'strict2@example.com', 'sixth')])
@@ -259,8 +266,8 @@ def test_unique_checks_on_is_unchanged(cursor):
         insert_sql(table, [(5, 'strict2@example.com', 'fifth')]),
         duplicate_sql,
     ])
-    if errno != 1213 or failed_at != duplicate_sql:
-        print(f"\tFailed: expected 1213 on the second INSERT, got {errno} on {failed_at}")
+    if errno != 1062 or failed_at != duplicate_sql:
+        print(f"\tFailed: expected 1062 on the second INSERT, got {errno} on {failed_at}")
         return 1
 
     total = row_count(cursor, table)
@@ -301,12 +308,12 @@ def test_insert_then_update(cursor, unique_checks, unique_index=True):
     return 0
 
 
-def test_auto_flush_distinct(cursor):
-    print("UNIQUE_CHECKS=0: AUTO-FLUSH BOUNDARY, DISTINCT KEYS TEST")
+def test_bulk_distinct(cursor):
+    print("UNIQUE_CHECKS=0: BULK STATEMENT, DISTINCT KEYS TEST")
     cursor.execute("SET SESSION unique_checks = 0")
     table = create_table(cursor)
 
-    rows = bulk_rows(AUTO_FLUSH_ROWS)
+    rows = bulk_rows(BULK_ROWS)
     errno = run(cursor, insert_sql(table, rows))
     if errno is not None:
         print(f"\tFailed: bulk insert rejected with {errno}")
@@ -318,28 +325,28 @@ def test_auto_flush_distinct(cursor):
                    f"AND uval <= '{rows[-1][1]}'")
     by_index = cursor.fetchone()[0]
     boundary = {i: index_ids(cursor, table, rows[i - 1][1])
-                for i in (1, 1024, 1025, AUTO_FLUSH_ROWS)}
-    if (total != AUTO_FLUSH_ROWS or by_index != AUTO_FLUSH_ROWS
+                for i in (1, 1024, 1025, BULK_ROWS)}
+    if (total != BULK_ROWS or by_index != BULK_ROWS
             or any(ids != [i] for i, ids in boundary.items())):
         print(f"\tFailed: {total} rows by primary key, {by_index} by unique index, "
-              f"boundary lookups {boundary}, expected {AUTO_FLUSH_ROWS}")
+              f"boundary lookups {boundary}, expected {BULK_ROWS}")
         return 1
 
     print("\tPassed!")
     return 0
 
 
-def test_auto_flush_duplicate_across_batches(cursor):
-    print("UNIQUE_CHECKS=0: AUTO-FLUSH BOUNDARY, DUPLICATE ACROSS BATCHES TEST")
+def test_bulk_duplicate_across_batches(cursor):
+    print("UNIQUE_CHECKS=0: BULK STATEMENT, DUPLICATE PAST THE FIRST BATCH TEST")
     cursor.execute("SET SESSION unique_checks = 0")
     table = create_table(cursor)
 
-    # Row 5 leaves with an auto-flushed batch, its duplicate at row 1030 only
-    # later, so the server has to reject a duplicate spanning two batches.
-    rows = bulk_rows(AUTO_FLUSH_ROWS, duplicate_of=5, duplicate_at=1030)
+    # Row 1030 duplicates row 5 of the same statement, past the 1024-key probe
+    # batch: the write set still answers, so it is 1062 at the statement.
+    rows = bulk_rows(BULK_ROWS, duplicate_of=5, duplicate_at=1030)
     errno = run(cursor, insert_sql(table, rows))
-    if errno != 1213:
-        print(f"\tFailed: expected 1213 on the statement, got {errno}")
+    if errno != 1062:
+        print(f"\tFailed: expected 1062 on the statement, got {errno}")
         return 1
 
     total = row_count(cursor, table)
@@ -351,43 +358,42 @@ def test_auto_flush_duplicate_across_batches(cursor):
     return 0
 
 
-def test_auto_flush_distinct_two_indexes(cursor):
-    # Three ops per row do not divide the batch, so rows straddle the flush
-    # boundary. Every one of them still has to land.
-    print("UNIQUE_CHECKS=0: AUTO-FLUSH BOUNDARY, TWO INDEXES, DISTINCT KEYS TEST")
+def test_bulk_distinct_two_indexes(cursor):
+    # Two index entries per row on top of the row itself; every one of them
+    # still has to land.
+    print("UNIQUE_CHECKS=0: BULK STATEMENT, TWO INDEXES, DISTINCT KEYS TEST")
     cursor.execute("SET SESSION unique_checks = 0")
     table = create_table(cursor, second_index=True)
 
-    rows = bulk_rows(AUTO_FLUSH_ROWS)
+    rows = bulk_rows(BULK_ROWS)
     errno = run(cursor, insert_sql(table, rows))
     if errno is not None:
         print(f"\tFailed: bulk insert rejected with {errno}")
         return 1
 
     total = row_count(cursor, table)
-    # 1024 ops is 341 whole rows plus one op, so row 342 is the split one
     boundary = {i: index_ids(cursor, table, rows[i - 1][1])
-                for i in (1, 341, 342, 343, AUTO_FLUSH_ROWS)}
-    if total != AUTO_FLUSH_ROWS or any(ids != [i] for i, ids in boundary.items()):
+                for i in (1, 341, 342, 343, BULK_ROWS)}
+    if total != BULK_ROWS or any(ids != [i] for i, ids in boundary.items()):
         print(f"\tFailed: {total} rows by primary key, boundary lookups "
-              f"{boundary}, expected {AUTO_FLUSH_ROWS}")
+              f"{boundary}, expected {BULK_ROWS}")
         return 1
 
     print("\tPassed!")
     return 0
 
 
-def test_auto_flush_duplicate_two_indexes(cursor):
-    # Three ops per row, so a row's index writes land in the batch after its
-    # own row write. The rejection still belongs to the statement.
-    print("UNIQUE_CHECKS=0: AUTO-FLUSH BOUNDARY, TWO INDEXES TEST")
+def test_bulk_duplicate_two_indexes(cursor):
+    # A second, non-unique index alongside the UNIQUE one does not change who
+    # reports the duplicate.
+    print("UNIQUE_CHECKS=0: BULK STATEMENT, TWO INDEXES TEST")
     cursor.execute("SET SESSION unique_checks = 0")
     table = create_table(cursor, second_index=True)
 
-    rows = bulk_rows(AUTO_FLUSH_ROWS, duplicate_of=5, duplicate_at=1030)
+    rows = bulk_rows(BULK_ROWS, duplicate_of=5, duplicate_at=1030)
     errno = run(cursor, insert_sql(table, rows))
-    if errno != 1213:
-        print(f"\tFailed: expected 1213 on the statement, got {errno}")
+    if errno != 1062:
+        print(f"\tFailed: expected 1062 on the statement, got {errno}")
         return 1
 
     total = row_count(cursor, table)
@@ -411,7 +417,39 @@ def start_statement(cursor, sql):
     return thread, outcome
 
 
+def test_bulk_duplicate_past_probe_batch(cursor):
+    # The duplicate is of a committed row, so only a storage probe finds it,
+    # and it sits past the first 1024-key probe request: the second batch is
+    # what has to report it, at the statement.
+    print("UNIQUE_CHECKS=1: BULK STATEMENT, DUPLICATE PAST THE PROBE BATCH TEST")
+    cursor.execute("SET SESSION unique_checks = 1")
+    table = create_table(cursor)
+
+    taken = 1030
+    rows = bulk_rows(BULK_ROWS)
+    errno = run(cursor, insert_sql(table, [rows[taken - 1]]))
+    if errno is not None:
+        print(f"\tFailed: the seed insert was rejected with {errno}")
+        return 1
+
+    errno = run(cursor, insert_sql(table, rows))
+    if errno != 1062:
+        print(f"\tFailed: expected 1062 on the statement, got {errno} "
+              f"({_last_error_message})")
+        return 1
+
+    total = row_count(cursor, table)
+    if total != 1:
+        print(f"\tFailed: table has {total} rows, expected the seeded 1")
+        return 1
+
+    print(f"\tPassed! (row {taken} rejected with {errno})")
+    return 0
+
+
 def test_cross_session_duplicate(cursor, user, password):
+    # Session B has no local answer and does not probe, so its commit is the
+    # one that meets A's committed index entry.
     print("UNIQUE_CHECKS=0: DUPLICATE FROM ANOTHER SESSION TEST")
     table = create_table(cursor)
 
@@ -431,9 +469,9 @@ def test_cross_session_duplicate(cursor, user, password):
 
         duplicate_sql = insert_sql(table, [(2, 'cross@example.com', 'b')])
         errno, failed_at = run_transaction(cursor_b, [duplicate_sql])
-        if errno != 1213 or failed_at != duplicate_sql:
-            print(f"\tFailed: expected 1213 on session B's INSERT, got {errno} "
-                  f"on {failed_at}")
+        if not is_commit_duplicate(errno) or failed_at != "COMMIT":
+            print(f"\tFailed: expected the commit duplicate, got {errno} "
+                  f"on {failed_at} ({_last_error_message})")
             return 1
     finally:
         cursor_a.close()
@@ -479,9 +517,9 @@ def test_concurrent_sessions(cursor, user, password):
             print(f"\tFailed: session B insert rejected with {errno}")
             return 1
 
-        # Each INSERT was flushed at its own statement end, so the server now
-        # holds both duplicate index writes from two open transactions. Neither
-        # is in conflict yet: only committing one makes them so.
+        # Both INSERTs are still buffered in their own transactions, so the
+        # storage holds neither index entry yet: only committing one makes
+        # them conflict.
         errno = run(cursor_a, lookup_sql)
         if errno is not None:
             print(f"\tFailed: session A lookup rejected with {errno}")
@@ -491,9 +529,8 @@ def test_concurrent_sessions(cursor, user, password):
             print(f"\tFailed: session B lookup rejected with {errno}")
             return 1
 
-        # A commits on its own thread: a plugin built with FENCE=true holds that
-        # commit until B's transaction ends, so B has to run meanwhile. OCC lets
-        # at most one of the two commit.
+        # A commits on its own thread so B can run meanwhile. OCC lets at most
+        # one of the two commit.
         thread_a, outcome_a = start_statement(cursor_a, "COMMIT")
         time.sleep(COMMIT_HEAD_START_SECONDS)
 
@@ -502,7 +539,7 @@ def test_concurrent_sessions(cursor, user, password):
         if errno is None:
             print("\tFailed: second committer unexpectedly succeeded")
             return 1
-        if not is_conflict(errno):
+        if not is_commit_duplicate(errno):
             print(f"\tFailed: expected the COMMIT to fail as a duplicate, got "
                   f"{errno}: {_last_error_message}")
             return 1
@@ -548,9 +585,9 @@ def rpc_types_after(trace_path, offset, table):
 
 
 def test_rpc_shape(user, password):
-    # Every other case asserts an outcome the synchronous branch reaches too.
-    # Only the RPCs tell the two branches apart, so this one reads the trace.
-    print("UNIQUE_CHECKS=0: NO SYNCHRONOUS INDEX RPC TEST")
+    # Every other case asserts an outcome both settings can reach. Only the
+    # RPCs tell the two apart, so this one reads the trace.
+    print("UNIQUE_CHECKS=0: NO UNIQUE PROBE RPC TEST")
     trace_path = f"/tmp/uniq_defer_rpc_trace_{os.getpid()}.jsonl"
     # scripts/start_mysql.sh derives this path from the port it is given
     pid_path = f"/tmp/mysql_{RPC_TRACE_PORT}.pid"
@@ -596,18 +633,19 @@ def test_rpc_shape(user, password):
                 return 1
             seen[checks] = rpc_types_after(trace_path, offset, table)
 
-        sync_on = seen[1].count(SYNC_INDEX_RPC)
-        if sync_on != RPC_TRACE_ROWS:
-            print(f"\tFailed: unique_checks=1 sent {sync_on} {SYNC_INDEX_RPC}, "
-                  f"expected one per row ({RPC_TRACE_ROWS})")
+        probes_on = seen[1].count(UNIQUE_PROBE_RPC)
+        if probes_on != RPC_TRACE_ROWS:
+            print(f"\tFailed: unique_checks=1 sent {probes_on} "
+                  f"{UNIQUE_PROBE_RPC}, expected one per row "
+                  f"({RPC_TRACE_ROWS})")
             return 1
-        if SYNC_INDEX_RPC in seen[0]:
+        if UNIQUE_PROBE_RPC in seen[0]:
             print(f"\tFailed: unique_checks=0 sent "
-                  f"{seen[0].count(SYNC_INDEX_RPC)} {SYNC_INDEX_RPC}, expected "
-                  f"none; the index write was not deferred")
+                  f"{seen[0].count(UNIQUE_PROBE_RPC)} {UNIQUE_PROBE_RPC}, "
+                  f"expected none; the UNIQUE key was probed anyway")
             return 1
-        if BATCHED_WRITE_RPC not in seen[0]:
-            print(f"\tFailed: unique_checks=0 never sent {BATCHED_WRITE_RPC}, "
+        if COMMIT_RPC not in seen[0]:
+            print(f"\tFailed: unique_checks=0 never sent {COMMIT_RPC}, "
                   f"only {sorted(set(seen[0]))}")
             return 1
     finally:
@@ -615,7 +653,8 @@ def test_rpc_shape(user, password):
             db.close()
         os.kill(pid, signal.SIGKILL)
 
-    print(f"\tPassed! ({SYNC_INDEX_RPC} x{sync_on} at unique_checks=1, none at 0)")
+    print(f"\tPassed! ({UNIQUE_PROBE_RPC} x{probes_on} at unique_checks=1, "
+          f"none at 0)")
     return 0
 
 
@@ -633,15 +672,16 @@ def main():
     result |= test_duplicate_within_statement(cursor)
     result |= test_duplicate_of_committed_row(cursor)
     result |= test_duplicate_within_transaction(cursor)
-    result |= test_unique_checks_on_is_unchanged(cursor)
+    result |= test_unique_checks_on_reports_at_the_statement(cursor)
     result |= test_insert_then_update(cursor, 0)
     result |= test_insert_then_update(cursor, 1)
     result |= test_insert_then_update(cursor, 0, unique_index=False)
     result |= test_insert_then_update(cursor, 1, unique_index=False)
-    result |= test_auto_flush_distinct(cursor)
-    result |= test_auto_flush_duplicate_across_batches(cursor)
-    result |= test_auto_flush_distinct_two_indexes(cursor)
-    result |= test_auto_flush_duplicate_two_indexes(cursor)
+    result |= test_bulk_distinct(cursor)
+    result |= test_bulk_duplicate_across_batches(cursor)
+    result |= test_bulk_distinct_two_indexes(cursor)
+    result |= test_bulk_duplicate_two_indexes(cursor)
+    result |= test_bulk_duplicate_past_probe_batch(cursor)
     result |= test_cross_session_duplicate(cursor, args.user, args.password)
     result |= test_concurrent_sessions(cursor, args.user, args.password)
     result |= test_rpc_shape(args.user, args.password)

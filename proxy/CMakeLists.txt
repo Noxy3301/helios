@@ -34,10 +34,6 @@ MYSQL_PROTOBUF_GENERATE_CPP_LIBRARY(
 # Add include path for generated protobuf header files
 include_directories(${CMAKE_CURRENT_BINARY_DIR})
 
-# Add LineairDB subdirectory
-set(LINEAIRDB_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/LineairDB")
-add_subdirectory(${LINEAIRDB_DIR} ${CMAKE_CURRENT_BINARY_DIR}/LineairDB)
-set(LINEAIRDB_PLUGIN_DYNAMIC "ha_lineairdb")
 set(LINEAIRDB_SOURCES ha_lineairdb.cc ha_lineairdb.hh
                       ha_lineairdb_columnar.cc
                       ha_lineairdb_columnar.hh
@@ -54,7 +50,6 @@ set(LINEAIRDB_SOURCES ha_lineairdb.cc ha_lineairdb.hh
                       lineairdb_proxy.cc lineairdb_proxy.hh
                       lineairdb_keyenc.cc lineairdb_keyenc.hh
                       row_codec.cc
-                      lineairdb_pushdown.cc lineairdb_pushdown.hh
                       lineairdb_index_search.cc lineairdb_index_search.hh
                       lineairdb_prefetch.cc lineairdb_prefetch.hh
                       lineairdb_autogen.cc lineairdb_autogen.hh
@@ -64,8 +59,8 @@ set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wno-error -Wextra -mcx16 -fPIC")
 
 if(WITH_LINEAIRDB_STORAGE_ENGINE AND NOT WITHOUT_LINEAIRDB_STORAGE_ENGINE)
   mysql_add_plugin(lineairdb_storage_engine ${LINEAIRDB_SOURCES} STORAGE_ENGINE
-                   DEFAULT LINK_LIBRARIES lineairdb::lineairdb lineairdb_proto ext::libprotobuf)
+                   DEFAULT LINK_LIBRARIES lineairdb_proto ext::libprotobuf extra::rapidjson)
 elseif(NOT WITHOUT_LINEAIRDB_STORAGE_ENGINE)
   mysql_add_plugin(lineairdb_storage_engine ${LINEAIRDB_SOURCES} STORAGE_ENGINE
-                   MODULE_ONLY LINK_LIBRARIES lineairdb::lineairdb lineairdb_proto ext::libprotobuf)
+                   MODULE_ONLY LINK_LIBRARIES lineairdb_proto ext::libprotobuf extra::rapidjson)
 endif()

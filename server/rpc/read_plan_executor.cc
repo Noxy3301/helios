@@ -1,25 +1,24 @@
+// Executes a read plan: one RPC runs a statement's staged point reads and
+// scans, where a later step builds its keys from what an earlier one read.
+
 #include "lineairdb_rpc.hh"
 
 #include <algorithm>
 #include <cstdint>
 #include <string_view>
 #include <thread>
-#include <type_traits>
-#include <unordered_map>
 #include <unordered_set>
 #include <utility>
 #include <vector>
 
-#include "../../common/log.h"
 #include "lineairdb.pb.h"
 
 #include "flat_plan_encode.hh"
 #include "parallel_scan.hh"
-#include "predicate_evaluator.hh"
 #include "row_codec.hh"
 
 // Read-plan execution: the TX_EXECUTE_READ_PLAN handler and its plan-key
-// binding glue. Runs staged scans and semijoin probes.
+// binding glue.
 
 namespace {
 
@@ -110,44 +109,6 @@ std::string build_plan_key(
     return key;
 }
 
-void collect_filter_columns(
-    const LineairDB::Protocol::FilterExpr& expr,
-    std::vector<uint32_t>& columns) {
-    if (expr.op() == LineairDB::Protocol::FilterExpr::COLUMN_REF) {
-        columns.push_back(expr.column_index());
-    }
-    for (const auto& child : expr.children()) {
-        collect_filter_columns(child, columns);
-    }
-}
-
-const std::vector<uint32_t>* selected_columns_for_materialization(
-    const LineairDB::Protocol::TxExecuteReadPlan::PlanStep& step,
-    std::vector<uint32_t>& selected_columns) {
-    selected_columns.clear();
-    if (!step.has_projection() ||
-        step.projection().field_indexes_size() == 0) {
-        return nullptr;
-    }
-    selected_columns.assign(step.projection().field_indexes().begin(),
-                            step.projection().field_indexes().end());
-    if (step.has_filter() && step.filter().has_expr()) {
-        collect_filter_columns(step.filter().expr(), selected_columns);
-    }
-    for (const auto& semijoin : step.semijoins()) {
-        selected_columns.push_back(semijoin.probe_column());
-    }
-    std::sort(selected_columns.begin(), selected_columns.end());
-    selected_columns.erase(
-        std::unique(selected_columns.begin(), selected_columns.end()),
-        selected_columns.end());
-    if (step.projection().num_columns() > 0 &&
-        selected_columns.size() >= step.projection().num_columns()) {
-        return nullptr;
-    }
-    return &selected_columns;
-}
-
 }  // namespace
 
 void LineairDBRpc::handleTxExecuteReadPlan(const std::string& message,
@@ -178,94 +139,7 @@ void LineairDBRpc::handleTxExecuteReadPlan(const std::string& message,
             end_key = next_lexicographic_key(start_key);
         }
 
-        // Step-level row filter: parseable non-matches are dropped; rows the
-        // evaluator cannot parse are returned for MySQL to re-check.
-        const bool step_has_filter =
-            step.has_filter() && step.filter().has_expr();
-        const auto* step_filter =
-            step_has_filter ? &step.filter().expr() : nullptr;
-        const uint32_t step_filter_cols =
-            step_has_filter ? step.filter().num_columns() : 0;
-        PredicateEvaluator step_eval;
-        auto row_passes = [&](const std::string& value) {
-            if (step_filter == nullptr) return true;
-            if (!step_eval.parse_row(value.data(), value.size(),
-                                     step_filter_cols)) {
-                return true;
-            }
-            return step_eval.evaluate(*step_filter);
-        };
-
-        const bool step_has_projection = step.has_projection();
-        std::vector<uint32_t> selected_columns;
-        const std::vector<uint32_t>* selected_columns_for_reads =
-            selected_columns_for_materialization(step, selected_columns);
-
-        // PAX-backed reads can materialize only the selected payloads needed
-        // for server-side filtering and final projection while keeping the
-        // full row shape. Projection then trims emitted VALUES to the kept
-        // columns; malformed rows fail the plan instead of mixing full and
-        // projected layouts.
-        bool projection_failed = false;
-        auto project_value = [&](std::string&& v) -> std::string {
-            if (!step_has_projection || v.empty()) return std::move(v);
-            std::string out;
-            if (trim_row_value(v, step.projection().field_indexes(),
-                               step.projection().num_columns(), out)) {
-                return out;
-            }
-            projection_failed = true;
-            return std::move(v);
-        };
-
-        // Build membership sets from earlier source steps, then drop probe
-        // rows whose join key is absent. This is a plan-local reduction, not a
-        // row predicate, so rejected rows are not negative-cache material.
-        std::vector<SemijoinReduction> semijoin_reductions;
-        const int this_step_idx =
-            static_cast<int>(previous_results.size()) - 1;
-        for (const auto& sj : step.semijoins()) {
-            const int source_step = static_cast<int>(sj.source_step());
-            if (source_step < 0 || source_step >= this_step_idx) continue;
-            SemijoinReduction reduction;
-            reduction.probe_column = sj.probe_column();
-            const bool source_filter_on =
-                sj.has_source_filter() && sj.source_filter().has_expr();
-            const uint32_t source_filter_columns =
-                source_filter_on ? sj.source_filter().num_columns() : 0;
-            for (const auto& value :
-                 previous_results[source_step]->scan_values()) {
-                if (value.empty()) continue;
-                if (source_filter_on) {
-                    PredicateEvaluator evaluator;
-                    if (evaluator.parse_row(value.data(), value.size(),
-                                            source_filter_columns) &&
-                        !evaluator.evaluate(sj.source_filter().expr())) {
-                        continue;
-                    }
-                }
-                auto column = extract_value_column(value, sj.source_column());
-                if (!column.empty()) reduction.keys.emplace(column);
-            }
-            semijoin_reductions.push_back(std::move(reduction));
-        }
-        auto semijoin_rejects = [&](const std::string& value) -> bool {
-            for (const auto& reduction : semijoin_reductions) {
-                auto column =
-                    extract_value_column(value, reduction.probe_column);
-                if (reduction.keys.find(std::string(column)) ==
-                    reduction.keys.end()) {
-                    return true;
-                }
-            }
-            return false;
-        };
-
         if (step.for_each()) {
-            // Anti-join probe: it only needs a match to exist. Stop after the
-            // first surviving row. No scan_limit -- index_next reports a clean
-            // EOF (see PlanStep.existence_only).
-            const bool existence_only = step.existence_only();
             int source_step = -1;
             if (step.bindings_size() > 0) {
                 source_step = static_cast<int>(step.bindings(0).source_step());
@@ -317,7 +191,6 @@ void LineairDBRpc::handleTxExecuteReadPlan(const std::string& message,
                 std::vector<char> failed(worker_count, 0);
                 auto* db = db_manager_->get_database().get();
                 const bool scan_probe = step.is_scan();
-                const bool has_projection = step.has_projection();
                 std::vector<std::thread> workers;
                 workers.reserve(worker_count);
 
@@ -329,30 +202,6 @@ void LineairDBRpc::handleTxExecuteReadPlan(const std::string& message,
                             probe_count * worker_index / worker_count;
                         const size_t end =
                             probe_count * (worker_index + 1) / worker_count;
-                        PredicateEvaluator evaluator;
-                        auto worker_row_passes = [&](const std::string& value) {
-                            if (step_filter == nullptr) return true;
-                            if (!evaluator.parse_row(value.data(),
-                                                     value.size(),
-                                                     step_filter_cols)) {
-                                return true;
-                            }
-                            return evaluator.evaluate(*step_filter);
-                        };
-                        auto worker_project = [&](std::string&& value) {
-                            if (!has_projection || value.empty())
-                                return std::move(value);
-                            std::string trimmed;
-                            if (trim_row_value(
-                                    value, step.projection().field_indexes(),
-                                    step.projection().num_columns(),
-                                    trimmed)) {
-                                return trimmed;
-                            }
-                            failed[worker_index] = 1;
-                            return std::move(value);
-                        };
-
                         ProbeOut& out = outputs[worker_index];
                         for (size_t probe_index = begin;
                              probe_index < end && !failed[worker_index];
@@ -364,77 +213,52 @@ void LineairDBRpc::handleTxExecuteReadPlan(const std::string& message,
                                     next_lexicographic_key(row_key);
                                 uint32_t group_rows = 0;
                                 if (step.index_name().empty()) {
-                                    auto scan_result =
-                                        db->StatelessRangeScan(
-                                            step.table_name(), row_key,
-                                            row_end, step.scan_limit(),
-                                            step.reverse_scan(),
-                                            selected_columns_for_reads);
-                                    if (!scan_result.ok) {
-                                        failed[worker_index] = 1;
-                                        break;
-                                    }
+                                  auto scan_result = db->Scan(
+                                      step.table_name(), row_key, row_end,
+                                      step.scan_limit(), step.reverse_scan(),
+                                      nullptr);
+                                  if (!scan_result.ok) {
+                                    failed[worker_index] = 1;
+                                    break;
+                                  }
                                     for (auto& r : scan_result.rows) {
-                                        if (!worker_row_passes(r.value))
-                                            continue;
-                                        if (!semijoin_reductions.empty() &&
-                                            semijoin_rejects(r.value))
-                                            continue;
                                         out.keys.push_back(std::move(r.key));
-                                        out.values.push_back(worker_project(
-                                            std::move(r.value)));
+                                        out.values.push_back(std::move(r.value));
                                         out.tids.push_back(r.tid);
                                         ++group_rows;
-                                        if (existence_only) break;
                                     }
                                 } else {
-                                    auto scan_result =
-                                        db->StatelessSecondaryRangeScan(
-                                            step.table_name(),
-                                            step.index_name(), row_key,
-                                            row_end, step.scan_limit(),
-                                            step.reverse_scan(),
-                                            selected_columns_for_reads);
-                                    if (!scan_result.ok) {
-                                        failed[worker_index] = 1;
-                                        break;
-                                    }
+                                  auto scan_result = db->ScanIndex(
+                                      step.table_name(), step.index_name(),
+                                      row_key, row_end, step.scan_limit(),
+                                      step.reverse_scan(), nullptr);
+                                  if (!scan_result.ok) {
+                                    failed[worker_index] = 1;
+                                    break;
+                                  }
                                     for (auto& r : scan_result.rows) {
-                                        if (!worker_row_passes(r.value))
-                                            continue;
-                                        if (!semijoin_reductions.empty() &&
-                                            semijoin_rejects(r.value))
-                                            continue;
                                         out.secondary_keys.push_back(
                                             std::move(r.secondary_key));
                                         out.keys.push_back(
                                             std::move(r.primary_key));
-                                        out.values.push_back(worker_project(
-                                            std::move(r.value)));
+                                        out.values.push_back(std::move(r.value));
                                         out.tids.push_back(r.tid);
                                         ++group_rows;
-                                        if (existence_only) break;
                                     }
                                 }
                                 out.group_rows.push_back(group_rows);
                             } else {
-                                auto read_result =
-                                    db->StatelessRead(step.table_name(),
-                                                      row_key,
-                                                      selected_columns_for_reads);
-                                out.keys.push_back(row_key);
-                                out.tids.push_back(read_result.tid);
-                                if (read_result.found &&
-                                    !(!semijoin_reductions.empty() &&
-                                      semijoin_rejects(read_result.value))) {
-                                    out.values.push_back(worker_project(
-                                        std::move(read_result.value)));
-                                } else {
-                                    out.values.push_back("");
-                                }
+                              auto read_result =
+                                  db->Read(step.table_name(), row_key, nullptr);
+                              out.keys.push_back(row_key);
+                              out.tids.push_back(read_result.tid);
+                              out.values.push_back(
+                                  read_result.found
+                                      ? std::move(read_result.value)
+                                      : std::string());
                             }
                         }
-                        db->ReleaseMasstreeThreadEpoch();
+                        db->ReleaseThreadEpoch();
                     });
                 }
                 for (auto& worker : workers) worker.join();
@@ -488,54 +312,37 @@ void LineairDBRpc::handleTxExecuteReadPlan(const std::string& message,
                     const std::string row_end = next_lexicographic_key(row_key);
                     int group_rows = 0;
                     if (step.index_name().empty()) {
-                        auto scan_result =
-                            db_manager_->get_database()->StatelessRangeScan(
-                                step.table_name(), row_key, row_end,
-                                step.scan_limit(), step.reverse_scan(),
-                                selected_columns_for_reads);
-                        if (!scan_result.ok) {
-                            response.set_ok(false);
-                            flat_plan::encode_to_string(response, result);
-                            return;
-                        }
+                      auto scan_result = db_manager_->get_database()->Scan(
+                          step.table_name(), row_key, row_end,
+                          step.scan_limit(), step.reverse_scan(), nullptr);
+                      if (!scan_result.ok) {
+                        response.set_ok(false);
+                        flat_plan::encode_to_string(response, result);
+                        return;
+                      }
                         for (auto& r : scan_result.rows) {
-                            if (!row_passes(r.value)) continue;
-                            if (!semijoin_reductions.empty() &&
-                                semijoin_rejects(r.value))
-                                continue;
                             step_result->add_scan_keys(std::move(r.key));
-                            step_result->add_scan_values(
-                                project_value(std::move(r.value)));
+                            step_result->add_scan_values(std::move(r.value));
                             step_result->add_scan_tids(r.tid);
                             ++group_rows;
-                            if (existence_only) break;
                         }
                     } else {
-                        auto scan_result =
-                            db_manager_->get_database()
-                                ->StatelessSecondaryRangeScan(
-                                    step.table_name(), step.index_name(),
-                                    row_key, row_end, step.scan_limit(),
-                                    step.reverse_scan(),
-                                    selected_columns_for_reads);
-                        if (!scan_result.ok) {
-                            response.set_ok(false);
-                            flat_plan::encode_to_string(response, result);
-                            return;
-                        }
+                      auto scan_result = db_manager_->get_database()->ScanIndex(
+                          step.table_name(), step.index_name(), row_key,
+                          row_end, step.scan_limit(), step.reverse_scan(),
+                          nullptr);
+                      if (!scan_result.ok) {
+                        response.set_ok(false);
+                        flat_plan::encode_to_string(response, result);
+                        return;
+                      }
                         for (auto& r : scan_result.rows) {
-                            if (!row_passes(r.value)) continue;
-                            if (!semijoin_reductions.empty() &&
-                                semijoin_rejects(r.value))
-                                continue;
                             step_result->add_secondary_keys(
                                 std::move(r.secondary_key));
                             step_result->add_scan_keys(std::move(r.primary_key));
-                            step_result->add_scan_values(
-                                project_value(std::move(r.value)));
+                            step_result->add_scan_values(std::move(r.value));
                             step_result->add_scan_tids(r.tid);
                             ++group_rows;
-                            if (existence_only) break;
                         }
                     }
                     step_result->add_group_sizes(
@@ -545,47 +352,28 @@ void LineairDBRpc::handleTxExecuteReadPlan(const std::string& message,
                     continue;
                 }
 
-                auto read_result =
-                    db_manager_->get_database()->StatelessRead(
-                        step.table_name(), row_key,
-                        selected_columns_for_reads);
+                auto read_result = db_manager_->get_database()->Read(
+                    step.table_name(), row_key, nullptr);
                 step_result->add_scan_keys(row_key);
                 step_result->add_scan_tids(read_result.tid);
-                if (read_result.found &&
-                    !(!semijoin_reductions.empty() &&
-                      semijoin_rejects(read_result.value))) {
-                    step_result->add_scan_values(
-                        project_value(std::move(read_result.value)));
-                } else {
-                    // Semijoin-rejected point probes are covered as not-found.
-                    step_result->add_scan_values("");
-                }
-            }
-            if (projection_failed) {
-                response.set_ok(false);
-                flat_plan::encode_to_string(response, result);
-                return;
+                step_result->add_scan_values(
+                    read_result.found ? std::move(read_result.value)
+                                      : std::string());
             }
             continue;
         }
 
         if (!step.is_scan()) {
-            auto read_result =
-                db_manager_->get_database()->StatelessRead(
-                    step.table_name(), start_key, selected_columns_for_reads);
-            step_result->set_actual_key(start_key);
-            step_result->set_actual_start_key(start_key);
-            step_result->set_found(read_result.found);
-            step_result->set_tid(read_result.tid);
-            if (read_result.found) {
-                step_result->set_value(project_value(std::move(read_result.value)));
-            }
-            if (projection_failed) {
-                response.set_ok(false);
-                flat_plan::encode_to_string(response, result);
-                return;
-            }
-            continue;
+          auto read_result = db_manager_->get_database()->Read(
+              step.table_name(), start_key, nullptr);
+          step_result->set_actual_key(start_key);
+          step_result->set_actual_start_key(start_key);
+          step_result->set_found(read_result.found);
+          step_result->set_tid(read_result.tid);
+          if (read_result.found) {
+            step_result->set_value(std::move(read_result.value));
+          }
+          continue;
         }
 
         if (step.index_name().empty()) {
@@ -593,91 +381,40 @@ void LineairDBRpc::handleTxExecuteReadPlan(const std::string& message,
             step_result->set_actual_end_key(end_key);
             if (parallel_primary_pax_row_ref_scan(
                     db_manager_->get_database().get(), step, start_key,
-                    end_key, step_result, projection_failed,
-                    semijoin_reductions)) {
-                if (projection_failed) {
-                    response.set_ok(false);
-                    flat_plan::encode_to_string(response, result);
-                    return;
-                }
+                    end_key, step_result)) {
                 continue;
             }
-            if (!step.for_each() && step.scan_limit() == 0 &&
-                !step.reverse_scan() && semijoin_reductions.empty() &&
-                step.has_filter() && step.filter().has_expr()) {
-                if (parallel_primary_filter_scan(
-                        db_manager_->get_database().get(), step, start_key,
-                        end_key, step_result)) {
-                    continue;
-                }
-            }
 
-            // With a pushed filter, LIMIT must apply after filter evaluation.
-            const bool limit_after_filter = step_has_filter;
-            const uint64_t scan_limit_for_lineairdb =
-                limit_after_filter ? 0 : step.scan_limit();
-            auto scan_result =
-                db_manager_->get_database()->StatelessRangeScan(
-                    step.table_name(), start_key, end_key,
-                    scan_limit_for_lineairdb, step.reverse_scan(),
-                    selected_columns_for_reads);
+            auto scan_result = db_manager_->get_database()->Scan(
+                step.table_name(), start_key, end_key, step.scan_limit(),
+                step.reverse_scan(), nullptr);
             if (!scan_result.ok) {
                 response.set_ok(false);
                 flat_plan::encode_to_string(response, result);
                 return;
             }
-            uint64_t emitted = 0;
             for (auto& row : scan_result.rows) {
-                if (!row_passes(row.value)) {
-                    // Negative coverage for point probes into this scan.
-                    step_result->add_filtered_keys(std::move(row.key));
-                    continue;
-                }
-                if (!semijoin_reductions.empty() &&
-                    semijoin_rejects(row.value)) {
-                    continue;
-                }
                 step_result->add_scan_keys(std::move(row.key));
-                step_result->add_scan_values(project_value(std::move(row.value)));
+                step_result->add_scan_values(std::move(row.value));
                 step_result->add_scan_tids(row.tid);
-                if (step.scan_limit() > 0 &&
-                    ++emitted >= step.scan_limit()) {
-                    break;
-                }
             }
         } else {
             step_result->set_actual_start_key(start_key);
             step_result->set_actual_end_key(end_key);
-            auto scan_result =
-                db_manager_->get_database()->StatelessSecondaryRangeScan(
-                    step.table_name(), step.index_name(), start_key, end_key,
-                    step.scan_limit(), step.reverse_scan(),
-                    selected_columns_for_reads);
+            auto scan_result = db_manager_->get_database()->ScanIndex(
+                step.table_name(), step.index_name(), start_key, end_key,
+                step.scan_limit(), step.reverse_scan(), nullptr);
             if (!scan_result.ok) {
                 response.set_ok(false);
                 flat_plan::encode_to_string(response, result);
                 return;
             }
             for (auto& row : scan_result.rows) {
-                if (!row_passes(row.value)) {
-                    // Secondary scans report rejected rows by primary key.
-                    step_result->add_filtered_keys(std::move(row.primary_key));
-                    continue;
-                }
-                if (!semijoin_reductions.empty() &&
-                    semijoin_rejects(row.value)) {
-                    continue;
-                }
                 step_result->add_secondary_keys(std::move(row.secondary_key));
                 step_result->add_scan_keys(std::move(row.primary_key));
-                step_result->add_scan_values(project_value(std::move(row.value)));
+                step_result->add_scan_values(std::move(row.value));
                 step_result->add_scan_tids(row.tid);
             }
-        }
-        if (projection_failed) {
-            response.set_ok(false);
-            flat_plan::encode_to_string(response, result);
-            return;
         }
     }
 

@@ -9,7 +9,7 @@ def where (db, cursor) :
     cursor.execute('CREATE DATABASE ha_lineairdb_test')
     cursor.execute('CREATE TABLE ha_lineairdb_test.items (\
         title int NOT NULL,\
-        content TEXT,\
+        content VARCHAR(255),\
         INDEX title_idx (title)\
     )ENGINE = LineairDB')
     print("PRIMARY KEY INT TEST")

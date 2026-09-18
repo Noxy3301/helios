@@ -1,11 +1,10 @@
 """INSERT must refuse a primary key that already holds a row.
 
-The check is deferred: a plain INSERT buffers its rows and the storage server
-refuses the key when the buffer is sent, which is the end of the statement for
-a normal transaction and the commit for a prefetch one. REPLACE, INSERT IGNORE
-and ON DUPLICATE KEY UPDATE need the answer at the row, so those read the key
-first. Run with lineairdb_prefetch_execution off and on; the prefetch case
-turns it on for itself either way.
+A plain INSERT probes the keys it inserts against the storage before the
+statement returns, so the duplicate is ER_DUP_ENTRY from the INSERT; the
+commit refuses one that appears after the probe. REPLACE, INSERT IGNORE and
+ON DUPLICATE KEY UPDATE need the answer at the row, so those read the key
+first. Run with --read-path row and plan.
 """
 import argparse
 import sys
@@ -57,19 +56,26 @@ def reset(db, cursor):
     db.commit()
 
 
-def create_table(cursor, primary_key=True):
+def create_table(cursor, primary_key=True, indexed=False):
     global _table_seq
     _table_seq += 1
     table = f"t{int(time.time() * 1000000)}_{_table_seq}"
     key = "PRIMARY KEY (id)" if primary_key else "INDEX id_idx (id)"
+    index = ",\n            INDEX v_idx (v)" if indexed else ""
     cursor.execute(
         f"""CREATE TABLE {DBNAME}.{table} (
             id INT NOT NULL,
             v VARCHAR(32) NOT NULL,
-            {key}
+            {key}{index}
         ) ENGINE = LineairDB"""
     )
     return table
+
+
+def rows_by_index(cursor, table, value):
+    cursor.execute(f"SELECT id, v FROM {DBNAME}.{table} FORCE INDEX (v_idx) "
+                   f"WHERE v = '{value}'")
+    return sorted(cursor.fetchall())
 
 
 def run(cursor, sql):
@@ -189,6 +195,37 @@ def test_replace_overwrites(cursor):
     surviving = rows(cursor, table)
     if surviving != [(1, "replaced")]:
         print(f"\tFailed: table holds {surviving}, expected [(1, 'replaced')]")
+        return 1
+
+    print("\tPassed!")
+    return 0
+
+
+def test_replace_moves_secondary_entries(cursor):
+    # REPLACE overwrites the row, so the index entry the old row left has to
+    # go with it: a lookup by the old value must not answer with the new row.
+    print("REPLACE MOVES THE ROW'S SECONDARY INDEX ENTRIES TEST")
+    table = create_table(cursor, indexed=True)
+    if seed(cursor, table, [(1, "old")]) is not None:
+        print("\tFailed: seed insert rejected")
+        return 1
+
+    errno = run(cursor, insert_sql(table, [(1, "new")], prefix="REPLACE"))
+    if errno is not None:
+        print(f"\tFailed: REPLACE rejected with {errno}")
+        return 1
+
+    by_old = rows_by_index(cursor, table, "old")
+    by_new = rows_by_index(cursor, table, "new")
+    if by_old != [] or by_new != [(1, "new")]:
+        print(f"\tFailed: the index answers 'old' with {by_old} and 'new' "
+              f"with {by_new}, expected [] and [(1, 'new')]")
+        return 1
+
+    cursor.execute(f"SELECT COUNT(*) FROM {DBNAME}.{table}")
+    total = cursor.fetchone()[0]
+    if total != 1 or rows(cursor, table) != [(1, "new")]:
+        print(f"\tFailed: table holds {total} rows, expected 1")
         return 1
 
     print("\tPassed!")
@@ -327,9 +364,8 @@ def test_concurrent_sessions(cursor, user, password):
             print(f"\tFailed: session B insert rejected with {errno}")
             return 1
 
-        # A commits on its own thread: a plugin built with FENCE=true holds that
-        # commit until B's transaction ends, so B has to run meanwhile. The head
-        # start keeps A the first to reach the server in either build.
+        # A commits on its own thread so B can run meanwhile. The head start
+        # keeps A the first to reach the server.
         thread_a, outcome_a = start_statement(cursor_a, "COMMIT")
         time.sleep(COMMIT_HEAD_START_SECONDS)
 
@@ -371,11 +407,8 @@ def test_concurrent_sessions(cursor, user, password):
 
 
 def test_conflicting_read_outranks_the_duplicate(cursor, user, password):
-    # The TPC-C shape: two sessions take the same next order id, the first
-    # commits its increment and its order, and the second's insert then lands
-    # on a key that exists. Its district read is already stale, so this is a
-    # conflict to retry, not a duplicate to report -- BenchBase retries 1213
-    # and commit-time 1180, never 1062.
+    # The second session's insert lands on a key that exists and its earlier
+    # district read is stale, so this is a conflict to retry, not a duplicate.
     print("A STALE READ OUTRANKS THE DUPLICATE IT CAUSED TEST")
     district = create_table(cursor)
     orders = create_table(cursor)
@@ -405,8 +438,7 @@ def test_conflicting_read_outranks_the_duplicate(cursor, user, password):
             print(f"\tFailed: session A rejected with {errno}")
             return 1
 
-        # A commits on its own thread: a plugin built with FENCE=true holds
-        # that commit until B's transaction ends.
+        # A commits on its own thread so B can run meanwhile.
         thread_a, outcome_a = start_statement(cursor_a, "COMMIT")
         time.sleep(COMMIT_HEAD_START_SECONDS)
 
@@ -415,8 +447,7 @@ def test_conflicting_read_outranks_the_duplicate(cursor, user, password):
             errno = run(cursor_b, "COMMIT")
         run(cursor_b, "ROLLBACK")
         # Only the conflict shape retries; a duplicate shape here is the
-        # regression this test exists for. Under FENCE=true, B reaches 1213
-        # through ordinary validation; only FENCE=false hits the row guard.
+        # regression this test exists for.
         if not is_conflict(errno):
             print(f"\tFailed: expected a conflict shape, got {errno} "
                   f"({_last_error_message})")
@@ -466,17 +497,16 @@ def test_table_without_primary_key(cursor):
     return 0
 
 
-def test_prefetch_commit_path(cursor, db):
-    # The prefetch commit installs rows itself, so it carries its own duplicate
-    # check. A transaction reaches it only when its first statement is
-    # prefetch-eligible, which is why this one opens with a staged read.
-    print("INSERT DUPLICATE PRIMARY KEY ON THE PREFETCH COMMIT PATH TEST")
+def test_staged_read_then_duplicate_insert(cursor, db):
+    # A transaction whose reads are staged still owes ER_DUP_ENTRY to the
+    # INSERT statement, not to the commit.
+    print("INSERT DUPLICATE PRIMARY KEY AFTER A STAGED READ TEST")
     table = create_table(cursor)
     if seed(cursor, table, [(1, "first"), (2, "second")]) is not None:
         print("\tFailed: seed insert rejected")
         return 1
 
-    cursor.execute("SET GLOBAL lineairdb_prefetch_execution=ON")
+    cursor.execute("SET GLOBAL lineairdb_read_path='plan'")
     try:
         cursor.execute(f"SET @_tx_plan='R:{table}:2'")
         cursor.execute(f"USE {DBNAME}")
@@ -489,23 +519,13 @@ def test_prefetch_commit_path(cursor, db):
             return 1
 
         errno = run(cursor, insert_sql(table, [(1, "dup")]))
-        if errno is not None:
-            print(f"\tFailed: the staged INSERT must not fail at the "
-                  f"statement, got {errno} ({_last_error_message})")
-            run(cursor, "ROLLBACK")
-            return 1
-        commit_errno = run(cursor, "COMMIT")
         run(cursor, "ROLLBACK")
-        if commit_errno is None:
-            print("\tFailed: the duplicate committed")
-            return 1
-        if not is_commit_duplicate(commit_errno):
-            print(f"\tFailed: expected the wrapped commit duplicate, got "
-                  f"{commit_errno} ({_last_error_message})")
+        if errno != 1062:
+            print(f"\tFailed: expected 1062 at the statement, got {errno} "
+                  f"({_last_error_message})")
             return 1
     finally:
-        cursor.execute(f"SET GLOBAL lineairdb_prefetch_execution="
-                       f"{prefetch_setting()}")
+        cursor.execute(f"SET GLOBAL lineairdb_read_path='{args.read_path}'")
         cursor.execute("SET @_tx_plan=NULL")
 
     surviving = rows(cursor, table)
@@ -513,12 +533,8 @@ def test_prefetch_commit_path(cursor, db):
         print(f"\tFailed: table holds {surviving}, expected the seeded rows")
         return 1
 
-    print(f"\tPassed! (rejected with {commit_errno} on the COMMIT)")
+    print("\tPassed!")
     return 0
-
-
-def prefetch_setting():
-    return "ON" if args.prefetch else "OFF"
 
 
 def main():
@@ -526,9 +542,8 @@ def main():
     cursor = db.cursor()
 
     reset(db, cursor)
-    cursor.execute(f"SET GLOBAL lineairdb_prefetch_execution="
-                   f"{prefetch_setting()}")
-    print(f"lineairdb_prefetch_execution={prefetch_setting()}")
+    cursor.execute(f"SET GLOBAL lineairdb_read_path='{args.read_path}'")
+    print(f"lineairdb_read_path={args.read_path}")
     # Transactions are opened with an explicit BEGIN so that a lone statement
     # is its own transaction and every error arrives through the cursor.
     db.autocommit = True
@@ -538,6 +553,7 @@ def main():
     result |= test_duplicate_in_transaction(cursor)
     result |= test_duplicate_within_one_statement(cursor)
     result |= test_replace_overwrites(cursor)
+    result |= test_replace_moves_secondary_entries(cursor)
     result |= test_on_duplicate_key_update(cursor)
     result |= test_insert_ignore(cursor)
     result |= test_delete_then_insert(cursor)
@@ -546,7 +562,7 @@ def main():
     result |= test_conflicting_read_outranks_the_duplicate(
         cursor, args.user, args.password)
     result |= test_table_without_primary_key(cursor)
-    result |= test_prefetch_commit_path(cursor, db)
+    result |= test_staged_read_then_duplicate_insert(cursor, db)
 
     if result == 0:
         print("\nALL TESTS PASSED!")
@@ -564,7 +580,8 @@ if __name__ == "__main__":
     parser.add_argument('--password', metavar='pw', type=str,
                         help='password for the user',
                         default="")
-    parser.add_argument('--prefetch', action='store_true',
-                        help='run with lineairdb_prefetch_execution ON')
+    parser.add_argument('--read-path', choices=('row', 'plan'),
+                        default='plan',
+                        help='value of lineairdb_read_path for the run')
     args = parser.parse_args()
     main()

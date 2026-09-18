@@ -19,7 +19,6 @@
 #include "lineairdb_field_types.h"
 #include "lineairdb_index_search.hh"
 #include "lineairdb_keyenc.hh"
-#include "lineairdb_pushdown.hh"
 #include "lineairdb.pb.h"
 #include "my_dbug.h"
 #include "mysql/plugin.h"
@@ -32,6 +31,34 @@
 #include "sql/sql_plugin.h"
 #include "sql/table.h"
 #include "typelib.h"
+
+// The query block a table is read in. A table inside a derived table or a
+// subquery is governed by that block's own WHERE and LIMIT, not the
+// statement's outermost block.
+static Query_block *owning_query_block(THD *thd, const TABLE *table) {
+  if (table != nullptr && table->pos_in_table_list != nullptr &&
+      table->pos_in_table_list->query_block != nullptr) {
+    return table->pos_in_table_list->query_block;
+  }
+  if (thd == nullptr || thd->lex == nullptr || thd->lex->unit == nullptr) {
+    return nullptr;
+  }
+  return thd->lex->unit->global_parameters();
+}
+
+// A storage scan carries no predicate, so every row MySQL drops above the
+// handler would have come out of a pushed LIMIT. Only a SELECT with no WHERE
+// left for this table's rows may push one.
+static bool select_scan_limit_is_safe(THD *thd, TABLE *table) {
+  if (thd == nullptr || thd->lex == nullptr || thd->lex->unit == nullptr) {
+    return false;
+  }
+  if (table == nullptr || table->s == nullptr) return false;
+
+  Query_block *qb = owning_query_block(thd, table);
+  if (qb == nullptr) return false;
+  return qb->where_cond() == nullptr;
+}
 
 // True when one ORDER BY item is exactly the requested keypart and direction
 static bool order_item_matches_key_part(ORDER *order, const KEY *key,
@@ -105,9 +132,14 @@ RangeScanLimit range_scan_limit_for_order(
   if (!is_select) return scan_limit;                   // Not SELECT
 
   // LIMIT is only safe for one-table, non-aggregate reads
-  Query_expression *unit = thd->lex->unit;
-  Query_block *qb = unit->global_parameters();
+  const TABLE *scanned = (key != nullptr && key->key_part != nullptr &&
+                          key->key_part[0].field != nullptr)
+                             ? key->key_part[0].field->table
+                             : nullptr;
+  Query_block *qb = owning_query_block(thd, scanned);
   if (qb == nullptr) return scan_limit;                // Missing query block
+  Query_expression *unit = qb->master_query_expression();
+  if (unit == nullptr) return scan_limit;              // Missing query unit
   if (qb->leaf_table_count != 1) return scan_limit;    // Join needs root LIMIT
   if (qb->is_explicitly_grouped()) return scan_limit;  // GROUP BY changes rows
   if (qb->is_implicitly_grouped()) return scan_limit;  // Aggregate changes rows
@@ -139,10 +171,6 @@ RangeScanLimit range_scan_limit_for_order(
   return scan_limit;
 }
 
-/**
- * Calculate how many key parts are covered by the given key length
- * This is an approximation based on key part sizes
- */
 uint ha_lineairdb::calculate_key_parts_from_length(KEY *key, uint key_length) {
   if (key == nullptr || key_length == 0)
     return 0;
@@ -167,13 +195,6 @@ uint ha_lineairdb::calculate_key_parts_from_length(KEY *key, uint key_length) {
   return parts;
 }
 
-/**
- * @brief Count the number of key parts used in a key_part_map
- *
- * @param key_info KEY structure containing key part information
- * @param keypart_map Bitmap indicating which key parts are used
- * @return Number of consecutive key parts used (from the beginning)
- */
 uint ha_lineairdb::count_used_key_parts(const KEY *key_info,
                                         key_part_map keypart_map) {
   uint count = 0;
@@ -186,22 +207,12 @@ uint ha_lineairdb::count_used_key_parts(const KEY *key_info,
   return count;
 }
 
-/**
- * @brief Build search plan
- *
- * Decision steps:
- * 1. Reset state
- * 2. Extract basic information (used_key_parts, is_unique, has_nullable)
- * 3. Decide op
- * 4. Serialize boundaries
- */
 void ha_lineairdb::build_search_plan(const uchar *key, key_part_map keypart_map,
                                      enum ha_rkey_function find_flag,
                                      KEY *key_info) {
   // 1. Reset state
   current_plan_.reset();
   reset_index_search_buffers();
-  end_range_exclusive_key_.clear();
 
   // 2. Extract basic information
   current_plan_.is_primary = (active_index == table->s->primary_key);
@@ -279,10 +290,6 @@ void ha_lineairdb::build_search_plan(const uchar *key, key_part_map keypart_map,
   }
 }
 
-/**
- * @brief Execute search plan
- * @return 0: success, HA_ERR_*: error
- */
 int ha_lineairdb::execute_plan(uchar *buf, LineairDBTransaction *tx) {
   switch (current_plan_.op) {
   case IndexSearchOp::kIndexFirst:
@@ -304,16 +311,13 @@ int ha_lineairdb::execute_plan(uchar *buf, LineairDBTransaction *tx) {
   }
 }
 
-/**
- * @brief kIndexFirst: full scan when key==nullptr
- */
 int ha_lineairdb::execute_index_first(uchar *buf, LineairDBTransaction *tx) {
   std::string start_key = "";
   std::string end_key = current_plan_.end_key_serialized.empty()
                             ? lineairdb_keyenc::scan_end_sentinel()
                             : current_plan_.end_key_serialized;
 
-  if (current_plan_.is_primary && !tx->is_prefetch_mode()) {
+  if (current_plan_.is_primary && !statement_uses_read_plan(ha_thd())) {
     index_cursor_active_ = true;
     index_cursor_reverse_ = false;
     index_cursor_secondary_ = false;
@@ -321,8 +325,8 @@ int ha_lineairdb::execute_index_first(uchar *buf, LineairDBTransaction *tx) {
     index_cursor_end_key_ = end_key;
     (void)refill_index_cursor(tx);
   } else if (current_plan_.is_primary) {
-    // Prefetch caches are keyed by the staged full-range shape. Keep that
-    // established path until index-first can stage a bounded autogen cursor.
+    // Staged windows are keyed by the full-range shape, so ask for the whole
+    // range instead of walking it in cursor windows.
     auto key_values =
         tx->get_matching_keys_and_values_in_range(start_key, end_key);
     for (auto &kv : key_values) {
@@ -347,10 +351,6 @@ int ha_lineairdb::execute_index_first(uchar *buf, LineairDBTransaction *tx) {
   return fetch_and_set_current_result(buf, tx);
 }
 
-/**
- * @brief kUniquePoint: exact match on unique index
- * @return HA_ERR_KEY_NOT_FOUND (no match), 0 (success)
- */
 int ha_lineairdb::execute_unique_point(uchar *buf, LineairDBTransaction *tx) {
   if (current_plan_.is_primary) {
     auto result = tx->read(current_plan_.start_key_serialized);
@@ -396,10 +396,6 @@ int ha_lineairdb::execute_unique_point(uchar *buf, LineairDBTransaction *tx) {
   }
 }
 
-/**
- * @brief kSameKeyMaterialize: exact search (prefix match, non-unique, nullable
- * unique)
- */
 int ha_lineairdb::execute_same_key_materialize(uchar *buf,
                                                LineairDBTransaction *tx) {
   const std::string &prefix = current_plan_.same_group_prefix_serialized;
@@ -408,17 +404,18 @@ int ha_lineairdb::execute_same_key_materialize(uchar *buf,
   if (current_plan_.is_primary) {
     // Push LIMIT only when the server can also apply the SELECT WHERE.
     const KEY *key = &table->key_info[active_index];
-    const bool filter_ready = prepare_select_filter_for_tx(
-        ha_thd(), table, tx, &pushed_filter_serialized_);
     RangeScanLimit scan_limit = range_scan_limit_for_order(
         ha_thd(), key, current_plan_.used_key_parts,
-        has_unpushed_filter_ || !filter_ready);
-    // Autogen stages the full forward range without a pushed filter; request the
-    // canonical {forward, unlimited} shape so MySQL applies LIMIT/WHERE above
-    // (see execute_range_materialize). DSL keeps its explicit pushdown.
-    if (tx->is_prefetch_mode() && !tx->tx_plan_used()) scan_limit = RangeScanLimit{};
+        !select_scan_limit_is_safe(ha_thd(), table));
+    // Autogen stages the forward, unlimited range and MySQL applies ORDER BY,
+    // LIMIT and WHERE above the handler (see execute_range_materialize). The
+    // DSL stages the limit and direction it names.
+    if (statement_uses_read_plan(ha_thd()) && !tx->tx_plan_used()) {
+      scan_limit = RangeScanLimit{};
+    }
 
     // Same-key scans can use ASC or DESC LIMIT when ORDER BY matches the key.
+    truncated_scan_end_ = prefix_end;
     auto key_values = tx->get_matching_keys_and_values_in_range(
         prefix, prefix_end, static_cast<uint64_t>(scan_limit.row_limit),
         scan_limit.reverse_scan, &materialized_scan_truncated_);
@@ -453,17 +450,15 @@ int ha_lineairdb::execute_same_key_materialize(uchar *buf,
   return fetch_and_set_current_result(buf, tx);
 }
 
-/**
- * @brief kPrefixFirst: return first row matching prefix, then continue with
- * normal index_next
- */
 int ha_lineairdb::execute_prefix_first(uchar *buf, LineairDBTransaction *tx) {
   const std::string &prefix = current_plan_.same_group_prefix_serialized;
   const std::string &prefix_end = current_plan_.same_group_end_serialized;
 
   if (current_plan_.is_primary) {
     // Restrict to [prefix, prefix_end) so index_next never leaks non-prefix
-    // rows. A limit-staged hit must abort if index_next reads past it.
+    // rows. A limit-staged hit continues from the storage when index_next
+    // reads past it.
+    truncated_scan_end_ = prefix_end;
     auto key_values = tx->get_matching_keys_and_values_in_range(
         prefix, prefix_end, 0, false, &materialized_scan_truncated_);
     for (auto &kv : key_values) {
@@ -516,20 +511,18 @@ int ha_lineairdb::execute_range_materialize(uchar *buf,
   if (current_plan_.is_primary) {
     // Push LIMIT only when the server can also apply the SELECT WHERE.
     const KEY *key = &table->key_info[active_index];
-    const bool filter_ready = prepare_select_filter_for_tx(
-        ha_thd(), table, tx, &pushed_filter_serialized_);
     RangeScanLimit scan_limit = range_scan_limit_for_order(
         ha_thd(), key, current_plan_.used_key_parts,
-        has_unpushed_filter_ || !filter_ready);
-    // Statement-scoped autogen stages the full forward range and its read-plan
-    // scan carries no pushed filter, so a server-side LIMIT/reverse would
-    // truncate rows before MySQL applies the WHERE (wrong results) and would not
-    // match the staged {forward, unlimited} cache. Request the canonical shape
-    // and let MySQL apply ORDER BY / LIMIT / WHERE above the handler. The
-    // tx-scoped DSL path keeps its explicit pushdown (its plan matches it).
-    if (tx->is_prefetch_mode() && !tx->tx_plan_used()) scan_limit = RangeScanLimit{};
+        !select_scan_limit_is_safe(ha_thd(), table));
+    // Autogen stages only the forward, unlimited range; ORDER BY, LIMIT and
+    // WHERE stay above the handler. The DSL stages the limit and direction it
+    // names, and its plan matches them.
+    if (statement_uses_read_plan(ha_thd()) && !tx->tx_plan_used()) {
+      scan_limit = RangeScanLimit{};
+    }
 
     // Range scans can use ASC or DESC LIMIT when ORDER BY matches the key.
+    truncated_scan_end_ = effective_end;
     auto key_values = tx->get_matching_keys_and_values_in_range(
         effective_start, effective_end,
         static_cast<uint64_t>(scan_limit.row_limit), scan_limit.reverse_scan,
@@ -556,10 +549,6 @@ int ha_lineairdb::execute_range_materialize(uchar *buf,
   return fetch_and_set_current_result(buf, tx);
 }
 
-/**
- * @brief kPrevKey: read key or previous key (HA_READ_KEY_OR_PREV /
- * HA_READ_BEFORE_KEY)
- */
 int ha_lineairdb::execute_prev_key(uchar *buf, LineairDBTransaction *tx) {
   const std::string &target_key = current_plan_.start_key_serialized;
   // HA_READ_BEFORE_KEY : SQL < target → already exclusive end.
@@ -594,10 +583,6 @@ int ha_lineairdb::execute_prev_key(uchar *buf, LineairDBTransaction *tx) {
   return fetch_and_set_current_result(buf, tx);
 }
 
-/**
- * @brief kPrefixLast: last row in prefix range
- * @note Materialize mode returns the last row directly (slow but correct)
- */
 int ha_lineairdb::execute_prefix_last(uchar *buf, LineairDBTransaction *tx) {
   if (current_plan_.find_flag == HA_READ_PREFIX_LAST_OR_PREV) {
     const std::string &prefix = current_plan_.same_group_prefix_serialized;
@@ -606,15 +591,13 @@ int ha_lineairdb::execute_prefix_last(uchar *buf, LineairDBTransaction *tx) {
     if (current_plan_.is_primary) {
       // Push LIMIT only when the server can also apply the SELECT WHERE.
       const KEY *key = &table->key_info[active_index];
-      const bool filter_ready = prepare_select_filter_for_tx(
-          ha_thd(), table, tx, &pushed_filter_serialized_);
       RangeScanLimit scan_limit = range_scan_limit_for_order(
           ha_thd(), key, current_plan_.used_key_parts,
-          has_unpushed_filter_ || !filter_ready);
-      // Autogen stages the full forward range without a pushed filter; drop the
-      // pushdown so MySQL applies LIMIT/WHERE above (see
-      // execute_range_materialize). DSL keeps its explicit pushdown.
-      if (tx->is_prefetch_mode() && !tx->tx_plan_used()) {
+          !select_scan_limit_is_safe(ha_thd(), table));
+      // Autogen stages the forward, unlimited range and MySQL applies ORDER BY,
+      // LIMIT and WHERE above the handler (see execute_range_materialize). The
+      // DSL stages the limit and direction it names.
+      if (statement_uses_read_plan(ha_thd()) && !tx->tx_plan_used()) {
         scan_limit = RangeScanLimit{};
       }
       const bool push_desc_limit =
@@ -662,15 +645,13 @@ int ha_lineairdb::execute_prefix_last(uchar *buf, LineairDBTransaction *tx) {
   if (current_plan_.is_primary) {
     // Push LIMIT only when the server can also apply the SELECT WHERE.
     const KEY *key = &table->key_info[active_index];
-    const bool filter_ready = prepare_select_filter_for_tx(
-        ha_thd(), table, tx, &pushed_filter_serialized_);
     RangeScanLimit scan_limit = range_scan_limit_for_order(
         ha_thd(), key, current_plan_.used_key_parts,
-        has_unpushed_filter_ || !filter_ready);
-    // Autogen stages the full forward range without a pushed filter; drop the
-    // pushdown so MySQL applies LIMIT/WHERE above (see
-    // execute_range_materialize). DSL keeps its explicit pushdown.
-    if (tx->is_prefetch_mode() && !tx->tx_plan_used()) {
+        !select_scan_limit_is_safe(ha_thd(), table));
+    // Autogen stages the forward, unlimited range and MySQL applies ORDER BY,
+    // LIMIT and WHERE above the handler (see execute_range_materialize). The
+    // DSL stages the limit and direction it names.
+    if (statement_uses_read_plan(ha_thd()) && !tx->tx_plan_used()) {
       scan_limit = RangeScanLimit{};
     }
     const bool push_desc_limit =
@@ -688,14 +669,11 @@ int ha_lineairdb::execute_prefix_last(uchar *buf, LineairDBTransaction *tx) {
     }
   } else {
     // A prefix-last probe may hit a staged reverse LIMIT 1 secondary scan.
-    // Normal stateful execution keeps the full prefix range.
     const KEY *key = &table->key_info[active_index];
-    const bool filter_ready = prepare_select_filter_for_tx(
-        ha_thd(), table, tx, &pushed_filter_serialized_);
     RangeScanLimit scan_limit = range_scan_limit_for_order(
         ha_thd(), key, current_plan_.used_key_parts,
-        has_unpushed_filter_ || !filter_ready);
-    if (tx->is_prefetch_mode() && !tx->tx_plan_used()) {
+        !select_scan_limit_is_safe(ha_thd(), table));
+    if (statement_uses_read_plan(ha_thd()) && !tx->tx_plan_used()) {
       scan_limit = RangeScanLimit{};
     }
     const bool push_desc_limit =
@@ -721,18 +699,6 @@ int ha_lineairdb::execute_prefix_last(uchar *buf, LineairDBTransaction *tx) {
   return fetch_and_set_current_result(buf, tx);
 }
 
-/**
- * @brief Pre-fetch all row data for a secondary index scan result in one RPC.
- *
- * A secondary index query is a two-step process:
- *   1) Index scan → returns a list of primary keys (secondary_index_results_)
- *   2) Row fetch  → read each row by primary key
- * Without this, step 2 would issue one READ RPC per row (N rows = N RPCs).
- * This method does step 2 in bulk: it sends all primary keys in a single
- * batch_read RPC and stores the results in secondary_index_payloads_.
- * When fetch_and_set_current_result() later returns rows one by one,
- * the data is already in memory — no further RPCs needed.
- */
 void ha_lineairdb::batch_fetch_secondary_payloads(LineairDBTransaction *tx) {
   if (secondary_index_results_.empty()) return;
 
@@ -746,16 +712,6 @@ void ha_lineairdb::batch_fetch_secondary_payloads(LineairDBTransaction *tx) {
   }
 }
 
-/**
- * @brief Fetch and set the current result from secondary_index_results_
- *
- * This helper function reads the primary key at current_position_in_index_,
- * fetches the data from LineairDB, and sets the fields in the buffer.
- *
- * @param buf Buffer to store the result
- * @param tx Transaction object
- * @return 0 on success, error code on failure
- */
 int ha_lineairdb::fetch_and_set_current_result(uchar *buf,
                                                LineairDBTransaction *tx) {
   if (secondary_index_results_.empty()) {
@@ -776,18 +732,10 @@ int ha_lineairdb::fetch_and_set_current_result(uchar *buf,
     const std::string &inline_value =
         secondary_index_payloads_[current_position_in_index_];
     if (inline_value.empty()) {
-      // An empty payload means the base row was deleted between the server's
-      // index walk and its row fetch; a real row encoding is never empty.
-      // Under prefetch the staged absence fails commit validation, so abort
-      // as retryable contention and let a retry stage a consistent snapshot.
-      // A permanently dangling index entry is an index-maintenance bug and
-      // shows up here as a retry loop, never as a wrong result.
-      // In the normal path the base row is simply gone: report not-found.
-      if (tx->is_prefetch_mode()) {
-        tx->set_status_to_abort();
-        return abort_errno(tx);
-      }
-      return HA_ERR_KEY_NOT_FOUND;
+      // The base row vanished under a concurrent commit between the index walk
+      // and the row fetch; the recorded range no longer replays at commit.
+      tx->set_status_to_abort();
+      return abort_errno(tx);
     }
     value_ptr = reinterpret_cast<const std::byte *>(inline_value.data());
     value_size = inline_value.size();

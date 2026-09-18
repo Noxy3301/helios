@@ -672,16 +672,14 @@ def test_reserved_range_dies_with_the_server(user, password):
     return 0
 
 
-def test_prefetch_range_dies_with_the_server(user, password):
+def test_range_dies_with_the_server(user, password):
     """A connection must not spend a range its server no longer owns.
 
-    The reservation rides the normal path even here: INSERT is not one of the
-    statements thd_can_use_prefetch admits, so the sysvar below only covers the
-    reads. What invalidates the cached range is the reset every transport
-    failure performs; the proxy does not reconnect, so the connection that
-    takes that failure is spent with it.
+    What invalidates the cached range is the reset every transport failure
+    performs; the proxy does not reconnect, so the connection that takes that
+    failure is spent with it.
     """
-    print("HIDDEN PRIMARY KEY: PREFETCH RANGE VS SERVER RESTART TEST")
+    print("HIDDEN PRIMARY KEY: RANGE VS SERVER RESTART TEST")
     port_a, port_b = RESTART_MYSQLD_PORTS
 
     if port_is_open(RESTART_SERVER_PORT):
@@ -689,7 +687,7 @@ def test_prefetch_range_dies_with_the_server(user, password):
               "HELIOS_TEST_SERVER_PORT to a free one")
         return 1
 
-    work_dir = tempfile.mkdtemp(prefix="hpk_prefetch_")
+    work_dir = tempfile.mkdtemp(prefix="hpk_range_")
     server = None
     started = []
     connections = []
@@ -703,16 +701,12 @@ def test_prefetch_range_dies_with_the_server(user, password):
             if not start_mysqld(port, RESTART_SERVER_PORT):
                 return 1
 
-        table = unique_table("hidden_prefetch")
+        table = unique_table("hidden_range_restart")
         first = connection_on(port_a, user, password)
         connections.append(first)
         first.autocommit = True
         cursor_a = first.cursor()
         reset_schema(cursor_a)
-        # GLOBAL is the only scope the sysvar has; this mysqld is private to
-        # the case, so nothing else sees it
-
-        cursor_a.execute("SET GLOBAL lineairdb_prefetch_execution=ON")
         create_hidden_pk_table(cursor_a, table)
         # Reserves a range and spends its first id. The row itself dies with
         # the server below; the point is the rest of the range A still holds.
@@ -773,13 +767,8 @@ def test_prefetch_range_dies_with_the_server(user, password):
     return 0
 
 
-def prefetch_insert(cursor, table, payload):
-    """One INSERT inside a transaction prefetch mode will take.
-
-    Prefetch is fixed at the transaction's first statement and INSERT is not
-    one thd_can_use_prefetch admits, so the SELECT has to come first for the
-    INSERT to run on a prefetch connection at all.
-    """
+def read_then_insert(cursor, table, payload):
+    """One INSERT in a transaction that has already read."""
     cursor.execute("START TRANSACTION")
     cursor.execute(f"SELECT payload FROM {DATABASE}.{table}")
     cursor.fetchall()
@@ -787,15 +776,14 @@ def prefetch_insert(cursor, table, payload):
     cursor.execute("COMMIT")
 
 
-def test_prefetch_reservation_dies_with_the_server(user, password):
-    """A prefetch transaction must not spend a range from a dead run.
+def test_reservation_dies_with_the_server(user, password):
+    """A transaction must not spend a range from a dead run.
 
-    A prefetch connection never sends TX_BEGIN, so it cannot learn the current
-    run there, and closing cleanly leaves no failed RPC to reset anything. What
-    keeps the next connection off A's old range is that it starts at token 0
-    and re-reserves.
+    A connection learns the storage run only from its own reservation, and
+    closing cleanly leaves no failed RPC to reset anything. What keeps the next
+    connection off A's old range is that it starts at token 0 and re-reserves.
     """
-    print("HIDDEN PRIMARY KEY: PREFETCH RESERVATION VS SERVER RESTART TEST")
+    print("HIDDEN PRIMARY KEY: RESERVATION VS SERVER RESTART TEST")
     port_a, port_b = RESTART_MYSQLD_PORTS
 
     if port_is_open(RESTART_SERVER_PORT):
@@ -803,11 +791,11 @@ def test_prefetch_reservation_dies_with_the_server(user, password):
               "HELIOS_TEST_SERVER_PORT to a free one")
         return 1
 
-    work_dir = tempfile.mkdtemp(prefix="hpk_prefetch_tx_")
+    work_dir = tempfile.mkdtemp(prefix="hpk_reservation_")
     server = None
     started = []
     connections = []
-    prefetch_was = None
+    read_path_was = None
     try:
         # No recovery: the restart hands the same ids out a second time
         server = start_storage_server(work_dir, recovery=False)
@@ -818,19 +806,19 @@ def test_prefetch_reservation_dies_with_the_server(user, password):
             if not start_mysqld(port, RESTART_SERVER_PORT):
                 return 1
 
-        table = unique_table("hidden_prefetch_tx")
+        table = unique_table("hidden_read_then_insert")
         first = connection_on(port_a, user, password)
         connections.append(first)
         first.autocommit = True
         cursor_a = first.cursor()
         reset_schema(cursor_a)
-        cursor_a.execute("SELECT @@GLOBAL.lineairdb_prefetch_execution")
-        prefetch_was = cursor_a.fetchone()[0]
-        cursor_a.execute("SET GLOBAL lineairdb_prefetch_execution=ON")
+        cursor_a.execute("SELECT @@GLOBAL.lineairdb_read_path")
+        read_path_was = cursor_a.fetchone()[0]
+        cursor_a.execute("SET GLOBAL lineairdb_read_path='plan'")
         create_hidden_pk_table(cursor_a, table)
 
         # Reserves a range under this run and spends its first id
-        prefetch_insert(cursor_a, table, "a-doomed")
+        read_then_insert(cursor_a, table, "a-doomed")
 
         # Closing cleanly is the point: no RPC fails, so nothing resets a
         # token, and only a fresh connection's zero keeps the range off B's.
@@ -858,7 +846,7 @@ def test_prefetch_reservation_dies_with_the_server(user, password):
         resumed_a.autocommit = True
         cursor_resumed_a = resumed_a.cursor()
         try:
-            prefetch_insert(cursor_resumed_a, table, "a-after")
+            read_then_insert(cursor_resumed_a, table, "a-after")
         except mysql.connector.Error as err:
             print(f"\tFailed: the stale range was spent: {err}")
             return 1
@@ -869,11 +857,11 @@ def test_prefetch_reservation_dies_with_the_server(user, password):
             print(f"\tFailed: {report_payloads(expected, observed)}")
             return 1
     finally:
-        if prefetch_was is not None and connections:
+        if read_path_was is not None and connections:
             try:
                 restore = connections[-1].cursor()
-                restore.execute("SET GLOBAL lineairdb_prefetch_execution="
-                                f"{'ON' if int(prefetch_was) else 'OFF'}")
+                restore.execute("SET GLOBAL lineairdb_read_path="
+                                f"'{read_path_was}'")
                 restore.close()
             except mysql.connector.Error:
                 pass
@@ -924,9 +912,9 @@ def main():
                                                             args.password)
         result |= test_reserved_range_dies_with_the_server(args.user,
                                                            args.password)
-        result |= test_prefetch_range_dies_with_the_server(args.user,
+        result |= test_range_dies_with_the_server(args.user,
                                                            args.password)
-        result |= test_prefetch_reservation_dies_with_the_server(args.user,
+        result |= test_reservation_dies_with_the_server(args.user,
                                                                  args.password)
     finally:
         if second_db is not None:

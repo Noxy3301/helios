@@ -6,7 +6,7 @@
 # runs.
 #
 # Usage:
-#   fair_sweep.sh [--mode prefetch|stateful] [--sf N] [--time S] [--terms LIST]
+#   fair_sweep.sh [--read-path plan|row] [--sf N] [--time S] [--terms LIST]
 #                 [--label TAG]
 #
 # Output:
@@ -18,7 +18,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 SCRIPTS="$ROOT/scripts"
 
-MODE=prefetch          # prefetch | stateful
+READ_PATH=plan         # plan | row
 SF=1
 TIME=30
 TERMS="1,4,16,32,64,128,256,384,512"
@@ -26,7 +26,7 @@ LABEL=""
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --mode)  MODE="$2"; shift 2 ;;
+    --read-path) READ_PATH="$2"; shift 2 ;;
     --sf)    SF="$2"; shift 2 ;;
     --time)  TIME="$2"; shift 2 ;;
     --terms) TERMS="$2"; shift 2 ;;
@@ -37,19 +37,16 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-[[ "$MODE" =~ ^(prefetch|stateful)$ ]] || { echo "Invalid --mode" >&2; exit 2; }
+[[ "$READ_PATH" =~ ^(plan|row)$ ]] || { echo "Invalid --read-path" >&2; exit 2; }
 
 ts=$(date +%Y%m%d_%H%M%S)
-tag="${LABEL:+${LABEL}-}${MODE}-sf${SF}"
+tag="${LABEL:+${LABEL}-}${READ_PATH}-sf${SF}"
 OUT_DIR="$ROOT/bench/results/fair-sweep-${tag}-${ts}"
 mkdir -p "$OUT_DIR/log"
 SUMMARY="$OUT_DIR/summary.csv"
 echo "terminals,throughput,goodput,retry,wall_s,drain_s,load_s" > "$SUMMARY"
 
-PREFETCH_FLAG=""
-[[ "$MODE" == "prefetch" ]] && PREFETCH_FLAG="--prefetch"
-
-echo "fair_sweep: mode=$MODE sf=$SF time=${TIME}s terms=$TERMS"
+echo "fair_sweep: read-path=$READ_PATH sf=$SF time=${TIME}s terms=$TERMS"
 echo "output: $OUT_DIR"
 echo
 
@@ -68,14 +65,16 @@ force_stop() {
 
 trap force_stop EXIT
 
-# Avoid carrying lineairdb_logs across iterations: each fresh server start
-# would race on the directory anyway and we already wipe build/data.
+# Avoid carrying the WAL and the server logs across iterations: each fresh
+# server start would race on them anyway and we already wipe build/data.
 IFS=',' read -ra TERM_LIST <<< "$TERMS"
 for term in "${TERM_LIST[@]}"; do
   log="$OUT_DIR/log/iter_${term}.log"
   echo "[$(date +%H:%M:%S)] === t=${term} ===" | tee -a "$SUMMARY".meta
   force_stop
-  rm -rf "$ROOT/build/data" "$ROOT/build/lineairdb_logs" 2>/dev/null || true
+  rm -rf "$ROOT/build/data" "$ROOT/lineairdb_logs" 2>/dev/null || true
+  # The work directory may be a link onto another volume: clear it, keep it.
+  [ -d "$ROOT/helios_wal" ] && find "$ROOT/helios_wal/" -mindepth 1 -delete 2>/dev/null || true
 
   "$SCRIPTS/start_server.sh" >>"$log" 2>&1 &
   for _ in $(seq 1 20); do
@@ -93,7 +92,7 @@ for term in "${TERM_LIST[@]}"; do
   set +e
   python3 "$ROOT/bench/bin/benchrun.py" tpcc \
     --terminals "$term" --time "$TIME" --scalefactor "$SF" \
-    --external-server $PREFETCH_FLAG \
+    --external-server --read-path "$READ_PATH" \
     >>"$log" 2>&1
   rc=$?
   set -e

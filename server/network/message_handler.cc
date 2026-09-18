@@ -9,8 +9,8 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 
-bool MessageHandler::receive_message(int socket, uint64_t& sender_id, 
-                                    MessageType& message_type, std::string& payload) {
+bool MessageHandler::receive_message(int socket, MessageType& message_type,
+                                     std::string& payload) {
     // Read fixed-size header
     MessageHeader net_header{};
     ssize_t header_read = recv(socket, &net_header, sizeof(net_header), MSG_WAITALL);
@@ -24,12 +24,11 @@ bool MessageHandler::receive_message(int socket, uint64_t& sender_id,
     }
 
     // Convert message header (network order -> host order)
-    sender_id = be64toh(net_header.sender_id);
     message_type = static_cast<MessageType>(ntohl(net_header.message_type));
     uint32_t payload_size = ntohl(net_header.payload_size);
 
-    LOG_DEBUG("Received header: sender_id=%lu, message_type=%u, payload_size=%u", 
-              sender_id, static_cast<uint32_t>(message_type), payload_size);
+    LOG_DEBUG("Received header: message_type=%u, payload_size=%u",
+              static_cast<uint32_t>(message_type), payload_size);
 
     // Read payload (if exists)
     payload.clear();
@@ -49,8 +48,8 @@ bool MessageHandler::receive_message(int socket, uint64_t& sender_id,
     return true;
 }
 
-bool MessageHandler::send_response(int socket, uint64_t sender_id,
-                                  MessageType message_type, const std::string& payload) {
+bool MessageHandler::send_response(int socket, MessageType message_type,
+                                   const std::string& payload) {
     LOG_DEBUG("Sending response (%zu bytes)", payload.size());
 
     if (payload.size() > UINT32_MAX) {
@@ -61,7 +60,6 @@ bool MessageHandler::send_response(int socket, uint64_t sender_id,
 
     // Prepare response header
     MessageHeader response_header;
-    response_header.sender_id = htobe64(sender_id);
     response_header.message_type = htonl(static_cast<uint32_t>(message_type));
     response_header.payload_size = htonl(static_cast<uint32_t>(payload.size()));
 
@@ -87,8 +85,8 @@ bool MessageHandler::send_response(int socket, uint64_t sender_id,
     return true;
 }
 
-bool MessageHandler::send_response_writev(int socket, uint64_t sender_id,
-                                          MessageType message_type, const std::string& payload) {
+bool MessageHandler::send_response_writev(int socket, MessageType message_type,
+                                          const std::string& payload) {
     LOG_DEBUG("Sending response via writev (%zu bytes)", payload.size());
 
     if (payload.size() > UINT32_MAX) {
@@ -98,7 +96,6 @@ bool MessageHandler::send_response_writev(int socket, uint64_t sender_id,
     }
 
     MessageHeader response_header;
-    response_header.sender_id = htobe64(sender_id);
     response_header.message_type = htonl(static_cast<uint32_t>(message_type));
     response_header.payload_size = htonl(static_cast<uint32_t>(payload.size()));
 

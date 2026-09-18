@@ -1,5 +1,7 @@
 #include "lineairdb_autogen.hh"
 
+#include "../common/log.h"
+
 #include <algorithm>
 #include <cstdint>
 #include <limits>
@@ -9,7 +11,6 @@
 #include <vector>
 
 #include "lineairdb_keyenc.hh"
-#include "lineairdb_pushdown.hh"
 #include "my_base.h"
 #include "my_sys.h"
 #include "mysqld_error.h"
@@ -89,8 +90,10 @@ const char *access_path_type_name(AccessPath::Type type) {
   return "UNKNOWN";
 }
 
-bool raise_unsupported(THD *thd, const char *type_name,
-                       const std::string &reason) {
+// Report a shape with no read plan. Not an error: the statement's reads take
+// the row path instead. Always returns false so callers can return it.
+bool plan_not_staged(THD *thd, const char *type_name,
+                     const std::string &reason) {
   const LEX_CSTRING query = thd != nullptr ? thd->query() : LEX_CSTRING();
   const std::string sql =
       query.str != nullptr && query.length > 0
@@ -98,22 +101,15 @@ bool raise_unsupported(THD *thd, const char *type_name,
           : std::string();
   const long long query_id = thd != nullptr ? thd->query_id : 0;
 
-  std::string msg = "LineairDB autogen read plan unsupported: type=";
-  msg += type_name != nullptr ? type_name : "UNKNOWN";
-  msg += " reason=";
-  msg += reason;
-  msg += " query_id=";
-  msg += std::to_string(query_id);
-  msg += " sql=";
-  msg += sql;
-
-  my_error(ER_NOT_SUPPORTED_YET, MYF(0), msg.c_str());
+  LOG_DEBUG("autogen read plan not staged: type=%s reason=%s query_id=%lld sql=%s",
+            type_name != nullptr ? type_name : "UNKNOWN", reason.c_str(),
+            query_id, sql.c_str());
   return false;
 }
 
-bool raise_unsupported(THD *thd, AccessPath::Type type,
-                       const std::string &reason) {
-  return raise_unsupported(thd, access_path_type_name(type), reason);
+bool plan_not_staged(THD *thd, AccessPath::Type type,
+                     const std::string &reason) {
+  return plan_not_staged(thd, access_path_type_name(type), reason);
 }
 
 void set_unsupported(AccessPath *p, const char *reason, bool *ok,
@@ -422,10 +418,8 @@ bool compile_index_range_scan(AccessPath *leaf, TABLE *table,
   QUICK_RANGE *range = range_scan.ranges[0];
   step->table_name = physical_table_key(table);
   step->is_scan = true;
-  // Stage the canonical forward, unbounded shape (reverse_scan=false,
-  // scan_limit=0); MySQL applies ORDER BY / LIMIT / WHERE above and the consumer
-  // requests the same shape, so staged and consumed scans match. Pushing
-  // direction/limit is filter-aware v2 work (the plan scan carries no WHERE).
+  // Stage the canonical forward, unbounded shape; MySQL applies ORDER BY /
+  // LIMIT / WHERE above and the consumer requests the same shape.
   if (range_scan.index != table->s->primary_key) {
     step->index_name = table->key_info[range_scan.index].name;
   }
@@ -439,10 +433,9 @@ bool compile_index_range_scan(AccessPath *leaf, TABLE *table,
       if (reason != nullptr) *reason = "failed to encode range start key";
       return false;
     }
-    // NEAR_MIN (exclusive lower): match the handler, which appends one '\0' for
-    // HA_READ_AFTER_KEY. build_prefix_range_end would overshoot the handler's
-    // start and miss the cache; '\0' can over-include a shared-prefix key, but
-    // the WHERE re-check makes that a safe over-fetch.
+    // NEAR_MIN (exclusive lower): append one '\0' as the handler does for
+    // HA_READ_AFTER_KEY. It can over-include a shared-prefix key, which the
+    // WHERE re-check trims.
     if (range->flag & NEAR_MIN) step->key_prefix.push_back('\0');
   }
 
@@ -536,10 +529,9 @@ bool compile_ref_lookup(
     bound_items.push_back({kp, item_field});
   }
 
-  // Pick the iterator source. A keypart bound to a real earlier step iterates
-  // directly. One bound to a materialized temp table is remapped via Item_equal
-  // onto a real earlier step, staging only the leading key prefix; the dropped
-  // trailing keyparts over-fetch a superset that the WHERE re-check trims.
+  // A keypart bound to a real earlier step iterates directly; one bound to a
+  // materialized temp table is remapped via Item_equal onto a real step,
+  // staging only the leading key prefix and over-fetching the rest.
   TABLE *iter_table = nullptr;
   int iter_step = -1;
 
@@ -931,10 +923,8 @@ bool plan_tree_contains(AccessPath *root, const AccessPath *node) {
   return false;
 }
 
-// Find the query block whose plan contains `node`, descending from `unit`
-// through inner query expressions. The node may sit below wrapper paths
-// (FILTER for HAVING, LIMIT_OFFSET, ...), so containment is checked instead
-// of comparing against the block's plan root.
+// The query block whose plan contains `node`. The node may sit below wrapper
+// paths (FILTER, LIMIT_OFFSET), so this tests containment, not the plan root.
 Query_block *query_block_containing_plan_node(Query_expression *unit,
                                               const AccessPath *node) {
   if (unit == nullptr || node == nullptr) return nullptr;
@@ -955,11 +945,9 @@ Query_block *query_block_containing_plan_node(Query_expression *unit,
   return nullptr;
 }
 
-// Stage the scan behind a bare COUNT(*). The UNQUALIFIED_COUNT node has no
-// table parameters; MySQL counts through ha_records() (a primary full scan)
-// for JT_ALL plans and through ha_records(index) (an index_first/index_next
-// walk over the optimizer-chosen index) otherwise, so the staged step must
-// follow the chosen access.
+// Stage the scan behind a bare COUNT(*). UNQUALIFIED_COUNT carries no table
+// parameters, so the step must follow the access MySQL counts through:
+// ha_records() for JT_ALL, ha_records(index) otherwise.
 bool compile_unqualified_count(
     THD *thd, AccessPath *leaf,
     std::unordered_map<TABLE *, int> *table_steps,
@@ -994,11 +982,9 @@ bool compile_unqualified_count(
     return false;
   }
 
-  // Mirror get_exact_record_count(): JT_ALL (and a clustered-primary index
-  // choice) counts via ha_records(); any other plan counts via
-  // ha_records(qt->index()). ha_lineairdb reports a non-clustered primary,
-  // so only JT_ALL and index()==primary land on the staged primary range;
-  // a secondary index choice must stage that secondary range instead.
+  // Mirror get_exact_record_count(). ha_lineairdb reports a non-clustered
+  // primary, so only JT_ALL and index()==primary count through the staged
+  // primary range; another index choice stages that secondary range.
   const QEP_TAB *qt = nullptr;
   if (qb->join != nullptr && qb->join->qep_tab != nullptr &&
       qb->join->primary_tables > 0) {
@@ -1086,9 +1072,10 @@ bool compile_tree_leaves(
       unsupported->reason = "unsupported QEP leaf";
       return false;
     }
-    if (table->s != nullptr && table->s->tmp_table != NO_TMP_TABLE) {
-      // Local MySQL temp tables are not stored in LineairDB, so there is
-      // nothing to prefetch for this leaf.
+    if ((table->s != nullptr && table->s->tmp_table != NO_TMP_TABLE) ||
+        table->file == nullptr || table->file->ht != lineairdb_hton) {
+      // Only LineairDB base tables hold staged rows; MySQL temp tables and
+      // tables of another engine have nothing to prefetch for this leaf.
       continue;
     }
     if (table_steps->find(table) != table_steps->end()) {
@@ -1168,12 +1155,12 @@ bool autogen_read_plan_from_qep(
     std::vector<LineairDBProxy::ReadPlanStep> *out,
     bool include_inner_units) {
   if (out == nullptr) {
-    return raise_unsupported(thd, "NONE", "null output vector");
+    return plan_not_staged(thd, "NONE", "null output vector");
   }
   out->clear();
 
   if (root == nullptr) {
-    return raise_unsupported(thd, "NONE", "missing JOIN root_access_path");
+    return plan_not_staged(thd, "NONE", "missing JOIN root_access_path");
   }
 
   std::unordered_map<TABLE *, int> table_steps;
@@ -1184,7 +1171,7 @@ bool autogen_read_plan_from_qep(
   if (!compile_tree_leaves(thd, root, /*allow_limit_pushdown=*/true,
                            &table_steps, &steps,
                            &added_tables, &unsupported)) {
-    return raise_unsupported(thd, unsupported.type, unsupported.reason);
+    return plan_not_staged(thd, unsupported.type, unsupported.reason);
   }
 
   if (include_inner_units && thd != nullptr && thd->lex != nullptr) {
@@ -1212,13 +1199,12 @@ bool autogen_read_plan_from_qep(
   }
 
   if (steps.empty()) {
-    return raise_unsupported(thd, root->type, "QEP has no stageable leaves");
+    return plan_not_staged(thd, root->type, "QEP has no stageable leaves");
   }
 
-  // SharedScan dedup: fold byte-identical staged steps into one -- (a)
-  // self-contained scans (a view read twice) and (b) for_each probes with
-  // deep-equal bindings (a self-join or correlated subquery). Keep the
-  // earliest and remap later steps' source_step (like execute_read_plan).
+  // Fold byte-identical staged steps into the earliest one (a view read twice,
+  // or for_each probes with deep-equal bindings) and remap the later steps'
+  // source_step.
   std::vector<std::vector<TABLE *>> step_aliases(steps.size());
   for (size_t i = 0; i < steps.size() && i < added_tables.size(); ++i) {
     if (added_tables[i] != nullptr) step_aliases[i].push_back(added_tables[i]);
@@ -1299,20 +1285,20 @@ bool autogen_read_plan_from_qep(
   return true;
 }
 
-// Produce a one-step prefetch plan from the handler access, raising
-// ER_NOT_SUPPORTED on an unsupported shape.
+// Produce a one-step read plan from the handler access; a shape it cannot
+// stage returns false and its reads take the row path.
 bool autogen_read_plan_from_index_search(
     THD *thd, TABLE *table, uint index, const IndexSearchPlan &search,
     std::vector<LineairDBProxy::ReadPlanStep> *out) {
   if (out == nullptr) {
-    return raise_unsupported(thd, "HANDLER", "null output vector");
+    return plan_not_staged(thd, "HANDLER", "null output vector");
   }
   out->clear();
 
   LineairDBProxy::ReadPlanStep step;
   std::string reason;
   if (!compile_index_search(table, index, search, &step, &reason)) {
-    return raise_unsupported(thd, "HANDLER", reason);
+    return plan_not_staged(thd, "HANDLER", reason);
   }
 
   out->push_back(std::move(step));

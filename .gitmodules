@@ -2,11 +2,6 @@
 	path = third_party/mysql-server
 	url = https://github.com/mysql/mysql-server.git
 	ignore = dirty
-[submodule "third_party/LineairDB"]
-	path = third_party/LineairDB
-	url = https://github.com/Noxy3301/LineairDB.git
-	branch = research/helios
-	ignore = dirty
 [submodule "third_party/benchbase"]
 	path = third_party/benchbase
 	url = https://github.com/Noxy3301/benchbase.git
@@ -16,3 +11,16 @@
 	path = third_party/duckdb
 	url = https://github.com/duckdb/duckdb.git
 	ignore = dirty
+[submodule "server/storage/third_party/spdlog"]
+	path = server/storage/third_party/spdlog
+	url = https://github.com/gabime/spdlog.git
+[submodule "server/storage/third_party/googletest"]
+	path = server/storage/third_party/googletest
+	url = https://github.com/google/googletest.git
+[submodule "server/storage/third_party/msgpack"]
+	path = server/storage/third_party/msgpack
+	url = https://github.com/msgpack/msgpack-c.git
+	branch = cpp_master
+[submodule "server/storage/third_party/masstree"]
+	path = server/storage/third_party/masstree
+	url = https://github.com/Noxy3301/masstree-beta.git

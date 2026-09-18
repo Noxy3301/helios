@@ -42,7 +42,8 @@ mkdir -p \
   "$B/build/lib" \
   "$B/bench/config" \
   "$B/bench/benchbase-mysql/results" \
-  "$B/lineairdb_logs"
+  "$B/lineairdb_logs" \
+  "$B/helios_wal"
 
 # --- mysqld / client (query node) ------------------------------------------------
 cp "$HELIOS/build/runtime_output_directory/"{mysqld,mysql,mysqladmin} \
@@ -81,8 +82,9 @@ cp "$HELIOS/scripts/"{start_mysql.sh,stop_mysql.sh,start_server.sh,stop_server.s
    "$B/scripts/"
 
 # Inject a cd to the bundle root and an LD_LIBRARY_PATH export into the start
-# scripts: lineairdb-server writes ./lineairdb_logs relative to cwd, and the
-# library path replaces the build machine's absolute RUNPATH
+# scripts: lineairdb-server writes ./helios_wal and its own log under
+# ./lineairdb_logs relative to cwd, and the library path replaces the build
+# machine's absolute RUNPATH
 for s in start_mysql.sh start_server.sh; do
   sed -i '1a\
 # --- injected by build_bundle.sh (relocatable bundle) ---\
@@ -103,7 +105,7 @@ EOF
   echo "built_at: $(date -Iseconds)"
   echo "built_on: $(hostname) ($(uname -sr), glibc $(ldd --version | head -1 | awk '{print $NF}'))"
   echo "helios:   $(git -C "$HELIOS" rev-parse --abbrev-ref HEAD)@$(git -C "$HELIOS" rev-parse --short HEAD)"
-  for sub in third_party/LineairDB third_party/mysql-server third_party/duckdb third_party/benchbase; do
+  for sub in third_party/mysql-server third_party/duckdb third_party/benchbase; do
     [ -d "$HELIOS/$sub/.git" ] || [ -f "$HELIOS/$sub/.git" ] || continue
     echo "$(basename "$sub"): $(git -C "$HELIOS/$sub" rev-parse --short HEAD)"
   done

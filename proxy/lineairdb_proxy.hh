@@ -2,7 +2,6 @@
 #define LINEAIRDB_PROXY_H
 
 #include <cstdint>
-#include <optional>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -11,22 +10,11 @@
 
 #include "lineairdb.pb.h"
 
-class LineairDBTransaction;
 class TxRpcTrace;
 
-struct KeyValue {
-    std::string key;
-    std::string value;
-};
-
-struct SecondaryIndexEntry {
-    std::string secondary_key;
-    std::vector<std::string> primary_keys;
-};
-
-// Message header for RPC communication (matching server implementation)
+// Frame header of one request or response (the server's message.hh), both
+// fields in network order.
 struct MessageHeader {
-    uint64_t sender_id;      // sender ID
     uint32_t message_type;   // OpCode from protobuf
     uint32_t payload_size;   // size of the protobuf payload
 };
@@ -35,67 +23,33 @@ struct MessageHeader {
 enum class MessageType : uint32_t {
     UNKNOWN = 0,
 
-    // Transaction lifecycle
-    TX_BEGIN_TRANSACTION = 1,
-    TX_ABORT = 2,
+    // Reads
+    TX_READ = 1,
+    TX_BATCH_READ = 2,
+    TX_SCAN = 3,
+    TX_SCAN_INDEX = 4,
+    TX_EXECUTE_READ_PLAN = 5,
 
-    // Primary key operations
-    TX_READ = 3,
-    TX_WRITE = 4,
-    TX_DELETE = 5,
+    // The one commit of a transaction
+    TX_COMMIT = 6,
 
-    // Secondary index operations
-    TX_READ_SECONDARY_INDEX = 6,
-    TX_WRITE_SECONDARY_INDEX = 7,
-    TX_DELETE_SECONDARY_INDEX = 8,
-    TX_UPDATE_SECONDARY_INDEX = 9,
+    TX_GET_TABLE_STATS = 7,
+    TX_EXECUTE_DUCKDB_QUERY = 8,
 
-    // Primary key scan operations
-    TX_GET_MATCHING_KEYS_IN_RANGE = 10,
-    TX_GET_MATCHING_KEYS_AND_VALUES_IN_RANGE = 11,
-    TX_GET_MATCHING_KEYS_AND_VALUES_FROM_PREFIX = 12,
-    TX_FETCH_LAST_KEY_IN_RANGE = 13,
-    TX_FETCH_FIRST_KEY_WITH_PREFIX = 14,
-    TX_FETCH_NEXT_KEY_WITH_PREFIX = 15,
-
-    // Secondary index scan operations
-    TX_GET_MATCHING_PRIMARY_KEYS_IN_RANGE = 16,
-    TX_GET_MATCHING_PRIMARY_KEYS_FROM_PREFIX = 17,
-    TX_FETCH_LAST_PRIMARY_KEY_IN_SECONDARY_RANGE = 18,
-    TX_FETCH_LAST_SECONDARY_ENTRY_IN_RANGE = 19,
-
-    // Database operations
-    DB_FENCE = 20,
-    DB_END_TRANSACTION = 21,
-    DB_CREATE_TABLE = 22,
-    DB_SET_TABLE = 23,
-    DB_CREATE_SECONDARY_INDEX = 24,
-
-    // Batch operations
-    TX_BATCH_READ = 25,
-    TX_BATCH_WRITE = 26,
-
-    // Experimental prefetch operations
-    TX_STATELESS_READ = 27,
-    TX_STATELESS_BATCH_READ = 28,
-    TX_VALIDATE_AND_COMMIT = 29,
-    TX_EXECUTE_READ_PLAN = 30,
-    TX_GET_TABLE_STATS = 31,
-
-    // DuckDB bridge (resolved-statement request). See lineairdb.proto.
-    TX_EXECUTE_DUCKDB_QUERY = 36,
-
-    // Hidden primary key allocation
-    DB_ALLOCATE_HIDDEN_KEYS = 37
+    // Definitions and server state
+    DB_CREATE_TABLE = 9,
+    DB_CREATE_SECONDARY_INDEX = 10,
+    DB_ALLOCATE_HIDDEN_KEYS = 11,
+    DB_SET_COMMIT_DURABILITY = 12
 };
 
 /**
- * RPC client that provides the same transactional API as LineairDB,
- * but internally forwards all operations to a remote server via RPC over TCP.
+ * RPC client for the storage server. Every read answers from the storage's
+ * current state and leaves nothing behind there; the query layer keeps the
+ * transaction and installs it with one TX_COMMIT.
  *
- * In this disaggregated architecture, MySQL instances do not embed LineairDB
- * directly; instead, each THD holds a LineairDBProxy that maintains a
- * TCP connection to the remote LineairDB server. Managed via LineairDBThdCtx.
+ * Each THD holds a LineairDBProxy with its own TCP connection, managed via
+ * LineairDBThdCtx.
  */
 class LineairDBProxy {
 public:
@@ -107,8 +61,6 @@ public:
     void disconnect();
     bool is_connected() const;
 
-    // transaction management
-    int64_t tx_begin_transaction();
     struct IndexNdvResult {
         bool available = false;
         // values[i] is the NDV for the first i+1 key parts.
@@ -130,28 +82,69 @@ public:
     const std::unordered_map<std::string, IndexHistResult>& last_index_hist() const {
         return last_index_hist_;
     }
-    void tx_abort(int64_t tx_id);
 
-    // primary key operations
-    std::string tx_read(LineairDBTransaction* tx, const std::string& key);
-    bool tx_write(LineairDBTransaction* tx, const std::string& key, const std::string& value);
-    bool tx_delete(LineairDBTransaction* tx, const std::string& key);
-
-    // batch operations
-    struct BatchReadResult {
-        bool found;
-        std::string value;
-    };
-    struct StatelessReadResult {
+    // One row by primary key. ok is false when the request did not reach the
+    // server; found says whether the key holds a row, tid is what the commit
+    // validates.
+    struct ReadResult {
         bool ok = false;
         bool found = false;
         std::string value;
         uint64_t tid = 0;
     };
-    struct StatelessReadKey {
+    struct ReadKey {
         std::string table_name;
         std::string key;
     };
+    ReadResult tx_read(const std::string& table_name, const std::string& key);
+    std::vector<ReadResult> tx_batch_read(const std::vector<ReadKey>& keys);
+
+    // Rows of [start_key, end_key) in key order, reversed when reverse_scan.
+    // row_limit 0 means every row; keys_only leaves value empty. ok is false
+    // when the table (or index) is missing or end_key is empty.
+    struct ScanRow {
+        std::string key;
+        std::string value;
+        uint64_t tid = 0;
+    };
+    struct ScanResult {
+        bool ok = false;
+        // The exchange itself failed, which is not contention and never a
+        // refusal by the server.
+        bool transport_error = false;
+        std::vector<ScanRow> rows;
+    };
+    ScanResult tx_scan(const std::string& table_name,
+                       const std::string& start_key,
+                       const std::string& end_key, uint64_t row_limit,
+                       bool reverse_scan, bool keys_only);
+
+    struct ScanIndexRow {
+        std::string secondary_key;
+        std::string primary_key;
+        std::string value;
+        uint64_t tid = 0;  // the base row's TID
+    };
+    struct ScanIndexResult {
+        bool ok = false;
+        bool transport_error = false;
+        std::vector<ScanIndexRow> rows;
+    };
+    ScanIndexResult tx_scan_index(const std::string& table_name,
+                                  const std::string& index_name,
+                                  const std::string& start_key,
+                                  const std::string& end_key,
+                                  uint64_t row_limit, bool reverse_scan,
+                                  bool keys_only);
+
+    // One row the transaction read, validated by its TID at commit.
+    struct ReadEntry {
+        std::string table_name;
+        std::string key;
+        uint64_t tid = 0;
+    };
+    // One range the transaction scanned. The commit re-runs the scan these
+    // bounds describe and requires the same key list.
     struct RangeReadEntry {
         std::string table_name;
         std::string index_name;
@@ -200,16 +193,23 @@ public:
         std::vector<uint32_t> group_sizes;
         std::vector<std::string> group_start_keys;
         std::vector<std::string> group_end_keys;
-        // Keys the step filter rejected (plain scans): negative coverage.
-        std::vector<std::string> filtered_keys;
     };
     struct ReadPlanResult {
         bool ok = false;
+        // No valid response came back at all, as opposed to a plan the server
+        // refused: a lost connection is not contention.
+        bool transport_error = false;
         std::vector<ReadPlanStepResult> steps;
     };
-    std::vector<BatchReadResult> tx_batch_read(LineairDBTransaction* tx,
-                                                const std::vector<std::string>& keys);
-    struct BatchOp {
+    ReadPlanResult tx_execute_read_plan(
+        const std::vector<ReadPlanStep>& steps);
+    bool tx_execute_duckdb_query(
+        const LineairDB::Protocol::TxExecuteDuckdbQuery::Request& request,
+        LineairDB::Protocol::TxExecuteDuckdbQuery::Response* response);
+
+    // One row or secondary-index change the transaction installs at commit,
+    // kept in the order the query layer issued it.
+    struct WriteOp {
         enum class Type {
             Write,
             Delete,
@@ -224,107 +224,27 @@ public:
         std::string primary_key;
         std::string table_name;
         // Row write that must find the key free; the server refuses it
-        // otherwise. Never set on a REPLACE, which is an upsert by contract.
+        // otherwise.
         bool is_insert = false;
     };
-    bool tx_batch_write(LineairDBTransaction* tx,
-                        const std::string& table_name,
-                        const std::vector<BatchOp>& ops);
-    StatelessReadResult tx_stateless_read(const std::string& table_name,
-                                          const std::string& key);
-    std::vector<StatelessReadResult> tx_stateless_batch_read(
-        const std::vector<StatelessReadKey>& keys);
-    ReadPlanResult tx_execute_read_plan(
-        const std::vector<ReadPlanStep>& steps);
-    bool tx_execute_duckdb_query(
-        const LineairDB::Protocol::TxExecuteDuckdbQuery::Request& request,
-        LineairDB::Protocol::TxExecuteDuckdbQuery::Response* response);
-    bool tx_validate_and_commit(
-        const std::vector<StatelessReadKey>& reads,
-        const std::vector<uint64_t>& read_tids,
-        const std::vector<bool>& read_found,
+    // Validate every read and range, then install the writes. duplicate_key is
+    // set when the server refused a duplicate primary or unique secondary key.
+    bool tx_commit(
+        const std::vector<ReadEntry>& reads,
         const std::vector<RangeReadEntry>& range_reads,
-        const std::vector<BatchOp>& ops,
+        const std::vector<WriteOp>& ops,
         const std::vector<std::pair<std::string, int64_t>>& row_deltas,
-        bool isFence,
         std::string* abort_detail = nullptr,
         bool* duplicate_key = nullptr,
         bool* transport_error = nullptr);
 
-    // secondary index operations
-    std::vector<std::string> tx_read_secondary_index(LineairDBTransaction* tx,
-                                                     const std::string& index_name,
-                                                     const std::string& secondary_key);
-    bool tx_write_secondary_index(LineairDBTransaction* tx,
-                                  const std::string& index_name,
-                                  const std::string& secondary_key,
-                                  const std::string& primary_key);
-    bool tx_delete_secondary_index(LineairDBTransaction* tx,
-                                   const std::string& index_name,
-                                   const std::string& secondary_key,
-                                   const std::string& primary_key);
-    bool tx_update_secondary_index(LineairDBTransaction* tx,
-                                   const std::string& index_name,
-                                   const std::string& old_secondary_key,
-                                   const std::string& new_secondary_key,
-                                   const std::string& primary_key);
-
-    // primary key scan operations
-    std::vector<std::string> tx_get_matching_keys_in_range(LineairDBTransaction* tx,
-                                                           const std::string& start_key,
-                                                           const std::string& end_key);
-    std::vector<KeyValue> tx_get_matching_keys_and_values_in_range(LineairDBTransaction* tx,
-                                                                    const std::string& start_key,
-                                                                    const std::string& end_key,
-                                                                    uint64_t row_limit = 0,
-                                                                    bool reverse_scan = false);
-    std::vector<KeyValue> tx_get_matching_keys_and_values_from_prefix(LineairDBTransaction* tx,
-                                                                       const std::string& prefix);
-    // Zero-copy variant: parse binary response directly into caller-provided buffers.
-    // Returns number of entries parsed, or -1 on error.
-    int tx_scan_into_buffers(LineairDBTransaction* tx,
-                             const std::string& prefix,
-                             std::vector<std::string>& out_keys,
-                             std::vector<std::vector<std::byte>>& out_values,
-                             std::unordered_map<std::string, size_t>& out_cache);
-    std::optional<std::string> tx_fetch_last_key_in_range(LineairDBTransaction* tx,
-                                                           const std::string& start_key,
-                                                           const std::string& end_key);
-    std::optional<std::string> tx_fetch_first_key_with_prefix(LineairDBTransaction* tx,
-                                                               const std::string& prefix,
-                                                               const std::string& prefix_end);
-    std::optional<std::string> tx_fetch_next_key_with_prefix(LineairDBTransaction* tx,
-                                                              const std::string& last_key,
-                                                              const std::string& prefix_end);
-
-    // secondary index scan operations
-    std::vector<std::string> tx_get_matching_primary_keys_in_range(LineairDBTransaction* tx,
-                                                                    const std::string& index_name,
-                                                                    const std::string& start_key,
-                                                                    const std::string& end_key);
-    std::vector<std::string> tx_get_matching_primary_keys_from_prefix(LineairDBTransaction* tx,
-                                                                       const std::string& index_name,
-                                                                       const std::string& prefix);
-    std::optional<std::string> tx_fetch_last_primary_key_in_secondary_range(LineairDBTransaction* tx,
-                                                                             const std::string& index_name,
-                                                                             const std::string& start_key,
-                                                                             const std::string& end_key);
-    std::optional<SecondaryIndexEntry> tx_fetch_last_secondary_entry_in_range(LineairDBTransaction* tx,
-                                                                               const std::string& index_name,
-                                                                               const std::string& start_key,
-                                                                               const std::string& end_key);
-
     // table/index management (non-transactional)
-    // Optional PAX storage cell widths. Entry 0 is the null-flags field; later
-    // entries follow TABLE::field order. Empty keeps the ordinary row layout.
-    // pax_field_kind/pax_field_scale carry PAX typed-cell metadata, one entry
-    // per pax_field_max_bytes entry; empty keeps the ASCII byte layout.
-    bool db_create_table(
-        const std::string& table_name,
-        const std::vector<uint32_t>& pax_field_max_bytes = {},
-        const std::vector<uint32_t>& pax_field_kind = {},
-        const std::vector<int32_t>& pax_field_scale = {});
-    bool db_set_table(int64_t tx_id, const std::string& table_name);
+    // PAX cell widths in bytes (entry 0 = null flags, then TABLE::field
+    // order); kind/scale carry typed cells, one entry per width.
+    bool db_create_table(const std::string& table_name,
+                         const std::vector<uint32_t>& pax_field_max_bytes,
+                         const std::vector<uint32_t>& pax_field_kind,
+                         const std::vector<int32_t>& pax_field_scale);
     bool db_create_secondary_index(const std::string& table_name,
                                    const std::string& index_name,
                                    uint32_t index_type);
@@ -345,14 +265,7 @@ public:
     HiddenKeyReservation db_allocate_hidden_keys(const std::string& table_name,
                                                  uint32_t count);
 
-    // database operations
-    bool db_end_transaction(int64_t tx_id, bool isFence,
-                            const std::vector<std::pair<std::string, int64_t>>& row_deltas = {},
-                            bool *duplicate_key = nullptr,
-                            bool *transport_error = nullptr);
-    void db_fence();
-
-    // statistics: cached table row counts, refreshed on BEGIN/END
+    // statistics: cached table row counts, refreshed by every commit
     const std::unordered_map<std::string, int64_t>& cached_table_stats() const {
         return table_stats_cache_;
     }
@@ -360,9 +273,8 @@ public:
     // Route per-RPC measurements to the active transaction trace.
     void set_current_trace(TxRpcTrace* trace) { current_trace_ = trace; }
 
-    // Run of the storage server this connection has heard from, 0 until it
-    // hears from one and again after any transport failure. Starting at 0 is
-    // what makes a new connection re-reserve rather than trust a cached range.
+    // Run of the storage server this connection has heard from; 0 until heard
+    // and after any transport failure, which forces re-reservation.
     uint64_t storage_boot_token() const { return storage_boot_token_; }
 
 private:
@@ -376,8 +288,6 @@ private:
     template<typename RequestType>
     bool send_protobuf_recv_binary(const RequestType& request, std::string& raw_response,
                                    MessageType message_type, const std::string& meta = "");
-    // Parse flat binary scan response: [is_aborted:1B] [entries...] [sentinel: key_len=0]
-    static std::vector<KeyValue> parse_binary_kv_response(const std::string& raw, bool& is_aborted);
     bool send_message_with_header(const std::string& serialized_request,
                                   std::string& serialized_response,
                                   MessageType message_type,
@@ -387,6 +297,10 @@ private:
     bool exchange_message(const std::string& serialized_request,
                           std::string& serialized_response,
                           MessageType message_type, const std::string& meta);
+
+    // Connect on demand so a channel closed by a transport error is reopened
+    // by the next RPC.
+    bool ensure_connected();
 
     uint64_t storage_boot_token_ = 0;
     int socket_fd_;

@@ -16,7 +16,7 @@
 struct RpcEntry {
   MessageType type;
   uint64_t us;          // duration microseconds
-  uint64_t off_us;      // offset from tx_begin in microseconds
+  uint64_t off_us;      // offset from the transaction start in microseconds
   uint32_t req_b;       // serialized request bytes
   uint32_t resp_b;      // serialized response bytes
   uint32_t stmt_idx;    // index into statements_; UINT32_MAX if pre-stmt
@@ -41,8 +41,7 @@ struct LocalViewEntry {
 // Per-LineairDBTransaction trace state.
 class TxRpcTrace {
  public:
-  void start(int64_t tx_id, std::thread::id tid);
-  void set_tx_id(int64_t tx_id) { tx_id_ = tx_id; }
+  void start(std::thread::id tid);
   void on_stmt(const std::string& sql);
   void record(MessageType type, uint64_t us, uint32_t req_b,
               uint32_t resp_b, const std::string& meta);
@@ -53,7 +52,6 @@ class TxRpcTrace {
 
  private:
   bool active_ = false;
-  int64_t tx_id_ = -1;
   std::thread::id tid_;
   std::chrono::steady_clock::time_point started_;
   std::chrono::system_clock::time_point started_wall_;

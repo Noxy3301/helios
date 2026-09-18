@@ -1,0 +1,11 @@
+This tree is derived from LineairDB, Copyright (C) 2020 Nippon Telegraph and
+Telephone Corporation, licensed under the Apache License, Version 2.0 (see
+LICENSE). It is an independently pruned and rewritten derivative, not LineairDB
+itself: the upstream API and documentation do not describe this code.
+
+Frozen fork it was taken from: https://github.com/Noxy3301/LineairDB
+Upstream: https://github.com/LineairDB/LineairDB
+
+The fork also added implementations, including CRC32C, PAX, index statistics,
+and epoch-frame WAL. The source includes those additions and subsequent
+Helios changes alongside upstream-derived code.

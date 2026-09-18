@@ -1,11 +1,10 @@
 #include "lineairdb_rpc.hh"
 
 #include <chrono>
-#include <condition_variable>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <limits>
-#include <memory>
 #include <mutex>
 #include <random>
 #include <string>
@@ -13,33 +12,16 @@
 
 #include "../../common/log.h"
 #include "lineairdb.pb.h"
+#include "lineairdb/pax.h"
+#include "lineairdb/transaction.h"
 
-// Database-wide RPC handlers for fencing and DDL.
-
-void LineairDBRpc::handleDbFence(const std::string& message,
-                                 std::string& result) {
-    LOG_DEBUG("Handling DbFence");
-
-    LineairDB::Protocol::DbFence::Request request;
-    LineairDB::Protocol::DbFence::Response response;
-
-    request.ParseFromString(message);
-
-    db_manager_->get_database()->Fence();
-    LOG_DEBUG("Database fence completed");
-
-    result = response.SerializeAsString();
-}
+// Database-wide RPC handlers for DDL.
 
 namespace {
 
 // Holds one next-unallocated id per table, keyed by table name. MySQL table
 // names are paths and always begin with "./", so no user table can land here.
 constexpr char kWatermarkTable[] = "__helios_hidden_keys";
-
-// A concurrent writer can invalidate the publishing commit; retry before
-// turning that into a statement error.
-constexpr int kReserveAttempts = 8;
 
 }  // namespace
 
@@ -65,81 +47,42 @@ uint64_t storage_boot_token() {
 
 namespace {
 
-// One reservation attempt, shared with the pool thread that runs it. Held by
-// shared_ptr so the transaction task can outlive the caller's frame.
-struct Reservation {
-    std::string table_name;
-    uint32_t count = 0;
+// Watermark rows are one row-format field of 8 bytes after the null flags.
+const std::vector<uint32_t> kWatermarkFields = {1, 8};
 
-    std::mutex mutex;
-    std::condition_variable decided;
-    bool done      = false;
-    bool committed = false;
-    bool permanent = false;
-    // A refusal that belongs to the table, not to this attempt
-    bool refusal_is_permanent_for_table = false;
-    uint64_t first_id = 0;
-    std::string error;
-};
+std::string pack_watermark(uint64_t next) {
+    std::string row("\x01\x01\x00\x01\x08", 5);  // null flags: one byte, no nulls; then the counter
+    row.append(reinterpret_cast<const char*>(&next), sizeof(next));
+    return row;
+}
 
-// The reservation is one small OCC transaction on an idle pool; a wait this
-// long means something is wrong, and holding the allocator mutex for it would
-// stall every other table too.
-constexpr auto kReservationDeadline = std::chrono::seconds(60);
-
-void run_reservation(LineairDB::Transaction& tx, Reservation& reservation) {
-    if (!tx.SetTable(kWatermarkTable)) {
-        reservation.error     = "the hidden key table is missing";
-        reservation.permanent = true;
-        tx.Abort();
-        return;
+bool unpack_watermark(const std::string& row, uint64_t* next) {
+    if (row.size() != 13 ||
+        row.compare(0, 5, std::string("\x01\x01\x00\x01\x08", 5)) != 0) {
+        return false;
     }
-
-    // The grant comes from what this transaction read, never from a value
-    // captured earlier. The allocator mutex and max_thread=1 serialise
-    // reservations; once the row exists the concurrency control backs that up.
-    const auto stored = tx.Read<uint64_t>(reservation.table_name);
-    const uint64_t next = stored.has_value() ? stored.value() : 0;
-
-    if (next > std::numeric_limits<uint64_t>::max() - reservation.count) {
-        reservation.error = "the hidden key space of " + reservation.table_name +
-                            " is exhausted";
-        reservation.permanent                      = true;
-        reservation.refusal_is_permanent_for_table = true;
-        tx.Abort();
-        return;
-    }
-
-    reservation.first_id = next;
-    tx.Write<uint64_t>(reservation.table_name, next + reservation.count);
+    std::memcpy(next, row.data() + 5, sizeof(*next));
+    return true;
 }
 
 using DurabilityRpc = LineairDB::Protocol::DbSetCommitDurability;
 
-// Bound on the durable barrier; the wait holds the switch mutex and a closed
-// socket does not cancel it
-constexpr auto kBarrierTimeout = std::chrono::hours(1);
-
-const char* durability_name(LineairDB::Config::CommitDurability mode) {
+const char* durability_name(helios::storage::CommitDurability mode) {
     switch (mode) {
-        case LineairDB::Config::CommitDurability::Volatile:
-            return "VOLATILE";
-        case LineairDB::Config::CommitDurability::Async:
+        case helios::storage::CommitDurability::kAsync:
             return "ASYNC";
-        case LineairDB::Config::CommitDurability::Sync:
+        case helios::storage::CommitDurability::kSync:
             return "SYNC";
     }
     return "UNKNOWN";
 }
 
-DurabilityRpc::Mode to_wire_mode(LineairDB::Config::CommitDurability mode) {
+DurabilityRpc::Mode to_wire_mode(helios::storage::CommitDurability mode) {
     switch (mode) {
-        case LineairDB::Config::CommitDurability::Async:
+        case helios::storage::CommitDurability::kAsync:
             return DurabilityRpc::ASYNC;
-        case LineairDB::Config::CommitDurability::Sync:
+        case helios::storage::CommitDurability::kSync:
             return DurabilityRpc::SYNC;
-        case LineairDB::Config::CommitDurability::Volatile:
-            return DurabilityRpc::VOLATILE;
     }
     return DurabilityRpc::MODE_UNSPECIFIED;
 }
@@ -152,7 +95,7 @@ void HiddenKeyAllocator::ForgetTable(const std::string& table_name) {
     announced_.erase(table_name);
 }
 
-bool HiddenKeyAllocator::Allocate(LineairDB::Database& database,
+bool HiddenKeyAllocator::Allocate(helios::storage::Database& database,
                                   const std::string& table_name, uint32_t count,
                                   uint64_t* first_id, std::string* error,
                                   bool* permanent) {
@@ -172,73 +115,53 @@ bool HiddenKeyAllocator::Allocate(LineairDB::Database& database,
     }
 
     if (!watermark_table_ready_) {
-        // Recovery restores it when it already existed; this covers a fresh one
+        // Recovery restores the table and its schema when they existed; this
+        // covers a fresh store.
         database.CreateTable(kWatermarkTable);
-        watermark_table_ready_ = true;
-    }
-
-    for (int attempt = 0; attempt < kReserveAttempts; ++attempt) {
-        auto reservation        = std::make_shared<Reservation>();
-        reservation->table_name = table_name;
-        reservation->count      = count;
-
-        auto* db = &database;
-        database.ExecuteTransaction(
-            [reservation](LineairDB::Transaction& tx) {
-                run_reservation(tx, *reservation);
-            },
-            // Runs on the pool thread with nothing of this transaction in
-            // flight, the only safe point to hand masstree's RCU epoch back;
-            // nothing else un-enrols this thread, so leaves would never reclaim
-            [db](LineairDB::TxStatus) { db->ReleaseMasstreeThreadEpoch(); },
-            // Precommit is the decision to act on. Its log record rides the
-            // epoch this commits in, which closes no later than the epoch of
-            // the first row written under the range.
-            [reservation](LineairDB::TxStatus status) {
-                {
-                    std::lock_guard<std::mutex> lock(reservation->mutex);
-                    reservation->committed =
-                        status == LineairDB::TxStatus::Committed;
-                    reservation->done = true;
-                }
-                reservation->decided.notify_one();
-            });
-
-        bool decided = false;
-        {
-            std::unique_lock<std::mutex> lock(reservation->mutex);
-            decided = reservation->decided.wait_for(
-                lock, kReservationDeadline,
-                [&reservation]() { return reservation->done; });
-        }
-        if (!decided) {
-            // The attempt may still commit; harmless, since the next one reads
-            // the watermark it leaves behind rather than anything cached here.
-            *error = "the storage server did not answer a hidden key "
-                     "reservation for " + table_name;
-            return false;
-        }
-
-        if (reservation->permanent) {
-            if (reservation->refusal_is_permanent_for_table) {
-                refused_[table_name] = reservation->error;
-            }
-            *error     = reservation->error;
+        if (!database.InstallPaxSchema(kWatermarkTable, kWatermarkFields)) {
+            *error     = "the hidden key table has no schema";
             *permanent = true;
             return false;
         }
-        if (!reservation->committed) continue;
-
-        if (announced_.insert(table_name).second) {
-            LOG_INFO("Hidden keys for '%s' resume at %llu", table_name.c_str(),
-                     static_cast<unsigned long long>(reservation->first_id));
-        }
-        *first_id = reservation->first_id;
-        return true;
+        watermark_table_ready_ = true;
     }
 
-    *error = "could not reserve hidden keys for " + table_name;
-    return false;
+    const auto stored = database.Read(kWatermarkTable, table_name);
+    uint64_t next = 0;
+    if (stored.found && !unpack_watermark(stored.value, &next)) {
+        *error = "the hidden key watermark of " + table_name + " is not a counter";
+        refused_[table_name] = *error;
+        *permanent           = true;
+        return false;
+    }
+    if (next > std::numeric_limits<uint64_t>::max() - count) {
+        *error = "the hidden key space of " + table_name + " is exhausted";
+        refused_[table_name] = *error;
+        *permanent           = true;
+        return false;
+    }
+
+    // Committed Async under the mutex: the boot token, not durability, ties
+    // the range to this run.
+    helios::storage::silo::Transaction tx(database);
+    tx.Read(kWatermarkTable, table_name, helios::storage::Tidword(stored.tid));
+    std::string reason;
+    const std::string row = pack_watermark(next + count);
+    if (!tx.Write(kWatermarkTable, table_name, row,
+                  stored.found ? helios::storage::RowOp::kUpdate
+                               : helios::storage::RowOp::kInsert,
+                  reason) ||
+        !tx.Commit(helios::storage::CommitDurability::kAsync, reason)) {
+        *error = "could not reserve hidden keys for " + table_name + ": " + reason;
+        return false;
+    }
+
+    if (announced_.insert(table_name).second) {
+        LOG_INFO("Hidden keys for '%s' resume at %llu", table_name.c_str(),
+                 static_cast<unsigned long long>(next));
+    }
+    *first_id = next;
+    return true;
 }
 
 void LineairDBRpc::handleDbAllocateHiddenKeys(const std::string& message,
@@ -283,55 +206,35 @@ void LineairDBRpc::handleDbSetCommitDurability(const std::string& message,
 
     if (!request.ParseFromString(message)) {
         response.set_ok(false);
-        response.set_mode(
-            to_wire_mode(db_manager_->get_database()->GetCommitDurability()));
+        response.set_mode(to_wire_mode(db_manager_->commit_durability()));
         response.set_error("malformed request");
         LOG_ERROR("SetCommitDurability: malformed request");
         result = response.SerializeAsString();
         return;
     }
 
-    LineairDB::Config::CommitDurability mode;
+    helios::storage::CommitDurability mode;
     switch (request.mode()) {
         case DurabilityRpc::ASYNC:
-            mode = LineairDB::Config::CommitDurability::Async;
+            mode = helios::storage::CommitDurability::kAsync;
             break;
         case DurabilityRpc::SYNC:
-            mode = LineairDB::Config::CommitDurability::Sync;
+            mode = helios::storage::CommitDurability::kSync;
             break;
         default:
             response.set_ok(false);
-            response.set_mode(to_wire_mode(
-                db_manager_->get_database()->GetCommitDurability()));
-            // VOLATILE lands here too: it is reportable, not requestable
+            response.set_mode(to_wire_mode(db_manager_->commit_durability()));
             response.set_error("commit durability mode cannot be requested");
             LOG_ERROR("SetCommitDurability: unrequestable mode");
             result = response.SerializeAsString();
             return;
     }
 
-    const bool ok =
-        db_manager_->get_database()->SetCommitDurability(mode, kBarrierTimeout);
+    db_manager_->set_commit_durability(mode);
+    response.set_ok(true);
+    response.set_mode(to_wire_mode(mode));
 
-    const auto effective = db_manager_->get_database()->GetCommitDurability();
-    response.set_ok(ok);
-    response.set_mode(to_wire_mode(effective));
-    if (!ok) {
-        if (effective == LineairDB::Config::CommitDurability::Volatile) {
-            response.set_error(
-                "the database is volatile; commit durability is fixed at "
-                "startup");
-        } else {
-            response.set_error(
-                std::string("commit durability switch not confirmed; policy "
-                            "in force: ") +
-                durability_name(effective));
-        }
-    }
-
-    LOG_INFO("SetCommitDurability requested=%s result=%s effective=%s",
-             durability_name(mode), ok ? "ok" : "failed",
-             durability_name(effective));
+    LOG_INFO("Commit durability switched to %s", durability_name(mode));
 
     result = response.SerializeAsString();
 }
@@ -345,35 +248,30 @@ void LineairDBRpc::handleDbCreateTable(const std::string& message,
 
     request.ParseFromString(message);
 
-    const bool success =
-        db_manager_->get_database()->CreateTable(request.table_name());
-    response.set_success(success);
+    // A table another query node created is the same table; its schema
+    // install answers whether the definition matches the one in place.
+    auto db = db_manager_->get_database();
+    const bool created =
+        db->CreateTable(request.table_name()) || db->HasTable(request.table_name());
     hidden_keys_->ForgetTable(request.table_name());
-    LOG_DEBUG("CreateTable '%s': %s", request.table_name().c_str(),
-              success ? "success" : "already exists");
 
-    // Non-empty widths mean the proxy wants this table to try PAX storage.
-    if (request.pax_field_max_bytes_size() > 0) {
+    bool installed = false;
+    if (created) {
         std::vector<uint32_t> widths;
         widths.reserve(request.pax_field_max_bytes_size());
         for (const uint32_t width : request.pax_field_max_bytes()) {
             widths.push_back(width);
         }
 
-        // Typed cells: gate on HELIOS_PAX_TYPED (default on). When off, or when
-        // the proxy sent no/mismatched kinds, install an UNTYPED schema
-        // (byte-identical to the ASCII layout).
-        static const bool pax_typed_enabled = []() {
-            const char* v = std::getenv("HELIOS_PAX_TYPED");
-            return !(v != nullptr && v[0] == '0' && v[1] == '\0');
-        }();
-        std::vector<uint8_t> kinds;
+        // Every schema is typed: the request carries one kind per width.
+        std::vector<helios::storage::pax::FieldType> types;
         std::vector<int8_t> scales;
-        if (pax_typed_enabled &&
-            request.pax_field_kind_size() ==
-                request.pax_field_max_bytes_size()) {
-            kinds.assign(request.pax_field_kind().begin(),
-                         request.pax_field_kind().end());
+        {
+            types.reserve(request.pax_field_kind_size());
+            for (const uint32_t kind : request.pax_field_kind()) {
+                types.push_back(
+                    static_cast<helios::storage::pax::FieldType>(kind));
+            }
             if (request.pax_field_scale_size() ==
                 request.pax_field_max_bytes_size()) {
                 scales.reserve(request.pax_field_scale_size());
@@ -383,13 +281,16 @@ void LineairDBRpc::handleDbCreateTable(const std::string& message,
             }
         }
 
-        const bool installed = db_manager_->get_database()->InstallPaxSchema(
-            request.table_name(), widths, kinds, scales);
+        installed = db->InstallPaxSchema(request.table_name(), widths, types,
+                                         scales);
         LOG_INFO("PAX schema for '%s': %zu fields, typed=%s, %s",
                  request.table_name().c_str(), widths.size(),
-                 kinds.empty() ? "no" : "yes",
-                 installed ? "installed" : "skipped");
+                 types.empty() ? "no" : "yes",
+                 installed ? "installed" : "refused");
     }
+    response.set_success(created && installed);
+    LOG_DEBUG("CreateTable '%s': %s", request.table_name().c_str(),
+              response.success() ? "success" : "refused");
 
     result = response.SerializeAsString();
 }
@@ -404,7 +305,8 @@ void LineairDBRpc::handleDbCreateSecondaryIndex(const std::string& message,
     request.ParseFromString(message);
 
     const bool success = db_manager_->get_database()->CreateSecondaryIndex(
-        request.table_name(), request.index_name(), request.index_type());
+        request.table_name(), request.index_name(),
+        static_cast<helios::storage::IndexConstraint>(request.index_type()));
     response.set_success(success);
 
     result = response.SerializeAsString();

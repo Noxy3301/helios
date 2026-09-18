@@ -1,0 +1,174 @@
+# Modified for Helios.
+
+#
+# Copyright (C) 2020 Nippon Telegraph and Telephone Corporation.
+#
+# Licensed under the Apache License, Version 2.0 (the "License"); you may not
+# use this file except in compliance with the License. You may obtain a copy of
+# the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+# WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+# License for the specific language governing permissions and limitations under
+# the License.
+#
+
+cmake_minimum_required(VERSION 3.10)
+project(
+  helios_storage
+  VERSION 0.1.0
+  DESCRIPTION
+    "Storage engine for Helios based on LineairDB."
+  LANGUAGES CXX)
+
+# Build Options
+option(BUILD_TESTS "Build testing executables" ON)
+option(BUILD_SANITIZER "Build with clang's address sanitizer" OFF)
+
+if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
+  set(IS_TOPLEVEL_PROJECT TRUE)
+endif()
+
+set(CMAKE_MODULE_PATH ${CMAKE_MODULE_PATH}
+                      "${PROJECT_SOURCE_DIR}/cmake/modules")
+set(CMAKE_INCLUDE_CURRENT_DIR_IN_INTERFACE ON)
+add_compile_definitions(_LIBCPP_NO_EXPERIMENTAL_DEPRECATION_WARNING_FILESYSTEM)
+
+# Compiler Options
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+set(CMAKE_C_FLAGS "--std=c99")
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wall -Wextra -fPIC")
+
+# Check for and disable nan-infinity warnings early to avoid GoogleTest compilation issues
+include(CheckCXXCompilerFlag)
+check_cxx_compiler_flag("-Wno-nan-infinity-disabled" COMPILER_SUPPORTS_NAN_INFINITY_DISABLED)
+if(COMPILER_SUPPORTS_NAN_INFINITY_DISABLED)
+  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wno-nan-infinity-disabled")
+endif()
+if (NOT APPLE)
+  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -mcx16")
+endif()
+if(NOT IS_TOPLEVEL_PROJECT)
+  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -ftls-model=local-dynamic")
+endif()
+
+set(CMAKE_CXX_FLAGS_DEBUG
+    "${CMAKE_CXX_FLAGS} -g3 -O0 -fno-omit-frame-pointer")
+if(CMAKE_CXX_COMPILER_ID MATCHES "^(Apple)?Clang$")
+  set(CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG} -fcolor-diagnostics")
+  if(IS_TOPLEVEL_PROJECT AND BUILD_SANITIZER)
+    set(CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG} -fsanitize=address")
+    message(STATUS "AddressSanitizer enabled")
+  endif()
+endif()
+set(CMAKE_CXX_FLAGS_RELWITHDEBINFO "${CMAKE_CXX_FLAGS_DEBUG} -Ofast")
+set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS} -O3 -ffast-math -DNDEBUG")
+if(APPLE AND CMAKE_SYSTEM_PROCESSOR STREQUAL "arm64")
+  # Apple Silicon (m1) does not support `march=native`. use `mcpu` instead.
+  set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} -mcpu=apple-m1")
+else()
+  set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} -march=native")
+endif()
+
+# Build as library
+file(GLOB_RECURSE SOURCES "src/*.cc")
+add_library(${PROJECT_NAME} ${SOURCES})
+add_library(${PROJECT_NAME}::${PROJECT_NAME} ALIAS ${PROJECT_NAME})
+target_compile_options(${PROJECT_NAME} PRIVATE -Wno-error -Wno-error=extra-semi -Wno-extra-semi -Wno-unused-parameter)
+
+find_package(Boost QUIET)
+if(Boost_FOUND)
+  target_include_directories(${PROJECT_NAME} PUBLIC
+    ${Boost_INCLUDE_DIRS}
+  )
+else()
+  target_compile_definitions(${PROJECT_NAME} PUBLIC MSGPACK_NO_BOOST=ON)
+endif()
+
+find_package(jemalloc QUIET)
+if(JEMALLOC_FOUND)
+  if(NOT APPLE) # WANTFIX: it seems that googletest's TYPED_TEST, that are built
+                # with static linking of jemalloc, always result in SIGSEGV on
+                # OSX.
+    message(STATUS "JEMALLOC ${JEMALLOC_LIBRARIES}")
+    target_link_libraries(${PROJECT_NAME} ${JEMALLOC_LIBRARIES})
+  endif()
+else()
+  message("warning: jemalloc is not found in this environment.")
+endif()
+
+if(CMAKE_CXX_COMPILER_ID STREQUAL "AppleClang")
+  target_link_libraries(${PROJECT_NAME} pthread)
+elseif(CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
+  if(APPLE)
+    target_link_libraries(${PROJECT_NAME} pthread)
+  else()
+    target_link_libraries(${PROJECT_NAME} stdc++ atomic pthread numa)
+  endif()
+elseif(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+  target_link_libraries(${PROJECT_NAME} stdc++ atomic pthread numa)
+else()
+  message(WARNING "Unknown compiler: ${CMAKE_CXX_COMPILER_ID}")
+  target_link_libraries(${PROJECT_NAME} pthread)
+endif()
+
+# Database directly owns storage components declared in the source headers.
+target_include_directories(
+  ${PROJECT_NAME} PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include
+                         ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_compile_features(${PROJECT_NAME} PUBLIC cxx_std_17)
+
+# MessagePack is also included by the types Database owns.
+target_include_directories(
+  ${PROJECT_NAME} SYSTEM
+  PUBLIC
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/third_party/spdlog/include>
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/third_party/msgpack/include>)
+
+# Masstree B+tree backend (switchable index)
+# Built via masstree's own autoconf -> libjson.a, from a copy in the build
+# tree: its bootstrap writes generated sources next to the ones it reads, and
+# the submodule stays untouched. Linked PRIVATE because masstree symbols are
+# internal to the index implementation, not exposed via public headers.
+set(MASSTREE_SRC "${CMAKE_CURRENT_SOURCE_DIR}/third_party/masstree")
+set(MASSTREE_DIR "${CMAKE_CURRENT_BINARY_DIR}/masstree")
+set(MASSTREE_LIB "${MASSTREE_DIR}/libjson.a")
+file(MAKE_DIRECTORY ${MASSTREE_DIR})
+
+add_custom_command(
+  OUTPUT ${MASSTREE_LIB}
+  # Tracked entry points of the submodule, so a bump rebuilds the copy.
+  DEPENDS ${MASSTREE_SRC}/masstree.hh ${MASSTREE_SRC}/configure.ac
+          ${MASSTREE_SRC}/bootstrap.sh
+  COMMAND ${CMAKE_COMMAND} -E copy_directory ${MASSTREE_SRC} ${MASSTREE_DIR}
+  COMMAND ${CMAKE_COMMAND} -E env "CXXFLAGS=-fPIC -O3" ./bootstrap.sh
+  COMMAND ${CMAKE_COMMAND} -E env "CXXFLAGS=-fPIC -O3" ./configure --disable-assertions
+  COMMAND make -j libjson.a
+  WORKING_DIRECTORY ${MASSTREE_DIR}
+  COMMENT "Building masstree (libjson.a)"
+  VERBATIM)
+
+add_custom_target(masstree_build DEPENDS ${MASSTREE_LIB})
+add_library(masstree STATIC IMPORTED GLOBAL)
+set_target_properties(masstree PROPERTIES IMPORTED_LOCATION ${MASSTREE_LIB})
+add_dependencies(masstree masstree_build)
+
+target_link_libraries(${PROJECT_NAME} masstree)
+target_include_directories(${PROJECT_NAME} SYSTEM PRIVATE ${MASSTREE_DIR})
+
+# Tests
+if(IS_TOPLEVEL_PROJECT AND BUILD_TESTS)
+  enable_testing()
+  if(NOT TARGET gtest)
+    set(BUILD_GMOCK OFF CACHE BOOL "" FORCE)
+    add_subdirectory(third_party/googletest)
+    target_include_directories(gtest BEFORE PRIVATE ${CMAKE_SOURCE_DIR}/third_party/googletest/googletest/include)
+    target_include_directories(gtest_main BEFORE PRIVATE ${CMAKE_SOURCE_DIR}/third_party/googletest/googletest/include)
+  endif()
+  add_subdirectory(tests)
+endif()

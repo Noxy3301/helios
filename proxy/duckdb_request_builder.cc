@@ -1200,7 +1200,6 @@ bool BuildDuckdbQueryRequest(THD* thd, LEX* lex,
         return false;
     }
     Serializer s{thd, request, why};
-    request->set_format_version(1);
     Query_block* block = lex->unit->first_query_block();
     if (!SerializeBlock(s, block, request->mutable_root())) {
         request->Clear();

@@ -13,11 +13,9 @@ namespace {
 
 constexpr uint16_t kDefaultPort = 9999;
 
-/**
- * @brief Applies LINEAIRDB_SERVER_PORT, keeping the default when it is unset.
- * A value that is not a decimal port refuses startup: falling back would serve
- * a caller that asked for another port.
- */
+// LINEAIRDB_SERVER_PORT, or the default when unset. A value that is not a
+// port refuses startup: falling back would serve a caller that asked for
+// another port.
 uint16_t listen_port() {
     static const uint16_t port = []() -> uint16_t {
         const char* raw = std::getenv("LINEAIRDB_SERVER_PORT");
@@ -55,31 +53,22 @@ void LineairDBServer::init() {
 
 void LineairDBServer::handle_client(int client_socket) {
     LOG_INFO("Handling client connection fd=%d", client_socket);
-    // Per-connection managers
-    auto tx_manager = std::make_shared<TransactionManager>(*db_manager_->get_database());
-    auto rpc_handler = std::make_shared<LineairDBRpc>(db_manager_, tx_manager,
-                                                      row_counts_, hidden_keys_);
+    auto rpc_handler =
+        std::make_shared<LineairDBRpc>(db_manager_, row_counts_, hidden_keys_);
 
     while (true) {
-        uint64_t sender_id;
         MessageType message_type;
         std::string payload;
 
-        if (!MessageHandler::receive_message(client_socket, sender_id, message_type, payload)) {
+        if (!MessageHandler::receive_message(client_socket, message_type, payload)) {
             break;  // Client disconnected or error
         }
 
         std::string result;
-        rpc_handler->handle_rpc(sender_id, message_type, payload, result);
+        rpc_handler->handle_rpc(message_type, payload, result);
 
-        if (!MessageHandler::send_response_writev(client_socket, 0, message_type, result)) {
+        if (!MessageHandler::send_response_writev(client_socket, message_type, result)) {
             break;  // Failed to send response
         }
     }
-
-    // Must run on this thread: the epoch slot it releases is thread-local.
-    tx_manager->abort_all_and_end();
-
-    // An enrolled thread that exits pins min_active_epoch() forever.
-    db_manager_->get_database()->ReleaseMasstreeThreadEpoch();
 }

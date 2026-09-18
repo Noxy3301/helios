@@ -34,9 +34,7 @@ HIGH_WATER = 0xFFFFFFFF - (1 << 20)
 
 # Wal frame constants, little-endian.
 MAGIC = 0x4C57414C
-VERSION = 1
 FLAGS = 0
-HEADER = struct.Struct("<IHHIII")
 
 STARTUP_TIMEOUT_SECONDS = 20
 
@@ -61,7 +59,7 @@ def make_frame(epoch):
     array of a uint32 and an empty array.
     """
     payload = b"\x91\x92" + b"\xce" + struct.pack(">I", epoch) + b"\x90"
-    header_without_crc = struct.pack("<IHHII", MAGIC, VERSION, FLAGS,
+    header_without_crc = struct.pack("<IHII", MAGIC, FLAGS,
                                      len(payload), epoch)
     checksum = crc32c(header_without_crc + payload)
     return header_without_crc + struct.pack("<I", checksum) + payload
@@ -90,7 +88,7 @@ def run_server(work_dir, extra_env):
 
 def with_crafted_log(frontier, extra_env):
     with tempfile.TemporaryDirectory(prefix="helios_high_water_") as work_dir:
-        log_dir = os.path.join(work_dir, "lineairdb_logs")
+        log_dir = os.path.join(work_dir, "helios_wal")
         os.makedirs(log_dir)
         with open(os.path.join(log_dir, "wal.log"), "wb") as wal:
             wal.write(make_frame(frontier))

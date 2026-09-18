@@ -11,7 +11,10 @@
 #include <vector>
 
 #include "lineairdb_field_types.h"
+#include "my_base.h"
 #include "my_dbug.h"
+#include "my_sys.h"
+#include "mysqld_error.h"
 #include "sql/field.h"
 #include "sql/key.h"
 #include "sql/sql_class.h"
@@ -23,22 +26,21 @@
 
 namespace {
 
-// LineairDB SecondaryIndexOption::Constraint wire bit for UNIQUE.
+// helios::storage::IndexConstraint::kUnique, the wire value of a UNIQUE index.
 constexpr uint kUniqueSecondaryIndex = 1u;
 
 // Backfill batching bounds each OCC write set while keeping connection reuse.
-constexpr bool kFence = false;
 constexpr uint64_t kBackfillWriteChunkRows = 2000;
 constexpr size_t kBackfillParallelWorkers = 16;
+
+// Widest payload a PAX cell holds. A column needing more has no home.
+constexpr uint32_t kMaxCellBytes = 2048;
 
 }  // namespace
 
 std::vector<uint32_t> compute_pax_field_widths(
     TABLE *table, std::vector<uint32_t> *kinds,
-    std::vector<int32_t> *scales) {
-  // Keep fixed-width cells bounded for variable-width columns such as TEXT.
-  constexpr uint32_t kMaxCellBytes = 2048;
-
+    std::vector<int32_t> *scales, uint *wide_field) {
   std::vector<uint32_t> widths;
   widths.reserve(table->s->fields + 1);
   if (kinds) {
@@ -59,12 +61,9 @@ std::vector<uint32_t> compute_pax_field_widths(
     uint32_t kind = pax_kind::UNTYPED;
     int32_t scale = 0;
 
-    // A ZEROFILL integer left-pads val_str to its display width, so the value
-    // alone cannot reproduce the exact bytes -- keep such columns UNTYPED.
-    // MYSQL_TYPE_YEAR renders zero-filled to its display width ("0000" for 0)
-    // REGARDLESS of the Field_num::zerofill member (which is observed false at
-    // runtime), so relying on that flag mis-types YEAR and gathers "0" != "0000"
-    // -- force YEAR UNTYPED explicitly.
+    // ZEROFILL and YEAR render zero-padded bytes the value alone cannot
+    // reproduce (YEAR does so whatever Field_num::zerofill says), so both
+    // stay UNTYPED.
     const bool zerofill =
         (field->type() == MYSQL_TYPE_YEAR)
             ? true
@@ -114,18 +113,9 @@ std::vector<uint32_t> compute_pax_field_widths(
         // Sign + decimal point slack for the UNTYPED bound, kept as the fallback
         // width when the value is not encoded as a scaled int64 below.
         width += 2;
-        // A fixed-scale DECIMAL(p,s) becomes an 8-byte FK_DEC64 cell holding
-        // value * 10^s as a scaled int64. The precision <= 15 cap has two
-        // independent exactness reasons:
-        //   (i)  the scaled int64 must hold every value: 10^15 - 1 < INT64_MAX;
-        //   (ii) the server FILTER path compares (double)m / 10^s, which must
-        //        equal strtod(val_str) EXACTLY to preserve the byte path's
-        //        double compare semantics (q6's 0.07-excluding BETWEEN bound).
-        //        That holds only while m and 10^s are both exact doubles, i.e.
-        //        m < 2^53 <=> p <= 15 (10^15 < 2^53). The AGG path stays exact
-        //        regardless via the int64 mantissa.
-        // A ZEROFILL DECIMAL left-pads val_str, so its bytes are not
-        // reproducible from the value alone -- keep it UNTYPED, as is p > 15.
+        // A fixed-scale DECIMAL(p,s) becomes an 8-byte decimal cell holding
+        // value * 10^s. Precision <= 15 keeps the scaled int64 and both 10^s
+        // and the mantissa exact as doubles; p > 15 and ZEROFILL stay UNTYPED.
         const auto *fd = down_cast<const Field_new_decimal *>(field);
         if (!zerofill && fd->precision <= 15) {
           kind = pax_kind::DEC64;
@@ -153,19 +143,18 @@ std::vector<uint32_t> compute_pax_field_widths(
       case MYSQL_TYPE_VAR_STRING:
       case MYSQL_TYPE_ENUM:
       case MYSQL_TYPE_SET:
-        // field_length is the charset octet length: utf8mb4 reserves 4 bytes
-        // per declared character, padding a pure-ASCII VARCHAR(44) cell to 176
-        // B. Size the cell to the declared character count instead (a no-op for
-        // latin1/binary where mbmaxlen == 1). A genuine multibyte row whose
-        // bytes exceed char_length() falls back to the existing per-row heap
-        // path, which disables strip-direct scans for that table.
-        width = field->char_length();
+        // The cell holds the encoded bytes, so the width is the charset's
+        // octet length of the declared characters.
+        width = field->field_length;
         break;
       default:
         break;
     }
 
-    if (width > kMaxCellBytes) return {};
+    if (width > kMaxCellBytes) {
+      if (wide_field) *wide_field = i;
+      return {};
+    }
     widths.push_back(width);
     if (kinds) kinds->push_back(kind);
     if (scales) scales->push_back(scale);
@@ -179,14 +168,10 @@ void ha_lineairdb::set_key_and_key_part_info(const TABLE *const table) {
   uint pk_index = table->s->primary_key;
 
   if (pk_index != MAX_KEY) {
-    primary_key_type = static_cast<ha_base_keytype>(
-        table->key_info[pk_index].key_part[0].type);
-
     key_part = table->key_info[pk_index].key_part;
     indexed_key_part = key_part[0];
     num_key_parts = table->key_info[pk_index].user_defined_key_parts;
   } else {
-    primary_key_type = HA_KEYTYPE_END;
     key_part = nullptr;
     num_key_parts = 0;
   }
@@ -204,10 +189,8 @@ int ha_lineairdb::open(const char *table_name, int, uint, const dd::Table *) {
     set_key_and_key_part_info(table);
 
   if (table->s->primary_key != MAX_KEY) {
-    // Calculate LineairDBField-encoded PK size. Each key part is encoded as:
-    //   1 (null marker) + 1 (type tag) + 2 (length field) + payload
-    // For STRING types, an extra terminator byte is added (+5 total overhead).
-    // MySQL's key_length only counts raw column bytes, which is smaller.
+    // A key part carries 4 bytes of overhead (null marker, type tag, 2-byte
+    // length) and STRING one more terminator; key_length counts neither.
     uint pk_index = table->s->primary_key;
     KEY *pk = &table->key_info[pk_index];
     size_t encoded_pk_size = 0;
@@ -263,21 +246,40 @@ int ha_lineairdb::create(const char *table_name, TABLE *table, HA_CREATE_INFO *,
   auto proxy = get_proxy();
   std::vector<uint32_t> pax_kinds;
   std::vector<int32_t> pax_scales;
+  uint wide_field = 0;
   std::vector<uint32_t> pax_widths =
-      compute_pax_field_widths(table, &pax_kinds, &pax_scales);
-  if (pax_widths.empty()) {  // table skips PAX: send nothing typed
-    pax_kinds.clear();
-    pax_scales.clear();
+      compute_pax_field_widths(table, &pax_kinds, &pax_scales, &wide_field);
+  // The storage keeps no row outside PAX, so a table the PAX store cannot
+  // hold is refused here and nothing is created on the server.
+  if (pax_widths.empty()) {
+    const Field *field = table->field[wide_field];
+    char buf[128];
+    String sql_type(buf, sizeof(buf), field->charset());
+    field->sql_type(sql_type);
+    std::string msg = "LineairDB: column ";
+    msg += field->field_name;
+    msg += " (";
+    msg.append(sql_type.ptr(), sql_type.length());
+    msg += ") exceeds the PAX cell limit of " + std::to_string(kMaxCellBytes) +
+           " bytes";
+    my_error(ER_NOT_SUPPORTED_YET, MYF(0), msg.c_str());
+    return HA_ERR_UNSUPPORTED;
   }
-  proxy->db_create_table(db_table_name, pax_widths, pax_kinds, pax_scales);
+  if (!proxy->db_create_table(db_table_name, pax_widths, pax_kinds,
+                              pax_scales)) {
+    return HA_ERR_GENERIC;
+  }
 
+  // The server keeps each declared index in its catalog; a refused
+  // declaration fails the statement.
   for (uint i = 0; i < table->s->keys; i++) {
     auto key_info = table->key_info[i];
     uint index_type =
         (key_info.flags & HA_NOSAME) ? kUniqueSecondaryIndex : 0;
-    if (i != table->s->primary_key) {
-      proxy->db_create_secondary_index(
-          db_table_name, std::string(key_info.name), index_type);
+    if (i != table->s->primary_key &&
+        !proxy->db_create_secondary_index(
+            db_table_name, std::string(key_info.name), index_type)) {
+      return HA_ERR_GENERIC;
     }
   }
   return 0;
@@ -314,19 +316,17 @@ enum_alter_inplace_result ha_lineairdb::check_if_supported_inplace_alter(
 }
 
 bool ha_lineairdb::backfill_commit_chunk(
-    std::vector<LineairDBProxy::BatchOp> &ops) {
+    std::vector<LineairDBProxy::WriteOp> &ops) {
   if (ops.empty()) return true;
 
-  auto *chunk_tx = new_transaction(ha_thd(), kFence);
+  auto *chunk_tx = new_transaction(ha_thd());
   if (chunk_tx == nullptr) return false;
-  chunk_tx->set_prefetch_mode(false);
   chunk_tx->begin_transaction();
   chunk_tx->choose_table(db_table_name);
 
-  // One checked batch write per chunk so a server-side abort is observed.
-  const bool wrote = chunk_tx->batch_write(db_table_name, ops);
+  chunk_tx->buffer_writes(db_table_name, ops);
   ops.clear();
-  if (!wrote || chunk_tx->is_aborted()) {
+  if (chunk_tx->is_aborted()) {
     chunk_tx->set_status_to_abort();
     chunk_tx->end_transaction();
     return false;
@@ -339,7 +339,7 @@ bool ha_lineairdb::backfill_indexes_parallel(
     const std::vector<std::pair<std::string, const KEY *>> &specs) {
   // Phase A: decode each row once, build one write per index, and bucket it by
   // secondary-key hash. Single-threaded -- decode uses the shared record buffer.
-  std::vector<std::vector<LineairDBProxy::BatchOp>> partition(
+  std::vector<std::vector<LineairDBProxy::WriteOp>> partition(
       kBackfillParallelWorkers);
   // Reserve each bucket to its expected hash share so the per-row push_back
   // below does not repeatedly reallocate the per-worker write buffers.
@@ -361,8 +361,8 @@ bool ha_lineairdb::backfill_indexes_parallel(
       break;
     }
     for (const auto &spec : specs) {
-      LineairDBProxy::BatchOp op;
-      op.type = LineairDBProxy::BatchOp::Type::SecondaryIndexWrite;
+      LineairDBProxy::WriteOp op;
+      op.type = LineairDBProxy::WriteOp::Type::SecondaryIndexWrite;
       op.table_name = db_table_name;
       op.index_name = spec.first;
       op.primary_key = row.first;
@@ -375,12 +375,9 @@ bool ha_lineairdb::backfill_indexes_parallel(
   blobroot.Clear();
   if (decode_failed) return false;
 
-  // Phase B: one worker per partition, each on its own connection. The hash
-  // partition commits every op for a secondary key on one worker, so no two
-  // workers mutate the same index DataItem; distinct keys are distinct
-  // DataItems committed through the normal concurrent path LineairDB serves for
-  // multiple query layers. Workers touch no MySQL state; a failure sets the
-  // shared flag for the caller to report.
+  // Phase B: one worker per key-hash partition on its own connection, so no
+  // two workers mutate the same index entry. Workers touch no MySQL state; a
+  // failure sets the shared flag for the caller to report.
   std::atomic<bool> failed{false};
   const std::string host = server_connection_host();
   const int port = server_connection_port();
@@ -390,14 +387,13 @@ bool ha_lineairdb::backfill_indexes_parallel(
     if (partition[w].empty()) continue;
     workers.emplace_back([&, w]() {
       LineairDBProxy conn(host, port);
-      std::vector<LineairDBProxy::BatchOp> chunk;
+      std::vector<LineairDBProxy::WriteOp> chunk;
       chunk.reserve(kBackfillWriteChunkRows);
-      // Ship the buffered writes as one stateless commit (no reads to validate).
+      // Ship the buffered writes as one commit (no reads to validate).
       auto commit_chunk = [&]() -> bool {
         if (chunk.empty()) return true;
         std::string reason;
-        const bool ok = conn.tx_validate_and_commit({}, {}, {}, {}, chunk, {},
-                                                     kFence, &reason);
+        const bool ok = conn.tx_commit({}, {}, chunk, {}, &reason);
         chunk.clear();
         return ok;
       };
@@ -418,8 +414,8 @@ bool ha_lineairdb::backfill_indexes_parallel(
 
 bool ha_lineairdb::backfill_unique_serial(const std::string &index_name,
                                           const KEY &runtime_key) {
-  // A unique index scans and commits serially through the staging path, which
-  // keeps the in-write duplicate check. Its cost is small (no unique index is on
+  // A unique index scans and commits serially, which keeps the in-write
+  // duplicate check. Its cost is small (no unique index is on
   // the large fact table); the parallel scan-once path is for the non-unique set.
   auto *scan_tx = get_transaction(ha_thd());
   if (scan_tx == nullptr || scan_tx->is_aborted()) return false;
@@ -427,7 +423,7 @@ bool ha_lineairdb::backfill_unique_serial(const std::string &index_name,
   auto rows = scan_tx->get_matching_keys_and_values_from_prefix(std::string());
   if (scan_tx->is_aborted()) return false;
 
-  std::vector<LineairDBProxy::BatchOp> write_chunk;
+  std::vector<LineairDBProxy::WriteOp> write_chunk;
   write_chunk.reserve(kBackfillWriteChunkRows);
   bool failed = false;
   for (auto &row : rows) {
@@ -437,8 +433,8 @@ bool ha_lineairdb::backfill_unique_serial(const std::string &index_name,
       failed = true;
       break;
     }
-    LineairDBProxy::BatchOp op;
-    op.type = LineairDBProxy::BatchOp::Type::SecondaryIndexWrite;
+    LineairDBProxy::WriteOp op;
+    op.type = LineairDBProxy::WriteOp::Type::SecondaryIndexWrite;
     op.table_name = db_table_name;
     op.index_name = index_name;
     op.primary_key = std::move(row.first);

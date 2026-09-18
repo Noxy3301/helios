@@ -1,0 +1,64 @@
+/**
+ * @file server/storage/tests/recovery_tid_test.cc
+ * That the transaction id a recovered key carries admits the next write.
+ */
+
+#include <filesystem>
+#include <string>
+
+#include "lineairdb/config.h"
+#include "lineairdb/database.h"
+
+#include "db_helper.h"
+#include "gtest/gtest.h"
+
+namespace {
+
+constexpr const char *kTable = "recovery_tid_test";
+
+helios::storage::Config MakeConfig() {
+  helios::storage::Config config;
+  config.epoch_duration_ms = 10;
+  config.enable_recovery = true;
+  config.work_dir = "./helios_recovery_tid_test_logs";
+  return config;
+}
+
+// A write captures its log entry while the row lock is held.
+// An entry persisted with the locked TID breaks recovery: the recovered
+// row looks locked by a transaction that no longer exists, and every later
+// access to the key spins or aborts forever.
+TEST(RecoveryTidTest, ARecoveredKeyAcceptsTheNextWrite) {
+  const auto config = MakeConfig();
+  std::filesystem::remove_all(config.work_dir);
+
+  {
+    helios::storage::Database db(config);
+    TestHelper::CreateTable(db, kTable);
+    std::string reason;
+    const bool committed = TestHelper::CommitRows(
+        db, {}, {{kTable, "alice", TestHelper::Row("v1")}}, {}, {}, reason);
+    ASSERT_TRUE(committed) << reason;
+  }
+
+  {
+    helios::storage::Database db(config);
+    // Recovery re-created the table, so this call is expected to find it.
+    TestHelper::CreateTable(db, kTable);
+
+    auto recovered = db.Read(kTable, "alice");
+    db.ReleaseThreadEpoch();
+    ASSERT_TRUE(recovered.found);
+    EXPECT_FALSE(helios::storage::Tidword(recovered.tid).lock)
+        << "the recovered TID still carries the lock bit";
+
+    std::string reason;
+    const bool committed = TestHelper::CommitRows(
+        db, {}, {{kTable, "alice", TestHelper::Row("v2")}}, {}, {}, reason);
+    EXPECT_TRUE(committed) << reason;
+  }
+
+  std::filesystem::remove_all(config.work_dir);
+}
+
+}  // namespace

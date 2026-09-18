@@ -6,7 +6,7 @@
   vars:
     lineairdb_nofile_limit: 1048576
     ena_rss_interface: ens5
-    helios_durability: volatile
+    helios_durability: async
     # helios_load_durability (optional): contract for the load phase only.
     # measure_usage.yml switches the server to helios_durability before the
     # sweep; left undefined, the load runs under helios_durability as well.
@@ -30,7 +30,7 @@
         data_mount: "{{ wal_mount }}"
         data_volume: "{{ wal_volume }}"
 
-    - name: Point lineairdb_logs at the WAL volume
+    - name: Point helios_wal at the WAL volume
       # Separate from the mount block so a re-pushed bundle (which recreates
       # the plain directory) is re-linked even when the volume stayed mounted.
       when: wal_volume | bool
@@ -38,15 +38,15 @@
       tags: [privileged]
       shell: |
         set -euo pipefail
-        mkdir -p {{ wal_mount }}/lineairdb_logs
-        chown {{ ansible_user }}:{{ ansible_user }} {{ wal_mount }}/lineairdb_logs
-        target=/home/{{ ansible_user }}/helios/lineairdb_logs
+        mkdir -p {{ wal_mount }}/helios_wal
+        chown {{ ansible_user }}:{{ ansible_user }} {{ wal_mount }}/helios_wal
+        target=/home/{{ ansible_user }}/helios/helios_wal
         if [ -L "$target" ]; then
           rm -f "$target"
         elif [ -e "$target" ]; then
           rm -rf "$target"
         fi
-        ln -s {{ wal_mount }}/lineairdb_logs "$target"
+        ln -s {{ wal_mount }}/helios_wal "$target"
         chown -h {{ ansible_user }}:{{ ansible_user }} "$target"
       args:
         executable: /bin/bash
@@ -61,8 +61,9 @@
 
     - name: Start LineairDB-Server
       # Never pipe the start scripts: log to a file and verify liveness explicitly;
-      # lineairdb_logs is wiped first, following the WAL symlink when present, so
-      # a run never replays a previous WAL
+      # helios_wal is wiped first, following the WAL symlink when present, so
+      # a run never replays a previous WAL; lineairdb_logs holds the process
+      # logs and is wiped so a sweep's archive carries only its own run
       shell: |
         set -euo pipefail
         cd ~/helios
@@ -75,7 +76,8 @@
           sleep 1
         done
         [ "$rc" -eq 1 ] || { echo "refusing to wipe the WAL: a previous lineairdb-server is still running or pgrep failed (status $rc)"; exit 1; }
-        find ~/helios/lineairdb_logs/ -mindepth 1 -delete
+        mkdir -p ~/helios/helios_wal ~/helios/lineairdb_logs
+        find ~/helios/helios_wal/ ~/helios/lineairdb_logs/ -mindepth 1 -delete
         ulimit -n {{ lineairdb_nofile_limit }}
         export LINEAIRDB_COMMIT_DURABILITY="{{ helios_load_durability | default(helios_durability) }}"
         {% if helios_epoch_ms %}

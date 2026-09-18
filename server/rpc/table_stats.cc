@@ -1,8 +1,10 @@
 #include "lineairdb_rpc.hh"
 
+#include <cstddef>
 #include <cstdint>
 #include <mutex>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -11,6 +13,40 @@
 
 // Table statistics handler: row counts plus the process-wide NDV and
 // range-histogram caches consumed by the proxy cost model.
+
+namespace {
+
+// A key part is [0x00 not-null][type][2-byte big-endian length][payload].
+// Fills the offset past each of the leading num_parts parts; false leaves the key out.
+bool key_part_ends(std::string_view key, uint32_t num_parts, size_t* ends,
+                   bool allow_datetime) {
+    size_t off = 0;
+    for (uint32_t p = 0; p < num_parts; ++p) {
+        if (off + 4 > key.size()) return false;
+        const auto marker = static_cast<unsigned char>(key[off]);
+        const auto type = static_cast<unsigned char>(key[off + 1]);
+        if (marker != 0x00 || !(type == 0x10 || (allow_datetime && type == 0x30))) {
+            return false;
+        }
+        const size_t len =
+            (static_cast<size_t>(static_cast<unsigned char>(key[off + 2])) << 8) |
+            static_cast<unsigned char>(key[off + 3]);
+        off += 4 + len;
+        if (off > key.size()) return false;
+        ends[p] = off;
+    }
+    return true;
+}
+
+bool int_key_parts(std::string_view key, uint32_t n, size_t* ends) {
+    return key_part_ends(key, n, ends, false);
+}
+
+bool hist_key_parts(std::string_view key, uint32_t n, size_t* ends) {
+    return key_part_ends(key, n, ends, true);
+}
+
+}  // namespace
 
 std::mutex LineairDBRpc::ndv_cache_mu_;
 std::unordered_map<std::string, std::pair<bool, std::vector<uint64_t>>>
@@ -23,16 +59,17 @@ void LineairDBRpc::handleTxGetTableStats(const std::string& message,
     LineairDB::Protocol::GetTableStats::Request request;
     request.ParseFromString(message);
     LineairDB::Protocol::GetTableStats::Response response;
+    // Every connection asks for stats when it opens a table, so this is where
+    // it learns which run of this server it is talking to.
+    response.set_boot_token(storage_boot_token());
 
-    if (row_counts_) {
-        for (const auto& [name, count] : row_counts_->snapshot()) {
-            auto* ts = response.add_table_stats();
-            ts->set_table_name(name);
-            ts->set_row_count(count);
-        }
+    for (const auto& [name, count] : row_counts_->snapshot()) {
+        auto* ts = response.add_table_stats();
+        ts->set_table_name(name);
+        ts->set_row_count(count);
     }
 
-    if (!request.ndv_table().empty() && db_manager_) {
+    if (!request.ndv_table().empty()) {
         auto db = db_manager_->get_database();
         for (const auto& desc : request.ndv_indexes()) {
             auto* out = response.add_index_ndv();
@@ -59,9 +96,10 @@ void LineairDBRpc::handleTxGetTableStats(const std::string& message,
             }
 
             if (!cached) {
-                available = db && db->ComputeIndexNdvInt(
-                                      request.ndv_table(), desc.index_name(),
-                                      desc.num_key_parts(), ndv);
+                available = db->IndexNdv(request.ndv_table(),
+                                               desc.index_name(),
+                                               desc.num_key_parts(),
+                                               int_key_parts, ndv);
                 std::lock_guard<std::mutex> lock(ndv_cache_mu_);
                 ndv_cache_[cache_key] = {available, ndv};
             }
@@ -85,12 +123,12 @@ void LineairDBRpc::handleTxGetTableStats(const std::string& message,
             }
 
             if (!hist_cached) {
-                hist.available = db && db->ComputeIndexHistogram(
-                                            request.ndv_table(),
-                                            desc.index_name(),
-                                            kHistogramBuckets,
-                                            hist.bounds,
-                                            hist.cum);
+                hist.available = db->IndexHistogram(request.ndv_table(),
+                                                          desc.index_name(),
+                                                          kHistogramBuckets,
+                                                          hist_key_parts,
+                                                          hist.bounds,
+                                                          hist.cum);
                 if (!hist.available) {
                     hist.bounds.clear();
                     hist.cum.clear();

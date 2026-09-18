@@ -11,7 +11,7 @@ def reset (db, cursor) :
         middle_name VARCHAR(50) NOT NULL,\
         last_name VARCHAR(50) NOT NULL,\
         age int NOT NULL,\
-        content TEXT,\
+        content VARCHAR(255),\
         PRIMARY KEY(age, middle_name, last_name, first_name)  \
     )ENGINE = LineairDB')
     db.commit()

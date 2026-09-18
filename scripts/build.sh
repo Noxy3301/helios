@@ -13,20 +13,6 @@ if [ ! -f "boost/boost_1_77_0.tar.bz2" ]; then
     cd ..
 fi
 
-# Apply LineairDB CMakeLists.txt fixes for compilation warnings
-echo "Applying LineairDB compilation fixes..."
-LINEAIRDB_CMAKE="third_party/LineairDB/CMakeLists.txt"
-if ! grep -q "target_compile_options.*-Wno-error" "$LINEAIRDB_CMAKE"; then
-    # Add include(GNUInstallDirs) if not present
-    if ! grep -q "include(GNUInstallDirs)" "$LINEAIRDB_CMAKE"; then
-        sed -i '/cmake_minimum_required/a include(GNUInstallDirs)' "$LINEAIRDB_CMAKE"
-    fi
-    
-    # Add -Wno-error flag to LineairDB library
-    sed -i '/add_library.*SOURCES/a target_compile_options(${PROJECT_NAME} PRIVATE -Wno-error)' "$LINEAIRDB_CMAKE"
-    echo "Applied LineairDB compilation fixes"
-fi
-
 # Prepare build directory with clean structure
 echo "Setting up build directory structure..."
 mkdir -p build/data
@@ -47,9 +33,6 @@ MYSQL_BUILD_TYPE=${MYSQL_BUILD_TYPE:-Release}
 # Create proxy copy with necessary dependencies in build directory
 echo "Creating proxy build structure..."
 cp -r proxy build/
-# Create symbolic links in build directory only
-mkdir -p build/proxy/third_party
-ln -sf $(pwd)/third_party/LineairDB build/proxy/third_party/LineairDB
 rm -rf build/proxy/proto
 mkdir -p build/proxy/proto
 cp -a proto/. build/proxy/proto/
