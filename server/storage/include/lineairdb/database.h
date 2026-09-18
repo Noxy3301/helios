@@ -200,7 +200,7 @@ class Database {
   bool PaxViewValid(const PaxReadView &view) const;
 
   /**
-   * @brief Reads one row without opening a server-side transaction.
+   * @brief Reads one row from the current state, leaving nothing behind.
    *
    * Looks the key up in the primary index of `table_name` and returns the
    * current value together with the TID word observed at read time. The

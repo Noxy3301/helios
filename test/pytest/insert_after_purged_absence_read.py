@@ -32,9 +32,8 @@ SERVER_PORT_WAIT_SECONDS = 20
 MYSQLD_PORT_WAIT_SECONDS = 90
 ARRIVAL_WAIT_SECONDS = 30
 STATEMENT_DEADLINE_SECONDS = 60.0
-# The REPLACE installs its row in one round trip, but a plugin built with
-# FENCE=true then holds its client call until the parked transaction ends, so
-# the commit cannot wait for the statement to return.
+# The REPLACE commits on its own; the parked INSERT reaches the storage only
+# at its COMMIT, which is issued after the REPLACE has installed its row.
 REPLACE_INSTALL_SECONDS = 5.0
 PURGE_RELEASE_DELAY_SECONDS = 1.5
 
@@ -181,10 +180,9 @@ def test_insert_after_a_purged_absence_read(user, password,
             f"resolved the entry the reaper held")
         return 1
 
-    # The insert's statement-end flush claims a fresh entry for the purged key;
-    # the replacer then installs and commits its row into that entry. A plugin
-    # built with FENCE=true holds the REPLACE's return until this transaction
-    # ends, so wait only for its install before committing.
+    # The INSERT stays in this transaction's write buffer; the replacer installs
+    # and commits its row under the purged key first, and the COMMIT's
+    # validation of that key refuses the INSERT.
     t_cursor.execute(f"INSERT INTO {DBNAME}.t VALUES (1, 'mine')")
     replacer = Statement(f"REPLACE INTO {DBNAME}.t VALUES (1, 'replacer')",
                          user, password)

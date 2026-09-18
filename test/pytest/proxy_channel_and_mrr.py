@@ -126,7 +126,7 @@ def test_batch_mrr_rowid_sort(user, password):
     setup_cursor.close()
     setup.close()
 
-    # read_path is latched when the transaction starts, so take a new session
+    # A new session keeps the restart scenario apart from the setup connection.
     connection = get_connection(user, password)
     connection.autocommit = True
     cursor = connection.cursor()

@@ -22,7 +22,7 @@ SERVER = os.path.join(REPO, "build", "server", "lineairdb-server")
 
 VARIABLE = "LINEAIRDB_WAL_INITIAL_CAPACITY_BYTES"
 STARTUP_TIMEOUT_SECONDS = 20
-# server/storage/database_manager.cc: kMaxWalCapacityBytes
+# server/database_manager.cc: kMaxWalCapacityBytes
 MAX_BYTES = 64 * 1024**3
 
 

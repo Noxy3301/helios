@@ -116,56 +116,8 @@ static int lineairdb_abort(handlerton *hton, THD *thd, bool);
 
 static int lineairdb_close_connection(handlerton *hton, THD *thd);
 
-/*
-  List of all system tables specific to the SE.
-  Array element would look like below,
-     { "<database_name>", "<system table name>" },
-  The last element MUST be,
-     { (const char*)NULL, (const char*)NULL }
-
-  This array is optional, so every SE need not implement it.
-*/
-static st_handler_tablename ha_lineairdb_system_tables[] = {
-    {(const char *)nullptr, (const char *)nullptr}};
-
-/**
-  @brief Check if the given db.tablename is a system table for this SE.
-
-  @param db                         Database name to check.
-  @param table_name                 table name to check.
-  @param is_sql_layer_system_table  if the supplied db.table_name is a SQL
-                                    layer system table.
-
-  @retval true   Given db.table_name is supported system table.
-  @retval false  Given db.table_name is not a supported system table.
-*/
-static bool
-lineairdb_is_supported_system_table(const char *db, const char *table_name,
-                                    bool is_sql_layer_system_table) {
-  st_handler_tablename *systab;
-
-  // Does this SE support "ALL" SQL layer system tables ?
-  if (is_sql_layer_system_table)
-    return false;
-
-  // Check if this is SE layer system tables
-  systab = ha_lineairdb_system_tables;
-  while (systab && systab->db) {
-    if (systab->db == db && strcmp(systab->tablename, table_name) == 0)
-      return true;
-    systab++;
-  }
-
-  return false;
-}
-
 static handler *lineairdb_create_handler(handlerton *hton, TABLE_SHARE *table,
                                          bool partitioned, MEM_ROOT *mem_root);
-
-/* Interface to mysqld, to check system tables supported by SE */
-static bool lineairdb_is_supported_system_table(const char *db,
-                                                const char *table_name,
-                                                bool is_sql_layer_system_table);
 
 static handler *lineairdb_create_handler(handlerton *hton, TABLE_SHARE *table,
                                          bool, MEM_ROOT *mem_root) {
@@ -183,8 +135,6 @@ static int lineairdb_init_func(void *p) {
   // SECONDARY_LOAD/UNLOAD cleanup calls the primary engine's post_ddl hook.
   // LineairDB has no post-DDL storage work here, but the hook must be present.
   lineairdb_hton->post_ddl = [](THD *) {};
-  lineairdb_hton->is_supported_system_table =
-      lineairdb_is_supported_system_table;
   lineairdb_hton->db_type = DB_TYPE_UNKNOWN;
   lineairdb_hton->commit = lineairdb_commit;
   lineairdb_hton->rollback = lineairdb_abort;

@@ -208,7 +208,13 @@ def cleanup_lineairdb_logs():
         return
 
     removed = 0
-    if HELIOS_WAL_DIR.exists():
+    if HELIOS_WAL_DIR.is_symlink():
+        # A work directory linked onto another volume keeps the link; only its
+        # contents go.
+        for path in HELIOS_WAL_DIR.iterdir():
+            shutil.rmtree(path) if path.is_dir() and not path.is_symlink() else path.unlink()
+        removed += 1
+    elif HELIOS_WAL_DIR.exists():
         shutil.rmtree(HELIOS_WAL_DIR)
         removed += 1
     for path in LINEAIRDB_LOG_DIR.iterdir() if LINEAIRDB_LOG_DIR.exists() else []:
@@ -882,7 +888,7 @@ def main():
     parser.add_argument("--external-server", action="store_true",
                         help="Skip auto start/stop of lineairdb-server and mysqld (assume already running)")
     parser.add_argument("--keep-lineairdb-logs", action="store_true",
-                        help="Keep lineairdb_logs after the benchmark")
+                        help="Keep lineairdb_logs and helios_wal after the benchmark")
     parser.add_argument("--read-path", choices=["row", "plan"], default="plan",
                         help="SET GLOBAL lineairdb_read_path: row sends one request per handler "
                              "read, plan stages what it can in one request (default)")
@@ -891,6 +897,8 @@ def main():
                              "inject @_tx_plan, instead of the per-statement plan the proxy "
                              "derives from the QEP")
     args = parser.parse_args()
+    if args.tx_plan and args.read_path == "row":
+        sys.exit("--tx-plan stages reads through the plan; it cannot be combined with --read-path row")
 
     # Validate
     if args.load_durability == "async":

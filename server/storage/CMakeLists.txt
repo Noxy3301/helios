@@ -17,7 +17,6 @@
 #
 
 cmake_minimum_required(VERSION 3.10)
-list(APPEND CMAKE_MODULE_PATH "${CMAKE_SOURCE_DIR}/cmake")
 project(
   helios_storage
   VERSION 0.1.0
@@ -28,11 +27,6 @@ project(
 # Build Options
 option(BUILD_TESTS "Build testing executables" ON)
 option(BUILD_SANITIZER "Build with clang's address sanitizer" OFF)
-
-# Build Parameters
-if (DEFINED PREFETCH_LOCALITY)
-  add_compile_definitions(PREFETCH_LOCALITY=${PREFETCH_LOCALITY})
-endif()
 
 if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
   set(IS_TOPLEVEL_PROJECT TRUE)

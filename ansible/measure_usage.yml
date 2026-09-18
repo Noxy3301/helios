@@ -100,16 +100,16 @@
               timestamp={{ lookup('pipe', 'date -Iseconds') }}
 
         # The load may run under a relaxed contract; the sweep never does.
-        # Reconciling returns only once every write acknowledged under the load
-        # contract is durable, so it runs before the samplers start.
+        # The switch applies to the commits that follow and waits for no
+        # barrier; it runs before the samplers start.
         - name: Put the storage server in the measured durability contract
           when: inventory_hostname in groups.get('lineairdb', [])
           block:
             - name: "Gate: the measured durability contract is declared"
               assert:
-                that: helios_durability in ['volatile', 'async', 'sync']
+                that: helios_durability in ['async', 'sync']
                 fail_msg: >-
-                  measure_usage.yml needs helios_durability=<volatile|async|sync>:
+                  measure_usage.yml needs helios_durability=<async|sync>:
                   the sweep must not inherit whatever contract the load left behind
                 quiet: true
 
@@ -130,23 +130,23 @@
                   first=$(grep -hoE 'Commit durability: [a-z]+' "$log" | head -n1 || true)
                   printf '%s' "${first##* }"
                 }
-                # The policy in force: the last one the server published, else the
-                # startup contract. A failed barrier still published its policy.
+                # The policy in force: the last switch the server logged, else the
+                # startup contract.
                 policy_in_force() {
                   local last
-                  last=$(grep -h 'SetCommitDurability .*effective=' "$log" \
-                         | grep -oE 'effective=[A-Z]+' | tail -n1 || true)
+                  last=$(grep -hoE 'Commit durability switched to [A-Z]+' "$log" \
+                         | tail -n1 || true)
                   if [ -z "$last" ]; then
                     startup_contract
                     return
                   fi
-                  printf '%s' "${last#effective=}" | tr 'A-Z' 'a-z'
+                  printf '%s' "${last##* }" | tr 'A-Z' 'a-z'
                 }
                 # Apparent size: wal.log is preallocated, so this stays at the
                 # initial capacity until the log outgrows it.
                 wal_file_bytes() {
                   local total
-                  total=$(du -Lbc ~/helios/lineairdb_logs/wal*.log 2>/dev/null \
+                  total=$(du -Lbc ~/helios/helios_wal/wal*.log 2>/dev/null \
                           | tail -n1 | cut -f1 || true)
                   echo "${total:-0}"
                 }
@@ -175,8 +175,8 @@
                   exit 1
                 fi
                 mode_before=$(policy_in_force)
-                # The load ran under the startup contract whatever happened after, so a
-                # failed barrier can be retried by re-running this play.
+                # The load ran under the startup contract whatever happened after; a
+                # failed switch is retried by re-running this play.
                 if [ "$startup" != "$declared_load" ]; then
                   echo "SWITCH_FAIL: the load ran under $startup, not the declared $declared_load" >&2
                   exit 1
@@ -184,27 +184,15 @@
                 rss_before=$(awk '/^VmRSS:/{print $2}' "/proc/$pid/status" || true)
                 wal_before=$(wal_file_bytes)
                 started=$(date +%s.%N)
-                if [ "$measured" = volatile ]; then
-                  if ! grep -q 'Commit durability: volatile' "$log"; then
-                    echo "SWITCH_FAIL: $log has no volatile startup line" >&2
-                    exit 1
-                  fi
-                  if grep -q 'SetCommitDurability .*result=ok .*effective=' "$log"; then
-                    echo "SWITCH_FAIL: $log records a switch under a volatile sweep" >&2
-                    exit 1
-                  fi
-                  reply="(volatile: no barrier)"
-                else
-                  expected="ok mode=$(printf '%s' "$measured" | tr 'a-z' 'A-Z')"
-                  reply=$(~/helios/build/server/lineairdb-ctl --host 127.0.0.1 --port 9999 \
-                            set-durability "$measured") || {
-                    echo "SWITCH_FAIL: lineairdb-ctl exited non-zero" >&2
-                    exit 1
-                  }
-                  if [ "$reply" != "$expected" ]; then
-                    echo "SWITCH_FAIL: expected '$expected', got '$reply'" >&2
-                    exit 1
-                  fi
+                expected="ok mode=$(printf '%s' "$measured" | tr 'a-z' 'A-Z')"
+                reply=$(~/helios/build/server/lineairdb-ctl --host 127.0.0.1 --port 9999 \
+                          set-durability "$measured") || {
+                  echo "SWITCH_FAIL: lineairdb-ctl exited non-zero" >&2
+                  exit 1
+                }
+                if [ "$reply" != "$expected" ]; then
+                  echo "SWITCH_FAIL: expected '$expected', got '$reply'" >&2
+                  exit 1
                 fi
                 ended=$(date +%s.%N)
                 rss_after=$(awk '/^VmRSS:/{print $2}' "/proc/$pid/status" || true)
@@ -757,8 +745,7 @@
         executable: /bin/bash
 
     - name: Package LineairDB logs
-      # lineairdb_server_*.log only: wal.log / checkpoint*.log live in the same
-      # dir and can be tens of GB.
+      # The server's own log only; the WAL under helios_wal can be tens of GB.
       when: inventory_hostname in groups.get('lineairdb', [])
       shell: |
         cd ~/helios/lineairdb_logs 2>/dev/null || exit 0
@@ -773,8 +760,8 @@
       when: inventory_hostname in groups.get('lineairdb', [])
       shell: |
         {
-          echo "=== du -sh ~/helios/lineairdb_logs/ ==="
-          du -sh ~/helios/lineairdb_logs/ 2>/dev/null
+          echo "=== du -sh ~/helios/helios_wal/ ==="
+          du -sh ~/helios/helios_wal/ 2>/dev/null
           echo "=== df -h ==="
           df -h
         } > {{ sample_dir }}/wal-usage-{{ run_id }}.txt

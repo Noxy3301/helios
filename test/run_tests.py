@@ -18,7 +18,9 @@ def restart_services():
   os.system(f"./scripts/stop_server.sh {QUIET}")
   # The storage keeps its PAX catalog and log across restarts even with
   # recovery off, and the suite re-creates tables with different columns.
-  shutil.rmtree("helios_wal", ignore_errors=True)
+  # The work directory may be a link onto another volume: clear it, keep it.
+  for entry in (os.scandir("helios_wal") if os.path.isdir("helios_wal") else []):
+    shutil.rmtree(entry.path, ignore_errors=True) if entry.is_dir(follow_symlinks=False) else os.unlink(entry.path)
   time.sleep(1)
   os.system(f"./scripts/start_server.sh {QUIET}")
   time.sleep(2)

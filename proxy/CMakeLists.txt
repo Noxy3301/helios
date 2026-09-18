@@ -34,7 +34,6 @@ MYSQL_PROTOBUF_GENERATE_CPP_LIBRARY(
 # Add include path for generated protobuf header files
 include_directories(${CMAKE_CURRENT_BINARY_DIR})
 
-set(LINEAIRDB_PLUGIN_DYNAMIC "ha_lineairdb")
 set(LINEAIRDB_SOURCES ha_lineairdb.cc ha_lineairdb.hh
                       ha_lineairdb_columnar.cc
                       ha_lineairdb_columnar.hh

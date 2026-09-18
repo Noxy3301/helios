@@ -95,7 +95,7 @@ class EpochScanCheckpoint {
   /**
    * @brief Starts the thread that captures on the configured interval.
    * A zero interval and no one-shot delay leaves the thread unstarted, which
-   * is the default, and so does a durability contract that writes no log.
+   * is the default.
    * @pre epoch::Framework::Start has been called.
    */
   void Start();

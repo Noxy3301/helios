@@ -11,8 +11,8 @@ struct TABLE;
 /**
  * @brief PAX typed-cell kind constants.
  *
- * @details Mirror of LineairDB::Pax::FieldKind (pax_store.h). The proxy is
- * PAX-oblivious; the values are duplicated by design and kept in sync.
+ * @details The values of helios::storage::pax::FieldType (server/storage
+ * include/lineairdb/pax.h); the plugin carries no storage header.
  */
 namespace pax_kind {
 constexpr uint32_t UNTYPED = 0;                 // verbatim byte layout

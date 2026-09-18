@@ -24,6 +24,7 @@ ctest --test-dir build/storage -j1
 ```
 
 The tests share one working directory and run serially.
+`scripts/storage_tests.sh [build_dir]` runs the three steps in one command.
 
 ## Provenance
 

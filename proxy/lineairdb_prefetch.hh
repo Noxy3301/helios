@@ -18,8 +18,8 @@ bool thd_can_use_prefetch(THD *thd);
  *        at transaction begin, if one is present.
  *
  * Marks the transaction (tx_plan_used) so the statement-scoped autogen path
- * stays out of the way; the two prefetch paths are mutually exclusive per
- * transaction. No-op when no @_tx_plan is set.
+ * stays out of the way; a transaction takes its plan from one source, the
+ * DSL or the QEP. No-op when no @_tx_plan is set.
  *
  * @param thd Current session.
  * @param tx  Transaction to prefetch into.

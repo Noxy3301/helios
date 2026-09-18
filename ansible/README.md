@@ -112,7 +112,7 @@ ansible-playbook -i inventory.ini benchbase.yml \
 
 # Execute with monitoring
 ansible-playbook -i inventory.ini measure_usage.yml \
-  -e "helios_durability=volatile bench_type=ycsb bench_profile=b run_id=$(date +%Y%m%d-%H%M%S)"
+  -e "helios_durability=sync bench_type=ycsb bench_profile=b run_id=$(date +%Y%m%d-%H%M%S)"
 ```
 
 #### TPC-C
@@ -124,11 +124,11 @@ ansible-playbook -i inventory.ini benchbase.yml \
 
 # Execute
 ansible-playbook -i inventory.ini measure_usage.yml \
-  -e "helios_durability=volatile bench_type=tpcc bench_time=60 run_id=$(date +%Y%m%d-%H%M%S)"
+  -e "helios_durability=sync bench_type=tpcc bench_time=60 run_id=$(date +%Y%m%d-%H%M%S)"
 
 # Custom terminal sweep
 ansible-playbook -i inventory.ini measure_usage.yml \
-  -e "helios_durability=volatile bench_type=tpcc bench_terms=[1,16,64,128] run_id=$(date +%Y%m%d-%H%M%S)"
+  -e "helios_durability=sync bench_type=tpcc bench_terms=[1,16,64,128] run_id=$(date +%Y%m%d-%H%M%S)"
 ```
 
 #### TPC-H serial (22 queries once each)
@@ -140,7 +140,7 @@ ansible-playbook -i inventory.ini benchbase.yml \
 
 # Execute (bench_serial defaults to true for tpch, bench_terms defaults to [1])
 ansible-playbook -i inventory.ini measure_usage.yml \
-  -e "helios_durability=volatile bench_type=tpch run_id=$(date +%Y%m%d-%H%M%S)"
+  -e "helios_durability=sync bench_type=tpch run_id=$(date +%Y%m%d-%H%M%S)"
 ```
 
 #### TPC-H parallel (scalability test)
@@ -152,7 +152,7 @@ ansible-playbook -i inventory.ini benchbase.yml \
 
 # Execute with terminal sweep
 ansible-playbook -i inventory.ini measure_usage.yml \
-  -e "helios_durability=volatile bench_type=tpch bench_serial=false bench_scalefactor=0.01 bench_time=60 bench_terms=[1,2,4,8,16,32] run_id=$(date +%Y%m%d-%H%M%S)"
+  -e "helios_durability=sync bench_type=tpch bench_serial=false bench_scalefactor=0.01 bench_time=60 bench_terms=[1,2,4,8,16,32] run_id=$(date +%Y%m%d-%H%M%S)"
 ```
 
 ## Variables reference
@@ -167,9 +167,11 @@ ansible-playbook -i inventory.ini measure_usage.yml \
 | `bench_time`        | `60`                                            | Execution time in seconds                   |
 | `bench_terms`       | `[1]` (tpch serial) / `[1,32,...,256]` (others) | Terminal counts to sweep                    |
 | `bench_sync`        | `true`                                          | Synchronize start across bench nodes        |
+| `bench_read_path`   | `plan`                                          | `SET GLOBAL lineairdb_read_path`: `plan` or `row` |
+| `bench_tx_plan`     | `false`                                         | Export `HELIOS_PREFETCH_PLAN=1` so TPC-C injects `@_tx_plan` |
 | `bench_sync_buffer` | `5`                                             | Sync buffer (seconds)                       |
 | `run_id`            | `run`                                           | Identifier for log filenames                |
-| `helios_durability` | none (required for the lineairdb engine)        | Commit durability the sweep measures: `volatile`, `async`, `sync`. `measure_usage.yml` reconciles the storage server with it before sampling and refuses to sweep without it |
+| `helios_durability` | `async` (`lineairdb.yml`); `measure_usage.yml` requires it explicitly | Commit durability the sweep measures: `async` or `sync`. `measure_usage.yml` reconciles the storage server with it before sampling and refuses to sweep without it |
 | `helios_load_durability` | unset                                      | Relaxed contract for the load phase only (`async`). Passed to `lineairdb.yml` to start the server under it, and to `measure_usage.yml`, which refuses to sweep unless the storage server started under it |
 | `sample_interval`   | `1`                                             | CPU sampling interval (seconds)             |
 
@@ -233,5 +235,5 @@ python3 py/plot_tpch.py          # TPC-H per-query latency (auto-called for tpch
   `unique_checks=1` gate is a backstop of a different kind: that relaxation
   (`bench_load_unique_checks_off`) lives in the loader's JDBC session, and
   `measure_term.yml` already refuses an execute config carrying it.
-- **Server restart clears data**: LineairDB is in-memory. Restarting the Helios server loses all data. Re-run `benchbase.yml` after restart.
+- **Server restart clears data**: `lineairdb.yml` wipes `helios_wal` before it starts the server, so a redeploy starts empty. Re-run `benchbase.yml` after restart.
 

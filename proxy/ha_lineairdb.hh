@@ -62,10 +62,10 @@
 #include "sql_string.h"
 #include "thr_lock.h" /* THR_LOCK, THR_LOCK_DATA */
 
-/** @brief
-  LineairDB_share is a class that will be shared among all open handlers.
-  This lineairdb implements the minimum of what you will probably need.
-*/
+/**
+ * @brief State every open handler of one table shares: the lock, the hidden
+ * key range, the row-count shards and the cached index statistics.
+ */
 class LineairDB_share : public Handler_share
 {
 public:

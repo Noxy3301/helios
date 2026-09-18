@@ -11,13 +11,12 @@
     bench_type: ycsb
     bench_profile: b
     bench_serial: "{{ bench_type == 'tpch' }}"
-    # Run BenchBase in Helios prefetch mode: SET GLOBAL lineairdb_prefetch_execution=ON
-    # on every MySQL once per sweep.
-    bench_prefetch: false
-    # Whether to also export HELIOS_PREFETCH_PLAN=1, which makes the TPC-C procedures
-    # inject @_tx_plan hints. Set false to measure the statement-scoped autogen path,
-    # where the proxy derives a per-statement read plan from the QEP instead.
-    bench_prefetch_plan: true
+    # Where a statement's reads come from: plan stages a read plan per statement,
+    # row sends one request per handler call. Set on every MySQL once per sweep.
+    bench_read_path: plan
+    # Export HELIOS_PREFETCH_PLAN=1 so the TPC-C procedures inject @_tx_plan and
+    # the read plan comes from that DSL instead of the statement's QEP.
+    bench_tx_plan: false
     # Refetch index NDV and histogram when the row count drifts more than 20%.
     # Off by default: the recompute is synchronous on the read path.
     bench_ndv_drift: false
@@ -60,13 +59,13 @@
       loop_control:
         label: "{{ item }}"
 
-    - name: "Toggle lineairdb_prefetch_execution on each MySQL (={{ 'ON' if bench_prefetch | bool else 'OFF' }})"
+    - name: "Set lineairdb_read_path on each MySQL (={{ bench_read_path }})"
       when: mysql_engine | default('lineairdb') != 'innodb'
       shell: |
         ~/helios/build/runtime_output_directory/mysql \
           -u root --protocol=TCP \
           -h {{ hostvars[item].private_ip }} -P 3307 \
-          -e "SET GLOBAL lineairdb_prefetch_execution={{ 'ON' if bench_prefetch | bool else 'OFF' }};"
+          -e "SET GLOBAL lineairdb_read_path='{{ bench_read_path }}';"
       args:
         executable: /bin/bash
       run_once: true
