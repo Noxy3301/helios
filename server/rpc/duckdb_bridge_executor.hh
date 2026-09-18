@@ -23,4 +23,14 @@ void ExecuteDuckdbQuery(
     const LineairDB::Protocol::TxExecuteDuckdbQuery::Request& request,
     LineairDB::Protocol::TxExecuteDuckdbQuery::Response* response);
 
+/**
+ * @brief Reads HELIOS_BRIDGE_THREADS and HELIOS_BRIDGE_MEM_LIMIT into the
+ * bounds the DuckDB runtime starts under.
+ *
+ * @details Call once on the start path: a value that is not a bound ends the
+ * process here, rather than at the first analytical request, which is when
+ * the runtime is built.
+ */
+void ConfigureLimits();
+
 }  // namespace duckdb_bridge

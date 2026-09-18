@@ -1,5 +1,6 @@
 #include "database_manager.hh"
 #include "../../common/log.h"
+#include "rpc/duckdb_bridge_executor.hh"
 
 #include <charconv>
 #include <cstdint>
@@ -140,6 +141,7 @@ DatabaseManager::DatabaseManager() {
     configure_checkpoint(conf);
     conf.enable_recovery = env_enabled("LINEAIRDB_ENABLE_RECOVERY");
     set_commit_durability(configure_commit_durability());
+    duckdb_bridge::ConfigureLimits();
     try {
         database_ = std::make_shared<helios::storage::Database>(conf);
     } catch (const std::system_error& err) {

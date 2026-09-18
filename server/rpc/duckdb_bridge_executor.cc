@@ -4,6 +4,10 @@
 // groups without epoch images and through those images otherwise. DuckDB
 // contributes its binder, planner, and vectorized runtime; no table data ever
 // lives inside DuckDB. duckdb_bridge_dispatch.cc routes the opcode here.
+// HELIOS_BRIDGE_THREADS bounds the analytical thread pool; unset is a quarter
+// of the hardware threads, which leaves the OLTP side its cores in a mixed run.
+// HELIOS_BRIDGE_MEM_LIMIT bounds DuckDB's operator memory (a byte count, K/M/G
+// accepted); unset is DuckDB's own default.
 //
 // Consistency: the request runs against a columnar read view with snapshot
 // epoch se (Database::OpenPaxView). A slot that holds an epoch image resolves
@@ -18,12 +22,14 @@
 
 #include "duckdb_ast_builder.hh"
 
+#include <duckdb/common/exception/conversion_exception.hpp>
 #include <duckdb/common/vector_operations/ternary_executor.hpp>
 #include <duckdb/common/vector_operations/unary_executor.hpp>
 #include <duckdb/function/scalar_function.hpp>
 #include <duckdb/parser/parsed_data/create_collation_info.hpp>
 #include <duckdb/parser/parsed_data/create_scalar_function_info.hpp>
 
+#include "../../common/log.h"
 #include "../mysql_charset_runtime.hh"
 #include "m_ctype.h"
 
@@ -32,6 +38,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <charconv>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
@@ -42,6 +49,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <system_error>
 #include <thread>
 #include <unordered_map>
 #include <utility>
@@ -309,7 +317,6 @@ using duckdb::ClientContext;
 using duckdb::column_t;
 using duckdb::Connection;
 using duckdb::DataChunk;
-using duckdb::Date;
 using duckdb::date_t;
 using duckdb::ExecutionContext;
 using duckdb::FlatVector;
@@ -549,6 +556,62 @@ unique_ptr<LocalTableFunctionState> PaxInitLocal(ExecutionContext&,
 }
 
 /**
+ * @brief One output row whose in-place DATE cell names no calendar day.
+ *
+ * @details A cell a concurrent writer tore reads this way, and so does a
+ * date stored under a relaxed sql_mode. The chunk audit tells them apart: a
+ * group whose preserve counter moved has the row re-read, and a group whose
+ * counter held stored the value.
+ */
+struct InvalidDate {
+  idx_t row;
+  int32_t ymd;
+};
+
+/**
+ * @brief Converts a year/month/day into a date_t (days since the epoch),
+ * false when the parts name no calendar day.
+ *
+ * @details A rejected date leaves the epoch in `out` as a placeholder, which
+ * reaches the result only for a row the audit confirms, and the audit raises
+ * on that row.
+ */
+inline bool TryCanonicalDate(int32_t year, int32_t month, int32_t day,
+                             date_t* out) {
+  if (month < 1 || month > 12 || day < 1 || day > 31 ||
+      !duckdb::Date::TryFromDate(year, month, day, *out)) {
+    *out = date_t(0);
+    return false;
+  }
+  return true;
+}
+
+/**
+ * @brief Converts a year/month/day into a date_t and raises when the parts
+ * name no calendar day.
+ *
+ * @details For a value no audit covers: an epoch image carries the ASCII a
+ * writer formatted under a lock, which no reader can tear.
+ */
+inline date_t CanonicalDate(int32_t year, int32_t month, int32_t day) {
+  date_t result;
+  if (!TryCanonicalDate(year, month, day, &result)) {
+    throw duckdb::ConversionException("Date out of range: %d-%d-%d", year,
+                                      month, day);
+  }
+  return result;
+}
+
+/**
+ * @brief Raises the conversion `bad` failed.
+ */
+[[noreturn]] void RaiseInvalidDate(const InvalidDate& bad) {
+  throw duckdb::ConversionException("Date out of range: %d-%d-%d",
+                                    bad.ymd / 10000, (bad.ymd / 100) % 100,
+                                    bad.ymd % 100);
+}
+
+/**
  * @brief Writes a scaled DEC64 mantissa through the vector's physical type.
  *
  * @details DuckDB stores DECIMAL(p, s) in the narrowest integer type that
@@ -576,17 +639,43 @@ inline void WriteDecimalPhysical(Vector& output_vector, idx_t row,
 }
 
 /**
+ * @brief Decodes a run of DEC64 cells into the vector's physical type.
+ *
+ * @details The data pointer is fetched once per run; DuckDB's GetData checks
+ * the vector type on every call.
+ */
+template <class T>
+void DecodeDecimalRun(const std::byte* src, uint32_t stride, uint32_t width,
+                      uint32_t count, Vector& output_vector, idx_t out_base) {
+  T* dst = FlatVector::GetData<T>(output_vector) + out_base;
+  for (uint32_t i = 0; i < count; i++, src += stride) {
+    uint16_t cell_length;
+    std::memcpy(&cell_length, src, sizeof(cell_length));
+    if (cell_length == width) {
+      int64_t mantissa;
+      std::memcpy(&mantissa, src + PaxGroup::kCellLenBytes, sizeof(mantissa));
+      dst[i] = T(mantissa);
+    } else {
+      dst[i] = T(0);
+      FlatVector::SetNull(output_vector, out_base + i, true);
+    }
+  }
+}
+
+/**
  * @brief Bulk-decodes one typed (non-UNTYPED) column across a contiguous run
  * of visible slots.
  *
  * @details A typed cell is [u16 len][fixed-width LE payload]; a length equal
  * to the column width means the payload is present, any other length (an
- * empty cell) is SQL NULL.
+ * empty cell) is SQL NULL. A DATE cell naming no calendar day appends to
+ * `invalid_dates` rather than raising, leaving the verdict to the audit.
  */
 void BulkDecodeTyped(FieldType type, const PaxGroup& group, size_t field,
                      uint32_t width, uint32_t slot_start, uint32_t count,
                      Vector& output_vector, idx_t out_base,
-                     PhysicalType decimal_physical_type) {
+                     PhysicalType decimal_physical_type,
+                     std::vector<InvalidDate>* invalid_dates) {
   const std::byte* strip_base = group.strip(field);
   const uint32_t stride = group.stride(field);
   const std::byte* src = strip_base + static_cast<size_t>(stride) * slot_start;
@@ -629,28 +718,36 @@ void BulkDecodeTyped(FieldType type, const PaxGroup& group, size_t field,
         if (cell_length == width) {
           int32_t ymd;
           std::memcpy(&ymd, src + kCellLenBytes, sizeof(ymd));
-          dst[i] = Date::FromDate(ymd / 10000, (ymd / 100) % 100, ymd % 100);
+          if (!TryCanonicalDate(ymd / 10000, (ymd / 100) % 100, ymd % 100,
+                                &dst[i])) {
+            invalid_dates->push_back({out_base + i, ymd});
+          }
         } else {
           FlatVector::SetNull(output_vector, out_base + i, true);
         }
       }
       break;
     }
-    case FieldType::kDecimal64: {
-      for (uint32_t i = 0; i < count; i++, src += stride) {
-        uint16_t cell_length;
-        std::memcpy(&cell_length, src, sizeof(cell_length));
-        if (cell_length == width) {
-          int64_t mantissa;
-          std::memcpy(&mantissa, src + kCellLenBytes, sizeof(mantissa));
-          WriteDecimalPhysical(output_vector, out_base + i, mantissa,
-                               decimal_physical_type);
-        } else {
-          FlatVector::SetNull(output_vector, out_base + i, true);
-        }
+    case FieldType::kDecimal64:
+      switch (decimal_physical_type) {
+        case PhysicalType::INT16:
+          DecodeDecimalRun<int16_t>(src, stride, width, count, output_vector,
+                                    out_base);
+          break;
+        case PhysicalType::INT32:
+          DecodeDecimalRun<int32_t>(src, stride, width, count, output_vector,
+                                    out_base);
+          break;
+        case PhysicalType::INT64:
+          DecodeDecimalRun<int64_t>(src, stride, width, count, output_vector,
+                                    out_base);
+          break;
+        default:
+          DecodeDecimalRun<hugeint_t>(src, stride, width, count, output_vector,
+                                      out_base);
+          break;
       }
       break;
-    }
     default:
       break;  // kUntyped never reaches here
   }
@@ -700,7 +797,8 @@ struct ColumnContext {
  */
 void EmitInPlaceRow(const PaxGroup& group,
                     const std::vector<ColumnContext>& scan_columns,
-                    uint32_t slot, DataChunk& output, idx_t out_row) {
+                    uint32_t slot, DataChunk& output, idx_t out_row,
+                    std::vector<InvalidDate>* invalid_dates) {
   for (idx_t i = 0; i < scan_columns.size(); i++) {
     const ColumnContext& column = scan_columns[i];
     FlatVector::SetNull(output.data[i], out_row, false);
@@ -708,7 +806,8 @@ void EmitInPlaceRow(const PaxGroup& group,
       DecodeUntypedCell(group, column.field, slot, output.data[i], out_row);
     } else {
       BulkDecodeTyped(column.type, group, column.field, column.width, slot, 1,
-                      output.data[i], out_row, column.decimal_physical_type);
+                      output.data[i], out_row, column.decimal_physical_type,
+                      invalid_dates);
     }
   }
 }
@@ -764,7 +863,7 @@ void EmitImageRow(const std::string& old_row,
           throw std::runtime_error("epoch image DATE field does not parse");
         }
         FlatVector::GetData<date_t>(output_vector)[out_row] =
-            Date::FromDate(year, month, day);
+            CanonicalDate(year, month, day);
         break;
       }
       case FieldType::kDecimal64: {
@@ -836,6 +935,18 @@ void PaxScan(ClientContext&, TableFunctionInput& data, DataChunk& output) {
   uint32_t entry_slot = local_state.current_slot;
   idx_t entry_row = 0;
 
+  // In-place DATE cells of the open audit window that name no calendar day,
+  // in output row order. The audit empties the list, either by dropping the
+  // rows its redo replaces or by raising, so it is empty whenever no window
+  // is open.
+  std::vector<InvalidDate> invalid_dates;
+  // Forgets the records of output rows a rewind or a redo overwrites.
+  auto drop_invalid_dates_from = [&](idx_t row) {
+    while (!invalid_dates.empty() && invalid_dates.back().row >= row) {
+      invalid_dates.pop_back();
+    }
+  };
+
   auto emit_image = [&](const pax::EpochImage& image) {
     table_view.slots_from_images.fetch_add(1, std::memory_order_relaxed);
     if (!image.was_visible) return;  // the slot held no row at se
@@ -866,7 +977,8 @@ void PaxScan(ClientContext&, TableFunctionInput& data, DataChunk& output) {
       }
       const bool visible_now = group->IsVisible(slot);
       if (visible_now) {
-        EmitInPlaceRow(*group, scan_columns, slot, output, rows_emitted);
+        EmitInPlaceRow(*group, scan_columns, slot, output, rows_emitted,
+                       &invalid_dates);
       }
       // The fence orders the cell reads above before the closing sample; an
       // acquire load alone leaves them free to sink past it.
@@ -882,6 +994,7 @@ void PaxScan(ClientContext&, TableFunctionInput& data, DataChunk& output) {
         local_state.count_at_claim = count_now;
         CopyGroupImages(local_state, snapshot_epoch);
         if (late != nullptr) {
+          drop_invalid_dates_from(rows_emitted);
           emit_image(*late);
           continue;
         }
@@ -904,12 +1017,19 @@ void PaxScan(ClientContext&, TableFunctionInput& data, DataChunk& output) {
     std::atomic_thread_fence(std::memory_order_acquire);
     if (pax::PreserveCount(GroupState(local_state, group)) ==
         local_state.count_at_claim) {
+      // The counter held, so every cell read in this window is what the
+      // group stores, an unconvertible DATE among them.
+      if (!invalid_dates.empty()) RaiseInvalidDate(invalid_dates.front());
       return;
     }
     table_view.chunk_audits_redone.fetch_add(1, std::memory_order_relaxed);
     const idx_t high_water = rows_emitted;
     rows_emitted = entry_row;
+    drop_invalid_dates_from(rows_emitted);
     redo_slots(entry_slot, read_through);
+    // A redo resolves each slot against its own counter sample, so a record
+    // it leaves behind is a stored value.
+    if (!invalid_dates.empty()) RaiseInvalidDate(invalid_dates.front());
     // The rows the redo abandons keep the validity bits the rewound pass
     // wrote, and the bulk run that fills those rows next writes cells only,
     // so their columns are marked valid again.
@@ -994,7 +1114,7 @@ void PaxScan(ClientContext&, TableFunctionInput& data, DataChunk& output) {
         } else {
           BulkDecodeTyped(column.type, *group, column.field, column.width, slot,
                           run_length, output.data[i], rows_emitted,
-                          column.decimal_physical_type);
+                          column.decimal_physical_type, &invalid_dates);
         }
       }
 
@@ -1062,19 +1182,98 @@ void EncodeRow(duckdb::MaterializedQueryResult& result, idx_t row_index,
 // ---------------------------------------------------------------------------
 
 /**
+ * @brief Parses a positive integer that spans the whole token.
+ *
+ * @details False for an empty token, a non-digit anywhere in it, or a value
+ * past uint64_t. `tail` takes the one suffix letter a byte count allows; a
+ * caller that wants none passes nullptr.
+ */
+bool ParseWholeNumber(const char* value, uint64_t* out, char* tail) {
+  const std::string_view input(value);
+  if (input.empty()) return false;
+  const char* const last = input.data() + input.size();
+  const auto [end, error] = std::from_chars(input.data(), last, *out, 10);
+  if (error != std::errc{} || *out == 0) return false;
+  if (end == last) {
+    if (tail != nullptr) *tail = '\0';
+    return true;
+  }
+  if (tail == nullptr || end + 1 != last) return false;
+  *tail = *end;
+  return true;
+}
+
+/**
+ * @brief Parses a byte count with an optional K, M or G suffix.
+ *
+ * @details False for a token the count does not span, a suffix outside
+ * K/M/G, a count past uint64_t, or a count the suffix takes past it.
+ */
+bool ParseByteSize(const char* value, uint64_t* out) {
+  char suffix = '\0';
+  if (!ParseWholeNumber(value, out, &suffix)) return false;
+  uint64_t scale = 1;
+  switch (suffix) {
+    case 'g':
+    case 'G':
+      scale = 1ull << 30;
+      break;
+    case 'm':
+    case 'M':
+      scale = 1ull << 20;
+      break;
+    case 'k':
+    case 'K':
+      scale = 1ull << 10;
+      break;
+    case '\0':
+      break;
+    default:
+      return false;
+  }
+  if (*out > UINT64_MAX / scale) return false;
+  *out *= scale;
+  return true;
+}
+
+// The bounds ConfigureLimits read, 0 while the environment sets neither.
+idx_t bridge_threads = 0;
+idx_t bridge_memory = 0;
+
+/**
+ * @brief Applies the bridge's thread and memory bounds to `config`.
+ *
+ * @details The thread pool defaults to a quarter of the hardware threads, so
+ * an analytical stream does not take the cores the OLTP side runs on; a pure
+ * analytical run sets HELIOS_BRIDGE_THREADS itself. An unset memory bound is
+ * DuckDB's own default.
+ */
+duckdb::DBConfig* ConfigureBridgeLimits(duckdb::DBConfig* config) {
+  config->options.maximum_threads =
+      bridge_threads != 0
+          ? bridge_threads
+          : std::max<idx_t>(1, std::thread::hardware_concurrency() / 4);
+  if (bridge_memory != 0) config->options.maximum_memory = bridge_memory;
+  return config;
+}
+
+/**
  * @brief Process-lifetime DuckDB runtime.
  *
  * @details The bridge borrows DuckDB's binder, planner, and vectorized
  * executor; the in-memory duckdb::DuckDB instance holds no table data, and
- * its system catalog only ever contains this bridge's scan function. The function-local static gives thread-safe, exactly-once
- * construction: the first request pays the construction cost, every later
- * request on any thread reuses the instance. This follows DuckDB's
- * documented concurrency model
- * (https://duckdb.org/docs/stable/connect/concurrency): one shared instance,
- * one fresh Connection per request/thread.
+ * its system catalog only ever contains this bridge's scan function. The
+ * function-local static gives thread-safe, exactly-once construction: the
+ * first request pays the construction cost, every later request on any
+ * thread reuses the instance. This follows DuckDB's documented concurrency
+ * model (https://duckdb.org/docs/stable/connect/concurrency): one shared
+ * instance, one fresh Connection per request/thread.
  */
 duckdb::DuckDB& GlobalRuntime() {
-  static duckdb::DuckDB runtime(nullptr);  // nullptr: in-memory, no db file
+  // Function-local statics initialize in order, so the config is complete
+  // before the instance reads it. nullptr: in-memory, no db file.
+  static duckdb::DBConfig config;
+  static duckdb::DuckDB runtime(nullptr, ConfigureBridgeLimits(&config));
   return runtime;
 }
 
@@ -1108,9 +1307,23 @@ void Utf8mb40900AiCiSortKey(duckdb::DataChunk& args, duckdb::ExpressionState&,
         "utf8mb4_0900_ai_ci collation runtime is not ready or is not NO PAD");
   }
 
+  // Contract: the key bytes are what a direct strnxfrm call produces under
+  // this CHARSET_INFO with these flags. Memoization and the exact-size
+  // reservation change only how often it runs and how much heap it takes.
+  // The collated columns of an analytical scan have few distinct values, so
+  // one map per call collapses a chunk to that many strnxfrm calls.
+  //
+  // The map owns its key bytes: an inlined string_t carries them inside the
+  // by-value argument, which dies with the call.
+  std::unordered_map<std::string, duckdb::string_t> memo;
+  static thread_local std::vector<unsigned char> scratch;
+
   duckdb::UnaryExecutor::Execute<duckdb::string_t, duckdb::string_t>(
       args.data[0], result, args.size(), [&](duckdb::string_t input) {
         const size_t input_size = input.GetSize();
+        std::string value(input.GetData(), input_size);
+        const auto hit = memo.find(value);
+        if (hit != memo.end()) return hit->second;
         if (input_size > SIZE_MAX / collation->mbmaxlen) {
           throw std::runtime_error(
               "utf8mb4_0900_ai_ci sort key input is too large");
@@ -1125,21 +1338,20 @@ void Utf8mb40900AiCiSortKey(duckdb::DataChunk& args, duckdb::ExpressionState&,
           throw std::runtime_error(
               "utf8mb4_0900_ai_ci sort key is too large for DuckDB");
         }
-        duckdb::string_t key =
-            duckdb::StringVector::EmptyString(result, capacity);
+        if (scratch.size() < capacity) scratch.resize(capacity);
         const size_t key_size = collation->coll->strnxfrm(
-            collation, reinterpret_cast<uchar*>(key.GetDataWriteable()),
-            capacity, /*num_codepoints=*/0,
+            collation, scratch.data(), capacity, /*num_codepoints=*/0,
             reinterpret_cast<const uchar*>(input.GetData()), input_size,
             /*flags=*/0);
         if (key_size > capacity || key_size > UINT32_MAX) {
           throw std::runtime_error(
               "utf8mb4_0900_ai_ci sort key exceeded its allocation");
         }
-        // strnxfrm can use less than its worst-case allocation. This both
-        // records the actual length and refreshes string_t's cached prefix;
-        // comparison uses the prefix while hashing reads the payload.
-        key.SetSizeAndFinalize(static_cast<uint32_t>(key_size), capacity);
+        // strnxfrm can use less than its worst-case bound, so the string heap
+        // takes the produced length, not the bound.
+        const duckdb::string_t key = duckdb::StringVector::AddStringOrBlob(
+            result, reinterpret_cast<const char*>(scratch.data()), key_size);
+        memo.emplace(std::move(value), key);
         return key;
       });
 }
@@ -1259,6 +1471,30 @@ void EnsureDuckdbScanRegistered() {
 
 }  // namespace
 
+void ConfigureLimits() {
+  const char* threads = std::getenv("HELIOS_BRIDGE_THREADS");
+  if (threads != nullptr) {
+    uint64_t parsed = 0;
+    if (!ParseWholeNumber(threads, &parsed, nullptr)) {
+      LOG_FATAL(
+          "Invalid HELIOS_BRIDGE_THREADS='%s': expected a positive integer",
+          threads);
+    }
+    bridge_threads = static_cast<idx_t>(parsed);
+  }
+  const char* memory = std::getenv("HELIOS_BRIDGE_MEM_LIMIT");
+  if (memory != nullptr) {
+    uint64_t bytes = 0;
+    if (!ParseByteSize(memory, &bytes)) {
+      LOG_FATAL(
+          "Invalid HELIOS_BRIDGE_MEM_LIMIT='%s': expected a positive byte "
+          "count with an optional K, M or G suffix",
+          memory);
+    }
+    bridge_memory = static_cast<idx_t>(bytes);
+  }
+}
+
 void ExecuteDuckdbQuery(
     helios::storage::Database* db,
     const pb::TxExecuteDuckdbQuery::Request& request,
@@ -1281,7 +1517,18 @@ void ExecuteDuckdbQuery(
     struct ReadViewRelease {
       helios::storage::Database* database;
       const helios::storage::Database::PaxReadView& handle;
-      ~ReadViewRelease() { database->ClosePaxView(handle); }
+      ~ReadViewRelease() {
+        // Sampled before the close, so the line reports what this view was
+        // holding rather than what survives it.
+        const pax::ImageBufferStats stats =
+            BridgeDebugEnabled() ? pax::ImageStats() : pax::ImageBufferStats{};
+        database->ClosePaxView(handle);
+        if (BridgeDebugEnabled()) {
+          std::fprintf(stderr,
+                       "[epoch-images] images=%lu bytes=%lu open_views=%lu\n",
+                       stats.images, stats.bytes, stats.open_views);
+        }
+      }
     } read_view_release{db, read_view};
 
     std::vector<PaxTableView> table_views(

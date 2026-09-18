@@ -46,6 +46,13 @@ writer updates scattered rows for the whole length of the scan, so installs
 land in groups the scan is holding, and the run asserts that at least one
 chunk audit had to redo a group.
 
+Not covered here: an in-place DATE cell that names no calendar day. A cell a
+writer tore and a date stored under a relaxed sql_mode both read that way,
+and the chunk audit separates them (a group whose counter moved has the row
+re-read, a group whose counter held fails the request). Reaching the stored
+half needs a table loaded with sql_mode relaxed, which this file does not
+build.
+
 Operational notes: as in quiescence_1sr_hole.py, the test owns the local
 stack, restarts it with the sync points armed, and stops it afterwards.
 """
