@@ -1,7 +1,9 @@
 #include "server_config.hh"
-#include "../common/log.h"
+
+#include <spdlog/spdlog.h>
 
 #include <charconv>
+#include <cstdlib>
 #include <fstream>
 #include <string_view>
 #include <system_error>
@@ -19,8 +21,9 @@ ServerConfig g_config;
 
 [[noreturn]] void refuse(const std::string& key, const std::string& value,
                          const char* expected) {
-    LOG_FATAL("Invalid configuration '%s = %s': expected %s", key.c_str(),
-              value.c_str(), expected);
+    SPDLOG_CRITICAL("Invalid configuration '{} = {}': expected {}", key, value,
+                    expected);
+    std::exit(1);
 }
 
 /// Digits only, within [lo, hi].
@@ -99,8 +102,15 @@ void apply_key(const std::string& key, const std::string& value) {
             refuse(key, value, "a positive integer");
         }
         g_config.read_view_fence_timeout_ms = static_cast<uint32_t>(number);
+    } else if (key == "log_level") {
+        if (spdlog::level::from_str(value) == spdlog::level::off &&
+            value != "off") {
+            refuse(key, value, "a spdlog level name");
+        }
+        g_config.log_level = value;
     } else {
-        LOG_FATAL("Unknown configuration key '%s'", key.c_str());
+        SPDLOG_CRITICAL("Unknown configuration key '{}'", key);
+        std::exit(1);
     }
 }
 
@@ -117,7 +127,10 @@ const ServerConfig& config() { return g_config; }
 
 void load_config(const char* path) {
     std::ifstream file(path);
-    if (!file) LOG_FATAL("Could not open the configuration file '%s'", path);
+    if (!file) {
+        SPDLOG_CRITICAL("Could not open the configuration file '{}'", path);
+        std::exit(1);
+    }
 
     // Keys before any section header count as the server's own section.
     bool own_section = true;
@@ -132,8 +145,9 @@ void load_config(const char* path) {
         if (!own_section) continue;
         const auto separator = text.find('=');
         if (separator == std::string::npos) {
-            LOG_FATAL("Invalid configuration line '%s': expected key = value",
-                      text.c_str());
+            SPDLOG_CRITICAL("Invalid configuration line '{}': expected key = value",
+                            text);
+            std::exit(1);
         }
         apply_key(trim(std::string_view(text).substr(0, separator)),
                   trim(std::string_view(text).substr(separator + 1)));

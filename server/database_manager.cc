@@ -1,8 +1,10 @@
 #include "database_manager.hh"
-#include "../../common/log.h"
 #include "rpc/duckdb_bridge_executor.hh"
 #include "server_config.hh"
 
+#include <spdlog/spdlog.h>
+
+#include <cstdlib>
 #include <system_error>
 
 DatabaseManager::DatabaseManager() {
@@ -16,19 +18,20 @@ DatabaseManager::DatabaseManager() {
                               ? helios::storage::CommitDurability::kAsync
                               : helios::storage::CommitDurability::kSync);
     duckdb_bridge::ConfigureLimits();
-    LOG_INFO("Epoch %zu ms, durability %s, WAL capacity %llu bytes, recovery %s",
+    SPDLOG_INFO("Epoch {} ms, durability {}, WAL capacity {} bytes, recovery {}",
              conf.epoch_duration_ms, config().commit_durability.c_str(),
              static_cast<unsigned long long>(conf.wal_initial_capacity_bytes),
              conf.enable_recovery ? "on" : "off");
     if (conf.checkpoint_interval_ms != 0 || conf.checkpoint_once_after_ms != 0) {
-        LOG_INFO("Checkpoint image: every %zu ms, one after %zu ms",
-                 conf.checkpoint_interval_ms, conf.checkpoint_once_after_ms);
+        SPDLOG_INFO("Checkpoint image: every {} ms, one after {} ms",
+                    conf.checkpoint_interval_ms, conf.checkpoint_once_after_ms);
     }
     try {
         database_ = std::make_shared<helios::storage::Database>(conf);
     } catch (const std::system_error& err) {
-        LOG_FATAL("Could not open the working directory '%s': %s",
-                  conf.work_dir.c_str(), err.what());
+        SPDLOG_CRITICAL("Could not open the working directory '{}': {}",
+                        conf.work_dir, err.what());
+        std::exit(1);
     }
-    LOG_INFO("Database manager initialized");
+    SPDLOG_INFO("Database manager initialized");
 }

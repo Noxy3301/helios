@@ -1,10 +1,11 @@
+#include <spdlog/spdlog.h>
+
 #include <csignal>
-#include <iostream>
+#include <cstdlib>
 #include <string_view>
 
 #include "helios_server.hh"
 #include "server_config.hh"
-#include "../common/log.h"
 
 int main(int argc, char** argv) {
     // A client that disconnects mid-response must not end the process.
@@ -16,15 +17,18 @@ int main(int argc, char** argv) {
             load_config(argv[++i]);
             continue;
         }
-        LOG_FATAL("Usage: helios-storage [--config <path>]...");
+        SPDLOG_CRITICAL("Usage: helios-storage [--config <path>]...");
+        std::exit(1);
     }
 
-    LOG_INFO("Starting Helios server...");
+    spdlog::set_level(spdlog::level::from_str(config().log_level));
+
+    SPDLOG_INFO("Starting Helios server...");
 
     HeliosServer server;
     server.init();
     if (!server.run()) {  // Start listening
-        LOG_ERROR("The server could not listen; exiting");
+        SPDLOG_ERROR("The server could not listen; exiting");
         return 1;
     }
 

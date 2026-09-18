@@ -10,7 +10,7 @@
 #include <string>
 #include <vector>
 
-#include "../../common/log.h"
+#include <spdlog/spdlog.h>
 #include "helios.pb.h"
 #include "helios/pax.h"
 #include "helios/transaction.h"
@@ -157,7 +157,7 @@ bool HiddenKeyAllocator::Allocate(helios::storage::Database& database,
     }
 
     if (announced_.insert(table_name).second) {
-        LOG_INFO("Hidden keys for '%s' resume at %llu", table_name.c_str(),
+        SPDLOG_INFO("Hidden keys for '{}' resume at {}", table_name.c_str(),
                  static_cast<unsigned long long>(next));
     }
     *first_id = next;
@@ -173,7 +173,7 @@ void HeliosRpc::handleDbAllocateHiddenKeys(const std::string& message,
         response.set_ok(false);
         response.set_permanent(true);
         response.set_error("malformed request");
-        LOG_ERROR("AllocateHiddenKeys: malformed request");
+        SPDLOG_ERROR("AllocateHiddenKeys: malformed request");
         result = response.SerializeAsString();
         return;
     }
@@ -192,7 +192,7 @@ void HeliosRpc::handleDbAllocateHiddenKeys(const std::string& message,
     } else {
         response.set_permanent(permanent);
         response.set_error(error);
-        LOG_ERROR("AllocateHiddenKeys for '%s': %s",
+        SPDLOG_ERROR("AllocateHiddenKeys for '{}': {}",
                   request.table_name().c_str(), error.c_str());
     }
 
@@ -208,7 +208,7 @@ void HeliosRpc::handleDbSetCommitDurability(const std::string& message,
         response.set_ok(false);
         response.set_mode(to_wire_mode(db_manager_->commit_durability()));
         response.set_error("malformed request");
-        LOG_ERROR("SetCommitDurability: malformed request");
+        SPDLOG_ERROR("SetCommitDurability: malformed request");
         result = response.SerializeAsString();
         return;
     }
@@ -225,7 +225,7 @@ void HeliosRpc::handleDbSetCommitDurability(const std::string& message,
             response.set_ok(false);
             response.set_mode(to_wire_mode(db_manager_->commit_durability()));
             response.set_error("commit durability mode cannot be requested");
-            LOG_ERROR("SetCommitDurability: unrequestable mode");
+            SPDLOG_ERROR("SetCommitDurability: unrequestable mode");
             result = response.SerializeAsString();
             return;
     }
@@ -234,14 +234,14 @@ void HeliosRpc::handleDbSetCommitDurability(const std::string& message,
     response.set_ok(true);
     response.set_mode(to_wire_mode(mode));
 
-    LOG_INFO("Commit durability switched to %s", durability_name(mode));
+    SPDLOG_INFO("Commit durability switched to {}", durability_name(mode));
 
     result = response.SerializeAsString();
 }
 
 void HeliosRpc::handleDbCreateTable(const std::string& message,
                                        std::string& result) {
-    LOG_DEBUG("Handling DbCreateTable");
+    SPDLOG_DEBUG("Handling DbCreateTable");
 
     Helios::Protocol::DbCreateTable::Request request;
     Helios::Protocol::DbCreateTable::Response response;
@@ -283,13 +283,13 @@ void HeliosRpc::handleDbCreateTable(const std::string& message,
 
         installed = db->InstallPaxSchema(request.table_name(), widths, types,
                                          scales);
-        LOG_INFO("PAX schema for '%s': %zu fields, typed=%s, %s",
+        SPDLOG_INFO("PAX schema for '{}': {} fields, typed={}, {}",
                  request.table_name().c_str(), widths.size(),
                  types.empty() ? "no" : "yes",
                  installed ? "installed" : "refused");
     }
     response.set_success(created && installed);
-    LOG_DEBUG("CreateTable '%s': %s", request.table_name().c_str(),
+    SPDLOG_DEBUG("CreateTable '{}': {}", request.table_name().c_str(),
               response.success() ? "success" : "refused");
 
     result = response.SerializeAsString();
@@ -297,7 +297,7 @@ void HeliosRpc::handleDbCreateTable(const std::string& message,
 
 void HeliosRpc::handleDbCreateSecondaryIndex(const std::string& message,
                                                 std::string& result) {
-    LOG_DEBUG("Handling DbCreateSecondaryIndex");
+    SPDLOG_DEBUG("Handling DbCreateSecondaryIndex");
 
     Helios::Protocol::DbCreateSecondaryIndex::Request request;
     Helios::Protocol::DbCreateSecondaryIndex::Response response;

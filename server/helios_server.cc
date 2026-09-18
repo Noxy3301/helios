@@ -1,6 +1,6 @@
 #include "helios_server.hh"
 #include "server_config.hh"
-#include "../common/log.h"
+#include <spdlog/spdlog.h>
 #include "helios.pb.h"
 #include "rpc/helios_rpc.hh"
 
@@ -15,13 +15,13 @@ void HeliosServer::init() {
         db_manager_ = std::make_shared<DatabaseManager>();
     }
 
-    LOG_INFO("Helios server initialized successfully on port %u, boot token %llu",
+    SPDLOG_INFO("Helios server initialized successfully on port {}, boot token {}",
              static_cast<unsigned>(config().server_port),
              static_cast<unsigned long long>(storage_boot_token()));
 }
 
 void HeliosServer::handle_client(int client_socket) {
-    LOG_INFO("Handling client connection fd=%d", client_socket);
+    SPDLOG_INFO("Handling client connection fd={}", client_socket);
     auto rpc_handler =
         std::make_shared<HeliosRpc>(db_manager_, row_counts_, hidden_keys_);
 

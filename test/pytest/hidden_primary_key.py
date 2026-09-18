@@ -8,6 +8,7 @@ and would take down another checkout's stack.
 """
 import argparse
 import os
+import re
 import shutil
 import signal
 import socket
@@ -183,15 +184,14 @@ def start_storage_server(work_dir, recovery=True):
 
 
 def resume_lines(work_dir, table, offset):
-    """Resume lines the server logged for `table` past `offset`.
-
-    LOG_INFO writes to stderr, which start_storage_server sends to this file;
-    the offset skips the run that wrote before a restart.
-    """
+    """The watermarks the server logged for `table` as 'resume at N' past
+    `offset`, which skips the run that wrote before a restart. The server's
+    log goes to this file through start_storage_server."""
     with open(os.path.join(work_dir, "server.log"), errors="replace") as handle:
         handle.seek(offset)
-        return [line.rstrip() for line in handle
-                if "resume at" in line and table in line]
+        return [int(m.group(1)) for m in
+                (re.search(r"resume at (\d+)", line) for line in handle if table in line)
+                if m is not None]
 
 
 def stop_storage_server(process):
@@ -403,10 +403,9 @@ def test_multi_row_insert_one_statement(user, password):
 
         # One sized reservation leaves the counter at 2500; three default
         # blocks would have left it at 3000.
-        expected_resume = f"resume at {ROWS_ONE_STATEMENT}"
         resumed = resume_lines(work_dir, table, log_offset)
-        if len(resumed) != 1 or not resumed[0].endswith(expected_resume):
-            print(f"\tFailed: expected one '{expected_resume}' line, got {resumed}")
+        if resumed != [ROWS_ONE_STATEMENT]:
+            print(f"\tFailed: expected one 'resume at {ROWS_ONE_STATEMENT}' line, got {resumed}")
             return 1
     finally:
         for connection in connections:
@@ -551,10 +550,9 @@ def test_reservation_survives_storage_restart(user, password):
         # The payloads alone would not pin the value down: B's row at key 0
         # collides with the durable seed either way. The resume line asserts
         # the watermark itself, which a lost one would report as 0.
-        expected_resume = f"resume at {HIDDEN_KEY_RANGE}"
         resumed = resume_lines(work_dir, table, log_offset)
-        if len(resumed) != 1 or not resumed[0].endswith(expected_resume):
-            print(f"\tFailed: expected one '{expected_resume}' line, got {resumed}")
+        if resumed != [HIDDEN_KEY_RANGE]:
+            print(f"\tFailed: expected one 'resume at {HIDDEN_KEY_RANGE}' line, got {resumed}")
             return 1
 
         expected = ["seed"] + from_a + from_b

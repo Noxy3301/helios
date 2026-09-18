@@ -29,7 +29,7 @@
 #include <duckdb/parser/parsed_data/create_collation_info.hpp>
 #include <duckdb/parser/parsed_data/create_scalar_function_info.hpp>
 
-#include "../../common/log.h"
+#include <spdlog/spdlog.h>
 #include "../server_config.hh"
 #include "../mysql_charset_runtime.hh"
 #include "m_ctype.h"
@@ -1497,10 +1497,11 @@ void ConfigureLimits() {
   if (!memory.empty()) {
     uint64_t bytes = 0;
     if (!ParseByteSize(memory.c_str(), &bytes)) {
-      LOG_FATAL(
-          "Invalid configuration 'bridge_mem_limit = %s': expected a positive "
+      SPDLOG_CRITICAL(
+          "Invalid configuration 'bridge_mem_limit = {}': expected a positive "
           "byte count with an optional K, M or G suffix",
           memory.c_str());
+      std::exit(1);
     }
     bridge_memory = static_cast<idx_t>(bytes);
   }

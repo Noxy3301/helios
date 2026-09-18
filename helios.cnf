@@ -42,3 +42,7 @@ bridge_debug = 0
 
 # Upper bound on the read view's epoch-fence wait, in milliseconds.
 read_view_fence_timeout_ms = 5000
+
+# The lowest level the log keeps: trace, debug, info, warning, error,
+# critical or off.
+log_level = info

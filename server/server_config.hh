@@ -34,6 +34,9 @@ struct ServerConfig {
     bool bridge_debug = false;
     /// Upper bound on the read view's epoch-fence wait, in milliseconds.
     uint32_t read_view_fence_timeout_ms = 5000;
+    /// The lowest level the log keeps: trace, debug, info, warning, error,
+    /// critical or off.
+    std::string log_level = "info";
 };
 
 /**

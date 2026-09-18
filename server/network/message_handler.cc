@@ -1,5 +1,5 @@
 #include "message_handler.hh"
-#include "../../common/log.h"
+#include <spdlog/spdlog.h>
 
 #include <iostream>
 #include <vector>
@@ -16,9 +16,9 @@ bool MessageHandler::receive_message(int socket, MessageType& message_type,
     ssize_t header_read = recv(socket, &net_header, sizeof(net_header), MSG_WAITALL);
     if (header_read != static_cast<ssize_t>(sizeof(net_header))) {
         if (header_read < 0) {
-            LOG_ERROR("Failed to receive message header");
+            SPDLOG_ERROR("Failed to receive message header");
         } else {
-            LOG_DEBUG("Client disconnected while receiving header");
+            SPDLOG_DEBUG("Client disconnected while receiving header");
         }
         return false;
     }
@@ -27,7 +27,7 @@ bool MessageHandler::receive_message(int socket, MessageType& message_type,
     message_type = static_cast<MessageType>(ntohl(net_header.message_type));
     uint32_t payload_size = ntohl(net_header.payload_size);
 
-    LOG_DEBUG("Received header: message_type=%u, payload_size=%u",
+    SPDLOG_DEBUG("Received header: message_type={}, payload_size={}",
               static_cast<uint32_t>(message_type), payload_size);
 
     // Read payload (if exists)
@@ -37,9 +37,9 @@ bool MessageHandler::receive_message(int socket, MessageType& message_type,
         ssize_t body_read = recv(socket, &payload[0], payload_size, MSG_WAITALL);
         if (body_read != static_cast<ssize_t>(payload_size)) {
             if (body_read < 0) {
-                LOG_ERROR("Failed to receive message payload");
+                SPDLOG_ERROR("Failed to receive message payload");
             } else {
-                LOG_DEBUG("Client disconnected while receiving payload");
+                SPDLOG_DEBUG("Client disconnected while receiving payload");
             }
             return false;
         }
@@ -50,10 +50,10 @@ bool MessageHandler::receive_message(int socket, MessageType& message_type,
 
 bool MessageHandler::send_response(int socket, MessageType message_type,
                                    const std::string& payload) {
-    LOG_DEBUG("Sending response (%zu bytes)", payload.size());
+    SPDLOG_DEBUG("Sending response ({} bytes)", payload.size());
 
     if (payload.size() > UINT32_MAX) {
-        LOG_ERROR("Response payload %zu bytes exceeds the u32 frame limit; dropping",
+        SPDLOG_ERROR("Response payload {} bytes exceeds the u32 frame limit; dropping",
                   payload.size());
         return false;
     }
@@ -75,22 +75,22 @@ bool MessageHandler::send_response(int socket, MessageType message_type,
         ssize_t bytes_sent = send(socket, response_buffer.data() + total_sent,
                                   response_total_size - total_sent, 0);
         if (bytes_sent <= 0) {
-            LOG_ERROR("Failed to send response (sent %zu/%zu bytes)", total_sent, response_total_size);
+            SPDLOG_ERROR("Failed to send response (sent {}/{} bytes)", total_sent, response_total_size);
             return false;
         }
         total_sent += bytes_sent;
     }
     
-    LOG_DEBUG("Response sent successfully");
+    SPDLOG_DEBUG("Response sent successfully");
     return true;
 }
 
 bool MessageHandler::send_response_writev(int socket, MessageType message_type,
                                           const std::string& payload) {
-    LOG_DEBUG("Sending response via writev (%zu bytes)", payload.size());
+    SPDLOG_DEBUG("Sending response via writev ({} bytes)", payload.size());
 
     if (payload.size() > UINT32_MAX) {
-        LOG_ERROR("Response payload %zu bytes exceeds the u32 frame limit; dropping",
+        SPDLOG_ERROR("Response payload {} bytes exceeds the u32 frame limit; dropping",
                   payload.size());
         return false;
     }
@@ -111,7 +111,7 @@ bool MessageHandler::send_response_writev(int socket, MessageType message_type,
     while (total_sent < total_size) {
         ssize_t bytes_sent = writev(socket, iov, 2);
         if (bytes_sent <= 0) {
-            LOG_ERROR("writev failed (sent %zu/%zu bytes)", total_sent, total_size);
+            SPDLOG_ERROR("writev failed (sent {}/{} bytes)", total_sent, total_size);
             return false;
         }
         total_sent += bytes_sent;
@@ -131,6 +131,6 @@ bool MessageHandler::send_response_writev(int socket, MessageType message_type,
         }
     }
 
-    LOG_DEBUG("writev response sent successfully");
+    SPDLOG_DEBUG("writev response sent successfully");
     return true;
 }
