@@ -1,11 +1,11 @@
 /**
- * @file server/storage/include/lineairdb/transaction.h
+ * @file server/storage/include/helios/transaction.h
  * One commit attempt: the write operations and durability a request submits,
  * and the Silo protocol that validates and installs its read and write sets.
  */
 
-#ifndef HELIOS_STORAGE_INCLUDE_LINEAIRDB_TRANSACTION_H
-#define HELIOS_STORAGE_INCLUDE_LINEAIRDB_TRANSACTION_H
+#ifndef HELIOS_STORAGE_INCLUDE_HELIOS_TRANSACTION_H
+#define HELIOS_STORAGE_INCLUDE_HELIOS_TRANSACTION_H
 
 #include <cstdint>
 #include <map>
@@ -14,7 +14,7 @@
 #include <variant>
 #include <vector>
 
-#include "lineairdb/index.h"
+#include "helios/index.h"
 
 #include "index/data_item.h"
 #include "pax/table.h"
@@ -317,4 +317,4 @@ class Transaction {
 }  // namespace silo
 }  // namespace helios::storage
 
-#endif  // HELIOS_STORAGE_INCLUDE_LINEAIRDB_TRANSACTION_H
+#endif  // HELIOS_STORAGE_INCLUDE_HELIOS_TRANSACTION_H

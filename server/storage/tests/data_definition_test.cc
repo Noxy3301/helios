@@ -27,8 +27,8 @@
 #include <memory>
 #include <thread>
 
-#include "lineairdb/config.h"
-#include "lineairdb/database.h"
+#include "helios/config.h"
+#include "helios/database.h"
 
 #include "db_helper.h"
 #include "gtest/gtest.h"

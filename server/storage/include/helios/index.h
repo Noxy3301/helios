@@ -1,12 +1,12 @@
 // Modified for Helios.
 
 /**
- * @file server/storage/include/lineairdb/index.h
+ * @file server/storage/include/helios/index.h
  * What a secondary index promises about its keys.
  */
 
-#ifndef HELIOS_STORAGE_INCLUDE_LINEAIRDB_INDEX_H
-#define HELIOS_STORAGE_INCLUDE_LINEAIRDB_INDEX_H
+#ifndef HELIOS_STORAGE_INCLUDE_HELIOS_INDEX_H
+#define HELIOS_STORAGE_INCLUDE_HELIOS_INDEX_H
 
 #include <cstdint>
 
@@ -25,4 +25,4 @@ enum class IndexConstraint : uint32_t {
 
 }  // namespace helios::storage
 
-#endif  // HELIOS_STORAGE_INCLUDE_LINEAIRDB_INDEX_H
+#endif  // HELIOS_STORAGE_INCLUDE_HELIOS_INDEX_H

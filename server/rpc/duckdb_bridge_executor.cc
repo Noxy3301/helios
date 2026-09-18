@@ -33,8 +33,8 @@
 #include "../mysql_charset_runtime.hh"
 #include "m_ctype.h"
 
-#include "lineairdb/database.h"
-#include "lineairdb/pax.h"
+#include "helios/database.h"
+#include "helios/pax.h"
 
 #include <algorithm>
 #include <atomic>

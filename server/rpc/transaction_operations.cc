@@ -6,7 +6,7 @@
 #include <vector>
 
 #include "helios.pb.h"
-#include "lineairdb/transaction.h"
+#include "helios/transaction.h"
 
 // The reads, scans and the commit of a transaction; each request acts on the
 // database directly and leaves nothing behind.

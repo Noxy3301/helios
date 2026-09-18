@@ -4,7 +4,7 @@
  * and secondary indexes.
  */
 
-#include "lineairdb/database.h"
+#include "helios/database.h"
 
 #include "index/data_item.h"
 #include "index/secondary_index.h"

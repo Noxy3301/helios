@@ -9,7 +9,7 @@
 #ifndef HELIOS_STORAGE_SRC_INDEX_SECONDARY_INDEX_H
 #define HELIOS_STORAGE_SRC_INDEX_SECONDARY_INDEX_H
 
-#include "lineairdb/index.h"
+#include "helios/index.h"
 
 #include "index/masstree_index.h"
 

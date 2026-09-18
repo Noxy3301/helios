@@ -13,7 +13,7 @@
 #include <string>
 #include <vector>
 
-#include "lineairdb/pax.h"
+#include "helios/pax.h"
 
 #include "index/masstree_index.h"
 #include "index/secondary_index.h"

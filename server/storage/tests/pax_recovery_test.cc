@@ -9,8 +9,8 @@
 #include <string>
 #include <vector>
 
-#include "lineairdb/database.h"
-#include "lineairdb/pax.h"
+#include "helios/database.h"
+#include "helios/pax.h"
 
 #include "db_helper.h"
 #include "gtest/gtest.h"

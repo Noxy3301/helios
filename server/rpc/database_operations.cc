@@ -12,8 +12,8 @@
 
 #include "../../common/log.h"
 #include "helios.pb.h"
-#include "lineairdb/pax.h"
-#include "lineairdb/transaction.h"
+#include "helios/pax.h"
+#include "helios/transaction.h"
 
 // Database-wide RPC handlers for DDL.
 

@@ -1,14 +1,14 @@
-# LineairDB for Helios
+# Helios storage engine
 
 Modified for Helios.
 
 Helios's storage engine is derived from
 [LineairDB](https://github.com/LineairDB/LineairDB), adapted for Helios's
 research goals with Silo concurrency control and PAX storage. The public
-headers keep the LineairDB name:
+headers live under `include/helios`:
 
 ```cpp
-#include "lineairdb/database.h"
+#include "helios/database.h"
 ```
 
 The API uses the `helios::storage` namespace and the `helios_storage` CMake

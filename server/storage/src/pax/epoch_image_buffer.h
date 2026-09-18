@@ -17,7 +17,7 @@
 #include <unordered_map>
 #include <vector>
 
-#include "lineairdb/pax.h"
+#include "helios/pax.h"
 
 #include "util/epoch.h"
 

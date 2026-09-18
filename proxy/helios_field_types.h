@@ -12,7 +12,7 @@ struct TABLE;
  * @brief PAX typed-cell kind constants.
  *
  * @details The values of helios::storage::pax::FieldType (server/storage
- * include/lineairdb/pax.h); the plugin carries no storage header.
+ * include/helios/pax.h); the plugin carries no storage header.
  */
 namespace pax_kind {
 constexpr uint32_t UNTYPED = 0;                 // verbatim byte layout

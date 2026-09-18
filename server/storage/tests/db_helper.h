@@ -16,9 +16,9 @@
 #include <utility>
 #include <vector>
 
-#include "lineairdb/transaction.h"
-#include "lineairdb/database.h"
-#include "lineairdb/read.h"
+#include "helios/transaction.h"
+#include "helios/database.h"
+#include "helios/read.h"
 
 #include "gtest/gtest.h"
 

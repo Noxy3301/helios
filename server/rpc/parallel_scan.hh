@@ -3,7 +3,7 @@
 #include <string>
 
 #include "helios.pb.h"
-#include "lineairdb/database.h"
+#include "helios/database.h"
 
 /**
  * @brief Scans a primary range of a PAX table with several workers and emits

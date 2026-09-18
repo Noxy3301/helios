@@ -22,12 +22,12 @@
  * framework, WAL, checkpoint worker and reaper.
  */
 
-#include "lineairdb/database.h"
+#include "helios/database.h"
 
 #include <algorithm>
 #include <mutex>
 
-#include "lineairdb/config.h"
+#include "helios/config.h"
 
 #include "index/masstree_index.h"
 #include "index/secondary_index.h"

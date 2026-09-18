@@ -7,7 +7,7 @@
 #include <string_view>
 #include <vector>
 
-#include "lineairdb/pax.h"
+#include "helios/pax.h"
 
 #include "gtest/gtest.h"
 #include "index/data_item.h"

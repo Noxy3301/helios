@@ -17,13 +17,13 @@
 // Modified for Helios.
 
 /**
- * @file server/storage/include/lineairdb/config.h
+ * @file server/storage/include/helios/config.h
  * Startup configuration of a storage instance: where it keeps its files,
  * how long an epoch lasts, and which durability contract it runs under.
  */
 
-#ifndef HELIOS_STORAGE_INCLUDE_LINEAIRDB_CONFIG_H
-#define HELIOS_STORAGE_INCLUDE_LINEAIRDB_CONFIG_H
+#ifndef HELIOS_STORAGE_INCLUDE_HELIOS_CONFIG_H
+#define HELIOS_STORAGE_INCLUDE_HELIOS_CONFIG_H
 
 #include <cstddef>
 #include <cstdint>
@@ -119,4 +119,4 @@ struct Config {
 
 }  // namespace helios::storage
 
-#endif  // HELIOS_STORAGE_INCLUDE_LINEAIRDB_CONFIG_H
+#endif  // HELIOS_STORAGE_INCLUDE_HELIOS_CONFIG_H

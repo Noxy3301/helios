@@ -22,7 +22,7 @@
  * and concurrent insertions.
  */
 
-#include "lineairdb/database.h"
+#include "helios/database.h"
 
 #include <filesystem>
 #include <memory>
@@ -30,7 +30,7 @@
 #include <thread>
 #include <vector>
 
-#include "lineairdb/config.h"
+#include "helios/config.h"
 
 #include "db_helper.h"
 #include "gtest/gtest.h"

@@ -36,7 +36,7 @@
 #include <utility>
 #include <vector>
 
-#include "lineairdb/pax.h"
+#include "helios/pax.h"
 
 #include "index/primary_key_list.h"
 #include "silo/tidword.h"

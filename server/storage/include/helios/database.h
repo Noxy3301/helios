@@ -17,13 +17,13 @@
 // Modified for Helios.
 
 /**
- * @file server/storage/include/lineairdb/database.h
+ * @file server/storage/include/helios/database.h
  * The public face of the store: table and index definition, the read ops,
  * the commit attempt, and the epoch handshake every calling thread performs.
  */
 
-#ifndef HELIOS_STORAGE_INCLUDE_LINEAIRDB_DATABASE_H
-#define HELIOS_STORAGE_INCLUDE_LINEAIRDB_DATABASE_H
+#ifndef HELIOS_STORAGE_INCLUDE_HELIOS_DATABASE_H
+#define HELIOS_STORAGE_INCLUDE_HELIOS_DATABASE_H
 
 #include <cstdint>
 #include <functional>
@@ -34,10 +34,10 @@
 #include <utility>
 #include <vector>
 
-#include "lineairdb/transaction.h"
-#include "lineairdb/config.h"
-#include "lineairdb/index.h"
-#include "lineairdb/read.h"
+#include "helios/transaction.h"
+#include "helios/config.h"
+#include "helios/index.h"
+#include "helios/read.h"
 
 #include "index/reaper.h"
 #include "pax/catalog.h"
@@ -417,4 +417,4 @@ class Database {
 };
 }  // namespace helios::storage
 
-#endif  // HELIOS_STORAGE_INCLUDE_LINEAIRDB_DATABASE_H
+#endif  // HELIOS_STORAGE_INCLUDE_HELIOS_DATABASE_H

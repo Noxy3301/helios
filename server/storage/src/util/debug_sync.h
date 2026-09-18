@@ -80,7 +80,7 @@ inline bool DebugSyncArmed() {
 
 [[noreturn]] inline void DebugSyncFatal(const char *point_name,
                                         const char *detail) {
-  std::fprintf(stderr, "LineairDB debug sync point '%s': %s\n", point_name,
+  std::fprintf(stderr, "Helios debug sync point '%s': %s\n", point_name,
                detail);
   std::abort();
 }

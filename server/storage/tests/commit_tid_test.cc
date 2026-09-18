@@ -13,15 +13,15 @@
 #include <thread>
 #include <vector>
 
-#include "lineairdb/config.h"
-#include "lineairdb/database.h"
+#include "helios/config.h"
+#include "helios/database.h"
 
 #include "db_helper.h"
 #include "gtest/gtest.h"
 #include "index/reaper.h"
 #include "pax/epoch_image_buffer.h"
 #include "silo/stable_read.h"
-#include "lineairdb/transaction.h"
+#include "helios/transaction.h"
 #include "table/table_dictionary.h"
 #include "util/epoch_framework.h"
 #include "wal/logger.h"

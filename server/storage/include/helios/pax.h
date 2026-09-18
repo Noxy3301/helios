@@ -1,12 +1,12 @@
 /**
- * @file server/storage/include/lineairdb/pax.h
+ * @file server/storage/include/helios/pax.h
  * The PAX row format a table declares at creation, the strips a reader scans
  * in place, and the epoch image surface that resolves a row a writer changed
  * under an open read view.
  */
 
-#ifndef HELIOS_STORAGE_INCLUDE_LINEAIRDB_PAX_H
-#define HELIOS_STORAGE_INCLUDE_LINEAIRDB_PAX_H
+#ifndef HELIOS_STORAGE_INCLUDE_HELIOS_PAX_H
+#define HELIOS_STORAGE_INCLUDE_HELIOS_PAX_H
 
 #include <atomic>
 #include <cstddef>
@@ -372,4 +372,4 @@ std::vector<EpochImage> SlotImages(const GroupImageState *state, uint32_t slot);
 }  // namespace pax
 }  // namespace helios::storage
 
-#endif  // HELIOS_STORAGE_INCLUDE_LINEAIRDB_PAX_H
+#endif  // HELIOS_STORAGE_INCLUDE_HELIOS_PAX_H

@@ -4,13 +4,13 @@
  * protocol that validate, install and publish it.
  */
 
-#include "lineairdb/transaction.h"
+#include "helios/transaction.h"
 
 #include <xmmintrin.h>
 #include <algorithm>
 #include <utility>
 
-#include "lineairdb/database.h"
+#include "helios/database.h"
 
 #include "index/masstree_index.h"
 #include "index/reaper.h"
