@@ -85,14 +85,14 @@ SERVER_ENV = (
     "ENABLE_DUCKDB_BRIDGE_DEBUG=1 "
     # The table is loaded one row per transaction, because the install pause
     # fires between the row installs of any larger one.
-    "LINEAIRDB_COMMIT_DURABILITY=async")
+    "HELIOS_COMMIT_DURABILITY=async")
 # A fence takes one to two epochs; the writer delay allows for it.
 FENCE_S = 0.06
 # Where the second install should land inside the scan.
 INSTALL_AT = 0.45
 
-DB = "ha_lineairdb_test"
-STACK_PATTERNS = ("build/server/lineairdb-server",
+DB = "ha_helios_test"
+STACK_PATTERNS = ("build/server/helios-storage",
                   "runtime_output_directory/mysqld")
 
 # A per-row LIKE over a wide column costs about 1.4us, so this is a scan of
@@ -188,7 +188,7 @@ def create_table(cursor, table):
     cursor.execute(
         f"CREATE TABLE {table} "
         "(id INT PRIMARY KEY, v INT, n INT NULL, s VARCHAR(255)) "
-        "ENGINE=LineairDB SECONDARY_ENGINE=LINEAIRDB_COLUMNAR")
+        "ENGINE=Helios SECONDARY_ENGINE=HELIOS_COLUMNAR")
     started = time.monotonic()
     for i in range(1, ROWS + 1):
         n = "NULL" if i % 2 == 0 else str(i)
@@ -279,7 +279,7 @@ def last_scan_tally():
     lines after the last statement belong to the read just finished.
     """
     logs = sorted(glob.glob(
-        os.path.join(ROOT, "lineairdb_logs", "lineairdb_server_*.log")))
+        os.path.join(ROOT, "helios_logs", "helios_storage_*.log")))
     if not logs:
         return {}
     tally = {}
@@ -548,7 +548,7 @@ def run_probe(user, password):
     try:
         cursor = db.cursor()
         print("SETUP")
-        cursor.execute("SET GLOBAL lineairdb_read_path = 'plan'")
+        cursor.execute("SET GLOBAL helios_read_path = 'plan'")
         cursor.execute(f"DROP DATABASE IF EXISTS {DB}")
         cursor.execute(f"CREATE DATABASE {DB}")
         cursor.execute(f"USE {DB}")

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Fair-sweep harness: run a TPC-C terminal sweep, restarting server + mysqld
 # (and rerunning load) between every iteration so each measurement sees a
-# clean LineairDB state. Eliminates the cross-iteration contamination that
+# clean Helios state. Eliminates the cross-iteration contamination that
 # made the existing benchrun --sweep mode unfair to later (higher-terminal)
 # runs.
 #
@@ -56,10 +56,10 @@ force_stop() {
   "$SCRIPTS/stop_mysql.sh"  >/dev/null 2>&1 || true
   pkill -9 mysqld           2>/dev/null || true
   # stop_server.sh handles SIGTERM; force-kill as fallback.
-  if [[ -f /tmp/lineairdb_server.pid ]]; then
-    kill -9 "$(cat /tmp/lineairdb_server.pid)" 2>/dev/null || true
+  if [[ -f /tmp/helios_storage.pid ]]; then
+    kill -9 "$(cat /tmp/helios_storage.pid)" 2>/dev/null || true
   fi
-  pkill -9 lineairdb-serve  2>/dev/null || true
+  pkill -9 helios-storage  2>/dev/null || true
   sleep 1
 }
 
@@ -72,7 +72,7 @@ for term in "${TERM_LIST[@]}"; do
   log="$OUT_DIR/log/iter_${term}.log"
   echo "[$(date +%H:%M:%S)] === t=${term} ===" | tee -a "$SUMMARY".meta
   force_stop
-  rm -rf "$ROOT/build/data" "$ROOT/lineairdb_logs" 2>/dev/null || true
+  rm -rf "$ROOT/build/data" "$ROOT/helios_logs" 2>/dev/null || true
   # The work directory may be a link onto another volume: clear it, keep it.
   [ -d "$ROOT/helios_wal" ] && find "$ROOT/helios_wal/" -mindepth 1 -delete 2>/dev/null || true
 

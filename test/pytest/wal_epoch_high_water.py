@@ -16,7 +16,7 @@ high-water message and without reporting a successful initialization. The
 control case, a frontier nowhere near the mark, checks the opposite pair: the
 server initializes and the high-water message never appears.
 
-Not a LineairDB gtest death test: constructing a Database in-process hangs in
+Not a storage gtest death test: constructing a Database in-process hangs in
 this fork for reasons unrelated to durability, so the child would hang rather
 than die.
 """
@@ -27,13 +27,13 @@ import sys
 import tempfile
 
 REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-SERVER = os.path.join(REPO, "build", "server", "lineairdb-server")
+SERVER = os.path.join(REPO, "build", "server", "helios-storage")
 
 # EpochFramework::kEpochHighWater
 HIGH_WATER = 0xFFFFFFFF - (1 << 20)
 
 # Wal frame constants, little-endian.
-MAGIC = 0x4C57414C
+MAGIC = 0x4C415748
 FLAGS = 0
 
 STARTUP_TIMEOUT_SECONDS = 20
@@ -67,8 +67,8 @@ def make_frame(epoch):
 
 def run_server(work_dir, extra_env):
     """Starts the server with work_dir as its cwd and returns (rc, output)."""
-    env = {**os.environ, "LINEAIRDB_EPOCH_DURATION_MS": "10", **extra_env}
-    env.pop("LINEAIRDB_ENABLE_RECOVERY", None)
+    env = {**os.environ, "HELIOS_EPOCH_DURATION_MS": "10", **extra_env}
+    env.pop("HELIOS_ENABLE_RECOVERY", None)
     env.update(extra_env)
     try:
         done = subprocess.run([SERVER], cwd=work_dir, env=env,
@@ -149,9 +149,9 @@ def main():
 
     # The scan runs under every contract, so the mode here only has to be one
     # that keeps a log; recovery is what the two cases vary.
-    off = {"LINEAIRDB_COMMIT_DURABILITY": "async"}
-    on = {"LINEAIRDB_COMMIT_DURABILITY": "async",
-          "LINEAIRDB_ENABLE_RECOVERY": "1"}
+    off = {"HELIOS_COMMIT_DURABILITY": "async"}
+    on = {"HELIOS_COMMIT_DURABILITY": "async",
+          "HELIOS_ENABLE_RECOVERY": "1"}
 
     ok = True
     # Both startup paths compute the resume epoch: without recovery the records

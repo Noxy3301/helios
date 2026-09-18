@@ -13,7 +13,7 @@ import mysql.connector
 import hidden_primary_key as hpk
 from utils.connection import get_connection
 
-DATABASE = "ha_lineairdb_test"
+DATABASE = "ha_helios_test"
 MRR_ROWS = 50
 DELETE_ROWS = 5
 WIDE_COLUMN = 512  # the utf8mb4 width at the PAX cell limit
@@ -26,7 +26,7 @@ def channel_table(cursor, table):
         f"""CREATE TABLE {DATABASE}.{table} (
             pk INT PRIMARY KEY,
             c VARCHAR(64) NOT NULL
-        ) ENGINE = LineairDB""")
+        ) ENGINE = Helios""")
 
 
 def test_channel_reopens_after_storage_restart(user, password):
@@ -122,7 +122,7 @@ def test_batch_mrr_rowid_sort(user, password):
     setup = get_connection(user, password)
     setup.autocommit = True
     setup_cursor = setup.cursor()
-    setup_cursor.execute("SET GLOBAL lineairdb_read_path = 'row'")
+    setup_cursor.execute("SET GLOBAL helios_read_path = 'row'")
     setup_cursor.close()
     setup.close()
 
@@ -138,7 +138,7 @@ def test_batch_mrr_rowid_sort(user, password):
             f"""CREATE TABLE {DATABASE}.{table} (
                 pk INT PRIMARY KEY,
                 c VARCHAR({WIDE_COLUMN}) NOT NULL
-            ) ENGINE = LineairDB""")
+            ) ENGINE = Helios""")
 
         # c descends while pk ascends, so ORDER BY c reverses the batch order
         payload = {pk: f"{MRR_ROWS - pk:04d}-" + "x" * 64
@@ -188,7 +188,7 @@ def test_batch_mrr_rowid_sort(user, password):
         print("\tPassed!")
         return 0
     finally:
-        cursor.execute("SET GLOBAL lineairdb_read_path = 'plan'")
+        cursor.execute("SET GLOBAL helios_read_path = 'plan'")
         cursor.close()
         connection.close()
 

@@ -7,8 +7,8 @@ from utils.connection import get_connection
 import argparse
 
 def reset(db, cursor):
-    cursor.execute('DROP DATABASE IF EXISTS ha_lineairdb_test')
-    cursor.execute('CREATE DATABASE ha_lineairdb_test')
+    cursor.execute('DROP DATABASE IF EXISTS ha_helios_test')
+    cursor.execute('CREATE DATABASE ha_helios_test')
     db.commit()
 
 def test_create_index_and_use(db, cursor):
@@ -17,29 +17,29 @@ def test_create_index_and_use(db, cursor):
     
     # 1. Create table
     cursor.execute('''
-        CREATE TABLE ha_lineairdb_test.t1 (
+        CREATE TABLE ha_helios_test.t1 (
             id INT NOT NULL PRIMARY KEY,
             name VARCHAR(50) NOT NULL
-        ) ENGINE = LineairDB
+        ) ENGINE = Helios
     ''')
     db.commit()
     
     # 2. Create index
     try:
-        cursor.execute('CREATE INDEX idx_name ON ha_lineairdb_test.t1 (name)')
+        cursor.execute('CREATE INDEX idx_name ON ha_helios_test.t1 (name)')
         db.commit()
     except mysql.connector.Error as err:
         print(f"\tFailed to create index: {err}")
         return 1
     
     # 3. Insert data
-    cursor.execute("INSERT INTO ha_lineairdb_test.t1 VALUES (1, 'Alice')")
-    cursor.execute("INSERT INTO ha_lineairdb_test.t1 VALUES (2, 'Bob')")
-    cursor.execute("INSERT INTO ha_lineairdb_test.t1 VALUES (3, 'Charlie')")
+    cursor.execute("INSERT INTO ha_helios_test.t1 VALUES (1, 'Alice')")
+    cursor.execute("INSERT INTO ha_helios_test.t1 VALUES (2, 'Bob')")
+    cursor.execute("INSERT INTO ha_helios_test.t1 VALUES (3, 'Charlie')")
     db.commit()
     
     # 4. Read using indexed column
-    cursor.execute("SELECT * FROM ha_lineairdb_test.t1 WHERE name = 'Bob'")
+    cursor.execute("SELECT * FROM ha_helios_test.t1 WHERE name = 'Bob'")
     result = cursor.fetchall()
     if len(result) != 1 or result[0][0] != 2:
         print(f"\tFailed to read: expected (2, 'Bob'), got {result}")

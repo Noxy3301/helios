@@ -59,13 +59,13 @@
       loop_control:
         label: "{{ item }}"
 
-    - name: "Set lineairdb_read_path on each MySQL (={{ bench_read_path }})"
-      when: mysql_engine | default('lineairdb') != 'innodb'
+    - name: "Set helios_read_path on each MySQL (={{ bench_read_path }})"
+      when: mysql_engine | default('helios') != 'innodb'
       shell: |
         ~/helios/build/runtime_output_directory/mysql \
           -u root --protocol=TCP \
           -h {{ hostvars[item].private_ip }} -P 3307 \
-          -e "SET GLOBAL lineairdb_read_path='{{ bench_read_path }}';"
+          -e "SET GLOBAL helios_read_path='{{ bench_read_path }}';"
       args:
         executable: /bin/bash
       run_once: true
@@ -74,13 +74,13 @@
       loop_control:
         label: "{{ item }}"
 
-    - name: "Toggle lineairdb_stats_drift_refresh on each MySQL (={{ 'ON' if bench_ndv_drift | bool else 'OFF' }})"
-      when: mysql_engine | default('lineairdb') != 'innodb'
+    - name: "Toggle helios_stats_drift_refresh on each MySQL (={{ 'ON' if bench_ndv_drift | bool else 'OFF' }})"
+      when: mysql_engine | default('helios') != 'innodb'
       shell: |
         ~/helios/build/runtime_output_directory/mysql \
           -u root --protocol=TCP \
           -h {{ hostvars[item].private_ip }} -P 3307 \
-          -e "SET GLOBAL lineairdb_stats_drift_refresh={{ 'ON' if bench_ndv_drift | bool else 'OFF' }};"
+          -e "SET GLOBAL helios_stats_drift_refresh={{ 'ON' if bench_ndv_drift | bool else 'OFF' }};"
       args:
         executable: /bin/bash
       run_once: true

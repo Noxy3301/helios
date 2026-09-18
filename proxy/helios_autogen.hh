@@ -1,0 +1,44 @@
+#ifndef HELIOS_AUTOGEN_HH
+#define HELIOS_AUTOGEN_HH
+
+#include <cstdint>
+#include <string>
+#include <unordered_map>
+#include <vector>
+
+class THD;
+struct TABLE;
+
+#include "helios_index_search.hh"
+#include "helios_proxy.hh"
+
+struct AccessPath;
+
+/**
+ * @brief Build a statement-scoped read plan from a QEP root.
+ *
+ * @details `root` may be the whole statement root, or a subquery unit root
+ * when MySQL evaluates the subquery before the statement plan is finalized.
+ * If `include_inner_units` is true, Item-held subquery plans are compiled into
+ * the same step list so correlated probes can bind to earlier outer steps.
+ *
+ * @note A QEP shape with no plan returns false; its reads take the row path.
+ * Inner-unit failures are ignored only when `include_inner_units` is true; the
+ * outer plan remains unchanged.
+ */
+bool autogen_read_plan_from_qep(
+    THD *thd, AccessPath *root,
+    std::vector<HeliosProxy::ReadPlanStep> *out,
+    bool include_inner_units = false);
+
+/**
+ * @brief Build one statement-scoped plan step from handler index access.
+ *
+ * @details Used for single-table UPDATE/DELETE, where the handler
+ * supplies the selected index/range instead of a normal QEP root.
+ */
+bool autogen_read_plan_from_index_search(
+    THD *thd, TABLE *table, uint index, const IndexSearchPlan &search,
+    std::vector<HeliosProxy::ReadPlanStep> *out);
+
+#endif

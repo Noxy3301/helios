@@ -4,16 +4,16 @@ from utils.connection import get_connection
 import argparse
 
 def reset (db, cursor) :
-    cursor.execute('DROP DATABASE IF EXISTS ha_lineairdb_test')
-    cursor.execute('CREATE DATABASE ha_lineairdb_test')
-    cursor.execute('CREATE TABLE ha_lineairdb_test.items (\
+    cursor.execute('DROP DATABASE IF EXISTS ha_helios_test')
+    cursor.execute('CREATE DATABASE ha_helios_test')
+    cursor.execute('CREATE TABLE ha_helios_test.items (\
         first_name VARCHAR(50) NOT NULL,\
         middle_name VARCHAR(50) NOT NULL,\
         last_name VARCHAR(50) NOT NULL,\
         age int NOT NULL,\
         content VARCHAR(255),\
         PRIMARY KEY(age, middle_name, last_name, first_name)  \
-    )ENGINE = LineairDB')
+    )ENGINE = Helios')
     db.commit()
 
 def composite_key (db, cursor) :
@@ -24,12 +24,12 @@ def composite_key (db, cursor) :
       print(e)
       return 1
     cursor.execute(\
-        'INSERT INTO ha_lineairdb_test.items (\
+        'INSERT INTO ha_helios_test.items (\
             first_name, middle_name, last_name, age, content\
         ) VALUES ("alice", "avril", "ada", 5, "alice meets bob")'\
     )
     db.commit()
-    cursor.execute('SELECT * FROM ha_lineairdb_test.items')
+    cursor.execute('SELECT * FROM ha_helios_test.items')
     rows = cursor.fetchall()
     if not rows :
         print("\tCheck 1 Failed")
@@ -38,19 +38,19 @@ def composite_key (db, cursor) :
     print("\tCheck 1 Passed")
     db.commit()
     cursor.execute(\
-        'INSERT INTO ha_lineairdb_test.items (\
+        'INSERT INTO ha_helios_test.items (\
             first_name, middle_name, last_name, age, content\
         ) VALUES ("alice", "ann", "adalace", 3, "new comer")'\
     )
     db.commit()
-    cursor.execute('SELECT * FROM ha_lineairdb_test.items WHERE age = 5')
+    cursor.execute('SELECT * FROM ha_helios_test.items WHERE age = 5')
     rows = cursor.fetchall()
     if not rows :
         print("\tCheck 2 Failed")
         print("\t", rows)
         return 1
     db.commit()
-    cursor.execute('SELECT * FROM ha_lineairdb_test.items WHERE first_name = "alice"')
+    cursor.execute('SELECT * FROM ha_helios_test.items WHERE first_name = "alice"')
     rows = cursor.fetchall()
     if len(rows) != 2 :
         print("\tCheck 3 Failed")

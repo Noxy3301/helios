@@ -1,6 +1,6 @@
 """
 The reservation size the write-ahead log starts with is taken from
-LINEAIRDB_WAL_INITIAL_CAPACITY_BYTES, and a value that does not parse exactly has
+HELIOS_WAL_INITIAL_CAPACITY_BYTES, and a value that does not parse exactly has
 to stop startup.
 
 The value decides whether a commit's fdatasync also persists a new file size. A run
@@ -18,9 +18,9 @@ import sys
 import tempfile
 
 REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-SERVER = os.path.join(REPO, "build", "server", "lineairdb-server")
+SERVER = os.path.join(REPO, "build", "server", "helios-storage")
 
-VARIABLE = "LINEAIRDB_WAL_INITIAL_CAPACITY_BYTES"
+VARIABLE = "HELIOS_WAL_INITIAL_CAPACITY_BYTES"
 STARTUP_TIMEOUT_SECONDS = 20
 # server/database_manager.cc: kMaxWalCapacityBytes
 MAX_BYTES = 64 * 1024**3
@@ -28,8 +28,8 @@ MAX_BYTES = 64 * 1024**3
 
 def run_server(value):
     """Starts the server with the variable set and returns its output."""
-    env = {**os.environ, "LINEAIRDB_EPOCH_DURATION_MS": "10", VARIABLE: value}
-    env.pop("LINEAIRDB_ENABLE_RECOVERY", None)
+    env = {**os.environ, "HELIOS_EPOCH_DURATION_MS": "10", VARIABLE: value}
+    env.pop("HELIOS_ENABLE_RECOVERY", None)
     with tempfile.TemporaryDirectory(prefix="helios_wal_capacity_") as work_dir:
         try:
             done = subprocess.run([SERVER], cwd=work_dir, env=env,

@@ -8,17 +8,17 @@ def insert (db, cursor) :
     reset(db, cursor)
     print("INSERT TEST")
     cursor.execute(\
-        'INSERT INTO ha_lineairdb_test.items (\
+        'INSERT INTO ha_helios_test.items (\
             title, content\
         ) VALUES ("alice", "alice meets bob")'\
     )
     cursor.execute(\
-        'INSERT INTO ha_lineairdb_test.items (\
+        'INSERT INTO ha_helios_test.items (\
             title, content\
         ) VALUES ("bob", "bob meets carol")'\
     )
     db.commit()
-    cursor.execute('SELECT title FROM ha_lineairdb_test.items')
+    cursor.execute('SELECT title FROM ha_helios_test.items')
     rows = cursor.fetchall()
     if not rows: 
         print("\tFailed: list empty")

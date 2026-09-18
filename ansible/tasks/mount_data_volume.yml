@@ -1,5 +1,5 @@
 ---
-# Idempotent io2 data volume mount shared by lineairdb.yml (WAL) and
+# Idempotent io2 data volume mount shared by storage.yml (WAL) and
 # mysql.yml (InnoDB datadir). The caller sets data_mount and data_volume
 # via vars: and puts become: true and tags: [privileged] on the import line.
 - name: Check whether the data volume is already mounted

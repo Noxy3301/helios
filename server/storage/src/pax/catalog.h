@@ -11,8 +11,8 @@
 #include <string>
 #include <vector>
 
-#include "lineairdb/index.h"
-#include "lineairdb/pax.h"
+#include "helios/index.h"
+#include "helios/pax.h"
 
 namespace helios::storage::pax {
 

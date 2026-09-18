@@ -15,7 +15,7 @@ import mysql.connector
 
 from utils.connection import get_connection
 
-DBNAME = "ha_lineairdb_insert_dup"
+DBNAME = "ha_helios_insert_dup"
 
 COMMIT_DEADLINE_SECONDS = 20.0
 COMMIT_HEAD_START_SECONDS = 0.5
@@ -67,7 +67,7 @@ def create_table(cursor, primary_key=True, indexed=False):
             id INT NOT NULL,
             v VARCHAR(32) NOT NULL,
             {key}{index}
-        ) ENGINE = LineairDB"""
+        ) ENGINE = Helios"""
     )
     return table
 
@@ -506,7 +506,7 @@ def test_staged_read_then_duplicate_insert(cursor, db):
         print("\tFailed: seed insert rejected")
         return 1
 
-    cursor.execute("SET GLOBAL lineairdb_read_path='plan'")
+    cursor.execute("SET GLOBAL helios_read_path='plan'")
     try:
         cursor.execute(f"SET @_tx_plan='R:{table}:2'")
         cursor.execute(f"USE {DBNAME}")
@@ -525,7 +525,7 @@ def test_staged_read_then_duplicate_insert(cursor, db):
                   f"({_last_error_message})")
             return 1
     finally:
-        cursor.execute(f"SET GLOBAL lineairdb_read_path='{args.read_path}'")
+        cursor.execute(f"SET GLOBAL helios_read_path='{args.read_path}'")
         cursor.execute("SET @_tx_plan=NULL")
 
     surviving = rows(cursor, table)
@@ -542,8 +542,8 @@ def main():
     cursor = db.cursor()
 
     reset(db, cursor)
-    cursor.execute(f"SET GLOBAL lineairdb_read_path='{args.read_path}'")
-    print(f"lineairdb_read_path={args.read_path}")
+    cursor.execute(f"SET GLOBAL helios_read_path='{args.read_path}'")
+    print(f"helios_read_path={args.read_path}")
     # Transactions are opened with an explicit BEGIN so that a lone statement
     # is its own transaction and every error arrives through the cursor.
     db.autocommit = True
@@ -582,6 +582,6 @@ if __name__ == "__main__":
                         default="")
     parser.add_argument('--read-path', choices=('row', 'plan'),
                         default='plan',
-                        help='value of lineairdb_read_path for the run')
+                        help='value of helios_read_path for the run')
     args = parser.parse_args()
     main()

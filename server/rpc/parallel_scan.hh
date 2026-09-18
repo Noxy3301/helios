@@ -2,8 +2,8 @@
 
 #include <string>
 
-#include "lineairdb.pb.h"
-#include "lineairdb/database.h"
+#include "helios.pb.h"
+#include "helios/database.h"
 
 /**
  * @brief Scans a primary range of a PAX table with several workers and emits
@@ -15,6 +15,6 @@
  */
 bool parallel_primary_pax_row_ref_scan(
     helios::storage::Database* db,
-    const LineairDB::Protocol::TxExecuteReadPlan::PlanStep& step,
+    const Helios::Protocol::TxExecuteReadPlan::PlanStep& step,
     const std::string& start_key, const std::string& end_key,
-    LineairDB::Protocol::TxExecuteReadPlan::StepResult* step_result);
+    Helios::Protocol::TxExecuteReadPlan::StepResult* step_result);

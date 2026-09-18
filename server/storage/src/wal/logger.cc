@@ -33,7 +33,7 @@
 #include <unordered_map>
 #include <utility>
 
-#include "lineairdb/config.h"
+#include "helios/config.h"
 
 #include "util/epoch.h"
 #include "util/epoch_framework.h"

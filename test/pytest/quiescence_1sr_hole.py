@@ -10,7 +10,7 @@ resolution instead, and this test demands consistent results.
 
 The test opens the install window wide and synchronizes on it instead of
 racing:
-  - lineairdb-server runs with the silo_commit between_row_installs debug
+  - helios-storage runs with the silo_commit between_row_installs debug
     sync point set to sleep, so the install loop stays open between
     consecutive row installs; every commit path goes through it (see
     server/storage/src/util/debug_sync.h)
@@ -36,7 +36,7 @@ agreement on the final state.
 
 Operational notes: the test assumes exclusive ownership of the local stack
 (run_tests.py convention; the stop scripts kill every local instance). It
-restarts lineairdb-server and mysqld itself because both need the special
+restarts helios-storage and mysqld itself because both need the special
 environment, verifies the preflight stop actually emptied the stack
 (start_server.sh treats "already running" as success), and stops the stack
 afterwards so the sync point does not survive into later runs.
@@ -70,9 +70,9 @@ SYNC_POINT_ENV = (
 # The bridge resolves tables through the statement's own resolved
 # references, so queries here simply run with USE <db> and unqualified
 # table names.
-DB = "ha_lineairdb_test"
+DB = "ha_helios_test"
 
-STACK_PATTERNS = ("build/server/lineairdb-server",
+STACK_PATTERNS = ("build/server/helios-storage",
                   "runtime_output_directory/mysqld")
 
 # Each scenario: fresh table with BASE rows, then one transaction whose two
@@ -213,7 +213,7 @@ def run_scenario(cursor, user, password, scenario):
     print(f"SCENARIO {scenario['name']}")
     cursor.execute(
         f"CREATE TABLE {table} (id INT PRIMARY KEY, v INT) "
-        "ENGINE=LineairDB SECONDARY_ENGINE=LINEAIRDB_COLUMNAR"
+        "ENGINE=Helios SECONDARY_ENGINE=HELIOS_COLUMNAR"
     )
     values = ", ".join(f"({k}, {v})" for k, v in BASE_ROWS.items())
     cursor.execute(f"INSERT INTO {table} VALUES {values}")
@@ -366,7 +366,7 @@ def run_read_view_before_write(cursor, user, password, scenario):
     print(f"SCENARIO read-view-before-write/{scenario['name']}")
     cursor.execute(
         f"CREATE TABLE {table} (id INT PRIMARY KEY, v INT) "
-        "ENGINE=LineairDB SECONDARY_ENGINE=LINEAIRDB_COLUMNAR"
+        "ENGINE=Helios SECONDARY_ENGINE=HELIOS_COLUMNAR"
     )
     values = ", ".join(f"({k}, {v})" for k, v in BASE_ROWS.items())
     cursor.execute(f"INSERT INTO {table} VALUES {values}")
@@ -453,7 +453,7 @@ def run_probe(user, password):
         cursor = db.cursor()
 
         print("SETUP")
-        cursor.execute("SET GLOBAL lineairdb_read_path = 'plan'")
+        cursor.execute("SET GLOBAL helios_read_path = 'plan'")
         cursor.execute(f"DROP DATABASE IF EXISTS {DB}")
         cursor.execute(f"CREATE DATABASE {DB}")
         cursor.execute(f"USE {DB}")

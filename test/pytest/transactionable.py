@@ -15,7 +15,7 @@ def tx3_expect_row () :
     cursor.execute('BEGIN')
 
     print("\ttx3 SELECT")
-    cursor.execute('SELECT title, content FROM ha_lineairdb_test.items')
+    cursor.execute('SELECT title, content FROM ha_helios_test.items')
     rows = cursor.fetchall()
 
     print("\ttx3 COMMIT")
@@ -31,7 +31,7 @@ def tx2_expect_no_row () :
 
     print("\ttx2 SELECT")
     try:
-        cursor.execute('SELECT title, content FROM ha_lineairdb_test.items')
+        cursor.execute('SELECT title, content FROM ha_helios_test.items')
         rows = cursor.fetchall()
     finally:
         hasThread2ExecutedQuery.set()
@@ -51,7 +51,7 @@ def transaction (db, cursor) :
 
     print("\ttx1 INSERT")
     cursor.execute(\
-        'INSERT INTO ha_lineairdb_test.items (\
+        'INSERT INTO ha_helios_test.items (\
             title, content\
         ) VALUES ("alice", "alice meets bob")'\
     )
@@ -81,21 +81,21 @@ def transaction (db, cursor) :
 
 
 def clear_data(db, cursor):
-    cursor.execute('DELETE FROM ha_lineairdb_test.items')
+    cursor.execute('DELETE FROM ha_helios_test.items')
     db.commit()
 
 def simple_for_update_test(db, cursor):
     clear_data(db, cursor)
     print("SIMPLE FOR UPDATE TEST")
 
-    cursor.execute('INSERT INTO ha_lineairdb_test.items (title, content) VALUES ("alice", "alice content")')
+    cursor.execute('INSERT INTO ha_helios_test.items (title, content) VALUES ("alice", "alice content")')
     db.commit()
 
     print("\ttx BEGIN")
     cursor.execute('BEGIN')
 
     print("\ttx SELECT FOR UPDATE")
-    cursor.execute('SELECT * FROM ha_lineairdb_test.items WHERE title="alice" FOR UPDATE')
+    cursor.execute('SELECT * FROM ha_helios_test.items WHERE title="alice" FOR UPDATE')
     rows = cursor.fetchall()
 
     if not rows:

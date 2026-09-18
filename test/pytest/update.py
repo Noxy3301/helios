@@ -9,25 +9,25 @@ def update_basic(db, cursor):
     reset(db, cursor)
     print("UPDATE BASIC TEST")
     
-    cursor.execute('SELECT * FROM ha_lineairdb_test.items')
+    cursor.execute('SELECT * FROM ha_helios_test.items')
     print("\t[DEBUG] Before INSERT:", cursor.fetchall())
     
     cursor.execute(\
-        'INSERT INTO ha_lineairdb_test.items (\
+        'INSERT INTO ha_helios_test.items (\
             title, content\
         ) VALUES ("carol", "ddd")'\
     )
     db.commit()
     
-    cursor.execute('SELECT * FROM ha_lineairdb_test.items')
+    cursor.execute('SELECT * FROM ha_helios_test.items')
     rows_after_insert = cursor.fetchall()
     print("\t[DEBUG] After INSERT:", rows_after_insert)
     print("\t[DEBUG] Number of rows after INSERT:", len(rows_after_insert))
     
-    cursor.execute('UPDATE ha_lineairdb_test.items SET content="XXX"')
+    cursor.execute('UPDATE ha_helios_test.items SET content="XXX"')
     db.commit()
     
-    cursor.execute('SELECT * FROM ha_lineairdb_test.items')
+    cursor.execute('SELECT * FROM ha_helios_test.items')
     rows = cursor.fetchall()
     print("\t[DEBUG] After UPDATE:", rows)
     print("\t[DEBUG] Number of rows after UPDATE:", len(rows))
@@ -56,40 +56,40 @@ def update_secondary_index_basic(db, cursor):
     print("\nUPDATE SECONDARY INDEX BASIC TEST")
     
     table_name = f"test_update_idx_{int(time.time() * 100000)}"
-    cursor.execute(f'''CREATE TABLE ha_lineairdb_test.{table_name} (
+    cursor.execute(f'''CREATE TABLE ha_helios_test.{table_name} (
         name VARCHAR(50) NOT NULL,
         age INT NOT NULL,
         department VARCHAR(50) NOT NULL,
         INDEX age_idx (age)
-    ) ENGINE = LineairDB''')
+    ) ENGINE = Helios''')
     db.commit()
     
-    cursor.execute(f'INSERT INTO ha_lineairdb_test.{table_name} (name, age, department) VALUES ("Alice", 25, "Sales")')
-    cursor.execute(f'INSERT INTO ha_lineairdb_test.{table_name} (name, age, department) VALUES ("Bob", 30, "Engineering")')
-    cursor.execute(f'INSERT INTO ha_lineairdb_test.{table_name} (name, age, department) VALUES ("Carol", 25, "Marketing")')
+    cursor.execute(f'INSERT INTO ha_helios_test.{table_name} (name, age, department) VALUES ("Alice", 25, "Sales")')
+    cursor.execute(f'INSERT INTO ha_helios_test.{table_name} (name, age, department) VALUES ("Bob", 30, "Engineering")')
+    cursor.execute(f'INSERT INTO ha_helios_test.{table_name} (name, age, department) VALUES ("Carol", 25, "Marketing")')
     db.commit()
     
-    cursor.execute(f'SELECT name, age, department FROM ha_lineairdb_test.{table_name} ORDER BY name')
+    cursor.execute(f'SELECT name, age, department FROM ha_helios_test.{table_name} ORDER BY name')
     print("\t[DEBUG] Before UPDATE - All rows:", cursor.fetchall())
     
-    cursor.execute(f'SELECT name, age FROM ha_lineairdb_test.{table_name} WHERE age=25 ORDER BY name')
+    cursor.execute(f'SELECT name, age FROM ha_helios_test.{table_name} WHERE age=25 ORDER BY name')
     print("\t[DEBUG] Before UPDATE - Age=25:", cursor.fetchall())
     
     print(f"\t[DEBUG] Executing: UPDATE {table_name} SET age=26 WHERE name='Alice'")
-    cursor.execute(f'UPDATE ha_lineairdb_test.{table_name} SET age=26 WHERE name="Alice"')
+    cursor.execute(f'UPDATE ha_helios_test.{table_name} SET age=26 WHERE name="Alice"')
     print("\t[DEBUG] UPDATE committed")
 
     db.commit()
 
-    cursor.execute(f'SELECT name, age FROM ha_lineairdb_test.{table_name} WHERE age=26')
+    cursor.execute(f'SELECT name, age FROM ha_helios_test.{table_name} WHERE age=26')
     rows_26 = cursor.fetchall()
     print("\t[DEBUG] After UPDATE - Age=26:", rows_26)
     
-    cursor.execute(f'SELECT name, age, department FROM ha_lineairdb_test.{table_name} ORDER BY name')
+    cursor.execute(f'SELECT name, age, department FROM ha_helios_test.{table_name} ORDER BY name')
     all_rows = cursor.fetchall()
     print("\t[DEBUG] After UPDATE - All rows:", all_rows)
     
-    cursor.execute(f'SELECT name, age FROM ha_lineairdb_test.{table_name} WHERE age=25 ORDER BY name')
+    cursor.execute(f'SELECT name, age FROM ha_helios_test.{table_name} WHERE age=25 ORDER BY name')
     rows_25 = cursor.fetchall()
     print("\t[DEBUG] After UPDATE - Age=25:", rows_25)
     
@@ -113,31 +113,31 @@ def update_secondary_index_multiple_rows(db, cursor):
     
     table_name = f"test_update_multi_{int(time.time() * 1000000)}"
     
-    cursor.execute(f'''CREATE TABLE ha_lineairdb_test.{table_name} (
+    cursor.execute(f'''CREATE TABLE ha_helios_test.{table_name} (
         name VARCHAR(50) NOT NULL,
         age INT NOT NULL,
         department VARCHAR(50) NOT NULL,
         INDEX age_idx (age),
         INDEX dept_idx (department)
-    ) ENGINE = LineairDB''')
+    ) ENGINE = Helios''')
     db.commit()
     
-    cursor.execute(f'INSERT INTO ha_lineairdb_test.{table_name} (name, age, department) VALUES ("Alice", 25, "Sales")')
-    cursor.execute(f'INSERT INTO ha_lineairdb_test.{table_name} (name, age, department) VALUES ("Bob", 30, "Sales")')
-    cursor.execute(f'INSERT INTO ha_lineairdb_test.{table_name} (name, age, department) VALUES ("Carol", 28, "Sales")')
-    cursor.execute(f'INSERT INTO ha_lineairdb_test.{table_name} (name, age, department) VALUES ("Dave", 35, "Engineering")')
+    cursor.execute(f'INSERT INTO ha_helios_test.{table_name} (name, age, department) VALUES ("Alice", 25, "Sales")')
+    cursor.execute(f'INSERT INTO ha_helios_test.{table_name} (name, age, department) VALUES ("Bob", 30, "Sales")')
+    cursor.execute(f'INSERT INTO ha_helios_test.{table_name} (name, age, department) VALUES ("Carol", 28, "Sales")')
+    cursor.execute(f'INSERT INTO ha_helios_test.{table_name} (name, age, department) VALUES ("Dave", 35, "Engineering")')
     db.commit()
     
-    cursor.execute(f'SELECT name, age, department FROM ha_lineairdb_test.{table_name} ORDER BY name')
+    cursor.execute(f'SELECT name, age, department FROM ha_helios_test.{table_name} ORDER BY name')
     print("\t[DEBUG] Before UPDATE:", cursor.fetchall())
     print(f"\t[DEBUG] Executing: UPDATE {table_name} SET age=age+1 WHERE department='Sales'")
-    cursor.execute(f'UPDATE ha_lineairdb_test.{table_name} SET age=age+1 WHERE department="Sales"')
+    cursor.execute(f'UPDATE ha_helios_test.{table_name} SET age=age+1 WHERE department="Sales"')
     db.commit()
     
-    cursor.execute(f'SELECT name, age, department FROM ha_lineairdb_test.{table_name} ORDER BY name')
+    cursor.execute(f'SELECT name, age, department FROM ha_helios_test.{table_name} ORDER BY name')
     print("\t[DEBUG] After UPDATE:", cursor.fetchall())
     
-    cursor.execute(f'SELECT name, age FROM ha_lineairdb_test.{table_name} WHERE department="Sales" ORDER BY name')
+    cursor.execute(f'SELECT name, age FROM ha_helios_test.{table_name} WHERE department="Sales" ORDER BY name')
     rows = cursor.fetchall()
     expected = [("Alice", 26), ("Bob", 31), ("Carol", 29)]
     if len(rows) != 3:
@@ -151,7 +151,7 @@ def update_secondary_index_multiple_rows(db, cursor):
             print("\tGot:", rows)
             return 1
     
-    cursor.execute(f'SELECT name, age FROM ha_lineairdb_test.{table_name} WHERE department="Engineering"')
+    cursor.execute(f'SELECT name, age FROM ha_helios_test.{table_name} WHERE department="Engineering"')
     rows = cursor.fetchall()
     if len(rows) != 1 or rows[0][0] != "Dave" or rows[0][1] != 35:
         print("\tFailed: Dave's age should remain 35")
@@ -167,23 +167,23 @@ def update_secondary_index_to_existing_value(db, cursor):
     
     table_name = f"test_update_exist_{int(time.time() * 1000000)}"
     
-    cursor.execute(f'''CREATE TABLE ha_lineairdb_test.{table_name} (
+    cursor.execute(f'''CREATE TABLE ha_helios_test.{table_name} (
         name VARCHAR(50) NOT NULL,
         age INT NOT NULL,
         department VARCHAR(50) NOT NULL,
         INDEX age_idx (age)
-    ) ENGINE = LineairDB''')
+    ) ENGINE = Helios''')
     db.commit()
     
-    cursor.execute(f'INSERT INTO ha_lineairdb_test.{table_name} (name, age, department) VALUES ("Alice", 25, "Sales")')
-    cursor.execute(f'INSERT INTO ha_lineairdb_test.{table_name} (name, age, department) VALUES ("Bob", 30, "Engineering")')
-    cursor.execute(f'INSERT INTO ha_lineairdb_test.{table_name} (name, age, department) VALUES ("Carol", 28, "Marketing")')
+    cursor.execute(f'INSERT INTO ha_helios_test.{table_name} (name, age, department) VALUES ("Alice", 25, "Sales")')
+    cursor.execute(f'INSERT INTO ha_helios_test.{table_name} (name, age, department) VALUES ("Bob", 30, "Engineering")')
+    cursor.execute(f'INSERT INTO ha_helios_test.{table_name} (name, age, department) VALUES ("Carol", 28, "Marketing")')
     db.commit()
     
-    cursor.execute(f'UPDATE ha_lineairdb_test.{table_name} SET age=30 WHERE name="Alice"')
+    cursor.execute(f'UPDATE ha_helios_test.{table_name} SET age=30 WHERE name="Alice"')
     db.commit()
     
-    cursor.execute(f'SELECT name FROM ha_lineairdb_test.{table_name} WHERE age=30 ORDER BY name')
+    cursor.execute(f'SELECT name FROM ha_helios_test.{table_name} WHERE age=30 ORDER BY name')
     rows = cursor.fetchall()
     if len(rows) != 2:
         print(f"\tFailed: Expected 2 rows with age=30, got {len(rows)}")
@@ -196,7 +196,7 @@ def update_secondary_index_to_existing_value(db, cursor):
         print("\tGot:", names)
         return 1
 
-    cursor.execute(f'SELECT name FROM ha_lineairdb_test.{table_name} WHERE age=25')
+    cursor.execute(f'SELECT name FROM ha_helios_test.{table_name} WHERE age=25')
     rows = cursor.fetchall()
     if len(rows) != 0:
         print("\tFailed: No one should have age=25")
@@ -212,44 +212,44 @@ def update_multiple_secondary_indexes(db, cursor):
     
     table_name = f"test_update_multi_idx_{int(time.time() * 1000000)}"
     
-    cursor.execute(f'''CREATE TABLE ha_lineairdb_test.{table_name} (
+    cursor.execute(f'''CREATE TABLE ha_helios_test.{table_name} (
         name VARCHAR(50) NOT NULL,
         age INT NOT NULL,
         department VARCHAR(50) NOT NULL,
         INDEX age_idx (age),
         INDEX dept_idx (department)
-    ) ENGINE = LineairDB''')
+    ) ENGINE = Helios''')
     db.commit()
     
-    cursor.execute(f'INSERT INTO ha_lineairdb_test.{table_name} (name, age, department) VALUES ("Alice", 25, "Sales")')
-    cursor.execute(f'INSERT INTO ha_lineairdb_test.{table_name} (name, age, department) VALUES ("Bob", 30, "Engineering")')
+    cursor.execute(f'INSERT INTO ha_helios_test.{table_name} (name, age, department) VALUES ("Alice", 25, "Sales")')
+    cursor.execute(f'INSERT INTO ha_helios_test.{table_name} (name, age, department) VALUES ("Bob", 30, "Engineering")')
     db.commit()
     
-    cursor.execute(f'UPDATE ha_lineairdb_test.{table_name} SET age=26, department="Marketing" WHERE name="Alice"')
+    cursor.execute(f'UPDATE ha_helios_test.{table_name} SET age=26, department="Marketing" WHERE name="Alice"')
     db.commit()
     
-    cursor.execute(f'SELECT name, department FROM ha_lineairdb_test.{table_name} WHERE age=26')
+    cursor.execute(f'SELECT name, department FROM ha_helios_test.{table_name} WHERE age=26')
     rows = cursor.fetchall()
     if len(rows) != 1 or rows[0][0] != "Alice" or rows[0][1] != "Marketing":
         print("\tFailed: Alice should have age=26 and department=Marketing")
         print("\t", rows)
         return 1
     
-    cursor.execute(f'SELECT name, age FROM ha_lineairdb_test.{table_name} WHERE department="Marketing"')
+    cursor.execute(f'SELECT name, age FROM ha_helios_test.{table_name} WHERE department="Marketing"')
     rows = cursor.fetchall()
     if len(rows) != 1 or rows[0][0] != "Alice" or rows[0][1] != 26:
         print("\tFailed: Alice should be found in Marketing with age 26")
         print("\t", rows)
         return 1
     
-    cursor.execute(f'SELECT name FROM ha_lineairdb_test.{table_name} WHERE age=25')
+    cursor.execute(f'SELECT name FROM ha_helios_test.{table_name} WHERE age=25')
     rows = cursor.fetchall()
     if len(rows) != 0:
         print("\tFailed: No one should have age=25")
         print("\t", rows)
         return 1
     
-    cursor.execute(f'SELECT name FROM ha_lineairdb_test.{table_name} WHERE department="Sales"')
+    cursor.execute(f'SELECT name FROM ha_helios_test.{table_name} WHERE department="Sales"')
     rows = cursor.fetchall()
     if len(rows) != 0:
         print("\tFailed: No one should be in Sales department")
@@ -265,23 +265,23 @@ def update_secondary_index_with_transaction(db, cursor):
     
     table_name = f"test_update_tx_{int(time.time() * 1000000)}"
     
-    cursor.execute(f'''CREATE TABLE ha_lineairdb_test.{table_name} (
+    cursor.execute(f'''CREATE TABLE ha_helios_test.{table_name} (
         name VARCHAR(50) NOT NULL,
         age INT NOT NULL,
         department VARCHAR(50) NOT NULL,
         INDEX age_idx (age)
-    ) ENGINE = LineairDB''')
+    ) ENGINE = Helios''')
     db.commit()
     
-    cursor.execute(f'INSERT INTO ha_lineairdb_test.{table_name} (name, age, department) VALUES ("Alice", 25, "Sales")')
-    cursor.execute(f'INSERT INTO ha_lineairdb_test.{table_name} (name, age, department) VALUES ("Bob", 30, "Engineering")')
+    cursor.execute(f'INSERT INTO ha_helios_test.{table_name} (name, age, department) VALUES ("Alice", 25, "Sales")')
+    cursor.execute(f'INSERT INTO ha_helios_test.{table_name} (name, age, department) VALUES ("Bob", 30, "Engineering")')
     db.commit()
     
-    cursor.execute(f'UPDATE ha_lineairdb_test.{table_name} SET age=26 WHERE name="Alice"')
-    cursor.execute(f'UPDATE ha_lineairdb_test.{table_name} SET age=31 WHERE name="Bob"')
+    cursor.execute(f'UPDATE ha_helios_test.{table_name} SET age=26 WHERE name="Alice"')
+    cursor.execute(f'UPDATE ha_helios_test.{table_name} SET age=31 WHERE name="Bob"')
     db.commit()
     
-    cursor.execute(f'SELECT name, age FROM ha_lineairdb_test.{table_name} ORDER BY name')
+    cursor.execute(f'SELECT name, age FROM ha_helios_test.{table_name} ORDER BY name')
     rows = cursor.fetchall()
     if len(rows) != 2:
         print(f"\tFailed: Expected 2 rows, got {len(rows)}")
@@ -307,28 +307,28 @@ def update_primary_key_basic(db, cursor):
     
     table_name = f"test_update_pk_{int(time.time() * 1000000)}"
     
-    cursor.execute(f'''CREATE TABLE ha_lineairdb_test.{table_name} (
+    cursor.execute(f'''CREATE TABLE ha_helios_test.{table_name} (
         id INT NOT NULL,
         name VARCHAR(50) NOT NULL,
         age INT NOT NULL,
         PRIMARY KEY (id)
-    ) ENGINE = LineairDB''')
+    ) ENGINE = Helios''')
     db.commit()
     
-    cursor.execute(f'INSERT INTO ha_lineairdb_test.{table_name} (id, name, age) VALUES (1, "Alice", 25)')
-    cursor.execute(f'INSERT INTO ha_lineairdb_test.{table_name} (id, name, age) VALUES (2, "Bob", 30)')
-    cursor.execute(f'INSERT INTO ha_lineairdb_test.{table_name} (id, name, age) VALUES (3, "Carol", 28)')
+    cursor.execute(f'INSERT INTO ha_helios_test.{table_name} (id, name, age) VALUES (1, "Alice", 25)')
+    cursor.execute(f'INSERT INTO ha_helios_test.{table_name} (id, name, age) VALUES (2, "Bob", 30)')
+    cursor.execute(f'INSERT INTO ha_helios_test.{table_name} (id, name, age) VALUES (3, "Carol", 28)')
     db.commit()
     
     print("\t[DEBUG] Before UPDATE:")
-    cursor.execute(f'SELECT id, name, age FROM ha_lineairdb_test.{table_name} ORDER BY id')
+    cursor.execute(f'SELECT id, name, age FROM ha_helios_test.{table_name} ORDER BY id')
     print("\t", cursor.fetchall())
     
-    cursor.execute(f'UPDATE ha_lineairdb_test.{table_name} SET name="Alice Smith", age=26 WHERE id=1')
+    cursor.execute(f'UPDATE ha_helios_test.{table_name} SET name="Alice Smith", age=26 WHERE id=1')
     db.commit()
     
     print("\t[DEBUG] After UPDATE:")
-    cursor.execute(f'SELECT id, name, age FROM ha_lineairdb_test.{table_name} ORDER BY id')
+    cursor.execute(f'SELECT id, name, age FROM ha_helios_test.{table_name} ORDER BY id')
     rows = cursor.fetchall()
     print("\t", rows)
     
@@ -355,30 +355,30 @@ def update_primary_key_multiple_rows(db, cursor):
     
     table_name = f"test_update_pk_multi_{int(time.time() * 1000000)}"
     
-    cursor.execute(f'''CREATE TABLE ha_lineairdb_test.{table_name} (
+    cursor.execute(f'''CREATE TABLE ha_helios_test.{table_name} (
         id INT NOT NULL,
         name VARCHAR(50) NOT NULL,
         age INT NOT NULL,
         department VARCHAR(50) NOT NULL,
         PRIMARY KEY (id)
-    ) ENGINE = LineairDB''')
+    ) ENGINE = Helios''')
     db.commit()
     
-    cursor.execute(f'INSERT INTO ha_lineairdb_test.{table_name} (id, name, age, department) VALUES (1, "Alice", 25, "Sales")')
-    cursor.execute(f'INSERT INTO ha_lineairdb_test.{table_name} (id, name, age, department) VALUES (2, "Bob", 30, "Sales")')
-    cursor.execute(f'INSERT INTO ha_lineairdb_test.{table_name} (id, name, age, department) VALUES (3, "Carol", 28, "Engineering")')
-    cursor.execute(f'INSERT INTO ha_lineairdb_test.{table_name} (id, name, age, department) VALUES (4, "Dave", 35, "Engineering")')
+    cursor.execute(f'INSERT INTO ha_helios_test.{table_name} (id, name, age, department) VALUES (1, "Alice", 25, "Sales")')
+    cursor.execute(f'INSERT INTO ha_helios_test.{table_name} (id, name, age, department) VALUES (2, "Bob", 30, "Sales")')
+    cursor.execute(f'INSERT INTO ha_helios_test.{table_name} (id, name, age, department) VALUES (3, "Carol", 28, "Engineering")')
+    cursor.execute(f'INSERT INTO ha_helios_test.{table_name} (id, name, age, department) VALUES (4, "Dave", 35, "Engineering")')
     db.commit()
     
     print("\t[DEBUG] Before UPDATE:")
-    cursor.execute(f'SELECT id, name, age, department FROM ha_lineairdb_test.{table_name} ORDER BY id')
+    cursor.execute(f'SELECT id, name, age, department FROM ha_helios_test.{table_name} ORDER BY id')
     print("\t", cursor.fetchall())
     
-    cursor.execute(f'UPDATE ha_lineairdb_test.{table_name} SET age=age+1 WHERE department="Sales"')
+    cursor.execute(f'UPDATE ha_helios_test.{table_name} SET age=age+1 WHERE department="Sales"')
     db.commit()
     
     print("\t[DEBUG] After UPDATE:")
-    cursor.execute(f'SELECT id, name, age, department FROM ha_lineairdb_test.{table_name} ORDER BY id')
+    cursor.execute(f'SELECT id, name, age, department FROM ha_helios_test.{table_name} ORDER BY id')
     rows = cursor.fetchall()
     print("\t", rows)
 
@@ -401,7 +401,7 @@ def update_primary_key_with_secondary_index(db, cursor):
     
     table_name = f"test_update_pk_idx_{int(time.time() * 1000000)}"
     
-    cursor.execute(f'''CREATE TABLE ha_lineairdb_test.{table_name} (
+    cursor.execute(f'''CREATE TABLE ha_helios_test.{table_name} (
         id INT NOT NULL,
         name VARCHAR(50) NOT NULL,
         age INT NOT NULL,
@@ -409,54 +409,54 @@ def update_primary_key_with_secondary_index(db, cursor):
         PRIMARY KEY (id),
         INDEX age_idx (age),
         INDEX dept_idx (department)
-    ) ENGINE = LineairDB''')
+    ) ENGINE = Helios''')
     db.commit()
     
-    cursor.execute(f'INSERT INTO ha_lineairdb_test.{table_name} (id, name, age, department) VALUES (1, "Alice", 25, "Sales")')
-    cursor.execute(f'INSERT INTO ha_lineairdb_test.{table_name} (id, name, age, department) VALUES (2, "Bob", 30, "Engineering")')
-    cursor.execute(f'INSERT INTO ha_lineairdb_test.{table_name} (id, name, age, department) VALUES (3, "Carol", 25, "Marketing")')
+    cursor.execute(f'INSERT INTO ha_helios_test.{table_name} (id, name, age, department) VALUES (1, "Alice", 25, "Sales")')
+    cursor.execute(f'INSERT INTO ha_helios_test.{table_name} (id, name, age, department) VALUES (2, "Bob", 30, "Engineering")')
+    cursor.execute(f'INSERT INTO ha_helios_test.{table_name} (id, name, age, department) VALUES (3, "Carol", 25, "Marketing")')
     db.commit()
     
     print("\t[DEBUG] Before UPDATE:")
-    cursor.execute(f'SELECT id, name, age, department FROM ha_lineairdb_test.{table_name} ORDER BY id')
+    cursor.execute(f'SELECT id, name, age, department FROM ha_helios_test.{table_name} ORDER BY id')
     print("\t", cursor.fetchall())
     
-    cursor.execute(f'UPDATE ha_lineairdb_test.{table_name} SET age=26, department="HR" WHERE id=1')
+    cursor.execute(f'UPDATE ha_helios_test.{table_name} SET age=26, department="HR" WHERE id=1')
     db.commit()
     
     print("\t[DEBUG] After UPDATE:")
-    cursor.execute(f'SELECT id, name, age, department FROM ha_lineairdb_test.{table_name} ORDER BY id')
+    cursor.execute(f'SELECT id, name, age, department FROM ha_helios_test.{table_name} ORDER BY id')
     print("\t", cursor.fetchall())
     
-    cursor.execute(f'SELECT name, age, department FROM ha_lineairdb_test.{table_name} WHERE id=1')
+    cursor.execute(f'SELECT name, age, department FROM ha_helios_test.{table_name} WHERE id=1')
     rows = cursor.fetchall()
     if len(rows) != 1 or rows[0] != ("Alice", 26, "HR"):
         print("\tFailed: ID 1 should have age=26 and department=HR")
         print("\t", rows)
         return 1
     
-    cursor.execute(f'SELECT id, name FROM ha_lineairdb_test.{table_name} WHERE age=26')
+    cursor.execute(f'SELECT id, name FROM ha_helios_test.{table_name} WHERE age=26')
     rows = cursor.fetchall()
     if len(rows) != 1 or rows[0] != (1, "Alice"):
         print("\tFailed: age=26 should find Alice")
         print("\t", rows)
         return 1
     
-    cursor.execute(f'SELECT id, name FROM ha_lineairdb_test.{table_name} WHERE department="HR"')
+    cursor.execute(f'SELECT id, name FROM ha_helios_test.{table_name} WHERE department="HR"')
     rows = cursor.fetchall()
     if len(rows) != 1 or rows[0] != (1, "Alice"):
         print("\tFailed: department=HR should find Alice")
         print("\t", rows)
         return 1
     
-    cursor.execute(f'SELECT id FROM ha_lineairdb_test.{table_name} WHERE age=25 ORDER BY id')
+    cursor.execute(f'SELECT id FROM ha_helios_test.{table_name} WHERE age=25 ORDER BY id')
     rows = cursor.fetchall()
     if len(rows) != 1 or rows[0][0] != 3:
         print("\tFailed: age=25 should only find Carol")
         print("\t", rows)
         return 1
     
-    cursor.execute(f'SELECT id FROM ha_lineairdb_test.{table_name} WHERE department="Sales"')
+    cursor.execute(f'SELECT id FROM ha_helios_test.{table_name} WHERE department="Sales"')
     rows = cursor.fetchall()
     if len(rows) != 0:
         print("\tFailed: No one should be in Sales department")
@@ -472,29 +472,29 @@ def update_composite_primary_key(db, cursor):
     
     table_name = f"test_update_comp_pk_{int(time.time() * 1000000)}"
     
-    cursor.execute(f'''CREATE TABLE ha_lineairdb_test.{table_name} (
+    cursor.execute(f'''CREATE TABLE ha_helios_test.{table_name} (
         dept_id INT NOT NULL,
         emp_id INT NOT NULL,
         name VARCHAR(50) NOT NULL,
         salary INT NOT NULL,
         PRIMARY KEY (dept_id, emp_id)
-    ) ENGINE = LineairDB''')
+    ) ENGINE = Helios''')
     db.commit()
     
-    cursor.execute(f'INSERT INTO ha_lineairdb_test.{table_name} (dept_id, emp_id, name, salary) VALUES (1, 1, "Alice", 50000)')
-    cursor.execute(f'INSERT INTO ha_lineairdb_test.{table_name} (dept_id, emp_id, name, salary) VALUES (1, 2, "Bob", 55000)')
-    cursor.execute(f'INSERT INTO ha_lineairdb_test.{table_name} (dept_id, emp_id, name, salary) VALUES (2, 1, "Carol", 60000)')
+    cursor.execute(f'INSERT INTO ha_helios_test.{table_name} (dept_id, emp_id, name, salary) VALUES (1, 1, "Alice", 50000)')
+    cursor.execute(f'INSERT INTO ha_helios_test.{table_name} (dept_id, emp_id, name, salary) VALUES (1, 2, "Bob", 55000)')
+    cursor.execute(f'INSERT INTO ha_helios_test.{table_name} (dept_id, emp_id, name, salary) VALUES (2, 1, "Carol", 60000)')
     db.commit()
     
     print("\t[DEBUG] Before UPDATE:")
-    cursor.execute(f'SELECT dept_id, emp_id, name, salary FROM ha_lineairdb_test.{table_name} ORDER BY dept_id, emp_id')
+    cursor.execute(f'SELECT dept_id, emp_id, name, salary FROM ha_helios_test.{table_name} ORDER BY dept_id, emp_id')
     print("\t", cursor.fetchall())
     
-    cursor.execute(f'UPDATE ha_lineairdb_test.{table_name} SET name="Alice Smith", salary=52000 WHERE dept_id=1 AND emp_id=1')
+    cursor.execute(f'UPDATE ha_helios_test.{table_name} SET name="Alice Smith", salary=52000 WHERE dept_id=1 AND emp_id=1')
     db.commit()
     
     print("\t[DEBUG] After UPDATE:")
-    cursor.execute(f'SELECT dept_id, emp_id, name, salary FROM ha_lineairdb_test.{table_name} ORDER BY dept_id, emp_id')
+    cursor.execute(f'SELECT dept_id, emp_id, name, salary FROM ha_helios_test.{table_name} ORDER BY dept_id, emp_id')
     rows = cursor.fetchall()
     print("\t", rows)
     

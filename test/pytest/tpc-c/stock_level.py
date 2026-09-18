@@ -380,12 +380,12 @@ def main():
     cursor = db.cursor()
 
     try:
-        reset(db, cursor, "ha_lineairdb_test")
-        setup_schema(db, cursor, "ha_lineairdb_test", "LineairDB")
-        populate_stock_level_fixture(db, cursor, "ha_lineairdb_test")
+        reset(db, cursor, "ha_helios_test")
+        setup_schema(db, cursor, "ha_helios_test", "Helios")
+        populate_stock_level_fixture(db, cursor, "ha_helios_test")
 
         result = 0
-        result |= test_tpcc_stocklevel(db, cursor, "ha_lineairdb_test", terminalDistrictUpperID=2, threshold=50)
+        result |= test_tpcc_stocklevel(db, cursor, "ha_helios_test", terminalDistrictUpperID=2, threshold=50)
 
         if result == 0:
             print("\nALL TESTS PASSED!")

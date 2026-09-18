@@ -1,19 +1,19 @@
-#include "lineairdb_rpc.hh"
+#include "helios_rpc.hh"
 
 #include <memory>
 #include <string>
 
 #include "duckdb_bridge_executor.hh"
-#include "lineairdb.pb.h"
+#include "helios.pb.h"
 
 /**
  * @brief Parses a TX_EXECUTE_DUCKDB_QUERY request and hands it to
  * duckdb_bridge::ExecuteDuckdbQuery.
  */
-void LineairDBRpc::handleTxExecuteDuckdbQuery(const std::string& message,
+void HeliosRpc::handleTxExecuteDuckdbQuery(const std::string& message,
                                               std::string& result) {
-    LineairDB::Protocol::TxExecuteDuckdbQuery::Request request;
-    LineairDB::Protocol::TxExecuteDuckdbQuery::Response response;
+    Helios::Protocol::TxExecuteDuckdbQuery::Request request;
+    Helios::Protocol::TxExecuteDuckdbQuery::Response response;
 
     if (!request.ParseFromString(message)) {
         response.set_ok(false);

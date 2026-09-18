@@ -29,7 +29,7 @@
 #include <string>
 #include <vector>
 
-#include "lineairdb/index.h"
+#include "helios/index.h"
 
 #include "silo/tidword.h"
 

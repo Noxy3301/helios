@@ -565,12 +565,12 @@ def main():
     cursor = db.cursor()
 
     try:
-        reset(db, cursor, "ha_lineairdb_test")
-        setup_schema(db, cursor, "ha_lineairdb_test", "LineairDB")
-        seed_minimal_data(db, cursor, "ha_lineairdb_test")
+        reset(db, cursor, "ha_helios_test")
+        setup_schema(db, cursor, "ha_helios_test", "Helios")
+        seed_minimal_data(db, cursor, "ha_helios_test")
 
         result = 0
-        result |= test_tpcc_payment(db, cursor, "ha_lineairdb_test", amount=200.00)
+        result |= test_tpcc_payment(db, cursor, "ha_helios_test", amount=200.00)
 
         if result == 0:
             print("\nALL TESTS PASSED!")

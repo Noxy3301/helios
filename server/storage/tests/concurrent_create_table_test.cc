@@ -30,8 +30,8 @@
 #include <thread>
 #include <vector>
 
-#include "lineairdb/config.h"
-#include "lineairdb/database.h"
+#include "helios/config.h"
+#include "helios/database.h"
 
 #include "gtest/gtest.h"
 

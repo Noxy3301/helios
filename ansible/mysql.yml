@@ -1,15 +1,15 @@
 ---
-# Start mysqld + LineairDB proxy plugin from the pushed bundle
+# Start mysqld + Helios plugin from the pushed bundle
 # (push_bundle.yml runs first; no repository or build step on the node).
 #
 # mysql_engine == 'innodb' switches this node to a stock MySQL/InnoDB
-# baseline (no storage server, no proxy plugin) for comparison runs.
+# baseline (no storage server, no plugin) for comparison runs.
 - hosts: mysql
   gather_facts: false
   vars:
     mysqld_extra_args: ""
     ena_rss_interface: ens5
-    mysql_engine: lineairdb
+    mysql_engine: helios
     wal_volume: false
     wal_mount: /mnt/wal
     wal_iops: 12000
@@ -28,16 +28,16 @@
         data_mount: "{{ wal_mount }}"
         data_volume: "{{ wal_volume }}"
 
-    - name: Wait for the LineairDB server port
+    - name: Wait for the Helios server port
       # Bundle deploys start the roles in parallel, so mysqld must wait for the
       # server's listen socket.
       when: mysql_engine != 'innodb'
       wait_for:
-        host: "{{ hostvars['lineairdb-1'].private_ip }}"
+        host: "{{ hostvars['storage-1'].private_ip }}"
         port: 9999
         timeout: 600
 
-    - name: Start MySQL with LineairDB-Proxy
+    - name: Start MySQL with Helios plugin
       # Never pipe the start scripts to a pager/tail; log to a file and
       # verify the listener explicitly.
       when: mysql_engine != 'innodb'
@@ -49,7 +49,7 @@
         export MYSQLD_EXTRA_ARGS="{{ mysqld_extra_args }}"
         timeout -k 10 900 ./scripts/start_mysql.sh \
           --mysqld-port 3307 \
-          --server-host {{ hostvars['lineairdb-1'].private_ip }} \
+          --server-host {{ hostvars['storage-1'].private_ip }} \
           --server-port 9999 > /tmp/start_mysql.log 2>&1 || {
             echo "start_mysql.sh failed:"; tail -40 /tmp/start_mysql.log; exit 1; }
         for i in $(seq 1 30); do
@@ -64,7 +64,7 @@
         executable: /bin/bash
 
     - name: Start MySQL with InnoDB
-      # Direct mysqld start rather than start_mysql.sh, which installs the LineairDB
+      # Direct mysqld start rather than start_mysql.sh, which installs the Helios
       # plugin: the same option set plus binlog and InnoDB commit durability
       # (benchbase.yml relaxes both until the load and ANALYZE finish)
       when: mysql_engine == 'innodb'
@@ -161,7 +161,7 @@
         var: innodb_config.stdout_lines
 
     - name: apply bench/setup.sql
-      # Installs the LineairDB plugin; InnoDB has no such plugin, and the
+      # Installs the Helios plugin; InnoDB has no such plugin, and the
       # benchbase database is (re)created by benchbase.yml regardless
       when: mysql_engine != 'innodb'
       shell: |

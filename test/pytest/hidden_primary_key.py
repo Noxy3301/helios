@@ -24,7 +24,7 @@ from utils.connection import get_connection
 
 ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 SCRIPTS_DIR = os.path.join(ROOT_DIR, "scripts")
-SERVER_BIN = os.path.join(ROOT_DIR, "build", "server", "lineairdb-server")
+SERVER_BIN = os.path.join(ROOT_DIR, "build", "server", "helios-storage")
 
 SECOND_PORT = 3308
 # The first start of an instance initializes its data directory
@@ -37,7 +37,7 @@ RESTART_SERVER_PORT = int(os.environ.get("HELIOS_TEST_SERVER_PORT", "19998"))
 RESTART_MYSQLD_PORTS = (13307, 13308)
 SERVER_START_TIMEOUT = 60.0
 
-DATABASE = "ha_lineairdb_test"
+DATABASE = "ha_helios_test"
 
 # The plugin reserves hidden keys in blocks of this size, so a session that
 # writes more than that has to refill mid-statement-stream.
@@ -154,13 +154,13 @@ def start_storage_server(work_dir, recovery=True):
     which is what the reserved-but-not-durable window needs.
     """
     env = dict(os.environ)
-    env["LINEAIRDB_SERVER_PORT"] = str(RESTART_SERVER_PORT)
+    env["HELIOS_SERVER_PORT"] = str(RESTART_SERVER_PORT)
     if recovery:
-        env["LINEAIRDB_ENABLE_RECOVERY"] = "1"
-        env["LINEAIRDB_COMMIT_DURABILITY"] = "sync"
+        env["HELIOS_ENABLE_RECOVERY"] = "1"
+        env["HELIOS_COMMIT_DURABILITY"] = "sync"
     else:
-        env.pop("LINEAIRDB_ENABLE_RECOVERY", None)
-        env.pop("LINEAIRDB_COMMIT_DURABILITY", None)
+        env.pop("HELIOS_ENABLE_RECOVERY", None)
+        env.pop("HELIOS_COMMIT_DURABILITY", None)
     jemalloc = "/lib/x86_64-linux-gnu/libjemalloc.so.2"
     if os.path.exists(jemalloc):
         env["LD_PRELOAD"] = jemalloc
@@ -212,7 +212,7 @@ def create_hidden_pk_table(cursor, table):
     cursor.execute(
         f"""CREATE TABLE {DATABASE}.{table} (
             payload VARCHAR(64) NOT NULL
-        ) ENGINE = LineairDB"""
+        ) ENGINE = Helios"""
     )
 
 
@@ -222,7 +222,7 @@ def create_declared_pk_table(cursor, table):
             id INT NOT NULL,
             payload VARCHAR(64) NOT NULL,
             PRIMARY KEY (id)
-        ) ENGINE = LineairDB"""
+        ) ENGINE = Helios"""
     )
 
 
@@ -812,9 +812,9 @@ def test_reservation_dies_with_the_server(user, password):
         first.autocommit = True
         cursor_a = first.cursor()
         reset_schema(cursor_a)
-        cursor_a.execute("SELECT @@GLOBAL.lineairdb_read_path")
+        cursor_a.execute("SELECT @@GLOBAL.helios_read_path")
         read_path_was = cursor_a.fetchone()[0]
-        cursor_a.execute("SET GLOBAL lineairdb_read_path='plan'")
+        cursor_a.execute("SET GLOBAL helios_read_path='plan'")
         create_hidden_pk_table(cursor_a, table)
 
         # Reserves a range under this run and spends its first id
@@ -860,7 +860,7 @@ def test_reservation_dies_with_the_server(user, password):
         if read_path_was is not None and connections:
             try:
                 restore = connections[-1].cursor()
-                restore.execute("SET GLOBAL lineairdb_read_path="
+                restore.execute("SET GLOBAL helios_read_path="
                                 f"'{read_path_was}'")
                 restore.close()
             except mysql.connector.Error:

@@ -1,19 +1,19 @@
-#include "storage/lineairdb/ha_lineairdb.hh"
+#include "storage/helios/ha_helios.hh"
 
 #include <cstddef>
 #include <string>
 
-#include "lineairdb_prefetch.hh"
+#include "helios_prefetch.hh"
 #include "my_dbug.h"
 #include "sql/sql_class.h"
 #include "sql/table.h"
 
 // Handler full-table-scan entry points. These methods back MySQL's rnd_* scan
-// callbacks with LineairDB range reads and maintain the local row cache used
+// callbacks with Helios range reads and maintain the local row cache used
 // for sorted re-reads through rnd_pos().
 
-int ha_lineairdb::rnd_init(bool) {
-  DBUG_ENTER("ha_lineairdb::rnd_init");
+int ha_helios::rnd_init(bool) {
+  DBUG_ENTER("ha_helios::rnd_init");
   scanned_keys_.clear();
   scanned_values_.clear();
   scan_cache_.clear();
@@ -42,7 +42,7 @@ int ha_lineairdb::rnd_init(bool) {
   DBUG_RETURN(0);
 }
 
-int ha_lineairdb::rnd_end() {
+int ha_helios::rnd_end() {
   DBUG_TRACE;
   // Do not clear scan_cache_ or scanned_values_ here. MySQL can call rnd_end()
   // after scanning and then call rnd_pos() to re-read rows in sorted order.
@@ -53,8 +53,8 @@ int ha_lineairdb::rnd_end() {
   return 0;
 }
 
-bool ha_lineairdb::materialize_scan() {
-  DBUG_ENTER("ha_lineairdb::materialize_scan");
+bool ha_helios::materialize_scan() {
+  DBUG_ENTER("ha_helios::materialize_scan");
 
   auto tx = get_transaction(ha_thd());
   if (tx->is_aborted()) {
@@ -98,8 +98,8 @@ bool ha_lineairdb::materialize_scan() {
   DBUG_RETURN(true);
 }
 
-int ha_lineairdb::rnd_next(uchar *buf) {
-  DBUG_ENTER("ha_lineairdb::rnd_next");
+int ha_helios::rnd_next(uchar *buf) {
+  DBUG_ENTER("ha_helios::rnd_next");
   ha_statistic_increment(&System_status_var::ha_read_rnd_next_count);
 
   if (buffer_position_ >= scanned_keys_.size()) {
@@ -121,14 +121,14 @@ int ha_lineairdb::rnd_next(uchar *buf) {
   auto &value = scanned_values_[buffer_position_];
   buffer_position_++;
 
-  int error = set_fields_from_lineairdb(buf, value.data(), value.size());
+  int error = set_fields_from_helios(buf, value.data(), value.size());
   if (error == 0) {
     last_fetched_primary_key_ = key;
   }
   DBUG_RETURN(error);
 }
 
-void ha_lineairdb::position(const uchar *) {
+void ha_helios::position(const uchar *) {
   DBUG_TRACE;
 
   if (last_fetched_primary_key_.empty()) {
@@ -138,7 +138,7 @@ void ha_lineairdb::position(const uchar *) {
   store_primary_key_in_ref(last_fetched_primary_key_);
 }
 
-int ha_lineairdb::rnd_pos(uchar *buf, uchar *pos) {
+int ha_helios::rnd_pos(uchar *buf, uchar *pos) {
   DBUG_TRACE;
 
   std::string primary_key = extract_primary_key_from_ref(pos);
@@ -148,11 +148,11 @@ int ha_lineairdb::rnd_pos(uchar *buf, uchar *pos) {
   }
 
   // Return from scan_cache_ if available. Without this, each sorted re-read
-  // would require a separate RPC to LineairDB.
+  // would require a separate RPC to Helios.
   auto cache_it = scan_cache_.find(primary_key);
   if (cache_it != scan_cache_.end()) {
     auto &value = scanned_values_[cache_it->second];
-    if (set_fields_from_lineairdb(buf, value.data(), value.size())) {
+    if (set_fields_from_helios(buf, value.data(), value.size())) {
       return HA_ERR_OUT_OF_MEM;
     }
     last_fetched_primary_key_ = primary_key;
@@ -177,7 +177,7 @@ int ha_lineairdb::rnd_pos(uchar *buf, uchar *pos) {
     return HA_ERR_KEY_NOT_FOUND;
   }
 
-  if (set_fields_from_lineairdb(buf, result.first, result.second)) {
+  if (set_fields_from_helios(buf, result.first, result.second)) {
     tx->set_status_to_abort();
     return HA_ERR_OUT_OF_MEM;
   }

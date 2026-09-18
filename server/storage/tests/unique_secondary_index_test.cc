@@ -9,9 +9,9 @@
 #include <memory>
 #include <string>
 
-#include "lineairdb/config.h"
-#include "lineairdb/database.h"
-#include "lineairdb/index.h"
+#include "helios/config.h"
+#include "helios/database.h"
+#include "helios/index.h"
 
 #include "db_helper.h"
 #include "gtest/gtest.h"

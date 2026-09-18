@@ -1,0 +1,130 @@
+---
+# Start the Helios server from the pushed bundle (push_bundle.yml runs first;
+# there is no repository or build step on the node).
+- hosts: storage
+  gather_facts: false
+  vars:
+    storage_nofile_limit: 1048576
+    ena_rss_interface: ens5
+    helios_durability: async
+    # helios_load_durability (optional): contract for the load phase only.
+    # measure_usage.yml switches the server to helios_durability before the
+    # sweep; left undefined, the load runs under helios_durability as well.
+    helios_epoch_ms: ""
+    # Extra KEY=VALUE pairs exported to the server (space separated)
+    helios_storage_env: ""
+    # Path prefix for the WAL flush trace; empty disables it
+    helios_flush_trace: ""
+    wal_volume: false
+    wal_mount: /mnt/wal
+  tasks:
+    # Before any traffic; the play itself runs unprivileged
+    - import_tasks: tasks/ena_queue_tuning.yml
+      become: true
+      tags: [privileged]
+
+    - import_tasks: tasks/mount_data_volume.yml
+      become: true
+      tags: [privileged]
+      vars:
+        data_mount: "{{ wal_mount }}"
+        data_volume: "{{ wal_volume }}"
+
+    - name: Point helios_wal at the WAL volume
+      # Separate from the mount block so a re-pushed bundle (which recreates
+      # the plain directory) is re-linked even when the volume stayed mounted.
+      when: wal_volume | bool
+      become: true
+      tags: [privileged]
+      shell: |
+        set -euo pipefail
+        mkdir -p {{ wal_mount }}/helios_wal
+        chown {{ ansible_user }}:{{ ansible_user }} {{ wal_mount }}/helios_wal
+        target=/home/{{ ansible_user }}/helios/helios_wal
+        if [ -L "$target" ]; then
+          rm -f "$target"
+        elif [ -e "$target" ]; then
+          rm -rf "$target"
+        fi
+        ln -s {{ wal_mount }}/helios_wal "$target"
+        chown -h {{ ansible_user }}:{{ ansible_user }} "$target"
+      args:
+        executable: /bin/bash
+
+    - name: "Gate: the durability control tool is present"
+      # measure_usage.yml reconciles this server before the sweep; a bundle
+      # without the tool would only fail after the load.
+      shell: test -x ~/helios/build/server/helios-ctl
+      args:
+        executable: /bin/bash
+      changed_when: false
+
+    - name: Start the Helios server
+      # Never pipe the start scripts: log to a file and verify liveness explicitly;
+      # helios_wal is wiped first, following the WAL symlink when present, so
+      # a run never replays a previous WAL; helios_logs holds the process
+      # logs and is wiped so a sweep's archive carries only its own run
+      shell: |
+        set -euo pipefail
+        cd ~/helios
+        ./scripts/stop_server.sh > /dev/null 2>&1 || true
+        # pgrep status 1 means no process; anything else keeps the WAL untouched
+        rc=0
+        for _ in $(seq 1 30); do
+          pgrep -f '[b]uild/server/helios-storage' > /dev/null && rc=0 || rc=$?
+          [ "$rc" -eq 0 ] || break
+          sleep 1
+        done
+        [ "$rc" -eq 1 ] || { echo "refusing to wipe the WAL: a previous helios-storage is still running or pgrep failed (status $rc)"; exit 1; }
+        mkdir -p ~/helios/helios_wal ~/helios/helios_logs
+        find ~/helios/helios_wal/ ~/helios/helios_logs/ -mindepth 1 -delete
+        ulimit -n {{ storage_nofile_limit }}
+        export HELIOS_COMMIT_DURABILITY="{{ helios_load_durability | default(helios_durability) }}"
+        {% if helios_epoch_ms %}
+        export HELIOS_EPOCH_DURATION_MS="{{ helios_epoch_ms }}"
+        {% endif %}
+        {% for kv in helios_storage_env.split() %}
+        export '{{ kv }}'
+        {% endfor %}
+        {% if helios_flush_trace %}
+        mkdir -p "$(dirname {{ helios_flush_trace }})"
+        export HELIOS_FLUSH_TRACE="{{ helios_flush_trace }}"
+        {% endif %}
+        ./scripts/start_server.sh > /tmp/start_server.log 2>&1
+        sleep 2
+        # Bracketed: the pattern kill in stop_server.sh must not match this shell
+        pgrep -f '[b]uild/server/helios-storage' > /dev/null || {
+          echo "helios-storage did not stay up:"; cat /tmp/start_server.log
+          tail -20 ~/helios/helios_logs/helios_storage_*.log 2>/dev/null
+          exit 1
+        }
+        echo "helios-storage up (nofile=$(ulimit -n))"
+      args:
+        executable: /bin/bash
+      register: server_start
+
+    - name: Show server start log
+      debug:
+        var: server_start.stdout_lines
+
+    - name: Show durability configuration
+      debug:
+        msg:
+          - "HELIOS_COMMIT_DURABILITY={{ helios_load_durability | default(helios_durability) }} (load phase)"
+          - "measured contract: {{ helios_durability }}"
+          - "HELIOS_EPOCH_DURATION_MS={{ helios_epoch_ms if helios_epoch_ms else '(server default)' }}"
+          - "extra env: {{ helios_storage_env if helios_storage_env else '(none)' }}"
+          - "HELIOS_FLUSH_TRACE={{ helios_flush_trace if helios_flush_trace else '(off)' }}"
+
+    - name: Capture WAL volume disk usage
+      when: wal_volume | bool
+      shell: df -h {{ wal_mount }}
+      args:
+        executable: /bin/bash
+      register: wal_df
+      changed_when: false
+
+    - name: Show WAL volume disk usage
+      when: wal_volume | bool
+      debug:
+        var: wal_df.stdout_lines

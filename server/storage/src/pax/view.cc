@@ -9,7 +9,7 @@
 #include <string>
 #include <utility>
 
-#include "lineairdb/database.h"
+#include "helios/database.h"
 
 #include "pax/catalog.h"
 #include "pax/epoch_image_buffer.h"

@@ -24,7 +24,7 @@
       # Bracketed patterns so pkill cannot match this task's own shell
       shell: |
         pkill -f '[r]untime_output_directory/mysqld' 2>/dev/null || true
-        pkill -f '[b]uild/server/lineairdb-server' 2>/dev/null || true
+        pkill -f '[b]uild/server/helios-storage' 2>/dev/null || true
         true
       args:
         executable: /bin/bash
@@ -35,7 +35,7 @@
         test -e "$HOME/helios/.git" && { echo "refusing to replace a git checkout" >&2; exit 1; }
         rm -rf "$HOME/helios"
         tar -C "$HOME" -xzf {{ _remote_tar }}
-        # RUNPATH of lineairdb-server walks $ROOT/server/..; keep the dir real
+        # RUNPATH of helios-storage walks $ROOT/server/..; keep the dir real
         # as defense-in-depth (LD_LIBRARY_PATH already covers every dep).
         mkdir -p "$HOME/helios/server"
       args:
@@ -49,8 +49,8 @@
         for f in "$HOME/helios/build/runtime_output_directory/mysqld" \
                  "$HOME/helios/build/runtime_output_directory/mysql" \
                  "$HOME/helios/build/runtime_output_directory/mysqladmin" \
-                 "$HOME/helios/build/plugin_output_directory/ha_lineairdb_storage_engine.so" \
-                 "$HOME/helios/build/server/lineairdb-server"; do
+                 "$HOME/helios/build/plugin_output_directory/ha_helios_storage_engine.so" \
+                 "$HOME/helios/build/server/helios-storage"; do
           miss=$(LD_LIBRARY_PATH="$L" ldd "$f" | grep 'not found' || true)
           if [ -n "$miss" ]; then
             echo "UNRESOLVED DEPS in $f:"; echo "$miss"; rc=1

@@ -477,8 +477,8 @@ def main():
     try:
         result = 0
 
-        prepare_tpcc_environment(db, cursor, "ha_lineairdb_test", "LineairDB", num_items=20, reset_schema=True)
-        result |= test_tpcc_neworder(db, cursor, "ha_lineairdb_test", num_items=10)
+        prepare_tpcc_environment(db, cursor, "ha_helios_test", "Helios", num_items=20, reset_schema=True)
+        result |= test_tpcc_neworder(db, cursor, "ha_helios_test", num_items=10)
 
         if result == 0:
             print("\nALL TESTS PASSED!")

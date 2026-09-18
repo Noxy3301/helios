@@ -3,7 +3,7 @@ Switching a running server from Async to Sync, observed from outside.
 
 A load runs faster under Async, and the load is not part of a measurement, so
 the run wants Async while it populates and Sync from the first measured
-transaction onwards. One scenario: after `lineairdb-ctl set-durability sync`,
+transaction onwards. One scenario: after `helios-ctl set-durability sync`,
 a commit behaves as it does on a server that started Sync, which is a bounded
 wait plus an order. The wait is that nothing may be acknowledged during
 NOT_ANSWERED_SECONDS while that commit's fdatasync is held at a sync point;
@@ -27,8 +27,8 @@ import threading
 import time
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-SERVER = os.path.join(ROOT, "build", "server", "lineairdb-server")
-CTL = os.path.join(ROOT, "build", "server", "lineairdb-ctl")
+SERVER = os.path.join(ROOT, "build", "server", "helios-storage")
+CTL = os.path.join(ROOT, "build", "server", "helios-ctl")
 MYSQL_SOCKET = "/tmp/mysql.sock"
 MYSQLD_PORT = "3307"
 
@@ -146,9 +146,9 @@ def start_server(work_dir, mode, extra_env=None, pass_fds=()):
     """Starts the server directly, so its log directory and inherited
     descriptors are the test's to choose."""
     env = dict(os.environ)
-    env["LINEAIRDB_COMMIT_DURABILITY"] = mode
-    env["LINEAIRDB_EPOCH_DURATION_MS"] = "40"
-    env.pop("LINEAIRDB_ENABLE_RECOVERY", None)
+    env["HELIOS_COMMIT_DURABILITY"] = mode
+    env["HELIOS_EPOCH_DURATION_MS"] = "40"
+    env.pop("HELIOS_ENABLE_RECOVERY", None)
     if extra_env:
         env.update(extra_env)
     if port_is_open(9999):
@@ -213,7 +213,7 @@ def sql(statements):
 def create_table(name):
     sql("CREATE DATABASE IF NOT EXISTS dur;")
     sql(f"USE dur; DROP TABLE IF EXISTS {name};"
-        f" CREATE TABLE {name} (id INT PRIMARY KEY, v INT) ENGINE=lineairdb;")
+        f" CREATE TABLE {name} (id INT PRIMARY KEY, v INT) ENGINE=helios;")
 
 
 def start_switch(mode):
@@ -276,7 +276,7 @@ def kill_now(server):
 def recovered_rows(work_dir, table):
     """Restarts the server with recovery and reads the table back."""
     server = start_server(work_dir, "async",
-                          extra_env={"LINEAIRDB_ENABLE_RECOVERY": "1"})
+                          extra_env={"HELIOS_ENABLE_RECOVERY": "1"})
     start_mysqld()
     rows = {}
     for line in sql(f"SELECT id, v FROM dur.{table} ORDER BY id;") \

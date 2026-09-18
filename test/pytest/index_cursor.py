@@ -8,45 +8,45 @@ ROW_COUNT = 2505  # crosses the 1024-row cursor boundary twice
 
 
 def test_index_cursor(db, cursor):
-    cursor.execute("DROP DATABASE IF EXISTS ha_lineairdb_test")
-    cursor.execute("CREATE DATABASE ha_lineairdb_test")
+    cursor.execute("DROP DATABASE IF EXISTS ha_helios_test")
+    cursor.execute("CREATE DATABASE ha_helios_test")
     cursor.execute(
         """
-        CREATE TABLE ha_lineairdb_test.index_cursor (
+        CREATE TABLE ha_helios_test.index_cursor (
             pk INT NOT NULL PRIMARY KEY,
             sk INT NOT NULL,
             payload VARCHAR(20) NOT NULL,
             KEY idx_sk (sk)
-        ) ENGINE=LineairDB
+        ) ENGINE=Helios
         """
     )
 
     rows = [(i, i // 3, f"v{i}") for i in range(ROW_COUNT)]
     cursor.executemany(
-        "INSERT INTO ha_lineairdb_test.index_cursor VALUES (%s, %s, %s)",
+        "INSERT INTO ha_helios_test.index_cursor VALUES (%s, %s, %s)",
         rows,
     )
     db.commit()
 
     cursor.execute(
-        "SELECT MIN(pk), MAX(pk) FROM ha_lineairdb_test.index_cursor"
+        "SELECT MIN(pk), MAX(pk) FROM ha_helios_test.index_cursor"
     )
     if cursor.fetchone() != (0, ROW_COUNT - 1):
         print("MIN/MAX did not return the index endpoints")
         return 1
 
-    cursor.execute("SELECT MAX(sk) FROM ha_lineairdb_test.index_cursor")
+    cursor.execute("SELECT MAX(sk) FROM ha_helios_test.index_cursor")
     if cursor.fetchone() != ((ROW_COUNT - 1) // 3,):
         print("secondary-index MAX did not return the index tail")
         return 1
 
-    cursor.execute("SELECT MIN(sk) FROM ha_lineairdb_test.index_cursor")
+    cursor.execute("SELECT MIN(sk) FROM ha_helios_test.index_cursor")
     if cursor.fetchone() != (0,):
         print("secondary-index MIN did not return the index head")
         return 1
 
     cursor.execute(
-        "SELECT pk FROM ha_lineairdb_test.index_cursor "
+        "SELECT pk FROM ha_helios_test.index_cursor "
         "FORCE INDEX(PRIMARY) ORDER BY pk"
     )
     ascending = [row[0] for row in cursor.fetchall()]
@@ -55,7 +55,7 @@ def test_index_cursor(db, cursor):
         return 1
 
     cursor.execute(
-        "SELECT pk FROM ha_lineairdb_test.index_cursor "
+        "SELECT pk FROM ha_helios_test.index_cursor "
         "FORCE INDEX(PRIMARY) ORDER BY pk DESC"
     )
     descending = [row[0] for row in cursor.fetchall()]
@@ -64,7 +64,7 @@ def test_index_cursor(db, cursor):
         return 1
 
     cursor.execute(
-        "SELECT sk FROM ha_lineairdb_test.index_cursor "
+        "SELECT sk FROM ha_helios_test.index_cursor "
         "FORCE INDEX(idx_sk) ORDER BY sk DESC"
     )
     secondary = [row[0] for row in cursor.fetchall()]
@@ -88,7 +88,7 @@ def main():
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="LineairDB index cursor test")
+    parser = argparse.ArgumentParser(description="Helios index cursor test")
     parser.add_argument("--user", default="root")
     parser.add_argument("--password", default="")
     args = parser.parse_args()

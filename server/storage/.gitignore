@@ -95,5 +95,5 @@ Temporary Items
 
 # End of https://www.gitignore.io/api/osx,c++,linux,visualstudiocode
 
-# LineairDB runtime output (WAL, checkpoints) written by tests and local runs
+# Storage runtime output (WAL, checkpoints) written by tests and local runs
 helios_wal/

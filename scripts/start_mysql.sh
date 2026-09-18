@@ -53,7 +53,7 @@ read -r -a MYSQLD_EXTRA <<< "${MYSQLD_EXTRA_ARGS:-}"
 # Per-instance log so the background mysqld does not inherit the caller's
 # stdout/stderr (otherwise subprocess.run() in benchrun.py blocks forever
 # waiting for the inherited pipe to close).
-MYSQL_LOG_DIR="$ROOT_DIR/lineairdb_logs"
+MYSQL_LOG_DIR="$ROOT_DIR/helios_logs"
 mkdir -p "$MYSQL_LOG_DIR"
 MYSQL_LOG_FILE="$MYSQL_LOG_DIR/mysqld_${MYSQLD_PORT}_$(date +%Y%m%d_%H%M%S).log"
 
@@ -79,11 +79,11 @@ until ./runtime_output_directory/mysqladmin ping -u root --socket="$SOCKET" --po
   sleep 1
 done
 
-echo "Step 4/5: Installing LineairDB plugin..."
+echo "Step 4/5: Installing Helios plugin..."
 ./runtime_output_directory/mysql -u root --socket="$SOCKET" --port="$MYSQLD_PORT" \
-  -e "INSTALL PLUGIN lineairdb SONAME 'ha_lineairdb_storage_engine.so';" 2>/dev/null || true
+  -e "INSTALL PLUGIN helios SONAME 'ha_helios_storage_engine.so';" 2>/dev/null || true
 ./runtime_output_directory/mysql -u root --socket="$SOCKET" --port="$MYSQLD_PORT" \
-  -e "INSTALL PLUGIN lineairdb_columnar SONAME 'ha_lineairdb_storage_engine.so';" 2>/dev/null || true
+  -e "INSTALL PLUGIN helios_columnar SONAME 'ha_helios_storage_engine.so';" 2>/dev/null || true
 
 # --skip-name-resolve makes TCP clients match accounts by IP literal only;
 # 'root'@'localhost' stays socket-only, so create loopback root accounts.
@@ -94,13 +94,13 @@ echo "Step 4/5: Installing LineairDB plugin..."
       GRANT ALL PRIVILEGES ON *.* TO 'root'@'::1' WITH GRANT OPTION;
       FLUSH PRIVILEGES;" 2>/dev/null || true
 
-echo "Step 5/5: Stopping MySQL and restarting with LineairDB as default..."
+echo "Step 5/5: Stopping MySQL and restarting with Helios as default..."
 kill "$BOOT_PID" 2>/dev/null || true
 wait "$BOOT_PID" 2>/dev/null || true
 sleep 3
 
 nohup ./runtime_output_directory/mysqld --datadir="$DATA_DIR" --socket="$SOCKET" --port="$MYSQLD_PORT" \
-  --pid-file="$PID_FILE" --default-storage-engine=lineairdb \
+  --pid-file="$PID_FILE" --default-storage-engine=helios \
   --max-connections=16384 \
   --open-files-limit=65535 \
   --table-open-cache=8192 \
@@ -115,14 +115,14 @@ until ./runtime_output_directory/mysqladmin ping -u root --socket="$SOCKET" --po
 done
 
 ./runtime_output_directory/mysql -u root --socket="$SOCKET" --port="$MYSQLD_PORT" \
-  -e "SET GLOBAL lineairdb_server_host='${SERVER_HOST}'; SET GLOBAL lineairdb_server_port=${SERVER_PORT};" >/dev/null
+  -e "SET GLOBAL helios_server_host='${SERVER_HOST}'; SET GLOBAL helios_server_port=${SERVER_PORT};" >/dev/null
 
 # Prove the loopback root account authenticates over TCP: every check above
 # runs on the socket and would report success even if provisioning failed.
 ./runtime_output_directory/mysql -u root --protocol=TCP --host=127.0.0.1 --port="$MYSQLD_PORT" \
   -e "SELECT 1;" >/dev/null
 
-echo "MySQL running with LineairDB"
+echo "MySQL running with Helios"
 echo "PID       : $MYSQL_PID"
 echo "Port      : $MYSQLD_PORT"
 echo "Data dir  : $DATA_DIR"

@@ -22,12 +22,12 @@
 #include "sql/table.h"
 #include "sql/visible_fields.h"
 
-#include "lineairdb_field_types.h"
+#include "helios_field_types.h"
 
-namespace lineairdb_columnar {
+namespace helios_columnar {
 namespace {
 
-namespace pb = LineairDB::Protocol;
+namespace pb = Helios::Protocol;
 using Resolved = pb::TxExecuteDuckdbQuery;
 
 struct Serializer {
@@ -1216,4 +1216,4 @@ bool BuildDuckdbQueryRequest(THD* thd, LEX* lex,
     return true;
 }
 
-}  // namespace lineairdb_columnar
+}  // namespace helios_columnar

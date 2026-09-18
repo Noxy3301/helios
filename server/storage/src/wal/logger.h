@@ -32,7 +32,7 @@
 #include <string>
 #include <thread>
 
-#include "lineairdb/config.h"
+#include "helios/config.h"
 
 #include "util/epoch.h"
 #include "util/thread_key_storage.h"

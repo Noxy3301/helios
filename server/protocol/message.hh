@@ -8,7 +8,7 @@ struct MessageHeader {
     uint32_t payload_size;   // size of the protobuf payload
 };
 
-// MessageType enum (the names and values of OpCode in lineairdb.proto)
+// MessageType enum (the names and values of OpCode in helios.proto)
 enum class MessageType : uint32_t {
     UNKNOWN = 0,
 

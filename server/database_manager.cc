@@ -26,11 +26,11 @@ bool env_enabled(const char* name) {
 }
 
 /**
- * @brief Applies LINEAIRDB_EPOCH_DURATION_MS, keeping the storage default
+ * @brief Applies HELIOS_EPOCH_DURATION_MS, keeping the storage default
  * when it is unset.
  */
 void configure_epoch_duration(helios::storage::Config& config) {
-    const char* raw = std::getenv("LINEAIRDB_EPOCH_DURATION_MS");
+    const char* raw = std::getenv("HELIOS_EPOCH_DURATION_MS");
     if (raw == nullptr) return;
 
     const std::string_view input(raw);
@@ -40,7 +40,7 @@ void configure_epoch_duration(helios::storage::Config& config) {
     const bool consumed_all = end == input.data() + input.size();
     if (input.empty() || error != std::errc{} || !consumed_all ||
         parsed < kMinEpochDurationMs || parsed > kMaxEpochDurationMs) {
-        LOG_FATAL("Invalid LINEAIRDB_EPOCH_DURATION_MS='%s': expected an integer in [%zu,%zu]",
+        LOG_FATAL("Invalid HELIOS_EPOCH_DURATION_MS='%s': expected an integer in [%zu,%zu]",
                   raw, kMinEpochDurationMs, kMaxEpochDurationMs);
     }
     config.epoch_duration_ms = parsed;
@@ -48,11 +48,11 @@ void configure_epoch_duration(helios::storage::Config& config) {
 }
 
 /**
- * @brief Reads LINEAIRDB_COMMIT_DURABILITY (async|sync, default sync) into
+ * @brief Reads HELIOS_COMMIT_DURABILITY (async|sync, default sync) into
  * the mode the server passes to every commit.
  */
 helios::storage::CommitDurability configure_commit_durability() {
-    const char* raw = std::getenv("LINEAIRDB_COMMIT_DURABILITY");
+    const char* raw = std::getenv("HELIOS_COMMIT_DURABILITY");
     if (raw == nullptr) {
         LOG_INFO("Commit durability: sync (default)");
         return helios::storage::CommitDurability::kSync;
@@ -63,18 +63,18 @@ helios::storage::CommitDurability configure_commit_durability() {
     if (mode == "async") {
         durability = helios::storage::CommitDurability::kAsync;
     } else if (mode != "sync") {
-        LOG_FATAL("Invalid LINEAIRDB_COMMIT_DURABILITY='%s': expected async or sync", raw);
+        LOG_FATAL("Invalid HELIOS_COMMIT_DURABILITY='%s': expected async or sync", raw);
     }
     LOG_INFO("Commit durability: %s", raw);
     return durability;
 }
 
 /**
- * @brief Applies LINEAIRDB_WAL_INITIAL_CAPACITY_BYTES, the size the log is
+ * @brief Applies HELIOS_WAL_INITIAL_CAPACITY_BYTES, the size the log is
  * written out to before records land in it in place.
  */
 void configure_wal_capacity(helios::storage::Config& config) {
-    const char* raw = std::getenv("LINEAIRDB_WAL_INITIAL_CAPACITY_BYTES");
+    const char* raw = std::getenv("HELIOS_WAL_INITIAL_CAPACITY_BYTES");
     if (raw == nullptr) return;
 
     const std::string_view input(raw);
@@ -84,7 +84,7 @@ void configure_wal_capacity(helios::storage::Config& config) {
     const bool consumed_all = end == input.data() + input.size();
     if (input.empty() || error != std::errc{} || !consumed_all ||
         parsed > kMaxWalCapacityBytes) {
-        LOG_FATAL("Invalid LINEAIRDB_WAL_INITIAL_CAPACITY_BYTES='%s': expected an integer in [0,%llu]",
+        LOG_FATAL("Invalid HELIOS_WAL_INITIAL_CAPACITY_BYTES='%s': expected an integer in [0,%llu]",
                   raw, static_cast<unsigned long long>(kMaxWalCapacityBytes));
     }
     config.wal_initial_capacity_bytes = parsed;
@@ -111,19 +111,19 @@ size_t parse_milliseconds(const char* name, const char* raw) {
 }
 
 /**
- * @brief Applies LINEAIRDB_CHECKPOINT_INTERVAL_MS and
- * LINEAIRDB_CHECKPOINT_ONCE_AFTER_MS; zero, the default, writes no image.
+ * @brief Applies HELIOS_CHECKPOINT_INTERVAL_MS and
+ * HELIOS_CHECKPOINT_ONCE_AFTER_MS; zero, the default, writes no image.
  */
 void configure_checkpoint(helios::storage::Config& config) {
-    const char* interval = std::getenv("LINEAIRDB_CHECKPOINT_INTERVAL_MS");
+    const char* interval = std::getenv("HELIOS_CHECKPOINT_INTERVAL_MS");
     if (interval != nullptr) {
         config.checkpoint_interval_ms =
-            parse_milliseconds("LINEAIRDB_CHECKPOINT_INTERVAL_MS", interval);
+            parse_milliseconds("HELIOS_CHECKPOINT_INTERVAL_MS", interval);
     }
-    const char* once = std::getenv("LINEAIRDB_CHECKPOINT_ONCE_AFTER_MS");
+    const char* once = std::getenv("HELIOS_CHECKPOINT_ONCE_AFTER_MS");
     if (once != nullptr) {
         config.checkpoint_once_after_ms =
-            parse_milliseconds("LINEAIRDB_CHECKPOINT_ONCE_AFTER_MS", once);
+            parse_milliseconds("HELIOS_CHECKPOINT_ONCE_AFTER_MS", once);
     }
     if (config.checkpoint_interval_ms == 0 && config.checkpoint_once_after_ms == 0) {
         return;
@@ -139,7 +139,7 @@ DatabaseManager::DatabaseManager() {
     configure_epoch_duration(conf);
     configure_wal_capacity(conf);
     configure_checkpoint(conf);
-    conf.enable_recovery = env_enabled("LINEAIRDB_ENABLE_RECOVERY");
+    conf.enable_recovery = env_enabled("HELIOS_ENABLE_RECOVERY");
     set_commit_durability(configure_commit_durability());
     duckdb_bridge::ConfigureLimits();
     try {

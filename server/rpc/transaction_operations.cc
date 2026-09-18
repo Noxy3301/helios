@@ -1,12 +1,12 @@
-#include "lineairdb_rpc.hh"
+#include "helios_rpc.hh"
 
 #include <string>
 #include <string_view>
 #include <utility>
 #include <vector>
 
-#include "lineairdb.pb.h"
-#include "lineairdb/transaction.h"
+#include "helios.pb.h"
+#include "helios/transaction.h"
 
 // The reads, scans and the commit of a transaction; each request acts on the
 // database directly and leaves nothing behind.
@@ -19,10 +19,10 @@ const std::vector<uint32_t> kNoColumns;
 
 }  // namespace
 
-void LineairDBRpc::handleTxRead(const std::string& message,
+void HeliosRpc::handleTxRead(const std::string& message,
                                 std::string& result) {
-    LineairDB::Protocol::TxRead::Request request;
-    LineairDB::Protocol::TxRead::Response response;
+    Helios::Protocol::TxRead::Request request;
+    Helios::Protocol::TxRead::Response response;
 
     request.ParseFromString(message);
 
@@ -37,10 +37,10 @@ void LineairDBRpc::handleTxRead(const std::string& message,
     result = response.SerializeAsString();
 }
 
-void LineairDBRpc::handleTxBatchRead(const std::string& message,
+void HeliosRpc::handleTxBatchRead(const std::string& message,
                                      std::string& result) {
-    LineairDB::Protocol::TxBatchRead::Request request;
-    LineairDB::Protocol::TxBatchRead::Response response;
+    Helios::Protocol::TxBatchRead::Request request;
+    Helios::Protocol::TxBatchRead::Response response;
 
     request.ParseFromString(message);
 
@@ -63,10 +63,10 @@ void LineairDBRpc::handleTxBatchRead(const std::string& message,
     result = response.SerializeAsString();
 }
 
-void LineairDBRpc::handleTxScan(const std::string& message,
+void HeliosRpc::handleTxScan(const std::string& message,
                                 std::string& result) {
-    LineairDB::Protocol::TxScan::Request request;
-    LineairDB::Protocol::TxScan::Response response;
+    Helios::Protocol::TxScan::Request request;
+    Helios::Protocol::TxScan::Response response;
 
     request.ParseFromString(message);
 
@@ -86,10 +86,10 @@ void LineairDBRpc::handleTxScan(const std::string& message,
     result = response.SerializeAsString();
 }
 
-void LineairDBRpc::handleTxScanIndex(const std::string& message,
+void HeliosRpc::handleTxScanIndex(const std::string& message,
                                      std::string& result) {
-    LineairDB::Protocol::TxScanIndex::Request request;
-    LineairDB::Protocol::TxScanIndex::Response response;
+    Helios::Protocol::TxScanIndex::Request request;
+    Helios::Protocol::TxScanIndex::Response response;
 
     request.ParseFromString(message);
 
@@ -110,10 +110,10 @@ void LineairDBRpc::handleTxScanIndex(const std::string& message,
     result = response.SerializeAsString();
 }
 
-void LineairDBRpc::handleTxCommit(const std::string& message,
+void HeliosRpc::handleTxCommit(const std::string& message,
                                   std::string& result) {
-    LineairDB::Protocol::TxCommit::Request request;
-    LineairDB::Protocol::TxCommit::Response response;
+    Helios::Protocol::TxCommit::Request request;
+    Helios::Protocol::TxCommit::Response response;
 
     if (!request.ParseFromString(message)) {
         response.set_committed(false);
@@ -143,9 +143,9 @@ void LineairDBRpc::handleTxCommit(const std::string& message,
     for (const auto& write : request.writes()) {
         helios::storage::RowOp op;
         switch (write.op()) {
-            case LineairDB::Protocol::TxCommit::UPDATE: op = helios::storage::RowOp::kUpdate; break;
-            case LineairDB::Protocol::TxCommit::INSERT: op = helios::storage::RowOp::kInsert; break;
-            case LineairDB::Protocol::TxCommit::DELETE: op = helios::storage::RowOp::kDelete; break;
+            case Helios::Protocol::TxCommit::UPDATE: op = helios::storage::RowOp::kUpdate; break;
+            case Helios::Protocol::TxCommit::INSERT: op = helios::storage::RowOp::kInsert; break;
+            case Helios::Protocol::TxCommit::DELETE: op = helios::storage::RowOp::kDelete; break;
             default:
                 reason = "unknown row op";
                 fed = false;
@@ -175,11 +175,11 @@ void LineairDBRpc::handleTxCommit(const std::string& message,
         response.set_abort_detail(reason);
         if (reason == helios::storage::kDuplicatePrimaryKeyAbortReason) {
             response.set_abort_reason(
-                LineairDB::Protocol::ABORT_REASON_DUPLICATE_PRIMARY_KEY);
+                Helios::Protocol::ABORT_REASON_DUPLICATE_PRIMARY_KEY);
         } else if (reason.rfind(helios::storage::kDuplicateSecondaryKeyAbortPrefix,
                                 0) == 0) {
             response.set_abort_reason(
-                LineairDB::Protocol::ABORT_REASON_DUPLICATE_SECONDARY_KEY);
+                Helios::Protocol::ABORT_REASON_DUPLICATE_SECONDARY_KEY);
         }
     }
 

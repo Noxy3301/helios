@@ -1,0 +1,612 @@
+syntax = "proto3";
+
+package Helios.Protocol;
+
+// Identifies which RPC is being invoked. Every read answers from the
+// storage's current state and leaves nothing behind; the query layer keeps
+// what it read and commits once.
+enum OpCode {
+    UNKNOWN = 0;
+
+    // Reads
+    TX_READ = 1;
+    TX_BATCH_READ = 2;
+    TX_SCAN = 3;
+    TX_SCAN_INDEX = 4;
+    TX_EXECUTE_READ_PLAN = 5;
+
+    // The one commit of a transaction
+    TX_COMMIT = 6;
+
+    TX_GET_TABLE_STATS = 7;
+    TX_EXECUTE_DUCKDB_QUERY = 8;
+
+    // Definitions and server state
+    DB_CREATE_TABLE = 9;
+    DB_CREATE_SECONDARY_INDEX = 10;
+    DB_ALLOCATE_HIDDEN_KEYS = 11;
+    DB_SET_COMMIT_DURABILITY = 12;
+}
+
+// Why the server refused a transaction, where the query layer has to tell the
+// cause apart from ordinary contention.
+enum AbortReason {
+    ABORT_REASON_UNSPECIFIED = 0;
+    ABORT_REASON_DUPLICATE_PRIMARY_KEY = 1;
+    ABORT_REASON_DUPLICATE_SECONDARY_KEY = 2;
+}
+
+// A range this transaction scanned. The commit re-runs the scan described
+// by the bounds and requires the same key list.
+message RangeReadEntry {
+    string table_name = 1;
+    string index_name = 2; // Empty means primary index.
+    bytes start_key = 3;
+    bytes end_key = 4;
+    uint64 row_limit = 5; // 0 means compare the whole range.
+    bool reverse_scan = 6;
+    repeated bytes result_keys = 7; // PK scan: primary keys. SI scan: secondary keys.
+    repeated bytes result_primary_keys = 8; // SI scan only.
+}
+
+// Optimizer statistics: row counts and index NDV.
+message GetTableStats {
+    message IndexDesc {
+        string index_name = 1; // Empty means primary index.
+        uint32 num_key_parts = 2; // Number of leading key parts to measure.
+    }
+    message Request {
+        string ndv_table = 1; // Table to compute NDV for; empty means row counts only.
+        repeated IndexDesc ndv_indexes = 2;
+        bool ndv_force_recompute = 3; // ANALYZE TABLE forces NDV recomputation.
+    }
+    // NDV (Number of Distinct Values) per key-prefix length.
+    message IndexNdv {
+        string index_name = 1;
+        bool available = 2; // False when NDV is unavailable for this index.
+        repeated uint64 ndv = 3;
+        // Leading-key range histogram. bounds[i] is a raw encoded leading-key
+        // boundary; cum[i] is the cumulative live-row count up to that bound.
+        repeated bytes hist_bounds = 4;
+        repeated uint64 hist_cum = 5;
+        bool hist_available = 6;
+    }
+    message Response {
+        repeated TableRowCount table_stats = 1;
+        repeated IndexNdv index_ndv = 2;
+        // The run of the storage server that answered, as in
+        // DbAllocateHiddenKeys.Response. A connection learns it here, so a
+        // hidden-key range the query layer already holds stays usable.
+        uint64 boot_token = 3;
+    }
+}
+
+// One row by primary key. The commit validates the returned TID.
+message TxRead {
+    message Request {
+        string table_name = 1;
+        bytes key = 2;
+    }
+    message Response {
+        bool found = 1;
+        bytes value = 2;
+        uint64 tid = 3;
+    }
+}
+
+// Several rows by primary key in one round trip.
+message TxBatchRead {
+    message ReadOp {
+        string table_name = 1;
+        bytes key = 2;
+    }
+    message Request {
+        repeated ReadOp ops = 1;
+    }
+    message ReadResult {
+        bool found = 1;
+        bytes value = 2;
+        uint64 tid = 3;
+    }
+    message Response {
+        repeated ReadResult results = 1;
+    }
+}
+
+// Rows of the primary index in [start_key, end_key), in key order (reverse
+// when reverse_scan). row_limit 0 means every row and counts live rows;
+// keys_only leaves the values empty; ok is false when the table is missing.
+message TxScan {
+    message Request {
+        string table_name = 1;
+        bytes start_key = 2;
+        bytes end_key = 3;
+        uint64 row_limit = 4;
+        bool reverse_scan = 5;
+        bool keys_only = 6;
+    }
+    message Row {
+        bytes key = 1;
+        bytes value = 2;
+        uint64 tid = 3;
+    }
+    message Response {
+        bool ok = 1;
+        repeated Row rows = 2;
+    }
+}
+
+// Rows reached through a secondary index in [start_key, end_key) of the
+// secondary key, primary keys in key order within one secondary key whichever
+// the direction. Parameters as in TxScan.
+message TxScanIndex {
+    message Request {
+        string table_name = 1;
+        string index_name = 2;
+        bytes start_key = 3;
+        bytes end_key = 4;
+        uint64 row_limit = 5;
+        bool reverse_scan = 6;
+        bool keys_only = 7;
+    }
+    message Row {
+        bytes secondary_key = 1;
+        bytes primary_key = 2;
+        bytes value = 3;
+        uint64 tid = 4;  // the base row's TID
+    }
+    message Response {
+        bool ok = 1;
+        repeated Row rows = 2;
+    }
+}
+
+// Execute a dependent read plan in one RPC.
+// Steps may read values produced by earlier steps to build later keys.
+message TxExecuteReadPlan {
+    message KeyBinding {
+        uint32 source_step = 1;
+        uint32 source_row = 2;
+        uint32 source_offset = 3;
+        uint32 source_length = 4; // 0 means the rest of the source bytes.
+        bool use_midpoint = 5;
+        bool from_key = 6;
+        int32 source_column = 7; // 1-based row column; 0 means disabled.
+        bool column_as_int_key = 8;
+        int64 int_delta = 9;
+    }
+    message PlanStep {
+        string table_name = 1;
+        bytes key_prefix = 2;
+        bytes end_key_prefix = 3;
+        bool is_scan = 4;
+        uint64 scan_limit = 5; // 0 means no limit.
+        string index_name = 6; // Empty means primary index.
+        repeated KeyBinding bindings = 7;
+        repeated KeyBinding end_bindings = 8;
+        bool for_each = 9;
+        bool reverse_scan = 10;
+    }
+    message StepResult {
+        bool found = 1;
+        bytes value = 2;
+        uint64 tid = 3;
+        bytes actual_key = 4;
+        repeated bytes scan_keys = 5;
+        repeated bytes scan_values = 6;
+        repeated uint64 scan_tids = 7;
+        repeated bytes secondary_keys = 8;
+        bytes actual_start_key = 9;
+        bytes actual_end_key = 10;
+        // for_each range probes return one group per deduplicated start key.
+        // group_sizes[i] rows belong to [group_start_keys[i], group_end_keys[i]).
+        repeated uint32 group_sizes = 11;
+        repeated bytes group_start_keys = 12;
+        repeated bytes group_end_keys = 13;
+    }
+    message Request {
+        repeated PlanStep steps = 1;
+    }
+    message Response {
+        repeated StepResult results = 1;
+        bool ok = 2;
+    }
+}
+
+// The one commit of a transaction: validates every row and range it read,
+// then installs its writes and index changes under the Silo protocol.
+message TxCommit {
+    message ReadEntry {
+        string table_name = 1;
+        bytes key = 2;
+        uint64 tid = 3;  // as returned by the read; an absent row has a TID too
+    }
+    enum RowOp {
+        UPDATE = 0;
+        INSERT = 1;  // refused when the key holds a row
+        DELETE = 2;
+    }
+    message WriteEntry {
+        string table_name = 1;
+        bytes key = 2;
+        bytes value = 3;
+        RowOp op = 4;
+    }
+    message SecondaryIndexEntry {
+        string table_name = 1;
+        string index_name = 2;
+        bytes secondary_key = 3;
+        bytes primary_key = 4;
+        bool is_delete = 5;
+    }
+    message Request {
+        repeated ReadEntry reads = 1;
+        repeated RangeReadEntry range_reads = 2;
+        repeated WriteEntry writes = 3;  // in the order the query layer issued them
+        repeated SecondaryIndexEntry secondary_index_ops = 4;
+        repeated TableRowDelta row_deltas = 5;
+    }
+    message Response {
+        bool committed = 1;
+        repeated TableRowCount table_stats = 2;
+        string abort_detail = 3; // Free-form cause, for tracing only.
+        AbortReason abort_reason = 4;
+    }
+}
+
+// Reserves a range of hidden primary keys for a table without a declared one
+message DbAllocateHiddenKeys {
+    message Request {
+        string table_name = 1;
+        uint32 count = 2;
+    }
+    message Response {
+        bool ok = 1;
+        uint64 first_id = 2;
+        string error = 3;
+        // The server will reject the same request again: do not retry
+        bool permanent = 4;
+        // Per-run value that increases across restarts unless the clock steps
+        // back. A range is only usable against the run that granted it, so a
+        // restart invalidates every cached range.
+        uint64 boot_token = 5;
+    }
+}
+
+// Runtime switch of the commit acknowledgement policy (see
+// DatabaseManager::set_commit_durability).
+message DbSetCommitDurability {
+    enum Mode {
+        MODE_UNSPECIFIED = 0;
+        ASYNC = 1;
+        SYNC = 2;
+    }
+    message Request {
+        Mode mode = 1;
+    }
+    message Response {
+        bool ok = 1;
+        // The policy in force when this reply was built. With ok = false it
+        // does not say whether this call published it: a concurrent switch to
+        // the same mode may have.
+        Mode mode = 2;
+        string error = 3;
+    }
+}
+
+// Row-count delta the query layer reports with its commit.
+message TableRowDelta {
+    string table_name = 1;
+    int64 delta = 2;
+}
+
+// Snapshot of a single table's row count, returned with a commit and with the table stats.
+message TableRowCount {
+    string table_name = 1;
+    int64 row_count = 2;
+}
+
+// Create a new table in the database.
+message DbCreateTable {
+    message Request {
+        string table_name = 1;
+        // PAX cell widths in bytes, entry 0 = null flags, later entries in
+        // TABLE::field order; kind and scale carry one entry per width.
+        repeated uint32 pax_field_max_bytes = 2 [packed = true];
+        // Typed-cell kind per width entry, matching pax::FieldType.
+        repeated uint32 pax_field_kind = 3 [packed = true];
+        // DECIMAL scale per typed field, 0 elsewhere.
+        repeated int32 pax_field_scale = 4 [packed = true];
+    }
+    message Response {
+        bool success = 1;
+    }
+}
+
+// Create a secondary index on a table.
+// @param index_type  0 = IndexConstraint::kNone, 1 = IndexConstraint::kUnique
+message DbCreateSecondaryIndex {
+    message Request {
+        string table_name = 1;
+        string index_name = 2;
+        uint32 index_type = 3;
+    }
+    message Response {
+        bool success = 1;
+    }
+}
+
+// Resolved-statement request: the proxy serializes the Query_block and Item
+// trees, the server builds DuckDB's AST from them, so no SQL text crosses the
+// wire. Both ends default-deny a node they have no rule for.
+message TxExecuteDuckdbQuery {
+    enum TypeKind {
+        TYPE_UNSPECIFIED = 0;
+        INT64 = 1;
+        DECIMAL = 2;   // DEC64: at most 15 significant digits
+        VARCHAR = 3;
+        DATE = 4;
+        DATETIME = 5;
+        BOOL = 6;
+    }
+
+    message ResolvedType {
+        TypeKind kind = 1;
+        bool nullable = 2;
+        uint32 precision = 3;    // DECIMAL only
+        uint32 scale = 4;        // DECIMAL only
+        uint32 collation_id = 5; // VARCHAR only; MySQL collation number
+    }
+
+    message DecimalLit {
+        sint64 unscaled = 1;
+        uint32 scale = 2;
+    }
+    message DateLit {
+        int32 year = 1;
+        uint32 month = 2;
+        uint32 day = 3;
+    }
+    message DatetimeLit {
+        DateLit date = 1;
+        uint32 hour = 2;
+        uint32 minute = 3;
+        uint32 second = 4;
+        uint32 microsecond = 5;
+    }
+    message Literal {
+        oneof value {
+            int64 int_value = 1;
+            DecimalLit decimal_value = 2;
+            bytes string_value = 3;
+            DateLit date_value = 4;
+            DatetimeLit datetime_value = 5;
+            bool bool_value = 6;
+            bool null_value = 7; // set true; typed by Expr.result_type
+        }
+    }
+
+    // relation_id is unique across the whole request, subqueries included,
+    // so a correlated reference names its defining relation directly.
+    message ColumnRef {
+        uint32 relation_id = 1;
+        uint32 column_ordinal = 2; // TABLE::field[] order for a base table;
+                                   // select-list position for a derived one
+    }
+
+    message Logical {
+        enum Op {
+            OP_UNSPECIFIED = 0;
+            AND = 1;
+            OR = 2;
+        }
+        Op op = 1;
+        repeated Expr args = 2;
+    }
+    message Not {
+        Expr arg = 1;
+    }
+    message IsNullTest {
+        Expr arg = 1;
+        bool negated = 2;
+    }
+    message Comparison {
+        enum Op {
+            OP_UNSPECIFIED = 0;
+            EQ = 1;
+            NE = 2;
+            LT = 3;
+            LE = 4;
+            GT = 5;
+            GE = 6;
+        }
+        Op op = 1;
+        Expr left = 2;
+        Expr right = 3;
+        // The type MySQL resolved the comparison under. The server inserts
+        // casts so DuckDB compares under the same type instead of inferring.
+        ResolvedType compare_as = 4;
+    }
+    message Arithmetic {
+        enum Op {
+            OP_UNSPECIFIED = 0;
+            ADD = 1;
+            SUB = 2;
+            MUL = 3;
+            DIV = 4;
+            MOD = 5;
+        }
+        Op op = 1;
+        Expr left = 2;
+        Expr right = 3;
+        ResolvedType result_as = 4;
+    }
+    message Between {
+        Expr value = 1;
+        Expr low = 2;
+        Expr high = 3;
+        bool negated = 4;
+        ResolvedType compare_as = 5;
+    }
+    message InList {
+        Expr value = 1;
+        repeated Expr list = 2;
+        bool negated = 3;
+    }
+    message CaseWhen {
+        message Branch {
+            Expr when = 1;
+            Expr then = 2;
+        }
+        repeated Branch branches = 1;
+        Expr else_result = 2;
+    }
+    message FunctionCall {
+        enum Fn {
+            FN_UNSPECIFIED = 0;
+            EXTRACT_YEAR = 1;
+            SUBSTRING = 2;
+            ASCII = 3;
+        }
+        Fn fn = 1;
+        repeated Expr args = 2;
+    }
+    message Aggregate {
+        enum Kind {
+            KIND_UNSPECIFIED = 0;
+            COUNT_STAR = 1;
+            COUNT = 2;
+            SUM = 3;
+            AVG = 4;
+            MIN = 5;
+            MAX = 6;
+        }
+        Kind kind = 1;
+        Expr arg = 2; // absent for COUNT_STAR
+        bool distinct = 3;
+    }
+    message LikePred {
+        Expr value = 1;
+        Expr pattern = 2;
+        sint32 escape = 3;
+        bool negated = 4;
+        uint32 collation_id = 5;
+    }
+    message Subquery {
+        enum Kind {
+            KIND_UNSPECIFIED = 0;
+            SCALAR = 1;
+            EXISTS = 2;
+            IN = 3;
+        }
+        Kind kind = 1;
+        QueryBlock query = 2;
+        Expr left = 3; // IN only
+        bool negated = 4;
+    }
+    message CastExpr {
+        Expr arg = 1;
+        ResolvedType to = 2;
+    }
+
+    message Expr {
+        ResolvedType result_type = 1;
+        oneof node {
+            Literal literal = 10;
+            ColumnRef column = 11;
+            Logical logical = 12;
+            Not not = 13;
+            IsNullTest is_null = 14;
+            Comparison comparison = 15;
+            Arithmetic arithmetic = 16;
+            Between between = 17;
+            InList in_list = 18;
+            CaseWhen case_when = 19;
+            FunctionCall function = 20;
+            Aggregate aggregate = 21;
+            LikePred like = 22;
+            Subquery subquery = 23;
+            CastExpr cast = 24;
+        }
+    }
+
+    message BaseTable {
+        uint32 relation_id = 1;
+        uint32 table_desc_index = 2; // into Request.tables
+    }
+    message DerivedTable {
+        uint32 relation_id = 1;
+        QueryBlock query = 2;
+    }
+    message JoinRel {
+        enum Kind {
+            KIND_UNSPECIFIED = 0;
+            INNER = 1;
+            LEFT = 2;
+            CROSS = 3;
+            SEMI = 4;
+            ANTI = 5;
+        }
+        Kind kind = 1;
+        Relation left = 2;
+        Relation right = 3;
+        Expr condition = 4; // absent for CROSS
+    }
+    message Relation {
+        oneof node {
+            BaseTable base = 1;
+            DerivedTable derived = 2;
+            JoinRel join = 3;
+        }
+    }
+
+    message SelectItem {
+        Expr expression = 1;
+    }
+    message OrderKey {
+        Expr expression = 1;
+        bool descending = 2;
+        bool nulls_first = 3;
+    }
+    message QueryBlock {
+        Relation from = 1;
+        repeated SelectItem select = 2;
+        Expr where = 3;
+        repeated Expr group_by = 4;
+        Expr having = 5;
+        repeated OrderKey order_by = 6;
+        bool distinct = 7;
+        optional uint64 limit = 8;  // absent means no LIMIT
+        optional uint64 offset = 9; // absent means no OFFSET
+    }
+
+    // Mirrors pax::FieldType: 0=UNTYPED, 1=INT32,
+    // 2=INT64, 3=DATE, 4=DEC64.
+    message ColumnDesc {
+        uint32 pax_kind = 1;
+        uint32 pax_width = 2;    // PAX cell payload width (bytes)
+        int32 pax_scale = 3;     // DEC64 only
+        // Null bit of the column in the row null-flags field: 0 when the
+        // column is not nullable, else 1 + null byte offset * 8 + bit index.
+        uint32 null_bit = 4;
+    }
+    // The server keeps the PAX schema in its catalog; each request carries
+    // the per-table cell metadata derived from TABLE::field[], and the
+    // server validates it against the store.
+    message TableDesc {
+        string table_name = 1;             // PaxStore lookup key
+                                           // (TABLE_SHARE::normalized_path)
+        repeated ColumnDesc columns = 2;   // TABLE::field[] order
+    }
+
+    message Request {
+        repeated TableDesc tables = 1;
+        QueryBlock root = 2;
+        uint32 expected_output_count = 3;
+    }
+    message Response {
+        bool ok = 1;
+        string error = 2;
+        repeated bytes rows = 3; // proxy row format, DuckDB result order
+    }
+}

@@ -1,7 +1,7 @@
 ---
 # Schema setup and data loading for distributed benchmarks: creates tables on
 # each MySQL node (Helios DDL doesn't sync across nodes) and loads data once
-# into shared LineairDB storage.
+# into shared Helios storage.
 # Usage: ansible-playbook -i inventory.ini benchbase.yml -e "bench_type=tpcc"
 # run_id and machine_spec place load-phase artifacts in the sweep's result
 # dir; load_jstack is opt-in because it pauses the loader JVM.
@@ -9,7 +9,7 @@
 # ── Load-phase samplers: started before any load traffic ────────────────────
 # Passive readers (mpstat, pidstat, /proc/<pid>/status) that write to /tmp and
 # are collected by the final play.
-- hosts: lineairdb:mysql:benchbase
+- hosts: storage:mysql:benchbase
   gather_facts: false
   vars:
     load_sample: true
@@ -42,7 +42,7 @@
         executable: /bin/bash
       when: load_sample | bool
 
-    - name: Start load-phase VmRSS + pidstat sampling for lineairdb-server
+    - name: Start load-phase VmRSS + pidstat sampling for helios-storage
       # VmRSS is read straight from /proc, re-resolving the pid each tick so a
       # server restart is survived.
       shell: |
@@ -51,7 +51,7 @@
         OUT={{ load_sample_dir }}/load-vmrss.log
         : > "$OUT"
         while :; do
-          p=$(pgrep -f '[l]ineairdb-server' | head -1)
+          p=$(pgrep -f '[h]elios-storage' | head -1)
           if [ -n "$p" ] && [ -r "/proc/$p/status" ]; then
             r=$(awk '/^VmRSS:/{print $2}' "/proc/$p/status" 2>/dev/null)
             [ -n "$r" ] && echo "$(date +%s) $r" >> "$OUT"
@@ -62,7 +62,7 @@
         chmod +x {{ load_sample_dir }}/rss_probe.sh
         nohup setsid {{ load_sample_dir }}/rss_probe.sh >/dev/null 2>&1 < /dev/null &
         echo $! > {{ load_sample_dir }}/load-vmrss.pid
-        pid=$(pgrep -f '[l]ineairdb-server' | head -1)
+        pid=$(pgrep -f '[h]elios-storage' | head -1)
         if [ -n "$pid" ]; then
           nohup pidstat -t -u -p "$pid" {{ load_sample_interval }} \
             > {{ load_sample_dir }}/load-threads.log 2>&1 &
@@ -72,7 +72,7 @@
         executable: /bin/bash
       when:
         - load_sample | bool
-        - inventory_hostname in groups.get('lineairdb', [])
+        - inventory_hostname in groups.get('storage', [])
 
     # IPC / LLC counters for the LOAD phase, query + storage nodes only
     - include_tasks: tasks/perf_stat_start.yml
@@ -81,7 +81,7 @@
         perf_stat_label: load
       when:
         - perf_stat | bool
-        - inventory_hostname in groups.get('lineairdb', []) + groups.get('mysql', [])
+        - inventory_hostname in groups.get('storage', []) + groups.get('mysql', [])
 
 - hosts: benchbase
   gather_facts: false
@@ -93,7 +93,7 @@
     _config_dir: ~/helios/bench/config
     # Interface whose ENA queue count bench_aws.py raises at launch
     ena_rss_interface: ens5
-    mysql_engine: lineairdb
+    mysql_engine: helios
     # InnoDB persistent stats are sampled, so a post-load ANALYZE refreshes them;
     # Helios defaults to false and bench_aws.py turns it on for --tx-plan runs
     bench_analyze: "{{ mysql_engine == 'innodb' }}"
@@ -411,7 +411,7 @@
 # ── Stop load-phase samplers and collect them ───────────────────────────────
 # Must run before measure_usage.yml so the load-phase samplers cannot overlap
 # the measurement window.
-- hosts: lineairdb:mysql:benchbase
+- hosts: storage:mysql:benchbase
   gather_facts: false
   vars:
     load_sample: true
@@ -429,7 +429,7 @@
         perf_stat_label: load
       when:
         - perf_stat | bool
-        - inventory_hostname in groups.get('lineairdb', []) + groups.get('mysql', [])
+        - inventory_hostname in groups.get('storage', []) + groups.get('mysql', [])
 
     - name: Stop load-phase samplers
       shell: |

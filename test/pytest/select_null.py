@@ -8,13 +8,13 @@ def selectNull (db, cursor) :
     reset(db, cursor)
     print("NULL SELECT TEST")
     cursor.execute(\
-        'INSERT INTO ha_lineairdb_test.items (\
+        'INSERT INTO ha_helios_test.items (\
             title, content9\
         ) VALUES ("carol", "")'\
     )
     db.commit()
 
-    cursor.execute('SELECT * FROM ha_lineairdb_test.items')
+    cursor.execute('SELECT * FROM ha_helios_test.items')
     rows = cursor.fetchall()
     if not rows :
         print("\tCheck 1 Failed")

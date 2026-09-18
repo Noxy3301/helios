@@ -2,12 +2,12 @@
 
 #include <string>
 
-#include "lineairdb.pb.h"
+#include "helios.pb.h"
 
 class THD;
 struct LEX;
 
-namespace lineairdb_columnar {
+namespace helios_columnar {
 
 /**
  * @brief Builds the duckdb bridge request from MySQL's resolved statement.
@@ -27,7 +27,7 @@ namespace lineairdb_columnar {
  */
 bool BuildDuckdbQueryRequest(
     THD* thd, LEX* lex,
-    LineairDB::Protocol::TxExecuteDuckdbQuery::Request* request,
+    Helios::Protocol::TxExecuteDuckdbQuery::Request* request,
     std::string* why);
 
-}  // namespace lineairdb_columnar
+}  // namespace helios_columnar

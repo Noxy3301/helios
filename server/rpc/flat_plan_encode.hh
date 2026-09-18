@@ -2,9 +2,9 @@
 
 #include <string>
 
-#include "lineairdb.pb.h"
+#include "helios.pb.h"
 
-// Flat binary encoder for TxExecuteReadPlan responses ("LDBFLATP" format).
+// Flat binary encoder for TxExecuteReadPlan responses ("HELIOSRP" format).
 namespace flat_plan {
 
 /**
@@ -14,7 +14,7 @@ namespace flat_plan {
  * read-plan responses do not keep both protobuf rows and the flat payload
  * alive.
  */
-void encode_to_string(LineairDB::Protocol::TxExecuteReadPlan::Response& r,
+void encode_to_string(Helios::Protocol::TxExecuteReadPlan::Response& r,
                       std::string& out);
 
 }  // namespace flat_plan

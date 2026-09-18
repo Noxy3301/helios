@@ -1,4 +1,4 @@
-#include "lineairdb_rpc.hh"
+#include "helios_rpc.hh"
 
 #include <chrono>
 #include <cstdint>
@@ -11,9 +11,9 @@
 #include <vector>
 
 #include "../../common/log.h"
-#include "lineairdb.pb.h"
-#include "lineairdb/pax.h"
-#include "lineairdb/transaction.h"
+#include "helios.pb.h"
+#include "helios/pax.h"
+#include "helios/transaction.h"
 
 // Database-wide RPC handlers for DDL.
 
@@ -65,7 +65,7 @@ bool unpack_watermark(const std::string& row, uint64_t* next) {
     return true;
 }
 
-using DurabilityRpc = LineairDB::Protocol::DbSetCommitDurability;
+using DurabilityRpc = Helios::Protocol::DbSetCommitDurability;
 
 const char* durability_name(helios::storage::CommitDurability mode) {
     switch (mode) {
@@ -164,10 +164,10 @@ bool HiddenKeyAllocator::Allocate(helios::storage::Database& database,
     return true;
 }
 
-void LineairDBRpc::handleDbAllocateHiddenKeys(const std::string& message,
+void HeliosRpc::handleDbAllocateHiddenKeys(const std::string& message,
                                               std::string& result) {
-    LineairDB::Protocol::DbAllocateHiddenKeys::Request request;
-    LineairDB::Protocol::DbAllocateHiddenKeys::Response response;
+    Helios::Protocol::DbAllocateHiddenKeys::Request request;
+    Helios::Protocol::DbAllocateHiddenKeys::Response response;
 
     if (!request.ParseFromString(message)) {
         response.set_ok(false);
@@ -199,10 +199,10 @@ void LineairDBRpc::handleDbAllocateHiddenKeys(const std::string& message,
     result = response.SerializeAsString();
 }
 
-void LineairDBRpc::handleDbSetCommitDurability(const std::string& message,
+void HeliosRpc::handleDbSetCommitDurability(const std::string& message,
                                                std::string& result) {
-    LineairDB::Protocol::DbSetCommitDurability::Request request;
-    LineairDB::Protocol::DbSetCommitDurability::Response response;
+    Helios::Protocol::DbSetCommitDurability::Request request;
+    Helios::Protocol::DbSetCommitDurability::Response response;
 
     if (!request.ParseFromString(message)) {
         response.set_ok(false);
@@ -239,12 +239,12 @@ void LineairDBRpc::handleDbSetCommitDurability(const std::string& message,
     result = response.SerializeAsString();
 }
 
-void LineairDBRpc::handleDbCreateTable(const std::string& message,
+void HeliosRpc::handleDbCreateTable(const std::string& message,
                                        std::string& result) {
     LOG_DEBUG("Handling DbCreateTable");
 
-    LineairDB::Protocol::DbCreateTable::Request request;
-    LineairDB::Protocol::DbCreateTable::Response response;
+    Helios::Protocol::DbCreateTable::Request request;
+    Helios::Protocol::DbCreateTable::Response response;
 
     request.ParseFromString(message);
 
@@ -295,12 +295,12 @@ void LineairDBRpc::handleDbCreateTable(const std::string& message,
     result = response.SerializeAsString();
 }
 
-void LineairDBRpc::handleDbCreateSecondaryIndex(const std::string& message,
+void HeliosRpc::handleDbCreateSecondaryIndex(const std::string& message,
                                                 std::string& result) {
     LOG_DEBUG("Handling DbCreateSecondaryIndex");
 
-    LineairDB::Protocol::DbCreateSecondaryIndex::Request request;
-    LineairDB::Protocol::DbCreateSecondaryIndex::Response response;
+    Helios::Protocol::DbCreateSecondaryIndex::Request request;
+    Helios::Protocol::DbCreateSecondaryIndex::Response response;
 
     request.ParseFromString(message);
 

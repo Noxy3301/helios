@@ -40,7 +40,7 @@ def setup_schema(db, cursor, dbname, engine):
       w_state    CHAR(2) NOT NULL,
       w_zip      CHAR(9) NOT NULL,
       PRIMARY KEY (w_id)
-    ) ENGINE=LineairDB
+    ) ENGINE=Helios
     ''')
 
     cursor.execute(f'''
@@ -57,7 +57,7 @@ def setup_schema(db, cursor, dbname, engine):
       d_state      CHAR(2) NOT NULL,
       d_zip        CHAR(9) NOT NULL,
       PRIMARY KEY (d_w_id, d_id)
-    ) ENGINE=LineairDB
+    ) ENGINE=Helios
     ''')
 
     # Define indexes inside CREATE TABLE (safe in MySQL)
@@ -97,7 +97,7 @@ def setup_schema(db, cursor, dbname, engine):
       i_data  VARCHAR(50) NOT NULL,
       i_im_id INT NOT NULL,
       PRIMARY KEY (i_id)
-    ) ENGINE=LineairDB
+    ) ENGINE=Helios
     ''')
 
     cursor.execute(f'''
@@ -120,7 +120,7 @@ def setup_schema(db, cursor, dbname, engine):
       s_dist_09    CHAR(24) NOT NULL,
       s_dist_10    CHAR(24) NOT NULL,
       PRIMARY KEY (s_w_id, s_i_id)
-    ) ENGINE=LineairDB
+    ) ENGINE=Helios
     ''')
 
     cursor.execute(f'''
@@ -135,7 +135,7 @@ def setup_schema(db, cursor, dbname, engine):
       o_entry_d    DATETIME NULL,
       PRIMARY KEY (o_w_id, o_d_id, o_id),
       UNIQUE (o_w_id, o_d_id, o_c_id, o_id)
-    ) ENGINE=LineairDB
+    ) ENGINE=Helios
     ''')
 
     cursor.execute(f'''
@@ -144,7 +144,7 @@ def setup_schema(db, cursor, dbname, engine):
       no_d_id INT NOT NULL,
       no_o_id INT NOT NULL,
       PRIMARY KEY (no_w_id, no_d_id, no_o_id)
-    ) ENGINE=LineairDB
+    ) ENGINE=Helios
     ''')
 
     cursor.execute(f'''
@@ -160,7 +160,7 @@ def setup_schema(db, cursor, dbname, engine):
       ol_quantity    DECIMAL(2,0) NOT NULL,
       ol_dist_info   CHAR(24) NOT NULL,
       PRIMARY KEY (ol_w_id, ol_d_id, ol_o_id, ol_number)
-    ) ENGINE=LineairDB
+    ) ENGINE=Helios
     ''')
 
     cursor.execute(f'''
@@ -173,7 +173,7 @@ def setup_schema(db, cursor, dbname, engine):
       h_date   DATETIME NULL,
       h_amount DECIMAL(6,2) NOT NULL,
       h_data   VARCHAR(24) NOT NULL
-    ) ENGINE=LineairDB
+    ) ENGINE=Helios
     ''')
     db.commit()
     return 0
@@ -184,8 +184,8 @@ def main():
     parser.add_argument('--port', type=int, default=3306)
     parser.add_argument('--user', type=str, default='root')
     parser.add_argument('--password', type=str, default='')
-    parser.add_argument('--dbname', type=str, default='ha_lineairdb_test')
-    parser.add_argument('--engine', type=str, default='LineairDB', help='Storage engine (LineairDB/InnoDB/...)')
+    parser.add_argument('--dbname', type=str, default='ha_helios_test')
+    parser.add_argument('--engine', type=str, default='Helios', help='Storage engine (Helios/InnoDB/...)')
     parser.add_argument('--ol_cnt', type=int, default=10, help='Order lines count for New-Order test')
     args = parser.parse_args()
 

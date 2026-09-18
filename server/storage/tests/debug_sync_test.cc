@@ -189,7 +189,7 @@ TEST_F(DebugSyncTest, MalformedActivationsAreFailures) {
   for (const char *action : malformed) {
     Arm(variable, action);
     EXPECT_DEATH(HELIOS_DEBUG_SYNC("test.malformed"),
-                 "LineairDB debug sync point")
+                 "Helios debug sync point")
         << "action: " << action;
   }
 }

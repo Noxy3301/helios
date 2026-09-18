@@ -10,9 +10,9 @@
 #include <thread>
 #include <vector>
 
-#include "lineairdb/config.h"
-#include "lineairdb/database.h"
-#include "lineairdb/read.h"
+#include "helios/config.h"
+#include "helios/database.h"
+#include "helios/read.h"
 
 #include "db_helper.h"
 #include "gtest/gtest.h"

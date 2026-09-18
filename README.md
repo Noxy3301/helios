@@ -33,7 +33,7 @@ cd helios
 # Terminal 1: Start Helios Server
 ./scripts/start_server.sh
 
-# Terminal 2: Start MySQL (auto-initializes data directory and installs LineairDB plugin)
+# Terminal 2: Start MySQL (auto-initializes data directory and installs Helios plugin)
 ./scripts/start_mysql.sh --mysqld-port 3307 --server-host 127.0.0.1 --server-port 9999
 ```
 
@@ -44,14 +44,14 @@ cd helios
 ```
 
 ```sql
-DROP DATABASE IF EXISTS lineairdb_test;
-CREATE DATABASE lineairdb_test;
-USE lineairdb_test;
+DROP DATABASE IF EXISTS helios_test;
+CREATE DATABASE helios_test;
+USE helios_test;
 
 CREATE TABLE test (
     id INT PRIMARY KEY,
     name VARCHAR(20)
-) ENGINE=LINEAIRDB;
+) ENGINE=HELIOS;
 
 INSERT INTO test VALUES (1, 'hello');
 INSERT INTO test VALUES (2, 'world');

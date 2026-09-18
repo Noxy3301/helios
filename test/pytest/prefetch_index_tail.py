@@ -7,7 +7,7 @@ import mysql.connector
 from utils.connection import get_connection
 
 
-DBNAME = f"ha_lineairdb_index_tail_{int(time.time())}"
+DBNAME = f"ha_helios_index_tail_{int(time.time())}"
 
 # The staged tail window is INDEX_CURSOR_READ_AHEAD_SIZE (1024) rows; use a
 # table larger than one window so window-boundary behavior is exercised.
@@ -24,7 +24,7 @@ def reset(cursor, db):
 
 
 def load_rows(cursor, db, n):
-    # DROP TABLE / DROP DATABASE do not purge LineairDB storage rows (known
+    # DROP TABLE / DROP DATABASE do not purge Helios storage rows (known
     # upstream bug): a same-name recreate still sees the old rows. Use a fresh
     # table name per load so shrinking loads are not masked.
     global _table_seq
@@ -32,7 +32,7 @@ def load_rows(cursor, db, n):
     name = f"t{_table_seq}"
     cursor.execute(
         f"CREATE TABLE {name} (id INT NOT NULL PRIMARY KEY, v INT NOT NULL) "
-        "ENGINE=LineairDB"
+        "ENGINE=Helios"
     )
     batch = []
     for i in range(1, n + 1):
@@ -48,12 +48,12 @@ def load_rows(cursor, db, n):
 
 def read_path_plan(cursor):
     # Statement-scoped autogen: plan read path, no @_tx_plan.
-    cursor.execute("SET GLOBAL lineairdb_read_path='plan'")
+    cursor.execute("SET GLOBAL helios_read_path='plan'")
     cursor.execute("SET @_tx_plan=NULL")
 
 
 def read_path_row(cursor):
-    cursor.execute("SET GLOBAL lineairdb_read_path='row'")
+    cursor.execute("SET GLOBAL helios_read_path='row'")
 
 
 def recover(cursor):
@@ -250,7 +250,7 @@ def main():
     try:
         db2 = get_connection(user=args.user, password=args.password)
         c2 = db2.cursor()
-        c2.execute("SET GLOBAL lineairdb_read_path='plan'")
+        c2.execute("SET GLOBAL helios_read_path='plan'")
         c2.execute(f"DROP DATABASE IF EXISTS {DBNAME}")
         db2.commit()
         db2.close()

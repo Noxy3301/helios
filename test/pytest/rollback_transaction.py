@@ -16,7 +16,7 @@ def tx2_expect_no_row () :
 
     print("\ttx2 SELECT")
     try:
-        cursor.execute('SELECT title, content FROM ha_lineairdb_test.items')
+        cursor.execute('SELECT title, content FROM ha_helios_test.items')
         rows = cursor.fetchall()
     finally:
         isThread2Precommit.set()
@@ -35,7 +35,7 @@ def transaction (db, cursor) :
 
     print("\ttx1 INSERT")
     cursor.execute(\
-        'INSERT INTO ha_lineairdb_test.items (\
+        'INSERT INTO ha_helios_test.items (\
             title, content\
         ) VALUES ("alice", "alice meets bob")'\
     )

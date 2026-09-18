@@ -1,6 +1,6 @@
 #pragma once
 
-#include "lineairdb.pb.h"
+#include "helios.pb.h"
 
 namespace helios::storage {
 class Database;
@@ -20,8 +20,8 @@ namespace duckdb_bridge {
  */
 void ExecuteDuckdbQuery(
     helios::storage::Database* db,
-    const LineairDB::Protocol::TxExecuteDuckdbQuery::Request& request,
-    LineairDB::Protocol::TxExecuteDuckdbQuery::Response* response);
+    const Helios::Protocol::TxExecuteDuckdbQuery::Request& request,
+    Helios::Protocol::TxExecuteDuckdbQuery::Response* response);
 
 /**
  * @brief Reads HELIOS_BRIDGE_THREADS and HELIOS_BRIDGE_MEM_LIMIT into the
