@@ -77,7 +77,7 @@ struct WalIo {
 
 /**
  * @brief The single write-ahead log: one file of epoch frames, written by
- * one flusher.
+ * one logger.
  *
  * @details
  * Frames are written in place, at an offset the instance tracks, into a
@@ -103,7 +103,7 @@ struct WalIo {
  * which refuses them rather than skipping them.
  *
  * @note An exclusive flock keeps out a second process; it does not make a
- * second flusher inside this process defined.
+ * second logger inside this process defined.
  */
 class Wal {
  public:

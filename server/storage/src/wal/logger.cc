@@ -19,7 +19,7 @@
 /**
  * @file server/storage/src/wal/logger.cc
  * The write-ahead log and the durable epoch a synchronous commit waits on.
- * Folds the checkpoint and the log tail into the entries recovery replays.
+ * Applies the checkpoint and the log tail to the entries recovery replays.
  */
 
 #include "wal/logger.h"
@@ -47,10 +47,10 @@ namespace wal {
 namespace {
 
 /**
- * @brief Folds one more field's hash into a seed.
+ * @brief Mixes one more field's hash into a seed.
  * @note The constant is `2^32` divided by the golden ratio, boost's
  * hash_combine mixer; with the shifts it spreads each field's bits before
- * the fold.
+ * they meet the seed.
  */
 size_t HashCombine(size_t seed, size_t value) {
   constexpr size_t kGoldenRatioMix = 0x9e3779b9u;
@@ -135,7 +135,7 @@ bool IsSecondary(const Write &write) { return !write.index_name.empty(); }
 // Keep the newest delta per (secondary key, primary key). A full entry
 // arrives as one add per primary key it holds. On an equal transaction id
 // the later record wins, on both paths.
-void FoldSecondary(const Write &write, SecondaryOps &ops) {
+void ApplySecondary(const Write &write, SecondaryOps &ops) {
   const auto op = write.secondary_op;
   if (op == SecondaryIndexOp::kFull) {
     for (const auto &pk : write.primary_keys) {
@@ -157,11 +157,11 @@ void FoldSecondary(const Write &write, SecondaryOps &ops) {
   }
 }
 
-// Keep the newest version per row. Folded through a position map rather than
-// a rescan of the entries: the fold runs once per logged write, and a linear
-// rescan makes recovery quadratic in the log size.
-void FoldPrimary(const Write &write, LogEntries &recovery_entries,
-                 PrimaryPos &positions) {
+// Keep the newest version per row. Applied through a position map rather
+// than a rescan of the entries: this runs once per logged write, and a
+// linear rescan makes recovery quadratic in the log size.
+void ApplyPrimary(const Write &write, LogEntries &recovery_entries,
+                  PrimaryPos &positions) {
   const auto it = positions.find({write.table_name, write.key});
   if (it != positions.end()) {
     auto &item = recovery_entries[it->second];
@@ -220,14 +220,14 @@ void GroupSecondary(const SecondaryOps &ops, LogEntries &recovery_entries) {
 }
 
 /**
- * @brief Folds log records into the entries the database replays.
+ * @brief Applies log records to the entries the database replays.
  *
  * A key may appear in several epochs; the newest transaction id wins. Secondary
  * index entries arrive as per-primary-key deltas and are regrouped into one
  * entry per secondary key.
  *
- * The checkpoint is folded in ahead of the log's tail as ordinary
- * records, under the same rule that resolves two epochs of the log.
+ * The checkpoint is applied ahead of the log's tail as ordinary records,
+ * under the same rule that resolves two epochs of the log.
  */
 LogEntries BuildRecoveryEntries(const LogRecords &checkpoint,
                                 const LogRecords &tail) {
@@ -240,9 +240,9 @@ LogEntries BuildRecoveryEntries(const LogRecords &checkpoint,
     for (const auto &log_record : *source) {
       for (const auto &write : log_record.writes) {
         if (IsSecondary(write)) {
-          FoldSecondary(write, secondary_latest);
+          ApplySecondary(write, secondary_latest);
         } else {
-          FoldPrimary(write, recovery_entries, primary_position);
+          ApplyPrimary(write, recovery_entries, primary_position);
         }
       }
     }
@@ -264,7 +264,7 @@ Logger::Logger(const Config &config, WalIo io)
 Logger::~Logger() { Stop(); }
 
 void Logger::Enqueue(LogRecord record) {
-  // Append to this thread's buffer; the worker collects it later.
+  // Append to this thread's buffer; the logger thread collects it later.
   auto *buffer = buffers_.Get();
   std::lock_guard<std::mutex> lock(buffer->mutex);
   buffer->records.emplace_back(std::move(record));
@@ -323,8 +323,8 @@ Logger::RecoveryResult Logger::Recover() {
 }
 
 void Logger::Start() {
-  assert(!worker_.joinable());
-  worker_ = std::thread(&Logger::Worker, this);
+  assert(!logger_thread_.joinable());
+  logger_thread_ = std::thread(&Logger::LoggerThread, this);
 }
 
 void Logger::RequestFlush(EpochNumber max_epoch) {
@@ -332,7 +332,7 @@ void Logger::RequestFlush(EpochNumber max_epoch) {
   const bool traced = trace.Enabled();
   const int64_t close_enter = traced ? FlushTrace::Now() : 0;
 
-  // Raise the requested flush limit before waking the worker.
+  // Raise the requested flush limit before waking the logger thread.
   {
     std::lock_guard<std::mutex> lock(work_mutex_);
     if (stop_requested_) return;
@@ -344,13 +344,14 @@ void Logger::RequestFlush(EpochNumber max_epoch) {
 }
 
 void Logger::Stop() {
-  // Let the worker finish closed epochs before releasing its WAL and buffers.
+  // Let the logger thread finish closed epochs before releasing its WAL and
+  // buffers.
   {
     std::lock_guard<std::mutex> lock(work_mutex_);
     stop_requested_ = true;
   }
   work_cv_.notify_all();
-  if (worker_.joinable()) worker_.join();
+  if (logger_thread_.joinable()) logger_thread_.join();
   PublishStopped();
 }
 
@@ -432,14 +433,14 @@ Logger::WaitResult Logger::WaitUntilDurable(EpochNumber commit_epoch,
   return state_ == State::kStopped ? WaitResult::kStopped : WaitResult::kFailed;
 }
 
-void Logger::WaitEpochDiff(epoch::Framework &epoch) {
+void Logger::WaitMaxLag(epoch::Framework &epoch) {
   assert(epoch.ThreadEpoch() == epoch::Framework::kThreadOffline);
   // D before E: D only grows, and a pass then held when E was read.
   const auto within = [&] {
     const EpochNumber durable_epoch = GetDurableEpoch();
     const EpochNumber global_epoch = epoch.GetGlobalEpoch();
-    return global_epoch <= kEpochDiff ||
-           durable_epoch >= global_epoch - kEpochDiff;
+    return global_epoch <= kMaxLagEpochs ||
+           durable_epoch >= global_epoch - kMaxLagEpochs;
   };
   if (within()) return;
   std::unique_lock<std::mutex> lock(durability_mutex_);
@@ -514,7 +515,7 @@ WalAppendResult Logger::FlushThrough(EpochNumber target) {
   return result;
 }
 
-void Logger::Worker() {
+void Logger::LoggerThread() {
   for (;;) {
     // Wait for a flush request, or finish draining on shutdown.
     EpochNumber target = 0;
@@ -535,11 +536,11 @@ void Logger::Worker() {
     try {
       result = FlushThrough(target);
     } catch (const std::exception &e) {
-      SPDLOG_CRITICAL("Durability Error: the logger worker threw: {0}",
+      SPDLOG_CRITICAL("Durability Error: the logger thread threw: {0}",
                       e.what());
       result = {false, EIO};
     } catch (...) {
-      SPDLOG_CRITICAL("Durability Error: the logger worker threw");
+      SPDLOG_CRITICAL("Durability Error: the logger thread threw");
       result = {false, EIO};
     }
 

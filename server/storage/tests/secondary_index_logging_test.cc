@@ -68,7 +68,7 @@ size_t GetLogDirectorySize(const helios::storage::Config &conf) {
  * @brief Reads the log's newest epoch.
  *
  * The caller must have destroyed the Database first: scanning opens the log and
- * truncates an incomplete tail, which would corrupt a log the flusher is still
+ * truncates an incomplete tail, which would corrupt a log the logger is still
  * appending to.
  */
 SecondaryLogStats GetSecondaryIndexLogStatsForLatestEpoch(
@@ -194,7 +194,7 @@ TEST_F(SecondaryIndexLoggingTest,
   }
 
   // Close the database before reading the log: the destructor drains the
-  // flusher, and scanning a log that is still being appended to would truncate
+  // logger, and scanning a log that is still being appended to would truncate
   // a frame in flight.
   db_.reset(nullptr);
 

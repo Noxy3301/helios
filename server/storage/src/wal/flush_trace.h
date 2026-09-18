@@ -62,7 +62,7 @@ class FlushTrace {
    *
    * A group that fails produces no row. A group that carries nothing to write
    * does produce one, with `write_begin` through `sync_end` left at zero,
-   * because the flusher still publishes the target it was given; an analysis
+   * because the logger still publishes the target it was given; an analysis
    * that reads write or sync durations has to drop those rows.
    *
    * The interval between `pack_end` and `write_begin` holds the capacity
@@ -106,7 +106,7 @@ class FlushTrace {
   };
 
   /**
-   * @brief One epoch handed to the flusher as closed.
+   * @brief One epoch handed to the logger as closed.
    */
   struct CloseRow {
     EpochNumber closed;
@@ -132,7 +132,7 @@ class FlushTrace {
         .count();
   }
 
-  // --- Group census. Called by the flusher thread only. ---
+  // --- Group census. Called by the logger thread only. ---
 
   void GroupCollectBegin(EpochNumber durable_before) {
     if (!enabled_) return;
@@ -183,7 +183,7 @@ class FlushTrace {
     }
   }
 
-  // --- Epoch closure. Called by the epoch framework's writer thread only. ---
+  // Epoch closure. Called by the epoch framework's thread only.
 
   void EpochClosed(EpochNumber closed, int64_t enter, int64_t exit) {
     if (!enabled_) return;
@@ -261,7 +261,7 @@ class FlushTrace {
   }
 
  private:
-  // One row per group. The flusher wakes once per closed epoch, so a 1 ms
+  // One row per group. The logger wakes once per closed epoch, so a 1 ms
   // epoch produces about a thousand rows a second for the life of the
   // process. A million rows covers a thousand seconds.
   static constexpr size_t kGroupCapacity = 1048576;

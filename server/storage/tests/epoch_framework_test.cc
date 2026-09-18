@@ -1,6 +1,6 @@
 /**
  * @file server/storage/tests/epoch_framework_test.cc
- * The epoch writer's lifetime around Start() and destruction.
+ * The epoch thread's lifetime around Start() and destruction.
  */
 
 #include "util/epoch_framework.h"
@@ -24,7 +24,7 @@ void DestroyUnstarted(std::promise<void> done) {
 
 }  // namespace
 
-// The constructor parks the writer on the start signal, so a framework that
+// The constructor parks the epoch thread on the start signal, so a framework that
 // is never started still has a thread for the destructor to wake and join.
 // The thread is detached because a destructor that does not return would
 // otherwise hang this test instead of failing it.

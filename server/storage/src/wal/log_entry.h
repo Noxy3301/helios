@@ -48,7 +48,7 @@ enum class SecondaryIndexOp : uint8_t {
  *
  * @details An empty `index_name` marks a primary row, whose payload is
  * `value`; otherwise the entry belongs to that secondary index and carries
- * the final `primary_keys` list the fold produced. Values and lists are
+ * the final `primary_keys` list recovery produced. Values and lists are
  * owned.
  */
 struct LogEntry {

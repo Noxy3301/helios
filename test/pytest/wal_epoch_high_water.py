@@ -105,7 +105,7 @@ def expect_refusal(label, frontier, extra_env):
         print(f"FAIL [{label}]: the server exited cleanly (rc=0) instead of "
               f"failing startup")
         return False
-    # Distinguishes a startup refusal from the epoch writer's later abort, which
+    # Distinguishes a startup refusal from the epoch thread's later abort, which
     # is what happens if the bound is put on the frontier instead of on the
     # epoch that startup resumes at.
     if "high-water mark" not in output:
@@ -160,7 +160,7 @@ def main():
     ok &= expect_refusal("at the mark, recovery off", HIGH_WATER, off)
     ok &= expect_refusal("at the mark, recovery on", HIGH_WATER, on)
     # One below the mark still has to be refused: resuming above it lands exactly
-    # on the mark, which the epoch writer cannot advance past.
+    # on the mark, which the epoch thread cannot advance past.
     ok &= expect_refusal("one below the mark, recovery off", HIGH_WATER - 1, off)
     ok &= expect_refusal("one below the mark, recovery on", HIGH_WATER - 1, on)
     # The scanner accepts UINT32_MAX by design, so the refusal has to be written

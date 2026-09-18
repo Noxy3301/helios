@@ -38,7 +38,7 @@ class Logger;
  *
  * The scan starts after a barrier, so every commit at or below the start epoch
  * is already in memory; rows committed during the scan may be captured too, and
- * recovery resolves that mixture by folding the checkpoint under the log's own
+ * recovery resolves that mixture by applying the checkpoint under the log's own
  * newest-transaction-id-wins rule and replaying everything above the start
  * epoch. Each row's copy is torn-free under the read path's version protocol,
  * and the checkpoint is published only once the log covers every epoch the scan

@@ -63,12 +63,12 @@ class Framework {
       : start_(false),
         stop_(false),
         global_epoch_(1),
-        epoch_writer_([=]() { EpochWriterJob(epoch_duration_ms); }) {}
+        epoch_thread_([=]() { EpochThreadJob(epoch_duration_ms); }) {}
   /**
-   * @brief Starts the epoch writer, parked until Start().
+   * @brief Starts the epoch thread, parked until Start().
    *
-   * @param epoch_duration_ms Writer poll period.
-   * @param hook Invoked on the writer thread after each successful advance,
+   * @param epoch_duration_ms Epoch thread poll period.
+   * @param hook Invoked on the epoch thread after each successful advance,
    * with the new global epoch. May be empty.
    */
   Framework(size_t epoch_duration_ms, std::function<void(EpochNumber)> &&hook)
@@ -76,7 +76,7 @@ class Framework {
         stop_(false),
         global_epoch_(1),
         epoch_hook_(std::move(hook)),
-        epoch_writer_([=]() { EpochWriterJob(epoch_duration_ms); }) {}
+        epoch_thread_([=]() { EpochThreadJob(epoch_duration_ms); }) {}
 
   ~Framework() { Stop(); }
 
@@ -99,7 +99,7 @@ class Framework {
   /**
    * @brief Overwrites this thread's already-online slot.
    *
-   * @details Valid only before #Start(), where the epoch writer has not begun
+   * @details Valid only before #Start(), where the epoch thread has not begun
    * scanning slots.
    */
   void SetThreadEpoch(const EpochNumber epoch) {
@@ -116,14 +116,14 @@ class Framework {
    * @details The caller must not enqueue log records, and must not take its
    * commit epoch, before this returns.
    *
-   * Once this returns worker epoch `e_w`, global epoch `E` cannot reach `e_w + 2`
-   * while the slot still reads `e_w`: only one writer scan that missed the
-   * publication can be outstanding, and the next one reads `e_w`. This assumes
-   * `e_w` stays clear of wraparound: the epoch writer stops at #kEpochHighWater
-   * rather than wrapping, and a counter seeded at or past the mark before
-   * #Start() fail-stops on the writer's first eligible advance. A thread
-   * still inside the loop carries no such guarantee, which is why the
-   * contract above exists.
+   * Once this returns worker epoch `e_w`, global epoch `E` cannot reach
+   * `e_w + 2` while the slot still reads `e_w`: only one epoch thread scan that
+   * missed the publication can be outstanding, and the next one reads `e_w`.
+   * This assumes `e_w` stays clear of wraparound: the epoch thread stops at
+   * #kEpochHighWater rather than wrapping, and a counter seeded at or past the
+   * mark before #Start() fail-stops on the epoch thread's first eligible
+   * advance. A thread still inside the loop carries no such guarantee, which is
+   * why the contract above exists.
    */
   EpochNumber Join() {
     std::atomic<EpochNumber> *my_epoch = ThreadSlot();
@@ -135,7 +135,7 @@ class Framework {
       const EpochNumber reloaded =
           global_epoch_.load(std::memory_order_seq_cst);
       if (reloaded == published) return published;
-      // A single store does not suffice: two consecutive writer scans can
+      // A single store does not suffice: two consecutive epoch thread scans can
       // read the slot before the store lands, and the advances they gate
       // leave this thread online two epochs behind. Republish until the
       // reload agrees.
@@ -185,7 +185,7 @@ class Framework {
   // meaning.
   static constexpr EpochNumber kEpochHighWater = UINT32_MAX - (1u << 20);
 
-  // Asks the epoch writer to run its advance check now instead of at the
+  // Asks the epoch thread to run its advance check at once instead of at the
   // next tick. The advance condition itself is unchanged. No-op at or
   // above the high-water mark.
   void RequestEpochAdvance() {
@@ -194,7 +194,7 @@ class Framework {
       std::lock_guard<std::mutex> lk(epoch_mutex_);
       advance_requested_.store(true);
     }
-    worker_cv_.notify_one();
+    epoch_thread_cv_.notify_one();
   }
 
   // Blocks the kThreadOffline caller until it observes `global_epoch >= target`.
@@ -217,7 +217,7 @@ class Framework {
       if (global_epoch_.load() >= target) return true;
       if (stop_.load()) return false;
       advance_requested_.store(true);
-      worker_cv_.notify_one();
+      epoch_thread_cv_.notify_one();
       if (epoch_cv_.wait_until(lk, deadline) == std::cv_status::timeout) {
         return global_epoch_.load() >= target;
       }
@@ -237,8 +237,8 @@ class Framework {
       stop_.store(true);
     }
     epoch_cv_.notify_all();
-    worker_cv_.notify_all();
-    if (epoch_writer_.joinable()) epoch_writer_.join();
+    epoch_thread_cv_.notify_all();
+    if (epoch_thread_.joinable()) epoch_thread_.join();
   }
 
  private:
@@ -266,7 +266,7 @@ class Framework {
     return min_epoch;
   }
 
-  void EpochWriterJob(size_t epoch_duration_ms) {
+  void EpochThreadJob(size_t epoch_duration_ms) {
     const auto epoch_duration =
         std::chrono::duration_cast<std::chrono::nanoseconds>(
             std::chrono::milliseconds(epoch_duration_ms));
@@ -285,10 +285,10 @@ class Framework {
         // cadence while draining still-online threads
         std::this_thread::sleep_for(epoch_duration);
       } else {
-        // Forced requests wake the writer early; the advance condition
+        // Forced requests wake the epoch thread early; the advance condition
         // below still gates
         std::unique_lock<std::mutex> lk(epoch_mutex_);
-        forced_wake = worker_cv_.wait_for(lk, epoch_duration, [&] {
+        forced_wake = epoch_thread_cv_.wait_for(lk, epoch_duration, [&] {
           return advance_requested_.load() || stop_.load();
         });
         advance_requested_.store(false);
@@ -334,11 +334,11 @@ class Framework {
   std::atomic<EpochNumber> global_epoch_;
   std::mutex epoch_mutex_;
   std::condition_variable epoch_cv_;
-  std::condition_variable worker_cv_;
+  std::condition_variable epoch_thread_cv_;
   const std::function<void(EpochNumber)> epoch_hook_;
   // Started by the constructor but parked on epoch_cv_ until Start(), so it
   // cannot reach thread_epochs_ before that member is constructed.
-  std::thread epoch_writer_;
+  std::thread epoch_thread_;
   // `e_w`: the epoch published by each participating worker.
   ThreadKeyStorage<std::atomic<EpochNumber>> thread_epochs_;
 };

@@ -47,7 +47,7 @@ constexpr unsigned kSpinAttempts = 64;
 constexpr unsigned kRetryRounds = 200;
 constexpr auto kRetryPause = std::chrono::milliseconds(25);
 // The durable epoch advances once per epoch, so a wait beyond this means the
-// flusher is not running rather than that the epoch is slow.
+// logger is not running rather than that the epoch is slow.
 constexpr auto kDurabilityWait = std::chrono::seconds(60);
 
 // Checkpoint header fields, in bytes from the start of the file. The magic word
@@ -238,7 +238,7 @@ EpochScanCheckpoint::CaptureResult EpochScanCheckpoint::CaptureSecondaryEntry(
       continue;
     }
     if (observed.absent) return EpochScanCheckpoint::CaptureResult::kSkipped;
-    auto primary_keys = std::atomic_load(&item.primary_keys_);
+    auto primary_keys = std::atomic_load(&item.primary_keys);
     if (item.transaction_id.load() != observed) {
       ++retries;
       continue;

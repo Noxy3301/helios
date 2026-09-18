@@ -66,7 +66,7 @@ class MasstreeIndex final {
 };
 
 /**
- * @brief Advances Masstree's epoch from the storage epoch ticker.
+ * @brief Advances Masstree's epoch from the storage epoch thread.
  */
 void MasstreeAdvanceEpoch();
 

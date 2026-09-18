@@ -56,19 +56,19 @@ struct DataItem {
   // Readers take `absent` from this word; the committer sets it from IsLive()
   // at publish.
   std::atomic<Tidword> transaction_id;
-  std::shared_ptr<const PrimaryKeyList> primary_keys_;
+  std::shared_ptr<const PrimaryKeyList> primary_keys;
 
   size_t size() const { return size_; }
   bool IsLive() const {
     if (size_ != 0) return true;
-    const auto primary_keys = std::atomic_load(&primary_keys_);
-    return primary_keys && primary_keys->count != 0;
+    const auto keys = std::atomic_load(&primary_keys);
+    return keys && keys->count != 0;
   }
 
-  void SetPrimaryKeys(const std::vector<std::string> &primary_keys) {
-    assert(IsSortedDeduped(primary_keys));
-    auto packed = PrimaryKeyList::FromSortedDeduped(primary_keys);
-    std::atomic_store(&primary_keys_, std::move(packed));
+  void SetPrimaryKeys(const std::vector<std::string> &keys) {
+    assert(IsSortedDeduped(keys));
+    auto packed = PrimaryKeyList::FromSortedDeduped(keys);
+    std::atomic_store(&primary_keys, std::move(packed));
   }
 
   DataItem() : transaction_id(Tidword::Absent()) {}
@@ -78,7 +78,7 @@ struct DataItem {
 
   DataItem(DataItem &&rhs) noexcept
       : transaction_id(rhs.transaction_id.load()),
-        primary_keys_(std::move(rhs.primary_keys_)),
+        primary_keys(std::move(rhs.primary_keys)),
         group_(std::exchange(rhs.group_, nullptr)),
         slot_(std::exchange(rhs.slot_, 0)),
         size_(std::exchange(rhs.size_, 0)) {}
@@ -88,7 +88,7 @@ struct DataItem {
     group_ = std::exchange(rhs.group_, nullptr);
     slot_ = std::exchange(rhs.slot_, 0);
     size_ = std::exchange(rhs.size_, 0);
-    std::atomic_store(&primary_keys_, std::move(rhs.primary_keys_));
+    std::atomic_store(&primary_keys, std::move(rhs.primary_keys));
     return *this;
   }
 
@@ -136,19 +136,19 @@ struct DataItem {
 
   void InsertPrimaryKey(const std::byte *key, size_t len) {
     const std::string_view new_key(reinterpret_cast<const char *>(key), len);
-    auto current = std::atomic_load(&primary_keys_);
+    auto current = std::atomic_load(&primary_keys);
     auto next = PrimaryKeyList::Insert(current, new_key);
     if (next != current) {
-      std::atomic_store(&primary_keys_, std::move(next));
+      std::atomic_store(&primary_keys, std::move(next));
     }
   }
 
   void DeletePrimaryKey(const std::byte *key, size_t len) {
     std::string_view target(reinterpret_cast<const char *>(key), len);
-    auto current = std::atomic_load(&primary_keys_);
+    auto current = std::atomic_load(&primary_keys);
     auto next = PrimaryKeyList::Delete(current, target);
     if (next != current) {
-      std::atomic_store(&primary_keys_, std::move(next));
+      std::atomic_store(&primary_keys, std::move(next));
     }
   }
 

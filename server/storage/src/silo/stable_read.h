@@ -95,7 +95,7 @@ inline StablePrimaryKeys StableReadKeys(const DataItem &item) {
   for (;;) {
     const Tidword tid = StableTid(item);
     // Keep this immutable list alive even if a writer replaces it.
-    auto primary_keys = std::atomic_load(&item.primary_keys_);
+    auto primary_keys = std::atomic_load(&item.primary_keys);
     const bool found = !tid.absent;
 
     if (item.transaction_id.load() == tid) {
