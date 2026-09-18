@@ -472,7 +472,7 @@ WalScanResult Wal::Scan(EpochNumber min_epoch) {
       Crc32c crc;
       crc.Update(boundary_header, kCrcCoverage);
       crc.Update(payload.data(), payload.size());
-      if (crc.Finish() != GetLe32(boundary_header + kCrcCoverage)) {
+      if (crc.Finish() != GetLe32(boundary_header + kOffCrc)) {
         retry_full_scan = true;
       }
     }
@@ -510,7 +510,7 @@ WalScanResult Wal::Scan(EpochNumber min_epoch) {
     const uint16_t flags = GetLe16(header + kOffFlags);
     const uint32_t payload_size = GetLe32(header + kOffPayloadSize);
     const EpochNumber epoch = GetLe32(header + kOffEpoch);
-    const uint32_t stored_crc = GetLe32(header + kCrcCoverage);
+    const uint32_t stored_crc = GetLe32(header + kOffCrc);
 
     if (magic != kMagic) {
       stop_reason = "frame magic mismatch";
