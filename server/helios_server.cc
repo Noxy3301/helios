@@ -16,8 +16,7 @@ void HeliosServer::init() {
     }
 
     SPDLOG_INFO("Helios server initialized successfully on port {}, boot token {}",
-             static_cast<unsigned>(config().server_port),
-             static_cast<unsigned long long>(storage_boot_token()));
+             static_cast<unsigned>(config().server_port), hidden_keys_->boot_token);
 }
 
 void HeliosServer::handle_client(int client_socket) {

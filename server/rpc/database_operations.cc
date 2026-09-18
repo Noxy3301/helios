@@ -1,12 +1,10 @@
 #include "helios_rpc.hh"
 
-#include <chrono>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <mutex>
-#include <random>
 #include <string>
 #include <vector>
 
@@ -24,26 +22,6 @@ namespace {
 constexpr char kWatermarkTable[] = "__helios_hidden_keys";
 
 }  // namespace
-
-uint64_t storage_boot_token() {
-    // Startup nanoseconds with the low bits replaced by entropy: restarts are
-    // milliseconds apart, so the token strictly increases across runs. A clock
-    // stepped back onto a bucket a past run used could repeat a token.
-    constexpr int kEntropyBits  = 16;  // ~65 us, far below a restart
-    constexpr uint64_t kLowMask = (1ull << kEntropyBits) - 1;
-
-    static const uint64_t token = []() -> uint64_t {
-        const uint64_t started = static_cast<uint64_t>(
-            std::chrono::duration_cast<std::chrono::nanoseconds>(
-                std::chrono::system_clock::now().time_since_epoch())
-                .count());
-        std::random_device source;
-        const uint64_t value =
-            (started & ~kLowMask) | (static_cast<uint64_t>(source()) & kLowMask);
-        return value == 0 ? 1 : value;  // zero means "no token" to the plugin
-    }();
-    return token;
-}
 
 namespace {
 
@@ -186,7 +164,7 @@ void HeliosRpc::handleDbAllocateHiddenKeys(const std::string& message,
                                             request.count(), &first_id, &error,
                                             &permanent);
     response.set_ok(ok);
-    response.set_boot_token(storage_boot_token());
+    response.set_boot_token(hidden_keys_->boot_token);
     if (ok) {
         response.set_first_id(first_id);
     } else {
