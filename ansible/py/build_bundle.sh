@@ -4,8 +4,7 @@
 # the nodes carry no toolchain. Usage: build_bundle.sh [out.tar.gz]; HELIOS_ROOT
 # overrides the repository location. The archive extracts to ~/helios. No
 # patchelf: the start scripts get an injected LD_LIBRARY_PATH and keep their
-# jemalloc LD_PRELOAD. The server carries the build machine's -march=native ISA;
-# for an older CPU run scripts/build_portable.sh and copy its binary into build/server/.
+# jemalloc LD_PRELOAD. The server carries the build machine's -march=native ISA.
 
 set -euo pipefail
 
