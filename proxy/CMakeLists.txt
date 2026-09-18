@@ -48,7 +48,7 @@ set(HELIOS_SOURCES ha_helios.cc ha_helios.hh
                       helios_field.cc helios_field.hh
                       helios_transaction.cc helios_transaction.hh
                       helios_proxy.cc helios_proxy.hh
-                      helios_keyenc.cc helios_keyenc.hh
+                      key_pack.cc key_pack.hh
                       row_codec.cc
                       helios_index_search.cc helios_index_search.hh
                       helios_prefetch.cc helios_prefetch.hh

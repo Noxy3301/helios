@@ -1,6 +1,6 @@
 #include "helios_transaction.hh"
 #include "storage/helios/ha_helios.hh"
-#include "helios_keyenc.hh"
+#include "key_pack.hh"
 #include "../common/log.h"
 #include "sql/sql_lex.h"
 #include "sql/table.h"
@@ -38,8 +38,8 @@ inline std::string index_scope_key(const std::string& table,
 // Exclusive upper bound of a prefix range, or the sentinel when the prefix is
 // all 0xff and has no successor.
 std::string prefix_range_end(const std::string& prefix) {
-  std::string end = helios_keyenc::build_prefix_range_end(prefix);
-  if (end.empty()) return helios_keyenc::scan_end_sentinel();
+  std::string end = key_pack::build_prefix_range_end(prefix);
+  if (end.empty()) return key_pack::scan_end_sentinel();
   return end;
 }
 
@@ -577,7 +577,7 @@ HeliosTransaction::get_matching_keys_and_values_in_range(std::string start_key,
   if (table_is_not_chosen()) return {};
   // An empty end is not a range the server answers; real encoded keys begin
   // with a null marker and sort below the sentinel.
-  if (end_key.empty()) end_key = helios_keyenc::scan_end_sentinel();
+  if (end_key.empty()) end_key = key_pack::scan_end_sentinel();
 
   if (auto cached = lookup_range_scan_cache(
           db_table_key, start_key, end_key, reverse_scan, row_limit,
@@ -668,7 +668,7 @@ HeliosTransaction::get_matching_primary_keys_in_range(std::string index_name,
                                                          uint64_t row_limit,
                                                          bool reverse_scan) {
   if (table_is_not_chosen()) return {};
-  if (end_key.empty()) end_key = helios_keyenc::scan_end_sentinel();
+  if (end_key.empty()) end_key = key_pack::scan_end_sentinel();
 
   auto cached = lookup_secondary_scan_cache(
       db_table_key, index_name, start_key, end_key, reverse_scan, row_limit);
@@ -786,7 +786,7 @@ HeliosTransaction::fetch_secondary_batch_below(
   if (table_is_not_chosen()) return std::nullopt;
 
   const std::string effective_end =
-      end_key.empty() ? helios_keyenc::scan_end_sentinel() : end_key;
+      end_key.empty() ? key_pack::scan_end_sentinel() : end_key;
 
   // A reverse scan puts the highest secondary key first, so batch_entries
   // entries hold the top of the range. The lowest group in them may be cut

@@ -10,7 +10,7 @@
 #include <utility>
 #include <vector>
 
-#include "helios_keyenc.hh"
+#include "key_pack.hh"
 #include "my_dbug.h"
 #include "sql/field.h"
 #include "sql/key.h"
@@ -459,7 +459,7 @@ ha_rows ha_helios::records_in_range(uint inx, key_range *min_key,
           double lo = 0.0;
           double hi = static_cast<double>(hist.cum.back());
           if (min_key != nullptr) {
-            std::string encoded = helios_keyenc::encode_key(
+            std::string encoded = key_pack::pack_key(
                 table, inx, min_key->key, kLeadingPart);
             if (encoded.empty())
               enc_ok = false;
@@ -467,7 +467,7 @@ ha_rows ha_helios::records_in_range(uint inx, key_range *min_key,
               lo = rank_le(encoded);
           }
           if (enc_ok && max_key != nullptr) {
-            std::string encoded = helios_keyenc::encode_key(
+            std::string encoded = key_pack::pack_key(
                 table, inx, max_key->key, kLeadingPart);
             if (encoded.empty())
               enc_ok = false;

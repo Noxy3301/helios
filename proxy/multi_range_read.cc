@@ -106,7 +106,7 @@ int ha_helios::multi_range_read_init(RANGE_SEQ_IF *seq, void *seq_init_param,
                                  mode | HA_MRR_USE_DEFAULT_IMPL, buf);
     }
     batch_keys.push_back(
-        encode_key(range.start_key.key, range.start_key.keypart_map));
+        pack_key(range.start_key.key, range.start_key.keypart_map));
     range_infos.push_back(range.ptr);
   }
 

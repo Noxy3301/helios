@@ -244,7 +244,7 @@ private:
                                  const std::string &secondary_key,
                                  const std::string &primary_key);
   std::string write_buffer_;
-  HeliosField row_codec_;
+  HeliosField field_pack_;
   MEM_ROOT blobroot;
 
   // State for buffer fetching
@@ -682,10 +682,10 @@ private:
                   bool duplicate_is_conflict = false);
 
   // Key conversion helpers
-  static std::string encode_int_key(const uchar *data, size_t len);
+  static std::string pack_int_key(const uchar *data, size_t len);
   static std::string encode_datetime_key(const uchar *data, size_t len,
                                           enum_field_types mysql_type);
-  static std::string encode_string_key(const uchar *data, size_t len);
+  static std::string pack_string_key(const uchar *data, size_t len);
 
   static unsigned char key_part_type_tag(HeliosFieldType type);
   static void append_key_part_encoding(std::string &out, bool is_null,
@@ -733,7 +733,7 @@ private:
   // batch read into secondary_index_payloads_.
   void batch_fetch_secondary_payloads(HeliosTransaction *tx);
 
-  std::string encode_key(const uchar *key, key_part_map keypart_map);
+  std::string pack_key(const uchar *key, key_part_map keypart_map);
   /**
    * @brief Serializes the field's current value in the order-preserving key
    * encoding (null marker, type tag, payload) shared by every key path.

@@ -48,7 +48,7 @@
 #include <strings.h>
 
 #include "helios_field_types.h"
-#include "helios_keyenc.hh"
+#include "key_pack.hh"
 #include "helios_prefetch.hh"
 #include "helios.pb.h"
 #include "my_dbug.h"

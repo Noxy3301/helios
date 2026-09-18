@@ -16,7 +16,7 @@
 
 #include "helios_autogen.hh"
 #include "helios_field_types.h"
-#include "helios_keyenc.hh"
+#include "key_pack.hh"
 #include "helios_prefetch.hh"
 #include "helios.pb.h"
 #include "my_base.h"
@@ -546,7 +546,7 @@ int maybe_prefetch_for_index_tail(THD *thd, HeliosTransaction *tx,
   step.is_scan = true;
   step.reverse_scan = true;
   step.scan_limit = window_rows;
-  step.end_key_prefix = helios_keyenc::scan_end_sentinel();
+  step.end_key_prefix = key_pack::scan_end_sentinel();
 
   std::vector<HeliosProxy::ReadPlanStep> steps;
   steps.push_back(std::move(step));

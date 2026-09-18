@@ -1,8 +1,8 @@
-// helios_keyenc.hh
-// Helios Storage Engine: shared index key / range encoding.
+// key_pack.hh
+// Helios Storage Engine: shared index key / range packing.
 
-#ifndef HELIOS_KEYENC_HH
-#define HELIOS_KEYENC_HH
+#ifndef HELIOS_KEY_PACK_HH
+#define HELIOS_KEY_PACK_HH
 
 #include <cstddef>
 #include <string>
@@ -23,12 +23,12 @@ constexpr unsigned char kKeyTypeString = 0x20;
 constexpr unsigned char kKeyTypeDatetime = 0x30;
 constexpr unsigned char kKeyTypeOther = 0xF0;
 
-namespace helios_keyenc {
+namespace key_pack {
 
-std::string encode_int_key(const uchar *data, size_t len);
+std::string pack_int_key(const uchar *data, size_t len);
 std::string encode_datetime_key(const uchar *data, size_t len,
                                 enum_field_types mysql_type);
-std::string encode_string_key(const uchar *data, size_t len);
+std::string pack_string_key(const uchar *data, size_t len);
 
 unsigned char key_part_type_tag(HeliosFieldType type);
 void append_key_part_encoding(std::string &out, bool is_null,
@@ -45,9 +45,9 @@ inline std::string scan_end_sentinel() {
   return std::string(kScanEndSentinelSize, '\xff');
 }
 
-std::string encode_key(TABLE *table, uint key_index, const uchar *key,
+std::string pack_key(TABLE *table, uint key_index, const uchar *key,
                        key_part_map keypart_map);
 
-}  // namespace helios_keyenc
+}  // namespace key_pack
 
-#endif // HELIOS_KEYENC_HH
+#endif // HELIOS_KEY_PACK_HH

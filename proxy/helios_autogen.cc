@@ -10,7 +10,7 @@
 #include <utility>
 #include <vector>
 
-#include "helios_keyenc.hh"
+#include "key_pack.hh"
 #include "my_base.h"
 #include "my_sys.h"
 #include "mysqld_error.h"
@@ -427,7 +427,7 @@ bool compile_index_range_scan(AccessPath *leaf, TABLE *table,
   if (range->flag & NO_MIN_RANGE) {
     step->key_prefix.clear();
   } else {
-    step->key_prefix = helios_keyenc::encode_key(
+    step->key_prefix = key_pack::pack_key(
         table, range_scan.index, range->min_key, range->min_keypart_map);
     if (range->min_keypart_map != 0 && step->key_prefix.empty()) {
       if (reason != nullptr) *reason = "failed to encode range start key";
@@ -440,9 +440,9 @@ bool compile_index_range_scan(AccessPath *leaf, TABLE *table,
   }
 
   if (range->flag & NO_MAX_RANGE) {
-    step->end_key_prefix = helios_keyenc::scan_end_sentinel();
+    step->end_key_prefix = key_pack::scan_end_sentinel();
   } else {
-    step->end_key_prefix = helios_keyenc::encode_key(
+    step->end_key_prefix = key_pack::pack_key(
         table, range_scan.index, range->max_key, range->max_keypart_map);
     if (range->max_keypart_map != 0 && step->end_key_prefix.empty()) {
       if (reason != nullptr) *reason = "failed to encode range end key";
@@ -450,7 +450,7 @@ bool compile_index_range_scan(AccessPath *leaf, TABLE *table,
     }
     if (!(range->flag & NEAR_MAX)) {
       step->end_key_prefix =
-          helios_keyenc::build_prefix_range_end(step->end_key_prefix);
+          key_pack::build_prefix_range_end(step->end_key_prefix);
     }
   }
 
@@ -554,7 +554,7 @@ bool compile_ref_lookup(
     step->for_each = false;
     step->is_scan = true;
     step->key_prefix.clear();
-    step->end_key_prefix = helios_keyenc::scan_end_sentinel();
+    step->end_key_prefix = key_pack::scan_end_sentinel();
     if (ref->key == static_cast<int>(table->s->primary_key)) {
       step->index_name.clear();
     } else {
@@ -696,7 +696,7 @@ bool compile_ref_lookup(
 
   if (leading_constant_parts > 0) {
     step->key_prefix =
-        helios_keyenc::encode_key(table, ref->key, ref->key_buff,
+        key_pack::pack_key(table, ref->key, ref->key_buff,
                                   first_n_keyparts_map(leading_constant_parts));
     if (step->key_prefix.empty()) {
       if (reason != nullptr) *reason = "failed to encode constant key prefix";
@@ -732,7 +732,7 @@ bool compile_ref_lookup(
     return !step->table_name.empty();
   }
 
-  step->key_prefix = helios_keyenc::encode_key(
+  step->key_prefix = key_pack::pack_key(
       table, ref->key, ref->key_buff, first_n_keyparts_map(used_key_parts));
   if (step->key_prefix.empty()) {
     if (reason != nullptr) *reason = "failed to encode constant key";
@@ -744,7 +744,7 @@ bool compile_ref_lookup(
   } else {
     step->is_scan = true;
     step->end_key_prefix =
-        helios_keyenc::build_prefix_range_end(step->key_prefix);
+        key_pack::build_prefix_range_end(step->key_prefix);
     if (!child_primary) step->index_name = key.name;
   }
 
@@ -799,7 +799,7 @@ bool compile_leaf(AccessPath *leaf,
          full_scan_index == static_cast<int>(table->s->primary_key));
     step->is_scan = true;
     step->key_prefix.clear();
-    step->end_key_prefix = helios_keyenc::scan_end_sentinel();
+    step->end_key_prefix = key_pack::scan_end_sentinel();
     if (!primary_order) {
       // Full secondary INDEX_SCAN: stage the secondary range itself. Runtime
       // index_first/index_next consumes it, then base rows come from row cache.
@@ -846,7 +846,7 @@ bool compile_index_search(TABLE *table, uint index,
     step->is_scan = true;
     step->key_prefix = start;
     step->end_key_prefix =
-        end.empty() ? helios_keyenc::scan_end_sentinel() : end;
+        end.empty() ? key_pack::scan_end_sentinel() : end;
     if (!is_primary) step->index_name = table->key_info[index].name;
   };
 
@@ -861,7 +861,7 @@ bool compile_index_search(TABLE *table, uint index,
         step->key_prefix = search.start_key_serialized;
       } else {
         set_scan(search.start_key_serialized,
-                 helios_keyenc::build_prefix_range_end(
+                 key_pack::build_prefix_range_end(
                      search.start_key_serialized));
       }
       return true;
@@ -1017,7 +1017,7 @@ bool compile_unqualified_count(
   }
   step.is_scan = true;
   step.key_prefix.clear();
-  step.end_key_prefix = helios_keyenc::scan_end_sentinel();
+  step.end_key_prefix = key_pack::scan_end_sentinel();
   step.index_name = std::move(index_name);
   (*table_steps)[table] = static_cast<int>(steps->size());
   added_tables->push_back(table);

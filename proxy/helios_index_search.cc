@@ -18,7 +18,7 @@
 
 #include "helios_field_types.h"
 #include "helios_index_search.hh"
-#include "helios_keyenc.hh"
+#include "key_pack.hh"
 #include "helios.pb.h"
 #include "my_dbug.h"
 #include "mysql/plugin.h"
@@ -261,7 +261,7 @@ void ha_helios::build_search_plan(const uchar *key, key_part_map keypart_map,
 
   // 4. Serialize boundaries
   if (key != nullptr) {
-    current_plan_.start_key_serialized = encode_key(key, keypart_map);
+    current_plan_.start_key_serialized = pack_key(key, keypart_map);
 
     // same group boundary (prefix operations)
     if (current_plan_.op == IndexSearchOp::kSameKeyMaterialize ||
@@ -277,7 +277,7 @@ void ha_helios::build_search_plan(const uchar *key, key_part_map keypart_map,
   // end_range processing
   if (end_range != nullptr) {
     current_plan_.end_key_serialized =
-        encode_key(end_range->key, end_range->keypart_map);
+        pack_key(end_range->key, end_range->keypart_map);
 
     if (end_range->flag != HA_READ_BEFORE_KEY) {
       // SQL inclusive upper bound must become Helios's exclusive upper
@@ -313,7 +313,7 @@ int ha_helios::execute_plan(uchar *buf, HeliosTransaction *tx) {
 int ha_helios::execute_index_first(uchar *buf, HeliosTransaction *tx) {
   std::string start_key = "";
   std::string end_key = current_plan_.end_key_serialized.empty()
-                            ? helios_keyenc::scan_end_sentinel()
+                            ? key_pack::scan_end_sentinel()
                             : current_plan_.end_key_serialized;
 
   if (current_plan_.is_primary && !statement_uses_read_plan(ha_thd())) {
