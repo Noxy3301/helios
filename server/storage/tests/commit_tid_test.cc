@@ -77,7 +77,7 @@ class CommitTidTest : public ::testing::Test {
     logger_ = std::make_unique<wal::Logger>(config_);
     ASSERT_EQ(wal::Logger::RecoveryStatus::kOk, logger_->Recover().status);
     logger_->Start();
-    // Leave the ticker parked so tests control epoch boundaries exactly.
+    // Leave the epoch thread parked so tests control epoch boundaries exactly.
     SetEpoch(10);
   }
 
@@ -216,9 +216,9 @@ TEST_F(CommitTidTest, CommitJoinsTheEpochAfterItsLocksAreHeld) {
 
 TEST_F(CommitTidTest, CommitWithWritesWaitsForTheDurableEpoch) {
   auto *item = SeedRow("key", Version(10, 5));
-  // A raw move puts E exactly kEpochDiff + 1 epochs ahead of D.
+  // A raw move puts E exactly kMaxLagEpochs + 1 epochs ahead of D.
   const EpochNumber durable = logger_->GetDurableEpoch();
-  epoch_.SetGlobalEpoch(durable + wal::Logger::kEpochDiff + 1);
+  epoch_.SetGlobalEpoch(durable + wal::Logger::kMaxLagEpochs + 1);
 
   // The sleep gives the commit time to reach the wait; the durable epoch it
   // sees on return shows it completed only once the flush closed the lag.
@@ -240,7 +240,7 @@ TEST_F(CommitTidTest, CommitWithWritesWaitsForTheDurableEpoch) {
   EXPECT_EQ(TestHelper::Row("next"), item->CopyValue());
 
   // A read-only commit runs at a lag above the bound without waiting.
-  epoch_.SetGlobalEpoch(logger_->GetDurableEpoch() + wal::Logger::kEpochDiff +
+  epoch_.SetGlobalEpoch(logger_->GetDurableEpoch() + wal::Logger::kMaxLagEpochs +
                         1);
   EXPECT_TRUE(Commit({{kTable, "key", item->transaction_id.load().obj}}, {}))
       << reason_;

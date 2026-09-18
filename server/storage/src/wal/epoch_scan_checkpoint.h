@@ -38,7 +38,7 @@ class Logger;
  *
  * The scan starts after a barrier, so every commit at or below the start epoch
  * is already in memory; rows committed during the scan may be captured too, and
- * recovery resolves that mixture by folding the checkpoint under the log's own
+ * recovery resolves that mixture by applying the checkpoint under the log's own
  * newest-transaction-id-wins rule and replaying everything above the start
  * epoch. Each row's copy is torn-free under the read path's version protocol,
  * and the checkpoint is published only once the log covers every epoch the scan
@@ -119,10 +119,13 @@ class EpochScanCheckpoint {
    * @brief Reads the published checkpoint of `work_dir`, if there is a usable
    * one.
    * @param[in] work_dir The directory the database logs into.
-   * @return The file's status and, when Ok, the records and epoch bounds it
-   * held.
+   * @param[in] load_records Whether to unpack the records. False validates
+   * the file and returns the epoch bounds alone, for a start that replays
+   * nothing.
+   * @return The file's status and, when Ok, the epoch bounds it held and the
+   * records when they were asked for.
    */
-  static LoadResult Load(const std::string &work_dir);
+  static LoadResult Load(const std::string &work_dir, bool load_records = true);
 
   /**
    * @brief Name of the published checkpoint inside the working directory.

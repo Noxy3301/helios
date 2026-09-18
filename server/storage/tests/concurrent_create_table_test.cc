@@ -52,7 +52,7 @@ TEST_F(ConcurrentCreateTableTest, ConcurrentCreateTableAcrossEpochs) {
   constexpr size_t kNumWorkers = 4;
   constexpr size_t kNumTables = 100;
   constexpr size_t kYieldInterval = 128;
-  // Long enough for the epoch writer to tick across the race.
+  // Long enough for the epoch thread to advance across the race.
   constexpr size_t kNumEpochs = 3;
 
   std::atomic<bool> stop{false};

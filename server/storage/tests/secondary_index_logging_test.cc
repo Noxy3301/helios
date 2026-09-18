@@ -68,7 +68,7 @@ size_t GetLogDirectorySize(const helios::storage::Config &conf) {
  * @brief Reads the log's newest epoch.
  *
  * The caller must have destroyed the Database first: scanning opens the log and
- * truncates an incomplete tail, which would corrupt a log the flusher is still
+ * truncates an incomplete tail, which would corrupt a log the logger is still
  * appending to.
  */
 SecondaryLogStats GetSecondaryIndexLogStatsForLatestEpoch(
@@ -194,7 +194,7 @@ TEST_F(SecondaryIndexLoggingTest,
   }
 
   // Close the database before reading the log: the destructor drains the
-  // flusher, and scanning a log that is still being appended to would truncate
+  // logger, and scanning a log that is still being appended to would truncate
   // a frame in flight.
   db_.reset(nullptr);
 
@@ -233,6 +233,29 @@ TEST_F(SecondaryIndexLoggingTest, RecoveryKeepsLastSecondaryDeltaWithSameTid) {
             TestHelper::ReadIndex(*db_, "users", "idx", "drop"));
   EXPECT_EQ(std::vector<std::string>({"a"}),
             TestHelper::ReadIndex(*db_, "users", "idx", "keep"));
+}
+
+// The operation tells a delta from a full list, not the length of the primary
+// key it names.
+TEST_F(SecondaryIndexLoggingTest, RecoveryKeepsADeltaForAnEmptyPrimaryKey) {
+  ASSERT_TRUE(db_->CreateSecondaryIndex(
+      "users", "idx", helios::storage::IndexConstraint::kNone));
+  ASSERT_TRUE(TestHelper::CommitWrites(*db_, {{"users", "", "value"}},
+                                       {{"users", "idx", "k", "", false}}));
+  EXPECT_EQ(std::vector<std::string>({""}),
+            TestHelper::ReadIndex(*db_, "users", "idx", "k"));
+
+  db_.reset();
+  db_ = std::make_unique<helios::storage::Database>(config_);
+  EXPECT_EQ(std::vector<std::string>({""}),
+            TestHelper::ReadIndex(*db_, "users", "idx", "k"));
+
+  // A dropped delete would bring the key back after the restart.
+  ASSERT_TRUE(TestHelper::CommitWrites(*db_, {{"users", "", "value"}},
+                                       {{"users", "idx", "k", "", true}}));
+  db_.reset();
+  db_ = std::make_unique<helios::storage::Database>(config_);
+  EXPECT_TRUE(TestHelper::ReadIndex(*db_, "users", "idx", "k").empty());
 }
 
 TEST_F(SecondaryIndexLoggingTest, RecoveryWithSecondaryIndexWithoutCheckpoint) {

@@ -45,7 +45,7 @@ class UniqueSecondaryIndexTest : public ::testing::Test {
   void TearDown() override { std::filesystem::remove_all(config_.work_dir); }
 };
 
-TEST_F(UniqueSecondaryIndexTest, DictUniqueFlagRejectsDuplicateSecondaryKey) {
+TEST_F(UniqueSecondaryIndexTest, UniqueIndexRejectsDuplicateSecondaryKey) {
   config_.work_dir = "./helios_unique_secondary_index_test_logs";
   std::filesystem::remove_all(config_.work_dir);
   config_.enable_recovery = false;

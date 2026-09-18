@@ -5,10 +5,10 @@ Two properties are checked, both of which a unit test cannot reach because both
 are about what a client is told and when:
 
   1. Ordering. A Sync commit is acknowledged after its log reaches the device,
-     never before. The proof stops the flusher immediately before it calls
+     never before. The proof stops the logger immediately before it calls
      fdatasync: while it is parked there, the INSERT that is waiting for that
-     flush must not have returned, and it must return once the flusher is
-     released. A sleep would only widen a window; parking the flusher
+     flush must not have returned, and it must return once the logger is
+     released. A sleep would only widen a window; parking the logger
      establishes the order.
 
   2. Survival. Every row whose INSERT returned under Sync is present after the
@@ -118,7 +118,7 @@ def drain_arrivals(arrived_r, release_w):
     """Releases every sync point already waiting.
 
     Startup and DDL commit their own records, and each of those flushes stops
-    at the point too. Releasing them first leaves the flusher idle, so the next
+    at the point too. Releasing them first leaves the logger idle, so the next
     arrival is the one this test caused.
     """
     released = 0
@@ -228,7 +228,7 @@ def test_acknowledgement_follows_the_fdatasync(work_dir):
         log("PASS")
         return 0
     finally:
-        # Order matters: the flusher may be parked at the point, and shutdown
+        # Order matters: the logger may be parked at the point, and shutdown
         # drains it.
         try:
             drain_arrivals(arrived_r, release_w)

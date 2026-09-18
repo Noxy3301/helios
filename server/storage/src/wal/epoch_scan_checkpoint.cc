@@ -47,7 +47,7 @@ constexpr unsigned kSpinAttempts = 64;
 constexpr unsigned kRetryRounds = 200;
 constexpr auto kRetryPause = std::chrono::milliseconds(25);
 // The durable epoch advances once per epoch, so a wait beyond this means the
-// flusher is not running rather than that the epoch is slow.
+// logger is not running rather than that the epoch is slow.
 constexpr auto kDurabilityWait = std::chrono::seconds(60);
 
 // Checkpoint header fields, in bytes from the start of the file. The magic word
@@ -238,7 +238,7 @@ EpochScanCheckpoint::CaptureResult EpochScanCheckpoint::CaptureSecondaryEntry(
       continue;
     }
     if (observed.absent) return EpochScanCheckpoint::CaptureResult::kSkipped;
-    auto primary_keys = std::atomic_load(&item.primary_keys_);
+    auto primary_keys = std::atomic_load(&item.primary_keys);
     if (item.transaction_id.load() != observed) {
       ++retries;
       continue;
@@ -579,7 +579,7 @@ bool EpochScanCheckpoint::Publish(const LogRecords &records, Stats &stats) {
 }
 
 EpochScanCheckpoint::LoadResult EpochScanCheckpoint::Load(
-    const std::string &work_dir) {
+    const std::string &work_dir, const bool load_records) {
   LoadResult checkpoint;
   const std::string path =
       (std::filesystem::path(work_dir) / CheckpointFileName()).string();
@@ -644,13 +644,15 @@ EpochScanCheckpoint::LoadResult EpochScanCheckpoint::Load(
       return unusable("the checkpoint checksum does not hold");
     }
 
-    size_t consumed = 0;
-    auto handle =
-        msgpack::unpack(reinterpret_cast<const char *>(payload.data()),
-                        payload.size(), consumed);
-    handle.get().convert(checkpoint.records);
-    if (consumed != payload.size()) {
-      return unusable("the checkpoint payload has trailing bytes");
+    if (load_records) {
+      size_t consumed = 0;
+      auto handle =
+          msgpack::unpack(reinterpret_cast<const char *>(payload.data()),
+                          payload.size(), consumed);
+      handle.get().convert(checkpoint.records);
+      if (consumed != payload.size()) {
+        return unusable("the checkpoint payload has trailing bytes");
+      }
     }
   } catch (const std::exception &e) {
     return unusable(std::string("the checkpoint payload does not unpack: ") +

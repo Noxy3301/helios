@@ -34,16 +34,6 @@ using helios::storage::wal::WalIo;
 
 constexpr auto kTestTimeout = std::chrono::seconds(5);
 
-// The epoch writer parks until Start(), and the destructor joins it, on
-// every exit.
-struct Joiner {
-  helios::storage::epoch::Framework &framework;
-  ~Joiner() {
-    framework.Start();
-    framework.Stop();
-  }
-};
-
 // Exercises the logger without constructing a Database: the WAL and the
 // durable epoch are the units under test here, and a Database would
 // drag in the epoch framework.
@@ -100,49 +90,47 @@ TEST_F(LoggerDurabilityTest, AlreadyDurableReturnsImmediately) {
   logger.Stop();
 }
 
-TEST_F(LoggerDurabilityTest, WaitEpochDiffReturnsWhenTheDurableEpochIsClose) {
+TEST_F(LoggerDurabilityTest, WaitMaxLagReturnsWhenTheDurableEpochIsClose) {
   Logger logger(config_);
   ASSERT_EQ(logger.Recover().status, Logger::RecoveryStatus::kOk);
   logger.Start();
-  // The ticker stays parked; SetGlobalEpoch moves E by hand.
+  // The epoch thread stays parked; SetGlobalEpoch moves E by hand.
   helios::storage::epoch::Framework framework;
-  Joiner joiner{framework};
 
   // An epoch below the bound is the guard against unsigned underflow.
   framework.SetGlobalEpoch(1);
-  logger.WaitEpochDiff(framework);
+  logger.WaitMaxLag(framework);
 
   // D is 0 and the lag equals the bound: nothing is waited for.
-  framework.SetGlobalEpoch(Logger::kEpochDiff);
-  logger.WaitEpochDiff(framework);
+  framework.SetGlobalEpoch(Logger::kMaxLagEpochs);
+  logger.WaitMaxLag(framework);
 
   logger.RequestFlush(5);
   ASSERT_EQ(logger.WaitUntilDurable(5, Logger::Deadline::max()),
             Logger::WaitResult::kDurable);
-  framework.SetGlobalEpoch(5 + Logger::kEpochDiff);
-  logger.WaitEpochDiff(framework);
+  framework.SetGlobalEpoch(5 + Logger::kMaxLagEpochs);
+  logger.WaitMaxLag(framework);
 
   logger.Stop();
   // A stopped logger ends the wait, as it does in WaitUntilDurable.
   framework.SetGlobalEpoch(1000);
-  logger.WaitEpochDiff(framework);
+  logger.WaitMaxLag(framework);
 }
 
-TEST_F(LoggerDurabilityTest, WaitEpochDiffFollowsTheGlobalEpochWhileWaiting) {
+TEST_F(LoggerDurabilityTest, WaitMaxLagFollowsTheGlobalEpochWhileWaiting) {
   Logger logger(config_);
   ASSERT_EQ(logger.Recover().status, Logger::RecoveryStatus::kOk);
   logger.Start();
-  // The ticker stays parked; SetGlobalEpoch moves E by hand.
+  // The epoch thread stays parked; SetGlobalEpoch moves E by hand.
   helios::storage::epoch::Framework framework;
-  Joiner joiner{framework};
 
   // D is 0 and the lag is one epoch over the bound.
-  framework.SetGlobalEpoch(Logger::kEpochDiff + 1);
+  framework.SetGlobalEpoch(Logger::kMaxLagEpochs + 1);
   std::atomic<bool> entered{false};
   std::atomic<EpochNumber> durable_at_return{0};
   std::thread waiter([&] {
     entered = true;
-    logger.WaitEpochDiff(framework);
+    logger.WaitMaxLag(framework);
     durable_at_return = logger.GetDurableEpoch();
   });
 
@@ -152,7 +140,7 @@ TEST_F(LoggerDurabilityTest, WaitEpochDiffFollowsTheGlobalEpochWhileWaiting) {
 
   // The floor the waiter entered on no longer releases it: D reaches 1 while
   // the bound now asks for 3.
-  framework.SetGlobalEpoch(Logger::kEpochDiff + 3);
+  framework.SetGlobalEpoch(Logger::kMaxLagEpochs + 3);
   logger.RequestFlush(1);
   ASSERT_EQ(logger.WaitUntilDurable(1, Logger::Deadline::max()),
             Logger::WaitResult::kDurable);
@@ -163,22 +151,21 @@ TEST_F(LoggerDurabilityTest, WaitEpochDiffFollowsTheGlobalEpochWhileWaiting) {
   logger.Stop();
 }
 
-TEST_F(LoggerDurabilityTest, WaitEpochDiffEndsWhenTheLoggerStops) {
+TEST_F(LoggerDurabilityTest, WaitMaxLagEndsWhenTheLoggerStops) {
   Logger logger(config_);
   ASSERT_EQ(logger.Recover().status, Logger::RecoveryStatus::kOk);
   logger.Start();
-  // The ticker stays parked; SetGlobalEpoch moves E by hand.
+  // The epoch thread stays parked; SetGlobalEpoch moves E by hand.
   helios::storage::epoch::Framework framework;
-  Joiner joiner{framework};
 
   // D is 0 and the lag is one epoch over the bound: the waiter blocks.
-  framework.SetGlobalEpoch(Logger::kEpochDiff + 1);
-  std::thread waiter([&] { logger.WaitEpochDiff(framework); });
+  framework.SetGlobalEpoch(Logger::kMaxLagEpochs + 1);
+  std::thread waiter([&] { logger.WaitMaxLag(framework); });
   logger.Stop();
   waiter.join();
 
   // A later wait on a stopped logger does not block either.
-  logger.WaitEpochDiff(framework);
+  logger.WaitMaxLag(framework);
 }
 
 TEST_F(LoggerDurabilityTest, WaitersWakeAtEpochGranularity) {
@@ -189,9 +176,13 @@ TEST_F(LoggerDurabilityTest, WaitersWakeAtEpochGranularity) {
   logger.Enqueue(MakePrimaryRecord("alice", 5));
   logger.Enqueue(MakePrimaryRecord("bob", 7));
 
+  // A waiter on another thread takes a deadline: an unbounded one would turn
+  // a failed assertion below into a test that never ends, because the
+  // future's destructor joins it.
   auto spawn_waiter = [&logger](EpochNumber epoch) {
     return std::async(std::launch::async, [&logger, epoch] {
-      return logger.WaitUntilDurable(epoch, Logger::Deadline::max());
+      return logger.WaitUntilDurable(
+          epoch, std::chrono::steady_clock::now() + kTestTimeout);
     });
   };
   auto first = spawn_waiter(5);
@@ -237,7 +228,7 @@ TEST_F(LoggerDurabilityTest, SyncReportFollowsTheFdatasync) {
   std::atomic<bool> committer_started{false};
   std::future<void> committer;
 
-  // Releases a held fdatasync and drains the logger worker on every exit:
+  // Releases a held fdatasync and drains the logger thread on every exit:
   // an assertion failure would otherwise leave the committer waiting forever,
   // and the future's destructor would block before ~Logger could wake it.
   // Declared after the future so unwinding runs the guard first; the drain
@@ -332,7 +323,8 @@ TEST_F(LoggerDurabilityTest, ArmedFailStopEndsTheProcessOnFdatasyncFailure) {
     return -1;
   };
 
-  // A worker started in the parent would not survive the death-test fork.
+  // A logger thread started in the parent would not survive the death-test
+  // fork.
   // Create and arm the logger in the child, as Database does before Start.
   EXPECT_EXIT(
       {
@@ -383,10 +375,12 @@ TEST_F(LoggerDurabilityTest, StopWakesEveryWaiter) {
   logger.Start();
 
   auto first = std::async(std::launch::async, [&logger] {
-    return logger.WaitUntilDurable(11, Logger::Deadline::max());
+    return logger.WaitUntilDurable(
+        11, std::chrono::steady_clock::now() + kTestTimeout);
   });
   auto second = std::async(std::launch::async, [&logger] {
-    return logger.WaitUntilDurable(12, Logger::Deadline::max());
+    return logger.WaitUntilDurable(
+        12, std::chrono::steady_clock::now() + kTestTimeout);
   });
   // Both are inside the wait, rather than merely started, when the stop
   // arrives: neither epoch is durable, so neither may be ready.
@@ -416,7 +410,8 @@ TEST_F(LoggerDurabilityTest,
 
   logger.Enqueue(MakePrimaryRecord("alice", 3));
   auto waiting = std::async(std::launch::async, [&logger] {
-    return logger.WaitUntilDurable(3, Logger::Deadline::max());
+    return logger.WaitUntilDurable(
+        3, std::chrono::steady_clock::now() + kTestTimeout);
   });
   ASSERT_EQ(waiting.wait_for(std::chrono::milliseconds(50)),
             std::future_status::timeout);

@@ -148,17 +148,15 @@ Database::~Database() noexcept {
 const Config &Database::GetConfig() const noexcept { return config_; }
 
 std::function<void(EpochNumber)> Database::MakeEpochHook() {
-  // The epoch writer calls this with the global epoch it just published.
+  // The epoch thread calls this with the global epoch it just published.
   return [this](const EpochNumber global_epoch) {
     // Workers lag E by at most one epoch, so none remain in epochs <= E - 2.
-    // Flushing and reclamation have different roles but currently share this bound.
-    // Commit epochs are positive, so E - 2 must be at least 1.
+    // Flushing and reclamation have different roles but currently share this
+    // bound. Commit epochs are positive, so E - 2 must be at least 1.
     if (global_epoch >= 3) {
-      const EpochNumber flush_epoch = global_epoch - 2;
-      logger_.RequestFlush(flush_epoch);
-
-      const EpochNumber reclamation_epoch = global_epoch - 2;
-      reaper_.Purge(reclamation_epoch);
+      const EpochNumber closed_epoch = global_epoch - 2;
+      logger_.RequestFlush(closed_epoch);
+      reaper_.Purge(closed_epoch);
     }
 
     // Tick masstree's globalepoch so RCU can free retired leaves and
@@ -246,7 +244,7 @@ void Database::Recover() {
 
   for (auto &entry : recovered.recovery_entries) {
     // A delete is logged with absent set and must not be re-inserted; a
-    // secondary entry survives the fold only with inserts.
+    // secondary entry survives recovery only with inserts.
     if (entry.tid.absent) continue;
     auto table = GetTable(entry.table_name);
     if (table == nullptr || table->GetPaxTable() == nullptr) {

@@ -25,6 +25,7 @@
 #include "helios/read.h"
 
 #include "db_helper.h"
+#include "wal/logger.h"
 #include "wal/wal.h"
 
 namespace {
@@ -437,6 +438,36 @@ TEST_F(EpochScanCheckpointTest, AQuietTailAfterTheCheckpointIsAccepted) {
   helios::storage::Database db(config);
   EXPECT_EQ(Read(db, "alice").value, "two");
   EXPECT_EQ(Read(db, "bob").value, "one");
+}
+
+// A start that does not replay still takes the checkpoint's end epoch:
+// publication waited for that epoch to become durable, so resuming below it
+// would hand later commits epochs a replay treats as covered.
+TEST_F(EpochScanCheckpointTest, AStartWithoutAReplayTakesTheCheckpointEpoch) {
+  {
+    auto config = MakeConfig(false);
+    helios::storage::Database db(config);
+    TestHelper::CreateTable(db, kTable);
+    ASSERT_TRUE(CommitWrite(db, "alice", "one"));
+    // The database goes quiet before the checkpoint does, so the checkpoint
+    // ends above the epoch of the log's last frame.
+    ASSERT_TRUE(db.WriteCheckpoint());
+  }
+
+  const auto checkpoint = EpochScanCheckpoint::Load(work_dir_);
+  ASSERT_EQ(checkpoint.status, EpochScanCheckpoint::LoadResult::Status::kOk);
+  {
+    Wal wal(work_dir_, helios::storage::wal::WalIo::Posix(), 1ull << 20);
+    auto scan = wal.Scan(0);
+    ASSERT_EQ(scan.status, WalScanResult::Status::kOk);
+    ASSERT_LT(scan.last_epoch, checkpoint.end_epoch);
+  }
+
+  helios::storage::wal::Logger logger(MakeConfig(false));
+  const auto recovery = logger.Recover();
+  ASSERT_EQ(recovery.status,
+            helios::storage::wal::Logger::RecoveryStatus::kOk);
+  EXPECT_EQ(recovery.durable_epoch, checkpoint.end_epoch);
 }
 
 TEST_F(EpochScanCheckpointTest, ARowLockedDuringTheScanIsRetried) {

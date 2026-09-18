@@ -18,7 +18,8 @@
 
 /**
  * @file server/storage/src/wal/logger.h
- * Producer log buffers, their background writer and the durable epoch.
+ * Producer log buffers, the logger thread that persists them and the durable
+ * epoch.
  */
 
 #ifndef HELIOS_STORAGE_SRC_WAL_LOGGER_H
@@ -49,14 +50,17 @@ class Framework;
 namespace wal {
 
 /**
- * @brief Owns the WAL, per-producer buffers and the worker that persists them.
+ * @brief Owns the WAL, per-producer buffers and the logger thread that
+ * persists them.
  *
- * @details Each producer appends to its own buffer. The worker collects the
+ * @details Each producer appends to its own buffer. The logger thread collects
+ * the
  * records and writes closed epochs, then publishes durable epoch `D` to
  * waiting commits. An epoch with no records advances without a file write.
  * A producer with writes waits at the start of its commit while `D` trails
- * `E` by more than kEpochDiff.
- * The destructor joins the worker before destroying the WAL and buffers.
+ * `E` by more than kMaxLagEpochs.
+ * The destructor joins the logger thread before destroying the WAL and
+ * buffers.
  */
 class Logger {
  public:
@@ -90,16 +94,17 @@ class Logger {
   /**
    * @brief Scans the log and zeroes the tail at its first invalid frame.
    * @details On success it sets the durable epoch from the log and any
-   * published checkpoint, and returns it together with the folded log entries,
+   * published checkpoint, and returns it together with the log entries,
    * the checkpoint first when one was loaded, then the log. On kFailed,
    * durable_epoch is 0 and recovery_entries is empty.
-   * @note Runs before the worker starts and before the database accepts
-   * work.
+   * @note Runs before the logger thread starts and before the database
+   * accepts work.
    */
   RecoveryResult Recover();
 
   /**
-   * @brief Starts the logger worker after recovery, before epoch notifications.
+   * @brief Starts the logger thread after recovery, before epoch
+   * notifications.
    */
   void Start();
 
@@ -128,17 +133,17 @@ class Logger {
 
   // Epochs a producer may run ahead of the durable epoch, Silo's
   // g_max_lag_epochs. The flush trails E by two.
-  static constexpr EpochNumber kEpochDiff = 128;
+  static constexpr EpochNumber kMaxLagEpochs = 128;
 
   /**
    * @brief Blocks while the durable epoch trails the global epoch by more
-   * than kEpochDiff.
+   * than kMaxLagEpochs.
    * @details An admission check: the lag can grow again after it returns.
    * Shutdown and a log failure end the wait, as in WaitUntilDurable.
    * @note The caller must have left the storage epoch: a producer that waits
    * online holds the epoch the logger has to close.
    */
-  void WaitEpochDiff(epoch::Framework &epoch);
+  void WaitMaxLag(epoch::Framework &epoch);
 
   /**
    * @brief Returns once the transaction that committed in `commit_epoch` may
@@ -155,7 +160,8 @@ class Logger {
   void AwaitCommitDurability(EpochNumber commit_epoch, bool awaits_durability);
 
   /**
-   * @brief Drains closed epochs, joins the worker and wakes remaining waiters.
+   * @brief Drains closed epochs, joins the logger thread and wakes remaining
+   * waiters.
    * @details After a write failure, no further records are written. Calling
    * Stop again, or before Start, is safe.
    */
@@ -178,15 +184,16 @@ class Logger {
   };
 
   const std::string work_dir_;
-  const bool loads_checkpoint_;
+  const bool loads_checkpoint_records_;
   Wal wal_;
 
   // One buffer per producer, also retained after that producer exits.
   ThreadKeyStorage<LogBuffer> buffers_;
-  // Owned by the worker; records beyond the requested flush epoch stay here.
+  // Owned by the logger thread; records beyond the requested flush epoch stay
+  // here.
   std::map<EpochNumber, LogRecords> pending_records_;
 
-  // Protects the flush request and the request to stop the worker.
+  // Protects the flush request and the request to stop the logger thread.
   std::mutex work_mutex_;
   std::condition_variable work_cv_;
   EpochNumber flush_epoch_{0};
@@ -201,18 +208,18 @@ class Logger {
   State state_{State::kRunning};
   bool process_fail_stop_{false};
 
-  std::thread worker_;
+  std::thread logger_thread_;
 
   /**
    * @brief Collects producer buffers and persists records through target.
-   * @note Called only by the worker, without holding work_mutex_.
+   * @note Called only by the logger thread, without holding work_mutex_.
    */
   WalAppendResult FlushThrough(EpochNumber target);
 
   /**
    * @brief Writes closed epochs until stopped or a batch fails.
    */
-  void Worker();
+  void LoggerThread();
 
   RecoveryResult FailRecovery(const WalScanResult &wal);
   void PublishDurable(EpochNumber durable_epoch);

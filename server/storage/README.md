@@ -20,10 +20,11 @@ adaptation to use this engine.
 ```bash
 cmake -S server/storage -B build/storage -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTS=ON
 cmake --build build/storage
-ctest --test-dir build/storage -j1
+ctest --test-dir build/storage -j "$(nproc)"
 ```
 
-The tests share one working directory and run serially.
+The tests that build a database on the default working directory hold a lock,
+so no two of them run at once; the rest run alongside them.
 `scripts/storage_tests.sh [build_dir]` runs the three steps in one command.
 
 ## Provenance

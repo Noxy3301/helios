@@ -31,10 +31,12 @@ helios::storage::Config MakeConfig(size_t epoch_duration_ms) {
 }
 
 bool CommitWrite(helios::storage::Database &db, const std::string &key,
-                 const std::string &value) {
+                 const std::string &value,
+                 helios::storage::CommitDurability durability =
+                     helios::storage::CommitDurability::kSync) {
   std::string commit_reason;
   return TestHelper::CommitRows(db, {}, {{kTable, key, TestHelper::Row(value)}},
-                                {}, {}, commit_reason);
+                                {}, {}, commit_reason, durability);
 }
 
 bool CommitInsert(helios::storage::Database &db, const std::string &key,
@@ -45,11 +47,13 @@ bool CommitInsert(helios::storage::Database &db, const std::string &key,
       {}, {}, reason);
 }
 
-bool CommitDelete(helios::storage::Database &db, const std::string &key) {
+bool CommitDelete(helios::storage::Database &db, const std::string &key,
+                  helios::storage::CommitDurability durability =
+                      helios::storage::CommitDurability::kSync) {
   std::string commit_reason;
   return TestHelper::CommitRows(
       db, {}, {{kTable, key, "", helios::storage::RowOp::kDelete}}, {}, {},
-      commit_reason);
+      commit_reason, durability);
 }
 
 helios::storage::ReadResult Read(helios::storage::Database &db,
@@ -82,20 +86,49 @@ void SleepAroundEpochRelease(helios::storage::Database &db,
 }  // namespace
 
 TEST(DeferredPurgeTest, SameEpochDeleteReinsertInvalidatesStaleRead) {
-  auto config = MakeConfig(100);
+  // Async commits wait on no epoch boundary, so the read, the delete and the
+  // re-insert below share an epoch unless the epoch thread advances between
+  // them; a sequence the boundary splits is repeated on a fresh key.
+  auto config = MakeConfig(1000);
   helios::storage::Database db(config);
   ASSERT_TRUE(TestHelper::CreateTable(db, kTable));
 
-  ASSERT_TRUE(CommitWrite(db, "k", "v1"));
-  const auto stale = Read(db, "k");
-  ASSERT_TRUE(stale.found);
-  ASSERT_EQ(stale.value, "v1");
+  const auto kAsync = helios::storage::CommitDurability::kAsync;
+  helios::storage::ReadResult stale;
+  helios::storage::ReadResult tombstone;
+  helios::storage::ReadResult live;
+  std::string key;
+  for (int attempt = 0; attempt < 5; ++attempt) {
+    key = "k" + std::to_string(attempt);
+    ASSERT_TRUE(CommitWrite(db, key, "v1", kAsync));
+    stale = Read(db, key);
+    ASSERT_TRUE(stale.found);
+    ASSERT_EQ(stale.value, "v1");
 
-  ASSERT_TRUE(CommitDelete(db, "k"));
-  ASSERT_TRUE(CommitWrite(db, "k", "v2"));
+    // The delete publishes a tombstone and queues the slot for the reaper; the
+    // re-insert takes the same slot ahead of any purge.
+    ASSERT_TRUE(CommitDelete(db, key, kAsync));
+    tombstone = Read(db, key);
+    ASSERT_FALSE(tombstone.found);
+    ASSERT_TRUE(helios::storage::Tidword(tombstone.tid).absent);
+
+    ASSERT_TRUE(CommitWrite(db, key, "v2", kAsync));
+    live = Read(db, key);
+    ASSERT_EQ(live.value, "v2");
+
+    const auto epoch = helios::storage::Tidword(stale.tid).epoch;
+    if (helios::storage::Tidword(tombstone.tid).epoch == epoch &&
+        helios::storage::Tidword(live.tid).epoch == epoch) {
+      break;
+    }
+  }
+  ASSERT_EQ(helios::storage::Tidword(stale.tid).epoch,
+            helios::storage::Tidword(tombstone.tid).epoch);
+  ASSERT_EQ(helios::storage::Tidword(tombstone.tid).epoch,
+            helios::storage::Tidword(live.tid).epoch);
 
   std::string reason;
-  EXPECT_FALSE(ValidateRead(db, stale, "k", reason));
+  EXPECT_FALSE(ValidateRead(db, stale, key, reason));
   EXPECT_TRUE(StartsWith(reason, "exact_read_tid_moved")) << reason;
 }
 

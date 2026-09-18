@@ -151,9 +151,9 @@ bool Transaction::Commit(CommitDurability durability, std::string &reason) {
     }
   }
 
-  // A writer stays within kEpochDiff of the durable epoch; wait here, before
+  // A writer stays within kMaxLagEpochs of the durable epoch; wait here, before
   // any lock and before joining the epoch.
-  if (!write_set_.empty()) logger_.WaitEpochDiff(epoch_);
+  if (!write_set_.empty()) logger_.WaitMaxLag(epoch_);
 
   // The largest word this attempt read or found under a lock (Silo §4.2).
   Tidword max_tid;
@@ -285,9 +285,9 @@ bool Transaction::Prepare(DataItem &item, WriteEntry &entry,
     return true;
   }
 
-  // Fold the request's changes into the list this commit publishes.
+  // Apply the request's changes to the list this commit publishes.
   auto &index = std::get<IndexUpdate>(entry.update);
-  index.primary_keys = std::atomic_load(&item.primary_keys_);
+  index.primary_keys = std::atomic_load(&item.primary_keys);
   for (const auto &delta : index.deltas) {
     if (delta.op == wal::SecondaryIndexOp::kDelete) {
       index.primary_keys =
@@ -424,7 +424,7 @@ bool Transaction::ReplayIndexRange(const RangeEntry &range, Tidword &max_tid) {
     }
 
     // The key list is a separate load; abort if the word moved around it.
-    auto primary_keys = std::atomic_load(&item->primary_keys_);
+    auto primary_keys = std::atomic_load(&item->primary_keys);
     if (item->transaction_id.load() != tid) {
       aborted = true;
       return true;
@@ -456,7 +456,7 @@ void Transaction::Apply(DataItem &item, const WriteEntry &entry,
       item.InstallRow(row->row, epoch);
     return;
   }
-  std::atomic_store(&item.primary_keys_,
+  std::atomic_store(&item.primary_keys,
                     std::get<IndexUpdate>(entry.update).primary_keys);
 }
 

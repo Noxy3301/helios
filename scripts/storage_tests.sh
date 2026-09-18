@@ -11,5 +11,6 @@ BUILD_DIR="${1:-/tmp/helios-storage-build}"
 cmake -S "$ROOT_DIR/server/storage" -B "$BUILD_DIR" \
   -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTS=ON
 cmake --build "$BUILD_DIR" -j "$(nproc)"
-# The tests share one working directory, so they run serially.
-ctest --test-dir "$BUILD_DIR" -j1 --output-on-failure
+# The tests that share the default working directory hold a lock; the rest run
+# in parallel.
+ctest --test-dir "$BUILD_DIR" -j "$(nproc)" --output-on-failure

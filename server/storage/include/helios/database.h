@@ -406,7 +406,7 @@ class Database {
    */
   static EpochNumber ResumeEpochAbove(EpochNumber durable_epoch);
 
-  // Builds the callback the epoch writer runs after each advance.
+  // Builds the callback the epoch thread runs after each advance.
   std::function<void(EpochNumber)> MakeEpochHook();
 
   /**
