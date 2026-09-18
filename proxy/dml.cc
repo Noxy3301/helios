@@ -1,17 +1,17 @@
-#include "storage/lineairdb/ha_lineairdb.hh"
+#include "storage/helios/ha_helios.hh"
 
 #include <string>
 #include <utility>
 #include <vector>
 
-#include "lineairdb_prefetch.hh"
+#include "helios_prefetch.hh"
 #include "my_dbug.h"
 #include "sql/table.h"
 
 // Handler DML entry points. These methods stage base-row mutations and their
-// secondary-index side effects in the current LineairDB transaction.
+// secondary-index side effects in the current Helios transaction.
 
-int ha_lineairdb::duplicate_or_conflict(LineairDBTransaction *tx, uint index) {
+int ha_helios::duplicate_or_conflict(HeliosTransaction *tx, uint index) {
   if (!tx->reads_still_valid()) {
     tx->set_status_to_abort();
     return abort_errno(tx);
@@ -20,12 +20,12 @@ int ha_lineairdb::duplicate_or_conflict(LineairDBTransaction *tx, uint index) {
   return HA_ERR_FOUND_DUPP_KEY;
 }
 
-bool ha_lineairdb::checks_unique_keys() {
+bool ha_helios::checks_unique_keys() {
   return !::thd_test_options(ha_thd(), OPTION_RELAXED_UNIQUE_CHECKS);
 }
 
-int ha_lineairdb::check_unique_secondary_key(
-    LineairDBTransaction *tx, uint index, const KEY &key_info,
+int ha_helios::check_unique_secondary_key(
+    HeliosTransaction *tx, uint index, const KEY &key_info,
     const std::string &secondary_key, const std::string &primary_key) {
   // An index entry this transaction wrote itself is a duplicate whatever
   // unique_checks says: no request settles it.
@@ -51,7 +51,7 @@ int ha_lineairdb::check_unique_secondary_key(
   return 0;
 }
 
-int ha_lineairdb::flush_insert_probe(LineairDBTransaction *tx) {
+int ha_helios::flush_insert_probe(HeliosTransaction *tx) {
   if (insert_probe_keys_.empty()) return 0;
   std::vector<std::string> keys;
   keys.swap(insert_probe_keys_);
@@ -59,7 +59,7 @@ int ha_lineairdb::flush_insert_probe(LineairDBTransaction *tx) {
   return duplicate_or_conflict(tx, table_share->primary_key);
 }
 
-int ha_lineairdb::write_row(uchar *buf) {
+int ha_helios::write_row(uchar *buf) {
   DBUG_TRACE;
 
   set_write_buffer(buf);
@@ -92,7 +92,7 @@ int ha_lineairdb::write_row(uchar *buf) {
     }
     if (old_row.first != nullptr && old_row.second != 0) {
       // record[1] is MySQL's buffer for the row being replaced.
-      if (set_fields_from_lineairdb(table->record[1], old_row.first,
+      if (set_fields_from_helios(table->record[1], old_row.first,
                                     old_row.second)) {
         return HA_ERR_OUT_OF_MEM;
       }
@@ -116,14 +116,14 @@ int ha_lineairdb::write_row(uchar *buf) {
     }
   } else if (!insert_can_replace_ && is_primary_key_exists()) {
     switch (tx->insert_key_state(db_table_name, key)) {
-      case LineairDBTransaction::KeyState::Taken:
+      case HeliosTransaction::KeyState::Taken:
         // A row this transaction wrote itself: no request settles it, and
         // unique_checks does not make it acceptable either.
         duplicate_key_index_ = table_share->primary_key;
         return HA_ERR_FOUND_DUPP_KEY;
-      case LineairDBTransaction::KeyState::Free:
+      case HeliosTransaction::KeyState::Free:
         break;
-      case LineairDBTransaction::KeyState::Unknown:
+      case HeliosTransaction::KeyState::Unknown:
         // Under unique_checks the statement owes ER_DUP_ENTRY: probe keys
         // resolve at end_bulk_insert, or here without that bracket.
         if (checks_unique_keys()) {
@@ -194,7 +194,7 @@ int ha_lineairdb::write_row(uchar *buf) {
   return 0;
 }
 
-int ha_lineairdb::update_row(const uchar *old_data, uchar *new_data) {
+int ha_helios::update_row(const uchar *old_data, uchar *new_data) {
   DBUG_TRACE;
 
   auto tx = get_transaction(ha_thd());
@@ -276,7 +276,7 @@ int ha_lineairdb::update_row(const uchar *old_data, uchar *new_data) {
   return 0;
 }
 
-int ha_lineairdb::delete_row(const uchar *buf) {
+int ha_helios::delete_row(const uchar *buf) {
   DBUG_TRACE;
 
   auto key = extract_key_from_mysql(buf);

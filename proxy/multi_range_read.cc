@@ -1,17 +1,17 @@
-#include "storage/lineairdb/ha_lineairdb.hh"
+#include "storage/helios/ha_helios.hh"
 
 #include <string>
 #include <utility>
 #include <vector>
 
-#include "lineairdb_prefetch.hh"
+#include "helios_prefetch.hh"
 #include "sql/table.h"
 
 // Handler MRR/read_range entry points. The custom path batches primary-key
-// point lookups into one LineairDB RPC; unsupported ranges fall back to MySQL's
+// point lookups into one Helios RPC; unsupported ranges fall back to MySQL's
 // default DS-MRR implementation.
 
-ha_rows ha_lineairdb::multi_range_read_info_const(
+ha_rows ha_helios::multi_range_read_info_const(
     uint keyno, RANGE_SEQ_IF *seq, void *seq_init_param, uint n_ranges,
     uint *bufsz, uint *flags, bool *force_default_mrr, Cost_estimate *cost) {
   ha_rows rows = handler::multi_range_read_info_const(
@@ -31,7 +31,7 @@ ha_rows ha_lineairdb::multi_range_read_info_const(
   return rows;
 }
 
-ha_rows ha_lineairdb::multi_range_read_info(uint keyno, uint n_ranges,
+ha_rows ha_helios::multi_range_read_info(uint keyno, uint n_ranges,
                                             uint keys, uint *bufsz,
                                             uint *flags,
                                             Cost_estimate *cost) {
@@ -49,7 +49,7 @@ ha_rows ha_lineairdb::multi_range_read_info(uint keyno, uint n_ranges,
   return rows;
 }
 
-int ha_lineairdb::multi_range_read_init(RANGE_SEQ_IF *seq, void *seq_init_param,
+int ha_helios::multi_range_read_init(RANGE_SEQ_IF *seq, void *seq_init_param,
                                         uint n_ranges, uint mode,
                                         HANDLER_BUFFER *buf) {
   auto tx = get_transaction(ha_thd());
@@ -105,9 +105,8 @@ int ha_lineairdb::multi_range_read_init(RANGE_SEQ_IF *seq, void *seq_init_param,
       return m_ds_mrr.dsmrr_init(seq, seq_init_param, n_ranges,
                                  mode | HA_MRR_USE_DEFAULT_IMPL, buf);
     }
-    std::string ldb_key = convert_key_to_ldbformat(
-        range.start_key.key, range.start_key.keypart_map);
-    batch_keys.push_back(ldb_key);
+    batch_keys.push_back(
+        encode_key(range.start_key.key, range.start_key.keypart_map));
     range_infos.push_back(range.ptr);
   }
 
@@ -135,7 +134,7 @@ int ha_lineairdb::multi_range_read_init(RANGE_SEQ_IF *seq, void *seq_init_param,
   return 0;
 }
 
-int ha_lineairdb::multi_range_read_next(char **range_info) {
+int ha_helios::multi_range_read_next(char **range_info) {
   if (!mrr_use_batch_) {
     return m_ds_mrr.dsmrr_next(range_info);
   }
@@ -147,7 +146,7 @@ int ha_lineairdb::multi_range_read_next(char **range_info) {
   auto &row = mrr_buffer_[mrr_buffer_pos_++];
 
   const std::byte *ptr = reinterpret_cast<const std::byte *>(row.value.data());
-  if (set_fields_from_lineairdb(table->record[0], ptr, row.value.size())) {
+  if (set_fields_from_helios(table->record[0], ptr, row.value.size())) {
     return HA_ERR_OUT_OF_MEM;
   }
   // position() stores this member into ref, so rowid reads of a batched row
@@ -158,10 +157,10 @@ int ha_lineairdb::multi_range_read_next(char **range_info) {
   return 0;
 }
 
-int ha_lineairdb::read_range_first(const key_range *start_key,
+int ha_helios::read_range_first(const key_range *start_key,
                                    const key_range *end_key, bool eq_range_arg,
                                    bool sorted) {
   return handler::read_range_first(start_key, end_key, eq_range_arg, sorted);
 }
 
-int ha_lineairdb::read_range_next() { return handler::read_range_next(); }
+int ha_helios::read_range_next() { return handler::read_range_next(); }

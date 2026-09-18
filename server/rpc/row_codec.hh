@@ -5,7 +5,7 @@
 #include <string_view>
 
 // Byte-level encode/decode helpers shared across the RPC handlers:
-// LineairDBField-format row access plus the int-keyed primary-key layout
+// HeliosField-format row access plus the int-keyed primary-key layout
 // mirrored from the proxy.
 
 // Bump the byte string to its lexicographic successor; empty on overflow.
@@ -17,10 +17,10 @@ std::string_view extract_value_column(const std::string& row,
                                       int column_index);
 
 /**
- * @brief Build an int-keyed primary-key part in LineairDB's byte layout.
+ * @brief Build an int-keyed primary-key part in Helios's byte layout.
  *
  * @details [0x00 not-null][0x10 INT tag][2-byte big-endian length 4][4-byte
- * signed int with the top bit flipped], the layout ha_lineairdb writes, so
+ * signed int with the top bit flipped], the layout ha_helios writes, so
  * byte-wise order matches signed integer order.
  */
 std::string encode_int_key_part(int64_t value);

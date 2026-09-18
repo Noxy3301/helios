@@ -7,7 +7,7 @@
 class THD;
 struct LEX;
 
-namespace lineairdb_columnar {
+namespace helios_columnar {
 
 /**
  * @brief Builds the duckdb bridge request from MySQL's resolved statement.
@@ -30,4 +30,4 @@ bool BuildDuckdbQueryRequest(
     LineairDB::Protocol::TxExecuteDuckdbQuery::Request* request,
     std::string* why);
 
-}  // namespace lineairdb_columnar
+}  // namespace helios_columnar

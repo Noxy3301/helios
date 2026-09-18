@@ -1,5 +1,5 @@
-#ifndef LINEAIRDB_PROXY_H
-#define LINEAIRDB_PROXY_H
+#ifndef HELIOS_PROXY_H
+#define HELIOS_PROXY_H
 
 #include <cstdint>
 #include <string>
@@ -48,13 +48,13 @@ enum class MessageType : uint32_t {
  * current state and leaves nothing behind there; the query layer keeps the
  * transaction and installs it with one TX_COMMIT.
  *
- * Each THD holds a LineairDBProxy with its own TCP connection, managed via
- * LineairDBThdCtx.
+ * Each THD holds a HeliosProxy with its own TCP connection, managed via
+ * HeliosThdCtx.
  */
-class LineairDBProxy {
+class HeliosProxy {
 public:
-    LineairDBProxy(const std::string& host, int port);
-    ~LineairDBProxy();
+    HeliosProxy(const std::string& host, int port);
+    ~HeliosProxy();
 
     // connection management
     bool connect(const std::string& host, int port);
@@ -310,4 +310,4 @@ private:
     TxRpcTrace* current_trace_ = nullptr;
 };
 
-#endif // LINEAIRDB_PROXY_H
+#endif // HELIOS_PROXY_H

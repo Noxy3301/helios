@@ -167,7 +167,7 @@ ansible-playbook -i inventory.ini measure_usage.yml \
 | `bench_time`             | `60`                                                                | Execution time in seconds                                                                                                                                                                               |
 | `bench_terms`            | `[1]` (tpch serial) / `[1,32,...,256]` (others)                     | Terminal counts to sweep                                                                                                                                                                                |
 | `bench_sync`             | `true`                                                              | Synchronize start across bench nodes                                                                                                                                                                    |
-| `bench_read_path`        | `plan`                                                              | `SET GLOBAL lineairdb_read_path`: `plan` or `row`                                                                                                                                                       |
+| `bench_read_path`        | `plan`                                                              | `SET GLOBAL helios_read_path`: `plan` or `row`                                                                                                                                                          |
 | `bench_tx_plan`          | `false`                                                             | Export `HELIOS_PREFETCH_PLAN=1` so TPC-C injects `@_tx_plan`                                                                                                                                            |
 | `bench_sync_buffer`      | `5`                                                                 | Sync buffer (seconds)                                                                                                                                                                                   |
 | `run_id`                 | `run`                                                               | Identifier for log filenames                                                                                                                                                                            |
@@ -212,7 +212,7 @@ python3 py/plot_tpch.py          # TPC-H per-query latency (auto-called for tpch
 | `push_bundle.yml`   | Push and extract the prebuilt bundle onto every node      |
 | `site.yml`          | Master: push_bundle → storage → mysql → benchbase         |
 | `storage.yml`       | Start the storage server from the bundle                  |
-| `mysql.yml`         | Start MySQL with Helios proxy, create users               |
+| `mysql.yml`         | Start MySQL with Helios plugin, create users              |
 | `benchbase.yml`     | Create schema + load data (supports ycsb/tpcc/tpch)       |
 | `measure.yml`       | Run benchmark terminal sweep (ungated: see the notes)     |
 | `measure_term.yml`  | Single terminal count execution (included by measure.yml) |

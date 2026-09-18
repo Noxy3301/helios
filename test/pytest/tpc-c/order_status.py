@@ -447,12 +447,12 @@ def main():
     cursor = db.cursor()
 
     try:
-        reset(db, cursor, "ha_lineairdb_test")
-        setup_schema(db, cursor, "ha_lineairdb_test", "LineairDB")
-        populate_order_status_fixture(db, cursor, "ha_lineairdb_test")
+        reset(db, cursor, "ha_helios_test")
+        setup_schema(db, cursor, "ha_helios_test", "Helios")
+        populate_order_status_fixture(db, cursor, "ha_helios_test")
 
         result = 0
-        result |= test_tpcc_orderstatus(db, cursor, "ha_lineairdb_test")
+        result |= test_tpcc_orderstatus(db, cursor, "ha_helios_test")
 
         if result == 0:
             print("\nALL TESTS PASSED!")

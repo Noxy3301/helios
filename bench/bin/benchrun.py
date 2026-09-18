@@ -392,7 +392,7 @@ def _start_metrics(metrics_dir):
     if mysql_pidfile.exists():
         mysql_pid = mysql_pidfile.read_text().strip()
     if not mysql_pid:
-        mysql_pid = _find_pid("mysqld.*lineairdb")
+        mysql_pid = _find_pid("mysqld.*helios")
     if mysql_pid:
         f = open(metrics_dir / "pidstat-mysql.log", "w")
         p = subprocess.Popen(["pidstat", "-u", "-w", "-p", mysql_pid, interval], stdout=f, stderr=subprocess.DEVNULL)
@@ -526,14 +526,14 @@ def attach_secondary(benchmark, mysql_host, mysql_port):
     # back to the primary engine. Verify the plugin and the per-table state.
     result = mysql_cmd(mysql_port, mysql_host,
                        "SELECT PLUGIN_NAME FROM information_schema.PLUGINS "
-                       "WHERE PLUGIN_NAME='lineairdb_columnar' "
+                       "WHERE PLUGIN_NAME='helios_columnar' "
                        "AND PLUGIN_STATUS='ACTIVE';")
-    if "lineairdb_columnar" not in result.stdout.lower():
-        sys.exit(f"lineairdb_columnar plugin is not ACTIVE on {mysql_host}:{mysql_port}")
+    if "helios_columnar" not in result.stdout.lower():
+        sys.exit(f"helios_columnar plugin is not ACTIVE on {mysql_host}:{mysql_port}")
     for t in ("customer", "lineitem", "nation", "orders",
               "part", "partsupp", "region", "supplier"):
         result = mysql_cmd(mysql_port, mysql_host,
-                           f"USE benchbase; ALTER TABLE {t} SECONDARY_ENGINE=lineairdb_columnar;")
+                           f"USE benchbase; ALTER TABLE {t} SECONDARY_ENGINE=helios_columnar;")
         if result.returncode != 0 and "already has a secondary engine" not in result.stderr:
             sys.exit(f"SECONDARY_ENGINE attach failed for {t}: {result.stderr.strip()[-300:]}")
         result = mysql_cmd(mysql_port, mysql_host,
@@ -544,7 +544,7 @@ def attach_secondary(benchmark, mysql_host, mysql_port):
                            "SELECT CREATE_OPTIONS FROM information_schema.TABLES "
                            f"WHERE TABLE_SCHEMA='benchbase' AND TABLE_NAME='{t}';")
         options = result.stdout.lower()
-        if ('secondary_engine="lineairdb_columnar"' not in options or
+        if ('secondary_engine="helios_columnar"' not in options or
                 'secondary_load="1"' not in options):
             sys.exit(f"secondary engine state not verified for {t}: "
                      f"{result.stdout.strip()[-200:]}")
@@ -890,7 +890,7 @@ def main():
     parser.add_argument("--keep-helios-logs", action="store_true",
                         help="Keep helios_logs and helios_wal after the benchmark")
     parser.add_argument("--read-path", choices=["row", "plan"], default="plan",
-                        help="SET GLOBAL lineairdb_read_path: row sends one request per handler "
+                        help="SET GLOBAL helios_read_path: row sends one request per handler "
                              "read, plan stages what it can in one request (default)")
     parser.add_argument("--tx-plan", action="store_true",
                         help="Pass HELIOS_PREFETCH_PLAN=1 to BenchBase so the TPC-C procedures "
@@ -1081,12 +1081,12 @@ def _run_bench(args, config_work, thread_list, result_base):
     # Set the read path explicitly to avoid stale state from prior runs. The
     # sysvar is per-mysqld and volatile, so set it on every endpoint and fail
     # fast: an endpoint left on the wrong path corrupts the run.
-    print(f"  Setting lineairdb_read_path={args.read_path}")
+    print(f"  Setting helios_read_path={args.read_path}")
     for host, port in args.mysql_endpoints:
         result = mysql_cmd(port, host,
-                           f"SET GLOBAL lineairdb_read_path='{args.read_path}';")
+                           f"SET GLOBAL helios_read_path='{args.read_path}';")
         if result.returncode != 0:
-            sys.exit(f"Failed to set lineairdb_read_path on {host}:{port}")
+            sys.exit(f"Failed to set helios_read_path on {host}:{port}")
 
     # Setup phase
     load_time = None

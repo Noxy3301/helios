@@ -10,8 +10,8 @@ _last_error_message = ""
 
 
 def reset(db, cursor):
-    cursor.execute('DROP DATABASE IF EXISTS ha_lineairdb_test')
-    cursor.execute('CREATE DATABASE ha_lineairdb_test')
+    cursor.execute('DROP DATABASE IF EXISTS ha_helios_test')
+    cursor.execute('CREATE DATABASE ha_helios_test')
     db.commit()
 
 
@@ -39,25 +39,25 @@ def run(cursor, sql):
 def create_unique_table(cursor):
     table = f"unique_update_{int(time.time() * 1000000)}"
     cursor.execute(
-        f'''CREATE TABLE ha_lineairdb_test.{table} (
+        f'''CREATE TABLE ha_helios_test.{table} (
             id INT NOT NULL,
             email VARCHAR(63) NOT NULL,
             name VARCHAR(64),
             PRIMARY KEY (id),
             UNIQUE INDEX email_uidx (email)
-        ) ENGINE = LineairDB'''
+        ) ENGINE = Helios'''
     )
     return table
 
 
 def seed_two_rows(cursor, table, first_email, second_email):
-    return run(cursor, f"INSERT INTO ha_lineairdb_test.{table} "
+    return run(cursor, f"INSERT INTO ha_helios_test.{table} "
                        "(id, email, name) VALUES "
                        f"(1, '{first_email}', 'a'), (2, '{second_email}', 'b')")
 
 
 def rows_of(cursor, table):
-    cursor.execute(f"SELECT id, email FROM ha_lineairdb_test.{table} "
+    cursor.execute(f"SELECT id, email FROM ha_helios_test.{table} "
                    "ORDER BY id")
     return cursor.fetchall()
 
@@ -74,7 +74,7 @@ def test_update_onto_taken_unique_value(db, cursor):
     table = create_unique_table(cursor)
     db.commit()
 
-    errno = run(cursor, f"INSERT INTO ha_lineairdb_test.{table} "
+    errno = run(cursor, f"INSERT INTO ha_helios_test.{table} "
                         "(id, email, name) VALUES (1, 'a@example.com', 'a'), "
                         "(2, 'b@example.com', 'b')")
     if errno is not None:
@@ -82,7 +82,7 @@ def test_update_onto_taken_unique_value(db, cursor):
         return 1
     db.commit()
 
-    errno = run(cursor, f"UPDATE ha_lineairdb_test.{table} "
+    errno = run(cursor, f"UPDATE ha_helios_test.{table} "
                         "SET email = 'a@example.com' WHERE id = 2")
     if errno != 1062:
         print(f"\tFailed: expected 1062 at the statement, got {errno} "
@@ -91,7 +91,7 @@ def test_update_onto_taken_unique_value(db, cursor):
         return 1
     db.rollback()
 
-    cursor.execute(f"SELECT id, email FROM ha_lineairdb_test.{table} "
+    cursor.execute(f"SELECT id, email FROM ha_helios_test.{table} "
                    "ORDER BY id")
     rows = cursor.fetchall()
     if rows != [(1, 'a@example.com'), (2, 'b@example.com')]:
@@ -109,7 +109,7 @@ def test_update_onto_taken_unique_value_no_checks(db, cursor):
     table = create_unique_table(cursor)
     db.commit()
 
-    errno = run(cursor, f"INSERT INTO ha_lineairdb_test.{table} "
+    errno = run(cursor, f"INSERT INTO ha_helios_test.{table} "
                         "(id, email, name) VALUES (1, 'c@example.com', 'c'), "
                         "(2, 'd@example.com', 'd')")
     if errno is not None:
@@ -121,7 +121,7 @@ def test_update_onto_taken_unique_value_no_checks(db, cursor):
     try:
         errno = run(cursor, "BEGIN")
         if errno is None:
-            errno = run(cursor, f"UPDATE ha_lineairdb_test.{table} "
+            errno = run(cursor, f"UPDATE ha_helios_test.{table} "
                                 "SET email = 'c@example.com' WHERE id = 2")
         if errno is not None:
             print(f"\tFailed: the UPDATE was rejected with {errno} "
@@ -138,7 +138,7 @@ def test_update_onto_taken_unique_value_no_checks(db, cursor):
               f"got {errno} ({_last_error_message})")
         return 1
 
-    cursor.execute(f"SELECT id, email FROM ha_lineairdb_test.{table} "
+    cursor.execute(f"SELECT id, email FROM ha_helios_test.{table} "
                    "ORDER BY id")
     rows = cursor.fetchall()
     if rows != [(1, 'c@example.com'), (2, 'd@example.com')]:
@@ -154,25 +154,25 @@ def test_unique_index_defined_in_create_table(db, cursor):
     table_name = f"unique_create_{int(time.time() * 1000000)}"
 
     cursor.execute(
-        f'''CREATE TABLE ha_lineairdb_test.{table_name} (
+        f'''CREATE TABLE ha_helios_test.{table_name} (
             id INT NOT NULL,
             email VARCHAR(63) NOT NULL,
             name VARCHAR(64),
             PRIMARY KEY (id),
             UNIQUE INDEX email_uidx (email)
-        ) ENGINE = LineairDB'''
+        ) ENGINE = Helios'''
     )
     db.commit()
 
     cursor.execute(
-        f"INSERT INTO ha_lineairdb_test.{table_name} (id, email, name) "
+        f"INSERT INTO ha_helios_test.{table_name} (id, email, name) "
         "VALUES (1, 'alice@example.com', 'alice')"
     )
     db.commit()
 
     ok, detail = expect_duplicate_insert_error(
         cursor,
-        f"INSERT INTO ha_lineairdb_test.{table_name} (id, email, name) "
+        f"INSERT INTO ha_helios_test.{table_name} (id, email, name) "
         "VALUES (2, 'alice@example.com', 'bob')",
     )
     if not ok:
@@ -182,7 +182,7 @@ def test_unique_index_defined_in_create_table(db, cursor):
 
     db.rollback()
     cursor.execute(
-        f"SELECT COUNT(*) FROM ha_lineairdb_test.{table_name} "
+        f"SELECT COUNT(*) FROM ha_helios_test.{table_name} "
         "WHERE email = 'alice@example.com'"
     )
     count = cursor.fetchone()[0]
@@ -207,7 +207,7 @@ def test_rejected_update_reaches_no_commit(db, cursor):
     db.commit()
 
     run(cursor, "BEGIN")
-    errno = run(cursor, f"UPDATE ha_lineairdb_test.{table} "
+    errno = run(cursor, f"UPDATE ha_helios_test.{table} "
                         "SET email = 'e@example.com' WHERE id = 2")
     if errno != 1062:
         print(f"\tFailed: expected 1062 at the statement, got {errno} "
@@ -243,7 +243,7 @@ def test_update_ignore_onto_taken_unique_value(db, cursor):
     db.commit()
 
     run(cursor, "BEGIN")
-    errno = run(cursor, f"UPDATE IGNORE ha_lineairdb_test.{table} "
+    errno = run(cursor, f"UPDATE IGNORE ha_helios_test.{table} "
                         "SET email = 'g@example.com' WHERE id = 2")
     if errno is not None:
         print(f"\tFailed: UPDATE IGNORE was rejected with {errno} "
@@ -283,7 +283,7 @@ def test_rejected_insert_reaches_no_commit(db, cursor):
     db.commit()
 
     run(cursor, "BEGIN")
-    errno = run(cursor, f"INSERT INTO ha_lineairdb_test.{table} "
+    errno = run(cursor, f"INSERT INTO ha_helios_test.{table} "
                         "(id, email, name) VALUES (3, 'i@example.com', 'c')")
     if errno != 1062:
         print(f"\tFailed: expected 1062 at the statement, got {errno} "
@@ -317,7 +317,7 @@ def test_insert_ignore_onto_taken_unique_value(db, cursor):
     db.commit()
 
     run(cursor, "BEGIN")
-    errno = run(cursor, f"INSERT IGNORE INTO ha_lineairdb_test.{table} "
+    errno = run(cursor, f"INSERT IGNORE INTO ha_helios_test.{table} "
                         "(id, email, name) VALUES (3, 'k@example.com', 'c')")
     if errno is not None:
         print(f"\tFailed: INSERT IGNORE was rejected with {errno} "

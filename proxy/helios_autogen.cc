@@ -1,4 +1,4 @@
-#include "lineairdb_autogen.hh"
+#include "helios_autogen.hh"
 
 #include "../common/log.h"
 
@@ -10,7 +10,7 @@
 #include <utility>
 #include <vector>
 
-#include "lineairdb_keyenc.hh"
+#include "helios_keyenc.hh"
 #include "my_base.h"
 #include "my_sys.h"
 #include "mysqld_error.h"
@@ -23,9 +23,9 @@
 #include "sql/sql_optimizer.h"
 #include "sql/sql_opt_exec_shared.h"
 #include "sql/table.h"
-#include "storage/lineairdb/ha_lineairdb.hh"
+#include "storage/helios/ha_helios.hh"
 
-extern handlerton *lineairdb_hton;
+extern handlerton *helios_hton;
 
 namespace {
 
@@ -133,7 +133,7 @@ bool is_int32_key_field(const Field *f) {
 }
 
 // Handler table key from the TABLE share path. MySQL passes the same normalized
-// path to ha_lineairdb::open(), and the handler stores it as db_table_name.
+// path to ha_helios::open(), and the handler stores it as db_table_name.
 std::string physical_table_key(const TABLE *t) {
   if (t == nullptr || t->s == nullptr) return std::string();
   const TABLE_SHARE *s = t->s;
@@ -210,7 +210,7 @@ void collect_qep_leaves(AccessPath *p, std::vector<AccessPath *> *out,
       return;
     case AccessPath::TEMPTABLE_AGGREGATE:
       // MySQL can run GROUP BY by filling an internal temp table and reading it
-      // back. Prefetch only needs the LineairDB reads that feed that temp table;
+      // back. Prefetch only needs the Helios reads that feed that temp table;
       // the temp-table leaves themselves are skipped in the compile loop.
       collect_qep_leaves(p->temptable_aggregate().subquery_path, out, ok,
                          unsupported);
@@ -219,7 +219,7 @@ void collect_qep_leaves(AccessPath *p, std::vector<AccessPath *> *out,
       return;
     case AccessPath::MATERIALIZE:
       // Derived tables and materialized subqueries have the same shape: the
-      // source subqueries may read LineairDB, but the materialized table is
+      // source subqueries may read Helios, but the materialized table is
       // local to MySQL.
       for (const MaterializePathParameters::QueryBlock &qb :
            p->materialize().param->query_blocks) {
@@ -315,7 +315,7 @@ bool qep_leaf_info(AccessPath *p, TABLE **tbl, Index_lookup **ref,
 bool append_bound_keypart(
     TABLE *target, Index_lookup *ref, uint keypart_idx,
     Field *source_field, int source_step,
-    LineairDBProxy::ReadPlanStep *step, std::string *reason) {
+    HeliosProxy::ReadPlanStep *step, std::string *reason) {
   if (target == nullptr || target->s == nullptr || ref == nullptr ||
       step == nullptr || source_field == nullptr ||
       source_field->table == nullptr || ref->key < 0 ||
@@ -330,7 +330,7 @@ bool append_bound_keypart(
     return false;
   }
 
-  LineairDBProxy::ReadPlanKeyBinding binding;
+  HeliosProxy::ReadPlanKeyBinding binding;
   binding.source_step = static_cast<uint32_t>(source_step);
 
   TABLE *source_table = source_field->table;
@@ -389,7 +389,7 @@ bool append_bound_keypart(
 }
 
 bool compile_index_range_scan(AccessPath *leaf, TABLE *table,
-                              LineairDBProxy::ReadPlanStep *step,
+                              HeliosProxy::ReadPlanStep *step,
                               std::string *reason) {
   if (leaf == nullptr || table == nullptr || table->s == nullptr ||
       step == nullptr) {
@@ -427,7 +427,7 @@ bool compile_index_range_scan(AccessPath *leaf, TABLE *table,
   if (range->flag & NO_MIN_RANGE) {
     step->key_prefix.clear();
   } else {
-    step->key_prefix = lineairdb_keyenc::convert_key_to_ldbformat(
+    step->key_prefix = helios_keyenc::encode_key(
         table, range_scan.index, range->min_key, range->min_keypart_map);
     if (range->min_keypart_map != 0 && step->key_prefix.empty()) {
       if (reason != nullptr) *reason = "failed to encode range start key";
@@ -440,9 +440,9 @@ bool compile_index_range_scan(AccessPath *leaf, TABLE *table,
   }
 
   if (range->flag & NO_MAX_RANGE) {
-    step->end_key_prefix = lineairdb_keyenc::scan_end_sentinel();
+    step->end_key_prefix = helios_keyenc::scan_end_sentinel();
   } else {
-    step->end_key_prefix = lineairdb_keyenc::convert_key_to_ldbformat(
+    step->end_key_prefix = helios_keyenc::encode_key(
         table, range_scan.index, range->max_key, range->max_keypart_map);
     if (range->max_keypart_map != 0 && step->end_key_prefix.empty()) {
       if (reason != nullptr) *reason = "failed to encode range end key";
@@ -450,7 +450,7 @@ bool compile_index_range_scan(AccessPath *leaf, TABLE *table,
     }
     if (!(range->flag & NEAR_MAX)) {
       step->end_key_prefix =
-          lineairdb_keyenc::build_prefix_range_end(step->end_key_prefix);
+          helios_keyenc::build_prefix_range_end(step->end_key_prefix);
     }
   }
 
@@ -460,7 +460,7 @@ bool compile_index_range_scan(AccessPath *leaf, TABLE *table,
 bool compile_ref_lookup(
     TABLE *table, Index_lookup *ref,
     const std::unordered_map<TABLE *, int> &table_steps,
-    LineairDBProxy::ReadPlanStep *step, std::string *reason) {
+    HeliosProxy::ReadPlanStep *step, std::string *reason) {
   if (table == nullptr || table->s == nullptr || ref == nullptr ||
       step == nullptr) {
     if (reason != nullptr) *reason = "invalid ref metadata";
@@ -554,7 +554,7 @@ bool compile_ref_lookup(
     step->for_each = false;
     step->is_scan = true;
     step->key_prefix.clear();
-    step->end_key_prefix = lineairdb_keyenc::scan_end_sentinel();
+    step->end_key_prefix = helios_keyenc::scan_end_sentinel();
     if (ref->key == static_cast<int>(table->s->primary_key)) {
       step->index_name.clear();
     } else {
@@ -695,9 +695,9 @@ bool compile_ref_lookup(
   }
 
   if (leading_constant_parts > 0) {
-    step->key_prefix = lineairdb_keyenc::convert_key_to_ldbformat(
-        table, ref->key, ref->key_buff,
-        first_n_keyparts_map(leading_constant_parts));
+    step->key_prefix =
+        helios_keyenc::encode_key(table, ref->key, ref->key_buff,
+                                  first_n_keyparts_map(leading_constant_parts));
     if (step->key_prefix.empty()) {
       if (reason != nullptr) *reason = "failed to encode constant key prefix";
       return false;
@@ -732,7 +732,7 @@ bool compile_ref_lookup(
     return !step->table_name.empty();
   }
 
-  step->key_prefix = lineairdb_keyenc::convert_key_to_ldbformat(
+  step->key_prefix = helios_keyenc::encode_key(
       table, ref->key, ref->key_buff, first_n_keyparts_map(used_key_parts));
   if (step->key_prefix.empty()) {
     if (reason != nullptr) *reason = "failed to encode constant key";
@@ -744,7 +744,7 @@ bool compile_ref_lookup(
   } else {
     step->is_scan = true;
     step->end_key_prefix =
-        lineairdb_keyenc::build_prefix_range_end(step->key_prefix);
+        helios_keyenc::build_prefix_range_end(step->key_prefix);
     if (!child_primary) step->index_name = key.name;
   }
 
@@ -753,7 +753,7 @@ bool compile_ref_lookup(
 
 bool compile_leaf(AccessPath *leaf,
                   const std::unordered_map<TABLE *, int> &table_steps,
-                  LineairDBProxy::ReadPlanStep *step, std::string *reason) {
+                  HeliosProxy::ReadPlanStep *step, std::string *reason) {
   TABLE *table = nullptr;
   Index_lookup *ref = nullptr;
   bool full_scan = false;
@@ -799,7 +799,7 @@ bool compile_leaf(AccessPath *leaf,
          full_scan_index == static_cast<int>(table->s->primary_key));
     step->is_scan = true;
     step->key_prefix.clear();
-    step->end_key_prefix = lineairdb_keyenc::scan_end_sentinel();
+    step->end_key_prefix = helios_keyenc::scan_end_sentinel();
     if (!primary_order) {
       // Full secondary INDEX_SCAN: stage the secondary range itself. Runtime
       // index_first/index_next consumes it, then base rows come from row cache.
@@ -818,7 +818,7 @@ bool compile_leaf(AccessPath *leaf,
 // index-first) into a single ReadPlanStep; reject reverse/unbounded access.
 bool compile_index_search(TABLE *table, uint index,
                           const IndexSearchPlan &search,
-                          LineairDBProxy::ReadPlanStep *step,
+                          HeliosProxy::ReadPlanStep *step,
                           std::string *reason) {
   if (table == nullptr || table->s == nullptr || step == nullptr) {
     if (reason != nullptr) *reason = "invalid handler search metadata";
@@ -846,7 +846,7 @@ bool compile_index_search(TABLE *table, uint index,
     step->is_scan = true;
     step->key_prefix = start;
     step->end_key_prefix =
-        end.empty() ? lineairdb_keyenc::scan_end_sentinel() : end;
+        end.empty() ? helios_keyenc::scan_end_sentinel() : end;
     if (!is_primary) step->index_name = table->key_info[index].name;
   };
 
@@ -861,7 +861,7 @@ bool compile_index_search(TABLE *table, uint index,
         step->key_prefix = search.start_key_serialized;
       } else {
         set_scan(search.start_key_serialized,
-                 lineairdb_keyenc::build_prefix_range_end(
+                 helios_keyenc::build_prefix_range_end(
                      search.start_key_serialized));
       }
       return true;
@@ -951,7 +951,7 @@ Query_block *query_block_containing_plan_node(Query_expression *unit,
 bool compile_unqualified_count(
     THD *thd, AccessPath *leaf,
     std::unordered_map<TABLE *, int> *table_steps,
-    std::vector<LineairDBProxy::ReadPlanStep> *steps,
+    std::vector<HeliosProxy::ReadPlanStep> *steps,
     std::vector<TABLE *> *added_tables, UnsupportedQep *unsupported) {
   Query_block *qb =
       (thd != nullptr && thd->lex != nullptr)
@@ -970,7 +970,7 @@ bool compile_unqualified_count(
   }
   if (table == nullptr || table->s == nullptr ||
       table->s->tmp_table != NO_TMP_TABLE || table->file == nullptr ||
-      table->file->ht != lineairdb_hton ||
+      table->file->ht != helios_hton ||
       table->reginfo.lock_type > TL_READ) {
     unsupported->type = leaf->type;
     unsupported->reason = "unqualified COUNT table not stageable";
@@ -982,7 +982,7 @@ bool compile_unqualified_count(
     return false;
   }
 
-  // Mirror get_exact_record_count(). ha_lineairdb reports a non-clustered
+  // Mirror get_exact_record_count(). ha_helios reports a non-clustered
   // primary, so only JT_ALL and index()==primary count through the staged
   // primary range; another index choice stages that secondary range.
   const QEP_TAB *qt = nullptr;
@@ -1008,7 +1008,7 @@ bool compile_unqualified_count(
     }
   }
 
-  LineairDBProxy::ReadPlanStep step;
+  HeliosProxy::ReadPlanStep step;
   step.table_name = physical_table_key(table);
   if (step.table_name.empty()) {
     unsupported->type = leaf->type;
@@ -1017,7 +1017,7 @@ bool compile_unqualified_count(
   }
   step.is_scan = true;
   step.key_prefix.clear();
-  step.end_key_prefix = lineairdb_keyenc::scan_end_sentinel();
+  step.end_key_prefix = helios_keyenc::scan_end_sentinel();
   step.index_name = std::move(index_name);
   (*table_steps)[table] = static_cast<int>(steps->size());
   added_tables->push_back(table);
@@ -1039,7 +1039,7 @@ bool compile_unqualified_count(
 bool compile_tree_leaves(
     THD *thd, AccessPath *root, bool allow_limit_pushdown,
     std::unordered_map<TABLE *, int> *table_steps,
-    std::vector<LineairDBProxy::ReadPlanStep> *steps,
+    std::vector<HeliosProxy::ReadPlanStep> *steps,
     std::vector<TABLE *> *added_tables,
     UnsupportedQep *unsupported) {
   std::vector<AccessPath *> leaves;
@@ -1073,8 +1073,8 @@ bool compile_tree_leaves(
       return false;
     }
     if ((table->s != nullptr && table->s->tmp_table != NO_TMP_TABLE) ||
-        table->file == nullptr || table->file->ht != lineairdb_hton) {
-      // Only LineairDB base tables hold staged rows; MySQL temp tables and
+        table->file == nullptr || table->file->ht != helios_hton) {
+      // Only Helios base tables hold staged rows; MySQL temp tables and
       // tables of another engine have nothing to prefetch for this leaf.
       continue;
     }
@@ -1084,7 +1084,7 @@ bool compile_tree_leaves(
       return false;
     }
 
-    LineairDBProxy::ReadPlanStep step;
+    HeliosProxy::ReadPlanStep step;
     std::string reason;
     if (!compile_leaf(leaf, *table_steps, &step, &reason)) {
       unsupported->type = leaf->type;
@@ -1152,7 +1152,7 @@ void collect_inner_unit_roots(Query_expression *unit,
 
 bool autogen_read_plan_from_qep(
     THD *thd, AccessPath *root,
-    std::vector<LineairDBProxy::ReadPlanStep> *out,
+    std::vector<HeliosProxy::ReadPlanStep> *out,
     bool include_inner_units) {
   if (out == nullptr) {
     return plan_not_staged(thd, "NONE", "null output vector");
@@ -1164,7 +1164,7 @@ bool autogen_read_plan_from_qep(
   }
 
   std::unordered_map<TABLE *, int> table_steps;
-  std::vector<LineairDBProxy::ReadPlanStep> steps;
+  std::vector<HeliosProxy::ReadPlanStep> steps;
   std::vector<TABLE *> added_tables;
   UnsupportedQep unsupported;
 
@@ -1210,11 +1210,11 @@ bool autogen_read_plan_from_qep(
     if (added_tables[i] != nullptr) step_aliases[i].push_back(added_tables[i]);
   }
   {
-    const auto foldable = [](const LineairDBProxy::ReadPlanStep &s) {
+    const auto foldable = [](const HeliosProxy::ReadPlanStep &s) {
       return s.is_scan && s.scan_limit == 0;
     };
-    const auto same_binding = [](const LineairDBProxy::ReadPlanKeyBinding &a,
-                                 const LineairDBProxy::ReadPlanKeyBinding &b) {
+    const auto same_binding = [](const HeliosProxy::ReadPlanKeyBinding &a,
+                                 const HeliosProxy::ReadPlanKeyBinding &b) {
       return a.source_step == b.source_step && a.source_row == b.source_row &&
              a.source_offset == b.source_offset &&
              a.source_length == b.source_length &&
@@ -1224,15 +1224,15 @@ bool autogen_read_plan_from_qep(
              a.int_delta == b.int_delta;
     };
     const auto same_bindings =
-        [&](const std::vector<LineairDBProxy::ReadPlanKeyBinding> &a,
-            const std::vector<LineairDBProxy::ReadPlanKeyBinding> &b) {
+        [&](const std::vector<HeliosProxy::ReadPlanKeyBinding> &a,
+            const std::vector<HeliosProxy::ReadPlanKeyBinding> &b) {
           if (a.size() != b.size()) return false;
           for (size_t k = 0; k < a.size(); ++k)
             if (!same_binding(a[k], b[k])) return false;
           return true;
         };
-    const auto same_step = [&](const LineairDBProxy::ReadPlanStep &a,
-                               const LineairDBProxy::ReadPlanStep &b) {
+    const auto same_step = [&](const HeliosProxy::ReadPlanStep &a,
+                               const HeliosProxy::ReadPlanStep &b) {
       return a.table_name == b.table_name && a.index_name == b.index_name &&
              a.key_prefix == b.key_prefix &&
              a.end_key_prefix == b.end_key_prefix &&
@@ -1241,7 +1241,7 @@ bool autogen_read_plan_from_qep(
              same_bindings(a.end_bindings, b.end_bindings);
     };
     std::vector<uint32_t> new_index(steps.size(), 0);
-    std::vector<LineairDBProxy::ReadPlanStep> folded;
+    std::vector<HeliosProxy::ReadPlanStep> folded;
     std::vector<std::vector<TABLE *>> folded_aliases;
     folded.reserve(steps.size());
     folded_aliases.reserve(steps.size());
@@ -1289,13 +1289,13 @@ bool autogen_read_plan_from_qep(
 // stage returns false and its reads take the row path.
 bool autogen_read_plan_from_index_search(
     THD *thd, TABLE *table, uint index, const IndexSearchPlan &search,
-    std::vector<LineairDBProxy::ReadPlanStep> *out) {
+    std::vector<HeliosProxy::ReadPlanStep> *out) {
   if (out == nullptr) {
     return plan_not_staged(thd, "HANDLER", "null output vector");
   }
   out->clear();
 
-  LineairDBProxy::ReadPlanStep step;
+  HeliosProxy::ReadPlanStep step;
   std::string reason;
   if (!compile_index_search(table, index, search, &step, &reason)) {
     return plan_not_staged(thd, "HANDLER", reason);

@@ -1,4 +1,4 @@
-#include "ha_lineairdb_columnar.hh"
+#include "ha_helios_columnar.hh"
 
 #include <algorithm>
 #include <cassert>
@@ -34,15 +34,15 @@
 #include "thr_lock.h"
 
 #include "lineairdb.pb.h"
-#include "lineairdb_field_types.h"
+#include "helios_field_types.h"
 #include "duckdb_request_builder.hh"
-#include "lineairdb_proxy.hh"
+#include "helios_proxy.hh"
 
-namespace lineairdb {
-std::shared_ptr<LineairDBProxy> acquire_shared_proxy(THD *thd);
-}  // namespace lineairdb
+namespace helios {
+std::shared_ptr<HeliosProxy> acquire_shared_proxy(THD *thd);
+}  // namespace helios
 
-namespace lineairdb_columnar {
+namespace helios_columnar {
 
 namespace {
 
@@ -229,7 +229,7 @@ struct DecodedField {
 };
 
 /**
- * @brief Decode LineairDB's row-field framing into field slices.
+ * @brief Decode Helios's row-field framing into field slices.
  *
  * Each field is stored as a one-byte length-width tag, that many little-endian
  * length bytes, then the payload. A tag of 0xff carries no payload and yields
@@ -355,19 +355,19 @@ bool ExecuteDuckdbBridge(JOIN *join, Query_result *result) {
       thd->lex->secondary_engine_execution_context());
   if (ctx == nullptr || !ctx->duckdb_ready) {
     return RaiseColumnarError(thd,
-                              "LINEAIRDB_COLUMNAR: no duckdb-bridge plan");
+                              "HELIOS_COLUMNAR: no duckdb-bridge plan");
   }
 
-  std::shared_ptr<LineairDBProxy> proxy = lineairdb::acquire_shared_proxy(thd);
+  std::shared_ptr<HeliosProxy> proxy = helios::acquire_shared_proxy(thd);
   if (!proxy) {
-    return RaiseColumnarError(thd, "LINEAIRDB_COLUMNAR: no server connection");
+    return RaiseColumnarError(thd, "HELIOS_COLUMNAR: no server connection");
   }
 
   LineairDB::Protocol::TxExecuteDuckdbQuery::Response rpc;
   if (!proxy->tx_execute_duckdb_query(ctx->duckdb_request, &rpc) ||
       !rpc.ok()) {
     char message[192];
-    snprintf(message, sizeof(message), "LINEAIRDB_COLUMNAR duckdb-bridge: %s",
+    snprintf(message, sizeof(message), "HELIOS_COLUMNAR duckdb-bridge: %s",
              rpc.error().empty() ? "duckdb bridge RPC failed"
                                  : rpc.error().c_str());
     return RaiseColumnarError(thd, message);
@@ -402,7 +402,7 @@ bool ExecuteDuckdbBridge(JOIN *join, Query_result *result) {
     if (!DecodeRowFields(row, &fields) || fields.size() != expected) {
       return RaiseColumnarError(
           thd,
-          "LINEAIRDB_COLUMNAR duckdb-bridge: malformed row (DuckDB result "
+          "HELIOS_COLUMNAR duckdb-bridge: malformed row (DuckDB result "
           "column count may not match the original SELECT list)");
     }
 
@@ -452,18 +452,18 @@ bool OptimizeSecondaryEngine(THD *, LEX *lex) {
       lex->secondary_engine_execution_context());
   if (ctx == nullptr) {
     return RaiseColumnarError(
-        lex->thd, "LINEAIRDB_COLUMNAR statement context is not available");
+        lex->thd, "HELIOS_COLUMNAR statement context is not available");
   }
 
   Query_block *query_block = lex->unit->first_query_block();
   JOIN *join = query_block != nullptr ? query_block->join : nullptr;
   if (join == nullptr) {
     return RaiseColumnarError(lex->thd,
-                              "LINEAIRDB_COLUMNAR unsupported shape: no JOIN");
+                              "HELIOS_COLUMNAR unsupported shape: no JOIN");
   }
 
   if (!ctx->request_build_attempted || !ctx->refusal.empty()) {
-    std::string message = "LINEAIRDB_COLUMNAR duckdb-query: ";
+    std::string message = "HELIOS_COLUMNAR duckdb-query: ";
     message.append(ctx->request_build_attempted
                        ? ctx->refusal
                        : std::string("request was not built before optimization"));
@@ -539,16 +539,16 @@ bool CompareJoinCost(THD *thd, const JOIN &join, double optimizer_cost,
 
 handler *CreateColumnarHandler(handlerton *hton, TABLE_SHARE *table_share,
                                bool, MEM_ROOT *mem_root) {
-  return new (mem_root) ha_lineairdb_columnar(hton, table_share);
+  return new (mem_root) ha_helios_columnar(hton, table_share);
 }
 
 }  // namespace
 
-ha_lineairdb_columnar::ha_lineairdb_columnar(handlerton *hton,
+ha_helios_columnar::ha_helios_columnar(handlerton *hton,
                                              TABLE_SHARE *table_share_arg)
     : handler(hton, table_share_arg) {}
 
-int ha_lineairdb_columnar::open(const char *, int, unsigned int,
+int ha_helios_columnar::open(const char *, int, unsigned int,
                                 const dd::Table *) {
   THR_LOCK *lock =
       loaded_tables->lock(table_share->db.str, table_share->table_name.str);
@@ -561,7 +561,7 @@ int ha_lineairdb_columnar::open(const char *, int, unsigned int,
   return 0;
 }
 
-int ha_lineairdb_columnar::info(unsigned int flags) {
+int ha_helios_columnar::info(unsigned int flags) {
   // Statistics come from the primary engine when it is available.
   handler *primary = ha_get_primary_handler();
   if (primary == nullptr) return 0;
@@ -605,7 +605,7 @@ int ha_lineairdb_columnar::info(unsigned int flags) {
   return 0;
 }
 
-ha_rows ha_lineairdb_columnar::records_in_range(unsigned int index,
+ha_rows ha_helios_columnar::records_in_range(unsigned int index,
                                                 key_range *min_key,
                                                 key_range *max_key) {
   handler *primary = ha_get_primary_handler();
@@ -614,7 +614,7 @@ ha_rows ha_lineairdb_columnar::records_in_range(unsigned int index,
                                                         max_key);
 }
 
-unsigned long ha_lineairdb_columnar::index_flags(unsigned int index,
+unsigned long ha_helios_columnar::index_flags(unsigned int index,
                                                  unsigned int part,
                                                  bool all_parts) const {
   const handler *primary = ha_get_primary_handler();
@@ -628,7 +628,7 @@ unsigned long ha_lineairdb_columnar::index_flags(unsigned int index,
 // Builds the request once per statement, at the only stock point after
 // resolution and before optimization. The outcome is recorded, not raised:
 // a non-zero return here reads as a lock error and aborts the statement.
-int ha_lineairdb_columnar::external_lock(THD *thd, int lock_type) {
+int ha_helios_columnar::external_lock(THD *thd, int lock_type) {
   if (lock_type == F_UNLCK) return 0;
   auto *ctx = static_cast<ColumnarExecutionContext *>(
       thd->lex->secondary_engine_execution_context());
@@ -652,7 +652,7 @@ int ha_lineairdb_columnar::external_lock(THD *thd, int lock_type) {
   return 0;
 }
 
-THR_LOCK_DATA **ha_lineairdb_columnar::store_lock(THD *, THR_LOCK_DATA **to,
+THR_LOCK_DATA **ha_helios_columnar::store_lock(THD *, THR_LOCK_DATA **to,
                                                   thr_lock_type lock_type) {
   if (lock_type != TL_IGNORE && lock_data_.type == TL_UNLOCK)
     lock_data_.type = lock_type;
@@ -660,13 +660,13 @@ THR_LOCK_DATA **ha_lineairdb_columnar::store_lock(THD *, THR_LOCK_DATA **to,
   return to;
 }
 
-int ha_lineairdb_columnar::load_table(const TABLE &table) {
+int ha_helios_columnar::load_table(const TABLE &table) {
   assert(table.file != nullptr);
   loaded_tables->add(table.s->db.str, table.s->table_name.str);
   return 0;
 }
 
-int ha_lineairdb_columnar::unload_table(const char *db_name,
+int ha_helios_columnar::unload_table(const char *db_name,
                                         const char *table_name,
                                         bool error_if_not_loaded) {
   if (error_if_not_loaded &&
@@ -680,36 +680,36 @@ int ha_lineairdb_columnar::unload_table(const char *db_name,
   return 0;
 }
 
-}  // namespace lineairdb_columnar
+}  // namespace helios_columnar
 
-struct st_mysql_storage_engine lineairdb_columnar_storage_engine = {
+struct st_mysql_storage_engine helios_columnar_storage_engine = {
     MYSQL_HANDLERTON_INTERFACE_VERSION};
 
-int lineairdb_columnar_init(void *p) {
-  lineairdb_columnar::loaded_tables = new lineairdb_columnar::LoadedTables();
+int helios_columnar_init(void *p) {
+  helios_columnar::loaded_tables = new helios_columnar::LoadedTables();
 
   handlerton *hton = static_cast<handlerton *>(p);
-  hton->create = lineairdb_columnar::CreateColumnarHandler;
+  hton->create = helios_columnar::CreateColumnarHandler;
   hton->state = SHOW_OPTION_YES;
   hton->flags = HTON_IS_SECONDARY_ENGINE;
   hton->db_type = DB_TYPE_UNKNOWN;
-  hton->prepare_secondary_engine = lineairdb_columnar::PrepareSecondaryEngine;
-  hton->optimize_secondary_engine = lineairdb_columnar::OptimizeSecondaryEngine;
-  hton->compare_secondary_engine_cost = lineairdb_columnar::CompareJoinCost;
+  hton->prepare_secondary_engine = helios_columnar::PrepareSecondaryEngine;
+  hton->optimize_secondary_engine = helios_columnar::OptimizeSecondaryEngine;
+  hton->compare_secondary_engine_cost = helios_columnar::CompareJoinCost;
   hton->secondary_engine_modify_access_path_cost =
-      lineairdb_columnar::ModifyAccessPathCost;
+      helios_columnar::ModifyAccessPathCost;
   hton->get_secondary_engine_offload_or_exec_fail_reason =
-      lineairdb_columnar::GetColumnarFailReason;
+      helios_columnar::GetColumnarFailReason;
   hton->set_secondary_engine_offload_fail_reason =
-      lineairdb_columnar::SetColumnarFailReason;
+      helios_columnar::SetColumnarFailReason;
   hton->secondary_engine_flags =
       MakeSecondaryEngineFlags(SecondaryEngineFlag::SUPPORTS_HASH_JOIN,
                                SecondaryEngineFlag::SUPPORTS_NESTED_LOOP_JOIN);
   return 0;
 }
 
-int lineairdb_columnar_deinit(void *) {
-  delete lineairdb_columnar::loaded_tables;
-  lineairdb_columnar::loaded_tables = nullptr;
+int helios_columnar_deinit(void *) {
+  delete helios_columnar::loaded_tables;
+  helios_columnar::loaded_tables = nullptr;
   return 0;
 }

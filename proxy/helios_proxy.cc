@@ -10,28 +10,28 @@
 #include <iostream>
 #include <vector>
 
-#include "lineairdb_proxy.hh"
+#include "helios_proxy.hh"
 #include "rpc_trace.hh"
 #include "../common/log.h"
 
 
 
-LineairDBProxy::LineairDBProxy(const std::string& host, int port)
+HeliosProxy::HeliosProxy(const std::string& host, int port)
     : socket_fd_(-1), connected_(false), host_(host), port_(port) {
-    LOG_INFO("LineairDBProxy(%p): connecting to %s:%d",
+    LOG_INFO("HeliosProxy(%p): connecting to %s:%d",
              static_cast<const void*>(this), host_.c_str(), port_);
     if (!connect(host_, port_)) {
-        std::cerr << "Failed to connect to LineairDB service at " << host_ << ":" << port_ << std::endl;
+        std::cerr << "Failed to connect to Helios service at " << host_ << ":" << port_ << std::endl;
     }
 }
 
-LineairDBProxy::~LineairDBProxy() {
-    LOG_INFO("LineairDBProxy(%p): destructor, connected=%s",
+HeliosProxy::~HeliosProxy() {
+    LOG_INFO("HeliosProxy(%p): destructor, connected=%s",
              static_cast<const void*>(this), connected_ ? "true" : "false");
     disconnect();
 }
 
-bool LineairDBProxy::connect(const std::string& host, int port) {
+bool HeliosProxy::connect(const std::string& host, int port) {
     if (connected_) {
         disconnect();
     }
@@ -71,9 +71,9 @@ bool LineairDBProxy::connect(const std::string& host, int port) {
     return true;
 }
 
-void LineairDBProxy::disconnect() {
+void HeliosProxy::disconnect() {
     if (socket_fd_ >= 0) {
-        LOG_INFO("LineairDBProxy(%p): disconnecting socket_fd=%d",
+        LOG_INFO("HeliosProxy(%p): disconnecting socket_fd=%d",
                  static_cast<const void*>(this), socket_fd_);
         close(socket_fd_);
         socket_fd_ = -1;
@@ -81,16 +81,16 @@ void LineairDBProxy::disconnect() {
     connected_ = false;
 }
 
-bool LineairDBProxy::is_connected() const {
+bool HeliosProxy::is_connected() const {
     return connected_;
 }
 
 // A transport failure closes the channel; the next RPC opens a new one.
-bool LineairDBProxy::ensure_connected() {
+bool HeliosProxy::ensure_connected() {
     return connected_ || connect(host_, port_);
 }
 
-bool LineairDBProxy::fetch_table_stats(
+bool HeliosProxy::fetch_table_stats(
     const std::string& ndv_table,
     const std::vector<std::pair<std::string, uint32_t>>& ndv_indexes,
     bool force_ndv) {
@@ -138,7 +138,7 @@ bool LineairDBProxy::fetch_table_stats(
     return true;
 }
 
-LineairDBProxy::ReadResult LineairDBProxy::tx_read(
+HeliosProxy::ReadResult HeliosProxy::tx_read(
     const std::string& table_name, const std::string& key) {
     ReadResult result;
     if (!ensure_connected()) {
@@ -163,7 +163,7 @@ LineairDBProxy::ReadResult LineairDBProxy::tx_read(
     return result;
 }
 
-std::vector<LineairDBProxy::ReadResult> LineairDBProxy::tx_batch_read(
+std::vector<HeliosProxy::ReadResult> HeliosProxy::tx_batch_read(
     const std::vector<ReadKey>& keys) {
     if (!ensure_connected()) {
         LOG_ERROR("RPC failed: Not connected to server");
@@ -197,7 +197,7 @@ std::vector<LineairDBProxy::ReadResult> LineairDBProxy::tx_batch_read(
     return results;
 }
 
-LineairDBProxy::ScanResult LineairDBProxy::tx_scan(
+HeliosProxy::ScanResult HeliosProxy::tx_scan(
     const std::string& table_name, const std::string& start_key,
     const std::string& end_key, uint64_t row_limit, bool reverse_scan,
     bool keys_only) {
@@ -236,7 +236,7 @@ LineairDBProxy::ScanResult LineairDBProxy::tx_scan(
     return result;
 }
 
-LineairDBProxy::ScanIndexResult LineairDBProxy::tx_scan_index(
+HeliosProxy::ScanIndexResult HeliosProxy::tx_scan_index(
     const std::string& table_name, const std::string& index_name,
     const std::string& start_key, const std::string& end_key,
     uint64_t row_limit, bool reverse_scan, bool keys_only) {
@@ -278,7 +278,7 @@ LineairDBProxy::ScanIndexResult LineairDBProxy::tx_scan_index(
     return result;
 }
 
-bool LineairDBProxy::tx_commit(
+bool HeliosProxy::tx_commit(
     const std::vector<ReadEntry>& reads,
     const std::vector<RangeReadEntry>& range_reads,
     const std::vector<WriteOp>& ops,
@@ -384,7 +384,7 @@ bool LineairDBProxy::tx_commit(
 
 namespace {
 void fill_bindings(
-    const std::vector<LineairDBProxy::ReadPlanKeyBinding>& bindings,
+    const std::vector<HeliosProxy::ReadPlanKeyBinding>& bindings,
     google::protobuf::RepeatedPtrField<
         LineairDB::Protocol::TxExecuteReadPlan::KeyBinding>* out) {
     for (const auto& binding : bindings) {
@@ -402,7 +402,7 @@ void fill_bindings(
 }
 }  // namespace
 
-LineairDBProxy::ReadPlanResult LineairDBProxy::tx_execute_read_plan(
+HeliosProxy::ReadPlanResult HeliosProxy::tx_execute_read_plan(
     const std::vector<ReadPlanStep>& steps) {
     ReadPlanResult result;
     if (!ensure_connected()) {
@@ -541,7 +541,7 @@ LineairDBProxy::ReadPlanResult LineairDBProxy::tx_execute_read_plan(
     return result;
 }
 
-bool LineairDBProxy::tx_execute_duckdb_query(
+bool HeliosProxy::tx_execute_duckdb_query(
     const LineairDB::Protocol::TxExecuteDuckdbQuery::Request& request,
     LineairDB::Protocol::TxExecuteDuckdbQuery::Response* response) {
     if (!ensure_connected()) {
@@ -560,7 +560,7 @@ bool LineairDBProxy::tx_execute_duckdb_query(
     return true;
 }
 
-bool LineairDBProxy::db_create_table(
+bool HeliosProxy::db_create_table(
     const std::string& table_name,
     const std::vector<uint32_t>& pax_field_max_bytes,
     const std::vector<uint32_t>& pax_field_kind,
@@ -594,7 +594,7 @@ bool LineairDBProxy::db_create_table(
     return response.success();
 }
 
-LineairDBProxy::HiddenKeyReservation LineairDBProxy::db_allocate_hidden_keys(
+HeliosProxy::HiddenKeyReservation HeliosProxy::db_allocate_hidden_keys(
     const std::string& table_name, uint32_t count) {
     HiddenKeyReservation reservation;
     if (!ensure_connected()) {
@@ -633,7 +633,7 @@ LineairDBProxy::HiddenKeyReservation LineairDBProxy::db_allocate_hidden_keys(
     return reservation;
 }
 
-bool LineairDBProxy::db_create_secondary_index(const std::string& table_name,
+bool HeliosProxy::db_create_secondary_index(const std::string& table_name,
                                                 const std::string& index_name,
                                                 uint32_t index_type) {
     LOG_DEBUG("CLIENT: db_create_secondary_index called with table=%s, index=%s, type=%u",
@@ -660,7 +660,7 @@ bool LineairDBProxy::db_create_secondary_index(const std::string& table_name,
 }
 
 template<typename RequestType, typename ResponseType>
-bool LineairDBProxy::send_protobuf_message(const RequestType& request,
+bool HeliosProxy::send_protobuf_message(const RequestType& request,
                                            ResponseType& response,
                                            MessageType message_type,
                                            const std::string& meta) {
@@ -686,7 +686,7 @@ bool LineairDBProxy::send_protobuf_message(const RequestType& request,
 
 // Sends a protobuf request and receives the flat binary reply of TX_EXECUTE_READ_PLAN.
 template<typename RequestType>
-bool LineairDBProxy::send_protobuf_recv_binary(const RequestType& request,
+bool HeliosProxy::send_protobuf_recv_binary(const RequestType& request,
                                                 std::string& raw_response,
                                                 MessageType message_type,
                                                 const std::string& meta) {
@@ -695,7 +695,7 @@ bool LineairDBProxy::send_protobuf_recv_binary(const RequestType& request,
                                     message_type, meta);
 }
 
-bool LineairDBProxy::send_message_with_header(const std::string& serialized_request,
+bool HeliosProxy::send_message_with_header(const std::string& serialized_request,
                                               std::string& serialized_response,
                                               MessageType message_type,
                                               const std::string& meta) {
@@ -711,7 +711,7 @@ bool LineairDBProxy::send_message_with_header(const std::string& serialized_requ
     return false;
 }
 
-bool LineairDBProxy::exchange_message(const std::string& serialized_request,
+bool HeliosProxy::exchange_message(const std::string& serialized_request,
                                       std::string& serialized_response,
                                       MessageType message_type,
                                       const std::string& meta) {

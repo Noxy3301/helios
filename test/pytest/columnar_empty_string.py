@@ -3,7 +3,7 @@
 The proxy row format encodes a zero-length field with one marker byte, so a
 VARCHAR '' and a SQL NULL share it. The null bitmap in field 0 of the row is
 what separates them, and the row path reads it (proxy/row_codec.cc). This
-file pins that the analytical path (SECONDARY_ENGINE=LINEAIRDB_COLUMNAR,
+file pins that the analytical path (SECONDARY_ENGINE=HELIOS_COLUMNAR,
 served by the DuckDB bridge) agrees with it: WHERE c = '', WHERE c IS NULL,
 COUNT(c), GROUP BY c and the select list must return the same answers as the
 row path.
@@ -46,7 +46,7 @@ SERVER_ENV = ("HELIOS_DEBUG_SYNC_PAX_VIEW_AFTER_FENCE"
 # to two epochs, so this also clears it.
 WRITE_AT_S = 0.35
 
-DB = "ha_lineairdb_test"
+DB = "ha_helios_test"
 # One table per scenario: DROP TABLE leaves the rows in the storage, so a
 # reused name collides on the primary key.
 TABLES = ("empty_string_place", "empty_string_image")
@@ -192,7 +192,7 @@ def create_table(cursor):
     cursor.execute(
         f"CREATE TABLE {TABLE} (id INT PRIMARY KEY, a VARCHAR(32), "
         "b VARCHAR(32) NOT NULL, c VARCHAR(32)) "
-        "ENGINE=LineairDB SECONDARY_ENGINE=LINEAIRDB_COLUMNAR")
+        "ENGINE=Helios SECONDARY_ENGINE=HELIOS_COLUMNAR")
     for row in ROWS:
         cursor.execute(f"INSERT INTO {TABLE} VALUES (%s, %s, %s, %s)", row)
     cursor.execute(f"ALTER TABLE {TABLE} SECONDARY_LOAD")

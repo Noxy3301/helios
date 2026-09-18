@@ -1,4 +1,4 @@
-#include "storage/lineairdb/ha_lineairdb.hh"
+#include "storage/helios/ha_helios.hh"
 #include "../common/log.h"
 
 #include <algorithm>
@@ -16,9 +16,9 @@
 // for ::strcasecmp
 #include <strings.h>
 
-#include "lineairdb_field_types.h"
-#include "lineairdb_index_search.hh"
-#include "lineairdb_keyenc.hh"
+#include "helios_field_types.h"
+#include "helios_index_search.hh"
+#include "helios_keyenc.hh"
 #include "lineairdb.pb.h"
 #include "my_dbug.h"
 #include "mysql/plugin.h"
@@ -157,7 +157,7 @@ RangeScanLimit range_scan_limit_for_order(
     return scan_limit;
   }
 
-  // ASC uses the natural key order; DESC uses LineairDB ScanReverse
+  // ASC uses the natural key order; DESC uses Helios ScanReverse
   if (order_by_matches_key_suffix(qb, key, matched_prefix, ORDER_ASC)) {
     scan_limit.row_limit = unit->select_limit_cnt;
     return scan_limit;
@@ -171,7 +171,7 @@ RangeScanLimit range_scan_limit_for_order(
   return scan_limit;
 }
 
-uint ha_lineairdb::calculate_key_parts_from_length(KEY *key, uint key_length) {
+uint ha_helios::calculate_key_parts_from_length(KEY *key, uint key_length) {
   if (key == nullptr || key_length == 0)
     return 0;
 
@@ -195,7 +195,7 @@ uint ha_lineairdb::calculate_key_parts_from_length(KEY *key, uint key_length) {
   return parts;
 }
 
-uint ha_lineairdb::count_used_key_parts(const KEY *key_info,
+uint ha_helios::count_used_key_parts(const KEY *key_info,
                                         key_part_map keypart_map) {
   uint count = 0;
   for (uint i = 0; i < key_info->user_defined_key_parts; i++) {
@@ -207,7 +207,7 @@ uint ha_lineairdb::count_used_key_parts(const KEY *key_info,
   return count;
 }
 
-void ha_lineairdb::build_search_plan(const uchar *key, key_part_map keypart_map,
+void ha_helios::build_search_plan(const uchar *key, key_part_map keypart_map,
                                      enum ha_rkey_function find_flag,
                                      KEY *key_info) {
   // 1. Reset state
@@ -261,8 +261,7 @@ void ha_lineairdb::build_search_plan(const uchar *key, key_part_map keypart_map,
 
   // 4. Serialize boundaries
   if (key != nullptr) {
-    current_plan_.start_key_serialized =
-        convert_key_to_ldbformat(key, keypart_map);
+    current_plan_.start_key_serialized = encode_key(key, keypart_map);
 
     // same group boundary (prefix operations)
     if (current_plan_.op == IndexSearchOp::kSameKeyMaterialize ||
@@ -278,10 +277,10 @@ void ha_lineairdb::build_search_plan(const uchar *key, key_part_map keypart_map,
   // end_range processing
   if (end_range != nullptr) {
     current_plan_.end_key_serialized =
-        convert_key_to_ldbformat(end_range->key, end_range->keypart_map);
+        encode_key(end_range->key, end_range->keypart_map);
 
     if (end_range->flag != HA_READ_BEFORE_KEY) {
-      // SQL inclusive upper bound must become LineairDB's exclusive upper
+      // SQL inclusive upper bound must become Helios's exclusive upper
       // bound. This is required for both full keys (k <= 30) and partial-key
       // prefix ranges.
       current_plan_.end_key_serialized =
@@ -290,7 +289,7 @@ void ha_lineairdb::build_search_plan(const uchar *key, key_part_map keypart_map,
   }
 }
 
-int ha_lineairdb::execute_plan(uchar *buf, LineairDBTransaction *tx) {
+int ha_helios::execute_plan(uchar *buf, HeliosTransaction *tx) {
   switch (current_plan_.op) {
   case IndexSearchOp::kIndexFirst:
     return execute_index_first(buf, tx);
@@ -311,10 +310,10 @@ int ha_lineairdb::execute_plan(uchar *buf, LineairDBTransaction *tx) {
   }
 }
 
-int ha_lineairdb::execute_index_first(uchar *buf, LineairDBTransaction *tx) {
+int ha_helios::execute_index_first(uchar *buf, HeliosTransaction *tx) {
   std::string start_key = "";
   std::string end_key = current_plan_.end_key_serialized.empty()
-                            ? lineairdb_keyenc::scan_end_sentinel()
+                            ? helios_keyenc::scan_end_sentinel()
                             : current_plan_.end_key_serialized;
 
   if (current_plan_.is_primary && !statement_uses_read_plan(ha_thd())) {
@@ -351,7 +350,7 @@ int ha_lineairdb::execute_index_first(uchar *buf, LineairDBTransaction *tx) {
   return fetch_and_set_current_result(buf, tx);
 }
 
-int ha_lineairdb::execute_unique_point(uchar *buf, LineairDBTransaction *tx) {
+int ha_helios::execute_unique_point(uchar *buf, HeliosTransaction *tx) {
   if (current_plan_.is_primary) {
     auto result = tx->read(current_plan_.start_key_serialized);
 
@@ -363,7 +362,7 @@ int ha_lineairdb::execute_unique_point(uchar *buf, LineairDBTransaction *tx) {
       return HA_ERR_KEY_NOT_FOUND;
     }
 
-    if (set_fields_from_lineairdb(buf, result.first, result.second)) {
+    if (set_fields_from_helios(buf, result.first, result.second)) {
       tx->set_status_to_abort();
       return HA_ERR_OUT_OF_MEM;
     }
@@ -396,8 +395,8 @@ int ha_lineairdb::execute_unique_point(uchar *buf, LineairDBTransaction *tx) {
   }
 }
 
-int ha_lineairdb::execute_same_key_materialize(uchar *buf,
-                                               LineairDBTransaction *tx) {
+int ha_helios::execute_same_key_materialize(uchar *buf,
+                                               HeliosTransaction *tx) {
   const std::string &prefix = current_plan_.same_group_prefix_serialized;
   const std::string &prefix_end = current_plan_.same_group_end_serialized;
 
@@ -450,7 +449,7 @@ int ha_lineairdb::execute_same_key_materialize(uchar *buf,
   return fetch_and_set_current_result(buf, tx);
 }
 
-int ha_lineairdb::execute_prefix_first(uchar *buf, LineairDBTransaction *tx) {
+int ha_helios::execute_prefix_first(uchar *buf, HeliosTransaction *tx) {
   const std::string &prefix = current_plan_.same_group_prefix_serialized;
   const std::string &prefix_end = current_plan_.same_group_end_serialized;
 
@@ -497,8 +496,8 @@ int ha_lineairdb::execute_prefix_first(uchar *buf, LineairDBTransaction *tx) {
 /**
  * @brief kRangeMaterialize: range search (AFTER_KEY, KEY_OR_NEXT, etc.)
  */
-int ha_lineairdb::execute_range_materialize(uchar *buf,
-                                            LineairDBTransaction *tx) {
+int ha_helios::execute_range_materialize(uchar *buf,
+                                            HeliosTransaction *tx) {
   std::string effective_start = current_plan_.start_key_serialized;
   std::string effective_end = current_plan_.end_key_serialized;
 
@@ -549,7 +548,7 @@ int ha_lineairdb::execute_range_materialize(uchar *buf,
   return fetch_and_set_current_result(buf, tx);
 }
 
-int ha_lineairdb::execute_prev_key(uchar *buf, LineairDBTransaction *tx) {
+int ha_helios::execute_prev_key(uchar *buf, HeliosTransaction *tx) {
   const std::string &target_key = current_plan_.start_key_serialized;
   // HA_READ_BEFORE_KEY : SQL < target → already exclusive end.
   // HA_READ_KEY_OR_PREV: SQL <= target → convert via build_prefix_range_end so
@@ -583,7 +582,7 @@ int ha_lineairdb::execute_prev_key(uchar *buf, LineairDBTransaction *tx) {
   return fetch_and_set_current_result(buf, tx);
 }
 
-int ha_lineairdb::execute_prefix_last(uchar *buf, LineairDBTransaction *tx) {
+int ha_helios::execute_prefix_last(uchar *buf, HeliosTransaction *tx) {
   if (current_plan_.find_flag == HA_READ_PREFIX_LAST_OR_PREV) {
     const std::string &prefix = current_plan_.same_group_prefix_serialized;
     const std::string &prefix_end = current_plan_.same_group_end_serialized;
@@ -699,7 +698,7 @@ int ha_lineairdb::execute_prefix_last(uchar *buf, LineairDBTransaction *tx) {
   return fetch_and_set_current_result(buf, tx);
 }
 
-void ha_lineairdb::batch_fetch_secondary_payloads(LineairDBTransaction *tx) {
+void ha_helios::batch_fetch_secondary_payloads(HeliosTransaction *tx) {
   if (secondary_index_results_.empty()) return;
 
   auto results = tx->batch_read(secondary_index_results_);
@@ -712,8 +711,8 @@ void ha_lineairdb::batch_fetch_secondary_payloads(LineairDBTransaction *tx) {
   }
 }
 
-int ha_lineairdb::fetch_and_set_current_result(uchar *buf,
-                                               LineairDBTransaction *tx) {
+int ha_helios::fetch_and_set_current_result(uchar *buf,
+                                               HeliosTransaction *tx) {
   if (secondary_index_results_.empty()) {
     return HA_ERR_KEY_NOT_FOUND;
   }
@@ -751,7 +750,7 @@ int ha_lineairdb::fetch_and_set_current_result(uchar *buf,
     value_size = result.second;
   }
 
-  if (set_fields_from_lineairdb(buf, value_ptr, value_size)) {
+  if (set_fields_from_helios(buf, value_ptr, value_size)) {
     tx->set_status_to_abort();
     return HA_ERR_OUT_OF_MEM;
   }

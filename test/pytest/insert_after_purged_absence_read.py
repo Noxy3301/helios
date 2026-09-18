@@ -25,7 +25,7 @@ from utils.connection import get_connection  # noqa: E402
 
 SERVER = os.path.join(ROOT, "build", "server", "helios-storage")
 MYSQLD_PORT = "3307"
-DBNAME = "ha_lineairdb_purge_race"
+DBNAME = "ha_helios_purge_race"
 SYNC_ENV = "HELIOS_DEBUG_SYNC_REAPER_PURGE_LOCKED_WINDOW"
 
 SERVER_PORT_WAIT_SECONDS = 20
@@ -146,7 +146,7 @@ def test_insert_after_a_purged_absence_read(user, password,
                            id INT NOT NULL,
                            v VARCHAR(32) NOT NULL,
                            PRIMARY KEY (id)
-                       ) ENGINE = LineairDB""")
+                       ) ENGINE = Helios""")
     cursor.execute(f"INSERT INTO {DBNAME}.t VALUES (1, 'old')")
     cursor.execute(f"DELETE FROM {DBNAME}.t WHERE id = 1")
 

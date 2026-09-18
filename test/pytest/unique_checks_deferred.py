@@ -49,8 +49,8 @@ def is_commit_duplicate(errno):
 
 
 def reset(db, cursor):
-    cursor.execute('DROP DATABASE IF EXISTS ha_lineairdb_test')
-    cursor.execute('CREATE DATABASE ha_lineairdb_test')
+    cursor.execute('DROP DATABASE IF EXISTS ha_helios_test')
+    cursor.execute('CREATE DATABASE ha_helios_test')
     db.commit()
 
 
@@ -63,19 +63,19 @@ def create_table(cursor, unique_index=True, second_index=False):
     name_column = "VARCHAR(63) NOT NULL" if second_index else "VARCHAR(64)"
     extra = ",\n            INDEX name_idx (name)" if second_index else ""
     cursor.execute(
-        f'''CREATE TABLE ha_lineairdb_test.{table} (
+        f'''CREATE TABLE ha_helios_test.{table} (
             id INT NOT NULL,
             uval VARCHAR(63) NOT NULL,
             name {name_column},
             PRIMARY KEY (id),
             {index} uval_idx (uval){extra}
-        ) ENGINE = LineairDB'''
+        ) ENGINE = Helios'''
     )
     return table
 
 
 # Enough rows that one statement carries more than the 1024-key probe batch
-# (proxy/ha_lineairdb.hh kInsertProbeBatch). Only a unique_checks=1 statement
+# (proxy/ha_helios.hh kInsertProbeBatch). Only a unique_checks=1 statement
 # probes, so the cases below that turn it off just exercise one commit
 # carrying more than 1024 writes.
 BULK_ROWS = 1100
@@ -91,17 +91,17 @@ def bulk_rows(count, duplicate_of=None, duplicate_at=None):
 
 def insert_sql(table, rows):
     values = ", ".join(f"({i}, '{v}', '{n}')" for i, v, n in rows)
-    return f"INSERT INTO ha_lineairdb_test.{table} (id, uval, name) VALUES {values}"
+    return f"INSERT INTO ha_helios_test.{table} (id, uval, name) VALUES {values}"
 
 
 def row_count(cursor, table):
-    cursor.execute(f'SELECT COUNT(*) FROM ha_lineairdb_test.{table}')
+    cursor.execute(f'SELECT COUNT(*) FROM ha_helios_test.{table}')
     return cursor.fetchone()[0]
 
 
 def index_ids(cursor, table, value):
     cursor.execute(
-        f"SELECT id FROM ha_lineairdb_test.{table} "
+        f"SELECT id FROM ha_helios_test.{table} "
         f"FORCE INDEX (uval_idx) WHERE uval = '{value}'"
     )
     return sorted(row[0] for row in cursor.fetchall())
@@ -290,7 +290,7 @@ def test_insert_then_update(cursor, unique_checks, unique_index=True):
 
     errno, failed_at = run_transaction(cursor, [
         insert_sql(table, [(1, 'before@example.com', 'first')]),
-        f"UPDATE ha_lineairdb_test.{table} SET uval = 'after@example.com' WHERE id = 1",
+        f"UPDATE ha_helios_test.{table} SET uval = 'after@example.com' WHERE id = 1",
     ])
     if errno is not None:
         print(f"\tFailed: rejected with {errno} on {failed_at}")
@@ -320,7 +320,7 @@ def test_bulk_distinct(cursor):
         return 1
 
     total = row_count(cursor, table)
-    cursor.execute(f"SELECT COUNT(*) FROM ha_lineairdb_test.{table} "
+    cursor.execute(f"SELECT COUNT(*) FROM ha_helios_test.{table} "
                    f"FORCE INDEX (uval_idx) WHERE uval >= '{rows[0][1]}' "
                    f"AND uval <= '{rows[-1][1]}'")
     by_index = cursor.fetchone()[0]
@@ -495,7 +495,7 @@ def test_concurrent_sessions(cursor, user, password):
     table = create_table(cursor)
     # Read back over the index both sessions have written to, to check the
     # lookup itself does not reject either of them.
-    lookup_sql = (f"SELECT id FROM ha_lineairdb_test.{table} "
+    lookup_sql = (f"SELECT id FROM ha_helios_test.{table} "
                   "FORCE INDEX (uval_idx) WHERE uval = 'absent@example.com'")
 
     session_a = get_connection(user=user, password=password)
@@ -616,7 +616,7 @@ def test_rpc_shape(user, password):
         db.autocommit = True
         cursor = db.cursor()
         # DDL is per-mysqld, so this node creates the table it will write to
-        cursor.execute("CREATE DATABASE IF NOT EXISTS ha_lineairdb_test")
+        cursor.execute("CREATE DATABASE IF NOT EXISTS ha_helios_test")
         table = create_table(cursor)
 
         seen = {}

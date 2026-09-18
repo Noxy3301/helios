@@ -12,7 +12,7 @@ import mysql.connector
 
 from utils.connection import get_connection
 
-DBNAME = "ha_lineairdb_pax_limits"
+DBNAME = "ha_helios_pax_limits"
 
 # Widest payload a PAX cell holds (proxy/ddl.cc kMaxCellBytes).
 MAX_CELL_BYTES = 2048
@@ -48,7 +48,7 @@ def create_table(cursor, table, column):
             id INT NOT NULL,
             c {column},
             PRIMARY KEY (id)
-        ) ENGINE = LineairDB""")
+        ) ENGINE = Helios""")
 
 
 def table_exists(cursor, table):

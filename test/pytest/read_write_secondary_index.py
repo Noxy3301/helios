@@ -10,23 +10,23 @@ def test_write_operation(db, cursor):
     
     table_name = f"test_write_{int(time.time() * 1000000)}"
     
-    cursor.execute(f'''CREATE TABLE ha_lineairdb_test.{table_name} (
+    cursor.execute(f'''CREATE TABLE ha_helios_test.{table_name} (
         title VARCHAR(50) NOT NULL,
         content VARCHAR(255),
         INDEX title_idx (title)
-    ) ENGINE = LineairDB''')
+    ) ENGINE = Helios''')
     db.commit()
     
-    cursor.execute(f'INSERT INTO ha_lineairdb_test.{table_name} (title, content) VALUES ("alice", "test data 1")')
-    cursor.execute(f'INSERT INTO ha_lineairdb_test.{table_name} (title, content) VALUES ("bob", "test data 2")')
-    cursor.execute(f'INSERT INTO ha_lineairdb_test.{table_name} (title, content) VALUES ("carol", "test data 3")')
+    cursor.execute(f'INSERT INTO ha_helios_test.{table_name} (title, content) VALUES ("alice", "test data 1")')
+    cursor.execute(f'INSERT INTO ha_helios_test.{table_name} (title, content) VALUES ("bob", "test data 2")')
+    cursor.execute(f'INSERT INTO ha_helios_test.{table_name} (title, content) VALUES ("carol", "test data 3")')
     db.commit()
     
-    cursor.execute(f'SELECT COUNT(*) FROM ha_lineairdb_test.{table_name}')
+    cursor.execute(f'SELECT COUNT(*) FROM ha_helios_test.{table_name}')
     count = cursor.fetchone()[0]
     if count != 3:
         print(f"\tFailed: expected 3 rows, got {count}")
-        cursor.execute(f'SELECT title, content FROM ha_lineairdb_test.{table_name}')
+        cursor.execute(f'SELECT title, content FROM ha_helios_test.{table_name}')
         print("\tActual data:", cursor.fetchall())
         return 1
     
@@ -39,26 +39,26 @@ def test_read_operation(db, cursor):
     
     table_name = f"test_read_{int(time.time() * 1000000)}"
     
-    cursor.execute(f'''CREATE TABLE ha_lineairdb_test.{table_name} (
+    cursor.execute(f'''CREATE TABLE ha_helios_test.{table_name} (
         title VARCHAR(50) NOT NULL,
         content VARCHAR(255),
         INDEX title_idx (title)
-    ) ENGINE = LineairDB''')
+    ) ENGINE = Helios''')
     db.commit()
     
-    cursor.execute(f'INSERT INTO ha_lineairdb_test.{table_name} (title, content) VALUES ("alice", "data1")')
-    cursor.execute(f'INSERT INTO ha_lineairdb_test.{table_name} (title, content) VALUES ("bob", "data2")')
-    cursor.execute(f'INSERT INTO ha_lineairdb_test.{table_name} (title, content) VALUES ("carol", "data3")')
+    cursor.execute(f'INSERT INTO ha_helios_test.{table_name} (title, content) VALUES ("alice", "data1")')
+    cursor.execute(f'INSERT INTO ha_helios_test.{table_name} (title, content) VALUES ("bob", "data2")')
+    cursor.execute(f'INSERT INTO ha_helios_test.{table_name} (title, content) VALUES ("carol", "data3")')
     db.commit()
     
-    cursor.execute(f'SELECT title, content FROM ha_lineairdb_test.{table_name} WHERE title = "bob"')
+    cursor.execute(f'SELECT title, content FROM ha_helios_test.{table_name} WHERE title = "bob"')
     rows = cursor.fetchall()
     if len(rows) != 1 or rows[0][0] != "bob" or rows[0][1] != "data2":
         print("\tFailed: expected ('bob', 'data2')")
         print("\tGot:", rows)
         return 1
     
-    cursor.execute(f'SELECT title FROM ha_lineairdb_test.{table_name}')
+    cursor.execute(f'SELECT title FROM ha_helios_test.{table_name}')
     rows = cursor.fetchall()
     if len(rows) != 3:
         print("\tFailed: expected 3 rows")
@@ -82,26 +82,26 @@ def test_secondary_index_multiple_values(db, cursor):
     table_name = f"test_multi_{int(time.time() * 1000000)}"
     
     # Create table with secondary index on age
-    cursor.execute(f'''CREATE TABLE ha_lineairdb_test.{table_name} (
+    cursor.execute(f'''CREATE TABLE ha_helios_test.{table_name} (
         name VARCHAR(50) NOT NULL,
         age INT NOT NULL,
         department VARCHAR(50),
         INDEX age_idx (age)
-    ) ENGINE = LineairDB''')
+    ) ENGINE = Helios''')
     db.commit()
     
     # Insert rows with duplicate age values
-    cursor.execute(f'INSERT INTO ha_lineairdb_test.{table_name} (name, age, department) VALUES ("alice", 25, "engineering")')
-    cursor.execute(f'INSERT INTO ha_lineairdb_test.{table_name} (name, age, department) VALUES ("bob", 30, "sales")')
-    cursor.execute(f'INSERT INTO ha_lineairdb_test.{table_name} (name, age, department) VALUES ("carol", 25, "marketing")')
-    cursor.execute(f'INSERT INTO ha_lineairdb_test.{table_name} (name, age, department) VALUES ("dave", 25, "engineering")')
-    cursor.execute(f'INSERT INTO ha_lineairdb_test.{table_name} (name, age, department) VALUES ("john", 25, "student")')
-    cursor.execute(f'INSERT INTO ha_lineairdb_test.{table_name} (name, age, department) VALUES ("eve", 30, "hr")')
-    cursor.execute(f'INSERT INTO ha_lineairdb_test.{table_name} (name, age, department) VALUES ("gariman", 30, "programmer")')
+    cursor.execute(f'INSERT INTO ha_helios_test.{table_name} (name, age, department) VALUES ("alice", 25, "engineering")')
+    cursor.execute(f'INSERT INTO ha_helios_test.{table_name} (name, age, department) VALUES ("bob", 30, "sales")')
+    cursor.execute(f'INSERT INTO ha_helios_test.{table_name} (name, age, department) VALUES ("carol", 25, "marketing")')
+    cursor.execute(f'INSERT INTO ha_helios_test.{table_name} (name, age, department) VALUES ("dave", 25, "engineering")')
+    cursor.execute(f'INSERT INTO ha_helios_test.{table_name} (name, age, department) VALUES ("john", 25, "student")')
+    cursor.execute(f'INSERT INTO ha_helios_test.{table_name} (name, age, department) VALUES ("eve", 30, "hr")')
+    cursor.execute(f'INSERT INTO ha_helios_test.{table_name} (name, age, department) VALUES ("gariman", 30, "programmer")')
     db.commit()
     
     # Expect 4 rows with age=25
-    cursor.execute(f'SELECT name, age, department FROM ha_lineairdb_test.{table_name} WHERE age = 25')
+    cursor.execute(f'SELECT name, age, department FROM ha_helios_test.{table_name} WHERE age = 25')
     rows_25 = cursor.fetchall()
     
     if len(rows_25) != 4:
@@ -114,7 +114,7 @@ def test_secondary_index_multiple_values(db, cursor):
         return 1
     
     # Expect 3 rows with age=30
-    cursor.execute(f'SELECT name, age, department FROM ha_lineairdb_test.{table_name} WHERE age = 30')
+    cursor.execute(f'SELECT name, age, department FROM ha_helios_test.{table_name} WHERE age = 30')
     rows_30 = cursor.fetchall()
     
     if len(rows_30) != 3:
@@ -127,7 +127,7 @@ def test_secondary_index_multiple_values(db, cursor):
         return 1
     
     # Expect no rows with age=99
-    cursor.execute(f'SELECT name, age, department FROM ha_lineairdb_test.{table_name} WHERE age = 99')
+    cursor.execute(f'SELECT name, age, department FROM ha_helios_test.{table_name} WHERE age = 99')
     rows_99 = cursor.fetchall()
     if len(rows_99) != 0:
         print(f"\tFailed: expected 0 rows with age=99, got {len(rows_99)}")
@@ -142,28 +142,28 @@ def test_secondary_index_range_query(db, cursor):
     
     table_name = f"test_range_{int(time.time() * 1000000)}"
     
-    cursor.execute(f'''CREATE TABLE ha_lineairdb_test.{table_name} (
+    cursor.execute(f'''CREATE TABLE ha_helios_test.{table_name} (
         name VARCHAR(50) NOT NULL,
         age INT NOT NULL,
         department VARCHAR(50),
         INDEX age_idx (age)
-    ) ENGINE = LineairDB''')
+    ) ENGINE = Helios''')
     db.commit()
     
-    cursor.execute(f'INSERT INTO ha_lineairdb_test.{table_name} (name, age, department) VALUES ("alice", 22, "engineering")')
-    cursor.execute(f'INSERT INTO ha_lineairdb_test.{table_name} (name, age, department) VALUES ("bob", 30, "sales")')
-    cursor.execute(f'INSERT INTO ha_lineairdb_test.{table_name} (name, age, department) VALUES ("carol", 25, "marketing")')
-    cursor.execute(f'INSERT INTO ha_lineairdb_test.{table_name} (name, age, department) VALUES ("dave", 27, "engineering")')
-    cursor.execute(f'INSERT INTO ha_lineairdb_test.{table_name} (name, age, department) VALUES ("john", 25, "student")')
-    cursor.execute(f'INSERT INTO ha_lineairdb_test.{table_name} (name, age, department) VALUES ("eve", 31, "hr")')
-    cursor.execute(f'INSERT INTO ha_lineairdb_test.{table_name} (name, age, department) VALUES ("gariman", 35, "programmer")')
-    cursor.execute(f'INSERT INTO ha_lineairdb_test.{table_name} (name, age, department) VALUES ("haru", 29, "finance")')
-    cursor.execute(f'INSERT INTO ha_lineairdb_test.{table_name} (name, age, department) VALUES ("ken", 40, "design")')
-    cursor.execute(f'INSERT INTO ha_lineairdb_test.{table_name} (name, age, department) VALUES ("lisa", 24, "research")')
+    cursor.execute(f'INSERT INTO ha_helios_test.{table_name} (name, age, department) VALUES ("alice", 22, "engineering")')
+    cursor.execute(f'INSERT INTO ha_helios_test.{table_name} (name, age, department) VALUES ("bob", 30, "sales")')
+    cursor.execute(f'INSERT INTO ha_helios_test.{table_name} (name, age, department) VALUES ("carol", 25, "marketing")')
+    cursor.execute(f'INSERT INTO ha_helios_test.{table_name} (name, age, department) VALUES ("dave", 27, "engineering")')
+    cursor.execute(f'INSERT INTO ha_helios_test.{table_name} (name, age, department) VALUES ("john", 25, "student")')
+    cursor.execute(f'INSERT INTO ha_helios_test.{table_name} (name, age, department) VALUES ("eve", 31, "hr")')
+    cursor.execute(f'INSERT INTO ha_helios_test.{table_name} (name, age, department) VALUES ("gariman", 35, "programmer")')
+    cursor.execute(f'INSERT INTO ha_helios_test.{table_name} (name, age, department) VALUES ("haru", 29, "finance")')
+    cursor.execute(f'INSERT INTO ha_helios_test.{table_name} (name, age, department) VALUES ("ken", 40, "design")')
+    cursor.execute(f'INSERT INTO ha_helios_test.{table_name} (name, age, department) VALUES ("lisa", 24, "research")')
     db.commit()
     
     # Verify row count
-    cursor.execute(f'SELECT name, age, department FROM ha_lineairdb_test.{table_name}')
+    cursor.execute(f'SELECT name, age, department FROM ha_helios_test.{table_name}')
     all_rows = cursor.fetchall()
     
     if len(all_rows) != 10:
@@ -171,7 +171,7 @@ def test_secondary_index_range_query(db, cursor):
         return 1
     
     # Lookup age = 25 (expect carol, john)
-    cursor.execute(f'SELECT name, age, department FROM ha_lineairdb_test.{table_name} WHERE age = 25')
+    cursor.execute(f'SELECT name, age, department FROM ha_helios_test.{table_name} WHERE age = 25')
     rows_25 = cursor.fetchall()
     
     if len(rows_25) != 2:
@@ -184,7 +184,7 @@ def test_secondary_index_range_query(db, cursor):
         return 1
     
     # Lookup age = 30 (expect bob)
-    cursor.execute(f'SELECT name, age, department FROM ha_lineairdb_test.{table_name} WHERE age = 30')
+    cursor.execute(f'SELECT name, age, department FROM ha_helios_test.{table_name} WHERE age = 30')
     rows_30 = cursor.fetchall()
     
     if len(rows_30) != 1:
@@ -196,7 +196,7 @@ def test_secondary_index_range_query(db, cursor):
         return 1
     
     # Range query: age < 30 (expect 6 rows)
-    cursor.execute(f'SELECT name, age, department FROM ha_lineairdb_test.{table_name} WHERE age < 30')
+    cursor.execute(f'SELECT name, age, department FROM ha_helios_test.{table_name} WHERE age < 30')
     rows_lt_30 = cursor.fetchall()
     
     if len(rows_lt_30) != 6:
@@ -211,7 +211,7 @@ def test_secondary_index_range_query(db, cursor):
             return 1
     
     # Range query: age <= 30 (expect 7 rows)
-    cursor.execute(f'SELECT name, age, department FROM ha_lineairdb_test.{table_name} WHERE age <= 30')
+    cursor.execute(f'SELECT name, age, department FROM ha_helios_test.{table_name} WHERE age <= 30')
     rows_lte_30 = cursor.fetchall()
     
     if len(rows_lte_30) != 7:
@@ -219,7 +219,7 @@ def test_secondary_index_range_query(db, cursor):
         return 1
     
     # Range query: age > 30 (expect 3 rows)
-    cursor.execute(f'SELECT name, age, department FROM ha_lineairdb_test.{table_name} WHERE age > 30')
+    cursor.execute(f'SELECT name, age, department FROM ha_helios_test.{table_name} WHERE age > 30')
     rows_gt_30 = cursor.fetchall()
     
     if len(rows_gt_30) != 3:
@@ -234,7 +234,7 @@ def test_secondary_index_range_query(db, cursor):
             return 1
     
     # Range query: age >= 30 (expect 4 rows)
-    cursor.execute(f'SELECT name, age, department FROM ha_lineairdb_test.{table_name} WHERE age >= 30')
+    cursor.execute(f'SELECT name, age, department FROM ha_helios_test.{table_name} WHERE age >= 30')
     rows_gte_30 = cursor.fetchall()
     
     if len(rows_gte_30) != 4:
@@ -242,7 +242,7 @@ def test_secondary_index_range_query(db, cursor):
         return 1
     
     # Range query: age BETWEEN 25 AND 30 (expect 5 rows)
-    cursor.execute(f'SELECT name, age, department FROM ha_lineairdb_test.{table_name} WHERE age BETWEEN 25 AND 30')
+    cursor.execute(f'SELECT name, age, department FROM ha_helios_test.{table_name} WHERE age BETWEEN 25 AND 30')
     rows_between = cursor.fetchall()
     
     if len(rows_between) != 5:
@@ -265,25 +265,25 @@ def test_string_range_query(db, cursor):
     
     table_name = f"test_str_{int(time.time() * 1000000)}"
     
-    cursor.execute(f'''CREATE TABLE ha_lineairdb_test.{table_name} (
+    cursor.execute(f'''CREATE TABLE ha_helios_test.{table_name} (
         id INT NOT NULL,
         code VARCHAR(5) NOT NULL,
         name VARCHAR(20),
         INDEX code_idx (code)
-    ) ENGINE = LineairDB''')
+    ) ENGINE = Helios''')
     db.commit()
     
-    cursor.execute(f'INSERT INTO ha_lineairdb_test.{table_name} (id, code, name) VALUES (1, "A1", "alpha")')
-    cursor.execute(f'INSERT INTO ha_lineairdb_test.{table_name} (id, code, name) VALUES (2, "B2", "beta")')
-    cursor.execute(f'INSERT INTO ha_lineairdb_test.{table_name} (id, code, name) VALUES (3, "C3", "gamma")')
-    cursor.execute(f'INSERT INTO ha_lineairdb_test.{table_name} (id, code, name) VALUES (4, "D4", "delta")')
-    cursor.execute(f'INSERT INTO ha_lineairdb_test.{table_name} (id, code, name) VALUES (5, "E5", "epsilon")')
-    cursor.execute(f'INSERT INTO ha_lineairdb_test.{table_name} (id, code, name) VALUES (6, "AA", "test1")')
-    cursor.execute(f'INSERT INTO ha_lineairdb_test.{table_name} (id, code, name) VALUES (7, "BB", "test2")')
-    cursor.execute(f'INSERT INTO ha_lineairdb_test.{table_name} (id, code, name) VALUES (8, "CC", "test3")')
+    cursor.execute(f'INSERT INTO ha_helios_test.{table_name} (id, code, name) VALUES (1, "A1", "alpha")')
+    cursor.execute(f'INSERT INTO ha_helios_test.{table_name} (id, code, name) VALUES (2, "B2", "beta")')
+    cursor.execute(f'INSERT INTO ha_helios_test.{table_name} (id, code, name) VALUES (3, "C3", "gamma")')
+    cursor.execute(f'INSERT INTO ha_helios_test.{table_name} (id, code, name) VALUES (4, "D4", "delta")')
+    cursor.execute(f'INSERT INTO ha_helios_test.{table_name} (id, code, name) VALUES (5, "E5", "epsilon")')
+    cursor.execute(f'INSERT INTO ha_helios_test.{table_name} (id, code, name) VALUES (6, "AA", "test1")')
+    cursor.execute(f'INSERT INTO ha_helios_test.{table_name} (id, code, name) VALUES (7, "BB", "test2")')
+    cursor.execute(f'INSERT INTO ha_helios_test.{table_name} (id, code, name) VALUES (8, "CC", "test3")')
     db.commit()
     
-    cursor.execute(f'SELECT id, code, name FROM ha_lineairdb_test.{table_name}')
+    cursor.execute(f'SELECT id, code, name FROM ha_helios_test.{table_name}')
     all_rows = cursor.fetchall()
     
     if len(all_rows) != 8:
@@ -291,7 +291,7 @@ def test_string_range_query(db, cursor):
         return 1
     
     # Range query: code < 'C3'
-    cursor.execute(f'SELECT id, code, name FROM ha_lineairdb_test.{table_name} WHERE code < "C3"')
+    cursor.execute(f'SELECT id, code, name FROM ha_helios_test.{table_name} WHERE code < "C3"')
     rows_lt = cursor.fetchall()
     
     if len(rows_lt) != 4:
@@ -306,7 +306,7 @@ def test_string_range_query(db, cursor):
             return 1
     
     # Range query: code >= 'C3'
-    cursor.execute(f'SELECT id, code, name FROM ha_lineairdb_test.{table_name} WHERE code >= "C3"')
+    cursor.execute(f'SELECT id, code, name FROM ha_helios_test.{table_name} WHERE code >= "C3"')
     rows_gte = cursor.fetchall()
     
     if len(rows_gte) != 4:
@@ -321,7 +321,7 @@ def test_string_range_query(db, cursor):
             return 1
     
     # Range query: code BETWEEN 'B2' AND 'D4'
-    cursor.execute(f'SELECT id, code, name FROM ha_lineairdb_test.{table_name} WHERE code BETWEEN "B2" AND "D4"')
+    cursor.execute(f'SELECT id, code, name FROM ha_helios_test.{table_name} WHERE code BETWEEN "B2" AND "D4"')
     rows_between = cursor.fetchall()
     
     if len(rows_between) != 5:
@@ -344,24 +344,24 @@ def test_datetime_range_query(db, cursor):
     
     table_name = f"test_dt_{int(time.time() * 1000000)}"
     
-    cursor.execute(f'''CREATE TABLE ha_lineairdb_test.{table_name} (
+    cursor.execute(f'''CREATE TABLE ha_helios_test.{table_name} (
         id INT NOT NULL,
         user VARCHAR(10),
         reg_date DATETIME NOT NULL,
         INDEX date_idx (reg_date)
-    ) ENGINE = LineairDB''')
+    ) ENGINE = Helios''')
     db.commit()
     
-    cursor.execute(f'INSERT INTO ha_lineairdb_test.{table_name} (id, user, reg_date) VALUES (1, "alice", "2024-01-15 10:00:00")')
-    cursor.execute(f'INSERT INTO ha_lineairdb_test.{table_name} (id, user, reg_date) VALUES (2, "bob", "2024-03-20 14:30:00")')
-    cursor.execute(f'INSERT INTO ha_lineairdb_test.{table_name} (id, user, reg_date) VALUES (3, "carol", "2024-06-10 09:15:00")')
-    cursor.execute(f'INSERT INTO ha_lineairdb_test.{table_name} (id, user, reg_date) VALUES (4, "dave", "2024-06-25 16:45:00")')
-    cursor.execute(f'INSERT INTO ha_lineairdb_test.{table_name} (id, user, reg_date) VALUES (5, "eve", "2024-09-05 11:20:00")')
-    cursor.execute(f'INSERT INTO ha_lineairdb_test.{table_name} (id, user, reg_date) VALUES (6, "frank", "2024-12-01 08:00:00")')
-    cursor.execute(f'INSERT INTO ha_lineairdb_test.{table_name} (id, user, reg_date) VALUES (7, "grace", "2024-12-15 13:30:00")')
+    cursor.execute(f'INSERT INTO ha_helios_test.{table_name} (id, user, reg_date) VALUES (1, "alice", "2024-01-15 10:00:00")')
+    cursor.execute(f'INSERT INTO ha_helios_test.{table_name} (id, user, reg_date) VALUES (2, "bob", "2024-03-20 14:30:00")')
+    cursor.execute(f'INSERT INTO ha_helios_test.{table_name} (id, user, reg_date) VALUES (3, "carol", "2024-06-10 09:15:00")')
+    cursor.execute(f'INSERT INTO ha_helios_test.{table_name} (id, user, reg_date) VALUES (4, "dave", "2024-06-25 16:45:00")')
+    cursor.execute(f'INSERT INTO ha_helios_test.{table_name} (id, user, reg_date) VALUES (5, "eve", "2024-09-05 11:20:00")')
+    cursor.execute(f'INSERT INTO ha_helios_test.{table_name} (id, user, reg_date) VALUES (6, "frank", "2024-12-01 08:00:00")')
+    cursor.execute(f'INSERT INTO ha_helios_test.{table_name} (id, user, reg_date) VALUES (7, "grace", "2024-12-15 13:30:00")')
     db.commit()
     
-    cursor.execute(f'SELECT id, user, reg_date FROM ha_lineairdb_test.{table_name}')
+    cursor.execute(f'SELECT id, user, reg_date FROM ha_helios_test.{table_name}')
     all_rows = cursor.fetchall()
     
     if len(all_rows) != 7:
@@ -369,7 +369,7 @@ def test_datetime_range_query(db, cursor):
         return 1
     
     # Range query: reg_date < '2024-06-01'
-    cursor.execute(f'SELECT id, user, reg_date FROM ha_lineairdb_test.{table_name} WHERE reg_date < "2024-06-01"')
+    cursor.execute(f'SELECT id, user, reg_date FROM ha_helios_test.{table_name} WHERE reg_date < "2024-06-01"')
     rows_lt = cursor.fetchall()
     
     if len(rows_lt) != 2:
@@ -382,7 +382,7 @@ def test_datetime_range_query(db, cursor):
         return 1
     
     # Range query: reg_date >= '2024-09-01'
-    cursor.execute(f'SELECT id, user, reg_date FROM ha_lineairdb_test.{table_name} WHERE reg_date >= "2024-09-01"')
+    cursor.execute(f'SELECT id, user, reg_date FROM ha_helios_test.{table_name} WHERE reg_date >= "2024-09-01"')
     rows_gte = cursor.fetchall()
     
     if len(rows_gte) != 3:
@@ -397,7 +397,7 @@ def test_datetime_range_query(db, cursor):
             return 1
     
     # Range query: reg_date BETWEEN '2024-06-01' AND '2024-09-30'
-    cursor.execute(f'SELECT id, user, reg_date FROM ha_lineairdb_test.{table_name} WHERE reg_date BETWEEN "2024-06-01" AND "2024-09-30"')
+    cursor.execute(f'SELECT id, user, reg_date FROM ha_helios_test.{table_name} WHERE reg_date BETWEEN "2024-06-01" AND "2024-09-30"')
     rows_between = cursor.fetchall()
     
     if len(rows_between) != 3:
@@ -412,7 +412,7 @@ def test_datetime_range_query(db, cursor):
             return 1
     
     # Range query: reg_date > '2024-06-10 12:00:00'
-    cursor.execute(f'SELECT id, user, reg_date FROM ha_lineairdb_test.{table_name} WHERE reg_date > "2024-06-10 12:00:00"')
+    cursor.execute(f'SELECT id, user, reg_date FROM ha_helios_test.{table_name} WHERE reg_date > "2024-06-10 12:00:00"')
     rows_time = cursor.fetchall()
     
     if len(rows_time) != 4:
@@ -435,25 +435,25 @@ def test_composite_index_int_string(db, cursor):
     
     table_name = f"test_comp_int_str_{int(time.time() * 1000000)}"
     
-    cursor.execute(f'''CREATE TABLE ha_lineairdb_test.{table_name} (
+    cursor.execute(f'''CREATE TABLE ha_helios_test.{table_name} (
         name VARCHAR(50) NOT NULL,
         age INT NOT NULL,
         department VARCHAR(50) NOT NULL,
         salary INT,
         INDEX age_dept_idx (age, department)
-    ) ENGINE = LineairDB''')
+    ) ENGINE = Helios''')
     db.commit()
     
-    cursor.execute(f'INSERT INTO ha_lineairdb_test.{table_name} (name, age, department, salary) VALUES ("alice", 25, "engineering", 5000)')
-    cursor.execute(f'INSERT INTO ha_lineairdb_test.{table_name} (name, age, department, salary) VALUES ("bob", 25, "sales", 4500)')
-    cursor.execute(f'INSERT INTO ha_lineairdb_test.{table_name} (name, age, department, salary) VALUES ("carol", 30, "engineering", 6000)')
-    cursor.execute(f'INSERT INTO ha_lineairdb_test.{table_name} (name, age, department, salary) VALUES ("dave", 25, "engineering", 5200)')
-    cursor.execute(f'INSERT INTO ha_lineairdb_test.{table_name} (name, age, department, salary) VALUES ("eve", 30, "sales", 5500)')
-    cursor.execute(f'INSERT INTO ha_lineairdb_test.{table_name} (name, age, department, salary) VALUES ("frank", 25, "marketing", 4800)')
-    cursor.execute(f'INSERT INTO ha_lineairdb_test.{table_name} (name, age, department, salary) VALUES ("grace", 30, "engineering", 6200)')
+    cursor.execute(f'INSERT INTO ha_helios_test.{table_name} (name, age, department, salary) VALUES ("alice", 25, "engineering", 5000)')
+    cursor.execute(f'INSERT INTO ha_helios_test.{table_name} (name, age, department, salary) VALUES ("bob", 25, "sales", 4500)')
+    cursor.execute(f'INSERT INTO ha_helios_test.{table_name} (name, age, department, salary) VALUES ("carol", 30, "engineering", 6000)')
+    cursor.execute(f'INSERT INTO ha_helios_test.{table_name} (name, age, department, salary) VALUES ("dave", 25, "engineering", 5200)')
+    cursor.execute(f'INSERT INTO ha_helios_test.{table_name} (name, age, department, salary) VALUES ("eve", 30, "sales", 5500)')
+    cursor.execute(f'INSERT INTO ha_helios_test.{table_name} (name, age, department, salary) VALUES ("frank", 25, "marketing", 4800)')
+    cursor.execute(f'INSERT INTO ha_helios_test.{table_name} (name, age, department, salary) VALUES ("grace", 30, "engineering", 6200)')
     db.commit()
     
-    cursor.execute(f'SELECT name, age, department, salary FROM ha_lineairdb_test.{table_name}')
+    cursor.execute(f'SELECT name, age, department, salary FROM ha_helios_test.{table_name}')
     all_rows = cursor.fetchall()
     
     if len(all_rows) != 7:
@@ -461,7 +461,7 @@ def test_composite_index_int_string(db, cursor):
         return 1
     
     # Exact match: age=25 AND department='engineering'
-    cursor.execute(f'SELECT name, age, department, salary FROM ha_lineairdb_test.{table_name} WHERE age = 25 AND department = "engineering"')
+    cursor.execute(f'SELECT name, age, department, salary FROM ha_helios_test.{table_name} WHERE age = 25 AND department = "engineering"')
     rows_exact = cursor.fetchall()
     
     if len(rows_exact) != 2:
@@ -474,7 +474,7 @@ def test_composite_index_int_string(db, cursor):
         return 1
     
     # Prefix match: age=25
-    cursor.execute(f'SELECT name, age, department FROM ha_lineairdb_test.{table_name} WHERE age = 25')
+    cursor.execute(f'SELECT name, age, department FROM ha_helios_test.{table_name} WHERE age = 25')
     rows_prefix = cursor.fetchall()
     
     if len(rows_prefix) != 4:
@@ -489,7 +489,7 @@ def test_composite_index_int_string(db, cursor):
             return 1
     
     # Range query: age=30 AND department <= 'engineering'
-    cursor.execute(f'SELECT name, age, department FROM ha_lineairdb_test.{table_name} WHERE age = 30 AND department <= "engineering"')
+    cursor.execute(f'SELECT name, age, department FROM ha_helios_test.{table_name} WHERE age = 30 AND department <= "engineering"')
     rows_range = cursor.fetchall()
     
     if len(rows_range) != 2:
@@ -510,25 +510,25 @@ def test_composite_index_string_datetime(db, cursor):
     
     table_name = f"test_comp_str_dt_{int(time.time() * 1000000)}"
     
-    cursor.execute(f'''CREATE TABLE ha_lineairdb_test.{table_name} (
+    cursor.execute(f'''CREATE TABLE ha_helios_test.{table_name} (
         id INT NOT NULL,
         status VARCHAR(20) NOT NULL,
         created_at DATETIME NOT NULL,
         description VARCHAR(50),
         INDEX status_date_idx (status, created_at)
-    ) ENGINE = LineairDB''')
+    ) ENGINE = Helios''')
     db.commit()
     
-    cursor.execute(f'INSERT INTO ha_lineairdb_test.{table_name} (id, status, created_at, description) VALUES (1, "active", "2024-01-15 10:00:00", "task1")')
-    cursor.execute(f'INSERT INTO ha_lineairdb_test.{table_name} (id, status, created_at, description) VALUES (2, "active", "2024-03-20 14:30:00", "task2")')
-    cursor.execute(f'INSERT INTO ha_lineairdb_test.{table_name} (id, status, created_at, description) VALUES (3, "pending", "2024-02-10 09:15:00", "task3")')
-    cursor.execute(f'INSERT INTO ha_lineairdb_test.{table_name} (id, status, created_at, description) VALUES (4, "active", "2024-06-25 16:45:00", "task4")')
-    cursor.execute(f'INSERT INTO ha_lineairdb_test.{table_name} (id, status, created_at, description) VALUES (5, "completed", "2024-05-05 11:20:00", "task5")')
-    cursor.execute(f'INSERT INTO ha_lineairdb_test.{table_name} (id, status, created_at, description) VALUES (6, "pending", "2024-07-01 08:00:00", "task6")')
-    cursor.execute(f'INSERT INTO ha_lineairdb_test.{table_name} (id, status, created_at, description) VALUES (7, "active", "2024-02-15 13:30:00", "task7")')
+    cursor.execute(f'INSERT INTO ha_helios_test.{table_name} (id, status, created_at, description) VALUES (1, "active", "2024-01-15 10:00:00", "task1")')
+    cursor.execute(f'INSERT INTO ha_helios_test.{table_name} (id, status, created_at, description) VALUES (2, "active", "2024-03-20 14:30:00", "task2")')
+    cursor.execute(f'INSERT INTO ha_helios_test.{table_name} (id, status, created_at, description) VALUES (3, "pending", "2024-02-10 09:15:00", "task3")')
+    cursor.execute(f'INSERT INTO ha_helios_test.{table_name} (id, status, created_at, description) VALUES (4, "active", "2024-06-25 16:45:00", "task4")')
+    cursor.execute(f'INSERT INTO ha_helios_test.{table_name} (id, status, created_at, description) VALUES (5, "completed", "2024-05-05 11:20:00", "task5")')
+    cursor.execute(f'INSERT INTO ha_helios_test.{table_name} (id, status, created_at, description) VALUES (6, "pending", "2024-07-01 08:00:00", "task6")')
+    cursor.execute(f'INSERT INTO ha_helios_test.{table_name} (id, status, created_at, description) VALUES (7, "active", "2024-02-15 13:30:00", "task7")')
     db.commit()
     
-    cursor.execute(f'SELECT id, status, created_at, description FROM ha_lineairdb_test.{table_name}')
+    cursor.execute(f'SELECT id, status, created_at, description FROM ha_helios_test.{table_name}')
     all_rows = cursor.fetchall()
     
     if len(all_rows) != 7:
@@ -536,7 +536,7 @@ def test_composite_index_string_datetime(db, cursor):
         return 1
     
     # Exact match: status='active' AND created_at='2024-03-20 14:30:00'
-    cursor.execute(f'SELECT id, status, created_at FROM ha_lineairdb_test.{table_name} WHERE status = "active" AND created_at = "2024-03-20 14:30:00"')
+    cursor.execute(f'SELECT id, status, created_at FROM ha_helios_test.{table_name} WHERE status = "active" AND created_at = "2024-03-20 14:30:00"')
     rows_exact = cursor.fetchall()
     
     if len(rows_exact) != 1:
@@ -548,7 +548,7 @@ def test_composite_index_string_datetime(db, cursor):
         return 1
     
     # Prefix match: status='active'
-    cursor.execute(f'SELECT id, status, created_at FROM ha_lineairdb_test.{table_name} WHERE status = "active"')
+    cursor.execute(f'SELECT id, status, created_at FROM ha_helios_test.{table_name} WHERE status = "active"')
     rows_prefix = cursor.fetchall()
     
     if len(rows_prefix) != 4:
@@ -563,7 +563,7 @@ def test_composite_index_string_datetime(db, cursor):
             return 1
     
     # Range query: status='active' AND created_at < '2024-03-01'
-    cursor.execute(f'SELECT id, status, created_at FROM ha_lineairdb_test.{table_name} WHERE status = "active" AND created_at < "2024-03-01"')
+    cursor.execute(f'SELECT id, status, created_at FROM ha_helios_test.{table_name} WHERE status = "active" AND created_at < "2024-03-01"')
     rows_range = cursor.fetchall()
     
     if len(rows_range) != 2:
@@ -584,25 +584,25 @@ def test_composite_index_int_int(db, cursor):
     
     table_name = f"test_comp_int_int_{int(time.time() * 1000000)}"
     
-    cursor.execute(f'''CREATE TABLE ha_lineairdb_test.{table_name} (
+    cursor.execute(f'''CREATE TABLE ha_helios_test.{table_name} (
         id INT NOT NULL,
         year INT NOT NULL,
         month INT NOT NULL,
         sales INT,
         INDEX year_month_idx (year, month)
-    ) ENGINE = LineairDB''')
+    ) ENGINE = Helios''')
     db.commit()
     
-    cursor.execute(f'INSERT INTO ha_lineairdb_test.{table_name} (id, year, month, sales) VALUES (1, 2023, 1, 1000)')
-    cursor.execute(f'INSERT INTO ha_lineairdb_test.{table_name} (id, year, month, sales) VALUES (2, 2023, 6, 1500)')
-    cursor.execute(f'INSERT INTO ha_lineairdb_test.{table_name} (id, year, month, sales) VALUES (3, 2023, 12, 2000)')
-    cursor.execute(f'INSERT INTO ha_lineairdb_test.{table_name} (id, year, month, sales) VALUES (4, 2024, 1, 1800)')
-    cursor.execute(f'INSERT INTO ha_lineairdb_test.{table_name} (id, year, month, sales) VALUES (5, 2024, 3, 2200)')
-    cursor.execute(f'INSERT INTO ha_lineairdb_test.{table_name} (id, year, month, sales) VALUES (6, 2024, 6, 2500)')
-    cursor.execute(f'INSERT INTO ha_lineairdb_test.{table_name} (id, year, month, sales) VALUES (7, 2024, 12, 3000)')
+    cursor.execute(f'INSERT INTO ha_helios_test.{table_name} (id, year, month, sales) VALUES (1, 2023, 1, 1000)')
+    cursor.execute(f'INSERT INTO ha_helios_test.{table_name} (id, year, month, sales) VALUES (2, 2023, 6, 1500)')
+    cursor.execute(f'INSERT INTO ha_helios_test.{table_name} (id, year, month, sales) VALUES (3, 2023, 12, 2000)')
+    cursor.execute(f'INSERT INTO ha_helios_test.{table_name} (id, year, month, sales) VALUES (4, 2024, 1, 1800)')
+    cursor.execute(f'INSERT INTO ha_helios_test.{table_name} (id, year, month, sales) VALUES (5, 2024, 3, 2200)')
+    cursor.execute(f'INSERT INTO ha_helios_test.{table_name} (id, year, month, sales) VALUES (6, 2024, 6, 2500)')
+    cursor.execute(f'INSERT INTO ha_helios_test.{table_name} (id, year, month, sales) VALUES (7, 2024, 12, 3000)')
     db.commit()
     
-    cursor.execute(f'SELECT id, year, month, sales FROM ha_lineairdb_test.{table_name}')
+    cursor.execute(f'SELECT id, year, month, sales FROM ha_helios_test.{table_name}')
     all_rows = cursor.fetchall()
     
     if len(all_rows) != 7:
@@ -610,7 +610,7 @@ def test_composite_index_int_int(db, cursor):
         return 1
     
     # Exact match: year=2024 AND month=6
-    cursor.execute(f'SELECT id, year, month, sales FROM ha_lineairdb_test.{table_name} WHERE year = 2024 AND month = 6')
+    cursor.execute(f'SELECT id, year, month, sales FROM ha_helios_test.{table_name} WHERE year = 2024 AND month = 6')
     rows_exact = cursor.fetchall()
     
     if len(rows_exact) != 1:
@@ -622,7 +622,7 @@ def test_composite_index_int_int(db, cursor):
         return 1
     
     # Prefix match: year=2024
-    cursor.execute(f'SELECT id, year, month FROM ha_lineairdb_test.{table_name} WHERE year = 2024')
+    cursor.execute(f'SELECT id, year, month FROM ha_helios_test.{table_name} WHERE year = 2024')
     rows_prefix = cursor.fetchall()
     
     if len(rows_prefix) != 4:
@@ -637,7 +637,7 @@ def test_composite_index_int_int(db, cursor):
             return 1
     
     # Range query: year=2024 AND month>=6
-    cursor.execute(f'SELECT id, year, month FROM ha_lineairdb_test.{table_name} WHERE year = 2024 AND month >= 6')
+    cursor.execute(f'SELECT id, year, month FROM ha_helios_test.{table_name} WHERE year = 2024 AND month >= 6')
     rows_range = cursor.fetchall()
     
     if len(rows_range) != 2:
@@ -650,7 +650,7 @@ def test_composite_index_int_int(db, cursor):
         return 1
     
     # Range query: year=2023 AND month BETWEEN 6 AND 12
-    cursor.execute(f'SELECT id, year, month FROM ha_lineairdb_test.{table_name} WHERE year = 2023 AND month BETWEEN 6 AND 12')
+    cursor.execute(f'SELECT id, year, month FROM ha_helios_test.{table_name} WHERE year = 2023 AND month BETWEEN 6 AND 12')
     rows_between = cursor.fetchall()
     
     if len(rows_between) != 2:
@@ -671,14 +671,14 @@ def test_composite_index_skip_middle_key(db, cursor):
 
     table_name = f"test_skip_middle_{int(time.time() * 1000000)}"
 
-    cursor.execute(f'''CREATE TABLE ha_lineairdb_test.{table_name} (
+    cursor.execute(f'''CREATE TABLE ha_helios_test.{table_name} (
         id INT NOT NULL,
         category VARCHAR(20) NOT NULL,
         status VARCHAR(20) NOT NULL,
         priority INT NOT NULL,
         description VARCHAR(50),
         INDEX cat_stat_pri_idx (category, status, priority)
-    ) ENGINE = LineairDB''')
+    ) ENGINE = Helios''')
     db.commit()
 
     rows_to_insert = [
@@ -693,20 +693,20 @@ def test_composite_index_skip_middle_key(db, cursor):
     ]
 
     insert_sql = (
-        f'INSERT INTO ha_lineairdb_test.{table_name} '
+        f'INSERT INTO ha_helios_test.{table_name} '
         f'(id, category, status, priority, description) VALUES (%s, %s, %s, %s, %s)'
     )
     for row in rows_to_insert:
         cursor.execute(insert_sql, row)
     db.commit()
 
-    cursor.execute(f'SELECT COUNT(*) FROM ha_lineairdb_test.{table_name}')
+    cursor.execute(f'SELECT COUNT(*) FROM ha_helios_test.{table_name}')
     if cursor.fetchone()[0] != 8:
         print("\tFailed: expected 8 rows after setup")
         return 1
 
     cursor.execute(
-        f'SELECT id FROM ha_lineairdb_test.{table_name} '
+        f'SELECT id FROM ha_helios_test.{table_name} '
         f'WHERE category = "bug" AND status = "open" AND priority = 1 ORDER BY id'
     )
     ids_full = [row[0] for row in cursor.fetchall()]
@@ -715,7 +715,7 @@ def test_composite_index_skip_middle_key(db, cursor):
         return 1
 
     cursor.execute(
-        f'SELECT id FROM ha_lineairdb_test.{table_name} '
+        f'SELECT id FROM ha_helios_test.{table_name} '
         f'WHERE category = "bug" ORDER BY id'
     )
     ids_category = [row[0] for row in cursor.fetchall()]
@@ -724,7 +724,7 @@ def test_composite_index_skip_middle_key(db, cursor):
         return 1
 
     cursor.execute(
-        f'SELECT id FROM ha_lineairdb_test.{table_name} '
+        f'SELECT id FROM ha_helios_test.{table_name} '
         f'WHERE category = "bug" AND status = "open" ORDER BY id'
     )
     ids_category_status = [row[0] for row in cursor.fetchall()]
@@ -733,7 +733,7 @@ def test_composite_index_skip_middle_key(db, cursor):
         return 1
 
     cursor.execute(
-        f'SELECT id FROM ha_lineairdb_test.{table_name} '
+        f'SELECT id FROM ha_helios_test.{table_name} '
         f'WHERE category = "bug" AND priority = 1 ORDER BY id'
     )
     ids_category_priority = [row[0] for row in cursor.fetchall()]
@@ -742,7 +742,7 @@ def test_composite_index_skip_middle_key(db, cursor):
         return 1
 
     cursor.execute(
-        f'SELECT id FROM ha_lineairdb_test.{table_name} '
+        f'SELECT id FROM ha_helios_test.{table_name} '
         f'WHERE category = "feature" AND priority >= 2 ORDER BY id'
     )
     ids_feature_range = [row[0] for row in cursor.fetchall()]
@@ -759,27 +759,27 @@ def test_composite_primary_key_basic(db, cursor):
     
     table_name = f"test_comp_pk_basic_{int(time.time() * 1000000)}"
     
-    cursor.execute(f'''CREATE TABLE ha_lineairdb_test.{table_name} (
+    cursor.execute(f'''CREATE TABLE ha_helios_test.{table_name} (
         year INT NOT NULL,
         month INT NOT NULL,
         sales INT,
         region VARCHAR(20),
         PRIMARY KEY (year, month)
-    ) ENGINE = LineairDB''')
+    ) ENGINE = Helios''')
     db.commit()
     
-    cursor.execute(f'INSERT INTO ha_lineairdb_test.{table_name} (year, month, sales, region) VALUES (2023, 1, 1000, "Tokyo")')
-    cursor.execute(f'INSERT INTO ha_lineairdb_test.{table_name} (year, month, sales, region) VALUES (2023, 3, 1200, "Osaka")')
-    cursor.execute(f'INSERT INTO ha_lineairdb_test.{table_name} (year, month, sales, region) VALUES (2023, 6, 1500, "Tokyo")')
-    cursor.execute(f'INSERT INTO ha_lineairdb_test.{table_name} (year, month, sales, region) VALUES (2023, 12, 2000, "Nagoya")')
-    cursor.execute(f'INSERT INTO ha_lineairdb_test.{table_name} (year, month, sales, region) VALUES (2024, 1, 1800, "Tokyo")')
-    cursor.execute(f'INSERT INTO ha_lineairdb_test.{table_name} (year, month, sales, region) VALUES (2024, 3, 2200, "Osaka")')
-    cursor.execute(f'INSERT INTO ha_lineairdb_test.{table_name} (year, month, sales, region) VALUES (2024, 6, 2500, "Tokyo")')
-    cursor.execute(f'INSERT INTO ha_lineairdb_test.{table_name} (year, month, sales, region) VALUES (2024, 9, 2700, "Nagoya")')
-    cursor.execute(f'INSERT INTO ha_lineairdb_test.{table_name} (year, month, sales, region) VALUES (2024, 12, 3000, "Tokyo")')
+    cursor.execute(f'INSERT INTO ha_helios_test.{table_name} (year, month, sales, region) VALUES (2023, 1, 1000, "Tokyo")')
+    cursor.execute(f'INSERT INTO ha_helios_test.{table_name} (year, month, sales, region) VALUES (2023, 3, 1200, "Osaka")')
+    cursor.execute(f'INSERT INTO ha_helios_test.{table_name} (year, month, sales, region) VALUES (2023, 6, 1500, "Tokyo")')
+    cursor.execute(f'INSERT INTO ha_helios_test.{table_name} (year, month, sales, region) VALUES (2023, 12, 2000, "Nagoya")')
+    cursor.execute(f'INSERT INTO ha_helios_test.{table_name} (year, month, sales, region) VALUES (2024, 1, 1800, "Tokyo")')
+    cursor.execute(f'INSERT INTO ha_helios_test.{table_name} (year, month, sales, region) VALUES (2024, 3, 2200, "Osaka")')
+    cursor.execute(f'INSERT INTO ha_helios_test.{table_name} (year, month, sales, region) VALUES (2024, 6, 2500, "Tokyo")')
+    cursor.execute(f'INSERT INTO ha_helios_test.{table_name} (year, month, sales, region) VALUES (2024, 9, 2700, "Nagoya")')
+    cursor.execute(f'INSERT INTO ha_helios_test.{table_name} (year, month, sales, region) VALUES (2024, 12, 3000, "Tokyo")')
     db.commit()
     
-    cursor.execute(f'SELECT year, month, sales, region FROM ha_lineairdb_test.{table_name}')
+    cursor.execute(f'SELECT year, month, sales, region FROM ha_helios_test.{table_name}')
     all_rows = cursor.fetchall()
     
     if len(all_rows) != 9:
@@ -787,7 +787,7 @@ def test_composite_primary_key_basic(db, cursor):
         return 1
     
     # Exact match: year=2024 AND month=6
-    cursor.execute(f'SELECT year, month, sales, region FROM ha_lineairdb_test.{table_name} WHERE year = 2024 AND month = 6')
+    cursor.execute(f'SELECT year, month, sales, region FROM ha_helios_test.{table_name} WHERE year = 2024 AND month = 6')
     rows_exact = cursor.fetchall()
     if len(rows_exact) != 1:
         print(f"\tFailed: expected 1 row, got {len(rows_exact)}")
@@ -798,7 +798,7 @@ def test_composite_primary_key_basic(db, cursor):
         return 1
     
     # Prefix match: year=2023
-    cursor.execute(f'SELECT year, month, sales FROM ha_lineairdb_test.{table_name} WHERE year = 2023')
+    cursor.execute(f'SELECT year, month, sales FROM ha_helios_test.{table_name} WHERE year = 2023')
     rows_prefix = cursor.fetchall()
     
     if len(rows_prefix) != 4:
@@ -821,28 +821,28 @@ def test_composite_primary_key_range(db, cursor):
     
     table_name = f"test_comp_pk_range_{int(time.time() * 1000000)}"
     
-    cursor.execute(f'''CREATE TABLE ha_lineairdb_test.{table_name} (
+    cursor.execute(f'''CREATE TABLE ha_helios_test.{table_name} (
         category VARCHAR(20) NOT NULL,
         item_id INT NOT NULL,
         item_name VARCHAR(50),
         price INT,
         PRIMARY KEY (category, item_id)
-    ) ENGINE = LineairDB''')
+    ) ENGINE = Helios''')
     db.commit()
     
-    cursor.execute(f'INSERT INTO ha_lineairdb_test.{table_name} (category, item_id, item_name, price) VALUES ("book", 1, "Novel A", 1000)')
-    cursor.execute(f'INSERT INTO ha_lineairdb_test.{table_name} (category, item_id, item_name, price) VALUES ("book", 5, "Novel B", 1500)')
-    cursor.execute(f'INSERT INTO ha_lineairdb_test.{table_name} (category, item_id, item_name, price) VALUES ("book", 10, "Novel C", 2000)')
-    cursor.execute(f'INSERT INTO ha_lineairdb_test.{table_name} (category, item_id, item_name, price) VALUES ("book", 15, "Novel D", 1800)')
-    cursor.execute(f'INSERT INTO ha_lineairdb_test.{table_name} (category, item_id, item_name, price) VALUES ("electronics", 2, "Phone", 50000)')
-    cursor.execute(f'INSERT INTO ha_lineairdb_test.{table_name} (category, item_id, item_name, price) VALUES ("electronics", 8, "Tablet", 30000)')
-    cursor.execute(f'INSERT INTO ha_lineairdb_test.{table_name} (category, item_id, item_name, price) VALUES ("electronics", 12, "Laptop", 80000)')
-    cursor.execute(f'INSERT INTO ha_lineairdb_test.{table_name} (category, item_id, item_name, price) VALUES ("food", 3, "Apple", 200)')
-    cursor.execute(f'INSERT INTO ha_lineairdb_test.{table_name} (category, item_id, item_name, price) VALUES ("food", 7, "Banana", 150)')
-    cursor.execute(f'INSERT INTO ha_lineairdb_test.{table_name} (category, item_id, item_name, price) VALUES ("food", 11, "Orange", 180)')
+    cursor.execute(f'INSERT INTO ha_helios_test.{table_name} (category, item_id, item_name, price) VALUES ("book", 1, "Novel A", 1000)')
+    cursor.execute(f'INSERT INTO ha_helios_test.{table_name} (category, item_id, item_name, price) VALUES ("book", 5, "Novel B", 1500)')
+    cursor.execute(f'INSERT INTO ha_helios_test.{table_name} (category, item_id, item_name, price) VALUES ("book", 10, "Novel C", 2000)')
+    cursor.execute(f'INSERT INTO ha_helios_test.{table_name} (category, item_id, item_name, price) VALUES ("book", 15, "Novel D", 1800)')
+    cursor.execute(f'INSERT INTO ha_helios_test.{table_name} (category, item_id, item_name, price) VALUES ("electronics", 2, "Phone", 50000)')
+    cursor.execute(f'INSERT INTO ha_helios_test.{table_name} (category, item_id, item_name, price) VALUES ("electronics", 8, "Tablet", 30000)')
+    cursor.execute(f'INSERT INTO ha_helios_test.{table_name} (category, item_id, item_name, price) VALUES ("electronics", 12, "Laptop", 80000)')
+    cursor.execute(f'INSERT INTO ha_helios_test.{table_name} (category, item_id, item_name, price) VALUES ("food", 3, "Apple", 200)')
+    cursor.execute(f'INSERT INTO ha_helios_test.{table_name} (category, item_id, item_name, price) VALUES ("food", 7, "Banana", 150)')
+    cursor.execute(f'INSERT INTO ha_helios_test.{table_name} (category, item_id, item_name, price) VALUES ("food", 11, "Orange", 180)')
     db.commit()
     
-    cursor.execute(f'SELECT category, item_id, item_name, price FROM ha_lineairdb_test.{table_name}')
+    cursor.execute(f'SELECT category, item_id, item_name, price FROM ha_helios_test.{table_name}')
     all_rows = cursor.fetchall()
     
     if len(all_rows) != 10:
@@ -850,7 +850,7 @@ def test_composite_primary_key_range(db, cursor):
         return 1
     
     # Range query: category='book' AND item_id BETWEEN 5 AND 12
-    cursor.execute(f'SELECT category, item_id, item_name FROM ha_lineairdb_test.{table_name} WHERE category = "book" AND item_id BETWEEN 5 AND 12')
+    cursor.execute(f'SELECT category, item_id, item_name FROM ha_helios_test.{table_name} WHERE category = "book" AND item_id BETWEEN 5 AND 12')
     rows_range = cursor.fetchall()
     
     if len(rows_range) != 2:
@@ -863,7 +863,7 @@ def test_composite_primary_key_range(db, cursor):
         return 1
     
     # Range query: category='electronics' AND item_id < 10
-    cursor.execute(f'SELECT category, item_id, item_name FROM ha_lineairdb_test.{table_name} WHERE category = "electronics" AND item_id < 10')
+    cursor.execute(f'SELECT category, item_id, item_name FROM ha_helios_test.{table_name} WHERE category = "electronics" AND item_id < 10')
     rows_lt = cursor.fetchall()
     
     if len(rows_lt) != 2:
@@ -876,7 +876,7 @@ def test_composite_primary_key_range(db, cursor):
         return 1
     
     # Range query: category='food' AND item_id > 5
-    cursor.execute(f'SELECT category, item_id, item_name FROM ha_lineairdb_test.{table_name} WHERE category = "food" AND item_id > 5')
+    cursor.execute(f'SELECT category, item_id, item_name FROM ha_helios_test.{table_name} WHERE category = "food" AND item_id > 5')
     rows_gt = cursor.fetchall()
     
     if len(rows_gt) != 2:
@@ -889,7 +889,7 @@ def test_composite_primary_key_range(db, cursor):
         return 1
     
     # Range on first primary-key column: category >= 'electronics'
-    cursor.execute(f'SELECT category, item_id, item_name FROM ha_lineairdb_test.{table_name} WHERE category >= "electronics"')
+    cursor.execute(f'SELECT category, item_id, item_name FROM ha_helios_test.{table_name} WHERE category >= "electronics"')
     rows_cat = cursor.fetchall()
     
     if len(rows_cat) != 6:
@@ -910,14 +910,14 @@ def test_composite_primary_key_three_columns(db, cursor):
 
     table_name = f"test_comp_pk_3col_{int(time.time() * 1000000)}"
 
-    cursor.execute(f'''CREATE TABLE ha_lineairdb_test.{table_name} (
+    cursor.execute(f'''CREATE TABLE ha_helios_test.{table_name} (
         year INT NOT NULL,
         month INT NOT NULL,
         day INT NOT NULL,
         temperature FLOAT,
         weather VARCHAR(20),
         PRIMARY KEY (year, month, day)
-    ) ENGINE = LineairDB''')
+    ) ENGINE = Helios''')
     db.commit()
 
     rows_to_insert = [
@@ -933,20 +933,20 @@ def test_composite_primary_key_three_columns(db, cursor):
     ]
 
     insert_sql = (
-        f'INSERT INTO ha_lineairdb_test.{table_name} '
+        f'INSERT INTO ha_helios_test.{table_name} '
         f'(year, month, day, temperature, weather) VALUES (%s, %s, %s, %s, %s)'
     )
     for row in rows_to_insert:
         cursor.execute(insert_sql, row)
     db.commit()
 
-    cursor.execute(f'SELECT COUNT(*) FROM ha_lineairdb_test.{table_name}')
+    cursor.execute(f'SELECT COUNT(*) FROM ha_helios_test.{table_name}')
     if cursor.fetchone()[0] != 9:
         print("\tFailed: expected 9 rows after setup")
         return 1
 
     cursor.execute(
-        f'SELECT temperature FROM ha_lineairdb_test.{table_name} '
+        f'SELECT temperature FROM ha_helios_test.{table_name} '
         f'WHERE year = 2024 AND month = 3 AND day = 15'
     )
     temp_row = cursor.fetchall()
@@ -955,7 +955,7 @@ def test_composite_primary_key_three_columns(db, cursor):
         return 1
 
     cursor.execute(
-        f'SELECT COUNT(*) FROM ha_lineairdb_test.{table_name} '
+        f'SELECT COUNT(*) FROM ha_helios_test.{table_name} '
         f'WHERE year = 2024'
     )
     if cursor.fetchone()[0] != 9:
@@ -963,7 +963,7 @@ def test_composite_primary_key_three_columns(db, cursor):
         return 1
 
     cursor.execute(
-        f'SELECT day FROM ha_lineairdb_test.{table_name} '
+        f'SELECT day FROM ha_helios_test.{table_name} '
         f'WHERE year = 2024 AND month = 1 ORDER BY day'
     )
     days_january = [row[0] for row in cursor.fetchall()]
@@ -972,7 +972,7 @@ def test_composite_primary_key_three_columns(db, cursor):
         return 1
 
     cursor.execute(
-        f'SELECT day FROM ha_lineairdb_test.{table_name} '
+        f'SELECT day FROM ha_helios_test.{table_name} '
         f'WHERE year = 2024 AND month = 3 AND day >= 15 ORDER BY day'
     )
     days_range = [row[0] for row in cursor.fetchall()]
@@ -981,7 +981,7 @@ def test_composite_primary_key_three_columns(db, cursor):
         return 1
 
     cursor.execute(
-        f'SELECT month FROM ha_lineairdb_test.{table_name} '
+        f'SELECT month FROM ha_helios_test.{table_name} '
         f'WHERE year = 2024 AND month BETWEEN 3 AND 6 ORDER BY month, day'
     )
     months_in_range = [row[0] for row in cursor.fetchall()]
@@ -998,14 +998,14 @@ def test_composite_index_with_primary_key(db, cursor):
 
     table_name = f"test_comp_with_pk_{int(time.time() * 1000000)}"
 
-    cursor.execute(f'''CREATE TABLE ha_lineairdb_test.{table_name} (
+    cursor.execute(f'''CREATE TABLE ha_helios_test.{table_name} (
         id INT NOT NULL PRIMARY KEY,
         name VARCHAR(50) NOT NULL,
         age INT NOT NULL,
         department VARCHAR(50) NOT NULL,
         salary INT,
         INDEX age_dept_idx (age, department)
-    ) ENGINE = LineairDB''')
+    ) ENGINE = Helios''')
     db.commit()
 
     rows_to_insert = [
@@ -1019,20 +1019,20 @@ def test_composite_index_with_primary_key(db, cursor):
     ]
 
     insert_sql = (
-        f'INSERT INTO ha_lineairdb_test.{table_name} '
+        f'INSERT INTO ha_helios_test.{table_name} '
         f'(id, name, age, department, salary) VALUES (%s, %s, %s, %s, %s)'
     )
     for row in rows_to_insert:
         cursor.execute(insert_sql, row)
     db.commit()
 
-    cursor.execute(f'SELECT COUNT(*) FROM ha_lineairdb_test.{table_name}')
+    cursor.execute(f'SELECT COUNT(*) FROM ha_helios_test.{table_name}')
     if cursor.fetchone()[0] != 7:
         print("\tFailed: expected 7 rows after setup")
         return 1
 
     cursor.execute(
-        f'SELECT name FROM ha_lineairdb_test.{table_name} '
+        f'SELECT name FROM ha_helios_test.{table_name} '
         f'WHERE age = 25 AND department = "engineering" ORDER BY name'
     )
     names_exact = [row[0] for row in cursor.fetchall()]
@@ -1041,7 +1041,7 @@ def test_composite_index_with_primary_key(db, cursor):
         return 1
 
     cursor.execute(
-        f'SELECT name FROM ha_lineairdb_test.{table_name} '
+        f'SELECT name FROM ha_helios_test.{table_name} '
         f'WHERE age = 25 ORDER BY name'
     )
     names_age_25 = [row[0] for row in cursor.fetchall()]
@@ -1050,7 +1050,7 @@ def test_composite_index_with_primary_key(db, cursor):
         return 1
 
     cursor.execute(
-        f'SELECT name FROM ha_lineairdb_test.{table_name} '
+        f'SELECT name FROM ha_helios_test.{table_name} '
         f'WHERE age = 30 AND department <= "engineering" ORDER BY name'
     )
     names_range = [row[0] for row in cursor.fetchall()]
@@ -1059,7 +1059,7 @@ def test_composite_index_with_primary_key(db, cursor):
         return 1
 
     cursor.execute(
-        f'SELECT id, name, age, department FROM ha_lineairdb_test.{table_name} '
+        f'SELECT id, name, age, department FROM ha_helios_test.{table_name} '
         f'WHERE id = 3'
     )
     pk_row = cursor.fetchall()
@@ -1076,20 +1076,20 @@ def test_exclusive_range_boundary(db, cursor):
     
     table_name = f"test_excl_range_{int(time.time() * 1000000)}"
     
-    cursor.execute(f'''CREATE TABLE ha_lineairdb_test.{table_name} (
+    cursor.execute(f'''CREATE TABLE ha_helios_test.{table_name} (
         id INT NOT NULL,
         value INT NOT NULL,
         INDEX value_idx (value)
-    ) ENGINE = LineairDB''')
+    ) ENGINE = Helios''')
     db.commit()
     
     # Insert values 1, 2, 3, 4, 5
     for i in range(1, 6):
-        cursor.execute(f'INSERT INTO ha_lineairdb_test.{table_name} (id, value) VALUES ({i}, {i})')
+        cursor.execute(f'INSERT INTO ha_helios_test.{table_name} (id, value) VALUES ({i}, {i})')
     db.commit()
     
     # Test: value < 3 should return values 1, 2 (NOT 3)
-    cursor.execute(f'SELECT value FROM ha_lineairdb_test.{table_name} WHERE value < 3 ORDER BY value')
+    cursor.execute(f'SELECT value FROM ha_helios_test.{table_name} WHERE value < 3 ORDER BY value')
     rows_lt = cursor.fetchall()
     values_lt = [row[0] for row in rows_lt]
     
@@ -1100,7 +1100,7 @@ def test_exclusive_range_boundary(db, cursor):
         return 1
     
     # Test: value > 3 should return values 4, 5 (NOT 3)
-    cursor.execute(f'SELECT value FROM ha_lineairdb_test.{table_name} WHERE value > 3 ORDER BY value')
+    cursor.execute(f'SELECT value FROM ha_helios_test.{table_name} WHERE value > 3 ORDER BY value')
     rows_gt = cursor.fetchall()
     values_gt = [row[0] for row in rows_gt]
     
@@ -1111,7 +1111,7 @@ def test_exclusive_range_boundary(db, cursor):
         return 1
     
     # Test: value <= 3 should return values 1, 2, 3
-    cursor.execute(f'SELECT value FROM ha_lineairdb_test.{table_name} WHERE value <= 3 ORDER BY value')
+    cursor.execute(f'SELECT value FROM ha_helios_test.{table_name} WHERE value <= 3 ORDER BY value')
     rows_lte = cursor.fetchall()
     values_lte = [row[0] for row in rows_lte]
     
@@ -1120,7 +1120,7 @@ def test_exclusive_range_boundary(db, cursor):
         return 1
     
     # Test: value >= 3 should return values 3, 4, 5
-    cursor.execute(f'SELECT value FROM ha_lineairdb_test.{table_name} WHERE value >= 3 ORDER BY value')
+    cursor.execute(f'SELECT value FROM ha_helios_test.{table_name} WHERE value >= 3 ORDER BY value')
     rows_gte = cursor.fetchall()
     values_gte = [row[0] for row in rows_gte]
     
@@ -1129,7 +1129,7 @@ def test_exclusive_range_boundary(db, cursor):
         return 1
     
     # Test combined: 2 < value < 4 should return only 3
-    cursor.execute(f'SELECT value FROM ha_lineairdb_test.{table_name} WHERE value > 2 AND value < 4 ORDER BY value')
+    cursor.execute(f'SELECT value FROM ha_helios_test.{table_name} WHERE value > 2 AND value < 4 ORDER BY value')
     rows_between = cursor.fetchall()
     values_between = [row[0] for row in rows_between]
     
@@ -1146,12 +1146,12 @@ def test_composite_index_exclusive_range(db, cursor):
     
     table_name = f"test_comp_excl_{int(time.time() * 1000000)}"
     
-    cursor.execute(f'''CREATE TABLE ha_lineairdb_test.{table_name} (
+    cursor.execute(f'''CREATE TABLE ha_helios_test.{table_name} (
         id INT NOT NULL,
         category VARCHAR(20) NOT NULL,
         priority INT NOT NULL,
         INDEX cat_pri_idx (category, priority)
-    ) ENGINE = LineairDB''')
+    ) ENGINE = Helios''')
     db.commit()
     
     # Insert test data: category='bug' with priorities 1, 3, 5, 7, 9
@@ -1163,11 +1163,11 @@ def test_composite_index_exclusive_range(db, cursor):
         (5, "bug", 9),
     ]
     for id_val, cat, pri in test_data:
-        cursor.execute(f'INSERT INTO ha_lineairdb_test.{table_name} VALUES ({id_val}, "{cat}", {pri})')
+        cursor.execute(f'INSERT INTO ha_helios_test.{table_name} VALUES ({id_val}, "{cat}", {pri})')
     db.commit()
     
     # Test: category='bug' AND priority < 5 should return 1, 3 (NOT 5)
-    cursor.execute(f'SELECT priority FROM ha_lineairdb_test.{table_name} WHERE category = "bug" AND priority < 5 ORDER BY priority')
+    cursor.execute(f'SELECT priority FROM ha_helios_test.{table_name} WHERE category = "bug" AND priority < 5 ORDER BY priority')
     rows = cursor.fetchall()
     priorities = [row[0] for row in rows]
     
@@ -1178,7 +1178,7 @@ def test_composite_index_exclusive_range(db, cursor):
         return 1
     
     # Test: category='bug' AND priority > 5 should return 7, 9 (NOT 5)
-    cursor.execute(f'SELECT priority FROM ha_lineairdb_test.{table_name} WHERE category = "bug" AND priority > 5 ORDER BY priority')
+    cursor.execute(f'SELECT priority FROM ha_helios_test.{table_name} WHERE category = "bug" AND priority > 5 ORDER BY priority')
     rows = cursor.fetchall()
     priorities = [row[0] for row in rows]
     
@@ -1189,7 +1189,7 @@ def test_composite_index_exclusive_range(db, cursor):
         return 1
     
     # Test: category='bug' AND priority <= 5 should return 1, 3, 5
-    cursor.execute(f'SELECT priority FROM ha_lineairdb_test.{table_name} WHERE category = "bug" AND priority <= 5 ORDER BY priority')
+    cursor.execute(f'SELECT priority FROM ha_helios_test.{table_name} WHERE category = "bug" AND priority <= 5 ORDER BY priority')
     rows = cursor.fetchall()
     priorities = [row[0] for row in rows]
     
@@ -1198,7 +1198,7 @@ def test_composite_index_exclusive_range(db, cursor):
         return 1
     
     # Test: category='bug' AND priority >= 5 should return 5, 7, 9
-    cursor.execute(f'SELECT priority FROM ha_lineairdb_test.{table_name} WHERE category = "bug" AND priority >= 5 ORDER BY priority')
+    cursor.execute(f'SELECT priority FROM ha_helios_test.{table_name} WHERE category = "bug" AND priority >= 5 ORDER BY priority')
     rows = cursor.fetchall()
     priorities = [row[0] for row in rows]
     
@@ -1207,7 +1207,7 @@ def test_composite_index_exclusive_range(db, cursor):
         return 1
     
     # Test: category='bug' AND 3 < priority < 7 should return only 5
-    cursor.execute(f'SELECT priority FROM ha_lineairdb_test.{table_name} WHERE category = "bug" AND priority > 3 AND priority < 7 ORDER BY priority')
+    cursor.execute(f'SELECT priority FROM ha_helios_test.{table_name} WHERE category = "bug" AND priority > 3 AND priority < 7 ORDER BY priority')
     rows = cursor.fetchall()
     priorities = [row[0] for row in rows]
     
@@ -1224,13 +1224,13 @@ def test_composite_index_string_collision(db, cursor):
 
     table_name = f"test_comp_str_collision_{int(time.time() * 1000000)}"
 
-    cursor.execute(f'''CREATE TABLE ha_lineairdb_test.{table_name} (
+    cursor.execute(f'''CREATE TABLE ha_helios_test.{table_name} (
         id INT NOT NULL,
         key_part1 VARCHAR(10) NOT NULL,
         key_part2 VARCHAR(10) NOT NULL,
         payload VARCHAR(50),
         INDEX key_idx (key_part1, key_part2)
-    ) ENGINE = LineairDB''')
+    ) ENGINE = Helios''')
     db.commit()
 
     rows_to_insert = [
@@ -1239,7 +1239,7 @@ def test_composite_index_string_collision(db, cursor):
     ]
 
     insert_sql = (
-        f'INSERT INTO ha_lineairdb_test.{table_name} '
+        f'INSERT INTO ha_helios_test.{table_name} '
         f'(id, key_part1, key_part2, payload) VALUES (%s, %s, %s, %s)'
     )
     for row in rows_to_insert:
@@ -1247,13 +1247,13 @@ def test_composite_index_string_collision(db, cursor):
     db.commit()
 
     cursor.execute(
-        f'SELECT COUNT(*) FROM ha_lineairdb_test.{table_name}')
+        f'SELECT COUNT(*) FROM ha_helios_test.{table_name}')
     if cursor.fetchone()[0] != 2:
         print("\tFailed: expected 2 rows after setup")
         return 1
 
     cursor.execute(
-        f'SELECT payload FROM ha_lineairdb_test.{table_name} '
+        f'SELECT payload FROM ha_helios_test.{table_name} '
         f'WHERE key_part1 = "ab" AND key_part2 = "c"')
     rows_ab_c = cursor.fetchall()
     if len(rows_ab_c) != 1 or rows_ab_c[0][0] != "value_ab_c":
@@ -1262,7 +1262,7 @@ def test_composite_index_string_collision(db, cursor):
         return 1
 
     cursor.execute(
-        f'SELECT payload FROM ha_lineairdb_test.{table_name} '
+        f'SELECT payload FROM ha_helios_test.{table_name} '
         f'WHERE key_part1 = "a" AND key_part2 = "bc"')
     rows_a_bc = cursor.fetchall()
     if len(rows_a_bc) != 1 or rows_a_bc[0][0] != "value_a_bc":
@@ -1271,7 +1271,7 @@ def test_composite_index_string_collision(db, cursor):
         return 1
 
     cursor.execute(
-        f'SELECT COUNT(*) FROM ha_lineairdb_test.{table_name} '
+        f'SELECT COUNT(*) FROM ha_helios_test.{table_name} '
         f'WHERE key_part1 = "ab" AND key_part2 = "bc"')
     count_wrong = cursor.fetchone()[0]
     if count_wrong != 0:
@@ -1279,7 +1279,7 @@ def test_composite_index_string_collision(db, cursor):
         return 1
 
     cursor.execute(
-        f'SELECT COUNT(*) FROM ha_lineairdb_test.{table_name} '
+        f'SELECT COUNT(*) FROM ha_helios_test.{table_name} '
         f'WHERE key_part1 = "a" AND key_part2 = "c"')
     count_wrong2 = cursor.fetchone()[0]
     if count_wrong2 != 0:
@@ -1295,7 +1295,7 @@ def main():
     cursor = db.cursor()
     
     # Ensure the test database exists
-    cursor.execute('CREATE DATABASE IF NOT EXISTS ha_lineairdb_test')
+    cursor.execute('CREATE DATABASE IF NOT EXISTS ha_helios_test')
     db.commit()
     
     result = 0

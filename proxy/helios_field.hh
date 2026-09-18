@@ -1,5 +1,5 @@
-#ifndef LINEAIRDB_FIELD_HH
-#define LINEAIRDB_FIELD_HH
+#ifndef HELIOS_FIELD_HH
+#define HELIOS_FIELD_HH
 
 #include <climits>
 #include <string>
@@ -11,9 +11,9 @@
 
 /**
  * @brief This class is responsible for the translation between
- * MySQL Field value and LineairDB Field.
+ * MySQL Field value and Helios Field.
  * @details
- * LineairDB field consists of the following 3 information:
+ * Helios field consists of the following 3 information:
  *  header1     header2
  * [byteSize][valueLength][value]
  * header info
@@ -26,7 +26,7 @@
  * Each row consists of multiple fields.
  * First field stores null flags.
  */
-class LineairDBField {
+class HeliosField {
  public:
   std::string convert_numeric_to_bytes(const size_t num) const;
   size_t convert_bytes_to_numeric(
@@ -37,21 +37,21 @@ class LineairDBField {
    * @brief These methods are called for INSERT and UPDATE statements
    */
   std::string get_null_field() const;
-  std::string get_lineairdb_field() const;
+  std::string get_helios_field() const;
 
   void set_null_field(const uchar* const buf, const size_t null_byte_length);
-  void set_lineairdb_field(std::variant<const uchar*, const char*> srcMysql,
+  void set_helios_field(std::variant<const uchar*, const char*> srcMysql,
                            const size_t length);
 
   /**
    * @brief These methods are called for SELECT statements.
    *
-   * make_mysql_table_row parses the LineairDB-encoded row and records each
-   * field as a (pointer, length) pair into ldbRawData. No allocations or
-   * copies are performed — the caller MUST keep ldbRawData alive while
+   * make_mysql_table_row parses the Helios-encoded row and records each
+   * field as a (pointer, length) pair into raw_row. No allocations or
+   * copies are performed — the caller MUST keep raw_row alive while
    * iterating via get_column_of_row().
    */
-  void make_mysql_table_row(const std::byte* const ldbRawData,
+  void make_mysql_table_row(const std::byte *const raw_row,
                             const size_t length);
   std::string_view get_null_flags() const { return nullFlagView; }
   std::string_view get_column_of_row(const size_t i) const { return row[i]; }
@@ -59,7 +59,7 @@ class LineairDBField {
   // by this, not by s->fields.
   size_t get_row_size() const { return row.size(); }
 
-  LineairDBField() = default;
+  HeliosField() = default;
 
  private:
   static constexpr char noValue = 0xff;
@@ -69,7 +69,7 @@ class LineairDBField {
   std::string valueLength;
   std::string value;
 
-  // Zero-copy row parsing: views point into the caller-owned ldbRawData.
+  // Zero-copy row parsing: views point into the caller-owned raw_row.
   std::string_view nullFlagView;
   std::vector<std::string_view> row;
 
@@ -84,4 +84,4 @@ class LineairDBField {
   }
 };
 
-#endif /* LINEAIRDB_FIELD_HH */
+#endif /* HELIOS_FIELD_HH */

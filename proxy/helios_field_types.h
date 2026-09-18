@@ -1,5 +1,5 @@
-#ifndef LINEAIRDB_FIELD_TYPES_H
-#define LINEAIRDB_FIELD_TYPES_H
+#ifndef HELIOS_FIELD_TYPES_H
+#define HELIOS_FIELD_TYPES_H
 
 #include <cstdint>
 #include <vector>
@@ -26,7 +26,7 @@ constexpr uint32_t DEC64 = 4;                   // 8-byte LE scaled int (DEC64)
  * @brief Computes PAX cell widths, kinds, and scales for the encoded row
  * fields of `table`.
  *
- * @details LineairDB rows store each MySQL field as the string payload
+ * @details Helios rows store each MySQL field as the string payload
  * produced by Field::val_str(). The returned vector contains one maximum
  * payload width per encoded row field: entry 0 is the row null-flags field,
  * and the remaining entries follow TABLE::field order. For an UNTYPED field
@@ -56,30 +56,30 @@ std::vector<uint32_t> compute_pax_field_widths(
     std::vector<int32_t> *scales = nullptr, uint *wide_field = nullptr);
 
 /**
- * @brief LineairDB-internal classification of MySQL field types.
+ * @brief Helios-internal classification of MySQL field types.
  */
-enum class LineairDBFieldType {
+enum class HeliosFieldType {
   // Numeric types
-  LINEAIRDB_INT,
+  HELIOS_INT,
 
   // String types
-  LINEAIRDB_STRING,
+  HELIOS_STRING,
 
   // Date/Time types
-  LINEAIRDB_DATETIME,
+  HELIOS_DATETIME,
 
   // Other/Unsupported types
-  LINEAIRDB_OTHER
+  HELIOS_OTHER
 };
 
 /**
- * @brief Maps a MySQL field type to its LineairDB field type.
+ * @brief Maps a MySQL field type to its Helios field type.
  *
  * @param mysql_type MySQL's enum_field_types.
- * @return Corresponding LineairDB field type.
+ * @return Corresponding Helios field type.
  */
-inline LineairDBFieldType
-convert_mysql_type_to_lineairdb(enum_field_types mysql_type) {
+inline HeliosFieldType
+convert_mysql_type_to_helios(enum_field_types mysql_type) {
   switch (mysql_type) {
   // Numeric types
   case MYSQL_TYPE_TINY:       // TINYINT
@@ -92,7 +92,7 @@ convert_mysql_type_to_lineairdb(enum_field_types mysql_type) {
   case MYSQL_TYPE_DECIMAL:    // DECIMAL (old)
   case MYSQL_TYPE_NEWDECIMAL: // DECIMAL (new)
   case MYSQL_TYPE_YEAR:       // YEAR
-    return LineairDBFieldType::LINEAIRDB_INT;
+    return HeliosFieldType::HELIOS_INT;
 
   // String types
   case MYSQL_TYPE_VARCHAR:     // VARCHAR
@@ -104,7 +104,7 @@ convert_mysql_type_to_lineairdb(enum_field_types mysql_type) {
   case MYSQL_TYPE_LONG_BLOB:   // LONGBLOB, LONGTEXT
   case MYSQL_TYPE_ENUM:        // ENUM
   case MYSQL_TYPE_SET:         // SET
-    return LineairDBFieldType::LINEAIRDB_STRING;
+    return HeliosFieldType::HELIOS_STRING;
 
   // Date/Time types
   case MYSQL_TYPE_TIMESTAMP:  // TIMESTAMP
@@ -115,7 +115,7 @@ convert_mysql_type_to_lineairdb(enum_field_types mysql_type) {
   case MYSQL_TYPE_TIME:       // TIME
   case MYSQL_TYPE_TIME2:      // TIME (internal)
   case MYSQL_TYPE_NEWDATE:    // NEWDATE (internal)
-    return LineairDBFieldType::LINEAIRDB_DATETIME;
+    return HeliosFieldType::HELIOS_DATETIME;
 
   // Other/Unsupported types
   case MYSQL_TYPE_NULL:        // NULL
@@ -126,29 +126,29 @@ convert_mysql_type_to_lineairdb(enum_field_types mysql_type) {
   case MYSQL_TYPE_BOOL:        // BOOL (placeholder)
   case MYSQL_TYPE_INVALID:     // INVALID
   default:
-    return LineairDBFieldType::LINEAIRDB_OTHER;
+    return HeliosFieldType::HELIOS_OTHER;
   }
 }
 
 /**
- * @brief Returns the display name of a LineairDB field type.
+ * @brief Returns the display name of a Helios field type.
  *
- * @param type LineairDB field type.
+ * @param type Helios field type.
  * @return Type name as a string constant.
  */
-inline const char *lineairdb_field_type_name(LineairDBFieldType type) {
+inline const char *helios_field_type_name(HeliosFieldType type) {
   switch (type) {
-  case LineairDBFieldType::LINEAIRDB_INT:
+  case HeliosFieldType::HELIOS_INT:
     return "INT";
-  case LineairDBFieldType::LINEAIRDB_STRING:
+  case HeliosFieldType::HELIOS_STRING:
     return "STRING";
-  case LineairDBFieldType::LINEAIRDB_DATETIME:
+  case HeliosFieldType::HELIOS_DATETIME:
     return "DATETIME";
-  case LineairDBFieldType::LINEAIRDB_OTHER:
+  case HeliosFieldType::HELIOS_OTHER:
     return "OTHER";
   default:
     return "UNKNOWN";
   }
 }
 
-#endif  // LINEAIRDB_FIELD_TYPES_H
+#endif  // HELIOS_FIELD_TYPES_H

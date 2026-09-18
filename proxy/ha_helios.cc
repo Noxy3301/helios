@@ -21,14 +21,14 @@
   Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301  USA */
 
 /**
- * @file ha_lineairdb.cc
+ * @file ha_helios.cc
  *
- * The LINEAIRDB storage engine handler: plugin registration, session and
+ * The HELIOS storage engine handler: plugin registration, session and
  * transaction lifecycle, and the handler calls that do not belong to one of
  * the scan, DML, DDL or statistics units.
  */
 
-#include "storage/lineairdb/ha_lineairdb.hh"
+#include "storage/helios/ha_helios.hh"
 #include "../common/log.h"
 
 #include <algorithm>
@@ -47,10 +47,10 @@
 // for ::strcasecmp
 #include <strings.h>
 
-#include "lineairdb_field_types.h"
-#include "lineairdb_keyenc.hh"
-#include "lineairdb_prefetch.hh"
-#include "lineairdb.pb.h"
+#include "helios_field_types.h"
+#include "helios_keyenc.hh"
+#include "helios_prefetch.hh"
+#include "helios.pb.h"
 #include "my_dbug.h"
 #include "mysql/plugin.h"
 #include "sql/field.h"
@@ -66,93 +66,93 @@
 
 #define BLOB_MEMROOT_ALLOC_SIZE (8192)
 
-// LineairDB server connection target (GLOBAL sysvars backing storage)
+// Helios server connection target (GLOBAL sysvars backing storage)
 static char *srv_server_host = nullptr;
 static ulong srv_server_port = 9999;
 ulong srv_read_path = kReadPathPlan;
 bool srv_stats_drift_refresh = false;
-handlerton *lineairdb_hton;
+handlerton *helios_hton;
 
 // THD-scoped context
-struct LineairDBThdCtx {
-  std::shared_ptr<LineairDBProxy> proxy;
-  LineairDBTransaction *tx{nullptr};
+struct HeliosThdCtx {
+  std::shared_ptr<HeliosProxy> proxy;
+  HeliosTransaction *tx{nullptr};
 };
 
 /**
- * @brief Return the THD-local LineairDB context slot.
+ * @brief Return the THD-local Helios context slot.
  */
-static LineairDBThdCtx *&lineairdb_thd_ctx(THD *thd, handlerton *hton) {
-  return *reinterpret_cast<LineairDBThdCtx **>(thd_ha_data(thd, hton));
+static HeliosThdCtx *&helios_thd_ctx(THD *thd, handlerton *hton) {
+  return *reinterpret_cast<HeliosThdCtx **>(thd_ha_data(thd, hton));
 }
 
 /**
  * @brief Create the THD context and RPC proxy when this thread has none.
  */
-static void ensure_lineairdb_proxy(LineairDBThdCtx *&ctx) {
+static void ensure_helios_proxy(HeliosThdCtx *&ctx) {
   if (ctx == nullptr)
-    ctx = new LineairDBThdCtx();
+    ctx = new HeliosThdCtx();
   if (!ctx->proxy) {
     std::string host =
         srv_server_host ? srv_server_host : std::string("127.0.0.1");
     int port = static_cast<int>(srv_server_port);
-    ctx->proxy = std::make_shared<LineairDBProxy>(host, port);
+    ctx->proxy = std::make_shared<HeliosProxy>(host, port);
   }
 }
 
-namespace lineairdb {
+namespace helios {
 
-std::shared_ptr<LineairDBProxy> acquire_shared_proxy(THD *thd) {
-  if (thd == nullptr || lineairdb_hton == nullptr) return nullptr;
-  LineairDBThdCtx *&ctx = lineairdb_thd_ctx(thd, lineairdb_hton);
-  ensure_lineairdb_proxy(ctx);
+std::shared_ptr<HeliosProxy> acquire_shared_proxy(THD *thd) {
+  if (thd == nullptr || helios_hton == nullptr) return nullptr;
+  HeliosThdCtx *&ctx = helios_thd_ctx(thd, helios_hton);
+  ensure_helios_proxy(ctx);
   return ctx->proxy;
 }
 
-}  // namespace lineairdb
+}  // namespace helios
 
-static int lineairdb_commit(handlerton *hton, THD *thd, bool shouldCommit);
-static int lineairdb_abort(handlerton *hton, THD *thd, bool);
+static int helios_commit(handlerton *hton, THD *thd, bool shouldCommit);
+static int helios_abort(handlerton *hton, THD *thd, bool);
 
-static int lineairdb_close_connection(handlerton *hton, THD *thd);
+static int helios_close_connection(handlerton *hton, THD *thd);
 
-static handler *lineairdb_create_handler(handlerton *hton, TABLE_SHARE *table,
+static handler *helios_create_handler(handlerton *hton, TABLE_SHARE *table,
                                          bool partitioned, MEM_ROOT *mem_root);
 
-static handler *lineairdb_create_handler(handlerton *hton, TABLE_SHARE *table,
+static handler *helios_create_handler(handlerton *hton, TABLE_SHARE *table,
                                          bool, MEM_ROOT *mem_root) {
-  return new (mem_root) ha_lineairdb(hton, table);
+  return new (mem_root) ha_helios(hton, table);
 }
 
-static int lineairdb_init_func(void *p) {
+static int helios_init_func(void *p) {
   DBUG_TRACE;
 
-  lineairdb_hton = (handlerton *)p;
-  lineairdb_hton->state = SHOW_OPTION_YES;
-  lineairdb_hton->create = lineairdb_create_handler;
-  lineairdb_hton->flags =
+  helios_hton = (handlerton *)p;
+  helios_hton->state = SHOW_OPTION_YES;
+  helios_hton->create = helios_create_handler;
+  helios_hton->flags =
       HTON_CAN_RECREATE | HTON_SUPPORTS_SECONDARY_ENGINE;
   // SECONDARY_LOAD/UNLOAD cleanup calls the primary engine's post_ddl hook.
-  // LineairDB has no post-DDL storage work here, but the hook must be present.
-  lineairdb_hton->post_ddl = [](THD *) {};
-  lineairdb_hton->db_type = DB_TYPE_UNKNOWN;
-  lineairdb_hton->commit = lineairdb_commit;
-  lineairdb_hton->rollback = lineairdb_abort;
-  lineairdb_hton->close_connection = lineairdb_close_connection;
+  // Helios has no post-DDL storage work here, but the hook must be present.
+  helios_hton->post_ddl = [](THD *) {};
+  helios_hton->db_type = DB_TYPE_UNKNOWN;
+  helios_hton->commit = helios_commit;
+  helios_hton->rollback = helios_abort;
+  helios_hton->close_connection = helios_close_connection;
 
   return 0;
 }
 
-LineairDB_share::LineairDB_share() { thr_lock_init(&lock); }
+Helios_share::Helios_share() { thr_lock_init(&lock); }
 
-LineairDB_share *ha_lineairdb::get_share() {
-  LineairDB_share *tmp_share;
+Helios_share *ha_helios::get_share() {
+  Helios_share *tmp_share;
 
   DBUG_TRACE;
 
   lock_shared_ha_data();
-  if (!(tmp_share = static_cast<LineairDB_share *>(get_ha_share_ptr()))) {
-    tmp_share = new LineairDB_share;
+  if (!(tmp_share = static_cast<Helios_share *>(get_ha_share_ptr()))) {
+    tmp_share = new Helios_share;
     if (!tmp_share)
       goto err;
 
@@ -163,30 +163,30 @@ err:
   return tmp_share;
 }
 
-LineairDBProxy *ha_lineairdb::get_proxy() {
+HeliosProxy *ha_helios::get_proxy() {
   // thd_ha_data provides a single void* slot per THD per storage engine.
-  // We need LineairDBThdCtx to hold both the RPC proxy and the transaction.
-  LineairDBThdCtx *&ctx = lineairdb_thd_ctx(userThread, lineairdb_hton);
-  ensure_lineairdb_proxy(ctx);
+  // We need HeliosThdCtx to hold both the RPC proxy and the transaction.
+  HeliosThdCtx *&ctx = helios_thd_ctx(userThread, helios_hton);
+  ensure_helios_proxy(ctx);
   return ctx->proxy.get();
 }
 
-std::string ha_lineairdb::server_connection_host() {
+std::string ha_helios::server_connection_host() {
   return srv_server_host ? srv_server_host : std::string("127.0.0.1");
 }
 
-int ha_lineairdb::server_connection_port() {
+int ha_helios::server_connection_port() {
   return static_cast<int>(srv_server_port);
 }
 
-static PSI_memory_key lineairdb_key_memory_blobroot;
+static PSI_memory_key helios_key_memory_blobroot;
 
-ha_lineairdb::ha_lineairdb(handlerton *hton, TABLE_SHARE *table_arg)
+ha_helios::ha_helios(handlerton *hton, TABLE_SHARE *table_arg)
     : handler(hton, table_arg), m_ds_mrr(this), buffer_position_(0),
       scan_exhausted_(false),
-      blobroot(lineairdb_key_memory_blobroot, BLOB_MEMROOT_ALLOC_SIZE) {}
+      blobroot(helios_key_memory_blobroot, BLOB_MEMROOT_ALLOC_SIZE) {}
 
-int ha_lineairdb::extra(enum ha_extra_function operation) {
+int ha_helios::extra(enum ha_extra_function operation) {
   DBUG_TRACE;
   switch (operation) {
     case HA_EXTRA_WRITE_CAN_REPLACE:
@@ -209,7 +209,7 @@ int ha_lineairdb::extra(enum ha_extra_function operation) {
   return 0;
 }
 
-int ha_lineairdb::reset() {
+int ha_helios::reset() {
   DBUG_TRACE;
   insert_can_replace_ = false;
   insert_peeks_duplicates_ = false;
@@ -223,7 +223,7 @@ int ha_lineairdb::reset() {
   return 0;
 }
 
-void ha_lineairdb::start_bulk_insert(ha_rows rows) {
+void ha_helios::start_bulk_insert(ha_rows rows) {
   DBUG_TRACE;
   bulk_insert_rows_ = rows;
   bulk_insert_generated_ = 0;
@@ -231,7 +231,7 @@ void ha_lineairdb::start_bulk_insert(ha_rows rows) {
   insert_probe_keys_.clear();
 }
 
-int ha_lineairdb::end_bulk_insert() {
+int ha_helios::end_bulk_insert() {
   DBUG_TRACE;
   bulk_insert_rows_ = 0;
   bulk_insert_generated_ = 0;
@@ -260,12 +260,12 @@ int ha_lineairdb::end_bulk_insert() {
   return error;
 }
 
-int ha_lineairdb::delete_all_rows() {
+int ha_helios::delete_all_rows() {
   DBUG_TRACE;
   return HA_ERR_WRONG_COMMAND;
 }
 
-int ha_lineairdb::external_lock(THD *thd, int lock_type) {
+int ha_helios::external_lock(THD *thd, int lock_type) {
   DBUG_TRACE;
 
   userThread = thd;
@@ -274,7 +274,7 @@ int ha_lineairdb::external_lock(THD *thd, int lock_type) {
   if (tx_is_ready_to_commit) return 0;
 
   // get_transaction() will automatically start the transaction if needed
-  LineairDBTransaction *tx = get_transaction(thd);
+  HeliosTransaction *tx = get_transaction(thd);
   if (tx != nullptr) {
     const LEX_CSTRING &q = thd->query();
     if (q.str != nullptr && q.length > 0) {
@@ -289,30 +289,30 @@ int ha_lineairdb::external_lock(THD *thd, int lock_type) {
   return 0;
 }
 
-int ha_lineairdb::start_stmt(THD *thd, thr_lock_type lock_type) {
+int ha_helios::start_stmt(THD *thd, thr_lock_type lock_type) {
   assert(lock_type > 0);
   userThread = thd;
   return external_lock(thd, lock_type);
 }
 
-LineairDBTransaction *ha_lineairdb::active_transaction(THD *thd) const {
+HeliosTransaction *ha_helios::active_transaction(THD *thd) const {
   if (thd == nullptr) return nullptr;
-  LineairDBThdCtx *ctx =
-      *reinterpret_cast<LineairDBThdCtx **>(thd_ha_data(thd, lineairdb_hton));
+  HeliosThdCtx *ctx =
+      *reinterpret_cast<HeliosThdCtx **>(thd_ha_data(thd, helios_hton));
   return (ctx != nullptr) ? ctx->tx : nullptr;
 }
 
-LineairDBTransaction *ha_lineairdb::new_transaction(THD *thd) {
+HeliosTransaction *ha_helios::new_transaction(THD *thd) {
   if (thd == nullptr) return nullptr;
   userThread = thd;
-  return new LineairDBTransaction(thd, get_proxy(), lineairdb_hton);
+  return new HeliosTransaction(thd, get_proxy(), helios_hton);
 }
 
-LineairDBTransaction *&ha_lineairdb::get_transaction(THD *thd) {
-  LineairDBThdCtx *&ctx = lineairdb_thd_ctx(thd, lineairdb_hton);
-  ensure_lineairdb_proxy(ctx);
+HeliosTransaction *&ha_helios::get_transaction(THD *thd) {
+  HeliosThdCtx *&ctx = helios_thd_ctx(thd, helios_hton);
+  ensure_helios_proxy(ctx);
   if (ctx->tx == nullptr) {
-    ctx->tx = new LineairDBTransaction(thd, ctx->proxy.get(), lineairdb_hton);
+    ctx->tx = new HeliosTransaction(thd, ctx->proxy.get(), helios_hton);
   }
   if (ctx->tx->is_not_started()) {
     ctx->tx->begin_transaction();
@@ -321,7 +321,7 @@ LineairDBTransaction *&ha_lineairdb::get_transaction(THD *thd) {
   return ctx->tx;
 }
 
-int ha_lineairdb::abort_errno(LineairDBTransaction *tx,
+int ha_helios::abort_errno(HeliosTransaction *tx,
                               bool duplicate_is_conflict) {
   if (tx != nullptr && tx->has_transport_error()) {
     thd_mark_transaction_to_rollback(ha_thd(), 1);
@@ -342,11 +342,11 @@ int ha_lineairdb::abort_errno(LineairDBTransaction *tx,
 }
 
 /**
- * implementation of commit for lineairdb_hton
+ * implementation of commit for helios_hton
  */
-static int lineairdb_commit(handlerton *hton, THD *thd, bool all) {
-  LineairDBThdCtx *&ctx =
-      *reinterpret_cast<LineairDBThdCtx **>(thd_ha_data(thd, hton));
+static int helios_commit(handlerton *hton, THD *thd, bool all) {
+  HeliosThdCtx *&ctx =
+      *reinterpret_cast<HeliosThdCtx **>(thd_ha_data(thd, hton));
 
   // Nothing to commit when this engine took no part in the transaction.
   if (ctx == nullptr || ctx->tx == nullptr)
@@ -376,11 +376,11 @@ static int lineairdb_commit(handlerton *hton, THD *thd, bool all) {
 }
 
 /**
- * implementation of rollback for lineairdb_hton
+ * implementation of rollback for helios_hton
  */
-static int lineairdb_abort(handlerton *hton, THD *thd, bool) {
-  LineairDBThdCtx *&ctx =
-      *reinterpret_cast<LineairDBThdCtx **>(thd_ha_data(thd, hton));
+static int helios_abort(handlerton *hton, THD *thd, bool) {
+  HeliosThdCtx *&ctx =
+      *reinterpret_cast<HeliosThdCtx **>(thd_ha_data(thd, hton));
 
   // Nothing to roll back when this engine took no part in the transaction.
   if (ctx == nullptr || ctx->tx == nullptr)
@@ -392,29 +392,29 @@ static int lineairdb_abort(handlerton *hton, THD *thd, bool) {
   return 0;
 }
 
-static int lineairdb_close_connection(handlerton *hton, THD *thd) {
-  LineairDBThdCtx **ctx_slot =
-      reinterpret_cast<LineairDBThdCtx **>(thd_ha_data(thd, hton));
+static int helios_close_connection(handlerton *hton, THD *thd) {
+  HeliosThdCtx **ctx_slot =
+      reinterpret_cast<HeliosThdCtx **>(thd_ha_data(thd, hton));
   if (ctx_slot == nullptr)
     return 0;
 
-  LineairDBThdCtx *ctx = *ctx_slot;
+  HeliosThdCtx *ctx = *ctx_slot;
   if (ctx == nullptr)
     return 0;
 
-  LOG_INFO("lineairdb_close_connection: thd=%p ctx=%p proxy=%p",
+  LOG_INFO("helios_close_connection: thd=%p ctx=%p proxy=%p",
            static_cast<void *>(thd), static_cast<void *>(ctx),
            ctx->proxy.get());
 
   if (ctx->tx != nullptr) {
-    LOG_INFO("lineairdb_close_connection: aborting pending tx=%p", ctx->tx);
+    LOG_INFO("helios_close_connection: aborting pending tx=%p", ctx->tx);
     ctx->tx->set_status_to_abort();
     (void)ctx->tx->end_transaction();
     ctx->tx = nullptr;
   }
 
   if (ctx->proxy) {
-    LOG_INFO("lineairdb_close_connection: releasing proxy=%p",
+    LOG_INFO("helios_close_connection: releasing proxy=%p",
              ctx->proxy.get());
   }
   ctx->proxy.reset();
@@ -423,11 +423,11 @@ static int lineairdb_close_connection(handlerton *hton, THD *thd) {
   return 0;
 }
 
-THR_LOCK_DATA **ha_lineairdb::store_lock(THD *, THR_LOCK_DATA **to,
+THR_LOCK_DATA **ha_helios::store_lock(THD *, THR_LOCK_DATA **to,
                                          enum thr_lock_type lock_type) {
   DBUG_TRACE;
   /*
-    LineairDB uses its own transaction-level locking, so we don't take part
+    Helios uses its own transaction-level locking, so we don't take part
     in the server's THR_LOCK table locking. lock_count() advertises this by
     returning 0; keep store_lock() consistent by leaving the lock array
     untouched.
@@ -442,20 +442,20 @@ THR_LOCK_DATA **ha_lineairdb::store_lock(THD *, THR_LOCK_DATA **to,
  * get_transaction() (which allocates and may emit RPCs). Read the session
  * instead.
  */
-bool ha_lineairdb::statement_uses_read_plan(THD *thd) {
+bool ha_helios::statement_uses_read_plan(THD *thd) {
   return srv_read_path == kReadPathPlan && thd_can_use_prefetch(thd);
 }
 
-struct st_mysql_storage_engine lineairdb_storage_engine = {
+struct st_mysql_storage_engine helios_storage_engine = {
     MYSQL_HANDLERTON_INTERFACE_VERSION};
 
-// LineairDB server connection target sysvars
+// Helios server connection target sysvars
 static MYSQL_SYSVAR_STR(server_host, srv_server_host,
                         PLUGIN_VAR_RQCMDARG | PLUGIN_VAR_MEMALLOC,
-                        "LineairDB server hostname or IP address.", nullptr,
+                        "Helios server hostname or IP address.", nullptr,
                         nullptr, "127.0.0.1");
 static MYSQL_SYSVAR_ULONG(server_port, srv_server_port, PLUGIN_VAR_RQCMDARG,
-                          "LineairDB server TCP port.", nullptr, nullptr, 9999,
+                          "Helios server TCP port.", nullptr, nullptr, 9999,
                           1, 65535, 0);
 static const char *read_path_names[] = {"row", "plan", NullS};
 static TYPELIB read_path_typelib = {array_elements(read_path_names) - 1,
@@ -474,43 +474,43 @@ static MYSQL_SYSVAR_BOOL(stats_drift_refresh, srv_stats_drift_refresh,
                          "synchronous refresh scans every requested index on "
                          "the server.",
                          nullptr, nullptr, false);
-static SYS_VAR *lineairdb_system_variables[] = {
+static SYS_VAR *helios_system_variables[] = {
     MYSQL_SYSVAR(server_host),
     MYSQL_SYSVAR(server_port),
     MYSQL_SYSVAR(read_path),
     MYSQL_SYSVAR(stats_drift_refresh),
     nullptr};
 
-extern struct st_mysql_storage_engine lineairdb_columnar_storage_engine;
-extern int lineairdb_columnar_init(void *p);
-extern int lineairdb_columnar_deinit(void *p);
+extern struct st_mysql_storage_engine helios_columnar_storage_engine;
+extern int helios_columnar_init(void *p);
+extern int helios_columnar_deinit(void *p);
 
-mysql_declare_plugin(lineairdb){
+mysql_declare_plugin(helios){
     MYSQL_STORAGE_ENGINE_PLUGIN,
-    &lineairdb_storage_engine,
-    "LINEAIRDB",
+    &helios_storage_engine,
+    "HELIOS",
     PLUGIN_AUTHOR_ORACLE,
-    "LineairDB storage engine",
+    "Helios storage engine",
     PLUGIN_LICENSE_GPL,
-    lineairdb_init_func, /* Plugin Init */
+    helios_init_func, /* Plugin Init */
     nullptr,             /* Plugin check uninstall */
     nullptr,             /* Plugin Deinit */
     0x0001 /* 0.1 */,
     nullptr,                    /* status variables */
-    lineairdb_system_variables, /* system variables */
+    helios_system_variables, /* system variables */
     nullptr,                    /* config options */
     0,                          /* flags */
 },
 {
     MYSQL_STORAGE_ENGINE_PLUGIN,
-    &lineairdb_columnar_storage_engine,
-    "LINEAIRDB_COLUMNAR",
+    &helios_columnar_storage_engine,
+    "HELIOS_COLUMNAR",
     PLUGIN_AUTHOR_ORACLE,
-    "LineairDB columnar secondary engine",
+    "Helios columnar secondary engine",
     PLUGIN_LICENSE_GPL,
-    lineairdb_columnar_init,   /* Plugin Init */
+    helios_columnar_init,   /* Plugin Init */
     nullptr,                   /* Plugin check uninstall */
-    lineairdb_columnar_deinit, /* Plugin Deinit */
+    helios_columnar_deinit, /* Plugin Deinit */
     0x0001 /* 0.1 */,
     nullptr, /* status variables */
     nullptr, /* system variables */

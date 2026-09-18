@@ -36,7 +36,7 @@
     # Default false so the sweep path is behaviourally identical when unused.
     perf_stat: false
     perf_stat_interval_ms: 10000
-    # Commit durability contract for the sweep; required for the lineairdb engine
+    # Commit durability contract for the sweep; required for the helios engine
     helios_durability: ""
   tasks:
     # A storage host that drops out before or inside the durability gate has to
@@ -484,7 +484,7 @@
           echo ""
           echo "=== Helios server variables ==="
           $MYSQL -u root --protocol=TCP -h 127.0.0.1 -P 3307 \
-            -e "SHOW VARIABLES LIKE 'lineairdb%'"
+            -e "SHOW VARIABLES LIKE 'helios%'"
         } > "$OUT" 2>&1
       args:
         executable: /bin/bash
@@ -788,7 +788,7 @@
       failed_when: false
 
     - name: Capture InnoDB engine status (post)
-      when: (mysql_engine | default('lineairdb') == 'innodb') and inventory_hostname in groups['mysql']
+      when: (mysql_engine | default('helios') == 'innodb') and inventory_hostname in groups['mysql']
       shell: |
         ~/helios/build/runtime_output_directory/mysql \
           -u root --protocol=TCP -h 127.0.0.1 -P 3307 \
@@ -828,7 +828,7 @@
           echo ""
           echo "=== Helios server variables ==="
           $MYSQL -u root --protocol=TCP -h 127.0.0.1 -P 3307 \
-            -e "SHOW VARIABLES LIKE 'lineairdb%'"
+            -e "SHOW VARIABLES LIKE 'helios%'"
         } > "$OUT" 2>&1
       args:
         executable: /bin/bash
@@ -948,7 +948,7 @@
         flat: yes
 
     - name: Fetch InnoDB engine status
-      when: (mysql_engine | default('lineairdb') == 'innodb') and inventory_hostname in groups['mysql']
+      when: (mysql_engine | default('helios') == 'innodb') and inventory_hostname in groups['mysql']
       fetch:
         src: "{{ sample_dir }}/innodb-status-{{ run_id }}.txt"
         dest: "{{ result_dir }}/mysql/{{ inventory_hostname }}/"

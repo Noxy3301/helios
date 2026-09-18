@@ -1,6 +1,6 @@
-#include "lineairdb_transaction.hh"
-#include "storage/lineairdb/ha_lineairdb.hh"
-#include "lineairdb_keyenc.hh"
+#include "helios_transaction.hh"
+#include "storage/helios/ha_helios.hh"
+#include "helios_keyenc.hh"
 #include "../common/log.h"
 #include "sql/sql_lex.h"
 #include "sql/table.h"
@@ -38,8 +38,8 @@ inline std::string index_scope_key(const std::string& table,
 // Exclusive upper bound of a prefix range, or the sentinel when the prefix is
 // all 0xff and has no successor.
 std::string prefix_range_end(const std::string& prefix) {
-  std::string end = lineairdb_keyenc::build_prefix_range_end(prefix);
-  if (end.empty()) return lineairdb_keyenc::scan_end_sentinel();
+  std::string end = helios_keyenc::build_prefix_range_end(prefix);
+  if (end.empty()) return helios_keyenc::scan_end_sentinel();
   return end;
 }
 
@@ -64,30 +64,30 @@ std::string trace_plan_scan_event(const std::string& table_name,
 
 }  // namespace
 
-LineairDBTransaction::LineairDBTransaction(THD* thd,
-                                            LineairDBProxy* lineairdb_proxy,
-                                            handlerton* lineairdb_hton)
-    : lineairdb_proxy(lineairdb_proxy),
+HeliosTransaction::HeliosTransaction(THD* thd,
+                                            HeliosProxy* helios_proxy,
+                                            handlerton* helios_hton)
+    : helios_proxy(helios_proxy),
       thread(thd),
       isTransaction(false),
-      hton(lineairdb_hton),
+      hton(helios_hton),
       is_aborted_(false)
     {}
 
-void LineairDBTransaction::choose_table(std::string db_table_name) {
+void HeliosTransaction::choose_table(std::string db_table_name) {
   db_table_key = db_table_name;
 }
 
-bool LineairDBTransaction::table_is_not_chosen() {
+bool HeliosTransaction::table_is_not_chosen() {
   if (db_table_key.size() == 0) {
-    LOG_WARNING("Database and Table is not chosen in LineairDBTransaction");
+    LOG_WARNING("Database and Table is not chosen in HeliosTransaction");
     return true;
   }
   return false;
 }
 
 const std::pair<const std::byte *const, const size_t>
-LineairDBTransaction::read(std::string key) {
+HeliosTransaction::read(std::string key) {
   if (table_is_not_chosen()) return std::pair<const std::byte *const, const size_t>{nullptr, 0};
 
   // Silo-style local view: own writes are visible before remote reads
@@ -111,7 +111,7 @@ LineairDBTransaction::read(std::string key) {
   }
 
   rpc_trace_.record_local_view("read_miss");
-  auto result = lineairdb_proxy->tx_read(db_table_key, key);
+  auto result = helios_proxy->tx_read(db_table_key, key);
   if (!result.ok) {
     mark_transport_error();
     return std::pair<const std::byte *const, const size_t>{nullptr, 0};
@@ -128,13 +128,13 @@ LineairDBTransaction::read(std::string key) {
 }
 
 std::vector<std::pair<bool, std::string>>
-LineairDBTransaction::batch_read(const std::vector<std::string>& keys) {
+HeliosTransaction::batch_read(const std::vector<std::string>& keys) {
   if (table_is_not_chosen()) return {};
 
   std::vector<std::pair<bool, std::string>> pairs;
   pairs.resize(keys.size());
 
-  std::vector<LineairDBProxy::ReadKey> rpc_keys;
+  std::vector<HeliosProxy::ReadKey> rpc_keys;
   std::vector<size_t> rpc_positions;
   rpc_keys.reserve(keys.size());
   rpc_positions.reserve(keys.size());
@@ -163,7 +163,7 @@ LineairDBTransaction::batch_read(const std::vector<std::string>& keys) {
   //   Example: keys=[A,B,C], B is local -> rpc_keys=[A,C],
   //            rpc_positions=[0,2], so RPC results fill pairs[0] and pairs[2].
   if (!rpc_keys.empty()) {
-    auto results = lineairdb_proxy->tx_batch_read(rpc_keys);
+    auto results = helios_proxy->tx_batch_read(rpc_keys);
     if (results.size() != rpc_keys.size()) {
       rpc_trace_.record_local_view("abort_batch_size_mismatch");
       mark_transport_error();
@@ -181,7 +181,7 @@ LineairDBTransaction::batch_read(const std::vector<std::string>& keys) {
   return pairs;
 }
 
-LineairDBTransaction::KeyState LineairDBTransaction::insert_key_state(
+HeliosTransaction::KeyState HeliosTransaction::insert_key_state(
     const std::string& table_name, const std::string& key) const {
   // A row this transaction still holds is a duplicate of its own making; a key
   // it deleted is free, and the commit checks the absence again under the
@@ -192,7 +192,7 @@ LineairDBTransaction::KeyState LineairDBTransaction::insert_key_state(
   return KeyState::Unknown;
 }
 
-bool LineairDBTransaction::index_key_taken_by_own_write(
+bool HeliosTransaction::index_key_taken_by_own_write(
     const std::string& table_name, const std::string& index_name,
     const std::string& secondary_key, const std::string& primary_key) const {
   const auto scope =
@@ -206,22 +206,22 @@ bool LineairDBTransaction::index_key_taken_by_own_write(
   return false;
 }
 
-void LineairDBTransaction::record_index_op(
-    const LineairDBProxy::WriteOp& op) {
+void HeliosTransaction::record_index_op(
+    const HeliosProxy::WriteOp& op) {
   // The last op for one (secondary key, primary key) pair decides.
   pending_index_entries_[index_scope_key(op.table_name, op.index_name)]
                         [op.secondary_key][op.primary_key] =
-      op.type == LineairDBProxy::WriteOp::Type::SecondaryIndexWrite;
+      op.type == HeliosProxy::WriteOp::Type::SecondaryIndexWrite;
 }
 
-bool LineairDBTransaction::reads_still_valid() {
+bool HeliosTransaction::reads_still_valid() {
   if (!base_row_read_set_.empty()) {
-    std::vector<LineairDBProxy::ReadKey> keys;
+    std::vector<HeliosProxy::ReadKey> keys;
     keys.reserve(base_row_read_set_.size());
     for (const auto& entry : base_row_read_set_) {
       keys.push_back({entry.table_name, entry.key});
     }
-    auto results = lineairdb_proxy->tx_batch_read(keys);
+    auto results = helios_proxy->tx_batch_read(keys);
     if (results.size() != keys.size()) {
       mark_transport_error();
       return false;
@@ -233,7 +233,7 @@ bool LineairDBTransaction::reads_still_valid() {
 
   for (const auto& range : range_read_set_) {
     if (range.index_name.empty()) {
-      auto now = lineairdb_proxy->tx_scan(range.table_name, range.start_key,
+      auto now = helios_proxy->tx_scan(range.table_name, range.start_key,
                                           range.end_key, range.row_limit,
                                           range.reverse_scan,
                                           /*keys_only=*/true);
@@ -248,7 +248,7 @@ bool LineairDBTransaction::reads_still_valid() {
       continue;
     }
 
-    auto now = lineairdb_proxy->tx_scan_index(
+    auto now = helios_proxy->tx_scan_index(
         range.table_name, range.index_name, range.start_key, range.end_key,
         range.row_limit, range.reverse_scan, /*keys_only=*/true);
     if (!now.ok) {
@@ -269,15 +269,15 @@ bool LineairDBTransaction::reads_still_valid() {
   return true;
 }
 
-bool LineairDBTransaction::probe_insert_keys(
+bool HeliosTransaction::probe_insert_keys(
     const std::string& table_name, const std::vector<std::string>& keys) {
   if (keys.empty()) return false;
 
-  std::vector<LineairDBProxy::ReadKey> reads;
+  std::vector<HeliosProxy::ReadKey> reads;
   reads.reserve(keys.size());
   for (const auto& key : keys) reads.push_back({table_name, key});
 
-  auto results = lineairdb_proxy->tx_batch_read(reads);
+  auto results = helios_proxy->tx_batch_read(reads);
   if (results.size() != reads.size()) {
     rpc_trace_.record_local_view("abort_probe_size_mismatch");
     mark_transport_error();
@@ -294,8 +294,8 @@ bool LineairDBTransaction::probe_insert_keys(
   return taken;
 }
 
-void LineairDBTransaction::execute_read_plan(
-    const std::vector<LineairDBProxy::ReadPlanStep>& full_steps) {
+void HeliosTransaction::execute_read_plan(
+    const std::vector<HeliosProxy::ReadPlanStep>& full_steps) {
   if (full_steps.empty()) return;
 
   // Exact point reads already covered by the local view need no staging RPC.
@@ -311,7 +311,7 @@ void LineairDBTransaction::execute_read_plan(
     }
   }
 
-  std::vector<LineairDBProxy::ReadPlanStep> steps;
+  std::vector<HeliosProxy::ReadPlanStep> steps;
   steps.reserve(full_steps.size());
   std::vector<uint32_t> new_index(full_steps.size(), 0);
   size_t covered = 0;
@@ -348,7 +348,7 @@ void LineairDBTransaction::execute_read_plan(
 
   rpc_trace_.record_local_view("plan_request:steps=" +
                                std::to_string(steps.size()));
-  auto result = lineairdb_proxy->tx_execute_read_plan(steps);
+  auto result = helios_proxy->tx_execute_read_plan(steps);
   if (!result.ok || result.steps.size() != steps.size()) {
     rpc_trace_.record_local_view("abort_read_plan_rpc");
     if (result.transport_error) {
@@ -389,7 +389,7 @@ void LineairDBTransaction::execute_read_plan(
         record_row_cache(step.table_name, step_result.actual_key, false, "",
                           step_result.tid);
       }
-      step_result = LineairDBProxy::ReadPlanStepResult{};
+      step_result = HeliosProxy::ReadPlanStepResult{};
       continue;
     }
 
@@ -457,7 +457,7 @@ void LineairDBTransaction::execute_read_plan(
         }
         flat += n;
       }
-      step_result = LineairDBProxy::ReadPlanStepResult{};
+      step_result = HeliosProxy::ReadPlanStepResult{};
       continue;
     }
 
@@ -469,7 +469,7 @@ void LineairDBTransaction::execute_read_plan(
         uint64_t tid = 0;
         take_row(j, key, value, tid);
       }
-      step_result = LineairDBProxy::ReadPlanStepResult{};
+      step_result = HeliosProxy::ReadPlanStepResult{};
       continue;
     }
 
@@ -516,18 +516,18 @@ void LineairDBTransaction::execute_read_plan(
       }
       push_secondary_scan_cache(std::move(cached));
     }
-    step_result = LineairDBProxy::ReadPlanStepResult{};
+    step_result = HeliosProxy::ReadPlanStepResult{};
   }
 }
 
-void LineairDBTransaction::buffer_writes(
+void HeliosTransaction::buffer_writes(
     const std::string& table_name,
-    const std::vector<LineairDBProxy::WriteOp>& ops) {
+    const std::vector<HeliosProxy::WriteOp>& ops) {
   for (auto op : ops) {
     if (op.table_name.empty()) op.table_name = table_name;
-    if (op.type == LineairDBProxy::WriteOp::Type::Write) {
+    if (op.type == HeliosProxy::WriteOp::Type::Write) {
       record_write(op.table_name, op.key, true, op.value);
-    } else if (op.type == LineairDBProxy::WriteOp::Type::Delete) {
+    } else if (op.type == HeliosProxy::WriteOp::Type::Delete) {
       record_write(op.table_name, op.key, false, ""); // value unused when not found
     } else {
       record_index_op(op);
@@ -539,7 +539,7 @@ void LineairDBTransaction::buffer_writes(
 // Secondary index operations
 
 std::vector<std::string>
-LineairDBTransaction::read_secondary_index(std::string index_name,
+HeliosTransaction::read_secondary_index(std::string index_name,
                                            std::string secondary_key,
                                            bool keys_only) {
   if (table_is_not_chosen()) return {};
@@ -555,7 +555,7 @@ LineairDBTransaction::read_secondary_index(std::string index_name,
   return get_matching_primary_keys_in_range(index_name, secondary_key, end_key);
 }
 
-void LineairDBTransaction::update_secondary_index(std::string index_name,
+void HeliosTransaction::update_secondary_index(std::string index_name,
                                                   std::string old_secondary_key,
                                                   std::string new_secondary_key,
                                                   const std::string primary_key) {
@@ -568,7 +568,7 @@ void LineairDBTransaction::update_secondary_index(std::string index_name,
 // Primary key scan operations
 
 std::vector<std::pair<std::string, std::string>>
-LineairDBTransaction::get_matching_keys_and_values_in_range(std::string start_key,
+HeliosTransaction::get_matching_keys_and_values_in_range(std::string start_key,
                                                             std::string end_key,
                                                             uint64_t row_limit,
                                                             bool reverse_scan,
@@ -577,7 +577,7 @@ LineairDBTransaction::get_matching_keys_and_values_in_range(std::string start_ke
   if (table_is_not_chosen()) return {};
   // An empty end is not a range the server answers; real encoded keys begin
   // with a null marker and sort below the sentinel.
-  if (end_key.empty()) end_key = lineairdb_keyenc::scan_end_sentinel();
+  if (end_key.empty()) end_key = helios_keyenc::scan_end_sentinel();
 
   if (auto cached = lookup_range_scan_cache(
           db_table_key, start_key, end_key, reverse_scan, row_limit,
@@ -605,7 +605,7 @@ LineairDBTransaction::get_matching_keys_and_values_in_range(std::string start_ke
 }
 
 std::vector<std::pair<std::string, std::string>>
-LineairDBTransaction::scan_range(const std::string& start_key,
+HeliosTransaction::scan_range(const std::string& start_key,
                                  const std::string& end_key,
                                  uint64_t row_limit, bool reverse_scan) {
   // A pending write of this transaction inside the range changes which rows a
@@ -615,7 +615,7 @@ LineairDBTransaction::scan_range(const std::string& start_key,
           ? 0
           : row_limit;
 
-  auto result = lineairdb_proxy->tx_scan(db_table_key, start_key, end_key,
+  auto result = helios_proxy->tx_scan(db_table_key, start_key, end_key,
                                          sent_limit, reverse_scan, false);
   if (!result.ok) {
     if (result.transport_error) {
@@ -651,7 +651,7 @@ LineairDBTransaction::scan_range(const std::string& start_key,
 }
 
 std::vector<std::pair<std::string, std::string>>
-LineairDBTransaction::get_matching_keys_and_values_from_prefix(std::string prefix) {
+HeliosTransaction::get_matching_keys_and_values_from_prefix(std::string prefix) {
   if (table_is_not_chosen()) return {};
   if (prefix.empty()) {
     return get_matching_keys_and_values_in_range("", std::string());
@@ -662,13 +662,13 @@ LineairDBTransaction::get_matching_keys_and_values_from_prefix(std::string prefi
 // Secondary index scan operations
 
 std::vector<std::string>
-LineairDBTransaction::get_matching_primary_keys_in_range(std::string index_name,
+HeliosTransaction::get_matching_primary_keys_in_range(std::string index_name,
                                                          std::string start_key,
                                                          std::string end_key,
                                                          uint64_t row_limit,
                                                          bool reverse_scan) {
   if (table_is_not_chosen()) return {};
-  if (end_key.empty()) end_key = lineairdb_keyenc::scan_end_sentinel();
+  if (end_key.empty()) end_key = helios_keyenc::scan_end_sentinel();
 
   auto cached = lookup_secondary_scan_cache(
       db_table_key, index_name, start_key, end_key, reverse_scan, row_limit);
@@ -697,7 +697,7 @@ LineairDBTransaction::get_matching_primary_keys_in_range(std::string index_name,
       .primary_keys;
 }
 
-LineairDBTransaction::SecondaryScan LineairDBTransaction::scan_index_range(
+HeliosTransaction::SecondaryScan HeliosTransaction::scan_index_range(
     const std::string& index_name, const std::string& start_key,
     const std::string& end_key, uint64_t row_limit, bool reverse_scan,
     bool keys_only) {
@@ -711,7 +711,7 @@ LineairDBTransaction::SecondaryScan LineairDBTransaction::scan_index_range(
           : row_limit;
 
   auto result =
-      lineairdb_proxy->tx_scan_index(db_table_key, index_name, start_key,
+      helios_proxy->tx_scan_index(db_table_key, index_name, start_key,
                                      end_key, sent_limit, reverse_scan,
                                      keys_only);
   if (!result.ok) {
@@ -748,7 +748,7 @@ LineairDBTransaction::SecondaryScan LineairDBTransaction::scan_index_range(
                           reverse_scan, groups);
 }
 
-LineairDBTransaction::SecondaryScan LineairDBTransaction::merge_index_scan(
+HeliosTransaction::SecondaryScan HeliosTransaction::merge_index_scan(
     const std::string& index_name, const std::string& start_key,
     const std::string& end_key, uint64_t row_limit, bool reverse_scan,
     std::map<std::string, std::vector<std::string>>& groups) const {
@@ -779,14 +779,14 @@ LineairDBTransaction::SecondaryScan LineairDBTransaction::merge_index_scan(
   return out;
 }
 
-std::optional<LineairDBTransaction::SecondaryBatch>
-LineairDBTransaction::fetch_secondary_batch_below(
+std::optional<HeliosTransaction::SecondaryBatch>
+HeliosTransaction::fetch_secondary_batch_below(
     const std::string &index_name, const std::string &start_key,
     const std::string &end_key, uint64_t batch_entries) {
   if (table_is_not_chosen()) return std::nullopt;
 
   const std::string effective_end =
-      end_key.empty() ? lineairdb_keyenc::scan_end_sentinel() : end_key;
+      end_key.empty() ? helios_keyenc::scan_end_sentinel() : end_key;
 
   // A reverse scan puts the highest secondary key first, so batch_entries
   // entries hold the top of the range. The lowest group in them may be cut
@@ -821,7 +821,7 @@ LineairDBTransaction::fetch_secondary_batch_below(
 
 // Row count delta tracking
 
-void LineairDBTransaction::add_rowcount_delta(LineairDB_share *share,
+void HeliosTransaction::add_rowcount_delta(Helios_share *share,
                                               const std::string &table_name,
                                               int64_t delta) {
   if (share == nullptr || delta == 0) return;
@@ -837,7 +837,7 @@ void LineairDBTransaction::add_rowcount_delta(LineairDB_share *share,
 }
 
 int64_t
-LineairDBTransaction::peek_rowcount_delta(const LineairDB_share *share) const {
+HeliosTransaction::peek_rowcount_delta(const Helios_share *share) const {
   if (share == nullptr) return 0;
 
   for (const auto &entry : rowcount_deltas_) {
@@ -848,12 +848,12 @@ LineairDBTransaction::peek_rowcount_delta(const LineairDB_share *share) const {
   return 0;
 }
 
-void LineairDBTransaction::buffer_write(const std::string& table_name,
+void HeliosTransaction::buffer_write(const std::string& table_name,
                                         const std::string& key,
                                         const std::string& value,
                                         bool is_insert) {
-  LineairDBProxy::WriteOp op;
-  op.type = LineairDBProxy::WriteOp::Type::Write;
+  HeliosProxy::WriteOp op;
+  op.type = HeliosProxy::WriteOp::Type::Write;
   op.key = key;
   op.value = value;
   op.table_name = table_name;
@@ -862,12 +862,12 @@ void LineairDBTransaction::buffer_write(const std::string& table_name,
   record_write(table_name, key, true, value);
 }
 
-void LineairDBTransaction::buffer_write_secondary_index(const std::string& table_name,
+void HeliosTransaction::buffer_write_secondary_index(const std::string& table_name,
                                                         const std::string& index_name,
                                                         const std::string& secondary_key,
                                                         const std::string& primary_key) {
-  LineairDBProxy::WriteOp op;
-  op.type = LineairDBProxy::WriteOp::Type::SecondaryIndexWrite;
+  HeliosProxy::WriteOp op;
+  op.type = HeliosProxy::WriteOp::Type::SecondaryIndexWrite;
   op.index_name = index_name;
   op.secondary_key = secondary_key;
   op.primary_key = primary_key;
@@ -876,23 +876,23 @@ void LineairDBTransaction::buffer_write_secondary_index(const std::string& table
   write_buffer_ops_.push_back(std::move(op));
 }
 
-void LineairDBTransaction::buffer_delete(const std::string& table_name,
+void HeliosTransaction::buffer_delete(const std::string& table_name,
                                          const std::string& key) {
-  LineairDBProxy::WriteOp op;
-  op.type = LineairDBProxy::WriteOp::Type::Delete;
+  HeliosProxy::WriteOp op;
+  op.type = HeliosProxy::WriteOp::Type::Delete;
   op.key = key;
   op.table_name = table_name;
   write_buffer_ops_.push_back(std::move(op));
   record_write(table_name, key, false, ""); // value unused when not found
 }
 
-void LineairDBTransaction::buffer_delete_secondary_index(
+void HeliosTransaction::buffer_delete_secondary_index(
     const std::string& table_name,
     const std::string& index_name,
     const std::string& secondary_key,
     const std::string& primary_key) {
-  LineairDBProxy::WriteOp op;
-  op.type = LineairDBProxy::WriteOp::Type::SecondaryIndexDelete;
+  HeliosProxy::WriteOp op;
+  op.type = HeliosProxy::WriteOp::Type::SecondaryIndexDelete;
   op.index_name = index_name;
   op.secondary_key = secondary_key;
   op.primary_key = primary_key;
@@ -901,35 +901,35 @@ void LineairDBTransaction::buffer_delete_secondary_index(
   write_buffer_ops_.push_back(std::move(op));
 }
 
-std::optional<LineairDBTransaction::LocalRowEntry>
-LineairDBTransaction::lookup_write_set(
+std::optional<HeliosTransaction::LocalRowEntry>
+HeliosTransaction::lookup_write_set(
     const std::string& table_name, const std::string& key) const {
   auto it = own_writes_index_.find(make_row_cache_key(table_name, key));
   if (it == own_writes_index_.end()) return std::nullopt;
   return own_writes_[it->second];
 }
 
-std::optional<LineairDBTransaction::LocalRowEntry>
-LineairDBTransaction::lookup_row_cache(
+std::optional<HeliosTransaction::LocalRowEntry>
+HeliosTransaction::lookup_row_cache(
     const std::string& table_name, const std::string& key) const {
   auto it = row_cache_.find(make_row_cache_key(table_name, key));
   if (it == row_cache_.end()) return std::nullopt;
   return it->second;
 }
 
-void LineairDBTransaction::drop_row_cache(const std::string& table_name,
+void HeliosTransaction::drop_row_cache(const std::string& table_name,
                                            const std::string& key) {
   row_cache_.erase(make_row_cache_key(table_name, key));
 }
 
-bool LineairDBTransaction::key_is_in_range(const std::string& key,
+bool HeliosTransaction::key_is_in_range(const std::string& key,
                                            const std::string& start_key,
                                            const std::string& end_key) const {
-  // LineairDB ranges are [start_key, end_key)
+  // Helios ranges are [start_key, end_key)
   return key >= start_key && key < end_key;
 }
 
-void LineairDBTransaction::remove_scan_row(
+void HeliosTransaction::remove_scan_row(
     std::vector<std::pair<std::string, std::string>>& rows,
     const std::string& key) const {
   // Local write/delete replaces any server row with the same key
@@ -941,7 +941,7 @@ void LineairDBTransaction::remove_scan_row(
   }
 }
 
-void LineairDBTransaction::insert_scan_row_in_order(
+void HeliosTransaction::insert_scan_row_in_order(
     std::vector<std::pair<std::string, std::string>>& rows,
     const std::string& key, const std::string& value,
     bool reverse_scan) const {
@@ -955,7 +955,7 @@ void LineairDBTransaction::insert_scan_row_in_order(
   rows.emplace_back(key, value);
 }
 
-void LineairDBTransaction::merge_pending_rows_into_range_scan(
+void HeliosTransaction::merge_pending_rows_into_range_scan(
     std::vector<std::pair<std::string, std::string>>& rows,
     const std::string& start_key, const std::string& end_key,
     bool reverse_scan) const {
@@ -963,26 +963,26 @@ void LineairDBTransaction::merge_pending_rows_into_range_scan(
   // transaction has written but not yet installed.
   for (const auto& op : write_buffer_ops_) {
     if (op.table_name != db_table_key) continue;
-    if (op.type != LineairDBProxy::WriteOp::Type::Write &&
-        op.type != LineairDBProxy::WriteOp::Type::Delete) {
+    if (op.type != HeliosProxy::WriteOp::Type::Write &&
+        op.type != HeliosProxy::WriteOp::Type::Delete) {
       continue;
     }
     if (!key_is_in_range(op.key, start_key, end_key)) continue;
 
     remove_scan_row(rows, op.key);
-    if (op.type == LineairDBProxy::WriteOp::Type::Write) {
+    if (op.type == HeliosProxy::WriteOp::Type::Write) {
       insert_scan_row_in_order(rows, op.key, op.value, reverse_scan);
     }
   }
 }
 
-bool LineairDBTransaction::has_pending_row_ops_in_range(
+bool HeliosTransaction::has_pending_row_ops_in_range(
     const std::string& table_name, const std::string& start_key,
     const std::string& end_key) const {
   for (const auto& op : write_buffer_ops_) {
     if (op.table_name != table_name) continue;
-    if (op.type != LineairDBProxy::WriteOp::Type::Write &&
-        op.type != LineairDBProxy::WriteOp::Type::Delete) {
+    if (op.type != HeliosProxy::WriteOp::Type::Write &&
+        op.type != HeliosProxy::WriteOp::Type::Delete) {
       continue;
     }
     if (op.key >= start_key && op.key < end_key) return true;
@@ -990,7 +990,7 @@ bool LineairDBTransaction::has_pending_row_ops_in_range(
   return false;
 }
 
-bool LineairDBTransaction::has_pending_secondary_ops_in_range(
+bool HeliosTransaction::has_pending_secondary_ops_in_range(
     const std::string& table_name, const std::string& index_name,
     const std::string& start_key, const std::string& end_key) const {
   const auto scope =
@@ -1000,7 +1000,7 @@ bool LineairDBTransaction::has_pending_secondary_ops_in_range(
   return it != scope->second.end() && it->first < end_key;
 }
 
-void LineairDBTransaction::merge_pending_index_ops(
+void HeliosTransaction::merge_pending_index_ops(
     const std::string& index_name, const std::string& start_key,
     const std::string& end_key,
     std::map<std::string, std::vector<std::string>>& groups) const {
@@ -1027,7 +1027,7 @@ void LineairDBTransaction::merge_pending_index_ops(
   }
 }
 
-void LineairDBTransaction::record_write(const std::string& table_name,
+void HeliosTransaction::record_write(const std::string& table_name,
                                               const std::string& key,
                                               bool found,
                                               const std::string& value) {
@@ -1048,7 +1048,7 @@ void LineairDBTransaction::record_write(const std::string& table_name,
   own_writes_index_.emplace(std::move(index_key), own_writes_.size() - 1);
 }
 
-void LineairDBTransaction::record_row_cache(
+void HeliosTransaction::record_row_cache(
     const std::string& table_name, const std::string& key, bool found,
     const std::string& value, uint64_t tid) {
   // Re-staging overwrites the cached row; every consume has already appended
@@ -1057,19 +1057,19 @@ void LineairDBTransaction::record_row_cache(
       LocalRowEntry{table_name, key, found, value, tid};
 }
 
-void LineairDBTransaction::append_base_row_read(
+void HeliosTransaction::append_base_row_read(
     const std::string& table_name, const std::string& key, uint64_t tid) {
   // Append every observation, no dedup (Silo read_set style): a repeated read
   // validates the same TID again.
   base_row_read_set_.push_back({table_name, key, tid});
 }
 
-void LineairDBTransaction::append_range_read(
+void HeliosTransaction::append_range_read(
     const LocalRangeScanEntry& scanned) {
   // The bounds describe the replay and result_keys is the observed key list in
   // scan order. Append, like the point and Silo read sets; a scan consumed
   // twice is revalidated twice: redundant but never wrong.
-  LineairDBProxy::RangeReadEntry entry;
+  HeliosProxy::RangeReadEntry entry;
   entry.table_name = scanned.table_name;
   entry.start_key = scanned.start_key;
   entry.end_key = scanned.end_key;
@@ -1082,9 +1082,9 @@ void LineairDBTransaction::append_range_read(
   range_read_set_.push_back(std::move(entry));
 }
 
-void LineairDBTransaction::append_secondary_range_read(
+void HeliosTransaction::append_secondary_range_read(
     const LocalSecondaryScanEntry& scanned) {
-  LineairDBProxy::RangeReadEntry entry;
+  HeliosProxy::RangeReadEntry entry;
   entry.table_name = scanned.table_name;
   entry.index_name = scanned.index_name;
   entry.start_key = scanned.start_key;
@@ -1096,21 +1096,21 @@ void LineairDBTransaction::append_secondary_range_read(
   range_read_set_.push_back(std::move(entry));
 }
 
-void LineairDBTransaction::abort_server_refused(const char* what) {
+void HeliosTransaction::abort_server_refused(const char* what) {
   rpc_trace_.record_local_view(std::string("abort_server_refused:") + what);
   LOG_WARNING("Storage server refused %s table=%s", what, db_table_key.c_str());
   is_aborted_ = true;
   thd_mark_transaction_to_rollback(thread, 1);
 }
 
-void LineairDBTransaction::push_range_scan_cache(LocalRangeScanEntry entry) {
+void HeliosTransaction::push_range_scan_cache(LocalRangeScanEntry entry) {
   range_scan_start_index_[scan_cache_index_key(entry.table_name, "",
                                                entry.start_key)]
       .push_back(range_scan_cache_.size());
   range_scan_cache_.push_back(std::move(entry));
 }
 
-void LineairDBTransaction::push_secondary_scan_cache(
+void HeliosTransaction::push_secondary_scan_cache(
     LocalSecondaryScanEntry entry) {
   secondary_scan_start_index_[scan_cache_index_key(
                                   entry.table_name, entry.index_name,
@@ -1119,8 +1119,8 @@ void LineairDBTransaction::push_secondary_scan_cache(
   secondary_scan_cache_.push_back(std::move(entry));
 }
 
-std::optional<LineairDBTransaction::LocalRangeScanEntry>
-LineairDBTransaction::lookup_range_scan_cache(
+std::optional<HeliosTransaction::LocalRangeScanEntry>
+HeliosTransaction::lookup_range_scan_cache(
     const std::string& table_name, const std::string& start_key,
     const std::string& end_key, bool reverse_scan, uint64_t row_limit,
     bool allow_truncated) const {
@@ -1200,7 +1200,7 @@ LineairDBTransaction::lookup_range_scan_cache(
   return std::nullopt;
 }
 
-void LineairDBTransaction::trim_range_entry(
+void HeliosTransaction::trim_range_entry(
     LocalRangeScanEntry& entry, const std::string& start_key,
     const std::string& end_key) {
   std::vector<std::pair<std::string, std::string>> rows;
@@ -1217,7 +1217,7 @@ void LineairDBTransaction::trim_range_entry(
   entry.row_tids = std::move(row_tids);
 }
 
-void LineairDBTransaction::trim_secondary_entry(
+void HeliosTransaction::trim_secondary_entry(
     LocalSecondaryScanEntry& entry, const std::string& start_key,
     const std::string& end_key) {
   std::vector<std::string> secondary_keys;
@@ -1235,8 +1235,8 @@ void LineairDBTransaction::trim_secondary_entry(
   entry.primary_keys = std::move(primary_keys);
 }
 
-std::optional<LineairDBTransaction::LocalSecondaryScanEntry>
-LineairDBTransaction::lookup_secondary_scan_cache(
+std::optional<HeliosTransaction::LocalSecondaryScanEntry>
+HeliosTransaction::lookup_secondary_scan_cache(
     const std::string& table_name, const std::string& index_name,
     const std::string& start_key, const std::string& end_key,
     bool reverse_scan, uint64_t row_limit) const {
@@ -1301,7 +1301,7 @@ LineairDBTransaction::lookup_secondary_scan_cache(
   return std::nullopt;
 }
 
-bool LineairDBTransaction::end_transaction(bool *transport_error,
+bool HeliosTransaction::end_transaction(bool *transport_error,
                                            bool *duplicate_key) {
   if (transport_error != nullptr) *transport_error = transport_error_;
   if (duplicate_key != nullptr) *duplicate_key = duplicate_key_abort_;
@@ -1321,7 +1321,7 @@ bool LineairDBTransaction::end_transaction(bool *transport_error,
   if (!was_aborted) {
     bool commit_transport_error = false;
     bool commit_duplicate_key = false;
-    committed = lineairdb_proxy->tx_commit(
+    committed = helios_proxy->tx_commit(
         base_row_read_set_, range_read_set_, write_buffer_ops_, server_deltas,
         &abort_detail, &commit_duplicate_key, &commit_transport_error);
     if (transport_error != nullptr) {
@@ -1342,7 +1342,7 @@ bool LineairDBTransaction::end_transaction(bool *transport_error,
   if (!was_aborted && committed && !rowcount_deltas_.empty()) {
     const uint64_t tid = static_cast<uint64_t>(thread->thread_id());
     const size_t shard =
-        static_cast<size_t>(tid) & (LineairDB_share::kRowCountShards - 1);
+        static_cast<size_t>(tid) & (Helios_share::kRowCountShards - 1);
 
     for (const auto& entry : rowcount_deltas_) {
       if (entry.share == nullptr || entry.delta == 0)
@@ -1357,16 +1357,16 @@ bool LineairDBTransaction::end_transaction(bool *transport_error,
     RpcTraceLogger::instance().log_line(
         rpc_trace_.finalize_jsonl(committed));
   }
-  lineairdb_proxy->set_current_trace(nullptr);
+  helios_proxy->set_current_trace(nullptr);
 
   delete this;
   return committed;
 }
 
-void LineairDBTransaction::begin_transaction() {
+void HeliosTransaction::begin_transaction() {
   assert(is_not_started());
   rpc_trace_.start(std::this_thread::get_id());
-  lineairdb_proxy->set_current_trace(&rpc_trace_);
+  helios_proxy->set_current_trace(&rpc_trace_);
 
   registered_ = true;
   is_aborted_ = false;
@@ -1379,17 +1379,17 @@ void LineairDBTransaction::begin_transaction() {
   }
 }
 
-void LineairDBTransaction::set_status_to_abort() { is_aborted_ = true; }
+void HeliosTransaction::set_status_to_abort() { is_aborted_ = true; }
 
-bool LineairDBTransaction::thd_is_transaction() const {
+bool HeliosTransaction::thd_is_transaction() const {
   return ::thd_test_options(thread, OPTION_NOT_AUTOCOMMIT | OPTION_BEGIN | OPTION_TABLE_LOCK);
 }
 
-void LineairDBTransaction::register_transaction_to_mysql() {
+void HeliosTransaction::register_transaction_to_mysql() {
   const ulonglong threadID = static_cast<ulonglong>(thread->thread_id());
   ::trans_register_ha(thread, isTransaction, hton, &threadID);
 }
 
-void LineairDBTransaction::register_single_statement_to_mysql() {
+void HeliosTransaction::register_single_statement_to_mysql() {
   register_transaction_to_mysql();
 }

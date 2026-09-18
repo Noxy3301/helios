@@ -1,4 +1,4 @@
-#include "storage/lineairdb/ha_lineairdb.hh"
+#include "storage/helios/ha_helios.hh"
 
 #include <algorithm>
 #include <cmath>
@@ -10,7 +10,7 @@
 #include <utility>
 #include <vector>
 
-#include "lineairdb_keyenc.hh"
+#include "helios_keyenc.hh"
 #include "my_dbug.h"
 #include "sql/field.h"
 #include "sql/key.h"
@@ -19,7 +19,7 @@
 #include "sql/table.h"
 
 // Optimizer statistics and cost-model entry points. These methods keep MySQL's
-// table/index cardinality estimates aligned with LineairDB row counts, NDV
+// table/index cardinality estimates aligned with Helios row counts, NDV
 // stats, histograms, and batched remote-access costs.
 
 static std::vector<std::pair<std::string, uint32_t>> index_ndv_descriptors(
@@ -71,7 +71,7 @@ static bool decode_int_keypart(TABLE *table, KEY *key, uint part,
   return true;
 }
 
-bool ha_lineairdb::seed_row_count_from_cache(LineairDBProxy *proxy) {
+bool ha_helios::seed_row_count_from_cache(HeliosProxy *proxy) {
   if (proxy == nullptr || share == nullptr || db_table_name.empty())
     return false;
 
@@ -87,7 +87,7 @@ bool ha_lineairdb::seed_row_count_from_cache(LineairDBProxy *proxy) {
   return true;
 }
 
-void ha_lineairdb::load_index_stats_from_cache(LineairDBProxy *proxy) {
+void ha_helios::load_index_stats_from_cache(HeliosProxy *proxy) {
   if (proxy == nullptr || share == nullptr)
     return;
 
@@ -117,7 +117,7 @@ void ha_lineairdb::load_index_stats_from_cache(LineairDBProxy *proxy) {
     if (!monotone)
       continue;
 
-    LineairDB_share::RangeHist range_hist;
+    Helios_share::RangeHist range_hist;
     range_hist.bounds = hist.bounds;
     range_hist.cum = hist.cum;
     share->index_hist_[entry.first] = std::move(range_hist);
@@ -126,7 +126,7 @@ void ha_lineairdb::load_index_stats_from_cache(LineairDBProxy *proxy) {
   share->index_ndv_loaded_.store(true, std::memory_order_relaxed);
 }
 
-void ha_lineairdb::mark_stale_index_ndv_for_select() {
+void ha_helios::mark_stale_index_ndv_for_select() {
   if (!srv_stats_drift_refresh)
     return;
 
@@ -154,7 +154,7 @@ void ha_lineairdb::mark_stale_index_ndv_for_select() {
   share->index_ndv_loaded_.store(false, std::memory_order_relaxed);
 }
 
-void ha_lineairdb::seed_optimizer_stats() {
+void ha_helios::seed_optimizer_stats() {
   if (share == nullptr || db_table_name.empty())
     return;
 
@@ -173,7 +173,7 @@ void ha_lineairdb::seed_optimizer_stats() {
     return;
 
   userThread = thd;
-  LineairDBProxy *proxy = get_proxy();
+  HeliosProxy *proxy = get_proxy();
   if (proxy == nullptr)
     return;
 
@@ -202,7 +202,7 @@ void ha_lineairdb::seed_optimizer_stats() {
   }
 }
 
-int ha_lineairdb::info(uint flag) {
+int ha_helios::info(uint flag) {
   DBUG_TRACE;
 
   if (table == nullptr || table->s == nullptr) {
@@ -234,7 +234,7 @@ int ha_lineairdb::info(uint flag) {
 
     THD *thd = ha_thd();
     if (thd != nullptr) {
-      LineairDBTransaction *active_tx = active_transaction(thd);
+      HeliosTransaction *active_tx = active_transaction(thd);
       if (active_tx != nullptr && !active_tx->is_not_started()) {
         if (active_tx->is_aborted()) {
           return abort_errno(active_tx);
@@ -272,7 +272,7 @@ int ha_lineairdb::info(uint flag) {
   return 0;
 }
 
-int ha_lineairdb::analyze(THD *, HA_CHECK_OPT *) {
+int ha_helios::analyze(THD *, HA_CHECK_OPT *) {
   DBUG_TRACE;
 
   if (share != nullptr) {
@@ -287,7 +287,7 @@ int ha_lineairdb::analyze(THD *, HA_CHECK_OPT *) {
   return HA_ADMIN_OK;
 }
 
-void ha_lineairdb::set_generic_rec_per_key(KEY *key, uint key_parts,
+void ha_helios::set_generic_rec_per_key(KEY *key, uint key_parts,
                                            bool is_primary) {
   bool is_unique = (key->flags & HA_NOSAME);
 
@@ -328,7 +328,7 @@ void ha_lineairdb::set_generic_rec_per_key(KEY *key, uint key_parts,
   }
 }
 
-ha_rows ha_lineairdb::records_in_range(uint inx, key_range *min_key,
+ha_rows ha_helios::records_in_range(uint inx, key_range *min_key,
                                        key_range *max_key) {
   DBUG_TRACE;
 
@@ -439,7 +439,7 @@ ha_rows ha_lineairdb::records_in_range(uint inx, key_range *min_key,
       std::lock_guard<std::mutex> lock(share->index_ndv_mu_);
       auto hist_it = share->index_hist_.find(index_name);
       if (hist_it != share->index_hist_.end()) {
-        const LineairDB_share::RangeHist &hist = hist_it->second;
+        const Helios_share::RangeHist &hist = hist_it->second;
         if (!hist.bounds.empty() && hist.bounds.size() == hist.cum.size()) {
           auto rank_le = [&](const std::string &encoded_key) -> double {
             if (encoded_key >= hist.bounds.back())
@@ -459,7 +459,7 @@ ha_rows ha_lineairdb::records_in_range(uint inx, key_range *min_key,
           double lo = 0.0;
           double hi = static_cast<double>(hist.cum.back());
           if (min_key != nullptr) {
-            std::string encoded = lineairdb_keyenc::convert_key_to_ldbformat(
+            std::string encoded = helios_keyenc::encode_key(
                 table, inx, min_key->key, kLeadingPart);
             if (encoded.empty())
               enc_ok = false;
@@ -467,7 +467,7 @@ ha_rows ha_lineairdb::records_in_range(uint inx, key_range *min_key,
               lo = rank_le(encoded);
           }
           if (enc_ok && max_key != nullptr) {
-            std::string encoded = lineairdb_keyenc::convert_key_to_ldbformat(
+            std::string encoded = helios_keyenc::encode_key(
                 table, inx, max_key->key, kLeadingPart);
             if (encoded.empty())
               enc_ok = false;
@@ -490,7 +490,7 @@ ha_rows ha_lineairdb::records_in_range(uint inx, key_range *min_key,
   return estimate;
 }
 
-bool ha_lineairdb::should_charge_materialization_cost(
+bool ha_helios::should_charge_materialization_cost(
     uint index, double rows [[maybe_unused]]) const {
   const TABLE *t = table;
   if (t == nullptr || t->in_use == nullptr) return true;

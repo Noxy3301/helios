@@ -38,7 +38,7 @@ mkdir -p build/proxy/proto
 cp -a proto/. build/proxy/proto/
 
 # Create MySQL storage engine link to build directory version
-ln -sf $(pwd)/build/proxy third_party/mysql-server/storage/lineairdb
+ln -sf $(pwd)/build/proxy third_party/mysql-server/storage/helios
 
 # Build MySQL with proxy storage engine  
 echo "Building MySQL with proxy (CMAKE_BUILD_TYPE=${MYSQL_BUILD_TYPE})..."

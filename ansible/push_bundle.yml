@@ -49,7 +49,7 @@
         for f in "$HOME/helios/build/runtime_output_directory/mysqld" \
                  "$HOME/helios/build/runtime_output_directory/mysql" \
                  "$HOME/helios/build/runtime_output_directory/mysqladmin" \
-                 "$HOME/helios/build/plugin_output_directory/ha_lineairdb_storage_engine.so" \
+                 "$HOME/helios/build/plugin_output_directory/ha_helios_storage_engine.so" \
                  "$HOME/helios/build/server/helios-storage"; do
           miss=$(LD_LIBRARY_PATH="$L" ldd "$f" | grep 'not found' || true)
           if [ -n "$miss" ]; then

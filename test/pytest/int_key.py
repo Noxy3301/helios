@@ -5,29 +5,29 @@ from utils.reset import reset
 import argparse
 
 def where (db, cursor) :
-    cursor.execute('DROP DATABASE IF EXISTS ha_lineairdb_test')
-    cursor.execute('CREATE DATABASE ha_lineairdb_test')
-    cursor.execute('CREATE TABLE ha_lineairdb_test.items (\
+    cursor.execute('DROP DATABASE IF EXISTS ha_helios_test')
+    cursor.execute('CREATE DATABASE ha_helios_test')
+    cursor.execute('CREATE TABLE ha_helios_test.items (\
         title int NOT NULL,\
         content VARCHAR(255),\
         INDEX title_idx (title)\
-    )ENGINE = LineairDB')
+    )ENGINE = Helios')
     print("PRIMARY KEY INT TEST")
     cursor.execute(\
-        'INSERT INTO ha_lineairdb_test.items (\
+        'INSERT INTO ha_helios_test.items (\
             title, content\
         ) VALUES ("1", "alice")'\
     )
     db.commit()
 
-    cursor.execute('SELECT * FROM ha_lineairdb_test.items')
+    cursor.execute('SELECT * FROM ha_helios_test.items')
     rows = cursor.fetchall()
     if not rows or rows[0][0] != 1 :
         print("\tCheck 1 Failed")
         print("\t", rows)
         return 1
     print("\tCheck 1 Passed")
-    cursor.execute('SELECT * FROM ha_lineairdb_test.items WHERE title = "1"')
+    cursor.execute('SELECT * FROM ha_helios_test.items WHERE title = "1"')
     rows = cursor.fetchall()
     if not rows or rows[0][1] != "alice" :
         print("\tCheck 2 Failed")

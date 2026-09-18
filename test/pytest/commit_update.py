@@ -13,7 +13,7 @@ def commit_update_single_row(db, cursor):
     print("\tTX1 BEGIN")
     cursor.execute('BEGIN')
     cursor.execute(
-        'INSERT INTO ha_lineairdb_test.items (\
+        'INSERT INTO ha_helios_test.items (\
             title, content\
         ) VALUES ("alice", "before update")'
     )
@@ -24,13 +24,13 @@ def commit_update_single_row(db, cursor):
     print("\tTX2 BEGIN")
     cursor.execute('BEGIN')
     cursor.execute(
-        'UPDATE ha_lineairdb_test.items SET content="after update" WHERE title="alice"'
+        'UPDATE ha_helios_test.items SET content="after update" WHERE title="alice"'
     )
     print("\tTX2 COMMIT")
     cursor.execute('COMMIT')
     db.commit()
 
-    cursor.execute('SELECT title, content FROM ha_lineairdb_test.items')
+    cursor.execute('SELECT title, content FROM ha_helios_test.items')
     rows = cursor.fetchall()
     print("\t[DEBUG] Rows after commit:", rows)
 
@@ -54,7 +54,7 @@ def commit_update_multiple_rows(db, cursor):
     print("\tTX1 BEGIN")
     cursor.execute('BEGIN')
     cursor.execute(
-        'INSERT INTO ha_lineairdb_test.items (title, content) VALUES '
+        'INSERT INTO ha_helios_test.items (title, content) VALUES '
         '("alice", "v1"), ("bob", "v1"), ("carol", "v1")'
     )
     print("\tTX1 COMMIT")
@@ -64,13 +64,13 @@ def commit_update_multiple_rows(db, cursor):
     print("\tTX2 BEGIN")
     cursor.execute('BEGIN')
     cursor.execute(
-        'UPDATE ha_lineairdb_test.items SET content="v2" WHERE title IN ("alice", "bob")'
+        'UPDATE ha_helios_test.items SET content="v2" WHERE title IN ("alice", "bob")'
     )
     print("\tTX2 COMMIT")
     cursor.execute('COMMIT')
 
     cursor.execute(
-        'SELECT title, content FROM ha_lineairdb_test.items ORDER BY title'
+        'SELECT title, content FROM ha_helios_test.items ORDER BY title'
     )
     rows = cursor.fetchall()
     print("\t[DEBUG] Rows after commit:", rows)

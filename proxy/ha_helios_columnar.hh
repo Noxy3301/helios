@@ -1,5 +1,5 @@
-#ifndef HA_LINEAIRDB_COLUMNAR_HH
-#define HA_LINEAIRDB_COLUMNAR_HH
+#ifndef HA_HELIOS_COLUMNAR_HH
+#define HA_HELIOS_COLUMNAR_HH
 
 #include "my_base.h"
 #include "sql/handler.h"
@@ -13,24 +13,24 @@ namespace dd {
 class Table;
 }
 
-namespace lineairdb_columnar {
+namespace helios_columnar {
 
 /**
- * @brief MySQL secondary engine handler for LINEAIRDB_COLUMNAR.
+ * @brief MySQL secondary engine handler for HELIOS_COLUMNAR.
  *
  * This is the table-facing handler MySQL opens after a table is assigned to
- * LINEAIRDB_COLUMNAR and marked with SECONDARY_LOAD. Loading only records that
- * the table may be opened through this plugin; rows stay in LineairDB/PAX
- * storage and are shared with the primary LineairDB handler.
+ * HELIOS_COLUMNAR and marked with SECONDARY_LOAD. Loading only records that
+ * the table may be opened through this plugin; rows stay in Helios/PAX
+ * storage and are shared with the primary Helios handler.
  *
  * Row-access methods are intentionally inert. Supported SELECT blocks run
  * through JOIN::override_executor_func after optimize_secondary_engine accepts
  * their shape; unsupported blocks reject from the secondary path and can retry
  * on the primary engine when use_secondary_engine=ON.
  */
-class ha_lineairdb_columnar : public handler {
+class ha_helios_columnar : public handler {
  public:
-  ha_lineairdb_columnar(handlerton *hton, TABLE_SHARE *table_share_arg);
+  ha_helios_columnar(handlerton *hton, TABLE_SHARE *table_share_arg);
 
   int create(const char *, TABLE *, HA_CREATE_INFO *, dd::Table *) override {
     return HA_ERR_WRONG_COMMAND;
@@ -53,7 +53,7 @@ class ha_lineairdb_columnar : public handler {
                              thr_lock_type lock_type) override;
   int external_lock(THD *thd, int lock_type) override;
   Table_flags table_flags() const override { return HA_NO_INDEX_ACCESS; }
-  const char *table_type() const override { return "LINEAIRDB_COLUMNAR"; }
+  const char *table_type() const override { return "HELIOS_COLUMNAR"; }
   int load_table(const TABLE &table) override;
   int unload_table(const char *db_name, const char *table_name,
                    bool error_if_not_loaded) override;
@@ -62,6 +62,6 @@ class ha_lineairdb_columnar : public handler {
   THR_LOCK_DATA lock_data_;
 };
 
-}  // namespace lineairdb_columnar
+}  // namespace helios_columnar
 
-#endif  // HA_LINEAIRDB_COLUMNAR_HH
+#endif  // HA_HELIOS_COLUMNAR_HH

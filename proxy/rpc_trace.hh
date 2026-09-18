@@ -1,5 +1,5 @@
-#ifndef LINEAIRDB_RPC_TRACE_HH
-#define LINEAIRDB_RPC_TRACE_HH
+#ifndef HELIOS_RPC_TRACE_HH
+#define HELIOS_RPC_TRACE_HH
 
 #include <chrono>
 #include <cstdint>
@@ -10,7 +10,7 @@
 #include <thread>
 #include <vector>
 
-#include "lineairdb_proxy.hh"  // MessageType
+#include "helios_proxy.hh"  // MessageType
 
 // Per-RPC record captured by send_message_with_header.
 struct RpcEntry {
@@ -38,7 +38,7 @@ struct LocalViewEntry {
   uint32_t stmt_idx;
 };
 
-// Per-LineairDBTransaction trace state.
+// Per-HeliosTransaction trace state.
 class TxRpcTrace {
  public:
   void start(std::thread::id tid);
@@ -89,4 +89,4 @@ class RpcTraceLogger {
 const char* message_type_name(MessageType t);
 std::string json_escape(const std::string& s, size_t max_len = 1024);
 
-#endif  // LINEAIRDB_RPC_TRACE_HH
+#endif  // HELIOS_RPC_TRACE_HH

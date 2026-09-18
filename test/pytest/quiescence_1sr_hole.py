@@ -70,7 +70,7 @@ SYNC_POINT_ENV = (
 # The bridge resolves tables through the statement's own resolved
 # references, so queries here simply run with USE <db> and unqualified
 # table names.
-DB = "ha_lineairdb_test"
+DB = "ha_helios_test"
 
 STACK_PATTERNS = ("build/server/helios-storage",
                   "runtime_output_directory/mysqld")
@@ -213,7 +213,7 @@ def run_scenario(cursor, user, password, scenario):
     print(f"SCENARIO {scenario['name']}")
     cursor.execute(
         f"CREATE TABLE {table} (id INT PRIMARY KEY, v INT) "
-        "ENGINE=LineairDB SECONDARY_ENGINE=LINEAIRDB_COLUMNAR"
+        "ENGINE=Helios SECONDARY_ENGINE=HELIOS_COLUMNAR"
     )
     values = ", ".join(f"({k}, {v})" for k, v in BASE_ROWS.items())
     cursor.execute(f"INSERT INTO {table} VALUES {values}")
@@ -366,7 +366,7 @@ def run_read_view_before_write(cursor, user, password, scenario):
     print(f"SCENARIO read-view-before-write/{scenario['name']}")
     cursor.execute(
         f"CREATE TABLE {table} (id INT PRIMARY KEY, v INT) "
-        "ENGINE=LineairDB SECONDARY_ENGINE=LINEAIRDB_COLUMNAR"
+        "ENGINE=Helios SECONDARY_ENGINE=HELIOS_COLUMNAR"
     )
     values = ", ".join(f"({k}, {v})" for k, v in BASE_ROWS.items())
     cursor.execute(f"INSERT INTO {table} VALUES {values}")
@@ -453,7 +453,7 @@ def run_probe(user, password):
         cursor = db.cursor()
 
         print("SETUP")
-        cursor.execute("SET GLOBAL lineairdb_read_path = 'plan'")
+        cursor.execute("SET GLOBAL helios_read_path = 'plan'")
         cursor.execute(f"DROP DATABASE IF EXISTS {DB}")
         cursor.execute(f"CREATE DATABASE {DB}")
         cursor.execute(f"USE {DB}")

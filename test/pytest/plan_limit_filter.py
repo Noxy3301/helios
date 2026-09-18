@@ -8,7 +8,7 @@ import sys
 from utils.connection import get_connection
 
 
-DBNAME = "ha_lineairdb_plan_limit_filter"
+DBNAME = "ha_helios_plan_limit_filter"
 
 # k = 1 for pk 1..40, flag = 1 only for pk 31..40, so the filtered rows sit at
 # the far end of the index window a staged LIMIT would truncate.
@@ -36,7 +36,7 @@ def setup():
     cursor.execute(f"USE {DBNAME}")
     cursor.execute(
         "CREATE TABLE t (pk INT NOT NULL PRIMARY KEY, k INT NOT NULL, "
-        "flag INT NOT NULL, v VARCHAR(32), KEY k_idx(k)) ENGINE=LineairDB"
+        "flag INT NOT NULL, v VARCHAR(32), KEY k_idx(k)) ENGINE=Helios"
     )
     values = []
     for pk in range(1, ROWS + 1):
@@ -56,7 +56,7 @@ def setup():
 def set_read_path(value):
     db = get_connection(user=args.user, password=args.password)
     cursor = db.cursor()
-    cursor.execute(f"SET GLOBAL lineairdb_read_path='{value}'")
+    cursor.execute(f"SET GLOBAL helios_read_path='{value}'")
     cursor.close()
     db.close()
 
@@ -67,7 +67,7 @@ def run_path(path, explain):
     db = get_connection(user=args.user, password=args.password)
     cursor = db.cursor()
     cursor.execute(f"USE {DBNAME}")
-    cursor.execute("SELECT @@GLOBAL.lineairdb_read_path")
+    cursor.execute("SELECT @@GLOBAL.helios_read_path")
     active = cursor.fetchone()[0]
     print(f"\n=== read path: requested {path}, global reports {active}")
 

@@ -8,21 +8,21 @@ def test_primary_key_exact_match(db, cursor):
     """Exact match search test with PRIMARY KEY"""
     print("PRIMARY KEY EXACT MATCH TEST")
     
-    cursor.execute('DROP DATABASE IF EXISTS ha_lineairdb_test')
-    cursor.execute('CREATE DATABASE ha_lineairdb_test')
+    cursor.execute('DROP DATABASE IF EXISTS ha_helios_test')
+    cursor.execute('CREATE DATABASE ha_helios_test')
     cursor.execute('''
-        CREATE TABLE ha_lineairdb_test.users (
+        CREATE TABLE ha_helios_test.users (
             id INT NOT NULL PRIMARY KEY,
             name VARCHAR(50) NOT NULL,
             age INT NOT NULL
-        ) ENGINE=LineairDB
+        ) ENGINE=Helios
     ''')
     cursor.execute('''
-        CREATE TABLE ha_lineairdb_test.users_no_pk (
+        CREATE TABLE ha_helios_test.users_no_pk (
             id INT NOT NULL,
             name VARCHAR(50) NOT NULL,
             age INT NOT NULL
-        ) ENGINE=LineairDB
+        ) ENGINE=Helios
     ''')
     
     # Insert test data
@@ -36,16 +36,16 @@ def test_primary_key_exact_match(db, cursor):
     
     for id_val, name, age in test_data:
         cursor.execute(
-            f'INSERT INTO ha_lineairdb_test.users VALUES ({id_val}, "{name}", {age})'
+            f'INSERT INTO ha_helios_test.users VALUES ({id_val}, "{name}", {age})'
         )
         cursor.execute(
-            f'INSERT INTO ha_lineairdb_test.users_no_pk VALUES ({id_val}, "{name}", {age})'
+            f'INSERT INTO ha_helios_test.users_no_pk VALUES ({id_val}, "{name}", {age})'
         )
     db.commit()
 
     # Full scan test
     print("\tFull scan:")
-    cursor.execute('SELECT * FROM ha_lineairdb_test.users')
+    cursor.execute('SELECT * FROM ha_helios_test.users')
     rows = cursor.fetchall()
     for row in rows:
         print(f"\t  {row}")
@@ -53,7 +53,7 @@ def test_primary_key_exact_match(db, cursor):
 
     # Full scan test
     print("\tFull scan (no PK):")
-    cursor.execute('SELECT * FROM ha_lineairdb_test.users_no_pk')
+    cursor.execute('SELECT * FROM ha_helios_test.users_no_pk')
     rows = cursor.fetchall()
     for row in rows:
         print(f"\t  {row}")
@@ -61,7 +61,7 @@ def test_primary_key_exact_match(db, cursor):
     
     # Exact match test
     print("\tExact match: id=5")
-    cursor.execute('SELECT * FROM ha_lineairdb_test.users WHERE id = 5')
+    cursor.execute('SELECT * FROM ha_helios_test.users WHERE id = 5')
     rows = cursor.fetchall()
     
     if len(rows) != 1 or rows[0][0] != 5 or rows[0][1] != 'carol':
@@ -71,7 +71,7 @@ def test_primary_key_exact_match(db, cursor):
     
     # Non-existent key
     print("\tNon-existent key: id=100")
-    cursor.execute('SELECT * FROM ha_lineairdb_test.users WHERE id = 100')
+    cursor.execute('SELECT * FROM ha_helios_test.users WHERE id = 100')
     rows = cursor.fetchall()
     
     if len(rows) != 0:
@@ -81,7 +81,7 @@ def test_primary_key_exact_match(db, cursor):
     
     # Minimum value
     print("\tMinimum value: id=1")
-    cursor.execute('SELECT * FROM ha_lineairdb_test.users WHERE id = 1')
+    cursor.execute('SELECT * FROM ha_helios_test.users WHERE id = 1')
     rows = cursor.fetchall()
     
     if len(rows) != 1 or rows[0][1] != 'alice':
@@ -91,7 +91,7 @@ def test_primary_key_exact_match(db, cursor):
     
     # Maximum value
     print("\tMaximum value: id=15")
-    cursor.execute('SELECT * FROM ha_lineairdb_test.users WHERE id = 15')
+    cursor.execute('SELECT * FROM ha_helios_test.users WHERE id = 15')
     rows = cursor.fetchall()
     
     if len(rows) != 1 or rows[0][1] != 'eve':
@@ -106,14 +106,14 @@ def test_primary_key_range_queries(db, cursor):
     """PRIMARY KEY range query test"""
     print("\nPRIMARY KEY RANGE QUERY TEST")
     
-    cursor.execute('DROP DATABASE IF EXISTS ha_lineairdb_test')
-    cursor.execute('CREATE DATABASE ha_lineairdb_test')
+    cursor.execute('DROP DATABASE IF EXISTS ha_helios_test')
+    cursor.execute('CREATE DATABASE ha_helios_test')
     cursor.execute('''
-        CREATE TABLE ha_lineairdb_test.products (
+        CREATE TABLE ha_helios_test.products (
             id INT NOT NULL PRIMARY KEY,
             name VARCHAR(50) NOT NULL,
             price INT NOT NULL
-        ) ENGINE=LineairDB
+        ) ENGINE=Helios
     ''')
     
     # Insert test data
@@ -129,19 +129,19 @@ def test_primary_key_range_queries(db, cursor):
     
     for id_val, name, price in test_data:
         cursor.execute(
-            f'INSERT INTO ha_lineairdb_test.products VALUES ({id_val}, "{name}", {price})'
+            f'INSERT INTO ha_helios_test.products VALUES ({id_val}, "{name}", {price})'
         )
     db.commit()
     
     print("\tAll rows:")
-    cursor.execute('SELECT * FROM ha_lineairdb_test.products')
+    cursor.execute('SELECT * FROM ha_helios_test.products')
     all_rows = cursor.fetchall()
     for row in all_rows:
         print(f"\t  {row}")
     
     # Range query: id > 15
     print("\n\tRange query: id > 15")
-    cursor.execute('SELECT id, name FROM ha_lineairdb_test.products WHERE id > 15')
+    cursor.execute('SELECT id, name FROM ha_helios_test.products WHERE id > 15')
     rows = cursor.fetchall()
     print(f"\t  Result: {rows}")
     
@@ -154,7 +154,7 @@ def test_primary_key_range_queries(db, cursor):
     
     # Range query: id < 15
     print("\n\tRange query: id < 15")
-    cursor.execute('SELECT id, name FROM ha_lineairdb_test.products WHERE id < 15')
+    cursor.execute('SELECT id, name FROM ha_helios_test.products WHERE id < 15')
     rows = cursor.fetchall()
     print(f"\t  Result: {rows}")
     
@@ -167,7 +167,7 @@ def test_primary_key_range_queries(db, cursor):
     
     # Range query: id >= 10 AND id <= 20
     print("\n\tRange query: id >= 10 AND id <= 20")
-    cursor.execute('SELECT id, name FROM ha_lineairdb_test.products WHERE id >= 10 AND id <= 20')
+    cursor.execute('SELECT id, name FROM ha_helios_test.products WHERE id >= 10 AND id <= 20')
     rows = cursor.fetchall()
     print(f"\t  Result: {rows}")
     
@@ -180,7 +180,7 @@ def test_primary_key_range_queries(db, cursor):
     
     # BETWEEN
     print("\n\tRange query: id BETWEEN 5 AND 15")
-    cursor.execute('SELECT id, name FROM ha_lineairdb_test.products WHERE id BETWEEN 5 AND 15')
+    cursor.execute('SELECT id, name FROM ha_helios_test.products WHERE id BETWEEN 5 AND 15')
     rows = cursor.fetchall()
     print(f"\t  Result: {rows}")
     
@@ -198,13 +198,13 @@ def test_primary_key_max_query(db, cursor):
     """MAX() aggregation test on PRIMARY KEY"""
     print("\nPRIMARY KEY MAX() QUERY TEST")
 
-    cursor.execute('DROP DATABASE IF EXISTS ha_lineairdb_test')
-    cursor.execute('CREATE DATABASE ha_lineairdb_test')
+    cursor.execute('DROP DATABASE IF EXISTS ha_helios_test')
+    cursor.execute('CREATE DATABASE ha_helios_test')
     cursor.execute('''
-        CREATE TABLE ha_lineairdb_test.usertable (
+        CREATE TABLE ha_helios_test.usertable (
             ycsb_key INT NOT NULL PRIMARY KEY,
             field1 VARCHAR(50) NOT NULL
-        ) ENGINE=LineairDB
+        ) ENGINE=Helios
     ''')
 
     test_data = [
@@ -217,12 +217,12 @@ def test_primary_key_max_query(db, cursor):
 
     for ycsb_key, field1 in test_data:
         cursor.execute(
-            f'INSERT INTO ha_lineairdb_test.usertable VALUES ({ycsb_key}, "{field1}")'
+            f'INSERT INTO ha_helios_test.usertable VALUES ({ycsb_key}, "{field1}")'
         )
     db.commit()
 
     print("\tMAX(ycsb_key)")
-    cursor.execute('SELECT MAX(ycsb_key) FROM ha_lineairdb_test.usertable')
+    cursor.execute('SELECT MAX(ycsb_key) FROM ha_helios_test.usertable')
     row = cursor.fetchone()
     max_key = row[0] if row else None
 
@@ -240,23 +240,23 @@ def test_primary_key_exclusive_range(db, cursor):
     """PRIMARY KEY exclusive range boundary test (< and >)"""
     print("\nPRIMARY KEY EXCLUSIVE RANGE BOUNDARY TEST")
     
-    cursor.execute('DROP DATABASE IF EXISTS ha_lineairdb_test')
-    cursor.execute('CREATE DATABASE ha_lineairdb_test')
+    cursor.execute('DROP DATABASE IF EXISTS ha_helios_test')
+    cursor.execute('CREATE DATABASE ha_helios_test')
     cursor.execute('''
-        CREATE TABLE ha_lineairdb_test.items (
+        CREATE TABLE ha_helios_test.items (
             id INT NOT NULL PRIMARY KEY,
             name VARCHAR(50) NOT NULL
-        ) ENGINE=LineairDB
+        ) ENGINE=Helios
     ''')
     
     # Insert values 1, 2, 3, 4, 5
     for i in range(1, 6):
-        cursor.execute(f'INSERT INTO ha_lineairdb_test.items VALUES ({i}, "item_{i}")')
+        cursor.execute(f'INSERT INTO ha_helios_test.items VALUES ({i}, "item_{i}")')
     db.commit()
     
     # Test: id < 3 should return 1, 2 (NOT 3)
     print("\tRange query: id < 3 (exclusive)")
-    cursor.execute('SELECT id FROM ha_lineairdb_test.items WHERE id < 3 ORDER BY id')
+    cursor.execute('SELECT id FROM ha_helios_test.items WHERE id < 3 ORDER BY id')
     rows = cursor.fetchall()
     result_ids = [row[0] for row in rows]
     
@@ -269,7 +269,7 @@ def test_primary_key_exclusive_range(db, cursor):
     
     # Test: id > 3 should return 4, 5 (NOT 3)
     print("\tRange query: id > 3 (exclusive)")
-    cursor.execute('SELECT id FROM ha_lineairdb_test.items WHERE id > 3 ORDER BY id')
+    cursor.execute('SELECT id FROM ha_helios_test.items WHERE id > 3 ORDER BY id')
     rows = cursor.fetchall()
     result_ids = [row[0] for row in rows]
     
@@ -282,7 +282,7 @@ def test_primary_key_exclusive_range(db, cursor):
     
     # Test: id <= 3 should return 1, 2, 3
     print("\tRange query: id <= 3 (inclusive)")
-    cursor.execute('SELECT id FROM ha_lineairdb_test.items WHERE id <= 3 ORDER BY id')
+    cursor.execute('SELECT id FROM ha_helios_test.items WHERE id <= 3 ORDER BY id')
     rows = cursor.fetchall()
     result_ids = [row[0] for row in rows]
     
@@ -293,7 +293,7 @@ def test_primary_key_exclusive_range(db, cursor):
     
     # Test: id >= 3 should return 3, 4, 5
     print("\tRange query: id >= 3 (inclusive)")
-    cursor.execute('SELECT id FROM ha_lineairdb_test.items WHERE id >= 3 ORDER BY id')
+    cursor.execute('SELECT id FROM ha_helios_test.items WHERE id >= 3 ORDER BY id')
     rows = cursor.fetchall()
     result_ids = [row[0] for row in rows]
     
@@ -304,7 +304,7 @@ def test_primary_key_exclusive_range(db, cursor):
     
     # Test: 2 < id < 4 should return only 3
     print("\tRange query: 2 < id < 4 (both exclusive)")
-    cursor.execute('SELECT id FROM ha_lineairdb_test.items WHERE id > 2 AND id < 4 ORDER BY id')
+    cursor.execute('SELECT id FROM ha_helios_test.items WHERE id > 2 AND id < 4 ORDER BY id')
     rows = cursor.fetchall()
     result_ids = [row[0] for row in rows]
     
@@ -320,15 +320,15 @@ def test_composite_primary_key_exclusive_range(db, cursor):
     """Composite PRIMARY KEY exclusive range boundary test"""
     print("\nCOMPOSITE PRIMARY KEY EXCLUSIVE RANGE TEST")
     
-    cursor.execute('DROP DATABASE IF EXISTS ha_lineairdb_test')
-    cursor.execute('CREATE DATABASE ha_lineairdb_test')
+    cursor.execute('DROP DATABASE IF EXISTS ha_helios_test')
+    cursor.execute('CREATE DATABASE ha_helios_test')
     cursor.execute('''
-        CREATE TABLE ha_lineairdb_test.sales (
+        CREATE TABLE ha_helios_test.sales (
             year INT NOT NULL,
             month INT NOT NULL,
             amount INT NOT NULL,
             PRIMARY KEY (year, month)
-        ) ENGINE=LineairDB
+        ) ENGINE=Helios
     ''')
     
     # Insert test data
@@ -341,12 +341,12 @@ def test_composite_primary_key_exclusive_range(db, cursor):
     ]
     
     for year, month, amount in test_data:
-        cursor.execute(f'INSERT INTO ha_lineairdb_test.sales VALUES ({year}, {month}, {amount})')
+        cursor.execute(f'INSERT INTO ha_helios_test.sales VALUES ({year}, {month}, {amount})')
     db.commit()
     
     # Test: year=2024 AND month < 6 should return months 1, 3 (NOT 6)
     print("\tComposite key range: year=2024 AND month < 6")
-    cursor.execute('SELECT month FROM ha_lineairdb_test.sales WHERE year = 2024 AND month < 6 ORDER BY month')
+    cursor.execute('SELECT month FROM ha_helios_test.sales WHERE year = 2024 AND month < 6 ORDER BY month')
     rows = cursor.fetchall()
     result_months = [row[0] for row in rows]
     
@@ -359,7 +359,7 @@ def test_composite_primary_key_exclusive_range(db, cursor):
     
     # Test: year=2024 AND month > 6 should return months 9, 12 (NOT 6)
     print("\tComposite key range: year=2024 AND month > 6")
-    cursor.execute('SELECT month FROM ha_lineairdb_test.sales WHERE year = 2024 AND month > 6 ORDER BY month')
+    cursor.execute('SELECT month FROM ha_helios_test.sales WHERE year = 2024 AND month > 6 ORDER BY month')
     rows = cursor.fetchall()
     result_months = [row[0] for row in rows]
     
@@ -372,7 +372,7 @@ def test_composite_primary_key_exclusive_range(db, cursor):
     
     # Test: year=2024 AND month <= 6 should return months 1, 3, 6
     print("\tComposite key range: year=2024 AND month <= 6")
-    cursor.execute('SELECT month FROM ha_lineairdb_test.sales WHERE year = 2024 AND month <= 6 ORDER BY month')
+    cursor.execute('SELECT month FROM ha_helios_test.sales WHERE year = 2024 AND month <= 6 ORDER BY month')
     rows = cursor.fetchall()
     result_months = [row[0] for row in rows]
     
@@ -383,7 +383,7 @@ def test_composite_primary_key_exclusive_range(db, cursor):
     
     # Test: year=2024 AND month >= 6 should return months 6, 9, 12
     print("\tComposite key range: year=2024 AND month >= 6")
-    cursor.execute('SELECT month FROM ha_lineairdb_test.sales WHERE year = 2024 AND month >= 6 ORDER BY month')
+    cursor.execute('SELECT month FROM ha_helios_test.sales WHERE year = 2024 AND month >= 6 ORDER BY month')
     rows = cursor.fetchall()
     result_months = [row[0] for row in rows]
     
@@ -394,7 +394,7 @@ def test_composite_primary_key_exclusive_range(db, cursor):
     
     # Test: year=2024 AND 3 < month < 9 should return only 6
     print("\tComposite key range: year=2024 AND 3 < month < 9")
-    cursor.execute('SELECT month FROM ha_lineairdb_test.sales WHERE year = 2024 AND month > 3 AND month < 9 ORDER BY month')
+    cursor.execute('SELECT month FROM ha_helios_test.sales WHERE year = 2024 AND month > 3 AND month < 9 ORDER BY month')
     rows = cursor.fetchall()
     result_months = [row[0] for row in rows]
     
@@ -410,17 +410,17 @@ def test_primary_key_composite(db, cursor):
     """Composite PRIMARY KEY test"""
     print("\nCOMPOSITE PRIMARY KEY TEST")
     
-    cursor.execute('DROP DATABASE IF EXISTS ha_lineairdb_test')
-    cursor.execute('CREATE DATABASE ha_lineairdb_test')
+    cursor.execute('DROP DATABASE IF EXISTS ha_helios_test')
+    cursor.execute('CREATE DATABASE ha_helios_test')
     
     # Composite PRIMARY KEY
     cursor.execute('''
-        CREATE TABLE ha_lineairdb_test.order_items (
+        CREATE TABLE ha_helios_test.order_items (
             order_id INT NOT NULL,
             item_id INT NOT NULL,
             quantity INT NOT NULL,
             PRIMARY KEY (order_id, item_id)
-        ) ENGINE=LineairDB
+        ) ENGINE=Helios
     ''')
     
     # Insert test data
@@ -435,19 +435,19 @@ def test_primary_key_composite(db, cursor):
     
     for order_id, item_id, quantity in test_data:
         cursor.execute(
-            f'INSERT INTO ha_lineairdb_test.order_items VALUES ({order_id}, {item_id}, {quantity})'
+            f'INSERT INTO ha_helios_test.order_items VALUES ({order_id}, {item_id}, {quantity})'
         )
     db.commit()
     
     print("\tAll rows:")
-    cursor.execute('SELECT * FROM ha_lineairdb_test.order_items')
+    cursor.execute('SELECT * FROM ha_helios_test.order_items')
     all_rows = cursor.fetchall()
     for row in all_rows:
         print(f"\t  {row}")
     
     # Composite key exact match
     print("\n\tComposite key exact match: order_id=1 AND item_id=2")
-    cursor.execute('SELECT * FROM ha_lineairdb_test.order_items WHERE order_id = 1 AND item_id = 2')
+    cursor.execute('SELECT * FROM ha_helios_test.order_items WHERE order_id = 1 AND item_id = 2')
     rows = cursor.fetchall()
     print(f"\t  Result: {rows}")
     
@@ -458,7 +458,7 @@ def test_primary_key_composite(db, cursor):
     
     # Composite key prefix match
     print("\n\tComposite key prefix match: order_id=1")
-    cursor.execute('SELECT * FROM ha_lineairdb_test.order_items WHERE order_id = 1')
+    cursor.execute('SELECT * FROM ha_helios_test.order_items WHERE order_id = 1')
     rows = cursor.fetchall()
     print(f"\t  Result: {rows}")
     
@@ -497,7 +497,7 @@ def main():
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description='PRIMARY KEY comprehensive tests for LineairDB')
+    parser = argparse.ArgumentParser(description='PRIMARY KEY comprehensive tests for Helios')
     parser.add_argument('--user', metavar='user', type=str,
                         help='MySQL user name',
                         default="root")

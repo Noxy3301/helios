@@ -710,7 +710,7 @@ Examples:
     parser.add_argument("--bench-serial", default=None, type=lambda x: x.lower() == "true",
                         help="TPC-H serial mode (true/false)")
     parser.add_argument("--read-path", choices=["row", "plan"], default="plan",
-                        help="SET GLOBAL lineairdb_read_path on every MySQL: row sends one "
+                        help="SET GLOBAL helios_read_path on every MySQL: row sends one "
                              "request per handler call, plan stages a read plan per "
                              "statement (default: plan)")
     parser.add_argument("--tx-plan", action="store_true",
@@ -718,7 +718,7 @@ Examples:
                              "procedures inject @_tx_plan, instead of the per-statement "
                              "plan the proxy derives from the QEP")
     parser.add_argument("--bench-ndv-drift", action="store_true",
-                        help="SET GLOBAL lineairdb_stats_drift_refresh=ON "
+                        help="SET GLOBAL helios_stats_drift_refresh=ON "
                              "(default OFF: the NDV/histogram recompute is synchronous "
                              "on the read path)")
     parser.add_argument("--bench-analyze", action="store_true",

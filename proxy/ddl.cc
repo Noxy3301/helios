@@ -1,4 +1,4 @@
-#include "storage/lineairdb/ha_lineairdb.hh"
+#include "storage/helios/ha_helios.hh"
 
 #include <algorithm>
 #include <atomic>
@@ -10,7 +10,7 @@
 #include <utility>
 #include <vector>
 
-#include "lineairdb_field_types.h"
+#include "helios_field_types.h"
 #include "my_base.h"
 #include "my_dbug.h"
 #include "my_sys.h"
@@ -21,7 +21,7 @@
 #include "sql/table.h"
 
 // Handler table lifecycle and DDL entry points. These methods open MySQL table
-// metadata, create LineairDB-side tables/indexes, and backfill secondary
+// metadata, create Helios-side tables/indexes, and backfill secondary
 // indexes for online ALTER TABLE ADD INDEX.
 
 namespace {
@@ -163,7 +163,7 @@ std::vector<uint32_t> compute_pax_field_widths(
   return widths;
 }
 
-void ha_lineairdb::set_key_and_key_part_info(const TABLE *const table) {
+void ha_helios::set_key_and_key_part_info(const TABLE *const table) {
   key_info = table->key_info;
   uint pk_index = table->s->primary_key;
 
@@ -177,7 +177,7 @@ void ha_lineairdb::set_key_and_key_part_info(const TABLE *const table) {
   }
 }
 
-int ha_lineairdb::open(const char *table_name, int, uint, const dd::Table *) {
+int ha_helios::open(const char *table_name, int, uint, const dd::Table *) {
   DBUG_TRACE;
   if (!(share = get_share()))
     return 1;
@@ -197,9 +197,8 @@ int ha_lineairdb::open(const char *table_name, int, uint, const dd::Table *) {
     for (uint i = 0; i < pk->user_defined_key_parts; i++) {
       KEY_PART_INFO *part = &pk->key_part[i];
       Field *field = part->field;
-      LineairDBFieldType ldb_type =
-          convert_mysql_type_to_lineairdb(field->type());
-      if (ldb_type == LineairDBFieldType::LINEAIRDB_STRING) {
+      HeliosFieldType helios_type = convert_mysql_type_to_helios(field->type());
+      if (helios_type == HeliosFieldType::HELIOS_STRING) {
         // STRING: marker(1) + type(1) + payload + terminator(1) + length(2)
         encoded_pk_size += 5 + part->length;
       } else {
@@ -215,23 +214,23 @@ int ha_lineairdb::open(const char *table_name, int, uint, const dd::Table *) {
   return 0;
 }
 
-int ha_lineairdb::close(void) {
+int ha_helios::close(void) {
   DBUG_TRACE;
   return 0;
 }
 
-int ha_lineairdb::delete_table(const char *, const dd::Table *) {
+int ha_helios::delete_table(const char *, const dd::Table *) {
   DBUG_TRACE;
   return 0;
 }
 
-int ha_lineairdb::rename_table(const char *, const char *, const dd::Table *,
+int ha_helios::rename_table(const char *, const char *, const dd::Table *,
                                dd::Table *) {
   DBUG_TRACE;
   return HA_ERR_WRONG_COMMAND;
 }
 
-int ha_lineairdb::create(const char *table_name, TABLE *table, HA_CREATE_INFO *,
+int ha_helios::create(const char *table_name, TABLE *table, HA_CREATE_INFO *,
                          dd::Table *) {
   DBUG_TRACE;
   db_table_name = std::string(table_name);
@@ -240,7 +239,7 @@ int ha_lineairdb::create(const char *table_name, TABLE *table, HA_CREATE_INFO *,
   // be set yet. Use ha_thd() to ensure get_proxy() can find the THD context.
   userThread = ha_thd();
 
-  // In a disaggregated setup, multiple MySQL nodes share the same LineairDB
+  // In a disaggregated setup, multiple MySQL nodes share the same Helios
   // storage. The table/index may already exist from another node's CREATE
   // TABLE; MySQL-side metadata still needs to be created.
   auto proxy = get_proxy();
@@ -256,7 +255,7 @@ int ha_lineairdb::create(const char *table_name, TABLE *table, HA_CREATE_INFO *,
     char buf[128];
     String sql_type(buf, sizeof(buf), field->charset());
     field->sql_type(sql_type);
-    std::string msg = "LineairDB: column ";
+    std::string msg = "Helios: column ";
     msg += field->field_name;
     msg += " (";
     msg.append(sql_type.ptr(), sql_type.length());
@@ -285,11 +284,11 @@ int ha_lineairdb::create(const char *table_name, TABLE *table, HA_CREATE_INFO *,
   return 0;
 }
 
-enum_alter_inplace_result ha_lineairdb::check_if_supported_inplace_alter(
+enum_alter_inplace_result ha_helios::check_if_supported_inplace_alter(
     TABLE *altered_table [[maybe_unused]], Alter_inplace_info *ha_alter_info) {
   DBUG_TRACE;
 
-  // DROP_INDEX is a no-op placeholder: the index data remains in LineairDB. It
+  // DROP_INDEX is a no-op placeholder: the index data remains in Helios. It
   // must be accepted because MySQL sends ADD_INDEX | DROP_INDEX together when
   // replacing a foreign-key auto-index with an explicit CREATE INDEX.
   Alter_inplace_info::HA_ALTER_FLAGS dominated_flags =
@@ -315,8 +314,8 @@ enum_alter_inplace_result ha_lineairdb::check_if_supported_inplace_alter(
   return HA_ALTER_INPLACE_EXCLUSIVE_LOCK;
 }
 
-bool ha_lineairdb::backfill_commit_chunk(
-    std::vector<LineairDBProxy::WriteOp> &ops) {
+bool ha_helios::backfill_commit_chunk(
+    std::vector<HeliosProxy::WriteOp> &ops) {
   if (ops.empty()) return true;
 
   auto *chunk_tx = new_transaction(ha_thd());
@@ -334,12 +333,12 @@ bool ha_lineairdb::backfill_commit_chunk(
   return chunk_tx->end_transaction();
 }
 
-bool ha_lineairdb::backfill_indexes_parallel(
+bool ha_helios::backfill_indexes_parallel(
     std::vector<std::pair<std::string, std::string>> &rows,
     const std::vector<std::pair<std::string, const KEY *>> &specs) {
   // Phase A: decode each row once, build one write per index, and bucket it by
   // secondary-key hash. Single-threaded -- decode uses the shared record buffer.
-  std::vector<std::vector<LineairDBProxy::WriteOp>> partition(
+  std::vector<std::vector<HeliosProxy::WriteOp>> partition(
       kBackfillParallelWorkers);
   // Reserve each bucket to its expected hash share so the per-row push_back
   // below does not repeatedly reallocate the per-worker write buffers.
@@ -356,13 +355,13 @@ bool ha_lineairdb::backfill_indexes_parallel(
   for (auto &row : rows) {
     if (row.second.empty()) continue;
     const auto *value = reinterpret_cast<const std::byte *>(row.second.data());
-    if (set_fields_from_lineairdb(table->record[0], value, row.second.size())) {
+    if (set_fields_from_helios(table->record[0], value, row.second.size())) {
       decode_failed = true;
       break;
     }
     for (const auto &spec : specs) {
-      LineairDBProxy::WriteOp op;
-      op.type = LineairDBProxy::WriteOp::Type::SecondaryIndexWrite;
+      HeliosProxy::WriteOp op;
+      op.type = HeliosProxy::WriteOp::Type::SecondaryIndexWrite;
       op.table_name = db_table_name;
       op.index_name = spec.first;
       op.primary_key = row.first;
@@ -386,8 +385,8 @@ bool ha_lineairdb::backfill_indexes_parallel(
   for (size_t w = 0; w < kBackfillParallelWorkers; ++w) {
     if (partition[w].empty()) continue;
     workers.emplace_back([&, w]() {
-      LineairDBProxy conn(host, port);
-      std::vector<LineairDBProxy::WriteOp> chunk;
+      HeliosProxy conn(host, port);
+      std::vector<HeliosProxy::WriteOp> chunk;
       chunk.reserve(kBackfillWriteChunkRows);
       // Ship the buffered writes as one commit (no reads to validate).
       auto commit_chunk = [&]() -> bool {
@@ -412,7 +411,7 @@ bool ha_lineairdb::backfill_indexes_parallel(
   return !failed.load(std::memory_order_relaxed);
 }
 
-bool ha_lineairdb::backfill_unique_serial(const std::string &index_name,
+bool ha_helios::backfill_unique_serial(const std::string &index_name,
                                           const KEY &runtime_key) {
   // A unique index scans and commits serially, which keeps the in-write
   // duplicate check. Its cost is small (no unique index is on
@@ -423,18 +422,18 @@ bool ha_lineairdb::backfill_unique_serial(const std::string &index_name,
   auto rows = scan_tx->get_matching_keys_and_values_from_prefix(std::string());
   if (scan_tx->is_aborted()) return false;
 
-  std::vector<LineairDBProxy::WriteOp> write_chunk;
+  std::vector<HeliosProxy::WriteOp> write_chunk;
   write_chunk.reserve(kBackfillWriteChunkRows);
   bool failed = false;
   for (auto &row : rows) {
     if (row.second.empty()) continue;
     const auto *value = reinterpret_cast<const std::byte *>(row.second.data());
-    if (set_fields_from_lineairdb(table->record[0], value, row.second.size())) {
+    if (set_fields_from_helios(table->record[0], value, row.second.size())) {
       failed = true;
       break;
     }
-    LineairDBProxy::WriteOp op;
-    op.type = LineairDBProxy::WriteOp::Type::SecondaryIndexWrite;
+    HeliosProxy::WriteOp op;
+    op.type = HeliosProxy::WriteOp::Type::SecondaryIndexWrite;
     op.table_name = db_table_name;
     op.index_name = index_name;
     op.primary_key = std::move(row.first);
@@ -455,7 +454,7 @@ bool ha_lineairdb::backfill_unique_serial(const std::string &index_name,
   return true;
 }
 
-bool ha_lineairdb::inplace_alter_table(TABLE *altered_table,
+bool ha_helios::inplace_alter_table(TABLE *altered_table,
                                        Alter_inplace_info *ha_alter_info,
                                        const dd::Table *old_table_def
                                        [[maybe_unused]],
@@ -496,7 +495,7 @@ bool ha_lineairdb::inplace_alter_table(TABLE *altered_table,
     }
     if (runtime_key == nullptr) return true;
 
-    // LineairDB treats an encoded NULL key as a duplicate, but SQL allows many
+    // Helios treats an encoded NULL key as a duplicate, but SQL allows many
     // NULLs in a UNIQUE index; reject nullable UNIQUE backfill instead.
     if (key_info->flags & HA_NOSAME) {
       for (uint p = 0; p < runtime_key->user_defined_key_parts; ++p) {

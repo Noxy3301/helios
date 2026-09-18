@@ -20,14 +20,14 @@
   along with this program; if not, write to the Free Software
   Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301  USA */
 
-/** @file ha_lineairdb.hh
+/** @file ha_helios.hh
 
     @brief
-  The LineairDB storage engine handler declaration.
+  The Helios storage engine handler declaration.
 
     @note
-  The handler implementation is split across the storage/lineairdb translation
-  units. The LineairDB storage engine implements all methods that are *required*
+  The handler implementation is split across the storage/helios translation
+  units. The Helios storage engine implements all methods that are *required*
   to be implemented. For a full list of all methods that you can implement, see
   handler.h.
 
@@ -35,8 +35,8 @@
   /sql/handler.h
 */
 
-#ifndef HA_LINEAIRDB_H
-#define HA_LINEAIRDB_H
+#ifndef HA_HELIOS_H
+#define HA_HELIOS_H
 
 #include <string.h>
 #include <sys/types.h>
@@ -50,11 +50,11 @@
 #include <unordered_map>
 #include <vector>
 
-#include "lineairdb_field_types.h"
-#include "lineairdb_field.hh"
-#include "lineairdb_transaction.hh"
-#include "lineairdb_proxy.hh"
-#include "lineairdb_index_search.hh"
+#include "helios_field_types.h"
+#include "helios_field.hh"
+#include "helios_transaction.hh"
+#include "helios_proxy.hh"
+#include "helios_index_search.hh"
 #include "my_base.h" /* ha_rows */
 #include "my_compiler.h"
 #include "my_inttypes.h"
@@ -66,12 +66,12 @@
  * @brief State every open handler of one table shares: the lock, the hidden
  * key range, the row-count shards and the cached index statistics.
  */
-class LineairDB_share : public Handler_share
+class Helios_share : public Handler_share
 {
 public:
   THR_LOCK lock;
-  LineairDB_share();
-  ~LineairDB_share() override { thr_lock_delete(&lock); }
+  Helios_share();
+  ~Helios_share() override { thr_lock_delete(&lock); }
   // Hidden primary keys reserved from the storage server, handed out to every
   // connection of this mysqld that writes to the table. next == end means the
   // range is spent and the next row has to reserve another one.
@@ -117,7 +117,7 @@ public:
   std::unordered_map<std::string, RangeHist> index_hist_;
 };
 
-// LIMIT and direction that a handler range scan may push to LineairDB.
+// LIMIT and direction that a handler range scan may push to Helios.
 // row_limit=0 means keep the scan unbounded and let MySQL apply LIMIT.
 struct RangeScanLimit {
   ha_rows row_limit{0};
@@ -142,27 +142,27 @@ extern bool srv_stats_drift_refresh;
 enum ReadPath { kReadPathRow = 0, kReadPathPlan = 1 };
 extern ulong srv_read_path;
 
-namespace lineairdb {
+namespace helios {
 
 /**
- * @brief Return the THD-scoped RPC proxy shared by LineairDB engines.
+ * @brief Return the THD-scoped RPC proxy shared by Helios engines.
  *
  * The primary handler owns the connection context. Secondary handlers use this
- * entry point so both engines talk to the same LineairDB server for a session.
+ * entry point so both engines talk to the same Helios server for a session.
  */
-std::shared_ptr<LineairDBProxy> acquire_shared_proxy(THD *thd);
+std::shared_ptr<HeliosProxy> acquire_shared_proxy(THD *thd);
 
-}  // namespace lineairdb
+}  // namespace helios
 
 /** @brief
   Class definition for the storage engine
 */
-class ha_lineairdb : public handler
+class ha_helios : public handler
 {
   THR_LOCK_DATA lock;           ///< MySQL lock
-  LineairDB_share *share;       ///< Shared lock info
-  LineairDB_share *get_share(); ///< Get the share
-  LineairDBProxy *get_proxy();
+  Helios_share *share;       ///< Shared lock info
+  Helios_share *get_share(); ///< Get the share
+  HeliosProxy *get_proxy();
 
 private:
   std::string db_table_name;
@@ -201,7 +201,7 @@ private:
   bool materialized_scan_truncated_{false};
   std::string truncated_scan_end_;
 
-  // Per-statement memo for set_fields_from_lineairdb, refreshed on query_id
+  // Per-statement memo for set_fields_from_helios, refreshed on query_id
   // change.
   uint64_t serve_memo_query_id_{0};
 
@@ -230,21 +230,21 @@ private:
   static constexpr size_t kInsertProbeBatch = 1024;
   // Resolve the queued keys against the storage. Returns the error for a key
   // that already holds a row, 0 when every one of them is free.
-  int flush_insert_probe(LineairDBTransaction *tx);
+  int flush_insert_probe(HeliosTransaction *tx);
   // The error for a duplicate the storage reported: the client's to fix only
   // when every read this transaction took still holds, else a lost race.
-  int duplicate_or_conflict(LineairDBTransaction *tx, uint index);
+  int duplicate_or_conflict(HeliosTransaction *tx, uint index);
   // True while the session wants UNIQUE keys resolved by the statement.
   bool checks_unique_keys();
   // Refuse a UNIQUE secondary key another row already holds: this
   // transaction's own write settles it with no request, the storage with one
   // probe. 0 when the key is free for primary_key.
-  int check_unique_secondary_key(LineairDBTransaction *tx, uint index,
+  int check_unique_secondary_key(HeliosTransaction *tx, uint index,
                                  const KEY &key_info,
                                  const std::string &secondary_key,
                                  const std::string &primary_key);
   std::string write_buffer_;
-  LineairDBField ldbField;
+  HeliosField row_codec_;
   MEM_ROOT blobroot;
 
   // State for buffer fetching
@@ -256,26 +256,26 @@ private:
 
   void store_primary_key_in_ref(const std::string &primary_key);
   std::string extract_primary_key_from_ref(const uchar *pos) const;
-  int generate_hidden_primary_key(LineairDBTransaction *tx, std::string *key);
+  int generate_hidden_primary_key(HeliosTransaction *tx, std::string *key);
   std::string serialize_hidden_primary_key(uint64_t row_id) const;
   bool materialize_scan();
 
   // Refill the rows buffered for index_next()/index_prev().
-  bool refill_index_cursor(LineairDBTransaction *tx);
+  bool refill_index_cursor(HeliosTransaction *tx);
   // Materialize the rest of a range whose staged window ran out. False when
   // the range really ended (or the transaction is gone).
-  bool refill_truncated_scan(LineairDBTransaction *tx);
+  bool refill_truncated_scan(HeliosTransaction *tx);
 
   void reset_index_search_buffers();
 
 public:
-  ha_lineairdb(handlerton *hton, TABLE_SHARE *table_arg);
-  ~ha_lineairdb() override = default;
+  ha_helios(handlerton *hton, TABLE_SHARE *table_arg);
+  ~ha_helios() override = default;
 
   /** @brief
     The name that will be used for display purposes.
    */
-  const char *table_type() const override { return "LineairDB"; }
+  const char *table_type() const override { return "Helios"; }
 
   /**
     Replace key algorithm with one supported by SE, return the default key
@@ -371,7 +371,7 @@ public:
    * @brief Helios cost model for the MySQL 8.0 Cost_estimate API.
    *
    * @details The join planner uses these methods for scan-vs-ref and
-   * join-order decisions. LineairDB does not pay page-I/O cost like InnoDB;
+   * join-order decisions. Helios does not pay page-I/O cost like InnoDB;
    * the dominant costs are RPC round trips, transferred bytes, row
    * materialization, and batched remote probes.
    *
@@ -419,7 +419,7 @@ public:
     return v;
   }
 
-  // C_remote: one row scanned on the LineairDB server side. 0.05 models remote
+  // C_remote: one row scanned on the Helios server side. 0.05 models remote
   // scan work as lighter than decoding a full row on the MySQL side.
   static double kC_remote() {
     static const double v = helios_cost_param("HELIOS_C_REMOTE", 0.05);
@@ -497,7 +497,7 @@ public:
 
   /*
     Handler method declarations. Implementations are split by behavior across
-    the storage/lineairdb translation units.
+    the storage/helios translation units.
 
     Most of these methods are not obligatory; if an override is omitted, MySQL
     treats the capability as not implemented.
@@ -587,7 +587,7 @@ public:
                    const dd::Table *from_table_def,
                    dd::Table *to_table_def) override;
   /**
-   * @brief Create the table and its secondary indexes in LineairDB storage.
+   * @brief Create the table and its secondary indexes in Helios storage.
    */
   int create(const char *name, TABLE *form, HA_CREATE_INFO *create_info,
              dd::Table *table_def) override; ///< required
@@ -615,7 +615,7 @@ public:
    *
    * On the row read path, these methods clear HA_MRR_USE_DEFAULT_IMPL for
    * primary-key lookup ranges so multi_range_read_init() can batch all keys
-   * into one LineairDB RPC. The plan path keeps MySQL's default DS-MRR path,
+   * into one Helios RPC. The plan path keeps MySQL's default DS-MRR path,
    * where a staged window serves the rows.
    */
   ha_rows multi_range_read_info_const(
@@ -629,7 +629,7 @@ public:
   /**
    * @brief Batch full primary-key point ranges or delegate to MySQL DS-MRR.
    *
-   * Only exact full-key ranges can use LineairDBTransaction::batch_read().
+   * Only exact full-key ranges can use HeliosTransaction::batch_read().
    * Partial-key and inequality ranges fall back to the default MRR
    * implementation.
    */
@@ -660,8 +660,8 @@ private:
   static bool statement_uses_read_plan(THD *thd);
   static std::string server_connection_host();
   static int server_connection_port();
-  LineairDBTransaction *new_transaction(THD *thd);
-  LineairDBTransaction *active_transaction(THD *thd) const;
+  HeliosTransaction *new_transaction(THD *thd);
+  HeliosTransaction *active_transaction(THD *thd) const;
   /**
    * @brief The THD's transaction, created on first handler access.
    *
@@ -669,7 +669,7 @@ private:
    * semijoin or subquery materialization) before external_lock; the
    * transaction starts at the first of those calls, as InnoDB's does.
    */
-  LineairDBTransaction *&
+  HeliosTransaction *&
   get_transaction(THD *thd);
   /**
    * @brief Map an aborted transaction to a handler errno: cache miss to
@@ -678,7 +678,7 @@ private:
    * @param duplicate_is_conflict Report a duplicate as a lost race instead,
    *   for a statement that already gave its row-time duplicate answer.
    */
-  int abort_errno(LineairDBTransaction *tx,
+  int abort_errno(HeliosTransaction *tx,
                   bool duplicate_is_conflict = false);
 
   // Key conversion helpers
@@ -687,9 +687,9 @@ private:
                                           enum_field_types mysql_type);
   static std::string encode_string_key(const uchar *data, size_t len);
 
-  static unsigned char key_part_type_tag(LineairDBFieldType type);
+  static unsigned char key_part_type_tag(HeliosFieldType type);
   static void append_key_part_encoding(std::string &out, bool is_null,
-                                       LineairDBFieldType type,
+                                       HeliosFieldType type,
                                        const std::string &payload);
   static std::string build_prefix_range_end(const std::string &prefix);
   static uint count_used_key_parts(const KEY *key_info, key_part_map keypart_map);
@@ -701,7 +701,7 @@ private:
    * @return 0 with the row in buf, HA_ERR_KEY_NOT_FOUND when the position is
    *   past the result, else the handler error of the row fetch.
    */
-  int fetch_and_set_current_result(uchar *buf, LineairDBTransaction *tx);
+  int fetch_and_set_current_result(uchar *buf, HeliosTransaction *tx);
 
   /**
    * @brief Turns one index lookup (key, keypart_map, find_flag) into
@@ -721,19 +721,19 @@ private:
    *   The execute_* methods below are the per-IndexSearchOp bodies with the
    *   same contract.
    */
-  int execute_plan(uchar *buf, LineairDBTransaction *tx);
-  int execute_index_first(uchar *buf, LineairDBTransaction *tx);
-  int execute_unique_point(uchar *buf, LineairDBTransaction *tx);
-  int execute_same_key_materialize(uchar *buf, LineairDBTransaction *tx);
-  int execute_prefix_first(uchar *buf, LineairDBTransaction *tx);
-  int execute_range_materialize(uchar *buf, LineairDBTransaction *tx);
-  int execute_prev_key(uchar *buf, LineairDBTransaction *tx);
-  int execute_prefix_last(uchar *buf, LineairDBTransaction *tx);
+  int execute_plan(uchar *buf, HeliosTransaction *tx);
+  int execute_index_first(uchar *buf, HeliosTransaction *tx);
+  int execute_unique_point(uchar *buf, HeliosTransaction *tx);
+  int execute_same_key_materialize(uchar *buf, HeliosTransaction *tx);
+  int execute_prefix_first(uchar *buf, HeliosTransaction *tx);
+  int execute_range_materialize(uchar *buf, HeliosTransaction *tx);
+  int execute_prev_key(uchar *buf, HeliosTransaction *tx);
+  int execute_prefix_last(uchar *buf, HeliosTransaction *tx);
   // Fetches the primary row of every key in secondary_index_results_ with one
   // batch read into secondary_index_payloads_.
-  void batch_fetch_secondary_payloads(LineairDBTransaction *tx);
+  void batch_fetch_secondary_payloads(HeliosTransaction *tx);
 
-  std::string convert_key_to_ldbformat(const uchar *key, key_part_map keypart_map);
+  std::string encode_key(const uchar *key, key_part_map keypart_map);
   /**
    * @brief Serializes the field's current value in the order-preserving key
    * encoding (null marker, type tag, payload) shared by every key path.
@@ -748,8 +748,8 @@ private:
    *   Retryable when the server could not be reached, non-retryable when it
    *   refused. `tx` is marked aborted on failure and *key is left untouched.
    */
-  int extract_key(const uchar *buf, LineairDBTransaction *tx, std::string *key);
-  int autogenerate_key(LineairDBTransaction *tx, std::string *key);
+  int extract_key(const uchar *buf, HeliosTransaction *tx, std::string *key);
+  int autogenerate_key(HeliosTransaction *tx, std::string *key);
   std::string extract_key_from_mysql(const uchar *row_buffer);
 
   /**
@@ -759,7 +759,7 @@ private:
    * transaction bounded while preserving the normal secondary-index write path.
    * `ops` is cleared before return.
    */
-  bool backfill_commit_chunk(std::vector<LineairDBProxy::WriteOp> &ops);
+  bool backfill_commit_chunk(std::vector<HeliosProxy::WriteOp> &ops);
 
   /**
    * @brief Backfill the indexes in `specs` in one decode, committed on
@@ -786,12 +786,12 @@ private:
   void set_key_and_key_part_info(const TABLE *const table);
 
   bool store_blob_to_field(Field **field);
-  int set_fields_from_lineairdb(uchar *buf, const std::byte *const read_buf,
+  int set_fields_from_helios(uchar *buf, const std::byte *const read_buf,
                                 const size_t read_buf_size);
 
   // rec_per_key helpers
-  bool seed_row_count_from_cache(LineairDBProxy *proxy);
-  void load_index_stats_from_cache(LineairDBProxy *proxy);
+  bool seed_row_count_from_cache(HeliosProxy *proxy);
+  void load_index_stats_from_cache(HeliosProxy *proxy);
   void mark_stale_index_ndv_for_select();
   void seed_optimizer_stats();
   void set_generic_rec_per_key(KEY *key, uint key_parts, bool is_primary);
@@ -800,4 +800,4 @@ private:
   uint calculate_key_parts_from_length(KEY *key, uint key_length);
 };
 
-#endif /* HA_LINEAIRDB_H */
+#endif /* HA_HELIOS_H */

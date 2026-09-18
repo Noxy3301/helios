@@ -28,15 +28,15 @@ INCLUDE(${CMAKE_SOURCE_DIR}/cmake/protobuf.cmake)
 # Generate protobuf library
 set(PROTO_DIR "${CMAKE_CURRENT_SOURCE_DIR}/proto")
 MYSQL_PROTOBUF_GENERATE_CPP_LIBRARY(
-  lineairdb_proto
-  ${PROTO_DIR}/lineairdb.proto)
+  helios_proto
+  ${PROTO_DIR}/helios.proto)
 
 # Add include path for generated protobuf header files
 include_directories(${CMAKE_CURRENT_BINARY_DIR})
 
-set(LINEAIRDB_SOURCES ha_lineairdb.cc ha_lineairdb.hh
-                      ha_lineairdb_columnar.cc
-                      ha_lineairdb_columnar.hh
+set(HELIOS_SOURCES ha_helios.cc ha_helios.hh
+                      ha_helios_columnar.cc
+                      ha_helios_columnar.hh
                       duckdb_request_builder.cc
                       duckdb_request_builder.hh
                       ddl.cc
@@ -45,22 +45,22 @@ set(LINEAIRDB_SOURCES ha_lineairdb.cc ha_lineairdb.hh
                       table_scan.cc
                       multi_range_read.cc
                       optimizer_stats.cc
-                      lineairdb_field.cc lineairdb_field.hh
-                      lineairdb_transaction.cc lineairdb_transaction.hh
-                      lineairdb_proxy.cc lineairdb_proxy.hh
-                      lineairdb_keyenc.cc lineairdb_keyenc.hh
+                      helios_field.cc helios_field.hh
+                      helios_transaction.cc helios_transaction.hh
+                      helios_proxy.cc helios_proxy.hh
+                      helios_keyenc.cc helios_keyenc.hh
                       row_codec.cc
-                      lineairdb_index_search.cc lineairdb_index_search.hh
-                      lineairdb_prefetch.cc lineairdb_prefetch.hh
-                      lineairdb_autogen.cc lineairdb_autogen.hh
+                      helios_index_search.cc helios_index_search.hh
+                      helios_prefetch.cc helios_prefetch.hh
+                      helios_autogen.cc helios_autogen.hh
                       rpc_trace.cc rpc_trace.hh)
 add_definitions(-DMYSQL_SERVER)
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wno-error -Wextra -mcx16 -fPIC")
 
-if(WITH_LINEAIRDB_STORAGE_ENGINE AND NOT WITHOUT_LINEAIRDB_STORAGE_ENGINE)
-  mysql_add_plugin(lineairdb_storage_engine ${LINEAIRDB_SOURCES} STORAGE_ENGINE
-                   DEFAULT LINK_LIBRARIES lineairdb_proto ext::libprotobuf extra::rapidjson)
-elseif(NOT WITHOUT_LINEAIRDB_STORAGE_ENGINE)
-  mysql_add_plugin(lineairdb_storage_engine ${LINEAIRDB_SOURCES} STORAGE_ENGINE
-                   MODULE_ONLY LINK_LIBRARIES lineairdb_proto ext::libprotobuf extra::rapidjson)
+if(WITH_HELIOS_STORAGE_ENGINE AND NOT WITHOUT_HELIOS_STORAGE_ENGINE)
+  mysql_add_plugin(helios_storage_engine ${HELIOS_SOURCES} STORAGE_ENGINE
+                   DEFAULT LINK_LIBRARIES helios_proto ext::libprotobuf extra::rapidjson)
+elseif(NOT WITHOUT_HELIOS_STORAGE_ENGINE)
+  mysql_add_plugin(helios_storage_engine ${HELIOS_SOURCES} STORAGE_ENGINE
+                   MODULE_ONLY LINK_LIBRARIES helios_proto ext::libprotobuf extra::rapidjson)
 endif()

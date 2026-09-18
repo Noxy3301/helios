@@ -1,4 +1,4 @@
-#include "storage/lineairdb/ha_lineairdb.hh"
+#include "storage/helios/ha_helios.hh"
 
 #include <cstddef>
 #include <cstdint>
@@ -11,7 +11,7 @@
 #include "sql/sql_lex.h"
 #include "sql/table.h"
 
-// MySQL record <-> LineairDB row-byte conversion helpers used by DML and scan
+// MySQL record <-> Helios row-byte conversion helpers used by DML and scan
 // paths.
 
 namespace {
@@ -45,9 +45,9 @@ class MoveFieldOffset {
 
 }  // namespace
 
-void ha_lineairdb::set_write_buffer(uchar *buf) {
-  ldbField.set_null_field(buf, table->s->null_bytes);
-  write_buffer_ = ldbField.get_null_field();
+void ha_helios::set_write_buffer(uchar *buf) {
+  row_codec_.set_null_field(buf, table->s->null_bytes);
+  write_buffer_ = row_codec_.get_null_field();
 
   String attribute;
   attribute.set_charset(&my_charset_bin);
@@ -55,22 +55,22 @@ void ha_lineairdb::set_write_buffer(uchar *buf) {
   my_bitmap_map *org_bitmap = tmp_use_all_columns(table, table->read_set);
   for (Field **field = table->field; *field; field++) {
     if ((*field)->is_nullable() && (*field)->is_null()) {
-      ldbField.set_lineairdb_field("", 0);
+      row_codec_.set_helios_field("", 0);
     } else {
       attribute.length(0);
       (*field)->val_str(&attribute, &attribute);
-      ldbField.set_lineairdb_field(attribute.c_ptr(), attribute.length());
+      row_codec_.set_helios_field(attribute.c_ptr(), attribute.length());
     }
-    write_buffer_ += ldbField.get_lineairdb_field();
+    write_buffer_ += row_codec_.get_helios_field();
   }
   tmp_restore_column_map(table->read_set, org_bitmap);
 }
 
-bool ha_lineairdb::is_primary_key_exists() {
+bool ha_helios::is_primary_key_exists() {
   return table->s->primary_key != MAX_KEY;
 }
 
-bool ha_lineairdb::store_blob_to_field(Field **field) {
+bool ha_helios::store_blob_to_field(Field **field) {
   if ((*field)->is_flag_set(BLOB_FLAG)) {
     Field_blob *blob_field = down_cast<Field_blob *>(*field);
     size_t length = blob_field->get_length();
@@ -84,17 +84,17 @@ bool ha_lineairdb::store_blob_to_field(Field **field) {
   return false;
 }
 
-int ha_lineairdb::set_fields_from_lineairdb(uchar *buf,
+int ha_helios::set_fields_from_helios(uchar *buf,
                                             const std::byte *const read_buf,
                                             const size_t read_buf_size) {
   MoveFieldOffset field_offset(table, buf - table->record[0]);
 
   // Clear BLOB data from the previous row.
   blobroot.ClearForReuse();
-  ldbField.make_mysql_table_row(read_buf, read_buf_size);
+  row_codec_.make_mysql_table_row(read_buf, read_buf_size);
   // For each 8 potentially-null columns, buf holds 1 byte flag at the front.
   // MySQL starts these bytes at 0xff and clears one bit per non-null column.
-  const auto nullFlags = ldbField.get_null_flags();
+  const auto nullFlags = row_codec_.get_null_flags();
   for (size_t i = 0; i < nullFlags.size(); i++) {
     buf[i] = static_cast<uchar>(nullFlags[i]);
   }
@@ -124,8 +124,8 @@ int ha_lineairdb::set_fields_from_lineairdb(uchar *buf,
   // Full rows map parsed column index directly to TABLE::field[].
   size_t columnIndex = 0;
   for (Field **field = table->field; *field; field++) {
-    if (columnIndex >= ldbField.get_row_size()) break;
-    const auto mysqlFieldValue = ldbField.get_column_of_row(columnIndex++);
+    if (columnIndex >= row_codec_.get_row_size()) break;
+    const auto mysqlFieldValue = row_codec_.get_column_of_row(columnIndex++);
     if (can_skip_unread_fields &&
         !bitmap_is_set(table->read_set, (*field)->field_index())) {
       continue;

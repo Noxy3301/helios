@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-JOIN Query Test for LineairDB Storage Engine
+JOIN Query Test for Helios Storage Engine
 
 This test file validates JOIN operations between tables using:
 1. PRIMARY KEY joins
@@ -31,7 +31,7 @@ def reset_join_tables(db, cursor):
             i_id INT NOT NULL,
             quantity INT,
             PRIMARY KEY (w_id, i_id)
-        ) ENGINE=LINEAIRDB
+        ) ENGINE=HELIOS
     ''')
     
     # Order table (like TPC-C bmsql_order_line)
@@ -40,7 +40,7 @@ def reset_join_tables(db, cursor):
             o_id INT NOT NULL,
             i_id INT NOT NULL,
             PRIMARY KEY (o_id)
-        ) ENGINE=LINEAIRDB
+        ) ENGINE=HELIOS
     ''')
     
     db.commit()
@@ -112,7 +112,7 @@ def test_secondary_index_join(db, cursor):
             quantity INT,
             PRIMARY KEY (w_id, i_id),
             INDEX idx_stock_item (i_id)
-        ) ENGINE=LINEAIRDB
+        ) ENGINE=HELIOS
     ''')
     
     cursor.execute('''
@@ -121,7 +121,7 @@ def test_secondary_index_join(db, cursor):
             i_id INT NOT NULL,
             PRIMARY KEY (o_id),
             INDEX idx_order_item (i_id)
-        ) ENGINE=LINEAIRDB
+        ) ENGINE=HELIOS
     ''')
     db.commit()
     
@@ -266,7 +266,7 @@ def test_multiple_table_scan(db, cursor):
 def run_all_tests(db, cursor):
     """Run all JOIN tests"""
     print("=" * 60)
-    print("LineairDB Storage Engine - JOIN Test Suite")
+    print("Helios Storage Engine - JOIN Test Suite")
     print("=" * 60)
     
     reset_join_tables(db, cursor)
@@ -302,7 +302,7 @@ def main():
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description='JOIN Query Test for LineairDB')
+    parser = argparse.ArgumentParser(description='JOIN Query Test for Helios')
     parser.add_argument('--user', metavar='user', type=str,
                         help='MySQL user name',
                         default="root")

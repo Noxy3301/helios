@@ -172,7 +172,7 @@ def test_acknowledgement_follows_the_fdatasync(work_dir):
         sql("CREATE DATABASE IF NOT EXISTS dur;")
         sql("USE dur; DROP TABLE IF EXISTS ordering;"
             " CREATE TABLE ordering (id INT PRIMARY KEY, v INT)"
-            " ENGINE=lineairdb;")
+            " ENGINE=helios;")
         # Let every flush the DDL caused reach the point, then clear them.
         time.sleep(1.0)
         released = drain_arrivals(arrived_r, release_w)
@@ -254,7 +254,7 @@ def test_acknowledged_rows_survive_a_process_crash(work_dir):
         sql("CREATE DATABASE IF NOT EXISTS dur;")
         sql("USE dur; DROP TABLE IF EXISTS crash;"
             " CREATE TABLE crash (id INT PRIMARY KEY, v INT)"
-            " ENGINE=lineairdb;")
+            " ENGINE=helios;")
         acknowledged = []
         for row in range(1, ROWS + 1):
             sql(f"USE dur; INSERT INTO crash VALUES ({row}, {row * 10});")
@@ -307,7 +307,7 @@ def test_a_failed_fdatasync_is_never_acknowledged(work_dir):
         sql("CREATE DATABASE IF NOT EXISTS dur;")
         sql("USE dur; DROP TABLE IF EXISTS failed_sync;"
             " CREATE TABLE failed_sync (id INT PRIMARY KEY, v INT)"
-            " ENGINE=lineairdb;")
+            " ENGINE=helios;")
 
         committer = Committer("USE dur; INSERT INTO failed_sync VALUES (1, 1);")
         committer.start()

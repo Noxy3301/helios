@@ -11,11 +11,11 @@ def test_delete_primary_key(db, cursor):
 
     pk_table = f"test_delete_pk_{int(time.time() * 1000000)}"
     cursor.execute(
-        f'''CREATE TABLE ha_lineairdb_test.{pk_table} (
+        f'''CREATE TABLE ha_helios_test.{pk_table} (
         id INT PRIMARY KEY,
         name VARCHAR(50),
         age INT
-    ) ENGINE = LineairDB'''
+    ) ENGINE = Helios'''
     )
     db.commit()
 
@@ -25,15 +25,15 @@ def test_delete_primary_key(db, cursor):
         (3, "carol", 27),
     ]
     cursor.executemany(
-        f'INSERT INTO ha_lineairdb_test.{pk_table} (id, name, age) VALUES (%s, %s, %s)',
+        f'INSERT INTO ha_helios_test.{pk_table} (id, name, age) VALUES (%s, %s, %s)',
         pk_rows,
     )
     db.commit()
 
-    cursor.execute(f'DELETE FROM ha_lineairdb_test.{pk_table} WHERE id = 2')
+    cursor.execute(f'DELETE FROM ha_helios_test.{pk_table} WHERE id = 2')
     db.commit()
 
-    cursor.execute(f'SELECT id, name FROM ha_lineairdb_test.{pk_table} ORDER BY id')
+    cursor.execute(f'SELECT id, name FROM ha_helios_test.{pk_table} ORDER BY id')
     remaining_pk = cursor.fetchall()
     if remaining_pk != [(1, "alice"), (3, "carol")]:
         print("\tCheck 3 Failed")
@@ -46,23 +46,23 @@ def test_delete_primary_key(db, cursor):
 def test_hidden_primary_key(db, cursor):
     print("DELETE TEST (hidden primary key)")
     table_name = f"test_delete_hidden_pk_{int(time.time() * 1000000)}"
-    cursor.execute(f'''CREATE TABLE ha_lineairdb_test.{table_name} (
+    cursor.execute(f'''CREATE TABLE ha_helios_test.{table_name} (
         id INT,
         name VARCHAR(50),
         age INT
-    ) ENGINE = LineairDB'''
+    ) ENGINE = Helios'''
     )
     db.commit()
 
-    cursor.execute(f'INSERT INTO ha_lineairdb_test.{table_name} (id, name, age) VALUES (1, "alice", 25)')
-    cursor.execute(f'INSERT INTO ha_lineairdb_test.{table_name} (id, name, age) VALUES (2, "bob", 30)')
-    cursor.execute(f'INSERT INTO ha_lineairdb_test.{table_name} (id, name, age) VALUES (3, "carol", 27)')
+    cursor.execute(f'INSERT INTO ha_helios_test.{table_name} (id, name, age) VALUES (1, "alice", 25)')
+    cursor.execute(f'INSERT INTO ha_helios_test.{table_name} (id, name, age) VALUES (2, "bob", 30)')
+    cursor.execute(f'INSERT INTO ha_helios_test.{table_name} (id, name, age) VALUES (3, "carol", 27)')
     db.commit()
 
-    cursor.execute(f'DELETE FROM ha_lineairdb_test.{table_name} WHERE id = 2')
+    cursor.execute(f'DELETE FROM ha_helios_test.{table_name} WHERE id = 2')
     db.commit()
 
-    cursor.execute(f'SELECT id, name FROM ha_lineairdb_test.{table_name} ORDER BY id')
+    cursor.execute(f'SELECT id, name FROM ha_helios_test.{table_name} ORDER BY id')
     remaining_hidden_pk = cursor.fetchall()
     if remaining_hidden_pk != [(1, "alice"), (3, "carol")]:
         print("\tCheck 3 Failed")
@@ -75,12 +75,12 @@ def test_hidden_primary_key(db, cursor):
 def test_delete_secondary_index(db, cursor):
     print("DELETE TEST (Secondary Index)")
     table_name = f"test_delete_sec_idx_{int(time.time() * 1000000)}"
-    cursor.execute(f'''CREATE TABLE ha_lineairdb_test.{table_name} (
+    cursor.execute(f'''CREATE TABLE ha_helios_test.{table_name} (
         id INT PRIMARY KEY,
         name VARCHAR(50) NOT NULL,
         age INT,
         INDEX name_idx (name)
-    ) ENGINE = LineairDB'''
+    ) ENGINE = Helios'''
     )
     db.commit()
 
@@ -90,15 +90,15 @@ def test_delete_secondary_index(db, cursor):
         (3, "alice", 27),
     ]
     cursor.executemany(
-        f'INSERT INTO ha_lineairdb_test.{table_name} (id, name, age) VALUES (%s, %s, %s)',
+        f'INSERT INTO ha_helios_test.{table_name} (id, name, age) VALUES (%s, %s, %s)',
         rows,
     )
     db.commit()
 
-    cursor.execute(f'DELETE FROM ha_lineairdb_test.{table_name} WHERE name = "alice"')
+    cursor.execute(f'DELETE FROM ha_helios_test.{table_name} WHERE name = "alice"')
     db.commit()
 
-    cursor.execute(f'SELECT id, name FROM ha_lineairdb_test.{table_name} ORDER BY id')
+    cursor.execute(f'SELECT id, name FROM ha_helios_test.{table_name} ORDER BY id')
     remaining = cursor.fetchall()
     
     if remaining != [(2, "bob")]:

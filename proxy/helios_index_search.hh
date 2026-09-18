@@ -1,8 +1,8 @@
-// lineairdb_index_search.hh
-// LineairDB Storage Engine: A structure to hold the search plan
+// helios_index_search.hh
+// Helios Storage Engine: A structure to hold the search plan
 
-#ifndef LINEAIRDB_INDEX_SEARCH_HH
-#define LINEAIRDB_INDEX_SEARCH_HH
+#ifndef HELIOS_INDEX_SEARCH_HH
+#define HELIOS_INDEX_SEARCH_HH
 
 #include <string>
 #include <optional>
@@ -61,4 +61,4 @@ struct IndexSearchPlan
     }
 };
 
-#endif // LINEAIRDB_INDEX_SEARCH_HH
+#endif // HELIOS_INDEX_SEARCH_HH

@@ -213,7 +213,7 @@ def sql(statements):
 def create_table(name):
     sql("CREATE DATABASE IF NOT EXISTS dur;")
     sql(f"USE dur; DROP TABLE IF EXISTS {name};"
-        f" CREATE TABLE {name} (id INT PRIMARY KEY, v INT) ENGINE=lineairdb;")
+        f" CREATE TABLE {name} (id INT PRIMARY KEY, v INT) ENGINE=helios;")
 
 
 def start_switch(mode):

@@ -1,11 +1,11 @@
-#ifndef LINEAIRDB_PREFETCH_HH
-#define LINEAIRDB_PREFETCH_HH
+#ifndef HELIOS_PREFETCH_HH
+#define HELIOS_PREFETCH_HH
 
 #include <cstdint>
 #include <string>
 
 class THD;
-class LineairDBTransaction;
+class HeliosTransaction;
 struct IndexSearchPlan;
 struct TABLE;
 
@@ -25,7 +25,7 @@ bool thd_can_use_prefetch(THD *thd);
  * @param tx  Transaction to prefetch into.
  */
 void maybe_prefetch_for_transaction(THD *thd,
-                                      LineairDBTransaction *tx);
+                                      HeliosTransaction *tx);
 
 /**
  * @brief Statement-scoped prefetch: auto-generate the read plan from the QEP,
@@ -44,7 +44,7 @@ void maybe_prefetch_for_transaction(THD *thd,
  *         aborted the transaction, HA_ERR_NO_CONNECTION when it lost the
  *         connection. Propagate any non-zero return to fail the statement.
  */
-int maybe_prefetch_for_statement(THD *thd, LineairDBTransaction *tx,
+int maybe_prefetch_for_statement(THD *thd, HeliosTransaction *tx,
                                  TABLE *table);
 
 /**
@@ -55,7 +55,7 @@ int maybe_prefetch_for_statement(THD *thd, LineairDBTransaction *tx,
  *        UPDATE/DELETE to the deferred path.
  */
 bool prefetch_needs_legacy_dml_handler(THD *thd,
-                                      LineairDBTransaction *tx);
+                                      HeliosTransaction *tx);
 
 /**
  * @brief Compile and stage a legacy single-table UPDATE/DELETE from its first
@@ -63,7 +63,7 @@ bool prefetch_needs_legacy_dml_handler(THD *thd,
  *        range cannot cover is left to the row path.
  */
 int maybe_prefetch_for_legacy_dml_handler(
-    THD *thd, LineairDBTransaction *tx, TABLE *table, uint index,
+    THD *thd, HeliosTransaction *tx, TABLE *table, uint index,
     const IndexSearchPlan &search);
 
 /**
@@ -78,7 +78,7 @@ int maybe_prefetch_for_legacy_dml_handler(
  * @return 0 on success or skip (row path / tx-scoped plan active). Non-zero
  *         HA_ERR_* when the staging RPC aborted; propagate it.
  */
-int maybe_prefetch_for_index_tail(THD *thd, LineairDBTransaction *tx,
+int maybe_prefetch_for_index_tail(THD *thd, HeliosTransaction *tx,
                                   const std::string &table_key,
                                   uint64_t window_rows);
 
@@ -93,7 +93,7 @@ int maybe_prefetch_for_index_tail(THD *thd, LineairDBTransaction *tx,
  * @param reason Short human-readable cause, included in the error message.
  * @return HA_ERR_UNSUPPORTED, so the caller can return it directly.
  */
-int reject_unsupported_statement(THD *thd, LineairDBTransaction *tx,
+int reject_unsupported_statement(THD *thd, HeliosTransaction *tx,
                                  const char *reason);
 
 /**
@@ -109,6 +109,6 @@ int reject_unsupported_statement(THD *thd, LineairDBTransaction *tx,
  * @param tx  Transaction whose outcome is inspected; may be null.
  * @return 0 when live or null, else the handler error for the abort.
  */
-int prefetch_abort_errno(THD *thd, LineairDBTransaction *tx);
+int prefetch_abort_errno(THD *thd, HeliosTransaction *tx);
 
-#endif // LINEAIRDB_PREFETCH_HH
+#endif // HELIOS_PREFETCH_HH

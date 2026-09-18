@@ -62,14 +62,14 @@ done
 
 echo "== [4/5] measurement conditions =="
 "$MYSQL" -u root --socket="$SOCKET" -e "
-  SET GLOBAL lineairdb_read_path='plan';
+  SET GLOBAL helios_read_path='plan';
   SET GLOBAL optimizer_switch='batched_key_access=on,mrr_cost_based=off,subquery_to_derived=off';
   SET GLOBAL join_buffer_size=1073741824;"
 
 echo "== [5/5] secondary engine attach =="
 for t in customer lineitem nation orders part partsupp region supplier; do
   "$MYSQL" -u root --socket="$SOCKET" benchbase -e \
-    "ALTER TABLE $t SECONDARY_ENGINE = LINEAIRDB_COLUMNAR; ALTER TABLE $t SECONDARY_LOAD;"
+    "ALTER TABLE $t SECONDARY_ENGINE = HELIOS_COLUMNAR; ALTER TABLE $t SECONDARY_LOAD;"
 done
 
 echo "setup done"

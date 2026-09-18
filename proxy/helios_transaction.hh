@@ -1,5 +1,5 @@
-#ifndef LINEAIRDB_TRANSACTION_HH
-#define LINEAIRDB_TRANSACTION_HH
+#ifndef HELIOS_TRANSACTION_HH
+#define HELIOS_TRANSACTION_HH
 
 #include <map>
 #include <optional>
@@ -11,10 +11,10 @@
 #include "sql/handler.h" /* handler */
 #include "mysql/plugin.h"
 #include "sql/sql_class.h"
-#include "lineairdb_proxy.hh"
+#include "helios_proxy.hh"
 #include "rpc_trace.hh"
 
-class LineairDB_share;
+class Helios_share;
 
 /**
  * @brief The transaction, kept by the query layer.
@@ -27,9 +27,9 @@ class LineairDB_share;
  * Lifetime of this class equals the lifetime of the transaction.
  * The instance of this class is deleted in end_transaction.
  * Set the pointer to this class to nullptr after end_transaction
- * to indicate that LineairDBTransaction is terminated.
+ * to indicate that HeliosTransaction is terminated.
  */
-class LineairDBTransaction
+class HeliosTransaction
 {
 public:
   void choose_table(std::string db_table_name);
@@ -39,7 +39,7 @@ public:
   std::vector<std::pair<bool, std::string>> batch_read(const std::vector<std::string>& keys);
   // Buffer ops built elsewhere (the DDL backfill); the commit installs them.
   void buffer_writes(const std::string& table_name,
-                     const std::vector<LineairDBProxy::WriteOp>& ops);
+                     const std::vector<HeliosProxy::WriteOp>& ops);
   // served_truncated, when given, lets a staged window that holds only the
   // first rows of the range serve an unlimited request; it is set when the
   // result stops at the window and the caller has to fetch the rest.
@@ -122,7 +122,7 @@ public:
   void set_status_to_abort();
   bool end_transaction(bool *transport_error = nullptr,
                        bool *duplicate_key = nullptr);
-  void execute_read_plan(const std::vector<LineairDBProxy::ReadPlanStep>& steps);
+  void execute_read_plan(const std::vector<HeliosProxy::ReadPlanStep>& steps);
 
   // Set when an injected tx-scoped plan (@_tx_plan / DSL) ran at begin, so the
   // statement-scoped autogen path stays out of the way (the two are mutually
@@ -182,19 +182,19 @@ public:
 
   inline bool is_a_single_statement() const { return !isTransaction; }
 
-  void add_rowcount_delta(LineairDB_share *share, const std::string &table_name, int64_t delta);
-  int64_t peek_rowcount_delta(const LineairDB_share *share) const;
+  void add_rowcount_delta(Helios_share *share, const std::string &table_name, int64_t delta);
+  int64_t peek_rowcount_delta(const Helios_share *share) const;
 
   // RPC trace statement boundary; TxRpcTrace dedupes repeated SQL strings.
   void on_stmt_boundary(const std::string& sql) { rpc_trace_.on_stmt(sql); }
 
-  LineairDBTransaction(THD* thd,
-                       LineairDBProxy* lineairdb_proxy,
-                       handlerton* lineairdb_hton);
-  ~LineairDBTransaction() = default;
+  HeliosTransaction(THD* thd,
+                       HeliosProxy* helios_proxy,
+                       handlerton* helios_hton);
+  ~HeliosTransaction() = default;
 
 private:
-  LineairDBProxy* lineairdb_proxy;
+  HeliosProxy* helios_proxy;
   std::string db_table_key;
   THD* thread;
   bool isTransaction;
@@ -222,7 +222,7 @@ private:
   bool duplicate_key_abort_{false};
 
   struct RowCountDelta {
-    LineairDB_share *share;
+    Helios_share *share;
     std::string table_name;
     int64_t delta;
   };
@@ -235,7 +235,7 @@ private:
     std::string value;
     uint64_t tid = 0;
   };
-  // These sets live only inside one LineairDBTransaction.
+  // These sets live only inside one HeliosTransaction.
   // commit/abort deletes the object, so cached rows never cross txs.
 
   // Served-row cache for point reads, keyed by (table_name + '\0' + key).
@@ -259,8 +259,8 @@ private:
 
   // Append-only read sets the commit re-validates: per-key TIDs of base rows,
   // and per-range key lists replayed to catch phantoms.
-  std::vector<LineairDBProxy::ReadEntry> base_row_read_set_;
-  std::vector<LineairDBProxy::RangeReadEntry> range_read_set_;
+  std::vector<HeliosProxy::ReadEntry> base_row_read_set_;
+  std::vector<HeliosProxy::RangeReadEntry> range_read_set_;
 
   struct LocalRangeScanEntry {
     std::string table_name;
@@ -304,7 +304,7 @@ private:
                                    const std::string& end_key);
 
   // Row and secondary-index ops in the order MySQL issued them
-  std::vector<LineairDBProxy::WriteOp> write_buffer_ops_;
+  std::vector<HeliosProxy::WriteOp> write_buffer_ops_;
   // The index entries those ops leave behind: table\x01index -> secondary key
   // -> primary key -> still there. Ordered by secondary key so a probe or a
   // scan asks for one key or one range of it, instead of the walk of the whole
@@ -313,7 +313,7 @@ private:
       std::string,
       std::map<std::string, std::unordered_map<std::string, bool>>>
       pending_index_entries_;
-  void record_index_op(const LineairDBProxy::WriteOp& op);
+  void record_index_op(const HeliosProxy::WriteOp& op);
 
   TxRpcTrace rpc_trace_;
 
@@ -394,4 +394,4 @@ private:
   void register_single_statement_to_mysql();
 };
 
-#endif /* LINEAIRDB_TRANSACTION_HH */
+#endif /* HELIOS_TRANSACTION_HH */

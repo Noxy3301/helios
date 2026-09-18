@@ -82,7 +82,7 @@ uint32_t LengthPrefixBytes(uint32_t length) {
 
 /**
  * @brief Appends one field in the proxy row format (matches
- * proxy/ha_lineairdb_columnar.cc's DecodeRowFields).
+ * proxy/ha_helios_columnar.cc's DecodeRowFields).
  *
  * @details One byte length-width tag (0xFF for a field with no payload),
  * then that many little-endian length bytes, then the payload. A zero-length
@@ -292,7 +292,7 @@ struct ColumnSpec {
  *
  * @details Column metadata comes from the request: the proxy recomputes
  * type/width/scale from TABLE::field[] with the pure function used at CREATE
- * TABLE time (see proxy/lineairdb_field_types.h), matching what the server
+ * TABLE time (see proxy/helios_field_types.h), matching what the server
  * stored while the schema is unchanged.
  */
 struct PaxTableView {

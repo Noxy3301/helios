@@ -1,5 +1,5 @@
-#ifndef LINEAIRDB_AUTOGEN_HH
-#define LINEAIRDB_AUTOGEN_HH
+#ifndef HELIOS_AUTOGEN_HH
+#define HELIOS_AUTOGEN_HH
 
 #include <cstdint>
 #include <string>
@@ -9,8 +9,8 @@
 class THD;
 struct TABLE;
 
-#include "lineairdb_index_search.hh"
-#include "lineairdb_proxy.hh"
+#include "helios_index_search.hh"
+#include "helios_proxy.hh"
 
 struct AccessPath;
 
@@ -28,7 +28,7 @@ struct AccessPath;
  */
 bool autogen_read_plan_from_qep(
     THD *thd, AccessPath *root,
-    std::vector<LineairDBProxy::ReadPlanStep> *out,
+    std::vector<HeliosProxy::ReadPlanStep> *out,
     bool include_inner_units = false);
 
 /**
@@ -39,6 +39,6 @@ bool autogen_read_plan_from_qep(
  */
 bool autogen_read_plan_from_index_search(
     THD *thd, TABLE *table, uint index, const IndexSearchPlan &search,
-    std::vector<LineairDBProxy::ReadPlanStep> *out);
+    std::vector<HeliosProxy::ReadPlanStep> *out);
 
 #endif

@@ -14,7 +14,7 @@ def tx1_select_for_update(user, password):
         cursor.execute("BEGIN")
         
         print("[T1] SELECT ... FOR UPDATE (locking row 'alice')")
-        cursor.execute("SELECT title, content FROM ha_lineairdb_test.items WHERE title='alice' FOR UPDATE")
+        cursor.execute("SELECT title, content FROM ha_helios_test.items WHERE title='alice' FOR UPDATE")
         rows = cursor.fetchall()
         print(f"[T1] Result: {rows}")
         
@@ -41,14 +41,14 @@ def tx2_update(user, password):
         start_time = time.time()
         
         # Execute update
-        cursor.execute("UPDATE ha_lineairdb_test.items SET content='updated_by_t2' WHERE title='alice'")
+        cursor.execute("UPDATE ha_helios_test.items SET content='updated_by_t2' WHERE title='alice'")
         
         end_time = time.time()
         elapsed = end_time - start_time
         print(f"[T2] UPDATE finished. Elapsed time: {elapsed:.4f} sec")
         
         if elapsed < 1.0:
-             print("[T2] Result: Non-blocking (Fast) - Expected for LineairDB")
+             print("[T2] Result: Non-blocking (Fast) - Expected for Helios")
         else:
              print("[T2] Result: Blocking (Slow) - Standard pessimistic locking behavior")
 
@@ -63,7 +63,7 @@ def test_for_update(db, cursor, args):
     
     # Insert test data
     print("Initializing data...")
-    cursor.execute("INSERT INTO ha_lineairdb_test.items (title, content) VALUES ('alice', 'initial_content')")
+    cursor.execute("INSERT INTO ha_helios_test.items (title, content) VALUES ('alice', 'initial_content')")
     db.commit()
     
     # Create threads

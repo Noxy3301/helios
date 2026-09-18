@@ -93,7 +93,7 @@
     _config_dir: ~/helios/bench/config
     # Interface whose ENA queue count bench_aws.py raises at launch
     ena_rss_interface: ens5
-    mysql_engine: lineairdb
+    mysql_engine: helios
     # InnoDB persistent stats are sampled, so a post-load ANALYZE refreshes them;
     # Helios defaults to false and bench_aws.py turns it on for --tx-plan runs
     bench_analyze: "{{ mysql_engine == 'innodb' }}"

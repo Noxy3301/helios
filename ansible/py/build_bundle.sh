@@ -17,7 +17,7 @@ req() { [ -e "$1" ] || { echo "ERROR: missing $1" >&2; exit 1; }; }
 req "$HELIOS/build/runtime_output_directory/mysqld"
 req "$HELIOS/build/runtime_output_directory/mysql"
 req "$HELIOS/build/runtime_output_directory/mysqladmin"
-req "$HELIOS/build/plugin_output_directory/ha_lineairdb_storage_engine.so"
+req "$HELIOS/build/plugin_output_directory/ha_helios_storage_engine.so"
 req "$HELIOS/build/library_output_directory/libprotobuf-lite.so.24.4.0"
 req "$HELIOS/build/library_output_directory/libprotobuf.so.24.4.0"
 req "$HELIOS/build/share/english/errmsg.sys"
@@ -48,7 +48,7 @@ mkdir -p \
 # --- mysqld / client (query node) ------------------------------------------------
 cp "$HELIOS/build/runtime_output_directory/"{mysqld,mysql,mysqladmin} \
    "$B/build/runtime_output_directory/"
-cp "$HELIOS/build/plugin_output_directory/ha_lineairdb_storage_engine.so" \
+cp "$HELIOS/build/plugin_output_directory/ha_helios_storage_engine.so" \
    "$B/build/plugin_output_directory/"
 cp "$HELIOS/build/library_output_directory/"{libprotobuf-lite.so.24.4.0,libprotobuf.so.24.4.0} \
    "$B/build/library_output_directory/"
@@ -123,7 +123,7 @@ check_ldd() {
   fi
 }
 check_ldd "$B/build/runtime_output_directory/mysqld"
-check_ldd "$B/build/plugin_output_directory/ha_lineairdb_storage_engine.so"
+check_ldd "$B/build/plugin_output_directory/ha_helios_storage_engine.so"
 check_ldd "$B/build/server/helios-storage"
 
 # --- tar -----------------------------------------------------------------------

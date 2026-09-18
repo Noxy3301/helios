@@ -1,19 +1,19 @@
-#include "storage/lineairdb/ha_lineairdb.hh"
+#include "storage/helios/ha_helios.hh"
 
 #include <algorithm>
 #include <string>
 #include <utility>
 
-#include "lineairdb_prefetch.hh"
+#include "helios_prefetch.hh"
 #include "my_dbug.h"
 #include "sql/key.h"
 #include "sql/table.h"
 
 // Handler index-access entry points. These methods translate MySQL index
-// cursor operations into LineairDB primary/secondary range reads and consume
+// cursor operations into Helios primary/secondary range reads and consume
 // the materialized result buffers populated by the search planner.
 
-void ha_lineairdb::reset_index_search_buffers() {
+void ha_helios::reset_index_search_buffers() {
   secondary_index_results_.clear();
   secondary_index_payloads_.clear();
   current_position_in_index_ = 0;
@@ -27,7 +27,7 @@ void ha_lineairdb::reset_index_search_buffers() {
   index_cursor_end_key_.clear();
 }
 
-bool ha_lineairdb::refill_index_cursor(LineairDBTransaction *tx) {
+bool ha_helios::refill_index_cursor(HeliosTransaction *tx) {
   secondary_index_results_.clear();
   secondary_index_payloads_.clear();
   current_position_in_index_ = 0;
@@ -73,7 +73,7 @@ bool ha_lineairdb::refill_index_cursor(LineairDBTransaction *tx) {
       index_cursor_end_key_ = key_values.front().first;  // exclusive resume
     } else {
       index_cursor_start_key_ = key_values.back().first;
-      // LineairDB ranges are [start,end). Appending NUL is the smallest bound
+      // Helios ranges are [start,end). Appending NUL is the smallest bound
       // strictly greater than this complete serialized index key.
       index_cursor_start_key_.push_back('\0');
     }
@@ -95,12 +95,12 @@ bool ha_lineairdb::refill_index_cursor(LineairDBTransaction *tx) {
   return true;
 }
 
-bool ha_lineairdb::refill_truncated_scan(LineairDBTransaction *tx) {
+bool ha_helios::refill_truncated_scan(HeliosTransaction *tx) {
   materialized_scan_truncated_ = false;
   if (secondary_index_results_.empty()) return false;
 
   // The window stopped at its last key; ask the storage for the rest of the
-  // range the statement wanted. LineairDB ranges are [start, end), so the
+  // range the statement wanted. Helios ranges are [start, end), so the
   // smallest key above a complete serialized key is that key plus NUL.
   std::string start_key = secondary_index_results_.back();
   start_key.push_back('\0');
@@ -121,7 +121,7 @@ bool ha_lineairdb::refill_truncated_scan(LineairDBTransaction *tx) {
   return true;
 }
 
-int ha_lineairdb::change_active_index(uint keynr) {
+int ha_helios::change_active_index(uint keynr) {
   DBUG_TRACE;
   active_index = keynr;
 
@@ -134,7 +134,7 @@ int ha_lineairdb::change_active_index(uint keynr) {
   return 0;
 }
 
-int ha_lineairdb::index_init(uint idx, bool sorted [[maybe_unused]]) {
+int ha_helios::index_init(uint idx, bool sorted [[maybe_unused]]) {
   DBUG_TRACE;
   reset_index_search_buffers();
   last_fetched_primary_key_.clear();
@@ -142,7 +142,7 @@ int ha_lineairdb::index_init(uint idx, bool sorted [[maybe_unused]]) {
   return change_active_index(idx);
 }
 
-int ha_lineairdb::index_end() {
+int ha_helios::index_end() {
   DBUG_TRACE;
   active_index = MAX_KEY;
   mrr_use_batch_ = false;
@@ -151,14 +151,14 @@ int ha_lineairdb::index_end() {
   return 0;
 }
 
-int ha_lineairdb::index_read(uchar *buf, const uchar *key,
+int ha_helios::index_read(uchar *buf, const uchar *key,
                              uint key_len [[maybe_unused]],
                              enum ha_rkey_function find_flag) {
   DBUG_TRACE;
   return index_read_map(buf, key, HA_WHOLE_KEY, find_flag);
 }
 
-int ha_lineairdb::index_read_last(uchar *buf, const uchar *key, uint key_len) {
+int ha_helios::index_read_last(uchar *buf, const uchar *key, uint key_len) {
   DBUG_TRACE;
 
   if (key == nullptr || key_len == 0) {
@@ -198,7 +198,7 @@ int ha_lineairdb::index_read_last(uchar *buf, const uchar *key, uint key_len) {
   return index_read_map(buf, key, keypart_map, HA_READ_PREFIX_LAST);
 }
 
-int ha_lineairdb::index_read_map(uchar *buf, const uchar *key,
+int ha_helios::index_read_map(uchar *buf, const uchar *key,
                                  key_part_map keypart_map,
                                  enum ha_rkey_function find_flag) {
   DBUG_TRACE;
@@ -234,7 +234,7 @@ int ha_lineairdb::index_read_map(uchar *buf, const uchar *key,
   return execute_plan(buf, tx);
 }
 
-int ha_lineairdb::index_next(uchar *buf) {
+int ha_helios::index_next(uchar *buf) {
   DBUG_TRACE;
 
   auto tx = get_transaction(ha_thd());
@@ -264,7 +264,7 @@ int ha_lineairdb::index_next(uchar *buf) {
   return fetch_and_set_current_result(buf, tx);
 }
 
-int ha_lineairdb::index_next_same(uchar *buf, const uchar *key [[maybe_unused]],
+int ha_helios::index_next_same(uchar *buf, const uchar *key [[maybe_unused]],
                                   uint key_len [[maybe_unused]]) {
   DBUG_TRACE;
 
@@ -288,7 +288,7 @@ int ha_lineairdb::index_next_same(uchar *buf, const uchar *key [[maybe_unused]],
   return fetch_and_set_current_result(buf, tx);
 }
 
-int ha_lineairdb::index_prev(uchar *buf) {
+int ha_helios::index_prev(uchar *buf) {
   DBUG_TRACE;
 
   auto tx = get_transaction(ha_thd());
@@ -314,7 +314,7 @@ int ha_lineairdb::index_prev(uchar *buf) {
   return fetch_and_set_current_result(buf, tx);
 }
 
-int ha_lineairdb::index_first(uchar *buf) {
+int ha_helios::index_first(uchar *buf) {
   DBUG_TRACE;
   int error = index_read(buf, nullptr, 0, HA_READ_AFTER_KEY);
 
@@ -326,7 +326,7 @@ int ha_lineairdb::index_first(uchar *buf) {
   return error;
 }
 
-int ha_lineairdb::index_last(uchar *buf) {
+int ha_helios::index_last(uchar *buf) {
   DBUG_TRACE;
 
   reset_index_search_buffers();

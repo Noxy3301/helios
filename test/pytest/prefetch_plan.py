@@ -7,7 +7,7 @@ import mysql.connector
 from utils.connection import get_connection
 
 
-DBNAME = f"ha_lineairdb_prefetch_plan_{int(time.time())}"
+DBNAME = f"ha_helios_prefetch_plan_{int(time.time())}"
 
 
 def reset(cursor, db):
@@ -38,12 +38,12 @@ def test_prefetch_scope(cursor, db):
     print("PREFETCH PLAN PREFETCH SCOPE TEST")
     cursor.execute(
         "CREATE TABLE t (id INT NOT NULL PRIMARY KEY, v INT NOT NULL) "
-        "ENGINE=LineairDB"
+        "ENGINE=Helios"
     )
     cursor.execute("INSERT INTO t VALUES (1,100),(2,200),(3,300)")
     db.commit()
 
-    cursor.execute("SET GLOBAL lineairdb_read_path='plan'")
+    cursor.execute("SET GLOBAL helios_read_path='plan'")
     cursor.execute("SET @_tx_plan='R:t:1;R:t:2;R:t:3'")
     cursor.execute("START TRANSACTION")
     cursor.execute("SELECT v FROM t WHERE id=1")
@@ -75,7 +75,7 @@ def test_conflict_abort():
     try:
         ca.execute(f"USE {DBNAME}")
         cb.execute(f"USE {DBNAME}")
-        ca.execute("SET GLOBAL lineairdb_read_path='plan'")
+        ca.execute("SET GLOBAL helios_read_path='plan'")
         ca.execute("SET @_tx_plan='R:t:1'")
         ca.execute("START TRANSACTION")
         ca.execute("SELECT v FROM t WHERE id=1")
@@ -107,12 +107,12 @@ def test_unique_commit_check(cursor, db):
     print("PREFETCH PLAN UNIQUE SECONDARY TEST")
     cursor.execute(
         "CREATE TABLE unique_c (id INT NOT NULL, c INT NOT NULL, "
-        "PRIMARY KEY(id), UNIQUE KEY u_c(c)) ENGINE=LineairDB"
+        "PRIMARY KEY(id), UNIQUE KEY u_c(c)) ENGINE=Helios"
     )
     cursor.execute("INSERT INTO unique_c VALUES (1,10)")
     db.commit()
 
-    cursor.execute("SET GLOBAL lineairdb_read_path='plan'")
+    cursor.execute("SET GLOBAL helios_read_path='plan'")
     cursor.execute("SET @_tx_plan='R:t:2'")
     # unique_checks=1 refuses the duplicate at the INSERT, which is what MySQL
     # does; turn it off so the commit is the one that refuses the UNIQUE key.
@@ -147,12 +147,12 @@ def test_range_clean_commit(cursor, db):
     print("PREFETCH PLAN RANGE CLEAN COMMIT TEST")
     cursor.execute(
         "CREATE TABLE range_clean_t (id INT NOT NULL PRIMARY KEY, "
-        "v INT NOT NULL) ENGINE=LineairDB"
+        "v INT NOT NULL) ENGINE=Helios"
     )
     cursor.execute("INSERT INTO range_clean_t VALUES (1,1),(10,10),(20,20)")
     db.commit()
 
-    cursor.execute("SET GLOBAL lineairdb_read_path='plan'")
+    cursor.execute("SET GLOBAL helios_read_path='plan'")
     cursor.execute("SET @_tx_plan='S:range_clean_t:10:E:30'")
     cursor.execute("START TRANSACTION")
     cursor.execute(
@@ -177,12 +177,12 @@ def test_range_phantom_abort():
         cb.execute(f"USE {DBNAME}")
         ca.execute(
             "CREATE TABLE range_t (id INT NOT NULL PRIMARY KEY, "
-            "v INT NOT NULL) ENGINE=LineairDB"
+            "v INT NOT NULL) ENGINE=Helios"
         )
         ca.execute("INSERT INTO range_t VALUES (1,1),(10,10),(20,20),(30,30)")
         a.commit()
 
-        ca.execute("SET GLOBAL lineairdb_read_path='plan'")
+        ca.execute("SET GLOBAL helios_read_path='plan'")
         ca.execute("SET @_tx_plan='S:range_t:10:E:30'")
         ca.execute("START TRANSACTION")
         ca.execute(
@@ -220,7 +220,7 @@ def test_range_tombstone_reinsert_abort():
         cb.execute(f"USE {DBNAME}")
         ca.execute(
             "CREATE TABLE tombstone_t (id INT NOT NULL PRIMARY KEY, "
-            "v INT NOT NULL) ENGINE=LineairDB"
+            "v INT NOT NULL) ENGINE=Helios"
         )
         ca.execute(
             "INSERT INTO tombstone_t VALUES (10,10),(15,15),(20,20)"
@@ -228,7 +228,7 @@ def test_range_tombstone_reinsert_abort():
         ca.execute("DELETE FROM tombstone_t WHERE id=15")
         a.commit()
 
-        ca.execute("SET GLOBAL lineairdb_read_path='plan'")
+        ca.execute("SET GLOBAL helios_read_path='plan'")
         ca.execute("SET @_tx_plan='S:tombstone_t:10:E:30'")
         ca.execute("START TRANSACTION")
         ca.execute(
@@ -262,7 +262,7 @@ def test_secondary_range_clean_commit(cursor, db):
         "id INT NOT NULL PRIMARY KEY, "
         "c INT NOT NULL, "
         "v INT NOT NULL, "
-        "KEY c_idx(c)) ENGINE=LineairDB"
+        "KEY c_idx(c)) ENGINE=Helios"
     )
     cursor.execute(
         "INSERT INTO si_range_clean_t VALUES "
@@ -270,7 +270,7 @@ def test_secondary_range_clean_commit(cursor, db):
     )
     db.commit()
 
-    cursor.execute("SET GLOBAL lineairdb_read_path='plan'")
+    cursor.execute("SET GLOBAL helios_read_path='plan'")
     cursor.execute("SET @_tx_plan='SI:si_range_clean_t:c_idx:10'")
     cursor.execute("START TRANSACTION")
     cursor.execute(
@@ -298,7 +298,7 @@ def test_secondary_range_phantom_abort():
             "id INT NOT NULL PRIMARY KEY, "
             "c INT NOT NULL, "
             "v INT NOT NULL, "
-            "KEY c_idx(c)) ENGINE=LineairDB"
+            "KEY c_idx(c)) ENGINE=Helios"
         )
         ca.execute(
             "INSERT INTO si_range_t VALUES "
@@ -306,7 +306,7 @@ def test_secondary_range_phantom_abort():
         )
         a.commit()
 
-        ca.execute("SET GLOBAL lineairdb_read_path='plan'")
+        ca.execute("SET GLOBAL helios_read_path='plan'")
         ca.execute("SET @_tx_plan='SI:si_range_t:c_idx:10'")
         ca.execute("START TRANSACTION")
         ca.execute(

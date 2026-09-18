@@ -1,8 +1,8 @@
-// lineairdb_keyenc.cc
-// LineairDB Storage Engine: MySQL index key <-> LineairDB key/range encoding.
+// helios_keyenc.cc
+// Helios Storage Engine: MySQL index key <-> Helios key/range encoding.
 // Handler members delegate to the free functions in this module.
 
-#include "storage/lineairdb/ha_lineairdb.hh"
+#include "storage/helios/ha_helios.hh"
 #include "../common/log.h"
 
 #include <algorithm>
@@ -21,7 +21,7 @@
 // for ::strcasecmp
 #include <strings.h>
 
-#include "lineairdb_field_types.h"
+#include "helios_field_types.h"
 #include "lineairdb.pb.h"
 #include "my_base.h"
 #include "my_dbug.h"
@@ -32,33 +32,33 @@
 #include "sql/item_cmpfunc.h"
 #include "sql/item_func.h"
 #include "sql/sql_class.h"
-#include "lineairdb_keyenc.hh"
+#include "helios_keyenc.hh"
 
-namespace lineairdb_keyenc {
+namespace helios_keyenc {
 
-unsigned char key_part_type_tag(LineairDBFieldType type) {
+unsigned char key_part_type_tag(HeliosFieldType type) {
   switch (type) {
-  case LineairDBFieldType::LINEAIRDB_INT:
+  case HeliosFieldType::HELIOS_INT:
     return kKeyTypeInt;
-  case LineairDBFieldType::LINEAIRDB_STRING:
+  case HeliosFieldType::HELIOS_STRING:
     return kKeyTypeString;
-  case LineairDBFieldType::LINEAIRDB_DATETIME:
+  case HeliosFieldType::HELIOS_DATETIME:
     return kKeyTypeDatetime;
-  case LineairDBFieldType::LINEAIRDB_OTHER:
+  case HeliosFieldType::HELIOS_OTHER:
   default:
     return kKeyTypeOther;
   }
 }
 
 void append_key_part_encoding(std::string &out, bool is_null,
-                              LineairDBFieldType type,
+                              HeliosFieldType type,
                               const std::string &payload) {
   constexpr size_t kLengthFieldSize = 2;
   const size_t max_payload_length = std::numeric_limits<uint16_t>::max();
   size_t copy_length = std::min(payload.size(), max_payload_length);
 
   if (payload.size() > max_payload_length) {
-    std::cerr << "[LineairDB][encode_key_part] payload truncated: length="
+    std::cerr << "[Helios][encode_key_part] payload truncated: length="
               << payload.size() << std::endl;
   }
 
@@ -67,7 +67,7 @@ void append_key_part_encoding(std::string &out, bool is_null,
       static_cast<char>(is_null ? kKeyMarkerNull : kKeyMarkerNotNull));
   out.push_back(static_cast<char>(key_part_type_tag(type)));
 
-  if (type == LineairDBFieldType::LINEAIRDB_STRING) {
+  if (type == HeliosFieldType::HELIOS_STRING) {
     // STRING: payload first, then terminator (0x00), then length
     if (copy_length > 0) {
       out.append(payload.data(), copy_length);
@@ -107,32 +107,32 @@ std::string build_prefix_range_end(const std::string &prefix) {
   return std::string();
 }
 
-}  // namespace lineairdb_keyenc
+}  // namespace helios_keyenc
 
-unsigned char ha_lineairdb::key_part_type_tag(LineairDBFieldType type) {
-  return lineairdb_keyenc::key_part_type_tag(type);
+unsigned char ha_helios::key_part_type_tag(HeliosFieldType type) {
+  return helios_keyenc::key_part_type_tag(type);
 }
 
-void ha_lineairdb::append_key_part_encoding(std::string &out, bool is_null,
-                                            LineairDBFieldType type,
+void ha_helios::append_key_part_encoding(std::string &out, bool is_null,
+                                            HeliosFieldType type,
                                             const std::string &payload) {
-  lineairdb_keyenc::append_key_part_encoding(out, is_null, type, payload);
+  helios_keyenc::append_key_part_encoding(out, is_null, type, payload);
 }
 
-std::string ha_lineairdb::build_prefix_range_end(const std::string &prefix) {
-  return lineairdb_keyenc::build_prefix_range_end(prefix);
+std::string ha_helios::build_prefix_range_end(const std::string &prefix) {
+  return helios_keyenc::build_prefix_range_end(prefix);
 }
 
-std::string ha_lineairdb::serialize_key_from_field(Field *field) {
+std::string ha_helios::serialize_key_from_field(Field *field) {
   const bool is_null = field->is_null();
   enum_field_types mysql_type = field->type();
-  LineairDBFieldType ldb_type = convert_mysql_type_to_lineairdb(mysql_type);
+  HeliosFieldType helios_type = convert_mysql_type_to_helios(mysql_type);
 
   std::string payload;
 
   if (!is_null) {
-    switch (ldb_type) {
-    case LineairDBFieldType::LINEAIRDB_INT: {
+    switch (helios_type) {
+    case HeliosFieldType::HELIOS_INT: {
       int64_t value = field->val_int();
       size_t field_len = field->pack_length();
 
@@ -163,7 +163,7 @@ std::string ha_lineairdb::serialize_key_from_field(Field *field) {
       break;
     }
 
-    case LineairDBFieldType::LINEAIRDB_DATETIME: {
+    case HeliosFieldType::HELIOS_DATETIME: {
       size_t field_len = field->pack_length();
       std::string raw(field_len, '\0');
       field->get_key_image(reinterpret_cast<uchar *>(raw.data()), field_len,
@@ -173,14 +173,14 @@ std::string ha_lineairdb::serialize_key_from_field(Field *field) {
       break;
     }
 
-    case LineairDBFieldType::LINEAIRDB_STRING: {
+    case HeliosFieldType::HELIOS_STRING: {
       String buffer;
       field->val_str(&buffer, &buffer);
       payload.assign(buffer.c_ptr(), buffer.length());
       break;
     }
 
-    case LineairDBFieldType::LINEAIRDB_OTHER:
+    case HeliosFieldType::HELIOS_OTHER:
     default: {
       String buffer;
       field->val_str(&buffer, &buffer);
@@ -191,11 +191,11 @@ std::string ha_lineairdb::serialize_key_from_field(Field *field) {
   }
 
   std::string encoded;
-  append_key_part_encoding(encoded, is_null, ldb_type, payload);
+  append_key_part_encoding(encoded, is_null, helios_type, payload);
   return encoded;
 }
 
-std::string ha_lineairdb::build_secondary_key_from_row(const uchar *row_buffer,
+std::string ha_helios::build_secondary_key_from_row(const uchar *row_buffer,
                                                        const KEY &key_info) {
   // Temporarily set read_set to include all columns
   my_bitmap_map *org_bitmap = tmp_use_all_columns(table, table->read_set);
@@ -226,7 +226,7 @@ std::string ha_lineairdb::build_secondary_key_from_row(const uchar *row_buffer,
   return secondary_key;
 }
 
-void ha_lineairdb::store_primary_key_in_ref(const std::string &primary_key) {
+void ha_helios::store_primary_key_in_ref(const std::string &primary_key) {
   if (table == nullptr || table->s == nullptr || ref == nullptr) {
     return;
   }
@@ -237,7 +237,7 @@ void ha_lineairdb::store_primary_key_in_ref(const std::string &primary_key) {
   }
 
   if (primary_key.size() > std::numeric_limits<uint16_t>::max()) {
-    std::cerr << "[LineairDB][position] primary key length exceeds uint16_t: "
+    std::cerr << "[Helios][position] primary key length exceeds uint16_t: "
               << primary_key.size() << std::endl;
     return;
   }
@@ -245,7 +245,7 @@ void ha_lineairdb::store_primary_key_in_ref(const std::string &primary_key) {
   const size_t payload_capacity = ref_length_local - sizeof(uint16_t);
   if (primary_key.size() > payload_capacity) {
     std::cerr
-        << "[LineairDB][position] primary key length exceeds ref capacity: "
+        << "[Helios][position] primary key length exceeds ref capacity: "
         << primary_key.size() << " > " << payload_capacity << std::endl;
     return;
   }
@@ -263,7 +263,7 @@ void ha_lineairdb::store_primary_key_in_ref(const std::string &primary_key) {
   }
 }
 
-std::string ha_lineairdb::extract_primary_key_from_ref(const uchar *pos) const {
+std::string ha_helios::extract_primary_key_from_ref(const uchar *pos) const {
   if (pos == nullptr || table == nullptr || table->s == nullptr) {
     return {};
   }
@@ -296,7 +296,7 @@ static constexpr uint32_t kHiddenKeyRangeSize = 1000;
 // Mirrors HiddenKeyAllocator::kMaxCount, which the proxy cannot include
 static constexpr uint32_t kHiddenKeyMaxRange = 65536;
 
-std::string ha_lineairdb::serialize_hidden_primary_key(uint64_t row_id) const {
+std::string ha_helios::serialize_hidden_primary_key(uint64_t row_id) const {
   std::ostringstream oss;
   oss << std::hex << std::setw(16) << std::setfill('0') << row_id;
   return oss.str();
@@ -305,13 +305,13 @@ std::string ha_lineairdb::serialize_hidden_primary_key(uint64_t row_id) const {
 namespace {
 
 // A rejection the storage server will repeat: retrying can only spin on it
-int reject_hidden_key(THD *thd, LineairDBTransaction *tx,
+int reject_hidden_key(THD *thd, HeliosTransaction *tx,
                       const std::string &reason) {
   // The handler layer turns the return code into ER_AUTOINC_READ_FAILED, whose
   // text has no room for the cause, so the cause rides along as a warning.
   if (thd != nullptr) {
     push_warning_printf(thd, Sql_condition::SL_WARNING, ER_AUTOINC_READ_FAILED,
-                        "LineairDB could not reserve a hidden primary key: %s",
+                        "Helios could not reserve a hidden primary key: %s",
                         reason.c_str());
     thd_mark_transaction_to_rollback(thd, 1);
   }
@@ -321,7 +321,7 @@ int reject_hidden_key(THD *thd, LineairDBTransaction *tx,
 
 }  // namespace
 
-int ha_lineairdb::generate_hidden_primary_key(LineairDBTransaction *tx,
+int ha_helios::generate_hidden_primary_key(HeliosTransaction *tx,
                                               std::string *key) {
   if (share == nullptr) {
     share = get_share();
@@ -369,7 +369,7 @@ int ha_lineairdb::generate_hidden_primary_key(LineairDBTransaction *tx,
   return 0;
 }
 
-int ha_lineairdb::extract_key(const uchar *buf, LineairDBTransaction *tx,
+int ha_helios::extract_key(const uchar *buf, HeliosTransaction *tx,
                               std::string *key) {
   if (is_primary_key_exists()) {
     *key = extract_key_from_mysql(buf);
@@ -378,7 +378,7 @@ int ha_lineairdb::extract_key(const uchar *buf, LineairDBTransaction *tx,
   return autogenerate_key(tx, key);
 }
 
-std::string ha_lineairdb::extract_key_from_mysql(const uchar *row_buffer) {
+std::string ha_helios::extract_key_from_mysql(const uchar *row_buffer) {
   std::string complete_key;
 
   // Guard: return empty if no explicit primary key exists
@@ -403,7 +403,7 @@ std::string ha_lineairdb::extract_key_from_mysql(const uchar *row_buffer) {
   return complete_key;
 }
 
-int ha_lineairdb::autogenerate_key(LineairDBTransaction *tx,
+int ha_helios::autogenerate_key(HeliosTransaction *tx,
                                    std::string *key) {
   return generate_hidden_primary_key(tx, key);
 }
@@ -414,7 +414,7 @@ int ha_lineairdb::autogenerate_key(LineairDBTransaction *tx,
  * @details Little-endian to big-endian with the sign bit flipped, so
  * lexicographic order matches signed integer order.
  */
-namespace lineairdb_keyenc {
+namespace helios_keyenc {
 
 std::string encode_int_key(const uchar *data, size_t len) {
   uint64_t value = 0;
@@ -504,30 +504,29 @@ std::string encode_string_key(const uchar *data, size_t len) {
   return std::string(reinterpret_cast<const char *>(data + 2), str_len);
 }
 
-}  // namespace lineairdb_keyenc
+}  // namespace helios_keyenc
 
-std::string ha_lineairdb::encode_int_key(const uchar *data, size_t len) {
-  return lineairdb_keyenc::encode_int_key(data, len);
+std::string ha_helios::encode_int_key(const uchar *data, size_t len) {
+  return helios_keyenc::encode_int_key(data, len);
 }
 
-std::string ha_lineairdb::encode_datetime_key(const uchar *data, size_t len,
+std::string ha_helios::encode_datetime_key(const uchar *data, size_t len,
                                               enum_field_types mysql_type) {
-  return lineairdb_keyenc::encode_datetime_key(data, len, mysql_type);
+  return helios_keyenc::encode_datetime_key(data, len, mysql_type);
 }
 
-std::string ha_lineairdb::encode_string_key(const uchar *data, size_t len) {
-  return lineairdb_keyenc::encode_string_key(data, len);
+std::string ha_helios::encode_string_key(const uchar *data, size_t len) {
+  return helios_keyenc::encode_string_key(data, len);
 }
 
 /**
  * @brief Convert a MySQL composite key into the sortable key format: the key
  * parts named by keypart_map, each encoded by its type, concatenated.
  */
-namespace lineairdb_keyenc {
+namespace helios_keyenc {
 
-std::string convert_key_to_ldbformat(TABLE *table, uint key_index,
-                                     const uchar *key,
-                                     key_part_map keypart_map) {
+std::string encode_key(TABLE *table, uint key_index, const uchar *key,
+                       key_part_map keypart_map) {
   KEY *key_info = &table->key_info[key_index];
   std::string result;
   const uchar *key_ptr = key;
@@ -549,7 +548,7 @@ std::string convert_key_to_ldbformat(TABLE *table, uint key_index,
       if (is_null) {
         key_ptr += (kp->store_length - 1);
         append_key_part_encoding(result, true,
-                                 convert_mysql_type_to_lineairdb(field->type()),
+                                 convert_mysql_type_to_helios(field->type()),
                                  std::string());
         continue;
       }
@@ -565,29 +564,29 @@ std::string convert_key_to_ldbformat(TABLE *table, uint key_index,
     }
 
     enum_field_types mysql_type = field->type();
-    LineairDBFieldType ldb_type = convert_mysql_type_to_lineairdb(mysql_type);
+    HeliosFieldType helios_type = convert_mysql_type_to_helios(mysql_type);
 
     std::string payload;
-    switch (ldb_type) {
-    case LineairDBFieldType::LINEAIRDB_INT:
+    switch (helios_type) {
+    case HeliosFieldType::HELIOS_INT:
       payload = encode_int_key(data_ptr, data_len);
       break;
 
-    case LineairDBFieldType::LINEAIRDB_DATETIME:
+    case HeliosFieldType::HELIOS_DATETIME:
       payload = encode_datetime_key(data_ptr, data_len, mysql_type);
       break;
 
-    case LineairDBFieldType::LINEAIRDB_STRING:
+    case HeliosFieldType::HELIOS_STRING:
       payload.assign(reinterpret_cast<const char *>(data_ptr), data_len);
       break;
 
-    case LineairDBFieldType::LINEAIRDB_OTHER:
+    case HeliosFieldType::HELIOS_OTHER:
     default:
       payload.assign(reinterpret_cast<const char *>(data_ptr), data_len);
       break;
     }
 
-    append_key_part_encoding(result, false, ldb_type, payload);
+    append_key_part_encoding(result, false, helios_type, payload);
 
     if (kp->key_part_flag & HA_VAR_LENGTH_PART) {
       key_ptr += kp->length;
@@ -599,11 +598,9 @@ std::string convert_key_to_ldbformat(TABLE *table, uint key_index,
   return result;
 }
 
-}  // namespace lineairdb_keyenc
+}  // namespace helios_keyenc
 
-std::string ha_lineairdb::convert_key_to_ldbformat(const uchar *key,
-                                                   key_part_map keypart_map) {
-  return lineairdb_keyenc::convert_key_to_ldbformat(table, active_index, key,
-                                                    keypart_map);
+std::string ha_helios::encode_key(const uchar *key, key_part_map keypart_map) {
+  return helios_keyenc::encode_key(table, active_index, key, keypart_map);
 }
 

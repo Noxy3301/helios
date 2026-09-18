@@ -163,9 +163,9 @@ PROXY_CATEGORIES = {
 
 def classify_proxy(symbol, lib, kind):
     clean = symbol.split("(")[0].strip()
-    # ha_lineairdb
-    if "ha_lineairdb" in lib:
-        return "ha_lineairdb"
+    # ha_helios
+    if "ha_helios" in lib:
+        return "ha_helios"
     # protobuf
     if "protobuf" in lib:
         return "protobuf"
@@ -207,7 +207,7 @@ CATEGORY_LABELS = {
     "other_user": "Other",
     "unresolved": "Other (unresolved)",
     # proxy
-    "ha_lineairdb": "ha_lineairdb (SE plugin)",
+    "ha_helios": "ha_helios (SE plugin)",
     "mysql_parser": "MySQL parser + lexer",
     "mysql_optimizer": "MySQL optimizer",
     "mysql_executor": "MySQL executor + PFS",
@@ -227,7 +227,7 @@ CATEGORY_COLORS = {
     "other_user": "#bdc3c7",
     "unresolved": "#ecf0f1",
     # proxy
-    "ha_lineairdb": "#2ecc71",
+    "ha_helios": "#2ecc71",
     "mysql_parser": "#e67e22",
     "mysql_optimizer": "#d35400",
     "mysql_executor": "#e74c3c",

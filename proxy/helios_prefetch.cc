@@ -1,4 +1,4 @@
-#include "storage/lineairdb/ha_lineairdb.hh"
+#include "storage/helios/ha_helios.hh"
 #include "../common/log.h"
 
 #include <algorithm>
@@ -14,10 +14,10 @@
 // for ::strcasecmp
 #include <strings.h>
 
-#include "lineairdb_autogen.hh"
-#include "lineairdb_field_types.h"
-#include "lineairdb_keyenc.hh"
-#include "lineairdb_prefetch.hh"
+#include "helios_autogen.hh"
+#include "helios_field_types.h"
+#include "helios_keyenc.hh"
+#include "helios_prefetch.hh"
 #include "lineairdb.pb.h"
 #include "my_base.h"
 #include "my_dbug.h"
@@ -167,9 +167,9 @@ static std::string normalize_plan_table_name(THD *thd,
   return prefix + table_name;
 }
 
-static LineairDBProxy::ReadPlanKeyBinding parse_plan_binding(
+static HeliosProxy::ReadPlanKeyBinding parse_plan_binding(
     const std::string& spec) {
-  LineairDBProxy::ReadPlanKeyBinding binding;
+  HeliosProxy::ReadPlanKeyBinding binding;
   if (spec.size() < 2 || spec[0] != 'B') return binding;
 
   size_t pos = 1;
@@ -233,7 +233,7 @@ static bool token_is_plan_binding(const std::string& token) {
   return pos > 1 && pos < token.size() && token[pos] == '.';
 }
 
-static void append_plan_key_token(LineairDBProxy::ReadPlanStep *step,
+static void append_plan_key_token(HeliosProxy::ReadPlanStep *step,
                                   const std::string& token,
                                   bool end_key) {
   if (step == nullptr || token.empty()) return;
@@ -255,16 +255,16 @@ static void append_plan_key_token(LineairDBProxy::ReadPlanStep *step,
 }
 
 // Parse read-plan DSL: R=point, S=PK range/prefix scan, SI=secondary scan
-static std::vector<LineairDBProxy::ReadPlanStep> parse_plan_steps(
+static std::vector<HeliosProxy::ReadPlanStep> parse_plan_steps(
     THD *thd, const std::string& plan_text) {
-  std::vector<LineairDBProxy::ReadPlanStep> steps;
+  std::vector<HeliosProxy::ReadPlanStep> steps;
 
   for (const auto& step : split_plan_text(plan_text, ';')) {
     if (step.empty()) continue;
     const auto parts = split_plan_text(step, ':');
     if (parts.size() < 2) continue;
 
-    LineairDBProxy::ReadPlanStep parsed;
+    HeliosProxy::ReadPlanStep parsed;
     parsed.table_name = normalize_plan_table_name(thd, parts[1]);
     bool end_key = false;
     size_t token_start = 2;
@@ -329,7 +329,7 @@ static std::string read_and_clear_tx_plan(THD *thd) {
 }
 
 void maybe_prefetch_for_transaction(THD *thd,
-                                            LineairDBTransaction *tx) {
+                                            HeliosTransaction *tx) {
   if (tx == nullptr || srv_read_path != kReadPathPlan) return;
 
   const std::string plan_text = read_and_clear_tx_plan(thd);
@@ -343,9 +343,9 @@ void maybe_prefetch_for_transaction(THD *thd,
 
 // Build the read plan from the given QEP root and run it in one prefetch RPC.
 static int autogen_and_execute_prefetch(THD *thd, AccessPath *root,
-                                        LineairDBTransaction *tx,
+                                        HeliosTransaction *tx,
                                         bool include_inner_units = false) {
-  std::vector<LineairDBProxy::ReadPlanStep> steps;
+  std::vector<HeliosProxy::ReadPlanStep> steps;
   // A staged scan carries key bounds and a LIMIT; the commit replays the range
   // without a filter. A shape autogen cannot stage takes the row path.
   if (!autogen_read_plan_from_qep(thd, root, &steps, include_inner_units)) {
@@ -386,7 +386,7 @@ static AccessPath *table_unit_plan_root(TABLE *table) {
   return nullptr;
 }
 
-static void sync_autogen_statement(THD *thd, LineairDBTransaction *tx) {
+static void sync_autogen_statement(THD *thd, HeliosTransaction *tx) {
   const uint64_t query_id =
       (thd != nullptr) ? static_cast<uint64_t>(thd->query_id) : 0;
   if (tx->autogen_query_id() != query_id) {
@@ -449,7 +449,7 @@ static const char *legacy_dml_shape_rejection(THD *thd, TABLE *table) {
   return nullptr;
 }
 
-int maybe_prefetch_for_statement(THD *thd, LineairDBTransaction *tx,
+int maybe_prefetch_for_statement(THD *thd, HeliosTransaction *tx,
                                  TABLE *table) {
   if (tx == nullptr || srv_read_path != kReadPathPlan) return 0;
   if (tx->tx_plan_used()) return 0;  // tx-scoped plan covers it
@@ -489,7 +489,7 @@ int maybe_prefetch_for_statement(THD *thd, LineairDBTransaction *tx,
 // Gate for the handler entry points: true when autogen must defer to the
 // handler index access, marking it handler-deferred on the first call.
 bool prefetch_needs_legacy_dml_handler(THD *thd,
-                                      LineairDBTransaction *tx) {
+                                      HeliosTransaction *tx) {
   if (tx == nullptr || srv_read_path != kReadPathPlan || tx->tx_plan_used()) {
     return false;
   }
@@ -505,7 +505,7 @@ bool prefetch_needs_legacy_dml_handler(THD *thd,
 // handler index access, once per statement. A shape one staged range cannot
 // cover is left to the row path.
 int maybe_prefetch_for_legacy_dml_handler(
-    THD *thd, LineairDBTransaction *tx, TABLE *table, uint index,
+    THD *thd, HeliosTransaction *tx, TABLE *table, uint index,
     const IndexSearchPlan &search) {
   if (tx == nullptr || srv_read_path != kReadPathPlan || tx->tx_plan_used()) {
     return 0;
@@ -519,7 +519,7 @@ int maybe_prefetch_for_legacy_dml_handler(
   if (!is_legacy_single_table_dml(thd)) return 0;
   if (legacy_dml_shape_rejection(thd, table) != nullptr) return 0;
 
-  std::vector<LineairDBProxy::ReadPlanStep> steps;
+  std::vector<HeliosProxy::ReadPlanStep> steps;
   if (!autogen_read_plan_from_index_search(thd, table, index, search, &steps)) {
     return 0;
   }
@@ -528,7 +528,7 @@ int maybe_prefetch_for_legacy_dml_handler(
   return prefetch_abort_errno(thd, tx);
 }
 
-int maybe_prefetch_for_index_tail(THD *thd, LineairDBTransaction *tx,
+int maybe_prefetch_for_index_tail(THD *thd, HeliosTransaction *tx,
                                   const std::string &table_key,
                                   uint64_t window_rows) {
   if (tx == nullptr || srv_read_path != kReadPathPlan) return 0;
@@ -541,22 +541,22 @@ int maybe_prefetch_for_index_tail(THD *thd, LineairDBTransaction *tx,
   // One plain primary scan step: last-N of the whole range. The server echoes
   // the requested bounds as the staged entry's range, so the handler's
   // ("", sentinel, reverse, N) lookup matches it exactly.
-  LineairDBProxy::ReadPlanStep step;
+  HeliosProxy::ReadPlanStep step;
   step.table_name = table_key;
   step.is_scan = true;
   step.reverse_scan = true;
   step.scan_limit = window_rows;
-  step.end_key_prefix = lineairdb_keyenc::scan_end_sentinel();
+  step.end_key_prefix = helios_keyenc::scan_end_sentinel();
 
-  std::vector<LineairDBProxy::ReadPlanStep> steps;
+  std::vector<HeliosProxy::ReadPlanStep> steps;
   steps.push_back(std::move(step));
   tx->execute_read_plan(steps);
   return prefetch_abort_errno(thd, tx);
 }
 
-int reject_unsupported_statement(THD *thd, LineairDBTransaction *tx,
+int reject_unsupported_statement(THD *thd, HeliosTransaction *tx,
                                  const char *reason) {
-  std::string msg = "LineairDB unsupported: ";
+  std::string msg = "Helios unsupported: ";
   msg += reason != nullptr ? reason : "unsupported access shape";
   if (thd != nullptr) {
     const LEX_CSTRING query = thd->query();
@@ -571,7 +571,7 @@ int reject_unsupported_statement(THD *thd, LineairDBTransaction *tx,
   return HA_ERR_UNSUPPORTED;
 }
 
-int prefetch_abort_errno(THD *thd, LineairDBTransaction *tx) {
+int prefetch_abort_errno(THD *thd, HeliosTransaction *tx) {
   if (tx == nullptr || !tx->is_aborted()) return 0;
   thd_mark_transaction_to_rollback(thd, 1);
   if (tx->has_transport_error()) return HA_ERR_NO_CONNECTION;

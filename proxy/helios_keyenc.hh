@@ -1,14 +1,14 @@
-// lineairdb_keyenc.hh
-// LineairDB Storage Engine: shared index key / range encoding.
+// helios_keyenc.hh
+// Helios Storage Engine: shared index key / range encoding.
 
-#ifndef LINEAIRDB_KEYENC_HH
-#define LINEAIRDB_KEYENC_HH
+#ifndef HELIOS_KEYENC_HH
+#define HELIOS_KEYENC_HH
 
 #include <cstddef>
 #include <string>
 
 #include "field_types.h"
-#include "lineairdb_field_types.h"
+#include "helios_field_types.h"
 #include "my_base.h"
 #include "my_inttypes.h"
 
@@ -23,16 +23,16 @@ constexpr unsigned char kKeyTypeString = 0x20;
 constexpr unsigned char kKeyTypeDatetime = 0x30;
 constexpr unsigned char kKeyTypeOther = 0xF0;
 
-namespace lineairdb_keyenc {
+namespace helios_keyenc {
 
 std::string encode_int_key(const uchar *data, size_t len);
 std::string encode_datetime_key(const uchar *data, size_t len,
                                 enum_field_types mysql_type);
 std::string encode_string_key(const uchar *data, size_t len);
 
-unsigned char key_part_type_tag(LineairDBFieldType type);
+unsigned char key_part_type_tag(HeliosFieldType type);
 void append_key_part_encoding(std::string &out, bool is_null,
-                              LineairDBFieldType type,
+                              HeliosFieldType type,
                               const std::string &payload);
 std::string build_prefix_range_end(const std::string &prefix);
 
@@ -45,10 +45,9 @@ inline std::string scan_end_sentinel() {
   return std::string(kScanEndSentinelSize, '\xff');
 }
 
-std::string convert_key_to_ldbformat(TABLE *table, uint key_index,
-                                     const uchar *key,
-                                     key_part_map keypart_map);
+std::string encode_key(TABLE *table, uint key_index, const uchar *key,
+                       key_part_map keypart_map);
 
-}  // namespace lineairdb_keyenc
+}  // namespace helios_keyenc
 
-#endif // LINEAIRDB_KEYENC_HH
+#endif // HELIOS_KEYENC_HH
