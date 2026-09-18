@@ -369,22 +369,6 @@ std::unordered_map<uint32_t, std::vector<EpochImage>> GroupImages(
  */
 std::vector<EpochImage> SlotImages(const GroupImageState *state, uint32_t slot);
 
-/**
- * @brief Returns the monotonic preserve counter of `group`.
- */
-uint64_t GroupPreserveCount(const PaxGroup *group);
-
-/**
- * @brief Copies every epoch image recorded for `group`, keyed by slot.
- */
-std::unordered_map<uint32_t, std::vector<EpochImage>> GroupImages(
-    const PaxGroup *group);
-
-/**
- * @brief Copies the epoch images recorded for one (group, slot).
- */
-std::vector<EpochImage> SlotImages(const PaxGroup *group, uint32_t slot);
-
 }  // namespace pax
 }  // namespace helios::storage
 

@@ -117,11 +117,12 @@ void EpochImageBuffer::Preserve(PaxGroup *group, uint32_t slot,
     }
   }
   // Count after the append, or the skip, and before the caller mutates any
-  // strip cell.
-  // Readers that sample preserve_count, read the strip cells, then sample
-  // again finished their in-place reads before this writer's first cell
-  // write.
-  state->preserve_count.fetch_add(1, std::memory_order_release);
+  // strip cell. acq_rel: the release half publishes the append, the acquire
+  // half keeps the caller's cell writes from becoming visible ahead of the
+  // bump. A reader that samples preserve_count, reads the strip cells, then
+  // samples again finished its in-place reads before this writer's first
+  // cell write.
+  state->preserve_count.fetch_add(1, std::memory_order_acq_rel);
 }
 
 EpochNumber EpochImageBuffer::Open(const epoch::Framework &epoch) {
@@ -201,20 +202,6 @@ std::vector<EpochImage> SlotImages(const GroupImageState *state,
   auto it = state->images.find(slot);
   if (it == state->images.end()) return {};
   return it->second;
-}
-
-uint64_t GroupPreserveCount(const PaxGroup *group) {
-  return PreserveCount(ImageState(group));
-}
-
-std::unordered_map<uint32_t, std::vector<EpochImage>> GroupImages(
-    const PaxGroup *group) {
-  uint64_t imaged[PaxGroup::kRows / PaxGroup::kVisibilityWordBits];
-  return GroupImages(ImageState(group), imaged);
-}
-
-std::vector<EpochImage> SlotImages(const PaxGroup *group, uint32_t slot) {
-  return SlotImages(ImageState(group), slot);
 }
 
 void ForgetGroup(const PaxGroup *group) {
