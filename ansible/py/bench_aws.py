@@ -416,8 +416,8 @@ def deploy_infrastructure(args, bundle_path, bundle_sha256):
         storage_vars["helios_load_durability"] = args.load_durability
     if args.epoch_ms is not None:
         storage_vars["helios_epoch_ms"] = args.epoch_ms
-    if args.server_env:
-        storage_vars["helios_storage_env"] = args.server_env
+    if args.server_conf:
+        storage_vars["helios_storage_conf"] = args.server_conf
     if args.flush_trace:
         storage_vars["helios_flush_trace"] = FLUSH_TRACE_PREFIX
     mysql_vars = {"mysqld_extra_args": args.mysqld_extra_args}
@@ -751,8 +751,9 @@ Examples:
     parser.add_argument("--wal-iops", type=int, default=12000, help="IOPS for the io2 WAL volume")
     parser.add_argument("--mysqld-extra-args", default="--performance-schema=OFF",
                         help="Extra mysqld options, passed through MYSQLD_EXTRA_ARGS")
-    parser.add_argument("--server-env", default="",
-                        help="Extra KEY=VALUE pairs (space separated) exported to the storage server")
+    parser.add_argument("--server-conf", default="",
+                        help="Extra key=value pairs (space separated) written into the storage "
+                             "server's configuration file")
     parser.add_argument("--flush-trace", action="store_true",
                         help="Record the storage server's WAL flush trace on the WAL volume and fetch it "
                              "after the sweep (needs --wal-gib)")
@@ -807,14 +808,13 @@ Examples:
         parser.error("--wal-gib must be 0 (no volume) or a positive size")
     if not re.fullmatch(r"[A-Za-z0-9_=./:,+ -]*", args.mysqld_extra_args):
         parser.error("--mysqld-extra-args accepts only letters, digits, space and _ = . / : , + -")
-    for kv in args.server_env.split():
-        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=[A-Za-z0-9_./:,+-]*", kv):
-            parser.error(f"--server-env entry {kv!r} is not NAME=VALUE with NAME a shell identifier "
-                         "and VALUE made of letters, digits and _ . / : , + -")
-        if kv.split("=", 1)[0] in ("HELIOS_COMMIT_DURABILITY",
-                                   "HELIOS_EPOCH_DURATION_MS"):
-            parser.error("--server-env must not set HELIOS_COMMIT_DURABILITY or "
-                         "HELIOS_EPOCH_DURATION_MS; they have dedicated flags "
+    for kv in args.server_conf.split():
+        if not re.fullmatch(r"[a-z_][a-z0-9_]*=[A-Za-z0-9_./:,+-]*", kv):
+            parser.error(f"--server-conf entry {kv!r} is not key=value with key a configuration "
+                         "key and value made of letters, digits and _ . / : , + -")
+        if kv.split("=", 1)[0] in ("commit_durability", "epoch_duration_ms"):
+            parser.error("--server-conf must not set commit_durability or "
+                         "epoch_duration_ms; they have dedicated flags "
                          "(--durability / --load-durability / --epoch-ms)")
     if args.load_durability == "async":
         if args.durability != "sync":
@@ -829,8 +829,8 @@ Examples:
         if args.read_path != "plan" or args.tx_plan or args.bench_ndv_drift:
             parser.error("--engine innodb has no Helios sysvars; "
                          "--read-path, --tx-plan and --bench-ndv-drift are not supported")
-        if args.durability != "sync" or args.epoch_ms is not None or args.server_env or args.flush_trace:
-            parser.error("--durability/--epoch-ms/--server-env/--flush-trace configure the Helios server; "
+        if args.durability != "sync" or args.epoch_ms is not None or args.server_conf or args.flush_trace:
+            parser.error("--durability/--epoch-ms/--server-conf/--flush-trace configure the Helios server; "
                          "not valid with --engine innodb")
         if args.storage_instance_type is not None:
             parser.error("--storage-instance-type is meaningless with --engine innodb")

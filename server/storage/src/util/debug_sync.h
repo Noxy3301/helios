@@ -158,6 +158,8 @@ inline void DebugSyncPoint(const char *point_name) {
                             : static_cast<char>(std::toupper(
                                   static_cast<unsigned char>(*p))));
   }
+  // A test hook, not server configuration: the suite arms a point per run,
+  // so it stays in the environment.
   const char *action = std::getenv(var.c_str());
   if (action == nullptr) return;
   constexpr char kSleep[] = "sleep:";

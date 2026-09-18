@@ -26,6 +26,9 @@ import tempfile
 import threading
 import time
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from utils.server_conf import write_conf
+
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 SERVER = os.path.join(ROOT, "build", "server", "helios-storage")
 CTL = os.path.join(ROOT, "build", "server", "helios-ctl")
@@ -142,20 +145,20 @@ def stop_stack():
     raise RuntimeError("ports 9999/3307 are still held after stop_stack")
 
 
-def start_server(work_dir, mode, extra_env=None, pass_fds=()):
+def start_server(work_dir, mode, conf=None, extra_env=None, pass_fds=()):
     """Starts the server directly, so its log directory and inherited
     descriptors are the test's to choose."""
+    # The debug sync points are the one knob that stays in the environment.
     env = dict(os.environ)
-    env["HELIOS_COMMIT_DURABILITY"] = mode
-    env["HELIOS_EPOCH_DURATION_MS"] = "40"
-    env.pop("HELIOS_ENABLE_RECOVERY", None)
     if extra_env:
         env.update(extra_env)
+    path = write_conf(work_dir, commit_durability=mode, epoch_duration_ms=40,
+                      **(conf or {}))
     if port_is_open(9999):
         raise RuntimeError("port 9999 is already held; this server would not "
                            "be the one under test")
     out = open(os.path.join(work_dir, "server.out"), "ab")
-    process = subprocess.Popen([SERVER], cwd=work_dir, env=env,
+    process = subprocess.Popen([SERVER, "--config", path], cwd=work_dir, env=env,
                                stdin=subprocess.DEVNULL, stdout=out,
                                stderr=subprocess.STDOUT, pass_fds=pass_fds)
     if not wait_for_port(9999, SERVER_PORT_WAIT_SECONDS):
@@ -275,8 +278,7 @@ def kill_now(server):
 
 def recovered_rows(work_dir, table):
     """Restarts the server with recovery and reads the table back."""
-    server = start_server(work_dir, "async",
-                          extra_env={"HELIOS_ENABLE_RECOVERY": "1"})
+    server = start_server(work_dir, "async", conf={"enable_recovery": 1})
     start_mysqld()
     rows = {}
     for line in sql(f"SELECT id, v FROM dur.{table} ORDER BY id;") \

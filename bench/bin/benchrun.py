@@ -45,6 +45,9 @@ HELIOS_CTL = ROOT / "build" / "server" / "helios-ctl"
 SERVER_COMM = "helios-storage"
 HELIOS_LOG_DIR = ROOT / "helios_logs"
 HELIOS_WAL_DIR = ROOT / "helios_wal"  # the storage's work directory
+# The server configuration a run generates when it needs other than the
+# checked-in defaults.
+LOCAL_CONF = ROOT / "helios.local.cnf"
 
 YCSB_PROFILES = {
     "a": "50,0,0,50,0,0",
@@ -105,17 +108,20 @@ def start_helios_storage(commit_durability=None):
     """Start helios-storage via scripts/start_server.sh and wait for port 9999.
 
     commit_durability overrides the server's startup contract for this run only;
-    it reaches the daemon through the launcher's environment.
+    it reaches the daemon through helios.local.cnf, which every run rewrites.
     """
     if _is_port_open("127.0.0.1", 9999):
         print("  helios-storage already running on port 9999, reusing")
         return True
     print("  Starting helios-storage...")
-    env = None
+    argv = [str(SCRIPTS_DIR / "start_server.sh")]
+    # start_server.sh reads helios.local.cnf on its own; a run without an
+    # override leaves it empty so an earlier run's value does not carry over.
+    LOCAL_CONF.write_text(
+        f"commit_durability = {commit_durability}\n" if commit_durability else "")
     if commit_durability:
-        env = dict(os.environ, HELIOS_COMMIT_DURABILITY=commit_durability)
-        print(f"  HELIOS_COMMIT_DURABILITY={commit_durability}")
-    result = _run_script([str(SCRIPTS_DIR / "start_server.sh")], timeout=30, env=env)
+        print(f"  commit_durability = {commit_durability}")
+    result = _run_script(argv, timeout=30)
     if result is None or result.returncode != 0:
         if result is not None:
             print(f"  ERROR starting helios-storage:\n{result.stdout}", file=sys.stderr)
@@ -908,9 +914,6 @@ def main():
         if not HELIOS_CTL.exists():
             sys.exit(f"--load-durability async needs {HELIOS_CTL} to end the load "
                      "contract; build it first")
-        if "HELIOS_COMMIT_DURABILITY" in os.environ:
-            sys.exit("--load-durability async sets HELIOS_COMMIT_DURABILITY itself; "
-                     "unset it in the environment first")
     jar = BENCHBASE_DIR / "benchbase.jar"
     if not jar.exists():
         print(f"ERROR: {jar} not found.\nRun: python3 bench/bin/build_benchbase.py", file=sys.stderr)

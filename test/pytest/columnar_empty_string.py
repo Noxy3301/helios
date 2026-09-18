@@ -33,15 +33,17 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from utils.connection import get_connection
+from utils.server_conf import write_conf
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 QUIET = "> /dev/null 2>&1"
 # The hold every bridge read takes between its epoch fence and its scan.
 FENCE_HOLD_MS = 1000
+# The debug sync points stay in the environment; the rest is configuration.
 SERVER_ENV = ("HELIOS_DEBUG_SYNC_PAX_VIEW_AFTER_FENCE"
-              f"=sleep:{FENCE_HOLD_MS} "
-              # The scan tallies, read back from the server log.
-              "ENABLE_DUCKDB_BRIDGE_DEBUG=1")
+              f"=sleep:{FENCE_HOLD_MS}")
+# The scan tallies, read back from the server log.
+SERVER_CONF = {"bridge_debug": 1}
 # Where the writer's commit lands inside the fence hold; a fence takes one
 # to two epochs, so this also clears it.
 WRITE_AT_S = 0.35
@@ -120,7 +122,8 @@ def ensure_stack_stopped(timeout_s=10):
 
 
 def start_stack_with_test_env():
-    if sh(f"{SERVER_ENV} ./scripts/start_server.sh {QUIET}") != 0:
+    conf = write_conf(**SERVER_CONF)
+    if sh(f"{SERVER_ENV} ./scripts/start_server.sh --config {conf} {QUIET}") != 0:
         raise RuntimeError("start_server.sh failed")
     time.sleep(2)
     if sh(f"./scripts/start_mysql.sh "

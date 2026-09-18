@@ -30,6 +30,7 @@
 #include <duckdb/parser/parsed_data/create_scalar_function_info.hpp>
 
 #include "../../common/log.h"
+#include "../server_config.hh"
 #include "../mysql_charset_runtime.hh"
 #include "m_ctype.h"
 
@@ -115,29 +116,14 @@ void AppendProxyField(std::string& out, std::string_view payload,
 // ---------------------------------------------------------------------------
 
 /**
- * @brief Whether ENABLE_DUCKDB_BRIDGE_DEBUG asks for the bridge's trace lines.
+ * @brief Whether the configuration asks for the bridge's trace lines.
  */
-bool BridgeDebugEnabled() {
-  static const bool enabled = [] {
-    const char* value = std::getenv("ENABLE_DUCKDB_BRIDGE_DEBUG");
-    return value != nullptr && value[0] != '\0' &&
-           std::string_view(value) != "0";
-  }();
-  return enabled;
-}
+bool BridgeDebugEnabled() { return config().bridge_debug; }
 
 /**
  * @brief Upper bound on the read view's epoch-fence wait.
  */
-uint32_t FenceTimeoutMs() {
-  static const uint32_t timeout_ms = [] {
-    const char* value = std::getenv("HELIOS_READ_VIEW_FENCE_TIMEOUT_MS");
-    if (value == nullptr) return 5000u;
-    const long parsed = std::strtol(value, nullptr, 10);
-    return parsed > 0 ? static_cast<uint32_t>(parsed) : 5000u;
-  }();
-  return timeout_ms;
-}
+uint32_t FenceTimeoutMs() { return config().read_view_fence_timeout_ms; }
 
 // ---------------------------------------------------------------------------
 // Proxy row-format decoding, for epoch images. A preserved old_row is a proxy
@@ -1270,7 +1256,7 @@ bool ParseByteSize(const char* value, uint64_t* out) {
   return true;
 }
 
-// The bounds ConfigureLimits read, 0 while the environment sets neither.
+// The bounds ConfigureLimits read, 0 while the configuration sets neither.
 idx_t bridge_threads = 0;
 idx_t bridge_memory = 0;
 
@@ -1279,7 +1265,7 @@ idx_t bridge_memory = 0;
  *
  * @details The thread pool defaults to a quarter of the hardware threads, so
  * an analytical stream does not take the cores the OLTP side runs on; a pure
- * analytical run sets HELIOS_BRIDGE_THREADS itself. An unset memory bound is
+ * analytical run sets bridge_threads itself. An unset memory bound is
  * DuckDB's own default.
  */
 duckdb::DBConfig* ConfigureBridgeLimits(duckdb::DBConfig* config) {
@@ -1506,24 +1492,15 @@ void EnsureDuckdbScanRegistered() {
 }  // namespace
 
 void ConfigureLimits() {
-  const char* threads = std::getenv("HELIOS_BRIDGE_THREADS");
-  if (threads != nullptr) {
-    uint64_t parsed = 0;
-    if (!ParseWholeNumber(threads, &parsed, nullptr)) {
-      LOG_FATAL(
-          "Invalid HELIOS_BRIDGE_THREADS='%s': expected a positive integer",
-          threads);
-    }
-    bridge_threads = static_cast<idx_t>(parsed);
-  }
-  const char* memory = std::getenv("HELIOS_BRIDGE_MEM_LIMIT");
-  if (memory != nullptr) {
+  bridge_threads = static_cast<idx_t>(config().bridge_threads);
+  const std::string& memory = config().bridge_mem_limit;
+  if (!memory.empty()) {
     uint64_t bytes = 0;
-    if (!ParseByteSize(memory, &bytes)) {
+    if (!ParseByteSize(memory.c_str(), &bytes)) {
       LOG_FATAL(
-          "Invalid HELIOS_BRIDGE_MEM_LIMIT='%s': expected a positive byte "
-          "count with an optional K, M or G suffix",
-          memory);
+          "Invalid configuration 'bridge_mem_limit = %s': expected a positive "
+          "byte count with an optional K, M or G suffix",
+          memory.c_str());
     }
     bridge_memory = static_cast<idx_t>(bytes);
   }

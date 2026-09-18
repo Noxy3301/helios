@@ -58,6 +58,8 @@ set(SOURCES
     main.cc
     helios_server.cc
     helios_server.hh
+    server_config.cc
+    server_config.hh
     
     # Network layer
     network/tcp_server.cc

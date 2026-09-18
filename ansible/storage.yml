@@ -12,7 +12,7 @@
     # sweep; left undefined, the load runs under helios_durability as well.
     helios_epoch_ms: ""
     # Extra KEY=VALUE pairs exported to the server (space separated)
-    helios_storage_env: ""
+    helios_storage_conf: ""
     # Path prefix for the WAL flush trace; empty disables it
     helios_flush_trace: ""
     wal_volume: false
@@ -79,13 +79,16 @@
         mkdir -p ~/helios/helios_wal ~/helios/helios_logs
         find ~/helios/helios_wal/ ~/helios/helios_logs/ -mindepth 1 -delete
         ulimit -n {{ storage_nofile_limit }}
-        export HELIOS_COMMIT_DURABILITY="{{ helios_load_durability | default(helios_durability) }}"
+        cat > ~/helios/helios.local.cnf <<'CONF'
+        commit_durability = {{ helios_load_durability | default(helios_durability) }}
         {% if helios_epoch_ms %}
-        export HELIOS_EPOCH_DURATION_MS="{{ helios_epoch_ms }}"
+        epoch_duration_ms = {{ helios_epoch_ms }}
         {% endif %}
-        {% for kv in helios_storage_env.split() %}
-        export '{{ kv }}'
+        {% for kv in helios_storage_conf.split() %}
+        {{ kv.split('=', 1) | join(' = ') }}
         {% endfor %}
+        CONF
+        # The flush trace is a storage diagnostic hook, not server configuration
         {% if helios_flush_trace %}
         mkdir -p "$(dirname {{ helios_flush_trace }})"
         export HELIOS_FLUSH_TRACE="{{ helios_flush_trace }}"
@@ -110,10 +113,10 @@
     - name: Show durability configuration
       debug:
         msg:
-          - "HELIOS_COMMIT_DURABILITY={{ helios_load_durability | default(helios_durability) }} (load phase)"
+          - "commit_durability={{ helios_load_durability | default(helios_durability) }} (load phase)"
           - "measured contract: {{ helios_durability }}"
-          - "HELIOS_EPOCH_DURATION_MS={{ helios_epoch_ms if helios_epoch_ms else '(server default)' }}"
-          - "extra env: {{ helios_storage_env if helios_storage_env else '(none)' }}"
+          - "epoch_duration_ms={{ helios_epoch_ms if helios_epoch_ms else '(server default)' }}"
+          - "extra configuration: {{ helios_storage_conf if helios_storage_conf else '(none)' }}"
           - "HELIOS_FLUSH_TRACE={{ helios_flush_trace if helios_flush_trace else '(off)' }}"
 
     - name: Capture WAL volume disk usage

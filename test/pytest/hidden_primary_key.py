@@ -21,6 +21,7 @@ import mysql.connector
 from mysql.connector import errorcode
 
 from utils.connection import get_connection
+from utils.server_conf import write_conf
 
 ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 SCRIPTS_DIR = os.path.join(ROOT_DIR, "scripts")
@@ -153,21 +154,18 @@ def start_storage_server(work_dir, recovery=True):
     before the restart below; with it off the restart starts from nothing,
     which is what the reserved-but-not-durable window needs.
     """
-    env = dict(os.environ)
-    env["HELIOS_SERVER_PORT"] = str(RESTART_SERVER_PORT)
+    conf = {"server_port": RESTART_SERVER_PORT}
     if recovery:
-        env["HELIOS_ENABLE_RECOVERY"] = "1"
-        env["HELIOS_COMMIT_DURABILITY"] = "sync"
-    else:
-        env.pop("HELIOS_ENABLE_RECOVERY", None)
-        env.pop("HELIOS_COMMIT_DURABILITY", None)
+        conf.update(enable_recovery=1, commit_durability="sync")
+    path = write_conf(work_dir, **conf)
+    env = dict(os.environ)
     jemalloc = "/lib/x86_64-linux-gnu/libjemalloc.so.2"
     if os.path.exists(jemalloc):
         env["LD_PRELOAD"] = jemalloc
 
     log = open(os.path.join(work_dir, "server.log"), "a")
-    process = subprocess.Popen([SERVER_BIN], cwd=work_dir, env=env,
-                               stdin=subprocess.DEVNULL, stdout=log,
+    process = subprocess.Popen([SERVER_BIN, "--config", path], cwd=work_dir,
+                               env=env, stdin=subprocess.DEVNULL, stdout=log,
                                stderr=subprocess.STDOUT)
     deadline = time.time() + SERVER_START_TIMEOUT
     while time.time() < deadline:

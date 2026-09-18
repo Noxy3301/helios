@@ -10,6 +10,7 @@ boost
 
 helios_logs
 helios_wal
+helios.local.cnf
 .related_work
 
 bench/benchbase-mysql/

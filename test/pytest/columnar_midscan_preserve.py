@@ -67,6 +67,7 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from utils.connection import get_connection
+from utils.server_conf import write_conf
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 QUIET = "> /dev/null 2>&1"
@@ -74,18 +75,20 @@ QUIET = "> /dev/null 2>&1"
 # its epoch fence and its scan.
 PAUSE_MS = 1500
 FENCE_HOLD_MS = 2500
+# The debug sync points stay in the environment; the rest is configuration.
 SERVER_ENV = (
     "HELIOS_DEBUG_SYNC_SILO_COMMIT_BETWEEN_ROW_INSTALLS"
     f"=sleep:{PAUSE_MS} "
     "HELIOS_DEBUG_SYNC_PAX_VIEW_AFTER_FENCE"
-    f"=sleep:{FENCE_HOLD_MS} "
+    f"=sleep:{FENCE_HOLD_MS}")
+SERVER_CONF = {
     # One analytical thread: the scan has to outlive the install pause.
-    "HELIOS_BRIDGE_THREADS=1 "
+    "bridge_threads": 1,
     # The scan tallies, read back from the server log.
-    "ENABLE_DUCKDB_BRIDGE_DEBUG=1 "
+    "bridge_debug": 1,
     # The table is loaded one row per transaction, because the install pause
     # fires between the row installs of any larger one.
-    "HELIOS_COMMIT_DURABILITY=async")
+    "commit_durability": "async"}
 # A fence takes one to two epochs; the writer delay allows for it.
 FENCE_S = 0.06
 # Where the second install should land inside the scan.
@@ -157,7 +160,8 @@ def ensure_stack_stopped(timeout_s=10):
 
 
 def start_stack_with_test_env():
-    if sh(f"{SERVER_ENV} ./scripts/start_server.sh {QUIET}") != 0:
+    conf = write_conf(**SERVER_CONF)
+    if sh(f"{SERVER_ENV} ./scripts/start_server.sh --config {conf} {QUIET}") != 0:
         raise RuntimeError("start_server.sh failed")
     time.sleep(2)
     if sh(f"./scripts/start_mysql.sh "

@@ -26,6 +26,9 @@ import subprocess
 import sys
 import tempfile
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from utils.server_conf import write_conf
+
 REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 SERVER = os.path.join(REPO, "build", "server", "helios-storage")
 
@@ -65,13 +68,11 @@ def make_frame(epoch):
     return header_without_crc + struct.pack("<I", checksum) + payload
 
 
-def run_server(work_dir, extra_env):
+def run_server(work_dir, conf):
     """Starts the server with work_dir as its cwd and returns (rc, output)."""
-    env = {**os.environ, "HELIOS_EPOCH_DURATION_MS": "10", **extra_env}
-    env.pop("HELIOS_ENABLE_RECOVERY", None)
-    env.update(extra_env)
+    path = write_conf(work_dir, epoch_duration_ms=10, **conf)
     try:
-        done = subprocess.run([SERVER], cwd=work_dir, env=env,
+        done = subprocess.run([SERVER, "--config", path], cwd=work_dir,
                               stdin=subprocess.DEVNULL,
                               stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                               text=True, timeout=STARTUP_TIMEOUT_SECONDS)
@@ -86,17 +87,17 @@ def run_server(work_dir, extra_env):
         return None, captured
 
 
-def with_crafted_log(frontier, extra_env):
+def with_crafted_log(frontier, conf):
     with tempfile.TemporaryDirectory(prefix="helios_high_water_") as work_dir:
         log_dir = os.path.join(work_dir, "helios_wal")
         os.makedirs(log_dir)
         with open(os.path.join(log_dir, "wal.log"), "wb") as wal:
             wal.write(make_frame(frontier))
-        return run_server(work_dir, extra_env)
+        return run_server(work_dir, conf)
 
 
-def expect_refusal(label, frontier, extra_env):
-    rc, output = with_crafted_log(frontier, extra_env)
+def expect_refusal(label, frontier, conf):
+    rc, output = with_crafted_log(frontier, conf)
     if rc is None:
         print(f"FAIL [{label}]: the server kept running instead of refusing to "
               f"start")
@@ -120,7 +121,7 @@ def expect_refusal(label, frontier, extra_env):
     return True
 
 
-def expect_startup(label, frontier, extra_env):
+def expect_startup(label, frontier, conf):
     """The control: startup must not be refused for a frontier far from the mark.
 
     The oracle is the startup decision, not the exit code. Whether the process
@@ -128,7 +129,7 @@ def expect_startup(label, frontier, extra_env):
     runs with a server already listening on it -- so it reaches initialization
     and exits on the bind instead of serving.
     """
-    rc, output = with_crafted_log(frontier, extra_env)
+    rc, output = with_crafted_log(frontier, conf)
     if "high-water mark" in output:
         print(f"FAIL [{label}]: startup was refused for a frontier that is "
               f"nowhere near the mark; output was:\n{output[-800:]}")
@@ -149,9 +150,8 @@ def main():
 
     # The scan runs under every contract, so the mode here only has to be one
     # that keeps a log; recovery is what the two cases vary.
-    off = {"HELIOS_COMMIT_DURABILITY": "async"}
-    on = {"HELIOS_COMMIT_DURABILITY": "async",
-          "HELIOS_ENABLE_RECOVERY": "1"}
+    off = {"commit_durability": "async"}
+    on = {"commit_durability": "async", "enable_recovery": 1}
 
     ok = True
     # Both startup paths compute the resume epoch: without recovery the records
