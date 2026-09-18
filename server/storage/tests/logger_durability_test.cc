@@ -176,9 +176,13 @@ TEST_F(LoggerDurabilityTest, WaitersWakeAtEpochGranularity) {
   logger.Enqueue(MakePrimaryRecord("alice", 5));
   logger.Enqueue(MakePrimaryRecord("bob", 7));
 
+  // A waiter on another thread takes a deadline: an unbounded one would turn
+  // a failed assertion below into a test that never ends, because the
+  // future's destructor joins it.
   auto spawn_waiter = [&logger](EpochNumber epoch) {
     return std::async(std::launch::async, [&logger, epoch] {
-      return logger.WaitUntilDurable(epoch, Logger::Deadline::max());
+      return logger.WaitUntilDurable(
+          epoch, std::chrono::steady_clock::now() + kTestTimeout);
     });
   };
   auto first = spawn_waiter(5);
@@ -370,10 +374,12 @@ TEST_F(LoggerDurabilityTest, StopWakesEveryWaiter) {
   logger.Start();
 
   auto first = std::async(std::launch::async, [&logger] {
-    return logger.WaitUntilDurable(11, Logger::Deadline::max());
+    return logger.WaitUntilDurable(
+        11, std::chrono::steady_clock::now() + kTestTimeout);
   });
   auto second = std::async(std::launch::async, [&logger] {
-    return logger.WaitUntilDurable(12, Logger::Deadline::max());
+    return logger.WaitUntilDurable(
+        12, std::chrono::steady_clock::now() + kTestTimeout);
   });
   // Both are inside the wait, rather than merely started, when the stop
   // arrives: neither epoch is durable, so neither may be ready.
@@ -403,7 +409,8 @@ TEST_F(LoggerDurabilityTest,
 
   logger.Enqueue(MakePrimaryRecord("alice", 3));
   auto waiting = std::async(std::launch::async, [&logger] {
-    return logger.WaitUntilDurable(3, Logger::Deadline::max());
+    return logger.WaitUntilDurable(
+        3, std::chrono::steady_clock::now() + kTestTimeout);
   });
   ASSERT_EQ(waiting.wait_for(std::chrono::milliseconds(50)),
             std::future_status::timeout);
