@@ -1,6 +1,6 @@
 #include "helios_autogen.hh"
 
-#include "../common/log.h"
+#include "helios_log.hh"
 
 #include <algorithm>
 #include <cstdint>
@@ -33,84 +33,6 @@ struct UnsupportedQep {
   AccessPath::Type type{AccessPath::TABLE_SCAN};
   std::string reason;
 };
-
-const char *access_path_type_name(AccessPath::Type type) {
-  switch (type) {
-    case AccessPath::TABLE_SCAN: return "TABLE_SCAN";
-    case AccessPath::INDEX_SCAN: return "INDEX_SCAN";
-    case AccessPath::REF: return "REF";
-    case AccessPath::REF_OR_NULL: return "REF_OR_NULL";
-    case AccessPath::EQ_REF: return "EQ_REF";
-    case AccessPath::PUSHED_JOIN_REF: return "PUSHED_JOIN_REF";
-    case AccessPath::FULL_TEXT_SEARCH: return "FULL_TEXT_SEARCH";
-    case AccessPath::CONST_TABLE: return "CONST_TABLE";
-    case AccessPath::MRR: return "MRR";
-    case AccessPath::FOLLOW_TAIL: return "FOLLOW_TAIL";
-    case AccessPath::INDEX_RANGE_SCAN: return "INDEX_RANGE_SCAN";
-    case AccessPath::INDEX_MERGE: return "INDEX_MERGE";
-    case AccessPath::ROWID_INTERSECTION: return "ROWID_INTERSECTION";
-    case AccessPath::ROWID_UNION: return "ROWID_UNION";
-    case AccessPath::INDEX_SKIP_SCAN: return "INDEX_SKIP_SCAN";
-    case AccessPath::GROUP_INDEX_SKIP_SCAN: return "GROUP_INDEX_SKIP_SCAN";
-    case AccessPath::DYNAMIC_INDEX_RANGE_SCAN:
-      return "DYNAMIC_INDEX_RANGE_SCAN";
-    case AccessPath::TABLE_VALUE_CONSTRUCTOR:
-      return "TABLE_VALUE_CONSTRUCTOR";
-    case AccessPath::FAKE_SINGLE_ROW: return "FAKE_SINGLE_ROW";
-    case AccessPath::ZERO_ROWS: return "ZERO_ROWS";
-    case AccessPath::ZERO_ROWS_AGGREGATED: return "ZERO_ROWS_AGGREGATED";
-    case AccessPath::MATERIALIZED_TABLE_FUNCTION:
-      return "MATERIALIZED_TABLE_FUNCTION";
-    case AccessPath::UNQUALIFIED_COUNT: return "UNQUALIFIED_COUNT";
-    case AccessPath::NESTED_LOOP_JOIN: return "NESTED_LOOP_JOIN";
-    case AccessPath::NESTED_LOOP_SEMIJOIN_WITH_DUPLICATE_REMOVAL:
-      return "NESTED_LOOP_SEMIJOIN_WITH_DUPLICATE_REMOVAL";
-    case AccessPath::BKA_JOIN: return "BKA_JOIN";
-    case AccessPath::HASH_JOIN: return "HASH_JOIN";
-    case AccessPath::FILTER: return "FILTER";
-    case AccessPath::SORT: return "SORT";
-    case AccessPath::AGGREGATE: return "AGGREGATE";
-    case AccessPath::TEMPTABLE_AGGREGATE: return "TEMPTABLE_AGGREGATE";
-    case AccessPath::LIMIT_OFFSET: return "LIMIT_OFFSET";
-    case AccessPath::STREAM: return "STREAM";
-    case AccessPath::MATERIALIZE: return "MATERIALIZE";
-    case AccessPath::MATERIALIZE_INFORMATION_SCHEMA_TABLE:
-      return "MATERIALIZE_INFORMATION_SCHEMA_TABLE";
-    case AccessPath::APPEND: return "APPEND";
-    case AccessPath::WINDOW: return "WINDOW";
-    case AccessPath::WEEDOUT: return "WEEDOUT";
-    case AccessPath::REMOVE_DUPLICATES: return "REMOVE_DUPLICATES";
-    case AccessPath::REMOVE_DUPLICATES_ON_INDEX:
-      return "REMOVE_DUPLICATES_ON_INDEX";
-    case AccessPath::ALTERNATIVE: return "ALTERNATIVE";
-    case AccessPath::CACHE_INVALIDATOR: return "CACHE_INVALIDATOR";
-    case AccessPath::DELETE_ROWS: return "DELETE_ROWS";
-    case AccessPath::UPDATE_ROWS: return "UPDATE_ROWS";
-  }
-  return "UNKNOWN";
-}
-
-// Report a shape with no read plan. Not an error: the statement's reads take
-// the row path instead. Always returns false so callers can return it.
-bool plan_not_staged(THD *thd, const char *type_name,
-                     const std::string &reason) {
-  const LEX_CSTRING query = thd != nullptr ? thd->query() : LEX_CSTRING();
-  const std::string sql =
-      query.str != nullptr && query.length > 0
-          ? std::string(query.str, query.length)
-          : std::string();
-  const long long query_id = thd != nullptr ? thd->query_id : 0;
-
-  LOG_DEBUG("autogen read plan not staged: type=%s reason=%s query_id=%lld sql=%s",
-            type_name != nullptr ? type_name : "UNKNOWN", reason.c_str(),
-            query_id, sql.c_str());
-  return false;
-}
-
-bool plan_not_staged(THD *thd, AccessPath::Type type,
-                     const std::string &reason) {
-  return plan_not_staged(thd, access_path_type_name(type), reason);
-}
 
 void set_unsupported(AccessPath *p, const char *reason, bool *ok,
                      UnsupportedQep *unsupported) {
@@ -1155,12 +1077,12 @@ bool autogen_read_plan_from_qep(
     std::vector<HeliosProxy::ReadPlanStep> *out,
     bool include_inner_units) {
   if (out == nullptr) {
-    return plan_not_staged(thd, "NONE", "null output vector");
+    return false;  // null output vector
   }
   out->clear();
 
   if (root == nullptr) {
-    return plan_not_staged(thd, "NONE", "missing JOIN root_access_path");
+    return false;  // missing JOIN root_access_path
   }
 
   std::unordered_map<TABLE *, int> table_steps;
@@ -1171,7 +1093,7 @@ bool autogen_read_plan_from_qep(
   if (!compile_tree_leaves(thd, root, /*allow_limit_pushdown=*/true,
                            &table_steps, &steps,
                            &added_tables, &unsupported)) {
-    return plan_not_staged(thd, unsupported.type, unsupported.reason);
+    return false;  // unsupported names the leaf
   }
 
   if (include_inner_units && thd != nullptr && thd->lex != nullptr) {
@@ -1199,7 +1121,7 @@ bool autogen_read_plan_from_qep(
   }
 
   if (steps.empty()) {
-    return plan_not_staged(thd, root->type, "QEP has no stageable leaves");
+    return false;  // the QEP has no leaf a read plan covers
   }
 
   // Fold byte-identical staged steps into the earliest one (a view read twice,
@@ -1291,14 +1213,14 @@ bool autogen_read_plan_from_index_search(
     THD *thd, TABLE *table, uint index, const IndexSearchPlan &search,
     std::vector<HeliosProxy::ReadPlanStep> *out) {
   if (out == nullptr) {
-    return plan_not_staged(thd, "HANDLER", "null output vector");
+    return false;  // null output vector
   }
   out->clear();
 
   HeliosProxy::ReadPlanStep step;
   std::string reason;
   if (!compile_index_search(table, index, search, &step, &reason)) {
-    return plan_not_staged(thd, "HANDLER", reason);
+    return false;  // reason names the shape
   }
 
   out->push_back(std::move(step));

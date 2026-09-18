@@ -12,7 +12,7 @@
 
 #include "helios_proxy.hh"
 #include "rpc_trace.hh"
-#include "../common/log.h"
+#include "helios_log.hh"
 
 
 
@@ -565,7 +565,6 @@ bool HeliosProxy::db_create_table(
     const std::vector<uint32_t>& pax_field_max_bytes,
     const std::vector<uint32_t>& pax_field_kind,
     const std::vector<int32_t>& pax_field_scale) {
-    LOG_DEBUG("CLIENT: db_create_table called with table=%s", table_name.c_str());
     if (!ensure_connected()) {
         LOG_ERROR("RPC failed: Not connected to server");
         return false;
@@ -590,7 +589,6 @@ bool HeliosProxy::db_create_table(
         return false;
     }
 
-    LOG_DEBUG("CLIENT: db_create_table completed, success: %s", response.success() ? "true" : "false");
     return response.success();
 }
 
@@ -636,8 +634,6 @@ HeliosProxy::HiddenKeyReservation HeliosProxy::db_allocate_hidden_keys(
 bool HeliosProxy::db_create_secondary_index(const std::string& table_name,
                                                 const std::string& index_name,
                                                 uint32_t index_type) {
-    LOG_DEBUG("CLIENT: db_create_secondary_index called with table=%s, index=%s, type=%u",
-              table_name.c_str(), index_name.c_str(), index_type);
     if (!ensure_connected()) {
         LOG_ERROR("RPC failed: Not connected to server");
         return false;
@@ -655,7 +651,6 @@ bool HeliosProxy::db_create_secondary_index(const std::string& table_name,
         return false;
     }
 
-    LOG_DEBUG("CLIENT: db_create_secondary_index completed, success: %s", response.success() ? "true" : "false");
     return response.success();
 }
 
@@ -728,16 +723,12 @@ bool HeliosProxy::exchange_message(const std::string& serialized_request,
         return false;
     }
 
-    LOG_DEBUG("SEND_MESSAGE: Sending message of size %zu bytes with message_type %u", 
-              serialized_request.size(), static_cast<uint32_t>(message_type));
 
     // prepare message header
     MessageHeader header;
     header.message_type = htonl(static_cast<uint32_t>(message_type));
     header.payload_size = htonl(static_cast<uint32_t>(serialized_request.size()));
 
-    LOG_DEBUG("SEND_MESSAGE: Prepared header: message_type=%u, payload_size=%zu",
-              static_cast<uint32_t>(message_type), serialized_request.size());
 
     // combine header and payload
     size_t total_size = sizeof(header) + serialized_request.size();
@@ -757,7 +748,6 @@ bool HeliosProxy::exchange_message(const std::string& serialized_request,
         total_sent += bytes_sent;
     }
 
-    LOG_DEBUG("SEND_MESSAGE: Successfully sent %zu bytes", total_sent);
 
     // receive response header
     MessageHeader response_header;
@@ -771,8 +761,6 @@ bool HeliosProxy::exchange_message(const std::string& serialized_request,
     uint32_t response_message_type = ntohl(response_header.message_type);
     uint32_t response_payload_size = ntohl(response_header.payload_size);
 
-    LOG_DEBUG("SEND_MESSAGE: Received response header: message_type=%u, payload_size=%u",
-              response_message_type, response_payload_size);
 
     // Receive the response payload. recv(MSG_WAITALL) still caps one call near
     // 2GB, so large read-plan responses must be drained in a loop.
@@ -790,13 +778,10 @@ bool HeliosProxy::exchange_message(const std::string& serialized_request,
             }
             received_total += static_cast<size_t>(chunk);
         }
-        LOG_DEBUG("SEND_MESSAGE: Successfully received response payload (%zu bytes)", received_total);
     } else {
-        LOG_DEBUG("SEND_MESSAGE: No response payload (empty response)");
         serialized_response.clear();
     }
 
-    LOG_DEBUG("SEND_MESSAGE: Message exchange completed successfully");
     if (current_trace_ != nullptr && current_trace_->active()) {
         auto rpc_us = std::chrono::duration_cast<std::chrono::microseconds>(
                           std::chrono::steady_clock::now() - rpc_start_ts)

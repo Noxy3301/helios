@@ -29,7 +29,7 @@
  */
 
 #include "storage/helios/ha_helios.hh"
-#include "../common/log.h"
+#include "helios_log.hh"
 
 #include <algorithm>
 #include <cctype>
@@ -72,6 +72,11 @@ static ulong srv_server_port = 9999;
 ulong srv_read_path = kReadPathPlan;
 bool srv_stats_drift_refresh = false;
 handlerton *helios_hton;
+
+// Error log service, acquired for the life of the plugin.
+static SERVICE_TYPE(registry) *reg_srv = nullptr;
+SERVICE_TYPE(log_builtins) *log_bi = nullptr;
+SERVICE_TYPE(log_builtins_string) *log_bs = nullptr;
 
 // THD-scoped context
 struct HeliosThdCtx {
@@ -127,6 +132,8 @@ static handler *helios_create_handler(handlerton *hton, TABLE_SHARE *table,
 static int helios_init_func(void *p) {
   DBUG_TRACE;
 
+  if (init_logging_service_for_plugin(&reg_srv, &log_bi, &log_bs)) return 1;
+
   helios_hton = (handlerton *)p;
   helios_hton->state = SHOW_OPTION_YES;
   helios_hton->create = helios_create_handler;
@@ -140,6 +147,11 @@ static int helios_init_func(void *p) {
   helios_hton->rollback = helios_abort;
   helios_hton->close_connection = helios_close_connection;
 
+  return 0;
+}
+
+static int helios_deinit_func(void *) {
+  deinit_logging_service_for_plugin(&reg_srv, &log_bi, &log_bs);
   return 0;
 }
 
@@ -494,7 +506,7 @@ mysql_declare_plugin(helios){
     PLUGIN_LICENSE_GPL,
     helios_init_func, /* Plugin Init */
     nullptr,             /* Plugin check uninstall */
-    nullptr,             /* Plugin Deinit */
+    helios_deinit_func,  /* Plugin Deinit */
     0x0001 /* 0.1 */,
     nullptr,                    /* status variables */
     helios_system_variables, /* system variables */

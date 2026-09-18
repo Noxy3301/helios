@@ -46,6 +46,7 @@ set(HELIOS_SOURCES ha_helios.cc ha_helios.hh
                       multi_range_read.cc
                       optimizer_stats.cc
                       helios_field.cc helios_field.hh
+                      helios_log.hh
                       helios_transaction.cc helios_transaction.hh
                       helios_proxy.cc helios_proxy.hh
                       key_pack.cc key_pack.hh
