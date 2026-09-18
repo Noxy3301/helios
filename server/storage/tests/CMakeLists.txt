@@ -38,7 +38,23 @@ macro(register_test testfile testfilepath)
   add_test(
     NAME ${testfile}
     COMMAND ${CMAKE_CURRENT_BINARY_DIR}/${testfile})
+
+  # These build a Database on the default working directory, so no two of them
+  # may run at once; the lock lets the rest run alongside.
+  if(${testfile} IN_LIST shared_work_dir_tests)
+    set_tests_properties(${testfile} PROPERTIES RESOURCE_LOCK default_work_dir)
+  endif()
 endmacro()
+
+set(shared_work_dir_tests
+    concurrent_create_table_test
+    create_secondary_index_test
+    data_definition_test
+    database_test
+    durability_test
+    manipulate_secondary_index_test
+    secondary_index_logging_test
+    unique_secondary_index_test)
 
 file(GLOB_RECURSE tests RELATIVE ${CMAKE_CURRENT_SOURCE_DIR} "*_test.cc")
 foreach(test ${tests})
