@@ -33,7 +33,7 @@ SERVER = os.path.join(REPO, "build", "server", "helios-storage")
 HIGH_WATER = 0xFFFFFFFF - (1 << 20)
 
 # Wal frame constants, little-endian.
-MAGIC = 0x4C57414C
+MAGIC = 0x4C415748
 FLAGS = 0
 
 STARTUP_TIMEOUT_SECONDS = 20

@@ -176,7 +176,7 @@ class Wal {
    */
   size_t extension_count() const { return extension_count_; }
 
-  static constexpr uint32_t kMagic = 0x4c57414c;  // "LAWL"
+  static constexpr uint32_t kMagic = 0x4c415748;  // "HWAL"
   static constexpr uint16_t kFlags = 0;
   static constexpr size_t kHeaderSize = 18;
   static constexpr uint32_t kMaxPayloadSize = 256u * 1024u * 1024u;

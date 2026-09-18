@@ -133,7 +133,7 @@ class EpochScanCheckpoint {
    */
   static const char *WorkingFileName();
 
-  static constexpr uint32_t kMagic = 0x504b434c;  // "LCKP"
+  static constexpr uint32_t kMagic = 0x504b4348;  // "HCKP"
   static constexpr uint16_t kFlags = 0;
   static constexpr size_t kHeaderSize = 50;
 
