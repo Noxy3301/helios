@@ -691,8 +691,8 @@ Examples:
     )
 
     # Engine selection
-    parser.add_argument("--engine", default="storage", choices=["storage", "innodb"],
-                        help="Storage engine under test (default: storage, the full Helios "
+    parser.add_argument("--engine", default="helios", choices=["helios", "innodb"],
+                        help="Storage engine under test (default: helios, the full Helios "
                              "stack). innodb runs the same sweep against a single stock "
                              "MySQL/InnoDB node instead: no Helios storage server, "
                              "--mysql-count fixed at 1, no read-path/ndv-drift options; size "
@@ -820,7 +820,7 @@ Examples:
         if args.durability != "sync":
             parser.error("--load-durability async only relaxes a sync sweep; "
                          "pass --durability sync")
-        if args.engine != "storage":
+        if args.engine != "helios":
             parser.error("--load-durability async switches the Helios storage server; "
                          "not valid with --engine innodb")
     if args.engine == "innodb":
