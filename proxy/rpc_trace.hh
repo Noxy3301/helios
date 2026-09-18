@@ -70,7 +70,7 @@ class TxRpcTrace {
   std::map<std::string, uint32_t> local_view_by_kind_;
 };
 
-// Singleton JSONL logger enabled by ENABLE_RPC_TRACE.
+// Singleton JSONL logger enabled by helios_rpc_trace.
 class RpcTraceLogger {
  public:
   static RpcTraceLogger& instance();

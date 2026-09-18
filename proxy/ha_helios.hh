@@ -142,6 +142,12 @@ extern bool srv_stats_drift_refresh;
 enum ReadPath { kReadPathRow = 0, kReadPathPlan = 1 };
 extern ulong srv_read_path;
 
+// Whether the RPC trace is written, and where; empty names a file under /tmp
+// by pid.
+extern bool srv_rpc_trace;
+extern char *srv_rpc_trace_path;
+
+
 namespace helios {
 
 /**

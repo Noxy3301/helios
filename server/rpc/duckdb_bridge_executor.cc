@@ -4,9 +4,9 @@
 // groups without epoch images and through those images otherwise. DuckDB
 // contributes its binder, planner, and vectorized runtime; no table data ever
 // lives inside DuckDB. duckdb_bridge_dispatch.cc routes the opcode here.
-// HELIOS_BRIDGE_THREADS bounds the analytical thread pool; unset is a quarter
-// of the hardware threads, which leaves the OLTP side its cores in a mixed run.
-// HELIOS_BRIDGE_MEM_LIMIT bounds DuckDB's operator memory (a byte count, K/M/G
+// bridge_threads bounds the analytical thread pool; unset is a quarter of the
+// hardware threads, which leaves the OLTP side its cores in a mixed run.
+// bridge_mem_limit bounds DuckDB's operator memory (a byte count, K/M/G
 // accepted); unset is DuckDB's own default.
 //
 // Consistency: the request runs against a columnar read view with snapshot
@@ -287,7 +287,7 @@ struct PaxTableView {
   size_t group_count = 0;  // fixed after the read view fence, not live state
   uint32_t snapshot_epoch = 0;  // read view serialization point se
 
-  // Scan tallies for one request, reported under ENABLE_DUCKDB_BRIDGE_DEBUG.
+  // Scan tallies for one request, reported under bridge_debug.
   std::atomic<uint64_t> groups_scanned{0};
   std::atomic<uint64_t> groups_with_images{0};
   std::atomic<uint64_t> chunk_audits_redone{0};

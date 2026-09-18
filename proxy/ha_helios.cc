@@ -71,6 +71,8 @@ static char *srv_server_host = nullptr;
 static ulong srv_server_port = 9999;
 ulong srv_read_path = kReadPathPlan;
 bool srv_stats_drift_refresh = false;
+bool srv_rpc_trace = false;
+char *srv_rpc_trace_path = nullptr;
 handlerton *helios_hton;
 
 // Error log service, acquired for the life of the plugin.
@@ -486,11 +488,23 @@ static MYSQL_SYSVAR_BOOL(stats_drift_refresh, srv_stats_drift_refresh,
                          "synchronous refresh scans every requested index on "
                          "the server.",
                          nullptr, nullptr, false);
+// The trace file is opened once, on the first RPC of the process.
+static MYSQL_SYSVAR_BOOL(rpc_trace, srv_rpc_trace, PLUGIN_VAR_READONLY,
+                         "Write a JSONL trace of every RPC, statement and "
+                         "transaction.",
+                         nullptr, nullptr, false);
+static MYSQL_SYSVAR_STR(rpc_trace_path, srv_rpc_trace_path,
+                        PLUGIN_VAR_READONLY | PLUGIN_VAR_MEMALLOC,
+                        "Where the RPC trace is written; unset writes "
+                        "/tmp/helios_rpc_trace_<pid>.jsonl.",
+                        nullptr, nullptr, nullptr);
 static SYS_VAR *helios_system_variables[] = {
     MYSQL_SYSVAR(server_host),
     MYSQL_SYSVAR(server_port),
     MYSQL_SYSVAR(read_path),
     MYSQL_SYSVAR(stats_drift_refresh),
+    MYSQL_SYSVAR(rpc_trace),
+    MYSQL_SYSVAR(rpc_trace_path),
     nullptr};
 
 extern struct st_mysql_storage_engine helios_columnar_storage_engine;

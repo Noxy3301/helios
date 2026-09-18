@@ -600,8 +600,9 @@ def test_rpc_shape(user, password):
          "--mysqld-port", str(RPC_TRACE_PORT),
          "--server-host", "127.0.0.1", "--server-port", "9999"],
         cwd=ROOT, capture_output=True, text=True,
-        env={**os.environ, "ENABLE_RPC_TRACE": "1",
-             "ENABLE_RPC_TRACE_PATH": trace_path})
+        env={**os.environ,
+             "MYSQLD_EXTRA_ARGS": f"--helios-rpc-trace=ON "
+                                  f"--helios-rpc-trace-path={trace_path}"})
     pid = int(open(pid_path).read().strip()) if os.path.exists(pid_path) else None
     if done.returncode != 0 or pid is None:
         print(f"\tFailed: no mysqld on {RPC_TRACE_PORT}: {done.stdout[-300:]}")

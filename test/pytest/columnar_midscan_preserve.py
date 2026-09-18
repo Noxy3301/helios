@@ -21,7 +21,7 @@ afterwards, so a run that missed the window fails loudly instead of passing
 vacuously.
 
 The scan is made long enough to span the pause by a per-row LIKE over a wide
-column and a single analytical thread (HELIOS_BRIDGE_THREADS=1). The query
+column and a single analytical thread (bridge_threads = 1). The query
 aggregates, so a torn result is a wrong number rather than a wrong row order:
 COUNT(*), SUM(v) and COUNT(n) must equal the full pre-write state, never a
 mix. Column n is nullable and carries NULL on every even id, which pins the
