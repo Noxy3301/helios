@@ -202,10 +202,13 @@ bool Database::IndexHistogram(const std::string_view table_name,
     out_cum.clear();
     return false;
   }
-  if (out_bounds.empty() || out_cum.back() != total) {
+  // The counts come from the second walk, which a concurrent write can leave
+  // apart from the first walk's total; mixing the two breaks monotonicity.
+  if (seen == 0) return false;
+  if (out_bounds.empty() || out_cum.back() != seen) {
     // Include the last visited key as the final histogram boundary.
     out_bounds.push_back(last_bound);
-    out_cum.push_back(total);
+    out_cum.push_back(seen);
   }
   return !out_bounds.empty();
 }

@@ -34,16 +34,6 @@ using helios::storage::wal::WalIo;
 
 constexpr auto kTestTimeout = std::chrono::seconds(5);
 
-// The epoch writer parks until Start(), and the destructor joins it, on
-// every exit.
-struct Joiner {
-  helios::storage::epoch::Framework &framework;
-  ~Joiner() {
-    framework.Start();
-    framework.Stop();
-  }
-};
-
 // Exercises the logger without constructing a Database: the WAL and the
 // durable epoch are the units under test here, and a Database would
 // drag in the epoch framework.
@@ -106,7 +96,6 @@ TEST_F(LoggerDurabilityTest, WaitEpochDiffReturnsWhenTheDurableEpochIsClose) {
   logger.Start();
   // The ticker stays parked; SetGlobalEpoch moves E by hand.
   helios::storage::epoch::Framework framework;
-  Joiner joiner{framework};
 
   // An epoch below the bound is the guard against unsigned underflow.
   framework.SetGlobalEpoch(1);
@@ -134,7 +123,6 @@ TEST_F(LoggerDurabilityTest, WaitEpochDiffFollowsTheGlobalEpochWhileWaiting) {
   logger.Start();
   // The ticker stays parked; SetGlobalEpoch moves E by hand.
   helios::storage::epoch::Framework framework;
-  Joiner joiner{framework};
 
   // D is 0 and the lag is one epoch over the bound.
   framework.SetGlobalEpoch(Logger::kEpochDiff + 1);
@@ -169,7 +157,6 @@ TEST_F(LoggerDurabilityTest, WaitEpochDiffEndsWhenTheLoggerStops) {
   logger.Start();
   // The ticker stays parked; SetGlobalEpoch moves E by hand.
   helios::storage::epoch::Framework framework;
-  Joiner joiner{framework};
 
   // D is 0 and the lag is one epoch over the bound: the waiter blocks.
   framework.SetGlobalEpoch(Logger::kEpochDiff + 1);

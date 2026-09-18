@@ -270,10 +270,12 @@ class Framework {
     const auto epoch_duration =
         std::chrono::duration_cast<std::chrono::nanoseconds>(
             std::chrono::milliseconds(epoch_duration_ms));
-    // Block until Start().
+    // Block until Start(), or until a framework that was never started is
+    // destroyed.
     {
       std::unique_lock<std::mutex> lk(epoch_mutex_);
-      epoch_cv_.wait(lk, [&] { return start_.load(); });
+      epoch_cv_.wait(lk, [&] { return start_.load() || stop_.load(); });
+      if (!start_.load()) return;
     }
 
     for (;;) {

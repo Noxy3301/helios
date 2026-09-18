@@ -133,7 +133,8 @@ using PrimaryPos = std::unordered_map<std::pair<std::string, std::string>,
 bool IsSecondary(const Write &write) { return !write.index_name.empty(); }
 
 // Keep the newest delta per (secondary key, primary key). A full entry
-// arrives as one add per primary key it holds.
+// arrives as one add per primary key it holds. On an equal transaction id
+// the later record wins, on both paths.
 void FoldSecondary(const Write &write, SecondaryOps &ops) {
   const auto op = write.secondary_op;
   if (op == SecondaryIndexOp::kFull) {
@@ -141,11 +142,12 @@ void FoldSecondary(const Write &write, SecondaryOps &ops) {
       SecondaryOpKey op_key{write.table_name, write.index_name,
                             write.index_type, write.key, pk};
       auto it = ops.find(op_key);
-      if (it == ops.end() || it->second.tid < write.transaction_id) {
+      if (it == ops.end() || !(write.transaction_id < it->second.tid)) {
         ops[op_key] = {write.transaction_id, SecondaryIndexOp::kInsert};
       }
     }
-  } else if (!write.secondary_primary_key.empty()) {
+  } else {
+    // A delta names one primary key joining or leaving the list.
     SecondaryOpKey op_key{write.table_name, write.index_name, write.index_type,
                           write.key, write.secondary_primary_key};
     auto it = ops.find(op_key);
@@ -254,7 +256,7 @@ LogEntries BuildRecoveryEntries(const LogRecords &checkpoint,
 
 Logger::Logger(const Config &config, WalIo io)
     : work_dir_(config.work_dir),
-      loads_checkpoint_(config.enable_recovery),
+      loads_checkpoint_records_(config.enable_recovery),
       wal_(config.work_dir, std::move(io), config.wal_initial_capacity_bytes) {
   helios::storage::util::InitDebugLog();
 }
@@ -278,29 +280,31 @@ Logger::RecoveryResult Logger::FailRecovery(const WalScanResult &wal) {
 }
 
 Logger::RecoveryResult Logger::Recover() {
-  // Only a replay reads the checkpoint. A startup that scans the log without
-  // replaying it does so to find the end of the log, which the checkpoint says
-  // nothing about.
-  EpochScanCheckpoint::LoadResult checkpoint;
-  if (loads_checkpoint_) {
-    checkpoint = EpochScanCheckpoint::Load(work_dir_);
-    if (checkpoint.status ==
-        EpochScanCheckpoint::LoadResult::Status::kUnusable) {
-      // A checkpoint that cannot be trusted is not a reason to refuse to start:
-      // the log alone still holds everything the checkpoint would have
-      // supplied.
-      SPDLOG_WARN("Ignoring the checkpoint: {0}", checkpoint.detail);
-      checkpoint.records.clear();
-      // The start epoch is cleared with it so the scan skips nothing.
-      checkpoint.start_epoch = 0;
-    }
+  // Every startup reads the checkpoint: its publication waited for the end
+  // epoch to become durable, so that epoch binds even when nothing is
+  // replayed. A startup that replays nothing takes the epoch bounds alone.
+  auto checkpoint = EpochScanCheckpoint::Load(work_dir_, loads_checkpoint_records_);
+  if (checkpoint.status == EpochScanCheckpoint::LoadResult::Status::kUnusable) {
+    // A checkpoint that cannot be trusted is not a reason to refuse to start:
+    // the log alone still holds everything the checkpoint would have
+    // supplied.
+    SPDLOG_WARN("Ignoring the checkpoint: {0}", checkpoint.detail);
+    checkpoint.records.clear();
+    // The start epoch is cleared with it so the scan skips nothing; the
+    // status keeps the end epoch out of the durable epoch below.
+    checkpoint.start_epoch = 0;
+  }
+  if (!loads_checkpoint_records_) {
+    // Without a replay every frame is read, so nothing is skipped.
+    checkpoint.start_epoch = 0;
   }
 
   const auto wal = wal_.Scan(checkpoint.start_epoch);
   RecoveryResult result;
   if (wal.status != WalScanResult::Status::kOk) return FailRecovery(wal);
 
-  if (checkpoint.status == EpochScanCheckpoint::LoadResult::Status::kOk) {
+  if (loads_checkpoint_records_ &&
+      checkpoint.status == EpochScanCheckpoint::LoadResult::Status::kOk) {
     SPDLOG_INFO(
         "Recovering from the checkpoint of epoch {0}: {1} frames of "
         "{2} bytes are covered by it and are not replayed",

@@ -119,10 +119,13 @@ class EpochScanCheckpoint {
    * @brief Reads the published checkpoint of `work_dir`, if there is a usable
    * one.
    * @param[in] work_dir The directory the database logs into.
-   * @return The file's status and, when Ok, the records and epoch bounds it
-   * held.
+   * @param[in] load_records Whether to unpack the records. False validates
+   * the file and returns the epoch bounds alone, for a start that replays
+   * nothing.
+   * @return The file's status and, when Ok, the epoch bounds it held and the
+   * records when they were asked for.
    */
-  static LoadResult Load(const std::string &work_dir);
+  static LoadResult Load(const std::string &work_dir, bool load_records = true);
 
   /**
    * @brief Name of the published checkpoint inside the working directory.
