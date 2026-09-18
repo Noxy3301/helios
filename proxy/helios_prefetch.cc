@@ -396,7 +396,7 @@ static void sync_autogen_statement(THD *thd, HeliosTransaction *tx) {
 
 // True for a single-table UPDATE/DELETE on the pre-iterator executor, where
 // no JOIN/root AccessPath exists for QEP autogen to read.
-static bool is_legacy_single_table_dml(THD *thd) {
+static bool is_single_table_dml_without_qep(THD *thd) {
   if (thd == nullptr || thd->lex == nullptr || thd->lex->unit == nullptr) {
     return false;
   }
@@ -410,40 +410,40 @@ static bool is_legacy_single_table_dml(THD *thd) {
   return query_block->join->root_access_path() == nullptr;
 }
 
-// Return why a legacy-DML shape (extra tables, subquery, ORDER BY/LIMIT,
+// Return why a single-table DML shape (extra tables, subquery, ORDER BY/LIMIT,
 // partitioning, triggers) cannot be served by one staged range; nullptr when
 // the shape is safe.
-static const char *legacy_dml_shape_rejection(THD *thd, TABLE *table) {
+static const char *single_table_dml_shape_rejection(THD *thd, TABLE *table) {
   if (thd == nullptr || thd->lex == nullptr || thd->lex->unit == nullptr ||
       table == nullptr) {
-    return "missing legacy DML metadata";
+    return "missing single-table DML metadata";
   }
 
   Query_block *query_block = thd->lex->unit->first_query_block();
-  if (query_block == nullptr) return "missing legacy DML query block";
+  if (query_block == nullptr) return "missing single-table DML query block";
   if (query_block->leaf_table_count != 1 ||
       query_block->derived_table_count != 0 ||
       query_block->materialized_derived_table_count != 0) {
-    return "legacy DML additional-table read";
+    return "single-table DML additional-table read";
   }
   if (query_block->first_inner_query_expression() != nullptr) {
-    return "legacy DML subquery";
+    return "single-table DML subquery";
   }
   if (query_block->is_ordered() || query_block->has_limit()) {
-    return "legacy DML ORDER BY/LIMIT";
+    return "single-table DML ORDER BY/LIMIT";
   }
   if (query_block->partitioned_table_count != 0 ||
       table->part_info != nullptr) {
-    return "legacy DML partitioned table";
+    return "single-table DML partitioned table";
   }
   if (table->triggers != nullptr) {
     if (thd->lex->sql_command == SQLCOM_UPDATE &&
         table->triggers->has_update_triggers()) {
-      return "legacy DML UPDATE trigger";
+      return "single-table DML UPDATE trigger";
     }
     if (thd->lex->sql_command == SQLCOM_DELETE &&
         table->triggers->has_delete_triggers()) {
-      return "legacy DML DELETE trigger";
+      return "single-table DML DELETE trigger";
     }
   }
   return nullptr;
@@ -488,23 +488,23 @@ int maybe_prefetch_for_statement(THD *thd, HeliosTransaction *tx,
 
 // Gate for the handler entry points: true when autogen must defer to the
 // handler index access, marking it handler-deferred on the first call.
-bool prefetch_needs_legacy_dml_handler(THD *thd,
-                                      HeliosTransaction *tx) {
+bool prefetch_needs_single_table_dml_handler(THD *thd,
+                                             HeliosTransaction *tx) {
   if (tx == nullptr || srv_read_path != kReadPathPlan || tx->tx_plan_used()) {
     return false;
   }
   sync_autogen_statement(thd, tx);
   if (tx->autogen_stmt_resolved()) return false;
   if (tx->is_autogen_stmt_handler_deferred()) return true;
-  if (!is_legacy_single_table_dml(thd)) return false;
+  if (!is_single_table_dml_without_qep(thd)) return false;
   tx->mark_autogen_stmt_handler_deferred();
   return true;
 }
 
-// Build and stage a legacy single-table UPDATE/DELETE plan from its first
+// Build and stage a single-table UPDATE/DELETE plan from its first
 // handler index access, once per statement. A shape one staged range cannot
 // cover is left to the row path.
-int maybe_prefetch_for_legacy_dml_handler(
+int maybe_prefetch_for_single_table_dml_handler(
     THD *thd, HeliosTransaction *tx, TABLE *table, uint index,
     const IndexSearchPlan &search) {
   if (tx == nullptr || srv_read_path != kReadPathPlan || tx->tx_plan_used()) {
@@ -516,8 +516,8 @@ int maybe_prefetch_for_legacy_dml_handler(
   tx->mark_autogen_stmt_handler_deferred();
   tx->mark_autogen_stmt_resolved();
 
-  if (!is_legacy_single_table_dml(thd)) return 0;
-  if (legacy_dml_shape_rejection(thd, table) != nullptr) return 0;
+  if (!is_single_table_dml_without_qep(thd)) return 0;
+  if (single_table_dml_shape_rejection(thd, table) != nullptr) return 0;
 
   std::vector<HeliosProxy::ReadPlanStep> steps;
   if (!autogen_read_plan_from_index_search(thd, table, index, search, &steps)) {

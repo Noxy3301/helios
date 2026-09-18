@@ -17,8 +17,8 @@ void ha_helios::reset_index_search_buffers() {
   secondary_index_results_.clear();
   secondary_index_payloads_.clear();
   current_position_in_index_ = 0;
-  materialized_scan_truncated_ = false;
-  truncated_scan_end_.clear();
+  index_scan_is_partial_ = false;
+  index_scan_end_key_.clear();
   index_cursor_active_ = false;
   index_cursor_reverse_ = false;
   index_cursor_secondary_ = false;
@@ -95,18 +95,18 @@ bool ha_helios::refill_index_cursor(HeliosTransaction *tx) {
   return true;
 }
 
-bool ha_helios::refill_truncated_scan(HeliosTransaction *tx) {
-  materialized_scan_truncated_ = false;
+bool ha_helios::refill_index_scan(HeliosTransaction *tx) {
+  index_scan_is_partial_ = false;
   if (secondary_index_results_.empty()) return false;
 
-  // The window stopped at its last key; ask the storage for the rest of the
+  // The cached scan stopped at its last key; ask the storage for the rest of the
   // range the statement wanted. Helios ranges are [start, end), so the
   // smallest key above a complete serialized key is that key plus NUL.
   std::string start_key = secondary_index_results_.back();
   start_key.push_back('\0');
 
   auto key_values =
-      tx->get_matching_keys_and_values_in_range(start_key, truncated_scan_end_);
+      tx->get_matching_keys_and_values_in_range(start_key, index_scan_end_key_);
   if (tx->is_aborted() || key_values.empty()) return false;
 
   secondary_index_results_.clear();
@@ -217,9 +217,9 @@ int ha_helios::index_read_map(uchar *buf, const uchar *key,
   // MySQL runs single-table UPDATE/DELETE through the old executor
   // (sql_update.cc/sql_delete.cc), which has no JOIN/access path. Derive its
   // autogen plan from the optimizer-selected handler access instead.
-  if (prefetch_needs_legacy_dml_handler(ha_thd(), tx)) {
+  if (prefetch_needs_single_table_dml_handler(ha_thd(), tx)) {
     build_search_plan(key, keypart_map, find_flag, key_info);
-    if (int err = maybe_prefetch_for_legacy_dml_handler(
+    if (int err = maybe_prefetch_for_single_table_dml_handler(
             ha_thd(), tx, table, active_index, current_plan_)) {
       return err;
     }
@@ -253,7 +253,7 @@ int ha_helios::index_next(uchar *buf) {
   // Consume materialized index results.
   if (secondary_index_results_.empty() ||
       current_position_in_index_ >= secondary_index_results_.size()) {
-    if (materialized_scan_truncated_ && !refill_truncated_scan(tx)) {
+    if (index_scan_is_partial_ && !refill_index_scan(tx)) {
       return tx->is_aborted() ? abort_errno(tx) : HA_ERR_END_OF_FILE;
     }
     if (current_position_in_index_ >= secondary_index_results_.size()) {
@@ -277,7 +277,7 @@ int ha_helios::index_next_same(uchar *buf, const uchar *key [[maybe_unused]],
   // Consume materialized index results.
   if (secondary_index_results_.empty() ||
       current_position_in_index_ >= secondary_index_results_.size()) {
-    if (materialized_scan_truncated_ && !refill_truncated_scan(tx)) {
+    if (index_scan_is_partial_ && !refill_index_scan(tx)) {
       return tx->is_aborted() ? abort_errno(tx) : HA_ERR_END_OF_FILE;
     }
     if (current_position_in_index_ >= secondary_index_results_.size()) {

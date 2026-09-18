@@ -61,9 +61,9 @@ int ha_helios::multi_range_read_init(RANGE_SEQ_IF *seq, void *seq_init_param,
   // (read_range_first -> index_read_map) consumes the staged rows, and a range
   // no plan covers goes to the storage server there.
   if (statement_uses_read_plan(ha_thd())) {
-    // Legacy single-table DML has no QEP plan. Default DS-MRR reaches
+    // A single-table DML has no QEP plan. Default DS-MRR reaches
     // read_range_first()->index_read_map(), where the complete bounds exist.
-    if (!prefetch_needs_legacy_dml_handler(ha_thd(), tx)) {
+    if (!prefetch_needs_single_table_dml_handler(ha_thd(), tx)) {
       if (int err = maybe_prefetch_for_statement(ha_thd(), tx, table))
         return err;
     }

@@ -206,7 +206,7 @@ private:
   std::unordered_set<const void*> autogen_staged_roots_;
   std::unordered_set<std::string> autogen_tail_staged_;
   // Set when this statement's plan is built from the handler index access
-  // (deferred legacy-DML path) instead of the QEP; a second handler access
+  // (deferred single-table DML path) instead of the QEP; a second handler access
   // then means an index merge the single staged range cannot serve.
   bool autogen_stmt_handler_deferred_{false};
 

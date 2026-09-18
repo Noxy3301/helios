@@ -414,10 +414,10 @@ int ha_helios::execute_same_key_materialize(uchar *buf,
     }
 
     // Same-key scans can use ASC or DESC LIMIT when ORDER BY matches the key.
-    truncated_scan_end_ = prefix_end;
+    index_scan_end_key_ = prefix_end;
     auto key_values = tx->get_matching_keys_and_values_in_range(
         prefix, prefix_end, static_cast<uint64_t>(scan_limit.row_limit),
-        scan_limit.reverse_scan, &materialized_scan_truncated_);
+        scan_limit.reverse_scan, &index_scan_is_partial_);
     for (auto &kv : key_values) {
       secondary_index_results_.push_back(kv.first);
       secondary_index_payloads_.push_back(std::move(kv.second));
@@ -457,9 +457,9 @@ int ha_helios::execute_prefix_first(uchar *buf, HeliosTransaction *tx) {
     // Restrict to [prefix, prefix_end) so index_next never leaks non-prefix
     // rows. A limit-staged hit continues from the storage when index_next
     // reads past it.
-    truncated_scan_end_ = prefix_end;
+    index_scan_end_key_ = prefix_end;
     auto key_values = tx->get_matching_keys_and_values_in_range(
-        prefix, prefix_end, 0, false, &materialized_scan_truncated_);
+        prefix, prefix_end, 0, false, &index_scan_is_partial_);
     for (auto &kv : key_values) {
       secondary_index_results_.push_back(kv.first);
       secondary_index_payloads_.push_back(std::move(kv.second));
@@ -521,11 +521,11 @@ int ha_helios::execute_range_materialize(uchar *buf,
     }
 
     // Range scans can use ASC or DESC LIMIT when ORDER BY matches the key.
-    truncated_scan_end_ = effective_end;
+    index_scan_end_key_ = effective_end;
     auto key_values = tx->get_matching_keys_and_values_in_range(
         effective_start, effective_end,
         static_cast<uint64_t>(scan_limit.row_limit), scan_limit.reverse_scan,
-        &materialized_scan_truncated_);
+        &index_scan_is_partial_);
     for (auto &kv : key_values) {
       secondary_index_results_.push_back(kv.first);
       secondary_index_payloads_.push_back(std::move(kv.second));

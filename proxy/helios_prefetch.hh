@@ -49,20 +49,20 @@ int maybe_prefetch_for_statement(THD *thd, HeliosTransaction *tx,
 
 /**
  * @brief True when this statement must defer plan generation until
- *        index_read_map() exposes the legacy single-table DML handler access.
+ *        index_read_map() exposes the single-table DML handler access.
  *        The handler entry points index_read_map(), rnd_init(), and
- *        multi_range_read_init() consult this to route legacy single-table
+ *        multi_range_read_init() consult this to route single-table
  *        UPDATE/DELETE to the deferred path.
  */
-bool prefetch_needs_legacy_dml_handler(THD *thd,
-                                      HeliosTransaction *tx);
+bool prefetch_needs_single_table_dml_handler(THD *thd,
+                                             HeliosTransaction *tx);
 
 /**
- * @brief Compile and stage a legacy single-table UPDATE/DELETE from its first
+ * @brief Compile and stage a single-table UPDATE/DELETE from its first
  *        handler index access, at most once per statement. A shape one staged
  *        range cannot cover is left to the row path.
  */
-int maybe_prefetch_for_legacy_dml_handler(
+int maybe_prefetch_for_single_table_dml_handler(
     THD *thd, HeliosTransaction *tx, TABLE *table, uint index,
     const IndexSearchPlan &search);
 

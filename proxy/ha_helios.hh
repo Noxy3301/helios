@@ -196,10 +196,10 @@ private:
   std::string index_cursor_start_key_;
   std::string index_cursor_end_key_;
 
-  // Set when a staged window served only the first rows of its range;
-  // index_next/index_next_same fetch the rest from storage within this end.
-  bool materialized_scan_truncated_{false};
-  std::string truncated_scan_end_;
+  // Set when the cached index scan holds only the first rows of its range;
+  // index_next/index_next_same fetch the rest from storage up to this key.
+  bool index_scan_is_partial_{false};
+  std::string index_scan_end_key_;
 
   // Per-statement memo for set_fields_from_helios, refreshed on query_id
   // change.
@@ -264,7 +264,7 @@ private:
   bool refill_index_cursor(HeliosTransaction *tx);
   // Materialize the rest of a range whose staged window ran out. False when
   // the range really ended (or the transaction is gone).
-  bool refill_truncated_scan(HeliosTransaction *tx);
+  bool refill_index_scan(HeliosTransaction *tx);
 
   void reset_index_search_buffers();
 

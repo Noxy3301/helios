@@ -34,7 +34,7 @@ bool autogen_read_plan_from_qep(
 /**
  * @brief Build one statement-scoped plan step from handler index access.
  *
- * @details Used for legacy single-table UPDATE/DELETE, where the handler
+ * @details Used for single-table UPDATE/DELETE, where the handler
  * supplies the selected index/range instead of a normal QEP root.
  */
 bool autogen_read_plan_from_index_search(
