@@ -12,7 +12,8 @@
 std::string next_lexicographic_key(std::string key);
 
 // Bytes of one column of a packed row [null_flags][col_0]..[col_n], each
-// field [byteSize:1B][len:byteSize B][bytes], byteSize 0xFF meaning NULL.
+// field [byteSize:1B][len:byteSize B][bytes]. A byteSize of 0xFF marks an
+// empty payload; whether the column is NULL is in the null flags.
 std::string_view unpack_row_field(const std::string& row, int column_index);
 
 /**
