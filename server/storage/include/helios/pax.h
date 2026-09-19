@@ -28,8 +28,8 @@ namespace pax {
  * layer wrote, unchanged. A typed field stores the value as a fixed-width
  * little-endian binary payload of `field_max_bytes[f]` bytes (4 or 8). A
  * typed cell's u16 length prefix is 0 for SQL NULL and the binary width for a
- * present value. DecodeRow converts input bytes before the commit protocol;
- * ScatterRow writes the decoded cells without reparsing.
+ * present value. unpack_row converts input bytes before the commit protocol;
+ * ScatterRow writes the unpacked cells without reparsing.
  * GatherRow reconstructs the original field bytes from the typed cells.
  */
 enum class FieldType : uint8_t {
@@ -136,14 +136,17 @@ class PaxGroup {
   explicit PaxGroup(const TableSchema &schema);
 
   /**
-   * @brief Drops the epoch image state this group published, if any.
+   * @brief Drops the images this group published and detaches its state.
+   *
+   * @details The state object stays in the image buffer: a scan reaches it by
+   * raw pointer for the length of its read.
    */
   ~PaxGroup();
 
   /**
-   * @brief Writes a decoded row into this group's strip cells.
+   * @brief Writes an unpacked row into this group's strip cells.
    * @param slot Target slot inside this group.
-   * @param row Decoded using this group's schema; its input
+   * @param row Unpacked using this group's schema; its input
    * bytes must remain unchanged until the call finishes.
    */
   void ScatterRow(uint32_t slot, const Row &row);
@@ -188,7 +191,7 @@ class PaxGroup {
    * unused strips.
    *
    * @param slot Source slot inside this group.
-   * @param columns Zero-based MySQL column indexes to materialize, in ascending
+   * @param columns Zero-based MySQL column indexes to gather, in ascending
    * order.
    * @param n_columns Number of entries in `columns`.
    * @param out Destination string; gathered bytes are appended.
@@ -248,7 +251,8 @@ class PaxGroup {
    * @brief Appends one field's row-format value into `out`.
    *
    * @details Verbatim for an UNTYPED cell; reformatted to the exact val_str
-   * ASCII for a typed present cell. An empty cell is emitted as a NULL field.
+   * ASCII for a typed present cell. An empty cell is emitted as an empty
+   * field, and the null-flags field is what says whether it is SQL NULL.
    *
    * @param field Field index, where 0 is the null-flags field and MySQL column
    * i is field `i + 1`.

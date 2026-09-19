@@ -75,7 +75,7 @@ def create_table(cursor, unique_index=True, second_index=False):
 
 
 # Enough rows that one statement carries more than the 1024-key probe batch
-# (proxy/ha_helios.hh kInsertProbeBatch). Only a unique_checks=1 statement
+# (plugin/ha_helios.hh kInsertProbeBatch). Only a unique_checks=1 statement
 # probes, so the cases below that turn it off just exercise one commit
 # carrying more than 1024 writes.
 BULK_ROWS = 1100

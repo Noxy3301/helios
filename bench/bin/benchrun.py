@@ -501,26 +501,26 @@ def setup_benchmark(benchmark, config_path, mysql_host, mysql_port, log_dir=None
 
 
 def attach_secondary(benchmark, mysql_host, mysql_port):
-    """Attach and load the columnar secondary engine before execution.
+    """Attach and load the DuckDB secondary engine before execution.
 
     Offload needs both; SECONDARY_LOAD state is process-local to mysqld, so
     this runs before every execute phase, not only after a fresh load."""
     if benchmark != "tpch":
         return
-    print(f"  Attaching the columnar secondary engine ({mysql_host}:{mysql_port})...")
+    print(f"  Attaching the DuckDB secondary engine ({mysql_host}:{mysql_port})...")
     # ALTER success alone proves nothing: SECONDARY_LOAD on an unavailable
     # engine succeeds with only a warning, and execution then silently falls
     # back to the primary engine. Verify the plugin and the per-table state.
     result = mysql_cmd(mysql_port, mysql_host,
                        "SELECT PLUGIN_NAME FROM information_schema.PLUGINS "
-                       "WHERE PLUGIN_NAME='helios_columnar' "
+                       "WHERE PLUGIN_NAME='helios_duckdb' "
                        "AND PLUGIN_STATUS='ACTIVE';")
-    if "helios_columnar" not in result.stdout.lower():
-        sys.exit(f"helios_columnar plugin is not ACTIVE on {mysql_host}:{mysql_port}")
+    if "helios_duckdb" not in result.stdout.lower():
+        sys.exit(f"helios_duckdb plugin is not ACTIVE on {mysql_host}:{mysql_port}")
     for t in ("customer", "lineitem", "nation", "orders",
               "part", "partsupp", "region", "supplier"):
         result = mysql_cmd(mysql_port, mysql_host,
-                           f"USE benchbase; ALTER TABLE {t} SECONDARY_ENGINE=helios_columnar;")
+                           f"USE benchbase; ALTER TABLE {t} SECONDARY_ENGINE=helios_duckdb;")
         if result.returncode != 0 and "already has a secondary engine" not in result.stderr:
             sys.exit(f"SECONDARY_ENGINE attach failed for {t}: {result.stderr.strip()[-300:]}")
         result = mysql_cmd(mysql_port, mysql_host,
@@ -531,7 +531,7 @@ def attach_secondary(benchmark, mysql_host, mysql_port):
                            "SELECT CREATE_OPTIONS FROM information_schema.TABLES "
                            f"WHERE TABLE_SCHEMA='benchbase' AND TABLE_NAME='{t}';")
         options = result.stdout.lower()
-        if ('secondary_engine="helios_columnar"' not in options or
+        if ('secondary_engine="helios_duckdb"' not in options or
                 'secondary_load="1"' not in options):
             sys.exit(f"secondary engine state not verified for {t}: "
                      f"{result.stdout.strip()[-200:]}")
@@ -878,14 +878,14 @@ def main():
                         help="Keep helios_data after the benchmark")
     parser.add_argument("--read-path", choices=["row", "plan"], default="plan",
                         help="SET GLOBAL helios_read_path: row sends one request per handler "
-                             "read, plan stages what it can in one request (default)")
+                             "read, plan caches what it can in one request (default)")
     parser.add_argument("--tx-plan", action="store_true",
                         help="Pass HELIOS_PREFETCH_PLAN=1 to BenchBase so the TPC-C procedures "
-                             "inject @_tx_plan, instead of the per-statement plan the proxy "
+                             "inject @_tx_plan, instead of the per-statement plan the plugin "
                              "derives from the QEP")
     args = parser.parse_args()
     if args.tx_plan and args.read_path == "row":
-        sys.exit("--tx-plan stages reads through the plan; it cannot be combined with --read-path row")
+        sys.exit("--tx-plan takes its reads from the injected plan; it cannot be combined with --read-path row")
 
     # Validate
     if args.load_durability == "async":

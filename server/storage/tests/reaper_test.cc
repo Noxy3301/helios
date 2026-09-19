@@ -18,7 +18,7 @@ class ReaperTest : public ::testing::Test {
   index::MasstreeIndex tree_;
   index::Reaper reaper_;
 
-  void TearDown() override { index::MasstreeReleaseThreadEpoch(); }
+  void TearDown() override { index::release_thread_epoch(); }
 
   DataItem *Enqueue(const std::string &key, EpochNumber epoch) {
     Tidword deleted;

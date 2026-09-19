@@ -160,7 +160,7 @@ class Database {
   pax::PaxTable *GetPaxTable(const std::string_view table_name);
 
   /**
-   * @brief Handle for one columnar read view.
+   * @brief Handle for one read view.
    *
    * @details snapshot_epoch `se` is the read view's serialization point:
    * commits with `epoch <= se` are visible; later ones resolve to epoch images.
@@ -179,10 +179,10 @@ class Database {
    * @details On return every commit through snapshot_epoch `se` has finished
    * installing, and every later commit preserves the row it replaces when this
    * view reads it. The calling thread must not hold an epoch (it must be
-   * outside any transaction). Fails instead of falling back on fence timeout
-   * or near the epoch high-water mark.
+   * outside any transaction). Fails instead of falling back on a read view
+   * fence timeout or near the epoch high-water mark.
    *
-   * @param fence_timeout_ms Upper bound on the fence wait.
+   * @param fence_timeout_ms Upper bound on the read view fence wait.
    * @return A valid handle, or an invalid one carrying the reason.
    */
   PaxReadView OpenPaxView(uint32_t fence_timeout_ms);
@@ -212,12 +212,12 @@ class Database {
    *
    * @param table_name Target table.
    * @param key Primary key to look up.
-   * @param selected_columns Optional zero-based MySQL columns to materialize
+   * @param selected_columns Optional zero-based MySQL columns to gather
    * for PAX-resident rows. Null selects the whole row; an empty list selects
    * no data columns. Unselected PAX fields become empty markers; null flags
    * remain in every result.
-   * @return Result with `found` set when the key exists and was non-empty.
-   *         When the table does not exist, `found` is false and `tid` is 0.
+   * @return Result with `found` set when the key holds a live row. When the
+   *         table does not exist, `found` is false and `tid` is 0.
    */
   ReadResult Read(const std::string_view table_name, const std::string_view key,
                   const std::vector<uint32_t> *selected_columns = nullptr);
@@ -226,8 +226,9 @@ class Database {
    * @brief Reads several rows in one call.
    *
    * Each `keys[i] = {table_name, key}` is resolved with the same protocol as
-   * Read. Reads do not share state, so this is purely a transport
-   * optimization on top of repeated Read calls.
+   * Read, over the whole row: there is no column selection here. Reads do not
+   * share state, so this is purely a transport optimization on top of
+   * repeated Read calls.
    *
    * @param keys (table_name, key) pairs to look up.
    * @return One ReadResult per input, in the same order.
@@ -248,7 +249,7 @@ class Database {
    * @param end_key   Exclusive end of the range. Must be non-empty.
    * @param row_limit Maximum rows to return. 0 means no cap.
    * @param reverse_scan When true, iterate from `end_key` toward `start_key`.
-   * @param selected_columns Optional zero-based MySQL columns to materialize
+   * @param selected_columns Optional zero-based MySQL columns to gather
    * for PAX-resident rows. Null selects the whole row; an empty list selects
    * no data columns. Unselected PAX fields become empty markers; null flags
    * remain in every result.
@@ -278,7 +279,7 @@ class Database {
    * @param end_key Exclusive end of the secondary range. Must be non-empty.
    * @param row_limit Maximum rows to return. 0 means no cap.
    * @param reverse_scan When true, iterate in reverse secondary-key order.
-   * @param selected_columns Optional zero-based MySQL columns to materialize
+   * @param selected_columns Optional zero-based MySQL columns to gather
    * for PAX-resident base rows, with the same null/empty rules as Read.
    * Unselected PAX columns are returned as empty fields.
    * @return Result with `ok == false` if the table or the index is missing,
@@ -293,7 +294,7 @@ class Database {
   /**
    * @brief Range-scans the primary index and returns PAX cell references.
    *
-   * @details The returned rows are not materialized.
+   * @details The returned rows are not copied.
    *
    * @param table_name Target table.
    * @param start_key Inclusive start of the range.

@@ -39,7 +39,7 @@ namespace helios::storage {
 
 Database::Database() : Database(Config()) {}
 
-void Database::ReleaseThreadEpoch() { index::MasstreeReleaseThreadEpoch(); }
+void Database::ReleaseThreadEpoch() { index::release_thread_epoch(); }
 
 bool Database::HasTable(const std::string_view table_name) {
   return GetTable(table_name) != nullptr;
@@ -110,7 +110,7 @@ Database::Database(const Config &config)
 
   // The replay enrolled this thread in the Masstree epoch; leaving it lets
   // the nodes the replay retired be reclaimed.
-  index::MasstreeReleaseThreadEpoch();
+  index::release_thread_epoch();
 
   // Abort the process if the running logger cannot persist its records.
   logger_.SetFailStop();
@@ -163,7 +163,7 @@ std::function<void(EpochNumber)> Database::MakeEpochHook() {
     // DataItem limbo once min_active_epoch() catches up. Workers release
     // their epoch at RPC boundaries through ReleaseThreadEpoch; this call
     // only moves active_epoch.
-    index::MasstreeAdvanceEpoch();
+    index::advance_epoch();
   };
 }
 
@@ -260,7 +260,7 @@ void Database::Recover() {
       const auto *bytes =
           reinterpret_cast<const std::byte *>(entry.value.data());
       pax::Row row;
-      if (!pax::DecodeRow(table->GetPaxTable()->schema(), bytes,
+      if (!pax::unpack_row(table->GetPaxTable()->schema(), bytes,
                           entry.value.size(), row)) {
         SPDLOG_CRITICAL("Recovery failed: value of {} in {} does not fit PAX",
                         entry.key, entry.table_name);
@@ -285,7 +285,7 @@ void Database::Recover() {
             entry.index_name, entry.key, entry.primary_keys.size());
         DataItem item;
         item.transaction_id.store(entry.tid);
-        item.SetPrimaryKeys(entry.primary_keys);
+        item.set_primary_keys(entry.primary_keys);
         idx->tree.Put(entry.key, std::move(item));
       } else {
         SPDLOG_CRITICAL(

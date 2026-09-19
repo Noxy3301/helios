@@ -36,7 +36,7 @@
 
 namespace helios::storage {
 namespace util {
-static inline void InitDebugLog() {
+static inline void set_log_pattern() {
   spdlog::set_pattern("[Thread %t] %+ [+%omsec]");
 }
 }  // namespace util

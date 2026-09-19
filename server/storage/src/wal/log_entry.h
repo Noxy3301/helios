@@ -19,7 +19,7 @@
 
 /**
  * @file server/storage/src/wal/log_entry.h
- * The row values and secondary-index lists that recovery replays.
+ * The final row values and secondary-index lists recovery installs.
  */
 
 #ifndef HELIOS_STORAGE_SRC_WAL_LOG_ENTRY_H
@@ -44,7 +44,8 @@ enum class SecondaryIndexOp : uint8_t {
 };
 
 /**
- * @brief One row value or secondary-index entry to replay.
+ * @brief The final row value or secondary-index list recovery installs for
+ *        one key.
  *
  * @details An empty `index_name` marks a primary row, whose payload is
  * `value`; otherwise the entry belongs to that secondary index and carries

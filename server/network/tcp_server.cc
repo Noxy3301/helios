@@ -13,6 +13,13 @@
 #include <cstring>
 #include <atomic>
 
+namespace {
+
+// Connections being served, for the accept and close log lines.
+std::atomic<int> active_connections{0};
+
+}  // namespace
+
 TcpServer::TcpServer(uint16_t port) : port_(port) {}
 
 bool TcpServer::run() {
@@ -68,8 +75,17 @@ bool TcpServer::setup_and_listen(int& server_socket) {
     return true;
 }
 
+void TcpServer::serve_client(int client_socket, std::string client_ip) {
+    handle_client(client_socket);
+    // Ensure socket is closed when done
+    int fd = client_socket;
+    close(client_socket);
+    int left = --active_connections;
+    SPDLOG_INFO("Closed connection fd={} ({}) (active={})", fd,
+                client_ip.c_str(), left);
+}
+
 void TcpServer::accept_clients(int server_socket) {
-    static std::atomic<int> active_connections{0};
     while (true) {
         struct sockaddr_in client_addr;
         socklen_t client_addr_len = sizeof(client_addr);
@@ -96,14 +112,7 @@ void TcpServer::accept_clients(int server_socket) {
         int now_active = ++active_connections;
         SPDLOG_INFO("Accepted connection fd={} from {} (active={})", client_socket, client_ip.c_str(), now_active);
 
-        std::thread([this, client_socket, client_ip]() {
-            // Process the client in this thread
-            handle_client(client_socket);
-            // Ensure socket is closed when done
-            int fd = client_socket;
-            close(client_socket);
-            int left = --active_connections;
-            SPDLOG_INFO("Closed connection fd={} ({}) (active={})", fd, client_ip.c_str(), left);
-        }).detach();
+        std::thread(&TcpServer::serve_client, this, client_socket, client_ip)
+            .detach();
     }
 }

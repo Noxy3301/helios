@@ -49,12 +49,12 @@ struct Config {
   /**
    * @brief Whether the instance replays its log at construction.
    *
-   * @details The log is always scanned and its interrupted tail truncated,
-   * since that tail has to go before the first append lands behind it. This
-   * decides only whether the records the scan read are replayed and whether a
-   * published checkpoint's records are loaded; the checkpoint's header is
-   * read and validated on every start, and its end epoch bounds the epoch the
-   * instance resumes at.
+   * @details The log is always scanned and its interrupted tail overwritten
+   * with zeroes, which has to happen before the first append lands behind it.
+   * This decides only whether the records the scan read are replayed and
+   * whether a published checkpoint's records are loaded; the checkpoint's
+   * header is read and validated on every start, and its end epoch bounds the
+   * epoch the instance resumes at.
    * PAX column definitions are always restored before the database starts.
    *
    * Default: true

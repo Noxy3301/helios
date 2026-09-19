@@ -83,7 +83,7 @@ echo "Step 4/5: Installing Helios plugin..."
 ./runtime_output_directory/mysql -u root --socket="$SOCKET" --port="$MYSQLD_PORT" \
   -e "INSTALL PLUGIN helios SONAME 'ha_helios_storage_engine.so';" 2>/dev/null || true
 ./runtime_output_directory/mysql -u root --socket="$SOCKET" --port="$MYSQLD_PORT" \
-  -e "INSTALL PLUGIN helios_columnar SONAME 'ha_helios_storage_engine.so';" 2>/dev/null || true
+  -e "INSTALL PLUGIN helios_duckdb SONAME 'ha_helios_storage_engine.so';" 2>/dev/null || true
 
 # --skip-name-resolve makes TCP clients match accounts by IP literal only;
 # 'root'@'localhost' stays socket-only, so create loopback root accounts.

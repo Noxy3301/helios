@@ -123,15 +123,15 @@ class Transaction {
   void Read(std::string_view table, std::string_view key, Tidword observed);
 
   /**
-   * @brief Records a range read to replay at commit.
+   * @brief Records a range read to revalidate at commit.
    *
    * @details The bounds, index, limit and direction describe the scan to
    * re-run over `[begin, end)`. An empty `index` names the primary index, and
    * a `limit` of 0 caps nothing. `keys`, and `primary_keys` on a secondary
-   * index, are the keys that scan returned, in scan order. Commit replays the
-   * scan and aborts when that ordered list differs. Row words are not part of
-   * this call: each row the caller consumed is also a Read. Commit refuses a
-   * range whose `end` is empty.
+   * index, are the keys that scan returned, in scan order. Commit re-scans
+   * the range and aborts when that ordered list differs. Row contents are
+   * not part of this call: each row the caller consumed is also a Read.
+   * Commit refuses a range whose `end` is empty.
    */
   void RangeRead(std::string_view table, std::string_view index,
                  std::string_view begin, std::string_view end, uint64_t limit,
@@ -139,14 +139,14 @@ class Transaction {
                  std::vector<std::string_view> primary_keys);
 
   /**
-   * @brief Decodes the row and merges it into its record's pending update.
+   * @brief Unpacks the row and merges it into its record's pending update.
    *
    * @details `row_bytes` holds packed bytes matching the table's installed PAX
    * schema, and is ignored for a kDelete. Later writes to one key replace the
    * value; if the record's first operation was INSERT, Commit keeps checking
    * that the row is absent.
    * @return false with reason `write_table_missing`, `pax_schema_missing`,
-   * `pax_row_decode_failed`, or @ref kDuplicatePrimaryKeyAbortReason for an
+   * `pax_row_unpack_failed`, or @ref kDuplicatePrimaryKeyAbortReason for an
    * INSERT after a pending live row. Nothing is claimed on false.
    */
   bool Write(std::string_view table_name, std::string_view key,
@@ -158,8 +158,8 @@ class Transaction {
    * @details With `remove` true, `primary_key` leaves the secondary key's
    * list; otherwise it joins it. Uniqueness belongs to the named index, not to
    * this call.
-   * @return false with reason `si_table_missing`, `pax_schema_missing`, or
-   * `si_index_missing`.
+   * @return false with reason `secondary_index_table_missing`,
+   * `pax_schema_missing`, or `secondary_index_missing`.
    */
   bool IndexWrite(std::string_view table_name, std::string_view index_name,
                   std::string_view secondary_key, std::string_view primary_key,
@@ -173,16 +173,16 @@ class Transaction {
    *
    * - Phase 1: lock every record in pointer order. Then join the epoch, as
    *   Silo reads it after locking.
-   * - Phase 2: validate every point read by word, replay every range and
+   * - Phase 2: validate every point read by word, revalidate every range and
    *   compare its key list, check INSERT and UNIQUE under the locks, then
    *   choose the commit TID. Reserve every PAX slot before the first value
    *   changes.
    * - Phase 3: install each record, append its WAL write, and publish its
    *   TID, which unlocks it.
    *
-   * The record is enqueued before the worker leaves the epoch. A Sync commit
-   * then waits for that epoch to become durable, and only when a record was
-   * logged: a read-only commit returns at once.
+   * The log record is enqueued before the worker leaves the epoch. A Sync
+   * commit then waits for that epoch to become durable, and only when a log
+   * record was enqueued: a read-only commit returns at once.
    *
    * @param[out] reason Cleared on entry and empty on success. On abort, a
    * short label naming the failed check.
@@ -210,7 +210,7 @@ class Transaction {
   };
 
   struct RowUpdate {
-    pax::Row row;  ///< Decoded value; unused for DELETE.
+    pax::Row row;  ///< Unpacked value; unused for DELETE.
     /// The table's PAX store, checked non-null at Write.
     pax::PaxTable *store;
     RowOp op;
@@ -249,8 +249,8 @@ class Transaction {
   /**
    * @brief Reports whether this attempt holds the record's lock.
    *
-   * @details Read validation and both range replays allow a locked word only
-   * when this attempt is the holder; any other lock aborts.
+   * @details Read validation and both range revalidations allow a locked word
+   * only when this attempt is the holder; any other lock aborts.
    */
   bool OwnsLock(DataItem *item) const;
 
@@ -279,15 +279,15 @@ class Transaction {
   bool Prepare(DataItem &item, WriteEntry &entry, std::string &reason);
 
   /**
-   * @brief Checks every point word and replays every range.
+   * @brief Checks every point word and revalidates every range.
    *
    * @param[in,out] max_tid Raised to the largest word validation observed.
    * @return false with reason set at the first check that fails.
    */
   bool ValidateReads(Tidword &max_tid, std::string &reason);
 
-  bool ReplayRange(const RangeEntry &range, Tidword &max_tid);
-  bool ReplayIndexRange(const RangeEntry &range, Tidword &max_tid);
+  bool RevalidateRange(const RangeEntry &range, Tidword &max_tid);
+  bool RevalidateSecondaryRange(const RangeEntry &range, Tidword &max_tid);
 
   /**
    * @brief Installs the final value while the record stays locked.
@@ -298,9 +298,9 @@ class Transaction {
 
   /**
    * @brief Copies the installed row, or the ordered index changes, into the
-   * record.
+   * log record.
    *
-   * @pre Apply completed and the record is still locked.
+   * @pre Apply completed and the index record is still locked.
    */
   static void AppendLog(wal::LogRecord &record, const DataItem &item,
                         const WriteEntry &entry, Tidword commit_tid);

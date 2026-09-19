@@ -672,7 +672,7 @@ def test_range_dies_with_the_server(user, password):
     """A connection must not spend a range its server no longer owns.
 
     What invalidates the cached range is the reset every transport failure
-    performs; the proxy does not reconnect, so the connection that takes that
+    performs; the plugin does not reconnect, so the connection that takes that
     failure is spent with it.
     """
     print("HIDDEN PRIMARY KEY: RANGE VS SERVER RESTART TEST")

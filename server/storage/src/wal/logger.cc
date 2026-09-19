@@ -258,7 +258,7 @@ Logger::Logger(const Config &config, WalIo io)
     : work_dir_(config.work_dir),
       loads_checkpoint_records_(config.enable_recovery),
       wal_(config.work_dir, std::move(io), config.wal_initial_capacity_bytes) {
-  helios::storage::util::InitDebugLog();
+  helios::storage::util::set_log_pattern();
 }
 
 Logger::~Logger() { Stop(); }
@@ -433,19 +433,20 @@ Logger::WaitResult Logger::WaitUntilDurable(EpochNumber commit_epoch,
   return state_ == State::kStopped ? WaitResult::kStopped : WaitResult::kFailed;
 }
 
+bool Logger::within_max_lag(epoch::Framework &epoch) const {
+  // D before E: D only grows, and a pass then held when E was read.
+  const EpochNumber durable_epoch = GetDurableEpoch();
+  const EpochNumber global_epoch = epoch.GetGlobalEpoch();
+  return global_epoch <= kMaxLagEpochs ||
+         durable_epoch >= global_epoch - kMaxLagEpochs;
+}
+
 void Logger::WaitMaxLag(epoch::Framework &epoch) {
   assert(epoch.ThreadEpoch() == epoch::Framework::kThreadOffline);
-  // D before E: D only grows, and a pass then held when E was read.
-  const auto within = [&] {
-    const EpochNumber durable_epoch = GetDurableEpoch();
-    const EpochNumber global_epoch = epoch.GetGlobalEpoch();
-    return global_epoch <= kMaxLagEpochs ||
-           durable_epoch >= global_epoch - kMaxLagEpochs;
-  };
-  if (within()) return;
+  if (within_max_lag(epoch)) return;
   std::unique_lock<std::mutex> lock(durability_mutex_);
-  durability_cv_.wait(lock,
-                      [&] { return state_ != State::kRunning || within(); });
+  durability_cv_.wait(
+      lock, [&] { return state_ != State::kRunning || within_max_lag(epoch); });
 }
 
 void Logger::AwaitCommitDurability(EpochNumber commit_epoch,

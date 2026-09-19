@@ -1,6 +1,6 @@
 /**
  * @file server/storage/src/pax/epoch_image_buffer.h
- * The epoch images a writer preserves for the slots a columnar read view is
+ * The epoch images a writer preserves for the slots a read view is
  * looking at.
  */
 
@@ -47,7 +47,7 @@ struct GroupImageState {
 };
 
 /**
- * @brief The epoch images that keep a columnar read view consistent.
+ * @brief The epoch images that keep a read view consistent.
  *
  * @details An epoch image is the row a slot held before an install made
  * under a later epoch. Each open read view registers its snapshot epoch
@@ -122,7 +122,7 @@ class EpochImageBuffer {
    *
    * @details Samples the global epoch under the registry lock, so a writer
    * that sees the registration also sees the epoch. The caller performs the
-   * epoch fence itself; Close may run on another thread.
+   * read view fence itself; Close may run on another thread.
    */
   EpochNumber Open(const epoch::Framework &epoch);
 
@@ -155,16 +155,16 @@ class EpochImageBuffer {
                                      uint32_t slot) const;
 
  private:
-  // seq_cst on both sides is load-bearing for the fence proof; do not
-  // weaken.
+  // seq_cst on both sides is load-bearing for the read view fence proof; do
+  // not weaken.
   std::atomic<uint64_t> open_count_{0};
   // What the buffer holds, for attributing the process's memory. Moved
   // wherever an image is appended, trimmed or dropped.
   std::atomic<uint64_t> images_held_{0};
   std::atomic<uint64_t> bytes_held_{0};
 
-  // shared: NeedsImage, Preserve; exclusive: Open, Close and the clear the
-  // last close performs. Const readers take neither.
+  // shared: NeedsImage, Preserve, Stats; exclusive: Open, Close and the clear
+  // the last close performs. Forget takes groups_mutex_ alone.
   mutable std::shared_mutex registry_mutex_;
   // Snapshot epochs of the open views, guarded by registry_mutex_.
   std::multiset<EpochNumber> open_views_;

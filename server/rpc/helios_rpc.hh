@@ -142,7 +142,7 @@ private:
         const Helios::Protocol::TxExecuteReadPlan::Request& request,
         std::string* result);
 
-    // DuckDB bridge (resolved-statement request over live PAX storage).
+    // DuckDB executor (resolved-statement request over live PAX storage).
     void handleTxExecuteDuckdbQuery(
         const Helios::Protocol::TxExecuteDuckdbQuery::Request& request,
         Helios::Protocol::TxExecuteDuckdbQuery::Response* response);

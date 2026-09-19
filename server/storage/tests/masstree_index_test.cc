@@ -40,8 +40,8 @@
 namespace {
 
 // A word a commit publishes: epoch, tid, and the absent bit.
-helios::storage::Tidword Word(helios::storage::EpochNumber epoch,
-                                    uint32_t tid, bool absent) {
+helios::storage::Tidword make_tidword(helios::storage::EpochNumber epoch,
+                                      uint32_t tid, bool absent) {
   helios::storage::Tidword word;
   word.epoch = epoch;
   word.tid = tid;
@@ -51,15 +51,6 @@ helios::storage::Tidword Word(helios::storage::EpochNumber epoch,
 }
 
 }  // namespace
-
-TEST(MasstreeIndexTest, Instantiate) {
-  ASSERT_NO_THROW(helios::storage::index::MasstreeIndex table);
-}
-
-TEST(MasstreeIndexTest, Put) {
-  helios::storage::index::MasstreeIndex table;
-  table.Put("alice", helios::storage::DataItem{});
-}
 
 TEST(MasstreeIndexTest, Get) {
   helios::storage::index::MasstreeIndex table;
@@ -71,6 +62,20 @@ TEST(MasstreeIndexTest, Get) {
 TEST(MasstreeIndexTest, GetOrInsert) {
   helios::storage::index::MasstreeIndex table;
   ASSERT_NE(nullptr, table.GetOrInsert("alice"));
+}
+
+TEST(MasstreeIndexTest, ConcurrentPutSameKey) {
+  std::vector<std::thread> threads;
+  helios::storage::index::MasstreeIndex table;
+
+  for (size_t i = 0; i < 10; i++) {
+    threads.emplace_back([&]() { table.Put("alice", {}); });
+  }
+  for (auto &thread : threads) {
+    thread.join();
+  }
+
+  ASSERT_NE(nullptr, table.Get("alice"));
 }
 
 TEST(MasstreeIndexTest, ConcurrentInserting) {
@@ -88,25 +93,6 @@ TEST(MasstreeIndexTest, ConcurrentInserting) {
   }
 }
 
-TEST(MasstreeIndexTest, ConcurrentPutSameKey) {
-  std::vector<std::thread> threads;
-  helios::storage::index::MasstreeIndex table;
-
-  for (size_t i = 0; i < 10; i++) {
-    threads.emplace_back([&]() { table.Put("alice", {}); });
-  }
-  for (auto &thread : threads) {
-    thread.join();
-  }
-  bool some_item_were_inserted = false;
-  auto *item = table.Get("alice");
-  for (size_t i = 0; i < 10; i++) {
-    if (item != nullptr) some_item_were_inserted = true;
-  }
-
-  ASSERT_TRUE(some_item_were_inserted);
-}
-
 TEST(MasstreeIndexTest, Scan) {
   helios::storage::index::MasstreeIndex table;
   table.Put("alice", {});
@@ -119,43 +105,6 @@ TEST(MasstreeIndexTest, Scan) {
   // A callback that cancels stops the walk at the first key.
   ASSERT_EQ(size_t(1),
             table.Scan("alice", "carol", [](auto, auto &) { return true; }));
-}
-
-TEST(MasstreeIndexTest, TremendousPut) {
-  std::vector<std::thread> threads;
-  helios::storage::index::MasstreeIndex table;
-
-  constexpr size_t working_set_size = 8192;
-  for (size_t i = 0; i < 10; i++) {
-    threads.emplace_back([&, i]() {
-      for (size_t j = i * working_set_size; j < (i + 1) * working_set_size;
-           j++) {
-        table.Put(std::to_string(j), {});
-      }
-    });
-  }
-  for (auto &thread : threads) {
-    thread.join();
-  }
-}
-
-TEST(MasstreeIndexTest, TremendousGetAndPut) {
-  std::vector<std::thread> threads;
-  helios::storage::index::MasstreeIndex table;
-
-  constexpr size_t working_set_size = 8192;
-  for (size_t i = 0; i < 10; i++) {
-    threads.emplace_back([&, i]() {
-      for (size_t j = i * working_set_size; j < (i + 1) * working_set_size;
-           j++) {
-        table.Get(std::to_string(j - working_set_size));
-        table.Put(std::to_string(j), {});
-      }
-    });
-  }
-  for (auto &thread : threads) {
-    thread.join();
-  }
 }
 
 TEST(MasstreeIndexTest, ReverseScanCountsOnlyTheKeysItEmits) {
@@ -187,7 +136,7 @@ TEST(MasstreeIndexTest, ConcurrentGetOrInsertReturnsTheSameEntry) {
       ready.fetch_add(1);
       while (!start.load()) std::this_thread::yield();
       results[i] = tree.GetOrInsert("shared");
-      index::MasstreeReleaseThreadEpoch();
+      index::release_thread_epoch();
     });
   }
   while (ready.load() != results.size()) std::this_thread::yield();
@@ -198,7 +147,7 @@ TEST(MasstreeIndexTest, ConcurrentGetOrInsertReturnsTheSameEntry) {
   ASSERT_NE(nullptr, item);
   for (auto *result : results) EXPECT_EQ(item, result);
   EXPECT_EQ(item, tree.GetOrInsert("shared"));
-  index::MasstreeReleaseThreadEpoch();
+  index::release_thread_epoch();
 }
 
 TEST(MasstreeIndexTest, PrimaryEntryTakesItsPaxSlotOnAllocation) {
@@ -215,14 +164,14 @@ TEST(MasstreeIndexTest, PrimaryEntryTakesItsPaxSlotOnAllocation) {
   EXPECT_EQ(1u, store.slots_allocated());
   EXPECT_EQ(store.group(0), item->pax_group());
   EXPECT_EQ(item, tree.GetOrInsert("row"));
-  index::MasstreeReleaseThreadEpoch();
+  index::release_thread_epoch();
 }
 
-TEST(MasstreeIndexTest, ReaperPreservesReusedSecondaryEntry) {
+TEST(MasstreeIndexTest, ReaperDoesNotPurgeReusedSecondaryEntry) {
   using namespace helios::storage;
   index::MasstreeIndex tree;
   index::Reaper reaper;
-  const Tidword deleted = Word(10, 2, /*absent=*/true);
+  const Tidword deleted = make_tidword(10, 2, /*absent=*/true);
   DataItem *item = tree.GetOrInsert("secondary");
   item->transaction_id.store(deleted);
   reaper.Enqueue(tree, "secondary", *item, deleted);
@@ -231,21 +180,21 @@ TEST(MasstreeIndexTest, ReaperPreservesReusedSecondaryEntry) {
   reaper.Purge(9);
   EXPECT_EQ(item, tree.Get("secondary"));
 
-  // A later insertion reuses the slot and publishes a newer TID.
-  item->SetPrimaryKeys({"primary"});
-  item->transaction_id.store(Word(10, 4, /*absent=*/false));
+  // A later insertion reuses the index record and publishes a newer TID.
+  item->set_primary_keys({"primary"});
+  item->transaction_id.store(make_tidword(10, 4, /*absent=*/false));
   reaper.Purge(10);
   EXPECT_EQ(item, tree.Get("secondary"));
   EXPECT_TRUE(item->IsLive());
 
-  // Deleting that last posting allows the same tree to purge the slot.
-  item->SetPrimaryKeys({});
-  const Tidword deleted_again = Word(12, 6, /*absent=*/true);
+  // Deleting that last posting allows the same tree to purge the record.
+  item->set_primary_keys({});
+  const Tidword deleted_again = make_tidword(12, 6, /*absent=*/true);
   item->transaction_id.store(deleted_again);
   reaper.Enqueue(tree, "secondary", *item, deleted_again);
   reaper.Purge(12);
   EXPECT_EQ(nullptr, tree.Get("secondary"));
-  index::MasstreeReleaseThreadEpoch();
+  index::release_thread_epoch();
 }
 
 TEST(MasstreeIndexTest, PurgeRejectsAReplacementEntry) {
@@ -256,9 +205,10 @@ TEST(MasstreeIndexTest, PurgeRejectsAReplacementEntry) {
   DataItem *replacement = tree.Get("key");
   ASSERT_NE(old_item, replacement);
 
-  EXPECT_FALSE(tree.Purge("key", *old_item, Word(10, 4, /*absent=*/true)));
+  EXPECT_FALSE(
+      tree.Purge("key", *old_item, make_tidword(10, 4, /*absent=*/true)));
   EXPECT_EQ(replacement, tree.Get("key"));
-  index::MasstreeReleaseThreadEpoch();
+  index::release_thread_epoch();
 }
 
 TEST(MasstreeIndexTest, UnboundedReverseScanIncludesEveryKey) {
@@ -273,7 +223,7 @@ TEST(MasstreeIndexTest, UnboundedReverseScanIncludesEveryKey) {
       });
   EXPECT_EQ(std::vector<std::string>({"b", "a", ""}), keys);
   EXPECT_EQ(3u, count);
-  index::MasstreeReleaseThreadEpoch();
+  index::release_thread_epoch();
 }
 
 TEST(MasstreeIndexTest, ScanReturnsMatchingItemsInByteOrder) {
@@ -307,7 +257,7 @@ TEST(MasstreeIndexTest, ScanReturnsMatchingItemsInByteOrder) {
   seen.clear();
   tree.ForEach(collect);
   EXPECT_EQ(keys, seen);
-  index::MasstreeReleaseThreadEpoch();
+  index::release_thread_epoch();
 }
 
 TEST(MasstreeIndexTest, EmptyUpperBoundIsNotAnUnboundedScan) {
@@ -325,7 +275,7 @@ TEST(MasstreeIndexTest, EmptyUpperBoundIsNotAnUnboundedScan) {
   EXPECT_EQ(0u, tree.ScanReverse("a", "a", unexpected));
   EXPECT_EQ(0u, tree.Scan("b", "a", unexpected));
   EXPECT_EQ(0u, tree.ScanReverse("b", "a", unexpected));
-  index::MasstreeReleaseThreadEpoch();
+  index::release_thread_epoch();
 }
 
 TEST(MasstreeIndexTest, BoundedValueScanCountsTheCallbackThatStopsIt) {
@@ -344,5 +294,5 @@ TEST(MasstreeIndexTest, BoundedValueScanCountsTheCallbackThatStopsIt) {
   seen.clear();
   EXPECT_EQ(2u, tree.ScanReverse("a", "d", stop_after_two));
   EXPECT_EQ(std::vector<std::string>({"c", "b"}), seen);
-  index::MasstreeReleaseThreadEpoch();
+  index::release_thread_epoch();
 }

@@ -8,13 +8,14 @@ cd build/server
 make -j `nproc`
 cd ../..
 
-echo "Building proxy..."
+echo "Building plugin..."
 
-# Sync proxy sources to MySQL SE sources (do not edit third_party directly; this is a build-time copy)
+# Sync plugin sources to MySQL SE sources (do not edit third_party directly; this is a build-time copy)
 ROOT_DIR=$(pwd)
 SE_DIR="$ROOT_DIR/third_party/mysql-server/storage/helios"
-echo "Syncing proxy sources into storage/helios ..."
-cp -v "$ROOT_DIR"/proxy/*.cc "$ROOT_DIR"/proxy/*.hh "$ROOT_DIR"/proxy/*.h "$ROOT_DIR"/proxy/CMakeLists.txt "$SE_DIR/"
+echo "Syncing plugin sources into storage/helios ..."
+rm -f "$SE_DIR"/*.cc "$SE_DIR"/*.hh "$SE_DIR"/*.h
+cp -v "$ROOT_DIR"/plugin/*.cc "$ROOT_DIR"/plugin/*.hh "$ROOT_DIR"/plugin/*.h "$ROOT_DIR"/plugin/CMakeLists.txt "$SE_DIR/"
 cp -v "$ROOT_DIR"/proto/helios.proto "$SE_DIR/proto/"
 mkdir -p "$SE_DIR/common"
 cp -a "$ROOT_DIR"/common/. "$SE_DIR/common/"

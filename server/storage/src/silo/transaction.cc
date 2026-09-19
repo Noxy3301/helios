@@ -74,10 +74,10 @@ bool Transaction::Write(std::string_view table_name, std::string_view key,
   }
   pax::Row row;
   if (op != RowOp::kDelete &&
-      !pax::DecodeRow(store->schema(),
+      !pax::unpack_row(store->schema(),
                       reinterpret_cast<const std::byte *>(row_bytes.data()),
                       row_bytes.size(), row)) {
-    reason = "pax_row_decode_failed";
+    reason = "pax_row_unpack_failed";
     return false;
   }
 
@@ -113,7 +113,7 @@ bool Transaction::IndexWrite(std::string_view table_name,
                              std::string &reason) {
   Table *table = tables_.GetTable(table_name);
   if (table == nullptr) {
-    reason = "si_table_missing";
+    reason = "secondary_index_table_missing";
     return false;
   }
   // Recovery refuses a log entry whose table has no schema, so a record on
@@ -124,7 +124,7 @@ bool Transaction::IndexWrite(std::string_view table_name,
   }
   index::SecondaryIndex *index = table->GetSecondaryIndex(index_name);
   if (index == nullptr) {
-    reason = "si_index_missing";
+    reason = "secondary_index_missing";
     return false;
   }
   DataItem *item = index->tree.GetOrInsert(secondary_key);
@@ -143,7 +143,8 @@ bool Transaction::IndexWrite(std::string_view table_name,
 
 bool Transaction::Commit(CommitDurability durability, std::string &reason) {
   reason.clear();
-  // A range without its end bound cannot be replayed; refuse before locking.
+  // A range without its end bound cannot be revalidated; refuse before
+  // locking.
   for (const auto &range : range_set_) {
     if (range.end.empty()) {
       reason = "range_end_key_missing";
@@ -291,7 +292,7 @@ bool Transaction::Prepare(DataItem &item, WriteEntry &entry,
   for (const auto &delta : index.deltas) {
     if (delta.op == wal::SecondaryIndexOp::kDelete) {
       index.primary_keys =
-          PrimaryKeyList::Delete(index.primary_keys, delta.primary_key);
+          PrimaryKeyList::erase(index.primary_keys, delta.primary_key);
       continue;
     }
     // A UNIQUE key holds one primary key; adding that same key again is not
@@ -304,7 +305,7 @@ bool Transaction::Prepare(DataItem &item, WriteEntry &entry,
       return false;
     }
     index.primary_keys =
-        PrimaryKeyList::Insert(index.primary_keys, delta.primary_key);
+        PrimaryKeyList::insert(index.primary_keys, delta.primary_key);
   }
   return true;
 }
@@ -335,8 +336,9 @@ bool Transaction::ValidateReads(Tidword &max_tid, std::string &reason) {
   }
 
   for (const auto &range : range_set_) {
-    const bool ok = range.index.empty() ? ReplayRange(range, max_tid)
-                                        : ReplayIndexRange(range, max_tid);
+    const bool ok = range.index.empty()
+                        ? RevalidateRange(range, max_tid)
+                        : RevalidateSecondaryRange(range, max_tid);
     if (!ok) {
       reason = range.index.empty() ? "primary_range_result_changed"
                                    : "secondary_range_result_changed";
@@ -346,7 +348,7 @@ bool Transaction::ValidateReads(Tidword &max_tid, std::string &reason) {
   return true;
 }
 
-bool Transaction::ReplayRange(const RangeEntry &range, Tidword &max_tid) {
+bool Transaction::RevalidateRange(const RangeEntry &range, Tidword &max_tid) {
   auto table = tables_.GetTable(range.table);
   if (table == nullptr) return false;
 
@@ -380,7 +382,8 @@ bool Transaction::ReplayRange(const RangeEntry &range, Tidword &max_tid) {
   return matches && result_pos == range.keys.size();
 }
 
-bool Transaction::ReplayIndexRange(const RangeEntry &range, Tidword &max_tid) {
+bool Transaction::RevalidateSecondaryRange(const RangeEntry &range,
+                                           Tidword &max_tid) {
   auto table = tables_.GetTable(range.table);
   if (table == nullptr) return false;
   auto *index = table->GetSecondaryIndex(range.index);

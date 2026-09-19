@@ -1,7 +1,7 @@
 /**
  * @file server/storage/tests/range_validation_test.cc
  * Which changes inside a validated range abort the transaction that read
- * it, and which fall outside its cap.
+ * it, and which fall outside its row limit.
  */
 
 #include <filesystem>
@@ -45,7 +45,7 @@ bool CommitDelete(helios::storage::Database &db, const std::string &key) {
   return committed;
 }
 
-// Scans the range and assembles the evidence a caller submits at commit.
+// Scans the range and assembles the range read set a caller submits at commit.
 TestHelper::Range ScanRange(helios::storage::Database &db,
                             const std::string &start_key,
                             const std::string &end_key, uint64_t row_limit = 0,
@@ -60,7 +60,7 @@ TestHelper::Range ScanRange(helios::storage::Database &db,
   range.end_key = end_key;
   range.row_limit = row_limit;
   range.reverse_scan = reverse_scan;
-  // A refused scan has no rows to submit as evidence; returning the empty
+  // A refused scan has no rows for the range read set; returning the empty
   // range keeps the caller's own expectations from passing on it.
   if (!scan.ok) return range;
   for (const auto &row : scan.rows) {
@@ -78,17 +78,6 @@ void SeedRows(helios::storage::Database &db) {
   for (const char *key : {"k1", "k2", "k3", "k4"}) {
     ASSERT_TRUE(CommitWrite(db, key, "v"));
   }
-}
-
-// Materializes a key without ever initializing it. Resolving a write inserts
-// the slot before validation runs, and an aborted commit leaves it behind.
-void LeaveAbsentSlot(helios::storage::Database &db, const std::string &key) {
-  std::string reason;
-  const bool committed = TestHelper::CommitRows(
-      db, {{kTable, "k1", 0}}, {{kTable, key, TestHelper::Row("v")}}, {}, {},
-      reason);
-  ASSERT_FALSE(committed) << "the write was supposed to abort";
-  EXPECT_FALSE(reason.empty()) << "an abort names its reason";
 }
 
 }  // namespace
@@ -122,7 +111,7 @@ TEST(RangeValidationTest, ARowDeletedInsideTheRangeAborts) {
 }
 
 TEST(RangeValidationTest, ARowDeletedAtTheEndOfTheRangeAborts) {
-  // The replay is a strict prefix of the evidence, so nothing diverges
+  // The re-scan is a strict prefix of the recorded keys, so nothing diverges
   // positionally and only the length check rejects it.
   auto config = MakeConfig();
   helios::storage::Database db(config);
@@ -152,8 +141,8 @@ TEST(RangeValidationTest, ARowInsertedInsideTheRangeAborts) {
 }
 
 TEST(RangeValidationTest, ARowInsertedAtTheEndOfTheRangeAborts) {
-  // The evidence is a strict prefix of the replay, so the divergence is the
-  // first live row past the evidence.
+  // The recorded keys are a strict prefix of the re-scan, so the divergence is
+  // the first live row past them.
   auto config = MakeConfig();
   helios::storage::Database db(config);
   ASSERT_TRUE(TestHelper::CreateTable(db, kTable));
@@ -167,7 +156,7 @@ TEST(RangeValidationTest, ARowInsertedAtTheEndOfTheRangeAborts) {
   EXPECT_EQ(reason, "primary_range_result_changed");
 }
 
-TEST(RangeValidationTest, ALimitedRangeIgnoresChangesPastItsCap) {
+TEST(RangeValidationTest, ALimitedRangeIgnoresChangesPastItsRowLimit) {
   auto config = MakeConfig();
   helios::storage::Database db(config);
   ASSERT_TRUE(TestHelper::CreateTable(db, kTable));
@@ -181,14 +170,21 @@ TEST(RangeValidationTest, ALimitedRangeIgnoresChangesPastItsCap) {
   EXPECT_TRUE(Revalidate(db, range, reason)) << reason;
 }
 
-TEST(RangeValidationTest, AnAbsentSlotDoesNotConsumeTheCap) {
-  // The cap counts live rows. An absent slot between the first two of them must
-  // leave the replay room to reach the second.
+TEST(RangeValidationTest, ABlankRecordDoesNotConsumeTheRowLimit) {
+  // The row limit counts live rows. A blank record between the first two of
+  // them must leave the re-scan room to reach the second.
   auto config = MakeConfig();
   helios::storage::Database db(config);
   ASSERT_TRUE(TestHelper::CreateTable(db, kTable));
   SeedRows(db);
-  LeaveAbsentSlot(db, "k15");
+
+  // A write whose read set is stale inserts its blank record before
+  // validation runs, and the abort leaves the record behind.
+  std::string blank_reason;
+  ASSERT_FALSE(TestHelper::CommitRows(db, {{kTable, "k1", 0}},
+                                      {{kTable, "k15", TestHelper::Row("v")}},
+                                      {}, {}, blank_reason));
+  EXPECT_FALSE(blank_reason.empty()) << "an abort names its reason";
 
   const auto range = ScanRange(db, "k1", "k5", 2);
   ASSERT_EQ(range.result_keys, (std::vector<std::string>{"k1", "k2"}));
@@ -225,9 +221,9 @@ TEST(RangeValidationTest, ARowAppearingInAnEmptyRangeAborts) {
   EXPECT_EQ(reason, "primary_range_result_changed");
 }
 
-TEST(RangeValidationTest, EvidenceRepeatingAKeyAborts) {
-  // A primary index cannot return the same key twice, so evidence that does
-  // is rejected rather than matched by the positional walk.
+TEST(RangeValidationTest, ARangeReadSetRepeatingAKeyAborts) {
+  // A primary index cannot return the same key twice, so a range read set
+  // that repeats one is rejected rather than matched by the positional walk.
   auto config = MakeConfig();
   helios::storage::Database db(config);
   ASSERT_TRUE(TestHelper::CreateTable(db, kTable));

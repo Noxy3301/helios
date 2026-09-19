@@ -51,8 +51,6 @@ class DatabaseTest : public ::testing::Test {
   }
 };
 
-TEST_F(DatabaseTest, Instantiate) {}
-
 TEST_F(DatabaseTest, InstantiateWithConfig) {
   db_.reset(nullptr);
   helios::storage::Config conf;
@@ -127,7 +125,7 @@ TEST_F(DatabaseTest, FailedCommitLeavesItsEpoch) {
   EXPECT_FALSE(TestHelper::CommitRows(*db_, {}, writes,
                                       {{kTable, "missing_index", "s", "new"}},
                                       {}, reason, CommitDurability::kAsync));
-  EXPECT_EQ("si_index_missing", reason);
+  EXPECT_EQ("secondary_index_missing", reason);
   check_epoch_released();
   EXPECT_FALSE(TestHelper::ReadRow(*db_, kTable, "new").has_value());
   EXPECT_TRUE(TestHelper::WriteRow(*db_, kTable, "new", TestHelper::Row("next")));

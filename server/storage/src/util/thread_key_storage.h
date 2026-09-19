@@ -18,8 +18,8 @@
 
 /**
  * @file server/storage/src/util/thread_key_storage.h
- * Per-thread slots addressed by a key, with an enumeration over the live
- * threads that the epoch framework walks.
+ * Per-thread slots addressed by a key, with an enumeration over every slot
+ * created so far that the epoch framework walks.
  */
 
 #ifndef HELIOS_STORAGE_SRC_UTIL_THREAD_KEY_STORAGE_H

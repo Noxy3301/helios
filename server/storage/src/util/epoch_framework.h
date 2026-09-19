@@ -63,7 +63,7 @@ class Framework {
       : start_(false),
         stop_(false),
         global_epoch_(1),
-        epoch_thread_([=]() { EpochThreadJob(epoch_duration_ms); }) {}
+        epoch_thread_(&Framework::EpochThreadJob, this, epoch_duration_ms) {}
   /**
    * @brief Starts the epoch thread, parked until Start().
    *
@@ -76,7 +76,7 @@ class Framework {
         stop_(false),
         global_epoch_(1),
         epoch_hook_(std::move(hook)),
-        epoch_thread_([=]() { EpochThreadJob(epoch_duration_ms); }) {}
+        epoch_thread_(&Framework::EpochThreadJob, this, epoch_duration_ms) {}
 
   ~Framework() { Stop(); }
 
@@ -175,9 +175,9 @@ class Framework {
     }
   }
 
-  // Margin below the uint32 wrap point. Forced advances and fences refuse
-  // beyond it, and a read view's epoch lifetime is bounded well under the
-  // margin; every read-view epoch comparison therefore stays inside one
+  // Margin below the uint32 wrap point. Forced advances and read view fences
+  // refuse beyond it, and a read view's epoch lifetime is bounded well under
+  // the margin; every read-view epoch comparison therefore stays inside one
   // wrap-free window where plain unsigned ordering is exact. The timer-driven
   // advance stops the process at the mark rather than wrapping: past the wrap,
   // the epoch no longer orders against the durable epoch, so a commit

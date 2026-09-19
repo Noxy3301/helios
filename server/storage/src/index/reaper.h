@@ -29,9 +29,9 @@ class MasstreeIndex;
 class Reaper {
  public:
   /**
-   * @brief Registers one logically deleted slot for a later physical purge.
+   * @brief Registers one logically deleted record for a later physical purge.
    *
-   * The committer passes the tree owning the already resolved slot.
+   * The committer passes the tree owning the already resolved record.
    */
   void Enqueue(MasstreeIndex &index, std::string_view key, DataItem &item,
                Tidword delete_commit_tid);
@@ -47,10 +47,10 @@ class Reaper {
 
  private:
   /**
-   * @brief One logically deleted slot awaiting its physical purge.
+   * @brief One logically deleted record awaiting its physical purge.
    *
-   * index is the tree owning the slot. item is the slot pointer observed at
-   * enqueue time and serves as an identity check at purge time.
+   * index is the tree owning the record. item is the DataItem the key resolved
+   * to at enqueue time and serves as an identity check at purge time.
    * `delete_commit_tid` identifies the deletion; a newer version cancels
    * this candidate.
    */

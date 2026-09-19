@@ -1,20 +1,20 @@
 """
-Regression: a log whose frontier sits at the epoch high-water mark must stop
-startup, on both startup paths.
+Regression: a log whose durable epoch sits at the epoch high-water mark must
+stop startup, on both startup paths.
 
-Recovery resumes strictly above the frontier it read, so that a transaction
-joining the frontier's own epoch cannot see that epoch already reported durable
+Recovery resumes strictly above the durable epoch D it read, so that a
+transaction joining D itself cannot see that epoch already reported durable
 and return a Sync acknowledgement before its record was written. Adding one to
 an epoch at the wrap point would break the ordering that comparison rests on,
 so the server refuses to start instead.
 
 Both paths compute the resume epoch: with recovery the records are replayed
-first, without recovery they are discarded and only the frontier is used. A
-regression in either one is silent -- the server starts and serves -- so this
+first, without recovery they are discarded and only the durable epoch is used.
+A regression in either one is silent -- the server starts and serves -- so this
 test drives the real binary and checks that it exits non-zero with the
 high-water message and without reporting a successful initialization. The
-control case, a frontier nowhere near the mark, checks the opposite pair: the
-server initializes and the high-water message never appears.
+control case, a durable epoch nowhere near the mark, checks the opposite pair:
+the server initializes and the high-water message never appears.
 
 Not a storage gtest death test: constructing a Database in-process hangs in
 this fork for reasons unrelated to durability, so the child would hang rather
@@ -87,17 +87,17 @@ def run_server(work_dir, conf):
         return None, captured
 
 
-def with_crafted_log(frontier, conf):
+def with_crafted_log(durable_epoch, conf):
     with tempfile.TemporaryDirectory(prefix="helios_high_water_") as work_dir:
         log_dir = os.path.join(work_dir, "helios_data")
         os.makedirs(log_dir)
         with open(os.path.join(log_dir, "wal.log"), "wb") as wal:
-            wal.write(make_frame(frontier))
+            wal.write(make_frame(durable_epoch))
         return run_server(work_dir, conf)
 
 
-def expect_refusal(label, frontier, conf):
-    rc, output = with_crafted_log(frontier, conf)
+def expect_refusal(label, durable_epoch, conf):
+    rc, output = with_crafted_log(durable_epoch, conf)
     if rc is None:
         print(f"FAIL [{label}]: the server kept running instead of refusing to "
               f"start")
@@ -107,13 +107,13 @@ def expect_refusal(label, frontier, conf):
               f"failing startup")
         return False
     # Distinguishes a startup refusal from the epoch thread's later abort, which
-    # is what happens if the bound is put on the frontier instead of on the
+    # is what happens if the bound is put on the durable epoch instead of on the
     # epoch that startup resumes at.
     if "high-water mark" not in output:
         print(f"FAIL [{label}]: exited rc={rc} but not for the high-water "
               f"reason; output was:\n{output[-800:]}")
         return False
-    if "server initialized successfully" in output:
+    if "Storage server initialized" in output:
         print(f"FAIL [{label}]: the server finished initializing before failing; "
               f"the refusal must happen during startup")
         return False
@@ -121,20 +121,20 @@ def expect_refusal(label, frontier, conf):
     return True
 
 
-def expect_startup(label, frontier, conf):
-    """The control: startup must not be refused for a frontier far from the mark.
+def expect_startup(label, durable_epoch, conf):
+    """The control: a durable epoch far from the mark must not refuse startup.
 
     The oracle is the startup decision, not the exit code. Whether the process
     then keeps running depends on whether port 9999 is free, and the test suite
     runs with a server already listening on it -- so it reaches initialization
     and exits on the bind instead of serving.
     """
-    rc, output = with_crafted_log(frontier, conf)
+    rc, output = with_crafted_log(durable_epoch, conf)
     if "high-water mark" in output:
-        print(f"FAIL [{label}]: startup was refused for a frontier that is "
+        print(f"FAIL [{label}]: startup was refused for a durable epoch "
               f"nowhere near the mark; output was:\n{output[-800:]}")
         return False
-    if "server initialized successfully" not in output:
+    if "Storage server initialized" not in output:
         print(f"FAIL [{label}]: the server never finished initializing "
               f"(rc={rc}); output was:\n{output[-800:]}")
         return False
@@ -155,7 +155,7 @@ def main():
 
     ok = True
     # Both startup paths compute the resume epoch: without recovery the records
-    # are discarded and only the frontier is used, with recovery the frontier is
+    # are discarded and only the durable epoch is used, with recovery it is
     # combined with the epochs seen while replaying.
     ok &= expect_refusal("at the mark, recovery off", HIGH_WATER, off)
     ok &= expect_refusal("at the mark, recovery on", HIGH_WATER, on)
@@ -168,7 +168,7 @@ def main():
     # value that means "no participant".
     ok &= expect_refusal("maximum epoch, recovery off", 0xFFFFFFFF, off)
     ok &= expect_refusal("maximum epoch, recovery on", 0xFFFFFFFF, on)
-    # A frontier far from the mark must still start, so the refusal above is the
+    # A durable epoch far from the mark must still start, so the refusal is the
     # boundary and not "any crafted log is rejected".
     ok &= expect_startup("far from the mark, recovery on", 1000, on)
     if not ok:

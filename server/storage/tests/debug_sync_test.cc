@@ -11,71 +11,20 @@
 #include <unistd.h>
 
 #include <chrono>
-#include <cstdlib>
 #include <future>
 #include <string>
-#include <thread>
-#include <vector>
+
+#include "sync_point.h"
 
 namespace {
 
 constexpr auto kTestTimeout = std::chrono::seconds(5);
 
-// Closes both ends on scope exit so an assertion failure cannot leak them.
-class Pipe {
- public:
-  Pipe() { EXPECT_EQ(::pipe(fds_), 0); }
-  ~Pipe() {
-    CloseRead();
-    CloseWrite();
-  }
-  int read_fd() const { return fds_[0]; }
-  int write_fd() const { return fds_[1]; }
-  void CloseRead() { Close(fds_[0]); }
-  void CloseWrite() { Close(fds_[1]); }
-
- private:
-  static void Close(int &fd) {
-    if (fd >= 0) {
-      ::close(fd);
-      fd = -1;
-    }
-  }
-  int fds_[2] = {-1, -1};
-};
-
-// Writes the release byte on scope exit. Declared after the future so it runs
-// first and the blocked point can always finish; the extra byte on the
-// success path is never read and harmless.
-struct ReleaseOnExit {
-  int fd;
-  ~ReleaseOnExit() { [[maybe_unused]] const ssize_t rc = ::write(fd, "r", 1); }
-};
-
-// The facility decides once per process whether anything is armed. This
-// sentinel keeps that decision armed in every execution order; without it, a
-// test that arms nothing could run first and cache "nothing armed" for the
-// rest of the file.
 class DebugSyncTest : public ::testing::Test {
  protected:
-  static void SetUpTestSuite() {
-    ::setenv("HELIOS_DEBUG_SYNC_KEEPS_THE_FACILITY_ARMED", "sleep:0", 1);
-  }
+  static void SetUpTestSuite() { keep_sync_facility_armed(); }
 
-  void Arm(const std::string &variable, const std::string &action) {
-    ::setenv(variable.c_str(), action.c_str(), 1);
-    armed_.push_back(variable);
-  }
-
-  void TearDown() override {
-    for (const auto &variable : armed_) {
-      ::unsetenv(variable.c_str());
-    }
-    armed_.clear();
-  }
-
- private:
-  std::vector<std::string> armed_;
+  ArmedSyncPoints points_;
 };
 
 TEST_F(DebugSyncTest, ArriveAndWaitBlocksUntilReleased) {
@@ -83,9 +32,9 @@ TEST_F(DebugSyncTest, ArriveAndWaitBlocksUntilReleased) {
   Pipe release;
   ASSERT_GE(arrived.write_fd(), 0);
   ASSERT_GE(release.read_fd(), 0);
-  Arm("HELIOS_DEBUG_SYNC_TEST_HANDSHAKE",
-      "arrive_and_wait:" + std::to_string(arrived.write_fd()) + ":" +
-          std::to_string(release.read_fd()));
+  points_.arm("HELIOS_DEBUG_SYNC_TEST_HANDSHAKE",
+              "arrive_and_wait:" + std::to_string(arrived.write_fd()) + ":" +
+                  std::to_string(release.read_fd()));
 
   auto reached = std::async(std::launch::async,
                             [] { HELIOS_DEBUG_SYNC("test.handshake"); });
@@ -114,7 +63,7 @@ TEST_F(DebugSyncTest, LookupMissFallsThrough) {
 }
 
 TEST_F(DebugSyncTest, SleepWaitsTheConfiguredMs) {
-  Arm("HELIOS_DEBUG_SYNC_TEST_SLEEP", "sleep:120");
+  points_.arm("HELIOS_DEBUG_SYNC_TEST_SLEEP", "sleep:120");
   auto start = std::chrono::steady_clock::now();
   HELIOS_DEBUG_SYNC("test.sleep");
   EXPECT_GE(std::chrono::steady_clock::now() - start,
@@ -126,10 +75,10 @@ TEST_F(DebugSyncTest, ClosedReleasePipeIsAFailure) {
   Pipe release;
   ASSERT_GE(arrived.write_fd(), 0);
   ASSERT_GE(release.read_fd(), 0);
-  Arm("HELIOS_DEBUG_SYNC_TEST_EOF",
-      "arrive_and_wait:" + std::to_string(arrived.write_fd()) + ":" +
-          std::to_string(release.read_fd()));
-  release.CloseWrite();
+  points_.arm("HELIOS_DEBUG_SYNC_TEST_EOF",
+              "arrive_and_wait:" + std::to_string(arrived.write_fd()) + ":" +
+                  std::to_string(release.read_fd()));
+  release.close_write();
 
   // Read of a pipe with no writer returns 0. Continuing would run the code
   // after the point as if the observer had released it.
@@ -139,10 +88,10 @@ TEST_F(DebugSyncTest, ClosedReleasePipeIsAFailure) {
 TEST_F(DebugSyncTest, BrokenArrivalPipeIsAFailure) {
   Pipe arrived;
   Pipe release;
-  Arm("HELIOS_DEBUG_SYNC_TEST_NO_READER",
-      "arrive_and_wait:" + std::to_string(arrived.write_fd()) + ":" +
-          std::to_string(release.read_fd()));
-  arrived.CloseRead();
+  points_.arm("HELIOS_DEBUG_SYNC_TEST_NO_READER",
+              "arrive_and_wait:" + std::to_string(arrived.write_fd()) + ":" +
+                  std::to_string(release.read_fd()));
+  arrived.close_read();
 
   // With no reader, write raises SIGPIPE; the point must still die through
   // its own diagnostic rather than the signal's default action.
@@ -155,7 +104,7 @@ TEST_F(DebugSyncTest, AnUnusableDescriptorIsAFailure) {
   // about something other than announcement failure.
   ASSERT_EQ(::fcntl(987654, F_GETFD), -1);
   ASSERT_EQ(::fcntl(987655, F_GETFD), -1);
-  Arm("HELIOS_DEBUG_SYNC_TEST_BAD_FD", "arrive_and_wait:987654:987655");
+  points_.arm("HELIOS_DEBUG_SYNC_TEST_BAD_FD", "arrive_and_wait:987654:987655");
   EXPECT_DEATH(HELIOS_DEBUG_SYNC("test.bad_fd"), "could not announce arrival");
 }
 
@@ -187,9 +136,8 @@ TEST_F(DebugSyncTest, MalformedActivationsAreFailures) {
       "",                            // armed with nothing
   };
   for (const char *action : malformed) {
-    Arm(variable, action);
-    EXPECT_DEATH(HELIOS_DEBUG_SYNC("test.malformed"),
-                 "Helios debug sync point")
+    points_.arm(variable, action);
+    EXPECT_DEATH(HELIOS_DEBUG_SYNC("test.malformed"), "Helios debug sync point")
         << "action: " << action;
   }
 }

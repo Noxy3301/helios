@@ -19,7 +19,7 @@ namespace index {
 /**
  * @brief Maps ordered keys to DataItems.
  * @details DataItem pointers stay valid until this thread calls
- * MasstreeReleaseThreadEpoch().
+ * release_thread_epoch().
  */
 class MasstreeIndex final {
  public:
@@ -37,13 +37,19 @@ class MasstreeIndex final {
   DataItem *GetOrInsert(std::string_view key);
 
   /**
-   * @brief Scans [begin, end); nullopt means no upper bound. Reverse scans down.
+   * @brief Walks [begin, end) upwards; nullopt for `end` means no upper bound.
    * @details The key is valid only during the callback. Return true to stop.
    * Use stable reads for values; a scan is not a snapshot.
    * @return Visited key count, including the key that stopped the scan.
    */
   size_t Scan(std::string_view begin, std::optional<std::string_view> end,
               std::function<bool(std::string_view, DataItem &)> operation);
+
+  /**
+   * @brief Walks the same half-open range downwards, from below `end`;
+   *        nullopt for `end` starts at the largest key.
+   * @details Same callback contract and same count as Scan.
+   */
   size_t ScanReverse(
       std::string_view begin, std::optional<std::string_view> end,
       std::function<bool(std::string_view, DataItem &)> operation);
@@ -68,14 +74,14 @@ class MasstreeIndex final {
 /**
  * @brief Advances Masstree's epoch from the storage epoch thread.
  */
-void MasstreeAdvanceEpoch();
+void advance_epoch();
 
 /**
  * @brief Releases this thread's Masstree epoch.
  * @details Call only after finishing with all pointers obtained in that epoch.
  * The next index operation enters an epoch again.
  */
-void MasstreeReleaseThreadEpoch();
+void release_thread_epoch();
 
 }  // namespace index
 }  // namespace helios::storage

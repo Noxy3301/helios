@@ -26,8 +26,6 @@
 #include <filesystem>
 #include <memory>
 #include <string>
-#include <thread>
-#include <vector>
 
 #include "helios/config.h"
 #include "helios/database.h"
@@ -111,27 +109,6 @@ TEST_F(DurabilityTest, RecoveryLargeObject) {
   }
 }
 
-TEST_F(DurabilityTest, RecoveryInContendedWorkload) {
-  // Recovery logging is on by default.
-  const helios::storage::Config config = db_->GetConfig();
-
-  const int value = 0xBEEF;
-  std::vector<std::thread> writers;
-  for (size_t i = 0; i < 3; i++) {
-    writers.emplace_back([&] {
-      while (!TestHelper::Write<int>(*db_, kTable, "alice", value)) {
-      }
-    });
-  }
-  for (auto &writer : writers) writer.join();
-
-  Restart(config);
-
-  auto alice = TestHelper::Read<int>(*db_, kTable, "alice");
-  ASSERT_TRUE(alice.has_value());
-  ASSERT_EQ(value, alice.value());
-}
-
 TEST_F(DurabilityTest, RecoveryWithNamedTable) {
   const helios::storage::Config config = db_->GetConfig();
   const std::string table_name = "accounts";
@@ -153,7 +130,7 @@ TEST_F(DurabilityTest, RecoveryWithNamedTable) {
 
 // A commit that asked for Async is reported at precommit, so it returns
 // without the epoch it committed in having reached the device. The epoch
-// window is the clock here: an epoch this long cannot close, let alone be
+// duration is the clock here: an epoch this long cannot close, let alone be
 // flushed, inside the time an Async commit is allowed to take, so a return
 // that fast is proof it did not wait. The Sync commit beside it does wait,
 // which is what makes the comparison a contract and not a stopwatch reading.

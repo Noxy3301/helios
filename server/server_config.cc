@@ -108,18 +108,18 @@ void apply_key(const std::string& key, const std::string& value) {
             refuse(key, value, "an integer up to one day in milliseconds");
         }
         g_config.checkpoint_once_after_ms = static_cast<size_t>(number);
-    } else if (key == "bridge_threads") {
+    } else if (key == "olap_threads") {
         if (!parse_number(value, 1, UINT32_MAX, &number)) {
             refuse(key, value, "a positive integer");
         }
-        g_config.bridge_threads = number;
-    } else if (key == "bridge_mem_limit") {
-        if (!parse_bytes(value, &g_config.bridge_mem_limit_bytes)) {
+        g_config.olap_threads = number;
+    } else if (key == "olap_mem_limit") {
+        if (!parse_bytes(value, &g_config.olap_mem_limit_bytes)) {
             refuse(key, value,
                    "a positive byte count with an optional K, M or G suffix");
         }
-    } else if (key == "bridge_debug") {
-        if (!parse_bool(value, &g_config.bridge_debug)) {
+    } else if (key == "olap_trace") {
+        if (!parse_bool(value, &g_config.olap_trace)) {
             refuse(key, value, "0 or 1, true or false, on or off");
         }
     } else if (key == "read_view_fence_timeout_ms") {

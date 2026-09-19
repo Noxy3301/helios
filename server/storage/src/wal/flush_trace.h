@@ -326,13 +326,10 @@ class FlushTrace {
   uint32_t ThreadSlotIndex() {
     // A 64-bit ticket cannot wrap in a process lifetime, so exhaustion
     // stays exhaustion.
-    static thread_local uint32_t index = [this] {
-      const uint64_t ticket =
-          next_slot_.fetch_add(1, std::memory_order_relaxed);
-      return ticket < kMaxSlots ? static_cast<uint32_t>(ticket)
-                                : static_cast<uint32_t>(kMaxSlots);
-    }();
-    return index;
+    static thread_local uint64_t ticket =
+        next_slot_.fetch_add(1, std::memory_order_relaxed);
+    return ticket < kMaxSlots ? static_cast<uint32_t>(ticket)
+                              : static_cast<uint32_t>(kMaxSlots);
   }
 
   bool enabled_{false};

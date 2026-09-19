@@ -10,8 +10,8 @@
  * the rows as PAX row references.
  *
  * @return true when the rows were emitted; false when the table, the key
- *   shape or the row count does not fit, and the caller materializes the
- *   range serially.
+ *   shape or the row count does not fit, and the caller scans the range
+ *   serially.
  */
 bool parallel_primary_pax_row_ref_scan(
     helios::storage::Database* db,

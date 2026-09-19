@@ -140,7 +140,7 @@ Catalog LoadCatalog(const std::string &work_dir) {
   }
 
   try {
-    // Decode the whole catalog; never recover with only some table definitions.
+    // Unpack the whole catalog; never recover with only some table definitions.
     std::vector<char> bytes(static_cast<size_t>(info.st_size));
     if (std::fread(bytes.data(), 1, bytes.size(), file.get()) != bytes.size()) {
       result.detail = "cannot read the complete PAX catalog";

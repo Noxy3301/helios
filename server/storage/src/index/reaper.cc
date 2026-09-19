@@ -1,7 +1,7 @@
 /**
  * @file server/storage/src/index/reaper.cc
  * The deferred purge queue: candidates wait for an epoch no reader can be
- * in before their slots are erased.
+ * in before their records are erased.
  */
 
 #include "index/reaper.h"
@@ -79,7 +79,7 @@ void Reaper::Purge(EpochNumber reclamation_epoch) {
 
   // Get and Purge enrolled this thread in masstree's RCU epoch; release it
   // before returning to the epoch hook.
-  MasstreeReleaseThreadEpoch();
+  release_thread_epoch();
 }
 
 }  // namespace index

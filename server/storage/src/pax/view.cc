@@ -1,7 +1,7 @@
 /**
  * @file server/storage/src/pax/view.cc
- * PAX schema installation, and the consistent columnar read view, which an
- * epoch fence makes consistent.
+ * PAX schema installation, and the consistent read view a read view fence
+ * opens.
  */
 
 #include <chrono>
@@ -41,7 +41,7 @@ Database::PaxReadView Database::OpenPaxView(uint32_t fence_timeout_ms) {
   if (snapshot_epoch >= epoch::Framework::kEpochHighWater - kInstallDrainEpochs) {
     image_buffer.Close(snapshot_epoch);
     view.error =
-        "columnar read view rejected: epoch space is near its wrap "
+        "read view rejected: epoch space is near its wrap "
         "high-water mark, restart the server";
     return view;
   }
@@ -50,7 +50,7 @@ Database::PaxReadView Database::OpenPaxView(uint32_t fence_timeout_ms) {
           std::chrono::milliseconds(fence_timeout_ms))) {
     image_buffer.Close(snapshot_epoch);
     view.error =
-        "columnar read view fence timed out; a long-running transaction is "
+        "read view fence timed out; a long-running transaction is "
         "holding the epoch";
     return view;
   }

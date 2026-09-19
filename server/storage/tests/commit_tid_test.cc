@@ -98,7 +98,7 @@ class CommitTidTest : public ::testing::Test {
     }
     epoch_.Start();
     epoch_.Stop();
-    index::MasstreeReleaseThreadEpoch();
+    index::release_thread_epoch();
     std::filesystem::remove_all(config_.work_dir);
   }
 
@@ -107,7 +107,7 @@ class CommitTidTest : public ::testing::Test {
     auto *item = table->GetPrimaryIndex().GetOrInsert(key);
     const std::string bytes = TestHelper::Row(key);
     pax::Row row;
-    EXPECT_TRUE(pax::DecodeRow(
+    EXPECT_TRUE(pax::unpack_row(
         table->GetPaxTable()->schema(),
         reinterpret_cast<const std::byte *>(bytes.data()), bytes.size(), row));
     EXPECT_TRUE(item->AllocateSlot(*table->GetPaxTable()));
@@ -128,7 +128,7 @@ class CommitTidTest : public ::testing::Test {
     const bool committed =
         TestHelper::Feed(tx, reads, ranges, rows, index_ops, reason_) &&
         tx.Commit(CommitDurability::kAsync, reason_);
-    index::MasstreeReleaseThreadEpoch();
+    index::release_thread_epoch();
     return committed;
   }
 };
@@ -159,7 +159,7 @@ TEST_F(CommitTidTest, CommitReadsTheEpochAfterTheWriteSetIsFed) {
   EXPECT_EQ(epoch::Framework::kThreadOffline, epoch_.ThreadEpoch());
   EXPECT_EQ(published, item->transaction_id.load());
   EXPECT_FALSE(item->transaction_id.load().lock);
-  index::MasstreeReleaseThreadEpoch();
+  index::release_thread_epoch();
 
   // Only the first commit reached the log; the stale attempt logged nothing.
   logger_->RequestFlush(11);
@@ -197,7 +197,7 @@ TEST_F(CommitTidTest, CommitJoinsTheEpochAfterItsLocksAreHeld) {
     EXPECT_EQ(epoch::Framework::kThreadOffline, epoch_.ThreadEpoch());
     committed = tx.Commit(CommitDurability::kAsync, reason_);
     EXPECT_EQ(epoch::Framework::kThreadOffline, epoch_.ThreadEpoch());
-    index::MasstreeReleaseThreadEpoch();
+    index::release_thread_epoch();
   });
 
   // The committer holds the first record and is waiting on the second
@@ -595,7 +595,7 @@ TEST_F(CommitTidTest, OneTidCoversReadsRowsIndexesAndTheWorker) {
   auto *read = SeedRow("read", Version(10, 80));
   auto *index = tables_.GetTable(kTable)->GetSecondaryIndex("idx");
   auto *posting = index->tree.GetOrInsert("group");
-  posting->SetPrimaryKeys({"a"});
+  posting->set_primary_keys({"a"});
   posting->transaction_id.store(Version(10, 40));
   last_tid_ = Version(10, 60);
 
@@ -634,7 +634,7 @@ TEST_F(CommitTidTest, WrittenRowsAndIndexesContributeTheirPreviousVersions) {
 
   auto *index = tables_.GetTable(kTable)->GetSecondaryIndex("idx");
   auto *posting = index->tree.GetOrInsert("group");
-  posting->SetPrimaryKeys({"a"});
+  posting->set_primary_keys({"a"});
   posting->transaction_id.store(Version(10, 700));
   ASSERT_TRUE(Commit({}, {{kTable, "b", "value"}},
                      {{kTable, "idx", "group", "b", false}}))
@@ -680,7 +680,7 @@ TEST_F(CommitTidTest, UniqueIndexTakesASecondAdditionThatFollowsARemoval) {
   const auto view = keys.primary_keys_view();
   ASSERT_EQ(1u, view.size());
   EXPECT_EQ("b", *view.begin());
-  index::MasstreeReleaseThreadEpoch();
+  index::release_thread_epoch();
 }
 
 TEST_F(CommitTidTest, PointReadFailureUsesFixedReasonForBinaryKey) {
@@ -777,7 +777,7 @@ TEST_F(CommitTidTest, SecondaryRangeReadContributesIndexAndRowVersions) {
   auto *row = SeedRow("a", Version(10, 10));
   auto *index = tables_.GetTable(kTable)->GetSecondaryIndex("idx");
   auto *posting = index->tree.GetOrInsert("group");
-  posting->SetPrimaryKeys({"a"});
+  posting->set_primary_keys({"a"});
   posting->transaction_id.store(Version(10, 300));
   TestHelper::Range range;
   range.table_name = kTable;
@@ -854,7 +854,7 @@ TEST_F(CommitTidTest, FutureEpochAbortsAndReleasesTheWriteLock) {
 
 TEST_F(CommitTidTest, AbsentReadAcceptsABlankRecordAnotherTransactionLeft) {
   auto &tree = tables_.GetTable(kTable)->GetPrimaryIndex();
-  // An aborted attempt leaves the key materialized but still absent.
+  // An aborted attempt leaves the key a blank record, still absent.
   ASSERT_NE(nullptr, tree.GetOrInsert("blank"));
   ASSERT_TRUE(Commit({{kTable, "blank", Tidword::Absent().obj}},
                      {{kTable, "other", "value"}}))
@@ -897,11 +897,11 @@ TEST_F(CommitTidTest, ReadThenWriteOfOneKeyValidatesThroughOwnLock) {
   EXPECT_EQ(Version(10, 21), item->transaction_id.load());
 }
 
-TEST_F(CommitTidTest, RangeReplayAllowsOwnLockOnPrimaryAndSecondary) {
+TEST_F(CommitTidTest, RangeRevalidationAllowsOwnLockOnPrimaryAndSecondary) {
   SeedRow("k", Version(10, 10));
   auto *index = tables_.GetTable(kTable)->GetSecondaryIndex("idx");
   auto *posting = index->tree.GetOrInsert("s");
-  posting->SetPrimaryKeys({"k"});
+  posting->set_primary_keys({"k"});
   posting->transaction_id.store(Version(10, 12));
 
   TestHelper::Range rows;
@@ -931,7 +931,7 @@ TEST_F(CommitTidTest, AbsentReadAbortsWhenTheKeyWasDeletedMeanwhile) {
   EXPECT_EQ(0u, reason_.rfind("exact_read_tid_moved", 0)) << reason_;
 }
 
-TEST_F(CommitTidTest, AbsentEvidenceAbortsAfterThePurge) {
+TEST_F(CommitTidTest, AbsentReadAbortsAfterThePurge) {
   auto *item = SeedRow("k", Version(10, 4));
   ASSERT_TRUE(Commit({}, {{kTable, "k", "", RowOp::kDelete}})) << reason_;
   const uint64_t deleted = item->transaction_id.load().obj;
@@ -1007,7 +1007,7 @@ TEST_F(CommitTidTest,
   tree.GetOrInsert("a")->transaction_id.store(Deleted(11, 5));
   auto *index = tables_.GetTable(kTable)->GetSecondaryIndex("idx");
   auto *posting = index->tree.GetOrInsert("group");
-  posting->SetPrimaryKeys({"a"});
+  posting->set_primary_keys({"a"});
   posting->transaction_id.store(Version(10, 30));
   TestHelper::Range range;
   range.table_name = kTable;
@@ -1024,13 +1024,13 @@ TEST_F(CommitTidTest,
   SeedRow("a", Version(10, 2));
   auto *index = tables_.GetTable(kTable)->GetSecondaryIndex("idx");
   auto *posting = index->tree.GetOrInsert("s");
-  posting->SetPrimaryKeys({"a"});
+  posting->set_primary_keys({"a"});
   posting->transaction_id.store(Version(10, 4));
 
   ASSERT_TRUE(Commit({}, {}, {{kTable, "idx", "s", "a", true}})) << reason_;
   EXPECT_EQ(Deleted(10, 5), posting->transaction_id.load());
 
-  // The emptied entry replays as absent until the reaper removes it.
+  // The emptied entry revalidates as absent until the reaper removes it.
   TestHelper::Range range;
   range.table_name = kTable;
   range.index_name = "idx";

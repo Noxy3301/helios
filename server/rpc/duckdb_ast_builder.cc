@@ -28,7 +28,7 @@
 #include "duckdb/parser/tableref/subqueryref.hpp"
 #include "duckdb/parser/tableref/table_function_ref.hpp"
 
-namespace duckdb_bridge {
+namespace olap {
 namespace {
 
 namespace pb = Helios::Protocol;
@@ -46,7 +46,7 @@ constexpr char kMysqlAiCiLike[] = "mysql_utf8mb4_0900_ai_ci_like";
 constexpr char kMysqlAiCiNotLike[] = "mysql_utf8mb4_0900_ai_ci_not_like";
 constexpr char kMysqlAiCiSortKey[] = "mysql_utf8mb4_0900_ai_ci_sort_key";
 
-// MySQL collation ids whose comparison the bridge implements: 255 through
+// MySQL collation ids whose comparison the executor implements: 255 through
 // the registered strnxfrm collation, 309/63 as byte comparison.
 bool CollationIsByteSafe(uint32_t id) { return id == 309 || id == 63; }
 bool CollationIsAiCi(uint32_t id) { return id == 255; }
@@ -873,6 +873,14 @@ duckdb::unique_ptr<duckdb::TableRef> BuildRelation(
     }
 }
 
+// LIMIT 2^64-1 is MySQL's idiom for "all rows"; clamp to BIGINT, far beyond
+// any real result.
+unique_ptr<ParsedExpression> clamp_to_bigint(uint64_t v) {
+    return make_uniq<duckdb::ConstantExpression>(Value::BIGINT(
+        static_cast<int64_t>(std::min<uint64_t>(
+            v, std::numeric_limits<int64_t>::max()))));
+}
+
 duckdb::unique_ptr<duckdb::SelectStatement> BuildBlock(
     Builder& b, const Resolved::QueryBlock& block) {
     if (!block.has_from()) {
@@ -939,16 +947,9 @@ duckdb::unique_ptr<duckdb::SelectStatement> BuildBlock(
         node->modifiers.push_back(std::move(order));
     }
     if (block.has_limit() || block.has_offset()) {
-        // LIMIT 2^64-1 is MySQL's idiom for "all rows"; clamp to BIGINT,
-        // far beyond any real result.
-        auto clamp = [](uint64_t v) {
-            return make_uniq<duckdb::ConstantExpression>(
-                Value::BIGINT(static_cast<int64_t>(std::min<uint64_t>(
-                    v, std::numeric_limits<int64_t>::max()))));
-        };
         auto limit = make_uniq<duckdb::LimitModifier>();
-        if (block.has_limit()) limit->limit = clamp(block.limit());
-        if (block.has_offset()) limit->offset = clamp(block.offset());
+        if (block.has_limit()) limit->limit = clamp_to_bigint(block.limit());
+        if (block.has_offset()) limit->offset = clamp_to_bigint(block.offset());
         node->modifiers.push_back(std::move(limit));
     }
     auto statement = make_uniq<duckdb::SelectStatement>();
@@ -986,4 +987,4 @@ AstBuildResult BuildSelectStatement(const Resolved::Request& request,
     return result;
 }
 
-}  // namespace duckdb_bridge
+}  // namespace olap

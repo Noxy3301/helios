@@ -170,6 +170,15 @@ bool FsyncDirectory(const std::string &directory) {
   return ok;
 }
 
+// A checkpoint that is present but cannot be trusted, carrying no records:
+// recovery falls back to the log alone.
+EpochScanCheckpoint::LoadResult unusable(const std::string &detail) {
+  EpochScanCheckpoint::LoadResult checkpoint;
+  checkpoint.status = EpochScanCheckpoint::LoadResult::Status::kUnusable;
+  checkpoint.detail = detail;
+  return checkpoint;
+}
+
 }  // namespace
 
 const char *EpochScanCheckpoint::CheckpointFileName() { return "checkpoint"; }
@@ -280,7 +289,7 @@ void EpochScanCheckpoint::Start() {
       config_.checkpoint_once_after_ms == 0) {
     return;
   }
-  thread_ = std::thread([this]() { Loop(); });
+  thread_ = std::thread(&EpochScanCheckpoint::Loop, this);
 }
 
 void EpochScanCheckpoint::Stop() {
@@ -351,7 +360,7 @@ bool EpochScanCheckpoint::RunOnce(Stats *out_stats) {
   // epoch. Ending the reclamation critical section the pass held open from
   // its first walk is what lets a row retired during it be freed: no index
   // reclaims anything while a thread is inside a Masstree RCU enrolment.
-  index::MasstreeReleaseThreadEpoch();
+  index::release_thread_epoch();
 
   stats.scan_ms = ElapsedMs(scan_begin);
   // Every version in the checkpoint was published at or below this epoch, which
@@ -361,10 +370,11 @@ bool EpochScanCheckpoint::RunOnce(Stats *out_stats) {
   // Keep the previous checkpoint when the scan could not settle.
   if (abandoned) {
     ::unlink(working_path_.c_str());
-    const bool stopping = [&] {
+    bool stopping = false;
+    {
       std::lock_guard<std::mutex> lock(stop_mutex_);
-      return stop_;
-    }();
+      stopping = stop_;
+    }
     if (stopping) {
       SPDLOG_INFO("Checkpoint {0} abandoned: the capture thread is stopping",
                   stats.generation);
@@ -399,7 +409,7 @@ bool EpochScanCheckpoint::CaptureTable(Table &table, LogRecord &record,
   std::vector<std::string> unstable_rows;
   std::vector<std::pair<std::string, std::string>> unstable_entries;
 
-  // Capture every primary slot; defer the keys that stayed locked. The
+  // Capture every primary record; defer the keys that stayed locked. The
   // walk's callback returns true to stop, so a capture that wants every row
   // returns false.
   table.GetPrimaryIndex().ForEach([&](std::string_view key, DataItem &item) {
@@ -444,7 +454,7 @@ bool EpochScanCheckpoint::CaptureTable(Table &table, LogRecord &record,
 
   // Retry pass: resolve the deferred keys again and copy what has settled.
   // Rows held by a writer for the whole spin are resolved again by key: the
-  // slot they were in may have been purged and replaced meanwhile, and a
+  // record they were in may have been purged and replaced meanwhile, and a
   // pointer kept across the pass would name the old one.
   bool stopped = false;
   for (unsigned round = 0; round < kRetryRounds; ++round) {
@@ -592,13 +602,6 @@ EpochScanCheckpoint::LoadResult EpochScanCheckpoint::Load(
     return checkpoint;
   }
   const int fd = file.fd;
-
-  auto unusable = [&](const std::string &detail) {
-    checkpoint.status = LoadResult::Status::kUnusable;
-    checkpoint.detail = detail;
-    checkpoint.records.clear();
-    return checkpoint;
-  };
 
   struct stat file_stat {};
   if (::fstat(fd, &file_stat) < 0)

@@ -1,4 +1,4 @@
-// Executes a read plan: one RPC runs a statement's staged point reads and
+// Executes a read plan: one RPC runs a statement's prefetched point reads and
 // scans, where a later step builds its keys from what an earlier one read.
 
 #include "helios_rpc.hh"
@@ -13,9 +13,9 @@
 
 #include "helios.pb.h"
 
-#include "flat_plan_encode.hh"
+#include "flat_plan_pack.hh"
 #include "parallel_scan.hh"
-#include "row_codec.hh"
+#include "key_pack.hh"
 
 // Read-plan execution: the tx_execute_read_plan handler and its plan-key
 // binding glue.
@@ -71,10 +71,10 @@ std::string build_plan_key(
                 select_source_bytes(source, binding, false, row_override);
             if (bytes != nullptr) {
                 extracted =
-                    extract_value_column(*bytes, binding.source_column() - 1);
+                    unpack_row_field(*bytes, binding.source_column() - 1);
                 if (binding.column_as_int_key()) {
                     scratch =
-                        encode_column_as_int_key(extracted,
+                        pack_column_as_int_key(extracted,
                                                  binding.int_delta());
                     extracted = scratch;
                 }
@@ -151,8 +151,8 @@ void HeliosRpc::handleTxExecuteReadPlan(
             const auto* source = previous_results[source_step];
             const int row_count =
                 std::max(source->scan_keys_size(), source->scan_values_size());
-            // Dedup probes: many source rows share a join key, and the proxy
-            // serves every runtime probe of one key from the single staged
+            // Dedup probes: many source rows share a join key, and the plugin
+            // serves every runtime probe of one key from the single cached
             // result, so re-executing the probe only inflates the response.
             std::vector<std::string> probe_keys;
             probe_keys.reserve(static_cast<size_t>(row_count));
@@ -316,7 +316,7 @@ void HeliosRpc::handleTxExecuteReadPlan(
                           step.scan_limit(), step.reverse_scan(), nullptr);
                       if (!scan_result.ok) {
                         response.set_ok(false);
-                        flat_plan::encode_to_string(response, *result);
+                        flat_plan::pack(response, *result);
                         return;
                       }
                         for (auto& r : scan_result.rows) {
@@ -332,7 +332,7 @@ void HeliosRpc::handleTxExecuteReadPlan(
                           nullptr);
                       if (!scan_result.ok) {
                         response.set_ok(false);
-                        flat_plan::encode_to_string(response, *result);
+                        flat_plan::pack(response, *result);
                         return;
                       }
                         for (auto& r : scan_result.rows) {
@@ -389,7 +389,7 @@ void HeliosRpc::handleTxExecuteReadPlan(
                 step.reverse_scan(), nullptr);
             if (!scan_result.ok) {
                 response.set_ok(false);
-                flat_plan::encode_to_string(response, *result);
+                flat_plan::pack(response, *result);
                 return;
             }
             for (auto& row : scan_result.rows) {
@@ -405,7 +405,7 @@ void HeliosRpc::handleTxExecuteReadPlan(
                 step.scan_limit(), step.reverse_scan(), nullptr);
             if (!scan_result.ok) {
                 response.set_ok(false);
-                flat_plan::encode_to_string(response, *result);
+                flat_plan::pack(response, *result);
                 return;
             }
             for (auto& row : scan_result.rows) {
@@ -417,5 +417,5 @@ void HeliosRpc::handleTxExecuteReadPlan(
         }
     }
 
-    flat_plan::encode_to_string(response, *result);
+    flat_plan::pack(response, *result);
 }

@@ -307,7 +307,7 @@ def test_delete_then_insert(cursor):
 
 
 def test_insert_delete_then_insert(cursor):
-    # The staged row is a tombstone by the time the second insert runs, and a
+    # The buffered row is a tombstone by the time the second insert runs, and a
     # tombstone still carries the buffer the first insert wrote.
     print("INSERT, DELETE, THEN INSERT THE SAME KEY IN ONE TRANSACTION TEST")
     table = create_table(cursor)
@@ -497,10 +497,10 @@ def test_table_without_primary_key(cursor):
     return 0
 
 
-def test_staged_read_then_duplicate_insert(cursor, db):
-    # A transaction whose reads are staged still owes ER_DUP_ENTRY to the
+def test_cached_read_then_duplicate_insert(cursor, db):
+    # A transaction whose reads are cached still owes ER_DUP_ENTRY to the
     # INSERT statement, not to the commit.
-    print("INSERT DUPLICATE PRIMARY KEY AFTER A STAGED READ TEST")
+    print("INSERT DUPLICATE PRIMARY KEY AFTER A CACHED READ TEST")
     table = create_table(cursor)
     if seed(cursor, table, [(1, "first"), (2, "second")]) is not None:
         print("\tFailed: seed insert rejected")
@@ -514,7 +514,7 @@ def test_staged_read_then_duplicate_insert(cursor, db):
         if errno is None:
             errno = run(cursor, f"SELECT v FROM {DBNAME}.{table} WHERE id = 2")
         if errno is not None:
-            print(f"\tFailed: staged read rejected with {errno}")
+            print(f"\tFailed: cached read rejected with {errno}")
             run(cursor, "ROLLBACK")
             return 1
 
@@ -562,7 +562,7 @@ def main():
     result |= test_conflicting_read_outranks_the_duplicate(
         cursor, args.user, args.password)
     result |= test_table_without_primary_key(cursor)
-    result |= test_staged_read_then_duplicate_insert(cursor, db)
+    result |= test_cached_read_then_duplicate_insert(cursor, db)
 
     if result == 0:
         print("\nALL TESTS PASSED!")

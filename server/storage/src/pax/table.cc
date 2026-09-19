@@ -19,11 +19,11 @@ namespace pax {
 namespace {
 
 // ---------------------------------------------------------------------------
-// Row bytes follow proxy/helios_field.cc: a width byte, that many
+// Row bytes follow plugin/helios_field.cc: a width byte, that many
 // little-endian length bytes, then the payload. Width 0xFF marks an empty
 // field; the first field carries the row's SQL NULL flags.
 //
-// DecodeRow converts typed fields from text to fixed-width binary values.
+// unpack_row converts typed fields from text to fixed-width binary values.
 // ScatterRow copies those values into PAX; GatherRow restores the input bytes.
 // Values are rejected if parsing fails, they exceed the supported range, or
 // gathering would change their bytes.
@@ -36,18 +36,23 @@ inline bool ParseI64(const char *s, size_t len, int64_t &out) {
   return res.ec == std::errc() && res.ptr == s + len;
 }
 
+// n ASCII digits, most significant first, accumulated into out.
+inline bool parse_digits(const char *p, int n, int64_t &out) {
+  for (int i = 0; i < n; i++) {
+    if (p[i] < '0' || p[i] > '9') return false;
+    out = out * 10 + (p[i] - '0');
+  }
+  return true;
+}
+
 // "YYYY-MM-DD" -> YYYYMMDD (fits int32; `string order == int order`).
 inline bool ParseDate(const char *s, size_t len, int64_t &out) {
   if (len != 10 || s[4] != '-' || s[7] != '-') return false;
   int64_t y = 0, m = 0, d = 0;
-  auto digs = [](const char *p, int n, int64_t &o) {
-    for (int i = 0; i < n; i++) {
-      if (p[i] < '0' || p[i] > '9') return false;
-      o = o * 10 + (p[i] - '0');
-    }
-    return true;
-  };
-  if (!digs(s, 4, y) || !digs(s + 5, 2, m) || !digs(s + 8, 2, d)) return false;
+  if (!parse_digits(s, 4, y) || !parse_digits(s + 5, 2, m) ||
+      !parse_digits(s + 8, 2, d)) {
+    return false;
+  }
   out = y * 10000 + m * 100 + d;
   return true;
 }
@@ -243,8 +248,8 @@ void AppendField(std::string &out, std::string_view payload) {
  * @return Number of fields read, or `SIZE_MAX` when the input is malformed
  * or contains more than `max_fields` fields.
  */
-size_t UnpackRow(const std::byte *row, size_t size, Row::Field *out,
-                 size_t max_fields) {
+size_t split_row_fields(const std::byte *row, size_t size, Row::Field *out,
+                        size_t max_fields) {
   size_t off = 0;
   size_t n = 0;
   while (off < size) {
@@ -272,12 +277,14 @@ size_t UnpackRow(const std::byte *row, size_t size, Row::Field *out,
 
 }  // namespace
 
-bool DecodeRow(const TableSchema &schema, const std::byte *value, size_t size,
+bool unpack_row(const TableSchema &schema, const std::byte *value, size_t size,
                Row &out) {
   const size_t fields = schema.field_count();
   if (fields == 0) return false;
   out.fields.resize(fields);
-  if (UnpackRow(value, size, out.fields.data(), fields) != fields) return false;
+  if (split_row_fields(value, size, out.fields.data(), fields) != fields) {
+    return false;
+  }
 
   // Keep the conversion result so installation only copies prepared cells.
   for (size_t f = 0; f < fields; ++f) {

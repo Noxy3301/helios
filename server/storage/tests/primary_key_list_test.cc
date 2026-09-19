@@ -136,14 +136,14 @@ std::vector<std::string> BuildKeyUniverse() {
 
 TEST(PrimaryKeyListTest, DedupInsertAndEraseMissingReturnSameInstance) {
   const std::vector<std::string> seed = {"a", "b", std::string(128, 'x')};
-  auto primary_keys = PrimaryKeyList::FromSortedDeduped(seed);
+  auto primary_keys = PrimaryKeyList::from_sorted_deduped(seed);
 
-  const auto duplicate = PrimaryKeyList::Insert(primary_keys, "b");
+  const auto duplicate = PrimaryKeyList::insert(primary_keys, "b");
   EXPECT_EQ(duplicate.get(), primary_keys.get());
   EXPECT_TRUE(PrimaryKeyList::View(duplicate).equals(
       PrimaryKeyList::View(primary_keys)));
 
-  const auto missing = PrimaryKeyList::Delete(primary_keys, "missing");
+  const auto missing = PrimaryKeyList::erase(primary_keys, "missing");
   EXPECT_EQ(missing.get(), primary_keys.get());
   EXPECT_TRUE(
       PrimaryKeyList::View(missing).equals(PrimaryKeyList::View(primary_keys)));
@@ -156,10 +156,10 @@ TEST(PrimaryKeyListTest, SortedFactoryEqualsIncrementalInsertions) {
   std::sort(sorted.begin(), sorted.end());
   sorted.erase(std::unique(sorted.begin(), sorted.end()), sorted.end());
 
-  auto from_factory = PrimaryKeyList::FromSortedDeduped(sorted);
-  auto incremental = PrimaryKeyList::FromSortedDeduped({});
+  auto from_factory = PrimaryKeyList::from_sorted_deduped(sorted);
+  auto incremental = PrimaryKeyList::from_sorted_deduped({});
   for (const auto &key : sorted) {
-    incremental = PrimaryKeyList::Insert(incremental, key);
+    incremental = PrimaryKeyList::insert(incremental, key);
   }
 
   EXPECT_TRUE(PrimaryKeyList::View(from_factory)
@@ -169,7 +169,7 @@ TEST(PrimaryKeyListTest, SortedFactoryEqualsIncrementalInsertions) {
 
 TEST(PrimaryKeyListTest, RandomizedOperationsLockstepWithVectorOracle) {
   const auto universe = BuildKeyUniverse();
-  auto primary_keys = PrimaryKeyList::FromSortedDeduped({});
+  auto primary_keys = PrimaryKeyList::from_sorted_deduped({});
   std::vector<std::string> oracle;
   std::mt19937 rng(0x51b10b);
   std::uniform_int_distribution<size_t> key_dist(0, universe.size() - 1);
@@ -180,14 +180,14 @@ TEST(PrimaryKeyListTest, RandomizedOperationsLockstepWithVectorOracle) {
     if (insert_dist(rng)) {
       const bool changed = OracleInsert(oracle, key);
       const auto previous = primary_keys;
-      primary_keys = PrimaryKeyList::Insert(primary_keys, key);
+      primary_keys = PrimaryKeyList::insert(primary_keys, key);
       if (!changed) {
         EXPECT_EQ(primary_keys.get(), previous.get()) << "step " << step;
       }
     } else {
       const bool changed = OracleErase(oracle, key);
       const auto previous = primary_keys;
-      primary_keys = PrimaryKeyList::Delete(primary_keys, key);
+      primary_keys = PrimaryKeyList::erase(primary_keys, key);
       if (!changed) {
         EXPECT_EQ(primary_keys.get(), previous.get()) << "step " << step;
       }

@@ -1,3 +1,9 @@
+/**
+ * @file proto/helios.proto
+ * The request and response envelopes the plugin and the storage server
+ * exchange, with one oneof arm per RPC.
+ */
+
 syntax = "proto3";
 
 package Helios.Protocol;
@@ -72,8 +78,9 @@ message RangeReadEntry {
     bytes end_key = 4;
     uint64 row_limit = 5; // 0 means compare the whole range.
     bool reverse_scan = 6;
-    repeated bytes result_keys = 7; // PK scan: primary keys. SI scan: secondary keys.
-    repeated bytes result_primary_keys = 8; // SI scan only.
+    // Primary-key scan: primary keys. Secondary-index scan: secondary keys.
+    repeated bytes result_keys = 7;
+    repeated bytes result_primary_keys = 8; // Secondary-index scan only.
 }
 
 // Optimizer statistics: row counts and index NDV.
@@ -92,7 +99,7 @@ message GetTableStats {
         string index_name = 1;
         bool available = 2; // False when NDV is unavailable for this index.
         repeated uint64 ndv = 3;
-        // Leading-key range histogram. bounds[i] is a raw encoded leading-key
+        // Leading-key range histogram. bounds[i] is a raw packed leading-key
         // boundary; cum[i] is the cumulative live-row count up to that bound.
         repeated bytes hist_bounds = 4;
         repeated uint64 hist_cum = 5;
@@ -363,9 +370,9 @@ message DbCreateSecondaryIndex {
     }
 }
 
-// Resolved-statement request: the proxy serializes the Query_block and Item
+// Resolved-statement request: the plugin serializes the Query_block and Item
 // trees, the server builds DuckDB's AST from them, so no SQL text crosses the
-// wire. Both ends default-deny a node they have no rule for.
+// wire. Both ends refuse a node they have no rule for.
 message TxExecuteDuckdbQuery {
     enum TypeKind {
         TYPE_UNSPECIFIED = 0;
@@ -621,8 +628,7 @@ message TxExecuteDuckdbQuery {
     // the per-table cell metadata derived from TABLE::field[], and the
     // server validates it against the store.
     message TableDesc {
-        string table_name = 1;             // PaxStore lookup key
-                                           // (TABLE_SHARE::normalized_path)
+        string table_name = 1;             // TABLE_SHARE::normalized_path
         repeated ColumnDesc columns = 2;   // TABLE::field[] order
     }
 
@@ -634,6 +640,6 @@ message TxExecuteDuckdbQuery {
     message Response {
         bool ok = 1;
         string error = 2;
-        repeated bytes rows = 3; // proxy row format, DuckDB result order
+        repeated bytes rows = 3; // Helios packed row format, DuckDB result order
     }
 }

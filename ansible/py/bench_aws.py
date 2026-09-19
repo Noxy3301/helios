@@ -557,7 +557,7 @@ def _plot_perf_reports(result_root):
     plot_dir = config_root / "_plot"
     plot_dir.mkdir(parents=True, exist_ok=True)
 
-    role_modes = {"storage": "server", "mysql": "proxy"}
+    role_modes = {"storage": "server", "mysql": "plugin"}
     for role, mode in role_modes.items():
         cfg = CLUSTER.get(role)
         if not cfg or cfg["count"] == 0:
@@ -711,12 +711,12 @@ Examples:
                         help="TPC-H serial mode (true/false)")
     parser.add_argument("--read-path", choices=["row", "plan"], default="plan",
                         help="SET GLOBAL helios_read_path on every MySQL: row sends one "
-                             "request per handler call, plan stages a read plan per "
-                             "statement (default: plan)")
+                             "request per handler call, plan executes a read plan per "
+                             "statement and caches its results (default: plan)")
     parser.add_argument("--tx-plan", action="store_true",
                         help="Pass HELIOS_PREFETCH_PLAN=1 to BenchBase so the TPC-C "
                              "procedures inject @_tx_plan, instead of the per-statement "
-                             "plan the proxy derives from the QEP")
+                             "plan the plugin derives from the QEP")
     parser.add_argument("--bench-ndv-drift", action="store_true",
                         help="SET GLOBAL helios_stats_drift_refresh=ON "
                              "(default OFF: the NDV/histogram recompute is synchronous "

@@ -185,17 +185,17 @@ TEST_F(PaxRecoveryTest, RejectsBadInputBeforeConflictChecksAndSlotAllocation) {
   ASSERT_TRUE(TestHelper::WriteRow(db, "t", "a", original));
   const auto slots = pax::SlotsAllocated(db.GetPaxTable("t"));
 
-  // Bad row bytes must be rejected before Silo sees the stale read evidence.
+  // Bad row bytes must be rejected before Silo sees the stale observed TID.
   std::string reason;
   EXPECT_FALSE(TestHelper::CommitRows(
       db, {{"t", "a", 0}}, {{"t", "b", Row("2", "2.0")}}, {}, {}, reason));
-  EXPECT_EQ(reason, "pax_row_decode_failed");
+  EXPECT_EQ(reason, "pax_row_unpack_failed");
   EXPECT_EQ(pax::SlotsAllocated(db.GetPaxTable("t")), slots);
   EXPECT_EQ(TestHelper::ReadRow(db, "t", "a").value(), original);
   EXPECT_FALSE(TestHelper::ReadRow(db, "t", "b").has_value());
 }
 
-TEST_F(PaxRecoveryTest, KeepsDecodedValuesSeparateAcrossWritesAndRecovery) {
+TEST_F(PaxRecoveryTest, KeepsUnpackedValuesSeparateAcrossWritesAndRecovery) {
   const auto first = Row("1", "1.00");
   const auto second = Row("2", "-2.50");
   const auto last = Row("3", "3.75");
@@ -205,7 +205,7 @@ TEST_F(PaxRecoveryTest, KeepsDecodedValuesSeparateAcrossWritesAndRecovery) {
     ASSERT_TRUE(db.CreateTable("t"));
     ASSERT_TRUE(db.InstallPaxSchema("t", kWidths, kTypes, kScales));
 
-    // Each write keeps its own decoded fields, even when keys repeat.
+    // Each write keeps its own unpacked fields, even when keys repeat.
     ASSERT_TRUE(
         TestHelper::CommitRows(db, {},
                                {{"t", "a", first},

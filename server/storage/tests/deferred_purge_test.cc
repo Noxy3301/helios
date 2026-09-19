@@ -1,6 +1,6 @@
 /**
  * @file server/storage/tests/deferred_purge_test.cc
- * What a reader observes while a deleted slot waits for the reaper, and
+ * What a reader observes while a deleted record waits for the reaper, and
  * what a re-insert of the same key does to a standing read.
  */
 
@@ -105,8 +105,8 @@ TEST(DeferredPurgeTest, SameEpochDeleteReinsertInvalidatesStaleRead) {
     ASSERT_TRUE(stale.found);
     ASSERT_EQ(stale.value, "v1");
 
-    // The delete publishes a tombstone and queues the slot for the reaper; the
-    // re-insert takes the same slot ahead of any purge.
+    // The delete publishes a tombstone and queues the record for the reaper;
+    // the re-insert takes the same record ahead of any purge.
     ASSERT_TRUE(CommitDelete(db, key, kAsync));
     tombstone = Read(db, key);
     ASSERT_FALSE(tombstone.found);
@@ -132,7 +132,7 @@ TEST(DeferredPurgeTest, SameEpochDeleteReinsertInvalidatesStaleRead) {
   EXPECT_TRUE(StartsWith(reason, "exact_read_tid_moved")) << reason;
 }
 
-TEST(DeferredPurgeTest, FoundReadAbortsAfterDeferredPurgeRemovesSlot) {
+TEST(DeferredPurgeTest, FoundReadAbortsAfterDeferredPurgeRemovesRecord) {
   auto config = MakeConfig(5);
   helios::storage::Database db(config);
   ASSERT_TRUE(TestHelper::CreateTable(db, kTable));
@@ -198,7 +198,7 @@ TEST(DeferredPurgeTest, InsertAfterPurgeWaitSeesLiveRow) {
   ASSERT_TRUE(CommitInsert(db, key, "v1", commit_reason));
   ASSERT_TRUE(CommitDelete(db, key));
 
-  // Several epochs, so the reaper retires the tombstone's slot before the
+  // Several epochs, so the reaper retires the tombstone's record before the
   // insert below claims the key again.
   SleepAroundEpochRelease(db, std::chrono::milliseconds(200));
 

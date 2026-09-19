@@ -1,5 +1,5 @@
 """Check that a residual WHERE plus LIMIT returns the same rows on both read
-paths. The plan path may stage a LIMIT into the storage scan, so a filter MySQL
+paths. The plan path may push a LIMIT into the storage scan, so a filter MySQL
 evaluates above the scan must not lose rows."""
 
 import argparse
@@ -11,7 +11,7 @@ from utils.connection import get_connection
 DBNAME = "ha_helios_plan_limit_filter"
 
 # k = 1 for pk 1..40, flag = 1 only for pk 31..40, so the filtered rows sit at
-# the far end of the index window a staged LIMIT would truncate.
+# the far end of the index range a pushed LIMIT would truncate.
 ROWS = 50
 K_ROWS = 40
 FLAG_LO, FLAG_HI = 31, 40

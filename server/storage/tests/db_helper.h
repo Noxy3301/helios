@@ -1,7 +1,7 @@
 /**
  * @file server/storage/tests/db_helper.h
  * Test fixtures that drive the read and commit API the way a request does:
- * observe, then submit the observations as evidence with the writes.
+ * observe, then submit the observations as the read set with the writes.
  */
 
 #ifndef HELIOS_STORAGE_TESTS_DB_HELPER_H
@@ -23,8 +23,8 @@
 #include "gtest/gtest.h"
 
 // Drives the read and commit API the way the query layer does: observe, then
-// submit the observations as evidence along with the writes. Every call hands
-// the thread's masstree epoch back, as an RPC handler does.
+// submit the observations as the read set along with the writes. Every call
+// hands the thread's masstree epoch back, as an RPC handler does.
 namespace TestHelper {
 
 // Sorts above any key a test writes, for scans that mean "to the end".
