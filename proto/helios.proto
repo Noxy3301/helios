@@ -1,3 +1,9 @@
+/**
+ * @file proto/helios.proto
+ * The request and response envelopes the plugin and the storage server
+ * exchange, with one oneof arm per RPC.
+ */
+
 syntax = "proto3";
 
 package Helios.Protocol;
@@ -366,7 +372,7 @@ message DbCreateSecondaryIndex {
 
 // Resolved-statement request: the plugin serializes the Query_block and Item
 // trees, the server builds DuckDB's AST from them, so no SQL text crosses the
-// wire. Both ends default-deny a node they have no rule for.
+// wire. Both ends refuse a node they have no rule for.
 message TxExecuteDuckdbQuery {
     enum TypeKind {
         TYPE_UNSPECIFIED = 0;
@@ -622,8 +628,7 @@ message TxExecuteDuckdbQuery {
     // the per-table cell metadata derived from TABLE::field[], and the
     // server validates it against the store.
     message TableDesc {
-        string table_name = 1;             // PaxStore lookup key
-                                           // (TABLE_SHARE::normalized_path)
+        string table_name = 1;             // TABLE_SHARE::normalized_path
         repeated ColumnDesc columns = 2;   // TABLE::field[] order
     }
 
