@@ -31,8 +31,9 @@ struct StatementEntry {
   uint32_t last_rpc_idx;
 };
 
-// Per-local-view decision captured before a point read falls back to RPC.
-struct LocalViewEntry {
+// One transaction-local decision or abort, recorded in order with the
+// statement it belongs to.
+struct TraceEvent {
   std::string kind;
   uint64_t off_us;
   uint32_t stmt_idx;
@@ -45,7 +46,7 @@ class TxRpcTrace {
   void on_stmt(const std::string& sql);
   void record(RpcOp type, uint64_t us, uint32_t req_b,
               uint64_t resp_b, const std::string& meta);
-  void record_local_view(const std::string& kind);
+  void record_event(const std::string& kind);
   std::string finalize_jsonl(bool committed);
 
   bool active() const { return active_; }
@@ -57,7 +58,7 @@ class TxRpcTrace {
   std::chrono::system_clock::time_point started_wall_;
   std::vector<RpcEntry> rpcs_;
   std::vector<StatementEntry> statements_;
-  std::vector<LocalViewEntry> local_view_entries_;
+  std::vector<TraceEvent> events_;
 
   struct Agg {
     uint32_t n = 0;
@@ -67,7 +68,7 @@ class TxRpcTrace {
   };
 
   std::map<RpcOp, Agg> by_type_;
-  std::map<std::string, uint32_t> local_view_by_kind_;
+  std::map<std::string, uint32_t> event_counts_;
 };
 
 // Singleton JSONL logger enabled by helios_rpc_trace.

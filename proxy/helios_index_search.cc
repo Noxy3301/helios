@@ -240,7 +240,7 @@ void ha_helios::build_search_plan(const uchar *key, key_part_map keypart_map,
              !current_plan_.has_nullable_parts) {
     current_plan_.op = IndexSearchOp::kUniquePoint;
   } else if (find_flag == HA_READ_KEY_EXACT) {
-    current_plan_.op = IndexSearchOp::kSameKeyMaterialize;
+    current_plan_.op = IndexSearchOp::kSameKey;
   } else if (find_flag == HA_READ_PREFIX) {
     current_plan_.op = IndexSearchOp::kPrefixFirst;
   } else if (find_flag == HA_READ_PREFIX_LAST ||
@@ -255,7 +255,7 @@ void ha_helios::build_search_plan(const uchar *key, key_part_map keypart_map,
              find_flag == HA_READ_BEFORE_KEY) {
     current_plan_.op = IndexSearchOp::kPrevKey;
   } else {
-    current_plan_.op = IndexSearchOp::kRangeMaterialize;
+    current_plan_.op = IndexSearchOp::kRangeScan;
   }
 
   // 4. Serialize boundaries
@@ -263,7 +263,7 @@ void ha_helios::build_search_plan(const uchar *key, key_part_map keypart_map,
     current_plan_.start_key_serialized = pack_key(key, keypart_map);
 
     // same group boundary (prefix operations)
-    if (current_plan_.op == IndexSearchOp::kSameKeyMaterialize ||
+    if (current_plan_.op == IndexSearchOp::kSameKey ||
         current_plan_.op == IndexSearchOp::kPrefixFirst ||
         current_plan_.op == IndexSearchOp::kPrefixLast) {
       current_plan_.same_group_prefix_serialized =
@@ -294,12 +294,12 @@ int ha_helios::execute_plan(uchar *buf, HeliosTransaction *tx) {
     return execute_index_first(buf, tx);
   case IndexSearchOp::kUniquePoint:
     return execute_unique_point(buf, tx);
-  case IndexSearchOp::kSameKeyMaterialize:
-    return execute_same_key_materialize(buf, tx);
+  case IndexSearchOp::kSameKey:
+    return execute_same_key(buf, tx);
   case IndexSearchOp::kPrefixFirst:
     return execute_prefix_first(buf, tx);
-  case IndexSearchOp::kRangeMaterialize:
-    return execute_range_materialize(buf, tx);
+  case IndexSearchOp::kRangeScan:
+    return execute_range(buf, tx);
   case IndexSearchOp::kPrevKey:
     return execute_prev_key(buf, tx);
   case IndexSearchOp::kPrefixLast:
@@ -323,8 +323,8 @@ int ha_helios::execute_index_first(uchar *buf, HeliosTransaction *tx) {
     index_cursor_end_key_ = end_key;
     (void)refill_index_cursor(tx);
   } else if (current_plan_.is_primary) {
-    // Staged windows are keyed by the full-range shape, so ask for the whole
-    // range instead of walking it in cursor windows.
+    // The index scan cache is keyed by the full-range shape, so ask for the
+    // whole range instead of walking it in index cursor batches.
     auto key_values =
         tx->get_matching_keys_and_values_in_range(start_key, end_key);
     for (auto &kv : key_values) {
@@ -394,8 +394,7 @@ int ha_helios::execute_unique_point(uchar *buf, HeliosTransaction *tx) {
   }
 }
 
-int ha_helios::execute_same_key_materialize(uchar *buf,
-                                               HeliosTransaction *tx) {
+int ha_helios::execute_same_key(uchar *buf, HeliosTransaction *tx) {
   const std::string &prefix = current_plan_.same_group_prefix_serialized;
   const std::string &prefix_end = current_plan_.same_group_end_serialized;
 
@@ -405,9 +404,9 @@ int ha_helios::execute_same_key_materialize(uchar *buf,
     RangeScanLimit scan_limit = range_scan_limit_for_order(
         ha_thd(), key, current_plan_.used_key_parts,
         !select_scan_limit_is_safe(ha_thd(), table));
-    // Autogen stages the forward, unlimited range and MySQL applies ORDER BY,
-    // LIMIT and WHERE above the handler (see execute_range_materialize). The
-    // DSL stages the limit and direction it names.
+    // The read-plan compiler asks for the forward, unlimited range and
+    // MySQL applies ORDER BY, LIMIT and WHERE above the handler (see
+    // execute_range). The DSL names the limit and direction it wants.
     if (statement_uses_read_plan(ha_thd()) && !tx->tx_plan_used()) {
       scan_limit = RangeScanLimit{};
     }
@@ -454,8 +453,8 @@ int ha_helios::execute_prefix_first(uchar *buf, HeliosTransaction *tx) {
 
   if (current_plan_.is_primary) {
     // Restrict to [prefix, prefix_end) so index_next never leaks non-prefix
-    // rows. A limit-staged hit continues from the storage when index_next
-    // reads past it.
+    // rows. A hit on a limited cache entry continues from the storage when
+    // index_next reads past it.
     index_scan_end_key_ = prefix_end;
     auto key_values = tx->get_matching_keys_and_values_in_range(
         prefix, prefix_end, 0, false, &index_scan_is_partial_);
@@ -493,10 +492,9 @@ int ha_helios::execute_prefix_first(uchar *buf, HeliosTransaction *tx) {
 }
 
 /**
- * @brief kRangeMaterialize: range search (AFTER_KEY, KEY_OR_NEXT, etc.)
+ * @brief kRangeScan: range search (AFTER_KEY, KEY_OR_NEXT, etc.)
  */
-int ha_helios::execute_range_materialize(uchar *buf,
-                                            HeliosTransaction *tx) {
+int ha_helios::execute_range(uchar *buf, HeliosTransaction *tx) {
   std::string effective_start = current_plan_.start_key_serialized;
   std::string effective_end = current_plan_.end_key_serialized;
 
@@ -512,9 +510,9 @@ int ha_helios::execute_range_materialize(uchar *buf,
     RangeScanLimit scan_limit = range_scan_limit_for_order(
         ha_thd(), key, current_plan_.used_key_parts,
         !select_scan_limit_is_safe(ha_thd(), table));
-    // Autogen stages only the forward, unlimited range; ORDER BY, LIMIT and
-    // WHERE stay above the handler. The DSL stages the limit and direction it
-    // names, and its plan matches them.
+    // The read-plan compiler asks for the forward, unlimited range only;
+    // ORDER BY, LIMIT and WHERE stay above the handler. The DSL names the
+    // limit and direction it wants, and its plan matches them.
     if (statement_uses_read_plan(ha_thd()) && !tx->tx_plan_used()) {
       scan_limit = RangeScanLimit{};
     }
@@ -592,9 +590,9 @@ int ha_helios::execute_prefix_last(uchar *buf, HeliosTransaction *tx) {
       RangeScanLimit scan_limit = range_scan_limit_for_order(
           ha_thd(), key, current_plan_.used_key_parts,
           !select_scan_limit_is_safe(ha_thd(), table));
-      // Autogen stages the forward, unlimited range and MySQL applies ORDER BY,
-      // LIMIT and WHERE above the handler (see execute_range_materialize). The
-      // DSL stages the limit and direction it names.
+      // The read-plan compiler asks for the forward, unlimited range and
+      // MySQL applies ORDER BY, LIMIT and WHERE above the handler (see
+      // execute_range). The DSL names the limit and direction it wants.
       if (statement_uses_read_plan(ha_thd()) && !tx->tx_plan_used()) {
         scan_limit = RangeScanLimit{};
       }
@@ -639,23 +637,23 @@ int ha_helios::execute_prefix_last(uchar *buf, HeliosTransaction *tx) {
     return fetch_and_set_current_result(buf, tx);
   }
 
-  // materialize mode
+  // range scan mode
   if (current_plan_.is_primary) {
     // Push LIMIT only when the server can also apply the SELECT WHERE.
     const KEY *key = &table->key_info[active_index];
     RangeScanLimit scan_limit = range_scan_limit_for_order(
         ha_thd(), key, current_plan_.used_key_parts,
         !select_scan_limit_is_safe(ha_thd(), table));
-    // Autogen stages the forward, unlimited range and MySQL applies ORDER BY,
-    // LIMIT and WHERE above the handler (see execute_range_materialize). The
-    // DSL stages the limit and direction it names.
+    // The read-plan compiler asks for the forward, unlimited range and
+    // MySQL applies ORDER BY, LIMIT and WHERE above the handler (see
+    // execute_range). The DSL names the limit and direction it wants.
     if (statement_uses_read_plan(ha_thd()) && !tx->tx_plan_used()) {
       scan_limit = RangeScanLimit{};
     }
     const bool push_desc_limit =
         (scan_limit.row_limit == 1 && scan_limit.reverse_scan);
 
-    // Prefix-last materialization only uses DESC LIMIT 1.
+    // The prefix-last fetch only uses DESC LIMIT 1.
     auto key_values = tx->get_matching_keys_and_values_in_range(
         current_plan_.same_group_prefix_serialized,
         current_plan_.same_group_end_serialized,
@@ -666,7 +664,7 @@ int ha_helios::execute_prefix_last(uchar *buf, HeliosTransaction *tx) {
       secondary_index_payloads_.push_back(std::move(kv.second));
     }
   } else {
-    // A prefix-last probe may hit a staged reverse LIMIT 1 secondary scan.
+    // A prefix-last probe may hit a cached reverse LIMIT 1 secondary scan.
     const KEY *key = &table->key_info[active_index];
     RangeScanLimit scan_limit = range_scan_limit_for_order(
         ha_thd(), key, current_plan_.used_key_parts,
@@ -731,7 +729,7 @@ int ha_helios::fetch_and_set_current_result(uchar *buf,
         secondary_index_payloads_[current_position_in_index_];
     if (inline_value.empty()) {
       // The base row vanished under a concurrent commit between the index walk
-      // and the row fetch; the recorded range no longer replays at commit.
+      // and the row fetch; commit would fail range revalidation.
       tx->set_status_to_abort();
       return abort_errno(tx);
     }

@@ -878,14 +878,14 @@ def main():
                         help="Keep helios_data after the benchmark")
     parser.add_argument("--read-path", choices=["row", "plan"], default="plan",
                         help="SET GLOBAL helios_read_path: row sends one request per handler "
-                             "read, plan stages what it can in one request (default)")
+                             "read, plan caches what it can in one request (default)")
     parser.add_argument("--tx-plan", action="store_true",
                         help="Pass HELIOS_PREFETCH_PLAN=1 to BenchBase so the TPC-C procedures "
-                             "inject @_tx_plan, instead of the per-statement plan the proxy "
+                             "inject @_tx_plan, instead of the per-statement plan the plugin "
                              "derives from the QEP")
     args = parser.parse_args()
     if args.tx_plan and args.read_path == "row":
-        sys.exit("--tx-plan stages reads through the plan; it cannot be combined with --read-path row")
+        sys.exit("--tx-plan takes its reads from the injected plan; it cannot be combined with --read-path row")
 
     # Validate
     if args.load_durability == "async":

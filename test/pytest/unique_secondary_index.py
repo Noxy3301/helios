@@ -196,7 +196,8 @@ def test_unique_index_defined_in_create_table(db, cursor):
 
 def test_rejected_update_reaches_no_commit(db, cursor):
     # The engine registers at session scope, so MySQL does not roll the
-    # statement back: a refused UPDATE must have staged nothing for the COMMIT.
+    # statement back: a refused UPDATE must have buffered nothing for the
+    # COMMIT.
     print("UNIQUE SECONDARY INDEX (REFUSED UPDATE, THEN COMMIT) TEST")
     table = create_unique_table(cursor)
     db.commit()

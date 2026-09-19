@@ -8,7 +8,7 @@
 #include "my_dbug.h"
 #include "sql/table.h"
 
-// Handler DML entry points. These methods stage base-row mutations and their
+// Handler DML entry points. These methods buffer base-row mutations and their
 // secondary-index side effects in the current Helios transaction.
 
 int ha_helios::duplicate_or_conflict(HeliosTransaction *tx, uint index) {
@@ -142,7 +142,7 @@ int ha_helios::write_row(uchar *buf) {
     }
   }
 
-  // A rejected statement keeps what the handler staged, so every UNIQUE key is
+  // A rejected statement keeps what the handler buffered, so every UNIQUE key
   // probed before the first write of the row is buffered.
   std::vector<std::string> secondary_keys(table->s->keys);
   for (uint i = 0; i < table->s->keys; i++) {
@@ -225,7 +225,7 @@ int ha_helios::update_row(const uchar *old_data, uchar *new_data) {
 
   tx->choose_table(db_table_name);
 
-  // A rejected statement keeps what the handler staged, so every UNIQUE key is
+  // A rejected statement keeps what the handler buffered, so every UNIQUE key
   // probed before the first write of the row is buffered.
   std::vector<std::string> old_keys(table->s->keys);
   std::vector<std::string> new_keys(table->s->keys);

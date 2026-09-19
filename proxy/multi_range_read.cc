@@ -19,7 +19,8 @@ ha_rows ha_helios::multi_range_read_info_const(
       cost);
   if (rows == HA_POS_ERROR) return rows;
 
-  // Custom batch MRR only on the row path; a staged plan already holds the rows.
+  // Custom batch MRR only on the row path; the cached read-plan results
+  // already hold the rows.
   if (!statement_uses_read_plan(ha_thd()) && keyno == table->s->primary_key) {
     *flags &= ~HA_MRR_USE_DEFAULT_IMPL;
     *bufsz = 0;
@@ -37,7 +38,8 @@ ha_rows ha_helios::multi_range_read_info(uint keyno, uint n_ranges,
                                             Cost_estimate *cost) {
   ha_rows rows = handler::multi_range_read_info(keyno, n_ranges, keys, bufsz,
                                                 flags, cost);
-  // Custom batch MRR only on the row path; a staged plan already holds the rows.
+  // Custom batch MRR only on the row path; the cached read-plan results
+  // already hold the rows.
   if (!statement_uses_read_plan(ha_thd()) && keyno == table->s->primary_key) {
     *flags &= ~HA_MRR_USE_DEFAULT_IMPL;
     *bufsz = 0;
@@ -58,7 +60,7 @@ int ha_helios::multi_range_read_init(RANGE_SEQ_IF *seq, void *seq_init_param,
   }
 
   // The plan path does not use the custom batch path: default MRR
-  // (read_range_first -> index_read_map) consumes the staged rows, and a range
+  // (read_range_first -> index_read_map) consumes the cached rows, and a range
   // no plan covers goes to the storage server there.
   if (statement_uses_read_plan(ha_thd())) {
     // A single-table DML has no QEP plan. Default DS-MRR reaches

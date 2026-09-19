@@ -26,7 +26,7 @@ struct AccessPath;
  * Inner-unit failures are ignored only when `include_inner_units` is true; the
  * outer plan remains unchanged.
  */
-bool autogen_read_plan_from_qep(
+bool compile_read_plan_from_qep(
     THD *thd, AccessPath *root,
     std::vector<HeliosProxy::ReadPlanStep> *out,
     bool include_inner_units = false);
@@ -37,7 +37,7 @@ bool autogen_read_plan_from_qep(
  * @details Used for single-table UPDATE/DELETE, where the handler
  * supplies the selected index/range instead of a normal QEP root.
  */
-bool autogen_read_plan_from_index_search(
+bool compile_read_plan_for_single_table_dml(
     THD *thd, TABLE *table, uint index, const IndexSearchPlan &search,
     std::vector<HeliosProxy::ReadPlanStep> *out);
 

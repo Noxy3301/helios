@@ -140,7 +140,7 @@ void collect_qep_leaves(AccessPath *p, std::vector<AccessPath *> *out,
       return;
     case AccessPath::WEEDOUT:
       // Semijoin duplicate weedout dedups locally via handler rowids;
-      // position()/rnd_pos() re-reads hit the staged row cache.
+      // position()/rnd_pos() re-reads hit the transaction row cache.
       collect_qep_leaves(p->weedout().child, out, ok);
       return;
     case AccessPath::NESTED_LOOP_SEMIJOIN_WITH_DUPLICATE_REMOVAL:
@@ -311,7 +311,7 @@ bool compile_index_range_scan(AccessPath *leaf, TABLE *table,
   QUICK_RANGE *range = range_scan.ranges[0];
   step->table_name = physical_table_key(table);
   step->is_scan = true;
-  // Stage the canonical forward, unbounded shape; MySQL applies ORDER BY /
+  // Ask for the canonical forward, unbounded shape; MySQL applies ORDER BY /
   // LIMIT / WHERE above and the consumer requests the same shape.
   if (range_scan.index != table->s->primary_key) {
     step->index_name = table->key_info[range_scan.index].name;
@@ -413,13 +413,13 @@ bool compile_ref_lookup(
 
   // A keypart bound to a real earlier step iterates directly; one bound to a
   // materialized temp table is remapped via Item_equal onto a real step,
-  // staging only the leading key prefix and over-fetching the rest.
+  // reading only the leading key prefix and over-fetching the rest.
   TABLE *iter_table = nullptr;
   int iter_step = -1;
 
-  // Stage the probed table/index as a full range. Used when a temp-table-driven
+  // Read the probed table/index as a full range. Used when a temp-table-driven
   // probe has no salvageable leading prefix.
-  auto stage_full_range = [&]() -> bool {
+  auto use_full_range = [&]() -> bool {
     const THD *leaf_thd = table->in_use;
     const bool plain_select =
         leaf_thd != nullptr && leaf_thd->lex != nullptr &&
@@ -442,7 +442,7 @@ bool compile_ref_lookup(
     return !step->table_name.empty();
   };
 
-  // Resolve a bound keypart to a real earlier step: a direct staged source if
+  // Resolve a bound keypart to a real earlier step: a direct source step if
   // it has one, else the latest real step among its Item_equal members.
   auto resolve_real_step = [&](Item_field *bound, TABLE **out_table,
                                int *out_step) -> bool {
@@ -498,7 +498,7 @@ bool compile_ref_lookup(
         src_table->s->tmp_table != NO_TMP_TABLE) {
       saw_temp_source = true;
     } else {
-      // Unknown source (neither a staged step nor a temp table): fail the read
+      // Unknown source (neither a plan step nor a temp table): fail the read
       // plan as unsupported, rather than salvaging or full-ranging it.
       return false;
     }
@@ -531,7 +531,7 @@ bool compile_ref_lookup(
     }
     bound_items.swap(leading);
     if (bound_items.empty() && leading_constant_parts == 0) {
-      return stage_full_range();
+      return use_full_range();
     }
   }
 
@@ -556,14 +556,14 @@ bool compile_ref_lookup(
         }
       }
       if (remapped == nullptr) {
-        if (saw_temp_source) return stage_full_range();
+        if (saw_temp_source) return use_full_range();
         return false;
       }
       source_field = remapped;
     }
     if (!append_bound_keypart(table, ref, bp.kp, source_field, iter_step,
                               step)) {
-      if (saw_temp_source) return stage_full_range();
+      if (saw_temp_source) return use_full_range();
       return false;
     }
     ++bound_parts;
@@ -647,7 +647,7 @@ bool compile_leaf(AccessPath *leaf,
     return compile_index_range_scan(leaf, table, step);
   }
   if (full_scan) {
-    // Plain SELECT primary scans consume the staged ["", sentinel) range.
+    // Plain SELECT primary scans consume the cached ["", sentinel) range.
     const THD *leaf_thd = table->in_use;
     const bool plain_select = leaf_thd != nullptr && leaf_thd->lex != nullptr &&
                               leaf_thd->lex->sql_command == SQLCOM_SELECT &&
@@ -667,7 +667,7 @@ bool compile_leaf(AccessPath *leaf,
     step->key_prefix.clear();
     step->end_key_prefix = key_pack::scan_end_sentinel();
     if (!primary_order) {
-      // Full secondary INDEX_SCAN: stage the secondary range itself. Runtime
+      // Full secondary INDEX_SCAN: read the secondary range itself. Runtime
       // index_first/index_next consumes it, then base rows come from row cache.
       step->index_name = table->key_info[full_scan_index].name;
     }
@@ -725,7 +725,7 @@ bool compile_index_search(TABLE *table, uint index,
       }
       return true;
 
-    case IndexSearchOp::kSameKeyMaterialize:
+    case IndexSearchOp::kSameKey:
     case IndexSearchOp::kPrefixFirst:
       if (search.same_group_prefix_serialized.empty()) {
         return false;
@@ -734,7 +734,7 @@ bool compile_index_search(TABLE *table, uint index,
                search.same_group_end_serialized);
       return true;
 
-    case IndexSearchOp::kRangeMaterialize: {
+    case IndexSearchOp::kRangeScan: {
       if (search.start_key_serialized.empty()) {
         return false;
       }
@@ -796,7 +796,7 @@ Query_block *query_block_containing_plan_node(Query_expression *unit,
   return nullptr;
 }
 
-// Stage the scan behind a bare COUNT(*). UNQUALIFIED_COUNT carries no table
+// Compile the scan behind a bare COUNT(*). UNQUALIFIED_COUNT carries no table
 // parameters, so the step must follow the access MySQL counts through:
 // ha_records() for JT_ALL, ha_records(index) otherwise.
 bool compile_unqualified_count(
@@ -830,8 +830,8 @@ bool compile_unqualified_count(
   }
 
   // Mirror get_exact_record_count(). ha_helios reports a non-clustered
-  // primary, so only JT_ALL and index()==primary count through the staged
-  // primary range; another index choice stages that secondary range.
+  // primary, so only JT_ALL and index()==primary count through the cached
+  // primary range; another index choice reads that secondary range.
   const QEP_TAB *qt = nullptr;
   if (qb->join != nullptr && qb->join->qep_tab != nullptr &&
       qb->join->primary_tables > 0) {
@@ -867,7 +867,7 @@ bool compile_unqualified_count(
 }
 
 /**
- * @brief Compile one AccessPath tree into staged read-plan steps.
+ * @brief Compile one AccessPath tree into read-plan steps.
  *
  * @details The main statement tree and optional inner subquery trees share
  * `table_steps`, so correlated inner probes can bind to earlier outer steps.
@@ -909,7 +909,7 @@ bool compile_tree_leaves(
     }
     if ((table->s != nullptr && table->s->tmp_table != NO_TMP_TABLE) ||
         table->file == nullptr || table->file->ht != helios_hton) {
-      // Only Helios base tables hold staged rows; MySQL temp tables and
+      // Only Helios base tables hold cached rows; MySQL temp tables and
       // tables of another engine have nothing to prefetch for this leaf.
       continue;
     }
@@ -924,7 +924,7 @@ bool compile_tree_leaves(
 
     // Push LIMIT into a single ASC REF scan only when LIMIT sits directly
     // above this leaf. count_all_rows and reject_multiple_rows both read past
-    // LIMIT, so they cannot use a truncated staged entry.
+    // LIMIT, so they cannot use a truncated cache entry.
     if (allow_limit_pushdown && root->type == AccessPath::LIMIT_OFFSET &&
         root->limit_offset().offset == 0 &&
         !root->limit_offset().count_all_rows &&
@@ -956,7 +956,7 @@ bool compile_tree_leaves(
  *
  * @details The main AccessPath tree does not cover every read MySQL may run.
  * IN and correlated subqueries can live as separate Query_expressions under
- * Item conditions, so collect those roots and stage them separately.
+ * Item conditions, so collect those roots and compile them separately.
  */
 void collect_inner_unit_roots(Query_expression *unit,
                               std::vector<AccessPath *> *roots) {
@@ -980,7 +980,7 @@ void collect_inner_unit_roots(Query_expression *unit,
 
 }  // namespace
 
-bool autogen_read_plan_from_qep(
+bool compile_read_plan_from_qep(
     THD *thd, AccessPath *root,
     std::vector<HeliosProxy::ReadPlanStep> *out,
     bool include_inner_units) {
@@ -1028,7 +1028,7 @@ bool autogen_read_plan_from_qep(
     return false;  // the QEP has no leaf a read plan covers
   }
 
-  // Fold byte-identical staged steps into the earliest one (a view read twice,
+  // Fold byte-identical steps into the earliest one (a view read twice,
   // or for_each probes with deep-equal bindings) and remap the later steps'
   // source_step.
   std::vector<std::vector<TABLE *>> step_aliases(steps.size());
@@ -1112,8 +1112,8 @@ bool autogen_read_plan_from_qep(
 }
 
 // Produce a one-step read plan from the handler access; a shape it cannot
-// stage returns false and its reads take the row path.
-bool autogen_read_plan_from_index_search(
+// compile returns false and its reads take the row path.
+bool compile_read_plan_for_single_table_dml(
     THD *thd, TABLE *table, uint index, const IndexSearchPlan &search,
     std::vector<HeliosProxy::ReadPlanStep> *out) {
   if (out == nullptr) {

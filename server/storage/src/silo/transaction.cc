@@ -143,7 +143,8 @@ bool Transaction::IndexWrite(std::string_view table_name,
 
 bool Transaction::Commit(CommitDurability durability, std::string &reason) {
   reason.clear();
-  // A range without its end bound cannot be replayed; refuse before locking.
+  // A range without its end bound cannot be revalidated; refuse before
+  // locking.
   for (const auto &range : range_set_) {
     if (range.end.empty()) {
       reason = "range_end_key_missing";
@@ -335,8 +336,8 @@ bool Transaction::ValidateReads(Tidword &max_tid, std::string &reason) {
   }
 
   for (const auto &range : range_set_) {
-    const bool ok = range.index.empty() ? ReplayRange(range, max_tid)
-                                        : ReplayIndexRange(range, max_tid);
+    const bool ok = range.index.empty() ? RevalidateRange(range, max_tid)
+                                        : RevalidateSecondaryRange(range, max_tid);
     if (!ok) {
       reason = range.index.empty() ? "primary_range_result_changed"
                                    : "secondary_range_result_changed";
@@ -346,7 +347,7 @@ bool Transaction::ValidateReads(Tidword &max_tid, std::string &reason) {
   return true;
 }
 
-bool Transaction::ReplayRange(const RangeEntry &range, Tidword &max_tid) {
+bool Transaction::RevalidateRange(const RangeEntry &range, Tidword &max_tid) {
   auto table = tables_.GetTable(range.table);
   if (table == nullptr) return false;
 
@@ -380,7 +381,7 @@ bool Transaction::ReplayRange(const RangeEntry &range, Tidword &max_tid) {
   return matches && result_pos == range.keys.size();
 }
 
-bool Transaction::ReplayIndexRange(const RangeEntry &range, Tidword &max_tid) {
+bool Transaction::RevalidateSecondaryRange(const RangeEntry &range, Tidword &max_tid) {
   auto table = tables_.GetTable(range.table);
   if (table == nullptr) return false;
   auto *index = table->GetSecondaryIndex(range.index);

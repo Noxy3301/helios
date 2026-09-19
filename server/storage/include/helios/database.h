@@ -212,7 +212,7 @@ class Database {
    *
    * @param table_name Target table.
    * @param key Primary key to look up.
-   * @param selected_columns Optional zero-based MySQL columns to materialize
+   * @param selected_columns Optional zero-based MySQL columns to gather
    * for PAX-resident rows. Null selects the whole row; an empty list selects
    * no data columns. Unselected PAX fields become empty markers; null flags
    * remain in every result.
@@ -248,7 +248,7 @@ class Database {
    * @param end_key   Exclusive end of the range. Must be non-empty.
    * @param row_limit Maximum rows to return. 0 means no cap.
    * @param reverse_scan When true, iterate from `end_key` toward `start_key`.
-   * @param selected_columns Optional zero-based MySQL columns to materialize
+   * @param selected_columns Optional zero-based MySQL columns to gather
    * for PAX-resident rows. Null selects the whole row; an empty list selects
    * no data columns. Unselected PAX fields become empty markers; null flags
    * remain in every result.
@@ -278,7 +278,7 @@ class Database {
    * @param end_key Exclusive end of the secondary range. Must be non-empty.
    * @param row_limit Maximum rows to return. 0 means no cap.
    * @param reverse_scan When true, iterate in reverse secondary-key order.
-   * @param selected_columns Optional zero-based MySQL columns to materialize
+   * @param selected_columns Optional zero-based MySQL columns to gather
    * for PAX-resident base rows, with the same null/empty rules as Read.
    * Unselected PAX columns are returned as empty fields.
    * @return Result with `ok == false` if the table or the index is missing,
@@ -293,7 +293,7 @@ class Database {
   /**
    * @brief Range-scans the primary index and returns PAX cell references.
    *
-   * @details The returned rows are not materialized.
+   * @details The returned rows are not copied.
    *
    * @param table_name Target table.
    * @param start_key Inclusive start of the range.

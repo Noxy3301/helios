@@ -80,7 +80,7 @@ void SeedRows(helios::storage::Database &db) {
   }
 }
 
-// Materializes a key without ever initializing it. Resolving a write inserts
+// Leaves a record that never held a value. Resolving a write inserts
 // the blank record before validation runs, and an aborted commit leaves it
 // behind.
 void LeaveBlankRecord(helios::storage::Database &db, const std::string &key) {
@@ -123,7 +123,7 @@ TEST(RangeValidationTest, ARowDeletedInsideTheRangeAborts) {
 }
 
 TEST(RangeValidationTest, ARowDeletedAtTheEndOfTheRangeAborts) {
-  // The replay is a strict prefix of the recorded keys, so nothing diverges
+  // The re-scan is a strict prefix of the recorded keys, so nothing diverges
   // positionally and only the length check rejects it.
   auto config = MakeConfig();
   helios::storage::Database db(config);
@@ -153,7 +153,7 @@ TEST(RangeValidationTest, ARowInsertedInsideTheRangeAborts) {
 }
 
 TEST(RangeValidationTest, ARowInsertedAtTheEndOfTheRangeAborts) {
-  // The recorded keys are a strict prefix of the replay, so the divergence is
+  // The recorded keys are a strict prefix of the re-scan, so the divergence is
   // the first live row past them.
   auto config = MakeConfig();
   helios::storage::Database db(config);
@@ -184,7 +184,7 @@ TEST(RangeValidationTest, ALimitedRangeIgnoresChangesPastItsCap) {
 
 TEST(RangeValidationTest, ABlankRecordDoesNotConsumeTheCap) {
   // The cap counts live rows. A blank record between the first two of them must
-  // leave the replay room to reach the second.
+  // leave the re-scan room to reach the second.
   auto config = MakeConfig();
   helios::storage::Database db(config);
   ASSERT_TRUE(TestHelper::CreateTable(db, kTable));

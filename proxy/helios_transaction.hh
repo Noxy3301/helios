@@ -21,8 +21,8 @@ class Helios_share;
  *
  * It holds what it read (rows with their TIDs, ranges with their key lists),
  * what it wrote, and the row-count deltas, and installs all of it with one
- * tx_commit. Reads a staged plan did not cover go to the storage server as
- * they happen.
+ * tx_commit. Reads the cached read-plan results do not cover go to the
+ * storage server as they happen.
  *
  * Lifetime of this class equals the lifetime of the transaction.
  * The instance of this class is deleted in end_transaction.
@@ -40,9 +40,9 @@ public:
   // Buffer ops built elsewhere (the DDL backfill); the commit installs them.
   void buffer_writes(const std::string& table_name,
                      const std::vector<HeliosProxy::WriteOp>& ops);
-  // served_truncated, when given, lets a staged window that holds only the
-  // first rows of the range serve an unlimited request; it is set when the
-  // result stops at the window and the caller has to fetch the rest.
+  // served_truncated, when given, lets a cached range that holds only the
+  // first rows serve an unlimited request; it is set when the result is a
+  // partial scan result and the caller has to fetch the rest.
   std::vector<std::pair<std::string, std::string>> get_matching_keys_and_values_in_range(
       std::string start_key, std::string end_key, uint64_t row_limit = 0,
       bool reverse_scan = false, bool *served_truncated = nullptr);
@@ -109,7 +109,7 @@ public:
   // True when every row and range this transaction read still reads the same
   // way. A duplicate found after one of them moved is a lost race, not a
   // constraint the client can fix. Sends one batch read and one keys-only
-  // replay per recorded range; records nothing.
+  // revalidation per recorded range; records nothing.
   bool reads_still_valid();
   // Probe the storage for keys an INSERT statement inserts, in one RPC. Every
   // answer enters the read set, so the commit revalidates an absence. Call it
@@ -125,44 +125,44 @@ public:
   void execute_read_plan(const std::vector<HeliosProxy::ReadPlanStep>& steps);
 
   // Set when an injected tx-scoped plan (@_tx_plan / DSL) ran at begin, so the
-  // statement-scoped autogen path stays out of the way (the two are mutually
+  // statement-scoped prefetch stays out of the way (the two are mutually
   // exclusive per transaction).
   void set_tx_plan_used(bool used) { tx_plan_used_ = used; }
   bool tx_plan_used() const { return tx_plan_used_; }
 
-  // Statement-scoped autogen staging is gated per MySQL statement, keyed by
-  // thd->query_id: the plan is auto-generated and executed once per statement,
+  // The statement-scoped prefetch is gated per MySQL statement, keyed by
+  // thd->query_id: the plan is compiled and executed once per statement,
   // and the reads accumulate into this transaction's validation set.
-  uint64_t autogen_query_id() const { return autogen_query_id_; }
-  void reset_autogen_for_statement(uint64_t query_id) {
-    autogen_query_id_ = query_id;
-    autogen_stmt_resolved_ = false;
-    autogen_stmt_handler_deferred_ = false;
-    autogen_staged_roots_.clear();
-    autogen_tail_staged_.clear();
+  uint64_t stmt_plan_query_id() const { return stmt_plan_query_id_; }
+  void reset_stmt_plan(uint64_t query_id) {
+    stmt_plan_query_id_ = query_id;
+    stmt_prefetch_done_ = false;
+    single_table_dml_deferred_ = false;
+    stmt_plan_roots_.clear();
+    index_tail_tables_.clear();
   }
-  bool autogen_stmt_resolved() const { return autogen_stmt_resolved_; }
-  void mark_autogen_stmt_resolved() { autogen_stmt_resolved_ = true; }
-  // Subqueries may be staged before the statement root exists. Remember each
-  // root so the same subquery plan is not staged twice in one statement.
-  bool autogen_root_staged(const void *root) const {
-    return autogen_staged_roots_.count(root) != 0;
+  bool stmt_prefetch_done() const { return stmt_prefetch_done_; }
+  void mark_stmt_prefetch_done() { stmt_prefetch_done_ = true; }
+  // Subqueries may run before the statement root exists. Remember each root
+  // so the same subquery plan is not run twice in one statement.
+  bool has_stmt_plan_root(const void *root) const {
+    return stmt_plan_roots_.count(root) != 0;
   }
-  void mark_autogen_root_staged(const void *root) {
-    autogen_staged_roots_.insert(root);
+  void note_stmt_plan_root(const void *root) {
+    stmt_plan_roots_.insert(root);
   }
-  // Key-less index_last tail windows staged this statement, keyed by table.
-  bool autogen_tail_staged(const std::string &table_key) const {
-    return autogen_tail_staged_.count(table_key) != 0;
+  // Key-less index tail fetches made this statement, keyed by table.
+  bool has_index_tail_fetch(const std::string &table_key) const {
+    return index_tail_tables_.count(table_key) != 0;
   }
-  void mark_autogen_tail_staged(const std::string &table_key) {
-    autogen_tail_staged_.insert(table_key);
+  void note_index_tail_fetch(const std::string &table_key) {
+    index_tail_tables_.insert(table_key);
   }
-  bool is_autogen_stmt_handler_deferred() const {
-    return autogen_stmt_handler_deferred_;
+  bool single_table_dml_deferred() const {
+    return single_table_dml_deferred_;
   }
-  void mark_autogen_stmt_handler_deferred() {
-    autogen_stmt_handler_deferred_ = true;
+  void mark_single_table_dml_deferred() {
+    single_table_dml_deferred_ = true;
   }
 
   inline bool is_not_started() const { return !registered_; }
@@ -201,14 +201,14 @@ private:
   handlerton* hton;
   bool registered_{false};
   bool tx_plan_used_{false};
-  uint64_t autogen_query_id_{0};
-  bool autogen_stmt_resolved_{false};
-  std::unordered_set<const void*> autogen_staged_roots_;
-  std::unordered_set<std::string> autogen_tail_staged_;
+  uint64_t stmt_plan_query_id_{0};
+  bool stmt_prefetch_done_{false};
+  std::unordered_set<const void*> stmt_plan_roots_;
+  std::unordered_set<std::string> index_tail_tables_;
   // Set when this statement's plan is built from the handler index access
-  // (deferred single-table DML path) instead of the QEP; a second handler access
-  // then means an index merge the single staged range cannot serve.
-  bool autogen_stmt_handler_deferred_{false};
+  // instead of the QEP; a second handler access then means an index merge the
+  // single cached range cannot serve.
+  bool single_table_dml_deferred_{false};
 
   // stores the last RPC read result to maintain data pointer validity
   std::string last_read_value_;
@@ -228,7 +228,7 @@ private:
   };
   std::vector<RowCountDelta> rowcount_deltas_;
 
-  struct LocalRowEntry {
+  struct RowEntry {
     std::string table_name;
     std::string key;
     bool found;
@@ -240,8 +240,8 @@ private:
 
   // Served-row cache for point reads, keyed by (table_name + '\0' + key).
   // Not a validation set: an entry's TID joins base_row_read_set_ only when a
-  // cached row is actually consumed. Re-staging a key overwrites it.
-  std::unordered_map<std::string, LocalRowEntry> row_cache_;
+  // cached row is actually consumed. Caching a key again overwrites it.
+  std::unordered_map<std::string, RowEntry> row_cache_;
   static std::string make_row_cache_key(const std::string& table,
                                          const std::string& key) {
     std::string k;
@@ -252,17 +252,17 @@ private:
     return k;
   }
   // Write set for exact primary-key writes/deletes
-  std::vector<LocalRowEntry> own_writes_;
+  std::vector<RowEntry> own_writes_;
   // Dedup/lookup index into own_writes_, keyed like row_cache_. own_writes_ only
   // ever grows by push_back, so a stored index never moves and stays valid.
   std::unordered_map<std::string, size_t> own_writes_index_;
 
   // Append-only read sets the commit re-validates: per-key TIDs of base rows,
-  // and per-range key lists replayed to catch phantoms.
+  // and per-range key lists revalidated to catch phantoms.
   std::vector<HeliosProxy::ReadEntry> base_row_read_set_;
   std::vector<HeliosProxy::RangeReadEntry> range_read_set_;
 
-  struct LocalRangeScanEntry {
+  struct RangeScanCacheEntry {
     std::string table_name;
     std::string start_key;
     std::string end_key;
@@ -270,11 +270,11 @@ private:
     uint64_t row_limit = 0;
     std::vector<std::pair<std::string, std::string>> rows;
     std::vector<uint64_t> row_tids;
-    // Set only on a lookup return copy: this window holds the first rows of
-    // the range, not all of them.
+    // Set only on a lookup return copy: a partial scan result holds the first
+    // rows of the range, not all of them.
     bool truncated = false;
   };
-  struct LocalSecondaryScanEntry {
+  struct SecondaryScanCacheEntry {
     std::string table_name;
     std::string index_name;
     std::string start_key;
@@ -284,22 +284,22 @@ private:
     std::vector<std::string> secondary_keys;
     std::vector<std::string> primary_keys;
   };
-  // Windows a read plan staged for this statement. A request a window covers
+  // Ranges a read plan cached for this statement. A request the cache covers
   // is served from it; anything else goes to the storage server.
-  std::vector<LocalRangeScanEntry> range_scan_cache_;
-  std::vector<LocalSecondaryScanEntry> secondary_scan_cache_;
+  std::vector<RangeScanCacheEntry> range_scan_cache_;
+  std::vector<SecondaryScanCacheEntry> secondary_scan_cache_;
   // Exact-start indexes for grouped range scans. Without these, each runtime
   // probe would scan the whole cache vector. Keyed table\x01index\x01start_key.
   std::unordered_map<std::string, std::vector<size_t>> range_scan_start_index_;
   std::unordered_map<std::string, std::vector<size_t>> secondary_scan_start_index_;
-  void push_range_scan_cache(LocalRangeScanEntry entry);
-  void push_secondary_scan_cache(LocalSecondaryScanEntry entry);
+  void push_range_scan_cache(RangeScanCacheEntry entry);
+  void push_secondary_scan_cache(SecondaryScanCacheEntry entry);
   // Keep the rows (pairs) the request's bounds cover. The parallel arrays are
   // appended together at every push site, so they are the same length.
-  static void trim_range_entry(LocalRangeScanEntry& entry,
+  static void trim_range_entry(RangeScanCacheEntry& entry,
                                const std::string& start_key,
                                const std::string& end_key);
-  static void trim_secondary_entry(LocalSecondaryScanEntry& entry,
+  static void trim_secondary_entry(SecondaryScanCacheEntry& entry,
                                    const std::string& start_key,
                                    const std::string& end_key);
 
@@ -317,10 +317,10 @@ private:
 
   TxRpcTrace rpc_trace_;
 
-  std::optional<LocalRowEntry> lookup_write_set(
-      const std::string& table_name, const std::string& key) const;
-  std::optional<LocalRowEntry> lookup_row_cache(
-      const std::string& table_name, const std::string& key) const;
+  std::optional<RowEntry> lookup_write_set(const std::string& table_name,
+                                           const std::string& key) const;
+  std::optional<RowEntry> lookup_row_cache(const std::string& table_name,
+                                           const std::string& key) const;
   void drop_row_cache(const std::string& table_name,
                        const std::string& key);
   bool key_is_in_range(const std::string& key,
@@ -355,16 +355,16 @@ private:
                                const std::string& value, uint64_t tid = 0);
   void append_base_row_read(const std::string& table_name,
                                     const std::string& key, uint64_t tid);
-  void append_range_read(const LocalRangeScanEntry& scanned);
-  void append_secondary_range_read(const LocalSecondaryScanEntry& scanned);
+  void append_range_read(const RangeScanCacheEntry& scanned);
+  void append_secondary_range_read(const SecondaryScanCacheEntry& scanned);
   // The storage server refused the request (a missing table or index). Not
   // contention, but the statement cannot go on either.
   void abort_server_refused(const char* what);
-  std::optional<LocalRangeScanEntry> lookup_range_scan_cache(
+  std::optional<RangeScanCacheEntry> lookup_range_scan_cache(
       const std::string& table_name, const std::string& start_key,
       const std::string& end_key, bool reverse_scan, uint64_t row_limit,
       bool allow_truncated) const;
-  std::optional<LocalSecondaryScanEntry> lookup_secondary_scan_cache(
+  std::optional<SecondaryScanCacheEntry> lookup_secondary_scan_cache(
       const std::string& table_name, const std::string& index_name,
       const std::string& start_key, const std::string& end_key,
       bool reverse_scan, uint64_t row_limit) const;

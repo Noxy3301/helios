@@ -950,11 +950,10 @@ void PaxScan(ClientContext&, TableFunctionInput& data, DataChunk& output) {
   uint32_t entry_slot = local_state.current_slot;
   idx_t entry_row = 0;
 
-  // In-place DATE cells of the open validation window that name no calendar
-  // day, in output row order. The validation empties the list, either by
-  // dropping the rows its re-read replaces or by raising, so it is empty
-  // whenever no window
-  // is open.
+  // In-place DATE cells of this group's rows in this chunk that name no
+  // calendar day, in output row order. The validation empties the list, either
+  // by dropping the rows its re-read replaces or by raising, so it is empty
+  // whenever no group is open.
   std::vector<InvalidDate> invalid_dates;
   // Forgets the records of output rows a rewind or a re-read overwrites.
   auto drop_invalid_dates_from = [&](idx_t row) {
@@ -1034,8 +1033,8 @@ void PaxScan(ClientContext&, TableFunctionInput& data, DataChunk& output) {
     std::atomic_thread_fence(std::memory_order_acquire);
     if (pax::PreserveCount(GroupState(local_state, group)) ==
         local_state.count_at_claim) {
-      // The counter held, so every cell read in this window is what the
-      // group stores, an unconvertible DATE among them.
+      // The counter held, so every cell read of this group in this call is
+      // what the group stores, an unconvertible DATE among them.
       if (!invalid_dates.empty()) RaiseInvalidDate(invalid_dates.front());
       return;
     }
@@ -1055,8 +1054,8 @@ void PaxScan(ClientContext&, TableFunctionInput& data, DataChunk& output) {
         FlatVector::SetNull(output.data[column], row, false);
       }
     }
-    // The re-read's fresh copy and counter are the baseline of the window any
-    // further in-place read of this group in this call belongs to.
+    // The re-read's fresh copy and counter are the baseline any further
+    // in-place read of this group in this call is validated against.
     chunk_validation_pending = local_state.current_slot < PaxGroup::kRows;
     entry_slot = local_state.current_slot;
     entry_row = rows_emitted;

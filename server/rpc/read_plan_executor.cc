@@ -1,4 +1,4 @@
-// Executes a read plan: one RPC runs a statement's staged point reads and
+// Executes a read plan: one RPC runs a statement's prefetched point reads and
 // scans, where a later step builds its keys from what an earlier one read.
 
 #include "helios_rpc.hh"
@@ -152,7 +152,7 @@ void HeliosRpc::handleTxExecuteReadPlan(
             const int row_count =
                 std::max(source->scan_keys_size(), source->scan_values_size());
             // Dedup probes: many source rows share a join key, and the proxy
-            // serves every runtime probe of one key from the single staged
+            // serves every runtime probe of one key from the single cached
             // result, so re-executing the probe only inflates the response.
             std::vector<std::string> probe_keys;
             probe_keys.reserve(static_cast<size_t>(row_count));

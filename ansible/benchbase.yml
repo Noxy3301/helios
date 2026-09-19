@@ -331,7 +331,7 @@
     - name: "Refresh MySQL stats with ANALYZE TABLE on each MySQL ({{ bench_type | upper }})"
       # The statement-scoped read plan reads live row counts from the storage
       # server; only an injected @_tx_plan needs ANALYZE, because MySQL's chosen
-      # plan must match the DSL or every staged read misses. The timeout bounds a
+      # plan must match the DSL or every cached read misses. The timeout bounds a
       # hang here
       when: bench_analyze | bool
       shell: |

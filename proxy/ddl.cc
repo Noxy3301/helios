@@ -471,8 +471,8 @@ bool ha_helios::inplace_alter_table(TABLE *altered_table,
   if (altered_table == nullptr || altered_table->s == nullptr) return true;
 
   // Non-unique indexes are collected and backfilled together below so a single
-  // scan and decode pass feeds them all. A unique index keeps the staging commit
-  // path (its in-write duplicate check) and is backfilled serially.
+  // scan and decode pass feeds them all. A unique index keeps the buffered
+  // commit path (its in-write duplicate check) and is backfilled serially.
   std::vector<std::pair<std::string, const KEY *>> nu_specs;
   for (uint i = 0; i < ha_alter_info->index_add_count; i++) {
     const uint key_idx = ha_alter_info->index_add_buffer[i];

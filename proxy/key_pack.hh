@@ -38,7 +38,8 @@ std::string build_prefix_range_end(const std::string &prefix);
 // "+infinity" end for an unbounded-upper range scan. 16 0xFF bytes sort after
 // every key (real keys start with the 0x00/0x01 null marker). An empty end will
 // not do: the server reads an empty plan-step end as a single-key range, and
-// autogen and the consumer must stage identical bytes for the cache to match.
+// the read-plan compiler and the consumer must pack identical bytes for the
+// cache to match.
 constexpr std::size_t kScanEndSentinelSize = 16;
 inline std::string scan_end_sentinel() {
   return std::string(kScanEndSentinelSize, '\xff');

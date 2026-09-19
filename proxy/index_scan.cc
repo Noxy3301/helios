@@ -11,7 +11,7 @@
 
 // Handler index-access entry points. These methods translate MySQL index
 // cursor operations into Helios primary/secondary range reads and consume
-// the materialized result buffers populated by the search planner.
+// the index scan cache populated by the search planner.
 
 void ha_helios::reset_index_search_buffers() {
   secondary_index_results_.clear();
@@ -37,7 +37,7 @@ bool ha_helios::refill_index_cursor(HeliosTransaction *tx) {
   if (index_cursor_secondary_) {
     // One batch of complete secondary-key groups at a time. The lowest group
     // in it is the next exclusive end, which preserves the original
-    // (secondary key, primary key) order without materializing the full index.
+    // (secondary key, primary key) order without reading the full index.
     auto batch = tx->fetch_secondary_batch_below(
         current_index_name, index_cursor_start_key_, index_cursor_end_key_,
         INDEX_CURSOR_BATCH_SIZE);
@@ -216,7 +216,7 @@ int ha_helios::index_read_map(uchar *buf, const uchar *key,
 
   // MySQL runs single-table UPDATE/DELETE through the old executor
   // (sql_update.cc/sql_delete.cc), which has no JOIN/access path. Derive its
-  // autogen plan from the optimizer-selected handler access instead.
+  // plan from the optimizer-selected handler access instead.
   if (prefetch_needs_single_table_dml_handler(ha_thd(), tx)) {
     build_search_plan(key, keypart_map, find_flag, key_info);
     if (int err = maybe_prefetch_for_single_table_dml_handler(
@@ -250,7 +250,7 @@ int ha_helios::index_next(uchar *buf) {
     }
   }
 
-  // Consume materialized index results.
+  // Consume the index scan cache.
   if (secondary_index_results_.empty() ||
       current_position_in_index_ >= secondary_index_results_.size()) {
     if (index_scan_is_partial_ && !refill_index_scan(tx)) {
@@ -274,7 +274,7 @@ int ha_helios::index_next_same(uchar *buf, const uchar *key [[maybe_unused]],
   }
   tx->choose_table(db_table_name);
 
-  // Consume materialized index results.
+  // Consume the index scan cache.
   if (secondary_index_results_.empty() ||
       current_position_in_index_ >= secondary_index_results_.size()) {
     if (index_scan_is_partial_ && !refill_index_scan(tx)) {
@@ -305,7 +305,7 @@ int ha_helios::index_prev(uchar *buf) {
     return fetch_and_set_current_result(buf, tx);
   }
 
-  // Consume materialized index results.
+  // Consume the index scan cache.
   if (secondary_index_results_.empty() || current_position_in_index_ < 2) {
     return HA_ERR_END_OF_FILE;
   }
@@ -339,9 +339,10 @@ int ha_helios::index_last(uchar *buf) {
 
   tx->choose_table(db_table_name);
 
-  // A key-less tail seek carries no range for QEP autogen to cover (an
-  // unbounded MAX reaches it straight from the optimizer), so stage the
-  // last-N window on demand. A secondary tail walks the index cursor instead.
+  // A key-less tail seek carries no range for the read-plan compiler (an
+  // unbounded MAX reaches it straight from the optimizer), so cache the
+  // index tail fetch on demand. A secondary tail walks the index cursor
+  // instead.
   if (active_index == table->s->primary_key) {
     if (int err = maybe_prefetch_for_index_tail(ha_thd(), tx, db_table_name,
                                                 INDEX_CURSOR_BATCH_SIZE)) {

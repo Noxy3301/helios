@@ -456,7 +456,7 @@ THR_LOCK_DATA **ha_helios::store_lock(THD *, THR_LOCK_DATA **to,
 }
 
 /**
- * @brief Whether this statement's reads are staged through a read plan.
+ * @brief Whether this statement's reads come from a read plan.
  *
  * MRR cost estimation must stay side-effect-free, so it cannot call
  * get_transaction() (which allocates and may emit RPCs). Read the session
@@ -483,7 +483,7 @@ static TYPELIB read_path_typelib = {array_elements(read_path_names) - 1,
                                     nullptr};
 static MYSQL_SYSVAR_ENUM(read_path, srv_read_path, PLUGIN_VAR_RQCMDARG,
                          "Where a statement's reads come from: row sends one "
-                         "request per handler read, plan stages what it can in "
+                         "request per handler read, plan caches what it can in "
                          "one request and sends the rest as they happen.",
                          nullptr, nullptr, kReadPathPlan, &read_path_typelib);
 static const char *commit_durability_names[] = {"async", "sync", NullS};

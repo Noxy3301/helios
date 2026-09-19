@@ -15,9 +15,9 @@ enum class IndexSearchOp
 {
     kIndexFirst,         // key == nullptr
     kUniquePoint,        // (PK or UNIQUE) && full key && !nullable-unique
-    kSameKeyMaterialize, // find_flag == EXACT but not unique point
+    kSameKey,            // find_flag == EXACT but not unique point
     kPrefixFirst,        // HA_READ_PREFIX: return first match only
-    kRangeMaterialize,   // range search (KEY_OR_NEXT / AFTER_KEY / BEFORE_KEY, etc.)
+    kRangeScan,          // range search (KEY_OR_NEXT / AFTER_KEY, etc.)
     kPrevKey,            // HA_READ_KEY_OR_PREV / HA_READ_BEFORE_KEY
     kPrefixLast,         // HA_READ_PREFIX_LAST / LAST_OR_PREV, etc.
 };
@@ -27,7 +27,7 @@ enum class IndexSearchOp
  */
 struct IndexSearchPlan
 {
-    IndexSearchOp op = IndexSearchOp::kRangeMaterialize;
+    IndexSearchOp op = IndexSearchOp::kRangeScan;
 
     // basic information
     bool is_primary = false;
@@ -47,7 +47,7 @@ struct IndexSearchPlan
 
     void reset()
     {
-        op = IndexSearchOp::kRangeMaterialize;
+        op = IndexSearchOp::kRangeScan;
         is_primary = false;
         used_key_parts = 0;
         all_parts_specified = false;

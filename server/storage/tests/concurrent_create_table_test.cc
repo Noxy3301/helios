@@ -46,8 +46,7 @@ class ConcurrentCreateTableTest : public ::testing::Test {
   }
 };
 
-// Holds its window open across several epochs and races CreateTable against
-// the epoch tick.
+// Races CreateTable against the epoch tick across several epochs.
 TEST_F(ConcurrentCreateTableTest, ConcurrentCreateTableAcrossEpochs) {
   constexpr size_t kNumWorkers = 4;
   constexpr size_t kNumTables = 100;

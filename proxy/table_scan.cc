@@ -16,7 +16,7 @@ int ha_helios::rnd_init(bool) {
   DBUG_ENTER("ha_helios::rnd_init");
   scanned_keys_.clear();
   scanned_values_.clear();
-  scan_cache_.clear();
+  scan_buffer_.clear();
   buffer_position_ = 0;
   scan_exhausted_ = false;
   last_fetched_primary_key_.clear();
@@ -32,8 +32,8 @@ int ha_helios::rnd_init(bool) {
 
   tx->choose_table(db_table_name);
 
-  // The optimizer has run, so the QEP is available. Statement-scoped autogen
-  // stages the read plan once per statement; a shape it cannot stage reads
+  // The optimizer has run, so the QEP is available. Statement-scoped prefetch
+  // runs the read plan once per statement; a shape it cannot compile reads
   // from the storage server row by row.
   if (int err = maybe_prefetch_for_statement(ha_thd(), tx, table)) {
     DBUG_RETURN(err);
@@ -44,7 +44,7 @@ int ha_helios::rnd_init(bool) {
 
 int ha_helios::rnd_end() {
   DBUG_TRACE;
-  // Do not clear scan_cache_ or scanned_values_ here. MySQL can call rnd_end()
+  // Do not clear scan_buffer_ or scanned_values_ here. MySQL can call rnd_end()
   // after scanning and then call rnd_pos() to re-read rows in sorted order.
   // Clear them at the start of the next rnd_init() instead.
   buffer_position_ = 0;
@@ -53,8 +53,8 @@ int ha_helios::rnd_end() {
   return 0;
 }
 
-bool ha_helios::materialize_scan() {
-  DBUG_ENTER("ha_helios::materialize_scan");
+bool ha_helios::fill_scan_buffer() {
+  DBUG_ENTER("ha_helios::fill_scan_buffer");
 
   auto tx = get_transaction(ha_thd());
   if (tx->is_aborted()) {
@@ -65,7 +65,7 @@ bool ha_helios::materialize_scan() {
 
   scanned_keys_.clear();
   scanned_values_.clear();
-  scan_cache_.clear();
+  scan_buffer_.clear();
   buffer_position_ = 0;
 
   auto key_value_pairs = tx->get_matching_keys_and_values_from_prefix("");
@@ -73,14 +73,14 @@ bool ha_helios::materialize_scan() {
   for (auto &kv : key_value_pairs) {
     if (kv.second.empty()) continue;
 
-    // Store row data and build scan_cache_ so rnd_pos() can reuse it later.
+    // Store row data and build scan_buffer_ so rnd_pos() can reuse it later.
     size_t idx = scanned_keys_.size();
     scanned_keys_.push_back(kv.first);
     const auto &val = kv.second;
     scanned_values_.emplace_back(
         reinterpret_cast<const std::byte *>(val.data()),
         reinterpret_cast<const std::byte *>(val.data()) + val.size());
-    scan_cache_[kv.first] = idx;
+    scan_buffer_[kv.first] = idx;
   }
 
   if (tx->is_aborted()) {
@@ -107,7 +107,7 @@ int ha_helios::rnd_next(uchar *buf) {
       DBUG_RETURN(HA_ERR_END_OF_FILE);
     }
 
-    if (!materialize_scan()) {
+    if (!fill_scan_buffer()) {
       auto tx = get_transaction(ha_thd());
       if (tx->is_aborted()) {
         DBUG_RETURN(abort_errno(tx));
@@ -147,10 +147,10 @@ int ha_helios::rnd_pos(uchar *buf, uchar *pos) {
     return HA_ERR_KEY_NOT_FOUND;
   }
 
-  // Return from scan_cache_ if available. Without this, each sorted re-read
+  // Return from scan_buffer_ if available. Without this, each sorted re-read
   // would require a separate RPC to Helios.
-  auto cache_it = scan_cache_.find(primary_key);
-  if (cache_it != scan_cache_.end()) {
+  auto cache_it = scan_buffer_.find(primary_key);
+  if (cache_it != scan_buffer_.end()) {
     auto &value = scanned_values_[cache_it->second];
     if (set_fields_from_helios(buf, value.data(), value.size())) {
       return HA_ERR_OUT_OF_MEM;

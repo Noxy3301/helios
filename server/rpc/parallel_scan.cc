@@ -20,7 +20,7 @@ bool parallel_primary_pax_row_ref_scan(
         std::vector<std::string> scan_keys;
         std::vector<std::string> scan_values;
         std::vector<uint64_t> tids;
-        bool materialized_path_required = false;
+        bool serial_scan_required = false;
     };
 
     auto run_range = [&](const std::string& chunk_start,
@@ -29,7 +29,7 @@ bool parallel_primary_pax_row_ref_scan(
         auto refs = db->ScanPax(step.table_name(), chunk_start, chunk_end,
                                 step.scan_limit(), step.reverse_scan());
         if (!refs.ok) {
-            out.materialized_path_required = true;
+            out.serial_scan_required = true;
             if (release_epoch) db->ReleaseThreadEpoch();
             return;
         }
@@ -126,7 +126,7 @@ bool parallel_primary_pax_row_ref_scan(
     }
 
     for (const auto& chunk : chunks) {
-        if (chunk.materialized_path_required) return false;
+        if (chunk.serial_scan_required) return false;
     }
 
     uint64_t emitted = 0;

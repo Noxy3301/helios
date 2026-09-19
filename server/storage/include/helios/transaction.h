@@ -123,13 +123,13 @@ class Transaction {
   void Read(std::string_view table, std::string_view key, Tidword observed);
 
   /**
-   * @brief Records a range read to replay at commit.
+   * @brief Records a range read to revalidate at commit.
    *
    * @details The bounds, index, limit and direction describe the scan to
    * re-run over `[begin, end)`. An empty `index` names the primary index, and
    * a `limit` of 0 caps nothing. `keys`, and `primary_keys` on a secondary
-   * index, are the keys that scan returned, in scan order. Commit replays the
-   * scan and aborts when that ordered list differs. Row words are not part of
+   * index, are the keys that scan returned, in scan order. Commit re-scans
+   * the range and aborts when that ordered list differs. Row words are not part of
    * this call: each row the caller consumed is also a Read. Commit refuses a
    * range whose `end` is empty.
    */
@@ -173,7 +173,7 @@ class Transaction {
    *
    * - Phase 1: lock every record in pointer order. Then join the epoch, as
    *   Silo reads it after locking.
-   * - Phase 2: validate every point read by word, replay every range and
+   * - Phase 2: validate every point read by word, revalidate every range and
    *   compare its key list, check INSERT and UNIQUE under the locks, then
    *   choose the commit TID. Reserve every PAX slot before the first value
    *   changes.
@@ -249,8 +249,8 @@ class Transaction {
   /**
    * @brief Reports whether this attempt holds the record's lock.
    *
-   * @details Read validation and both range replays allow a locked word only
-   * when this attempt is the holder; any other lock aborts.
+   * @details Read validation and both range revalidations allow a locked word
+   * only when this attempt is the holder; any other lock aborts.
    */
   bool OwnsLock(DataItem *item) const;
 
@@ -279,15 +279,15 @@ class Transaction {
   bool Prepare(DataItem &item, WriteEntry &entry, std::string &reason);
 
   /**
-   * @brief Checks every point word and replays every range.
+   * @brief Checks every point word and revalidates every range.
    *
    * @param[in,out] max_tid Raised to the largest word validation observed.
    * @return false with reason set at the first check that fails.
    */
   bool ValidateReads(Tidword &max_tid, std::string &reason);
 
-  bool ReplayRange(const RangeEntry &range, Tidword &max_tid);
-  bool ReplayIndexRange(const RangeEntry &range, Tidword &max_tid);
+  bool RevalidateRange(const RangeEntry &range, Tidword &max_tid);
+  bool RevalidateSecondaryRange(const RangeEntry &range, Tidword &max_tid);
 
   /**
    * @brief Installs the final value while the record stays locked.

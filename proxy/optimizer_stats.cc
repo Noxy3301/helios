@@ -490,7 +490,7 @@ ha_rows ha_helios::records_in_range(uint inx, key_range *min_key,
   return estimate;
 }
 
-bool ha_helios::should_charge_materialization_cost(
+bool ha_helios::should_charge_remote_row_cost(
     uint index, double rows [[maybe_unused]]) const {
   const TABLE *t = table;
   if (t == nullptr || t->in_use == nullptr) return true;

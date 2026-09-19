@@ -188,7 +188,7 @@ class PaxGroup {
    * unused strips.
    *
    * @param slot Source slot inside this group.
-   * @param columns Zero-based MySQL column indexes to materialize, in ascending
+   * @param columns Zero-based MySQL column indexes to gather, in ascending
    * order.
    * @param n_columns Number of entries in `columns`.
    * @param out Destination string; gathered bytes are appended.

@@ -854,7 +854,7 @@ TEST_F(CommitTidTest, FutureEpochAbortsAndReleasesTheWriteLock) {
 
 TEST_F(CommitTidTest, AbsentReadAcceptsABlankRecordAnotherTransactionLeft) {
   auto &tree = tables_.GetTable(kTable)->GetPrimaryIndex();
-  // An aborted attempt leaves the key materialized but still absent.
+  // An aborted attempt leaves the key a blank record, still absent.
   ASSERT_NE(nullptr, tree.GetOrInsert("blank"));
   ASSERT_TRUE(Commit({{kTable, "blank", Tidword::Absent().obj}},
                      {{kTable, "other", "value"}}))
@@ -897,7 +897,7 @@ TEST_F(CommitTidTest, ReadThenWriteOfOneKeyValidatesThroughOwnLock) {
   EXPECT_EQ(Version(10, 21), item->transaction_id.load());
 }
 
-TEST_F(CommitTidTest, RangeReplayAllowsOwnLockOnPrimaryAndSecondary) {
+TEST_F(CommitTidTest, RangeRevalidationAllowsOwnLockOnPrimaryAndSecondary) {
   SeedRow("k", Version(10, 10));
   auto *index = tables_.GetTable(kTable)->GetSecondaryIndex("idx");
   auto *posting = index->tree.GetOrInsert("s");
@@ -1030,7 +1030,7 @@ TEST_F(CommitTidTest,
   ASSERT_TRUE(Commit({}, {}, {{kTable, "idx", "s", "a", true}})) << reason_;
   EXPECT_EQ(Deleted(10, 5), posting->transaction_id.load());
 
-  // The emptied entry replays as absent until the reaper removes it.
+  // The emptied entry revalidates as absent until the reaper removes it.
   TestHelper::Range range;
   range.table_name = kTable;
   range.index_name = "idx";

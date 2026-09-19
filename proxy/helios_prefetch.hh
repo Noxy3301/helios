@@ -17,7 +17,7 @@ bool thd_can_use_prefetch(THD *thd);
  * @brief Transaction-scoped prefetch: run an injected @_tx_plan (DSL) once
  *        at transaction begin, if one is present.
  *
- * Marks the transaction (tx_plan_used) so the statement-scoped autogen path
+ * Marks the transaction (tx_plan_used) so the statement-scoped prefetch
  * stays out of the way; a transaction takes its plan from one source, the
  * DSL or the QEP. No-op when no @_tx_plan is set.
  *
@@ -29,18 +29,19 @@ void maybe_prefetch_for_transaction(THD *thd,
 
 /**
  * @brief Statement-scoped prefetch: auto-generate the read plan from the QEP,
- *        run it in one RPC, and load the result into the transaction's local
- *        view, at most once per statement.
+ *        run it in one RPC, and load the result into the transaction's row
+ *        and scan caches, at most once per statement.
  *
- * "maybe" because it is a conditional no-op: it returns 0 without staging
- * anything when the read path is row, a tx-scoped @_tx_plan is already active,
- * the statement was already staged (keyed by thd->query_id), or its shape has
- * no plan. Unstaged reads go to the storage server one request at a time. Call
- * from rnd_init() / index_read_map() after the optimizer has built the plan.
+ * "maybe" because it is a conditional no-op: it returns 0 without caching
+ * anything when the read path is row, a tx-scoped @_tx_plan is already
+ * active, prefetch was already attempted for the statement (keyed by
+ * thd->query_id), or its shape has no plan. Uncached reads go to the storage
+ * server one request at a time. Call from rnd_init() / index_read_map() after
+ * the optimizer has built the plan.
  *
  * @param thd Current session; its query_id keys the per-statement guard.
- * @param tx  Transaction to stage into.
- * @return 0 on success or skip. HA_ERR_LOCK_DEADLOCK when the staging RPC
+ * @param tx  Transaction to cache into.
+ * @return 0 on success or skip. HA_ERR_LOCK_DEADLOCK when the prefetch RPC
  *         aborted the transaction, HA_ERR_NO_CONNECTION when it lost the
  *         connection. Propagate any non-zero return to fail the statement.
  */
@@ -58,29 +59,29 @@ bool prefetch_needs_single_table_dml_handler(THD *thd,
                                              HeliosTransaction *tx);
 
 /**
- * @brief Compile and stage a single-table UPDATE/DELETE from its first
- *        handler index access, at most once per statement. A shape one staged
- *        range cannot cover is left to the row path.
+ * @brief Compile and run the read plan for a single-table UPDATE/DELETE from
+ *        its first handler index access, at most once per statement. A shape
+ *        one cached range cannot cover is left to the row path.
  */
 int maybe_prefetch_for_single_table_dml_handler(
     THD *thd, HeliosTransaction *tx, TABLE *table, uint index,
     const IndexSearchPlan &search);
 
 /**
- * @brief Stage the reverse tail window for a key-less primary index_last seek,
+ * @brief Cache the index tail fetch for a key-less primary index_last seek,
  *        at most once per statement and table.
  *
- * The handler consumes the window through the ordinary staged-scan lookup,
- * which registers the reverse+limit range for commit-time replay. `table_key`
- * must be the key the handler passed to choose_table() so the staged entry and
- * the lookup agree.
+ * The handler consumes the rows through the ordinary scan cache lookup,
+ * which registers the reverse+limit range for commit-time revalidation.
+ * `table_key` must be the key the handler passed to choose_table() so the
+ * cache entry and the lookup agree.
  *
  * @return 0 on success or skip (row path / tx-scoped plan active). Non-zero
- *         HA_ERR_* when the staging RPC aborted; propagate it.
+ *         HA_ERR_* when the prefetch RPC aborted; propagate it.
  */
 int maybe_prefetch_for_index_tail(THD *thd, HeliosTransaction *tx,
                                   const std::string &table_key,
-                                  uint64_t window_rows);
+                                  uint64_t scan_limit);
 
 /**
  * @brief Fail, loudly, a statement this engine cannot execute at all.
@@ -97,7 +98,7 @@ int reject_unsupported_statement(THD *thd, HeliosTransaction *tx,
                                  const char *reason);
 
 /**
- * @brief Map a completed staging attempt to a handler error code.
+ * @brief Map a completed prefetch attempt to a handler error code.
  *
  * A lost connection maps to HA_ERR_NO_CONNECTION, any other abort to the
  * retryable HA_ERR_LOCK_DEADLOCK with the transaction marked for rollback.

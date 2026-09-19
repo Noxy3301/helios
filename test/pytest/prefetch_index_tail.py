@@ -9,8 +9,8 @@ from utils.connection import get_connection
 
 DBNAME = f"ha_helios_index_tail_{int(time.time())}"
 
-# The staged tail window is INDEX_CURSOR_READ_AHEAD_SIZE (1024) rows; use a
-# table larger than one window so window-boundary behavior is exercised.
+# The index tail fetch is INDEX_CURSOR_READ_AHEAD_SIZE (1024) rows; use a
+# table larger than one fetch so its boundary behavior is exercised.
 ROWS = 2500
 
 _table_seq = 0
@@ -47,7 +47,7 @@ def load_rows(cursor, db, n):
 
 
 def read_path_plan(cursor):
-    # Statement-scoped autogen: plan read path, no @_tx_plan.
+    # Statement-scoped prefetch: plan read path, no @_tx_plan.
     cursor.execute("SET GLOBAL helios_read_path='plan'")
     cursor.execute("SET @_tx_plan=NULL")
 
@@ -102,9 +102,9 @@ def test_max_small_and_empty(cursor, db):
     return 0
 
 
-def test_desc_limit_within_window(cursor, db):
-    # This shape works under the staged tail window and must succeed.
-    print("INDEX TAIL: ORDER BY pk DESC LIMIT within window")
+def test_desc_limit_within_tail_fetch(cursor, db):
+    # This shape works under the index tail fetch and must succeed.
+    print("INDEX TAIL: ORDER BY pk DESC LIMIT within the tail fetch")
     t = load_rows(cursor, db, ROWS)
     read_path_plan(cursor)
     cursor.execute(f"SELECT id FROM {t} ORDER BY id DESC LIMIT 5")
@@ -118,11 +118,11 @@ def test_desc_limit_within_window(cursor, db):
 
 
 
-def test_desc_walk_past_window(cursor, db):
+def test_desc_walk_past_tail_fetch(cursor, db):
     # A derived-table COUNT would let the optimizer drop the ORDER BY and
     # bypass index_last; force the backward index walk so the read really
-    # runs off the staged tail window and continues from the server.
-    print("INDEX TAIL: full DESC walk past the staged window")
+    # runs off the index tail fetch and continues from the server.
+    print("INDEX TAIL: full DESC walk past the tail fetch")
     t = load_rows(cursor, db, ROWS)
     read_path_plan(cursor)
     cursor.execute(f"SELECT id FROM {t} FORCE INDEX(PRIMARY) ORDER BY id DESC")
@@ -150,9 +150,9 @@ def test_own_write_then_max_never_stale(cursor, db):
     return 0
 
 
-def test_window_boundaries(cursor, db):
+def test_tail_fetch_boundaries(cursor, db):
     # INDEX_CURSOR_READ_AHEAD_SIZE is 1024; MAX must be right at 1, K-1, K, K+1.
-    print("INDEX TAIL: MAX at window-size boundaries")
+    print("INDEX TAIL: MAX at tail-fetch boundaries")
     read_path_plan(cursor)
     for n in (1, 1023, 1024, 1025):
         t = load_rows(cursor, db, n)
@@ -166,7 +166,7 @@ def test_window_boundaries(cursor, db):
 
 
 def test_all_tombstone(cursor, db):
-    # The staged tail scan skips tombstones server-side; MAX must be NULL.
+    # The tail fetch skips tombstones server-side; MAX must be NULL.
     print("INDEX TAIL: MAX after deleting every row")
     t = load_rows(cursor, db, 200)
     read_path_plan(cursor)
@@ -181,8 +181,8 @@ def test_all_tombstone(cursor, db):
     return 0
 
 
-def test_exact_window_full_desc_walk(cursor, db):
-    # Exactly one window of live rows: the walk continues past it and ends at
+def test_exact_tail_fetch_full_desc_walk(cursor, db):
+    # Exactly one tail fetch of live rows: the walk continues past it and ends at
     # a true EOF.
     print("INDEX TAIL: exactly-K full DESC walk")
     t = load_rows(cursor, db, 1024)
@@ -212,12 +212,12 @@ def test_baseline_regression(cursor, db):
 TESTS = [
     test_max_under_stmt_plan,
     test_max_small_and_empty,
-    test_desc_limit_within_window,
-    test_desc_walk_past_window,
+    test_desc_limit_within_tail_fetch,
+    test_desc_walk_past_tail_fetch,
     test_own_write_then_max_never_stale,
-    test_window_boundaries,
+    test_tail_fetch_boundaries,
     test_all_tombstone,
-    test_exact_window_full_desc_walk,
+    test_exact_tail_fetch_full_desc_walk,
     test_baseline_regression,
 ]
 

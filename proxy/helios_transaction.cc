@@ -90,9 +90,9 @@ const std::pair<const std::byte *const, const size_t>
 HeliosTransaction::read(std::string key) {
   if (table_is_not_chosen()) return std::pair<const std::byte *const, const size_t>{nullptr, 0};
 
-  // Silo-style local view: own writes are visible before remote reads
+  // Read-your-writes: the write buffer is visible before an RPC
   if (auto entry = lookup_write_set(db_table_key, key)) {
-    rpc_trace_.record_local_view("write_set_hit");
+    rpc_trace_.record_event("write_set_hit");
     if (!entry->found) return {nullptr, 0};
     last_read_value_ = entry->value;
     return {reinterpret_cast<const std::byte*>(last_read_value_.data()), last_read_value_.size()};
@@ -100,9 +100,9 @@ HeliosTransaction::read(std::string key) {
 
   // Repeat exact-key reads can use the local read set
   if (auto entry = lookup_row_cache(db_table_key, key)) {
-    rpc_trace_.record_local_view("read_cache_hit");
+    rpc_trace_.record_event("read_cache_hit");
     // A consumed cache hit appends to the point read set.
-    rpc_trace_.record_local_view(
+    rpc_trace_.record_event(
         trace_count_event("use_point_read", entry->table_name, 1));
     append_base_row_read(entry->table_name, entry->key, entry->tid);
     if (!entry->found) return {nullptr, 0};
@@ -110,7 +110,7 @@ HeliosTransaction::read(std::string key) {
     return {reinterpret_cast<const std::byte*>(last_read_value_.data()), last_read_value_.size()};
   }
 
-  rpc_trace_.record_local_view("read_miss");
+  rpc_trace_.record_event("read_miss");
   auto result = helios_proxy->tx_read(db_table_key, key);
   if (!result.ok) {
     mark_transport_error();
@@ -142,19 +142,19 @@ HeliosTransaction::batch_read(const std::vector<std::string>& keys) {
   // Resolve keys covered by the local read/write sets first
   for (size_t i = 0; i < keys.size(); ++i) {
     if (auto entry = lookup_write_set(db_table_key, keys[i])) {
-      rpc_trace_.record_local_view("write_set_hit");
+      rpc_trace_.record_event("write_set_hit");
       pairs[i] = {entry->found, entry->value};
       continue;
     }
     if (auto entry = lookup_row_cache(db_table_key, keys[i])) {
-      rpc_trace_.record_local_view("batch_cache_hit");
-      rpc_trace_.record_local_view(
+      rpc_trace_.record_event("batch_cache_hit");
+      rpc_trace_.record_event(
           trace_count_event("use_point_read", entry->table_name, 1));
       append_base_row_read(entry->table_name, entry->key, entry->tid);
       pairs[i] = {entry->found, entry->value};
       continue;
     }
-    rpc_trace_.record_local_view("batch_miss");
+    rpc_trace_.record_event("batch_miss");
     rpc_positions.push_back(i);
     rpc_keys.push_back({db_table_key, keys[i]});
   }
@@ -165,7 +165,7 @@ HeliosTransaction::batch_read(const std::vector<std::string>& keys) {
   if (!rpc_keys.empty()) {
     auto results = helios_proxy->tx_batch_read(rpc_keys);
     if (results.size() != rpc_keys.size()) {
-      rpc_trace_.record_local_view("abort_batch_size_mismatch");
+      rpc_trace_.record_event("abort_batch_size_mismatch");
       mark_transport_error();
       return pairs;
     }
@@ -279,7 +279,7 @@ bool HeliosTransaction::probe_insert_keys(
 
   auto results = helios_proxy->tx_batch_read(reads);
   if (results.size() != reads.size()) {
-    rpc_trace_.record_local_view("abort_probe_size_mismatch");
+    rpc_trace_.record_event("abort_probe_size_mismatch");
     mark_transport_error();
     return false;
   }
@@ -298,7 +298,8 @@ void HeliosTransaction::execute_read_plan(
     const std::vector<HeliosProxy::ReadPlanStep>& full_steps) {
   if (full_steps.empty()) return;
 
-  // Exact point reads already covered by the local view need no staging RPC.
+  // Exact point reads already in the write buffer or the row cache need no
+  // prefetch RPC.
   // Referenced steps must survive because later bindings point at
   // them by source_step index.
   std::vector<bool> referenced(full_steps.size(), false);
@@ -346,11 +347,11 @@ void HeliosTransaction::execute_read_plan(
   }
   if (steps.empty()) return;
 
-  rpc_trace_.record_local_view("plan_request:steps=" +
-                               std::to_string(steps.size()));
+  rpc_trace_.record_event("plan_request:steps=" +
+                          std::to_string(steps.size()));
   auto result = helios_proxy->tx_execute_read_plan(steps);
   if (!result.ok || result.steps.size() != steps.size()) {
-    rpc_trace_.record_local_view("abort_read_plan_rpc");
+    rpc_trace_.record_event("abort_read_plan_rpc");
     if (result.transport_error) {
       mark_transport_error();
     } else {
@@ -360,7 +361,7 @@ void HeliosTransaction::execute_read_plan(
   }
 
   // Consume each decoded step destructively: move strings into local caches,
-  // then release the step before staging the next one.
+  // then release the step before caching the next one.
   for (size_t i = 0; i < result.steps.size() && i < steps.size(); ++i) {
     const auto& step = steps[i];
     auto& step_result = result.steps[i];
@@ -379,7 +380,7 @@ void HeliosTransaction::execute_read_plan(
     };
 
     if (!step.is_scan && !step.for_each) {
-      rpc_trace_.record_local_view(trace_count_event(
+      rpc_trace_.record_event(trace_count_event(
           step_result.found ? "plan_fetch:R:hit" : "plan_fetch:R:miss",
           step.table_name, 1));
       if (step_result.found) {
@@ -393,18 +394,18 @@ void HeliosTransaction::execute_read_plan(
       continue;
     }
 
-    rpc_trace_.record_local_view(trace_plan_scan_event(
+    rpc_trace_.record_event(trace_plan_scan_event(
         step.table_name, step.index_name, step_result.scan_keys.size(),
         step_result.scan_values.size(), step.scan_limit, step.for_each));
 
     if (step.for_each && step.is_scan) {
-      // Stage grouped for_each range results as ordinary scan-cache entries.
+      // Cache grouped for_each range results as ordinary scan cache entries.
       // Each group corresponds to one deduplicated probe key.
       if (step_result.group_start_keys.size() !=
               step_result.group_sizes.size() ||
           step_result.group_end_keys.size() != step_result.group_sizes.size()) {
         // A group without its bounds cannot serve anything; the plan failed.
-        rpc_trace_.record_local_view("abort_read_plan_groups");
+        rpc_trace_.record_event("abort_read_plan_groups");
         is_aborted_ = true;
         return;
       }
@@ -415,7 +416,7 @@ void HeliosTransaction::execute_read_plan(
         const std::string& gend = step_result.group_end_keys[g];
         if (step.index_name.empty()) {
           // Primary range group: cache row values by primary key.
-          LocalRangeScanEntry entry;
+          RangeScanCacheEntry entry;
           entry.table_name = step.table_name;
           entry.start_key = gstart;
           entry.end_key = gend;
@@ -434,7 +435,7 @@ void HeliosTransaction::execute_read_plan(
           push_range_scan_cache(std::move(entry));
         } else {
           // Secondary range group: cache secondary keys and their primary keys.
-          LocalSecondaryScanEntry entry;
+          SecondaryScanCacheEntry entry;
           entry.table_name = step.table_name;
           entry.index_name = step.index_name;
           entry.start_key = gstart;
@@ -474,7 +475,7 @@ void HeliosTransaction::execute_read_plan(
     }
 
     if (step.index_name.empty()) {
-      // Primary scan: cache row values and stage one primary range entry.
+      // Primary scan: cache row values and one primary range entry.
       std::vector<std::pair<std::string, std::string>> rows;
       std::vector<uint64_t> row_tids;
       rows.reserve(step_result.scan_keys.size());
@@ -488,14 +489,14 @@ void HeliosTransaction::execute_read_plan(
           row_tids.push_back(tid);
         }
       }
-      LocalRangeScanEntry entry{
+      RangeScanCacheEntry entry{
           step.table_name, step_result.actual_start_key,
           step_result.actual_end_key, step.reverse_scan, step.scan_limit,
           std::move(rows), std::move(row_tids)};
       push_range_scan_cache(std::move(entry));
     } else {
       // Keep secondary_keys and primary_keys aligned; lookup walks the pairs.
-      LocalSecondaryScanEntry cached;
+      SecondaryScanCacheEntry cached;
       cached.table_name = step.table_name;
       cached.index_name = step.index_name;
       cached.start_key = step_result.actual_start_key;
@@ -588,15 +589,15 @@ HeliosTransaction::get_matching_keys_and_values_in_range(std::string start_key,
       append_base_row_read(db_table_key, cached->rows[i].first,
                            cached->row_tids[i]);
     }
-    // Record the pre-merge staged rows: commit-side replay cannot see this
-    // transaction's pending writes.
+    // Record the pre-merge cached rows: commit-side revalidation cannot see
+    // this transaction's pending writes.
     append_range_read(*cached);
 
     merge_pending_rows_into_range_scan(pairs, start_key, end_key, reverse_scan);
     if (row_limit > 0 && pairs.size() > row_limit) {
       pairs.resize(static_cast<size_t>(row_limit));
     }
-    rpc_trace_.record_local_view(
+    rpc_trace_.record_event(
         trace_count_event("use_pk_value_scan", db_table_key, pairs.size()));
     return pairs;
   }
@@ -626,7 +627,7 @@ HeliosTransaction::scan_range(const std::string& start_key,
     return {};
   }
 
-  LocalRangeScanEntry scanned;
+  RangeScanCacheEntry scanned;
   scanned.table_name = db_table_key;
   scanned.start_key = start_key;
   scanned.end_key = end_key;
@@ -673,7 +674,7 @@ HeliosTransaction::get_matching_primary_keys_in_range(std::string index_name,
   auto cached = lookup_secondary_scan_cache(
       db_table_key, index_name, start_key, end_key, reverse_scan, row_limit);
   if (!cached && row_limit != 0) {
-    // An unlimited staged scan of the same range covers a limited request;
+    // An unlimited cached scan of the same range covers a limited request;
     // the limit is applied to the merged result below.
     cached = lookup_secondary_scan_cache(db_table_key, index_name, start_key,
                                          end_key, reverse_scan, 0);
@@ -686,9 +687,9 @@ HeliosTransaction::get_matching_primary_keys_in_range(std::string index_name,
     }
     auto merged = merge_index_scan(index_name, start_key, end_key, row_limit,
                                    reverse_scan, groups);
-    rpc_trace_.record_local_view("use_secondary_scan:" + db_table_key + ":" +
-                                 index_name + ":n=" +
-                                 std::to_string(merged.primary_keys.size()));
+    rpc_trace_.record_event("use_secondary_scan:" + db_table_key + ":" +
+                            index_name + ":n=" +
+                            std::to_string(merged.primary_keys.size()));
     return merged.primary_keys;
   }
 
@@ -723,7 +724,7 @@ HeliosTransaction::SecondaryScan HeliosTransaction::scan_index_range(
     return out;
   }
 
-  LocalSecondaryScanEntry scanned;
+  SecondaryScanCacheEntry scanned;
   scanned.table_name = db_table_key;
   scanned.index_name = index_name;
   scanned.start_key = start_key;
@@ -901,7 +902,7 @@ void HeliosTransaction::buffer_delete_secondary_index(
   write_buffer_ops_.push_back(std::move(op));
 }
 
-std::optional<HeliosTransaction::LocalRowEntry>
+std::optional<HeliosTransaction::RowEntry>
 HeliosTransaction::lookup_write_set(
     const std::string& table_name, const std::string& key) const {
   auto it = own_writes_index_.find(make_row_cache_key(table_name, key));
@@ -909,7 +910,7 @@ HeliosTransaction::lookup_write_set(
   return own_writes_[it->second];
 }
 
-std::optional<HeliosTransaction::LocalRowEntry>
+std::optional<HeliosTransaction::RowEntry>
 HeliosTransaction::lookup_row_cache(
     const std::string& table_name, const std::string& key) const {
   auto it = row_cache_.find(make_row_cache_key(table_name, key));
@@ -945,7 +946,7 @@ void HeliosTransaction::insert_scan_row_in_order(
     std::vector<std::pair<std::string, std::string>>& rows,
     const std::string& key, const std::string& value,
     bool reverse_scan) const {
-  // Keep the materialized scan result in key order
+  // Keep rows in scan order
   for (auto it = rows.begin(); it != rows.end(); ++it) {
     if ((!reverse_scan && key < it->first) || (reverse_scan && key > it->first)) {
       rows.insert(it, {key, value});
@@ -1037,7 +1038,7 @@ void HeliosTransaction::record_write(const std::string& table_name,
   std::string index_key = make_row_cache_key(table_name, key);
   auto it = own_writes_index_.find(index_key);
   if (it != own_writes_index_.end()) {
-    LocalRowEntry& entry = own_writes_[it->second];
+    RowEntry& entry = own_writes_[it->second];
     entry.found = found;
     entry.value = value;
     return;
@@ -1051,10 +1052,10 @@ void HeliosTransaction::record_write(const std::string& table_name,
 void HeliosTransaction::record_row_cache(
     const std::string& table_name, const std::string& key, bool found,
     const std::string& value, uint64_t tid) {
-  // Re-staging overwrites the cached row; every consume has already appended
+  // Caching again overwrites the cached row; every consume has already appended
   // its TID to the read set, so no observation is lost.
   row_cache_[make_row_cache_key(table_name, key)] =
-      LocalRowEntry{table_name, key, found, value, tid};
+      RowEntry{table_name, key, found, value, tid};
 }
 
 void HeliosTransaction::append_base_row_read(
@@ -1065,10 +1066,10 @@ void HeliosTransaction::append_base_row_read(
 }
 
 void HeliosTransaction::append_range_read(
-    const LocalRangeScanEntry& scanned) {
-  // The bounds describe the replay and result_keys is the observed key list in
-  // scan order. Append, like the point and Silo read sets; a scan consumed
-  // twice is revalidated twice: redundant but never wrong.
+    const RangeScanCacheEntry& scanned) {
+  // The bounds describe the revalidation and result_keys is the observed key
+  // list in scan order. Append, like the point and Silo read sets; a scan
+  // consumed twice is revalidated twice: redundant but never wrong.
   HeliosProxy::RangeReadEntry entry;
   entry.table_name = scanned.table_name;
   entry.start_key = scanned.start_key;
@@ -1083,7 +1084,7 @@ void HeliosTransaction::append_range_read(
 }
 
 void HeliosTransaction::append_secondary_range_read(
-    const LocalSecondaryScanEntry& scanned) {
+    const SecondaryScanCacheEntry& scanned) {
   HeliosProxy::RangeReadEntry entry;
   entry.table_name = scanned.table_name;
   entry.index_name = scanned.index_name;
@@ -1097,13 +1098,13 @@ void HeliosTransaction::append_secondary_range_read(
 }
 
 void HeliosTransaction::abort_server_refused(const char* what) {
-  rpc_trace_.record_local_view(std::string("abort_server_refused:") + what);
+  rpc_trace_.record_event(std::string("abort_server_refused:") + what);
   LOG_WARNING("Storage server refused %s table=%s", what, db_table_key.c_str());
   is_aborted_ = true;
   thd_mark_transaction_to_rollback(thread, 1);
 }
 
-void HeliosTransaction::push_range_scan_cache(LocalRangeScanEntry entry) {
+void HeliosTransaction::push_range_scan_cache(RangeScanCacheEntry entry) {
   range_scan_start_index_[scan_cache_index_key(entry.table_name, "",
                                                entry.start_key)]
       .push_back(range_scan_cache_.size());
@@ -1111,7 +1112,7 @@ void HeliosTransaction::push_range_scan_cache(LocalRangeScanEntry entry) {
 }
 
 void HeliosTransaction::push_secondary_scan_cache(
-    LocalSecondaryScanEntry entry) {
+    SecondaryScanCacheEntry entry) {
   secondary_scan_start_index_[scan_cache_index_key(
                                   entry.table_name, entry.index_name,
                                   entry.start_key)]
@@ -1119,7 +1120,7 @@ void HeliosTransaction::push_secondary_scan_cache(
   secondary_scan_cache_.push_back(std::move(entry));
 }
 
-std::optional<HeliosTransaction::LocalRangeScanEntry>
+std::optional<HeliosTransaction::RangeScanCacheEntry>
 HeliosTransaction::lookup_range_scan_cache(
     const std::string& table_name, const std::string& start_key,
     const std::string& end_key, bool reverse_scan, uint64_t row_limit,
@@ -1127,7 +1128,7 @@ HeliosTransaction::lookup_range_scan_cache(
   const bool pending_in_range =
       has_pending_row_ops_in_range(table_name, start_key, end_key);
 
-  // Grouped for_each range probes are staged by exact start key. Try that
+  // Grouped for_each range probes are cached by exact start key. Try that
   // index before falling back to the wider range-cache scan below.
   auto idx_it = range_scan_start_index_.find(
       scan_cache_index_key(table_name, "", start_key));
@@ -1136,14 +1137,14 @@ HeliosTransaction::lookup_range_scan_cache(
          ++rit) {
       const auto& e = range_scan_cache_[*rit];
       if (e.row_limit != 0 && pending_in_range) continue;
-      // A limited window holds K rows adjacent to one endpoint: forward from
+      // A limited entry holds K rows adjacent to one endpoint: forward from
       // start_key (equal here by index key), reverse before end_key. Serving a
-      // reverse window at a different end reads as EOF over rows it never held.
+      // reverse entry at a different end reads as EOF over rows it never held.
       if (e.row_limit != 0 && e.reverse_scan && end_key != e.end_key) continue;
       if (e.reverse_scan == reverse_scan && e.row_limit == row_limit &&
           end_key <= e.end_key) {
-        // Copy and trim because the staged group may cover a wider range.
-        LocalRangeScanEntry cached = e;
+        // Copy and trim because the cached group may cover a wider range.
+        RangeScanCacheEntry cached = e;
         cached.start_key = start_key;
         cached.end_key = end_key;
         cached.row_limit = row_limit;
@@ -1159,7 +1160,7 @@ HeliosTransaction::lookup_range_scan_cache(
     const bool same_table = it->table_name == table_name;
     const bool same_direction = it->reverse_scan == reverse_scan;
     const bool same_limit = it->row_limit == row_limit;
-    // A limited window is anchored at one endpoint and cannot serve a request
+    // A limited entry is anchored at one endpoint and cannot serve a request
     // that moves it. Forward needs the same start and may narrow the end,
     // reverse the same end and may raise the start.
     const bool anchored =
@@ -1168,7 +1169,7 @@ HeliosTransaction::lookup_range_scan_cache(
     const bool covers_range =
         it->start_key <= start_key && end_key <= it->end_key;
     if (same_table && same_direction && same_limit && anchored && covers_range) {
-      LocalRangeScanEntry cached = *it;
+      RangeScanCacheEntry cached = *it;
       cached.start_key = start_key;
       cached.end_key = end_key;
       cached.row_limit = row_limit;
@@ -1177,8 +1178,8 @@ HeliosTransaction::lookup_range_scan_cache(
     }
   }
 
-  // An unlimited request may be served by a limited window only over the same
-  // bounds and only when the caller can fetch the rest; the window's own limit
+  // An unlimited request may be served by a limited entry only over the same
+  // bounds and only when the caller can fetch the rest; the entry's own limit
   // is what gets recorded.
   if (allow_truncated && row_limit == 0 && !reverse_scan && !pending_in_range) {
     auto limited = range_scan_start_index_.find(
@@ -1189,7 +1190,7 @@ HeliosTransaction::lookup_range_scan_cache(
         const auto& e = range_scan_cache_[*rit];
         if (e.row_limit > 0 && !e.reverse_scan && e.start_key == start_key &&
             e.end_key == end_key) {
-          LocalRangeScanEntry cached = e;
+          RangeScanCacheEntry cached = e;
           cached.truncated = (e.rows.size() >= e.row_limit);
           return cached;
         }
@@ -1201,7 +1202,7 @@ HeliosTransaction::lookup_range_scan_cache(
 }
 
 void HeliosTransaction::trim_range_entry(
-    LocalRangeScanEntry& entry, const std::string& start_key,
+    RangeScanCacheEntry& entry, const std::string& start_key,
     const std::string& end_key) {
   std::vector<std::pair<std::string, std::string>> rows;
   std::vector<uint64_t> row_tids;
@@ -1218,7 +1219,7 @@ void HeliosTransaction::trim_range_entry(
 }
 
 void HeliosTransaction::trim_secondary_entry(
-    LocalSecondaryScanEntry& entry, const std::string& start_key,
+    SecondaryScanCacheEntry& entry, const std::string& start_key,
     const std::string& end_key) {
   std::vector<std::string> secondary_keys;
   std::vector<std::string> primary_keys;
@@ -1235,20 +1236,20 @@ void HeliosTransaction::trim_secondary_entry(
   entry.primary_keys = std::move(primary_keys);
 }
 
-std::optional<HeliosTransaction::LocalSecondaryScanEntry>
+std::optional<HeliosTransaction::SecondaryScanCacheEntry>
 HeliosTransaction::lookup_secondary_scan_cache(
     const std::string& table_name, const std::string& index_name,
     const std::string& start_key, const std::string& end_key,
     bool reverse_scan, uint64_t row_limit) const {
-  // A limited window holds the first entries the storage had, so an entry of
-  // this transaction inside the range could belong in it. An unlimited one
+  // A limited entry holds the first keys the storage had, so a key of this
+  // transaction inside the range could belong in it. An unlimited one
   // merges cleanly.
   const bool pending_in_range =
       row_limit == 0 ? false
                      : has_pending_secondary_ops_in_range(
                            table_name, index_name, start_key, end_key);
 
-  // Grouped for_each secondary probes are staged by exact start key. Try that
+  // Grouped for_each secondary probes are cached by exact start key. Try that
   // index before falling back to the wider secondary-cache scan below.
   auto idx_it = secondary_scan_start_index_.find(
       scan_cache_index_key(table_name, index_name, start_key));
@@ -1257,14 +1258,14 @@ HeliosTransaction::lookup_secondary_scan_cache(
          ++rit) {
       const auto& e = secondary_scan_cache_[*rit];
       if (e.row_limit != 0 && pending_in_range) continue;
-      // A limited window holds K entries adjacent to one endpoint, so a
-      // reverse window at another end would report an end it never held.
+      // A limited entry holds K keys adjacent to one endpoint, so a reverse
+      // entry at another end would report an end it never held.
       if (e.row_limit != 0 && e.reverse_scan && end_key != e.end_key) continue;
-      // A window holds its keys in its own direction, so only a request of
+      // An entry holds its keys in its own direction, so only a request of
       // that direction can consume it in order.
       if (e.row_limit == row_limit && end_key <= e.end_key &&
           e.reverse_scan == reverse_scan) {
-        LocalSecondaryScanEntry cached = e;
+        SecondaryScanCacheEntry cached = e;
         cached.start_key = start_key;
         cached.end_key = end_key;
         cached.row_limit = row_limit;
@@ -1280,7 +1281,7 @@ HeliosTransaction::lookup_secondary_scan_cache(
     const bool same_index =
         it->table_name == table_name && it->index_name == index_name;
     const bool same_limit = it->row_limit == row_limit;
-    // A limited window is anchored at one endpoint and cannot serve a request
+    // A limited entry is anchored at one endpoint and cannot serve a request
     // that moves it. Forward needs the same start and may narrow the end,
     // reverse the same end and may raise the start.
     const bool anchored =
@@ -1290,7 +1291,7 @@ HeliosTransaction::lookup_secondary_scan_cache(
         it->start_key <= start_key && end_key <= it->end_key;
     if (same_index && same_limit && anchored && covers_range &&
         it->reverse_scan == reverse_scan) {
-      LocalSecondaryScanEntry cached = *it;
+      SecondaryScanCacheEntry cached = *it;
       cached.start_key = start_key;
       cached.end_key = end_key;
       cached.row_limit = row_limit;
@@ -1332,7 +1333,7 @@ bool HeliosTransaction::end_transaction(bool *transport_error,
       if (duplicate_key != nullptr) *duplicate_key = true;
     }
     if (!committed && !abort_detail.empty()) {
-      rpc_trace_.record_local_view("abort_validate_" + abort_detail);
+      rpc_trace_.record_event("abort_validate_" + abort_detail);
     }
   }
   if (!committed) {

@@ -83,9 +83,9 @@ void TxRpcTrace::start(std::thread::id tid) {
   started_wall_ = std::chrono::system_clock::now();
   rpcs_.clear();
   statements_.clear();
-  local_view_entries_.clear();
+  events_.clear();
   by_type_.clear();
-  local_view_by_kind_.clear();
+  event_counts_.clear();
 }
 
 void TxRpcTrace::on_stmt(const std::string& sql) {
@@ -132,20 +132,20 @@ void TxRpcTrace::record(RpcOp type, uint64_t us, uint32_t req_b,
   a.resp_b += resp_b;
 }
 
-void TxRpcTrace::record_local_view(const std::string& kind) {
+void TxRpcTrace::record_event(const std::string& kind) {
   if (!active_) return;
   const uint64_t off = std::chrono::duration_cast<std::chrono::microseconds>(
                            std::chrono::steady_clock::now() - started_)
                            .count();
 
-  LocalViewEntry e;
+  TraceEvent e;
   e.kind = kind;
   e.off_us = off;
   e.stmt_idx = statements_.empty()
                    ? UINT32_MAX
                    : static_cast<uint32_t>(statements_.size() - 1);
-  local_view_entries_.push_back(std::move(e));
-  local_view_by_kind_[kind]++;
+  events_.push_back(std::move(e));
+  event_counts_[kind]++;
 }
 
 std::string TxRpcTrace::finalize_jsonl(bool committed) {
@@ -204,9 +204,9 @@ std::string TxRpcTrace::finalize_jsonl(bool committed) {
   }
   os << ']';
 
-  os << ",\"local_view_events\":[";
-  for (size_t i = 0; i < local_view_entries_.size(); ++i) {
-    const auto& e = local_view_entries_[i];
+  os << ",\"events\":[";
+  for (size_t i = 0; i < events_.size(); ++i) {
+    const auto& e = events_[i];
     if (i > 0) os << ',';
     os << '{'
        << "\"i\":" << i
@@ -236,9 +236,9 @@ std::string TxRpcTrace::finalize_jsonl(bool committed) {
   }
   os << '}';
 
-  os << ",\"summary_local_view\":{";
+  os << ",\"summary_events\":{";
   bool first_local = true;
-  for (const auto& kv : local_view_by_kind_) {
+  for (const auto& kv : event_counts_) {
     if (!first_local) os << ',';
     first_local = false;
     os << '"' << json_escape(kv.first, 128) << "\":" << kv.second;

@@ -28,7 +28,7 @@
 // Supported actions:
 //   sleep:<ms>
 //     Sleeps, capped at 10000 ms. <ms> is decimal digits only. Orders
-//     nothing: it makes a window wider, which is enough to provoke a race
+//     nothing: it widens the race, which is enough to provoke it
 //     but never enough to prove an order.
 //   arrive_and_wait:<arrived_write_fd>:<release_read_fd>
 //     Writes one byte to the first descriptor and blocks until one byte can be

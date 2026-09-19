@@ -341,13 +341,14 @@ void maybe_prefetch_for_transaction(THD *thd,
 }
 
 // Build the read plan from the given QEP root and run it in one prefetch RPC.
-static int autogen_and_execute_prefetch(THD *thd, AccessPath *root,
+static int compile_and_execute_prefetch(THD *thd, AccessPath *root,
                                         HeliosTransaction *tx,
                                         bool include_inner_units = false) {
   std::vector<HeliosProxy::ReadPlanStep> steps;
-  // A staged scan carries key bounds and a LIMIT; the commit replays the range
-  // without a filter. A shape autogen cannot stage takes the row path.
-  if (!autogen_read_plan_from_qep(thd, root, &steps, include_inner_units)) {
+  // A cached scan carries key bounds and a LIMIT; the commit revalidates the
+  // range without a filter. A shape the read-plan compiler cannot handle
+  // takes the row path.
+  if (!compile_read_plan_from_qep(thd, root, &steps, include_inner_units)) {
     return 0;
   }
   if (steps.empty()) return 0;
@@ -385,16 +386,16 @@ static AccessPath *table_unit_plan_root(TABLE *table) {
   return nullptr;
 }
 
-static void sync_autogen_statement(THD *thd, HeliosTransaction *tx) {
+static void sync_stmt_plan(THD *thd, HeliosTransaction *tx) {
   const uint64_t query_id =
       (thd != nullptr) ? static_cast<uint64_t>(thd->query_id) : 0;
-  if (tx->autogen_query_id() != query_id) {
-    tx->reset_autogen_for_statement(query_id);
+  if (tx->stmt_plan_query_id() != query_id) {
+    tx->reset_stmt_plan(query_id);
   }
 }
 
 // True for a single-table UPDATE/DELETE on the pre-iterator executor, where
-// no JOIN/root AccessPath exists for QEP autogen to read.
+// no JOIN/root AccessPath exists for the read-plan compiler to read.
 static bool is_single_table_dml_without_qep(THD *thd) {
   if (thd == nullptr || thd->lex == nullptr || thd->lex->unit == nullptr) {
     return false;
@@ -410,7 +411,7 @@ static bool is_single_table_dml_without_qep(THD *thd) {
 }
 
 // Return why a single-table DML shape (extra tables, subquery, ORDER BY/LIMIT,
-// partitioning, triggers) cannot be served by one staged range; nullptr when
+// partitioning, triggers) cannot be served by one cached range; nullptr when
 // the shape is safe.
 static const char *single_table_dml_shape_rejection(THD *thd, TABLE *table) {
   if (thd == nullptr || thd->lex == nullptr || thd->lex->unit == nullptr ||
@@ -453,55 +454,55 @@ int maybe_prefetch_for_statement(THD *thd, HeliosTransaction *tx,
   if (tx == nullptr || srv_read_path != kReadPathPlan) return 0;
   if (tx->tx_plan_used()) return 0;  // tx-scoped plan covers it
 
-  sync_autogen_statement(thd, tx);
+  sync_stmt_plan(thd, tx);
 
   AccessPath *stmt_root = statement_plan_root(thd);
   if (stmt_root != nullptr) {
-    if (tx->autogen_stmt_resolved()) return 0;  // already done this statement
-    tx->mark_autogen_stmt_resolved();
+    if (tx->stmt_prefetch_done()) return 0;  // already done this statement
+    tx->mark_stmt_prefetch_done();
 
     if (!thd_can_use_prefetch(thd)) return 0;
 
-    // Statement-level staging also sweeps Item-embedded subquery plan trees
+    // The statement's plan also sweeps Item-embedded subquery plan trees
     // that are invisible to the main-tree leaf walk.
-    return autogen_and_execute_prefetch(thd, stmt_root, tx,
+    return compile_and_execute_prefetch(thd, stmt_root, tx,
                                         /*include_inner_units=*/true);
   }
 
   // No statement root yet: MySQL is evaluating a subquery before the outer
-  // plan is built. Stage that subquery's own plan once; the full statement is
-  // still staged later when outer execution starts.
+  // plan is built. Run that subquery's own plan once; the full statement is
+  // still cached later when outer execution starts.
   AccessPath *unit_root = table_unit_plan_root(table);
   if (unit_root == nullptr) {
-    if (tx->autogen_stmt_resolved()) return 0;
-    tx->mark_autogen_stmt_resolved();
+    if (tx->stmt_prefetch_done()) return 0;
+    tx->mark_stmt_prefetch_done();
     return 0;
   }
-  if (tx->autogen_root_staged(unit_root)) return 0;
-  tx->mark_autogen_root_staged(unit_root);
+  if (tx->has_stmt_plan_root(unit_root)) return 0;
+  tx->note_stmt_plan_root(unit_root);
 
   if (!thd_can_use_prefetch(thd)) return 0;
 
-  return autogen_and_execute_prefetch(thd, unit_root, tx);
+  return compile_and_execute_prefetch(thd, unit_root, tx);
 }
 
-// Gate for the handler entry points: true when autogen must defer to the
-// handler index access, marking it handler-deferred on the first call.
+// Gate for the handler entry points: true when the read-plan compiler must
+// defer to the handler index access, marked on the first call.
 bool prefetch_needs_single_table_dml_handler(THD *thd,
                                              HeliosTransaction *tx) {
   if (tx == nullptr || srv_read_path != kReadPathPlan || tx->tx_plan_used()) {
     return false;
   }
-  sync_autogen_statement(thd, tx);
-  if (tx->autogen_stmt_resolved()) return false;
-  if (tx->is_autogen_stmt_handler_deferred()) return true;
+  sync_stmt_plan(thd, tx);
+  if (tx->stmt_prefetch_done()) return false;
+  if (tx->single_table_dml_deferred()) return true;
   if (!is_single_table_dml_without_qep(thd)) return false;
-  tx->mark_autogen_stmt_handler_deferred();
+  tx->mark_single_table_dml_deferred();
   return true;
 }
 
-// Build and stage a single-table UPDATE/DELETE plan from its first
-// handler index access, once per statement. A shape one staged range cannot
+// Build and run a single-table UPDATE/DELETE plan from its first
+// handler index access, once per statement. A shape one cached range cannot
 // cover is left to the row path.
 int maybe_prefetch_for_single_table_dml_handler(
     THD *thd, HeliosTransaction *tx, TABLE *table, uint index,
@@ -510,16 +511,16 @@ int maybe_prefetch_for_single_table_dml_handler(
     return 0;
   }
 
-  sync_autogen_statement(thd, tx);
-  if (tx->autogen_stmt_resolved()) return 0;
-  tx->mark_autogen_stmt_handler_deferred();
-  tx->mark_autogen_stmt_resolved();
+  sync_stmt_plan(thd, tx);
+  if (tx->stmt_prefetch_done()) return 0;
+  tx->mark_single_table_dml_deferred();
+  tx->mark_stmt_prefetch_done();
 
   if (!is_single_table_dml_without_qep(thd)) return 0;
   if (single_table_dml_shape_rejection(thd, table) != nullptr) return 0;
 
   std::vector<HeliosProxy::ReadPlanStep> steps;
-  if (!autogen_read_plan_from_index_search(thd, table, index, search, &steps)) {
+  if (!compile_read_plan_for_single_table_dml(thd, table, index, search, &steps)) {
     return 0;
   }
 
@@ -529,22 +530,22 @@ int maybe_prefetch_for_single_table_dml_handler(
 
 int maybe_prefetch_for_index_tail(THD *thd, HeliosTransaction *tx,
                                   const std::string &table_key,
-                                  uint64_t window_rows) {
+                                  uint64_t scan_limit) {
   if (tx == nullptr || srv_read_path != kReadPathPlan) return 0;
   if (tx->tx_plan_used()) return 0;
 
-  sync_autogen_statement(thd, tx);
-  if (tx->autogen_tail_staged(table_key)) return 0;
-  tx->mark_autogen_tail_staged(table_key);
+  sync_stmt_plan(thd, tx);
+  if (tx->has_index_tail_fetch(table_key)) return 0;
+  tx->note_index_tail_fetch(table_key);
 
   // One plain primary scan step: last-N of the whole range. The server echoes
-  // the requested bounds as the staged entry's range, so the handler's
+  // the requested bounds as the cache entry's range, so the handler's
   // ("", sentinel, reverse, N) lookup matches it exactly.
   HeliosProxy::ReadPlanStep step;
   step.table_name = table_key;
   step.is_scan = true;
   step.reverse_scan = true;
-  step.scan_limit = window_rows;
+  step.scan_limit = scan_limit;
   step.end_key_prefix = key_pack::scan_end_sentinel();
 
   std::vector<HeliosProxy::ReadPlanStep> steps;

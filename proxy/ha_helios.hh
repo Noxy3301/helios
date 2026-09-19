@@ -137,7 +137,7 @@ RangeScanLimit range_scan_limit_for_order(THD *thd, const KEY *key,
 extern bool srv_stats_drift_refresh;
 
 // Where a statement's reads come from: kReadPathRow sends one request per
-// handler read, kReadPathPlan stages what it can through tx_execute_read_plan
+// handler read, kReadPathPlan caches what it can through tx_execute_read_plan
 // and sends the rest as they happen.
 enum ReadPath { kReadPathRow = 0, kReadPathPlan = 1 };
 extern ulong srv_read_path;
@@ -185,9 +185,9 @@ private:
   uint current_position_in_index_;
   std::vector<std::string> scanned_keys_;
   std::vector<std::vector<std::byte>> scanned_values_;
-  // Row cache so the rnd_pos() re-reads after an ORDER BY sort cost no RPC.
-  // Populated during rnd_next()/materialize_scan(), cleared on next rnd_init().
-  std::unordered_map<std::string, size_t> scan_cache_;  // primary key -> index in scanned_values_
+  // Scan buffer so the rnd_pos() re-reads after an ORDER BY sort cost no RPC.
+  // Populated during rnd_next()/fill_scan_buffer(), cleared on next rnd_init().
+  std::unordered_map<std::string, size_t> scan_buffer_;  // primary key -> index in scanned_values_
   std::vector<std::string> secondary_index_results_;
   std::vector<std::string> secondary_index_payloads_;
 
@@ -264,12 +264,12 @@ private:
   std::string extract_primary_key_from_ref(const uchar *pos) const;
   int generate_hidden_primary_key(HeliosTransaction *tx, std::string *key);
   std::string serialize_hidden_primary_key(uint64_t row_id) const;
-  bool materialize_scan();
+  bool fill_scan_buffer();
 
   // Refill the rows buffered for index_next()/index_prev().
   bool refill_index_cursor(HeliosTransaction *tx);
-  // Materialize the rest of a range whose staged window ran out. False when
-  // the range really ended (or the transaction is gone).
+  // Fetch the rest of a range whose partial scan result ran out. False when the
+  // range really ended (or the transaction is gone).
   bool refill_index_scan(HeliosTransaction *tx);
 
   void reset_index_search_buffers();
@@ -303,7 +303,8 @@ public:
     implements. The current table flags are documented in handler.h
   */
   // HA_BLOCK_CONST_TABLE keeps equality lookups out of JOIN::optimize, where
-  // no AccessPath exists for autogen to stage, and demotes them to JT_EQ_REF.
+  // no AccessPath exists for the read-plan compiler, and demotes them to
+  // JT_EQ_REF.
   ulonglong table_flags() const override {
     return HA_BINLOG_ROW_CAPABLE | HA_BLOCK_CONST_TABLE;
   }
@@ -358,7 +359,7 @@ public:
   */
   double scan_time() override
   {
-    // Materializing all matches costs one RPC; NDB charges records * 1000
+    // Fetching all matching rows costs one RPC; NDB charges records * 1000
     // (storage/ndb/plugin/ha_ndbcluster.cc:7197).
     return (double)stats.records * 10.0 + 10;
   }
@@ -368,7 +369,7 @@ public:
   */
   double read_time(uint index, uint ranges, ha_rows rows) override
   {
-    // Cost is one RPC per index lookup plus the materialized rows;
+    // Cost is one RPC per index lookup plus the rows it fetches;
     // batch_fetch_secondary_payloads gives PK and secondary the same shape.
     return (double)ranges * 1.0 + (double)rows * 0.5;
   }
@@ -378,8 +379,8 @@ public:
    *
    * @details The join planner uses these methods for scan-vs-ref and
    * join-order decisions. Helios does not pay page-I/O cost like InnoDB;
-   * the dominant costs are RPC round trips, transferred bytes, row
-   * materialization, and batched remote probes.
+   * the dominant costs are RPC round trips, transferred bytes, remote row
+   * fetches, and batched remote probes.
    *
    *   scan : io = C_rpc + bytes*C_byte               ; cpu = rows*(C_row + C_remote)
    *   ref  : io = ranges*(C_rpc/batch) + bytes*C_byte ; cpu = rows*(C_probe + C_row)
@@ -409,12 +410,12 @@ public:
   static constexpr double kCostLookup = 8.0;
 
   /**
-   * @brief Return whether read_cost() should charge remote row materialization.
+   * @brief Return whether read_cost() should charge the remote row fetch.
    *
    * The default is true. It returns false for clustered primary-key access,
    * where rows are not fetched one-by-one by a secondary-key-to-PK lookup.
    */
-  bool should_charge_materialization_cost(uint index, double rows) const;
+  bool should_charge_remote_row_cost(uint index, double rows) const;
 
   double helios_row_bytes() const {
     // stats.mean_rec_length is set in info() from table->s->reclength (>=100).
@@ -438,7 +439,7 @@ public:
     const double rows = (double)stats.records;
     const double bytes = rows * helios_row_bytes();
     c.add_io(kCostRpc + bytes * kCostByte);      // 1 scan RPC + transfer wait
-    c.add_cpu(rows * (kCostRow + kCostRemote));  // materialize + remote scan CPU
+    c.add_cpu(rows * (kCostRow + kCostRemote));  // row fetch + remote scan CPU
     return c;
   }
 
@@ -448,7 +449,7 @@ public:
 
     // read_cost() is the non-covering path: the index narrows keys, then each
     // matching base row is fetched by PK. Covering scans use index_scan_cost().
-    if (should_charge_materialization_cost(index, rows)) {
+    if (should_charge_remote_row_cost(index, rows)) {
       c.add_io(std::ceil(rows / kCostBatch) * kCostRpc);
       c.add_cpu(rows * kCostLookup);
     }
@@ -582,7 +583,7 @@ public:
    * On the row read path, these methods clear HA_MRR_USE_DEFAULT_IMPL for
    * primary-key lookup ranges so multi_range_read_init() can batch all keys
    * into one Helios RPC. The plan path keeps MySQL's default DS-MRR path,
-   * where a staged window serves the rows.
+   * where the index scan cache serves the rows.
    */
   ha_rows multi_range_read_info_const(
       uint keyno, RANGE_SEQ_IF *seq, void *seq_init_param, uint n_ranges,
@@ -621,7 +622,7 @@ private:
   std::vector<MrrBufferedRow> mrr_buffer_;
   size_t mrr_buffer_pos_ = 0;
   bool mrr_use_batch_ = false;
-  // True when this statement's reads are staged through a read plan, so
+  // True when this statement's reads come from a read plan, so
   // the handler's own batched MRR is not the path the rows arrive on.
   static bool statement_uses_read_plan(THD *thd);
   static std::string server_connection_host();
@@ -689,9 +690,9 @@ private:
   int execute_plan(uchar *buf, HeliosTransaction *tx);
   int execute_index_first(uchar *buf, HeliosTransaction *tx);
   int execute_unique_point(uchar *buf, HeliosTransaction *tx);
-  int execute_same_key_materialize(uchar *buf, HeliosTransaction *tx);
+  int execute_same_key(uchar *buf, HeliosTransaction *tx);
   int execute_prefix_first(uchar *buf, HeliosTransaction *tx);
-  int execute_range_materialize(uchar *buf, HeliosTransaction *tx);
+  int execute_range(uchar *buf, HeliosTransaction *tx);
   int execute_prev_key(uchar *buf, HeliosTransaction *tx);
   int execute_prefix_last(uchar *buf, HeliosTransaction *tx);
   // Fetches the primary row of every key in secondary_index_results_ with one
@@ -737,10 +738,10 @@ private:
       const std::vector<std::pair<std::string, const KEY *>> &specs);
 
   /**
-   * @brief Backfill one unique secondary index serially via the staging path.
+   * @brief Backfill one unique secondary index serially via the write buffer.
    *
-   * @details Scans the table and commits in bounded chunks, keeping the staging
-   * commit path so the server's in-write duplicate check runs. Returns false on
+   * @details Scans the table and commits in bounded chunks, keeping the
+   * buffered commit path so the server's in-write duplicate check runs. Returns false on
    * any failure; the caller fails the ALTER.
    */
   bool backfill_unique_serial(const std::string &index_name,

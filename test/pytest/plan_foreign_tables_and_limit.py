@@ -38,7 +38,7 @@ def check(rows, errno, message, expected, label):
 
 
 def test_foreign_engine_leaves(cursor, db):
-    """A leaf of another engine must not be staged into the read plan."""
+    """A leaf of another engine must not be compiled into the read plan."""
     print("PLAN FOREIGN ENGINE LEAF TEST")
     cursor.execute(
         "CREATE TABLE fe_helios (id INT NOT NULL PRIMARY KEY, v INT NOT NULL) "
