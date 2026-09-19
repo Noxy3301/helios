@@ -35,8 +35,8 @@ MYSQL_PROTOBUF_GENERATE_CPP_LIBRARY(
 include_directories(${CMAKE_CURRENT_BINARY_DIR})
 
 set(HELIOS_SOURCES ha_helios.cc ha_helios.hh
-                      ha_helios_columnar.cc
-                      ha_helios_columnar.hh
+                      ha_helios_duckdb.cc
+                      ha_helios_duckdb.h
                       duckdb_request_builder.cc
                       duckdb_request_builder.hh
                       ddl.cc

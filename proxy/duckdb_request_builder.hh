@@ -7,8 +7,6 @@
 class THD;
 struct LEX;
 
-namespace helios_columnar {
-
 /**
  * @brief Builds the DuckDB executor request from MySQL's resolved statement.
  *
@@ -30,4 +28,3 @@ bool BuildDuckdbQueryRequest(
     Helios::Protocol::TxExecuteDuckdbQuery::Request* request,
     std::string* why);
 
-}  // namespace helios_columnar

@@ -160,7 +160,7 @@ class Database {
   pax::PaxTable *GetPaxTable(const std::string_view table_name);
 
   /**
-   * @brief Handle for one columnar read view.
+   * @brief Handle for one read view.
    *
    * @details snapshot_epoch `se` is the read view's serialization point:
    * commits with `epoch <= se` are visible; later ones resolve to epoch images.

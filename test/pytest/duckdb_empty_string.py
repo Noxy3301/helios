@@ -3,7 +3,7 @@
 The Helios packed row format packs a zero-length field with one marker byte,
 which a VARCHAR '' and a SQL NULL share. The null bitmap in field 0 of the row
 is what separates them, and the row path reads it (proxy/row_codec.cc). This
-file pins that the analytical path (SECONDARY_ENGINE=HELIOS_COLUMNAR,
+file pins that the analytical path (SECONDARY_ENGINE=HELIOS_DUCKDB,
 served by the DuckDB executor) agrees with it: WHERE c = '', WHERE c IS NULL,
 COUNT(c), GROUP BY c and the select list must return the same answers as the
 row path.
@@ -20,7 +20,7 @@ The concurrent scenario uses the pax_view.after_fence sync point that holds
 every OLAP read between its read view fence and its scan, so the writer
 commits inside the hold and its rows resolve through images. The test owns
 the local stack: it restarts it with the sync point armed and stops it
-afterwards, as columnar_midscan_preserve.py does.
+afterwards, as duckdb_midscan_preserve.py does.
 """
 
 import argparse
@@ -196,7 +196,7 @@ def create_table(cursor):
     cursor.execute(
         f"CREATE TABLE {TABLE} (id INT PRIMARY KEY, a VARCHAR(32), "
         "b VARCHAR(32) NOT NULL, c VARCHAR(32)) "
-        "ENGINE=Helios SECONDARY_ENGINE=HELIOS_COLUMNAR")
+        "ENGINE=Helios SECONDARY_ENGINE=HELIOS_DUCKDB")
     for row in ROWS:
         cursor.execute(f"INSERT INTO {TABLE} VALUES (%s, %s, %s, %s)", row)
     cursor.execute(f"ALTER TABLE {TABLE} SECONDARY_LOAD")

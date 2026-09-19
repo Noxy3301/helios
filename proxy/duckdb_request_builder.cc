@@ -24,7 +24,6 @@
 
 #include "helios_field_types.h"
 
-namespace helios_columnar {
 namespace {
 
 namespace pb = Helios::Protocol;
@@ -1215,5 +1214,3 @@ bool BuildDuckdbQueryRequest(THD* thd, LEX* lex,
         static_cast<uint32_t>(request->root().select_size()));
     return true;
 }
-
-}  // namespace helios_columnar

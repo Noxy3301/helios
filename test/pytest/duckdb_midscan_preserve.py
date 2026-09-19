@@ -1,4 +1,4 @@
-"""Columnar read view consistency for writes that land inside the scan.
+"""Read view consistency for writes that land inside the scan.
 
 quiescence_1sr_hole.py pins the two schedules whose write lands before the
 scan starts: the fence waits for the paused COMMIT (all-new), or the fence
@@ -198,7 +198,7 @@ def create_table(cursor, table):
     cursor.execute(
         f"CREATE TABLE {table} "
         "(id INT PRIMARY KEY, v INT, n INT NULL, s VARCHAR(255)) "
-        "ENGINE=Helios SECONDARY_ENGINE=HELIOS_COLUMNAR")
+        "ENGINE=Helios SECONDARY_ENGINE=HELIOS_DUCKDB")
     started = time.monotonic()
     for i in range(1, ROWS + 1):
         n = "NULL" if i % 2 == 0 else str(i)

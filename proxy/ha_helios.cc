@@ -549,9 +549,9 @@ static SYS_VAR *helios_system_variables[] = {
     MYSQL_SYSVAR(rpc_trace_path),
     nullptr};
 
-extern struct st_mysql_storage_engine helios_columnar_storage_engine;
-extern int helios_columnar_init(void *p);
-extern int helios_columnar_deinit(void *p);
+extern struct st_mysql_storage_engine helios_duckdb_storage_engine;
+extern int helios_duckdb_init(void *p);
+extern int helios_duckdb_deinit(void *p);
 
 mysql_declare_plugin(helios){
     MYSQL_STORAGE_ENGINE_PLUGIN,
@@ -571,14 +571,14 @@ mysql_declare_plugin(helios){
 },
 {
     MYSQL_STORAGE_ENGINE_PLUGIN,
-    &helios_columnar_storage_engine,
-    "HELIOS_COLUMNAR",
+    &helios_duckdb_storage_engine,
+    "HELIOS_DUCKDB",
     PLUGIN_AUTHOR_ORACLE,
-    "Helios columnar secondary engine",
+    "Helios DuckDB secondary engine",
     PLUGIN_LICENSE_GPL,
-    helios_columnar_init,   /* Plugin Init */
+    helios_duckdb_init,   /* Plugin Init */
     nullptr,                   /* Plugin check uninstall */
-    helios_columnar_deinit, /* Plugin Deinit */
+    helios_duckdb_deinit, /* Plugin Deinit */
     0x0001 /* 0.1 */,
     nullptr, /* status variables */
     nullptr, /* system variables */

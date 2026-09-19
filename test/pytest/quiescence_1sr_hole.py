@@ -1,4 +1,4 @@
-"""Columnar read view consistency across commit row installs (1SR regression).
+"""Read view consistency across commit row installs (1SR regression).
 
 1SR (one-copy serializability with real-time order) requires every read to
 return a complete committed state and a read issued after a commit returns
@@ -15,8 +15,8 @@ racing:
     sync point set to sleep, so the install loop stays open between
     consecutive row installs; every commit path goes through it (see
     server/storage/src/util/debug_sync.h)
-  - FORCED SELECTs take the columnar offload through the executor, the only
-    columnar executor
+  - FORCED SELECTs take the secondary-engine offload through the DuckDB
+    executor, the only analytical executor
   - a writer thread signals right before COMMIT of a two-row-install
     transaction; the main thread then runs FORCED SELECTs while that
     COMMIT is in flight
@@ -214,7 +214,7 @@ def run_scenario(cursor, user, password, scenario):
     print(f"SCENARIO {scenario['name']}")
     cursor.execute(
         f"CREATE TABLE {table} (id INT PRIMARY KEY, v INT) "
-        "ENGINE=Helios SECONDARY_ENGINE=HELIOS_COLUMNAR"
+        "ENGINE=Helios SECONDARY_ENGINE=HELIOS_DUCKDB"
     )
     values = ", ".join(f"({k}, {v})" for k, v in BASE_ROWS.items())
     cursor.execute(f"INSERT INTO {table} VALUES {values}")
@@ -367,7 +367,7 @@ def run_read_view_before_write(cursor, user, password, scenario):
     print(f"SCENARIO read-view-before-write/{scenario['name']}")
     cursor.execute(
         f"CREATE TABLE {table} (id INT PRIMARY KEY, v INT) "
-        "ENGINE=Helios SECONDARY_ENGINE=HELIOS_COLUMNAR"
+        "ENGINE=Helios SECONDARY_ENGINE=HELIOS_DUCKDB"
     )
     values = ", ".join(f"({k}, {v})" for k, v in BASE_ROWS.items())
     cursor.execute(f"INSERT INTO {table} VALUES {values}")

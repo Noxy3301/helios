@@ -1,6 +1,6 @@
 /**
  * @file server/storage/src/pax/epoch_image_buffer.h
- * The epoch images a writer preserves for the slots a columnar read view is
+ * The epoch images a writer preserves for the slots a read view is
  * looking at.
  */
 
@@ -47,7 +47,7 @@ struct GroupImageState {
 };
 
 /**
- * @brief The epoch images that keep a columnar read view consistent.
+ * @brief The epoch images that keep a read view consistent.
  *
  * @details An epoch image is the row a slot held before an install made
  * under a later epoch. Each open read view registers its snapshot epoch

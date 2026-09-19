@@ -9,7 +9,7 @@
 // bridge_mem_limit bounds DuckDB's operator memory (a byte count, K/M/G
 // accepted); unset is DuckDB's own default.
 //
-// Consistency: the request runs against a columnar read view with snapshot
+// Consistency: the request runs against a read view with snapshot
 // epoch se (Database::OpenPaxView). A slot that holds an epoch image resolves
 // through it (the oldest image with epoch > se is the value the slot held at
 // se); every other slot is bulk-unpacked in place. Before each output chunk is
@@ -80,7 +80,7 @@ uint32_t LengthPrefixBytes(uint32_t length) {
 
 /**
  * @brief Appends one field in the Helios packed row format (matches
- * proxy/ha_helios_columnar.cc's unpack_row_fields).
+ * proxy/ha_helios_duckdb.cc's unpack_row_fields).
  *
  * @details One byte length-width tag (0xFF for a field with no payload),
  * then that many little-endian length bytes, then the payload. A zero-length
@@ -1563,7 +1563,7 @@ void execute_duckdb_query(
 
     if (!db->PaxViewValid(read_view)) {
       response->set_ok(false);
-      response->set_error("columnar read view expired during execution");
+      response->set_error("read view expired during execution");
       return;
     }
     if (debug_resolved) {

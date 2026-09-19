@@ -1,4 +1,4 @@
-#include "ha_helios_columnar.hh"
+#include "ha_helios_duckdb.h"
 
 #include <algorithm>
 #include <cassert>
@@ -41,8 +41,6 @@
 namespace helios {
 std::shared_ptr<HeliosProxy> acquire_shared_proxy(THD *thd);
 }  // namespace helios
-
-namespace helios_columnar {
 
 namespace {
 
@@ -88,35 +86,35 @@ class LoadedTables {
 
 LoadedTables *loaded_tables = nullptr;
 
-struct ColumnarFailReason {
+struct DuckdbFailReason {
   THD *thd = nullptr;
   query_id_t query_id = 0;
   std::string reason;
 };
 
-thread_local ColumnarFailReason columnar_fail_reason;
+thread_local DuckdbFailReason duckdb_fail_reason;
 
-const char *GetColumnarFailReason(THD *thd) {
-  if (thd == nullptr || columnar_fail_reason.thd != thd ||
-      columnar_fail_reason.query_id != thd->query_id ||
-      columnar_fail_reason.reason.empty()) {
+const char *GetDuckdbFailReason(THD *thd) {
+  if (thd == nullptr || duckdb_fail_reason.thd != thd ||
+      duckdb_fail_reason.query_id != thd->query_id ||
+      duckdb_fail_reason.reason.empty()) {
     return nullptr;
   }
-  return columnar_fail_reason.reason.c_str();
+  return duckdb_fail_reason.reason.c_str();
 }
 
-void SetColumnarFailReason(THD *thd, const char *reason) {
+void SetDuckdbFailReason(THD *thd, const char *reason) {
   if (reason == nullptr) {
-    columnar_fail_reason = {};
+    duckdb_fail_reason = {};
   } else {
-    columnar_fail_reason.thd = thd;
-    columnar_fail_reason.query_id = thd == nullptr ? 0 : thd->query_id;
-    columnar_fail_reason.reason.assign(reason);
+    duckdb_fail_reason.thd = thd;
+    duckdb_fail_reason.query_id = thd == nullptr ? 0 : thd->query_id;
+    duckdb_fail_reason.reason.assign(reason);
   }
 }
 
-bool RaiseColumnarError(THD *thd, const char *message) {
-  SetColumnarFailReason(thd, message);
+bool RaiseDuckdbError(THD *thd, const char *message) {
+  SetDuckdbFailReason(thd, message);
   my_error(ER_SECONDARY_ENGINE_PLUGIN, MYF(0), message);
   return true;
 }
@@ -125,9 +123,9 @@ bool RaiseColumnarError(THD *thd, const char *message) {
 // The override executor only needs Item instances that carry computed values
 // through Query_result::send_data(), so this class mirrors the prototype type
 // metadata while storing the server-produced value as text.
-class ItemColumnarValue final : public Item_string {
+class ItemDuckdbValue final : public Item_string {
  public:
-  explicit ItemColumnarValue(const Item *prototype)
+  explicit ItemDuckdbValue(const Item *prototype)
       : Item_string("", 0, prototype->collation.collation) {
     set_data_type(prototype->data_type());
     decimals = prototype->decimals;
@@ -171,7 +169,7 @@ class ItemColumnarValue final : public Item_string {
 // Statement-local state owned by LEX::secondary_engine_execution_context.
 // external_lock records the DuckDB executor request; execute_duckdb_query
 // consumes it after MySQL calls JOIN::override_executor_func.
-class ColumnarExecutionContext : public Secondary_engine_execution_context {
+class DuckdbExecutionContext : public Secondary_engine_execution_context {
  public:
   bool BestPlanSoFar(const JOIN &join, double cost) {
     // A second join-order search on the same JOIN resets join.best_read to
@@ -209,7 +207,7 @@ class ColumnarExecutionContext : public Secondary_engine_execution_context {
           OPTIMIZER_SWITCH_SUBQUERY_TO_DERIVED);
     thd->lex->m_subquery_to_derived_is_impossible = true;
   }
-  ~ColumnarExecutionContext() override {
+  ~DuckdbExecutionContext() override {
     if (restore_thd_ != nullptr) {
       restore_thd_->variables.optimizer_switch = saved_optimizer_switch_;
       restore_thd_->lex->m_subquery_to_derived_is_impossible = false;
@@ -351,37 +349,37 @@ bool RoundDecimalText(const char *ptr, size_t len, uint32_t target_scale,
  */
 bool execute_duckdb_query(JOIN *join, Query_result *result) {
   THD *thd = join->thd;
-  auto *ctx = static_cast<ColumnarExecutionContext *>(
+  auto *ctx = static_cast<DuckdbExecutionContext *>(
       thd->lex->secondary_engine_execution_context());
   if (ctx == nullptr || !ctx->duckdb_ready) {
-    return RaiseColumnarError(thd,
-                              "HELIOS_COLUMNAR: no duckdb executor plan");
+    return RaiseDuckdbError(thd,
+                              "HELIOS_DUCKDB: no duckdb executor plan");
   }
 
   std::shared_ptr<HeliosProxy> proxy = helios::acquire_shared_proxy(thd);
   if (!proxy) {
-    return RaiseColumnarError(thd, "HELIOS_COLUMNAR: no server connection");
+    return RaiseDuckdbError(thd, "HELIOS_DUCKDB: no server connection");
   }
 
   Helios::Protocol::TxExecuteDuckdbQuery::Response rpc;
   if (!proxy->tx_execute_duckdb_query(ctx->duckdb_request, &rpc) ||
       !rpc.ok()) {
     char message[192];
-    snprintf(message, sizeof(message), "HELIOS_COLUMNAR duckdb executor: %s",
+    snprintf(message, sizeof(message), "HELIOS_DUCKDB duckdb executor: %s",
              rpc.error().empty() ? "duckdb executor RPC failed"
                                  : rpc.error().c_str());
-    return RaiseColumnarError(thd, message);
+    return RaiseDuckdbError(thd, message);
   }
 
   mem_root_deque<Item *> output_items(thd->mem_root);
-  std::vector<ItemColumnarValue *> values;
+  std::vector<ItemDuckdbValue *> values;
   // Parallel to `values`: MySQL's authoritative decimal scale per output
   // expression, or DECIMAL_NOT_SPECIFIED for "don't touch". DuckDB returns
   // decimal-division results as DOUBLE text; RoundDecimalText reformats
   // those columns back to this scale.
   std::vector<uint32_t> target_scale;
   for (Item *item : VisibleFields(join->query_block->fields)) {
-    auto *value = new (thd->mem_root) ItemColumnarValue(item);
+    auto *value = new (thd->mem_root) ItemDuckdbValue(item);
     if (value == nullptr) return true;
     values.push_back(value);
     output_items.push_back(value);
@@ -400,9 +398,9 @@ bool execute_duckdb_query(JOIN *join, Query_result *result) {
   const size_t expected = 1 + values.size();
   for (const std::string &row : rpc.rows()) {
     if (!unpack_row_fields(row, &fields) || fields.size() != expected) {
-      return RaiseColumnarError(
+      return RaiseDuckdbError(
           thd,
-          "HELIOS_COLUMNAR duckdb executor: malformed row (DuckDB result "
+          "HELIOS_DUCKDB duckdb executor: malformed row (DuckDB result "
           "column count may not match the original SELECT list)");
     }
 
@@ -433,11 +431,11 @@ bool execute_duckdb_query(JOIN *join, Query_result *result) {
 }
 
 bool PrepareSecondaryEngine(THD *thd, LEX *lex) {
-  SetColumnarFailReason(thd, nullptr);
+  SetDuckdbFailReason(thd, nullptr);
   lex->add_statement_options(OPTION_NO_CONST_TABLES |
                              OPTION_NO_SUBQUERY_DURING_OPTIMIZATION);
 
-  auto *ctx = new (thd->mem_root) ColumnarExecutionContext;
+  auto *ctx = new (thd->mem_root) DuckdbExecutionContext;
   if (ctx == nullptr) return true;
   // Install first: set_... destroys any prior context, whose destructor
   // restores the switches this call is about to save.
@@ -447,27 +445,27 @@ bool PrepareSecondaryEngine(THD *thd, LEX *lex) {
 }
 
 bool OptimizeSecondaryEngine(THD *, LEX *lex) {
-  SetColumnarFailReason(lex->thd, nullptr);
-  auto *ctx = static_cast<ColumnarExecutionContext *>(
+  SetDuckdbFailReason(lex->thd, nullptr);
+  auto *ctx = static_cast<DuckdbExecutionContext *>(
       lex->secondary_engine_execution_context());
   if (ctx == nullptr) {
-    return RaiseColumnarError(
-        lex->thd, "HELIOS_COLUMNAR statement context is not available");
+    return RaiseDuckdbError(
+        lex->thd, "HELIOS_DUCKDB statement context is not available");
   }
 
   Query_block *query_block = lex->unit->first_query_block();
   JOIN *join = query_block != nullptr ? query_block->join : nullptr;
   if (join == nullptr) {
-    return RaiseColumnarError(lex->thd,
-                              "HELIOS_COLUMNAR unsupported shape: no JOIN");
+    return RaiseDuckdbError(lex->thd,
+                              "HELIOS_DUCKDB unsupported shape: no JOIN");
   }
 
   if (!ctx->request_build_attempted || !ctx->refusal.empty()) {
-    std::string message = "HELIOS_COLUMNAR duckdb-query: ";
+    std::string message = "HELIOS_DUCKDB duckdb-query: ";
     message.append(ctx->request_build_attempted
                        ? ctx->refusal
                        : std::string("request was not built before optimization"));
-    return RaiseColumnarError(lex->thd, message.c_str());
+    return RaiseDuckdbError(lex->thd, message.c_str());
   }
   ctx->duckdb_ready = true;
   join->override_executor_func = execute_duckdb_query;
@@ -530,25 +528,25 @@ bool CompareJoinCost(THD *thd, const JOIN &join, double optimizer_cost,
 
   // DisableSemijoin leaves every surviving subquery on the EXISTS
   // strategy, so its JOIN reaches this hook like any other.
-  auto *ctx = static_cast<ColumnarExecutionContext *>(
+  auto *ctx = static_cast<DuckdbExecutionContext *>(
       thd->lex->secondary_engine_execution_context());
   if (ctx == nullptr) return true;
   *cheaper = ctx->BestPlanSoFar(join, optimizer_cost);
   return false;
 }
 
-handler *CreateColumnarHandler(handlerton *hton, TABLE_SHARE *table_share,
+handler *CreateDuckdbHandler(handlerton *hton, TABLE_SHARE *table_share,
                                bool, MEM_ROOT *mem_root) {
-  return new (mem_root) ha_helios_columnar(hton, table_share);
+  return new (mem_root) ha_helios_duckdb(hton, table_share);
 }
 
 }  // namespace
 
-ha_helios_columnar::ha_helios_columnar(handlerton *hton,
+ha_helios_duckdb::ha_helios_duckdb(handlerton *hton,
                                              TABLE_SHARE *table_share_arg)
     : handler(hton, table_share_arg) {}
 
-int ha_helios_columnar::open(const char *, int, unsigned int,
+int ha_helios_duckdb::open(const char *, int, unsigned int,
                                 const dd::Table *) {
   THR_LOCK *lock =
       loaded_tables->lock(table_share->db.str, table_share->table_name.str);
@@ -561,7 +559,7 @@ int ha_helios_columnar::open(const char *, int, unsigned int,
   return 0;
 }
 
-int ha_helios_columnar::info(unsigned int flags) {
+int ha_helios_duckdb::info(unsigned int flags) {
   // Statistics come from the primary engine when it is available.
   handler *primary = ha_get_primary_handler();
   if (primary == nullptr) return 0;
@@ -605,7 +603,7 @@ int ha_helios_columnar::info(unsigned int flags) {
   return 0;
 }
 
-ha_rows ha_helios_columnar::records_in_range(unsigned int index,
+ha_rows ha_helios_duckdb::records_in_range(unsigned int index,
                                                 key_range *min_key,
                                                 key_range *max_key) {
   handler *primary = ha_get_primary_handler();
@@ -614,7 +612,7 @@ ha_rows ha_helios_columnar::records_in_range(unsigned int index,
                                                         max_key);
 }
 
-unsigned long ha_helios_columnar::index_flags(unsigned int index,
+unsigned long ha_helios_duckdb::index_flags(unsigned int index,
                                                  unsigned int part,
                                                  bool all_parts) const {
   const handler *primary = ha_get_primary_handler();
@@ -628,9 +626,9 @@ unsigned long ha_helios_columnar::index_flags(unsigned int index,
 // Builds the request once per statement, at the only stock point after
 // resolution and before optimization. The outcome is recorded, not raised:
 // a non-zero return here reads as a lock error and aborts the statement.
-int ha_helios_columnar::external_lock(THD *thd, int lock_type) {
+int ha_helios_duckdb::external_lock(THD *thd, int lock_type) {
   if (lock_type == F_UNLCK) return 0;
-  auto *ctx = static_cast<ColumnarExecutionContext *>(
+  auto *ctx = static_cast<DuckdbExecutionContext *>(
       thd->lex->secondary_engine_execution_context());
   if (ctx == nullptr || ctx->request_build_attempted) return 0;
   ctx->request_build_attempted = true;
@@ -642,7 +640,7 @@ int ha_helios_columnar::external_lock(THD *thd, int lock_type) {
   return 0;
 }
 
-THR_LOCK_DATA **ha_helios_columnar::store_lock(THD *, THR_LOCK_DATA **to,
+THR_LOCK_DATA **ha_helios_duckdb::store_lock(THD *, THR_LOCK_DATA **to,
                                                   thr_lock_type lock_type) {
   if (lock_type != TL_IGNORE && lock_data_.type == TL_UNLOCK)
     lock_data_.type = lock_type;
@@ -650,13 +648,13 @@ THR_LOCK_DATA **ha_helios_columnar::store_lock(THD *, THR_LOCK_DATA **to,
   return to;
 }
 
-int ha_helios_columnar::load_table(const TABLE &table) {
+int ha_helios_duckdb::load_table(const TABLE &table) {
   assert(table.file != nullptr);
   loaded_tables->add(table.s->db.str, table.s->table_name.str);
   return 0;
 }
 
-int ha_helios_columnar::unload_table(const char *db_name,
+int ha_helios_duckdb::unload_table(const char *db_name,
                                         const char *table_name,
                                         bool error_if_not_loaded) {
   if (error_if_not_loaded &&
@@ -670,36 +668,34 @@ int ha_helios_columnar::unload_table(const char *db_name,
   return 0;
 }
 
-}  // namespace helios_columnar
-
-struct st_mysql_storage_engine helios_columnar_storage_engine = {
+struct st_mysql_storage_engine helios_duckdb_storage_engine = {
     MYSQL_HANDLERTON_INTERFACE_VERSION};
 
-int helios_columnar_init(void *p) {
-  helios_columnar::loaded_tables = new helios_columnar::LoadedTables();
+int helios_duckdb_init(void *p) {
+  loaded_tables = new LoadedTables();
 
   handlerton *hton = static_cast<handlerton *>(p);
-  hton->create = helios_columnar::CreateColumnarHandler;
+  hton->create = CreateDuckdbHandler;
   hton->state = SHOW_OPTION_YES;
   hton->flags = HTON_IS_SECONDARY_ENGINE;
   hton->db_type = DB_TYPE_UNKNOWN;
-  hton->prepare_secondary_engine = helios_columnar::PrepareSecondaryEngine;
-  hton->optimize_secondary_engine = helios_columnar::OptimizeSecondaryEngine;
-  hton->compare_secondary_engine_cost = helios_columnar::CompareJoinCost;
+  hton->prepare_secondary_engine = PrepareSecondaryEngine;
+  hton->optimize_secondary_engine = OptimizeSecondaryEngine;
+  hton->compare_secondary_engine_cost = CompareJoinCost;
   hton->secondary_engine_modify_access_path_cost =
-      helios_columnar::ModifyAccessPathCost;
+      ModifyAccessPathCost;
   hton->get_secondary_engine_offload_or_exec_fail_reason =
-      helios_columnar::GetColumnarFailReason;
+      GetDuckdbFailReason;
   hton->set_secondary_engine_offload_fail_reason =
-      helios_columnar::SetColumnarFailReason;
+      SetDuckdbFailReason;
   hton->secondary_engine_flags =
       MakeSecondaryEngineFlags(SecondaryEngineFlag::SUPPORTS_HASH_JOIN,
                                SecondaryEngineFlag::SUPPORTS_NESTED_LOOP_JOIN);
   return 0;
 }
 
-int helios_columnar_deinit(void *) {
-  delete helios_columnar::loaded_tables;
-  helios_columnar::loaded_tables = nullptr;
+int helios_duckdb_deinit(void *) {
+  delete loaded_tables;
+  loaded_tables = nullptr;
   return 0;
 }

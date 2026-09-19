@@ -69,7 +69,7 @@ echo "== [4/5] measurement conditions =="
 echo "== [5/5] secondary engine attach =="
 for t in customer lineitem nation orders part partsupp region supplier; do
   "$MYSQL" -u root --socket="$SOCKET" benchbase -e \
-    "ALTER TABLE $t SECONDARY_ENGINE = HELIOS_COLUMNAR; ALTER TABLE $t SECONDARY_LOAD;"
+    "ALTER TABLE $t SECONDARY_ENGINE = HELIOS_DUCKDB; ALTER TABLE $t SECONDARY_LOAD;"
 done
 
 echo "setup done"
