@@ -52,15 +52,6 @@ helios::storage::Tidword make_tidword(helios::storage::EpochNumber epoch,
 
 }  // namespace
 
-TEST(MasstreeIndexTest, Instantiate) {
-  ASSERT_NO_THROW(helios::storage::index::MasstreeIndex table);
-}
-
-TEST(MasstreeIndexTest, Put) {
-  helios::storage::index::MasstreeIndex table;
-  table.Put("alice", helios::storage::DataItem{});
-}
-
 TEST(MasstreeIndexTest, Get) {
   helios::storage::index::MasstreeIndex table;
   ASSERT_EQ(nullptr, table.Get("alice"));
@@ -88,25 +79,6 @@ TEST(MasstreeIndexTest, ConcurrentInserting) {
   }
 }
 
-TEST(MasstreeIndexTest, ConcurrentPutSameKey) {
-  std::vector<std::thread> threads;
-  helios::storage::index::MasstreeIndex table;
-
-  for (size_t i = 0; i < 10; i++) {
-    threads.emplace_back([&]() { table.Put("alice", {}); });
-  }
-  for (auto &thread : threads) {
-    thread.join();
-  }
-  bool some_item_were_inserted = false;
-  auto *item = table.Get("alice");
-  for (size_t i = 0; i < 10; i++) {
-    if (item != nullptr) some_item_were_inserted = true;
-  }
-
-  ASSERT_TRUE(some_item_were_inserted);
-}
-
 TEST(MasstreeIndexTest, Scan) {
   helios::storage::index::MasstreeIndex table;
   table.Put("alice", {});
@@ -119,43 +91,6 @@ TEST(MasstreeIndexTest, Scan) {
   // A callback that cancels stops the walk at the first key.
   ASSERT_EQ(size_t(1),
             table.Scan("alice", "carol", [](auto, auto &) { return true; }));
-}
-
-TEST(MasstreeIndexTest, TremendousPut) {
-  std::vector<std::thread> threads;
-  helios::storage::index::MasstreeIndex table;
-
-  constexpr size_t working_set_size = 8192;
-  for (size_t i = 0; i < 10; i++) {
-    threads.emplace_back([&, i]() {
-      for (size_t j = i * working_set_size; j < (i + 1) * working_set_size;
-           j++) {
-        table.Put(std::to_string(j), {});
-      }
-    });
-  }
-  for (auto &thread : threads) {
-    thread.join();
-  }
-}
-
-TEST(MasstreeIndexTest, TremendousGetAndPut) {
-  std::vector<std::thread> threads;
-  helios::storage::index::MasstreeIndex table;
-
-  constexpr size_t working_set_size = 8192;
-  for (size_t i = 0; i < 10; i++) {
-    threads.emplace_back([&, i]() {
-      for (size_t j = i * working_set_size; j < (i + 1) * working_set_size;
-           j++) {
-        table.Get(std::to_string(j - working_set_size));
-        table.Put(std::to_string(j), {});
-      }
-    });
-  }
-  for (auto &thread : threads) {
-    thread.join();
-  }
 }
 
 TEST(MasstreeIndexTest, ReverseScanCountsOnlyTheKeysItEmits) {

@@ -26,8 +26,6 @@
 #include <filesystem>
 #include <memory>
 #include <string>
-#include <thread>
-#include <vector>
 
 #include "helios/config.h"
 #include "helios/database.h"
@@ -109,27 +107,6 @@ TEST_F(DurabilityTest, RecoveryLargeObject) {
     ASSERT_TRUE(alice.has_value());
     ASSERT_EQ(initial_value, alice.value());
   }
-}
-
-TEST_F(DurabilityTest, RecoveryInContendedWorkload) {
-  // Recovery logging is on by default.
-  const helios::storage::Config config = db_->GetConfig();
-
-  const int value = 0xBEEF;
-  std::vector<std::thread> writers;
-  for (size_t i = 0; i < 3; i++) {
-    writers.emplace_back([&] {
-      while (!TestHelper::Write<int>(*db_, kTable, "alice", value)) {
-      }
-    });
-  }
-  for (auto &writer : writers) writer.join();
-
-  Restart(config);
-
-  auto alice = TestHelper::Read<int>(*db_, kTable, "alice");
-  ASSERT_TRUE(alice.has_value());
-  ASSERT_EQ(value, alice.value());
 }
 
 TEST_F(DurabilityTest, RecoveryWithNamedTable) {

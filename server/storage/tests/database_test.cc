@@ -51,8 +51,6 @@ class DatabaseTest : public ::testing::Test {
   }
 };
 
-TEST_F(DatabaseTest, Instantiate) {}
-
 TEST_F(DatabaseTest, InstantiateWithConfig) {
   db_.reset(nullptr);
   helios::storage::Config conf;

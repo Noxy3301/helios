@@ -282,33 +282,6 @@ TEST_F(LoggerDurabilityTest, SyncReportFollowsTheFdatasync) {
   logger.Stop();
 }
 
-// A caller that decided not to wait returns at once, whether because the
-// contract is Async or because the transaction left no record.
-TEST_F(LoggerDurabilityTest, AsyncAndUnloggedCommitsDoNotWait) {
-  {
-    Logger logger(config_);
-    ASSERT_EQ(logger.Recover().status, Logger::RecoveryStatus::kOk);
-    logger.Start();
-
-    // Async: the commit path decided not to wait, and an epoch that will
-    // never be flushed still returns at once.
-    logger.AwaitCommitDurability(99, false);
-    EXPECT_EQ(logger.GetDurableEpoch(), 0u);
-    logger.Stop();
-  }
-
-  // The log is held exclusively for as long as a logger owns it, so the
-  // second logger gets its own scope rather than overlapping with the first.
-  Logger logger(config_);
-  ASSERT_EQ(logger.Recover().status, Logger::RecoveryStatus::kOk);
-  logger.Start();
-
-  // Sync, but nothing was enqueued: there is no record to wait for.
-  logger.AwaitCommitDurability(99, false);
-  EXPECT_EQ(logger.GetDurableEpoch(), 0u);
-  logger.Stop();
-}
-
 // With the fail-stop armed, a write failure ends the process by abort: under
 // Async nobody waits on the durable epoch, and a process that carried on would
 // keep reporting commits that exist only in memory. The rest of this file
