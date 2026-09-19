@@ -56,6 +56,12 @@ bool recv_part(int socket_fd, std::string& out) {
     return true;
 }
 
+// Reserves by the wire size: every encoded element costs at least one byte,
+// so a count read from a corrupt response cannot force a huge allocation.
+size_t reserve_count(uint64_t n, size_t wire_bytes) {
+    return static_cast<size_t>(std::min<uint64_t>(n, wire_bytes));
+}
+
 }  // namespace
 
 HeliosProxy::HeliosProxy(const std::string& host, int port)
@@ -535,12 +541,7 @@ HeliosProxy::ReadPlanResult HeliosProxy::tx_execute_read_plan(
     result.ok = resp_ok;
     if (!resp_ok) return result;
 
-    // Cap reserves by the wire size: every encoded element costs at least one
-    // byte, so a corrupt count cannot force a huge allocation.
-    const auto cap = [&raw](uint64_t n) {
-        return static_cast<size_t>(std::min<uint64_t>(n, raw.size()));
-    };
-    result.steps.reserve(cap(count));
+    result.steps.reserve(reserve_count(count, raw.size()));
     for (uint64_t i = 0; i < count && r.ok; ++i) {
         ReadPlanStepResult out;
         out.found = r.u8() != 0;
@@ -550,31 +551,31 @@ HeliosProxy::ReadPlanResult HeliosProxy::tx_execute_read_plan(
         out.actual_start_key = r.bytes();
         out.actual_end_key = r.bytes();
         uint64_t n = r.u64();
-        out.scan_keys.reserve(cap(n));
+        out.scan_keys.reserve(reserve_count(n, raw.size()));
         for (uint64_t j = 0; j < n && r.ok; ++j)
             out.scan_keys.push_back(r.bytes());
         n = r.u64();
-        out.scan_values.reserve(cap(n));
+        out.scan_values.reserve(reserve_count(n, raw.size()));
         for (uint64_t j = 0; j < n && r.ok; ++j)
             out.scan_values.push_back(r.bytes());
         n = r.u64();
-        out.scan_tids.reserve(cap(n));
+        out.scan_tids.reserve(reserve_count(n, raw.size()));
         for (uint64_t j = 0; j < n && r.ok; ++j)
             out.scan_tids.push_back(r.u64());
         n = r.u64();
-        out.secondary_keys.reserve(cap(n));
+        out.secondary_keys.reserve(reserve_count(n, raw.size()));
         for (uint64_t j = 0; j < n && r.ok; ++j)
             out.secondary_keys.push_back(r.bytes());
         n = r.u64();
-        out.group_sizes.reserve(cap(n));
+        out.group_sizes.reserve(reserve_count(n, raw.size()));
         for (uint64_t j = 0; j < n && r.ok; ++j)
             out.group_sizes.push_back(static_cast<uint32_t>(r.u64()));
         n = r.u64();
-        out.group_start_keys.reserve(cap(n));
+        out.group_start_keys.reserve(reserve_count(n, raw.size()));
         for (uint64_t j = 0; j < n && r.ok; ++j)
             out.group_start_keys.push_back(r.bytes());
         n = r.u64();
-        out.group_end_keys.reserve(cap(n));
+        out.group_end_keys.reserve(reserve_count(n, raw.size()));
         for (uint64_t j = 0; j < n && r.ok; ++j)
             out.group_end_keys.push_back(r.bytes());
         result.steps.push_back(std::move(out));

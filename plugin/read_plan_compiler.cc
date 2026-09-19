@@ -348,6 +348,80 @@ bool compile_index_range_scan(AccessPath *leaf, TABLE *table,
   return !step->table_name.empty();
 }
 
+// Read the probed table/index as a full range. Used when a temp-table-driven
+// probe has no salvageable leading prefix.
+bool use_full_range(TABLE *table, const Index_lookup *ref,
+                    HeliosProxy::ReadPlanStep *step) {
+  const THD *leaf_thd = table->in_use;
+  const bool plain_select =
+      leaf_thd != nullptr && leaf_thd->lex != nullptr &&
+      leaf_thd->lex->sql_command == SQLCOM_SELECT &&
+      table->reginfo.lock_type <= TL_READ;
+  if (!plain_select) {
+    return false;
+  }
+  step->bindings.clear();
+  step->end_bindings.clear();
+  step->for_each = false;
+  step->is_scan = true;
+  step->key_prefix.clear();
+  step->end_key_prefix = key_pack::scan_end_sentinel();
+  if (ref->key == static_cast<int>(table->s->primary_key)) {
+    step->index_name.clear();
+  } else {
+    step->index_name = table->key_info[ref->key].name;
+  }
+  return !step->table_name.empty();
+}
+
+// Resolve a bound keypart to a real earlier step: a direct source step if it
+// has one, else the latest real step among its Item_equal members.
+bool resolve_real_step(const std::unordered_map<TABLE *, int> &table_steps,
+                       Item_field *bound, TABLE **out_table, int *out_step) {
+  auto direct = table_steps.find(bound->field->table);
+  if (direct != table_steps.end()) {
+    *out_table = bound->field->table;
+    *out_step = direct->second;
+    return true;
+  }
+  Item_equal *eq = bound->item_equal_all_join_nests != nullptr
+                       ? bound->item_equal_all_join_nests
+                       : bound->item_equal;
+  if (eq == nullptr) return false;
+  TABLE *best = nullptr;
+  int best_step = -1;
+  Item_equal::FieldProxy proxy(eq);
+  for (Item_field &candidate : proxy) {
+    if (candidate.field == nullptr) continue;
+    auto real = table_steps.find(candidate.field->table);
+    if (real != table_steps.end() && real->second > best_step) {
+      best_step = real->second;
+      best = candidate.field->table;
+    }
+  }
+  if (best == nullptr) return false;
+  *out_table = best;
+  *out_step = best_step;
+  return true;
+}
+
+// True when the keypart's field is on the iterator table or has an Item_equal
+// member there (so the second pass below can bind it to that iterator).
+bool remaps_onto(Item_field *bound, TABLE *target) {
+  if (bound->field->table == target) return true;
+  Item_equal *eq = bound->item_equal_all_join_nests != nullptr
+                       ? bound->item_equal_all_join_nests
+                       : bound->item_equal;
+  if (eq == nullptr) return false;
+  Item_equal::FieldProxy proxy(eq);
+  for (Item_field &candidate : proxy) {
+    if (candidate.field != nullptr && candidate.field->table == target) {
+      return true;
+    }
+  }
+  return false;
+}
+
 bool compile_ref_lookup(
     TABLE *table, Index_lookup *ref,
     const std::unordered_map<TABLE *, int> &table_steps,
@@ -417,79 +491,6 @@ bool compile_ref_lookup(
   TABLE *iter_table = nullptr;
   int iter_step = -1;
 
-  // Read the probed table/index as a full range. Used when a temp-table-driven
-  // probe has no salvageable leading prefix.
-  auto use_full_range = [&]() -> bool {
-    const THD *leaf_thd = table->in_use;
-    const bool plain_select =
-        leaf_thd != nullptr && leaf_thd->lex != nullptr &&
-        leaf_thd->lex->sql_command == SQLCOM_SELECT &&
-        table->reginfo.lock_type <= TL_READ;
-    if (!plain_select) {
-      return false;
-    }
-    step->bindings.clear();
-    step->end_bindings.clear();
-    step->for_each = false;
-    step->is_scan = true;
-    step->key_prefix.clear();
-    step->end_key_prefix = key_pack::scan_end_sentinel();
-    if (ref->key == static_cast<int>(table->s->primary_key)) {
-      step->index_name.clear();
-    } else {
-      step->index_name = key.name;
-    }
-    return !step->table_name.empty();
-  };
-
-  // Resolve a bound keypart to a real earlier step: a direct source step if
-  // it has one, else the latest real step among its Item_equal members.
-  auto resolve_real_step = [&](Item_field *bound, TABLE **out_table,
-                               int *out_step) -> bool {
-    auto direct = table_steps.find(bound->field->table);
-    if (direct != table_steps.end()) {
-      *out_table = bound->field->table;
-      *out_step = direct->second;
-      return true;
-    }
-    Item_equal *eq = bound->item_equal_all_join_nests != nullptr
-                         ? bound->item_equal_all_join_nests
-                         : bound->item_equal;
-    if (eq == nullptr) return false;
-    TABLE *best = nullptr;
-    int best_step = -1;
-    Item_equal::FieldProxy proxy(eq);
-    for (Item_field &candidate : proxy) {
-      if (candidate.field == nullptr) continue;
-      auto real = table_steps.find(candidate.field->table);
-      if (real != table_steps.end() && real->second > best_step) {
-        best_step = real->second;
-        best = candidate.field->table;
-      }
-    }
-    if (best == nullptr) return false;
-    *out_table = best;
-    *out_step = best_step;
-    return true;
-  };
-
-  // True when the keypart's field is on the iterator table or has an Item_equal
-  // member there (so the second pass below can bind it to that iterator).
-  auto remaps_onto = [&](Item_field *bound, TABLE *target) -> bool {
-    if (bound->field->table == target) return true;
-    Item_equal *eq = bound->item_equal_all_join_nests != nullptr
-                         ? bound->item_equal_all_join_nests
-                         : bound->item_equal;
-    if (eq == nullptr) return false;
-    Item_equal::FieldProxy proxy(eq);
-    for (Item_field &candidate : proxy) {
-      if (candidate.field != nullptr && candidate.field->table == target) {
-        return true;
-      }
-    }
-    return false;
-  };
-
   bool saw_temp_source = false;
   for (const BoundPart &bp : bound_items) {
     if (table_steps.find(bp.item->field->table) != table_steps.end()) continue;
@@ -521,7 +522,8 @@ bool compile_ref_lookup(
       if (iter_table == nullptr) {
         TABLE *cand_table = nullptr;
         int cand_step = -1;
-        if (!resolve_real_step(bp.item, &cand_table, &cand_step)) break;
+        if (!resolve_real_step(table_steps, bp.item, &cand_table, &cand_step))
+          break;
         iter_table = cand_table;
         iter_step = cand_step;
       } else if (!remaps_onto(bp.item, iter_table)) {
@@ -531,7 +533,7 @@ bool compile_ref_lookup(
     }
     bound_items.swap(leading);
     if (bound_items.empty() && leading_constant_parts == 0) {
-      return use_full_range();
+      return use_full_range(table, ref, step);
     }
   }
 
@@ -556,14 +558,14 @@ bool compile_ref_lookup(
         }
       }
       if (remapped == nullptr) {
-        if (saw_temp_source) return use_full_range();
+        if (saw_temp_source) return use_full_range(table, ref, step);
         return false;
       }
       source_field = remapped;
     }
     if (!append_bound_keypart(table, ref, bp.kp, source_field, iter_step,
                               step)) {
-      if (saw_temp_source) return use_full_range();
+      if (saw_temp_source) return use_full_range(table, ref, step);
       return false;
     }
     ++bound_parts;
@@ -679,6 +681,17 @@ bool compile_leaf(AccessPath *leaf,
   return compile_ref_lookup(table, ref, table_steps, step);
 }
 
+// Point the step at one index range. An empty end means the whole tail.
+void set_scan(HeliosProxy::ReadPlanStep *step, TABLE *table, uint index,
+              const std::string &start, const std::string &end) {
+  step->is_scan = true;
+  step->key_prefix = start;
+  step->end_key_prefix = end.empty() ? key_pack::scan_end_sentinel() : end;
+  if (index != table->s->primary_key) {
+    step->index_name = table->key_info[index].name;
+  }
+}
+
 // Translate one resolved handler IndexSearchPlan (point/prefix/range/
 // index-first) into a single ReadPlanStep; reject reverse/unbounded access.
 bool compile_index_search(TABLE *table, uint index,
@@ -701,15 +714,6 @@ bool compile_index_search(TABLE *table, uint index,
     return false;
   }
 
-  const auto set_scan = [&](const std::string &start,
-                            const std::string &end) {
-    step->is_scan = true;
-    step->key_prefix = start;
-    step->end_key_prefix =
-        end.empty() ? key_pack::scan_end_sentinel() : end;
-    if (!is_primary) step->index_name = table->key_info[index].name;
-  };
-
   switch (search.op) {
     case IndexSearchOp::kUniquePoint:
       if (search.packed_start_key.empty()) {
@@ -719,9 +723,8 @@ bool compile_index_search(TABLE *table, uint index,
         step->is_scan = false;
         step->key_prefix = search.packed_start_key;
       } else {
-        set_scan(search.packed_start_key,
-                 key_pack::build_prefix_range_end(
-                     search.packed_start_key));
+        set_scan(step, table, index, search.packed_start_key,
+                 key_pack::build_prefix_range_end(search.packed_start_key));
       }
       return true;
 
@@ -730,7 +733,7 @@ bool compile_index_search(TABLE *table, uint index,
       if (search.packed_same_key_prefix.empty()) {
         return false;
       }
-      set_scan(search.packed_same_key_prefix,
+      set_scan(step, table, index, search.packed_same_key_prefix,
                search.packed_same_key_end);
       return true;
 
@@ -740,7 +743,7 @@ bool compile_index_search(TABLE *table, uint index,
       }
       std::string start = search.packed_start_key;
       if (search.find_flag == HA_READ_AFTER_KEY) start.push_back('\0');
-      set_scan(start, search.packed_end_key);
+      set_scan(step, table, index, start, search.packed_end_key);
       return true;
     }
 
@@ -748,7 +751,7 @@ bool compile_index_search(TABLE *table, uint index,
       if (search.packed_end_key.empty()) {
         return false;
       }
-      set_scan("", search.packed_end_key);
+      set_scan(step, table, index, "", search.packed_end_key);
       return true;
 
     case IndexSearchOp::kPrevKey:
@@ -978,6 +981,29 @@ void collect_inner_unit_roots(Query_expression *unit,
   }
 }
 
+// A step the fold below may share: an unlimited scan.
+bool foldable(const HeliosProxy::ReadPlanStep &s) {
+  return s.is_scan && s.scan_limit == 0;
+}
+
+bool same_bindings(const std::vector<HeliosProxy::ReadPlanKeyBinding> &a,
+                   const std::vector<HeliosProxy::ReadPlanKeyBinding> &b) {
+  if (a.size() != b.size()) return false;
+  for (size_t k = 0; k < a.size(); ++k) {
+    const HeliosProxy::ReadPlanKeyBinding &x = a[k];
+    const HeliosProxy::ReadPlanKeyBinding &y = b[k];
+    if (x.source_step != y.source_step || x.source_row != y.source_row ||
+        x.source_offset != y.source_offset ||
+        x.source_length != y.source_length ||
+        x.use_midpoint != y.use_midpoint || x.from_key != y.from_key ||
+        x.source_column != y.source_column ||
+        x.column_as_int_key != y.column_as_int_key ||
+        x.int_delta != y.int_delta)
+      return false;
+  }
+  return true;
+}
+
 }  // namespace
 
 bool compile_read_plan_from_qep(
@@ -1036,36 +1062,6 @@ bool compile_read_plan_from_qep(
     if (added_tables[i] != nullptr) step_aliases[i].push_back(added_tables[i]);
   }
   {
-    const auto foldable = [](const HeliosProxy::ReadPlanStep &s) {
-      return s.is_scan && s.scan_limit == 0;
-    };
-    const auto same_binding = [](const HeliosProxy::ReadPlanKeyBinding &a,
-                                 const HeliosProxy::ReadPlanKeyBinding &b) {
-      return a.source_step == b.source_step && a.source_row == b.source_row &&
-             a.source_offset == b.source_offset &&
-             a.source_length == b.source_length &&
-             a.use_midpoint == b.use_midpoint && a.from_key == b.from_key &&
-             a.source_column == b.source_column &&
-             a.column_as_int_key == b.column_as_int_key &&
-             a.int_delta == b.int_delta;
-    };
-    const auto same_bindings =
-        [&](const std::vector<HeliosProxy::ReadPlanKeyBinding> &a,
-            const std::vector<HeliosProxy::ReadPlanKeyBinding> &b) {
-          if (a.size() != b.size()) return false;
-          for (size_t k = 0; k < a.size(); ++k)
-            if (!same_binding(a[k], b[k])) return false;
-          return true;
-        };
-    const auto same_step = [&](const HeliosProxy::ReadPlanStep &a,
-                               const HeliosProxy::ReadPlanStep &b) {
-      return a.table_name == b.table_name && a.index_name == b.index_name &&
-             a.key_prefix == b.key_prefix &&
-             a.end_key_prefix == b.end_key_prefix &&
-             a.for_each == b.for_each && a.reverse_scan == b.reverse_scan &&
-             same_bindings(a.bindings, b.bindings) &&
-             same_bindings(a.end_bindings, b.end_bindings);
-    };
     std::vector<uint32_t> new_index(steps.size(), 0);
     std::vector<HeliosProxy::ReadPlanStep> folded;
     std::vector<std::vector<TABLE *>> folded_aliases;
@@ -1075,11 +1071,19 @@ bool compile_read_plan_from_qep(
     for (size_t j = 0; j < steps.size(); ++j) {
       int target = -1;
       if (foldable(steps[j])) {
+        const HeliosProxy::ReadPlanStep &s = steps[j];
         for (size_t i = 0; i < folded.size(); ++i) {
-          if (foldable(folded[i]) && same_step(folded[i], steps[j])) {
-            target = static_cast<int>(i);
-            break;
-          }
+          const HeliosProxy::ReadPlanStep &f = folded[i];
+          if (!foldable(f)) continue;
+          if (f.table_name != s.table_name || f.index_name != s.index_name ||
+              f.key_prefix != s.key_prefix ||
+              f.end_key_prefix != s.end_key_prefix ||
+              f.for_each != s.for_each || f.reverse_scan != s.reverse_scan ||
+              !same_bindings(f.bindings, s.bindings) ||
+              !same_bindings(f.end_bindings, s.end_bindings))
+            continue;
+          target = static_cast<int>(i);
+          break;
         }
       }
       if (target >= 0) {

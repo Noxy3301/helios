@@ -167,26 +167,6 @@ bool compare_type_of(Builder& b, const Resolved::Expr& left,
                      const Resolved::Expr& right, Resolved::ResolvedType* out) {
     const auto lk = left.result_type().kind();
     const auto rk = right.result_type().kind();
-    auto wider_decimal = [&](const Resolved::ResolvedType& lhs,
-                             const Resolved::ResolvedType& rhs) {
-        const uint32_t scale = std::max(lhs.scale(), rhs.scale());
-        const uint32_t integer = std::max(lhs.precision() - lhs.scale(),
-                                          rhs.precision() - rhs.scale());
-        // Beyond DECIMAL(38), DuckDB's binder keeps the scale and squeezes
-        // the integer digits into the remaining width; the removed sql-text
-        // path ran under exactly that. The comparison stays exact whenever
-        // the values fit; a value that does not fit raises in the cast and
-        // the statement fails rather than falling back, because MySQL only
-        // retries on the primary for failures raised before execution.
-        if (integer + scale > 38 &&
-            (contains_decimal_avg(b, left) || contains_decimal_avg(b, right))) {
-            return b.refuse("AVG operand in an over-wide decimal comparison");
-        }
-        out->set_kind(Resolved::DECIMAL);
-        out->set_precision(std::min<uint32_t>(integer + scale, 38));
-        out->set_scale(scale);
-        return true;
-    };
     if (lk == Resolved::INT64 && rk == Resolved::INT64) {
         out->set_kind(Resolved::INT64);
         return true;
@@ -197,9 +177,26 @@ bool compare_type_of(Builder& b, const Resolved::Expr& left,
         int_type.set_kind(Resolved::DECIMAL);
         int_type.set_precision(19);  // BIGINT needs 19 integer digits
         int_type.set_scale(0);
-        return wider_decimal(
-            lk == Resolved::DECIMAL ? left.result_type() : int_type,
-            rk == Resolved::DECIMAL ? right.result_type() : int_type);
+        const Resolved::ResolvedType& lhs =
+            lk == Resolved::DECIMAL ? left.result_type() : int_type;
+        const Resolved::ResolvedType& rhs =
+            rk == Resolved::DECIMAL ? right.result_type() : int_type;
+        const uint32_t scale = std::max(lhs.scale(), rhs.scale());
+        const uint32_t integer = std::max(lhs.precision() - lhs.scale(),
+                                          rhs.precision() - rhs.scale());
+        // Beyond DECIMAL(38), DuckDB's binder keeps the scale and squeezes the
+        // integer digits into the remaining width. The comparison stays exact
+        // whenever the values fit; a value that does not fit raises in the cast
+        // and the statement fails rather than falling back, because MySQL only
+        // retries on the primary for failures raised before execution.
+        if (integer + scale > 38 &&
+            (contains_decimal_avg(b, left) || contains_decimal_avg(b, right))) {
+            return b.refuse("AVG operand in an over-wide decimal comparison");
+        }
+        out->set_kind(Resolved::DECIMAL);
+        out->set_precision(std::min<uint32_t>(integer + scale, 38));
+        out->set_scale(scale);
+        return true;
     }
     const bool l_temporal = lk == Resolved::DATE || lk == Resolved::DATETIME;
     const bool r_temporal = rk == Resolved::DATE || rk == Resolved::DATETIME;
@@ -220,10 +217,8 @@ bool compare_type_of(Builder& b, const Resolved::Expr& left,
     if (lk == Resolved::VARCHAR && rk == Resolved::VARCHAR) {
         const uint32_t lc = left.result_type().collation_id();
         const uint32_t rc = right.result_type().collation_id();
-        auto implemented = [](uint32_t id) {
-            return id == 255 || id == 309 || id == 63;
-        };
-        if (lc == rc && implemented(lc)) {
+        // utf8mb4_0900_ai_ci, utf8mb4_0900_bin and binary.
+        if (lc == rc && (lc == 255 || lc == 309 || lc == 63)) {
             out->set_kind(Resolved::VARCHAR);
             out->set_collation_id(lc);
             return true;
@@ -867,15 +862,14 @@ bool build_temporal_const(Builder& b, Item* item, Resolved::Expr* out) {
     }
     // Zero dates, year zero, and ALLOW_INVALID_DATES values ('2001-02-31')
     // have no DuckDB equivalent.
-    auto leap_year = [](uint32_t y) {
-        return (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;
-    };
     static constexpr uint8_t kDaysInMonth[] = {31, 28, 31, 30, 31, 30,
                                                31, 31, 30, 31, 30, 31};
+    const bool leap = (time.year % 4 == 0 && time.year % 100 != 0) ||
+                      time.year % 400 == 0;
     if (time.year == 0 || time.month == 0 || time.month > 12 ||
         time.day == 0 ||
         time.day > kDaysInMonth[time.month - 1] +
-                       (time.month == 2 && leap_year(time.year))) {
+                       (time.month == 2 && leap)) {
         return b.refuse("date constant outside the Gregorian calendar");
     }
     auto* date = out->result_type().kind() == Resolved::DATE

@@ -2,9 +2,9 @@
 #define HELIOS_FIELD_HH
 
 #include <climits>
+#include <cstddef>
 #include <string>
 #include <string_view>
-#include <variant>
 #include <vector>
 
 #include "my_inttypes.h"
@@ -22,34 +22,28 @@
  * - valueLength: length of value
  *                max 4 bytes
  * value: MySQL value shown to users
- *        max 4294967295 = sizeof(LONGBLOB) bytes
+ *        max 4294967295 bytes, the LONGBLOB limit
  * Each row consists of multiple fields.
  * First field stores null flags.
  */
 class HeliosField {
  public:
   std::string convert_numeric_to_bytes(const size_t num) const;
-  size_t convert_bytes_to_numeric(
-      std::variant<const std::byte*, const uchar*> bytes,
-      const size_t length) const;
+  size_t convert_bytes_to_numeric(const std::byte* const bytes,
+                                  const size_t length) const;
 
   /**
-   * @brief These methods are called for INSERT and UPDATE statements
+   * @brief Packs one MySQL field value, then hands back the packed bytes.
    */
-  std::string get_null_field() const;
+  void set_helios_field(const char* const src, const size_t length);
   std::string get_helios_field() const;
 
-  void set_null_field(const uchar* const buf, const size_t null_byte_length);
-  void set_helios_field(std::variant<const uchar*, const char*> srcMysql,
-                           const size_t length);
-
   /**
-   * @brief These methods are called for SELECT statements.
+   * @brief Parses a packed row into one view per field.
    *
-   * make_mysql_table_row parses the Helios packed row and records each
-   * field as a (pointer, length) pair into raw_row. No allocations or
-   * copies are performed — the caller MUST keep raw_row alive while
-   * iterating via get_column_of_row().
+   * Each field is recorded as a (pointer, length) pair into raw_row. No
+   * allocations or copies are performed, and the caller MUST keep raw_row
+   * alive while iterating via get_column_of_row().
    */
   void make_mysql_table_row(const std::byte *const raw_row,
                             const size_t length);
@@ -72,16 +66,6 @@ class HeliosField {
   // Zero-copy row parsing: views point into the caller-owned raw_row.
   std::string_view nullFlagView;
   std::vector<std::string_view> row;
-
-  void set_header(const size_t num);
-  char convert_numeric_to_a_byte(const size_t num) const;
-
-  inline size_t calculate_minimum_byte_size_required(const size_t num) const {
-    const int byteMax = 256;
-    size_t num_bytes = 0;
-    for (size_t n = num; n > 0; n /= byteMax) num_bytes++;
-    return num_bytes;
-  }
 };
 
 #endif /* HELIOS_FIELD_HH */

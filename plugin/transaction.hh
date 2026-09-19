@@ -389,9 +389,17 @@ private:
       const std::string& index_name, const std::string& start_key,
       const std::string& end_key, uint64_t row_limit, bool reverse_scan,
       std::map<std::string, std::vector<std::string>>& groups) const;
+  // Moves row j of an unpacked plan step into the row cache; an empty value
+  // is a not-found answer.
+  bool take_plan_row(const HeliosProxy::ReadPlanStep& step,
+                     HeliosProxy::ReadPlanStepResult& result, size_t j,
+                     std::string& key, std::string& value, uint64_t& tid);
+  // Appends one secondary key once per primary key grouped under it.
+  static void append_index_group(
+      SecondaryScan& out, const std::string& secondary_key,
+      const std::vector<std::string>& primary_keys);
   bool thd_is_transaction() const;
   void register_transaction_to_mysql();
-  void register_single_statement_to_mysql();
 };
 
 #endif /* HELIOS_TRANSACTION_HH */

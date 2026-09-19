@@ -6,12 +6,10 @@
  * HeliosField method definitions
  */
 
-char HeliosField::convert_numeric_to_a_byte(const size_t num) const {
-  return convert_numeric_to_bytes(num)[0];
-}
-
 std::string HeliosField::convert_numeric_to_bytes(const size_t num) const {
-  size_t byteSizeOfNum = calculate_minimum_byte_size_required(num);
+  // Bytes the value needs, one base-256 digit at a time.
+  size_t byteSizeOfNum = 0;
+  for (size_t n = num; n > 0; n /= 256) byteSizeOfNum++;
   std::string byteSequence;
   byteSequence.reserve(byteSizeOfNum);
   // Pack in little-endian order to match convert_bytes_to_numeric().
@@ -21,54 +19,30 @@ std::string HeliosField::convert_numeric_to_bytes(const size_t num) const {
   return byteSequence;
 }
 
-size_t HeliosField::convert_bytes_to_numeric(
-    std::variant<const std::byte *, const uchar *> bytes,
-    const size_t length) const {
+size_t HeliosField::convert_bytes_to_numeric(const std::byte *const bytes,
+                                             const size_t length) const {
   size_t n = 0;
   for (size_t i = 0; i < length; i++) {
-    std::visit(
-        [&](auto &&oneByte) {
-          n = n | static_cast<uchar>(oneByte[i]) << CHAR_BIT * i;
-        },
-        bytes);
+    n = n | static_cast<uchar>(bytes[i]) << CHAR_BIT * i;
   }
   return n;
-}
-
-std::string HeliosField::get_null_field() const {
-  return get_helios_field();
 }
 
 std::string HeliosField::get_helios_field() const {
   return std::move(byteSize + valueLength + value);
 }
 
-void HeliosField::set_header(const size_t num) {
-  if (num == 0) {
+void HeliosField::set_helios_field(const char *const src, const size_t length) {
+  if (length == 0) {
     byteSize = noValue;
     valueLength.clear();
     value.clear();
     return;
   }
-  assert(num <= maxValueLength);
-  valueLength = convert_numeric_to_bytes(num);
-  byteSize = convert_numeric_to_a_byte(valueLength.size());
-}
-
-void HeliosField::set_null_field(const uchar *const buf,
-                                    const size_t null_byte_length) {
-  set_helios_field(buf, null_byte_length);
-}
-
-void HeliosField::set_helios_field(
-    std::variant<const uchar *, const char *> const srcMysql,
-    const size_t length) {
-  set_header(length);
-  std::visit(
-      [&](auto &&src) {
-        value.assign(reinterpret_cast<const char *>(src), length);
-      },
-      srcMysql);
+  assert(length <= maxValueLength);
+  valueLength = convert_numeric_to_bytes(length);
+  byteSize = static_cast<char>(valueLength.size());
+  value.assign(src, length);
 }
 
 void HeliosField::make_mysql_table_row(const std::byte *const raw_row,

@@ -46,8 +46,9 @@ class MoveFieldOffset {
 }  // namespace
 
 void ha_helios::set_write_buffer(uchar *buf) {
-  field_pack_.set_null_field(buf, table->s->null_bytes);
-  write_buffer_ = field_pack_.get_null_field();
+  field_pack_.set_helios_field(reinterpret_cast<const char *>(buf),
+                               table->s->null_bytes);
+  write_buffer_ = field_pack_.get_helios_field();
 
   String attribute;
   attribute.set_charset(&my_charset_bin);

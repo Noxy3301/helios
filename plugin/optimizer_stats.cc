@@ -22,6 +22,19 @@
 // table/index cardinality estimates aligned with Helios row counts, NDV
 // stats, histograms, and batched remote-access costs.
 
+// Rows of the histogram at or below packed_key, from its cumulative counts.
+static double rank_le(const Helios_share::RangeHist &hist,
+                      const std::string &packed_key) {
+  if (packed_key >= hist.bounds.back())
+    return static_cast<double>(hist.cum.back());
+  auto it =
+      std::upper_bound(hist.bounds.begin(), hist.bounds.end(), packed_key);
+  if (it == hist.bounds.begin())
+    return 0.0;
+  const size_t pos = static_cast<size_t>((it - hist.bounds.begin()) - 1);
+  return static_cast<double>(hist.cum[pos]);
+}
+
 static std::vector<std::pair<std::string, uint32_t>> index_ndv_descriptors(
     TABLE *table) {
   std::vector<std::pair<std::string, uint32_t>> descs;
@@ -441,19 +454,6 @@ ha_rows ha_helios::records_in_range(uint inx, key_range *min_key,
       if (hist_it != share->index_hist_.end()) {
         const Helios_share::RangeHist &hist = hist_it->second;
         if (!hist.bounds.empty() && hist.bounds.size() == hist.cum.size()) {
-          auto rank_le = [&](const std::string &packed_key) -> double {
-            if (packed_key >= hist.bounds.back())
-              return static_cast<double>(hist.cum.back());
-            auto it =
-                std::upper_bound(hist.bounds.begin(), hist.bounds.end(),
-                                 packed_key);
-            if (it == hist.bounds.begin())
-              return 0.0;
-            const size_t pos =
-                static_cast<size_t>((it - hist.bounds.begin()) - 1);
-            return static_cast<double>(hist.cum[pos]);
-          };
-
           constexpr key_part_map kLeadingPart = 1;
           bool enc_ok = true;
           double lo = 0.0;
@@ -464,7 +464,7 @@ ha_rows ha_helios::records_in_range(uint inx, key_range *min_key,
             if (packed.empty())
               enc_ok = false;
             else
-              lo = rank_le(packed);
+              lo = rank_le(hist, packed);
           }
           if (enc_ok && max_key != nullptr) {
             std::string packed = key_pack::pack_key(
@@ -472,7 +472,7 @@ ha_rows ha_helios::records_in_range(uint inx, key_range *min_key,
             if (packed.empty())
               enc_ok = false;
             else
-              hi = rank_le(packed);
+              hi = rank_le(hist, packed);
           }
           const double hist_est = enc_ok ? (hi - lo) : -1.0;
           if (hist_est >= 1.0 &&

@@ -17,8 +17,6 @@
 #include <sstream>
 #include <string_view>
 #include <vector>
-// for ::strcasecmp
-#include <strings.h>
 
 #include "helios_field_types.h"
 #include "helios.pb.h"
@@ -35,20 +33,6 @@
 
 namespace key_pack {
 
-unsigned char key_part_type_tag(HeliosFieldType type) {
-  switch (type) {
-  case HeliosFieldType::HELIOS_INT:
-    return kKeyTypeInt;
-  case HeliosFieldType::HELIOS_STRING:
-    return kKeyTypeString;
-  case HeliosFieldType::HELIOS_DATETIME:
-    return kKeyTypeDatetime;
-  case HeliosFieldType::HELIOS_OTHER:
-  default:
-    return kKeyTypeOther;
-  }
-}
-
 void append_key_part(std::string &out, bool is_null, HeliosFieldType type,
                      const std::string &payload) {
   constexpr size_t kLengthFieldSize = 2;
@@ -63,7 +47,21 @@ void append_key_part(std::string &out, bool is_null, HeliosFieldType type,
   out.reserve(out.size() + 5 + copy_length);
   out.push_back(
       static_cast<char>(is_null ? kKeyMarkerNull : kKeyMarkerNotNull));
-  out.push_back(static_cast<char>(key_part_type_tag(type)));
+  switch (type) {
+  case HeliosFieldType::HELIOS_INT:
+    out.push_back(static_cast<char>(kKeyTypeInt));
+    break;
+  case HeliosFieldType::HELIOS_STRING:
+    out.push_back(static_cast<char>(kKeyTypeString));
+    break;
+  case HeliosFieldType::HELIOS_DATETIME:
+    out.push_back(static_cast<char>(kKeyTypeDatetime));
+    break;
+  case HeliosFieldType::HELIOS_OTHER:
+  default:
+    out.push_back(static_cast<char>(kKeyTypeOther));
+    break;
+  }
 
   if (type == HeliosFieldType::HELIOS_STRING) {
     // STRING: payload first, then terminator (0x00), then length
@@ -107,16 +105,6 @@ std::string build_prefix_range_end(const std::string &prefix) {
 
 }  // namespace key_pack
 
-unsigned char ha_helios::key_part_type_tag(HeliosFieldType type) {
-  return key_pack::key_part_type_tag(type);
-}
-
-void ha_helios::append_key_part(std::string &out, bool is_null,
-                                HeliosFieldType type,
-                                const std::string &payload) {
-  key_pack::append_key_part(out, is_null, type, payload);
-}
-
 std::string ha_helios::build_prefix_range_end(const std::string &prefix) {
   return key_pack::build_prefix_range_end(prefix);
 }
@@ -157,7 +145,7 @@ std::string ha_helios::pack_key_from_field(Field *field) {
         field_len = 8;
       }
 
-      payload = pack_int_key(buf, field_len);
+      payload = key_pack::pack_int_key(buf, field_len);
       break;
     }
 
@@ -166,8 +154,8 @@ std::string ha_helios::pack_key_from_field(Field *field) {
       std::string raw(field_len, '\0');
       field->get_key_image(reinterpret_cast<uchar *>(raw.data()), field_len,
                            Field::itRAW);
-      payload = pack_datetime_key(reinterpret_cast<const uchar *>(raw.data()),
-                                  field_len, mysql_type);
+      payload = key_pack::pack_datetime_key(
+          reinterpret_cast<const uchar *>(raw.data()), field_len, mysql_type);
       break;
     }
 
@@ -189,7 +177,7 @@ std::string ha_helios::pack_key_from_field(Field *field) {
   }
 
   std::string packed;
-  append_key_part(packed, is_null, helios_type, payload);
+  key_pack::append_key_part(packed, is_null, helios_type, payload);
   return packed;
 }
 
@@ -373,7 +361,7 @@ int ha_helios::extract_key(const uchar *buf, HeliosTransaction *tx,
     *key = extract_key_from_mysql(buf);
     return 0;
   }
-  return autogenerate_key(tx, key);
+  return generate_hidden_primary_key(tx, key);
 }
 
 std::string ha_helios::extract_key_from_mysql(const uchar *row_buffer) {
@@ -401,10 +389,7 @@ std::string ha_helios::extract_key_from_mysql(const uchar *row_buffer) {
   return complete_key;
 }
 
-int ha_helios::autogenerate_key(HeliosTransaction *tx,
-                                   std::string *key) {
-  return generate_hidden_primary_key(tx, key);
-}
+namespace key_pack {
 
 /**
  * @brief Pack a 1, 2, 4 or 8 byte integer key part.
@@ -412,8 +397,6 @@ int ha_helios::autogenerate_key(HeliosTransaction *tx,
  * @details Little-endian to big-endian with the sign bit flipped, so
  * lexicographic order matches signed integer order.
  */
-namespace key_pack {
-
 std::string pack_int_key(const uchar *data, size_t len) {
   uint64_t value = 0;
 
@@ -481,48 +464,14 @@ std::string pack_datetime_key(const uchar *data, size_t len,
   return std::string(reinterpret_cast<const char *>(data), len);
 }
 
-/**
- * @brief Pack a VARCHAR key part: the string without MySQL's 2-byte
- * little-endian length prefix and without padding.
- */
-std::string pack_string_key(const uchar *data, size_t len) {
-  if (len < 2)
-    return std::string();
-
-  // First 2 bytes are length (little-endian)
-  uint16_t str_len =
-      static_cast<uint16_t>(data[0]) | (static_cast<uint16_t>(data[1]) << 8);
-
-  if (str_len == 0 || len < 2 + str_len) {
-    // Invalid or empty string
-    return std::string();
-  }
-
-  // Return actual string data (skip 2-byte prefix, exclude padding)
-  return std::string(reinterpret_cast<const char *>(data + 2), str_len);
-}
-
 }  // namespace key_pack
 
-std::string ha_helios::pack_int_key(const uchar *data, size_t len) {
-  return key_pack::pack_int_key(data, len);
-}
-
-std::string ha_helios::pack_datetime_key(const uchar *data, size_t len,
-                                         enum_field_types mysql_type) {
-  return key_pack::pack_datetime_key(data, len, mysql_type);
-}
-
-std::string ha_helios::pack_string_key(const uchar *data, size_t len) {
-  return key_pack::pack_string_key(data, len);
-}
+namespace key_pack {
 
 /**
  * @brief Convert a MySQL composite key into the sortable key format: the key
  * parts named by keypart_map, each packed by its type, concatenated.
  */
-namespace key_pack {
-
 std::string pack_key(TABLE *table, uint key_index, const uchar *key,
                      key_part_map keypart_map) {
   KEY *key_info = &table->key_info[key_index];

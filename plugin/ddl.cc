@@ -36,6 +36,34 @@ constexpr size_t kBackfillParallelWorkers = 16;
 // Widest payload a PAX cell holds. A column needing more has no home.
 constexpr uint32_t kMaxCellBytes = 2048;
 
+// Ships the buffered writes as one commit (no reads to validate).
+bool commit_ops(HeliosProxy &conn, std::vector<HeliosProxy::WriteOp> &chunk) {
+  if (chunk.empty()) return true;
+  std::string reason;
+  const bool ok = conn.tx_commit({}, {}, chunk, {}, &reason);
+  chunk.clear();
+  return ok;
+}
+
+// Backfill worker: commits one key-hash partition on its own connection, in
+// chunks. A failure sets the shared flag for the caller to report.
+void backfill_partition(const std::string &host, int port,
+                        std::vector<HeliosProxy::WriteOp> &ops,
+                        std::atomic<bool> &failed) {
+  HeliosProxy conn(host, port);
+  std::vector<HeliosProxy::WriteOp> chunk;
+  chunk.reserve(kBackfillWriteChunkRows);
+  for (auto &op : ops) {
+    if (failed.load(std::memory_order_relaxed)) return;
+    chunk.push_back(std::move(op));
+    if (chunk.size() >= kBackfillWriteChunkRows && !commit_ops(conn, chunk)) {
+      failed.store(true, std::memory_order_relaxed);
+      return;
+    }
+  }
+  if (!commit_ops(conn, chunk)) failed.store(true, std::memory_order_relaxed);
+}
+
 }  // namespace
 
 std::vector<uint32_t> compute_pax_field_widths(
@@ -105,8 +133,9 @@ std::vector<uint32_t> compute_pax_field_widths(
         width = std::max<uint32_t>(width, 40);
         break;
       case MYSQL_TYPE_DECIMAL:
-        // Legacy fixed-point text; reserve sign + decimal point slack (UNTYPED
-        // bound). Not a Field_new_decimal, so it never becomes FK_DEC64.
+        // Fixed-point text of the pre-5.0 type; reserve sign + decimal point
+        // slack (UNTYPED bound). Not a Field_new_decimal, so it never becomes
+        // FK_DEC64.
         width += 2;
         break;
       case MYSQL_TYPE_NEWDECIMAL: {
@@ -384,28 +413,8 @@ bool ha_helios::backfill_indexes_parallel(
   workers.reserve(kBackfillParallelWorkers);
   for (size_t w = 0; w < kBackfillParallelWorkers; ++w) {
     if (partition[w].empty()) continue;
-    workers.emplace_back([&, w]() {
-      HeliosProxy conn(host, port);
-      std::vector<HeliosProxy::WriteOp> chunk;
-      chunk.reserve(kBackfillWriteChunkRows);
-      // Ship the buffered writes as one commit (no reads to validate).
-      auto commit_chunk = [&]() -> bool {
-        if (chunk.empty()) return true;
-        std::string reason;
-        const bool ok = conn.tx_commit({}, {}, chunk, {}, &reason);
-        chunk.clear();
-        return ok;
-      };
-      for (auto &op : partition[w]) {
-        if (failed.load(std::memory_order_relaxed)) return;
-        chunk.push_back(std::move(op));
-        if (chunk.size() >= kBackfillWriteChunkRows && !commit_chunk()) {
-          failed.store(true, std::memory_order_relaxed);
-          return;
-        }
-      }
-      if (!commit_chunk()) failed.store(true, std::memory_order_relaxed);
-    });
+    workers.emplace_back(backfill_partition, std::cref(host), port,
+                         std::ref(partition[w]), std::ref(failed));
   }
   for (auto &t : workers) t.join();
   return !failed.load(std::memory_order_relaxed);
@@ -414,8 +423,7 @@ bool ha_helios::backfill_indexes_parallel(
 bool ha_helios::backfill_unique_serial(const std::string &index_name,
                                           const KEY &runtime_key) {
   // A unique index scans and commits serially, which keeps the in-write
-  // duplicate check. Its cost is small (no unique index is on
-  // the large fact table); the parallel scan-once path is for the non-unique set.
+  // duplicate check. The parallel scan-once path serves the non-unique set.
   auto *scan_tx = get_transaction(ha_thd());
   if (scan_tx == nullptr || scan_tx->is_aborted()) return false;
   scan_tx->choose_table(db_table_name);
@@ -463,8 +471,8 @@ bool ha_helios::inplace_alter_table(TABLE *altered_table,
   DBUG_TRACE;
 
   // Fill each new secondary index from existing rows. The EXCLUSIVE metadata
-  // lock is node-local, so this covers single-node ADD INDEX only; cross-node
-  // DDL coordination belongs to the ddl-sync work.
+  // lock is node-local, so this covers single-node ADD INDEX only. Cross-node
+  // DDL coordination does not exist.
   userThread = ha_thd();
   auto proxy = get_proxy();
 
@@ -505,7 +513,7 @@ bool ha_helios::inplace_alter_table(TABLE *altered_table,
 
     // Register the index; fail closed on error. On a multi-index ALTER a later
     // failure leaves earlier backfilled indexes on the server (the DD rollback
-    // hides them); purging them is the ddl-sync DROP work.
+    // hides them), and nothing purges them.
     if (!proxy->db_create_secondary_index(db_table_name, index_name,
                                           index_type)) {
       return true;
@@ -519,7 +527,7 @@ bool ha_helios::inplace_alter_table(TABLE *altered_table,
   }
 
   // Non-unique indexes share one scan and one unpack pass, then commit in
-  // parallel. A multi-index ALTER on the fact table makes this the common path.
+  // parallel.
   if (!nu_specs.empty()) {
     auto *scan_tx = get_transaction(ha_thd());
     if (scan_tx == nullptr || scan_tx->is_aborted()) return true;

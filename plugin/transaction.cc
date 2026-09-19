@@ -365,20 +365,6 @@ void HeliosTransaction::execute_read_plan(
   for (size_t i = 0; i < result.steps.size() && i < steps.size(); ++i) {
     const auto& step = steps[i];
     auto& step_result = result.steps[i];
-    // Move row j out of the wire result into the row cache; an empty value is
-    // a not-found answer.
-    auto take_row = [&](size_t j, std::string& key, std::string& value,
-                        uint64_t& tid) {
-      key = std::move(step_result.scan_keys[j]);
-      value = j < step_result.scan_values.size()
-                  ? std::move(step_result.scan_values[j])
-                  : std::string();
-      tid = j < step_result.scan_tids.size() ? step_result.scan_tids[j] : 0;
-      const bool found = !value.empty();
-      record_row_cache(step.table_name, key, found, value, tid);
-      return found;
-    };
-
     if (!step.is_scan && !step.for_each) {
       rpc_trace_.record_event(trace_count_event(
           step_result.found ? "plan_fetch:R:hit" : "plan_fetch:R:miss",
@@ -427,7 +413,7 @@ void HeliosTransaction::execute_read_plan(
             std::string key;
             std::string value;
             uint64_t tid = 0;
-            if (take_row(j, key, value, tid)) {
+            if (take_plan_row(step, step_result, j, key, value, tid)) {
               entry.rows.emplace_back(std::move(key), std::move(value));
               entry.row_tids.push_back(tid);
             }
@@ -447,7 +433,7 @@ void HeliosTransaction::execute_read_plan(
             std::string key;
             std::string value;
             uint64_t tid = 0;
-            take_row(j, key, value, tid);
+            take_plan_row(step, step_result, j, key, value, tid);
             if (j < step_result.secondary_keys.size()) {
               entry.secondary_keys.push_back(
                   std::move(step_result.secondary_keys[j]));
@@ -468,7 +454,7 @@ void HeliosTransaction::execute_read_plan(
         std::string key;
         std::string value;
         uint64_t tid = 0;
-        take_row(j, key, value, tid);
+        take_plan_row(step, step_result, j, key, value, tid);
       }
       step_result = HeliosProxy::ReadPlanStepResult{};
       continue;
@@ -484,7 +470,7 @@ void HeliosTransaction::execute_read_plan(
         std::string key;
         std::string value;
         uint64_t tid = 0;
-        if (take_row(j, key, value, tid)) {
+        if (take_plan_row(step, step_result, j, key, value, tid)) {
           rows.emplace_back(std::move(key), std::move(value));
           row_tids.push_back(tid);
         }
@@ -512,7 +498,7 @@ void HeliosTransaction::execute_read_plan(
         std::string key;
         std::string value;
         uint64_t tid = 0;
-        take_row(j, key, value, tid);
+        take_plan_row(step, step_result, j, key, value, tid);
         cached.primary_keys.push_back(std::move(key));
       }
       push_secondary_scan_cache(std::move(cached));
@@ -757,20 +743,13 @@ HeliosTransaction::SecondaryScan HeliosTransaction::merge_index_scan(
 
   SecondaryScan out;
   out.ok = true;
-  const auto emit = [&](const std::string& secondary_key,
-                        const std::vector<std::string>& primary_keys) {
-    for (const auto& pk : primary_keys) {
-      out.secondary_keys.push_back(secondary_key);
-      out.primary_keys.push_back(pk);
-    }
-  };
   if (reverse_scan) {
     for (auto it = groups.rbegin(); it != groups.rend(); ++it) {
-      emit(it->first, it->second);
+      append_index_group(out, it->first, it->second);
     }
   } else {
     for (const auto& [secondary_key, primary_keys] : groups) {
-      emit(secondary_key, primary_keys);
+      append_index_group(out, secondary_key, primary_keys);
     }
   }
   if (row_limit > 0 && out.primary_keys.size() > row_limit) {
@@ -1371,12 +1350,29 @@ void HeliosTransaction::begin_transaction() {
 
   registered_ = true;
   is_aborted_ = false;
-  if (thd_is_transaction()) {
-    isTransaction = true;
-    register_transaction_to_mysql();
-  }
-  else {
-    register_single_statement_to_mysql();
+  if (thd_is_transaction()) isTransaction = true;
+  register_transaction_to_mysql();
+}
+
+bool HeliosTransaction::take_plan_row(const HeliosProxy::ReadPlanStep& step,
+                                      HeliosProxy::ReadPlanStepResult& result,
+                                      size_t j, std::string& key,
+                                      std::string& value, uint64_t& tid) {
+  key = std::move(result.scan_keys[j]);
+  value = j < result.scan_values.size() ? std::move(result.scan_values[j])
+                                        : std::string();
+  tid = j < result.scan_tids.size() ? result.scan_tids[j] : 0;
+  const bool found = !value.empty();
+  record_row_cache(step.table_name, key, found, value, tid);
+  return found;
+}
+
+void HeliosTransaction::append_index_group(
+    SecondaryScan& out, const std::string& secondary_key,
+    const std::vector<std::string>& primary_keys) {
+  for (const auto& pk : primary_keys) {
+    out.secondary_keys.push_back(secondary_key);
+    out.primary_keys.push_back(pk);
   }
 }
 
@@ -1389,8 +1385,4 @@ bool HeliosTransaction::thd_is_transaction() const {
 void HeliosTransaction::register_transaction_to_mysql() {
   const ulonglong threadID = static_cast<ulonglong>(thread->thread_id());
   ::trans_register_ha(thread, isTransaction, hton, &threadID);
-}
-
-void HeliosTransaction::register_single_statement_to_mysql() {
-  register_transaction_to_mysql();
 }
