@@ -1,8 +1,9 @@
 """Read view consistency for writes that land inside the scan.
 
-quiescence_1sr_hole.py pins the two schedules whose write lands before the
-scan starts: the fence waits for the paused COMMIT (all-new), or the fence
-completes first and the whole write resolves through epoch images (all-old).
+strict_serializability_hole.py pins the two schedules whose write lands
+before the scan starts: the read view fence waits for the paused COMMIT
+(all-new), or it completes first and the whole write resolves through epoch
+images (all-old).
 Neither reaches the schedule this file covers: an install landing after the
 scan has claimed a group and started reading its slots. That is what the
 per-chunk preserve validation exists for, so it needs its own regression.
@@ -53,7 +54,7 @@ re-read, a group whose counter held fails the request). Reaching the stored
 half needs a table loaded with sql_mode relaxed, which this file does not
 build.
 
-Operational notes: as in quiescence_1sr_hole.py, the test owns the local
+Operational notes: as in strict_serializability_hole.py, the test owns the local
 stack, restarts it with the sync points armed, and stops it afterwards.
 """
 

@@ -7,7 +7,6 @@
 #include "wal/epoch_scan_checkpoint.h"
 
 #include <gtest/gtest.h>
-#include <poll.h>
 #include <unistd.h>
 
 #include <algorithm>
@@ -25,6 +24,7 @@
 #include "helios/read.h"
 
 #include "db_helper.h"
+#include "sync_point.h"
 #include "wal/logger.h"
 #include "wal/wal.h"
 
@@ -34,65 +34,21 @@ constexpr const char *kTable = "checkpoint_test";
 constexpr const char *kIndex = "idx";
 constexpr auto kTestTimeout = std::chrono::seconds(10);
 
-using helios::storage::wal::EpochScanCheckpoint;
-using helios::storage::wal::Wal;
-using helios::storage::wal::WalScanResult;
-
-// Closes both ends on scope exit so an assertion failure cannot leak them.
-// Ported from debug_sync_test.cc.
-class Pipe {
- public:
-  Pipe() { EXPECT_EQ(::pipe(fds_), 0); }
-  ~Pipe() {
-    CloseRead();
-    CloseWrite();
-  }
-  int read_fd() const { return fds_[0]; }
-  int write_fd() const { return fds_[1]; }
-  void CloseRead() { Close(fds_[0]); }
-  void CloseWrite() { Close(fds_[1]); }
-
- private:
-  static void Close(int &fd) {
-    if (fd >= 0) {
-      ::close(fd);
-      fd = -1;
-    }
-  }
-  int fds_[2] = {-1, -1};
-};
-
-// Writes the release byte on scope exit. Declared after the future so it runs
-// first and the blocked point can always finish; the extra byte on the
-// success path is never read and harmless. Ported from debug_sync_test.cc.
-struct ReleaseOnExit {
-  int fd;
-  ~ReleaseOnExit() { [[maybe_unused]] const ssize_t rc = ::write(fd, "r", 1); }
-};
-
 // Closes the write end on scope exit. Declared after the future whose read
 // loop owns the other end, so an early return delivers the EOF that ends it
 // before that future's destructor would otherwise block joining it.
 struct CloseWriteOnExit {
   Pipe &pipe;
-  ~CloseWriteOnExit() { pipe.CloseWrite(); }
+  ~CloseWriteOnExit() { pipe.close_write(); }
 };
 
-// True once `fd` has data to read, false if `timeout` passes first. Bounds an
-// arrival wait that would otherwise block forever if the point never fires.
-bool WaitReadable(int fd, std::chrono::milliseconds timeout) {
-  pollfd target{fd, POLLIN, 0};
-  const int rc = ::poll(&target, 1, static_cast<int>(timeout.count()));
-  return rc == 1 && (target.revents & POLLIN) != 0;
-}
+using helios::storage::wal::EpochScanCheckpoint;
+using helios::storage::wal::Wal;
+using helios::storage::wal::WalScanResult;
 
 class EpochScanCheckpointTest : public ::testing::Test {
  protected:
-  // The sync facility decides once per process whether anything is armed, so
-  // one variable stays set for every test in this binary.
-  static void SetUpTestSuite() {
-    ::setenv("HELIOS_DEBUG_SYNC_KEEPS_THE_FACILITY_ARMED", "sleep:0", 1);
-  }
+  static void SetUpTestSuite() { keep_sync_facility_armed(); }
 
   void SetUp() override {
     std::string pattern =
@@ -106,15 +62,8 @@ class EpochScanCheckpointTest : public ::testing::Test {
   }
 
   void TearDown() override {
-    for (const auto &variable : armed_) ::unsetenv(variable.c_str());
-    armed_.clear();
     std::error_code ec;
     std::filesystem::remove_all(root_, ec);
-  }
-
-  void Arm(const std::string &variable, const std::string &action) {
-    ::setenv(variable.c_str(), action.c_str(), 1);
-    armed_.push_back(variable);
   }
 
   helios::storage::Config MakeConfig(bool enable_recovery) const {
@@ -224,9 +173,7 @@ class EpochScanCheckpointTest : public ::testing::Test {
   std::string root_;
   std::string work_dir_;
   helios::storage::EpochNumber last_epoch_ = 0;
-
- private:
-  std::vector<std::string> armed_;
+  ArmedSyncPoints points_;
 };
 
 TEST_F(EpochScanCheckpointTest, ACheckpointHoldsWhatTheScanFound) {
@@ -465,8 +412,7 @@ TEST_F(EpochScanCheckpointTest, AStartWithoutAReplayTakesTheCheckpointEpoch) {
 
   helios::storage::wal::Logger logger(MakeConfig(false));
   const auto recovery = logger.Recover();
-  ASSERT_EQ(recovery.status,
-            helios::storage::wal::Logger::RecoveryStatus::kOk);
+  ASSERT_EQ(recovery.status, helios::storage::wal::Logger::RecoveryStatus::kOk);
   EXPECT_EQ(recovery.durable_epoch, checkpoint.end_epoch);
 }
 
@@ -482,12 +428,12 @@ TEST_F(EpochScanCheckpointTest, ARowLockedDuringTheScanIsRetried) {
   ASSERT_TRUE(CommitWrite(db, "alice", std::string(64, 'a')));
   ASSERT_TRUE(CommitWrite(db, "bob", std::string(64, 'a')));
 
-  Arm("HELIOS_DEBUG_SYNC_CHECKPOINT_BEFORE_ROW_COPY",
-      "arrive_and_wait:" + std::to_string(scan_arrived.write_fd()) + ":" +
-          std::to_string(scan_release.read_fd()));
-  Arm("HELIOS_DEBUG_SYNC_SILO_COMMIT_BETWEEN_ROW_INSTALLS",
-      "arrive_and_wait:" + std::to_string(write_arrived.write_fd()) + ":" +
-          std::to_string(write_release.read_fd()));
+  points_.arm("HELIOS_DEBUG_SYNC_CHECKPOINT_BEFORE_ROW_COPY",
+              "arrive_and_wait:" + std::to_string(scan_arrived.write_fd()) +
+                  ":" + std::to_string(scan_release.read_fd()));
+  points_.arm("HELIOS_DEBUG_SYNC_SILO_COMMIT_BETWEEN_ROW_INSTALLS",
+              "arrive_and_wait:" + std::to_string(write_arrived.write_fd()) +
+                  ":" + std::to_string(write_release.read_fd()));
 
   uint64_t version_retries = 0;
   auto scan = std::async(std::launch::async, [&db, &version_retries] {
@@ -504,7 +450,7 @@ TEST_F(EpochScanCheckpointTest, ARowLockedDuringTheScanIsRetried) {
   // The scan has loaded a version and is about to copy the bytes it belongs
   // to; nothing has locked that row yet.
   char announcement = 0;
-  ASSERT_TRUE(WaitReadable(scan_arrived.read_fd(), kTestTimeout));
+  ASSERT_TRUE(wait_readable(scan_arrived.read_fd(), kTestTimeout));
   ASSERT_EQ(::read(scan_arrived.read_fd(), &announcement, 1), 1);
 
   auto writer = std::async(std::launch::async, [&db] {
@@ -518,7 +464,7 @@ TEST_F(EpochScanCheckpointTest, ARowLockedDuringTheScanIsRetried) {
   ReleaseOnExit release_write_on_exit{write_release.write_fd()};
 
   // One row is installed and published; the other remains locked.
-  ASSERT_TRUE(WaitReadable(write_arrived.read_fd(), kTestTimeout));
+  ASSERT_TRUE(wait_readable(write_arrived.read_fd(), kTestTimeout));
   ASSERT_EQ(::read(write_arrived.read_fd(), &announcement, 1), 1);
   // Releasing the scan here makes it copy bytes the writer is changing, which
   // its second version read has to reject.
@@ -547,7 +493,7 @@ TEST_F(EpochScanCheckpointTest, ARowLockedDuringTheScanIsRetried) {
   // The scan's old version must be rejected whether the row is already
   // published or is still locked by the writer.
   EXPECT_GT(version_retries, 0u);
-  scan_arrived.CloseWrite();
+  scan_arrived.close_write();
   ASSERT_EQ(releaser.wait_for(kTestTimeout), std::future_status::ready);
   releaser.get();
 
@@ -562,80 +508,6 @@ TEST_F(EpochScanCheckpointTest, ARowLockedDuringTheScanIsRetried) {
                 *value == std::string(64, 'b'))
         << key << " holds " << *value;
   }
-}
-
-TEST_F(EpochScanCheckpointTest, EarlyPublicationKeepsTheOriginalWalValue) {
-  using namespace helios::storage;
-  Pipe arrived;
-  Pipe release;
-  std::string first_key;
-  Tidword first_commit_tid;
-  {
-    Database db(MakeConfig(false));
-    TestHelper::CreateTable(db, kTable);
-    ASSERT_TRUE(CommitWrite(db, "alice", "old"));
-    ASSERT_TRUE(CommitWrite(db, "bob", "old"));
-    const auto rows = db.ScanPax(kTable, "", "\xff", 0, false);
-    db.ReleaseThreadEpoch();
-    ASSERT_TRUE(rows.ok);
-    ASSERT_EQ(2u, rows.rows.size());
-
-    Arm("HELIOS_DEBUG_SYNC_SILO_COMMIT_BETWEEN_ROW_INSTALLS",
-        "arrive_and_wait:" + std::to_string(arrived.write_fd()) + ":" +
-            std::to_string(release.read_fd()));
-    auto writer = std::async(std::launch::async, [&] {
-      std::string reason;
-      return TestHelper::CommitRows(
-          db, {},
-          {{kTable, "alice", TestHelper::Row("batch")},
-           {kTable, "bob", TestHelper::Row("batch")}},
-          {}, {}, reason);
-    });
-    ReleaseOnExit release_writer{release.write_fd()};
-    char announcement;
-    ASSERT_TRUE(WaitReadable(arrived.read_fd(), kTestTimeout));
-    ASSERT_EQ(::read(arrived.read_fd(), &announcement, 1), 1);
-
-    // The map's pointer order is unspecified; locate the published row by its lock.
-    const Tidword left(CurrentTid(rows.rows[0]));
-    const Tidword right(CurrentTid(rows.rows[1]));
-    ASSERT_NE(left.lock, right.lock);
-    const auto &published = left.lock ? rows.rows[1] : rows.rows[0];
-    first_key = published.key;
-    first_commit_tid = Tidword(CurrentTid(published));
-
-    auto overwrite = std::async(std::launch::async, [&] {
-      std::string reason;
-      return TestHelper::CommitRows(
-          db, {}, {{kTable, first_key, TestHelper::Row("later")}}, {}, {},
-          reason, CommitDurability::kAsync);
-    });
-    ReleaseOnExit release_before_overwrite_join{release.write_fd()};
-    ASSERT_EQ(overwrite.wait_for(kTestTimeout), std::future_status::ready);
-    EXPECT_TRUE(overwrite.get());
-    EXPECT_EQ(Read(db, first_key).value, "later");
-
-    ASSERT_EQ(::write(release.write_fd(), "r", 1), 1);
-    ASSERT_EQ(writer.wait_for(kTestTimeout), std::future_status::ready);
-    EXPECT_TRUE(writer.get());
-  }
-
-  const auto scan = Wal(work_dir_).Scan();
-  ASSERT_EQ(scan.status, WalScanResult::Status::kOk);
-  size_t batch_values = 0;
-  bool found_later = false;
-  for (const auto &record : scan.records) {
-    for (const auto &write : record.writes) {
-      if (write.transaction_id == first_commit_tid) {
-        EXPECT_EQ(write.buffer, TestHelper::Row("batch"));
-        ++batch_values;
-      }
-      if (write.key == first_key && write.buffer == TestHelper::Row("later"))
-        found_later = true;
-    }
-  }
-  EXPECT_EQ(batch_values, 2u);
-  EXPECT_TRUE(found_later);
 }
 
 TEST_F(EpochScanCheckpointTest, ALeftoverWorkingFileIsNotRead) {

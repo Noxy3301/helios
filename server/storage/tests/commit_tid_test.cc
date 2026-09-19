@@ -931,7 +931,7 @@ TEST_F(CommitTidTest, AbsentReadAbortsWhenTheKeyWasDeletedMeanwhile) {
   EXPECT_EQ(0u, reason_.rfind("exact_read_tid_moved", 0)) << reason_;
 }
 
-TEST_F(CommitTidTest, AbsentEvidenceAbortsAfterThePurge) {
+TEST_F(CommitTidTest, AbsentReadAbortsAfterThePurge) {
   auto *item = SeedRow("k", Version(10, 4));
   ASSERT_TRUE(Commit({}, {{kTable, "k", "", RowOp::kDelete}})) << reason_;
   const uint64_t deleted = item->transaction_id.load().obj;

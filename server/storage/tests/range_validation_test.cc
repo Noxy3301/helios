@@ -1,7 +1,7 @@
 /**
  * @file server/storage/tests/range_validation_test.cc
  * Which changes inside a validated range abort the transaction that read
- * it, and which fall outside its cap.
+ * it, and which fall outside its row limit.
  */
 
 #include <filesystem>
@@ -80,18 +80,6 @@ void SeedRows(helios::storage::Database &db) {
   }
 }
 
-// Leaves a record that never held a value. Resolving a write inserts
-// the blank record before validation runs, and an aborted commit leaves it
-// behind.
-void LeaveBlankRecord(helios::storage::Database &db, const std::string &key) {
-  std::string reason;
-  const bool committed = TestHelper::CommitRows(
-      db, {{kTable, "k1", 0}}, {{kTable, key, TestHelper::Row("v")}}, {}, {},
-      reason);
-  ASSERT_FALSE(committed) << "the write was supposed to abort";
-  EXPECT_FALSE(reason.empty()) << "an abort names its reason";
-}
-
 }  // namespace
 
 TEST(RangeValidationTest, AnUnchangedRangeCommits) {
@@ -168,7 +156,7 @@ TEST(RangeValidationTest, ARowInsertedAtTheEndOfTheRangeAborts) {
   EXPECT_EQ(reason, "primary_range_result_changed");
 }
 
-TEST(RangeValidationTest, ALimitedRangeIgnoresChangesPastItsCap) {
+TEST(RangeValidationTest, ALimitedRangeIgnoresChangesPastItsRowLimit) {
   auto config = MakeConfig();
   helios::storage::Database db(config);
   ASSERT_TRUE(TestHelper::CreateTable(db, kTable));
@@ -182,14 +170,21 @@ TEST(RangeValidationTest, ALimitedRangeIgnoresChangesPastItsCap) {
   EXPECT_TRUE(Revalidate(db, range, reason)) << reason;
 }
 
-TEST(RangeValidationTest, ABlankRecordDoesNotConsumeTheCap) {
-  // The cap counts live rows. A blank record between the first two of them must
-  // leave the re-scan room to reach the second.
+TEST(RangeValidationTest, ABlankRecordDoesNotConsumeTheRowLimit) {
+  // The row limit counts live rows. A blank record between the first two of
+  // them must leave the re-scan room to reach the second.
   auto config = MakeConfig();
   helios::storage::Database db(config);
   ASSERT_TRUE(TestHelper::CreateTable(db, kTable));
   SeedRows(db);
-  LeaveBlankRecord(db, "k15");
+
+  // A write whose read set is stale inserts its blank record before
+  // validation runs, and the abort leaves the record behind.
+  std::string blank_reason;
+  ASSERT_FALSE(TestHelper::CommitRows(db, {{kTable, "k1", 0}},
+                                      {{kTable, "k15", TestHelper::Row("v")}},
+                                      {}, {}, blank_reason));
+  EXPECT_FALSE(blank_reason.empty()) << "an abort names its reason";
 
   const auto range = ScanRange(db, "k1", "k5", 2);
   ASSERT_EQ(range.result_keys, (std::vector<std::string>{"k1", "k2"}));
@@ -226,7 +221,7 @@ TEST(RangeValidationTest, ARowAppearingInAnEmptyRangeAborts) {
   EXPECT_EQ(reason, "primary_range_result_changed");
 }
 
-TEST(RangeValidationTest, EvidenceRepeatingAKeyAborts) {
+TEST(RangeValidationTest, ARangeReadSetRepeatingAKeyAborts) {
   // A primary index cannot return the same key twice, so a range read set
   // that repeats one is rejected rather than matched by the positional walk.
   auto config = MakeConfig();

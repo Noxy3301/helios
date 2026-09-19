@@ -1,6 +1,6 @@
-"""An insert whose absence read outlived the reaper's purge must not win.
+"""An insert whose absent read outlived the reaper's purge must not win.
 
-The reaper-ABA schedule: the insert's absence read resolves the tombstone's
+The reaper-ABA schedule: the insert's absent read resolves the tombstone's
 index entry, the reaper purges it, and the insert then claims a fresh entry.
 A row committed into that fresh entry must survive and the insert must be
 refused at COMMIT. The server is started here rather than by the runner
@@ -128,14 +128,14 @@ def wait_for_arrival(arrived_r, timeout):
 
 def commit_refusal_names_the_race(errno, message):
     # The refusal is made at the commit, which has no handler in scope, so it
-    # arrives wrapped. The purge recycled the entry the absence read observed,
+    # arrives wrapped. The purge recycled the entry the absent read observed,
     # so the read fails validation (149) before the duplicate check runs; a
     # duplicate refusal (121) would mean the entry was never purged.
     return errno == 1180 and "Got error 149" in message
 
 
-def test_insert_after_a_purged_absence_read(user, password,
-                                            arrived_r, release_w):
+def test_insert_after_a_purged_absent_read(user, password,
+                                           arrived_r, release_w):
     log("a row installed after the read's entry was purged must survive")
     connection = get_connection(user=user, password=password)
     connection.autocommit = True
@@ -157,7 +157,7 @@ def test_insert_after_a_purged_absence_read(user, password,
             f"{ARRIVAL_WAIT_SECONDS}s")
         return 1
 
-    # The absence read resolves the parked entry and spins on its lock bit, so
+    # The absent read resolves the parked entry and spins on its lock bit, so
     # it can only return after the release publishes the retired TID. A timer
     # thread releases the reaper; the read blocking for at least that long is
     # the proof that it resolved the entry before the purge.
@@ -257,7 +257,7 @@ def main():
     try:
         server = start_server(work_dir, arrived_w, release_r)
         start_mysqld()
-        failures = test_insert_after_a_purged_absence_read(
+        failures = test_insert_after_a_purged_absent_read(
             args.user, args.password, arrived_r, release_w)
     except Exception as failure:  # noqa: BLE001 - reported by the test
         print(f"FAIL: {failure!r}")

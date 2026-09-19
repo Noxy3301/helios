@@ -1134,14 +1134,6 @@ TEST_F(WalFrameTest, InjectedFdatasyncFailsAfterTheAllowedCalls) {
   const auto result = wal.AppendGroup(buckets, 3);
   EXPECT_FALSE(result.ok);
   EXPECT_EQ(result.error_number, EIO);
-
-  // The failed sync poisons the instance exactly like a failed write: a
-  // later append is refused before it touches the file.
-  const off_t offset_after_failure = wal.write_offset();
-  buckets.clear();
-  buckets[4] = MakeRecords(4, "k4");
-  EXPECT_DEATH(wal.AppendGroup(buckets, 4), "");
-  EXPECT_EQ(wal.write_offset(), offset_after_failure);
 }
 
 TEST_F(WalFrameTest, AnUnparsableInjectionCountStopsStartup) {

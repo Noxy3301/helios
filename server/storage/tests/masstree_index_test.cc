@@ -153,7 +153,7 @@ TEST(MasstreeIndexTest, PrimaryEntryTakesItsPaxSlotOnAllocation) {
   index::release_thread_epoch();
 }
 
-TEST(MasstreeIndexTest, ReaperPreservesReusedSecondaryEntry) {
+TEST(MasstreeIndexTest, ReaperDoesNotPurgeReusedSecondaryEntry) {
   using namespace helios::storage;
   index::MasstreeIndex tree;
   index::Reaper reaper;

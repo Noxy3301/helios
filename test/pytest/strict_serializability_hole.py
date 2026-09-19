@@ -1,8 +1,8 @@
-"""Read view consistency across commit row installs (1SR regression).
+"""Read view consistency across commit row installs.
 
-1SR (one-copy serializability with real-time order) requires every read to
-return a complete committed state and a read issued after a commit returns
-to see that commit. Per-group write counters cannot provide this: they
+Strict serializability (external consistency) requires every read to return
+a complete committed state, and a read issued after a commit returns to see
+that commit. Per-group write counters cannot provide this: they
 return to even after every ROW install, so a reader scheduled between two
 row installs of a multi-row commit observes a stable-looking half-applied
 table. The DuckDB executor reads a read view opened behind the read view
@@ -205,8 +205,7 @@ def run_scenario(cursor, user, password, scenario):
 
     Coverage note: the paused writer stays ONLINE at its commit epoch, so
     the windowed reader's read view fence waits for the paused COMMIT to
-    finish installing and the read serializes after it (all-new). The old
-    contract returned a torn result on this exact schedule; the
+    finish installing and the read serializes after it (all-new). The
     before-image resolution itself is exercised by
     run_read_view_before_write, where the fence completes first.
     """
@@ -357,11 +356,8 @@ def run_read_view_before_write(cursor, user, password, scenario):
     The reader's read view fence completes before the writer goes online, so
     the writer's commit epoch exceeds the read view cut and every row it
     installs must resolve through the version store: updates and deletes to
-    their captured before-images (a deleted row must reappear), inserts to
-    absence (a fresh slot must stay invisible). The old quiescence contract
-    could never serve this schedule (it either returned torn bytes or
-    aborted); returning the complete old state is the multi-version read's
-    defining behavior.
+    their captured before-images (a deleted row must reappear), and inserts
+    to an absent record (a record installed later must stay invisible).
     """
     table = "held_" + scenario["table"]
     print(f"SCENARIO read-view-before-write/{scenario['name']}")
