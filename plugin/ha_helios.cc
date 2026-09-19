@@ -560,14 +560,14 @@ mysql_declare_plugin(helios){
     PLUGIN_AUTHOR_ORACLE,
     "Helios storage engine",
     PLUGIN_LICENSE_GPL,
-    helios_init_func, /* Plugin Init */
-    nullptr,             /* Plugin check uninstall */
-    helios_deinit_func,  /* Plugin Deinit */
+    helios_init_func,        /* Plugin Init */
+    nullptr,                 /* Plugin check uninstall */
+    helios_deinit_func,      /* Plugin Deinit */
     0x0001 /* 0.1 */,
-    nullptr,                    /* status variables */
+    nullptr,                 /* status variables */
     helios_system_variables, /* system variables */
-    nullptr,                    /* config options */
-    0,                          /* flags */
+    nullptr,                 /* config options */
+    0,                       /* flags */
 },
 {
     MYSQL_STORAGE_ENGINE_PLUGIN,
@@ -577,11 +577,11 @@ mysql_declare_plugin(helios){
     "Helios DuckDB secondary engine",
     PLUGIN_LICENSE_GPL,
     helios_duckdb_init,   /* Plugin Init */
-    nullptr,                   /* Plugin check uninstall */
+    nullptr,              /* Plugin check uninstall */
     helios_duckdb_deinit, /* Plugin Deinit */
     0x0001 /* 0.1 */,
-    nullptr, /* status variables */
-    nullptr, /* system variables */
-    nullptr, /* config options */
-    0,       /* flags */
+    nullptr,              /* status variables */
+    nullptr,              /* system variables */
+    nullptr,              /* config options */
+    0,                    /* flags */
 } mysql_declare_plugin_end;

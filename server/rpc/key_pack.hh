@@ -11,7 +11,7 @@
 // Bump the byte string to its lexicographic successor; empty on overflow.
 std::string next_lexicographic_key(std::string key);
 
-// Bytes of one column of a serialized row [null_flags][col_0]..[col_n], each
+// Bytes of one column of a packed row [null_flags][col_0]..[col_n], each
 // field [byteSize:1B][len:byteSize B][bytes], byteSize 0xFF meaning NULL.
 std::string_view unpack_row_field(const std::string& row,
                                       int column_index);

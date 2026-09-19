@@ -126,8 +126,9 @@ uint32_t fence_timeout_ms() {
 
 // ---------------------------------------------------------------------------
 // Helios packed row format: unpacking, for epoch images. A preserved old_row
-// is a packed row payload whose typed fields carry val_str ASCII; the parsers mirror the
-// scatter-side packing, and a failure is a broken invariant and throws.
+// is a packed row payload whose typed fields carry val_str ASCII; the parsers
+// mirror the packing the plugin writes, and a failure is a broken invariant
+// and throws.
 // ---------------------------------------------------------------------------
 
 /**
@@ -545,9 +546,8 @@ unique_ptr<LocalTableFunctionState> pax_init_local(ExecutionContext&,
  * @brief One output row whose in-place DATE cell names no calendar day.
  *
  * @details A cell a concurrent writer tore reads this way, and so does a
- * date stored under a relaxed sql_mode. The chunk validation tells them
- * apart: a
- * group whose preserve counter moved has the row re-read, and a group whose
+ * date stored under a relaxed sql_mode. The chunk validation tells them apart:
+ * a group whose preserve counter moved has the row re-read, and a group whose
  * counter held stored the value.
  */
 struct InvalidDate {
@@ -577,9 +577,8 @@ inline bool try_canonical_date(int32_t year, int32_t month, int32_t day,
  * @brief Converts a year/month/day into a date_t and raises when the parts
  * name no calendar day.
  *
- * @details For a value no chunk validation covers: an epoch image carries
- * the ASCII a
- * writer formatted under a lock, which no reader can tear.
+ * @details For a value no chunk validation covers: an epoch image carries the
+ * ASCII a writer formatted under a lock, which no reader can tear.
  */
 inline date_t canonical_date(int32_t year, int32_t month, int32_t day) {
   date_t result;

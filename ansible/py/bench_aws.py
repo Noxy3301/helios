@@ -711,8 +711,8 @@ Examples:
                         help="TPC-H serial mode (true/false)")
     parser.add_argument("--read-path", choices=["row", "plan"], default="plan",
                         help="SET GLOBAL helios_read_path on every MySQL: row sends one "
-                             "request per handler call, plan caches a read plan per "
-                             "statement (default: plan)")
+                             "request per handler call, plan executes a read plan per "
+                             "statement and caches its results (default: plan)")
     parser.add_argument("--tx-plan", action="store_true",
                         help="Pass HELIOS_PREFETCH_PLAN=1 to BenchBase so the TPC-C "
                              "procedures inject @_tx_plan, instead of the per-statement "

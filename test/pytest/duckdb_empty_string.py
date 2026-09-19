@@ -46,8 +46,8 @@ SERVER_ENV = ("HELIOS_DEBUG_SYNC_PAX_VIEW_AFTER_FENCE"
               f"=sleep:{FENCE_HOLD_MS}")
 # The scan tallies, read back from the server log.
 SERVER_CONF = {"olap_trace": 1}
-# Where the writer's commit lands inside the fence hold; a fence takes one
-# to two epochs, so this also clears it.
+# Where the writer's commit lands inside the read view fence hold, which
+# takes one to two epochs, so this also clears it.
 WRITE_AT_S = 0.35
 
 DB = "ha_helios_test"
@@ -250,7 +250,7 @@ class Reader(threading.Thread):
 
 
 class Writer(threading.Thread):
-    """One transaction whose commit lands inside the reader's fence hold."""
+    """One transaction whose commit lands inside the read view fence hold."""
 
     def __init__(self, user, password):
         super().__init__(daemon=True)
@@ -353,7 +353,7 @@ def run_probe(user, password):
 
 def main(user, password):
     os.environ.pop("MYSQL_UNIX_PORT", None)
-    print(f"restarting stack with a {FENCE_HOLD_MS}ms fence hold")
+    print(f"restarting stack with a {FENCE_HOLD_MS}ms read view fence hold")
     sh(f"./scripts/stop_mysql.sh {QUIET}")
     sh(f"./scripts/stop_server.sh {QUIET}")
     ensure_stack_stopped()

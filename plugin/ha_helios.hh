@@ -187,7 +187,8 @@ private:
   std::vector<std::vector<std::byte>> scanned_values_;
   // Scan buffer so the rnd_pos() re-reads after an ORDER BY sort cost no RPC.
   // Populated during rnd_next()/fill_scan_buffer(), cleared on next rnd_init().
-  std::unordered_map<std::string, size_t> scan_buffer_;  // primary key -> index in scanned_values_
+  // Maps the primary key to its index in scanned_values_.
+  std::unordered_map<std::string, size_t> scan_buffer_;
   std::vector<std::string> secondary_index_results_;
   std::vector<std::string> secondary_index_payloads_;
 
@@ -732,8 +733,8 @@ private:
    * @brief Backfill one unique secondary index serially via the write buffer.
    *
    * @details Scans the table and commits in bounded chunks, keeping the
-   * buffered commit path so the server's in-write duplicate check runs. Returns false on
-   * any failure; the caller fails the ALTER.
+   * buffered commit path so the server's in-write duplicate check runs.
+   * Returns false on any failure; the caller fails the ALTER.
    */
   bool backfill_unique_serial(const std::string &index_name,
                               const KEY &runtime_key);

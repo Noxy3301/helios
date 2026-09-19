@@ -372,8 +372,7 @@ int ha_helios::execute_unique_point(uchar *buf, HeliosTransaction *tx) {
     last_fetched_primary_key_ = current_plan_.packed_start_key;
     return 0;
   } else {
-    // Secondary UNIQUE: read_secondary_index → read primary key
-    // Plugin adaptation: read_secondary_index returns vector<string> (primary keys)
+    // Secondary UNIQUE: read_secondary_index gives the primary keys to read
     auto primary_keys = tx->read_secondary_index(
         current_index_name, current_plan_.packed_start_key);
 

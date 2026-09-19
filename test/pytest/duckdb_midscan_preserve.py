@@ -15,11 +15,11 @@ The schedule is built out of the same two sync points:
     installs of one transaction
 
 The reader starts first and the writer is released so that its FIRST install
-lands during the fence hold (an image already there when the group is
-claimed) and its SECOND lands while the scan is running. The delay is derived
-from a measured scan, and the timing the run actually achieved is asserted
-afterwards, so a run that missed the window fails loudly instead of passing
-vacuously.
+lands during the read view fence hold (an image already there when the group
+is claimed) and its SECOND lands while the scan is running. The delay is
+derived from a measured scan, and the timing the run actually achieved is
+asserted afterwards, so a run that missed the window fails loudly instead of
+passing vacuously.
 
 The scan is made long enough to span the pause by a per-row LIKE over a wide
 column and a single analytical thread (olap_threads = 1). The query
@@ -40,12 +40,12 @@ scan is reading when the second install lands):
 A paused commit lands its two installs at two instants, so it cannot prove
 the per-chunk validation ran: the aimed install can still land before the group
 is claimed and be resolved by the claim copy. The three paused scenarios verify
-the returned rows, which pins the boundary cases (an install inside the fence
-hold resolves through the claim copy, an insert stays invisible, a delete
-reads from its image). The validation itself is pinned by the last scenario: a
-writer updates scattered rows for the whole length of the scan, so installs
-land in groups the scan is holding, and the run asserts that at least one
-chunk validation had to re-read a group.
+the returned rows, which pins the boundary cases (an install inside the read
+view fence hold resolves through the claim copy, an insert stays invisible, a
+delete reads from its image). The validation itself is pinned by the last
+scenario: a writer updates scattered rows for the whole length of the scan,
+so installs land in groups the scan is holding, and the run asserts that at
+least one chunk validation had to re-read a group.
 
 Not covered here: an in-place DATE cell that names no calendar day. A cell a
 writer tore and a date stored under a relaxed sql_mode both read that way,
@@ -92,7 +92,7 @@ SERVER_CONF = {
     # The table is loaded one row per transaction, because the install pause
     # fires between the row installs of any larger one.
     "commit_durability": "async"}
-# A fence takes one to two epochs; the writer delay allows for it.
+# A read view fence takes one to two epochs; the writer delay allows for it.
 FENCE_S = 0.06
 # Where the second install should land inside the scan.
 INSTALL_AT = 0.45
@@ -303,7 +303,7 @@ def last_scan_tally():
 
 
 def measure_scan(cursor, table):
-    """Scan time of one FORCED read, with the fence hold subtracted."""
+    """Scan time of one FORCED read, less the read view fence hold."""
     cursor.execute("SET SESSION use_secondary_engine = FORCED")
     started = time.monotonic()
     cursor.execute(fill(QUERY, table))
@@ -316,10 +316,11 @@ def measure_scan(cursor, table):
 def run_scenario(cursor, user, password, scenario):
     """One paused commit: the rows the scan returns must be the pre-write ones.
 
-    This pins the boundary cases (an install inside the fence hold resolves
-    through the claim copy, an insert stays invisible, a delete reads from its
-    image). It does not pin the per-chunk validation: the second install can
-    land before its group is claimed, and then the claim copy answers.
+    This pins the boundary cases (an install inside the read view fence hold
+    resolves through the claim copy, an insert stays invisible, a delete reads
+    from its image). It does not pin the per-chunk validation: the second
+    install can land before its group is claimed, and then the claim copy
+    answers.
     """
     table = scenario["table"]
     print(f"SCENARIO {scenario['name']}")
@@ -331,13 +332,13 @@ def run_scenario(cursor, user, password, scenario):
         print(f"\tFailed: scan of {scan_s * 1000:.0f}ms is too short to span "
               f"an install; raise ROWS")
         return 1
-    # The first install lands during the fence hold, the second part of the
-    # way into the scan that follows it.
+    # The first install lands during the read view fence hold, the second
+    # part of the way into the scan that follows it.
     delay_s = (FENCE_HOLD_MS / 1000.0 + FENCE_S + INSTALL_AT * scan_s -
                PAUSE_MS / 1000.0)
     if delay_s <= 0.2:
-        print("\tFailed: the fence hold is shorter than the install pause; "
-              "the first install cannot land before the scan")
+        print("\tFailed: the read view fence hold is shorter than the install "
+              "pause; the first install cannot land before the scan")
         return 1
 
     secondary_before = secondary_execution_count(cursor)
@@ -572,7 +573,7 @@ def run_probe(user, password):
 def main(user, password):
     os.environ.pop("MYSQL_UNIX_PORT", None)
     print(f"restarting stack with {PAUSE_MS}ms install sync point, "
-          f"{FENCE_HOLD_MS}ms fence hold and one OLAP thread")
+          f"{FENCE_HOLD_MS}ms read view fence hold and one OLAP thread")
     sh(f"./scripts/stop_mysql.sh {QUIET}")
     sh(f"./scripts/stop_server.sh {QUIET}")
     ensure_stack_stopped()
