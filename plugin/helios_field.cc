@@ -47,8 +47,8 @@ void HeliosField::set_helios_field(const char *const src, const size_t length) {
 
 void HeliosField::make_mysql_table_row(const std::byte *const raw_row,
                                        const size_t length) {
-  // Zero-copy parse: record each field as a string_view pointing into
-  // raw_row. No per-field allocations, no string copies.
+  // Record each field as a string_view pointing into raw_row: the payloads
+  // are not copied.
   row.clear();
   nullFlagView = {};
 

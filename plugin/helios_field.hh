@@ -32,18 +32,15 @@ class HeliosField {
   size_t convert_bytes_to_numeric(const std::byte* const bytes,
                                   const size_t length) const;
 
-  /**
-   * @brief Packs one MySQL field value, then hands back the packed bytes.
-   */
   void set_helios_field(const char* const src, const size_t length);
   std::string get_helios_field() const;
 
   /**
    * @brief Parses a packed row into one view per field.
    *
-   * Each field is recorded as a (pointer, length) pair into raw_row. No
-   * allocations or copies are performed, and the caller MUST keep raw_row
-   * alive while iterating via get_column_of_row().
+   * Each field is recorded as a (pointer, length) pair into raw_row, so no
+   * field payload is copied, and the caller MUST keep raw_row alive while
+   * iterating via get_column_of_row().
    */
   void make_mysql_table_row(const std::byte *const raw_row,
                             const size_t length);
