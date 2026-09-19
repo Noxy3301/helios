@@ -97,19 +97,15 @@ bool FsyncDirectory(const std::string &directory, int &error) {
 
 WalIo WalIo::Posix() {
   WalIo io;
-  io.pwrite = [](int fd, const void *data, size_t size, off_t offset) {
-    return ::pwrite(fd, data, size, offset);
-  };
+  io.pwrite = ::pwrite;
   io.initialise_pwrite = io.pwrite;
-  io.pread = [](int fd, void *data, size_t size, off_t offset) {
-    return ::pread(fd, data, size, offset);
-  };
+  io.pread = ::pread;
 
   // Armed from the environment, like a debug sync point, so an out-of-process
   // test can arrange an EIO. Unset means the bare syscall.
   const char *raw = std::getenv("HELIOS_WAL_FDATASYNC_FAIL_AFTER");
   if (raw == nullptr) {
-    io.fdatasync = [](int fd) { return ::fdatasync(fd); };
+    io.fdatasync = ::fdatasync;
     return io;
   }
   // Digits only. A value that does not parse stops startup rather than

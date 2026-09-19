@@ -66,15 +66,18 @@ inline constexpr char kEnvPrefix[] = "HELIOS_DEBUG_SYNC_";
 // Longest sleep a point may ask for: a test that wants longer is a hang.
 inline constexpr long kSleepCapMs = 10000;
 
-inline bool DebugSyncArmed() {
-  static const bool armed = [] {
-    for (char **e = environ; *e != nullptr; ++e) {
-      if (std::strncmp(*e, kEnvPrefix, sizeof(kEnvPrefix) - 1) == 0) {
-        return true;
-      }
+// True when the environment holds any point's variable.
+inline bool debug_sync_env_present() {
+  for (char **e = environ; *e != nullptr; ++e) {
+    if (std::strncmp(*e, kEnvPrefix, sizeof(kEnvPrefix) - 1) == 0) {
+      return true;
     }
-    return false;
-  }();
+  }
+  return false;
+}
+
+inline bool DebugSyncArmed() {
+  static const bool armed = debug_sync_env_present();
   return armed;
 }
 

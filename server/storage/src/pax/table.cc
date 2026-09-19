@@ -36,18 +36,23 @@ inline bool ParseI64(const char *s, size_t len, int64_t &out) {
   return res.ec == std::errc() && res.ptr == s + len;
 }
 
+// n ASCII digits, most significant first, accumulated into out.
+inline bool parse_digits(const char *p, int n, int64_t &out) {
+  for (int i = 0; i < n; i++) {
+    if (p[i] < '0' || p[i] > '9') return false;
+    out = out * 10 + (p[i] - '0');
+  }
+  return true;
+}
+
 // "YYYY-MM-DD" -> YYYYMMDD (fits int32; `string order == int order`).
 inline bool ParseDate(const char *s, size_t len, int64_t &out) {
   if (len != 10 || s[4] != '-' || s[7] != '-') return false;
   int64_t y = 0, m = 0, d = 0;
-  auto digs = [](const char *p, int n, int64_t &o) {
-    for (int i = 0; i < n; i++) {
-      if (p[i] < '0' || p[i] > '9') return false;
-      o = o * 10 + (p[i] - '0');
-    }
-    return true;
-  };
-  if (!digs(s, 4, y) || !digs(s + 5, 2, m) || !digs(s + 8, 2, d)) return false;
+  if (!parse_digits(s, 4, y) || !parse_digits(s + 5, 2, m) ||
+      !parse_digits(s + 8, 2, d)) {
+    return false;
+  }
   out = y * 10000 + m * 100 + d;
   return true;
 }

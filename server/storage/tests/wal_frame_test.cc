@@ -973,9 +973,8 @@ TEST_F(WalFrameTest, EmptyGroupNeitherWritesNorSyncs) {
   EXPECT_EQ(wal.write_offset(), 0);
 }
 
-// The skip's whole point: a covered frame costs one header read and nothing
-// else, except the one frame right before the tail, which is read in full as
-// a guard on the boundary the caller is trusting.
+// A covered frame costs one header read and nothing else, except the one
+// frame right before the tail, which is read in full as a guard.
 TEST_F(WalFrameTest, SkipReadsOnlyTheGuardAndTailPayloads) {
   AppendEpochs({1, 2, 3, 4, 5});
 

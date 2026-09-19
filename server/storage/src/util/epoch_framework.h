@@ -63,7 +63,7 @@ class Framework {
       : start_(false),
         stop_(false),
         global_epoch_(1),
-        epoch_thread_([=]() { EpochThreadJob(epoch_duration_ms); }) {}
+        epoch_thread_(&Framework::EpochThreadJob, this, epoch_duration_ms) {}
   /**
    * @brief Starts the epoch thread, parked until Start().
    *
@@ -76,7 +76,7 @@ class Framework {
         stop_(false),
         global_epoch_(1),
         epoch_hook_(std::move(hook)),
-        epoch_thread_([=]() { EpochThreadJob(epoch_duration_ms); }) {}
+        epoch_thread_(&Framework::EpochThreadJob, this, epoch_duration_ms) {}
 
   ~Framework() { Stop(); }
 

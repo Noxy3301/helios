@@ -170,6 +170,15 @@ bool FsyncDirectory(const std::string &directory) {
   return ok;
 }
 
+// A checkpoint that is present but cannot be trusted, carrying no records:
+// recovery falls back to the log alone.
+EpochScanCheckpoint::LoadResult unusable(const std::string &detail) {
+  EpochScanCheckpoint::LoadResult checkpoint;
+  checkpoint.status = EpochScanCheckpoint::LoadResult::Status::kUnusable;
+  checkpoint.detail = detail;
+  return checkpoint;
+}
+
 }  // namespace
 
 const char *EpochScanCheckpoint::CheckpointFileName() { return "checkpoint"; }
@@ -280,7 +289,7 @@ void EpochScanCheckpoint::Start() {
       config_.checkpoint_once_after_ms == 0) {
     return;
   }
-  thread_ = std::thread([this]() { Loop(); });
+  thread_ = std::thread(&EpochScanCheckpoint::Loop, this);
 }
 
 void EpochScanCheckpoint::Stop() {
@@ -361,10 +370,11 @@ bool EpochScanCheckpoint::RunOnce(Stats *out_stats) {
   // Keep the previous checkpoint when the scan could not settle.
   if (abandoned) {
     ::unlink(working_path_.c_str());
-    const bool stopping = [&] {
+    bool stopping = false;
+    {
       std::lock_guard<std::mutex> lock(stop_mutex_);
-      return stop_;
-    }();
+      stopping = stop_;
+    }
     if (stopping) {
       SPDLOG_INFO("Checkpoint {0} abandoned: the capture thread is stopping",
                   stats.generation);
@@ -592,13 +602,6 @@ EpochScanCheckpoint::LoadResult EpochScanCheckpoint::Load(
     return checkpoint;
   }
   const int fd = file.fd;
-
-  auto unusable = [&](const std::string &detail) {
-    checkpoint.status = LoadResult::Status::kUnusable;
-    checkpoint.detail = detail;
-    checkpoint.records.clear();
-    return checkpoint;
-  };
 
   struct stat file_stat {};
   if (::fstat(fd, &file_stat) < 0)

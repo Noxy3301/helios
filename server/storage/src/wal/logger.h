@@ -211,6 +211,11 @@ class Logger {
   std::thread logger_thread_;
 
   /**
+   * @brief Reports whether `D` is within kMaxLagEpochs of `E`.
+   */
+  bool within_max_lag(epoch::Framework &epoch) const;
+
+  /**
    * @brief Collects producer buffers and persists records through target.
    * @note Called only by the logger thread, without holding work_mutex_.
    */

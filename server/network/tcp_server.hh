@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <string>
 
 class TcpServer {
 public:
@@ -19,4 +20,5 @@ private:
     
     bool setup_and_listen(int& server_socket);
     void accept_clients(int server_socket);
+    void serve_client(int client_socket, std::string client_ip);
 };
