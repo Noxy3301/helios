@@ -249,7 +249,7 @@ void AppendField(std::string &out, std::string_view payload) {
  * or contains more than `max_fields` fields.
  */
 size_t split_row_fields(const std::byte *row, size_t size, Row::Field *out,
-                 size_t max_fields) {
+                        size_t max_fields) {
   size_t off = 0;
   size_t n = 0;
   while (off < size) {

@@ -3,10 +3,11 @@
 #include <cstddef>
 #include <string>
 
-#include "prefetch.hh"
 #include "my_dbug.h"
 #include "sql/sql_class.h"
 #include "sql/table.h"
+
+#include "prefetch.hh"
 
 // Handler full-table-scan entry points. These methods back MySQL's rnd_* scan
 // callbacks with Helios range reads and maintain the local row cache used
