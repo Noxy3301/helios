@@ -1,9 +1,9 @@
-// DuckDB bridge executor: runs a TX_EXECUTE_DUCKDB_QUERY request by building
+// DuckDB bridge executor: runs a tx_execute_duckdb_query request by building
 // DuckDB's parsed AST from the wire IR and executing it on the embedded
 // runtime, whose scan function reads the live PaxTable instances, in place for
 // groups without epoch images and through those images otherwise. DuckDB
 // contributes its binder, planner, and vectorized runtime; no table data ever
-// lives inside DuckDB. duckdb_bridge_dispatch.cc routes the opcode here.
+// lives inside DuckDB. duckdb_bridge_dispatch.cc routes that arm here.
 // bridge_threads bounds the analytical thread pool; unset is a quarter of the
 // hardware threads, which leaves the OLTP side its cores in a mixed run.
 // bridge_mem_limit bounds DuckDB's operator memory (a byte count, K/M/G

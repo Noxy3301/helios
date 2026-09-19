@@ -17,7 +17,7 @@
 #include "parallel_scan.hh"
 #include "row_codec.hh"
 
-// Read-plan execution: the TX_EXECUTE_READ_PLAN handler and its plan-key
+// Read-plan execution: the tx_execute_read_plan handler and its plan-key
 // binding glue.
 
 namespace {
@@ -111,11 +111,10 @@ std::string build_plan_key(
 
 }  // namespace
 
-void HeliosRpc::handleTxExecuteReadPlan(const std::string& message,
-                                           std::string& result) {
-    Helios::Protocol::TxExecuteReadPlan::Request request;
+void HeliosRpc::handleTxExecuteReadPlan(
+    const Helios::Protocol::TxExecuteReadPlan::Request& request,
+    std::string* result) {
     Helios::Protocol::TxExecuteReadPlan::Response response;
-    request.ParseFromString(message);
     response.set_ok(true);
 
     std::vector<Helios::Protocol::TxExecuteReadPlan::StepResult*>
@@ -317,7 +316,7 @@ void HeliosRpc::handleTxExecuteReadPlan(const std::string& message,
                           step.scan_limit(), step.reverse_scan(), nullptr);
                       if (!scan_result.ok) {
                         response.set_ok(false);
-                        flat_plan::encode_to_string(response, result);
+                        flat_plan::encode_to_string(response, *result);
                         return;
                       }
                         for (auto& r : scan_result.rows) {
@@ -333,7 +332,7 @@ void HeliosRpc::handleTxExecuteReadPlan(const std::string& message,
                           nullptr);
                       if (!scan_result.ok) {
                         response.set_ok(false);
-                        flat_plan::encode_to_string(response, result);
+                        flat_plan::encode_to_string(response, *result);
                         return;
                       }
                         for (auto& r : scan_result.rows) {
@@ -390,7 +389,7 @@ void HeliosRpc::handleTxExecuteReadPlan(const std::string& message,
                 step.reverse_scan(), nullptr);
             if (!scan_result.ok) {
                 response.set_ok(false);
-                flat_plan::encode_to_string(response, result);
+                flat_plan::encode_to_string(response, *result);
                 return;
             }
             for (auto& row : scan_result.rows) {
@@ -406,7 +405,7 @@ void HeliosRpc::handleTxExecuteReadPlan(const std::string& message,
                 step.scan_limit(), step.reverse_scan(), nullptr);
             if (!scan_result.ok) {
                 response.set_ok(false);
-                flat_plan::encode_to_string(response, result);
+                flat_plan::encode_to_string(response, *result);
                 return;
             }
             for (auto& row : scan_result.rows) {
@@ -418,5 +417,5 @@ void HeliosRpc::handleTxExecuteReadPlan(const std::string& message,
         }
     }
 
-    flat_plan::encode_to_string(response, result);
+    flat_plan::encode_to_string(response, *result);
 }

@@ -12,41 +12,13 @@
 
 class TxRpcTrace;
 
-// Frame header of one request or response (the server's message.hh), both
-// fields in network order.
-struct MessageHeader {
-    uint32_t message_type;   // OpCode from protobuf
-    uint32_t payload_size;   // size of the protobuf payload
-};
-
-// MessageType enum (corresponds to protobuf OpCode)
-enum class MessageType : uint32_t {
-    UNKNOWN = 0,
-
-    // Reads
-    TX_READ = 1,
-    TX_BATCH_READ = 2,
-    TX_SCAN = 3,
-    TX_SCAN_INDEX = 4,
-    TX_EXECUTE_READ_PLAN = 5,
-
-    // The one commit of a transaction
-    TX_COMMIT = 6,
-
-    TX_GET_TABLE_STATS = 7,
-    TX_EXECUTE_DUCKDB_QUERY = 8,
-
-    // Definitions and server state
-    DB_CREATE_TABLE = 9,
-    DB_CREATE_SECONDARY_INDEX = 10,
-    DB_ALLOCATE_HIDDEN_KEYS = 11,
-    DB_SET_COMMIT_DURABILITY = 12
-};
+// The RPC an entry names, as the arm its request envelope sets.
+using RpcOp = Helios::Protocol::Request::BodyCase;
 
 /**
  * RPC client for the storage server. Every read answers from the storage's
  * current state and leaves nothing behind there; the query layer keeps the
- * transaction and installs it with one TX_COMMIT.
+ * transaction and installs it with one tx_commit.
  *
  * Each THD holds a HeliosProxy with its own TCP connection, managed via
  * HeliosThdCtx.
@@ -287,22 +259,24 @@ private:
     std::unordered_map<std::string, int64_t> table_stats_cache_;
     std::unordered_map<std::string, IndexNdvResult> last_index_ndv_;
     std::unordered_map<std::string, IndexHistResult> last_index_hist_;
-    template<typename RequestType, typename ResponseType>
-    bool send_protobuf_message(const RequestType& request, ResponseType& response,
-                               MessageType message_type, const std::string& meta = "");
-    // Send protobuf request, receive raw binary response
-    template<typename RequestType>
-    bool send_protobuf_recv_binary(const RequestType& request, std::string& raw_response,
-                                   MessageType message_type, const std::string& meta = "");
-    bool send_message_with_header(const std::string& serialized_request,
-                                  std::string& serialized_response,
-                                  MessageType message_type,
-                                  const std::string& meta = "");
-    // The exchange itself; send_message_with_header wraps it so that every
-    // transport failure invalidates the boot token.
+    /**
+     * @brief Sends one request envelope and parses the reply.
+     *
+     * @param[out] payload  Takes the bytes riding raw after the reply
+     *   envelope, which only the read-plan reply carries. May be null.
+     * @return false when the transport fails or the reply sets another arm
+     *   than the request, which is the answer to another RPC.
+     */
+    bool send_request(const Helios::Protocol::Request& request,
+                      Helios::Protocol::Response& response,
+                      const std::string& meta = "",
+                      std::string* payload = nullptr);
+    // The exchange itself. A failure here is a transport failure, which
+    // send_request answers by invalidating the boot token and the channel.
     bool exchange_message(const std::string& serialized_request,
                           std::string& serialized_response,
-                          MessageType message_type, const std::string& meta);
+                          std::string& payload, RpcOp op,
+                          const std::string& meta);
 
     // Connect on demand so a channel closed by a transport error is reopened
     // by the next RPC.

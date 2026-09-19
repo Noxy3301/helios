@@ -137,7 +137,7 @@ RangeScanLimit range_scan_limit_for_order(THD *thd, const KEY *key,
 extern bool srv_stats_drift_refresh;
 
 // Where a statement's reads come from: kReadPathRow sends one request per
-// handler read, kReadPathPlan stages what it can through TX_EXECUTE_READ_PLAN
+// handler read, kReadPathPlan stages what it can through tx_execute_read_plan
 // and sends the rest as they happen.
 enum ReadPath { kReadPathRow = 0, kReadPathPlan = 1 };
 extern ulong srv_read_path;

@@ -21,7 +21,7 @@ class Helios_share;
  *
  * It holds what it read (rows with their TIDs, ranges with their key lists),
  * what it wrote, and the row-count deltas, and installs all of it with one
- * TX_COMMIT. Reads a staged plan did not cover go to the storage server as
+ * tx_commit. Reads a staged plan did not cover go to the storage server as
  * they happen.
  *
  * Lifetime of this class equals the lifetime of the transaction.

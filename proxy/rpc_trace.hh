@@ -10,15 +10,15 @@
 #include <thread>
 #include <vector>
 
-#include "helios_proxy.hh"  // MessageType
+#include "helios_proxy.hh"  // RpcOp
 
-// Per-RPC record captured by send_message_with_header.
+// Per-RPC record captured by exchange_message.
 struct RpcEntry {
-  MessageType type;
+  RpcOp type;
   uint64_t us;          // duration microseconds
   uint64_t off_us;      // offset from the transaction start in microseconds
   uint32_t req_b;       // serialized request bytes
-  uint32_t resp_b;      // serialized response bytes
+  uint64_t resp_b;      // serialized response bytes
   uint32_t stmt_idx;    // index into statements_; UINT32_MAX if pre-stmt
   std::string meta;     // optional key, index name, prefix, etc.
 };
@@ -43,8 +43,8 @@ class TxRpcTrace {
  public:
   void start(std::thread::id tid);
   void on_stmt(const std::string& sql);
-  void record(MessageType type, uint64_t us, uint32_t req_b,
-              uint32_t resp_b, const std::string& meta);
+  void record(RpcOp type, uint64_t us, uint32_t req_b,
+              uint64_t resp_b, const std::string& meta);
   void record_local_view(const std::string& kind);
   std::string finalize_jsonl(bool committed);
 
@@ -66,7 +66,7 @@ class TxRpcTrace {
     uint64_t resp_b = 0;
   };
 
-  std::map<MessageType, Agg> by_type_;
+  std::map<RpcOp, Agg> by_type_;
   std::map<std::string, uint32_t> local_view_by_kind_;
 };
 
@@ -86,7 +86,8 @@ class RpcTraceLogger {
   std::ofstream file_;
 };
 
-const char* message_type_name(MessageType t);
+// The RPC's name, as protobuf spells the envelope arm it sets.
+const char* rpc_op_name(RpcOp op);
 std::string json_escape(const std::string& s, size_t max_len = 1024);
 
 #endif  // HELIOS_RPC_TRACE_HH

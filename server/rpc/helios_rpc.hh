@@ -1,5 +1,6 @@
-// The RPC surface of the storage server: the handler for every OpCode, plus
-// the server-wide row counts, boot token and hidden-key allocator they use.
+// The RPC surface of the storage server: the handler for every arm of the
+// request envelope, plus the server-wide row counts, boot token and
+// hidden-key allocator they use.
 #pragma once
 
 #include <chrono>
@@ -12,7 +13,8 @@
 #include <utility>
 #include <vector>
 
-#include "../protocol/message.hh"
+#include "helios.pb.h"
+
 #include "../database_manager.hh"
 
 // Server-wide table row count tracker, shared across all connections.
@@ -91,8 +93,13 @@ public:
                  std::shared_ptr<HiddenKeyAllocator> hidden_keys);
     ~HeliosRpc() = default;
 
-    void handle_rpc(MessageType message_type,
-                   const std::string& message, std::string& result);
+    // Parses one request envelope, routes the arm it sets, and serializes the
+    // response envelope into result. payload takes the bytes that ride raw
+    // after the envelope, which only the read-plan reply carries. Returns
+    // false when the response cannot be serialized, which leaves the request
+    // unanswered.
+    bool handle_rpc(const std::string& message, std::string& result,
+                    std::string& payload);
 
 private:
     std::shared_ptr<DatabaseManager> db_manager_;
@@ -113,26 +120,49 @@ private:
     static std::unordered_map<std::string, HistEntry> hist_cache_;
 
     // Reads, scans and the commit of a transaction
-    void handleTxRead(const std::string& message, std::string& result);
-    void handleTxBatchRead(const std::string& message, std::string& result);
-    void handleTxScan(const std::string& message, std::string& result);
-    void handleTxScanIndex(const std::string& message, std::string& result);
-    void handleTxCommit(const std::string& message, std::string& result);
+    void handleTxRead(
+        const Helios::Protocol::TxRead::Request& request,
+        Helios::Protocol::TxRead::Response* response);
+    void handleTxBatchRead(
+        const Helios::Protocol::TxBatchRead::Request& request,
+        Helios::Protocol::TxBatchRead::Response* response);
+    void handleTxScan(
+        const Helios::Protocol::TxScan::Request& request,
+        Helios::Protocol::TxScan::Response* response);
+    void handleTxScanIndex(
+        const Helios::Protocol::TxScanIndex::Request& request,
+        Helios::Protocol::TxScanIndex::Response* response);
+    void handleTxCommit(
+        const Helios::Protocol::TxCommit::Request& request,
+        Helios::Protocol::TxCommit::Response* response);
 
-    // Read-plan execution
-    void handleTxExecuteReadPlan(const std::string& message, std::string& result);
+    // Read-plan execution. The reply is the flat HELIOSRP payload, which
+    // rides raw after the envelope.
+    void handleTxExecuteReadPlan(
+        const Helios::Protocol::TxExecuteReadPlan::Request& request,
+        std::string* result);
 
     // DuckDB bridge (resolved-statement request over live PAX storage).
-    void handleTxExecuteDuckdbQuery(const std::string& message,
-                                    std::string& result);
+    void handleTxExecuteDuckdbQuery(
+        const Helios::Protocol::TxExecuteDuckdbQuery::Request& request,
+        Helios::Protocol::TxExecuteDuckdbQuery::Response* response);
 
     // Table statistics
-    void handleTxGetTableStats(const std::string& message, std::string& result);
+    void handleTxGetTableStats(
+        const Helios::Protocol::GetTableStats::Request& request,
+        Helios::Protocol::GetTableStats::Response* response);
 
     // Database operations
-    void handleDbCreateTable(const std::string& message, std::string& result);
-    void handleDbCreateSecondaryIndex(const std::string& message, std::string& result);
-    void handleDbAllocateHiddenKeys(const std::string& message, std::string& result);
-    void handleDbSetCommitDurability(const std::string& message,
-                                     std::string& result);
+    void handleDbCreateTable(
+        const Helios::Protocol::DbCreateTable::Request& request,
+        Helios::Protocol::DbCreateTable::Response* response);
+    void handleDbCreateSecondaryIndex(
+        const Helios::Protocol::DbCreateSecondaryIndex::Request& request,
+        Helios::Protocol::DbCreateSecondaryIndex::Response* response);
+    void handleDbAllocateHiddenKeys(
+        const Helios::Protocol::DbAllocateHiddenKeys::Request& request,
+        Helios::Protocol::DbAllocateHiddenKeys::Response* response);
+    void handleDbSetCommitDurability(
+        const Helios::Protocol::DbSetCommitDurability::Request& request,
+        Helios::Protocol::DbSetCommitDurability::Response* response);
 };

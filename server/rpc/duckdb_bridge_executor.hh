@@ -9,7 +9,7 @@ class Database;
 namespace duckdb_bridge {
 
 /**
- * @brief Executes a TX_EXECUTE_DUCKDB_QUERY request.
+ * @brief Executes a tx_execute_duckdb_query request.
  *
  * @details Constructs DuckDB's parsed AST from the proxy's serialization of
  * the resolved statement and executes it; no SQL text is parsed. Runs under

@@ -1,12 +1,13 @@
-// Dispatch of one request: decodes nothing itself, routes the OpCode to its
-// handler and releases the thread's epoch once the reply is built.
+// Dispatch of one request: routes the arm the envelope sets to its handler
+// and releases the thread's epoch once the reply is built.
 
 #include "helios_rpc.hh"
 
-#include <cstdint>
 #include <string>
 
 #include <spdlog/spdlog.h>
+
+using Helios::Protocol::Request;
 
 HeliosRpc::HeliosRpc(std::shared_ptr<DatabaseManager> db_manager,
                            std::shared_ptr<TableRowCounts> row_counts,
@@ -15,60 +16,89 @@ HeliosRpc::HeliosRpc(std::shared_ptr<DatabaseManager> db_manager,
       hidden_keys_(hidden_keys) {
 }
 
-void HeliosRpc::handle_rpc(MessageType message_type,
-                              const std::string& message,
-                              std::string& result) {
-    SPDLOG_DEBUG("Handling RPC: message_type={}", static_cast<uint32_t>(message_type));
+bool HeliosRpc::handle_rpc(const std::string& message, std::string& result,
+                           std::string& payload) {
+    Request request;
+    Helios::Protocol::Response response;
 
-    switch(message_type) {
-        // Reads
-        case MessageType::TX_READ:
-            handleTxRead(message, result);
-            break;
-        case MessageType::TX_BATCH_READ:
-            handleTxBatchRead(message, result);
-            break;
-        case MessageType::TX_SCAN:
-            handleTxScan(message, result);
-            break;
-        case MessageType::TX_SCAN_INDEX:
-            handleTxScanIndex(message, result);
-            break;
-        case MessageType::TX_EXECUTE_READ_PLAN:
-            handleTxExecuteReadPlan(message, result);
-            break;
+    if (!request.ParseFromString(message)) {
+        SPDLOG_ERROR("Malformed request envelope ({} bytes)", message.size());
+        response.set_error("malformed request");
+    } else {
+        // No default: -Wswitch reports an arm that has no handler.
+        switch (request.body_case()) {
+            // Reads
+            case Request::kTxRead:
+                handleTxRead(request.tx_read(), response.mutable_tx_read());
+                break;
+            case Request::kTxBatchRead:
+                handleTxBatchRead(request.tx_batch_read(),
+                                  response.mutable_tx_batch_read());
+                break;
+            case Request::kTxScan:
+                handleTxScan(request.tx_scan(), response.mutable_tx_scan());
+                break;
+            case Request::kTxScanIndex:
+                handleTxScanIndex(request.tx_scan_index(),
+                                  response.mutable_tx_scan_index());
+                break;
+            case Request::kTxExecuteReadPlan:
+                // The arm is a marker: the flat result rides raw after the
+                // envelope instead of being copied into protobuf.
+                response.mutable_tx_execute_read_plan();
+                handleTxExecuteReadPlan(request.tx_execute_read_plan(),
+                                        &payload);
+                break;
 
-        // The one commit of a transaction
-        case MessageType::TX_COMMIT:
-            handleTxCommit(message, result);
-            break;
+            // The one commit of a transaction
+            case Request::kTxCommit:
+                handleTxCommit(request.tx_commit(), response.mutable_tx_commit());
+                break;
 
-        case MessageType::TX_GET_TABLE_STATS:
-            handleTxGetTableStats(message, result);
-            break;
-        case MessageType::TX_EXECUTE_DUCKDB_QUERY:
-            handleTxExecuteDuckdbQuery(message, result);
-            break;
+            case Request::kGetTableStats:
+                handleTxGetTableStats(request.get_table_stats(),
+                                      response.mutable_get_table_stats());
+                break;
+            case Request::kTxExecuteDuckdbQuery:
+                handleTxExecuteDuckdbQuery(
+                    request.tx_execute_duckdb_query(),
+                    response.mutable_tx_execute_duckdb_query());
+                break;
 
-        // Definitions and server state
-        case MessageType::DB_CREATE_TABLE:
-            handleDbCreateTable(message, result);
-            break;
-        case MessageType::DB_CREATE_SECONDARY_INDEX:
-            handleDbCreateSecondaryIndex(message, result);
-            break;
-        case MessageType::DB_ALLOCATE_HIDDEN_KEYS:
-            handleDbAllocateHiddenKeys(message, result);
-            break;
-        case MessageType::DB_SET_COMMIT_DURABILITY:
-            handleDbSetCommitDurability(message, result);
-            break;
+            // Definitions and server state
+            case Request::kDbCreateTable:
+                handleDbCreateTable(request.db_create_table(),
+                                    response.mutable_db_create_table());
+                break;
+            case Request::kDbCreateSecondaryIndex:
+                handleDbCreateSecondaryIndex(
+                    request.db_create_secondary_index(),
+                    response.mutable_db_create_secondary_index());
+                break;
+            case Request::kDbAllocateHiddenKeys:
+                handleDbAllocateHiddenKeys(
+                    request.db_allocate_hidden_keys(),
+                    response.mutable_db_allocate_hidden_keys());
+                break;
+            case Request::kDbSetCommitDurability:
+                handleDbSetCommitDurability(
+                    request.db_set_commit_durability(),
+                    response.mutable_db_set_commit_durability());
+                break;
 
-        default:
-            SPDLOG_ERROR("Unknown message type: {}", static_cast<uint32_t>(message_type));
-            break;
+            case Request::BODY_NOT_SET:
+                SPDLOG_ERROR("Request envelope carries no body");
+                response.set_error("request carries no body");
+                break;
+        }
     }
 
     // A request holds nothing in the index past its reply.
     db_manager_->get_database()->ReleaseThreadEpoch();
+
+    if (!response.SerializeToString(&result)) {
+        SPDLOG_ERROR("Failed to serialize the response envelope");
+        return false;
+    }
+    return true;
 }

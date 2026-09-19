@@ -142,20 +142,9 @@ bool HiddenKeyAllocator::Allocate(helios::storage::Database& database,
     return true;
 }
 
-void HeliosRpc::handleDbAllocateHiddenKeys(const std::string& message,
-                                              std::string& result) {
-    Helios::Protocol::DbAllocateHiddenKeys::Request request;
-    Helios::Protocol::DbAllocateHiddenKeys::Response response;
-
-    if (!request.ParseFromString(message)) {
-        response.set_ok(false);
-        response.set_permanent(true);
-        response.set_error("malformed request");
-        SPDLOG_ERROR("AllocateHiddenKeys: malformed request");
-        result = response.SerializeAsString();
-        return;
-    }
-
+void HeliosRpc::handleDbAllocateHiddenKeys(
+    const Helios::Protocol::DbAllocateHiddenKeys::Request& request,
+    Helios::Protocol::DbAllocateHiddenKeys::Response* response) {
     uint64_t first_id = 0;
     std::string error;
     bool permanent = false;
@@ -163,34 +152,21 @@ void HeliosRpc::handleDbAllocateHiddenKeys(const std::string& message,
                                             request.table_name(),
                                             request.count(), &first_id, &error,
                                             &permanent);
-    response.set_ok(ok);
-    response.set_boot_token(hidden_keys_->boot_token);
+    response->set_ok(ok);
+    response->set_boot_token(hidden_keys_->boot_token);
     if (ok) {
-        response.set_first_id(first_id);
+        response->set_first_id(first_id);
     } else {
-        response.set_permanent(permanent);
-        response.set_error(error);
+        response->set_permanent(permanent);
+        response->set_error(error);
         SPDLOG_ERROR("AllocateHiddenKeys for '{}': {}",
                   request.table_name().c_str(), error.c_str());
     }
-
-    result = response.SerializeAsString();
 }
 
-void HeliosRpc::handleDbSetCommitDurability(const std::string& message,
-                                               std::string& result) {
-    Helios::Protocol::DbSetCommitDurability::Request request;
-    Helios::Protocol::DbSetCommitDurability::Response response;
-
-    if (!request.ParseFromString(message)) {
-        response.set_ok(false);
-        response.set_mode(to_wire_mode(db_manager_->commit_durability()));
-        response.set_error("malformed request");
-        SPDLOG_ERROR("SetCommitDurability: malformed request");
-        result = response.SerializeAsString();
-        return;
-    }
-
+void HeliosRpc::handleDbSetCommitDurability(
+    const Helios::Protocol::DbSetCommitDurability::Request& request,
+    Helios::Protocol::DbSetCommitDurability::Response* response) {
     helios::storage::CommitDurability mode;
     switch (request.mode()) {
         case DurabilityRpc::ASYNC:
@@ -200,31 +176,24 @@ void HeliosRpc::handleDbSetCommitDurability(const std::string& message,
             mode = helios::storage::CommitDurability::kSync;
             break;
         default:
-            response.set_ok(false);
-            response.set_mode(to_wire_mode(db_manager_->commit_durability()));
-            response.set_error("commit durability mode cannot be requested");
+            response->set_ok(false);
+            response->set_mode(to_wire_mode(db_manager_->commit_durability()));
+            response->set_error("commit durability mode cannot be requested");
             SPDLOG_ERROR("SetCommitDurability: unrequestable mode");
-            result = response.SerializeAsString();
             return;
     }
 
     db_manager_->set_commit_durability(mode);
-    response.set_ok(true);
-    response.set_mode(to_wire_mode(mode));
+    response->set_ok(true);
+    response->set_mode(to_wire_mode(mode));
 
     SPDLOG_INFO("Commit durability switched to {}", durability_name(mode));
-
-    result = response.SerializeAsString();
 }
 
-void HeliosRpc::handleDbCreateTable(const std::string& message,
-                                       std::string& result) {
+void HeliosRpc::handleDbCreateTable(
+    const Helios::Protocol::DbCreateTable::Request& request,
+    Helios::Protocol::DbCreateTable::Response* response) {
     SPDLOG_DEBUG("Handling DbCreateTable");
-
-    Helios::Protocol::DbCreateTable::Request request;
-    Helios::Protocol::DbCreateTable::Response response;
-
-    request.ParseFromString(message);
 
     // A table another query node created is the same table; its schema
     // install answers whether the definition matches the one in place.
@@ -266,26 +235,18 @@ void HeliosRpc::handleDbCreateTable(const std::string& message,
                  types.empty() ? "no" : "yes",
                  installed ? "installed" : "refused");
     }
-    response.set_success(created && installed);
+    response->set_success(created && installed);
     SPDLOG_DEBUG("CreateTable '{}': {}", request.table_name().c_str(),
-              response.success() ? "success" : "refused");
-
-    result = response.SerializeAsString();
+              response->success() ? "success" : "refused");
 }
 
-void HeliosRpc::handleDbCreateSecondaryIndex(const std::string& message,
-                                                std::string& result) {
+void HeliosRpc::handleDbCreateSecondaryIndex(
+    const Helios::Protocol::DbCreateSecondaryIndex::Request& request,
+    Helios::Protocol::DbCreateSecondaryIndex::Response* response) {
     SPDLOG_DEBUG("Handling DbCreateSecondaryIndex");
-
-    Helios::Protocol::DbCreateSecondaryIndex::Request request;
-    Helios::Protocol::DbCreateSecondaryIndex::Response response;
-
-    request.ParseFromString(message);
 
     const bool success = db_manager_->get_database()->CreateSecondaryIndex(
         request.table_name(), request.index_name(),
         static_cast<helios::storage::IndexConstraint>(request.index_type()));
-    response.set_success(success);
-
-    result = response.SerializeAsString();
+    response->set_success(success);
 }

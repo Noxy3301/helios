@@ -29,36 +29,11 @@ std::string format_iso(std::chrono::system_clock::time_point tp) {
 
 }  // namespace
 
-const char* message_type_name(MessageType t) {
-  switch (t) {
-    case MessageType::UNKNOWN:
-      return "UNKNOWN";
-    case MessageType::TX_READ:
-      return "TX_READ";
-    case MessageType::TX_BATCH_READ:
-      return "TX_BATCH_READ";
-    case MessageType::TX_SCAN:
-      return "TX_SCAN";
-    case MessageType::TX_SCAN_INDEX:
-      return "TX_SCAN_INDEX";
-    case MessageType::TX_EXECUTE_READ_PLAN:
-      return "TX_EXECUTE_READ_PLAN";
-    case MessageType::TX_COMMIT:
-      return "TX_COMMIT";
-    case MessageType::TX_GET_TABLE_STATS:
-      return "TX_GET_TABLE_STATS";
-    case MessageType::TX_EXECUTE_DUCKDB_QUERY:
-      return "TX_EXECUTE_DUCKDB_QUERY";
-    case MessageType::DB_CREATE_TABLE:
-      return "DB_CREATE_TABLE";
-    case MessageType::DB_CREATE_SECONDARY_INDEX:
-      return "DB_CREATE_SECONDARY_INDEX";
-    case MessageType::DB_ALLOCATE_HIDDEN_KEYS:
-      return "DB_ALLOCATE_HIDDEN_KEYS";
-    case MessageType::DB_SET_COMMIT_DURABILITY:
-      return "DB_SET_COMMIT_DURABILITY";
-  }
-  return "UNDEFINED";
+const char* rpc_op_name(RpcOp op) {
+  const auto* field =
+      Helios::Protocol::Request::descriptor()->FindFieldByNumber(
+          static_cast<int>(op));
+  return field != nullptr ? field->name().c_str() : "none";
 }
 
 std::string json_escape(const std::string& s, size_t max_len) {
@@ -127,8 +102,8 @@ void TxRpcTrace::on_stmt(const std::string& sql) {
   statements_.push_back(std::move(s));
 }
 
-void TxRpcTrace::record(MessageType type, uint64_t us, uint32_t req_b,
-                        uint32_t resp_b, const std::string& meta) {
+void TxRpcTrace::record(RpcOp type, uint64_t us, uint32_t req_b,
+                        uint64_t resp_b, const std::string& meta) {
   if (!active_) return;
   const uint64_t off = std::chrono::duration_cast<std::chrono::microseconds>(
                            std::chrono::steady_clock::now() - started_)
@@ -211,7 +186,7 @@ std::string TxRpcTrace::finalize_jsonl(bool committed) {
     if (i > 0) os << ',';
     os << '{'
        << "\"i\":" << i
-       << ",\"type\":\"" << message_type_name(r.type) << '"'
+       << ",\"type\":\"" << rpc_op_name(r.type) << '"'
        << ",\"off_us\":" << r.off_us
        << ",\"us\":" << r.us
        << ",\"req_b\":" << r.req_b
@@ -252,7 +227,7 @@ std::string TxRpcTrace::finalize_jsonl(bool committed) {
   for (const auto& kv : by_type_) {
     if (!first) os << ',';
     first = false;
-    os << '"' << message_type_name(kv.first) << "\":{"
+    os << '"' << rpc_op_name(kv.first) << "\":{"
        << "\"n\":" << kv.second.n
        << ",\"us\":" << kv.second.us
        << ",\"req_b\":" << kv.second.req_b

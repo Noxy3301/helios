@@ -31,6 +31,7 @@ set(MYSQL_INCLUDE_DIRS
 
 # Include directories
 include_directories(${CMAKE_CURRENT_SOURCE_DIR})
+include_directories(${CMAKE_CURRENT_SOURCE_DIR}/..)
 include_directories(${CMAKE_CURRENT_SOURCE_DIR}/../proto)
 include_directories(${DUCKDB_ROOT}/src/include)
 
@@ -91,9 +92,6 @@ set(SOURCES
     # Storage layer
     database_manager.cc
     database_manager.hh
-
-    # Protocol
-    protocol/message.hh
 )
 
 # The generated sources belong to exactly one target: listing them in two
@@ -125,8 +123,8 @@ set_target_properties(helios-storage PROPERTIES
     BUILD_RPATH "${DUCKDB_LIB_DIR}"
     INSTALL_RPATH "${DUCKDB_LIB_DIR}")
 
-# Compiler flags to suppress warnings
-target_compile_options(helios-storage PRIVATE -O3 -Wno-error -Wno-unused-parameter)
+# -Wswitch reports an envelope arm that the dispatch switch has no case for.
+target_compile_options(helios-storage PRIVATE -O3 -Wno-error -Wno-unused-parameter -Wswitch)
 
 # spdlog drops anything below this at compile time, so debug lines stay in the
 # binary and log_level decides at run time.

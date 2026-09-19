@@ -13,8 +13,50 @@
 #include "helios_proxy.hh"
 #include "rpc_trace.hh"
 #include "helios_log.hh"
+#include "common/rpc_frame.h"
 
+namespace {
 
+// Reads one u32 length in network order and the bytes it counts.
+bool recv_part(int socket_fd, std::string& out) {
+    uint32_t net_size = 0;
+    ssize_t header_received =
+        recv(socket_fd, &net_size, sizeof(net_size), MSG_WAITALL);
+    if (header_received != static_cast<ssize_t>(sizeof(net_size))) {
+        LOG_ERROR("SEND_MESSAGE: Failed to receive a frame length, received %zd bytes",
+                  header_received);
+        return false;
+    }
+
+    const uint32_t size = ntohl(net_size);
+    if (size > helios::rpc::kMaxPartBytes) {
+        LOG_ERROR("SEND_MESSAGE: frame part of %u bytes exceeds the %u byte limit",
+                  size, helios::rpc::kMaxPartBytes);
+        return false;
+    }
+    out.clear();
+    if (size == 0) {
+        return true;
+    }
+
+    // recv(MSG_WAITALL) still caps one call near 2GB, so a large read-plan
+    // result must be drained in a loop.
+    out.resize(size);
+    size_t received_total = 0;
+    while (received_total < size) {
+        const ssize_t chunk = recv(socket_fd, &out[received_total],
+                                   size - received_total, MSG_WAITALL);
+        if (chunk <= 0) {
+            LOG_ERROR("SEND_MESSAGE: Failed to receive a frame, received %zu/%u bytes",
+                      received_total, size);
+            return false;
+        }
+        received_total += static_cast<size_t>(chunk);
+    }
+    return true;
+}
+
+}  // namespace
 
 HeliosProxy::HeliosProxy(const std::string& host, int port)
     : socket_fd_(-1), connected_(false), host_(host), port_(port) {
@@ -96,8 +138,8 @@ bool HeliosProxy::fetch_table_stats(
     bool force_ndv) {
     if (!ensure_connected()) return false;
 
-    Helios::Protocol::GetTableStats::Request request;
-    Helios::Protocol::GetTableStats::Response response;
+    Helios::Protocol::Request envelope;
+    auto& request = *envelope.mutable_get_table_stats();
     if (!ndv_table.empty()) {
         request.set_ndv_table(ndv_table);
         request.set_ndv_force_recompute(force_ndv);
@@ -108,10 +150,11 @@ bool HeliosProxy::fetch_table_stats(
         }
     }
 
-    if (!send_protobuf_message(request, response,
-                               MessageType::TX_GET_TABLE_STATS)) {
+    Helios::Protocol::Response reply;
+    if (!send_request(envelope, reply)) {
         return false;
     }
+    const auto& response = reply.get_table_stats();
 
     storage_boot_token_ = response.boot_token();
     table_stats_cache_.clear();
@@ -146,15 +189,17 @@ HeliosProxy::ReadResult HeliosProxy::tx_read(
         return result;
     }
 
-    Helios::Protocol::TxRead::Request request;
-    Helios::Protocol::TxRead::Response response;
+    Helios::Protocol::Request envelope;
+    auto& request = *envelope.mutable_tx_read();
     request.set_table_name(table_name);
     request.set_key(key);
 
-    if (!send_protobuf_message(request, response, MessageType::TX_READ)) {
+    Helios::Protocol::Response reply;
+    if (!send_request(envelope, reply)) {
         LOG_ERROR("RPC failed: Failed to send read message to server");
         return result;
     }
+    const auto& response = reply.tx_read();
 
     result.ok = true;
     result.found = response.found();
@@ -170,19 +215,20 @@ std::vector<HeliosProxy::ReadResult> HeliosProxy::tx_batch_read(
         return {};
     }
 
-    Helios::Protocol::TxBatchRead::Request request;
-    Helios::Protocol::TxBatchRead::Response response;
+    Helios::Protocol::Request envelope;
+    auto& request = *envelope.mutable_tx_batch_read();
     for (const auto& key : keys) {
         auto* op = request.add_ops();
         op->set_table_name(key.table_name);
         op->set_key(key.key);
     }
 
-    if (!send_protobuf_message(request, response,
-                               MessageType::TX_BATCH_READ)) {
+    Helios::Protocol::Response reply;
+    if (!send_request(envelope, reply)) {
         LOG_ERROR("RPC failed: Failed to send batch_read message to server");
         return {};
     }
+    const auto& response = reply.tx_batch_read();
 
     std::vector<ReadResult> results;
     results.reserve(response.results_size());
@@ -208,8 +254,8 @@ HeliosProxy::ScanResult HeliosProxy::tx_scan(
         return result;
     }
 
-    Helios::Protocol::TxScan::Request request;
-    Helios::Protocol::TxScan::Response response;
+    Helios::Protocol::Request envelope;
+    auto& request = *envelope.mutable_tx_scan();
     request.set_table_name(table_name);
     request.set_start_key(start_key);
     request.set_end_key(end_key);
@@ -217,11 +263,13 @@ HeliosProxy::ScanResult HeliosProxy::tx_scan(
     request.set_reverse_scan(reverse_scan);
     request.set_keys_only(keys_only);
 
-    if (!send_protobuf_message(request, response, MessageType::TX_SCAN)) {
+    Helios::Protocol::Response reply;
+    if (!send_request(envelope, reply)) {
         LOG_ERROR("RPC failed: Failed to send scan message to server");
         result.transport_error = true;
         return result;
     }
+    auto& response = *reply.mutable_tx_scan();
 
     result.ok = response.ok();
     if (!result.ok) return result;
@@ -247,8 +295,8 @@ HeliosProxy::ScanIndexResult HeliosProxy::tx_scan_index(
         return result;
     }
 
-    Helios::Protocol::TxScanIndex::Request request;
-    Helios::Protocol::TxScanIndex::Response response;
+    Helios::Protocol::Request envelope;
+    auto& request = *envelope.mutable_tx_scan_index();
     request.set_table_name(table_name);
     request.set_index_name(index_name);
     request.set_start_key(start_key);
@@ -257,12 +305,13 @@ HeliosProxy::ScanIndexResult HeliosProxy::tx_scan_index(
     request.set_reverse_scan(reverse_scan);
     request.set_keys_only(keys_only);
 
-    if (!send_protobuf_message(request, response,
-                               MessageType::TX_SCAN_INDEX)) {
+    Helios::Protocol::Response reply;
+    if (!send_request(envelope, reply)) {
         LOG_ERROR("RPC failed: Failed to send scan_index message to server");
         result.transport_error = true;
         return result;
     }
+    auto& response = *reply.mutable_tx_scan_index();
 
     result.ok = response.ok();
     if (!result.ok) return result;
@@ -295,8 +344,8 @@ bool HeliosProxy::tx_commit(
         return false;
     }
 
-    Helios::Protocol::TxCommit::Request request;
-    Helios::Protocol::TxCommit::Response response;
+    Helios::Protocol::Request envelope;
+    auto& request = *envelope.mutable_tx_commit();
 
     for (const auto& entry : reads) {
         auto* read = request.add_reads();
@@ -358,11 +407,13 @@ bool HeliosProxy::tx_commit(
         rd->set_delta(delta);
     }
 
-    if (!send_protobuf_message(request, response, MessageType::TX_COMMIT)) {
+    Helios::Protocol::Response reply;
+    if (!send_request(envelope, reply)) {
         LOG_ERROR("RPC failed: Failed to send commit message to server");
         if (transport_error != nullptr) *transport_error = true;
         return false;
     }
+    const auto& response = reply.tx_commit();
 
     table_stats_cache_.clear();
     for (const auto& ts : response.table_stats()) {
@@ -411,7 +462,8 @@ HeliosProxy::ReadPlanResult HeliosProxy::tx_execute_read_plan(
         return result;
     }
 
-    Helios::Protocol::TxExecuteReadPlan::Request request;
+    Helios::Protocol::Request envelope;
+    auto& request = *envelope.mutable_tx_execute_read_plan();
     for (const auto& step : steps) {
         auto* out = request.add_steps();
         out->set_table_name(step.table_name);
@@ -426,11 +478,9 @@ HeliosProxy::ReadPlanResult HeliosProxy::tx_execute_read_plan(
         fill_bindings(step.end_bindings, out->mutable_end_bindings());
     }
 
-    // TxExecuteReadPlan responses can exceed protobuf's ~2GB message limit, so
-    // the server returns this response as flat binary.
+    Helios::Protocol::Response reply;
     std::string raw;
-    if (!send_protobuf_recv_binary(request, raw,
-                                   MessageType::TX_EXECUTE_READ_PLAN)) {
+    if (!send_request(envelope, reply, "", &raw)) {
         LOG_ERROR("RPC failed: Failed to send execute read plan message to server");
         result.transport_error = true;
         return result;
@@ -470,10 +520,8 @@ HeliosProxy::ReadPlanResult HeliosProxy::tx_execute_read_plan(
         }
     };
 
-    // Native-endian bytes spell "HELIOSRP" (Helios read plan response).
-    static constexpr uint64_t kFlatMagic = 0x5052534F494C4548ull;
     Reader r(raw.data(), raw.size());
-    if (r.u64() != kFlatMagic) {
+    if (r.u64() != helios::rpc::kFlatMagic) {
         LOG_ERROR("RPC failed: bad flat read-plan response header");
         result.transport_error = true;
         return result;
@@ -552,11 +600,15 @@ bool HeliosProxy::tx_execute_duckdb_query(
         LOG_ERROR("RPC failed: resolved duckdb response is null");
         return false;
     }
-    if (!send_protobuf_message(request, *response,
-                               MessageType::TX_EXECUTE_DUCKDB_QUERY)) {
+    Helios::Protocol::Request envelope;
+    *envelope.mutable_tx_execute_duckdb_query() = request;
+
+    Helios::Protocol::Response reply;
+    if (!send_request(envelope, reply)) {
         LOG_ERROR("RPC failed: resolved duckdb message");
         return false;
     }
+    *response = std::move(*reply.mutable_tx_execute_duckdb_query());
     return true;
 }
 
@@ -570,8 +622,8 @@ bool HeliosProxy::db_create_table(
         return false;
     }
 
-    Helios::Protocol::DbCreateTable::Request request;
-    Helios::Protocol::DbCreateTable::Response response;
+    Helios::Protocol::Request envelope;
+    auto& request = *envelope.mutable_db_create_table();
 
     request.set_table_name(table_name);
     for (const uint32_t width : pax_field_max_bytes) {
@@ -584,10 +636,12 @@ bool HeliosProxy::db_create_table(
         request.add_pax_field_scale(scale);
     }
 
-    if (!send_protobuf_message(request, response, MessageType::DB_CREATE_TABLE)) {
+    Helios::Protocol::Response reply;
+    if (!send_request(envelope, reply)) {
         LOG_ERROR("RPC failed: Failed to send message to server");
         return false;
     }
+    const auto& response = reply.db_create_table();
 
     return response.success();
 }
@@ -602,19 +656,20 @@ HeliosProxy::HiddenKeyReservation HeliosProxy::db_allocate_hidden_keys(
         return reservation;
     }
 
-    Helios::Protocol::DbAllocateHiddenKeys::Request request;
-    Helios::Protocol::DbAllocateHiddenKeys::Response response;
+    Helios::Protocol::Request envelope;
+    auto& request = *envelope.mutable_db_allocate_hidden_keys();
 
     request.set_table_name(table_name);
     request.set_count(count);
 
-    if (!send_protobuf_message(request, response,
-                               MessageType::DB_ALLOCATE_HIDDEN_KEYS)) {
+    Helios::Protocol::Response reply;
+    if (!send_request(envelope, reply)) {
         LOG_ERROR("RPC failed: Failed to send message to server");
         reservation.transport_error = true;
         reservation.error = "the storage server did not answer";
         return reservation;
     }
+    const auto& response = reply.db_allocate_hidden_keys();
 
     storage_boot_token_ = response.boot_token();
     if (!response.ok()) {
@@ -639,17 +694,19 @@ bool HeliosProxy::db_create_secondary_index(const std::string& table_name,
         return false;
     }
 
-    Helios::Protocol::DbCreateSecondaryIndex::Request request;
-    Helios::Protocol::DbCreateSecondaryIndex::Response response;
+    Helios::Protocol::Request envelope;
+    auto& request = *envelope.mutable_db_create_secondary_index();
 
     request.set_table_name(table_name);
     request.set_index_name(index_name);
     request.set_index_type(index_type);
 
-    if (!send_protobuf_message(request, response, MessageType::DB_CREATE_SECONDARY_INDEX)) {
+    Helios::Protocol::Response reply;
+    if (!send_request(envelope, reply)) {
         LOG_ERROR("RPC failed: Failed to send message to server");
         return false;
     }
+    const auto& response = reply.db_create_secondary_index();
 
     return response.success();
 }
@@ -661,16 +718,17 @@ bool HeliosProxy::db_set_commit_durability(
         return false;
     }
 
-    Helios::Protocol::DbSetCommitDurability::Request request;
-    Helios::Protocol::DbSetCommitDurability::Response response;
+    Helios::Protocol::Request envelope;
+    auto& request = *envelope.mutable_db_set_commit_durability();
 
     request.set_mode(mode);
 
-    if (!send_protobuf_message(request, response,
-                               MessageType::DB_SET_COMMIT_DURABILITY)) {
+    Helios::Protocol::Response reply;
+    if (!send_request(envelope, reply)) {
         *error = "the storage server did not answer";
         return false;
     }
+    const auto& response = reply.db_set_commit_durability();
 
     if (!response.ok()) {
         *error = response.error().empty() ? "the server refused the switch"
@@ -680,61 +738,56 @@ bool HeliosProxy::db_set_commit_durability(
     return true;
 }
 
-template<typename RequestType, typename ResponseType>
-bool HeliosProxy::send_protobuf_message(const RequestType& request,
-                                           ResponseType& response,
-                                           MessageType message_type,
-                                           const std::string& meta) {
-    // serialize request
-    std::string serialized_request = request.SerializeAsString();
-
-    // send message with header
-    std::string serialized_response;
-    if (!send_message_with_header(serialized_request, serialized_response,
-                                  message_type, meta)) {
-        LOG_ERROR("PROTOBUF_MESSAGE: Failed to send message with header");
+bool HeliosProxy::send_request(const Helios::Protocol::Request& request,
+                                  Helios::Protocol::Response& response,
+                                  const std::string& meta,
+                                  std::string* payload) {
+    std::string serialized_request;
+    if (!request.SerializeToString(&serialized_request)) {
+        LOG_ERROR("SEND_REQUEST: Failed to serialize %s",
+                  rpc_op_name(request.body_case()));
         return false;
     }
 
-    // deserialize response
+    std::string serialized_response;
+    std::string discarded_payload;
+    if (!exchange_message(serialized_request, serialized_response,
+                          payload != nullptr ? *payload : discarded_payload,
+                          request.body_case(), meta)) {
+        LOG_ERROR("SEND_REQUEST: Failed to send %s",
+                  rpc_op_name(request.body_case()));
+        // A transport error ends the transaction and the channel: the reset
+        // invalidates the ranges this connection cached, and the close drops a
+        // partially consumed response. The next transaction opens a new
+        // channel.
+        storage_boot_token_ = 0;
+        disconnect();
+        return false;
+    }
+
     if (!response.ParseFromString(serialized_response)) {
-        LOG_ERROR("PROTOBUF_MESSAGE: Failed to parse response");
+        LOG_ERROR("SEND_REQUEST: Failed to parse the response envelope");
+        return false;
+    }
+
+    // The arms are numbered alike, so the reply answers this request only
+    // when the two cases agree on an arm that names an RPC.
+    if (request.body_case() == Helios::Protocol::Request::BODY_NOT_SET ||
+        static_cast<int>(response.body_case()) !=
+            static_cast<int>(request.body_case())) {
+        LOG_ERROR("SEND_REQUEST: %s answered with case %d: %s",
+                  rpc_op_name(request.body_case()),
+                  static_cast<int>(response.body_case()),
+                  response.error().c_str());
         return false;
     }
 
     return true;
 }
 
-// Sends a protobuf request and receives the flat binary reply of TX_EXECUTE_READ_PLAN.
-template<typename RequestType>
-bool HeliosProxy::send_protobuf_recv_binary(const RequestType& request,
-                                                std::string& raw_response,
-                                                MessageType message_type,
-                                                const std::string& meta) {
-    std::string serialized_request = request.SerializeAsString();
-    return send_message_with_header(serialized_request, raw_response,
-                                    message_type, meta);
-}
-
-bool HeliosProxy::send_message_with_header(const std::string& serialized_request,
-                                              std::string& serialized_response,
-                                              MessageType message_type,
-                                              const std::string& meta) {
-    if (exchange_message(serialized_request, serialized_response, message_type,
-                         meta)) {
-        return true;
-    }
-    // A transport error ends the transaction and the channel: the reset
-    // invalidates the ranges this connection cached, and the close drops a
-    // partially consumed response. The next transaction opens a new channel.
-    storage_boot_token_ = 0;
-    disconnect();
-    return false;
-}
-
 bool HeliosProxy::exchange_message(const std::string& serialized_request,
                                       std::string& serialized_response,
-                                      MessageType message_type,
+                                      std::string& payload, RpcOp op,
                                       const std::string& meta) {
     auto rpc_start_ts = std::chrono::steady_clock::now();
     const uint32_t req_bytes = static_cast<uint32_t>(serialized_request.size());
@@ -749,18 +802,19 @@ bool HeliosProxy::exchange_message(const std::string& serialized_request,
         return false;
     }
 
+    const uint32_t env_len =
+        htonl(static_cast<uint32_t>(serialized_request.size()));
+    const uint32_t pay_len = 0;  // A request carries no raw payload.
 
-    // prepare message header
-    MessageHeader header;
-    header.message_type = htonl(static_cast<uint32_t>(message_type));
-    header.payload_size = htonl(static_cast<uint32_t>(serialized_request.size()));
-
-
-    // combine header and payload
-    size_t total_size = sizeof(header) + serialized_request.size();
+    // combine the envelope and the two length words
+    size_t total_size =
+        sizeof(env_len) + serialized_request.size() + sizeof(pay_len);
     std::vector<char> buffer(total_size);
-    std::memcpy(buffer.data(), &header, sizeof(header));
-    std::memcpy(buffer.data() + sizeof(header), serialized_request.c_str(), serialized_request.size());
+    std::memcpy(buffer.data(), &env_len, sizeof(env_len));
+    std::memcpy(buffer.data() + sizeof(env_len), serialized_request.data(),
+                serialized_request.size());
+    std::memcpy(buffer.data() + sizeof(env_len) + serialized_request.size(),
+                &pay_len, sizeof(pay_len));
 
     // send (handle partial writes for large messages)
     size_t total_sent = 0;
@@ -774,38 +828,9 @@ bool HeliosProxy::exchange_message(const std::string& serialized_request,
         total_sent += bytes_sent;
     }
 
-
-    // receive response header
-    MessageHeader response_header;
-    ssize_t header_received = recv(socket_fd_, &response_header, sizeof(response_header), MSG_WAITALL);
-    if (header_received != sizeof(response_header)) {
-        LOG_ERROR("SEND_MESSAGE: Failed to receive response header, received %zd bytes", header_received);
+    if (!recv_part(socket_fd_, serialized_response) ||
+        !recv_part(socket_fd_, payload)) {
         return false;
-    }
-
-    // convert from network byte order to host byte order
-    uint32_t response_message_type = ntohl(response_header.message_type);
-    uint32_t response_payload_size = ntohl(response_header.payload_size);
-
-
-    // Receive the response payload. recv(MSG_WAITALL) still caps one call near
-    // 2GB, so large read-plan responses must be drained in a loop.
-    if (response_payload_size > 0) {
-        serialized_response.resize(response_payload_size);
-        size_t received_total = 0;
-        while (received_total < response_payload_size) {
-            const ssize_t chunk =
-                recv(socket_fd_, &serialized_response[received_total],
-                     response_payload_size - received_total, MSG_WAITALL);
-            if (chunk <= 0) {
-                LOG_ERROR("SEND_MESSAGE: Failed to receive response payload, received %zu/%u bytes",
-                          received_total, response_payload_size);
-                return false;
-            }
-            received_total += static_cast<size_t>(chunk);
-        }
-    } else {
-        serialized_response.clear();
     }
 
     if (current_trace_ != nullptr && current_trace_->active()) {
@@ -813,8 +838,8 @@ bool HeliosProxy::exchange_message(const std::string& serialized_request,
                           std::chrono::steady_clock::now() - rpc_start_ts)
                           .count();
         current_trace_->record(
-            message_type, static_cast<uint64_t>(rpc_us), req_bytes,
-            static_cast<uint32_t>(serialized_response.size()), meta);
+            op, static_cast<uint64_t>(rpc_us), req_bytes,
+            serialized_response.size() + payload.size(), meta);
     }
     return true;
 }
