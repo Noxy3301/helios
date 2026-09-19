@@ -1,4 +1,4 @@
-// helios_index_search.hh
+// index_search.hh
 // Helios Storage Engine: A structure to hold the search plan
 
 #ifndef HELIOS_INDEX_SEARCH_HH

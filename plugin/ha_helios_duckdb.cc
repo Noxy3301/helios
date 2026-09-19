@@ -1,4 +1,4 @@
-#include "ha_helios_duckdb.h"
+#include "ha_helios_duckdb.hh"
 
 #include <algorithm>
 #include <cassert>

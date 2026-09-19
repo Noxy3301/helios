@@ -12,7 +12,7 @@
 
 #include "helios_proxy.hh"
 #include "rpc_trace.hh"
-#include "helios_log.hh"
+#include "log.hh"
 #include "common/rpc_frame.h"
 
 namespace {

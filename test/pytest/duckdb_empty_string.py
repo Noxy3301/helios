@@ -2,7 +2,7 @@
 
 The Helios packed row format packs a zero-length field with one marker byte,
 which a VARCHAR '' and a SQL NULL share. The null bitmap in field 0 of the row
-is what separates them, and the row path reads it (proxy/row_codec.cc). This
+is what separates them, and the row path reads it (plugin/row_codec.cc). This
 file pins that the analytical path (SECONDARY_ENGINE=HELIOS_DUCKDB,
 served by the DuckDB executor) agrees with it: WHERE c = '', WHERE c IS NULL,
 COUNT(c), GROUP BY c and the select list must return the same answers as the

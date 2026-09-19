@@ -19,7 +19,7 @@ namespace pax {
 namespace {
 
 // ---------------------------------------------------------------------------
-// Row bytes follow proxy/helios_field.cc: a width byte, that many
+// Row bytes follow plugin/helios_field.cc: a width byte, that many
 // little-endian length bytes, then the payload. Width 0xFF marks an empty
 // field; the first field carries the row's SQL NULL flags.
 //

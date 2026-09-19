@@ -36,7 +36,7 @@ include_directories(${CMAKE_CURRENT_BINARY_DIR})
 
 set(HELIOS_SOURCES ha_helios.cc ha_helios.hh
                       ha_helios_duckdb.cc
-                      ha_helios_duckdb.h
+                      ha_helios_duckdb.hh
                       duckdb_request_builder.cc
                       duckdb_request_builder.hh
                       ddl.cc
@@ -46,14 +46,14 @@ set(HELIOS_SOURCES ha_helios.cc ha_helios.hh
                       multi_range_read.cc
                       optimizer_stats.cc
                       helios_field.cc helios_field.hh
-                      helios_log.hh
-                      helios_transaction.cc helios_transaction.hh
+                      log.hh
+                      transaction.cc transaction.hh
                       helios_proxy.cc helios_proxy.hh
                       key_pack.cc key_pack.hh
                       row_codec.cc
-                      helios_index_search.cc helios_index_search.hh
-                      helios_prefetch.cc helios_prefetch.hh
-                      helios_autogen.cc helios_autogen.hh
+                      index_search.cc index_search.hh
+                      prefetch.cc prefetch.hh
+                      read_plan_compiler.cc read_plan_compiler.hh
                       rpc_trace.cc rpc_trace.hh)
 add_definitions(-DMYSQL_SERVER)
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wno-error -Wextra -mcx16 -fPIC")

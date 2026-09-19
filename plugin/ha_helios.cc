@@ -29,7 +29,7 @@
  */
 
 #include "storage/helios/ha_helios.hh"
-#include "helios_log.hh"
+#include "log.hh"
 
 #include <algorithm>
 #include <cctype>
@@ -49,7 +49,7 @@
 
 #include "helios_field_types.h"
 #include "key_pack.hh"
-#include "helios_prefetch.hh"
+#include "prefetch.hh"
 #include "helios.pb.h"
 #include "my_dbug.h"
 #include "my_sys.h"

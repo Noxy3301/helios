@@ -35,7 +35,7 @@ def test_channel_reopens_after_storage_restart(user, password):
     The failed exchange can have consumed part of a response, so the socket is
     closed; the next transaction on the same MySQL connection has to reconnect.
     """
-    print("PROXY CHANNEL: STORAGE SERVER RESTART TEST")
+    print("PLUGIN CHANNEL: STORAGE SERVER RESTART TEST")
     port = hpk.RESTART_MYSQLD_PORTS[0]
 
     if hpk.port_is_open(hpk.RESTART_SERVER_PORT):
@@ -43,7 +43,7 @@ def test_channel_reopens_after_storage_restart(user, password):
               "HELIOS_TEST_SERVER_PORT to a free one")
         return 1
 
-    work_dir = tempfile.mkdtemp(prefix="proxy_channel_")
+    work_dir = tempfile.mkdtemp(prefix="plugin_channel_")
     server = None
     started = False
     connection = None

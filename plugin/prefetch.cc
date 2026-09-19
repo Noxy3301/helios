@@ -13,10 +13,10 @@
 // for ::strcasecmp
 #include <strings.h>
 
-#include "helios_autogen.hh"
+#include "read_plan_compiler.hh"
 #include "helios_field_types.h"
 #include "key_pack.hh"
-#include "helios_prefetch.hh"
+#include "prefetch.hh"
 #include "helios.pb.h"
 #include "my_base.h"
 #include "my_dbug.h"

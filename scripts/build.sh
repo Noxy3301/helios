@@ -16,7 +16,8 @@ fi
 # Prepare build directory with clean structure
 echo "Setting up build directory structure..."
 mkdir -p build/data
-mkdir -p build/proxy
+rm -rf build/helios_plugin
+mkdir -p build/helios_plugin
 mkdir -p build/server
 
 # Build DuckDB (third_party submodule) if its shared library is absent.
@@ -30,19 +31,19 @@ fi
 SERVER_BUILD_TYPE=${SERVER_BUILD_TYPE:-Release}
 MYSQL_BUILD_TYPE=${MYSQL_BUILD_TYPE:-Release}
 
-# Create proxy copy with necessary dependencies in build directory
-echo "Creating proxy build structure..."
-cp -r proxy build/
-rm -rf build/proxy/proto build/proxy/common
-mkdir -p build/proxy/proto build/proxy/common
-cp -a proto/. build/proxy/proto/
-cp -a common/. build/proxy/common/
+# Create the plugin copy with necessary dependencies in the build directory
+echo "Creating plugin build structure..."
+cp -a plugin/. build/helios_plugin/
+rm -rf build/helios_plugin/proto build/helios_plugin/common
+mkdir -p build/helios_plugin/proto build/helios_plugin/common
+cp -a proto/. build/helios_plugin/proto/
+cp -a common/. build/helios_plugin/common/
 
 # Create MySQL storage engine link to build directory version
-ln -sf $(pwd)/build/proxy third_party/mysql-server/storage/helios
+ln -sfn $(pwd)/build/helios_plugin third_party/mysql-server/storage/helios
 
-# Build MySQL with proxy storage engine  
-echo "Building MySQL with proxy (CMAKE_BUILD_TYPE=${MYSQL_BUILD_TYPE})..."
+# Build MySQL with the plugin storage engine
+echo "Building MySQL with the plugin (CMAKE_BUILD_TYPE=${MYSQL_BUILD_TYPE})..."
 cd build
 
 cmake ../third_party/mysql-server \

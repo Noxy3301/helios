@@ -52,9 +52,9 @@
 
 #include "helios_field_types.h"
 #include "helios_field.hh"
-#include "helios_transaction.hh"
+#include "transaction.hh"
 #include "helios_proxy.hh"
-#include "helios_index_search.hh"
+#include "index_search.hh"
 #include "my_base.h" /* ha_rows */
 #include "my_compiler.h"
 #include "my_inttypes.h"

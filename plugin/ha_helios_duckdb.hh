@@ -1,5 +1,5 @@
-#ifndef HA_HELIOS_DUCKDB_H
-#define HA_HELIOS_DUCKDB_H
+#ifndef HA_HELIOS_DUCKDB_HH
+#define HA_HELIOS_DUCKDB_HH
 
 #include "my_base.h"
 #include "sql/handler.h"
@@ -60,4 +60,4 @@ class ha_helios_duckdb : public handler {
   THR_LOCK_DATA lock_data_;
 };
 
-#endif  // HA_HELIOS_DUCKDB_H
+#endif  // HA_HELIOS_DUCKDB_HH

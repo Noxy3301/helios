@@ -14,7 +14,7 @@ from utils.connection import get_connection
 
 DBNAME = "ha_helios_pax_limits"
 
-# Widest payload a PAX cell holds (proxy/ddl.cc kMaxCellBytes).
+# Widest payload a PAX cell holds (plugin/ddl.cc kMaxCellBytes).
 MAX_CELL_BYTES = 2048
 # The limit counts the charset octets: utf8mb4 holds four bytes per character.
 MAX_UTF8MB4_CHARS = MAX_CELL_BYTES // 4

@@ -3,7 +3,7 @@
 #include <cstddef>
 #include <string>
 
-#include "helios_prefetch.hh"
+#include "prefetch.hh"
 #include "my_dbug.h"
 #include "sql/sql_class.h"
 #include "sql/table.h"

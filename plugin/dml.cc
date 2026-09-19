@@ -4,7 +4,7 @@
 #include <utility>
 #include <vector>
 
-#include "helios_prefetch.hh"
+#include "prefetch.hh"
 #include "my_dbug.h"
 #include "sql/table.h"
 

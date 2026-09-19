@@ -1,6 +1,6 @@
-#include "helios_transaction.hh"
+#include "transaction.hh"
 #include "storage/helios/ha_helios.hh"
-#include "helios_log.hh"
+#include "log.hh"
 #include "key_pack.hh"
 #include "sql/sql_lex.h"
 #include "sql/table.h"

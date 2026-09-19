@@ -80,7 +80,7 @@ uint32_t length_prefix_bytes(uint32_t length) {
 
 /**
  * @brief Appends one field in the Helios packed row format (matches
- * proxy/ha_helios_duckdb.cc's unpack_row_fields).
+ * plugin/ha_helios_duckdb.cc's unpack_row_fields).
  *
  * @details One byte length-width tag (0xFF for a field with no payload),
  * then that many little-endian length bytes, then the payload. A zero-length
@@ -277,7 +277,7 @@ struct ColumnSpec {
  *
  * @details Column metadata comes from the request: the plugin recomputes
  * type/width/scale from TABLE::field[] with the pure function used at CREATE
- * TABLE time (see proxy/helios_field_types.h), matching what the server
+ * TABLE time (see plugin/helios_field_types.h), matching what the server
  * stored while the schema is unchanged.
  */
 struct PaxTableView {

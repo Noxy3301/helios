@@ -16,7 +16,7 @@
 #include <strings.h>
 
 #include "helios_field_types.h"
-#include "helios_index_search.hh"
+#include "index_search.hh"
 #include "key_pack.hh"
 #include "helios.pb.h"
 #include "my_dbug.h"

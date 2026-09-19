@@ -4,7 +4,7 @@
 #include <utility>
 #include <vector>
 
-#include "helios_prefetch.hh"
+#include "prefetch.hh"
 #include "sql/table.h"
 
 // Handler MRR/read_range entry points. The custom path batches primary-key

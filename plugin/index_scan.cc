@@ -4,7 +4,7 @@
 #include <string>
 #include <utility>
 
-#include "helios_prefetch.hh"
+#include "prefetch.hh"
 #include "my_dbug.h"
 #include "sql/key.h"
 #include "sql/table.h"

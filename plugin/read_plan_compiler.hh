@@ -1,5 +1,5 @@
-#ifndef HELIOS_AUTOGEN_HH
-#define HELIOS_AUTOGEN_HH
+#ifndef HELIOS_READ_PLAN_COMPILER_HH
+#define HELIOS_READ_PLAN_COMPILER_HH
 
 #include <cstdint>
 #include <string>
@@ -9,7 +9,7 @@
 class THD;
 struct TABLE;
 
-#include "helios_index_search.hh"
+#include "index_search.hh"
 #include "helios_proxy.hh"
 
 struct AccessPath;
