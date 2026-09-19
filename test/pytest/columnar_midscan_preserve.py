@@ -58,7 +58,6 @@ stack, restarts it with the sync points armed, and stops it afterwards.
 """
 
 import argparse
-import glob
 import os
 import subprocess
 import sys
@@ -66,11 +65,14 @@ import threading
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from utils import server_log
 from utils.connection import get_connection
 from utils.server_conf import write_conf
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 QUIET = "> /dev/null 2>&1"
+# Bytes the server log held before this test started the stack.
+LOG_OFFSET = 0
 # The writer's install pause, and the hold every bridge read takes between
 # its epoch fence and its scan.
 PAUSE_MS = 1500
@@ -160,7 +162,11 @@ def ensure_stack_stopped(timeout_s=10):
 
 
 def start_stack_with_test_env():
+    global LOG_OFFSET
     conf = write_conf(**SERVER_CONF)
+    # Every start appends to the one log; the tallies read back below are the
+    # ones this start writes.
+    LOG_OFFSET = server_log.size()
     if sh(f"{SERVER_ENV} ./scripts/start_server.sh --config {conf} {QUIET}") != 0:
         raise RuntimeError("start_server.sh failed")
     time.sleep(2)
@@ -282,21 +288,16 @@ def last_scan_tally():
     Each request logs its statement and then one tally line per table, so the
     lines after the last statement belong to the read just finished.
     """
-    logs = sorted(glob.glob(
-        os.path.join(ROOT, "helios_logs", "helios_storage_*.log")))
-    if not logs:
-        return {}
     tally = {}
-    with open(logs[-1], errors="replace") as log:
-        for line in log:
-            if line.startswith("[duckdb-ast] "):
-                tally = {}
-            elif line.startswith("[duckdb-scan] "):
-                for part in line.split()[2:]:
-                    if "=" not in part:
-                        continue
-                    key, value = part.split("=", 1)
-                    tally[key] = tally.get(key, 0) + int(value)
+    for line in server_log.read_since(LOG_OFFSET).splitlines():
+        if line.startswith("[duckdb-ast] "):
+            tally = {}
+        elif line.startswith("[duckdb-scan] "):
+            for part in line.split()[2:]:
+                if "=" not in part:
+                    continue
+                key, value = part.split("=", 1)
+                tally[key] = tally.get(key, 0) + int(value)
     return tally
 
 

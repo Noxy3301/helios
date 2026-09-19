@@ -73,7 +73,10 @@ bool parse_bool(const std::string& value, bool* out) {
 /// Applies one key, refusing an unknown name or an unparsable value.
 void apply_key(const std::string& key, const std::string& value) {
     uint64_t number = 0;
-    if (key == "server_port") {
+    if (key == "datadir") {
+        if (value.empty()) refuse(key, value, "a directory path");
+        g_config.datadir = value;
+    } else if (key == "server_port") {
         if (!parse_number(value, 1, 65535, &number)) {
             refuse(key, value, "an integer in [1,65535]");
         }

@@ -117,17 +117,17 @@
               shell: |
                 set -euo pipefail
                 declared_load="{{ helios_load_durability | default(helios_durability) }}"
-                log=$(ls -t ~/helios/helios_logs/helios_storage_*.log 2>/dev/null \
-                      | head -n1 || true)
-                if [ -z "$log" ]; then
-                  echo "SWITCH_FAIL: no server log under ~/helios/helios_logs" >&2
+                log=~/helios/helios_data/logs/helios.log
+                if [ ! -r "$log" ]; then
+                  echo "SWITCH_FAIL: no server log at $log" >&2
                   exit 1
                 fi
-                # What the server started under: the load always precedes any switch
+                # What the server started under: every start appends to the one
+                # log, and the load always precedes any switch
                 startup_contract() {
-                  local first
-                  first=$(grep -hoE 'Commit durability: [a-z]+' "$log" | head -n1 || true)
-                  printf '%s' "${first##* }"
+                  local line
+                  line=$(grep -hoE 'Commit durability: [a-z]+' "$log" | tail -n1 || true)
+                  printf '%s' "${line##* }"
                 }
                 # The policy in force: the last switch the server logged, else the
                 # startup contract.
@@ -145,7 +145,7 @@
                 # initial capacity until the log outgrows it.
                 wal_file_bytes() {
                   local total
-                  total=$(du -Lbc ~/helios/helios_wal/wal*.log 2>/dev/null \
+                  total=$(du -Lbc ~/helios/helios_data/wal*.log 2>/dev/null \
                           | tail -n1 | cut -f1 || true)
                   echo "${total:-0}"
                 }
@@ -205,9 +205,9 @@
               shell: |
                 set -euo pipefail
                 pid=$(cat /tmp/helios_storage.pid)
-                total=$(du -Lbc ~/helios/helios_wal/wal*.log 2>/dev/null \
+                total=$(du -Lbc ~/helios/helios_data/wal*.log 2>/dev/null \
                         | tail -n1 | cut -f1 || true)
-                log=$(ls -t ~/helios/helios_logs/helios_storage_*.log | head -n1)
+                log=~/helios/helios_data/logs/helios.log
                 mode_after=$(grep -hoE 'Commit durability switched to [A-Z]+' "$log" \
                              | tail -n1 | awk '{print tolower($NF)}' || true)
                 if [ "$mode_after" != "{{ helios_durability }}" ]; then
@@ -761,12 +761,12 @@
         executable: /bin/bash
 
     - name: Package Helios logs
-      # The server's own log only; the WAL under helios_wal can be tens of GB.
+      # The server's own log only; the WAL under helios_data can be tens of GB.
       when: inventory_hostname in groups.get('storage', [])
       shell: |
-        cd ~/helios/helios_logs 2>/dev/null || exit 0
-        if ls helios_storage_*.log >/dev/null 2>&1; then
-          tar -czf {{ sample_dir }}/storage-{{ run_id }}.tgz helios_storage_*.log
+        cd ~/helios/helios_data/logs 2>/dev/null || exit 0
+        if [ -f helios.log ]; then
+          tar -czf {{ sample_dir }}/storage-{{ run_id }}.tgz helios.log
         fi
       args:
         executable: /bin/bash
@@ -776,8 +776,8 @@
       when: inventory_hostname in groups.get('storage', [])
       shell: |
         {
-          echo "=== du -sh ~/helios/helios_wal/ ==="
-          du -sh ~/helios/helios_wal/ 2>/dev/null
+          echo "=== du -sh ~/helios/helios_data/ ==="
+          du -sh ~/helios/helios_data/ 2>/dev/null
           echo "=== df -h ==="
           df -h
         } > {{ sample_dir }}/wal-usage-{{ run_id }}.txt

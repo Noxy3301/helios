@@ -53,9 +53,9 @@ read -r -a MYSQLD_EXTRA <<< "${MYSQLD_EXTRA_ARGS:-}"
 # Per-instance log so the background mysqld does not inherit the caller's
 # stdout/stderr (otherwise subprocess.run() in benchrun.py blocks forever
 # waiting for the inherited pipe to close).
-MYSQL_LOG_DIR="$ROOT_DIR/helios_logs"
+MYSQL_LOG_DIR="$ROOT_DIR/helios_data/logs"
 mkdir -p "$MYSQL_LOG_DIR"
-MYSQL_LOG_FILE="$MYSQL_LOG_DIR/mysqld_${MYSQLD_PORT}_$(date +%Y%m%d_%H%M%S).log"
+MYSQL_LOG_FILE="$MYSQL_LOG_DIR/mysqld_${MYSQLD_PORT}.log"
 
 # Step 1: Initialize if data directory doesn't exist
 if [ ! -d "$DATA_DIR" ] || [ ! -f "$DATA_DIR/ibdata1" ]; then

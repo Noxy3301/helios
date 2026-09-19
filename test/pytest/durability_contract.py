@@ -264,7 +264,7 @@ def test_acknowledged_rows_survive_a_process_crash(work_dir):
             acknowledged.append(row)
         log(f"acknowledged rows: {acknowledged}")
 
-        wal = os.path.join(work_dir, "helios_wal", "wal.log")
+        wal = os.path.join(work_dir, "helios_data", "wal.log")
         size_before = os.path.getsize(wal)
 
         # SIGKILL, not shutdown: a clean stop would flush and prove nothing.

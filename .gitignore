@@ -8,8 +8,7 @@ CLAUDE.md
 build
 boost
 
-helios_logs
-helios_wal
+helios_data
 helios.local.cnf
 .related_work
 

@@ -9,9 +9,7 @@ BIN="$ROOT_DIR/build/server/helios-storage"
 # earlier one, and an explicit --config takes the place of the local file.
 CONF=(--config "$ROOT_DIR/helios.cnf")
 EXTRA=()
-LOG_DIR="$ROOT_DIR/helios_logs"
-TS=$(date +%Y%m%d_%H%M%S)
-LOG_FILE="$LOG_DIR/helios_storage_$TS.log"
+LOG_FILE="$ROOT_DIR/helios_data/logs/helios.log"
 PID_FILE="/tmp/helios_storage.pid"
 
 while [ $# -gt 0 ]; do
@@ -27,7 +25,7 @@ elif [ -f "$ROOT_DIR/helios.local.cnf" ]; then
   CONF+=(--config "$ROOT_DIR/helios.local.cnf")
 fi
 
-mkdir -p "$LOG_DIR"
+mkdir -p "$(dirname "$LOG_FILE")"
 
 # jemalloc: use LD_PRELOAD to replace glibc malloc
 JEMALLOC="/lib/x86_64-linux-gnu/libjemalloc.so.2"
@@ -50,7 +48,7 @@ fi
 
 echo "Starting helios-storage (${CONF[*]}) ..."
 ulimit -n 1048576 2>/dev/null || ulimit -n 65535 2>/dev/null || true
-nohup "$BIN" "${CONF[@]}" > "$LOG_FILE" 2>&1 &
+nohup "$BIN" "${CONF[@]}" >> "$LOG_FILE" 2>&1 &
 PID=$!
 echo $PID > "$PID_FILE"
 

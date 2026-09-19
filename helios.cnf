@@ -7,6 +7,10 @@
 
 [helios-storage]
 
+# Directory holding the log, the checkpoint and the PAX catalog, relative to
+# the directory the server runs in.
+datadir = ./helios_data
+
 # TCP port the RPC listener binds, in [1,65535].
 server_port = 9999
 

@@ -9,6 +9,7 @@
 
 DatabaseManager::DatabaseManager() {
     helios::storage::Config conf;
+    conf.work_dir                   = config().datadir;
     conf.epoch_duration_ms          = config().epoch_duration_ms;
     conf.wal_initial_capacity_bytes = config().wal_initial_capacity_bytes;
     conf.checkpoint_interval_ms     = config().checkpoint_interval_ms;

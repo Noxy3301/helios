@@ -42,8 +42,8 @@ BENCHBASE_DIR = ROOT / "bench" / "benchbase-mysql"
 MYSQL_BIN = ROOT / "build" / "runtime_output_directory" / "mysql"
 # The kernel truncates the process name to 15 characters
 SERVER_COMM = "helios-storage"
-HELIOS_LOG_DIR = ROOT / "helios_logs"
-HELIOS_WAL_DIR = ROOT / "helios_wal"  # the storage's work directory
+HELIOS_DATA_DIR = ROOT / "helios_data"  # the storage's work directory
+HELIOS_LOG = HELIOS_DATA_DIR / "logs" / "helios.log"
 # The server configuration a run generates when it needs other than the
 # checked-in defaults.
 LOCAL_CONF = ROOT / "helios.local.cnf"
@@ -156,16 +156,15 @@ def start_mysql_server(mysqld_port=3307, server_host="127.0.0.1", server_port=99
 
 
 def server_startup_contract():
-    """Commit durability the newest server log reports at startup, or None."""
-    logs = sorted(HELIOS_LOG_DIR.glob("helios_storage_*.log"),
-                  key=lambda p: p.stat().st_mtime, reverse=True)
-    if not logs:
+    """Commit durability the last start in the server log reports, or None."""
+    if not HELIOS_LOG.exists():
         return None
-    for line in logs[0].read_text(errors="replace").splitlines():
-        marker = "Commit durability:"
+    marker = "Commit durability:"
+    contract = None
+    for line in HELIOS_LOG.read_text(errors="replace").splitlines():
         if marker in line:
-            return line.split(marker, 1)[1].split()[0]
-    return None
+            contract = line.split(marker, 1)[1].split()[0]
+    return contract
 
 
 def switch_commit_durability(mode, host, port):
@@ -197,40 +196,26 @@ def stop_all_servers():
             pass
 
 
-def cleanup_helios_logs():
-    """Remove the server logs and the storage's work directory after managed benchmark runs."""
-    if not HELIOS_LOG_DIR.exists() and not HELIOS_WAL_DIR.exists():
+def cleanup_helios_data():
+    """Remove the storage's work directory, the server log included, after managed benchmark runs."""
+    if not HELIOS_DATA_DIR.exists():
         return
 
     # Match start_helios_storage()'s reuse predicate (port) and catch a
     # relative-path launch that is not listening yet. A launch racing the
     # unlink below stays possible; the bench launcher does not do that.
     if _find_pid("build/server/helios-storage") or _is_port_open("127.0.0.1", 9999):
-        print("  Skipping helios_logs cleanup: helios-storage is still running")
+        print("  Skipping helios_data cleanup: helios-storage is still running")
         return
 
-    removed = 0
-    if HELIOS_WAL_DIR.is_symlink():
+    if HELIOS_DATA_DIR.is_symlink():
         # A work directory linked onto another volume keeps the link; only its
         # contents go.
-        for path in HELIOS_WAL_DIR.iterdir():
+        for path in HELIOS_DATA_DIR.iterdir():
             shutil.rmtree(path) if path.is_dir() and not path.is_symlink() else path.unlink()
-        removed += 1
-    elif HELIOS_WAL_DIR.exists():
-        shutil.rmtree(HELIOS_WAL_DIR)
-        removed += 1
-    for path in HELIOS_LOG_DIR.iterdir() if HELIOS_LOG_DIR.exists() else []:
-        try:
-            if path.is_dir() and not path.is_symlink():
-                shutil.rmtree(path)
-            else:
-                path.unlink()
-            removed += 1
-        except FileNotFoundError:
-            continue
-
-    if removed:
-        print(f"  Cleaned helios_logs ({removed} entries)")
+    else:
+        shutil.rmtree(HELIOS_DATA_DIR)
+    print("  Cleaned helios_data")
 
 
 def mysql_cmd(port, host, sql):
@@ -889,8 +874,8 @@ def main():
                         help="Run ANALYZE TABLE after load (automatic for --tx-plan runs)")
     parser.add_argument("--external-server", action="store_true",
                         help="Skip auto start/stop of helios-storage and mysqld (assume already running)")
-    parser.add_argument("--keep-helios-logs", action="store_true",
-                        help="Keep helios_logs and helios_wal after the benchmark")
+    parser.add_argument("--keep-helios-data", action="store_true",
+                        help="Keep helios_data after the benchmark")
     parser.add_argument("--read-path", choices=["row", "plan"], default="plan",
                         help="SET GLOBAL helios_read_path: row sends one request per handler "
                              "read, plan stages what it can in one request (default)")
@@ -1046,7 +1031,7 @@ def main():
         # Wipe any WAL left by a previous run before starting a fresh server,
         # so stale logs never trigger recovery. No-op if helios-storage is
         # already running (reuse case, handled inside the function).
-        cleanup_helios_logs()
+        cleanup_helios_data()
         load_durability = "async" if args.load_durability == "async" else None
         if not start_helios_storage(commit_durability=load_durability):
             sys.exit(1)
@@ -1068,8 +1053,8 @@ def main():
     finally:
         if managed:
             stop_all_servers()
-        if not args.keep_helios_logs:
-            cleanup_helios_logs()
+        if not args.keep_helios_data:
+            cleanup_helios_data()
 
 
 def _run_bench(args, config_work, thread_list, result_base):

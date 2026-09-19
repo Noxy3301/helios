@@ -15,6 +15,8 @@ struct ServerConfig {
     uint16_t server_port = 9999;
     // The server passes every storage field below on, set or not, so these
     // defaults, not the ones in helios/config.h, are what it runs under.
+    /// Directory holding the log, the checkpoint and the PAX catalog.
+    std::string datadir = "./helios_data";
     /// How often the global epoch advances, in milliseconds.
     size_t epoch_duration_ms = 40;
     /// The contract every commit runs under: "sync" or "async".
