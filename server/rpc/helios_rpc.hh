@@ -2,6 +2,7 @@
 // the server-wide row counts, boot token and hidden-key allocator they use.
 #pragma once
 
+#include <chrono>
 #include <string>
 #include <memory>
 #include <mutex>
@@ -35,11 +36,6 @@ struct TableRowCounts {
     }
 };
 
-// Identifies this run of the storage server: a hidden-key range is valid only
-// against the run that granted it. Derived from startup time so it moves
-// forward across restarts unless the clock steps back. Never zero.
-uint64_t storage_boot_token();
-
 /**
  * @brief Server-wide source of the hidden primary keys handed to tables that
  * declare none, shared across all connections.
@@ -50,6 +46,12 @@ uint64_t storage_boot_token();
  */
 class HiddenKeyAllocator {
 public:
+    // Identifies this run of the storage server: a range is valid only against
+    // the run that granted it. Restarts are milliseconds apart, so the clock
+    // moves it forward.
+    const uint64_t boot_token = static_cast<uint64_t>(
+        std::chrono::system_clock::now().time_since_epoch().count());
+
     /**
      * @brief Reserves [*first_id, *first_id + count) for the caller.
      *

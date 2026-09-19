@@ -1,16 +1,14 @@
 #include "helios_rpc.hh"
 
-#include <chrono>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <mutex>
-#include <random>
 #include <string>
 #include <vector>
 
-#include "../../common/log.h"
+#include <spdlog/spdlog.h>
 #include "helios.pb.h"
 #include "helios/pax.h"
 #include "helios/transaction.h"
@@ -24,26 +22,6 @@ namespace {
 constexpr char kWatermarkTable[] = "__helios_hidden_keys";
 
 }  // namespace
-
-uint64_t storage_boot_token() {
-    // Startup nanoseconds with the low bits replaced by entropy: restarts are
-    // milliseconds apart, so the token strictly increases across runs. A clock
-    // stepped back onto a bucket a past run used could repeat a token.
-    constexpr int kEntropyBits  = 16;  // ~65 us, far below a restart
-    constexpr uint64_t kLowMask = (1ull << kEntropyBits) - 1;
-
-    static const uint64_t token = []() -> uint64_t {
-        const uint64_t started = static_cast<uint64_t>(
-            std::chrono::duration_cast<std::chrono::nanoseconds>(
-                std::chrono::system_clock::now().time_since_epoch())
-                .count());
-        std::random_device source;
-        const uint64_t value =
-            (started & ~kLowMask) | (static_cast<uint64_t>(source()) & kLowMask);
-        return value == 0 ? 1 : value;  // zero means "no token" to the plugin
-    }();
-    return token;
-}
 
 namespace {
 
@@ -157,7 +135,7 @@ bool HiddenKeyAllocator::Allocate(helios::storage::Database& database,
     }
 
     if (announced_.insert(table_name).second) {
-        LOG_INFO("Hidden keys for '%s' resume at %llu", table_name.c_str(),
+        SPDLOG_INFO("Hidden keys for '{}' resume at {}", table_name.c_str(),
                  static_cast<unsigned long long>(next));
     }
     *first_id = next;
@@ -173,7 +151,7 @@ void HeliosRpc::handleDbAllocateHiddenKeys(const std::string& message,
         response.set_ok(false);
         response.set_permanent(true);
         response.set_error("malformed request");
-        LOG_ERROR("AllocateHiddenKeys: malformed request");
+        SPDLOG_ERROR("AllocateHiddenKeys: malformed request");
         result = response.SerializeAsString();
         return;
     }
@@ -186,13 +164,13 @@ void HeliosRpc::handleDbAllocateHiddenKeys(const std::string& message,
                                             request.count(), &first_id, &error,
                                             &permanent);
     response.set_ok(ok);
-    response.set_boot_token(storage_boot_token());
+    response.set_boot_token(hidden_keys_->boot_token);
     if (ok) {
         response.set_first_id(first_id);
     } else {
         response.set_permanent(permanent);
         response.set_error(error);
-        LOG_ERROR("AllocateHiddenKeys for '%s': %s",
+        SPDLOG_ERROR("AllocateHiddenKeys for '{}': {}",
                   request.table_name().c_str(), error.c_str());
     }
 
@@ -208,7 +186,7 @@ void HeliosRpc::handleDbSetCommitDurability(const std::string& message,
         response.set_ok(false);
         response.set_mode(to_wire_mode(db_manager_->commit_durability()));
         response.set_error("malformed request");
-        LOG_ERROR("SetCommitDurability: malformed request");
+        SPDLOG_ERROR("SetCommitDurability: malformed request");
         result = response.SerializeAsString();
         return;
     }
@@ -225,7 +203,7 @@ void HeliosRpc::handleDbSetCommitDurability(const std::string& message,
             response.set_ok(false);
             response.set_mode(to_wire_mode(db_manager_->commit_durability()));
             response.set_error("commit durability mode cannot be requested");
-            LOG_ERROR("SetCommitDurability: unrequestable mode");
+            SPDLOG_ERROR("SetCommitDurability: unrequestable mode");
             result = response.SerializeAsString();
             return;
     }
@@ -234,14 +212,14 @@ void HeliosRpc::handleDbSetCommitDurability(const std::string& message,
     response.set_ok(true);
     response.set_mode(to_wire_mode(mode));
 
-    LOG_INFO("Commit durability switched to %s", durability_name(mode));
+    SPDLOG_INFO("Commit durability switched to {}", durability_name(mode));
 
     result = response.SerializeAsString();
 }
 
 void HeliosRpc::handleDbCreateTable(const std::string& message,
                                        std::string& result) {
-    LOG_DEBUG("Handling DbCreateTable");
+    SPDLOG_DEBUG("Handling DbCreateTable");
 
     Helios::Protocol::DbCreateTable::Request request;
     Helios::Protocol::DbCreateTable::Response response;
@@ -283,13 +261,13 @@ void HeliosRpc::handleDbCreateTable(const std::string& message,
 
         installed = db->InstallPaxSchema(request.table_name(), widths, types,
                                          scales);
-        LOG_INFO("PAX schema for '%s': %zu fields, typed=%s, %s",
+        SPDLOG_INFO("PAX schema for '{}': {} fields, typed={}, {}",
                  request.table_name().c_str(), widths.size(),
                  types.empty() ? "no" : "yes",
                  installed ? "installed" : "refused");
     }
     response.set_success(created && installed);
-    LOG_DEBUG("CreateTable '%s': %s", request.table_name().c_str(),
+    SPDLOG_DEBUG("CreateTable '{}': {}", request.table_name().c_str(),
               response.success() ? "success" : "refused");
 
     result = response.SerializeAsString();
@@ -297,7 +275,7 @@ void HeliosRpc::handleDbCreateTable(const std::string& message,
 
 void HeliosRpc::handleDbCreateSecondaryIndex(const std::string& message,
                                                 std::string& result) {
-    LOG_DEBUG("Handling DbCreateSecondaryIndex");
+    SPDLOG_DEBUG("Handling DbCreateSecondaryIndex");
 
     Helios::Protocol::DbCreateSecondaryIndex::Request request;
     Helios::Protocol::DbCreateSecondaryIndex::Response response;

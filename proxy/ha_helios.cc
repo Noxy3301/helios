@@ -29,7 +29,7 @@
  */
 
 #include "storage/helios/ha_helios.hh"
-#include "../common/log.h"
+#include "helios_log.hh"
 
 #include <algorithm>
 #include <cctype>
@@ -52,7 +52,9 @@
 #include "helios_prefetch.hh"
 #include "helios.pb.h"
 #include "my_dbug.h"
+#include "my_sys.h"
 #include "mysql/plugin.h"
+#include "mysqld_error.h"
 #include "sql/field.h"
 #include "sql/item.h"
 #include "sql/item_cmpfunc.h"
@@ -70,8 +72,19 @@
 static char *srv_server_host = nullptr;
 static ulong srv_server_port = 9999;
 ulong srv_read_path = kReadPathPlan;
+enum CommitDurability { kCommitDurabilityAsync = 0, kCommitDurabilitySync = 1 };
+// The mode this node last set on the storage server. The server starts
+// under the contract helios.cnf gives it, which no query node observes.
+static ulong srv_commit_durability = kCommitDurabilitySync;
 bool srv_stats_drift_refresh = false;
+bool srv_rpc_trace = false;
+char *srv_rpc_trace_path = nullptr;
 handlerton *helios_hton;
+
+// Error log service, acquired for the life of the plugin.
+static SERVICE_TYPE(registry) *reg_srv = nullptr;
+SERVICE_TYPE(log_builtins) *log_bi = nullptr;
+SERVICE_TYPE(log_builtins_string) *log_bs = nullptr;
 
 // THD-scoped context
 struct HeliosThdCtx {
@@ -127,6 +140,8 @@ static handler *helios_create_handler(handlerton *hton, TABLE_SHARE *table,
 static int helios_init_func(void *p) {
   DBUG_TRACE;
 
+  if (init_logging_service_for_plugin(&reg_srv, &log_bi, &log_bs)) return 1;
+
   helios_hton = (handlerton *)p;
   helios_hton->state = SHOW_OPTION_YES;
   helios_hton->create = helios_create_handler;
@@ -140,6 +155,11 @@ static int helios_init_func(void *p) {
   helios_hton->rollback = helios_abort;
   helios_hton->close_connection = helios_close_connection;
 
+  return 0;
+}
+
+static int helios_deinit_func(void *) {
+  deinit_logging_service_for_plugin(&reg_srv, &log_bi, &log_bs);
   return 0;
 }
 
@@ -466,6 +486,41 @@ static MYSQL_SYSVAR_ENUM(read_path, srv_read_path, PLUGIN_VAR_RQCMDARG,
                          "request per handler read, plan stages what it can in "
                          "one request and sends the rest as they happen.",
                          nullptr, nullptr, kReadPathPlan, &read_path_typelib);
+static const char *commit_durability_names[] = {"async", "sync", NullS};
+static TYPELIB commit_durability_typelib = {
+    array_elements(commit_durability_names) - 1, "commit_durability_typelib",
+    commit_durability_names, nullptr};
+
+// Publishes the mode on the storage server; a refused switch fails the SET
+// GLOBAL with the server's reason and leaves the variable as it was.
+static void update_commit_durability(THD *, SYS_VAR *, void *var_ptr,
+                                     const void *save) {
+  const ulong mode = *static_cast<const ulong *>(save);
+  const std::string host =
+      srv_server_host ? srv_server_host : std::string("127.0.0.1");
+  HeliosProxy proxy(host, static_cast<int>(srv_server_port));
+  std::string error;
+  if (!proxy.db_set_commit_durability(
+          mode == kCommitDurabilitySync
+              ? Helios::Protocol::DbSetCommitDurability::SYNC
+              : Helios::Protocol::DbSetCommitDurability::ASYNC,
+          &error)) {
+    my_printf_error(ER_WRONG_VALUE_FOR_VAR, "helios_commit_durability: %s",
+                    MYF(0), error.c_str());
+    return;
+  }
+  *static_cast<ulong *>(var_ptr) = mode;
+}
+
+static MYSQL_SYSVAR_ENUM(commit_durability, srv_commit_durability,
+                         PLUGIN_VAR_RQCMDARG | PLUGIN_VAR_NOCMDOPT |
+                             PLUGIN_VAR_NOPERSIST,
+                         "Commit acknowledgement contract of the storage "
+                         "server: async returns before the log is on disk, "
+                         "sync waits for it. Setting it switches the running "
+                         "server.",
+                         nullptr, update_commit_durability,
+                         kCommitDurabilitySync, &commit_durability_typelib);
 static MYSQL_SYSVAR_BOOL(stats_drift_refresh, srv_stats_drift_refresh,
                          PLUGIN_VAR_OPCMDARG,
                          "Automatically refresh index statistics before SELECT "
@@ -474,11 +529,24 @@ static MYSQL_SYSVAR_BOOL(stats_drift_refresh, srv_stats_drift_refresh,
                          "synchronous refresh scans every requested index on "
                          "the server.",
                          nullptr, nullptr, false);
+// The trace file is opened once, on the first RPC of the process.
+static MYSQL_SYSVAR_BOOL(rpc_trace, srv_rpc_trace, PLUGIN_VAR_READONLY,
+                         "Write a JSONL trace of every RPC, statement and "
+                         "transaction.",
+                         nullptr, nullptr, false);
+static MYSQL_SYSVAR_STR(rpc_trace_path, srv_rpc_trace_path,
+                        PLUGIN_VAR_READONLY | PLUGIN_VAR_MEMALLOC,
+                        "Where the RPC trace is written; unset writes "
+                        "/tmp/helios_rpc_trace_<pid>.jsonl.",
+                        nullptr, nullptr, nullptr);
 static SYS_VAR *helios_system_variables[] = {
     MYSQL_SYSVAR(server_host),
     MYSQL_SYSVAR(server_port),
     MYSQL_SYSVAR(read_path),
+    MYSQL_SYSVAR(commit_durability),
     MYSQL_SYSVAR(stats_drift_refresh),
+    MYSQL_SYSVAR(rpc_trace),
+    MYSQL_SYSVAR(rpc_trace_path),
     nullptr};
 
 extern struct st_mysql_storage_engine helios_columnar_storage_engine;
@@ -494,7 +562,7 @@ mysql_declare_plugin(helios){
     PLUGIN_LICENSE_GPL,
     helios_init_func, /* Plugin Init */
     nullptr,             /* Plugin check uninstall */
-    nullptr,             /* Plugin Deinit */
+    helios_deinit_func,  /* Plugin Deinit */
     0x0001 /* 0.1 */,
     nullptr,                    /* status variables */
     helios_system_variables, /* system variables */

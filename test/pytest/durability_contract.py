@@ -31,6 +31,9 @@ import tempfile
 import threading
 import time
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from utils.server_conf import write_conf
+
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 SERVER = os.path.join(ROOT, "build", "server", "helios-storage")
 MYSQL_SOCKET = "/tmp/mysql.sock"
@@ -73,17 +76,17 @@ def stop_stack():
     time.sleep(1)
 
 
-def start_server(work_dir, mode, extra_env=None, pass_fds=()):
+def start_server(work_dir, mode, conf=None, extra_env=None, pass_fds=()):
     """Starts the server directly, so its log directory and inherited
     descriptors are the test's to choose."""
+    # The debug sync points are the one knob that stays in the environment.
     env = dict(os.environ)
-    env["HELIOS_COMMIT_DURABILITY"] = mode
-    env["HELIOS_EPOCH_DURATION_MS"] = "40"
-    env.pop("HELIOS_ENABLE_RECOVERY", None)
     if extra_env:
         env.update(extra_env)
+    path = write_conf(work_dir, commit_durability=mode, epoch_duration_ms=40,
+                      **(conf or {}))
     out = open(os.path.join(work_dir, "server.out"), "wb")
-    process = subprocess.Popen([SERVER], cwd=work_dir, env=env,
+    process = subprocess.Popen([SERVER, "--config", path], cwd=work_dir, env=env,
                                stdin=subprocess.DEVNULL, stdout=out,
                                stderr=subprocess.STDOUT, pass_fds=pass_fds)
     if not wait_for_port(9999, SERVER_PORT_WAIT_SECONDS):
@@ -261,7 +264,7 @@ def test_acknowledged_rows_survive_a_process_crash(work_dir):
             acknowledged.append(row)
         log(f"acknowledged rows: {acknowledged}")
 
-        wal = os.path.join(work_dir, "helios_wal", "wal.log")
+        wal = os.path.join(work_dir, "helios_data", "wal.log")
         size_before = os.path.getsize(wal)
 
         # SIGKILL, not shutdown: a clean stop would flush and prove nothing.
@@ -273,8 +276,7 @@ def test_acknowledged_rows_survive_a_process_crash(work_dir):
         server = None
         log(f"killed the server; wal.log is {size_before} bytes")
 
-        server = start_server(work_dir, "sync",
-                              extra_env={"HELIOS_ENABLE_RECOVERY": "1"})
+        server = start_server(work_dir, "sync", conf={"enable_recovery": 1})
         start_mysqld()
         rows = sql("SELECT id, v FROM dur.crash ORDER BY id;")
         recovered = {}

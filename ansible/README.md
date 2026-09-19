@@ -235,5 +235,5 @@ python3 py/plot_tpch.py          # TPC-H per-query latency (auto-called for tpch
   `unique_checks=1` gate is a backstop of a different kind: that relaxation
   (`bench_load_unique_checks_off`) lives in the loader's JDBC session, and
   `measure_term.yml` already refuses an execute config carrying it.
-- **Server restart clears data**: `storage.yml` wipes `helios_wal` before it starts the server, so a redeploy starts empty. Re-run `benchbase.yml` after restart.
+- **Server restart clears data**: `storage.yml` wipes `helios_data` before it starts the server, so a redeploy starts empty. Re-run `benchbase.yml` after restart.
 

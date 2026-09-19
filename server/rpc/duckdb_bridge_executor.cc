@@ -4,9 +4,9 @@
 // groups without epoch images and through those images otherwise. DuckDB
 // contributes its binder, planner, and vectorized runtime; no table data ever
 // lives inside DuckDB. duckdb_bridge_dispatch.cc routes the opcode here.
-// HELIOS_BRIDGE_THREADS bounds the analytical thread pool; unset is a quarter
-// of the hardware threads, which leaves the OLTP side its cores in a mixed run.
-// HELIOS_BRIDGE_MEM_LIMIT bounds DuckDB's operator memory (a byte count, K/M/G
+// bridge_threads bounds the analytical thread pool; unset is a quarter of the
+// hardware threads, which leaves the OLTP side its cores in a mixed run.
+// bridge_mem_limit bounds DuckDB's operator memory (a byte count, K/M/G
 // accepted); unset is DuckDB's own default.
 //
 // Consistency: the request runs against a columnar read view with snapshot
@@ -29,7 +29,7 @@
 #include <duckdb/parser/parsed_data/create_collation_info.hpp>
 #include <duckdb/parser/parsed_data/create_scalar_function_info.hpp>
 
-#include "../../common/log.h"
+#include "../server_config.hh"
 #include "../mysql_charset_runtime.hh"
 #include "m_ctype.h"
 
@@ -38,11 +38,9 @@
 
 #include <algorithm>
 #include <atomic>
-#include <charconv>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
-#include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <mutex>
@@ -115,29 +113,14 @@ void AppendProxyField(std::string& out, std::string_view payload,
 // ---------------------------------------------------------------------------
 
 /**
- * @brief Whether ENABLE_DUCKDB_BRIDGE_DEBUG asks for the bridge's trace lines.
+ * @brief Whether the configuration asks for the bridge's trace lines.
  */
-bool BridgeDebugEnabled() {
-  static const bool enabled = [] {
-    const char* value = std::getenv("ENABLE_DUCKDB_BRIDGE_DEBUG");
-    return value != nullptr && value[0] != '\0' &&
-           std::string_view(value) != "0";
-  }();
-  return enabled;
-}
+bool BridgeDebugEnabled() { return config().bridge_debug; }
 
 /**
  * @brief Upper bound on the read view's epoch-fence wait.
  */
-uint32_t FenceTimeoutMs() {
-  static const uint32_t timeout_ms = [] {
-    const char* value = std::getenv("HELIOS_READ_VIEW_FENCE_TIMEOUT_MS");
-    if (value == nullptr) return 5000u;
-    const long parsed = std::strtol(value, nullptr, 10);
-    return parsed > 0 ? static_cast<uint32_t>(parsed) : 5000u;
-  }();
-  return timeout_ms;
-}
+uint32_t FenceTimeoutMs() { return config().read_view_fence_timeout_ms; }
 
 // ---------------------------------------------------------------------------
 // Proxy row-format decoding, for epoch images. A preserved old_row is a proxy
@@ -301,7 +284,7 @@ struct PaxTableView {
   size_t group_count = 0;  // fixed after the read view fence, not live state
   uint32_t snapshot_epoch = 0;  // read view serialization point se
 
-  // Scan tallies for one request, reported under ENABLE_DUCKDB_BRIDGE_DEBUG.
+  // Scan tallies for one request, reported under bridge_debug.
   std::atomic<uint64_t> groups_scanned{0};
   std::atomic<uint64_t> groups_with_images{0};
   std::atomic<uint64_t> chunk_audits_redone{0};
@@ -1215,62 +1198,7 @@ void EncodeRow(duckdb::MaterializedQueryResult& result, idx_t row_index,
 // Process-lifetime state.
 // ---------------------------------------------------------------------------
 
-/**
- * @brief Parses a positive integer that spans the whole token.
- *
- * @details False for an empty token, a non-digit anywhere in it, or a value
- * past uint64_t. `tail` takes the one suffix letter a byte count allows; a
- * caller that wants none passes nullptr.
- */
-bool ParseWholeNumber(const char* value, uint64_t* out, char* tail) {
-  const std::string_view input(value);
-  if (input.empty()) return false;
-  const char* const last = input.data() + input.size();
-  const auto [end, error] = std::from_chars(input.data(), last, *out, 10);
-  if (error != std::errc{} || *out == 0) return false;
-  if (end == last) {
-    if (tail != nullptr) *tail = '\0';
-    return true;
-  }
-  if (tail == nullptr || end + 1 != last) return false;
-  *tail = *end;
-  return true;
-}
-
-/**
- * @brief Parses a byte count with an optional K, M or G suffix.
- *
- * @details False for a token the count does not span, a suffix outside
- * K/M/G, a count past uint64_t, or a count the suffix takes past it.
- */
-bool ParseByteSize(const char* value, uint64_t* out) {
-  char suffix = '\0';
-  if (!ParseWholeNumber(value, out, &suffix)) return false;
-  uint64_t scale = 1;
-  switch (suffix) {
-    case 'g':
-    case 'G':
-      scale = 1ull << 30;
-      break;
-    case 'm':
-    case 'M':
-      scale = 1ull << 20;
-      break;
-    case 'k':
-    case 'K':
-      scale = 1ull << 10;
-      break;
-    case '\0':
-      break;
-    default:
-      return false;
-  }
-  if (*out > UINT64_MAX / scale) return false;
-  *out *= scale;
-  return true;
-}
-
-// The bounds ConfigureLimits read, 0 while the environment sets neither.
+// The bounds ConfigureLimits read, 0 while the configuration sets neither.
 idx_t bridge_threads = 0;
 idx_t bridge_memory = 0;
 
@@ -1279,7 +1207,7 @@ idx_t bridge_memory = 0;
  *
  * @details The thread pool defaults to a quarter of the hardware threads, so
  * an analytical stream does not take the cores the OLTP side runs on; a pure
- * analytical run sets HELIOS_BRIDGE_THREADS itself. An unset memory bound is
+ * analytical run sets bridge_threads itself. An unset memory bound is
  * DuckDB's own default.
  */
 duckdb::DBConfig* ConfigureBridgeLimits(duckdb::DBConfig* config) {
@@ -1506,27 +1434,8 @@ void EnsureDuckdbScanRegistered() {
 }  // namespace
 
 void ConfigureLimits() {
-  const char* threads = std::getenv("HELIOS_BRIDGE_THREADS");
-  if (threads != nullptr) {
-    uint64_t parsed = 0;
-    if (!ParseWholeNumber(threads, &parsed, nullptr)) {
-      LOG_FATAL(
-          "Invalid HELIOS_BRIDGE_THREADS='%s': expected a positive integer",
-          threads);
-    }
-    bridge_threads = static_cast<idx_t>(parsed);
-  }
-  const char* memory = std::getenv("HELIOS_BRIDGE_MEM_LIMIT");
-  if (memory != nullptr) {
-    uint64_t bytes = 0;
-    if (!ParseByteSize(memory, &bytes)) {
-      LOG_FATAL(
-          "Invalid HELIOS_BRIDGE_MEM_LIMIT='%s': expected a positive byte "
-          "count with an optional K, M or G suffix",
-          memory);
-    }
-    bridge_memory = static_cast<idx_t>(bytes);
-  }
+  bridge_threads = static_cast<idx_t>(config().bridge_threads);
+  bridge_memory = static_cast<idx_t>(config().bridge_mem_limit_bytes);
 }
 
 void ExecuteDuckdbQuery(

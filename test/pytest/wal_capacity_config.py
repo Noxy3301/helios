@@ -1,7 +1,7 @@
 """
-The reservation size the write-ahead log starts with is taken from
-HELIOS_WAL_INITIAL_CAPACITY_BYTES, and a value that does not parse exactly has
-to stop startup.
+The reservation size the write-ahead log starts with is taken from the
+configuration key wal_initial_capacity_bytes, and a value that does not parse
+exactly has to stop startup.
 
 The value decides whether a commit's fdatasync also persists a new file size. A run
 that silently fell back to a default would be labelled with a reservation it did not
@@ -17,22 +17,24 @@ import subprocess
 import sys
 import tempfile
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from utils.server_conf import write_conf
+
 REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 SERVER = os.path.join(REPO, "build", "server", "helios-storage")
 
-VARIABLE = "HELIOS_WAL_INITIAL_CAPACITY_BYTES"
+KEY = "wal_initial_capacity_bytes"
 STARTUP_TIMEOUT_SECONDS = 20
-# server/database_manager.cc: kMaxWalCapacityBytes
+# server/server_config.cc: kMaxWalCapacityBytes
 MAX_BYTES = 64 * 1024**3
 
 
 def run_server(value):
-    """Starts the server with the variable set and returns its output."""
-    env = {**os.environ, "HELIOS_EPOCH_DURATION_MS": "10", VARIABLE: value}
-    env.pop("HELIOS_ENABLE_RECOVERY", None)
+    """Starts the server with the key set and returns its output."""
     with tempfile.TemporaryDirectory(prefix="helios_wal_capacity_") as work_dir:
+        conf = write_conf(work_dir, epoch_duration_ms=10, **{KEY: value})
         try:
-            done = subprocess.run([SERVER], cwd=work_dir, env=env,
+            done = subprocess.run([SERVER, "--config", conf], cwd=work_dir,
                                   stdin=subprocess.DEVNULL,
                                   stdout=subprocess.PIPE,
                                   stderr=subprocess.STDOUT,
@@ -53,9 +55,9 @@ def expect_refusal(label, value):
     rc, output = run_server(value)
     if rc is None:
         print(f"FAIL [{label}]: the server kept running instead of refusing "
-              f"{VARIABLE}={value!r}")
+              f"{KEY} = {value!r}")
         return False
-    if f"Invalid {VARIABLE}" not in output:
+    if f"Invalid configuration '{KEY}" not in output:
         print(f"FAIL [{label}]: exited rc={rc} but not for the parsing reason; "
               f"output was:\n{output[-800:]}")
         return False
@@ -69,7 +71,7 @@ def expect_refusal(label, value):
 
 def expect_startup(label, value, reported):
     rc, output = run_server(value)
-    if f"Invalid {VARIABLE}" in output:
+    if f"Invalid configuration '{KEY}" in output:
         print(f"FAIL [{label}]: startup was refused for a value that parses; "
               f"output was:\n{output[-800:]}")
         return False

@@ -1,5 +1,4 @@
 #include "storage/helios/ha_helios.hh"
-#include "../common/log.h"
 
 #include <algorithm>
 #include <cctype>

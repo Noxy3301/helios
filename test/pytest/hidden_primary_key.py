@@ -8,6 +8,7 @@ and would take down another checkout's stack.
 """
 import argparse
 import os
+import re
 import shutil
 import signal
 import socket
@@ -21,6 +22,7 @@ import mysql.connector
 from mysql.connector import errorcode
 
 from utils.connection import get_connection
+from utils.server_conf import write_conf
 
 ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 SCRIPTS_DIR = os.path.join(ROOT_DIR, "scripts")
@@ -153,21 +155,18 @@ def start_storage_server(work_dir, recovery=True):
     before the restart below; with it off the restart starts from nothing,
     which is what the reserved-but-not-durable window needs.
     """
-    env = dict(os.environ)
-    env["HELIOS_SERVER_PORT"] = str(RESTART_SERVER_PORT)
+    conf = {"server_port": RESTART_SERVER_PORT}
     if recovery:
-        env["HELIOS_ENABLE_RECOVERY"] = "1"
-        env["HELIOS_COMMIT_DURABILITY"] = "sync"
-    else:
-        env.pop("HELIOS_ENABLE_RECOVERY", None)
-        env.pop("HELIOS_COMMIT_DURABILITY", None)
+        conf.update(enable_recovery=1, commit_durability="sync")
+    path = write_conf(work_dir, **conf)
+    env = dict(os.environ)
     jemalloc = "/lib/x86_64-linux-gnu/libjemalloc.so.2"
     if os.path.exists(jemalloc):
         env["LD_PRELOAD"] = jemalloc
 
     log = open(os.path.join(work_dir, "server.log"), "a")
-    process = subprocess.Popen([SERVER_BIN], cwd=work_dir, env=env,
-                               stdin=subprocess.DEVNULL, stdout=log,
+    process = subprocess.Popen([SERVER_BIN, "--config", path], cwd=work_dir,
+                               env=env, stdin=subprocess.DEVNULL, stdout=log,
                                stderr=subprocess.STDOUT)
     deadline = time.time() + SERVER_START_TIMEOUT
     while time.time() < deadline:
@@ -185,15 +184,14 @@ def start_storage_server(work_dir, recovery=True):
 
 
 def resume_lines(work_dir, table, offset):
-    """Resume lines the server logged for `table` past `offset`.
-
-    LOG_INFO writes to stderr, which start_storage_server sends to this file;
-    the offset skips the run that wrote before a restart.
-    """
+    """The watermarks the server logged for `table` as 'resume at N' past
+    `offset`, which skips the run that wrote before a restart. The server's
+    log goes to this file through start_storage_server."""
     with open(os.path.join(work_dir, "server.log"), errors="replace") as handle:
         handle.seek(offset)
-        return [line.rstrip() for line in handle
-                if "resume at" in line and table in line]
+        return [int(m.group(1)) for m in
+                (re.search(r"resume at (\d+)", line) for line in handle if table in line)
+                if m is not None]
 
 
 def stop_storage_server(process):
@@ -405,10 +403,9 @@ def test_multi_row_insert_one_statement(user, password):
 
         # One sized reservation leaves the counter at 2500; three default
         # blocks would have left it at 3000.
-        expected_resume = f"resume at {ROWS_ONE_STATEMENT}"
         resumed = resume_lines(work_dir, table, log_offset)
-        if len(resumed) != 1 or not resumed[0].endswith(expected_resume):
-            print(f"\tFailed: expected one '{expected_resume}' line, got {resumed}")
+        if resumed != [ROWS_ONE_STATEMENT]:
+            print(f"\tFailed: expected one 'resume at {ROWS_ONE_STATEMENT}' line, got {resumed}")
             return 1
     finally:
         for connection in connections:
@@ -553,10 +550,9 @@ def test_reservation_survives_storage_restart(user, password):
         # The payloads alone would not pin the value down: B's row at key 0
         # collides with the durable seed either way. The resume line asserts
         # the watermark itself, which a lost one would report as 0.
-        expected_resume = f"resume at {HIDDEN_KEY_RANGE}"
         resumed = resume_lines(work_dir, table, log_offset)
-        if len(resumed) != 1 or not resumed[0].endswith(expected_resume):
-            print(f"\tFailed: expected one '{expected_resume}' line, got {resumed}")
+        if resumed != [HIDDEN_KEY_RANGE]:
+            print(f"\tFailed: expected one 'resume at {HIDDEN_KEY_RANGE}' line, got {resumed}")
             return 1
 
         expected = ["seed"] + from_a + from_b

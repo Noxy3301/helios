@@ -61,7 +61,7 @@ void HeliosRpc::handleTxGetTableStats(const std::string& message,
     Helios::Protocol::GetTableStats::Response response;
     // Every connection asks for stats when it opens a table, so this is where
     // it learns which run of this server it is talking to.
-    response.set_boot_token(storage_boot_token());
+    response.set_boot_token(hidden_keys_->boot_token);
 
     for (const auto& [name, count] : row_counts_->snapshot()) {
         auto* ts = response.add_table_stats();

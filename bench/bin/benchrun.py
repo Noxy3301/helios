@@ -40,11 +40,13 @@ SCRIPTS_DIR = Path(__file__).resolve().parents[2] / "scripts"
 ROOT = Path(__file__).resolve().parents[2]
 BENCHBASE_DIR = ROOT / "bench" / "benchbase-mysql"
 MYSQL_BIN = ROOT / "build" / "runtime_output_directory" / "mysql"
-HELIOS_CTL = ROOT / "build" / "server" / "helios-ctl"
 # The kernel truncates the process name to 15 characters
 SERVER_COMM = "helios-storage"
-HELIOS_LOG_DIR = ROOT / "helios_logs"
-HELIOS_WAL_DIR = ROOT / "helios_wal"  # the storage's work directory
+HELIOS_DATA_DIR = ROOT / "helios_data"  # the storage's work directory
+HELIOS_LOG = HELIOS_DATA_DIR / "logs" / "helios.log"
+# The server configuration a run generates when it needs other than the
+# checked-in defaults.
+LOCAL_CONF = ROOT / "helios.local.cnf"
 
 YCSB_PROFILES = {
     "a": "50,0,0,50,0,0",
@@ -76,7 +78,7 @@ def _wait_for_port(host, port, timeout=30):
     return False
 
 
-def _run_script(argv, timeout, env=None):
+def _run_script(argv, timeout):
     """Run a launcher script with stdin closed and a hard timeout.
 
     The launcher scripts spawn long-lived background daemons that previously
@@ -92,7 +94,6 @@ def _run_script(argv, timeout, env=None):
             stderr=subprocess.STDOUT,
             text=True,
             timeout=timeout,
-            env=env,
         )
     except subprocess.TimeoutExpired as e:
         print(f"  ERROR: launcher timed out after {timeout}s: {' '.join(argv)}", file=sys.stderr)
@@ -105,17 +106,20 @@ def start_helios_storage(commit_durability=None):
     """Start helios-storage via scripts/start_server.sh and wait for port 9999.
 
     commit_durability overrides the server's startup contract for this run only;
-    it reaches the daemon through the launcher's environment.
+    it reaches the daemon through helios.local.cnf, which every run rewrites.
     """
     if _is_port_open("127.0.0.1", 9999):
         print("  helios-storage already running on port 9999, reusing")
         return True
     print("  Starting helios-storage...")
-    env = None
+    argv = [str(SCRIPTS_DIR / "start_server.sh")]
+    # start_server.sh reads helios.local.cnf on its own; a run without an
+    # override leaves it empty so an earlier run's value does not carry over.
+    LOCAL_CONF.write_text(
+        f"commit_durability = {commit_durability}\n" if commit_durability else "")
     if commit_durability:
-        env = dict(os.environ, HELIOS_COMMIT_DURABILITY=commit_durability)
-        print(f"  HELIOS_COMMIT_DURABILITY={commit_durability}")
-    result = _run_script([str(SCRIPTS_DIR / "start_server.sh")], timeout=30, env=env)
+        print(f"  commit_durability = {commit_durability}")
+    result = _run_script(argv, timeout=30)
     if result is None or result.returncode != 0:
         if result is not None:
             print(f"  ERROR starting helios-storage:\n{result.stdout}", file=sys.stderr)
@@ -152,30 +156,27 @@ def start_mysql_server(mysqld_port=3307, server_host="127.0.0.1", server_port=99
 
 
 def server_startup_contract():
-    """Commit durability the newest server log reports at startup, or None."""
-    logs = sorted(HELIOS_LOG_DIR.glob("helios_storage_*.log"),
-                  key=lambda p: p.stat().st_mtime, reverse=True)
-    if not logs:
+    """Commit durability the last start in the server log reports, or None."""
+    if not HELIOS_LOG.exists():
         return None
-    for line in logs[0].read_text(errors="replace").splitlines():
-        marker = "Commit durability:"
+    marker = "Commit durability:"
+    contract = None
+    for line in HELIOS_LOG.read_text(errors="replace").splitlines():
         if marker in line:
-            return line.split(marker, 1)[1].split()[0]
-    return None
+            contract = line.split(marker, 1)[1].split()[0]
+    return contract
 
 
-def switch_commit_durability(mode):
+def switch_commit_durability(mode, host, port):
     """Set the running storage server's commit durability to `mode`. The switch
     publishes the new contract and does not wait for commits acknowledged under
     the old one. Returns the elapsed seconds, or None if it did not happen."""
     print(f"  Switching durability to {mode}...")
     started = time.time()
-    result = subprocess.run(
-        [str(HELIOS_CTL), "--host", "127.0.0.1", "--port", "9999",
-         "set-durability", mode],
-        capture_output=True, text=True)
+    result = mysql_cmd(port, host,
+                       f"SET GLOBAL helios_commit_durability = '{mode}'")
     elapsed = time.time() - started
-    if result.returncode != 0 or result.stdout.strip() != f"ok mode={mode.upper()}":
+    if result.returncode != 0:
         print(f"  ERROR: durability switch to {mode} failed: "
               f"{(result.stdout + result.stderr).strip()}", file=sys.stderr)
         return None
@@ -195,40 +196,26 @@ def stop_all_servers():
             pass
 
 
-def cleanup_helios_logs():
-    """Remove the server logs and the storage's work directory after managed benchmark runs."""
-    if not HELIOS_LOG_DIR.exists() and not HELIOS_WAL_DIR.exists():
+def cleanup_helios_data():
+    """Remove the storage's work directory, the server log included, after managed benchmark runs."""
+    if not HELIOS_DATA_DIR.exists():
         return
 
     # Match start_helios_storage()'s reuse predicate (port) and catch a
     # relative-path launch that is not listening yet. A launch racing the
     # unlink below stays possible; the bench launcher does not do that.
     if _find_pid("build/server/helios-storage") or _is_port_open("127.0.0.1", 9999):
-        print("  Skipping helios_logs cleanup: helios-storage is still running")
+        print("  Skipping helios_data cleanup: helios-storage is still running")
         return
 
-    removed = 0
-    if HELIOS_WAL_DIR.is_symlink():
+    if HELIOS_DATA_DIR.is_symlink():
         # A work directory linked onto another volume keeps the link; only its
         # contents go.
-        for path in HELIOS_WAL_DIR.iterdir():
+        for path in HELIOS_DATA_DIR.iterdir():
             shutil.rmtree(path) if path.is_dir() and not path.is_symlink() else path.unlink()
-        removed += 1
-    elif HELIOS_WAL_DIR.exists():
-        shutil.rmtree(HELIOS_WAL_DIR)
-        removed += 1
-    for path in HELIOS_LOG_DIR.iterdir() if HELIOS_LOG_DIR.exists() else []:
-        try:
-            if path.is_dir() and not path.is_symlink():
-                shutil.rmtree(path)
-            else:
-                path.unlink()
-            removed += 1
-        except FileNotFoundError:
-            continue
-
-    if removed:
-        print(f"  Cleaned helios_logs ({removed} entries)")
+    else:
+        shutil.rmtree(HELIOS_DATA_DIR)
+    print("  Cleaned helios_data")
 
 
 def mysql_cmd(port, host, sql):
@@ -887,8 +874,8 @@ def main():
                         help="Run ANALYZE TABLE after load (automatic for --tx-plan runs)")
     parser.add_argument("--external-server", action="store_true",
                         help="Skip auto start/stop of helios-storage and mysqld (assume already running)")
-    parser.add_argument("--keep-helios-logs", action="store_true",
-                        help="Keep helios_logs and helios_wal after the benchmark")
+    parser.add_argument("--keep-helios-data", action="store_true",
+                        help="Keep helios_data after the benchmark")
     parser.add_argument("--read-path", choices=["row", "plan"], default="plan",
                         help="SET GLOBAL helios_read_path: row sends one request per handler "
                              "read, plan stages what it can in one request (default)")
@@ -905,12 +892,6 @@ def main():
         if args.external_server or args.no_setup:
             sys.exit("--load-durability async starts the storage server under the load "
                      "contract: not valid with --external-server or --no-setup")
-        if not HELIOS_CTL.exists():
-            sys.exit(f"--load-durability async needs {HELIOS_CTL} to end the load "
-                     "contract; build it first")
-        if "HELIOS_COMMIT_DURABILITY" in os.environ:
-            sys.exit("--load-durability async sets HELIOS_COMMIT_DURABILITY itself; "
-                     "unset it in the environment first")
     jar = BENCHBASE_DIR / "benchbase.jar"
     if not jar.exists():
         print(f"ERROR: {jar} not found.\nRun: python3 bench/bin/build_benchbase.py", file=sys.stderr)
@@ -1050,7 +1031,7 @@ def main():
         # Wipe any WAL left by a previous run before starting a fresh server,
         # so stale logs never trigger recovery. No-op if helios-storage is
         # already running (reuse case, handled inside the function).
-        cleanup_helios_logs()
+        cleanup_helios_data()
         load_durability = "async" if args.load_durability == "async" else None
         if not start_helios_storage(commit_durability=load_durability):
             sys.exit(1)
@@ -1072,8 +1053,8 @@ def main():
     finally:
         if managed:
             stop_all_servers()
-        if not args.keep_helios_logs:
-            cleanup_helios_logs()
+        if not args.keep_helios_data:
+            cleanup_helios_data()
 
 
 def _run_bench(args, config_work, thread_list, result_base):
@@ -1111,7 +1092,8 @@ def _run_bench(args, config_work, thread_list, result_base):
             sys.exit(1)
 
     if args.load_durability == "async":
-        elapsed = switch_commit_durability("sync")
+        elapsed = switch_commit_durability("sync", args.mysql_host,
+                                           args.mysql_port)
         if elapsed is None:
             sys.exit(1)
         print(f"  Durability switch async -> sync took {elapsed:.2f}s (no barrier)")

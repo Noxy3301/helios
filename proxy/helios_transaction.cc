@@ -1,7 +1,7 @@
 #include "helios_transaction.hh"
 #include "storage/helios/ha_helios.hh"
+#include "helios_log.hh"
 #include "key_pack.hh"
-#include "../common/log.h"
 #include "sql/sql_lex.h"
 #include "sql/table.h"
 

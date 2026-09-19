@@ -132,7 +132,7 @@ class SecondaryIndexLoggingTest : public ::testing::Test {
 
   void SetUp() override {
     spdlog::set_level(spdlog::level::info);
-    std::filesystem::remove_all("helios_wal");
+    std::filesystem::remove_all(config_.work_dir);
     config_.enable_recovery = true;
     db_ = std::make_unique<helios::storage::Database>(config_);
     TestHelper::CreateTable(*db_, "users");

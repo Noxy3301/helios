@@ -114,9 +114,9 @@ struct Config {
    * @brief The working directory, which holds the log and every related
    *        file.
    *
-   * Default: "./helios_wal"
+   * Default: "./helios_data"
    */
-  std::string work_dir = "./helios_wal";
+  std::string work_dir = "./helios_data";
 };
 
 }  // namespace helios::storage

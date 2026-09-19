@@ -639,16 +639,6 @@ int ha_helios_columnar::external_lock(THD *thd, int lock_type) {
       ctx->refusal.empty()) {
     ctx->refusal = "request build failed";
   }
-  static const bool debug_resolved = [] {
-    const char *value = std::getenv("ENABLE_DUCKDB_BRIDGE_DEBUG");
-    return value != nullptr && value[0] != '\0' &&
-           std::string_view(value) != "0";
-  }();
-  if (debug_resolved) {
-    std::fprintf(stderr, "[duckdb-request] refusal='%s'\n%s\n",
-                 ctx->refusal.c_str(),
-                 ctx->duckdb_request.DebugString().c_str());
-  }
   return 0;
 }
 

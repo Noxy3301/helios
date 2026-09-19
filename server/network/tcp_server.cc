@@ -1,5 +1,5 @@
 #include "tcp_server.hh"
-#include "../../common/log.h"
+#include <spdlog/spdlog.h>
 
 #include <iostream>
 #include <sys/socket.h>
@@ -16,14 +16,14 @@
 TcpServer::TcpServer(uint16_t port) : port_(port) {}
 
 bool TcpServer::run() {
-    LOG_INFO("Starting server on port %d", port_);
+    SPDLOG_INFO("Starting server on port {}", port_);
     
     int server_socket;
     if (!setup_and_listen(server_socket)) {
         return false;
     }
     
-    LOG_INFO("Server listening on port %d", port_);
+    SPDLOG_INFO("Server listening on port {}", port_);
     accept_clients(server_socket);
     close(server_socket);
     return true;
@@ -34,7 +34,7 @@ bool TcpServer::setup_and_listen(int& server_socket) {
     server_socket = socket(AF_INET, SOCK_STREAM, 0);
     if (server_socket < 0) {
         int err = errno;
-        LOG_ERROR("Failed to create socket: %s (errno=%d)", std::strerror(err), err);
+        SPDLOG_ERROR("Failed to create socket: {} (errno={})", std::strerror(err), err);
         return false;
     }
     
@@ -77,7 +77,7 @@ void TcpServer::accept_clients(int server_socket) {
         int client_socket = accept(server_socket, (struct sockaddr*)&client_addr, &client_addr_len);
         if (client_socket < 0) {
             int err = errno;
-            LOG_ERROR("Failed to accept client connection: %s (errno=%d)",
+            SPDLOG_ERROR("Failed to accept client connection: {} (errno={})",
                       std::strerror(err), err);
             if (err == EINTR) {
                 continue;  // retry on interrupt
@@ -94,7 +94,7 @@ void TcpServer::accept_clients(int server_socket) {
         // Hand off each client to a dedicated thread
         auto client_ip = std::string(inet_ntoa(client_addr.sin_addr));
         int now_active = ++active_connections;
-        LOG_INFO("Accepted connection fd=%d from %s (active=%d)", client_socket, client_ip.c_str(), now_active);
+        SPDLOG_INFO("Accepted connection fd={} from {} (active={})", client_socket, client_ip.c_str(), now_active);
 
         std::thread([this, client_socket, client_ip]() {
             // Process the client in this thread
@@ -103,7 +103,7 @@ void TcpServer::accept_clients(int server_socket) {
             int fd = client_socket;
             close(client_socket);
             int left = --active_connections;
-            LOG_INFO("Closed connection fd=%d (%s) (active=%d)", fd, client_ip.c_str(), left);
+            SPDLOG_INFO("Closed connection fd={} ({}) (active={})", fd, client_ip.c_str(), left);
         }).detach();
     }
 }

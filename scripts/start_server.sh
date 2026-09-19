@@ -4,12 +4,28 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BIN="$ROOT_DIR/build/server/helios-storage"
-LOG_DIR="$ROOT_DIR/helios_logs"
-TS=$(date +%Y%m%d_%H%M%S)
-LOG_FILE="$LOG_DIR/helios_storage_$TS.log"
+# The server reads helios.cnf and then helios.local.cnf when it exists, or
+# helios.cnf and then the --config files given here; a later file overrides an
+# earlier one, and an explicit --config takes the place of the local file.
+CONF=(--config "$ROOT_DIR/helios.cnf")
+EXTRA=()
+LOG_FILE="$ROOT_DIR/helios_data/logs/helios.log"
 PID_FILE="/tmp/helios_storage.pid"
 
-mkdir -p "$LOG_DIR"
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --config) EXTRA+=(--config "$2"); shift 2 ;;
+    *) echo "Usage: start_server.sh [--config <path>]" >&2; exit 1 ;;
+  esac
+done
+
+if [ ${#EXTRA[@]} -gt 0 ]; then
+  CONF+=("${EXTRA[@]}")
+elif [ -f "$ROOT_DIR/helios.local.cnf" ]; then
+  CONF+=(--config "$ROOT_DIR/helios.local.cnf")
+fi
+
+mkdir -p "$(dirname "$LOG_FILE")"
 
 # jemalloc: use LD_PRELOAD to replace glibc malloc
 JEMALLOC="/lib/x86_64-linux-gnu/libjemalloc.so.2"
@@ -30,9 +46,9 @@ if pgrep -f "/build/server/helios-storage" >/dev/null 2>&1; then
   exit 0
 fi
 
-echo "Starting helios-storage (port 9999) ..."
+echo "Starting helios-storage (${CONF[*]}) ..."
 ulimit -n 1048576 2>/dev/null || ulimit -n 65535 2>/dev/null || true
-nohup "$BIN" > "$LOG_FILE" 2>&1 &
+nohup "$BIN" "${CONF[@]}" >> "$LOG_FILE" 2>&1 &
 PID=$!
 echo $PID > "$PID_FILE"
 

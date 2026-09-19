@@ -142,6 +142,12 @@ extern bool srv_stats_drift_refresh;
 enum ReadPath { kReadPathRow = 0, kReadPathPlan = 1 };
 extern ulong srv_read_path;
 
+// Whether the RPC trace is written, and where; empty names a file under /tmp
+// by pid.
+extern bool srv_rpc_trace;
+extern char *srv_rpc_trace_path;
+
+
 namespace helios {
 
 /**
@@ -380,67 +386,27 @@ public:
    *
    * Ref probes are batched, so a nested-loop chain is charged by effective
    * batches instead of one RPC per outer row.
-   *
-   * @note Defaults are optimizer units, not wall-clock time.
    */
-  static double helios_cost_param(const char *name, double def) {
-    // Optional calibration knob; the Helios cost model itself is always on.
-    const char *e = std::getenv(name);
-    if (!e || !e[0]) return def;
-    char *end = nullptr;
-    double v = strtod(e, &end);
-    return (end && end != e) ? v : def;
-  }
-  // C_rpc: one client/server round trip. 50.0 means one RPC costs about
-  // 500 row evaluations on MySQL's ROW_EVALUATE_COST=0.1 scale.
-  static double kC_rpc() {
-    static const double v = helios_cost_param("HELIOS_C_RPC", 50.0);
-    return v;
-  }
-
-  // C_byte: one transferred byte. 0.0008 makes 1 KiB cost about 0.82, so
-  // wide rows affect plan choice without overwhelming the fixed RPC cost.
-  static double kC_byte() {
-    static const double v = helios_cost_param("HELIOS_C_BYTE", 0.0008);
-    return v;
-  }
-
-  // C_row: one row materialized and decoded on the MySQL/proxy side. 0.10
-  // matches MySQL's ROW_EVALUATE_COST baseline for one row.
-  static double kC_row() {
-    static const double v = helios_cost_param("HELIOS_C_ROW", 0.10);
-    return v;
-  }
-
-  // C_probe: one ref/index probe key before row materialization. 0.05 treats
-  // probe handling as lighter than decoding a full row.
-  static double kC_probe() {
-    static const double v = helios_cost_param("HELIOS_C_PROBE", 0.05);
-    return v;
-  }
-
-  // C_remote: one row scanned on the Helios server side. 0.05 models remote
-  // scan work as lighter than decoding a full row on the MySQL side.
-  static double kC_remote() {
-    static const double v = helios_cost_param("HELIOS_C_REMOTE", 0.05);
-    return v;
-  }
-
-  // B_eff: effective probe batch size used to amortize RPC cost. 1024 is a
-  // steering estimate, not a protocol limit.
-  static double kEffBatch() {
-    static const double v = helios_cost_param("HELIOS_BATCH", 1024.0);
-    return v;
-  }
-
-  // C_materialise: one remote PK row fetch after a non-covering secondary scan.
-  // 8.0 is an inflated steering value: it makes large row-by-row materialization
-  // lose to a bulk full scan even when cardinality is underestimated.
-  static double kC_materialise() {
-    static const double v =
-        helios_cost_param("HELIOS_C_MATERIALISE", 8.0);
-    return v;
-  }
+  // The coefficients are steering values in optimizer units, not measured
+  // times. One client/server round trip: 50 is about 500 row evaluations on
+  // MySQL's ROW_EVALUATE_COST=0.1 scale.
+  static constexpr double kCostRpc = 50.0;
+  // One transferred byte: 1 KiB costs about 0.82, so wide rows weigh on the
+  // choice without overwhelming the round trip.
+  static constexpr double kCostByte = 0.0008;
+  // One row unpacked on the MySQL side, MySQL's ROW_EVALUATE_COST baseline.
+  static constexpr double kCostRow = 0.10;
+  // One ref/index probe key, lighter than unpacking a full row.
+  static constexpr double kCostProbe = 0.05;
+  // One row scanned on the storage server, lighter than unpacking it here.
+  static constexpr double kCostRemote = 0.05;
+  // Effective probe batch the round trip is amortized over; a steering
+  // estimate, not a protocol limit.
+  static constexpr double kCostBatch = 1024.0;
+  // One primary-key lookup after a non-covering secondary scan. Inflated so
+  // that a large row-by-row lookup loses to a bulk full scan even when the
+  // cardinality is underestimated.
+  static constexpr double kCostLookup = 8.0;
 
   /**
    * @brief Return whether read_cost() should charge remote row materialization.
@@ -460,9 +426,9 @@ public:
     Cost_estimate c;
     const double bytes = rows * helios_row_bytes();
     // per-lookup RPC amortized over the batch size.
-    const double rpc = (ranges > 0 ? ranges : 1.0) * (kC_rpc() / kEffBatch());
-    c.add_io(rpc + bytes * kC_byte());
-    c.add_cpu(rows * (kC_probe() + kC_row()));
+    const double rpc = (ranges > 0 ? ranges : 1.0) * (kCostRpc / kCostBatch);
+    c.add_io(rpc + bytes * kCostByte);
+    c.add_cpu(rows * (kCostProbe + kCostRow));
     return c;
   }
 
@@ -471,8 +437,8 @@ public:
     Cost_estimate c;
     const double rows = (double)stats.records;
     const double bytes = rows * helios_row_bytes();
-    c.add_io(kC_rpc() + bytes * kC_byte());      // 1 scan RPC + transfer wait
-    c.add_cpu(rows * (kC_row() + kC_remote()));  // materialize + remote scan CPU
+    c.add_io(kCostRpc + bytes * kCostByte);      // 1 scan RPC + transfer wait
+    c.add_cpu(rows * (kCostRow + kCostRemote));  // materialize + remote scan CPU
     return c;
   }
 
@@ -483,8 +449,8 @@ public:
     // read_cost() is the non-covering path: the index narrows keys, then each
     // matching base row is fetched by PK. Covering scans use index_scan_cost().
     if (should_charge_materialization_cost(index, rows)) {
-      c.add_io(std::ceil(rows / kEffBatch()) * kC_rpc());
-      c.add_cpu(rows * kC_materialise());
+      c.add_io(std::ceil(rows / kCostBatch) * kCostRpc);
+      c.add_cpu(rows * kCostLookup);
     }
     return c;
   }

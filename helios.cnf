@@ -1,0 +1,52 @@
+# Configuration of the Helios stack, one section per program (my.cnf style).
+# The storage server reads its section from every --config file it is given,
+# a later file overriding an earlier one; start_server.sh passes this file and
+# then helios.local.cnf when it exists (overrides for this machine or run, not
+# committed). Every key is listed with the value the server uses when the key
+# is absent; an unknown key or a value that does not parse refuses startup.
+
+[helios-storage]
+
+# Directory holding the log, the checkpoint and the PAX catalog, relative to
+# the directory the server runs in.
+datadir = ./helios_data
+
+# TCP port the RPC listener binds, in [1,65535].
+server_port = 9999
+
+# How often the global epoch advances, in milliseconds, in [1,10000].
+epoch_duration_ms = 40
+
+# The contract every commit runs under: sync or async.
+commit_durability = sync
+
+# Whether the log is replayed at startup.
+enable_recovery = 0
+
+# How much of the log is written out and made writable in place at a time,
+# in bytes; 0 lets the file grow as written.
+wal_initial_capacity_bytes = 67108864
+
+# Milliseconds between checkpoints of the live rows; 0 writes none.
+checkpoint_interval_ms = 0
+
+# One checkpoint this many milliseconds after startup; 0 writes none.
+checkpoint_once_after_ms = 0
+
+# DuckDB thread pool size; commented out takes a quarter of the hardware
+# threads, which leaves the OLTP side its cores.
+# bridge_threads = 8
+
+# DuckDB memory bound: a positive byte count with an optional K, M or G
+# suffix. Leave the key out, rather than empty, for DuckDB's own default.
+# bridge_mem_limit = 4G
+
+# Whether the analytical bridge writes its trace lines.
+bridge_debug = 0
+
+# Upper bound on the read view's epoch-fence wait, in milliseconds.
+read_view_fence_timeout_ms = 5000
+
+# The lowest level the log keeps: trace, debug, info, warning, error,
+# critical or off.
+log_level = info

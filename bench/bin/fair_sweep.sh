@@ -65,16 +65,16 @@ force_stop() {
 
 trap force_stop EXIT
 
-# Avoid carrying the WAL and the server logs across iterations: each fresh
+# Avoid carrying the WAL and the server log across iterations: each fresh
 # server start would race on them anyway and we already wipe build/data.
 IFS=',' read -ra TERM_LIST <<< "$TERMS"
 for term in "${TERM_LIST[@]}"; do
   log="$OUT_DIR/log/iter_${term}.log"
   echo "[$(date +%H:%M:%S)] === t=${term} ===" | tee -a "$SUMMARY".meta
   force_stop
-  rm -rf "$ROOT/build/data" "$ROOT/helios_logs" 2>/dev/null || true
+  rm -rf "$ROOT/build/data" 2>/dev/null || true
   # The work directory may be a link onto another volume: clear it, keep it.
-  [ -d "$ROOT/helios_wal" ] && find "$ROOT/helios_wal/" -mindepth 1 -delete 2>/dev/null || true
+  [ -d "$ROOT/helios_data" ] && find "$ROOT/helios_data/" -mindepth 1 -delete 2>/dev/null || true
 
   "$SCRIPTS/start_server.sh" >>"$log" 2>&1 &
   for _ in $(seq 1 20); do

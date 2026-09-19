@@ -24,12 +24,11 @@ void ExecuteDuckdbQuery(
     Helios::Protocol::TxExecuteDuckdbQuery::Response* response);
 
 /**
- * @brief Reads HELIOS_BRIDGE_THREADS and HELIOS_BRIDGE_MEM_LIMIT into the
- * bounds the DuckDB runtime starts under.
+ * @brief Reads bridge_threads and bridge_mem_limit_bytes into the bounds the
+ * DuckDB runtime starts under.
  *
- * @details Call once on the start path: a value that is not a bound ends the
- * process here, rather than at the first analytical request, which is when
- * the runtime is built.
+ * @details Call once on the start path: the runtime is built at the first
+ * analytical request and takes the bounds as they stand then.
  */
 void ConfigureLimits();
 

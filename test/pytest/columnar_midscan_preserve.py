@@ -21,7 +21,7 @@ afterwards, so a run that missed the window fails loudly instead of passing
 vacuously.
 
 The scan is made long enough to span the pause by a per-row LIKE over a wide
-column and a single analytical thread (HELIOS_BRIDGE_THREADS=1). The query
+column and a single analytical thread (bridge_threads = 1). The query
 aggregates, so a torn result is a wrong number rather than a wrong row order:
 COUNT(*), SUM(v) and COUNT(n) must equal the full pre-write state, never a
 mix. Column n is nullable and carries NULL on every even id, which pins the
@@ -58,7 +58,6 @@ stack, restarts it with the sync points armed, and stops it afterwards.
 """
 
 import argparse
-import glob
 import os
 import subprocess
 import sys
@@ -66,26 +65,32 @@ import threading
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from utils import server_log
 from utils.connection import get_connection
+from utils.server_conf import write_conf
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 QUIET = "> /dev/null 2>&1"
+# Bytes the server log held before this test started the stack.
+LOG_OFFSET = 0
 # The writer's install pause, and the hold every bridge read takes between
 # its epoch fence and its scan.
 PAUSE_MS = 1500
 FENCE_HOLD_MS = 2500
+# The debug sync points stay in the environment; the rest is configuration.
 SERVER_ENV = (
     "HELIOS_DEBUG_SYNC_SILO_COMMIT_BETWEEN_ROW_INSTALLS"
     f"=sleep:{PAUSE_MS} "
     "HELIOS_DEBUG_SYNC_PAX_VIEW_AFTER_FENCE"
-    f"=sleep:{FENCE_HOLD_MS} "
+    f"=sleep:{FENCE_HOLD_MS}")
+SERVER_CONF = {
     # One analytical thread: the scan has to outlive the install pause.
-    "HELIOS_BRIDGE_THREADS=1 "
+    "bridge_threads": 1,
     # The scan tallies, read back from the server log.
-    "ENABLE_DUCKDB_BRIDGE_DEBUG=1 "
+    "bridge_debug": 1,
     # The table is loaded one row per transaction, because the install pause
     # fires between the row installs of any larger one.
-    "HELIOS_COMMIT_DURABILITY=async")
+    "commit_durability": "async"}
 # A fence takes one to two epochs; the writer delay allows for it.
 FENCE_S = 0.06
 # Where the second install should land inside the scan.
@@ -157,7 +162,12 @@ def ensure_stack_stopped(timeout_s=10):
 
 
 def start_stack_with_test_env():
-    if sh(f"{SERVER_ENV} ./scripts/start_server.sh {QUIET}") != 0:
+    global LOG_OFFSET
+    conf = write_conf(**SERVER_CONF)
+    # Every start appends to the one log; the tallies read back below are the
+    # ones this start writes.
+    LOG_OFFSET = server_log.size()
+    if sh(f"{SERVER_ENV} ./scripts/start_server.sh --config {conf} {QUIET}") != 0:
         raise RuntimeError("start_server.sh failed")
     time.sleep(2)
     if sh(f"./scripts/start_mysql.sh "
@@ -278,21 +288,16 @@ def last_scan_tally():
     Each request logs its statement and then one tally line per table, so the
     lines after the last statement belong to the read just finished.
     """
-    logs = sorted(glob.glob(
-        os.path.join(ROOT, "helios_logs", "helios_storage_*.log")))
-    if not logs:
-        return {}
     tally = {}
-    with open(logs[-1], errors="replace") as log:
-        for line in log:
-            if line.startswith("[duckdb-ast] "):
-                tally = {}
-            elif line.startswith("[duckdb-scan] "):
-                for part in line.split()[2:]:
-                    if "=" not in part:
-                        continue
-                    key, value = part.split("=", 1)
-                    tally[key] = tally.get(key, 0) + int(value)
+    for line in server_log.read_since(LOG_OFFSET).splitlines():
+        if line.startswith("[duckdb-ast] "):
+            tally = {}
+        elif line.startswith("[duckdb-scan] "):
+            for part in line.split()[2:]:
+                if "=" not in part:
+                    continue
+                key, value = part.split("=", 1)
+                tally[key] = tally.get(key, 0) + int(value)
     return tally
 
 

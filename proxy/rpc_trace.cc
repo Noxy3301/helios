@@ -1,5 +1,7 @@
 #include "rpc_trace.hh"
 
+#include "ha_helios.hh"
+
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
@@ -279,16 +281,14 @@ RpcTraceLogger& RpcTraceLogger::instance() {
 }
 
 RpcTraceLogger::RpcTraceLogger() {
-  const char* env = std::getenv("ENABLE_RPC_TRACE");
-  if (env == nullptr || env[0] == '\0' || std::string(env) == "0") {
+  if (!srv_rpc_trace) {
     enabled_ = false;
     return;
   }
 
-  const char* path_env = std::getenv("ENABLE_RPC_TRACE_PATH");
   std::string path;
-  if (path_env != nullptr && path_env[0] != '\0') {
-    path = path_env;
+  if (srv_rpc_trace_path != nullptr && srv_rpc_trace_path[0] != '\0') {
+    path = srv_rpc_trace_path;
   } else {
     char buf[64];
     std::snprintf(buf, sizeof(buf), "/tmp/helios_rpc_trace_%d.jsonl",

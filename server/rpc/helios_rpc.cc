@@ -6,7 +6,7 @@
 #include <cstdint>
 #include <string>
 
-#include "../../common/log.h"
+#include <spdlog/spdlog.h>
 
 HeliosRpc::HeliosRpc(std::shared_ptr<DatabaseManager> db_manager,
                            std::shared_ptr<TableRowCounts> row_counts,
@@ -18,7 +18,7 @@ HeliosRpc::HeliosRpc(std::shared_ptr<DatabaseManager> db_manager,
 void HeliosRpc::handle_rpc(MessageType message_type,
                               const std::string& message,
                               std::string& result) {
-    LOG_DEBUG("Handling RPC: message_type=%u", static_cast<uint32_t>(message_type));
+    SPDLOG_DEBUG("Handling RPC: message_type={}", static_cast<uint32_t>(message_type));
 
     switch(message_type) {
         // Reads
@@ -65,7 +65,7 @@ void HeliosRpc::handle_rpc(MessageType message_type,
             break;
 
         default:
-            LOG_ERROR("Unknown message type: %u", static_cast<uint32_t>(message_type));
+            SPDLOG_ERROR("Unknown message type: {}", static_cast<uint32_t>(message_type));
             break;
     }
 

@@ -16,10 +16,13 @@ def restart_services():
   """Restart the storage server and MySQL for a clean state."""
   os.system(f"./scripts/stop_mysql.sh {QUIET}")
   os.system(f"./scripts/stop_server.sh {QUIET}")
+  # An interrupted run can leave a contract behind in the local overrides.
+  if os.path.exists("helios.local.cnf"):
+    os.unlink("helios.local.cnf")
   # The storage keeps its PAX catalog and log across restarts even with
   # recovery off, and the suite re-creates tables with different columns.
   # The work directory may be a link onto another volume: clear it, keep it.
-  for entry in (os.scandir("helios_wal") if os.path.isdir("helios_wal") else []):
+  for entry in (os.scandir("helios_data") if os.path.isdir("helios_data") else []):
     shutil.rmtree(entry.path, ignore_errors=True) if entry.is_dir(follow_symlinks=False) else os.unlink(entry.path)
   time.sleep(1)
   os.system(f"./scripts/start_server.sh {QUIET}")
