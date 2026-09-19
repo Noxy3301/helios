@@ -16,7 +16,8 @@ HeliosRpc::HeliosRpc(std::shared_ptr<DatabaseManager> db_manager,
       hidden_keys_(hidden_keys) {
 }
 
-bool HeliosRpc::handle_rpc(const std::string& message, std::string& result) {
+bool HeliosRpc::handle_rpc(const std::string& message, std::string& result,
+                           std::string& payload) {
     Request request;
     Helios::Protocol::Response response;
 
@@ -42,8 +43,11 @@ bool HeliosRpc::handle_rpc(const std::string& message, std::string& result) {
                                   response.mutable_tx_scan_index());
                 break;
             case Request::kTxExecuteReadPlan:
+                // The arm is a marker: the flat result rides raw after the
+                // envelope instead of being copied into protobuf.
+                response.mutable_tx_execute_read_plan();
                 handleTxExecuteReadPlan(request.tx_execute_read_plan(),
-                                        response.mutable_tx_execute_read_plan());
+                                        &payload);
                 break;
 
             // The one commit of a transaction

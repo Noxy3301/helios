@@ -103,7 +103,7 @@ void TxRpcTrace::on_stmt(const std::string& sql) {
 }
 
 void TxRpcTrace::record(RpcOp type, uint64_t us, uint32_t req_b,
-                        uint32_t resp_b, const std::string& meta) {
+                        uint64_t resp_b, const std::string& meta) {
   if (!active_) return;
   const uint64_t off = std::chrono::duration_cast<std::chrono::microseconds>(
                            std::chrono::steady_clock::now() - started_)

@@ -27,6 +27,9 @@ message Request {
     }
 }
 
+// Marks the read-plan reply, whose flat result rides raw after the envelope.
+message FlatReadPlanResult {}
+
 // The reply to one Request. The arm set matches the arm of the request; a
 // request the server cannot route at all sets error and no arm.
 message Response {
@@ -35,8 +38,7 @@ message Response {
         TxBatchRead.Response tx_batch_read = 2;
         TxScan.Response tx_scan = 3;
         TxScanIndex.Response tx_scan_index = 4;
-        // The flat HELIOSRP payload of the read plan's result.
-        bytes tx_execute_read_plan = 5;
+        FlatReadPlanResult tx_execute_read_plan = 5;
 
         TxCommit.Response tx_commit = 6;
 

@@ -93,10 +93,13 @@ public:
                  std::shared_ptr<HiddenKeyAllocator> hidden_keys);
     ~HeliosRpc() = default;
 
-    // Parses one request envelope, routes the arm it sets, and serializes
-    // the response envelope into result. Returns false when the response
-    // cannot be serialized, which leaves the request unanswered.
-    bool handle_rpc(const std::string& message, std::string& result);
+    // Parses one request envelope, routes the arm it sets, and serializes the
+    // response envelope into result. payload takes the bytes that ride raw
+    // after the envelope, which only the read-plan reply carries. Returns
+    // false when the response cannot be serialized, which leaves the request
+    // unanswered.
+    bool handle_rpc(const std::string& message, std::string& result,
+                    std::string& payload);
 
 private:
     std::shared_ptr<DatabaseManager> db_manager_;
@@ -133,7 +136,8 @@ private:
         const Helios::Protocol::TxCommit::Request& request,
         Helios::Protocol::TxCommit::Response* response);
 
-    // Read-plan execution. The reply is the flat HELIOSRP payload.
+    // Read-plan execution. The reply is the flat HELIOSRP payload, which
+    // rides raw after the envelope.
     void handleTxExecuteReadPlan(
         const Helios::Protocol::TxExecuteReadPlan::Request& request,
         std::string* result);

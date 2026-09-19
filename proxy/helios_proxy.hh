@@ -259,17 +259,24 @@ private:
     std::unordered_map<std::string, int64_t> table_stats_cache_;
     std::unordered_map<std::string, IndexNdvResult> last_index_ndv_;
     std::unordered_map<std::string, IndexHistResult> last_index_hist_;
-    // Sends one request envelope and parses the reply. It fails when the
-    // reply sets another arm than the request, which is the answer to another
-    // RPC.
+    /**
+     * @brief Sends one request envelope and parses the reply.
+     *
+     * @param[out] payload  Takes the bytes riding raw after the reply
+     *   envelope, which only the read-plan reply carries. May be null.
+     * @return false when the transport fails or the reply sets another arm
+     *   than the request, which is the answer to another RPC.
+     */
     bool send_request(const Helios::Protocol::Request& request,
                       Helios::Protocol::Response& response,
-                      const std::string& meta = "");
+                      const std::string& meta = "",
+                      std::string* payload = nullptr);
     // The exchange itself. A failure here is a transport failure, which
     // send_request answers by invalidating the boot token and the channel.
     bool exchange_message(const std::string& serialized_request,
                           std::string& serialized_response,
-                          RpcOp op, const std::string& meta);
+                          std::string& payload, RpcOp op,
+                          const std::string& meta);
 
     // Connect on demand so a channel closed by a transport error is reopened
     // by the next RPC.

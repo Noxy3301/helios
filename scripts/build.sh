@@ -33,9 +33,10 @@ MYSQL_BUILD_TYPE=${MYSQL_BUILD_TYPE:-Release}
 # Create proxy copy with necessary dependencies in build directory
 echo "Creating proxy build structure..."
 cp -r proxy build/
-rm -rf build/proxy/proto
-mkdir -p build/proxy/proto
+rm -rf build/proxy/proto build/proxy/common
+mkdir -p build/proxy/proto build/proxy/common
 cp -a proto/. build/proxy/proto/
+cp -a common/. build/proxy/common/
 
 # Create MySQL storage engine link to build directory version
 ln -sf $(pwd)/build/proxy third_party/mysql-server/storage/helios

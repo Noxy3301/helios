@@ -31,6 +31,7 @@ set(MYSQL_INCLUDE_DIRS
 
 # Include directories
 include_directories(${CMAKE_CURRENT_SOURCE_DIR})
+include_directories(${CMAKE_CURRENT_SOURCE_DIR}/..)
 include_directories(${CMAKE_CURRENT_SOURCE_DIR}/../proto)
 include_directories(${DUCKDB_ROOT}/src/include)
 

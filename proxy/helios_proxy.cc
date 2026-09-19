@@ -13,8 +13,50 @@
 #include "helios_proxy.hh"
 #include "rpc_trace.hh"
 #include "helios_log.hh"
+#include "common/rpc_frame.h"
 
+namespace {
 
+// Reads one u32 length in network order and the bytes it counts.
+bool recv_part(int socket_fd, std::string& out) {
+    uint32_t net_size = 0;
+    ssize_t header_received =
+        recv(socket_fd, &net_size, sizeof(net_size), MSG_WAITALL);
+    if (header_received != static_cast<ssize_t>(sizeof(net_size))) {
+        LOG_ERROR("SEND_MESSAGE: Failed to receive a frame length, received %zd bytes",
+                  header_received);
+        return false;
+    }
+
+    const uint32_t size = ntohl(net_size);
+    if (size > helios::rpc::kMaxPartBytes) {
+        LOG_ERROR("SEND_MESSAGE: frame part of %u bytes exceeds the %u byte limit",
+                  size, helios::rpc::kMaxPartBytes);
+        return false;
+    }
+    out.clear();
+    if (size == 0) {
+        return true;
+    }
+
+    // recv(MSG_WAITALL) still caps one call near 2GB, so a large read-plan
+    // result must be drained in a loop.
+    out.resize(size);
+    size_t received_total = 0;
+    while (received_total < size) {
+        const ssize_t chunk = recv(socket_fd, &out[received_total],
+                                   size - received_total, MSG_WAITALL);
+        if (chunk <= 0) {
+            LOG_ERROR("SEND_MESSAGE: Failed to receive a frame, received %zu/%u bytes",
+                      received_total, size);
+            return false;
+        }
+        received_total += static_cast<size_t>(chunk);
+    }
+    return true;
+}
+
+}  // namespace
 
 HeliosProxy::HeliosProxy(const std::string& host, int port)
     : socket_fd_(-1), connected_(false), host_(host), port_(port) {
@@ -437,14 +479,12 @@ HeliosProxy::ReadPlanResult HeliosProxy::tx_execute_read_plan(
     }
 
     Helios::Protocol::Response reply;
-    if (!send_request(envelope, reply)) {
+    std::string raw;
+    if (!send_request(envelope, reply, "", &raw)) {
         LOG_ERROR("RPC failed: Failed to send execute read plan message to server");
         result.transport_error = true;
         return result;
     }
-    // The reply is the flat payload, which a plan can fill past the size
-    // protobuf encodes a message in.
-    const std::string& raw = reply.tx_execute_read_plan();
 
     struct Reader {
         const char* p;
@@ -480,10 +520,8 @@ HeliosProxy::ReadPlanResult HeliosProxy::tx_execute_read_plan(
         }
     };
 
-    // Native-endian bytes spell "HELIOSRP" (Helios read plan response).
-    static constexpr uint64_t kFlatMagic = 0x5052534F494C4548ull;
     Reader r(raw.data(), raw.size());
-    if (r.u64() != kFlatMagic) {
+    if (r.u64() != helios::rpc::kFlatMagic) {
         LOG_ERROR("RPC failed: bad flat read-plan response header");
         result.transport_error = true;
         return result;
@@ -702,7 +740,8 @@ bool HeliosProxy::db_set_commit_durability(
 
 bool HeliosProxy::send_request(const Helios::Protocol::Request& request,
                                   Helios::Protocol::Response& response,
-                                  const std::string& meta) {
+                                  const std::string& meta,
+                                  std::string* payload) {
     std::string serialized_request;
     if (!request.SerializeToString(&serialized_request)) {
         LOG_ERROR("SEND_REQUEST: Failed to serialize %s",
@@ -711,7 +750,9 @@ bool HeliosProxy::send_request(const Helios::Protocol::Request& request,
     }
 
     std::string serialized_response;
+    std::string discarded_payload;
     if (!exchange_message(serialized_request, serialized_response,
+                          payload != nullptr ? *payload : discarded_payload,
                           request.body_case(), meta)) {
         LOG_ERROR("SEND_REQUEST: Failed to send %s",
                   rpc_op_name(request.body_case()));
@@ -746,7 +787,8 @@ bool HeliosProxy::send_request(const Helios::Protocol::Request& request,
 
 bool HeliosProxy::exchange_message(const std::string& serialized_request,
                                       std::string& serialized_response,
-                                      RpcOp op, const std::string& meta) {
+                                      std::string& payload, RpcOp op,
+                                      const std::string& meta) {
     auto rpc_start_ts = std::chrono::steady_clock::now();
     const uint32_t req_bytes = static_cast<uint32_t>(serialized_request.size());
 
@@ -760,13 +802,19 @@ bool HeliosProxy::exchange_message(const std::string& serialized_request,
         return false;
     }
 
-    const uint32_t header = htonl(static_cast<uint32_t>(serialized_request.size()));
+    const uint32_t env_len =
+        htonl(static_cast<uint32_t>(serialized_request.size()));
+    const uint32_t pay_len = 0;  // A request carries no raw payload.
 
-    // combine header and payload
-    size_t total_size = sizeof(header) + serialized_request.size();
+    // combine the envelope and the two length words
+    size_t total_size =
+        sizeof(env_len) + serialized_request.size() + sizeof(pay_len);
     std::vector<char> buffer(total_size);
-    std::memcpy(buffer.data(), &header, sizeof(header));
-    std::memcpy(buffer.data() + sizeof(header), serialized_request.c_str(), serialized_request.size());
+    std::memcpy(buffer.data(), &env_len, sizeof(env_len));
+    std::memcpy(buffer.data() + sizeof(env_len), serialized_request.data(),
+                serialized_request.size());
+    std::memcpy(buffer.data() + sizeof(env_len) + serialized_request.size(),
+                &pay_len, sizeof(pay_len));
 
     // send (handle partial writes for large messages)
     size_t total_sent = 0;
@@ -780,36 +828,9 @@ bool HeliosProxy::exchange_message(const std::string& serialized_request,
         total_sent += bytes_sent;
     }
 
-
-    // receive response header
-    uint32_t response_header = 0;
-    ssize_t header_received = recv(socket_fd_, &response_header, sizeof(response_header), MSG_WAITALL);
-    if (header_received != sizeof(response_header)) {
-        LOG_ERROR("SEND_MESSAGE: Failed to receive response header, received %zd bytes", header_received);
+    if (!recv_part(socket_fd_, serialized_response) ||
+        !recv_part(socket_fd_, payload)) {
         return false;
-    }
-
-    const uint32_t response_payload_size = ntohl(response_header);
-
-
-    // Receive the response payload. recv(MSG_WAITALL) still caps one call near
-    // 2GB, so large read-plan responses must be drained in a loop.
-    if (response_payload_size > 0) {
-        serialized_response.resize(response_payload_size);
-        size_t received_total = 0;
-        while (received_total < response_payload_size) {
-            const ssize_t chunk =
-                recv(socket_fd_, &serialized_response[received_total],
-                     response_payload_size - received_total, MSG_WAITALL);
-            if (chunk <= 0) {
-                LOG_ERROR("SEND_MESSAGE: Failed to receive response payload, received %zu/%u bytes",
-                          received_total, response_payload_size);
-                return false;
-            }
-            received_total += static_cast<size_t>(chunk);
-        }
-    } else {
-        serialized_response.clear();
     }
 
     if (current_trace_ != nullptr && current_trace_->active()) {
@@ -818,7 +839,7 @@ bool HeliosProxy::exchange_message(const std::string& serialized_request,
                           .count();
         current_trace_->record(
             op, static_cast<uint64_t>(rpc_us), req_bytes,
-            static_cast<uint32_t>(serialized_response.size()), meta);
+            serialized_response.size() + payload.size(), meta);
     }
     return true;
 }

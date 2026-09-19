@@ -4,10 +4,10 @@
 #include <cstdint>
 #include <cstring>
 
+#include "common/rpc_frame.h"
+
 namespace flat_plan {
 namespace {
-// Native-endian bytes spell "HELIOSRP" (Helios read plan response).
-constexpr uint64_t kMagic = 0x5052534F494C4548ull;
 
 template <class Sink>
 void w_u8(Sink& out, uint8_t v) {
@@ -67,7 +67,7 @@ void encode_to_string(Helios::Protocol::TxExecuteReadPlan::Response& r,
 
     out.clear();
     out.reserve(count.n);
-    w_u64(out, kMagic);
+    w_u64(out, helios::rpc::kFlatMagic);
     w_u8(out, r.ok() ? 1 : 0);
     w_u64(out, static_cast<uint64_t>(r.results_size()));
     for (int i = 0; i < r.results_size(); ++i) {

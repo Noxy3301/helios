@@ -18,7 +18,7 @@ struct RpcEntry {
   uint64_t us;          // duration microseconds
   uint64_t off_us;      // offset from the transaction start in microseconds
   uint32_t req_b;       // serialized request bytes
-  uint32_t resp_b;      // serialized response bytes
+  uint64_t resp_b;      // serialized response bytes
   uint32_t stmt_idx;    // index into statements_; UINT32_MAX if pre-stmt
   std::string meta;     // optional key, index name, prefix, etc.
 };
@@ -44,7 +44,7 @@ class TxRpcTrace {
   void start(std::thread::id tid);
   void on_stmt(const std::string& sql);
   void record(RpcOp type, uint64_t us, uint32_t req_b,
-              uint32_t resp_b, const std::string& meta);
+              uint64_t resp_b, const std::string& meta);
   void record_local_view(const std::string& kind);
   std::string finalize_jsonl(bool committed);
 
