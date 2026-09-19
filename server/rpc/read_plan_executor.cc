@@ -17,7 +17,7 @@
 #include "parallel_scan.hh"
 #include "row_codec.hh"
 
-// Read-plan execution: the TX_EXECUTE_READ_PLAN handler and its plan-key
+// Read-plan execution: the tx_execute_read_plan handler and its plan-key
 // binding glue.
 
 namespace {

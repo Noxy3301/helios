@@ -12,7 +12,7 @@ public:
 
     std::shared_ptr<helios::storage::Database> get_database() const { return database_; }
 
-    // The mode every commit runs under; DB_SET_COMMIT_DURABILITY moves it.
+    // The mode every commit runs under; db_set_commit_durability moves it.
     helios::storage::CommitDurability commit_durability() const {
         return commit_durability_.load(std::memory_order_relaxed);
     }

@@ -18,7 +18,7 @@ using RpcOp = Helios::Protocol::Request::BodyCase;
 /**
  * RPC client for the storage server. Every read answers from the storage's
  * current state and leaves nothing behind there; the query layer keeps the
- * transaction and installs it with one TX_COMMIT.
+ * transaction and installs it with one tx_commit.
  *
  * Each THD holds a HeliosProxy with its own TCP connection, managed via
  * HeliosThdCtx.
