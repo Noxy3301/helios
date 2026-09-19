@@ -258,7 +258,7 @@ Logger::Logger(const Config &config, WalIo io)
     : work_dir_(config.work_dir),
       loads_checkpoint_records_(config.enable_recovery),
       wal_(config.work_dir, std::move(io), config.wal_initial_capacity_bytes) {
-  helios::storage::util::InitDebugLog();
+  helios::storage::util::set_log_pattern();
 }
 
 Logger::~Logger() { Stop(); }

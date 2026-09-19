@@ -79,7 +79,7 @@ void Reaper::Purge(EpochNumber reclamation_epoch) {
 
   // Get and Purge enrolled this thread in masstree's RCU epoch; release it
   // before returning to the epoch hook.
-  MasstreeReleaseThreadEpoch();
+  release_thread_epoch();
 }
 
 }  // namespace index

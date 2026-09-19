@@ -65,9 +65,9 @@ struct DataItem {
     return keys && keys->count != 0;
   }
 
-  void SetPrimaryKeys(const std::vector<std::string> &keys) {
+  void set_primary_keys(const std::vector<std::string> &keys) {
     assert(IsSortedDeduped(keys));
-    auto packed = PrimaryKeyList::FromSortedDeduped(keys);
+    auto packed = PrimaryKeyList::from_sorted_deduped(keys);
     std::atomic_store(&primary_keys, std::move(packed));
   }
 
@@ -134,19 +134,19 @@ struct DataItem {
    */
   std::string CopyValue() const;
 
-  void InsertPrimaryKey(const std::byte *key, size_t len) {
+  void insert_primary_key(const std::byte *key, size_t len) {
     const std::string_view new_key(reinterpret_cast<const char *>(key), len);
     auto current = std::atomic_load(&primary_keys);
-    auto next = PrimaryKeyList::Insert(current, new_key);
+    auto next = PrimaryKeyList::insert(current, new_key);
     if (next != current) {
       std::atomic_store(&primary_keys, std::move(next));
     }
   }
 
-  void DeletePrimaryKey(const std::byte *key, size_t len) {
+  void delete_primary_key(const std::byte *key, size_t len) {
     std::string_view target(reinterpret_cast<const char *>(key), len);
     auto current = std::atomic_load(&primary_keys);
-    auto next = PrimaryKeyList::Delete(current, target);
+    auto next = PrimaryKeyList::erase(current, target);
     if (next != current) {
       std::atomic_store(&primary_keys, std::move(next));
     }

@@ -19,7 +19,7 @@ namespace index {
 /**
  * @brief Maps ordered keys to DataItems.
  * @details DataItem pointers stay valid until this thread calls
- * MasstreeReleaseThreadEpoch().
+ * release_thread_epoch().
  */
 class MasstreeIndex final {
  public:
@@ -68,14 +68,14 @@ class MasstreeIndex final {
 /**
  * @brief Advances Masstree's epoch from the storage epoch thread.
  */
-void MasstreeAdvanceEpoch();
+void advance_epoch();
 
 /**
  * @brief Releases this thread's Masstree epoch.
  * @details Call only after finishing with all pointers obtained in that epoch.
  * The next index operation enters an epoch again.
  */
-void MasstreeReleaseThreadEpoch();
+void release_thread_epoch();
 
 }  // namespace index
 }  // namespace helios::storage

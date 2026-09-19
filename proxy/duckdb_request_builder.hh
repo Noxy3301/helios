@@ -23,7 +23,7 @@ struct LEX;
  * @param why Receives the refusal reason when the walk returns false.
  * @return True when the whole statement translated into *request.
  */
-bool BuildDuckdbQueryRequest(
+bool build_olap_request(
     THD* thd, LEX* lex,
     Helios::Protocol::TxExecuteDuckdbQuery::Request* request,
     std::string* why);

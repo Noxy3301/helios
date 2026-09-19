@@ -72,7 +72,7 @@ using pax::PaxTable;
 /**
  * @brief Number of little-endian bytes needed to pack `length`.
  */
-uint32_t LengthPrefixBytes(uint32_t length) {
+uint32_t length_prefix_bytes(uint32_t length) {
   uint32_t prefix_bytes = 0;
   for (uint32_t value = length; value > 0; value /= 256) prefix_bytes++;
   return prefix_bytes;
@@ -93,14 +93,14 @@ uint32_t LengthPrefixBytes(uint32_t length) {
  * @param payload Field bytes; ignored when is_null.
  * @param is_null True writes the payload-free tag.
  */
-void AppendProxyField(std::string& out, std::string_view payload,
-                      bool is_null) {
+void append_packed_field(std::string& out, std::string_view payload,
+                         bool is_null) {
   if (is_null) {
     out.push_back(static_cast<char>(0xFF));
     return;
   }
   const uint32_t length = static_cast<uint32_t>(payload.size());
-  const uint32_t prefix_bytes = LengthPrefixBytes(length);
+  const uint32_t prefix_bytes = length_prefix_bytes(length);
   out.push_back(static_cast<char>(prefix_bytes));
   for (uint32_t i = 0; i < prefix_bytes; i++) {
     out.push_back(static_cast<char>((length >> (8 * i)) & 0xFF));
@@ -120,7 +120,9 @@ bool trace_enabled() { return config().olap_trace; }
 /**
  * @brief Upper bound on the read view fence wait.
  */
-uint32_t FenceTimeoutMs() { return config().read_view_fence_timeout_ms; }
+uint32_t fence_timeout_ms() {
+  return config().read_view_fence_timeout_ms;
+}
 
 // ---------------------------------------------------------------------------
 // Helios packed row format: unpacking, for epoch images. A preserved old_row
@@ -135,8 +137,8 @@ uint32_t FenceTimeoutMs() { return config().read_view_fence_timeout_ms; }
  * 0xFF width tag and a zero-length payload both yield length 0, and the
  * null-flags field is what separates a NULL column from an empty value.
  */
-void SplitProxyRow(const std::string& row,
-                   std::vector<std::pair<const char*, uint32_t>>* fields) {
+void split_packed_row(const std::string& row,
+                      std::vector<std::pair<const char*, uint32_t>>* fields) {
   fields->clear();
   const char* data = row.data();
   const size_t size = row.size();
@@ -166,7 +168,7 @@ void SplitProxyRow(const std::string& row,
 /**
  * @brief Parses a val_str ASCII integer (optional sign, digits only).
  */
-bool ParseAsciiInt64(const char* s, uint32_t len, int64_t* out) {
+bool parse_ascii_int64(const char* s, uint32_t len, int64_t* out) {
   if (len == 0) return false;
   uint32_t i = 0;
   bool negative = false;
@@ -193,8 +195,8 @@ bool ParseAsciiInt64(const char* s, uint32_t len, int64_t* out) {
 /**
  * @brief Parses a val_str "YYYY-MM-DD" date into its year/month/day parts.
  */
-bool ParseAsciiDate(const char* s, uint32_t len, int32_t* year, int32_t* month,
-                    int32_t* day) {
+bool parse_ascii_date(const char* s, uint32_t len, int32_t* year,
+                      int32_t* month, int32_t* day) {
   if (len != 10 || s[4] != '-' || s[7] != '-') return false;
   int32_t parts[3] = {0, 0, 0};
   const uint32_t spans[3][2] = {{0, 4}, {5, 7}, {8, 10}};
@@ -216,8 +218,8 @@ bool ParseAsciiDate(const char* s, uint32_t len, int32_t* year, int32_t* month,
  * `scale` (mirrors the scatter-side DEC64 rule, including padding when fewer
  * fractional digits are present).
  */
-bool ParseAsciiDecimalScaled(const char* s, uint32_t len, int scale,
-                             int64_t* out) {
+bool parse_ascii_decimal_scaled(const char* s, uint32_t len, int scale,
+                                int64_t* out) {
   if (len == 0) return false;
   uint32_t i = 0;
   bool negative = false;
@@ -371,8 +373,8 @@ struct PaxLocalState : public LocalTableFunctionState {
  * @brief Returns the claimed group's image state, reloading it once when the
  * group had none when it was claimed.
  */
-inline pax::GroupImageState* GroupState(PaxLocalState& state,
-                                        const PaxGroup* group) {
+inline pax::GroupImageState* group_state(PaxLocalState& state,
+                                         const PaxGroup* group) {
   if (state.image_state == nullptr) state.image_state = pax::ImageState(group);
   return state.image_state;
 }
@@ -385,7 +387,7 @@ inline pax::GroupImageState* GroupState(PaxLocalState& state,
  * epoch-non-decreasing per slot, so the first match is the oldest one and it
  * holds the value the slot had at se.
  */
-const pax::EpochImage* OldestImageAfterSnapshot(
+const pax::EpochImage* oldest_image_after_snapshot(
     const std::vector<pax::EpochImage>& images, uint32_t snapshot_epoch) {
   for (const pax::EpochImage& image : images) {
     if (pax::EpochAfterSnapshot(image.writer_epoch, snapshot_epoch)) {
@@ -403,13 +405,13 @@ const pax::EpochImage* OldestImageAfterSnapshot(
  * value at se in its cells, so it stays out of the bitset and joins the bulk
  * visible runs.
  */
-inline void CopyGroupImages(PaxLocalState& state, uint32_t snapshot_epoch) {
+inline void copy_group_images(PaxLocalState& state, uint32_t snapshot_epoch) {
   constexpr uint32_t kWordBits = PaxGroup::kVisibilityWordBits;
   state.images = pax::GroupImages(state.image_state, state.imaged);
   state.has_images = false;
   for (const auto& [slot, images] : state.images) {
     if (slot >= PaxGroup::kRows) continue;
-    if (OldestImageAfterSnapshot(images, snapshot_epoch) != nullptr) {
+    if (oldest_image_after_snapshot(images, snapshot_epoch) != nullptr) {
       state.has_images = true;
     } else {
       state.imaged[slot / kWordBits] &= ~(uint64_t{1} << (slot % kWordBits));
@@ -421,17 +423,17 @@ inline void CopyGroupImages(PaxLocalState& state, uint32_t snapshot_epoch) {
  * @brief Samples the group's preserve counter, then copies its images and
  * imaged-slot bits. The counter first, so a preserve in between is caught.
  */
-inline void ClaimGroupImages(PaxLocalState& state, const PaxGroup* group,
-                             uint32_t snapshot_epoch) {
+inline void claim_group_images(PaxLocalState& state, const PaxGroup* group,
+                               uint32_t snapshot_epoch) {
   state.image_state = pax::ImageState(group);
   state.count_at_claim = pax::PreserveCount(state.image_state);
-  CopyGroupImages(state, snapshot_epoch);
+  copy_group_images(state, snapshot_epoch);
 }
 
 /**
  * @brief Returns whether the claimed copy resolves `slot` through an image.
  */
-inline bool SlotImaged(const PaxLocalState& state, uint32_t slot) {
+inline bool slot_imaged(const PaxLocalState& state, uint32_t slot) {
   constexpr uint32_t kWordBits = PaxGroup::kVisibilityWordBits;
   return state.has_images &&
          ((state.imaged[slot / kWordBits] >> (slot % kWordBits)) & 1u) != 0;
@@ -440,7 +442,7 @@ inline bool SlotImaged(const PaxLocalState& state, uint32_t slot) {
 /**
  * @brief Maps a PAX FieldType to the DuckDB column type.
  */
-LogicalType FieldTypeToLogicalType(FieldType type, int8_t scale) {
+LogicalType field_type_to_logical_type(FieldType type, int8_t scale) {
   switch (type) {
     case FieldType::kInt32:
       return LogicalType::INTEGER;
@@ -463,16 +465,17 @@ LogicalType FieldTypeToLogicalType(FieldType type, int8_t scale) {
  * exposed as _c0.._cN in TABLE::field order, matching the wire ColumnRef
  * ordinals, so no MySQL identifier ever participates in DuckDB binding.
  */
-unique_ptr<FunctionData> PaxPointerBind(ClientContext&,
-                                        TableFunctionBindInput& input,
-                                        vector<LogicalType>& return_types,
-                                        vector<string>& names) {
+unique_ptr<FunctionData> pax_pointer_bind(ClientContext&,
+                                          TableFunctionBindInput& input,
+                                          vector<LogicalType>& return_types,
+                                          vector<string>& names) {
   auto bind_data = duckdb::make_uniq<PaxBindData>();
   bind_data->table = reinterpret_cast<PaxTableView*>(
       input.inputs[0].GetPointer());
   size_t ordinal = 0;
   for (const auto& column : bind_data->table->columns) {
-    return_types.push_back(FieldTypeToLogicalType(column.type, column.scale));
+    return_types.push_back(
+        field_type_to_logical_type(column.type, column.scale));
     names.push_back("_c" + std::to_string(ordinal++));
   }
   return std::move(bind_data);
@@ -484,7 +487,7 @@ unique_ptr<FunctionData> PaxPointerBind(ClientContext&,
  * @details SlotsAllocated() bounds live rows from above, so the estimate
  * is an upper bound rather than an exact count.
  */
-unique_ptr<duckdb::NodeStatistics> PaxCardinality(
+unique_ptr<duckdb::NodeStatistics> pax_cardinality(
     ClientContext&, const FunctionData* bind_data) {
   const auto& data = bind_data->Cast<PaxBindData>();
   const uint64_t rows = pax::SlotsAllocated(data.table->table);
@@ -495,7 +498,7 @@ unique_ptr<duckdb::NodeStatistics> PaxCardinality(
  * @brief Builds the shared scan state: the projected column ids and a thread
  * count of min(hardware threads, group count).
  */
-unique_ptr<GlobalTableFunctionState> PaxInitGlobal(
+unique_ptr<GlobalTableFunctionState> pax_init_global(
     ClientContext&, TableFunctionInitInput& input) {
   const auto& bind_data = input.bind_data->Cast<PaxBindData>();
   PaxTableView& table_view = *bind_data.table;
@@ -532,9 +535,9 @@ unique_ptr<GlobalTableFunctionState> PaxInitGlobal(
 /**
  * @brief Creates the per-thread scan cursor.
  */
-unique_ptr<LocalTableFunctionState> PaxInitLocal(ExecutionContext&,
-                                                 TableFunctionInitInput&,
-                                                 GlobalTableFunctionState*) {
+unique_ptr<LocalTableFunctionState> pax_init_local(ExecutionContext&,
+                                                   TableFunctionInitInput&,
+                                                   GlobalTableFunctionState*) {
   return duckdb::make_uniq<PaxLocalState>();
 }
 
@@ -560,8 +563,8 @@ struct InvalidDate {
  * reaches the result only for a row the chunk validation confirms, and the
  * validation raises on that row.
  */
-inline bool TryCanonicalDate(int32_t year, int32_t month, int32_t day,
-                             date_t* out) {
+inline bool try_canonical_date(int32_t year, int32_t month, int32_t day,
+                               date_t* out) {
   if (month < 1 || month > 12 || day < 1 || day > 31 ||
       !duckdb::Date::TryFromDate(year, month, day, *out)) {
     *out = date_t(0);
@@ -578,9 +581,9 @@ inline bool TryCanonicalDate(int32_t year, int32_t month, int32_t day,
  * the ASCII a
  * writer formatted under a lock, which no reader can tear.
  */
-inline date_t CanonicalDate(int32_t year, int32_t month, int32_t day) {
+inline date_t canonical_date(int32_t year, int32_t month, int32_t day) {
   date_t result;
-  if (!TryCanonicalDate(year, month, day, &result)) {
+  if (!try_canonical_date(year, month, day, &result)) {
     throw duckdb::ConversionException("Date out of range: %d-%d-%d", year,
                                       month, day);
   }
@@ -590,7 +593,7 @@ inline date_t CanonicalDate(int32_t year, int32_t month, int32_t day) {
 /**
  * @brief Raises the conversion `bad` failed.
  */
-[[noreturn]] void RaiseInvalidDate(const InvalidDate& bad) {
+[[noreturn]] void raise_invalid_date(const InvalidDate& bad) {
   throw duckdb::ConversionException("Date out of range: %d-%d-%d",
                                     bad.ymd / 10000, (bad.ymd / 100) % 100,
                                     bad.ymd % 100);
@@ -602,8 +605,9 @@ inline date_t CanonicalDate(int32_t year, int32_t month, int32_t day) {
  * @details DuckDB stores DECIMAL(p, s) in the narrowest integer type that
  * fits p; the mantissa is written as that type.
  */
-inline void WriteDecimalPhysical(Vector& output_vector, idx_t row,
-                                 int64_t mantissa, PhysicalType physical_type) {
+inline void write_decimal_physical(Vector& output_vector, idx_t row,
+                                   int64_t mantissa,
+                                   PhysicalType physical_type) {
   switch (physical_type) {
     case PhysicalType::INT16:
       FlatVector::GetData<int16_t>(output_vector)[row] =
@@ -631,7 +635,7 @@ inline void WriteDecimalPhysical(Vector& output_vector, idx_t row,
  */
 template <class T>
 void unpack_decimal_run(const std::byte* src, uint32_t stride, uint32_t width,
-                      uint32_t count, Vector& output_vector, idx_t out_base) {
+                        uint32_t count, Vector& output_vector, idx_t out_base) {
   T* dst = FlatVector::GetData<T>(output_vector) + out_base;
   for (uint32_t i = 0; i < count; i++, src += stride) {
     uint16_t cell_length;
@@ -658,10 +662,10 @@ void unpack_decimal_run(const std::byte* src, uint32_t stride, uint32_t width,
  * validation.
  */
 void unpack_typed_run(FieldType type, const PaxGroup& group, size_t field,
-                     uint32_t width, uint32_t slot_start, uint32_t count,
-                     Vector& output_vector, idx_t out_base,
-                     PhysicalType decimal_physical_type,
-                     std::vector<InvalidDate>* invalid_dates) {
+                      uint32_t width, uint32_t slot_start, uint32_t count,
+                      Vector& output_vector, idx_t out_base,
+                      PhysicalType decimal_physical_type,
+                      std::vector<InvalidDate>* invalid_dates) {
   const std::byte* strip_base = group.strip(field);
   const uint32_t stride = group.stride(field);
   const std::byte* src = strip_base + static_cast<size_t>(stride) * slot_start;
@@ -704,8 +708,8 @@ void unpack_typed_run(FieldType type, const PaxGroup& group, size_t field,
         if (cell_length == width) {
           int32_t ymd;
           std::memcpy(&ymd, src + kCellLenBytes, sizeof(ymd));
-          if (!TryCanonicalDate(ymd / 10000, (ymd / 100) % 100, ymd % 100,
-                                &dst[i])) {
+          if (!try_canonical_date(ymd / 10000, (ymd / 100) % 100, ymd % 100,
+                                  &dst[i])) {
             invalid_dates->push_back({out_base + i, ymd});
           }
         } else {
@@ -718,19 +722,19 @@ void unpack_typed_run(FieldType type, const PaxGroup& group, size_t field,
       switch (decimal_physical_type) {
         case PhysicalType::INT16:
           unpack_decimal_run<int16_t>(src, stride, width, count, output_vector,
-                                    out_base);
+                                      out_base);
           break;
         case PhysicalType::INT32:
           unpack_decimal_run<int32_t>(src, stride, width, count, output_vector,
-                                    out_base);
+                                      out_base);
           break;
         case PhysicalType::INT64:
           unpack_decimal_run<int64_t>(src, stride, width, count, output_vector,
-                                    out_base);
+                                      out_base);
           break;
         default:
           unpack_decimal_run<hugeint_t>(src, stride, width, count, output_vector,
-                                      out_base);
+                                        out_base);
           break;
       }
       break;
@@ -747,8 +751,8 @@ void unpack_typed_run(FieldType type, const PaxGroup& group, size_t field,
  * inline into string_t, longer ones copy into the vector's string heap.
  */
 inline void unpack_untyped_cell(const PaxGroup& group, size_t field,
-                              uint32_t slot, bool is_null,
-                              Vector& output_vector, idx_t out_row) {
+                                uint32_t slot, bool is_null,
+                                Vector& output_vector, idx_t out_row) {
   if (is_null) {
     FlatVector::SetNull(output_vector, out_row, true);
     return;
@@ -781,8 +785,8 @@ struct ColumnContext {
 /**
  * @brief Returns whether a row's null-flags field marks `column` NULL.
  */
-inline bool CellIsNull(std::string_view null_flags,
-                       const ColumnContext& column) {
+inline bool cell_is_null(std::string_view null_flags,
+                         const ColumnContext& column) {
   return column.null_mask != 0 && column.null_byte < null_flags.size() &&
          (static_cast<uint8_t>(null_flags[column.null_byte]) &
           column.null_mask) != 0;
@@ -796,22 +800,22 @@ inline bool CellIsNull(std::string_view null_flags,
  * overwrite a row index whose previous occupant was dropped or replaced, so
  * a stale NULL bit must not survive into the new row.
  */
-void EmitInPlaceRow(const PaxGroup& group,
-                    const std::vector<ColumnContext>& scan_columns,
-                    uint32_t slot, DataChunk& output, idx_t out_row,
-                    std::vector<InvalidDate>* invalid_dates) {
+void emit_in_place_row(const PaxGroup& group,
+                       const std::vector<ColumnContext>& scan_columns,
+                       uint32_t slot, DataChunk& output, idx_t out_row,
+                       std::vector<InvalidDate>* invalid_dates) {
   const std::string_view null_flags = group.cell(0, slot);
   for (idx_t i = 0; i < scan_columns.size(); i++) {
     const ColumnContext& column = scan_columns[i];
     FlatVector::SetNull(output.data[i], out_row, false);
     if (column.type == FieldType::kUntyped) {
       unpack_untyped_cell(group, column.field, slot,
-                        CellIsNull(null_flags, column), output.data[i],
-                        out_row);
+                          cell_is_null(null_flags, column), output.data[i],
+                          out_row);
     } else {
       unpack_typed_run(column.type, group, column.field, column.width, slot, 1,
-                      output.data[i], out_row, column.decimal_physical_type,
-                      invalid_dates);
+                       output.data[i], out_row, column.decimal_physical_type,
+                       invalid_dates);
     }
   }
 }
@@ -824,11 +828,11 @@ void EmitInPlaceRow(const PaxGroup& group,
  * image that fails to parse is a broken invariant, and the request must fail
  * rather than emit a wrong row.
  */
-void EmitImageRow(const std::string& old_row,
-                  const std::vector<ColumnContext>& scan_columns,
-                  std::vector<std::pair<const char*, uint32_t>>& refs,
-                  DataChunk& output, idx_t out_row) {
-  SplitProxyRow(old_row, &refs);
+void emit_image_row(const std::string& old_row,
+                    const std::vector<ColumnContext>& scan_columns,
+                    std::vector<std::pair<const char*, uint32_t>>& refs,
+                    DataChunk& output, idx_t out_row) {
+  split_packed_row(old_row, &refs);
   if (refs.empty()) {
     throw std::runtime_error("epoch image row is missing the null-flags field");
   }
@@ -843,7 +847,7 @@ void EmitImageRow(const std::string& old_row,
     const uint32_t length = refs[column.field].second;
     // A typed field is zero-length only for SQL NULL; an untyped one needs
     // the null-flags bit to tell '' from NULL.
-    if (column.type == FieldType::kUntyped ? CellIsNull(null_flags, column)
+    if (column.type == FieldType::kUntyped ? cell_is_null(null_flags, column)
                                            : length == 0) {
       FlatVector::SetNull(output_vector, out_row, true);
       continue;
@@ -852,7 +856,7 @@ void EmitImageRow(const std::string& old_row,
     switch (column.type) {
       case FieldType::kInt32: {
         int64_t value;
-        if (!ParseAsciiInt64(payload, length, &value) || value < INT32_MIN ||
+        if (!parse_ascii_int64(payload, length, &value) || value < INT32_MIN ||
             value > INT32_MAX) {
           throw std::runtime_error("epoch image INT32 field does not parse");
         }
@@ -862,7 +866,7 @@ void EmitImageRow(const std::string& old_row,
       }
       case FieldType::kInt64: {
         int64_t value;
-        if (!ParseAsciiInt64(payload, length, &value)) {
+        if (!parse_ascii_int64(payload, length, &value)) {
           throw std::runtime_error("epoch image INT64 field does not parse");
         }
         FlatVector::GetData<int64_t>(output_vector)[out_row] = value;
@@ -870,21 +874,21 @@ void EmitImageRow(const std::string& old_row,
       }
       case FieldType::kDate: {
         int32_t year, month, day;
-        if (!ParseAsciiDate(payload, length, &year, &month, &day)) {
+        if (!parse_ascii_date(payload, length, &year, &month, &day)) {
           throw std::runtime_error("epoch image DATE field does not parse");
         }
         FlatVector::GetData<date_t>(output_vector)[out_row] =
-            CanonicalDate(year, month, day);
+            canonical_date(year, month, day);
         break;
       }
       case FieldType::kDecimal64: {
         int64_t mantissa;
-        if (!ParseAsciiDecimalScaled(payload, length, column.scale,
-                                     &mantissa)) {
+        if (!parse_ascii_decimal_scaled(payload, length, column.scale,
+                                        &mantissa)) {
           throw std::runtime_error("epoch image DECIMAL field does not parse");
         }
-        WriteDecimalPhysical(output_vector, out_row, mantissa,
-                             column.decimal_physical_type);
+        write_decimal_physical(output_vector, out_row, mantissa,
+                               column.decimal_physical_type);
         break;
       }
       default: {  // kUntyped: verbatim bytes
@@ -911,7 +915,7 @@ void EmitImageRow(const std::string& old_row,
  * that moved rewinds this call's rows of that group and re-reads its slots
  * one at a time (see the file header).
  */
-void PaxScan(ClientContext&, TableFunctionInput& data, DataChunk& output) {
+void pax_scan(ClientContext&, TableFunctionInput& data, DataChunk& output) {
   const auto& bind_data = data.bind_data->Cast<PaxBindData>();
   auto& global_state = data.global_state->Cast<PaxGlobalState>();
   auto& local_state = data.local_state->Cast<PaxLocalState>();
@@ -965,8 +969,8 @@ void PaxScan(ClientContext&, TableFunctionInput& data, DataChunk& output) {
   auto emit_image = [&](const pax::EpochImage& image) {
     table_view.slots_from_images.fetch_add(1, std::memory_order_relaxed);
     if (!image.was_visible) return;  // the slot held no row at se
-    EmitImageRow(image.old_row, scan_columns, local_state.field_refs, output,
-                 rows_emitted);
+    emit_image_row(image.old_row, scan_columns, local_state.field_refs, output,
+                   rows_emitted);
     rows_emitted++;
   };
 
@@ -975,7 +979,7 @@ void PaxScan(ClientContext&, TableFunctionInput& data, DataChunk& output) {
   // group stays claimed and the next call resumes at current_slot.
   auto reread_slots = [&](uint32_t from, uint32_t to) {
     PaxGroup* group = local_state.group_ptr;
-    ClaimGroupImages(local_state, group, snapshot_epoch);
+    claim_group_images(local_state, group, snapshot_epoch);
     for (uint32_t slot = from; slot < to; slot++) {
       if (rows_emitted >= max_rows) {
         local_state.current_slot = slot;
@@ -984,7 +988,7 @@ void PaxScan(ClientContext&, TableFunctionInput& data, DataChunk& output) {
       const auto images_it = local_state.images.find(slot);
       if (images_it != local_state.images.end()) {
         const pax::EpochImage* image =
-            OldestImageAfterSnapshot(images_it->second, snapshot_epoch);
+            oldest_image_after_snapshot(images_it->second, snapshot_epoch);
         if (image != nullptr) {
           emit_image(*image);
           continue;
@@ -992,22 +996,22 @@ void PaxScan(ClientContext&, TableFunctionInput& data, DataChunk& output) {
       }
       const bool visible_now = group->IsVisible(slot);
       if (visible_now) {
-        EmitInPlaceRow(*group, scan_columns, slot, output, rows_emitted,
-                       &invalid_dates);
+        emit_in_place_row(*group, scan_columns, slot, output, rows_emitted,
+                          &invalid_dates);
       }
       // The acquire fence orders the cell reads above before the closing
       // sample; an acquire load alone leaves them free to sink past it.
       std::atomic_thread_fence(std::memory_order_acquire);
       const uint64_t count_now =
-          pax::PreserveCount(GroupState(local_state, group));
+          pax::PreserveCount(group_state(local_state, group));
       if (count_now != local_state.count_at_claim) {
         // A preserve landed after the copy; re-resolve this slot from a fresh
         // lookup, then refresh the copy for the slots after it.
         const auto fresh = pax::SlotImages(local_state.image_state, slot);
         const pax::EpochImage* late =
-            OldestImageAfterSnapshot(fresh, snapshot_epoch);
+            oldest_image_after_snapshot(fresh, snapshot_epoch);
         local_state.count_at_claim = count_now;
-        CopyGroupImages(local_state, snapshot_epoch);
+        copy_group_images(local_state, snapshot_epoch);
         if (late != nullptr) {
           drop_invalid_dates_from(rows_emitted);
           emit_image(*late);
@@ -1031,11 +1035,11 @@ void PaxScan(ClientContext&, TableFunctionInput& data, DataChunk& output) {
     // The acquire fence orders this call's cell reads before the closing
     // sample; an acquire load alone leaves them free to sink past it.
     std::atomic_thread_fence(std::memory_order_acquire);
-    if (pax::PreserveCount(GroupState(local_state, group)) ==
+    if (pax::PreserveCount(group_state(local_state, group)) ==
         local_state.count_at_claim) {
       // The counter held, so every cell read of this group in this call is
       // what the group stores, an unconvertible DATE among them.
-      if (!invalid_dates.empty()) RaiseInvalidDate(invalid_dates.front());
+      if (!invalid_dates.empty()) raise_invalid_date(invalid_dates.front());
       return;
     }
     table_view.chunk_rereads.fetch_add(1, std::memory_order_relaxed);
@@ -1045,7 +1049,7 @@ void PaxScan(ClientContext&, TableFunctionInput& data, DataChunk& output) {
     reread_slots(entry_slot, read_through);
     // A re-read resolves each slot against its own counter sample, so a record
     // it leaves behind is a stored value.
-    if (!invalid_dates.empty()) RaiseInvalidDate(invalid_dates.front());
+    if (!invalid_dates.empty()) raise_invalid_date(invalid_dates.front());
     // The rows the re-read abandons keep the validity bits the rewound pass
     // wrote, and the bulk run that fills those rows next writes cells only,
     // so their columns are marked valid again.
@@ -1087,7 +1091,7 @@ void PaxScan(ClientContext&, TableFunctionInput& data, DataChunk& output) {
         local_state.current_slot = 0;
         if (local_state.group_ptr == nullptr) continue;
         table_view.groups_scanned.fetch_add(1, std::memory_order_relaxed);
-        ClaimGroupImages(local_state, local_state.group_ptr, snapshot_epoch);
+        claim_group_images(local_state, local_state.group_ptr, snapshot_epoch);
         if (local_state.has_images) {
           table_view.groups_with_images.fetch_add(1, std::memory_order_relaxed);
         }
@@ -1099,9 +1103,9 @@ void PaxScan(ClientContext&, TableFunctionInput& data, DataChunk& output) {
       PaxGroup* group = local_state.group_ptr;
       const uint32_t slot = local_state.current_slot;
 
-      if (SlotImaged(local_state, slot)) {
+      if (slot_imaged(local_state, slot)) {
         local_state.current_slot = slot + 1;
-        emit_image(*OldestImageAfterSnapshot(
+        emit_image(*oldest_image_after_snapshot(
             local_state.images.find(slot)->second, snapshot_epoch));
         continue;
       }
@@ -1115,7 +1119,7 @@ void PaxScan(ClientContext&, TableFunctionInput& data, DataChunk& output) {
                              static_cast<uint32_t>(max_rows - rows_emitted));
       uint32_t run_length = 1;
       while (run_length < max_run_length &&
-             !SlotImaged(local_state, slot + run_length) &&
+             !slot_imaged(local_state, slot + run_length) &&
              group->IsVisible(slot + run_length)) {
         run_length++;
       }
@@ -1125,13 +1129,13 @@ void PaxScan(ClientContext&, TableFunctionInput& data, DataChunk& output) {
         if (column.type == FieldType::kUntyped) {
           for (uint32_t row = 0; row < run_length; row++) {
             unpack_untyped_cell(*group, column.field, slot + row,
-                              CellIsNull(group->cell(0, slot + row), column),
-                              output.data[i], rows_emitted + row);
+                              cell_is_null(group->cell(0, slot + row), column),
+                                output.data[i], rows_emitted + row);
           }
         } else {
           unpack_typed_run(column.type, *group, column.field, column.width, slot,
-                          run_length, output.data[i], rows_emitted,
-                          column.decimal_physical_type, &invalid_dates);
+                           run_length, output.data[i], rows_emitted,
+                           column.decimal_physical_type, &invalid_dates);
         }
       }
 
@@ -1170,7 +1174,7 @@ void PaxScan(ClientContext&, TableFunctionInput& data, DataChunk& output) {
  * the DOUBLE result.
  */
 void pack_row(duckdb::MaterializedQueryResult& result, idx_t row_index,
-               std::string* out) {
+              std::string* out) {
   // Field 0 is the row null-flags field: bit i of byte i / 8 marks output
   // column i NULL. A NULL and an empty string are both zero-length fields,
   // so this bitmap is what separates them.
@@ -1185,19 +1189,19 @@ void pack_row(duckdb::MaterializedQueryResult& result, idx_t row_index,
     if (value.IsNull()) {
       null_flags[column_index / 8] |=
           static_cast<char>(1u << (column_index % 8));
-      AppendProxyField(body, "", /*is_null=*/true);
+      append_packed_field(body, "", /*is_null=*/true);
     } else if (value.type().id() == duckdb::LogicalTypeId::BOOLEAN) {
       // MySQL's boolean surface is 1/0; Item_string::val_int reads both
       // "true" and "false" as 0.
-      AppendProxyField(body, value.GetValue<bool>() ? "1" : "0",
-                       /*is_null=*/false);
+      append_packed_field(body, value.GetValue<bool>() ? "1" : "0",
+                          /*is_null=*/false);
     } else {
       const std::string text = value.ToString();
-      AppendProxyField(body, text, /*is_null=*/false);
+      append_packed_field(body, text, /*is_null=*/false);
     }
   }
   out->clear();
-  AppendProxyField(*out, null_flags, /*is_null=*/false);
+  append_packed_field(*out, null_flags, /*is_null=*/false);
   out->append(body);
 }
 
@@ -1238,7 +1242,7 @@ duckdb::DBConfig* apply_limits(duckdb::DBConfig* config) {
  * model (https://duckdb.org/docs/stable/connect/concurrency): one shared
  * instance, one fresh Connection per request/thread.
  */
-duckdb::DuckDB& GlobalRuntime() {
+duckdb::DuckDB& global_runtime() {
   // Function-local statics initialize in order, so the config is complete
   // before the instance reads it. nullptr: in-memory, no db file.
   static duckdb::DBConfig config;
@@ -1265,8 +1269,9 @@ constexpr const char* kUtf8mb40900AiCiNotLikeFunction =
  * grouping, or ordinary DISTINCT needs a key. Returning BLOB keeps MySQL's
  * raw strnxfrm bytes instead of hex-encoding them to twice their size.
  */
-void Utf8mb40900AiCiSortKey(duckdb::DataChunk& args, duckdb::ExpressionState&,
-                            duckdb::Vector& result) {
+void utf8mb4_0900_ai_ci_sort_key(duckdb::DataChunk& args,
+                                 duckdb::ExpressionState&,
+                                 duckdb::Vector& result) {
   const CHARSET_INFO* collation =
       mysql_charset_runtime::initialize(nullptr).utf8mb4_0900_ai_ci;
   if (collation == nullptr ||
@@ -1326,8 +1331,8 @@ void Utf8mb40900AiCiSortKey(duckdb::DataChunk& args, duckdb::ExpressionState&,
 }
 
 template <bool Negated>
-void Utf8mb40900AiCiLike(duckdb::DataChunk& args, duckdb::ExpressionState&,
-                         duckdb::Vector& result) {
+void utf8mb4_0900_ai_ci_like(duckdb::DataChunk& args, duckdb::ExpressionState&,
+                             duckdb::Vector& result) {
   const CHARSET_INFO* collation =
       mysql_charset_runtime::initialize(nullptr).utf8mb4_0900_ai_ci;
   if (collation == nullptr ||
@@ -1352,8 +1357,8 @@ void Utf8mb40900AiCiLike(duckdb::DataChunk& args, duckdb::ExpressionState&,
  * string. DuckDB's own ascii() is codepoint-valued and differs on any
  * multibyte head.
  */
-void MysqlAsciiFunction(duckdb::DataChunk& args, duckdb::ExpressionState&,
-                        duckdb::Vector& result) {
+void mysql_ascii_function(duckdb::DataChunk& args, duckdb::ExpressionState&,
+                          duckdb::Vector& result) {
   duckdb::UnaryExecutor::Execute<duckdb::string_t, int32_t>(
       args.data[0], result, args.size(), [](duckdb::string_t input) {
         if (input.GetSize() == 0) return 0;
@@ -1362,10 +1367,10 @@ void MysqlAsciiFunction(duckdb::DataChunk& args, duckdb::ExpressionState&,
       });
 }
 
-void RegisterMySqlCollationRuntime(Connection& connection) {
+void register_mysql_collation_runtime(Connection& connection) {
   duckdb::ScalarFunction sort_key(
       "mysql_utf8mb4_0900_ai_ci_sort_key", {duckdb::LogicalType::VARCHAR},
-      duckdb::LogicalType::BLOB, Utf8mb40900AiCiSortKey);
+      duckdb::LogicalType::BLOB, utf8mb4_0900_ai_ci_sort_key);
   duckdb::CreateCollationInfo create_info(
       kUtf8mb40900AiCiDuckdbName, std::move(sort_key),
       /*combinable=*/false,
@@ -1382,13 +1387,13 @@ void RegisterMySqlCollationRuntime(Connection& connection) {
       duckdb::LogicalType::INTEGER};
   duckdb::ScalarFunction like(kUtf8mb40900AiCiLikeFunction, arguments,
                               duckdb::LogicalType::BOOLEAN,
-                              Utf8mb40900AiCiLike<false>);
+                              utf8mb4_0900_ai_ci_like<false>);
   duckdb::CreateScalarFunctionInfo like_info(std::move(like));
   like_info.on_conflict = duckdb::OnCreateConflict::IGNORE_ON_CONFLICT;
   connection.context->RegisterFunction(like_info);
   duckdb::ScalarFunction not_like(kUtf8mb40900AiCiNotLikeFunction, arguments,
                                   duckdb::LogicalType::BOOLEAN,
-                                  Utf8mb40900AiCiLike<true>);
+                                  utf8mb4_0900_ai_ci_like<true>);
   duckdb::CreateScalarFunctionInfo not_like_info(std::move(not_like));
   not_like_info.on_conflict = duckdb::OnCreateConflict::IGNORE_ON_CONFLICT;
   connection.context->RegisterFunction(not_like_info);
@@ -1397,7 +1402,7 @@ void RegisterMySqlCollationRuntime(Connection& connection) {
   // where DuckDB does not push a non-combinable collation into children.
   duckdb::ScalarFunction sort_key_fn(
       "mysql_utf8mb4_0900_ai_ci_sort_key", {duckdb::LogicalType::VARCHAR},
-      duckdb::LogicalType::BLOB, Utf8mb40900AiCiSortKey);
+      duckdb::LogicalType::BLOB, utf8mb4_0900_ai_ci_sort_key);
   duckdb::CreateScalarFunctionInfo sort_key_info(std::move(sort_key_fn));
   sort_key_info.on_conflict = duckdb::OnCreateConflict::IGNORE_ON_CONFLICT;
   connection.context->RegisterFunction(sort_key_info);
@@ -1405,7 +1410,7 @@ void RegisterMySqlCollationRuntime(Connection& connection) {
   duckdb::ScalarFunction mysql_ascii("mysql_ascii",
                                      {duckdb::LogicalType::VARCHAR},
                                      duckdb::LogicalType::INTEGER,
-                                     MysqlAsciiFunction);
+                                     mysql_ascii_function);
   duckdb::CreateScalarFunctionInfo ascii_info(std::move(mysql_ascii));
   ascii_info.on_conflict = duckdb::OnCreateConflict::IGNORE_ON_CONFLICT;
   connection.context->RegisterFunction(ascii_info);
@@ -1418,23 +1423,23 @@ void RegisterMySqlCollationRuntime(Connection& connection) {
  * one immutable function is registered on first use, and every request hands
  * its stack-owned PaxTableView in as a pointer constant inside the AST.
  */
-void EnsureDuckdbScanRegistered() {
+void ensure_duckdb_scan_registered() {
   static std::once_flag registered;
   std::call_once(registered, [] {
-    Connection connection(GlobalRuntime());
+    Connection connection(global_runtime());
     TableFunction function("helios_pax_scan", {duckdb::LogicalType::POINTER},
-                           PaxScan, PaxPointerBind, PaxInitGlobal,
-                           PaxInitLocal);
+                           pax_scan, pax_pointer_bind, pax_init_global,
+                           pax_init_local);
     function.projection_pushdown = true;
     function.filter_pushdown = false;
-    function.cardinality = PaxCardinality;
+    function.cardinality = pax_cardinality;
     connection.context->RunFunctionInTransaction([&]() {
       auto& catalog = duckdb::Catalog::GetSystemCatalog(*connection.context);
       duckdb::CreateTableFunctionInfo create_info(function);
       create_info.on_conflict = duckdb::OnCreateConflict::IGNORE_ON_CONFLICT;
       catalog.CreateTableFunction(*connection.context, create_info);
     });
-    RegisterMySqlCollationRuntime(connection);
+    register_mysql_collation_runtime(connection);
   });
 }
 
@@ -1458,7 +1463,7 @@ void execute_duckdb_query(
   }
   try {
     const helios::storage::Database::PaxReadView read_view =
-        db->OpenPaxView(FenceTimeoutMs());
+        db->OpenPaxView(fence_timeout_ms());
     if (!read_view.valid) {
       response->set_ok(false);
       response->set_error(read_view.error);
@@ -1543,8 +1548,8 @@ void execute_duckdb_query(
           reinterpret_cast<uintptr_t>(&table_view);
     }
 
-    EnsureDuckdbScanRegistered();
-    Connection connection(GlobalRuntime());
+    ensure_duckdb_scan_registered();
+    Connection connection(global_runtime());
     auto built = BuildSelectStatement(request, handles);
     if (!built.statement) {
       response->set_ok(false);

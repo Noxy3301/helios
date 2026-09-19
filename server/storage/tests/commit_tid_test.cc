@@ -98,7 +98,7 @@ class CommitTidTest : public ::testing::Test {
     }
     epoch_.Start();
     epoch_.Stop();
-    index::MasstreeReleaseThreadEpoch();
+    index::release_thread_epoch();
     std::filesystem::remove_all(config_.work_dir);
   }
 
@@ -128,7 +128,7 @@ class CommitTidTest : public ::testing::Test {
     const bool committed =
         TestHelper::Feed(tx, reads, ranges, rows, index_ops, reason_) &&
         tx.Commit(CommitDurability::kAsync, reason_);
-    index::MasstreeReleaseThreadEpoch();
+    index::release_thread_epoch();
     return committed;
   }
 };
@@ -159,7 +159,7 @@ TEST_F(CommitTidTest, CommitReadsTheEpochAfterTheWriteSetIsFed) {
   EXPECT_EQ(epoch::Framework::kThreadOffline, epoch_.ThreadEpoch());
   EXPECT_EQ(published, item->transaction_id.load());
   EXPECT_FALSE(item->transaction_id.load().lock);
-  index::MasstreeReleaseThreadEpoch();
+  index::release_thread_epoch();
 
   // Only the first commit reached the log; the stale attempt logged nothing.
   logger_->RequestFlush(11);
@@ -197,7 +197,7 @@ TEST_F(CommitTidTest, CommitJoinsTheEpochAfterItsLocksAreHeld) {
     EXPECT_EQ(epoch::Framework::kThreadOffline, epoch_.ThreadEpoch());
     committed = tx.Commit(CommitDurability::kAsync, reason_);
     EXPECT_EQ(epoch::Framework::kThreadOffline, epoch_.ThreadEpoch());
-    index::MasstreeReleaseThreadEpoch();
+    index::release_thread_epoch();
   });
 
   // The committer holds the first record and is waiting on the second
@@ -595,7 +595,7 @@ TEST_F(CommitTidTest, OneTidCoversReadsRowsIndexesAndTheWorker) {
   auto *read = SeedRow("read", Version(10, 80));
   auto *index = tables_.GetTable(kTable)->GetSecondaryIndex("idx");
   auto *posting = index->tree.GetOrInsert("group");
-  posting->SetPrimaryKeys({"a"});
+  posting->set_primary_keys({"a"});
   posting->transaction_id.store(Version(10, 40));
   last_tid_ = Version(10, 60);
 
@@ -634,7 +634,7 @@ TEST_F(CommitTidTest, WrittenRowsAndIndexesContributeTheirPreviousVersions) {
 
   auto *index = tables_.GetTable(kTable)->GetSecondaryIndex("idx");
   auto *posting = index->tree.GetOrInsert("group");
-  posting->SetPrimaryKeys({"a"});
+  posting->set_primary_keys({"a"});
   posting->transaction_id.store(Version(10, 700));
   ASSERT_TRUE(Commit({}, {{kTable, "b", "value"}},
                      {{kTable, "idx", "group", "b", false}}))
@@ -680,7 +680,7 @@ TEST_F(CommitTidTest, UniqueIndexTakesASecondAdditionThatFollowsARemoval) {
   const auto view = keys.primary_keys_view();
   ASSERT_EQ(1u, view.size());
   EXPECT_EQ("b", *view.begin());
-  index::MasstreeReleaseThreadEpoch();
+  index::release_thread_epoch();
 }
 
 TEST_F(CommitTidTest, PointReadFailureUsesFixedReasonForBinaryKey) {
@@ -777,7 +777,7 @@ TEST_F(CommitTidTest, SecondaryRangeReadContributesIndexAndRowVersions) {
   auto *row = SeedRow("a", Version(10, 10));
   auto *index = tables_.GetTable(kTable)->GetSecondaryIndex("idx");
   auto *posting = index->tree.GetOrInsert("group");
-  posting->SetPrimaryKeys({"a"});
+  posting->set_primary_keys({"a"});
   posting->transaction_id.store(Version(10, 300));
   TestHelper::Range range;
   range.table_name = kTable;
@@ -901,7 +901,7 @@ TEST_F(CommitTidTest, RangeRevalidationAllowsOwnLockOnPrimaryAndSecondary) {
   SeedRow("k", Version(10, 10));
   auto *index = tables_.GetTable(kTable)->GetSecondaryIndex("idx");
   auto *posting = index->tree.GetOrInsert("s");
-  posting->SetPrimaryKeys({"k"});
+  posting->set_primary_keys({"k"});
   posting->transaction_id.store(Version(10, 12));
 
   TestHelper::Range rows;
@@ -1007,7 +1007,7 @@ TEST_F(CommitTidTest,
   tree.GetOrInsert("a")->transaction_id.store(Deleted(11, 5));
   auto *index = tables_.GetTable(kTable)->GetSecondaryIndex("idx");
   auto *posting = index->tree.GetOrInsert("group");
-  posting->SetPrimaryKeys({"a"});
+  posting->set_primary_keys({"a"});
   posting->transaction_id.store(Version(10, 30));
   TestHelper::Range range;
   range.table_name = kTable;
@@ -1024,7 +1024,7 @@ TEST_F(CommitTidTest,
   SeedRow("a", Version(10, 2));
   auto *index = tables_.GetTable(kTable)->GetSecondaryIndex("idx");
   auto *posting = index->tree.GetOrInsert("s");
-  posting->SetPrimaryKeys({"a"});
+  posting->set_primary_keys({"a"});
   posting->transaction_id.store(Version(10, 4));
 
   ASSERT_TRUE(Commit({}, {}, {{kTable, "idx", "s", "a", true}})) << reason_;

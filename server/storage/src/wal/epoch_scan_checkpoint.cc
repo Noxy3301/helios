@@ -351,7 +351,7 @@ bool EpochScanCheckpoint::RunOnce(Stats *out_stats) {
   // epoch. Ending the reclamation critical section the pass held open from
   // its first walk is what lets a row retired during it be freed: no index
   // reclaims anything while a thread is inside a Masstree RCU enrolment.
-  index::MasstreeReleaseThreadEpoch();
+  index::release_thread_epoch();
 
   stats.scan_ms = ElapsedMs(scan_begin);
   // Every version in the checkpoint was published at or below this epoch, which

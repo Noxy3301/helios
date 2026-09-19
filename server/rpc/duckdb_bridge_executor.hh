@@ -11,12 +11,12 @@ namespace olap {
 /**
  * @brief Executes a tx_execute_duckdb_query request.
  *
- * @details Constructs DuckDB's parsed AST from the plugin's serialization of
- * the resolved statement and executes it; no SQL text is parsed. Runs under
- * the same read view fence, validity gate and chunk validation as the text
- * path, but keeps no per-request catalog state: the one process-lifetime
- * helios_pax_scan(POINTER) function reads request-owned table views passed as
- * pointer constants inside the AST.
+ * @details Constructs DuckDB's parsed AST from the request the plugin builds
+ * from the resolved statement and executes it; no SQL text is parsed. Runs
+ * under the read view fence, validity gate and chunk validation, and keeps no
+ * per-request catalog state: the one process-lifetime helios_pax_scan(POINTER)
+ * function reads request-owned table views passed as pointer constants inside
+ * the AST.
  */
 void execute_duckdb_query(
     helios::storage::Database* db,

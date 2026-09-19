@@ -292,7 +292,7 @@ bool Transaction::Prepare(DataItem &item, WriteEntry &entry,
   for (const auto &delta : index.deltas) {
     if (delta.op == wal::SecondaryIndexOp::kDelete) {
       index.primary_keys =
-          PrimaryKeyList::Delete(index.primary_keys, delta.primary_key);
+          PrimaryKeyList::erase(index.primary_keys, delta.primary_key);
       continue;
     }
     // A UNIQUE key holds one primary key; adding that same key again is not
@@ -305,7 +305,7 @@ bool Transaction::Prepare(DataItem &item, WriteEntry &entry,
       return false;
     }
     index.primary_keys =
-        PrimaryKeyList::Insert(index.primary_keys, delta.primary_key);
+        PrimaryKeyList::insert(index.primary_keys, delta.primary_key);
   }
   return true;
 }

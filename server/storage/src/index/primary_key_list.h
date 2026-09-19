@@ -47,21 +47,21 @@ struct PrimaryKeyList {
    * @throws std::length_error if the count or payload byte length exceeds
    * `uint32_t`.
    */
-  static Ptr FromSortedDeduped(const std::vector<std::string> &keys) {
+  static Ptr from_sorted_deduped(const std::vector<std::string> &keys) {
     size_t payload_bytes = 0;
     for (const auto &key : keys) {
-      payload_bytes += PackedKey::PackedSize(key);
-      CheckFitsUint32(payload_bytes, "packed primary-key list bytes");
+      payload_bytes += PackedKey::packed_size(key);
+      check_fits_uint32(payload_bytes, "packed primary-key list bytes");
     }
 
-    auto packed = AllocateMutable(
-        CheckFitsUint32(keys.size(), "packed primary-key list count"),
+    auto packed = allocate_mutable(
+        check_fits_uint32(keys.size(), "packed primary-key list count"),
         static_cast<uint32_t>(payload_bytes));
-    char *out = packed->MutablePackedKeys();
+    char *out = packed->mutable_packed_keys();
     for (const auto &key : keys) {
-      out = PackedKey::Pack(out, key);
+      out = PackedKey::pack(out, key);
     }
-    assert(out == packed->MutablePackedKeys() + packed->bytes);
+    assert(out == packed->mutable_packed_keys() + packed->bytes);
     return packed;
   }
 
@@ -75,17 +75,17 @@ struct PrimaryKeyList {
    * @throws std::length_error if the updated count or payload byte length
    * exceeds `uint32_t`.
    */
-  static Ptr Insert(const Ptr &keys, std::string_view key) {
+  static Ptr insert(const Ptr &keys, std::string_view key) {
     if (!keys) {
-      return FromOne(key);
+      return from_one(key);
     }
 
-    const char *const src_begin = keys->PackedKeys();
+    const char *const src_begin = keys->packed_keys();
     const char *const src_end = src_begin + keys->bytes;
     const char *insert_pos = src_end;
 
     for (const char *cursor = src_begin; cursor != src_end;) {
-      const PackedKey packed = PackedKey::Unpack(cursor);
+      const PackedKey packed = PackedKey::unpack(cursor);
       const std::string_view value(packed.value, packed.length);
       if (value == key) return keys;
       if (key < value) {
@@ -95,26 +95,26 @@ struct PrimaryKeyList {
       cursor = packed.next;
     }
 
-    const size_t added_bytes = PackedKey::PackedSize(key);
+    const size_t added_bytes = PackedKey::packed_size(key);
     const size_t new_bytes = static_cast<size_t>(keys->bytes) + added_bytes;
-    auto next = AllocateMutable(
-        CheckFitsUint32(static_cast<size_t>(keys->count) + 1,
-                        "packed primary-key list count"),
-        CheckFitsUint32(new_bytes, "packed primary-key list bytes"));
+    auto next = allocate_mutable(
+        check_fits_uint32(static_cast<size_t>(keys->count) + 1,
+                          "packed primary-key list count"),
+        check_fits_uint32(new_bytes, "packed primary-key list bytes"));
 
-    char *out = next->MutablePackedKeys();
+    char *out = next->mutable_packed_keys();
     const size_t prefix_bytes = static_cast<size_t>(insert_pos - src_begin);
     if (prefix_bytes != 0) {
       std::memcpy(out, src_begin, prefix_bytes);
       out += prefix_bytes;
     }
-    out = PackedKey::Pack(out, key);
+    out = PackedKey::pack(out, key);
     const size_t suffix_bytes = static_cast<size_t>(src_end - insert_pos);
     if (suffix_bytes != 0) {
       std::memcpy(out, insert_pos, suffix_bytes);
       out += suffix_bytes;
     }
-    assert(out == next->MutablePackedKeys() + next->bytes);
+    assert(out == next->mutable_packed_keys() + next->bytes);
     return next;
   }
 
@@ -126,26 +126,26 @@ struct PrimaryKeyList {
    * @return The same `shared_ptr` when `keys` is null, empty, or does not
    * contain `key`; otherwise a new immutable primary-key list without `key`.
    */
-  static Ptr Delete(const Ptr &keys, std::string_view key) {
+  static Ptr erase(const Ptr &keys, std::string_view key) {
     if (!keys || keys->count == 0) return keys;
 
-    const char *const src_begin = keys->PackedKeys();
+    const char *const src_begin = keys->packed_keys();
     const char *const src_end = src_begin + keys->bytes;
 
     for (const char *cursor = src_begin; cursor != src_end;) {
-      const PackedKey packed = PackedKey::Unpack(cursor);
+      const PackedKey packed = PackedKey::unpack(cursor);
       const std::string_view value(packed.value, packed.length);
       if (value == key) {
         const size_t removed_bytes =
             static_cast<size_t>(packed.next - packed.start);
         const size_t new_bytes =
             static_cast<size_t>(keys->bytes) - removed_bytes;
-        auto next = AllocateMutable(
-            CheckFitsUint32(static_cast<size_t>(keys->count) - 1,
-                            "packed primary-key list count"),
+        auto next = allocate_mutable(
+            check_fits_uint32(static_cast<size_t>(keys->count) - 1,
+                              "packed primary-key list count"),
             static_cast<uint32_t>(new_bytes));
 
-        char *out = next->MutablePackedKeys();
+        char *out = next->mutable_packed_keys();
         const size_t prefix_bytes =
             static_cast<size_t>(packed.start - src_begin);
         if (prefix_bytes != 0) {
@@ -157,7 +157,7 @@ struct PrimaryKeyList {
           std::memcpy(out, packed.next, suffix_bytes);
           out += suffix_bytes;
         }
-        assert(out == next->MutablePackedKeys() + next->bytes);
+        assert(out == next->mutable_packed_keys() + next->bytes);
         return next;
       }
       if (key < value) return keys;
@@ -171,7 +171,7 @@ struct PrimaryKeyList {
    * @brief Returns the packed keys after the fixed header.
    * @return Pointer to the `count` records that occupy `bytes` bytes.
    */
-  const char *PackedKeys() const {
+  const char *packed_keys() const {
     return reinterpret_cast<const char *>(this) + sizeof(PrimaryKeyList);
   }
 
@@ -180,8 +180,8 @@ struct PrimaryKeyList {
    * @brief One primary key as the list stores it: an unsigned LEB128 length,
    *        then the key bytes.
    *
-   * @details Unpack locates the key at `start` and Pack writes one; neither
-   * has anything to do with a table row.
+   * @details Reading is unpack and writing is pack; neither has anything to do
+   * with a table row.
    */
   struct PackedKey {
     const char *start;
@@ -189,13 +189,13 @@ struct PrimaryKeyList {
     const char *next;
     size_t length;
 
-    static size_t PackedSize(std::string_view key) {
-      return VarintSize(key.size()) + key.size();
+    static size_t packed_size(std::string_view key) {
+      return varint_size(key.size()) + key.size();
     }
 
     // Writes one packed key at `out` and returns the byte after it.
-    static char *Pack(char *out, std::string_view key) {
-      out = WriteVarint(out, key.size());
+    static char *pack(char *out, std::string_view key) {
+      out = write_varint(out, key.size());
       if (!key.empty()) {
         std::memcpy(out, key.data(), key.size());
         out += key.size();
@@ -203,9 +203,9 @@ struct PrimaryKeyList {
       return out;
     }
 
-    // Reads the key packed at `start`. Pack is the only writer, so the length
-    // always terminates and stays inside the allocation.
-    static PackedKey Unpack(const char *start) {
+    // Reads the key packed at `start`. The packer is the only writer, and the
+    // length always terminates and stays inside the allocation.
+    static PackedKey unpack(const char *start) {
       const char *cursor = start;
       size_t length = 0;
       for (unsigned shift = 0;; shift += 7) {
@@ -230,8 +230,8 @@ struct PrimaryKeyList {
   PrimaryKeyList(uint32_t record_count, uint32_t payload_bytes)
       : count(record_count), bytes(payload_bytes) {}
 
-  static MutablePtr AllocateMutable(uint32_t record_count,
-                                    uint32_t payload_bytes) {
+  static MutablePtr allocate_mutable(uint32_t record_count,
+                                     uint32_t payload_bytes) {
     const size_t allocation_size =
         sizeof(PrimaryKeyList) + static_cast<size_t>(payload_bytes);
     std::byte *raw = new std::byte[allocation_size];
@@ -239,17 +239,17 @@ struct PrimaryKeyList {
     return MutablePtr(packed, Deleter{});
   }
 
-  static Ptr FromOne(std::string_view key) {
-    const size_t payload_bytes = PackedKey::PackedSize(key);
-    auto packed = AllocateMutable(
-        1, CheckFitsUint32(payload_bytes, "packed primary-key list bytes"));
+  static Ptr from_one(std::string_view key) {
+    const size_t payload_bytes = PackedKey::packed_size(key);
+    auto packed = allocate_mutable(
+        1, check_fits_uint32(payload_bytes, "packed primary-key list bytes"));
     [[maybe_unused]] char *out =
-        PackedKey::Pack(packed->MutablePackedKeys(), key);
-    assert(out == packed->MutablePackedKeys() + packed->bytes);
+        PackedKey::pack(packed->mutable_packed_keys(), key);
+    assert(out == packed->mutable_packed_keys() + packed->bytes);
     return packed;
   }
 
-  static uint32_t CheckFitsUint32(size_t value, const char *field) {
+  static uint32_t check_fits_uint32(size_t value, const char *field) {
     if (value > std::numeric_limits<uint32_t>::max()) {
       throw std::length_error(field);
     }
@@ -257,7 +257,7 @@ struct PrimaryKeyList {
   }
 
   // Unsigned LEB128: seven bits a byte, high bit continues.
-  static size_t VarintSize(size_t value) {
+  static size_t varint_size(size_t value) {
     size_t size = 1;
     while (value >= 0x80) {
       value >>= 7;
@@ -266,7 +266,7 @@ struct PrimaryKeyList {
     return size;
   }
 
-  static char *WriteVarint(char *out, size_t value) {
+  static char *write_varint(char *out, size_t value) {
     while (value >= 0x80) {
       *out++ = static_cast<char>((value & 0x7f) | 0x80);
       value >>= 7;
@@ -275,7 +275,7 @@ struct PrimaryKeyList {
     return out;
   }
 
-  char *MutablePackedKeys() {
+  char *mutable_packed_keys() {
     return reinterpret_cast<char *>(this) + sizeof(PrimaryKeyList);
   }
 };
@@ -308,13 +308,13 @@ class PrimaryKeyList::View {
     iterator() = default;
 
     reference operator*() const {
-      const auto packed = PrimaryKeyList::PackedKey::Unpack(cursor_);
+      const auto packed = PrimaryKeyList::PackedKey::unpack(cursor_);
       return std::string_view(packed.value, packed.length);
     }
 
     iterator &operator++() {
       assert(remaining_ != 0);
-      const auto packed = PrimaryKeyList::PackedKey::Unpack(cursor_);
+      const auto packed = PrimaryKeyList::PackedKey::unpack(cursor_);
       cursor_ = packed.next;
       --remaining_;
       return *this;
@@ -360,13 +360,13 @@ class PrimaryKeyList::View {
 
   iterator begin() const {
     if (!keys_) return iterator();
-    const char *const start = keys_->PackedKeys();
+    const char *const start = keys_->packed_keys();
     return iterator(start, keys_->count);
   }
 
   iterator end() const {
     if (!keys_) return iterator();
-    return iterator(keys_->PackedKeys() + keys_->bytes, 0);
+    return iterator(keys_->packed_keys() + keys_->bytes, 0);
   }
 
   /**

@@ -268,14 +268,14 @@ bool MasstreeIndex::Purge(std::string_view key, DataItem &expected,
   return impl_->Purge(key, expected, retired_tid);
 }
 
-void MasstreeAdvanceEpoch() {
+void advance_epoch() {
   // Hold the thread-list lock while reading active epochs.
   std::lock_guard<std::mutex> lg(thread_init_mutex);
   globalepoch.store(globalepoch.load() + 1);
   active_epoch.store(threadinfo::min_active_epoch());
 }
 
-void MasstreeReleaseThreadEpoch() {
+void release_thread_epoch() {
   // Release the epoch and reclaim items whose RCU grace period has passed.
   if (tls_ti == nullptr) return;
   tls_ti->rcu_stop();

@@ -94,7 +94,7 @@ struct DuckdbFailReason {
 
 thread_local DuckdbFailReason duckdb_fail_reason;
 
-const char *GetDuckdbFailReason(THD *thd) {
+const char *get_duckdb_fail_reason(THD *thd) {
   if (thd == nullptr || duckdb_fail_reason.thd != thd ||
       duckdb_fail_reason.query_id != thd->query_id ||
       duckdb_fail_reason.reason.empty()) {
@@ -103,7 +103,7 @@ const char *GetDuckdbFailReason(THD *thd) {
   return duckdb_fail_reason.reason.c_str();
 }
 
-void SetDuckdbFailReason(THD *thd, const char *reason) {
+void set_duckdb_fail_reason(THD *thd, const char *reason) {
   if (reason == nullptr) {
     duckdb_fail_reason = {};
   } else {
@@ -113,8 +113,8 @@ void SetDuckdbFailReason(THD *thd, const char *reason) {
   }
 }
 
-bool RaiseDuckdbError(THD *thd, const char *message) {
-  SetDuckdbFailReason(thd, message);
+bool raise_duckdb_error(THD *thd, const char *message) {
+  set_duckdb_fail_reason(thd, message);
   my_error(ER_SECONDARY_ENGINE_PLUGIN, MYF(0), message);
   return true;
 }
@@ -341,7 +341,7 @@ bool RoundDecimalText(const char *ptr, size_t len, uint32_t target_scale,
 }
 
 /**
- * @brief Execute the request recorded by BuildDuckdbQueryRequest.
+ * @brief Execute the request recorded by build_olap_request.
  *
  * MySQL has already sent result-set metadata for the original SELECT list;
  * this override only ships value-only Item carriers that match it. The
@@ -352,13 +352,13 @@ bool execute_duckdb_query(JOIN *join, Query_result *result) {
   auto *ctx = static_cast<DuckdbExecutionContext *>(
       thd->lex->secondary_engine_execution_context());
   if (ctx == nullptr || !ctx->duckdb_ready) {
-    return RaiseDuckdbError(thd,
+    return raise_duckdb_error(thd,
                               "HELIOS_DUCKDB: no duckdb executor plan");
   }
 
   std::shared_ptr<HeliosProxy> proxy = helios::acquire_shared_proxy(thd);
   if (!proxy) {
-    return RaiseDuckdbError(thd, "HELIOS_DUCKDB: no server connection");
+    return raise_duckdb_error(thd, "HELIOS_DUCKDB: no server connection");
   }
 
   Helios::Protocol::TxExecuteDuckdbQuery::Response rpc;
@@ -368,7 +368,7 @@ bool execute_duckdb_query(JOIN *join, Query_result *result) {
     snprintf(message, sizeof(message), "HELIOS_DUCKDB duckdb executor: %s",
              rpc.error().empty() ? "duckdb executor RPC failed"
                                  : rpc.error().c_str());
-    return RaiseDuckdbError(thd, message);
+    return raise_duckdb_error(thd, message);
   }
 
   mem_root_deque<Item *> output_items(thd->mem_root);
@@ -398,7 +398,7 @@ bool execute_duckdb_query(JOIN *join, Query_result *result) {
   const size_t expected = 1 + values.size();
   for (const std::string &row : rpc.rows()) {
     if (!unpack_row_fields(row, &fields) || fields.size() != expected) {
-      return RaiseDuckdbError(
+      return raise_duckdb_error(
           thd,
           "HELIOS_DUCKDB duckdb executor: malformed row (DuckDB result "
           "column count may not match the original SELECT list)");
@@ -431,7 +431,7 @@ bool execute_duckdb_query(JOIN *join, Query_result *result) {
 }
 
 bool PrepareSecondaryEngine(THD *thd, LEX *lex) {
-  SetDuckdbFailReason(thd, nullptr);
+  set_duckdb_fail_reason(thd, nullptr);
   lex->add_statement_options(OPTION_NO_CONST_TABLES |
                              OPTION_NO_SUBQUERY_DURING_OPTIMIZATION);
 
@@ -445,18 +445,18 @@ bool PrepareSecondaryEngine(THD *thd, LEX *lex) {
 }
 
 bool OptimizeSecondaryEngine(THD *, LEX *lex) {
-  SetDuckdbFailReason(lex->thd, nullptr);
+  set_duckdb_fail_reason(lex->thd, nullptr);
   auto *ctx = static_cast<DuckdbExecutionContext *>(
       lex->secondary_engine_execution_context());
   if (ctx == nullptr) {
-    return RaiseDuckdbError(
+    return raise_duckdb_error(
         lex->thd, "HELIOS_DUCKDB statement context is not available");
   }
 
   Query_block *query_block = lex->unit->first_query_block();
   JOIN *join = query_block != nullptr ? query_block->join : nullptr;
   if (join == nullptr) {
-    return RaiseDuckdbError(lex->thd,
+    return raise_duckdb_error(lex->thd,
                               "HELIOS_DUCKDB unsupported shape: no JOIN");
   }
 
@@ -465,7 +465,7 @@ bool OptimizeSecondaryEngine(THD *, LEX *lex) {
     message.append(ctx->request_build_attempted
                        ? ctx->refusal
                        : std::string("request was not built before optimization"));
-    return RaiseDuckdbError(lex->thd, message.c_str());
+    return raise_duckdb_error(lex->thd, message.c_str());
   }
   ctx->duckdb_ready = true;
   join->override_executor_func = execute_duckdb_query;
@@ -535,7 +535,7 @@ bool CompareJoinCost(THD *thd, const JOIN &join, double optimizer_cost,
   return false;
 }
 
-handler *CreateDuckdbHandler(handlerton *hton, TABLE_SHARE *table_share,
+handler *create_duckdb_handler(handlerton *hton, TABLE_SHARE *table_share,
                                bool, MEM_ROOT *mem_root) {
   return new (mem_root) ha_helios_duckdb(hton, table_share);
 }
@@ -632,7 +632,7 @@ int ha_helios_duckdb::external_lock(THD *thd, int lock_type) {
       thd->lex->secondary_engine_execution_context());
   if (ctx == nullptr || ctx->request_build_attempted) return 0;
   ctx->request_build_attempted = true;
-  if (!BuildDuckdbQueryRequest(thd, thd->lex, &ctx->duckdb_request,
+  if (!build_olap_request(thd, thd->lex, &ctx->duckdb_request,
                               &ctx->refusal) &&
       ctx->refusal.empty()) {
     ctx->refusal = "request build failed";
@@ -675,7 +675,7 @@ int helios_duckdb_init(void *p) {
   loaded_tables = new LoadedTables();
 
   handlerton *hton = static_cast<handlerton *>(p);
-  hton->create = CreateDuckdbHandler;
+  hton->create = create_duckdb_handler;
   hton->state = SHOW_OPTION_YES;
   hton->flags = HTON_IS_SECONDARY_ENGINE;
   hton->db_type = DB_TYPE_UNKNOWN;
@@ -685,9 +685,9 @@ int helios_duckdb_init(void *p) {
   hton->secondary_engine_modify_access_path_cost =
       ModifyAccessPathCost;
   hton->get_secondary_engine_offload_or_exec_fail_reason =
-      GetDuckdbFailReason;
+      get_duckdb_fail_reason;
   hton->set_secondary_engine_offload_fail_reason =
-      SetDuckdbFailReason;
+      set_duckdb_fail_reason;
   hton->secondary_engine_flags =
       MakeSecondaryEngineFlags(SecondaryEngineFlag::SUPPORTS_HASH_JOIN,
                                SecondaryEngineFlag::SUPPORTS_NESTED_LOOP_JOIN);
