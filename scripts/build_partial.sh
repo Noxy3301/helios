@@ -22,3 +22,16 @@ cp -a "$ROOT_DIR"/common/. "$SE_DIR/common/"
 
 cd build
 ninja ha_helios_storage_engine.so
+
+# A shared module links with symbols left undefined, and one that nothing
+# defines fails only when mysqld loads the module. Nothing outside the
+# module defines a helios symbol, so an undefined one can never resolve.
+PLUGIN="$ROOT_DIR/build/plugin_output_directory/ha_helios_storage_engine.so"
+# Assigned on its own: inside a pipe, a failing nm would read as no undefined
+# symbols. -D reads the dynamic table, which stripping keeps.
+SYMBOLS=$(nm -DuC "$PLUGIN")
+if MISSING=$(printf '%s\n' "$SYMBOLS" | grep -i helios); then
+  echo "undefined helios symbols in $PLUGIN:" >&2
+  echo "$MISSING" >&2
+  exit 1
+fi
