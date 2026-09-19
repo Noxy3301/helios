@@ -39,6 +39,26 @@ bool parse_number(const std::string& value, uint64_t lo, uint64_t hi,
     return *out >= lo && *out <= hi;
 }
 
+/// Digits with an optional K, M or G suffix, as a positive byte count.
+bool parse_bytes(const std::string& value, uint64_t* out) {
+    if (value.empty()) return false;
+    uint64_t scale = 1;
+    switch (value.back()) {
+        case 'k':
+        case 'K': scale = 1ull << 10; break;
+        case 'm':
+        case 'M': scale = 1ull << 20; break;
+        case 'g':
+        case 'G': scale = 1ull << 30; break;
+        default: break;
+    }
+    const std::string digits =
+        scale == 1 ? value : value.substr(0, value.size() - 1);
+    if (!parse_number(digits, 1, UINT64_MAX / scale, out)) return false;
+    *out *= scale;
+    return true;
+}
+
 bool parse_bool(const std::string& value, bool* out) {
     if (value == "1" || value == "true" || value == "on") {
         *out = true;
@@ -68,7 +88,7 @@ void apply_key(const std::string& key, const std::string& value) {
         g_config.commit_durability = value;
     } else if (key == "enable_recovery") {
         if (!parse_bool(value, &g_config.enable_recovery)) {
-            refuse(key, value, "0 or 1");
+            refuse(key, value, "0 or 1, true or false, on or off");
         }
     } else if (key == "wal_initial_capacity_bytes") {
         if (!parse_number(value, 0, kMaxWalCapacityBytes, &number)) {
@@ -91,11 +111,13 @@ void apply_key(const std::string& key, const std::string& value) {
         }
         g_config.bridge_threads = number;
     } else if (key == "bridge_mem_limit") {
-        // The byte count is parsed where DuckDB is configured.
-        g_config.bridge_mem_limit = value;
+        if (!parse_bytes(value, &g_config.bridge_mem_limit_bytes)) {
+            refuse(key, value,
+                   "a positive byte count with an optional K, M or G suffix");
+        }
     } else if (key == "bridge_debug") {
         if (!parse_bool(value, &g_config.bridge_debug)) {
-            refuse(key, value, "0 or 1");
+            refuse(key, value, "0 or 1, true or false, on or off");
         }
     } else if (key == "read_view_fence_timeout_ms") {
         if (!parse_number(value, 1, UINT32_MAX, &number)) {
@@ -151,5 +173,10 @@ void load_config(const char* path) {
         }
         apply_key(trim(std::string_view(text).substr(0, separator)),
                   trim(std::string_view(text).substr(separator + 1)));
+    }
+    // A directory, or a read error mid-file, reaches here with eof unset.
+    if (!file.eof()) {
+        SPDLOG_CRITICAL("Could not read the configuration file '{}'", path);
+        std::exit(1);
     }
 }

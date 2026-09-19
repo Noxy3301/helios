@@ -33,8 +33,8 @@ checkpoint_once_after_ms = 0
 # threads, which leaves the OLTP side its cores.
 # bridge_threads = 8
 
-# DuckDB memory bound: digits with an optional K, M or G suffix; commented
-# out takes DuckDB's own default.
+# DuckDB memory bound: a positive byte count with an optional K, M or G
+# suffix. Leave the key out, rather than empty, for DuckDB's own default.
 # bridge_mem_limit = 4G
 
 # Whether the analytical bridge writes its trace lines.

@@ -13,6 +13,8 @@
 struct ServerConfig {
     /// TCP port the RPC listener binds.
     uint16_t server_port = 9999;
+    // The server passes every storage field below on, set or not, so these
+    // defaults, not the ones in helios/config.h, are what it runs under.
     /// How often the global epoch advances, in milliseconds.
     size_t epoch_duration_ms = 40;
     /// The contract every commit runs under: "sync" or "async".
@@ -27,9 +29,8 @@ struct ServerConfig {
     size_t checkpoint_once_after_ms = 0;
     /// DuckDB thread pool size; zero takes a quarter of the hardware threads.
     uint64_t bridge_threads = 0;
-    /// DuckDB memory bound, digits with an optional K, M or G suffix; empty
-    /// takes DuckDB's own default.
-    std::string bridge_mem_limit;
+    /// DuckDB memory bound in bytes; zero takes DuckDB's own default.
+    uint64_t bridge_mem_limit_bytes = 0;
     /// Whether the analytical bridge writes its trace lines.
     bool bridge_debug = false;
     /// Upper bound on the read view's epoch-fence wait, in milliseconds.
