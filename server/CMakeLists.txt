@@ -57,8 +57,8 @@ add_subdirectory(storage)
 set(SOURCES
     # Core
     main.cc
-    helios_server.cc
-    helios_server.hh
+    storage_server.cc
+    storage_server.hh
     server_config.cc
     server_config.hh
     

@@ -7,10 +7,10 @@
 #include "rpc/helios_rpc.hh"
 #include "database_manager.hh"
 
-class HeliosServer : public TcpServer {
+class StorageServer : public TcpServer {
 public:
-    HeliosServer();
-    ~HeliosServer() = default;
+    StorageServer();
+    ~StorageServer() = default;
 
     void init();
 

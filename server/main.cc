@@ -4,7 +4,7 @@
 #include <cstdlib>
 #include <string_view>
 
-#include "helios_server.hh"
+#include "storage_server.hh"
 #include "server_config.hh"
 
 int main(int argc, char** argv) {
@@ -23,9 +23,9 @@ int main(int argc, char** argv) {
 
     spdlog::set_level(spdlog::level::from_str(config().log_level));
 
-    SPDLOG_INFO("Starting Helios server...");
+    SPDLOG_INFO("Starting storage server");
 
-    HeliosServer server;
+    StorageServer server;
     server.init();
     if (!server.run()) {  // Start listening
         SPDLOG_ERROR("The server could not listen; exiting");

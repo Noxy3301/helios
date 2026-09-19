@@ -61,7 +61,7 @@ def expect_refusal(label, value):
         print(f"FAIL [{label}]: exited rc={rc} but not for the parsing reason; "
               f"output was:\n{output[-800:]}")
         return False
-    if "server initialized successfully" in output:
+    if "Storage server initialized" in output:
         print(f"FAIL [{label}]: the server finished initializing before failing; "
               f"the refusal must happen during startup")
         return False
@@ -75,7 +75,7 @@ def expect_startup(label, value, reported):
         print(f"FAIL [{label}]: startup was refused for a value that parses; "
               f"output was:\n{output[-800:]}")
         return False
-    if "server initialized successfully" not in output:
+    if "Storage server initialized" not in output:
         print(f"FAIL [{label}]: the server never finished initializing (rc={rc}); "
               f"output was:\n{output[-800:]}")
         return False

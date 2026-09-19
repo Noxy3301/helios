@@ -113,7 +113,7 @@ def expect_refusal(label, durable_epoch, conf):
         print(f"FAIL [{label}]: exited rc={rc} but not for the high-water "
               f"reason; output was:\n{output[-800:]}")
         return False
-    if "server initialized successfully" in output:
+    if "Storage server initialized" in output:
         print(f"FAIL [{label}]: the server finished initializing before failing; "
               f"the refusal must happen during startup")
         return False
@@ -134,7 +134,7 @@ def expect_startup(label, durable_epoch, conf):
         print(f"FAIL [{label}]: startup was refused for a durable epoch "
               f"nowhere near the mark; output was:\n{output[-800:]}")
         return False
-    if "server initialized successfully" not in output:
+    if "Storage server initialized" not in output:
         print(f"FAIL [{label}]: the server never finished initializing "
               f"(rc={rc}); output was:\n{output[-800:]}")
         return False
