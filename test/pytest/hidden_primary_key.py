@@ -155,9 +155,9 @@ def start_storage_server(work_dir, recovery=True):
     before the restart below; with it off the restart starts from nothing,
     which is what the reserved-but-not-durable window needs.
     """
-    conf = {"server_port": RESTART_SERVER_PORT}
+    conf = {"server_port": RESTART_SERVER_PORT, "enable_recovery": int(recovery)}
     if recovery:
-        conf.update(enable_recovery=1, commit_durability="sync")
+        conf.update(commit_durability="sync")
     path = write_conf(work_dir, **conf)
     env = dict(os.environ)
     jemalloc = "/lib/x86_64-linux-gnu/libjemalloc.so.2"

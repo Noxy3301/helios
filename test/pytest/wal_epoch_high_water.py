@@ -150,7 +150,7 @@ def main():
 
     # The scan runs under every contract, so the mode here only has to be one
     # that keeps a log; recovery is what the two cases vary.
-    off = {"commit_durability": "async"}
+    off = {"commit_durability": "async", "enable_recovery": 0}
     on = {"commit_durability": "async", "enable_recovery": 1}
 
     ok = True

@@ -19,8 +19,8 @@ def restart_services():
   # An interrupted run can leave a contract behind in the local overrides.
   if os.path.exists("helios.local.cnf"):
     os.unlink("helios.local.cnf")
-  # The storage keeps its PAX catalog and log across restarts even with
-  # recovery off, and the suite re-creates tables with different columns.
+  # The storage restores its PAX catalog and rows at startup, and the suite
+  # re-creates tables with different columns.
   # The work directory may be a link onto another volume: clear it, keep it.
   for entry in (os.scandir("helios_data") if os.path.isdir("helios_data") else []):
     shutil.rmtree(entry.path, ignore_errors=True) if entry.is_dir(follow_symlinks=False) else os.unlink(entry.path)

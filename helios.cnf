@@ -21,7 +21,7 @@ epoch_duration_ms = 40
 commit_durability = sync
 
 # Whether the log is replayed at startup.
-enable_recovery = 0
+enable_recovery = 1
 
 # How much of the log is written out and made writable in place at a time,
 # in bytes; 0 lets the file grow as written.

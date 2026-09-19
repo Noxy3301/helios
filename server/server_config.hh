@@ -22,7 +22,7 @@ struct ServerConfig {
     /// The contract every commit runs under: "sync" or "async".
     std::string commit_durability = "sync";
     /// Whether the log is replayed at startup.
-    bool enable_recovery = false;
+    bool enable_recovery = true;
     /// How much of the log is written out and made writable in place at a time.
     uint64_t wal_initial_capacity_bytes = 64ull * 1024ull * 1024ull;
     /// Milliseconds between checkpoints; zero writes none.
