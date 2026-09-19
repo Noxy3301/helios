@@ -15,7 +15,7 @@ std::string next_lexicographic_key(std::string key) {
     return {};
 }
 
-std::string_view extract_value_column(const std::string& row,
+std::string_view unpack_row_field(const std::string& row,
                                       int column_index) {
     size_t offset = 0;
     int field_index = 0;
@@ -48,22 +48,22 @@ std::string_view extract_value_column(const std::string& row,
     return {};
 }
 
-std::string encode_int_key_part(int64_t value) {
-    const auto encoded = static_cast<uint32_t>(static_cast<int32_t>(value)) ^
+std::string pack_int_key_part(int64_t value) {
+    const auto packed = static_cast<uint32_t>(static_cast<int32_t>(value)) ^
                          0x80000000U;
     std::string out;
     out.push_back(static_cast<char>(0x00));
     out.push_back(static_cast<char>(0x10));
     out.push_back(static_cast<char>(0x00));
     out.push_back(static_cast<char>(0x04));
-    out.push_back(static_cast<char>((encoded >> 24) & 0xFF));
-    out.push_back(static_cast<char>((encoded >> 16) & 0xFF));
-    out.push_back(static_cast<char>((encoded >> 8) & 0xFF));
-    out.push_back(static_cast<char>(encoded & 0xFF));
+    out.push_back(static_cast<char>((packed >> 24) & 0xFF));
+    out.push_back(static_cast<char>((packed >> 16) & 0xFF));
+    out.push_back(static_cast<char>((packed >> 8) & 0xFF));
+    out.push_back(static_cast<char>(packed & 0xFF));
     return out;
 }
 
-bool decode_leading_int_key(std::string_view key, int64_t& out) {
+bool unpack_leading_int_key(std::string_view key, int64_t& out) {
     if (key.size() < 8) return false;
     if (static_cast<uint8_t>(key[0]) != 0x00 ||
         static_cast<uint8_t>(key[1]) != 0x10 ||
@@ -72,18 +72,18 @@ bool decode_leading_int_key(std::string_view key, int64_t& out) {
         return false;
     }
 
-    const uint32_t encoded =
+    const uint32_t packed =
         (static_cast<uint32_t>(static_cast<uint8_t>(key[4])) << 24) |
         (static_cast<uint32_t>(static_cast<uint8_t>(key[5])) << 16) |
         (static_cast<uint32_t>(static_cast<uint8_t>(key[6])) << 8) |
         static_cast<uint32_t>(static_cast<uint8_t>(key[7]));
-    out = static_cast<int32_t>(encoded ^ 0x80000000U);
+    out = static_cast<int32_t>(packed ^ 0x80000000U);
     return true;
 }
 
-std::string encode_column_as_int_key(std::string_view column,
+std::string pack_column_as_int_key(std::string_view column,
                                      int64_t int_delta) {
     std::string tmp(column);
     int64_t value = std::strtoll(tmp.c_str(), nullptr, 10);
-    return encode_int_key_part(value + int_delta);
+    return pack_int_key_part(value + int_delta);
 }

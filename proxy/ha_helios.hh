@@ -263,7 +263,7 @@ private:
   void store_primary_key_in_ref(const std::string &primary_key);
   std::string extract_primary_key_from_ref(const uchar *pos) const;
   int generate_hidden_primary_key(HeliosTransaction *tx, std::string *key);
-  std::string serialize_hidden_primary_key(uint64_t row_id) const;
+  std::string pack_hidden_primary_key(uint64_t row_id) const;
   bool fill_scan_buffer();
 
   // Refill the rows buffered for index_next()/index_prev().
@@ -671,7 +671,7 @@ private:
 
   /**
    * @brief Turns one index lookup (key, keypart_map, find_flag) into
-   * current_plan_: the IndexSearchOp and the serialized start and end keys.
+   * current_plan_: the IndexSearchOp and the packed start and end keys.
    *
    * @details The plan covers the index_read_map call and the index_next,
    * index_prev and index_next_same calls that continue it.
@@ -701,10 +701,10 @@ private:
 
   std::string pack_key(const uchar *key, key_part_map keypart_map);
   /**
-   * @brief Serializes the field's current value in the order-preserving key
-   * encoding (null marker, type tag, payload) shared by every key path.
+   * @brief Packs the field's current value in the order-preserving key
+   * packing (null marker, type tag, payload) shared by every key path.
    */
-  std::string serialize_key_from_field(Field *field);
+  std::string pack_key_from_field(Field *field);
   std::string build_secondary_key_from_row(const uchar *row_buffer, const KEY &key_info);
   /**
    * @brief Key of the row in `buf`, reserving a hidden one from the storage
@@ -728,7 +728,7 @@ private:
   bool backfill_commit_chunk(std::vector<HeliosProxy::WriteOp> &ops);
 
   /**
-   * @brief Backfill the indexes in `specs` in one decode, committed on
+   * @brief Backfill the indexes in `specs` in one unpack pass, committed on
    * per-key-hash workers so no two of them mutate the same index entry.
    *
    * @return false when any worker commit fails; the caller fails the ALTER.

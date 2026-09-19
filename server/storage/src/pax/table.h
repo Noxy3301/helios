@@ -24,7 +24,7 @@ namespace pax {
  * @brief One row's values in PAX cell representation.
  * @details Typed fields hold binary values; other fields borrow the input
  * bytes. The write set owns this row until commit finishes. Input bytes and
- * the schema used by DecodeRow must remain unchanged until ScatterRow ends.
+ * the schema used by unpack_row must remain unchanged until ScatterRow ends.
  */
 struct Row {
   struct Field {
@@ -37,10 +37,10 @@ struct Row {
 };
 
 /**
- * @brief Decodes input row bytes into the cell values used by the write set.
+ * @brief Unpacks input row bytes into the cell values used by the write set.
  * @return False if the input cannot be represented by the schema; discard out.
  */
-bool DecodeRow(const TableSchema &schema, const std::byte *value, size_t size,
+bool unpack_row(const TableSchema &schema, const std::byte *value, size_t size,
                Row &out);
 
 /**

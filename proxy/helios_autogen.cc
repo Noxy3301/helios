@@ -712,43 +712,43 @@ bool compile_index_search(TABLE *table, uint index,
 
   switch (search.op) {
     case IndexSearchOp::kUniquePoint:
-      if (search.start_key_serialized.empty()) {
+      if (search.packed_start_key.empty()) {
         return false;
       }
       if (is_primary) {
         step->is_scan = false;
-        step->key_prefix = search.start_key_serialized;
+        step->key_prefix = search.packed_start_key;
       } else {
-        set_scan(search.start_key_serialized,
+        set_scan(search.packed_start_key,
                  key_pack::build_prefix_range_end(
-                     search.start_key_serialized));
+                     search.packed_start_key));
       }
       return true;
 
     case IndexSearchOp::kSameKey:
     case IndexSearchOp::kPrefixFirst:
-      if (search.same_group_prefix_serialized.empty()) {
+      if (search.packed_same_key_prefix.empty()) {
         return false;
       }
-      set_scan(search.same_group_prefix_serialized,
-               search.same_group_end_serialized);
+      set_scan(search.packed_same_key_prefix,
+               search.packed_same_key_end);
       return true;
 
     case IndexSearchOp::kRangeScan: {
-      if (search.start_key_serialized.empty()) {
+      if (search.packed_start_key.empty()) {
         return false;
       }
-      std::string start = search.start_key_serialized;
+      std::string start = search.packed_start_key;
       if (search.find_flag == HA_READ_AFTER_KEY) start.push_back('\0');
-      set_scan(start, search.end_key_serialized);
+      set_scan(start, search.packed_end_key);
       return true;
     }
 
     case IndexSearchOp::kIndexFirst:
-      if (search.end_key_serialized.empty()) {
+      if (search.packed_end_key.empty()) {
         return false;
       }
-      set_scan("", search.end_key_serialized);
+      set_scan("", search.packed_end_key);
       return true;
 
     case IndexSearchOp::kPrevKey:

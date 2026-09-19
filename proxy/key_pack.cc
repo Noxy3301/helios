@@ -121,7 +121,7 @@ std::string ha_helios::build_prefix_range_end(const std::string &prefix) {
   return key_pack::build_prefix_range_end(prefix);
 }
 
-std::string ha_helios::serialize_key_from_field(Field *field) {
+std::string ha_helios::pack_key_from_field(Field *field) {
   const bool is_null = field->is_null();
   enum_field_types mysql_type = field->type();
   HeliosFieldType helios_type = convert_mysql_type_to_helios(mysql_type);
@@ -211,8 +211,8 @@ std::string ha_helios::build_secondary_key_from_row(const uchar *row_buffer,
     // Adjust the Field pointer to match row_buffer
     field->move_field_offset(offset);
 
-    // Serialize each key part and concatenate
-    secondary_key += serialize_key_from_field(field);
+    // Pack each key part and concatenate
+    secondary_key += pack_key_from_field(field);
 
     // Restore the Field pointer back to original position
     field->move_field_offset(-offset);
@@ -294,7 +294,7 @@ static constexpr uint32_t kHiddenKeyRangeSize = 1000;
 // Mirrors HiddenKeyAllocator::kMaxCount, which the proxy cannot include
 static constexpr uint32_t kHiddenKeyMaxRange = 65536;
 
-std::string ha_helios::serialize_hidden_primary_key(uint64_t row_id) const {
+std::string ha_helios::pack_hidden_primary_key(uint64_t row_id) const {
   std::ostringstream oss;
   oss << std::hex << std::setw(16) << std::setfill('0') << row_id;
   return oss.str();
@@ -363,7 +363,7 @@ int ha_helios::generate_hidden_primary_key(HeliosTransaction *tx,
   }
 
   ++bulk_insert_generated_;
-  *key = serialize_hidden_primary_key(share->hidden_keys.next++);
+  *key = pack_hidden_primary_key(share->hidden_keys.next++);
   return 0;
 }
 
@@ -392,7 +392,7 @@ std::string ha_helios::extract_key_from_mysql(const uchar *row_buffer) {
     Field *field = table->field[field_index];
 
     field->move_field_offset(offset);
-    complete_key += serialize_key_from_field(field);
+    complete_key += pack_key_from_field(field);
     field->move_field_offset(-offset);
   }
 

@@ -4,7 +4,7 @@
 #include <string>
 #include <string_view>
 
-// Byte-level encode/decode helpers shared across the RPC handlers:
+// Byte-level pack/unpack helpers shared across the RPC handlers:
 // HeliosField-format row access plus the int-keyed primary-key layout
 // mirrored from the proxy.
 
@@ -13,7 +13,7 @@ std::string next_lexicographic_key(std::string key);
 
 // Bytes of one column of a serialized row [null_flags][col_0]..[col_n], each
 // field [byteSize:1B][len:byteSize B][bytes], byteSize 0xFF meaning NULL.
-std::string_view extract_value_column(const std::string& row,
+std::string_view unpack_row_field(const std::string& row,
                                       int column_index);
 
 /**
@@ -23,10 +23,10 @@ std::string_view extract_value_column(const std::string& row,
  * signed int with the top bit flipped], the layout ha_helios writes, so
  * byte-wise order matches signed integer order.
  */
-std::string encode_int_key_part(int64_t value);
+std::string pack_int_key_part(int64_t value);
 
-bool decode_leading_int_key(std::string_view key, int64_t& out);
+bool unpack_leading_int_key(std::string_view key, int64_t& out);
 
-// Parse a decimal-string column and encode it as int-keyed primary key bytes.
-std::string encode_column_as_int_key(std::string_view column,
+// Parse a decimal-string column and pack it as int-keyed primary key bytes.
+std::string pack_column_as_int_key(std::string_view column,
                                      int64_t int_delta);

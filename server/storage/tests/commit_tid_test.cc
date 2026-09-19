@@ -107,7 +107,7 @@ class CommitTidTest : public ::testing::Test {
     auto *item = table->GetPrimaryIndex().GetOrInsert(key);
     const std::string bytes = TestHelper::Row(key);
     pax::Row row;
-    EXPECT_TRUE(pax::DecodeRow(
+    EXPECT_TRUE(pax::unpack_row(
         table->GetPaxTable()->schema(),
         reinterpret_cast<const std::byte *>(bytes.data()), bytes.size(), row));
     EXPECT_TRUE(item->AllocateSlot(*table->GetPaxTable()));

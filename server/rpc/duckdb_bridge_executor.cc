@@ -12,7 +12,7 @@
 // Consistency: the request runs against a columnar read view with snapshot
 // epoch se (Database::OpenPaxView). A slot that holds an epoch image resolves
 // through it (the oldest image with epoch > se is the value the slot held at
-// se); every other slot is bulk-decoded in place. Before each output chunk is
+// se); every other slot is bulk-unpacked in place. Before each output chunk is
 // released, the preserve counter of every group that contributed in-place rows
 // to it is re-read; a counter that moved rewinds that group's rows of this
 // chunk and re-reads its slots one at a time from a fresh image copy. The
@@ -66,11 +66,11 @@ using pax::PaxGroup;
 using pax::PaxTable;
 
 // ---------------------------------------------------------------------------
-// Proxy row-format encoding.
+// Proxy row-format packing.
 // ---------------------------------------------------------------------------
 
 /**
- * @brief Number of little-endian bytes needed to encode `length`.
+ * @brief Number of little-endian bytes needed to pack `length`.
  */
 uint32_t LengthPrefixBytes(uint32_t length) {
   uint32_t prefix_bytes = 0;
@@ -80,7 +80,7 @@ uint32_t LengthPrefixBytes(uint32_t length) {
 
 /**
  * @brief Appends one field in the proxy row format (matches
- * proxy/ha_helios_columnar.cc's DecodeRowFields).
+ * proxy/ha_helios_columnar.cc's unpack_row_fields).
  *
  * @details One byte length-width tag (0xFF for a field with no payload),
  * then that many little-endian length bytes, then the payload. A zero-length
@@ -123,9 +123,9 @@ bool BridgeDebugEnabled() { return config().bridge_debug; }
 uint32_t FenceTimeoutMs() { return config().read_view_fence_timeout_ms; }
 
 // ---------------------------------------------------------------------------
-// Proxy row-format decoding, for epoch images. A preserved old_row is a proxy
+// Proxy row-format unpacking, for epoch images. A preserved old_row is a proxy
 // row payload whose typed fields carry val_str ASCII; the parsers mirror the
-// scatter-side codec, and a decode failure is a broken invariant and throws.
+// scatter-side packing, and a failure is a broken invariant and throws.
 // ---------------------------------------------------------------------------
 
 /**
@@ -293,7 +293,7 @@ struct PaxTableView {
 
 // ---------------------------------------------------------------------------
 // DuckDB table function over PaxTableView: parallel scan, projection
-// pushdown, bulk decode for typed columns, inline string_t for short strings.
+// pushdown, bulk unpack for typed columns, inline string_t for short strings.
 // ---------------------------------------------------------------------------
 
 using duckdb::ClientContext;
@@ -363,7 +363,7 @@ struct PaxLocalState : public LocalTableFunctionState {
   bool has_images = false;
   uint64_t imaged[PaxGroup::kRows / PaxGroup::kVisibilityWordBits] = {};
   std::unordered_map<uint32_t, std::vector<pax::EpochImage>> images;
-  // Scratch for decoding one epoch image row into output vectors.
+  // Scratch for unpacking one epoch image row into output vectors.
   std::vector<std::pair<const char*, uint32_t>> field_refs;
 };
 
@@ -624,13 +624,13 @@ inline void WriteDecimalPhysical(Vector& output_vector, idx_t row,
 }
 
 /**
- * @brief Decodes a run of DEC64 cells into the vector's physical type.
+ * @brief Unpacks a run of DEC64 cells into the vector's physical type.
  *
  * @details The data pointer is fetched once per run; DuckDB's GetData checks
  * the vector type on every call.
  */
 template <class T>
-void DecodeDecimalRun(const std::byte* src, uint32_t stride, uint32_t width,
+void unpack_decimal_run(const std::byte* src, uint32_t stride, uint32_t width,
                       uint32_t count, Vector& output_vector, idx_t out_base) {
   T* dst = FlatVector::GetData<T>(output_vector) + out_base;
   for (uint32_t i = 0; i < count; i++, src += stride) {
@@ -648,7 +648,7 @@ void DecodeDecimalRun(const std::byte* src, uint32_t stride, uint32_t width,
 }
 
 /**
- * @brief Bulk-decodes one typed (non-UNTYPED) column across a contiguous run
+ * @brief Bulk-unpacks one typed (non-UNTYPED) column across a contiguous run
  * of visible slots.
  *
  * @details A typed cell is [u16 len][fixed-width LE payload]; a length equal
@@ -657,7 +657,7 @@ void DecodeDecimalRun(const std::byte* src, uint32_t stride, uint32_t width,
  * `invalid_dates` rather than raising, leaving the verdict to the chunk
  * validation.
  */
-void BulkDecodeTyped(FieldType type, const PaxGroup& group, size_t field,
+void unpack_typed_run(FieldType type, const PaxGroup& group, size_t field,
                      uint32_t width, uint32_t slot_start, uint32_t count,
                      Vector& output_vector, idx_t out_base,
                      PhysicalType decimal_physical_type,
@@ -717,19 +717,19 @@ void BulkDecodeTyped(FieldType type, const PaxGroup& group, size_t field,
     case FieldType::kDecimal64:
       switch (decimal_physical_type) {
         case PhysicalType::INT16:
-          DecodeDecimalRun<int16_t>(src, stride, width, count, output_vector,
+          unpack_decimal_run<int16_t>(src, stride, width, count, output_vector,
                                     out_base);
           break;
         case PhysicalType::INT32:
-          DecodeDecimalRun<int32_t>(src, stride, width, count, output_vector,
+          unpack_decimal_run<int32_t>(src, stride, width, count, output_vector,
                                     out_base);
           break;
         case PhysicalType::INT64:
-          DecodeDecimalRun<int64_t>(src, stride, width, count, output_vector,
+          unpack_decimal_run<int64_t>(src, stride, width, count, output_vector,
                                     out_base);
           break;
         default:
-          DecodeDecimalRun<hugeint_t>(src, stride, width, count, output_vector,
+          unpack_decimal_run<hugeint_t>(src, stride, width, count, output_vector,
                                       out_base);
           break;
       }
@@ -740,13 +740,13 @@ void BulkDecodeTyped(FieldType type, const PaxGroup& group, size_t field,
 }
 
 /**
- * @brief Decodes one untyped cell into a VARCHAR vector slot.
+ * @brief Unpacks one untyped cell into a VARCHAR vector slot.
  *
  * @details A zero-length cell is SQL NULL only when the row's null-flags
  * field marks the column so, and the empty string otherwise; short payloads
  * inline into string_t, longer ones copy into the vector's string heap.
  */
-inline void DecodeUntypedCell(const PaxGroup& group, size_t field,
+inline void unpack_untyped_cell(const PaxGroup& group, size_t field,
                               uint32_t slot, bool is_null,
                               Vector& output_vector, idx_t out_row) {
   if (is_null) {
@@ -789,7 +789,7 @@ inline bool CellIsNull(std::string_view null_flags,
 }
 
 /**
- * @brief Decodes one slot's projected columns from the strip cells into
+ * @brief Unpacks one slot's projected columns from the strip cells into
  * chunk row `out_row`.
  *
  * @details Clears each column's validity first: per-slot resolution may
@@ -805,11 +805,11 @@ void EmitInPlaceRow(const PaxGroup& group,
     const ColumnContext& column = scan_columns[i];
     FlatVector::SetNull(output.data[i], out_row, false);
     if (column.type == FieldType::kUntyped) {
-      DecodeUntypedCell(group, column.field, slot,
+      unpack_untyped_cell(group, column.field, slot,
                         CellIsNull(null_flags, column), output.data[i],
                         out_row);
     } else {
-      BulkDecodeTyped(column.type, group, column.field, column.width, slot, 1,
+      unpack_typed_run(column.type, group, column.field, column.width, slot, 1,
                       output.data[i], out_row, column.decimal_physical_type,
                       invalid_dates);
     }
@@ -817,7 +817,7 @@ void EmitInPlaceRow(const PaxGroup& group,
 }
 
 /**
- * @brief Decodes one epoch image into chunk row `out_row`.
+ * @brief Unpacks one epoch image into chunk row `out_row`.
  *
  * @details The image is a proxy row payload whose typed fields carry val_str
  * ASCII (the gather round-trip contract); parse failures throw because an
@@ -906,7 +906,7 @@ void EmitImageRow(const std::string& old_row,
  *
  * @details Threads claim whole groups from the shared next_group counter.
  * Slots the claimed image copy marks emit their image for the snapshot epoch;
- * the rest decode contiguous visible-slot runs column-at-a-time. The group's
+ * the rest unpack contiguous visible-slot runs column-at-a-time. The group's
  * preserve counter is re-read before the chunk is released, and a counter
  * that moved rewinds this call's rows of that group and re-reads its slots
  * one at a time (see the file header).
@@ -1124,12 +1124,12 @@ void PaxScan(ClientContext&, TableFunctionInput& data, DataChunk& output) {
         const ColumnContext& column = scan_columns[i];
         if (column.type == FieldType::kUntyped) {
           for (uint32_t row = 0; row < run_length; row++) {
-            DecodeUntypedCell(*group, column.field, slot + row,
+            unpack_untyped_cell(*group, column.field, slot + row,
                               CellIsNull(group->cell(0, slot + row), column),
                               output.data[i], rows_emitted + row);
           }
         } else {
-          BulkDecodeTyped(column.type, *group, column.field, column.width, slot,
+          unpack_typed_run(column.type, *group, column.field, column.width, slot,
                           run_length, output.data[i], rows_emitted,
                           column.decimal_physical_type, &invalid_dates);
         }
@@ -1148,7 +1148,7 @@ void PaxScan(ClientContext&, TableFunctionInput& data, DataChunk& output) {
 }
 
 /**
- * @brief Encodes one result row into the proxy row format.
+ * @brief Packs one result row into the proxy row format.
  *
  * @details Uses DuckDB's own Value::ToString(): an exact fixed-point
  * representation for DECIMAL (no precision loss) and ISO "YYYY-MM-DD" for
@@ -1169,7 +1169,7 @@ void PaxScan(ClientContext&, TableFunctionInput& data, DataChunk& output) {
  * integer arithmetic (DuckDB extension or server-side) instead of trusting
  * the DOUBLE result.
  */
-void EncodeRow(duckdb::MaterializedQueryResult& result, idx_t row_index,
+void pack_row(duckdb::MaterializedQueryResult& result, idx_t row_index,
                std::string* out) {
   // Field 0 is the row null-flags field: bit i of byte i / 8 marks output
   // column i NULL. A NULL and an empty string are both zero-length fields,
@@ -1495,7 +1495,7 @@ void ExecuteDuckdbQuery(
         return;
       }
       // The wire descriptor drives strip access; a shape that disagrees
-      // with the store's own schema would read out of bounds or decode a
+      // with the store's own schema would read out of bounds or unpack a
       // cell under the wrong width. Field 0 is the row null-flags field.
       const auto& schema = pax::Schema(table);
       if (schema.field_count() !=
@@ -1587,7 +1587,7 @@ void ExecuteDuckdbQuery(
 
     std::string row;
     for (idx_t row_index = 0; row_index < result->RowCount(); row_index++) {
-      EncodeRow(*result, row_index, &row);
+      pack_row(*result, row_index, &row);
       response->add_rows(std::move(row));
     }
     response->set_ok(true);

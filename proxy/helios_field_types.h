@@ -23,12 +23,12 @@ constexpr uint32_t DEC64 = 4;                   // 8-byte LE scaled int (DEC64)
 }  // namespace pax_kind
 
 /**
- * @brief Computes PAX cell widths, kinds, and scales for the encoded row
+ * @brief Computes PAX cell widths, kinds, and scales for the packed row
  * fields of `table`.
  *
  * @details Helios rows store each MySQL field as the string payload
  * produced by Field::val_str(). The returned vector contains one maximum
- * payload width per encoded row field: entry 0 is the row null-flags field,
+ * payload width per packed row field: entry 0 is the row null-flags field,
  * and the remaining entries follow TABLE::field order. For an UNTYPED field
  * the width is a safe upper bound on the val_str bytes; for a typed field
  * (INT family, DATE) the width is the fixed binary payload width (4/8) and
@@ -42,7 +42,7 @@ constexpr uint32_t DEC64 = 4;                   // 8-byte LE scaled int (DEC64)
  * stored PAX cells recomputes them rather than reading them back from the
  * server.
  *
- * @param table Table whose encoded row fields are described.
+ * @param table Table whose packed row fields are described.
  * @param kinds When non-null, receives one pax_kind value per returned width.
  * @param scales When non-null, receives one decimal scale per returned width
  * (nonzero only for DEC64).

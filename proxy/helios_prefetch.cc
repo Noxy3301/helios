@@ -53,8 +53,8 @@ bool thd_can_use_prefetch(THD *thd) {
   }
 }
 
-// Encode one integer DSL key part into the same bytes as handler keys
-static std::string encode_plan_int_key_part(int64_t value, int size = 4) {
+// Pack one integer DSL key part into the same bytes as handler keys
+static std::string pack_plan_int_key_part(int64_t value, int size = 4) {
   uint64_t raw = 0;
   uint64_t sign_mask = 0;
 
@@ -82,20 +82,20 @@ static std::string encode_plan_int_key_part(int64_t value, int size = 4) {
       break;
   }
 
-  const uint64_t encoded = raw ^ sign_mask;
+  const uint64_t packed = raw ^ sign_mask;
   std::string out;
   out.push_back(static_cast<char>(kKeyMarkerNotNull));
   out.push_back(static_cast<char>(kKeyTypeInt));
   out.push_back(static_cast<char>((size >> 8) & 0xFF));
   out.push_back(static_cast<char>(size & 0xFF));
   for (int i = size - 1; i >= 0; --i) {
-    out.push_back(static_cast<char>((encoded >> (i * 8)) & 0xFF));
+    out.push_back(static_cast<char>((packed >> (i * 8)) & 0xFF));
   }
   return out;
 }
 
-// Encode one string DSL key part into the same bytes as handler keys
-static std::string encode_plan_string_key_part(const std::string& value) {
+// Pack one string DSL key part into the same bytes as handler keys
+static std::string pack_plan_string_key_part(const std::string& value) {
   std::string out;
   out.push_back(static_cast<char>(kKeyMarkerNotNull));
   out.push_back(static_cast<char>(kKeyTypeString));
@@ -114,8 +114,8 @@ static bool try_parse_plan_int(const std::string& text, int64_t *value) {
   return end == text.c_str() + text.size();
 }
 
-// Encode one DSL segment: 42=INT, 42t=TINYINT, 42s=SMALLINT, 42l=BIGINT
-static std::string encode_plan_key_segment(const std::string& segment) {
+// Pack one DSL segment: 42=INT, 42t=TINYINT, 42s=SMALLINT, 42l=BIGINT
+static std::string pack_plan_key_segment(const std::string& segment) {
   if (segment.empty()) return {};
 
   int int_size = 4;
@@ -137,9 +137,9 @@ static std::string encode_plan_key_segment(const std::string& segment) {
 
   int64_t int_value = 0;
   if (try_parse_plan_int(number, &int_value)) {
-    return encode_plan_int_key_part(int_value, int_size);
+    return pack_plan_int_key_part(int_value, int_size);
   }
-  return encode_plan_string_key_part(segment);
+  return pack_plan_string_key_part(segment);
 }
 
 static std::vector<std::string> split_plan_text(const std::string& text,
@@ -247,9 +247,9 @@ static void append_plan_key_token(HeliosProxy::ReadPlanStep *step,
   }
 
   if (end_key) {
-    step->end_key_prefix += encode_plan_key_segment(token);
+    step->end_key_prefix += pack_plan_key_segment(token);
   } else {
-    step->key_prefix += encode_plan_key_segment(token);
+    step->key_prefix += pack_plan_key_segment(token);
   }
 }
 

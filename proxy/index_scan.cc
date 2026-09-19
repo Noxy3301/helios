@@ -74,7 +74,7 @@ bool ha_helios::refill_index_cursor(HeliosTransaction *tx) {
     } else {
       index_cursor_start_key_ = key_values.back().first;
       // Helios ranges are [start,end). Appending NUL is the smallest bound
-      // strictly greater than this complete serialized index key.
+      // strictly greater than this complete packed index key.
       index_cursor_start_key_.push_back('\0');
     }
     index_cursor_at_eof_ = fetched < INDEX_CURSOR_BATCH_SIZE;
@@ -101,7 +101,7 @@ bool ha_helios::refill_index_scan(HeliosTransaction *tx) {
 
   // The cached scan stopped at its last key; ask the storage for the rest of the
   // range the statement wanted. Helios ranges are [start, end), so the
-  // smallest key above a complete serialized key is that key plus NUL.
+  // smallest key above a complete packed key is that key plus NUL.
   std::string start_key = secondary_index_results_.back();
   start_key.push_back('\0');
 

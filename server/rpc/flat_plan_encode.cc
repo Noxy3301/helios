@@ -34,7 +34,7 @@ struct CountSink {
 };
 
 template <class Sink>
-void encode_step(
+void pack_step(
     const Helios::Protocol::TxExecuteReadPlan::StepResult& s, Sink& out) {
     w_u8(out, s.found() ? 1 : 0);
     w_u64(out, s.tid());
@@ -59,11 +59,11 @@ void encode_step(
 }
 }  // namespace
 
-void encode_to_string(Helios::Protocol::TxExecuteReadPlan::Response& r,
+void pack(Helios::Protocol::TxExecuteReadPlan::Response& r,
                       std::string& out) {
     CountSink count;
     count.n = 8 + 1 + 8;  // magic + ok + result count
-    for (const auto& s : r.results()) encode_step(s, count);
+    for (const auto& s : r.results()) pack_step(s, count);
 
     out.clear();
     out.reserve(count.n);
@@ -71,7 +71,7 @@ void encode_to_string(Helios::Protocol::TxExecuteReadPlan::Response& r,
     w_u8(out, r.ok() ? 1 : 0);
     w_u64(out, static_cast<uint64_t>(r.results_size()));
     for (int i = 0; i < r.results_size(); ++i) {
-        encode_step(r.results(i), out);
+        pack_step(r.results(i), out);
         r.mutable_results(i)->Clear();
     }
 }

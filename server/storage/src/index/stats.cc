@@ -20,7 +20,7 @@ namespace helios::storage {
 
 namespace {
 
-// Encoded SQL keys start with a null marker below 0xff, so this bounds them.
+// Packed SQL keys start with a null marker below 0xff, so this bounds them.
 constexpr size_t kSupremumSize = 16;
 const std::string kSupremum(kSupremumSize, '\xff');
 

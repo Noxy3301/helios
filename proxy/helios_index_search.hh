@@ -37,13 +37,13 @@ struct IndexSearchPlan
     bool has_nullable_parts = false; // HA_NULL_PART_KEY
     enum ha_rkey_function find_flag = HA_READ_KEY_EXACT;
 
-    // boundary information (serialized)
-    std::string start_key_serialized;
-    std::string end_key_serialized;
+    // boundary information (packed)
+    std::string packed_start_key;
+    std::string packed_end_key;
 
     // same group boundary (for index_next_same)
-    std::string same_group_prefix_serialized;
-    std::string same_group_end_serialized;
+    std::string packed_same_key_prefix;
+    std::string packed_same_key_end;
 
     void reset()
     {
@@ -54,10 +54,10 @@ struct IndexSearchPlan
         is_unique_index = false;
         has_nullable_parts = false;
         find_flag = HA_READ_KEY_EXACT;
-        start_key_serialized.clear();
-        end_key_serialized.clear();
-        same_group_prefix_serialized.clear();
-        same_group_end_serialized.clear();
+        packed_start_key.clear();
+        packed_end_key.clear();
+        packed_same_key_prefix.clear();
+        packed_same_key_end.clear();
     }
 };
 

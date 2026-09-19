@@ -23,7 +23,7 @@ namespace {
 // little-endian length bytes, then the payload. Width 0xFF marks an empty
 // field; the first field carries the row's SQL NULL flags.
 //
-// DecodeRow converts typed fields from text to fixed-width binary values.
+// unpack_row converts typed fields from text to fixed-width binary values.
 // ScatterRow copies those values into PAX; GatherRow restores the input bytes.
 // Values are rejected if parsing fails, they exceed the supported range, or
 // gathering would change their bytes.
@@ -243,7 +243,7 @@ void AppendField(std::string &out, std::string_view payload) {
  * @return Number of fields read, or `SIZE_MAX` when the input is malformed
  * or contains more than `max_fields` fields.
  */
-size_t UnpackRow(const std::byte *row, size_t size, Row::Field *out,
+size_t split_row_fields(const std::byte *row, size_t size, Row::Field *out,
                  size_t max_fields) {
   size_t off = 0;
   size_t n = 0;
@@ -272,12 +272,14 @@ size_t UnpackRow(const std::byte *row, size_t size, Row::Field *out,
 
 }  // namespace
 
-bool DecodeRow(const TableSchema &schema, const std::byte *value, size_t size,
+bool unpack_row(const TableSchema &schema, const std::byte *value, size_t size,
                Row &out) {
   const size_t fields = schema.field_count();
   if (fields == 0) return false;
   out.fields.resize(fields);
-  if (UnpackRow(value, size, out.fields.data(), fields) != fields) return false;
+  if (split_row_fields(value, size, out.fields.data(), fields) != fields) {
+    return false;
+  }
 
   // Keep the conversion result so installation only copies prepared cells.
   for (size_t f = 0; f < fields; ++f) {

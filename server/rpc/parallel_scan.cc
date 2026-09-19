@@ -77,8 +77,8 @@ bool parallel_primary_pax_row_ref_scan(
         int64_t hi = 0;
         if (max_threads > 1 && first.ok && !first.rows.empty() && last.ok &&
             !last.rows.empty() &&
-            decode_leading_int_key(first.rows.front().key, lo) &&
-            decode_leading_int_key(last.rows.front().key, hi) && hi > lo) {
+            unpack_leading_int_key(first.rows.front().key, lo) &&
+            unpack_leading_int_key(last.rows.front().key, hi) && hi > lo) {
           const uint64_t span = static_cast<uint64_t>(hi - lo) + 1;
           constexpr uint64_t kMinParallelRows = 500000;
           constexpr uint64_t kMorselRows = 128000;
@@ -98,10 +98,10 @@ bool parallel_primary_pax_row_ref_scan(
                         : lo + static_cast<int64_t>((span * (i + 1)) /
                                                     worker_count);
                 starts[i] =
-                    i == 0 ? start_key : encode_int_key_part(begin_value);
+                    i == 0 ? start_key : pack_int_key_part(begin_value);
                 ends[i] = i + 1 == worker_count
                               ? end_key
-                              : encode_int_key_part(end_value);
+                              : pack_int_key_part(end_value);
               }
 
               chunks = std::vector<RefChunkOut>(worker_count);

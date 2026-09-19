@@ -360,7 +360,7 @@ void HeliosTransaction::execute_read_plan(
     return;
   }
 
-  // Consume each decoded step destructively: move strings into local caches,
+  // Consume each unpacked step destructively: move strings into local caches,
   // then release the step before caching the next one.
   for (size_t i = 0; i < result.steps.size() && i < steps.size(); ++i) {
     const auto& step = steps[i];
@@ -576,7 +576,7 @@ HeliosTransaction::get_matching_keys_and_values_in_range(std::string start_key,
                                                             bool *served_truncated) {
   if (served_truncated != nullptr) *served_truncated = false;
   if (table_is_not_chosen()) return {};
-  // An empty end is not a range the server answers; real encoded keys begin
+  // An empty end is not a range the server answers; real packed keys begin
   // with a null marker and sort below the sentinel.
   if (end_key.empty()) end_key = key_pack::scan_end_sentinel();
 

@@ -8,13 +8,13 @@
 namespace flat_plan {
 
 /**
- * @brief Encode a read-plan response into the flat payload format.
+ * @brief Pack a read-plan response into the flat payload format.
  *
- * This is destructive: each StepResult is released after encoding so large
+ * This is destructive: each StepResult is released after packing so large
  * read-plan responses do not keep both protobuf rows and the flat payload
  * alive.
  */
-void encode_to_string(Helios::Protocol::TxExecuteReadPlan::Response& r,
+void pack(Helios::Protocol::TxExecuteReadPlan::Response& r,
                       std::string& out);
 
 }  // namespace flat_plan

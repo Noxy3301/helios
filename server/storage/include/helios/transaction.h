@@ -139,14 +139,14 @@ class Transaction {
                  std::vector<std::string_view> primary_keys);
 
   /**
-   * @brief Decodes the row and merges it into its record's pending update.
+   * @brief Unpacks the row and merges it into its record's pending update.
    *
    * @details `row_bytes` holds packed bytes matching the table's installed PAX
    * schema, and is ignored for a kDelete. Later writes to one key replace the
    * value; if the record's first operation was INSERT, Commit keeps checking
    * that the row is absent.
    * @return false with reason `write_table_missing`, `pax_schema_missing`,
-   * `pax_row_decode_failed`, or @ref kDuplicatePrimaryKeyAbortReason for an
+   * `pax_row_unpack_failed`, or @ref kDuplicatePrimaryKeyAbortReason for an
    * INSERT after a pending live row. Nothing is claimed on false.
    */
   bool Write(std::string_view table_name, std::string_view key,
@@ -210,7 +210,7 @@ class Transaction {
   };
 
   struct RowUpdate {
-    pax::Row row;  ///< Decoded value; unused for DELETE.
+    pax::Row row;  ///< Unpacked value; unused for DELETE.
     /// The table's PAX store, checked non-null at Write.
     pax::PaxTable *store;
     RowOp op;

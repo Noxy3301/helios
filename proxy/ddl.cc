@@ -111,7 +111,7 @@ std::vector<uint32_t> compute_pax_field_widths(
         break;
       case MYSQL_TYPE_NEWDECIMAL: {
         // Sign + decimal point slack for the UNTYPED bound, kept as the fallback
-        // width when the value is not encoded as a scaled int64 below.
+        // width when the value is not packed as a scaled int64 below.
         width += 2;
         // A fixed-scale DECIMAL(p,s) becomes an 8-byte decimal cell holding
         // value * 10^s. Precision <= 15 keeps the scaled int64 and both 10^s
@@ -193,22 +193,22 @@ int ha_helios::open(const char *table_name, int, uint, const dd::Table *) {
     // length) and STRING one more terminator; key_length counts neither.
     uint pk_index = table->s->primary_key;
     KEY *pk = &table->key_info[pk_index];
-    size_t encoded_pk_size = 0;
+    size_t packed_pk_size = 0;
     for (uint i = 0; i < pk->user_defined_key_parts; i++) {
       KEY_PART_INFO *part = &pk->key_part[i];
       Field *field = part->field;
       HeliosFieldType helios_type = convert_mysql_type_to_helios(field->type());
       if (helios_type == HeliosFieldType::HELIOS_STRING) {
         // STRING: marker(1) + type(1) + payload + terminator(1) + length(2)
-        encoded_pk_size += 5 + part->length;
+        packed_pk_size += 5 + part->length;
       } else {
         // INT/DATETIME/OTHER: marker(1) + type(1) + length(2) + payload
-        encoded_pk_size += 4 + field->pack_length();
+        packed_pk_size += 4 + field->pack_length();
       }
     }
-    ref_length = sizeof(uint16_t) + encoded_pk_size;
+    ref_length = sizeof(uint16_t) + packed_pk_size;
   } else {
-    ref_length = sizeof(uint16_t) + serialize_hidden_primary_key(0).size();
+    ref_length = sizeof(uint16_t) + pack_hidden_primary_key(0).size();
   }
 
   return 0;
@@ -336,8 +336,8 @@ bool ha_helios::backfill_commit_chunk(
 bool ha_helios::backfill_indexes_parallel(
     std::vector<std::pair<std::string, std::string>> &rows,
     const std::vector<std::pair<std::string, const KEY *>> &specs) {
-  // Phase A: decode each row once, build one write per index, and bucket it by
-  // secondary-key hash. Single-threaded -- decode uses the shared record buffer.
+  // Phase A: unpack each row once, build one write per index, and bucket it by
+  // secondary-key hash. Single-threaded: unpack uses the shared record buffer.
   std::vector<std::vector<HeliosProxy::WriteOp>> partition(
       kBackfillParallelWorkers);
   // Reserve each bucket to its expected hash share so the per-row push_back
@@ -351,12 +351,12 @@ bool ha_helios::backfill_indexes_parallel(
     for (auto &bucket : partition) bucket.reserve(reserve_per_bucket);
   }
   std::hash<std::string> hasher;
-  bool decode_failed = false;
+  bool unpack_failed = false;
   for (auto &row : rows) {
     if (row.second.empty()) continue;
     const auto *value = reinterpret_cast<const std::byte *>(row.second.data());
     if (set_fields_from_helios(table->record[0], value, row.second.size())) {
-      decode_failed = true;
+      unpack_failed = true;
       break;
     }
     for (const auto &spec : specs) {
@@ -372,7 +372,7 @@ bool ha_helios::backfill_indexes_parallel(
     }
   }
   blobroot.Clear();
-  if (decode_failed) return false;
+  if (unpack_failed) return false;
 
   // Phase B: one worker per key-hash partition on its own connection, so no
   // two workers mutate the same index entry. Workers touch no MySQL state; a
@@ -471,7 +471,7 @@ bool ha_helios::inplace_alter_table(TABLE *altered_table,
   if (altered_table == nullptr || altered_table->s == nullptr) return true;
 
   // Non-unique indexes are collected and backfilled together below so a single
-  // scan and decode pass feeds them all. A unique index keeps the buffered
+  // scan and unpack pass feeds them all. A unique index keeps the buffered
   // commit path (its in-write duplicate check) and is backfilled serially.
   std::vector<std::pair<std::string, const KEY *>> nu_specs;
   for (uint i = 0; i < ha_alter_info->index_add_count; i++) {
@@ -484,7 +484,7 @@ bool ha_helios::inplace_alter_table(TABLE *altered_table,
         (key_info->flags & HA_NOSAME) ? kUniqueSecondaryIndex : 0;
 
     // key_info_buffer and TABLE::key_info use different field-number bases;
-    // resolve the runtime KEY by name or the encoder reads the wrong column.
+    // resolve the runtime KEY by name or the packer reads the wrong column.
     const KEY *runtime_key = nullptr;
     for (uint k = 0; k < altered_table->s->keys; ++k) {
       const KEY *candidate = &altered_table->key_info[k];
@@ -495,7 +495,7 @@ bool ha_helios::inplace_alter_table(TABLE *altered_table,
     }
     if (runtime_key == nullptr) return true;
 
-    // Helios treats an encoded NULL key as a duplicate, but SQL allows many
+    // Helios treats a packed NULL key as a duplicate, but SQL allows many
     // NULLs in a UNIQUE index; reject nullable UNIQUE backfill instead.
     if (key_info->flags & HA_NOSAME) {
       for (uint p = 0; p < runtime_key->user_defined_key_parts; ++p) {
@@ -518,7 +518,7 @@ bool ha_helios::inplace_alter_table(TABLE *altered_table,
     }
   }
 
-  // Non-unique indexes share one scan and one decode pass, then commit in
+  // Non-unique indexes share one scan and one unpack pass, then commit in
   // parallel. A multi-index ALTER on the fact table makes this the common path.
   if (!nu_specs.empty()) {
     auto *scan_tx = get_transaction(ha_thd());

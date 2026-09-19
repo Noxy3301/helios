@@ -39,9 +39,9 @@ static std::vector<std::pair<std::string, uint32_t>> index_ndv_descriptors(
   return descs;
 }
 
-// Decode a MySQL range endpoint through key_restore() so Field owns signedness
-// and key-format decoding. Unsupported shapes fall back to coarse estimates.
-static bool decode_int_keypart(TABLE *table, KEY *key, uint part,
+// Unpack a MySQL range endpoint through key_restore() so Field owns signedness
+// and the key format. Unsupported shapes fall back to coarse estimates.
+static bool unpack_int_keypart(TABLE *table, KEY *key, uint part,
                                const key_range *range, longlong *out_value) {
   if (table == nullptr || key == nullptr || range == nullptr ||
       range->key == nullptr || out_value == nullptr) {
@@ -394,7 +394,7 @@ ha_rows ha_helios::records_in_range(uint inx, key_range *min_key,
   ha_rows estimate;
   if (eq_parts > 0) {
     // Use rec_per_key at the equality depth; refine a trailing integer range
-    // when the endpoint can be decoded safely.
+    // when the endpoint can be unpacked safely.
     uint rpk_idx = eq_parts - 1;
     if (rpk_idx < key->user_defined_key_parts) {
       estimate = static_cast<ha_rows>(key->rec_per_key[rpk_idx]);
@@ -407,8 +407,8 @@ ha_rows ha_helios::records_in_range(uint inx, key_range *min_key,
       longlong hi = 0;
       if (eq_parts < key->user_defined_key_parts &&
           key->rec_per_key[eq_parts] > 0 &&
-          decode_int_keypart(table, key, eq_parts, min_key, &lo) &&
-          decode_int_keypart(table, key, eq_parts, max_key, &hi) &&
+          unpack_int_keypart(table, key, eq_parts, min_key, &lo) &&
+          unpack_int_keypart(table, key, eq_parts, max_key, &hi) &&
           hi >= lo) {
         const double range_vals =
             (hi > lo) ? static_cast<double>(hi - lo) : 1.0;
@@ -441,12 +441,12 @@ ha_rows ha_helios::records_in_range(uint inx, key_range *min_key,
       if (hist_it != share->index_hist_.end()) {
         const Helios_share::RangeHist &hist = hist_it->second;
         if (!hist.bounds.empty() && hist.bounds.size() == hist.cum.size()) {
-          auto rank_le = [&](const std::string &encoded_key) -> double {
-            if (encoded_key >= hist.bounds.back())
+          auto rank_le = [&](const std::string &packed_key) -> double {
+            if (packed_key >= hist.bounds.back())
               return static_cast<double>(hist.cum.back());
             auto it =
                 std::upper_bound(hist.bounds.begin(), hist.bounds.end(),
-                                 encoded_key);
+                                 packed_key);
             if (it == hist.bounds.begin())
               return 0.0;
             const size_t pos =
@@ -459,20 +459,20 @@ ha_rows ha_helios::records_in_range(uint inx, key_range *min_key,
           double lo = 0.0;
           double hi = static_cast<double>(hist.cum.back());
           if (min_key != nullptr) {
-            std::string encoded = key_pack::pack_key(
+            std::string packed = key_pack::pack_key(
                 table, inx, min_key->key, kLeadingPart);
-            if (encoded.empty())
+            if (packed.empty())
               enc_ok = false;
             else
-              lo = rank_le(encoded);
+              lo = rank_le(packed);
           }
           if (enc_ok && max_key != nullptr) {
-            std::string encoded = key_pack::pack_key(
+            std::string packed = key_pack::pack_key(
                 table, inx, max_key->key, kLeadingPart);
-            if (encoded.empty())
+            if (packed.empty())
               enc_ok = false;
             else
-              hi = rank_le(encoded);
+              hi = rank_le(packed);
           }
           const double hist_est = enc_ok ? (hi - lo) : -1.0;
           if (hist_est >= 1.0 &&

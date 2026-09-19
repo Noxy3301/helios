@@ -223,21 +223,21 @@ class ColumnarExecutionContext : public Secondary_engine_execution_context {
   ulonglong saved_optimizer_switch_ = 0;
 };
 
-struct DecodedField {
+struct UnpackedField {
   const char *ptr = nullptr;
   size_t len = 0;
 };
 
 /**
- * @brief Decode Helios's row-field framing into field slices.
+ * @brief Unpack Helios's row-field framing into field slices.
  *
  * Each field is stored as a one-byte length-width tag, that many little-endian
  * length bytes, then the payload. A tag of 0xff carries no payload and yields
  * a zero-length slice, as a payload of length 0 does; the null bitmap in field
  * 0 of the row marks the NULL columns.
  */
-[[maybe_unused]] bool DecodeRowFields(const std::string &row,
-                                      std::vector<DecodedField> *out) {
+[[maybe_unused]] bool unpack_row_fields(const std::string &row,
+                                      std::vector<UnpackedField> *out) {
   out->clear();
   size_t offset = 0;
 
@@ -347,7 +347,7 @@ bool RoundDecimalText(const char *ptr, size_t len, uint32_t target_scale,
  *
  * MySQL has already sent result-set metadata for the original SELECT list;
  * this override only ships value-only Item carriers that match it. The
- * response rows use the proxy row format (DecodeRowFields).
+ * response rows use the proxy row format (unpack_row_fields).
  */
 bool ExecuteDuckdbBridge(JOIN *join, Query_result *result) {
   THD *thd = join->thd;
@@ -395,11 +395,11 @@ bool ExecuteDuckdbBridge(JOIN *join, Query_result *result) {
                                 : static_cast<uint32_t>(DECIMAL_NOT_SPECIFIED));
   }
 
-  std::vector<DecodedField> fields;
+  std::vector<UnpackedField> fields;
   std::string rounded;
   const size_t expected = 1 + values.size();
   for (const std::string &row : rpc.rows()) {
-    if (!DecodeRowFields(row, &fields) || fields.size() != expected) {
+    if (!unpack_row_fields(row, &fields) || fields.size() != expected) {
       return RaiseColumnarError(
           thd,
           "HELIOS_COLUMNAR duckdb-bridge: malformed row (DuckDB result "
@@ -408,14 +408,14 @@ bool ExecuteDuckdbBridge(JOIN *join, Query_result *result) {
 
     // Field 0 is the row null-flags field: bit i of byte i / 8 marks output
     // column i NULL. A zero-length field is '' unless that bit is set.
-    const DecodedField &null_flags = fields[0];
+    const UnpackedField &null_flags = fields[0];
     for (size_t i = 0; i < values.size(); i++) {
       if (i / 8 < null_flags.len &&
           (static_cast<uint8_t>(null_flags.ptr[i / 8]) & (1u << (i % 8)))) {
         values[i]->set_null_value();
         continue;
       }
-      const DecodedField &field = fields[1 + i];
+      const UnpackedField &field = fields[1 + i];
       const char *text = field.ptr == nullptr ? "" : field.ptr;
       if (target_scale[i] != static_cast<uint32_t>(DECIMAL_NOT_SPECIFIED) &&
           RoundDecimalText(text, field.len, target_scale[i], &rounded)) {

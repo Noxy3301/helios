@@ -104,7 +104,7 @@ struct DataItem {
   bool AllocateSlot(pax::PaxTable &table);
 
   /**
-   * @brief Installs a decoded row into this item's PAX slot.
+   * @brief Installs an unpacked row into this item's PAX slot.
    * @note The caller holds the TID lock and has allocated every write's slot.
    * Recovery calls this before readers start.
    * @param epoch Commit epoch of this install; epoch images are tagged with

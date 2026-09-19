@@ -14,7 +14,7 @@ std::string HeliosField::convert_numeric_to_bytes(const size_t num) const {
   size_t byteSizeOfNum = calculate_minimum_byte_size_required(num);
   std::string byteSequence;
   byteSequence.reserve(byteSizeOfNum);
-  // Encode in little-endian order to match convert_bytes_to_numeric().
+  // Pack in little-endian order to match convert_bytes_to_numeric().
   for (size_t i = 0; i < byteSizeOfNum; i++) {
     byteSequence.push_back(static_cast<char>((num >> (CHAR_BIT * i)) & 0xFF));
   }

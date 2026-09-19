@@ -28,8 +28,8 @@ namespace pax {
  * layer wrote, unchanged. A typed field stores the value as a fixed-width
  * little-endian binary payload of `field_max_bytes[f]` bytes (4 or 8). A
  * typed cell's u16 length prefix is 0 for SQL NULL and the binary width for a
- * present value. DecodeRow converts input bytes before the commit protocol;
- * ScatterRow writes the decoded cells without reparsing.
+ * present value. unpack_row converts input bytes before the commit protocol;
+ * ScatterRow writes the unpacked cells without reparsing.
  * GatherRow reconstructs the original field bytes from the typed cells.
  */
 enum class FieldType : uint8_t {
@@ -141,9 +141,9 @@ class PaxGroup {
   ~PaxGroup();
 
   /**
-   * @brief Writes a decoded row into this group's strip cells.
+   * @brief Writes an unpacked row into this group's strip cells.
    * @param slot Target slot inside this group.
-   * @param row Decoded using this group's schema; its input
+   * @param row Unpacked using this group's schema; its input
    * bytes must remain unchanged until the call finishes.
    */
   void ScatterRow(uint32_t slot, const Row &row);

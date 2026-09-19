@@ -258,32 +258,32 @@ void ha_helios::build_search_plan(const uchar *key, key_part_map keypart_map,
     current_plan_.op = IndexSearchOp::kRangeScan;
   }
 
-  // 4. Serialize boundaries
+  // 4. Pack boundaries
   if (key != nullptr) {
-    current_plan_.start_key_serialized = pack_key(key, keypart_map);
+    current_plan_.packed_start_key = pack_key(key, keypart_map);
 
     // same group boundary (prefix operations)
     if (current_plan_.op == IndexSearchOp::kSameKey ||
         current_plan_.op == IndexSearchOp::kPrefixFirst ||
         current_plan_.op == IndexSearchOp::kPrefixLast) {
-      current_plan_.same_group_prefix_serialized =
-          current_plan_.start_key_serialized;
-      current_plan_.same_group_end_serialized =
-          build_prefix_range_end(current_plan_.start_key_serialized);
+      current_plan_.packed_same_key_prefix =
+          current_plan_.packed_start_key;
+      current_plan_.packed_same_key_end =
+          build_prefix_range_end(current_plan_.packed_start_key);
     }
   }
 
   // end_range processing
   if (end_range != nullptr) {
-    current_plan_.end_key_serialized =
+    current_plan_.packed_end_key =
         pack_key(end_range->key, end_range->keypart_map);
 
     if (end_range->flag != HA_READ_BEFORE_KEY) {
       // SQL inclusive upper bound must become Helios's exclusive upper
       // bound. This is required for both full keys (k <= 30) and partial-key
       // prefix ranges.
-      current_plan_.end_key_serialized =
-          build_prefix_range_end(current_plan_.end_key_serialized);
+      current_plan_.packed_end_key =
+          build_prefix_range_end(current_plan_.packed_end_key);
     }
   }
 }
@@ -311,9 +311,9 @@ int ha_helios::execute_plan(uchar *buf, HeliosTransaction *tx) {
 
 int ha_helios::execute_index_first(uchar *buf, HeliosTransaction *tx) {
   std::string start_key = "";
-  std::string end_key = current_plan_.end_key_serialized.empty()
+  std::string end_key = current_plan_.packed_end_key.empty()
                             ? key_pack::scan_end_sentinel()
-                            : current_plan_.end_key_serialized;
+                            : current_plan_.packed_end_key;
 
   if (current_plan_.is_primary && !statement_uses_read_plan(ha_thd())) {
     index_cursor_active_ = true;
@@ -351,7 +351,7 @@ int ha_helios::execute_index_first(uchar *buf, HeliosTransaction *tx) {
 
 int ha_helios::execute_unique_point(uchar *buf, HeliosTransaction *tx) {
   if (current_plan_.is_primary) {
-    auto result = tx->read(current_plan_.start_key_serialized);
+    auto result = tx->read(current_plan_.packed_start_key);
 
     if (tx->is_aborted()) {
       return abort_errno(tx);
@@ -367,15 +367,15 @@ int ha_helios::execute_unique_point(uchar *buf, HeliosTransaction *tx) {
     }
 
     // set state for index_next to return EOF
-    secondary_index_results_.push_back(current_plan_.start_key_serialized);
+    secondary_index_results_.push_back(current_plan_.packed_start_key);
     current_position_in_index_ = 1;
-    last_fetched_primary_key_ = current_plan_.start_key_serialized;
+    last_fetched_primary_key_ = current_plan_.packed_start_key;
     return 0;
   } else {
     // Secondary UNIQUE: read_secondary_index → read primary key
     // Proxy adaptation: read_secondary_index returns vector<string> (primary keys)
     auto primary_keys = tx->read_secondary_index(
-        current_index_name, current_plan_.start_key_serialized);
+        current_index_name, current_plan_.packed_start_key);
 
     if (tx->is_aborted()) {
       return abort_errno(tx);
@@ -395,8 +395,8 @@ int ha_helios::execute_unique_point(uchar *buf, HeliosTransaction *tx) {
 }
 
 int ha_helios::execute_same_key(uchar *buf, HeliosTransaction *tx) {
-  const std::string &prefix = current_plan_.same_group_prefix_serialized;
-  const std::string &prefix_end = current_plan_.same_group_end_serialized;
+  const std::string &prefix = current_plan_.packed_same_key_prefix;
+  const std::string &prefix_end = current_plan_.packed_same_key_end;
 
   if (current_plan_.is_primary) {
     // Push LIMIT only when the server can also apply the SELECT WHERE.
@@ -448,8 +448,8 @@ int ha_helios::execute_same_key(uchar *buf, HeliosTransaction *tx) {
 }
 
 int ha_helios::execute_prefix_first(uchar *buf, HeliosTransaction *tx) {
-  const std::string &prefix = current_plan_.same_group_prefix_serialized;
-  const std::string &prefix_end = current_plan_.same_group_end_serialized;
+  const std::string &prefix = current_plan_.packed_same_key_prefix;
+  const std::string &prefix_end = current_plan_.packed_same_key_end;
 
   if (current_plan_.is_primary) {
     // Restrict to [prefix, prefix_end) so index_next never leaks non-prefix
@@ -495,8 +495,8 @@ int ha_helios::execute_prefix_first(uchar *buf, HeliosTransaction *tx) {
  * @brief kRangeScan: range search (AFTER_KEY, KEY_OR_NEXT, etc.)
  */
 int ha_helios::execute_range(uchar *buf, HeliosTransaction *tx) {
-  std::string effective_start = current_plan_.start_key_serialized;
-  std::string effective_end = current_plan_.end_key_serialized;
+  std::string effective_start = current_plan_.packed_start_key;
+  std::string effective_end = current_plan_.packed_end_key;
 
   // adjust start key based on find_flag
   if (current_plan_.find_flag == HA_READ_AFTER_KEY) {
@@ -546,7 +546,7 @@ int ha_helios::execute_range(uchar *buf, HeliosTransaction *tx) {
 }
 
 int ha_helios::execute_prev_key(uchar *buf, HeliosTransaction *tx) {
-  const std::string &target_key = current_plan_.start_key_serialized;
+  const std::string &target_key = current_plan_.packed_start_key;
   // HA_READ_BEFORE_KEY : SQL < target → already exclusive end.
   // HA_READ_KEY_OR_PREV: SQL <= target → convert via build_prefix_range_end so
   //                      [begin, end) scan keeps target itself.
@@ -581,8 +581,8 @@ int ha_helios::execute_prev_key(uchar *buf, HeliosTransaction *tx) {
 
 int ha_helios::execute_prefix_last(uchar *buf, HeliosTransaction *tx) {
   if (current_plan_.find_flag == HA_READ_PREFIX_LAST_OR_PREV) {
-    const std::string &prefix = current_plan_.same_group_prefix_serialized;
-    const std::string &prefix_end = current_plan_.same_group_end_serialized;
+    const std::string &prefix = current_plan_.packed_same_key_prefix;
+    const std::string &prefix_end = current_plan_.packed_same_key_end;
 
     if (current_plan_.is_primary) {
       // Push LIMIT only when the server can also apply the SELECT WHERE.
@@ -655,8 +655,8 @@ int ha_helios::execute_prefix_last(uchar *buf, HeliosTransaction *tx) {
 
     // The prefix-last fetch only uses DESC LIMIT 1.
     auto key_values = tx->get_matching_keys_and_values_in_range(
-        current_plan_.same_group_prefix_serialized,
-        current_plan_.same_group_end_serialized,
+        current_plan_.packed_same_key_prefix,
+        current_plan_.packed_same_key_end,
         push_desc_limit ? static_cast<uint64_t>(scan_limit.row_limit) : 0,
         push_desc_limit);
     for (auto &kv : key_values) {
@@ -676,8 +676,8 @@ int ha_helios::execute_prefix_last(uchar *buf, HeliosTransaction *tx) {
         (scan_limit.row_limit == 1 && scan_limit.reverse_scan);
 
     secondary_index_results_ = tx->get_matching_primary_keys_in_range(
-        current_index_name, current_plan_.same_group_prefix_serialized,
-        current_plan_.same_group_end_serialized, push_desc_limit ? 1 : 0,
+        current_index_name, current_plan_.packed_same_key_prefix,
+        current_plan_.packed_same_key_end, push_desc_limit ? 1 : 0,
         push_desc_limit);
     batch_fetch_secondary_payloads(tx);
   }

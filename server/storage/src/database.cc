@@ -260,7 +260,7 @@ void Database::Recover() {
       const auto *bytes =
           reinterpret_cast<const std::byte *>(entry.value.data());
       pax::Row row;
-      if (!pax::DecodeRow(table->GetPaxTable()->schema(), bytes,
+      if (!pax::unpack_row(table->GetPaxTable()->schema(), bytes,
                           entry.value.size(), row)) {
         SPDLOG_CRITICAL("Recovery failed: value of {} in {} does not fit PAX",
                         entry.key, entry.table_name);

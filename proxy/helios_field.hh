@@ -46,7 +46,7 @@ class HeliosField {
   /**
    * @brief These methods are called for SELECT statements.
    *
-   * make_mysql_table_row parses the Helios-encoded row and records each
+   * make_mysql_table_row parses the Helios packed row and records each
    * field as a (pointer, length) pair into raw_row. No allocations or
    * copies are performed — the caller MUST keep raw_row alive while
    * iterating via get_column_of_row().
@@ -55,7 +55,7 @@ class HeliosField {
                             const size_t length);
   std::string_view get_null_flags() const { return nullFlagView; }
   std::string_view get_column_of_row(const size_t i) const { return row[i]; }
-  // Parsed column count of the decoded value; decoders size their mapping
+  // Parsed column count of the unpacked value; readers size their mapping
   // by this, not by s->fields.
   size_t get_row_size() const { return row.size(); }
 

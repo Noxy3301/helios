@@ -74,10 +74,10 @@ bool Transaction::Write(std::string_view table_name, std::string_view key,
   }
   pax::Row row;
   if (op != RowOp::kDelete &&
-      !pax::DecodeRow(store->schema(),
+      !pax::unpack_row(store->schema(),
                       reinterpret_cast<const std::byte *>(row_bytes.data()),
                       row_bytes.size(), row)) {
-    reason = "pax_row_decode_failed";
+    reason = "pax_row_unpack_failed";
     return false;
   }
 
@@ -336,8 +336,9 @@ bool Transaction::ValidateReads(Tidword &max_tid, std::string &reason) {
   }
 
   for (const auto &range : range_set_) {
-    const bool ok = range.index.empty() ? RevalidateRange(range, max_tid)
-                                        : RevalidateSecondaryRange(range, max_tid);
+    const bool ok = range.index.empty()
+                        ? RevalidateRange(range, max_tid)
+                        : RevalidateSecondaryRange(range, max_tid);
     if (!ok) {
       reason = range.index.empty() ? "primary_range_result_changed"
                                    : "secondary_range_result_changed";
@@ -381,7 +382,8 @@ bool Transaction::RevalidateRange(const RangeEntry &range, Tidword &max_tid) {
   return matches && result_pos == range.keys.size();
 }
 
-bool Transaction::RevalidateSecondaryRange(const RangeEntry &range, Tidword &max_tid) {
+bool Transaction::RevalidateSecondaryRange(const RangeEntry &range,
+                                           Tidword &max_tid) {
   auto table = tables_.GetTable(range.table);
   if (table == nullptr) return false;
   auto *index = table->GetSecondaryIndex(range.index);

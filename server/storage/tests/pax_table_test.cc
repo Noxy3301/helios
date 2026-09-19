@@ -42,12 +42,12 @@ std::string PackRow(const std::vector<std::string> &fields) {
 }
 
 bool Scatter(PaxGroup &group, uint32_t slot, const std::string &row) {
-  helios::storage::pax::Row decoded;
-  if (!helios::storage::pax::DecodeRow(
+  helios::storage::pax::Row unpacked;
+  if (!helios::storage::pax::unpack_row(
           group.schema(), reinterpret_cast<const std::byte *>(row.data()),
-          row.size(), decoded))
+          row.size(), unpacked))
     return false;
-  group.ScatterRow(slot, decoded);
+  group.ScatterRow(slot, unpacked);
   return true;
 }
 
@@ -114,23 +114,23 @@ TEST(PaxTableTest, CopyStaysWithinTheReadersBufferAfterRowGrowth) {
   const TableSchema schema = MakeSchema({1, 64}, {});
   helios::storage::pax::PaxTable store(schema);
   helios::storage::DataItem item;
-  helios::storage::pax::Row decoded;
+  helios::storage::pax::Row unpacked;
   const auto small = PackRow({std::string(1, '\0'), "a"});
   const auto large = PackRow({std::string(1, '\0'), std::string(64, 'b')});
-  ASSERT_TRUE(helios::storage::pax::DecodeRow(
+  ASSERT_TRUE(helios::storage::pax::unpack_row(
       schema, reinterpret_cast<const std::byte *>(small.data()), small.size(),
-      decoded));
+      unpacked));
   ASSERT_TRUE(item.AllocateSlot(store));
-  item.InstallRow(decoded, 1);
+  item.InstallRow(unpacked, 1);
 
   // A reader sizes its output, then a writer grows the row before the copy.
   const size_t capacity = item.size();
   const std::byte marker{0x5a};
   std::vector<std::byte> buffer(large.size() + 8, marker);
-  ASSERT_TRUE(helios::storage::pax::DecodeRow(
+  ASSERT_TRUE(helios::storage::pax::unpack_row(
       schema, reinterpret_cast<const std::byte *>(large.data()), large.size(),
-      decoded));
-  item.InstallRow(decoded, 1);
+      unpacked));
+  item.InstallRow(unpacked, 1);
   const size_t copied = item.GatherInto(buffer.data(), capacity);
   EXPECT_LE(copied, capacity);
   bool guard_intact = true;
