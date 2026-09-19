@@ -72,22 +72,22 @@ set(SOURCES
     rpc/helios_rpc.cc
     rpc/helios_rpc.hh
     rpc/database_operations.cc
-    rpc/flat_plan_encode.cc
-    rpc/flat_plan_encode.hh
+    rpc/flat_plan_pack.cc
+    rpc/flat_plan_pack.hh
     rpc/parallel_scan.cc
     rpc/parallel_scan.hh
     rpc/read_plan_executor.cc
-    rpc/row_codec.cc
-    rpc/row_codec.hh
+    rpc/key_pack.cc
+    rpc/key_pack.hh
     rpc/transaction_operations.cc
     rpc/table_stats.cc
     mysql_charset_runtime.cc
     mysql_charset_runtime.hh
     rpc/duckdb_ast_builder.cc
     rpc/duckdb_ast_builder.hh
-    rpc/duckdb_bridge_dispatch.cc
-    rpc/duckdb_bridge_executor.cc
-    rpc/duckdb_bridge_executor.hh
+    rpc/olap_dispatch.cc
+    rpc/olap_executor.cc
+    rpc/olap_executor.hh
     
     # Storage layer
     database_manager.cc

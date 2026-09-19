@@ -13,9 +13,9 @@
 
 #include "helios.pb.h"
 
-#include "flat_plan_encode.hh"
+#include "flat_plan_pack.hh"
 #include "parallel_scan.hh"
-#include "row_codec.hh"
+#include "key_pack.hh"
 
 // Read-plan execution: the tx_execute_read_plan handler and its plan-key
 // binding glue.

@@ -3,10 +3,10 @@
 // runtime, whose scan function reads the live PaxTable instances, in place for
 // groups without epoch images and through those images otherwise. DuckDB
 // contributes its binder, planner, and vectorized runtime; no table data ever
-// lives inside DuckDB. duckdb_bridge_dispatch.cc routes that arm here.
+// lives inside DuckDB. olap_dispatch.cc routes that arm here.
 // olap_threads bounds the analytical thread pool; unset is a quarter of the
 // hardware threads, which leaves the OLTP side its cores in a mixed run.
-// bridge_mem_limit bounds DuckDB's operator memory (a byte count, K/M/G
+// olap_mem_limit bounds DuckDB's operator memory (a byte count, K/M/G
 // accepted); unset is DuckDB's own default.
 //
 // Consistency: the request runs against a read view with snapshot
@@ -18,7 +18,7 @@
 // chunk and re-reads its slots one at a time from a fresh image copy. The
 // statement runs once. Writers never wait for a reader to finish.
 
-#include "duckdb_bridge_executor.hh"
+#include "olap_executor.hh"
 
 #include "duckdb_ast_builder.hh"
 

@@ -4,7 +4,7 @@
 
 #include "helios.pb.h"
 
-// Flat binary encoder for TxExecuteReadPlan responses ("HELIOSRP" format).
+// Flat binary packing for TxExecuteReadPlan responses ("HELIOSRP" format).
 namespace flat_plan {
 
 /**

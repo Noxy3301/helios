@@ -1,5 +1,5 @@
 #include "database_manager.hh"
-#include "rpc/duckdb_bridge_executor.hh"
+#include "rpc/olap_executor.hh"
 #include "server_config.hh"
 
 #include <spdlog/spdlog.h>

@@ -7,7 +7,7 @@
 #include <utility>
 #include <vector>
 
-#include "row_codec.hh"
+#include "key_pack.hh"
 
 bool parallel_primary_pax_row_ref_scan(
     helios::storage::Database* db,

@@ -3,7 +3,7 @@
 #include <memory>
 #include <string>
 
-#include "duckdb_bridge_executor.hh"
+#include "olap_executor.hh"
 #include "helios.pb.h"
 
 /**
