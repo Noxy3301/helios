@@ -12,7 +12,7 @@
 #include "helios.pb.h"
 
 // Table statistics handler: row counts plus the process-wide NDV and
-// range-histogram caches consumed by the proxy cost model.
+// range-histogram caches consumed by the plugin cost model.
 
 namespace {
 

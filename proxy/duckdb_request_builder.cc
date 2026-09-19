@@ -1124,7 +1124,7 @@ bool SerializeNest(Serializer& s, const mem_root_deque<Table_ref*>& nest,
 bool SerializeBlock(Serializer& s, Query_block* block,
                     Resolved::QueryBlock* out, bool ignore_limit) {
     if (block == nullptr) return s.Refuse("missing query block");
-    // FOUND_ROWS() reads the unbounded count from the executor; the bridge
+    // FOUND_ROWS() reads the unbounded count from the executor; the OLAP path
     // only reports rows DuckDB returned after applying LIMIT.
     if (block->active_options() & OPTION_FOUND_ROWS) {
         return s.Refuse("SQL_CALC_FOUND_ROWS is unsupported");

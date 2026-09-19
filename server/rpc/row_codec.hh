@@ -6,7 +6,7 @@
 
 // Byte-level pack/unpack helpers shared across the RPC handlers:
 // HeliosField-format row access plus the int-keyed primary-key layout
-// mirrored from the proxy.
+// mirrored from the plugin.
 
 // Bump the byte string to its lexicographic successor; empty on overflow.
 std::string next_lexicographic_key(std::string key);

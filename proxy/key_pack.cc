@@ -291,7 +291,7 @@ std::string ha_helios::extract_primary_key_from_ref(const uchar *pos) const {
 // Hidden primary keys are reserved a block at a time, sized to the statement
 // when MySQL estimates its rows. NDB Cluster prefetches the same default.
 static constexpr uint32_t kHiddenKeyRangeSize = 1000;
-// Mirrors HiddenKeyAllocator::kMaxCount, which the proxy cannot include
+// Mirrors HiddenKeyAllocator::kMaxCount, which the plugin cannot include
 static constexpr uint32_t kHiddenKeyMaxRange = 65536;
 
 std::string ha_helios::pack_hidden_primary_key(uint64_t row_id) const {

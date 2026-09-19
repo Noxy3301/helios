@@ -151,7 +151,7 @@ void HeliosRpc::handleTxExecuteReadPlan(
             const auto* source = previous_results[source_step];
             const int row_count =
                 std::max(source->scan_keys_size(), source->scan_values_size());
-            // Dedup probes: many source rows share a join key, and the proxy
+            // Dedup probes: many source rows share a join key, and the plugin
             // serves every runtime probe of one key from the single cached
             // result, so re-executing the probe only inflates the response.
             std::vector<std::string> probe_keys;

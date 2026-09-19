@@ -1,10 +1,10 @@
 """A non-NULL empty string must not read back as NULL on the analytical path.
 
-The proxy row format encodes a zero-length field with one marker byte, so a
-VARCHAR '' and a SQL NULL share it. The null bitmap in field 0 of the row is
-what separates them, and the row path reads it (proxy/row_codec.cc). This
+The Helios packed row format packs a zero-length field with one marker byte,
+which a VARCHAR '' and a SQL NULL share. The null bitmap in field 0 of the row
+is what separates them, and the row path reads it (proxy/row_codec.cc). This
 file pins that the analytical path (SECONDARY_ENGINE=HELIOS_COLUMNAR,
-served by the DuckDB bridge) agrees with it: WHERE c = '', WHERE c IS NULL,
+served by the DuckDB executor) agrees with it: WHERE c = '', WHERE c IS NULL,
 COUNT(c), GROUP BY c and the select list must return the same answers as the
 row path.
 
@@ -17,7 +17,7 @@ Two scan paths carry the same rows, and both are covered:
     view (the concurrent scenario, which asserts image_slots >= 1)
 
 The concurrent scenario uses the pax_view.after_fence sync point that holds
-every bridge read between its read view fence and its scan, so the writer
+every OLAP read between its read view fence and its scan, so the writer
 commits inside the hold and its rows resolve through images. The test owns
 the local stack: it restarts it with the sync point armed and stops it
 afterwards, as columnar_midscan_preserve.py does.
@@ -39,13 +39,13 @@ ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 QUIET = "> /dev/null 2>&1"
 # Bytes the server log held before this test started the stack.
 LOG_OFFSET = 0
-# The hold every bridge read takes between its read view fence and its scan.
+# The hold every OLAP read takes between its read view fence and its scan.
 FENCE_HOLD_MS = 1000
 # The debug sync points stay in the environment; the rest is configuration.
 SERVER_ENV = ("HELIOS_DEBUG_SYNC_PAX_VIEW_AFTER_FENCE"
               f"=sleep:{FENCE_HOLD_MS}")
 # The scan tallies, read back from the server log.
-SERVER_CONF = {"bridge_debug": 1}
+SERVER_CONF = {"olap_trace": 1}
 # Where the writer's commit lands inside the fence hold; a fence takes one
 # to two epochs, so this also clears it.
 WRITE_AT_S = 0.35
@@ -177,7 +177,7 @@ def fetch(cursor, sql, analytical):
 
 
 def last_scan_tally():
-    """Scan tallies of the most recent bridge request, from the server log."""
+    """Scan tallies of the most recent OLAP request, from the server log."""
     tally = {}
     for line in server_log.read_since(LOG_OFFSET).splitlines():
         if line.startswith("[duckdb-ast] "):

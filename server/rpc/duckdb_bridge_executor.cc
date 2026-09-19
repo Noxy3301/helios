@@ -1,10 +1,10 @@
-// DuckDB bridge executor: runs a tx_execute_duckdb_query request by building
+// DuckDB executor: runs a tx_execute_duckdb_query request by building
 // DuckDB's parsed AST from the wire IR and executing it on the embedded
 // runtime, whose scan function reads the live PaxTable instances, in place for
 // groups without epoch images and through those images otherwise. DuckDB
 // contributes its binder, planner, and vectorized runtime; no table data ever
 // lives inside DuckDB. duckdb_bridge_dispatch.cc routes that arm here.
-// bridge_threads bounds the analytical thread pool; unset is a quarter of the
+// olap_threads bounds the analytical thread pool; unset is a quarter of the
 // hardware threads, which leaves the OLTP side its cores in a mixed run.
 // bridge_mem_limit bounds DuckDB's operator memory (a byte count, K/M/G
 // accepted); unset is DuckDB's own default.
@@ -56,7 +56,7 @@
 #include <duckdb.hpp>
 #include <duckdb/parser/parsed_data/create_table_function_info.hpp>
 
-namespace duckdb_bridge {
+namespace olap {
 namespace {
 
 namespace pb = Helios::Protocol;
@@ -66,7 +66,7 @@ using pax::PaxGroup;
 using pax::PaxTable;
 
 // ---------------------------------------------------------------------------
-// Proxy row-format packing.
+// Helios packed row format: packing.
 // ---------------------------------------------------------------------------
 
 /**
@@ -79,7 +79,7 @@ uint32_t LengthPrefixBytes(uint32_t length) {
 }
 
 /**
- * @brief Appends one field in the proxy row format (matches
+ * @brief Appends one field in the Helios packed row format (matches
  * proxy/ha_helios_columnar.cc's unpack_row_fields).
  *
  * @details One byte length-width tag (0xFF for a field with no payload),
@@ -113,9 +113,9 @@ void AppendProxyField(std::string& out, std::string_view payload,
 // ---------------------------------------------------------------------------
 
 /**
- * @brief Whether the configuration asks for the bridge's trace lines.
+ * @brief Whether the configuration asks for the executor's trace lines.
  */
-bool BridgeDebugEnabled() { return config().bridge_debug; }
+bool trace_enabled() { return config().olap_trace; }
 
 /**
  * @brief Upper bound on the read view fence wait.
@@ -123,13 +123,13 @@ bool BridgeDebugEnabled() { return config().bridge_debug; }
 uint32_t FenceTimeoutMs() { return config().read_view_fence_timeout_ms; }
 
 // ---------------------------------------------------------------------------
-// Proxy row-format unpacking, for epoch images. A preserved old_row is a proxy
-// row payload whose typed fields carry val_str ASCII; the parsers mirror the
+// Helios packed row format: unpacking, for epoch images. A preserved old_row
+// is a packed row payload whose typed fields carry val_str ASCII; the parsers mirror the
 // scatter-side packing, and a failure is a broken invariant and throws.
 // ---------------------------------------------------------------------------
 
 /**
- * @brief Splits one proxy row payload into per-field {pointer, length} refs.
+ * @brief Splits one packed row payload into per-field {pointer, length} refs.
  *
  * @details Field 0 is the null-flags field; MySQL column i is field i + 1. A
  * 0xFF width tag and a zero-length payload both yield length 0, and the
@@ -273,7 +273,7 @@ struct ColumnSpec {
 /**
  * @brief Per-request description of one live PAX table.
  *
- * @details Column metadata comes from the request: the proxy recomputes
+ * @details Column metadata comes from the request: the plugin recomputes
  * type/width/scale from TABLE::field[] with the pure function used at CREATE
  * TABLE time (see proxy/helios_field_types.h), matching what the server
  * stored while the schema is unchanged.
@@ -284,7 +284,7 @@ struct PaxTableView {
   size_t group_count = 0;  // fixed after the read view fence, not live state
   uint32_t snapshot_epoch = 0;  // read view serialization point se
 
-  // Scan tallies for one request, reported under bridge_debug.
+  // Scan tallies for one request, reported under olap_trace.
   std::atomic<uint64_t> groups_scanned{0};
   std::atomic<uint64_t> groups_with_images{0};
   std::atomic<uint64_t> chunk_rereads{0};
@@ -819,7 +819,7 @@ void EmitInPlaceRow(const PaxGroup& group,
 /**
  * @brief Unpacks one epoch image into chunk row `out_row`.
  *
- * @details The image is a proxy row payload whose typed fields carry val_str
+ * @details The image is a packed row payload whose typed fields carry val_str
  * ASCII (the gather round-trip contract); parse failures throw because an
  * image that fails to parse is a broken invariant, and the request must fail
  * rather than emit a wrong row.
@@ -1148,7 +1148,7 @@ void PaxScan(ClientContext&, TableFunctionInput& data, DataChunk& output) {
 }
 
 /**
- * @brief Packs one result row into the proxy row format.
+ * @brief Packs one result row into the Helios packed row format.
  *
  * @details Uses DuckDB's own Value::ToString(): an exact fixed-point
  * representation for DECIMAL (no precision loss) and ISO "YYYY-MM-DD" for
@@ -1157,11 +1157,11 @@ void PaxScan(ClientContext&, TableFunctionInput& data, DataChunk& output) {
  * DECIMAL division / AVG: DuckDB resolves AVG() of a DECIMAL column (and any
  * DECIMAL/DECIMAL division) to DOUBLE by design
  * (https://duckdb.org/docs/stable/sql/data_types/numeric). Value::ToString()
- * on that DOUBLE uses shortest-round-trip formatting; the proxy reformats it
+ * on that DOUBLE uses shortest-round-trip formatting; the plugin reformats it
  * to MySQL's decimals convention with exact string/integer rounding once the
  * row crosses the wire.
  *
- * KNOWN LIMITATION: that proxy-side reformatting corrects display scale
+ * KNOWN LIMITATION: that plugin-side reformatting corrects display scale
  * only. The value itself went through DOUBLE division, and at large enough
  * magnitudes double's ~15-17 significant decimal digits could place the true
  * value on the wrong side of a rounding boundary relative to MySQL's exact
@@ -1205,33 +1205,33 @@ void pack_row(duckdb::MaterializedQueryResult& result, idx_t row_index,
 // Process-lifetime state.
 // ---------------------------------------------------------------------------
 
-// The bounds ConfigureLimits read, 0 while the configuration sets neither.
-idx_t bridge_threads = 0;
-idx_t bridge_memory = 0;
+// The bounds configure_limits read, 0 while the configuration sets neither.
+idx_t olap_threads = 0;
+idx_t olap_memory = 0;
 
 /**
- * @brief Applies the bridge's thread and memory bounds to `config`.
+ * @brief Applies the OLAP thread and memory bounds to `config`.
  *
  * @details The thread pool defaults to a quarter of the hardware threads, so
  * an analytical stream does not take the cores the OLTP side runs on; a pure
- * analytical run sets bridge_threads itself. An unset memory bound is
+ * analytical run sets olap_threads itself. An unset memory bound is
  * DuckDB's own default.
  */
-duckdb::DBConfig* ConfigureBridgeLimits(duckdb::DBConfig* config) {
+duckdb::DBConfig* apply_limits(duckdb::DBConfig* config) {
   config->options.maximum_threads =
-      bridge_threads != 0
-          ? bridge_threads
+      olap_threads != 0
+          ? olap_threads
           : std::max<idx_t>(1, std::thread::hardware_concurrency() / 4);
-  if (bridge_memory != 0) config->options.maximum_memory = bridge_memory;
+  if (olap_memory != 0) config->options.maximum_memory = olap_memory;
   return config;
 }
 
 /**
  * @brief Process-lifetime DuckDB runtime.
  *
- * @details The bridge borrows DuckDB's binder, planner, and vectorized
+ * @details The OLAP path borrows DuckDB's binder, planner, and vectorized
  * executor; the in-memory duckdb::DuckDB instance holds no table data, and
- * its system catalog only ever contains this bridge's scan function. The
+ * its system catalog only ever contains the PAX scan function. The
  * function-local static gives thread-safe, exactly-once construction: the
  * first request pays the construction cost, every later request on any
  * thread reuses the instance. This follows DuckDB's documented concurrency
@@ -1242,7 +1242,7 @@ duckdb::DuckDB& GlobalRuntime() {
   // Function-local statics initialize in order, so the config is complete
   // before the instance reads it. nullptr: in-memory, no db file.
   static duckdb::DBConfig config;
-  static duckdb::DuckDB runtime(nullptr, ConfigureBridgeLimits(&config));
+  static duckdb::DuckDB runtime(nullptr, apply_limits(&config));
   return runtime;
 }
 
@@ -1440,12 +1440,12 @@ void EnsureDuckdbScanRegistered() {
 
 }  // namespace
 
-void ConfigureLimits() {
-  bridge_threads = static_cast<idx_t>(config().bridge_threads);
-  bridge_memory = static_cast<idx_t>(config().bridge_mem_limit_bytes);
+void configure_limits() {
+  olap_threads = static_cast<idx_t>(config().olap_threads);
+  olap_memory = static_cast<idx_t>(config().olap_mem_limit_bytes);
 }
 
-void ExecuteDuckdbQuery(
+void execute_duckdb_query(
     helios::storage::Database* db,
     const pb::TxExecuteDuckdbQuery::Request& request,
     pb::TxExecuteDuckdbQuery::Response* response) {
@@ -1471,9 +1471,9 @@ void ExecuteDuckdbQuery(
         // Sampled before the close, so the line reports what this view was
         // holding rather than what survives it.
         const pax::ImageBufferStats stats =
-            BridgeDebugEnabled() ? pax::ImageStats() : pax::ImageBufferStats{};
+            trace_enabled() ? pax::ImageStats() : pax::ImageBufferStats{};
         database->ClosePaxView(handle);
-        if (BridgeDebugEnabled()) {
+        if (trace_enabled()) {
           std::fprintf(stderr,
                        "[epoch-images] images=%lu bytes=%lu open_views=%lu\n",
                        stats.images, stats.bytes, stats.open_views);
@@ -1553,7 +1553,7 @@ void ExecuteDuckdbQuery(
     }
     duckdb::unique_ptr<duckdb::SQLStatement> statement(
         built.statement.release());
-    const bool debug_resolved = BridgeDebugEnabled();
+    const bool debug_resolved = trace_enabled();
     if (debug_resolved) {
       std::fprintf(stderr, "[duckdb-ast] %s\n", statement->ToString().c_str());
     }
@@ -1598,8 +1598,8 @@ void ExecuteDuckdbQuery(
   } catch (...) {
     response->Clear();
     response->set_ok(false);
-    response->set_error("duckdb bridge execution failed");
+    response->set_error("duckdb executor failed");
   }
 }
 
-}  // namespace duckdb_bridge
+}  // namespace olap

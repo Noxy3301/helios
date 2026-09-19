@@ -28,7 +28,7 @@
 #include "duckdb/parser/tableref/subqueryref.hpp"
 #include "duckdb/parser/tableref/table_function_ref.hpp"
 
-namespace duckdb_bridge {
+namespace olap {
 namespace {
 
 namespace pb = Helios::Protocol;
@@ -46,7 +46,7 @@ constexpr char kMysqlAiCiLike[] = "mysql_utf8mb4_0900_ai_ci_like";
 constexpr char kMysqlAiCiNotLike[] = "mysql_utf8mb4_0900_ai_ci_not_like";
 constexpr char kMysqlAiCiSortKey[] = "mysql_utf8mb4_0900_ai_ci_sort_key";
 
-// MySQL collation ids whose comparison the bridge implements: 255 through
+// MySQL collation ids whose comparison the executor implements: 255 through
 // the registered strnxfrm collation, 309/63 as byte comparison.
 bool CollationIsByteSafe(uint32_t id) { return id == 309 || id == 63; }
 bool CollationIsAiCi(uint32_t id) { return id == 255; }
@@ -986,4 +986,4 @@ AstBuildResult BuildSelectStatement(const Resolved::Request& request,
     return result;
 }
 
-}  // namespace duckdb_bridge
+}  // namespace olap

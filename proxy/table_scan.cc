@@ -92,7 +92,7 @@ bool ha_helios::fill_scan_buffer() {
     DBUG_RETURN(false);
   }
 
-  // The proxy fetches all rows in one RPC.
+  // The plugin fetches all rows in one RPC.
   scan_exhausted_ = true;
 
   DBUG_RETURN(true);

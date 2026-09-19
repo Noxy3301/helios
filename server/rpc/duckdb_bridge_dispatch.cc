@@ -7,7 +7,7 @@
 #include "helios.pb.h"
 
 /**
- * @brief Hands a resolved-statement request to duckdb_bridge::ExecuteDuckdbQuery.
+ * @brief Hands a resolved-statement request to olap::execute_duckdb_query.
  */
 void HeliosRpc::handleTxExecuteDuckdbQuery(
     const Helios::Protocol::TxExecuteDuckdbQuery::Request& request,
@@ -20,5 +20,5 @@ void HeliosRpc::handleTxExecuteDuckdbQuery(
         return;
     }
 
-    duckdb_bridge::ExecuteDuckdbQuery(db.get(), request, response);
+    olap::execute_duckdb_query(db.get(), request, response);
 }

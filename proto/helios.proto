@@ -364,7 +364,7 @@ message DbCreateSecondaryIndex {
     }
 }
 
-// Resolved-statement request: the proxy serializes the Query_block and Item
+// Resolved-statement request: the plugin serializes the Query_block and Item
 // trees, the server builds DuckDB's AST from them, so no SQL text crosses the
 // wire. Both ends default-deny a node they have no rule for.
 message TxExecuteDuckdbQuery {
@@ -635,6 +635,6 @@ message TxExecuteDuckdbQuery {
     message Response {
         bool ok = 1;
         string error = 2;
-        repeated bytes rows = 3; // proxy row format, DuckDB result order
+        repeated bytes rows = 3; // Helios packed row format, DuckDB result order
     }
 }

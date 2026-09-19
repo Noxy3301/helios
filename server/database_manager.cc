@@ -18,7 +18,7 @@ DatabaseManager::DatabaseManager() {
     set_commit_durability(config().commit_durability == "async"
                               ? helios::storage::CommitDurability::kAsync
                               : helios::storage::CommitDurability::kSync);
-    duckdb_bridge::ConfigureLimits();
+    olap::configure_limits();
     // The startup contract on its own line: bench and deploy scripts grep it.
     SPDLOG_INFO("Commit durability: {}", config().commit_durability);
     SPDLOG_INFO("Epoch {} ms, WAL capacity {} bytes, recovery {}",

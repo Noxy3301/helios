@@ -8,7 +8,7 @@ scan has claimed a group and started reading its slots. That is what the
 per-chunk preserve validation exists for, so it needs its own regression.
 
 The schedule is built out of the same two sync points:
-  - pax_view.after_fence holds every bridge read between its read view fence
+  - pax_view.after_fence holds every OLAP read between its read view fence
     and its scan, so the writer's commit epoch is above the read view cut
   - silo_commit.between_row_installs pauses the writer between the two row
     installs of one transaction
@@ -21,7 +21,7 @@ afterwards, so a run that missed the window fails loudly instead of passing
 vacuously.
 
 The scan is made long enough to span the pause by a per-row LIKE over a wide
-column and a single analytical thread (bridge_threads = 1). The query
+column and a single analytical thread (olap_threads = 1). The query
 aggregates, so a torn result is a wrong number rather than a wrong row order:
 COUNT(*), SUM(v) and COUNT(n) must equal the full pre-write state, never a
 mix. Column n is nullable and carries NULL on every even id, which pins the
@@ -73,7 +73,7 @@ ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 QUIET = "> /dev/null 2>&1"
 # Bytes the server log held before this test started the stack.
 LOG_OFFSET = 0
-# The writer's install pause, and the hold every bridge read takes between
+# The writer's install pause, and the hold every OLAP read takes between
 # its read view fence and its scan.
 PAUSE_MS = 1500
 FENCE_HOLD_MS = 2500
@@ -85,9 +85,9 @@ SERVER_ENV = (
     f"=sleep:{FENCE_HOLD_MS}")
 SERVER_CONF = {
     # One analytical thread: the scan has to outlive the install pause.
-    "bridge_threads": 1,
+    "olap_threads": 1,
     # The scan tallies, read back from the server log.
-    "bridge_debug": 1,
+    "olap_trace": 1,
     # The table is loaded one row per transaction, because the install pause
     # fires between the row installs of any larger one.
     "commit_durability": "async"}
@@ -283,7 +283,7 @@ class Reader(threading.Thread):
 
 
 def last_scan_tally():
-    """Scan tallies of the most recent bridge request, from the server log.
+    """Scan tallies of the most recent OLAP request, from the server log.
 
     Each request logs its statement and then one tally line per table, so the
     lines after the last statement belong to the read just finished.
@@ -571,7 +571,7 @@ def run_probe(user, password):
 def main(user, password):
     os.environ.pop("MYSQL_UNIX_PORT", None)
     print(f"restarting stack with {PAUSE_MS}ms install sync point, "
-          f"{FENCE_HOLD_MS}ms fence hold and one bridge thread")
+          f"{FENCE_HOLD_MS}ms fence hold and one OLAP thread")
     sh(f"./scripts/stop_mysql.sh {QUIET}")
     sh(f"./scripts/stop_server.sh {QUIET}")
     ensure_stack_stopped()

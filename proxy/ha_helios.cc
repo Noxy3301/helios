@@ -303,7 +303,7 @@ int ha_helios::external_lock(THD *thd, int lock_type) {
   }
 
   // The server count is authoritative over the local shards, which count
-  // only this proxy's committed deltas.
+  // only this query node's committed deltas.
   seed_row_count_from_cache(get_proxy());
 
   return 0;

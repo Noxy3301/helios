@@ -169,7 +169,7 @@ class ItemColumnarValue final : public Item_string {
 };
 
 // Statement-local state owned by LEX::secondary_engine_execution_context.
-// external_lock records the DuckDB bridge request; ExecuteDuckdbBridge
+// external_lock records the DuckDB executor request; execute_duckdb_query
 // consumes it after MySQL calls JOIN::override_executor_func.
 class ColumnarExecutionContext : public Secondary_engine_execution_context {
  public:
@@ -188,7 +188,7 @@ class ColumnarExecutionContext : public Secondary_engine_execution_context {
   }
 
   // Built by external_lock (post-resolve, pre-optimize), shipped by
-  // ExecuteDuckdbBridge. A refused or never-built statement is declined by
+  // execute_duckdb_query. A refused or never-built statement is declined by
   // OptimizeSecondaryEngine; the reason lives in `refusal`.
   Helios::Protocol::TxExecuteDuckdbQuery::Request duckdb_request;
   bool request_build_attempted = false;
@@ -347,15 +347,15 @@ bool RoundDecimalText(const char *ptr, size_t len, uint32_t target_scale,
  *
  * MySQL has already sent result-set metadata for the original SELECT list;
  * this override only ships value-only Item carriers that match it. The
- * response rows use the proxy row format (unpack_row_fields).
+ * response rows use the Helios packed row format (unpack_row_fields).
  */
-bool ExecuteDuckdbBridge(JOIN *join, Query_result *result) {
+bool execute_duckdb_query(JOIN *join, Query_result *result) {
   THD *thd = join->thd;
   auto *ctx = static_cast<ColumnarExecutionContext *>(
       thd->lex->secondary_engine_execution_context());
   if (ctx == nullptr || !ctx->duckdb_ready) {
     return RaiseColumnarError(thd,
-                              "HELIOS_COLUMNAR: no duckdb-bridge plan");
+                              "HELIOS_COLUMNAR: no duckdb executor plan");
   }
 
   std::shared_ptr<HeliosProxy> proxy = helios::acquire_shared_proxy(thd);
@@ -367,8 +367,8 @@ bool ExecuteDuckdbBridge(JOIN *join, Query_result *result) {
   if (!proxy->tx_execute_duckdb_query(ctx->duckdb_request, &rpc) ||
       !rpc.ok()) {
     char message[192];
-    snprintf(message, sizeof(message), "HELIOS_COLUMNAR duckdb-bridge: %s",
-             rpc.error().empty() ? "duckdb bridge RPC failed"
+    snprintf(message, sizeof(message), "HELIOS_COLUMNAR duckdb executor: %s",
+             rpc.error().empty() ? "duckdb executor RPC failed"
                                  : rpc.error().c_str());
     return RaiseColumnarError(thd, message);
   }
@@ -402,7 +402,7 @@ bool ExecuteDuckdbBridge(JOIN *join, Query_result *result) {
     if (!unpack_row_fields(row, &fields) || fields.size() != expected) {
       return RaiseColumnarError(
           thd,
-          "HELIOS_COLUMNAR duckdb-bridge: malformed row (DuckDB result "
+          "HELIOS_COLUMNAR duckdb executor: malformed row (DuckDB result "
           "column count may not match the original SELECT list)");
     }
 
@@ -470,7 +470,7 @@ bool OptimizeSecondaryEngine(THD *, LEX *lex) {
     return RaiseColumnarError(lex->thd, message.c_str());
   }
   ctx->duckdb_ready = true;
-  join->override_executor_func = ExecuteDuckdbBridge;
+  join->override_executor_func = execute_duckdb_query;
   return false;
 }
 

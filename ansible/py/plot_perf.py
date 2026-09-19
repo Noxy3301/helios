@@ -140,8 +140,8 @@ def classify_sched_sub(symbol):
     return "other"
 
 
-# --- Proxy-specific classification ---
-PROXY_CATEGORIES = {
+# --- Plugin-specific classification ---
+PLUGIN_CATEGORIES = {
     "context_switch": {"finish_task_switch.isra.0"},
     "mysql_parser": {"MYSQLparse", "lex_one_token", "Lex_hash::get_hash_symbol",
                      "digest_add_token", "MYSQLlex"},
@@ -161,7 +161,7 @@ PROXY_CATEGORIES = {
 }
 
 
-def classify_proxy(symbol, lib, kind):
+def classify_plugin(symbol, lib, kind):
     clean = symbol.split("(")[0].strip()
     # ha_helios
     if "ha_helios" in lib:
@@ -176,8 +176,8 @@ def classify_proxy(symbol, lib, kind):
     for substr in NETWORK_SYMBOLS_SUBSTR:
         if substr in symbol.lower():
             return "network"
-    # Proxy-specific categories
-    for cat, syms in PROXY_CATEGORIES.items():
+    # Plugin-specific categories
+    for cat, syms in PLUGIN_CATEGORIES.items():
         for s in syms:
             if s in clean:
                 return cat
@@ -206,7 +206,7 @@ CATEGORY_LABELS = {
     "libstdcpp": "libstdc++",
     "other_user": "Other",
     "unresolved": "Other (unresolved)",
-    # proxy
+    # plugin
     "ha_helios": "ha_helios (SE plugin)",
     "mysql_parser": "MySQL parser + lexer",
     "mysql_optimizer": "MySQL optimizer",
@@ -226,7 +226,7 @@ CATEGORY_COLORS = {
     "libstdcpp": "#1abc9c",
     "other_user": "#bdc3c7",
     "unresolved": "#ecf0f1",
-    # proxy
+    # plugin
     "ha_helios": "#2ecc71",
     "mysql_parser": "#e67e22",
     "mysql_optimizer": "#d35400",
@@ -253,8 +253,8 @@ def main():
     parser.add_argument("input", help="perf report --stdio text file")
     parser.add_argument("--output", "-o", default=None, help="Output PNG path")
     parser.add_argument("--vcpu", type=int, default=64, help="vCPU count")
-    parser.add_argument("--mode", default="server", choices=["server", "proxy"],
-                        help="server (storage) or proxy (mysqld)")
+    parser.add_argument("--mode", default="server", choices=["server", "plugin"],
+                        help="server (storage) or plugin (mysqld)")
     args = parser.parse_args()
 
     entries = parse_perf_report(args.input)
@@ -262,7 +262,7 @@ def main():
         print("No entries parsed.", file=sys.stderr)
         return 1
 
-    classifier = classify if args.mode == "server" else classify_proxy
+    classifier = classify if args.mode == "server" else classify_plugin
 
     # Aggregate
     categories = {}
@@ -329,7 +329,7 @@ def main():
     ax_pie.legend(wedges, [f"{l} ({s:.1f}%)" for l, s in zip(labels, sizes)],
                   loc="center left", bbox_to_anchor=(-0.45, 0.5), fontsize=7.5)
 
-    mode_label = "Helios server" if args.mode == "server" else "MySQL Proxy"
+    mode_label = "Helios server" if args.mode == "server" else "MySQL plugin"
     ax_pie.set_title(f"{mode_label}\nCPU Breakdown ({args.vcpu} vCPU)", fontsize=12)
 
     # Panel 2: Top functions bar chart (all categories)

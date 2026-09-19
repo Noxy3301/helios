@@ -5,8 +5,9 @@ return a complete committed state and a read issued after a commit returns
 to see that commit. Per-group write counters cannot provide this: they
 return to even after every ROW install, so a reader scheduled between two
 row installs of a multi-row commit observes a stable-looking half-applied
-table. The bridge reads a read view opened behind the read view fence, with
-before-image resolution instead, and this test demands consistent results.
+table. The DuckDB executor reads a read view opened behind the read view
+fence, with before-image resolution instead, and this test demands
+consistent results.
 
 The test opens the install window wide and synchronizes on it instead of
 racing:
@@ -14,7 +15,7 @@ racing:
     sync point set to sleep, so the install loop stays open between
     consecutive row installs; every commit path goes through it (see
     server/storage/src/util/debug_sync.h)
-  - FORCED SELECTs take the columnar offload through the bridge, the only
+  - FORCED SELECTs take the columnar offload through the executor, the only
     columnar executor
   - a writer thread signals right before COMMIT of a two-row-install
     transaction; the main thread then runs FORCED SELECTs while that
@@ -55,7 +56,7 @@ from utils.connection import get_connection
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 QUIET = "> /dev/null 2>&1"
 PAUSE_MS = 1500
-# The read-view-before-write scenario holds every bridge read open between
+# The read-view-before-write scenario holds every OLAP read open between
 # its read view fence and its scan; shorter than PAUSE_MS so the held read
 # finishes while the writer's paused COMMIT is still in flight.
 FENCE_HOLD_MS = 1000
@@ -67,7 +68,7 @@ SYNC_POINT_ENV = (
     "HELIOS_DEBUG_SYNC_PAX_VIEW_AFTER_FENCE"
     f"=sleep:{FENCE_HOLD_MS}")
 
-# The bridge resolves tables through the statement's own resolved
+# The executor resolves tables through the statement's own resolved
 # references, so queries here simply run with USE <db> and unqualified
 # table names.
 DB = "ha_helios_test"
@@ -251,7 +252,7 @@ def run_scenario(cursor, user, password, scenario):
         secondary_after = secondary_execution_count(cursor)
         # Primary probe: OFF forbids the secondary engine (ON would still
         # allow it, and a wrong primary state could hide behind a correct
-        # bridge); the counter must not advance across it.
+        # OLAP path); the counter must not advance across it.
         cursor.execute("SET SESSION use_secondary_engine = OFF")
         cursor.execute(f"SELECT id, v FROM {table} ORDER BY id")
         primary_rows = dict(cursor.fetchall())
@@ -477,7 +478,7 @@ def main(user, password):
     # 127.0.0.1:3307 and must not follow an inherited socket elsewhere.
     os.environ.pop("MYSQL_UNIX_PORT", None)
 
-    print(f"restarting stack with {PAUSE_MS}ms install sync point + bridge")
+    print(f"restarting stack with {PAUSE_MS}ms install sync point + OLAP")
     sh(f"./scripts/stop_mysql.sh {QUIET}")
     sh(f"./scripts/stop_server.sh {QUIET}")
     ensure_stack_stopped()

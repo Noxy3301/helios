@@ -10,7 +10,7 @@ struct LEX;
 namespace helios_columnar {
 
 /**
- * @brief Builds the duckdb bridge request from MySQL's resolved statement.
+ * @brief Builds the DuckDB executor request from MySQL's resolved statement.
  *
  * @details Runs after resolution and before optimization, so the Item trees
  * are the permanent resolved ones, not yet edited in place by the

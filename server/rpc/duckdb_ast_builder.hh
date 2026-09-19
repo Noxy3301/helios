@@ -11,12 +11,12 @@ namespace duckdb {
 class SelectStatement;
 }
 
-namespace duckdb_bridge {
+namespace olap {
 
 /**
  * @brief Constructs a DuckDB parsed AST from a duckdb-query request.
  *
- * @details The request is the proxy's serialization of MySQL's resolved
+ * @details The request is the plugin's serialization of MySQL's resolved
  * statement; no SQL text is involved and DuckDB's parser never runs. Every
  * node kind is translated by an explicit rule; a request holding anything
  * without a rule is refused, never approximated. Base tables are referenced
@@ -33,4 +33,4 @@ AstBuildResult BuildSelectStatement(
     const Helios::Protocol::TxExecuteDuckdbQuery::Request& request,
     const std::vector<uintptr_t>& table_handles);
 
-}  // namespace duckdb_bridge
+}  // namespace olap

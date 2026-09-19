@@ -30,11 +30,11 @@ struct ServerConfig {
     /// One checkpoint this many milliseconds after startup; zero writes none.
     size_t checkpoint_once_after_ms = 0;
     /// DuckDB thread pool size; zero takes a quarter of the hardware threads.
-    uint64_t bridge_threads = 0;
+    uint64_t olap_threads = 0;
     /// DuckDB memory bound in bytes; zero takes DuckDB's own default.
-    uint64_t bridge_mem_limit_bytes = 0;
-    /// Whether the analytical bridge writes its trace lines.
-    bool bridge_debug = false;
+    uint64_t olap_mem_limit_bytes = 0;
+    /// Whether the DuckDB executor writes its trace lines.
+    bool olap_trace = false;
     /// Upper bound on the read view fence wait, in milliseconds.
     uint32_t read_view_fence_timeout_ms = 5000;
     /// The lowest level the log keeps: trace, debug, info, warning, error,

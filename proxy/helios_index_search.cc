@@ -373,7 +373,7 @@ int ha_helios::execute_unique_point(uchar *buf, HeliosTransaction *tx) {
     return 0;
   } else {
     // Secondary UNIQUE: read_secondary_index → read primary key
-    // Proxy adaptation: read_secondary_index returns vector<string> (primary keys)
+    // Plugin adaptation: read_secondary_index returns vector<string> (primary keys)
     auto primary_keys = tx->read_secondary_index(
         current_index_name, current_plan_.packed_start_key);
 

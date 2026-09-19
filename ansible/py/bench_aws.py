@@ -557,7 +557,7 @@ def _plot_perf_reports(result_root):
     plot_dir = config_root / "_plot"
     plot_dir.mkdir(parents=True, exist_ok=True)
 
-    role_modes = {"storage": "server", "mysql": "proxy"}
+    role_modes = {"storage": "server", "mysql": "plugin"}
     for role, mode in role_modes.items():
         cfg = CLUSTER.get(role)
         if not cfg or cfg["count"] == 0:

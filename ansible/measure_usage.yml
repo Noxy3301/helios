@@ -453,13 +453,13 @@
         mkdir -p {{ sample_dir }}
         pid=$(pgrep -f '[r]untime_output_directory/mysqld' | head -n1 || true)
         if [ -z "$pid" ]; then
-          echo "mysqld not running, skipping perf" > {{ sample_dir }}/perf-proxy-{{ run_id }}.log
+          echo "mysqld not running, skipping perf" > {{ sample_dir }}/perf-plugin-{{ run_id }}.log
           exit 0
         fi
         nohup {{ perf_bin }} record -g -F {{ perf_freq }} -p "$pid" \
-          -o {{ sample_dir }}/perf-proxy-{{ run_id }}.data \
-          -- sleep 3600 > {{ sample_dir }}/perf-proxy-{{ run_id }}.log 2>&1 &
-        echo $! > {{ sample_dir }}/perf-proxy-{{ run_id }}.pid
+          -o {{ sample_dir }}/perf-plugin-{{ run_id }}.data \
+          -- sleep 3600 > {{ sample_dir }}/perf-plugin-{{ run_id }}.log 2>&1 &
+        echo $! > {{ sample_dir }}/perf-plugin-{{ run_id }}.pid
       args:
         executable: /bin/bash
 
@@ -566,8 +566,8 @@
     - name: Stop perf and generate reports (mysql) [early]
       when: (enable_perf | bool) and inventory_hostname in groups.get('mysql', [])
       shell: |
-        if [ -f {{ sample_dir }}/perf-proxy-{{ run_id }}.pid ]; then
-          PID=$(cat {{ sample_dir }}/perf-proxy-{{ run_id }}.pid)
+        if [ -f {{ sample_dir }}/perf-plugin-{{ run_id }}.pid ]; then
+          PID=$(cat {{ sample_dir }}/perf-plugin-{{ run_id }}.pid)
           if kill -0 "$PID" 2>/dev/null; then
             kill -INT "$PID"
             for i in $(seq 1 30); do
@@ -576,15 +576,15 @@
             done
           fi
         fi
-        if [ -f {{ sample_dir }}/perf-proxy-{{ run_id }}.data ] && \
-           [ "$(stat -c%s {{ sample_dir }}/perf-proxy-{{ run_id }}.data 2>/dev/null)" -gt 1000 ]; then
-          {{ perf_bin | default('perf') }} report -i {{ sample_dir }}/perf-proxy-{{ run_id }}.data \
+        if [ -f {{ sample_dir }}/perf-plugin-{{ run_id }}.data ] && \
+           [ "$(stat -c%s {{ sample_dir }}/perf-plugin-{{ run_id }}.data 2>/dev/null)" -gt 1000 ]; then
+          {{ perf_bin | default('perf') }} report -i {{ sample_dir }}/perf-plugin-{{ run_id }}.data \
             --stdio --no-children -g none --percent-limit 0.1 \
-            > {{ sample_dir }}/perf-report-proxy-{{ run_id }}.txt 2>&1
-          {{ perf_bin | default('perf') }} report -i {{ sample_dir }}/perf-proxy-{{ run_id }}.data \
+            > {{ sample_dir }}/perf-report-plugin-{{ run_id }}.txt 2>&1
+          {{ perf_bin | default('perf') }} report -i {{ sample_dir }}/perf-plugin-{{ run_id }}.data \
             --stdio --no-children -g flat,0,caller --percent-limit 0.5 \
-            > {{ sample_dir }}/perf-callers-proxy-{{ run_id }}.txt 2>&1
-          rm -f {{ sample_dir }}/perf-proxy-{{ run_id }}.data
+            > {{ sample_dir }}/perf-callers-plugin-{{ run_id }}.txt 2>&1
+          rm -f {{ sample_dir }}/perf-plugin-{{ run_id }}.data
         fi
       args:
         executable: /bin/bash
@@ -1036,8 +1036,8 @@
         dest: "{{ result_dir }}/mysql/{{ inventory_hostname }}/"
         flat: yes
       loop:
-        - "{{ sample_dir }}/perf-report-proxy-{{ run_id }}.txt"
-        - "{{ sample_dir }}/perf-callers-proxy-{{ run_id }}.txt"
+        - "{{ sample_dir }}/perf-report-plugin-{{ run_id }}.txt"
+        - "{{ sample_dir }}/perf-callers-plugin-{{ run_id }}.txt"
       failed_when: false
 
     - name: "Gate: every MySQL carried its share of the commits"
