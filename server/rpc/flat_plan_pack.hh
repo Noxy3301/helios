@@ -15,6 +15,6 @@ namespace flat_plan {
  * alive.
  */
 void pack(Helios::Protocol::TxExecuteReadPlan::Response& r,
-                      std::string& out);
+          std::string& out);
 
 }  // namespace flat_plan

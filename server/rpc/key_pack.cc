@@ -16,7 +16,7 @@ std::string next_lexicographic_key(std::string key) {
 }
 
 std::string_view unpack_row_field(const std::string& row,
-                                      int column_index) {
+                                  int column_index) {
     size_t offset = 0;
     int field_index = 0;
     const int target_field = column_index + 1; // field 0 is null flags.
@@ -82,7 +82,7 @@ bool unpack_leading_int_key(std::string_view key, int64_t& out) {
 }
 
 std::string pack_column_as_int_key(std::string_view column,
-                                     int64_t int_delta) {
+                                   int64_t int_delta) {
     std::string tmp(column);
     int64_t value = std::strtoll(tmp.c_str(), nullptr, 10);
     return pack_int_key_part(value + int_delta);

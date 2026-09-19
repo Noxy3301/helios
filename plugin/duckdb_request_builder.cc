@@ -291,7 +291,7 @@ bool build_comparison(Builder& b, Item_func* function,
         return false;
     }
     return compare_type_of(b, cmp->left(), cmp->right(),
-                         cmp->mutable_compare_as());
+                           cmp->mutable_compare_as());
 }
 
 bool build_arithmetic(Builder& b, Item_func* function,
@@ -321,27 +321,27 @@ bool build_func(Builder& b, Item_func* function, Resolved::Expr* out) {
     switch (function->functype()) {
         case Item_func::EQ_FUNC:
             return build_comparison(b, function, Resolved::Comparison::EQ,
-                                       out);
+                                    out);
         case Item_func::NE_FUNC:
             return build_comparison(b, function, Resolved::Comparison::NE,
-                                       out);
+                                    out);
         case Item_func::LT_FUNC:
             return build_comparison(b, function, Resolved::Comparison::LT,
-                                       out);
+                                    out);
         case Item_func::LE_FUNC:
             return build_comparison(b, function, Resolved::Comparison::LE,
-                                       out);
+                                    out);
         case Item_func::GT_FUNC:
             return build_comparison(b, function, Resolved::Comparison::GT,
-                                       out);
+                                    out);
         case Item_func::GE_FUNC:
             return build_comparison(b, function, Resolved::Comparison::GE,
-                                       out);
+                                    out);
         case Item_func::NOT_FUNC: {
             if (function->argument_count() != 1) return b.refuse("NOT arity");
             out->mutable_result_type()->set_kind(Resolved::BOOL);
             return build_expr(b, function->arguments()[0],
-                                 out->mutable_not_()->mutable_arg());
+                              out->mutable_not_()->mutable_arg());
         }
         case Item_func::ISNULL_FUNC:
         case Item_func::ISNOTNULL_FUNC: {
@@ -353,7 +353,7 @@ bool build_func(Builder& b, Item_func* function, Resolved::Expr* out) {
             test->set_negated(function->functype() ==
                               Item_func::ISNOTNULL_FUNC);
             return build_expr(b, function->arguments()[0],
-                                 test->mutable_arg());
+                              test->mutable_arg());
         }
         case Item_func::BETWEEN: {
             auto* between_item = down_cast<Item_func_between*>(function);
@@ -364,21 +364,21 @@ bool build_func(Builder& b, Item_func* function, Resolved::Expr* out) {
             auto* between = out->mutable_between();
             between->set_negated(between_item->negated);
             if (!build_expr(b, function->arguments()[0],
-                               between->mutable_value()) ||
+                            between->mutable_value()) ||
                 !build_expr(b, function->arguments()[1],
-                               between->mutable_low()) ||
+                            between->mutable_low()) ||
                 !build_expr(b, function->arguments()[2],
-                               between->mutable_high())) {
+                            between->mutable_high())) {
                 return false;
             }
             Resolved::ResolvedType low_type;
             if (!compare_type_of(b, between->value(), between->low(),
-                               &low_type)) {
+                                 &low_type)) {
                 return false;
             }
             Resolved::ResolvedType high_type;
             if (!compare_type_of(b, between->value(), between->high(),
-                               &high_type)) {
+                                 &high_type)) {
                 return false;
             }
             // One comparison type governs both bounds, as MySQL aggregates
@@ -449,12 +449,12 @@ bool build_func(Builder& b, Item_func* function, Resolved::Expr* out) {
             auto* in_list = out->mutable_in_list();
             in_list->set_negated(in_item->negated);
             if (!build_expr(b, function->arguments()[0],
-                               in_list->mutable_value())) {
+                            in_list->mutable_value())) {
                 return false;
             }
             for (uint i = 1; i < function->argument_count(); i++) {
                 if (!build_expr(b, function->arguments()[i],
-                                   in_list->add_list())) {
+                                in_list->add_list())) {
                     return false;
                 }
             }
@@ -471,27 +471,27 @@ bool build_func(Builder& b, Item_func* function, Resolved::Expr* out) {
         }
         case Item_func::PLUS_FUNC:
             return build_arithmetic(b, function, Resolved::Arithmetic::ADD,
-                                       out);
+                                    out);
         case Item_func::MINUS_FUNC:
             return build_arithmetic(b, function, Resolved::Arithmetic::SUB,
-                                       out);
+                                    out);
         case Item_func::MUL_FUNC:
             return build_arithmetic(b, function, Resolved::Arithmetic::MUL,
-                                       out);
+                                    out);
         case Item_func::DIV_FUNC:
             return build_arithmetic(b, function, Resolved::Arithmetic::DIV,
-                                       out);
+                                    out);
         case Item_func::MOD_FUNC:
             return build_arithmetic(b, function, Resolved::Arithmetic::MOD,
-                                       out);
+                                    out);
         case Item_func::LIKE_FUNC: {
             auto* like_item = down_cast<Item_func_like*>(function);
             out->mutable_result_type()->set_kind(Resolved::BOOL);
             auto* like = out->mutable_like();
             if (!build_expr(b, function->arguments()[0],
-                               like->mutable_value()) ||
+                            like->mutable_value()) ||
                 !build_expr(b, function->arguments()[1],
-                               like->mutable_pattern())) {
+                            like->mutable_pattern())) {
                 return false;
             }
             if (like->value().result_type().kind() != Resolved::VARCHAR ||
@@ -531,7 +531,7 @@ bool build_func(Builder& b, Item_func* function, Resolved::Expr* out) {
             for (uint i = 0; i < branches; i++) {
                 auto* branch = case_when->add_branches();
                 if (!build_expr(b, function->arguments()[2 * i],
-                                   branch->mutable_when())) {
+                                branch->mutable_when())) {
                     return false;
                 }
                 if (branch->when().result_type().kind() != Resolved::BOOL) {
@@ -539,12 +539,12 @@ bool build_func(Builder& b, Item_func* function, Resolved::Expr* out) {
                                     "(simple CASE is unsupported)");
                 }
                 if (!build_expr(b, function->arguments()[2 * i + 1],
-                                   branch->mutable_then())) {
+                                branch->mutable_then())) {
                     return false;
                 }
             }
             return build_expr(b, function->arguments()[count - 1],
-                                 case_when->mutable_else_result());
+                              case_when->mutable_else_result());
         }
         case Item_func::YEAR_FUNC: {
             if (function->argument_count() != 1) return b.refuse("YEAR arity");
@@ -592,7 +592,7 @@ bool build_func(Builder& b, Item_func* function, Resolved::Expr* out) {
                 call->set_fn(Resolved::FunctionCall::SUBSTRING);
                 for (uint i = 0; i < 3; i++) {
                     if (!build_expr(b, function->arguments()[i],
-                                       call->add_args())) {
+                                    call->add_args())) {
                         return false;
                     }
                 }
@@ -605,7 +605,7 @@ bool build_func(Builder& b, Item_func* function, Resolved::Expr* out) {
                 auto* call = out->mutable_function();
                 call->set_fn(Resolved::FunctionCall::ASCII);
                 return build_expr(b, function->arguments()[0],
-                                     call->add_args());
+                                  call->add_args());
             }
             return b.refuse(std::string("function '") + name +
                             "' is unsupported");
@@ -624,7 +624,7 @@ bool build_subselect(Builder& b, Item_subselect* subselect,
         case Item_subselect::SINGLEROW_SUBS: {
             subquery->set_kind(Resolved::Subquery::SCALAR);
             if (!build_block(b, unit->first_query_block(),
-                                subquery->mutable_query())) {
+                             subquery->mutable_query())) {
                 return false;
             }
             if (subquery->query().select_size() != 1) {
@@ -653,8 +653,8 @@ bool build_subselect(Builder& b, Item_subselect* subselect,
             subquery->set_kind(Resolved::Subquery::EXISTS);
             subquery->set_negated(negated);
             return build_block(b, unit->first_query_block(),
-                                  subquery->mutable_query(),
-                                  /*ignore_limit=*/true);
+                               subquery->mutable_query(),
+                               /*ignore_limit=*/true);
         }
         case Item_subselect::IN_SUBS: {
             auto* in_subselect = down_cast<Item_in_subselect*>(subselect);
@@ -685,12 +685,12 @@ bool build_subselect(Builder& b, Item_subselect* subselect,
             in_subquery->set_kind(Resolved::Subquery::IN);
             in_subquery->set_negated(negated);
             if (!build_expr(b, in_subselect->left_expr,
-                               in_subquery->mutable_left())) {
+                            in_subquery->mutable_left())) {
                 return false;
             }
             if (!build_block(b, unit->first_query_block(),
-                                in_subquery->mutable_query(),
-                                /*ignore_limit=*/true)) {
+                             in_subquery->mutable_query(),
+                             /*ignore_limit=*/true)) {
                 return false;
             }
             if (in_subquery->query().select_size() != 1) {
@@ -728,8 +728,9 @@ bool build_aggregate(Builder& b, Item_sum* sum, Resolved::Expr* out) {
     switch (sum->sum_func()) {
         case Item_sum::COUNT_FUNC: {
             out->mutable_result_type()->set_kind(Resolved::INT64);
-            Item* arg =
-                sum->argument_count() == 1 ? real_item(sum->get_arg(0)) : nullptr;
+            Item* arg = sum->argument_count() == 1
+                            ? real_item(sum->get_arg(0))
+                            : nullptr;
             // COUNT over a never-null constant is COUNT(*): the same rows
             // are counted, and this is the shape MySQL itself uses.
             if (arg != nullptr && arg->const_item() && !arg->is_nullable()) {
@@ -980,7 +981,7 @@ bool build_expr(Builder& b, Item* item, Resolved::Expr* out) {
             return build_aggregate(b, down_cast<Item_sum*>(item), out);
         case Item::SUBSELECT_ITEM:
             return build_subselect(b, down_cast<Item_subselect*>(item),
-                                      out);
+                                   out);
         default:
             return b.refuse("item type " + std::to_string(item->type()) +
                             " is unsupported");
@@ -1064,7 +1065,7 @@ bool build_nest(Builder& b, const mem_root_deque<Table_ref*>& nest,
             auto* derived = leaf.mutable_derived();
             derived->set_relation_id(relation_id);
             if (!build_block(b, unit->first_query_block(),
-                                derived->mutable_query())) {
+                             derived->mutable_query())) {
                 return false;
             }
             for (const auto& item : derived->query().select()) {
@@ -1094,13 +1095,13 @@ bool build_nest(Builder& b, const mem_root_deque<Table_ref*>& nest,
             }
             join->set_kind(Resolved::JoinRel::LEFT);
             if (!build_expr(b, table_ref->join_cond(),
-                               join->mutable_condition())) {
+                            join->mutable_condition())) {
                 return false;
             }
         } else if (table_ref->join_cond() != nullptr) {
             join->set_kind(Resolved::JoinRel::INNER);
             if (!build_expr(b, table_ref->join_cond(),
-                               join->mutable_condition())) {
+                            join->mutable_condition())) {
                 return false;
             }
         } else {

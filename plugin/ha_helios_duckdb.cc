@@ -235,7 +235,7 @@ struct UnpackedField {
  * 0 of the row marks the NULL columns.
  */
 [[maybe_unused]] bool unpack_row_fields(const std::string &row,
-                                      std::vector<UnpackedField> *out) {
+                                        std::vector<UnpackedField> *out) {
   out->clear();
   size_t offset = 0;
 
@@ -543,11 +543,11 @@ handler *create_duckdb_handler(handlerton *hton, TABLE_SHARE *table_share,
 }  // namespace
 
 ha_helios_duckdb::ha_helios_duckdb(handlerton *hton,
-                                             TABLE_SHARE *table_share_arg)
+                                   TABLE_SHARE *table_share_arg)
     : handler(hton, table_share_arg) {}
 
 int ha_helios_duckdb::open(const char *, int, unsigned int,
-                                const dd::Table *) {
+                           const dd::Table *) {
   THR_LOCK *lock =
       loaded_tables->lock(table_share->db.str, table_share->table_name.str);
   if (lock == nullptr) {
@@ -604,8 +604,8 @@ int ha_helios_duckdb::info(unsigned int flags) {
 }
 
 ha_rows ha_helios_duckdb::records_in_range(unsigned int index,
-                                                key_range *min_key,
-                                                key_range *max_key) {
+                                           key_range *min_key,
+                                           key_range *max_key) {
   handler *primary = ha_get_primary_handler();
   return primary == nullptr ? handler::records_in_range(index, min_key, max_key)
                             : primary->records_in_range(index, min_key,
@@ -613,8 +613,8 @@ ha_rows ha_helios_duckdb::records_in_range(unsigned int index,
 }
 
 unsigned long ha_helios_duckdb::index_flags(unsigned int index,
-                                                 unsigned int part,
-                                                 bool all_parts) const {
+                                            unsigned int part,
+                                            bool all_parts) const {
   const handler *primary = ha_get_primary_handler();
   const unsigned long primary_flags =
       primary == nullptr ? 0 : primary->index_flags(index, part, all_parts);
@@ -633,7 +633,7 @@ int ha_helios_duckdb::external_lock(THD *thd, int lock_type) {
   if (ctx == nullptr || ctx->request_build_attempted) return 0;
   ctx->request_build_attempted = true;
   if (!build_olap_request(thd, thd->lex, &ctx->duckdb_request,
-                              &ctx->refusal) &&
+                          &ctx->refusal) &&
       ctx->refusal.empty()) {
     ctx->refusal = "request build failed";
   }
@@ -641,7 +641,7 @@ int ha_helios_duckdb::external_lock(THD *thd, int lock_type) {
 }
 
 THR_LOCK_DATA **ha_helios_duckdb::store_lock(THD *, THR_LOCK_DATA **to,
-                                                  thr_lock_type lock_type) {
+                                             thr_lock_type lock_type) {
   if (lock_type != TL_IGNORE && lock_data_.type == TL_UNLOCK)
     lock_data_.type = lock_type;
   *to++ = &lock_data_;
@@ -655,8 +655,8 @@ int ha_helios_duckdb::load_table(const TABLE &table) {
 }
 
 int ha_helios_duckdb::unload_table(const char *db_name,
-                                        const char *table_name,
-                                        bool error_if_not_loaded) {
+                                   const char *table_name,
+                                   bool error_if_not_loaded) {
   if (error_if_not_loaded &&
       !loaded_tables->contains(db_name, table_name)) {
     my_error(ER_SECONDARY_ENGINE_PLUGIN, MYF(0),

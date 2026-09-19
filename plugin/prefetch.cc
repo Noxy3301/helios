@@ -328,7 +328,7 @@ static std::string read_and_clear_tx_plan(THD *thd) {
 }
 
 void maybe_prefetch_for_transaction(THD *thd,
-                                            HeliosTransaction *tx) {
+                                    HeliosTransaction *tx) {
   if (tx == nullptr || srv_read_path != kReadPathPlan) return;
 
   const std::string plan_text = read_and_clear_tx_plan(thd);
@@ -520,7 +520,8 @@ int maybe_prefetch_for_single_table_dml_handler(
   if (single_table_dml_shape_rejection(thd, table) != nullptr) return 0;
 
   std::vector<HeliosProxy::ReadPlanStep> steps;
-  if (!compile_read_plan_for_single_table_dml(thd, table, index, search, &steps)) {
+  if (!compile_read_plan_for_single_table_dml(thd, table, index, search,
+                                              &steps)) {
     return 0;
   }
 
