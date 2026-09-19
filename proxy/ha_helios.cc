@@ -491,23 +491,11 @@ static TYPELIB commit_durability_typelib = {
     array_elements(commit_durability_names) - 1, "commit_durability_typelib",
     commit_durability_names, nullptr};
 
-// Publishes the requested mode on the storage server before the assignment,
-// so a switch the server refuses fails the SET GLOBAL.
-static int check_commit_durability(THD *, SYS_VAR *, void *save,
-                                   struct st_mysql_value *value) {
-  char buf[16];
-  int len = sizeof(buf);
-  const char *name = value->val_str(value, buf, &len);
-  const int mode = name != nullptr
-                       ? find_type(name, &commit_durability_typelib,
-                                   FIND_TYPE_BASIC) - 1
-                       : -1;
-  if (mode < 0) {
-    my_error(ER_WRONG_VALUE_FOR_VAR, MYF(0), "helios_commit_durability",
-             name != nullptr ? name : "");
-    return 1;
-  }
-
+// Publishes the mode on the storage server; a refused switch fails the SET
+// GLOBAL with the server's reason and leaves the variable as it was.
+static void update_commit_durability(THD *, SYS_VAR *, void *var_ptr,
+                                     const void *save) {
+  const ulong mode = *static_cast<const ulong *>(save);
   const std::string host =
       srv_server_host ? srv_server_host : std::string("127.0.0.1");
   HeliosProxy proxy(host, static_cast<int>(srv_server_port));
@@ -519,20 +507,19 @@ static int check_commit_durability(THD *, SYS_VAR *, void *save,
           &error)) {
     my_printf_error(ER_WRONG_VALUE_FOR_VAR, "helios_commit_durability: %s",
                     MYF(0), error.c_str());
-    return 1;
+    return;
   }
-
-  *static_cast<long *>(save) = mode;
-  return 0;
+  *static_cast<ulong *>(var_ptr) = mode;
 }
 
 static MYSQL_SYSVAR_ENUM(commit_durability, srv_commit_durability,
-                         PLUGIN_VAR_RQCMDARG,
+                         PLUGIN_VAR_RQCMDARG | PLUGIN_VAR_NOCMDOPT |
+                             PLUGIN_VAR_NOPERSIST,
                          "Commit acknowledgement contract of the storage "
                          "server: async returns before the log is on disk, "
                          "sync waits for it. Setting it switches the running "
                          "server.",
-                         check_commit_durability, nullptr,
+                         nullptr, update_commit_durability,
                          kCommitDurabilitySync, &commit_durability_typelib);
 static MYSQL_SYSVAR_BOOL(stats_drift_refresh, srv_stats_drift_refresh,
                          PLUGIN_VAR_OPCMDARG,

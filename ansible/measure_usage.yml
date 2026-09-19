@@ -116,7 +116,6 @@
             - name: Read the storage server before the switch
               shell: |
                 set -euo pipefail
-                measured="{{ helios_durability }}"
                 declared_load="{{ helios_load_durability | default(helios_durability) }}"
                 log=$(ls -t ~/helios/helios_logs/helios_storage_*.log 2>/dev/null \
                       | head -n1 || true)
@@ -177,7 +176,6 @@
                   exit 1
                 fi
                 echo "mode_before=$(policy_in_force)"
-                echo "mode_after=$measured"
                 echo "rss_kb_before=$(awk '/^VmRSS:/{print $2}' "/proc/$pid/status" || true)"
                 echo "wal_file_bytes_before=$(wal_file_bytes)"
               args:
@@ -209,6 +207,14 @@
                 pid=$(cat /tmp/helios_storage.pid)
                 total=$(du -Lbc ~/helios/helios_wal/wal*.log 2>/dev/null \
                         | tail -n1 | cut -f1 || true)
+                log=$(ls -t ~/helios/helios_logs/helios_storage_*.log | head -n1)
+                mode_after=$(grep -hoE 'Commit durability switched to [A-Z]+' "$log" \
+                             | tail -n1 | awk '{print tolower($NF)}' || true)
+                if [ "$mode_after" != "{{ helios_durability }}" ]; then
+                  echo "SWITCH_FAIL: the server is in ${mode_after:-the startup mode}, not {{ helios_durability }}" >&2
+                  exit 1
+                fi
+                echo "mode_after=$mode_after"
                 echo "rss_kb_after=$(awk '/^VmRSS:/{print $2}' "/proc/$pid/status" || true)"
                 echo "wal_file_bytes_after=${total:-0}"
               args:
