@@ -58,10 +58,5 @@ set(HELIOS_SOURCES ha_helios.cc ha_helios.hh
 add_definitions(-DMYSQL_SERVER)
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wno-error -Wextra -mcx16 -fPIC")
 
-if(WITH_HELIOS_STORAGE_ENGINE AND NOT WITHOUT_HELIOS_STORAGE_ENGINE)
-  mysql_add_plugin(helios_storage_engine ${HELIOS_SOURCES} STORAGE_ENGINE
-                   DEFAULT LINK_LIBRARIES helios_proto ext::libprotobuf extra::rapidjson)
-elseif(NOT WITHOUT_HELIOS_STORAGE_ENGINE)
-  mysql_add_plugin(helios_storage_engine ${HELIOS_SOURCES} STORAGE_ENGINE
-                   MODULE_ONLY LINK_LIBRARIES helios_proto ext::libprotobuf extra::rapidjson)
-endif()
+mysql_add_plugin(helios_storage_engine ${HELIOS_SOURCES} STORAGE_ENGINE
+                 MODULE_ONLY LINK_LIBRARIES helios_proto ext::libprotobuf extra::rapidjson)

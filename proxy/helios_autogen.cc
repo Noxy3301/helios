@@ -1,6 +1,5 @@
 #include "helios_autogen.hh"
 
-#include "helios_log.hh"
 
 #include <algorithm>
 #include <cstdint>
@@ -28,20 +27,6 @@
 extern handlerton *helios_hton;
 
 namespace {
-
-struct UnsupportedQep {
-  AccessPath::Type type{AccessPath::TABLE_SCAN};
-  std::string reason;
-};
-
-void set_unsupported(AccessPath *p, const char *reason, bool *ok,
-                     UnsupportedQep *unsupported) {
-  if (ok != nullptr) *ok = false;
-  if (unsupported != nullptr && unsupported->reason.empty()) {
-    unsupported->type = p != nullptr ? p->type : AccessPath::TABLE_SCAN;
-    unsupported->reason = reason != nullptr ? reason : "unsupported QEP node";
-  }
-}
 
 key_part_map first_n_keyparts_map(uint key_parts) {
   key_part_map map = 0;
@@ -73,7 +58,7 @@ int qep_table_field_index(TABLE *t, Field *f) {
 }
 
 void collect_qep_leaves(AccessPath *p, std::vector<AccessPath *> *out,
-                        bool *ok, UnsupportedQep *unsupported) {
+                        bool *ok) {
   if (p == nullptr || out == nullptr || ok == nullptr || !*ok) return;
   switch (p->type) {
     case AccessPath::TABLE_SCAN:
@@ -97,47 +82,45 @@ void collect_qep_leaves(AccessPath *p, std::vector<AccessPath *> *out,
       out->push_back(p);
       return;
     case AccessPath::NESTED_LOOP_JOIN:
-      collect_qep_leaves(p->nested_loop_join().outer, out, ok, unsupported);
-      collect_qep_leaves(p->nested_loop_join().inner, out, ok, unsupported);
+      collect_qep_leaves(p->nested_loop_join().outer, out, ok);
+      collect_qep_leaves(p->nested_loop_join().inner, out, ok);
       return;
     case AccessPath::BKA_JOIN:
-      collect_qep_leaves(p->bka_join().outer, out, ok, unsupported);
-      collect_qep_leaves(p->bka_join().inner, out, ok, unsupported);
+      collect_qep_leaves(p->bka_join().outer, out, ok);
+      collect_qep_leaves(p->bka_join().inner, out, ok);
       return;
     case AccessPath::HASH_JOIN:
       if ((p->hash_join().outer != nullptr &&
            p->hash_join().outer->parameter_tables != 0) ||
           (p->hash_join().inner != nullptr &&
            p->hash_join().inner->parameter_tables != 0)) {
-        set_unsupported(p, "parameterized hash join side", ok, unsupported);
+        *ok = false;
         return;
       }
-      collect_qep_leaves(p->hash_join().outer, out, ok, unsupported);
-      collect_qep_leaves(p->hash_join().inner, out, ok, unsupported);
+      collect_qep_leaves(p->hash_join().outer, out, ok);
+      collect_qep_leaves(p->hash_join().inner, out, ok);
       return;
     case AccessPath::FILTER:
-      collect_qep_leaves(p->filter().child, out, ok, unsupported);
+      collect_qep_leaves(p->filter().child, out, ok);
       return;
     case AccessPath::SORT:
-      collect_qep_leaves(p->sort().child, out, ok, unsupported);
+      collect_qep_leaves(p->sort().child, out, ok);
       return;
     case AccessPath::LIMIT_OFFSET:
-      collect_qep_leaves(p->limit_offset().child, out, ok, unsupported);
+      collect_qep_leaves(p->limit_offset().child, out, ok);
       return;
     case AccessPath::AGGREGATE:
-      collect_qep_leaves(p->aggregate().child, out, ok, unsupported);
+      collect_qep_leaves(p->aggregate().child, out, ok);
       return;
     case AccessPath::STREAM:
-      collect_qep_leaves(p->stream().child, out, ok, unsupported);
+      collect_qep_leaves(p->stream().child, out, ok);
       return;
     case AccessPath::TEMPTABLE_AGGREGATE:
       // MySQL can run GROUP BY by filling an internal temp table and reading it
       // back. Prefetch only needs the Helios reads that feed that temp table;
       // the temp-table leaves themselves are skipped in the compile loop.
-      collect_qep_leaves(p->temptable_aggregate().subquery_path, out, ok,
-                         unsupported);
-      collect_qep_leaves(p->temptable_aggregate().table_path, out, ok,
-                         unsupported);
+      collect_qep_leaves(p->temptable_aggregate().subquery_path, out, ok);
+      collect_qep_leaves(p->temptable_aggregate().table_path, out, ok);
       return;
     case AccessPath::MATERIALIZE:
       // Derived tables and materialized subqueries have the same shape: the
@@ -145,33 +128,33 @@ void collect_qep_leaves(AccessPath *p, std::vector<AccessPath *> *out,
       // local to MySQL.
       for (const MaterializePathParameters::QueryBlock &qb :
            p->materialize().param->query_blocks) {
-        collect_qep_leaves(qb.subquery_path, out, ok, unsupported);
+        collect_qep_leaves(qb.subquery_path, out, ok);
       }
-      collect_qep_leaves(p->materialize().table_path, out, ok, unsupported);
+      collect_qep_leaves(p->materialize().table_path, out, ok);
       return;
     case AccessPath::DELETE_ROWS:
-      collect_qep_leaves(p->delete_rows().child, out, ok, unsupported);
+      collect_qep_leaves(p->delete_rows().child, out, ok);
       return;
     case AccessPath::UPDATE_ROWS:
-      collect_qep_leaves(p->update_rows().child, out, ok, unsupported);
+      collect_qep_leaves(p->update_rows().child, out, ok);
       return;
     case AccessPath::WEEDOUT:
       // Semijoin duplicate weedout dedups locally via handler rowids;
       // position()/rnd_pos() re-reads hit the staged row cache.
-      collect_qep_leaves(p->weedout().child, out, ok, unsupported);
+      collect_qep_leaves(p->weedout().child, out, ok);
       return;
     case AccessPath::NESTED_LOOP_SEMIJOIN_WITH_DUPLICATE_REMOVAL:
       collect_qep_leaves(p->nested_loop_semijoin_with_duplicate_removal().outer,
-                         out, ok, unsupported);
+                         out, ok);
       collect_qep_leaves(p->nested_loop_semijoin_with_duplicate_removal().inner,
-                         out, ok, unsupported);
+                         out, ok);
       return;
     case AccessPath::ZERO_ROWS:
       // The optimizer proved this subtree returns nothing; no rows will be
       // read at runtime, so no prefetch step is needed.
       return;
     default:
-      set_unsupported(p, "unsupported QEP node", ok, unsupported);
+      *ok = false;
       return;
   }
 }
@@ -237,18 +220,16 @@ bool qep_leaf_info(AccessPath *p, TABLE **tbl, Index_lookup **ref,
 bool append_bound_keypart(
     TABLE *target, Index_lookup *ref, uint keypart_idx,
     Field *source_field, int source_step,
-    HeliosProxy::ReadPlanStep *step, std::string *reason) {
+    HeliosProxy::ReadPlanStep *step) {
   if (target == nullptr || target->s == nullptr || ref == nullptr ||
       step == nullptr || source_field == nullptr ||
       source_field->table == nullptr || ref->key < 0 ||
       ref->key >= static_cast<int>(target->s->keys)) {
-    if (reason != nullptr) *reason = "invalid bound keypart metadata";
     return false;
   }
 
   Field *target_field = target->key_info[ref->key].key_part[keypart_idx].field;
   if (!is_int32_key_field(target_field)) {
-    if (reason != nullptr) *reason = "non-INT4 join key";
     return false;
   }
 
@@ -272,7 +253,6 @@ bool append_bound_keypart(
 
   if (pk_pos == 0 && pk_parts == 1) {
     if (!is_int32_key_field(source_field)) {
-      if (reason != nullptr) *reason = "non-INT4 source key";
       return false;
     }
     binding.from_key = true;
@@ -280,7 +260,6 @@ bool append_bound_keypart(
     KEY &source_key = source_table->key_info[source_pk];
     for (int i = 0; i <= pk_pos; ++i) {
       if (!is_int32_key_field(source_key.key_part[i].field)) {
-        if (reason != nullptr) *reason = "non-INT4 source key slice";
         return false;
       }
     }
@@ -294,12 +273,10 @@ bool append_bound_keypart(
     binding.source_length = 4 + source_key.key_part[pk_pos].length;
   } else {
     if (!is_int32_key_field(source_field)) {
-      if (reason != nullptr) *reason = "non-INT4 source column";
       return false;
     }
     const int field_index = qep_table_field_index(source_table, source_field);
     if (field_index < 0) {
-      if (reason != nullptr) *reason = "source field not in table";
       return false;
     }
     binding.source_column = field_index + 1;
@@ -311,29 +288,23 @@ bool append_bound_keypart(
 }
 
 bool compile_index_range_scan(AccessPath *leaf, TABLE *table,
-                              HeliosProxy::ReadPlanStep *step,
-                              std::string *reason) {
+                              HeliosProxy::ReadPlanStep *step) {
   if (leaf == nullptr || table == nullptr || table->s == nullptr ||
       step == nullptr) {
-    if (reason != nullptr) *reason = "invalid range-scan metadata";
     return false;
   }
 
   const auto &range_scan = leaf->index_range_scan();
   if (range_scan.geometry) {
-    if (reason != nullptr) *reason = "geometry index range scan";
     return false;
   }
   if (range_scan.index >= table->s->keys) {
-    if (reason != nullptr) *reason = "invalid range-scan index";
     return false;
   }
   if (range_scan.num_ranges != 1) {
-    if (reason != nullptr) *reason = "multi-range index scan";
     return false;
   }
   if (range_scan.ranges == nullptr || range_scan.ranges[0] == nullptr) {
-    if (reason != nullptr) *reason = "missing range bounds";
     return false;
   }
 
@@ -352,7 +323,6 @@ bool compile_index_range_scan(AccessPath *leaf, TABLE *table,
     step->key_prefix = key_pack::pack_key(
         table, range_scan.index, range->min_key, range->min_keypart_map);
     if (range->min_keypart_map != 0 && step->key_prefix.empty()) {
-      if (reason != nullptr) *reason = "failed to pack range start key";
       return false;
     }
     // NEAR_MIN (exclusive lower): append one '\0' as the handler does for
@@ -367,7 +337,6 @@ bool compile_index_range_scan(AccessPath *leaf, TABLE *table,
     step->end_key_prefix = key_pack::pack_key(
         table, range_scan.index, range->max_key, range->max_keypart_map);
     if (range->max_keypart_map != 0 && step->end_key_prefix.empty()) {
-      if (reason != nullptr) *reason = "failed to pack range end key";
       return false;
     }
     if (!(range->flag & NEAR_MAX)) {
@@ -382,25 +351,21 @@ bool compile_index_range_scan(AccessPath *leaf, TABLE *table,
 bool compile_ref_lookup(
     TABLE *table, Index_lookup *ref,
     const std::unordered_map<TABLE *, int> &table_steps,
-    HeliosProxy::ReadPlanStep *step, std::string *reason) {
+    HeliosProxy::ReadPlanStep *step) {
   if (table == nullptr || table->s == nullptr || ref == nullptr ||
       step == nullptr) {
-    if (reason != nullptr) *reason = "invalid ref metadata";
     return false;
   }
   if (ref->key < 0 || ref->key >= static_cast<int>(table->s->keys)) {
-    if (reason != nullptr) *reason = "invalid ref index";
     return false;
   }
   if (ref->key_parts == 0 || ref->key_buff == nullptr ||
       ref->items == nullptr) {
-    if (reason != nullptr) *reason = "missing ref key buffer";
     return false;
   }
 
   KEY &key = table->key_info[ref->key];
   if (ref->key_parts > key.user_defined_key_parts) {
-    if (reason != nullptr) *reason = "ref uses too many keyparts";
     return false;
   }
 
@@ -420,22 +385,18 @@ bool compile_ref_lookup(
   for (uint kp = 0; kp < ref->key_parts; ++kp) {
     Item *item = ref->items[kp];
     if (item == nullptr) {
-      if (reason != nullptr) *reason = "missing ref keypart item";
       return false;
     }
     item = item->real_item();
     if (item == nullptr) {
-      if (reason != nullptr) *reason = "missing real ref keypart item";
       return false;
     }
 
     if (item->type() != Item::FIELD_ITEM) {
       if (!item->const_for_execution()) {
-        if (reason != nullptr) *reason = "non-constant non-field keypart";
         return false;
       }
       if (saw_binding) {
-        if (reason != nullptr) *reason = "constant keypart after binding";
         return false;
       }
       ++leading_constant_parts;
@@ -445,7 +406,6 @@ bool compile_ref_lookup(
     saw_binding = true;
     Item_field *item_field = down_cast<Item_field *>(item);
     if (item_field->field == nullptr || item_field->field->table == nullptr) {
-      if (reason != nullptr) *reason = "missing bound source field";
       return false;
     }
     bound_items.push_back({kp, item_field});
@@ -466,9 +426,6 @@ bool compile_ref_lookup(
         leaf_thd->lex->sql_command == SQLCOM_SELECT &&
         table->reginfo.lock_type <= TL_READ;
     if (!plain_select) {
-      if (reason != nullptr) {
-        *reason = "temp-table-driven probe outside plain SELECT";
-      }
       return false;
     }
     step->bindings.clear();
@@ -543,7 +500,6 @@ bool compile_ref_lookup(
     } else {
       // Unknown source (neither a staged step nor a temp table): fail the read
       // plan as unsupported, rather than salvaging or full-ranging it.
-      if (reason != nullptr) *reason = "bound source is not an earlier step";
       return false;
     }
   }
@@ -601,15 +557,12 @@ bool compile_ref_lookup(
       }
       if (remapped == nullptr) {
         if (saw_temp_source) return stage_full_range();
-        if (reason != nullptr) {
-          *reason = "for_each binding spans multiple source steps";
-        }
         return false;
       }
       source_field = remapped;
     }
     if (!append_bound_keypart(table, ref, bp.kp, source_field, iter_step,
-                              step, reason)) {
+                              step)) {
       if (saw_temp_source) return stage_full_range();
       return false;
     }
@@ -621,14 +574,12 @@ bool compile_ref_lookup(
         key_pack::pack_key(table, ref->key, ref->key_buff,
                            first_n_keyparts_map(leading_constant_parts));
     if (step->key_prefix.empty()) {
-      if (reason != nullptr) *reason = "failed to pack constant key prefix";
       return false;
     }
   }
 
   const uint used_key_parts = leading_constant_parts + bound_parts;
   if (used_key_parts == 0) {
-    if (reason != nullptr) *reason = "no compilable keyparts";
     return false;
   }
 
@@ -657,7 +608,6 @@ bool compile_ref_lookup(
   step->key_prefix = key_pack::pack_key(
       table, ref->key, ref->key_buff, first_n_keyparts_map(used_key_parts));
   if (step->key_prefix.empty()) {
-    if (reason != nullptr) *reason = "failed to pack constant key";
     return false;
   }
 
@@ -675,30 +625,26 @@ bool compile_ref_lookup(
 
 bool compile_leaf(AccessPath *leaf,
                   const std::unordered_map<TABLE *, int> &table_steps,
-                  HeliosProxy::ReadPlanStep *step, std::string *reason) {
+                  HeliosProxy::ReadPlanStep *step) {
   TABLE *table = nullptr;
   Index_lookup *ref = nullptr;
   bool full_scan = false;
   int full_scan_index = -1;
   if (!qep_leaf_info(leaf, &table, &ref, &full_scan, &full_scan_index)) {
-    if (reason != nullptr) *reason = "unsupported QEP leaf";
     return false;
   }
   if (table == nullptr || table->s == nullptr) {
-    if (reason != nullptr) *reason = "missing leaf table";
     return false;
   }
   if (table->s->tmp_table != NO_TMP_TABLE) {
-    if (reason != nullptr) *reason = "temporary-table leaf";
     return false;
   }
   if (leaf->type == AccessPath::REF_OR_NULL) {
-    if (reason != nullptr) *reason = "REF_OR_NULL null companion lookup";
     return false;
   }
 
   if (leaf->type == AccessPath::INDEX_RANGE_SCAN) {
-    return compile_index_range_scan(leaf, table, step, reason);
+    return compile_index_range_scan(leaf, table, step);
   }
   if (full_scan) {
     // Plain SELECT primary scans consume the staged ["", sentinel) range.
@@ -707,12 +653,10 @@ bool compile_leaf(AccessPath *leaf,
                               leaf_thd->lex->sql_command == SQLCOM_SELECT &&
                               table->reginfo.lock_type <= TL_READ;
     if (!plain_select) {
-      if (reason != nullptr) *reason = "full table/index scan unsupported";
       return false;
     }
     step->table_name = physical_table_key(table);
     if (step->table_name.empty()) {
-      if (reason != nullptr) *reason = "missing leaf table name";
       return false;
     }
     const bool primary_order =
@@ -730,36 +674,30 @@ bool compile_leaf(AccessPath *leaf,
     return true;
   }
   if (ref == nullptr) {
-    if (reason != nullptr) *reason = "table access without ref or range bound";
     return false;
   }
-  return compile_ref_lookup(table, ref, table_steps, step, reason);
+  return compile_ref_lookup(table, ref, table_steps, step);
 }
 
 // Translate one resolved handler IndexSearchPlan (point/prefix/range/
 // index-first) into a single ReadPlanStep; reject reverse/unbounded access.
 bool compile_index_search(TABLE *table, uint index,
                           const IndexSearchPlan &search,
-                          HeliosProxy::ReadPlanStep *step,
-                          std::string *reason) {
+                          HeliosProxy::ReadPlanStep *step) {
   if (table == nullptr || table->s == nullptr || step == nullptr) {
-    if (reason != nullptr) *reason = "invalid handler search metadata";
     return false;
   }
   if (index >= table->s->keys) {
-    if (reason != nullptr) *reason = "invalid handler index";
     return false;
   }
 
   const bool is_primary = index == table->s->primary_key;
   if (search.is_primary != is_primary) {
-    if (reason != nullptr) *reason = "handler primary-index mismatch";
     return false;
   }
 
   step->table_name = physical_table_key(table);
   if (step->table_name.empty()) {
-    if (reason != nullptr) *reason = "missing handler table name";
     return false;
   }
 
@@ -775,7 +713,6 @@ bool compile_index_search(TABLE *table, uint index,
   switch (search.op) {
     case IndexSearchOp::kUniquePoint:
       if (search.start_key_serialized.empty()) {
-        if (reason != nullptr) *reason = "missing handler point key";
         return false;
       }
       if (is_primary) {
@@ -791,7 +728,6 @@ bool compile_index_search(TABLE *table, uint index,
     case IndexSearchOp::kSameKeyMaterialize:
     case IndexSearchOp::kPrefixFirst:
       if (search.same_group_prefix_serialized.empty()) {
-        if (reason != nullptr) *reason = "missing handler prefix bound";
         return false;
       }
       set_scan(search.same_group_prefix_serialized,
@@ -800,7 +736,6 @@ bool compile_index_search(TABLE *table, uint index,
 
     case IndexSearchOp::kRangeMaterialize: {
       if (search.start_key_serialized.empty()) {
-        if (reason != nullptr) *reason = "missing handler range start";
         return false;
       }
       std::string start = search.start_key_serialized;
@@ -811,9 +746,6 @@ bool compile_index_search(TABLE *table, uint index,
 
     case IndexSearchOp::kIndexFirst:
       if (search.end_key_serialized.empty()) {
-        if (reason != nullptr) {
-          *reason = "unbounded index-first/full scan unsupported";
-        }
         return false;
       }
       set_scan("", search.end_key_serialized);
@@ -821,11 +753,9 @@ bool compile_index_search(TABLE *table, uint index,
 
     case IndexSearchOp::kPrevKey:
     case IndexSearchOp::kPrefixLast:
-      if (reason != nullptr) *reason = "reverse handler access unsupported";
       return false;
   }
 
-  if (reason != nullptr) *reason = "unsupported handler access";
   return false;
 }
 
@@ -837,8 +767,7 @@ bool plan_tree_contains(AccessPath *root, const AccessPath *node) {
   if (root == node) return true;
   std::vector<AccessPath *> leaves;
   bool ok = true;
-  UnsupportedQep ignored;
-  collect_qep_leaves(root, &leaves, &ok, &ignored);
+  collect_qep_leaves(root, &leaves, &ok);
   for (const AccessPath *collected : leaves) {
     if (collected == node) return true;
   }
@@ -874,7 +803,7 @@ bool compile_unqualified_count(
     THD *thd, AccessPath *leaf,
     std::unordered_map<TABLE *, int> *table_steps,
     std::vector<HeliosProxy::ReadPlanStep> *steps,
-    std::vector<TABLE *> *added_tables, UnsupportedQep *unsupported) {
+    std::vector<TABLE *> *added_tables) {
   Query_block *qb =
       (thd != nullptr && thd->lex != nullptr)
           ? query_block_containing_plan_node(thd->lex->unit, leaf)
@@ -894,13 +823,9 @@ bool compile_unqualified_count(
       table->s->tmp_table != NO_TMP_TABLE || table->file == nullptr ||
       table->file->ht != helios_hton ||
       table->reginfo.lock_type > TL_READ) {
-    unsupported->type = leaf->type;
-    unsupported->reason = "unqualified COUNT table not stageable";
     return false;
   }
   if (table_steps->find(table) != table_steps->end()) {
-    unsupported->type = leaf->type;
-    unsupported->reason = "duplicate QEP table leaf";
     return false;
   }
 
@@ -913,16 +838,12 @@ bool compile_unqualified_count(
     qt = &qb->join->qep_tab[0];
   }
   if (qt == nullptr || qt->table() != table) {
-    unsupported->type = leaf->type;
-    unsupported->reason = "unqualified COUNT access not resolvable";
     return false;
   }
   std::string index_name;
   if (qt->type() != JT_ALL) {
     const uint count_index = qt->index();
     if (count_index >= table->s->keys) {
-      unsupported->type = leaf->type;
-      unsupported->reason = "unqualified COUNT index not resolvable";
       return false;
     }
     if (count_index != table->s->primary_key) {
@@ -933,8 +854,6 @@ bool compile_unqualified_count(
   HeliosProxy::ReadPlanStep step;
   step.table_name = physical_table_key(table);
   if (step.table_name.empty()) {
-    unsupported->type = leaf->type;
-    unsupported->reason = "missing leaf table name";
     return false;
   }
   step.is_scan = true;
@@ -954,32 +873,28 @@ bool compile_unqualified_count(
  * `table_steps`, so correlated inner probes can bind to earlier outer steps.
  * `allow_limit_pushdown` is kept off for optional inner roots.
  *
- * @note Failures are returned through `unsupported` instead of raising
- * immediately; `added_tables` lets optional callers roll back only this tree's
+ * @note `added_tables` lets optional callers roll back only this tree's
  * additions.
  */
 bool compile_tree_leaves(
     THD *thd, AccessPath *root, bool allow_limit_pushdown,
     std::unordered_map<TABLE *, int> *table_steps,
     std::vector<HeliosProxy::ReadPlanStep> *steps,
-    std::vector<TABLE *> *added_tables,
-    UnsupportedQep *unsupported) {
+    std::vector<TABLE *> *added_tables) {
   std::vector<AccessPath *> leaves;
   bool ok = true;
-  collect_qep_leaves(root, &leaves, &ok, unsupported);
+  collect_qep_leaves(root, &leaves, &ok);
   if (!ok) {
     return false;
   }
   if (leaves.empty()) {
-    unsupported->type = root->type;
-    unsupported->reason = "QEP has no table leaves";
     return false;
   }
 
   for (AccessPath *leaf : leaves) {
     if (leaf->type == AccessPath::UNQUALIFIED_COUNT) {
       if (!compile_unqualified_count(thd, leaf, table_steps, steps,
-                                     added_tables, unsupported)) {
+                                     added_tables)) {
         return false;
       }
       continue;
@@ -990,8 +905,6 @@ bool compile_tree_leaves(
     int full_scan_index = -1;
     if (!qep_leaf_info(leaf, &table, &ref, &full_scan, &full_scan_index) ||
         table == nullptr) {
-      unsupported->type = leaf->type;
-      unsupported->reason = "unsupported QEP leaf";
       return false;
     }
     if ((table->s != nullptr && table->s->tmp_table != NO_TMP_TABLE) ||
@@ -1001,16 +914,11 @@ bool compile_tree_leaves(
       continue;
     }
     if (table_steps->find(table) != table_steps->end()) {
-      unsupported->type = leaf->type;
-      unsupported->reason = "duplicate QEP table leaf";
       return false;
     }
 
     HeliosProxy::ReadPlanStep step;
-    std::string reason;
-    if (!compile_leaf(leaf, *table_steps, &step, &reason)) {
-      unsupported->type = leaf->type;
-      unsupported->reason = reason;
+    if (!compile_leaf(leaf, *table_steps, &step)) {
       return false;
     }
 
@@ -1088,12 +996,10 @@ bool autogen_read_plan_from_qep(
   std::unordered_map<TABLE *, int> table_steps;
   std::vector<HeliosProxy::ReadPlanStep> steps;
   std::vector<TABLE *> added_tables;
-  UnsupportedQep unsupported;
 
   if (!compile_tree_leaves(thd, root, /*allow_limit_pushdown=*/true,
-                           &table_steps, &steps,
-                           &added_tables, &unsupported)) {
-    return false;  // unsupported names the leaf
+                           &table_steps, &steps, &added_tables)) {
+    return false;  // a leaf shape no step covers
   }
 
   if (include_inner_units && thd != nullptr && thd->lex != nullptr) {
@@ -1106,11 +1012,9 @@ bool autogen_read_plan_from_qep(
       // stageable, but remove any partial steps from the failed attempt.
       const size_t step_mark = steps.size();
       const size_t table_mark = added_tables.size();
-      UnsupportedQep inner_unsupported;
       if (!compile_tree_leaves(thd, inner_root,
                                /*allow_limit_pushdown=*/false, &table_steps,
-                               &steps, &added_tables,
-                               &inner_unsupported)) {
+                               &steps, &added_tables)) {
         steps.resize(step_mark);
         for (size_t i = table_mark; i < added_tables.size(); ++i) {
           table_steps.erase(added_tables[i]);
@@ -1218,9 +1122,8 @@ bool autogen_read_plan_from_index_search(
   out->clear();
 
   HeliosProxy::ReadPlanStep step;
-  std::string reason;
-  if (!compile_index_search(table, index, search, &step, &reason)) {
-    return false;  // reason names the shape
+  if (!compile_index_search(table, index, search, &step)) {
+    return false;  // a handler shape no step covers
   }
 
   out->push_back(std::move(step));

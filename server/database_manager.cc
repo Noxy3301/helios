@@ -18,8 +18,10 @@ DatabaseManager::DatabaseManager() {
                               ? helios::storage::CommitDurability::kAsync
                               : helios::storage::CommitDurability::kSync);
     duckdb_bridge::ConfigureLimits();
-    SPDLOG_INFO("Epoch {} ms, durability {}, WAL capacity {} bytes, recovery {}",
-             conf.epoch_duration_ms, config().commit_durability.c_str(),
+    // The startup contract on its own line: bench and deploy scripts grep it.
+    SPDLOG_INFO("Commit durability: {}", config().commit_durability);
+    SPDLOG_INFO("Epoch {} ms, WAL capacity {} bytes, recovery {}",
+             conf.epoch_duration_ms,
              static_cast<unsigned long long>(conf.wal_initial_capacity_bytes),
              conf.enable_recovery ? "on" : "off");
     if (conf.checkpoint_interval_ms != 0 || conf.checkpoint_once_after_ms != 0) {

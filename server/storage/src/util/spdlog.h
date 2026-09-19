@@ -37,11 +37,6 @@
 namespace helios::storage {
 namespace util {
 static inline void InitDebugLog() {
-#ifdef NDEBUG
-  spdlog::set_level(spdlog::level::info);
-#else
-  spdlog::set_level(spdlog::level::debug);
-#endif
   spdlog::set_pattern("[Thread %t] %+ [+%omsec]");
 }
 }  // namespace util
