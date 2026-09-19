@@ -127,18 +127,17 @@ class Wal {
   /**
    * @brief Reads the log from the beginning, repairs an interrupted tail,
    * and initialises the capacity beyond it.
-   * @param[in] min_epoch Frames at or below this are counted but not read.
+   * @param[in] min_epoch Frames at or below this are counted but not read. A
+   * skipped frame still contributes the last epoch and the log end; it is
+   * skipped by header alone, except the boundary frame, which is read and
+   * checksummed in full. A header that fails to parse falls back to a full
+   * scan from offset 0.
    * @return See WalScanResult; `Ok` carries the last epoch and the records.
-   * @note Must succeed before the first append: it is what locates the end
-   * of the log, and until the bytes of an interrupted write are overwritten
-   * with zeroes a later shorter group would leave them behind as a frame
-   * the next scan cannot place. A scan run after this instance has already
-   * failed does not retry; it reports the failure again.
-   *
-   * A skipped frame still contributes the last epoch and the log end. Such a
-   * frame is skipped by header alone, except the boundary frame, which is
-   * read and checksummed in full. A header that fails to parse falls back to
-   * a full scan from offset 0.
+   * @note Must succeed before the first append: it locates the end of the log
+   * and overwrites the bytes of an interrupted write with zeroes, which a
+   * later shorter group would otherwise leave behind as a frame the next scan
+   * cannot place. A scan run after this instance has already failed reports
+   * that failure again.
    */
   WalScanResult Scan(EpochNumber min_epoch = 0);
 

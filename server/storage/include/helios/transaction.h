@@ -129,9 +129,9 @@ class Transaction {
    * re-run over `[begin, end)`. An empty `index` names the primary index, and
    * a `limit` of 0 caps nothing. `keys`, and `primary_keys` on a secondary
    * index, are the keys that scan returned, in scan order. Commit re-scans
-   * the range and aborts when that ordered list differs. Row words are not part of
-   * this call: each row the caller consumed is also a Read. Commit refuses a
-   * range whose `end` is empty.
+   * the range and aborts when that ordered list differs. Row contents are
+   * not part of this call: each row the caller consumed is also a Read.
+   * Commit refuses a range whose `end` is empty.
    */
   void RangeRead(std::string_view table, std::string_view index,
                  std::string_view begin, std::string_view end, uint64_t limit,
@@ -180,9 +180,9 @@ class Transaction {
    * - Phase 3: install each record, append its WAL write, and publish its
    *   TID, which unlocks it.
    *
-   * The record is enqueued before the worker leaves the epoch. A Sync commit
-   * then waits for that epoch to become durable, and only when a record was
-   * logged: a read-only commit returns at once.
+   * The log record is enqueued before the worker leaves the epoch. A Sync
+   * commit then waits for that epoch to become durable, and only when a log
+   * record was enqueued: a read-only commit returns at once.
    *
    * @param[out] reason Cleared on entry and empty on success. On abort, a
    * short label naming the failed check.
@@ -298,9 +298,9 @@ class Transaction {
 
   /**
    * @brief Copies the installed row, or the ordered index changes, into the
-   * record.
+   * log record.
    *
-   * @pre Apply completed and the record is still locked.
+   * @pre Apply completed and the index record is still locked.
    */
   static void AppendLog(wal::LogRecord &record, const DataItem &item,
                         const WriteEntry &entry, Tidword commit_tid);

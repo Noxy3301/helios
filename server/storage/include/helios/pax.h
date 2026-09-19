@@ -136,7 +136,10 @@ class PaxGroup {
   explicit PaxGroup(const TableSchema &schema);
 
   /**
-   * @brief Drops the epoch image state this group published, if any.
+   * @brief Drops the images this group published and detaches its state.
+   *
+   * @details The state object stays in the image buffer: a scan reaches it by
+   * raw pointer for the length of its read.
    */
   ~PaxGroup();
 
@@ -248,7 +251,8 @@ class PaxGroup {
    * @brief Appends one field's row-format value into `out`.
    *
    * @details Verbatim for an UNTYPED cell; reformatted to the exact val_str
-   * ASCII for a typed present cell. An empty cell is emitted as a NULL field.
+   * ASCII for a typed present cell. An empty cell is emitted as an empty
+   * field, and the null-flags field is what says whether it is SQL NULL.
    *
    * @param field Field index, where 0 is the null-flags field and MySQL column
    * i is field `i + 1`.

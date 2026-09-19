@@ -163,8 +163,8 @@ class EpochImageBuffer {
   std::atomic<uint64_t> images_held_{0};
   std::atomic<uint64_t> bytes_held_{0};
 
-  // shared: NeedsImage, Preserve; exclusive: Open, Close and the clear the
-  // last close performs. Const readers take neither.
+  // shared: NeedsImage, Preserve, Stats; exclusive: Open, Close and the clear
+  // the last close performs. Forget takes groups_mutex_ alone.
   mutable std::shared_mutex registry_mutex_;
   // Snapshot epochs of the open views, guarded by registry_mutex_.
   std::multiset<EpochNumber> open_views_;

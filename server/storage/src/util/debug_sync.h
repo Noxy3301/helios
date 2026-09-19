@@ -1,45 +1,13 @@
 /**
  * @file server/storage/src/util/debug_sync.h
- * Named synchronization points a test arms from the environment, so a race
- * can be reproduced in the binary that serves production traffic.
+ * Named synchronization points after MySQL's DEBUG_SYNC (sql/debug_sync.h):
+ * code marks one with HELIOS_DEBUG_SYNC("<name>"), and a test activates it
+ * through HELIOS_DEBUG_SYNC_<NAME>, the name upper-cased with '.' mapped to
+ * '_'. The actions are documented where each is parsed.
  */
 
 #ifndef HELIOS_STORAGE_SRC_UTIL_DEBUG_SYNC_H
 #define HELIOS_STORAGE_SRC_UTIL_DEBUG_SYNC_H
-
-// Debug Sync facility, after MySQL's DEBUG_SYNC (sql/debug_sync.h):
-// production code marks a named synchronization point with one macro line,
-// and the point's behavior is injected from outside the binary. MySQL
-// compiles its points out of release builds; here the points stay compiled
-// in and are gated at runtime instead, so the exact binary under test is
-// the one that serves production traffic. A process with no
-// HELIOS_DEBUG_SYNC_* environment variables evaluates each point as a
-// call into the cached enabled check plus one branch.
-//
-// Marking a point:
-//   HELIOS_DEBUG_SYNC("silo_commit.between_row_installs");
-//
-// Activating a point (environment):
-//   HELIOS_DEBUG_SYNC_SILO_COMMIT_BETWEEN_ROW_INSTALLS=sleep:1500
-// The variable name is the point name upper-cased with '.' mapped to '_'.
-// The prefix scan that answers "is anything armed" is cached at first use;
-// an armed process re-reads the point's action on every hit.
-//
-// Supported actions:
-//   sleep:<ms>
-//     Sleeps, capped at 10000 ms. <ms> is decimal digits only. Orders
-//     nothing: it widens the race, which is enough to provoke it
-//     but never enough to prove an order.
-//   arrive_and_wait:<arrived_write_fd>:<release_read_fd>
-//     Writes one byte to the first descriptor and blocks until one byte can be
-//     read from the second. The observer therefore knows the process is inside
-//     the point, and the process stays there until the observer says otherwise,
-//     which is what an ordering assertion needs. Both integers are descriptors
-//     the process already holds, whether it opened them itself or inherited
-//     them from the process that started it. A descriptor that cannot be used,
-//     or an action that does not parse, is a broken test rather than a
-//     production condition, and stops the process instead of continuing
-//     unsynchronized.
 
 #include <signal.h>
 #include <unistd.h>
@@ -76,6 +44,8 @@ inline bool debug_sync_env_present() {
   return false;
 }
 
+// Cached at first use: a process with no point armed pays this call and one
+// branch per point. An armed process re-reads the action on every hit.
 inline bool DebugSyncArmed() {
   static const bool armed = debug_sync_env_present();
   return armed;
@@ -165,6 +135,8 @@ inline void DebugSyncPoint(const char *point_name) {
   // so it stays in the environment.
   const char *action = std::getenv(var.c_str());
   if (action == nullptr) return;
+  // sleep:<ms>, decimal digits only, capped at kSleepCapMs. It orders
+  // nothing: it widens the race, which provokes it but never proves an order.
   constexpr char kSleep[] = "sleep:";
   if (std::strncmp(action, kSleep, sizeof(kSleep) - 1) == 0) {
     const char *cursor = action + sizeof(kSleep) - 1;
@@ -175,6 +147,8 @@ inline void DebugSyncPoint(const char *point_name) {
     return;
   }
 
+  // arrive_and_wait:<arrived_write_fd>:<release_read_fd>, over descriptors
+  // the process already holds, whether it opened them or inherited them.
   constexpr char kArriveAndWait[] = "arrive_and_wait:";
   if (std::strncmp(action, kArriveAndWait, sizeof(kArriveAndWait) - 1) == 0) {
     const char *cursor = action + sizeof(kArriveAndWait) - 1;
@@ -190,10 +164,6 @@ inline void DebugSyncPoint(const char *point_name) {
 }  // namespace util
 }  // namespace helios::storage
 
-/**
- * @brief Marks a named synchronization point whose action comes from the
- *        environment.
- */
 #define HELIOS_DEBUG_SYNC(point_name)                      \
   do {                                                     \
     if (::helios::storage::util::DebugSyncArmed()) {       \

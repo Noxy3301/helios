@@ -216,8 +216,8 @@ class Database {
    * for PAX-resident rows. Null selects the whole row; an empty list selects
    * no data columns. Unselected PAX fields become empty markers; null flags
    * remain in every result.
-   * @return Result with `found` set when the key exists and was non-empty.
-   *         When the table does not exist, `found` is false and `tid` is 0.
+   * @return Result with `found` set when the key holds a live row. When the
+   *         table does not exist, `found` is false and `tid` is 0.
    */
   ReadResult Read(const std::string_view table_name, const std::string_view key,
                   const std::vector<uint32_t> *selected_columns = nullptr);
@@ -226,8 +226,9 @@ class Database {
    * @brief Reads several rows in one call.
    *
    * Each `keys[i] = {table_name, key}` is resolved with the same protocol as
-   * Read. Reads do not share state, so this is purely a transport
-   * optimization on top of repeated Read calls.
+   * Read, over the whole row: there is no column selection here. Reads do not
+   * share state, so this is purely a transport optimization on top of
+   * repeated Read calls.
    *
    * @param keys (table_name, key) pairs to look up.
    * @return One ReadResult per input, in the same order.
