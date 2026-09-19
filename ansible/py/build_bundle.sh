@@ -25,6 +25,7 @@ req "$HELIOS/third_party/duckdb/build/release/src/libduckdb.so"
 req "$HELIOS/bench/benchbase-mysql/benchbase.jar"
 req "$HELIOS/bench/benchbase-mysql/config/plugin.xml"
 req "$HELIOS/bench/setup.sql"
+req "$HELIOS/helios.cnf"
 
 STAGE="$(mktemp -d)"
 trap 'rm -rf "$STAGE"' EXIT
@@ -78,6 +79,8 @@ cp "$HELIOS/bench/setup.sql" "$B/bench/"
 # --- scripts (start/stop) -----------------------------------------------------
 cp "$HELIOS/scripts/"{start_mysql.sh,stop_mysql.sh,start_server.sh,stop_server.sh} \
    "$B/scripts/"
+# start_server.sh always passes the bundle-root helios.cnf.
+cp "$HELIOS/helios.cnf" "$B/"
 
 # Inject a cd to the bundle root and an LD_LIBRARY_PATH export into the start
 # scripts: helios-storage writes ./helios_wal and its own log under

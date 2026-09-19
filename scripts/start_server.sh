@@ -4,12 +4,11 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BIN="$ROOT_DIR/build/server/helios-storage"
-# The server reads helios.cnf, then helios.local.cnf when it exists, then any
-# --config given here; a later file overrides an earlier one.
+# The server reads helios.cnf and then helios.local.cnf when it exists, or
+# helios.cnf and then the --config files given here; a later file overrides an
+# earlier one, and an explicit --config takes the place of the local file.
 CONF=(--config "$ROOT_DIR/helios.cnf")
-if [ -f "$ROOT_DIR/helios.local.cnf" ]; then
-  CONF+=(--config "$ROOT_DIR/helios.local.cnf")
-fi
+EXTRA=()
 LOG_DIR="$ROOT_DIR/helios_logs"
 TS=$(date +%Y%m%d_%H%M%S)
 LOG_FILE="$LOG_DIR/helios_storage_$TS.log"
@@ -17,10 +16,16 @@ PID_FILE="/tmp/helios_storage.pid"
 
 while [ $# -gt 0 ]; do
   case "$1" in
-    --config) CONF+=(--config "$2"); shift 2 ;;
+    --config) EXTRA+=(--config "$2"); shift 2 ;;
     *) echo "Usage: start_server.sh [--config <path>]" >&2; exit 1 ;;
   esac
 done
+
+if [ ${#EXTRA[@]} -gt 0 ]; then
+  CONF+=("${EXTRA[@]}")
+elif [ -f "$ROOT_DIR/helios.local.cnf" ]; then
+  CONF+=(--config "$ROOT_DIR/helios.local.cnf")
+fi
 
 mkdir -p "$LOG_DIR"
 

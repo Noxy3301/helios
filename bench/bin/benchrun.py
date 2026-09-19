@@ -78,7 +78,7 @@ def _wait_for_port(host, port, timeout=30):
     return False
 
 
-def _run_script(argv, timeout, env=None):
+def _run_script(argv, timeout):
     """Run a launcher script with stdin closed and a hard timeout.
 
     The launcher scripts spawn long-lived background daemons that previously
@@ -94,7 +94,6 @@ def _run_script(argv, timeout, env=None):
             stderr=subprocess.STDOUT,
             text=True,
             timeout=timeout,
-            env=env,
         )
     except subprocess.TimeoutExpired as e:
         print(f"  ERROR: launcher timed out after {timeout}s: {' '.join(argv)}", file=sys.stderr)
@@ -169,13 +168,13 @@ def server_startup_contract():
     return None
 
 
-def switch_commit_durability(mode):
+def switch_commit_durability(mode, host, port):
     """Set the running storage server's commit durability to `mode`. The switch
     publishes the new contract and does not wait for commits acknowledged under
     the old one. Returns the elapsed seconds, or None if it did not happen."""
     print(f"  Switching durability to {mode}...")
     started = time.time()
-    result = mysql_cmd(3307, "127.0.0.1",
+    result = mysql_cmd(port, host,
                        f"SET GLOBAL helios_commit_durability = '{mode}'")
     elapsed = time.time() - started
     if result.returncode != 0:
@@ -1108,7 +1107,8 @@ def _run_bench(args, config_work, thread_list, result_base):
             sys.exit(1)
 
     if args.load_durability == "async":
-        elapsed = switch_commit_durability("sync")
+        elapsed = switch_commit_durability("sync", args.mysql_host,
+                                           args.mysql_port)
         if elapsed is None:
             sys.exit(1)
         print(f"  Durability switch async -> sync took {elapsed:.2f}s (no barrier)")
