@@ -35,8 +35,8 @@ RPC_TRACE_PORT = 3308
 RPC_TRACE_ROWS = 5
 # write_row probes one of these per row it adds a UNIQUE key for; without
 # unique_checks it probes nothing and the commit carries the index write.
-UNIQUE_PROBE_RPC = "TX_SCAN_INDEX"
-COMMIT_RPC = "TX_COMMIT"
+UNIQUE_PROBE_RPC = "tx_scan_index"
+COMMIT_RPC = "tx_commit"
 
 _table_seq = 0
 _last_error_message = ""

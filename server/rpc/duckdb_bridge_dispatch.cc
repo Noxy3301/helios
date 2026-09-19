@@ -7,30 +7,18 @@
 #include "helios.pb.h"
 
 /**
- * @brief Parses a TX_EXECUTE_DUCKDB_QUERY request and hands it to
- * duckdb_bridge::ExecuteDuckdbQuery.
+ * @brief Hands a resolved-statement request to duckdb_bridge::ExecuteDuckdbQuery.
  */
-void HeliosRpc::handleTxExecuteDuckdbQuery(const std::string& message,
-                                              std::string& result) {
-    Helios::Protocol::TxExecuteDuckdbQuery::Request request;
-    Helios::Protocol::TxExecuteDuckdbQuery::Response response;
-
-    if (!request.ParseFromString(message)) {
-        response.set_ok(false);
-        response.set_error("failed to parse duckdb-query request");
-        result = response.SerializeAsString();
-        return;
-    }
-
+void HeliosRpc::handleTxExecuteDuckdbQuery(
+    const Helios::Protocol::TxExecuteDuckdbQuery::Request& request,
+    Helios::Protocol::TxExecuteDuckdbQuery::Response* response) {
     std::shared_ptr<helios::storage::Database> db =
         db_manager_ ? db_manager_->get_database() : nullptr;
     if (!db) {
-        response.set_ok(false);
-        response.set_error("database is unavailable");
-        result = response.SerializeAsString();
+        response->set_ok(false);
+        response->set_error("database is unavailable");
         return;
     }
 
-    duckdb_bridge::ExecuteDuckdbQuery(db.get(), request, &response);
-    result = response.SerializeAsString();
+    duckdb_bridge::ExecuteDuckdbQuery(db.get(), request, response);
 }

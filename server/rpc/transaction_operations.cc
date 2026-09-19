@@ -19,31 +19,21 @@ const std::vector<uint32_t> kNoColumns;
 
 }  // namespace
 
-void HeliosRpc::handleTxRead(const std::string& message,
-                                std::string& result) {
-    Helios::Protocol::TxRead::Request request;
-    Helios::Protocol::TxRead::Response response;
-
-    request.ParseFromString(message);
-
+void HeliosRpc::handleTxRead(
+    const Helios::Protocol::TxRead::Request& request,
+    Helios::Protocol::TxRead::Response* response) {
     auto read_result =
         db_manager_->get_database()->Read(request.table_name(), request.key());
-    response.set_found(read_result.found);
-    response.set_tid(read_result.tid);
+    response->set_found(read_result.found);
+    response->set_tid(read_result.tid);
     if (read_result.found) {
-        response.set_value(std::move(read_result.value));
+        response->set_value(std::move(read_result.value));
     }
-
-    result = response.SerializeAsString();
 }
 
-void HeliosRpc::handleTxBatchRead(const std::string& message,
-                                     std::string& result) {
-    Helios::Protocol::TxBatchRead::Request request;
-    Helios::Protocol::TxBatchRead::Response response;
-
-    request.ParseFromString(message);
-
+void HeliosRpc::handleTxBatchRead(
+    const Helios::Protocol::TxBatchRead::Request& request,
+    Helios::Protocol::TxBatchRead::Response* response) {
     std::vector<std::pair<std::string, std::string>> keys;
     keys.reserve(request.ops_size());
     for (const auto& op : request.ops()) {
@@ -52,76 +42,53 @@ void HeliosRpc::handleTxBatchRead(const std::string& message,
 
     auto read_results = db_manager_->get_database()->BatchRead(keys);
     for (auto& read_result : read_results) {
-        auto* out = response.add_results();
+        auto* out = response->add_results();
         out->set_found(read_result.found);
         out->set_tid(read_result.tid);
         if (read_result.found) {
             out->set_value(std::move(read_result.value));
         }
     }
-
-    result = response.SerializeAsString();
 }
 
-void HeliosRpc::handleTxScan(const std::string& message,
-                                std::string& result) {
-    Helios::Protocol::TxScan::Request request;
-    Helios::Protocol::TxScan::Response response;
-
-    request.ParseFromString(message);
-
+void HeliosRpc::handleTxScan(
+    const Helios::Protocol::TxScan::Request& request,
+    Helios::Protocol::TxScan::Response* response) {
     auto scan = db_manager_->get_database()->Scan(
         request.table_name(), request.start_key(), request.end_key(),
         request.row_limit(), request.reverse_scan(),
         request.keys_only() ? &kNoColumns : nullptr);
 
-    response.set_ok(scan.ok);
+    response->set_ok(scan.ok);
     for (auto& row : scan.rows) {
-        auto* out = response.add_rows();
+        auto* out = response->add_rows();
         out->set_key(std::move(row.key));
         out->set_tid(row.tid);
         if (!request.keys_only()) out->set_value(std::move(row.value));
     }
-
-    result = response.SerializeAsString();
 }
 
-void HeliosRpc::handleTxScanIndex(const std::string& message,
-                                     std::string& result) {
-    Helios::Protocol::TxScanIndex::Request request;
-    Helios::Protocol::TxScanIndex::Response response;
-
-    request.ParseFromString(message);
-
+void HeliosRpc::handleTxScanIndex(
+    const Helios::Protocol::TxScanIndex::Request& request,
+    Helios::Protocol::TxScanIndex::Response* response) {
     auto scan = db_manager_->get_database()->ScanIndex(
         request.table_name(), request.index_name(), request.start_key(),
         request.end_key(), request.row_limit(), request.reverse_scan(),
         request.keys_only() ? &kNoColumns : nullptr);
 
-    response.set_ok(scan.ok);
+    response->set_ok(scan.ok);
     for (auto& row : scan.rows) {
-        auto* out = response.add_rows();
+        auto* out = response->add_rows();
         out->set_secondary_key(std::move(row.secondary_key));
         out->set_primary_key(std::move(row.primary_key));
         out->set_tid(row.tid);
         if (!request.keys_only()) out->set_value(std::move(row.value));
     }
-
-    result = response.SerializeAsString();
 }
 
-void HeliosRpc::handleTxCommit(const std::string& message,
-                                  std::string& result) {
-    Helios::Protocol::TxCommit::Request request;
-    Helios::Protocol::TxCommit::Response response;
-
-    if (!request.ParseFromString(message)) {
-        response.set_committed(false);
-        response.set_abort_detail("malformed request");
-        result = response.SerializeAsString();
-        return;
-    }
-
+void HeliosRpc::handleTxCommit(
+    const Helios::Protocol::TxCommit::Request& request,
+    Helios::Protocol::TxCommit::Response* response) {
     auto& db = *db_manager_->get_database();
     helios::storage::silo::Transaction tx(db);
     for (const auto& read : request.reads()) {
@@ -170,15 +137,15 @@ void HeliosRpc::handleTxCommit(const std::string& message,
     const bool committed =
         fed && tx.Commit(db_manager_->commit_durability(), reason);
 
-    response.set_committed(committed);
+    response->set_committed(committed);
     if (!committed && !reason.empty()) {
-        response.set_abort_detail(reason);
+        response->set_abort_detail(reason);
         if (reason == helios::storage::kDuplicatePrimaryKeyAbortReason) {
-            response.set_abort_reason(
+            response->set_abort_reason(
                 Helios::Protocol::ABORT_REASON_DUPLICATE_PRIMARY_KEY);
         } else if (reason.rfind(helios::storage::kDuplicateSecondaryKeyAbortPrefix,
                                 0) == 0) {
-            response.set_abort_reason(
+            response->set_abort_reason(
                 Helios::Protocol::ABORT_REASON_DUPLICATE_SECONDARY_KEY);
         }
     }
@@ -188,10 +155,8 @@ void HeliosRpc::handleTxCommit(const std::string& message,
     }
 
     for (const auto& [name, count] : row_counts_->snapshot()) {
-        auto* ts = response.add_table_stats();
+        auto* ts = response->add_table_stats();
         ts->set_table_name(name);
         ts->set_row_count(count);
     }
-
-    result = response.SerializeAsString();
 }

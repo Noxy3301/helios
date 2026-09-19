@@ -54,17 +54,15 @@ std::unordered_map<std::string, std::pair<bool, std::vector<uint64_t>>>
 std::unordered_map<std::string, HeliosRpc::HistEntry>
     HeliosRpc::hist_cache_;
 
-void HeliosRpc::handleTxGetTableStats(const std::string& message,
-                                         std::string& result) {
-    Helios::Protocol::GetTableStats::Request request;
-    request.ParseFromString(message);
-    Helios::Protocol::GetTableStats::Response response;
+void HeliosRpc::handleTxGetTableStats(
+    const Helios::Protocol::GetTableStats::Request& request,
+    Helios::Protocol::GetTableStats::Response* response) {
     // Every connection asks for stats when it opens a table, so this is where
     // it learns which run of this server it is talking to.
-    response.set_boot_token(hidden_keys_->boot_token);
+    response->set_boot_token(hidden_keys_->boot_token);
 
     for (const auto& [name, count] : row_counts_->snapshot()) {
-        auto* ts = response.add_table_stats();
+        auto* ts = response->add_table_stats();
         ts->set_table_name(name);
         ts->set_row_count(count);
     }
@@ -72,7 +70,7 @@ void HeliosRpc::handleTxGetTableStats(const std::string& message,
     if (!request.ndv_table().empty()) {
         auto db = db_manager_->get_database();
         for (const auto& desc : request.ndv_indexes()) {
-            auto* out = response.add_index_ndv();
+            auto* out = response->add_index_ndv();
             out->set_index_name(desc.index_name());
 
             std::string cache_key = request.ndv_table();
@@ -146,6 +144,4 @@ void HeliosRpc::handleTxGetTableStats(const std::string& message,
             }
         }
     }
-
-    result = response.SerializeAsString();
 }

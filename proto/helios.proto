@@ -2,30 +2,55 @@ syntax = "proto3";
 
 package Helios.Protocol;
 
-// Identifies which RPC is being invoked. Every read answers from the
-// storage's current state and leaves nothing behind; the query layer keeps
-// what it read and commits once.
-enum OpCode {
-    UNKNOWN = 0;
+// Every request the server serves, one arm per RPC. The frame carries no
+// opcode: the arm that is set names the RPC.
+message Request {
+    oneof body {
+        // Reads
+        TxRead.Request tx_read = 1;
+        TxBatchRead.Request tx_batch_read = 2;
+        TxScan.Request tx_scan = 3;
+        TxScanIndex.Request tx_scan_index = 4;
+        TxExecuteReadPlan.Request tx_execute_read_plan = 5;
 
-    // Reads
-    TX_READ = 1;
-    TX_BATCH_READ = 2;
-    TX_SCAN = 3;
-    TX_SCAN_INDEX = 4;
-    TX_EXECUTE_READ_PLAN = 5;
+        // The one commit of a transaction
+        TxCommit.Request tx_commit = 6;
 
-    // The one commit of a transaction
-    TX_COMMIT = 6;
+        GetTableStats.Request get_table_stats = 7;
+        TxExecuteDuckdbQuery.Request tx_execute_duckdb_query = 8;
 
-    TX_GET_TABLE_STATS = 7;
-    TX_EXECUTE_DUCKDB_QUERY = 8;
+        // Definitions and server state
+        DbCreateTable.Request db_create_table = 9;
+        DbCreateSecondaryIndex.Request db_create_secondary_index = 10;
+        DbAllocateHiddenKeys.Request db_allocate_hidden_keys = 11;
+        DbSetCommitDurability.Request db_set_commit_durability = 12;
+    }
+}
 
-    // Definitions and server state
-    DB_CREATE_TABLE = 9;
-    DB_CREATE_SECONDARY_INDEX = 10;
-    DB_ALLOCATE_HIDDEN_KEYS = 11;
-    DB_SET_COMMIT_DURABILITY = 12;
+// The reply to one Request. The arm set matches the arm of the request; a
+// request the server cannot route at all sets error and no arm.
+message Response {
+    oneof body {
+        TxRead.Response tx_read = 1;
+        TxBatchRead.Response tx_batch_read = 2;
+        TxScan.Response tx_scan = 3;
+        TxScanIndex.Response tx_scan_index = 4;
+        // The flat HELIOSRP payload of the read plan's result.
+        bytes tx_execute_read_plan = 5;
+
+        TxCommit.Response tx_commit = 6;
+
+        GetTableStats.Response get_table_stats = 7;
+        TxExecuteDuckdbQuery.Response tx_execute_duckdb_query = 8;
+
+        DbCreateTable.Response db_create_table = 9;
+        DbCreateSecondaryIndex.Response db_create_secondary_index = 10;
+        DbAllocateHiddenKeys.Response db_allocate_hidden_keys = 11;
+        DbSetCommitDurability.Response db_set_commit_durability = 12;
+    }
+
+    // Why the request was refused before any handler ran.
+    string error = 13;
 }
 
 // Why the server refused a transaction, where the query layer has to tell the

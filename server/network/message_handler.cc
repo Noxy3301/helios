@@ -1,20 +1,15 @@
 #include "message_handler.hh"
 #include <spdlog/spdlog.h>
 
-#include <iostream>
-#include <vector>
-#include <cstring>
+#include <cstdint>
 #include <sys/socket.h>
 #include <sys/uio.h>
-#include <netinet/in.h>
 #include <arpa/inet.h>
 
-bool MessageHandler::receive_message(int socket, MessageType& message_type,
-                                     std::string& payload) {
-    // Read fixed-size header
-    MessageHeader net_header{};
-    ssize_t header_read = recv(socket, &net_header, sizeof(net_header), MSG_WAITALL);
-    if (header_read != static_cast<ssize_t>(sizeof(net_header))) {
+bool MessageHandler::receive_message(int socket, std::string& payload) {
+    uint32_t net_size = 0;
+    ssize_t header_read = recv(socket, &net_size, sizeof(net_size), MSG_WAITALL);
+    if (header_read != static_cast<ssize_t>(sizeof(net_size))) {
         if (header_read < 0) {
             SPDLOG_ERROR("Failed to receive message header");
         } else {
@@ -23,14 +18,9 @@ bool MessageHandler::receive_message(int socket, MessageType& message_type,
         return false;
     }
 
-    // Convert message header (network order -> host order)
-    message_type = static_cast<MessageType>(ntohl(net_header.message_type));
-    uint32_t payload_size = ntohl(net_header.payload_size);
+    const uint32_t payload_size = ntohl(net_size);
+    SPDLOG_DEBUG("Received header: payload_size={}", payload_size);
 
-    SPDLOG_DEBUG("Received header: message_type={}, payload_size={}",
-              static_cast<uint32_t>(message_type), payload_size);
-
-    // Read payload (if exists)
     payload.clear();
     if (payload_size > 0) {
         payload.resize(payload_size);
@@ -48,8 +38,7 @@ bool MessageHandler::receive_message(int socket, MessageType& message_type,
     return true;
 }
 
-bool MessageHandler::send_response(int socket, MessageType message_type,
-                                   const std::string& payload) {
+bool MessageHandler::send_response(int socket, const std::string& payload) {
     SPDLOG_DEBUG("Sending response ({} bytes)", payload.size());
 
     if (payload.size() > UINT32_MAX) {
@@ -58,54 +47,15 @@ bool MessageHandler::send_response(int socket, MessageType message_type,
         return false;
     }
 
-    // Prepare response header
-    MessageHeader response_header;
-    response_header.message_type = htonl(static_cast<uint32_t>(message_type));
-    response_header.payload_size = htonl(static_cast<uint32_t>(payload.size()));
-
-    // Combine header and response
-    size_t response_total_size = sizeof(response_header) + payload.size();
-    std::vector<char> response_buffer(response_total_size);
-    std::memcpy(response_buffer.data(), &response_header, sizeof(response_header));
-    std::memcpy(response_buffer.data() + sizeof(response_header), payload.c_str(), payload.size());
-
-    // Send response (handle partial writes for large messages)
-    size_t total_sent = 0;
-    while (total_sent < response_total_size) {
-        ssize_t bytes_sent = send(socket, response_buffer.data() + total_sent,
-                                  response_total_size - total_sent, 0);
-        if (bytes_sent <= 0) {
-            SPDLOG_ERROR("Failed to send response (sent {}/{} bytes)", total_sent, response_total_size);
-            return false;
-        }
-        total_sent += bytes_sent;
-    }
-    
-    SPDLOG_DEBUG("Response sent successfully");
-    return true;
-}
-
-bool MessageHandler::send_response_writev(int socket, MessageType message_type,
-                                          const std::string& payload) {
-    SPDLOG_DEBUG("Sending response via writev ({} bytes)", payload.size());
-
-    if (payload.size() > UINT32_MAX) {
-        SPDLOG_ERROR("Response payload {} bytes exceeds the u32 frame limit; dropping",
-                  payload.size());
-        return false;
-    }
-
-    MessageHeader response_header;
-    response_header.message_type = htonl(static_cast<uint32_t>(message_type));
-    response_header.payload_size = htonl(static_cast<uint32_t>(payload.size()));
+    uint32_t net_size = htonl(static_cast<uint32_t>(payload.size()));
 
     struct iovec iov[2];
-    iov[0].iov_base = &response_header;
-    iov[0].iov_len = sizeof(response_header);
+    iov[0].iov_base = &net_size;
+    iov[0].iov_len = sizeof(net_size);
     iov[1].iov_base = const_cast<char*>(payload.data());
     iov[1].iov_len = payload.size();
 
-    size_t total_size = sizeof(response_header) + payload.size();
+    size_t total_size = sizeof(net_size) + payload.size();
     size_t total_sent = 0;
 
     while (total_sent < total_size) {
@@ -131,6 +81,6 @@ bool MessageHandler::send_response_writev(int socket, MessageType message_type,
         }
     }
 
-    SPDLOG_DEBUG("writev response sent successfully");
+    SPDLOG_DEBUG("Response sent successfully");
     return true;
 }

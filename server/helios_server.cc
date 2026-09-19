@@ -25,17 +25,18 @@ void HeliosServer::handle_client(int client_socket) {
         std::make_shared<HeliosRpc>(db_manager_, row_counts_, hidden_keys_);
 
     while (true) {
-        MessageType message_type;
         std::string payload;
 
-        if (!MessageHandler::receive_message(client_socket, message_type, payload)) {
+        if (!MessageHandler::receive_message(client_socket, payload)) {
             break;  // Client disconnected or error
         }
 
         std::string result;
-        rpc_handler->handle_rpc(message_type, payload, result);
+        if (!rpc_handler->handle_rpc(payload, result)) {
+            break;  // Nothing to answer with
+        }
 
-        if (!MessageHandler::send_response_writev(client_socket, message_type, result)) {
+        if (!MessageHandler::send_response(client_socket, result)) {
             break;  // Failed to send response
         }
     }
