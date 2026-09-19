@@ -98,6 +98,21 @@ TEST(PaxTableTest, ShortTypeVectorLeavesTheRestUntyped) {
   EXPECT_EQ(Gather(group, 0, row.size()), row);
 }
 
+TEST(PaxTableTest, ScattersAndGathersFiveHundredColumns) {
+  std::vector<uint32_t> widths(513, 1);
+  widths[0] = 64;  // Null flags for 512 nullable data columns.
+  const TableSchema schema = MakeSchema(widths, {});
+  PaxGroup group(schema);
+  std::vector<std::string> fields(513);
+  fields[0] = std::string(64, '\0');
+  for (size_t i = 1; i < fields.size(); i++) {
+    fields[i] = std::string(1, static_cast<char>('a' + i % 26));
+  }
+  const auto row = PackRow(fields);
+  ASSERT_TRUE(Scatter(group, 0, row));
+  EXPECT_EQ(Gather(group, 0, row.size()), row);
+}
+
 TEST(PaxTableTest, CopyStaysWithinTheReadersBufferAfterRowGrowth) {
   const TableSchema schema = MakeSchema({1, 64}, {});
   helios::storage::pax::PaxTable store(schema);

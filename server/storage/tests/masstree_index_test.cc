@@ -64,6 +64,20 @@ TEST(MasstreeIndexTest, GetOrInsert) {
   ASSERT_NE(nullptr, table.GetOrInsert("alice"));
 }
 
+TEST(MasstreeIndexTest, ConcurrentPutSameKey) {
+  std::vector<std::thread> threads;
+  helios::storage::index::MasstreeIndex table;
+
+  for (size_t i = 0; i < 10; i++) {
+    threads.emplace_back([&]() { table.Put("alice", {}); });
+  }
+  for (auto &thread : threads) {
+    thread.join();
+  }
+
+  ASSERT_NE(nullptr, table.Get("alice"));
+}
+
 TEST(MasstreeIndexTest, ConcurrentInserting) {
   std::vector<std::thread> threads;
   helios::storage::index::MasstreeIndex table;
