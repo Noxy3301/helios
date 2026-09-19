@@ -72,8 +72,9 @@ message RangeReadEntry {
     bytes end_key = 4;
     uint64 row_limit = 5; // 0 means compare the whole range.
     bool reverse_scan = 6;
-    repeated bytes result_keys = 7; // PK scan: primary keys. SI scan: secondary keys.
-    repeated bytes result_primary_keys = 8; // SI scan only.
+    // Primary-key scan: primary keys. Secondary-index scan: secondary keys.
+    repeated bytes result_keys = 7;
+    repeated bytes result_primary_keys = 8; // Secondary-index scan only.
 }
 
 // Optimizer statistics: row counts and index NDV.

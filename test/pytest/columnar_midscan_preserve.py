@@ -5,11 +5,11 @@ scan starts: the fence waits for the paused COMMIT (all-new), or the fence
 completes first and the whole write resolves through epoch images (all-old).
 Neither reaches the schedule this file covers: an install landing after the
 scan has claimed a group and started reading its slots. That is what the
-per-chunk preserve audit exists for, so it needs its own regression.
+per-chunk preserve validation exists for, so it needs its own regression.
 
 The schedule is built out of the same two sync points:
-  - pax_view.after_fence holds every bridge read between its epoch fence and
-    its scan, so the writer's commit epoch is above the read view cut
+  - pax_view.after_fence holds every bridge read between its read view fence
+    and its scan, so the writer's commit epoch is above the read view cut
   - silo_commit.between_row_installs pauses the writer between the two row
     installs of one transaction
 
@@ -37,18 +37,18 @@ scan is reading when the second install lands):
   delete          a row disappears (it must be returned from its image)
 
 A paused commit lands its two installs at two instants, so it cannot prove
-the per-chunk audit ran: the aimed install can still land before the group is
-claimed and be resolved by the claim copy. The three paused scenarios verify
+the per-chunk validation ran: the aimed install can still land before the group
+is claimed and be resolved by the claim copy. The three paused scenarios verify
 the returned rows, which pins the boundary cases (an install inside the fence
 hold resolves through the claim copy, an insert stays invisible, a delete
-reads from its image). The audit itself is pinned by the last scenario: a
+reads from its image). The validation itself is pinned by the last scenario: a
 writer updates scattered rows for the whole length of the scan, so installs
 land in groups the scan is holding, and the run asserts that at least one
-chunk audit had to redo a group.
+chunk validation had to re-read a group.
 
 Not covered here: an in-place DATE cell that names no calendar day. A cell a
 writer tore and a date stored under a relaxed sql_mode both read that way,
-and the chunk audit separates them (a group whose counter moved has the row
+and the chunk validation separates them (a group whose counter moved has the row
 re-read, a group whose counter held fails the request). Reaching the stored
 half needs a table loaded with sql_mode relaxed, which this file does not
 build.
@@ -74,7 +74,7 @@ QUIET = "> /dev/null 2>&1"
 # Bytes the server log held before this test started the stack.
 LOG_OFFSET = 0
 # The writer's install pause, and the hold every bridge read takes between
-# its epoch fence and its scan.
+# its read view fence and its scan.
 PAUSE_MS = 1500
 FENCE_HOLD_MS = 2500
 # The debug sync points stay in the environment; the rest is configuration.
@@ -317,8 +317,8 @@ def run_scenario(cursor, user, password, scenario):
 
     This pins the boundary cases (an install inside the fence hold resolves
     through the claim copy, an insert stays invisible, a delete reads from its
-    image). It does not pin the per-chunk audit: the second install can land
-    before its group is claimed, and then the claim copy answers.
+    image). It does not pin the per-chunk validation: the second install can
+    land before its group is claimed, and then the claim copy answers.
     """
     table = scenario["table"]
     print(f"SCENARIO {scenario['name']}")
@@ -469,9 +469,9 @@ class Hammer(threading.Thread):
 
 
 def run_concurrent_scenario(cursor, user, password):
-    """Installs throughout the scan: the only scenario that pins the audit.
+    """Installs throughout the scan: the only scenario that pins the validation.
 
-    Installs land in groups the scan is holding, so chunk_redos >= 1 is
+    Installs land in groups the scan is holding, so chunk_rereads >= 1 is
     asserted; the paused scenarios cannot reach that.
     """
     table = "midscan_stream"
@@ -512,8 +512,8 @@ def run_concurrent_scenario(cursor, user, password):
         print(f"\tFailed: read view returned {reader.rows} != pre-write state "
               f"{OLD_STATE}; a mid-scan install reached the result")
         return 1
-    if tally.get("chunk_redos", 0) < 1:
-        print(f"\tFailed: no chunk audit found a group written under it "
+    if tally.get("chunk_rereads", 0) < 1:
+        print(f"\tFailed: no chunk validation found a group written under it "
               f"({tally}); the mid-scan schedule was not reached")
         return 1
 
@@ -541,9 +541,9 @@ def run_concurrent_scenario(cursor, user, password):
         print(f"\tFailed: primary state {primary_rows} != {new_state}")
         return 1
 
-    print(f"\tconsistent: {tally.get('chunk_redos')} chunk audits redid a "
-          f"group written under the scan, and the read returned the complete "
-          f"pre-write state")
+    print(f"\tconsistent: {tally.get('chunk_rereads')} chunk validations "
+          f"re-read a group written under the scan, and the read returned the "
+          f"complete pre-write state")
     return 0
 
 

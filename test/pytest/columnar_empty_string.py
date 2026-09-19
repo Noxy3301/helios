@@ -17,8 +17,8 @@ Two scan paths carry the same rows, and both are covered:
     view (the concurrent scenario, which asserts image_slots >= 1)
 
 The concurrent scenario uses the pax_view.after_fence sync point that holds
-every bridge read between its epoch fence and its scan, so the writer commits
-inside the hold and its rows resolve through images. The test therefore owns
+every bridge read between its read view fence and its scan, so the writer
+commits inside the hold and its rows resolve through images. The test owns
 the local stack: it restarts it with the sync point armed and stops it
 afterwards, as columnar_midscan_preserve.py does.
 """
@@ -39,7 +39,7 @@ ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 QUIET = "> /dev/null 2>&1"
 # Bytes the server log held before this test started the stack.
 LOG_OFFSET = 0
-# The hold every bridge read takes between its epoch fence and its scan.
+# The hold every bridge read takes between its read view fence and its scan.
 FENCE_HOLD_MS = 1000
 # The debug sync points stay in the environment; the rest is configuration.
 SERVER_ENV = ("HELIOS_DEBUG_SYNC_PAX_VIEW_AFTER_FENCE"
@@ -221,7 +221,7 @@ def compare(cursor, rows, label):
 
 
 class Reader(threading.Thread):
-    """One FORCED select of the whole table, held at the epoch fence."""
+    """One FORCED select of the whole table, held at the read view fence."""
 
     def __init__(self, user, password):
         super().__init__(daemon=True)

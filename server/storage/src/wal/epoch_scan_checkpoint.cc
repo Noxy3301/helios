@@ -399,7 +399,7 @@ bool EpochScanCheckpoint::CaptureTable(Table &table, LogRecord &record,
   std::vector<std::string> unstable_rows;
   std::vector<std::pair<std::string, std::string>> unstable_entries;
 
-  // Capture every primary slot; defer the keys that stayed locked. The
+  // Capture every primary record; defer the keys that stayed locked. The
   // walk's callback returns true to stop, so a capture that wants every row
   // returns false.
   table.GetPrimaryIndex().ForEach([&](std::string_view key, DataItem &item) {
@@ -444,7 +444,7 @@ bool EpochScanCheckpoint::CaptureTable(Table &table, LogRecord &record,
 
   // Retry pass: resolve the deferred keys again and copy what has settled.
   // Rows held by a writer for the whole spin are resolved again by key: the
-  // slot they were in may have been purged and replaced meanwhile, and a
+  // record they were in may have been purged and replaced meanwhile, and a
   // pointer kept across the pass would name the old one.
   bool stopped = false;
   for (unsigned round = 0; round < kRetryRounds; ++round) {

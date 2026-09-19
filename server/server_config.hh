@@ -35,7 +35,7 @@ struct ServerConfig {
     uint64_t bridge_mem_limit_bytes = 0;
     /// Whether the analytical bridge writes its trace lines.
     bool bridge_debug = false;
-    /// Upper bound on the read view's epoch-fence wait, in milliseconds.
+    /// Upper bound on the read view fence wait, in milliseconds.
     uint32_t read_view_fence_timeout_ms = 5000;
     /// The lowest level the log keeps: trace, debug, info, warning, error,
     /// critical or off.

@@ -389,13 +389,13 @@ bool HeliosProxy::tx_commit(
             }
             case WriteOp::Type::SecondaryIndexWrite:
             case WriteOp::Type::SecondaryIndexDelete: {
-                auto* si = request.add_secondary_index_ops();
-                si->set_table_name(op.table_name);
-                si->set_index_name(op.index_name);
-                si->set_secondary_key(op.secondary_key);
-                si->set_primary_key(op.primary_key);
-                si->set_is_delete(op.type ==
-                                  WriteOp::Type::SecondaryIndexDelete);
+                auto* index_op = request.add_secondary_index_ops();
+                index_op->set_table_name(op.table_name);
+                index_op->set_index_name(op.index_name);
+                index_op->set_secondary_key(op.secondary_key);
+                index_op->set_primary_key(op.primary_key);
+                index_op->set_is_delete(op.type ==
+                                        WriteOp::Type::SecondaryIndexDelete);
                 break;
             }
         }

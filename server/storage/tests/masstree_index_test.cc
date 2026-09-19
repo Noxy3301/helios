@@ -231,14 +231,14 @@ TEST(MasstreeIndexTest, ReaperPreservesReusedSecondaryEntry) {
   reaper.Purge(9);
   EXPECT_EQ(item, tree.Get("secondary"));
 
-  // A later insertion reuses the slot and publishes a newer TID.
+  // A later insertion reuses the index record and publishes a newer TID.
   item->SetPrimaryKeys({"primary"});
   item->transaction_id.store(Word(10, 4, /*absent=*/false));
   reaper.Purge(10);
   EXPECT_EQ(item, tree.Get("secondary"));
   EXPECT_TRUE(item->IsLive());
 
-  // Deleting that last posting allows the same tree to purge the slot.
+  // Deleting that last posting allows the same tree to purge the record.
   item->SetPrimaryKeys({});
   const Tidword deleted_again = Word(12, 6, /*absent=*/true);
   item->transaction_id.store(deleted_again);

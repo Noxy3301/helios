@@ -686,7 +686,7 @@ HeliosTransaction::get_matching_primary_keys_in_range(std::string index_name,
     }
     auto merged = merge_index_scan(index_name, start_key, end_key, row_limit,
                                    reverse_scan, groups);
-    rpc_trace_.record_local_view("use_si_scan:" + db_table_key + ":" +
+    rpc_trace_.record_local_view("use_secondary_scan:" + db_table_key + ":" +
                                  index_name + ":n=" +
                                  std::to_string(merged.primary_keys.size()));
     return merged.primary_keys;

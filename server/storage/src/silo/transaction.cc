@@ -113,7 +113,7 @@ bool Transaction::IndexWrite(std::string_view table_name,
                              std::string &reason) {
   Table *table = tables_.GetTable(table_name);
   if (table == nullptr) {
-    reason = "si_table_missing";
+    reason = "secondary_index_table_missing";
     return false;
   }
   // Recovery refuses a log entry whose table has no schema, so a record on
@@ -124,7 +124,7 @@ bool Transaction::IndexWrite(std::string_view table_name,
   }
   index::SecondaryIndex *index = table->GetSecondaryIndex(index_name);
   if (index == nullptr) {
-    reason = "si_index_missing";
+    reason = "secondary_index_missing";
     return false;
   }
   DataItem *item = index->tree.GetOrInsert(secondary_key);

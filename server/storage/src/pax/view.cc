@@ -1,7 +1,7 @@
 /**
  * @file server/storage/src/pax/view.cc
- * PAX schema installation, and the consistent columnar read view, which an
- * epoch fence makes consistent.
+ * PAX schema installation, and the consistent columnar read view, which a
+ * read view fence makes consistent.
  */
 
 #include <chrono>

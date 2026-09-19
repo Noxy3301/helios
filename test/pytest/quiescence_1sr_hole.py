@@ -5,8 +5,8 @@ return a complete committed state and a read issued after a commit returns
 to see that commit. Per-group write counters cannot provide this: they
 return to even after every ROW install, so a reader scheduled between two
 row installs of a multi-row commit observes a stable-looking half-applied
-table. The bridge reads an epoch-fenced read view with before-image
-resolution instead, and this test demands consistent results.
+table. The bridge reads a read view opened behind the read view fence, with
+before-image resolution instead, and this test demands consistent results.
 
 The test opens the install window wide and synchronizes on it instead of
 racing:
@@ -56,7 +56,7 @@ ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 QUIET = "> /dev/null 2>&1"
 PAUSE_MS = 1500
 # The read-view-before-write scenario holds every bridge read open between
-# its epoch fence and its scan; shorter than PAUSE_MS so the held read
+# its read view fence and its scan; shorter than PAUSE_MS so the held read
 # finishes while the writer's paused COMMIT is still in flight.
 FENCE_HOLD_MS = 1000
 # One point carries the install pause: every transaction installs through the
@@ -316,7 +316,7 @@ class Reader(threading.Thread):
     """One FORCED SELECT on its own connection, with result and end stamp.
 
     The armed pax_view.after_fence point holds the SELECT open between
-    its epoch fence and its scan, so writes committed meanwhile land with
+    its read view fence and its scan, so writes committed meanwhile land with
     epochs above the read view's cut.
     """
 

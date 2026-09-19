@@ -122,7 +122,7 @@ class EpochImageBuffer {
    *
    * @details Samples the global epoch under the registry lock, so a writer
    * that sees the registration also sees the epoch. The caller performs the
-   * epoch fence itself; Close may run on another thread.
+   * read view fence itself; Close may run on another thread.
    */
   EpochNumber Open(const epoch::Framework &epoch);
 
@@ -155,8 +155,8 @@ class EpochImageBuffer {
                                      uint32_t slot) const;
 
  private:
-  // seq_cst on both sides is load-bearing for the fence proof; do not
-  // weaken.
+  // seq_cst on both sides is load-bearing for the read view fence proof; do
+  // not weaken.
   std::atomic<uint64_t> open_count_{0};
   // What the buffer holds, for attributing the process's memory. Moved
   // wherever an image is appended, trimmed or dropped.

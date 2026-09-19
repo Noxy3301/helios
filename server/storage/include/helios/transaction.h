@@ -158,8 +158,8 @@ class Transaction {
    * @details With `remove` true, `primary_key` leaves the secondary key's
    * list; otherwise it joins it. Uniqueness belongs to the named index, not to
    * this call.
-   * @return false with reason `si_table_missing`, `pax_schema_missing`, or
-   * `si_index_missing`.
+   * @return false with reason `secondary_index_table_missing`,
+   * `pax_schema_missing`, or `secondary_index_missing`.
    */
   bool IndexWrite(std::string_view table_name, std::string_view index_name,
                   std::string_view secondary_key, std::string_view primary_key,

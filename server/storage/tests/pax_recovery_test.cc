@@ -185,7 +185,7 @@ TEST_F(PaxRecoveryTest, RejectsBadInputBeforeConflictChecksAndSlotAllocation) {
   ASSERT_TRUE(TestHelper::WriteRow(db, "t", "a", original));
   const auto slots = pax::SlotsAllocated(db.GetPaxTable("t"));
 
-  // Bad row bytes must be rejected before Silo sees the stale read evidence.
+  // Bad row bytes must be rejected before Silo sees the stale observed TID.
   std::string reason;
   EXPECT_FALSE(TestHelper::CommitRows(
       db, {{"t", "a", 0}}, {{"t", "b", Row("2", "2.0")}}, {}, {}, reason));

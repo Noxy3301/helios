@@ -118,7 +118,7 @@ void AppendProxyField(std::string& out, std::string_view payload,
 bool BridgeDebugEnabled() { return config().bridge_debug; }
 
 /**
- * @brief Upper bound on the read view's epoch-fence wait.
+ * @brief Upper bound on the read view fence wait.
  */
 uint32_t FenceTimeoutMs() { return config().read_view_fence_timeout_ms; }
 
@@ -287,7 +287,7 @@ struct PaxTableView {
   // Scan tallies for one request, reported under bridge_debug.
   std::atomic<uint64_t> groups_scanned{0};
   std::atomic<uint64_t> groups_with_images{0};
-  std::atomic<uint64_t> chunk_audits_redone{0};
+  std::atomic<uint64_t> chunk_rereads{0};
   std::atomic<uint64_t> slots_from_images{0};
 };
 
@@ -352,7 +352,7 @@ struct PaxGlobalState : public GlobalTableFunctionState {
  *
  * @details Claim time samples `count_at_claim` and then copies the group's
  * image map and its imaged-slot bits; a preserve landing between the two
- * bumps a value the chunk audit compares against. `image_state` is the
+ * bumps a value the chunk validation compares against. `image_state` is the
  * group's image state as of the claim, null while the group has none.
  */
 struct PaxLocalState : public LocalTableFunctionState {
@@ -542,7 +542,8 @@ unique_ptr<LocalTableFunctionState> PaxInitLocal(ExecutionContext&,
  * @brief One output row whose in-place DATE cell names no calendar day.
  *
  * @details A cell a concurrent writer tore reads this way, and so does a
- * date stored under a relaxed sql_mode. The chunk audit tells them apart: a
+ * date stored under a relaxed sql_mode. The chunk validation tells them
+ * apart: a
  * group whose preserve counter moved has the row re-read, and a group whose
  * counter held stored the value.
  */
@@ -556,8 +557,8 @@ struct InvalidDate {
  * false when the parts name no calendar day.
  *
  * @details A rejected date leaves the epoch in `out` as a placeholder, which
- * reaches the result only for a row the audit confirms, and the audit raises
- * on that row.
+ * reaches the result only for a row the chunk validation confirms, and the
+ * validation raises on that row.
  */
 inline bool TryCanonicalDate(int32_t year, int32_t month, int32_t day,
                              date_t* out) {
@@ -573,7 +574,8 @@ inline bool TryCanonicalDate(int32_t year, int32_t month, int32_t day,
  * @brief Converts a year/month/day into a date_t and raises when the parts
  * name no calendar day.
  *
- * @details For a value no audit covers: an epoch image carries the ASCII a
+ * @details For a value no chunk validation covers: an epoch image carries
+ * the ASCII a
  * writer formatted under a lock, which no reader can tear.
  */
 inline date_t CanonicalDate(int32_t year, int32_t month, int32_t day) {
@@ -652,7 +654,8 @@ void DecodeDecimalRun(const std::byte* src, uint32_t stride, uint32_t width,
  * @details A typed cell is [u16 len][fixed-width LE payload]; a length equal
  * to the column width means the payload is present, any other length (an
  * empty cell) is SQL NULL. A DATE cell naming no calendar day appends to
- * `invalid_dates` rather than raising, leaving the verdict to the audit.
+ * `invalid_dates` rather than raising, leaving the verdict to the chunk
+ * validation.
  */
 void BulkDecodeTyped(FieldType type, const PaxGroup& group, size_t field,
                      uint32_t width, uint32_t slot_start, uint32_t count,
@@ -917,7 +920,8 @@ void PaxScan(ClientContext&, TableFunctionInput& data, DataChunk& output) {
   PaxTable* table = table_view.table;
   const uint32_t snapshot_epoch = table_view.snapshot_epoch;
   // The chunk DuckDB hands in holds STANDARD_VECTOR_SIZE rows (2048 in the
-  // default build); the audit below runs once per chunk, before it is returned.
+  // default build); the validation below runs once per chunk, before it is
+  // returned.
   const idx_t max_rows = output.GetCapacity();
   idx_t rows_emitted = 0;
 
@@ -938,19 +942,21 @@ void PaxScan(ClientContext&, TableFunctionInput& data, DataChunk& output) {
   }
 
   // The current group's in-place reads in this call: the slot they started at
-  // and the output row the group's rows begin at, which a dirty audit rewinds
-  // to. A group carried over from an earlier call resumes at its cursor.
-  bool audit_pending = local_state.group_ptr != nullptr &&
-                       local_state.current_slot < PaxGroup::kRows;
+  // and the output row the group's rows begin at, which a chunk re-read
+  // rewinds to. A group carried over from an earlier call resumes at its
+  // cursor.
+  bool chunk_validation_pending = local_state.group_ptr != nullptr &&
+                                  local_state.current_slot < PaxGroup::kRows;
   uint32_t entry_slot = local_state.current_slot;
   idx_t entry_row = 0;
 
-  // In-place DATE cells of the open audit window that name no calendar day,
-  // in output row order. The audit empties the list, either by dropping the
-  // rows its redo replaces or by raising, so it is empty whenever no window
+  // In-place DATE cells of the open validation window that name no calendar
+  // day, in output row order. The validation empties the list, either by
+  // dropping the rows its re-read replaces or by raising, so it is empty
+  // whenever no window
   // is open.
   std::vector<InvalidDate> invalid_dates;
-  // Forgets the records of output rows a rewind or a redo overwrites.
+  // Forgets the records of output rows a rewind or a re-read overwrites.
   auto drop_invalid_dates_from = [&](idx_t row) {
     while (!invalid_dates.empty() && invalid_dates.back().row >= row) {
       invalid_dates.pop_back();
@@ -968,7 +974,7 @@ void PaxScan(ClientContext&, TableFunctionInput& data, DataChunk& output) {
   // Re-reads [from, to) of the claimed group against a fresh image copy,
   // revalidating the counter per row, and stops when the chunk fills: the
   // group stays claimed and the next call resumes at current_slot.
-  auto redo_slots = [&](uint32_t from, uint32_t to) {
+  auto reread_slots = [&](uint32_t from, uint32_t to) {
     PaxGroup* group = local_state.group_ptr;
     ClaimGroupImages(local_state, group, snapshot_epoch);
     for (uint32_t slot = from; slot < to; slot++) {
@@ -990,8 +996,8 @@ void PaxScan(ClientContext&, TableFunctionInput& data, DataChunk& output) {
         EmitInPlaceRow(*group, scan_columns, slot, output, rows_emitted,
                        &invalid_dates);
       }
-      // The fence orders the cell reads above before the closing sample; an
-      // acquire load alone leaves them free to sink past it.
+      // The acquire fence orders the cell reads above before the closing
+      // sample; an acquire load alone leaves them free to sink past it.
       std::atomic_thread_fence(std::memory_order_acquire);
       const uint64_t count_now =
           pax::PreserveCount(GroupState(local_state, group));
@@ -1016,14 +1022,15 @@ void PaxScan(ClientContext&, TableFunctionInput& data, DataChunk& output) {
 
   // A preserve bumps the counter before the writer's first strip mutation, so
   // an unchanged counter means no in-place row of this group was read torn.
-  // The audit runs before the chunk reaches DuckDB, which cannot give one back.
-  auto audit = [&]() {
-    if (!audit_pending) return;
-    audit_pending = false;
+  // The validation runs before the chunk reaches DuckDB, which cannot give
+  // one back.
+  auto validate_chunk = [&]() {
+    if (!chunk_validation_pending) return;
+    chunk_validation_pending = false;
     PaxGroup* group = local_state.group_ptr;
     const uint32_t read_through = local_state.current_slot;
-    // The fence orders this call's cell reads before the closing sample; an
-    // acquire load alone leaves them free to sink past it.
+    // The acquire fence orders this call's cell reads before the closing
+    // sample; an acquire load alone leaves them free to sink past it.
     std::atomic_thread_fence(std::memory_order_acquire);
     if (pax::PreserveCount(GroupState(local_state, group)) ==
         local_state.count_at_claim) {
@@ -1032,15 +1039,15 @@ void PaxScan(ClientContext&, TableFunctionInput& data, DataChunk& output) {
       if (!invalid_dates.empty()) RaiseInvalidDate(invalid_dates.front());
       return;
     }
-    table_view.chunk_audits_redone.fetch_add(1, std::memory_order_relaxed);
+    table_view.chunk_rereads.fetch_add(1, std::memory_order_relaxed);
     const idx_t high_water = rows_emitted;
     rows_emitted = entry_row;
     drop_invalid_dates_from(rows_emitted);
-    redo_slots(entry_slot, read_through);
-    // A redo resolves each slot against its own counter sample, so a record
+    reread_slots(entry_slot, read_through);
+    // A re-read resolves each slot against its own counter sample, so a record
     // it leaves behind is a stored value.
     if (!invalid_dates.empty()) RaiseInvalidDate(invalid_dates.front());
-    // The rows the redo abandons keep the validity bits the rewound pass
+    // The rows the re-read abandons keep the validity bits the rewound pass
     // wrote, and the bulk run that fills those rows next writes cells only,
     // so their columns are marked valid again.
     for (idx_t column = 0; column < scan_columns.size(); column++) {
@@ -1048,14 +1055,14 @@ void PaxScan(ClientContext&, TableFunctionInput& data, DataChunk& output) {
         FlatVector::SetNull(output.data[column], row, false);
       }
     }
-    // The redo's fresh copy and counter are the baseline of the window any
+    // The re-read's fresh copy and counter are the baseline of the window any
     // further in-place read of this group in this call belongs to.
-    audit_pending = local_state.current_slot < PaxGroup::kRows;
+    chunk_validation_pending = local_state.current_slot < PaxGroup::kRows;
     entry_slot = local_state.current_slot;
     entry_row = rows_emitted;
   };
 
-  // An empty chunk ends this thread's scan, and a redo can empty one, so a
+  // An empty chunk ends this thread's scan, and a re-read can empty one, so a
   // call that has groups left to claim claims them rather than returning
   // cardinality 0.
   bool groups_exhausted = false;
@@ -1063,11 +1070,11 @@ void PaxScan(ClientContext&, TableFunctionInput& data, DataChunk& output) {
     while (rows_emitted < max_rows) {
       if (local_state.group_ptr != nullptr &&
           local_state.current_slot >= PaxGroup::kRows) {
-        audit();
-        // A redo that fills the chunk leaves the group unfinished.
+        validate_chunk();
+        // A re-read that fills the chunk leaves the group unfinished.
         if (local_state.current_slot < PaxGroup::kRows) continue;
         local_state.group_ptr = nullptr;
-        // A redo can fill the chunk on the group's last slot.
+        // A re-read can fill the chunk on the group's last slot.
         if (rows_emitted >= max_rows) break;
       }
       if (local_state.group_ptr == nullptr) {
@@ -1085,7 +1092,7 @@ void PaxScan(ClientContext&, TableFunctionInput& data, DataChunk& output) {
         if (local_state.has_images) {
           table_view.groups_with_images.fetch_add(1, std::memory_order_relaxed);
         }
-        audit_pending = true;
+        chunk_validation_pending = true;
         entry_slot = 0;
         entry_row = rows_emitted;
       }
@@ -1133,10 +1140,11 @@ void PaxScan(ClientContext&, TableFunctionInput& data, DataChunk& output) {
       local_state.current_slot = slot + run_length;
     }
 
-    audit();
+    validate_chunk();
     if (rows_emitted > 0 || groups_exhausted) break;
   }
-  // Past this line the chunk is DuckDB's; every group that fed it is audited.
+  // Past this line the chunk is DuckDB's; every group that fed it is
+  // validated.
   output.SetCardinality(rows_emitted);
 }
 
@@ -1564,11 +1572,11 @@ void ExecuteDuckdbQuery(
         const PaxTableView& table_view = table_views[i];
         std::fprintf(stderr,
                      "[duckdb-scan] %s groups=%lu imaged_groups=%lu "
-                     "chunk_redos=%lu image_slots=%lu\n",
+                     "chunk_rereads=%lu image_slots=%lu\n",
                      request.tables(static_cast<int>(i)).table_name().c_str(),
                      table_view.groups_scanned.load(),
                      table_view.groups_with_images.load(),
-                     table_view.chunk_audits_redone.load(),
+                     table_view.chunk_rereads.load(),
                      table_view.slots_from_images.load());
       }
     }
