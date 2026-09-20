@@ -16,6 +16,7 @@
 #include <vector>
 
 #include "helios/pax.h"
+#include "pax/hyperloglog.h"
 
 namespace helios::storage {
 namespace pax {
@@ -127,10 +128,6 @@ class PaxTable {
   }
 
  private:
-  // HyperLogLog registers a field, one byte each.
-  static constexpr size_t kSketchBits = 10;
-  static constexpr size_t kSketchRegisters = size_t{1} << kSketchBits;
-
   TableSchema schema_;
   // Fixed at kMaxGroups entries; the groups it points at are owned here and
   // are freed only when the store is.
@@ -142,8 +139,8 @@ class PaxTable {
   // Per-field value range. An untyped field keeps the empty range lo > hi.
   std::unique_ptr<std::atomic<int64_t>[]> lo_;
   std::unique_ptr<std::atomic<int64_t>[]> hi_;
-  // Per-field HyperLogLog registers, kSketchRegisters to a field.
-  std::unique_ptr<std::atomic<uint8_t>[]> sketch_;
+  // One distinct-value sketch a field.
+  std::unique_ptr<HyperLogLog[]> sketch_;
 };
 
 }  // namespace pax
