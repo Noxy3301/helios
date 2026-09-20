@@ -1062,6 +1062,7 @@ def main():
     finally:
         if managed:
             stop_all_servers()
+            LOCAL_CONF.write_text("")
         if not args.keep_helios_data:
             cleanup_helios_data()
 
