@@ -463,13 +463,7 @@ void PaxGroup::GatherRowMasked(uint32_t slot, const uint32_t *columns,
 PaxTable::PaxTable(TableSchema schema) : schema_(std::move(schema)) {
   dir_.reset(new std::atomic<PaxGroup *>[kMaxGroups]());
   const size_t fields = schema_.field_count();
-  // Start every field's range empty; Observe widens the typed ones.
-  lo_.reset(new std::atomic<int64_t>[fields]);
-  hi_.reset(new std::atomic<int64_t>[fields]);
-  for (size_t f = 0; f < fields; f++) {
-    lo_[f].store(INT64_MAX, std::memory_order_relaxed);
-    hi_[f].store(INT64_MIN, std::memory_order_relaxed);
-  }
+  range_.reset(new ValueRange[fields]);
   sketch_.reset(new HyperLogLog[fields]);
 }
 
@@ -494,28 +488,13 @@ std::pair<PaxGroup *, uint32_t> PaxTable::AllocateSlot() {
 }
 
 void PaxTable::observe(size_t field, int64_t value) {
-  std::atomic<int64_t> &lo = lo_[field];
-  int64_t low = lo.load(std::memory_order_relaxed);
-  while (value < low && !lo.compare_exchange_weak(low, value,
-                                                  std::memory_order_relaxed)) {
-  }
-  std::atomic<int64_t> &hi = hi_[field];
-  int64_t high = hi.load(std::memory_order_relaxed);
-  while (value > high && !hi.compare_exchange_weak(high, value,
-                                                   std::memory_order_relaxed)) {
-  }
-
+  range_[field].add(value);
   sketch_[field].add(value);
 }
 
 bool PaxTable::range(size_t field, int64_t *lo, int64_t *hi) const {
   if (field >= schema_.field_count()) return false;
-  const int64_t low = lo_[field].load(std::memory_order_relaxed);
-  const int64_t high = hi_[field].load(std::memory_order_relaxed);
-  if (low > high) return false;
-  *lo = low;
-  *hi = high;
-  return true;
+  return range_[field].read(lo, hi);
 }
 
 bool PaxTable::distinct(size_t field, uint64_t *ndv) const {

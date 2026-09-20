@@ -17,6 +17,7 @@
 
 #include "helios/pax.h"
 #include "pax/hyperloglog.h"
+#include "pax/value_range.h"
 
 namespace helios::storage {
 namespace pax {
@@ -136,9 +137,8 @@ class PaxTable {
   // Serializes the first touch of a directory entry, not the directory
   // itself, which never grows.
   std::mutex alloc_mutex_;
-  // Per-field value range. An untyped field keeps the empty range lo > hi.
-  std::unique_ptr<std::atomic<int64_t>[]> lo_;
-  std::unique_ptr<std::atomic<int64_t>[]> hi_;
+  // One value range a field. An untyped field keeps the empty range.
+  std::unique_ptr<ValueRange[]> range_;
   // One distinct-value sketch a field.
   std::unique_ptr<HyperLogLog[]> sketch_;
 };
