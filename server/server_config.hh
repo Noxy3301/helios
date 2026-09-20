@@ -18,7 +18,7 @@ struct ServerConfig {
     /// Directory holding the log, the checkpoint and the PAX catalog.
     std::string datadir = "./helios_data";
     /// How often the global epoch advances, in milliseconds.
-    size_t epoch_duration_ms = 40;
+    size_t epoch_duration_ms = 1;
     /// The contract every commit runs under: "sync" or "async".
     std::string commit_durability = "sync";
     /// Whether the log is replayed at startup.

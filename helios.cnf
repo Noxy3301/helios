@@ -15,7 +15,7 @@ datadir = ./helios_data
 server_port = 9999
 
 # How often the global epoch advances, in milliseconds, in [1,10000].
-epoch_duration_ms = 40
+epoch_duration_ms = 1
 
 # The contract every commit runs under: sync or async.
 commit_durability = sync
