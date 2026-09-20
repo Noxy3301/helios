@@ -132,8 +132,10 @@ class PaxGroup {
    * @brief Creates an empty group whose strips are sized from `schema`.
    *
    * @param schema Table schema owned by `PaxTable`; must outlive this group.
+   * @param table Table whose column statistics this group's writes feed;
+   * it owns this group and outlives it.
    */
-  explicit PaxGroup(const TableSchema &schema);
+  PaxGroup(const TableSchema &schema, PaxTable &table);
 
   /**
    * @brief Drops the images this group published and detaches its state.
@@ -262,6 +264,7 @@ class PaxGroup {
   void AppendCellField(size_t field, uint32_t slot, std::string &out) const;
 
   const TableSchema &schema_;  // Owned by PaxTable; outlives all groups.
+  PaxTable &table_;            // Owns this group and outlives it.
   std::vector<uint32_t> stride_;
   std::vector<size_t> strip_offset_;
   std::unique_ptr<std::byte[]> arena_;
@@ -288,6 +291,38 @@ uint64_t SlotsAllocated(const PaxTable *store);
  * @brief Returns the number of row groups that may contain allocated slots.
  */
 size_t GroupCount(const PaxTable *store);
+
+/**
+ * @brief Returns the value range written to a typed field.
+ *
+ * @details The range only widens, so a retired or overwritten row leaves it
+ * wider than the live rows need and it bounds them from outside. A query
+ * planner reads it as a bound, never as a set of values present.
+ *
+ * @param field Field index, where 0 is the null-flags field and MySQL column
+ * i is field `i + 1`.
+ * @param lo Lowest value written, untouched when the field has none.
+ * @param hi Highest value written, untouched when the field has none.
+ * @return false when the field is outside the schema, untyped, or holds no
+ * value yet.
+ */
+bool ColumnRange(const PaxTable *store, size_t field, int64_t *lo,
+                 int64_t *hi);
+
+/**
+ * @brief Returns the estimated number of distinct values a typed field holds.
+ *
+ * @details A HyperLogLog sketch over the values written. The estimate errs
+ * in either direction by a few percent and counts values whose rows are
+ * gone, which makes it an estimate rather than a bound.
+ *
+ * @param field Field index, where 0 is the null-flags field and MySQL column
+ * i is field `i + 1`.
+ * @param ndv Estimate, untouched when the field holds no value.
+ * @return false when the field is outside the schema, untyped, or holds no
+ * value yet.
+ */
+bool ColumnDistinct(const PaxTable *store, size_t field, uint64_t *ndv);
 
 /**
  * @brief One epoch image of a (group, slot).

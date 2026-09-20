@@ -28,6 +28,8 @@
 #include <duckdb/function/scalar_function.hpp>
 #include <duckdb/parser/parsed_data/create_collation_info.hpp>
 #include <duckdb/parser/parsed_data/create_scalar_function_info.hpp>
+#include <duckdb/storage/statistics/numeric_stats.hpp>
+#include <spdlog/spdlog.h>
 
 #include "../server_config.hh"
 #include "../mysql_charset_runtime.hh"
@@ -440,6 +442,10 @@ inline bool slot_imaged(const PaxLocalState& state, uint32_t slot) {
          ((state.imaged[slot / kWordBits] >> (slot % kWordBits)) & 1u) != 0;
 }
 
+// Width of a kDecimal64 column, matching its typing rule (precision <= 15);
+// see helios::storage::pax::FieldType.
+constexpr uint8_t kDecimalWidth = 15;
+
 /**
  * @brief Maps a PAX FieldType to the DuckDB column type.
  */
@@ -452,9 +458,7 @@ LogicalType field_type_to_logical_type(FieldType type, int8_t scale) {
     case FieldType::kDate:
       return LogicalType::DATE;
     case FieldType::kDecimal64:
-      // Width 15 matches the kDecimal64 typing rule (precision <= 15); see
-      // helios::storage::pax::FieldType.
-      return LogicalType::DECIMAL(15, static_cast<uint8_t>(scale));
+      return LogicalType::DECIMAL(kDecimalWidth, static_cast<uint8_t>(scale));
     default:
       return LogicalType::VARCHAR;
   }
@@ -590,6 +594,84 @@ inline date_t canonical_date(int32_t year, int32_t month, int32_t day) {
 }
 
 /**
+ * @brief Converts a YYYYMMDD integer into a date, false for a missing day.
+ */
+inline bool ymd_to_date(int64_t ymd, date_t* out) {
+  return try_canonical_date(static_cast<int32_t>(ymd / 10000),
+                            static_cast<int32_t>((ymd / 100) % 100),
+                            static_cast<int32_t>(ymd % 100), out);
+}
+
+/**
+ * @brief A typed column's value range and distinct-value estimate.
+ *
+ * @details The range covers every value written and never narrows, so DuckDB
+ * may prune a filter against it. The distinct count is an estimate in both
+ * directions, which the join-order search tolerates.
+ */
+unique_ptr<duckdb::BaseStatistics> pax_statistics(ClientContext&,
+                                                  const FunctionData* bind_data,
+                                                  column_t column_index) {
+  const auto& data = bind_data->Cast<PaxBindData>();
+  const PaxTableView& view = *data.table;
+  if (column_index >= view.columns.size()) return nullptr;
+  const ColumnSpec& column = view.columns[column_index];
+  if (column.type == FieldType::kUntyped) return nullptr;
+
+  const size_t field = static_cast<size_t>(column_index) + 1;
+  int64_t low, high;
+  if (!pax::ColumnRange(view.table, field, &low, &high)) return nullptr;
+
+  duckdb::Value min_value, max_value;
+  switch (column.type) {
+    case FieldType::kInt32:
+      min_value = duckdb::Value::INTEGER(static_cast<int32_t>(low));
+      max_value = duckdb::Value::INTEGER(static_cast<int32_t>(high));
+      break;
+    case FieldType::kInt64:
+      min_value = duckdb::Value::BIGINT(low);
+      max_value = duckdb::Value::BIGINT(high);
+      break;
+    case FieldType::kDate: {
+      // YYYYMMDD orders as the calendar does, so the extremes convert alone.
+      date_t min_date, max_date;
+      if (!ymd_to_date(low, &min_date) || !ymd_to_date(high, &max_date)) {
+        SPDLOG_WARN(
+            "column {} bounds a date outside the calendar, leaving the "
+            "column without statistics",
+            column_index);
+        return nullptr;
+      }
+      min_value = duckdb::Value::DATE(min_date);
+      max_value = duckdb::Value::DATE(max_date);
+      break;
+    }
+    case FieldType::kDecimal64:
+      min_value = duckdb::Value::DECIMAL(low, kDecimalWidth,
+                                         static_cast<uint8_t>(column.scale));
+      max_value = duckdb::Value::DECIMAL(high, kDecimalWidth,
+                                         static_cast<uint8_t>(column.scale));
+      break;
+    default:
+      return nullptr;
+  }
+
+  auto stats = duckdb::NumericStats::CreateUnknown(
+      field_type_to_logical_type(column.type, column.scale));
+  duckdb::NumericStats::SetMin(stats, min_value);
+  duckdb::NumericStats::SetMax(stats, max_value);
+
+  // The sketch counts values whose rows are gone, so the slot count is the
+  // ceiling: a column can hold no more distinct values than it has rows.
+  uint64_t distinct = 0;
+  if (pax::ColumnDistinct(view.table, field, &distinct)) {
+    const uint64_t rows = pax::SlotsAllocated(view.table);
+    stats.SetDistinctCount(static_cast<idx_t>(std::min(distinct, rows)));
+  }
+  return stats.ToUnique();
+}
+
+/**
  * @brief Raises the conversion `bad` failed.
  */
 [[noreturn]] void raise_invalid_date(const InvalidDate& bad) {
@@ -707,8 +789,7 @@ void unpack_typed_run(FieldType type, const PaxGroup& group, size_t field,
         if (cell_length == width) {
           int32_t ymd;
           std::memcpy(&ymd, src + kCellLenBytes, sizeof(ymd));
-          if (!try_canonical_date(ymd / 10000, (ymd / 100) % 100, ymd % 100,
-                                  &dst[i])) {
+          if (!ymd_to_date(ymd, &dst[i])) {
             invalid_dates->push_back({out_base + i, ymd});
           }
         } else {
@@ -1432,6 +1513,7 @@ void ensure_duckdb_scan_registered() {
     function.projection_pushdown = true;
     function.filter_pushdown = false;
     function.cardinality = pax_cardinality;
+    function.statistics = pax_statistics;
     connection.context->RunFunctionInTransaction([&]() {
       auto& catalog = duckdb::Catalog::GetSystemCatalog(*connection.context);
       duckdb::CreateTableFunctionInfo create_info(function);

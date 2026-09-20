@@ -311,7 +311,8 @@ bool unpack_row(const TableSchema &schema, const std::byte *value, size_t size,
   return true;
 }
 
-PaxGroup::PaxGroup(const TableSchema &schema) : schema_(schema) {
+PaxGroup::PaxGroup(const TableSchema &schema, PaxTable &table)
+    : schema_(schema), table_(table) {
   const size_t fields = schema.field_count();
   stride_.resize(fields);
   strip_offset_.resize(fields);
@@ -342,6 +343,7 @@ void PaxGroup::ScatterRow(uint32_t slot, const Row &row) {
       const uint16_t len = static_cast<uint16_t>(schema_.field_max_bytes[f]);
       std::memcpy(cell, &len, sizeof(len));
       std::memcpy(cell + kCellLenBytes, &field.typed_value, len);
+      table_.observe(f, static_cast<int64_t>(field.typed_value));
       continue;
     }
     // Untyped bytes and NULL markers need no numeric conversion.
@@ -460,6 +462,9 @@ void PaxGroup::GatherRowMasked(uint32_t slot, const uint32_t *columns,
 
 PaxTable::PaxTable(TableSchema schema) : schema_(std::move(schema)) {
   dir_.reset(new std::atomic<PaxGroup *>[kMaxGroups]());
+  const size_t fields = schema_.field_count();
+  range_.reset(new ValueRange[fields]);
+  sketch_.reset(new HyperLogLog[fields]);
 }
 
 PaxTable::~PaxTable() {
@@ -475,11 +480,26 @@ std::pair<PaxGroup *, uint32_t> PaxTable::AllocateSlot() {
     std::lock_guard<std::mutex> lk(alloc_mutex_);
     grp = dir_[group_idx].load(std::memory_order_acquire);
     if (grp == nullptr) {
-      grp = new PaxGroup(schema_);
+      grp = new PaxGroup(schema_, *this);
       dir_[group_idx].store(grp, std::memory_order_release);
     }
   }
   return {grp, static_cast<uint32_t>(idx % PaxGroup::kRows)};
+}
+
+void PaxTable::observe(size_t field, int64_t value) {
+  range_[field].add(value);
+  sketch_[field].add(value);
+}
+
+bool PaxTable::range(size_t field, int64_t *lo, int64_t *hi) const {
+  if (field >= schema_.field_count()) return false;
+  return range_[field].read(lo, hi);
+}
+
+bool PaxTable::distinct(size_t field, uint64_t *ndv) const {
+  if (field >= schema_.field_count()) return false;
+  return sketch_[field].estimate(ndv);
 }
 
 const TableSchema &Schema(const PaxTable *store) { return store->schema(); }
@@ -491,6 +511,15 @@ uint64_t SlotsAllocated(const PaxTable *store) {
 }
 
 size_t GroupCount(const PaxTable *store) { return store->group_count(); }
+
+bool ColumnRange(const PaxTable *store, size_t field, int64_t *lo,
+                 int64_t *hi) {
+  return store->range(field, lo, hi);
+}
+
+bool ColumnDistinct(const PaxTable *store, size_t field, uint64_t *ndv) {
+  return store->distinct(field, ndv);
+}
 
 
 }  // namespace pax

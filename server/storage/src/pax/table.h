@@ -16,6 +16,8 @@
 #include <vector>
 
 #include "helios/pax.h"
+#include "pax/hyperloglog.h"
+#include "pax/value_range.h"
 
 namespace helios::storage {
 namespace pax {
@@ -95,6 +97,28 @@ class PaxTable {
   }
 
   /**
+   * @brief Records one typed value written to field `field`.
+   *
+   * @details Widens the field's range and feeds its distinct-value sketch.
+   * The range covers every value written, and a delete or an overwrite leaves
+   * it wider than the live rows need. The sketch keeps historical values too,
+   * and its estimate errs in either direction.
+   */
+  void observe(size_t field, int64_t value);
+
+  /**
+   * @brief Returns the value range written to field `field`, or false when it
+   * has none.
+   */
+  bool range(size_t field, int64_t *lo, int64_t *hi) const;
+
+  /**
+   * @brief Returns the distinct-value estimate for field `field`, or false
+   * when it has none.
+   */
+  bool distinct(size_t field, uint64_t *ndv) const;
+
+  /**
    * @brief Returns the number of row groups that may contain allocated slots.
    */
   size_t group_count() const {
@@ -113,6 +137,10 @@ class PaxTable {
   // Serializes the first touch of a directory entry, not the directory
   // itself, which never grows.
   std::mutex alloc_mutex_;
+  // One value range a field. An untyped field keeps the empty range.
+  std::unique_ptr<ValueRange[]> range_;
+  // One distinct-value sketch a field.
+  std::unique_ptr<HyperLogLog[]> sketch_;
 };
 
 }  // namespace pax
