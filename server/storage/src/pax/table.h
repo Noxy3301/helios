@@ -95,6 +95,28 @@ class PaxTable {
   }
 
   /**
+   * @brief Records one typed value written to field `field`.
+   *
+   * @details Widens the field's range and feeds its distinct-value sketch.
+   * The range covers every value written, and a delete or an overwrite leaves
+   * it wider than the live rows need. The sketch keeps historical values too,
+   * and its estimate errs in either direction.
+   */
+  void observe(size_t field, int64_t value);
+
+  /**
+   * @brief Returns the value range written to field `field`, or false when it
+   * has none.
+   */
+  bool range(size_t field, int64_t *lo, int64_t *hi) const;
+
+  /**
+   * @brief Returns the distinct-value estimate for field `field`, or false
+   * when it has none.
+   */
+  bool distinct(size_t field, uint64_t *ndv) const;
+
+  /**
    * @brief Returns the number of row groups that may contain allocated slots.
    */
   size_t group_count() const {
@@ -105,6 +127,10 @@ class PaxTable {
   }
 
  private:
+  // HyperLogLog registers a field, one byte each.
+  static constexpr size_t kSketchBits = 10;
+  static constexpr size_t kSketchRegisters = size_t{1} << kSketchBits;
+
   TableSchema schema_;
   // Fixed at kMaxGroups entries; the groups it points at are owned here and
   // are freed only when the store is.
@@ -113,6 +139,11 @@ class PaxTable {
   // Serializes the first touch of a directory entry, not the directory
   // itself, which never grows.
   std::mutex alloc_mutex_;
+  // Per-field value range. An untyped field keeps the empty range lo > hi.
+  std::unique_ptr<std::atomic<int64_t>[]> lo_;
+  std::unique_ptr<std::atomic<int64_t>[]> hi_;
+  // Per-field HyperLogLog registers, kSketchRegisters to a field.
+  std::unique_ptr<std::atomic<uint8_t>[]> sketch_;
 };
 
 }  // namespace pax

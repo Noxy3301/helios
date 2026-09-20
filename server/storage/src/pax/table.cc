@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <cassert>
 #include <charconv>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -202,6 +203,15 @@ void FormatTyped(FieldType type, int scale, const std::byte *cell,
   }
 }
 
+// splitmix64's finalizer: spreads keys that differ in one bit across the
+// whole word, which the sketch's register choice depends on.
+inline uint64_t mix64(uint64_t x) {
+  x += 0x9e3779b97f4a7c15ull;
+  x = (x ^ (x >> 30)) * 0xbf58476d1ce4e5b9ull;
+  x = (x ^ (x >> 27)) * 0x94d049bb133111ebull;
+  return x ^ (x >> 31);
+}
+
 // Row format marker for an empty/no-value field.
 constexpr std::byte kNoValue{0xFF};
 
@@ -311,7 +321,8 @@ bool unpack_row(const TableSchema &schema, const std::byte *value, size_t size,
   return true;
 }
 
-PaxGroup::PaxGroup(const TableSchema &schema) : schema_(schema) {
+PaxGroup::PaxGroup(const TableSchema &schema, PaxTable &table)
+    : schema_(schema), table_(table) {
   const size_t fields = schema.field_count();
   stride_.resize(fields);
   strip_offset_.resize(fields);
@@ -342,6 +353,7 @@ void PaxGroup::ScatterRow(uint32_t slot, const Row &row) {
       const uint16_t len = static_cast<uint16_t>(schema_.field_max_bytes[f]);
       std::memcpy(cell, &len, sizeof(len));
       std::memcpy(cell + kCellLenBytes, &field.typed_value, len);
+      table_.observe(f, static_cast<int64_t>(field.typed_value));
       continue;
     }
     // Untyped bytes and NULL markers need no numeric conversion.
@@ -460,6 +472,15 @@ void PaxGroup::GatherRowMasked(uint32_t slot, const uint32_t *columns,
 
 PaxTable::PaxTable(TableSchema schema) : schema_(std::move(schema)) {
   dir_.reset(new std::atomic<PaxGroup *>[kMaxGroups]());
+  const size_t fields = schema_.field_count();
+  // Start every field's range empty; Observe widens the typed ones.
+  lo_.reset(new std::atomic<int64_t>[fields]);
+  hi_.reset(new std::atomic<int64_t>[fields]);
+  for (size_t f = 0; f < fields; f++) {
+    lo_[f].store(INT64_MAX, std::memory_order_relaxed);
+    hi_[f].store(INT64_MIN, std::memory_order_relaxed);
+  }
+  sketch_.reset(new std::atomic<uint8_t>[fields * kSketchRegisters]());
 }
 
 PaxTable::~PaxTable() {
@@ -475,11 +496,76 @@ std::pair<PaxGroup *, uint32_t> PaxTable::AllocateSlot() {
     std::lock_guard<std::mutex> lk(alloc_mutex_);
     grp = dir_[group_idx].load(std::memory_order_acquire);
     if (grp == nullptr) {
-      grp = new PaxGroup(schema_);
+      grp = new PaxGroup(schema_, *this);
       dir_[group_idx].store(grp, std::memory_order_release);
     }
   }
   return {grp, static_cast<uint32_t>(idx % PaxGroup::kRows)};
+}
+
+void PaxTable::observe(size_t field, int64_t value) {
+  std::atomic<int64_t> &lo = lo_[field];
+  int64_t low = lo.load(std::memory_order_relaxed);
+  while (value < low && !lo.compare_exchange_weak(low, value,
+                                                  std::memory_order_relaxed)) {
+  }
+  std::atomic<int64_t> &hi = hi_[field];
+  int64_t high = hi.load(std::memory_order_relaxed);
+  while (value > high && !hi.compare_exchange_weak(high, value,
+                                                   std::memory_order_relaxed)) {
+  }
+
+  // HyperLogLog: the top bits pick the register, the run of zeros below them
+  // is the rank. Neighbouring keys must land in unrelated registers, so the
+  // value passes through a finalizer first.
+  const uint64_t h = mix64(static_cast<uint64_t>(value));
+  const size_t reg_index = static_cast<size_t>(h >> (64 - kSketchBits));
+  const uint64_t tail = h << kSketchBits;
+  const uint8_t rank =
+      tail == 0 ? static_cast<uint8_t>(64 - kSketchBits + 1)
+                : static_cast<uint8_t>(__builtin_clzll(tail) + 1);
+  std::atomic<uint8_t> &reg = sketch_[field * kSketchRegisters + reg_index];
+  uint8_t seen = reg.load(std::memory_order_relaxed);
+  while (rank > seen &&
+         !reg.compare_exchange_weak(seen, rank, std::memory_order_relaxed)) {
+  }
+}
+
+bool PaxTable::range(size_t field, int64_t *lo, int64_t *hi) const {
+  if (field >= schema_.field_count()) return false;
+  const int64_t low = lo_[field].load(std::memory_order_relaxed);
+  const int64_t high = hi_[field].load(std::memory_order_relaxed);
+  if (low > high) return false;
+  *lo = low;
+  *hi = high;
+  return true;
+}
+
+bool PaxTable::distinct(size_t field, uint64_t *ndv) const {
+  if (field >= schema_.field_count()) return false;
+  const std::atomic<uint8_t> *regs = &sketch_[field * kSketchRegisters];
+  double inverse = 0;
+  size_t empty = 0;
+  for (size_t i = 0; i < kSketchRegisters; i++) {
+    const uint8_t rank = regs[i].load(std::memory_order_relaxed);
+    if (rank == 0) empty++;
+    inverse += std::ldexp(1.0, -rank);
+  }
+  if (empty == kSketchRegisters) return false;
+  const double m = static_cast<double>(kSketchRegisters);
+  // Flajolet's alpha_m for the raw estimate.
+  const double alpha = 0.7213 / (1.0 + 1.079 / m);
+  double estimate = alpha * m * m / inverse;
+  // At 2.5m and below the raw estimate is biased; the small-range correction
+  // reads the empty registers instead.
+  if (estimate <= 2.5 * m && empty > 0) {
+    estimate = m * std::log(m / static_cast<double>(empty));
+  }
+  if (estimate < 1.0) estimate = 1.0;
+  // Every register at its highest rank puts the raw estimate past 2^64, which
+  // has no uint64_t to convert to.
+  *ndv = estimate >= 0x1p64 ? UINT64_MAX : static_cast<uint64_t>(estimate);
+  return true;
 }
 
 const TableSchema &Schema(const PaxTable *store) { return store->schema(); }
@@ -491,6 +577,15 @@ uint64_t SlotsAllocated(const PaxTable *store) {
 }
 
 size_t GroupCount(const PaxTable *store) { return store->group_count(); }
+
+bool ColumnRange(const PaxTable *store, size_t field, int64_t *lo,
+                 int64_t *hi) {
+  return store->range(field, lo, hi);
+}
+
+bool ColumnDistinct(const PaxTable *store, size_t field, uint64_t *ndv) {
+  return store->distinct(field, ndv);
+}
 
 
 }  // namespace pax

@@ -1,8 +1,10 @@
 /**
  * @file server/storage/tests/pax_table_test.cc
- * Typed PAX cells whose declared width does not match their type.
+ * Typed PAX cells whose declared width does not match their type, and the
+ * column statistics a write feeds.
  */
 
+#include <deque>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -59,6 +61,11 @@ std::string Gather(const PaxGroup &group, uint32_t slot, size_t expected_size) {
   return out;
 }
 
+// The group PaxTable hands out first, holding slot 0.
+PaxGroup &FirstGroup(helios::storage::pax::PaxTable &store) {
+  return *store.AllocateSlot().first;
+}
+
 TableSchema MakeSchema(std::vector<uint32_t> widths,
                        std::vector<FieldType> types) {
   TableSchema schema;
@@ -76,7 +83,8 @@ TEST(PaxTableTest, TooNarrowTypedFieldStaysVerbatim) {
       MakeSchema({1, 2}, {FieldType::kUntyped, FieldType::kInt32});
   EXPECT_EQ(schema.type_of(1), FieldType::kUntyped);
 
-  PaxGroup group(schema);
+  helios::storage::pax::PaxTable store(schema);
+  PaxGroup &group = FirstGroup(store);
   const std::string first = PackRow({std::string(1, '\0'), "42"});
   const std::string second = PackRow({std::string(1, '\0'), "99"});
   ASSERT_TRUE(Scatter(group, 0, first));
@@ -92,7 +100,8 @@ TEST(PaxTableTest, ShortTypeVectorLeavesTheRestUntyped) {
   const TableSchema schema = MakeSchema({1, 4}, {FieldType::kUntyped});
   EXPECT_EQ(schema.type_of(1), FieldType::kUntyped);
 
-  PaxGroup group(schema);
+  helios::storage::pax::PaxTable store(schema);
+  PaxGroup &group = FirstGroup(store);
   const std::string row = PackRow({std::string(1, '\0'), "7"});
   ASSERT_TRUE(Scatter(group, 0, row));
   EXPECT_EQ(Gather(group, 0, row.size()), row);
@@ -102,7 +111,8 @@ TEST(PaxTableTest, ScattersAndGathersFiveHundredColumns) {
   std::vector<uint32_t> widths(513, 1);
   widths[0] = 64;  // Null flags for 512 nullable data columns.
   const TableSchema schema = MakeSchema(widths, {});
-  PaxGroup group(schema);
+  helios::storage::pax::PaxTable store(schema);
+  PaxGroup &group = FirstGroup(store);
   std::vector<std::string> fields(513);
   fields[0] = std::string(64, '\0');
   for (size_t i = 1; i < fields.size(); i++) {
@@ -145,6 +155,97 @@ TEST(PaxTableTest, CopyStaysWithinTheReadersBufferAfterRowGrowth) {
   // Deletion between allocation and copying also keeps the same bound.
   item.DeleteRow(1);
   EXPECT_LE(item.GatherInto(buffer.data(), capacity), capacity);
+}
+
+helios::storage::DataItem &Install(
+    std::deque<helios::storage::DataItem> &items,
+    helios::storage::pax::PaxTable &store, const TableSchema &schema,
+    const std::string &row) {
+  helios::storage::pax::Row unpacked;
+  EXPECT_TRUE(helios::storage::pax::unpack_row(
+      schema, reinterpret_cast<const std::byte *>(row.data()), row.size(),
+      unpacked));
+  helios::storage::DataItem &item = items.emplace_back();
+  EXPECT_TRUE(item.AllocateSlot(store));
+  item.InstallRow(unpacked, 1);
+  return item;
+}
+
+// The range covers every value written, and deleting the one row that holds
+// the maximum leaves it wide: a planner reads it as a bound, not as the set
+// of values present.
+TEST(PaxTableTest, ColumnRangeCoversWrittenValues) {
+  TableSchema schema =
+      MakeSchema({1, 4, 8, 2}, {FieldType::kUntyped, FieldType::kInt32,
+                                FieldType::kDecimal64, FieldType::kUntyped});
+  schema.field_scale = {0, 0, 2, 0};
+  helios::storage::pax::PaxTable store(schema);
+  std::deque<helios::storage::DataItem> items;
+  const std::string nulls(1, '\0');
+
+  int64_t lo = 0, hi = 0;
+  EXPECT_FALSE(helios::storage::pax::ColumnRange(&store, 1, &lo, &hi));
+
+  Install(items, store, schema, PackRow({nulls, "-5", "1.25", "ab"}));
+  Install(items, store, schema, PackRow({nulls, "7", "-9.00", "zz"}));
+
+  ASSERT_TRUE(helios::storage::pax::ColumnRange(&store, 1, &lo, &hi));
+  EXPECT_EQ(lo, -5);
+  EXPECT_EQ(hi, 7);
+  ASSERT_TRUE(helios::storage::pax::ColumnRange(&store, 2, &lo, &hi));
+  EXPECT_EQ(lo, -900);  // scaled by 10^2
+  EXPECT_EQ(hi, 125);
+  EXPECT_FALSE(helios::storage::pax::ColumnRange(&store, 3, &lo, &hi));
+  EXPECT_FALSE(helios::storage::pax::ColumnRange(&store, 9, &lo, &hi));
+
+  // A row installed into a second group widens the same range.
+  for (uint32_t i = 2; i < PaxGroup::kRows; i++) {
+    Install(items, store, schema, PackRow({nulls, "0", "0.00", "x"}));
+  }
+  helios::storage::DataItem &peak =
+      Install(items, store, schema, PackRow({nulls, "100", "0.00", "x"}));
+  ASSERT_GE(helios::storage::pax::GroupCount(&store), 2u);
+  ASSERT_TRUE(helios::storage::pax::ColumnRange(&store, 1, &lo, &hi));
+  EXPECT_EQ(hi, 100);
+
+  // 100 lives in that one row, and 7 is the highest value left after it goes.
+  peak.DeleteRow(1);
+  ASSERT_TRUE(helios::storage::pax::ColumnRange(&store, 1, &lo, &hi));
+  EXPECT_EQ(lo, -5);
+  EXPECT_EQ(hi, 100);
+}
+
+// The distinct estimate counts the values written, within the sketch's error,
+// and an empty table still reports what it once held.
+TEST(PaxTableTest, ColumnDistinctEstimatesWrittenValues) {
+  TableSchema schema =
+      MakeSchema({1, 4}, {FieldType::kUntyped, FieldType::kInt32});
+  helios::storage::pax::PaxTable store(schema);
+  std::deque<helios::storage::DataItem> items;
+  const std::string nulls(1, '\0');
+
+  uint64_t ndv = 0;
+  EXPECT_FALSE(helios::storage::pax::ColumnDistinct(&store, 1, &ndv));
+
+  // 2,000 distinct values, each written twice.
+  constexpr int kDistinct = 2000;
+  for (int pass = 0; pass < 2; pass++) {
+    for (int i = 0; i < kDistinct; i++) {
+      Install(items, store, schema, PackRow({nulls, std::to_string(i)}));
+    }
+  }
+  ASSERT_TRUE(helios::storage::pax::ColumnDistinct(&store, 1, &ndv));
+  // 1,024 registers put the standard error near 3%; allow four times that.
+  EXPECT_GT(ndv, kDistinct * 0.88);
+  EXPECT_LT(ndv, kDistinct * 1.12);
+
+  // Every row goes, and the estimate stays where the writes put it.
+  for (helios::storage::DataItem &item : items) item.DeleteRow(1);
+  uint64_t after = 0;
+  ASSERT_TRUE(helios::storage::pax::ColumnDistinct(&store, 1, &after));
+  EXPECT_EQ(after, ndv);
+
+  EXPECT_FALSE(helios::storage::pax::ColumnDistinct(&store, 0, &ndv));
 }
 
 }  // namespace
