@@ -102,11 +102,12 @@ def _run_script(argv, timeout):
         return None
 
 
-def start_helios_storage(commit_durability=None):
+def start_helios_storage(commit_durability=None, epoch_ms=None):
     """Start helios-storage via scripts/start_server.sh and wait for port 9999.
 
-    commit_durability overrides the server's startup contract for this run only;
-    it reaches the daemon through helios.local.cnf, which every run rewrites.
+    commit_durability and epoch_ms override the server's configuration for this
+    run only; they reach the daemon through helios.local.cnf, which every run
+    rewrites. A server that is already up keeps the settings it started with.
     """
     if _is_port_open("127.0.0.1", 9999):
         print("  helios-storage already running on port 9999, reusing")
@@ -115,10 +116,14 @@ def start_helios_storage(commit_durability=None):
     argv = [str(SCRIPTS_DIR / "start_server.sh")]
     # start_server.sh reads helios.local.cnf on its own; a run without an
     # override leaves it empty so an earlier run's value does not carry over.
-    LOCAL_CONF.write_text(
-        f"commit_durability = {commit_durability}\n" if commit_durability else "")
+    overrides = []
     if commit_durability:
-        print(f"  commit_durability = {commit_durability}")
+        overrides.append(f"commit_durability = {commit_durability}")
+    if epoch_ms:
+        overrides.append(f"epoch_duration_ms = {epoch_ms}")
+    LOCAL_CONF.write_text("".join(f"{line}\n" for line in overrides))
+    for line in overrides:
+        print(f"  {line}")
     result = _run_script(argv, timeout=30)
     if result is None or result.returncode != 0:
         if result is not None:
@@ -860,6 +865,9 @@ def main():
     parser.add_argument("--load-defer-unique-checks", choices=["on", "off"], default="on",
                         help="Defer UNIQUE secondary-index checks during the create and load "
                              "phases; the execute phase always keeps them on (default: on)")
+    parser.add_argument("--epoch-ms", type=int, default=None,
+                        help="Epoch duration in milliseconds for this run "
+                             "(default: the value in helios.cnf, managed lifecycle only)")
     parser.add_argument("--load-durability", choices=["same", "async"], default="same",
                         help="Commit durability for the load phase: same keeps the server's "
                              "startup contract, async starts it under Async and switches it "
@@ -1033,7 +1041,8 @@ def main():
         # already running (reuse case, handled inside the function).
         cleanup_helios_data()
         load_durability = "async" if args.load_durability == "async" else None
-        if not start_helios_storage(commit_durability=load_durability):
+        if not start_helios_storage(commit_durability=load_durability,
+                                    epoch_ms=args.epoch_ms):
             sys.exit(1)
         # A server that was already up would have been reused: the log is the
         # only proof that the load contract is the one we asked for.
