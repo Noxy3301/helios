@@ -93,10 +93,15 @@ bool ha_helios::seed_row_count_from_cache(HeliosProxy *proxy) {
   if (it == stats_cache.end() || it->second <= 0)
     return false;
 
-  share->stats_base_records.store(static_cast<uint64_t>(it->second),
-                                  std::memory_order_relaxed);
-  for (auto &shard : share->rowcount_shards)
-    shard.delta.store(0, std::memory_order_relaxed);
+  // Every statement of every handler on the table gets here, so it stores
+  // only a value that changes: a store takes the line from every other core.
+  const auto base = static_cast<uint64_t>(it->second);
+  if (share->stats_base_records.load(std::memory_order_relaxed) != base)
+    share->stats_base_records.store(base, std::memory_order_relaxed);
+  for (auto &shard : share->rowcount_shards) {
+    if (shard.delta.load(std::memory_order_relaxed) != 0)
+      shard.delta.store(0, std::memory_order_relaxed);
+  }
   return true;
 }
 
