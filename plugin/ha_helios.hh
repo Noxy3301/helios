@@ -101,6 +101,8 @@ public:
   std::mutex index_ndv_mu_;
   std::unordered_map<std::string, std::vector<uint64_t>> index_ndv_;
   std::atomic<bool> index_ndv_loaded_{false};
+  // Bumped under index_ndv_mu_ each time index_ndv_ is reloaded.
+  std::atomic<uint64_t> index_ndv_gen_{0};
 
   // Row count observed when index_ndv_ was fetched.
   std::atomic<uint64_t> index_ndv_records_{0};
@@ -256,6 +258,10 @@ private:
                                  const std::string &primary_key);
   std::string write_buffer_;
   HeliosField field_pack_;
+  // share->index_ndv_ by key number as of its generation ndv_gen_, which
+  // info() reads without the share's lock.
+  std::vector<std::vector<uint64_t>> key_ndv_;
+  uint64_t ndv_gen_{0};
   MEM_ROOT blobroot;
 
   // State for buffer fetching

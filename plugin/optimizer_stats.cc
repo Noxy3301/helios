@@ -140,6 +140,7 @@ void ha_helios::load_index_stats_from_cache(HeliosProxy *proxy) {
     range_hist.cum = hist.cum;
     share->index_hist_[entry.first] = std::move(range_hist);
   }
+  share->index_ndv_gen_.fetch_add(1, std::memory_order_relaxed);
   share->index_ndv_records_.store(records, std::memory_order_relaxed);
   share->index_ndv_loaded_.store(true, std::memory_order_relaxed);
 }
@@ -278,6 +279,22 @@ int ha_helios::info(uint flag) {
   }
   if ((flag & (HA_STATUS_CONST | HA_STATUS_VARIABLE)) && table != nullptr &&
       table->s != nullptr) {
+    // Copy the share's NDV again only once it has been reloaded.
+    if (share != nullptr &&
+        share->index_ndv_gen_.load(std::memory_order_relaxed) != ndv_gen_) {
+      std::lock_guard<std::mutex> lock(share->index_ndv_mu_);
+      key_ndv_.assign(table->s->keys, {});
+      for (uint i = 0; i < table->s->keys; i++) {
+        const KEY *key = table->key_info + i;
+        const std::string index_name =
+            i == table->s->primary_key
+                ? std::string()
+                : std::string(key->name ? key->name : "");
+        const auto it = share->index_ndv_.find(index_name);
+        if (it != share->index_ndv_.end()) key_ndv_[i] = it->second;
+      }
+      ndv_gen_ = share->index_ndv_gen_.load(std::memory_order_relaxed);
+    }
     for (uint i = 0; i < table->s->keys; i++) {
       KEY *key = table->key_info + i;
       if (key == nullptr)
@@ -310,17 +327,13 @@ void ha_helios::set_generic_rec_per_key(KEY *key, uint key_parts,
   bool is_unique = (key->flags & HA_NOSAME);
 
   // Prefer server-measured NDV; otherwise use a uniform-distribution fallback.
-  std::vector<uint64_t> ndv;
+  const size_t k = static_cast<size_t>(key - table->key_info);
+  const std::vector<uint64_t> *ndv = nullptr;
   if (share != nullptr &&
-      share->index_ndv_loaded_.load(std::memory_order_relaxed)) {
-    const std::string index_name =
-        is_primary ? std::string() : std::string(key->name ? key->name : "");
-    std::lock_guard<std::mutex> lock(share->index_ndv_mu_);
-    auto it = share->index_ndv_.find(index_name);
-    if (it != share->index_ndv_.end() && it->second.size() >= key_parts)
-      ndv = it->second;
+      share->index_ndv_loaded_.load(std::memory_order_relaxed) &&
+      k < key_ndv_.size() && key_ndv_[k].size() >= key_parts) {
+    ndv = &key_ndv_[k];
   }
-  const bool has_ndv = ndv.size() >= key_parts;
 
   // How much each additional key part narrows the result set (fallback path).
   double per_part = std::max(
@@ -330,9 +343,9 @@ void ha_helios::set_generic_rec_per_key(KEY *key, uint key_parts,
     ulong rpk;
     if ((is_primary || is_unique) && j == key_parts - 1) {
       rpk = 1;
-    } else if (has_ndv && ndv[j] > 0) {
+    } else if (ndv != nullptr && (*ndv)[j] > 0) {
       const uint64_t records = static_cast<uint64_t>(stats.records);
-      const uint64_t distinct = ndv[j];
+      const uint64_t distinct = (*ndv)[j];
       rpk = static_cast<ulong>(
           std::max<uint64_t>(1, (records + distinct - 1) / distinct));
     } else {
