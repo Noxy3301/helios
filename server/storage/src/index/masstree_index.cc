@@ -188,11 +188,16 @@ struct MasstreeIndex::Impl {
     return true;
   }
 
-  DataItem *GetOrInsert(std::string_view key) {
-    // Existing entries need only the optimistic lookup.
-    if (auto *item = Get(key)) return item;
+  DataItem *GetOrInsert(std::string_view key, bool expect_new) {
+    // Existing entries need only the optimistic lookup, which a key expected
+    // to be new skips.
+    if (expect_new) {
+      ensure_thread_active();
+    } else if (auto *item = Get(key)) {
+      return item;
+    }
 
-    // Recheck under the leaf lock before publishing a new absent entry.
+    // Find the entry under the leaf lock, or publish a new absent one.
     cursor_type lp(table_, key.data(), key.size());
     bool found = lp.find_insert(*tls_ti);
     if (!found) lp.value() = new DataItem();
@@ -242,8 +247,8 @@ void MasstreeIndex::Put(std::string_view key, DataItem &&value) {
   impl_->Put(key, std::move(value));
 }
 
-DataItem *MasstreeIndex::GetOrInsert(std::string_view key) {
-  return impl_->GetOrInsert(key);
+DataItem *MasstreeIndex::GetOrInsert(std::string_view key, bool expect_new) {
+  return impl_->GetOrInsert(key, expect_new);
 }
 
 size_t MasstreeIndex::Scan(

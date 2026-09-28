@@ -261,6 +261,39 @@ TEST_F(CommitTidTest, FinalRowKeepsTheFirstInsertRequirement) {
   EXPECT_EQ(TestHelper::Row("final"), item->CopyValue());
 }
 
+TEST_F(CommitTidTest, RacingInsertsOfOneKeyLeaveOneRecord) {
+  const std::string bytes = TestHelper::Row("value");
+  std::atomic<int> ready{0};
+  bool committed[2] = {};
+  std::string reasons[2];
+  Tidword last_tids[2];
+  std::vector<std::thread> threads;
+  for (int i = 0; i < 2; ++i) {
+    threads.emplace_back([&, i] {
+      silo::Transaction tx(tables_, epoch_, reaper_, *logger_, last_tids[i]);
+      ready.fetch_add(1);
+      while (ready.load() != 2) std::this_thread::yield();
+      committed[i] =
+          tx.Write(kTable, "key", bytes, RowOp::kInsert, reasons[i]) &&
+          tx.Commit(CommitDurability::kAsync, reasons[i]);
+      index::release_thread_epoch();
+    });
+  }
+  for (auto &thread : threads) thread.join();
+
+  // Both writes find one record; the later lock sees the first row there.
+  ASSERT_NE(committed[0], committed[1]);
+  EXPECT_EQ(kDuplicatePrimaryKeyAbortReason, reasons[committed[0] ? 1 : 0]);
+  size_t records = 0;
+  tables_.GetTable(kTable)->GetPrimaryIndex().Scan(
+      "", std::nullopt, [&](std::string_view, DataItem &item) {
+        EXPECT_TRUE(item.IsLive());
+        ++records;
+        return false;
+      });
+  EXPECT_EQ(1u, records);
+}
+
 TEST_F(CommitTidTest, RepeatedRowWritesLogOnlyTheFinalValue) {
   ASSERT_TRUE(Commit({}, {{kTable, "a", "first"}, {kTable, "b", "second"},
                          {kTable, "a", "", RowOp::kDelete},

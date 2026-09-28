@@ -64,6 +64,20 @@ TEST(MasstreeIndexTest, GetOrInsert) {
   ASSERT_NE(nullptr, table.GetOrInsert("alice"));
 }
 
+TEST(MasstreeIndexTest, ExpectNewPublishesOneAbsentEntry) {
+  using namespace helios::storage;
+  index::MasstreeIndex tree;
+  DataItem *item = tree.GetOrInsert("new", true);
+  ASSERT_NE(nullptr, item);
+  EXPECT_TRUE(item->transaction_id.load().absent);
+  EXPECT_EQ(item, tree.Get("new"));
+  // A second insert of the key returns the entry the first published.
+  EXPECT_EQ(item, tree.GetOrInsert("new", true));
+  EXPECT_EQ(1u,
+            tree.Scan("", std::nullopt, [](auto, auto &) { return false; }));
+  index::release_thread_epoch();
+}
+
 TEST(MasstreeIndexTest, ConcurrentPutSameKey) {
   std::vector<std::thread> threads;
   helios::storage::index::MasstreeIndex table;

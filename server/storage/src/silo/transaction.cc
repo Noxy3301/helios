@@ -112,7 +112,9 @@ bool Transaction::Write(std::string_view table_name, std::string_view key,
   }
 
   auto &index = table->GetPrimaryIndex();
-  DataItem *item = index.GetOrInsert(key);
+  // An inserted key is usually new.
+  const bool expect_new = op == RowOp::kInsert;
+  DataItem *item = index.GetOrInsert(key, expect_new);
   const std::string_view bytes =
       op == RowOp::kDelete ? std::string_view() : row_bytes;
   auto entry = write_set_.find(item);
@@ -157,7 +159,10 @@ bool Transaction::IndexWrite(std::string_view table_name,
     reason = "secondary_index_missing";
     return false;
   }
-  DataItem *item = index->tree.GetOrInsert(secondary_key);
+  // A UNIQUE key being added is usually new; a non-unique one usually exists.
+  const bool expect_new =
+      !remove && index->constraint == IndexConstraint::kUnique;
+  DataItem *item = index->tree.GetOrInsert(secondary_key, expect_new);
   auto entry =
       write_set_
           .try_emplace(

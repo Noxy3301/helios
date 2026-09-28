@@ -33,9 +33,11 @@ class MasstreeIndex final {
    * @brief Gets the entry for key, creating an absent DataItem if needed.
    * @details The reaper may unlink the record afterwards; Commit checks the
    * record's latest bit after locking it.
+   * @param expect_new A hint that the index likely has no entry for key. It
+   * skips the optimistic lookup and affects cost, not the result.
    * @return Non-null; allocation failure throws.
    */
-  DataItem *GetOrInsert(std::string_view key);
+  DataItem *GetOrInsert(std::string_view key, bool expect_new = false);
 
   /**
    * @brief Walks [begin, end) upwards; nullopt for `end` means no upper bound.
