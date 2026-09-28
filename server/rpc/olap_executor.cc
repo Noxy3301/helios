@@ -41,6 +41,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -1447,6 +1448,17 @@ void mysql_ascii_function(duckdb::DataChunk& args, duckdb::ExpressionState&,
       });
 }
 
+void mysql_double(duckdb::DataChunk& args, duckdb::ExpressionState&,
+                  duckdb::Vector& result) {
+  duckdb::UnaryExecutor::Execute<double, double>(
+      args.data[0], result, args.size(), [](double value) {
+        if (!std::isfinite(value)) {
+          throw duckdb::OutOfRangeException("DOUBLE value is out of range");
+        }
+        return value;
+      });
+}
+
 void register_mysql_collation_runtime(Connection& connection) {
   duckdb::ScalarFunction sort_key(
       "mysql_utf8mb4_0900_ai_ci_sort_key", {duckdb::LogicalType::VARCHAR},
@@ -1494,6 +1506,14 @@ void register_mysql_collation_runtime(Connection& connection) {
   duckdb::CreateScalarFunctionInfo ascii_info(std::move(mysql_ascii));
   ascii_info.on_conflict = duckdb::OnCreateConflict::IGNORE_ON_CONFLICT;
   connection.context->RegisterFunction(ascii_info);
+
+  duckdb::ScalarFunction double_fn("mysql_double",
+                                   {duckdb::LogicalType::DOUBLE},
+                                   duckdb::LogicalType::DOUBLE, mysql_double);
+  double_fn.SetFallible();
+  duckdb::CreateScalarFunctionInfo double_info(std::move(double_fn));
+  double_info.on_conflict = duckdb::OnCreateConflict::IGNORE_ON_CONFLICT;
+  connection.context->RegisterFunction(double_info);
 }
 
 /**

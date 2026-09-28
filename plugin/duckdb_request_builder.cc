@@ -83,6 +83,13 @@ bool type_of(Builder& b, Item* item, Resolved::ResolvedType* out) {
             }
             out->set_kind(Resolved::INT64);
             return true;
+        case MYSQL_TYPE_DOUBLE:
+            // MySQL compares two fixed-scale REAL operands with a tolerance.
+            if (item->decimals != DECIMAL_NOT_SPECIFIED) {
+                return b.refuse("fixed-scale DOUBLE is unsupported");
+            }
+            out->set_kind(Resolved::DOUBLE);
+            return true;
         case MYSQL_TYPE_NEWDECIMAL: {
             uint32_t precision = item->decimal_precision();
             const uint32_t scale = item->decimals;
@@ -160,6 +167,12 @@ bool contains_decimal_avg(const Builder& b, const Resolved::Expr& expr) {
     return false;
 }
 
+// DuckDB's DECIMAL to DOUBLE cast can round twice above 15 digits.
+bool wide_decimal(const Resolved::Expr& expr) {
+    const auto& type = expr.result_type();
+    return type.kind() == Resolved::DECIMAL && type.precision() > 15;
+}
+
 // The type MySQL compares two operands under. Mirrors the numeric/temporal
 // part of MySQL's comparison-context rules; string comparison needs the
 // collation machinery and is refused until that phase.
@@ -196,6 +209,17 @@ bool compare_type_of(Builder& b, const Resolved::Expr& left,
         out->set_kind(Resolved::DECIMAL);
         out->set_precision(std::min<uint32_t>(integer + scale, 38));
         out->set_scale(scale);
+        return true;
+    }
+    if ((lk == Resolved::DOUBLE &&
+         (rk == Resolved::INT64 || rk == Resolved::DECIMAL ||
+          rk == Resolved::DOUBLE)) ||
+        (rk == Resolved::DOUBLE &&
+         (lk == Resolved::INT64 || lk == Resolved::DECIMAL))) {
+        if (wide_decimal(left) || wide_decimal(right)) {
+            return b.refuse("DECIMAL above 15 digits against DOUBLE");
+        }
+        out->set_kind(Resolved::DOUBLE);
         return true;
     }
     const bool l_temporal = lk == Resolved::DATE || lk == Resolved::DATETIME;
@@ -312,6 +336,14 @@ bool build_arithmetic(Builder& b, Item_func* function,
         if (kind == Resolved::DATE || kind == Resolved::DATETIME) {
             return b.refuse("temporal operand in arithmetic is unsupported");
         }
+    }
+    if (arith->left().result_type().kind() == Resolved::VARCHAR ||
+        arith->right().result_type().kind() == Resolved::VARCHAR) {
+        return b.refuse("nonconstant string arithmetic is unsupported");
+    }
+    if (out->result_type().kind() == Resolved::DOUBLE &&
+        (wide_decimal(arith->left()) || wide_decimal(arith->right()))) {
+        return b.refuse("DECIMAL above 15 digits in DOUBLE arithmetic");
     }
     *arith->mutable_result_as() = out->result_type();
     return true;
@@ -430,6 +462,16 @@ bool build_func(Builder& b, Item_func* function, Resolved::Expr* out) {
                 } else {
                     *compare_as = low_type;
                 }
+            } else if ((lk2 == Resolved::DOUBLE &&
+                        (hk2 == Resolved::INT64 || hk2 == Resolved::DECIMAL)) ||
+                       (hk2 == Resolved::DOUBLE &&
+                        (lk2 == Resolved::INT64 || lk2 == Resolved::DECIMAL))) {
+                if (wide_decimal(between->value()) ||
+                    wide_decimal(between->low()) ||
+                    wide_decimal(between->high())) {
+                    return b.refuse("DECIMAL above 15 digits against DOUBLE");
+                }
+                compare_as->set_kind(Resolved::DOUBLE);
             } else if ((lk2 == Resolved::DATE && hk2 == Resolved::DATETIME) ||
                        (lk2 == Resolved::DATETIME && hk2 == Resolved::DATE)) {
                 compare_as->set_kind(Resolved::DATETIME);
@@ -769,6 +811,12 @@ bool build_aggregate(Builder& b, Item_sum* sum, Resolved::Expr* out) {
             return b.refuse("aggregate is unsupported");
     }
     if (sum->argument_count() != 1) return b.refuse("aggregate arity");
+    // DuckDB and MySQL add DOUBLE values in different orders; the sums differ.
+    if ((kind == Resolved::Aggregate::SUM ||
+         kind == Resolved::Aggregate::AVG) &&
+        out->result_type().kind() == Resolved::DOUBLE) {
+        return b.refuse("DOUBLE SUM and AVG are unsupported");
+    }
     aggregate->set_kind(kind);
     aggregate->set_distinct(distinct);
     return build_expr(b, sum->get_arg(0), aggregate->mutable_arg());
@@ -791,8 +839,7 @@ struct ScopedDiagnostics {
 
 // const_item() alone proves table independence, not purity: a constant tree
 // can still hide a side-effecting call (GET_LOCK) that must not run at plan
-// time. Only literals, temporal casts, and interval arithmetic over pure
-// arguments are evaluated.
+// time. Only literals, casts, and arithmetic over pure arguments are evaluated.
 bool const_tree_is_pure(Item* item) {
     item = real_item(item);
     if (item == nullptr) return false;
@@ -800,7 +847,12 @@ bool const_tree_is_pure(Item* item) {
     if (item->type() != Item::FUNC_ITEM) return false;
     auto* function = down_cast<Item_func*>(item);
     if (function->functype() != Item_func::DATEADD_FUNC &&
-        function->functype() != Item_func::TYPECAST_FUNC) {
+        function->functype() != Item_func::TYPECAST_FUNC &&
+        function->functype() != Item_func::PLUS_FUNC &&
+        function->functype() != Item_func::MINUS_FUNC &&
+        function->functype() != Item_func::MUL_FUNC &&
+        function->functype() != Item_func::DIV_FUNC &&
+        function->functype() != Item_func::MOD_FUNC) {
         return false;
     }
     for (uint i = 0; i < function->argument_count(); ++i) {
@@ -892,6 +944,26 @@ bool build_temporal_const(Builder& b, Item* item, Resolved::Expr* out) {
 bool build_expr(Builder& b, Item* item, Resolved::Expr* out) {
     item = real_item(item);
     if (item == nullptr) return b.refuse("null item");
+    if (item->data_type() == MYSQL_TYPE_DOUBLE && item->const_item() &&
+        const_tree_is_pure(item)) {
+        double value;
+        bool clean;
+        {
+            ScopedDiagnostics diagnostics(b.thd);
+            value = item->val_real();
+            clean = diagnostics.clean();
+        }
+        if (!clean) {
+            return b.refuse("constant evaluation raised a condition");
+        }
+        out->mutable_result_type()->set_kind(Resolved::DOUBLE);
+        if (item->null_value) {
+            out->mutable_literal()->set_null_value(true);
+        } else {
+            out->mutable_literal()->set_double_value(value);
+        }
+        return true;
+    }
     switch (item->data_type()) {
         case MYSQL_TYPE_DATE:
         case MYSQL_TYPE_NEWDATE:

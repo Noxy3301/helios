@@ -382,6 +382,7 @@ message TxExecuteDuckdbQuery {
         DATE = 4;
         DATETIME = 5;
         BOOL = 6;
+        DOUBLE = 7;
     }
 
     message ResolvedType {
@@ -417,6 +418,7 @@ message TxExecuteDuckdbQuery {
             DatetimeLit datetime_value = 5;
             bool bool_value = 6;
             bool null_value = 7; // set true; typed by Expr.result_type
+            double double_value = 8;
         }
     }
 
