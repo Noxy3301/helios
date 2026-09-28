@@ -251,8 +251,8 @@ bool Transaction::Lock(DataItem &item, WriteEntry &entry, Tidword &max_tid,
     if (!item.transaction_id.compare_exchange_weak(current, locked)) continue;
     entry.owns_lock = true;
     max_tid = std::max(max_tid, current);
-    // A purge may detach the record while we wait for its lock.
-    if (entry.index->Get(entry.key) != &item) {
+    // The reaper clears latest when it unlinks the record.
+    if (!current.latest) {
       reason = "write_target_detached";
       return false;
     }

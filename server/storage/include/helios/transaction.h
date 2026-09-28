@@ -255,8 +255,10 @@ class Transaction {
   bool OwnsLock(DataItem *item) const;
 
   /**
-   * @brief Locks the record and checks that its index still points to it.
+   * @brief Locks the record and checks that it is still the latest.
    *
+   * @details The reaper clears the latest bit when it unlinks a record, so a
+   * locked record with the bit set is the one its index holds for the key.
    * @param[in,out] max_tid Raised to the word observed under the lock.
    * @return false with reason set on detachment; the lock is held and
    * UnlockAll releases it.

@@ -897,6 +897,28 @@ TEST_F(CommitTidTest, ReadThenWriteOfOneKeyValidatesThroughOwnLock) {
   EXPECT_EQ(Version(10, 21), item->transaction_id.load());
 }
 
+TEST_F(CommitTidTest, WriteTargetReplacedAfterTheWriteAbortsAtItsLock) {
+  SeedRow("k", Version(10, 20));
+  const std::string row = TestHelper::Row("next");
+  silo::Transaction tx(tables_, epoch_, reaper_, *logger_, last_tid_);
+  tx.Read(kTable, "k", Version(10, 20));
+  ASSERT_TRUE(tx.Write(kTable, "k", row, RowOp::kUpdate, reason_)) << reason_;
+
+  // Another thread deletes the row, purges its record and inserts the key
+  // again; this thread's epoch keeps the old record allocated.
+  std::thread other([&] {
+    ASSERT_TRUE(Commit({}, {{kTable, "k", "", RowOp::kDelete}})) << reason_;
+    reaper_.Purge(10);
+    ASSERT_TRUE(Commit({}, {{kTable, "k", "again", RowOp::kInsert}}))
+        << reason_;
+  });
+  other.join();
+
+  EXPECT_FALSE(tx.Commit(CommitDurability::kAsync, reason_));
+  EXPECT_EQ("write_target_detached", reason_);
+  index::release_thread_epoch();
+}
+
 TEST_F(CommitTidTest, RangeRevalidationAllowsOwnLockOnPrimaryAndSecondary) {
   SeedRow("k", Version(10, 10));
   auto *index = tables_.GetTable(kTable)->GetSecondaryIndex("idx");
@@ -1043,7 +1065,7 @@ TEST_F(CommitTidTest,
 }
 
 TEST(TidWordTest, BitPositionsMatchLayout) {
-  EXPECT_EQ(4u, Tidword::Absent().obj);
+  EXPECT_EQ(6u, Tidword::Absent().obj);
   EXPECT_EQ((10ull << 32) | (8u << 3) | 2u, Version(10, 8).obj);
 }
 

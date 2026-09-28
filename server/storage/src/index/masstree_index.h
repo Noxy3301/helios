@@ -31,7 +31,8 @@ class MasstreeIndex final {
 
   /**
    * @brief Gets the entry for key, creating an absent DataItem if needed.
-   * @details Commit must recheck the key after locking the item.
+   * @details The reaper may unlink the record afterwards; Commit checks the
+   * record's latest bit after locking it.
    * @return Non-null; allocation failure throws.
    */
   DataItem *GetOrInsert(std::string_view key);
