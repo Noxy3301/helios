@@ -581,10 +581,10 @@ public:
   /**
    * @brief Advertise custom batched MRR for primary-key point lookups.
    *
-   * On the row read path, these methods clear HA_MRR_USE_DEFAULT_IMPL for
-   * primary-key lookup ranges so multi_range_read_init() can batch all keys
-   * into one Helios RPC. The plan path keeps MySQL's default DS-MRR path,
-   * where the index scan cache serves the rows.
+   * These methods clear HA_MRR_USE_DEFAULT_IMPL for primary-key lookup ranges
+   * so multi_range_read_init() can batch all keys into one Helios RPC. Under
+   * read plans, a primary-key MRR with more than one range takes that batch
+   * read path, and a single range keeps MySQL's default DS-MRR.
    */
   ha_rows multi_range_read_info_const(
       uint keyno, RANGE_SEQ_IF *seq, void *seq_init_param, uint n_ranges,
@@ -623,8 +623,8 @@ private:
   std::vector<MrrBufferedRow> mrr_buffer_;
   size_t mrr_buffer_pos_ = 0;
   bool mrr_use_batch_ = false;
-  // True when this statement's reads come from a read plan, so
-  // the handler's own batched MRR is not the path the rows arrive on.
+  // True when this statement's reads come from a read plan, where only a
+  // primary-key MRR with more than one range takes the batch read path.
   static bool statement_uses_read_plan(THD *thd);
   static std::string server_connection_host();
   static int server_connection_port();

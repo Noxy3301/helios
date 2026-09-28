@@ -14,17 +14,19 @@
 ha_rows ha_helios::multi_range_read_info_const(
     uint keyno, RANGE_SEQ_IF *seq, void *seq_init_param, uint n_ranges,
     uint *bufsz, uint *flags, bool *force_default_mrr, Cost_estimate *cost) {
+  const bool use_default = (*flags & HA_MRR_USE_DEFAULT_IMPL) != 0;
+  const bool use_plan = statement_uses_read_plan(ha_thd());
   ha_rows rows = handler::multi_range_read_info_const(
       keyno, seq, seq_init_param, n_ranges, bufsz, flags, force_default_mrr,
       cost);
   if (rows == HA_POS_ERROR) return rows;
 
-  // Custom batch MRR only on the row path; the cached read-plan results
-  // already hold the rows.
-  if (!statement_uses_read_plan(ha_thd()) && keyno == table->s->primary_key) {
+  // Primary-key ranges advertise the batch read; the row path also replaces
+  // the cost. Under read plans multi_range_read_init() checks the range count.
+  if (!use_default && keyno == table->s->primary_key) {
     *flags &= ~HA_MRR_USE_DEFAULT_IMPL;
     *bufsz = 0;
-    if (cost) {
+    if (cost && !use_plan) {
       cost->reset();
       cost->add_io(1.0);
     }
@@ -36,14 +38,16 @@ ha_rows ha_helios::multi_range_read_info(uint keyno, uint n_ranges,
                                             uint keys, uint *bufsz,
                                             uint *flags,
                                             Cost_estimate *cost) {
+  const bool use_default = (*flags & HA_MRR_USE_DEFAULT_IMPL) != 0;
+  const bool use_plan = statement_uses_read_plan(ha_thd());
   ha_rows rows = handler::multi_range_read_info(keyno, n_ranges, keys, bufsz,
                                                 flags, cost);
-  // Custom batch MRR only on the row path; the cached read-plan results
-  // already hold the rows.
-  if (!statement_uses_read_plan(ha_thd()) && keyno == table->s->primary_key) {
+  // Primary-key ranges advertise the batch read; the row path also replaces
+  // the cost. Under read plans multi_range_read_init() checks the range count.
+  if (!use_default && keyno == table->s->primary_key) {
     *flags &= ~HA_MRR_USE_DEFAULT_IMPL;
     *bufsz = 0;
-    if (cost) {
+    if (cost && !use_plan) {
       cost->reset();
       cost->add_io(1.0);
     }
@@ -59,12 +63,10 @@ int ha_helios::multi_range_read_init(RANGE_SEQ_IF *seq, void *seq_init_param,
     return abort_errno(tx);
   }
 
-  // The plan path does not use the custom batch path: default MRR
-  // (read_range_first -> index_read_map) consumes the cached rows, and a range
-  // no plan covers goes to the storage server there.
+  // Read plans can supply the primary point set before MRR consumes it.
   if (statement_uses_read_plan(ha_thd())) {
-    // A single-table DML has no QEP plan. Default DS-MRR reaches
-    // read_range_first()->index_read_map(), where the complete bounds exist.
+    // A single-table DML has no QEP plan. On the DS-MRR path below,
+    // read_range_first()->index_read_map() builds it from the complete bounds.
     if (!prefetch_needs_single_table_dml_handler(ha_thd(), tx)) {
       if (int err = maybe_prefetch_for_statement(ha_thd(), tx, table))
         return err;
@@ -72,12 +74,14 @@ int ha_helios::multi_range_read_init(RANGE_SEQ_IF *seq, void *seq_init_param,
     if (tx->is_aborted()) {
       return abort_errno(tx);
     }
-    mrr_use_batch_ = false;
-    mrr_buffer_.clear();
-    mrr_buffer_pos_ = 0;
-    m_ds_mrr.init(table);
-    return m_ds_mrr.dsmrr_init(seq, seq_init_param, n_ranges,
-                               mode | HA_MRR_USE_DEFAULT_IMPL, buf);
+    if (active_index != table->s->primary_key || n_ranges <= 1) {
+      mrr_use_batch_ = false;
+      mrr_buffer_.clear();
+      mrr_buffer_pos_ = 0;
+      m_ds_mrr.init(table);
+      return m_ds_mrr.dsmrr_init(seq, seq_init_param, n_ranges,
+                                 mode | HA_MRR_USE_DEFAULT_IMPL, buf);
+    }
   }
 
   if (mode & HA_MRR_USE_DEFAULT_IMPL) {
