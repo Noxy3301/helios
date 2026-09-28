@@ -58,8 +58,8 @@
     sed -i '/<serial>false<\/serial>/a\            <time>{{ bench_time }}</time>' "$CFG"
     {% endif %}
 
-    # Measured connections must validate UNIQUE indexes: the load phase's
-    # relaxation must never reach the execute config
+    # Measured connections must validate UNIQUE indexes: the relaxation
+    # used by the load must never reach the execute config
     if grep -q 'unique_checks=0' "$CFG"; then
       echo "GATE_FAIL: unique_checks=0 in exec config" >&2
       exit 1

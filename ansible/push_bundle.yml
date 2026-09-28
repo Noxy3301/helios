@@ -69,9 +69,9 @@
         executable: /bin/bash
 
     - name: Gate — the dead-man timer is armed
-      # cloud-final schedules the shutdown from user-data after sshd is up, so
-      # wait for it; an instance launched by hand passes deadman_required=false.
-      shell: test -e /run/systemd/shutdown/scheduled
+      # cloud-final arms it from user-data after sshd is up, so wait for it;
+      # an instance launched by hand passes deadman_required=false.
+      shell: systemctl is-active --quiet helios-deadman.timer
       register: deadman
       until: deadman.rc == 0
       retries: 12
