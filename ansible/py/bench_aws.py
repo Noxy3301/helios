@@ -210,9 +210,10 @@ def ena_queue_count(instance_type):
 def _launch_role(role, cfg, args, run_id):
     """Launch instances for a single role, spot by default.
 
-    Fully explicit run-instances (no launch template): env AMI, dead-man
-    user-data (self-terminate if forgotten), gp3 root with DeleteOnTermination,
-    IMDSv2. On-demand happens only with --on-demand or --allow-od-fallback."""
+    Fully explicit run-instances (no launch template): env AMI, user-data that
+    arms the dead-man (self-terminate if forgotten) and stops the apt timers,
+    gp3 root with DeleteOnTermination, IMDSv2. On-demand happens only with
+    --on-demand or --allow-od-fallback."""
     region = args.region
     tags = (f"Tags=[{{Key=Name,Value={cfg['tag']}}},"
             f"{{Key=Project,Value={args.project_tag}}},"
@@ -222,10 +223,13 @@ def _launch_role(role, cfg, args, run_id):
         f"ResourceType=instance,{tags}",
         f"ResourceType=volume,{tags}",
     ]
-    # A timer counted from boot: `shutdown +N` blocks ssh logins for its last
-    # five minutes (pam_nologin).
-    deadman = (f"#!/bin/bash\n"
-               f"systemd-run --unit=helios-deadman --on-boot={args.deadman_minutes}m /bin/systemctl poweroff\n")
+    # The dead-man is a timer counted from boot: `shutdown +N` blocks ssh logins
+    # for its last five minutes (pam_nologin). The apt timers would otherwise
+    # run package downloads and upgrades in the middle of a measurement.
+    user_data = (f"#!/bin/bash\n"
+                 f"systemd-run --unit=helios-deadman --on-boot={args.deadman_minutes}m /bin/systemctl poweroff\n"
+                 "systemctl disable --now apt-daily.timer apt-daily-upgrade.timer\n"
+                 "systemctl stop apt-daily.service apt-daily-upgrade.service\n")
 
     block_device_mappings = [
         f"DeviceName=/dev/sda1,Ebs={{VolumeSize={args.root_gib},"
@@ -246,7 +250,7 @@ def _launch_role(role, cfg, args, run_id):
         "--block-device-mappings", *block_device_mappings,
         "--metadata-options", "HttpTokens=required,HttpEndpoint=enabled",
         "--instance-initiated-shutdown-behavior", "terminate",
-        "--user-data", deadman,
+        "--user-data", user_data,
     ]
 
     # Every role requests min(32, vCPU/2) ENA queues at launch (ena_queue_count());
