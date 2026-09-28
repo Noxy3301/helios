@@ -16,6 +16,7 @@
 #include "flat_plan_pack.hh"
 #include "parallel_scan.hh"
 #include "key_pack.hh"
+#include "server/server_config.hh"
 
 // Read-plan execution: the tx_execute_read_plan handler and its plan-key
 // binding glue.
@@ -171,9 +172,8 @@ void HeliosRpc::handleTxExecuteReadPlan(
             }
 
             const size_t min_parallel_probes = 4096;  // FIXME: make configurable
-            const unsigned nproc = std::thread::hardware_concurrency();
-            const unsigned max_probe_threads =
-                std::min<unsigned>(nproc ? nproc : 4, 8);  // FIXME: make configurable
+            const unsigned max_probe_threads = std::min<unsigned>(
+                hardware_threads ? hardware_threads : 4, 8);  // FIXME: make configurable
             if (probe_keys.size() >= min_parallel_probes &&
                 max_probe_threads > 1) {
                 const size_t probe_count = probe_keys.size();

@@ -7,6 +7,7 @@
 #include <fstream>
 #include <string_view>
 #include <system_error>
+#include <thread>
 
 namespace {
 
@@ -149,6 +150,8 @@ std::string trim(std::string_view text) {
 }  // namespace
 
 const ServerConfig& config() { return g_config; }
+
+const unsigned hardware_threads = std::thread::hardware_concurrency();
 
 void load_config(const char* path) {
     std::ifstream file(path);

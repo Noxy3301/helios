@@ -48,6 +48,12 @@ struct ServerConfig {
 const ServerConfig& config();
 
 /**
+ * @brief std::thread::hardware_concurrency() as read once at startup; 0 when
+ * the platform cannot tell.
+ */
+extern const unsigned hardware_threads;
+
+/**
  * @brief Reads the [helios-storage] section of `path` into that configuration; a later file overrides an earlier one.
  *
  * @details A file that cannot be opened, a key the server does not know, or a
