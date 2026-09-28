@@ -222,8 +222,10 @@ def _launch_role(role, cfg, args, run_id):
         f"ResourceType=instance,{tags}",
         f"ResourceType=volume,{tags}",
     ]
+    # A timer counted from boot: `shutdown +N` blocks ssh logins for its last
+    # five minutes (pam_nologin).
     deadman = (f"#!/bin/bash\n"
-               f"shutdown +{args.deadman_minutes} \"helios bench dead-man\"\n")
+               f"systemd-run --unit=helios-deadman --on-boot={args.deadman_minutes}m /bin/systemctl poweroff\n")
 
     block_device_mappings = [
         f"DeviceName=/dev/sda1,Ebs={{VolumeSize={args.root_gib},"
