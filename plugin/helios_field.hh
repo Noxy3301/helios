@@ -28,12 +28,10 @@
  */
 class HeliosField {
  public:
-  std::string convert_numeric_to_bytes(const size_t num) const;
   size_t convert_bytes_to_numeric(const std::byte* const bytes,
                                   const size_t length) const;
 
-  void set_helios_field(const char* const src, const size_t length);
-  std::string get_helios_field() const;
+  static void append_field(std::string &out, const char *src, size_t length);
 
   /**
    * @brief Parses a packed row into one view per field.
@@ -55,10 +53,6 @@ class HeliosField {
  private:
   static constexpr char noValue = 0xff;
   static constexpr size_t maxValueLength = UINT_MAX;
-
-  char byteSize;
-  std::string valueLength;
-  std::string value;
 
   // Zero-copy row parsing: views point into the caller-owned raw_row.
   std::string_view nullFlagView;

@@ -473,11 +473,7 @@ int maybe_prefetch_for_statement(THD *thd, HeliosTransaction *tx,
   // plan is built. Run that subquery's own plan once; the full statement is
   // still cached later when outer execution starts.
   AccessPath *unit_root = table_unit_plan_root(table);
-  if (unit_root == nullptr) {
-    if (tx->stmt_prefetch_done()) return 0;
-    tx->mark_stmt_prefetch_done();
-    return 0;
-  }
+  if (unit_root == nullptr) return 0;
   if (tx->has_stmt_plan_root(unit_root)) return 0;
   tx->note_stmt_plan_root(unit_root);
 

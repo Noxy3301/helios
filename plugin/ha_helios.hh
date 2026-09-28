@@ -101,6 +101,8 @@ public:
   std::mutex index_ndv_mu_;
   std::unordered_map<std::string, std::vector<uint64_t>> index_ndv_;
   std::atomic<bool> index_ndv_loaded_{false};
+  // Bumped under index_ndv_mu_ each time index_ndv_ is reloaded.
+  std::atomic<uint64_t> index_ndv_gen_{0};
 
   // Row count observed when index_ndv_ was fetched.
   std::atomic<uint64_t> index_ndv_records_{0};
@@ -217,6 +219,10 @@ private:
 
   std::string last_fetched_primary_key_;
 
+  // HA_BLOCK_CONST_TABLE, or 0 when external_lock() found a query block with
+  // one leaf table.
+  ulonglong block_const_{HA_BLOCK_CONST_TABLE};
+
   // Duplicate-key contract for the running statement, from extra(). REPLACE
   // may overwrite the row it finds; IGNORE and ON DUPLICATE KEY UPDATE need
   // the duplicate reported at the row, so write_row reads the key first.
@@ -252,6 +258,10 @@ private:
                                  const std::string &primary_key);
   std::string write_buffer_;
   HeliosField field_pack_;
+  // share->index_ndv_ by key number as of its generation ndv_gen_, which
+  // info() reads without the share's lock.
+  std::vector<std::vector<uint64_t>> key_ndv_;
+  uint64_t ndv_gen_{0};
   MEM_ROOT blobroot;
 
   // State for buffer fetching
@@ -303,11 +313,8 @@ public:
     This is a list of flags that indicate what functionality the storage engine
     implements. The current table flags are documented in handler.h
   */
-  // HA_BLOCK_CONST_TABLE keeps equality lookups out of JOIN::optimize, where
-  // no AccessPath exists for the read-plan compiler, and demotes them to
-  // JT_EQ_REF.
   ulonglong table_flags() const override {
-    return HA_BINLOG_ROW_CAPABLE | HA_BLOCK_CONST_TABLE;
+    return HA_BINLOG_ROW_CAPABLE | block_const_;
   }
 
   /** @brief
@@ -581,10 +588,10 @@ public:
   /**
    * @brief Advertise custom batched MRR for primary-key point lookups.
    *
-   * On the row read path, these methods clear HA_MRR_USE_DEFAULT_IMPL for
-   * primary-key lookup ranges so multi_range_read_init() can batch all keys
-   * into one Helios RPC. The plan path keeps MySQL's default DS-MRR path,
-   * where the index scan cache serves the rows.
+   * These methods clear HA_MRR_USE_DEFAULT_IMPL for primary-key lookup ranges
+   * so multi_range_read_init() can batch all keys into one Helios RPC. Under
+   * read plans, a primary-key MRR with more than one range takes that batch
+   * read path, and a single range keeps MySQL's default DS-MRR.
    */
   ha_rows multi_range_read_info_const(
       uint keyno, RANGE_SEQ_IF *seq, void *seq_init_param, uint n_ranges,
@@ -623,8 +630,8 @@ private:
   std::vector<MrrBufferedRow> mrr_buffer_;
   size_t mrr_buffer_pos_ = 0;
   bool mrr_use_batch_ = false;
-  // True when this statement's reads come from a read plan, so
-  // the handler's own batched MRR is not the path the rows arrive on.
+  // True when this statement's reads come from a read plan, where only a
+  // primary-key MRR with more than one range takes the batch read path.
   static bool statement_uses_read_plan(THD *thd);
   static std::string server_connection_host();
   static int server_connection_port();

@@ -293,11 +293,23 @@ int ha_helios::external_lock(THD *thd, int lock_type) {
   const bool tx_is_ready_to_commit = lock_type == F_UNLCK;
   if (tx_is_ready_to_commit) return 0;
 
+  // A join's const lookups in JOIN::optimize have no AccessPath for read plans.
+  // Statements under LOCK TABLES and prelocked sub-statements keep the value
+  // their locking statement set.
+  if (thd->locked_tables_mode == LTM_NONE) {
+    const Table_ref *ref = table->pos_in_table_list;
+    block_const_ = HA_BLOCK_CONST_TABLE;
+    if (ref != nullptr && ref->query_block != nullptr &&
+        ref->query_block->leaf_table_count == 1) {
+      block_const_ = 0;
+    }
+  }
+
   // get_transaction() will automatically start the transaction if needed
   HeliosTransaction *tx = get_transaction(thd);
   if (tx != nullptr) {
     const LEX_CSTRING &q = thd->query();
-    if (q.str != nullptr && q.length > 0) {
+    if (srv_rpc_trace && q.str != nullptr && q.length > 0) {
       tx->on_stmt_boundary(std::string(q.str, q.length));
     }
   }
