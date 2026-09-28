@@ -8,11 +8,13 @@
 #define HELIOS_STORAGE_SRC_WAL_WAL_H
 
 #include <sys/types.h>
+#include <sys/uio.h>
 
 #include <cstdint>
 #include <functional>
 #include <map>
 #include <string>
+#include <vector>
 
 #include "util/epoch.h"
 #include "wal/log_record.h"
@@ -54,7 +56,7 @@ struct WalAppendResult {
 /**
  * @brief Seam for the syscalls the append and capacity paths use, letting a
  * test inject a write, sync, initialisation or read failure.
- * @details `pwrite` and `fdatasync` carry a group; `initialise_pwrite`
+ * @details `pwritev` and `fdatasync` carry a group; `initialise_pwrite`
  * carries the zeroes that reserve capacity, kept separate so a capacity
  * failure cannot consume an injection aimed at a group; `pread` is what
  * the scan and the repair-range check read through.
@@ -67,7 +69,7 @@ struct WalAppendResult {
  * fit in a long, stops startup.
  */
 struct WalIo {
-  std::function<ssize_t(int, const void *, size_t, off_t)> pwrite;
+  std::function<ssize_t(int, const iovec *, int, off_t)> pwritev;
   std::function<int(int)> fdatasync;
   std::function<ssize_t(int, const void *, size_t, off_t)> initialise_pwrite;
   std::function<ssize_t(int, void *, size_t, off_t)> pread;
@@ -191,7 +193,7 @@ class Wal {
                        int &error) const;
   bool EnsureCapacityFor(off_t end_of_log, size_t group_size, int &error);
   bool WriteZeroesAndSync(off_t from, off_t to, int &error);
-  bool WriteAllAt(const uint8_t *data, size_t size, off_t offset, int &error);
+  bool WriteAllAt(std::vector<iovec> &iov, off_t offset, int &error);
 
   /**
    * @brief Reads exactly size bytes from the WAL at offset into out.

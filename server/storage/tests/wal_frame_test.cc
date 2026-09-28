@@ -6,16 +6,20 @@
 
 #include <fcntl.h>
 #include <gtest/gtest.h>
+#include <limits.h>
 #include <sys/stat.h>
+#include <sys/uio.h>
 #include <unistd.h>
 
 #include <algorithm>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <iterator>
 #include <map>
 #include <msgpack.hpp>
 #include <string>
+#include <vector>
 
 #include "wal/crc32c.h"
 #include "wal/wal.h"
@@ -255,10 +259,10 @@ TEST_F(WalFrameTest, AGroupIsOneWriteAndOneSync) {
   helios::storage::wal::WalIo io = helios::storage::wal::WalIo::Posix();
   int write_calls = 0;
   int sync_calls = 0;
-  io.pwrite = [&write_calls](int fd, const void *data, size_t size,
-                             off_t offset) {
+  io.pwritev = [&write_calls](int fd, const iovec *iov, int iovcnt,
+                              off_t offset) {
     ++write_calls;
-    return ::pwrite(fd, data, size, offset);
+    return ::pwritev(fd, iov, iovcnt, offset);
   };
   io.fdatasync = [&sync_calls](int fd) {
     ++sync_calls;
@@ -565,10 +569,10 @@ TEST_F(WalFrameTest, ShortWritesAreRetriedUntilTheGroupIsComplete) {
   {
     helios::storage::wal::WalIo io = helios::storage::wal::WalIo::Posix();
     int write_calls = 0;
-    io.pwrite = [&write_calls](int fd, const void *data, size_t,
-                               off_t offset) -> ssize_t {
+    io.pwritev = [&write_calls](int fd, const iovec *iov, int,
+                                off_t offset) -> ssize_t {
       ++write_calls;
-      return ::pwrite(fd, data, 1, offset);  // one byte per call
+      return ::pwrite(fd, iov[0].iov_base, 1, offset);  // one byte per call
     };
 
     Wal wal(work_dir_, io, kCapacity);
@@ -594,9 +598,10 @@ TEST_F(WalFrameTest, ShortWritesAreRetriedUntilTheGroupIsComplete) {
 TEST_F(WalFrameTest, APartialWriteIsCarriedToCompletion) {
   helios::storage::wal::WalIo io = helios::storage::wal::WalIo::Posix();
   size_t calls = 0;
-  io.pwrite = [&calls](int fd, const void *data, size_t size, off_t offset) {
+  io.pwritev = [&calls](int fd, const iovec *iov, int, off_t offset) {
     ++calls;
-    return ::pwrite(fd, data, std::min<size_t>(size, 7), offset);
+    return ::pwrite(fd, iov[0].iov_base, std::min<size_t>(iov[0].iov_len, 7),
+                    offset);
   };
 
   Wal wal(work_dir_, io, kCapacity);
@@ -614,10 +619,62 @@ TEST_F(WalFrameTest, APartialWriteIsCarriedToCompletion) {
   EXPECT_EQ(result.records.size(), 2u);
 }
 
+// Written from iovecs, a group is byte for byte the frames of its buckets,
+// also when writes stop inside an iovec and the group has more iovecs than
+// one call takes.
+TEST_F(WalFrameTest, AGroupIsTheFramesOfItsBucketsByteForByte) {
+  // Record lists under and over the msgpack fixarray and array16 limits.
+  const std::map<EpochNumber, size_t> counts = {
+      {1, 1}, {2, 16}, {3, 2000}, {4, 70000}};
+  std::map<EpochNumber, PackedLogRecords> buckets;
+  std::vector<uint8_t> expected;
+  for (const auto &[epoch, count] : counts) {
+    LogRecords records;
+    for (size_t i = 0; i != count; ++i) {
+      records.push_back(MakeRecords(epoch, "k" + std::to_string(i)).front());
+      buckets[epoch].push_back(pack_record(records.back()));
+    }
+    const std::vector<uint8_t> frame = MakeFrame(epoch, PackRecords(records));
+    expected.insert(expected.end(), frame.begin(), frame.end());
+  }
+
+  // Each call writes a few bytes, a few pages or a long run of the iovecs.
+  static constexpr size_t kCaps[] = {7, 4099, 65537};
+  helios::storage::wal::WalIo io = helios::storage::wal::WalIo::Posix();
+  size_t calls = 0;
+  int widest = 0;
+  io.pwritev = [&calls, &widest](int fd, const iovec *iov, int iovcnt,
+                                 off_t offset) {
+    widest = std::max(widest, iovcnt);
+    size_t cap = kCaps[calls++ % std::size(kCaps)];
+    std::vector<iovec> part;
+    for (int i = 0; i < iovcnt && cap != 0; ++i) {
+      const size_t len = std::min(cap, iov[i].iov_len);
+      part.push_back({iov[i].iov_base, len});
+      cap -= len;
+    }
+    return ::pwritev(fd, part.data(), static_cast<int>(part.size()), offset);
+  };
+  {
+    Wal wal(work_dir_, io, Wal::kNoPreallocation);
+    ASSERT_EQ(wal.Scan().status, WalScanResult::Status::kOk);
+    ASSERT_TRUE(wal.AppendGroup(buckets, 4).ok);
+  }
+  EXPECT_EQ(widest, IOV_MAX);
+
+  std::vector<uint8_t> written(static_cast<size_t>(FileSize()));
+  const int fd = ::open(WalPath().c_str(), O_RDONLY);
+  ASSERT_GE(fd, 0);
+  const ssize_t got = ::pread(fd, written.data(), written.size(), 0);
+  ::close(fd);
+  ASSERT_EQ(got, static_cast<ssize_t>(written.size()));
+  EXPECT_TRUE(written == expected);
+}
+
 TEST_F(WalFrameTest, WriteFailurePropagatesWithoutSyncing) {
   helios::storage::wal::WalIo io = helios::storage::wal::WalIo::Posix();
   bool synced = false;
-  io.pwrite = [](int, const void *, size_t, off_t) -> ssize_t {
+  io.pwritev = [](int, const iovec *, int, off_t) -> ssize_t {
     errno = EIO;
     return -1;
   };
@@ -964,9 +1021,9 @@ TEST_F(WalFrameTest, EmptyGroupNeitherWritesNorSyncs) {
   helios::storage::wal::WalIo io = helios::storage::wal::WalIo::Posix();
   bool wrote = false;
   bool synced = false;
-  io.pwrite = [&wrote](int fd, const void *data, size_t size, off_t offset) {
+  io.pwritev = [&wrote](int fd, const iovec *iov, int iovcnt, off_t offset) {
     wrote = true;
-    return ::pwrite(fd, data, size, offset);
+    return ::pwritev(fd, iov, iovcnt, offset);
   };
   io.fdatasync = [&synced](int fd) {
     synced = true;

@@ -47,6 +47,13 @@ constexpr size_t kOffCrc = 14;
 // which sits last.
 constexpr size_t kCrcCoverage = Wal::kHeaderSize - sizeof(uint32_t);
 
+// A frame's header followed by its record list's msgpack array header, which
+// takes at most 5 bytes.
+struct FrameHead {
+  uint8_t bytes[Wal::kHeaderSize + 5];
+  size_t size;
+};
+
 void PutLe16(uint8_t *out, uint16_t value) {
   out[0] = static_cast<uint8_t>(value & 0xffu);
   out[1] = static_cast<uint8_t>((value >> 8) & 0xffu);
@@ -97,8 +104,8 @@ bool FsyncDirectory(const std::string &directory, int &error) {
 
 WalIo WalIo::Posix() {
   WalIo io;
-  io.pwrite = ::pwrite;
-  io.initialise_pwrite = io.pwrite;
+  io.pwritev = ::pwritev;
+  io.initialise_pwrite = ::pwrite;
   io.pread = ::pread;
 
   // Armed from the environment, like a debug sync point, so an out-of-process
@@ -233,20 +240,30 @@ WalScanResult Wal::IoFailure(const std::string &operation, int error) {
   return result;
 }
 
-bool Wal::WriteAllAt(const uint8_t *data, size_t size, off_t offset,
-                     int &error) {
-  while (size != 0) {
-    const size_t chunk = std::min<size_t>(size, SSIZE_MAX);
-    const ssize_t written = io_.pwrite(fd_, data, chunk, offset);
-    if (written > 0) {
-      data += written;
-      offset += written;
-      size -= static_cast<size_t>(written);
-      continue;
-    }
+// Writes every byte `iov` names at `offset`, at most IOV_MAX iovecs a call; a
+// short write resumes inside the iovec it stopped in, which `iov` records.
+bool Wal::WriteAllAt(std::vector<iovec> &iov, off_t offset, int &error) {
+  size_t next = 0;
+  while (next != iov.size()) {
+    const auto count =
+        static_cast<int>(std::min<size_t>(iov.size() - next, IOV_MAX));
+    const ssize_t written = io_.pwritev(fd_, iov.data() + next, count, offset);
     if (written < 0 && errno == EINTR) continue;
-    error = written == 0 ? EIO : errno;
-    return false;
+    if (written <= 0) {
+      error = written == 0 ? EIO : errno;
+      return false;
+    }
+
+    offset += written;
+    auto left = static_cast<size_t>(written);
+    while (next != iov.size() && left >= iov[next].iov_len) {
+      left -= iov[next].iov_len;
+      ++next;
+    }
+    if (left != 0) {
+      iov[next].iov_base = static_cast<uint8_t *>(iov[next].iov_base) + left;
+      iov[next].iov_len -= left;
+    }
   }
   return true;
 }
@@ -637,12 +654,18 @@ WalAppendResult Wal::AppendGroup(
     std::abort();
   }
 
-  // Frame the buckets at or below target into one group.
+  // Frame the buckets at or below target into one group. A frame's header and
+  // record list header are built here; its records are written from their
+  // own bytes.
   auto &trace = FlushTrace::Instance();
   const bool traced = trace.Enabled();
   const int64_t pack_begin = traced ? FlushTrace::Now() : 0;
   uint32_t packed_epochs = 0;
-  std::vector<uint8_t> group;
+  size_t group_size = 0;
+  // The iovecs point into `heads`, which therefore never reallocates.
+  std::vector<FrameHead> heads;
+  heads.reserve(buckets.size());
+  std::vector<iovec> iov;
   EpochNumber last_packed = last_epoch_;
   for (const auto &[epoch, records] : buckets) {
     if (epoch > target) break;
@@ -669,37 +692,39 @@ WalAppendResult Wal::AppendGroup(
       return {false, EOVERFLOW};
     }
 
-    const size_t frame_offset = group.size();
-    group.resize(frame_offset + kHeaderSize + payload_size);
-    uint8_t *frame = group.data() + frame_offset;
+    FrameHead &head = heads.emplace_back();
+    uint8_t *frame = head.bytes;
     PutLe32(frame, kMagic);
     PutLe16(frame + kOffFlags, kFlags);
     PutLe32(frame + kOffPayloadSize, static_cast<uint32_t>(payload_size));
     PutLe32(frame + kOffEpoch, epoch);
-    uint8_t *out = frame + kHeaderSize;
-    std::memcpy(out, list_header.data(), list_header.size());
-    out += list_header.size();
-    for (const auto &record : records) {
-      std::memcpy(out, record.bytes.data(), record.bytes.size());
-      out += record.bytes.size();
-    }
+    std::memcpy(frame + kHeaderSize, list_header.data(), list_header.size());
+    head.size = kHeaderSize + list_header.size();
 
+    // The checksum runs over the bytes the iovecs name, in their order.
     Crc32c crc;
     crc.Update(frame, kCrcCoverage);
-    crc.Update(frame + kHeaderSize, payload_size);
+    crc.Update(frame + kHeaderSize, list_header.size());
+    iov.push_back({frame, head.size});
+    for (const auto &record : records) {
+      crc.Update(record.bytes.data(), record.bytes.size());
+      iov.push_back(
+          {const_cast<char *>(record.bytes.data()), record.bytes.size()});
+    }
     PutLe32(frame + kOffCrc, crc.Finish());
+    group_size += kHeaderSize + payload_size;
   }
 
   if (traced) {
-    trace.GroupPack(pack_begin, FlushTrace::Now(), group.size(), packed_epochs);
+    trace.GroupPack(pack_begin, FlushTrace::Now(), group_size, packed_epochs);
   }
 
-  if (group.empty()) return {true, 0};
+  if (group_size == 0) return {true, 0};
 
   // Extend the zeroed region if the group does not fit.
   int error = 0;
   const off_t initialised_before = initialised_size_;
-  if (!EnsureCapacityFor(write_offset_, group.size(), error)) {
+  if (!EnsureCapacityFor(write_offset_, group_size, error)) {
     state_ = State::kFailed;
     return {false, error};
   }
@@ -711,7 +736,7 @@ WalAppendResult Wal::AppendGroup(
 
   // Write, fdatasync, then publish the offset and the last epoch.
   const int64_t write_begin = traced ? FlushTrace::Now() : 0;
-  if (!WriteAllAt(group.data(), group.size(), write_offset_, error)) {
+  if (!WriteAllAt(iov, write_offset_, error)) {
     state_ = State::kFailed;
     return {false, error};
   }
@@ -733,7 +758,7 @@ WalAppendResult Wal::AppendGroup(
   }
   if (traced) trace.GroupSync(sync_begin, FlushTrace::Now());
 
-  write_offset_ += static_cast<off_t>(group.size());
+  write_offset_ += static_cast<off_t>(group_size);
   // Without preallocation the group carried the file's size with it.
   initialised_size_ = std::max(initialised_size_, write_offset_);
   last_epoch_ = last_packed;

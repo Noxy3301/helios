@@ -407,7 +407,7 @@ TEST_F(LoggerDurabilityTest,
 
 TEST_F(LoggerDurabilityTest, WriteFailureFailsWaiters) {
   WalIo io = WalIo::Posix();
-  io.pwrite = [](int, const void *, size_t, off_t) -> ssize_t {
+  io.pwritev = [](int, const iovec *, int, off_t) -> ssize_t {
     errno = EIO;
     return -1;
   };
