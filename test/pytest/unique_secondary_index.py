@@ -347,6 +347,48 @@ def test_insert_ignore_onto_taken_unique_value(db, cursor):
     return 0
 
 
+def test_insert_names_the_colliding_key(db, cursor):
+    # The both-taken plain INSERT pins the deferred primary probe: it names the
+    # UNIQUE key, where InnoDB checks the clustered index first and names
+    # PRIMARY. MySQL skips start_bulk_insert under prelocking (stored function).
+    print("UNIQUE SECONDARY INDEX (INSERT, PRIMARY OR UNIQUE KEY TAKEN) TEST")
+    table = create_unique_table(cursor)
+    cursor.execute(f"CREATE FUNCTION ha_helios_test.ins_{table}"
+                   "(i INT, e VARCHAR(63)) RETURNS INT DETERMINISTIC "
+                   f"BEGIN INSERT INTO ha_helios_test.{table} (id, email, name) "
+                   "VALUES (i, e, 'x'); RETURN 1; END")
+    db.commit()
+
+    if seed_two_rows(cursor, table, 'm@example.com', 'n@example.com'):
+        print(f"\tFailed: the seed insert was rejected ({_last_error_message})")
+        return 1
+    db.commit()
+
+    cases = [(1, 'o@example.com', 'PRIMARY', 'PRIMARY'),
+             (3, 'm@example.com', 'email_uidx', 'email_uidx'),
+             (1, 'n@example.com', 'email_uidx', 'PRIMARY')]
+    for i, e, plain, in_function in cases:
+        for sql, index in [
+                (f"INSERT INTO ha_helios_test.{table} (id, email, name) "
+                 f"VALUES ({i}, '{e}', 'x')", plain),
+                (f"SELECT ha_helios_test.ins_{table}({i}, '{e}')",
+                 in_function)]:
+            errno = run(cursor, sql)
+            db.rollback()
+            if errno != 1062 or f".{index}'" not in _last_error_message:
+                print(f"\tFailed: {sql} expected 1062 on {index}, got {errno} "
+                      f"({_last_error_message})")
+                return 1
+
+    rows = rows_of(cursor, table)
+    if rows != [(1, 'm@example.com'), (2, 'n@example.com')]:
+        print(f"\tFailed: table holds {rows}, expected only the seeded rows")
+        return 1
+
+    print("\tPassed!")
+    return 0
+
+
 def main():
     db = get_connection(user=args.user, password=args.password)
     cursor = db.cursor()
@@ -361,6 +403,7 @@ def main():
     result |= test_update_ignore_onto_taken_unique_value(db, cursor)
     result |= test_rejected_insert_reaches_no_commit(db, cursor)
     result |= test_insert_ignore_onto_taken_unique_value(db, cursor)
+    result |= test_insert_names_the_colliding_key(db, cursor)
 
     if result == 0:
         print("\nALL TESTS PASSED!")
