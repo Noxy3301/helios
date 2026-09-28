@@ -144,8 +144,8 @@ class Wal {
   /**
    * @brief Appends one frame per bucket whose epoch is at or below `target`,
    * in epoch order, as one group write followed by one fdatasync.
-   * @param[in] buckets Records grouped by their commit epoch. Buckets above
-   * `target` are ignored and stay the caller's to carry forward.
+   * @param[in] buckets Packed records grouped by their commit epoch. Buckets
+   * above `target` are ignored and stay the caller's to carry forward.
    * @param[in] target The highest epoch this call may write.
    * @return Failure is returned without having advanced anything the caller
    * may publish. A bucket that would produce a frame the scan rejects
@@ -157,8 +157,9 @@ class Wal {
    * left the end of the log unknown, fail-stops the process rather than
    * returning: there is nothing trustworthy to append at.
    */
-  WalAppendResult AppendGroup(const std::map<EpochNumber, LogRecords> &buckets,
-                              EpochNumber target);
+  WalAppendResult AppendGroup(
+      const std::map<EpochNumber, PackedLogRecords> &buckets,
+      EpochNumber target);
 
   const std::string &path() const { return path_; }
 

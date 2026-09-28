@@ -63,6 +63,19 @@ struct LogRecord {
 
 using LogRecords = std::vector<LogRecord>;
 
+/**
+ * @brief One LogRecord as msgpack packs it, and its epoch.
+ */
+struct PackedLogRecord {
+  EpochNumber epoch = 0;
+  std::string bytes;
+
+  // The msgpack stream interface: packing into a record appends to `bytes`.
+  void write(const char *buf, size_t len) { bytes.append(buf, len); }
+};
+
+using PackedLogRecords = std::vector<PackedLogRecord>;
+
 }  // namespace wal
 }  // namespace helios::storage
 

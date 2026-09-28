@@ -624,7 +624,8 @@ WalScanResult Wal::Scan(EpochNumber min_epoch) {
 }
 
 WalAppendResult Wal::AppendGroup(
-    const std::map<EpochNumber, LogRecords> &buckets, EpochNumber target) {
+    const std::map<EpochNumber, PackedLogRecords> &buckets,
+    EpochNumber target) {
   // Where the log ends is what a successful scan establishes, and an
   // instance that never reached Ready, or that an earlier failure poisoned,
   // has nothing trustworthy to append at.
@@ -636,7 +637,7 @@ WalAppendResult Wal::AppendGroup(
     std::abort();
   }
 
-  // Pack the buckets at or below target into one group.
+  // Frame the buckets at or below target into one group.
   auto &trace = FlushTrace::Instance();
   const bool traced = trace.Enabled();
   const int64_t pack_begin = traced ? FlushTrace::Now() : 0;
@@ -650,30 +651,42 @@ WalAppendResult Wal::AppendGroup(
     // written, which leaves the log's end known and this instance usable.
     if (records.empty() || epoch == 0) return {false, EINVAL};
     if (epoch < last_epoch_) return {false, EINVAL};
+    size_t records_size = 0;
     for (const auto &record : records) {
       if (record.epoch != epoch) return {false, EINVAL};
+      records_size += record.bytes.size();
     }
     last_packed = epoch;
 
-    msgpack::sbuffer payload;
-    msgpack::pack(payload, records);
-    if (payload.size() > kMaxPayloadSize ||
-        payload.size() > static_cast<size_t>(UINT32_MAX)) {
+    // The payload is the packing of the bucket as a record list: the list's
+    // array header, then each record's bytes as the producer packed them.
+    msgpack::sbuffer list_header(8);
+    msgpack::packer<msgpack::sbuffer>(list_header)
+        .pack_array(static_cast<uint32_t>(records.size()));
+    const size_t payload_size = list_header.size() + records_size;
+    if (payload_size > kMaxPayloadSize ||
+        payload_size > static_cast<size_t>(UINT32_MAX)) {
       return {false, EOVERFLOW};
     }
 
     const size_t frame_offset = group.size();
-    group.resize(frame_offset + kHeaderSize + payload.size());
+    group.resize(frame_offset + kHeaderSize + payload_size);
     uint8_t *frame = group.data() + frame_offset;
     PutLe32(frame, kMagic);
     PutLe16(frame + kOffFlags, kFlags);
-    PutLe32(frame + kOffPayloadSize, static_cast<uint32_t>(payload.size()));
+    PutLe32(frame + kOffPayloadSize, static_cast<uint32_t>(payload_size));
     PutLe32(frame + kOffEpoch, epoch);
-    std::memcpy(frame + kHeaderSize, payload.data(), payload.size());
+    uint8_t *out = frame + kHeaderSize;
+    std::memcpy(out, list_header.data(), list_header.size());
+    out += list_header.size();
+    for (const auto &record : records) {
+      std::memcpy(out, record.bytes.data(), record.bytes.size());
+      out += record.bytes.size();
+    }
 
     Crc32c crc;
     crc.Update(frame, kCrcCoverage);
-    crc.Update(payload.data(), payload.size());
+    crc.Update(frame + kHeaderSize, payload_size);
     PutLe32(frame + kOffCrc, crc.Finish());
   }
 

@@ -308,13 +308,14 @@ class Transaction {
   static void Apply(DataItem &item, const WriteEntry &entry, EpochNumber epoch);
 
   /**
-   * @brief Copies the row the request sent, or the ordered index changes,
-   * into the log record.
+   * @brief Packs the row the request sent, or the ordered index changes,
+   * into the log record as LogRecord::Write elements.
    *
    * @pre Apply completed and the index record is still locked.
    */
-  static void AppendLog(wal::LogRecord &record, const DataItem &item,
-                        const WriteEntry &entry, Tidword commit_tid);
+  static void AppendLog(msgpack::packer<wal::PackedLogRecord> &pk,
+                        const DataItem &item, const WriteEntry &entry,
+                        Tidword commit_tid);
 
   /**
    * @brief Publishes the TID, which unlocks the record, and queues it when it

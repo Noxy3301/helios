@@ -30,6 +30,7 @@ namespace {
 using helios::storage::EpochNumber;
 using helios::storage::wal::Logger;
 using helios::storage::wal::LogRecord;
+using helios::storage::wal::PackedLogRecord;
 using helios::storage::wal::WalIo;
 
 constexpr auto kTestTimeout = std::chrono::seconds(5);
@@ -58,15 +59,17 @@ class LoggerDurabilityTest : public ::testing::Test {
     std::filesystem::remove_all(root_, ec);
   }
 
-  static LogRecord MakePrimaryRecord(const std::string &key,
-                                     EpochNumber epoch) {
+  static PackedLogRecord MakePrimaryRecord(const std::string &key,
+                                           EpochNumber epoch) {
     LogRecord record;
     record.epoch = epoch;
     LogRecord::Write write;
     write.key = key;
     write.table_name = "t";
     record.writes.emplace_back(std::move(write));
-    return record;
+    PackedLogRecord packed{epoch, {}};
+    msgpack::pack(packed, record);
+    return packed;
   }
 
   std::string root_;

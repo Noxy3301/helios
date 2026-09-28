@@ -30,6 +30,31 @@ Tidword PublishedTid(Tidword commit_tid, const DataItem &item) {
   return commit_tid;
 }
 
+// Upper bounds on the msgpack bytes a record adds around its strings: the
+// record, epoch and write-list headers, and per write its array header, five
+// string headers, the TID, index type, key list and op.
+constexpr size_t kLogRecordFraming = 11;
+constexpr size_t kLogWriteFraming = 44;
+
+// Packs one write as LogRecord::Write's MSGPACK_DEFINE does. A commit logs no
+// primary-key list, which packs as an empty array.
+void pack_write(msgpack::packer<wal::PackedLogRecord> &pk, std::string_view key,
+                std::string_view buffer, Tidword tid,
+                std::string_view table_name, std::string_view index_name,
+                uint32_t index_type, wal::SecondaryIndexOp op,
+                std::string_view primary_key) {
+  pk.pack_array(9);
+  pk.pack(key);
+  pk.pack(buffer);
+  pk.pack(tid);
+  pk.pack(table_name);
+  pk.pack(index_name);
+  pk.pack(index_type);
+  pk.pack_array(0);
+  pk.pack(op);
+  pk.pack(primary_key);
+}
+
 }  // namespace
 
 Transaction::Transaction(TableDictionary &tables, epoch::Framework &epoch,
@@ -212,10 +237,35 @@ bool Transaction::Commit(CommitDurability durability, std::string &reason) {
     }
   }
 
-  // Phase 3: install each record, copy its log, then publish and unlock it.
+  // Phase 3: install each record, pack its log, then publish and unlock it.
   last_commit_tid_ = commit_tid;
-  wal::LogRecord record;
+  // Count the logged writes and bound their packed size, so the record packs
+  // without regrowing.
+  size_t log_writes = 0;
+  size_t log_bytes = kLogRecordFraming;
+  for (const auto &[item, entry] : write_set_) {
+    const size_t names = kLogWriteFraming + entry.key.size() +
+                         entry.table->Name().size() + entry.index_name.size();
+    if (const auto *row = std::get_if<RowUpdate>(&entry.update)) {
+      ++log_writes;
+      log_bytes += names + row->bytes.size();
+      continue;
+    }
+    for (const auto &delta : std::get<IndexUpdate>(entry.update).deltas) {
+      ++log_writes;
+      log_bytes += names + delta.primary_key.size();
+    }
+  }
+  // The record packs as LogRecord's MSGPACK_DEFINE does: [epoch, [write...]].
+  wal::PackedLogRecord record;
   record.epoch = commit_tid.epoch;
+  msgpack::packer<wal::PackedLogRecord> pk(record);
+  if (log_writes != 0) {
+    record.bytes.reserve(log_bytes);
+    pk.pack_array(2);
+    pk.pack(record.epoch);
+    pk.pack_array(static_cast<uint32_t>(log_writes));
+  }
   bool row_applied = false;
   for (auto &[item, entry] : write_set_) {
     const bool is_row = std::holds_alternative<RowUpdate>(entry.update);
@@ -223,13 +273,13 @@ bool Transaction::Commit(CommitDurability durability, std::string &reason) {
       HELIOS_DEBUG_SYNC("silo_commit.between_row_installs");
     Apply(*item, entry, commit_tid.epoch);
     // Once unlocked, another writer may replace this record immediately.
-    AppendLog(record, *item, entry, commit_tid);
+    AppendLog(pk, *item, entry, commit_tid);
     Publish(*item, entry, commit_tid);
     row_applied = row_applied || is_row;
   }
 
   // Buffer the record before leaving, so a flush cannot pass this commit.
-  const bool logged = !record.writes.empty();
+  const bool logged = log_writes != 0;
   if (logged) logger_.Enqueue(std::move(record));
   epoch_.Leave();
   // Leave before waiting, so this worker does not hold back epoch advancement.
@@ -468,32 +518,24 @@ void Transaction::Apply(DataItem &item, const WriteEntry &entry,
                     std::get<IndexUpdate>(entry.update).primary_keys);
 }
 
-void Transaction::AppendLog(wal::LogRecord &record, const DataItem &item,
-                            const WriteEntry &entry, Tidword commit_tid) {
+void Transaction::AppendLog(msgpack::packer<wal::PackedLogRecord> &pk,
+                            const DataItem &item, const WriteEntry &entry,
+                            Tidword commit_tid) {
   const Tidword published = PublishedTid(commit_tid, item);
+  const std::string &table_name = entry.table->Name();
   if (const auto *row = std::get_if<RowUpdate>(&entry.update)) {
-    wal::LogRecord::Write write;
-    write.key = entry.key;
     // The bytes the install unpacked; a delete logs an empty value.
-    write.buffer = std::string(row->bytes);
-    write.transaction_id = published;
-    write.table_name = entry.table->Name();
-    record.writes.emplace_back(std::move(write));
+    pack_write(pk, entry.key, row->bytes, published, table_name, {}, 0,
+               wal::SecondaryIndexOp::kNone, {});
     return;
   }
 
   // Preserve all changes in order, including repeated primary keys.
   const auto &index = std::get<IndexUpdate>(entry.update);
   for (const auto &delta : index.deltas) {
-    wal::LogRecord::Write write;
-    write.key = entry.key;
-    write.transaction_id = published;
-    write.table_name = entry.table->Name();
-    write.index_name = entry.index_name;
-    write.index_type = static_cast<uint32_t>(index.constraint);
-    write.secondary_op = delta.op;
-    write.secondary_primary_key = delta.primary_key;
-    record.writes.emplace_back(std::move(write));
+    pack_write(pk, entry.key, {}, published, table_name, entry.index_name,
+               static_cast<uint32_t>(index.constraint), delta.op,
+               delta.primary_key);
   }
 }
 

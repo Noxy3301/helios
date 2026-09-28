@@ -30,6 +30,8 @@ using helios::storage::EpochNumber;
 using helios::storage::wal::Crc32c;
 using helios::storage::wal::LogRecord;
 using helios::storage::wal::LogRecords;
+using helios::storage::wal::PackedLogRecord;
+using helios::storage::wal::PackedLogRecords;
 using helios::storage::wal::Wal;
 using helios::storage::wal::WalScanResult;
 
@@ -42,6 +44,16 @@ LogRecords MakeRecords(EpochNumber epoch, const std::string &key) {
   write.table_name = "t";
   record.writes.emplace_back(std::move(write));
   return LogRecords{std::move(record)};
+}
+
+PackedLogRecord pack_record(const LogRecord &record) {
+  PackedLogRecord packed{record.epoch, {}};
+  msgpack::pack(packed, record);
+  return packed;
+}
+
+PackedLogRecords MakePacked(EpochNumber epoch, const std::string &key) {
+  return PackedLogRecords{pack_record(MakeRecords(epoch, key).front())};
 }
 
 class WalFrameTest : public ::testing::Test {
@@ -133,9 +145,9 @@ class WalFrameTest : public ::testing::Test {
   void AppendEpochs(const std::vector<EpochNumber> &epochs) {
     Wal wal(work_dir_, helios::storage::wal::WalIo::Posix(), kCapacity);
     ASSERT_EQ(wal.Scan().status, WalScanResult::Status::kOk);
-    std::map<EpochNumber, LogRecords> buckets;
+    std::map<EpochNumber, PackedLogRecords> buckets;
     for (const auto epoch : epochs) {
-      buckets[epoch] = MakeRecords(epoch, "k" + std::to_string(epoch));
+      buckets[epoch] = MakePacked(epoch, "k" + std::to_string(epoch));
     }
     const auto result = wal.AppendGroup(buckets, epochs.back());
     ASSERT_TRUE(result.ok) << "errno " << result.error_number;
@@ -255,10 +267,10 @@ TEST_F(WalFrameTest, AGroupIsOneWriteAndOneSync) {
 
   Wal wal(work_dir_, io, kCapacity);
   ASSERT_EQ(wal.Scan().status, WalScanResult::Status::kOk);
-  std::map<EpochNumber, LogRecords> buckets;
-  buckets[1] = MakeRecords(1, "k1");
-  buckets[2] = MakeRecords(2, "k2");
-  buckets[3] = MakeRecords(3, "k3");
+  std::map<EpochNumber, PackedLogRecords> buckets;
+  buckets[1] = MakePacked(1, "k1");
+  buckets[2] = MakePacked(2, "k2");
+  buckets[3] = MakePacked(3, "k3");
   ASSERT_TRUE(wal.AppendGroup(buckets, 3).ok);
   EXPECT_EQ(write_calls, 1);
   EXPECT_EQ(sync_calls, 1);
@@ -267,10 +279,10 @@ TEST_F(WalFrameTest, AGroupIsOneWriteAndOneSync) {
 TEST_F(WalFrameTest, GroupSkipsBucketsAboveTheTarget) {
   Wal wal(work_dir_, helios::storage::wal::WalIo::Posix(), kCapacity);
   ASSERT_EQ(wal.Scan().status, WalScanResult::Status::kOk);
-  std::map<EpochNumber, LogRecords> buckets;
-  buckets[1] = MakeRecords(1, "k1");
-  buckets[2] = MakeRecords(2, "k2");
-  buckets[3] = MakeRecords(3, "k3");
+  std::map<EpochNumber, PackedLogRecords> buckets;
+  buckets[1] = MakePacked(1, "k1");
+  buckets[2] = MakePacked(2, "k2");
+  buckets[3] = MakePacked(3, "k3");
   ASSERT_TRUE(wal.AppendGroup(buckets, 2).ok);
 
   const auto result = wal.Scan();
@@ -307,8 +319,8 @@ TEST_F(WalFrameTest, TheFirstInvalidFrameEndsThePrefixAndAppendResumesThere) {
     ASSERT_EQ(result.status, WalScanResult::Status::kOk);
     EXPECT_FALSE(result.tail_zeroed);
     ASSERT_EQ(wal.write_offset(), damaged);
-    std::map<EpochNumber, LogRecords> buckets;
-    buckets[4] = MakeRecords(4, "k4");
+    std::map<EpochNumber, PackedLogRecords> buckets;
+    buckets[4] = MakePacked(4, "k4");
     ASSERT_TRUE(wal.AppendGroup(buckets, 4).ok);
     EXPECT_EQ(FileSize(), file_size);
   }
@@ -528,8 +540,8 @@ TEST_F(WalFrameTest, AnAppendBelowTheLastEpochIsRefused) {
 
   Wal wal(work_dir_, helios::storage::wal::WalIo::Posix(), kCapacity);
   ASSERT_EQ(wal.Scan().status, WalScanResult::Status::kOk);
-  std::map<EpochNumber, LogRecords> buckets;
-  buckets[2] = MakeRecords(2, "k2");
+  std::map<EpochNumber, PackedLogRecords> buckets;
+  buckets[2] = MakePacked(2, "k2");
   const auto result = wal.AppendGroup(buckets, 2);
   EXPECT_FALSE(result.ok);
   EXPECT_EQ(result.error_number, EINVAL);
@@ -544,8 +556,8 @@ TEST_F(WalFrameTest, AnAppendBelowTheLastEpochIsRefused) {
  */
 TEST_F(WalFrameTest, AnAppendBeforeTheScanIsRefused) {
   Wal wal(work_dir_, helios::storage::wal::WalIo::Posix(), kCapacity);
-  std::map<EpochNumber, LogRecords> buckets;
-  buckets[1] = MakeRecords(1, "k1");
+  std::map<EpochNumber, PackedLogRecords> buckets;
+  buckets[1] = MakePacked(1, "k1");
   EXPECT_DEATH(wal.AppendGroup(buckets, 1), "");
 }
 
@@ -561,8 +573,8 @@ TEST_F(WalFrameTest, ShortWritesAreRetriedUntilTheGroupIsComplete) {
 
     Wal wal(work_dir_, io, kCapacity);
     ASSERT_EQ(wal.Scan().status, WalScanResult::Status::kOk);
-    std::map<EpochNumber, LogRecords> buckets;
-    buckets[1] = MakeRecords(1, "k1");
+    std::map<EpochNumber, PackedLogRecords> buckets;
+    buckets[1] = MakePacked(1, "k1");
     ASSERT_TRUE(wal.AppendGroup(buckets, 1).ok);
     EXPECT_GT(write_calls, 1);
   }
@@ -589,9 +601,9 @@ TEST_F(WalFrameTest, APartialWriteIsCarriedToCompletion) {
 
   Wal wal(work_dir_, io, kCapacity);
   ASSERT_EQ(wal.Scan().status, WalScanResult::Status::kOk);
-  std::map<EpochNumber, LogRecords> buckets;
-  buckets[1] = MakeRecords(1, "k1");
-  buckets[2] = MakeRecords(2, "k2");
+  std::map<EpochNumber, PackedLogRecords> buckets;
+  buckets[1] = MakePacked(1, "k1");
+  buckets[2] = MakePacked(2, "k2");
   ASSERT_TRUE(wal.AppendGroup(buckets, 2).ok);
   EXPECT_GT(calls, 1u);
 
@@ -616,8 +628,8 @@ TEST_F(WalFrameTest, WriteFailurePropagatesWithoutSyncing) {
 
   Wal wal(work_dir_, io, kCapacity);
   ASSERT_EQ(wal.Scan().status, WalScanResult::Status::kOk);
-  std::map<EpochNumber, LogRecords> buckets;
-  buckets[1] = MakeRecords(1, "k1");
+  std::map<EpochNumber, PackedLogRecords> buckets;
+  buckets[1] = MakePacked(1, "k1");
   const auto result = wal.AppendGroup(buckets, 1);
   EXPECT_FALSE(result.ok);
   EXPECT_EQ(result.error_number, EIO);
@@ -639,12 +651,12 @@ TEST_F(WalFrameTest, AFailedAppendRefusesEveryLaterAppend) {
 
   Wal wal(work_dir_, io, kCapacity);
   ASSERT_EQ(wal.Scan().status, WalScanResult::Status::kOk);
-  std::map<EpochNumber, LogRecords> first;
-  first[1] = MakeRecords(1, "k1");
+  std::map<EpochNumber, PackedLogRecords> first;
+  first[1] = MakePacked(1, "k1");
   ASSERT_FALSE(wal.AppendGroup(first, 1).ok);
 
-  std::map<EpochNumber, LogRecords> second;
-  second[2] = MakeRecords(2, "k2");
+  std::map<EpochNumber, PackedLogRecords> second;
+  second[2] = MakePacked(2, "k2");
   EXPECT_DEATH(wal.AppendGroup(second, 2), "");
 }
 
@@ -652,15 +664,15 @@ TEST_F(WalFrameTest, ABucketTheScanWouldRejectIsRefused) {
   Wal wal(work_dir_, helios::storage::wal::WalIo::Posix(), kCapacity);
   ASSERT_EQ(wal.Scan().status, WalScanResult::Status::kOk);
   {
-    std::map<EpochNumber, LogRecords> buckets;
-    buckets[1] = LogRecords{};  // empty
+    std::map<EpochNumber, PackedLogRecords> buckets;
+    buckets[1] = PackedLogRecords{};  // empty
     const auto result = wal.AppendGroup(buckets, 1);
     EXPECT_FALSE(result.ok);
     EXPECT_EQ(result.error_number, EINVAL);
   }
   {
-    std::map<EpochNumber, LogRecords> buckets;
-    buckets[2] = MakeRecords(7, "k7");  // record epoch disagrees
+    std::map<EpochNumber, PackedLogRecords> buckets;
+    buckets[2] = MakePacked(7, "k7");  // record epoch disagrees
     const auto result = wal.AppendGroup(buckets, 2);
     EXPECT_FALSE(result.ok);
     EXPECT_EQ(result.error_number, EINVAL);
@@ -677,8 +689,8 @@ TEST_F(WalFrameTest, FdatasyncFailurePropagates) {
 
   Wal wal(work_dir_, io, kCapacity);
   ASSERT_EQ(wal.Scan().status, WalScanResult::Status::kOk);
-  std::map<EpochNumber, LogRecords> buckets;
-  buckets[1] = MakeRecords(1, "k1");
+  std::map<EpochNumber, PackedLogRecords> buckets;
+  buckets[1] = MakePacked(1, "k1");
   const auto result = wal.AppendGroup(buckets, 1);
   EXPECT_FALSE(result.ok);
   EXPECT_EQ(result.error_number, EIO);
@@ -693,8 +705,8 @@ TEST_F(WalFrameTest, ScanAcceptsTheMaximumEpoch) {
   {
     Wal wal(work_dir_, helios::storage::wal::WalIo::Posix(), kCapacity);
     ASSERT_EQ(wal.Scan().status, WalScanResult::Status::kOk);
-    std::map<EpochNumber, LogRecords> buckets;
-    buckets[near_wrap] = MakeRecords(near_wrap, "k");
+    std::map<EpochNumber, PackedLogRecords> buckets;
+    buckets[near_wrap] = MakePacked(near_wrap, "k");
     ASSERT_TRUE(wal.AppendGroup(buckets, near_wrap).ok);
   }
   Wal wal(work_dir_, helios::storage::wal::WalIo::Posix(), kCapacity);
@@ -712,8 +724,8 @@ TEST_F(WalFrameTest, CapacityIsWrittenOutAndGroupsDoNotChangeTheFileSize) {
 
   off_t previous_end = 0;
   for (EpochNumber epoch = 1; epoch <= 4; ++epoch) {
-    std::map<EpochNumber, LogRecords> buckets;
-    buckets[epoch] = MakeRecords(epoch, "k" + std::to_string(epoch));
+    std::map<EpochNumber, PackedLogRecords> buckets;
+    buckets[epoch] = MakePacked(epoch, "k" + std::to_string(epoch));
     ASSERT_TRUE(wal.AppendGroup(buckets, epoch).ok);
     EXPECT_EQ(FileSize(), static_cast<off_t>(kCapacity));
     EXPECT_GT(wal.write_offset(), previous_end);
@@ -729,9 +741,9 @@ TEST_F(WalFrameTest, AGrownLogIsAdoptedWithoutLosingFrames) {
     Wal wal(work_dir_, helios::storage::wal::WalIo::Posix(),
             Wal::kNoPreallocation);
     ASSERT_EQ(wal.Scan().status, WalScanResult::Status::kOk);
-    std::map<EpochNumber, LogRecords> buckets;
-    buckets[1] = MakeRecords(1, "k1");
-    buckets[2] = MakeRecords(2, "k2");
+    std::map<EpochNumber, PackedLogRecords> buckets;
+    buckets[1] = MakePacked(1, "k1");
+    buckets[2] = MakePacked(2, "k2");
     ASSERT_TRUE(wal.AppendGroup(buckets, 2).ok);
     ASSERT_EQ(FileSize(), wal.write_offset());
   }
@@ -746,8 +758,8 @@ TEST_F(WalFrameTest, AGrownLogIsAdoptedWithoutLosingFrames) {
   EXPECT_EQ(wal.write_offset(), grown_end);
   EXPECT_EQ(FileSize(), static_cast<off_t>(kCapacity));
 
-  std::map<EpochNumber, LogRecords> buckets;
-  buckets[3] = MakeRecords(3, "k3");
+  std::map<EpochNumber, PackedLogRecords> buckets;
+  buckets[3] = MakePacked(3, "k3");
   ASSERT_TRUE(wal.AppendGroup(buckets, 3).ok);
   EXPECT_EQ(FileSize(), static_cast<off_t>(kCapacity));
 }
@@ -781,8 +793,8 @@ TEST_F(WalFrameTest, AnInterruptedReservationIsCompletedOnTheNextStart) {
     Wal wal(work_dir_, helios::storage::wal::WalIo::Posix(),
             Wal::kNoPreallocation);
     ASSERT_EQ(wal.Scan().status, WalScanResult::Status::kOk);
-    std::map<EpochNumber, LogRecords> buckets;
-    buckets[1] = MakeRecords(1, "k1");
+    std::map<EpochNumber, PackedLogRecords> buckets;
+    buckets[1] = MakePacked(1, "k1");
     ASSERT_TRUE(wal.AppendGroup(buckets, 1).ok);
   }
   const off_t log_end = FileSize();
@@ -827,8 +839,8 @@ TEST_F(WalFrameTest, ACapacityOfOneByteReservesPerGroup) {
   ASSERT_EQ(wal.Scan().status, WalScanResult::Status::kOk);
 
   for (EpochNumber epoch = 1; epoch <= 3; ++epoch) {
-    std::map<EpochNumber, LogRecords> buckets;
-    buckets[epoch] = MakeRecords(epoch, "k" + std::to_string(epoch));
+    std::map<EpochNumber, PackedLogRecords> buckets;
+    buckets[epoch] = MakePacked(epoch, "k" + std::to_string(epoch));
     ASSERT_TRUE(wal.AppendGroup(buckets, epoch).ok);
     EXPECT_EQ(FileSize(), wal.write_offset());
   }
@@ -850,9 +862,9 @@ TEST_F(WalFrameTest, OutgrowingCapacityExtendsAndIsCounted) {
   ASSERT_EQ(FileSize(), static_cast<off_t>(kTinyCapacity));
 
   for (EpochNumber epoch = 1; epoch <= 60; ++epoch) {
-    std::map<EpochNumber, LogRecords> buckets;
+    std::map<EpochNumber, PackedLogRecords> buckets;
     buckets[epoch] =
-        MakeRecords(epoch, std::string(200, 'x') + std::to_string(epoch));
+        MakePacked(epoch, std::string(200, 'x') + std::to_string(epoch));
     ASSERT_TRUE(wal.AppendGroup(buckets, epoch).ok);
   }
   ASSERT_GT(wal.write_offset(), static_cast<off_t>(kTinyCapacity));
@@ -885,9 +897,9 @@ TEST_F(WalFrameTest, ALegacyLogLargerThanCapacityIsPreserved) {
             Wal::kNoPreallocation);
     ASSERT_EQ(wal.Scan().status, WalScanResult::Status::kOk);
     for (EpochNumber epoch = 1; epoch <= 40; ++epoch) {
-      std::map<EpochNumber, LogRecords> buckets;
+      std::map<EpochNumber, PackedLogRecords> buckets;
       buckets[epoch] =
-          MakeRecords(epoch, std::string(200, 'x') + std::to_string(epoch));
+          MakePacked(epoch, std::string(200, 'x') + std::to_string(epoch));
       ASSERT_TRUE(wal.AppendGroup(buckets, epoch).ok);
     }
     ASSERT_GT(wal.write_offset(), static_cast<off_t>(kTinyCapacity));
@@ -912,8 +924,8 @@ TEST_F(WalFrameTest, WithoutPreallocationTheFileTracksTheLog) {
   EXPECT_EQ(FileSize(), 0);
 
   for (EpochNumber epoch = 1; epoch <= 3; ++epoch) {
-    std::map<EpochNumber, LogRecords> buckets;
-    buckets[epoch] = MakeRecords(epoch, "k" + std::to_string(epoch));
+    std::map<EpochNumber, PackedLogRecords> buckets;
+    buckets[epoch] = MakePacked(epoch, "k" + std::to_string(epoch));
     ASSERT_TRUE(wal.AppendGroup(buckets, epoch).ok);
     EXPECT_EQ(FileSize(), wal.write_offset());
   }
@@ -963,8 +975,8 @@ TEST_F(WalFrameTest, EmptyGroupNeitherWritesNorSyncs) {
 
   Wal wal(work_dir_, io, kCapacity);
   ASSERT_EQ(wal.Scan().status, WalScanResult::Status::kOk);
-  std::map<EpochNumber, LogRecords> buckets;
-  buckets[5] = MakeRecords(5, "k5");
+  std::map<EpochNumber, PackedLogRecords> buckets;
+  buckets[5] = MakePacked(5, "k5");
   // Target below every bucket: nothing is eligible.
   const auto result = wal.AppendGroup(buckets, 4);
   EXPECT_TRUE(result.ok);
@@ -1123,14 +1135,14 @@ TEST_F(WalFrameTest, InjectedFdatasyncFailsAfterTheAllowedCalls) {
 
   Wal wal(work_dir_, io, kCapacity);
   ASSERT_EQ(wal.Scan().status, WalScanResult::Status::kOk);
-  std::map<EpochNumber, LogRecords> buckets;
-  buckets[1] = MakeRecords(1, "k1");
+  std::map<EpochNumber, PackedLogRecords> buckets;
+  buckets[1] = MakePacked(1, "k1");
   ASSERT_TRUE(wal.AppendGroup(buckets, 1).ok);
   buckets.clear();
-  buckets[2] = MakeRecords(2, "k2");
+  buckets[2] = MakePacked(2, "k2");
   ASSERT_TRUE(wal.AppendGroup(buckets, 2).ok);
   buckets.clear();
-  buckets[3] = MakeRecords(3, "k3");
+  buckets[3] = MakePacked(3, "k3");
   const auto result = wal.AppendGroup(buckets, 3);
   EXPECT_FALSE(result.ok);
   EXPECT_EQ(result.error_number, EIO);

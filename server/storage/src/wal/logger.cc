@@ -263,7 +263,7 @@ Logger::Logger(const Config &config, WalIo io)
 
 Logger::~Logger() { Stop(); }
 
-void Logger::Enqueue(LogRecord record) {
+void Logger::Enqueue(PackedLogRecord record) {
   // Append to this thread's buffer; the logger thread collects it later.
   auto *buffer = buffers_.Get();
   std::lock_guard<std::mutex> lock(buffer->mutex);
@@ -487,7 +487,7 @@ WalAppendResult Logger::FlushThrough(EpochNumber target) {
 
   // Take each producer's records without holding its lock during file I/O.
   buffers_.ForEach([&](LogBuffer *buffer) {
-    LogRecords swapped;
+    PackedLogRecords swapped;
     {
       std::lock_guard<std::mutex> lock(buffer->mutex);
       swapped.swap(buffer->records);
