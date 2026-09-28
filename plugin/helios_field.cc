@@ -6,19 +6,6 @@
  * HeliosField method definitions
  */
 
-std::string HeliosField::convert_numeric_to_bytes(const size_t num) const {
-  // Bytes the value needs, one base-256 digit at a time.
-  size_t byteSizeOfNum = 0;
-  for (size_t n = num; n > 0; n /= 256) byteSizeOfNum++;
-  std::string byteSequence;
-  byteSequence.reserve(byteSizeOfNum);
-  // Pack in little-endian order to match convert_bytes_to_numeric().
-  for (size_t i = 0; i < byteSizeOfNum; i++) {
-    byteSequence.push_back(static_cast<char>((num >> (CHAR_BIT * i)) & 0xFF));
-  }
-  return byteSequence;
-}
-
 size_t HeliosField::convert_bytes_to_numeric(const std::byte *const bytes,
                                              const size_t length) const {
   size_t n = 0;
@@ -28,21 +15,20 @@ size_t HeliosField::convert_bytes_to_numeric(const std::byte *const bytes,
   return n;
 }
 
-std::string HeliosField::get_helios_field() const {
-  return std::move(byteSize + valueLength + value);
-}
-
-void HeliosField::set_helios_field(const char *const src, const size_t length) {
+void HeliosField::append_field(std::string &out, const char *src,
+                               size_t length) {
   if (length == 0) {
-    byteSize = noValue;
-    valueLength.clear();
-    value.clear();
+    out.push_back(noValue);
     return;
   }
   assert(length <= maxValueLength);
-  valueLength = convert_numeric_to_bytes(length);
-  byteSize = static_cast<char>(valueLength.size());
-  value.assign(src, length);
+  size_t width = 1;
+  for (size_t n = length >> CHAR_BIT; n != 0; n >>= CHAR_BIT) ++width;
+  out.push_back(static_cast<char>(width));
+  for (size_t i = 0; i < width; ++i) {
+    out.push_back(static_cast<char>(length >> (CHAR_BIT * i)));
+  }
+  out.append(src, length);
 }
 
 void HeliosField::make_mysql_table_row(const std::byte *const raw_row,
@@ -55,8 +41,7 @@ void HeliosField::make_mysql_table_row(const std::byte *const raw_row,
   for (size_t offset = 0; offset < length;) {
     const auto field = raw_row + offset;
 
-    byteSize =
-        static_cast<char>(convert_bytes_to_numeric(field, sizeof(byteSize)));
+    const char byteSize = static_cast<char>(*field);
 
     if (byteSize == noValue) {
       if (offset != 0) {

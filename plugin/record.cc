@@ -8,6 +8,7 @@
 #include "my_dbug.h"
 #include "sql/field.h"
 #include "sql/sql_class.h"
+#include "sql/sql_const.h"
 #include "sql/sql_lex.h"
 #include "sql/table.h"
 
@@ -46,23 +47,22 @@ class MoveFieldOffset {
 }  // namespace
 
 void ha_helios::set_write_buffer(uchar *buf) {
-  field_pack_.set_helios_field(reinterpret_cast<const char *>(buf),
-                               table->s->null_bytes);
-  write_buffer_ = field_pack_.get_helios_field();
+  write_buffer_.clear();
+  HeliosField::append_field(write_buffer_, reinterpret_cast<const char *>(buf),
+                            table->s->null_bytes);
 
-  String attribute;
-  attribute.set_charset(&my_charset_bin);
+  StringBuffer<STRING_BUFFER_USUAL_SIZE> buffer;
+  String reference;
 
   my_bitmap_map *org_bitmap = tmp_use_all_columns(table, table->read_set);
   for (Field **field = table->field; *field; field++) {
     if ((*field)->is_nullable() && (*field)->is_null()) {
-      field_pack_.set_helios_field("", 0);
+      HeliosField::append_field(write_buffer_, "", 0);
     } else {
-      attribute.length(0);
-      (*field)->val_str(&attribute, &attribute);
-      field_pack_.set_helios_field(attribute.c_ptr(), attribute.length());
+      buffer.length(0);
+      const String *value = (*field)->val_str(&buffer, &reference);
+      HeliosField::append_field(write_buffer_, value->ptr(), value->length());
     }
-    write_buffer_ += field_pack_.get_helios_field();
   }
   tmp_restore_column_map(table->read_set, org_bitmap);
 }
