@@ -570,7 +570,6 @@ HeliosTransaction::get_matching_keys_and_values_in_range(std::string start_key,
           db_table_key, start_key, end_key, reverse_scan, row_limit,
           /*allow_truncated=*/served_truncated != nullptr)) {
     if (served_truncated != nullptr) *served_truncated = cached->truncated;
-    std::vector<std::pair<std::string, std::string>> pairs = cached->rows;
     for (size_t i = 0; i < cached->rows.size(); ++i) {
       append_base_row_read(db_table_key, cached->rows[i].first,
                            cached->row_tids[i]);
@@ -579,6 +578,7 @@ HeliosTransaction::get_matching_keys_and_values_in_range(std::string start_key,
     // this transaction's pending writes.
     append_range_read(*cached);
 
+    auto pairs = std::move(cached->rows);
     merge_pending_rows_into_range_scan(pairs, start_key, end_key, reverse_scan);
     if (row_limit > 0 && pairs.size() > row_limit) {
       pairs.resize(static_cast<size_t>(row_limit));
@@ -1183,36 +1183,36 @@ HeliosTransaction::lookup_range_scan_cache(
 void HeliosTransaction::trim_range_entry(
     RangeScanCacheEntry& entry, const std::string& start_key,
     const std::string& end_key) {
-  std::vector<std::pair<std::string, std::string>> rows;
-  std::vector<uint64_t> row_tids;
-  rows.reserve(entry.rows.size());
-  row_tids.reserve(entry.rows.size());
+  size_t count = 0;
   for (size_t i = 0; i < entry.rows.size(); ++i) {
     if (entry.rows[i].first >= start_key && entry.rows[i].first < end_key) {
-      rows.push_back(entry.rows[i]);
-      row_tids.push_back(entry.row_tids[i]);
+      if (count != i) {
+        entry.rows[count] = std::move(entry.rows[i]);
+        entry.row_tids[count] = entry.row_tids[i];
+      }
+      ++count;
     }
   }
-  entry.rows = std::move(rows);
-  entry.row_tids = std::move(row_tids);
+  entry.rows.resize(count);
+  entry.row_tids.resize(count);
 }
 
 void HeliosTransaction::trim_secondary_entry(
     SecondaryScanCacheEntry& entry, const std::string& start_key,
     const std::string& end_key) {
-  std::vector<std::string> secondary_keys;
-  std::vector<std::string> primary_keys;
-  secondary_keys.reserve(entry.secondary_keys.size());
-  primary_keys.reserve(entry.secondary_keys.size());
+  size_t count = 0;
   for (size_t i = 0; i < entry.secondary_keys.size(); ++i) {
     if (entry.secondary_keys[i] >= start_key &&
         entry.secondary_keys[i] < end_key) {
-      secondary_keys.push_back(entry.secondary_keys[i]);
-      primary_keys.push_back(entry.primary_keys[i]);
+      if (count != i) {
+        entry.secondary_keys[count] = std::move(entry.secondary_keys[i]);
+        entry.primary_keys[count] = std::move(entry.primary_keys[i]);
+      }
+      ++count;
     }
   }
-  entry.secondary_keys = std::move(secondary_keys);
-  entry.primary_keys = std::move(primary_keys);
+  entry.secondary_keys.resize(count);
+  entry.primary_keys.resize(count);
 }
 
 std::optional<HeliosTransaction::SecondaryScanCacheEntry>
