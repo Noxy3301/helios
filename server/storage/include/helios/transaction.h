@@ -112,6 +112,12 @@ class Transaction {
   Transaction &operator=(const Transaction &) = delete;
 
   /**
+   * @brief Sizes the point-read and range sets for the counts about to be
+   * fed.
+   */
+  void reserve(size_t reads, size_t ranges);
+
+  /**
    * @brief Records a point read to revalidate: the key and the word it
    * returned.
    *

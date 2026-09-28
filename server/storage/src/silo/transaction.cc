@@ -45,6 +45,11 @@ Transaction::Transaction(Database &db)
     : Transaction(db.table_dictionary_, db.epoch_framework_, db.reaper_,
                   db.logger_, *db.last_commit_tids_.Get()) {}
 
+void Transaction::reserve(size_t reads, size_t ranges) {
+  read_set_.reserve(reads);
+  range_set_.reserve(ranges);
+}
+
 void Transaction::Read(std::string_view table, std::string_view key,
                        Tidword observed) {
   read_set_.push_back({table, key, observed});
