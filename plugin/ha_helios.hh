@@ -217,6 +217,10 @@ private:
 
   std::string last_fetched_primary_key_;
 
+  // HA_BLOCK_CONST_TABLE, or 0 when external_lock() found a query block with
+  // one leaf table.
+  ulonglong block_const_{HA_BLOCK_CONST_TABLE};
+
   // Duplicate-key contract for the running statement, from extra(). REPLACE
   // may overwrite the row it finds; IGNORE and ON DUPLICATE KEY UPDATE need
   // the duplicate reported at the row, so write_row reads the key first.
@@ -303,11 +307,8 @@ public:
     This is a list of flags that indicate what functionality the storage engine
     implements. The current table flags are documented in handler.h
   */
-  // HA_BLOCK_CONST_TABLE keeps equality lookups out of JOIN::optimize, where
-  // no AccessPath exists for the read-plan compiler, and demotes them to
-  // JT_EQ_REF.
   ulonglong table_flags() const override {
-    return HA_BINLOG_ROW_CAPABLE | HA_BLOCK_CONST_TABLE;
+    return HA_BINLOG_ROW_CAPABLE | block_const_;
   }
 
   /** @brief
