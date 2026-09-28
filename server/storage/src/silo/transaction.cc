@@ -88,15 +88,14 @@ bool Transaction::Write(std::string_view table_name, std::string_view key,
 
   auto &index = table->GetPrimaryIndex();
   DataItem *item = index.GetOrInsert(key);
+  const std::string_view bytes =
+      op == RowOp::kDelete ? std::string_view() : row_bytes;
   auto entry = write_set_.find(item);
   if (entry == write_set_.end()) {
-    write_set_.emplace(item, WriteEntry{table,
-                                        {},
-                                        key,
-                                        &index,
-                                        false,
-                                        RowUpdate{std::move(row), store, op,
-                                                  op == RowOp::kInsert}});
+    RowUpdate row_update{std::move(row), store, op, op == RowOp::kInsert,
+                         bytes};
+    write_set_.emplace(
+        item, WriteEntry{table, {}, key, &index, false, std::move(row_update)});
     return true;
   }
   // The record already has a pending update; the last value wins, and the
@@ -108,6 +107,7 @@ bool Transaction::Write(std::string_view table_name, std::string_view key,
   }
   update.row = std::move(row);
   update.op = op;
+  update.bytes = bytes;
   return true;
 }
 
@@ -471,10 +471,11 @@ void Transaction::Apply(DataItem &item, const WriteEntry &entry,
 void Transaction::AppendLog(wal::LogRecord &record, const DataItem &item,
                             const WriteEntry &entry, Tidword commit_tid) {
   const Tidword published = PublishedTid(commit_tid, item);
-  if (std::holds_alternative<RowUpdate>(entry.update)) {
+  if (const auto *row = std::get_if<RowUpdate>(&entry.update)) {
     wal::LogRecord::Write write;
     write.key = entry.key;
-    write.buffer = item.CopyValue();
+    // The bytes the install unpacked; a delete logs an empty value.
+    write.buffer = std::string(row->bytes);
     write.transaction_id = published;
     write.table_name = entry.table->Name();
     record.writes.emplace_back(std::move(write));

@@ -221,6 +221,9 @@ class Transaction {
     pax::PaxTable *store;
     RowOp op;
     bool check_absent;  ///< The record's first operation was INSERT.
+    /// The row the log records, as the request sent it, which the caller
+    /// keeps alive until Commit returns. Empty for DELETE.
+    std::string_view bytes;
   };
 
   struct IndexUpdate {
@@ -305,8 +308,8 @@ class Transaction {
   static void Apply(DataItem &item, const WriteEntry &entry, EpochNumber epoch);
 
   /**
-   * @brief Copies the installed row, or the ordered index changes, into the
-   * log record.
+   * @brief Copies the row the request sent, or the ordered index changes,
+   * into the log record.
    *
    * @pre Apply completed and the index record is still locked.
    */
