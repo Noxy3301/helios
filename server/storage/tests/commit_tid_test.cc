@@ -261,6 +261,39 @@ TEST_F(CommitTidTest, FinalRowKeepsTheFirstInsertRequirement) {
   EXPECT_EQ(TestHelper::Row("final"), item->CopyValue());
 }
 
+TEST_F(CommitTidTest, RacingInsertsOfOneKeyLeaveOneRecord) {
+  const std::string bytes = TestHelper::Row("value");
+  std::atomic<int> ready{0};
+  bool committed[2] = {};
+  std::string reasons[2];
+  Tidword last_tids[2];
+  std::vector<std::thread> threads;
+  for (int i = 0; i < 2; ++i) {
+    threads.emplace_back([&, i] {
+      silo::Transaction tx(tables_, epoch_, reaper_, *logger_, last_tids[i]);
+      ready.fetch_add(1);
+      while (ready.load() != 2) std::this_thread::yield();
+      committed[i] =
+          tx.Write(kTable, "key", bytes, RowOp::kInsert, reasons[i]) &&
+          tx.Commit(CommitDurability::kAsync, reasons[i]);
+      index::release_thread_epoch();
+    });
+  }
+  for (auto &thread : threads) thread.join();
+
+  // Both writes find one record; the later lock sees the first row there.
+  ASSERT_NE(committed[0], committed[1]);
+  EXPECT_EQ(kDuplicatePrimaryKeyAbortReason, reasons[committed[0] ? 1 : 0]);
+  size_t records = 0;
+  tables_.GetTable(kTable)->GetPrimaryIndex().Scan(
+      "", std::nullopt, [&](std::string_view, DataItem &item) {
+        EXPECT_TRUE(item.IsLive());
+        ++records;
+        return false;
+      });
+  EXPECT_EQ(1u, records);
+}
+
 TEST_F(CommitTidTest, RepeatedRowWritesLogOnlyTheFinalValue) {
   ASSERT_TRUE(Commit({}, {{kTable, "a", "first"}, {kTable, "b", "second"},
                          {kTable, "a", "", RowOp::kDelete},
@@ -897,6 +930,28 @@ TEST_F(CommitTidTest, ReadThenWriteOfOneKeyValidatesThroughOwnLock) {
   EXPECT_EQ(Version(10, 21), item->transaction_id.load());
 }
 
+TEST_F(CommitTidTest, WriteTargetReplacedAfterTheWriteAbortsAtItsLock) {
+  SeedRow("k", Version(10, 20));
+  const std::string row = TestHelper::Row("next");
+  silo::Transaction tx(tables_, epoch_, reaper_, *logger_, last_tid_);
+  tx.Read(kTable, "k", Version(10, 20));
+  ASSERT_TRUE(tx.Write(kTable, "k", row, RowOp::kUpdate, reason_)) << reason_;
+
+  // Another thread deletes the row, purges its record and inserts the key
+  // again; this thread's epoch keeps the old record allocated.
+  std::thread other([&] {
+    ASSERT_TRUE(Commit({}, {{kTable, "k", "", RowOp::kDelete}})) << reason_;
+    reaper_.Purge(10);
+    ASSERT_TRUE(Commit({}, {{kTable, "k", "again", RowOp::kInsert}}))
+        << reason_;
+  });
+  other.join();
+
+  EXPECT_FALSE(tx.Commit(CommitDurability::kAsync, reason_));
+  EXPECT_EQ("write_target_detached", reason_);
+  index::release_thread_epoch();
+}
+
 TEST_F(CommitTidTest, RangeRevalidationAllowsOwnLockOnPrimaryAndSecondary) {
   SeedRow("k", Version(10, 10));
   auto *index = tables_.GetTable(kTable)->GetSecondaryIndex("idx");
@@ -1043,7 +1098,7 @@ TEST_F(CommitTidTest,
 }
 
 TEST(TidWordTest, BitPositionsMatchLayout) {
-  EXPECT_EQ(4u, Tidword::Absent().obj);
+  EXPECT_EQ(6u, Tidword::Absent().obj);
   EXPECT_EQ((10ull << 32) | (8u << 3) | 2u, Version(10, 8).obj);
 }
 

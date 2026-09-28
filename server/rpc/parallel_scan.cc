@@ -9,6 +9,7 @@
 #include <vector>
 
 #include "key_pack.hh"
+#include "server/server_config.hh"
 
 namespace {
 
@@ -75,8 +76,8 @@ bool parallel_primary_pax_row_ref_scan(
     std::vector<RefChunkOut> chunks;
     bool ran_parallel = false;
     if (step.scan_limit() == 0 && !step.reverse_scan()) {
-        const unsigned nproc = std::thread::hardware_concurrency();
-        const unsigned max_threads = std::min<unsigned>(nproc ? nproc : 4, 8);
+        const unsigned max_threads =
+            std::min<unsigned>(hardware_threads ? hardware_threads : 4, 8);
         const std::vector<uint32_t> key_only_columns;
         auto first = db->Scan(step.table_name(), start_key, end_key, 1, false,
                               &key_only_columns);

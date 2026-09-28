@@ -147,6 +147,7 @@ class FlushTrace {
     current_group_.collect_end = Now();
   }
 
+  // Times the framing of a group; each commit packs its own record.
   void GroupPack(int64_t begin, int64_t end, uint64_t bytes, uint32_t epochs) {
     if (!enabled_) return;
     current_group_.pack_begin = begin;

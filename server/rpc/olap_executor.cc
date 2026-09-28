@@ -530,8 +530,6 @@ unique_ptr<GlobalTableFunctionState> pax_init_global(
     }
   }
 
-  const unsigned hardware_threads =
-      std::max(1u, std::thread::hardware_concurrency());
   global_state->threads = static_cast<idx_t>(std::max<size_t>(
       1, std::min<size_t>(hardware_threads,
                           std::max<size_t>(1, table_view.group_count))));
@@ -1306,7 +1304,7 @@ duckdb::DBConfig* apply_limits(duckdb::DBConfig* config) {
   config->options.maximum_threads =
       olap_threads != 0
           ? olap_threads
-          : std::max<idx_t>(1, std::thread::hardware_concurrency() / 4);
+          : std::max<idx_t>(1, hardware_threads / 4);
   if (olap_memory != 0) config->options.maximum_memory = olap_memory;
   return config;
 }

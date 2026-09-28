@@ -59,12 +59,13 @@ void Reaper::Purge(EpochNumber reclamation_epoch) {
         continue;
       }
 
-      // Mark removal so readers holding the old pointer see the change.
+      // Clear latest so a reader or writer holding the old pointer sees the
+      // removal.
       Tidword retired = tombstone.delete_commit_tid;
       retired.latest = false;
       if (!tombstone.index->Purge(tombstone.key, *item, retired)) {
-        // A failed purge still leaves this item locked; release it.
-        item->transaction_id.store(tombstone.delete_commit_tid);
+        // A failed purge leaves this record locked and out of the index.
+        item->transaction_id.store(retired);
       }
     }
   }

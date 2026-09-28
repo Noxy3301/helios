@@ -89,7 +89,7 @@ class Logger {
    * @brief Buffers one committed transaction's record.
    * @note The caller passes only records that hold writes.
    */
-  void Enqueue(LogRecord record);
+  void Enqueue(PackedLogRecord record);
 
   /**
    * @brief Scans the log and zeroes the tail at its first invalid frame.
@@ -180,7 +180,7 @@ class Logger {
  private:
   struct LogBuffer {
     std::mutex mutex;
-    LogRecords records;
+    PackedLogRecords records;
   };
 
   const std::string work_dir_;
@@ -191,7 +191,7 @@ class Logger {
   ThreadKeyStorage<LogBuffer> buffers_;
   // Owned by the logger thread; records beyond the requested flush epoch stay
   // here.
-  std::map<EpochNumber, LogRecords> pending_records_;
+  std::map<EpochNumber, PackedLogRecords> pending_records_;
 
   // Protects the flush request and the request to stop the logger thread.
   std::mutex work_mutex_;

@@ -8,11 +8,13 @@
 #define HELIOS_STORAGE_SRC_WAL_WAL_H
 
 #include <sys/types.h>
+#include <sys/uio.h>
 
 #include <cstdint>
 #include <functional>
 #include <map>
 #include <string>
+#include <vector>
 
 #include "util/epoch.h"
 #include "wal/log_record.h"
@@ -54,7 +56,7 @@ struct WalAppendResult {
 /**
  * @brief Seam for the syscalls the append and capacity paths use, letting a
  * test inject a write, sync, initialisation or read failure.
- * @details `pwrite` and `fdatasync` carry a group; `initialise_pwrite`
+ * @details `pwritev` and `fdatasync` carry a group; `initialise_pwrite`
  * carries the zeroes that reserve capacity, kept separate so a capacity
  * failure cannot consume an injection aimed at a group; `pread` is what
  * the scan and the repair-range check read through.
@@ -67,7 +69,7 @@ struct WalAppendResult {
  * fit in a long, stops startup.
  */
 struct WalIo {
-  std::function<ssize_t(int, const void *, size_t, off_t)> pwrite;
+  std::function<ssize_t(int, const iovec *, int, off_t)> pwritev;
   std::function<int(int)> fdatasync;
   std::function<ssize_t(int, const void *, size_t, off_t)> initialise_pwrite;
   std::function<ssize_t(int, void *, size_t, off_t)> pread;
@@ -144,8 +146,8 @@ class Wal {
   /**
    * @brief Appends one frame per bucket whose epoch is at or below `target`,
    * in epoch order, as one group write followed by one fdatasync.
-   * @param[in] buckets Records grouped by their commit epoch. Buckets above
-   * `target` are ignored and stay the caller's to carry forward.
+   * @param[in] buckets Packed records grouped by their commit epoch. Buckets
+   * above `target` are ignored and stay the caller's to carry forward.
    * @param[in] target The highest epoch this call may write.
    * @return Failure is returned without having advanced anything the caller
    * may publish. A bucket that would produce a frame the scan rejects
@@ -157,8 +159,9 @@ class Wal {
    * left the end of the log unknown, fail-stops the process rather than
    * returning: there is nothing trustworthy to append at.
    */
-  WalAppendResult AppendGroup(const std::map<EpochNumber, LogRecords> &buckets,
-                              EpochNumber target);
+  WalAppendResult AppendGroup(
+      const std::map<EpochNumber, PackedLogRecords> &buckets,
+      EpochNumber target);
 
   const std::string &path() const { return path_; }
 
@@ -190,7 +193,7 @@ class Wal {
                        int &error) const;
   bool EnsureCapacityFor(off_t end_of_log, size_t group_size, int &error);
   bool WriteZeroesAndSync(off_t from, off_t to, int &error);
-  bool WriteAllAt(const uint8_t *data, size_t size, off_t offset, int &error);
+  bool WriteAllAt(std::vector<iovec> &iov, off_t offset, int &error);
 
   /**
    * @brief Reads exactly size bytes from the WAL at offset into out.

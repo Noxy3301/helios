@@ -37,7 +37,7 @@ struct Tidword {
     uint64_t obj;
     struct {
       bool lock : 1;      // Set while a committer holds the record.
-      bool latest : 1;    // Set on commit; cleared on physical removal.
+      bool latest : 1;    // Set while the index holds the record.
       bool absent : 1;    // The record holds no row (or no primary key).
       uint64_t tid : 29;  // Tid within the epoch.
       uint64_t epoch : 32;
@@ -50,6 +50,7 @@ struct Tidword {
   // A missing key and a newly allocated record have the same absent word.
   static Tidword Absent() {
     Tidword tid;
+    tid.latest = true;
     tid.absent = true;
     return tid;
   }

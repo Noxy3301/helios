@@ -30,6 +30,31 @@ Tidword PublishedTid(Tidword commit_tid, const DataItem &item) {
   return commit_tid;
 }
 
+// Upper bounds on the msgpack bytes a record adds around its strings: the
+// record, epoch and write-list headers, and per write its array header, five
+// string headers, the TID, index type, key list and op.
+constexpr size_t kLogRecordFraming = 11;
+constexpr size_t kLogWriteFraming = 44;
+
+// Packs one write as LogRecord::Write's MSGPACK_DEFINE does. A commit logs no
+// primary-key list, which packs as an empty array.
+void pack_write(msgpack::packer<wal::PackedLogRecord> &pk, std::string_view key,
+                std::string_view buffer, Tidword tid,
+                std::string_view table_name, std::string_view index_name,
+                uint32_t index_type, wal::SecondaryIndexOp op,
+                std::string_view primary_key) {
+  pk.pack_array(9);
+  pk.pack(key);
+  pk.pack(buffer);
+  pk.pack(tid);
+  pk.pack(table_name);
+  pk.pack(index_name);
+  pk.pack(index_type);
+  pk.pack_array(0);
+  pk.pack(op);
+  pk.pack(primary_key);
+}
+
 }  // namespace
 
 Transaction::Transaction(TableDictionary &tables, epoch::Framework &epoch,
@@ -44,6 +69,11 @@ Transaction::Transaction(TableDictionary &tables, epoch::Framework &epoch,
 Transaction::Transaction(Database &db)
     : Transaction(db.table_dictionary_, db.epoch_framework_, db.reaper_,
                   db.logger_, *db.last_commit_tids_.Get()) {}
+
+void Transaction::reserve(size_t reads, size_t ranges) {
+  read_set_.reserve(reads);
+  range_set_.reserve(ranges);
+}
 
 void Transaction::Read(std::string_view table, std::string_view key,
                        Tidword observed) {
@@ -82,16 +112,17 @@ bool Transaction::Write(std::string_view table_name, std::string_view key,
   }
 
   auto &index = table->GetPrimaryIndex();
-  DataItem *item = index.GetOrInsert(key);
+  // An inserted key is usually new.
+  const bool expect_new = op == RowOp::kInsert;
+  DataItem *item = index.GetOrInsert(key, expect_new);
+  const std::string_view bytes =
+      op == RowOp::kDelete ? std::string_view() : row_bytes;
   auto entry = write_set_.find(item);
   if (entry == write_set_.end()) {
-    write_set_.emplace(item, WriteEntry{table,
-                                        {},
-                                        key,
-                                        &index,
-                                        false,
-                                        RowUpdate{std::move(row), store, op,
-                                                  op == RowOp::kInsert}});
+    RowUpdate row_update{std::move(row), store, op, op == RowOp::kInsert,
+                         bytes};
+    write_set_.emplace(
+        item, WriteEntry{table, {}, key, &index, false, std::move(row_update)});
     return true;
   }
   // The record already has a pending update; the last value wins, and the
@@ -103,6 +134,7 @@ bool Transaction::Write(std::string_view table_name, std::string_view key,
   }
   update.row = std::move(row);
   update.op = op;
+  update.bytes = bytes;
   return true;
 }
 
@@ -127,7 +159,10 @@ bool Transaction::IndexWrite(std::string_view table_name,
     reason = "secondary_index_missing";
     return false;
   }
-  DataItem *item = index->tree.GetOrInsert(secondary_key);
+  // A UNIQUE key being added is usually new; a non-unique one usually exists.
+  const bool expect_new =
+      !remove && index->constraint == IndexConstraint::kUnique;
+  DataItem *item = index->tree.GetOrInsert(secondary_key, expect_new);
   auto entry =
       write_set_
           .try_emplace(
@@ -207,10 +242,35 @@ bool Transaction::Commit(CommitDurability durability, std::string &reason) {
     }
   }
 
-  // Phase 3: install each record, copy its log, then publish and unlock it.
+  // Phase 3: install each record, pack its log, then publish and unlock it.
   last_commit_tid_ = commit_tid;
-  wal::LogRecord record;
+  // Count the logged writes and bound their packed size, so the record packs
+  // without regrowing.
+  size_t log_writes = 0;
+  size_t log_bytes = kLogRecordFraming;
+  for (const auto &[item, entry] : write_set_) {
+    const size_t names = kLogWriteFraming + entry.key.size() +
+                         entry.table->Name().size() + entry.index_name.size();
+    if (const auto *row = std::get_if<RowUpdate>(&entry.update)) {
+      ++log_writes;
+      log_bytes += names + row->bytes.size();
+      continue;
+    }
+    for (const auto &delta : std::get<IndexUpdate>(entry.update).deltas) {
+      ++log_writes;
+      log_bytes += names + delta.primary_key.size();
+    }
+  }
+  // The record packs as LogRecord's MSGPACK_DEFINE does: [epoch, [write...]].
+  wal::PackedLogRecord record;
   record.epoch = commit_tid.epoch;
+  msgpack::packer<wal::PackedLogRecord> pk(record);
+  if (log_writes != 0) {
+    record.bytes.reserve(log_bytes);
+    pk.pack_array(2);
+    pk.pack(record.epoch);
+    pk.pack_array(static_cast<uint32_t>(log_writes));
+  }
   bool row_applied = false;
   for (auto &[item, entry] : write_set_) {
     const bool is_row = std::holds_alternative<RowUpdate>(entry.update);
@@ -218,13 +278,13 @@ bool Transaction::Commit(CommitDurability durability, std::string &reason) {
       HELIOS_DEBUG_SYNC("silo_commit.between_row_installs");
     Apply(*item, entry, commit_tid.epoch);
     // Once unlocked, another writer may replace this record immediately.
-    AppendLog(record, *item, entry, commit_tid);
+    AppendLog(pk, *item, entry, commit_tid);
     Publish(*item, entry, commit_tid);
     row_applied = row_applied || is_row;
   }
 
   // Buffer the record before leaving, so a flush cannot pass this commit.
-  const bool logged = !record.writes.empty();
+  const bool logged = log_writes != 0;
   if (logged) logger_.Enqueue(std::move(record));
   epoch_.Leave();
   // Leave before waiting, so this worker does not hold back epoch advancement.
@@ -251,8 +311,8 @@ bool Transaction::Lock(DataItem &item, WriteEntry &entry, Tidword &max_tid,
     if (!item.transaction_id.compare_exchange_weak(current, locked)) continue;
     entry.owns_lock = true;
     max_tid = std::max(max_tid, current);
-    // A purge may detach the record while we wait for its lock.
-    if (entry.index->Get(entry.key) != &item) {
+    // The reaper clears latest when it unlinks the record.
+    if (!current.latest) {
       reason = "write_target_detached";
       return false;
     }
@@ -463,31 +523,24 @@ void Transaction::Apply(DataItem &item, const WriteEntry &entry,
                     std::get<IndexUpdate>(entry.update).primary_keys);
 }
 
-void Transaction::AppendLog(wal::LogRecord &record, const DataItem &item,
-                            const WriteEntry &entry, Tidword commit_tid) {
+void Transaction::AppendLog(msgpack::packer<wal::PackedLogRecord> &pk,
+                            const DataItem &item, const WriteEntry &entry,
+                            Tidword commit_tid) {
   const Tidword published = PublishedTid(commit_tid, item);
-  if (std::holds_alternative<RowUpdate>(entry.update)) {
-    wal::LogRecord::Write write;
-    write.key = entry.key;
-    write.buffer = item.CopyValue();
-    write.transaction_id = published;
-    write.table_name = entry.table->Name();
-    record.writes.emplace_back(std::move(write));
+  const std::string &table_name = entry.table->Name();
+  if (const auto *row = std::get_if<RowUpdate>(&entry.update)) {
+    // The bytes the install unpacked; a delete logs an empty value.
+    pack_write(pk, entry.key, row->bytes, published, table_name, {}, 0,
+               wal::SecondaryIndexOp::kNone, {});
     return;
   }
 
   // Preserve all changes in order, including repeated primary keys.
   const auto &index = std::get<IndexUpdate>(entry.update);
   for (const auto &delta : index.deltas) {
-    wal::LogRecord::Write write;
-    write.key = entry.key;
-    write.transaction_id = published;
-    write.table_name = entry.table->Name();
-    write.index_name = entry.index_name;
-    write.index_type = static_cast<uint32_t>(index.constraint);
-    write.secondary_op = delta.op;
-    write.secondary_primary_key = delta.primary_key;
-    record.writes.emplace_back(std::move(write));
+    pack_write(pk, entry.key, {}, published, table_name, entry.index_name,
+               static_cast<uint32_t>(index.constraint), delta.op,
+               delta.primary_key);
   }
 }
 

@@ -112,6 +112,12 @@ class Transaction {
   Transaction &operator=(const Transaction &) = delete;
 
   /**
+   * @brief Sizes the point-read and range sets for the counts about to be
+   * fed.
+   */
+  void reserve(size_t reads, size_t ranges);
+
+  /**
    * @brief Records a point read to revalidate: the key and the word it
    * returned.
    *
@@ -215,6 +221,9 @@ class Transaction {
     pax::PaxTable *store;
     RowOp op;
     bool check_absent;  ///< The record's first operation was INSERT.
+    /// The row the log records, as the request sent it, which the caller
+    /// keeps alive until Commit returns. Empty for DELETE.
+    std::string_view bytes;
   };
 
   struct IndexUpdate {
@@ -255,8 +264,10 @@ class Transaction {
   bool OwnsLock(DataItem *item) const;
 
   /**
-   * @brief Locks the record and checks that its index still points to it.
+   * @brief Locks the record and checks that it is still the latest.
    *
+   * @details The reaper clears the latest bit when it unlinks a record, so a
+   * locked record with the bit set is the one its index holds for the key.
    * @param[in,out] max_tid Raised to the word observed under the lock.
    * @return false with reason set on detachment; the lock is held and
    * UnlockAll releases it.
@@ -297,13 +308,14 @@ class Transaction {
   static void Apply(DataItem &item, const WriteEntry &entry, EpochNumber epoch);
 
   /**
-   * @brief Copies the installed row, or the ordered index changes, into the
-   * log record.
+   * @brief Packs the row the request sent, or the ordered index changes,
+   * into the log record as LogRecord::Write elements.
    *
    * @pre Apply completed and the index record is still locked.
    */
-  static void AppendLog(wal::LogRecord &record, const DataItem &item,
-                        const WriteEntry &entry, Tidword commit_tid);
+  static void AppendLog(msgpack::packer<wal::PackedLogRecord> &pk,
+                        const DataItem &item, const WriteEntry &entry,
+                        Tidword commit_tid);
 
   /**
    * @brief Publishes the TID, which unlocks the record, and queues it when it

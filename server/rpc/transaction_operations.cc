@@ -91,6 +91,7 @@ void HeliosRpc::handleTxCommit(
     Helios::Protocol::TxCommit::Response* response) {
     auto& db = *db_manager_->get_database();
     helios::storage::silo::Transaction tx(db);
+    tx.reserve(request.reads_size(), request.range_reads_size());
     for (const auto& read : request.reads()) {
         tx.Read(read.table_name(), read.key(), helios::storage::Tidword(read.tid()));
     }
