@@ -309,7 +309,7 @@ int ha_helios::external_lock(THD *thd, int lock_type) {
   HeliosTransaction *tx = get_transaction(thd);
   if (tx != nullptr) {
     const LEX_CSTRING &q = thd->query();
-    if (q.str != nullptr && q.length > 0) {
+    if (srv_rpc_trace && q.str != nullptr && q.length > 0) {
       tx->on_stmt_boundary(std::string(q.str, q.length));
     }
   }
