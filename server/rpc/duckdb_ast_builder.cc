@@ -86,6 +86,9 @@ bool ResolveType(Builder& b, const Resolved::ResolvedType& type,
         case Resolved::INT64:
             *out = LogicalType::BIGINT;
             return true;
+        case Resolved::DOUBLE:
+            *out = LogicalType::DOUBLE;
+            return true;
         case Resolved::DECIMAL: {
             const uint32_t width = type.precision();
             const uint32_t scale = type.scale();
@@ -127,6 +130,8 @@ bool LiteralMatchesType(Resolved::Literal::ValueCase value,
             return kind == Resolved::INT64;
         case Resolved::Literal::kDecimalValue:
             return kind == Resolved::DECIMAL;
+        case Resolved::Literal::kDoubleValue:
+            return kind == Resolved::DOUBLE;
         case Resolved::Literal::kStringValue:
             return kind == Resolved::VARCHAR;
         case Resolved::Literal::kDateValue:
@@ -153,6 +158,9 @@ unique_ptr<ParsedExpression> BuildLiteral(Builder& b,
         case Resolved::Literal::kIntValue:
             return make_uniq<duckdb::ConstantExpression>(
                 Value::BIGINT(lit.int_value()));
+        case Resolved::Literal::kDoubleValue:
+            return make_uniq<duckdb::ConstantExpression>(
+                Value::DOUBLE(lit.double_value()));
         case Resolved::Literal::kDecimalValue: {
             const auto& dec = lit.decimal_value();
             uint32_t width = expr.result_type().precision();
@@ -566,14 +574,22 @@ unique_ptr<ParsedExpression> BuildExpr(Builder& b, const Resolved::Expr& expr) {
             if (left == nullptr) return nullptr;
             auto right = BuildExpr(b, arith.right());
             if (right == nullptr) return nullptr;
+            if (arith.result_as().kind() == Resolved::DOUBLE) {
+                left = CastTo(b, arith.left(), arith.result_as(),
+                              std::move(left));
+                right = CastTo(b, arith.right(), arith.result_as(),
+                               std::move(right));
+                if (left == nullptr || right == nullptr) return nullptr;
+            }
             duckdb::vector<unique_ptr<ParsedExpression>> children;
             children.push_back(std::move(left));
             children.push_back(std::move(right));
-            // MySQL's x/0 is NULL; DuckDB's "/" divides through. NULLIF
-            // makes the divisor NULL and the division follow.
+            // MySQL's x/0 and x%0 are NULL; DuckDB's "/" divides through and
+            // its DOUBLE "%" gives NaN. NULLIF makes the divisor NULL.
             // DuckDB runs "/" through DOUBLE, so quotients lose exactness
             // past 2^53; the profile's monetary values stay well below.
-            if (arith.op() == Resolved::Arithmetic::DIV) {
+            if (arith.op() == Resolved::Arithmetic::DIV ||
+                arith.op() == Resolved::Arithmetic::MOD) {
                 duckdb::vector<unique_ptr<ParsedExpression>> nullif_args;
                 nullif_args.push_back(std::move(children[1]));
                 nullif_args.push_back(make_uniq<duckdb::ConstantExpression>(
@@ -596,6 +612,12 @@ unique_ptr<ParsedExpression> BuildExpr(Builder& b, const Resolved::Expr& expr) {
                 }
                 function = make_uniq<duckdb::CastExpression>(
                     target, std::move(function));
+            }
+            if (arith.result_as().kind() == Resolved::DOUBLE) {
+                duckdb::vector<unique_ptr<ParsedExpression>> checked;
+                checked.push_back(std::move(function));
+                function = make_uniq<duckdb::FunctionExpression>(
+                    "mysql_double", std::move(checked));
             }
             return function;
         }
