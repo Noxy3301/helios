@@ -158,21 +158,15 @@ class Framework {
    */
   EpochNumber Sync() {
     assert(ThreadEpoch() == kThreadOffline);
-    size_t reload_count = 0;
-    for (;;) {
-      auto current_epoch = global_epoch_.load();
-      {
-        std::unique_lock<std::mutex> lk(epoch_mutex_);
-        epoch_cv_.wait(lk, [&] {
-          return stop_.load() || (global_epoch_.load() != current_epoch);
-        });
-      }
-      auto reload_epoch = global_epoch_.load();
-      if (stop_.load()) return reload_epoch;
-      reload_count++;
-
-      if (reload_count == 2) return reload_epoch;
-    }
+    // Ask for both advances rather than wait for two ticks. The target is
+    // fixed here: requested advances can land faster than this thread wakes
+    // to count them.
+    const EpochNumber target = global_epoch_.load() + 2;
+    RequestEpochAdvance(target);
+    std::unique_lock<std::mutex> lk(epoch_mutex_);
+    epoch_cv_.wait(
+        lk, [&] { return stop_.load() || global_epoch_.load() >= target; });
+    return global_epoch_.load();
   }
 
   // Margin below the uint32 wrap point. Forced advances and read view fences
@@ -185,14 +179,16 @@ class Framework {
   // meaning.
   static constexpr EpochNumber kEpochHighWater = UINT32_MAX - (1u << 20);
 
-  // Asks the epoch thread to run its advance check at once instead of at the
-  // next tick. The advance condition itself is unchanged. No-op at or
-  // above the high-water mark.
-  void RequestEpochAdvance() {
-    if (global_epoch_.load() >= kEpochHighWater) return;
+  // Asks the epoch thread to advance to `target` without waiting for the
+  // ticks, and returns at once. The request stays pending until E reaches it;
+  // a refused attempt is retried shortly. No-op beyond the high-water mark.
+  void RequestEpochAdvance(EpochNumber target) {
+    if (target > kEpochHighWater) return;
     {
       std::lock_guard<std::mutex> lk(epoch_mutex_);
-      advance_requested_.store(true);
+      // A pending request at or above `target` already covers it.
+      if (target <= requested_epoch_) return;
+      requested_epoch_ = target;
     }
     epoch_thread_cv_.notify_one();
   }
@@ -212,12 +208,11 @@ class Framework {
     assert(ThreadEpoch() == kThreadOffline);
     if (global_epoch_.load() >= target) return true;
     if (target > kEpochHighWater) return false;
+    RequestEpochAdvance(target);
     std::unique_lock<std::mutex> lk(epoch_mutex_);
     for (;;) {
       if (global_epoch_.load() >= target) return true;
       if (stop_.load()) return false;
-      advance_requested_.store(true);
-      epoch_thread_cv_.notify_one();
       if (epoch_cv_.wait_until(lk, deadline) == std::cv_status::timeout) {
         return global_epoch_.load() >= target;
       }
@@ -285,22 +280,16 @@ class Framework {
         // cadence while draining still-online threads
         std::this_thread::sleep_for(epoch_duration);
       } else {
-        // Forced requests wake the epoch thread early; the advance condition
-        // below still gates
+        // A pending request wakes the epoch thread early; the advance
+        // condition below still gates
         std::unique_lock<std::mutex> lk(epoch_mutex_);
         forced_wake = epoch_thread_cv_.wait_for(lk, epoch_duration, [&] {
-          return advance_requested_.load() || stop_.load();
+          return requested_epoch_ > global_epoch_.load() || stop_.load();
         });
-        advance_requested_.store(false);
       }
       // Sample the smallest online epoch and the current global one.
       EpochNumber min_epoch = GetSmallestEpoch();
       EpochNumber old_epoch = global_epoch_;
-      if (forced_wake && !stop_.load() && old_epoch >= kEpochHighWater) {
-        // A racing forced request must not advance past the high-water
-        // margin; timer cadence continues
-        continue;
-      }
       if (min_epoch == kThreadOffline || min_epoch == old_epoch) {
         if (old_epoch >= kEpochHighWater) {
           // Stopping here is the conservative end, including during the
@@ -322,14 +311,21 @@ class Framework {
         const EpochNumber global_epoch = global_epoch_.load();
         epoch_cv_.notify_all();
         if (epoch_hook_) epoch_hook_(global_epoch);
+      } else if (forced_wake) {
+        // A thread still in `E - 1` refused a pending request; it leaves
+        // within one commit, so retry soon rather than a tick later.
+        std::this_thread::sleep_for(kForcedRetry);
       }
       if (stop_.load() && min_epoch == kThreadOffline) break;
     }
   }
 
+  static constexpr auto kForcedRetry = std::chrono::microseconds(50);
+
   std::atomic<bool> start_;
   std::atomic<bool> stop_;
-  std::atomic<bool> advance_requested_{false};
+  // The epoch a pending request asks for; guarded by epoch_mutex_.
+  EpochNumber requested_epoch_{0};
   // `E`: the global epoch shared by all participants.
   std::atomic<EpochNumber> global_epoch_;
   std::mutex epoch_mutex_;
