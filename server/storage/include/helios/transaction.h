@@ -99,6 +99,16 @@ inline constexpr uint32_t kMaxTid = (1u << 29) - 1;
  */
 class Transaction {
  public:
+  /**
+   * @brief An index record a range scan visited and the TID word it read.
+   *
+   * @details The key is borrowed, like every RangeRead input.
+   */
+  struct RangeRecord {
+    std::string_view key;
+    Tidword tid;
+  };
+
   Transaction(TableDictionary &tables, epoch::Framework &epoch,
               index::Reaper &reaper, wal::Logger &logger,
               Tidword &last_commit_tid);
@@ -133,16 +143,16 @@ class Transaction {
    *
    * @details The bounds, index, limit and direction describe the scan to
    * re-run over `[begin, end)`. An empty `index` names the primary index, and
-   * a `limit` of 0 caps nothing. `keys`, and `primary_keys` on a secondary
-   * index, are the keys that scan returned, in scan order. Commit re-scans
-   * the range and aborts when that ordered list differs. Row contents are
-   * not part of this call: each row the caller consumed is also a Read.
-   * Commit refuses a range whose `end` is empty.
+   * a `limit` of 0 caps nothing. `rows` and `visited` are the rows that scan
+   * returned and the records it visited without returning them, in scan
+   * order. Commit aborts unless the re-scan reaches the same records with the
+   * same words, apart from tombstones the reaper purged. Each row the caller
+   * consumed is also a Read. Commit refuses a range whose `end` is empty.
    */
   void RangeRead(std::string_view table, std::string_view index,
                  std::string_view begin, std::string_view end, uint64_t limit,
-                 bool reverse, std::vector<std::string_view> keys,
-                 std::vector<std::string_view> primary_keys);
+                 bool reverse, std::vector<RangeRecord> rows,
+                 std::vector<RangeRecord> visited);
 
   /**
    * @brief Unpacks the row and merges it into its record's pending update.
@@ -180,9 +190,9 @@ class Transaction {
    * - Phase 1: lock every record in pointer order. Then join the epoch, as
    *   Silo reads it after locking.
    * - Phase 2: validate every point read by word, revalidate every range and
-   *   compare its key list, check INSERT and UNIQUE under the locks, then
-   *   choose the commit TID. Reserve every PAX slot before the first value
-   *   changes.
+   *   compare the records it visits, check INSERT and UNIQUE under the locks,
+   *   then choose the commit TID. Reserve every PAX slot before the first
+   *   value changes.
    * - Phase 3: install each record, append its WAL write, and publish its
    *   TID, which unlocks it.
    *
@@ -211,8 +221,8 @@ class Transaction {
     std::string_view end;
     uint64_t limit;
     bool reverse;
-    std::vector<std::string_view> keys;
-    std::vector<std::string_view> primary_keys;
+    std::vector<RangeRecord> rows;
+    std::vector<RangeRecord> visited;
   };
 
   struct RowUpdate {
@@ -299,6 +309,31 @@ class Transaction {
 
   bool RevalidateRange(const RangeEntry &range, Tidword &max_tid);
   bool RevalidateSecondaryRange(const RangeEntry &range, Tidword &max_tid);
+
+  /**
+   * @brief Matches a record a range re-scan reached against the next one the
+   * read-phase scan recorded.
+   *
+   * @details A live row, primary or base, matches the next of `rows`; any
+   * other record, a secondary entry included, the next of `visited`. A blank
+   * record, or one the reaper unlinked (latest clear), counts as not reached.
+   * Recorded tombstones the re-scan passed without reaching are skipped as
+   * purged. Only this attempt's own lock may differ from the recorded word.
+   *
+   * @param range The range being revalidated.
+   * @param[in,out] row The next of `rows`, advanced past a match.
+   * @param[in,out] visited The next of `visited`, advanced past a match.
+   * @param key The reached record's key.
+   * @param item The reached record, checked for this attempt's lock.
+   * @param tid The word the re-scan loaded from `item`.
+   * @param entry The record is a secondary entry.
+   * @param[in,out] max_tid Raised to the matched word.
+   * @return false when another committer holds the record or it differs from
+   * the next recorded one.
+   */
+  bool match_record(const RangeEntry &range, size_t &row, size_t &visited,
+                    std::string_view key, DataItem *item, Tidword tid,
+                    bool entry, Tidword &max_tid) const;
 
   /**
    * @brief Installs the final value while the record stays locked.

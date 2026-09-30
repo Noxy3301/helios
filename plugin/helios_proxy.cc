@@ -74,6 +74,18 @@ std::vector<HeliosProxy::RangeRecord> take_visited(Response& response) {
     return visited;
 }
 
+// Copies range records into a commit request, which reads key and tid.
+void add_records(
+    google::protobuf::RepeatedPtrField<Helios::Protocol::RangeRecord>* out,
+    const std::vector<HeliosProxy::RangeRecord>& records) {
+    out->Reserve(static_cast<int>(records.size()));
+    for (const auto& record : records) {
+        auto* added = out->Add();
+        added->set_key(record.key);
+        added->set_tid(record.tid);
+    }
+}
+
 }  // namespace
 
 HeliosProxy::HeliosProxy(const std::string& host, int port)
@@ -382,10 +394,8 @@ bool HeliosProxy::tx_commit(
         range->set_end_key(entry.end_key);
         range->set_row_limit(entry.row_limit);
         range->set_reverse_scan(entry.reverse_scan);
-        for (const auto& key : entry.result_keys) range->add_result_keys(key);
-        for (const auto& key : entry.result_primary_keys) {
-            range->add_result_primary_keys(key);
-        }
+        add_records(range->mutable_rows(), entry.rows);
+        add_records(range->mutable_visited(), entry.visited);
     }
 
     for (const auto& op : ops) {

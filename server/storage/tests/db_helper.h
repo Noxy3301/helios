@@ -68,7 +68,8 @@ struct Range {
   std::string table_name, index_name, start_key, end_key;
   uint64_t row_limit = 0;
   bool reverse_scan = false;
-  std::vector<std::string> result_keys, result_primary_keys;
+  // The rows the scan returned and the records it visited, in scan order.
+  std::vector<Record> rows, visited;
 };
 
 // Feeds reads, ranges, writes and index ops in that order; false with reason
@@ -81,13 +82,14 @@ inline bool Feed(helios::storage::silo::Transaction &tx,
   for (const auto &read : reads)
     tx.Read(read.table, read.key, helios::storage::Tidword(read.tid));
   for (const auto &range : ranges) {
-    const std::vector<std::string_view> keys(range.result_keys.begin(),
-                                             range.result_keys.end());
-    const std::vector<std::string_view> primary_keys(
-        range.result_primary_keys.begin(), range.result_primary_keys.end());
+    std::vector<helios::storage::silo::Transaction::RangeRecord> rows, visited;
+    for (const auto &row : range.rows)
+      rows.push_back({row.key, helios::storage::Tidword(row.tid)});
+    for (const auto &record : range.visited)
+      visited.push_back({record.key, helios::storage::Tidword(record.tid)});
     tx.RangeRead(range.table_name, range.index_name, range.start_key,
-                 range.end_key, range.row_limit, range.reverse_scan, keys,
-                 primary_keys);
+                 range.end_key, range.row_limit, range.reverse_scan,
+                 std::move(rows), std::move(visited));
   }
   for (const auto &write : writes)
     if (!tx.Write(write.table, write.key, write.value, write.op, reason))

@@ -77,6 +77,10 @@ public:
         std::string key;
         uint64_t tid = 0;
         bool entry = false;  // A secondary entry, not a base record.
+        bool operator==(const RangeRecord& other) const {
+            return key == other.key && tid == other.tid &&
+                   entry == other.entry;
+        }
     };
 
     // Rows of [start_key, end_key) in key order, reversed when reverse_scan.
@@ -127,7 +131,8 @@ public:
         uint64_t tid = 0;
     };
     // One range the transaction scanned. The commit re-runs the scan these
-    // bounds describe and requires the same key list.
+    // bounds describe and requires the records it read with the same TID
+    // words.
     struct RangeReadEntry {
         std::string table_name;
         std::string index_name;
@@ -135,8 +140,10 @@ public:
         std::string end_key;
         uint64_t row_limit = 0;
         bool reverse_scan = false;
-        std::vector<std::string> result_keys;
-        std::vector<std::string> result_primary_keys;
+        // The rows the scan returned, keyed by primary key, and the records
+        // it visited without returning them, each in scan order.
+        std::vector<RangeRecord> rows;
+        std::vector<RangeRecord> visited;
     };
     struct ReadPlanKeyBinding {
         uint32_t source_step = 0;

@@ -258,7 +258,7 @@ private:
   std::unordered_map<std::string, size_t> own_writes_index_;
 
   // Append-only read sets the commit re-validates: per-key TIDs of base rows,
-  // and per-range key lists revalidated to catch phantoms.
+  // and per-range record lists revalidated to catch phantoms.
   std::vector<HeliosProxy::ReadEntry> base_row_read_set_;
   std::vector<HeliosProxy::RangeReadEntry> range_read_set_;
 

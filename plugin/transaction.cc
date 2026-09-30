@@ -231,40 +231,33 @@ bool HeliosTransaction::reads_still_valid() {
     }
   }
 
+  // Each range must return the same rows with the same words. The visited
+  // records are left to commit validation, which accepts a purged tombstone.
   for (const auto& range : range_read_set_) {
+    std::vector<HeliosProxy::RangeRecord> rows;
     if (range.index_name.empty()) {
-      auto now = helios_proxy->tx_scan(range.table_name, range.start_key,
-                                          range.end_key, range.row_limit,
-                                          range.reverse_scan,
-                                          /*keys_only=*/true);
-      if (!now.ok) {
-        if (now.transport_error) mark_transport_error();
+      auto scan = helios_proxy->tx_scan(range.table_name, range.start_key,
+                                        range.end_key, range.row_limit,
+                                        range.reverse_scan,
+                                        /*keys_only=*/true);
+      if (!scan.ok) {
+        if (scan.transport_error) mark_transport_error();
         return false;
       }
-      if (now.rows.size() != range.result_keys.size()) return false;
-      for (size_t i = 0; i < now.rows.size(); ++i) {
-        if (now.rows[i].key != range.result_keys[i]) return false;
-      }
-      continue;
-    }
-
-    auto now = helios_proxy->tx_scan_index(
-        range.table_name, range.index_name, range.start_key, range.end_key,
-        range.row_limit, range.reverse_scan, /*keys_only=*/true);
-    if (!now.ok) {
-      if (now.transport_error) mark_transport_error();
-      return false;
-    }
-    if (now.rows.size() != range.result_keys.size() ||
-        now.rows.size() != range.result_primary_keys.size()) {
-      return false;
-    }
-    for (size_t i = 0; i < now.rows.size(); ++i) {
-      if (now.rows[i].secondary_key != range.result_keys[i] ||
-          now.rows[i].primary_key != range.result_primary_keys[i]) {
+      for (auto& row : scan.rows) rows.push_back({std::move(row.key), row.tid});
+    } else {
+      auto scan = helios_proxy->tx_scan_index(
+          range.table_name, range.index_name, range.start_key, range.end_key,
+          range.row_limit, range.reverse_scan, /*keys_only=*/true);
+      if (!scan.ok) {
+        if (scan.transport_error) mark_transport_error();
         return false;
       }
+      for (auto& row : scan.rows) {
+        rows.push_back({std::move(row.primary_key), row.tid});
+      }
     }
+    if (rows != range.rows) return false;
   }
   return true;
 }
@@ -1069,8 +1062,8 @@ void HeliosTransaction::append_base_row_read(
 
 void HeliosTransaction::append_range_read(
     const RangeScanCacheEntry& scanned) {
-  // The bounds describe the revalidation and result_keys is the observed key
-  // list in scan order. Append, like the point and Silo read sets; a scan
+  // The bounds describe the revalidation and the records are what the scan
+  // read, in scan order. Append, like the point and Silo read sets; a scan
   // consumed twice is revalidated twice: redundant but never wrong.
   HeliosProxy::RangeReadEntry entry;
   entry.table_name = scanned.table_name;
@@ -1078,10 +1071,11 @@ void HeliosTransaction::append_range_read(
   entry.end_key = scanned.end_key;
   entry.row_limit = scanned.row_limit;
   entry.reverse_scan = scanned.reverse_scan;
-  entry.result_keys.reserve(scanned.rows.size());
-  for (const auto& row : scanned.rows) {
-    entry.result_keys.push_back(row.first);
+  entry.rows.reserve(scanned.rows.size());
+  for (size_t i = 0; i < scanned.rows.size(); ++i) {
+    entry.rows.push_back({scanned.rows[i].first, scanned.row_tids[i]});
   }
+  entry.visited = scanned.visited;
   range_read_set_.push_back(std::move(entry));
 }
 
@@ -1094,8 +1088,11 @@ void HeliosTransaction::append_secondary_range_read(
   entry.end_key = scanned.end_key;
   entry.row_limit = scanned.row_limit;
   entry.reverse_scan = scanned.reverse_scan;
-  entry.result_keys = scanned.secondary_keys;
-  entry.result_primary_keys = scanned.primary_keys;
+  entry.rows.reserve(scanned.primary_keys.size());
+  for (size_t i = 0; i < scanned.primary_keys.size(); ++i) {
+    entry.rows.push_back({scanned.primary_keys[i], scanned.row_tids[i]});
+  }
+  entry.visited = scanned.visited;
   range_read_set_.push_back(std::move(entry));
 }
 
