@@ -17,6 +17,18 @@ namespace {
 // for; a null list would gather the whole row.
 const std::vector<uint32_t> kNoColumns;
 
+// Borrows a commit request's range records for silo::Transaction::RangeRead.
+std::vector<helios::storage::silo::Transaction::RangeRecord> range_records(
+    const google::protobuf::RepeatedPtrField<Helios::Protocol::RangeRecord>&
+        records) {
+    std::vector<helios::storage::silo::Transaction::RangeRecord> out;
+    out.reserve(records.size());
+    for (const auto& record : records) {
+        out.push_back({record.key(), helios::storage::Tidword(record.tid())});
+    }
+    return out;
+}
+
 }  // namespace
 
 void HeliosRpc::handleTxRead(
@@ -66,6 +78,7 @@ void HeliosRpc::handleTxScan(
         out->set_tid(row.tid);
         if (!request.keys_only()) out->set_value(std::move(row.value));
     }
+    add_visited(response, scan.visited);
 }
 
 void HeliosRpc::handleTxScanIndex(
@@ -84,6 +97,7 @@ void HeliosRpc::handleTxScanIndex(
         out->set_tid(row.tid);
         if (!request.keys_only()) out->set_value(std::move(row.value));
     }
+    add_visited(response, scan.visited);
 }
 
 void HeliosRpc::handleTxCommit(
@@ -96,14 +110,10 @@ void HeliosRpc::handleTxCommit(
         tx.Read(read.table_name(), read.key(), helios::storage::Tidword(read.tid()));
     }
     for (const auto& range : request.range_reads()) {
-        std::vector<std::string_view> keys(range.result_keys().begin(),
-                                           range.result_keys().end());
-        std::vector<std::string_view> primary_keys(
-            range.result_primary_keys().begin(),
-            range.result_primary_keys().end());
         tx.RangeRead(range.table_name(), range.index_name(), range.start_key(),
                      range.end_key(), range.row_limit(), range.reverse_scan(),
-                     std::move(keys), std::move(primary_keys));
+                     range_records(range.rows()),
+                     range_records(range.visited()));
     }
 
     std::string reason;

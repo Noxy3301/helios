@@ -59,6 +59,8 @@ ScanResult Database::Scan(const std::string_view table_name,
       result.rows.push_back(
           {std::string(key), std::move(row.value), row.tid.obj});
       ++returned_rows;
+    } else if (row.tid != Tidword::Absent()) {
+      result.visited.push_back({std::string(key), row.tid.obj});
     }
     // Count only live rows toward the limit; tombstones stay for later cleanup.
     return row_limit > 0 && returned_rows >= row_limit;
@@ -108,6 +110,8 @@ ScanIndexResult Database::ScanIndex(
                              std::string(primary_key), std::move(row.value),
                              row.tid.obj});
       ++returned_rows;
+    } else if (row.tid != Tidword::Absent()) {
+      result.visited.push_back({std::string(primary_key), row.tid.obj});
     }
     return row_limit > 0 && returned_rows >= row_limit;
   };
@@ -116,6 +120,8 @@ ScanIndexResult Database::ScanIndex(
   auto append_secondary_entry = [&](std::string_view key, DataItem &item) {
     const std::string secondary_key(key);
     const auto keys = silo::StableReadKeys(item);
+    if (keys.tid != Tidword::Absent())
+      result.visited.push_back({secondary_key, keys.tid.obj, true});
     for (std::string_view primary_key : keys.primary_keys_view()) {
       if (append_base_row(secondary_key, primary_key)) return true;
     }
@@ -149,7 +155,11 @@ ScanPaxResult Database::ScanPax(const std::string_view table_name,
   auto append_pax_row = [&](std::string_view key, DataItem &item) {
     // Read an unlocked TID; the caller must recheck it after reading the cells.
     const Tidword tid = silo::StableTid(item);
-    if (tid.absent) return false;
+    if (tid.absent) {
+      if (tid != Tidword::Absent())
+        result.visited.push_back({std::string(key), tid.obj});
+      return false;
+    }
 
     // Return the PAX location for the caller to read directly.
     result.rows.push_back({std::string(key), item.pax_group(), item.pax_slot(),

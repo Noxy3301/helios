@@ -63,10 +63,15 @@ TestHelper::Range ScanRange(helios::storage::Database &db,
   // A refused scan has no rows for the range read set; returning the empty
   // range keeps the caller's own expectations from passing on it.
   if (!scan.ok) return range;
-  for (const auto &row : scan.rows) {
-    range.result_keys.emplace_back(row.key);
-  }
+  range.rows = TestHelper::records(scan.rows);
+  range.visited = TestHelper::records(scan.visited);
   return range;
+}
+
+std::vector<std::string> keys(const std::vector<TestHelper::Record> &records) {
+  std::vector<std::string> out;
+  for (const auto &record : records) out.push_back(record.key);
+  return out;
 }
 
 bool Revalidate(helios::storage::Database &db, const TestHelper::Range &range,
@@ -89,7 +94,7 @@ TEST(RangeValidationTest, AnUnchangedRangeCommits) {
   SeedRows(db);
 
   const auto range = ScanRange(db, "k1", "k5");
-  ASSERT_EQ(range.result_keys,
+  ASSERT_EQ(keys(range.rows),
             (std::vector<std::string>{"k1", "k2", "k3", "k4"}));
 
   std::string reason;
@@ -111,8 +116,7 @@ TEST(RangeValidationTest, ARowDeletedInsideTheRangeAborts) {
 }
 
 TEST(RangeValidationTest, ARowDeletedAtTheEndOfTheRangeAborts) {
-  // The re-scan is a strict prefix of the recorded keys, so nothing diverges
-  // positionally and only the length check rejects it.
+  // The re-scan reaches k4's tombstone where the scan read the live row.
   auto config = MakeConfig();
   helios::storage::Database db(config);
   ASSERT_TRUE(TestHelper::CreateTable(db, kTable));
@@ -163,7 +167,7 @@ TEST(RangeValidationTest, ALimitedRangeIgnoresChangesPastItsRowLimit) {
   SeedRows(db);
 
   const auto range = ScanRange(db, "k1", "k5", 2);
-  ASSERT_EQ(range.result_keys, (std::vector<std::string>{"k1", "k2"}));
+  ASSERT_EQ(keys(range.rows), (std::vector<std::string>{"k1", "k2"}));
   ASSERT_TRUE(CommitWrite(db, "k45", "v"));
 
   std::string reason;
@@ -187,7 +191,7 @@ TEST(RangeValidationTest, ABlankRecordDoesNotConsumeTheRowLimit) {
   EXPECT_FALSE(blank_reason.empty()) << "an abort names its reason";
 
   const auto range = ScanRange(db, "k1", "k5", 2);
-  ASSERT_EQ(range.result_keys, (std::vector<std::string>{"k1", "k2"}));
+  ASSERT_EQ(keys(range.rows), (std::vector<std::string>{"k1", "k2"}));
 
   std::string reason;
   EXPECT_TRUE(Revalidate(db, range, reason)) << reason;
@@ -200,7 +204,7 @@ TEST(RangeValidationTest, AnEmptyRangeCommits) {
   SeedRows(db);
 
   const auto range = ScanRange(db, "m1", "m9");
-  ASSERT_TRUE(range.result_keys.empty());
+  ASSERT_TRUE(range.rows.empty() && range.visited.empty());
 
   std::string reason;
   EXPECT_TRUE(Revalidate(db, range, reason)) << reason;
@@ -213,7 +217,7 @@ TEST(RangeValidationTest, ARowAppearingInAnEmptyRangeAborts) {
   SeedRows(db);
 
   const auto range = ScanRange(db, "m1", "m9");
-  ASSERT_TRUE(range.result_keys.empty());
+  ASSERT_TRUE(range.rows.empty() && range.visited.empty());
   ASSERT_TRUE(CommitWrite(db, "m5", "v"));
 
   std::string reason;
@@ -230,7 +234,7 @@ TEST(RangeValidationTest, ARangeReadSetRepeatingAKeyAborts) {
   SeedRows(db);
 
   auto range = ScanRange(db, "k1", "k5");
-  range.result_keys.insert(range.result_keys.begin(), "k1");
+  range.rows.insert(range.rows.begin(), range.rows.front());
 
   std::string reason;
   EXPECT_FALSE(Revalidate(db, range, reason));
@@ -244,11 +248,45 @@ TEST(RangeValidationTest, AReverseRangeAbortsOnTheSameChange) {
   SeedRows(db);
 
   const auto range = ScanRange(db, "k1", "k5", 0, true);
-  ASSERT_EQ(range.result_keys,
+  ASSERT_EQ(keys(range.rows),
             (std::vector<std::string>{"k4", "k3", "k2", "k1"}));
   ASSERT_TRUE(CommitDelete(db, "k2"));
 
   std::string reason;
   EXPECT_FALSE(Revalidate(db, range, reason));
   EXPECT_EQ(reason, "primary_range_result_changed");
+}
+
+TEST(RangeValidationTest, APaxScanListsTheRecordsARowScanVisits) {
+  // The parallel scan must return the rows and list the tombstone a row scan
+  // does.
+  auto config = MakeConfig();
+  // A long epoch keeps the reaper away from the tombstone.
+  config.epoch_duration_ms = 1000;
+  helios::storage::Database db(config);
+  ASSERT_TRUE(TestHelper::CreateTable(db, kTable));
+  std::string reason;
+  ASSERT_TRUE(TestHelper::CommitRows(db, {},
+                                     {{kTable, "k1", TestHelper::Row("v")},
+                                      {kTable, "k2", TestHelper::Row("v")},
+                                      {kTable, "k3", TestHelper::Row("v")}},
+                                     {}, {}, reason,
+                                     helios::storage::CommitDurability::kAsync))
+      << reason;
+  ASSERT_TRUE(TestHelper::CommitRows(
+      db, {}, {{kTable, "k2", "", helios::storage::RowOp::kDelete}}, {}, {},
+      reason, helios::storage::CommitDurability::kAsync))
+      << reason;
+
+  const auto scan = db.Scan(kTable, "k1", "k5", 0, false);
+  db.ReleaseThreadEpoch();
+  const auto pax = db.ScanPax(kTable, "k1", "k5", 0, false);
+  db.ReleaseThreadEpoch();
+  ASSERT_TRUE(scan.ok);
+  ASSERT_TRUE(pax.ok);
+  ASSERT_EQ(scan.visited.size(), 1u);
+  EXPECT_EQ(scan.visited[0].key, "k2");
+  EXPECT_EQ(TestHelper::records(pax.rows), TestHelper::records(scan.rows));
+  EXPECT_EQ(TestHelper::records(pax.visited),
+            TestHelper::records(scan.visited));
 }

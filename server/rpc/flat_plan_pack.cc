@@ -56,6 +56,14 @@ void pack_step(
     for (const auto& k : s.group_start_keys()) w_bytes(out, k);
     w_u64(out, static_cast<uint64_t>(s.group_end_keys_size()));
     for (const auto& k : s.group_end_keys()) w_bytes(out, k);
+    w_u64(out, static_cast<uint64_t>(s.visited_size()));
+    for (const auto& v : s.visited()) {
+        w_bytes(out, v.key());
+        w_u64(out, v.tid());
+        w_u8(out, v.entry() ? 1 : 0);
+    }
+    w_u64(out, static_cast<uint64_t>(s.group_visited_sizes_size()));
+    for (const auto g : s.group_visited_sizes()) w_u64(out, g);
 }
 }  // namespace
 

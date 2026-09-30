@@ -241,8 +241,9 @@ class Database {
    *        the range.
    *
    * Each returned row carries its own TID. Revalidating the range at commit
-   * is a silo::Transaction::RangeRead call with this call's arguments and the
-   * returned keys, plus one silo::Transaction::Read call per consumed row.
+   * is a silo::Transaction::RangeRead call with this call's arguments, the
+   * returned rows and `visited`, plus one silo::Transaction::Read call per
+   * consumed row.
    *
    * @param table_name Target table.
    * @param start_key Inclusive start of the range.
@@ -270,8 +271,8 @@ class Database {
    * its primary keys, reads the base row, and reports
    * `{secondary_key, primary_key, value, tid}` per result. Revalidating the
    * range at commit is a silo::Transaction::RangeRead call with this call's
-   * arguments and both returned key lists; each base row carries its TID for
-   * revalidation as a point read.
+   * arguments, the returned rows keyed by primary key, and `visited`; each
+   * base row carries its TID for revalidation as a point read.
    *
    * @param table_name Base table.
    * @param index_name Secondary index name.

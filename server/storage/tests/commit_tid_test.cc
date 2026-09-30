@@ -8,6 +8,7 @@
 #include <chrono>
 #include <filesystem>
 #include <functional>
+#include <future>
 #include <memory>
 #include <string>
 #include <thread>
@@ -21,6 +22,7 @@
 #include "index/reaper.h"
 #include "pax/epoch_image_buffer.h"
 #include "silo/stable_read.h"
+#include "sync_point.h"
 #include "helios/transaction.h"
 #include "table/table_dictionary.h"
 #include "util/epoch_framework.h"
@@ -63,6 +65,8 @@ class CommitTidTest : public ::testing::Test {
   std::unique_ptr<wal::Logger> logger_;
   Tidword last_tid_;
   std::string reason_;
+
+  static void SetUpTestSuite() { keep_sync_facility_armed(); }
 
   void SetUp() override {
     config_.work_dir = "./helios_commit_tid_test_logs";
@@ -120,18 +124,41 @@ class CommitTidTest : public ::testing::Test {
               const std::vector<TestHelper::RowWrite> &writes,
               const std::vector<TestHelper::IndexOp> &index_ops = {},
               const std::vector<TestHelper::Range> &ranges = {}) {
-    reason_.clear();
+    return commit_as(last_tid_, reason_, reads, writes, index_ops, ranges);
+  }
+
+  // Commits as the worker that owns `last_tid` and `reason`.
+  bool commit_as(Tidword &last_tid, std::string &reason,
+                 const std::vector<TestHelper::PointRead> &reads,
+                 const std::vector<TestHelper::RowWrite> &writes,
+                 const std::vector<TestHelper::IndexOp> &index_ops,
+                 const std::vector<TestHelper::Range> &ranges) {
+    reason.clear();
     // The packed rows outlive the attempt; the transaction borrows their bytes.
     std::vector<TestHelper::RowWrite> rows = writes;
     for (auto &row : rows) row.value = TestHelper::Row(row.value);
-    silo::Transaction tx(tables_, epoch_, reaper_, *logger_, last_tid_);
+    silo::Transaction tx(tables_, epoch_, reaper_, *logger_, last_tid);
     const bool committed =
-        TestHelper::Feed(tx, reads, ranges, rows, index_ops, reason_) &&
-        tx.Commit(CommitDurability::kAsync, reason_);
+        TestHelper::Feed(tx, reads, ranges, rows, index_ops, reason) &&
+        tx.Commit(CommitDurability::kAsync, reason);
     index::release_thread_epoch();
     return committed;
   }
 };
+
+constexpr auto kArrivalTimeout = std::chrono::seconds(5);
+
+std::string arrive_and_wait(const Pipe &arrived, const Pipe &release) {
+  return "arrive_and_wait:" + std::to_string(arrived.write_fd()) + ":" +
+         std::to_string(release.read_fd());
+}
+
+// Waits until the committer stops at the armed point.
+bool wait_arrival(const Pipe &arrived) {
+  char announcement = 0;
+  return wait_readable(arrived.read_fd(), kArrivalTimeout) &&
+         ::read(arrived.read_fd(), &announcement, 1) == 1;
+}
 
 TEST_F(CommitTidTest, CommitReadsTheEpochAfterTheWriteSetIsFed) {
   auto *item = SeedRow("key", Version(10, 5));
@@ -731,8 +758,8 @@ TEST_F(CommitTidTest, SecondaryRangeFailureKeepsItsAbortReason) {
   range.table_name = kTable;
   range.index_name = "idx";
   range.end_key = "z";
-  range.result_keys = {"missing"};
-  range.result_primary_keys = {"key"};
+  range.visited = {{"missing", Version(10, 1).obj}};
+  range.rows = {{"key", Version(10, 1).obj}};
   EXPECT_FALSE(Commit({}, {}, {}, {range}));
   EXPECT_EQ("secondary_range_result_changed", reason_);
   EXPECT_EQ(epoch::Framework::kThreadOffline, epoch_.ThreadEpoch());
@@ -817,14 +844,16 @@ TEST_F(CommitTidTest, SecondaryRangeReadContributesIndexAndRowVersions) {
   range.index_name = "idx";
   range.start_key = "group";
   range.end_key = "grouq";
-  range.result_keys = {"group"};
-  range.result_primary_keys = {"a"};
+  range.visited = {{"group", Version(10, 300).obj}};
+  range.rows = {{"a", Version(10, 10).obj}};
 
   ASSERT_TRUE(Commit({}, {{kTable, "unrelated", "value"}}, {}, {range}))
       << reason_;
   EXPECT_EQ(Version(10, 301), last_tid_);
 
+  // A scan after the row moved records its new word.
   row->transaction_id.store(Version(10, 500));
+  range.rows[0].tid = Version(10, 500).obj;
   ASSERT_TRUE(Commit({}, {{kTable, "unrelated", "value"}}, {}, {range}))
       << reason_;
   EXPECT_EQ(Version(10, 501), last_tid_);
@@ -836,7 +865,7 @@ TEST_F(CommitTidTest, PrimaryRangeReadContributesItsVersionWithoutPointReads) {
   range.table_name = kTable;
   range.start_key = "high";
   range.end_key = "higi";
-  range.result_keys = {"high"};
+  range.rows = {{"high", Version(10, 400).obj}};
   ASSERT_TRUE(Commit({}, {{kTable, "other", "value"}}, {}, {range})) << reason_;
   EXPECT_EQ(Version(10, 401), last_tid_);
 }
@@ -963,14 +992,14 @@ TEST_F(CommitTidTest, RangeRevalidationAllowsOwnLockOnPrimaryAndSecondary) {
   rows.table_name = kTable;
   rows.start_key = "k";
   rows.end_key = "l";
-  rows.result_keys = {"k"};
+  rows.rows = {{"k", Version(10, 10).obj}};
   TestHelper::Range postings;
   postings.table_name = kTable;
   postings.index_name = "idx";
   postings.start_key = "s";
   postings.end_key = "t";
-  postings.result_keys = {"s"};
-  postings.result_primary_keys = {"k"};
+  postings.visited = {{"s", Version(10, 12).obj}};
+  postings.rows = {{"k", Version(10, 10).obj}};
 
   ASSERT_TRUE(Commit({}, {{kTable, "k", "next"}, {kTable, "k2", "new"}},
                      {{kTable, "idx", "s", "k2", false}}, {rows, postings}))
@@ -1025,6 +1054,7 @@ TEST_F(CommitTidTest, EmptyPrimaryRangeAbortsWhenAnAbsentRowIsFromALaterEpoch) {
   range.table_name = kTable;
   range.start_key = "x";
   range.end_key = "y";
+  range.visited = {{"x", Deleted(11, 5).obj}};
 
   EXPECT_FALSE(Commit({}, {{kTable, "w", "value"}}, {}, {range}));
   EXPECT_EQ("commit_epoch_stale", reason_);
@@ -1045,6 +1075,7 @@ TEST_F(CommitTidTest,
   range.index_name = "idx";
   range.start_key = "s";
   range.end_key = "t";
+  range.visited = {{"s", Deleted(11, 5).obj}};
 
   EXPECT_FALSE(Commit({}, {{kTable, "w", "value"}}, {}, {range}));
   EXPECT_EQ("commit_epoch_stale", reason_);
@@ -1069,6 +1100,7 @@ TEST_F(CommitTidTest,
   range.index_name = "idx";
   range.start_key = "group";
   range.end_key = "grouq";
+  range.visited = {{"group", Version(10, 30).obj}, {"a", Deleted(11, 5).obj}};
 
   EXPECT_FALSE(Commit({}, {{kTable, "unrelated", "value"}}, {}, {range}));
   EXPECT_EQ("commit_epoch_stale", reason_);
@@ -1085,16 +1117,222 @@ TEST_F(CommitTidTest,
   ASSERT_TRUE(Commit({}, {}, {{kTable, "idx", "s", "a", true}})) << reason_;
   EXPECT_EQ(Deleted(10, 5), posting->transaction_id.load());
 
-  // The emptied entry revalidates as absent until the reaper removes it.
+  // A scan that visited the emptied entry revalidates against it until the
+  // reaper removes it.
   TestHelper::Range range;
   range.table_name = kTable;
   range.index_name = "idx";
   range.start_key = "s";
   range.end_key = "t";
+  range.visited = {{"s", Deleted(10, 5).obj}};
   ASSERT_TRUE(Commit({}, {{kTable, "other", "value"}}, {}, {range})) << reason_;
 
   reaper_.Purge(10);
   EXPECT_EQ(nullptr, index->tree.Get("s"));
+}
+
+TEST_F(CommitTidTest, RangeEmptiedAgainAfterItsPointReadsAborts) {
+  // A reads x from B, which also inserted m5 into A's empty range. C deletes
+  // m5 and overwrites x after A validated x and before A re-scans the range.
+  // No serial order has the range empty while x holds B's value.
+  auto *x = SeedRow("x", Version(10, 1));
+  TestHelper::Range range;
+  range.table_name = kTable;
+  range.start_key = "m";
+  range.end_key = "n";
+  ASSERT_TRUE(
+      Commit({}, {{kTable, "m5", "b", RowOp::kInsert}, {kTable, "x", "b"}}))
+      << reason_;
+  const uint64_t x_from_b = x->transaction_id.load().obj;
+
+  Pipe arrived;
+  Pipe release;
+  ArmedSyncPoints points;
+  points.arm("HELIOS_DEBUG_SYNC_SILO_COMMIT_BEFORE_RANGE_REVALIDATION",
+             arrive_and_wait(arrived, release));
+  Tidword a_last_tid;
+  std::string a_reason;
+  auto committer = std::async(std::launch::async, [&] {
+    return commit_as(a_last_tid, a_reason, {{kTable, "x", x_from_b}},
+                    {{kTable, "z", "a"}}, {}, {range});
+  });
+  ReleaseOnExit release_on_exit{release.write_fd()};
+  ASSERT_TRUE(wait_arrival(arrived));
+
+  ASSERT_TRUE(
+      Commit({}, {{kTable, "m5", "", RowOp::kDelete}, {kTable, "x", "c"}}))
+      << reason_;
+  ASSERT_EQ(::write(release.write_fd(), "r", 1), 1);
+  ASSERT_EQ(committer.wait_for(kArrivalTimeout), std::future_status::ready);
+  EXPECT_FALSE(committer.get());
+  EXPECT_EQ("primary_range_result_changed", a_reason);
+}
+
+TEST_F(CommitTidTest, OneCommitBetweenTwoRangeRevalidationsAborts) {
+  // A scans p5 live in [p, q); B deletes m5 and p5; A scans [m, n) empty.
+  // C inserts m5 and p5 again after A revalidated [m, n) and before it
+  // re-scans [p, q). No serial order has [m, n) empty while p5 is live.
+  auto *m5 = SeedRow("m5", Version(10, 1));
+  SeedRow("p5", Version(10, 1));
+  TestHelper::Range second;
+  second.table_name = kTable;
+  second.start_key = "p";
+  second.end_key = "q";
+  second.rows = {{"p5", Version(10, 1).obj}};
+  ASSERT_TRUE(Commit({}, {{kTable, "m5", "", RowOp::kDelete},
+                          {kTable, "p5", "", RowOp::kDelete}}))
+      << reason_;
+  TestHelper::Range first;
+  first.table_name = kTable;
+  first.start_key = "m";
+  first.end_key = "n";
+  first.visited = {{"m5", m5->transaction_id.load().obj}};
+
+  Pipe arrived;
+  Pipe release;
+  ArmedSyncPoints points;
+  points.arm("HELIOS_DEBUG_SYNC_SILO_COMMIT_BEFORE_RANGE_REVALIDATION",
+             arrive_and_wait(arrived, release));
+  Tidword a_last_tid;
+  std::string a_reason;
+  auto committer = std::async(std::launch::async, [&] {
+    return commit_as(a_last_tid, a_reason, {}, {{kTable, "z", "a"}}, {},
+                    {first, second});
+  });
+  ReleaseOnExit release_on_exit{release.write_fd()};
+  ASSERT_TRUE(wait_arrival(arrived));
+  ASSERT_EQ(::write(release.write_fd(), "r", 1), 1);
+  ASSERT_TRUE(wait_arrival(arrived));
+
+  ASSERT_TRUE(Commit({}, {{kTable, "m5", "c", RowOp::kInsert},
+                          {kTable, "p5", "c", RowOp::kInsert}}))
+      << reason_;
+  ASSERT_EQ(::write(release.write_fd(), "r", 1), 1);
+  ASSERT_EQ(committer.wait_for(kArrivalTimeout), std::future_status::ready);
+  EXPECT_FALSE(committer.get());
+  EXPECT_EQ("primary_range_result_changed", a_reason);
+}
+
+TEST_F(CommitTidTest, RangeAcceptsAPurgedTombstoneButNotAPurgedRow) {
+  auto *k1 = SeedRow("k1", Version(10, 1));
+  SeedRow("k2", Version(10, 1));
+  auto *k3 = SeedRow("k3", Version(10, 1));
+  auto *k4 = SeedRow("k4", Version(10, 1));
+  TestHelper::Range before;
+  before.table_name = kTable;
+  before.start_key = "k";
+  before.end_key = "l";
+  before.rows = {{"k1", Version(10, 1).obj},
+                 {"k2", Version(10, 1).obj},
+                 {"k3", Version(10, 1).obj},
+                 {"k4", Version(10, 1).obj}};
+  ASSERT_TRUE(Commit({}, {{kTable, "k1", "", RowOp::kDelete},
+                          {kTable, "k3", "", RowOp::kDelete},
+                          {kTable, "k4", "", RowOp::kDelete}}))
+      << reason_;
+  // A scan after the deletes read the tombstones around k2.
+  TestHelper::Range after = before;
+  after.rows = {{"k2", Version(10, 1).obj}};
+  after.visited = {{"k1", k1->transaction_id.load().obj},
+                   {"k3", k3->transaction_id.load().obj},
+                   {"k4", k4->transaction_id.load().obj}};
+
+  // Stands in for the purge at E = 12; k1 comes back as a blank record, and
+  // the re-scan reaches k4 after the reaper cleared its latest bit.
+  Tidword retired = k4->transaction_id.load();
+  retired.latest = false;
+  k4->transaction_id.store(retired);
+  auto &tree = tables_.GetTable(kTable)->GetPrimaryIndex();
+  reaper_.Purge(10);
+  ASSERT_EQ(nullptr, tree.Get("k3"));
+  ASSERT_NE(k1, tree.GetOrInsert("k1"));
+
+  EXPECT_TRUE(Commit({}, {{kTable, "z", "value"}}, {}, {after})) << reason_;
+  EXPECT_FALSE(Commit({}, {{kTable, "z", "value"}}, {}, {before}));
+  EXPECT_EQ("primary_range_result_changed", reason_);
+}
+
+TEST_F(CommitTidTest, PrimaryRangeAbortsWhenARecordedTombstoneRevives) {
+  auto *k = SeedRow("k", Version(10, 1));
+  ASSERT_TRUE(Commit({}, {{kTable, "k", "", RowOp::kDelete}})) << reason_;
+  TestHelper::Range range;
+  range.table_name = kTable;
+  range.start_key = "k";
+  range.end_key = "l";
+  range.visited = {{"k", k->transaction_id.load().obj}};
+  ASSERT_TRUE(Commit({}, {{kTable, "z", "value"}}, {}, {range})) << reason_;
+
+  // The revived row must not match the tombstone the scan read.
+  ASSERT_TRUE(Commit({}, {{kTable, "k", "again", RowOp::kInsert}})) << reason_;
+  EXPECT_FALSE(Commit({}, {{kTable, "z", "value"}}, {}, {range}));
+  EXPECT_EQ("primary_range_result_changed", reason_);
+}
+
+TEST_F(CommitTidTest,
+       SecondaryRangeAcceptsPurgedTombstonesButNotDeletedOrRevivedRows) {
+  // Entry d lists live row a, p lists deleted row b, q was emptied, qq lists
+  // live row f, and r lists deleted row e. A row deleted without its entry is
+  // a base tombstone under an unchanged entry.
+  ASSERT_TRUE(Commit({},
+                     {{kTable, "a", "v", RowOp::kInsert},
+                      {kTable, "b", "v", RowOp::kInsert},
+                      {kTable, "c", "v", RowOp::kInsert},
+                      {kTable, "e", "v", RowOp::kInsert},
+                      {kTable, "f", "v", RowOp::kInsert}},
+                     {{kTable, "idx", "d", "a", false},
+                      {kTable, "idx", "p", "b", false},
+                      {kTable, "idx", "q", "c", false},
+                      {kTable, "idx", "qq", "f", false},
+                      {kTable, "idx", "r", "e", false}}))
+      << reason_;
+  ASSERT_TRUE(Commit(
+      {},
+      {{kTable, "b", "", RowOp::kDelete}, {kTable, "e", "", RowOp::kDelete}},
+      {{kTable, "idx", "q", "c", true}}))
+      << reason_;
+
+  auto &tree = tables_.GetTable(kTable)->GetPrimaryIndex();
+  auto &entries = tables_.GetTable(kTable)->GetSecondaryIndex("idx")->tree;
+  TestHelper::Range live;
+  live.table_name = kTable;
+  live.index_name = "idx";
+  live.start_key = "d";
+  live.end_key = "e";
+  live.visited = {{"d", entries.Get("d")->transaction_id.load().obj}};
+  live.rows = {{"a", tree.Get("a")->transaction_id.load().obj}};
+  TestHelper::Range purged = live;
+  purged.start_key = "p";
+  purged.end_key = "r";
+  purged.visited = {{"p", entries.Get("p")->transaction_id.load().obj},
+                    {"b", tree.Get("b")->transaction_id.load().obj},
+                    {"q", entries.Get("q")->transaction_id.load().obj},
+                    {"qq", entries.Get("qq")->transaction_id.load().obj}};
+  purged.rows = {{"f", tree.Get("f")->transaction_id.load().obj}};
+  TestHelper::Range revived = purged;
+  revived.start_key = "r";
+  revived.end_key = "s";
+  revived.visited = {{"r", entries.Get("r")->transaction_id.load().obj},
+                     {"e", tree.Get("e")->transaction_id.load().obj}};
+  revived.rows = {};
+  ASSERT_TRUE(Commit({}, {{kTable, "z", "value"}}, {}, {live, purged, revived}))
+      << reason_;
+
+  // A live row that became a tombstone matches no visited record.
+  ASSERT_TRUE(Commit({}, {{kTable, "a", "", RowOp::kDelete}})) << reason_;
+  EXPECT_FALSE(Commit({}, {{kTable, "z", "value"}}, {}, {live}));
+  EXPECT_EQ("secondary_range_result_changed", reason_);
+
+  // A base tombstone that became a live row matches no recorded row.
+  ASSERT_TRUE(Commit({}, {{kTable, "e", "again", RowOp::kInsert}})) << reason_;
+  EXPECT_FALSE(Commit({}, {{kTable, "z", "value"}}, {}, {revived}));
+  EXPECT_EQ("secondary_range_result_changed", reason_);
+
+  // The purged base tombstone and emptied entry are not reached, and qq still
+  // matches after them.
+  reaper_.Purge(10);
+  ASSERT_EQ(nullptr, tree.Get("b"));
+  ASSERT_EQ(nullptr, entries.Get("q"));
+  EXPECT_TRUE(Commit({}, {{kTable, "z", "value"}}, {}, {purged})) << reason_;
 }
 
 TEST(TidWordTest, BitPositionsMatchLayout) {

@@ -70,7 +70,7 @@ enum AbortReason {
 }
 
 // A range this transaction scanned. The commit re-runs the scan described
-// by the bounds and requires the same key list.
+// by the bounds and requires the records it read with the same TID words.
 message RangeReadEntry {
     string table_name = 1;
     string index_name = 2; // Empty means primary index.
@@ -78,9 +78,17 @@ message RangeReadEntry {
     bytes end_key = 4;
     uint64 row_limit = 5; // 0 means compare the whole range.
     bool reverse_scan = 6;
-    // Primary-key scan: primary keys. Secondary-index scan: secondary keys.
-    repeated bytes result_keys = 7;
-    repeated bytes result_primary_keys = 8; // Secondary-index scan only.
+    // The rows the scan returned, keyed by primary key, and the records it
+    // visited without returning them, each in scan order.
+    repeated RangeRecord rows = 7;
+    repeated RangeRecord visited = 8;
+}
+
+// An index record a range scan visited and the TID word it read.
+message RangeRecord {
+    bytes key = 1;
+    uint64 tid = 2;
+    bool entry = 3;  // A secondary entry, not a base record.
 }
 
 // Optimizer statistics: row counts and index NDV.
@@ -167,6 +175,8 @@ message TxScan {
     message Response {
         bool ok = 1;
         repeated Row rows = 2;
+        // The tombstones the scan visited, in scan order.
+        repeated RangeRecord visited = 3;
     }
 }
 
@@ -192,6 +202,8 @@ message TxScanIndex {
     message Response {
         bool ok = 1;
         repeated Row rows = 2;
+        // The entries and base tombstones the scan visited, in scan order.
+        repeated RangeRecord visited = 3;
     }
 }
 
@@ -237,6 +249,10 @@ message TxExecuteReadPlan {
         repeated uint32 group_sizes = 11;
         repeated bytes group_start_keys = 12;
         repeated bytes group_end_keys = 13;
+        // The records a scan visited without returning them as rows, in scan
+        // order; group_visited_sizes[i] of them belong to group i.
+        repeated RangeRecord visited = 14;
+        repeated uint32 group_visited_sizes = 15;
     }
     message Request {
         repeated PlanStep steps = 1;

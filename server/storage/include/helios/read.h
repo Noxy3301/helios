@@ -51,6 +51,21 @@ struct ScanIndexRow {
 };
 
 /**
+ * @brief An index record a range scan visited without returning it as a row,
+ * and the TID word the scan read from it.
+ *
+ * @details A primary index scan lists its tombstones. A secondary index scan
+ * lists every secondary entry and every base tombstone, each entry before the
+ * base records its primary keys name. The list is in scan order, and a blank
+ * record reads as no record and is not listed.
+ */
+struct VisitedRecord {
+  std::string key;
+  uint64_t tid = 0;
+  bool entry = false;  // A secondary entry, not a base record.
+};
+
+/**
  * @brief Outcome of Database::Scan.
  *
  * `ok` separates a genuine empty result from a scan that never ran: the
@@ -60,6 +75,7 @@ struct ScanIndexRow {
 struct ScanResult {
   bool ok = false;
   std::vector<ScanRow> rows;
+  std::vector<VisitedRecord> visited;
 };
 
 /**
@@ -91,6 +107,7 @@ struct ScanPaxRow {
 struct ScanPaxResult {
   bool ok = false;
   std::vector<ScanPaxRow> rows;
+  std::vector<VisitedRecord> visited;
 };
 
 /**
@@ -110,6 +127,7 @@ uint64_t CurrentTid(const ScanPaxRow &row);
 struct ScanIndexResult {
   bool ok = false;
   std::vector<ScanIndexRow> rows;
+  std::vector<VisitedRecord> visited;
 };
 
 }  // namespace helios::storage

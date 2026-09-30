@@ -55,6 +55,14 @@ void pack_write(msgpack::packer<wal::PackedLogRecord> &pk, std::string_view key,
   pk.pack(primary_key);
 }
 
+// True when every record from `pos` on is a tombstone the re-scan did not
+// reach, which the reaper purged as Transaction::match_record describes.
+bool rest_purged(const std::vector<Transaction::RangeRecord> &records,
+                 size_t pos) {
+  return std::all_of(records.begin() + pos, records.end(),
+                     [](const auto &record) { return record.tid.absent; });
+}
+
 }  // namespace
 
 Transaction::Transaction(TableDictionary &tables, epoch::Framework &epoch,
@@ -83,10 +91,10 @@ void Transaction::Read(std::string_view table, std::string_view key,
 void Transaction::RangeRead(std::string_view table, std::string_view index,
                             std::string_view begin, std::string_view end,
                             uint64_t limit, bool reverse,
-                            std::vector<std::string_view> keys,
-                            std::vector<std::string_view> primary_keys) {
+                            std::vector<RangeRecord> rows,
+                            std::vector<RangeRecord> visited) {
   range_set_.push_back({table, index, begin, end, limit, reverse,
-                        std::move(keys), std::move(primary_keys)});
+                        std::move(rows), std::move(visited)});
 }
 
 bool Transaction::Write(std::string_view table_name, std::string_view key,
@@ -396,6 +404,7 @@ bool Transaction::ValidateReads(Tidword &max_tid, std::string &reason) {
   }
 
   for (const auto &range : range_set_) {
+    HELIOS_DEBUG_SYNC("silo_commit.before_range_revalidation");
     const bool ok = range.index.empty()
                         ? RevalidateRange(range, max_tid)
                         : RevalidateSecondaryRange(range, max_tid);
@@ -412,34 +421,28 @@ bool Transaction::RevalidateRange(const RangeEntry &range, Tidword &max_tid) {
   auto table = tables_.GetTable(range.table);
   if (table == nullptr) return false;
 
-  size_t result_pos = 0;
-  bool aborted = false;
+  size_t row = 0;
+  size_t visited = 0;
+  uint64_t live = 0;
   bool matches = true;
-  auto collect_key = [&](std::string_view key, DataItem &item) {
+  // Match each record the re-scan reaches, up to its limit-th live row.
+  auto match_key = [&](std::string_view key, DataItem &item) {
     const Tidword tid = item.transaction_id.load();
-    if (tid.lock && !OwnsLock(&item)) {
-      aborted = true;
+    if (!match_record(range, row, visited, key, &item, tid, false, max_tid)) {
+      matches = false;
       return true;
     }
-    // Include tombstones too: their delete TIDs determine the state we saw.
-    max_tid = std::max(max_tid, tid);
-    if (!tid.absent) {
-      if (result_pos >= range.keys.size() || range.keys[result_pos] != key) {
-        matches = false;
-        return true;
-      }
-      ++result_pos;
-    }
-    return range.limit > 0 && result_pos >= range.limit;
+    if (!tid.absent) ++live;
+    return range.limit > 0 && live >= range.limit;
   };
 
   if (range.reverse) {
-    table->GetPrimaryIndex().ScanReverse(range.begin, range.end, collect_key);
+    table->GetPrimaryIndex().ScanReverse(range.begin, range.end, match_key);
   } else {
-    table->GetPrimaryIndex().Scan(range.begin, range.end, collect_key);
+    table->GetPrimaryIndex().Scan(range.begin, range.end, match_key);
   }
-  if (aborted) return false;
-  return matches && result_pos == range.keys.size();
+  return matches && row == range.rows.size() &&
+         rest_purged(range.visited, visited);
 }
 
 bool Transaction::RevalidateSecondaryRange(const RangeEntry &range,
@@ -449,65 +452,79 @@ bool Transaction::RevalidateSecondaryRange(const RangeEntry &range,
   auto *index = table->GetSecondaryIndex(range.index);
   if (index == nullptr) return false;
 
-  size_t result_pos = 0;
-  bool aborted = false;
+  size_t row = 0;
+  size_t visited = 0;
+  uint64_t live = 0;
   bool matches = true;
-  auto collect_base_row = [&](std::string_view secondary_key,
-                              std::string_view primary_key) {
-    DataItem *item = table->GetPrimaryIndex().Get(primary_key);
-    if (item == nullptr) return false;
-    const Tidword tid = item->transaction_id.load();
-    if (tid.lock && !OwnsLock(item)) {
-      aborted = true;
-      return true;
-    }
-    max_tid = std::max(max_tid, tid);
-    if (!tid.absent) {
-      if (result_pos >= range.keys.size() ||
-          result_pos >= range.primary_keys.size() ||
-          range.keys[result_pos] != secondary_key ||
-          range.primary_keys[result_pos] != primary_key) {
-        matches = false;
-        return true;
-      }
-      ++result_pos;
-    }
-    return range.limit > 0 && result_pos >= range.limit;
-  };
-
-  auto collect_secondary_key = [&](std::string_view key, DataItem &) {
+  auto match_entry = [&](std::string_view key, DataItem &) {
     // Find the current entry; the item supplied by the scan may be stale.
     DataItem *item = index->tree.Get(key);
     if (item == nullptr) return false;
 
-    const Tidword tid = item->transaction_id.load();
-    if (tid.lock && !OwnsLock(item)) {
-      aborted = true;
-      return true;
-    }
-
     // The key list is a separate load; abort if the word moved around it.
+    const Tidword tid = item->transaction_id.load();
     auto primary_keys = std::atomic_load(&item->primary_keys);
-    if (item->transaction_id.load() != tid) {
-      aborted = true;
+    if (item->transaction_id.load() != tid ||
+        !match_record(range, row, visited, key, item, tid, true, max_tid)) {
+      matches = false;
       return true;
     }
-    max_tid = std::max(max_tid, tid);
 
+    // The entry's word fixes its list, so its base records follow in order. A
+    // missing base record reads as no record, as the scan skipped it.
     for (std::string_view primary_key : PrimaryKeyList::View(primary_keys)) {
-      if (collect_base_row(key, primary_key)) return true;
+      DataItem *base = table->GetPrimaryIndex().Get(primary_key);
+      if (base == nullptr) continue;
+      const Tidword base_tid = base->transaction_id.load();
+      if (!match_record(range, row, visited, primary_key, base, base_tid, false,
+                        max_tid)) {
+        matches = false;
+        return true;
+      }
+      if (!base_tid.absent) ++live;
+      if (range.limit > 0 && live >= range.limit) return true;
     }
     return false;
   };
 
   if (range.reverse) {
-    index->tree.ScanReverse(range.begin, range.end, collect_secondary_key);
+    index->tree.ScanReverse(range.begin, range.end, match_entry);
   } else {
-    index->tree.Scan(range.begin, range.end, collect_secondary_key);
+    index->tree.Scan(range.begin, range.end, match_entry);
   }
-  if (aborted) return false;
-  return matches && result_pos == range.keys.size() &&
-         result_pos == range.primary_keys.size();
+  return matches && row == range.rows.size() &&
+         rest_purged(range.visited, visited);
+}
+
+bool Transaction::match_record(const RangeEntry &range, size_t &row,
+                               size_t &visited, std::string_view key,
+                               DataItem *item, Tidword tid, bool entry,
+                               Tidword &max_tid) const {
+  if (tid.lock) {
+    if (!OwnsLock(item)) return false;
+    tid.lock = false;
+  }
+  // A record the reaper unlinked (latest clear) counts as not reached.
+  if (!tid.latest) return true;
+  if (tid == Tidword::Absent()) return true;
+
+  // A skipped tombstone's deleter serializes before this attempt: the reaper
+  // purges only deletes of epoch <= E - 2, and E <= e + 1 while this attempt
+  // is joined at e.
+  const bool live = !entry && !tid.absent;
+  const auto &records = live ? range.rows : range.visited;
+  size_t &pos = live ? row : visited;
+  while (pos < records.size() && records[pos].key != key &&
+         records[pos].tid.absent) {
+    ++pos;
+  }
+  if (pos >= records.size() || records[pos].key != key ||
+      records[pos].tid != tid) {
+    return false;
+  }
+  ++pos;
+  max_tid = std::max(max_tid, tid);
+  return true;
 }
 
 void Transaction::Apply(DataItem &item, const WriteEntry &entry,

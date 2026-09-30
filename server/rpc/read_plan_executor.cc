@@ -185,6 +185,8 @@ void HeliosRpc::handleTxExecuteReadPlan(
                     std::vector<std::string> secondary_keys;
                     std::vector<uint64_t> tids;
                     std::vector<uint32_t> group_rows;
+                    std::vector<helios::storage::VisitedRecord> visited;
+                    std::vector<uint32_t> group_visited;
                 };
                 std::vector<ProbeOut> outputs(worker_count);
                 std::vector<char> failed(worker_count, 0);
@@ -211,6 +213,8 @@ void HeliosRpc::handleTxExecuteReadPlan(
                                 const std::string row_end =
                                     next_lexicographic_key(row_key);
                                 uint32_t group_rows = 0;
+                                const size_t visited_before =
+                                    out.visited.size();
                                 if (step.index_name().empty()) {
                                   auto scan_result = db->Scan(
                                       step.table_name(), row_key, row_end,
@@ -226,6 +230,8 @@ void HeliosRpc::handleTxExecuteReadPlan(
                                         out.tids.push_back(r.tid);
                                         ++group_rows;
                                     }
+                                    for (auto& v : scan_result.visited)
+                                        out.visited.push_back(std::move(v));
                                 } else {
                                   auto scan_result = db->ScanIndex(
                                       step.table_name(), step.index_name(),
@@ -244,8 +250,13 @@ void HeliosRpc::handleTxExecuteReadPlan(
                                         out.tids.push_back(r.tid);
                                         ++group_rows;
                                     }
+                                    for (auto& v : scan_result.visited)
+                                        out.visited.push_back(std::move(v));
                                 }
                                 out.group_rows.push_back(group_rows);
+                                out.group_visited.push_back(
+                                    static_cast<uint32_t>(out.visited.size() -
+                                                          visited_before));
                             } else {
                               auto read_result =
                                   db->Read(step.table_name(), row_key, nullptr);
@@ -271,6 +282,7 @@ void HeliosRpc::handleTxExecuteReadPlan(
                     for (unsigned worker_index = 0;
                          worker_index < worker_count; ++worker_index) {
                         ProbeOut& out = outputs[worker_index];
+                        add_visited(step_result, out.visited);
                         for (size_t i = 0; i < out.keys.size(); ++i) {
                             if (!out.secondary_keys.empty()) {
                                 step_result->add_secondary_keys(
@@ -294,6 +306,8 @@ void HeliosRpc::handleTxExecuteReadPlan(
                                     probe_keys[probe_index];
                                 step_result->add_group_sizes(
                                     out.group_rows[probe_index - begin]);
+                                step_result->add_group_visited_sizes(
+                                    out.group_visited[probe_index - begin]);
                                 step_result->add_group_start_keys(row_key);
                                 step_result->add_group_end_keys(
                                     next_lexicographic_key(row_key));
@@ -310,6 +324,7 @@ void HeliosRpc::handleTxExecuteReadPlan(
                     // Per-probe range scan: [row_key, next(row_key)).
                     const std::string row_end = next_lexicographic_key(row_key);
                     int group_rows = 0;
+                    const int visited_before = step_result->visited_size();
                     if (step.index_name().empty()) {
                       auto scan_result = db_manager_->get_database()->Scan(
                           step.table_name(), row_key, row_end,
@@ -319,6 +334,7 @@ void HeliosRpc::handleTxExecuteReadPlan(
                         flat_plan::pack(response, *result);
                         return;
                       }
+                        add_visited(step_result, scan_result.visited);
                         for (auto& r : scan_result.rows) {
                             step_result->add_scan_keys(std::move(r.key));
                             step_result->add_scan_values(std::move(r.value));
@@ -335,6 +351,7 @@ void HeliosRpc::handleTxExecuteReadPlan(
                         flat_plan::pack(response, *result);
                         return;
                       }
+                        add_visited(step_result, scan_result.visited);
                         for (auto& r : scan_result.rows) {
                             step_result->add_secondary_keys(
                                 std::move(r.secondary_key));
@@ -346,6 +363,8 @@ void HeliosRpc::handleTxExecuteReadPlan(
                     }
                     step_result->add_group_sizes(
                         static_cast<uint32_t>(group_rows));
+                    step_result->add_group_visited_sizes(static_cast<uint32_t>(
+                        step_result->visited_size() - visited_before));
                     step_result->add_group_start_keys(row_key);
                     step_result->add_group_end_keys(row_end);
                     continue;
@@ -397,6 +416,7 @@ void HeliosRpc::handleTxExecuteReadPlan(
                 step_result->add_scan_values(std::move(row.value));
                 step_result->add_scan_tids(row.tid);
             }
+            add_visited(step_result, scan_result.visited);
         } else {
             step_result->set_actual_start_key(start_key);
             step_result->set_actual_end_key(end_key);
@@ -414,6 +434,7 @@ void HeliosRpc::handleTxExecuteReadPlan(
                 step_result->add_scan_values(std::move(row.value));
                 step_result->add_scan_tids(row.tid);
             }
+            add_visited(step_result, scan_result.visited);
         }
     }
 
