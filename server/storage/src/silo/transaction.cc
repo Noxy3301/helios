@@ -396,6 +396,7 @@ bool Transaction::ValidateReads(Tidword &max_tid, std::string &reason) {
   }
 
   for (const auto &range : range_set_) {
+    HELIOS_DEBUG_SYNC("silo_commit.before_range_revalidation");
     const bool ok = range.index.empty()
                         ? RevalidateRange(range, max_tid)
                         : RevalidateSecondaryRange(range, max_tid);

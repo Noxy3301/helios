@@ -8,6 +8,7 @@
 #include <chrono>
 #include <filesystem>
 #include <functional>
+#include <future>
 #include <memory>
 #include <string>
 #include <thread>
@@ -21,6 +22,7 @@
 #include "index/reaper.h"
 #include "pax/epoch_image_buffer.h"
 #include "silo/stable_read.h"
+#include "sync_point.h"
 #include "helios/transaction.h"
 #include "table/table_dictionary.h"
 #include "util/epoch_framework.h"
@@ -63,6 +65,8 @@ class CommitTidTest : public ::testing::Test {
   std::unique_ptr<wal::Logger> logger_;
   Tidword last_tid_;
   std::string reason_;
+
+  static void SetUpTestSuite() { keep_sync_facility_armed(); }
 
   void SetUp() override {
     config_.work_dir = "./helios_commit_tid_test_logs";
@@ -120,18 +124,41 @@ class CommitTidTest : public ::testing::Test {
               const std::vector<TestHelper::RowWrite> &writes,
               const std::vector<TestHelper::IndexOp> &index_ops = {},
               const std::vector<TestHelper::Range> &ranges = {}) {
-    reason_.clear();
+    return commit_as(last_tid_, reason_, reads, writes, index_ops, ranges);
+  }
+
+  // Commits as the worker that owns `last_tid` and `reason`.
+  bool commit_as(Tidword &last_tid, std::string &reason,
+                 const std::vector<TestHelper::PointRead> &reads,
+                 const std::vector<TestHelper::RowWrite> &writes,
+                 const std::vector<TestHelper::IndexOp> &index_ops,
+                 const std::vector<TestHelper::Range> &ranges) {
+    reason.clear();
     // The packed rows outlive the attempt; the transaction borrows their bytes.
     std::vector<TestHelper::RowWrite> rows = writes;
     for (auto &row : rows) row.value = TestHelper::Row(row.value);
-    silo::Transaction tx(tables_, epoch_, reaper_, *logger_, last_tid_);
+    silo::Transaction tx(tables_, epoch_, reaper_, *logger_, last_tid);
     const bool committed =
-        TestHelper::Feed(tx, reads, ranges, rows, index_ops, reason_) &&
-        tx.Commit(CommitDurability::kAsync, reason_);
+        TestHelper::Feed(tx, reads, ranges, rows, index_ops, reason) &&
+        tx.Commit(CommitDurability::kAsync, reason);
     index::release_thread_epoch();
     return committed;
   }
 };
+
+constexpr auto kArrivalTimeout = std::chrono::seconds(5);
+
+std::string arrive_and_wait(const Pipe &arrived, const Pipe &release) {
+  return "arrive_and_wait:" + std::to_string(arrived.write_fd()) + ":" +
+         std::to_string(release.read_fd());
+}
+
+// Waits until the committer stops at the armed point.
+bool wait_arrival(const Pipe &arrived) {
+  char announcement = 0;
+  return wait_readable(arrived.read_fd(), kArrivalTimeout) &&
+         ::read(arrived.read_fd(), &announcement, 1) == 1;
+}
 
 TEST_F(CommitTidTest, CommitReadsTheEpochAfterTheWriteSetIsFed) {
   auto *item = SeedRow("key", Version(10, 5));
@@ -1095,6 +1122,87 @@ TEST_F(CommitTidTest,
 
   reaper_.Purge(10);
   EXPECT_EQ(nullptr, index->tree.Get("s"));
+}
+
+TEST_F(CommitTidTest, DISABLED_RangeEmptiedAgainAfterItsPointReadsAborts) {
+  // A reads x from B, which also inserted m5 into A's empty range. C deletes
+  // m5 and overwrites x after A validated x and before A re-scans the range.
+  // No serial order has the range empty while x holds B's value.
+  auto *x = SeedRow("x", Version(10, 1));
+  TestHelper::Range range;
+  range.table_name = kTable;
+  range.start_key = "m";
+  range.end_key = "n";
+  ASSERT_TRUE(
+      Commit({}, {{kTable, "m5", "b", RowOp::kInsert}, {kTable, "x", "b"}}))
+      << reason_;
+  const uint64_t x_from_b = x->transaction_id.load().obj;
+
+  Pipe arrived;
+  Pipe release;
+  ArmedSyncPoints points;
+  points.arm("HELIOS_DEBUG_SYNC_SILO_COMMIT_BEFORE_RANGE_REVALIDATION",
+             arrive_and_wait(arrived, release));
+  Tidword a_last_tid;
+  std::string a_reason;
+  auto committer = std::async(std::launch::async, [&] {
+    return commit_as(a_last_tid, a_reason, {{kTable, "x", x_from_b}},
+                    {{kTable, "z", "a"}}, {}, {range});
+  });
+  ReleaseOnExit release_on_exit{release.write_fd()};
+  ASSERT_TRUE(wait_arrival(arrived));
+
+  ASSERT_TRUE(
+      Commit({}, {{kTable, "m5", "", RowOp::kDelete}, {kTable, "x", "c"}}))
+      << reason_;
+  ASSERT_EQ(::write(release.write_fd(), "r", 1), 1);
+  ASSERT_EQ(committer.wait_for(kArrivalTimeout), std::future_status::ready);
+  EXPECT_FALSE(committer.get());
+  EXPECT_EQ("primary_range_result_changed", a_reason);
+}
+
+TEST_F(CommitTidTest, DISABLED_OneCommitBetweenTwoRangeRevalidationsAborts) {
+  // A scans p5 live in [p, q); B deletes m5 and p5; A scans [m, n) empty.
+  // C inserts m5 and p5 again after A revalidated [m, n) and before it
+  // re-scans [p, q). No serial order has [m, n) empty while p5 is live.
+  SeedRow("m5", Version(10, 1));
+  SeedRow("p5", Version(10, 1));
+  TestHelper::Range second;
+  second.table_name = kTable;
+  second.start_key = "p";
+  second.end_key = "q";
+  second.result_keys = {"p5"};
+  ASSERT_TRUE(Commit({}, {{kTable, "m5", "", RowOp::kDelete},
+                          {kTable, "p5", "", RowOp::kDelete}}))
+      << reason_;
+  TestHelper::Range first;
+  first.table_name = kTable;
+  first.start_key = "m";
+  first.end_key = "n";
+
+  Pipe arrived;
+  Pipe release;
+  ArmedSyncPoints points;
+  points.arm("HELIOS_DEBUG_SYNC_SILO_COMMIT_BEFORE_RANGE_REVALIDATION",
+             arrive_and_wait(arrived, release));
+  Tidword a_last_tid;
+  std::string a_reason;
+  auto committer = std::async(std::launch::async, [&] {
+    return commit_as(a_last_tid, a_reason, {}, {{kTable, "z", "a"}}, {},
+                    {first, second});
+  });
+  ReleaseOnExit release_on_exit{release.write_fd()};
+  ASSERT_TRUE(wait_arrival(arrived));
+  ASSERT_EQ(::write(release.write_fd(), "r", 1), 1);
+  ASSERT_TRUE(wait_arrival(arrived));
+
+  ASSERT_TRUE(Commit({}, {{kTable, "m5", "c", RowOp::kInsert},
+                          {kTable, "p5", "c", RowOp::kInsert}}))
+      << reason_;
+  ASSERT_EQ(::write(release.write_fd(), "r", 1), 1);
+  ASSERT_EQ(committer.wait_for(kArrivalTimeout), std::future_status::ready);
+  EXPECT_FALSE(committer.get());
+  EXPECT_EQ("primary_range_result_changed", a_reason);
 }
 
 TEST(TidWordTest, BitPositionsMatchLayout) {
