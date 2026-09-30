@@ -270,6 +270,8 @@ private:
     uint64_t row_limit = 0;
     std::vector<std::pair<std::string, std::string>> rows;
     std::vector<uint64_t> row_tids;
+    // Tombstones the scan visited, in scan order.
+    std::vector<HeliosProxy::RangeRecord> visited;
     // Set only on a lookup return copy: a partial scan result holds the first
     // rows of the range, not all of them.
     bool truncated = false;
@@ -283,6 +285,9 @@ private:
     uint64_t row_limit = 0;
     std::vector<std::string> secondary_keys;
     std::vector<std::string> primary_keys;
+    std::vector<uint64_t> row_tids;  // Of the base rows.
+    // Entries and base tombstones the scan visited, in scan order.
+    std::vector<HeliosProxy::RangeRecord> visited;
   };
   // Ranges a read plan cached for this statement. A request the cache covers
   // is served from it; anything else goes to the storage server.
@@ -294,8 +299,9 @@ private:
   std::unordered_map<std::string, std::vector<size_t>> secondary_scan_start_index_;
   void push_range_scan_cache(RangeScanCacheEntry entry);
   void push_secondary_scan_cache(SecondaryScanCacheEntry entry);
-  // Keep the rows (pairs) the request's bounds cover. The parallel arrays are
-  // appended together at every push site, so they are the same length.
+  // Keep the rows (pairs) the request's bounds cover, and the visited records
+  // inside them. The parallel arrays are appended together at every push
+  // site, so they are the same length.
   static void trim_range_entry(RangeScanCacheEntry& entry,
                                const std::string& start_key,
                                const std::string& end_key);

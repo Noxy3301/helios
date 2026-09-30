@@ -8,6 +8,7 @@
 #include <utility>
 #include <vector>
 
+#include "helios_rpc.hh"
 #include "key_pack.hh"
 #include "server/server_config.hh"
 
@@ -18,6 +19,7 @@ struct RefChunkOut {
     std::vector<std::string> scan_keys;
     std::vector<std::string> scan_values;
     std::vector<uint64_t> tids;
+    std::vector<helios::storage::VisitedRecord> visited;  // In scan order.
     bool serial_scan_required = false;
 };
 
@@ -35,6 +37,7 @@ void run_range(helios::storage::Database* db,
         return;
     }
 
+    out.visited = std::move(refs.visited);
     for (auto& row_ref : refs.rows) {
         const auto* group =
             static_cast<const helios::storage::pax::PaxGroup*>(row_ref.group);
@@ -49,7 +52,12 @@ void run_range(helios::storage::Database* db,
         // the ref-scan observation. Otherwise re-read a stable row copy.
         if (helios::storage::CurrentTid(row_ref) != row_ref.tid) {
             auto reread = db->Read(step.table_name(), row_ref.key, nullptr);
-            if (!reread.found) continue;
+            // A row deleted after the ref scan is a tombstone this list
+            // lacks; the row scan lists it.
+            if (!reread.found) {
+                out.serial_scan_required = true;
+                break;
+            }
             out.scan_keys.push_back(std::move(row_ref.key));
             out.scan_values.push_back(std::move(reread.value));
             out.tids.push_back(reread.tid);
@@ -141,6 +149,7 @@ bool parallel_primary_pax_row_ref_scan(
 
     uint64_t emitted = 0;
     for (auto& chunk : chunks) {
+        add_visited(step_result, chunk.visited);
         for (size_t i = 0; i < chunk.scan_keys.size(); ++i) {
             step_result->add_scan_keys(std::move(chunk.scan_keys[i]));
             step_result->add_scan_values(std::move(chunk.scan_values[i]));

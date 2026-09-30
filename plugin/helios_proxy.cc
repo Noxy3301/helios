@@ -62,6 +62,18 @@ size_t reserve_count(uint64_t n, size_t wire_bytes) {
     return static_cast<size_t>(std::min<uint64_t>(n, wire_bytes));
 }
 
+// Moves a scan reply's visited records out of the reply.
+template <class Response>
+std::vector<HeliosProxy::RangeRecord> take_visited(Response& response) {
+    std::vector<HeliosProxy::RangeRecord> visited;
+    visited.reserve(response.visited_size());
+    for (auto& record : *response.mutable_visited()) {
+        visited.push_back(
+            {std::move(*record.mutable_key()), record.tid(), record.entry()});
+    }
+    return visited;
+}
+
 }  // namespace
 
 HeliosProxy::HeliosProxy(const std::string& host, int port)
@@ -287,6 +299,7 @@ HeliosProxy::ScanResult HeliosProxy::tx_scan(
         out.tid = row.tid();
         result.rows.push_back(std::move(out));
     }
+    result.visited = take_visited(response);
     return result;
 }
 
@@ -330,6 +343,7 @@ HeliosProxy::ScanIndexResult HeliosProxy::tx_scan_index(
         out.tid = row.tid();
         result.rows.push_back(std::move(out));
     }
+    result.visited = take_visited(response);
     return result;
 }
 
@@ -578,6 +592,19 @@ HeliosProxy::ReadPlanResult HeliosProxy::tx_execute_read_plan(
         out.group_end_keys.reserve(reserve_count(n, raw.size()));
         for (uint64_t j = 0; j < n && r.ok; ++j)
             out.group_end_keys.push_back(r.bytes());
+        n = r.u64();
+        out.visited.reserve(reserve_count(n, raw.size()));
+        for (uint64_t j = 0; j < n && r.ok; ++j) {
+            RangeRecord record;
+            record.key = r.bytes();
+            record.tid = r.u64();
+            record.entry = r.u8() != 0;
+            out.visited.push_back(std::move(record));
+        }
+        n = r.u64();
+        out.group_visited_sizes.reserve(reserve_count(n, raw.size()));
+        for (uint64_t j = 0; j < n && r.ok; ++j)
+            out.group_visited_sizes.push_back(static_cast<uint32_t>(r.u64()));
         result.steps.push_back(std::move(out));
     }
     if (!r.ok) {

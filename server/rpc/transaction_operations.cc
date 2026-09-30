@@ -66,6 +66,7 @@ void HeliosRpc::handleTxScan(
         out->set_tid(row.tid);
         if (!request.keys_only()) out->set_value(std::move(row.value));
     }
+    add_visited(response, scan.visited);
 }
 
 void HeliosRpc::handleTxScanIndex(
@@ -84,6 +85,7 @@ void HeliosRpc::handleTxScanIndex(
         out->set_tid(row.tid);
         if (!request.keys_only()) out->set_value(std::move(row.value));
     }
+    add_visited(response, scan.visited);
 }
 
 void HeliosRpc::handleTxCommit(

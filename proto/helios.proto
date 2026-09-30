@@ -83,6 +83,13 @@ message RangeReadEntry {
     repeated bytes result_primary_keys = 8; // Secondary-index scan only.
 }
 
+// An index record a range scan visited and the TID word it read.
+message RangeRecord {
+    bytes key = 1;
+    uint64 tid = 2;
+    bool entry = 3;  // A secondary entry, not a base record.
+}
+
 // Optimizer statistics: row counts and index NDV.
 message GetTableStats {
     message IndexDesc {
@@ -167,6 +174,8 @@ message TxScan {
     message Response {
         bool ok = 1;
         repeated Row rows = 2;
+        // The tombstones the scan visited, in scan order.
+        repeated RangeRecord visited = 3;
     }
 }
 
@@ -192,6 +201,8 @@ message TxScanIndex {
     message Response {
         bool ok = 1;
         repeated Row rows = 2;
+        // The entries and base tombstones the scan visited, in scan order.
+        repeated RangeRecord visited = 3;
     }
 }
 
@@ -237,6 +248,10 @@ message TxExecuteReadPlan {
         repeated uint32 group_sizes = 11;
         repeated bytes group_start_keys = 12;
         repeated bytes group_end_keys = 13;
+        // The records a scan visited without returning them as rows, in scan
+        // order; group_visited_sizes[i] of them belong to group i.
+        repeated RangeRecord visited = 14;
+        repeated uint32 group_visited_sizes = 15;
     }
     message Request {
         repeated PlanStep steps = 1;

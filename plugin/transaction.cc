@@ -389,17 +389,27 @@ void HeliosTransaction::execute_read_plan(
       // Each group corresponds to one deduplicated probe key.
       if (step_result.group_start_keys.size() !=
               step_result.group_sizes.size() ||
-          step_result.group_end_keys.size() != step_result.group_sizes.size()) {
+          step_result.group_end_keys.size() != step_result.group_sizes.size() ||
+          step_result.group_visited_sizes.size() !=
+              step_result.group_sizes.size()) {
         // A group without its bounds cannot serve anything; the plan failed.
         rpc_trace_.record_event("abort_read_plan_groups");
         is_aborted_ = true;
         return;
       }
       size_t flat = 0;  // Offset into the flat scan arrays across all groups.
+      size_t next_visited = 0;
       for (size_t g = 0; g < step_result.group_sizes.size(); ++g) {
         const size_t n = step_result.group_sizes[g];
         const std::string& gstart = step_result.group_start_keys[g];
         const std::string& gend = step_result.group_end_keys[g];
+        // This group's visited records follow the earlier groups'.
+        const auto visited_begin = step_result.visited.begin() + next_visited;
+        next_visited += step_result.group_visited_sizes[g];
+        std::vector<HeliosProxy::RangeRecord> visited(
+            std::make_move_iterator(visited_begin),
+            std::make_move_iterator(step_result.visited.begin() +
+                                    next_visited));
         if (step.index_name.empty()) {
           // Primary range group: cache row values by primary key.
           RangeScanCacheEntry entry;
@@ -418,6 +428,7 @@ void HeliosTransaction::execute_read_plan(
               entry.row_tids.push_back(tid);
             }
           }
+          entry.visited = std::move(visited);
           push_range_scan_cache(std::move(entry));
         } else {
           // Secondary range group: cache secondary keys and their primary keys.
@@ -439,7 +450,9 @@ void HeliosTransaction::execute_read_plan(
                   std::move(step_result.secondary_keys[j]));
             }
             entry.primary_keys.push_back(std::move(key));
+            entry.row_tids.push_back(tid);
           }
+          entry.visited = std::move(visited);
           push_secondary_scan_cache(std::move(entry));
         }
         flat += n;
@@ -475,10 +488,14 @@ void HeliosTransaction::execute_read_plan(
           row_tids.push_back(tid);
         }
       }
-      RangeScanCacheEntry entry{
-          step.table_name, step_result.actual_start_key,
-          step_result.actual_end_key, step.reverse_scan, step.scan_limit,
-          std::move(rows), std::move(row_tids)};
+      RangeScanCacheEntry entry{step.table_name,
+                                step_result.actual_start_key,
+                                step_result.actual_end_key,
+                                step.reverse_scan,
+                                step.scan_limit,
+                                std::move(rows),
+                                std::move(row_tids),
+                                std::move(step_result.visited)};
       push_range_scan_cache(std::move(entry));
     } else {
       // Keep secondary_keys and primary_keys aligned; lookup walks the pairs.
@@ -494,13 +511,16 @@ void HeliosTransaction::execute_read_plan(
         cached.secondary_keys.push_back(std::move(key));
       }
       cached.primary_keys.reserve(step_result.scan_keys.size());
+      cached.row_tids.reserve(step_result.scan_keys.size());
       for (size_t j = 0; j < step_result.scan_keys.size(); ++j) {
         std::string key;
         std::string value;
         uint64_t tid = 0;
         take_plan_row(step, step_result, j, key, value, tid);
         cached.primary_keys.push_back(std::move(key));
+        cached.row_tids.push_back(tid);
       }
+      cached.visited = std::move(step_result.visited);
       push_secondary_scan_cache(std::move(cached));
     }
     step_result = HeliosProxy::ReadPlanStepResult{};
@@ -627,6 +647,7 @@ HeliosTransaction::scan_range(const std::string& start_key,
     scanned.rows.emplace_back(std::move(row.key), std::move(row.value));
     scanned.row_tids.push_back(row.tid);
   }
+  scanned.visited = std::move(result.visited);
   append_range_read(scanned);
 
   auto pairs = std::move(scanned.rows);
@@ -728,7 +749,9 @@ HeliosTransaction::SecondaryScan HeliosTransaction::scan_index_range(
     scanned.secondary_keys.push_back(row.secondary_key);
     groups[row.secondary_key].push_back(row.primary_key);
     scanned.primary_keys.push_back(std::move(row.primary_key));
+    scanned.row_tids.push_back(row.tid);
   }
+  scanned.visited = std::move(result.visited);
   append_secondary_range_read(scanned);
 
   return merge_index_scan(index_name, start_key, end_key, row_limit,
@@ -1195,6 +1218,15 @@ void HeliosTransaction::trim_range_entry(
   }
   entry.rows.resize(count);
   entry.row_tids.resize(count);
+
+  size_t kept = 0;
+  for (size_t i = 0; i < entry.visited.size(); ++i) {
+    if (entry.visited[i].key >= start_key && entry.visited[i].key < end_key) {
+      if (kept != i) entry.visited[kept] = std::move(entry.visited[i]);
+      ++kept;
+    }
+  }
+  entry.visited.resize(kept);
 }
 
 void HeliosTransaction::trim_secondary_entry(
@@ -1207,12 +1239,29 @@ void HeliosTransaction::trim_secondary_entry(
       if (count != i) {
         entry.secondary_keys[count] = std::move(entry.secondary_keys[i]);
         entry.primary_keys[count] = std::move(entry.primary_keys[i]);
+        entry.row_tids[count] = entry.row_tids[i];
       }
       ++count;
     }
   }
   entry.secondary_keys.resize(count);
   entry.primary_keys.resize(count);
+  entry.row_tids.resize(count);
+
+  // A base tombstone belongs to the entry before it.
+  size_t kept = 0;
+  bool inside = false;
+  for (size_t i = 0; i < entry.visited.size(); ++i) {
+    if (entry.visited[i].entry) {
+      inside =
+          entry.visited[i].key >= start_key && entry.visited[i].key < end_key;
+    }
+    if (inside) {
+      if (kept != i) entry.visited[kept] = std::move(entry.visited[i]);
+      ++kept;
+    }
+  }
+  entry.visited.resize(kept);
 }
 
 std::optional<HeliosTransaction::SecondaryScanCacheEntry>

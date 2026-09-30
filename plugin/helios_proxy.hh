@@ -71,6 +71,14 @@ public:
     ReadResult tx_read(const std::string& table_name, const std::string& key);
     std::vector<ReadResult> tx_batch_read(const std::vector<ReadKey>& keys);
 
+    // An index record a range scan visited and the TID word it read
+    // (RangeRecord in helios.proto).
+    struct RangeRecord {
+        std::string key;
+        uint64_t tid = 0;
+        bool entry = false;  // A secondary entry, not a base record.
+    };
+
     // Rows of [start_key, end_key) in key order, reversed when reverse_scan.
     // row_limit 0 means every row; keys_only leaves value empty. ok is false
     // when the table (or index) is missing or end_key is empty.
@@ -85,6 +93,7 @@ public:
         // refusal by the server.
         bool transport_error = false;
         std::vector<ScanRow> rows;
+        std::vector<RangeRecord> visited;  // Tombstones, in scan order.
     };
     ScanResult tx_scan(const std::string& table_name,
                        const std::string& start_key,
@@ -101,6 +110,8 @@ public:
         bool ok = false;
         bool transport_error = false;
         std::vector<ScanIndexRow> rows;
+        // Entries and base tombstones, in scan order.
+        std::vector<RangeRecord> visited;
     };
     ScanIndexResult tx_scan_index(const std::string& table_name,
                                   const std::string& index_name,
@@ -165,6 +176,10 @@ public:
         std::vector<uint32_t> group_sizes;
         std::vector<std::string> group_start_keys;
         std::vector<std::string> group_end_keys;
+        // Records a scan visited without returning them, over every group;
+        // group_visited_sizes splits them.
+        std::vector<RangeRecord> visited;
+        std::vector<uint32_t> group_visited_sizes;
     };
     struct ReadPlanResult {
         bool ok = false;

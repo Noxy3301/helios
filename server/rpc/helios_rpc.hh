@@ -16,6 +16,19 @@
 #include "helios.pb.h"
 
 #include "../database_manager.hh"
+#include "helios/read.h"
+
+// Appends a scan's visited records to a reply, in scan order.
+template <class Reply>
+void add_visited(Reply* reply,
+                 std::vector<helios::storage::VisitedRecord>& visited) {
+    for (auto& record : visited) {
+        auto* out = reply->add_visited();
+        out->set_key(std::move(record.key));
+        out->set_tid(record.tid);
+        out->set_entry(record.entry);
+    }
+}
 
 // Server-wide table row count tracker, shared across all connections.
 struct TableRowCounts {
