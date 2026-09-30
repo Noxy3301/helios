@@ -30,6 +30,7 @@ struct StableValue {
 struct StablePrimaryKeys {
   bool found = false;
   PrimaryKeyList::Ptr primary_keys;
+  Tidword tid;  // The version the list belongs to.
 
   // Valid while this struct lives: the view points into the list it pins.
   PrimaryKeyList::View primary_keys_view() const {
@@ -99,7 +100,7 @@ inline StablePrimaryKeys StableReadKeys(const DataItem &item) {
     const bool found = !tid.absent;
 
     if (item.transaction_id.load() == tid) {
-      return {found, std::move(primary_keys)};
+      return {found, std::move(primary_keys), tid};
     }
   }
 }

@@ -47,6 +47,23 @@ struct IndexOp {
   bool remove = false;
 };
 
+// One record a range scan visited: its key and the TID word it read.
+struct Record {
+  std::string key;
+  uint64_t tid = 0;
+  bool operator==(const Record &other) const {
+    return key == other.key && tid == other.tid;
+  }
+};
+
+// The key and TID word of each row or visited record of a scan, in order.
+template <typename Row>
+std::vector<Record> records(const std::vector<Row> &rows) {
+  std::vector<Record> out;
+  for (const auto &row : rows) out.push_back({row.key, row.tid});
+  return out;
+}
+
 struct Range {
   std::string table_name, index_name, start_key, end_key;
   uint64_t row_limit = 0;

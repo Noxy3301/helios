@@ -252,3 +252,37 @@ TEST(RangeValidationTest, AReverseRangeAbortsOnTheSameChange) {
   EXPECT_FALSE(Revalidate(db, range, reason));
   EXPECT_EQ(reason, "primary_range_result_changed");
 }
+
+TEST(RangeValidationTest, APaxScanListsTheRecordsARowScanVisits) {
+  // The parallel scan must return the rows and list the tombstone a row scan
+  // does.
+  auto config = MakeConfig();
+  // A long epoch keeps the reaper away from the tombstone.
+  config.epoch_duration_ms = 1000;
+  helios::storage::Database db(config);
+  ASSERT_TRUE(TestHelper::CreateTable(db, kTable));
+  std::string reason;
+  ASSERT_TRUE(TestHelper::CommitRows(db, {},
+                                     {{kTable, "k1", TestHelper::Row("v")},
+                                      {kTable, "k2", TestHelper::Row("v")},
+                                      {kTable, "k3", TestHelper::Row("v")}},
+                                     {}, {}, reason,
+                                     helios::storage::CommitDurability::kAsync))
+      << reason;
+  ASSERT_TRUE(TestHelper::CommitRows(
+      db, {}, {{kTable, "k2", "", helios::storage::RowOp::kDelete}}, {}, {},
+      reason, helios::storage::CommitDurability::kAsync))
+      << reason;
+
+  const auto scan = db.Scan(kTable, "k1", "k5", 0, false);
+  db.ReleaseThreadEpoch();
+  const auto pax = db.ScanPax(kTable, "k1", "k5", 0, false);
+  db.ReleaseThreadEpoch();
+  ASSERT_TRUE(scan.ok);
+  ASSERT_TRUE(pax.ok);
+  ASSERT_EQ(scan.visited.size(), 1u);
+  EXPECT_EQ(scan.visited[0].key, "k2");
+  EXPECT_EQ(TestHelper::records(pax.rows), TestHelper::records(scan.rows));
+  EXPECT_EQ(TestHelper::records(pax.visited),
+            TestHelper::records(scan.visited));
+}
