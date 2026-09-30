@@ -105,8 +105,10 @@ class Logger {
   /**
    * @brief Starts the logger thread after recovery, before epoch
    * notifications.
+   * @param epoch The framework asked to close the epochs durability waiters
+   * need. Without one, a durability wait asks for no epoch advance.
    */
-  void Start();
+  void Start(epoch::Framework *epoch = nullptr);
 
   /**
    * @brief Requests WAL persistence without waiting for I/O.
@@ -122,7 +124,9 @@ class Logger {
 
   /**
    * @brief Blocks until the durable epoch reaches `commit_epoch`.
-   * @details Pass Deadline::max() to wait without a timeout; shutdown and an
+   * @details A wait that cannot return at once asks for `commit_epoch` to
+   * close instead of waiting for the epoch timer.
+   * Pass Deadline::max() to wait without a timeout; shutdown and an
    * I/O failure still end the wait, as Stopped and Failed respectively. An
    * epoch that is already durable is reported as such even after a terminal
    * state.
@@ -208,6 +212,8 @@ class Logger {
   State state_{State::kRunning};
   bool process_fail_stop_{false};
 
+  // Set by Start before any durability wait runs.
+  epoch::Framework *epoch_{nullptr};
   std::thread logger_thread_;
 
   /**

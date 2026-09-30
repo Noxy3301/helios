@@ -24,6 +24,8 @@
 
 #include <chrono>
 #include <filesystem>
+#include <fstream>
+#include <iterator>
 #include <memory>
 #include <string>
 
@@ -36,6 +38,13 @@
 
 namespace {
 constexpr const char *kTable = "users";
+
+bool logged(const std::string &work_dir, const std::string &key) {
+  std::ifstream file(work_dir + "/wal.log", std::ios::binary);
+  const std::string bytes((std::istreambuf_iterator<char>(file)),
+                          std::istreambuf_iterator<char>());
+  return bytes.find(key) != std::string::npos;
+}
 }  // namespace
 
 class DurabilityTest : public ::testing::Test {
@@ -128,19 +137,18 @@ TEST_F(DurabilityTest, RecoveryWithNamedTable) {
   ASSERT_EQ(data.value(), value);
 }
 
-// A commit that asked for Async is reported at precommit, so it returns
-// without the epoch it committed in having reached the device. The epoch
-// duration is the clock here: an epoch this long cannot close, let alone be
-// flushed, inside the time an Async commit is allowed to take, so a return
-// that fast is proof it did not wait. The Sync commit beside it does wait,
-// which is what makes the comparison a contract and not a stopwatch reading.
-TEST(CommitDurabilityTest, AsyncDoesNotWaitForTheDevice) {
-  constexpr size_t kEpochMs = 1000;
+// With an epoch timer far slower than the test, only a commit's own request
+// closes an epoch: an Async commit makes none and leaves its record out of the
+// log, and a Sync commit makes one and returns promptly with its record logged.
+TEST(CommitDurabilityTest, SyncCommitClosesItsOwnEpoch) {
+  constexpr size_t kEpochMs = 10000;
+  constexpr long kPromptMs = 100;
   helios::storage::Config config;
   config.work_dir = "./helios_commit_policy_test_logs";
   std::filesystem::remove_all(config.work_dir);
   config.enable_recovery = false;
   config.epoch_duration_ms = kEpochMs;
+  config.wal_initial_capacity_bytes = 1u << 20;
 
   {
     helios::storage::Database db(config);
@@ -159,18 +167,16 @@ TEST(CommitDurabilityTest, AsyncDoesNotWaitForTheDevice) {
           .count();
     };
 
-    const auto async_ms =
-        commit("async_key", helios::storage::CommitDurability::kAsync);
-    EXPECT_LT(async_ms, static_cast<long>(kEpochMs))
-        << "an Async commit waited for its epoch to become durable";
+    EXPECT_LT(commit("lazy_key", helios::storage::CommitDurability::kAsync),
+              kPromptMs);
+    EXPECT_FALSE(logged(config.work_dir, "lazy_key"))
+        << "an Async commit closed its epoch";
 
-    const auto sync_ms =
-        commit("sync_key", helios::storage::CommitDurability::kSync);
-    EXPECT_GE(sync_ms, static_cast<long>(kEpochMs))
-        << "a Sync commit returned before its epoch could close";
-    EXPECT_LT(async_ms, sync_ms)
-        << "Async did not return sooner than Sync (async " << async_ms
-        << " ms, sync " << sync_ms << " ms)";
+    EXPECT_LT(commit("durable_key", helios::storage::CommitDurability::kSync),
+              kPromptMs)
+        << "a Sync commit waited for the epoch timer";
+    EXPECT_TRUE(logged(config.work_dir, "durable_key"))
+        << "a Sync commit returned before its record was logged";
   }
   // After the database is destroyed: it holds the log open until then.
   std::filesystem::remove_all(config.work_dir);

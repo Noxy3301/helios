@@ -119,7 +119,7 @@ Database::Database(const Config &config)
   wal::FlushTrace::Instance();
 
   // Checkpointing needs both WAL persistence and epoch advancement running.
-  logger_.Start();
+  logger_.Start(&epoch_framework_);
   epoch_framework_.Start();
   scan_checkpoint_.Start();
 }
