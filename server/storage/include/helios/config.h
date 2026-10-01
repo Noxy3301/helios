@@ -38,8 +38,9 @@ struct Config {
   /**
    * @brief How often the global epoch advances, in milliseconds.
    *
-   * @details Transactions of one epoch are group-committed together, so a
-   * longer duration raises throughput and raises response time with it.
+   * @details A Sync commit or a read view that waits on an epoch advances it
+   * sooner, so the duration mostly sets how soon an Async commit reaches the
+   * device.
    *
    * Default: 40 ms
    * @see [Tu13] https://dl.acm.org/doi/10.1145/2517349.2522713

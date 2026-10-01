@@ -25,6 +25,7 @@
 #include "helios/database.h"
 
 #include <algorithm>
+#include <chrono>
 #include <mutex>
 
 #include "helios/config.h"
@@ -119,7 +120,7 @@ Database::Database(const Config &config)
   wal::FlushTrace::Instance();
 
   // Checkpointing needs both WAL persistence and epoch advancement running.
-  logger_.Start();
+  logger_.Start(&epoch_framework_);
   epoch_framework_.Start();
   scan_checkpoint_.Start();
 }
@@ -149,7 +150,9 @@ const Config &Database::GetConfig() const noexcept { return config_; }
 
 std::function<void(EpochNumber)> Database::MakeEpochHook() {
   // The epoch thread calls this with the global epoch it just published.
-  return [this](const EpochNumber global_epoch) {
+  const auto interval = std::chrono::milliseconds(config_.epoch_duration_ms);
+  return [this, interval, last_tick = std::chrono::steady_clock::time_point()](
+             const EpochNumber global_epoch) mutable {
     // Workers lag E by at most one epoch, so none remain in epochs <= E - 2.
     // Flushing and reclamation have different roles but currently share this
     // bound. Commit epochs are positive, so E - 2 must be at least 1.
@@ -159,11 +162,14 @@ std::function<void(EpochNumber)> Database::MakeEpochHook() {
       reaper_.Purge(closed_epoch);
     }
 
-    // Tick masstree's globalepoch so RCU can free retired leaves and
-    // DataItem limbo once min_active_epoch() catches up. Workers release
-    // their epoch at RPC boundaries through ReleaseThreadEpoch; this call
-    // only moves active_epoch.
-    index::advance_epoch();
+    // Tick masstree's epoch, which paces only the RCU freeing of retired
+    // leaves and DataItems, at most once per epoch duration however often
+    // requests advance E. Workers leave it through ReleaseThreadEpoch.
+    const auto now = std::chrono::steady_clock::now();
+    if (now - last_tick >= interval) {
+      last_tick = now;
+      index::advance_epoch();
+    }
   };
 }
 

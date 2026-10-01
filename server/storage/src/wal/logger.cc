@@ -322,8 +322,9 @@ Logger::RecoveryResult Logger::Recover() {
   return result;
 }
 
-void Logger::Start() {
+void Logger::Start(epoch::Framework *epoch) {
   assert(!logger_thread_.joinable());
+  epoch_ = epoch;
   logger_thread_ = std::thread(&Logger::LoggerThread, this);
 }
 
@@ -413,6 +414,9 @@ Logger::WaitResult Logger::WaitUntilDurable(EpochNumber commit_epoch,
   if (durable_epoch_.load(std::memory_order_seq_cst) >= commit_epoch) {
     return WaitResult::kDurable;
   }
+
+  // The epoch hook requests this epoch's flush once `E = commit_epoch + 2`.
+  if (epoch_ != nullptr) epoch_->RequestEpochAdvance(commit_epoch + 2);
 
   std::unique_lock<std::mutex> lock(durability_mutex_);
   const auto reached = [&] {
