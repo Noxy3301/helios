@@ -220,6 +220,8 @@ public:
         // Row write that must find the key free; the server refuses it
         // otherwise.
         bool is_insert = false;
+        // PAX fields a row write assigned, bit min(f, 63) for field f
+        uint64_t column_mask = 0;
     };
     // Validate every read and range, then install the writes. duplicate_key is
     // set when the server refused a duplicate primary or unique secondary key.

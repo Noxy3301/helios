@@ -101,7 +101,7 @@ void Transaction::RangeRead(std::string_view table, std::string_view index,
 
 bool Transaction::Write(std::string_view table_name, std::string_view key,
                         std::string_view row_bytes, RowOp op,
-                        std::string &reason) {
+                        std::string &reason, uint64_t column_mask) {
   Table *table = tables_.GetTable(table_name);
   if (table == nullptr) {
     reason = "write_table_missing";
@@ -130,7 +130,7 @@ bool Transaction::Write(std::string_view table_name, std::string_view key,
   auto entry = write_set_.find(item);
   if (entry == write_set_.end()) {
     RowUpdate row_update{std::move(row), store, op, op == RowOp::kInsert,
-                         bytes};
+                         bytes, column_mask};
     write_set_.emplace(
         item, WriteEntry{table, {}, key, &index, false, std::move(row_update)});
     return true;
@@ -145,6 +145,7 @@ bool Transaction::Write(std::string_view table_name, std::string_view key,
   update.row = std::move(row);
   update.op = op;
   update.bytes = bytes;
+  update.column_mask |= column_mask;
   return true;
 }
 
@@ -412,7 +413,7 @@ bool Transaction::ValidateReads(Tidword &max_tid, std::string &reason) {
       bool held =
           maskable &&
           read.tid.epoch >= resume_epoch_ &&  // the read is from this run
-          // no install since changed a used field or the null flags
+          // no install since changed or assigned a used field or the null flags
           item->pax_group()->max_column_tid(read.column_mask | 1) <=
               read.tid.obj;
       // The word unchanged across both loads means no install came between.
@@ -562,7 +563,8 @@ void Transaction::Apply(DataItem &item, const WriteEntry &entry,
       return;
     }
     const bool inserted = item.size() == 0;
-    uint64_t fields = item.InstallRow(row->row, commit_tid.epoch);
+    uint64_t fields =
+        item.InstallRow(row->row, commit_tid.epoch) | row->column_mask;
 
     // Every masked read validates field 0, so raising it for an insert or a
     // null-flag change fails every older masked read in the group. The raise

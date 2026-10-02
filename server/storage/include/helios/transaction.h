@@ -146,7 +146,8 @@ class Transaction {
    *   not exceed the read word.
    *
    * An install into the row after the read carries a larger TID, so the last
-   * condition rules out one that inserted the row or changed those fields.
+   * condition rules out one that inserted the row or changed or assigned
+   * those fields.
    */
   void Read(std::string_view table, std::string_view key, Tidword observed,
             uint64_t column_mask = 0);
@@ -173,13 +174,16 @@ class Transaction {
    * @details `row_bytes` holds packed bytes matching the table's installed PAX
    * schema, and is ignored for a kDelete. Later writes to one key replace the
    * value; if the record's first operation was INSERT, Commit keeps checking
-   * that the row is absent.
+   * that the row is absent. `column_mask` names the PAX fields the write
+   * assigned, bit `min(f, 63)` for field `f`, and the masks of later writes
+   * to one key accumulate.
    * @return false with reason `write_table_missing`, `pax_schema_missing`,
    * `pax_row_unpack_failed`, or @ref kDuplicatePrimaryKeyAbortReason for an
    * INSERT after a pending live row. Nothing is claimed on false.
    */
   bool Write(std::string_view table_name, std::string_view key,
-             std::string_view row_bytes, RowOp op, std::string &reason);
+             std::string_view row_bytes, RowOp op, std::string &reason,
+             uint64_t column_mask = 0);
 
   /**
    * @brief Appends one primary-key addition or removal to a secondary record.
@@ -248,6 +252,7 @@ class Transaction {
     /// The row the log records, as the request sent it, which the caller
     /// keeps alive until Commit returns. Empty for DELETE.
     std::string_view bytes;
+    uint64_t column_mask;  ///< PAX fields the record's writes assigned.
   };
 
   struct IndexUpdate {
@@ -354,8 +359,8 @@ class Transaction {
    * @brief Installs the final value while the record stays locked.
    *
    * @details A row update raises the column TIDs of its PAX group to
-   * `commit_tid` for the fields it changed, the null flags included. An
-   * insert raises only the column TID of the null flags.
+   * `commit_tid` for the fields it changed or assigned, the null flags
+   * included. An insert raises only the column TID of the null flags.
    *
    * @pre Validation, preparation and slot reservation all succeeded.
    */

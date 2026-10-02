@@ -120,6 +120,23 @@ TEST_F(ColumnValidationTest, AReadColumnChangedAndRestoredAborts) {
   EXPECT_EQ(reason, "exact_read_tid_moved");
 }
 
+TEST_F(ColumnValidationTest, AReadColumnAssignedItsValueAborts) {
+  // The write assigns column a the bytes it already holds.
+  const uint64_t tid = observe(*db_);
+  const std::string row = make_row("a0", "b0");
+  std::string reason;
+  helios::storage::silo::Transaction tx(*db_);
+  ASSERT_TRUE(tx.Write(kTable, kKey, row, helios::storage::RowOp::kUpdate,
+                       reason, kReadsA))
+      << reason;
+  ASSERT_TRUE(tx.Commit(helios::storage::CommitDurability::kSync, reason))
+      << reason;
+  db_->ReleaseThreadEpoch();
+
+  EXPECT_FALSE(commit_read(*db_, tid, kReadsA, reason));
+  EXPECT_EQ(reason, "exact_read_tid_moved");
+}
+
 TEST_F(ColumnValidationTest, ANullFlagChangeAborts) {
   const uint64_t tid = observe(*db_);
   put(*db_, kKey, make_row("a0", "", std::string_view("\2", 1)));

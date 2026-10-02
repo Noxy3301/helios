@@ -83,7 +83,7 @@ public:
   // Buffered writes, installed by the commit in the order they were issued.
   void buffer_write(const std::string& table_name,
                     const std::string& key, const std::string& value,
-                    bool is_insert = false);
+                    bool is_insert, uint64_t column_mask);
   void buffer_write_secondary_index(const std::string& table_name,
                                      const std::string& index_name,
                                      const std::string& secondary_key,

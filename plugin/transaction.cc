@@ -847,13 +847,15 @@ HeliosTransaction::peek_rowcount_delta(const Helios_share *share) const {
 void HeliosTransaction::buffer_write(const std::string& table_name,
                                         const std::string& key,
                                         const std::string& value,
-                                        bool is_insert) {
+                                        bool is_insert,
+                                        uint64_t column_mask) {
   HeliosProxy::WriteOp op;
   op.type = HeliosProxy::WriteOp::Type::Write;
   op.key = key;
   op.value = value;
   op.table_name = table_name;
   op.is_insert = is_insert;
+  op.column_mask = column_mask;
   write_buffer_ops_.push_back(std::move(op));
   record_write(table_name, key, true, value);
 }

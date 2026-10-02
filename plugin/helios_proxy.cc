@@ -408,6 +408,7 @@ bool HeliosProxy::tx_commit(
                 write->set_op(op.is_insert
                                   ? Helios::Protocol::TxCommit::INSERT
                                   : Helios::Protocol::TxCommit::UPDATE);
+                write->set_column_mask(op.column_mask);
                 break;
             }
             case WriteOp::Type::Delete: {

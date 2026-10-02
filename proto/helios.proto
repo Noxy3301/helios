@@ -284,6 +284,8 @@ message TxCommit {
         bytes key = 2;
         bytes value = 3;
         RowOp op = 4;
+        // PAX fields the write assigned, bit min(f, 63) for field f
+        uint64 column_mask = 5;
     }
     message SecondaryIndexEntry {
         string table_name = 1;

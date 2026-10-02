@@ -1,5 +1,6 @@
 #include "storage/helios/ha_helios.hh"
 
+#include <algorithm>
 #include <string>
 #include <utility>
 #include <vector>
@@ -162,9 +163,14 @@ int ha_helios::write_row(uchar *buf) {
     }
   }
 
+  // An INSERT or REPLACE assigns every column.
+  uint64_t column_mask = 0;
+  for (uint i = 0; i < table->s->fields; i++)
+    column_mask |= uint64_t{1} << std::min<uint>(i + 1, 63);
+
   // The commit installs the row and refuses an INSERT whose key is taken.
   tx->buffer_write(db_table_name, key, write_buffer_,
-                   !insert_can_replace_ || !replaced_existing_row);
+                   !insert_can_replace_ || !replaced_existing_row, column_mask);
 
   for (uint i = 0; i < table->s->keys; i++) {
     if (i == table->s->primary_key) continue;
@@ -253,8 +259,17 @@ int ha_helios::update_row(const uchar *old_data, uchar *new_data) {
     }
   }
 
+  // The update assigns the columns in write_set: PAX field i + 1 is column i,
+  // and fields past 63 share bit 63.
+  uint64_t column_mask = 0;
+  for (uint i = 0; i < table->s->fields; i++) {
+    if (bitmap_is_set(table->write_set, i))
+      column_mask |= uint64_t{1} << std::min<uint>(i + 1, 63);
+  }
+
   // Buffer the base-row update; the commit installs it.
-  tx->buffer_write(db_table_name, key, write_buffer_);
+  tx->buffer_write(db_table_name, key, write_buffer_, /*is_insert=*/false,
+                   column_mask);
 
   if (tx->is_aborted()) {
     return abort_errno(tx);

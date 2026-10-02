@@ -131,7 +131,8 @@ void HeliosRpc::handleTxCommit(
                 break;
         }
         if (!fed) break;
-        if (!tx.Write(write.table_name(), write.key(), write.value(), op, reason)) {
+        if (!tx.Write(write.table_name(), write.key(), write.value(), op,
+                      reason, write.column_mask())) {
             fed = false;
             break;
         }

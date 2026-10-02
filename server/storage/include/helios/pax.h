@@ -293,8 +293,8 @@ class PaxGroup {
   // Slot visibility flags for strip-direct scans.
   std::unique_ptr<std::atomic<uint64_t>[]> visible_;
   // One per column-mask bit: the largest commit TID word of an install in this
-  // group that changed a cell of that bucket, where an insert counts for
-  // field 0 only. Zero at each storage startup.
+  // group that changed or assigned a field of that bucket, where an insert
+  // counts for field 0 only. Zero at each storage startup.
   alignas(64) std::atomic<uint64_t> column_tid_[64]{};
 };
 
