@@ -135,8 +135,21 @@ class Transaction {
    * when the record's word moved: a new version, a row that appeared or
    * disappeared, or another committer's lock. A table that does not exist at
    * commit is accepted only with the word 0 a read of a missing table returns.
+   *
+   * A nonzero `column_mask` names the PAX fields the read used, bit
+   * `min(f, 63)` for field `f`. Commit then may accept a moved word, but only
+   * when all of these hold:
+   * - the row exists, as it did at the read, and no committer holds its lock,
+   *   so a row this attempt writes is validated whole;
+   * - the read word's epoch is at least the one this storage run resumed at;
+   * - the PAX group's column TIDs of those fields and of the null flags do
+   *   not exceed the read word.
+   *
+   * An install into the row after the read carries a larger TID, so the last
+   * condition rules out one that inserted the row or changed those fields.
    */
-  void Read(std::string_view table, std::string_view key, Tidword observed);
+  void Read(std::string_view table, std::string_view key, Tidword observed,
+            uint64_t column_mask = 0);
 
   /**
    * @brief Records a range read to revalidate at commit.
@@ -212,6 +225,7 @@ class Transaction {
     std::string_view table;
     std::string_view key;
     Tidword tid;
+    uint64_t column_mask;  ///< 0 validates the whole row.
   };
 
   struct RangeEntry {
@@ -260,6 +274,7 @@ class Transaction {
   index::Reaper &reaper_;
   wal::Logger &logger_;
   Tidword &last_commit_tid_;  ///< This worker's, kept across attempts.
+  EpochNumber resume_epoch_ = 0;  ///< The epoch this storage run resumed at.
 
   std::vector<ReadEntry> read_set_;
   std::vector<RangeEntry> range_set_;
@@ -338,9 +353,14 @@ class Transaction {
   /**
    * @brief Installs the final value while the record stays locked.
    *
+   * @details A row update raises the column TIDs of its PAX group to
+   * `commit_tid` for the fields it changed, the null flags included. An
+   * insert raises only the column TID of the null flags.
+   *
    * @pre Validation, preparation and slot reservation all succeeded.
    */
-  static void Apply(DataItem &item, const WriteEntry &entry, EpochNumber epoch);
+  static void Apply(DataItem &item, const WriteEntry &entry,
+                    Tidword commit_tid);
 
   /**
    * @brief Packs the row the request sent, or the ordered index changes,

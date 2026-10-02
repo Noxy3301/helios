@@ -107,7 +107,8 @@ void HeliosRpc::handleTxCommit(
     helios::storage::silo::Transaction tx(db);
     tx.reserve(request.reads_size(), request.range_reads_size());
     for (const auto& read : request.reads()) {
-        tx.Read(read.table_name(), read.key(), helios::storage::Tidword(read.tid()));
+        tx.Read(read.table_name(), read.key(), helios::storage::Tidword(read.tid()),
+                read.column_mask());
     }
     for (const auto& range : request.range_reads()) {
         tx.RangeRead(range.table_name(), range.index_name(), range.start_key(),

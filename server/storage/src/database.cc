@@ -108,6 +108,7 @@ Database::Database(const Config &config)
       epoch_framework_.SetGlobalEpoch(ResumeEpochAbove(scanned.durable_epoch));
     }
   }
+  resume_epoch_ = epoch_framework_.GetGlobalEpoch();
 
   // The replay enrolled this thread in the Masstree epoch; leaving it lets
   // the nodes the replay retired be reclaimed.

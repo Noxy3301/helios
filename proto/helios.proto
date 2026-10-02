@@ -270,6 +270,9 @@ message TxCommit {
         string table_name = 1;
         bytes key = 2;
         uint64 tid = 3;  // as returned by the read; an absent row has a TID too
+        // PAX fields the read used, bit min(f, 63) for field f; 0 validates
+        // the whole row
+        uint64 column_mask = 4;
     }
     enum RowOp {
         UPDATE = 0;

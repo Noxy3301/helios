@@ -370,7 +370,8 @@ class Database {
   bool WriteCheckpoint(uint64_t *out_version_retries = nullptr);
 
  private:
-  // Reads the tables, epoch framework, reaper, logger and last-TID slots.
+  // Reads the tables, epoch framework, reaper, logger, last-TID slots and
+  // resume epoch.
   friend class silo::Transaction;
 
   // Declared in dependency order
@@ -384,6 +385,9 @@ class Database {
   index::Reaper reaper_;
   // Each worker remembers the last TID it chose for this database.
   ThreadKeyStorage<Tidword> last_commit_tids_;
+  // The global epoch at startup, set before any transaction; every word below
+  // it was installed before this run.
+  EpochNumber resume_epoch_ = 0;
 
   // Bound the lifetime of a read view so `E - se` stays in the wrap-free window.
   static constexpr EpochNumber kPaxReadViewEpochLifetime =
