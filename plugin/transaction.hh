@@ -220,6 +220,9 @@ private:
   bool transport_error_{false};
   // A duplicate key is a permanent rejection, not contention.
   bool duplicate_key_abort_{false};
+  // The proxy's generation at begin. The commit aborts on any other: a read
+  // taken before a channel closed may come from a storage run that ended.
+  uint64_t generation_{0};
 
   struct RowCountDelta {
     Helios_share *share;

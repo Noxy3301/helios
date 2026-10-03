@@ -74,8 +74,9 @@ def test_channel_reopens_after_storage_restart(user, password):
         if server is None:
             return 1
 
-        # The statement that meets the dead socket. It may also survive, when
-        # the first RPC to fail is one whose caller does not end the statement.
+        # The statement that meets the dead socket. When the first RPC to fail
+        # is one whose caller does not end the statement, its commit aborts as
+        # contention (1180) instead.
         seen = None
         try:
             cursor.execute(f"SELECT pk FROM {DATABASE}.{table}")
@@ -84,7 +85,7 @@ def test_channel_reopens_after_storage_restart(user, password):
             seen = err.errno
             print(f"\tThe statement after the restart failed with {err.errno}: "
                   f"{err.msg}")
-        if seen is not None and seen not in (2013, 1030, 1296):
+        if seen is not None and seen not in (2013, 1030, 1296, 1180):
             print(f"\tFailed: unexpected error {seen} after the restart")
             return 1
 

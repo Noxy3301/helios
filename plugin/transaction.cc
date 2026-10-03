@@ -1333,7 +1333,8 @@ bool HeliosTransaction::end_transaction(bool *transport_error,
                                            bool *duplicate_key) {
   if (transport_error != nullptr) *transport_error = transport_error_;
   if (duplicate_key != nullptr) *duplicate_key = duplicate_key_abort_;
-  const bool was_aborted = is_aborted_;
+  const bool was_aborted =
+      is_aborted_ || helios_proxy->generation() != generation_;
 
   std::vector<std::pair<std::string, int64_t>> server_deltas;
   if (!was_aborted && !rowcount_deltas_.empty()) {
@@ -1395,6 +1396,7 @@ void HeliosTransaction::begin_transaction() {
   assert(is_not_started());
   rpc_trace_.start(std::this_thread::get_id());
   helios_proxy->set_current_trace(&rpc_trace_);
+  generation_ = helios_proxy->generation();
 
   registered_ = true;
   is_aborted_ = false;

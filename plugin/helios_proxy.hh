@@ -279,6 +279,10 @@ public:
     // and after any transport failure, which forces re-reservation.
     uint64_t storage_boot_token() const { return storage_boot_token_; }
 
+    // Advances whenever an open channel closes, so equal values bracket RPCs
+    // that all went over one channel.
+    uint64_t generation() const { return generation_; }
+
 private:
     std::unordered_map<std::string, int64_t> table_stats_cache_;
     std::unordered_map<std::string, IndexNdvResult> last_index_ndv_;
@@ -307,6 +311,7 @@ private:
     bool ensure_connected();
 
     uint64_t storage_boot_token_ = 0;
+    uint64_t generation_ = 0;
     int socket_fd_;
     bool connected_;
     std::string host_;

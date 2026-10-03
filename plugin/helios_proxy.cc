@@ -149,6 +149,7 @@ void HeliosProxy::disconnect() {
                  static_cast<const void*>(this), socket_fd_);
         close(socket_fd_);
         socket_fd_ = -1;
+        ++generation_;
     }
     connected_ = false;
 }
