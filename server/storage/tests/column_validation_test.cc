@@ -146,6 +146,23 @@ TEST_F(ColumnValidationTest, ANullFlagChangeAborts) {
   EXPECT_EQ(reason, "exact_read_tid_moved");
 }
 
+TEST_F(ColumnValidationTest, ADeleteAborts) {
+  // An async delete skips the durability wait, during which the reaper would
+  // purge the record before the masked read's commit validates it.
+  const uint64_t tid = observe(*db_);
+  std::string reason;
+  helios::storage::silo::Transaction tx(*db_);
+  ASSERT_TRUE(
+      tx.Write(kTable, kKey, "", helios::storage::RowOp::kDelete, reason))
+      << reason;
+  ASSERT_TRUE(tx.Commit(helios::storage::CommitDurability::kAsync, reason))
+      << reason;
+  db_->ReleaseThreadEpoch();
+
+  EXPECT_FALSE(commit_read(*db_, tid, kReadsA, reason));
+  EXPECT_EQ(reason, "exact_read_tid_moved");
+}
+
 TEST_F(ColumnValidationTest, ADeleteAndReinsertAborts) {
   const uint64_t tid = observe(*db_);
   ASSERT_TRUE(TestHelper::Delete(*db_, kTable, kKey));
