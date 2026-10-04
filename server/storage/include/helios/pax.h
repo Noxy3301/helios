@@ -164,7 +164,7 @@ class PaxGroup {
    * @param fields Bit `min(f, 63)` names field `f`.
    * @param tid Commit TID word, compared as `Tidword::obj`.
    */
-  void raise_column_tid(uint64_t fields, uint64_t tid);
+  void update_max_column_tid(uint64_t fields, uint64_t tid);
 
   /**
    * @brief Returns the largest column TID among the buckets `fields` names,

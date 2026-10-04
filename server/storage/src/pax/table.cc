@@ -367,7 +367,7 @@ uint64_t PaxGroup::ScatterRow(uint32_t slot, const Row &row, bool compare) {
   return changed;
 }
 
-void PaxGroup::raise_column_tid(uint64_t fields, uint64_t tid) {
+void PaxGroup::update_max_column_tid(uint64_t fields, uint64_t tid) {
   // A CAS, not a store: installs on different rows arrive out of TID order.
   for (; fields != 0; fields &= fields - 1) {
     auto &column = column_tid_[__builtin_ctzll(fields)];

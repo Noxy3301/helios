@@ -565,7 +565,7 @@ void Transaction::Apply(DataItem &item, const WriteEntry &entry,
     // null-flag change fails every older masked read in the group. The raise
     // precedes Publish, so a validator that loads the new word sees it.
     if (inserted) fields = 1;
-    item.pax_group()->raise_column_tid(fields, commit_tid.obj);
+    item.pax_group()->update_max_column_tid(fields, commit_tid.obj);
     return;
   }
   std::atomic_store(&item.primary_keys,
