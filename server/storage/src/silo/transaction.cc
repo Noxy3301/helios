@@ -76,9 +76,7 @@ Transaction::Transaction(TableDictionary &tables, epoch::Framework &epoch,
 
 Transaction::Transaction(Database &db)
     : Transaction(db.table_dictionary_, db.epoch_framework_, db.reaper_,
-                  db.logger_, *db.last_commit_tids_.Get()) {
-  resume_epoch_ = db.resume_epoch_;
-}
+                  db.logger_, *db.last_commit_tids_.Get()) {}
 
 void Transaction::reserve(size_t reads, size_t ranges) {
   read_set_.reserve(reads);
@@ -408,11 +406,8 @@ bool Transaction::ValidateReads(Tidword &max_tid, std::string &reason) {
           !current.absent &&  // the row exists now,
           current.latest &&   // is still the key's record,
           !read.tid.absent;   // and existed when read
-      // Column TIDs restart at zero in each run, and every install into this
-      // row since the read carries a TID above the read word.
       bool held =
           maskable &&
-          read.tid.epoch >= resume_epoch_ &&  // the read is from this run
           // no install since changed or assigned a used field or the null flags
           item->pax_group()->max_column_tid(read.column_mask | 1) <=
               read.tid.obj;

@@ -141,13 +141,13 @@ class Transaction {
    * when all of these hold:
    * - the row exists, as it did at the read, and no committer holds its lock,
    *   so a row this attempt writes is validated whole;
-   * - the read word's epoch is at least the one this storage run resumed at;
    * - the PAX group's column TIDs of those fields and of the null flags do
    *   not exceed the read word.
    *
    * An install into the row after the read carries a larger TID, so the last
    * condition rules out one that inserted the row or changed or assigned
-   * those fields.
+   * those fields. `observed` must come from a read in this storage run, since
+   * column TIDs start at zero at each startup.
    */
   void Read(std::string_view table, std::string_view key, Tidword observed,
             uint64_t column_mask = 0);
@@ -279,7 +279,6 @@ class Transaction {
   index::Reaper &reaper_;
   wal::Logger &logger_;
   Tidword &last_commit_tid_;  ///< This worker's, kept across attempts.
-  EpochNumber resume_epoch_ = 0;  ///< The epoch this storage run resumed at.
 
   std::vector<ReadEntry> read_set_;
   std::vector<RangeEntry> range_set_;
