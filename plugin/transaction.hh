@@ -35,7 +35,10 @@ public:
   void choose_table(std::string db_table_name);
   bool table_is_not_chosen();
 
-  const std::pair<const std::byte *const, const size_t> read(std::string key);
+  // A nonzero column_mask validates the read by those PAX fields only
+  // (HeliosProxy::ReadEntry).
+  const std::pair<const std::byte *const, const size_t> read(
+      std::string key, uint64_t column_mask = 0);
   std::vector<std::pair<bool, std::string>> batch_read(const std::vector<std::string>& keys);
   // Buffer ops built elsewhere (the DDL backfill); the commit installs them.
   void buffer_writes(const std::string& table_name,
@@ -363,7 +366,8 @@ private:
                                const std::string& key, bool found,
                                const std::string& value, uint64_t tid = 0);
   void append_base_row_read(const std::string& table_name,
-                                    const std::string& key, uint64_t tid);
+                                    const std::string& key, uint64_t tid,
+                                    uint64_t column_mask = 0);
   void append_range_read(const RangeScanCacheEntry& scanned);
   void append_secondary_range_read(const SecondaryScanCacheEntry& scanned);
   // The storage server refused the request (a missing table or index). Not

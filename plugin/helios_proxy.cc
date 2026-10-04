@@ -385,6 +385,7 @@ bool HeliosProxy::tx_commit(
         read->set_table_name(entry.table_name);
         read->set_key(entry.key);
         read->set_tid(entry.tid);
+        read->set_column_mask(entry.column_mask);
     }
 
     for (const auto& entry : range_reads) {

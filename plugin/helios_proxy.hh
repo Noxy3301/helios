@@ -129,6 +129,9 @@ public:
         std::string table_name;
         std::string key;
         uint64_t tid = 0;
+        // PAX fields the read used, bit min(f, 63) for field f; 0 validates the
+        // whole row.
+        uint64_t column_mask = 0;
     };
     // One range the transaction scanned. The commit re-runs the scan these
     // bounds describe and requires the records it read with the same TID
