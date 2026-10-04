@@ -109,8 +109,10 @@ struct DataItem {
    * Recovery calls this before readers start.
    * @param epoch Commit epoch of this install; epoch images are tagged with
    * it.
+   * @return The PAX fields whose cells changed, bit `min(f, 63)` for field
+   * `f`; every bit when the item held no row.
    */
-  void InstallRow(const pax::Row &row, EpochNumber epoch);
+  uint64_t InstallRow(const pax::Row &row, EpochNumber epoch);
 
   /**
    * @brief Hides this item's row: retires the slot from strip scans and

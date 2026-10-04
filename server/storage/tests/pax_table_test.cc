@@ -49,7 +49,7 @@ bool Scatter(PaxGroup &group, uint32_t slot, const std::string &row) {
           group.schema(), reinterpret_cast<const std::byte *>(row.data()),
           row.size(), unpacked))
     return false;
-  group.ScatterRow(slot, unpacked);
+  group.ScatterRow(slot, unpacked, false);
   return true;
 }
 

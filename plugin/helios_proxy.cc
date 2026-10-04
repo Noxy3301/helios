@@ -149,6 +149,7 @@ void HeliosProxy::disconnect() {
                  static_cast<const void*>(this), socket_fd_);
         close(socket_fd_);
         socket_fd_ = -1;
+        ++generation_;
     }
     connected_ = false;
 }
@@ -384,6 +385,7 @@ bool HeliosProxy::tx_commit(
         read->set_table_name(entry.table_name);
         read->set_key(entry.key);
         read->set_tid(entry.tid);
+        read->set_column_mask(entry.column_mask);
     }
 
     for (const auto& entry : range_reads) {
@@ -408,6 +410,7 @@ bool HeliosProxy::tx_commit(
                 write->set_op(op.is_insert
                                   ? Helios::Protocol::TxCommit::INSERT
                                   : Helios::Protocol::TxCommit::UPDATE);
+                write->set_column_mask(op.column_mask);
                 break;
             }
             case WriteOp::Type::Delete: {

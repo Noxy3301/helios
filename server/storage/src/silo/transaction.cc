@@ -84,8 +84,8 @@ void Transaction::reserve(size_t reads, size_t ranges) {
 }
 
 void Transaction::Read(std::string_view table, std::string_view key,
-                       Tidword observed) {
-  read_set_.push_back({table, key, observed});
+                       Tidword observed, uint64_t column_mask) {
+  read_set_.push_back({table, key, observed, column_mask});
 }
 
 void Transaction::RangeRead(std::string_view table, std::string_view index,
@@ -99,7 +99,7 @@ void Transaction::RangeRead(std::string_view table, std::string_view index,
 
 bool Transaction::Write(std::string_view table_name, std::string_view key,
                         std::string_view row_bytes, RowOp op,
-                        std::string &reason) {
+                        std::string &reason, uint64_t column_mask) {
   Table *table = tables_.GetTable(table_name);
   if (table == nullptr) {
     reason = "write_table_missing";
@@ -128,7 +128,7 @@ bool Transaction::Write(std::string_view table_name, std::string_view key,
   auto entry = write_set_.find(item);
   if (entry == write_set_.end()) {
     RowUpdate row_update{std::move(row), store, op, op == RowOp::kInsert,
-                         bytes};
+                         bytes, column_mask};
     write_set_.emplace(
         item, WriteEntry{table, {}, key, &index, false, std::move(row_update)});
     return true;
@@ -143,6 +143,7 @@ bool Transaction::Write(std::string_view table_name, std::string_view key,
   update.row = std::move(row);
   update.op = op;
   update.bytes = bytes;
+  update.column_mask |= column_mask;
   return true;
 }
 
@@ -284,7 +285,7 @@ bool Transaction::Commit(CommitDurability durability, std::string &reason) {
     const bool is_row = std::holds_alternative<RowUpdate>(entry.update);
     if (is_row && row_applied)
       HELIOS_DEBUG_SYNC("silo_commit.between_row_installs");
-    Apply(*item, entry, commit_tid.epoch);
+    Apply(*item, entry, commit_tid);
     // Once unlocked, another writer may replace this record immediately.
     AppendLog(pk, *item, entry, commit_tid);
     Publish(*item, entry, commit_tid);
@@ -397,8 +398,30 @@ bool Transaction::ValidateReads(Tidword &max_tid, std::string &reason) {
     Tidword expected = read.tid;
     if (item != nullptr && OwnsLock(item)) expected.lock = true;
     if (current != expected) {
-      reason = "exact_read_tid_moved";
-      return false;
+      // A masked read outlives a moved word only on a live row nobody locks.
+      const bool maskable =
+          read.column_mask != 0 &&  // the plugin named the fields it read
+          item != nullptr &&
+          !current.lock &&    // no install in flight, this attempt's too
+          !current.absent &&  // the row exists now,
+          current.latest &&   // is still the key's record,
+          !read.tid.absent;   // and existed when read
+      bool held =
+          maskable &&
+          // no install since changed or assigned a used field or the null flags
+          item->pax_group()->max_column_tid(read.column_mask | 1) <=
+              read.tid.obj;
+      // The word unchanged across both loads means no install came between.
+      if (held) {
+        std::atomic_thread_fence(std::memory_order_acquire);
+        held = item->transaction_id.load() == current;
+      }
+      if (!held) {
+        reason = "exact_read_tid_moved";
+        return false;
+      }
+      max_tid = std::max(max_tid, current);
+      continue;
     }
     max_tid = std::max(max_tid, read.tid);
   }
@@ -528,12 +551,21 @@ bool Transaction::match_record(const RangeEntry &range, size_t &row,
 }
 
 void Transaction::Apply(DataItem &item, const WriteEntry &entry,
-                        EpochNumber epoch) {
+                        Tidword commit_tid) {
   if (const auto *row = std::get_if<RowUpdate>(&entry.update)) {
-    if (row->op == RowOp::kDelete)
-      item.DeleteRow(epoch);
-    else
-      item.InstallRow(row->row, epoch);
+    if (row->op == RowOp::kDelete) {
+      item.DeleteRow(commit_tid.epoch);
+      return;
+    }
+    const bool inserted = item.size() == 0;
+    uint64_t fields =
+        item.InstallRow(row->row, commit_tid.epoch) | row->column_mask;
+
+    // Every masked read validates field 0, so raising it for an insert or a
+    // null-flag change fails every older masked read in the group. The raise
+    // precedes Publish, so a validator that loads the new word sees it.
+    if (inserted) fields = 1;
+    item.pax_group()->update_max_column_tid(fields, commit_tid.obj);
     return;
   }
   std::atomic_store(&item.primary_keys,

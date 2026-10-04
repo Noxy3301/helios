@@ -87,7 +87,7 @@ bool HeliosTransaction::table_is_not_chosen() {
 }
 
 const std::pair<const std::byte *const, const size_t>
-HeliosTransaction::read(std::string key) {
+HeliosTransaction::read(std::string key, uint64_t column_mask) {
   if (table_is_not_chosen()) return std::pair<const std::byte *const, const size_t>{nullptr, 0};
 
   // Read-your-writes: the write buffer is visible before an RPC
@@ -104,7 +104,8 @@ HeliosTransaction::read(std::string key) {
     // A consumed cache hit appends to the point read set.
     rpc_trace_.record_event(
         trace_count_event("use_point_read", entry->table_name, 1));
-    append_base_row_read(entry->table_name, entry->key, entry->tid);
+    append_base_row_read(entry->table_name, entry->key, entry->tid,
+                         column_mask);
     if (!entry->found) return {nullptr, 0};
     last_read_value_ = entry->value;
     return {reinterpret_cast<const std::byte*>(last_read_value_.data()), last_read_value_.size()};
@@ -118,7 +119,7 @@ HeliosTransaction::read(std::string key) {
   }
 
   record_row_cache(db_table_key, key, result.found, result.value, result.tid);
-  append_base_row_read(db_table_key, key, result.tid);
+  append_base_row_read(db_table_key, key, result.tid, column_mask);
   if (!result.found) {
     return std::pair<const std::byte *const, const size_t>{nullptr, 0};
   }
@@ -847,13 +848,15 @@ HeliosTransaction::peek_rowcount_delta(const Helios_share *share) const {
 void HeliosTransaction::buffer_write(const std::string& table_name,
                                         const std::string& key,
                                         const std::string& value,
-                                        bool is_insert) {
+                                        bool is_insert,
+                                        uint64_t column_mask) {
   HeliosProxy::WriteOp op;
   op.type = HeliosProxy::WriteOp::Type::Write;
   op.key = key;
   op.value = value;
   op.table_name = table_name;
   op.is_insert = is_insert;
+  op.column_mask = column_mask;
   write_buffer_ops_.push_back(std::move(op));
   record_write(table_name, key, true, value);
 }
@@ -1054,10 +1057,11 @@ void HeliosTransaction::record_row_cache(
 }
 
 void HeliosTransaction::append_base_row_read(
-    const std::string& table_name, const std::string& key, uint64_t tid) {
+    const std::string& table_name, const std::string& key, uint64_t tid,
+    uint64_t column_mask) {
   // Append every observation, no dedup (Silo read_set style): a repeated read
   // validates the same TID again.
-  base_row_read_set_.push_back({table_name, key, tid});
+  base_row_read_set_.push_back({table_name, key, tid, column_mask});
 }
 
 void HeliosTransaction::append_range_read(
@@ -1331,7 +1335,8 @@ bool HeliosTransaction::end_transaction(bool *transport_error,
                                            bool *duplicate_key) {
   if (transport_error != nullptr) *transport_error = transport_error_;
   if (duplicate_key != nullptr) *duplicate_key = duplicate_key_abort_;
-  const bool was_aborted = is_aborted_;
+  const bool was_aborted =
+      is_aborted_ || helios_proxy->generation() != generation_;
 
   std::vector<std::pair<std::string, int64_t>> server_deltas;
   if (!was_aborted && !rowcount_deltas_.empty()) {
@@ -1393,6 +1398,7 @@ void HeliosTransaction::begin_transaction() {
   assert(is_not_started());
   rpc_trace_.start(std::this_thread::get_id());
   helios_proxy->set_current_trace(&rpc_trace_);
+  generation_ = helios_proxy->generation();
 
   registered_ = true;
   is_aborted_ = false;

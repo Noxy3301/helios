@@ -35,7 +35,10 @@ public:
   void choose_table(std::string db_table_name);
   bool table_is_not_chosen();
 
-  const std::pair<const std::byte *const, const size_t> read(std::string key);
+  // A nonzero column_mask validates the read by those PAX fields only
+  // (HeliosProxy::ReadEntry).
+  const std::pair<const std::byte *const, const size_t> read(
+      std::string key, uint64_t column_mask = 0);
   std::vector<std::pair<bool, std::string>> batch_read(const std::vector<std::string>& keys);
   // Buffer ops built elsewhere (the DDL backfill); the commit installs them.
   void buffer_writes(const std::string& table_name,
@@ -83,7 +86,7 @@ public:
   // Buffered writes, installed by the commit in the order they were issued.
   void buffer_write(const std::string& table_name,
                     const std::string& key, const std::string& value,
-                    bool is_insert = false);
+                    bool is_insert, uint64_t column_mask);
   void buffer_write_secondary_index(const std::string& table_name,
                                      const std::string& index_name,
                                      const std::string& secondary_key,
@@ -220,6 +223,9 @@ private:
   bool transport_error_{false};
   // A duplicate key is a permanent rejection, not contention.
   bool duplicate_key_abort_{false};
+  // The proxy's generation at begin. The commit aborts on any other: a read
+  // taken before a channel closed may come from a storage run that ended.
+  uint64_t generation_{0};
 
   struct RowCountDelta {
     Helios_share *share;
@@ -360,7 +366,8 @@ private:
                                const std::string& key, bool found,
                                const std::string& value, uint64_t tid = 0);
   void append_base_row_read(const std::string& table_name,
-                                    const std::string& key, uint64_t tid);
+                                    const std::string& key, uint64_t tid,
+                                    uint64_t column_mask = 0);
   void append_range_read(const RangeScanCacheEntry& scanned);
   void append_secondary_range_read(const SecondaryScanCacheEntry& scanned);
   // The storage server refused the request (a missing table or index). Not

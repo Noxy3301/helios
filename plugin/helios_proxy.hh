@@ -129,6 +129,9 @@ public:
         std::string table_name;
         std::string key;
         uint64_t tid = 0;
+        // PAX fields the read used, bit min(f, 63) for field f; 0 validates the
+        // whole row.
+        uint64_t column_mask = 0;
     };
     // One range the transaction scanned. The commit re-runs the scan these
     // bounds describe and requires the records it read with the same TID
@@ -220,6 +223,8 @@ public:
         // Row write that must find the key free; the server refuses it
         // otherwise.
         bool is_insert = false;
+        // PAX fields a row write assigned, bit min(f, 63) for field f
+        uint64_t column_mask = 0;
     };
     // Validate every read and range, then install the writes. duplicate_key is
     // set when the server refused a duplicate primary or unique secondary key.
@@ -277,6 +282,10 @@ public:
     // and after any transport failure, which forces re-reservation.
     uint64_t storage_boot_token() const { return storage_boot_token_; }
 
+    // Advances whenever an open channel closes, so equal values bracket RPCs
+    // that all went over one channel.
+    uint64_t generation() const { return generation_; }
+
 private:
     std::unordered_map<std::string, int64_t> table_stats_cache_;
     std::unordered_map<std::string, IndexNdvResult> last_index_ndv_;
@@ -305,6 +314,7 @@ private:
     bool ensure_connected();
 
     uint64_t storage_boot_token_ = 0;
+    uint64_t generation_ = 0;
     int socket_fd_;
     bool connected_;
     std::string host_;

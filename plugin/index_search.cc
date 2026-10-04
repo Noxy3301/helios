@@ -351,7 +351,19 @@ int ha_helios::execute_index_first(uchar *buf, HeliosTransaction *tx) {
 
 int ha_helios::execute_unique_point(uchar *buf, HeliosTransaction *tx) {
   if (current_plan_.is_primary) {
-    auto result = tx->read(current_plan_.packed_start_key);
+    // The commit validates a plain SELECT's read by the null flags and the
+    // columns it reads: PAX field i + 1 is column i, and fields past 63 share
+    // bit 63.
+    uint64_t column_mask = 0;
+    if (ha_thd()->lex->sql_command == SQLCOM_SELECT &&
+        table->reginfo.lock_type <= TL_READ) {
+      column_mask = 1;
+      for (uint i = 0; i < table->s->fields; i++) {
+        if (bitmap_is_set(table->read_set, i))
+          column_mask |= uint64_t{1} << std::min<uint>(i + 1, 63);
+      }
+    }
+    auto result = tx->read(current_plan_.packed_start_key, column_mask);
 
     if (tx->is_aborted()) {
       return abort_errno(tx);

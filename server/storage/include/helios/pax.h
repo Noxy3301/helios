@@ -150,8 +150,30 @@ class PaxGroup {
    * @param slot Target slot inside this group.
    * @param row Unpacked using this group's schema; its input
    * bytes must remain unchanged until the call finishes.
+   * @param compare The slot holds a row: leave a cell whose length and bytes
+   * already match untouched.
+   * @return Fields whose cells changed, bit `min(f, 63)` for field `f`; every
+   * bit when `compare` is false.
    */
-  void ScatterRow(uint32_t slot, const Row &row);
+  uint64_t ScatterRow(uint32_t slot, const Row &row, bool compare);
+
+  /**
+   * @brief Raises the column TID of every bucket `fields` names to `tid`
+   * where it is lower.
+   *
+   * @param fields Bit `min(f, 63)` names field `f`.
+   * @param tid Commit TID word, compared as `Tidword::obj`.
+   */
+  void update_max_column_tid(uint64_t fields, uint64_t tid);
+
+  /**
+   * @brief Returns the largest column TID among the buckets `fields` names,
+   * each loaded with acquire order.
+   *
+   * @param fields Bit `min(f, 63)` names field `f`.
+   * @return 0 when no install of this run raised one of those buckets.
+   */
+  uint64_t max_column_tid(uint64_t fields) const;
 
   /**
    * @brief Marks one slot as invisible to strip-direct readers.
@@ -270,6 +292,10 @@ class PaxGroup {
   std::unique_ptr<std::byte[]> arena_;
   // Slot visibility flags for strip-direct scans.
   std::unique_ptr<std::atomic<uint64_t>[]> visible_;
+  // One per column-mask bit: the largest commit TID word of an install in this
+  // group that changed or assigned a field of that bucket, where an insert
+  // counts for field 0 only. Zero at each storage startup.
+  alignas(64) std::atomic<uint64_t> column_tid_[64]{};
 };
 
 /**

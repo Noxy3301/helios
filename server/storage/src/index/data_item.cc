@@ -40,11 +40,12 @@ void DataItem::PreserveImage(EpochNumber epoch) {
                         visible ? CopyValue() : std::string());
 }
 
-void DataItem::InstallRow(const pax::Row &row, EpochNumber epoch) {
+uint64_t DataItem::InstallRow(const pax::Row &row, EpochNumber epoch) {
   assert(pax_allocated() && row.size != 0);
   PreserveImage(epoch);
-  pax_group()->ScatterRow(slot_, row);
+  const uint64_t changed = pax_group()->ScatterRow(slot_, row, size_ != 0);
   size_ = row.size;
+  return changed;
 }
 
 void DataItem::DeleteRow(EpochNumber epoch) {

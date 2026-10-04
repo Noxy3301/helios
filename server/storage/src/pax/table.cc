@@ -330,30 +330,59 @@ PaxGroup::PaxGroup(const TableSchema &schema, PaxTable &table)
 
 PaxGroup::~PaxGroup() { ForgetGroup(this); }
 
-void PaxGroup::ScatterRow(uint32_t slot, const Row &row) {
+uint64_t PaxGroup::ScatterRow(uint32_t slot, const Row &row, bool compare) {
   assert(slot < kRows);
-  const size_t fields = schema_.field_count();
-  assert(row.fields.size() == fields);
-  for (size_t f = 0; f < fields; f++) {
-    const auto &field = row.fields[f];
-    std::byte *cell = arena_.get() + strip_offset_[f] +
-                      static_cast<size_t>(stride_[f]) * slot;
-    const FieldType type = schema_.type_of(f);
-    if (type != FieldType::kUntyped && field.len != 0) {
-      const uint16_t len = static_cast<uint16_t>(schema_.field_max_bytes[f]);
-      std::memcpy(cell, &len, sizeof(len));
-      std::memcpy(cell + kCellLenBytes, &field.typed_value, len);
-      table_.observe(f, static_cast<int64_t>(field.typed_value));
-      continue;
+  const size_t field_count = schema_.field_count();
+  assert(row.fields.size() == field_count);
+  uint64_t changed = compare ? 0 : ~uint64_t{0};
+  for (size_t field_index = 0; field_index < field_count; field_index++) {
+    const auto &field = row.fields[field_index];
+    std::byte *cell = arena_.get() + strip_offset_[field_index] +
+                      static_cast<size_t>(stride_[field_index]) * slot;
+    // Typed cells take the binary value; untyped bytes and NULL markers need
+    // no numeric conversion.
+    uint16_t len = static_cast<uint16_t>(field.len);
+    const void *src = field.payload;
+    if (schema_.type_of(field_index) != FieldType::kUntyped && field.len != 0) {
+      len = static_cast<uint16_t>(schema_.field_max_bytes[field_index]);
+      src = &field.typed_value;
+      table_.observe(field_index, static_cast<int64_t>(field.typed_value));
     }
-    // Untyped bytes and NULL markers need no numeric conversion.
-    const uint16_t len = static_cast<uint16_t>(field.len);
+
+    // Leave a cell that already holds these bytes untouched.
+    if (compare) {
+      uint16_t old;
+      std::memcpy(&old, cell, sizeof(old));
+      if (old == len &&
+          (len == 0 || std::memcmp(cell + kCellLenBytes, src, len) == 0))
+        continue;
+      changed |= uint64_t{1} << std::min<size_t>(field_index, 63);
+    }
     std::memcpy(cell, &len, sizeof(len));
-    if (len > 0) std::memcpy(cell + kCellLenBytes, field.payload, len);
+    if (len > 0) std::memcpy(cell + kCellLenBytes, src, len);
   }
   // Publish this slot to strip-direct readers after the cells are written.
   visible_[slot / kVisibilityWordBits].fetch_or(
       uint64_t{1} << (slot % kVisibilityWordBits), std::memory_order_release);
+  return changed;
+}
+
+void PaxGroup::update_max_column_tid(uint64_t fields, uint64_t tid) {
+  // A CAS, not a store: installs on different rows arrive out of TID order.
+  for (; fields != 0; fields &= fields - 1) {
+    auto &column = column_tid_[__builtin_ctzll(fields)];
+    uint64_t old = column.load(std::memory_order_relaxed);
+    while (old < tid && !column.compare_exchange_weak(old, tid)) {
+    }
+  }
+}
+
+uint64_t PaxGroup::max_column_tid(uint64_t fields) const {
+  uint64_t max = 0;
+  for (; fields != 0; fields &= fields - 1)
+    max = std::max(max, column_tid_[__builtin_ctzll(fields)].load(
+                            std::memory_order_acquire));
+  return max;
 }
 
 void PaxGroup::RetireSlot(uint32_t slot) {
