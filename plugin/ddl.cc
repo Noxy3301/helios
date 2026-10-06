@@ -239,6 +239,8 @@ int ha_helios::open(const char *table_name, int, uint, const dd::Table *) {
   } else {
     ref_length = sizeof(uint16_t) + pack_hidden_primary_key(0).size();
   }
+  // BKA sizes its MRR buffer from this; ha_statistics leaves it uninitialized.
+  stats.mrr_length_per_rec = ref_length + sizeof(void *);
 
   return 0;
 }
