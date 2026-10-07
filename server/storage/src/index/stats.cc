@@ -88,11 +88,16 @@ bool Database::IndexNdv(const std::string_view table_name,
     if (index == nullptr) return false;
 
     // Secondary entries count only if one referenced base row is live.
+    // A secondary key's pairs are adjacent and the counted parts end inside
+    // it, so after one live pair the rest add nothing.
     index->tree.Scan(std::string_view(), std::string_view(kSupremum),
                      [&](std::string_view key, DataItem &item) -> bool {
                        const auto keys =
                            silo::StableReadKeys(item, index->constraint);
                        if (!keys.found) return false;
+                       const std::string_view secondary_key =
+                           key.substr(0, key.size() - keys.pk_len);
+                       if (!first && secondary_key == prev_key) return false;
                        const bool live = for_each_primary_key(
                            key, keys.pk_len, keys.primary_keys,
                            [&](std::string_view primary_key) {
@@ -102,7 +107,7 @@ bool Database::IndexNdv(const std::string_view table_name,
                                     !base_item->transaction_id.load().absent;
                            });
                        if (!live) return false;
-                       return count_key(key);
+                       return count_key(secondary_key);
                      });
   }
 
