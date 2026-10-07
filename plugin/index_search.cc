@@ -509,9 +509,10 @@ int ha_helios::execute_range(uchar *buf, HeliosTransaction *tx) {
   std::string effective_start = current_plan_.packed_start_key;
   std::string effective_end = current_plan_.packed_end_key;
 
-  // adjust start key based on find_flag
+  // Exclude every key with the start prefix, including a non-unique
+  // secondary entry keyed by the start key followed by its primary key.
   if (current_plan_.find_flag == HA_READ_AFTER_KEY) {
-    effective_start.push_back('\x00'); // exclude start key
+    effective_start = build_prefix_range_end(effective_start);
   }
 
   // execute scan

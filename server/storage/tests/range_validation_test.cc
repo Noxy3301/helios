@@ -6,6 +6,7 @@
 
 #include <filesystem>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "helios/config.h"
@@ -82,6 +83,55 @@ bool Revalidate(helios::storage::Database &db, const TestHelper::Range &range,
 void SeedRows(helios::storage::Database &db) {
   for (const char *key : {"k1", "k2", "k3", "k4"}) {
     ASSERT_TRUE(CommitWrite(db, key, "v"));
+  }
+}
+
+constexpr const char *kIndex = "idx";
+
+// Commits one row and the pair that indexes it under `secondary_key`.
+bool commit_indexed(helios::storage::Database &db, const std::string &key,
+                    const std::string &secondary_key) {
+  std::string reason;
+  const bool committed = TestHelper::CommitRows(
+      db, {}, {{kTable, key, TestHelper::Row("v")}},
+      {{kTable, kIndex, secondary_key, key}}, {}, reason);
+  EXPECT_TRUE(committed) << "pair " << key << " aborted: " << reason;
+  return committed;
+}
+
+// Scans a non-unique index and assembles the range read set a caller
+// submits: the rows by primary key and the records visited.
+TestHelper::Range scan_index_range(helios::storage::Database &db,
+                                   const std::string &start_key,
+                                   const std::string &end_key,
+                                   uint64_t row_limit = 0,
+                                   bool reverse_scan = false) {
+  auto scan =
+      db.ScanIndex(kTable, kIndex, start_key, end_key, row_limit, reverse_scan);
+  db.ReleaseThreadEpoch();
+  EXPECT_TRUE(scan.ok) << "scan [" << start_key << ", " << end_key << ")";
+
+  TestHelper::Range range;
+  range.table_name = kTable;
+  range.index_name = kIndex;
+  range.start_key = start_key;
+  range.end_key = end_key;
+  range.row_limit = row_limit;
+  range.reverse_scan = reverse_scan;
+  for (const auto &row : scan.rows)
+    range.rows.push_back({row.primary_key, row.tid});
+  range.visited = TestHelper::records(scan.visited);
+  return range;
+}
+
+// Two values with two rows each: (v1, k1), (v1, k2), (v2, k3), (v2, k4).
+void seed_pairs(helios::storage::Database &db) {
+  ASSERT_TRUE(db.CreateSecondaryIndex(kTable, kIndex,
+                                      helios::storage::IndexConstraint::kNone));
+  for (const auto &[key, secondary_key] :
+       std::vector<std::pair<std::string, std::string>>{
+           {"k1", "v1"}, {"k2", "v1"}, {"k3", "v2"}, {"k4", "v2"}}) {
+    ASSERT_TRUE(commit_indexed(db, key, secondary_key));
   }
 }
 
@@ -289,4 +339,54 @@ TEST(RangeValidationTest, APaxScanListsTheRecordsARowScanVisits) {
   EXPECT_EQ(TestHelper::records(pax.rows), TestHelper::records(scan.rows));
   EXPECT_EQ(TestHelper::records(pax.visited),
             TestHelper::records(scan.visited));
+}
+
+TEST(RangeValidationTest, APairInsertedUnderAScannedValueAborts) {
+  auto config = MakeConfig();
+  helios::storage::Database db(config);
+  ASSERT_TRUE(TestHelper::CreateTable(db, kTable));
+  seed_pairs(db);
+
+  const auto range = scan_index_range(db, "v1", TestHelper::prefix_end("v2"));
+  std::string reason;
+  ASSERT_TRUE(Revalidate(db, range, reason)) << reason;
+
+  // The new pair's record sits between v1's two pairs.
+  ASSERT_TRUE(commit_indexed(db, "k15", "v1"));
+  EXPECT_FALSE(Revalidate(db, range, reason));
+  EXPECT_EQ(reason, "secondary_range_result_changed");
+}
+
+TEST(RangeValidationTest, APairDeletedUnderAScannedValueAborts) {
+  // The base row stays; only the pair leaves the index.
+  auto config = MakeConfig();
+  helios::storage::Database db(config);
+  ASSERT_TRUE(TestHelper::CreateTable(db, kTable));
+  seed_pairs(db);
+
+  const auto range =
+      scan_index_range(db, "v1", TestHelper::prefix_end("v2"), 0, true);
+  std::string reason;
+  ASSERT_TRUE(Revalidate(db, range, reason)) << reason;
+
+  ASSERT_TRUE(
+      TestHelper::CommitWrites(db, {}, {{kTable, kIndex, "v2", "k3", true}}));
+  EXPECT_FALSE(Revalidate(db, range, reason));
+  EXPECT_EQ(reason, "secondary_range_result_changed");
+}
+
+TEST(RangeValidationTest, ALimitedIndexRangeIgnoresPairsPastItsLimit) {
+  auto config = MakeConfig();
+  helios::storage::Database db(config);
+  ASSERT_TRUE(TestHelper::CreateTable(db, kTable));
+  seed_pairs(db);
+
+  // The limit stops the scan at (v1, k1); a pair added under v1 after it lies
+  // past the limit.
+  const auto range =
+      scan_index_range(db, "v1", TestHelper::prefix_end("v2"), 1);
+  ASSERT_TRUE(commit_indexed(db, "k15", "v1"));
+
+  std::string reason;
+  EXPECT_TRUE(Revalidate(db, range, reason)) << reason;
 }

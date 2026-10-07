@@ -289,10 +289,21 @@ void Database::Recover() {
             "  Recovery: Secondary index '{0}' restoring key '{1}' with {2} "
             "primary keys",
             entry.index_name, entry.key, entry.primary_keys.size());
-        DataItem item;
-        item.transaction_id.store(entry.tid);
-        item.set_primary_keys(entry.primary_keys);
-        idx->tree.Put(entry.key, std::move(item));
+        if (idx->constraint == IndexConstraint::kUnique) {
+          DataItem item;
+          item.transaction_id.store(entry.tid);
+          item.set_primary_keys(entry.primary_keys);
+          idx->tree.Put(entry.key, std::move(item));
+        } else {
+          // A non-unique index keeps one record per pair, under the
+          // secondary key followed by the primary key, whose length it keeps.
+          for (const auto &primary_key : entry.primary_keys) {
+            DataItem item;
+            item.transaction_id.store(entry.tid);
+            item.set_pk_len(primary_key.size());
+            idx->tree.Put(entry.key + primary_key, std::move(item));
+          }
+        }
       } else {
         SPDLOG_CRITICAL(
             "Recovery failed: secondary index {0} of table {1} is declared "

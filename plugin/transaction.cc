@@ -732,8 +732,6 @@ HeliosTransaction::SecondaryScan HeliosTransaction::scan_index_range(
   scanned.end_key = end_key;
   scanned.reverse_scan = reverse_scan;
   scanned.row_limit = sent_limit;
-  // Within one secondary key the primary keys come in key order whichever the
-  // direction, so each group stays sorted for the merge below.
   std::map<std::string, std::vector<std::string>> groups;
   for (auto& row : result.rows) {
     if (!keys_only) {
@@ -756,6 +754,11 @@ HeliosTransaction::SecondaryScan HeliosTransaction::merge_index_scan(
     const std::string& index_name, const std::string& start_key,
     const std::string& end_key, uint64_t row_limit, bool reverse_scan,
     std::map<std::string, std::vector<std::string>>& groups) const {
+  // A reverse scan returns one secondary key's primary keys in descending
+  // order; the merge and the callers take each group ascending.
+  for (auto& [secondary_key, primary_keys] : groups) {
+    std::sort(primary_keys.begin(), primary_keys.end());
+  }
   merge_pending_index_ops(index_name, start_key, end_key, groups);
 
   SecondaryScan out;

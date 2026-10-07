@@ -223,8 +223,8 @@ TEST_F(WalPackingTest, ACommitRecordIsTheLogRecordPacking) {
       {unique_index, static_cast<uint32_t>(IndexConstraint::kUnique)}};
 
   // Keys and row bytes cross the fixstr, str8 and str16 boundaries (a row of
-  // value length n packs as n + 5 bytes below 256, n + 6 above); secondary
-  // primary keys reach str32.
+  // value length n packs as n + 5 bytes below 256, n + 6 above); primary keys
+  // under the UNIQUE index reach str32.
   const std::string key32(32, 'b');
   const std::string pk_str16(65535, 'p');
   const std::string pk_str32(65536, 'q');
@@ -237,19 +237,21 @@ TEST_F(WalPackingTest, ACommitRecordIsTheLogRecordPacking) {
                      {table, std::string(256, 'd'), std::string(251, 'x')},
                      {table, std::string(300, 'e'), std::string(4000, 'x')},
                      {wide_table, "w1", "v"}};
-  commits[0].ops = {
-      {table, index, "s", "k"},       {table, index, "s", std::string(31, 'a')},
-      {table, index, "s", pk_str16},  {table, index, "s2", pk_str32},
-      {table, index, "s2", pk_large}, {wide_table, unique_index, "u1", "w1"}};
+  commits[0].ops = {{table, index, "s", "k"},
+                    {table, index, "s1", std::string(31, 'a')},
+                    {wide_table, unique_index, "u1", "w1"},
+                    {wide_table, unique_index, "u2", pk_str16},
+                    {wide_table, unique_index, "u3", pk_str32},
+                    {wide_table, unique_index, "u4", pk_large}};
   commits[1].rows = {{table, "k", "new"},
                      {table, key32, "", RowOp::kDelete},
                      {wide_table, "w1", "", RowOp::kDelete}};
   commits[1].ops = {{table, index, "s", "k", true},
                     {table, index, "s", "k"},
-                    {table, index, "s2", pk_str32, true},
-                    {table, index, "s2", pk_large, true},
+                    {wide_table, unique_index, "u3", pk_str32, true},
+                    {wide_table, unique_index, "u4", pk_large, true},
                     {wide_table, unique_index, "u1", "w1", true}};
-  commits[1].emptied = {"s2", "u1"};
+  commits[1].emptied = {"u1", "u3", "u4"};
 
   {
     helios::storage::Config config;

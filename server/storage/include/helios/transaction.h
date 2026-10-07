@@ -190,9 +190,11 @@ class Transaction {
    *
    * @details With `remove` true, `primary_key` leaves the secondary key's
    * list; otherwise it joins it. Uniqueness belongs to the named index, not to
-   * this call.
+   * this call. A UNIQUE index keeps one record per secondary key; any other
+   * keeps one per pair, keyed by `secondary_key` followed by `primary_key`.
    * @return false with reason `secondary_index_table_missing`,
-   * `pax_schema_missing`, or `secondary_index_missing`.
+   * `pax_schema_missing`, `secondary_index_missing`, or
+   * `secondary_key_too_long` when a pair's key exceeds the index's limit.
    */
   bool IndexWrite(std::string_view table_name, std::string_view index_name,
                   std::string_view secondary_key, std::string_view primary_key,
@@ -261,13 +263,16 @@ class Transaction {
       wal::SecondaryIndexOp op;
     };
     IndexConstraint constraint;
-    std::vector<Delta> deltas;         ///< Request order, logged as is.
-    PrimaryKeyList::Ptr primary_keys;  ///< Final list, built under the lock.
+    std::vector<Delta> deltas;  ///< Request order, logged as is.
+    /// Final list of a UNIQUE record, built under the lock.
+    PrimaryKeyList::Ptr primary_keys;
   };
 
   struct WriteEntry {
     Table *table;
     std::string_view index_name;  ///< Empty for a primary record.
+    /// The key the log records: the primary key, or the secondary key,
+    /// without the primary key a non-unique record's tree key ends with.
     std::string_view key;
     index::MasstreeIndex *index;  ///< The tree holding the record.
     bool owns_lock = false;
@@ -362,27 +367,29 @@ class Transaction {
    * included. An insert raises only the column TID of the null flags.
    *
    * @pre Validation, preparation and slot reservation all succeeded.
+   * @return `commit_tid` with the absent flag set when the record holds
+   * nothing: a row or a UNIQUE list left empty, or a pair whose last change
+   * removes it.
    */
-  static void Apply(DataItem &item, const WriteEntry &entry,
-                    Tidword commit_tid);
+  static Tidword Apply(DataItem &item, const WriteEntry &entry,
+                       Tidword commit_tid);
 
   /**
    * @brief Packs the row the request sent, or the ordered index changes,
    * into the log record as LogRecord::Write elements.
    *
-   * @pre Apply completed and the index record is still locked.
+   * @pre Apply returned `published` and the index record is still locked.
    */
   static void AppendLog(msgpack::packer<wal::PackedLogRecord> &pk,
-                        const DataItem &item, const WriteEntry &entry,
-                        Tidword commit_tid);
+                        const WriteEntry &entry, Tidword published);
 
   /**
-   * @brief Publishes the TID, which unlocks the record, and queues it when it
-   * holds nothing.
+   * @brief Publishes the TID Apply returned, which unlocks the record, and
+   * queues it when it holds nothing.
    *
    * @pre Apply and AppendLog completed for this record.
    */
-  void Publish(DataItem &item, WriteEntry &entry, Tidword commit_tid);
+  void Publish(DataItem &item, WriteEntry &entry, Tidword published);
 };
 
 }  // namespace silo

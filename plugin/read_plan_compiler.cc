@@ -325,10 +325,11 @@ bool compile_index_range_scan(AccessPath *leaf, TABLE *table,
     if (range->min_keypart_map != 0 && step->key_prefix.empty()) {
       return false;
     }
-    // NEAR_MIN (exclusive lower): append one '\0' as the handler does for
-    // HA_READ_AFTER_KEY. It can over-include a shared-prefix key, which the
-    // WHERE re-check trims.
-    if (range->flag & NEAR_MIN) step->key_prefix.push_back('\0');
+    // NEAR_MIN (exclusive lower): start above every key with this prefix, as
+    // the handler does for HA_READ_AFTER_KEY. A non-unique secondary entry's
+    // key extends its secondary key with the primary key.
+    if (range->flag & NEAR_MIN)
+      step->key_prefix = key_pack::build_prefix_range_end(step->key_prefix);
   }
 
   if (range->flag & NO_MAX_RANGE) {
@@ -742,7 +743,8 @@ bool compile_index_search(TABLE *table, uint index,
         return false;
       }
       std::string start = search.packed_start_key;
-      if (search.find_flag == HA_READ_AFTER_KEY) start.push_back('\0');
+      if (search.find_flag == HA_READ_AFTER_KEY)
+        start = key_pack::build_prefix_range_end(start);
       set_scan(step, table, index, start, search.packed_end_key);
       return true;
     }

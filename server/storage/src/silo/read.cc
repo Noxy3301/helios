@@ -116,16 +116,19 @@ ScanIndexResult Database::ScanIndex(
     return row_limit > 0 && returned_rows >= row_limit;
   };
 
-  // Keep the key list alive while reading the referenced rows.
+  // Keep the key list alive while reading the referenced rows. A pair's key
+  // ends with its one primary key, which the row leaves out.
   auto append_secondary_entry = [&](std::string_view key, DataItem &item) {
-    const std::string secondary_key(key);
-    const auto keys = silo::StableReadKeys(item);
+    const auto keys = silo::StableReadKeys(item, index->constraint);
     if (keys.tid != Tidword::Absent())
-      result.visited.push_back({secondary_key, keys.tid.obj, true});
-    for (std::string_view primary_key : keys.primary_keys_view()) {
-      if (append_base_row(secondary_key, primary_key)) return true;
-    }
-    return false;
+      result.visited.push_back({std::string(key), keys.tid.obj, true});
+    if (!keys.found) return false;
+    const std::string_view secondary_key =
+        key.substr(0, key.size() - keys.pk_len);
+    return for_each_primary_key(
+        key, keys.pk_len, keys.primary_keys, [&](std::string_view primary_key) {
+          return append_base_row(secondary_key, primary_key);
+        });
   };
 
   if (reverse_scan) {

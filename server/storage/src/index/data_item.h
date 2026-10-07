@@ -33,6 +33,7 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -49,16 +50,22 @@ namespace helios::storage {
  *
  * @details A primary-index item refers to a PAX slot its table hands out on
  * the item's first install.
- * A secondary-index item owns the primary-key list published with atomic
- * load and store. Both use transaction_id as their Silo version word.
+ * A UNIQUE secondary item owns the primary-key list published with atomic
+ * load and store. A non-unique item keys one (secondary key, primary key)
+ * pair and holds no list: its key ends with the primary key, whose length it
+ * keeps. All use transaction_id as their Silo version word.
  */
 struct DataItem {
-  // Readers take `absent` from this word; the committer sets it from IsLive()
-  // at publish.
+  // Readers take `absent` from this word; the committer sets it at publish
+  // from IsLive(), or for a pair from its last change.
   std::atomic<Tidword> transaction_id;
   std::shared_ptr<const PrimaryKeyList> primary_keys;
 
   size_t size() const { return size_; }
+  size_t pk_len() const { return pk_len_.load(std::memory_order_relaxed); }
+  void set_pk_len(size_t len) {
+    pk_len_.store(static_cast<uint16_t>(len), std::memory_order_relaxed);
+  }
   bool IsLive() const {
     if (size_ != 0) return true;
     const auto keys = std::atomic_load(&primary_keys);
@@ -81,12 +88,15 @@ struct DataItem {
         primary_keys(std::move(rhs.primary_keys)),
         group_(std::exchange(rhs.group_, nullptr)),
         slot_(std::exchange(rhs.slot_, 0)),
+        pk_len_(rhs.pk_len_.exchange(0, std::memory_order_relaxed)),
         size_(std::exchange(rhs.size_, 0)) {}
 
   DataItem &operator=(DataItem &&rhs) noexcept {
     transaction_id.store(rhs.transaction_id.load());
     group_ = std::exchange(rhs.group_, nullptr);
     slot_ = std::exchange(rhs.slot_, 0);
+    pk_len_.store(rhs.pk_len_.exchange(0, std::memory_order_relaxed),
+                  std::memory_order_relaxed);
     size_ = std::exchange(rhs.size_, 0);
     std::atomic_store(&primary_keys, std::move(rhs.primary_keys));
     return *this;
@@ -157,6 +167,9 @@ struct DataItem {
  private:
   pax::PaxGroup *group_ = nullptr;  // The group holding this item's slot.
   uint32_t slot_ = 0;               // Slot inside group_.
+  // A pair's primary-key length: its key ends with the primary key. The TID
+  // word orders it; relaxed access only keeps readers race-free.
+  std::atomic<uint16_t> pk_len_ = 0;
   size_t size_ = 0;  // Row length in bytes; zero once deleted.
 
   void PreserveImage(EpochNumber epoch);
@@ -171,5 +184,28 @@ struct DataItem {
 };
 
 static_assert(sizeof(DataItem) == 48, "DataItem must remain 48 bytes");
+
+/**
+ * @brief Calls `fn` with each primary key a live secondary record points at,
+ *        until `fn` returns true.
+ *
+ * A record without a list is a non-unique pair, whose key ends with its one
+ * primary key. The caller reads `pk_len` and `list` under one live version of
+ * the record.
+ *
+ * @param key    The record's index key.
+ * @param pk_len A pair's primary-key length; unused when `list` is set.
+ * @param list   A UNIQUE record's primary-key list, or null for a pair.
+ * @return true when `fn` stopped the walk.
+ */
+template <typename Fn>
+bool for_each_primary_key(std::string_view key, size_t pk_len,
+                          const PrimaryKeyList::Ptr &list, Fn &&fn) {
+  if (!list) return fn(key.substr(key.size() - pk_len));
+  for (std::string_view primary_key : PrimaryKeyList::View(list)) {
+    if (fn(primary_key)) return true;
+  }
+  return false;
+}
 }  // namespace helios::storage
 #endif  // HELIOS_STORAGE_SRC_INDEX_DATA_ITEM_H

@@ -16,6 +16,10 @@
 namespace helios::storage {
 namespace index {
 
+// Masstree's MASSTREE_MAXKEYLEN: a scan copies each key into a buffer this
+// long.
+inline constexpr size_t kMaxKeyLength = 255;
+
 /**
  * @brief Maps ordered keys to DataItems.
  * @details DataItem pointers stay valid until this thread calls

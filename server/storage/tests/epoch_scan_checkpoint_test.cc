@@ -145,17 +145,20 @@ class EpochScanCheckpointTest : public ::testing::Test {
     return std::nullopt;
   }
 
-  // The primary keys the checkpoint lists under a secondary key.
+  // The primary keys the checkpoint lists under a secondary key, over every
+  // entry it holds for that key.
   static std::vector<std::string> IndexEntryInCheckpoint(
       const EpochScanCheckpoint::LoadResult &checkpoint,
       const std::string &key) {
+    std::vector<std::string> primary_keys;
     for (const auto &record : checkpoint.records) {
       for (const auto &write : record.writes) {
         if (write.index_name != kIndex || write.key != key) continue;
-        return write.primary_keys;
+        primary_keys.insert(primary_keys.end(), write.primary_keys.begin(),
+                            write.primary_keys.end());
       }
     }
-    return {};
+    return primary_keys;
   }
 
   std::string checkpoint_path() const {
@@ -346,6 +349,88 @@ TEST_F(EpochScanCheckpointTest,
   // longer reaches the row the tail deleted.
   EXPECT_EQ(index_with_checkpoint,
             (std::vector<std::string>{"s/alice=two", "s/carol=two"}));
+}
+
+// The checkpoint keys a non-unique pair by its secondary key, as the log
+// does, so a removal in the tail cancels the pair the checkpoint holds.
+TEST_F(EpochScanCheckpointTest, APairTheTailRemovesStaysRemoved) {
+  {
+    auto config = MakeConfig(false);
+    helios::storage::Database db(config);
+    TestHelper::CreateTable(db, kTable);
+    ASSERT_TRUE(db.CreateSecondaryIndex(
+        kTable, kIndex, helios::storage::IndexConstraint::kNone));
+    ASSERT_TRUE(CommitIndexedWrite(db, "alice", "one", "s"));
+    ASSERT_TRUE(CommitIndexedWrite(db, "bob", "two", "s"));
+    ASSERT_TRUE(CommitIndexedWrite(db, "carol", "three", "t"));
+    ASSERT_TRUE(db.WriteCheckpoint());
+    std::string reason;
+    ASSERT_TRUE(TestHelper::CommitRows(
+        db, {}, {}, {{kTable, kIndex, "s", "bob", true}}, {}, reason))
+        << reason;
+    ASSERT_TRUE(CommitIndexedWrite(db, "dave", "four", "s"));
+  }
+
+  const std::vector<std::string> expected{"s/alice=one", "s/dave=four",
+                                          "t/carol=three"};
+  {
+    auto config = MakeConfig(true);
+    helios::storage::Database db(config);
+    EXPECT_EQ(ReadIndex(db), expected);
+  }
+  // The log alone recovers the same pairs.
+  std::error_code ec;
+  ASSERT_TRUE(std::filesystem::remove(checkpoint_path(), ec)) << ec.message();
+  {
+    auto config = MakeConfig(true);
+    helios::storage::Database db(config);
+    EXPECT_EQ(ReadIndex(db), expected);
+  }
+}
+
+// A pair's record key is its two keys run together, and recovery restores
+// where the primary key starts, from the checkpoint and from the log alike.
+// Keys of differing lengths make a wrong split a different pair.
+TEST_F(EpochScanCheckpointTest, ARestoredPairKeepsItsPrimaryKeyLength) {
+  {
+    auto config = MakeConfig(false);
+    helios::storage::Database db(config);
+    TestHelper::CreateTable(db, kTable);
+    ASSERT_TRUE(db.CreateSecondaryIndex(
+        kTable, kIndex, helios::storage::IndexConstraint::kNone));
+    ASSERT_TRUE(CommitIndexedWrite(db, "a", "one", "sss"));
+    ASSERT_TRUE(CommitIndexedWrite(db, "bbb", "two", "s"));
+    ASSERT_TRUE(db.WriteCheckpoint());
+    ASSERT_TRUE(CommitIndexedWrite(db, "cc", "three", "ss"));
+  }
+
+  const std::vector<std::string> expected{"s/bbb=two", "ss/cc=three",
+                                          "sss/a=one"};
+  {
+    auto config = MakeConfig(true);
+    helios::storage::Database db(config);
+    EXPECT_EQ(ReadIndex(db), expected);
+
+    // A restored pair is removed by its two keys and returns when added again.
+    std::string reason;
+    ASSERT_TRUE(TestHelper::CommitRows(
+        db, {}, {}, {{kTable, kIndex, "s", "bbb", true}}, {}, reason))
+        << reason;
+    EXPECT_EQ(ReadIndex(db),
+              (std::vector<std::string>{"ss/cc=three", "sss/a=one"}));
+    ASSERT_TRUE(TestHelper::CommitRows(
+        db, {}, {}, {{kTable, kIndex, "s", "bbb", false}}, {}, reason))
+        << reason;
+    EXPECT_EQ(ReadIndex(db), expected);
+  }
+  // The log alone restores the same split.
+  std::error_code ec;
+  ASSERT_TRUE(std::filesystem::remove(checkpoint_path(), ec)) << ec.message();
+  {
+    auto config = MakeConfig(true);
+    helios::storage::Database db(config);
+    EXPECT_EQ(ReadIndex(db), expected);
+  }
 }
 
 TEST_F(EpochScanCheckpointTest, AQuietTailAfterTheCheckpointIsAccepted) {

@@ -88,23 +88,26 @@ bool Database::IndexNdv(const std::string_view table_name,
     if (index == nullptr) return false;
 
     // Secondary entries count only if one referenced base row is live.
-    auto stable_live_secondary = [&](const DataItem &item) {
-      const auto keys = silo::StableReadKeys(item);
-      if (!keys.found) return false;
-      for (std::string_view primary_key : keys.primary_keys_view()) {
-        DataItem *base_item = primary_index.Get(primary_key);
-        if (base_item != nullptr && !base_item->transaction_id.load().absent)
-          return true;
-      }
-      return false;
-    };
-
+    // A secondary key's pairs are adjacent and the counted parts end inside
+    // it, so after one live pair the rest add nothing.
     index->tree.Scan(std::string_view(), std::string_view(kSupremum),
                      [&](std::string_view key, DataItem &item) -> bool {
-                       if (!stable_live_secondary(item)) {
-                         return false;
-                       }
-                       return count_key(key);
+                       const auto keys =
+                           silo::StableReadKeys(item, index->constraint);
+                       if (!keys.found) return false;
+                       const std::string_view secondary_key =
+                           key.substr(0, key.size() - keys.pk_len);
+                       if (!first && secondary_key == prev_key) return false;
+                       const bool live = for_each_primary_key(
+                           key, keys.pk_len, keys.primary_keys,
+                           [&](std::string_view primary_key) {
+                             DataItem *base_item =
+                                 primary_index.Get(primary_key);
+                             return base_item != nullptr &&
+                                    !base_item->transaction_id.load().absent;
+                           });
+                       if (!live) return false;
+                       return count_key(secondary_key);
                      });
   }
 
@@ -133,12 +136,7 @@ bool Database::IndexHistogram(const std::string_view table_name,
     return parts(key, 1, &end) ? end : 0;
   };
 
-  // Weight each secondary key by the number of primary keys it references.
-  const auto stable_pk_count = [](const DataItem &item) -> uint64_t {
-    const auto keys = silo::StableReadKeys(item);
-    return keys.found ? keys.primary_keys->count : 0;
-  };
-  // Visit keys with weight 1 for primary rows, or the list size for secondary keys.
+  // Visit keys with weight 1 for each live primary row or secondary record.
   // Secondary weights do not recheck whether the referenced rows are live.
   bool failed = false;
   auto walk = [&](auto &&fn) {
@@ -159,16 +157,33 @@ bool Database::IndexHistogram(const std::string_view table_name,
         failed = true;
         return;
       }
+      // Sum a secondary key's adjacent pairs and visit the key once, so a
+      // bucket closes only between secondary keys.
+      std::string pending;
+      uint64_t pending_w = 0;
       index->tree.Scan(std::string_view(), std::string_view(kSupremum),
                        [&](std::string_view key, DataItem &item) -> bool {
-                         const uint64_t w = stable_pk_count(item);
-                         if (w == 0) return false;  // dead/empty secondary entry
+                         // A live record is one row: a pair, or the one owner
+                         // of a UNIQUE key.
+                         const auto keys =
+                             silo::StableReadKeys(item, index->constraint);
+                         if (!keys.found) return false;  // dead secondary entry
                          if (leading_end(key) == 0) {
                            failed = true;
                            return true;
                          }
-                         return fn(key, w);
+                         const std::string_view secondary_key =
+                             key.substr(0, key.size() - keys.pk_len);
+                         if (pending_w != 0 && secondary_key == pending) {
+                           ++pending_w;
+                           return false;
+                         }
+                         if (pending_w != 0) fn(pending, pending_w);
+                         pending.assign(secondary_key);
+                         pending_w = 1;
+                         return false;
                        });
+      if (!failed && pending_w != 0) fn(pending, pending_w);
     }
   };
 

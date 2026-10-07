@@ -61,6 +61,14 @@ struct WriteBehindTheCursor {
   }
 };
 
+// Two-byte key parts; a non-unique record's key continues with its primary
+// key, which no part reaches.
+bool two_byte_parts(std::string_view key, uint32_t num_parts, size_t *ends) {
+  if (key.size() < 2 * num_parts) return false;
+  for (uint32_t part = 0; part < num_parts; ++part) ends[part] = 2 * (part + 1);
+  return true;
+}
+
 }  // namespace
 
 // The histogram walks the index twice, and the second walk can see a row the
@@ -88,4 +96,37 @@ TEST(StatsTest, CountsRiseWhenARowArrivesBetweenTheWalks) {
   for (size_t i = 1; i < cum.size(); ++i) EXPECT_GE(cum[i], cum[i - 1]);
   EXPECT_EQ(bounds.back(), "c");
   EXPECT_EQ(cum.back(), 3u);
+}
+
+// A value's many rows are one distinct value, and the histogram weighs each
+// row once.
+TEST(StatsTest, NdvCountsValuesNotRows) {
+  auto config = MakeConfig();
+  helios::storage::Database db(config);
+  ASSERT_TRUE(TestHelper::CreateTable(db, kTable));
+  ASSERT_TRUE(db.CreateSecondaryIndex(kTable, "idx",
+                                      helios::storage::IndexConstraint::kNone));
+
+  // 150 rows over three values of two parts: a1b1, a1b2 and a2b1.
+  const char *values[] = {"a1b1", "a1b2", "a2b1"};
+  std::vector<TestHelper::RowWrite> rows;
+  std::vector<TestHelper::IndexOp> ops;
+  for (int i = 0; i < 150; ++i) {
+    const std::string pk = "p" + std::to_string(1000 + i);
+    rows.push_back({kTable, pk, "v"});
+    ops.push_back({kTable, "idx", values[i % 3], pk});
+  }
+  ASSERT_TRUE(TestHelper::CommitWrites(db, rows, ops));
+
+  std::vector<uint64_t> ndv;
+  ASSERT_TRUE(db.IndexNdv(kTable, "idx", 2, two_byte_parts, ndv));
+  EXPECT_EQ(ndv, (std::vector<uint64_t>{2, 3}));
+
+  std::vector<std::string> bounds;
+  std::vector<uint64_t> cum;
+  ASSERT_TRUE(db.IndexHistogram(kTable, "idx", 4, two_byte_parts, bounds, cum));
+  db.ReleaseThreadEpoch();
+  ASSERT_FALSE(cum.empty());
+  EXPECT_EQ(cum.back(), 150u);
+  EXPECT_EQ(bounds.back(), "a2");
 }

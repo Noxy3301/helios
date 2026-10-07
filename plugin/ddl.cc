@@ -368,7 +368,7 @@ bool ha_helios::backfill_indexes_parallel(
     std::vector<std::pair<std::string, std::string>> &rows,
     const std::vector<std::pair<std::string, const KEY *>> &specs) {
   // Phase A: unpack each row once, build one write per index, and bucket it by
-  // secondary-key hash. Single-threaded: unpack uses the shared record buffer.
+  // primary-key hash. Single-threaded: unpack uses the shared record buffer.
   std::vector<std::vector<HeliosProxy::WriteOp>> partition(
       kBackfillParallelWorkers);
   // Reserve each bucket to its expected hash share so the per-row push_back
@@ -398,7 +398,7 @@ bool ha_helios::backfill_indexes_parallel(
       op.primary_key = row.first;
       op.secondary_key =
           build_secondary_key_from_row(table->record[0], *spec.second);
-      partition[hasher(op.secondary_key) % kBackfillParallelWorkers].push_back(
+      partition[hasher(op.primary_key) % kBackfillParallelWorkers].push_back(
           std::move(op));
     }
   }

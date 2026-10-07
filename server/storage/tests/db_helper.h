@@ -278,16 +278,25 @@ inline std::vector<std::pair<std::string, std::string>> ScanIndex(
   return rows;
 }
 
+// The smallest key above every key that starts with `prefix`, which does not
+// end in 0xff.
+inline std::string prefix_end(std::string prefix) {
+  ++prefix.back();
+  return prefix;
+}
+
 // Primary keys a single secondary key resolves to.
 inline std::vector<std::string> ReadIndex(helios::storage::Database &db,
                                           const std::string &table,
                                           const std::string &index_name,
                                           const std::string &secondary_key) {
   std::vector<std::string> primary_keys;
-  // The exclusive end of an exact-match scan of one secondary key.
-  for (auto &entry :
-       ScanIndex(db, table, index_name, secondary_key, secondary_key + '\0')) {
-    primary_keys.push_back(std::move(entry.second));
+  // A non-unique record's key extends its secondary key, as a longer
+  // secondary key can; keep the exact matches.
+  for (auto &entry : ScanIndex(db, table, index_name, secondary_key,
+                               prefix_end(secondary_key))) {
+    if (entry.first == secondary_key)
+      primary_keys.push_back(std::move(entry.second));
   }
   return primary_keys;
 }
