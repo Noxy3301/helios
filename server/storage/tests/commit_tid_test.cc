@@ -736,7 +736,7 @@ TEST_F(CommitTidTest, UniqueIndexTakesASecondAdditionThatFollowsARemoval) {
   ASSERT_NE(nullptr, posting);
   const auto keys = silo::StableReadKeys(*posting);
   EXPECT_TRUE(keys.found);
-  const auto view = keys.primary_keys_view();
+  const PrimaryKeyList::View view(keys.primary_keys);
   ASSERT_EQ(1u, view.size());
   EXPECT_EQ("b", *view.begin());
   index::release_thread_epoch();
@@ -836,7 +836,7 @@ TEST_F(CommitTidTest, SecondaryRangeReadContributesIndexAndRowVersions) {
   auto *row = SeedRow("a", Version(10, 10));
   auto *index = tables_.GetTable(kTable)->GetSecondaryIndex("idx");
   auto *posting = index->tree.GetOrInsert("groupa");
-  posting->set_primary_keys({"a"});
+  posting->set_pk_len(1);
   posting->transaction_id.store(Version(10, 300));
   TestHelper::Range range;
   range.table_name = kTable;
@@ -984,7 +984,7 @@ TEST_F(CommitTidTest, RangeRevalidationAllowsOwnLockOnPrimaryAndSecondary) {
   SeedRow("k", Version(10, 10));
   auto *index = tables_.GetTable(kTable)->GetSecondaryIndex("idx");
   auto *posting = index->tree.GetOrInsert("sk");
-  posting->set_primary_keys({"k"});
+  posting->set_pk_len(1);
   posting->transaction_id.store(Version(10, 12));
 
   TestHelper::Range rows;
@@ -1093,7 +1093,7 @@ TEST_F(CommitTidTest,
   tree.GetOrInsert("a")->transaction_id.store(Deleted(11, 5));
   auto *index = tables_.GetTable(kTable)->GetSecondaryIndex("idx");
   auto *posting = index->tree.GetOrInsert("groupa");
-  posting->set_primary_keys({"a"});
+  posting->set_pk_len(1);
   posting->transaction_id.store(Version(10, 30));
   TestHelper::Range range;
   range.table_name = kTable;
@@ -1112,7 +1112,7 @@ TEST_F(CommitTidTest,
   // A non-unique index keys the pair (s, a) as "sa".
   auto *index = tables_.GetTable(kTable)->GetSecondaryIndex("idx");
   auto *posting = index->tree.GetOrInsert("sa");
-  posting->set_primary_keys({"a"});
+  posting->set_pk_len(1);
   posting->transaction_id.store(Version(10, 4));
 
   ASSERT_TRUE(Commit({}, {}, {{kTable, "idx", "s", "a", true}})) << reason_;

@@ -232,3 +232,35 @@ TEST_F(ManipulateSecondaryIndexTest,
   ASSERT_EQ(current.size(), 1u);
   EXPECT_EQ(current[0], "user1");
 }
+
+// A removed pair's record stays until the reaper takes it; the pair's last
+// change in a request decides whether it is found.
+TEST_F(ManipulateSecondaryIndexTest, APairRemovedAndAddedAgainIsFoundAgain) {
+  ASSERT_TRUE(TestHelper::CreateTable(*db_, "users"));
+  ASSERT_TRUE(
+      db_->CreateSecondaryIndex("users", "age_index", IndexConstraint::kNone));
+  const std::vector<std::string> found{"user1"};
+
+  ASSERT_TRUE(
+      TestHelper::CommitWrites(*db_, {{"users", "user1", "Alice"}},
+                               {{"users", "age_index", "25", "user1"}}));
+  ASSERT_TRUE(TestHelper::CommitWrites(
+      *db_, {}, {{"users", "age_index", "25", "user1", true}}));
+  EXPECT_TRUE(TestHelper::ReadIndex(*db_, "users", "age_index", "25").empty());
+
+  ASSERT_TRUE(TestHelper::CommitWrites(
+      *db_, {}, {{"users", "age_index", "25", "user1"}}));
+  EXPECT_EQ(TestHelper::ReadIndex(*db_, "users", "age_index", "25"), found);
+
+  ASSERT_TRUE(
+      TestHelper::CommitWrites(*db_, {},
+                               {{"users", "age_index", "25", "user1", true},
+                                {"users", "age_index", "25", "user1", false}}));
+  EXPECT_EQ(TestHelper::ReadIndex(*db_, "users", "age_index", "25"), found);
+
+  ASSERT_TRUE(
+      TestHelper::CommitWrites(*db_, {},
+                               {{"users", "age_index", "25", "user1", false},
+                                {"users", "age_index", "25", "user1", true}}));
+  EXPECT_TRUE(TestHelper::ReadIndex(*db_, "users", "age_index", "25").empty());
+}

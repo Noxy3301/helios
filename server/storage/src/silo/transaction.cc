@@ -296,10 +296,10 @@ bool Transaction::Commit(CommitDurability durability, std::string &reason) {
     const bool is_row = std::holds_alternative<RowUpdate>(entry.update);
     if (is_row && row_applied)
       HELIOS_DEBUG_SYNC("silo_commit.between_row_installs");
-    Apply(*item, entry, commit_tid);
+    const Tidword published = Apply(*item, entry, commit_tid);
     // Once unlocked, another writer may replace this record immediately.
-    AppendLog(pk, *item, entry, commit_tid);
-    Publish(*item, entry, commit_tid);
+    AppendLog(pk, entry, published);
+    Publish(*item, entry, published);
     row_applied = row_applied || is_row;
   }
 
@@ -366,8 +366,10 @@ bool Transaction::Prepare(DataItem &item, WriteEntry &entry,
     return true;
   }
 
-  // Apply the request's changes to the list this commit publishes.
+  // Apply the request's changes to the list this commit publishes. A pair
+  // holds no list and no constraint.
   auto &index = std::get<IndexUpdate>(entry.update);
+  if (index.constraint != IndexConstraint::kUnique) return true;
   index.primary_keys = std::atomic_load(&item.primary_keys);
   for (const auto &delta : index.deltas) {
     if (delta.op == wal::SecondaryIndexOp::kDelete) {
@@ -378,7 +380,7 @@ bool Transaction::Prepare(DataItem &item, WriteEntry &entry,
     // A UNIQUE key holds one primary key; adding that same key again is not
     // a second one.
     const PrimaryKeyList::View keys(index.primary_keys);
-    if (index.constraint == IndexConstraint::kUnique && !keys.empty() &&
+    if (!keys.empty() &&
         !(keys.size() == 1 && keys.contains(delta.primary_key))) {
       reason =
           std::string(kDuplicateSecondaryKeyAbortPrefix) + "exists_after_lock";
@@ -495,30 +497,33 @@ bool Transaction::RevalidateSecondaryRange(const RangeEntry &range,
     DataItem *item = index->tree.Get(key);
     if (item == nullptr) return false;
 
-    // The key list is a separate load; abort if the word moved around it.
+    // The key list and a pair's length are separate loads; abort if the word
+    // moved around them.
     const Tidword tid = item->transaction_id.load();
     auto primary_keys = std::atomic_load(&item->primary_keys);
+    const size_t pk_len = item->pk_len();
     if (item->transaction_id.load() != tid ||
         !match_record(range, row, visited, key, item, tid, true, max_tid)) {
       matches = false;
       return true;
     }
 
-    // The entry's word fixes its list, so its base records follow in order. A
-    // missing base record reads as no record, as the scan skipped it.
-    for (std::string_view primary_key : PrimaryKeyList::View(primary_keys)) {
-      DataItem *base = table->GetPrimaryIndex().Get(primary_key);
-      if (base == nullptr) continue;
-      const Tidword base_tid = base->transaction_id.load();
-      if (!match_record(range, row, visited, primary_key, base, base_tid, false,
-                        max_tid)) {
-        matches = false;
-        return true;
-      }
-      if (!base_tid.absent) ++live;
-      if (range.limit > 0 && live >= range.limit) return true;
-    }
-    return false;
+    // The entry's word fixes its primary keys, so its base records follow in
+    // order. A missing base record reads as no record, as the scan skipped it.
+    if (tid.absent) return false;
+    return for_each_primary_key(
+        key, pk_len, primary_keys, [&](std::string_view primary_key) {
+          DataItem *base = table->GetPrimaryIndex().Get(primary_key);
+          if (base == nullptr) return false;
+          const Tidword base_tid = base->transaction_id.load();
+          if (!match_record(range, row, visited, primary_key, base, base_tid,
+                            false, max_tid)) {
+            matches = false;
+            return true;
+          }
+          if (!base_tid.absent) ++live;
+          return range.limit > 0 && live >= range.limit;
+        });
   };
 
   if (range.reverse) {
@@ -561,12 +566,12 @@ bool Transaction::match_record(const RangeEntry &range, size_t &row,
   return true;
 }
 
-void Transaction::Apply(DataItem &item, const WriteEntry &entry,
-                        Tidword commit_tid) {
+Tidword Transaction::Apply(DataItem &item, const WriteEntry &entry,
+                           Tidword commit_tid) {
   if (const auto *row = std::get_if<RowUpdate>(&entry.update)) {
     if (row->op == RowOp::kDelete) {
       item.DeleteRow(commit_tid.epoch);
-      return;
+      return PublishedTid(commit_tid, item);
     }
     const bool inserted = item.size() == 0;
     uint64_t fields =
@@ -577,16 +582,23 @@ void Transaction::Apply(DataItem &item, const WriteEntry &entry,
     // precedes Publish, so a validator that loads the new word sees it.
     if (inserted) fields = 1;
     item.pax_group()->update_max_column_tid(fields, commit_tid.obj);
-    return;
+    return PublishedTid(commit_tid, item);
   }
-  std::atomic_store(&item.primary_keys,
-                    std::get<IndexUpdate>(entry.update).primary_keys);
+  const auto &index = std::get<IndexUpdate>(entry.update);
+  if (index.constraint == IndexConstraint::kUnique) {
+    std::atomic_store(&item.primary_keys, index.primary_keys);
+    return PublishedTid(commit_tid, item);
+  }
+
+  // A pair holds no list; its last delta decides whether it is present.
+  const auto &last = index.deltas.back();
+  commit_tid.absent = last.op == wal::SecondaryIndexOp::kDelete;
+  if (!commit_tid.absent) item.set_pk_len(last.primary_key.size());
+  return commit_tid;
 }
 
 void Transaction::AppendLog(msgpack::packer<wal::PackedLogRecord> &pk,
-                            const DataItem &item, const WriteEntry &entry,
-                            Tidword commit_tid) {
-  const Tidword published = PublishedTid(commit_tid, item);
+                            const WriteEntry &entry, Tidword published) {
   const std::string &table_name = entry.table->Name();
   if (const auto *row = std::get_if<RowUpdate>(&entry.update)) {
     // The bytes the install unpacked; a delete logs an empty value.
@@ -605,8 +617,7 @@ void Transaction::AppendLog(msgpack::packer<wal::PackedLogRecord> &pk,
 }
 
 void Transaction::Publish(DataItem &item, WriteEntry &entry,
-                          Tidword commit_tid) {
-  const Tidword published = PublishedTid(commit_tid, item);
+                          Tidword published) {
   item.transaction_id.store(published);
   entry.owns_lock = false;
   if (!published.absent) return;

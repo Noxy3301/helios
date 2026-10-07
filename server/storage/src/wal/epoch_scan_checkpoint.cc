@@ -225,12 +225,11 @@ EpochScanCheckpoint::CaptureResult EpochScanCheckpoint::CapturePrimaryRow(
 }
 
 /**
- * @brief Copies one secondary key's whole primary-key list under the same
- *        protocol.
+ * @brief Copies one secondary record's primary keys under the same protocol.
  *
- * @details The list is a complete posting list rather than a delta: recovery
+ * @details The keys are a complete posting list rather than a delta: recovery
  * expands it into adds and then applies the log's own adds and removes by
- * transaction id.
+ * transaction id. A pair's list is the one primary key its key ends with.
  *
  * @param retries Incremented once per rejected attempt.
  * @return kTaken, kSkipped when the absent flag is set, or kUnstable.
@@ -248,25 +247,22 @@ EpochScanCheckpoint::CaptureResult EpochScanCheckpoint::CaptureSecondaryEntry(
     }
     if (observed.absent) return EpochScanCheckpoint::CaptureResult::kSkipped;
     auto primary_keys = std::atomic_load(&item.primary_keys);
+    const size_t pk_len = item.pk_len();
     if (item.transaction_id.load() != observed) {
       ++retries;
       continue;
     }
-    const PrimaryKeyList::View keys(primary_keys);
-    // A non-unique record's key ends with its one primary key; the log keys
-    // a secondary write by the secondary key alone.
-    if (index_type != static_cast<uint32_t>(IndexConstraint::kUnique) &&
-        !keys.empty())
-      key.remove_suffix((*keys.begin()).size());
-    out.key.assign(key.data(), key.size());
+    // The log keys a secondary write by the secondary key alone.
+    out.key.assign(key.data(), key.size() - pk_len);
     out.transaction_id = observed;
     out.table_name = table_name;
     out.index_name = index_name;
     out.index_type = index_type;
-    out.primary_keys.reserve(keys.size());
-    for (std::string_view primary_key : keys) {
-      out.primary_keys.emplace_back(primary_key.data(), primary_key.size());
-    }
+    for_each_primary_key(key, pk_len, primary_keys,
+                         [&](std::string_view primary_key) {
+                           out.primary_keys.emplace_back(primary_key);
+                           return false;
+                         });
     out.secondary_op = SecondaryIndexOp::kFull;
     return EpochScanCheckpoint::CaptureResult::kTaken;
   }

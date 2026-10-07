@@ -388,6 +388,51 @@ TEST_F(EpochScanCheckpointTest, APairTheTailRemovesStaysRemoved) {
   }
 }
 
+// A pair's record key is its two keys run together, and recovery restores
+// where the primary key starts, from the checkpoint and from the log alike.
+// Keys of differing lengths make a wrong split a different pair.
+TEST_F(EpochScanCheckpointTest, ARestoredPairKeepsItsPrimaryKeyLength) {
+  {
+    auto config = MakeConfig(false);
+    helios::storage::Database db(config);
+    TestHelper::CreateTable(db, kTable);
+    ASSERT_TRUE(db.CreateSecondaryIndex(
+        kTable, kIndex, helios::storage::IndexConstraint::kNone));
+    ASSERT_TRUE(CommitIndexedWrite(db, "a", "one", "sss"));
+    ASSERT_TRUE(CommitIndexedWrite(db, "bbb", "two", "s"));
+    ASSERT_TRUE(db.WriteCheckpoint());
+    ASSERT_TRUE(CommitIndexedWrite(db, "cc", "three", "ss"));
+  }
+
+  const std::vector<std::string> expected{"s/bbb=two", "ss/cc=three",
+                                          "sss/a=one"};
+  {
+    auto config = MakeConfig(true);
+    helios::storage::Database db(config);
+    EXPECT_EQ(ReadIndex(db), expected);
+
+    // A restored pair is removed by its two keys and returns when added again.
+    std::string reason;
+    ASSERT_TRUE(TestHelper::CommitRows(
+        db, {}, {}, {{kTable, kIndex, "s", "bbb", true}}, {}, reason))
+        << reason;
+    EXPECT_EQ(ReadIndex(db),
+              (std::vector<std::string>{"ss/cc=three", "sss/a=one"}));
+    ASSERT_TRUE(TestHelper::CommitRows(
+        db, {}, {}, {{kTable, kIndex, "s", "bbb", false}}, {}, reason))
+        << reason;
+    EXPECT_EQ(ReadIndex(db), expected);
+  }
+  // The log alone restores the same split.
+  std::error_code ec;
+  ASSERT_TRUE(std::filesystem::remove(checkpoint_path(), ec)) << ec.message();
+  {
+    auto config = MakeConfig(true);
+    helios::storage::Database db(config);
+    EXPECT_EQ(ReadIndex(db), expected);
+  }
+}
+
 TEST_F(EpochScanCheckpointTest, AQuietTailAfterTheCheckpointIsAccepted) {
   {
     auto config = MakeConfig(false);
