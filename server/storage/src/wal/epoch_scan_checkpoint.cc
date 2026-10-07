@@ -246,7 +246,9 @@ EpochScanCheckpoint::CaptureResult EpochScanCheckpoint::CaptureSecondaryEntry(
       continue;
     }
     if (observed.absent) return EpochScanCheckpoint::CaptureResult::kSkipped;
-    auto primary_keys = std::atomic_load(&item.primary_keys);
+    PrimaryKeyList::Ptr primary_keys;
+    if (index_type == static_cast<uint32_t>(IndexConstraint::kUnique))
+      primary_keys = std::atomic_load(&item.primary_keys);
     const size_t pk_len = item.pk_len();
     if (item.transaction_id.load() != observed) {
       ++retries;

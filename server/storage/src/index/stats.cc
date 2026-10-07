@@ -90,7 +90,8 @@ bool Database::IndexNdv(const std::string_view table_name,
     // Secondary entries count only if one referenced base row is live.
     index->tree.Scan(std::string_view(), std::string_view(kSupremum),
                      [&](std::string_view key, DataItem &item) -> bool {
-                       const auto keys = silo::StableReadKeys(item);
+                       const auto keys =
+                           silo::StableReadKeys(item, index->constraint);
                        if (!keys.found) return false;
                        const bool live = for_each_primary_key(
                            key, keys.pk_len, keys.primary_keys,
@@ -159,7 +160,8 @@ bool Database::IndexHistogram(const std::string_view table_name,
                        [&](std::string_view key, DataItem &item) -> bool {
                          // A live record is one row: a pair, or the one owner
                          // of a UNIQUE key.
-                         const auto keys = silo::StableReadKeys(item);
+                         const auto keys =
+                             silo::StableReadKeys(item, index->constraint);
                          if (!keys.found) return false;  // dead secondary entry
                          if (leading_end(key) == 0) {
                            failed = true;

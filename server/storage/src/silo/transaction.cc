@@ -500,7 +500,9 @@ bool Transaction::RevalidateSecondaryRange(const RangeEntry &range,
     // The key list and a pair's length are separate loads; abort if the word
     // moved around them.
     const Tidword tid = item->transaction_id.load();
-    auto primary_keys = std::atomic_load(&item->primary_keys);
+    PrimaryKeyList::Ptr primary_keys;
+    if (index->constraint == IndexConstraint::kUnique)
+      primary_keys = std::atomic_load(&item->primary_keys);
     const size_t pk_len = item->pk_len();
     if (item->transaction_id.load() != tid ||
         !match_record(range, row, visited, key, item, tid, true, max_tid)) {
