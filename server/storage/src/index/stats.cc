@@ -133,11 +133,6 @@ bool Database::IndexHistogram(const std::string_view table_name,
     return parts(key, 1, &end) ? end : 0;
   };
 
-  // Weight each secondary key by the number of primary keys it references.
-  const auto stable_pk_count = [](const DataItem &item) -> uint64_t {
-    const auto keys = silo::StableReadKeys(item);
-    return keys.found ? keys.primary_keys->count : 0;
-  };
   // Visit keys with weight 1 for primary rows, or the list size for secondary keys.
   // Secondary weights do not recheck whether the referenced rows are live.
   bool failed = false;
@@ -159,16 +154,38 @@ bool Database::IndexHistogram(const std::string_view table_name,
         failed = true;
         return;
       }
+      // Sum a secondary key's adjacent pairs and visit the key once, so a
+      // bucket closes only between secondary keys.
+      const bool unique = index->constraint == IndexConstraint::kUnique;
+      std::string pending;
+      uint64_t pending_w = 0;
       index->tree.Scan(std::string_view(), std::string_view(kSupremum),
                        [&](std::string_view key, DataItem &item) -> bool {
-                         const uint64_t w = stable_pk_count(item);
+                         // Weight each secondary key by the number of primary
+                         // keys it references.
+                         const auto keys = silo::StableReadKeys(item);
+                         const uint64_t w =
+                             keys.found ? keys.primary_keys->count : 0;
                          if (w == 0) return false;  // dead/empty secondary entry
                          if (leading_end(key) == 0) {
                            failed = true;
                            return true;
                          }
-                         return fn(key, w);
+                         // A pair's key ends with its one primary key.
+                         std::string_view secondary_key = key;
+                         if (!unique)
+                           secondary_key.remove_suffix(
+                               (*keys.primary_keys_view().begin()).size());
+                         if (pending_w != 0 && secondary_key == pending) {
+                           pending_w += w;
+                           return false;
+                         }
+                         if (pending_w != 0) fn(pending, pending_w);
+                         pending.assign(secondary_key);
+                         pending_w = w;
+                         return false;
                        });
+      if (!failed && pending_w != 0) fn(pending, pending_w);
     }
   };
 

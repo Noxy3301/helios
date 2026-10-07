@@ -6,6 +6,7 @@
  * delete adds or removes.
  */
 
+#include <algorithm>
 #include <filesystem>
 #include <memory>
 #include <string>
@@ -126,11 +127,10 @@ TEST_F(ScanSecondaryIndexTest, ReverseScan) {
        {"users", "group_index", "g1", "user1", false},
        {"users", "group_index", "g2", "user3", false}}));
 
-  // Reverse walks the secondary keys backwards; the primary keys under one
-  // secondary key keep their stored ascending order.
+  // Reverse walks the (secondary key, primary key) pairs backwards.
   EXPECT_EQ(
       TestHelper::ScanIndex(*db_, "users", "group_index", "g1", "g3", 0, true),
-      (SecondaryScanRows{{"g2", "user3"}, {"g1", "user1"}, {"g1", "user2"}}));
+      (SecondaryScanRows{{"g2", "user3"}, {"g1", "user2"}, {"g1", "user1"}}));
 }
 
 TEST_F(ScanSecondaryIndexTest, StopScanning) {
@@ -184,4 +184,83 @@ TEST_F(ScanSecondaryIndexTest, ExcludeDeletedKeys) {
   EXPECT_EQ(
       TestHelper::ScanIndex(*db_, "users", "name_index", "alice", "carol"),
       (SecondaryScanRows{{"alice", "user1"}}));
+}
+
+TEST_F(ScanSecondaryIndexTest, ManyRowsPerValue) {
+  ASSERT_TRUE(TestHelper::CreateTable(*db_, "users"));
+  ASSERT_TRUE(db_->CreateSecondaryIndex("users", "group_index",
+                                        IndexConstraint::kNone));
+
+  // Four values of 100 rows each, interleaved by primary key and fed in
+  // descending order. Fixed-width keys keep one value's pairs apart.
+  SecondaryScanRows all;
+  std::vector<TestHelper::RowWrite> rows;
+  std::vector<TestHelper::IndexOp> ops;
+  for (int i = 399; i >= 0; --i) {
+    const std::string pk = "u" + std::to_string(1000 + i);
+    const std::string sk = "g" + std::to_string(i % 4);
+    rows.push_back({"users", pk, pk});
+    ops.push_back({"users", "group_index", sk, pk});
+    all.emplace_back(sk, pk);
+  }
+  ASSERT_TRUE(TestHelper::CommitWrites(*db_, rows, ops));
+  std::sort(all.begin(), all.end());
+  const SecondaryScanRows g1_g2(all.begin() + 100, all.begin() + 300);
+  const SecondaryScanRows g2(all.begin() + 200, all.begin() + 300);
+
+  EXPECT_EQ(TestHelper::ScanIndex(*db_, "users", "group_index", "g1",
+                                  TestHelper::prefix_end("g2")),
+            g1_g2);
+  // A start above g1 leaves every g1 pair out.
+  EXPECT_EQ(TestHelper::ScanIndex(*db_, "users", "group_index",
+                                  TestHelper::prefix_end("g1"), "g3"),
+            g2);
+  EXPECT_EQ(
+      TestHelper::ScanIndex(*db_, "users", "group_index", "g1", "g3", 0, true),
+      SecondaryScanRows(g1_g2.rbegin(), g1_g2.rend()));
+
+  // A limit counts pairs, not values, in either direction.
+  EXPECT_EQ(
+      TestHelper::ScanIndex(*db_, "users", "group_index", "g1", "g3", 150),
+      SecondaryScanRows(g1_g2.begin(), g1_g2.begin() + 150));
+  EXPECT_EQ(TestHelper::ScanIndex(*db_, "users", "group_index", "g1", "g3", 150,
+                                  true),
+            SecondaryScanRows(g1_g2.rbegin(), g1_g2.rbegin() + 150));
+
+  // Removing half of g2's pairs leaves the other half and the other values.
+  std::vector<TestHelper::IndexOp> removals;
+  std::vector<std::string> kept;
+  for (size_t i = 0; i < g2.size(); ++i) {
+    if (i % 2 == 0) {
+      removals.push_back({"users", "group_index", "g2", g2[i].second, true});
+    } else {
+      kept.push_back(g2[i].second);
+    }
+  }
+  ASSERT_TRUE(TestHelper::CommitWrites(*db_, {}, removals));
+  EXPECT_EQ(TestHelper::ReadIndex(*db_, "users", "group_index", "g2"), kept);
+  EXPECT_EQ(TestHelper::ReadIndex(*db_, "users", "group_index", "g1").size(),
+            100u);
+}
+
+TEST_F(ScanSecondaryIndexTest, APairPastTheKeyLimitIsRefused) {
+  ASSERT_TRUE(TestHelper::CreateTable(*db_, "users"));
+  ASSERT_TRUE(
+      db_->CreateSecondaryIndex("users", "name_index", IndexConstraint::kNone));
+
+  // A non-unique record's key is both keys; a scan copies at most 255 bytes.
+  const std::string secondary_key(200, 'a');
+  const std::string primary_key(55, 'p');
+  std::string reason;
+  EXPECT_FALSE(TestHelper::Commit(
+      *db_, {}, {}, {{"users", "name_index", secondary_key, primary_key + "p"}},
+      {}, reason));
+  EXPECT_EQ(reason, "secondary_key_too_long");
+
+  // A pair of exactly 255 bytes is stored and scanned back.
+  ASSERT_TRUE(TestHelper::CommitWrites(
+      *db_, {{"users", primary_key, "v"}},
+      {{"users", "name_index", secondary_key, primary_key}}));
+  EXPECT_EQ(TestHelper::ReadIndex(*db_, "users", "name_index", secondary_key),
+            std::vector<std::string>{primary_key});
 }

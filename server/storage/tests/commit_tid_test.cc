@@ -653,10 +653,10 @@ TEST_F(CommitTidTest, OneTidCoversReadsRowsIndexesAndTheWorker) {
   auto *a = SeedRow("a", Version(10, 8));
   auto *b = SeedRow("b", Version(10, 24));
   auto *read = SeedRow("read", Version(10, 80));
+  // The pair the commit adds was removed before; its record keeps the word.
   auto *index = tables_.GetTable(kTable)->GetSecondaryIndex("idx");
-  auto *posting = index->tree.GetOrInsert("group");
-  posting->set_primary_keys({"a"});
-  posting->transaction_id.store(Version(10, 40));
+  auto *posting = index->tree.GetOrInsert("groupb");
+  posting->transaction_id.store(Deleted(10, 40));
   last_tid_ = Version(10, 60);
 
   ASSERT_TRUE(Commit({{kTable, "read", Version(10, 80).obj}},
@@ -693,9 +693,8 @@ TEST_F(CommitTidTest, WrittenRowsAndIndexesContributeTheirPreviousVersions) {
   EXPECT_EQ(Version(10, 501), row->transaction_id.load());
 
   auto *index = tables_.GetTable(kTable)->GetSecondaryIndex("idx");
-  auto *posting = index->tree.GetOrInsert("group");
-  posting->set_primary_keys({"a"});
-  posting->transaction_id.store(Version(10, 700));
+  auto *posting = index->tree.GetOrInsert("groupb");
+  posting->transaction_id.store(Deleted(10, 700));
   ASSERT_TRUE(Commit({}, {{kTable, "b", "value"}},
                      {{kTable, "idx", "group", "b", false}}))
       << reason_;
@@ -836,7 +835,7 @@ TEST_F(CommitTidTest, ReadOnlyCommitAdvancesWorkerOrdering) {
 TEST_F(CommitTidTest, SecondaryRangeReadContributesIndexAndRowVersions) {
   auto *row = SeedRow("a", Version(10, 10));
   auto *index = tables_.GetTable(kTable)->GetSecondaryIndex("idx");
-  auto *posting = index->tree.GetOrInsert("group");
+  auto *posting = index->tree.GetOrInsert("groupa");
   posting->set_primary_keys({"a"});
   posting->transaction_id.store(Version(10, 300));
   TestHelper::Range range;
@@ -844,7 +843,7 @@ TEST_F(CommitTidTest, SecondaryRangeReadContributesIndexAndRowVersions) {
   range.index_name = "idx";
   range.start_key = "group";
   range.end_key = "grouq";
-  range.visited = {{"group", Version(10, 300).obj}};
+  range.visited = {{"groupa", Version(10, 300).obj}};
   range.rows = {{"a", Version(10, 10).obj}};
 
   ASSERT_TRUE(Commit({}, {{kTable, "unrelated", "value"}}, {}, {range}))
@@ -984,7 +983,7 @@ TEST_F(CommitTidTest, WriteTargetReplacedAfterTheWriteAbortsAtItsLock) {
 TEST_F(CommitTidTest, RangeRevalidationAllowsOwnLockOnPrimaryAndSecondary) {
   SeedRow("k", Version(10, 10));
   auto *index = tables_.GetTable(kTable)->GetSecondaryIndex("idx");
-  auto *posting = index->tree.GetOrInsert("s");
+  auto *posting = index->tree.GetOrInsert("sk");
   posting->set_primary_keys({"k"});
   posting->transaction_id.store(Version(10, 12));
 
@@ -998,11 +997,12 @@ TEST_F(CommitTidTest, RangeRevalidationAllowsOwnLockOnPrimaryAndSecondary) {
   postings.index_name = "idx";
   postings.start_key = "s";
   postings.end_key = "t";
-  postings.visited = {{"s", Version(10, 12).obj}};
+  postings.visited = {{"sk", Version(10, 12).obj}};
   postings.rows = {{"k", Version(10, 10).obj}};
 
-  ASSERT_TRUE(Commit({}, {{kTable, "k", "next"}, {kTable, "k2", "new"}},
-                     {{kTable, "idx", "s", "k2", false}}, {rows, postings}))
+  // The commit locks the scanned pair it removes and the row it updates.
+  ASSERT_TRUE(Commit({}, {{kTable, "k", "next"}},
+                     {{kTable, "idx", "s", "k", true}}, {rows, postings}))
       << reason_;
 }
 
@@ -1092,7 +1092,7 @@ TEST_F(CommitTidTest,
   auto &tree = tables_.GetTable(kTable)->GetPrimaryIndex();
   tree.GetOrInsert("a")->transaction_id.store(Deleted(11, 5));
   auto *index = tables_.GetTable(kTable)->GetSecondaryIndex("idx");
-  auto *posting = index->tree.GetOrInsert("group");
+  auto *posting = index->tree.GetOrInsert("groupa");
   posting->set_primary_keys({"a"});
   posting->transaction_id.store(Version(10, 30));
   TestHelper::Range range;
@@ -1100,7 +1100,7 @@ TEST_F(CommitTidTest,
   range.index_name = "idx";
   range.start_key = "group";
   range.end_key = "grouq";
-  range.visited = {{"group", Version(10, 30).obj}, {"a", Deleted(11, 5).obj}};
+  range.visited = {{"groupa", Version(10, 30).obj}, {"a", Deleted(11, 5).obj}};
 
   EXPECT_FALSE(Commit({}, {{kTable, "unrelated", "value"}}, {}, {range}));
   EXPECT_EQ("commit_epoch_stale", reason_);
@@ -1109,8 +1109,9 @@ TEST_F(CommitTidTest,
 TEST_F(CommitTidTest,
        SecondaryDeleteThatEmptiesAnEntryPublishesAbsentAndTheReaperPurgesIt) {
   SeedRow("a", Version(10, 2));
+  // A non-unique index keys the pair (s, a) as "sa".
   auto *index = tables_.GetTable(kTable)->GetSecondaryIndex("idx");
-  auto *posting = index->tree.GetOrInsert("s");
+  auto *posting = index->tree.GetOrInsert("sa");
   posting->set_primary_keys({"a"});
   posting->transaction_id.store(Version(10, 4));
 
@@ -1124,11 +1125,11 @@ TEST_F(CommitTidTest,
   range.index_name = "idx";
   range.start_key = "s";
   range.end_key = "t";
-  range.visited = {{"s", Deleted(10, 5).obj}};
+  range.visited = {{"sa", Deleted(10, 5).obj}};
   ASSERT_TRUE(Commit({}, {{kTable, "other", "value"}}, {}, {range})) << reason_;
 
   reaper_.Purge(10);
-  EXPECT_EQ(nullptr, index->tree.Get("s"));
+  EXPECT_EQ(nullptr, index->tree.Get("sa"));
 }
 
 TEST_F(CommitTidTest, RangeEmptiedAgainAfterItsPointReadsAborts) {
@@ -1298,20 +1299,20 @@ TEST_F(CommitTidTest,
   live.index_name = "idx";
   live.start_key = "d";
   live.end_key = "e";
-  live.visited = {{"d", entries.Get("d")->transaction_id.load().obj}};
+  live.visited = {{"da", entries.Get("da")->transaction_id.load().obj}};
   live.rows = {{"a", tree.Get("a")->transaction_id.load().obj}};
   TestHelper::Range purged = live;
   purged.start_key = "p";
   purged.end_key = "r";
-  purged.visited = {{"p", entries.Get("p")->transaction_id.load().obj},
+  purged.visited = {{"pb", entries.Get("pb")->transaction_id.load().obj},
                     {"b", tree.Get("b")->transaction_id.load().obj},
-                    {"q", entries.Get("q")->transaction_id.load().obj},
-                    {"qq", entries.Get("qq")->transaction_id.load().obj}};
+                    {"qc", entries.Get("qc")->transaction_id.load().obj},
+                    {"qqf", entries.Get("qqf")->transaction_id.load().obj}};
   purged.rows = {{"f", tree.Get("f")->transaction_id.load().obj}};
   TestHelper::Range revived = purged;
   revived.start_key = "r";
   revived.end_key = "s";
-  revived.visited = {{"r", entries.Get("r")->transaction_id.load().obj},
+  revived.visited = {{"re", entries.Get("re")->transaction_id.load().obj},
                      {"e", tree.Get("e")->transaction_id.load().obj}};
   revived.rows = {};
   ASSERT_TRUE(Commit({}, {{kTable, "z", "value"}}, {}, {live, purged, revived}))
@@ -1331,7 +1332,7 @@ TEST_F(CommitTidTest,
   // matches after them.
   reaper_.Purge(10);
   ASSERT_EQ(nullptr, tree.Get("b"));
-  ASSERT_EQ(nullptr, entries.Get("q"));
+  ASSERT_EQ(nullptr, entries.Get("qc"));
   EXPECT_TRUE(Commit({}, {{kTable, "z", "value"}}, {}, {purged})) << reason_;
 }
 

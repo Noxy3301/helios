@@ -168,10 +168,21 @@ bool Transaction::IndexWrite(std::string_view table_name,
     reason = "secondary_index_missing";
     return false;
   }
-  // A UNIQUE key being added is usually new; a non-unique one usually exists.
-  const bool expect_new =
-      !remove && index->constraint == IndexConstraint::kUnique;
-  DataItem *item = index->tree.GetOrInsert(secondary_key, expect_new);
+  // A UNIQUE index keeps one record per secondary key, the lock its check
+  // runs under. A non-unique one keeps one record per (secondary key, primary
+  // key), under the two concatenated.
+  std::string composite;
+  std::string_view key = secondary_key;
+  if (index->constraint != IndexConstraint::kUnique) {
+    if (secondary_key.size() + primary_key.size() > index::kMaxKeyLength) {
+      reason = "secondary_key_too_long";
+      return false;
+    }
+    composite.append(secondary_key).append(primary_key);
+    key = composite;
+  }
+  // An added key is usually new.
+  DataItem *item = index->tree.GetOrInsert(key, !remove);
   auto entry =
       write_set_
           .try_emplace(
@@ -598,8 +609,17 @@ void Transaction::Publish(DataItem &item, WriteEntry &entry,
   const Tidword published = PublishedTid(commit_tid, item);
   item.transaction_id.store(published);
   entry.owns_lock = false;
-  if (published.absent)
+  if (!published.absent) return;
+
+  // A non-unique record sits under its secondary key and its one primary key.
+  const auto *index = std::get_if<IndexUpdate>(&entry.update);
+  if (index == nullptr || index->constraint == IndexConstraint::kUnique) {
     reaper_.Enqueue(*entry.index, entry.key, item, published);
+    return;
+  }
+  std::string key(entry.key);
+  key += index->deltas.front().primary_key;
+  reaper_.Enqueue(*entry.index, key, item, published);
 }
 
 }  // namespace silo

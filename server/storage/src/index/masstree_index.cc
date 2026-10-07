@@ -33,6 +33,8 @@ volatile bool recovering = false;
 namespace helios::storage {
 namespace index {
 
+static_assert(kMaxKeyLength == MASSTREE_MAXKEYLEN);
+
 namespace {
 
 class key_unparse_unsigned {

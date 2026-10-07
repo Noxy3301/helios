@@ -267,19 +267,25 @@ class Database {
    * @brief Range-scans a secondary index and resolves each hit to its base
    *        row.
    *
-   * For every secondary key in `[start_key, end_key)`, this resolves each of
+   * For every index record in `[start_key, end_key)`, this resolves each of
    * its primary keys, reads the base row, and reports
    * `{secondary_key, primary_key, value, tid}` per result. Revalidating the
    * range at commit is a silo::Transaction::RangeRead call with this call's
    * arguments, the returned rows keyed by primary key, and `visited`; each
    * base row carries its TID for revalidation as a point read.
    *
+   * A UNIQUE index keys a record by its secondary key. Any other index keys
+   * one record per pair by the secondary key followed by the primary key, so
+   * the range orders pairs: a bound past a secondary key is its prefix
+   * successor, and a reverse scan returns one secondary key's primary keys
+   * in descending order.
+   *
    * @param table_name Base table.
    * @param index_name Secondary index name.
    * @param start_key Inclusive start of the secondary range.
    * @param end_key Exclusive end of the secondary range. Must be non-empty.
    * @param row_limit Maximum rows to return. 0 means no cap.
-   * @param reverse_scan When true, iterate in reverse secondary-key order.
+   * @param reverse_scan When true, iterate in reverse key order.
    * @param selected_columns Optional zero-based MySQL columns to gather
    * for PAX-resident base rows, with the same null/empty rules as Read.
    * Unselected PAX columns are returned as empty fields.

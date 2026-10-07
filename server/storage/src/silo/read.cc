@@ -116,13 +116,16 @@ ScanIndexResult Database::ScanIndex(
     return row_limit > 0 && returned_rows >= row_limit;
   };
 
-  // Keep the key list alive while reading the referenced rows.
+  // Keep the key list alive while reading the referenced rows. A non-unique
+  // record's key ends with its one primary key, which the row leaves out.
+  const bool unique = index->constraint == IndexConstraint::kUnique;
   auto append_secondary_entry = [&](std::string_view key, DataItem &item) {
-    const std::string secondary_key(key);
     const auto keys = silo::StableReadKeys(item);
     if (keys.tid != Tidword::Absent())
-      result.visited.push_back({secondary_key, keys.tid.obj, true});
+      result.visited.push_back({std::string(key), keys.tid.obj, true});
     for (std::string_view primary_key : keys.primary_keys_view()) {
+      std::string_view secondary_key = key;
+      if (!unique) secondary_key.remove_suffix(primary_key.size());
       if (append_base_row(secondary_key, primary_key)) return true;
     }
     return false;

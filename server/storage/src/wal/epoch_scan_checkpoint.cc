@@ -253,6 +253,11 @@ EpochScanCheckpoint::CaptureResult EpochScanCheckpoint::CaptureSecondaryEntry(
       continue;
     }
     const PrimaryKeyList::View keys(primary_keys);
+    // A non-unique record's key ends with its one primary key; the log keys
+    // a secondary write by the secondary key alone.
+    if (index_type != static_cast<uint32_t>(IndexConstraint::kUnique) &&
+        !keys.empty())
+      key.remove_suffix((*keys.begin()).size());
     out.key.assign(key.data(), key.size());
     out.transaction_id = observed;
     out.table_name = table_name;
