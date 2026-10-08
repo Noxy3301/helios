@@ -138,8 +138,8 @@ TEST_F(DurabilityTest, RecoveryWithNamedTable) {
 }
 
 // With an epoch timer far slower than the test, only a commit's own request
-// closes an epoch: an Async commit makes none and leaves its record out of the
-// log, and a Sync commit makes one and returns promptly with its record logged.
+// closes an epoch: an Async commit makes none, a read-only Sync commit returns
+// after the write it read is logged, and a Sync write returns promptly logged.
 TEST(CommitDurabilityTest, SyncCommitClosesItsOwnEpoch) {
   constexpr size_t kEpochMs = 10000;
   constexpr long kPromptMs = 100;
@@ -171,6 +171,16 @@ TEST(CommitDurabilityTest, SyncCommitClosesItsOwnEpoch) {
               kPromptMs);
     EXPECT_FALSE(logged(config.work_dir, "lazy_key"))
         << "an Async commit closed its epoch";
+
+    const uint64_t lazy_tid = db.Read(kTable, "lazy_key").tid;
+    db.ReleaseThreadEpoch();
+    std::string read_reason;
+    EXPECT_TRUE(TestHelper::CommitRows(
+        db, {{kTable, "lazy_key", lazy_tid}}, {}, {}, {}, read_reason,
+        helios::storage::CommitDurability::kSync))
+        << read_reason;
+    EXPECT_TRUE(logged(config.work_dir, "lazy_key"))
+        << "a read-only Sync commit returned before the write it read";
 
     EXPECT_LT(commit("durable_key", helios::storage::CommitDurability::kSync),
               kPromptMs)

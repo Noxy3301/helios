@@ -308,8 +308,8 @@ bool Transaction::Commit(CommitDurability durability, std::string &reason) {
   if (logged) logger_.Enqueue(std::move(record));
   epoch_.Leave();
   // Leave before waiting, so this worker does not hold back epoch advancement.
-  logger_.AwaitCommitDurability(
-      commit_tid.epoch, logged && durability == CommitDurability::kSync);
+  logger_.AwaitCommitDurability(commit_tid.epoch,
+                                durability == CommitDurability::kSync);
   return true;
 }
 
