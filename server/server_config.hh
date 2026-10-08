@@ -35,7 +35,8 @@ struct ServerConfig {
     uint64_t olap_mem_limit_bytes = 0;
     /// Whether the DuckDB executor writes its trace lines.
     bool olap_trace = false;
-    /// Upper bound on the read view fence wait, in milliseconds.
+    /// Upper bound on the read view fence wait and, under Sync, the
+    /// durability wait after it, in milliseconds.
     uint32_t read_view_fence_timeout_ms = 5000;
     /// The lowest level the log keeps: trace, debug, info, warning, error,
     /// critical or off.

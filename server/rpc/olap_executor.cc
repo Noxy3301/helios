@@ -1551,6 +1551,7 @@ void configure_limits() {
 
 void execute_duckdb_query(
     helios::storage::Database* db,
+    helios::storage::CommitDurability durability,
     const pb::TxExecuteDuckdbQuery::Request& request,
     pb::TxExecuteDuckdbQuery::Response* response) {
   if (response == nullptr) return;
@@ -1562,7 +1563,7 @@ void execute_duckdb_query(
   }
   try {
     const helios::storage::Database::PaxReadView read_view =
-        db->OpenPaxView(fence_timeout_ms());
+        db->OpenPaxView(fence_timeout_ms(), durability);
     if (!read_view.valid) {
       response->set_ok(false);
       response->set_error(read_view.error);

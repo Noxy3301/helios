@@ -20,5 +20,6 @@ void HeliosRpc::handleTxExecuteDuckdbQuery(
         return;
     }
 
-    olap::execute_duckdb_query(db.get(), request, response);
+    olap::execute_duckdb_query(db.get(), db_manager_->commit_durability(),
+                               request, response);
 }

@@ -174,18 +174,25 @@ class Database {
   };
 
   /**
-   * @brief Opens a read view and waits for global epoch `E >= se + 2`.
+   * @brief Opens a read view and waits for global epoch `E >= se + 2`, and
+   * under Sync for durable epoch `D >= se`.
    *
    * @details On return every commit through snapshot_epoch `se` has finished
    * installing, and every later commit preserves the row it replaces when this
-   * view reads it. The calling thread must not hold an epoch (it must be
-   * outside any transaction). Fails instead of falling back on a read view
-   * fence timeout or near the epoch high-water mark.
+   * view reads it. Under Sync every commit through `se` is also durable. The
+   * calling thread must not hold an epoch (it must be outside any
+   * transaction). Fails instead of falling back on a read view fence timeout,
+   * a durability wait that times out or whose logger stops or fails first, or
+   * near the epoch high-water mark.
    *
-   * @param fence_timeout_ms Upper bound on the read view fence wait.
+   * @param fence_timeout_ms Upper bound on the read view fence and durability
+   * waits together.
+   * @param durability The commit durability mode the view's result is
+   * reported under.
    * @return A valid handle, or an invalid one carrying the reason.
    */
-  PaxReadView OpenPaxView(uint32_t fence_timeout_ms);
+  PaxReadView OpenPaxView(uint32_t fence_timeout_ms,
+                          CommitDurability durability);
 
   /**
    * @brief Closes a read view; the last close clears the epoch images. Safe

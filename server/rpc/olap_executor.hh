@@ -4,6 +4,7 @@
 
 namespace helios::storage {
 class Database;
+enum class CommitDurability;
 }
 
 namespace olap {
@@ -20,6 +21,7 @@ namespace olap {
  */
 void execute_duckdb_query(
     helios::storage::Database* db,
+    helios::storage::CommitDurability durability,
     const Helios::Protocol::TxExecuteDuckdbQuery::Request& request,
     Helios::Protocol::TxExecuteDuckdbQuery::Response* response);
 
