@@ -86,6 +86,13 @@ bool backfill_scan(HeliosProxy &conn, const std::string &table,
   return true;
 }
 
+// Fails the ALTER with the reason. Returning true from inplace_alter_table
+// with no error raised rolls the dictionary back but answers the client OK.
+bool alter_fail(const std::string &reason) {
+  my_error(ER_GET_ERRNO, MYF(0), HA_ERR_GENERIC, reason.c_str());
+  return true;
+}
+
 }  // namespace
 
 std::vector<uint32_t> compute_pax_field_widths(
@@ -500,7 +507,9 @@ bool ha_helios::inplace_alter_table(TABLE *altered_table,
   userThread = ha_thd();
   auto proxy = get_proxy();
 
-  if (altered_table == nullptr || altered_table->s == nullptr) return true;
+  if (altered_table == nullptr || altered_table->s == nullptr) {
+    return alter_fail("no altered table");
+  }
 
   // Non-unique indexes are collected and backfilled together below so a single
   // scan and unpack pass feeds them all. A unique index keeps the buffered
@@ -510,7 +519,7 @@ bool ha_helios::inplace_alter_table(TABLE *altered_table,
     const uint key_idx = ha_alter_info->index_add_buffer[i];
     const KEY *key_info = &ha_alter_info->key_info_buffer[key_idx];
     const std::string index_name(key_info->name ? key_info->name : "");
-    if (index_name.empty()) return true;  // fail closed: unnamed index
+    if (index_name.empty()) return alter_fail("an added index has no name");
 
     const uint index_type =
         (key_info->flags & HA_NOSAME) ? kUniqueSecondaryIndex : 0;
@@ -525,13 +534,18 @@ bool ha_helios::inplace_alter_table(TABLE *altered_table,
         break;
       }
     }
-    if (runtime_key == nullptr) return true;
+    if (runtime_key == nullptr) {
+      return alter_fail("index " + index_name + " is not in the altered table");
+    }
 
     // Helios treats a packed NULL key as a duplicate, but SQL allows many
     // NULLs in a UNIQUE index; reject nullable UNIQUE backfill instead.
     if (key_info->flags & HA_NOSAME) {
       for (uint p = 0; p < runtime_key->user_defined_key_parts; ++p) {
-        if (runtime_key->key_part[p].null_bit != 0) return true;
+        if (runtime_key->key_part[p].null_bit != 0) {
+          return alter_fail("UNIQUE index " + index_name +
+                            " has a nullable column");
+        }
       }
     }
 
@@ -540,11 +554,13 @@ bool ha_helios::inplace_alter_table(TABLE *altered_table,
     // hides them), and nothing purges them.
     if (!proxy->db_create_secondary_index(db_table_name, index_name,
                                           index_type)) {
-      return true;
+      return alter_fail("the storage server refused index " + index_name);
     }
 
     if (index_type == kUniqueSecondaryIndex) {
-      if (!backfill_unique_serial(index_name, *runtime_key)) return true;
+      if (!backfill_unique_serial(index_name, *runtime_key)) {
+        return alter_fail("backfill of index " + index_name + " failed");
+      }
     } else {
       nu_specs.emplace_back(index_name, runtime_key);
     }
@@ -557,8 +573,12 @@ bool ha_helios::inplace_alter_table(TABLE *altered_table,
     std::vector<HeliosProxy::ScanRow> rows;
     std::string start;
     do {
-      if (!backfill_scan(*proxy, db_table_name, start, rows)) return true;
-      if (!backfill_indexes_parallel(rows, nu_specs, conns)) return true;
+      if (!backfill_scan(*proxy, db_table_name, start, rows) ||
+          !backfill_indexes_parallel(rows, nu_specs, conns)) {
+        std::string names;
+        for (const auto &spec : nu_specs) names += " " + spec.first;
+        return alter_fail("backfill of index" + names + " failed");
+      }
     } while (rows.size() == kBackfillScanRows);
   }
 
