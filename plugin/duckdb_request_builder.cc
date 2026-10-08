@@ -173,9 +173,25 @@ bool wide_decimal(const Resolved::Expr& expr) {
     return type.kind() == Resolved::DECIMAL && type.precision() > 15;
 }
 
-// The type MySQL compares two operands under. Mirrors the numeric/temporal
-// part of MySQL's comparison-context rules; string comparison needs the
-// collation machinery and is refused until that phase.
+// utf8mb4_0900_ai_ci, utf8mb4_0900_bin and binary.
+bool collation_supported(uint32_t id) {
+    return id == 255 || id == 309 || id == 63;
+}
+
+// The executor collates every string it projects, groups, orders, aggregates
+// or matches, and implements only the supported collations.
+bool admit_string(Builder& b, const Resolved::Expr& expr) {
+    const auto& type = expr.result_type();
+    if (type.kind() != Resolved::VARCHAR ||
+        collation_supported(type.collation_id())) {
+        return true;
+    }
+    return b.refuse("string collation " +
+                    std::to_string(type.collation_id()) + " is unsupported");
+}
+
+// The type MySQL compares two operands under. Mirrors MySQL's
+// comparison-context rules for the numeric, temporal and string profile.
 bool compare_type_of(Builder& b, const Resolved::Expr& left,
                      const Resolved::Expr& right, Resolved::ResolvedType* out) {
     const auto lk = left.result_type().kind();
@@ -241,8 +257,7 @@ bool compare_type_of(Builder& b, const Resolved::Expr& left,
     if (lk == Resolved::VARCHAR && rk == Resolved::VARCHAR) {
         const uint32_t lc = left.result_type().collation_id();
         const uint32_t rc = right.result_type().collation_id();
-        // utf8mb4_0900_ai_ci, utf8mb4_0900_bin and binary.
-        if (lc == rc && (lc == 255 || lc == 309 || lc == 63)) {
+        if (lc == rc && collation_supported(lc)) {
             out->set_kind(Resolved::VARCHAR);
             out->set_collation_id(lc);
             return true;
@@ -504,12 +519,17 @@ bool build_func(Builder& b, Item_func* function, Resolved::Expr* out) {
             // member to one common type. The translations agree only when
             // the members already share the value's kind.
             const auto value_kind = in_list->value().result_type().kind();
+            const auto value_collation =
+                in_list->value().result_type().collation_id();
             for (const auto& element : in_list->list()) {
                 if (element.result_type().kind() != value_kind) {
                     return b.refuse("IN list mixes value kinds");
                 }
+                if (element.result_type().collation_id() != value_collation) {
+                    return b.refuse("IN list mixes string collations");
+                }
             }
-            return true;
+            return admit_string(b, in_list->value());
         }
         case Item_func::PLUS_FUNC:
             return build_arithmetic(b, function, Resolved::Arithmetic::ADD,
@@ -555,7 +575,7 @@ bool build_func(Builder& b, Item_func* function, Resolved::Expr* out) {
                 return b.refuse("LIKE operand collations differ");
             }
             like->set_collation_id(value_type.collation_id());
-            return true;
+            return admit_string(b, like->value());
         }
         case Item_func::CASE_FUNC: {
             auto* case_item = down_cast<Item_func_case*>(function);
@@ -823,7 +843,8 @@ bool build_aggregate(Builder& b, Item_sum* sum, Resolved::Expr* out) {
     }
     aggregate->set_kind(kind);
     aggregate->set_distinct(distinct);
-    return build_expr(b, sum->get_arg(0), aggregate->mutable_arg());
+    return build_expr(b, sum->get_arg(0), aggregate->mutable_arg()) &&
+           admit_string(b, aggregate->arg());
 }
 
 // The row path emits evaluation warnings per row; a plan-time fold must not
@@ -1231,7 +1252,8 @@ bool build_block(Builder& b, Query_block* block,
     }
     for (ORDER* group = block->group_list.first; group != nullptr;
          group = group->next) {
-        if (!build_expr(b, *group->item, out->add_group_by())) {
+        auto* key = out->add_group_by();
+        if (!build_expr(b, *group->item, key) || !admit_string(b, *key)) {
             return false;
         }
     }
@@ -1242,14 +1264,16 @@ bool build_block(Builder& b, Query_block* block,
         }
     }
     for (Item* item : block->visible_fields()) {
-        if (!build_expr(b, item, out->add_select()->mutable_expression())) {
+        auto* expr = out->add_select()->mutable_expression();
+        if (!build_expr(b, item, expr) || !admit_string(b, *expr)) {
             return false;
         }
     }
     for (ORDER* order = block->order_list.first; order != nullptr;
          order = order->next) {
         auto* key = out->add_order_by();
-        if (!build_expr(b, *order->item, key->mutable_expression())) {
+        if (!build_expr(b, *order->item, key->mutable_expression()) ||
+            !admit_string(b, key->expression())) {
             return false;
         }
         const bool descending = order->direction == ORDER_DESC;
