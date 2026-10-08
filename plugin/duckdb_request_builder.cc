@@ -762,6 +762,15 @@ bool build_subselect(Builder& b, Item_subselect* subselect,
             if (in_subquery->query().select_size() != 1) {
                 return b.refuse("IN subquery with several columns");
             }
+            const auto& left_type = in_subquery->left().result_type();
+            const auto& item_type =
+                in_subquery->query().select(0).expression().result_type();
+            if ((left_type.kind() == Resolved::VARCHAR ||
+                 item_type.kind() == Resolved::VARCHAR) &&
+                (left_type.kind() != item_type.kind() ||
+                 left_type.collation_id() != item_type.collation_id())) {
+                return b.refuse("IN subquery mixes string collations");
+            }
             if (!fold_unknown) {
                 *out->mutable_subquery() = std::move(*in_subquery);
                 return true;
