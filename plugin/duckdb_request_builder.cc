@@ -382,9 +382,9 @@ bool build_comparison(Builder& b, Item_func* function,
         !build_expr(b, function->arguments()[1], cmp->mutable_right())) {
         return false;
     }
-    // After this request is built, MySQL compares a DECIMAL column with a
-    // DOUBLE constant, or with a DOUBLE operand it replaces by one, as
-    // DECIMAL; comparing as DOUBLE agrees with that only up to 15 digits.
+    // After this request is built, MySQL compares an integer or DECIMAL column
+    // with a DOUBLE constant, or with a DOUBLE operand it replaces by one, in
+    // the column's type. DOUBLE can differ from that above 15 digits.
     const Resolved::Expr* sides[] = {&cmp->left(), &cmp->right()};
     for (int i = 0; i < 2; ++i) {
         const auto& column = *sides[i];
@@ -394,6 +394,11 @@ bool build_comparison(Builder& b, Item_func* function,
             column.result_type().precision() > 15 &&
             other.result_type().kind() == Resolved::DOUBLE) {
             return b.refuse("DECIMAL column above 15 digits against DOUBLE");
+        }
+        if (column.has_column() &&
+            column.result_type().kind() == Resolved::INT64 &&
+            other.result_type().kind() == Resolved::DOUBLE) {
+            return b.refuse("integer column against DOUBLE");
         }
     }
     return compare_type_of(b, cmp->left(), cmp->right(),

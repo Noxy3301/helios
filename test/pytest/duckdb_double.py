@@ -20,9 +20,10 @@ def main():
     # 2^53. w + 0 is not a column, so MySQL does not fold its comparison with
     # x into DECIMAL and compares the pair as DOUBLE.
     wide = [Decimal('9007199254740993.50'), Decimal('-9007199254740993.50')]
-    rows = [(i, Decimal(i) / 100, i % 4, wide[i % 2], float(wide[i % 2]))
-            for i in range(100)]
-    rows.append((100, None, 0, None, None))
+    # b's three values all round to the double 9007199254740996.
+    rows = [(i, Decimal(i) / 100, i % 4, wide[i % 2], float(wide[i % 2]),
+             9007199254740995 + i % 3) for i in range(100)]
+    rows.append((100, None, 0, None, None, None))
     try:
         cursor.execute('DROP DATABASE IF EXISTS ha_helios_double')
         cursor.execute('CREATE DATABASE ha_helios_double')
@@ -30,9 +31,10 @@ def main():
         for table, engine in [('h', 'HELIOS'), ('i', 'InnoDB')]:
             cursor.execute(f'CREATE TABLE {table} '
                            '(id INT PRIMARY KEY, d DECIMAL(15,2), g INT, '
-                           f'w DECIMAL(20,2), x DOUBLE) ENGINE={engine}')
-            cursor.executemany(f'INSERT INTO {table} VALUES (%s,%s,%s,%s,%s)',
-                               rows)
+                           'w DECIMAL(20,2), x DOUBLE, b BIGINT) '
+                           f'ENGINE={engine}')
+            cursor.executemany(f'INSERT INTO {table} '
+                               'VALUES (%s,%s,%s,%s,%s,%s)', rows)
         cursor.execute('ALTER TABLE h SECONDARY_ENGINE=HELIOS_DUCKDB')
         cursor.execute('ALTER TABLE h SECONDARY_LOAD')
         cursor.fetchall()
@@ -63,6 +65,7 @@ def main():
             'SELECT id FROM {t} WHERE w BETWEEN x AND x ORDER BY id',
             'SELECT id, CASE WHEN g < 2 THEN w ELSE x END FROM {t} ORDER BY id',
             'SELECT id, CASE WHEN g >= 2 THEN x ELSE w END FROM {t} ORDER BY id',
+            'SELECT id FROM {t} WHERE b = 9.007199254740996E15 ORDER BY id',
         ]
         # Refused by the request builder: ON runs them on the primary engine.
         primary = [
@@ -88,6 +91,8 @@ def main():
             'WHERE id IN (0,1,2)',
             'SELECT id, CASE WHEN g = 0 THEN w / 1 ELSE x END FROM {t} '
             'ORDER BY id',
+            'SELECT id FROM {t} WHERE b = x + 2E0 '
+            'AND x + 2E0 = 9.007199254740996E15 ORDER BY id',
         ]
         for query, mode in ([(q, 'FORCED') for q in queries] +
                             [(q, 'ON') for q in primary]):
