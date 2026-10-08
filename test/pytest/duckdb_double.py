@@ -61,6 +61,8 @@ def main():
             'SELECT id, w * 1.0E0 FROM {t} ORDER BY id',
             'SELECT id FROM {t} WHERE w + 0 = x ORDER BY id',
             'SELECT id FROM {t} WHERE w BETWEEN x AND x ORDER BY id',
+            'SELECT id, CASE WHEN g < 2 THEN w ELSE x END FROM {t} ORDER BY id',
+            'SELECT id, CASE WHEN g >= 2 THEN x ELSE w END FROM {t} ORDER BY id',
         ]
         # Refused by the request builder: ON runs them on the primary engine.
         primary = [
@@ -82,6 +84,10 @@ def main():
             'SELECT id, x IN (SELECT w FROM {t}) FROM {t} ORDER BY id',
             'SELECT id FROM {t} WHERE w = x + 0E0 '
             'AND x + 0E0 = 9.007199254740994E15 ORDER BY id',
+            'SELECT CASE WHEN COUNT(*) > 0 THEN AVG(w) ELSE 0E0 END FROM {t} '
+            'WHERE id IN (0,1,2)',
+            'SELECT id, CASE WHEN g = 0 THEN w / 1 ELSE x END FROM {t} '
+            'ORDER BY id',
         ]
         for query, mode in ([(q, 'FORCED') for q in queries] +
                             [(q, 'ON') for q in primary]):

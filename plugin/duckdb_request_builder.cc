@@ -677,8 +677,17 @@ bool build_func(Builder& b, Item_func* function, Resolved::Expr* out) {
                     return false;
                 }
             }
-            return build_expr(b, function->arguments()[count - 1],
-                              case_when->mutable_else_result());
+            if (!build_expr(b, function->arguments()[count - 1],
+                            case_when->mutable_else_result())) {
+                return false;
+            }
+            if (out->result_type().kind() == Resolved::DOUBLE) {
+                for (const auto& branch : case_when->branches()) {
+                    if (!admit_double_operand(b, branch.then())) return false;
+                }
+                return admit_double_operand(b, case_when->else_result());
+            }
+            return true;
         }
         case Item_func::YEAR_FUNC: {
             if (function->argument_count() != 1) return b.refuse("YEAR arity");
