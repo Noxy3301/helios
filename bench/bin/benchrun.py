@@ -310,9 +310,10 @@ def extract_throughput(output):
 
 
 def extract_histograms(output):
-    """Parse retry and error counts from BenchBase output."""
+    """Parse completed, retry and error counts from BenchBase output."""
     info = {}
     for label, key in [
+        ("Completed Transactions", "completed"),
         ("Rejected Transactions (Server Retry)", "server_retry"),
         ("Unexpected SQL Errors", "unexpected_errors"),
     ]:
@@ -540,6 +541,17 @@ def attach_secondary(benchmark, mysql_host, mysql_port):
                 'secondary_load="1"' not in options):
             sys.exit(f"secondary engine state not verified for {t}: "
                      f"{result.stdout.strip()[-200:]}")
+
+
+def secondary_executions(endpoints):
+    """Global Secondary_engine_execution_count summed over the endpoints."""
+    total = 0
+    for host, port in endpoints:
+        result = mysql_cmd(port, host, "SHOW GLOBAL STATUS LIKE 'Secondary_engine_execution_count';")
+        if result.returncode != 0:
+            sys.exit(f"Failed to read Secondary_engine_execution_count on {host}:{port}")
+        total += int(result.stdout.split()[-1])
+    return total
 
 
 def run_execute(benchmark, config_path, terminals, result_base, tx_plan=False):
@@ -1127,7 +1139,21 @@ def _run_bench(args, config_work, thread_list, result_base):
     # Execute: sweep terminal counts (data is reused)
     all_results = []
     for terminals in thread_list:
+        if args.benchmark == "tpch":
+            before = secondary_executions(args.mysql_endpoints)
         result = run_execute(args.benchmark, config_work, terminals, result_base, tx_plan=args.tx_plan)
+        # MySQL reruns a query the secondary engine refuses on the primary
+        # without an error, so every completed query has to count as offloaded,
+        # and a failed or retried attempt could offset a missing one.
+        if args.benchmark == "tpch":
+            ran = secondary_executions(args.mysql_endpoints) - before
+            done = result.get("completed")
+            if done is None:
+                sys.exit("No Completed Transactions histogram in the BenchBase output")
+            failed = result.get("unexpected_errors", 0) + result.get("server_retry", 0)
+            if ran != done or failed:
+                sys.exit(f"The secondary engine ran {ran} of the {done} TPC-H queries BenchBase completed "
+                         f"({failed} errors or retries); plugin refusals are in the mysqld log as HELIOS_DUCKDB")
         if result:
             result["load_time"] = load_time
             all_results.append(result)
