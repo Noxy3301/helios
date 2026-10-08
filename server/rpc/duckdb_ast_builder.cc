@@ -254,6 +254,13 @@ unique_ptr<ParsedExpression> CastTo(Builder& b, const Resolved::Expr& child,
     }
     LogicalType target;
     if (!ResolveType(b, type, &target)) return nullptr;
+    // DuckDB can round a DECIMAL above 15 digits twice; the decimal string
+    // gives the correctly rounded double, as MySQL does.
+    if (type.kind() == Resolved::DOUBLE && have.kind() == Resolved::DECIMAL &&
+        have.precision() > 15) {
+        built = make_uniq<duckdb::CastExpression>(LogicalType::VARCHAR,
+                                                  std::move(built));
+    }
     return make_uniq<duckdb::CastExpression>(target, std::move(built));
 }
 
