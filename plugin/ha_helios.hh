@@ -727,14 +727,18 @@ private:
   bool backfill_commit_chunk(std::vector<HeliosProxy::WriteOp> &ops);
 
   /**
-   * @brief Backfill the indexes in `specs` in one unpack pass, committed on
-   * per-key-hash workers so no two of them mutate the same index entry.
+   * @brief Backfill the indexes in `specs` from one chunk of rows in one
+   * unpack pass, committed on per-key-hash workers so no two of them mutate
+   * the same index entry.
    *
+   * @param conns One slot per worker. An empty slot is connected on first use
+   *   and kept for the next chunk.
    * @return false when any worker commit fails; the caller fails the ALTER.
    */
   bool backfill_indexes_parallel(
-      std::vector<std::pair<std::string, std::string>> &rows,
-      const std::vector<std::pair<std::string, const KEY *>> &specs);
+      std::vector<HeliosProxy::ScanRow> &rows,
+      const std::vector<std::pair<std::string, const KEY *>> &specs,
+      std::vector<std::unique_ptr<HeliosProxy>> &conns);
 
   /**
    * @brief Backfill one unique secondary index serially via the write buffer.
