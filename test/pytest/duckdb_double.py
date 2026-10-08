@@ -16,17 +16,25 @@ def main():
     connection = get_connection(args.user, args.password)
     connection.autocommit = True
     cursor = connection.cursor()
-    rows = [(i, Decimal(i) / 100, i % 4) for i in range(100)]
-    rows.append((100, None, 0))
+    # x is w's nearest double, 2^53 + 2 in magnitude; rounding w twice gives
+    # 2^53. w + 0 is not a column, so MySQL does not fold its comparison with
+    # x into DECIMAL and compares the pair as DOUBLE.
+    wide = [Decimal('9007199254740993.50'), Decimal('-9007199254740993.50')]
+    # b's three values all round to the double 9007199254740996.
+    rows = [(i, Decimal(i) / 100, i % 4, wide[i % 2], float(wide[i % 2]),
+             9007199254740995 + i % 3) for i in range(100)]
+    rows.append((100, None, 0, None, None, None))
     try:
         cursor.execute('DROP DATABASE IF EXISTS ha_helios_double')
         cursor.execute('CREATE DATABASE ha_helios_double')
         cursor.execute('USE ha_helios_double')
         for table, engine in [('h', 'HELIOS'), ('i', 'InnoDB')]:
             cursor.execute(f'CREATE TABLE {table} '
-                           '(id INT PRIMARY KEY, d DECIMAL(15,2), g INT) '
+                           '(id INT PRIMARY KEY, d DECIMAL(15,2), g INT, '
+                           'w DECIMAL(20,2), x DOUBLE, b BIGINT) '
                            f'ENGINE={engine}')
-            cursor.executemany(f'INSERT INTO {table} VALUES (%s,%s,%s)', rows)
+            cursor.executemany(f'INSERT INTO {table} '
+                               'VALUES (%s,%s,%s,%s,%s,%s)', rows)
         cursor.execute('ALTER TABLE h SECONDARY_ENGINE=HELIOS_DUCKDB')
         cursor.execute('ALTER TABLE h SECONDARY_LOAD')
         cursor.fetchall()
@@ -50,14 +58,41 @@ def main():
             'SELECT id FROM {t} WHERE d * 1.0E0 IN (2.0E-2,6.0E-2) ORDER BY id',
             'SELECT id, d * 2.0E-1 FROM {t} ORDER BY id',
             'SELECT id, d % 0E0 FROM {t} ORDER BY id',
+            'SELECT g, SUM(d) FROM {t} GROUP BY g HAVING SUM(d) > '
+            '(SELECT SUM(d) * 2.0E-1 FROM {t}) ORDER BY g',
+            'SELECT id, w * 1.0E0 FROM {t} ORDER BY id',
+            'SELECT id FROM {t} WHERE w + 0 = x ORDER BY id',
+            'SELECT id FROM {t} WHERE w BETWEEN x AND x ORDER BY id',
+            'SELECT id, CASE WHEN g < 2 THEN w ELSE x END FROM {t} ORDER BY id',
+            'SELECT id, CASE WHEN g >= 2 THEN x ELSE w END FROM {t} ORDER BY id',
+            'SELECT id FROM {t} WHERE b = 9.007199254740996E15 ORDER BY id',
         ]
         # Refused by the request builder: ON runs them on the primary engine.
         primary = [
             'SELECT g, SUM(d * 1.0E-1) FROM {t} GROUP BY g ORDER BY g',
-            'SELECT g, SUM(d) FROM {t} GROUP BY g HAVING SUM(d) > '
-            '(SELECT SUM(d) * 2.0E-1 FROM {t}) ORDER BY g',
             'SELECT id FROM {t} WHERE d > '
             '(SELECT AVG(d * 2.0E-1) FROM {t}) ORDER BY id',
+            'SELECT id FROM {t} WHERE w = 9.007199254740994E15 ORDER BY id',
+            'SELECT id FROM {t} WHERE x = 9.007199254740994E15 AND w = x '
+            'ORDER BY id',
+            'SELECT AVG(w) * 1.0E0 FROM {t}',
+            'SELECT id FROM {t} WHERE x > (SELECT AVG(w) FROM {t}) ORDER BY id',
+            'SELECT id, (w / 1 - w) * 1.0E0 FROM {t} ORDER BY id',
+            'SELECT id FROM {t} WHERE w / 1 = x ORDER BY id',
+            'SELECT id, (w % 7) * 1.0E0 FROM {t} ORDER BY id',
+            'SELECT q * 1E0 FROM (SELECT MIN(w / 1 - w) AS q FROM {t} '
+            'WHERE id = 0) AS s',
+            'SELECT a * 1E0 FROM (SELECT AVG(w) AS a FROM {t} GROUP BY g) '
+            'AS s ORDER BY 1',
+            'SELECT id, x IN (SELECT w FROM {t}) FROM {t} ORDER BY id',
+            'SELECT id FROM {t} WHERE w = x + 0E0 '
+            'AND x + 0E0 = 9.007199254740994E15 ORDER BY id',
+            'SELECT CASE WHEN COUNT(*) > 0 THEN AVG(w) ELSE 0E0 END FROM {t} '
+            'WHERE id IN (0,1,2)',
+            'SELECT id, CASE WHEN g = 0 THEN w / 1 ELSE x END FROM {t} '
+            'ORDER BY id',
+            'SELECT id FROM {t} WHERE b = x + 2E0 '
+            'AND x + 2E0 = 9.007199254740996E15 ORDER BY id',
         ]
         for query, mode in ([(q, 'FORCED') for q in queries] +
                             [(q, 'ON') for q in primary]):

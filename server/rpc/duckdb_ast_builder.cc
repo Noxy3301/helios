@@ -254,6 +254,13 @@ unique_ptr<ParsedExpression> CastTo(Builder& b, const Resolved::Expr& child,
     }
     LogicalType target;
     if (!ResolveType(b, type, &target)) return nullptr;
+    // DuckDB can round a DECIMAL above 15 digits twice; the decimal string
+    // gives the correctly rounded double, as MySQL does.
+    if (type.kind() == Resolved::DOUBLE && have.kind() == Resolved::DECIMAL &&
+        have.precision() > 15) {
+        built = make_uniq<duckdb::CastExpression>(LogicalType::VARCHAR,
+                                                  std::move(built));
+    }
     return make_uniq<duckdb::CastExpression>(target, std::move(built));
 }
 
@@ -707,16 +714,31 @@ unique_ptr<ParsedExpression> BuildExpr(Builder& b, const Resolved::Expr& expr) {
                 return nullptr;
             }
             auto node = make_uniq<duckdb::CaseExpression>();
+            // MySQL converts the chosen branch of a DOUBLE CASE by its own
+            // val_real; CastTo on each branch keeps a DECIMAL above 15 digits
+            // off DuckDB's common-type cast, which can round it twice.
+            const auto& type = expr.result_type();
+            const bool is_double = type.kind() == Resolved::DOUBLE;
             for (const auto& branch : case_when.branches()) {
                 duckdb::CaseCheck check;
                 check.when_expr = BuildExpr(b, branch.when());
                 if (check.when_expr == nullptr) return nullptr;
                 check.then_expr = BuildExpr(b, branch.then());
                 if (check.then_expr == nullptr) return nullptr;
+                if (is_double) {
+                    check.then_expr = CastTo(b, branch.then(), type,
+                                             std::move(check.then_expr));
+                    if (check.then_expr == nullptr) return nullptr;
+                }
                 node->case_checks.push_back(std::move(check));
             }
             node->else_expr = BuildExpr(b, case_when.else_result());
             if (node->else_expr == nullptr) return nullptr;
+            if (is_double) {
+                node->else_expr = CastTo(b, case_when.else_result(), type,
+                                         std::move(node->else_expr));
+                if (node->else_expr == nullptr) return nullptr;
+            }
             // MySQL aggregated the THEN/ELSE types into result_type; DuckDB
             // would infer its own. Cast so both agree.
             if (expr.result_type().kind() != Resolved::TYPE_UNSPECIFIED) {

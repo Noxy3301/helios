@@ -38,8 +38,12 @@ struct Builder {
     std::unordered_map<const Table_ref*, uint32_t> relation_ids;
     uint32_t next_relation_id = 0;
     // Derived relations whose select list carries a DECIMAL AVG; a column
-    // reference into one keeps that lineage for the comparison guard.
+    // reference into one keeps that lineage for a squeezed comparison or a
+    // DOUBLE context.
     std::set<uint32_t> avg_relations;
+    // Derived relations whose select list carries a DECIMAL quotient or
+    // remainder, with the same lineage for a DOUBLE context.
+    std::set<uint32_t> quotient_relations;
 
     bool refuse(const std::string& reason) {
         if (why->empty()) *why = reason;
@@ -126,8 +130,9 @@ bool type_of(Builder& b, Item* item, Resolved::ResolvedType* out) {
     }
 }
 
-// DuckDB computes decimal AVG through DOUBLE; a squeezed comparison must
-// not inherit that approximation, so its value tree is scanned for one.
+// DuckDB computes decimal AVG through DOUBLE; a squeezed comparison or a
+// DOUBLE context must not inherit that approximation, so its value tree is
+// scanned for one.
 bool contains_decimal_avg(const Builder& b, const Resolved::Expr& expr) {
     if (expr.has_column()) {
         return b.avg_relations.count(expr.column().relation_id()) != 0;
@@ -167,10 +172,58 @@ bool contains_decimal_avg(const Builder& b, const Resolved::Expr& expr) {
     return false;
 }
 
-// DuckDB's DECIMAL to DOUBLE cast can round twice above 15 digits.
-bool wide_decimal(const Resolved::Expr& expr) {
+// DuckDB divides DECIMALs through DOUBLE and can take a DECIMAL remainder
+// through DOUBLE, where MySQL computes both exactly.
+bool contains_decimal_quotient(const Builder& b, const Resolved::Expr& expr) {
+    if (expr.has_column()) {
+        return b.quotient_relations.count(expr.column().relation_id()) != 0;
+    }
+    if (expr.has_arithmetic()) {
+        const auto& arith = expr.arithmetic();
+        return ((arith.op() == Resolved::Arithmetic::DIV ||
+                 arith.op() == Resolved::Arithmetic::MOD) &&
+                expr.result_type().kind() == Resolved::DECIMAL) ||
+               contains_decimal_quotient(b, arith.left()) ||
+               contains_decimal_quotient(b, arith.right());
+    }
+    if (expr.has_aggregate()) {
+        return expr.aggregate().has_arg() &&
+               contains_decimal_quotient(b, expr.aggregate().arg());
+    }
+    if (expr.has_case_when()) {
+        for (const auto& branch : expr.case_when().branches()) {
+            if (contains_decimal_quotient(b, branch.then())) return true;
+        }
+        return expr.case_when().has_else_result() &&
+               contains_decimal_quotient(b, expr.case_when().else_result());
+    }
+    if (expr.has_function()) {
+        for (const auto& arg : expr.function().args()) {
+            if (contains_decimal_quotient(b, arg)) return true;
+        }
+        return false;
+    }
+    if (expr.has_subquery()) {
+        for (const auto& item : expr.subquery().query().select()) {
+            if (contains_decimal_quotient(b, item.expression())) return true;
+        }
+    }
+    return false;
+}
+
+// CastTo converts a DECIMAL operand of a DOUBLE context as MySQL does, but
+// not a value DuckDB already computed through DOUBLE: a decimal AVG, or a
+// quotient inside an operand above 15 digits.
+bool admit_double_operand(Builder& b, const Resolved::Expr& expr) {
     const auto& type = expr.result_type();
-    return type.kind() == Resolved::DECIMAL && type.precision() > 15;
+    if (type.kind() != Resolved::DECIMAL) return true;
+    if (contains_decimal_avg(b, expr)) {
+        return b.refuse("decimal AVG operand in a DOUBLE context");
+    }
+    if (type.precision() > 15 && contains_decimal_quotient(b, expr)) {
+        return b.refuse("DECIMAL quotient above 15 digits in a DOUBLE context");
+    }
+    return true;
 }
 
 // utf8mb4_0900_ai_ci, utf8mb4_0900_bin and binary.
@@ -232,8 +285,8 @@ bool compare_type_of(Builder& b, const Resolved::Expr& left,
           rk == Resolved::DOUBLE)) ||
         (rk == Resolved::DOUBLE &&
          (lk == Resolved::INT64 || lk == Resolved::DECIMAL))) {
-        if (wide_decimal(left) || wide_decimal(right)) {
-            return b.refuse("DECIMAL above 15 digits against DOUBLE");
+        if (!admit_double_operand(b, left) || !admit_double_operand(b, right)) {
+            return false;
         }
         out->set_kind(Resolved::DOUBLE);
         return true;
@@ -329,6 +382,25 @@ bool build_comparison(Builder& b, Item_func* function,
         !build_expr(b, function->arguments()[1], cmp->mutable_right())) {
         return false;
     }
+    // After this request is built, MySQL compares an integer or DECIMAL column
+    // with a DOUBLE constant, or with a DOUBLE operand it replaces by one, in
+    // the column's type. DOUBLE can differ from that above 15 digits.
+    const Resolved::Expr* sides[] = {&cmp->left(), &cmp->right()};
+    for (int i = 0; i < 2; ++i) {
+        const auto& column = *sides[i];
+        const auto& other = *sides[1 - i];
+        if (column.has_column() &&
+            column.result_type().kind() == Resolved::DECIMAL &&
+            column.result_type().precision() > 15 &&
+            other.result_type().kind() == Resolved::DOUBLE) {
+            return b.refuse("DECIMAL column above 15 digits against DOUBLE");
+        }
+        if (column.has_column() &&
+            column.result_type().kind() == Resolved::INT64 &&
+            other.result_type().kind() == Resolved::DOUBLE) {
+            return b.refuse("integer column against DOUBLE");
+        }
+    }
     return compare_type_of(b, cmp->left(), cmp->right(),
                            cmp->mutable_compare_as());
 }
@@ -357,8 +429,9 @@ bool build_arithmetic(Builder& b, Item_func* function,
         return b.refuse("nonconstant string arithmetic is unsupported");
     }
     if (out->result_type().kind() == Resolved::DOUBLE &&
-        (wide_decimal(arith->left()) || wide_decimal(arith->right()))) {
-        return b.refuse("DECIMAL above 15 digits in DOUBLE arithmetic");
+        (!admit_double_operand(b, arith->left()) ||
+         !admit_double_operand(b, arith->right()))) {
+        return false;
     }
     *arith->mutable_result_as() = out->result_type();
     return true;
@@ -481,10 +554,10 @@ bool build_func(Builder& b, Item_func* function, Resolved::Expr* out) {
                         (hk2 == Resolved::INT64 || hk2 == Resolved::DECIMAL)) ||
                        (hk2 == Resolved::DOUBLE &&
                         (lk2 == Resolved::INT64 || lk2 == Resolved::DECIMAL))) {
-                if (wide_decimal(between->value()) ||
-                    wide_decimal(between->low()) ||
-                    wide_decimal(between->high())) {
-                    return b.refuse("DECIMAL above 15 digits against DOUBLE");
+                if (!admit_double_operand(b, between->value()) ||
+                    !admit_double_operand(b, between->low()) ||
+                    !admit_double_operand(b, between->high())) {
+                    return false;
                 }
                 compare_as->set_kind(Resolved::DOUBLE);
             } else if ((lk2 == Resolved::DATE && hk2 == Resolved::DATETIME) ||
@@ -609,8 +682,17 @@ bool build_func(Builder& b, Item_func* function, Resolved::Expr* out) {
                     return false;
                 }
             }
-            return build_expr(b, function->arguments()[count - 1],
-                              case_when->mutable_else_result());
+            if (!build_expr(b, function->arguments()[count - 1],
+                            case_when->mutable_else_result())) {
+                return false;
+            }
+            if (out->result_type().kind() == Resolved::DOUBLE) {
+                for (const auto& branch : case_when->branches()) {
+                    if (!admit_double_operand(b, branch.then())) return false;
+                }
+                return admit_double_operand(b, case_when->else_result());
+            }
+            return true;
         }
         case Item_func::YEAR_FUNC: {
             if (function->argument_count() != 1) return b.refuse("YEAR arity");
@@ -770,6 +852,15 @@ bool build_subselect(Builder& b, Item_subselect* subselect,
                 (left_type.kind() != item_type.kind() ||
                  left_type.collation_id() != item_type.collation_id())) {
                 return b.refuse("IN subquery mixes string collations");
+            }
+            // DuckDB compares the two sides without CastTo, and its DECIMAL
+            // to DOUBLE cast can round twice above 15 digits.
+            auto wide = [](const Resolved::ResolvedType& type) {
+                return type.kind() == Resolved::DECIMAL && type.precision() > 15;
+            };
+            if ((left_type.kind() == Resolved::DOUBLE && wide(item_type)) ||
+                (item_type.kind() == Resolved::DOUBLE && wide(left_type))) {
+                return b.refuse("IN subquery pairs DOUBLE with a wide DECIMAL");
             }
             if (!fold_unknown) {
                 *out->mutable_subquery() = std::move(*in_subquery);
@@ -1177,7 +1268,9 @@ bool build_nest(Builder& b, const mem_root_deque<Table_ref*>& nest,
             for (const auto& item : derived->query().select()) {
                 if (contains_decimal_avg(b, item.expression())) {
                     b.avg_relations.insert(relation_id);
-                    break;
+                }
+                if (contains_decimal_quotient(b, item.expression())) {
+                    b.quotient_relations.insert(relation_id);
                 }
             }
         } else {
