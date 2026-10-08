@@ -521,6 +521,10 @@ bool build_func(Builder& b, Item_func* function, Resolved::Expr* out) {
             return build_arithmetic(b, function, Resolved::Arithmetic::MUL,
                                     out);
         case Item_func::DIV_FUNC:
+            // Integer DIV shares DIV_FUNC with "/" but truncates.
+            if (strcmp(function->func_name(), "DIV") == 0) {
+                return b.refuse("integer DIV is unsupported");
+            }
             return build_arithmetic(b, function, Resolved::Arithmetic::DIV,
                                     out);
         case Item_func::MOD_FUNC:
