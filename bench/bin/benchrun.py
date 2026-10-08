@@ -598,6 +598,9 @@ def run_execute(benchmark, config_path, terminals, result_base, tx_plan=False):
         (res_dir / "benchbase_output.log").write_text(combined)
     except Exception:
         pass
+    if bb_proc.returncode != 0:
+        sys.exit(f"BenchBase exited with {bb_proc.returncode} (log: {res_dir / 'benchbase_output.log'}):\n"
+                 f"{stderr[-500:]}")
     perf = extract_throughput(combined)
     histograms = extract_histograms(combined)
 
@@ -606,8 +609,6 @@ def run_execute(benchmark, config_path, terminals, result_base, tx_plan=False):
         print(f"  Server Retry: {histograms.get('server_retry', 0)} | Unexpected Errors: {histograms.get('unexpected_errors', 0)}")
     else:
         print(f"  WARNING: Could not parse throughput from output")
-        if bb_proc.returncode != 0:
-            print(f"  BenchBase stderr (last 500 chars):\n{stderr[-500:]}")
 
     # Move BenchBase output files
     bb_results = BENCHBASE_DIR / "results"
