@@ -37,6 +37,7 @@
 #include "helios_field_types.h"
 #include "duckdb_request_builder.hh"
 #include "helios_proxy.hh"
+#include "log.hh"
 
 namespace helios {
 std::shared_ptr<HeliosProxy> acquire_shared_proxy(THD *thd);
@@ -115,6 +116,12 @@ void set_duckdb_fail_reason(THD *thd, const char *reason) {
 
 bool raise_duckdb_error(THD *thd, const char *message) {
   set_duckdb_fail_reason(thd, message);
+  // MySQL reruns a statement refused before execution on the primary and
+  // drops this error unless use_secondary_engine is FORCED; the log keeps it.
+  const LEX_CSTRING &query = thd->query();
+  LOG_WARNING("%s; query: %.*s", message,
+              static_cast<int>(std::min(query.length, size_t{200})),
+              query.str);
   my_error(ER_SECONDARY_ENGINE_PLUGIN, MYF(0), message);
   return true;
 }
