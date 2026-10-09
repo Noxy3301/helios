@@ -12,6 +12,8 @@
 namespace collation {
 namespace {
 
+enum class Coll { kAiCi, kBin, kBinary };
+
 // Decodes one well-formed UTF-8 sequence (Unicode Table 3-7); 0 if ill-formed.
 size_t utf8_decode(const uint8_t *s, const uint8_t *end, char32_t *cp) {
   const uint8_t b = s[0];
@@ -112,14 +114,141 @@ int weights(char32_t cp, uint16_t *w) {
   return 2;
 }
 
-// Length of the LIKE pattern character at p, 0 if ill-formed; c is its code
-// point, which the wildcards and the escape compare with.
+// Length of the LIKE pattern character at p, 0 if ill-formed. c is what the
+// wildcards and the escape compare with: the code point, for kBin the first
+// byte, for kBinary the byte as a signed char.
+template <Coll C>
 size_t pattern_char(const uint8_t *p, const uint8_t *end, int *c) {
+  if constexpr (C == Coll::kBinary) {
+    *c = static_cast<int8_t>(*p);
+    return 1;
+  }
   char32_t cp;
   const size_t n = utf8_decode(p, end, &cp);
+  if constexpr (C == Coll::kBin) {
+    *c = *p;
+    return n != 0 ? n : 1;
+  }
   if (n == 0) return 0;
   *c = cp;
   return n;
+}
+
+// Length of the text character at t, 0 if ill-formed; kBin takes an
+// ill-formed byte as one character.
+template <Coll C>
+size_t text_char(const uint8_t *t, const uint8_t *end, char32_t *c) {
+  if constexpr (C == Coll::kBinary) return 1;
+  const size_t n = utf8_decode(t, end, c);
+  if constexpr (C == Coll::kBin) return n != 0 ? n : 1;
+  return n;
+}
+
+// Greedy match that, on a mismatch, lets the last '%' absorb one more text
+// character and retries from there; O(text * pattern) characters.
+template <Coll C>
+bool like(std::string_view text, std::string_view pattern, int escape) {
+  const int one = escape == '_' ? -1 : '_';
+  const int many = escape == '%' ? -1 : '%';
+  const auto *t = reinterpret_cast<const uint8_t *>(text.data());
+  const auto *t_end = t + text.size();
+  const auto *p = reinterpret_cast<const uint8_t *>(pattern.data());
+  const auto *p_end = p + pattern.size();
+  const uint8_t *star_p = nullptr;
+  const uint8_t *star_t = nullptr;
+  char32_t tc = 0;
+
+  for (;;) {
+    if (p != p_end) {
+      int pc;
+      size_t pn = pattern_char<C>(p, p_end, &pc);
+      if (pn == 0) return false;
+      if (pc == many) {
+        // A run of '%' and '_' takes one text character per '_' up front.
+        p += pn;
+        while (p != p_end) {
+          pn = pattern_char<C>(p, p_end, &pc);
+          if (pn == 0) return false;
+          if (pc != many && pc != one) break;
+          if (pc == one) {
+            if (t == t_end) return false;
+            const size_t tn = text_char<C>(t, t_end, &tc);
+            if (tn == 0) return false;
+            t += tn;
+          }
+          p += pn;
+        }
+        if (p == p_end) return true;
+        star_p = p;
+        star_t = t;
+        continue;
+      }
+      if (t != t_end) {
+        const size_t tn = text_char<C>(t, t_end, &tc);
+        if (tn == 0) return false;
+        if (pc == one) {
+          p += pn;
+          t += tn;
+          continue;
+        }
+        // kBin and kBinary match the escape against one byte; kBinary takes
+        // it as unsigned only right after a '%' run.
+        const bool scan = p == star_p;
+        const size_t escape_len = C == Coll::kAiCi ? pn : 1;
+        const int escape_c = C == Coll::kBinary && scan ? *p : pc;
+        if (escape_c == escape && p + escape_len != p_end) {
+          p += escape_len;
+          pn = pattern_char<C>(p, p_end, &pc);
+          if (pn == 0) return false;
+        }
+        if constexpr (C == Coll::kAiCi) {
+          // One weight or none on both sides compares the table values; a
+          // code point in a block without DUCET entries equals only itself.
+          bool eq = static_cast<char32_t>(pc) == tc;
+          if (!eq) {
+            const uint16_t a = table_value(pc);
+            const uint16_t b = table_value(tc);
+            if (a != kAbsent && b != kAbsent && ((a | b) & kExpansion) == 0) {
+              eq = a == b;
+            } else if (block_has_entry(pc) && block_has_entry(tc)) {
+              uint16_t wp[kMaxWeights];
+              uint16_t wt[kMaxWeights];
+              const int n = weights(pc, wp);
+              eq = n == weights(tc, wt) &&
+                   std::memcmp(wp, wt, n * sizeof(*wp)) == 0;
+            }
+          }
+          if (eq) {
+            p += pn;
+            t += tn;
+            continue;
+          }
+        } else if (static_cast<size_t>(t_end - t) >= pn && *p == *t &&
+                   std::memcmp(p + 1, t + 1, pn - 1) == 0 &&
+                   (!scan || tn == pn)) {
+          // A literal right after a '%' run equals a whole text character.
+          p += pn;
+          t += pn;
+          continue;
+        }
+        if (scan) {
+          star_t = t + tn;
+          t = star_t;
+          p = star_p;
+          continue;
+        }
+      }
+    } else if (t == t_end) {
+      return true;
+    }
+
+    if (star_p == nullptr || star_t == t_end) return false;
+    const size_t n = text_char<C>(star_t, t_end, &tc);
+    if (n == 0) return false;
+    star_t += n;
+    t = star_t;
+    p = star_p;
+  }
 }
 
 }  // namespace
@@ -151,98 +280,18 @@ size_t utf8mb4_0900_ai_ci_key(std::string_view s, uint8_t *dst) {
   return out - dst;
 }
 
-// Greedy match that, on a mismatch, lets the last '%' absorb one more text
-// character and retries from there; O(text * pattern) characters.
 bool utf8mb4_0900_ai_ci_like(std::string_view text, std::string_view pattern,
                              int escape) {
-  const int one = escape == '_' ? -1 : '_';
-  const int many = escape == '%' ? -1 : '%';
-  const auto *t = reinterpret_cast<const uint8_t *>(text.data());
-  const auto *t_end = t + text.size();
-  const auto *p = reinterpret_cast<const uint8_t *>(pattern.data());
-  const auto *p_end = p + pattern.size();
-  const uint8_t *star_p = nullptr;
-  const uint8_t *star_t = nullptr;
-  char32_t tc = 0;
+  return like<Coll::kAiCi>(text, pattern, escape);
+}
 
-  for (;;) {
-    if (p != p_end) {
-      int pc;
-      size_t pn = pattern_char(p, p_end, &pc);
-      if (pn == 0) return false;
-      if (pc == many) {
-        // A run of '%' and '_' takes one text character per '_' up front.
-        p += pn;
-        while (p != p_end) {
-          pn = pattern_char(p, p_end, &pc);
-          if (pn == 0) return false;
-          if (pc != many && pc != one) break;
-          if (pc == one) {
-            if (t == t_end) return false;
-            const size_t tn = utf8_decode(t, t_end, &tc);
-            if (tn == 0) return false;
-            t += tn;
-          }
-          p += pn;
-        }
-        if (p == p_end) return true;
-        star_p = p;
-        star_t = t;
-        continue;
-      }
-      if (t != t_end) {
-        const size_t tn = utf8_decode(t, t_end, &tc);
-        if (tn == 0) return false;
-        if (pc == one) {
-          p += pn;
-          t += tn;
-          continue;
-        }
-        const bool scan = p == star_p;
-        if (pc == escape && p + pn != p_end) {
-          p += pn;
-          pn = pattern_char(p, p_end, &pc);
-          if (pn == 0) return false;
-        }
-        // One weight or none on both sides compares the table values; a code
-        // point in a block without DUCET entries equals only itself.
-        bool eq = static_cast<char32_t>(pc) == tc;
-        if (!eq) {
-          const uint16_t a = table_value(pc);
-          const uint16_t b = table_value(tc);
-          if (a != kAbsent && b != kAbsent && ((a | b) & kExpansion) == 0) {
-            eq = a == b;
-          } else if (block_has_entry(pc) && block_has_entry(tc)) {
-            uint16_t wp[kMaxWeights];
-            uint16_t wt[kMaxWeights];
-            const int n = weights(pc, wp);
-            eq = n == weights(tc, wt) &&
-                 std::memcmp(wp, wt, n * sizeof(*wp)) == 0;
-          }
-        }
-        if (eq) {
-          p += pn;
-          t += tn;
-          continue;
-        }
-        if (scan) {
-          star_t = t + tn;
-          t = star_t;
-          p = star_p;
-          continue;
-        }
-      }
-    } else if (t == t_end) {
-      return true;
-    }
+bool utf8mb4_0900_bin_like(std::string_view text, std::string_view pattern,
+                           int escape) {
+  return like<Coll::kBin>(text, pattern, escape);
+}
 
-    if (star_p == nullptr || star_t == t_end) return false;
-    const size_t n = utf8_decode(star_t, t_end, &tc);
-    if (n == 0) return false;
-    star_t += n;
-    t = star_t;
-    p = star_p;
-  }
+bool binary_like(std::string_view text, std::string_view pattern, int escape) {
+  return like<Coll::kBinary>(text, pattern, escape);
 }
 
 }  // namespace collation

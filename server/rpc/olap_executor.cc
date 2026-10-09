@@ -1383,12 +1383,6 @@ duckdb::DuckDB& global_runtime() {
 
 // Name the collation is registered under inside DuckDB (COLLATE targets it).
 constexpr const char* kUtf8mb40900AiCiDuckdbName = "utf8mb4_0900_ai_ci";
-// DuckDB scalar functions implementing MySQL LIKE / NOT LIKE under this
-// collation; the AST builder emits calls to them by these names.
-constexpr const char* kUtf8mb40900AiCiLikeFunction =
-    "mysql_utf8mb4_0900_ai_ci_like";
-constexpr const char* kUtf8mb40900AiCiNotLikeFunction =
-    "mysql_utf8mb4_0900_ai_ci_not_like";
 
 /**
  * @brief DuckDB collation scalar for MySQL utf8mb4_0900_ai_ci.
@@ -1427,16 +1421,19 @@ void utf8mb4_0900_ai_ci_sort_key(duckdb::DataChunk& args,
       });
 }
 
-template <bool Negated>
-void utf8mb4_0900_ai_ci_like(duckdb::DataChunk& args, duckdb::ExpressionState&,
-                             duckdb::Vector& result) {
+// MySQL LIKE (Negated: NOT LIKE) of (value, pattern, INTEGER escape) under
+// the collation Match implements.
+template <bool (*Match)(std::string_view, std::string_view, int), bool Negated>
+void mysql_like(duckdb::DataChunk& args, duckdb::ExpressionState&,
+                duckdb::Vector& result) {
   duckdb::TernaryExecutor::Execute<duckdb::string_t, duckdb::string_t,
                                    int32_t, bool>(
       args.data[0], args.data[1], args.data[2], result, args.size(),
       [](duckdb::string_t text, duckdb::string_t pattern, int32_t escape) {
-        const bool matched = collation::utf8mb4_0900_ai_ci_like(
-            std::string_view(text.GetData(), text.GetSize()),
-            std::string_view(pattern.GetData(), pattern.GetSize()), escape);
+        const bool matched =
+            Match(std::string_view(text.GetData(), text.GetSize()),
+                  std::string_view(pattern.GetData(), pattern.GetSize()),
+                  escape);
         return Negated ? !matched : matched;
       });
 }
@@ -1485,18 +1482,30 @@ void register_mysql_collation_runtime(Connection& connection) {
   const duckdb::vector<duckdb::LogicalType> arguments = {
       duckdb::LogicalType::VARCHAR, duckdb::LogicalType::VARCHAR,
       duckdb::LogicalType::INTEGER};
-  duckdb::ScalarFunction like(kUtf8mb40900AiCiLikeFunction, arguments,
-                              duckdb::LogicalType::BOOLEAN,
-                              utf8mb4_0900_ai_ci_like<false>);
-  duckdb::CreateScalarFunctionInfo like_info(std::move(like));
-  like_info.on_conflict = duckdb::OnCreateConflict::IGNORE_ON_CONFLICT;
-  connection.context->RegisterFunction(like_info);
-  duckdb::ScalarFunction not_like(kUtf8mb40900AiCiNotLikeFunction, arguments,
-                                  duckdb::LogicalType::BOOLEAN,
-                                  utf8mb4_0900_ai_ci_like<true>);
-  duckdb::CreateScalarFunctionInfo not_like_info(std::move(not_like));
-  not_like_info.on_conflict = duckdb::OnCreateConflict::IGNORE_ON_CONFLICT;
-  connection.context->RegisterFunction(not_like_info);
+  // MySQL LIKE / NOT LIKE per collation; the AST builder emits calls to them
+  // by these names.
+  const struct {
+    const char* name;
+    void (*fn)(duckdb::DataChunk&, duckdb::ExpressionState&, duckdb::Vector&);
+  } likes[] = {
+      {"mysql_utf8mb4_0900_ai_ci_like",
+       mysql_like<collation::utf8mb4_0900_ai_ci_like, false>},
+      {"mysql_utf8mb4_0900_ai_ci_not_like",
+       mysql_like<collation::utf8mb4_0900_ai_ci_like, true>},
+      {"mysql_utf8mb4_0900_bin_like",
+       mysql_like<collation::utf8mb4_0900_bin_like, false>},
+      {"mysql_utf8mb4_0900_bin_not_like",
+       mysql_like<collation::utf8mb4_0900_bin_like, true>},
+      {"mysql_binary_like", mysql_like<collation::binary_like, false>},
+      {"mysql_binary_not_like", mysql_like<collation::binary_like, true>},
+  };
+  for (const auto& like : likes) {
+    duckdb::ScalarFunction fn(like.name, arguments,
+                              duckdb::LogicalType::BOOLEAN, like.fn);
+    duckdb::CreateScalarFunctionInfo info(std::move(fn));
+    info.on_conflict = duckdb::OnCreateConflict::IGNORE_ON_CONFLICT;
+    connection.context->RegisterFunction(info);
+  }
 
   // Callable form of the sort key, for aggregate-DISTINCT deduplication
   // where DuckDB does not push a non-combinable collation into children.

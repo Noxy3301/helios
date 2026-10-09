@@ -1,7 +1,7 @@
 /**
  * @file server/rpc/collation.hh
  * MySQL string semantics the DuckDB executor evaluates: the utf8mb4_0900_ai_ci
- * sort key and LIKE.
+ * sort key and LIKE under utf8mb4_0900_ai_ci, utf8mb4_0900_bin and binary.
  */
 #ifndef HELIOS_SERVER_RPC_COLLATION_H
 #define HELIOS_SERVER_RPC_COLLATION_H
@@ -50,6 +50,38 @@ size_t utf8mb4_0900_ai_ci_key(std::string_view s, uint8_t *dst);
  */
 bool utf8mb4_0900_ai_ci_like(std::string_view text, std::string_view pattern,
                              int escape);
+
+/**
+ * @brief MySQL LIKE of text against pattern under utf8mb4_0900_bin.
+ *
+ * Same wildcards as utf8mb4_0900_ai_ci_like over characters that are
+ * well-formed UTF-8 sequences or else single bytes. A literal matches its
+ * own bytes in the text; right after a '%' run it must match a whole text
+ * character. The wildcards and the escape compare with the first byte of a
+ * pattern character, and the escape skips that byte only.
+ *
+ * @param text    Value bytes.
+ * @param pattern Pattern bytes.
+ * @param escape  Escape code point, as the ESCAPE clause evaluates.
+ * @return True when text matches pattern.
+ */
+bool utf8mb4_0900_bin_like(std::string_view text, std::string_view pattern,
+                           int escape);
+
+/**
+ * @brief MySQL LIKE of text against pattern under binary.
+ *
+ * Same wildcards over bytes ('_' is one byte); a literal matches the same
+ * byte. The wildcards and the escape compare with a pattern byte read as a
+ * signed char, so 0xFF stands for the wildcard an escape of '%' or '_'
+ * replaces; right after a '%' run the escape compares with the unsigned byte.
+ *
+ * @param text    Value bytes.
+ * @param pattern Pattern bytes.
+ * @param escape  Escape byte value, as the ESCAPE clause evaluates.
+ * @return True when text matches pattern.
+ */
+bool binary_like(std::string_view text, std::string_view pattern, int escape);
 
 }  // namespace collation
 
