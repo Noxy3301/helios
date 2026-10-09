@@ -222,22 +222,6 @@ inline uint32_t LengthPrefixBytes(uint32_t len) {
   return n;
 }
 
-// Writes one field in row format: the marker for an empty payload, otherwise
-// the length-prefix width, the little-endian length and the bytes.
-void AppendField(std::string &out, std::string_view payload) {
-  if (payload.empty()) {
-    out.push_back(static_cast<char>(kNoValue));
-    return;
-  }
-  const uint32_t len = static_cast<uint32_t>(payload.size());
-  const uint32_t prefix = LengthPrefixBytes(len);
-  out.push_back(static_cast<char>(prefix));
-  for (uint32_t i = 0; i < prefix; i++) {
-    out.push_back(static_cast<char>((len >> (8 * i)) & 0xFF));
-  }
-  out.append(payload.data(), payload.size());
-}
-
 /**
  * @brief Parses row bytes into per-field payload references.
  *
@@ -438,55 +422,6 @@ size_t PaxGroup::GatherRow(uint32_t slot, std::byte *dst,
     off += vlen;
   }
   return off;
-}
-
-void PaxGroup::AppendCellField(size_t field, uint32_t slot,
-                               std::string &out) const {
-  const std::string_view cv = cell(field, slot);
-  const FieldType type = schema_.type_of(field);
-  if (type == FieldType::kUntyped || cv.empty()) {
-    AppendField(out, cv);
-    return;
-  }
-  const std::byte *c = arena_.get() + strip_offset_[field] +
-                       static_cast<size_t>(stride_[field]) * slot;
-  std::string tmp;
-  FormatTyped(type, schema_.scale_of(field), c + kCellLenBytes,
-              schema_.field_max_bytes[field], tmp);
-  AppendField(out, tmp);
-}
-
-bool PaxGroup::GatherRowProjected(uint32_t slot, const uint32_t *columns,
-                                  size_t n_columns, std::string &out) const {
-  assert(slot < kRows);
-  const size_t fields = schema_.field_count();
-  AppendCellField(0, slot, out);  // null-flags field (always UNTYPED)
-  for (size_t i = 0; i < n_columns; i++) {
-    const size_t field = static_cast<size_t>(columns[i]) + 1;
-    if (field >= fields) return false;
-    AppendCellField(field, slot, out);
-  }
-  return true;
-}
-
-void PaxGroup::GatherRowMasked(uint32_t slot, const uint32_t *columns,
-                               size_t n_columns, std::string &out) const {
-  assert(slot < kRows);
-  const size_t fields = schema_.field_count();
-  AppendCellField(0, slot, out);  // null-flags field (always UNTYPED)
-
-  // Merge the ascending MySQL column numbers onto fields `1..n`; mark the rest
-  // empty.
-  size_t column_index = 0;
-  for (size_t field = 1; field < fields; ++field) {
-    if (column_index < n_columns &&
-        static_cast<size_t>(columns[column_index]) + 1 == field) {
-      AppendCellField(field, slot, out);
-      ++column_index;
-      continue;
-    }
-    out.push_back(static_cast<char>(kNoValue));
-  }
 }
 
 PaxTable::PaxTable(TableSchema schema) : schema_(std::move(schema)) {

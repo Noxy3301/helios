@@ -168,7 +168,7 @@ TEST_F(DatabaseTest, ThreadSafetyWrites) {
   }
 }
 
-TEST_F(DatabaseTest, PaxColumnSelectionPreservesNullAndEmptyReads) {
+TEST_F(DatabaseTest, PaxReadsReturnRowAndRejectOversizedField) {
   std::string commit_reason;
   const char *kTable = "projected";
   ASSERT_TRUE(db_->CreateTable(kTable));
@@ -183,33 +183,21 @@ TEST_F(DatabaseTest, PaxColumnSelectionPreservesNullAndEmptyReads) {
                                      {{kTable, "name", "a", "alice"}}, {},
                                      commit_reason));
 
-  const std::vector<uint32_t> no_columns;
-  const std::vector<uint32_t> second_column{1};
-  const std::vector<const std::vector<uint32_t> *> selections{
-      nullptr, &no_columns, &second_column};
-  const std::vector<std::string> expected{
-      row, null_flags + "\xff\xff", null_flags + "\xff\1\3def"};
+  const auto point = db_->Read(kTable, "alice");
+  const auto primary = db_->Scan(kTable, "alice", "bob", 0, false);
+  const auto secondary = db_->ScanIndex(kTable, "name", "a", "b", 0, false);
+  db_->ReleaseThreadEpoch();
 
-  // Point, primary-range and secondary-range reads share column semantics.
-  for (size_t i = 0; i < selections.size(); ++i) {
-    const auto point = db_->Read(kTable, "alice", selections[i]);
-    const auto primary =
-        db_->Scan(kTable, "alice", "bob", 0, false, selections[i]);
-    const auto secondary =
-        db_->ScanIndex(kTable, "name", "a", "b", 0, false, selections[i]);
-    db_->ReleaseThreadEpoch();
-
-    ASSERT_TRUE(point.found);
-    EXPECT_EQ(point.value, expected[i]);
-    ASSERT_TRUE(primary.ok);
-    ASSERT_EQ(primary.rows.size(), 1u);
-    EXPECT_EQ(primary.rows[0].value, expected[i]);
-    EXPECT_EQ(primary.rows[0].tid, point.tid);
-    ASSERT_TRUE(secondary.ok);
-    ASSERT_EQ(secondary.rows.size(), 1u);
-    EXPECT_EQ(secondary.rows[0].value, expected[i]);
-    EXPECT_EQ(secondary.rows[0].tid, point.tid);
-  }
+  ASSERT_TRUE(point.found);
+  EXPECT_EQ(point.value, row);
+  ASSERT_TRUE(primary.ok);
+  ASSERT_EQ(primary.rows.size(), 1u);
+  EXPECT_EQ(primary.rows[0].value, row);
+  EXPECT_EQ(primary.rows[0].tid, point.tid);
+  ASSERT_TRUE(secondary.ok);
+  ASSERT_EQ(secondary.rows.size(), 1u);
+  EXPECT_EQ(secondary.rows[0].value, row);
+  EXPECT_EQ(secondary.rows[0].tid, point.tid);
 
   // An oversized field is rejected; the earlier value remains in PAX.
   const std::string oversized = null_flags + "\1\4abcd\1\3def";

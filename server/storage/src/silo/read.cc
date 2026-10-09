@@ -16,15 +16,14 @@
 namespace helios::storage {
 
 ReadResult Database::Read(const std::string_view table_name,
-                          const std::string_view key,
-                          const std::vector<uint32_t> *selected_columns) {
+                          const std::string_view key) {
   auto table = GetTable(table_name);
   if (table == nullptr) return {};
 
   DataItem *item = table->GetPrimaryIndex().Get(key);
   if (item == nullptr) return {false, {}, Tidword::Absent().obj};
 
-  auto row = silo::StableRead(*item, selected_columns);
+  auto row = silo::StableRead(*item);
   return {row.found, std::move(row.value), row.tid.obj};
 }
 
@@ -41,8 +40,7 @@ std::vector<ReadResult> Database::BatchRead(
 ScanResult Database::Scan(const std::string_view table_name,
                           const std::string_view start_key,
                           const std::string_view end_key, uint64_t row_limit,
-                          bool reverse_scan,
-                          const std::vector<uint32_t> *selected_columns) {
+                          bool reverse_scan, bool keys_only) {
   ScanResult result;
   if (end_key.empty()) return result;
 
@@ -54,7 +52,7 @@ ScanResult Database::Scan(const std::string_view table_name,
 
   // Copy each live row from the DataItem found by the scan.
   auto append_scan_entry = [&](std::string_view key, DataItem &item) {
-    auto row = silo::StableRead(item, selected_columns);
+    auto row = silo::StableRead(item, keys_only);
     if (row.found) {
       result.rows.push_back(
           {std::string(key), std::move(row.value), row.tid.obj});
@@ -79,11 +77,12 @@ uint64_t CurrentTid(const ScanPaxRow &row) {
   return item->transaction_id.load().obj;
 }
 
-ScanIndexResult Database::ScanIndex(
-    const std::string_view table_name, const std::string_view index_name,
-    const std::string_view start_key, const std::string_view end_key,
-    uint64_t row_limit, bool reverse_scan,
-    const std::vector<uint32_t> *selected_columns) {
+ScanIndexResult Database::ScanIndex(const std::string_view table_name,
+                                    const std::string_view index_name,
+                                    const std::string_view start_key,
+                                    const std::string_view end_key,
+                                    uint64_t row_limit, bool reverse_scan,
+                                    bool keys_only) {
   ScanIndexResult result;
   if (end_key.empty()) return result;
 
@@ -104,7 +103,7 @@ ScanIndexResult Database::ScanIndex(
       return false;
     }
 
-    auto row = silo::StableRead(*item, selected_columns);
+    auto row = silo::StableRead(*item, keys_only);
     if (row.found) {
       result.rows.push_back({std::string(secondary_key),
                              std::string(primary_key), std::move(row.value),

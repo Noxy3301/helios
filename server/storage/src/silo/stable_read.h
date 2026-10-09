@@ -13,7 +13,6 @@
 #include <string>
 #include <string_view>
 #include <utility>
-#include <vector>
 
 #include "helios/index.h"
 
@@ -50,31 +49,17 @@ inline Tidword StableTid(const DataItem &item) {
 
 /**
  * @brief Reads a value, retrying if its TID changes during the copy.
- * @param selected_columns Columns needed for projection pushdown, given as
- * ascending zero-based MySQL column numbers. nullptr selects all columns;
- * an empty list selects no data columns. Null flags are always retained.
- * @details PAX copies the selected columns and leaves empty markers in the
- * others. Every stored value is read from its PAX slot.
+ * @param keys_only When true, no value is copied and `value` stays empty.
  * @return The value and its TID, with `found == false` if the slot has no live
  * value.
  */
-inline StableValue StableRead(
-    const DataItem &item,
-    const std::vector<uint32_t> *selected_columns = nullptr) {
+inline StableValue StableRead(const DataItem &item, bool keys_only = false) {
   for (;;) {
     // Observe an unlocked version before copying its live row.
     const Tidword tid = StableTid(item);
     const bool found = !tid.absent;
     std::string value;
-    if (found) {
-      if (selected_columns == nullptr) {
-        value = item.CopyValue();
-      } else {
-        item.pax_group()->GatherRowMasked(item.pax_slot(),
-                                          selected_columns->data(),
-                                          selected_columns->size(), value);
-      }
-    }
+    if (found && !keys_only) value = item.CopyValue();
 
     // Accept the copy only if the same version is still current.
     if (item.transaction_id.load() == tid) {

@@ -194,36 +194,6 @@ class PaxGroup {
   size_t GatherRow(uint32_t slot, std::byte *dst, size_t expected_size) const;
 
   /**
-   * @brief Gathers the null-flags field and selected columns into `out`.
-   *
-   * @param slot Source slot inside this group.
-   * @param columns Zero-based MySQL column indexes to gather.
-   * @param n_columns Number of entries in `columns`.
-   * @param out Destination string; gathered bytes are appended.
-   * @return false when a column index is outside this group's schema; `out`
-   * may already hold the null-flags field and the columns before it.
-   */
-  bool GatherRowProjected(uint32_t slot, const uint32_t *columns,
-                          size_t n_columns, std::string &out) const;
-
-  /**
-   * @brief Gathers a row-shaped payload with unselected columns masked out.
-   *
-   * @details The null-flags field is always gathered. Zero-based MySQL columns
-   * listed in `columns` are gathered from their strips; unlisted columns are
-   * emitted as one-byte empty fields, preserving field indexes without reading
-   * unused strips.
-   *
-   * @param slot Source slot inside this group.
-   * @param columns Zero-based MySQL column indexes to gather, in ascending
-   * order.
-   * @param n_columns Number of entries in `columns`.
-   * @param out Destination string; gathered bytes are appended.
-   */
-  void GatherRowMasked(uint32_t slot, const uint32_t *columns, size_t n_columns,
-                       std::string &out) const;
-
-  /**
    * @brief Returns whether strip-direct readers should consider `slot` live.
    *
    * @param slot Slot inside this group.
@@ -241,7 +211,7 @@ class PaxGroup {
    *
    * @details Verbatim bytes for an UNTYPED cell, little-endian binary for a
    * typed one. This does not reformat a typed cell into row-format bytes;
-   * AppendCellField does.
+   * GatherRow does.
    *
    * @param field Field index, where 0 is the null-flags field and MySQL column
    * i is field `i + 1`.
@@ -271,20 +241,6 @@ class PaxGroup {
   mutable std::atomic<GroupImageState *> image_state{nullptr};
 
  private:
-  /**
-   * @brief Appends one field's row-format value into `out`.
-   *
-   * @details Verbatim for an UNTYPED cell; reformatted to the exact val_str
-   * ASCII for a typed present cell. An empty cell is emitted as an empty
-   * field, and the null-flags field is what says whether it is SQL NULL.
-   *
-   * @param field Field index, where 0 is the null-flags field and MySQL column
-   * i is field `i + 1`.
-   * @param slot Slot inside this group.
-   * @param out Destination string; the packed field is appended.
-   */
-  void AppendCellField(size_t field, uint32_t slot, std::string &out) const;
-
   const TableSchema &schema_;  // Owned by PaxTable; outlives all groups.
   PaxTable &table_;            // Owns this group and outlives it.
   std::vector<uint32_t> stride_;

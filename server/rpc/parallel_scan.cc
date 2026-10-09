@@ -51,7 +51,7 @@ void run_range(helios::storage::Database* db,
         // The cells just read are valid only if the row TID still matches
         // the ref-scan observation. Otherwise re-read a stable row copy.
         if (helios::storage::CurrentTid(row_ref) != row_ref.tid) {
-            auto reread = db->Read(step.table_name(), row_ref.key, nullptr);
+            auto reread = db->Read(step.table_name(), row_ref.key);
             // A row deleted after the ref scan is a tombstone this list
             // lacks; the row scan lists it.
             if (!reread.found) {
@@ -86,11 +86,10 @@ bool parallel_primary_pax_row_ref_scan(
     if (step.scan_limit() == 0 && !step.reverse_scan()) {
         const unsigned max_threads =
             std::min<unsigned>(hardware_threads ? hardware_threads : 4, 8);
-        const std::vector<uint32_t> key_only_columns;
-        auto first = db->Scan(step.table_name(), start_key, end_key, 1, false,
-                              &key_only_columns);
-        auto last = db->Scan(step.table_name(), start_key, end_key, 1, true,
-                             &key_only_columns);
+        auto first =
+            db->Scan(step.table_name(), start_key, end_key, 1, false, true);
+        auto last =
+            db->Scan(step.table_name(), start_key, end_key, 1, true, true);
         int64_t lo = 0;
         int64_t hi = 0;
         if (max_threads > 1 && first.ok && !first.rows.empty() && last.ok &&
