@@ -872,32 +872,6 @@ void unpack_typed_run(FieldType type, const PaxGroup& group, size_t field,
 }
 
 /**
- * @brief Unpacks one untyped cell into a VARCHAR vector slot.
- *
- * @details A zero-length cell is SQL NULL only when the row's null-flags
- * field marks the column so, and the empty string otherwise; short payloads
- * inline into string_t, longer ones copy into the vector's string heap.
- */
-inline void unpack_untyped_cell(const PaxGroup& group, size_t field,
-                                uint32_t slot, bool is_null,
-                                Vector& output_vector, idx_t out_row) {
-  if (is_null) {
-    FlatVector::SetNull(output_vector, out_row, true);
-    return;
-  }
-  const std::string_view cell_value = group.cell(field, slot);
-  if (cell_value.size() <= duckdb::string_t::INLINE_LENGTH) {
-    FlatVector::GetData<duckdb::string_t>(output_vector)[out_row] =
-        duckdb::string_t(cell_value.data(),
-                         static_cast<uint32_t>(cell_value.size()));
-  } else {
-    FlatVector::GetData<duckdb::string_t>(output_vector)[out_row] =
-        StringVector::AddString(output_vector, cell_value.data(),
-                                cell_value.size());
-  }
-}
-
-/**
  * @brief Projection context for one scanned column.
  */
 struct ColumnContext {
@@ -921,6 +895,42 @@ inline bool cell_is_null(std::string_view null_flags,
 }
 
 /**
+ * @brief Unpacks one UNTYPED column across `count` consecutive slots.
+ *
+ * @details A cell is SQL NULL only when the row's null-flags field marks the
+ * column so, and a zero-length cell is the empty string. A length past the
+ * field's maximum reads as empty, as in PaxGroup::cell.
+ */
+void unpack_untyped_run(const PaxGroup& group, const ColumnContext& column,
+                        uint32_t slot_start, uint32_t count,
+                        Vector& output_vector, idx_t out_base) {
+  const uint32_t stride = group.stride(column.field);
+  const uint32_t max_length = group.schema().field_max_bytes[column.field];
+  const std::byte* src =
+      group.strip(column.field) + static_cast<size_t>(stride) * slot_start;
+  duckdb::string_t* dst =
+      FlatVector::GetData<duckdb::string_t>(output_vector) + out_base;
+
+  for (uint32_t i = 0; i < count; i++, src += stride) {
+    if (column.null_mask != 0 &&
+        cell_is_null(group.cell(0, slot_start + i), column)) {
+      FlatVector::SetNull(output_vector, out_base + i, true);
+      continue;
+    }
+    uint16_t length;
+    std::memcpy(&length, src, sizeof(length));
+    if (length > max_length) length = 0;
+    const char* data =
+        reinterpret_cast<const char*>(src + PaxGroup::kCellLenBytes);
+    if (length <= duckdb::string_t::INLINE_LENGTH) {
+      dst[i] = duckdb::string_t(data, length);
+    } else {
+      dst[i] = StringVector::AddString(output_vector, data, length);
+    }
+  }
+}
+
+/**
  * @brief Unpacks one slot's projected columns from the strip cells into
  * chunk row `out_row`.
  *
@@ -932,14 +942,11 @@ void emit_in_place_row(const PaxGroup& group,
                        const std::vector<ColumnContext>& scan_columns,
                        uint32_t slot, DataChunk& output, idx_t out_row,
                        std::vector<InvalidDate>* invalid_dates) {
-  const std::string_view null_flags = group.cell(0, slot);
   for (idx_t i = 0; i < scan_columns.size(); i++) {
     const ColumnContext& column = scan_columns[i];
     FlatVector::SetNull(output.data[i], out_row, false);
     if (column.type == FieldType::kUntyped) {
-      unpack_untyped_cell(group, column.field, slot,
-                          cell_is_null(null_flags, column), output.data[i],
-                          out_row);
+      unpack_untyped_run(group, column, slot, 1, output.data[i], out_row);
     } else {
       unpack_typed_run(column.type, group, column.field, column.width, slot, 1,
                        output.data[i], out_row, column.decimal_physical_type,
@@ -1255,11 +1262,8 @@ void pax_scan(ClientContext&, TableFunctionInput& data, DataChunk& output) {
       for (idx_t i = 0; i < scan_columns.size(); i++) {
         const ColumnContext& column = scan_columns[i];
         if (column.type == FieldType::kUntyped) {
-          for (uint32_t row = 0; row < run_length; row++) {
-            unpack_untyped_cell(*group, column.field, slot + row,
-                              cell_is_null(group->cell(0, slot + row), column),
-                                output.data[i], rows_emitted + row);
-          }
+          unpack_untyped_run(*group, column, slot, run_length, output.data[i],
+                             rows_emitted);
         } else {
           unpack_typed_run(column.type, *group, column.field, column.width, slot,
                            run_length, output.data[i], rows_emitted,
