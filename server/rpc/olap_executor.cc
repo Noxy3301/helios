@@ -603,9 +603,48 @@ inline date_t canonical_date(int32_t year, int32_t month, int32_t day) {
 }
 
 /**
+ * @brief The day number of January 1 of years 0 to 10000, whose differences
+ * give each year's length, and the 0-based day of year of each MMDD in a
+ * common year ([0]) and a leap year ([1]), -1 for no day.
+ */
+struct DateTables {
+  DateTables() {
+    date_t date;
+    for (int32_t year = 0; year <= 10000; year++) {
+      try_canonical_date(year, 1, 1, &date);
+      year_start[year] = date.days;
+    }
+    for (int32_t leap = 0; leap < 2; leap++) {
+      const int32_t year = 2001 - leap;
+      for (int32_t md = 0; md < 1232; md++) {
+        day_of_year[leap][md] = -1;
+        if (try_canonical_date(year, md / 100, md % 100, &date)) {
+          day_of_year[leap][md] = date.days - year_start[year];
+        }
+      }
+    }
+  }
+
+  int32_t year_start[10001];
+  int16_t day_of_year[2][1232];
+};
+
+const DateTables kDateTables;
+
+/**
  * @brief Converts a YYYYMMDD integer into a date, false for a missing day.
  */
 inline bool ymd_to_date(int64_t ymd, date_t* out) {
+  if (ymd >= 0 && ymd < 100000000) {
+    const uint32_t year = static_cast<uint32_t>(ymd) / 10000;
+    const uint32_t md = static_cast<uint32_t>(ymd) - year * 10000;
+    const int32_t start = kDateTables.year_start[year];
+    const int32_t leap = kDateTables.year_start[year + 1] - start - 365;
+    if (md < 1232 && kDateTables.day_of_year[leap][md] >= 0) {
+      *out = date_t(start + kDateTables.day_of_year[leap][md]);
+      return true;
+    }
+  }
   return try_canonical_date(static_cast<int32_t>(ymd / 10000),
                             static_cast<int32_t>((ymd / 100) % 100),
                             static_cast<int32_t>(ymd % 100), out);
