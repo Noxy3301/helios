@@ -47,7 +47,7 @@ constexpr char kMysqlAiCiNotLike[] = "mysql_utf8mb4_0900_ai_ci_not_like";
 constexpr char kMysqlAiCiSortKey[] = "mysql_utf8mb4_0900_ai_ci_sort_key";
 
 // MySQL collation ids whose comparison the executor implements: 255 through
-// the registered strnxfrm collation, 309/63 as byte comparison.
+// the registered sort-key collation, 309/63 as byte comparison.
 bool CollationIsByteSafe(uint32_t id) { return id == 309 || id == 63; }
 bool CollationIsAiCi(uint32_t id) { return id == 255; }
 
@@ -771,9 +771,9 @@ unique_ptr<ParsedExpression> BuildExpr(Builder& b, const Resolved::Expr& expr) {
             auto pattern = BuildExpr(b, like.pattern());
             if (pattern == nullptr) return nullptr;
             if (CollationIsAiCi(like.collation_id())) {
-                // The registered function evaluates my_wildcmp under the
-                // real MySQL collation, so escape and multibyte semantics
-                // are MySQL's own.
+                // The registered function evaluates MySQL's LIKE under
+                // utf8mb4_0900_ai_ci, escape and multibyte semantics
+                // included.
                 duckdb::vector<unique_ptr<ParsedExpression>> args;
                 args.push_back(std::move(value));
                 args.push_back(std::move(pattern));

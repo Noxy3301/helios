@@ -1,0 +1,154 @@
+#!/usr/bin/env python3
+
+# Writes server/rpc/uca900_primary.hh, the UCA 9.0.0 primary weights of every
+# DUCET code point, from allkeys-9.0.0.txt
+# (https://www.unicode.org/Public/UCA/9.0.0/allkeys.txt).
+# Usage: scripts/gen_uca900.py allkeys-9.0.0.txt > server/rpc/uca900_primary.hh
+
+import re
+import sys
+
+PAGE_BITS = 8
+PAGE_SIZE = 1 << PAGE_BITS
+MAX_WEIGHTS = 8  # utf8mb4_0900_ai_ci keeps the first 8 weights of a code point
+IGNORABLE = 0
+ABSENT = 1
+EXPANSION = 0x8000
+
+# The notice quotes Unicode-DFS-2016 as the SPDX License List gives it, from
+# the title and the copyright and permission notice on.
+NOTICE = """\
+The tables in this file are a modified copy of allkeys-9.0.0.txt, a Unicode
+Data File, and are covered by the following copyright and permission notice.
+
+UNICODE, INC. LICENSE AGREEMENT - DATA FILES AND SOFTWARE
+
+COPYRIGHT AND PERMISSION NOTICE
+
+Copyright © 1991-2016 Unicode, Inc. All rights reserved. Distributed under
+the Terms of Use in http://www.unicode.org/copyright.html.
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of the Unicode data files and any associated documentation (the "Data
+Files") or Unicode software and any associated documentation (the
+"Software") to deal in the Data Files or Software without restriction,
+including without limitation the rights to use, copy, modify, merge,
+publish, distribute, and/or sell copies of the Data Files or Software, and
+to permit persons to whom the Data Files or Software are furnished to do so,
+provided that either
+
+     (a) this copyright and permission notice appear with all copies of the
+         Data Files or Software, or
+     (b) this copyright and permission notice appear in associated
+         Documentation.
+
+THE DATA FILES AND SOFTWARE ARE PROVIDED "AS IS", WITHOUT WARRANTY OF ANY
+KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT OF
+THIRD PARTY RIGHTS. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR HOLDERS
+INCLUDED IN THIS NOTICE BE LIABLE FOR ANY CLAIM, OR ANY SPECIAL INDIRECT OR
+CONSEQUENTIAL DAMAGES, OR ANY DAMAGES WHATSOEVER RESULTING FROM LOSS OF USE,
+DATA OR PROFITS, WHETHER IN AN ACTION OF CONTRACT, NEGLIGENCE OR OTHER
+TORTIOUS ACTION, ARISING OUT OF OR IN CONNECTION WITH THE USE OR PERFORMANCE
+OF THE DATA FILES OR SOFTWARE.
+
+Except as contained in this notice, the name of a copyright holder shall not
+be used in advertising or otherwise to promote the sale, use or other
+dealings in these Data Files or Software without prior written authorization
+of the copyright holder.
+"""
+
+
+def emit(name, ctype, values, out):
+    out.write("constexpr %s %s[%d] = {\n" % (ctype, name, len(values)))
+    line = " "
+    for v in values:
+        item = " %d," % v
+        if len(line) + len(item) > 80:
+            out.write(line + "\n")
+            line = " "
+        line += item
+    out.write(line + "\n};\n")
+
+
+def main():
+    weights = {}
+    copyright_line = None
+    for line in open(sys.argv[1], encoding="utf-8"):
+        if copyright_line is None and line.startswith("# Copyright"):
+            copyright_line = line[2:].strip()
+        line = line.split("#")[0].strip()
+        if not line or line.startswith("@"):
+            continue
+        cps, elements = line.split(";")
+        cps = cps.split()
+        # utf8mb4_0900_ai_ci applies no contractions.
+        if len(cps) != 1:
+            continue
+        primaries = [int(p, 16) for p in
+                     re.findall(r"\[[.*]([0-9A-F]{4})\.", elements)]
+        weights[int(cps[0], 16)] = [p for p in primaries if p][:MAX_WEIGHTS]
+
+    expansions = []
+    expansion_off = {}
+    pages = {(ABSENT,) * PAGE_SIZE: 0}
+    index = []
+    for first in range(0, max(weights) + 1, PAGE_SIZE):
+        page = []
+        for cp in range(first, first + PAGE_SIZE):
+            w = weights.get(cp)
+            if w is None:
+                page.append(ABSENT)
+            elif not w:
+                page.append(IGNORABLE)
+            elif len(w) == 1 and w[0] < EXPANSION:
+                page.append(w[0])
+            else:
+                w = tuple(w)
+                if w not in expansion_off:
+                    expansion_off[w] = len(expansions)
+                    expansions += [len(w)] + list(w)
+                page.append(EXPANSION | expansion_off[w])
+        page = tuple(page)
+        if page not in pages:
+            pages[page] = len(pages)
+        index.append(pages[page])
+    assert len(pages) <= 256 and len(expansions) <= 0x8000
+    assert min(w for v in weights.values() for w in v) > ABSENT
+    # collation.cc weighs a Hangul syllable as one weight per jamo.
+    jamo = [*range(0x1100, 0x1114), *range(0x1161, 0x1176),
+            *range(0x11A8, 0x11C3)]
+    assert all(len(weights[c]) == 1 and weights[c][0] < EXPANSION for c in jamo)
+
+    out = sys.stdout
+    out.write("// Generated by scripts/gen_uca900.py from allkeys-9.0.0.txt\n"
+              "// (DUCET, UCA 9.0.0). %s\n//\n" % copyright_line)
+    for line in NOTICE.splitlines():
+        out.write(("// " + line).rstrip() + "\n")
+    out.write("""
+#ifndef HELIOS_SERVER_RPC_UCA900_PRIMARY_H
+#define HELIOS_SERVER_RPC_UCA900_PRIMARY_H
+
+#include <cstdint>
+
+namespace collation {
+
+constexpr int kUcaPageBits = %d;
+constexpr uint32_t kUcaEnd = 0x%X;
+// kUcaPages values: kIgnorable for no primary weight, kAbsent for no DUCET
+// entry, kExpansion | offset into kUcaExpansions ([count, weights...]), or
+// else the one weight. A block without DUCET entries maps to page 0.
+constexpr uint16_t kIgnorable = %d;
+constexpr uint16_t kAbsent = %d;
+constexpr uint16_t kExpansion = 0x%X;
+constexpr int kMaxWeights = %d;
+""" % (PAGE_BITS, len(index) * PAGE_SIZE, IGNORABLE, ABSENT, EXPANSION,
+       MAX_WEIGHTS))
+    emit("kUcaPageIndex", "uint8_t", index, out)
+    emit("kUcaPages", "uint16_t", [v for page in pages for v in page], out)
+    emit("kUcaExpansions", "uint16_t", expansions, out)
+    out.write("\n}  // namespace collation\n\n"
+              "#endif  // HELIOS_SERVER_RPC_UCA900_PRIMARY_H\n")
+
+
+main()

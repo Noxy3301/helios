@@ -32,8 +32,7 @@
 #include <spdlog/spdlog.h>
 
 #include "../server_config.hh"
-#include "../mysql_charset_runtime.hh"
-#include "m_ctype.h"
+#include "server/rpc/collation.hh"
 
 #include "helios/database.h"
 #include "helios/pax.h"
@@ -1382,8 +1381,6 @@ duckdb::DuckDB& global_runtime() {
   return runtime;
 }
 
-// MySQL's collation number for utf8mb4_0900_ai_ci, as the wire IR carries it.
-constexpr uint32_t kUtf8mb40900AiCiCollationId = 255;
 // Name the collation is registered under inside DuckDB (COLLATE targets it).
 constexpr const char* kUtf8mb40900AiCiDuckdbName = "utf8mb4_0900_ai_ci";
 // DuckDB scalar functions implementing MySQL LIKE / NOT LIKE under this
@@ -1398,63 +1395,31 @@ constexpr const char* kUtf8mb40900AiCiNotLikeFunction =
  *
  * @details DuckDB implements a collation by replacing the collated VARCHAR
  * with this scalar's byte-comparable result wherever comparison, ordering,
- * grouping, or ordinary DISTINCT needs a key. Returning BLOB keeps MySQL's
- * raw strnxfrm bytes instead of hex-encoding them to twice their size.
+ * grouping, or ordinary DISTINCT needs a key. Returning BLOB keeps the raw
+ * sort key bytes instead of hex-encoding them to twice their size.
  */
 void utf8mb4_0900_ai_ci_sort_key(duckdb::DataChunk& args,
                                  duckdb::ExpressionState&,
                                  duckdb::Vector& result) {
-  const CHARSET_INFO* collation =
-      mysql_charset_runtime::initialize(nullptr).utf8mb4_0900_ai_ci;
-  if (collation == nullptr ||
-      collation->number != kUtf8mb40900AiCiCollationId ||
-      collation->pad_attribute != NO_PAD) {
-    throw std::runtime_error(
-        "utf8mb4_0900_ai_ci collation runtime is not ready or is not NO PAD");
-  }
-
-  // Contract: the key bytes are what a direct strnxfrm call produces under
-  // this CHARSET_INFO with these flags. Memoization and the exact-size
-  // reservation change only how often it runs and how much heap it takes.
-  // The collated columns of an analytical scan have few distinct values, so
-  // one map per call collapses a chunk to that many strnxfrm calls.
-  //
-  // The map owns its key bytes: an inlined string_t carries them inside the
+  // One map per call computes each distinct value's key once. The map keys on
+  // a std::string copy: an inlined string_t carries its bytes inside the
   // by-value argument, which dies with the call.
   std::unordered_map<std::string, duckdb::string_t> memo;
   static thread_local std::vector<unsigned char> scratch;
 
   duckdb::UnaryExecutor::Execute<duckdb::string_t, duckdb::string_t>(
       args.data[0], result, args.size(), [&](duckdb::string_t input) {
-        const size_t input_size = input.GetSize();
-        std::string value(input.GetData(), input_size);
+        std::string value(input.GetData(), input.GetSize());
         const auto hit = memo.find(value);
         if (hit != memo.end()) return hit->second;
-        if (input_size > SIZE_MAX / collation->mbmaxlen) {
-          throw std::runtime_error(
-              "utf8mb4_0900_ai_ci sort key input is too large");
-        }
-        // strnxfrmlen requires a pessimistic byte count: utf8mb4's maximum
-        // bytes per codepoint times the maximum possible codepoint count.
-        const size_t pessimistic_bytes = input_size * collation->mbmaxlen;
-        const size_t capacity =
-            collation->coll->strnxfrmlen(collation, pessimistic_bytes);
-        if ((capacity & 1) != 0 ||
-            capacity > duckdb::string_t::MAX_STRING_SIZE) {
+        const size_t capacity = value.size() * collation::kKeyBytesPerByte;
+        if (scratch.size() < capacity) scratch.resize(capacity);
+        const size_t key_size =
+            collation::utf8mb4_0900_ai_ci_key(value, scratch.data());
+        if (key_size > duckdb::string_t::MAX_STRING_SIZE) {
           throw std::runtime_error(
               "utf8mb4_0900_ai_ci sort key is too large for DuckDB");
         }
-        if (scratch.size() < capacity) scratch.resize(capacity);
-        const size_t key_size = collation->coll->strnxfrm(
-            collation, scratch.data(), capacity, /*num_codepoints=*/0,
-            reinterpret_cast<const uchar*>(input.GetData()), input_size,
-            /*flags=*/0);
-        if (key_size > capacity || key_size > UINT32_MAX) {
-          throw std::runtime_error(
-              "utf8mb4_0900_ai_ci sort key exceeded its allocation");
-        }
-        // strnxfrm can use less than its worst-case bound, so the string heap
-        // takes the produced length, not the bound.
         const duckdb::string_t key = duckdb::StringVector::AddStringOrBlob(
             result, reinterpret_cast<const char*>(scratch.data()), key_size);
         memo.emplace(std::move(value), key);
@@ -1465,21 +1430,13 @@ void utf8mb4_0900_ai_ci_sort_key(duckdb::DataChunk& args,
 template <bool Negated>
 void utf8mb4_0900_ai_ci_like(duckdb::DataChunk& args, duckdb::ExpressionState&,
                              duckdb::Vector& result) {
-  const CHARSET_INFO* collation =
-      mysql_charset_runtime::initialize(nullptr).utf8mb4_0900_ai_ci;
-  if (collation == nullptr ||
-      collation->number != kUtf8mb40900AiCiCollationId) {
-    throw std::runtime_error("utf8mb4_0900_ai_ci LIKE runtime is not ready");
-  }
   duckdb::TernaryExecutor::Execute<duckdb::string_t, duckdb::string_t,
                                    int32_t, bool>(
       args.data[0], args.data[1], args.data[2], result, args.size(),
-      [&](duckdb::string_t text, duckdb::string_t pattern, int32_t escape) {
-        const int compared = my_wildcmp(
-            collation, text.GetData(), text.GetData() + text.GetSize(),
-            pattern.GetData(), pattern.GetData() + pattern.GetSize(), escape,
-            escape == '_' ? -1 : '_', escape == '%' ? -1 : '%');
-        const bool matched = compared == 0;
+      [](duckdb::string_t text, duckdb::string_t pattern, int32_t escape) {
+        const bool matched = collation::utf8mb4_0900_ai_ci_like(
+            std::string_view(text.GetData(), text.GetSize()),
+            std::string_view(pattern.GetData(), pattern.GetSize()), escape);
         return Negated ? !matched : matched;
       });
 }
