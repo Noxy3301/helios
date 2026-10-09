@@ -218,8 +218,7 @@ void HeliosRpc::handleTxExecuteReadPlan(
                                 if (step.index_name().empty()) {
                                   auto scan_result = db->Scan(
                                       step.table_name(), row_key, row_end,
-                                      step.scan_limit(), step.reverse_scan(),
-                                      nullptr);
+                                      step.scan_limit(), step.reverse_scan());
                                   if (!scan_result.ok) {
                                     failed[worker_index] = 1;
                                     break;
@@ -236,7 +235,7 @@ void HeliosRpc::handleTxExecuteReadPlan(
                                   auto scan_result = db->ScanIndex(
                                       step.table_name(), step.index_name(),
                                       row_key, row_end, step.scan_limit(),
-                                      step.reverse_scan(), nullptr);
+                                      step.reverse_scan());
                                   if (!scan_result.ok) {
                                     failed[worker_index] = 1;
                                     break;
@@ -259,7 +258,7 @@ void HeliosRpc::handleTxExecuteReadPlan(
                                                           visited_before));
                             } else {
                               auto read_result =
-                                  db->Read(step.table_name(), row_key, nullptr);
+                                  db->Read(step.table_name(), row_key);
                               out.keys.push_back(row_key);
                               out.tids.push_back(read_result.tid);
                               out.values.push_back(
@@ -328,7 +327,7 @@ void HeliosRpc::handleTxExecuteReadPlan(
                     if (step.index_name().empty()) {
                       auto scan_result = db_manager_->get_database()->Scan(
                           step.table_name(), row_key, row_end,
-                          step.scan_limit(), step.reverse_scan(), nullptr);
+                          step.scan_limit(), step.reverse_scan());
                       if (!scan_result.ok) {
                         response.set_ok(false);
                         flat_plan::pack(response, *result);
@@ -344,8 +343,7 @@ void HeliosRpc::handleTxExecuteReadPlan(
                     } else {
                       auto scan_result = db_manager_->get_database()->ScanIndex(
                           step.table_name(), step.index_name(), row_key,
-                          row_end, step.scan_limit(), step.reverse_scan(),
-                          nullptr);
+                          row_end, step.scan_limit(), step.reverse_scan());
                       if (!scan_result.ok) {
                         response.set_ok(false);
                         flat_plan::pack(response, *result);
@@ -371,7 +369,7 @@ void HeliosRpc::handleTxExecuteReadPlan(
                 }
 
                 auto read_result = db_manager_->get_database()->Read(
-                    step.table_name(), row_key, nullptr);
+                    step.table_name(), row_key);
                 step_result->add_scan_keys(row_key);
                 step_result->add_scan_tids(read_result.tid);
                 step_result->add_scan_values(
@@ -382,8 +380,8 @@ void HeliosRpc::handleTxExecuteReadPlan(
         }
 
         if (!step.is_scan()) {
-          auto read_result = db_manager_->get_database()->Read(
-              step.table_name(), start_key, nullptr);
+          auto read_result =
+              db_manager_->get_database()->Read(step.table_name(), start_key);
           step_result->set_actual_key(start_key);
           step_result->set_actual_start_key(start_key);
           step_result->set_found(read_result.found);
@@ -405,7 +403,7 @@ void HeliosRpc::handleTxExecuteReadPlan(
 
             auto scan_result = db_manager_->get_database()->Scan(
                 step.table_name(), start_key, end_key, step.scan_limit(),
-                step.reverse_scan(), nullptr);
+                step.reverse_scan());
             if (!scan_result.ok) {
                 response.set_ok(false);
                 flat_plan::pack(response, *result);
@@ -422,7 +420,7 @@ void HeliosRpc::handleTxExecuteReadPlan(
             step_result->set_actual_end_key(end_key);
             auto scan_result = db_manager_->get_database()->ScanIndex(
                 step.table_name(), step.index_name(), start_key, end_key,
-                step.scan_limit(), step.reverse_scan(), nullptr);
+                step.scan_limit(), step.reverse_scan());
             if (!scan_result.ok) {
                 response.set_ok(false);
                 flat_plan::pack(response, *result);

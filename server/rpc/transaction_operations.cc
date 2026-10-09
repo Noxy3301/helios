@@ -13,10 +13,6 @@
 
 namespace {
 
-// An empty column list gathers no data column, which is what keys_only asks
-// for; a null list would gather the whole row.
-const std::vector<uint32_t> kNoColumns;
-
 // Borrows a commit request's range records for silo::Transaction::RangeRead.
 std::vector<helios::storage::silo::Transaction::RangeRecord> range_records(
     const google::protobuf::RepeatedPtrField<Helios::Protocol::RangeRecord>&
@@ -68,15 +64,14 @@ void HeliosRpc::handleTxScan(
     Helios::Protocol::TxScan::Response* response) {
     auto scan = db_manager_->get_database()->Scan(
         request.table_name(), request.start_key(), request.end_key(),
-        request.row_limit(), request.reverse_scan(),
-        request.keys_only() ? &kNoColumns : nullptr);
+        request.row_limit(), request.reverse_scan(), request.keys_only());
 
     response->set_ok(scan.ok);
     for (auto& row : scan.rows) {
         auto* out = response->add_rows();
         out->set_key(std::move(row.key));
         out->set_tid(row.tid);
-        if (!request.keys_only()) out->set_value(std::move(row.value));
+        out->set_value(std::move(row.value));
     }
     add_visited(response, scan.visited);
 }
@@ -87,7 +82,7 @@ void HeliosRpc::handleTxScanIndex(
     auto scan = db_manager_->get_database()->ScanIndex(
         request.table_name(), request.index_name(), request.start_key(),
         request.end_key(), request.row_limit(), request.reverse_scan(),
-        request.keys_only() ? &kNoColumns : nullptr);
+        request.keys_only());
 
     response->set_ok(scan.ok);
     for (auto& row : scan.rows) {
@@ -95,7 +90,7 @@ void HeliosRpc::handleTxScanIndex(
         out->set_secondary_key(std::move(row.secondary_key));
         out->set_primary_key(std::move(row.primary_key));
         out->set_tid(row.tid);
-        if (!request.keys_only()) out->set_value(std::move(row.value));
+        out->set_value(std::move(row.value));
     }
     add_visited(response, scan.visited);
 }

@@ -219,23 +219,18 @@ class Database {
    *
    * @param table_name Target table.
    * @param key Primary key to look up.
-   * @param selected_columns Optional zero-based MySQL columns to gather
-   * for PAX-resident rows. Null selects the whole row; an empty list selects
-   * no data columns. Unselected PAX fields become empty markers; null flags
-   * remain in every result.
    * @return Result with `found` set when the key holds a live row. When the
    *         table does not exist, `found` is false and `tid` is 0.
    */
-  ReadResult Read(const std::string_view table_name, const std::string_view key,
-                  const std::vector<uint32_t> *selected_columns = nullptr);
+  ReadResult Read(const std::string_view table_name,
+                  const std::string_view key);
 
   /**
    * @brief Reads several rows in one call.
    *
    * Each `keys[i] = {table_name, key}` is resolved with the same protocol as
-   * Read, over the whole row: there is no column selection here. Reads do not
-   * share state, so this is purely a transport optimization on top of
-   * repeated Read calls.
+   * Read. Reads do not share state, so this is purely a transport
+   * optimization on top of repeated Read calls.
    *
    * @param keys (table_name, key) pairs to look up.
    * @return One ReadResult per input, in the same order.
@@ -257,18 +252,14 @@ class Database {
    * @param end_key   Exclusive end of the range. Must be non-empty.
    * @param row_limit Maximum rows to return. 0 means no cap.
    * @param reverse_scan When true, iterate from `end_key` toward `start_key`.
-   * @param selected_columns Optional zero-based MySQL columns to gather
-   * for PAX-resident rows. Null selects the whole row; an empty list selects
-   * no data columns. Unselected PAX fields become empty markers; null flags
-   * remain in every result.
+   * @param keys_only When true, each returned row has an empty value.
    * @return Result with `ok == false` if the table is missing or `end_key`
    *         is empty. Callers should treat `!ok` as an abort signal.
    */
   ScanResult Scan(const std::string_view table_name,
                   const std::string_view start_key,
                   const std::string_view end_key, uint64_t row_limit,
-                  bool reverse_scan,
-                  const std::vector<uint32_t> *selected_columns = nullptr);
+                  bool reverse_scan, bool keys_only = false);
 
   /**
    * @brief Range-scans a secondary index and resolves each hit to its base
@@ -293,17 +284,15 @@ class Database {
    * @param end_key Exclusive end of the secondary range. Must be non-empty.
    * @param row_limit Maximum rows to return. 0 means no cap.
    * @param reverse_scan When true, iterate in reverse key order.
-   * @param selected_columns Optional zero-based MySQL columns to gather
-   * for PAX-resident base rows, with the same null/empty rules as Read.
-   * Unselected PAX columns are returned as empty fields.
+   * @param keys_only When true, each returned row has an empty value.
    * @return Result with `ok == false` if the table or the index is missing,
    *         or `end_key` is empty.
    */
-  ScanIndexResult ScanIndex(
-      const std::string_view table_name, const std::string_view index_name,
-      const std::string_view start_key, const std::string_view end_key,
-      uint64_t row_limit, bool reverse_scan,
-      const std::vector<uint32_t> *selected_columns = nullptr);
+  ScanIndexResult ScanIndex(const std::string_view table_name,
+                            const std::string_view index_name,
+                            const std::string_view start_key,
+                            const std::string_view end_key, uint64_t row_limit,
+                            bool reverse_scan, bool keys_only = false);
 
   /**
    * @brief Range-scans the primary index and returns PAX cell references.
