@@ -568,11 +568,21 @@ struct InvalidDate {
  */
 inline bool try_canonical_date(int32_t year, int32_t month, int32_t day,
                                date_t* out) {
-  if (month < 1 || month > 12 || day < 1 || day > 31 ||
-      !duckdb::Date::TryFromDate(year, month, day, *out)) {
+  if (month < 1 || month > 12 || day < 1 ||
+      (day > duckdb::Date::NORMAL_DAYS[month] &&
+       !(month == 2 && day == 29 && year % 4 == 0 &&
+         (year % 100 != 0 || year % 400 == 0)))) {
     *out = date_t(0);
     return false;
   }
+
+  // days_from_civil: https://howardhinnant.github.io/date_algorithms.html
+  const int32_t y = year - (month <= 2);
+  const int32_t era = (y >= 0 ? y : y - 399) / 400;
+  const uint32_t yoe = y - era * 400;
+  const uint32_t doy = (153 * ((month + 9) % 12) + 2) / 5 + day - 1;
+  const uint32_t doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+  *out = date_t(era * 146097 + static_cast<int32_t>(doe) - 719468);
   return true;
 }
 
