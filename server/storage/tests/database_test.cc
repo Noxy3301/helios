@@ -109,7 +109,7 @@ TEST_F(DatabaseTest, FailedCommitLeavesItsEpoch) {
   const std::vector<TestHelper::RowWrite> writes = {
       {kTable, "new", TestHelper::Row("value")}};
   auto check_epoch_released = [&] {
-    const auto view = db_->OpenPaxView(1000);
+    const auto view = db_->OpenPaxView(1000, CommitDurability::kAsync);
     EXPECT_TRUE(view.valid) << view.error;
     db_->ClosePaxView(view);
   };

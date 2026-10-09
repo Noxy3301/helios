@@ -28,7 +28,8 @@ pax::PaxTable *Database::GetPaxTable(const std::string_view table_name) {
   return table == nullptr ? nullptr : table->GetPaxTable();
 }
 
-Database::PaxReadView Database::OpenPaxView(uint32_t fence_timeout_ms) {
+Database::PaxReadView Database::OpenPaxView(uint32_t fence_timeout_ms,
+                                            CommitDurability durability) {
   Database::PaxReadView view;
   auto &image_buffer = pax::EpochImageBuffer::Global();
   // Open registers the view and samples `E` as snapshot `se` under the
@@ -45,13 +46,25 @@ Database::PaxReadView Database::OpenPaxView(uint32_t fence_timeout_ms) {
         "high-water mark, restart the server";
     return view;
   }
-  if (!epoch_framework_.WaitEpoch(
-          snapshot_epoch + kInstallDrainEpochs,
-          std::chrono::milliseconds(fence_timeout_ms))) {
+  const auto deadline = std::chrono::steady_clock::now() +
+                        std::chrono::milliseconds(fence_timeout_ms);
+  if (!epoch_framework_.WaitEpochUntil(snapshot_epoch + kInstallDrainEpochs,
+                                       deadline)) {
     image_buffer.Close(snapshot_epoch);
     view.error =
         "read view fence timed out; a long-running transaction is "
         "holding the epoch";
+    return view;
+  }
+  // Reaching `E >= se + 2` makes the epoch hook request the flush of `se`
+  // without waiting for it. Under Sync the view also waits for `D >= se`,
+  // within the same deadline.
+  if (durability == CommitDurability::kSync &&
+      logger_.WaitUntilDurable(snapshot_epoch, deadline) !=
+          wal::Logger::WaitResult::kDurable) {
+    image_buffer.Close(snapshot_epoch);
+    view.error =
+        "read view rejected: the snapshot epoch did not become durable";
     return view;
   }
   HELIOS_DEBUG_SYNC("pax_view.after_fence");

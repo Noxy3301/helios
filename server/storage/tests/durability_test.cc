@@ -18,13 +18,14 @@
 
 /**
  * @file server/storage/tests/durability_test.cc
- * Recovery from the log, and the difference the commit durability makes to
- * when a write is on the device.
+ * Recovery from the WAL, and the difference the commit durability makes to
+ * when a commit or a read view returns.
  */
 
 #include <chrono>
 #include <filesystem>
 #include <fstream>
+#include <future>
 #include <iterator>
 #include <memory>
 #include <string>
@@ -34,6 +35,7 @@
 
 #include "db_helper.h"
 #include "gtest/gtest.h"
+#include "sync_point.h"
 #include "util/spdlog.h"
 
 namespace {
@@ -45,6 +47,12 @@ bool logged(const std::string &work_dir, const std::string &key) {
                           std::istreambuf_iterator<char>());
   return bytes.find(key) != std::string::npos;
 }
+
+// The Debug Sync facility decides at its first point whether anything is
+// armed, and every case of this binary flushes the WAL, so the sentinel is set
+// at static initialization, before any case runs.
+[[maybe_unused]] const bool kSyncFacilityArmed =
+    (keep_sync_facility_armed(), true);
 }  // namespace
 
 class DurabilityTest : public ::testing::Test {
@@ -138,8 +146,8 @@ TEST_F(DurabilityTest, RecoveryWithNamedTable) {
 }
 
 // With an epoch timer far slower than the test, only a commit's own request
-// closes an epoch: an Async commit makes none and leaves its record out of the
-// log, and a Sync commit makes one and returns promptly with its record logged.
+// closes an epoch: an Async commit makes none, a read-only Sync commit returns
+// after the write it read is logged, and a Sync write returns promptly logged.
 TEST(CommitDurabilityTest, SyncCommitClosesItsOwnEpoch) {
   constexpr size_t kEpochMs = 10000;
   constexpr long kPromptMs = 100;
@@ -172,6 +180,16 @@ TEST(CommitDurabilityTest, SyncCommitClosesItsOwnEpoch) {
     EXPECT_FALSE(logged(config.work_dir, "lazy_key"))
         << "an Async commit closed its epoch";
 
+    const uint64_t lazy_tid = db.Read(kTable, "lazy_key").tid;
+    db.ReleaseThreadEpoch();
+    std::string read_reason;
+    EXPECT_TRUE(TestHelper::CommitRows(
+        db, {{kTable, "lazy_key", lazy_tid}}, {}, {}, {}, read_reason,
+        helios::storage::CommitDurability::kSync))
+        << read_reason;
+    EXPECT_TRUE(logged(config.work_dir, "lazy_key"))
+        << "a read-only Sync commit returned before the write it read";
+
     EXPECT_LT(commit("durable_key", helios::storage::CommitDurability::kSync),
               kPromptMs)
         << "a Sync commit waited for the epoch timer";
@@ -179,5 +197,46 @@ TEST(CommitDurabilityTest, SyncCommitClosesItsOwnEpoch) {
         << "a Sync commit returned before its record was logged";
   }
   // After the database is destroyed: it holds the log open until then.
+  std::filesystem::remove_all(config.work_dir);
+}
+
+// With the WAL flush of the snapshot epoch held before fdatasync, a Sync read
+// view does not return until the flush completes.
+TEST(CommitDurabilityTest, SyncReadViewWaitsForTheSnapshotEpoch) {
+  helios::storage::Config config;
+  config.work_dir = "./helios_read_view_durability_test_logs";
+  std::filesystem::remove_all(config.work_dir);
+  config.enable_recovery = false;
+  config.epoch_duration_ms = 10000;
+  config.wal_initial_capacity_bytes = 1u << 20;
+
+  {
+    helios::storage::Database db(config);
+    ASSERT_TRUE(TestHelper::CreateTable(db, kTable));
+    std::string commit_reason;
+    ASSERT_TRUE(TestHelper::CommitRows(
+        db, {}, {{kTable, "key", TestHelper::Row("v")}}, {}, {}, commit_reason,
+        helios::storage::CommitDurability::kAsync));
+
+    Pipe arrived;
+    Pipe release;
+    ArmedSyncPoints points;
+    points.arm("HELIOS_DEBUG_SYNC_WAL_BEFORE_FDATASYNC",
+               "arrive_and_wait:" + std::to_string(arrived.write_fd()) + ":" +
+                   std::to_string(release.read_fd()));
+    auto view = std::async(std::launch::async, [&db] {
+      return db.OpenPaxView(5000, helios::storage::CommitDurability::kSync);
+    });
+    ReleaseOnExit always_release{release.write_fd()};
+
+    ASSERT_TRUE(wait_readable(arrived.read_fd(), std::chrono::seconds(5)));
+    EXPECT_EQ(view.wait_for(std::chrono::milliseconds(200)),
+              std::future_status::timeout)
+        << "a Sync read view returned before its snapshot epoch was durable";
+    ASSERT_EQ(::write(release.write_fd(), "r", 1), 1);
+    const auto opened = view.get();
+    EXPECT_TRUE(opened.valid) << opened.error;
+    if (opened.valid) db.ClosePaxView(opened);
+  }
   std::filesystem::remove_all(config.work_dir);
 }

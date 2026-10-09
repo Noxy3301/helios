@@ -50,7 +50,7 @@ inline constexpr char kDuplicatePrimaryKeyAbortReason[] =
 inline constexpr char kDuplicateSecondaryKeyAbortPrefix[] = "unique_si_";
 
 /**
- * @brief Whether Commit waits for its record to reach stable storage.
+ * @brief Whether Commit waits for its commit epoch to become durable.
  * Carried per commit.
  *
  * The equivalent settings elsewhere, to keep Async from being read as a
@@ -215,9 +215,9 @@ class Transaction {
    * - Phase 3: install each record, append its WAL write, and publish its
    *   TID, which unlocks it.
    *
-   * The log record is enqueued before the worker leaves the epoch. A Sync
-   * commit then waits for that epoch to become durable, and only when a log
-   * record was enqueued: a read-only commit returns at once.
+   * A log record, if any, is enqueued before the worker leaves the epoch. A
+   * Sync commit, read-only or not, waits for its commit epoch to become
+   * durable.
    *
    * @param[out] reason Cleared on entry and empty on success. On abort, a
    * short label naming the failed check.
