@@ -66,8 +66,7 @@ ninja $1 -j `nproc`
 
 cd ..
 
-# Build server. It links the MySQL charset archives, which the MySQL build
-# above produces.
+# Build server
 echo "Building server (CMAKE_BUILD_TYPE=${SERVER_BUILD_TYPE})..."
 cd build/server
 cmake ../../server \

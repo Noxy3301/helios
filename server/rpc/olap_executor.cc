@@ -32,8 +32,7 @@
 #include <spdlog/spdlog.h>
 
 #include "../server_config.hh"
-#include "../mysql_charset_runtime.hh"
-#include "m_ctype.h"
+#include "server/rpc/collation.hh"
 
 #include "helios/database.h"
 #include "helios/pax.h"
@@ -568,11 +567,21 @@ struct InvalidDate {
  */
 inline bool try_canonical_date(int32_t year, int32_t month, int32_t day,
                                date_t* out) {
-  if (month < 1 || month > 12 || day < 1 || day > 31 ||
-      !duckdb::Date::TryFromDate(year, month, day, *out)) {
+  if (month < 1 || month > 12 || day < 1 ||
+      (day > duckdb::Date::NORMAL_DAYS[month] &&
+       !(month == 2 && day == 29 && year % 4 == 0 &&
+         (year % 100 != 0 || year % 400 == 0)))) {
     *out = date_t(0);
     return false;
   }
+
+  // days_from_civil: https://howardhinnant.github.io/date_algorithms.html
+  const int32_t y = year - (month <= 2);
+  const int32_t era = (y >= 0 ? y : y - 399) / 400;
+  const uint32_t yoe = y - era * 400;
+  const uint32_t doy = (153 * ((month + 9) % 12) + 2) / 5 + day - 1;
+  const uint32_t doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+  *out = date_t(era * 146097 + static_cast<int32_t>(doe) - 719468);
   return true;
 }
 
@@ -593,9 +602,48 @@ inline date_t canonical_date(int32_t year, int32_t month, int32_t day) {
 }
 
 /**
+ * @brief The day number of January 1 of years 0 to 10000, whose differences
+ * give each year's length, and the 0-based day of year of each MMDD in a
+ * common year ([0]) and a leap year ([1]), -1 for no day.
+ */
+struct DateTables {
+  DateTables() {
+    date_t date;
+    for (int32_t year = 0; year <= 10000; year++) {
+      try_canonical_date(year, 1, 1, &date);
+      year_start[year] = date.days;
+    }
+    for (int32_t leap = 0; leap < 2; leap++) {
+      const int32_t year = 2001 - leap;
+      for (int32_t md = 0; md < 1232; md++) {
+        day_of_year[leap][md] = -1;
+        if (try_canonical_date(year, md / 100, md % 100, &date)) {
+          day_of_year[leap][md] = date.days - year_start[year];
+        }
+      }
+    }
+  }
+
+  int32_t year_start[10001];
+  int16_t day_of_year[2][1232];
+};
+
+const DateTables kDateTables;
+
+/**
  * @brief Converts a YYYYMMDD integer into a date, false for a missing day.
  */
 inline bool ymd_to_date(int64_t ymd, date_t* out) {
+  if (ymd >= 0 && ymd < 100000000) {
+    const uint32_t year = static_cast<uint32_t>(ymd) / 10000;
+    const uint32_t md = static_cast<uint32_t>(ymd) - year * 10000;
+    const int32_t start = kDateTables.year_start[year];
+    const int32_t leap = kDateTables.year_start[year + 1] - start - 365;
+    if (md < 1232 && kDateTables.day_of_year[leap][md] >= 0) {
+      *out = date_t(start + kDateTables.day_of_year[leap][md]);
+      return true;
+    }
+  }
   return try_canonical_date(static_cast<int32_t>(ymd / 10000),
                             static_cast<int32_t>((ymd / 100) % 100),
                             static_cast<int32_t>(ymd % 100), out);
@@ -823,32 +871,6 @@ void unpack_typed_run(FieldType type, const PaxGroup& group, size_t field,
 }
 
 /**
- * @brief Unpacks one untyped cell into a VARCHAR vector slot.
- *
- * @details A zero-length cell is SQL NULL only when the row's null-flags
- * field marks the column so, and the empty string otherwise; short payloads
- * inline into string_t, longer ones copy into the vector's string heap.
- */
-inline void unpack_untyped_cell(const PaxGroup& group, size_t field,
-                                uint32_t slot, bool is_null,
-                                Vector& output_vector, idx_t out_row) {
-  if (is_null) {
-    FlatVector::SetNull(output_vector, out_row, true);
-    return;
-  }
-  const std::string_view cell_value = group.cell(field, slot);
-  if (cell_value.size() <= duckdb::string_t::INLINE_LENGTH) {
-    FlatVector::GetData<duckdb::string_t>(output_vector)[out_row] =
-        duckdb::string_t(cell_value.data(),
-                         static_cast<uint32_t>(cell_value.size()));
-  } else {
-    FlatVector::GetData<duckdb::string_t>(output_vector)[out_row] =
-        StringVector::AddString(output_vector, cell_value.data(),
-                                cell_value.size());
-  }
-}
-
-/**
  * @brief Projection context for one scanned column.
  */
 struct ColumnContext {
@@ -872,6 +894,42 @@ inline bool cell_is_null(std::string_view null_flags,
 }
 
 /**
+ * @brief Unpacks one UNTYPED column across `count` consecutive slots.
+ *
+ * @details A cell is SQL NULL only when the row's null-flags field marks the
+ * column so, and a zero-length cell is the empty string. A length past the
+ * field's maximum reads as empty, as in PaxGroup::cell.
+ */
+void unpack_untyped_run(const PaxGroup& group, const ColumnContext& column,
+                        uint32_t slot_start, uint32_t count,
+                        Vector& output_vector, idx_t out_base) {
+  const uint32_t stride = group.stride(column.field);
+  const uint32_t max_length = group.schema().field_max_bytes[column.field];
+  const std::byte* src =
+      group.strip(column.field) + static_cast<size_t>(stride) * slot_start;
+  duckdb::string_t* dst =
+      FlatVector::GetData<duckdb::string_t>(output_vector) + out_base;
+
+  for (uint32_t i = 0; i < count; i++, src += stride) {
+    if (column.null_mask != 0 &&
+        cell_is_null(group.cell(0, slot_start + i), column)) {
+      FlatVector::SetNull(output_vector, out_base + i, true);
+      continue;
+    }
+    uint16_t length;
+    std::memcpy(&length, src, sizeof(length));
+    if (length > max_length) length = 0;
+    const char* data =
+        reinterpret_cast<const char*>(src + PaxGroup::kCellLenBytes);
+    if (length <= duckdb::string_t::INLINE_LENGTH) {
+      dst[i] = duckdb::string_t(data, length);
+    } else {
+      dst[i] = StringVector::AddString(output_vector, data, length);
+    }
+  }
+}
+
+/**
  * @brief Unpacks one slot's projected columns from the strip cells into
  * chunk row `out_row`.
  *
@@ -883,14 +941,11 @@ void emit_in_place_row(const PaxGroup& group,
                        const std::vector<ColumnContext>& scan_columns,
                        uint32_t slot, DataChunk& output, idx_t out_row,
                        std::vector<InvalidDate>* invalid_dates) {
-  const std::string_view null_flags = group.cell(0, slot);
   for (idx_t i = 0; i < scan_columns.size(); i++) {
     const ColumnContext& column = scan_columns[i];
     FlatVector::SetNull(output.data[i], out_row, false);
     if (column.type == FieldType::kUntyped) {
-      unpack_untyped_cell(group, column.field, slot,
-                          cell_is_null(null_flags, column), output.data[i],
-                          out_row);
+      unpack_untyped_run(group, column, slot, 1, output.data[i], out_row);
     } else {
       unpack_typed_run(column.type, group, column.field, column.width, slot, 1,
                        output.data[i], out_row, column.decimal_physical_type,
@@ -1206,11 +1261,8 @@ void pax_scan(ClientContext&, TableFunctionInput& data, DataChunk& output) {
       for (idx_t i = 0; i < scan_columns.size(); i++) {
         const ColumnContext& column = scan_columns[i];
         if (column.type == FieldType::kUntyped) {
-          for (uint32_t row = 0; row < run_length; row++) {
-            unpack_untyped_cell(*group, column.field, slot + row,
-                              cell_is_null(group->cell(0, slot + row), column),
-                                output.data[i], rows_emitted + row);
-          }
+          unpack_untyped_run(*group, column, slot, run_length, output.data[i],
+                             rows_emitted);
         } else {
           unpack_typed_run(column.type, *group, column.field, column.width, slot,
                            run_length, output.data[i], rows_emitted,
@@ -1329,79 +1381,39 @@ duckdb::DuckDB& global_runtime() {
   return runtime;
 }
 
-// MySQL's collation number for utf8mb4_0900_ai_ci, as the wire IR carries it.
-constexpr uint32_t kUtf8mb40900AiCiCollationId = 255;
 // Name the collation is registered under inside DuckDB (COLLATE targets it).
 constexpr const char* kUtf8mb40900AiCiDuckdbName = "utf8mb4_0900_ai_ci";
-// DuckDB scalar functions implementing MySQL LIKE / NOT LIKE under this
-// collation; the AST builder emits calls to them by these names.
-constexpr const char* kUtf8mb40900AiCiLikeFunction =
-    "mysql_utf8mb4_0900_ai_ci_like";
-constexpr const char* kUtf8mb40900AiCiNotLikeFunction =
-    "mysql_utf8mb4_0900_ai_ci_not_like";
 
 /**
  * @brief DuckDB collation scalar for MySQL utf8mb4_0900_ai_ci.
  *
  * @details DuckDB implements a collation by replacing the collated VARCHAR
  * with this scalar's byte-comparable result wherever comparison, ordering,
- * grouping, or ordinary DISTINCT needs a key. Returning BLOB keeps MySQL's
- * raw strnxfrm bytes instead of hex-encoding them to twice their size.
+ * grouping, or ordinary DISTINCT needs a key. Returning BLOB keeps the raw
+ * sort key bytes instead of hex-encoding them to twice their size.
  */
 void utf8mb4_0900_ai_ci_sort_key(duckdb::DataChunk& args,
                                  duckdb::ExpressionState&,
                                  duckdb::Vector& result) {
-  const CHARSET_INFO* collation =
-      mysql_charset_runtime::initialize(nullptr).utf8mb4_0900_ai_ci;
-  if (collation == nullptr ||
-      collation->number != kUtf8mb40900AiCiCollationId ||
-      collation->pad_attribute != NO_PAD) {
-    throw std::runtime_error(
-        "utf8mb4_0900_ai_ci collation runtime is not ready or is not NO PAD");
-  }
-
-  // Contract: the key bytes are what a direct strnxfrm call produces under
-  // this CHARSET_INFO with these flags. Memoization and the exact-size
-  // reservation change only how often it runs and how much heap it takes.
-  // The collated columns of an analytical scan have few distinct values, so
-  // one map per call collapses a chunk to that many strnxfrm calls.
-  //
-  // The map owns its key bytes: an inlined string_t carries them inside the
+  // One map per call computes each distinct value's key once. The map keys on
+  // a std::string copy: an inlined string_t carries its bytes inside the
   // by-value argument, which dies with the call.
   std::unordered_map<std::string, duckdb::string_t> memo;
   static thread_local std::vector<unsigned char> scratch;
 
   duckdb::UnaryExecutor::Execute<duckdb::string_t, duckdb::string_t>(
       args.data[0], result, args.size(), [&](duckdb::string_t input) {
-        const size_t input_size = input.GetSize();
-        std::string value(input.GetData(), input_size);
+        std::string value(input.GetData(), input.GetSize());
         const auto hit = memo.find(value);
         if (hit != memo.end()) return hit->second;
-        if (input_size > SIZE_MAX / collation->mbmaxlen) {
-          throw std::runtime_error(
-              "utf8mb4_0900_ai_ci sort key input is too large");
-        }
-        // strnxfrmlen requires a pessimistic byte count: utf8mb4's maximum
-        // bytes per codepoint times the maximum possible codepoint count.
-        const size_t pessimistic_bytes = input_size * collation->mbmaxlen;
-        const size_t capacity =
-            collation->coll->strnxfrmlen(collation, pessimistic_bytes);
-        if ((capacity & 1) != 0 ||
-            capacity > duckdb::string_t::MAX_STRING_SIZE) {
+        const size_t capacity = value.size() * collation::kKeyBytesPerByte;
+        if (scratch.size() < capacity) scratch.resize(capacity);
+        const size_t key_size =
+            collation::utf8mb4_0900_ai_ci_key(value, scratch.data());
+        if (key_size > duckdb::string_t::MAX_STRING_SIZE) {
           throw std::runtime_error(
               "utf8mb4_0900_ai_ci sort key is too large for DuckDB");
         }
-        if (scratch.size() < capacity) scratch.resize(capacity);
-        const size_t key_size = collation->coll->strnxfrm(
-            collation, scratch.data(), capacity, /*num_codepoints=*/0,
-            reinterpret_cast<const uchar*>(input.GetData()), input_size,
-            /*flags=*/0);
-        if (key_size > capacity || key_size > UINT32_MAX) {
-          throw std::runtime_error(
-              "utf8mb4_0900_ai_ci sort key exceeded its allocation");
-        }
-        // strnxfrm can use less than its worst-case bound, so the string heap
-        // takes the produced length, not the bound.
         const duckdb::string_t key = duckdb::StringVector::AddStringOrBlob(
             result, reinterpret_cast<const char*>(scratch.data()), key_size);
         memo.emplace(std::move(value), key);
@@ -1409,24 +1421,19 @@ void utf8mb4_0900_ai_ci_sort_key(duckdb::DataChunk& args,
       });
 }
 
-template <bool Negated>
-void utf8mb4_0900_ai_ci_like(duckdb::DataChunk& args, duckdb::ExpressionState&,
-                             duckdb::Vector& result) {
-  const CHARSET_INFO* collation =
-      mysql_charset_runtime::initialize(nullptr).utf8mb4_0900_ai_ci;
-  if (collation == nullptr ||
-      collation->number != kUtf8mb40900AiCiCollationId) {
-    throw std::runtime_error("utf8mb4_0900_ai_ci LIKE runtime is not ready");
-  }
+// MySQL LIKE (Negated: NOT LIKE) of (value, pattern, INTEGER escape) under
+// the collation Match implements.
+template <bool (*Match)(std::string_view, std::string_view, int), bool Negated>
+void mysql_like(duckdb::DataChunk& args, duckdb::ExpressionState&,
+                duckdb::Vector& result) {
   duckdb::TernaryExecutor::Execute<duckdb::string_t, duckdb::string_t,
                                    int32_t, bool>(
       args.data[0], args.data[1], args.data[2], result, args.size(),
-      [&](duckdb::string_t text, duckdb::string_t pattern, int32_t escape) {
-        const int compared = my_wildcmp(
-            collation, text.GetData(), text.GetData() + text.GetSize(),
-            pattern.GetData(), pattern.GetData() + pattern.GetSize(), escape,
-            escape == '_' ? -1 : '_', escape == '%' ? -1 : '%');
-        const bool matched = compared == 0;
+      [](duckdb::string_t text, duckdb::string_t pattern, int32_t escape) {
+        const bool matched =
+            Match(std::string_view(text.GetData(), text.GetSize()),
+                  std::string_view(pattern.GetData(), pattern.GetSize()),
+                  escape);
         return Negated ? !matched : matched;
       });
 }
@@ -1475,18 +1482,30 @@ void register_mysql_collation_runtime(Connection& connection) {
   const duckdb::vector<duckdb::LogicalType> arguments = {
       duckdb::LogicalType::VARCHAR, duckdb::LogicalType::VARCHAR,
       duckdb::LogicalType::INTEGER};
-  duckdb::ScalarFunction like(kUtf8mb40900AiCiLikeFunction, arguments,
-                              duckdb::LogicalType::BOOLEAN,
-                              utf8mb4_0900_ai_ci_like<false>);
-  duckdb::CreateScalarFunctionInfo like_info(std::move(like));
-  like_info.on_conflict = duckdb::OnCreateConflict::IGNORE_ON_CONFLICT;
-  connection.context->RegisterFunction(like_info);
-  duckdb::ScalarFunction not_like(kUtf8mb40900AiCiNotLikeFunction, arguments,
-                                  duckdb::LogicalType::BOOLEAN,
-                                  utf8mb4_0900_ai_ci_like<true>);
-  duckdb::CreateScalarFunctionInfo not_like_info(std::move(not_like));
-  not_like_info.on_conflict = duckdb::OnCreateConflict::IGNORE_ON_CONFLICT;
-  connection.context->RegisterFunction(not_like_info);
+  // MySQL LIKE / NOT LIKE per collation; the AST builder emits calls to them
+  // by these names.
+  const struct {
+    const char* name;
+    void (*fn)(duckdb::DataChunk&, duckdb::ExpressionState&, duckdb::Vector&);
+  } likes[] = {
+      {"mysql_utf8mb4_0900_ai_ci_like",
+       mysql_like<collation::utf8mb4_0900_ai_ci_like, false>},
+      {"mysql_utf8mb4_0900_ai_ci_not_like",
+       mysql_like<collation::utf8mb4_0900_ai_ci_like, true>},
+      {"mysql_utf8mb4_0900_bin_like",
+       mysql_like<collation::utf8mb4_0900_bin_like, false>},
+      {"mysql_utf8mb4_0900_bin_not_like",
+       mysql_like<collation::utf8mb4_0900_bin_like, true>},
+      {"mysql_binary_like", mysql_like<collation::binary_like, false>},
+      {"mysql_binary_not_like", mysql_like<collation::binary_like, true>},
+  };
+  for (const auto& like : likes) {
+    duckdb::ScalarFunction fn(like.name, arguments,
+                              duckdb::LogicalType::BOOLEAN, like.fn);
+    duckdb::CreateScalarFunctionInfo info(std::move(fn));
+    info.on_conflict = duckdb::OnCreateConflict::IGNORE_ON_CONFLICT;
+    connection.context->RegisterFunction(info);
+  }
 
   // Callable form of the sort key, for aggregate-DISTINCT deduplication
   // where DuckDB does not push a non-combinable collation into children.

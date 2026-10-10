@@ -44,10 +44,14 @@ constexpr char kPaxScanFunction[] = "helios_pax_scan";
 constexpr char kMysqlAiCiCollation[] = "utf8mb4_0900_ai_ci";
 constexpr char kMysqlAiCiLike[] = "mysql_utf8mb4_0900_ai_ci_like";
 constexpr char kMysqlAiCiNotLike[] = "mysql_utf8mb4_0900_ai_ci_not_like";
+constexpr char kMysqlBinLike[] = "mysql_utf8mb4_0900_bin_like";
+constexpr char kMysqlBinNotLike[] = "mysql_utf8mb4_0900_bin_not_like";
+constexpr char kMysqlBinaryLike[] = "mysql_binary_like";
+constexpr char kMysqlBinaryNotLike[] = "mysql_binary_not_like";
 constexpr char kMysqlAiCiSortKey[] = "mysql_utf8mb4_0900_ai_ci_sort_key";
 
 // MySQL collation ids whose comparison the executor implements: 255 through
-// the registered strnxfrm collation, 309/63 as byte comparison.
+// the registered sort-key collation, 309/63 as byte comparison.
 bool CollationIsByteSafe(uint32_t id) { return id == 309 || id == 63; }
 bool CollationIsAiCi(uint32_t id) { return id == 255; }
 
@@ -770,39 +774,35 @@ unique_ptr<ParsedExpression> BuildExpr(Builder& b, const Resolved::Expr& expr) {
             if (value == nullptr) return nullptr;
             auto pattern = BuildExpr(b, like.pattern());
             if (pattern == nullptr) return nullptr;
-            if (CollationIsAiCi(like.collation_id())) {
-                // The registered function evaluates my_wildcmp under the
-                // real MySQL collation, so escape and multibyte semantics
-                // are MySQL's own.
-                duckdb::vector<unique_ptr<ParsedExpression>> args;
-                args.push_back(std::move(value));
-                args.push_back(std::move(pattern));
-                args.push_back(make_uniq<duckdb::ConstantExpression>(
-                    Value::INTEGER(like.escape())));
-                return make_uniq<duckdb::FunctionExpression>(
-                    like.negated() ? kMysqlAiCiNotLike : kMysqlAiCiLike,
-                    std::move(args));
-            }
-            if (!CollationIsByteSafe(like.collation_id())) {
-                b.Refuse("LIKE collation " +
-                         std::to_string(like.collation_id()) +
-                         " is unsupported");
-                return nullptr;
-            }
-            if (like.escape() != 0 && like.escape() != '\\') {
-                b.Refuse("LIKE escape is unsupported");
-                return nullptr;
+            // The registered functions evaluate MySQL's LIKE under the
+            // collation, escape and multibyte semantics included.
+            const char* function;
+            switch (like.collation_id()) {
+                case 255:
+                    function =
+                        like.negated() ? kMysqlAiCiNotLike : kMysqlAiCiLike;
+                    break;
+                case 309:
+                    function =
+                        like.negated() ? kMysqlBinNotLike : kMysqlBinLike;
+                    break;
+                case 63:
+                    function =
+                        like.negated() ? kMysqlBinaryNotLike : kMysqlBinaryLike;
+                    break;
+                default:
+                    b.Refuse("LIKE collation " +
+                             std::to_string(like.collation_id()) +
+                             " is unsupported");
+                    return nullptr;
             }
             duckdb::vector<unique_ptr<ParsedExpression>> args;
             args.push_back(std::move(value));
             args.push_back(std::move(pattern));
-            unique_ptr<ParsedExpression> built =
-                make_uniq<duckdb::FunctionExpression>("~~", std::move(args));
-            if (like.negated()) {
-                built = make_uniq<duckdb::OperatorExpression>(
-                    ExpressionType::OPERATOR_NOT, std::move(built));
-            }
-            return built;
+            args.push_back(make_uniq<duckdb::ConstantExpression>(
+                Value::INTEGER(like.escape())));
+            return make_uniq<duckdb::FunctionExpression>(function,
+                                                         std::move(args));
         }
         default:
             b.Refuse("expression with no node");

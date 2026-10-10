@@ -13,22 +13,6 @@ find_package(PkgConfig REQUIRED)
 set(DUCKDB_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../third_party/duckdb")
 set(DUCKDB_LIB_DIR "${DUCKDB_ROOT}/build/release/src")
 
-# MySQL charset runtime. libstrings contains the collation descriptors and
-# handlers; libmysys contains the loader, registry, and runtime
-# initialization. The final libstrings entry resolves libmysys
-# back-references with static-link semantics.
-set(MYSQL_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../third_party/mysql-server")
-set(MYSQL_BUILD_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../build")
-set(MYSQL_ARCHIVE_DIR "${MYSQL_BUILD_ROOT}/archive_output_directory")
-set(MYSQL_CHARSET_LIBRARIES
-    ${MYSQL_ARCHIVE_DIR}/libstrings.a
-    ${MYSQL_ARCHIVE_DIR}/libmysys.a
-    ${MYSQL_ARCHIVE_DIR}/libstrings.a)
-set(MYSQL_INCLUDE_DIRS
-    ${MYSQL_ROOT}
-    ${MYSQL_ROOT}/include
-    ${MYSQL_BUILD_ROOT}/include)
-
 # Include directories
 include_directories(${CMAKE_CURRENT_SOURCE_DIR})
 include_directories(${CMAKE_CURRENT_SOURCE_DIR}/..)
@@ -81,8 +65,9 @@ set(SOURCES
     rpc/key_pack.hh
     rpc/transaction_operations.cc
     rpc/table_stats.cc
-    mysql_charset_runtime.cc
-    mysql_charset_runtime.hh
+    rpc/collation.cc
+    rpc/collation.hh
+    rpc/uca900_primary.hh
     rpc/duckdb_ast_builder.cc
     rpc/duckdb_ast_builder.hh
     rpc/olap_dispatch.cc
@@ -109,13 +94,11 @@ target_link_libraries(helios-storage
     helios_proto
     pthread
     ${DUCKDB_LIB_DIR}/libduckdb.so
-    ${MYSQL_CHARSET_LIBRARIES}
 )
 
 # Additional include directories for generated files
 target_include_directories(helios-storage PRIVATE
-    ${CMAKE_CURRENT_BINARY_DIR}
-    ${MYSQL_INCLUDE_DIRS})
+    ${CMAKE_CURRENT_BINARY_DIR})
 
 # Embed an rpath to the DuckDB shared library. start_server.sh runs the binary
 # directly, without LD_LIBRARY_PATH.
