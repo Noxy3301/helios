@@ -247,8 +247,8 @@ int ha_helios::open(const char *table_name, int, uint, const dd::Table *) {
     set_key_and_key_part_info(table);
 
   if (table->s->primary_key != MAX_KEY) {
-    // A key part carries 4 bytes of overhead (null marker, type tag, 2-byte
-    // length) and STRING one more terminator; key_length counts neither.
+    // STRING weights have no tight bound, but no stored key exceeds
+    // kMaxKeyLength.
     uint pk_index = table->s->primary_key;
     KEY *pk = &table->key_info[pk_index];
     size_t packed_pk_size = 0;
@@ -257,14 +257,14 @@ int ha_helios::open(const char *table_name, int, uint, const dd::Table *) {
       Field *field = part->field;
       HeliosFieldType helios_type = convert_mysql_type_to_helios(field->type());
       if (helios_type == HeliosFieldType::HELIOS_STRING) {
-        // STRING: marker(1) + type(1) + payload + terminator(1) + length(2)
-        packed_pk_size += 5 + part->length;
+        packed_pk_size += key_pack::kMaxKeyLength;
       } else {
         // INT/DATETIME/OTHER: marker(1) + type(1) + length(2) + payload
         packed_pk_size += 4 + field->pack_length();
       }
     }
-    ref_length = sizeof(uint16_t) + packed_pk_size;
+    ref_length =
+        sizeof(uint16_t) + std::min(packed_pk_size, key_pack::kMaxKeyLength);
   } else {
     ref_length = sizeof(uint16_t) + pack_hidden_primary_key(0).size();
   }

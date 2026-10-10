@@ -13,6 +13,7 @@
 #include "my_inttypes.h"
 
 class Field;
+class KEY_PART_INFO;
 class KEY;
 struct TABLE;
 
@@ -37,6 +38,23 @@ std::string pack_datetime_key(const uchar *data, size_t len,
 void append_key_part(std::string &out, bool is_null, HeliosFieldType type,
                      const std::string &payload);
 std::string build_prefix_range_end(const std::string &prefix);
+
+/**
+ * @brief The weights of a string key part under its column's collation.
+ *
+ * @details The value is cut to the part's characters, a CHAR under a NO PAD
+ * collation drops its trailing spaces, and a PAD SPACE collation pads the
+ * weights to the part's full length, as Field_string::make_sort_key and
+ * Field_varstring::make_sort_key do. Collation-equal values get equal bytes,
+ * so the original text lives only in the row.
+ *
+ * @param kp  Key part whose field gives the collation and whose length gives
+ *            the indexed characters.
+ * @param s   The value, or its key image after the length prefix.
+ * @param len Bytes at `s`.
+ * @return The weight string; for ENUM and SET, the bytes at `s` unchanged.
+ */
+std::string string_weights(const KEY_PART_INFO &kp, const uchar *s, size_t len);
 
 /**
  * @brief Whether an index entry exceeds kMaxKeyLength.

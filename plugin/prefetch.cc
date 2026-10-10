@@ -16,6 +16,7 @@
 #include "read_plan_compiler.hh"
 #include "helios_field_types.h"
 #include "key_pack.hh"
+#include "log.hh"
 #include "prefetch.hh"
 #include "helios.pb.h"
 #include "my_base.h"
@@ -27,6 +28,7 @@
 #include "sql/item.h"
 #include "sql/item_cmpfunc.h"
 #include "sql/item_func.h"
+#include "sql/sql_base.h"
 #include "sql/sql_class.h"
 #include "sql/sql_lex.h"
 #include "sql/sql_optimizer.h"
@@ -94,17 +96,39 @@ static std::string pack_plan_int_key_part(int64_t value, int size = 4) {
   return out;
 }
 
-// Pack one string DSL key part into the same bytes as handler keys
-static std::string pack_plan_string_key_part(const std::string& value) {
-  std::string out;
-  out.push_back(static_cast<char>(kKeyMarkerNotNull));
-  out.push_back(static_cast<char>(kKeyTypeString));
-  out.append(value);
-  out.push_back('\0');
-  const uint16_t length = static_cast<uint16_t>(value.size());
-  out.push_back(static_cast<char>((length >> 8) & 0xFF));
-  out.push_back(static_cast<char>(length & 0xFF));
-  return out;
+// Pack a string DSL value as part `part` of the step's key, with the column
+// definition from the table cache, into the same bytes as handler keys. False
+// when this server has not cached the table or the key has no such part.
+static bool pack_plan_string_key_part(const HeliosProxy::ReadPlanStep &step,
+                                      size_t part, const std::string &value,
+                                      std::string &out) {
+  // table_name is "./db/table".
+  const size_t slash = step.table_name.find('/', 2);
+  if (slash == std::string::npos) return false;
+  const std::string db = step.table_name.substr(2, slash - 2);
+  const std::string name = step.table_name.substr(slash + 1);
+
+  bool found = false;
+  mysql_mutex_lock(&LOCK_open);
+  const TABLE_SHARE *share = get_cached_table_share(db.c_str(), name.c_str());
+  // A share still being opened fills its keys outside LOCK_open.
+  if (share != nullptr && share->m_open_in_progress) share = nullptr;
+  for (uint i = 0; share != nullptr && i < share->keys; i++) {
+    const KEY &key = share->key_info[i];
+    const bool named = step.index_name.empty() ? i == share->primary_key
+                                               : step.index_name == key.name;
+    if (named && part < key.user_defined_key_parts) {
+      key_pack::append_key_part(
+          out, false, HeliosFieldType::HELIOS_STRING,
+          key_pack::string_weights(key.key_part[part],
+                                   pointer_cast<const uchar *>(value.data()),
+                                   value.size()));
+      found = true;
+      break;
+    }
+  }
+  mysql_mutex_unlock(&LOCK_open);
+  return found;
 }
 
 static bool try_parse_plan_int(const std::string& text, int64_t *value) {
@@ -114,9 +138,12 @@ static bool try_parse_plan_int(const std::string& text, int64_t *value) {
   return end == text.c_str() + text.size();
 }
 
-// Pack one DSL segment: 42=INT, 42t=TINYINT, 42s=SMALLINT, 42l=BIGINT
-static std::string pack_plan_key_segment(const std::string& segment) {
-  if (segment.empty()) return {};
+// Pack one DSL segment: 42=INT, 42t=TINYINT, 42s=SMALLINT, 42l=BIGINT, and
+// other text as string part `part` of the step's key
+static bool pack_plan_key_segment(const HeliosProxy::ReadPlanStep &step,
+                                  size_t part, const std::string &segment,
+                                  std::string &out) {
+  if (segment.empty()) return true;
 
   int int_size = 4;
   std::string number = segment;
@@ -137,9 +164,10 @@ static std::string pack_plan_key_segment(const std::string& segment) {
 
   int64_t int_value = 0;
   if (try_parse_plan_int(number, &int_value)) {
-    return pack_plan_int_key_part(int_value, int_size);
+    out += pack_plan_int_key_part(int_value, int_size);
+    return true;
   }
-  return pack_plan_string_key_part(segment);
+  return pack_plan_string_key_part(step, part, segment, out);
 }
 
 static std::vector<std::string> split_plan_text(const std::string& text,
@@ -232,10 +260,10 @@ static bool token_is_plan_binding(const std::string& token) {
   return pos > 1 && pos < token.size() && token[pos] == '.';
 }
 
-static void append_plan_key_token(HeliosProxy::ReadPlanStep *step,
-                                  const std::string& token,
-                                  bool end_key) {
-  if (step == nullptr || token.empty()) return;
+static bool append_plan_key_token(HeliosProxy::ReadPlanStep *step,
+                                  const std::string &token, bool end_key,
+                                  size_t part) {
+  if (step == nullptr || token.empty()) return true;
   if (token_is_plan_binding(token)) {
     auto binding = parse_plan_binding(token);
     if (end_key) {
@@ -243,14 +271,13 @@ static void append_plan_key_token(HeliosProxy::ReadPlanStep *step,
     } else {
       step->bindings.push_back(std::move(binding));
     }
-    return;
+    return true;
   }
 
   if (end_key) {
-    step->end_key_prefix += pack_plan_key_segment(token);
-  } else {
-    step->key_prefix += pack_plan_key_segment(token);
+    return pack_plan_key_segment(*step, part, token, step->end_key_prefix);
   }
+  return pack_plan_key_segment(*step, part, token, step->key_prefix);
 }
 
 // Parse read-plan DSL: R=point, S=PK range/prefix scan, SI=secondary scan
@@ -266,6 +293,7 @@ static std::vector<HeliosProxy::ReadPlanStep> parse_plan_steps(
     HeliosProxy::ReadPlanStep parsed;
     parsed.table_name = normalize_plan_table_name(thd, parts[1]);
     bool end_key = false;
+    size_t nparts[2] = {0, 0};  // key parts taken by the start and end keys
     size_t token_start = 2;
     if (parts[0] == "R") {
       parsed.is_scan = false;
@@ -297,7 +325,12 @@ static std::vector<HeliosProxy::ReadPlanStep> parse_plan_steps(
         parsed.reverse_scan = token.substr(8) == "1";
         continue;
       }
-      append_plan_key_token(&parsed, token, end_key);
+      if (!append_plan_key_token(&parsed, token, end_key, nparts[end_key]++)) {
+        LOG_WARNING("tx plan dropped: no cached key part %zu of %s %s",
+                    nparts[end_key] - 1, parsed.table_name.c_str(),
+                    parsed.index_name.c_str());
+        return {};
+      }
     }
     if (!parsed.table_name.empty()) {
       steps.push_back(std::move(parsed));
