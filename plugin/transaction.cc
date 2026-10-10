@@ -556,16 +556,6 @@ HeliosTransaction::read_secondary_index(std::string index_name,
   return get_matching_primary_keys_in_range(index_name, secondary_key, end_key);
 }
 
-void HeliosTransaction::update_secondary_index(std::string index_name,
-                                                  std::string old_secondary_key,
-                                                  std::string new_secondary_key,
-                                                  const std::string primary_key) {
-  buffer_delete_secondary_index(db_table_key, index_name, old_secondary_key,
-                                primary_key);
-  buffer_write_secondary_index(db_table_key, index_name, new_secondary_key,
-                               primary_key);
-}
-
 // Primary key scan operations
 
 std::vector<std::pair<std::string, std::string>>

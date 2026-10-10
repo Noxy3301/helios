@@ -136,6 +136,32 @@ TEST(MasstreeIndexTest, ReverseScanCountsOnlyTheKeysItEmits) {
   EXPECT_EQ(seen.size(), count);
 }
 
+TEST(MasstreeIndexTest, ScansFromAFirstKeyLongerThanAnyStoredKey) {
+  using helios::storage::index::kMaxKeyLength;
+  helios::storage::index::MasstreeIndex table;
+  // Stored keys of the longest length on each side of a 300-byte bound.
+  const std::string low(kMaxKeyLength, 'a');
+  const std::string high = std::string(kMaxKeyLength - 1, 'a') + 'b';
+  const std::string bound = low + std::string(45, 'z');
+  table.Put(low, {});
+  table.Put(high, {});
+
+  std::vector<std::string> seen;
+  table.Scan(bound, std::nullopt,
+             [&](std::string_view key, helios::storage::DataItem &) {
+               seen.emplace_back(key);
+               return false;
+             });
+  EXPECT_EQ(std::vector<std::string>({high}), seen);
+  seen.clear();
+  table.ScanReverse("", std::optional<std::string_view>(bound),
+                    [&](std::string_view key, helios::storage::DataItem &) {
+                      seen.emplace_back(key);
+                      return false;
+                    });
+  EXPECT_EQ(std::vector<std::string>({low}), seen);
+}
+
 TEST(MasstreeIndexTest, ConcurrentGetOrInsertReturnsTheSameEntry) {
   using namespace helios::storage;
   index::MasstreeIndex tree;

@@ -19,7 +19,8 @@ bool thd_can_use_prefetch(THD *thd);
  *
  * Marks the transaction (tx_plan_used) so the statement-scoped prefetch
  * stays out of the way; a transaction takes its plan from one source, the
- * DSL or the QEP. No-op when no @_tx_plan is set.
+ * DSL or the QEP. No-op when no @_tx_plan is set or a string key part of
+ * the plan has no cached table definition.
  *
  * @param thd Current session.
  * @param tx  Transaction to prefetch into.

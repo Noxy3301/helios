@@ -5,12 +5,17 @@
 #include <utility>
 #include <vector>
 
+#include "key_pack.hh"
 #include "prefetch.hh"
 #include "my_dbug.h"
 #include "sql/table.h"
 
 // Handler DML entry points. These methods buffer base-row mutations and their
 // secondary-index side effects in the current Helios transaction.
+
+static const std::string kLongKey = "an index entry longer than " +
+                                    std::to_string(key_pack::kMaxKeyLength) +
+                                    " bytes once packed";
 
 int ha_helios::duplicate_or_conflict(HeliosTransaction *tx, uint index) {
   if (!tx->reads_still_valid()) {
@@ -78,6 +83,9 @@ int ha_helios::write_row(uchar *buf) {
   std::string key;
   if (const int error = extract_key(buf, tx, &key); error != 0) {
     return error;
+  }
+  if (key.size() > key_pack::kMaxKeyLength) {
+    return reject_unsupported_statement(ha_thd(), tx, kLongKey.c_str());
   }
 
   tx->choose_table(db_table_name);
@@ -151,6 +159,9 @@ int ha_helios::write_row(uchar *buf) {
     const auto &key_info = table->key_info[i];
 
     secondary_keys[i] = build_secondary_key_from_row(buf, key_info);
+    if (key_pack::index_key_too_long(key_info, secondary_keys[i], key)) {
+      return reject_unsupported_statement(ha_thd(), tx, kLongKey.c_str());
+    }
 
     // A UNIQUE secondary key is the statement's to report, like the primary.
     if (key_info.flags & HA_NOSAME) {
@@ -205,13 +216,7 @@ int ha_helios::update_row(const uchar *old_data, uchar *new_data) {
 
   auto tx = get_transaction(ha_thd());
   auto key = extract_key_from_mysql(old_data);
-  const auto new_key = extract_key_from_mysql(new_data);
-
-  // update_row overwrites in place at the old key and cannot move a row.
-  if (key != new_key) {  // FIXME: implement the move (delete+insert+index)
-    return reject_unsupported_statement(ha_thd(), tx,
-                                       "primary-key-changing UPDATE");
-  }
+  auto new_key = extract_key_from_mysql(new_data);
 
   if (key.empty()) {
     key = last_fetched_primary_key_;
@@ -223,6 +228,12 @@ int ha_helios::update_row(const uchar *old_data, uchar *new_data) {
 
   last_fetched_primary_key_ = key;
 
+  // A hidden primary key never changes.
+  if (new_key.empty()) {
+    new_key = key;
+  }
+  const bool moved = new_key != key;
+
   set_write_buffer(new_data);
 
   if (tx->is_aborted()) {
@@ -230,6 +241,21 @@ int ha_helios::update_row(const uchar *old_data, uchar *new_data) {
   }
 
   tx->choose_table(db_table_name);
+
+  // A changed primary key moves the row. A row already at the new key fails
+  // this row, as it does for INSERT.
+  if (moved) {
+    if (new_key.size() > key_pack::kMaxKeyLength) {
+      return reject_unsupported_statement(ha_thd(), tx, kLongKey.c_str());
+    }
+    const bool taken = tx->read(new_key).first != nullptr;
+    if (tx->is_aborted()) {
+      return abort_errno(tx);
+    }
+    if (taken) {
+      return duplicate_or_conflict(tx, table_share->primary_key);
+    }
+  }
 
   // A rejected statement keeps what the handler buffered, so every UNIQUE key
   // probed before the first write of the row is buffered.
@@ -244,13 +270,17 @@ int ha_helios::update_row(const uchar *old_data, uchar *new_data) {
     old_keys[i] = build_secondary_key_from_row(old_data, key_info);
     new_keys[i] = build_secondary_key_from_row(new_data, key_info);
 
-    if (old_keys[i] == new_keys[i]) {
+    // A moved row moves every index entry, unchanged values included.
+    if (!moved && old_keys[i] == new_keys[i]) {
       continue;
+    }
+    if (key_pack::index_key_too_long(key_info, new_keys[i], new_key)) {
+      return reject_unsupported_statement(ha_thd(), tx, kLongKey.c_str());
     }
 
     // Moving a row onto a UNIQUE key another row holds is the statement's to
-    // report, as it is for an INSERT.
-    if (key_info.flags & HA_NOSAME) {
+    // report, as it is for an INSERT. An unchanged value is the row's own.
+    if ((key_info.flags & HA_NOSAME) && old_keys[i] != new_keys[i]) {
       if (const int error =
               check_unique_secondary_key(tx, i, key_info, new_keys[i], key);
           error != 0) {
@@ -259,16 +289,19 @@ int ha_helios::update_row(const uchar *old_data, uchar *new_data) {
     }
   }
 
-  // The update assigns the columns in write_set: PAX field i + 1 is column i,
-  // and fields past 63 share bit 63.
+  // The update assigns the columns in write_set, and a moved row all of them.
+  // PAX field i + 1 is column i, and fields past 63 share bit 63.
   uint64_t column_mask = 0;
   for (uint i = 0; i < table->s->fields; i++) {
-    if (bitmap_is_set(table->write_set, i))
+    if (moved || bitmap_is_set(table->write_set, i))
       column_mask |= uint64_t{1} << std::min<uint>(i + 1, 63);
   }
 
   // Buffer the base-row update; the commit installs it.
-  tx->buffer_write(db_table_name, key, write_buffer_, /*is_insert=*/false,
+  if (moved) {
+    tx->buffer_delete(db_table_name, key);
+  }
+  tx->buffer_write(db_table_name, new_key, write_buffer_, /*is_insert=*/moved,
                    column_mask);
 
   if (tx->is_aborted()) {
@@ -276,12 +309,16 @@ int ha_helios::update_row(const uchar *old_data, uchar *new_data) {
   }
 
   for (uint i = 0; i < table->s->keys; i++) {
-    if (old_keys[i] == new_keys[i]) {
+    if (i == table->s->primary_key || (!moved && old_keys[i] == new_keys[i])) {
       continue;
     }
 
-    tx->update_secondary_index(table->key_info[i].name, old_keys[i],
-                               new_keys[i], key);
+    // Delete first: the commit applies a UNIQUE entry's changes in order and
+    // refuses an insert while another primary key holds the value.
+    tx->buffer_delete_secondary_index(db_table_name, table->key_info[i].name,
+                                      old_keys[i], key);
+    tx->buffer_write_secondary_index(db_table_name, table->key_info[i].name,
+                                     new_keys[i], new_key);
 
     if (tx->is_aborted()) {
       return abort_errno(tx);

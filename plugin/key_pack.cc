@@ -64,15 +64,13 @@ void append_key_part(std::string &out, bool is_null, HeliosFieldType type,
   }
 
   if (type == HeliosFieldType::HELIOS_STRING) {
-    // STRING: payload first, then terminator (0x00), then length
-    if (copy_length > 0) {
-      out.append(payload.data(), copy_length);
+    // STRING: the payload with each 00 escaped as 00 FF, then 00 00. A part
+    // ends at its first 00 00, and parts sort as their payloads do.
+    for (const char c : payload) {
+      out.push_back(c);
+      if (c == '\0') out.push_back('\xff');
     }
-    out.push_back('\0'); // terminator to ensure shorter strings sort before
-                         // longer ones with same prefix
-    uint16_t length_field = static_cast<uint16_t>(copy_length);
-    out.push_back(static_cast<char>((length_field >> 8) & 0xFF));
-    out.push_back(static_cast<char>(length_field & 0xFF));
+    out.append(2, '\0');
   } else {
     // INT, DATETIME, OTHER: length first, then payload (fixed-length types)
     uint16_t length_field = static_cast<uint16_t>(copy_length);
@@ -109,7 +107,8 @@ std::string ha_helios::build_prefix_range_end(const std::string &prefix) {
   return key_pack::build_prefix_range_end(prefix);
 }
 
-std::string ha_helios::pack_key_from_field(Field *field) {
+std::string ha_helios::pack_key_from_field(const KEY_PART_INFO &kp,
+                                           Field *field) {
   const bool is_null = field->is_null();
   enum_field_types mysql_type = field->type();
   HeliosFieldType helios_type = convert_mysql_type_to_helios(mysql_type);
@@ -162,7 +161,8 @@ std::string ha_helios::pack_key_from_field(Field *field) {
     case HeliosFieldType::HELIOS_STRING: {
       String buffer;
       field->val_str(&buffer, &buffer);
-      payload.assign(buffer.c_ptr(), buffer.length());
+      payload = key_pack::string_weights(
+          kp, pointer_cast<const uchar *>(buffer.ptr()), buffer.length());
       break;
     }
 
@@ -200,7 +200,7 @@ std::string ha_helios::build_secondary_key_from_row(const uchar *row_buffer,
     field->move_field_offset(offset);
 
     // Pack each key part and concatenate
-    secondary_key += pack_key_from_field(field);
+    secondary_key += pack_key_from_field(key_part, field);
 
     // Restore the Field pointer back to original position
     field->move_field_offset(-offset);
@@ -380,7 +380,7 @@ std::string ha_helios::extract_key_from_mysql(const uchar *row_buffer) {
     Field *field = table->field[field_index];
 
     field->move_field_offset(offset);
-    complete_key += pack_key_from_field(field);
+    complete_key += pack_key_from_field(key_part[i], field);
     field->move_field_offset(-offset);
   }
 
@@ -524,7 +524,7 @@ std::string pack_key(TABLE *table, uint key_index, const uchar *key,
       break;
 
     case HeliosFieldType::HELIOS_STRING:
-      payload.assign(reinterpret_cast<const char *>(data_ptr), data_len);
+      payload = string_weights(*kp, data_ptr, data_len);
       break;
 
     case HeliosFieldType::HELIOS_OTHER:
@@ -543,6 +543,36 @@ std::string pack_key(TABLE *table, uint key_index, const uchar *key,
   }
 
   return result;
+}
+
+std::string string_weights(const KEY_PART_INFO &kp, const uchar *s,
+                           size_t len) {
+  const Field *field = kp.field;
+  if (field->real_type() == MYSQL_TYPE_ENUM ||
+      field->real_type() == MYSQL_TYPE_SET) {
+    return std::string(pointer_cast<const char *>(s), len);
+  }
+
+  const CHARSET_INFO *cs = field->charset();
+  const uint nchars = kp.length / cs->mbmaxlen;
+  len = std::min(len, my_charpos(cs, s, s + len, nchars));
+  if (cs->pad_attribute == NO_PAD && field->type() == MYSQL_TYPE_STRING) {
+    len = cs->cset->lengthsp(cs, pointer_cast<const char *>(s), len);
+  }
+  const uint flags = cs->pad_attribute == NO_PAD ? 0 : MY_STRXFRM_PAD_TO_MAXLEN;
+
+  // strnxfrm takes an even buffer.
+  std::string out((cs->coll->strnxfrmlen(cs, kp.length) + 1) & ~size_t{1},
+                  '\0');
+  out.resize(cs->coll->strnxfrm(cs, pointer_cast<uchar *>(out.data()),
+                                out.size(), nchars, s, len, flags));
+  return out;
+}
+
+bool index_key_too_long(const KEY &key_info, const std::string &secondary_key,
+                        const std::string &primary_key) {
+  if (key_info.flags & HA_NOSAME) return secondary_key.size() > kMaxKeyLength;
+  return secondary_key.size() + primary_key.size() > kMaxKeyLength;
 }
 
 }  // namespace key_pack

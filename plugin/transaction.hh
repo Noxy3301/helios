@@ -77,11 +77,6 @@ public:
   std::optional<SecondaryBatch> fetch_secondary_batch_below(
       const std::string &index_name, const std::string &start_key,
       const std::string &end_key, uint64_t batch_entries);
-  void update_secondary_index(
-      std::string index_name,
-      std::string old_secondary_key,
-      std::string new_secondary_key,
-      const std::string primary_key);
 
   // Buffered writes, installed by the commit in the order they were issued.
   void buffer_write(const std::string& table_name,
