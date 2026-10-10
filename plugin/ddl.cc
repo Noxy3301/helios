@@ -480,6 +480,11 @@ bool ha_helios::backfill_unique_serial(const std::string &index_name,
       op.primary_key = std::move(row.key);
       op.secondary_key =
           build_secondary_key_from_row(table->record[0], runtime_key);
+      if (key_pack::index_key_too_long(runtime_key, op.secondary_key,
+                                       op.primary_key)) {
+        failed = true;
+        break;
+      }
       write_chunk.push_back(std::move(op));
       if (write_chunk.size() >= kBackfillWriteChunkRows &&
           !backfill_commit_chunk(write_chunk)) {

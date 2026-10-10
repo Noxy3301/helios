@@ -545,6 +545,12 @@ std::string pack_key(TABLE *table, uint key_index, const uchar *key,
   return result;
 }
 
+bool index_key_too_long(const KEY &key_info, const std::string &secondary_key,
+                        const std::string &primary_key) {
+  if (key_info.flags & HA_NOSAME) return secondary_key.size() > kMaxKeyLength;
+  return secondary_key.size() + primary_key.size() > kMaxKeyLength;
+}
+
 }  // namespace key_pack
 
 std::string ha_helios::pack_key(const uchar *key, key_part_map keypart_map) {

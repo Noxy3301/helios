@@ -5,12 +5,17 @@
 #include <utility>
 #include <vector>
 
+#include "key_pack.hh"
 #include "prefetch.hh"
 #include "my_dbug.h"
 #include "sql/table.h"
 
 // Handler DML entry points. These methods buffer base-row mutations and their
 // secondary-index side effects in the current Helios transaction.
+
+static const std::string kLongKey = "an index entry longer than " +
+                                    std::to_string(key_pack::kMaxKeyLength) +
+                                    " bytes once packed";
 
 int ha_helios::duplicate_or_conflict(HeliosTransaction *tx, uint index) {
   if (!tx->reads_still_valid()) {
@@ -78,6 +83,9 @@ int ha_helios::write_row(uchar *buf) {
   std::string key;
   if (const int error = extract_key(buf, tx, &key); error != 0) {
     return error;
+  }
+  if (key.size() > key_pack::kMaxKeyLength) {
+    return reject_unsupported_statement(ha_thd(), tx, kLongKey.c_str());
   }
 
   tx->choose_table(db_table_name);
@@ -151,6 +159,9 @@ int ha_helios::write_row(uchar *buf) {
     const auto &key_info = table->key_info[i];
 
     secondary_keys[i] = build_secondary_key_from_row(buf, key_info);
+    if (key_pack::index_key_too_long(key_info, secondary_keys[i], key)) {
+      return reject_unsupported_statement(ha_thd(), tx, kLongKey.c_str());
+    }
 
     // A UNIQUE secondary key is the statement's to report, like the primary.
     if (key_info.flags & HA_NOSAME) {
@@ -246,6 +257,9 @@ int ha_helios::update_row(const uchar *old_data, uchar *new_data) {
 
     if (old_keys[i] == new_keys[i]) {
       continue;
+    }
+    if (key_pack::index_key_too_long(key_info, new_keys[i], key)) {
+      return reject_unsupported_statement(ha_thd(), tx, kLongKey.c_str());
     }
 
     // Moving a row onto a UNIQUE key another row holds is the statement's to
