@@ -5,6 +5,7 @@
 
 #include "index/masstree_index.h"
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <mutex>
@@ -99,6 +100,13 @@ inline void RcuFree(DataItem *item) {
   void *mem = tls_ti->allocate(sizeof(RcuFreeCallback), memtag_masstree_gc);
   auto *operation = new (mem) RcuFreeCallback(item);
   tls_ti->rcu_register(operation);
+}
+
+// Masstree copies a scan's first key into a buffer of kMaxKeyLength + 1
+// bytes. No stored key is longer than kMaxKeyLength, so none equals the cut
+// key and each compares with it as with the whole key.
+Masstree::Str scan_first_key(std::string_view key) {
+  return Masstree::Str(key.data(), std::min(key.size(), kMaxKeyLength + 1));
 }
 
 // Pass matching entries to the callback and count visits.
@@ -214,8 +222,8 @@ struct MasstreeIndex::Impl {
     ensure_thread_active();
     // Start at begin; the scanner stops before end.
     Scanner scanner{std::nullopt, end, std::move(op)};
-    Masstree::Str firstkey(begin.data(), begin.size());
-    table_.scan(firstkey, /*emit_firstkey=*/true, scanner, *tls_ti);
+    table_.scan(scan_first_key(begin), /*emit_firstkey=*/true, scanner,
+                *tls_ti);
     return scanner.count;
   }
 
@@ -226,8 +234,8 @@ struct MasstreeIndex::Impl {
     // Start below end and stop when a key is smaller than begin.
     Scanner scanner{begin, std::nullopt, std::move(op)};
     if (end) {
-      Masstree::Str firstkey(end->data(), end->size());
-      table_.rscan(firstkey, /*emit_firstkey=*/false, scanner, *tls_ti);
+      table_.rscan(scan_first_key(*end), /*emit_firstkey=*/false, scanner,
+                   *tls_ti);
     } else {
       // Start at the largest supported key, including that key itself.
       std::array<char, MASSTREE_MAXKEYLEN> last_key;
