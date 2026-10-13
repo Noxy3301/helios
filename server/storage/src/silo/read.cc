@@ -115,8 +115,9 @@ ScanIndexResult Database::ScanIndex(const std::string_view table_name,
     return row_limit > 0 && returned_rows >= row_limit;
   };
 
-  // Keep the key list alive while reading the referenced rows. A pair's key
-  // ends with its one primary key, which the row leaves out.
+  // Keep the key list alive while reading the referenced rows. A non-unique
+  // index record's key ends with its one primary key, which the row leaves
+  // out.
   auto append_secondary_entry = [&](std::string_view key, DataItem &item) {
     const auto keys = silo::StableReadKeys(item, index->constraint);
     if (keys.tid != Tidword::Absent())

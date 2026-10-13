@@ -295,8 +295,9 @@ void Database::Recover() {
           item.set_primary_keys(entry.primary_keys);
           idx->tree.Put(entry.key, std::move(item));
         } else {
-          // A non-unique index keeps one record per pair, under the
-          // secondary key followed by the primary key, whose length it keeps.
+          // A non-unique index keeps one record per
+          // (secondary key, primary key), under the secondary key followed by
+          // the primary key, whose length it keeps.
           for (const auto &primary_key : entry.primary_keys) {
             DataItem item;
             item.transaction_id.store(entry.tid);

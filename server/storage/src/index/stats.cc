@@ -88,8 +88,8 @@ bool Database::IndexNdv(const std::string_view table_name,
     if (index == nullptr) return false;
 
     // Secondary entries count only if one referenced base row is live.
-    // A secondary key's pairs are adjacent and the counted parts end inside
-    // it, so after one live pair the rest add nothing.
+    // A secondary key's index records are adjacent and the counted parts end
+    // inside it, so after one live record the rest add nothing.
     index->tree.Scan(std::string_view(), std::string_view(kSupremum),
                      [&](std::string_view key, DataItem &item) -> bool {
                        const auto keys =
@@ -157,14 +157,14 @@ bool Database::IndexHistogram(const std::string_view table_name,
         failed = true;
         return;
       }
-      // Sum a secondary key's adjacent pairs and visit the key once, so a
-      // bucket closes only between secondary keys.
+      // Sum a secondary key's adjacent non-unique index records and visit the
+      // key once, so a bucket closes only between secondary keys.
       std::string pending;
       uint64_t pending_w = 0;
       index->tree.Scan(std::string_view(), std::string_view(kSupremum),
                        [&](std::string_view key, DataItem &item) -> bool {
-                         // A live record is one row: a pair, or the one owner
-                         // of a UNIQUE key.
+                         // A live record is one row: a non-unique index
+                         // record, or the one owner of a UNIQUE key.
                          const auto keys =
                              silo::StableReadKeys(item, index->constraint);
                          if (!keys.found) return false;  // dead secondary entry

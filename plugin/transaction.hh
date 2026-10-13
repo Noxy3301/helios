@@ -300,7 +300,7 @@ private:
   std::unordered_map<std::string, std::vector<size_t>> secondary_scan_start_index_;
   void push_range_scan_cache(RangeScanCacheEntry entry);
   void push_secondary_scan_cache(SecondaryScanCacheEntry entry);
-  // Keep the rows (pairs) the request's bounds cover, and the visited records
+  // Keep the rows the request's bounds cover, and the visited records
   // inside them. The parallel arrays are appended together at every push
   // site, so they are the same length.
   static void trim_range_entry(RangeScanCacheEntry& entry,

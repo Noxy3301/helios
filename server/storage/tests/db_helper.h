@@ -260,7 +260,8 @@ inline std::vector<std::pair<std::string, std::string>> Scan(
   return rows;
 }
 
-// (secondary key, primary key) pairs a secondary-index range scan returned.
+// The secondary key and primary key of each row a secondary-index range scan
+// returned.
 inline std::vector<std::pair<std::string, std::string>> ScanIndex(
     helios::storage::Database &db, const std::string &table,
     const std::string &index_name, const std::string &start_key,
@@ -291,7 +292,7 @@ inline std::vector<std::string> ReadIndex(helios::storage::Database &db,
                                           const std::string &index_name,
                                           const std::string &secondary_key) {
   std::vector<std::string> primary_keys;
-  // A non-unique record's key extends its secondary key, as a longer
+  // A non-unique index record's key extends its secondary key, as a longer
   // secondary key can; keep the exact matches.
   for (auto &entry : ScanIndex(db, table, index_name, secondary_key,
                                prefix_end(secondary_key))) {

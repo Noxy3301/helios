@@ -653,7 +653,8 @@ TEST_F(CommitTidTest, OneTidCoversReadsRowsIndexesAndTheWorker) {
   auto *a = SeedRow("a", Version(10, 8));
   auto *b = SeedRow("b", Version(10, 24));
   auto *read = SeedRow("read", Version(10, 80));
-  // The pair the commit adds was removed before; its record keeps the word.
+  // The commit adds back a secondary key and primary key removed before;
+  // their record keeps the word.
   auto *index = tables_.GetTable(kTable)->GetSecondaryIndex("idx");
   auto *posting = index->tree.GetOrInsert("groupb");
   posting->transaction_id.store(Deleted(10, 40));
@@ -1000,7 +1001,8 @@ TEST_F(CommitTidTest, RangeRevalidationAllowsOwnLockOnPrimaryAndSecondary) {
   postings.visited = {{"sk", Version(10, 12).obj}};
   postings.rows = {{"k", Version(10, 10).obj}};
 
-  // The commit locks the scanned pair it removes and the row it updates.
+  // The commit locks the scanned non-unique index record it removes and the
+  // row it updates.
   ASSERT_TRUE(Commit({}, {{kTable, "k", "next"}},
                      {{kTable, "idx", "s", "k", true}}, {rows, postings}))
       << reason_;
@@ -1109,7 +1111,7 @@ TEST_F(CommitTidTest,
 TEST_F(CommitTidTest,
        SecondaryDeleteThatEmptiesAnEntryPublishesAbsentAndTheReaperPurgesIt) {
   SeedRow("a", Version(10, 2));
-  // A non-unique index keys the pair (s, a) as "sa".
+  // A non-unique index keys secondary key s and primary key a as "sa".
   auto *index = tables_.GetTable(kTable)->GetSecondaryIndex("idx");
   auto *posting = index->tree.GetOrInsert("sa");
   posting->set_pk_len(1);

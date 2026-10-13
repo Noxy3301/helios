@@ -52,12 +52,12 @@ namespace helios::storage {
  * the item's first install.
  * A UNIQUE secondary item owns the primary-key list published with atomic
  * load and store. A non-unique item keys one (secondary key, primary key)
- * pair and holds no list: its key ends with the primary key, whose length it
+ * and holds no list: its key ends with the primary key, whose length it
  * keeps. All use transaction_id as their Silo version word.
  */
 struct DataItem {
   // Readers take `absent` from this word; the committer sets it at publish
-  // from IsLive(), or for a pair from its last change.
+  // from IsLive(), or for a non-unique index record from its last change.
   std::atomic<Tidword> transaction_id;
   std::shared_ptr<const PrimaryKeyList> primary_keys;
 
@@ -167,8 +167,9 @@ struct DataItem {
  private:
   pax::PaxGroup *group_ = nullptr;  // The group holding this item's slot.
   uint32_t slot_ = 0;               // Slot inside group_.
-  // A pair's primary-key length: its key ends with the primary key. The TID
-  // word orders it; relaxed access only keeps readers race-free.
+  // A non-unique index record's primary-key length: its key ends with the
+  // primary key. The TID word orders it; relaxed access only keeps readers
+  // race-free.
   std::atomic<uint16_t> pk_len_ = 0;
   size_t size_ = 0;  // Row length in bytes; zero once deleted.
 
@@ -189,13 +190,15 @@ static_assert(sizeof(DataItem) == 48, "DataItem must remain 48 bytes");
  * @brief Calls `fn` with each primary key a live secondary record points at,
  *        until `fn` returns true.
  *
- * A record without a list is a non-unique pair, whose key ends with its one
- * primary key. The caller reads `pk_len` and `list` under one live version of
- * the record.
+ * A record without a list is a non-unique index record, whose key ends with
+ * its one primary key. The caller reads `pk_len` and `list` under one live
+ * version of the record.
  *
  * @param key    The record's index key.
- * @param pk_len A pair's primary-key length; unused when `list` is set.
- * @param list   A UNIQUE record's primary-key list, or null for a pair.
+ * @param pk_len A non-unique index record's primary-key length; unused when
+ *               `list` is set.
+ * @param list   A UNIQUE record's primary-key list, or null for a non-unique
+ *               index record.
  * @return true when `fn` stopped the walk.
  */
 template <typename Fn>

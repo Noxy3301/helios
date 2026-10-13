@@ -209,7 +209,7 @@ bool HeliosTransaction::index_key_taken_by_own_write(
 
 void HeliosTransaction::record_index_op(
     const HeliosProxy::WriteOp& op) {
-  // The last op for one (secondary key, primary key) pair decides.
+  // The last op on a secondary key and primary key decides.
   pending_index_entries_[index_scope_key(op.table_name, op.index_name)]
                         [op.secondary_key][op.primary_key] =
       op.type == HeliosProxy::WriteOp::Type::SecondaryIndexWrite;
@@ -492,7 +492,8 @@ void HeliosTransaction::execute_read_plan(
                                 std::move(step_result.visited)};
       push_range_scan_cache(std::move(entry));
     } else {
-      // Keep secondary_keys and primary_keys aligned; lookup walks the pairs.
+      // Keep secondary_keys and primary_keys aligned; lookup walks each
+      // secondary key with its primary key.
       SecondaryScanCacheEntry cached;
       cached.table_name = step.table_name;
       cached.index_name = step.index_name;

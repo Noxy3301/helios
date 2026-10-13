@@ -366,8 +366,8 @@ bool Transaction::Prepare(DataItem &item, WriteEntry &entry,
     return true;
   }
 
-  // Apply the request's changes to the list this commit publishes. A pair
-  // holds no list and no constraint.
+  // Apply the request's changes to the list this commit publishes. A
+  // non-unique index record holds no list and no constraint.
   auto &index = std::get<IndexUpdate>(entry.update);
   if (index.constraint != IndexConstraint::kUnique) return true;
   index.primary_keys = std::atomic_load(&item.primary_keys);
@@ -497,8 +497,8 @@ bool Transaction::RevalidateSecondaryRange(const RangeEntry &range,
     DataItem *item = index->tree.Get(key);
     if (item == nullptr) return false;
 
-    // The key list and a pair's length are separate loads; abort if the word
-    // moved around them.
+    // The key list and a non-unique index record's primary-key length are
+    // separate loads; abort if the word moved around them.
     const Tidword tid = item->transaction_id.load();
     PrimaryKeyList::Ptr primary_keys;
     if (index->constraint == IndexConstraint::kUnique)
@@ -592,7 +592,8 @@ Tidword Transaction::Apply(DataItem &item, const WriteEntry &entry,
     return PublishedTid(commit_tid, item);
   }
 
-  // A pair holds no list; its last delta decides whether it is present.
+  // A non-unique index record holds no list; its last delta decides whether
+  // it is present.
   const auto &last = index.deltas.back();
   commit_tid.absent = last.op == wal::SecondaryIndexOp::kDelete;
   if (!commit_tid.absent) item.set_pk_len(last.primary_key.size());
@@ -624,7 +625,7 @@ void Transaction::Publish(DataItem &item, WriteEntry &entry,
   entry.owns_lock = false;
   if (!published.absent) return;
 
-  // A non-unique record sits under its secondary key and its one primary key.
+  // A non-unique index record sits under its secondary key and primary key.
   const auto *index = std::get_if<IndexUpdate>(&entry.update);
   if (index == nullptr || index->constraint == IndexConstraint::kUnique) {
     reaper_.Enqueue(*entry.index, entry.key, item, published);

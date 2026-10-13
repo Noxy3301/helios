@@ -229,7 +229,8 @@ EpochScanCheckpoint::CaptureResult EpochScanCheckpoint::CapturePrimaryRow(
  *
  * @details The keys are a complete posting list rather than a delta: recovery
  * expands it into adds and then applies the log's own adds and removes by
- * transaction id. A pair's list is the one primary key its key ends with.
+ * transaction id. A non-unique index record's list is the one primary key its
+ * key ends with.
  *
  * @param retries Incremented once per rejected attempt.
  * @return kTaken, kSkipped when the absent flag is set, or kUnstable.

@@ -273,10 +273,10 @@ class Database {
    * base row carries its TID for revalidation as a point read.
    *
    * A UNIQUE index keys a record by its secondary key. Any other index keys
-   * one record per pair by the secondary key followed by the primary key, so
-   * the range orders pairs: a bound past a secondary key is its prefix
-   * successor, and a reverse scan returns one secondary key's primary keys
-   * in descending order.
+   * one record per (secondary key, primary key) as the secondary key followed
+   * by the primary key, so the range is ordered by both: a bound past a
+   * secondary key is its prefix successor, and a reverse scan returns one
+   * secondary key's primary keys in descending order.
    *
    * @param table_name Base table.
    * @param index_name Secondary index name.

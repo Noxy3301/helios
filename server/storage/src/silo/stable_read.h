@@ -32,7 +32,7 @@ struct StablePrimaryKeys {
   bool found = false;
   PrimaryKeyList::Ptr primary_keys;
   Tidword tid;        // The version the list and the length belong to.
-  size_t pk_len = 0;  // A pair's primary-key length, as DataItem keeps it.
+  size_t pk_len = 0;  // A non-unique index record's pk_len().
 };
 
 /**
@@ -70,17 +70,18 @@ inline StableValue StableRead(const DataItem &item, bool keys_only = false) {
 
 /**
  * @brief Stable read of a secondary-index DataItem, pinning a UNIQUE record's
- * immutable primary-key list and taking a pair's primary-key length.
+ * immutable primary-key list and taking a non-unique index record's
+ * primary-key length.
  *
  * `found` is false when the word's absent bit is set, which the committer
- * publishes for an emptied list or a removed pair.
+ * publishes for an emptied list or a removed non-unique index record.
  */
 inline StablePrimaryKeys StableReadKeys(const DataItem &item,
                                         IndexConstraint constraint) {
   for (;;) {
     const Tidword tid = StableTid(item);
-    // Keep this immutable list alive even if a writer replaces it; a pair
-    // holds none.
+    // Keep this immutable list alive even if a writer replaces it; a
+    // non-unique index record holds none.
     PrimaryKeyList::Ptr primary_keys;
     if (constraint == IndexConstraint::kUnique)
       primary_keys = std::atomic_load(&item.primary_keys);

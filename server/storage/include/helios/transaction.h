@@ -191,10 +191,12 @@ class Transaction {
    * @details With `remove` true, `primary_key` leaves the secondary key's
    * list; otherwise it joins it. Uniqueness belongs to the named index, not to
    * this call. A UNIQUE index keeps one record per secondary key; any other
-   * keeps one per pair, keyed by `secondary_key` followed by `primary_key`.
+   * keeps one per (secondary key, primary key), keyed by `secondary_key`
+   * followed by `primary_key`.
    * @return false with reason `secondary_index_table_missing`,
    * `pax_schema_missing`, `secondary_index_missing`, or
-   * `secondary_key_too_long` when a pair's key exceeds the index's limit.
+   * `secondary_key_too_long` when a non-unique index record's key exceeds the
+   * index's limit.
    */
   bool IndexWrite(std::string_view table_name, std::string_view index_name,
                   std::string_view secondary_key, std::string_view primary_key,
@@ -272,7 +274,7 @@ class Transaction {
     Table *table;
     std::string_view index_name;  ///< Empty for a primary record.
     /// The key the log records: the primary key, or the secondary key,
-    /// without the primary key a non-unique record's tree key ends with.
+    /// without the primary key a non-unique index record's tree key ends with.
     std::string_view key;
     index::MasstreeIndex *index;  ///< The tree holding the record.
     bool owns_lock = false;
@@ -368,8 +370,8 @@ class Transaction {
    *
    * @pre Validation, preparation and slot reservation all succeeded.
    * @return `commit_tid` with the absent flag set when the record holds
-   * nothing: a row or a UNIQUE list left empty, or a pair whose last change
-   * removes it.
+   * nothing: a row or a UNIQUE list left empty, or a non-unique index record
+   * whose last change removes it.
    */
   static Tidword Apply(DataItem &item, const WriteEntry &entry,
                        Tidword commit_tid);
