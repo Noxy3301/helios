@@ -75,3 +75,7 @@ python3 bench/bin/benchrun.py ycsb --profile a --terminals 8 --scalefactor 100
 # TPC-H
 python3 bench/bin/benchrun.py tpch --terminals 1 --scalefactor 0.1 --time 300
 ```
+
+## Acknowledgments
+
+This work is partially based on results obtained from the project "Research and Development Project of the Enhanced Infrastructures for Post-5G Information and Communication Systems (JPNP20017)" by the New Energy and Industrial Technology Development Organization (NEDO).
