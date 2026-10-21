@@ -702,8 +702,7 @@ private:
   std::string pack_key(const uchar *key, key_part_map keypart_map);
   /**
    * @brief Packs the field's current value as key part `kp` in the
-   * order-preserving key packing (null marker, type tag, payload) shared by
-   * every key path.
+   * order-preserving key packing shared by every key path.
    */
   std::string pack_key_from_field(const KEY_PART_INFO &kp, Field *field);
   std::string build_secondary_key_from_row(const uchar *row_buffer, const KEY &key_info);

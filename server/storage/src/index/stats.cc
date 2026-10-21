@@ -6,6 +6,7 @@
 #include <xmmintrin.h>
 
 #include <algorithm>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -17,14 +18,6 @@
 #include "silo/stable_read.h"
 
 namespace helios::storage {
-
-namespace {
-
-// Packed SQL keys start with a null marker below 0xff, so this bounds them.
-constexpr size_t kSupremumSize = 16;
-const std::string kSupremum(kSupremumSize, '\xff');
-
-}  // namespace
 
 bool Database::IndexNdv(const std::string_view table_name,
                         const std::string_view index_name, uint32_t num_parts,
@@ -75,7 +68,7 @@ bool Database::IndexNdv(const std::string_view table_name,
 
   if (index_name.empty()) {
     // Primary index entries are base rows, so count live rows directly.
-    primary_index.Scan(std::string_view(), std::string_view(kSupremum),
+    primary_index.Scan(std::string_view(), std::nullopt,
                        [&](std::string_view key, IndexRecord &item) -> bool {
                          // The absent bit changes only when a commit
                          // publishes, so a locked word still shows the last
@@ -91,7 +84,7 @@ bool Database::IndexNdv(const std::string_view table_name,
     // A secondary key's index records are adjacent and the counted parts end
     // inside it, so after one live record the rest add nothing.
     index->tree.Scan(
-        std::string_view(), std::string_view(kSupremum),
+        std::string_view(), std::nullopt,
         [&](std::string_view key, IndexRecord &item) -> bool {
           const auto keys = silo::StableReadKeys(*index, key, item);
           if (!keys.found) return false;
@@ -134,7 +127,7 @@ bool Database::IndexHistogram(const std::string_view table_name,
   auto walk = [&](auto &&fn) {
     if (index_name.empty()) {
       table->GetPrimaryIndex().Scan(
-          std::string_view(), std::string_view(kSupremum),
+          std::string_view(), std::nullopt,
           [&](std::string_view key, IndexRecord &item) -> bool {
             if (item.transaction_id.load().absent) return false;
             if (leading_end(key) == 0) {
@@ -153,7 +146,7 @@ bool Database::IndexHistogram(const std::string_view table_name,
       // key once, so a bucket closes only between secondary keys.
       std::string pending;
       uint64_t pending_w = 0;
-      index->tree.Scan(std::string_view(), std::string_view(kSupremum),
+      index->tree.Scan(std::string_view(), std::nullopt,
                        [&](std::string_view key, IndexRecord &item) -> bool {
                          // A live record is one row: a non-unique index
                          // record, or the one owner of a UNIQUE key.

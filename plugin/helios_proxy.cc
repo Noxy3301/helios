@@ -165,7 +165,7 @@ bool HeliosProxy::ensure_connected() {
 
 bool HeliosProxy::fetch_table_stats(
     const std::string& ndv_table,
-    const std::vector<std::pair<std::string, uint32_t>>& ndv_indexes,
+    const std::vector<IndexStatsDesc>& ndv_indexes,
     bool force_ndv) {
     if (!ensure_connected()) return false;
 
@@ -174,10 +174,12 @@ bool HeliosProxy::fetch_table_stats(
     if (!ndv_table.empty()) {
         request.set_ndv_table(ndv_table);
         request.set_ndv_force_recompute(force_ndv);
-        for (const auto& [index_name, key_parts] : ndv_indexes) {
+        for (const auto& index : ndv_indexes) {
             auto* desc = request.add_ndv_indexes();
-            desc->set_index_name(index_name);
-            desc->set_num_key_parts(key_parts);
+            desc->set_index_name(index.index_name);
+            desc->set_num_key_parts(index.num_key_parts);
+            desc->mutable_part_widths()->Add(index.part_widths.begin(),
+                                             index.part_widths.end());
         }
     }
 

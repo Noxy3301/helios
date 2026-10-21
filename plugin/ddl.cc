@@ -258,6 +258,8 @@ int ha_helios::open(const char *table_name, int, uint, const dd::Table *) {
       HeliosFieldType helios_type = convert_mysql_type_to_helios(field->type());
       if (helios_type == HeliosFieldType::HELIOS_STRING) {
         packed_pk_size += key_pack::kMaxKeyLength;
+      } else if (const size_t width = key_pack::raw_part_width(*part)) {
+        packed_pk_size += width;
       } else {
         // INT/DATETIME/OTHER: marker(1) + type(1) + length(2) + payload
         packed_pk_size += 4 + field->pack_length();

@@ -14,40 +14,6 @@
 // Table statistics handler: row counts plus the process-wide NDV and
 // range-histogram caches consumed by the plugin cost model.
 
-namespace {
-
-// A key part is [0x00 not-null][type][2-byte big-endian length][payload].
-// Fills the offset past each of the leading num_parts parts; false leaves the key out.
-bool key_part_ends(std::string_view key, uint32_t num_parts, size_t* ends,
-                   bool allow_datetime) {
-    size_t off = 0;
-    for (uint32_t p = 0; p < num_parts; ++p) {
-        if (off + 4 > key.size()) return false;
-        const auto marker = static_cast<unsigned char>(key[off]);
-        const auto type = static_cast<unsigned char>(key[off + 1]);
-        if (marker != 0x00 || !(type == 0x10 || (allow_datetime && type == 0x30))) {
-            return false;
-        }
-        const size_t len =
-            (static_cast<size_t>(static_cast<unsigned char>(key[off + 2])) << 8) |
-            static_cast<unsigned char>(key[off + 3]);
-        off += 4 + len;
-        if (off > key.size()) return false;
-        ends[p] = off;
-    }
-    return true;
-}
-
-bool int_key_parts(std::string_view key, uint32_t n, size_t* ends) {
-    return key_part_ends(key, n, ends, false);
-}
-
-bool hist_key_parts(std::string_view key, uint32_t n, size_t* ends) {
-    return key_part_ends(key, n, ends, true);
-}
-
-}  // namespace
-
 std::mutex HeliosRpc::ndv_cache_mu_;
 std::unordered_map<std::string, std::pair<bool, std::vector<uint64_t>>>
     HeliosRpc::ndv_cache_;
@@ -70,6 +36,20 @@ void HeliosRpc::handleTxGetTableStats(
     if (!request.ndv_table().empty()) {
         auto db = db_manager_->get_database();
         for (const auto& desc : request.ndv_indexes()) {
+            // Fills the offset past each of the leading n parts from the
+            // part widths; false leaves the key out.
+            const auto& widths = desc.part_widths();
+            const auto parts = [&widths](std::string_view key, uint32_t n,
+                                         size_t* ends) {
+                if (n > static_cast<uint32_t>(widths.size())) return false;
+                size_t off = 0;
+                for (uint32_t p = 0; p < n; ++p) {
+                    off += widths[p];
+                    if (off > key.size()) return false;
+                    ends[p] = off;
+                }
+                return true;
+            };
             auto* out = response->add_index_ndv();
             out->set_index_name(desc.index_name());
 
@@ -97,7 +77,7 @@ void HeliosRpc::handleTxGetTableStats(
                 available = db->IndexNdv(request.ndv_table(),
                                                desc.index_name(),
                                                desc.num_key_parts(),
-                                               int_key_parts, ndv);
+                                               parts, ndv);
                 std::lock_guard<std::mutex> lock(ndv_cache_mu_);
                 ndv_cache_[cache_key] = {available, ndv};
             }
@@ -124,7 +104,7 @@ void HeliosRpc::handleTxGetTableStats(
                 hist.available = db->IndexHistogram(request.ndv_table(),
                                                           desc.index_name(),
                                                           kHistogramBuckets,
-                                                          hist_key_parts,
+                                                          parts,
                                                           hist.bounds,
                                                           hist.cum);
                 if (!hist.available) {

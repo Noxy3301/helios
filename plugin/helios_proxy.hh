@@ -43,10 +43,18 @@ public:
         std::vector<std::string> bounds;
         std::vector<uint64_t> cum;
     };
+    // One index to measure: NDV over its first num_key_parts parts (none
+    // when 0) and a histogram on its first part, whose bytes part_widths
+    // delimits (none when empty).
+    struct IndexStatsDesc {
+        std::string index_name;  // Empty means primary index.
+        uint32_t num_key_parts = 0;
+        std::vector<uint32_t> part_widths;
+    };
     // Refresh row counts, and optionally per-index NDV for one table.
     bool fetch_table_stats(
         const std::string& ndv_table = std::string(),
-        const std::vector<std::pair<std::string, uint32_t>>& ndv_indexes = {},
+        const std::vector<IndexStatsDesc>& ndv_indexes = {},
         bool force_ndv = false);
     const std::unordered_map<std::string, IndexNdvResult>& last_index_ndv() const {
         return last_index_ndv_;

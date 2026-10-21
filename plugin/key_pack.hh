@@ -35,8 +35,20 @@ std::string pack_int_key(const uchar *data, size_t len);
 std::string pack_datetime_key(const uchar *data, size_t len,
                               enum_field_types mysql_type);
 
-void append_key_part(std::string &out, bool is_null, HeliosFieldType type,
-                     const std::string &payload);
+/**
+ * @brief The width of a key part packed as its payload alone.
+ *
+ * @details A NOT NULL integer, DATE, DATETIME or TIMESTAMP part has a width
+ * the schema fixes, so it needs no null marker, type or length to sort and to
+ * stay apart from the next part. Every other part keeps them.
+ *
+ * @param kp The key part.
+ * @return The part's width in bytes, or 0 when it keeps the header.
+ */
+std::size_t raw_part_width(const KEY_PART_INFO &kp);
+
+void append_key_part(std::string &out, const KEY_PART_INFO &kp, bool is_null,
+                     HeliosFieldType type, const std::string &payload);
 std::string build_prefix_range_end(const std::string &prefix);
 
 /**
@@ -70,12 +82,12 @@ std::string string_weights(const KEY_PART_INFO &kp, const uchar *s, size_t len);
 bool index_key_too_long(const KEY &key_info, const std::string &secondary_key,
                         const std::string &primary_key);
 
-// "+infinity" end for an unbounded-upper range scan. 16 0xFF bytes sort after
-// every key (real keys start with the 0x00/0x01 null marker). An empty end will
-// not do: the server reads an empty plan-step end as a single-key range, and
-// the read-plan compiler and the consumer must pack identical bytes for the
-// cache to match.
-constexpr std::size_t kScanEndSentinelSize = 16;
+// "+infinity" end for an unbounded-upper range scan. It is one 0xFF byte longer
+// than the longest key, so it sorts after every key. An empty end will not do:
+// the server reads an empty plan-step end as a single-key range, and the
+// read-plan compiler and the consumer must pack identical bytes for the cache
+// to match.
+constexpr std::size_t kScanEndSentinelSize = kMaxKeyLength + 1;
 inline std::string scan_end_sentinel() {
   return std::string(kScanEndSentinelSize, '\xff');
 }

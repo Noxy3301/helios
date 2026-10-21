@@ -228,8 +228,9 @@ bool append_bound_keypart(
     return false;
   }
 
+  // A bound part takes a NOT NULL INT's four packed bytes.
   Field *target_field = target->key_info[ref->key].key_part[keypart_idx].field;
-  if (!is_int32_key_field(target_field)) {
+  if (!is_int32_key_field(target_field) || target_field->is_nullable()) {
     return false;
   }
 
@@ -267,10 +268,10 @@ bool append_bound_keypart(
     binding.from_key = true;
     uint offset = 0;
     for (int i = 0; i < pk_pos; ++i) {
-      offset += 4 + source_key.key_part[i].length;
+      offset += source_key.key_part[i].length;
     }
     binding.source_offset = offset;
-    binding.source_length = 4 + source_key.key_part[pk_pos].length;
+    binding.source_length = source_key.key_part[pk_pos].length;
   } else {
     if (!is_int32_key_field(source_field)) {
       return false;
