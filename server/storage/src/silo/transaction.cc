@@ -367,29 +367,25 @@ bool Transaction::Prepare(IndexRecord &item, WriteEntry &entry,
     return true;
   }
 
-  // Apply the request's changes to the list this commit publishes. A
-  // non-unique index record holds no list and no constraint.
+  // Apply the request's changes to the key this commit publishes. A
+  // non-unique index record holds no key and no constraint.
   auto &index = std::get<IndexUpdate>(entry.update);
   if (index.constraint != IndexConstraint::kUnique) return true;
-  index.primary_keys =
-      std::atomic_load(&static_cast<UniqueRecord &>(item).primary_keys);
+  const auto &unique = static_cast<UniqueRecord &>(item);
+  if (unique.IsLive()) index.primary_key = unique.primary_key();
   for (const auto &delta : index.deltas) {
     if (delta.op == wal::SecondaryIndexOp::kDelete) {
-      index.primary_keys =
-          PrimaryKeyList::erase(index.primary_keys, delta.primary_key);
+      if (index.primary_key == delta.primary_key) index.primary_key.reset();
       continue;
     }
     // A UNIQUE key holds one primary key; adding that same key again is not
     // a second one.
-    const PrimaryKeyList::View keys(index.primary_keys);
-    if (!keys.empty() &&
-        !(keys.size() == 1 && keys.contains(delta.primary_key))) {
+    if (index.primary_key && *index.primary_key != delta.primary_key) {
       reason =
           std::string(kDuplicateSecondaryKeyAbortPrefix) + "exists_after_lock";
       return false;
     }
-    index.primary_keys =
-        PrimaryKeyList::insert(index.primary_keys, delta.primary_key);
+    index.primary_key = delta.primary_key;
   }
   return true;
 }
@@ -500,39 +496,30 @@ bool Transaction::RevalidateSecondaryRange(const RangeEntry &range,
     IndexRecord *item = index->tree.Get(key);
     if (item == nullptr) return false;
 
-    // The key list and a non-unique index record's primary-key length are
-    // separate loads; abort if the word moved around them.
+    // The primary key and the word are separate loads; abort if the word
+    // moved around them.
     const Tidword tid = item->transaction_id.load();
-    PrimaryKeyList::Ptr primary_keys;
-    size_t pk_len = 0;
-    if (index->constraint == IndexConstraint::kUnique) {
-      primary_keys =
-          std::atomic_load(&static_cast<UniqueRecord *>(item)->primary_keys);
-    } else {
-      pk_len = static_cast<NonUniqueRecord *>(item)->pk_len();
-    }
+    const std::string_view primary_key =
+        index::split_entry(*index, key, *item).second;
     if (item->transaction_id.load() != tid ||
         !match_record(range, row, visited, key, item, tid, true, max_tid)) {
       matches = false;
       return true;
     }
 
-    // The entry's word fixes its primary keys, so its base records follow in
+    // The entry's word fixes its primary key, so its base record follows in
     // order. A missing base record reads as no record, as the scan skipped it.
     if (tid.absent) return false;
-    return for_each_primary_key(
-        key, pk_len, primary_keys, [&](std::string_view primary_key) {
-          IndexRecord *base = table->GetPrimaryIndex().Get(primary_key);
-          if (base == nullptr) return false;
-          const Tidword base_tid = base->transaction_id.load();
-          if (!match_record(range, row, visited, primary_key, base, base_tid,
-                            false, max_tid)) {
-            matches = false;
-            return true;
-          }
-          if (!base_tid.absent) ++live;
-          return range.limit > 0 && live >= range.limit;
-        });
+    IndexRecord *base = table->GetPrimaryIndex().Get(primary_key);
+    if (base == nullptr) return false;
+    const Tidword base_tid = base->transaction_id.load();
+    if (!match_record(range, row, visited, primary_key, base, base_tid, false,
+                      max_tid)) {
+      matches = false;
+      return true;
+    }
+    if (!base_tid.absent) ++live;
+    return range.limit > 0 && live >= range.limit;
   };
 
   if (range.reverse) {
@@ -597,12 +584,12 @@ Tidword Transaction::Apply(IndexRecord &record, const WriteEntry &entry,
   const auto &index = std::get<IndexUpdate>(entry.update);
   if (index.constraint == IndexConstraint::kUnique) {
     auto &item = static_cast<UniqueRecord &>(record);
-    std::atomic_store(&item.primary_keys, index.primary_keys);
+    item.set_primary_key(index.primary_key);
     return PublishedTid(commit_tid, item);
   }
 
-  // A non-unique index record holds no list; its last delta decides whether
-  // it is present.
+  // A non-unique index record holds no key; its last delta decides whether it
+  // is present.
   const auto &last = index.deltas.back();
   commit_tid.absent = last.op == wal::SecondaryIndexOp::kDelete;
   if (!commit_tid.absent) {

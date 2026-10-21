@@ -162,9 +162,9 @@ std::function<void(EpochNumber)> Database::MakeEpochHook() {
       reaper_.Purge(closed_epoch);
     }
 
-    // Tick masstree's epoch, which paces only the RCU freeing of retired
-    // leaves and index records, at most once per epoch duration however often
-    // requests advance E. Workers leave it through ReleaseThreadEpoch.
+    // Tick masstree's epoch, which paces only RCU frees of retired leaves,
+    // index records and UNIQUE key blocks, at most once per epoch duration
+    // however often requests advance E; workers leave via ReleaseThreadEpoch.
     const auto now = std::chrono::steady_clock::now();
     if (now - last_tick >= interval) {
       last_tick = now;
@@ -290,9 +290,17 @@ void Database::Recover() {
             "primary keys",
             entry.index_name, entry.key, entry.primary_keys.size());
         if (idx->constraint == IndexConstraint::kUnique) {
+          // A commit never leaves a UNIQUE key with two primary keys.
+          if (entry.primary_keys.size() != 1) {
+            SPDLOG_CRITICAL(
+                "Recovery failed: UNIQUE key {0} of index {1} restores {2} "
+                "primary keys",
+                entry.key, entry.index_name, entry.primary_keys.size());
+            exit(EXIT_FAILURE);
+          }
           auto *item = static_cast<UniqueRecord *>(idx->tree.Put(entry.key));
           item->transaction_id.store(entry.tid);
-          item->set_primary_keys(entry.primary_keys);
+          item->set_primary_key(entry.primary_keys.front());
         } else {
           // A non-unique index keeps one record per
           // (secondary key, primary key), under the secondary key followed by

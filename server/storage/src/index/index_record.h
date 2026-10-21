@@ -20,26 +20,22 @@
 /**
  * @file server/storage/src/index/index_record.h
  * What the index maps a key to: the Silo transaction id word and the row
- * payload behind it, or the primary keys a secondary key points at.
+ * payload behind it, or the primary key a secondary key points at.
  */
 
 #ifndef HELIOS_STORAGE_SRC_INDEX_INDEX_RECORD_H
 #define HELIOS_STORAGE_SRC_INDEX_INDEX_RECORD_H
 
-#include <algorithm>
 #include <atomic>
 #include <cassert>
 #include <cstddef>
 #include <cstdint>
-#include <memory>
+#include <optional>
 #include <string>
 #include <string_view>
-#include <utility>
-#include <vector>
 
 #include "helios/pax.h"
 
-#include "index/primary_key_list.h"
 #include "silo/tidword.h"
 #include "util/epoch.h"
 
@@ -86,32 +82,37 @@ static_assert(sizeof(NonUniqueRecord) == 16,
               "NonUniqueRecord must remain 16 bytes");
 
 /**
- * @brief A UNIQUE index record: it owns the primary-key list published with
- *        atomic load and store.
+ * @brief A UNIQUE index record: the one primary key its secondary key points
+ *        at, or none.
+ *
+ * @details A commit refuses a second primary key for a UNIQUE key, so one is
+ * all a record holds. The key lives in an immutable block that the committer
+ * replaces under the TID lock and frees after the RCU grace period.
  */
 struct UniqueRecord : IndexRecord {
-  std::shared_ptr<const PrimaryKeyList> primary_keys;
+  ~UniqueRecord();
 
-  bool IsLive() const {
-    const auto keys = std::atomic_load(&primary_keys);
-    return keys && keys->count != 0;
-  }
+  bool IsLive() const { return primary_key_.load() != nullptr; }
 
-  void set_primary_keys(const std::vector<std::string> &keys) {
-    assert(IsSortedDeduped(keys));
-    auto packed = PrimaryKeyList::from_sorted_deduped(keys);
-    std::atomic_store(&primary_keys, std::move(packed));
-  }
+  /**
+   * @brief Returns the primary key, empty when the record holds none.
+   * @note Read it under one version of the TID word. The view stays valid
+   * until the calling thread releases its epoch.
+   */
+  std::string_view primary_key() const;
+
+  /**
+   * @brief Publishes `key`, or no key for nullopt.
+   * @note The caller holds the TID lock, or is recovery before readers start.
+   */
+  void set_primary_key(std::optional<std::string_view> key);
 
  private:
-  static bool IsSortedDeduped(const std::vector<std::string> &keys) {
-    return std::adjacent_find(
-               keys.begin(), keys.end(),
-               [](const std::string &lhs, const std::string &rhs) {
-                 return !(lhs < rhs);
-               }) == keys.end();
-  }
+  // A uint32_t length then the key bytes, from std::malloc; null for none.
+  std::atomic<char *> primary_key_{nullptr};
 };
+
+static_assert(sizeof(UniqueRecord) == 16, "UniqueRecord must remain 16 bytes");
 
 /**
  * @brief A primary index record: it refers to a PAX slot its table hands out
@@ -175,29 +176,5 @@ struct RowRecord : IndexRecord {
 
 static_assert(sizeof(RowRecord) == 24, "RowRecord must remain 24 bytes");
 
-/**
- * @brief Calls `fn` with each primary key a live secondary record points at,
- *        until `fn` returns true.
- *
- * A record without a list is a non-unique index record, whose key ends with
- * its one primary key. The caller reads `pk_len` and `list` under one live
- * version of the record.
- *
- * @param key    The record's index key.
- * @param pk_len A non-unique index record's primary-key length; unused when
- *               `list` is set.
- * @param list   A UNIQUE record's primary-key list, or null for a non-unique
- *               index record.
- * @return true when `fn` stopped the walk.
- */
-template <typename Fn>
-bool for_each_primary_key(std::string_view key, size_t pk_len,
-                          const PrimaryKeyList::Ptr &list, Fn &&fn) {
-  if (!list) return fn(key.substr(key.size() - pk_len));
-  for (std::string_view primary_key : PrimaryKeyList::View(list)) {
-    if (fn(primary_key)) return true;
-  }
-  return false;
-}
 }  // namespace helios::storage
 #endif  // HELIOS_STORAGE_SRC_INDEX_INDEX_RECORD_H

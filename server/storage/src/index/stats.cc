@@ -90,25 +90,17 @@ bool Database::IndexNdv(const std::string_view table_name,
     // Secondary entries count only if one referenced base row is live.
     // A secondary key's index records are adjacent and the counted parts end
     // inside it, so after one live record the rest add nothing.
-    index->tree.Scan(std::string_view(), std::string_view(kSupremum),
-                     [&](std::string_view key, IndexRecord &item) -> bool {
-                       const auto keys =
-                           silo::StableReadKeys(item, index->constraint);
-                       if (!keys.found) return false;
-                       const std::string_view secondary_key =
-                           key.substr(0, key.size() - keys.pk_len);
-                       if (!first && secondary_key == prev_key) return false;
-                       const bool live = for_each_primary_key(
-                           key, keys.pk_len, keys.primary_keys,
-                           [&](std::string_view primary_key) {
-                             IndexRecord *base_item =
-                                 primary_index.Get(primary_key);
-                             return base_item != nullptr &&
-                                    !base_item->transaction_id.load().absent;
-                           });
-                       if (!live) return false;
-                       return count_key(secondary_key);
-                     });
+    index->tree.Scan(
+        std::string_view(), std::string_view(kSupremum),
+        [&](std::string_view key, IndexRecord &item) -> bool {
+          const auto keys = silo::StableReadKeys(*index, key, item);
+          if (!keys.found) return false;
+          if (!first && keys.secondary_key == prev_key) return false;
+          IndexRecord *base_item = primary_index.Get(keys.primary_key);
+          if (base_item == nullptr || base_item->transaction_id.load().absent)
+            return false;
+          return count_key(keys.secondary_key);
+        });
   }
 
   if (failed) {
@@ -166,20 +158,18 @@ bool Database::IndexHistogram(const std::string_view table_name,
                          // A live record is one row: a non-unique index
                          // record, or the one owner of a UNIQUE key.
                          const auto keys =
-                             silo::StableReadKeys(item, index->constraint);
+                             silo::StableReadKeys(*index, key, item);
                          if (!keys.found) return false;  // dead secondary entry
                          if (leading_end(key) == 0) {
                            failed = true;
                            return true;
                          }
-                         const std::string_view secondary_key =
-                             key.substr(0, key.size() - keys.pk_len);
-                         if (pending_w != 0 && secondary_key == pending) {
+                         if (pending_w != 0 && keys.secondary_key == pending) {
                            ++pending_w;
                            return false;
                          }
                          if (pending_w != 0) fn(pending, pending_w);
-                         pending.assign(secondary_key);
+                         pending.assign(keys.secondary_key);
                          pending_w = 1;
                          return false;
                        });

@@ -17,6 +17,7 @@
 #include "helios/index.h"
 
 #include "index/index_record.h"
+#include "index/secondary_index.h"
 #include "silo/tidword.h"
 
 namespace helios::storage {
@@ -30,9 +31,9 @@ struct StableValue {
 
 struct StablePrimaryKeys {
   bool found = false;
-  PrimaryKeyList::Ptr primary_keys;
-  Tidword tid;        // The version the list and the length belong to.
-  size_t pk_len = 0;  // A non-unique index record's pk_len().
+  Tidword tid;  // The version the two keys belong to.
+  std::string_view secondary_key;
+  std::string_view primary_key;  // Meaningful only when `found`.
 };
 
 /**
@@ -69,31 +70,23 @@ inline StableValue StableRead(const RowRecord &item, bool keys_only = false) {
 }
 
 /**
- * @brief Stable read of a secondary index record, pinning a UNIQUE record's
- * immutable primary-key list and taking a non-unique index record's
- * primary-key length.
+ * @brief Stable read of a secondary index record: its secondary key and the
+ * primary key it points at, under one version of its TID word.
  *
  * `found` is false when the word's absent bit is set, which the committer
- * publishes for an emptied list or a removed non-unique index record.
+ * publishes for an emptied UNIQUE key or a removed non-unique index record.
+ * The keys view `key` and the record's block, which stays valid until the
+ * thread releases its epoch.
  */
-inline StablePrimaryKeys StableReadKeys(const IndexRecord &item,
-                                        IndexConstraint constraint) {
+inline StablePrimaryKeys StableReadKeys(const index::SecondaryIndex &index,
+                                        std::string_view key,
+                                        const IndexRecord &item) {
   for (;;) {
     const Tidword tid = StableTid(item);
-    // Keep this immutable list alive even if a writer replaces it; a
-    // non-unique index record holds none.
-    PrimaryKeyList::Ptr primary_keys;
-    size_t pk_len = 0;
-    if (constraint == IndexConstraint::kUnique) {
-      primary_keys = std::atomic_load(
-          &static_cast<const UniqueRecord &>(item).primary_keys);
-    } else {
-      pk_len = static_cast<const NonUniqueRecord &>(item).pk_len();
-    }
-    const bool found = !tid.absent;
-
+    const auto [secondary_key, primary_key] =
+        index::split_entry(index, key, item);
     if (item.transaction_id.load() == tid) {
-      return {found, std::move(primary_keys), tid, pk_len};
+      return {!tid.absent, tid, secondary_key, primary_key};
     }
   }
 }

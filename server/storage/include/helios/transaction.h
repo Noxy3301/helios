@@ -9,6 +9,7 @@
 
 #include <cstdint>
 #include <map>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <variant>
@@ -266,8 +267,8 @@ class Transaction {
     };
     IndexConstraint constraint;
     std::vector<Delta> deltas;  ///< Request order, logged as is.
-    /// Final list of a UNIQUE record, built under the lock.
-    PrimaryKeyList::Ptr primary_keys;
+    /// Final primary key of a UNIQUE record, chosen under the lock.
+    std::optional<std::string_view> primary_key;
   };
 
   struct WriteEntry {
@@ -318,7 +319,8 @@ class Transaction {
   bool Abort();
 
   /**
-   * @brief Checks the INSERT or UNIQUE constraint and builds the final list.
+   * @brief Checks the INSERT or UNIQUE constraint and chooses a UNIQUE
+   * record's final primary key.
    *
    * @pre The record is locked and no stored value has changed.
    * @return false with reason set when the constraint fails.
@@ -370,7 +372,7 @@ class Transaction {
    *
    * @pre Validation, preparation and slot reservation all succeeded.
    * @return `commit_tid` with the absent flag set when the record holds
-   * nothing: a row or a UNIQUE list left empty, or a non-unique index record
+   * nothing: a row or a UNIQUE key left empty, or a non-unique index record
    * whose last change removes it.
    */
   static Tidword Apply(IndexRecord &record, const WriteEntry &entry,

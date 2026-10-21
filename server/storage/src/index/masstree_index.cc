@@ -306,6 +306,12 @@ void advance_epoch() {
   active_epoch.store(threadinfo::min_active_epoch());
 }
 
+void free_rcu(void *ptr, size_t size) {
+  ensure_thread_active();
+  // Masstree returns a value-tagged block to free() after the grace period.
+  tls_ti->deallocate_rcu(ptr, size, memtag_value);
+}
+
 void release_thread_epoch() {
   // Release the epoch and reclaim items whose RCU grace period has passed.
   if (tls_ti == nullptr) return;

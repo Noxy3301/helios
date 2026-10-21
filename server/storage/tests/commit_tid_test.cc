@@ -733,14 +733,12 @@ TEST_F(CommitTidTest, UniqueIndexTakesASecondAdditionThatFollowsARemoval) {
                       {kTable, "uidx", "s", "b", false}}))
       << reason_;
 
-  auto *posting =
-      tables_.GetTable(kTable)->GetSecondaryIndex("uidx")->tree.Get("s");
+  auto *index = tables_.GetTable(kTable)->GetSecondaryIndex("uidx");
+  auto *posting = index->tree.Get("s");
   ASSERT_NE(nullptr, posting);
-  const auto keys = silo::StableReadKeys(*posting, IndexConstraint::kUnique);
+  const auto keys = silo::StableReadKeys(*index, "s", *posting);
   EXPECT_TRUE(keys.found);
-  const PrimaryKeyList::View view(keys.primary_keys);
-  ASSERT_EQ(1u, view.size());
-  EXPECT_EQ("b", *view.begin());
+  EXPECT_EQ("b", keys.primary_key);
   index::release_thread_epoch();
 }
 

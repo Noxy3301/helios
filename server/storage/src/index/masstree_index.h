@@ -88,6 +88,12 @@ class MasstreeIndex final {
 void advance_epoch();
 
 /**
+ * @brief Frees `ptr`, a std::malloc block of `size` bytes, once every thread
+ *        that could have loaded it has released its epoch.
+ */
+void free_rcu(void *ptr, size_t size);
+
+/**
  * @brief Releases this thread's Masstree epoch.
  * @details Call only after finishing with all pointers obtained in that epoch.
  * The next index operation enters an epoch again.

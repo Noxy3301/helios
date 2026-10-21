@@ -221,14 +221,14 @@ TEST(MasstreeIndexTest, ReaperDoesNotPurgeReusedSecondaryEntry) {
   EXPECT_EQ(item, tree.Get("secondary"));
 
   // A later insertion reuses the index record and publishes a newer TID.
-  item->set_primary_keys({"primary"});
+  item->set_primary_key("primary");
   item->transaction_id.store(make_tidword(10, 4, /*absent=*/false));
   reaper.Purge(10);
   EXPECT_EQ(item, tree.Get("secondary"));
   EXPECT_TRUE(item->IsLive());
 
   // Deleting that last posting allows the same tree to purge the record.
-  item->set_primary_keys({});
+  item->set_primary_key(std::nullopt);
   const Tidword deleted_again = make_tidword(12, 6, /*absent=*/true);
   item->transaction_id.store(deleted_again);
   reaper.Enqueue(tree, "secondary", *item, deleted_again);
