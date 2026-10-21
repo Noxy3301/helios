@@ -109,7 +109,7 @@ struct GroupImageState;  // pax/epoch_image_buffer.h
  * @brief Stores a fixed-size row group as per-field PAX strips.
  *
  * @details Each logical row occupies the same slot number in every field
- * strip. The row's bytes are stored in the strip cells; `DataItem` continues
+ * strip. The row's bytes are stored in the strip cells; `RowRecord` continues
  * to own the transaction id word, so Silo validation remains outside this
  * storage class. Callers invoke `ScatterRow()` only while holding the row's
  * existing Silo TID lock. `GatherRow()` is memory-safe under a concurrent
@@ -187,7 +187,7 @@ class PaxGroup {
    *
    * @param slot Source slot inside this group.
    * @param dst Destination buffer with room for `expected_size` bytes.
-   * @param expected_size Row payload length tracked in `DataItem::size()`.
+   * @param expected_size Row payload length tracked in `RowRecord::size()`.
    * @return Number of bytes written, equal to `expected_size` when the slot is
    * quiet and the stored row is intact.
    */

@@ -11,7 +11,7 @@
 #include <optional>
 #include <string_view>
 
-#include "index/data_item.h"
+#include "index/index_record.h"
 
 namespace helios::storage {
 namespace index {
@@ -21,27 +21,32 @@ namespace index {
 inline constexpr size_t kMaxKeyLength = 255;
 
 /**
- * @brief Maps ordered keys to DataItems.
- * @details DataItem pointers stay valid until this thread calls
+ * @brief Maps ordered keys to index records of one RecordType.
+ * @details Record pointers stay valid until this thread calls
  * release_thread_epoch().
  */
 class MasstreeIndex final {
  public:
-  MasstreeIndex();
+  explicit MasstreeIndex(RecordType type = RecordType::kRow);
   ~MasstreeIndex();
 
-  DataItem *Get(std::string_view key);
-  void Put(std::string_view key, DataItem &&value);
+  IndexRecord *Get(std::string_view key);
 
   /**
-   * @brief Gets the entry for key, creating an absent DataItem if needed.
+   * @brief Maps key to a new absent record, replacing any entry it had.
+   * @return The new record, for the caller to fill before readers start.
+   */
+  IndexRecord *Put(std::string_view key);
+
+  /**
+   * @brief Gets the entry for key, creating an absent record if needed.
    * @details The reaper may unlink the record afterwards; Commit checks the
    * record's latest bit after locking it.
    * @param expect_new A hint that the index likely has no entry for key. It
    * skips the optimistic lookup and affects cost, not the result.
    * @return Non-null; allocation failure throws.
    */
-  DataItem *GetOrInsert(std::string_view key, bool expect_new = false);
+  IndexRecord *GetOrInsert(std::string_view key, bool expect_new = false);
 
   /**
    * @brief Walks [begin, end) upwards; nullopt for `end` means no upper bound.
@@ -50,7 +55,7 @@ class MasstreeIndex final {
    * @return Visited key count, including the key that stopped the scan.
    */
   size_t Scan(std::string_view begin, std::optional<std::string_view> end,
-              std::function<bool(std::string_view, DataItem &)> operation);
+              std::function<bool(std::string_view, IndexRecord &)> operation);
 
   /**
    * @brief Walks the same half-open range downwards, from below `end`;
@@ -59,18 +64,17 @@ class MasstreeIndex final {
    */
   size_t ScanReverse(
       std::string_view begin, std::optional<std::string_view> end,
-      std::function<bool(std::string_view, DataItem &)> operation);
+      std::function<bool(std::string_view, IndexRecord &)> operation);
 
   // Visits all keys unless the callback returns true to stop.
-  void ForEach(std::function<bool(std::string_view, DataItem &)> operation);
+  void ForEach(std::function<bool(std::string_view, IndexRecord &)> operation);
 
   /**
    * @brief Removes a tombstone after the reaper locks it and checks its TID.
    * @details Publishes retired_tid before queuing the item for RCU deletion.
    * @return False if key no longer points to expected; true after removal.
    */
-  bool Purge(std::string_view key, DataItem &expected,
-             Tidword retired_tid);
+  bool Purge(std::string_view key, IndexRecord &expected, Tidword retired_tid);
 
  private:
   // Keep Masstree headers out of callers.
@@ -82,6 +86,12 @@ class MasstreeIndex final {
  * @brief Advances Masstree's epoch from the storage epoch thread.
  */
 void advance_epoch();
+
+/**
+ * @brief Frees `ptr`, a std::malloc block of `size` bytes, once every thread
+ *        that could have loaded it has released its epoch.
+ */
+void free_rcu(void *ptr, size_t size);
 
 /**
  * @brief Releases this thread's Masstree epoch.

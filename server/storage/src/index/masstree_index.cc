@@ -47,7 +47,7 @@ class key_unparse_unsigned {
 };
 
 struct table_params : public Masstree::nodeparams<15, 15> {
-  using value_type = DataItem *;
+  using value_type = IndexRecord *;
   using value_print_type = Masstree::value_print<value_type>;
   using threadinfo_type = threadinfo;
   using key_unparse_type = key_unparse_unsigned;
@@ -76,7 +76,7 @@ inline void ensure_thread_init() {
   }
 }
 
-// Keep the original epoch while the caller still uses its DataItems.
+// Keep the original epoch while the caller still uses its records.
 inline void ensure_thread_active() {
   ensure_thread_init();
   if (!tls_enrolled) {
@@ -85,20 +85,33 @@ inline void ensure_thread_active() {
   }
 }
 
+IndexRecord *new_record(RecordType type) {
+  if (type == RecordType::kNonUnique) return new NonUniqueRecord();
+  if (type == RecordType::kUnique) return new UniqueRecord();
+  return new RowRecord();
+}
+
 // Delete the item after the RCU grace period, then free this callback.
 struct RcuFreeCallback : public threadinfo::mrcu_callback {
-  DataItem *item;
-  explicit RcuFreeCallback(DataItem *it) : item(it) {}
+  IndexRecord *item;
+  RecordType type;
+  RcuFreeCallback(IndexRecord *it, RecordType t) : item(it), type(t) {}
   void operator()(threadinfo &ti) override {
-    delete item;
+    if (type == RecordType::kNonUnique) {
+      delete static_cast<NonUniqueRecord *>(item);
+    } else if (type == RecordType::kUnique) {
+      delete static_cast<UniqueRecord *>(item);
+    } else {
+      delete static_cast<RowRecord *>(item);
+    }
     ti.deallocate(this, sizeof(RcuFreeCallback), memtag_masstree_gc);
   }
 };
 
-inline void RcuFree(DataItem *item) {
+inline void RcuFree(IndexRecord *item, RecordType type) {
   if (item == nullptr) return;
   void *mem = tls_ti->allocate(sizeof(RcuFreeCallback), memtag_masstree_gc);
-  auto *operation = new (mem) RcuFreeCallback(item);
+  auto *operation = new (mem) RcuFreeCallback(item, type);
   tls_ti->rcu_register(operation);
 }
 
@@ -113,14 +126,14 @@ Masstree::Str scan_first_key(std::string_view key) {
 struct Scanner {
   std::optional<std::string_view> begin;
   std::optional<std::string_view> end;
-  std::function<bool(std::string_view, DataItem &)> operation;
+  std::function<bool(std::string_view, IndexRecord &)> operation;
   size_t count = 0;
 
   template <typename SS, typename K>
   void visit_leaf(const SS &, const K &, threadinfo &) {}
 
   // Masstree returns true to continue; our callback returns true to stop.
-  bool visit_value(Masstree::Str key, DataItem *item, threadinfo &) {
+  bool visit_value(Masstree::Str key, IndexRecord *item, threadinfo &) {
     const std::string_view scanned_key(key.s, key.len);
     if (end && scanned_key >= *end) return false;
     if (begin && scanned_key < *begin) return false;
@@ -133,8 +146,9 @@ struct Scanner {
 
 struct MasstreeIndex::Impl {
   table_type table_;
+  const RecordType type_;
 
-  Impl() {
+  explicit Impl(RecordType type) : type_(type) {
     // Initialize inside an RCU epoch; preserve any epoch the caller already holds.
     ensure_thread_init();
     const bool was_enrolled = tls_enrolled;
@@ -152,17 +166,16 @@ struct MasstreeIndex::Impl {
     // destroy() only queues cleanup; this destructor does not run it.
   }
 
-  DataItem *Get(std::string_view key) {
+  IndexRecord *Get(std::string_view key) {
     ensure_thread_active();
     unlocked_cursor_type lp(table_, key.data(), key.size());
     if (lp.find_unlocked(*tls_ti)) return lp.value();
     return nullptr;
   }
 
-  // Insert or replace the entry with an owned DataItem.
-  void Put(std::string_view key, DataItem &&value) {
+  IndexRecord *Put(std::string_view key) {
     ensure_thread_active();
-    auto *item = new DataItem(std::move(value));
+    IndexRecord *item = new_record(type_);
     cursor_type lp(table_, key.data(), key.size());
     bool found = lp.find_insert(*tls_ti);
     // Keep the old item alive for readers that still hold its pointer.
@@ -170,11 +183,11 @@ struct MasstreeIndex::Impl {
     fence();
     // Report 1 for a new key, 0 for replacement, to keep leaf versions correct.
     lp.finish(found ? 0 : 1, *tls_ti);
+    return item;
   }
 
   // The reaper has locked the item and checked its delete TID.
-  bool Purge(std::string_view key, DataItem &expected,
-             Tidword retired_tid) {
+  bool Purge(std::string_view key, IndexRecord &expected, Tidword retired_tid) {
     ensure_thread_active();
     cursor_type lp(table_, key.data(), key.size());
     const bool found = lp.find_locked(*tls_ti);
@@ -182,7 +195,7 @@ struct MasstreeIndex::Impl {
       lp.finish(0, *tls_ti);
       return false;
     }
-    DataItem *current = lp.value();
+    IndexRecord *current = lp.value();
     if (current != &expected) {
       // Do not remove a replacement stored under the same key.
       lp.finish(0, *tls_ti);
@@ -194,11 +207,11 @@ struct MasstreeIndex::Impl {
     // readers that still hold its pointer.
     lp.finish(-1, *tls_ti);
     current->transaction_id.store(retired_tid);
-    RcuFree(current);
+    RcuFree(current, type_);
     return true;
   }
 
-  DataItem *GetOrInsert(std::string_view key, bool expect_new) {
+  IndexRecord *GetOrInsert(std::string_view key, bool expect_new) {
     // Existing entries need only the optimistic lookup, which a key expected
     // to be new skips.
     if (expect_new) {
@@ -210,15 +223,15 @@ struct MasstreeIndex::Impl {
     // Find the entry under the leaf lock, or publish a new absent one.
     cursor_type lp(table_, key.data(), key.size());
     bool found = lp.find_insert(*tls_ti);
-    if (!found) lp.value() = new DataItem();
-    DataItem *item = lp.value();
+    if (!found) lp.value() = new_record(type_);
+    IndexRecord *item = lp.value();
     fence();
     lp.finish(found ? 0 : 1, *tls_ti);
     return item;
   }
 
   size_t Scan(std::string_view begin, std::optional<std::string_view> end,
-              std::function<bool(std::string_view, DataItem &)> op) {
+              std::function<bool(std::string_view, IndexRecord &)> op) {
     ensure_thread_active();
     // Start at begin; the scanner stops before end.
     Scanner scanner{std::nullopt, end, std::move(op)};
@@ -229,7 +242,7 @@ struct MasstreeIndex::Impl {
 
   size_t ScanReverse(std::string_view begin,
                      std::optional<std::string_view> end,
-                     std::function<bool(std::string_view, DataItem &)> op) {
+                     std::function<bool(std::string_view, IndexRecord &)> op) {
     ensure_thread_active();
     // Start below end and stop when a key is smaller than begin.
     Scanner scanner{begin, std::nullopt, std::move(op)};
@@ -247,38 +260,41 @@ struct MasstreeIndex::Impl {
   }
 };
 
-MasstreeIndex::MasstreeIndex() : impl_(std::make_unique<Impl>()) {}
+MasstreeIndex::MasstreeIndex(RecordType type)
+    : impl_(std::make_unique<Impl>(type)) {}
 
 MasstreeIndex::~MasstreeIndex() = default;
 
-DataItem *MasstreeIndex::Get(std::string_view key) { return impl_->Get(key); }
-
-void MasstreeIndex::Put(std::string_view key, DataItem &&value) {
-  impl_->Put(key, std::move(value));
+IndexRecord *MasstreeIndex::Get(std::string_view key) {
+  return impl_->Get(key);
 }
 
-DataItem *MasstreeIndex::GetOrInsert(std::string_view key, bool expect_new) {
+IndexRecord *MasstreeIndex::Put(std::string_view key) {
+  return impl_->Put(key);
+}
+
+IndexRecord *MasstreeIndex::GetOrInsert(std::string_view key, bool expect_new) {
   return impl_->GetOrInsert(key, expect_new);
 }
 
 size_t MasstreeIndex::Scan(
     std::string_view begin, std::optional<std::string_view> end,
-    std::function<bool(std::string_view, DataItem &)> operation) {
+    std::function<bool(std::string_view, IndexRecord &)> operation) {
   return impl_->Scan(begin, end, std::move(operation));
 }
 
 size_t MasstreeIndex::ScanReverse(
     std::string_view begin, std::optional<std::string_view> end,
-    std::function<bool(std::string_view, DataItem &)> operation) {
+    std::function<bool(std::string_view, IndexRecord &)> operation) {
   return impl_->ScanReverse(begin, end, std::move(operation));
 }
 
 void MasstreeIndex::ForEach(
-    std::function<bool(std::string_view, DataItem &)> operation) {
+    std::function<bool(std::string_view, IndexRecord &)> operation) {
   impl_->Scan(std::string_view(), std::nullopt, std::move(operation));
 }
 
-bool MasstreeIndex::Purge(std::string_view key, DataItem &expected,
+bool MasstreeIndex::Purge(std::string_view key, IndexRecord &expected,
                           Tidword retired_tid) {
   return impl_->Purge(key, expected, retired_tid);
 }
@@ -288,6 +304,12 @@ void advance_epoch() {
   std::lock_guard<std::mutex> lg(thread_init_mutex);
   globalepoch.store(globalepoch.load() + 1);
   active_epoch.store(threadinfo::min_active_epoch());
+}
+
+void free_rcu(void *ptr, size_t size) {
+  ensure_thread_active();
+  // Masstree returns a value-tagged block to free() after the grace period.
+  tls_ti->deallocate_rcu(ptr, size, memtag_value);
 }
 
 void release_thread_epoch() {

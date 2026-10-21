@@ -61,8 +61,8 @@ struct WriteBehindTheCursor {
   }
 };
 
-// Two-byte key parts; a non-unique record's key continues with its primary
-// key, which no part reaches.
+// Two-byte key parts; a non-unique index record's key continues with its
+// primary key, which no part reaches.
 bool two_byte_parts(std::string_view key, uint32_t num_parts, size_t *ends) {
   if (key.size() < 2 * num_parts) return false;
   for (uint32_t part = 0; part < num_parts; ++part) ends[part] = 2 * (part + 1);

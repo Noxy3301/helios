@@ -12,7 +12,7 @@
 
 #include "helios/database.h"
 
-#include "index/data_item.h"
+#include "index/index_record.h"
 #include "index/secondary_index.h"
 #include "silo/stable_read.h"
 
@@ -76,7 +76,7 @@ bool Database::IndexNdv(const std::string_view table_name,
   if (index_name.empty()) {
     // Primary index entries are base rows, so count live rows directly.
     primary_index.Scan(std::string_view(), std::string_view(kSupremum),
-                       [&](std::string_view key, DataItem &item) -> bool {
+                       [&](std::string_view key, IndexRecord &item) -> bool {
                          // The absent bit changes only when a commit
                          // publishes, so a locked word still shows the last
                          // committed state.
@@ -88,27 +88,19 @@ bool Database::IndexNdv(const std::string_view table_name,
     if (index == nullptr) return false;
 
     // Secondary entries count only if one referenced base row is live.
-    // A secondary key's pairs are adjacent and the counted parts end inside
-    // it, so after one live pair the rest add nothing.
-    index->tree.Scan(std::string_view(), std::string_view(kSupremum),
-                     [&](std::string_view key, DataItem &item) -> bool {
-                       const auto keys =
-                           silo::StableReadKeys(item, index->constraint);
-                       if (!keys.found) return false;
-                       const std::string_view secondary_key =
-                           key.substr(0, key.size() - keys.pk_len);
-                       if (!first && secondary_key == prev_key) return false;
-                       const bool live = for_each_primary_key(
-                           key, keys.pk_len, keys.primary_keys,
-                           [&](std::string_view primary_key) {
-                             DataItem *base_item =
-                                 primary_index.Get(primary_key);
-                             return base_item != nullptr &&
-                                    !base_item->transaction_id.load().absent;
-                           });
-                       if (!live) return false;
-                       return count_key(secondary_key);
-                     });
+    // A secondary key's index records are adjacent and the counted parts end
+    // inside it, so after one live record the rest add nothing.
+    index->tree.Scan(
+        std::string_view(), std::string_view(kSupremum),
+        [&](std::string_view key, IndexRecord &item) -> bool {
+          const auto keys = silo::StableReadKeys(*index, key, item);
+          if (!keys.found) return false;
+          if (!first && keys.secondary_key == prev_key) return false;
+          IndexRecord *base_item = primary_index.Get(keys.primary_key);
+          if (base_item == nullptr || base_item->transaction_id.load().absent)
+            return false;
+          return count_key(keys.secondary_key);
+        });
   }
 
   if (failed) {
@@ -143,7 +135,7 @@ bool Database::IndexHistogram(const std::string_view table_name,
     if (index_name.empty()) {
       table->GetPrimaryIndex().Scan(
           std::string_view(), std::string_view(kSupremum),
-          [&](std::string_view key, DataItem &item) -> bool {
+          [&](std::string_view key, IndexRecord &item) -> bool {
             if (item.transaction_id.load().absent) return false;
             if (leading_end(key) == 0) {
               failed = true;
@@ -157,29 +149,27 @@ bool Database::IndexHistogram(const std::string_view table_name,
         failed = true;
         return;
       }
-      // Sum a secondary key's adjacent pairs and visit the key once, so a
-      // bucket closes only between secondary keys.
+      // Sum a secondary key's adjacent non-unique index records and visit the
+      // key once, so a bucket closes only between secondary keys.
       std::string pending;
       uint64_t pending_w = 0;
       index->tree.Scan(std::string_view(), std::string_view(kSupremum),
-                       [&](std::string_view key, DataItem &item) -> bool {
-                         // A live record is one row: a pair, or the one owner
-                         // of a UNIQUE key.
+                       [&](std::string_view key, IndexRecord &item) -> bool {
+                         // A live record is one row: a non-unique index
+                         // record, or the one owner of a UNIQUE key.
                          const auto keys =
-                             silo::StableReadKeys(item, index->constraint);
+                             silo::StableReadKeys(*index, key, item);
                          if (!keys.found) return false;  // dead secondary entry
                          if (leading_end(key) == 0) {
                            failed = true;
                            return true;
                          }
-                         const std::string_view secondary_key =
-                             key.substr(0, key.size() - keys.pk_len);
-                         if (pending_w != 0 && secondary_key == pending) {
+                         if (pending_w != 0 && keys.secondary_key == pending) {
                            ++pending_w;
                            return false;
                          }
                          if (pending_w != 0) fn(pending, pending_w);
-                         pending.assign(secondary_key);
+                         pending.assign(keys.secondary_key);
                          pending_w = 1;
                          return false;
                        });

@@ -12,7 +12,7 @@
 #include "helios/pax.h"
 
 #include "gtest/gtest.h"
-#include "index/data_item.h"
+#include "index/index_record.h"
 #include "pax/table.h"
 
 namespace {
@@ -126,7 +126,7 @@ TEST(PaxTableTest, ScattersAndGathersFiveHundredColumns) {
 TEST(PaxTableTest, CopyStaysWithinTheReadersBufferAfterRowGrowth) {
   const TableSchema schema = MakeSchema({1, 64}, {});
   helios::storage::pax::PaxTable store(schema);
-  helios::storage::DataItem item;
+  helios::storage::RowRecord item;
   helios::storage::pax::Row unpacked;
   const auto small = PackRow({std::string(1, '\0'), "a"});
   const auto large = PackRow({std::string(1, '\0'), std::string(64, 'b')});
@@ -157,15 +157,15 @@ TEST(PaxTableTest, CopyStaysWithinTheReadersBufferAfterRowGrowth) {
   EXPECT_LE(item.GatherInto(buffer.data(), capacity), capacity);
 }
 
-helios::storage::DataItem &Install(
-    std::deque<helios::storage::DataItem> &items,
+helios::storage::RowRecord &Install(
+    std::deque<helios::storage::RowRecord> &items,
     helios::storage::pax::PaxTable &store, const TableSchema &schema,
     const std::string &row) {
   helios::storage::pax::Row unpacked;
   EXPECT_TRUE(helios::storage::pax::unpack_row(
       schema, reinterpret_cast<const std::byte *>(row.data()), row.size(),
       unpacked));
-  helios::storage::DataItem &item = items.emplace_back();
+  helios::storage::RowRecord &item = items.emplace_back();
   EXPECT_TRUE(item.AllocateSlot(store));
   item.InstallRow(unpacked, 1);
   return item;
@@ -180,7 +180,7 @@ TEST(PaxTableTest, ColumnRangeCoversWrittenValues) {
                                 FieldType::kDecimal64, FieldType::kUntyped});
   schema.field_scale = {0, 0, 2, 0};
   helios::storage::pax::PaxTable store(schema);
-  std::deque<helios::storage::DataItem> items;
+  std::deque<helios::storage::RowRecord> items;
   const std::string nulls(1, '\0');
 
   int64_t lo = 0, hi = 0;
@@ -202,7 +202,7 @@ TEST(PaxTableTest, ColumnRangeCoversWrittenValues) {
   for (uint32_t i = 2; i < PaxGroup::kRows; i++) {
     Install(items, store, schema, PackRow({nulls, "0", "0.00", "x"}));
   }
-  helios::storage::DataItem &peak =
+  helios::storage::RowRecord &peak =
       Install(items, store, schema, PackRow({nulls, "100", "0.00", "x"}));
   ASSERT_GE(helios::storage::pax::GroupCount(&store), 2u);
   ASSERT_TRUE(helios::storage::pax::ColumnRange(&store, 1, &lo, &hi));
@@ -221,7 +221,7 @@ TEST(PaxTableTest, ColumnDistinctEstimatesWrittenValues) {
   TableSchema schema =
       MakeSchema({1, 4}, {FieldType::kUntyped, FieldType::kInt32});
   helios::storage::pax::PaxTable store(schema);
-  std::deque<helios::storage::DataItem> items;
+  std::deque<helios::storage::RowRecord> items;
   const std::string nulls(1, '\0');
 
   uint64_t ndv = 0;
@@ -240,7 +240,7 @@ TEST(PaxTableTest, ColumnDistinctEstimatesWrittenValues) {
   EXPECT_LT(ndv, kDistinct * 1.12);
 
   // Every row goes, and the estimate stays where the writes put it.
-  for (helios::storage::DataItem &item : items) item.DeleteRow(1);
+  for (helios::storage::RowRecord &item : items) item.DeleteRow(1);
   uint64_t after = 0;
   ASSERT_TRUE(helios::storage::pax::ColumnDistinct(&store, 1, &after));
   EXPECT_EQ(after, ndv);

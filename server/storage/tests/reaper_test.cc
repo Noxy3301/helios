@@ -20,7 +20,7 @@ class ReaperTest : public ::testing::Test {
 
   void TearDown() override { index::release_thread_epoch(); }
 
-  DataItem *Enqueue(const std::string &key, EpochNumber epoch) {
+  IndexRecord *Enqueue(const std::string &key, EpochNumber epoch) {
     Tidword deleted;
     deleted.epoch = epoch;
     deleted.latest = true;

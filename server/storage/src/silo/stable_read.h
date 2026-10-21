@@ -16,7 +16,8 @@
 
 #include "helios/index.h"
 
-#include "index/data_item.h"
+#include "index/index_record.h"
+#include "index/secondary_index.h"
 #include "silo/tidword.h"
 
 namespace helios::storage {
@@ -30,16 +31,16 @@ struct StableValue {
 
 struct StablePrimaryKeys {
   bool found = false;
-  PrimaryKeyList::Ptr primary_keys;
-  Tidword tid;        // The version the list and the length belong to.
-  size_t pk_len = 0;  // A pair's primary-key length, as DataItem keeps it.
+  Tidword tid;  // The version the two keys belong to.
+  std::string_view secondary_key;
+  std::string_view primary_key;  // Meaningful only when `found`.
 };
 
 /**
  * @brief Reads the transaction id once no committer holds the row (Silo's
  * stable version): spins while the lock bit is set.
  */
-inline Tidword StableTid(const DataItem &item) {
+inline Tidword StableTid(const IndexRecord &item) {
   for (;;) {
     const Tidword tid = item.transaction_id.load();
     if (!tid.lock) return tid;
@@ -53,7 +54,7 @@ inline Tidword StableTid(const DataItem &item) {
  * @return The value and its TID, with `found == false` if the slot has no live
  * value.
  */
-inline StableValue StableRead(const DataItem &item, bool keys_only = false) {
+inline StableValue StableRead(const RowRecord &item, bool keys_only = false) {
   for (;;) {
     // Observe an unlocked version before copying its live row.
     const Tidword tid = StableTid(item);
@@ -69,26 +70,23 @@ inline StableValue StableRead(const DataItem &item, bool keys_only = false) {
 }
 
 /**
- * @brief Stable read of a secondary-index DataItem, pinning a UNIQUE record's
- * immutable primary-key list and taking a pair's primary-key length.
+ * @brief Stable read of a secondary index record: its secondary key and the
+ * primary key it points at, under one version of its TID word.
  *
  * `found` is false when the word's absent bit is set, which the committer
- * publishes for an emptied list or a removed pair.
+ * publishes for an emptied UNIQUE key or a removed non-unique index record.
+ * The keys view `key` and the record's block, which stays valid until the
+ * thread releases its epoch.
  */
-inline StablePrimaryKeys StableReadKeys(const DataItem &item,
-                                        IndexConstraint constraint) {
+inline StablePrimaryKeys StableReadKeys(const index::SecondaryIndex &index,
+                                        std::string_view key,
+                                        const IndexRecord &item) {
   for (;;) {
     const Tidword tid = StableTid(item);
-    // Keep this immutable list alive even if a writer replaces it; a pair
-    // holds none.
-    PrimaryKeyList::Ptr primary_keys;
-    if (constraint == IndexConstraint::kUnique)
-      primary_keys = std::atomic_load(&item.primary_keys);
-    const size_t pk_len = item.pk_len();
-    const bool found = !tid.absent;
-
+    const auto [secondary_key, primary_key] =
+        index::split_entry(index, key, item);
     if (item.transaction_id.load() == tid) {
-      return {found, std::move(primary_keys), tid, pk_len};
+      return {!tid.absent, tid, secondary_key, primary_key};
     }
   }
 }

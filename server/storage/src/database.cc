@@ -162,9 +162,9 @@ std::function<void(EpochNumber)> Database::MakeEpochHook() {
       reaper_.Purge(closed_epoch);
     }
 
-    // Tick masstree's epoch, which paces only the RCU freeing of retired
-    // leaves and DataItems, at most once per epoch duration however often
-    // requests advance E. Workers leave it through ReleaseThreadEpoch.
+    // Tick masstree's epoch, which paces only RCU frees of retired leaves,
+    // index records and UNIQUE key blocks, at most once per epoch duration
+    // however often requests advance E; workers leave via ReleaseThreadEpoch.
     const auto now = std::chrono::steady_clock::now();
     if (now - last_tick >= interval) {
       last_tick = now;
@@ -262,7 +262,6 @@ void Database::Recover() {
     highest_epoch = std::max<EpochNumber>(highest_epoch, entry.tid.epoch);
 
     if (entry.index_name.empty()) {
-      DataItem item;
       const auto *bytes =
           reinterpret_cast<const std::byte *>(entry.value.data());
       pax::Row row;
@@ -272,14 +271,15 @@ void Database::Recover() {
                         entry.key, entry.table_name);
         exit(EXIT_FAILURE);
       }
-      if (!item.AllocateSlot(*table->GetPaxTable())) {
+      auto *item =
+          static_cast<RowRecord *>(table->GetPrimaryIndex().Put(entry.key));
+      if (!item->AllocateSlot(*table->GetPaxTable())) {
         SPDLOG_CRITICAL("Recovery failed: no PAX slot for {} in {}", entry.key,
                         entry.table_name);
         exit(EXIT_FAILURE);
       }
-      item.InstallRow(row, entry.tid.epoch);
-      item.transaction_id.store(entry.tid);
-      table->GetPrimaryIndex().Put(entry.key, std::move(item));
+      item->InstallRow(row, entry.tid.epoch);
+      item->transaction_id.store(entry.tid);
     } else {
       // Secondary Index recovery
       index::SecondaryIndex *idx =
@@ -290,18 +290,26 @@ void Database::Recover() {
             "primary keys",
             entry.index_name, entry.key, entry.primary_keys.size());
         if (idx->constraint == IndexConstraint::kUnique) {
-          DataItem item;
-          item.transaction_id.store(entry.tid);
-          item.set_primary_keys(entry.primary_keys);
-          idx->tree.Put(entry.key, std::move(item));
+          // A commit never leaves a UNIQUE key with two primary keys.
+          if (entry.primary_keys.size() != 1) {
+            SPDLOG_CRITICAL(
+                "Recovery failed: UNIQUE key {0} of index {1} restores {2} "
+                "primary keys",
+                entry.key, entry.index_name, entry.primary_keys.size());
+            exit(EXIT_FAILURE);
+          }
+          auto *item = static_cast<UniqueRecord *>(idx->tree.Put(entry.key));
+          item->transaction_id.store(entry.tid);
+          item->set_primary_key(entry.primary_keys.front());
         } else {
-          // A non-unique index keeps one record per pair, under the
-          // secondary key followed by the primary key, whose length it keeps.
+          // A non-unique index keeps one record per
+          // (secondary key, primary key), under the secondary key followed by
+          // the primary key, whose length it keeps.
           for (const auto &primary_key : entry.primary_keys) {
-            DataItem item;
-            item.transaction_id.store(entry.tid);
-            item.set_pk_len(primary_key.size());
-            idx->tree.Put(entry.key + primary_key, std::move(item));
+            auto *record = static_cast<NonUniqueRecord *>(
+                idx->tree.Put(entry.key + primary_key));
+            record->transaction_id.store(entry.tid);
+            record->set_pk_len(primary_key.size());
           }
         }
       } else {

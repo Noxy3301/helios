@@ -351,9 +351,10 @@ TEST_F(EpochScanCheckpointTest,
             (std::vector<std::string>{"s/alice=two", "s/carol=two"}));
 }
 
-// The checkpoint keys a non-unique pair by its secondary key, as the log
-// does, so a removal in the tail cancels the pair the checkpoint holds.
-TEST_F(EpochScanCheckpointTest, APairTheTailRemovesStaysRemoved) {
+// The checkpoint keys a non-unique index record by its secondary key, as the
+// log does, so a removal in the tail cancels the non-unique index record the
+// checkpoint holds.
+TEST_F(EpochScanCheckpointTest, ANonUniqueRecordTheTailRemovesStaysRemoved) {
   {
     auto config = MakeConfig(false);
     helios::storage::Database db(config);
@@ -378,7 +379,7 @@ TEST_F(EpochScanCheckpointTest, APairTheTailRemovesStaysRemoved) {
     helios::storage::Database db(config);
     EXPECT_EQ(ReadIndex(db), expected);
   }
-  // The log alone recovers the same pairs.
+  // The log alone recovers the same non-unique index records.
   std::error_code ec;
   ASSERT_TRUE(std::filesystem::remove(checkpoint_path(), ec)) << ec.message();
   {
@@ -388,10 +389,11 @@ TEST_F(EpochScanCheckpointTest, APairTheTailRemovesStaysRemoved) {
   }
 }
 
-// A pair's record key is its two keys run together, and recovery restores
-// where the primary key starts, from the checkpoint and from the log alike.
-// Keys of differing lengths make a wrong split a different pair.
-TEST_F(EpochScanCheckpointTest, ARestoredPairKeepsItsPrimaryKeyLength) {
+// A non-unique index record's key is its two keys run together, and recovery
+// restores where the primary key starts, from the checkpoint and from the log
+// alike. Keys of differing lengths make a wrong split yield different keys.
+TEST_F(EpochScanCheckpointTest,
+       ARestoredNonUniqueRecordKeepsItsPrimaryKeyLength) {
   {
     auto config = MakeConfig(false);
     helios::storage::Database db(config);
@@ -411,7 +413,8 @@ TEST_F(EpochScanCheckpointTest, ARestoredPairKeepsItsPrimaryKeyLength) {
     helios::storage::Database db(config);
     EXPECT_EQ(ReadIndex(db), expected);
 
-    // A restored pair is removed by its two keys and returns when added again.
+    // A restored non-unique index record is removed by its two keys and
+    // returns when added again.
     std::string reason;
     ASSERT_TRUE(TestHelper::CommitRows(
         db, {}, {}, {{kTable, kIndex, "s", "bbb", true}}, {}, reason))
