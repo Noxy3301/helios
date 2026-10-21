@@ -12,7 +12,8 @@ std::string next_lexicographic_key(std::string key) {
             return key;
         }
     }
-    return {};
+    // One byte longer than the longest stored key, Masstree's 255 bytes.
+    return std::string(256, '\xff');
 }
 
 std::string_view unpack_row_field(const std::string& row,
@@ -52,10 +53,6 @@ std::string pack_int_key_part(int64_t value) {
     const auto packed = static_cast<uint32_t>(static_cast<int32_t>(value)) ^
                          0x80000000U;
     std::string out;
-    out.push_back(static_cast<char>(0x00));
-    out.push_back(static_cast<char>(0x10));
-    out.push_back(static_cast<char>(0x00));
-    out.push_back(static_cast<char>(0x04));
     out.push_back(static_cast<char>((packed >> 24) & 0xFF));
     out.push_back(static_cast<char>((packed >> 16) & 0xFF));
     out.push_back(static_cast<char>((packed >> 8) & 0xFF));
@@ -64,19 +61,13 @@ std::string pack_int_key_part(int64_t value) {
 }
 
 bool unpack_leading_int_key(std::string_view key, int64_t& out) {
-    if (key.size() < 8) return false;
-    if (static_cast<uint8_t>(key[0]) != 0x00 ||
-        static_cast<uint8_t>(key[1]) != 0x10 ||
-        static_cast<uint8_t>(key[2]) != 0x00 ||
-        static_cast<uint8_t>(key[3]) != 0x04) {
-        return false;
-    }
+    if (key.size() < 4) return false;
 
     const uint32_t packed =
-        (static_cast<uint32_t>(static_cast<uint8_t>(key[4])) << 24) |
-        (static_cast<uint32_t>(static_cast<uint8_t>(key[5])) << 16) |
-        (static_cast<uint32_t>(static_cast<uint8_t>(key[6])) << 8) |
-        static_cast<uint32_t>(static_cast<uint8_t>(key[7]));
+        (static_cast<uint32_t>(static_cast<uint8_t>(key[0])) << 24) |
+        (static_cast<uint32_t>(static_cast<uint8_t>(key[1])) << 16) |
+        (static_cast<uint32_t>(static_cast<uint8_t>(key[2])) << 8) |
+        static_cast<uint32_t>(static_cast<uint8_t>(key[3]));
     out = static_cast<int32_t>(packed ^ 0x80000000U);
     return true;
 }

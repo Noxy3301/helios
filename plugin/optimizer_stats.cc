@@ -35,9 +35,11 @@ static double rank_le(const Helios_share::RangeHist &hist,
   return static_cast<double>(hist.cum[pos]);
 }
 
-static std::vector<std::pair<std::string, uint32_t>> index_ndv_descriptors(
+// The server finds part ends only in the fixed-width leading parts; NDV needs
+// every part to be an integer, the histogram only its first part.
+static std::vector<HeliosProxy::IndexStatsDesc> index_ndv_descriptors(
     TABLE *table) {
-  std::vector<std::pair<std::string, uint32_t>> descs;
+  std::vector<HeliosProxy::IndexStatsDesc> descs;
   if (table == nullptr || table->s == nullptr)
     return descs;
 
@@ -45,9 +47,21 @@ static std::vector<std::pair<std::string, uint32_t>> index_ndv_descriptors(
   for (uint i = 0; i < table->s->keys; ++i) {
     KEY *key = table->key_info + i;
     const bool is_primary = (i == table->s->primary_key);
-    descs.emplace_back(is_primary ? std::string()
-                                  : std::string(key->name ? key->name : ""),
-                       key->user_defined_key_parts);
+    HeliosProxy::IndexStatsDesc desc;
+    desc.index_name =
+        is_primary ? std::string() : std::string(key->name ? key->name : "");
+    bool ints = true;
+    for (uint p = 0; p < key->user_defined_key_parts; ++p) {
+      const KEY_PART_INFO &kp = key->key_part[p];
+      const size_t width = key_pack::raw_part_width(kp);
+      if (width == 0) break;
+      desc.part_widths.push_back(static_cast<uint32_t>(width));
+      ints = ints && convert_mysql_type_to_helios(kp.field->type()) ==
+                         HeliosFieldType::HELIOS_INT;
+    }
+    if (ints && desc.part_widths.size() == key->user_defined_key_parts)
+      desc.num_key_parts = key->user_defined_key_parts;
+    descs.push_back(std::move(desc));
   }
   return descs;
 }

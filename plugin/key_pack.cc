@@ -33,8 +33,29 @@
 
 namespace key_pack {
 
-void append_key_part(std::string &out, bool is_null, HeliosFieldType type,
-                     const std::string &payload) {
+size_t raw_part_width(const KEY_PART_INFO &kp) {
+  if (kp.null_bit != 0) return 0;
+  switch (kp.field->real_type()) {
+    case MYSQL_TYPE_TINY:
+    case MYSQL_TYPE_SHORT:
+    case MYSQL_TYPE_LONG:
+    case MYSQL_TYPE_LONGLONG:
+    case MYSQL_TYPE_NEWDATE:
+    case MYSQL_TYPE_DATETIME2:
+    case MYSQL_TYPE_TIMESTAMP2:
+      return kp.field->pack_length();
+    default:
+      return 0;
+  }
+}
+
+void append_key_part(std::string &out, const KEY_PART_INFO &kp, bool is_null,
+                     HeliosFieldType type, const std::string &payload) {
+  if (raw_part_width(kp) != 0) {
+    out += payload;
+    return;
+  }
+
   constexpr size_t kLengthFieldSize = 2;
   const size_t max_payload_length = std::numeric_limits<uint16_t>::max();
   size_t copy_length = std::min(payload.size(), max_payload_length);
@@ -85,7 +106,8 @@ void append_key_part(std::string &out, bool is_null, HeliosFieldType type,
 
 /**
  * @brief The end key of the prefix range [prefix, end): the next lexicographic
- * key, or empty when every byte is 0xFF and the range is unbounded above.
+ * key, or the scan-end sentinel when every byte is 0xFF and the range is
+ * unbounded above.
  */
 std::string build_prefix_range_end(const std::string &prefix) {
   std::string end = prefix;
@@ -97,8 +119,7 @@ std::string build_prefix_range_end(const std::string &prefix) {
       return end;
     }
   }
-  // no upper bound
-  return std::string();
+  return scan_end_sentinel();
 }
 
 }  // namespace key_pack
@@ -177,7 +198,7 @@ std::string ha_helios::pack_key_from_field(const KEY_PART_INFO &kp,
   }
 
   std::string packed;
-  key_pack::append_key_part(packed, is_null, helios_type, payload);
+  key_pack::append_key_part(packed, kp, is_null, helios_type, payload);
   return packed;
 }
 
@@ -494,7 +515,7 @@ std::string pack_key(TABLE *table, uint key_index, const uchar *key,
 
       if (is_null) {
         key_ptr += (kp->store_length - 1);
-        append_key_part(result, true,
+        append_key_part(result, *kp, true,
                         convert_mysql_type_to_helios(field->type()),
                         std::string());
         continue;
@@ -533,7 +554,7 @@ std::string pack_key(TABLE *table, uint key_index, const uchar *key,
       break;
     }
 
-    append_key_part(result, false, helios_type, payload);
+    append_key_part(result, *kp, false, helios_type, payload);
 
     if (kp->key_part_flag & HA_VAR_LENGTH_PART) {
       key_ptr += kp->length;

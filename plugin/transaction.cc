@@ -35,14 +35,6 @@ inline std::string index_scope_key(const std::string& table,
   return k;
 }
 
-// Exclusive upper bound of a prefix range, or the sentinel when the prefix is
-// all 0xff and has no successor.
-std::string prefix_range_end(const std::string& prefix) {
-  std::string end = key_pack::build_prefix_range_end(prefix);
-  if (end.empty()) return key_pack::scan_end_sentinel();
-  return end;
-}
-
 std::string trace_count_event(const char* kind, const std::string& table_name,
                               size_t count) {
   return std::string(kind) + ":" + table_name + ":n=" +
@@ -567,8 +559,8 @@ HeliosTransaction::get_matching_keys_and_values_in_range(std::string start_key,
                                                             bool *served_truncated) {
   if (served_truncated != nullptr) *served_truncated = false;
   if (table_is_not_chosen()) return {};
-  // An empty end is not a range the server answers; real packed keys begin
-  // with a null marker and sort below the sentinel.
+  // An empty end is not a range the server answers; every stored key is
+  // shorter than the sentinel and sorts below it.
   if (end_key.empty()) end_key = key_pack::scan_end_sentinel();
 
   if (auto cached = lookup_range_scan_cache(
@@ -649,7 +641,8 @@ HeliosTransaction::get_matching_keys_and_values_from_prefix(std::string prefix) 
   if (prefix.empty()) {
     return get_matching_keys_and_values_in_range("", std::string());
   }
-  return get_matching_keys_and_values_in_range(prefix, prefix_range_end(prefix));
+  return get_matching_keys_and_values_in_range(
+      prefix, key_pack::build_prefix_range_end(prefix));
 }
 
 // Secondary index scan operations
