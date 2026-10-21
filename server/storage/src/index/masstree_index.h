@@ -23,7 +23,7 @@ inline constexpr size_t kMaxKeyLength = 255;
 /**
  * @brief Maps ordered keys to index records of one RecordType.
  * @details Record pointers stay valid until this thread calls
- * release_thread_epoch().
+ * release_thread_epoch() or exits.
  */
 class MasstreeIndex final {
  public:
