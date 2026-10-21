@@ -10,6 +10,7 @@
 #include <atomic>
 #include <mutex>
 #include <utility>
+#include <vector>
 
 #include "util/debug_sync.h"
 
@@ -63,15 +64,34 @@ thread_local threadinfo *tls_ti = nullptr;
 thread_local bool tls_enrolled = false;
 std::atomic<int> next_thread_id{0};
 std::mutex thread_init_mutex;
+// Threadinfos of exited threads. None is inside an RCU epoch, so
+// min_active_epoch() skips them.
+std::vector<threadinfo *> idle_tis;
+
+// At thread exit, leave the epoch and hand the threadinfo, with its node
+// pools and pending RCU frees, to the next thread.
+struct ThreadExit {
+  ~ThreadExit() {
+    tls_ti->rcu_stop();
+    std::lock_guard<std::mutex> lg(thread_init_mutex);
+    idle_tis.push_back(tls_ti);
+  }
+};
 
 // Serialize registration: Masstree's thread list has no internal lock.
 inline void ensure_thread_init() {
   if (__builtin_expect(tls_ti == nullptr, 0)) {
     std::lock_guard<std::mutex> lg(thread_init_mutex);
     if (tls_ti == nullptr) {
-      tls_ti = threadinfo::make(
-          threadinfo::TI_PROCESS,
-          next_thread_id.fetch_add(1, std::memory_order_relaxed));
+      if (idle_tis.empty()) {
+        tls_ti = threadinfo::make(
+            threadinfo::TI_PROCESS,
+            next_thread_id.fetch_add(1, std::memory_order_relaxed));
+      } else {
+        tls_ti = idle_tis.back();
+        idle_tis.pop_back();
+      }
+      thread_local ThreadExit exit_hook;
     }
   }
 }
