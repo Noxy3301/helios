@@ -13,8 +13,8 @@
 namespace helios::storage {
 namespace index {
 
-void Reaper::Enqueue(MasstreeIndex &index, std::string_view key, DataItem &item,
-                     Tidword delete_commit_tid) {
+void Reaper::Enqueue(MasstreeIndex &index, std::string_view key,
+                     IndexRecord &item, Tidword delete_commit_tid) {
   Tombstone tombstone;
   tombstone.index = &index;
   tombstone.key = std::string(key);
@@ -45,7 +45,7 @@ void Reaper::Purge(EpochNumber reclamation_epoch) {
 
   for (auto &entries : ready) {
     for (auto &tombstone : entries) {
-      DataItem *item = tombstone.index->Get(tombstone.key);
+      IndexRecord *item = tombstone.index->Get(tombstone.key);
       // A different item under the key means the tombstone was already replaced.
       if (item != tombstone.item) continue;
 

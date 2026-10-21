@@ -16,7 +16,7 @@
 
 #include "helios/index.h"
 
-#include "index/data_item.h"
+#include "index/index_record.h"
 #include "silo/tidword.h"
 
 namespace helios::storage {
@@ -39,7 +39,7 @@ struct StablePrimaryKeys {
  * @brief Reads the transaction id once no committer holds the row (Silo's
  * stable version): spins while the lock bit is set.
  */
-inline Tidword StableTid(const DataItem &item) {
+inline Tidword StableTid(const IndexRecord &item) {
   for (;;) {
     const Tidword tid = item.transaction_id.load();
     if (!tid.lock) return tid;
@@ -53,7 +53,7 @@ inline Tidword StableTid(const DataItem &item) {
  * @return The value and its TID, with `found == false` if the slot has no live
  * value.
  */
-inline StableValue StableRead(const DataItem &item, bool keys_only = false) {
+inline StableValue StableRead(const RowRecord &item, bool keys_only = false) {
   for (;;) {
     // Observe an unlocked version before copying its live row.
     const Tidword tid = StableTid(item);
@@ -69,23 +69,27 @@ inline StableValue StableRead(const DataItem &item, bool keys_only = false) {
 }
 
 /**
- * @brief Stable read of a secondary-index DataItem, pinning a UNIQUE record's
+ * @brief Stable read of a secondary index record, pinning a UNIQUE record's
  * immutable primary-key list and taking a non-unique index record's
  * primary-key length.
  *
  * `found` is false when the word's absent bit is set, which the committer
  * publishes for an emptied list or a removed non-unique index record.
  */
-inline StablePrimaryKeys StableReadKeys(const DataItem &item,
+inline StablePrimaryKeys StableReadKeys(const IndexRecord &item,
                                         IndexConstraint constraint) {
   for (;;) {
     const Tidword tid = StableTid(item);
     // Keep this immutable list alive even if a writer replaces it; a
     // non-unique index record holds none.
     PrimaryKeyList::Ptr primary_keys;
-    if (constraint == IndexConstraint::kUnique)
-      primary_keys = std::atomic_load(&item.primary_keys);
-    const size_t pk_len = item.pk_len();
+    size_t pk_len = 0;
+    if (constraint == IndexConstraint::kUnique) {
+      primary_keys = std::atomic_load(
+          &static_cast<const UniqueRecord &>(item).primary_keys);
+    } else {
+      pk_len = static_cast<const NonUniqueRecord &>(item).pk_len();
+    }
     const bool found = !tid.absent;
 
     if (item.transaction_id.load() == tid) {

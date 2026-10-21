@@ -18,13 +18,13 @@
 // Modified for Helios.
 
 /**
- * @file server/storage/src/index/data_item.h
+ * @file server/storage/src/index/index_record.h
  * What the index maps a key to: the Silo transaction id word and the row
  * payload behind it, or the primary keys a secondary key points at.
  */
 
-#ifndef HELIOS_STORAGE_SRC_INDEX_DATA_ITEM_H
-#define HELIOS_STORAGE_SRC_INDEX_DATA_ITEM_H
+#ifndef HELIOS_STORAGE_SRC_INDEX_INDEX_RECORD_H
+#define HELIOS_STORAGE_SRC_INDEX_INDEX_RECORD_H
 
 #include <algorithm>
 #include <atomic>
@@ -46,28 +46,53 @@
 namespace helios::storage {
 
 /**
- * @brief What one index key maps to.
+ * @brief The base of every index record: its Silo version word.
  *
- * @details A primary-index item refers to a PAX slot its table hands out on
- * the item's first install.
- * A UNIQUE secondary item owns the primary-key list published with atomic
- * load and store. A non-unique item keys one (secondary key, primary key)
- * and holds no list: its key ends with the primary key, whose length it
- * keeps. All use transaction_id as their Silo version word.
+ * @details A tree allocates and frees its records as the type its
+ * RecordType names, so the base needs no virtual destructor.
  */
-struct DataItem {
+struct IndexRecord {
   // Readers take `absent` from this word; the committer sets it at publish
   // from IsLive(), or for a non-unique index record from its last change.
-  std::atomic<Tidword> transaction_id;
-  std::shared_ptr<const PrimaryKeyList> primary_keys;
+  std::atomic<Tidword> transaction_id{Tidword::Absent()};
+};
 
-  size_t size() const { return size_; }
+/**
+ * @brief The record type a tree maps its keys to.
+ */
+enum class RecordType : uint8_t {
+  kRow,        // A primary index's RowRecord.
+  kUnique,     // A UNIQUE index's UniqueRecord.
+  kNonUnique,  // A non-unique index's NonUniqueRecord.
+};
+
+/**
+ * @brief A non-unique index record: one per (secondary key, primary key),
+ *        under the secondary key followed by the primary key, whose length
+ *        it keeps.
+ */
+struct NonUniqueRecord : IndexRecord {
   size_t pk_len() const { return pk_len_.load(std::memory_order_relaxed); }
   void set_pk_len(size_t len) {
     pk_len_.store(static_cast<uint16_t>(len), std::memory_order_relaxed);
   }
+
+ private:
+  // The TID word orders it; relaxed access only keeps readers race-free.
+  std::atomic<uint16_t> pk_len_ = 0;
+};
+
+static_assert(sizeof(NonUniqueRecord) == 16,
+              "NonUniqueRecord must remain 16 bytes");
+
+/**
+ * @brief A UNIQUE index record: it owns the primary-key list published with
+ *        atomic load and store.
+ */
+struct UniqueRecord : IndexRecord {
+  std::shared_ptr<const PrimaryKeyList> primary_keys;
+
   bool IsLive() const {
-    if (size_ != 0) return true;
     const auto keys = std::atomic_load(&primary_keys);
     return keys && keys->count != 0;
   }
@@ -78,29 +103,23 @@ struct DataItem {
     std::atomic_store(&primary_keys, std::move(packed));
   }
 
-  DataItem() : transaction_id(Tidword::Absent()) {}
-
-  DataItem(const DataItem &) = delete;
-  DataItem &operator=(const DataItem &) = delete;
-
-  DataItem(DataItem &&rhs) noexcept
-      : transaction_id(rhs.transaction_id.load()),
-        primary_keys(std::move(rhs.primary_keys)),
-        group_(std::exchange(rhs.group_, nullptr)),
-        slot_(std::exchange(rhs.slot_, 0)),
-        pk_len_(rhs.pk_len_.exchange(0, std::memory_order_relaxed)),
-        size_(std::exchange(rhs.size_, 0)) {}
-
-  DataItem &operator=(DataItem &&rhs) noexcept {
-    transaction_id.store(rhs.transaction_id.load());
-    group_ = std::exchange(rhs.group_, nullptr);
-    slot_ = std::exchange(rhs.slot_, 0);
-    pk_len_.store(rhs.pk_len_.exchange(0, std::memory_order_relaxed),
-                  std::memory_order_relaxed);
-    size_ = std::exchange(rhs.size_, 0);
-    std::atomic_store(&primary_keys, std::move(rhs.primary_keys));
-    return *this;
+ private:
+  static bool IsSortedDeduped(const std::vector<std::string> &keys) {
+    return std::adjacent_find(
+               keys.begin(), keys.end(),
+               [](const std::string &lhs, const std::string &rhs) {
+                 return !(lhs < rhs);
+               }) == keys.end();
   }
+};
+
+/**
+ * @brief A primary index record: it refers to a PAX slot its table hands out
+ *        on the record's first install.
+ */
+struct RowRecord : IndexRecord {
+  size_t size() const { return size_; }
+  bool IsLive() const { return size_ != 0; }
 
   bool pax_allocated() const { return group_ != nullptr; }
   pax::PaxGroup *pax_group() const { return group_; }
@@ -146,45 +165,15 @@ struct DataItem {
    */
   std::string CopyValue() const;
 
-  void insert_primary_key(const std::byte *key, size_t len) {
-    const std::string_view new_key(reinterpret_cast<const char *>(key), len);
-    auto current = std::atomic_load(&primary_keys);
-    auto next = PrimaryKeyList::insert(current, new_key);
-    if (next != current) {
-      std::atomic_store(&primary_keys, std::move(next));
-    }
-  }
-
-  void delete_primary_key(const std::byte *key, size_t len) {
-    std::string_view target(reinterpret_cast<const char *>(key), len);
-    auto current = std::atomic_load(&primary_keys);
-    auto next = PrimaryKeyList::erase(current, target);
-    if (next != current) {
-      std::atomic_store(&primary_keys, std::move(next));
-    }
-  }
-
  private:
   pax::PaxGroup *group_ = nullptr;  // The group holding this item's slot.
   uint32_t slot_ = 0;               // Slot inside group_.
-  // A non-unique index record's primary-key length: its key ends with the
-  // primary key. The TID word orders it; relaxed access only keeps readers
-  // race-free.
-  std::atomic<uint16_t> pk_len_ = 0;
-  size_t size_ = 0;  // Row length in bytes; zero once deleted.
+  uint32_t size_ = 0;               // Row length in bytes; zero once deleted.
 
   void PreserveImage(EpochNumber epoch);
-
-  static bool IsSortedDeduped(const std::vector<std::string> &keys) {
-    return std::adjacent_find(
-               keys.begin(), keys.end(),
-               [](const std::string &lhs, const std::string &rhs) {
-                 return !(lhs < rhs);
-               }) == keys.end();
-  }
 };
 
-static_assert(sizeof(DataItem) == 48, "DataItem must remain 48 bytes");
+static_assert(sizeof(RowRecord) == 24, "RowRecord must remain 24 bytes");
 
 /**
  * @brief Calls `fn` with each primary key a live secondary record points at,
@@ -211,4 +200,4 @@ bool for_each_primary_key(std::string_view key, size_t pk_len,
   return false;
 }
 }  // namespace helios::storage
-#endif  // HELIOS_STORAGE_SRC_INDEX_DATA_ITEM_H
+#endif  // HELIOS_STORAGE_SRC_INDEX_INDEX_RECORD_H

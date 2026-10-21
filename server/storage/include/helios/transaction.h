@@ -16,7 +16,7 @@
 
 #include "helios/index.h"
 
-#include "index/data_item.h"
+#include "index/index_record.h"
 #include "pax/table.h"
 #include "silo/tidword.h"
 #include "util/epoch.h"
@@ -289,7 +289,7 @@ class Transaction {
 
   std::vector<ReadEntry> read_set_;
   std::vector<RangeEntry> range_set_;
-  std::map<DataItem *, WriteEntry> write_set_;  ///< Locked in pointer order.
+  std::map<IndexRecord *, WriteEntry> write_set_;  // Locked in pointer order.
 
   /**
    * @brief Reports whether this attempt holds the record's lock.
@@ -297,7 +297,7 @@ class Transaction {
    * @details Read validation and both range revalidations allow a locked word
    * only when this attempt is the holder; any other lock aborts.
    */
-  bool OwnsLock(DataItem *item) const;
+  bool OwnsLock(IndexRecord *item) const;
 
   /**
    * @brief Locks the record and checks that it is still the latest.
@@ -308,7 +308,7 @@ class Transaction {
    * @return false with reason set on detachment; the lock is held and
    * UnlockAll releases it.
    */
-  bool Lock(DataItem &item, WriteEntry &entry, Tidword &max_tid,
+  bool Lock(IndexRecord &item, WriteEntry &entry, Tidword &max_tid,
             std::string &reason);
 
   void UnlockAll();
@@ -323,7 +323,7 @@ class Transaction {
    * @pre The record is locked and no stored value has changed.
    * @return false with reason set when the constraint fails.
    */
-  bool Prepare(DataItem &item, WriteEntry &entry, std::string &reason);
+  bool Prepare(IndexRecord &item, WriteEntry &entry, std::string &reason);
 
   /**
    * @brief Checks every point word and revalidates every range.
@@ -358,7 +358,7 @@ class Transaction {
    * the next recorded one.
    */
   bool match_record(const RangeEntry &range, size_t &row, size_t &visited,
-                    std::string_view key, DataItem *item, Tidword tid,
+                    std::string_view key, IndexRecord *item, Tidword tid,
                     bool entry, Tidword &max_tid) const;
 
   /**
@@ -373,7 +373,7 @@ class Transaction {
    * nothing: a row or a UNIQUE list left empty, or a non-unique index record
    * whose last change removes it.
    */
-  static Tidword Apply(DataItem &item, const WriteEntry &entry,
+  static Tidword Apply(IndexRecord &record, const WriteEntry &entry,
                        Tidword commit_tid);
 
   /**
@@ -391,7 +391,7 @@ class Transaction {
    *
    * @pre Apply and AppendLog completed for this record.
    */
-  void Publish(DataItem &item, WriteEntry &entry, Tidword published);
+  void Publish(IndexRecord &item, WriteEntry &entry, Tidword published);
 };
 
 }  // namespace silo

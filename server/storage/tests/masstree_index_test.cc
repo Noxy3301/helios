@@ -55,7 +55,7 @@ helios::storage::Tidword make_tidword(helios::storage::EpochNumber epoch,
 TEST(MasstreeIndexTest, Get) {
   helios::storage::index::MasstreeIndex table;
   ASSERT_EQ(nullptr, table.Get("alice"));
-  table.Put("alice", {});
+  table.Put("alice");
   ASSERT_NE(nullptr, table.Get("alice"));
 }
 
@@ -67,7 +67,7 @@ TEST(MasstreeIndexTest, GetOrInsert) {
 TEST(MasstreeIndexTest, ExpectNewPublishesOneAbsentEntry) {
   using namespace helios::storage;
   index::MasstreeIndex tree;
-  DataItem *item = tree.GetOrInsert("new", true);
+  IndexRecord *item = tree.GetOrInsert("new", true);
   ASSERT_NE(nullptr, item);
   EXPECT_TRUE(item->transaction_id.load().absent);
   EXPECT_EQ(item, tree.Get("new"));
@@ -83,7 +83,7 @@ TEST(MasstreeIndexTest, ConcurrentPutSameKey) {
   helios::storage::index::MasstreeIndex table;
 
   for (size_t i = 0; i < 10; i++) {
-    threads.emplace_back([&]() { table.Put("alice", {}); });
+    threads.emplace_back([&]() { table.Put("alice"); });
   }
   for (auto &thread : threads) {
     thread.join();
@@ -97,7 +97,7 @@ TEST(MasstreeIndexTest, ConcurrentInserting) {
   helios::storage::index::MasstreeIndex table;
 
   for (size_t i = 0; i < 10; i++) {
-    threads.emplace_back([&, i]() { table.Put(std::to_string(i), {}); });
+    threads.emplace_back([&, i]() { table.Put(std::to_string(i)); });
   }
   for (auto &thread : threads) {
     thread.join();
@@ -109,9 +109,9 @@ TEST(MasstreeIndexTest, ConcurrentInserting) {
 
 TEST(MasstreeIndexTest, Scan) {
   helios::storage::index::MasstreeIndex table;
-  table.Put("alice", {});
-  table.Put("bob", {});
-  table.Put("carol", {});
+  table.Put("alice");
+  table.Put("bob");
+  table.Put("carol");
 
   // Scan is half-open: carol is the exclusive upper bound.
   ASSERT_EQ(size_t(2),
@@ -123,15 +123,15 @@ TEST(MasstreeIndexTest, Scan) {
 
 TEST(MasstreeIndexTest, ReverseScanCountsOnlyTheKeysItEmits) {
   helios::storage::index::MasstreeIndex table;
-  for (const char *key : {"a", "b", "c", "d"}) table.Put(key, {});
+  for (const char *key : {"a", "b", "c", "d"}) table.Put(key);
 
   std::vector<std::string> seen;
-  const size_t count =
-      table.ScanReverse("b", std::optional<std::string_view>("d"),
-                        [&](std::string_view key, helios::storage::DataItem &) {
-                          seen.emplace_back(key);
-                          return false;
-                        });
+  const size_t count = table.ScanReverse(
+      "b", std::optional<std::string_view>("d"),
+      [&](std::string_view key, helios::storage::IndexRecord &) {
+        seen.emplace_back(key);
+        return false;
+      });
   EXPECT_EQ(std::vector<std::string>({"c", "b"}), seen);
   EXPECT_EQ(seen.size(), count);
 }
@@ -143,19 +143,19 @@ TEST(MasstreeIndexTest, ScansFromAFirstKeyLongerThanAnyStoredKey) {
   const std::string low(kMaxKeyLength, 'a');
   const std::string high = std::string(kMaxKeyLength - 1, 'a') + 'b';
   const std::string bound = low + std::string(45, 'z');
-  table.Put(low, {});
-  table.Put(high, {});
+  table.Put(low);
+  table.Put(high);
 
   std::vector<std::string> seen;
   table.Scan(bound, std::nullopt,
-             [&](std::string_view key, helios::storage::DataItem &) {
+             [&](std::string_view key, helios::storage::IndexRecord &) {
                seen.emplace_back(key);
                return false;
              });
   EXPECT_EQ(std::vector<std::string>({high}), seen);
   seen.clear();
   table.ScanReverse("", std::optional<std::string_view>(bound),
-                    [&](std::string_view key, helios::storage::DataItem &) {
+                    [&](std::string_view key, helios::storage::IndexRecord &) {
                       seen.emplace_back(key);
                       return false;
                     });
@@ -165,7 +165,7 @@ TEST(MasstreeIndexTest, ScansFromAFirstKeyLongerThanAnyStoredKey) {
 TEST(MasstreeIndexTest, ConcurrentGetOrInsertReturnsTheSameEntry) {
   using namespace helios::storage;
   index::MasstreeIndex tree;
-  std::vector<DataItem *> results(16);
+  std::vector<IndexRecord *> results(16);
   std::atomic<size_t> ready{0};
   std::atomic<bool> start{false};
   std::vector<std::thread> threads;
@@ -183,7 +183,7 @@ TEST(MasstreeIndexTest, ConcurrentGetOrInsertReturnsTheSameEntry) {
   start.store(true);
   for (auto &thread : threads) thread.join();
 
-  DataItem *item = tree.Get("shared");
+  IndexRecord *item = tree.Get("shared");
   ASSERT_NE(nullptr, item);
   for (auto *result : results) EXPECT_EQ(item, result);
   EXPECT_EQ(item, tree.GetOrInsert("shared"));
@@ -197,7 +197,7 @@ TEST(MasstreeIndexTest, PrimaryEntryTakesItsPaxSlotOnAllocation) {
   pax::PaxTable store(schema);
   index::MasstreeIndex tree;
 
-  DataItem *item = tree.GetOrInsert("row");
+  auto *item = static_cast<RowRecord *>(tree.GetOrInsert("row"));
   ASSERT_NE(nullptr, item);
   EXPECT_FALSE(item->IsLive());
   ASSERT_TRUE(item->AllocateSlot(store));
@@ -209,10 +209,10 @@ TEST(MasstreeIndexTest, PrimaryEntryTakesItsPaxSlotOnAllocation) {
 
 TEST(MasstreeIndexTest, ReaperDoesNotPurgeReusedSecondaryEntry) {
   using namespace helios::storage;
-  index::MasstreeIndex tree;
+  index::MasstreeIndex tree(RecordType::kUnique);
   index::Reaper reaper;
   const Tidword deleted = make_tidword(10, 2, /*absent=*/true);
-  DataItem *item = tree.GetOrInsert("secondary");
+  auto *item = static_cast<UniqueRecord *>(tree.GetOrInsert("secondary"));
   item->transaction_id.store(deleted);
   reaper.Enqueue(tree, "secondary", *item, deleted);
 
@@ -240,9 +240,9 @@ TEST(MasstreeIndexTest, ReaperDoesNotPurgeReusedSecondaryEntry) {
 TEST(MasstreeIndexTest, PurgeRejectsAReplacementEntry) {
   using namespace helios::storage;
   index::MasstreeIndex tree;
-  DataItem *old_item = tree.GetOrInsert("key");
-  tree.Put("key", DataItem{});
-  DataItem *replacement = tree.Get("key");
+  IndexRecord *old_item = tree.GetOrInsert("key");
+  tree.Put("key");
+  IndexRecord *replacement = tree.Get("key");
   ASSERT_NE(old_item, replacement);
 
   EXPECT_FALSE(
@@ -257,7 +257,8 @@ TEST(MasstreeIndexTest, UnboundedReverseScanIncludesEveryKey) {
   for (const char *key : {"", "a", "b"}) tree.GetOrInsert(key);
   std::vector<std::string> keys;
   const size_t count = tree.ScanReverse(
-      "", std::nullopt, [&](std::string_view key, helios::storage::DataItem &) {
+      "", std::nullopt,
+      [&](std::string_view key, helios::storage::IndexRecord &) {
         keys.emplace_back(key);
         return false;
       });
@@ -282,7 +283,7 @@ TEST(MasstreeIndexTest, ScanReturnsMatchingItemsInByteOrder) {
   for (const auto &key : keys) tree.GetOrInsert(key);
 
   std::vector<std::string> seen;
-  auto collect = [&](std::string_view key, DataItem &item) {
+  auto collect = [&](std::string_view key, IndexRecord &item) {
     EXPECT_EQ(tree.Get(key), &item);
     seen.emplace_back(key);
     return false;
@@ -304,7 +305,7 @@ TEST(MasstreeIndexTest, EmptyUpperBoundIsNotAnUnboundedScan) {
   using namespace helios::storage;
   index::MasstreeIndex tree;
   for (const char *key : {"", "a", "b"}) tree.GetOrInsert(key);
-  auto unexpected = [](std::string_view, DataItem &) {
+  auto unexpected = [](std::string_view, IndexRecord &) {
     ADD_FAILURE() << "An empty range must not invoke the callback";
     return true;
   };
@@ -323,7 +324,7 @@ TEST(MasstreeIndexTest, BoundedValueScanCountsTheCallbackThatStopsIt) {
   index::MasstreeIndex tree;
   for (const char *key : {"a", "b", "c", "d"}) tree.GetOrInsert(key);
   std::vector<std::string> seen;
-  auto stop_after_two = [&](std::string_view key, DataItem &item) {
+  auto stop_after_two = [&](std::string_view key, IndexRecord &item) {
     EXPECT_EQ(tree.Get(key), &item);
     seen.emplace_back(key);
     return seen.size() == 2;

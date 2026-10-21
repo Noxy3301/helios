@@ -20,7 +20,7 @@
 #include <utility>
 #include <vector>
 
-#include "index/data_item.h"
+#include "index/index_record.h"
 #include "index/masstree_index.h"
 #include "index/secondary_index.h"
 #include "table/table.h"
@@ -198,7 +198,7 @@ const char *EpochScanCheckpoint::WorkingFileName() {
  * @return kTaken, kSkipped when the absent flag is set, or kUnstable.
  */
 EpochScanCheckpoint::CaptureResult EpochScanCheckpoint::CapturePrimaryRow(
-    const std::string &table_name, std::string_view key, const DataItem &item,
+    const std::string &table_name, std::string_view key, const RowRecord &item,
     LogRecord::Write &out, uint64_t &retries) {
   for (unsigned attempt = 0; attempt < kSpinAttempts; ++attempt) {
     const Tidword observed = item.transaction_id.load();
@@ -237,7 +237,7 @@ EpochScanCheckpoint::CaptureResult EpochScanCheckpoint::CapturePrimaryRow(
  */
 EpochScanCheckpoint::CaptureResult EpochScanCheckpoint::CaptureSecondaryEntry(
     const std::string &table_name, const std::string &index_name,
-    uint32_t index_type, std::string_view key, const DataItem &item,
+    uint32_t index_type, std::string_view key, const IndexRecord &item,
     LogRecord::Write &out, uint64_t &retries) {
   for (unsigned attempt = 0; attempt < kSpinAttempts; ++attempt) {
     const Tidword observed = item.transaction_id.load();
@@ -248,9 +248,13 @@ EpochScanCheckpoint::CaptureResult EpochScanCheckpoint::CaptureSecondaryEntry(
     }
     if (observed.absent) return EpochScanCheckpoint::CaptureResult::kSkipped;
     PrimaryKeyList::Ptr primary_keys;
-    if (index_type == static_cast<uint32_t>(IndexConstraint::kUnique))
-      primary_keys = std::atomic_load(&item.primary_keys);
-    const size_t pk_len = item.pk_len();
+    size_t pk_len = 0;
+    if (index_type == static_cast<uint32_t>(IndexConstraint::kUnique)) {
+      primary_keys = std::atomic_load(
+          &static_cast<const UniqueRecord &>(item).primary_keys);
+    } else {
+      pk_len = static_cast<const NonUniqueRecord &>(item).pk_len();
+    }
     if (item.transaction_id.load() != observed) {
       ++retries;
       continue;
@@ -416,10 +420,10 @@ bool EpochScanCheckpoint::CaptureTable(Table &table, LogRecord &record,
   // Capture every primary record; defer the keys that stayed locked. The
   // walk's callback returns true to stop, so a capture that wants every row
   // returns false.
-  table.GetPrimaryIndex().ForEach([&](std::string_view key, DataItem &item) {
+  table.GetPrimaryIndex().ForEach([&](std::string_view key, IndexRecord &item) {
     LogRecord::Write write;
-    switch (CapturePrimaryRow(table_name, key, item, write,
-                              stats.version_retries)) {
+    switch (CapturePrimaryRow(table_name, key, static_cast<RowRecord &>(item),
+                              write, stats.version_retries)) {
       case CaptureResult::kTaken:
         ++stats.primary_rows;
         record.writes.emplace_back(std::move(write));
@@ -437,7 +441,7 @@ bool EpochScanCheckpoint::CaptureTable(Table &table, LogRecord &record,
   table.ForEachSecondaryIndex(
       [&](const std::string &index_name, index::SecondaryIndex &index) {
         const uint32_t index_type = static_cast<uint32_t>(index.constraint);
-        index.tree.ForEach([&](std::string_view key, DataItem &item) {
+        index.tree.ForEach([&](std::string_view key, IndexRecord &item) {
           LogRecord::Write write;
           switch (CaptureSecondaryEntry(table_name, index_name, index_type, key,
                                         item, write, stats.version_retries)) {
@@ -472,7 +476,7 @@ bool EpochScanCheckpoint::CaptureTable(Table &table, LogRecord &record,
 
     std::vector<std::string> rows_left;
     for (const auto &key : unstable_rows) {
-      DataItem *item = table.GetPrimaryIndex().Get(key);
+      auto *item = static_cast<RowRecord *>(table.GetPrimaryIndex().Get(key));
       if (item == nullptr) continue;
       LogRecord::Write write;
       switch (CapturePrimaryRow(table_name, key, *item, write,
@@ -494,7 +498,7 @@ bool EpochScanCheckpoint::CaptureTable(Table &table, LogRecord &record,
     for (const auto &[index_name, key] : unstable_entries) {
       index::SecondaryIndex *index = table.GetSecondaryIndex(index_name);
       if (index == nullptr) continue;
-      DataItem *item = index->tree.Get(key);
+      IndexRecord *item = index->tree.Get(key);
       if (item == nullptr) continue;
       LogRecord::Write write;
       switch (CaptureSecondaryEntry(table_name, index_name,

@@ -18,9 +18,12 @@ namespace index {
 
 struct SecondaryIndex {
   explicit SecondaryIndex(IndexConstraint index_type = IndexConstraint::kNone)
-      : constraint(index_type) {}
+      : tree(index_type == IndexConstraint::kUnique ? RecordType::kUnique
+                                                    : RecordType::kNonUnique),
+        constraint(index_type) {}
 
-  // Tree operations are shared with the primary index; uniqueness is metadata.
+  // Tree operations are shared with the primary index; the constraint picks
+  // the record type.
   MasstreeIndex tree;
   const IndexConstraint constraint;
 };

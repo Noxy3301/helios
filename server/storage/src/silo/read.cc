@@ -6,7 +6,7 @@
 
 #include "helios/database.h"
 
-#include "index/data_item.h"
+#include "index/index_record.h"
 #include "index/secondary_index.h"
 #include "pax/table.h"
 #include "silo/stable_read.h"
@@ -20,7 +20,7 @@ ReadResult Database::Read(const std::string_view table_name,
   auto table = GetTable(table_name);
   if (table == nullptr) return {};
 
-  DataItem *item = table->GetPrimaryIndex().Get(key);
+  auto *item = static_cast<RowRecord *>(table->GetPrimaryIndex().Get(key));
   if (item == nullptr) return {false, {}, Tidword::Absent().obj};
 
   auto row = silo::StableRead(*item);
@@ -50,9 +50,9 @@ ScanResult Database::Scan(const std::string_view table_name,
 
   uint64_t returned_rows = 0;
 
-  // Copy each live row from the DataItem found by the scan.
-  auto append_scan_entry = [&](std::string_view key, DataItem &item) {
-    auto row = silo::StableRead(item, keys_only);
+  // Copy each live row from the RowRecord found by the scan.
+  auto append_scan_entry = [&](std::string_view key, IndexRecord &record) {
+    auto row = silo::StableRead(static_cast<RowRecord &>(record), keys_only);
     if (row.found) {
       result.rows.push_back(
           {std::string(key), std::move(row.value), row.tid.obj});
@@ -73,7 +73,7 @@ ScanResult Database::Scan(const std::string_view table_name,
 }
 
 uint64_t CurrentTid(const ScanPaxRow &row) {
-  const auto *item = static_cast<const DataItem *>(row.item);
+  const auto *item = static_cast<const IndexRecord *>(row.item);
   return item->transaction_id.load().obj;
 }
 
@@ -98,7 +98,8 @@ ScanIndexResult Database::ScanIndex(const std::string_view table_name,
   // Resolve each secondary hit to a stable copy of its primary row.
   auto append_base_row = [&](std::string_view secondary_key,
                              std::string_view primary_key) {
-    DataItem *item = table->GetPrimaryIndex().Get(primary_key);
+    auto *item =
+        static_cast<RowRecord *>(table->GetPrimaryIndex().Get(primary_key));
     if (item == nullptr) {
       return false;
     }
@@ -118,7 +119,7 @@ ScanIndexResult Database::ScanIndex(const std::string_view table_name,
   // Keep the key list alive while reading the referenced rows. A non-unique
   // index record's key ends with its one primary key, which the row leaves
   // out.
-  auto append_secondary_entry = [&](std::string_view key, DataItem &item) {
+  auto append_secondary_entry = [&](std::string_view key, IndexRecord &item) {
     const auto keys = silo::StableReadKeys(item, index->constraint);
     if (keys.tid != Tidword::Absent())
       result.visited.push_back({std::string(key), keys.tid.obj, true});
@@ -155,9 +156,9 @@ ScanPaxResult Database::ScanPax(const std::string_view table_name,
 
   uint64_t returned_rows = 0;
 
-  auto append_pax_row = [&](std::string_view key, DataItem &item) {
+  auto append_pax_row = [&](std::string_view key, IndexRecord &record) {
     // Read an unlocked TID; the caller must recheck it after reading the cells.
-    const Tidword tid = silo::StableTid(item);
+    const Tidword tid = silo::StableTid(record);
     if (tid.absent) {
       if (tid != Tidword::Absent())
         result.visited.push_back({std::string(key), tid.obj});
@@ -165,8 +166,10 @@ ScanPaxResult Database::ScanPax(const std::string_view table_name,
     }
 
     // Return the PAX location for the caller to read directly.
+    const auto &item = static_cast<RowRecord &>(record);
     result.rows.push_back({std::string(key), item.pax_group(), item.pax_slot(),
-                           static_cast<uint32_t>(item.size()), tid.obj, &item});
+                           static_cast<uint32_t>(item.size()), tid.obj,
+                           &record});
     ++returned_rows;
     return row_limit > 0 && returned_rows >= row_limit;
   };

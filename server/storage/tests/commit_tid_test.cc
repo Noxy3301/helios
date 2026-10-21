@@ -106,9 +106,10 @@ class CommitTidTest : public ::testing::Test {
     std::filesystem::remove_all(config_.work_dir);
   }
 
-  DataItem *SeedRow(const std::string &key, Tidword tid) {
+  RowRecord *SeedRow(const std::string &key, Tidword tid) {
     auto *table = tables_.GetTable(kTable);
-    auto *item = table->GetPrimaryIndex().GetOrInsert(key);
+    auto *item =
+        static_cast<RowRecord *>(table->GetPrimaryIndex().GetOrInsert(key));
     const std::string bytes = TestHelper::Row(key);
     pax::Row row;
     EXPECT_TRUE(pax::unpack_row(
@@ -204,10 +205,10 @@ TEST_F(CommitTidTest, CommitJoinsTheEpochAfterItsLocksAreHeld) {
   auto *b = SeedRow("b", Version(10, 5));
   const std::string bytes_a = TestHelper::Row("next_a");
   const std::string bytes_b = TestHelper::Row("next_b");
-  // The write set locks in DataItem pointer order, so the committer takes
+  // The write set locks in record pointer order, so the committer takes
   // this one first and then waits for the other.
-  DataItem *first = std::less<DataItem *>{}(a, b) ? a : b;
-  DataItem *second = first == a ? b : a;
+  RowRecord *first = std::less<RowRecord *>{}(a, b) ? a : b;
+  RowRecord *second = first == a ? b : a;
 
   // Another committer holds the record this attempt locks second.
   Tidword held = Version(10, 5);
@@ -313,8 +314,8 @@ TEST_F(CommitTidTest, RacingInsertsOfOneKeyLeaveOneRecord) {
   EXPECT_EQ(kDuplicatePrimaryKeyAbortReason, reasons[committed[0] ? 1 : 0]);
   size_t records = 0;
   tables_.GetTable(kTable)->GetPrimaryIndex().Scan(
-      "", std::nullopt, [&](std::string_view, DataItem &item) {
-        EXPECT_TRUE(item.IsLive());
+      "", std::nullopt, [&](std::string_view, IndexRecord &item) {
+        EXPECT_TRUE(static_cast<RowRecord &>(item).IsLive());
         ++records;
         return false;
       });
@@ -479,7 +480,7 @@ TEST_F(CommitTidTest, InsertAndReinsertAfterTheSnapshotPreserveAbsence) {
   const EpochNumber se = image_buffer.Open(epoch_);
   SetEpoch(11);
   const bool inserted = Commit({}, {{kTable, "new", "value", RowOp::kInsert}});
-  auto *item = index.GetOrInsert("new");
+  auto *item = static_cast<RowRecord *>(index.GetOrInsert("new"));
   const auto after_insert =
       image_buffer.SlotImages(item->pax_group(), item->pax_slot());
   const bool deleted = Commit({}, {{kTable, "new", "", RowOp::kDelete}});
@@ -521,7 +522,7 @@ TEST_F(CommitTidTest, ReinsertingUnderOneViewKeepsOneAbsenceImage) {
               Commit({}, {{kTable, "churn", "value", RowOp::kInsert}}) &&
               Commit({}, {{kTable, "churn", "", RowOp::kDelete}});
   }
-  auto *item = index.GetOrInsert("churn");
+  auto *item = static_cast<RowRecord *>(index.GetOrInsert("churn"));
   const auto images =
       image_buffer.SlotImages(item->pax_group(), item->pax_slot());
   const uint64_t count = image_buffer.GroupPreserveCount(item->pax_group());
@@ -624,7 +625,7 @@ TEST_F(CommitTidTest, DeletingAMissingKeyThenInsertingPreservesAbsence) {
   const bool deleted = Commit({}, {{kTable, "ghost", "", RowOp::kDelete}});
   const bool inserted =
       Commit({}, {{kTable, "ghost", "value", RowOp::kInsert}});
-  auto *item = index.GetOrInsert("ghost");
+  auto *item = static_cast<RowRecord *>(index.GetOrInsert("ghost"));
   const auto images =
       image_buffer.SlotImages(item->pax_group(), item->pax_slot());
   image_buffer.Close(se);
@@ -836,7 +837,8 @@ TEST_F(CommitTidTest, ReadOnlyCommitAdvancesWorkerOrdering) {
 TEST_F(CommitTidTest, SecondaryRangeReadContributesIndexAndRowVersions) {
   auto *row = SeedRow("a", Version(10, 10));
   auto *index = tables_.GetTable(kTable)->GetSecondaryIndex("idx");
-  auto *posting = index->tree.GetOrInsert("groupa");
+  auto *posting =
+      static_cast<NonUniqueRecord *>(index->tree.GetOrInsert("groupa"));
   posting->set_pk_len(1);
   posting->transaction_id.store(Version(10, 300));
   TestHelper::Range range;
@@ -894,7 +896,7 @@ TEST_F(CommitTidTest, FullTidRangeAllowsPurgeAndRejectsCommitWrap) {
   retired.latest = false;
   EXPECT_EQ(retired, retained->transaction_id.load());
   ASSERT_FALSE(retained->transaction_id.load().lock);
-  const auto read = silo::StableRead(*retained);
+  const auto read = silo::StableRead(*static_cast<RowRecord *>(retained));
   EXPECT_FALSE(read.found);
   EXPECT_EQ(retired, read.tid);
   EXPECT_EQ(nullptr, tree.Get("key"));
@@ -925,7 +927,7 @@ TEST_F(CommitTidTest, AbsentReadAcceptsABlankRecordAnotherTransactionLeft) {
 
 TEST_F(CommitTidTest, AbsentReadAbortsWhileAnotherCommitterHoldsTheRecord) {
   auto &tree = tables_.GetTable(kTable)->GetPrimaryIndex();
-  DataItem *claimed = tree.GetOrInsert("claimed");
+  IndexRecord *claimed = tree.GetOrInsert("claimed");
   // Another committer is midway through inserting the key.
   Tidword held = Tidword::Absent();
   held.lock = true;
@@ -934,7 +936,7 @@ TEST_F(CommitTidTest, AbsentReadAbortsWhileAnotherCommitterHoldsTheRecord) {
   EXPECT_FALSE(Commit({{kTable, "claimed", Tidword::Absent().obj}},
                       {{kTable, "other", "value"}}));
   EXPECT_EQ(0u, reason_.rfind("exact_read_tid_moved", 0)) << reason_;
-  DataItem *other = tree.Get("other");
+  IndexRecord *other = tree.Get("other");
   ASSERT_NE(nullptr, other);
   EXPECT_FALSE(other->transaction_id.load().lock);
 
@@ -984,7 +986,7 @@ TEST_F(CommitTidTest, WriteTargetReplacedAfterTheWriteAbortsAtItsLock) {
 TEST_F(CommitTidTest, RangeRevalidationAllowsOwnLockOnPrimaryAndSecondary) {
   SeedRow("k", Version(10, 10));
   auto *index = tables_.GetTable(kTable)->GetSecondaryIndex("idx");
-  auto *posting = index->tree.GetOrInsert("sk");
+  auto *posting = static_cast<NonUniqueRecord *>(index->tree.GetOrInsert("sk"));
   posting->set_pk_len(1);
   posting->transaction_id.store(Version(10, 12));
 
@@ -1094,7 +1096,8 @@ TEST_F(CommitTidTest,
   auto &tree = tables_.GetTable(kTable)->GetPrimaryIndex();
   tree.GetOrInsert("a")->transaction_id.store(Deleted(11, 5));
   auto *index = tables_.GetTable(kTable)->GetSecondaryIndex("idx");
-  auto *posting = index->tree.GetOrInsert("groupa");
+  auto *posting =
+      static_cast<NonUniqueRecord *>(index->tree.GetOrInsert("groupa"));
   posting->set_pk_len(1);
   posting->transaction_id.store(Version(10, 30));
   TestHelper::Range range;
@@ -1113,7 +1116,7 @@ TEST_F(CommitTidTest,
   SeedRow("a", Version(10, 2));
   // A non-unique index keys secondary key s and primary key a as "sa".
   auto *index = tables_.GetTable(kTable)->GetSecondaryIndex("idx");
-  auto *posting = index->tree.GetOrInsert("sa");
+  auto *posting = static_cast<NonUniqueRecord *>(index->tree.GetOrInsert("sa"));
   posting->set_pk_len(1);
   posting->transaction_id.store(Version(10, 4));
 

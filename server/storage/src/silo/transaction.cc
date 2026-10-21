@@ -25,7 +25,8 @@ namespace silo {
 
 namespace {
 
-Tidword PublishedTid(Tidword commit_tid, const DataItem &item) {
+template <typename Record>
+Tidword PublishedTid(Tidword commit_tid, const Record &item) {
   commit_tid.absent = !item.IsLive();
   return commit_tid;
 }
@@ -122,7 +123,7 @@ bool Transaction::Write(std::string_view table_name, std::string_view key,
   auto &index = table->GetPrimaryIndex();
   // An inserted key is usually new.
   const bool expect_new = op == RowOp::kInsert;
-  DataItem *item = index.GetOrInsert(key, expect_new);
+  IndexRecord *item = index.GetOrInsert(key, expect_new);
   const std::string_view bytes =
       op == RowOp::kDelete ? std::string_view() : row_bytes;
   auto entry = write_set_.find(item);
@@ -182,7 +183,7 @@ bool Transaction::IndexWrite(std::string_view table_name,
     key = composite;
   }
   // An added key is usually new.
-  DataItem *item = index->tree.GetOrInsert(key, !remove);
+  IndexRecord *item = index->tree.GetOrInsert(key, !remove);
   auto entry =
       write_set_
           .try_emplace(
@@ -256,7 +257,7 @@ bool Transaction::Commit(CommitDurability durability, std::string &reason) {
   for (auto &[item, entry] : write_set_) {
     const auto *row = std::get_if<RowUpdate>(&entry.update);
     if (row == nullptr || row->op == RowOp::kDelete) continue;
-    if (!item->AllocateSlot(*row->store)) {
+    if (!static_cast<RowRecord *>(item)->AllocateSlot(*row->store)) {
       reason = "pax_slots_exhausted";
       return Abort();
     }
@@ -313,12 +314,12 @@ bool Transaction::Commit(CommitDurability durability, std::string &reason) {
   return true;
 }
 
-bool Transaction::OwnsLock(DataItem *item) const {
+bool Transaction::OwnsLock(IndexRecord *item) const {
   const auto entry = write_set_.find(item);
   return entry != write_set_.end() && entry->second.owns_lock;
 }
 
-bool Transaction::Lock(DataItem &item, WriteEntry &entry, Tidword &max_tid,
+bool Transaction::Lock(IndexRecord &item, WriteEntry &entry, Tidword &max_tid,
                        std::string &reason) {
   for (;;) {
     Tidword current = item.transaction_id.load();
@@ -356,7 +357,7 @@ bool Transaction::Abort() {
   return false;
 }
 
-bool Transaction::Prepare(DataItem &item, WriteEntry &entry,
+bool Transaction::Prepare(IndexRecord &item, WriteEntry &entry,
                           std::string &reason) {
   if (const auto *row = std::get_if<RowUpdate>(&entry.update)) {
     if (row->check_absent && !item.transaction_id.load().absent) {
@@ -370,7 +371,8 @@ bool Transaction::Prepare(DataItem &item, WriteEntry &entry,
   // non-unique index record holds no list and no constraint.
   auto &index = std::get<IndexUpdate>(entry.update);
   if (index.constraint != IndexConstraint::kUnique) return true;
-  index.primary_keys = std::atomic_load(&item.primary_keys);
+  index.primary_keys =
+      std::atomic_load(&static_cast<UniqueRecord &>(item).primary_keys);
   for (const auto &delta : index.deltas) {
     if (delta.op == wal::SecondaryIndexOp::kDelete) {
       index.primary_keys =
@@ -403,7 +405,8 @@ bool Transaction::ValidateReads(Tidword &max_tid, std::string &reason) {
       }
       continue;
     }
-    DataItem *item = table->GetPrimaryIndex().Get(read.key);
+    auto *item =
+        static_cast<RowRecord *>(table->GetPrimaryIndex().Get(read.key));
     // A key with no record reads as the absent word.
     const Tidword current =
         item ? item->transaction_id.load() : Tidword::Absent();
@@ -462,7 +465,7 @@ bool Transaction::RevalidateRange(const RangeEntry &range, Tidword &max_tid) {
   uint64_t live = 0;
   bool matches = true;
   // Match each record the re-scan reaches, up to its limit-th live row.
-  auto match_key = [&](std::string_view key, DataItem &item) {
+  auto match_key = [&](std::string_view key, IndexRecord &item) {
     const Tidword tid = item.transaction_id.load();
     if (!match_record(range, row, visited, key, &item, tid, false, max_tid)) {
       matches = false;
@@ -492,18 +495,22 @@ bool Transaction::RevalidateSecondaryRange(const RangeEntry &range,
   size_t visited = 0;
   uint64_t live = 0;
   bool matches = true;
-  auto match_entry = [&](std::string_view key, DataItem &) {
+  auto match_entry = [&](std::string_view key, IndexRecord &) {
     // Find the current entry; the item supplied by the scan may be stale.
-    DataItem *item = index->tree.Get(key);
+    IndexRecord *item = index->tree.Get(key);
     if (item == nullptr) return false;
 
     // The key list and a non-unique index record's primary-key length are
     // separate loads; abort if the word moved around them.
     const Tidword tid = item->transaction_id.load();
     PrimaryKeyList::Ptr primary_keys;
-    if (index->constraint == IndexConstraint::kUnique)
-      primary_keys = std::atomic_load(&item->primary_keys);
-    const size_t pk_len = item->pk_len();
+    size_t pk_len = 0;
+    if (index->constraint == IndexConstraint::kUnique) {
+      primary_keys =
+          std::atomic_load(&static_cast<UniqueRecord *>(item)->primary_keys);
+    } else {
+      pk_len = static_cast<NonUniqueRecord *>(item)->pk_len();
+    }
     if (item->transaction_id.load() != tid ||
         !match_record(range, row, visited, key, item, tid, true, max_tid)) {
       matches = false;
@@ -515,7 +522,7 @@ bool Transaction::RevalidateSecondaryRange(const RangeEntry &range,
     if (tid.absent) return false;
     return for_each_primary_key(
         key, pk_len, primary_keys, [&](std::string_view primary_key) {
-          DataItem *base = table->GetPrimaryIndex().Get(primary_key);
+          IndexRecord *base = table->GetPrimaryIndex().Get(primary_key);
           if (base == nullptr) return false;
           const Tidword base_tid = base->transaction_id.load();
           if (!match_record(range, row, visited, primary_key, base, base_tid,
@@ -539,7 +546,7 @@ bool Transaction::RevalidateSecondaryRange(const RangeEntry &range,
 
 bool Transaction::match_record(const RangeEntry &range, size_t &row,
                                size_t &visited, std::string_view key,
-                               DataItem *item, Tidword tid, bool entry,
+                               IndexRecord *item, Tidword tid, bool entry,
                                Tidword &max_tid) const {
   if (tid.lock) {
     if (!OwnsLock(item)) return false;
@@ -568,9 +575,10 @@ bool Transaction::match_record(const RangeEntry &range, size_t &row,
   return true;
 }
 
-Tidword Transaction::Apply(DataItem &item, const WriteEntry &entry,
+Tidword Transaction::Apply(IndexRecord &record, const WriteEntry &entry,
                            Tidword commit_tid) {
   if (const auto *row = std::get_if<RowUpdate>(&entry.update)) {
+    auto &item = static_cast<RowRecord &>(record);
     if (row->op == RowOp::kDelete) {
       item.DeleteRow(commit_tid.epoch);
       return PublishedTid(commit_tid, item);
@@ -588,6 +596,7 @@ Tidword Transaction::Apply(DataItem &item, const WriteEntry &entry,
   }
   const auto &index = std::get<IndexUpdate>(entry.update);
   if (index.constraint == IndexConstraint::kUnique) {
+    auto &item = static_cast<UniqueRecord &>(record);
     std::atomic_store(&item.primary_keys, index.primary_keys);
     return PublishedTid(commit_tid, item);
   }
@@ -596,7 +605,9 @@ Tidword Transaction::Apply(DataItem &item, const WriteEntry &entry,
   // it is present.
   const auto &last = index.deltas.back();
   commit_tid.absent = last.op == wal::SecondaryIndexOp::kDelete;
-  if (!commit_tid.absent) item.set_pk_len(last.primary_key.size());
+  if (!commit_tid.absent) {
+    static_cast<NonUniqueRecord &>(record).set_pk_len(last.primary_key.size());
+  }
   return commit_tid;
 }
 
@@ -619,7 +630,7 @@ void Transaction::AppendLog(msgpack::packer<wal::PackedLogRecord> &pk,
   }
 }
 
-void Transaction::Publish(DataItem &item, WriteEntry &entry,
+void Transaction::Publish(IndexRecord &item, WriteEntry &entry,
                           Tidword published) {
   item.transaction_id.store(published);
   entry.owns_lock = false;

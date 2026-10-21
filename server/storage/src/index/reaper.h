@@ -13,7 +13,7 @@
 #include <string_view>
 #include <vector>
 
-#include "index/data_item.h"
+#include "index/index_record.h"
 #include "silo/tidword.h"
 #include "util/epoch.h"
 
@@ -33,7 +33,7 @@ class Reaper {
    *
    * The committer passes the tree owning the already resolved record.
    */
-  void Enqueue(MasstreeIndex &index, std::string_view key, DataItem &item,
+  void Enqueue(MasstreeIndex &index, std::string_view key, IndexRecord &item,
                Tidword delete_commit_tid);
 
   /**
@@ -49,7 +49,7 @@ class Reaper {
   /**
    * @brief One logically deleted record awaiting its physical purge.
    *
-   * index is the tree owning the record. item is the DataItem the key resolved
+   * index is the tree owning the record. item is the record the key resolved
    * to at enqueue time and serves as an identity check at purge time.
    * `delete_commit_tid` identifies the deletion; a newer version cancels
    * this candidate.
@@ -57,7 +57,7 @@ class Reaper {
   struct Tombstone {
     MasstreeIndex *index = nullptr;
     std::string key;
-    DataItem *item = nullptr;
+    IndexRecord *item = nullptr;
     Tidword delete_commit_tid;
   };
 

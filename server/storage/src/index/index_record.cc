@@ -1,16 +1,16 @@
 /**
- * @file server/storage/src/index/data_item.cc
+ * @file server/storage/src/index/index_record.cc
  * PAX slot allocation, value access and row updates.
  */
 
-#include "index/data_item.h"
+#include "index/index_record.h"
 
 #include "pax/epoch_image_buffer.h"
 #include "pax/table.h"
 
 namespace helios::storage {
 
-std::string DataItem::CopyValue() const {
+std::string RowRecord::CopyValue() const {
   std::string out(size_, '\0');
   if (!out.empty()) {
     GatherInto(reinterpret_cast<std::byte *>(out.data()), out.size());
@@ -18,7 +18,7 @@ std::string DataItem::CopyValue() const {
   return out;
 }
 
-bool DataItem::AllocateSlot(pax::PaxTable &table) {
+bool RowRecord::AllocateSlot(pax::PaxTable &table) {
   if (pax_allocated()) return true;
   const auto [group, slot] = table.AllocateSlot();
   if (group == nullptr) return false;
@@ -27,7 +27,7 @@ bool DataItem::AllocateSlot(pax::PaxTable &table) {
   return true;
 }
 
-void DataItem::PreserveImage(EpochNumber epoch) {
+void RowRecord::PreserveImage(EpochNumber epoch) {
   assert(epoch != 0);
   auto &image_buffer = pax::EpochImageBuffer::Global();
   if (!image_buffer.HasOpenView()) return;
@@ -40,15 +40,15 @@ void DataItem::PreserveImage(EpochNumber epoch) {
                         visible ? CopyValue() : std::string());
 }
 
-uint64_t DataItem::InstallRow(const pax::Row &row, EpochNumber epoch) {
+uint64_t RowRecord::InstallRow(const pax::Row &row, EpochNumber epoch) {
   assert(pax_allocated() && row.size != 0);
   PreserveImage(epoch);
   const uint64_t changed = pax_group()->ScatterRow(slot_, row, size_ != 0);
-  size_ = row.size;
+  size_ = static_cast<uint32_t>(row.size);
   return changed;
 }
 
-void DataItem::DeleteRow(EpochNumber epoch) {
+void RowRecord::DeleteRow(EpochNumber epoch) {
   if (pax_allocated() && size_ != 0) {
     PreserveImage(epoch);
     pax_group()->RetireSlot(slot_);
