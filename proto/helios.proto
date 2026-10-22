@@ -385,11 +385,15 @@ message DbCreateTable {
 
 // Create a secondary index on a table.
 // @param index_type  0 = IndexConstraint::kNone, 1 = IndexConstraint::kUnique
+// @param pk_slices   (offset, length) of each primary-key part in a
+//                    non-unique record's key, when the secondary key holds
+//                    primary-key columns.
 message DbCreateSecondaryIndex {
     message Request {
         string table_name = 1;
         string index_name = 2;
         uint32 index_type = 3;
+        repeated uint32 pk_slices = 4;
     }
     message Response {
         bool success = 1;

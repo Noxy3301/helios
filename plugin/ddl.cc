@@ -339,7 +339,8 @@ int ha_helios::create(const char *table_name, TABLE *table, HA_CREATE_INFO *,
         (key_info.flags & HA_NOSAME) ? kUniqueSecondaryIndex : 0;
     if (i != table->s->primary_key &&
         !proxy->db_create_secondary_index(
-            db_table_name, std::string(key_info.name), index_type)) {
+            db_table_name, std::string(key_info.name), index_type,
+            key_pack::pk_slices(*table, key_info))) {
       return HA_ERR_GENERIC;
     }
   }
@@ -559,8 +560,9 @@ bool ha_helios::inplace_alter_table(TABLE *altered_table,
     // Register the index; fail closed on error. On a multi-index ALTER a later
     // failure leaves earlier backfilled indexes on the server (the DD rollback
     // hides them), and nothing purges them.
-    if (!proxy->db_create_secondary_index(db_table_name, index_name,
-                                          index_type)) {
+    if (!proxy->db_create_secondary_index(
+            db_table_name, index_name, index_type,
+            key_pack::pk_slices(*altered_table, *runtime_key))) {
       return alter_fail("the storage server refused index " + index_name);
     }
 

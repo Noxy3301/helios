@@ -27,14 +27,16 @@ constexpr const char *kWorkingFile = "pax_schema.working";
 using File = std::unique_ptr<FILE, int (*)(FILE *)>;
 
 // Field types and index constraints are stored as their numeric tags; the map
-// key is the table name. The two index vectors are parallel.
+// key is the table name. The three index vectors are parallel.
 struct Entry {
   std::vector<uint32_t> widths;
   std::vector<uint8_t> types;
   std::vector<int8_t> scales;
   std::vector<std::string> index_names;
   std::vector<uint8_t> index_constraints;
-  MSGPACK_DEFINE(widths, types, scales, index_names, index_constraints);
+  std::vector<std::vector<uint32_t>> index_pk_slices;
+  MSGPACK_DEFINE(widths, types, scales, index_names, index_constraints,
+                 index_pk_slices);
 };
 
 struct PackedCatalog {
@@ -56,7 +58,7 @@ bool StoreCatalog(const std::string &work_dir, const CatalogEntries &entries) {
   for (const auto &[name, definition] : entries) {
     const auto &schema = definition.schema;
     if (schema.field_max_bytes.empty()) return false;
-    Entry entry{schema.field_max_bytes, {}, schema.field_scale, {}, {}};
+    Entry entry{schema.field_max_bytes, {}, schema.field_scale, {}, {}, {}};
     for (const auto type : schema.field_type) {
       const auto tag = static_cast<uint8_t>(type);
       if (tag > static_cast<uint8_t>(FieldType::kDecimal64)) {
@@ -75,6 +77,7 @@ bool StoreCatalog(const std::string &work_dir, const CatalogEntries &entries) {
       entry.index_names.push_back(index.name);
       entry.index_constraints.push_back(
           static_cast<uint8_t>(index.constraint));
+      entry.index_pk_slices.push_back(index.pk_slices);
     }
     catalog.entries.emplace(name, std::move(entry));
   }
@@ -162,7 +165,8 @@ Catalog LoadCatalog(const std::string &work_dir) {
     for (auto &[name, entry] : catalog.entries) {
       if (entry.widths.empty())
         throw std::runtime_error("PAX schema has no fields");
-      if (entry.index_names.size() != entry.index_constraints.size())
+      if (entry.index_names.size() != entry.index_constraints.size() ||
+          entry.index_names.size() != entry.index_pk_slices.size())
         throw std::runtime_error("secondary index definition is incomplete");
       TableDefinition definition;
 
@@ -183,7 +187,8 @@ Catalog LoadCatalog(const std::string &work_dir) {
         }
         definition.indexes.push_back(
             {std::move(entry.index_names[i]),
-             static_cast<IndexConstraint>(entry.index_constraints[i])});
+             static_cast<IndexConstraint>(entry.index_constraints[i]),
+             std::move(entry.index_pk_slices[i])});
       }
       result.entries.emplace(name, std::move(definition));
     }

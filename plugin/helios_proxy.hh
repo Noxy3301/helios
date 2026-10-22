@@ -252,9 +252,12 @@ public:
                          const std::vector<uint32_t>& pax_field_max_bytes,
                          const std::vector<uint32_t>& pax_field_kind,
                          const std::vector<int32_t>& pax_field_scale);
+    // pk_slices locate the primary key in a record's key, as
+    // key_pack::pk_slices builds them.
     bool db_create_secondary_index(const std::string& table_name,
                                    const std::string& index_name,
-                                   uint32_t index_type);
+                                   uint32_t index_type,
+                                   const std::vector<uint32_t>& pk_slices);
     // Switch the commit acknowledgement policy of the running server. Returns
     // false when the exchange fails or the server refuses, with the reason in
     // error.

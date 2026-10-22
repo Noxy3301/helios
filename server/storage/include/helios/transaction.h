@@ -193,11 +193,12 @@ class Transaction {
    * list; otherwise it joins it. Uniqueness belongs to the named index, not to
    * this call. A UNIQUE index keeps one record per secondary key; any other
    * keeps one per (secondary key, primary key), keyed by `secondary_key`
-   * followed by `primary_key`.
+   * followed by the parts of `primary_key` it lacks.
    * @return false with reason `secondary_index_table_missing`,
-   * `pax_schema_missing`, `secondary_index_missing`, or
-   * `secondary_key_too_long` when a non-unique index record's key exceeds the
-   * index's limit.
+   * `pax_schema_missing`, `secondary_index_missing`,
+   * `primary_key_slices_mismatch` when `primary_key` is not as long as the
+   * index's slices, or `secondary_key_too_long` when a non-unique index
+   * record's key exceeds the index's limit.
    */
   bool IndexWrite(std::string_view table_name, std::string_view index_name,
                   std::string_view secondary_key, std::string_view primary_key,
@@ -269,13 +270,15 @@ class Transaction {
     std::vector<Delta> deltas;  ///< Request order, logged as is.
     /// Final primary key of a UNIQUE record, chosen under the lock.
     std::optional<std::string_view> primary_key;
+    /// A non-unique record's tree key; empty for a UNIQUE one.
+    std::string tree_key;
   };
 
   struct WriteEntry {
     Table *table;
     std::string_view index_name;  ///< Empty for a primary record.
     /// The key the log records: the primary key, or the secondary key,
-    /// without the primary key a non-unique index record's tree key ends with.
+    /// without the primary-key bytes a non-unique record's tree key adds.
     std::string_view key;
     index::MasstreeIndex *index;  ///< The tree holding the record.
     bool owns_lock = false;

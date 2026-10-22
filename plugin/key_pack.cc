@@ -596,6 +596,47 @@ bool index_key_too_long(const KEY &key_info, const std::string &secondary_key,
   return secondary_key.size() + primary_key.size() > kMaxKeyLength;
 }
 
+std::vector<uint32_t> pk_slices(const TABLE &table, const KEY &key) {
+  const uint pk = table.s->primary_key;
+  if ((key.flags & HA_NOSAME) || pk == MAX_KEY) return {};
+  const KEY &primary = table.key_info[pk];
+
+  uint32_t key_len = 0;
+  for (uint i = 0; i < key.user_defined_key_parts; ++i) {
+    const size_t width = raw_part_width(key.key_part[i]);
+    if (width == 0) return {};
+    key_len += width;
+  }
+
+  // A primary-key part the secondary key holds is read in place; any other
+  // follows the secondary key.
+  std::vector<uint32_t> slices;
+  uint32_t tail = key_len;
+  bool held = false;
+  for (uint i = 0; i < primary.user_defined_key_parts; ++i) {
+    const KEY_PART_INFO &part = primary.key_part[i];
+    const uint32_t width = raw_part_width(part);
+    if (width == 0) return {};
+    uint32_t off = 0;
+    uint j = 0;
+    while (j < key.user_defined_key_parts &&
+           key.key_part[j].fieldnr != part.fieldnr) {
+      off += raw_part_width(key.key_part[j]);
+      ++j;
+    }
+    if (j == key.user_defined_key_parts) {
+      off = tail;
+      tail += width;
+    } else {
+      held = true;
+    }
+    slices.push_back(off);
+    slices.push_back(width);
+  }
+  if (!held) return {};
+  return slices;
+}
+
 }  // namespace key_pack
 
 std::string ha_helios::pack_key(const uchar *key, key_part_map keypart_map) {

@@ -39,10 +39,12 @@ class Table {
   /**
    * @brief Declares a secondary index on this table.
    *
+   * @param pk_slices SecondaryIndex::pk_slices.
    * @return false when an index of that name already exists.
    */
   bool CreateSecondaryIndex(const std::string_view index_name,
-                            const IndexConstraint index_type);
+                            const IndexConstraint index_type,
+                            std::vector<uint32_t> pk_slices = {});
 
   /**
    * @brief Installs PAX storage metadata for rows created after the call.
@@ -82,19 +84,21 @@ class Table {
   }
 
   /**
-   * @brief Returns the name and constraint of every secondary index, as the
-   * catalog stores them.
+   * @brief Returns the name, constraint and primary-key slices of every
+   * secondary index, as the catalog stores them.
    */
   std::vector<pax::IndexDefinition> IndexDefinitions();
 
   /**
-   * @brief Returns the index of that name, creating it when there is none.
+   * @brief Returns the index of that name, creating it with `pk_slices` when
+   * there is none.
    *
    * @return The index, or nullptr when an index of that name is declared with
    * a different constraint.
    */
   index::SecondaryIndex *GetOrCreateSecondaryIndex(
-      const std::string_view index_name, const IndexConstraint index_type);
+      const std::string_view index_name, const IndexConstraint index_type,
+      std::vector<uint32_t> pk_slices = {});
 
  private:
   struct IndexNode {
@@ -103,8 +107,10 @@ class Table {
     IndexNode *next;
 
     IndexNode(std::string_view index_name, IndexConstraint index_type,
-              IndexNode *next)
-        : name(index_name), index(index_type), next(next) {}
+              std::vector<uint32_t> pk_slices, IndexNode *next)
+        : name(index_name),
+          index(index_type, std::move(pk_slices)),
+          next(next) {}
   };
 
   index::MasstreeIndex primary_index_;

@@ -33,7 +33,7 @@ struct StablePrimaryKeys {
   bool found = false;
   Tidword tid;  // The version the two keys belong to.
   std::string_view secondary_key;
-  std::string_view primary_key;  // Meaningful only when `found`.
+  std::string primary_key;  // Meaningful only when `found`.
 };
 
 /**
@@ -75,18 +75,16 @@ inline StableValue StableRead(const RowRecord &item, bool keys_only = false) {
  *
  * `found` is false when the word's absent bit is set, which the committer
  * publishes for an emptied UNIQUE key or a removed non-unique index record.
- * The keys view `key` and the record's block, which stays valid until the
- * thread releases its epoch.
+ * The secondary key views `key`.
  */
 inline StablePrimaryKeys StableReadKeys(const index::SecondaryIndex &index,
                                         std::string_view key,
                                         const IndexRecord &item) {
   for (;;) {
     const Tidword tid = StableTid(item);
-    const auto [secondary_key, primary_key] =
-        index::split_entry(index, key, item);
+    auto [secondary_key, primary_key] = index::split_entry(index, key, item);
     if (item.transaction_id.load() == tid) {
-      return {!tid.absent, tid, secondary_key, primary_key};
+      return {!tid.absent, tid, secondary_key, std::move(primary_key)};
     }
   }
 }
