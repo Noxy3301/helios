@@ -247,6 +247,7 @@ void HeliosRpc::handleDbCreateSecondaryIndex(
 
     const bool success = db_manager_->get_database()->CreateSecondaryIndex(
         request.table_name(), request.index_name(),
-        static_cast<helios::storage::IndexConstraint>(request.index_type()));
+        static_cast<helios::storage::IndexConstraint>(request.index_type()),
+        {request.pk_slices().begin(), request.pk_slices().end()});
     response->set_success(success);
 }

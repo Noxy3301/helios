@@ -729,9 +729,9 @@ HeliosProxy::HiddenKeyReservation HeliosProxy::db_allocate_hidden_keys(
     return reservation;
 }
 
-bool HeliosProxy::db_create_secondary_index(const std::string& table_name,
-                                                const std::string& index_name,
-                                                uint32_t index_type) {
+bool HeliosProxy::db_create_secondary_index(
+    const std::string& table_name, const std::string& index_name,
+    uint32_t index_type, const std::vector<uint32_t>& pk_slices) {
     if (!ensure_connected()) {
         LOG_ERROR("RPC failed: Not connected to server");
         return false;
@@ -743,6 +743,7 @@ bool HeliosProxy::db_create_secondary_index(const std::string& table_name,
     request.set_table_name(table_name);
     request.set_index_name(index_name);
     request.set_index_type(index_type);
+    request.mutable_pk_slices()->Add(pk_slices.begin(), pk_slices.end());
 
     Helios::Protocol::Response reply;
     if (!send_request(envelope, reply)) {

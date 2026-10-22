@@ -64,8 +64,8 @@ enum class RecordType : uint8_t {
 
 /**
  * @brief A non-unique index record: one per (secondary key, primary key),
- *        under the secondary key followed by the primary key, whose length
- *        it keeps.
+ *        under the secondary key followed by the primary-key bytes it lacks,
+ *        whose length it keeps.
  */
 struct NonUniqueRecord : IndexRecord {
   size_t pk_len() const { return pk_len_.load(std::memory_order_relaxed); }

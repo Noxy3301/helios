@@ -100,15 +100,22 @@ class Database {
   /**
    * @brief Declares a secondary index on a table.
    *
-   * @return true when the index exists with `index_type` afterwards, whether
-   * this call declared it or an earlier one did; false when the table does
-   * not exist, the name is empty, an index of that name holds another
-   * constraint, `index_type` is not one of the declared values, or the
-   * catalog write of a new declaration fails.
+   * @param pk_slices For a non-unique index whose secondary key holds
+   * primary-key columns: the (offset, length) of each primary-key part in a
+   * record's key, in primary-key order. The key is then the secondary key
+   * followed by the primary-key parts it lacks. Empty when the key is the
+   * secondary key followed by the whole primary key.
+   * @return true when the index exists with `index_type` and `pk_slices`
+   * afterwards, whether this call declared it or an earlier one did; false
+   * when the table does not exist, the name is empty, an index of that name
+   * was declared otherwise, `index_type` is not one of the declared values,
+   * `pk_slices` is odd or given for a UNIQUE index, or the catalog write of a
+   * new declaration fails.
    */
   bool CreateSecondaryIndex(const std::string_view table_name,
                             const std::string_view index_name,
-                            IndexConstraint index_type);
+                            IndexConstraint index_type,
+                            std::vector<uint32_t> pk_slices = {});
 
   bool HasTable(const std::string_view table_name);
 
@@ -274,9 +281,9 @@ class Database {
    *
    * A UNIQUE index keys a record by its secondary key. Any other index keys
    * one record per (secondary key, primary key) as the secondary key followed
-   * by the primary key, so the range is ordered by both: a bound past a
-   * secondary key is its prefix successor, and a reverse scan returns one
-   * secondary key's primary keys in descending order.
+   * by the primary-key parts it lacks, so the range is ordered by both: a
+   * bound past a secondary key is its prefix successor, and a reverse scan
+   * returns one secondary key's primary keys in descending order.
    *
    * @param table_name Base table.
    * @param index_name Secondary index name.

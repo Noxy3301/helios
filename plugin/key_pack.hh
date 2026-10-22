@@ -5,7 +5,9 @@
 #define HELIOS_KEY_PACK_HH
 
 #include <cstddef>
+#include <cstdint>
 #include <string>
+#include <vector>
 
 #include "field_types.h"
 #include "helios_field_types.h"
@@ -71,16 +73,33 @@ std::string string_weights(const KEY_PART_INFO &kp, const uchar *s, size_t len);
 /**
  * @brief Whether an index entry exceeds kMaxKeyLength.
  *
- * @details A UNIQUE index stores the secondary key alone, any other index the
- * secondary key followed by the primary key.
+ * @details A UNIQUE index stores the secondary key alone, any other index at
+ * most the secondary key followed by the primary key.
  *
  * @param key_info      The index the entry belongs to.
  * @param secondary_key The entry's packed secondary key.
  * @param primary_key   The packed primary key of its row.
- * @return True when the stored entry would be longer than kMaxKeyLength.
+ * @return True when the stored entry could be longer than kMaxKeyLength.
  */
 bool index_key_too_long(const KEY &key_info, const std::string &secondary_key,
                         const std::string &primary_key);
+
+/**
+ * @brief Where a non-unique index record's key holds the primary key.
+ *
+ * @details The storage keys a record by the secondary key followed by the
+ * primary-key parts the secondary key does not hold. When every part of both
+ * keys has a raw_part_width and the secondary key holds a primary-key part,
+ * the key's layout is fixed and the result locates each primary-key part in
+ * it; otherwise the storage appends the whole primary key.
+ *
+ * @param table The table, whose primary key the records point at.
+ * @param key   The secondary index.
+ * @return (offset, length) of each primary-key part in the record's key, in
+ *         primary-key order; empty for a UNIQUE index, a table without a
+ *         primary key, or a layout that is not fixed.
+ */
+std::vector<uint32_t> pk_slices(const TABLE &table, const KEY &key);
 
 // "+infinity" end for an unbounded-upper range scan. It is one 0xFF byte longer
 // than the longest key, so it sorts after every key. An empty end will not do:

@@ -116,8 +116,8 @@ ScanIndexResult Database::ScanIndex(const std::string_view table_name,
     return row_limit > 0 && returned_rows >= row_limit;
   };
 
-  // A non-unique index record's key ends with its one primary key, which the
-  // row leaves out.
+  // A non-unique index record's key holds its one primary key; the row reports
+  // the secondary key.
   auto append_secondary_entry = [&](std::string_view key, IndexRecord &item) {
     const auto keys = silo::StableReadKeys(*index, key, item);
     if (keys.tid != Tidword::Absent())

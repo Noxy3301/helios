@@ -16,10 +16,12 @@
 
 namespace helios::storage::pax {
 
-// One secondary index, by the name and constraint it was declared with.
+// One secondary index, by the name, constraint and primary-key slices it was
+// declared with.
 struct IndexDefinition {
   std::string name;
   IndexConstraint constraint = IndexConstraint::kNone;
+  std::vector<uint32_t> pk_slices;
 };
 
 // Everything one table declares: its row format and its secondary indexes.

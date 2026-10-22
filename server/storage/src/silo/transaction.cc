@@ -169,26 +169,38 @@ bool Transaction::IndexWrite(std::string_view table_name,
     reason = "secondary_index_missing";
     return false;
   }
+  // Readers cut the primary key out of the tree key by the slices.
+  if (!index->pk_slices.empty()) {
+    size_t len = 0;
+    for (size_t i = 1; i < index->pk_slices.size(); i += 2)
+      len += index->pk_slices[i];
+    if (primary_key.size() != len) {
+      reason = "primary_key_slices_mismatch";
+      return false;
+    }
+  }
   // A UNIQUE index keeps one record per secondary key, the lock its check
   // runs under. A non-unique one keeps one record per (secondary key, primary
-  // key), under the two concatenated.
-  std::string composite;
+  // key), under join_entry of the two.
+  std::string tree_key;
   std::string_view key = secondary_key;
   if (index->constraint != IndexConstraint::kUnique) {
-    if (secondary_key.size() + primary_key.size() > index::kMaxKeyLength) {
+    tree_key = index::join_entry(*index, secondary_key, primary_key);
+    if (tree_key.size() > index::kMaxKeyLength) {
       reason = "secondary_key_too_long";
       return false;
     }
-    composite.append(secondary_key).append(primary_key);
-    key = composite;
+    key = tree_key;
   }
   // An added key is usually new.
   IndexRecord *item = index->tree.GetOrInsert(key, !remove);
   auto entry =
       write_set_
           .try_emplace(
-              item, WriteEntry{table, index_name, secondary_key, &index->tree,
-                               false, IndexUpdate{index->constraint, {}, {}}})
+              item,
+              WriteEntry{
+                  table, index_name, secondary_key, &index->tree, false,
+                  IndexUpdate{index->constraint, {}, {}, std::move(tree_key)}})
           .first;
   auto &update = std::get<IndexUpdate>(entry->second.update);
   update.deltas.push_back({primary_key, remove
@@ -499,7 +511,7 @@ bool Transaction::RevalidateSecondaryRange(const RangeEntry &range,
     // The primary key and the word are separate loads; abort if the word
     // moved around them.
     const Tidword tid = item->transaction_id.load();
-    const std::string_view primary_key =
+    const std::string primary_key =
         index::split_entry(*index, key, *item).second;
     if (item->transaction_id.load() != tid ||
         !match_record(range, row, visited, key, item, tid, true, max_tid)) {
@@ -593,7 +605,8 @@ Tidword Transaction::Apply(IndexRecord &record, const WriteEntry &entry,
   const auto &last = index.deltas.back();
   commit_tid.absent = last.op == wal::SecondaryIndexOp::kDelete;
   if (!commit_tid.absent) {
-    static_cast<NonUniqueRecord &>(record).set_pk_len(last.primary_key.size());
+    static_cast<NonUniqueRecord &>(record).set_pk_len(index.tree_key.size() -
+                                                      entry.key.size());
   }
   return commit_tid;
 }
@@ -623,15 +636,13 @@ void Transaction::Publish(IndexRecord &item, WriteEntry &entry,
   entry.owns_lock = false;
   if (!published.absent) return;
 
-  // A non-unique index record sits under its secondary key and primary key.
+  // A non-unique index record sits under its tree key.
   const auto *index = std::get_if<IndexUpdate>(&entry.update);
   if (index == nullptr || index->constraint == IndexConstraint::kUnique) {
     reaper_.Enqueue(*entry.index, entry.key, item, published);
     return;
   }
-  std::string key(entry.key);
-  key += index->deltas.front().primary_key;
-  reaper_.Enqueue(*entry.index, key, item, published);
+  reaper_.Enqueue(*entry.index, index->tree_key, item, published);
 }
 
 }  // namespace silo

@@ -82,7 +82,8 @@ Database::Database(const Config &config)
     // Declare the indexes before replay: one with no surviving record has to
     // carry its constraint too.
     for (const auto &index : definition.indexes) {
-      if (!table->CreateSecondaryIndex(index.name, index.constraint)) {
+      if (!table->CreateSecondaryIndex(index.name, index.constraint,
+                                       index.pk_slices)) {
         SPDLOG_CRITICAL("Cannot restore secondary index {} of table {}",
                         index.name, name);
         exit(EXIT_FAILURE);
@@ -179,11 +180,17 @@ bool Database::CreateTable(const std::string_view table_name) {
 
 bool Database::CreateSecondaryIndex(const std::string_view table_name,
                                     const std::string_view index_name,
-                                    IndexConstraint index_type) {
+                                    IndexConstraint index_type,
+                                    std::vector<uint32_t> pk_slices) {
   // A value the wire carried that is neither of the declared ones names a
   // promise this storage does not know how to keep.
   if (index_type != IndexConstraint::kNone &&
       index_type != IndexConstraint::kUnique) {
+    return false;
+  }
+  // Only a non-unique record's key holds slices, each an offset and a length.
+  if (!pk_slices.empty() &&
+      (index_type == IndexConstraint::kUnique || pk_slices.size() % 2 != 0)) {
     return false;
   }
   // An empty index name marks a primary record in the WAL
@@ -195,9 +202,12 @@ bool Database::CreateSecondaryIndex(const std::string_view table_name,
   // A query node that declares an index the storage already holds gets the
   // answer the declaration deserves: the same constraint, or a refusal.
   if (auto *existing = table->GetSecondaryIndex(index_name)) {
-    return existing->constraint == index_type;
+    return existing->constraint == index_type &&
+           existing->pk_slices == pk_slices;
   }
-  if (!table->CreateSecondaryIndex(index_name, index_type)) return false;
+  if (!table->CreateSecondaryIndex(index_name, index_type,
+                                   std::move(pk_slices)))
+    return false;
   // A catalog the definition did not reach would lose the index at the next
   // startup; the index stays in memory and the caller is refused.
   return pax::StoreCatalog(config_.work_dir, CatalogSnapshot());
@@ -303,13 +313,14 @@ void Database::Recover() {
           item->set_primary_key(entry.primary_keys.front());
         } else {
           // A non-unique index keeps one record per
-          // (secondary key, primary key), under the secondary key followed by
-          // the primary key, whose length it keeps.
+          // (secondary key, primary key), under join_entry of the two, with
+          // the length its key adds past the secondary key.
           for (const auto &primary_key : entry.primary_keys) {
-            auto *record = static_cast<NonUniqueRecord *>(
-                idx->tree.Put(entry.key + primary_key));
+            const std::string key =
+                index::join_entry(*idx, entry.key, primary_key);
+            auto *record = static_cast<NonUniqueRecord *>(idx->tree.Put(key));
             record->transaction_id.store(entry.tid);
-            record->set_pk_len(primary_key.size());
+            record->set_pk_len(key.size() - entry.key.size());
           }
         }
       } else {
