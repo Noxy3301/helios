@@ -28,10 +28,14 @@ Table::~Table() {
 
 bool Table::CreateSecondaryIndex(const std::string_view index_name,
                                  const IndexConstraint index_type,
+                                 uint32_t index_id,
                                  std::vector<uint32_t> pk_slices) {
-  if (GetSecondaryIndex(index_name) != nullptr) return false;
-  return GetOrCreateSecondaryIndex(index_name, index_type,
-                                   std::move(pk_slices)) != nullptr;
+  if (FindIndex(index_name) != nullptr) return false;
+  auto *node =
+      new IndexNode(index_name, index_type, index_id, std::move(pk_slices),
+                    indexes_.load(std::memory_order_relaxed));
+  indexes_.store(node, std::memory_order_release);
+  return true;
 }
 
 bool Table::InstallPaxSchema(pax::TableSchema schema) {
@@ -63,21 +67,9 @@ std::vector<pax::IndexDefinition> Table::IndexDefinitions() {
   std::vector<pax::IndexDefinition> definitions;
   ForEachSecondaryIndex([&definitions](const std::string &name,
                                        const index::SecondaryIndex &index) {
-    definitions.push_back({name, index.constraint, index.pk_slices});
+    definitions.push_back({name, index.constraint, index.id, index.pk_slices});
   });
   return definitions;
-}
-
-index::SecondaryIndex *Table::GetOrCreateSecondaryIndex(
-    const std::string_view index_name, const IndexConstraint index_type,
-    std::vector<uint32_t> pk_slices) {
-  if (IndexNode *node = FindIndex(index_name)) {
-    return node->index.constraint == index_type ? &node->index : nullptr;
-  }
-  auto *node = new IndexNode(index_name, index_type, std::move(pk_slices),
-                             indexes_.load(std::memory_order_relaxed));
-  indexes_.store(node, std::memory_order_release);
-  return &node->index;
 }
 
 const std::string &Table::Name() const { return table_name_; }

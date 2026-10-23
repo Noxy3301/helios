@@ -33,7 +33,7 @@ Tidword PublishedTid(Tidword commit_tid, const Record &item) {
 
 // Upper bounds on the msgpack bytes a record adds around its strings: the
 // record, epoch and write-list headers, and per write its array header, five
-// string headers, the TID, index type, key list and op.
+// string headers, the TID, index id, key list and op.
 constexpr size_t kLogRecordFraming = 11;
 constexpr size_t kLogWriteFraming = 44;
 
@@ -42,7 +42,7 @@ constexpr size_t kLogWriteFraming = 44;
 void pack_write(msgpack::packer<wal::PackedLogRecord> &pk, std::string_view key,
                 std::string_view buffer, Tidword tid,
                 std::string_view table_name, std::string_view index_name,
-                uint32_t index_type, wal::SecondaryIndexOp op,
+                uint32_t index_id, wal::SecondaryIndexOp op,
                 std::string_view primary_key) {
   pk.pack_array(9);
   pk.pack(key);
@@ -50,7 +50,7 @@ void pack_write(msgpack::packer<wal::PackedLogRecord> &pk, std::string_view key,
   pk.pack(tid);
   pk.pack(table_name);
   pk.pack(index_name);
-  pk.pack(index_type);
+  pk.pack(index_id);
   pk.pack_array(0);
   pk.pack(op);
   pk.pack(primary_key);
@@ -196,11 +196,13 @@ bool Transaction::IndexWrite(std::string_view table_name,
   IndexRecord *item = index->tree.GetOrInsert(key, !remove);
   auto entry =
       write_set_
-          .try_emplace(
-              item,
-              WriteEntry{
-                  table, index_name, secondary_key, &index->tree, false,
-                  IndexUpdate{index->constraint, {}, {}, std::move(tree_key)}})
+          .try_emplace(item, WriteEntry{table, index_name, secondary_key,
+                                        &index->tree, false,
+                                        IndexUpdate{index->constraint,
+                                                    index->id,
+                                                    {},
+                                                    {},
+                                                    std::move(tree_key)}})
           .first;
   auto &update = std::get<IndexUpdate>(entry->second.update);
   update.deltas.push_back({primary_key, remove
@@ -625,8 +627,7 @@ void Transaction::AppendLog(msgpack::packer<wal::PackedLogRecord> &pk,
   const auto &index = std::get<IndexUpdate>(entry.update);
   for (const auto &delta : index.deltas) {
     pack_write(pk, entry.key, {}, published, table_name, entry.index_name,
-               static_cast<uint32_t>(index.constraint), delta.op,
-               delta.primary_key);
+               index.index_id, delta.op, delta.primary_key);
   }
 }
 

@@ -77,7 +77,7 @@ class CommitTidTest : public ::testing::Test {
     schema.field_max_bytes = {1, 64};
     ASSERT_TRUE(tables_.GetTable(kTable)->InstallPaxSchema(schema));
     ASSERT_TRUE(tables_.GetTable(kTable)->CreateSecondaryIndex(
-        "idx", IndexConstraint::kNone));
+        "idx", IndexConstraint::kNone, 1));
     logger_ = std::make_unique<wal::Logger>(config_);
     ASSERT_EQ(wal::Logger::RecoveryStatus::kOk, logger_->Recover().status);
     logger_->Start();
@@ -721,7 +721,7 @@ TEST_F(CommitTidTest, MissingRangeEndAbortsBeforeLocking) {
 
 TEST_F(CommitTidTest, UniqueIndexTakesASecondAdditionThatFollowsARemoval) {
   ASSERT_TRUE(tables_.GetTable(kTable)->CreateSecondaryIndex(
-      "uidx", IndexConstraint::kUnique));
+      "uidx", IndexConstraint::kUnique, 2));
   SeedRow("a", Version(10, 2));
   SeedRow("b", Version(10, 3));
 

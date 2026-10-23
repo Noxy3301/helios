@@ -84,7 +84,7 @@ LogRecords VariedRecords() {
     delta.transaction_id = Tidword(kTids[(i + 3) % std::size(kTids)]);
     delta.table_name = Filled(i + 7, 't');
     delta.index_name = Filled(i + 4, 'i');
-    delta.index_type = i % 2 == 0 ? UINT32_MAX : static_cast<uint32_t>(i);
+    delta.index_id = i % 2 == 0 ? UINT32_MAX : static_cast<uint32_t>(i);
     delta.secondary_op =
         i % 2 == 0 ? SecondaryIndexOp::kInsert : SecondaryIndexOp::kDelete;
     delta.secondary_primary_key = Filled(i + 3, 'p');
@@ -103,7 +103,7 @@ LogRecords VariedRecords() {
   full.transaction_id = Tidword(kTids[7]);
   full.table_name = "t";
   full.index_name = "idx";
-  full.index_type = 1;
+  full.index_id = 1;
   full.secondary_op = SecondaryIndexOp::kFull;
   for (size_t i = 0; i < 20; ++i) full.primary_keys.push_back(Filled(i, 'f'));
   writes.push_back(full);
@@ -218,9 +218,9 @@ TEST_F(WalPackingTest, ACommitRecordIsTheLogRecordPacking) {
   const std::string wide_table(40, 'w');
   const std::string index = "idx";
   const std::string unique_index(32, 'u');
-  const std::map<std::string, uint32_t> index_types = {
-      {index, static_cast<uint32_t>(IndexConstraint::kNone)},
-      {unique_index, static_cast<uint32_t>(IndexConstraint::kUnique)}};
+  // The catalog numbers indexes from 1 in declaration order.
+  const std::map<std::string, uint32_t> index_ids = {{index, 1},
+                                                     {unique_index, 2}};
 
   // Keys and row bytes cross the fixstr, str8 and str16 boundaries (a row of
   // value length n packs as n + 5 bytes below 256, n + 6 above); primary keys
@@ -302,7 +302,7 @@ TEST_F(WalPackingTest, ACommitRecordIsTheLogRecordPacking) {
           commits[c].emptied.count(op.secondary_key) != 0;
       write.table_name = op.table;
       write.index_name = op.index;
-      write.index_type = index_types.at(op.index);
+      write.index_id = index_ids.at(op.index);
       write.secondary_op =
           op.remove ? SecondaryIndexOp::kDelete : SecondaryIndexOp::kInsert;
       write.secondary_primary_key = op.primary_key;
@@ -325,7 +325,7 @@ TEST_F(WalPackingTest, ACommitRecordIsTheLogRecordPacking) {
       EXPECT_TRUE(
           a.key == e.key && a.buffer == e.buffer &&
           a.table_name == e.table_name && a.index_name == e.index_name &&
-          a.index_type == e.index_type && a.primary_keys == e.primary_keys &&
+          a.index_id == e.index_id && a.primary_keys == e.primary_keys &&
           a.secondary_op == e.secondary_op &&
           a.secondary_primary_key == e.secondary_primary_key &&
           a.transaction_id.absent == e.transaction_id.absent)

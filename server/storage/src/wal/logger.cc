@@ -63,12 +63,12 @@ using Write = LogRecord::Write;
 struct SecondaryOpKey {
   std::string table_name;
   std::string index_name;
-  uint32_t index_type;
+  uint32_t index_id;
   std::string secondary_key;
   std::string primary_key;
   bool operator==(const SecondaryOpKey &rhs) const {
     return table_name == rhs.table_name && index_name == rhs.index_name &&
-           index_type == rhs.index_type && secondary_key == rhs.secondary_key &&
+           index_id == rhs.index_id && secondary_key == rhs.secondary_key &&
            primary_key == rhs.primary_key;
   }
 };
@@ -77,7 +77,7 @@ struct SecondaryOpKeyHash {
     const std::hash<std::string> hasher;
     size_t seed = hasher(key.table_name);
     seed = HashCombine(seed, hasher(key.index_name));
-    seed = HashCombine(seed, std::hash<uint32_t>{}(key.index_type));
+    seed = HashCombine(seed, std::hash<uint32_t>{}(key.index_id));
     seed = HashCombine(seed, hasher(key.secondary_key));
     seed = HashCombine(seed, hasher(key.primary_key));
     return seed;
@@ -92,11 +92,11 @@ struct SecondaryOpState {
 struct SecondaryGroupKey {
   std::string table_name;
   std::string index_name;
-  uint32_t index_type;
+  uint32_t index_id;
   std::string secondary_key;
   bool operator==(const SecondaryGroupKey &rhs) const {
     return table_name == rhs.table_name && index_name == rhs.index_name &&
-           index_type == rhs.index_type && secondary_key == rhs.secondary_key;
+           index_id == rhs.index_id && secondary_key == rhs.secondary_key;
   }
 };
 struct SecondaryGroupKeyHash {
@@ -104,7 +104,7 @@ struct SecondaryGroupKeyHash {
     const std::hash<std::string> hasher;
     size_t seed = hasher(key.table_name);
     seed = HashCombine(seed, hasher(key.index_name));
-    seed = HashCombine(seed, std::hash<uint32_t>{}(key.index_type));
+    seed = HashCombine(seed, std::hash<uint32_t>{}(key.index_id));
     seed = HashCombine(seed, hasher(key.secondary_key));
     return seed;
   }
@@ -139,8 +139,8 @@ void ApplySecondary(const Write &write, SecondaryOps &ops) {
   const auto op = write.secondary_op;
   if (op == SecondaryIndexOp::kFull) {
     for (const auto &pk : write.primary_keys) {
-      SecondaryOpKey op_key{write.table_name, write.index_name,
-                            write.index_type, write.key, pk};
+      SecondaryOpKey op_key{write.table_name, write.index_name, write.index_id,
+                            write.key, pk};
       auto it = ops.find(op_key);
       if (it == ops.end() || !(write.transaction_id < it->second.tid)) {
         ops[op_key] = {write.transaction_id, SecondaryIndexOp::kInsert};
@@ -148,7 +148,7 @@ void ApplySecondary(const Write &write, SecondaryOps &ops) {
     }
   } else {
     // A delta names one primary key joining or leaving the list.
-    SecondaryOpKey op_key{write.table_name, write.index_name, write.index_type,
+    SecondaryOpKey op_key{write.table_name, write.index_name, write.index_id,
                           write.key, write.secondary_primary_key};
     auto it = ops.find(op_key);
     if (it == ops.end() || !(write.transaction_id < it->second.tid)) {
@@ -170,7 +170,7 @@ void ApplyPrimary(const Write &write, LogEntries &recovery_entries,
       item.tid = write.transaction_id;
       item.table_name = write.table_name;
       item.index_name = write.index_name;
-      item.index_type = static_cast<IndexConstraint>(write.index_type);
+      item.index_id = write.index_id;
     }
     return;
   }
@@ -183,7 +183,7 @@ void ApplyPrimary(const Write &write, LogEntries &recovery_entries,
   entry.tid = write.transaction_id;
   entry.table_name = write.table_name;
   entry.index_name = write.index_name;
-  entry.index_type = static_cast<IndexConstraint>(write.index_type);
+  entry.index_id = write.index_id;
   recovery_entries.emplace_back(std::move(entry));
 }
 
@@ -196,7 +196,7 @@ void GroupSecondary(const SecondaryOps &ops, LogEntries &recovery_entries) {
   for (const auto &[op_key, state] : ops) {
     if (state.op != SecondaryIndexOp::kInsert) continue;
     SecondaryGroupKey group_key{op_key.table_name, op_key.index_name,
-                                op_key.index_type, op_key.secondary_key};
+                                op_key.index_id, op_key.secondary_key};
     auto &entry = grouped[group_key];
     entry.primary_keys.emplace_back(op_key.primary_key);
     if (entry.max_tid < state.tid) entry.max_tid = state.tid;
@@ -214,7 +214,7 @@ void GroupSecondary(const SecondaryOps &ops, LogEntries &recovery_entries) {
     log_entry.primary_keys = std::move(entry.primary_keys);
     log_entry.table_name = group_key.table_name;
     log_entry.index_name = group_key.index_name;
-    log_entry.index_type = static_cast<IndexConstraint>(group_key.index_type);
+    log_entry.index_id = group_key.index_id;
     recovery_entries.emplace_back(std::move(log_entry));
   }
 }

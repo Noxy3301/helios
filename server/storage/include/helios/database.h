@@ -390,6 +390,9 @@ class Database {
   wal::EpochScanCheckpoint scan_checkpoint_;
   // Serializes definition changes: index creation and the catalog rewrite
   std::mutex ddl_mutex_;
+  // The id the next index declaration takes; guarded by ddl_mutex_ and
+  // persisted with the catalog.
+  uint32_t next_index_id_ = 1;
   index::Reaper reaper_;
   // Each worker remembers the last TID it chose for this database.
   ThreadKeyStorage<Tidword> last_commit_tids_;
@@ -422,7 +425,9 @@ class Database {
 
   /**
    * @brief Replays WAL records into the indexes and resumes the global epoch.
-   * @note Refuses startup if a table or secondary index cannot be restored.
+   * @details A secondary write whose index id the catalog does not hold
+   * belongs to a dropped index and is skipped.
+   * @note Refuses startup if a table cannot be restored.
    */
   void Recover();
 };

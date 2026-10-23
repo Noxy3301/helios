@@ -10,6 +10,7 @@
 #define HELIOS_STORAGE_SRC_TABLE_TABLE_H
 
 #include <atomic>
+#include <cstdint>
 #include <string>
 #include <vector>
 
@@ -39,11 +40,12 @@ class Table {
   /**
    * @brief Declares a secondary index on this table.
    *
+   * @param index_id The id the catalog assigned to the index.
    * @param pk_slices SecondaryIndex::pk_slices.
    * @return false when an index of that name already exists.
    */
   bool CreateSecondaryIndex(const std::string_view index_name,
-                            const IndexConstraint index_type,
+                            const IndexConstraint index_type, uint32_t index_id,
                             std::vector<uint32_t> pk_slices = {});
 
   /**
@@ -84,21 +86,10 @@ class Table {
   }
 
   /**
-   * @brief Returns the name, constraint and primary-key slices of every
+   * @brief Returns the name, constraint, id and primary-key slices of every
    * secondary index, as the catalog stores them.
    */
   std::vector<pax::IndexDefinition> IndexDefinitions();
-
-  /**
-   * @brief Returns the index of that name, creating it with `pk_slices` when
-   * there is none.
-   *
-   * @return The index, or nullptr when an index of that name is declared with
-   * a different constraint.
-   */
-  index::SecondaryIndex *GetOrCreateSecondaryIndex(
-      const std::string_view index_name, const IndexConstraint index_type,
-      std::vector<uint32_t> pk_slices = {});
 
  private:
   struct IndexNode {
@@ -107,9 +98,10 @@ class Table {
     IndexNode *next;
 
     IndexNode(std::string_view index_name, IndexConstraint index_type,
-              std::vector<uint32_t> pk_slices, IndexNode *next)
+              uint32_t index_id, std::vector<uint32_t> pk_slices,
+              IndexNode *next)
         : name(index_name),
-          index(index_type, std::move(pk_slices)),
+          index(index_type, index_id, std::move(pk_slices)),
           next(next) {}
   };
 

@@ -72,6 +72,7 @@ Database::Database(const Config &config)
                     catalog.detail);
     exit(EXIT_FAILURE);
   }
+  next_index_id_ = catalog.next_index_id;
   for (auto &[name, definition] : catalog.entries) {
     CreateTable(name);
     Table *table = GetTable(name);
@@ -82,7 +83,7 @@ Database::Database(const Config &config)
     // Declare the indexes before replay: one with no surviving record has to
     // carry its constraint too.
     for (const auto &index : definition.indexes) {
-      if (!table->CreateSecondaryIndex(index.name, index.constraint,
+      if (!table->CreateSecondaryIndex(index.name, index.constraint, index.id,
                                        index.pk_slices)) {
         SPDLOG_CRITICAL("Cannot restore secondary index {} of table {}",
                         index.name, name);
@@ -205,12 +206,18 @@ bool Database::CreateSecondaryIndex(const std::string_view table_name,
     return existing->constraint == index_type &&
            existing->pk_slices == pk_slices;
   }
-  if (!table->CreateSecondaryIndex(index_name, index_type,
-                                   std::move(pk_slices)))
-    return false;
-  // A catalog the definition did not reach would lose the index at the next
-  // startup; the index stays in memory and the caller is refused.
-  return pax::StoreCatalog(config_.work_dir, CatalogSnapshot());
+  // The catalog holds the index before it takes a write, since recovery
+  // replays only the writes of indexes the catalog holds.
+  const uint32_t id = next_index_id_;
+  auto entries = CatalogSnapshot();
+  if (auto it = entries.find(table->Name()); it != entries.end()) {
+    it->second.indexes.push_back(
+        {std::string(index_name), index_type, id, pk_slices});
+  }
+  if (!pax::StoreCatalog(config_.work_dir, entries, id + 1)) return false;
+  next_index_id_ = id + 1;
+  return table->CreateSecondaryIndex(index_name, index_type, id,
+                                     std::move(pk_slices));
 }
 
 Table *Database::GetTable(const std::string_view table_name) const {
@@ -291,10 +298,10 @@ void Database::Recover() {
       item->InstallRow(row, entry.tid.epoch);
       item->transaction_id.store(entry.tid);
     } else {
-      // Secondary Index recovery
-      index::SecondaryIndex *idx =
-          table->GetOrCreateSecondaryIndex(entry.index_name, entry.index_type);
-      if (idx != nullptr) {
+      // An index dropped since, or an earlier one of the same name, has an id
+      // the catalog no longer holds; its writes are skipped.
+      index::SecondaryIndex *idx = table->GetSecondaryIndex(entry.index_name);
+      if (idx != nullptr && idx->id == entry.index_id) {
         SPDLOG_DEBUG(
             "  Recovery: Secondary index '{0}' restoring key '{1}' with {2} "
             "primary keys",
@@ -323,12 +330,6 @@ void Database::Recover() {
             record->set_pk_len(key.size() - entry.key.size());
           }
         }
-      } else {
-        SPDLOG_CRITICAL(
-            "Recovery failed: secondary index {0} of table {1} is declared "
-            "with a different constraint than the record restores",
-            entry.index_name, entry.table_name);
-        exit(EXIT_FAILURE);
       }
     }
   }

@@ -31,7 +31,6 @@
 
 #include "db_helper.h"
 #include "gtest/gtest.h"
-#include "table/table.h"
 
 namespace {
 using helios::storage::IndexConstraint;
@@ -76,17 +75,4 @@ TEST_F(CreateSecondaryIndexTest, CreateDuplicateSecondaryIndex) {
 TEST_F(CreateSecondaryIndexTest, CreateSecondaryIndexOnNonExistentTable) {
   ASSERT_FALSE(db_->CreateSecondaryIndex("non_existent_table", "index",
                                          IndexConstraint::kNone));
-}
-
-TEST(SecondaryIndexConstraintTest, GetOrCreateRefusesADifferentConstraint) {
-  helios::storage::Table table("users");
-  const auto unique = IndexConstraint::kUnique;
-  const auto none = IndexConstraint::kNone;
-
-  helios::storage::index::SecondaryIndex *index =
-      table.GetOrCreateSecondaryIndex("age_index", none);
-  ASSERT_NE(index, nullptr);
-
-  EXPECT_EQ(table.GetOrCreateSecondaryIndex("age_index", unique), nullptr);
-  EXPECT_EQ(table.GetOrCreateSecondaryIndex("age_index", none), index);
 }
