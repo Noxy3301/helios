@@ -7,6 +7,7 @@
 
 #include "table/table.h"
 
+#include <memory>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -20,7 +21,7 @@ Table::~Table() {
   delete pax_table_.load(std::memory_order_acquire);
   IndexNode *node = indexes_.load(std::memory_order_acquire);
   while (node != nullptr) {
-    IndexNode *next = node->next;
+    IndexNode *next = node->next.load(std::memory_order_relaxed);
     delete node;
     node = next;
   }
@@ -38,6 +39,21 @@ bool Table::CreateSecondaryIndex(const std::string_view index_name,
   return true;
 }
 
+std::unique_ptr<Table::IndexNode> Table::UnlinkSecondaryIndex(
+    const std::string_view index_name) {
+  // A reader standing on the node still follows its next pointer.
+  std::atomic<IndexNode *> *link = &indexes_;
+  while (IndexNode *node = link->load(std::memory_order_acquire)) {
+    if (node->name == index_name) {
+      link->store(node->next.load(std::memory_order_relaxed),
+                  std::memory_order_release);
+      return std::unique_ptr<IndexNode>(node);
+    }
+    link = &node->next;
+  }
+  return nullptr;
+}
+
 bool Table::InstallPaxSchema(pax::TableSchema schema) {
   if (pax_table_.load(std::memory_order_relaxed) != nullptr) return false;
   pax_table_.store(new pax::PaxTable(std::move(schema)),
@@ -50,8 +66,10 @@ pax::PaxTable *Table::GetPaxTable() const {
 }
 
 Table::IndexNode *Table::FindIndex(const std::string_view index_name) const {
+  // Entered before the walk, so the node found outlives a concurrent drop.
+  index::enter_thread_epoch();
   for (IndexNode *node = indexes_.load(std::memory_order_acquire);
-       node != nullptr; node = node->next) {
+       node != nullptr; node = node->next.load(std::memory_order_acquire)) {
     if (node->name == index_name) return node;
   }
   return nullptr;

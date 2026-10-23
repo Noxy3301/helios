@@ -8,7 +8,9 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <mutex>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -111,21 +113,31 @@ IndexRecord *new_record(RecordType type) {
   return new RowRecord();
 }
 
+void delete_record(IndexRecord *record, RecordType type) {
+  if (type == RecordType::kNonUnique) {
+    delete static_cast<NonUniqueRecord *>(record);
+  } else if (type == RecordType::kUnique) {
+    delete static_cast<UniqueRecord *>(record);
+  } else {
+    delete static_cast<RowRecord *>(record);
+  }
+}
+
 // Delete the item after the RCU grace period, then free this callback.
 struct RcuFreeCallback : public threadinfo::mrcu_callback {
   IndexRecord *item;
   RecordType type;
   RcuFreeCallback(IndexRecord *it, RecordType t) : item(it), type(t) {}
   void operator()(threadinfo &ti) override {
-    if (type == RecordType::kNonUnique) {
-      delete static_cast<NonUniqueRecord *>(item);
-    } else if (type == RecordType::kUnique) {
-      delete static_cast<UniqueRecord *>(item);
-    } else {
-      delete static_cast<RowRecord *>(item);
-    }
+    delete_record(item, type);
     ti.deallocate(this, sizeof(RcuFreeCallback), memtag_masstree_gc);
   }
+};
+
+// Records that the grace period of its registration epoch has passed.
+struct GraceCallback : public threadinfo::mrcu_callback {
+  bool passed = false;
+  void operator()(threadinfo &) override { passed = true; }
 };
 
 inline void RcuFree(IndexRecord *item, RecordType type) {
@@ -231,6 +243,17 @@ struct MasstreeIndex::Impl {
     return true;
   }
 
+  // Frees every record. The nodes stay allocated: a layer-collection callback
+  // queued on another thread may still walk them, and destroy() would hand
+  // them to this thread's pool for reuse.
+  void Destroy() {
+    Scan(std::string_view(), std::nullopt,
+         [this](std::string_view, IndexRecord &item) {
+           delete_record(&item, type_);
+           return false;
+         });
+  }
+
   IndexRecord *GetOrInsert(std::string_view key, bool expect_new) {
     // Existing entries need only the optimistic lookup, which a key expected
     // to be new skips.
@@ -319,6 +342,8 @@ bool MasstreeIndex::Purge(std::string_view key, IndexRecord &expected,
   return impl_->Purge(key, expected, retired_tid);
 }
 
+void MasstreeIndex::Destroy() { impl_->Destroy(); }
+
 void advance_epoch() {
   // Hold the thread-list lock while reading active epochs.
   std::lock_guard<std::mutex> lg(thread_init_mutex);
@@ -337,6 +362,21 @@ void release_thread_epoch() {
   if (tls_ti == nullptr) return;
   tls_ti->rcu_stop();
   tls_enrolled = false;
+}
+
+void enter_thread_epoch() { ensure_thread_active(); }
+
+void synchronize_rcu() {
+  ensure_thread_init();
+  GraceCallback grace;
+  tls_ti->rcu_register(&grace);
+  // The callback runs on this thread, from the quiesce in rcu_stop, once the
+  // epoch thread has seen every older section end.
+  for (;;) {
+    release_thread_epoch();
+    if (grace.passed) return;
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
 }
 
 }  // namespace index

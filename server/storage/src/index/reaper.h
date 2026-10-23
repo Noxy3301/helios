@@ -45,6 +45,14 @@ class Reaper {
    */
   void Purge(EpochNumber reclamation_epoch);
 
+  /**
+   * @brief Drops every queued record of `index`, which is about to be freed.
+   *
+   * @details Waits for a Purge in progress, which may hold such records. The
+   * caller guarantees that no commit enqueues into `index` any more.
+   */
+  void Forget(const MasstreeIndex &index);
+
  private:
   /**
    * @brief One logically deleted record awaiting its physical purge.
@@ -63,6 +71,8 @@ class Reaper {
 
   // Guards the queue shared by committers and the epoch thread.
   std::mutex mutex_;
+  // Held through each Purge, so Forget never meets a batch Purge detached.
+  std::mutex purge_mutex_;
   std::map<EpochNumber, std::vector<Tombstone>> tombstones_;
 };
 

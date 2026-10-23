@@ -26,6 +26,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <memory>
 #include <mutex>
 
 #include "helios/config.h"
@@ -218,6 +219,45 @@ bool Database::CreateSecondaryIndex(const std::string_view table_name,
   next_index_id_ = id + 1;
   return table->CreateSecondaryIndex(index_name, index_type, id,
                                      std::move(pk_slices));
+}
+
+bool Database::DropSecondaryIndexes(
+    const std::string_view table_name,
+    const std::vector<std::string> &index_names) {
+  std::vector<std::unique_ptr<Table::IndexNode>> dropped;
+  {
+    std::lock_guard<std::mutex> lk(ddl_mutex_);
+    Table *table = GetTable(table_name);
+    if (table == nullptr) return false;
+    // The catalog loses every named index before lookups stop finding them.
+    auto entries = CatalogSnapshot();
+    if (auto it = entries.find(table->Name()); it != entries.end()) {
+      auto &indexes = it->second.indexes;
+      indexes.erase(std::remove_if(indexes.begin(), indexes.end(),
+                                   [&index_names](const auto &index) {
+                                     return std::count(index_names.begin(),
+                                                       index_names.end(),
+                                                       index.name) != 0;
+                                   }),
+                    indexes.end());
+    }
+    if (!pax::StoreCatalog(config_.work_dir, entries, next_index_id_))
+      return false;
+    for (const auto &name : index_names) {
+      if (auto node = table->UnlinkSecondaryIndex(name))
+        dropped.push_back(std::move(node));
+    }
+  }
+  if (dropped.empty()) return true;
+
+  // A thread finds an index only inside its Masstree epoch, and a commit
+  // queues its tombstones before leaving it.
+  index::synchronize_rcu();
+  for (auto &node : dropped) {
+    reaper_.Forget(node->index.tree);
+    node->index.tree.Destroy();
+  }
+  return true;
 }
 
 Table *Database::GetTable(const std::string_view table_name) const {
