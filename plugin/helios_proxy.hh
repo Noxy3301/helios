@@ -258,6 +258,9 @@ public:
                                    const std::string& index_name,
                                    uint32_t index_type,
                                    const std::vector<uint32_t>& pk_slices);
+    // Drops the named secondary indexes of the table, all or none.
+    bool db_drop_secondary_indexes(const std::string& table_name,
+                                   const std::vector<std::string>& index_names);
     // Switch the commit acknowledgement policy of the running server. Returns
     // false when the exchange fails or the server refuses, with the reason in
     // error.

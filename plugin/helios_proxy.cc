@@ -755,6 +755,26 @@ bool HeliosProxy::db_create_secondary_index(
     return response.success();
 }
 
+bool HeliosProxy::db_drop_secondary_indexes(
+    const std::string& table_name, const std::vector<std::string>& index_names) {
+    if (!ensure_connected()) {
+        LOG_ERROR("RPC failed: Not connected to server");
+        return false;
+    }
+
+    Helios::Protocol::Request envelope;
+    auto& request = *envelope.mutable_db_drop_secondary_indexes();
+    request.set_table_name(table_name);
+    for (const auto& name : index_names) request.add_index_names(name);
+
+    Helios::Protocol::Response reply;
+    if (!send_request(envelope, reply)) {
+        LOG_ERROR("RPC failed: Failed to send message to server");
+        return false;
+    }
+    return reply.db_drop_secondary_indexes().success();
+}
+
 bool HeliosProxy::db_set_commit_durability(
     Helios::Protocol::DbSetCommitDurability::Mode mode, std::string* error) {
     if (!ensure_connected()) {

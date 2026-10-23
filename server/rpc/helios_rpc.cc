@@ -85,6 +85,11 @@ bool HeliosRpc::handle_rpc(const std::string& message, std::string& result,
                     request.db_set_commit_durability(),
                     response.mutable_db_set_commit_durability());
                 break;
+            case Request::kDbDropSecondaryIndexes:
+                handleDbDropSecondaryIndexes(
+                    request.db_drop_secondary_indexes(),
+                    response.mutable_db_drop_secondary_indexes());
+                break;
 
             case Request::BODY_NOT_SET:
                 SPDLOG_ERROR("Request envelope carries no body");
