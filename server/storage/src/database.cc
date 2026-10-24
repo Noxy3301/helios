@@ -28,7 +28,6 @@
 #include <chrono>
 #include <memory>
 #include <mutex>
-#include <optional>
 #include <string>
 #include <vector>
 
@@ -46,15 +45,6 @@ namespace {
 // Orders TID words by epoch and tid, leaving out the status bits.
 uint64_t tid_order(Tidword tid) { return tid.obj >> 3; }
 
-// Unlinks a record the replay found deleted. Nothing else reaches the
-// indexes yet.
-void purge(index::MasstreeIndex &tree, std::string_view key,
-           IndexRecord &item) {
-  Tidword retired = item.transaction_id.load();
-  retired.latest = false;
-  tree.Purge(key, item, retired);
-}
-
 // Applies one primary key joining or leaving a secondary entry. Of two
 // writes with one TID, the later wins.
 void replay_secondary(index::SecondaryIndex &index, const std::string &key,
@@ -70,8 +60,7 @@ void replay_secondary(index::SecondaryIndex &index, const std::string &key,
     if (!insert) {
       // Leaving a key the entry does not hold changes nothing.
       if (item == nullptr || item->primary_key() != primary_key) return;
-      item->set_primary_key(std::nullopt);
-      purge(index.tree, key, *item);
+      index.tree.Remove(key);
       return;
     }
     if (item == nullptr)
@@ -92,7 +81,7 @@ void replay_secondary(index::SecondaryIndex &index, const std::string &key,
     return;
   }
   if (!insert) {
-    if (item != nullptr) purge(index.tree, record_key, *item);
+    if (item != nullptr) index.tree.Remove(record_key);
     return;
   }
   if (item == nullptr) item = index.tree.GetOrInsert(record_key, true);
@@ -109,7 +98,8 @@ void replay_secondary(index::SecondaryIndex &index, const std::string &key,
  * @details Writes run in TID order. After the checkpoint each batch holds one
  * epoch, in ascending order, so only a checkpoint word can be newer than a
  * write applied after it. A delete, or an entry left without primary keys, is
- * unlinked at once, since no later write is older. Rows wait for replay_rows.
+ * unlinked and freed at once: no later write is older, and nothing else
+ * reaches the indexes yet. Rows wait for replay_rows.
  *
  * @param[in,out] highest_epoch Raised to the epoch of every write.
  */
@@ -144,7 +134,7 @@ void replay_keys(TableDictionary &tables, const wal::LogRecords &records,
         continue;
       }
       if (tid.absent) {
-        if (item != nullptr) purge(tree, write->key, *item);
+        if (item != nullptr) tree.Remove(write->key);
         continue;
       }
       if (item == nullptr)
@@ -285,7 +275,7 @@ Database::Database(const Config &config)
   }
 
   // The replay enrolled this thread in the Masstree epoch; leaving it lets
-  // the nodes the replay retired be reclaimed.
+  // other threads reclaim what they retire.
   index::release_thread_epoch();
 
   // Abort the process if the running logger cannot persist its records.

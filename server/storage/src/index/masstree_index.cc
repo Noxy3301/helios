@@ -230,6 +230,18 @@ struct MasstreeIndex::Impl {
     return true;
   }
 
+  void Remove(std::string_view key) {
+    ensure_thread_active();
+    cursor_type lp(table_, key.data(), key.size());
+    if (!lp.find_locked(*tls_ti)) {
+      lp.finish(0, *tls_ti);
+      return;
+    }
+    IndexRecord *item = lp.value();
+    lp.finish(-1, *tls_ti);
+    delete_record(item, type_);
+  }
+
   // Frees every record. The nodes stay allocated: a layer-collection callback
   // queued on another thread may still walk them, and destroy() would hand
   // them to this thread's pool for reuse.
@@ -324,6 +336,8 @@ bool MasstreeIndex::Purge(std::string_view key, IndexRecord &expected,
                           Tidword retired_tid) {
   return impl_->Purge(key, expected, retired_tid);
 }
+
+void MasstreeIndex::Remove(std::string_view key) { impl_->Remove(key); }
 
 void MasstreeIndex::Destroy() { impl_->Destroy(); }
 

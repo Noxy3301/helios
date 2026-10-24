@@ -71,6 +71,13 @@ class MasstreeIndex final {
   bool Purge(std::string_view key, IndexRecord &expected, Tidword retired_tid);
 
   /**
+   * @brief Unlinks key and frees its record at once, without RCU.
+   *
+   * Call only while no other thread can reach this index, as in recovery.
+   */
+  void Remove(std::string_view key);
+
+  /**
    * @brief Frees every record of this index; its nodes stay allocated.
    *
    * @details No other thread may reach the index any more (see
