@@ -60,6 +60,20 @@ PackedLogRecords MakePacked(EpochNumber epoch, const std::string &key) {
   return PackedLogRecords{pack_record(MakeRecords(epoch, key).front())};
 }
 
+// A scan's result and the records it replayed.
+struct RecordScan : WalScanResult {
+  LogRecords records;
+};
+
+RecordScan ScanRecords(Wal &wal, EpochNumber min_epoch = 0) {
+  RecordScan scan;
+  WalScanResult &result = scan;
+  result = wal.Scan(min_epoch, [&scan](const LogRecords &batch) {
+    scan.records.insert(scan.records.end(), batch.begin(), batch.end());
+  });
+  return scan;
+}
+
 class WalFrameTest : public ::testing::Test {
  protected:
   void SetUp() override {
@@ -230,7 +244,7 @@ class WalFrameTest : public ::testing::Test {
 
 TEST_F(WalFrameTest, ScanOfAFreshLogHasNoLastEpoch) {
   Wal wal(work_dir_, helios::storage::wal::WalIo::Posix(), kCapacity);
-  const auto result = wal.Scan();
+  const auto result = ScanRecords(wal);
   EXPECT_EQ(result.status, WalScanResult::Status::kOk);
   EXPECT_EQ(result.last_epoch, 0u);
   EXPECT_TRUE(result.records.empty());
@@ -243,7 +257,7 @@ TEST_F(WalFrameTest, ScanReturnsTheLastCompleteEpoch) {
   WriteRawBytesAt(EndOfLog(), MakeFrame(3, PackRecords(MakeRecords(3, "again"))));
 
   Wal wal(work_dir_, helios::storage::wal::WalIo::Posix(), kCapacity);
-  const auto result = wal.Scan();
+  const auto result = ScanRecords(wal);
   ASSERT_EQ(result.status, WalScanResult::Status::kOk);
   EXPECT_EQ(result.last_epoch, 3u);
   EXPECT_FALSE(result.tail_zeroed);
@@ -289,7 +303,7 @@ TEST_F(WalFrameTest, GroupSkipsBucketsAboveTheTarget) {
   buckets[3] = MakePacked(3, "k3");
   ASSERT_TRUE(wal.AppendGroup(buckets, 2).ok);
 
-  const auto result = wal.Scan();
+  const auto result = ScanRecords(wal);
   ASSERT_EQ(result.status, WalScanResult::Status::kOk);
   EXPECT_EQ(result.last_epoch, 2u);
   EXPECT_EQ(result.records.size(), 2u);
@@ -304,7 +318,7 @@ TEST_F(WalFrameTest, TheFirstInvalidFrameEndsThePrefixAndAppendResumesThere) {
   FlipByteAt(damaged + static_cast<off_t>(Wal::kHeaderSize) + 1);
   {
     Wal wal(work_dir_, helios::storage::wal::WalIo::Posix(), kCapacity);
-    const auto result = wal.Scan();
+    const auto result = ScanRecords(wal);
     ASSERT_EQ(result.status, WalScanResult::Status::kOk) << result.detail;
     EXPECT_TRUE(result.tail_zeroed);
     EXPECT_EQ(result.last_epoch, 1u);
@@ -329,7 +343,7 @@ TEST_F(WalFrameTest, TheFirstInvalidFrameEndsThePrefixAndAppendResumesThere) {
     EXPECT_EQ(FileSize(), file_size);
   }
   Wal wal(work_dir_, helios::storage::wal::WalIo::Posix(), kCapacity);
-  const auto result = wal.Scan();
+  const auto result = ScanRecords(wal);
   ASSERT_EQ(result.status, WalScanResult::Status::kOk) << result.detail;
   EXPECT_FALSE(result.tail_zeroed);
   EXPECT_EQ(result.last_epoch, 4u);
@@ -384,7 +398,7 @@ TEST_F(WalFrameTest, PartialPayloadIsRepaired) {
     WriteRawBytesAt(log_end, torn);
 
     Wal wal(work_dir_, helios::storage::wal::WalIo::Posix(), kCapacity);
-    const auto result = wal.Scan();
+    const auto result = ScanRecords(wal);
     ASSERT_EQ(result.status, WalScanResult::Status::kOk) << result.detail;
     EXPECT_TRUE(result.tail_zeroed);
     EXPECT_EQ(result.last_epoch, 2u);
@@ -401,7 +415,7 @@ TEST_F(WalFrameTest, AnInvalidHeaderEndsTheRecoveredPrefix) {
   WriteRawBytesAt(damaged + kFlagsOffset, {0x07, 0x00});
 
   Wal wal(work_dir_, helios::storage::wal::WalIo::Posix(), kCapacity);
-  const auto result = wal.Scan();
+  const auto result = ScanRecords(wal);
   ASSERT_EQ(result.status, WalScanResult::Status::kOk) << result.detail;
   EXPECT_TRUE(result.tail_zeroed);
   EXPECT_EQ(result.last_epoch, 1u);
@@ -419,7 +433,7 @@ TEST_F(WalFrameTest, AnEmbeddedFrameDoesNotSurviveTheTornTail) {
   WriteRawBytesAt(log_end, torn);
 
   Wal wal(work_dir_, helios::storage::wal::WalIo::Posix(), kCapacity);
-  const auto result = wal.Scan();
+  const auto result = ScanRecords(wal);
   ASSERT_EQ(result.status, WalScanResult::Status::kOk) << result.detail;
   EXPECT_TRUE(result.tail_zeroed);
   EXPECT_EQ(result.last_epoch, 1u);
@@ -443,7 +457,7 @@ TEST_F(WalFrameTest, MalformedPayloadsEndTheRecoveredPrefix) {
     // Recompute the checksum so the decoder, not CRC, rejects the frame.
     WriteRawBytesAt(log_end, MakeFrame(2, payload));
     Wal wal(work_dir_, helios::storage::wal::WalIo::Posix(), kCapacity);
-    const auto result = wal.Scan();
+    const auto result = ScanRecords(wal);
     ASSERT_EQ(result.status, WalScanResult::Status::kOk) << result.detail;
     EXPECT_TRUE(result.tail_zeroed);
     EXPECT_EQ(result.last_epoch, 1u);
@@ -462,7 +476,7 @@ TEST_F(WalFrameTest, ZeroOrRegressedEpochEndsTheRecoveredPrefix) {
     WriteRawBytesAt(
         log_end, MakeFrame(epoch, PackRecords(MakeRecords(epoch, "k"))));
     Wal wal(work_dir_, helios::storage::wal::WalIo::Posix(), kCapacity);
-    const auto result = wal.Scan();
+    const auto result = ScanRecords(wal);
     ASSERT_EQ(result.status, WalScanResult::Status::kOk) << result.detail;
     EXPECT_TRUE(result.tail_zeroed);
     EXPECT_EQ(result.last_epoch, 3u);
@@ -479,7 +493,7 @@ TEST_F(WalFrameTest, AZeroHeaderBeforeNonzeroBytesEndsTheRecoveredPrefix) {
   WriteRawBytesAt(log_end + 128, MakeFrame(2, PackRecords(MakeRecords(2, "k2"))));
 
   Wal wal(work_dir_, helios::storage::wal::WalIo::Posix(), kCapacity);
-  const auto result = wal.Scan();
+  const auto result = ScanRecords(wal);
   ASSERT_EQ(result.status, WalScanResult::Status::kOk) << result.detail;
   EXPECT_TRUE(result.tail_zeroed);
   EXPECT_EQ(result.last_epoch, 1u);
@@ -512,7 +526,7 @@ TEST_F(WalFrameTest, AReadFailureDoesNotRepairTheLog) {
     EXPECT_EQ(wal.write_offset(), 0);
   }
   Wal wal(work_dir_, helios::storage::wal::WalIo::Posix(), kCapacity);
-  const auto result = wal.Scan();
+  const auto result = ScanRecords(wal);
   ASSERT_EQ(result.status, WalScanResult::Status::kOk);
   EXPECT_FALSE(result.tail_zeroed);
   EXPECT_EQ(result.records.size(), 2u);
@@ -586,7 +600,7 @@ TEST_F(WalFrameTest, ShortWritesAreRetriedUntilTheGroupIsComplete) {
   // The exclusive flock is held only while `wal` is alive; the reader needs
   // its own instance, opened after that one is gone.
   Wal reader(work_dir_, helios::storage::wal::WalIo::Posix(), kCapacity);
-  const auto result = reader.Scan();
+  const auto result = ScanRecords(reader);
   ASSERT_EQ(result.status, WalScanResult::Status::kOk) << result.detail;
   EXPECT_EQ(result.last_epoch, 1u);
   ASSERT_EQ(result.records.size(), 1u);
@@ -612,7 +626,7 @@ TEST_F(WalFrameTest, APartialWriteIsCarriedToCompletion) {
   ASSERT_TRUE(wal.AppendGroup(buckets, 2).ok);
   EXPECT_GT(calls, 1u);
 
-  const auto result = wal.Scan();
+  const auto result = ScanRecords(wal);
   ASSERT_EQ(result.status, WalScanResult::Status::kOk) << result.detail;
   EXPECT_FALSE(result.tail_zeroed);
   EXPECT_EQ(result.last_epoch, 2u);
@@ -807,7 +821,7 @@ TEST_F(WalFrameTest, AGrownLogIsAdoptedWithoutLosingFrames) {
   const off_t grown_end = FileSize();
 
   Wal wal(work_dir_, helios::storage::wal::WalIo::Posix(), kCapacity);
-  const auto result = wal.Scan();
+  const auto result = ScanRecords(wal);
   ASSERT_EQ(result.status, WalScanResult::Status::kOk) << result.detail;
   EXPECT_FALSE(result.tail_zeroed);
   EXPECT_EQ(result.last_epoch, 2u);
@@ -903,7 +917,7 @@ TEST_F(WalFrameTest, ACapacityOfOneByteReservesPerGroup) {
   }
   EXPECT_EQ(wal.extension_count(), 3u);
 
-  const auto result = wal.Scan();
+  const auto result = ScanRecords(wal);
   ASSERT_EQ(result.status, WalScanResult::Status::kOk) << result.detail;
   EXPECT_EQ(result.last_epoch, 3u);
   EXPECT_EQ(result.records.size(), 3u);
@@ -929,7 +943,7 @@ TEST_F(WalFrameTest, OutgrowingCapacityExtendsAndIsCounted) {
   EXPECT_GE(FileSize(), wal.write_offset());
   EXPECT_EQ(FileSize() % static_cast<off_t>(kTinyCapacity), 0);
 
-  const auto result = wal.Scan();
+  const auto result = ScanRecords(wal);
   ASSERT_EQ(result.status, WalScanResult::Status::kOk) << result.detail;
   EXPECT_EQ(result.last_epoch, 60u);
   EXPECT_EQ(result.records.size(), 60u);
@@ -964,7 +978,7 @@ TEST_F(WalFrameTest, ALegacyLogLargerThanCapacityIsPreserved) {
   const off_t grown = FileSize();
 
   Wal wal(work_dir_, helios::storage::wal::WalIo::Posix(), kTinyCapacity);
-  const auto result = wal.Scan();
+  const auto result = ScanRecords(wal);
   ASSERT_EQ(result.status, WalScanResult::Status::kOk) << result.detail;
   EXPECT_EQ(result.last_epoch, 40u);
   EXPECT_EQ(result.records.size(), 40u);
@@ -1064,10 +1078,10 @@ TEST_F(WalFrameTest, SkipReadsOnlyTheGuardAndTailPayloads) {
     return real_pread(fd, data, size, offset);
   };
 
-  WalScanResult skipped;
+  RecordScan skipped;
   {
     Wal wal(work_dir_, io, kCapacity);
-    skipped = wal.Scan(3);
+    skipped = ScanRecords(wal, 3);
   }
   ASSERT_EQ(skipped.status, WalScanResult::Status::kOk) << skipped.detail;
   EXPECT_EQ(skipped.frames_skipped, 3u);
@@ -1112,7 +1126,7 @@ TEST_F(WalFrameTest, SkippingTheWholeLogStillFinishesTheScan) {
   };
 
   Wal wal(work_dir_, io, kCapacity);
-  const auto result = wal.Scan(3);
+  const auto result = ScanRecords(wal, 3);
   ASSERT_EQ(result.status, WalScanResult::Status::kOk) << result.detail;
   EXPECT_EQ(result.last_epoch, 3u);
   EXPECT_EQ(result.frames_skipped, 3u);
@@ -1130,7 +1144,7 @@ TEST_F(WalFrameTest, ATornEpochAtTheSkipBoundaryFallsBackToTheValidPrefix) {
   WriteRawBytesAt(third + 12, {2, 0, 0, 0});
   {
     Wal wal(work_dir_, helios::storage::wal::WalIo::Posix(), kCapacity);
-    const auto result = wal.Scan(2);
+    const auto result = ScanRecords(wal, 2);
     ASSERT_EQ(result.status, WalScanResult::Status::kOk) << result.detail;
     EXPECT_EQ(result.last_epoch, 2u);
     EXPECT_EQ(result.frames_skipped, 2u);
@@ -1141,7 +1155,7 @@ TEST_F(WalFrameTest, ATornEpochAtTheSkipBoundaryFallsBackToTheValidPrefix) {
   AssertRangeIsZero(third, FileSize());
 
   Wal wal(work_dir_, helios::storage::wal::WalIo::Posix(), kCapacity);
-  const auto result = wal.Scan();
+  const auto result = ScanRecords(wal);
   ASSERT_EQ(result.status, WalScanResult::Status::kOk) << result.detail;
   EXPECT_FALSE(result.tail_zeroed);
   EXPECT_EQ(result.last_epoch, 2u);
@@ -1161,15 +1175,15 @@ TEST_F(WalFrameTest,
   // mid-frame-1's own real payload rather than on frame 2's header.
   WriteRawBytesAt(8, {4, 0, 0, 0});
 
-  WalScanResult skip_result;
+  RecordScan skip_result;
   {
     Wal wal(work_dir_, helios::storage::wal::WalIo::Posix(), kCapacity);
-    skip_result = wal.Scan(4);
+    skip_result = ScanRecords(wal, 4);
   }
-  WalScanResult full_result;
+  RecordScan full_result;
   {
     Wal wal(work_dir_, helios::storage::wal::WalIo::Posix(), kCapacity);
-    full_result = wal.Scan(0);
+    full_result = ScanRecords(wal, 0);
   }
 
   ASSERT_EQ(skip_result.status, WalScanResult::Status::kOk) << skip_result.detail;

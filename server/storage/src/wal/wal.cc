@@ -404,7 +404,7 @@ WalScanResult Wal::FinishScan(WalScanResult &&result, off_t end_of_log) {
   return std::move(result);
 }
 
-WalScanResult Wal::Scan(EpochNumber min_epoch) {
+WalScanResult Wal::Scan(EpochNumber min_epoch, const Replay &replay) {
   // Refuse a scan on an instance that already failed.
   if (state_ == State::kFailed) {
     return IoFailure("scan " + path_ + " after a failure", EIO);
@@ -419,7 +419,6 @@ WalScanResult Wal::Scan(EpochNumber min_epoch) {
   const off_t file_size = file_stat.st_size;
   initialised_size_ = std::max(initialised_size_, file_size);
 
-  LogRecords records;
   EpochNumber last_epoch = 0;
   bool have_frame = false;
   size_t frames_skipped = 0;
@@ -506,6 +505,8 @@ WalScanResult Wal::Scan(EpochNumber min_epoch) {
   uint8_t header[kHeaderSize];
   std::vector<uint8_t> payload;
   std::string stop_reason;
+  // The frames of the last epoch read, which replay receives together.
+  LogRecords batch;
 
   // Read complete frames until the first invalid frame.
   while (offset < file_size) {
@@ -602,13 +603,22 @@ WalScanResult Wal::Scan(EpochNumber min_epoch) {
       break;
     }
 
-    // Keep this frame and advance the recovery boundary.
-    records.insert(records.end(), std::make_move_iterator(unpacked.begin()),
+    // Keep this frame for replay and advance the recovery boundary. An
+    // epoch's frames are handed on once a later epoch begins.
+    if (replay) {
+      if (epoch != last_epoch && !batch.empty()) {
+        replay(batch);
+        batch.clear();
+      }
+      batch.insert(batch.end(), std::make_move_iterator(unpacked.begin()),
                    std::make_move_iterator(unpacked.end()));
+    }
     last_epoch = epoch;
     have_frame = true;
     offset = static_cast<off_t>(frame_end);
   }
+
+  if (!batch.empty()) replay(batch);
 
   WalScanResult result;
   result.status = WalScanResult::Status::kOk;
@@ -635,8 +645,7 @@ WalScanResult Wal::Scan(EpochNumber min_epoch) {
     }
   }
 
-  // Publish the recovered prefix and its append position.
-  result.records = std::move(records);
+  // Publish the append position after the recovered prefix.
   return FinishScan(std::move(result), offset);
 }
 

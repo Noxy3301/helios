@@ -33,12 +33,6 @@ class MasstreeIndex final {
   IndexRecord *Get(std::string_view key);
 
   /**
-   * @brief Maps key to a new absent record, replacing any entry it had.
-   * @return The new record, for the caller to fill before readers start.
-   */
-  IndexRecord *Put(std::string_view key);
-
-  /**
    * @brief Gets the entry for key, creating an absent record if needed.
    * @details The reaper may unlink the record afterwards; Commit checks the
    * record's latest bit after locking it.
@@ -75,6 +69,13 @@ class MasstreeIndex final {
    * @return False if key no longer points to expected; true after removal.
    */
   bool Purge(std::string_view key, IndexRecord &expected, Tidword retired_tid);
+
+  /**
+   * @brief Unlinks key and frees its record at once, without RCU.
+   *
+   * Call only while no other thread can reach this index, as in recovery.
+   */
+  void Remove(std::string_view key);
 
   /**
    * @brief Frees every record of this index; its nodes stay allocated.

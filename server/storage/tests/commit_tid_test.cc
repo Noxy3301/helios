@@ -44,6 +44,20 @@ Tidword Version(EpochNumber epoch, uint32_t tid) {
 
 using pax::PaxGroup;
 
+// A scan's result and the records it replayed.
+struct RecordScan : wal::WalScanResult {
+  wal::LogRecords records;
+};
+
+RecordScan ScanRecords(wal::Wal &log) {
+  RecordScan scan;
+  wal::WalScanResult &result = scan;
+  result = log.Scan(0, [&scan](const wal::LogRecords &batch) {
+    scan.records.insert(scan.records.end(), batch.begin(), batch.end());
+  });
+  return scan;
+}
+
 // Reads one slot's bit out of the imaged-slot words GroupImages fills.
 bool SlotBit(const uint64_t *imaged, uint32_t slot) {
   constexpr uint32_t kWordBits = PaxGroup::kVisibilityWordBits;
@@ -193,7 +207,7 @@ TEST_F(CommitTidTest, CommitReadsTheEpochAfterTheWriteSetIsFed) {
   logger_->RequestFlush(11);
   logger_.reset();
   wal::Wal log(config_.work_dir);
-  const auto scan = log.Scan();
+  const auto scan = ScanRecords(log);
   ASSERT_EQ(wal::WalScanResult::Status::kOk, scan.status);
   ASSERT_EQ(1u, scan.records.size());
   ASSERT_EQ(1u, scan.records.front().writes.size());
@@ -330,7 +344,7 @@ TEST_F(CommitTidTest, RepeatedRowWritesLogOnlyTheFinalValue) {
   logger_->RequestFlush(10);
   logger_.reset();
   wal::Wal log(config_.work_dir);
-  const auto scan = log.Scan();
+  const auto scan = ScanRecords(log);
   ASSERT_EQ(wal::WalScanResult::Status::kOk, scan.status);
   ASSERT_EQ(1u, scan.records.size());
   ASSERT_EQ(2u, scan.records.front().writes.size());
@@ -678,7 +692,7 @@ TEST_F(CommitTidTest, OneTidCoversReadsRowsIndexesAndTheWorker) {
   logger_->RequestFlush(10);
   logger_.reset();
   wal::Wal log(config_.work_dir);
-  const auto scan = log.Scan();
+  const auto scan = ScanRecords(log);
   ASSERT_EQ(wal::WalScanResult::Status::kOk, scan.status);
   ASSERT_EQ(2u, scan.records.size());
   ASSERT_EQ(3u, scan.records[0].writes.size());
@@ -826,7 +840,7 @@ TEST_F(CommitTidTest, ReadOnlyCommitAdvancesWorkerOrdering) {
   logger_->RequestFlush(10);
   logger_.reset();
   wal::Wal log(config_.work_dir);
-  const auto scan = log.Scan();
+  const auto scan = ScanRecords(log);
   ASSERT_EQ(wal::WalScanResult::Status::kOk, scan.status);
   ASSERT_EQ(1u, scan.records.size());
   EXPECT_EQ(1u, scan.records.front().writes.size());

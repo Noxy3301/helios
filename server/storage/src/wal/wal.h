@@ -23,7 +23,7 @@ namespace helios::storage {
 namespace wal {
 
 /**
- * @brief The complete WAL prefix recovered at startup.
+ * @brief What the startup scan of the WAL found.
  *
  * @details The scan stops at the first invalid frame, zeroes the remaining
  * written bytes and succeeds with the preceding frames. Recovery assumes
@@ -38,7 +38,6 @@ struct WalScanResult {
   // repair may have zeroed part of the suffix; its prefix is never erased.
   Status status{Status::kOk};
   EpochNumber last_epoch{0};
-  LogRecords records;
   bool tail_zeroed{false};
   int error_number{0};
   std::string detail;
@@ -47,6 +46,9 @@ struct WalScanResult {
   size_t frames_skipped{0};
   uint64_t bytes_skipped{0};
 };
+
+// Receives one batch of the records a scan replays.
+using Replay = std::function<void(const LogRecords &)>;
 
 struct WalAppendResult {
   bool ok{true};
@@ -134,14 +136,17 @@ class Wal {
    * skipped by header alone, except the boundary frame, which is read and
    * checksummed in full. A header that fails to parse falls back to a full
    * scan from offset 0.
-   * @return See WalScanResult; `Ok` carries the last epoch and the records.
+   * @param[in] replay Called once per epoch, in log order, with the records
+   * of that epoch's valid frames, which are dropped after the call. Empty
+   * reads and checks every frame without keeping its records.
+   * @return See WalScanResult; `Ok` carries the last epoch.
    * @note Must succeed before the first append: it locates the end of the log
    * and overwrites the bytes of an interrupted write with zeroes, which a
    * later shorter group would otherwise leave behind as a frame the next scan
    * cannot place. A scan run after this instance has already failed reports
    * that failure again.
    */
-  WalScanResult Scan(EpochNumber min_epoch = 0);
+  WalScanResult Scan(EpochNumber min_epoch = 0, const Replay &replay = {});
 
   /**
    * @brief Appends one frame per bucket whose epoch is at or below `target`,

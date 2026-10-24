@@ -27,8 +27,23 @@ constexpr const char *kTable = "recovery_test";
 constexpr const char *kIndex = "idx";
 constexpr auto kTestTimeout = std::chrono::seconds(10);
 
+using helios::storage::wal::LogRecords;
 using helios::storage::wal::Wal;
 using helios::storage::wal::WalScanResult;
+
+// A scan's result and the records it replayed.
+struct RecordScan : WalScanResult {
+  LogRecords records;
+};
+
+RecordScan ScanRecords(Wal &wal) {
+  RecordScan scan;
+  WalScanResult &result = scan;
+  result = wal.Scan(0, [&scan](const LogRecords &batch) {
+    scan.records.insert(scan.records.end(), batch.begin(), batch.end());
+  });
+  return scan;
+}
 
 // The commit path is what query layer traffic takes, and what it writes
 // to the log is only observable after the instance that wrote it is gone:
@@ -118,7 +133,7 @@ TEST_F(RecoveryTest, ALoggedWriteCarriesTheUnlockedTid) {
   }
 
   Wal wal(work_dir_, helios::storage::wal::WalIo::Posix(), kWalCapacityBytes);
-  auto scan = wal.Scan();
+  auto scan = ScanRecords(wal);
   ASSERT_EQ(scan.status, WalScanResult::Status::kOk);
 
   bool seen_row = false;
@@ -161,7 +176,7 @@ TEST_F(RecoveryTest, ARecoveredKeyAcceptsAFurtherWrite) {
   // and the write below spin rather than fail.
   {
     Wal wal(work_dir_, helios::storage::wal::WalIo::Posix(), kWalCapacityBytes);
-    auto scan = wal.Scan();
+    auto scan = ScanRecords(wal);
     ASSERT_EQ(scan.status, WalScanResult::Status::kOk);
     bool seen = false;
     for (const auto &record : scan.records) {
@@ -282,7 +297,8 @@ TEST_F(RecoveryTest, EarlyPublicationKeepsTheOriginalWalValue) {
     EXPECT_TRUE(writer.get());
   }
 
-  const auto scan = Wal(work_dir_).Scan();
+  Wal wal(work_dir_);
+  const auto scan = ScanRecords(wal);
   ASSERT_EQ(scan.status, WalScanResult::Status::kOk);
   size_t batch_values = 0;
   bool found_later = false;

@@ -55,7 +55,7 @@ helios::storage::Tidword make_tidword(helios::storage::EpochNumber epoch,
 TEST(MasstreeIndexTest, Get) {
   helios::storage::index::MasstreeIndex table;
   ASSERT_EQ(nullptr, table.Get("alice"));
-  table.Put("alice");
+  table.GetOrInsert("alice");
   ASSERT_NE(nullptr, table.Get("alice"));
 }
 
@@ -78,26 +78,12 @@ TEST(MasstreeIndexTest, ExpectNewPublishesOneAbsentEntry) {
   index::release_thread_epoch();
 }
 
-TEST(MasstreeIndexTest, ConcurrentPutSameKey) {
-  std::vector<std::thread> threads;
-  helios::storage::index::MasstreeIndex table;
-
-  for (size_t i = 0; i < 10; i++) {
-    threads.emplace_back([&]() { table.Put("alice"); });
-  }
-  for (auto &thread : threads) {
-    thread.join();
-  }
-
-  ASSERT_NE(nullptr, table.Get("alice"));
-}
-
 TEST(MasstreeIndexTest, ConcurrentInserting) {
   std::vector<std::thread> threads;
   helios::storage::index::MasstreeIndex table;
 
   for (size_t i = 0; i < 10; i++) {
-    threads.emplace_back([&, i]() { table.Put(std::to_string(i)); });
+    threads.emplace_back([&, i]() { table.GetOrInsert(std::to_string(i)); });
   }
   for (auto &thread : threads) {
     thread.join();
@@ -109,9 +95,9 @@ TEST(MasstreeIndexTest, ConcurrentInserting) {
 
 TEST(MasstreeIndexTest, Scan) {
   helios::storage::index::MasstreeIndex table;
-  table.Put("alice");
-  table.Put("bob");
-  table.Put("carol");
+  table.GetOrInsert("alice");
+  table.GetOrInsert("bob");
+  table.GetOrInsert("carol");
 
   // Scan is half-open: carol is the exclusive upper bound.
   ASSERT_EQ(size_t(2),
@@ -123,7 +109,7 @@ TEST(MasstreeIndexTest, Scan) {
 
 TEST(MasstreeIndexTest, ReverseScanCountsOnlyTheKeysItEmits) {
   helios::storage::index::MasstreeIndex table;
-  for (const char *key : {"a", "b", "c", "d"}) table.Put(key);
+  for (const char *key : {"a", "b", "c", "d"}) table.GetOrInsert(key);
 
   std::vector<std::string> seen;
   const size_t count = table.ScanReverse(
@@ -143,8 +129,8 @@ TEST(MasstreeIndexTest, ScansFromAFirstKeyLongerThanAnyStoredKey) {
   const std::string low(kMaxKeyLength, 'a');
   const std::string high = std::string(kMaxKeyLength - 1, 'a') + 'b';
   const std::string bound = low + std::string(45, 'z');
-  table.Put(low);
-  table.Put(high);
+  table.GetOrInsert(low);
+  table.GetOrInsert(high);
 
   std::vector<std::string> seen;
   table.Scan(bound, std::nullopt,
@@ -237,16 +223,14 @@ TEST(MasstreeIndexTest, ReaperDoesNotPurgeReusedSecondaryEntry) {
   index::release_thread_epoch();
 }
 
-TEST(MasstreeIndexTest, PurgeRejectsAReplacementEntry) {
+TEST(MasstreeIndexTest, PurgeKeepsAnEntryOtherThanTheExpectedRecord) {
   using namespace helios::storage;
   index::MasstreeIndex tree;
-  IndexRecord *old_item = tree.GetOrInsert("key");
-  tree.Put("key");
-  IndexRecord *replacement = tree.Get("key");
-  ASSERT_NE(old_item, replacement);
+  RowRecord old_item;
+  IndexRecord *replacement = tree.GetOrInsert("key");
 
   EXPECT_FALSE(
-      tree.Purge("key", *old_item, make_tidword(10, 4, /*absent=*/true)));
+      tree.Purge("key", old_item, make_tidword(10, 4, /*absent=*/true)));
   EXPECT_EQ(replacement, tree.Get("key"));
   index::release_thread_epoch();
 }
