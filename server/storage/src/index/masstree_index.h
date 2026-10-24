@@ -76,6 +76,14 @@ class MasstreeIndex final {
    */
   bool Purge(std::string_view key, IndexRecord &expected, Tidword retired_tid);
 
+  /**
+   * @brief Frees every record of this index; its nodes stay allocated.
+   *
+   * @details No other thread may reach the index any more (see
+   * synchronize_rcu), and the index is unusable afterwards.
+   */
+  void Destroy();
+
  private:
   // Keep Masstree headers out of callers.
   struct Impl;
@@ -99,6 +107,20 @@ void free_rcu(void *ptr, size_t size);
  * The next index operation enters an epoch again.
  */
 void release_thread_epoch();
+
+/**
+ * @brief Enters this thread's Masstree epoch, as the next index operation
+ * would.
+ */
+void enter_thread_epoch();
+
+/**
+ * @brief Waits until every thread that was inside its Masstree epoch at the
+ * call has released it.
+ * @details Releases the calling thread's epoch first. Call outside any
+ * transaction and never from the epoch thread, which advances the epoch.
+ */
+void synchronize_rcu();
 
 }  // namespace index
 }  // namespace helios::storage

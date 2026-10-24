@@ -581,6 +581,16 @@ public:
                            const dd::Table *old_table_def,
                            dd::Table *new_table_def) override;
 
+  /**
+   * @brief Drop the indexes an in-place ALTER TABLE removes, once it commits.
+   *
+   * A rolled-back ALTER drops nothing.
+   */
+  bool commit_inplace_alter_table(TABLE *altered_table,
+                                  Alter_inplace_info *ha_alter_info,
+                                  bool commit, const dd::Table *old_table_def,
+                                  dd::Table *new_table_def) override;
+
   THR_LOCK_DATA **store_lock(
       THD *thd, THR_LOCK_DATA **to,
       enum thr_lock_type lock_type) override; ///< required

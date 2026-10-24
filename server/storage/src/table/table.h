@@ -10,6 +10,8 @@
 #define HELIOS_STORAGE_SRC_TABLE_TABLE_H
 
 #include <atomic>
+#include <cstdint>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -28,23 +30,49 @@ namespace helios::storage {
  *
  * @details A definition change publishes with a release store and a lookup
  * takes no lock; the caller serializes definition changes (Database's DDL
- * mutex, or recovery on one thread). An index is never removed, and a
- * pointer to one stays valid for the table's lifetime.
+ * mutex, or recovery on one thread). A lookup by name enters the calling
+ * thread's Masstree epoch, and an unlinked index stays allocated until every
+ * thread that found it has released that epoch.
  */
 class Table {
  public:
+  // One secondary index and its link in the table's chain.
+  struct IndexNode {
+    std::string name;
+    index::SecondaryIndex index;
+    std::atomic<IndexNode *> next;
+
+    IndexNode(std::string_view index_name, IndexConstraint index_type,
+              uint32_t index_id, std::vector<uint32_t> pk_slices,
+              IndexNode *next)
+        : name(index_name),
+          index(index_type, index_id, std::move(pk_slices)),
+          next(next) {}
+  };
+
   explicit Table(std::string_view table_name);
   ~Table();
 
   /**
    * @brief Declares a secondary index on this table.
    *
+   * @param index_id The id the catalog assigned to the index.
    * @param pk_slices SecondaryIndex::pk_slices.
    * @return false when an index of that name already exists.
    */
   bool CreateSecondaryIndex(const std::string_view index_name,
-                            const IndexConstraint index_type,
+                            const IndexConstraint index_type, uint32_t index_id,
                             std::vector<uint32_t> pk_slices = {});
+
+  /**
+   * @brief Removes the index of that name from lookups.
+   *
+   * @details A thread that found the index earlier may use it until it
+   * releases its Masstree epoch, so the caller frees the node only after
+   * index::synchronize_rcu().
+   * @return The unlinked node, or nullptr when the table holds no such index.
+   */
+  std::unique_ptr<IndexNode> UnlinkSecondaryIndex(std::string_view index_name);
 
   /**
    * @brief Installs PAX storage metadata for rows created after the call.
@@ -74,49 +102,29 @@ class Table {
 
   /**
    * @brief Calls `f(name, index)` for each secondary index of this table.
+   *
+   * @details The caller serializes with definition changes or is inside its
+   * Masstree epoch, or an index dropped meanwhile may be freed under `f`.
    */
   template <typename Func>
   void ForEachSecondaryIndex(Func &&f) {
     for (IndexNode *node = indexes_.load(std::memory_order_acquire);
-         node != nullptr; node = node->next) {
+         node != nullptr; node = node->next.load(std::memory_order_acquire)) {
       f(node->name, node->index);
     }
   }
 
   /**
-   * @brief Returns the name, constraint and primary-key slices of every
+   * @brief Returns the name, constraint, id and primary-key slices of every
    * secondary index, as the catalog stores them.
    */
   std::vector<pax::IndexDefinition> IndexDefinitions();
 
-  /**
-   * @brief Returns the index of that name, creating it with `pk_slices` when
-   * there is none.
-   *
-   * @return The index, or nullptr when an index of that name is declared with
-   * a different constraint.
-   */
-  index::SecondaryIndex *GetOrCreateSecondaryIndex(
-      const std::string_view index_name, const IndexConstraint index_type,
-      std::vector<uint32_t> pk_slices = {});
-
  private:
-  struct IndexNode {
-    std::string name;
-    index::SecondaryIndex index;
-    IndexNode *next;
-
-    IndexNode(std::string_view index_name, IndexConstraint index_type,
-              std::vector<uint32_t> pk_slices, IndexNode *next)
-        : name(index_name),
-          index(index_type, std::move(pk_slices)),
-          next(next) {}
-  };
-
   index::MasstreeIndex primary_index_;
   // Set once by InstallPaxSchema; the destructor deletes it.
   std::atomic<pax::PaxTable *> pax_table_{nullptr};
-  // Append-only chain, newest first.
+  // Chain of the live indexes, newest first.
   std::atomic<IndexNode *> indexes_{nullptr};
   std::string table_name_;
 

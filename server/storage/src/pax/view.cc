@@ -128,7 +128,8 @@ bool Database::InstallPaxSchema(const std::string_view table_name,
   auto &definition = entries[std::string(table_name)];
   definition.schema = schema;
   definition.indexes = table->IndexDefinitions();
-  if (!pax::StoreCatalog(config_.work_dir, entries)) return false;
+  if (!pax::StoreCatalog(config_.work_dir, entries, next_index_id_))
+    return false;
   return table->InstallPaxSchema(std::move(schema));
 }
 

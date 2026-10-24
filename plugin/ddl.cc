@@ -4,6 +4,7 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <functional>
 #include <memory>
 #include <string>
@@ -351,9 +352,8 @@ enum_alter_inplace_result ha_helios::check_if_supported_inplace_alter(
     TABLE *altered_table [[maybe_unused]], Alter_inplace_info *ha_alter_info) {
   DBUG_TRACE;
 
-  // DROP_INDEX is a no-op placeholder: the index data remains in Helios. It
-  // must be accepted because MySQL sends ADD_INDEX | DROP_INDEX together when
-  // replacing a foreign-key auto-index with an explicit CREATE INDEX.
+  // MySQL sends ADD_INDEX | DROP_INDEX together when an explicit index
+  // replaces the index it generated for a foreign key.
   Alter_inplace_info::HA_ALTER_FLAGS dominated_flags =
       Alter_inplace_info::ADD_INDEX | Alter_inplace_info::DROP_INDEX |
       Alter_inplace_info::ADD_UNIQUE_INDEX |
@@ -519,6 +519,20 @@ bool ha_helios::inplace_alter_table(TABLE *altered_table,
     return alter_fail("no altered table");
   }
 
+  // A dropped index leaves the storage server only at commit, so an index
+  // added under its name would land in the old one.
+  for (uint d = 0; d < ha_alter_info->index_drop_count; d++) {
+    const char *dropped = ha_alter_info->index_drop_buffer[d]->name;
+    for (uint a = 0; a < ha_alter_info->index_add_count; a++) {
+      const KEY &added =
+          ha_alter_info->key_info_buffer[ha_alter_info->index_add_buffer[a]];
+      if (strcmp(dropped, added.name) == 0) {
+        return alter_fail("index " + std::string(dropped) +
+                          " cannot be dropped and added in one ALTER");
+      }
+    }
+  }
+
   // Non-unique indexes are collected and backfilled together below so a single
   // scan and unpack pass feeds them all. A unique index keeps the buffered
   // commit path (its in-write duplicate check) and is backfilled serially.
@@ -591,5 +605,23 @@ bool ha_helios::inplace_alter_table(TABLE *altered_table,
     } while (rows.size() == kBackfillScanRows);
   }
 
+  return false;
+}
+
+bool ha_helios::commit_inplace_alter_table(
+    TABLE *altered_table [[maybe_unused]], Alter_inplace_info *ha_alter_info,
+    bool commit, const dd::Table *old_table_def [[maybe_unused]],
+    dd::Table *new_table_def [[maybe_unused]]) {
+  DBUG_TRACE;
+  if (!commit || ha_alter_info->index_drop_count == 0) return false;
+
+  std::vector<std::string> names;
+  for (uint i = 0; i < ha_alter_info->index_drop_count; i++) {
+    names.emplace_back(ha_alter_info->index_drop_buffer[i]->name);
+  }
+  userThread = ha_thd();
+  if (!get_proxy()->db_drop_secondary_indexes(db_table_name, names)) {
+    return alter_fail("the storage server refused to drop an index");
+  }
   return false;
 }

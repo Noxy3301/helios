@@ -117,6 +117,23 @@ class Database {
                             IndexConstraint index_type,
                             std::vector<uint32_t> pk_slices = {});
 
+  /**
+   * @brief Drops secondary indexes of a table and frees their memory.
+   *
+   * @details One catalog write removes every named index the table holds; a
+   * name it does not hold is skipped. Lookups stop finding the indexes, then
+   * the call waits until no thread can hold them and frees their records,
+   * leaving their Masstree nodes allocated. A later commit that names a
+   * dropped index in a range or a write aborts. Call outside any
+   * transaction; the call leaves the calling thread inside its Masstree
+   * epoch, which the RPC reply releases.
+   *
+   * @return false, dropping nothing, when the table does not exist or the
+   * catalog write fails.
+   */
+  bool DropSecondaryIndexes(const std::string_view table_name,
+                            const std::vector<std::string> &index_names);
+
   bool HasTable(const std::string_view table_name);
 
   /**
@@ -390,6 +407,9 @@ class Database {
   wal::EpochScanCheckpoint scan_checkpoint_;
   // Serializes definition changes: index creation and the catalog rewrite
   std::mutex ddl_mutex_;
+  // The id the next index declaration takes; guarded by ddl_mutex_ and
+  // persisted with the catalog.
+  uint32_t next_index_id_ = 1;
   index::Reaper reaper_;
   // Each worker remembers the last TID it chose for this database.
   ThreadKeyStorage<Tidword> last_commit_tids_;
@@ -422,7 +442,9 @@ class Database {
 
   /**
    * @brief Replays WAL records into the indexes and resumes the global epoch.
-   * @note Refuses startup if a table or secondary index cannot be restored.
+   * @details A secondary write whose index id the catalog does not hold
+   * belongs to a dropped index and is skipped.
+   * @note Refuses startup if a table cannot be restored.
    */
   void Recover();
 };

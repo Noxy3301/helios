@@ -26,22 +26,25 @@ constexpr const char *kCatalogFile = "pax_schema.catalog";
 constexpr const char *kWorkingFile = "pax_schema.working";
 using File = std::unique_ptr<FILE, int (*)(FILE *)>;
 
-// Field types and index constraints are stored as their numeric tags; the map
-// key is the table name. The three index vectors are parallel.
+// TableDefinition in msgpack form, keyed by table name: one entry per PAX
+// field (0 = null flags) in widths, types and scales, and one entry per index
+// in the four parallel index vectors. Types and constraints are numeric tags.
 struct Entry {
   std::vector<uint32_t> widths;
   std::vector<uint8_t> types;
   std::vector<int8_t> scales;
   std::vector<std::string> index_names;
   std::vector<uint8_t> index_constraints;
-  std::vector<std::vector<uint32_t>> index_pk_slices;
+  std::vector<std::vector<uint32_t>> index_pk_slices;  // (offset, length) pairs
+  std::vector<uint32_t> index_ids;
   MSGPACK_DEFINE(widths, types, scales, index_names, index_constraints,
-                 index_pk_slices);
+                 index_pk_slices, index_ids);
 };
 
 struct PackedCatalog {
   std::map<std::string, Entry> entries;
-  MSGPACK_DEFINE(entries);
+  uint32_t next_index_id = 1;
+  MSGPACK_DEFINE(entries, next_index_id);
 };
 
 bool Sync(int fd) {
@@ -53,8 +56,10 @@ bool Sync(int fd) {
 
 }  // namespace
 
-bool StoreCatalog(const std::string &work_dir, const CatalogEntries &entries) {
+bool StoreCatalog(const std::string &work_dir, const CatalogEntries &entries,
+                  uint32_t next_index_id) {
   PackedCatalog catalog;
+  catalog.next_index_id = next_index_id;
   for (const auto &[name, definition] : entries) {
     const auto &schema = definition.schema;
     if (schema.field_max_bytes.empty()) return false;
@@ -78,6 +83,7 @@ bool StoreCatalog(const std::string &work_dir, const CatalogEntries &entries) {
       entry.index_constraints.push_back(
           static_cast<uint8_t>(index.constraint));
       entry.index_pk_slices.push_back(index.pk_slices);
+      entry.index_ids.push_back(index.id);
     }
     catalog.entries.emplace(name, std::move(entry));
   }
@@ -152,7 +158,7 @@ Catalog LoadCatalog(const std::string &work_dir) {
     size_t consumed = 0;
     const auto object = msgpack::unpack(bytes.data(), bytes.size(), consumed);
     if (object.get().type != msgpack::type::ARRAY ||
-        object.get().via.array.size != 1) {
+        object.get().via.array.size != 2) {
       result.detail = "invalid PAX catalog header";
       return result;
     }
@@ -162,11 +168,13 @@ Catalog LoadCatalog(const std::string &work_dir) {
       result.detail = "the PAX catalog has trailing bytes";
       return result;
     }
+    result.next_index_id = catalog.next_index_id;
     for (auto &[name, entry] : catalog.entries) {
       if (entry.widths.empty())
         throw std::runtime_error("PAX schema has no fields");
       if (entry.index_names.size() != entry.index_constraints.size() ||
-          entry.index_names.size() != entry.index_pk_slices.size())
+          entry.index_names.size() != entry.index_pk_slices.size() ||
+          entry.index_names.size() != entry.index_ids.size())
         throw std::runtime_error("secondary index definition is incomplete");
       TableDefinition definition;
 
@@ -188,7 +196,7 @@ Catalog LoadCatalog(const std::string &work_dir) {
         definition.indexes.push_back(
             {std::move(entry.index_names[i]),
              static_cast<IndexConstraint>(entry.index_constraints[i]),
-             std::move(entry.index_pk_slices[i])});
+             entry.index_ids[i], std::move(entry.index_pk_slices[i])});
       }
       result.entries.emplace(name, std::move(definition));
     }

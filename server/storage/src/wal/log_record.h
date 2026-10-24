@@ -36,10 +36,10 @@ struct LogRecord {
    * @brief One recorded write, primary or secondary.
    *
    * @details An empty `index_name` marks a primary row, whose payload is
-   * `buffer`. Otherwise the write belongs to that secondary index, and
-   * `secondary_op` says how to read it: kFull carries the whole primary-key
-   * list in `primary_keys`, kInsert and kDelete carry one key in
-   * `secondary_primary_key`.
+   * `buffer`. Otherwise the write belongs to the secondary index of that name
+   * and catalog id `index_id`, and `secondary_op` says how to read it: kFull
+   * carries the whole primary-key list in `primary_keys`, kInsert and kDelete
+   * carry one key in `secondary_primary_key`.
    */
   struct Write {
     std::string key;
@@ -47,13 +47,12 @@ struct LogRecord {
     Tidword transaction_id;
     std::string table_name;
     std::string index_name;
-    uint32_t index_type = 0;  // IndexConstraint, as a msgpack-stable integer.
+    uint32_t index_id = 0;
     std::vector<std::string> primary_keys;
     SecondaryIndexOp secondary_op = SecondaryIndexOp::kNone;
     std::string secondary_primary_key;
     MSGPACK_DEFINE(key, buffer, transaction_id, table_name, index_name,
-                   index_type, primary_keys, secondary_op,
-                   secondary_primary_key);
+                   index_id, primary_keys, secondary_op, secondary_primary_key);
   };
 
   EpochNumber epoch = 0;

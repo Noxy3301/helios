@@ -23,17 +23,21 @@ namespace helios::storage {
 namespace index {
 
 struct SecondaryIndex {
-  explicit SecondaryIndex(IndexConstraint index_type = IndexConstraint::kNone,
-                          std::vector<uint32_t> slices = {})
+  SecondaryIndex(IndexConstraint index_type, uint32_t index_id,
+                 std::vector<uint32_t> slices = {})
       : tree(index_type == IndexConstraint::kUnique ? RecordType::kUnique
                                                     : RecordType::kNonUnique),
         constraint(index_type),
+        id(index_id),
         pk_slices(std::move(slices)) {}
 
   // Tree operations are shared with the primary index; the constraint picks
   // the record type.
   MasstreeIndex tree;
   const IndexConstraint constraint;
+  // Assigned by the catalog and never reused: the log names the index by it,
+  // so a dropped index's writes never reach a later one of the same name.
+  const uint32_t id;
   // (offset, length) of each primary-key part in a non-unique record's key,
   // in primary-key order, when the secondary key holds primary-key columns.
   // Empty when the key ends with the whole primary key.

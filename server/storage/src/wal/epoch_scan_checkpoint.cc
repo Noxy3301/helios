@@ -257,7 +257,7 @@ EpochScanCheckpoint::CaptureResult EpochScanCheckpoint::CaptureSecondaryEntry(
     out.transaction_id = observed;
     out.table_name = table_name;
     out.index_name = index_name;
-    out.index_type = static_cast<uint32_t>(index.constraint);
+    out.index_id = index.id;
     out.primary_keys.emplace_back(primary_key);
     out.secondary_op = SecondaryIndexOp::kFull;
     return EpochScanCheckpoint::CaptureResult::kTaken;

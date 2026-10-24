@@ -29,8 +29,6 @@
 #include <string>
 #include <vector>
 
-#include "helios/index.h"
-
 #include "silo/tidword.h"
 
 namespace helios::storage {
@@ -49,8 +47,8 @@ enum class SecondaryIndexOp : uint8_t {
  *
  * @details An empty `index_name` marks a primary row, whose payload is
  * `value`; otherwise the entry belongs to that secondary index and carries
- * the final `primary_keys` list recovery produced. Values and lists are
- * owned.
+ * the final `primary_keys` list recovery produced, under the index's catalog
+ * id `index_id`. Values and lists are owned.
  */
 struct LogEntry {
   std::string key;
@@ -59,7 +57,7 @@ struct LogEntry {
   std::vector<std::string> primary_keys;
   std::string table_name;
   std::string index_name;
-  IndexConstraint index_type = IndexConstraint::kNone;
+  uint32_t index_id = 0;
 };
 
 using LogEntries = std::vector<LogEntry>;

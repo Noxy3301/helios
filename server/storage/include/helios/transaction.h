@@ -267,6 +267,7 @@ class Transaction {
       wal::SecondaryIndexOp op;
     };
     IndexConstraint constraint;
+    uint32_t index_id;          ///< The catalog id the log names.
     std::vector<Delta> deltas;  ///< Request order, logged as is.
     /// Final primary key of a UNIQUE record, chosen under the lock.
     std::optional<std::string_view> primary_key;
