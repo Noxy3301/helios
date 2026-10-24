@@ -16,10 +16,16 @@
 
 #include "silo/tidword.h"
 #include "util/epoch.h"
-#include "wal/log_entry.h"
 
 namespace helios::storage {
 namespace wal {
+
+enum class SecondaryIndexOp : uint8_t {
+  kNone = 0,    // a primary row, which names no secondary index
+  kInsert = 1,  // one primary key joins the key's list
+  kDelete = 2,  // one primary key leaves it
+  kFull = 3,    // the whole list, as a checkpoint carries it
+};
 
 /**
  * @brief An epoch-tagged group of writes, as it is persisted.

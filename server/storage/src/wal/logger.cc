@@ -19,7 +19,6 @@
 /**
  * @file server/storage/src/wal/logger.cc
  * The write-ahead log and the durable epoch a synchronous commit waits on.
- * Applies the checkpoint and the log tail to the entries recovery replays.
  */
 
 #include "wal/logger.h"
@@ -29,8 +28,6 @@
 #include <cerrno>
 #include <cstdlib>
 #include <exception>
-#include <functional>
-#include <unordered_map>
 #include <utility>
 
 #include "helios/config.h"
@@ -43,216 +40,6 @@
 
 namespace helios::storage {
 namespace wal {
-
-namespace {
-
-/**
- * @brief Mixes one more field's hash into a seed.
- * @note The constant is `2^32` divided by the golden ratio, boost's
- * hash_combine mixer; with the shifts it spreads each field's bits before
- * they meet the seed.
- */
-size_t HashCombine(size_t seed, size_t value) {
-  constexpr size_t kGoldenRatioMix = 0x9e3779b9u;
-  return seed ^ (value + kGoldenRatioMix + (seed << 6) + (seed >> 2));
-}
-
-using Write = LogRecord::Write;
-
-// One secondary-index delta: which primary key the entry gained or lost.
-struct SecondaryOpKey {
-  std::string table_name;
-  std::string index_name;
-  uint32_t index_id;
-  std::string secondary_key;
-  std::string primary_key;
-  bool operator==(const SecondaryOpKey &rhs) const {
-    return table_name == rhs.table_name && index_name == rhs.index_name &&
-           index_id == rhs.index_id && secondary_key == rhs.secondary_key &&
-           primary_key == rhs.primary_key;
-  }
-};
-struct SecondaryOpKeyHash {
-  size_t operator()(const SecondaryOpKey &key) const {
-    const std::hash<std::string> hasher;
-    size_t seed = hasher(key.table_name);
-    seed = HashCombine(seed, hasher(key.index_name));
-    seed = HashCombine(seed, std::hash<uint32_t>{}(key.index_id));
-    seed = HashCombine(seed, hasher(key.secondary_key));
-    seed = HashCombine(seed, hasher(key.primary_key));
-    return seed;
-  }
-};
-struct SecondaryOpState {
-  Tidword tid;
-  SecondaryIndexOp op;
-};
-
-// One secondary-index entry the deltas above are regrouped into.
-struct SecondaryGroupKey {
-  std::string table_name;
-  std::string index_name;
-  uint32_t index_id;
-  std::string secondary_key;
-  bool operator==(const SecondaryGroupKey &rhs) const {
-    return table_name == rhs.table_name && index_name == rhs.index_name &&
-           index_id == rhs.index_id && secondary_key == rhs.secondary_key;
-  }
-};
-struct SecondaryGroupKeyHash {
-  size_t operator()(const SecondaryGroupKey &key) const {
-    const std::hash<std::string> hasher;
-    size_t seed = hasher(key.table_name);
-    seed = HashCombine(seed, hasher(key.index_name));
-    seed = HashCombine(seed, std::hash<uint32_t>{}(key.index_id));
-    seed = HashCombine(seed, hasher(key.secondary_key));
-    return seed;
-  }
-};
-struct SecondaryGroupValue {
-  Tidword max_tid{};
-  std::vector<std::string> primary_keys;
-};
-
-struct PrimaryKeyHash {
-  size_t operator()(const std::pair<std::string, std::string> &key) const {
-    const std::hash<std::string> hasher;
-    return HashCombine(hasher(key.first), hasher(key.second));
-  }
-};
-
-using SecondaryOps =
-    std::unordered_map<SecondaryOpKey, SecondaryOpState, SecondaryOpKeyHash>;
-// (table_name, key) -> position in the recovery entries. Only the primary path
-// uses it; a primary write always carries an empty index_name.
-using PrimaryPos = std::unordered_map<std::pair<std::string, std::string>,
-                                      size_t, PrimaryKeyHash>;
-
-// The index name alone decides: a primary write carries an empty one, and
-// the other fields are written on both paths.
-bool IsSecondary(const Write &write) { return !write.index_name.empty(); }
-
-// Keep the newest delta per (secondary key, primary key). A full entry
-// arrives as one add per primary key it holds. On an equal transaction id
-// the later record wins, on both paths.
-void ApplySecondary(const Write &write, SecondaryOps &ops) {
-  const auto op = write.secondary_op;
-  if (op == SecondaryIndexOp::kFull) {
-    for (const auto &pk : write.primary_keys) {
-      SecondaryOpKey op_key{write.table_name, write.index_name, write.index_id,
-                            write.key, pk};
-      auto it = ops.find(op_key);
-      if (it == ops.end() || !(write.transaction_id < it->second.tid)) {
-        ops[op_key] = {write.transaction_id, SecondaryIndexOp::kInsert};
-      }
-    }
-  } else {
-    // A delta names one primary key joining or leaving the list.
-    SecondaryOpKey op_key{write.table_name, write.index_name, write.index_id,
-                          write.key, write.secondary_primary_key};
-    auto it = ops.find(op_key);
-    if (it == ops.end() || !(write.transaction_id < it->second.tid)) {
-      ops[op_key] = {write.transaction_id, op};
-    }
-  }
-}
-
-// Keep the newest version per row. Applied through a position map rather
-// than a rescan of the entries: this runs once per logged write, and a
-// linear rescan makes recovery quadratic in the log size.
-void ApplyPrimary(const Write &write, LogEntries &recovery_entries,
-                  PrimaryPos &positions) {
-  const auto it = positions.find({write.table_name, write.key});
-  if (it != positions.end()) {
-    auto &item = recovery_entries[it->second];
-    if (item.tid < write.transaction_id) {
-      item.value = write.buffer;
-      item.tid = write.transaction_id;
-      item.table_name = write.table_name;
-      item.index_name = write.index_name;
-      item.index_id = write.index_id;
-    }
-    return;
-  }
-
-  positions.emplace(std::make_pair(write.table_name, write.key),
-                    recovery_entries.size());
-  LogEntry entry;
-  entry.key = write.key;
-  entry.value = write.buffer;
-  entry.tid = write.transaction_id;
-  entry.table_name = write.table_name;
-  entry.index_name = write.index_name;
-  entry.index_id = write.index_id;
-  recovery_entries.emplace_back(std::move(entry));
-}
-
-// Regroup the surviving adds into one entry per secondary key, so a key
-// deleted after being added does not come back.
-void GroupSecondary(const SecondaryOps &ops, LogEntries &recovery_entries) {
-  std::unordered_map<SecondaryGroupKey, SecondaryGroupValue,
-                     SecondaryGroupKeyHash>
-      grouped;
-  for (const auto &[op_key, state] : ops) {
-    if (state.op != SecondaryIndexOp::kInsert) continue;
-    SecondaryGroupKey group_key{op_key.table_name, op_key.index_name,
-                                op_key.index_id, op_key.secondary_key};
-    auto &entry = grouped[group_key];
-    entry.primary_keys.emplace_back(op_key.primary_key);
-    if (entry.max_tid < state.tid) entry.max_tid = state.tid;
-  }
-
-  for (auto &[group_key, entry] : grouped) {
-    if (entry.primary_keys.empty()) continue;
-    std::sort(entry.primary_keys.begin(), entry.primary_keys.end());
-    entry.primary_keys.erase(
-        std::unique(entry.primary_keys.begin(), entry.primary_keys.end()),
-        entry.primary_keys.end());
-    LogEntry log_entry;
-    log_entry.key = group_key.secondary_key;
-    log_entry.tid = entry.max_tid;
-    log_entry.primary_keys = std::move(entry.primary_keys);
-    log_entry.table_name = group_key.table_name;
-    log_entry.index_name = group_key.index_name;
-    log_entry.index_id = group_key.index_id;
-    recovery_entries.emplace_back(std::move(log_entry));
-  }
-}
-
-/**
- * @brief Applies log records to the entries the database replays.
- *
- * A key may appear in several epochs; the newest transaction id wins. Secondary
- * index entries arrive as per-primary-key deltas and are regrouped into one
- * entry per secondary key.
- *
- * The checkpoint is applied ahead of the log's tail as ordinary records,
- * under the same rule that resolves two epochs of the log.
- */
-LogEntries BuildRecoveryEntries(const LogRecords &checkpoint,
-                                const LogRecords &tail) {
-  SecondaryOps secondary_latest;
-  PrimaryPos primary_position;
-  LogEntries recovery_entries;
-
-  const LogRecords *sources[] = {&checkpoint, &tail};
-  for (const auto *source : sources) {
-    for (const auto &log_record : *source) {
-      for (const auto &write : log_record.writes) {
-        if (IsSecondary(write)) {
-          ApplySecondary(write, secondary_latest);
-        } else {
-          ApplyPrimary(write, recovery_entries, primary_position);
-        }
-      }
-    }
-  }
-
-  GroupSecondary(secondary_latest, recovery_entries);
-  return recovery_entries;
-}
-
-}  // namespace
 
 Logger::Logger(const Config &config, WalIo io)
     : work_dir_(config.work_dir),
@@ -279,7 +66,7 @@ Logger::RecoveryResult Logger::FailRecovery(const WalScanResult &wal) {
   return result;
 }
 
-Logger::RecoveryResult Logger::Recover() {
+Logger::RecoveryResult Logger::Recover(const std::vector<Replay> &passes) {
   // Every startup reads the checkpoint: its publication waited for the end
   // epoch to become durable, so that epoch binds even when nothing is
   // replayed. A startup that replays nothing takes the epoch bounds alone.
@@ -299,9 +86,17 @@ Logger::RecoveryResult Logger::Recover() {
     checkpoint.start_epoch = 0;
   }
 
-  const auto wal = wal_.Scan(checkpoint.start_epoch);
+  // Each pass replays the checkpoint, then the log. The first scan repairs
+  // the tail, so a later one reads the same frames. The checkpoint is
+  // released before the last scan.
+  WalScanResult wal;
+  for (size_t i = 0; i < passes.size(); ++i) {
+    if (passes[i]) passes[i](checkpoint.records);
+    if (i + 1 == passes.size()) LogRecords().swap(checkpoint.records);
+    wal = wal_.Scan(checkpoint.start_epoch, passes[i]);
+    if (wal.status != WalScanResult::Status::kOk) return FailRecovery(wal);
+  }
   RecoveryResult result;
-  if (wal.status != WalScanResult::Status::kOk) return FailRecovery(wal);
 
   if (loads_checkpoint_records_ &&
       checkpoint.status == EpochScanCheckpoint::LoadResult::Status::kOk) {
@@ -318,7 +113,6 @@ Logger::RecoveryResult Logger::Recover() {
     result.durable_epoch = std::max(wal.last_epoch, checkpoint.end_epoch);
   }
   durable_epoch_.store(result.durable_epoch, std::memory_order_seq_cst);
-  result.recovery_entries = BuildRecoveryEntries(checkpoint.records, wal.records);
   return result;
 }
 

@@ -308,15 +308,18 @@ TEST_F(EpochScanCheckpointTest,
   }
   {
     Wal wal(work_dir_, helios::storage::wal::WalIo::Posix(), 1ull << 20);
-    auto filtered = wal.Scan(checkpoint.start_epoch);
+    auto filtered =
+        wal.Scan(checkpoint.start_epoch,
+                 [&checkpoint](const helios::storage::wal::LogRecords &batch) {
+                   for (const auto &record : batch) {
+                     EXPECT_GT(record.epoch, checkpoint.start_epoch);
+                   }
+                 });
     ASSERT_EQ(filtered.status, WalScanResult::Status::kOk);
     EXPECT_GT(filtered.frames_skipped, 0u);
     EXPECT_GT(filtered.bytes_skipped, 0u);
     // The end of the log and how far it is durable come from every frame.
     EXPECT_EQ(filtered.last_epoch, last_epoch_);
-    for (const auto &record : filtered.records) {
-      EXPECT_GT(record.epoch, checkpoint.start_epoch);
-    }
   }
 
   std::vector<std::string> with_checkpoint;

@@ -33,12 +33,6 @@ class MasstreeIndex final {
   IndexRecord *Get(std::string_view key);
 
   /**
-   * @brief Maps key to a new absent record, replacing any entry it had.
-   * @return The new record, for the caller to fill before readers start.
-   */
-  IndexRecord *Put(std::string_view key);
-
-  /**
    * @brief Gets the entry for key, creating an absent record if needed.
    * @details The reaper may unlink the record afterwards; Commit checks the
    * record's latest bit after locking it.

@@ -191,9 +191,12 @@ TEST_F(WalPackingTest, AFramePayloadIsTheListPacking) {
 
   Wal wal(work_dir_, helios::storage::wal::WalIo::Posix(),
           Wal::kNoPreallocation);
-  const auto scan = wal.Scan();
+  LogRecords scanned;
+  const auto scan = wal.Scan(0, [&scanned](const LogRecords &batch) {
+    scanned.insert(scanned.end(), batch.begin(), batch.end());
+  });
   ASSERT_EQ(scan.status, WalScanResult::Status::kOk) << scan.detail;
-  EXPECT_TRUE(Packed(scan.records) == payloads[0]);
+  EXPECT_TRUE(Packed(scanned) == payloads[0]);
 }
 
 // One commit's writes and the secondary keys whose list it leaves empty.

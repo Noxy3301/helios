@@ -28,6 +28,9 @@
 #include <chrono>
 #include <memory>
 #include <mutex>
+#include <optional>
+#include <string>
+#include <vector>
 
 #include "helios/config.h"
 
@@ -36,8 +39,177 @@
 #include "pax/catalog.h"
 #include "util/spdlog.h"
 #include "wal/flush_trace.h"
-#include "wal/log_entry.h"
 namespace helios::storage {
+
+namespace {
+
+// Orders TID words by epoch and tid, leaving out the status bits.
+uint64_t tid_order(Tidword tid) { return tid.obj >> 3; }
+
+// Unlinks a record the replay found deleted. Nothing else reaches the
+// indexes yet.
+void purge(index::MasstreeIndex &tree, std::string_view key,
+           IndexRecord &item) {
+  Tidword retired = item.transaction_id.load();
+  retired.latest = false;
+  tree.Purge(key, item, retired);
+}
+
+// Applies one primary key joining or leaving a secondary entry. Of two
+// writes with one TID, the later wins.
+void replay_secondary(index::SecondaryIndex &index, const std::string &key,
+                      std::string_view primary_key, Tidword tid, bool insert) {
+  // A UNIQUE entry holds the primary key its newest commit left, under the
+  // word of the newest insert.
+  if (index.constraint == IndexConstraint::kUnique) {
+    auto *item = static_cast<UniqueRecord *>(index.tree.Get(key));
+    if (item != nullptr &&
+        tid_order(tid) < tid_order(item->transaction_id.load())) {
+      return;
+    }
+    if (!insert) {
+      // Leaving a key the entry does not hold changes nothing.
+      if (item == nullptr || item->primary_key() != primary_key) return;
+      item->set_primary_key(std::nullopt);
+      purge(index.tree, key, *item);
+      return;
+    }
+    if (item == nullptr)
+      item = static_cast<UniqueRecord *>(index.tree.GetOrInsert(key, true));
+    item->set_primary_key(primary_key);
+    tid.absent = false;
+    item->transaction_id.store(tid);
+    return;
+  }
+
+  // A non-unique index record is present exactly when its newest write adds
+  // it. Its key is join_entry of the two, and its pk_len the length that key
+  // adds past the secondary key.
+  const std::string record_key = index::join_entry(index, key, primary_key);
+  IndexRecord *item = index.tree.Get(record_key);
+  if (item != nullptr &&
+      tid_order(tid) < tid_order(item->transaction_id.load())) {
+    return;
+  }
+  if (!insert) {
+    if (item != nullptr) purge(index.tree, record_key, *item);
+    return;
+  }
+  if (item == nullptr) item = index.tree.GetOrInsert(record_key, true);
+  static_cast<NonUniqueRecord *>(item)->set_pk_len(record_key.size() -
+                                                   key.size());
+  tid.absent = false;
+  item->transaction_id.store(tid);
+}
+
+/**
+ * @brief Applies one batch of records to the indexes: every secondary entry,
+ *        and each primary key's newest TID word.
+ *
+ * @details Writes run in TID order. After the checkpoint each batch holds one
+ * epoch, in ascending order, so only a checkpoint word can be newer than a
+ * write applied after it. A delete, or an entry left without primary keys, is
+ * unlinked at once, since no later write is older. Rows wait for replay_rows.
+ *
+ * @param[in,out] highest_epoch Raised to the epoch of every write.
+ */
+void replay_keys(TableDictionary &tables, const wal::LogRecords &records,
+                 EpochNumber &highest_epoch) {
+  std::vector<const wal::LogRecord::Write *> writes;
+  for (const auto &record : records) {
+    for (const auto &write : record.writes) writes.push_back(&write);
+  }
+  std::stable_sort(
+      writes.begin(), writes.end(), [](const auto *lhs, const auto *rhs) {
+        return tid_order(lhs->transaction_id) < tid_order(rhs->transaction_id);
+      });
+
+  for (const auto *write : writes) {
+    Table *table = tables.GetTable(write->table_name);
+    if (table == nullptr || table->GetPaxTable() == nullptr) {
+      SPDLOG_CRITICAL("Recovery failed: PAX schema for table {0} is missing.",
+                      write->table_name);
+      exit(EXIT_FAILURE);
+    }
+    const Tidword tid = write->transaction_id;
+    highest_epoch = std::max<EpochNumber>(highest_epoch, tid.epoch);
+
+    // A primary key keeps its newest write's word; of two with one TID, the
+    // first.
+    if (write->index_name.empty()) {
+      auto &tree = table->GetPrimaryIndex();
+      auto *item = static_cast<RowRecord *>(tree.Get(write->key));
+      if (item != nullptr &&
+          tid_order(tid) <= tid_order(item->transaction_id.load())) {
+        continue;
+      }
+      if (tid.absent) {
+        if (item != nullptr) purge(tree, write->key, *item);
+        continue;
+      }
+      if (item == nullptr)
+        item = static_cast<RowRecord *>(tree.GetOrInsert(write->key, true));
+      item->transaction_id.store(tid);
+      continue;
+    }
+
+    // An index dropped since, or an earlier one of the same name, has an id
+    // the catalog no longer holds; its writes are skipped.
+    index::SecondaryIndex *index = table->GetSecondaryIndex(write->index_name);
+    if (index == nullptr || index->id != write->index_id) continue;
+    // A checkpoint's list counts as one insert per primary key it holds.
+    if (write->secondary_op == wal::SecondaryIndexOp::kFull) {
+      for (const auto &primary_key : write->primary_keys)
+        replay_secondary(*index, write->key, primary_key, tid, true);
+    } else {
+      replay_secondary(*index, write->key, write->secondary_primary_key, tid,
+                       write->secondary_op == wal::SecondaryIndexOp::kInsert);
+    }
+  }
+}
+
+/**
+ * @brief Installs the rows of one batch whose words replay_keys kept.
+ *
+ * @details Batches come in the order replay_keys saw them, so a row takes its
+ * PAX slot at the first write to its key and its value from the first write
+ * carrying the kept word.
+ */
+void replay_rows(TableDictionary &tables, const wal::LogRecords &records) {
+  for (const auto &record : records) {
+    for (const auto &write : record.writes) {
+      if (!write.index_name.empty()) continue;
+      Table *table = tables.GetTable(write.table_name);
+      auto *item =
+          static_cast<RowRecord *>(table->GetPrimaryIndex().Get(write.key));
+      if (item == nullptr) continue;
+
+      pax::PaxTable &store = *table->GetPaxTable();
+      if (!item->AllocateSlot(store)) {
+        SPDLOG_CRITICAL("Recovery failed: no PAX slot for {} in {}", write.key,
+                        write.table_name);
+        exit(EXIT_FAILURE);
+      }
+      const Tidword tid = item->transaction_id.load();
+      if (item->size() != 0 ||
+          tid_order(write.transaction_id) != tid_order(tid)) {
+        continue;
+      }
+      pax::Row row;
+      if (!pax::unpack_row(
+              store.schema(),
+              reinterpret_cast<const std::byte *>(write.buffer.data()),
+              write.buffer.size(), row)) {
+        SPDLOG_CRITICAL("Recovery failed: value of {} in {} does not fit PAX",
+                        write.key, write.table_name);
+        exit(EXIT_FAILURE);
+      }
+      item->InstallRow(row, tid.epoch);
+    }
+  }
+}
+
+}  // namespace
 
 Database::Database() : Database(Config()) {}
 
@@ -286,96 +458,26 @@ bool Database::WriteCheckpoint(uint64_t *out_version_retries) {
 
 void Database::Recover() {
   SPDLOG_INFO("Start recovery process");
-  auto recovered = logger_.Recover();
+  // The first pass leaves each primary key's newest word and every secondary
+  // entry in the indexes; the second installs only the rows that won.
+  EpochNumber highest_epoch = 1;
+  const auto recovered =
+      logger_.Recover({[this, &highest_epoch](const wal::LogRecords &records) {
+                         replay_keys(table_dictionary_, records, highest_epoch);
+                       },
+                       [this](const wal::LogRecords &records) {
+                         replay_rows(table_dictionary_, records);
+                       }});
   if (recovered.status != wal::Logger::RecoveryStatus::kOk) {
     SPDLOG_CRITICAL(
         "Recovery failed: the write-ahead log could not be read; refusing to "
         "start with an unknown durable state");
     exit(EXIT_FAILURE);
   }
+  SPDLOG_DEBUG("  Durable epoch is resumed from {0}", recovered.durable_epoch);
 
-  const EpochNumber durable_epoch = recovered.durable_epoch;
-  // Refuse before stamping the durable epoch on this thread: the scanner
-  // accepts a last epoch of UINT32_MAX, which is the registry's offline
-  // sentinel. The epochs the records carry are checked again at the end.
-  ResumeEpochAbove(durable_epoch);
-  EpochNumber highest_epoch = std::max<EpochNumber>(1, durable_epoch);
-  SPDLOG_DEBUG("  Durable epoch is resumed from {0}", durable_epoch);
-
-  epoch_framework_.Join();
-  epoch_framework_.SetThreadEpoch(durable_epoch);
-
-  for (auto &entry : recovered.recovery_entries) {
-    // A delete is logged with absent set and must not be re-inserted; a
-    // secondary entry survives recovery only with inserts.
-    if (entry.tid.absent) continue;
-    auto table = GetTable(entry.table_name);
-    if (table == nullptr || table->GetPaxTable() == nullptr) {
-      SPDLOG_CRITICAL("Recovery failed: PAX schema for table {0} is missing.",
-                      entry.table_name);
-      exit(EXIT_FAILURE);
-    }
-
-    highest_epoch = std::max<EpochNumber>(highest_epoch, entry.tid.epoch);
-
-    if (entry.index_name.empty()) {
-      const auto *bytes =
-          reinterpret_cast<const std::byte *>(entry.value.data());
-      pax::Row row;
-      if (!pax::unpack_row(table->GetPaxTable()->schema(), bytes,
-                          entry.value.size(), row)) {
-        SPDLOG_CRITICAL("Recovery failed: value of {} in {} does not fit PAX",
-                        entry.key, entry.table_name);
-        exit(EXIT_FAILURE);
-      }
-      auto *item =
-          static_cast<RowRecord *>(table->GetPrimaryIndex().Put(entry.key));
-      if (!item->AllocateSlot(*table->GetPaxTable())) {
-        SPDLOG_CRITICAL("Recovery failed: no PAX slot for {} in {}", entry.key,
-                        entry.table_name);
-        exit(EXIT_FAILURE);
-      }
-      item->InstallRow(row, entry.tid.epoch);
-      item->transaction_id.store(entry.tid);
-    } else {
-      // An index dropped since, or an earlier one of the same name, has an id
-      // the catalog no longer holds; its writes are skipped.
-      index::SecondaryIndex *idx = table->GetSecondaryIndex(entry.index_name);
-      if (idx != nullptr && idx->id == entry.index_id) {
-        SPDLOG_DEBUG(
-            "  Recovery: Secondary index '{0}' restoring key '{1}' with {2} "
-            "primary keys",
-            entry.index_name, entry.key, entry.primary_keys.size());
-        if (idx->constraint == IndexConstraint::kUnique) {
-          // A commit never leaves a UNIQUE key with two primary keys.
-          if (entry.primary_keys.size() != 1) {
-            SPDLOG_CRITICAL(
-                "Recovery failed: UNIQUE key {0} of index {1} restores {2} "
-                "primary keys",
-                entry.key, entry.index_name, entry.primary_keys.size());
-            exit(EXIT_FAILURE);
-          }
-          auto *item = static_cast<UniqueRecord *>(idx->tree.Put(entry.key));
-          item->transaction_id.store(entry.tid);
-          item->set_primary_key(entry.primary_keys.front());
-        } else {
-          // A non-unique index keeps one record per
-          // (secondary key, primary key), under join_entry of the two, with
-          // the length its key adds past the secondary key.
-          for (const auto &primary_key : entry.primary_keys) {
-            const std::string key =
-                index::join_entry(*idx, entry.key, primary_key);
-            auto *record = static_cast<NonUniqueRecord *>(idx->tree.Put(key));
-            record->transaction_id.store(entry.tid);
-            record->set_pk_len(key.size() - entry.key.size());
-          }
-        }
-      }
-    }
-  }
-  epoch_framework_.Leave();
-
-  const EpochNumber resumed_epoch = ResumeEpochAbove(highest_epoch);
+  const EpochNumber resumed_epoch =
+      ResumeEpochAbove(std::max(highest_epoch, recovered.durable_epoch));
   SPDLOG_DEBUG("  Global epoch is resumed from {0}", resumed_epoch);
   epoch_framework_.SetGlobalEpoch(resumed_epoch);
   SPDLOG_INFO("Finish recovery process");

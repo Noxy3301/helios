@@ -205,19 +205,6 @@ struct MasstreeIndex::Impl {
     return nullptr;
   }
 
-  IndexRecord *Put(std::string_view key) {
-    ensure_thread_active();
-    IndexRecord *item = new_record(type_);
-    cursor_type lp(table_, key.data(), key.size());
-    bool found = lp.find_insert(*tls_ti);
-    // Keep the old item alive for readers that still hold its pointer.
-    lp.value() = item;  // FIXME: retire the old item through RCU
-    fence();
-    // Report 1 for a new key, 0 for replacement, to keep leaf versions correct.
-    lp.finish(found ? 0 : 1, *tls_ti);
-    return item;
-  }
-
   // The reaper has locked the item and checked its delete TID.
   bool Purge(std::string_view key, IndexRecord &expected, Tidword retired_tid) {
     ensure_thread_active();
@@ -310,10 +297,6 @@ MasstreeIndex::~MasstreeIndex() = default;
 
 IndexRecord *MasstreeIndex::Get(std::string_view key) {
   return impl_->Get(key);
-}
-
-IndexRecord *MasstreeIndex::Put(std::string_view key) {
-  return impl_->Put(key);
 }
 
 IndexRecord *MasstreeIndex::GetOrInsert(std::string_view key, bool expect_new) {

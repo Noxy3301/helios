@@ -441,7 +441,8 @@ class Database {
   std::function<void(EpochNumber)> MakeEpochHook();
 
   /**
-   * @brief Replays WAL records into the indexes and resumes the global epoch.
+   * @brief Replays the checkpoint and the WAL into the indexes, one batch of
+   * records at a time, and resumes the global epoch.
    * @details A secondary write whose index id the catalog does not hold
    * belongs to a dropped index and is skipped.
    * @note Refuses startup if a table cannot be restored.
