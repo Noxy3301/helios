@@ -1283,16 +1283,19 @@ void pax_scan(ClientContext&, TableFunctionInput& data, DataChunk& output) {
 }
 
 /**
- * @brief Packs one result row into the Helios packed row format.
+ * @brief Appends every row of `result`, in order, to `rows` in the Helios
+ * packed row format.
  *
- * @details Uses DuckDB's own Value::ToString(): an exact fixed-point
- * representation for DECIMAL (no precision loss) and ISO "YYYY-MM-DD" for
- * DATE, matching this codebase's ASCII row-value convention.
+ * @details Writes the text Value::ToString() gives each cell: an exact
+ * fixed-point representation for DECIMAL (no precision loss) and ISO
+ * "YYYY-MM-DD" for DATE, matching this codebase's ASCII row-value convention.
+ * It casts each column other than BOOLEAN and VARCHAR to VARCHAR once per
+ * chunk with the default cast.
  *
  * DECIMAL division / AVG: DuckDB resolves AVG() of a DECIMAL column (and any
  * DECIMAL/DECIMAL division) to DOUBLE by design
- * (https://duckdb.org/docs/stable/sql/data_types/numeric). Value::ToString()
- * on that DOUBLE uses shortest-round-trip formatting; the plugin reformats it
+ * (https://duckdb.org/docs/stable/sql/data_types/numeric). The VARCHAR cast
+ * of that DOUBLE uses shortest-round-trip formatting; the plugin reformats it
  * to MySQL's decimals convention with exact string/integer rounding once the
  * row crosses the wire.
  *
@@ -1304,36 +1307,73 @@ void pax_scan(ClientContext&, TableFunctionInput& data, DataChunk& output) {
  * integer arithmetic (DuckDB extension or server-side) instead of trusting
  * the DOUBLE result.
  */
-void pack_row(duckdb::MaterializedQueryResult& result, idx_t row_index,
-              std::string* out) {
+void pack_rows(duckdb::MaterializedQueryResult& result,
+               google::protobuf::RepeatedPtrField<std::string>* rows) {
   // Field 0 is the row null-flags field: bit i of byte i / 8 marks output
   // column i NULL. A NULL and an empty string are both zero-length fields,
   // so this bitmap is what separates them.
   const idx_t columns = result.ColumnCount();
   std::string null_flags(static_cast<size_t>((columns + 7) / 8), '\0');
-  std::string body;
-  for (idx_t column_index = 0; column_index < columns; column_index++) {
-    const duckdb::Value value = result.GetValue(column_index, row_index);
-    // Check is_null BEFORE looking at the text: a genuine empty-string result
-    // (value.ToString() == "") is a valid non-null value, not a signal for
-    // the NULL sentinel. The text is only computed in the non-null case.
-    if (value.IsNull()) {
-      null_flags[column_index / 8] |=
-          static_cast<char>(1u << (column_index % 8));
-      append_packed_field(body, "", /*is_null=*/true);
-    } else if (value.type().id() == duckdb::LogicalTypeId::BOOLEAN) {
-      // MySQL's boolean surface is 1/0; Item_string::val_int reads both
-      // "true" and "false" as 0.
-      append_packed_field(body, value.GetValue<bool>() ? "1" : "0",
-                          /*is_null=*/false);
-    } else {
-      const std::string text = value.ToString();
-      append_packed_field(body, text, /*is_null=*/false);
+  std::vector<duckdb::UnifiedVectorFormat> cells(columns);
+  std::vector<duckdb::UnifiedVectorFormat> texts(columns);
+  std::vector<duckdb::unique_ptr<duckdb::Vector>> casts(columns);
+  size_t row_hint = 0;
+  rows->Reserve(static_cast<int>(result.RowCount()));
+  for (auto& chunk : result.Collection().Chunks()) {
+    const idx_t count = chunk.size();
+
+    // Casts every column but BOOLEAN and VARCHAR to VARCHAR for the chunk.
+    for (idx_t c = 0; c < columns; c++) {
+      duckdb::Vector& column = chunk.data[c];
+      const duckdb::LogicalTypeId id = column.GetType().id();
+      if (id == duckdb::LogicalTypeId::BOOLEAN ||
+          id == duckdb::LogicalTypeId::VARCHAR) {
+        casts[c].reset();
+      } else {
+        casts[c] = duckdb::make_uniq<duckdb::Vector>(
+            duckdb::LogicalType::VARCHAR, count);
+        duckdb::VectorOperations::DefaultCast(column, *casts[c], count);
+        casts[c]->ToUnifiedFormat(count, texts[c]);
+      }
+      // After the cast, which may change the column's representation.
+      column.ToUnifiedFormat(count, cells[c]);
+    }
+
+    for (idx_t i = 0; i < count; i++) {
+      std::fill(null_flags.begin(), null_flags.end(), '\0');
+      for (idx_t c = 0; c < columns; c++) {
+        if (!cells[c].validity.RowIsValid(cells[c].sel->get_index(i))) {
+          null_flags[c / 8] |= static_cast<char>(1u << (c % 8));
+        }
+      }
+      std::string& row = *rows->Add();
+      row.reserve(row_hint);
+      append_packed_field(row, null_flags, /*is_null=*/false);
+      for (idx_t c = 0; c < columns; c++) {
+        if (null_flags[c / 8] & (1u << (c % 8))) {
+          append_packed_field(row, "", /*is_null=*/true);
+          continue;
+        }
+        if (casts[c] == nullptr &&
+            chunk.data[c].GetType().id() == duckdb::LogicalTypeId::BOOLEAN) {
+          // MySQL's boolean surface is 1/0; Item_string::val_int reads both
+          // "true" and "false" as 0.
+          const bool b = duckdb::UnifiedVectorFormat::GetData<bool>(
+              cells[c])[cells[c].sel->get_index(i)];
+          append_packed_field(row, b ? "1" : "0", /*is_null=*/false);
+          continue;
+        }
+        const duckdb::UnifiedVectorFormat& text =
+            casts[c] == nullptr ? cells[c] : texts[c];
+        const duckdb::string_t s =
+            duckdb::UnifiedVectorFormat::GetData<duckdb::string_t>(
+                text)[text.sel->get_index(i)];
+        append_packed_field(row, std::string_view(s.GetData(), s.GetSize()),
+                            /*is_null=*/false);
+      }
+      row_hint = row.size() + 16;
     }
   }
-  out->clear();
-  append_packed_field(*out, null_flags, /*is_null=*/false);
-  out->append(body);
 }
 
 // ---------------------------------------------------------------------------
@@ -1709,11 +1749,7 @@ void execute_duckdb_query(
       return;
     }
 
-    std::string row;
-    for (idx_t row_index = 0; row_index < result->RowCount(); row_index++) {
-      pack_row(*result, row_index, &row);
-      response->add_rows(std::move(row));
-    }
+    pack_rows(*result, response->mutable_rows());
     response->set_ok(true);
   } catch (const std::exception& exception) {
     response->Clear();
