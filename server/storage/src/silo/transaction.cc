@@ -432,11 +432,12 @@ bool Transaction::ValidateReads(Tidword &max_tid, std::string &reason) {
           !current.absent &&  // the row exists now,
           current.latest &&   // is still the key's record,
           !read.tid.absent;   // and existed when read
+      const pax::PaxGroup *group =
+          maskable ? item->pax_address().group : nullptr;
       bool held =
           maskable &&
           // no install since changed or assigned a used field or the null flags
-          item->pax_group()->max_column_tid(read.column_mask | 1) <=
-              read.tid.obj;
+          group->max_column_tid(read.column_mask | 1) <= read.tid.obj;
       // The word unchanged across both loads means no install came between.
       if (held) {
         std::atomic_thread_fence(std::memory_order_acquire);
@@ -592,7 +593,7 @@ Tidword Transaction::Apply(IndexRecord &record, const WriteEntry &entry,
     // null-flag change fails every older masked read in the group. The raise
     // precedes Publish, so a validator that loads the new word sees it.
     if (inserted) fields = 1;
-    item.pax_group()->update_max_column_tid(fields, commit_tid.obj);
+    item.pax_address().group->update_max_column_tid(fields, commit_tid.obj);
     return PublishedTid(commit_tid, item);
   }
   const auto &index = std::get<IndexUpdate>(entry.update);

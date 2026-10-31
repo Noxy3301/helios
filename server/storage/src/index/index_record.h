@@ -117,14 +117,25 @@ static_assert(sizeof(UniqueRecord) == 16, "UniqueRecord must remain 16 bytes");
 /**
  * @brief A primary index record: it refers to a PAX slot its table hands out
  *        on the record's first install.
+ *
+ * @details The slot is one atomic address word: bit 31 set while a slot is
+ * attached, 18 bits of directory index and 13 bits of slot. A reader loads
+ * it once.
  */
 struct RowRecord : IndexRecord {
+  // Where the row lives; group is nullptr when no slot is attached.
+  struct PaxAddress {
+    pax::PaxGroup *group;
+    uint32_t slot;
+  };
+
   size_t size() const { return size_; }
   bool IsLive() const { return size_ != 0; }
 
-  bool pax_allocated() const { return group_ != nullptr; }
-  pax::PaxGroup *pax_group() const { return group_; }
-  uint32_t pax_slot() const { return slot_; }
+  bool pax_allocated() const {
+    return address_.load(std::memory_order_acquire) != 0;
+  }
+  PaxAddress pax_address() const;
 
   /**
    * @brief Reserves a slot in `table` if this item does not already have one.
@@ -156,8 +167,9 @@ struct RowRecord : IndexRecord {
 
   // A concurrent update may change size_; use the reader's buffer capacity.
   size_t GatherInto(std::byte *out, size_t capacity) const {
-    assert(pax_allocated());
-    return pax_group()->GatherRow(slot_, out, capacity);
+    const PaxAddress at = pax_address();
+    assert(at.group != nullptr);
+    return at.group->GatherRow(at.slot, out, capacity);
   }
 
   /**
@@ -167,11 +179,14 @@ struct RowRecord : IndexRecord {
   std::string CopyValue() const;
 
  private:
-  pax::PaxGroup *group_ = nullptr;  // The group holding this item's slot.
-  uint32_t slot_ = 0;               // Slot inside group_.
-  uint32_t size_ = 0;               // Row length in bytes; zero once deleted.
+  static constexpr uint32_t kAttached = 1u << 31;
+  static constexpr uint32_t kSlotBits = 13;
 
-  void PreserveImage(EpochNumber epoch);
+  pax::PaxTable *table_ = nullptr;  // Set by the first AllocateSlot.
+  std::atomic<uint32_t> address_{0};
+  uint32_t size_ = 0;  // Row length in bytes; zero once deleted.
+
+  void PreserveImage(PaxAddress at, bool visible, EpochNumber epoch);
 };
 
 static_assert(sizeof(RowRecord) == 24, "RowRecord must remain 24 bytes");

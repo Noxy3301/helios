@@ -161,7 +161,8 @@ ScanPaxResult Database::ScanPax(const std::string_view table_name,
 
     // Return the PAX location for the caller to read directly.
     const auto &item = static_cast<RowRecord &>(record);
-    result.rows.push_back({std::string(key), item.pax_group(), item.pax_slot(),
+    const auto at = item.pax_address();
+    result.rows.push_back({std::string(key), at.group, at.slot,
                            static_cast<uint32_t>(item.size()), tid.obj,
                            &record});
     ++returned_rows;

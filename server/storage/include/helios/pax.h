@@ -180,8 +180,9 @@ class PaxGroup {
    * @param schema Table schema owned by `PaxTable`; must outlive this group.
    * @param table Table whose column statistics this group's writes feed;
    * it owns this group and outlives it.
+   * @param index Position of this group in the table's directory.
    */
-  PaxGroup(const TableSchema &schema, PaxTable &table);
+  PaxGroup(const TableSchema &schema, PaxTable &table, uint32_t index);
 
   /**
    * @brief Drops the images this group published and detaches its state.
@@ -204,6 +205,8 @@ class PaxGroup {
   uint64_t ScatterRow(uint32_t slot, const Row &row, bool compare);
 
   const Layout &layout() const { return *layout_; }
+
+  uint32_t index() const { return index_; }
 
   /**
    * @brief Raises the column TID of every bucket `fields` names to `tid`
@@ -264,6 +267,7 @@ class PaxGroup {
  private:
   const TableSchema &schema_;  // Owned by PaxTable; outlives all groups.
   PaxTable &table_;            // Owns this group and outlives it.
+  const uint32_t index_;
   std::unique_ptr<Layout> layout_;
   // Slot visibility flags for strip-direct scans.
   std::unique_ptr<std::atomic<uint64_t>[]> visible_;

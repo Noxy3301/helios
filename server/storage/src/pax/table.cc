@@ -307,9 +307,10 @@ PaxGroup::Layout::Layout(std::vector<uint32_t> widths)
   arena.reset(new std::byte[total]());
 }
 
-PaxGroup::PaxGroup(const TableSchema &schema, PaxTable &table)
+PaxGroup::PaxGroup(const TableSchema &schema, PaxTable &table, uint32_t index)
     : schema_(schema),
       table_(table),
+      index_(index),
       layout_(std::make_unique<Layout>(schema.field_max_bytes)) {
   // Allocate visibility flags for this group's slots.
   visible_.reset(new std::atomic<uint64_t>[kRows / kVisibilityWordBits]());
@@ -449,7 +450,7 @@ std::pair<PaxGroup *, uint32_t> PaxTable::AllocateSlot() {
     std::lock_guard<std::mutex> lk(alloc_mutex_);
     grp = dir_[group_idx].load(std::memory_order_acquire);
     if (grp == nullptr) {
-      grp = new PaxGroup(schema_, *this);
+      grp = new PaxGroup(schema_, *this, static_cast<uint32_t>(group_idx));
       dir_[group_idx].store(grp, std::memory_order_release);
     }
   }
