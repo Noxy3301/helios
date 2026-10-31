@@ -103,6 +103,9 @@ inline void ensure_thread_active() {
   ensure_thread_init();
   if (!tls_enrolled) {
     tls_ti->rcu_start();
+    // Publish the epoch before the first load of a tree or an index chain, so
+    // min_active_epoch() cannot miss a reader whose store is still buffered.
+    std::atomic_thread_fence(std::memory_order_seq_cst);
     tls_enrolled = true;
   }
 }
@@ -345,6 +348,9 @@ void advance_epoch() {
   // Hold the thread-list lock while reading active epochs.
   std::lock_guard<std::mutex> lg(thread_init_mutex);
   globalepoch.store(globalepoch.load() + 1);
+  // Order the relaxed epoch store before the scan of thread epochs, matching
+  // the fence a thread issues after enrolling.
+  std::atomic_thread_fence(std::memory_order_seq_cst);
   active_epoch.store(threadinfo::min_active_epoch());
 }
 
