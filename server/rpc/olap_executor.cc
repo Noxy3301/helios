@@ -789,13 +789,13 @@ void unpack_decimal_run(const std::byte* src, uint32_t stride, uint32_t width,
  * `invalid_dates` rather than raising, leaving the verdict to the chunk
  * validation.
  */
-void unpack_typed_run(FieldType type, const PaxGroup& group, size_t field,
-                      uint32_t width, uint32_t slot_start, uint32_t count,
-                      Vector& output_vector, idx_t out_base,
+void unpack_typed_run(FieldType type, const PaxGroup::Layout& layout,
+                      size_t field, uint32_t width, uint32_t slot_start,
+                      uint32_t count, Vector& output_vector, idx_t out_base,
                       PhysicalType decimal_physical_type,
                       std::vector<InvalidDate>* invalid_dates) {
-  const std::byte* strip_base = group.strip(field);
-  const uint32_t stride = group.stride(field);
+  const std::byte* strip_base = layout.strip(field);
+  const uint32_t stride = layout.stride(field);
   const std::byte* src = strip_base + static_cast<size_t>(stride) * slot_start;
   constexpr uint32_t kCellLenBytes = PaxGroup::kCellLenBytes;
 
@@ -898,21 +898,21 @@ inline bool cell_is_null(std::string_view null_flags,
  *
  * @details A cell is SQL NULL only when the row's null-flags field marks the
  * column so, and a zero-length cell is the empty string. A length past the
- * field's maximum reads as empty, as in PaxGroup::cell.
+ * cell's capacity reads as empty, as in PaxGroup::Layout::cell.
  */
-void unpack_untyped_run(const PaxGroup& group, const ColumnContext& column,
-                        uint32_t slot_start, uint32_t count,
-                        Vector& output_vector, idx_t out_base) {
-  const uint32_t stride = group.stride(column.field);
-  const uint32_t max_length = group.schema().field_max_bytes[column.field];
+void unpack_untyped_run(const PaxGroup::Layout& layout,
+                        const ColumnContext& column, uint32_t slot_start,
+                        uint32_t count, Vector& output_vector, idx_t out_base) {
+  const uint32_t stride = layout.stride(column.field);
+  const uint32_t max_length = layout.cell_bytes[column.field];
   const std::byte* src =
-      group.strip(column.field) + static_cast<size_t>(stride) * slot_start;
+      layout.strip(column.field) + static_cast<size_t>(stride) * slot_start;
   duckdb::string_t* dst =
       FlatVector::GetData<duckdb::string_t>(output_vector) + out_base;
 
   for (uint32_t i = 0; i < count; i++, src += stride) {
     if (column.null_mask != 0 &&
-        cell_is_null(group.cell(0, slot_start + i), column)) {
+        cell_is_null(layout.cell(0, slot_start + i), column)) {
       FlatVector::SetNull(output_vector, out_base + i, true);
       continue;
     }
@@ -941,14 +941,15 @@ void emit_in_place_row(const PaxGroup& group,
                        const std::vector<ColumnContext>& scan_columns,
                        uint32_t slot, DataChunk& output, idx_t out_row,
                        std::vector<InvalidDate>* invalid_dates) {
+  const PaxGroup::Layout& layout = group.layout();
   for (idx_t i = 0; i < scan_columns.size(); i++) {
     const ColumnContext& column = scan_columns[i];
     FlatVector::SetNull(output.data[i], out_row, false);
     if (column.type == FieldType::kUntyped) {
-      unpack_untyped_run(group, column, slot, 1, output.data[i], out_row);
+      unpack_untyped_run(layout, column, slot, 1, output.data[i], out_row);
     } else {
-      unpack_typed_run(column.type, group, column.field, column.width, slot, 1,
-                       output.data[i], out_row, column.decimal_physical_type,
+      unpack_typed_run(column.type, layout, column.field, column.width, slot,
+                       1, output.data[i], out_row, column.decimal_physical_type,
                        invalid_dates);
     }
   }
@@ -1258,14 +1259,15 @@ void pax_scan(ClientContext&, TableFunctionInput& data, DataChunk& output) {
         run_length++;
       }
 
+      const PaxGroup::Layout& layout = group->layout();
       for (idx_t i = 0; i < scan_columns.size(); i++) {
         const ColumnContext& column = scan_columns[i];
         if (column.type == FieldType::kUntyped) {
-          unpack_untyped_run(*group, column, slot, run_length, output.data[i],
+          unpack_untyped_run(layout, column, slot, run_length, output.data[i],
                              rows_emitted);
         } else {
-          unpack_typed_run(column.type, *group, column.field, column.width, slot,
-                           run_length, output.data[i], rows_emitted,
+          unpack_typed_run(column.type, layout, column.field, column.width,
+                           slot, run_length, output.data[i], rows_emitted,
                            column.decimal_physical_type, &invalid_dates);
         }
       }

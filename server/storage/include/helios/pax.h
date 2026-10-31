@@ -129,6 +129,52 @@ class PaxGroup {
   static constexpr uint32_t kVisibilityWordBits = 64;
 
   /**
+   * @brief Where a group's strips live: the arena, each field's payload
+   *        capacity and each strip's offset.
+   *
+   * @details Fixed once published; writers change only the cells. A reader
+   * takes base, stride and capacity from the same Layout, so a length it
+   * clamps never reaches past the strip it reads.
+   */
+  struct Layout {
+    // Allocates a zeroed arena, so every cell starts empty.
+    explicit Layout(std::vector<uint32_t> widths);
+
+    std::vector<uint32_t> cell_bytes;  // payload capacity per field
+    std::vector<size_t> strip_offset;
+    std::unique_ptr<std::byte[]> arena;
+
+    uint32_t stride(size_t field) const {
+      return kCellLenBytes + cell_bytes[field];
+    }
+
+    const std::byte *strip(size_t field) const {
+      return arena.get() + strip_offset[field];
+    }
+
+    /**
+     * @brief Returns a memory-safe view of one cell payload.
+     *
+     * @details Verbatim bytes for an UNTYPED cell, little-endian binary for a
+     * typed one. This does not reformat a typed cell into row-format bytes;
+     * GatherRow does.
+     *
+     * @param field Field index, where 0 is the null-flags field and MySQL
+     * column i is field `i + 1`.
+     * @param slot Slot inside the group.
+     */
+    std::string_view cell(size_t field, uint32_t slot) const {
+      const std::byte *base =
+          strip(field) + static_cast<size_t>(stride(field)) * slot;
+      uint16_t len;
+      std::memcpy(&len, base, sizeof(len));
+      if (len > cell_bytes[field]) len = 0;
+      return std::string_view(
+          reinterpret_cast<const char *>(base) + kCellLenBytes, len);
+    }
+  };
+
+  /**
    * @brief Creates an empty group whose strips are sized from `schema`.
    *
    * @param schema Table schema owned by `PaxTable`; must outlive this group.
@@ -156,6 +202,8 @@ class PaxGroup {
    * bit when `compare` is false.
    */
   uint64_t ScatterRow(uint32_t slot, const Row &row, bool compare);
+
+  const Layout &layout() const { return *layout_; }
 
   /**
    * @brief Raises the column TID of every bucket `fields` names to `tid`
@@ -206,33 +254,6 @@ class PaxGroup {
            1u;
   }
 
-  /**
-   * @brief Returns a memory-safe view of one cell payload.
-   *
-   * @details Verbatim bytes for an UNTYPED cell, little-endian binary for a
-   * typed one. This does not reformat a typed cell into row-format bytes;
-   * GatherRow does.
-   *
-   * @param field Field index, where 0 is the null-flags field and MySQL column
-   * i is field `i + 1`.
-   * @param slot Slot inside this group.
-   */
-  std::string_view cell(size_t field, uint32_t slot) const {
-    const std::byte *base = arena_.get() + strip_offset_[field] +
-                            static_cast<size_t>(stride_[field]) * slot;
-    uint16_t len;
-    std::memcpy(&len, base, sizeof(len));
-    if (len > schema_.field_max_bytes[field]) len = 0;
-    return std::string_view(
-        reinterpret_cast<const char *>(base) + kCellLenBytes, len);
-  }
-
-  const std::byte *strip(size_t field) const {
-    return arena_.get() + strip_offset_[field];
-  }
-
-  uint32_t stride(size_t field) const { return stride_[field]; }
-
   const TableSchema &schema() const { return schema_; }
 
   // This group's epoch image state, published by the first preserve and never
@@ -243,9 +264,7 @@ class PaxGroup {
  private:
   const TableSchema &schema_;  // Owned by PaxTable; outlives all groups.
   PaxTable &table_;            // Owns this group and outlives it.
-  std::vector<uint32_t> stride_;
-  std::vector<size_t> strip_offset_;
-  std::unique_ptr<std::byte[]> arena_;
+  std::unique_ptr<Layout> layout_;
   // Slot visibility flags for strip-direct scans.
   std::unique_ptr<std::atomic<uint64_t>[]> visible_;
   // One per column-mask bit: the largest commit TID word of an install in this

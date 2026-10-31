@@ -295,19 +295,22 @@ bool unpack_row(const TableSchema &schema, const std::byte *value, size_t size,
   return true;
 }
 
-PaxGroup::PaxGroup(const TableSchema &schema, PaxTable &table)
-    : schema_(schema), table_(table) {
-  const size_t fields = schema.field_count();
-  stride_.resize(fields);
-  strip_offset_.resize(fields);
+PaxGroup::Layout::Layout(std::vector<uint32_t> widths)
+    : cell_bytes(std::move(widths)) {
+  strip_offset.resize(cell_bytes.size());
   size_t total = 0;
-  for (size_t f = 0; f < fields; f++) {
-    stride_[f] = kCellLenBytes + schema.field_max_bytes[f];
+  for (size_t f = 0; f < cell_bytes.size(); f++) {
     total = (total + kStripAlign - 1) & ~size_t{kStripAlign - 1};
-    strip_offset_[f] = total;
-    total += static_cast<size_t>(stride_[f]) * kRows;
+    strip_offset[f] = total;
+    total += static_cast<size_t>(stride(f)) * kRows;
   }
-  arena_.reset(new std::byte[total]());  // zero-init: len=0 everywhere
+  arena.reset(new std::byte[total]());
+}
+
+PaxGroup::PaxGroup(const TableSchema &schema, PaxTable &table)
+    : schema_(schema),
+      table_(table),
+      layout_(std::make_unique<Layout>(schema.field_max_bytes)) {
   // Allocate visibility flags for this group's slots.
   visible_.reset(new std::atomic<uint64_t>[kRows / kVisibilityWordBits]());
 }
@@ -318,11 +321,12 @@ uint64_t PaxGroup::ScatterRow(uint32_t slot, const Row &row, bool compare) {
   assert(slot < kRows);
   const size_t field_count = schema_.field_count();
   assert(row.fields.size() == field_count);
+  const Layout &layout = this->layout();
   uint64_t changed = compare ? 0 : ~uint64_t{0};
   for (size_t field_index = 0; field_index < field_count; field_index++) {
     const auto &field = row.fields[field_index];
-    std::byte *cell = arena_.get() + strip_offset_[field_index] +
-                      static_cast<size_t>(stride_[field_index]) * slot;
+    std::byte *cell = layout.arena.get() + layout.strip_offset[field_index] +
+                      static_cast<size_t>(layout.stride(field_index)) * slot;
     // Typed cells take the binary value; untyped bytes and NULL markers need
     // no numeric conversion.
     uint16_t len = static_cast<uint16_t>(field.len);
@@ -381,16 +385,17 @@ size_t PaxGroup::GatherRow(uint32_t slot, std::byte *dst,
                            size_t expected_size) const {
   assert(slot < kRows);
   const size_t fields = schema_.field_count();
+  const Layout &layout = this->layout();
   std::string scratch;  // reused typed->ASCII buffer (no per-field alloc)
   size_t off = 0;
   for (size_t f = 0; f < fields; f++) {
     // Load and clamp the cell length: a torn read can produce garbage but
     // must stay memory-safe. The caller's TID re-check rejects torn rows.
-    const std::byte *cell = arena_.get() + strip_offset_[f] +
-                            static_cast<size_t>(stride_[f]) * slot;
+    const std::byte *cell =
+        layout.strip(f) + static_cast<size_t>(layout.stride(f)) * slot;
     uint16_t len;
     std::memcpy(&len, cell, sizeof(len));
-    if (len > schema_.field_max_bytes[f]) len = 0;
+    if (len > layout.cell_bytes[f]) len = 0;
     // Emit the empty-field marker.
     if (len == 0) {
       if (off + 1 > expected_size) return off;
