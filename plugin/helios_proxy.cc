@@ -659,7 +659,8 @@ bool HeliosProxy::db_create_table(
     const std::string& table_name,
     const std::vector<uint32_t>& pax_field_max_bytes,
     const std::vector<uint32_t>& pax_field_kind,
-    const std::vector<int32_t>& pax_field_scale) {
+    const std::vector<int32_t>& pax_field_scale,
+    const std::vector<bool>& pax_field_not_null) {
     if (!ensure_connected()) {
         LOG_ERROR("RPC failed: Not connected to server");
         return false;
@@ -677,6 +678,9 @@ bool HeliosProxy::db_create_table(
     }
     for (const int32_t scale : pax_field_scale) {
         request.add_pax_field_scale(scale);
+    }
+    for (const bool not_null : pax_field_not_null) {
+        request.add_pax_field_not_null(not_null);
     }
 
     Helios::Protocol::Response reply;

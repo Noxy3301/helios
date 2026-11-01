@@ -213,6 +213,8 @@ void HeliosRpc::handleDbCreateTable(
         // Every schema is typed: the request carries one kind per width.
         std::vector<helios::storage::pax::FieldType> types;
         std::vector<int8_t> scales;
+        std::vector<bool> not_null(request.pax_field_not_null().begin(),
+                                   request.pax_field_not_null().end());
         {
             types.reserve(request.pax_field_kind_size());
             for (const uint32_t kind : request.pax_field_kind()) {
@@ -229,7 +231,7 @@ void HeliosRpc::handleDbCreateTable(
         }
 
         installed = db->InstallPaxSchema(request.table_name(), widths, types,
-                                         scales);
+                                         scales, not_null);
         SPDLOG_INFO("PAX schema for '{}': {} fields, typed={}, {}",
                  request.table_name().c_str(), widths.size(),
                  types.empty() ? "no" : "yes",

@@ -756,21 +756,34 @@ inline void write_decimal_physical(Vector& output_vector, idx_t row,
 }
 
 /**
+ * @brief Returns whether a typed cell holds a value.
+ *
+ * @details A cell with a length holds one when the length equals the width;
+ * a cell without one, `prefix == 0`, always does.
+ */
+inline bool typed_cell_present(const std::byte* cell, uint32_t prefix,
+                               uint32_t width) {
+  if (prefix == 0) return true;
+  uint16_t cell_length;
+  std::memcpy(&cell_length, cell, sizeof(cell_length));
+  return cell_length == width;
+}
+
+/**
  * @brief Unpacks a run of DEC64 cells into the vector's physical type.
  *
  * @details The data pointer is fetched once per run; DuckDB's GetData checks
  * the vector type on every call.
  */
 template <class T>
-void unpack_decimal_run(const std::byte* src, uint32_t stride, uint32_t width,
-                        uint32_t count, Vector& output_vector, idx_t out_base) {
+void unpack_decimal_run(const std::byte* src, uint32_t stride, uint32_t prefix,
+                        uint32_t width, uint32_t count, Vector& output_vector,
+                        idx_t out_base) {
   T* dst = FlatVector::GetData<T>(output_vector) + out_base;
   for (uint32_t i = 0; i < count; i++, src += stride) {
-    uint16_t cell_length;
-    std::memcpy(&cell_length, src, sizeof(cell_length));
-    if (cell_length == width) {
+    if (typed_cell_present(src, prefix, width)) {
       int64_t mantissa;
-      std::memcpy(&mantissa, src + PaxGroup::kCellLenBytes, sizeof(mantissa));
+      std::memcpy(&mantissa, src + prefix, sizeof(mantissa));
       dst[i] = T(mantissa);
     } else {
       dst[i] = T(0);
@@ -785,7 +798,8 @@ void unpack_decimal_run(const std::byte* src, uint32_t stride, uint32_t width,
  *
  * @details A typed cell is [u16 len][fixed-width LE payload]; a length equal
  * to the column width means the payload is present, any other length (an
- * empty cell) is SQL NULL. A DATE cell naming no calendar day appends to
+ * empty cell) is SQL NULL. The cell of a field declared NOT NULL is the
+ * payload alone and never NULL. A DATE cell naming no calendar day appends to
  * `invalid_dates` rather than raising, leaving the verdict to the chunk
  * validation.
  */
@@ -797,16 +811,14 @@ void unpack_typed_run(FieldType type, const PaxGroup::Layout& layout,
   const std::byte* strip_base = layout.strip(field);
   const uint32_t stride = layout.stride(field);
   const std::byte* src = strip_base + static_cast<size_t>(stride) * slot_start;
-  constexpr uint32_t kCellLenBytes = PaxGroup::kCellLenBytes;
+  const uint32_t prefix = layout.len_bytes[field];
 
   switch (type) {
     case FieldType::kInt32: {
       int32_t* dst = FlatVector::GetData<int32_t>(output_vector) + out_base;
       for (uint32_t i = 0; i < count; i++, src += stride) {
-        uint16_t cell_length;
-        std::memcpy(&cell_length, src, sizeof(cell_length));
-        if (cell_length == width) {
-          std::memcpy(&dst[i], src + kCellLenBytes, sizeof(int32_t));
+        if (typed_cell_present(src, prefix, width)) {
+          std::memcpy(&dst[i], src + prefix, sizeof(int32_t));
         } else {
           dst[i] = 0;
           FlatVector::SetNull(output_vector, out_base + i, true);
@@ -817,10 +829,8 @@ void unpack_typed_run(FieldType type, const PaxGroup::Layout& layout,
     case FieldType::kInt64: {
       int64_t* dst = FlatVector::GetData<int64_t>(output_vector) + out_base;
       for (uint32_t i = 0; i < count; i++, src += stride) {
-        uint16_t cell_length;
-        std::memcpy(&cell_length, src, sizeof(cell_length));
-        if (cell_length == width) {
-          std::memcpy(&dst[i], src + kCellLenBytes, sizeof(int64_t));
+        if (typed_cell_present(src, prefix, width)) {
+          std::memcpy(&dst[i], src + prefix, sizeof(int64_t));
         } else {
           dst[i] = 0;
           FlatVector::SetNull(output_vector, out_base + i, true);
@@ -831,11 +841,9 @@ void unpack_typed_run(FieldType type, const PaxGroup::Layout& layout,
     case FieldType::kDate: {
       date_t* dst = FlatVector::GetData<date_t>(output_vector) + out_base;
       for (uint32_t i = 0; i < count; i++, src += stride) {
-        uint16_t cell_length;
-        std::memcpy(&cell_length, src, sizeof(cell_length));
-        if (cell_length == width) {
+        if (typed_cell_present(src, prefix, width)) {
           int32_t ymd;
-          std::memcpy(&ymd, src + kCellLenBytes, sizeof(ymd));
+          std::memcpy(&ymd, src + prefix, sizeof(ymd));
           if (!ymd_to_date(ymd, &dst[i])) {
             invalid_dates->push_back({out_base + i, ymd});
           }
@@ -848,20 +856,20 @@ void unpack_typed_run(FieldType type, const PaxGroup::Layout& layout,
     case FieldType::kDecimal64:
       switch (decimal_physical_type) {
         case PhysicalType::INT16:
-          unpack_decimal_run<int16_t>(src, stride, width, count, output_vector,
-                                      out_base);
+          unpack_decimal_run<int16_t>(src, stride, prefix, width, count,
+                                      output_vector, out_base);
           break;
         case PhysicalType::INT32:
-          unpack_decimal_run<int32_t>(src, stride, width, count, output_vector,
-                                      out_base);
+          unpack_decimal_run<int32_t>(src, stride, prefix, width, count,
+                                      output_vector, out_base);
           break;
         case PhysicalType::INT64:
-          unpack_decimal_run<int64_t>(src, stride, width, count, output_vector,
-                                      out_base);
+          unpack_decimal_run<int64_t>(src, stride, prefix, width, count,
+                                      output_vector, out_base);
           break;
         default:
-          unpack_decimal_run<hugeint_t>(src, stride, width, count, output_vector,
-                                        out_base);
+          unpack_decimal_run<hugeint_t>(src, stride, prefix, width, count,
+                                        output_vector, out_base);
           break;
       }
       break;
@@ -897,34 +905,28 @@ inline bool cell_is_null(std::string_view null_flags,
  * @brief Unpacks one UNTYPED column across `count` consecutive slots.
  *
  * @details A cell is SQL NULL only when the row's null-flags field marks the
- * column so, and a zero-length cell is the empty string. A length past the
- * cell's capacity reads as empty, as in PaxGroup::Layout::cell.
+ * column so, and a zero-length cell is the empty string. Each cell is read
+ * through PaxGroup::Layout::cell, which clamps a length past the cell's
+ * capacity to empty.
  */
 void unpack_untyped_run(const PaxGroup::Layout& layout,
                         const ColumnContext& column, uint32_t slot_start,
                         uint32_t count, Vector& output_vector, idx_t out_base) {
-  const uint32_t stride = layout.stride(column.field);
-  const uint32_t max_length = layout.cell_bytes[column.field];
-  const std::byte* src =
-      layout.strip(column.field) + static_cast<size_t>(stride) * slot_start;
   duckdb::string_t* dst =
       FlatVector::GetData<duckdb::string_t>(output_vector) + out_base;
 
-  for (uint32_t i = 0; i < count; i++, src += stride) {
-    if (column.null_mask != 0 &&
-        cell_is_null(layout.cell(0, slot_start + i), column)) {
+  for (uint32_t i = 0; i < count; i++) {
+    const uint32_t slot = slot_start + i;
+    if (column.null_mask != 0 && cell_is_null(layout.cell(0, slot), column)) {
       FlatVector::SetNull(output_vector, out_base + i, true);
       continue;
     }
-    uint16_t length;
-    std::memcpy(&length, src, sizeof(length));
-    if (length > max_length) length = 0;
-    const char* data =
-        reinterpret_cast<const char*>(src + PaxGroup::kCellLenBytes);
+    const std::string_view value = layout.cell(column.field, slot);
+    const auto length = static_cast<uint32_t>(value.size());
     if (length <= duckdb::string_t::INLINE_LENGTH) {
-      dst[i] = duckdb::string_t(data, length);
+      dst[i] = duckdb::string_t(value.data(), length);
     } else {
-      dst[i] = StringVector::AddString(output_vector, data, length);
+      dst[i] = StringVector::AddString(output_vector, value.data(), length);
     }
   }
 }

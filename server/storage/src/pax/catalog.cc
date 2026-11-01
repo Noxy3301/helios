@@ -33,12 +33,13 @@ struct Entry {
   std::vector<uint32_t> widths;
   std::vector<uint8_t> types;
   std::vector<int8_t> scales;
+  std::vector<bool> not_null;
   std::vector<std::string> index_names;
   std::vector<uint8_t> index_constraints;
   std::vector<std::vector<uint32_t>> index_pk_slices;  // (offset, length) pairs
   std::vector<uint32_t> index_ids;
-  MSGPACK_DEFINE(widths, types, scales, index_names, index_constraints,
-                 index_pk_slices, index_ids);
+  MSGPACK_DEFINE(widths, types, scales, not_null, index_names,
+                 index_constraints, index_pk_slices, index_ids);
 };
 
 struct PackedCatalog {
@@ -64,6 +65,7 @@ bool StoreCatalog(const std::string &work_dir, const CatalogEntries &entries,
     const auto &schema = definition.schema;
     if (schema.field_max_bytes.empty()) return false;
     Entry entry{schema.field_max_bytes, {}, schema.field_scale, {}, {}, {}};
+    entry.not_null = schema.field_not_null;
     for (const auto type : schema.field_type) {
       const auto tag = static_cast<uint8_t>(type);
       if (tag > static_cast<uint8_t>(FieldType::kDecimal64)) {
@@ -180,6 +182,7 @@ Catalog LoadCatalog(const std::string &work_dir) {
 
       definition.schema.field_max_bytes = std::move(entry.widths);
       definition.schema.field_scale = std::move(entry.scales);
+      definition.schema.field_not_null = std::move(entry.not_null);
       for (const auto type : entry.types) {
         if (type > static_cast<uint8_t>(FieldType::kDecimal64)) {
           throw std::runtime_error("unknown PAX field type");

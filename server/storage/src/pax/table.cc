@@ -289,17 +289,23 @@ bool unpack_row(const TableSchema &schema, const std::byte *value, size_t size,
           std::string_view(reinterpret_cast<const char *>(field.payload),
                            field.len))
         return false;
+    } else if (!schema.has_len(f)) {
+      return false;  // a cell without a length cannot hold an empty value
     }
   }
   out.size = size;
   return true;
 }
 
-PaxGroup::Layout::Layout(std::vector<uint32_t> widths)
+PaxGroup::Layout::Layout(const TableSchema &schema,
+                         std::vector<uint32_t> widths)
     : cell_bytes(std::move(widths)) {
+  len_bytes.resize(cell_bytes.size());
   strip_offset.resize(cell_bytes.size());
   size_t total = 0;
   for (size_t f = 0; f < cell_bytes.size(); f++) {
+    len_bytes[f] =
+        cell_bytes[f] != 0 && schema.has_len(f) ? kCellLenBytes : 0;
     total = (total + kStripAlign - 1) & ~size_t{kStripAlign - 1};
     strip_offset[f] = total;
     total += static_cast<size_t>(stride(f)) * kRows;
@@ -312,7 +318,7 @@ PaxGroup::PaxGroup(const TableSchema &schema, PaxTable &table,
                    uint32_t size_class)
     : schema_(schema),
       table_(table),
-      layout_(std::move(cell_bytes)),
+      layout_(schema, std::move(cell_bytes)),
       index_(index),
       size_class_(size_class) {
   // Allocate visibility flags for this group's slots.
@@ -336,6 +342,8 @@ bool PaxGroup::ScatterRow(uint32_t slot, const Row &row, bool compare,
 
   changed = compare ? 0 : ~uint64_t{0};
   for (size_t field_index = 0; field_index < field_count; field_index++) {
+    // unpack_row admits only an empty value to a field without a strip.
+    if (layout.stride(field_index) == 0) continue;
     const auto &field = row.fields[field_index];
     std::byte *cell = layout.arena.get() + layout.strip_offset[field_index] +
                       static_cast<size_t>(layout.stride(field_index)) * slot;
@@ -349,17 +357,19 @@ bool PaxGroup::ScatterRow(uint32_t slot, const Row &row, bool compare,
       table_.observe(field_index, static_cast<int64_t>(field.typed_value));
     }
 
+    const bool has_len = schema_.has_len(field_index);
+    std::byte *payload = has_len ? cell + kCellLenBytes : cell;
+
     // Leave a cell that already holds these bytes untouched.
     if (compare) {
-      uint16_t old;
-      std::memcpy(&old, cell, sizeof(old));
-      if (old == len &&
-          (len == 0 || std::memcmp(cell + kCellLenBytes, src, len) == 0))
+      uint16_t old = len;
+      if (has_len) std::memcpy(&old, cell, sizeof(old));
+      if (old == len && (len == 0 || std::memcmp(payload, src, len) == 0))
         continue;
       changed |= uint64_t{1} << std::min<size_t>(field_index, 63);
     }
-    std::memcpy(cell, &len, sizeof(len));
-    if (len > 0) std::memcpy(cell + kCellLenBytes, src, len);
+    if (has_len) std::memcpy(cell, &len, sizeof(len));
+    if (len > 0) std::memcpy(payload, src, len);
   }
   // Publish this slot to strip-direct readers after the cells are written.
   visible_[slot / kVisibilityWordBits].fetch_or(
@@ -401,41 +411,33 @@ size_t PaxGroup::GatherRow(uint32_t slot, std::byte *dst,
   std::string scratch;  // reused typed->ASCII buffer (no per-field alloc)
   size_t off = 0;
   for (size_t f = 0; f < fields; f++) {
-    // Load and clamp the cell length: a torn read can produce garbage but
-    // must stay memory-safe. The caller's TID re-check rejects torn rows.
-    const std::byte *cell =
-        layout.strip(f) + static_cast<size_t>(layout.stride(f)) * slot;
-    uint16_t len;
-    std::memcpy(&len, cell, sizeof(len));
-    if (len > layout.cell_bytes[f]) len = 0;
+    // cell() clamps the length: a torn read can produce garbage but must stay
+    // memory-safe. The caller's TID re-check rejects torn rows.
+    std::string_view value = layout.cell(f, slot);
     // Emit the empty-field marker.
-    if (len == 0) {
+    if (value.empty()) {
       if (off + 1 > expected_size) return off;
       dst[off++] = kNoValue;
       continue;
     }
-    // Resolve the payload: typed ASCII, or the untyped bytes.
+    // A typed payload is formatted back to its ASCII.
     const FieldType type = schema_.type_of(f);
-    const char *src;
-    uint32_t vlen;
     if (type != FieldType::kUntyped) {
       scratch.clear();
-      FormatTyped(type, schema_.scale_of(f), cell + kCellLenBytes,
+      FormatTyped(type, schema_.scale_of(f),
+                  reinterpret_cast<const std::byte *>(value.data()),
                   schema_.field_max_bytes[f], scratch);
-      src = scratch.data();
-      vlen = static_cast<uint32_t>(scratch.size());
-    } else {
-      src = reinterpret_cast<const char *>(cell + kCellLenBytes);
-      vlen = len;
+      value = scratch;
     }
     // Write the length prefix and the payload.
+    const uint32_t vlen = static_cast<uint32_t>(value.size());
     const uint32_t prefix = LengthPrefixBytes(vlen);
     if (off + 1 + prefix + vlen > expected_size) return off;
     dst[off++] = static_cast<std::byte>(prefix);
     for (uint32_t i = 0; i < prefix; i++) {
       dst[off++] = static_cast<std::byte>((vlen >> (8 * i)) & 0xFF);
     }
-    std::memcpy(dst + off, src, vlen);
+    std::memcpy(dst + off, value.data(), vlen);
     off += vlen;
   }
   return off;

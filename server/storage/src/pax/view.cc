@@ -90,7 +90,8 @@ bool Database::PaxViewValid(const PaxReadView &view) const {
 bool Database::InstallPaxSchema(const std::string_view table_name,
                                 const std::vector<uint32_t> &field_max_bytes,
                                 const std::vector<pax::FieldType> &field_type,
-                                const std::vector<int8_t> &field_scale) {
+                                const std::vector<int8_t> &field_scale,
+                                const std::vector<bool> &field_not_null) {
   if (field_max_bytes.empty()) return false;
   // The catalog is rewritten from a snapshot of every installed schema, so
   // two installs must not interleave.
@@ -103,13 +104,15 @@ bool Database::InstallPaxSchema(const std::string_view table_name,
   // Typed cells only when the types vector matches the field count; otherwise
   // every field stays UNTYPED (byte-identical to the untyped layout). When
   // the types match, a scale vector of any other length is replaced with
-  // zeros.
+  // zeros and a NOT NULL vector of any other length is dropped.
   if (field_type.size() == field_max_bytes.size()) {
     schema.field_type = field_type;
     if (field_scale.size() == field_max_bytes.size())
       schema.field_scale = field_scale;
     else
       schema.field_scale.assign(field_max_bytes.size(), 0);
+    if (field_not_null.size() == field_max_bytes.size())
+      schema.field_not_null = field_not_null;
   }
 
   // Reattaching with the recovered definition is allowed; changing it is not.
@@ -117,7 +120,8 @@ bool Database::InstallPaxSchema(const std::string_view table_name,
     const auto &current = store->schema();
     return current.field_max_bytes == schema.field_max_bytes &&
            current.field_type == schema.field_type &&
-           current.field_scale == schema.field_scale;
+           current.field_scale == schema.field_scale &&
+           current.field_not_null == schema.field_not_null;
   }
 
   // Rewrite the catalog from every installed definition, then make this
