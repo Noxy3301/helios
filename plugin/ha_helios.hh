@@ -643,7 +643,6 @@ private:
   // True when this statement's reads come from a read plan, where only a
   // primary-key MRR with more than one range takes the batch read path.
   static bool statement_uses_read_plan(THD *thd);
-  HeliosTransaction *new_transaction(THD *thd);
   HeliosTransaction *active_transaction(THD *thd) const;
   /**
    * @brief The THD's transaction, created on first handler access.
@@ -726,19 +725,10 @@ private:
   std::string extract_key_from_mysql(const uchar *row_buffer);
 
   /**
-   * @brief Commit one CREATE INDEX backfill chunk in its own transaction.
+   * @brief Backfill one unique secondary index serially.
    *
-   * @details Backfill may touch every row in the table. Chunking keeps each OCC
-   * transaction bounded while preserving the normal secondary-index write path.
-   * `ops` is cleared before return.
-   */
-  bool backfill_commit_chunk(std::vector<HeliosProxy::WriteOp> &ops);
-
-  /**
-   * @brief Backfill one unique secondary index serially via the write buffer.
-   *
-   * @details Scans the table and commits in bounded chunks, keeping the
-   * buffered commit path so the server's in-write duplicate check runs.
+   * @details Scans the table and commits in bounded chunks on this handler's
+   * connection, so the server's in-write duplicate check runs.
    * Returns false on any failure; the caller fails the ALTER.
    */
   bool backfill_unique_serial(const std::string &index_name,

@@ -358,25 +358,6 @@ enum_alter_inplace_result ha_helios::check_if_supported_inplace_alter(
   return HA_ALTER_INPLACE_EXCLUSIVE_LOCK;
 }
 
-bool ha_helios::backfill_commit_chunk(
-    std::vector<HeliosProxy::WriteOp> &ops) {
-  if (ops.empty()) return true;
-
-  auto *chunk_tx = new_transaction(ha_thd());
-  if (chunk_tx == nullptr) return false;
-  chunk_tx->begin_transaction();
-  chunk_tx->choose_table(db_table_name);
-
-  chunk_tx->buffer_writes(db_table_name, ops);
-  ops.clear();
-  if (chunk_tx->is_aborted()) {
-    chunk_tx->set_status_to_abort();
-    chunk_tx->end_transaction();
-    return false;
-  }
-  return chunk_tx->end_transaction();
-}
-
 bool ha_helios::backfill_unique_serial(const std::string &index_name,
                                           const KEY &runtime_key) {
   // A unique index scans and commits serially, which keeps the in-write
@@ -411,14 +392,14 @@ bool ha_helios::backfill_unique_serial(const std::string &index_name,
       }
       write_chunk.push_back(std::move(op));
       if (write_chunk.size() >= kBackfillWriteChunkRows &&
-          !backfill_commit_chunk(write_chunk)) {
+          !commit_ops(*get_proxy(), write_chunk)) {
         failed = true;
         break;
       }
     }
   } while (!failed && rows.size() == kBackfillScanRows);
   blobroot.Clear();
-  if (failed || !backfill_commit_chunk(write_chunk)) return false;
+  if (failed || !commit_ops(*get_proxy(), write_chunk)) return false;
   return true;
 }
 

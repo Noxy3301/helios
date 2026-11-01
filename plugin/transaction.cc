@@ -514,22 +514,6 @@ void HeliosTransaction::execute_read_plan(
   }
 }
 
-void HeliosTransaction::buffer_writes(
-    const std::string& table_name,
-    const std::vector<HeliosProxy::WriteOp>& ops) {
-  for (auto op : ops) {
-    if (op.table_name.empty()) op.table_name = table_name;
-    if (op.type == HeliosProxy::WriteOp::Type::Write) {
-      record_write(op.table_name, op.key, true, op.value);
-    } else if (op.type == HeliosProxy::WriteOp::Type::Delete) {
-      record_write(op.table_name, op.key, false, ""); // value unused when not found
-    } else {
-      record_index_op(op);
-    }
-    write_buffer_ops_.push_back(std::move(op));
-  }
-}
-
 // Secondary index operations
 
 std::vector<std::string>
