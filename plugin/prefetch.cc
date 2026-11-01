@@ -300,6 +300,31 @@ static std::vector<HeliosProxy::ReadPlanStep> parse_plan_steps(
       if (parts.size() < 3) continue;
       parsed.is_scan = true;
       parsed.index_name = parts[2];
+      // The primary index serves PRIMARY and a UNIQUE index that packs to the
+      // primary key. table_name is "./db/table".
+      const size_t slash = parsed.table_name.find('/', 2);
+      const TABLE_SHARE *share = nullptr;
+      bool primary = false;
+      if (slash != std::string::npos) {
+        const std::string db = parsed.table_name.substr(2, slash - 2);
+        const std::string name = parsed.table_name.substr(slash + 1);
+        mysql_mutex_lock(&LOCK_open);
+        share = get_cached_table_share(db.c_str(), name.c_str());
+        if (share != nullptr && share->m_open_in_progress) share = nullptr;
+        for (uint i = 0; share != nullptr && i < share->keys; i++) {
+          if (parsed.index_name == share->key_info[i].name) {
+            primary = key_pack::same_as_primary(*share, i);
+            break;
+          }
+        }
+        mysql_mutex_unlock(&LOCK_open);
+      }
+      if (share == nullptr) {
+        LOG_WARNING("tx plan dropped: no cached table %s",
+                    parsed.table_name.c_str());
+        return {};
+      }
+      if (primary) parsed.index_name.clear();
       token_start = 3;
     } else if (parts[0] == "FE") {
       parsed.for_each = true;

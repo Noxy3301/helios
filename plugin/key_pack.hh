@@ -18,6 +18,7 @@ class Field;
 class KEY_PART_INFO;
 class KEY;
 struct TABLE;
+struct TABLE_SHARE;
 
 constexpr unsigned char kKeyMarkerNotNull = 0x00;
 constexpr unsigned char kKeyMarkerNull = 0x01;
@@ -100,6 +101,20 @@ bool index_key_too_long(const KEY &key_info, const std::string &secondary_key,
  *         primary key, or a layout that is not fixed.
  */
 std::vector<uint32_t> pk_slices(const TABLE &table, const KEY &key);
+
+/**
+ * @brief Whether an index packs to exactly the primary key.
+ *
+ * @details True for the primary key and for a UNIQUE index over the same
+ * columns, in the same order and with the same lengths and flags. The storage
+ * holds no index for the latter: the primary index serves its reads and its
+ * uniqueness.
+ *
+ * @param share The table's share.
+ * @param index Index number in `share`.
+ * @return True when the primary index serves `index`.
+ */
+bool same_as_primary(const TABLE_SHARE &share, uint index);
 
 // "+infinity" end for an unbounded-upper range scan. It is one 0xFF byte longer
 // than the longest key, so it sorts after every key. An empty end will not do:

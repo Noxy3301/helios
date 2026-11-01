@@ -637,6 +637,26 @@ std::vector<uint32_t> pk_slices(const TABLE &table, const KEY &key) {
   return slices;
 }
 
+bool same_as_primary(const TABLE_SHARE &share, uint index) {
+  if (index == share.primary_key) return true;
+  if (share.primary_key == MAX_KEY || index >= share.keys) return false;
+  const KEY &key = share.key_info[index];
+  const KEY &pk = share.key_info[share.primary_key];
+  if (!(key.flags & HA_NOSAME) ||
+      key.user_defined_key_parts != pk.user_defined_key_parts) {
+    return false;
+  }
+  for (uint i = 0; i < key.user_defined_key_parts; i++) {
+    const KEY_PART_INFO &a = key.key_part[i];
+    const KEY_PART_INFO &b = pk.key_part[i];
+    if (a.fieldnr != b.fieldnr || a.length != b.length ||
+        a.key_part_flag != b.key_part_flag) {
+      return false;
+    }
+  }
+  return true;
+}
+
 }  // namespace key_pack
 
 std::string ha_helios::pack_key(const uchar *key, key_part_map keypart_map) {

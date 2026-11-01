@@ -47,6 +47,8 @@ static std::vector<HeliosProxy::IndexStatsDesc> index_ndv_descriptors(
   for (uint i = 0; i < table->s->keys; ++i) {
     KEY *key = table->key_info + i;
     const bool is_primary = (i == table->s->primary_key);
+    // An index the primary index serves takes the primary key's statistics.
+    if (!is_primary && key_pack::same_as_primary(*table->s, i)) continue;
     HeliosProxy::IndexStatsDesc desc;
     desc.index_name =
         is_primary ? std::string() : std::string(key->name ? key->name : "");
@@ -301,7 +303,7 @@ int ha_helios::info(uint flag) {
       for (uint i = 0; i < table->s->keys; i++) {
         const KEY *key = table->key_info + i;
         const std::string index_name =
-            i == table->s->primary_key
+            key_pack::same_as_primary(*table->s, i)
                 ? std::string()
                 : std::string(key->name ? key->name : "");
         const auto it = share->index_ndv_.find(index_name);
@@ -477,7 +479,8 @@ ha_rows ha_helios::records_in_range(uint inx, key_range *min_key,
 
     // Leading-key range histogram is a floor over the heuristic. Missing or
     // malformed stats keep the fallback estimate.
-    const bool is_primary = table->s != nullptr && inx == table->s->primary_key;
+    const bool is_primary =
+        table->s != nullptr && key_pack::same_as_primary(*table->s, inx);
     const std::string index_name =
         is_primary ? std::string() : std::string(key->name ? key->name : "");
     if (share != nullptr) {
@@ -528,7 +531,7 @@ bool ha_helios::should_charge_remote_row_cost(
   if (t == nullptr || t->in_use == nullptr) return true;
 
   if (t->s != nullptr && t->s->primary_key != MAX_KEY &&
-      index == t->s->primary_key) {
+      key_pack::same_as_primary(*t->s, index)) {
     return false;
   }
 
