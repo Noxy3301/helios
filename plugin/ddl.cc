@@ -1,14 +1,10 @@
 #include "storage/helios/ha_helios.hh"
 
 #include <algorithm>
-#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
-#include <functional>
-#include <memory>
 #include <string>
-#include <thread>
 #include <utility>
 #include <vector>
 
@@ -34,7 +30,6 @@ constexpr uint kUniqueSecondaryIndex = 1u;
 
 // Backfill batching bounds each OCC write set while keeping connection reuse.
 constexpr uint64_t kBackfillWriteChunkRows = 2000;
-constexpr size_t kBackfillParallelWorkers = 16;
 
 // Rows per backfill scan: 4096 rows at MySQL's 64 KiB row-size limit fill a
 // quarter of the 1 GiB RPC frame.
@@ -50,24 +45,6 @@ bool commit_ops(HeliosProxy &conn, std::vector<HeliosProxy::WriteOp> &chunk) {
   const bool ok = conn.tx_commit({}, {}, chunk, {}, &reason);
   chunk.clear();
   return ok;
-}
-
-// Backfill worker: commits one key-hash partition on its own connection, in
-// chunks. A failure sets the shared flag for the caller to report.
-void backfill_partition(HeliosProxy &conn,
-                        std::vector<HeliosProxy::WriteOp> &ops,
-                        std::atomic<bool> &failed) {
-  std::vector<HeliosProxy::WriteOp> chunk;
-  chunk.reserve(kBackfillWriteChunkRows);
-  for (auto &op : ops) {
-    if (failed.load(std::memory_order_relaxed)) return;
-    chunk.push_back(std::move(op));
-    if (chunk.size() >= kBackfillWriteChunkRows && !commit_ops(conn, chunk)) {
-      failed.store(true, std::memory_order_relaxed);
-      return;
-    }
-  }
-  if (!commit_ops(conn, chunk)) failed.store(true, std::memory_order_relaxed);
 }
 
 // Reads the next kBackfillScanRows rows of the table at or above start, in key
@@ -400,66 +377,6 @@ bool ha_helios::backfill_commit_chunk(
   return chunk_tx->end_transaction();
 }
 
-bool ha_helios::backfill_indexes_parallel(
-    std::vector<HeliosProxy::ScanRow> &rows,
-    const std::vector<std::pair<std::string, const KEY *>> &specs,
-    std::vector<std::unique_ptr<HeliosProxy>> &conns) {
-  // Phase A: unpack each row once, build one write per index, and bucket it by
-  // primary-key hash. Single-threaded: unpack uses the shared record buffer.
-  std::vector<std::vector<HeliosProxy::WriteOp>> partition(
-      kBackfillParallelWorkers);
-  // Reserve each bucket to its expected hash share so the per-row push_back
-  // below does not repeatedly reallocate the per-worker write buffers.
-  const size_t total_ops = rows.size() * specs.size();
-  const size_t reserve_per_bucket =
-      total_ops == 0 ? 0
-                     : total_ops / kBackfillParallelWorkers +
-                           total_ops / (kBackfillParallelWorkers * 8) + 1;
-  if (reserve_per_bucket != 0) {
-    for (auto &bucket : partition) bucket.reserve(reserve_per_bucket);
-  }
-  std::hash<std::string> hasher;
-  bool unpack_failed = false;
-  for (auto &row : rows) {
-    const auto *value = reinterpret_cast<const std::byte *>(row.value.data());
-    if (set_fields_from_helios(table->record[0], value, row.value.size())) {
-      unpack_failed = true;
-      break;
-    }
-    for (const auto &spec : specs) {
-      HeliosProxy::WriteOp op;
-      op.type = HeliosProxy::WriteOp::Type::SecondaryIndexWrite;
-      op.table_name = db_table_name;
-      op.index_name = spec.first;
-      op.primary_key = row.key;
-      op.secondary_key =
-          build_secondary_key_from_row(table->record[0], *spec.second);
-      partition[hasher(op.primary_key) % kBackfillParallelWorkers].push_back(
-          std::move(op));
-    }
-  }
-  blobroot.Clear();
-  if (unpack_failed) return false;
-
-  // Phase B: one worker per key-hash partition on its own connection, so no
-  // two workers mutate the same index entry. Workers touch no MySQL state; a
-  // failure sets the shared flag for the caller to report.
-  std::atomic<bool> failed{false};
-  std::vector<std::thread> workers;
-  workers.reserve(kBackfillParallelWorkers);
-  for (size_t w = 0; w < kBackfillParallelWorkers; ++w) {
-    if (partition[w].empty()) continue;
-    if (!conns[w]) {
-      conns[w] = std::make_unique<HeliosProxy>(server_connection_host(),
-                                               server_connection_port());
-    }
-    workers.emplace_back(backfill_partition, std::ref(*conns[w]),
-                         std::ref(partition[w]), std::ref(failed));
-  }
-  for (auto &t : workers) t.join();
-  return !failed.load(std::memory_order_relaxed);
-}
-
 bool ha_helios::backfill_unique_serial(const std::string &index_name,
                                           const KEY &runtime_key) {
   // A unique index scans and commits serially, which keeps the in-write
@@ -505,6 +422,56 @@ bool ha_helios::backfill_unique_serial(const std::string &index_name,
   return true;
 }
 
+bool ha_helios::backfill_sorted(const std::string &index_name,
+                                const KEY &runtime_key) {
+  // One stored key (secondary key, then primary key) per row, with the
+  // secondary key's length.
+  std::vector<std::pair<std::string, size_t>> entries;
+  std::vector<HeliosProxy::ScanRow> rows;
+  std::string start;
+  bool failed = false;
+  do {
+    if (!backfill_scan(*get_proxy(), db_table_name, start, rows)) {
+      failed = true;
+      break;
+    }
+    for (auto &row : rows) {
+      const auto *value = reinterpret_cast<const std::byte *>(row.value.data());
+      if (set_fields_from_helios(table->record[0], value, row.value.size())) {
+        failed = true;
+        break;
+      }
+      std::string key =
+          build_secondary_key_from_row(table->record[0], runtime_key);
+      const size_t sk_len = key.size();
+      key += row.key;
+      entries.emplace_back(std::move(key), sk_len);
+    }
+  } while (!failed && rows.size() == kBackfillScanRows);
+  blobroot.Clear();
+  if (failed) return false;
+
+  // Masstree splits a full leaf in the middle unless the new key lands past
+  // the right end of its layer; an ascending stream only lands there.
+  std::sort(entries.begin(), entries.end());
+  std::vector<HeliosProxy::WriteOp> chunk;
+  chunk.reserve(kBackfillWriteChunkRows);
+  for (auto &[key, sk_len] : entries) {
+    HeliosProxy::WriteOp op;
+    op.type = HeliosProxy::WriteOp::Type::SecondaryIndexWrite;
+    op.table_name = db_table_name;
+    op.index_name = index_name;
+    op.secondary_key = key.substr(0, sk_len);
+    op.primary_key = key.substr(sk_len);
+    chunk.push_back(std::move(op));
+    if (chunk.size() >= kBackfillWriteChunkRows &&
+        !commit_ops(*get_proxy(), chunk)) {
+      return false;
+    }
+  }
+  return commit_ops(*get_proxy(), chunk);
+}
+
 bool ha_helios::inplace_alter_table(TABLE *altered_table,
                                        Alter_inplace_info *ha_alter_info,
                                        const dd::Table *old_table_def
@@ -537,10 +504,8 @@ bool ha_helios::inplace_alter_table(TABLE *altered_table,
     }
   }
 
-  // Non-unique indexes are collected and backfilled together below so a single
-  // scan and unpack pass feeds them all. A unique index keeps the buffered
-  // commit path (its in-write duplicate check) and is backfilled serially.
-  std::vector<std::pair<std::string, const KEY *>> nu_specs;
+  // A unique index keeps the buffered commit path (its in-write duplicate
+  // check); a non-unique one is written in stored-key order.
   for (uint i = 0; i < ha_alter_info->index_add_count; i++) {
     const uint key_idx = ha_alter_info->index_add_buffer[i];
     const KEY *key_info = &ha_alter_info->key_info_buffer[key_idx];
@@ -590,29 +555,13 @@ bool ha_helios::inplace_alter_table(TABLE *altered_table,
       return alter_fail("the storage server refused index " + index_name);
     }
 
+    bool ok;
     if (index_type == kUniqueSecondaryIndex) {
-      if (!backfill_unique_serial(index_name, *runtime_key)) {
-        return alter_fail("backfill of index " + index_name + " failed");
-      }
+      ok = backfill_unique_serial(index_name, *runtime_key);
     } else {
-      nu_specs.emplace_back(index_name, runtime_key);
+      ok = backfill_sorted(index_name, *runtime_key);
     }
-  }
-
-  // Non-unique indexes share one scan and one unpack pass per chunk, then
-  // commit in parallel.
-  if (!nu_specs.empty()) {
-    std::vector<std::unique_ptr<HeliosProxy>> conns(kBackfillParallelWorkers);
-    std::vector<HeliosProxy::ScanRow> rows;
-    std::string start;
-    do {
-      if (!backfill_scan(*proxy, db_table_name, start, rows) ||
-          !backfill_indexes_parallel(rows, nu_specs, conns)) {
-        std::string names;
-        for (const auto &spec : nu_specs) names += " " + spec.first;
-        return alter_fail("backfill of index" + names + " failed");
-      }
-    } while (rows.size() == kBackfillScanRows);
+    if (!ok) return alter_fail("backfill of index " + index_name + " failed");
   }
 
   return false;

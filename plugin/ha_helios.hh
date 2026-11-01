@@ -643,8 +643,6 @@ private:
   // True when this statement's reads come from a read plan, where only a
   // primary-key MRR with more than one range takes the batch read path.
   static bool statement_uses_read_plan(THD *thd);
-  static std::string server_connection_host();
-  static int server_connection_port();
   HeliosTransaction *new_transaction(THD *thd);
   HeliosTransaction *active_transaction(THD *thd) const;
   /**
@@ -737,20 +735,6 @@ private:
   bool backfill_commit_chunk(std::vector<HeliosProxy::WriteOp> &ops);
 
   /**
-   * @brief Backfill the indexes in `specs` from one chunk of rows in one
-   * unpack pass, committed on per-key-hash workers so no two of them mutate
-   * the same index entry.
-   *
-   * @param conns One slot per worker. An empty slot is connected on first use
-   *   and kept for the next chunk.
-   * @return false when any worker commit fails; the caller fails the ALTER.
-   */
-  bool backfill_indexes_parallel(
-      std::vector<HeliosProxy::ScanRow> &rows,
-      const std::vector<std::pair<std::string, const KEY *>> &specs,
-      std::vector<std::unique_ptr<HeliosProxy>> &conns);
-
-  /**
    * @brief Backfill one unique secondary index serially via the write buffer.
    *
    * @details Scans the table and commits in bounded chunks, keeping the
@@ -759,6 +743,15 @@ private:
    */
   bool backfill_unique_serial(const std::string &index_name,
                               const KEY &runtime_key);
+
+  /**
+   * @brief Backfill one non-unique secondary index as one ascending stream.
+   *
+   * @details Scans the table, sorts every entry by its stored key (secondary
+   * key, then primary key) in memory, and commits in bounded chunks in that
+   * order. Returns false on any failure; the caller fails the ALTER.
+   */
+  bool backfill_sorted(const std::string &index_name, const KEY &runtime_key);
 
   void set_write_buffer(uchar *buf);
   bool is_primary_key_exists();

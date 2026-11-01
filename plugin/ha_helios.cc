@@ -191,14 +191,6 @@ HeliosProxy *ha_helios::get_proxy() {
   return ctx->proxy.get();
 }
 
-std::string ha_helios::server_connection_host() {
-  return srv_server_host ? srv_server_host : std::string("127.0.0.1");
-}
-
-int ha_helios::server_connection_port() {
-  return static_cast<int>(srv_server_port);
-}
-
 static PSI_memory_key helios_key_memory_blobroot;
 
 ha_helios::ha_helios(handlerton *hton, TABLE_SHARE *table_arg)
