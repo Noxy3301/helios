@@ -65,7 +65,8 @@ inline uint32_t PackLength(FieldType type) {
  * len][payload up to the group's capacity]`, a capacity of at most
  * `field_max_bytes`; typed cells store `[u16 len][fixed-width LE binary]`
  * with `field_max_bytes` equal to the binary width (4/8), or the binary alone
- * for a field declared NOT NULL.
+ * for a field declared NOT NULL. A field of width 0, such as the null-flags
+ * field when MySQL reserves no null byte, is always empty and has no strip.
  */
 struct TableSchema {
   // Max payload bytes per field, starting with the null-flags field.
@@ -185,6 +186,7 @@ class PaxGroup {
      * @param slot Slot inside the group.
      */
     std::string_view cell(size_t field, uint32_t slot) const {
+      if (stride(field) == 0) return {};
       const std::byte *base =
           strip(field) + static_cast<size_t>(stride(field)) * slot;
       if (len_bytes[field] == 0) {

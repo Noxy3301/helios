@@ -304,7 +304,8 @@ PaxGroup::Layout::Layout(const TableSchema &schema,
   strip_offset.resize(cell_bytes.size());
   size_t total = 0;
   for (size_t f = 0; f < cell_bytes.size(); f++) {
-    len_bytes[f] = schema.has_len(f) ? kCellLenBytes : 0;
+    len_bytes[f] =
+        cell_bytes[f] != 0 && schema.has_len(f) ? kCellLenBytes : 0;
     total = (total + kStripAlign - 1) & ~size_t{kStripAlign - 1};
     strip_offset[f] = total;
     total += static_cast<size_t>(stride(f)) * kRows;
@@ -341,6 +342,8 @@ bool PaxGroup::ScatterRow(uint32_t slot, const Row &row, bool compare,
 
   changed = compare ? 0 : ~uint64_t{0};
   for (size_t field_index = 0; field_index < field_count; field_index++) {
+    // unpack_row admits only an empty value to a field without a strip.
+    if (layout.stride(field_index) == 0) continue;
     const auto &field = row.fields[field_index];
     std::byte *cell = layout.arena.get() + layout.strip_offset[field_index] +
                       static_cast<size_t>(layout.stride(field_index)) * slot;

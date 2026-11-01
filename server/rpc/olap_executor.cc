@@ -905,34 +905,28 @@ inline bool cell_is_null(std::string_view null_flags,
  * @brief Unpacks one UNTYPED column across `count` consecutive slots.
  *
  * @details A cell is SQL NULL only when the row's null-flags field marks the
- * column so, and a zero-length cell is the empty string. A length past the
- * cell's capacity reads as empty, as in PaxGroup::Layout::cell.
+ * column so, and a zero-length cell is the empty string. Each cell is read
+ * through PaxGroup::Layout::cell, which clamps a length past the cell's
+ * capacity to empty.
  */
 void unpack_untyped_run(const PaxGroup::Layout& layout,
                         const ColumnContext& column, uint32_t slot_start,
                         uint32_t count, Vector& output_vector, idx_t out_base) {
-  const uint32_t stride = layout.stride(column.field);
-  const uint32_t max_length = layout.cell_bytes[column.field];
-  const std::byte* src =
-      layout.strip(column.field) + static_cast<size_t>(stride) * slot_start;
   duckdb::string_t* dst =
       FlatVector::GetData<duckdb::string_t>(output_vector) + out_base;
 
-  for (uint32_t i = 0; i < count; i++, src += stride) {
-    if (column.null_mask != 0 &&
-        cell_is_null(layout.cell(0, slot_start + i), column)) {
+  for (uint32_t i = 0; i < count; i++) {
+    const uint32_t slot = slot_start + i;
+    if (column.null_mask != 0 && cell_is_null(layout.cell(0, slot), column)) {
       FlatVector::SetNull(output_vector, out_base + i, true);
       continue;
     }
-    uint16_t length;
-    std::memcpy(&length, src, sizeof(length));
-    if (length > max_length) length = 0;
-    const char* data =
-        reinterpret_cast<const char*>(src + PaxGroup::kCellLenBytes);
+    const std::string_view value = layout.cell(column.field, slot);
+    const auto length = static_cast<uint32_t>(value.size());
     if (length <= duckdb::string_t::INLINE_LENGTH) {
-      dst[i] = duckdb::string_t(data, length);
+      dst[i] = duckdb::string_t(value.data(), length);
     } else {
-      dst[i] = StringVector::AddString(output_vector, data, length);
+      dst[i] = StringVector::AddString(output_vector, value.data(), length);
     }
   }
 }
