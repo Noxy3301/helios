@@ -129,7 +129,7 @@ class CommitTidTest : public ::testing::Test {
     EXPECT_TRUE(pax::unpack_row(
         table->GetPaxTable()->schema(),
         reinterpret_cast<const std::byte *>(bytes.data()), bytes.size(), row));
-    EXPECT_TRUE(item->AllocateSlot(*table->GetPaxTable()));
+    EXPECT_TRUE(item->AllocateSlot(*table->GetPaxTable(), row, tid.epoch));
     item->InstallRow(row, tid.epoch);
     item->transaction_id.store(tid);
     return item;
@@ -367,8 +367,8 @@ TEST_F(CommitTidTest, RepeatedRowWritesKeepTheEpochImageFromBeforeTheCommit) {
   const bool committed = Commit({}, {{kTable, "key", "intermediate"},
                                     {kTable, "key", "", RowOp::kDelete},
                                     {kTable, "key", "final"}});
-  const auto images =
-      image_buffer.SlotImages(item->pax_group(), item->pax_slot());
+  const auto at = item->pax_address();
+  const auto images = image_buffer.SlotImages(at.group, at.slot);
   image_buffer.Close(se);
   ASSERT_TRUE(committed) << reason_;
   ASSERT_EQ(1u, images.size());
@@ -383,15 +383,13 @@ TEST_F(CommitTidTest, SecondInstallAfterTheSnapshotPreservesNothing) {
   const EpochNumber se = image_buffer.Open(epoch_);
   SetEpoch(12);
   const bool first = Commit({}, {{kTable, "key", "second"}});
-  const auto after_first =
-      image_buffer.SlotImages(item->pax_group(), item->pax_slot());
+  const auto at = item->pax_address();
+  const auto after_first = image_buffer.SlotImages(at.group, at.slot);
   const bool second = Commit({}, {{kTable, "key", "third"}});
-  const auto after_second =
-      image_buffer.SlotImages(item->pax_group(), item->pax_slot());
+  const auto after_second = image_buffer.SlotImages(at.group, at.slot);
   SetEpoch(13);
   const bool third = Commit({}, {{kTable, "key", "fourth"}});
-  const auto after_third =
-      image_buffer.SlotImages(item->pax_group(), item->pax_slot());
+  const auto after_third = image_buffer.SlotImages(at.group, at.slot);
   image_buffer.Close(se);
 
   EXPECT_EQ(10u, se);
@@ -409,34 +407,32 @@ TEST_F(CommitTidTest, SecondInstallAfterTheSnapshotPreservesNothing) {
 TEST_F(CommitTidTest, ClosingTheOldestViewDropsItsImagesOnTheNextPreserve) {
   auto *item = SeedRow("key", Version(10, 5));
   auto &image_buffer = pax::EpochImageBuffer::Global();
-  const uint64_t preserved = image_buffer.GroupPreserveCount(item->pax_group());
+  const uint64_t preserved =
+      image_buffer.GroupPreserveCount(item->pax_address().group);
   const EpochNumber v1 = image_buffer.Open(epoch_);
   SetEpoch(12);
   const bool first = Commit({}, {{kTable, "key", "a"}});
-  const auto after_first =
-      image_buffer.SlotImages(item->pax_group(), item->pax_slot());
+  const auto at = item->pax_address();
+  const auto after_first = image_buffer.SlotImages(at.group, at.slot);
   SetEpoch(14);
   const EpochNumber v2 = image_buffer.Open(epoch_);
   SetEpoch(16);
   const bool second = Commit({}, {{kTable, "key", "b"}});
-  const auto after_second =
-      image_buffer.SlotImages(item->pax_group(), item->pax_slot());
+  const auto after_second = image_buffer.SlotImages(at.group, at.slot);
   image_buffer.Close(v1);
-  const auto after_close =
-      image_buffer.SlotImages(item->pax_group(), item->pax_slot());
+  const auto after_close = image_buffer.SlotImages(at.group, at.slot);
   SetEpoch(18);
   const EpochNumber v3 = image_buffer.Open(epoch_);
   SetEpoch(20);
   const bool third = Commit({}, {{kTable, "key", "c"}});
-  const auto after_third =
-      image_buffer.SlotImages(item->pax_group(), item->pax_slot());
-  const uint64_t count = image_buffer.GroupPreserveCount(item->pax_group());
+  const auto after_third = image_buffer.SlotImages(at.group, at.slot);
+  const uint64_t count =
+      image_buffer.GroupPreserveCount(item->pax_address().group);
   image_buffer.Close(v2);
   image_buffer.Close(v3);
-  const auto after_last_close =
-      image_buffer.SlotImages(item->pax_group(), item->pax_slot());
+  const auto after_last_close = image_buffer.SlotImages(at.group, at.slot);
   const uint64_t count_after_close =
-      image_buffer.GroupPreserveCount(item->pax_group());
+      image_buffer.GroupPreserveCount(item->pax_address().group);
 
   EXPECT_EQ(10u, v1);
   EXPECT_EQ(14u, v2);
@@ -461,22 +457,22 @@ TEST_F(CommitTidTest, ClosingTheOldestViewDropsItsImagesOnTheNextPreserve) {
 TEST_F(CommitTidTest, TwoViewsAtOneSnapshotCloseOneAtATime) {
   auto *item = SeedRow("key", Version(10, 5));
   auto &image_buffer = pax::EpochImageBuffer::Global();
-  const uint64_t preserved = image_buffer.GroupPreserveCount(item->pax_group());
+  const uint64_t preserved =
+      image_buffer.GroupPreserveCount(item->pax_address().group);
   const EpochNumber a = image_buffer.Open(epoch_);
   const EpochNumber b = image_buffer.Open(epoch_);
   SetEpoch(11);
   const bool committed = Commit({}, {{kTable, "key", "next"}});
-  const auto after_commit =
-      image_buffer.SlotImages(item->pax_group(), item->pax_slot());
+  const auto at = item->pax_address();
+  const auto after_commit = image_buffer.SlotImages(at.group, at.slot);
   image_buffer.Close(a);
-  const auto after_first_close =
-      image_buffer.SlotImages(item->pax_group(), item->pax_slot());
-  const uint64_t count = image_buffer.GroupPreserveCount(item->pax_group());
+  const auto after_first_close = image_buffer.SlotImages(at.group, at.slot);
+  const uint64_t count =
+      image_buffer.GroupPreserveCount(item->pax_address().group);
   image_buffer.Close(b);
-  const auto after_second_close =
-      image_buffer.SlotImages(item->pax_group(), item->pax_slot());
+  const auto after_second_close = image_buffer.SlotImages(at.group, at.slot);
   const uint64_t count_after_close =
-      image_buffer.GroupPreserveCount(item->pax_group());
+      image_buffer.GroupPreserveCount(item->pax_address().group);
 
   EXPECT_EQ(10u, a);
   EXPECT_EQ(10u, b);
@@ -495,18 +491,17 @@ TEST_F(CommitTidTest, InsertAndReinsertAfterTheSnapshotPreserveAbsence) {
   SetEpoch(11);
   const bool inserted = Commit({}, {{kTable, "new", "value", RowOp::kInsert}});
   auto *item = static_cast<RowRecord *>(index.GetOrInsert("new"));
-  const auto after_insert =
-      image_buffer.SlotImages(item->pax_group(), item->pax_slot());
+  const auto first = item->pax_address();
+  const auto after_insert = image_buffer.SlotImages(first.group, first.slot);
   const bool deleted = Commit({}, {{kTable, "new", "", RowOp::kDelete}});
-  const auto after_delete =
-      image_buffer.SlotImages(item->pax_group(), item->pax_slot());
+  const auto after_delete = image_buffer.SlotImages(first.group, first.slot);
   SetEpoch(12);
   const EpochNumber v2 = image_buffer.Open(epoch_);
   SetEpoch(13);
   const bool reinserted =
       Commit({}, {{kTable, "new", "again", RowOp::kInsert}});
-  const auto after_reinsert =
-      image_buffer.SlotImages(item->pax_group(), item->pax_slot());
+  const auto at = item->pax_address();
+  const auto after_reinsert = image_buffer.SlotImages(at.group, at.slot);
   image_buffer.Close(se);
   image_buffer.Close(v2);
 
@@ -516,8 +511,9 @@ TEST_F(CommitTidTest, InsertAndReinsertAfterTheSnapshotPreserveAbsence) {
   EXPECT_FALSE(after_insert.front().was_visible);
   // The delete replaces a version from its own epoch.
   EXPECT_EQ(1u, after_delete.size());
-  ASSERT_EQ(2u, after_reinsert.size());
-  EXPECT_EQ(11u, after_reinsert.front().writer_epoch);
+  // The delete detached the slot, so the reinsert preserves absence in a
+  // slot of its own.
+  ASSERT_EQ(1u, after_reinsert.size());
   EXPECT_EQ(13u, after_reinsert.back().writer_epoch);
   EXPECT_FALSE(after_reinsert.back().was_visible);
 }
@@ -527,40 +523,45 @@ TEST_F(CommitTidTest, ReinsertingUnderOneViewKeepsOneAbsenceImage) {
   auto &image_buffer = pax::EpochImageBuffer::Global();
   // The seed row takes a slot in the group the churned key lands in.
   auto *seed = SeedRow("seed", Version(10, 1));
-  const uint64_t preserved = image_buffer.GroupPreserveCount(seed->pax_group());
+  const uint64_t preserved =
+      image_buffer.GroupPreserveCount(seed->pax_address().group);
   const EpochNumber se = image_buffer.Open(epoch_);
   SetEpoch(11);
   bool churned = true;
+  std::vector<std::vector<pax::EpochImage>> images;
+  RowRecord::PaxAddress at{};
   for (int cycle = 0; cycle < 3; ++cycle) {
-    churned = churned &&
-              Commit({}, {{kTable, "churn", "value", RowOp::kInsert}}) &&
-              Commit({}, {{kTable, "churn", "", RowOp::kDelete}});
+    churned =
+        churned && Commit({}, {{kTable, "churn", "value", RowOp::kInsert}});
+    at = static_cast<RowRecord *>(index.GetOrInsert("churn"))->pax_address();
+    churned = churned && Commit({}, {{kTable, "churn", "", RowOp::kDelete}});
+    images.push_back(image_buffer.SlotImages(at.group, at.slot));
   }
-  auto *item = static_cast<RowRecord *>(index.GetOrInsert("churn"));
-  const auto images =
-      image_buffer.SlotImages(item->pax_group(), item->pax_slot());
-  const uint64_t count = image_buffer.GroupPreserveCount(item->pax_group());
+  const uint64_t count = image_buffer.GroupPreserveCount(at.group);
   image_buffer.Close(se);
 
   ASSERT_TRUE(churned) << reason_;
-  // Every reinsert replaces the absence the first one preserved.
-  ASSERT_EQ(1u, images.size());
-  EXPECT_EQ(11u, images.front().writer_epoch);
-  EXPECT_FALSE(images.front().was_visible);
-  EXPECT_TRUE(images.front().old_row.empty());
+  // A delete detaches the slot, so every reinsert preserves the absence of a
+  // slot of its own.
+  for (const auto &slot_images : images) {
+    ASSERT_EQ(1u, slot_images.size());
+    EXPECT_EQ(11u, slot_images.front().writer_epoch);
+    EXPECT_FALSE(slot_images.front().was_visible);
+    EXPECT_TRUE(slot_images.front().old_row.empty());
+  }
   EXPECT_EQ(preserved + 3, count);
 }
 
 TEST_F(CommitTidTest, TheGroupPublishesItsImageStateOnTheFirstPreserve) {
   auto *item = SeedRow("key", Version(10, 5));
   auto &image_buffer = pax::EpochImageBuffer::Global();
-  EXPECT_EQ(nullptr, pax::ImageState(item->pax_group()));
+  EXPECT_EQ(nullptr, pax::ImageState(item->pax_address().group));
   EXPECT_EQ(0u, pax::PreserveCount(nullptr));
 
   const EpochNumber se = image_buffer.Open(epoch_);
   SetEpoch(12);
   const bool first = Commit({}, {{kTable, "key", "second"}});
-  pax::GroupImageState *state = pax::ImageState(item->pax_group());
+  pax::GroupImageState *state = pax::ImageState(item->pax_address().group);
   const uint64_t after_first = pax::PreserveCount(state);
   SetEpoch(14);
   const EpochNumber later = image_buffer.Open(epoch_);
@@ -573,10 +574,10 @@ TEST_F(CommitTidTest, TheGroupPublishesItsImageStateOnTheFirstPreserve) {
   ASSERT_NE(nullptr, state);
   // The published pointer is the one every later lookup returns, and reading
   // the counter through it matches the buffer's own lookup.
-  EXPECT_EQ(state, pax::ImageState(item->pax_group()));
+  EXPECT_EQ(state, pax::ImageState(item->pax_address().group));
   EXPECT_EQ(1u, after_first);
   EXPECT_EQ(2u, pax::PreserveCount(state));
-  EXPECT_EQ(image_buffer.GroupPreserveCount(item->pax_group()),
+  EXPECT_EQ(image_buffer.GroupPreserveCount(item->pax_address().group),
             pax::PreserveCount(state));
 }
 
@@ -613,21 +614,23 @@ TEST_F(CommitTidTest, TheImagedSlotBitsMirrorTheImageMapKeys) {
   const EpochNumber se = image_buffer.Open(epoch_);
   SetEpoch(12);
   const bool committed = Commit({}, {{kTable, "a", "later"}});
-  pax::GroupImageState *state = pax::ImageState(first->pax_group());
+  const auto first_at = first->pax_address();
+  const auto second_at = second->pax_address();
+  pax::GroupImageState *state = pax::ImageState(first_at.group);
   const auto images = pax::GroupImages(state, imaged);
   image_buffer.Close(se);
   const auto after_close = pax::GroupImages(state, imaged_after_close);
 
   ASSERT_TRUE(committed) << reason_;
-  ASSERT_EQ(first->pax_group(), second->pax_group());
+  ASSERT_EQ(first_at.group, second_at.group);
   ASSERT_EQ(1u, images.size());
-  EXPECT_EQ(1u, images.count(first->pax_slot()));
+  EXPECT_EQ(1u, images.count(first_at.slot));
   // The bits the same locked pass filled name exactly the imaged slots.
-  EXPECT_TRUE(SlotBit(imaged, first->pax_slot()));
-  EXPECT_FALSE(SlotBit(imaged, second->pax_slot()));
+  EXPECT_TRUE(SlotBit(imaged, first_at.slot));
+  EXPECT_FALSE(SlotBit(imaged, second_at.slot));
   // The last close clears the images, and with them the bits.
   EXPECT_TRUE(after_close.empty());
-  EXPECT_FALSE(SlotBit(imaged_after_close, first->pax_slot()));
+  EXPECT_FALSE(SlotBit(imaged_after_close, first_at.slot));
 }
 
 TEST_F(CommitTidTest, DeletingAMissingKeyThenInsertingPreservesAbsence) {
@@ -640,8 +643,8 @@ TEST_F(CommitTidTest, DeletingAMissingKeyThenInsertingPreservesAbsence) {
   const bool inserted =
       Commit({}, {{kTable, "ghost", "value", RowOp::kInsert}});
   auto *item = static_cast<RowRecord *>(index.GetOrInsert("ghost"));
-  const auto images =
-      image_buffer.SlotImages(item->pax_group(), item->pax_slot());
+  const auto at = item->pax_address();
+  const auto images = image_buffer.SlotImages(at.group, at.slot);
   image_buffer.Close(se);
 
   ASSERT_TRUE(deleted && inserted) << reason_;

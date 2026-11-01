@@ -186,9 +186,9 @@ TEST(MasstreeIndexTest, PrimaryEntryTakesItsPaxSlotOnAllocation) {
   auto *item = static_cast<RowRecord *>(tree.GetOrInsert("row"));
   ASSERT_NE(nullptr, item);
   EXPECT_FALSE(item->IsLive());
-  ASSERT_TRUE(item->AllocateSlot(store));
+  ASSERT_TRUE(item->AllocateSlot(store, pax::Row{}, 1));
   EXPECT_EQ(1u, store.slots_allocated());
-  EXPECT_EQ(store.group(0), item->pax_group());
+  EXPECT_NE(nullptr, item->pax_address().group);
   EXPECT_EQ(item, tree.GetOrInsert("row"));
   index::release_thread_epoch();
 }
