@@ -1,12 +1,14 @@
 #include "storage/helios/ha_helios.hh"
 
 #include <algorithm>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <functional>
 #include <future>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -49,6 +51,34 @@ bool commit_ops(HeliosProxy &conn, std::vector<HeliosProxy::WriteOp> &chunk) {
       conn.tx_commit({}, {}, chunk, {}, &reason, nullptr, nullptr, true);
   chunk.clear();
   return ok;
+}
+
+// Commits entries [begin, end) in chunks on conn, ascending or descending;
+// the storage inserts a chunk's writes in the order they are sent. A failure
+// sets failed, and a set failed stops the range.
+void commit_range(HeliosProxy &conn, const std::string &table,
+                  const std::string &index,
+                  const std::vector<std::pair<std::string, size_t>> &entries,
+                  size_t begin, size_t end, bool ascending,
+                  std::atomic<bool> &failed) {
+  std::vector<HeliosProxy::WriteOp> chunk;
+  chunk.reserve(kBackfillWriteChunkRows);
+  for (size_t i = begin; i < end; ++i) {
+    if (failed.load(std::memory_order_relaxed)) return;
+    const auto &[key, sk_len] = entries[ascending ? i : begin + end - 1 - i];
+    HeliosProxy::WriteOp op;
+    op.type = HeliosProxy::WriteOp::Type::SecondaryIndexWrite;
+    op.table_name = table;
+    op.index_name = index;
+    op.secondary_key = key.substr(0, sk_len);
+    op.primary_key = key.substr(sk_len);
+    chunk.push_back(std::move(op));
+    if (chunk.size() >= kBackfillWriteChunkRows && !commit_ops(conn, chunk)) {
+      failed.store(true, std::memory_order_relaxed);
+      return;
+    }
+  }
+  if (!commit_ops(conn, chunk)) failed.store(true, std::memory_order_relaxed);
 }
 
 // Reads the next kBackfillScanRows rows of the table at or above start, in key
@@ -452,25 +482,22 @@ bool ha_helios::backfill_sorted(const std::string &index_name,
   if (scan.valid()) scan.wait();
   if (failed) return false;
 
-  // Masstree splits a full leaf in the middle unless the new key lands past
-  // the right end of its layer; an ascending stream only lands there.
+  // Masstree splits a full leaf in the middle unless the new key lands before
+  // the first or past the last key of its layer. The halves split at a chunk
+  // boundary and grow outward from it, each on its own connection.
   std::sort(entries.begin(), entries.end());
-  std::vector<HeliosProxy::WriteOp> chunk;
-  chunk.reserve(kBackfillWriteChunkRows);
-  for (auto &[key, sk_len] : entries) {
-    HeliosProxy::WriteOp op;
-    op.type = HeliosProxy::WriteOp::Type::SecondaryIndexWrite;
-    op.table_name = db_table_name;
-    op.index_name = index_name;
-    op.secondary_key = key.substr(0, sk_len);
-    op.primary_key = key.substr(sk_len);
-    chunk.push_back(std::move(op));
-    if (chunk.size() >= kBackfillWriteChunkRows &&
-        !commit_ops(*get_proxy(), chunk)) {
-      return false;
-    }
-  }
-  return commit_ops(*get_proxy(), chunk);
+  const size_t chunks =
+      (entries.size() + kBackfillWriteChunkRows - 1) / kBackfillWriteChunkRows;
+  const size_t mid = chunks / 2 * kBackfillWriteChunkRows;
+  HeliosProxy lower_conn(server_connection_host(), server_connection_port());
+  std::atomic<bool> commit_failed{false};
+  std::thread lower(commit_range, std::ref(lower_conn),
+                    std::cref(db_table_name), std::cref(index_name),
+                    std::cref(entries), 0, mid, false, std::ref(commit_failed));
+  commit_range(proxy, db_table_name, index_name, entries, mid, entries.size(),
+               true, commit_failed);
+  lower.join();
+  return !commit_failed.load(std::memory_order_relaxed);
 }
 
 bool ha_helios::inplace_alter_table(TABLE *altered_table,

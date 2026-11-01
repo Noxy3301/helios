@@ -643,6 +643,8 @@ private:
   // True when this statement's reads come from a read plan, where only a
   // primary-key MRR with more than one range takes the batch read path.
   static bool statement_uses_read_plan(THD *thd);
+  static std::string server_connection_host();
+  static int server_connection_port();
   HeliosTransaction *active_transaction(THD *thd) const;
   /**
    * @brief The THD's transaction, created on first handler access.
@@ -735,11 +737,14 @@ private:
                               const KEY &runtime_key);
 
   /**
-   * @brief Backfill one non-unique secondary index as one ascending stream.
+   * @brief Backfill one non-unique secondary index from its sorted entries.
    *
    * @details Scans the table, sorts every entry by its stored key (secondary
-   * key, then primary key) in memory, and commits in bounded chunks in that
-   * order. Returns false on any failure; the caller fails the ALTER.
+   * key, then primary key) in memory, and commits in bounded chunks from the
+   * middle outward: the upper half ascending on this handler's connection,
+   * the lower half descending on a second connection. The scan and the lower
+   * half run on threads of their own, joined before return. Returns false on
+   * any failure; the caller fails the ALTER.
    */
   bool backfill_sorted(const std::string &index_name, const KEY &runtime_key);
 
