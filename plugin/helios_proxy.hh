@@ -247,11 +247,13 @@ public:
 
     // table/index management (non-transactional)
     // PAX cell widths in bytes (entry 0 = null flags, then TABLE::field
-    // order); kind/scale carry typed cells, one entry per width.
+    // order); kind/scale carry typed cells and not_null each field's NOT
+    // NULL, one entry per width.
     bool db_create_table(const std::string& table_name,
                          const std::vector<uint32_t>& pax_field_max_bytes,
                          const std::vector<uint32_t>& pax_field_kind,
-                         const std::vector<int32_t>& pax_field_scale);
+                         const std::vector<int32_t>& pax_field_scale,
+                         const std::vector<bool>& pax_field_not_null);
     // pk_slices locate the primary key in a record's key, as
     // key_pack::pk_slices builds them.
     bool db_create_secondary_index(const std::string& table_name,

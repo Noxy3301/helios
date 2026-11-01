@@ -165,6 +165,9 @@ class Database {
    * `field_max_bytes`, or a width that is not the one that type stores.
    * @param[in] field_scale Per-field DECIMAL scale, used by kDecimal64. Empty,
    * or a length that does not match, means a scale of zero.
+   * @param[in] field_not_null Per-field NOT NULL. A typed field declared NOT
+   * NULL is stored without a cell length and refuses an empty value. Empty, or
+   * a length that does not match, leaves every field nullable.
    * @return true when the schema is installed for the table.
    * @return false if the table is missing, the definition is empty or
    * conflicts, or the catalog cannot be saved.
@@ -172,7 +175,8 @@ class Database {
   bool InstallPaxSchema(const std::string_view table_name,
                         const std::vector<uint32_t> &field_max_bytes,
                         const std::vector<pax::FieldType> &field_type = {},
-                        const std::vector<int8_t> &field_scale = {});
+                        const std::vector<int8_t> &field_scale = {},
+                        const std::vector<bool> &field_not_null = {});
 
   /**
    * @brief Returns the PAX table installed for `table_name`.

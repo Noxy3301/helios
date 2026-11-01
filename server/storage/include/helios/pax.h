@@ -28,7 +28,8 @@ namespace pax {
  * layer wrote, unchanged. A typed field stores the value as a fixed-width
  * little-endian binary payload of `field_max_bytes[f]` bytes (4 or 8). A
  * typed cell's u16 length prefix is 0 for SQL NULL and the binary width for a
- * present value. unpack_row converts input bytes before the commit protocol;
+ * present value; the cell of a typed field declared NOT NULL has no prefix.
+ * unpack_row converts input bytes before the commit protocol;
  * ScatterRow writes the unpacked cells without reparsing.
  * GatherRow reconstructs the original field bytes from the typed cells.
  */
@@ -63,7 +64,8 @@ inline uint32_t PackLength(FieldType type) {
  * PaxGroup splits it into fixed-width cells. UNTYPED cells store `[u16
  * len][payload up to the group's capacity]`, a capacity of at most
  * `field_max_bytes`; typed cells store `[u16 len][fixed-width LE binary]`
- * with `field_max_bytes` equal to the binary width (4/8).
+ * with `field_max_bytes` equal to the binary width (4/8), or the binary alone
+ * for a field declared NOT NULL.
  */
 struct TableSchema {
   // Max payload bytes per field, starting with the null-flags field.
@@ -73,6 +75,9 @@ struct TableSchema {
   std::vector<FieldType> field_type;
   // Per-field DECIMAL scale for kDecimal64 (else 0). Same length when present.
   std::vector<int8_t> field_scale;
+  // Per-field NOT NULL as the query layer declared it. Empty => every field
+  // may be NULL. Same length when present.
+  std::vector<bool> field_not_null;
 
   size_t field_count() const { return field_max_bytes.size(); }
 
@@ -98,6 +103,17 @@ struct TableSchema {
    */
   int scale_of(size_t f) const {
     return f < field_scale.size() ? field_scale[f] : 0;
+  }
+
+  /**
+   * @brief Returns whether the cells of field `f` carry a length prefix.
+   *
+   * @details A typed field declared NOT NULL has none: each of its cells
+   * holds the full binary width, and unpack_row refuses an empty value for it.
+   */
+  bool has_len(size_t f) const {
+    return type_of(f) == FieldType::kUntyped || f >= field_not_null.size() ||
+           !field_not_null[f];
   }
 };
 
@@ -142,14 +158,15 @@ class PaxGroup {
    */
   struct Layout {
     // Allocates a zeroed arena, so every cell starts empty.
-    explicit Layout(std::vector<uint32_t> widths);
+    Layout(const TableSchema &schema, std::vector<uint32_t> widths);
 
     std::vector<uint32_t> cell_bytes;  // payload capacity per field
+    std::vector<uint32_t> len_bytes;   // kCellLenBytes, or 0 without a length
     std::vector<size_t> strip_offset;
     std::unique_ptr<std::byte[]> arena;
 
     uint32_t stride(size_t field) const {
-      return kCellLenBytes + cell_bytes[field];
+      return len_bytes[field] + cell_bytes[field];
     }
 
     const std::byte *strip(size_t field) const {
@@ -170,6 +187,10 @@ class PaxGroup {
     std::string_view cell(size_t field, uint32_t slot) const {
       const std::byte *base =
           strip(field) + static_cast<size_t>(stride(field)) * slot;
+      if (len_bytes[field] == 0) {
+        return std::string_view(reinterpret_cast<const char *>(base),
+                                cell_bytes[field]);
+      }
       uint16_t len;
       std::memcpy(&len, base, sizeof(len));
       if (len > cell_bytes[field]) len = 0;

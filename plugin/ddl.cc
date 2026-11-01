@@ -327,8 +327,12 @@ int ha_helios::create(const char *table_name, TABLE *table, HA_CREATE_INFO *,
     my_error(ER_NOT_SUPPORTED_YET, MYF(0), msg.c_str());
     return HA_ERR_UNSUPPORTED;
   }
-  if (!proxy->db_create_table(db_table_name, pax_widths, pax_kinds,
-                              pax_scales)) {
+  // Entry 0 is the null-flags field, not a column.
+  std::vector<bool> pax_not_null{false};
+  for (uint i = 0; i < table->s->fields; i++)
+    pax_not_null.push_back(!table->field[i]->is_nullable());
+  if (!proxy->db_create_table(db_table_name, pax_widths, pax_kinds, pax_scales,
+                              pax_not_null)) {
     return HA_ERR_GENERIC;
   }
 

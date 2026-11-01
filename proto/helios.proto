@@ -379,6 +379,8 @@ message DbCreateTable {
         repeated uint32 pax_field_kind = 3 [packed = true];
         // DECIMAL scale per typed field, 0 elsewhere.
         repeated int32 pax_field_scale = 4 [packed = true];
+        // NOT NULL per width entry; a typed NOT NULL field has no cell length.
+        repeated bool pax_field_not_null = 5 [packed = true];
     }
     message Response {
         bool success = 1;
