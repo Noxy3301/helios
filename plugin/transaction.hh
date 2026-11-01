@@ -40,9 +40,6 @@ public:
   const std::pair<const std::byte *const, const size_t> read(
       std::string key, uint64_t column_mask = 0);
   std::vector<std::pair<bool, std::string>> batch_read(const std::vector<std::string>& keys);
-  // Buffer ops built elsewhere (the DDL backfill); the commit installs them.
-  void buffer_writes(const std::string& table_name,
-                     const std::vector<HeliosProxy::WriteOp>& ops);
   // served_truncated, when given, lets a cached range that holds only the
   // first rows serve an unlimited request; it is set when the result is a
   // partial scan result and the caller has to fetch the rest.

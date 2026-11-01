@@ -236,6 +236,7 @@ public:
     };
     // Validate every read and range, then install the writes. duplicate_key is
     // set when the server refused a duplicate primary or unique secondary key.
+    // async_durability acknowledges at precommit under any server contract.
     bool tx_commit(
         const std::vector<ReadEntry>& reads,
         const std::vector<RangeReadEntry>& range_reads,
@@ -243,7 +244,8 @@ public:
         const std::vector<std::pair<std::string, int64_t>>& row_deltas,
         std::string* abort_detail = nullptr,
         bool* duplicate_key = nullptr,
-        bool* transport_error = nullptr);
+        bool* transport_error = nullptr,
+        bool async_durability = false);
 
     // table/index management (non-transactional)
     // PAX cell widths in bytes (entry 0 = null flags, then TABLE::field
