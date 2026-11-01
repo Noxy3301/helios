@@ -1,19 +1,24 @@
 /**
  * @file server/storage/tests/pax_table_test.cc
- * Typed PAX cells whose declared width does not match their type, and the
- * column statistics a write feeds.
+ * Typed PAX cells whose declared width does not match their type, the
+ * column statistics a write feeds, and rows placed by size class.
  */
 
+#include <algorithm>
 #include <deque>
 #include <string>
 #include <string_view>
+#include <thread>
+#include <utility>
 #include <vector>
 
 #include "helios/pax.h"
 
 #include "gtest/gtest.h"
 #include "index/index_record.h"
+#include "pax/epoch_image_buffer.h"
 #include "pax/table.h"
+#include "util/epoch_framework.h"
 
 namespace {
 
@@ -49,8 +54,8 @@ bool Scatter(PaxGroup &group, uint32_t slot, const std::string &row) {
           group.schema(), reinterpret_cast<const std::byte *>(row.data()),
           row.size(), unpacked))
     return false;
-  group.ScatterRow(slot, unpacked, false);
-  return true;
+  uint64_t changed;
+  return group.ScatterRow(slot, unpacked, false, changed);
 }
 
 std::string Gather(const PaxGroup &group, uint32_t slot, size_t expected_size) {
@@ -63,7 +68,10 @@ std::string Gather(const PaxGroup &group, uint32_t slot, size_t expected_size) {
 
 // The group PaxTable hands out first, holding slot 0.
 PaxGroup &FirstGroup(helios::storage::pax::PaxTable &store) {
-  return *store.AllocateSlot().first;
+  helios::storage::pax::Row widest;
+  for (uint32_t bytes : store.schema().field_max_bytes)
+    widest.fields.push_back({nullptr, bytes});
+  return *store.AllocateSlot(widest, 0).first;
 }
 
 TableSchema MakeSchema(std::vector<uint32_t> widths,
@@ -133,7 +141,7 @@ TEST(PaxTableTest, CopyStaysWithinTheReadersBufferAfterRowGrowth) {
   ASSERT_TRUE(helios::storage::pax::unpack_row(
       schema, reinterpret_cast<const std::byte *>(small.data()), small.size(),
       unpacked));
-  ASSERT_TRUE(item.AllocateSlot(store));
+  ASSERT_TRUE(item.AllocateSlot(store, unpacked, 1));
   item.InstallRow(unpacked, 1);
 
   // A reader sizes its output, then a writer grows the row before the copy.
@@ -166,7 +174,7 @@ helios::storage::RowRecord &Install(
       schema, reinterpret_cast<const std::byte *>(row.data()), row.size(),
       unpacked));
   helios::storage::RowRecord &item = items.emplace_back();
-  EXPECT_TRUE(item.AllocateSlot(store));
+  EXPECT_TRUE(item.AllocateSlot(store, unpacked, 1));
   item.InstallRow(unpacked, 1);
   return item;
 }
@@ -246,6 +254,152 @@ TEST(PaxTableTest, ColumnDistinctEstimatesWrittenValues) {
   EXPECT_EQ(after, ndv);
 
   EXPECT_FALSE(helios::storage::pax::ColumnDistinct(&store, 0, &ndv));
+}
+
+helios::storage::pax::Row Unpack(const TableSchema &schema,
+                                 const std::string &row) {
+  helios::storage::pax::Row unpacked;
+  EXPECT_TRUE(helios::storage::pax::unpack_row(
+      schema, reinterpret_cast<const std::byte *>(row.data()), row.size(),
+      unpacked));
+  return unpacked;
+}
+
+// A row that outgrows its class moves to the narrowest class that holds it;
+// the old slot is hidden and the row reads the same through its record.
+TEST(PaxTableTest, OutgrownRowMovesToAWiderClass) {
+  const TableSchema schema = MakeSchema({1, 500}, {});
+  helios::storage::pax::PaxTable store(schema);
+  std::deque<helios::storage::RowRecord> items;
+  const std::string nulls(1, '\0');
+  const std::string small = PackRow({nulls, std::string(10, 'a')});
+  helios::storage::RowRecord &item = Install(items, store, schema, small);
+  const auto before = item.pax_address();
+  ASSERT_EQ(before.group->layout().cell_bytes[1], 16u);
+  EXPECT_EQ(store.group(0)->layout().cell_bytes[1], 500u);
+  EXPECT_EQ(item.CopyValue(), small);
+
+  const std::string large = PackRow({nulls, std::string(300, 'z')});
+  EXPECT_EQ(item.InstallRow(Unpack(schema, large), 2), ~uint64_t{0});
+  const auto after = item.pax_address();
+  EXPECT_NE(after.group, before.group);
+  EXPECT_EQ(after.group->layout().cell_bytes[1], 320u);
+  EXPECT_FALSE(before.group->IsVisible(before.slot));
+  EXPECT_TRUE(after.group->IsVisible(after.slot));
+  EXPECT_EQ(item.CopyValue(), large);
+  EXPECT_EQ(store.moves(), 1u);
+}
+
+// A retired slot goes back to its class only once the allocating commit
+// epoch is two past the retire epoch.
+TEST(PaxTableTest, RetiredSlotIsReusedOnlyAfterTheGrace) {
+  const TableSchema schema = MakeSchema({1, 500}, {});
+  helios::storage::pax::PaxTable store(schema);
+  std::deque<helios::storage::RowRecord> items;
+  const std::string packed = PackRow({std::string(1, '\0'), "x"});
+  const auto row = Unpack(schema, packed);
+  helios::storage::RowRecord &victim = items.emplace_back();
+  ASSERT_TRUE(victim.AllocateSlot(store, row, 10));
+  victim.InstallRow(row, 10);
+  const auto retired = victim.pax_address();
+  for (uint32_t i = 1; i < PaxGroup::kRows; i++)
+    ASSERT_EQ(store.AllocateSlot(row, 10).first, retired.group);
+  victim.DeleteRow(10);
+  EXPECT_FALSE(victim.pax_allocated());
+
+  // Epoch 11 is inside the grace: the full class takes a new group.
+  const auto early = store.AllocateSlot(row, 11);
+  EXPECT_NE(early.first, retired.group);
+  for (uint32_t i = 1; i < PaxGroup::kRows; i++)
+    ASSERT_EQ(store.AllocateSlot(row, 11).first, early.first);
+  const auto reused = store.AllocateSlot(row, 12);
+  EXPECT_EQ(reused.first, retired.group);
+  EXPECT_EQ(reused.second, retired.slot);
+}
+
+// Threads racing for fresh slots of one class across group boundaries each
+// get a distinct slot, and the count matches what they took.
+TEST(PaxTableTest, ConcurrentAllocationsTakeDistinctSlots) {
+  constexpr size_t kThreads = 8;
+  constexpr size_t kEach = PaxGroup::kRows / 2 + 7;
+  helios::storage::pax::PaxTable store(MakeSchema({1, 500}, {}));
+  helios::storage::pax::Row row;
+  row.fields = {{nullptr, 1}, {nullptr, 10}};
+  std::vector<std::vector<std::pair<PaxGroup *, uint32_t>>> taken(kThreads);
+  std::vector<std::thread> threads;
+  for (size_t i = 0; i < kThreads; i++) {
+    threads.emplace_back([&, i] {
+      for (size_t n = 0; n < kEach; n++)
+        taken[i].push_back(store.AllocateSlot(row, 1));
+    });
+  }
+  for (auto &thread : threads) thread.join();
+
+  std::vector<std::pair<PaxGroup *, uint32_t>> all;
+  for (const auto &slots : taken)
+    all.insert(all.end(), slots.begin(), slots.end());
+  for (const auto &slot : all) ASSERT_NE(slot.first, nullptr);
+  std::sort(all.begin(), all.end());
+  EXPECT_EQ(std::adjacent_find(all.begin(), all.end()), all.end());
+  EXPECT_EQ(store.slots_allocated(), kThreads * kEach);
+}
+
+// The rows a read view at `se` resolves across every group: the oldest image
+// newer than `se` where one exists, else the visible strip row.
+std::vector<std::string> ViewRows(const helios::storage::pax::PaxTable &store,
+                                  uint32_t se) {
+  namespace pax = helios::storage::pax;
+  std::vector<std::string> rows;
+  for (size_t g = 0; g < store.group_count(); g++) {
+    const PaxGroup &group = *store.group(g);
+    uint64_t imaged[PaxGroup::kRows / PaxGroup::kVisibilityWordBits];
+    const auto images = pax::GroupImages(pax::ImageState(&group), imaged);
+    for (uint32_t slot = 0; slot < PaxGroup::kRows; slot++) {
+      const pax::EpochImage *image = nullptr;
+      if (auto it = images.find(slot); it != images.end()) {
+        for (const auto &candidate : it->second) {
+          if (candidate.writer_epoch > se) {
+            image = &candidate;
+            break;
+          }
+        }
+      }
+      if (image != nullptr) {
+        if (image->was_visible) rows.push_back(image->old_row);
+      } else if (group.IsVisible(slot)) {
+        rows.push_back(Gather(group, slot, 1024));
+      }
+    }
+  }
+  return rows;
+}
+
+// A view open across a move reads the old row once, from the old slot's
+// image; a view opened after it reads the new row once.
+TEST(PaxTableTest, ViewOpenAcrossAMoveSeesTheRowOnce) {
+  const TableSchema schema = MakeSchema({1, 500}, {});
+  helios::storage::pax::PaxTable store(schema);
+  std::deque<helios::storage::RowRecord> items;
+  const std::string nulls(1, '\0');
+  const std::string small = PackRow({nulls, std::string(10, 'a')});
+  const std::string large = PackRow({nulls, std::string(300, 'z')});
+  helios::storage::RowRecord &item = Install(items, store, schema, small);
+  item.transaction_id.store(helios::storage::Tidword{});
+
+  auto &image_buffer = helios::storage::pax::EpochImageBuffer::Global();
+  helios::storage::epoch::Framework epoch;
+  epoch.SetGlobalEpoch(10);
+  const uint32_t before = image_buffer.Open(epoch);
+  item.InstallRow(Unpack(schema, large), 12);
+  epoch.SetGlobalEpoch(13);
+  const uint32_t after = image_buffer.Open(epoch);
+  const auto old_rows = ViewRows(store, before);
+  const auto new_rows = ViewRows(store, after);
+  image_buffer.Close(before);
+  image_buffer.Close(after);
+
+  EXPECT_EQ(old_rows, std::vector<std::string>{small});
+  EXPECT_EQ(new_rows, std::vector<std::string>{large});
 }
 
 }  // namespace

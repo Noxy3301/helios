@@ -61,13 +61,17 @@ RowRecord::PaxAddress RowRecord::pax_address() const {
           word & (pax::PaxGroup::kRows - 1)};
 }
 
-bool RowRecord::AllocateSlot(pax::PaxTable &table) {
+uint32_t RowRecord::address_word(const pax::PaxGroup *group, uint32_t slot) {
+  return kAttached | (group->index() << kSlotBits) | slot;
+}
+
+bool RowRecord::AllocateSlot(pax::PaxTable &table, const pax::Row &row,
+                             EpochNumber epoch) {
   if (pax_allocated()) return true;
-  const auto [group, slot] = table.AllocateSlot();
+  const auto [group, slot] = table.AllocateSlot(row, epoch);
   if (group == nullptr) return false;
   table_ = &table;
-  address_.store(kAttached | (group->index() << kSlotBits) | slot,
-                 std::memory_order_release);
+  address_.store(address_word(group, slot), std::memory_order_release);
   return true;
 }
 
@@ -88,16 +92,28 @@ uint64_t RowRecord::InstallRow(const pax::Row &row, EpochNumber epoch) {
   const PaxAddress at = pax_address();
   const bool live = size_ != 0;
   PreserveImage(at, live, epoch);
-  const uint64_t changed = at.group->ScatterRow(at.slot, row, live);
+  uint64_t changed;
+  if (!at.group->ScatterRow(at.slot, row, live, changed)) {
+    // Outgrown: write the row to a wider class, then retire the old slot.
+    const auto [group, slot] = table_->AllocateSlot(row, epoch);
+    // A full directory during a move stops the process.
+    if (group == nullptr) std::abort();
+    PreserveImage({group, slot}, false, epoch);
+    group->ScatterRow(slot, row, false, changed);
+    address_.store(address_word(group, slot), std::memory_order_release);
+    table_->Retire(at.group, at.slot, epoch);
+    table_->count_move();
+  }
   size_ = static_cast<uint32_t>(row.size);
   return changed;
 }
 
 void RowRecord::DeleteRow(EpochNumber epoch) {
   const PaxAddress at = pax_address();
-  if (at.group != nullptr && size_ != 0) {
-    PreserveImage(at, true, epoch);
-    at.group->RetireSlot(at.slot);
+  if (at.group != nullptr) {
+    if (size_ != 0) PreserveImage(at, true, epoch);
+    address_.store(0, std::memory_order_release);
+    table_->Retire(at.group, at.slot, epoch);
   }
   size_ = 0;
 }

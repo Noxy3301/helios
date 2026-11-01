@@ -161,9 +161,8 @@ void replay_keys(TableDictionary &tables, const wal::LogRecords &records,
 /**
  * @brief Installs the rows of one batch whose words replay_keys kept.
  *
- * @details Batches come in the order replay_keys saw them, so a row takes its
- * PAX slot at the first write to its key and its value from the first write
- * carrying the kept word.
+ * @details A row takes its value from the first write carrying the kept word,
+ * and a slot of the size class that value needs.
  */
 void replay_rows(TableDictionary &tables, const wal::LogRecords &records) {
   for (const auto &record : records) {
@@ -175,11 +174,6 @@ void replay_rows(TableDictionary &tables, const wal::LogRecords &records) {
       if (item == nullptr) continue;
 
       pax::PaxTable &store = *table->GetPaxTable();
-      if (!item->AllocateSlot(store)) {
-        SPDLOG_CRITICAL("Recovery failed: no PAX slot for {} in {}", write.key,
-                        write.table_name);
-        exit(EXIT_FAILURE);
-      }
       const Tidword tid = item->transaction_id.load();
       if (item->size() != 0 ||
           tid_order(write.transaction_id) != tid_order(tid)) {
@@ -192,6 +186,11 @@ void replay_rows(TableDictionary &tables, const wal::LogRecords &records) {
               write.buffer.size(), row)) {
         SPDLOG_CRITICAL("Recovery failed: value of {} in {} does not fit PAX",
                         write.key, write.table_name);
+        exit(EXIT_FAILURE);
+      }
+      if (!item->AllocateSlot(store, row, tid.epoch)) {
+        SPDLOG_CRITICAL("Recovery failed: no PAX slot for {} in {}", write.key,
+                        write.table_name);
         exit(EXIT_FAILURE);
       }
       item->InstallRow(row, tid.epoch);

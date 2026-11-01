@@ -60,9 +60,9 @@ inline uint32_t PackLength(FieldType type) {
  * @brief Describes the row format fields a PAX-enabled table stores in strips.
  *
  * @details A row is one null-flags field followed by one field per column;
- * PaxGroup uses the maximum payload byte widths here to split it into
- * fixed-width cells. UNTYPED cells store `[u16 len][payload up to
- * field_max_bytes]`; typed cells store `[u16 len][fixed-width LE binary]`
+ * PaxGroup splits it into fixed-width cells. UNTYPED cells store `[u16
+ * len][payload up to the group's capacity]`, a capacity of at most
+ * `field_max_bytes`; typed cells store `[u16 len][fixed-width LE binary]`
  * with `field_max_bytes` equal to the binary width (4/8).
  */
 struct TableSchema {
@@ -116,6 +116,10 @@ struct GroupImageState;  // pax/epoch_image_buffer.h
  * scatter to the same slot, and callers reject torn rows with the normal TID
  * re-check. Strip-direct readers resolve a concurrent writer through the
  * images and the preserve counter declared below.
+ *
+ * Each group belongs to one size class of its table: every UNTYPED cell is
+ * `min(declared width, class width)` wide and never changes. A row that
+ * outgrows its class moves to a group of a wider class.
  */
 class PaxGroup {
  public:
@@ -132,9 +136,9 @@ class PaxGroup {
    * @brief Where a group's strips live: the arena, each field's payload
    *        capacity and each strip's offset.
    *
-   * @details Fixed once published; writers change only the cells. A reader
-   * takes base, stride and capacity from the same Layout, so a length it
-   * clamps never reaches past the strip it reads.
+   * @details Fixed for the life of the group; writers change only the
+   * cells. A reader takes base, stride and capacity from the same Layout, so
+   * a length it clamps never reaches past the strip it reads.
    */
   struct Layout {
     // Allocates a zeroed arena, so every cell starts empty.
@@ -175,14 +179,19 @@ class PaxGroup {
   };
 
   /**
-   * @brief Creates an empty group whose strips are sized from `schema`.
+   * @brief Creates an empty group with the given cell capacities.
    *
    * @param schema Table schema owned by `PaxTable`; must outlive this group.
    * @param table Table whose column statistics this group's writes feed;
    * it owns this group and outlives it.
+   * @param cell_bytes Payload capacity per field, each at most
+   * `schema.field_max_bytes`; a typed field takes exactly its width.
    * @param index Position of this group in the table's directory.
+   * @param size_class Size class of the table this group belongs to.
    */
-  PaxGroup(const TableSchema &schema, PaxTable &table, uint32_t index);
+  PaxGroup(const TableSchema &schema, PaxTable &table,
+           std::vector<uint32_t> cell_bytes, uint32_t index,
+           uint32_t size_class);
 
   /**
    * @brief Drops the images this group published and detaches its state.
@@ -199,14 +208,17 @@ class PaxGroup {
    * bytes must remain unchanged until the call finishes.
    * @param compare The slot holds a row: leave a cell whose length and bytes
    * already match untouched.
-   * @return Fields whose cells changed, bit `min(f, 63)` for field `f`; every
-   * bit when `compare` is false.
+   * @param changed Set to the fields whose cells changed, bit `min(f, 63)`
+   * for field `f`; every bit when `compare` is false.
+   * @return false, with nothing written, when an UNTYPED payload is longer
+   * than its cell; the caller moves the row to a wider size class.
    */
-  uint64_t ScatterRow(uint32_t slot, const Row &row, bool compare);
+  bool ScatterRow(uint32_t slot, const Row &row, bool compare,
+                  uint64_t &changed);
 
-  const Layout &layout() const { return *layout_; }
-
+  const Layout &layout() const { return layout_; }
   uint32_t index() const { return index_; }
+  uint32_t size_class() const { return size_class_; }
 
   /**
    * @brief Raises the column TID of every bucket `fields` names to `tid`
@@ -267,8 +279,9 @@ class PaxGroup {
  private:
   const TableSchema &schema_;  // Owned by PaxTable; outlives all groups.
   PaxTable &table_;            // Owns this group and outlives it.
+  const Layout layout_;
   const uint32_t index_;
-  std::unique_ptr<Layout> layout_;
+  const uint32_t size_class_;
   // Slot visibility flags for strip-direct scans.
   std::unique_ptr<std::atomic<uint64_t>[]> visible_;
   // One per column-mask bit: the largest commit TID word of an install in this
@@ -293,7 +306,7 @@ PaxGroup *Group(const PaxTable *store, size_t idx);
 uint64_t SlotsAllocated(const PaxTable *store);
 
 /**
- * @brief Returns the number of row groups that may contain allocated slots.
+ * @brief Returns the number of groups in the table's directory.
  */
 size_t GroupCount(const PaxTable *store);
 

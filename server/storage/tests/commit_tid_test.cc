@@ -129,7 +129,7 @@ class CommitTidTest : public ::testing::Test {
     EXPECT_TRUE(pax::unpack_row(
         table->GetPaxTable()->schema(),
         reinterpret_cast<const std::byte *>(bytes.data()), bytes.size(), row));
-    EXPECT_TRUE(item->AllocateSlot(*table->GetPaxTable()));
+    EXPECT_TRUE(item->AllocateSlot(*table->GetPaxTable(), row, tid.epoch));
     item->InstallRow(row, tid.epoch);
     item->transaction_id.store(tid);
     return item;
@@ -511,8 +511,9 @@ TEST_F(CommitTidTest, InsertAndReinsertAfterTheSnapshotPreserveAbsence) {
   EXPECT_FALSE(after_insert.front().was_visible);
   // The delete replaces a version from its own epoch.
   EXPECT_EQ(1u, after_delete.size());
-  ASSERT_EQ(2u, after_reinsert.size());
-  EXPECT_EQ(11u, after_reinsert.front().writer_epoch);
+  // The delete detached the slot, so the reinsert preserves absence in a
+  // slot of its own.
+  ASSERT_EQ(1u, after_reinsert.size());
   EXPECT_EQ(13u, after_reinsert.back().writer_epoch);
   EXPECT_FALSE(after_reinsert.back().was_visible);
 }
@@ -527,24 +528,27 @@ TEST_F(CommitTidTest, ReinsertingUnderOneViewKeepsOneAbsenceImage) {
   const EpochNumber se = image_buffer.Open(epoch_);
   SetEpoch(11);
   bool churned = true;
+  std::vector<std::vector<pax::EpochImage>> images;
+  RowRecord::PaxAddress at{};
   for (int cycle = 0; cycle < 3; ++cycle) {
-    churned = churned &&
-              Commit({}, {{kTable, "churn", "value", RowOp::kInsert}}) &&
-              Commit({}, {{kTable, "churn", "", RowOp::kDelete}});
+    churned =
+        churned && Commit({}, {{kTable, "churn", "value", RowOp::kInsert}});
+    at = static_cast<RowRecord *>(index.GetOrInsert("churn"))->pax_address();
+    churned = churned && Commit({}, {{kTable, "churn", "", RowOp::kDelete}});
+    images.push_back(image_buffer.SlotImages(at.group, at.slot));
   }
-  auto *item = static_cast<RowRecord *>(index.GetOrInsert("churn"));
-  const auto at = item->pax_address();
-  const auto images = image_buffer.SlotImages(at.group, at.slot);
-  const uint64_t count =
-      image_buffer.GroupPreserveCount(item->pax_address().group);
+  const uint64_t count = image_buffer.GroupPreserveCount(at.group);
   image_buffer.Close(se);
 
   ASSERT_TRUE(churned) << reason_;
-  // Every reinsert replaces the absence the first one preserved.
-  ASSERT_EQ(1u, images.size());
-  EXPECT_EQ(11u, images.front().writer_epoch);
-  EXPECT_FALSE(images.front().was_visible);
-  EXPECT_TRUE(images.front().old_row.empty());
+  // A delete detaches the slot, so every reinsert preserves the absence of a
+  // slot of its own.
+  for (const auto &slot_images : images) {
+    ASSERT_EQ(1u, slot_images.size());
+    EXPECT_EQ(11u, slot_images.front().writer_epoch);
+    EXPECT_FALSE(slot_images.front().was_visible);
+    EXPECT_TRUE(slot_images.front().old_row.empty());
+  }
   EXPECT_EQ(preserved + 3, count);
 }
 

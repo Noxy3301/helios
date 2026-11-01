@@ -267,11 +267,13 @@ bool Transaction::Commit(CommitDurability durability, std::string &reason) {
   }
   commit_tid.latest = true;
 
-  // Reserve every destination before changing the first stored value.
+  // Reserve a slot for every new row before changing the first stored value.
+  // A move allocates its destination inside install.
   for (auto &[item, entry] : write_set_) {
     const auto *row = std::get_if<RowUpdate>(&entry.update);
     if (row == nullptr || row->op == RowOp::kDelete) continue;
-    if (!static_cast<RowRecord *>(item)->AllocateSlot(*row->store)) {
+    if (!static_cast<RowRecord *>(item)->AllocateSlot(*row->store, row->row,
+                                                      commit_epoch)) {
       reason = "pax_slots_exhausted";
       return Abort();
     }
@@ -435,7 +437,7 @@ bool Transaction::ValidateReads(Tidword &max_tid, std::string &reason) {
       const pax::PaxGroup *group =
           maskable ? item->pax_address().group : nullptr;
       bool held =
-          maskable &&
+          group != nullptr &&
           // no install since changed or assigned a used field or the null flags
           group->max_column_tid(read.column_mask | 1) <= read.tid.obj;
       // The word unchanged across both loads means no install came between.

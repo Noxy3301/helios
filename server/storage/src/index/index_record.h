@@ -116,11 +116,11 @@ static_assert(sizeof(UniqueRecord) == 16, "UniqueRecord must remain 16 bytes");
 
 /**
  * @brief A primary index record: it refers to a PAX slot its table hands out
- *        on the record's first install.
+ *        on the record's first install, and moves when the row outgrows it.
  *
  * @details The slot is one atomic address word: bit 31 set while a slot is
  * attached, 18 bits of directory index and 13 bits of slot. A reader loads
- * it once.
+ * it once; a delete detaches it and a move replaces it under the TID lock.
  */
 struct RowRecord : IndexRecord {
   // Where the row lives; group is nullptr when no slot is attached.
@@ -138,27 +138,30 @@ struct RowRecord : IndexRecord {
   PaxAddress pax_address() const;
 
   /**
-   * @brief Reserves a slot in `table` if this item does not already have one.
+   * @brief Reserves a slot in the size class of `row` if this item does not
+   * already have one.
+   * @param epoch Commit epoch of the write.
    * @return true once the item holds a slot, including one it already had;
    * false when the table's slot directory is full.
    */
-  bool AllocateSlot(pax::PaxTable &table);
+  bool AllocateSlot(pax::PaxTable &table, const pax::Row &row,
+                    EpochNumber epoch);
 
   /**
-   * @brief Installs an unpacked row into this item's PAX slot.
+   * @brief Installs an unpacked row into this item's PAX slot, moving it to a
+   * slot of a wider size class when it does not fit.
    * @note The caller holds the TID lock and has allocated every write's slot.
    * Recovery calls this before readers start.
    * @param epoch Commit epoch of this install; epoch images are tagged with
    * it.
    * @return The PAX fields whose cells changed, bit `min(f, 63)` for field
-   * `f`; every bit when the item held no row.
+   * `f`; every bit when the item held no row or moved.
    */
   uint64_t InstallRow(const pax::Row &row, EpochNumber epoch);
 
   /**
-   * @brief Hides this item's row: retires the slot from strip scans and
-   * preserves its epoch image for an open read view. The slot stays
-   * reserved for a later write.
+   * @brief Hides this item's row: preserves its epoch image for an open read
+   * view, detaches the slot and retires it to its table.
    * @note The caller holds the TID lock; publishing the absent word is
    * separate.
    * @param epoch Commit epoch of this delete, the epoch image's writer epoch.
@@ -166,9 +169,10 @@ struct RowRecord : IndexRecord {
   void DeleteRow(EpochNumber epoch);
 
   // A concurrent update may change size_; use the reader's buffer capacity.
+  // Returns 0 when no slot is attached.
   size_t GatherInto(std::byte *out, size_t capacity) const {
     const PaxAddress at = pax_address();
-    assert(at.group != nullptr);
+    if (at.group == nullptr) return 0;
     return at.group->GatherRow(at.slot, out, capacity);
   }
 
@@ -186,6 +190,7 @@ struct RowRecord : IndexRecord {
   std::atomic<uint32_t> address_{0};
   uint32_t size_ = 0;  // Row length in bytes; zero once deleted.
 
+  static uint32_t address_word(const pax::PaxGroup *group, uint32_t slot);
   void PreserveImage(PaxAddress at, bool visible, EpochNumber epoch);
 };
 

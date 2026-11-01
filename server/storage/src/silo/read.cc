@@ -151,17 +151,22 @@ ScanPaxResult Database::ScanPax(const std::string_view table_name,
   uint64_t returned_rows = 0;
 
   auto append_pax_row = [&](std::string_view key, IndexRecord &record) {
+    const auto &item = static_cast<RowRecord &>(record);
     // Read an unlocked TID; the caller must recheck it after reading the cells.
-    const Tidword tid = silo::StableTid(record);
-    if (tid.absent) {
-      if (tid != Tidword::Absent())
-        result.visited.push_back({std::string(key), tid.obj});
-      return false;
-    }
+    // A delete in between detaches the slot, so reload until both agree.
+    Tidword tid;
+    RowRecord::PaxAddress at;
+    do {
+      tid = silo::StableTid(record);
+      if (tid.absent) {
+        if (tid != Tidword::Absent())
+          result.visited.push_back({std::string(key), tid.obj});
+        return false;
+      }
+      at = item.pax_address();
+    } while (at.group == nullptr);
 
     // Return the PAX location for the caller to read directly.
-    const auto &item = static_cast<RowRecord &>(record);
-    const auto at = item.pax_address();
     result.rows.push_back({std::string(key), at.group, at.slot,
                            static_cast<uint32_t>(item.size()), tid.obj,
                            &record});
