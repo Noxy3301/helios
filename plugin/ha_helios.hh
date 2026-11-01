@@ -737,16 +737,22 @@ private:
                               const KEY &runtime_key);
 
   /**
-   * @brief Backfill one non-unique secondary index from its sorted entries.
+   * @brief Backfill non-unique secondary indexes from one table scan.
    *
-   * @details Scans the table, sorts every entry by its stored key (secondary
-   * key, then primary key) in memory, and commits in bounded chunks from the
-   * middle outward: the upper half ascending on this handler's connection,
-   * the lower half descending on a second connection. The scan and the lower
-   * half run on threads of their own, joined before return. Returns false on
-   * any failure; the caller fails the ALTER.
+   * @details Decodes each row once and sorts each index's entries by stored
+   * key (secondary key, then primary key) in memory. Commits one index after
+   * another, in bounded chunks from the middle outward: the upper half
+   * ascending on this handler's connection, the lower half descending on a
+   * second connection. The scan and the lower half run on threads of their
+   * own, joined before return.
+   *
+   * @param keys Nonempty set of registered runtime keys, valid through return.
+   * @param failed_index On failure, the index whose commit fails, or the first
+   *   index for a shared scan or decode failure.
+   * @return False on any failure; the caller fails the ALTER.
    */
-  bool backfill_sorted(const std::string &index_name, const KEY &runtime_key);
+  bool backfill_sorted(const std::vector<const KEY *> &keys,
+                       std::string &failed_index);
 
   void set_write_buffer(uchar *buf);
   bool is_primary_key_exists();

@@ -437,11 +437,11 @@ bool ha_helios::backfill_unique_serial(const std::string &index_name,
   return true;
 }
 
-bool ha_helios::backfill_sorted(const std::string &index_name,
-                                const KEY &runtime_key) {
-  // One stored key (secondary key, then primary key) per row, with the
-  // secondary key's length.
-  std::vector<std::pair<std::string, size_t>> entries;
+bool ha_helios::backfill_sorted(const std::vector<const KEY *> &keys,
+                                std::string &failed_index) {
+  // One stored key per row and index, with the secondary key's length.
+  std::vector<std::vector<std::pair<std::string, size_t>>> entries(keys.size());
+  failed_index = keys.front()->name;
   // The next chunk's scan runs on this handler's connection while this thread
   // builds the keys of the current one.
   HeliosProxy &proxy = *get_proxy();
@@ -471,11 +471,13 @@ bool ha_helios::backfill_sorted(const std::string &index_name,
         failed = true;
         break;
       }
-      std::string key =
-          build_secondary_key_from_row(table->record[0], runtime_key);
-      const size_t sk_len = key.size();
-      key += row.key;
-      entries.emplace_back(std::move(key), sk_len);
+      for (size_t i = 0; i < keys.size(); ++i) {
+        std::string key =
+            build_secondary_key_from_row(table->record[0], *keys[i]);
+        const size_t sk_len = key.size();
+        key += row.key;
+        entries[i].emplace_back(std::move(key), sk_len);
+      }
     }
   }
   blobroot.Clear();
@@ -485,19 +487,29 @@ bool ha_helios::backfill_sorted(const std::string &index_name,
   // Masstree splits a full leaf in the middle unless the new key lands before
   // the first or past the last key of its layer. The halves split at a chunk
   // boundary and grow outward from it, each on its own connection.
-  std::sort(entries.begin(), entries.end());
-  const size_t chunks =
-      (entries.size() + kBackfillWriteChunkRows - 1) / kBackfillWriteChunkRows;
-  const size_t mid = chunks / 2 * kBackfillWriteChunkRows;
-  HeliosProxy lower_conn(server_connection_host(), server_connection_port());
-  std::atomic<bool> commit_failed{false};
-  std::thread lower(commit_range, std::ref(lower_conn),
-                    std::cref(db_table_name), std::cref(index_name),
-                    std::cref(entries), 0, mid, false, std::ref(commit_failed));
-  commit_range(proxy, db_table_name, index_name, entries, mid, entries.size(),
-               true, commit_failed);
-  lower.join();
-  return !commit_failed.load(std::memory_order_relaxed);
+  for (size_t i = 0; i < keys.size(); ++i) {
+    auto &index_entries = entries[i];
+    const std::string index_name(keys[i]->name);
+    std::sort(index_entries.begin(), index_entries.end());
+    const size_t chunks =
+        (index_entries.size() + kBackfillWriteChunkRows - 1) /
+        kBackfillWriteChunkRows;
+    const size_t mid = chunks / 2 * kBackfillWriteChunkRows;
+    HeliosProxy lower_conn(server_connection_host(), server_connection_port());
+    std::atomic<bool> commit_failed{false};
+    std::thread lower(commit_range, std::ref(lower_conn),
+                      std::cref(db_table_name), std::cref(index_name),
+                      std::cref(index_entries), 0, mid, false,
+                      std::ref(commit_failed));
+    commit_range(proxy, db_table_name, index_name, index_entries, mid,
+                 index_entries.size(), true, commit_failed);
+    lower.join();
+    if (commit_failed.load(std::memory_order_relaxed)) {
+      failed_index = index_name;
+      return false;
+    }
+  }
+  return true;
 }
 
 bool ha_helios::inplace_alter_table(TABLE *altered_table,
@@ -533,7 +545,9 @@ bool ha_helios::inplace_alter_table(TABLE *altered_table,
   }
 
   // A unique index is backfilled serially to keep its in-write duplicate
-  // check; a non-unique one is written in stored-key order.
+  // check; non-unique indexes share one scan and are written in stored-key
+  // order.
+  std::vector<const KEY *> keys;
   for (uint i = 0; i < ha_alter_info->index_add_count; i++) {
     const uint key_idx = ha_alter_info->index_add_buffer[i];
     const KEY *key_info = &ha_alter_info->key_info_buffer[key_idx];
@@ -574,22 +588,26 @@ bool ha_helios::inplace_alter_table(TABLE *altered_table,
       }
     }
 
-    // Register the index; fail closed on error. On a multi-index ALTER a later
-    // failure leaves earlier backfilled indexes on the server (the DD rollback
-    // hides them), and nothing purges them.
+    // Register the index; fail closed on error. A later failure in a
+    // multi-index ALTER leaves the registered indexes on the server, filled or
+    // not (the DD rollback hides them), and nothing purges them.
     if (!proxy->db_create_secondary_index(
             db_table_name, index_name, index_type,
             key_pack::pk_slices(*altered_table, *runtime_key))) {
       return alter_fail("the storage server refused index " + index_name);
     }
 
-    bool ok;
     if (index_type == kUniqueSecondaryIndex) {
-      ok = backfill_unique_serial(index_name, *runtime_key);
+      if (!backfill_unique_serial(index_name, *runtime_key)) {
+        return alter_fail("backfill of index " + index_name + " failed");
+      }
     } else {
-      ok = backfill_sorted(index_name, *runtime_key);
+      keys.push_back(runtime_key);
     }
-    if (!ok) return alter_fail("backfill of index " + index_name + " failed");
+  }
+  std::string failed_index;
+  if (!keys.empty() && !backfill_sorted(keys, failed_index)) {
+    return alter_fail("backfill of index " + failed_index + " failed");
   }
 
   // An empty commit under the server's contract covers every backfill commit
