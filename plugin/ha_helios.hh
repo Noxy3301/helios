@@ -743,8 +743,8 @@ private:
    * key (secondary key, then primary key) in memory. Commits one index after
    * another, in bounded chunks from the middle outward: the upper half
    * ascending on this handler's connection, the lower half descending on a
-   * second connection. The scan and the lower half run on threads of their
-   * own, joined before return.
+   * second connection. The scan, each index's sort and the lower half run on
+   * threads of their own, joined before return.
    *
    * @param keys Nonempty set of registered runtime keys, valid through return.
    * @param failed_index On failure, the index whose commit fails, or the first

@@ -484,13 +484,21 @@ bool ha_helios::backfill_sorted(const std::vector<const KEY *> &keys,
   if (scan.valid()) scan.wait();
   if (failed) return false;
 
+  // Each index's entries sort on their own thread.
+  std::vector<std::thread> sorters;
+  for (auto &index_entries : entries) {
+    sorters.emplace_back([&index_entries] {
+      std::sort(index_entries.begin(), index_entries.end());
+    });
+  }
+  for (auto &sorter : sorters) sorter.join();
+
   // Masstree splits a full leaf in the middle unless the new key lands before
   // the first or past the last key of its layer. The halves split at a chunk
   // boundary and grow outward from it, each on its own connection.
   for (size_t i = 0; i < keys.size(); ++i) {
     auto &index_entries = entries[i];
     const std::string index_name(keys[i]->name);
-    std::sort(index_entries.begin(), index_entries.end());
     const size_t chunks =
         (index_entries.size() + kBackfillWriteChunkRows - 1) /
         kBackfillWriteChunkRows;
