@@ -307,6 +307,9 @@ message TxCommit {
         repeated WriteEntry writes = 3;  // in the order the query layer issued them
         repeated SecondaryIndexEntry secondary_index_ops = 4;
         repeated TableRowDelta row_deltas = 5;
+        // Acknowledge at precommit, as the Async contract does, whatever
+        // contract the server runs under
+        bool async_durability = 6;
     }
     message Response {
         bool committed = 1;

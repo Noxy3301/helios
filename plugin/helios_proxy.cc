@@ -369,7 +369,8 @@ bool HeliosProxy::tx_commit(
     const std::vector<std::pair<std::string, int64_t>>& row_deltas,
     std::string* abort_detail,
     bool* duplicate_key,
-    bool* transport_error) {
+    bool* transport_error,
+    bool async_durability) {
     if (abort_detail != nullptr) abort_detail->clear();
     if (duplicate_key != nullptr) *duplicate_key = false;
     if (transport_error != nullptr) *transport_error = false;
@@ -441,6 +442,7 @@ bool HeliosProxy::tx_commit(
         rd->set_table_name(table);
         rd->set_delta(delta);
     }
+    request.set_async_durability(async_durability);
 
     Helios::Protocol::Response reply;
     if (!send_request(envelope, reply)) {
