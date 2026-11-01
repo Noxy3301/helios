@@ -155,7 +155,7 @@ int ha_helios::write_row(uchar *buf) {
   // probed before the first write of the row is buffered.
   std::vector<std::string> secondary_keys(table->s->keys);
   for (uint i = 0; i < table->s->keys; i++) {
-    if (i == table->s->primary_key) continue;
+    if (key_pack::same_as_primary(*table->s, i)) continue;
     const auto &key_info = table->key_info[i];
 
     secondary_keys[i] = build_secondary_key_from_row(buf, key_info);
@@ -184,7 +184,7 @@ int ha_helios::write_row(uchar *buf) {
                    !insert_can_replace_ || !replaced_existing_row, column_mask);
 
   for (uint i = 0; i < table->s->keys; i++) {
-    if (i == table->s->primary_key) continue;
+    if (key_pack::same_as_primary(*table->s, i)) continue;
     const auto &key_info = table->key_info[i];
 
     if (replaced_existing_row) {
@@ -262,7 +262,7 @@ int ha_helios::update_row(const uchar *old_data, uchar *new_data) {
   std::vector<std::string> old_keys(table->s->keys);
   std::vector<std::string> new_keys(table->s->keys);
   for (uint i = 0; i < table->s->keys; i++) {
-    if (i == table->s->primary_key) {
+    if (key_pack::same_as_primary(*table->s, i)) {
       continue;
     }
     const auto &key_info = table->key_info[i];
@@ -309,7 +309,8 @@ int ha_helios::update_row(const uchar *old_data, uchar *new_data) {
   }
 
   for (uint i = 0; i < table->s->keys; i++) {
-    if (i == table->s->primary_key || (!moved && old_keys[i] == new_keys[i])) {
+    if (key_pack::same_as_primary(*table->s, i) ||
+        (!moved && old_keys[i] == new_keys[i])) {
       continue;
     }
 
@@ -358,7 +359,7 @@ int ha_helios::delete_row(const uchar *buf) {
 
   for (uint i = 0; i < table->s->keys; i++) {
     auto key_info = table->key_info[i];
-    if (i != table->s->primary_key) {
+    if (!key_pack::same_as_primary(*table->s, i)) {
       std::string secondary_key = build_secondary_key_from_row(buf, key_info);
 
       tx->buffer_delete_secondary_index(db_table_name, key_info.name,

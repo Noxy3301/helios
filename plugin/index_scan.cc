@@ -4,6 +4,7 @@
 #include <string>
 #include <utility>
 
+#include "key_pack.hh"
 #include "prefetch.hh"
 #include "my_dbug.h"
 #include "sql/key.h"
@@ -343,14 +344,15 @@ int ha_helios::index_last(uchar *buf) {
   // unbounded MAX reaches it straight from the optimizer), so cache the
   // index tail fetch on demand. A secondary tail walks the index cursor
   // instead.
-  if (active_index == table->s->primary_key) {
+  const bool primary = key_pack::same_as_primary(*table->s, active_index);
+  if (primary) {
     if (int err = maybe_prefetch_for_index_tail(ha_thd(), tx, db_table_name,
                                                 INDEX_CURSOR_BATCH_SIZE)) {
       return err;
     }
   }
 
-  if (active_index == table->s->primary_key) {
+  if (primary) {
     index_cursor_active_ = true;
     index_cursor_reverse_ = true;
     index_cursor_secondary_ = false;

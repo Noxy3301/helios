@@ -214,7 +214,7 @@ void ha_helios::build_search_plan(const uchar *key, key_part_map keypart_map,
   reset_index_search_buffers();
 
   // 2. Extract basic information
-  current_plan_.is_primary = (active_index == table->s->primary_key);
+  current_plan_.is_primary = key_pack::same_as_primary(*table->s, active_index);
   current_plan_.find_flag = find_flag;
 
   // HA_WHOLE_KEY support

@@ -342,7 +342,7 @@ int ha_helios::create(const char *table_name, TABLE *table, HA_CREATE_INFO *,
     auto key_info = table->key_info[i];
     uint index_type =
         (key_info.flags & HA_NOSAME) ? kUniqueSecondaryIndex : 0;
-    if (i != table->s->primary_key &&
+    if (!key_pack::same_as_primary(*table->s, i) &&
         !proxy->db_create_secondary_index(
             db_table_name, std::string(key_info.name), index_type,
             key_pack::pk_slices(*table, key_info))) {
@@ -562,6 +562,12 @@ bool ha_helios::inplace_alter_table(TABLE *altered_table,
     }
     if (runtime_key == nullptr) {
       return alter_fail("index " + index_name + " is not in the altered table");
+    }
+    // The primary index holds every entry of an index that packs to the
+    // primary key, so the storage gets no index for it.
+    if (key_pack::same_as_primary(*altered_table->s,
+                                  runtime_key - altered_table->key_info)) {
+      continue;
     }
 
     // Helios treats a packed NULL key as a duplicate, but SQL allows many
