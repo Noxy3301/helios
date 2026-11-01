@@ -4,6 +4,8 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <functional>
+#include <future>
 #include <string>
 #include <utility>
 #include <vector>
@@ -410,13 +412,28 @@ bool ha_helios::backfill_sorted(const std::string &index_name,
   // One stored key (secondary key, then primary key) per row, with the
   // secondary key's length.
   std::vector<std::pair<std::string, size_t>> entries;
+  // The next chunk's scan runs on this handler's connection while this thread
+  // builds the keys of the current one.
+  HeliosProxy &proxy = *get_proxy();
   std::vector<HeliosProxy::ScanRow> rows;
+  std::vector<HeliosProxy::ScanRow> next_rows;
   std::string start;
+  std::future<bool> scan = std::async(std::launch::async, backfill_scan,
+                                      std::ref(proxy), std::cref(db_table_name),
+                                      std::ref(start), std::ref(next_rows));
   bool failed = false;
-  do {
-    if (!backfill_scan(*get_proxy(), db_table_name, start, rows)) {
+  bool more = true;
+  while (!failed && more) {
+    if (!scan.get()) {
       failed = true;
       break;
+    }
+    rows.swap(next_rows);
+    more = rows.size() == kBackfillScanRows;
+    if (more) {
+      scan = std::async(std::launch::async, backfill_scan, std::ref(proxy),
+                        std::cref(db_table_name), std::ref(start),
+                        std::ref(next_rows));
     }
     for (auto &row : rows) {
       const auto *value = reinterpret_cast<const std::byte *>(row.value.data());
@@ -430,8 +447,9 @@ bool ha_helios::backfill_sorted(const std::string &index_name,
       key += row.key;
       entries.emplace_back(std::move(key), sk_len);
     }
-  } while (!failed && rows.size() == kBackfillScanRows);
+  }
   blobroot.Clear();
+  if (scan.valid()) scan.wait();
   if (failed) return false;
 
   // Masstree splits a full leaf in the middle unless the new key lands past
