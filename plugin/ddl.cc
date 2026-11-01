@@ -38,11 +38,13 @@ constexpr uint64_t kBackfillScanRows = 4096;
 // Widest payload a PAX cell holds. A column needing more has no home.
 constexpr uint32_t kMaxCellBytes = 2048;
 
-// Ships the buffered writes as one commit (no reads to validate).
+// Ships the buffered writes as one commit (no reads to validate) that skips
+// the durability wait; inplace_alter_table waits once for all of them.
 bool commit_ops(HeliosProxy &conn, std::vector<HeliosProxy::WriteOp> &chunk) {
   if (chunk.empty()) return true;
   std::string reason;
-  const bool ok = conn.tx_commit({}, {}, chunk, {}, &reason);
+  const bool ok =
+      conn.tx_commit({}, {}, chunk, {}, &reason, nullptr, nullptr, true);
   chunk.clear();
   return ok;
 }
@@ -485,8 +487,8 @@ bool ha_helios::inplace_alter_table(TABLE *altered_table,
     }
   }
 
-  // A unique index keeps the buffered commit path (its in-write duplicate
-  // check); a non-unique one is written in stored-key order.
+  // A unique index is backfilled serially to keep its in-write duplicate
+  // check; a non-unique one is written in stored-key order.
   for (uint i = 0; i < ha_alter_info->index_add_count; i++) {
     const uint key_idx = ha_alter_info->index_add_buffer[i];
     const KEY *key_info = &ha_alter_info->key_info_buffer[key_idx];
@@ -545,6 +547,13 @@ bool ha_helios::inplace_alter_table(TABLE *altered_table,
     if (!ok) return alter_fail("backfill of index " + index_name + " failed");
   }
 
+  // An empty commit under the server's contract covers every backfill commit
+  // above: under Sync it waits until an epoch at or above all of theirs is
+  // durable.
+  if (ha_alter_info->index_add_count != 0 &&
+      !proxy->tx_commit({}, {}, {}, {})) {
+    return alter_fail("the backfilled indexes could not be made durable");
+  }
   return false;
 }
 
