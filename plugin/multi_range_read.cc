@@ -4,6 +4,7 @@
 #include <utility>
 #include <vector>
 
+#include "key_pack.hh"
 #include "prefetch.hh"
 #include "sql/table.h"
 
@@ -23,7 +24,7 @@ ha_rows ha_helios::multi_range_read_info_const(
 
   // Primary-key ranges advertise the batch read; the row path also replaces
   // the cost. Under read plans multi_range_read_init() checks the range count.
-  if (!use_default && keyno == table->s->primary_key) {
+  if (!use_default && key_pack::same_as_primary(*table->s, keyno)) {
     *flags &= ~HA_MRR_USE_DEFAULT_IMPL;
     *bufsz = 0;
     if (cost && !use_plan) {
@@ -44,7 +45,7 @@ ha_rows ha_helios::multi_range_read_info(uint keyno, uint n_ranges,
                                                 flags, cost);
   // Primary-key ranges advertise the batch read; the row path also replaces
   // the cost. Under read plans multi_range_read_init() checks the range count.
-  if (!use_default && keyno == table->s->primary_key) {
+  if (!use_default && key_pack::same_as_primary(*table->s, keyno)) {
     *flags &= ~HA_MRR_USE_DEFAULT_IMPL;
     *bufsz = 0;
     if (cost && !use_plan) {
@@ -74,7 +75,7 @@ int ha_helios::multi_range_read_init(RANGE_SEQ_IF *seq, void *seq_init_param,
     if (tx->is_aborted()) {
       return abort_errno(tx);
     }
-    if (active_index != table->s->primary_key || n_ranges <= 1) {
+    if (!key_pack::same_as_primary(*table->s, active_index) || n_ranges <= 1) {
       mrr_use_batch_ = false;
       mrr_buffer_.clear();
       mrr_buffer_pos_ = 0;

@@ -100,15 +100,39 @@ class Database {
   /**
    * @brief Declares a secondary index on a table.
    *
-   * @return true when the index exists with `index_type` afterwards, whether
-   * this call declared it or an earlier one did; false when the table does
-   * not exist, the name is empty, an index of that name holds another
-   * constraint, `index_type` is not one of the declared values, or the
-   * catalog write of a new declaration fails.
+   * @param pk_slices For a non-unique index whose secondary key holds
+   * primary-key columns: the (offset, length) of each primary-key part in a
+   * record's key, in primary-key order. The key is then the secondary key
+   * followed by the primary-key parts it lacks. Empty when the key is the
+   * secondary key followed by the whole primary key.
+   * @return true when the index exists with `index_type` and `pk_slices`
+   * afterwards, whether this call declared it or an earlier one did; false
+   * when the table does not exist, the name is empty, an index of that name
+   * was declared otherwise, `index_type` is not one of the declared values,
+   * `pk_slices` is odd or given for a UNIQUE index, or the catalog write of a
+   * new declaration fails.
    */
   bool CreateSecondaryIndex(const std::string_view table_name,
                             const std::string_view index_name,
-                            IndexConstraint index_type);
+                            IndexConstraint index_type,
+                            std::vector<uint32_t> pk_slices = {});
+
+  /**
+   * @brief Drops secondary indexes of a table and frees their memory.
+   *
+   * @details One catalog write removes every named index the table holds; a
+   * name it does not hold is skipped. Lookups stop finding the indexes, then
+   * the call waits until no thread can hold them and frees their records,
+   * leaving their Masstree nodes allocated. A later commit that names a
+   * dropped index in a range or a write aborts. Call outside any
+   * transaction; the call leaves the calling thread inside its Masstree
+   * epoch, which the RPC reply releases.
+   *
+   * @return false, dropping nothing, when the table does not exist or the
+   * catalog write fails.
+   */
+  bool DropSecondaryIndexes(const std::string_view table_name,
+                            const std::vector<std::string> &index_names);
 
   bool HasTable(const std::string_view table_name);
 
@@ -141,6 +165,9 @@ class Database {
    * `field_max_bytes`, or a width that is not the one that type stores.
    * @param[in] field_scale Per-field DECIMAL scale, used by kDecimal64. Empty,
    * or a length that does not match, means a scale of zero.
+   * @param[in] field_not_null Per-field NOT NULL. A typed field declared NOT
+   * NULL is stored without a cell length and refuses an empty value. Empty, or
+   * a length that does not match, leaves every field nullable.
    * @return true when the schema is installed for the table.
    * @return false if the table is missing, the definition is empty or
    * conflicts, or the catalog cannot be saved.
@@ -148,7 +175,8 @@ class Database {
   bool InstallPaxSchema(const std::string_view table_name,
                         const std::vector<uint32_t> &field_max_bytes,
                         const std::vector<pax::FieldType> &field_type = {},
-                        const std::vector<int8_t> &field_scale = {});
+                        const std::vector<int8_t> &field_scale = {},
+                        const std::vector<bool> &field_not_null = {});
 
   /**
    * @brief Returns the PAX table installed for `table_name`.
@@ -273,10 +301,10 @@ class Database {
    * base row carries its TID for revalidation as a point read.
    *
    * A UNIQUE index keys a record by its secondary key. Any other index keys
-   * one record per pair by the secondary key followed by the primary key, so
-   * the range orders pairs: a bound past a secondary key is its prefix
-   * successor, and a reverse scan returns one secondary key's primary keys
-   * in descending order.
+   * one record per (secondary key, primary key) as the secondary key followed
+   * by the primary-key parts it lacks, so the range is ordered by both: a
+   * bound past a secondary key is its prefix successor, and a reverse scan
+   * returns one secondary key's primary keys in descending order.
    *
    * @param table_name Base table.
    * @param index_name Secondary index name.
@@ -383,6 +411,9 @@ class Database {
   wal::EpochScanCheckpoint scan_checkpoint_;
   // Serializes definition changes: index creation and the catalog rewrite
   std::mutex ddl_mutex_;
+  // The id the next index declaration takes; guarded by ddl_mutex_ and
+  // persisted with the catalog.
+  uint32_t next_index_id_ = 1;
   index::Reaper reaper_;
   // Each worker remembers the last TID it chose for this database.
   ThreadKeyStorage<Tidword> last_commit_tids_;
@@ -414,8 +445,11 @@ class Database {
   std::function<void(EpochNumber)> MakeEpochHook();
 
   /**
-   * @brief Replays WAL records into the indexes and resumes the global epoch.
-   * @note Refuses startup if a table or secondary index cannot be restored.
+   * @brief Replays the checkpoint and the WAL into the indexes, one batch of
+   * records at a time, and resumes the global epoch.
+   * @details A secondary write whose index id the catalog does not hold
+   * belongs to a dropped index and is skipped.
+   * @note Refuses startup if a table cannot be restored.
    */
   void Recover();
 };

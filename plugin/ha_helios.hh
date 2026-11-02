@@ -581,6 +581,16 @@ public:
                            const dd::Table *old_table_def,
                            dd::Table *new_table_def) override;
 
+  /**
+   * @brief Drop the indexes an in-place ALTER TABLE removes, once it commits.
+   *
+   * A rolled-back ALTER drops nothing.
+   */
+  bool commit_inplace_alter_table(TABLE *altered_table,
+                                  Alter_inplace_info *ha_alter_info,
+                                  bool commit, const dd::Table *old_table_def,
+                                  dd::Table *new_table_def) override;
+
   THR_LOCK_DATA **store_lock(
       THD *thd, THR_LOCK_DATA **to,
       enum thr_lock_type lock_type) override; ///< required
@@ -635,7 +645,6 @@ private:
   static bool statement_uses_read_plan(THD *thd);
   static std::string server_connection_host();
   static int server_connection_port();
-  HeliosTransaction *new_transaction(THD *thd);
   HeliosTransaction *active_transaction(THD *thd) const;
   /**
    * @brief The THD's transaction, created on first handler access.
@@ -702,8 +711,7 @@ private:
   std::string pack_key(const uchar *key, key_part_map keypart_map);
   /**
    * @brief Packs the field's current value as key part `kp` in the
-   * order-preserving key packing (null marker, type tag, payload) shared by
-   * every key path.
+   * order-preserving key packing shared by every key path.
    */
   std::string pack_key_from_field(const KEY_PART_INFO &kp, Field *field);
   std::string build_secondary_key_from_row(const uchar *row_buffer, const KEY &key_info);
@@ -719,37 +727,32 @@ private:
   std::string extract_key_from_mysql(const uchar *row_buffer);
 
   /**
-   * @brief Commit one CREATE INDEX backfill chunk in its own transaction.
+   * @brief Backfill one unique secondary index serially.
    *
-   * @details Backfill may touch every row in the table. Chunking keeps each OCC
-   * transaction bounded while preserving the normal secondary-index write path.
-   * `ops` is cleared before return.
-   */
-  bool backfill_commit_chunk(std::vector<HeliosProxy::WriteOp> &ops);
-
-  /**
-   * @brief Backfill the indexes in `specs` from one chunk of rows in one
-   * unpack pass, committed on per-key-hash workers so no two of them mutate
-   * the same index entry.
-   *
-   * @param conns One slot per worker. An empty slot is connected on first use
-   *   and kept for the next chunk.
-   * @return false when any worker commit fails; the caller fails the ALTER.
-   */
-  bool backfill_indexes_parallel(
-      std::vector<HeliosProxy::ScanRow> &rows,
-      const std::vector<std::pair<std::string, const KEY *>> &specs,
-      std::vector<std::unique_ptr<HeliosProxy>> &conns);
-
-  /**
-   * @brief Backfill one unique secondary index serially via the write buffer.
-   *
-   * @details Scans the table and commits in bounded chunks, keeping the
-   * buffered commit path so the server's in-write duplicate check runs.
+   * @details Scans the table and commits in bounded chunks on this handler's
+   * connection, so the server's in-write duplicate check runs.
    * Returns false on any failure; the caller fails the ALTER.
    */
   bool backfill_unique_serial(const std::string &index_name,
                               const KEY &runtime_key);
+
+  /**
+   * @brief Backfill non-unique secondary indexes from one table scan.
+   *
+   * @details Decodes each row once and sorts each index's entries by stored
+   * key (secondary key, then primary key) in memory. Commits one index after
+   * another, in bounded chunks from the middle outward: the upper half
+   * ascending on this handler's connection, the lower half descending on a
+   * second connection. The scan, each index's sort and the lower half run on
+   * threads of their own, joined before return.
+   *
+   * @param keys Nonempty set of registered runtime keys, valid through return.
+   * @param failed_index On failure, the index whose commit fails, or the first
+   *   index for a shared scan or decode failure.
+   * @return False on any failure; the caller fails the ALTER.
+   */
+  bool backfill_sorted(const std::vector<const KEY *> &keys,
+                       std::string &failed_index);
 
   void set_write_buffer(uchar *buf);
   bool is_primary_key_exists();

@@ -3,6 +3,7 @@
  * Column definitions survive restart and put recovered values back in PAX.
  */
 
+#include <cstdio>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -15,6 +16,7 @@
 #include "db_helper.h"
 #include "gtest/gtest.h"
 #include "pax/catalog.h"
+#include "pax/table.h"
 
 namespace {
 
@@ -221,6 +223,54 @@ TEST_F(PaxRecoveryTest, KeepsUnpackedValuesSeparateAcrossWritesAndRecovery) {
     EXPECT_EQ(TestHelper::ReadRow(db, "t", "a").value(), last);
     EXPECT_EQ(TestHelper::ReadRow(db, "t", "b").value(), second);
   }
+}
+
+// `count` rows keyed from `first`, each holding `len` bytes of `fill`.
+std::vector<TestHelper::RowWrite> StringRows(int first, int count, size_t len,
+                                             char fill) {
+  std::vector<TestHelper::RowWrite> rows;
+  for (int i = first; i < first + count; i++) {
+    char key[16];
+    std::snprintf(key, sizeof(key), "k%06d", i);
+    rows.push_back({"t", key, std::string(len, fill)});
+  }
+  return rows;
+}
+
+// The cell width of the group holding `key`, read through a PAX scan.
+uint32_t CellWidth(Database &db, const std::string &key) {
+  const auto scan = db.ScanPax("t", key, key + '\0', 0, false);
+  db.ReleaseThreadEpoch();
+  if (scan.rows.size() != 1) return 0;
+  return static_cast<const pax::PaxGroup *>(scan.rows[0].group)
+      ->layout()
+      .cell_bytes[1];
+}
+
+// Replay places each recovered row in the size class of its final value,
+// including the row a long update moved.
+TEST_F(PaxRecoveryTest, RestoresRowsIntoTheirSizeClasses) {
+  constexpr int kRows = pax::PaxGroup::kRows;
+  {
+    Database db(config_);
+    ASSERT_TRUE(TestHelper::CreateTable(db, "t", 200));
+    ASSERT_TRUE(TestHelper::CommitWrites(db, StringRows(0, kRows, 10, 'a')));
+    ASSERT_TRUE(TestHelper::CommitWrites(db, StringRows(kRows, 8, 10, 'b')));
+    ASSERT_TRUE(
+        TestHelper::CommitWrites(db, StringRows(kRows + 3, 1, 150, 'c')));
+    EXPECT_EQ(db.GetPaxTable("t")->moves(), 1u);
+  }
+  Database db(config_);
+  auto *store = db.GetPaxTable("t");
+  ASSERT_NE(store, nullptr);
+  EXPECT_EQ(pax::Group(store, 0)->layout().cell_bytes[1], 200u);
+  EXPECT_EQ(TestHelper::Read(db, "t", "k000000").value(), std::string(10, 'a'));
+  EXPECT_EQ(TestHelper::Read(db, "t", "k008194").value(), std::string(10, 'b'));
+  EXPECT_EQ(TestHelper::Read(db, "t", "k008195").value(),
+            std::string(150, 'c'));
+  EXPECT_EQ(CellWidth(db, "k000000"), 16u);
+  EXPECT_EQ(CellWidth(db, "k008194"), 16u);
+  EXPECT_EQ(CellWidth(db, "k008195"), 160u);
 }
 
 TEST_F(PaxRecoveryTest, IgnoresAnInterruptedWorkingFile) {

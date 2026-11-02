@@ -40,9 +40,6 @@ public:
   const std::pair<const std::byte *const, const size_t> read(
       std::string key, uint64_t column_mask = 0);
   std::vector<std::pair<bool, std::string>> batch_read(const std::vector<std::string>& keys);
-  // Buffer ops built elsewhere (the DDL backfill); the commit installs them.
-  void buffer_writes(const std::string& table_name,
-                     const std::vector<HeliosProxy::WriteOp>& ops);
   // served_truncated, when given, lets a cached range that holds only the
   // first rows serve an unlimited request; it is set when the result is a
   // partial scan result and the caller has to fetch the rest.
@@ -300,7 +297,7 @@ private:
   std::unordered_map<std::string, std::vector<size_t>> secondary_scan_start_index_;
   void push_range_scan_cache(RangeScanCacheEntry entry);
   void push_secondary_scan_cache(SecondaryScanCacheEntry entry);
-  // Keep the rows (pairs) the request's bounds cover, and the visited records
+  // Keep the rows the request's bounds cover, and the visited records
   // inside them. The parallel arrays are appended together at every push
   // site, so they are the same length.
   static void trim_range_entry(RangeScanCacheEntry& entry,

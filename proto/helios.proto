@@ -30,6 +30,7 @@ message Request {
         DbCreateSecondaryIndex.Request db_create_secondary_index = 10;
         DbAllocateHiddenKeys.Request db_allocate_hidden_keys = 11;
         DbSetCommitDurability.Request db_set_commit_durability = 12;
+        DbDropSecondaryIndexes.Request db_drop_secondary_indexes = 13;
     }
 }
 
@@ -55,10 +56,11 @@ message Response {
         DbCreateSecondaryIndex.Response db_create_secondary_index = 10;
         DbAllocateHiddenKeys.Response db_allocate_hidden_keys = 11;
         DbSetCommitDurability.Response db_set_commit_durability = 12;
+        DbDropSecondaryIndexes.Response db_drop_secondary_indexes = 13;
     }
 
     // Why the request was refused before any handler ran.
-    string error = 13;
+    string error = 14;
 }
 
 // Why the server refused a transaction, where the query layer has to tell the
@@ -94,8 +96,13 @@ message RangeRecord {
 // Optimizer statistics: row counts and index NDV.
 message GetTableStats {
     message IndexDesc {
-        string index_name = 1; // Empty means primary index.
-        uint32 num_key_parts = 2; // Number of leading key parts to measure.
+        // Empty means primary index.
+        string index_name = 1;
+        // Leading key parts NDV counts; 0 skips NDV.
+        uint32 num_key_parts = 2;
+        // Bytes of each fixed-width leading key part. NDV and the histogram,
+        // which splits on the first part, find part ends only from these.
+        repeated uint32 part_widths = 3;
     }
     message Request {
         string ndv_table = 1; // Table to compute NDV for; empty means row counts only.
@@ -300,6 +307,9 @@ message TxCommit {
         repeated WriteEntry writes = 3;  // in the order the query layer issued them
         repeated SecondaryIndexEntry secondary_index_ops = 4;
         repeated TableRowDelta row_deltas = 5;
+        // Acknowledge at precommit, as the Async contract does, whatever
+        // contract the server runs under
+        bool async_durability = 6;
     }
     message Response {
         bool committed = 1;
@@ -372,6 +382,8 @@ message DbCreateTable {
         repeated uint32 pax_field_kind = 3 [packed = true];
         // DECIMAL scale per typed field, 0 elsewhere.
         repeated int32 pax_field_scale = 4 [packed = true];
+        // NOT NULL per width entry; a typed NOT NULL field has no cell length.
+        repeated bool pax_field_not_null = 5 [packed = true];
     }
     message Response {
         bool success = 1;
@@ -380,11 +392,27 @@ message DbCreateTable {
 
 // Create a secondary index on a table.
 // @param index_type  0 = IndexConstraint::kNone, 1 = IndexConstraint::kUnique
+// @param pk_slices   (offset, length) of each primary-key part in a
+//                    non-unique record's key, when the secondary key holds
+//                    primary-key columns.
 message DbCreateSecondaryIndex {
     message Request {
         string table_name = 1;
         string index_name = 2;
         uint32 index_type = 3;
+        repeated uint32 pk_slices = 4;
+    }
+    message Response {
+        bool success = 1;
+    }
+}
+
+// Drop secondary indexes of a table, all or none, and free their records; a
+// name the table does not hold is skipped.
+message DbDropSecondaryIndexes {
+    message Request {
+        string table_name = 1;
+        repeated string index_names = 2;
     }
     message Response {
         bool success = 1;

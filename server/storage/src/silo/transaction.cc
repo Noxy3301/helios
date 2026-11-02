@@ -25,14 +25,15 @@ namespace silo {
 
 namespace {
 
-Tidword PublishedTid(Tidword commit_tid, const DataItem &item) {
+template <typename Record>
+Tidword PublishedTid(Tidword commit_tid, const Record &item) {
   commit_tid.absent = !item.IsLive();
   return commit_tid;
 }
 
 // Upper bounds on the msgpack bytes a record adds around its strings: the
 // record, epoch and write-list headers, and per write its array header, five
-// string headers, the TID, index type, key list and op.
+// string headers, the TID, index id, key list and op.
 constexpr size_t kLogRecordFraming = 11;
 constexpr size_t kLogWriteFraming = 44;
 
@@ -41,7 +42,7 @@ constexpr size_t kLogWriteFraming = 44;
 void pack_write(msgpack::packer<wal::PackedLogRecord> &pk, std::string_view key,
                 std::string_view buffer, Tidword tid,
                 std::string_view table_name, std::string_view index_name,
-                uint32_t index_type, wal::SecondaryIndexOp op,
+                uint32_t index_id, wal::SecondaryIndexOp op,
                 std::string_view primary_key) {
   pk.pack_array(9);
   pk.pack(key);
@@ -49,7 +50,7 @@ void pack_write(msgpack::packer<wal::PackedLogRecord> &pk, std::string_view key,
   pk.pack(tid);
   pk.pack(table_name);
   pk.pack(index_name);
-  pk.pack(index_type);
+  pk.pack(index_id);
   pk.pack_array(0);
   pk.pack(op);
   pk.pack(primary_key);
@@ -122,7 +123,7 @@ bool Transaction::Write(std::string_view table_name, std::string_view key,
   auto &index = table->GetPrimaryIndex();
   // An inserted key is usually new.
   const bool expect_new = op == RowOp::kInsert;
-  DataItem *item = index.GetOrInsert(key, expect_new);
+  IndexRecord *item = index.GetOrInsert(key, expect_new);
   const std::string_view bytes =
       op == RowOp::kDelete ? std::string_view() : row_bytes;
   auto entry = write_set_.find(item);
@@ -168,26 +169,40 @@ bool Transaction::IndexWrite(std::string_view table_name,
     reason = "secondary_index_missing";
     return false;
   }
+  // Readers cut the primary key out of the tree key by the slices.
+  if (!index->pk_slices.empty()) {
+    size_t len = 0;
+    for (size_t i = 1; i < index->pk_slices.size(); i += 2)
+      len += index->pk_slices[i];
+    if (primary_key.size() != len) {
+      reason = "primary_key_slices_mismatch";
+      return false;
+    }
+  }
   // A UNIQUE index keeps one record per secondary key, the lock its check
   // runs under. A non-unique one keeps one record per (secondary key, primary
-  // key), under the two concatenated.
-  std::string composite;
+  // key), under join_entry of the two.
+  std::string tree_key;
   std::string_view key = secondary_key;
   if (index->constraint != IndexConstraint::kUnique) {
-    if (secondary_key.size() + primary_key.size() > index::kMaxKeyLength) {
+    tree_key = index::join_entry(*index, secondary_key, primary_key);
+    if (tree_key.size() > index::kMaxKeyLength) {
       reason = "secondary_key_too_long";
       return false;
     }
-    composite.append(secondary_key).append(primary_key);
-    key = composite;
+    key = tree_key;
   }
   // An added key is usually new.
-  DataItem *item = index->tree.GetOrInsert(key, !remove);
+  IndexRecord *item = index->tree.GetOrInsert(key, !remove);
   auto entry =
       write_set_
-          .try_emplace(
-              item, WriteEntry{table, index_name, secondary_key, &index->tree,
-                               false, IndexUpdate{index->constraint, {}, {}}})
+          .try_emplace(item, WriteEntry{table, index_name, secondary_key,
+                                        &index->tree, false,
+                                        IndexUpdate{index->constraint,
+                                                    index->id,
+                                                    {},
+                                                    {},
+                                                    std::move(tree_key)}})
           .first;
   auto &update = std::get<IndexUpdate>(entry->second.update);
   update.deltas.push_back({primary_key, remove
@@ -252,11 +267,13 @@ bool Transaction::Commit(CommitDurability durability, std::string &reason) {
   }
   commit_tid.latest = true;
 
-  // Reserve every destination before changing the first stored value.
+  // Reserve a slot for every new row before changing the first stored value.
+  // A move allocates its destination inside install.
   for (auto &[item, entry] : write_set_) {
     const auto *row = std::get_if<RowUpdate>(&entry.update);
     if (row == nullptr || row->op == RowOp::kDelete) continue;
-    if (!item->AllocateSlot(*row->store)) {
+    if (!static_cast<RowRecord *>(item)->AllocateSlot(*row->store, row->row,
+                                                      commit_epoch)) {
       reason = "pax_slots_exhausted";
       return Abort();
     }
@@ -313,12 +330,12 @@ bool Transaction::Commit(CommitDurability durability, std::string &reason) {
   return true;
 }
 
-bool Transaction::OwnsLock(DataItem *item) const {
+bool Transaction::OwnsLock(IndexRecord *item) const {
   const auto entry = write_set_.find(item);
   return entry != write_set_.end() && entry->second.owns_lock;
 }
 
-bool Transaction::Lock(DataItem &item, WriteEntry &entry, Tidword &max_tid,
+bool Transaction::Lock(IndexRecord &item, WriteEntry &entry, Tidword &max_tid,
                        std::string &reason) {
   for (;;) {
     Tidword current = item.transaction_id.load();
@@ -356,7 +373,7 @@ bool Transaction::Abort() {
   return false;
 }
 
-bool Transaction::Prepare(DataItem &item, WriteEntry &entry,
+bool Transaction::Prepare(IndexRecord &item, WriteEntry &entry,
                           std::string &reason) {
   if (const auto *row = std::get_if<RowUpdate>(&entry.update)) {
     if (row->check_absent && !item.transaction_id.load().absent) {
@@ -366,28 +383,25 @@ bool Transaction::Prepare(DataItem &item, WriteEntry &entry,
     return true;
   }
 
-  // Apply the request's changes to the list this commit publishes. A pair
-  // holds no list and no constraint.
+  // Apply the request's changes to the key this commit publishes. A
+  // non-unique index record holds no key and no constraint.
   auto &index = std::get<IndexUpdate>(entry.update);
   if (index.constraint != IndexConstraint::kUnique) return true;
-  index.primary_keys = std::atomic_load(&item.primary_keys);
+  const auto &unique = static_cast<UniqueRecord &>(item);
+  if (unique.IsLive()) index.primary_key = unique.primary_key();
   for (const auto &delta : index.deltas) {
     if (delta.op == wal::SecondaryIndexOp::kDelete) {
-      index.primary_keys =
-          PrimaryKeyList::erase(index.primary_keys, delta.primary_key);
+      if (index.primary_key == delta.primary_key) index.primary_key.reset();
       continue;
     }
     // A UNIQUE key holds one primary key; adding that same key again is not
     // a second one.
-    const PrimaryKeyList::View keys(index.primary_keys);
-    if (!keys.empty() &&
-        !(keys.size() == 1 && keys.contains(delta.primary_key))) {
+    if (index.primary_key && *index.primary_key != delta.primary_key) {
       reason =
           std::string(kDuplicateSecondaryKeyAbortPrefix) + "exists_after_lock";
       return false;
     }
-    index.primary_keys =
-        PrimaryKeyList::insert(index.primary_keys, delta.primary_key);
+    index.primary_key = delta.primary_key;
   }
   return true;
 }
@@ -403,7 +417,8 @@ bool Transaction::ValidateReads(Tidword &max_tid, std::string &reason) {
       }
       continue;
     }
-    DataItem *item = table->GetPrimaryIndex().Get(read.key);
+    auto *item =
+        static_cast<RowRecord *>(table->GetPrimaryIndex().Get(read.key));
     // A key with no record reads as the absent word.
     const Tidword current =
         item ? item->transaction_id.load() : Tidword::Absent();
@@ -419,11 +434,12 @@ bool Transaction::ValidateReads(Tidword &max_tid, std::string &reason) {
           !current.absent &&  // the row exists now,
           current.latest &&   // is still the key's record,
           !read.tid.absent;   // and existed when read
+      const pax::PaxGroup *group =
+          maskable ? item->pax_address().group : nullptr;
       bool held =
-          maskable &&
+          group != nullptr &&
           // no install since changed or assigned a used field or the null flags
-          item->pax_group()->max_column_tid(read.column_mask | 1) <=
-              read.tid.obj;
+          group->max_column_tid(read.column_mask | 1) <= read.tid.obj;
       // The word unchanged across both loads means no install came between.
       if (held) {
         std::atomic_thread_fence(std::memory_order_acquire);
@@ -462,7 +478,7 @@ bool Transaction::RevalidateRange(const RangeEntry &range, Tidword &max_tid) {
   uint64_t live = 0;
   bool matches = true;
   // Match each record the re-scan reaches, up to its limit-th live row.
-  auto match_key = [&](std::string_view key, DataItem &item) {
+  auto match_key = [&](std::string_view key, IndexRecord &item) {
     const Tidword tid = item.transaction_id.load();
     if (!match_record(range, row, visited, key, &item, tid, false, max_tid)) {
       matches = false;
@@ -492,40 +508,35 @@ bool Transaction::RevalidateSecondaryRange(const RangeEntry &range,
   size_t visited = 0;
   uint64_t live = 0;
   bool matches = true;
-  auto match_entry = [&](std::string_view key, DataItem &) {
+  auto match_entry = [&](std::string_view key, IndexRecord &) {
     // Find the current entry; the item supplied by the scan may be stale.
-    DataItem *item = index->tree.Get(key);
+    IndexRecord *item = index->tree.Get(key);
     if (item == nullptr) return false;
 
-    // The key list and a pair's length are separate loads; abort if the word
+    // The primary key and the word are separate loads; abort if the word
     // moved around them.
     const Tidword tid = item->transaction_id.load();
-    PrimaryKeyList::Ptr primary_keys;
-    if (index->constraint == IndexConstraint::kUnique)
-      primary_keys = std::atomic_load(&item->primary_keys);
-    const size_t pk_len = item->pk_len();
+    const std::string primary_key =
+        index::split_entry(*index, key, *item).second;
     if (item->transaction_id.load() != tid ||
         !match_record(range, row, visited, key, item, tid, true, max_tid)) {
       matches = false;
       return true;
     }
 
-    // The entry's word fixes its primary keys, so its base records follow in
+    // The entry's word fixes its primary key, so its base record follows in
     // order. A missing base record reads as no record, as the scan skipped it.
     if (tid.absent) return false;
-    return for_each_primary_key(
-        key, pk_len, primary_keys, [&](std::string_view primary_key) {
-          DataItem *base = table->GetPrimaryIndex().Get(primary_key);
-          if (base == nullptr) return false;
-          const Tidword base_tid = base->transaction_id.load();
-          if (!match_record(range, row, visited, primary_key, base, base_tid,
-                            false, max_tid)) {
-            matches = false;
-            return true;
-          }
-          if (!base_tid.absent) ++live;
-          return range.limit > 0 && live >= range.limit;
-        });
+    IndexRecord *base = table->GetPrimaryIndex().Get(primary_key);
+    if (base == nullptr) return false;
+    const Tidword base_tid = base->transaction_id.load();
+    if (!match_record(range, row, visited, primary_key, base, base_tid, false,
+                      max_tid)) {
+      matches = false;
+      return true;
+    }
+    if (!base_tid.absent) ++live;
+    return range.limit > 0 && live >= range.limit;
   };
 
   if (range.reverse) {
@@ -539,7 +550,7 @@ bool Transaction::RevalidateSecondaryRange(const RangeEntry &range,
 
 bool Transaction::match_record(const RangeEntry &range, size_t &row,
                                size_t &visited, std::string_view key,
-                               DataItem *item, Tidword tid, bool entry,
+                               IndexRecord *item, Tidword tid, bool entry,
                                Tidword &max_tid) const {
   if (tid.lock) {
     if (!OwnsLock(item)) return false;
@@ -568,9 +579,10 @@ bool Transaction::match_record(const RangeEntry &range, size_t &row,
   return true;
 }
 
-Tidword Transaction::Apply(DataItem &item, const WriteEntry &entry,
+Tidword Transaction::Apply(IndexRecord &record, const WriteEntry &entry,
                            Tidword commit_tid) {
   if (const auto *row = std::get_if<RowUpdate>(&entry.update)) {
+    auto &item = static_cast<RowRecord &>(record);
     if (row->op == RowOp::kDelete) {
       item.DeleteRow(commit_tid.epoch);
       return PublishedTid(commit_tid, item);
@@ -583,19 +595,24 @@ Tidword Transaction::Apply(DataItem &item, const WriteEntry &entry,
     // null-flag change fails every older masked read in the group. The raise
     // precedes Publish, so a validator that loads the new word sees it.
     if (inserted) fields = 1;
-    item.pax_group()->update_max_column_tid(fields, commit_tid.obj);
+    item.pax_address().group->update_max_column_tid(fields, commit_tid.obj);
     return PublishedTid(commit_tid, item);
   }
   const auto &index = std::get<IndexUpdate>(entry.update);
   if (index.constraint == IndexConstraint::kUnique) {
-    std::atomic_store(&item.primary_keys, index.primary_keys);
+    auto &item = static_cast<UniqueRecord &>(record);
+    item.set_primary_key(index.primary_key);
     return PublishedTid(commit_tid, item);
   }
 
-  // A pair holds no list; its last delta decides whether it is present.
+  // A non-unique index record holds no key; its last delta decides whether it
+  // is present.
   const auto &last = index.deltas.back();
   commit_tid.absent = last.op == wal::SecondaryIndexOp::kDelete;
-  if (!commit_tid.absent) item.set_pk_len(last.primary_key.size());
+  if (!commit_tid.absent) {
+    static_cast<NonUniqueRecord &>(record).set_pk_len(index.tree_key.size() -
+                                                      entry.key.size());
+  }
   return commit_tid;
 }
 
@@ -613,26 +630,23 @@ void Transaction::AppendLog(msgpack::packer<wal::PackedLogRecord> &pk,
   const auto &index = std::get<IndexUpdate>(entry.update);
   for (const auto &delta : index.deltas) {
     pack_write(pk, entry.key, {}, published, table_name, entry.index_name,
-               static_cast<uint32_t>(index.constraint), delta.op,
-               delta.primary_key);
+               index.index_id, delta.op, delta.primary_key);
   }
 }
 
-void Transaction::Publish(DataItem &item, WriteEntry &entry,
+void Transaction::Publish(IndexRecord &item, WriteEntry &entry,
                           Tidword published) {
   item.transaction_id.store(published);
   entry.owns_lock = false;
   if (!published.absent) return;
 
-  // A non-unique record sits under its secondary key and its one primary key.
+  // A non-unique index record sits under its tree key.
   const auto *index = std::get_if<IndexUpdate>(&entry.update);
   if (index == nullptr || index->constraint == IndexConstraint::kUnique) {
     reaper_.Enqueue(*entry.index, entry.key, item, published);
     return;
   }
-  std::string key(entry.key);
-  key += index->deltas.front().primary_key;
-  reaper_.Enqueue(*entry.index, key, item, published);
+  reaper_.Enqueue(*entry.index, index->tree_key, item, published);
 }
 
 }  // namespace silo

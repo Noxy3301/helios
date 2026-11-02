@@ -228,8 +228,9 @@ bool append_bound_keypart(
     return false;
   }
 
+  // A bound part takes a NOT NULL INT's four packed bytes.
   Field *target_field = target->key_info[ref->key].key_part[keypart_idx].field;
-  if (!is_int32_key_field(target_field)) {
+  if (!is_int32_key_field(target_field) || target_field->is_nullable()) {
     return false;
   }
 
@@ -267,10 +268,10 @@ bool append_bound_keypart(
     binding.from_key = true;
     uint offset = 0;
     for (int i = 0; i < pk_pos; ++i) {
-      offset += 4 + source_key.key_part[i].length;
+      offset += source_key.key_part[i].length;
     }
     binding.source_offset = offset;
-    binding.source_length = 4 + source_key.key_part[pk_pos].length;
+    binding.source_length = source_key.key_part[pk_pos].length;
   } else {
     if (!is_int32_key_field(source_field)) {
       return false;
@@ -313,7 +314,7 @@ bool compile_index_range_scan(AccessPath *leaf, TABLE *table,
   step->is_scan = true;
   // Ask for the canonical forward, unbounded shape; MySQL applies ORDER BY /
   // LIMIT / WHERE above and the consumer requests the same shape.
-  if (range_scan.index != table->s->primary_key) {
+  if (!key_pack::same_as_primary(*table->s, range_scan.index)) {
     step->index_name = table->key_info[range_scan.index].name;
   }
 
@@ -367,7 +368,7 @@ bool use_full_range(TABLE *table, const Index_lookup *ref,
   step->is_scan = true;
   step->key_prefix.clear();
   step->end_key_prefix = key_pack::scan_end_sentinel();
-  if (ref->key == static_cast<int>(table->s->primary_key)) {
+  if (key_pack::same_as_primary(*table->s, ref->key)) {
     step->index_name.clear();
   } else {
     step->index_name = table->key_info[ref->key].name;
@@ -586,8 +587,7 @@ bool compile_ref_lookup(
     return false;
   }
 
-  const bool child_primary =
-      ref->key == static_cast<int>(table->s->primary_key);
+  const bool child_primary = key_pack::same_as_primary(*table->s, ref->key);
   const uint child_pk_parts =
       table->s->primary_key != MAX_KEY
           ? table->key_info[table->s->primary_key].user_defined_key_parts
@@ -664,8 +664,7 @@ bool compile_leaf(AccessPath *leaf,
     }
     const bool primary_order =
         full_scan_index < 0 ||
-        (table->s->primary_key != MAX_KEY &&
-         full_scan_index == static_cast<int>(table->s->primary_key));
+        key_pack::same_as_primary(*table->s, full_scan_index);
     step->is_scan = true;
     step->key_prefix.clear();
     step->end_key_prefix = key_pack::scan_end_sentinel();
@@ -688,7 +687,7 @@ void set_scan(HeliosProxy::ReadPlanStep *step, TABLE *table, uint index,
   step->is_scan = true;
   step->key_prefix = start;
   step->end_key_prefix = end.empty() ? key_pack::scan_end_sentinel() : end;
-  if (index != table->s->primary_key) {
+  if (!key_pack::same_as_primary(*table->s, index)) {
     step->index_name = table->key_info[index].name;
   }
 }
@@ -705,7 +704,7 @@ bool compile_index_search(TABLE *table, uint index,
     return false;
   }
 
-  const bool is_primary = index == table->s->primary_key;
+  const bool is_primary = key_pack::same_as_primary(*table->s, index);
   if (search.is_primary != is_primary) {
     return false;
   }
@@ -851,7 +850,7 @@ bool compile_unqualified_count(
     if (count_index >= table->s->keys) {
       return false;
     }
-    if (count_index != table->s->primary_key) {
+    if (!key_pack::same_as_primary(*table->s, count_index)) {
       index_name = table->key_info[count_index].name;
     }
   }

@@ -5,7 +5,9 @@
 #define HELIOS_KEY_PACK_HH
 
 #include <cstddef>
+#include <cstdint>
 #include <string>
+#include <vector>
 
 #include "field_types.h"
 #include "helios_field_types.h"
@@ -16,6 +18,7 @@ class Field;
 class KEY_PART_INFO;
 class KEY;
 struct TABLE;
+struct TABLE_SHARE;
 
 constexpr unsigned char kKeyMarkerNotNull = 0x00;
 constexpr unsigned char kKeyMarkerNull = 0x01;
@@ -35,8 +38,20 @@ std::string pack_int_key(const uchar *data, size_t len);
 std::string pack_datetime_key(const uchar *data, size_t len,
                               enum_field_types mysql_type);
 
-void append_key_part(std::string &out, bool is_null, HeliosFieldType type,
-                     const std::string &payload);
+/**
+ * @brief The width of a key part packed as its payload alone.
+ *
+ * @details A NOT NULL integer, DATE, DATETIME or TIMESTAMP part has a width
+ * the schema fixes, so it needs no null marker, type or length to sort and to
+ * stay apart from the next part. Every other part keeps them.
+ *
+ * @param kp The key part.
+ * @return The part's width in bytes, or 0 when it keeps the header.
+ */
+std::size_t raw_part_width(const KEY_PART_INFO &kp);
+
+void append_key_part(std::string &out, const KEY_PART_INFO &kp, bool is_null,
+                     HeliosFieldType type, const std::string &payload);
 std::string build_prefix_range_end(const std::string &prefix);
 
 /**
@@ -59,23 +74,54 @@ std::string string_weights(const KEY_PART_INFO &kp, const uchar *s, size_t len);
 /**
  * @brief Whether an index entry exceeds kMaxKeyLength.
  *
- * @details A UNIQUE index stores the secondary key alone, any other index the
- * secondary key followed by the primary key.
+ * @details A UNIQUE index stores the secondary key alone, any other index at
+ * most the secondary key followed by the primary key.
  *
  * @param key_info      The index the entry belongs to.
  * @param secondary_key The entry's packed secondary key.
  * @param primary_key   The packed primary key of its row.
- * @return True when the stored entry would be longer than kMaxKeyLength.
+ * @return True when the stored entry could be longer than kMaxKeyLength.
  */
 bool index_key_too_long(const KEY &key_info, const std::string &secondary_key,
                         const std::string &primary_key);
 
-// "+infinity" end for an unbounded-upper range scan. 16 0xFF bytes sort after
-// every key (real keys start with the 0x00/0x01 null marker). An empty end will
-// not do: the server reads an empty plan-step end as a single-key range, and
-// the read-plan compiler and the consumer must pack identical bytes for the
-// cache to match.
-constexpr std::size_t kScanEndSentinelSize = 16;
+/**
+ * @brief Where a non-unique index record's key holds the primary key.
+ *
+ * @details The storage keys a record by the secondary key followed by the
+ * primary-key parts the secondary key does not hold. When every part of both
+ * keys has a raw_part_width and the secondary key holds a primary-key part,
+ * the key's layout is fixed and the result locates each primary-key part in
+ * it; otherwise the storage appends the whole primary key.
+ *
+ * @param table The table, whose primary key the records point at.
+ * @param key   The secondary index.
+ * @return (offset, length) of each primary-key part in the record's key, in
+ *         primary-key order; empty for a UNIQUE index, a table without a
+ *         primary key, or a layout that is not fixed.
+ */
+std::vector<uint32_t> pk_slices(const TABLE &table, const KEY &key);
+
+/**
+ * @brief Whether an index packs to exactly the primary key.
+ *
+ * @details True for the primary key and for a UNIQUE index over the same
+ * columns, in the same order and with the same lengths and flags. The storage
+ * holds no index for the latter: the primary index serves its reads and its
+ * uniqueness.
+ *
+ * @param share The table's share.
+ * @param index Index number in `share`.
+ * @return True when the primary index serves `index`.
+ */
+bool same_as_primary(const TABLE_SHARE &share, uint index);
+
+// "+infinity" end for an unbounded-upper range scan. It is one 0xFF byte longer
+// than the longest key, so it sorts after every key. An empty end will not do:
+// the server reads an empty plan-step end as a single-key range, and the
+// read-plan compiler and the consumer must pack identical bytes for the cache
+// to match.
+constexpr std::size_t kScanEndSentinelSize = kMaxKeyLength + 1;
 inline std::string scan_end_sentinel() {
   return std::string(kScanEndSentinelSize, '\xff');
 }

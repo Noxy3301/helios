@@ -28,7 +28,8 @@ namespace pax {
  * layer wrote, unchanged. A typed field stores the value as a fixed-width
  * little-endian binary payload of `field_max_bytes[f]` bytes (4 or 8). A
  * typed cell's u16 length prefix is 0 for SQL NULL and the binary width for a
- * present value. unpack_row converts input bytes before the commit protocol;
+ * present value; the cell of a typed field declared NOT NULL has no prefix.
+ * unpack_row converts input bytes before the commit protocol;
  * ScatterRow writes the unpacked cells without reparsing.
  * GatherRow reconstructs the original field bytes from the typed cells.
  */
@@ -60,10 +61,12 @@ inline uint32_t PackLength(FieldType type) {
  * @brief Describes the row format fields a PAX-enabled table stores in strips.
  *
  * @details A row is one null-flags field followed by one field per column;
- * PaxGroup uses the maximum payload byte widths here to split it into
- * fixed-width cells. UNTYPED cells store `[u16 len][payload up to
- * field_max_bytes]`; typed cells store `[u16 len][fixed-width LE binary]`
- * with `field_max_bytes` equal to the binary width (4/8).
+ * PaxGroup splits it into fixed-width cells. UNTYPED cells store `[u16
+ * len][payload up to the group's capacity]`, a capacity of at most
+ * `field_max_bytes`; typed cells store `[u16 len][fixed-width LE binary]`
+ * with `field_max_bytes` equal to the binary width (4/8), or the binary alone
+ * for a field declared NOT NULL. A field of width 0, such as the null-flags
+ * field when MySQL reserves no null byte, is always empty and has no strip.
  */
 struct TableSchema {
   // Max payload bytes per field, starting with the null-flags field.
@@ -73,6 +76,9 @@ struct TableSchema {
   std::vector<FieldType> field_type;
   // Per-field DECIMAL scale for kDecimal64 (else 0). Same length when present.
   std::vector<int8_t> field_scale;
+  // Per-field NOT NULL as the query layer declared it. Empty => every field
+  // may be NULL. Same length when present.
+  std::vector<bool> field_not_null;
 
   size_t field_count() const { return field_max_bytes.size(); }
 
@@ -99,6 +105,17 @@ struct TableSchema {
   int scale_of(size_t f) const {
     return f < field_scale.size() ? field_scale[f] : 0;
   }
+
+  /**
+   * @brief Returns whether the cells of field `f` carry a length prefix.
+   *
+   * @details A typed field declared NOT NULL has none: each of its cells
+   * holds the full binary width, and unpack_row refuses an empty value for it.
+   */
+  bool has_len(size_t f) const {
+    return type_of(f) == FieldType::kUntyped || f >= field_not_null.size() ||
+           !field_not_null[f];
+  }
 };
 
 class PaxTable;
@@ -109,13 +126,17 @@ struct GroupImageState;  // pax/epoch_image_buffer.h
  * @brief Stores a fixed-size row group as per-field PAX strips.
  *
  * @details Each logical row occupies the same slot number in every field
- * strip. The row's bytes are stored in the strip cells; `DataItem` continues
+ * strip. The row's bytes are stored in the strip cells; `RowRecord` continues
  * to own the transaction id word, so Silo validation remains outside this
  * storage class. Callers invoke `ScatterRow()` only while holding the row's
  * existing Silo TID lock. `GatherRow()` is memory-safe under a concurrent
  * scatter to the same slot, and callers reject torn rows with the normal TID
  * re-check. Strip-direct readers resolve a concurrent writer through the
  * images and the preserve counter declared below.
+ *
+ * Each group belongs to one size class of its table: every UNTYPED cell is
+ * `min(declared width, class width)` wide and never changes. A row that
+ * outgrows its class moves to a group of a wider class.
  */
 class PaxGroup {
  public:
@@ -129,13 +150,71 @@ class PaxGroup {
   static constexpr uint32_t kVisibilityWordBits = 64;
 
   /**
-   * @brief Creates an empty group whose strips are sized from `schema`.
+   * @brief Where a group's strips live: the arena, each field's payload
+   *        capacity and each strip's offset.
+   *
+   * @details Fixed for the life of the group; writers change only the
+   * cells. A reader takes base, stride and capacity from the same Layout, so
+   * a length it clamps never reaches past the strip it reads.
+   */
+  struct Layout {
+    // Allocates a zeroed arena, so every cell starts empty.
+    Layout(const TableSchema &schema, std::vector<uint32_t> widths);
+
+    std::vector<uint32_t> cell_bytes;  // payload capacity per field
+    std::vector<uint32_t> len_bytes;   // kCellLenBytes, or 0 without a length
+    std::vector<size_t> strip_offset;
+    std::unique_ptr<std::byte[]> arena;
+
+    uint32_t stride(size_t field) const {
+      return len_bytes[field] + cell_bytes[field];
+    }
+
+    const std::byte *strip(size_t field) const {
+      return arena.get() + strip_offset[field];
+    }
+
+    /**
+     * @brief Returns a memory-safe view of one cell payload.
+     *
+     * @details Verbatim bytes for an UNTYPED cell, little-endian binary for a
+     * typed one. This does not reformat a typed cell into row-format bytes;
+     * GatherRow does.
+     *
+     * @param field Field index, where 0 is the null-flags field and MySQL
+     * column i is field `i + 1`.
+     * @param slot Slot inside the group.
+     */
+    std::string_view cell(size_t field, uint32_t slot) const {
+      if (stride(field) == 0) return {};
+      const std::byte *base =
+          strip(field) + static_cast<size_t>(stride(field)) * slot;
+      if (len_bytes[field] == 0) {
+        return std::string_view(reinterpret_cast<const char *>(base),
+                                cell_bytes[field]);
+      }
+      uint16_t len;
+      std::memcpy(&len, base, sizeof(len));
+      if (len > cell_bytes[field]) len = 0;
+      return std::string_view(
+          reinterpret_cast<const char *>(base) + kCellLenBytes, len);
+    }
+  };
+
+  /**
+   * @brief Creates an empty group with the given cell capacities.
    *
    * @param schema Table schema owned by `PaxTable`; must outlive this group.
    * @param table Table whose column statistics this group's writes feed;
    * it owns this group and outlives it.
+   * @param cell_bytes Payload capacity per field, each at most
+   * `schema.field_max_bytes`; a typed field takes exactly its width.
+   * @param index Position of this group in the table's directory.
+   * @param size_class Size class of the table this group belongs to.
    */
-  PaxGroup(const TableSchema &schema, PaxTable &table);
+  PaxGroup(const TableSchema &schema, PaxTable &table,
+           std::vector<uint32_t> cell_bytes, uint32_t index,
+           uint32_t size_class);
 
   /**
    * @brief Drops the images this group published and detaches its state.
@@ -152,10 +231,17 @@ class PaxGroup {
    * bytes must remain unchanged until the call finishes.
    * @param compare The slot holds a row: leave a cell whose length and bytes
    * already match untouched.
-   * @return Fields whose cells changed, bit `min(f, 63)` for field `f`; every
-   * bit when `compare` is false.
+   * @param changed Set to the fields whose cells changed, bit `min(f, 63)`
+   * for field `f`; every bit when `compare` is false.
+   * @return false, with nothing written, when an UNTYPED payload is longer
+   * than its cell; the caller moves the row to a wider size class.
    */
-  uint64_t ScatterRow(uint32_t slot, const Row &row, bool compare);
+  bool ScatterRow(uint32_t slot, const Row &row, bool compare,
+                  uint64_t &changed);
+
+  const Layout &layout() const { return layout_; }
+  uint32_t index() const { return index_; }
+  uint32_t size_class() const { return size_class_; }
 
   /**
    * @brief Raises the column TID of every bucket `fields` names to `tid`
@@ -187,7 +273,7 @@ class PaxGroup {
    *
    * @param slot Source slot inside this group.
    * @param dst Destination buffer with room for `expected_size` bytes.
-   * @param expected_size Row payload length tracked in `DataItem::size()`.
+   * @param expected_size Row payload length tracked in `RowRecord::size()`.
    * @return Number of bytes written, equal to `expected_size` when the slot is
    * quiet and the stored row is intact.
    */
@@ -206,33 +292,6 @@ class PaxGroup {
            1u;
   }
 
-  /**
-   * @brief Returns a memory-safe view of one cell payload.
-   *
-   * @details Verbatim bytes for an UNTYPED cell, little-endian binary for a
-   * typed one. This does not reformat a typed cell into row-format bytes;
-   * GatherRow does.
-   *
-   * @param field Field index, where 0 is the null-flags field and MySQL column
-   * i is field `i + 1`.
-   * @param slot Slot inside this group.
-   */
-  std::string_view cell(size_t field, uint32_t slot) const {
-    const std::byte *base = arena_.get() + strip_offset_[field] +
-                            static_cast<size_t>(stride_[field]) * slot;
-    uint16_t len;
-    std::memcpy(&len, base, sizeof(len));
-    if (len > schema_.field_max_bytes[field]) len = 0;
-    return std::string_view(
-        reinterpret_cast<const char *>(base) + kCellLenBytes, len);
-  }
-
-  const std::byte *strip(size_t field) const {
-    return arena_.get() + strip_offset_[field];
-  }
-
-  uint32_t stride(size_t field) const { return stride_[field]; }
-
   const TableSchema &schema() const { return schema_; }
 
   // This group's epoch image state, published by the first preserve and never
@@ -243,9 +302,9 @@ class PaxGroup {
  private:
   const TableSchema &schema_;  // Owned by PaxTable; outlives all groups.
   PaxTable &table_;            // Owns this group and outlives it.
-  std::vector<uint32_t> stride_;
-  std::vector<size_t> strip_offset_;
-  std::unique_ptr<std::byte[]> arena_;
+  const Layout layout_;
+  const uint32_t index_;
+  const uint32_t size_class_;
   // Slot visibility flags for strip-direct scans.
   std::unique_ptr<std::atomic<uint64_t>[]> visible_;
   // One per column-mask bit: the largest commit TID word of an install in this
@@ -270,7 +329,7 @@ PaxGroup *Group(const PaxTable *store, size_t idx);
 uint64_t SlotsAllocated(const PaxTable *store);
 
 /**
- * @brief Returns the number of row groups that may contain allocated slots.
+ * @brief Returns the number of groups in the table's directory.
  */
 size_t GroupCount(const PaxTable *store);
 

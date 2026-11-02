@@ -26,7 +26,10 @@
 
 #include <algorithm>
 #include <chrono>
+#include <memory>
 #include <mutex>
+#include <string>
+#include <vector>
 
 #include "helios/config.h"
 
@@ -35,8 +38,167 @@
 #include "pax/catalog.h"
 #include "util/spdlog.h"
 #include "wal/flush_trace.h"
-#include "wal/log_entry.h"
 namespace helios::storage {
+
+namespace {
+
+// Orders TID words by epoch and tid, leaving out the status bits.
+uint64_t tid_order(Tidword tid) { return tid.obj >> 3; }
+
+// Applies one primary key joining or leaving a secondary entry. Of two
+// writes with one TID, the later wins.
+void replay_secondary(index::SecondaryIndex &index, const std::string &key,
+                      std::string_view primary_key, Tidword tid, bool insert) {
+  // A UNIQUE entry holds the primary key its newest commit left, under the
+  // word of the newest insert.
+  if (index.constraint == IndexConstraint::kUnique) {
+    auto *item = static_cast<UniqueRecord *>(index.tree.Get(key));
+    if (item != nullptr &&
+        tid_order(tid) < tid_order(item->transaction_id.load())) {
+      return;
+    }
+    if (!insert) {
+      // Leaving a key the entry does not hold changes nothing.
+      if (item == nullptr || item->primary_key() != primary_key) return;
+      index.tree.Remove(key);
+      return;
+    }
+    if (item == nullptr)
+      item = static_cast<UniqueRecord *>(index.tree.GetOrInsert(key, true));
+    item->set_primary_key(primary_key);
+    tid.absent = false;
+    item->transaction_id.store(tid);
+    return;
+  }
+
+  // A non-unique index record is present exactly when its newest write adds
+  // it. Its key is join_entry of the two, and its pk_len the length that key
+  // adds past the secondary key.
+  const std::string record_key = index::join_entry(index, key, primary_key);
+  IndexRecord *item = index.tree.Get(record_key);
+  if (item != nullptr &&
+      tid_order(tid) < tid_order(item->transaction_id.load())) {
+    return;
+  }
+  if (!insert) {
+    if (item != nullptr) index.tree.Remove(record_key);
+    return;
+  }
+  if (item == nullptr) item = index.tree.GetOrInsert(record_key, true);
+  static_cast<NonUniqueRecord *>(item)->set_pk_len(record_key.size() -
+                                                   key.size());
+  tid.absent = false;
+  item->transaction_id.store(tid);
+}
+
+/**
+ * @brief Applies one batch of records to the indexes: every secondary entry,
+ *        and each primary key's newest TID word.
+ *
+ * @details Writes run in TID order. After the checkpoint each batch holds one
+ * epoch, in ascending order, so only a checkpoint word can be newer than a
+ * write applied after it. A delete, or an entry left without primary keys, is
+ * unlinked and freed at once: no later write is older, and nothing else
+ * reaches the indexes yet. Rows wait for replay_rows.
+ *
+ * @param[in,out] highest_epoch Raised to the epoch of every write.
+ */
+void replay_keys(TableDictionary &tables, const wal::LogRecords &records,
+                 EpochNumber &highest_epoch) {
+  std::vector<const wal::LogRecord::Write *> writes;
+  for (const auto &record : records) {
+    for (const auto &write : record.writes) writes.push_back(&write);
+  }
+  std::stable_sort(
+      writes.begin(), writes.end(), [](const auto *lhs, const auto *rhs) {
+        return tid_order(lhs->transaction_id) < tid_order(rhs->transaction_id);
+      });
+
+  for (const auto *write : writes) {
+    Table *table = tables.GetTable(write->table_name);
+    if (table == nullptr || table->GetPaxTable() == nullptr) {
+      SPDLOG_CRITICAL("Recovery failed: PAX schema for table {0} is missing.",
+                      write->table_name);
+      exit(EXIT_FAILURE);
+    }
+    const Tidword tid = write->transaction_id;
+    highest_epoch = std::max<EpochNumber>(highest_epoch, tid.epoch);
+
+    // A primary key keeps its newest write's word; of two with one TID, the
+    // first.
+    if (write->index_name.empty()) {
+      auto &tree = table->GetPrimaryIndex();
+      auto *item = static_cast<RowRecord *>(tree.Get(write->key));
+      if (item != nullptr &&
+          tid_order(tid) <= tid_order(item->transaction_id.load())) {
+        continue;
+      }
+      if (tid.absent) {
+        if (item != nullptr) tree.Remove(write->key);
+        continue;
+      }
+      if (item == nullptr)
+        item = static_cast<RowRecord *>(tree.GetOrInsert(write->key, true));
+      item->transaction_id.store(tid);
+      continue;
+    }
+
+    // An index dropped since, or an earlier one of the same name, has an id
+    // the catalog no longer holds; its writes are skipped.
+    index::SecondaryIndex *index = table->GetSecondaryIndex(write->index_name);
+    if (index == nullptr || index->id != write->index_id) continue;
+    // A checkpoint's list counts as one insert per primary key it holds.
+    if (write->secondary_op == wal::SecondaryIndexOp::kFull) {
+      for (const auto &primary_key : write->primary_keys)
+        replay_secondary(*index, write->key, primary_key, tid, true);
+    } else {
+      replay_secondary(*index, write->key, write->secondary_primary_key, tid,
+                       write->secondary_op == wal::SecondaryIndexOp::kInsert);
+    }
+  }
+}
+
+/**
+ * @brief Installs the rows of one batch whose words replay_keys kept.
+ *
+ * @details A row takes its value from the first write carrying the kept word,
+ * and a slot of the size class that value needs.
+ */
+void replay_rows(TableDictionary &tables, const wal::LogRecords &records) {
+  for (const auto &record : records) {
+    for (const auto &write : record.writes) {
+      if (!write.index_name.empty()) continue;
+      Table *table = tables.GetTable(write.table_name);
+      auto *item =
+          static_cast<RowRecord *>(table->GetPrimaryIndex().Get(write.key));
+      if (item == nullptr) continue;
+
+      pax::PaxTable &store = *table->GetPaxTable();
+      const Tidword tid = item->transaction_id.load();
+      if (item->size() != 0 ||
+          tid_order(write.transaction_id) != tid_order(tid)) {
+        continue;
+      }
+      pax::Row row;
+      if (!pax::unpack_row(
+              store.schema(),
+              reinterpret_cast<const std::byte *>(write.buffer.data()),
+              write.buffer.size(), row)) {
+        SPDLOG_CRITICAL("Recovery failed: value of {} in {} does not fit PAX",
+                        write.key, write.table_name);
+        exit(EXIT_FAILURE);
+      }
+      if (!item->AllocateSlot(store, row, tid.epoch)) {
+        SPDLOG_CRITICAL("Recovery failed: no PAX slot for {} in {}", write.key,
+                        write.table_name);
+        exit(EXIT_FAILURE);
+      }
+      item->InstallRow(row, tid.epoch);
+    }
+  }
+}
+
+}  // namespace
 
 Database::Database() : Database(Config()) {}
 
@@ -72,6 +234,7 @@ Database::Database(const Config &config)
                     catalog.detail);
     exit(EXIT_FAILURE);
   }
+  next_index_id_ = catalog.next_index_id;
   for (auto &[name, definition] : catalog.entries) {
     CreateTable(name);
     Table *table = GetTable(name);
@@ -82,7 +245,8 @@ Database::Database(const Config &config)
     // Declare the indexes before replay: one with no surviving record has to
     // carry its constraint too.
     for (const auto &index : definition.indexes) {
-      if (!table->CreateSecondaryIndex(index.name, index.constraint)) {
+      if (!table->CreateSecondaryIndex(index.name, index.constraint, index.id,
+                                       index.pk_slices)) {
         SPDLOG_CRITICAL("Cannot restore secondary index {} of table {}",
                         index.name, name);
         exit(EXIT_FAILURE);
@@ -110,7 +274,7 @@ Database::Database(const Config &config)
   }
 
   // The replay enrolled this thread in the Masstree epoch; leaving it lets
-  // the nodes the replay retired be reclaimed.
+  // other threads reclaim what they retire.
   index::release_thread_epoch();
 
   // Abort the process if the running logger cannot persist its records.
@@ -162,9 +326,9 @@ std::function<void(EpochNumber)> Database::MakeEpochHook() {
       reaper_.Purge(closed_epoch);
     }
 
-    // Tick masstree's epoch, which paces only the RCU freeing of retired
-    // leaves and DataItems, at most once per epoch duration however often
-    // requests advance E. Workers leave it through ReleaseThreadEpoch.
+    // Tick masstree's epoch, which paces only RCU frees of retired leaves,
+    // index records and UNIQUE key blocks, at most once per epoch duration
+    // however often requests advance E; workers leave via ReleaseThreadEpoch.
     const auto now = std::chrono::steady_clock::now();
     if (now - last_tick >= interval) {
       last_tick = now;
@@ -179,11 +343,17 @@ bool Database::CreateTable(const std::string_view table_name) {
 
 bool Database::CreateSecondaryIndex(const std::string_view table_name,
                                     const std::string_view index_name,
-                                    IndexConstraint index_type) {
+                                    IndexConstraint index_type,
+                                    std::vector<uint32_t> pk_slices) {
   // A value the wire carried that is neither of the declared ones names a
   // promise this storage does not know how to keep.
   if (index_type != IndexConstraint::kNone &&
       index_type != IndexConstraint::kUnique) {
+    return false;
+  }
+  // Only a non-unique record's key holds slices, each an offset and a length.
+  if (!pk_slices.empty() &&
+      (index_type == IndexConstraint::kUnique || pk_slices.size() % 2 != 0)) {
     return false;
   }
   // An empty index name marks a primary record in the WAL
@@ -195,12 +365,60 @@ bool Database::CreateSecondaryIndex(const std::string_view table_name,
   // A query node that declares an index the storage already holds gets the
   // answer the declaration deserves: the same constraint, or a refusal.
   if (auto *existing = table->GetSecondaryIndex(index_name)) {
-    return existing->constraint == index_type;
+    return existing->constraint == index_type &&
+           existing->pk_slices == pk_slices;
   }
-  if (!table->CreateSecondaryIndex(index_name, index_type)) return false;
-  // A catalog the definition did not reach would lose the index at the next
-  // startup; the index stays in memory and the caller is refused.
-  return pax::StoreCatalog(config_.work_dir, CatalogSnapshot());
+  // The catalog holds the index before it takes a write, since recovery
+  // replays only the writes of indexes the catalog holds.
+  const uint32_t id = next_index_id_;
+  auto entries = CatalogSnapshot();
+  if (auto it = entries.find(table->Name()); it != entries.end()) {
+    it->second.indexes.push_back(
+        {std::string(index_name), index_type, id, pk_slices});
+  }
+  if (!pax::StoreCatalog(config_.work_dir, entries, id + 1)) return false;
+  next_index_id_ = id + 1;
+  return table->CreateSecondaryIndex(index_name, index_type, id,
+                                     std::move(pk_slices));
+}
+
+bool Database::DropSecondaryIndexes(
+    const std::string_view table_name,
+    const std::vector<std::string> &index_names) {
+  std::vector<std::unique_ptr<Table::IndexNode>> dropped;
+  {
+    std::lock_guard<std::mutex> lk(ddl_mutex_);
+    Table *table = GetTable(table_name);
+    if (table == nullptr) return false;
+    // The catalog loses every named index before lookups stop finding them.
+    auto entries = CatalogSnapshot();
+    if (auto it = entries.find(table->Name()); it != entries.end()) {
+      auto &indexes = it->second.indexes;
+      indexes.erase(std::remove_if(indexes.begin(), indexes.end(),
+                                   [&index_names](const auto &index) {
+                                     return std::count(index_names.begin(),
+                                                       index_names.end(),
+                                                       index.name) != 0;
+                                   }),
+                    indexes.end());
+    }
+    if (!pax::StoreCatalog(config_.work_dir, entries, next_index_id_))
+      return false;
+    for (const auto &name : index_names) {
+      if (auto node = table->UnlinkSecondaryIndex(name))
+        dropped.push_back(std::move(node));
+    }
+  }
+  if (dropped.empty()) return true;
+
+  // A thread finds an index only inside its Masstree epoch, and a commit
+  // queues its tombstones before leaving it.
+  index::synchronize_rcu();
+  for (auto &node : dropped) {
+    reaper_.Forget(node->index.tree);
+    node->index.tree.Destroy();
+  }
+  return true;
 }
 
 Table *Database::GetTable(const std::string_view table_name) const {
@@ -229,93 +447,26 @@ bool Database::WriteCheckpoint(uint64_t *out_version_retries) {
 
 void Database::Recover() {
   SPDLOG_INFO("Start recovery process");
-  auto recovered = logger_.Recover();
+  // The first pass leaves each primary key's newest word and every secondary
+  // entry in the indexes; the second installs only the rows that won.
+  EpochNumber highest_epoch = 1;
+  const auto recovered =
+      logger_.Recover({[this, &highest_epoch](const wal::LogRecords &records) {
+                         replay_keys(table_dictionary_, records, highest_epoch);
+                       },
+                       [this](const wal::LogRecords &records) {
+                         replay_rows(table_dictionary_, records);
+                       }});
   if (recovered.status != wal::Logger::RecoveryStatus::kOk) {
     SPDLOG_CRITICAL(
         "Recovery failed: the write-ahead log could not be read; refusing to "
         "start with an unknown durable state");
     exit(EXIT_FAILURE);
   }
+  SPDLOG_DEBUG("  Durable epoch is resumed from {0}", recovered.durable_epoch);
 
-  const EpochNumber durable_epoch = recovered.durable_epoch;
-  // Refuse before stamping the durable epoch on this thread: the scanner
-  // accepts a last epoch of UINT32_MAX, which is the registry's offline
-  // sentinel. The epochs the records carry are checked again at the end.
-  ResumeEpochAbove(durable_epoch);
-  EpochNumber highest_epoch = std::max<EpochNumber>(1, durable_epoch);
-  SPDLOG_DEBUG("  Durable epoch is resumed from {0}", durable_epoch);
-
-  epoch_framework_.Join();
-  epoch_framework_.SetThreadEpoch(durable_epoch);
-
-  for (auto &entry : recovered.recovery_entries) {
-    // A delete is logged with absent set and must not be re-inserted; a
-    // secondary entry survives recovery only with inserts.
-    if (entry.tid.absent) continue;
-    auto table = GetTable(entry.table_name);
-    if (table == nullptr || table->GetPaxTable() == nullptr) {
-      SPDLOG_CRITICAL("Recovery failed: PAX schema for table {0} is missing.",
-                      entry.table_name);
-      exit(EXIT_FAILURE);
-    }
-
-    highest_epoch = std::max<EpochNumber>(highest_epoch, entry.tid.epoch);
-
-    if (entry.index_name.empty()) {
-      DataItem item;
-      const auto *bytes =
-          reinterpret_cast<const std::byte *>(entry.value.data());
-      pax::Row row;
-      if (!pax::unpack_row(table->GetPaxTable()->schema(), bytes,
-                          entry.value.size(), row)) {
-        SPDLOG_CRITICAL("Recovery failed: value of {} in {} does not fit PAX",
-                        entry.key, entry.table_name);
-        exit(EXIT_FAILURE);
-      }
-      if (!item.AllocateSlot(*table->GetPaxTable())) {
-        SPDLOG_CRITICAL("Recovery failed: no PAX slot for {} in {}", entry.key,
-                        entry.table_name);
-        exit(EXIT_FAILURE);
-      }
-      item.InstallRow(row, entry.tid.epoch);
-      item.transaction_id.store(entry.tid);
-      table->GetPrimaryIndex().Put(entry.key, std::move(item));
-    } else {
-      // Secondary Index recovery
-      index::SecondaryIndex *idx =
-          table->GetOrCreateSecondaryIndex(entry.index_name, entry.index_type);
-      if (idx != nullptr) {
-        SPDLOG_DEBUG(
-            "  Recovery: Secondary index '{0}' restoring key '{1}' with {2} "
-            "primary keys",
-            entry.index_name, entry.key, entry.primary_keys.size());
-        if (idx->constraint == IndexConstraint::kUnique) {
-          DataItem item;
-          item.transaction_id.store(entry.tid);
-          item.set_primary_keys(entry.primary_keys);
-          idx->tree.Put(entry.key, std::move(item));
-        } else {
-          // A non-unique index keeps one record per pair, under the
-          // secondary key followed by the primary key, whose length it keeps.
-          for (const auto &primary_key : entry.primary_keys) {
-            DataItem item;
-            item.transaction_id.store(entry.tid);
-            item.set_pk_len(primary_key.size());
-            idx->tree.Put(entry.key + primary_key, std::move(item));
-          }
-        }
-      } else {
-        SPDLOG_CRITICAL(
-            "Recovery failed: secondary index {0} of table {1} is declared "
-            "with a different constraint than the record restores",
-            entry.index_name, entry.table_name);
-        exit(EXIT_FAILURE);
-      }
-    }
-  }
-  epoch_framework_.Leave();
-
-  const EpochNumber resumed_epoch = ResumeEpochAbove(highest_epoch);
+  const EpochNumber resumed_epoch =
+      ResumeEpochAbove(std::max(highest_epoch, recovered.durable_epoch));
   SPDLOG_DEBUG("  Global epoch is resumed from {0}", resumed_epoch);
   epoch_framework_.SetGlobalEpoch(resumed_epoch);
   SPDLOG_INFO("Finish recovery process");

@@ -165,7 +165,7 @@ bool HeliosProxy::ensure_connected() {
 
 bool HeliosProxy::fetch_table_stats(
     const std::string& ndv_table,
-    const std::vector<std::pair<std::string, uint32_t>>& ndv_indexes,
+    const std::vector<IndexStatsDesc>& ndv_indexes,
     bool force_ndv) {
     if (!ensure_connected()) return false;
 
@@ -174,10 +174,12 @@ bool HeliosProxy::fetch_table_stats(
     if (!ndv_table.empty()) {
         request.set_ndv_table(ndv_table);
         request.set_ndv_force_recompute(force_ndv);
-        for (const auto& [index_name, key_parts] : ndv_indexes) {
+        for (const auto& index : ndv_indexes) {
             auto* desc = request.add_ndv_indexes();
-            desc->set_index_name(index_name);
-            desc->set_num_key_parts(key_parts);
+            desc->set_index_name(index.index_name);
+            desc->set_num_key_parts(index.num_key_parts);
+            desc->mutable_part_widths()->Add(index.part_widths.begin(),
+                                             index.part_widths.end());
         }
     }
 
@@ -367,7 +369,8 @@ bool HeliosProxy::tx_commit(
     const std::vector<std::pair<std::string, int64_t>>& row_deltas,
     std::string* abort_detail,
     bool* duplicate_key,
-    bool* transport_error) {
+    bool* transport_error,
+    bool async_durability) {
     if (abort_detail != nullptr) abort_detail->clear();
     if (duplicate_key != nullptr) *duplicate_key = false;
     if (transport_error != nullptr) *transport_error = false;
@@ -439,6 +442,7 @@ bool HeliosProxy::tx_commit(
         rd->set_table_name(table);
         rd->set_delta(delta);
     }
+    request.set_async_durability(async_durability);
 
     Helios::Protocol::Response reply;
     if (!send_request(envelope, reply)) {
@@ -657,7 +661,8 @@ bool HeliosProxy::db_create_table(
     const std::string& table_name,
     const std::vector<uint32_t>& pax_field_max_bytes,
     const std::vector<uint32_t>& pax_field_kind,
-    const std::vector<int32_t>& pax_field_scale) {
+    const std::vector<int32_t>& pax_field_scale,
+    const std::vector<bool>& pax_field_not_null) {
     if (!ensure_connected()) {
         LOG_ERROR("RPC failed: Not connected to server");
         return false;
@@ -675,6 +680,9 @@ bool HeliosProxy::db_create_table(
     }
     for (const int32_t scale : pax_field_scale) {
         request.add_pax_field_scale(scale);
+    }
+    for (const bool not_null : pax_field_not_null) {
+        request.add_pax_field_not_null(not_null);
     }
 
     Helios::Protocol::Response reply;
@@ -727,9 +735,9 @@ HeliosProxy::HiddenKeyReservation HeliosProxy::db_allocate_hidden_keys(
     return reservation;
 }
 
-bool HeliosProxy::db_create_secondary_index(const std::string& table_name,
-                                                const std::string& index_name,
-                                                uint32_t index_type) {
+bool HeliosProxy::db_create_secondary_index(
+    const std::string& table_name, const std::string& index_name,
+    uint32_t index_type, const std::vector<uint32_t>& pk_slices) {
     if (!ensure_connected()) {
         LOG_ERROR("RPC failed: Not connected to server");
         return false;
@@ -741,6 +749,7 @@ bool HeliosProxy::db_create_secondary_index(const std::string& table_name,
     request.set_table_name(table_name);
     request.set_index_name(index_name);
     request.set_index_type(index_type);
+    request.mutable_pk_slices()->Add(pk_slices.begin(), pk_slices.end());
 
     Helios::Protocol::Response reply;
     if (!send_request(envelope, reply)) {
@@ -750,6 +759,26 @@ bool HeliosProxy::db_create_secondary_index(const std::string& table_name,
     const auto& response = reply.db_create_secondary_index();
 
     return response.success();
+}
+
+bool HeliosProxy::db_drop_secondary_indexes(
+    const std::string& table_name, const std::vector<std::string>& index_names) {
+    if (!ensure_connected()) {
+        LOG_ERROR("RPC failed: Not connected to server");
+        return false;
+    }
+
+    Helios::Protocol::Request envelope;
+    auto& request = *envelope.mutable_db_drop_secondary_indexes();
+    request.set_table_name(table_name);
+    for (const auto& name : index_names) request.add_index_names(name);
+
+    Helios::Protocol::Response reply;
+    if (!send_request(envelope, reply)) {
+        LOG_ERROR("RPC failed: Failed to send message to server");
+        return false;
+    }
+    return reply.db_drop_secondary_indexes().success();
 }
 
 bool HeliosProxy::db_set_commit_durability(

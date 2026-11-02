@@ -21,12 +21,16 @@
 
 namespace helios::storage {
 
-struct DataItem;
+struct RowRecord;
+struct IndexRecord;
 class Table;
 class TableDictionary;
 namespace epoch {
 class Framework;
 }  // namespace epoch
+namespace index {
+struct SecondaryIndex;
+}  // namespace index
 
 namespace wal {
 
@@ -152,13 +156,13 @@ class EpochScanCheckpoint {
 
   static CaptureResult CapturePrimaryRow(const std::string &table_name,
                                          std::string_view key,
-                                         const DataItem &item,
+                                         const RowRecord &item,
                                          LogRecord::Write &out,
                                          uint64_t &retries);
   static CaptureResult CaptureSecondaryEntry(
       const std::string &table_name, const std::string &index_name,
-      uint32_t index_type, std::string_view key, const DataItem &item,
-      LogRecord::Write &out, uint64_t &retries);
+      const index::SecondaryIndex &index, std::string_view key,
+      const IndexRecord &item, LogRecord::Write &out, uint64_t &retries);
   bool CaptureTable(Table &table, LogRecord &record, Stats &stats);
   bool Publish(const LogRecords &records, Stats &stats);
   void Loop();

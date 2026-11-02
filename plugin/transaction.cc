@@ -35,14 +35,6 @@ inline std::string index_scope_key(const std::string& table,
   return k;
 }
 
-// Exclusive upper bound of a prefix range, or the sentinel when the prefix is
-// all 0xff and has no successor.
-std::string prefix_range_end(const std::string& prefix) {
-  std::string end = key_pack::build_prefix_range_end(prefix);
-  if (end.empty()) return key_pack::scan_end_sentinel();
-  return end;
-}
-
 std::string trace_count_event(const char* kind, const std::string& table_name,
                               size_t count) {
   return std::string(kind) + ":" + table_name + ":n=" +
@@ -209,7 +201,7 @@ bool HeliosTransaction::index_key_taken_by_own_write(
 
 void HeliosTransaction::record_index_op(
     const HeliosProxy::WriteOp& op) {
-  // The last op for one (secondary key, primary key) pair decides.
+  // The last op on a secondary key and primary key decides.
   pending_index_entries_[index_scope_key(op.table_name, op.index_name)]
                         [op.secondary_key][op.primary_key] =
       op.type == HeliosProxy::WriteOp::Type::SecondaryIndexWrite;
@@ -492,7 +484,8 @@ void HeliosTransaction::execute_read_plan(
                                 std::move(step_result.visited)};
       push_range_scan_cache(std::move(entry));
     } else {
-      // Keep secondary_keys and primary_keys aligned; lookup walks the pairs.
+      // Keep secondary_keys and primary_keys aligned; lookup walks each
+      // secondary key with its primary key.
       SecondaryScanCacheEntry cached;
       cached.table_name = step.table_name;
       cached.index_name = step.index_name;
@@ -518,22 +511,6 @@ void HeliosTransaction::execute_read_plan(
       push_secondary_scan_cache(std::move(cached));
     }
     step_result = HeliosProxy::ReadPlanStepResult{};
-  }
-}
-
-void HeliosTransaction::buffer_writes(
-    const std::string& table_name,
-    const std::vector<HeliosProxy::WriteOp>& ops) {
-  for (auto op : ops) {
-    if (op.table_name.empty()) op.table_name = table_name;
-    if (op.type == HeliosProxy::WriteOp::Type::Write) {
-      record_write(op.table_name, op.key, true, op.value);
-    } else if (op.type == HeliosProxy::WriteOp::Type::Delete) {
-      record_write(op.table_name, op.key, false, ""); // value unused when not found
-    } else {
-      record_index_op(op);
-    }
-    write_buffer_ops_.push_back(std::move(op));
   }
 }
 
@@ -566,8 +543,8 @@ HeliosTransaction::get_matching_keys_and_values_in_range(std::string start_key,
                                                             bool *served_truncated) {
   if (served_truncated != nullptr) *served_truncated = false;
   if (table_is_not_chosen()) return {};
-  // An empty end is not a range the server answers; real packed keys begin
-  // with a null marker and sort below the sentinel.
+  // An empty end is not a range the server answers; every stored key is
+  // shorter than the sentinel and sorts below it.
   if (end_key.empty()) end_key = key_pack::scan_end_sentinel();
 
   if (auto cached = lookup_range_scan_cache(
@@ -648,7 +625,8 @@ HeliosTransaction::get_matching_keys_and_values_from_prefix(std::string prefix) 
   if (prefix.empty()) {
     return get_matching_keys_and_values_in_range("", std::string());
   }
-  return get_matching_keys_and_values_in_range(prefix, prefix_range_end(prefix));
+  return get_matching_keys_and_values_in_range(
+      prefix, key_pack::build_prefix_range_end(prefix));
 }
 
 // Secondary index scan operations

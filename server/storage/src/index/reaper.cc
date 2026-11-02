@@ -6,6 +6,7 @@
 
 #include "index/reaper.h"
 
+#include <algorithm>
 #include <utility>
 
 #include "index/masstree_index.h"
@@ -13,8 +14,8 @@
 namespace helios::storage {
 namespace index {
 
-void Reaper::Enqueue(MasstreeIndex &index, std::string_view key, DataItem &item,
-                     Tidword delete_commit_tid) {
+void Reaper::Enqueue(MasstreeIndex &index, std::string_view key,
+                     IndexRecord &item, Tidword delete_commit_tid) {
   Tombstone tombstone;
   tombstone.index = &index;
   tombstone.key = std::string(key);
@@ -26,6 +27,7 @@ void Reaper::Enqueue(MasstreeIndex &index, std::string_view key, DataItem &item,
 }
 
 void Reaper::Purge(EpochNumber reclamation_epoch) {
+  std::lock_guard<std::mutex> purging(purge_mutex_);
   std::vector<std::vector<Tombstone>> ready;
   {
     std::lock_guard<std::mutex> lk(mutex_);
@@ -45,7 +47,7 @@ void Reaper::Purge(EpochNumber reclamation_epoch) {
 
   for (auto &entries : ready) {
     for (auto &tombstone : entries) {
-      DataItem *item = tombstone.index->Get(tombstone.key);
+      IndexRecord *item = tombstone.index->Get(tombstone.key);
       // A different item under the key means the tombstone was already replaced.
       if (item != tombstone.item) continue;
 
@@ -81,6 +83,19 @@ void Reaper::Purge(EpochNumber reclamation_epoch) {
   // Get and Purge enrolled this thread in masstree's RCU epoch; release it
   // before returning to the epoch hook.
   release_thread_epoch();
+}
+
+void Reaper::Forget(const MasstreeIndex &index) {
+  std::lock_guard<std::mutex> purging(purge_mutex_);
+  std::lock_guard<std::mutex> lk(mutex_);
+  for (auto &queued : tombstones_) {
+    auto &entries = queued.second;
+    entries.erase(std::remove_if(entries.begin(), entries.end(),
+                                 [&index](const Tombstone &tombstone) {
+                                   return tombstone.index == &index;
+                                 }),
+                  entries.end());
+  }
 }
 
 }  // namespace index

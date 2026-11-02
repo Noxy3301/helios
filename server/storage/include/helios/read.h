@@ -81,7 +81,7 @@ struct ScanResult {
 /**
  * @brief One row reference from a PAX primary-index range scan.
  *
- * @details `group` is a `pax::PaxGroup*` and `item` is a `DataItem*`, kept
+ * @details `group` is a `pax::PaxGroup*` and `item` is an `IndexRecord*`, kept
  * opaque so this public header does not expose internal storage headers.
  * Both are non-null in a returned row, are owned by the database, and stay
  * valid until the calling thread releases its epoch. `slot` is the row's

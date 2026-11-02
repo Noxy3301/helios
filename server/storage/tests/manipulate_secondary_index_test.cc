@@ -233,9 +233,10 @@ TEST_F(ManipulateSecondaryIndexTest,
   EXPECT_EQ(current[0], "user1");
 }
 
-// A removed pair's record stays until the reaper takes it; the pair's last
+// A removed non-unique index record stays until the reaper takes it; its last
 // change in a request decides whether it is found.
-TEST_F(ManipulateSecondaryIndexTest, APairRemovedAndAddedAgainIsFoundAgain) {
+TEST_F(ManipulateSecondaryIndexTest,
+       ANonUniqueRecordRemovedAndAddedAgainIsFoundAgain) {
   ASSERT_TRUE(TestHelper::CreateTable(*db_, "users"));
   ASSERT_TRUE(
       db_->CreateSecondaryIndex("users", "age_index", IndexConstraint::kNone));

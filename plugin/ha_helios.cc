@@ -334,12 +334,6 @@ HeliosTransaction *ha_helios::active_transaction(THD *thd) const {
   return (ctx != nullptr) ? ctx->tx : nullptr;
 }
 
-HeliosTransaction *ha_helios::new_transaction(THD *thd) {
-  if (thd == nullptr) return nullptr;
-  userThread = thd;
-  return new HeliosTransaction(thd, get_proxy(), helios_hton);
-}
-
 HeliosTransaction *&ha_helios::get_transaction(THD *thd) {
   HeliosThdCtx *&ctx = helios_thd_ctx(thd, helios_hton);
   ensure_helios_proxy(ctx);

@@ -13,7 +13,7 @@
 #include <string_view>
 #include <vector>
 
-#include "index/data_item.h"
+#include "index/index_record.h"
 #include "silo/tidword.h"
 #include "util/epoch.h"
 
@@ -33,7 +33,7 @@ class Reaper {
    *
    * The committer passes the tree owning the already resolved record.
    */
-  void Enqueue(MasstreeIndex &index, std::string_view key, DataItem &item,
+  void Enqueue(MasstreeIndex &index, std::string_view key, IndexRecord &item,
                Tidword delete_commit_tid);
 
   /**
@@ -45,11 +45,19 @@ class Reaper {
    */
   void Purge(EpochNumber reclamation_epoch);
 
+  /**
+   * @brief Drops every queued record of `index`, which is about to be freed.
+   *
+   * @details Waits for a Purge in progress, which may hold such records. The
+   * caller guarantees that no commit enqueues into `index` any more.
+   */
+  void Forget(const MasstreeIndex &index);
+
  private:
   /**
    * @brief One logically deleted record awaiting its physical purge.
    *
-   * index is the tree owning the record. item is the DataItem the key resolved
+   * index is the tree owning the record. item is the record the key resolved
    * to at enqueue time and serves as an identity check at purge time.
    * `delete_commit_tid` identifies the deletion; a newer version cancels
    * this candidate.
@@ -57,12 +65,14 @@ class Reaper {
   struct Tombstone {
     MasstreeIndex *index = nullptr;
     std::string key;
-    DataItem *item = nullptr;
+    IndexRecord *item = nullptr;
     Tidword delete_commit_tid;
   };
 
   // Guards the queue shared by committers and the epoch thread.
   std::mutex mutex_;
+  // Held through each Purge, so Forget never meets a batch Purge detached.
+  std::mutex purge_mutex_;
   std::map<EpochNumber, std::vector<Tombstone>> tombstones_;
 };
 

@@ -32,12 +32,12 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <vector>
 
 #include "helios/config.h"
 
 #include "util/epoch.h"
 #include "util/thread_key_storage.h"
-#include "wal/log_entry.h"
 #include "wal/log_record.h"
 #include "wal/wal.h"
 
@@ -79,7 +79,6 @@ class Logger {
     RecoveryStatus status{RecoveryStatus::kOk};
     // Durable through the log's last frame and the checkpoint's end epoch.
     EpochNumber durable_epoch{0};
-    LogEntries recovery_entries;
   };
 
   explicit Logger(const Config &config, WalIo io = WalIo::Posix());
@@ -94,13 +93,15 @@ class Logger {
   /**
    * @brief Scans the log and zeroes the tail at its first invalid frame.
    * @details On success it sets the durable epoch from the log and any
-   * published checkpoint, and returns it together with the log entries,
-   * the checkpoint first when one was loaded, then the log. On kFailed,
-   * durable_epoch is 0 and recovery_entries is empty.
+   * published checkpoint, and returns it. On kFailed, durable_epoch is 0.
+   * @param passes Run in order, each over the checkpoint's records when they
+   * were loaded and then the log's records one epoch at a time, as
+   * Wal::Scan hands them on; the log is read once per pass. An empty pass
+   * only reads. Holds at least one.
    * @note Runs before the logger thread starts and before the database
    * accepts work.
    */
-  RecoveryResult Recover();
+  RecoveryResult Recover(const std::vector<Replay> &passes = {Replay()});
 
   /**
    * @brief Starts the logger thread after recovery, before epoch

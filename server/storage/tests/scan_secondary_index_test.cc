@@ -127,7 +127,7 @@ TEST_F(ScanSecondaryIndexTest, ReverseScan) {
        {"users", "group_index", "g1", "user1", false},
        {"users", "group_index", "g2", "user3", false}}));
 
-  // Reverse walks the (secondary key, primary key) pairs backwards.
+  // Reverse walks the (secondary key, primary key) order backwards.
   EXPECT_EQ(
       TestHelper::ScanIndex(*db_, "users", "group_index", "g1", "g3", 0, true),
       (SecondaryScanRows{{"g2", "user3"}, {"g1", "user2"}, {"g1", "user1"}}));
@@ -192,7 +192,8 @@ TEST_F(ScanSecondaryIndexTest, ManyRowsPerValue) {
                                         IndexConstraint::kNone));
 
   // Four values of 100 rows each, interleaved by primary key and fed in
-  // descending order. Fixed-width keys keep one value's pairs apart.
+  // descending order. Fixed-width keys keep one value's non-unique index
+  // records apart.
   SecondaryScanRows all;
   std::vector<TestHelper::RowWrite> rows;
   std::vector<TestHelper::IndexOp> ops;
@@ -211,7 +212,7 @@ TEST_F(ScanSecondaryIndexTest, ManyRowsPerValue) {
   EXPECT_EQ(TestHelper::ScanIndex(*db_, "users", "group_index", "g1",
                                   TestHelper::prefix_end("g2")),
             g1_g2);
-  // A start above g1 leaves every g1 pair out.
+  // A start above g1 leaves every non-unique index record of g1 out.
   EXPECT_EQ(TestHelper::ScanIndex(*db_, "users", "group_index",
                                   TestHelper::prefix_end("g1"), "g3"),
             g2);
@@ -219,7 +220,7 @@ TEST_F(ScanSecondaryIndexTest, ManyRowsPerValue) {
       TestHelper::ScanIndex(*db_, "users", "group_index", "g1", "g3", 0, true),
       SecondaryScanRows(g1_g2.rbegin(), g1_g2.rend()));
 
-  // A limit counts pairs, not values, in either direction.
+  // A limit counts non-unique index records, not values, in either direction.
   EXPECT_EQ(
       TestHelper::ScanIndex(*db_, "users", "group_index", "g1", "g3", 150),
       SecondaryScanRows(g1_g2.begin(), g1_g2.begin() + 150));
@@ -227,7 +228,8 @@ TEST_F(ScanSecondaryIndexTest, ManyRowsPerValue) {
                                   true),
             SecondaryScanRows(g1_g2.rbegin(), g1_g2.rbegin() + 150));
 
-  // Removing half of g2's pairs leaves the other half and the other values.
+  // Removing half of g2's non-unique index records leaves the other half and
+  // the other values.
   std::vector<TestHelper::IndexOp> removals;
   std::vector<std::string> kept;
   for (size_t i = 0; i < g2.size(); ++i) {
@@ -243,12 +245,12 @@ TEST_F(ScanSecondaryIndexTest, ManyRowsPerValue) {
             100u);
 }
 
-TEST_F(ScanSecondaryIndexTest, APairPastTheKeyLimitIsRefused) {
+TEST_F(ScanSecondaryIndexTest, ANonUniqueRecordPastTheKeyLimitIsRefused) {
   ASSERT_TRUE(TestHelper::CreateTable(*db_, "users"));
   ASSERT_TRUE(
       db_->CreateSecondaryIndex("users", "name_index", IndexConstraint::kNone));
 
-  // A non-unique record's key is both keys; a scan copies at most 255 bytes.
+  // The record's key is both keys; a scan copies at most 255 bytes.
   const std::string secondary_key(200, 'a');
   const std::string primary_key(55, 'p');
   std::string reason;
@@ -257,7 +259,8 @@ TEST_F(ScanSecondaryIndexTest, APairPastTheKeyLimitIsRefused) {
       {}, reason));
   EXPECT_EQ(reason, "secondary_key_too_long");
 
-  // A pair of exactly 255 bytes is stored and scanned back.
+  // A secondary key and primary key of exactly 255 bytes in all are stored
+  // and scanned back.
   ASSERT_TRUE(TestHelper::CommitWrites(
       *db_, {{"users", primary_key, "v"}},
       {{"users", "name_index", secondary_key, primary_key}}));

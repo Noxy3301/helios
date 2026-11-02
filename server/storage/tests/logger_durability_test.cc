@@ -30,6 +30,7 @@ namespace {
 using helios::storage::EpochNumber;
 using helios::storage::wal::Logger;
 using helios::storage::wal::LogRecord;
+using helios::storage::wal::LogRecords;
 using helios::storage::wal::PackedLogRecord;
 using helios::storage::wal::WalIo;
 
@@ -337,12 +338,15 @@ TEST_F(LoggerDurabilityTest, RecordsAboveTheTargetAreCarriedForward) {
   helios::storage::wal::Wal wal(config_.work_dir,
                                 helios::storage::wal::WalIo::Posix(),
                                 config_.wal_initial_capacity_bytes);
-  const auto scan = wal.Scan();
+  LogRecords records;
+  const auto scan = wal.Scan(0, [&records](const LogRecords &batch) {
+    records.insert(records.end(), batch.begin(), batch.end());
+  });
   ASSERT_EQ(scan.status, helios::storage::wal::WalScanResult::Status::kOk);
   EXPECT_EQ(scan.last_epoch, 9u);
-  ASSERT_EQ(scan.records.size(), 2u);
-  EXPECT_EQ(scan.records[0].epoch, 4u);
-  EXPECT_EQ(scan.records[1].epoch, 9u);
+  ASSERT_EQ(records.size(), 2u);
+  EXPECT_EQ(records[0].epoch, 4u);
+  EXPECT_EQ(records[1].epoch, 9u);
 }
 
 TEST_F(LoggerDurabilityTest, StopWakesEveryWaiter) {
@@ -469,12 +473,17 @@ TEST_F(LoggerDurabilityTest, RecoverReportsTheDurableEpochOfAnExistingLog) {
   }
 
   Logger reopened(config_);
-  const auto recovered = reopened.Recover();
+  std::vector<std::string> keys;
+  const auto recovered = reopened.Recover({[&keys](const LogRecords &batch) {
+    for (const auto &record : batch) {
+      for (const auto &write : record.writes) keys.push_back(write.key);
+    }
+  }});
   ASSERT_EQ(recovered.status, Logger::RecoveryStatus::kOk);
   EXPECT_EQ(recovered.durable_epoch, 8u);
   EXPECT_EQ(reopened.GetDurableEpoch(), 8u);
-  ASSERT_EQ(recovered.recovery_entries.size(), 1u);
-  EXPECT_EQ(recovered.recovery_entries[0].key, "alice");
+  ASSERT_EQ(keys.size(), 1u);
+  EXPECT_EQ(keys[0], "alice");
 }
 
 }  // namespace

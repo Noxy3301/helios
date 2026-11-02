@@ -55,7 +55,8 @@ bool thd_can_use_prefetch(THD *thd) {
   }
 }
 
-// Pack one integer DSL key part into the same bytes as handler keys
+// Pack one integer DSL key part into the same bytes as a NOT NULL handler key
+// part of that width
 static std::string pack_plan_int_key_part(int64_t value, int size = 4) {
   uint64_t raw = 0;
   uint64_t sign_mask = 0;
@@ -86,10 +87,6 @@ static std::string pack_plan_int_key_part(int64_t value, int size = 4) {
 
   const uint64_t packed = raw ^ sign_mask;
   std::string out;
-  out.push_back(static_cast<char>(kKeyMarkerNotNull));
-  out.push_back(static_cast<char>(kKeyTypeInt));
-  out.push_back(static_cast<char>((size >> 8) & 0xFF));
-  out.push_back(static_cast<char>(size & 0xFF));
   for (int i = size - 1; i >= 0; --i) {
     out.push_back(static_cast<char>((packed >> (i * 8)) & 0xFF));
   }
@@ -119,7 +116,7 @@ static bool pack_plan_string_key_part(const HeliosProxy::ReadPlanStep &step,
                                                : step.index_name == key.name;
     if (named && part < key.user_defined_key_parts) {
       key_pack::append_key_part(
-          out, false, HeliosFieldType::HELIOS_STRING,
+          out, key.key_part[part], false, HeliosFieldType::HELIOS_STRING,
           key_pack::string_weights(key.key_part[part],
                                    pointer_cast<const uchar *>(value.data()),
                                    value.size()));
@@ -303,6 +300,31 @@ static std::vector<HeliosProxy::ReadPlanStep> parse_plan_steps(
       if (parts.size() < 3) continue;
       parsed.is_scan = true;
       parsed.index_name = parts[2];
+      // The primary index serves PRIMARY and a UNIQUE index that packs to the
+      // primary key. table_name is "./db/table".
+      const size_t slash = parsed.table_name.find('/', 2);
+      const TABLE_SHARE *share = nullptr;
+      bool primary = false;
+      if (slash != std::string::npos) {
+        const std::string db = parsed.table_name.substr(2, slash - 2);
+        const std::string name = parsed.table_name.substr(slash + 1);
+        mysql_mutex_lock(&LOCK_open);
+        share = get_cached_table_share(db.c_str(), name.c_str());
+        if (share != nullptr && share->m_open_in_progress) share = nullptr;
+        for (uint i = 0; share != nullptr && i < share->keys; i++) {
+          if (parsed.index_name == share->key_info[i].name) {
+            primary = key_pack::same_as_primary(*share, i);
+            break;
+          }
+        }
+        mysql_mutex_unlock(&LOCK_open);
+      }
+      if (share == nullptr) {
+        LOG_WARNING("tx plan dropped: no cached table %s",
+                    parsed.table_name.c_str());
+        return {};
+      }
+      if (primary) parsed.index_name.clear();
       token_start = 3;
     } else if (parts[0] == "FE") {
       parsed.for_each = true;

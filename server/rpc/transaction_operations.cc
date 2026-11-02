@@ -142,8 +142,11 @@ void HeliosRpc::handleTxCommit(
             }
         }
     }
-    const bool committed =
-        fed && tx.Commit(db_manager_->commit_durability(), reason);
+    auto durability = db_manager_->commit_durability();
+    if (request.async_durability()) {
+        durability = helios::storage::CommitDurability::kAsync;
+    }
+    const bool committed = fed && tx.Commit(durability, reason);
 
     response->set_committed(committed);
     if (!committed && !reason.empty()) {

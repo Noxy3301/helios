@@ -82,18 +82,22 @@ SecondaryLogStats GetSecondaryIndexLogStatsForLatestEpoch(
   // Read the log through the writer's own format rather than re-deriving the
   // frame format here.
   helios::storage::wal::Wal wal(conf.work_dir);
-  const auto scan = wal.Scan();
+  helios::storage::wal::LogRecords records;
+  const auto scan =
+      wal.Scan(0, [&records](const helios::storage::wal::LogRecords &batch) {
+        records.insert(records.end(), batch.begin(), batch.end());
+      });
   EXPECT_EQ(scan.status, helios::storage::wal::WalScanResult::Status::kOk);
   if (scan.status != helios::storage::wal::WalScanResult::Status::kOk) {
     return stats;
   }
 
   helios::storage::EpochNumber max_epoch = 0;
-  for (const auto &record : scan.records) {
+  for (const auto &record : records) {
     if (record.epoch > max_epoch) max_epoch = record.epoch;
   }
 
-  for (const auto &record : scan.records) {
+  for (const auto &record : records) {
     if (record.epoch != max_epoch) continue;
     for (const auto &write : record.writes) {
       if (write.index_name.empty()) continue;

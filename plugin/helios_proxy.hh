@@ -43,10 +43,18 @@ public:
         std::vector<std::string> bounds;
         std::vector<uint64_t> cum;
     };
+    // One index to measure: NDV over its first num_key_parts parts (none
+    // when 0) and a histogram on its first part, whose bytes part_widths
+    // delimits (none when empty).
+    struct IndexStatsDesc {
+        std::string index_name;  // Empty means primary index.
+        uint32_t num_key_parts = 0;
+        std::vector<uint32_t> part_widths;
+    };
     // Refresh row counts, and optionally per-index NDV for one table.
     bool fetch_table_stats(
         const std::string& ndv_table = std::string(),
-        const std::vector<std::pair<std::string, uint32_t>>& ndv_indexes = {},
+        const std::vector<IndexStatsDesc>& ndv_indexes = {},
         bool force_ndv = false);
     const std::unordered_map<std::string, IndexNdvResult>& last_index_ndv() const {
         return last_index_ndv_;
@@ -228,6 +236,7 @@ public:
     };
     // Validate every read and range, then install the writes. duplicate_key is
     // set when the server refused a duplicate primary or unique secondary key.
+    // async_durability acknowledges at precommit under any server contract.
     bool tx_commit(
         const std::vector<ReadEntry>& reads,
         const std::vector<RangeReadEntry>& range_reads,
@@ -235,18 +244,27 @@ public:
         const std::vector<std::pair<std::string, int64_t>>& row_deltas,
         std::string* abort_detail = nullptr,
         bool* duplicate_key = nullptr,
-        bool* transport_error = nullptr);
+        bool* transport_error = nullptr,
+        bool async_durability = false);
 
     // table/index management (non-transactional)
     // PAX cell widths in bytes (entry 0 = null flags, then TABLE::field
-    // order); kind/scale carry typed cells, one entry per width.
+    // order); kind/scale carry typed cells and not_null each field's NOT
+    // NULL, one entry per width.
     bool db_create_table(const std::string& table_name,
                          const std::vector<uint32_t>& pax_field_max_bytes,
                          const std::vector<uint32_t>& pax_field_kind,
-                         const std::vector<int32_t>& pax_field_scale);
+                         const std::vector<int32_t>& pax_field_scale,
+                         const std::vector<bool>& pax_field_not_null);
+    // pk_slices locate the primary key in a record's key, as
+    // key_pack::pk_slices builds them.
     bool db_create_secondary_index(const std::string& table_name,
                                    const std::string& index_name,
-                                   uint32_t index_type);
+                                   uint32_t index_type,
+                                   const std::vector<uint32_t>& pk_slices);
+    // Drops the named secondary indexes of the table, all or none.
+    bool db_drop_secondary_indexes(const std::string& table_name,
+                                   const std::vector<std::string>& index_names);
     // Switch the commit acknowledgement policy of the running server. Returns
     // false when the exchange fails or the server refuses, with the reason in
     // error.

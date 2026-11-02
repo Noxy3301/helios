@@ -178,4 +178,7 @@ private:
     void handleDbSetCommitDurability(
         const Helios::Protocol::DbSetCommitDurability::Request& request,
         Helios::Protocol::DbSetCommitDurability::Response* response);
+    void handleDbDropSecondaryIndexes(
+        const Helios::Protocol::DbDropSecondaryIndexes::Request& request,
+        Helios::Protocol::DbDropSecondaryIndexes::Response* response);
 };
