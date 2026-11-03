@@ -84,6 +84,9 @@ Instruction counts are user space only and single-threaded. They do not show:
   epoch advance and fdatasync, and each RPC costs system calls). A change that
   saves instructions but adds RPCs or system calls can lose. `cgreport.py --calls
   'HeliosRpc::handle_rpc.*'` counts RPCs per transaction, which is deterministic.
+  The reverse also happens: with `--tx-plan`, NewOrder runs 4.6% more storage
+  instructions (833 K → 871 K) but makes 6 RPCs instead of 29. Its storage CPU
+  time falls by 44%, and BenchBase at 4 terminals gains 8.6% (95% CI +5.3% to +11.9%).
 - **Contention.** Aborts, retries and lock waits appear only with many terminals.
 - **Memory effects.** Cache misses and IPC do not show in instruction counts
   (rustc's discussion above names the same limit).
