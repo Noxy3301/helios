@@ -53,33 +53,51 @@ struct JobQueue {
 
 namespace {
 
+// Moves the acks swapped out of the queue to the end of `held`.
+void hold(std::vector<DeferredAck>& incoming, std::vector<DeferredAck>& held) {
+    held.insert(held.end(), std::make_move_iterator(incoming.begin()),
+                std::make_move_iterator(incoming.end()));
+    incoming.clear();
+}
+
 // The ack thread: queues each durable commit reply and wakes its connection.
 void deliver_acks(std::shared_ptr<AckQueue> queue,
                   std::shared_ptr<helios::storage::Database> db) {
     EpochNumber durable = 0;
+    // The queue is only swapped with `incoming` under its mutex; everything
+    // else works on vectors this thread owns.
+    std::vector<DeferredAck> incoming;
+    std::vector<DeferredAck> held;
     std::vector<DeferredAck> ready;
     for (;;) {
+        {
+            std::unique_lock<std::mutex> lock(queue->mutex);
+            queue->cv.wait(lock, [&] {
+                return !held.empty() || !queue->acks.empty();
+            });
+            incoming.swap(queue->acks);
+        }
+        hold(incoming, held);
         // Wake at the next durable epoch even when the oldest pending one is
         // later, so an ack queued behind a later one is not held for it.
         EpochNumber target = durable + 1;
-        {
-            std::unique_lock<std::mutex> lock(queue->mutex);
-            queue->cv.wait(lock, [&] { return !queue->acks.empty(); });
-            for (const auto& ack : queue->acks) {
-                target = std::min(target, ack.epoch);
-            }
+        for (const auto& ack : held) {
+            target = std::min(target, ack.epoch);
         }
         durable = db->await_durable(target);
 
+        // Acks queued during the wait may already be durable.
         {
             std::lock_guard<std::mutex> lock(queue->mutex);
-            auto held = std::partition(
-                queue->acks.begin(), queue->acks.end(),
-                [&](const DeferredAck& ack) { return ack.epoch > durable; });
-            ready.assign(std::make_move_iterator(held),
-                         std::make_move_iterator(queue->acks.end()));
-            queue->acks.erase(held, queue->acks.end());
+            incoming.swap(queue->acks);
         }
+        hold(incoming, held);
+        auto later = std::partition(
+            held.begin(), held.end(),
+            [&](const DeferredAck& ack) { return ack.epoch > durable; });
+        ready.assign(std::make_move_iterator(later),
+                     std::make_move_iterator(held.end()));
+        held.erase(later, held.end());
         // The connection's own thread sends, so a slow peer holds up only
         // the acks on its connection.
         for (auto& ack : ready) {
