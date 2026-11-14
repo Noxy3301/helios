@@ -354,7 +354,6 @@ bool PaxGroup::ScatterRow(uint32_t slot, const Row &row, bool compare,
     if (schema_.type_of(field_index) != FieldType::kUntyped && field.len != 0) {
       len = static_cast<uint16_t>(schema_.field_max_bytes[field_index]);
       src = &field.typed_value;
-      table_.observe(field_index, static_cast<int64_t>(field.typed_value));
     }
 
     const bool has_len = schema_.has_len(field_index);
@@ -368,6 +367,8 @@ bool PaxGroup::ScatterRow(uint32_t slot, const Row &row, bool compare,
         continue;
       changed |= uint64_t{1} << std::min<size_t>(field_index, 63);
     }
+    if (src == &field.typed_value)
+      table_.observe(field_index, static_cast<int64_t>(field.typed_value));
     if (has_len) std::memcpy(cell, &len, sizeof(len));
     if (len > 0) std::memcpy(payload, src, len);
   }
