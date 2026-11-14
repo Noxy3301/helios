@@ -14,6 +14,11 @@ void StorageServer::init() {
     if (!db_manager_) {
         db_manager_ = std::make_shared<DatabaseManager>();
     }
+    // Commits only move the counts, so a restart starts them from the rows
+    // recovery restored; otherwise the optimizer sees near-empty tables.
+    const auto& recovered = db_manager_->get_database()->recovered_row_counts();
+    row_counts_->seed(recovered);
+    SPDLOG_INFO("Row counts seeded for {} tables", recovered.size());
 
     SPDLOG_INFO("Storage server initialized on port {}, boot token {}",
              static_cast<unsigned>(config().server_port), hidden_keys_->boot_token);

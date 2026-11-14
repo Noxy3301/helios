@@ -31,6 +31,7 @@
 #include <mutex>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -84,6 +85,19 @@ class Database {
   Database &operator=(Database &&) = delete;
 
   const Config &GetConfig() const noexcept;
+
+  /**
+   * @brief The live rows each table held when recovery finished.
+   *
+   * @details Counted while the rows are installed: a key deleted by its
+   * newest write, and an older version of a key, are not counted. A table
+   * that recovered no rows has no entry, and neither does any table when
+   * recovery is disabled. Fixed after construction; commits do not move it.
+   *
+   * @return Live rows keyed by table name.
+   */
+  const std::unordered_map<std::string, uint64_t> &recovered_row_counts()
+      const noexcept;
 
   /**
    * @brief Ends the calling thread's index reclamation section and drops it
@@ -417,6 +431,8 @@ class Database {
   index::Reaper reaper_;
   // Each worker remembers the last TID it chose for this database.
   ThreadKeyStorage<Tidword> last_commit_tids_;
+  // Set by Recover; see recovered_row_counts.
+  std::unordered_map<std::string, uint64_t> recovered_row_counts_;
 
   // Bound the lifetime of a read view so `E - se` stays in the wrap-free window.
   static constexpr EpochNumber kPaxReadViewEpochLifetime =

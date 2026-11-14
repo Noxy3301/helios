@@ -45,6 +45,14 @@ struct TableRowCounts {
         }
     }
 
+    // Starts the counts from the rows recovery restored, before any connection
+    // can apply a delta, so they match what the deltas of a fresh load reach.
+    void seed(const std::unordered_map<std::string, uint64_t>& rows) {
+        std::unique_lock<std::shared_mutex> lock(s_mutex);
+        for (const auto& [name, count] : rows)
+            counts[name] = static_cast<int64_t>(count);
+    }
+
     std::unordered_map<std::string, int64_t> snapshot() {
         std::shared_lock<std::shared_mutex> lock(s_mutex);
         return counts;
