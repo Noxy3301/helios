@@ -553,10 +553,6 @@ HeliosTransaction::get_matching_keys_and_values_in_range(std::string start_key,
           db_table_key, start_key, end_key, reverse_scan, row_limit,
           /*allow_truncated=*/served_truncated != nullptr)) {
     if (served_truncated != nullptr) *served_truncated = cached->truncated;
-    for (size_t i = 0; i < cached->rows.size(); ++i) {
-      append_base_row_read(db_table_key, cached->rows[i].first,
-                           cached->row_tids[i]);
-    }
     // Record the pre-merge cached rows: commit-side revalidation cannot see
     // this transaction's pending writes.
     append_range_read(*cached);
@@ -606,7 +602,6 @@ HeliosTransaction::scan_range(const std::string& start_key,
   scanned.row_tids.reserve(result.rows.size());
   for (auto& row : result.rows) {
     record_row_cache(db_table_key, row.key, true, row.value, row.tid);
-    append_base_row_read(db_table_key, row.key, row.tid);
     scanned.rows.emplace_back(std::move(row.key), std::move(row.value));
     scanned.row_tids.push_back(row.tid);
   }
