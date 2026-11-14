@@ -875,20 +875,20 @@ void HeliosTransaction::buffer_delete_secondary_index(
   write_buffer_ops_.push_back(std::move(op));
 }
 
-std::optional<HeliosTransaction::RowEntry>
+const HeliosTransaction::RowEntry*
 HeliosTransaction::lookup_write_set(
     const std::string& table_name, const std::string& key) const {
   auto it = own_writes_index_.find(make_row_cache_key(table_name, key));
-  if (it == own_writes_index_.end()) return std::nullopt;
-  return own_writes_[it->second];
+  if (it == own_writes_index_.end()) return nullptr;
+  return &own_writes_[it->second];
 }
 
-std::optional<HeliosTransaction::RowEntry>
+const HeliosTransaction::RowEntry*
 HeliosTransaction::lookup_row_cache(
     const std::string& table_name, const std::string& key) const {
   auto it = row_cache_.find(make_row_cache_key(table_name, key));
-  if (it == row_cache_.end()) return std::nullopt;
-  return it->second;
+  if (it == row_cache_.end()) return nullptr;
+  return &it->second;
 }
 
 void HeliosTransaction::drop_row_cache(const std::string& table_name,
