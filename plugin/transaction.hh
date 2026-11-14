@@ -32,7 +32,7 @@ class Helios_share;
 class HeliosTransaction
 {
 public:
-  void choose_table(std::string db_table_name);
+  void choose_table(const std::string &db_table_name);
   bool table_is_not_chosen();
 
   // A nonzero column_mask validates the read by those PAX fields only

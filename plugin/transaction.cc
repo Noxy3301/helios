@@ -66,8 +66,8 @@ HeliosTransaction::HeliosTransaction(THD* thd,
       is_aborted_(false)
     {}
 
-void HeliosTransaction::choose_table(std::string db_table_name) {
-  db_table_key = db_table_name;
+void HeliosTransaction::choose_table(const std::string &db_table_name) {
+  if (db_table_key != db_table_name) db_table_key = db_table_name;
 }
 
 bool HeliosTransaction::table_is_not_chosen() {
@@ -94,7 +94,7 @@ HeliosTransaction::read(std::string key, uint64_t column_mask) {
   if (auto entry = lookup_row_cache(db_table_key, key)) {
     rpc_trace_.record_event("read_cache_hit");
     // A consumed cache hit appends to the point read set.
-    rpc_trace_.record_event(
+    if (rpc_trace_.active()) rpc_trace_.record_event(
         trace_count_event("use_point_read", entry->table_name, 1));
     append_base_row_read(entry->table_name, entry->key, entry->tid,
                          column_mask);
@@ -141,7 +141,7 @@ HeliosTransaction::batch_read(const std::vector<std::string>& keys) {
     }
     if (auto entry = lookup_row_cache(db_table_key, keys[i])) {
       rpc_trace_.record_event("batch_cache_hit");
-      rpc_trace_.record_event(
+      if (rpc_trace_.active()) rpc_trace_.record_event(
           trace_count_event("use_point_read", entry->table_name, 1));
       append_base_row_read(entry->table_name, entry->key, entry->tid);
       pairs[i] = {entry->found, entry->value};
@@ -333,8 +333,10 @@ void HeliosTransaction::execute_read_plan(
   }
   if (steps.empty()) return;
 
-  rpc_trace_.record_event("plan_request:steps=" +
-                          std::to_string(steps.size()));
+  if (rpc_trace_.active()) {
+    rpc_trace_.record_event("plan_request:steps=" +
+                            std::to_string(steps.size()));
+  }
   auto result = helios_proxy->tx_execute_read_plan(steps);
   if (!result.ok || result.steps.size() != steps.size()) {
     rpc_trace_.record_event("abort_read_plan_rpc");
@@ -352,7 +354,7 @@ void HeliosTransaction::execute_read_plan(
     const auto& step = steps[i];
     auto& step_result = result.steps[i];
     if (!step.is_scan && !step.for_each) {
-      rpc_trace_.record_event(trace_count_event(
+      if (rpc_trace_.active()) rpc_trace_.record_event(trace_count_event(
           step_result.found ? "plan_fetch:R:hit" : "plan_fetch:R:miss",
           step.table_name, 1));
       if (step_result.found) {
@@ -366,7 +368,7 @@ void HeliosTransaction::execute_read_plan(
       continue;
     }
 
-    rpc_trace_.record_event(trace_plan_scan_event(
+    if (rpc_trace_.active()) rpc_trace_.record_event(trace_plan_scan_event(
         step.table_name, step.index_name, step_result.scan_keys.size(),
         step_result.scan_values.size(), step.scan_limit, step.for_each));
 
@@ -564,7 +566,7 @@ HeliosTransaction::get_matching_keys_and_values_in_range(std::string start_key,
     if (row_limit > 0 && pairs.size() > row_limit) {
       pairs.resize(static_cast<size_t>(row_limit));
     }
-    rpc_trace_.record_event(
+    if (rpc_trace_.active()) rpc_trace_.record_event(
         trace_count_event("use_pk_value_scan", db_table_key, pairs.size()));
     return pairs;
   }
@@ -656,9 +658,11 @@ HeliosTransaction::get_matching_primary_keys_in_range(std::string index_name,
     }
     auto merged = merge_index_scan(index_name, start_key, end_key, row_limit,
                                    reverse_scan, groups);
-    rpc_trace_.record_event("use_secondary_scan:" + db_table_key + ":" +
-                            index_name + ":n=" +
-                            std::to_string(merged.primary_keys.size()));
+    if (rpc_trace_.active()) {
+      rpc_trace_.record_event("use_secondary_scan:" + db_table_key + ":" +
+                              index_name + ":n=" +
+                              std::to_string(merged.primary_keys.size()));
+    }
     return merged.primary_keys;
   }
 
@@ -1072,7 +1076,9 @@ void HeliosTransaction::append_secondary_range_read(
 }
 
 void HeliosTransaction::abort_server_refused(const char* what) {
-  rpc_trace_.record_event(std::string("abort_server_refused:") + what);
+  if (rpc_trace_.active()) {
+    rpc_trace_.record_event(std::string("abort_server_refused:") + what);
+  }
   LOG_WARNING("Storage server refused %s table=%s", what, db_table_key.c_str());
   is_aborted_ = true;
   thd_mark_transaction_to_rollback(thread, 1);
@@ -1333,7 +1339,7 @@ bool HeliosTransaction::end_transaction(bool *transport_error,
       duplicate_key_abort_ = true;
       if (duplicate_key != nullptr) *duplicate_key = true;
     }
-    if (!committed && !abort_detail.empty()) {
+    if (!committed && !abort_detail.empty() && rpc_trace_.active()) {
       rpc_trace_.record_event("abort_validate_" + abort_detail);
     }
   }
