@@ -26,6 +26,7 @@ constexpr const char *kTable = "stats";
 helios::storage::Config MakeConfig() {
   helios::storage::Config config;
   config.work_dir = "./helios_stats_test_logs";
+  config.wal_segment_bytes = 1u << 20;
   std::filesystem::remove_all(config.work_dir);
   return config;
 }

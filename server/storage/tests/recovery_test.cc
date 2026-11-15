@@ -68,13 +68,13 @@ class RecoveryTest : public ::testing::Test {
     std::filesystem::remove_all(root_, ec);
   }
 
-  static constexpr uint64_t kWalCapacityBytes = 1ull << 20;
+  static constexpr uint64_t kSegmentBytes = 1ull << 20;
 
   helios::storage::Config MakeConfig() const {
     helios::storage::Config config;
     config.epoch_duration_ms = 10;
     config.work_dir = work_dir_;
-    config.wal_initial_capacity_bytes = kWalCapacityBytes;
+    config.wal_segment_bytes = kSegmentBytes;
     return config;
   }
 
@@ -129,7 +129,7 @@ TEST_F(RecoveryTest, ALoggedWriteCarriesTheUnlockedTid) {
     ASSERT_TRUE(CommitWriteWithIndexEntry(db, "k", "v1", "s"));
   }
 
-  Wal wal(work_dir_, helios::storage::wal::WalIo::Posix(), kWalCapacityBytes);
+  Wal wal(work_dir_, helios::storage::wal::WalIo::Posix(), kSegmentBytes);
   auto scan = ScanRecords(wal);
   ASSERT_EQ(scan.status, WalScanResult::Status::kOk);
 
@@ -172,7 +172,7 @@ TEST_F(RecoveryTest, ARecoveredKeyAcceptsAFurtherWrite) {
   // Guarded by the assertion above: a locked TID in the log makes the read
   // and the write below spin rather than fail.
   {
-    Wal wal(work_dir_, helios::storage::wal::WalIo::Posix(), kWalCapacityBytes);
+    Wal wal(work_dir_, helios::storage::wal::WalIo::Posix(), kSegmentBytes);
     auto scan = ScanRecords(wal);
     ASSERT_EQ(scan.status, WalScanResult::Status::kOk);
     bool seen = false;
@@ -294,7 +294,7 @@ TEST_F(RecoveryTest, EarlyPublicationKeepsTheOriginalWalValue) {
     EXPECT_TRUE(writer.get());
   }
 
-  Wal wal(work_dir_);
+  Wal wal(work_dir_, helios::storage::wal::WalIo::Posix(), kSegmentBytes);
   const auto scan = ScanRecords(wal);
   ASSERT_EQ(scan.status, WalScanResult::Status::kOk);
   size_t batch_values = 0;

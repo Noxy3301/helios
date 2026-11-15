@@ -50,9 +50,9 @@ class LoggerDurabilityTest : public ::testing::Test {
     ASSERT_NE(::mkdtemp(buffer.data()), nullptr);
     root_ = buffer.data();
     config_.work_dir = root_ + "/logs";
-    // Every fixture writes out its capacity before its first group; these
-    // logs hold a handful of frames.
-    config_.wal_initial_capacity_bytes = 1ull << 20;
+    // Every fixture writes out two segments before its first group; these logs
+    // hold a handful of frames.
+    config_.wal_segment_bytes = 1ull << 20;
   }
 
   void TearDown() override {
@@ -337,7 +337,7 @@ TEST_F(LoggerDurabilityTest, RecordsAboveTheTargetAreCarriedForward) {
   // Both epochs must be present, in order, after reopening.
   helios::storage::wal::Wal wal(config_.work_dir,
                                 helios::storage::wal::WalIo::Posix(),
-                                config_.wal_initial_capacity_bytes);
+                                config_.wal_segment_bytes);
   LogRecords records;
   const auto scan = wal.Scan(0, [&records](const LogRecords &batch) {
     records.insert(records.end(), batch.begin(), batch.end());
@@ -454,7 +454,7 @@ TEST_F(LoggerDurabilityTest, StopDrainsWhatWasAlreadyClosed) {
 
   helios::storage::wal::Wal wal(config_.work_dir,
                                 helios::storage::wal::WalIo::Posix(),
-                                config_.wal_initial_capacity_bytes);
+                                config_.wal_segment_bytes);
   const auto scan = wal.Scan();
   ASSERT_EQ(scan.status, helios::storage::wal::WalScanResult::Status::kOk);
   EXPECT_EQ(scan.last_epoch, 6u);

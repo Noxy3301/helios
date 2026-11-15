@@ -11,10 +11,6 @@
 
 namespace {
 
-// A log larger than this is a mistyped value rather than an intended
-// reservation: the space is written out at startup and occupied for the life
-// of the process.
-constexpr uint64_t kMaxWalCapacityBytes = 64ull * 1024ull * 1024ull * 1024ull;
 // A day between images is already far past any run this serves.
 constexpr uint64_t kMaxCheckpointMs = 24ull * 60ull * 60ull * 1000ull;
 
@@ -90,11 +86,6 @@ void apply_key(const std::string& key, const std::string& value) {
     } else if (key == "commit_durability") {
         if (value != "sync" && value != "async") refuse(key, value, "sync or async");
         g_config.commit_durability = value;
-    } else if (key == "wal_initial_capacity_bytes") {
-        if (!parse_number(value, 0, kMaxWalCapacityBytes, &number)) {
-            refuse(key, value, "an integer up to 64 GiB");
-        }
-        g_config.wal_initial_capacity_bytes = number;
     } else if (key == "checkpoint_interval_ms") {
         if (!parse_number(value, 0, kMaxCheckpointMs, &number)) {
             refuse(key, value, "an integer up to one day in milliseconds");

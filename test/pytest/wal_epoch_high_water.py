@@ -1,6 +1,6 @@
 """
 Regression: a log whose durable epoch sits at the epoch high-water mark must
-stop startup, on both startup paths.
+stop startup.
 
 Recovery resumes strictly above the durable epoch D it read, so that a
 transaction joining D itself cannot see that epoch already reported durable
@@ -8,9 +8,7 @@ and return a Sync acknowledgement before its record was written. Adding one to
 an epoch at the wrap point would break the ordering that comparison rests on,
 so the server refuses to start instead.
 
-Both paths compute the resume epoch: with recovery the records are replayed
-first, without recovery they are discarded and only the durable epoch is used.
-A regression in either one is silent -- the server starts and serves -- so this
+A regression here is silent -- the server starts and serves -- so this
 test drives the real binary and checks that it exits non-zero with the
 high-water message and without reporting a successful initialization. The
 control case, a durable epoch nowhere near the mark, checks the opposite pair:
@@ -35,9 +33,13 @@ SERVER = os.path.join(REPO, "build", "server", "helios-storage")
 # EpochFramework::kEpochHighWater
 HIGH_WATER = 0xFFFFFFFF - (1 << 20)
 
-# Wal frame constants, little-endian.
+# Wal record constants, little-endian.
 MAGIC = 0x4C415748
-FLAGS = 0
+HEADER_RECORD = 0
+FRAME_RECORD = 1
+SEGMENT_NUMBER = 1
+BLOCK_BYTES = 4096
+SEGMENT_BYTES = 512 * 1024 * 1024
 
 STARTUP_TIMEOUT_SECONDS = 20
 
@@ -52,6 +54,14 @@ def crc32c(data):
     return crc ^ 0xFFFFFFFF
 
 
+def make_record(record_type, offset, epoch, payload):
+    """One record valid at `offset` of the crafted segment."""
+    header_without_crc = struct.pack("<IHQQII", MAGIC, record_type,
+                                     SEGMENT_NUMBER, offset, len(payload), epoch)
+    checksum = crc32c(header_without_crc + payload)
+    return header_without_crc + struct.pack("<I", checksum) + payload
+
+
 def make_frame(epoch):
     """One frame carrying a single record with no key-value pairs.
 
@@ -62,10 +72,7 @@ def make_frame(epoch):
     array of a uint32 and an empty array.
     """
     payload = b"\x91\x92" + b"\xce" + struct.pack(">I", epoch) + b"\x90"
-    header_without_crc = struct.pack("<IHII", MAGIC, FLAGS,
-                                     len(payload), epoch)
-    checksum = crc32c(header_without_crc + payload)
-    return header_without_crc + struct.pack("<I", checksum) + payload
+    return make_record(FRAME_RECORD, BLOCK_BYTES, epoch, payload)
 
 
 def run_server(work_dir, conf):
@@ -91,8 +98,13 @@ def with_crafted_log(durable_epoch, conf):
     with tempfile.TemporaryDirectory(prefix="helios_high_water_") as work_dir:
         log_dir = os.path.join(work_dir, "helios_data")
         os.makedirs(log_dir)
-        with open(os.path.join(log_dir, "wal.log"), "wb") as wal:
+        name = f"wal-{SEGMENT_NUMBER:016d}.log"
+        with open(os.path.join(log_dir, name), "wb") as wal:
+            # The segment's header fills its first block, then the frame.
+            header_payload = bytes(BLOCK_BYTES - 34)
+            wal.write(make_record(HEADER_RECORD, 0, 0, header_payload))
             wal.write(make_frame(durable_epoch))
+            wal.truncate(SEGMENT_BYTES)
         return run_server(work_dir, conf)
 
 

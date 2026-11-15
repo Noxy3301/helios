@@ -43,7 +43,7 @@ namespace wal {
 
 Logger::Logger(const Config &config, WalIo io)
     : work_dir_(config.work_dir),
-      wal_(config.work_dir, std::move(io), config.wal_initial_capacity_bytes) {
+      wal_(config.work_dir, std::move(io), config.wal_segment_bytes) {
   helios::storage::util::set_log_pattern();
 }
 

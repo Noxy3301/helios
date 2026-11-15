@@ -128,17 +128,21 @@ uint32_t GetLe32(const std::string &in, size_t off) {
   return value;
 }
 
-// The payloads of the log's frames, in file order.
+// The payloads of the first segment's frames, in file order. Record headers
+// hold the type at offset 4 and the payload length at offset 22.
 std::vector<std::string> FramePayloads(const std::string &work_dir) {
-  std::ifstream in(work_dir + "/wal.log", std::ios::binary);
+  std::ifstream in(work_dir + "/" + Wal::SegmentFileName(1), std::ios::binary);
   const std::string file((std::istreambuf_iterator<char>(in)),
                          std::istreambuf_iterator<char>());
+  constexpr char kFrameType = 1;
   std::vector<std::string> payloads;
   size_t off = 0;
   while (file.size() - off >= Wal::kHeaderSize &&
          GetLe32(file, off) == Wal::kMagic) {
-    const uint32_t size = GetLe32(file, off + 6);
-    payloads.push_back(file.substr(off + Wal::kHeaderSize, size));
+    const uint32_t size = GetLe32(file, off + 22);
+    if (file[off + 4] == kFrameType) {
+      payloads.push_back(file.substr(off + Wal::kHeaderSize, size));
+    }
     off += Wal::kHeaderSize + size;
   }
   return payloads;
@@ -146,6 +150,8 @@ std::vector<std::string> FramePayloads(const std::string &work_dir) {
 
 class WalPackingTest : public ::testing::Test {
  protected:
+  static constexpr uint64_t kSegmentBytes = 16ull << 20;
+
   void SetUp() override {
     std::string pattern =
         (std::filesystem::temp_directory_path() / "helios_walpack_XXXXXX")
@@ -177,8 +183,7 @@ TEST_F(WalPackingTest, AFramePayloadIsTheListPacking) {
   }
 
   {
-    Wal wal(work_dir_, helios::storage::wal::WalIo::Posix(),
-            Wal::kNoPreallocation);
+    Wal wal(work_dir_, helios::storage::wal::WalIo::Posix(), kSegmentBytes);
     ASSERT_EQ(wal.Scan().status, WalScanResult::Status::kOk);
     std::map<EpochNumber, PackedLogRecords> buckets;
     buckets[kEpoch] = packed;
@@ -189,8 +194,7 @@ TEST_F(WalPackingTest, AFramePayloadIsTheListPacking) {
   ASSERT_EQ(payloads.size(), 1u);
   EXPECT_TRUE(payloads[0] == Packed(records));
 
-  Wal wal(work_dir_, helios::storage::wal::WalIo::Posix(),
-          Wal::kNoPreallocation);
+  Wal wal(work_dir_, helios::storage::wal::WalIo::Posix(), kSegmentBytes);
   LogRecords scanned;
   const auto scan = wal.Scan(0, [&scanned](const LogRecords &batch) {
     scanned.insert(scanned.end(), batch.begin(), batch.end());
@@ -260,7 +264,7 @@ TEST_F(WalPackingTest, ACommitRecordIsTheLogRecordPacking) {
     helios::storage::Config config;
     config.epoch_duration_ms = 10;
     config.work_dir = work_dir_;
-    config.wal_initial_capacity_bytes = 1ull << 20;
+    config.wal_segment_bytes = 1ull << 20;
     helios::storage::Database db(config);
     ASSERT_TRUE(TestHelper::CreateTable(db, table));
     ASSERT_TRUE(TestHelper::CreateTable(db, wide_table));

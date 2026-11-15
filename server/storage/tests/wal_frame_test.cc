@@ -26,9 +26,12 @@
 
 namespace {
 
-// Offsets inside a frame header (magic, flags, payload length, epoch,
-// checksum).
-constexpr off_t kFlagsOffset = 4;
+// Offsets inside a record header (magic, type, segment, offset, payload length,
+// epoch, checksum).
+constexpr off_t kTypeOffset = 4;
+constexpr off_t kLengthOffset = 22;
+constexpr off_t kEpochOffset = 26;
+constexpr uint16_t kFrameType = 1;
 
 using helios::storage::EpochNumber;
 using helios::storage::wal::Crc32c;
@@ -37,6 +40,7 @@ using helios::storage::wal::LogRecords;
 using helios::storage::wal::PackedLogRecord;
 using helios::storage::wal::PackedLogRecords;
 using helios::storage::wal::Wal;
+using helios::storage::wal::WalPosition;
 using helios::storage::wal::WalScanResult;
 
 LogRecords MakeRecords(EpochNumber epoch, const std::string &key) {
@@ -65,12 +69,16 @@ struct RecordScan : WalScanResult {
   LogRecords records;
 };
 
-RecordScan ScanRecords(Wal &wal, EpochNumber min_epoch = 0) {
+RecordScan ScanRecords(Wal &wal, EpochNumber min_epoch = 0,
+                       WalPosition start = {}) {
   RecordScan scan;
   WalScanResult &result = scan;
-  result = wal.Scan(min_epoch, [&scan](const LogRecords &batch) {
-    scan.records.insert(scan.records.end(), batch.begin(), batch.end());
-  });
+  result = wal.Scan(
+      min_epoch,
+      [&scan](const LogRecords &batch) {
+        scan.records.insert(scan.records.end(), batch.begin(), batch.end());
+      },
+      start);
   return scan;
 }
 
@@ -91,7 +99,9 @@ class WalFrameTest : public ::testing::Test {
     std::filesystem::remove_all(root_, ec);
   }
 
-  std::string WalPath() const { return work_dir_ + "/wal.log"; }
+  std::string WalPath() const {
+    return work_dir_ + "/" + Wal::SegmentFileName(1);
+  }
 
   off_t FileSize() const {
     struct stat file_stat {};
@@ -102,11 +112,10 @@ class WalFrameTest : public ::testing::Test {
   /**
    * @brief Returns where the log ends, which is not where the file ends.
    *
-   * @details Capacity beyond the last frame is written out with zeroes in
-   * advance.
+   * @details This reopens the log, as a restart does.
    */
-  off_t EndOfLog() {
-    Wal wal(work_dir_, helios::storage::wal::WalIo::Posix(), kCapacity);
+  uint64_t EndOfLog() {
+    Wal wal(work_dir_, helios::storage::wal::WalIo::Posix(), kSegment);
     EXPECT_EQ(wal.Scan().status, WalScanResult::Status::kOk);
     return wal.write_offset();
   }
@@ -144,24 +153,24 @@ class WalFrameTest : public ::testing::Test {
     ASSERT_EQ(::close(fd), 0);
   }
 
-  /** Offset one past the frame at `frame_offset`, taken from its own
-   * length. */
-  off_t FrameEnd(off_t frame_offset) {
+  /** Offset one past the record at `offset`, taken from its own length. */
+  off_t RecordEnd(off_t offset) {
     uint8_t header[Wal::kHeaderSize];
     const int fd = ::open(WalPath().c_str(), O_RDONLY);
     EXPECT_GE(fd, 0);
-    EXPECT_EQ(::pread(fd, header, sizeof(header), frame_offset),
+    EXPECT_EQ(::pread(fd, header, sizeof(header), offset),
               static_cast<ssize_t>(sizeof(header)));
     EXPECT_EQ(::close(fd), 0);
-    const uint32_t length = static_cast<uint32_t>(header[6]) |
-                            (static_cast<uint32_t>(header[7]) << 8) |
-                            (static_cast<uint32_t>(header[8]) << 16) |
-                            (static_cast<uint32_t>(header[9]) << 24);
-    return frame_offset + static_cast<off_t>(Wal::kHeaderSize) + length;
+    const uint32_t length =
+        static_cast<uint32_t>(header[kLengthOffset]) |
+        (static_cast<uint32_t>(header[kLengthOffset + 1]) << 8) |
+        (static_cast<uint32_t>(header[kLengthOffset + 2]) << 16) |
+        (static_cast<uint32_t>(header[kLengthOffset + 3]) << 24);
+    return offset + static_cast<off_t>(Wal::kHeaderSize) + length;
   }
 
   void AppendEpochs(const std::vector<EpochNumber> &epochs) {
-    Wal wal(work_dir_, helios::storage::wal::WalIo::Posix(), kCapacity);
+    Wal wal(work_dir_, helios::storage::wal::WalIo::Posix(), kSegment);
     ASSERT_EQ(wal.Scan().status, WalScanResult::Status::kOk);
     std::map<EpochNumber, PackedLogRecords> buckets;
     for (const auto epoch : epochs) {
@@ -169,13 +178,10 @@ class WalFrameTest : public ::testing::Test {
     }
     const auto result = wal.AppendGroup(buckets, epochs.back());
     ASSERT_TRUE(result.ok) << "errno " << result.error_number;
-    ASSERT_EQ(wal.extension_count(), 0u);
   }
 
   // Writes raw bytes at an absolute offset, standing in for the on-disk
-  // state a torn or corrupted group write leaves behind. A settled-size log
-  // must be addressed by offset rather than by appending: the file's own end
-  // is capacity, not the log's end.
+  // state a torn or corrupted group write leaves behind.
   void WriteRawBytesAt(off_t offset, const std::vector<uint8_t> &bytes) {
     const int fd = ::open(WalPath().c_str(), O_WRONLY);
     ASSERT_GE(fd, 0);
@@ -197,30 +203,42 @@ class WalFrameTest : public ::testing::Test {
     out.push_back(static_cast<uint8_t>((value >> 24) & 0xffu));
   }
 
-  // A syntactically complete header whose payload the file does not fully
-  // carry: the remaining declared bytes read back as whatever the log's
-  // reserved capacity already held.
-  std::vector<uint8_t> MakeHeaderClaimingPayload(EpochNumber epoch,
-                                                 uint32_t payload_len) {
+  static void PutLe64(std::vector<uint8_t> &out, uint64_t value) {
+    PutLe32(out, static_cast<uint32_t>(value));
+    PutLe32(out, static_cast<uint32_t>(value >> 32));
+  }
+
+  // A frame header naming segment 1 and `offset`, without its checksum.
+  std::vector<uint8_t> MakeFrameHeader(uint64_t offset, EpochNumber epoch,
+                                       uint32_t payload_len) {
     std::vector<uint8_t> header;
     PutLe32(header, Wal::kMagic);
-    PutLe16(header, Wal::kFlags);
+    PutLe16(header, kFrameType);
+    PutLe64(header, 1);
+    PutLe64(header, offset);
     PutLe32(header, payload_len);
     PutLe32(header, epoch);
+    return header;
+  }
+
+  // A syntactically complete header whose payload the file does not fully
+  // carry: the remaining declared bytes read back as whatever the segment
+  // already held.
+  std::vector<uint8_t> MakeHeaderClaimingPayload(uint64_t offset,
+                                                 EpochNumber epoch,
+                                                 uint32_t payload_len) {
+    std::vector<uint8_t> header = MakeFrameHeader(offset, epoch, payload_len);
     PutLe32(header, 0);  // A placeholder; the real payload was never written.
     return header;
   }
 
   // A complete frame with a correct checksum over an arbitrary payload.
-  std::vector<uint8_t> MakeFrame(EpochNumber epoch,
+  std::vector<uint8_t> MakeFrame(uint64_t offset, EpochNumber epoch,
                                  const std::vector<uint8_t> &payload) {
-    std::vector<uint8_t> frame;
-    PutLe32(frame, Wal::kMagic);
-    PutLe16(frame, Wal::kFlags);
-    PutLe32(frame, static_cast<uint32_t>(payload.size()));
-    PutLe32(frame, epoch);
+    std::vector<uint8_t> frame =
+        MakeFrameHeader(offset, epoch, static_cast<uint32_t>(payload.size()));
     Crc32c crc;
-    crc.Update(frame.data(), Wal::kHeaderSize - sizeof(uint32_t));
+    crc.Update(frame.data(), frame.size());
     crc.Update(payload.data(), payload.size());
     PutLe32(frame, crc.Finish());
     frame.insert(frame.end(), payload.begin(), payload.end());
@@ -236,14 +254,16 @@ class WalFrameTest : public ::testing::Test {
 
   // Enough for every group these tests write, and small enough that writing
   // it out costs nothing worth measuring.
-  static constexpr uint64_t kCapacity = 1ull << 20;
+  static constexpr uint64_t kSegment = 1ull << 20;
+  // Where the first frame of a segment lands: after the header block.
+  static constexpr uint64_t kFirstFrame = 4096;
 
   std::string root_;
   std::string work_dir_;
 };
 
 TEST_F(WalFrameTest, ScanOfAFreshLogHasNoLastEpoch) {
-  Wal wal(work_dir_, helios::storage::wal::WalIo::Posix(), kCapacity);
+  Wal wal(work_dir_, helios::storage::wal::WalIo::Posix(), kSegment);
   const auto result = ScanRecords(wal);
   EXPECT_EQ(result.status, WalScanResult::Status::kOk);
   EXPECT_EQ(result.last_epoch, 0u);
@@ -252,21 +272,20 @@ TEST_F(WalFrameTest, ScanOfAFreshLogHasNoLastEpoch) {
 }
 
 TEST_F(WalFrameTest, ScanReturnsTheLastCompleteEpoch) {
+  // Empty epochs leave gaps in the log.
   AppendEpochs({1, 3});
-  // Frames may share an epoch, and empty epochs leave gaps in the log.
-  WriteRawBytesAt(EndOfLog(), MakeFrame(3, PackRecords(MakeRecords(3, "again"))));
+  AppendEpochs({5});
 
-  Wal wal(work_dir_, helios::storage::wal::WalIo::Posix(), kCapacity);
+  Wal wal(work_dir_, helios::storage::wal::WalIo::Posix(), kSegment);
   const auto result = ScanRecords(wal);
   ASSERT_EQ(result.status, WalScanResult::Status::kOk);
-  EXPECT_EQ(result.last_epoch, 3u);
-  EXPECT_FALSE(result.tail_zeroed);
+  EXPECT_EQ(result.last_epoch, 5u);
   ASSERT_EQ(result.records.size(), 3u);
   EXPECT_EQ(result.records[0].epoch, 1u);
   EXPECT_EQ(result.records[1].epoch, 3u);
-  EXPECT_EQ(result.records[2].epoch, 3u);
+  EXPECT_EQ(result.records[2].epoch, 5u);
   EXPECT_EQ(result.records[0].writes.at(0).key, "k1");
-  EXPECT_EQ(result.records[2].writes.at(0).key, "again");
+  EXPECT_EQ(result.records[2].writes.at(0).key, "k5");
 }
 
 TEST_F(WalFrameTest, AGroupIsOneWriteAndOneSync) {
@@ -283,7 +302,7 @@ TEST_F(WalFrameTest, AGroupIsOneWriteAndOneSync) {
     return ::fdatasync(fd);
   };
 
-  Wal wal(work_dir_, io, kCapacity);
+  Wal wal(work_dir_, io, kSegment);
   ASSERT_EQ(wal.Scan().status, WalScanResult::Status::kOk);
   std::map<EpochNumber, PackedLogRecords> buckets;
   buckets[1] = MakePacked(1, "k1");
@@ -295,7 +314,7 @@ TEST_F(WalFrameTest, AGroupIsOneWriteAndOneSync) {
 }
 
 TEST_F(WalFrameTest, GroupSkipsBucketsAboveTheTarget) {
-  Wal wal(work_dir_, helios::storage::wal::WalIo::Posix(), kCapacity);
+  Wal wal(work_dir_, helios::storage::wal::WalIo::Posix(), kSegment);
   ASSERT_EQ(wal.Scan().status, WalScanResult::Status::kOk);
   std::map<EpochNumber, PackedLogRecords> buckets;
   buckets[1] = MakePacked(1, "k1");
@@ -311,38 +330,43 @@ TEST_F(WalFrameTest, GroupSkipsBucketsAboveTheTarget) {
 
 TEST_F(WalFrameTest, TheFirstInvalidFrameEndsThePrefixAndAppendResumesThere) {
   AppendEpochs({1, 2, 3});
-  const off_t damaged = FrameEnd(0);
+  const off_t damaged = RecordEnd(kFirstFrame);
   const off_t file_size = FileSize();
 
   // A complete third frame does not license reading past the broken second.
   FlipByteAt(damaged + static_cast<off_t>(Wal::kHeaderSize) + 1);
+  uint64_t resumed = 0;
   {
-    Wal wal(work_dir_, helios::storage::wal::WalIo::Posix(), kCapacity);
+    Wal wal(work_dir_, helios::storage::wal::WalIo::Posix(), kSegment);
     const auto result = ScanRecords(wal);
     ASSERT_EQ(result.status, WalScanResult::Status::kOk) << result.detail;
     EXPECT_TRUE(result.tail_zeroed);
     EXPECT_EQ(result.last_epoch, 1u);
     ASSERT_EQ(result.records.size(), 1u);
     EXPECT_EQ(result.records[0].writes.at(0).key, "k1");
-    EXPECT_EQ(wal.write_offset(), damaged);
+    // The prefix ended mid-block, and the next group starts on a block of its
+    // own.
+    resumed = wal.write_offset();
+    EXPECT_GT(resumed, static_cast<uint64_t>(damaged));
+    EXPECT_EQ(resumed % kFirstFrame, 0u);
   }
-  AssertRangeIsZero(damaged, file_size);
+  AssertRangeIsZero(resumed, file_size);
   EXPECT_EQ(FileSize(), file_size);
 
-  // Repair keeps the reservation and restores the offset used by the next
-  // process, even when its new group is shorter than the discarded suffix.
+  // Repair restores the offset used by the next process, even when its new
+  // group is shorter than the discarded suffix.
   {
-    Wal wal(work_dir_, helios::storage::wal::WalIo::Posix(), kCapacity);
+    Wal wal(work_dir_, helios::storage::wal::WalIo::Posix(), kSegment);
     const auto result = wal.Scan();
     ASSERT_EQ(result.status, WalScanResult::Status::kOk);
     EXPECT_FALSE(result.tail_zeroed);
-    ASSERT_EQ(wal.write_offset(), damaged);
+    ASSERT_EQ(wal.write_offset(), resumed);
     std::map<EpochNumber, PackedLogRecords> buckets;
     buckets[4] = MakePacked(4, "k4");
     ASSERT_TRUE(wal.AppendGroup(buckets, 4).ok);
     EXPECT_EQ(FileSize(), file_size);
   }
-  Wal wal(work_dir_, helios::storage::wal::WalIo::Posix(), kCapacity);
+  Wal wal(work_dir_, helios::storage::wal::WalIo::Posix(), kSegment);
   const auto result = ScanRecords(wal);
   ASSERT_EQ(result.status, WalScanResult::Status::kOk) << result.detail;
   EXPECT_FALSE(result.tail_zeroed);
@@ -354,16 +378,16 @@ TEST_F(WalFrameTest, TheFirstInvalidFrameEndsThePrefixAndAppendResumesThere) {
 
 TEST_F(WalFrameTest, PartialHeaderIsRepaired) {
   AppendEpochs({1, 2});
-  const off_t full_end = EndOfLog();
+  const uint64_t full_end = EndOfLog();
   const off_t full_size = FileSize();
 
   // A write that stopped inside the next frame's header, which leaves a
-  // prefix of the magic over the reserved zeroes.
+  // prefix of the magic over the zeroes.
   const std::vector<uint8_t> partial_header = {0x4c, 0x41, 0x57};
   WriteRawBytesAt(full_end, partial_header);
 
   {
-    Wal wal(work_dir_, helios::storage::wal::WalIo::Posix(), kCapacity);
+    Wal wal(work_dir_, helios::storage::wal::WalIo::Posix(), kSegment);
     const auto result = wal.Scan();
     ASSERT_EQ(result.status, WalScanResult::Status::kOk) << result.detail;
     EXPECT_TRUE(result.tail_zeroed);
@@ -377,7 +401,7 @@ TEST_F(WalFrameTest, PartialHeaderIsRepaired) {
   EXPECT_EQ(FileSize(), full_size);
 
   // A later scan reaches the same end with nothing left to repair.
-  Wal wal(work_dir_, helios::storage::wal::WalIo::Posix(), kCapacity);
+  Wal wal(work_dir_, helios::storage::wal::WalIo::Posix(), kSegment);
   const auto result = wal.Scan();
   ASSERT_EQ(result.status, WalScanResult::Status::kOk) << result.detail;
   EXPECT_FALSE(result.tail_zeroed);
@@ -386,18 +410,18 @@ TEST_F(WalFrameTest, PartialHeaderIsRepaired) {
 
 TEST_F(WalFrameTest, PartialPayloadIsRepaired) {
   AppendEpochs({1, 2});
-  const off_t log_end = EndOfLog();
+  const uint64_t log_end = EndOfLog();
   const off_t file_size = FileSize();
 
   // A full header with only ten payload bytes. The declared end may lie in
-  // the reservation or beyond the file; both leave the same valid prefix.
-  for (const uint32_t length : {50u, static_cast<uint32_t>(kCapacity)}) {
+  // the segment or beyond it; both leave the same valid prefix.
+  for (const uint32_t length : {50u, static_cast<uint32_t>(kSegment)}) {
     SCOPED_TRACE(length);
-    auto torn = MakeHeaderClaimingPayload(3, length);
+    auto torn = MakeHeaderClaimingPayload(log_end, 3, length);
     torn.insert(torn.end(), 10, 0xab);
     WriteRawBytesAt(log_end, torn);
 
-    Wal wal(work_dir_, helios::storage::wal::WalIo::Posix(), kCapacity);
+    Wal wal(work_dir_, helios::storage::wal::WalIo::Posix(), kSegment);
     const auto result = ScanRecords(wal);
     ASSERT_EQ(result.status, WalScanResult::Status::kOk) << result.detail;
     EXPECT_TRUE(result.tail_zeroed);
@@ -411,28 +435,28 @@ TEST_F(WalFrameTest, PartialPayloadIsRepaired) {
 
 TEST_F(WalFrameTest, AnInvalidHeaderEndsTheRecoveredPrefix) {
   AppendEpochs({1, 2});
-  const off_t damaged = FrameEnd(0);
-  WriteRawBytesAt(damaged + kFlagsOffset, {0x07, 0x00});
+  const off_t damaged = RecordEnd(kFirstFrame);
+  WriteRawBytesAt(damaged + kTypeOffset, {0x07, 0x00});
 
-  Wal wal(work_dir_, helios::storage::wal::WalIo::Posix(), kCapacity);
+  Wal wal(work_dir_, helios::storage::wal::WalIo::Posix(), kSegment);
   const auto result = ScanRecords(wal);
   ASSERT_EQ(result.status, WalScanResult::Status::kOk) << result.detail;
   EXPECT_TRUE(result.tail_zeroed);
   EXPECT_EQ(result.last_epoch, 1u);
   ASSERT_EQ(result.records.size(), 1u);
-  EXPECT_EQ(wal.write_offset(), damaged);
-  AssertRangeIsZero(damaged, FileSize());
+  AssertRangeIsZero(wal.write_offset(), FileSize());
 }
 
 TEST_F(WalFrameTest, AnEmbeddedFrameDoesNotSurviveTheTornTail) {
   AppendEpochs({1});
-  const off_t log_end = EndOfLog();
-  const auto embedded = MakeFrame(5, PackRecords(MakeRecords(5, "k5")));
-  auto torn = MakeHeaderClaimingPayload(6, 4096);
+  const uint64_t log_end = EndOfLog();
+  auto torn = MakeHeaderClaimingPayload(log_end, 6, 4096);
+  const auto embedded =
+      MakeFrame(log_end + torn.size(), 5, PackRecords(MakeRecords(5, "k5")));
   torn.insert(torn.end(), embedded.begin(), embedded.end());
   WriteRawBytesAt(log_end, torn);
 
-  Wal wal(work_dir_, helios::storage::wal::WalIo::Posix(), kCapacity);
+  Wal wal(work_dir_, helios::storage::wal::WalIo::Posix(), kSegment);
   const auto result = ScanRecords(wal);
   ASSERT_EQ(result.status, WalScanResult::Status::kOk) << result.detail;
   EXPECT_TRUE(result.tail_zeroed);
@@ -444,7 +468,7 @@ TEST_F(WalFrameTest, AnEmbeddedFrameDoesNotSurviveTheTornTail) {
 
 TEST_F(WalFrameTest, MalformedPayloadsEndTheRecoveredPrefix) {
   AppendEpochs({1});
-  const off_t log_end = EndOfLog();
+  const uint64_t log_end = EndOfLog();
   auto trailing = PackRecords(MakeRecords(2, "k2"));
   trailing.push_back(0x00);
   const std::vector<std::vector<uint8_t>> payloads = {
@@ -455,8 +479,8 @@ TEST_F(WalFrameTest, MalformedPayloadsEndTheRecoveredPrefix) {
   };
   for (const auto &payload : payloads) {
     // Recompute the checksum so the decoder, not CRC, rejects the frame.
-    WriteRawBytesAt(log_end, MakeFrame(2, payload));
-    Wal wal(work_dir_, helios::storage::wal::WalIo::Posix(), kCapacity);
+    WriteRawBytesAt(log_end, MakeFrame(log_end, 2, payload));
+    Wal wal(work_dir_, helios::storage::wal::WalIo::Posix(), kSegment);
     const auto result = ScanRecords(wal);
     ASSERT_EQ(result.status, WalScanResult::Status::kOk) << result.detail;
     EXPECT_TRUE(result.tail_zeroed);
@@ -468,14 +492,14 @@ TEST_F(WalFrameTest, MalformedPayloadsEndTheRecoveredPrefix) {
   }
 }
 
-TEST_F(WalFrameTest, ZeroOrRegressedEpochEndsTheRecoveredPrefix) {
+TEST_F(WalFrameTest, AnEpochThatDoesNotIncreaseEndsTheRecoveredPrefix) {
   AppendEpochs({3});
-  const off_t log_end = EndOfLog();
-  for (const EpochNumber epoch : {0u, 2u}) {
+  const uint64_t log_end = EndOfLog();
+  for (const EpochNumber epoch : {0u, 2u, 3u}) {
     SCOPED_TRACE(epoch);
-    WriteRawBytesAt(
-        log_end, MakeFrame(epoch, PackRecords(MakeRecords(epoch, "k"))));
-    Wal wal(work_dir_, helios::storage::wal::WalIo::Posix(), kCapacity);
+    WriteRawBytesAt(log_end, MakeFrame(log_end, epoch,
+                                       PackRecords(MakeRecords(epoch, "k"))));
+    Wal wal(work_dir_, helios::storage::wal::WalIo::Posix(), kSegment);
     const auto result = ScanRecords(wal);
     ASSERT_EQ(result.status, WalScanResult::Status::kOk) << result.detail;
     EXPECT_TRUE(result.tail_zeroed);
@@ -488,11 +512,12 @@ TEST_F(WalFrameTest, ZeroOrRegressedEpochEndsTheRecoveredPrefix) {
 
 TEST_F(WalFrameTest, AZeroHeaderBeforeNonzeroBytesEndsTheRecoveredPrefix) {
   AppendEpochs({1});
-  const off_t log_end = EndOfLog();
-  // Frame-like bytes after the reserved-zero header are outside the prefix.
-  WriteRawBytesAt(log_end + 128, MakeFrame(2, PackRecords(MakeRecords(2, "k2"))));
+  const uint64_t log_end = EndOfLog();
+  // Frame-like bytes after a zero header are outside the prefix.
+  WriteRawBytesAt(log_end + 128, MakeFrame(log_end + 128, 2,
+                                           PackRecords(MakeRecords(2, "k2"))));
 
-  Wal wal(work_dir_, helios::storage::wal::WalIo::Posix(), kCapacity);
+  Wal wal(work_dir_, helios::storage::wal::WalIo::Posix(), kSegment);
   const auto result = ScanRecords(wal);
   ASSERT_EQ(result.status, WalScanResult::Status::kOk) << result.detail;
   EXPECT_TRUE(result.tail_zeroed);
@@ -504,8 +529,8 @@ TEST_F(WalFrameTest, AZeroHeaderBeforeNonzeroBytesEndsTheRecoveredPrefix) {
 
 TEST_F(WalFrameTest, AReadFailureDoesNotRepairTheLog) {
   AppendEpochs({1, 2});
-  const off_t payload_offset = FrameEnd(0) + Wal::kHeaderSize;
-  const off_t log_end = EndOfLog();
+  const off_t payload_offset = RecordEnd(kFirstFrame) + Wal::kHeaderSize;
+  const uint64_t log_end = EndOfLog();
   const off_t file_size = FileSize();
   auto io = helios::storage::wal::WalIo::Posix();
   const auto real_pread = io.pread;
@@ -518,14 +543,14 @@ TEST_F(WalFrameTest, AReadFailureDoesNotRepairTheLog) {
     return real_pread(fd, data, size, offset);
   };
   {
-    Wal wal(work_dir_, io, kCapacity);
+    Wal wal(work_dir_, io, kSegment);
     const auto result = wal.Scan();
     EXPECT_EQ(result.status, WalScanResult::Status::kIoError);
     EXPECT_EQ(result.error_number, EIO);
     EXPECT_FALSE(result.tail_zeroed);
-    EXPECT_EQ(wal.write_offset(), 0);
+    EXPECT_EQ(wal.write_offset(), 0u);
   }
-  Wal wal(work_dir_, helios::storage::wal::WalIo::Posix(), kCapacity);
+  Wal wal(work_dir_, helios::storage::wal::WalIo::Posix(), kSegment);
   const auto result = ScanRecords(wal);
   ASSERT_EQ(result.status, WalScanResult::Status::kOk);
   EXPECT_FALSE(result.tail_zeroed);
@@ -537,7 +562,7 @@ TEST_F(WalFrameTest, AReadFailureDoesNotRepairTheLog) {
 
 TEST_F(WalFrameTest, ARepairWriteFailureDoesNotReturnARecoveredPrefix) {
   AppendEpochs({1, 2});
-  const off_t damaged = FrameEnd(0);
+  const off_t damaged = RecordEnd(kFirstFrame);
   FlipByteAt(damaged + Wal::kHeaderSize + 1);
   auto io = helios::storage::wal::WalIo::Posix();
   io.initialise_pwrite = [](int, const void *, size_t, off_t) -> ssize_t {
@@ -545,24 +570,26 @@ TEST_F(WalFrameTest, ARepairWriteFailureDoesNotReturnARecoveredPrefix) {
     return -1;
   };
 
-  Wal wal(work_dir_, io, kCapacity);
+  Wal wal(work_dir_, io, kSegment);
   const auto result = wal.Scan();
   EXPECT_EQ(result.status, WalScanResult::Status::kIoError);
   EXPECT_EQ(result.error_number, ENOSPC);
   EXPECT_FALSE(result.tail_zeroed);
-  EXPECT_EQ(wal.write_offset(), 0);
+  EXPECT_EQ(wal.write_offset(), 0u);
 }
 
-TEST_F(WalFrameTest, AnAppendBelowTheLastEpochIsRefused) {
+TEST_F(WalFrameTest, AnAppendAtOrBelowTheLastEpochIsRefused) {
   AppendEpochs({3});
 
-  Wal wal(work_dir_, helios::storage::wal::WalIo::Posix(), kCapacity);
+  Wal wal(work_dir_, helios::storage::wal::WalIo::Posix(), kSegment);
   ASSERT_EQ(wal.Scan().status, WalScanResult::Status::kOk);
-  std::map<EpochNumber, PackedLogRecords> buckets;
-  buckets[2] = MakePacked(2, "k2");
-  const auto result = wal.AppendGroup(buckets, 2);
-  EXPECT_FALSE(result.ok);
-  EXPECT_EQ(result.error_number, EINVAL);
+  for (const EpochNumber epoch : {2u, 3u}) {
+    std::map<EpochNumber, PackedLogRecords> buckets;
+    buckets[epoch] = MakePacked(epoch, "k");
+    const auto result = wal.AppendGroup(buckets, epoch);
+    EXPECT_FALSE(result.ok);
+    EXPECT_EQ(result.error_number, EINVAL);
+  }
 }
 
 /**
@@ -573,7 +600,7 @@ TEST_F(WalFrameTest, AnAppendBelowTheLastEpochIsRefused) {
  * which writes to stdout, while a death test watches stderr.
  */
 TEST_F(WalFrameTest, AnAppendBeforeTheScanIsRefused) {
-  Wal wal(work_dir_, helios::storage::wal::WalIo::Posix(), kCapacity);
+  Wal wal(work_dir_, helios::storage::wal::WalIo::Posix(), kSegment);
   std::map<EpochNumber, PackedLogRecords> buckets;
   buckets[1] = MakePacked(1, "k1");
   EXPECT_DEATH(wal.AppendGroup(buckets, 1), "");
@@ -589,7 +616,7 @@ TEST_F(WalFrameTest, ShortWritesAreRetriedUntilTheGroupIsComplete) {
       return ::pwrite(fd, iov[0].iov_base, 1, offset);  // one byte per call
     };
 
-    Wal wal(work_dir_, io, kCapacity);
+    Wal wal(work_dir_, io, kSegment);
     ASSERT_EQ(wal.Scan().status, WalScanResult::Status::kOk);
     std::map<EpochNumber, PackedLogRecords> buckets;
     buckets[1] = MakePacked(1, "k1");
@@ -599,7 +626,7 @@ TEST_F(WalFrameTest, ShortWritesAreRetriedUntilTheGroupIsComplete) {
 
   // The exclusive flock is held only while `wal` is alive; the reader needs
   // its own instance, opened after that one is gone.
-  Wal reader(work_dir_, helios::storage::wal::WalIo::Posix(), kCapacity);
+  Wal reader(work_dir_, helios::storage::wal::WalIo::Posix(), kSegment);
   const auto result = ScanRecords(reader);
   ASSERT_EQ(result.status, WalScanResult::Status::kOk) << result.detail;
   EXPECT_EQ(result.last_epoch, 1u);
@@ -618,7 +645,7 @@ TEST_F(WalFrameTest, APartialWriteIsCarriedToCompletion) {
                     offset);
   };
 
-  Wal wal(work_dir_, io, kCapacity);
+  Wal wal(work_dir_, io, kSegment);
   ASSERT_EQ(wal.Scan().status, WalScanResult::Status::kOk);
   std::map<EpochNumber, PackedLogRecords> buckets;
   buckets[1] = MakePacked(1, "k1");
@@ -633,9 +660,6 @@ TEST_F(WalFrameTest, APartialWriteIsCarriedToCompletion) {
   EXPECT_EQ(result.records.size(), 2u);
 }
 
-// Written from iovecs, a group is byte for byte the frames of its buckets,
-// also when writes stop inside an iovec and the group has more iovecs than
-// one call takes.
 TEST_F(WalFrameTest, AGroupIsTheFramesOfItsBucketsByteForByte) {
   // Record lists under and over the msgpack fixarray and array16 limits.
   const std::map<EpochNumber, size_t> counts = {
@@ -648,7 +672,8 @@ TEST_F(WalFrameTest, AGroupIsTheFramesOfItsBucketsByteForByte) {
       records.push_back(MakeRecords(epoch, "k" + std::to_string(i)).front());
       buckets[epoch].push_back(pack_record(records.back()));
     }
-    const std::vector<uint8_t> frame = MakeFrame(epoch, PackRecords(records));
+    const std::vector<uint8_t> frame =
+        MakeFrame(kFirstFrame + expected.size(), epoch, PackRecords(records));
     expected.insert(expected.end(), frame.begin(), frame.end());
   }
 
@@ -670,16 +695,16 @@ TEST_F(WalFrameTest, AGroupIsTheFramesOfItsBucketsByteForByte) {
     return ::pwritev(fd, part.data(), static_cast<int>(part.size()), offset);
   };
   {
-    Wal wal(work_dir_, io, Wal::kNoPreallocation);
+    Wal wal(work_dir_, io, 16 * kSegment);
     ASSERT_EQ(wal.Scan().status, WalScanResult::Status::kOk);
     ASSERT_TRUE(wal.AppendGroup(buckets, 4).ok);
   }
   EXPECT_EQ(widest, IOV_MAX);
 
-  std::vector<uint8_t> written(static_cast<size_t>(FileSize()));
+  std::vector<uint8_t> written(expected.size());
   const int fd = ::open(WalPath().c_str(), O_RDONLY);
   ASSERT_GE(fd, 0);
-  const ssize_t got = ::pread(fd, written.data(), written.size(), 0);
+  const ssize_t got = ::pread(fd, written.data(), written.size(), kFirstFrame);
   ::close(fd);
   ASSERT_EQ(got, static_cast<ssize_t>(written.size()));
   EXPECT_TRUE(written == expected);
@@ -697,7 +722,7 @@ TEST_F(WalFrameTest, WriteFailurePropagatesWithoutSyncing) {
     return 0;
   };
 
-  Wal wal(work_dir_, io, kCapacity);
+  Wal wal(work_dir_, io, kSegment);
   ASSERT_EQ(wal.Scan().status, WalScanResult::Status::kOk);
   std::map<EpochNumber, PackedLogRecords> buckets;
   buckets[1] = MakePacked(1, "k1");
@@ -720,7 +745,7 @@ TEST_F(WalFrameTest, AFailedAppendRefusesEveryLaterAppend) {
     return -1;
   };
 
-  Wal wal(work_dir_, io, kCapacity);
+  Wal wal(work_dir_, io, kSegment);
   ASSERT_EQ(wal.Scan().status, WalScanResult::Status::kOk);
   std::map<EpochNumber, PackedLogRecords> first;
   first[1] = MakePacked(1, "k1");
@@ -732,7 +757,7 @@ TEST_F(WalFrameTest, AFailedAppendRefusesEveryLaterAppend) {
 }
 
 TEST_F(WalFrameTest, ABucketTheScanWouldRejectIsRefused) {
-  Wal wal(work_dir_, helios::storage::wal::WalIo::Posix(), kCapacity);
+  Wal wal(work_dir_, helios::storage::wal::WalIo::Posix(), kSegment);
   ASSERT_EQ(wal.Scan().status, WalScanResult::Status::kOk);
   {
     std::map<EpochNumber, PackedLogRecords> buckets;
@@ -748,7 +773,14 @@ TEST_F(WalFrameTest, ABucketTheScanWouldRejectIsRefused) {
     EXPECT_FALSE(result.ok);
     EXPECT_EQ(result.error_number, EINVAL);
   }
-  EXPECT_EQ(wal.write_offset(), 0);
+  {
+    std::map<EpochNumber, PackedLogRecords> buckets;
+    buckets[3] = MakePacked(3, std::string(kSegment, 'x'));  // over a segment
+    const auto result = wal.AppendGroup(buckets, 3);
+    EXPECT_FALSE(result.ok);
+    EXPECT_EQ(result.error_number, EOVERFLOW);
+  }
+  EXPECT_EQ(wal.write_offset(), kFirstFrame);
 }
 
 TEST_F(WalFrameTest, FdatasyncFailurePropagates) {
@@ -758,7 +790,7 @@ TEST_F(WalFrameTest, FdatasyncFailurePropagates) {
     return -1;
   };
 
-  Wal wal(work_dir_, io, kCapacity);
+  Wal wal(work_dir_, io, kSegment);
   ASSERT_EQ(wal.Scan().status, WalScanResult::Status::kOk);
   std::map<EpochNumber, PackedLogRecords> buckets;
   buckets[1] = MakePacked(1, "k1");
@@ -774,261 +806,63 @@ TEST_F(WalFrameTest, ScanAcceptsTheMaximumEpoch) {
   // startup to add one to UINT32_MAX.
   const EpochNumber near_wrap = 0xFFFFFFFFu;
   {
-    Wal wal(work_dir_, helios::storage::wal::WalIo::Posix(), kCapacity);
+    Wal wal(work_dir_, helios::storage::wal::WalIo::Posix(), kSegment);
     ASSERT_EQ(wal.Scan().status, WalScanResult::Status::kOk);
     std::map<EpochNumber, PackedLogRecords> buckets;
     buckets[near_wrap] = MakePacked(near_wrap, "k");
     ASSERT_TRUE(wal.AppendGroup(buckets, near_wrap).ok);
   }
-  Wal wal(work_dir_, helios::storage::wal::WalIo::Posix(), kCapacity);
+  Wal wal(work_dir_, helios::storage::wal::WalIo::Posix(), kSegment);
   const auto result = wal.Scan();
   ASSERT_EQ(result.status, WalScanResult::Status::kOk);
   EXPECT_EQ(result.last_epoch, near_wrap);
 }
 
-// The whole point of the design: the file's size is settled before the
-// first group, so a group flush has no new size to persist.
-TEST_F(WalFrameTest, CapacityIsWrittenOutAndGroupsDoNotChangeTheFileSize) {
-  Wal wal(work_dir_, helios::storage::wal::WalIo::Posix(), kCapacity);
+// The whole point of the design: a segment's size is settled before the first
+// group, so a group flush has no new size to persist, and every group ends on
+// a block of its own.
+TEST_F(WalFrameTest, ASegmentIsWrittenOutAndGroupsEndOnABlockBoundary) {
+  Wal wal(work_dir_, helios::storage::wal::WalIo::Posix(), kSegment);
   ASSERT_EQ(wal.Scan().status, WalScanResult::Status::kOk);
-  ASSERT_EQ(FileSize(), static_cast<off_t>(kCapacity));
+  ASSERT_EQ(FileSize(), static_cast<off_t>(kSegment));
 
-  off_t previous_end = 0;
+  uint64_t previous_end = 0;
   for (EpochNumber epoch = 1; epoch <= 4; ++epoch) {
     std::map<EpochNumber, PackedLogRecords> buckets;
     buckets[epoch] = MakePacked(epoch, "k" + std::to_string(epoch));
     ASSERT_TRUE(wal.AppendGroup(buckets, epoch).ok);
-    EXPECT_EQ(FileSize(), static_cast<off_t>(kCapacity));
+    EXPECT_EQ(FileSize(), static_cast<off_t>(kSegment));
     EXPECT_GT(wal.write_offset(), previous_end);
+    EXPECT_EQ(wal.write_offset() % kFirstFrame, 0u);
     previous_end = wal.write_offset();
   }
-  EXPECT_EQ(wal.extension_count(), 0u);
-}
-
-// A log written before capacity existed ends where the file ends, with no
-// zeroes after it. Opening it must find that end and reserve from there.
-TEST_F(WalFrameTest, AGrownLogIsAdoptedWithoutLosingFrames) {
-  {
-    Wal wal(work_dir_, helios::storage::wal::WalIo::Posix(),
-            Wal::kNoPreallocation);
-    ASSERT_EQ(wal.Scan().status, WalScanResult::Status::kOk);
-    std::map<EpochNumber, PackedLogRecords> buckets;
-    buckets[1] = MakePacked(1, "k1");
-    buckets[2] = MakePacked(2, "k2");
-    ASSERT_TRUE(wal.AppendGroup(buckets, 2).ok);
-    ASSERT_EQ(FileSize(), wal.write_offset());
-  }
-  const off_t grown_end = FileSize();
-
-  Wal wal(work_dir_, helios::storage::wal::WalIo::Posix(), kCapacity);
-  const auto result = ScanRecords(wal);
-  ASSERT_EQ(result.status, WalScanResult::Status::kOk) << result.detail;
-  EXPECT_FALSE(result.tail_zeroed);
-  EXPECT_EQ(result.last_epoch, 2u);
-  EXPECT_EQ(result.records.size(), 2u);
-  EXPECT_EQ(wal.write_offset(), grown_end);
-  EXPECT_EQ(FileSize(), static_cast<off_t>(kCapacity));
-
-  std::map<EpochNumber, PackedLogRecords> buckets;
-  buckets[3] = MakePacked(3, "k3");
-  ASSERT_TRUE(wal.AppendGroup(buckets, 3).ok);
-  EXPECT_EQ(FileSize(), static_cast<off_t>(kCapacity));
-}
-
-// A crash during an extension leaves a file whose size stopped partway,
-// because the zeroes are what advances it. The next start reserves the
-// rest.
-TEST_F(WalFrameTest, AHalfWrittenCapacityIsCompleted) {
-  AppendEpochs({1});
-  const off_t log_end = EndOfLog();
-
-  ASSERT_EQ(::truncate(WalPath().c_str(),
-                       log_end + static_cast<off_t>(kCapacity) / 4),
-            0);
-
-  Wal wal(work_dir_, helios::storage::wal::WalIo::Posix(), kCapacity);
-  const auto result = wal.Scan();
-  ASSERT_EQ(result.status, WalScanResult::Status::kOk) << result.detail;
-  EXPECT_FALSE(result.tail_zeroed);
-  EXPECT_EQ(result.last_epoch, 1u);
-  EXPECT_EQ(wal.write_offset(), log_end);
-  EXPECT_EQ(FileSize(), static_cast<off_t>(kCapacity));
-}
-
-// A reservation that fails partway leaves the file as far along as it got.
-// The next start finishes it, and the log it already held is untouched.
-TEST_F(WalFrameTest, AnInterruptedReservationIsCompletedOnTheNextStart) {
-  // Written without preallocation, so that the file still ends at the log
-  // and the reservation below has something to do.
-  {
-    Wal wal(work_dir_, helios::storage::wal::WalIo::Posix(),
-            Wal::kNoPreallocation);
-    ASSERT_EQ(wal.Scan().status, WalScanResult::Status::kOk);
-    std::map<EpochNumber, PackedLogRecords> buckets;
-    buckets[1] = MakePacked(1, "k1");
-    ASSERT_TRUE(wal.AppendGroup(buckets, 1).ok);
-  }
-  const off_t log_end = FileSize();
-
-  {
-    off_t allowed = static_cast<off_t>(kCapacity) / 4;
-    helios::storage::wal::WalIo io = helios::storage::wal::WalIo::Posix();
-    io.initialise_pwrite = [&allowed](int fd, const void *data, size_t size,
-                                      off_t offset) -> ssize_t {
-      if (allowed <= 0) {
-        errno = EIO;
-        return -1;
-      }
-      const ssize_t written =
-          ::pwrite(fd, data, std::min<size_t>(size, 4096), offset);
-      if (written > 0) allowed -= written;
-      return written;
-    };
-
-    Wal wal(work_dir_, io, kCapacity);
-    const auto result = wal.Scan();
-    EXPECT_EQ(result.status, WalScanResult::Status::kIoError);
-    EXPECT_EQ(wal.write_offset(), 0);
-  }
-  ASSERT_GT(FileSize(), log_end);
-  ASSERT_LT(FileSize(), static_cast<off_t>(kCapacity));
-
-  Wal wal(work_dir_, helios::storage::wal::WalIo::Posix(), kCapacity);
-  const auto result = wal.Scan();
-  ASSERT_EQ(result.status, WalScanResult::Status::kOk) << result.detail;
-  EXPECT_FALSE(result.tail_zeroed);
-  EXPECT_EQ(result.last_epoch, 1u);
-  EXPECT_EQ(wal.write_offset(), log_end);
-  EXPECT_EQ(FileSize(), static_cast<off_t>(kCapacity));
-}
-
-// A capacity of one byte reserves exactly what each group needs, which is
-// the worst case for rounding the target up and the case that would expose
-// a step per unit rather than a division.
-TEST_F(WalFrameTest, ACapacityOfOneByteReservesPerGroup) {
-  Wal wal(work_dir_, helios::storage::wal::WalIo::Posix(), 1);
-  ASSERT_EQ(wal.Scan().status, WalScanResult::Status::kOk);
-
-  for (EpochNumber epoch = 1; epoch <= 3; ++epoch) {
-    std::map<EpochNumber, PackedLogRecords> buckets;
-    buckets[epoch] = MakePacked(epoch, "k" + std::to_string(epoch));
-    ASSERT_TRUE(wal.AppendGroup(buckets, epoch).ok);
-    EXPECT_EQ(FileSize(), wal.write_offset());
-  }
-  EXPECT_EQ(wal.extension_count(), 3u);
-
-  const auto result = ScanRecords(wal);
-  ASSERT_EQ(result.status, WalScanResult::Status::kOk) << result.detail;
-  EXPECT_EQ(result.last_epoch, 3u);
-  EXPECT_EQ(result.records.size(), 3u);
-}
-
-// A log that outgrows its capacity is extended rather than refused, and the
-// extension is counted: it is a synchronous write of a whole new region,
-// which a measurement of the flush alone has to see is absent.
-TEST_F(WalFrameTest, OutgrowingCapacityExtendsAndIsCounted) {
-  constexpr uint64_t kTinyCapacity = 4096;
-  Wal wal(work_dir_, helios::storage::wal::WalIo::Posix(), kTinyCapacity);
-  ASSERT_EQ(wal.Scan().status, WalScanResult::Status::kOk);
-  ASSERT_EQ(FileSize(), static_cast<off_t>(kTinyCapacity));
-
-  for (EpochNumber epoch = 1; epoch <= 60; ++epoch) {
-    std::map<EpochNumber, PackedLogRecords> buckets;
-    buckets[epoch] =
-        MakePacked(epoch, std::string(200, 'x') + std::to_string(epoch));
-    ASSERT_TRUE(wal.AppendGroup(buckets, epoch).ok);
-  }
-  ASSERT_GT(wal.write_offset(), static_cast<off_t>(kTinyCapacity));
-  EXPECT_GT(wal.extension_count(), 0u);
-  EXPECT_GE(FileSize(), wal.write_offset());
-  EXPECT_EQ(FileSize() % static_cast<off_t>(kTinyCapacity), 0);
-
-  const auto result = ScanRecords(wal);
-  ASSERT_EQ(result.status, WalScanResult::Status::kOk) << result.detail;
-  EXPECT_EQ(result.last_epoch, 60u);
-  EXPECT_EQ(result.records.size(), 60u);
 }
 
 // Offsets are this process's to assign once the file is no longer opened for
 // appending, so a second holder would write over frames rather than after
 // them.
 TEST_F(WalFrameTest, ASecondHolderIsRefused) {
-  Wal wal(work_dir_, helios::storage::wal::WalIo::Posix(), kCapacity);
+  Wal wal(work_dir_, helios::storage::wal::WalIo::Posix(), kSegment);
   ASSERT_EQ(wal.Scan().status, WalScanResult::Status::kOk);
-  EXPECT_THROW(Wal(work_dir_, helios::storage::wal::WalIo::Posix(), kCapacity),
+  EXPECT_THROW(Wal(work_dir_, helios::storage::wal::WalIo::Posix(), kSegment),
                std::system_error);
 }
 
-// A log written before capacity existed can be larger than the capacity a
-// later start asks for. It is kept, not cut back to fit.
-TEST_F(WalFrameTest, ALegacyLogLargerThanCapacityIsPreserved) {
-  constexpr uint64_t kTinyCapacity = 4096;
-  {
-    Wal wal(work_dir_, helios::storage::wal::WalIo::Posix(),
-            Wal::kNoPreallocation);
-    ASSERT_EQ(wal.Scan().status, WalScanResult::Status::kOk);
-    for (EpochNumber epoch = 1; epoch <= 40; ++epoch) {
-      std::map<EpochNumber, PackedLogRecords> buckets;
-      buckets[epoch] =
-          MakePacked(epoch, std::string(200, 'x') + std::to_string(epoch));
-      ASSERT_TRUE(wal.AppendGroup(buckets, epoch).ok);
-    }
-    ASSERT_GT(wal.write_offset(), static_cast<off_t>(kTinyCapacity));
-  }
-  const off_t grown = FileSize();
-
-  Wal wal(work_dir_, helios::storage::wal::WalIo::Posix(), kTinyCapacity);
-  const auto result = ScanRecords(wal);
-  ASSERT_EQ(result.status, WalScanResult::Status::kOk) << result.detail;
-  EXPECT_EQ(result.last_epoch, 40u);
-  EXPECT_EQ(result.records.size(), 40u);
-  EXPECT_EQ(FileSize(), grown);
-  EXPECT_EQ(wal.write_offset(), grown);
-}
-
-// Without preallocation the file tracks the log exactly, which is what a
-// database that writes no record at all should leave behind.
-TEST_F(WalFrameTest, WithoutPreallocationTheFileTracksTheLog) {
-  Wal wal(work_dir_, helios::storage::wal::WalIo::Posix(),
-          Wal::kNoPreallocation);
-  ASSERT_EQ(wal.Scan().status, WalScanResult::Status::kOk);
-  EXPECT_EQ(FileSize(), 0);
-
-  for (EpochNumber epoch = 1; epoch <= 3; ++epoch) {
-    std::map<EpochNumber, PackedLogRecords> buckets;
-    buckets[epoch] = MakePacked(epoch, "k" + std::to_string(epoch));
-    ASSERT_TRUE(wal.AppendGroup(buckets, epoch).ok);
-    EXPECT_EQ(FileSize(), wal.write_offset());
-  }
-  EXPECT_EQ(wal.extension_count(), 0u);
-}
-
-// Reserving capacity is a startup failure of its own, told apart from a
-// group's failure by its own seam. Nothing may be published from a scan
-// that hit one.
-TEST_F(WalFrameTest, AFailureToReserveCapacityIsReported) {
+// Preparing a segment is a startup failure of its own, told apart from a
+// group's failure by its own seam. Nothing may be published from a scan that
+// hit one.
+TEST_F(WalFrameTest, AFailureToPrepareASegmentIsReported) {
   helios::storage::wal::WalIo io = helios::storage::wal::WalIo::Posix();
   io.initialise_pwrite = [](int, const void *, size_t, off_t) -> ssize_t {
     errno = ENOSPC;
     return -1;
   };
 
-  Wal wal(work_dir_, io, kCapacity);
+  Wal wal(work_dir_, io, kSegment);
   const auto result = wal.Scan();
   EXPECT_EQ(result.status, WalScanResult::Status::kIoError);
   EXPECT_EQ(result.error_number, ENOSPC);
-  EXPECT_EQ(wal.write_offset(), 0);
-}
-
-// A capacity that cannot be expressed as an offset is refused rather than
-// turned into a write of that size.
-TEST_F(WalFrameTest, ACapacityBeyondTheOffsetRangeIsRefused) {
-  Wal wal(work_dir_, helios::storage::wal::WalIo::Posix(), UINT64_MAX);
-  const auto result = wal.Scan();
-  EXPECT_EQ(result.status, WalScanResult::Status::kIoError);
-  EXPECT_EQ(result.error_number, EFBIG);
-  EXPECT_EQ(wal.write_offset(), 0);
-  EXPECT_EQ(FileSize(), 0);
+  EXPECT_EQ(wal.write_offset(), 0u);
 }
 
 TEST_F(WalFrameTest, EmptyGroupNeitherWritesNorSyncs) {
@@ -1044,7 +878,7 @@ TEST_F(WalFrameTest, EmptyGroupNeitherWritesNorSyncs) {
     return ::fdatasync(fd);
   };
 
-  Wal wal(work_dir_, io, kCapacity);
+  Wal wal(work_dir_, io, kSegment);
   ASSERT_EQ(wal.Scan().status, WalScanResult::Status::kOk);
   std::map<EpochNumber, PackedLogRecords> buckets;
   buckets[5] = MakePacked(5, "k5");
@@ -1053,34 +887,17 @@ TEST_F(WalFrameTest, EmptyGroupNeitherWritesNorSyncs) {
   EXPECT_TRUE(result.ok);
   EXPECT_FALSE(wrote);
   EXPECT_FALSE(synced);
-  EXPECT_EQ(wal.write_offset(), 0);
+  EXPECT_EQ(wal.write_offset(), kFirstFrame);
 }
 
-// A covered frame costs one header read and nothing else, except the one
-// frame right before the tail, which is read in full as a guard.
-TEST_F(WalFrameTest, SkipReadsOnlyTheGuardAndTailPayloads) {
+// A frame the checkpoint covers is still checked and counted, and its records
+// are not replayed.
+TEST_F(WalFrameTest, FramesAtOrBelowMinEpochAreCountedAndNotReplayed) {
   AppendEpochs({1, 2, 3, 4, 5});
-
-  helios::storage::wal::WalIo io = helios::storage::wal::WalIo::Posix();
-  auto header_reads = std::make_shared<int>(0);
-  auto payload_reads = std::make_shared<int>(0);
-  auto real_pread = io.pread;
-  // A frame's payload here is a few dozen bytes; the only reads anywhere near
-  // capacity-sized are the unrelated end-of-log scan this test does not mean
-  // to count.
-  io.pread = [real_pread, header_reads, payload_reads](
-                 int fd, void *data, size_t size, off_t offset) -> ssize_t {
-    if (size == Wal::kHeaderSize) {
-      ++*header_reads;
-    } else if (size > Wal::kHeaderSize && size < 4096) {
-      ++*payload_reads;
-    }
-    return real_pread(fd, data, size, offset);
-  };
 
   RecordScan skipped;
   {
-    Wal wal(work_dir_, io, kCapacity);
+    Wal wal(work_dir_, helios::storage::wal::WalIo::Posix(), kSegment);
     skipped = ScanRecords(wal, 3);
   }
   ASSERT_EQ(skipped.status, WalScanResult::Status::kOk) << skipped.detail;
@@ -1089,72 +906,33 @@ TEST_F(WalFrameTest, SkipReadsOnlyTheGuardAndTailPayloads) {
   ASSERT_EQ(skipped.records.size(), 2u);
   EXPECT_EQ(skipped.records[0].epoch, 4u);
   EXPECT_EQ(skipped.records[1].epoch, 5u);
-
-  // Header reads: 3 skipped frames, +1 to see the frame after them is past
-  // min_epoch, +3 more as the resuming scan re-reads that frame, the tail,
-  // and the all-zero header ending the log. `4 + 3 = 7`.
-  EXPECT_EQ(*header_reads, 7);
-  // One payload read per frame that is not a pure skip: the guard at epoch 3
-  // plus the two tail frames.
-  EXPECT_EQ(*payload_reads, 3);
-
-  Wal full_wal(work_dir_, helios::storage::wal::WalIo::Posix(), kCapacity);
-  const auto full = full_wal.Scan(0);
-  ASSERT_EQ(full.status, WalScanResult::Status::kOk);
-  EXPECT_EQ(skipped.last_epoch, full.last_epoch);
-  // bytes_skipped covers exactly the three skipped frames: the offset one past
-  // the third is where the first replayed frame, epoch 4, begins.
-  const off_t third_frame_end = FrameEnd(FrameEnd(FrameEnd(0)));
-  EXPECT_EQ(skipped.bytes_skipped, static_cast<uint64_t>(third_frame_end));
+  EXPECT_EQ(skipped.last_epoch, 5u);
+  const off_t third_frame_end = RecordEnd(RecordEnd(RecordEnd(kFirstFrame)));
+  EXPECT_EQ(skipped.bytes_skipped,
+            static_cast<uint64_t>(third_frame_end) - kFirstFrame);
 }
 
-// The whole log at or below min_epoch: the guard is the true last frame, and
-// end-of-log handling has to run exactly as it would without a skip.
-TEST_F(WalFrameTest, SkippingTheWholeLogStillFinishesTheScan) {
-  AppendEpochs({1, 2, 3});
-  const off_t log_end = EndOfLog();
-
-  helios::storage::wal::WalIo io = helios::storage::wal::WalIo::Posix();
-  auto payload_reads = std::make_shared<int>(0);
-  auto real_pread = io.pread;
-  // Locating the last nonzero byte can read reservation-sized chunks;
-  // those reads are not frame payloads.
-  io.pread = [real_pread, payload_reads](int fd, void *data, size_t size,
-                                         off_t offset) -> ssize_t {
-    if (size > Wal::kHeaderSize && size < 4096) ++*payload_reads;
-    return real_pread(fd, data, size, offset);
-  };
-
-  Wal wal(work_dir_, io, kCapacity);
-  const auto result = ScanRecords(wal, 3);
-  ASSERT_EQ(result.status, WalScanResult::Status::kOk) << result.detail;
-  EXPECT_EQ(result.last_epoch, 3u);
-  EXPECT_EQ(result.frames_skipped, 3u);
-  EXPECT_TRUE(result.records.empty());
-  EXPECT_FALSE(result.tail_zeroed);
-  EXPECT_EQ(wal.write_offset(), log_end);
-  // Only the guard, the true last frame of the log, has its payload read.
-  EXPECT_EQ(*payload_reads, 1);
-}
-
-TEST_F(WalFrameTest, ATornEpochAtTheSkipBoundaryFallsBackToTheValidPrefix) {
-  AppendEpochs({1, 2, 3});
-  const off_t third = FrameEnd(FrameEnd(0));
-  // Epoch 3 now looks covered by the checkpoint, but its checksum is stale.
-  WriteRawBytesAt(third + 12, {2, 0, 0, 0});
+TEST_F(WalFrameTest, ATornEpochAtTheCheckpointBoundaryEndsThePrefix) {
+  AppendEpochs({1, 2, 4});
+  const off_t third = RecordEnd(RecordEnd(kFirstFrame));
+  // Epoch 4 now looks covered by the checkpoint and still increases, so only
+  // its stale checksum gives it away.
+  WriteRawBytesAt(third + kEpochOffset, {3, 0, 0, 0});
+  uint64_t resumed = 0;
   {
-    Wal wal(work_dir_, helios::storage::wal::WalIo::Posix(), kCapacity);
-    const auto result = ScanRecords(wal, 2);
+    Wal wal(work_dir_, helios::storage::wal::WalIo::Posix(), kSegment);
+    const auto result = ScanRecords(wal, 3);
     ASSERT_EQ(result.status, WalScanResult::Status::kOk) << result.detail;
     EXPECT_EQ(result.last_epoch, 2u);
     EXPECT_EQ(result.frames_skipped, 2u);
     EXPECT_TRUE(result.records.empty());
     EXPECT_TRUE(result.tail_zeroed);
-    EXPECT_EQ(wal.write_offset(), third);
+    resumed = wal.write_offset();
+    EXPECT_GT(resumed, static_cast<uint64_t>(third));
   }
-  AssertRangeIsZero(third, FileSize());
+  AssertRangeIsZero(resumed, FileSize());
 
-  Wal wal(work_dir_, helios::storage::wal::WalIo::Posix(), kCapacity);
+  Wal wal(work_dir_, helios::storage::wal::WalIo::Posix(), kSegment);
   const auto result = ScanRecords(wal);
   ASSERT_EQ(result.status, WalScanResult::Status::kOk) << result.detail;
   EXPECT_FALSE(result.tail_zeroed);
@@ -1162,39 +940,83 @@ TEST_F(WalFrameTest, ATornEpochAtTheSkipBoundaryFallsBackToTheValidPrefix) {
   ASSERT_EQ(result.records.size(), 2u);
   EXPECT_EQ(result.records[0].writes.at(0).key, "k1");
   EXPECT_EQ(result.records[1].writes.at(0).key, "k2");
-  EXPECT_EQ(wal.write_offset(), third);
+  EXPECT_EQ(wal.write_offset(), resumed);
 }
 
-// A corrupted length inside the covered region lands the skip's next header
-// read on bytes that don't parse; it can't tell that apart from a lie only
-// in the last covered frame, so it falls back to a full scan from offset 0.
-TEST_F(WalFrameTest,
-       ACorruptedLengthInTheCoveredRegionFallsBackAndStaysCorrect) {
-  AppendEpochs({1, 2, 3, 4, 5});
-  // Frame 1's declared length, shrunk so the skip's blind trust in it lands
-  // mid-frame-1's own real payload rather than on frame 2's header.
-  WriteRawBytesAt(8, {4, 0, 0, 0});
+// A wrong length inside the covered region must not land the next read on bytes
+// inside a frame's own payload, whichever way it is wrong.
+TEST_F(WalFrameTest, ACorruptedLengthInTheCoveredRegionEndsThePrefix) {
+  for (const uint8_t length : {4, 200}) {
+    SCOPED_TRACE(static_cast<int>(length));
+    std::error_code ec;
+    std::filesystem::remove_all(work_dir_, ec);
+    AppendEpochs({1, 2, 3, 4, 5});
+    WriteRawBytesAt(kFirstFrame + kLengthOffset, {length, 0, 0, 0});
 
-  RecordScan skip_result;
-  {
-    Wal wal(work_dir_, helios::storage::wal::WalIo::Posix(), kCapacity);
-    skip_result = ScanRecords(wal, 4);
-  }
-  RecordScan full_result;
-  {
-    Wal wal(work_dir_, helios::storage::wal::WalIo::Posix(), kCapacity);
-    full_result = ScanRecords(wal, 0);
-  }
+    RecordScan skip_result;
+    {
+      Wal wal(work_dir_, helios::storage::wal::WalIo::Posix(), kSegment);
+      skip_result = ScanRecords(wal, 4);
+    }
+    RecordScan full_result;
+    {
+      Wal wal(work_dir_, helios::storage::wal::WalIo::Posix(), kSegment);
+      full_result = ScanRecords(wal, 0);
+    }
 
-  ASSERT_EQ(skip_result.status, WalScanResult::Status::kOk) << skip_result.detail;
-  EXPECT_TRUE(skip_result.tail_zeroed);
-  EXPECT_EQ(skip_result.last_epoch, 0u);
-  EXPECT_TRUE(skip_result.records.empty());
-  ASSERT_EQ(full_result.status, WalScanResult::Status::kOk) << full_result.detail;
-  EXPECT_FALSE(full_result.tail_zeroed);
-  EXPECT_EQ(full_result.last_epoch, 0u);
-  EXPECT_TRUE(full_result.records.empty());
-  AssertRangeIsZero(0, FileSize());
+    ASSERT_EQ(skip_result.status, WalScanResult::Status::kOk)
+        << skip_result.detail;
+    EXPECT_TRUE(skip_result.tail_zeroed);
+    EXPECT_EQ(skip_result.last_epoch, 0u);
+    EXPECT_TRUE(skip_result.records.empty());
+    ASSERT_EQ(full_result.status, WalScanResult::Status::kOk)
+        << full_result.detail;
+    EXPECT_FALSE(full_result.tail_zeroed);
+    EXPECT_EQ(full_result.last_epoch, 0u);
+    EXPECT_TRUE(full_result.records.empty());
+    AssertRangeIsZero(kFirstFrame, FileSize());
+  }
+}
+
+// The first frame after the redo start is checked like any other, so a damaged
+// one ends the log there rather than being stepped over.
+TEST_F(WalFrameTest, ADamagedFrameAtTheRedoStartEndsTheLog) {
+  for (const off_t field : {kEpochOffset, kLengthOffset}) {
+    SCOPED_TRACE(field);
+    std::error_code ec;
+    std::filesystem::remove_all(work_dir_, ec);
+    AppendEpochs({1, 2, 3});
+    const off_t second = RecordEnd(kFirstFrame);
+    FlipByteAt(second + field);
+
+    const WalPosition start{1, static_cast<uint64_t>(second)};
+    Wal wal(work_dir_, helios::storage::wal::WalIo::Posix(), kSegment);
+    const auto result = ScanRecords(wal, 2, start);
+    ASSERT_EQ(result.status, WalScanResult::Status::kOk) << result.detail;
+    EXPECT_TRUE(result.tail_zeroed);
+    EXPECT_EQ(result.last_epoch, 0u);
+    EXPECT_EQ(result.frames_skipped, 0u);
+    EXPECT_TRUE(result.records.empty());
+    AssertRangeIsZero(wal.write_offset(), FileSize());
+  }
+}
+
+// A frame before the redo start is covered and may already be overwritten, so
+// it is not read at all: damage there changes nothing.
+TEST_F(WalFrameTest, ADamagedFrameBeforeTheRedoStartIsNotRead) {
+  AppendEpochs({1, 2, 3});
+  const off_t second = RecordEnd(kFirstFrame);
+  FlipByteAt(kFirstFrame + Wal::kHeaderSize + 1);
+
+  const WalPosition start{1, static_cast<uint64_t>(second)};
+  Wal wal(work_dir_, helios::storage::wal::WalIo::Posix(), kSegment);
+  const auto result = ScanRecords(wal, 2, start);
+  ASSERT_EQ(result.status, WalScanResult::Status::kOk) << result.detail;
+  EXPECT_FALSE(result.tail_zeroed);
+  EXPECT_EQ(result.last_epoch, 3u);
+  EXPECT_EQ(result.frames_skipped, 1u);
+  ASSERT_EQ(result.records.size(), 1u);
+  EXPECT_EQ(result.records[0].writes.at(0).key, "k3");
 }
 
 TEST_F(WalFrameTest, InjectedFdatasyncFailsAfterTheAllowedCalls) {
@@ -1204,7 +1026,7 @@ TEST_F(WalFrameTest, InjectedFdatasyncFailsAfterTheAllowedCalls) {
   // tests.
   ASSERT_EQ(::unsetenv("HELIOS_WAL_FDATASYNC_FAIL_AFTER"), 0);
 
-  Wal wal(work_dir_, io, kCapacity);
+  Wal wal(work_dir_, io, kSegment);
   ASSERT_EQ(wal.Scan().status, WalScanResult::Status::kOk);
   std::map<EpochNumber, PackedLogRecords> buckets;
   buckets[1] = MakePacked(1, "k1");

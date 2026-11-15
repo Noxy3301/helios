@@ -20,6 +20,7 @@ helios::storage::Config MakeConfig() {
   helios::storage::Config config;
   config.epoch_duration_ms = 10;
   config.work_dir = "./helios_recovery_tid_test_logs";
+  config.wal_segment_bytes = 1u << 20;
   return config;
 }
 

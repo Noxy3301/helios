@@ -76,7 +76,7 @@ class PaxRecoveryTest : public ::testing::Test {
     ASSERT_NE(::mkdtemp(path.data()), nullptr);
     config_.work_dir = path.data();
     config_.epoch_duration_ms = 1;
-    config_.wal_initial_capacity_bytes = 4096;
+    config_.wal_segment_bytes = 1u << 20;
   }
 
   void TearDown() override { std::filesystem::remove_all(config_.work_dir); }

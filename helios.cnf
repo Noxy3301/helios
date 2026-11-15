@@ -21,10 +21,6 @@ epoch_duration_ms = 40
 # The contract every commit runs under: sync or async.
 commit_durability = sync
 
-# How much of the log is written out and made writable in place at a time,
-# in bytes; 0 lets the file grow as written.
-wal_initial_capacity_bytes = 67108864
-
 # Milliseconds between checkpoints of the live rows; 0 writes none.
 checkpoint_interval_ms = 0
 

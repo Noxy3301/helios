@@ -21,8 +21,6 @@ struct ServerConfig {
     size_t epoch_duration_ms = 40;
     /// The contract every commit runs under: "sync" or "async".
     std::string commit_durability = "sync";
-    /// How much of the log is written out and made writable in place at a time.
-    uint64_t wal_initial_capacity_bytes = 64ull * 1024ull * 1024ull;
     /// Milliseconds between checkpoints; zero writes none.
     size_t checkpoint_interval_ms = 0;
     /// One checkpoint this many milliseconds after startup; zero writes none.

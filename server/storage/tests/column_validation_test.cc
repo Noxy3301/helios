@@ -78,6 +78,7 @@ class ColumnValidationTest : public ::testing::Test {
  protected:
   void SetUp() override {
     config_.work_dir = "./helios_column_validation_test_logs";
+    config_.wal_segment_bytes = 1u << 20;
     std::filesystem::remove_all(config_.work_dir);
     db_ = std::make_unique<helios::storage::Database>(config_);
     ASSERT_TRUE(db_->CreateTable(kTable));

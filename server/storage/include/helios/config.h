@@ -31,6 +31,9 @@
 
 namespace helios::storage {
 
+// Fits a frame of the largest payload, so an epoch never needs splitting.
+inline constexpr uint64_t kWalSegmentBytes = 512ull * 1024ull * 1024ull;
+
 /**
  * @brief Configuration and options for one storage instance.
  */
@@ -48,27 +51,12 @@ struct Config {
   size_t epoch_duration_ms = 40;
 
   /**
-   * @brief How much of the write-ahead log is made writable in place at a
-   *        time.
+   * @brief Size of each write-ahead log segment.
    *
-   * @details The log file is written out with zeroes to this size before any
-   * record lands in it, and records are then written in place, so a commit's
-   * fdatasync persists data and not the size, allocation, or extent-state
-   * metadata a growing file drags in (the benefit is filesystem- and
-   * device-specific). A log that grows past it is extended by the same
-   * amount again: a granularity rather than a limit. Larger means fewer
-   * synchronous extensions but a longer startup scan of the reserved
-   * region. Zero disables reservation and lets the file grow as written.
-   *
-   * @note The storage stack must honour fsync/fdatasync; the supported
-   * ext4 setup uses its default data ordering and barriers. A log from a
-   * build that did not reserve is readable here; the reverse does not
-   * hold (such a build reads the reserved zeroes as a broken frame and
-   * refuses to start).
-   *
-   * Default: 64 MiB
+   * @note Only tests change this, to keep their files small. The server always
+   * runs with kWalSegmentBytes.
    */
-  uint64_t wal_initial_capacity_bytes = 64ull * 1024ull * 1024ull;
+  uint64_t wal_segment_bytes = kWalSegmentBytes;
 
   /**
    * @brief How often, in milliseconds, a checkpoint of the live rows is

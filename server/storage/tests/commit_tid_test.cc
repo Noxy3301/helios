@@ -84,7 +84,7 @@ class CommitTidTest : public ::testing::Test {
 
   void SetUp() override {
     config_.work_dir = "./helios_commit_tid_test_logs";
-    config_.wal_initial_capacity_bytes = 1u << 20;
+    config_.wal_segment_bytes = 1u << 20;
     std::filesystem::remove_all(config_.work_dir);
     ASSERT_TRUE(tables_.CreateTable(kTable));
     pax::TableSchema schema;
@@ -206,7 +206,8 @@ TEST_F(CommitTidTest, CommitReadsTheEpochAfterTheWriteSetIsFed) {
   // Only the first commit reached the log; the stale attempt logged nothing.
   logger_->RequestFlush(11);
   logger_.reset();
-  wal::Wal log(config_.work_dir);
+  wal::Wal log(config_.work_dir, wal::WalIo::Posix(),
+               config_.wal_segment_bytes);
   const auto scan = ScanRecords(log);
   ASSERT_EQ(wal::WalScanResult::Status::kOk, scan.status);
   ASSERT_EQ(1u, scan.records.size());
@@ -343,7 +344,8 @@ TEST_F(CommitTidTest, RepeatedRowWritesLogOnlyTheFinalValue) {
       << reason_;
   logger_->RequestFlush(10);
   logger_.reset();
-  wal::Wal log(config_.work_dir);
+  wal::Wal log(config_.work_dir, wal::WalIo::Posix(),
+               config_.wal_segment_bytes);
   const auto scan = ScanRecords(log);
   ASSERT_EQ(wal::WalScanResult::Status::kOk, scan.status);
   ASSERT_EQ(1u, scan.records.size());
@@ -694,7 +696,8 @@ TEST_F(CommitTidTest, OneTidCoversReadsRowsIndexesAndTheWorker) {
 
   logger_->RequestFlush(10);
   logger_.reset();
-  wal::Wal log(config_.work_dir);
+  wal::Wal log(config_.work_dir, wal::WalIo::Posix(),
+               config_.wal_segment_bytes);
   const auto scan = ScanRecords(log);
   ASSERT_EQ(wal::WalScanResult::Status::kOk, scan.status);
   ASSERT_EQ(2u, scan.records.size());
@@ -842,7 +845,8 @@ TEST_F(CommitTidTest, ReadOnlyCommitAdvancesWorkerOrdering) {
   // The read-only commit buffered nothing; only the write reached the log.
   logger_->RequestFlush(10);
   logger_.reset();
-  wal::Wal log(config_.work_dir);
+  wal::Wal log(config_.work_dir, wal::WalIo::Posix(),
+               config_.wal_segment_bytes);
   const auto scan = ScanRecords(log);
   ASSERT_EQ(wal::WalScanResult::Status::kOk, scan.status);
   ASSERT_EQ(1u, scan.records.size());
@@ -1365,7 +1369,7 @@ TEST(CommonTidWorkerTest, LastTidBelongsToEachWorkerAndDatabase) {
   Config config;
   config.work_dir = "./helios_common_tid_worker_logs";
   config.epoch_duration_ms = 1000;
-  config.wal_initial_capacity_bytes = 1u << 20;
+  config.wal_segment_bytes = 1u << 20;
   for (int instance = 0; instance < 2; ++instance) {
     std::filesystem::remove_all(config.work_dir);
     Database db(config);

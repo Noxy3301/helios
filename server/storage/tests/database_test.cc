@@ -46,6 +46,7 @@ class DatabaseTest : public ::testing::Test {
   virtual void SetUp() {
     std::filesystem::remove_all(config_.work_dir);
     config_.epoch_duration_ms = 100;
+    config_.wal_segment_bytes = 1u << 20;
     db_ = std::make_unique<helios::storage::Database>(config_);
     ASSERT_TRUE(TestHelper::CreateTable(*db_, kTable));
   }
@@ -54,6 +55,7 @@ class DatabaseTest : public ::testing::Test {
 TEST_F(DatabaseTest, InstantiateWithConfig) {
   db_.reset(nullptr);
   helios::storage::Config conf;
+  conf.wal_segment_bytes = 1u << 20;
   ASSERT_NO_THROW(db_ = std::make_unique<helios::storage::Database>(conf));
 }
 

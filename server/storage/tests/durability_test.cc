@@ -37,12 +37,15 @@
 #include "gtest/gtest.h"
 #include "sync_point.h"
 #include "util/spdlog.h"
+#include "wal/wal.h"
 
 namespace {
 constexpr const char *kTable = "users";
 
 bool logged(const std::string &work_dir, const std::string &key) {
-  std::ifstream file(work_dir + "/wal.log", std::ios::binary);
+  std::ifstream file(
+      work_dir + "/" + helios::storage::wal::Wal::SegmentFileName(1),
+      std::ios::binary);
   const std::string bytes((std::istreambuf_iterator<char>(file)),
                           std::istreambuf_iterator<char>());
   return bytes.find(key) != std::string::npos;
@@ -84,6 +87,7 @@ class DurabilityTest : public ::testing::Test {
   }
 
   virtual void SetUp() {
+    config_.wal_segment_bytes = 1u << 20;
     std::filesystem::remove_all(config_.work_dir);
     db_ = std::make_unique<helios::storage::Database>(config_);
     ASSERT_TRUE(TestHelper::CreateTable(*db_, kTable));
@@ -171,7 +175,7 @@ TEST(CommitDurabilityTest, SyncCommitClosesItsOwnEpoch) {
   config.work_dir = "./helios_commit_policy_test_logs";
   std::filesystem::remove_all(config.work_dir);
   config.epoch_duration_ms = kEpochMs;
-  config.wal_initial_capacity_bytes = 1u << 20;
+  config.wal_segment_bytes = 1u << 20;
 
   {
     helios::storage::Database db(config);
@@ -222,7 +226,7 @@ TEST(CommitDurabilityTest, SyncReadViewWaitsForTheSnapshotEpoch) {
   config.work_dir = "./helios_read_view_durability_test_logs";
   std::filesystem::remove_all(config.work_dir);
   config.epoch_duration_ms = 10000;
-  config.wal_initial_capacity_bytes = 1u << 20;
+  config.wal_segment_bytes = 1u << 20;
 
   {
     helios::storage::Database db(config);
@@ -268,6 +272,7 @@ TEST(CommitDurabilityTest, AwaitEpochLeavesTheWaitToTheCaller) {
   // Long epochs: the flush starts within the wait only because Commit asked
   // for its epoch's close.
   config.epoch_duration_ms = 10000;
+  config.wal_segment_bytes = 1u << 20;
 
   {
     // The pipes outlive db: its logger may read release after the scope below.

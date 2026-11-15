@@ -70,7 +70,7 @@ class EpochScanCheckpointTest : public ::testing::Test {
     helios::storage::Config config;
     config.epoch_duration_ms = 10;
     config.work_dir = work_dir_;
-    config.wal_initial_capacity_bytes = 1ull << 20;
+    config.wal_segment_bytes = 1ull << 20;
     return config;
   }
 

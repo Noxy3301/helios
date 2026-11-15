@@ -52,18 +52,6 @@ struct SecondaryLogStats {
   size_t primary_keys_bytes = 0;
 };
 
-size_t GetLogDirectorySize(const helios::storage::Config &conf) {
-  namespace fs = std::filesystem;
-  size_t size = 0;
-  for (const auto &entry : fs::directory_iterator(conf.work_dir)) {
-    if (entry.path().filename().generic_string().find("working") !=
-        std::string::npos)
-      continue;
-    size += fs::file_size(entry.path());
-  }
-  return size;
-}
-
 /**
  * @brief Reads the log's newest epoch.
  *
@@ -73,15 +61,13 @@ size_t GetLogDirectorySize(const helios::storage::Config &conf) {
  */
 SecondaryLogStats GetSecondaryIndexLogStatsForLatestEpoch(
     const helios::storage::Config &conf) {
-  namespace fs = std::filesystem;
   SecondaryLogStats stats{};
-  const bool log_exists = fs::exists(fs::path(conf.work_dir) / "wal.log");
-  EXPECT_TRUE(log_exists) << conf.work_dir << ": no log to read";
-  if (!log_exists) return stats;
 
   // Read the log through the writer's own format rather than re-deriving the
   // frame format here.
-  helios::storage::wal::Wal wal(conf.work_dir);
+  helios::storage::wal::Wal wal(conf.work_dir,
+                                helios::storage::wal::WalIo::Posix(),
+                                conf.wal_segment_bytes);
   helios::storage::wal::LogRecords records;
   const auto scan =
       wal.Scan(0, [&records](const helios::storage::wal::LogRecords &batch) {
@@ -136,6 +122,7 @@ class SecondaryIndexLoggingTest : public ::testing::Test {
 
   void SetUp() override {
     spdlog::set_level(spdlog::level::info);
+    config_.wal_segment_bytes = 1u << 20;
     std::filesystem::remove_all(config_.work_dir);
     db_ = std::make_unique<helios::storage::Database>(config_);
     TestHelper::CreateTable(*db_, "users");
@@ -302,11 +289,6 @@ TEST_F(SecondaryIndexLoggingTest, RecoveryWithSecondaryIndexWithoutCheckpoint) {
 
 TEST_F(SecondaryIndexLoggingTest, SecondaryIndexAddTimingRecorded) {
   helios::storage::Config config = db_->GetConfig();
-  // What this test reports per transaction is how many bytes of log one
-  // secondary-index write costs, and it reads that from the file's size. A
-  // preallocated log holds its size constant, which would report zero for
-  // every transaction, so this one log grows as it is written.
-  config.wal_initial_capacity_bytes = 0;
 
   db_.reset(nullptr);
   std::filesystem::remove_all(config.work_dir);
@@ -336,9 +318,7 @@ TEST_F(SecondaryIndexLoggingTest, SecondaryIndexAddTimingRecorded) {
   }
 
   std::vector<long long> durations_us;
-  std::vector<size_t> log_delta_bytes;
   durations_us.reserve(iterations);
-  log_delta_bytes.reserve(iterations);
 
   // Measure adding one primary key to the same secondary key.
   for (size_t i = 0; i < iterations; ++i) {
@@ -346,7 +326,6 @@ TEST_F(SecondaryIndexLoggingTest, SecondaryIndexAddTimingRecorded) {
     const std::string primary_key =
         MakeFixedPrimaryKey(initial_primary_keys + i);
     const std::string value = "val_" + primary_key;
-    const auto size_before = GetLogDirectorySize(config);
 
     const auto start = std::chrono::steady_clock::now();
     const bool committed = TestHelper::CommitRows(
@@ -360,10 +339,6 @@ TEST_F(SecondaryIndexLoggingTest, SecondaryIndexAddTimingRecorded) {
         std::chrono::duration_cast<std::chrono::microseconds>(end - start)
             .count();
     durations_us.push_back(elapsed);
-
-    const auto size_after = GetLogDirectorySize(config);
-    log_delta_bytes.push_back(
-        size_after >= size_before ? size_after - size_before : 0);
 
     // Cleanup to keep the secondary key size stable for the next iteration.
     ASSERT_TRUE(TestHelper::CommitWrites(
@@ -382,11 +357,6 @@ TEST_F(SecondaryIndexLoggingTest, SecondaryIndexAddTimingRecorded) {
   for (size_t i = 0; i < durations_us.size(); ++i) {
     if (i) std::cout << ",";
     std::cout << durations_us[i];
-  }
-  std::cout << "] log_delta_bytes=[";
-  for (size_t i = 0; i < log_delta_bytes.size(); ++i) {
-    if (i) std::cout << ",";
-    std::cout << log_delta_bytes[i];
   }
   std::cout << "]" << std::endl;
 }
