@@ -91,7 +91,8 @@ class PaxTable {
    * @brief Allocates a slot in the narrowest size class that holds `row`.
    *
    * @details Takes the next fresh slot of the class's newest group, else a
-   * reclaimed slot of the class, else creates a group of the class.
+   * reclaimed slot of the class, else installs a spare group of the class,
+   * creating one if needed.
    *
    * @param row Unpacked row the slot is for.
    * @param epoch Commit epoch of the allocating write; 0 reclaims nothing.
@@ -170,6 +171,11 @@ class PaxTable {
     // (retire epoch, slot) in retire order.
     std::deque<std::pair<EpochNumber, std::pair<PaxGroup *, uint32_t>>> retired;
     std::atomic<uint32_t> groups{0};
+    // A group already in the directory but not yet installed as the newest
+    // group, so not yet counted in groups.
+    std::atomic<PaxGroup *> spare{nullptr};
+    // Set while one thread builds the spare.
+    std::atomic<bool> building{false};
   };
 
   TableSchema schema_;
@@ -180,7 +186,8 @@ class PaxTable {
   std::unique_ptr<std::atomic<PaxGroup *>[]> dir_;
   std::atomic<size_t> group_count_{0};
   std::atomic<uint64_t> moves_{0};
-  // Serializes appends to the directory; taken after a class mutex.
+  // Serializes appends to the directory; taken after a class mutex or with
+  // none held.
   std::mutex dir_mutex_;
   // One value range a field. An untyped field keeps the empty range.
   std::unique_ptr<ValueRange[]> range_;
