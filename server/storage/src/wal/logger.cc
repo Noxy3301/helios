@@ -275,12 +275,11 @@ WalAppendResult Logger::FlushThrough(EpochNumber target) {
 
   // Take each producer's records without holding its lock during file I/O.
   buffers_.ForEach([&](LogBuffer *buffer) {
-    PackedLogRecords swapped;
     {
       std::lock_guard<std::mutex> lock(buffer->mutex);
-      swapped.swap(buffer->records);
+      buffer->drained.swap(buffer->records);
     }
-    for (auto &record : swapped) {
+    for (auto &record : buffer->drained) {
       if (record.epoch <= durable_before) {
         // Enqueue precedes epoch departure, so a durable epoch cannot gain
         // another record.
@@ -292,6 +291,7 @@ WalAppendResult Logger::FlushThrough(EpochNumber target) {
       }
       pending_records_[record.epoch].emplace_back(std::move(record));
     }
+    buffer->drained.clear();
   });
 
   if (traced) trace.GroupCollectEnd();

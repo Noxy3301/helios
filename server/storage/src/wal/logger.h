@@ -190,6 +190,9 @@ class Logger {
   struct LogBuffer {
     std::mutex mutex;
     PackedLogRecords records;
+    // Touched only by the logger thread; swapped with records to keep both
+    // capacities.
+    PackedLogRecords drained;
   };
 
   const std::string work_dir_;
