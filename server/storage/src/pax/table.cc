@@ -323,24 +323,34 @@ std::pair<PaxGroup *, uint32_t> PaxTable::allocate(uint32_t cls,
         c.retired.pop_front();
         return slot;
       }
-      grp = c.spare.exchange(nullptr, std::memory_order_acquire);
+      grp = c.spare.exchange(nullptr);
       if (grp == nullptr) grp = add_group(cls);
       if (grp == nullptr) return {nullptr, 0};
       c.groups.fetch_add(1, std::memory_order_relaxed);
       c.slot.store(uint64_t{grp->index()} << 32 | 1, std::memory_order_release);
     }
 
-    // Build the class's next group outside the class mutex, one builder at a
-    // time. A class on its first group gets none, so a sparse class holds one.
-    bool idle = false;
-    if (c.groups.load(std::memory_order_relaxed) > 1 &&
-        c.building.compare_exchange_strong(idle, true,
-                                           std::memory_order_acquire)) {
-      if (c.spare.load(std::memory_order_relaxed) == nullptr)
-        c.spare.store(add_group(cls), std::memory_order_release);
-      c.building.store(false, std::memory_order_release);
-    }
+    // A class on its first group gets no spare, so a sparse class holds one.
+    if (c.groups.load(std::memory_order_relaxed) > 1)
+      spare_wanted_.store(true);
     return {grp, 0};
+  }
+}
+
+void PaxTable::BuildSpares() {
+  if (!spare_wanted_.exchange(false)) return;
+  for (uint32_t cls = 0; cls < class_bytes_.size(); cls++) {
+    SizeClass &c = classes_[cls];
+    // One builder a class at a time.
+    bool idle = false;
+    if (c.groups.load(std::memory_order_relaxed) <= 1 ||
+        c.spare.load() != nullptr ||
+        !c.building.compare_exchange_strong(idle, true))
+      continue;
+    if (c.spare.load() == nullptr) c.spare.store(add_group(cls));
+    c.building.store(false);
+    // A spare taken before `building` cleared left its request unserved.
+    if (c.spare.load() == nullptr) spare_wanted_.store(true);
   }
 }
 

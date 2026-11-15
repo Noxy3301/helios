@@ -92,7 +92,8 @@ class PaxTable {
    *
    * @details Takes the next fresh slot of the class's newest group, else a
    * reclaimed slot of the class, else installs a spare group of the class,
-   * creating one if needed.
+   * creating one if needed. Installing a class's second or later group asks
+   * for a new spare, which BuildSpares builds.
    *
    * @param row Unpacked row the slot is for.
    * @param epoch Commit epoch of the allocating write; 0 reclaims nothing.
@@ -109,6 +110,17 @@ class PaxTable {
    * @param epoch Commit epoch of the write that retired it.
    */
   void Retire(PaxGroup *group, uint32_t slot, EpochNumber epoch);
+
+  /**
+   * @brief Builds the missing spare group of every class past its first group.
+   *
+   * @details Callable concurrently, with no lock held and outside any epoch.
+   */
+  void BuildSpares();
+
+  bool spare_wanted() const {
+    return spare_wanted_.load(std::memory_order_relaxed);
+  }
 
   void count_move() { moves_.fetch_add(1, std::memory_order_relaxed); }
 
@@ -174,7 +186,7 @@ class PaxTable {
     // A group already in the directory but not yet installed as the newest
     // group, so not yet counted in groups.
     std::atomic<PaxGroup *> spare{nullptr};
-    // Set while one thread builds the spare.
+    // Set while one BuildSpares call builds the spare.
     std::atomic<bool> building{false};
   };
 
@@ -186,6 +198,9 @@ class PaxTable {
   std::unique_ptr<std::atomic<PaxGroup *>[]> dir_;
   std::atomic<size_t> group_count_{0};
   std::atomic<uint64_t> moves_{0};
+  // Set when an allocation installs a class's second or later group, so that
+  // class may lack its spare.
+  std::atomic<bool> spare_wanted_{false};
   // Serializes appends to the directory; taken after a class mutex or with
   // none held.
   std::mutex dir_mutex_;
