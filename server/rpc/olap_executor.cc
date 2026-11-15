@@ -51,6 +51,7 @@
 #include <string_view>
 #include <system_error>
 #include <thread>
+#include <type_traits>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -780,6 +781,12 @@ void unpack_decimal_run(const std::byte* src, uint32_t stride, uint32_t prefix,
                         uint32_t width, uint32_t count, Vector& output_vector,
                         idx_t out_base) {
   T* dst = FlatVector::GetData<T>(output_vector) + out_base;
+  if constexpr (std::is_same_v<T, int64_t>) {
+    if (prefix == 0 && stride == sizeof(T)) {
+      std::memcpy(dst, src, count * sizeof(T));
+      return;
+    }
+  }
   for (uint32_t i = 0; i < count; i++, src += stride) {
     if (typed_cell_present(src, prefix, width)) {
       int64_t mantissa;
@@ -816,6 +823,10 @@ void unpack_typed_run(FieldType type, const PaxGroup::Layout& layout,
   switch (type) {
     case FieldType::kInt32: {
       int32_t* dst = FlatVector::GetData<int32_t>(output_vector) + out_base;
+      if (prefix == 0 && stride == sizeof(int32_t)) {
+        std::memcpy(dst, src, count * sizeof(int32_t));
+        break;
+      }
       for (uint32_t i = 0; i < count; i++, src += stride) {
         if (typed_cell_present(src, prefix, width)) {
           std::memcpy(&dst[i], src + prefix, sizeof(int32_t));
@@ -828,6 +839,10 @@ void unpack_typed_run(FieldType type, const PaxGroup::Layout& layout,
     }
     case FieldType::kInt64: {
       int64_t* dst = FlatVector::GetData<int64_t>(output_vector) + out_base;
+      if (prefix == 0 && stride == sizeof(int64_t)) {
+        std::memcpy(dst, src, count * sizeof(int64_t));
+        break;
+      }
       for (uint32_t i = 0; i < count; i++, src += stride) {
         if (typed_cell_present(src, prefix, width)) {
           std::memcpy(&dst[i], src + prefix, sizeof(int64_t));
@@ -1255,10 +1270,14 @@ void pax_scan(ClientContext&, TableFunctionInput& data, DataChunk& output) {
           std::min<uint32_t>(PaxGroup::kRows - slot,
                              static_cast<uint32_t>(max_rows - rows_emitted));
       uint32_t run_length = 1;
-      while (run_length < max_run_length &&
-             !slot_imaged(local_state, slot + run_length) &&
-             group->IsVisible(slot + run_length)) {
-        run_length++;
+      if (!local_state.has_images) {
+        run_length = group->visible_length(slot, max_run_length);
+      } else {
+        while (run_length < max_run_length &&
+               !slot_imaged(local_state, slot + run_length) &&
+               group->IsVisible(slot + run_length)) {
+          run_length++;
+        }
       }
 
       const PaxGroup::Layout& layout = group->layout();
