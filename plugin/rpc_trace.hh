@@ -34,7 +34,7 @@ struct StatementEntry {
 // One transaction-local decision or abort, recorded in order with the
 // statement it belongs to.
 struct TraceEvent {
-  std::string kind;
+  std::string name;
   uint64_t off_us;
   uint32_t stmt_idx;
 };
@@ -46,9 +46,9 @@ class TxRpcTrace {
   void on_stmt(const std::string& sql);
   void record(RpcOp type, uint64_t us, uint32_t req_b,
               uint64_t resp_b, const std::string& meta);
-  void record_event(const std::string& kind);
-  void record_event(const char* kind) {
-    if (active_) record_event(std::string(kind));
+  void record_event(const std::string& name);
+  void record_event(const char* name) {
+    if (active_) record_event(std::string(name));
   }
   std::string finalize_jsonl(bool committed);
 

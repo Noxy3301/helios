@@ -132,20 +132,20 @@ void TxRpcTrace::record(RpcOp type, uint64_t us, uint32_t req_b,
   a.resp_b += resp_b;
 }
 
-void TxRpcTrace::record_event(const std::string& kind) {
+void TxRpcTrace::record_event(const std::string& name) {
   if (!active_) return;
   const uint64_t off = std::chrono::duration_cast<std::chrono::microseconds>(
                            std::chrono::steady_clock::now() - started_)
                            .count();
 
   TraceEvent e;
-  e.kind = kind;
+  e.name = name;
   e.off_us = off;
   e.stmt_idx = statements_.empty()
                    ? UINT32_MAX
                    : static_cast<uint32_t>(statements_.size() - 1);
   events_.push_back(std::move(e));
-  event_counts_[kind]++;
+  event_counts_[name]++;
 }
 
 std::string TxRpcTrace::finalize_jsonl(bool committed) {
@@ -210,7 +210,7 @@ std::string TxRpcTrace::finalize_jsonl(bool committed) {
     if (i > 0) os << ',';
     os << '{'
        << "\"i\":" << i
-       << ",\"kind\":\"" << json_escape(e.kind, 128) << '"'
+       << ",\"name\":\"" << json_escape(e.name, 128) << '"'
        << ",\"off_us\":" << e.off_us
        << ",\"stmt\":";
     if (e.stmt_idx == UINT32_MAX) {
