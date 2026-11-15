@@ -26,6 +26,14 @@ void Reaper::Enqueue(MasstreeIndex &index, std::string_view key,
   tombstones_[delete_commit_tid.epoch].emplace_back(std::move(tombstone));
 }
 
+void Reaper::Enqueue(std::vector<Tombstone> &tombstones) {
+  std::lock_guard<std::mutex> lk(mutex_);
+  for (auto &tombstone : tombstones) {
+    tombstones_[tombstone.delete_commit_tid.epoch].emplace_back(
+        std::move(tombstone));
+  }
+}
+
 void Reaper::Purge(EpochNumber reclamation_epoch) {
   std::lock_guard<std::mutex> purging(purge_mutex_);
   std::vector<std::vector<Tombstone>> ready;

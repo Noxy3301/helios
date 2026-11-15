@@ -29,12 +29,34 @@ class MasstreeIndex;
 class Reaper {
  public:
   /**
+   * @brief One logically deleted record awaiting its physical purge.
+   *
+   * index is the tree owning the record. item is the record the key resolved
+   * to at enqueue time and serves as an identity check at purge time.
+   * `delete_commit_tid` identifies the deletion; a newer version cancels
+   * this candidate.
+   */
+  struct Tombstone {
+    MasstreeIndex *index = nullptr;
+    std::string key;
+    IndexRecord *item = nullptr;
+    Tidword delete_commit_tid;
+  };
+
+  /**
    * @brief Registers one logically deleted record for a later physical purge.
    *
    * The committer passes the tree owning the already resolved record.
    */
   void Enqueue(MasstreeIndex &index, std::string_view key, IndexRecord &item,
                Tidword delete_commit_tid);
+
+  /**
+   * @brief Registers every tombstone of one commit under a single lock.
+   *
+   * Each is filed under its own delete epoch. The elements are left moved-from.
+   */
+  void Enqueue(std::vector<Tombstone> &tombstones);
 
   /**
    * @brief Purges candidates deleted at or before reclamation_epoch.
@@ -54,21 +76,6 @@ class Reaper {
   void Forget(const MasstreeIndex &index);
 
  private:
-  /**
-   * @brief One logically deleted record awaiting its physical purge.
-   *
-   * index is the tree owning the record. item is the record the key resolved
-   * to at enqueue time and serves as an identity check at purge time.
-   * `delete_commit_tid` identifies the deletion; a newer version cancels
-   * this candidate.
-   */
-  struct Tombstone {
-    MasstreeIndex *index = nullptr;
-    std::string key;
-    IndexRecord *item = nullptr;
-    Tidword delete_commit_tid;
-  };
-
   // Guards the queue shared by committers and the epoch thread.
   std::mutex mutex_;
   // Held through each Purge, so Forget never meets a batch Purge detached.

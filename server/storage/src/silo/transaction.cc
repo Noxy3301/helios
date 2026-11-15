@@ -321,6 +321,11 @@ bool Transaction::Commit(CommitDurability durability, std::string &reason,
     Publish(*item, entry, published);
     row_applied = row_applied || is_row;
   }
+  // Queue the tombstones while still joined to the commit epoch.
+  if (!tombstones_.empty()) {
+    reaper_.Enqueue(tombstones_);
+    tombstones_.clear();
+  }
 
   // Buffer the record before leaving, so a flush cannot pass this commit.
   const bool logged = log_writes != 0;
@@ -654,10 +659,11 @@ void Transaction::Publish(IndexRecord &item, WriteEntry &entry,
   // A non-unique index record sits under its tree key.
   const auto *index = std::get_if<IndexUpdate>(&entry.update);
   if (index == nullptr || index->constraint == IndexConstraint::kUnique) {
-    reaper_.Enqueue(*entry.index, entry.key, item, published);
+    tombstones_.push_back(
+        {entry.index, std::string(entry.key), &item, published});
     return;
   }
-  reaper_.Enqueue(*entry.index, index->tree_key, item, published);
+  tombstones_.push_back({entry.index, index->tree_key, &item, published});
 }
 
 }  // namespace silo
