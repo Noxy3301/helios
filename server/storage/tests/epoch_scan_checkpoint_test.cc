@@ -10,9 +10,11 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <future>
 #include <optional>
 #include <string>
@@ -598,6 +600,148 @@ TEST_F(EpochScanCheckpointTest, ARowLockedDuringTheScanIsRetried) {
                 *value == std::string(64, 'b'))
         << key << " holds " << *value;
   }
+}
+
+// Polls `done` until it holds or `timeout` passes.
+bool WaitUntil(const std::function<bool()> &done,
+               std::chrono::milliseconds timeout) {
+  const auto deadline = std::chrono::steady_clock::now() + timeout;
+  while (!done()) {
+    if (std::chrono::steady_clock::now() >= deadline) return false;
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  return true;
+}
+
+// Rewrites the same 16 rows of `table` with `value` in one commit.
+bool CommitTraffic(helios::storage::Database &db, const char *table,
+                   const std::string &value) {
+  std::vector<TestHelper::RowWrite> writes;
+  for (int j = 0; j < 16; ++j) {
+    writes.push_back({table, "t" + std::to_string(j), TestHelper::Row(value)});
+  }
+  std::string commit_reason;
+  return TestHelper::CommitRows(db, {}, writes, {}, {}, commit_reason);
+}
+
+// While the worker captures, the logger prepares a segment only on a miss, and
+// the worker's walk over a secondary index keeps the pool served too.
+TEST_F(EpochScanCheckpointTest, TheSecondaryWalkServesTheSegmentPool) {
+  // Twice the capture's pool-check interval, so the secondary walk passes it.
+  constexpr uint64_t kRows = 2 * 4096;
+  constexpr const char *kTraffic = "traffic";
+  const std::string value(32 * 1024, 't');
+
+  Pipe scan_arrived;
+  Pipe scan_release;
+  Pipe prepare_arrived;
+  Pipe prepare_release;
+  // Row copies are numbered from 1 and answered while at or below
+  // `release_through`; every preparation is counted and answered at once.
+  std::atomic<uint64_t> row_copies{0};
+  std::atomic<uint64_t> release_through{kRows - 1};
+  std::atomic<uint64_t> preparations{0};
+  auto scan_releaser = std::async(std::launch::async, [&] {
+    char arrived = 0;
+    while (::read(scan_arrived.read_fd(), &arrived, 1) == 1) {
+      const uint64_t copy = ++row_copies;
+      while (copy > release_through.load()) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+      }
+      if (::write(scan_release.write_fd(), "r", 1) != 1) return;
+    }
+  });
+  auto prepare_releaser = std::async(std::launch::async, [&] {
+    char arrived = 0;
+    while (::read(prepare_arrived.read_fd(), &arrived, 1) == 1) {
+      ++preparations;
+      if (::write(prepare_release.write_fd(), "r", 1) != 1) return;
+    }
+  });
+  // See CloseWriteOnExit: runs after the database is gone and before the
+  // releasers are joined.
+  CloseWriteOnExit close_scan_arrived{scan_arrived};
+  CloseWriteOnExit close_prepare_arrived{prepare_arrived};
+
+  auto config = MakeConfig();
+  config.wal_segment_bytes = 4ull << 20;
+  config.wal_budget_bytes = 2 * config.wal_segment_bytes;
+  helios::storage::Database db(config);
+  // Tables are walked newest first: the indexed table, then the traffic.
+  TestHelper::CreateTable(db, kTraffic, value.size());
+  TestHelper::CreateTable(db, kTable);
+  ASSERT_TRUE(db.CreateSecondaryIndex(kTable, kIndex,
+                                      helios::storage::IndexConstraint::kNone));
+  for (uint64_t i = 0; i < kRows; i += 1024) {
+    std::vector<TestHelper::RowWrite> writes;
+    std::vector<TestHelper::IndexOp> index_ops;
+    for (uint64_t j = i; j < i + 1024; ++j) {
+      const std::string key = "key" + std::to_string(j);
+      writes.push_back({kTable, key, TestHelper::Row("v")});
+      index_ops.push_back({kTable, kIndex, "s" + std::to_string(j), key});
+    }
+    std::string commit_reason;
+    ASSERT_TRUE(
+        TestHelper::CommitRows(db, {}, writes, index_ops, {}, commit_reason))
+        << commit_reason;
+  }
+
+  points_.arm("HELIOS_DEBUG_SYNC_CHECKPOINT_BEFORE_ROW_COPY",
+              "arrive_and_wait:" + std::to_string(scan_arrived.write_fd()) +
+                  ":" + std::to_string(scan_release.read_fd()));
+  points_.arm("HELIOS_DEBUG_SYNC_WAL_PREPARE_AFTER_DIRECTORY_SYNC",
+              "arrive_and_wait:" + std::to_string(prepare_arrived.write_fd()) +
+                  ":" + std::to_string(prepare_release.read_fd()));
+
+  std::atomic<bool> stop_traffic{false};
+  std::future<bool> traffic;
+  // Declared after `traffic` so an early return lets the capture and the
+  // traffic finish before that future is joined.
+  struct Unblock {
+    std::atomic<bool> &stop_traffic;
+    std::atomic<uint64_t> &release_through;
+    ~Unblock() {
+      stop_traffic = true;
+      release_through = UINT64_MAX;
+    }
+  } unblock{stop_traffic, release_through};
+
+  // Grow the log until the worker's own capture starts. One segment holds
+  // eight commits, so the few that may land after the start do not empty the
+  // pool.
+  for (int i = 0; row_copies.load() == 0; ++i) {
+    ASSERT_LT(i, 64) << "no capture started";
+    ASSERT_TRUE(CommitTraffic(db, kTraffic, value));
+    WaitUntil([&] { return row_copies.load() != 0; },
+               std::chrono::milliseconds(250));
+  }
+  // The capture parks on the last primary row of the indexed table, with the
+  // pool topped up by its primary walk.
+  ASSERT_TRUE(
+      WaitUntil([&] { return row_copies.load() == kRows; }, kTestTimeout));
+
+  // The logger uses the ready segments, misses and prepares one itself, which
+  // leaves the pool empty. Commits keep completing.
+  const uint64_t prepared_at_park = preparations.load();
+  traffic = std::async(std::launch::async, [&] {
+    while (!stop_traffic.load()) {
+      if (!CommitTraffic(db, kTraffic, value)) return false;
+    }
+    return true;
+  });
+  ASSERT_TRUE(WaitUntil([&] { return preparations.load() > prepared_at_park; },
+                        kTestTimeout));
+  stop_traffic = true;
+  ASSERT_EQ(traffic.wait_for(kTestTimeout), std::future_status::ready);
+  EXPECT_TRUE(traffic.get());
+
+  // The capture walks the secondary index and parks again on the first row of
+  // the traffic table; with the log idle, only that walk can have prepared.
+  const uint64_t prepared_by_logger = preparations.load();
+  release_through = kRows;
+  ASSERT_TRUE(
+      WaitUntil([&] { return row_copies.load() == kRows + 1; }, kTestTimeout));
+  EXPECT_GT(preparations.load(), prepared_by_logger);
 }
 
 TEST_F(EpochScanCheckpointTest, ALeftoverWorkingFileIsNotRead) {

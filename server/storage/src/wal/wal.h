@@ -237,6 +237,7 @@ class Wal {
   uint64_t write_offset() const {
     return state_ == State::kReady ? active_.append_offset : 0;
   }
+  uint64_t active_segment() const { return active_.segment_number; }
 
   static std::string SegmentFileName(uint64_t segment_number);
 
