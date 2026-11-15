@@ -11,7 +11,9 @@
 #include <utility>
 #include <vector>
 
+#include "common/typed_cell.h"
 #include "helios.pb.h"
+#include "helios/pax.h"
 
 #include "flat_plan_pack.hh"
 #include "parallel_scan.hh"
@@ -22,6 +24,35 @@
 // binding glue.
 
 namespace {
+
+using helios::rpc::cell_width;
+using helios::rpc::PaxType;
+using helios::storage::pax::FieldType;
+using helios::storage::pax::PackLength;
+
+static_assert(static_cast<int>(PaxType::kUntyped) ==
+                  static_cast<int>(FieldType::kUntyped) &&
+              static_cast<int>(PaxType::kInt32) ==
+                  static_cast<int>(FieldType::kInt32) &&
+              static_cast<int>(PaxType::kInt64) ==
+                  static_cast<int>(FieldType::kInt64) &&
+              static_cast<int>(PaxType::kDate) ==
+                  static_cast<int>(FieldType::kDate) &&
+              static_cast<int>(PaxType::kDecimal64) ==
+                  static_cast<int>(FieldType::kDecimal64),
+              "a PaxType is its PAX field type");
+static_assert(
+    cell_width(PaxType::kInt32) == PackLength(FieldType::kInt32) &&
+        cell_width(PaxType::kInt64) == PackLength(FieldType::kInt64) &&
+        cell_width(PaxType::kDate) == PackLength(FieldType::kDate) &&
+        cell_width(PaxType::kDecimal64) == PackLength(FieldType::kDecimal64),
+    "a typed cell is as wide as its PAX cell");
+
+// How the source column of an int-key binding is stored.
+struct SourceColumn {
+    PaxType type = PaxType::kUntyped;
+    int scale = 0;
+};
 
 // Pick the source byte string for a binding (from a step's scan key, scan value, or value).
 const std::string* select_source_bytes(
@@ -45,18 +76,48 @@ const std::string* select_source_bytes(
     return &source.value();
 }
 
+// The source column of each binding: the source step's table says whether an
+// int-key binding's column is a typed cell, and its PAX field is the 1-based
+// column.
+std::vector<SourceColumn> source_columns(
+    helios::storage::Database& db,
+    const Helios::Protocol::TxExecuteReadPlan::Request& request,
+    const google::protobuf::RepeatedPtrField<
+        Helios::Protocol::TxExecuteReadPlan::KeyBinding>& bindings) {
+    std::vector<SourceColumn> columns(bindings.size());
+    for (int i = 0; i < bindings.size(); i++) {
+        const auto& binding = bindings[i];
+        if (!binding.column_as_int_key() || binding.source_column() <= 0 ||
+            binding.source_step() >=
+                static_cast<uint32_t>(request.steps_size())) {
+            continue;
+        }
+        const auto& source = request.steps(binding.source_step());
+        const auto* store = db.GetPaxTable(source.table_name());
+        if (store == nullptr) continue;
+        const auto& schema = helios::storage::pax::Schema(store);
+        const size_t field = binding.source_column();
+        columns[i].type = static_cast<PaxType>(schema.type_of(field));
+        columns[i].scale = schema.scale_of(field);
+    }
+    return columns;
+}
+
 // Compose a read-plan key prefix plus all bindings into the actual scan key.
+// columns holds source_columns() of the bindings.
 std::string build_plan_key(
     const std::string& prefix,
     const google::protobuf::RepeatedPtrField<
         Helios::Protocol::TxExecuteReadPlan::KeyBinding>& bindings,
+    const std::vector<SourceColumn>& columns,
     const std::vector<Helios::Protocol::TxExecuteReadPlan::StepResult*>&
         previous_results,
     int row_override = -1,
     bool *complete = nullptr) {
     if (complete != nullptr) *complete = true;
     std::string key = prefix;
-    for (const auto& binding : bindings) {
+    for (int i = 0; i < bindings.size(); i++) {
+        const auto& binding = bindings[i];
         const int source_step = static_cast<int>(binding.source_step());
         if (source_step < 0 ||
             source_step >= static_cast<int>(previous_results.size())) {
@@ -74,9 +135,9 @@ std::string build_plan_key(
                 extracted =
                     unpack_row_field(*bytes, binding.source_column() - 1);
                 if (binding.column_as_int_key()) {
-                    scratch =
-                        pack_column_as_int_key(extracted,
-                                                 binding.int_delta());
+                    scratch = pack_column_as_int_key(
+                        extracted, columns[i].type, columns[i].scale,
+                        binding.int_delta());
                     extracted = scratch;
                 }
             } else if (complete != nullptr) {
@@ -117,6 +178,7 @@ void HeliosRpc::handleTxExecuteReadPlan(
     std::string* result) {
     Helios::Protocol::TxExecuteReadPlan::Response response;
     response.set_ok(true);
+    auto* db = db_manager_->get_database().get();
 
     std::vector<Helios::Protocol::TxExecuteReadPlan::StepResult*>
         previous_results;
@@ -126,14 +188,19 @@ void HeliosRpc::handleTxExecuteReadPlan(
         auto* step_result = response.add_results();
         previous_results.push_back(step_result);
 
+        // Looked up once per step, not once per for_each row.
+        const auto columns = source_columns(*db, request, step.bindings());
+        const auto end_columns =
+            source_columns(*db, request, step.end_bindings());
+
         bool start_complete = true;
         bool end_complete = true;
         const std::string start_key =
-            build_plan_key(step.key_prefix(), step.bindings(),
+            build_plan_key(step.key_prefix(), step.bindings(), columns,
                            previous_results, -1, &start_complete);
         std::string end_key =
             build_plan_key(step.end_key_prefix(), step.end_bindings(),
-                           previous_results, -1, &end_complete);
+                           end_columns, previous_results, -1, &end_complete);
         if (!start_complete || !end_complete) continue;
         if (step.is_scan() && end_key.empty()) {
             end_key = next_lexicographic_key(start_key);
@@ -164,7 +231,8 @@ void HeliosRpc::handleTxExecuteReadPlan(
                     bool row_complete = true;
                     const std::string row_key =
                         build_plan_key(step.key_prefix(), step.bindings(),
-                                       previous_results, row, &row_complete);
+                                       columns, previous_results, row,
+                                       &row_complete);
                     if (!row_complete) continue;
                     if (!seen_probe_keys.insert(row_key).second) continue;
                     probe_keys.push_back(row_key);
@@ -190,7 +258,6 @@ void HeliosRpc::handleTxExecuteReadPlan(
                 };
                 std::vector<ProbeOut> outputs(worker_count);
                 std::vector<char> failed(worker_count, 0);
-                auto* db = db_manager_->get_database().get();
                 const bool scan_probe = step.is_scan();
                 std::vector<std::thread> workers;
                 workers.reserve(worker_count);

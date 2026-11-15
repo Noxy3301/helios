@@ -1191,10 +1191,10 @@ bool build_base_table(Builder& b, Table_ref* table_ref,
     if (table == nullptr || table->s == nullptr) {
         return b.refuse("table has no open TABLE");
     }
-    std::vector<uint32_t> pax_kinds;
+    std::vector<helios::rpc::PaxType> pax_types;
     std::vector<int32_t> pax_scales;
     std::vector<uint32_t> pax_widths =
-        compute_pax_field_widths(table, &pax_kinds, &pax_scales);
+        compute_pax_field_widths(table, &pax_types, &pax_scales);
     if (pax_widths.empty()) {
         return b.refuse("table is not PAX-eligible");
     }
@@ -1211,9 +1211,9 @@ bool build_base_table(Builder& b, Table_ref* table_ref,
     for (uint i = 0; i < table->s->fields; i++) {
         Field* field = table->field[i];
         auto* column = table_desc->add_columns();
-        // Entry 0 of the width/kind/scale vectors is the row null-flags
+        // Entry 0 of the width/type/scale vectors is the row null-flags
         // field, not a named column.
-        column->set_pax_kind(pax_kinds[i + 1]);
+        column->set_pax_kind(static_cast<uint32_t>(pax_types[i + 1]));
         column->set_pax_width(pax_widths[i + 1]);
         column->set_pax_scale(pax_scales[i + 1]);
         // A zero-length field is '' or NULL; only this bit tells them apart.

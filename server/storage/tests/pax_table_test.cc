@@ -48,6 +48,12 @@ std::string PackRow(const std::vector<std::string> &fields) {
   return row;
 }
 
+// A typed column's cell: the value's little-endian bytes.
+template <typename T>
+std::string Cell(T value) {
+  return std::string(reinterpret_cast<const char *>(&value), sizeof(value));
+}
+
 bool Scatter(PaxGroup &group, uint32_t slot, const std::string &row) {
   helios::storage::pax::Row unpacked;
   if (!helios::storage::pax::unpack_row(
@@ -194,8 +200,10 @@ TEST(PaxTableTest, ColumnRangeCoversWrittenValues) {
   int64_t lo = 0, hi = 0;
   EXPECT_FALSE(helios::storage::pax::ColumnRange(&store, 1, &lo, &hi));
 
-  Install(items, store, schema, PackRow({nulls, "-5", "1.25", "ab"}));
-  Install(items, store, schema, PackRow({nulls, "7", "-9.00", "zz"}));
+  Install(items, store, schema,
+          PackRow({nulls, Cell<int32_t>(-5), Cell<int64_t>(125), "ab"}));
+  Install(items, store, schema,
+          PackRow({nulls, Cell<int32_t>(7), Cell<int64_t>(-900), "zz"}));
 
   ASSERT_TRUE(helios::storage::pax::ColumnRange(&store, 1, &lo, &hi));
   EXPECT_EQ(lo, -5);
@@ -208,10 +216,12 @@ TEST(PaxTableTest, ColumnRangeCoversWrittenValues) {
 
   // A row installed into a second group widens the same range.
   for (uint32_t i = 2; i < PaxGroup::kRows; i++) {
-    Install(items, store, schema, PackRow({nulls, "0", "0.00", "x"}));
+    Install(items, store, schema,
+            PackRow({nulls, Cell<int32_t>(0), Cell<int64_t>(0), "x"}));
   }
   helios::storage::RowRecord &peak =
-      Install(items, store, schema, PackRow({nulls, "100", "0.00", "x"}));
+      Install(items, store, schema,
+              PackRow({nulls, Cell<int32_t>(100), Cell<int64_t>(0), "x"}));
   ASSERT_GE(helios::storage::pax::GroupCount(&store), 2u);
   ASSERT_TRUE(helios::storage::pax::ColumnRange(&store, 1, &lo, &hi));
   EXPECT_EQ(hi, 100);
@@ -239,7 +249,7 @@ TEST(PaxTableTest, ColumnDistinctEstimatesWrittenValues) {
   constexpr int kDistinct = 2000;
   for (int pass = 0; pass < 2; pass++) {
     for (int i = 0; i < kDistinct; i++) {
-      Install(items, store, schema, PackRow({nulls, std::to_string(i)}));
+      Install(items, store, schema, PackRow({nulls, Cell<int32_t>(i)}));
     }
   }
   ASSERT_TRUE(helios::storage::pax::ColumnDistinct(&store, 1, &ndv));

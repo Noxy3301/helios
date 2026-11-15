@@ -691,7 +691,7 @@ bool HeliosProxy::tx_execute_duckdb_query(
 bool HeliosProxy::db_create_table(
     const std::string& table_name,
     const std::vector<uint32_t>& pax_field_max_bytes,
-    const std::vector<uint32_t>& pax_field_kind,
+    const std::vector<helios::rpc::PaxType>& pax_types,
     const std::vector<int32_t>& pax_field_scale,
     const std::vector<bool>& pax_field_not_null) {
     if (!ensure_connected()) {
@@ -706,8 +706,8 @@ bool HeliosProxy::db_create_table(
     for (const uint32_t width : pax_field_max_bytes) {
         request.add_pax_field_max_bytes(width);
     }
-    for (const uint32_t kind : pax_field_kind) {
-        request.add_pax_field_kind(kind);
+    for (const auto type : pax_types) {
+        request.add_pax_field_kind(static_cast<uint32_t>(type));
     }
     for (const int32_t scale : pax_field_scale) {
         request.add_pax_field_scale(scale);

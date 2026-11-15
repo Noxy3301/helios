@@ -121,6 +121,9 @@ endif()
 target_include_directories(
   ${PROJECT_NAME} PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include
                          ${CMAKE_CURRENT_SOURCE_DIR}/src)
+# The repository root, whose common/typed_cell.h gives the typed cell format
+target_include_directories(
+  ${PROJECT_NAME} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../..)
 target_compile_features(${PROJECT_NAME} PUBLIC cxx_std_17)
 
 # MessagePack is also included by the types Database owns.

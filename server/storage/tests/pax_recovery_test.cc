@@ -3,6 +3,7 @@
  * Column definitions survive restart and put recovered values back in PAX.
  */
 
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
@@ -29,15 +30,37 @@ const std::vector<FieldType> kTypes{FieldType::kUntyped, FieldType::kInt32,
                                     FieldType::kDecimal64};
 const std::vector<int8_t> kScales{0, 0, 2};
 
-std::string Row(std::string_view integer, std::string_view decimal) {
-  // Null flags and two short, length-prefixed text values.
-  std::string row("\1\1\0", 3);
-  for (const auto field : {integer, decimal}) {
+// Row bytes of short fields: field 0 is the null flags, and an empty field is
+// the empty marker.
+std::string Pack(const std::vector<std::string> &fields) {
+  std::string row;
+  for (const auto &field : fields) {
+    if (field.empty()) {
+      row.push_back('\xFF');
+      continue;
+    }
     row.push_back('\1');
     row.push_back(static_cast<char>(field.size()));
     row.append(field);
   }
   return row;
+}
+
+// A typed column's cell: the value's little-endian bytes.
+template <typename T>
+std::string Cell(T value) {
+  return std::string(reinterpret_cast<const char *>(&value), sizeof(value));
+}
+
+// The two payloads under no NULL flag.
+std::string Fields(std::string_view integer, std::string_view decimal) {
+  return Pack(
+      {std::string(1, '\0'), std::string(integer), std::string(decimal)});
+}
+
+// A row of the INT column and the DECIMAL(p, 2) column holding `cents`.
+std::string Row(int32_t integer, int64_t cents) {
+  return Fields(Cell(integer), Cell(cents));
 }
 
 class PaxRecoveryTest : public ::testing::Test {
@@ -60,8 +83,8 @@ class PaxRecoveryTest : public ::testing::Test {
 };
 
 TEST_F(PaxRecoveryTest, RestoresSchemaBeforeCheckpointAndWalValues) {
-  const auto first = Row("42", "1.50");
-  const auto second = Row("43", "2.50");
+  const auto first = Row(42, 150);
+  const auto second = Row(43, 250);
   {
     Database db(config_);
     ASSERT_TRUE(db.CreateTable("t"));
@@ -97,7 +120,7 @@ TEST_F(PaxRecoveryTest, KeepsAllSchemasWhenRowReplayIsDisabled) {
     Database db(config_);
     ASSERT_TRUE(db.CreateTable("old"));
     ASSERT_TRUE(db.InstallPaxSchema("old", kWidths, kTypes, kScales));
-    ASSERT_TRUE(TestHelper::WriteRow(db, "old", "a", Row("1", "1.00")));
+    ASSERT_TRUE(TestHelper::WriteRow(db, "old", "a", Row(1, 100)));
   }
   {
     auto config = config_;
@@ -141,34 +164,33 @@ TEST_F(PaxRecoveryTest, FailedPublicationDoesNotEnableTheSchema) {
 TEST_F(PaxRecoveryTest, RequiresSchemaBeforeTheFirstValue) {
   Database db(config_);
   ASSERT_TRUE(db.CreateTable("t"));
-  EXPECT_FALSE(TestHelper::WriteRow(db, "t", "a", Row("1", "1.00")));
+  EXPECT_FALSE(TestHelper::WriteRow(db, "t", "a", Row(1, 100)));
   EXPECT_FALSE(TestHelper::ReadRow(db, "t", "a").has_value());
   EXPECT_TRUE(db.InstallPaxSchema("t", kWidths, kTypes, kScales));
-  EXPECT_TRUE(TestHelper::WriteRow(db, "t", "a", Row("1", "1.00")));
+  EXPECT_TRUE(TestHelper::WriteRow(db, "t", "a", Row(1, 100)));
 }
 
 TEST_F(PaxRecoveryTest, RejectsTheWholeWriteSetBeforeInstallingAnyValue) {
   Database db(config_);
   ASSERT_TRUE(db.CreateTable("t"));
   ASSERT_TRUE(db.InstallPaxSchema("t", kWidths, kTypes, kScales));
-  const auto original = Row("1", "1.00");
+  const auto original = Row(1, 100);
   ASSERT_TRUE(TestHelper::WriteRow(db, "t", "a", original));
   const auto before = db.Read("t", "a");
   db.ReleaseThreadEpoch();
 
-  // Reject malformed rows, non-round-tripping numbers and typed overflow.
+  // Reject malformed rows and typed fields that are not their cells.
   const std::vector<std::string> unsupported{
-      Row("3", "3.0"),
-      Row("03", "3.00"),
-      Row("2147483648", "3.00"),
-      Row("3", "92233720368547758.08"),
+      Fields("3", Cell<int64_t>(300)),
+      Fields(Cell<int64_t>(3), Cell<int64_t>(300)),
+      Fields(Cell<int32_t>(3), Cell<int32_t>(300)),
       original.substr(0, original.size() - 1),
       original + "extra",
       ""};
   for (const auto &value : unsupported) {
     std::string commit_reason;
     EXPECT_FALSE(TestHelper::CommitRows(
-        db, {}, {{"t", "a", Row("2", "2.00")}, {"t", "b", value}}, {}, {},
+        db, {}, {{"t", "a", Row(2, 200)}, {"t", "b", value}}, {}, {},
         commit_reason));
     const auto after = db.Read("t", "a");
     db.ReleaseThreadEpoch();
@@ -176,21 +198,22 @@ TEST_F(PaxRecoveryTest, RejectsTheWholeWriteSetBeforeInstallingAnyValue) {
     EXPECT_EQ(after.tid, before.tid);
     EXPECT_FALSE(TestHelper::ReadRow(db, "t", "b").has_value());
   }
-  EXPECT_TRUE(TestHelper::WriteRow(db, "t", "b", Row("3", "3.00")));
+  EXPECT_TRUE(TestHelper::WriteRow(db, "t", "b", Row(3, 300)));
 }
 
 TEST_F(PaxRecoveryTest, RejectsBadInputBeforeConflictChecksAndSlotAllocation) {
   Database db(config_);
   ASSERT_TRUE(db.CreateTable("t"));
   ASSERT_TRUE(db.InstallPaxSchema("t", kWidths, kTypes, kScales));
-  const auto original = Row("1", "1.00");
+  const auto original = Row(1, 100);
   ASSERT_TRUE(TestHelper::WriteRow(db, "t", "a", original));
   const auto slots = pax::SlotsAllocated(db.GetPaxTable("t"));
 
   // Bad row bytes must be rejected before Silo sees the stale observed TID.
   std::string reason;
   EXPECT_FALSE(TestHelper::CommitRows(
-      db, {{"t", "a", 0}}, {{"t", "b", Row("2", "2.0")}}, {}, {}, reason));
+      db, {{"t", "a", 0}}, {{"t", "b", Fields(Cell<int32_t>(2), "2.0")}}, {},
+      {}, reason));
   EXPECT_EQ(reason, "pax_row_unpack_failed");
   EXPECT_EQ(pax::SlotsAllocated(db.GetPaxTable("t")), slots);
   EXPECT_EQ(TestHelper::ReadRow(db, "t", "a").value(), original);
@@ -198,9 +221,9 @@ TEST_F(PaxRecoveryTest, RejectsBadInputBeforeConflictChecksAndSlotAllocation) {
 }
 
 TEST_F(PaxRecoveryTest, KeepsUnpackedValuesSeparateAcrossWritesAndRecovery) {
-  const auto first = Row("1", "1.00");
-  const auto second = Row("2", "-2.50");
-  const auto last = Row("3", "3.75");
+  const auto first = Row(1, 100);
+  const auto second = Row(2, -250);
+  const auto last = Row(3, 375);
   {
     std::string commit_reason;
     Database db(config_);
@@ -273,12 +296,48 @@ TEST_F(PaxRecoveryTest, RestoresRowsIntoTheirSizeClasses) {
   EXPECT_EQ(CellWidth(db, "k008195"), 160u);
 }
 
+// Typed cells and NULL read back as the bytes the commit wrote: in memory,
+// from the checkpoint and from the WAL.
+TEST_F(PaxRecoveryTest, TypedCellsSurviveCommitAndRecovery) {
+  const std::vector<uint32_t> widths{1, 4, 8, 4, 8};
+  const std::vector<FieldType> types{FieldType::kUntyped, FieldType::kInt32,
+                                     FieldType::kInt64, FieldType::kDate,
+                                     FieldType::kDecimal64};
+  const std::vector<int8_t> scales{0, 0, 0, 0, 4};
+  const std::string no_nulls(1, '\0');
+  const auto low =
+      Pack({no_nulls, Cell<int32_t>(INT32_MIN), Cell<int64_t>(INT64_MIN),
+            Cell<int32_t>(10000101), Cell<int64_t>(-1)});
+  const auto high =
+      Pack({no_nulls, Cell<int32_t>(INT32_MAX), Cell<int64_t>(INT64_MAX),
+            Cell<int32_t>(99991231), Cell<int64_t>(999999999999999)});
+  const auto nulls = Pack({std::string(1, '\x0f'), "", "", "", ""});
+  {
+    Database db(config_);
+    ASSERT_TRUE(db.CreateTable("t"));
+    ASSERT_TRUE(db.InstallPaxSchema("t", widths, types, scales));
+    ASSERT_TRUE(TestHelper::WriteRow(db, "t", "a", low));
+    ASSERT_TRUE(db.WriteCheckpoint());
+    std::string reason;
+    ASSERT_TRUE(TestHelper::CommitRows(
+        db, {}, {{"t", "b", high}, {"t", "c", nulls}}, {}, {}, reason))
+        << reason;
+    EXPECT_EQ(TestHelper::ReadRow(db, "t", "a").value(), low);
+    EXPECT_EQ(TestHelper::ReadRow(db, "t", "b").value(), high);
+    EXPECT_EQ(TestHelper::ReadRow(db, "t", "c").value(), nulls);
+  }
+  Database db(config_);
+  EXPECT_EQ(TestHelper::ReadRow(db, "t", "a").value(), low);
+  EXPECT_EQ(TestHelper::ReadRow(db, "t", "b").value(), high);
+  EXPECT_EQ(TestHelper::ReadRow(db, "t", "c").value(), nulls);
+}
+
 TEST_F(PaxRecoveryTest, IgnoresAnInterruptedWorkingFile) {
   {
     Database db(config_);
     ASSERT_TRUE(db.CreateTable("t"));
     ASSERT_TRUE(db.InstallPaxSchema("t", kWidths, kTypes, kScales));
-    ASSERT_TRUE(TestHelper::WriteRow(db, "t", "a", Row("1", "1.00")));
+    ASSERT_TRUE(TestHelper::WriteRow(db, "t", "a", Row(1, 100)));
   }
   std::ofstream(std::filesystem::path(config_.work_dir) / "pax_schema.working")
       << "unfinished";
@@ -292,7 +351,7 @@ TEST_F(PaxRecoveryTest, RefusesToRecoverValuesWithoutTheirSchema) {
     Database db(config_);
     ASSERT_TRUE(db.CreateTable("t"));
     ASSERT_TRUE(db.InstallPaxSchema("t", kWidths, kTypes, kScales));
-    ASSERT_TRUE(TestHelper::WriteRow(db, "t", "a", Row("1", "1.00")));
+    ASSERT_TRUE(TestHelper::WriteRow(db, "t", "a", Row(1, 100)));
   }
   ASSERT_TRUE(std::filesystem::remove(std::filesystem::path(config_.work_dir) /
                                       "pax_schema.catalog"));

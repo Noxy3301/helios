@@ -108,14 +108,15 @@ bool alter_fail(const std::string &reason) {
 }  // namespace
 
 std::vector<uint32_t> compute_pax_field_widths(
-    TABLE *table, std::vector<uint32_t> *kinds,
+    TABLE *table, std::vector<helios::rpc::PaxType> *types,
     std::vector<int32_t> *scales, uint *wide_field) {
+  using helios::rpc::PaxType;
   std::vector<uint32_t> widths;
   widths.reserve(table->s->fields + 1);
-  if (kinds) {
-    kinds->clear();
-    kinds->reserve(table->s->fields + 1);
-    kinds->push_back(pax_kind::UNTYPED);  // field #0: null flags, verbatim
+  if (types) {
+    types->clear();
+    types->reserve(table->s->fields + 1);
+    types->push_back(PaxType::kUntyped);  // field #0: null flags, verbatim
   }
   if (scales) {
     scales->clear();
@@ -127,7 +128,7 @@ std::vector<uint32_t> compute_pax_field_widths(
   for (uint i = 0; i < table->s->fields; i++) {
     Field *field = table->field[i];
     uint32_t width = field->field_length;
-    uint32_t kind = pax_kind::UNTYPED;
+    PaxType type = PaxType::kUntyped;
     int32_t scale = 0;
 
     // ZEROFILL and YEAR render zero-padded bytes the value alone cannot
@@ -161,10 +162,10 @@ std::vector<uint32_t> compute_pax_field_widths(
           if (is_ll && field->is_unsigned()) {
             // BIGINT UNSIGNED can exceed int64 range: keep ASCII.
           } else if (is_ll || (is_long && field->is_unsigned())) {
-            kind = pax_kind::INT64;  // 8-byte range
+            type = PaxType::kInt64;  // 8-byte range
             width = 8;
           } else {
-            kind = pax_kind::INT32;  // TINY/SHORT/INT24/LONG signed
+            type = PaxType::kInt32;  // TINY/SHORT/INT24/LONG signed
             width = 4;
           }
         }
@@ -176,7 +177,7 @@ std::vector<uint32_t> compute_pax_field_widths(
       case MYSQL_TYPE_DECIMAL:
         // Fixed-point text of the pre-5.0 type; reserve sign + decimal point
         // slack (UNTYPED bound). Not a Field_new_decimal, so it never becomes
-        // FK_DEC64.
+        // kDecimal64.
         width += 2;
         break;
       case MYSQL_TYPE_NEWDECIMAL: {
@@ -188,7 +189,7 @@ std::vector<uint32_t> compute_pax_field_widths(
         // and the mantissa exact as doubles; p > 15 and ZEROFILL stay UNTYPED.
         const auto *fd = down_cast<const Field_new_decimal *>(field);
         if (!zerofill && fd->precision <= 15) {
-          kind = pax_kind::DEC64;
+          type = PaxType::kDecimal64;
           scale = static_cast<int32_t>(field->decimals());
           width = 8;
         }
@@ -197,7 +198,7 @@ std::vector<uint32_t> compute_pax_field_widths(
       case MYSQL_TYPE_DATE:
       case MYSQL_TYPE_NEWDATE:
         // DATE val_str is always "YYYY-MM-DD" -> YYYYMMDD int (fits int32).
-        kind = pax_kind::DATE;
+        type = PaxType::kDate;
         width = 4;
         break;
       case MYSQL_TYPE_TIME:
@@ -226,7 +227,7 @@ std::vector<uint32_t> compute_pax_field_widths(
       return {};
     }
     widths.push_back(width);
-    if (kinds) kinds->push_back(kind);
+    if (types) types->push_back(type);
     if (scales) scales->push_back(scale);
   }
 
@@ -257,6 +258,9 @@ int ha_helios::open(const char *table_name, int, uint, const dd::Table *) {
 
   if ((num_keys = table->s->keys))
     set_key_and_key_part_info(table);
+
+  // Rows carry a typed column as its cell, so reads and writes convert it.
+  compute_pax_field_widths(table, &pax_types_, &pax_scales_);
 
   if (table->s->primary_key != MAX_KEY) {
     // STRING weights have no tight bound, but no stored key exceeds
@@ -317,11 +321,11 @@ int ha_helios::create(const char *table_name, TABLE *table, HA_CREATE_INFO *,
   // storage. The table/index may already exist from another node's CREATE
   // TABLE; MySQL-side metadata still needs to be created.
   auto proxy = get_proxy();
-  std::vector<uint32_t> pax_kinds;
+  std::vector<helios::rpc::PaxType> pax_types;
   std::vector<int32_t> pax_scales;
   uint wide_field = 0;
   std::vector<uint32_t> pax_widths =
-      compute_pax_field_widths(table, &pax_kinds, &pax_scales, &wide_field);
+      compute_pax_field_widths(table, &pax_types, &pax_scales, &wide_field);
   // The storage keeps no row outside PAX, so a table the PAX store cannot
   // hold is refused here and nothing is created on the server.
   if (pax_widths.empty()) {
@@ -342,7 +346,7 @@ int ha_helios::create(const char *table_name, TABLE *table, HA_CREATE_INFO *,
   std::vector<bool> pax_not_null{false};
   for (uint i = 0; i < table->s->fields; i++)
     pax_not_null.push_back(!table->field[i]->is_nullable());
-  if (!proxy->db_create_table(db_table_name, pax_widths, pax_kinds, pax_scales,
+  if (!proxy->db_create_table(db_table_name, pax_widths, pax_types, pax_scales,
                               pax_not_null)) {
     return HA_ERR_GENERIC;
   }

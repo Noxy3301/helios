@@ -79,9 +79,13 @@ int ha_helios::flush_insert_probe(HeliosTransaction *tx) {
 int ha_helios::write_row(uchar *buf) {
   DBUG_TRACE;
 
-  set_write_buffer(buf);
+  const bool packed = set_write_buffer(buf);
 
   auto tx = get_transaction(ha_thd());
+  if (!packed) {
+    return reject_unsupported_statement(ha_thd(), tx,
+                                        "value with no exact typed PAX cell");
+  }
 
   // A transaction already gone at row entry is one no statement can resolve
   // against, so a duplicate it carries must not be offered as ignorable.
@@ -260,7 +264,10 @@ int ha_helios::update_row(const uchar *old_data, uchar *new_data) {
   }
   const bool moved = new_key != key;
 
-  set_write_buffer(new_data);
+  if (!set_write_buffer(new_data)) {
+    return reject_unsupported_statement(ha_thd(), tx,
+                                        "value with no exact typed PAX cell");
+  }
 
   if (tx->is_aborted()) {
     return abort_errno(tx);

@@ -8,6 +8,7 @@
 #include <vector>
 #include <memory>
 
+#include "common/typed_cell.h"
 #include "helios.pb.h"
 
 class TxRpcTrace;
@@ -249,11 +250,11 @@ public:
 
     // table/index management (non-transactional)
     // PAX cell widths in bytes (entry 0 = null flags, then TABLE::field
-    // order); kind/scale carry typed cells and not_null each field's NOT
+    // order); type/scale carry typed cells and not_null each field's NOT
     // NULL, one entry per width.
     bool db_create_table(const std::string& table_name,
                          const std::vector<uint32_t>& pax_field_max_bytes,
-                         const std::vector<uint32_t>& pax_field_kind,
+                         const std::vector<helios::rpc::PaxType>& pax_types,
                          const std::vector<int32_t>& pax_field_scale,
                          const std::vector<bool>& pax_field_not_null);
     // pk_slices locate the primary key in a record's key, as

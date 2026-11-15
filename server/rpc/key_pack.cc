@@ -73,8 +73,21 @@ bool unpack_leading_int_key(std::string_view key, int64_t& out) {
 }
 
 std::string pack_column_as_int_key(std::string_view column,
+                                   helios::rpc::PaxType type, int scale,
                                    int64_t int_delta) {
-    std::string tmp(column);
-    int64_t value = std::strtoll(tmp.c_str(), nullptr, 10);
+    using helios::rpc::PaxType;
+    // Text, or an empty (NULL) column, which reads as 0.
+    if (type == PaxType::kUntyped ||
+        column.size() != helios::rpc::cell_width(type)) {
+        std::string tmp(column);
+        return pack_int_key_part(std::strtoll(tmp.c_str(), nullptr, 10) +
+                                 int_delta);
+    }
+
+    int64_t value = helios::rpc::load_cell(column.data(), column.size());
+    if (type == PaxType::kDate) value /= 10000;
+    if (type == PaxType::kDecimal64) {
+        for (int i = 0; i < scale; i++) value /= 10;
+    }
     return pack_int_key_part(value + int_delta);
 }

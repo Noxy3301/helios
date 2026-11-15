@@ -130,9 +130,8 @@ uint32_t fence_timeout_ms() {
 
 // ---------------------------------------------------------------------------
 // Helios packed row format: unpacking, for epoch images. A preserved old_row
-// is a packed row payload whose typed fields carry val_str ASCII; the parsers
-// mirror the packing the plugin writes, and a failure is a broken invariant
-// and throws.
+// is a packed row payload whose typed fields carry their cells; a malformed
+// one is a broken invariant and throws.
 // ---------------------------------------------------------------------------
 
 /**
@@ -168,98 +167,6 @@ void split_packed_row(const std::string& row,
     fields->emplace_back(data + offset, length);
     offset += length;
   }
-}
-
-/**
- * @brief Parses a val_str ASCII integer (optional sign, digits only).
- */
-bool parse_ascii_int64(const char* s, uint32_t len, int64_t* out) {
-  if (len == 0) return false;
-  uint32_t i = 0;
-  bool negative = false;
-  if (s[0] == '-') {
-    negative = true;
-    i = 1;
-  } else if (s[0] == '+') {
-    i = 1;
-  }
-  if (i == len) return false;
-  __int128 value = 0;
-  for (; i < len; i++) {
-    const char c = s[i];
-    if (c < '0' || c > '9') return false;
-    value = value * 10 + (c - '0');
-    if (value > static_cast<__int128>(INT64_MAX) + 1) return false;
-  }
-  if (negative) value = -value;
-  if (value > INT64_MAX || value < INT64_MIN) return false;
-  *out = static_cast<int64_t>(value);
-  return true;
-}
-
-/**
- * @brief Parses a val_str "YYYY-MM-DD" date into its year/month/day parts.
- */
-bool parse_ascii_date(const char* s, uint32_t len, int32_t* year,
-                      int32_t* month, int32_t* day) {
-  if (len != 10 || s[4] != '-' || s[7] != '-') return false;
-  int32_t parts[3] = {0, 0, 0};
-  const uint32_t spans[3][2] = {{0, 4}, {5, 7}, {8, 10}};
-  for (int p = 0; p < 3; p++) {
-    for (uint32_t i = spans[p][0]; i < spans[p][1]; i++) {
-      const char c = s[i];
-      if (c < '0' || c > '9') return false;
-      parts[p] = parts[p] * 10 + (c - '0');
-    }
-  }
-  *year = parts[0];
-  *month = parts[1];
-  *day = parts[2];
-  return true;
-}
-
-/**
- * @brief Parses a val_str fixed-point decimal into a mantissa scaled by
- * `scale` (mirrors the scatter-side DEC64 rule, including padding when fewer
- * fractional digits are present).
- */
-bool parse_ascii_decimal_scaled(const char* s, uint32_t len, int scale,
-                                int64_t* out) {
-  if (len == 0) return false;
-  uint32_t i = 0;
-  bool negative = false;
-  if (s[0] == '-') {
-    negative = true;
-    i = 1;
-  } else if (s[0] == '+') {
-    i = 1;
-  }
-  __int128 mantissa = 0;
-  int fractional_digits = 0;
-  bool seen_dot = false, any_digit = false;
-  for (; i < len; i++) {
-    const char c = s[i];
-    if (c == '.') {
-      if (seen_dot) return false;
-      seen_dot = true;
-      continue;
-    }
-    if (c < '0' || c > '9') return false;
-    mantissa = mantissa * 10 + (c - '0');
-    if (seen_dot) fractional_digits++;
-    any_digit = true;
-    if (mantissa > static_cast<__int128>(INT64_MAX) + 1) return false;
-  }
-  if (!any_digit || fractional_digits > scale) return false;
-  while (fractional_digits < scale) {
-    mantissa *= 10;
-    fractional_digits++;
-    if (mantissa > static_cast<__int128>(INT64_MAX) + 1) return false;
-  }
-  if (negative) mantissa = -mantissa;
-  if (mantissa > INT64_MAX || mantissa < INT64_MIN) return false;
-  *out = static_cast<int64_t>(mantissa);
-  return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -593,7 +500,7 @@ inline bool try_canonical_date(int32_t year, int32_t month, int32_t day,
  * name no calendar day.
  *
  * @details For a value no chunk validation covers: an epoch image carries the
- * ASCII a writer formatted under a lock, which no reader can tear.
+ * cell a writer gathered under a lock, which no reader can tear.
  */
 inline date_t canonical_date(int32_t year, int32_t month, int32_t day) {
   date_t result;
@@ -977,10 +884,10 @@ void emit_in_place_row(const PaxGroup& group,
 /**
  * @brief Unpacks one epoch image into chunk row `out_row`.
  *
- * @details The image is a packed row payload whose typed fields carry val_str
- * ASCII (the gather round-trip contract); parse failures throw because an
- * image that fails to parse is a broken invariant, and the request must fail
- * rather than emit a wrong row.
+ * @details The image is a packed row payload whose typed fields carry their
+ * cells; a cell of the wrong width throws because an image that fails to
+ * unpack is a broken invariant, and the request must fail rather than emit a
+ * wrong row.
  */
 void emit_image_row(const std::string& old_row,
                     const std::vector<ColumnContext>& scan_columns,
@@ -1007,40 +914,28 @@ void emit_image_row(const std::string& old_row,
       continue;
     }
     FlatVector::SetNull(output_vector, out_row, false);
+    if (column.type != FieldType::kUntyped && length != column.width) {
+      throw std::runtime_error("epoch image typed field has the wrong width");
+    }
     switch (column.type) {
-      case FieldType::kInt32: {
-        int64_t value;
-        if (!parse_ascii_int64(payload, length, &value) || value < INT32_MIN ||
-            value > INT32_MAX) {
-          throw std::runtime_error("epoch image INT32 field does not parse");
-        }
-        FlatVector::GetData<int32_t>(output_vector)[out_row] =
-            static_cast<int32_t>(value);
+      case FieldType::kInt32:
+        std::memcpy(FlatVector::GetData<int32_t>(output_vector) + out_row,
+                    payload, sizeof(int32_t));
         break;
-      }
-      case FieldType::kInt64: {
-        int64_t value;
-        if (!parse_ascii_int64(payload, length, &value)) {
-          throw std::runtime_error("epoch image INT64 field does not parse");
-        }
-        FlatVector::GetData<int64_t>(output_vector)[out_row] = value;
+      case FieldType::kInt64:
+        std::memcpy(FlatVector::GetData<int64_t>(output_vector) + out_row,
+                    payload, sizeof(int64_t));
         break;
-      }
       case FieldType::kDate: {
-        int32_t year, month, day;
-        if (!parse_ascii_date(payload, length, &year, &month, &day)) {
-          throw std::runtime_error("epoch image DATE field does not parse");
-        }
+        int32_t ymd;
+        std::memcpy(&ymd, payload, sizeof(ymd));
         FlatVector::GetData<date_t>(output_vector)[out_row] =
-            canonical_date(year, month, day);
+            canonical_date(ymd / 10000, (ymd / 100) % 100, ymd % 100);
         break;
       }
       case FieldType::kDecimal64: {
         int64_t mantissa;
-        if (!parse_ascii_decimal_scaled(payload, length, column.scale,
-                                        &mantissa)) {
-          throw std::runtime_error("epoch image DECIMAL field does not parse");
-        }
+        std::memcpy(&mantissa, payload, sizeof(mantissa));
         write_decimal_physical(output_vector, out_row, mantissa,
                                column.decimal_physical_type);
         break;

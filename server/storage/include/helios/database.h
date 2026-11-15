@@ -166,8 +166,9 @@ class Database {
    *
    * @details Installs the per-field maximum cell widths: index 0 is the row
    * format's null-flags field, followed by one entry per column in field order.
-   * Values are stored in per-column strips. A value that does not fit or
-   * cannot be represented exactly is rejected before any write is installed.
+   * Values are stored in per-column strips. A value that does not fit, or a
+   * typed field that is not its fixed-width cell, is rejected before any
+   * write is installed.
    * Call after CreateTable and before loading rows. The schema is restored
    * at startup, even when value replay is disabled. Repeating the same
    * definition succeeds; changing an existing definition is refused.

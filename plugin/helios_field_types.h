@@ -4,55 +4,42 @@
 #include <cstdint>
 #include <vector>
 
+#include "common/typed_cell.h"
 #include "field_types.h"
 
 struct TABLE;
 
 /**
- * @brief PAX typed-cell kind constants.
- *
- * @details The values of helios::storage::pax::FieldType (server/storage
- * include/helios/pax.h); the plugin carries no storage header.
- */
-namespace pax_kind {
-constexpr uint32_t UNTYPED = 0;                 // verbatim byte layout
-constexpr uint32_t INT32 = 1;                   // 4-byte LE signed int
-constexpr uint32_t INT64 = 2;                   // 8-byte LE signed int
-constexpr uint32_t DATE = 3;                    // 4-byte LE YYYYMMDD
-constexpr uint32_t DEC64 = 4;                   // 8-byte LE scaled int (DEC64)
-}  // namespace pax_kind
-
-/**
- * @brief Computes PAX cell widths, kinds, and scales for the packed row
+ * @brief Computes PAX cell widths, types, and scales for the packed row
  * fields of `table`.
  *
- * @details Helios rows store each MySQL field as the string payload
- * produced by Field::val_str(). The returned vector contains one maximum
- * payload width per packed row field: entry 0 is the row null-flags field,
- * and the remaining entries follow TABLE::field order. For an UNTYPED field
- * the width is a safe upper bound on the val_str bytes; for a typed field
- * (INT family, DATE) the width is the fixed binary payload width (4/8) and
- * the kind tells the engine to parse val_str once at scatter and reformat it
- * at gather. A table with any field wider than the PAX cell cap returns an
- * empty vector, and CREATE TABLE refuses the table.
+ * @details Helios rows store an UNTYPED field as the string payload
+ * produced by Field::val_str(), and a typed field (INT family, DATE, DECIMAL)
+ * as its fixed-width cell (common/typed_cell.h). The returned
+ * vector contains one maximum payload width per packed row field: entry 0 is
+ * the row null-flags field, and the remaining entries follow TABLE::field
+ * order. For an UNTYPED field the width is a safe upper bound on the val_str
+ * bytes; for a typed field it is the cell width (4/8). A table with any field
+ * wider than the PAX cell cap returns an empty vector, and CREATE TABLE
+ * refuses the table.
  *
  * The computation is a pure function of TABLE metadata: any two calls under
- * an unchanged schema yield identical widths/kinds/scales. CREATE TABLE
+ * an unchanged schema yield identical widths/types/scales. CREATE TABLE
  * installs these values server-side; a caller that needs to describe the
  * stored PAX cells recomputes them rather than reading them back from the
  * server.
  *
  * @param table Table whose packed row fields are described.
- * @param kinds When non-null, receives one pax_kind value per returned width.
+ * @param types When non-null, receives one PaxType per returned width.
  * @param scales When non-null, receives one decimal scale per returned width
- * (nonzero only for DEC64).
+ * (nonzero only for kDecimal64).
  * @param wide_field When non-null, receives the index of the column whose
  * payload exceeds the PAX cell limit, set only when the result is empty.
  * @return Per-field maximum payload widths, or an empty vector when a column
  * is too wide for a PAX cell.
  */
 std::vector<uint32_t> compute_pax_field_widths(
-    TABLE *table, std::vector<uint32_t> *kinds = nullptr,
+    TABLE *table, std::vector<helios::rpc::PaxType> *types = nullptr,
     std::vector<int32_t> *scales = nullptr, uint *wide_field = nullptr);
 
 /**

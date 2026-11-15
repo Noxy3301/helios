@@ -27,6 +27,8 @@ macro(register_test testfile testfilepath)
     $<BUILD_INTERFACE:${CMAKE_SOURCE_DIR}/src>
     $<BUILD_INTERFACE:${CMAKE_SOURCE_DIR}/third_party/spdlog/include>
     $<BUILD_INTERFACE:${CMAKE_SOURCE_DIR}/third_party/msgpack/include>
+    # The repository root, whose common/typed_cell.h gives the typed cell format
+    $<BUILD_INTERFACE:${CMAKE_SOURCE_DIR}/../..>
   )
 
   # Add compiler definitions and linker options for Apple Silicon compatibility
