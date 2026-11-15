@@ -59,30 +59,16 @@ struct Config {
   uint64_t wal_segment_bytes = kWalSegmentBytes;
 
   /**
-   * @brief How often, in milliseconds, a checkpoint of the live rows is
-   *        written; zero writes none.
+   * @brief The amount of log the server aims to keep, in bytes.
    *
-   * The checkpoint is scanned while transactions keep running and is merged
-   * with the log at recovery, which is what bounds the part of the log that has
-   * to be replayed. It does not bound the log on disk: nothing is truncated.
+   * @details A checkpoint starts when the log that recovery would still need
+   * reaches half of it; the other half is for what is written while the
+   * checkpoint is captured. It is a target, not a hard limit: the log exceeds
+   * it when a capture takes longer than the remaining half lasts.
    *
-   * Requires a durability contract that writes a log, since the checkpoint
-   * alone is not a recoverable state.
-   *
-   * Default: 0 (no checkpoint)
+   * Default: 64 GiB
    */
-  size_t checkpoint_interval_ms = 0;
-
-  /**
-   * @brief One checkpoint written this many milliseconds after startup; zero
-   *        writes none.
-   *
-   * @details When checkpoint_interval_ms is also set, its timer starts after
-   * this first checkpoint, not at startup.
-   *
-   * Default: 0 (no checkpoint)
-   */
-  size_t checkpoint_once_after_ms = 0;
+  uint64_t wal_budget_bytes = 64ull << 30;
 
   /**
    * @brief The working directory, which holds the log and every related

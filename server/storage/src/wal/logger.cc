@@ -71,14 +71,10 @@ Logger::RecoveryResult Logger::Recover(const std::vector<Replay> &passes) {
   // replayed.
   auto checkpoint = EpochScanCheckpoint::Load(work_dir_);
   if (checkpoint.status == EpochScanCheckpoint::LoadResult::Status::kUnusable) {
-    // A checkpoint that cannot be trusted is not a reason to refuse to start:
-    // the log alone still holds everything the checkpoint would have
-    // supplied.
-    SPDLOG_WARN("Ignoring the checkpoint: {0}", checkpoint.detail);
-    checkpoint.records.clear();
-    // The start epoch is cleared with it so the scan skips nothing; the
-    // status keeps the end epoch out of the durable epoch below.
-    checkpoint.start_epoch = 0;
+    // The log it covered may be recycled, so there is nothing to fall back on.
+    WalScanResult failed;
+    failed.detail = "the checkpoint is unusable: " + checkpoint.detail;
+    return FailRecovery(failed);
   }
 
   // Each pass replays the checkpoint, then the log. The first scan repairs
@@ -88,7 +84,7 @@ Logger::RecoveryResult Logger::Recover(const std::vector<Replay> &passes) {
   for (size_t i = 0; i < passes.size(); ++i) {
     if (passes[i]) passes[i](checkpoint.records);
     if (i + 1 == passes.size()) LogRecords().swap(checkpoint.records);
-    wal = wal_.Scan(checkpoint.start_epoch, passes[i]);
+    wal = wal_.Scan(checkpoint.start_epoch, passes[i], checkpoint.redo_start);
     if (wal.status != WalScanResult::Status::kOk) return FailRecovery(wal);
   }
   RecoveryResult result;

@@ -11,9 +11,6 @@
 
 namespace {
 
-// A day between images is already far past any run this serves.
-constexpr uint64_t kMaxCheckpointMs = 24ull * 60ull * 60ull * 1000ull;
-
 ServerConfig g_config;
 
 [[noreturn]] void refuse(const std::string& key, const std::string& value,
@@ -83,19 +80,14 @@ void apply_key(const std::string& key, const std::string& value) {
             refuse(key, value, "an integer in [1,10000]");
         }
         g_config.epoch_duration_ms = static_cast<size_t>(number);
+    } else if (key == "wal_budget_bytes") {
+        if (!parse_bytes(value, &g_config.wal_budget_bytes)) {
+            refuse(key, value,
+                   "a positive byte count with an optional K, M or G suffix");
+        }
     } else if (key == "commit_durability") {
         if (value != "sync" && value != "async") refuse(key, value, "sync or async");
         g_config.commit_durability = value;
-    } else if (key == "checkpoint_interval_ms") {
-        if (!parse_number(value, 0, kMaxCheckpointMs, &number)) {
-            refuse(key, value, "an integer up to one day in milliseconds");
-        }
-        g_config.checkpoint_interval_ms = static_cast<size_t>(number);
-    } else if (key == "checkpoint_once_after_ms") {
-        if (!parse_number(value, 0, kMaxCheckpointMs, &number)) {
-            refuse(key, value, "an integer up to one day in milliseconds");
-        }
-        g_config.checkpoint_once_after_ms = static_cast<size_t>(number);
     } else if (key == "olap_threads") {
         if (!parse_number(value, 1, UINT32_MAX, &number)) {
             refuse(key, value, "a positive integer");

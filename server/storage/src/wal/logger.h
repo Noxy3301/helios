@@ -91,9 +91,11 @@ class Logger {
   void Enqueue(PackedLogRecord record);
 
   /**
-   * @brief Scans the log and zeroes the tail at its first invalid frame.
+   * @brief Loads the checkpoint, scans the log from its redo start and zeroes
+   * the tail at the first invalid record.
    * @details On success it sets the durable epoch from the log and any
-   * published checkpoint, and returns it. On kFailed, durable_epoch is 0.
+   * published checkpoint, and returns it. On kFailed, durable_epoch is 0. A
+   * damaged checkpoint fails recovery: the log it covered may be gone.
    * @param passes Run in order, each over the checkpoint's records when they
    * were loaded and then the log's records one epoch at a time, as
    * Wal::Scan hands them on; the log is read once per pass. An empty pass
@@ -181,6 +183,8 @@ class Logger {
    * can be observed.
    */
   void SetFailStop();
+
+  Wal &wal() { return wal_; }
 
  private:
   struct LogBuffer {

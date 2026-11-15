@@ -18,14 +18,13 @@ server_port = 9999
 # A Sync commit or a read view that waits on an epoch advances it sooner.
 epoch_duration_ms = 40
 
+# The amount of log the server aims to keep: a positive byte count with an
+# optional K, M or G suffix. A checkpoint starts when the log recovery would
+# still need reaches half of it.
+wal_budget_bytes = 64G
+
 # The contract every commit runs under: sync or async.
 commit_durability = sync
-
-# Milliseconds between checkpoints of the live rows; 0 writes none.
-checkpoint_interval_ms = 0
-
-# One checkpoint this many milliseconds after startup; 0 writes none.
-checkpoint_once_after_ms = 0
 
 # DuckDB thread pool size; commented out takes a quarter of the hardware
 # threads, which leaves the OLTP side its cores.

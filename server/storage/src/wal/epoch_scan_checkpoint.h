@@ -1,13 +1,13 @@
 /**
  * @file server/storage/src/wal/epoch_scan_checkpoint.h
  * The checkpoint of the live rows, scanned while transactions keep running and
- * merged with the log at recovery.
+ * merged with the log at recovery, and the worker that takes it and keeps the
+ * log's segment pool filled.
  */
 
 #ifndef HELIOS_STORAGE_SRC_WAL_EPOCH_SCAN_CHECKPOINT_H
 #define HELIOS_STORAGE_SRC_WAL_EPOCH_SCAN_CHECKPOINT_H
 
-#include <condition_variable>
 #include <cstdint>
 #include <mutex>
 #include <string>
@@ -18,6 +18,7 @@
 
 #include "util/epoch.h"
 #include "wal/log_record.h"
+#include "wal/wal.h"
 
 namespace helios::storage {
 
@@ -46,8 +47,12 @@ class Logger;
  * newest-transaction-id-wins rule and replaying everything above the start
  * epoch. Each row's copy is torn-free under the read path's version protocol,
  * and the checkpoint is published only once the log covers every epoch the scan
- * could have observed. What the checkpoint bounds is the replay, not the log on
- * disk.
+ * could have observed. A published checkpoint names where the redo starts, and
+ * the segments before that are free to recycle.
+ *
+ * The worker takes one when the log appended since the capture start of the
+ * last published checkpoint reaches half of Config::wal_budget_bytes, and
+ * retries after one more segment when an attempt fails.
  */
 class EpochScanCheckpoint {
  public:
@@ -56,6 +61,9 @@ class EpochScanCheckpoint {
    */
   struct Stats {
     uint64_t generation{0};
+    // Where the log ended before the start epoch was sampled, so every frame
+    // above that epoch lies after it.
+    WalPosition redo_start;
     // Global epoch sampled before the barrier; recovery replays the log above
     // it.
     EpochNumber start_epoch{0};
@@ -75,14 +83,14 @@ class EpochScanCheckpoint {
   /**
    * @brief A published checkpoint as recovery receives it.
    *
-   * `Absent` and `Unusable` are both answered with a full replay of the log;
-   * they are distinguished so that a damaged checkpoint is reported rather than
-   * ignored.
+   * `Absent` is answered with a full replay of the log. `Unusable` fails
+   * recovery, since the log the checkpoint covered may be gone.
    */
   struct LoadResult {
     enum class Status { kOk, kAbsent, kUnusable };
 
     Status status{Status::kAbsent};
+    WalPosition redo_start;
     EpochNumber start_epoch{0};
     EpochNumber end_epoch{0};
     LogRecords records;
@@ -97,15 +105,14 @@ class EpochScanCheckpoint {
   EpochScanCheckpoint &operator=(const EpochScanCheckpoint &) = delete;
 
   /**
-   * @brief Starts the thread that captures on the configured interval.
-   * A zero interval and no one-shot delay leaves the thread unstarted, which
-   * is the default.
+   * @brief Starts the worker, which prepares segments and captures when the log
+   * has grown enough.
    * @pre epoch::Framework::Start has been called.
    */
   void Start();
 
   /**
-   * @brief Stops the thread, waiting for a capture in progress to finish.
+   * @brief Stops the worker, waiting for a capture in progress to finish.
    */
   void Stop();
 
@@ -113,7 +120,8 @@ class EpochScanCheckpoint {
    * @brief Captures one checkpoint and publishes it, or abandons the attempt.
    * An abandoned attempt leaves the checkpoint published before it in place;
    * only a directory-sync failure after the atomic rename can report failure
-   * with the new checkpoint already in place.
+   * with the new checkpoint already in place. Publication makes the segments
+   * before the redo start free to recycle.
    * @param[out] out_stats What the capture did, when non-null.
    * @return Whether it published durably.
    */
@@ -138,7 +146,7 @@ class EpochScanCheckpoint {
 
   static constexpr uint32_t kMagic = 0x504b4348;  // "HCKP"
   static constexpr uint16_t kFlags = 0;
-  static constexpr size_t kHeaderSize = 50;
+  static constexpr size_t kHeaderSize = 66;
 
  private:
   /**
@@ -162,12 +170,6 @@ class EpochScanCheckpoint {
   bool CaptureTable(Table &table, LogRecord &record, Stats &stats);
   bool Publish(const LogRecords &records, Stats &stats);
   void Loop();
-  /**
-   * @brief Waits for the interval, or for a stop.
-   *
-   * @return Whether the loop may continue, i.e. no stop was requested.
-   */
-  bool ContinueAfter(uint64_t milliseconds);
 
   const Config &config_;
   TableDictionary &tables_;
@@ -181,7 +183,6 @@ class EpochScanCheckpoint {
   // one's durability gate would publish the newer one's bytes.
   std::mutex capture_mutex_;
   std::mutex stop_mutex_;
-  std::condition_variable stop_cv_;
   bool stop_{false};
   std::thread thread_;
 };

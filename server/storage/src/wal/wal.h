@@ -1,7 +1,7 @@
 /**
  * @file server/storage/src/wal/wal.h
  * The log on disk: numbered segment files of epoch frames, the pool that
- * prepares them, and the startup scan that decides what survived.
+ * prepares and recycles them, and the startup scan that decides what survived.
  */
 
 #ifndef HELIOS_STORAGE_SRC_WAL_WAL_H
@@ -100,7 +100,8 @@ struct WalIo {
  * Records are written in place into segments whose blocks already exist, so
  * that a group's fdatasync persists data and not the size, allocation or
  * extent-state metadata a growing file drags in. A new segment is written out
- * with zeroes once.
+ * with zeroes once; after that its file is recycled, overwriting whatever an
+ * earlier segment left there.
  *
  * Record layout, little-endian:
  *   magic(u32) type(u16) segment_number(u64) physical_offset(u64)
@@ -119,14 +120,18 @@ struct WalIo {
  * closes a segment and is the only way into the next, which it reaches only
  * after both are durable.
  *
- * Ready segments have a durable header and name and wait for the logger; a
- * logger that finds none prepares one itself.
+ * Segments below the checkpoint's redo start are covered: only those are
+ * recycled. Ready segments have a durable header and name and wait for the
+ * logger; a logger that finds none prepares one itself, which recycles only a
+ * covered segment and so never overwrites what recovery still needs.
  *
  * @note An exclusive flock on the directory keeps out a second process; it does
  * not make a second logger inside this process defined.
  */
 class Wal {
  public:
+  enum class WorkerTask { kPrepare, kCheckpoint, kStop };
+
   /**
    * @brief Opens the directory and takes an exclusive lock on it.
    * @details The constructor reads nothing; Scan finds the end of the log.
@@ -146,7 +151,8 @@ class Wal {
    * accepted, deletes temporary files and segments past the end of the log,
    * syncs the directory and prepares a spare segment, so that a later crash
    * cannot expose stale records under a segment number used again or lose what
-   * this scan reported. Later calls only read.
+   * this scan reported. Segments below `start` become covered. Later calls only
+   * read.
    * @param[in] min_epoch Frames at or below this are checked and counted but
    * not replayed.
    * @param[in] replay Called once per frame in log order with its records,
@@ -185,13 +191,44 @@ class Wal {
       EpochNumber target);
 
   /**
-   * @brief Prepares one segment if fewer than the spare target are ready.
+   * @brief Prepares one segment if fewer than the spare target are ready,
+   * recycling a covered file when there is one and writing a fresh one when
+   * not.
    * @return False when the preparation fails, or when the last one failed and
    * none has succeeded since. A logger that runs out of ready segments
    * prepares one itself and fails only when that preparation fails.
    * @note Safe from any thread; preparations run one at a time.
    */
   bool PrepareSegment();
+
+  /**
+   * @brief Declares every segment below `redo_segment` covered by a published
+   * checkpoint, and so free to recycle.
+   */
+  void MarkCovered(uint64_t redo_segment);
+
+  /**
+   * @brief Blocks the worker until there is something for it to do.
+   * @details A due checkpoint comes first while a segment is ready; otherwise
+   * the worker tops the pool up to two segments.
+   */
+  WorkerTask WaitForWork();
+
+  /**
+   * @brief Ends WaitForWork.
+   */
+  void StopWorker();
+
+  /**
+   * @brief Where the next record lands, as of the last completed fdatasync.
+   * @details Every frame before this position was written before the call.
+   */
+  WalPosition durable_end();
+
+  uint64_t appended_bytes();
+  void set_checkpoint_threshold(uint64_t appended_bytes);
+
+  uint64_t segment_bytes() const { return segment_bytes_; }
 
   /**
    * @brief Offset in the active segment where the next group lands, or 0 before
@@ -246,10 +283,12 @@ class Wal {
   bool WriteAllAt(std::vector<iovec> &iov, off_t offset, int &error);
   bool Fdatasync(int fd, int &error);
   bool WriteAndSync(std::vector<iovec> &iov, uint64_t offset, int &error);
-  bool FormatSegment(uint64_t segment_number, int &fd, int &error);
+  bool FormatSegment(uint64_t segment_number, uint64_t recycled, int &fd,
+                     int &error);
   bool Prepare(bool miss, int &error);
   bool AcquireReady(Segment &next, int &error);
   bool Rotate(std::vector<iovec> &iov, size_t group_size, int &error);
+  void PublishEnd(const WalPosition &end, uint64_t written);
 
   /**
    * @brief Reads exactly size bytes from fd at offset into out.
@@ -282,12 +321,19 @@ class Wal {
   std::mutex pool_mutex_;
   std::condition_variable pool_cv_;
   std::deque<Segment> ready_;
+  std::deque<uint64_t> covered_;
+  uint64_t oldest_retained_{1};
   uint64_t next_segment_{1};
   // The last preparation's failure, cleared by a success. Only a preparation
   // for a miss runs while it is set.
   int prepare_error_{0};
   // A preparation holds a segment number; the next waits until it ends.
   bool preparing_{false};
+  bool worker_stopped_{false};
+  WalPosition durable_end_;
+  uint64_t appended_bytes_{0};
+  // No checkpoint is due until the checkpointer sets a threshold.
+  uint64_t checkpoint_threshold_{UINT64_MAX};
 };
 
 }  // namespace wal

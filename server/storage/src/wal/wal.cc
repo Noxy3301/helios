@@ -1,7 +1,7 @@
 /**
  * @file server/storage/src/wal/wal.cc
  * The log on disk: numbered segment files of epoch frames, the pool that
- * prepares them, and the startup scan that decides what survived.
+ * prepares and recycles them, and the startup scan that decides what survived.
  */
 
 #include "wal/wal.h"
@@ -49,7 +49,7 @@ constexpr size_t kOffPayloadSize = 22;
 constexpr size_t kOffEpoch = 26;
 constexpr size_t kOffCrc = 30;
 
-// How many segments a preparation ahead of need keeps ready for the logger.
+// How many segments the worker keeps ready ahead of the logger.
 constexpr uint64_t kSpareSegments = 2;
 
 // The header bytes the checksum covers: all of them but the checksum word,
@@ -554,6 +554,7 @@ WalScanResult Wal::FinishScan(WalScanResult &&result, bool fresh,
 
   // Sort the other files out, then make the deletions durable.
   for (const uint64_t number : segments) {
+    if (number < start.segment_number) covered_.push_back(number);
     if (number > tail.segment_number &&
         ::unlink(SegmentPath(number).c_str()) != 0) {
       return IoFailure("unlink " + SegmentPath(number), errno);
@@ -570,6 +571,7 @@ WalScanResult Wal::FinishScan(WalScanResult &&result, bool fresh,
 
   // Prepare the active segment of a new log, then the spare.
   next_segment_ = fresh ? 1 : tail.segment_number + 1;
+  oldest_retained_ = start.segment_number;
   if (fresh) {
     if (!AcquireReady(active, error)) {
       return IoFailure("prepare the first segment of " + directory_, error);
@@ -581,6 +583,7 @@ WalScanResult Wal::FinishScan(WalScanResult &&result, bool fresh,
   }
 
   active_ = active;
+  durable_end_ = {active.segment_number, active.append_offset};
   last_epoch_ = result.last_epoch;
   state_ = State::kReady;
   return std::move(result);
@@ -739,16 +742,32 @@ WalScanResult Wal::Scan(EpochNumber min_epoch, const Replay &replay,
 
 // Builds a segment under its temporary name, then publishes the numbered name.
 // Until the directory sync is done nothing refers to the segment, and a crash
-// at any step leaves a file the next start deletes.
-bool Wal::FormatSegment(uint64_t segment_number, int &fd, int &error) {
+// at any step leaves a file the next start deletes or a covered one.
+bool Wal::FormatSegment(uint64_t segment_number, uint64_t recycled, int &fd,
+                        int &error) {
   const std::string temporary = TemporaryPath(segment_number);
-  fd = ::open(temporary.c_str(), O_RDWR | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
-  if (fd < 0) {
-    error = errno;
-    return false;
-  }
-  if (!WriteZeroesAndSync(fd, 0, static_cast<off_t>(segment_bytes_), error)) {
-    return false;
+  if (recycled != 0) {
+    HELIOS_DEBUG_SYNC("wal.prepare.before_temp_rename");
+    if (::rename(SegmentPath(recycled).c_str(), temporary.c_str()) != 0) {
+      error = errno;
+      return false;
+    }
+    HELIOS_DEBUG_SYNC("wal.prepare.after_temp_rename");
+    fd = ::open(temporary.c_str(), O_RDWR | O_CLOEXEC);
+    if (fd < 0) {
+      error = errno;
+      return false;
+    }
+  } else {
+    fd =
+        ::open(temporary.c_str(), O_RDWR | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+    if (fd < 0) {
+      error = errno;
+      return false;
+    }
+    if (!WriteZeroesAndSync(fd, 0, static_cast<off_t>(segment_bytes_), error)) {
+      return false;
+    }
   }
 
   // The header fills the first block, so frames start on a block of their own.
@@ -784,6 +803,7 @@ bool Wal::PrepareSegment() {
 // segment the one under way pushes.
 bool Wal::Prepare(bool miss, int &error) {
   Segment segment;
+  uint64_t recycled = 0;
   {
     std::unique_lock<std::mutex> lock(pool_mutex_);
     while (preparing_ && !(miss && !ready_.empty())) pool_cv_.wait(lock);
@@ -795,10 +815,14 @@ bool Wal::Prepare(bool miss, int &error) {
     if (ready_.size() * segment_bytes_ >= target) return true;
     preparing_ = true;
     segment.segment_number = next_segment_++;
+    if (!covered_.empty()) {
+      recycled = covered_.front();
+      covered_.pop_front();
+    }
   }
 
   const bool formatted =
-      FormatSegment(segment.segment_number, segment.fd, error);
+      FormatSegment(segment.segment_number, recycled, segment.fd, error);
   if (!formatted && segment.fd >= 0) ::close(segment.fd);
   {
     std::lock_guard<std::mutex> lock(pool_mutex_);
@@ -819,7 +843,8 @@ bool Wal::Prepare(bool miss, int &error) {
 }
 
 // Takes the next ready segment, which is durable under its numbered name, and
-// prepares one on a miss.
+// prepares one on a miss. Preparation recycles only covered segments, so
+// nothing here can overwrite what recovery still needs.
 bool Wal::AcquireReady(Segment &next, int &error) {
   std::unique_lock<std::mutex> lock(pool_mutex_);
   while (ready_.empty()) {
@@ -833,6 +858,66 @@ bool Wal::AcquireReady(Segment &next, int &error) {
   lock.unlock();
   pool_cv_.notify_all();
   return true;
+}
+
+void Wal::MarkCovered(uint64_t redo_segment) {
+  std::lock_guard<std::mutex> lock(pool_mutex_);
+  for (; oldest_retained_ < redo_segment; ++oldest_retained_) {
+    covered_.push_back(oldest_retained_);
+  }
+}
+
+Wal::WorkerTask Wal::WaitForWork() {
+  std::unique_lock<std::mutex> lock(pool_mutex_);
+  for (;;) {
+    if (worker_stopped_) return WorkerTask::kStop;
+    // A due checkpoint comes first while a segment is ready: only a checkpoint
+    // frees segments, and zeroing fresh ones cannot outrun a saturated device.
+    const bool checkpoint_due = appended_bytes_ >= checkpoint_threshold_;
+    if (checkpoint_due && !ready_.empty()) return WorkerTask::kCheckpoint;
+    if (prepare_error_ == 0 &&
+        ready_.size() * segment_bytes_ < spare_target_bytes_) {
+      return WorkerTask::kPrepare;
+    }
+    if (checkpoint_due) return WorkerTask::kCheckpoint;
+    pool_cv_.wait(lock);
+  }
+}
+
+void Wal::StopWorker() {
+  {
+    std::lock_guard<std::mutex> lock(pool_mutex_);
+    worker_stopped_ = true;
+  }
+  pool_cv_.notify_all();
+}
+
+WalPosition Wal::durable_end() {
+  std::lock_guard<std::mutex> lock(pool_mutex_);
+  return durable_end_;
+}
+
+uint64_t Wal::appended_bytes() {
+  std::lock_guard<std::mutex> lock(pool_mutex_);
+  return appended_bytes_;
+}
+
+void Wal::set_checkpoint_threshold(uint64_t appended_bytes) {
+  std::lock_guard<std::mutex> lock(pool_mutex_);
+  checkpoint_threshold_ = appended_bytes;
+}
+
+// Publishes where the log ends after an fdatasync, and wakes the worker when
+// that makes a checkpoint due.
+void Wal::PublishEnd(const WalPosition &end, uint64_t written) {
+  bool due;
+  {
+    std::lock_guard<std::mutex> lock(pool_mutex_);
+    durable_end_ = end;
+    appended_bytes_ += written;
+    due = appended_bytes_ >= checkpoint_threshold_;
+  }
+  if (due) pool_cv_.notify_all();
 }
 
 // Writes `iov` at `offset` and persists it: nothing may report it durable
@@ -874,6 +959,8 @@ bool Wal::Rotate(std::vector<iovec> &iov, size_t group_size, int &error) {
 
   ::close(active_.fd);
   active_ = next;
+  PublishEnd({active_.segment_number, active_.append_offset},
+             group_size + kHeaderSize);
   return true;
 }
 
@@ -995,8 +1082,10 @@ WalAppendResult Wal::AppendGroup(
     state_ = State::kFailed;
     return {false, error};
   }
+  const uint64_t written = padded_end - active_.append_offset;
   active_.append_offset = padded_end;
   last_epoch_ = last_packed;
+  PublishEnd({active_.segment_number, active_.append_offset}, written);
   return {true, 0};
 }
 

@@ -19,12 +19,10 @@ struct ServerConfig {
     std::string datadir = "./helios_data";
     /// How often the global epoch advances, in milliseconds.
     size_t epoch_duration_ms = 40;
+    /// The amount of log the server aims to keep, in bytes.
+    uint64_t wal_budget_bytes = 64ull << 30;
     /// The contract every commit runs under: "sync" or "async".
     std::string commit_durability = "sync";
-    /// Milliseconds between checkpoints; zero writes none.
-    size_t checkpoint_interval_ms = 0;
-    /// One checkpoint this many milliseconds after startup; zero writes none.
-    size_t checkpoint_once_after_ms = 0;
     /// DuckDB thread pool size; zero takes a quarter of the hardware threads.
     uint64_t olap_threads = 0;
     /// DuckDB memory bound in bytes; zero takes DuckDB's own default.

@@ -1,7 +1,8 @@
 /**
  * @file server/storage/src/wal/epoch_scan_checkpoint.cc
  * The checkpoint of the live rows, scanned while transactions keep running and
- * merged with the log at recovery.
+ * merged with the log at recovery, and the worker that takes it and keeps the
+ * log's segment pool filled.
  */
 
 #include "wal/epoch_scan_checkpoint.h"
@@ -49,6 +50,9 @@ constexpr auto kRetryPause = std::chrono::milliseconds(25);
 // The durable epoch advances once per epoch, so a wait beyond this means the
 // logger is not running rather than that the epoch is slow.
 constexpr auto kDurabilityWait = std::chrono::seconds(60);
+// How soon a durability wait looks at the segment pool again.
+constexpr auto kPoolPoll = std::chrono::milliseconds(1);
+constexpr uint64_t kRowsPerPoolCheck = 4096;
 
 // Checkpoint header fields, in bytes from the start of the file. The magic word
 // opens it at offset 0 and the checksum closes it at `kHeaderSize - 4`.
@@ -59,6 +63,8 @@ constexpr size_t kOffEndEpoch = 18;
 constexpr size_t kOffPrimaryRows = 22;
 constexpr size_t kOffSecondaryEntries = 30;
 constexpr size_t kOffPayloadSize = 38;
+constexpr size_t kOffRedoSegment = 46;
+constexpr size_t kOffRedoOffset = 54;
 
 void PutLe16(uint8_t *out, uint16_t value) {
   out[0] = static_cast<uint8_t>(value & 0xffu);
@@ -170,8 +176,7 @@ bool FsyncDirectory(const std::string &directory) {
   return ok;
 }
 
-// A checkpoint that is present but cannot be trusted, carrying no records:
-// recovery falls back to the log alone.
+// A checkpoint that is present but cannot be trusted, carrying no records.
 EpochScanCheckpoint::LoadResult unusable(const std::string &detail) {
   EpochScanCheckpoint::LoadResult checkpoint;
   checkpoint.status = EpochScanCheckpoint::LoadResult::Status::kUnusable;
@@ -277,15 +282,13 @@ EpochScanCheckpoint::EpochScanCheckpoint(const Config &config,
           (std::filesystem::path(config.work_dir) / CheckpointFileName())
               .string()),
       working_path_((std::filesystem::path(config.work_dir) / WorkingFileName())
-                        .string()) {}
+                        .string()) {
+  logger_.wal().set_checkpoint_threshold(config.wal_budget_bytes / 2);
+}
 
 EpochScanCheckpoint::~EpochScanCheckpoint() { Stop(); }
 
 void EpochScanCheckpoint::Start() {
-  if (config_.checkpoint_interval_ms == 0 &&
-      config_.checkpoint_once_after_ms == 0) {
-    return;
-  }
   thread_ = std::thread(&EpochScanCheckpoint::Loop, this);
 }
 
@@ -294,32 +297,29 @@ void EpochScanCheckpoint::Stop() {
     std::lock_guard<std::mutex> lock(stop_mutex_);
     stop_ = true;
   }
-  stop_cv_.notify_all();
+  logger_.wal().StopWorker();
   if (thread_.joinable()) thread_.join();
 }
 
-bool EpochScanCheckpoint::ContinueAfter(uint64_t milliseconds) {
-  std::unique_lock<std::mutex> lock(stop_mutex_);
-  stop_cv_.wait_for(lock, std::chrono::milliseconds(milliseconds),
-                    [this] { return stop_; });
-  return !stop_;
-}
-
 void EpochScanCheckpoint::Loop() {
-  if (config_.checkpoint_once_after_ms != 0) {
-    if (!ContinueAfter(config_.checkpoint_once_after_ms)) return;
-    RunOnce();
-    if (config_.checkpoint_interval_ms == 0) return;
-  }
-  while (ContinueAfter(config_.checkpoint_interval_ms)) {
+  Wal &wal = logger_.wal();
+  for (;;) {
+    const Wal::WorkerTask task = wal.WaitForWork();
+    if (task == Wal::WorkerTask::kStop) return;
+    if (task == Wal::WorkerTask::kPrepare) {
+      wal.PrepareSegment();
+      continue;
+    }
     RunOnce();
   }
 }
 
 bool EpochScanCheckpoint::RunOnce(Stats *out_stats) {
+  Wal &wal = logger_.wal();
   std::unique_lock<std::mutex> guard(capture_mutex_, std::try_to_lock);
   if (!guard.owns_lock()) {
     SPDLOG_WARN("A checkpoint is already being written");
+    wal.set_checkpoint_threshold(wal.appended_bytes() + wal.segment_bytes());
     return false;
   }
 
@@ -329,6 +329,11 @@ bool EpochScanCheckpoint::RunOnce(Stats *out_stats) {
   // Sample the start epoch, then barrier until every commit at or below it has
   // installed.
   const auto barrier_begin = Clock::now();
+  // Read before the start epoch: a frame before this position was flushed
+  // below the global epoch of that moment, so it is at or below the start
+  // epoch. The byte count read first is at most the one at the redo start.
+  const uint64_t appended_at_start = wal.appended_bytes();
+  stats.redo_start = wal.durable_end();
   // The start epoch is read before the barrier: once Sync returns, every commit
   // at or below it has installed its values. A start epoch taken after the scan
   // started would drop the commits still in flight at that moment.
@@ -380,6 +385,7 @@ bool EpochScanCheckpoint::RunOnce(Stats *out_stats) {
           "Checkpoint {0} abandoned: a row did not present a stable version",
           stats.generation);
     }
+    wal.set_checkpoint_threshold(wal.appended_bytes() + wal.segment_bytes());
     if (out_stats != nullptr) *out_stats = stats;
     return false;
   }
@@ -387,7 +393,14 @@ bool EpochScanCheckpoint::RunOnce(Stats *out_stats) {
   // Wait for durability, write, and rename.
   const bool published = Publish(records, stats);
   if (out_stats != nullptr) *out_stats = stats;
-  if (!published) return false;
+  if (!published) {
+    wal.set_checkpoint_threshold(wal.appended_bytes() + wal.segment_bytes());
+    return false;
+  }
+  // A published checkpoint leaves recovery only the log from its redo start,
+  // so half the budget is counted from there.
+  wal.set_checkpoint_threshold(appended_at_start +
+                               config_.wal_budget_bytes / 2);
 
   SPDLOG_INFO(
       "Checkpoint {0} written: {1} rows, {2} index entries, {3} bytes, start "
@@ -406,10 +419,12 @@ bool EpochScanCheckpoint::CaptureTable(Table &table, LogRecord &record,
   std::vector<std::string> unstable_rows;
   std::vector<std::pair<std::string, std::string>> unstable_entries;
 
-  // Capture every primary record; defer the keys that stayed locked. The
-  // walk's callback returns true to stop, so a capture that wants every row
-  // returns false.
+  // Capture every primary record, deferring the keys that stayed locked (the
+  // callback returns true to stop). The walk also serves the segment pool,
+  // which keeps preparation off the logger thread.
+  uint64_t walked = 0;
   table.GetPrimaryIndex().ForEach([&](std::string_view key, IndexRecord &item) {
+    if (++walked % kRowsPerPoolCheck == 0) logger_.wal().PrepareSegment();
     LogRecord::Write write;
     switch (CapturePrimaryRow(table_name, key, static_cast<RowRecord &>(item),
                               write, stats.version_retries)) {
@@ -430,6 +445,7 @@ bool EpochScanCheckpoint::CaptureTable(Table &table, LogRecord &record,
   table.ForEachSecondaryIndex(
       [&](const std::string &index_name, index::SecondaryIndex &index) {
         index.tree.ForEach([&](std::string_view key, IndexRecord &item) {
+          if (++walked % kRowsPerPoolCheck == 0) logger_.wal().PrepareSegment();
           LogRecord::Write write;
           switch (CaptureSecondaryEntry(table_name, index_name, index, key,
                                         item, write, stats.version_retries)) {
@@ -461,6 +477,7 @@ bool EpochScanCheckpoint::CaptureTable(Table &table, LogRecord &record,
     }
     if (stopped) break;
     std::this_thread::sleep_for(kRetryPause);
+    logger_.wal().PrepareSegment();
 
     std::vector<std::string> rows_left;
     for (const auto &key : unstable_rows) {
@@ -512,11 +529,17 @@ bool EpochScanCheckpoint::Publish(const LogRecords &records, Stats &stats) {
   msgpack::sbuffer payload;
   msgpack::pack(payload, records);
 
-  // Publishing before the log covers the last epoch the scan could have
-  // observed would let a version come back without its transaction.
+  // Publishing before the log covers the capture's end epoch would let a
+  // version come back without its transaction. The wait keeps serving the
+  // pool.
   const auto gate_begin = Clock::now();
-  const auto result =
-      logger_.WaitUntilDurable(stats.end_epoch, Clock::now() + kDurabilityWait);
+  auto result = Logger::WaitResult::kTimedOut;
+  while (result == Logger::WaitResult::kTimedOut &&
+         Clock::now() - gate_begin < kDurabilityWait) {
+    result =
+        logger_.WaitUntilDurable(stats.end_epoch, Clock::now() + kPoolPoll);
+    if (result == Logger::WaitResult::kTimedOut) logger_.wal().PrepareSegment();
+  }
   if (result != Logger::WaitResult::kDurable) {
     // Nothing was written this round; drop any working file an earlier
     // failed attempt left behind.
@@ -540,6 +563,8 @@ bool EpochScanCheckpoint::Publish(const LogRecords &records, Stats &stats) {
   PutLe64(header + kOffPrimaryRows, stats.primary_rows);
   PutLe64(header + kOffSecondaryEntries, stats.secondary_entries);
   PutLe64(header + kOffPayloadSize, static_cast<uint64_t>(payload.size()));
+  PutLe64(header + kOffRedoSegment, stats.redo_start.segment_number);
+  PutLe64(header + kOffRedoOffset, stats.redo_start.offset);
   Crc32c crc;
   crc.Update(header, kHeaderSize - sizeof(uint32_t));
   crc.Update(payload.data(), payload.size());
@@ -580,6 +605,7 @@ bool EpochScanCheckpoint::Publish(const LogRecords &records, Stats &stats) {
         stats.generation, errno);
     return false;
   }
+  logger_.wal().MarkCovered(stats.redo_start.segment_number);
   return true;
 }
 
@@ -621,6 +647,8 @@ EpochScanCheckpoint::LoadResult EpochScanCheckpoint::Load(
 
   const EpochNumber start_epoch = GetLe32(header + kOffStartEpoch);
   const EpochNumber end_epoch = GetLe32(header + kOffEndEpoch);
+  const WalPosition redo_start{GetLe64(header + kOffRedoSegment),
+                               GetLe64(header + kOffRedoOffset)};
   // Epoch 0 is not a start epoch any writer produces, and a scan never ends
   // before its start.
   if (start_epoch == 0 || end_epoch < start_epoch) {
@@ -658,6 +686,7 @@ EpochScanCheckpoint::LoadResult EpochScanCheckpoint::Load(
   }
 
   checkpoint.status = LoadResult::Status::kOk;
+  checkpoint.redo_start = redo_start;
   checkpoint.start_epoch = start_epoch;
   checkpoint.end_epoch = end_epoch;
   return checkpoint;
