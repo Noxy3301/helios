@@ -77,13 +77,19 @@ Logger::RecoveryResult Logger::Recover(const std::vector<Replay> &passes) {
     return FailRecovery(failed);
   }
 
-  // Each pass replays the checkpoint, then the log. The first scan repairs
-  // the tail, so a later one reads the same frames. The checkpoint is
-  // released before the last scan.
+  // Each pass replays the checkpoint chunk by chunk, then the log. The first
+  // scan repairs the tail, so a later one reads the same frames.
   WalScanResult wal;
   for (size_t i = 0; i < passes.size(); ++i) {
-    if (passes[i]) passes[i](checkpoint.records);
-    if (i + 1 == passes.size()) LogRecords().swap(checkpoint.records);
+    if (checkpoint.status == EpochScanCheckpoint::LoadResult::Status::kOk &&
+        passes[i]) {
+      std::string detail;
+      if (!EpochScanCheckpoint::ReadChunks(work_dir_, passes[i], &detail)) {
+        WalScanResult failed;
+        failed.detail = "the checkpoint is unusable: " + detail;
+        return FailRecovery(failed);
+      }
+    }
     wal = wal_.Scan(checkpoint.start_epoch, passes[i], checkpoint.redo_start);
     if (wal.status != WalScanResult::Status::kOk) return FailRecovery(wal);
   }

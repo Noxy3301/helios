@@ -45,6 +45,7 @@ struct CloseWriteOnExit {
 };
 
 using helios::storage::wal::EpochScanCheckpoint;
+using helios::storage::wal::LogRecords;
 using helios::storage::wal::Wal;
 using helios::storage::wal::WalScanResult;
 
@@ -133,11 +134,26 @@ class EpochScanCheckpointTest : public ::testing::Test {
     return hits;
   }
 
+  // What the published checkpoint holds: one record per chunk.
+  LogRecords CheckpointRecords() const {
+    LogRecords records;
+    const auto checkpoint = EpochScanCheckpoint::Load(work_dir_);
+    EXPECT_EQ(checkpoint.status, EpochScanCheckpoint::LoadResult::Status::kOk);
+    std::string detail;
+    EXPECT_TRUE(EpochScanCheckpoint::ReadChunks(
+        work_dir_,
+        [&records](const LogRecords &chunk) {
+          records.insert(records.end(), chunk.begin(), chunk.end());
+        },
+        &detail))
+        << detail;
+    return records;
+  }
+
   // The row value the checkpoint holds for `key`, if it holds one.
-  static std::optional<std::string> RowInCheckpoint(
-      const EpochScanCheckpoint::LoadResult &checkpoint,
-      const std::string &key) {
-    for (const auto &record : checkpoint.records) {
+  static std::optional<std::string> RowInCheckpoint(const LogRecords &records,
+                                                    const std::string &key) {
+    for (const auto &record : records) {
       for (const auto &write : record.writes) {
         if (!write.index_name.empty() || write.key != key) continue;
         return TestHelper::RowPayload(write.buffer);
@@ -149,10 +165,9 @@ class EpochScanCheckpointTest : public ::testing::Test {
   // The primary keys the checkpoint lists under a secondary key, over every
   // entry it holds for that key.
   static std::vector<std::string> IndexEntryInCheckpoint(
-      const EpochScanCheckpoint::LoadResult &checkpoint,
-      const std::string &key) {
+      const LogRecords &records, const std::string &key) {
     std::vector<std::string> primary_keys;
-    for (const auto &record : checkpoint.records) {
+    for (const auto &record : records) {
       for (const auto &write : record.writes) {
         if (write.index_name != kIndex || write.key != key) continue;
         primary_keys.insert(primary_keys.end(), write.primary_keys.begin(),
@@ -166,6 +181,19 @@ class EpochScanCheckpointTest : public ::testing::Test {
     return (std::filesystem::path(work_dir_) /
             EpochScanCheckpoint::CheckpointFileName())
         .string();
+  }
+
+  // Inverts one byte of the published checkpoint.
+  void FlipByte(std::streamoff offset) const {
+    std::fstream file(checkpoint_path(),
+                      std::ios::in | std::ios::out | std::ios::binary);
+    ASSERT_TRUE(file.is_open());
+    file.seekg(offset);
+    char byte = 0;
+    file.read(&byte, 1);
+    byte = static_cast<char>(~byte);
+    file.seekp(offset);
+    file.write(&byte, 1);
   }
 
   std::string working_path() const {
@@ -194,9 +222,10 @@ TEST_F(EpochScanCheckpointTest, ACheckpointHoldsWhatTheScanFound) {
 
   auto checkpoint = EpochScanCheckpoint::Load(work_dir_);
   ASSERT_EQ(checkpoint.status, EpochScanCheckpoint::LoadResult::Status::kOk);
-  EXPECT_EQ(RowInCheckpoint(checkpoint, "alice"), "one");
-  EXPECT_EQ(RowInCheckpoint(checkpoint, "bob"), "two");
-  auto primary_keys = IndexEntryInCheckpoint(checkpoint, "s");
+  const auto records = CheckpointRecords();
+  EXPECT_EQ(RowInCheckpoint(records, "alice"), "one");
+  EXPECT_EQ(RowInCheckpoint(records, "bob"), "two");
+  auto primary_keys = IndexEntryInCheckpoint(records, "s");
   std::sort(primary_keys.begin(), primary_keys.end());
   EXPECT_EQ(primary_keys, (std::vector<std::string>{"alice", "bob"}));
   EXPECT_NE(checkpoint.start_epoch, 0u);
@@ -216,10 +245,9 @@ TEST_F(EpochScanCheckpointTest, ADeletedRowLeavesNoEntry) {
     ASSERT_TRUE(db.WriteCheckpoint());
   }
 
-  auto checkpoint = EpochScanCheckpoint::Load(work_dir_);
-  ASSERT_EQ(checkpoint.status, EpochScanCheckpoint::LoadResult::Status::kOk);
-  EXPECT_EQ(RowInCheckpoint(checkpoint, "alice"), std::nullopt);
-  EXPECT_EQ(RowInCheckpoint(checkpoint, "bob"), "two");
+  const auto records = CheckpointRecords();
+  EXPECT_EQ(RowInCheckpoint(records, "alice"), std::nullopt);
+  EXPECT_EQ(RowInCheckpoint(records, "bob"), "two");
 }
 
 TEST_F(EpochScanCheckpointTest, AnAbsentCheckpointIsNotAFailure) {
@@ -237,20 +265,70 @@ TEST_F(EpochScanCheckpointTest, ADamagedCheckpointIsRefused) {
     ASSERT_TRUE(db.WriteCheckpoint());
   }
 
-  // One byte inside the payload, which the checksum covers.
+  // One byte of the first chunk's payload: the header still holds, and the
+  // chunk's own checksum does not.
+  FlipByte(EpochScanCheckpoint::kHeaderSize + 8);
+  EXPECT_EQ(EpochScanCheckpoint::Load(work_dir_).status,
+            EpochScanCheckpoint::LoadResult::Status::kOk);
+  std::string detail;
+  EXPECT_FALSE(EpochScanCheckpoint::ReadChunks(
+      work_dir_, [](const LogRecords &) {}, &detail));
+  EXPECT_NE(detail.find("checksum"), std::string::npos) << detail;
+
+  // One byte of the header, which its own checksum covers.
+  FlipByte(6);
+  EXPECT_EQ(EpochScanCheckpoint::Load(work_dir_).status,
+            EpochScanCheckpoint::LoadResult::Status::kUnusable);
+}
+
+TEST_F(EpochScanCheckpointTest, ACheckpointOverSeveralChunksHoldsEveryRow) {
+  const std::string value(32 * 1024, 'v');
+  const size_t rows = EpochScanCheckpoint::kChunkBytes / value.size() + 8;
+  const size_t rows_per_commit = 16;
   {
-    std::fstream file(checkpoint_path(),
-                      std::ios::in | std::ios::out | std::ios::binary);
-    ASSERT_TRUE(file.is_open());
-    file.seekp(static_cast<std::streamoff>(EpochScanCheckpoint::kHeaderSize));
-    char flipped = 0x7f;
-    file.write(&flipped, 1);
+    auto config = MakeConfig();
+    helios::storage::Database db(config);
+    TestHelper::CreateTable(db, kTable, value.size());
+    for (size_t i = 0; i < rows; i += rows_per_commit) {
+      std::vector<TestHelper::RowWrite> writes;
+      for (size_t j = i; j < std::min(i + rows_per_commit, rows); ++j) {
+        writes.push_back({kTable, "key" + std::to_string(j),
+                          TestHelper::Row(value)});
+      }
+      std::string commit_reason;
+      ASSERT_TRUE(TestHelper::CommitRows(db, {}, writes, {}, {}, commit_reason))
+          << commit_reason;
+    }
+    ASSERT_TRUE(db.WriteCheckpoint());
   }
 
-  auto checkpoint = EpochScanCheckpoint::Load(work_dir_);
-  EXPECT_EQ(checkpoint.status,
+  const auto records = CheckpointRecords();
+  EXPECT_GT(records.size(), 1u);
+  size_t writes = 0;
+  for (const auto &record : records) writes += record.writes.size();
+  EXPECT_EQ(writes, rows);
+  for (size_t i = 0; i < rows; ++i) {
+    EXPECT_EQ(RowInCheckpoint(records, "key" + std::to_string(i)), value) << i;
+  }
+}
+
+TEST_F(EpochScanCheckpointTest, ATruncatedCheckpointIsRefused) {
+  {
+    auto config = MakeConfig();
+    helios::storage::Database db(config);
+    TestHelper::CreateTable(db, kTable);
+    ASSERT_TRUE(CommitWrite(db, "alice", "one"));
+    ASSERT_TRUE(db.WriteCheckpoint());
+  }
+
+  // The last chunk loses its end while the header still promises all of it.
+  std::filesystem::copy_file(checkpoint_path(), working_path());
+  std::filesystem::resize_file(working_path(),
+                               std::filesystem::file_size(working_path()) - 3);
+  std::filesystem::rename(working_path(), checkpoint_path());
+
+  EXPECT_EQ(EpochScanCheckpoint::Load(work_dir_).status,
             EpochScanCheckpoint::LoadResult::Status::kUnusable);
-  EXPECT_TRUE(checkpoint.records.empty());
 }
 
 TEST_F(EpochScanCheckpointTest, TheLogTailWinsOverTheCheckpoint) {
@@ -589,12 +667,11 @@ TEST_F(EpochScanCheckpointTest, ARowLockedDuringTheScanIsRetried) {
   ASSERT_EQ(releaser.wait_for(kTestTimeout), std::future_status::ready);
   releaser.get();
 
-  auto checkpoint = EpochScanCheckpoint::Load(work_dir_);
-  ASSERT_EQ(checkpoint.status, EpochScanCheckpoint::LoadResult::Status::kOk);
+  const auto records = CheckpointRecords();
   // Either version is a correct answer for a scan that runs alongside a
   // writer. A mixture of the two is not.
   for (const char *key : {"alice", "bob"}) {
-    const auto value = RowInCheckpoint(checkpoint, key);
+    const auto value = RowInCheckpoint(records, key);
     ASSERT_TRUE(value.has_value()) << key;
     EXPECT_TRUE(*value == std::string(64, 'a') ||
                 *value == std::string(64, 'b'))
@@ -760,9 +837,7 @@ TEST_F(EpochScanCheckpointTest, ALeftoverWorkingFileIsNotRead) {
     file << "half of a checkpoint";
   }
 
-  auto checkpoint = EpochScanCheckpoint::Load(work_dir_);
-  ASSERT_EQ(checkpoint.status, EpochScanCheckpoint::LoadResult::Status::kOk);
-  EXPECT_EQ(RowInCheckpoint(checkpoint, "alice"), "one");
+  EXPECT_EQ(RowInCheckpoint(CheckpointRecords(), "alice"), "one");
 }
 
 }  // namespace

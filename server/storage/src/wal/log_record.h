@@ -32,7 +32,7 @@ enum class SecondaryIndexOp : uint8_t {
  *
  * @details The logger emits one per committed transaction whose write set is
  * non-empty, tagged with its commit epoch; the checkpoint writer packs one
- * record per table.
+ * record per chunk, tagged with its start epoch.
  *
  * @note Lives at namespace scope rather than inside Logger so that
  * persistence code can name it without depending on the logger interface.
