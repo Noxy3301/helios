@@ -1213,7 +1213,7 @@ bool build_base_table(Builder& b, Table_ref* table_ref,
         auto* column = table_desc->add_columns();
         // Entry 0 of the width/type/scale vectors is the row null-flags
         // field, not a named column.
-        column->set_pax_kind(static_cast<uint32_t>(pax_types[i + 1]));
+        column->set_pax_type(static_cast<uint32_t>(pax_types[i + 1]));
         column->set_pax_width(pax_widths[i + 1]);
         column->set_pax_scale(pax_scales[i + 1]);
         // A zero-length field is '' or NULL; only this bit tells them apart.

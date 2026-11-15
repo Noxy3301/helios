@@ -707,7 +707,7 @@ bool HeliosProxy::db_create_table(
         request.add_pax_field_max_bytes(width);
     }
     for (const auto type : pax_types) {
-        request.add_pax_field_kind(static_cast<uint32_t>(type));
+        request.add_pax_field_type(static_cast<uint32_t>(type));
     }
     for (const int32_t scale : pax_field_scale) {
         request.add_pax_field_scale(scale);

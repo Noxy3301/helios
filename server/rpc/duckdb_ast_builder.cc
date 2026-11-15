@@ -483,7 +483,7 @@ unique_ptr<ParsedExpression> BuildExpr(Builder& b, const Resolved::Expr& expr) {
             const auto* desc = found->second.desc;
             if (desc != nullptr &&
                 desc->columns(static_cast<int>(col.column_ordinal()))
-                        .pax_kind() == 0 &&
+                        .pax_type() == 0 &&
                 expr.result_type().kind() != Resolved::VARCHAR &&
                 expr.result_type().kind() != Resolved::TYPE_UNSPECIFIED) {
                 LogicalType declared;

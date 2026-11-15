@@ -1589,7 +1589,7 @@ void execute_duckdb_query(
         const size_t f = static_cast<size_t>(c) + 1;
         // type_of/scale_of handle the documented empty-vector shapes
         // (an untyped store keeps field_type empty).
-        if (schema.type_of(f) != static_cast<FieldType>(column.pax_kind()) ||
+        if (schema.type_of(f) != static_cast<FieldType>(column.pax_type()) ||
             schema.field_max_bytes[f] != column.pax_width() ||
             schema.scale_of(f) != static_cast<int>(column.pax_scale()) ||
             (column.null_bit() != 0 &&
@@ -1608,7 +1608,7 @@ void execute_duckdb_query(
           static_cast<size_t>(table_desc.columns_size()));
       for (const auto& column : table_desc.columns()) {
         ColumnSpec spec;
-        spec.type = static_cast<FieldType>(column.pax_kind());
+        spec.type = static_cast<FieldType>(column.pax_type());
         spec.width = column.pax_width();
         spec.scale = static_cast<int8_t>(column.pax_scale());
         if (column.null_bit() != 0) {
