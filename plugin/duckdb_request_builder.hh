@@ -12,7 +12,7 @@ struct LEX;
  *
  * @details Runs after resolution and before optimization, so the Item trees
  * are the permanent resolved ones, not yet edited in place by the
- * optimizer. Every Item and Table_ref kind is translated by an explicit
+ * optimizer. Every Item and Table_ref type is translated by an explicit
  * rule; anything without a rule refuses with *why set and nothing emitted.
  * The request the server executes is therefore exactly the statement this
  * walk examined.

@@ -1,6 +1,6 @@
 // Builds the duckdb-query request from the resolved statement (Query_block +
 // Item trees). Every switch is exhaustive with a refusing default: an Item or
-// Table_ref kind without a rule here is never emitted.
+// Table_ref type without a rule here is never emitted.
 #include "duckdb_request_builder.hh"
 
 #include <cstdint>
@@ -85,14 +85,14 @@ bool type_of(Builder& b, Item* item, Resolved::ResolvedType* out) {
             if (item->unsigned_flag) {
                 return b.refuse("unsigned integer is unsupported");
             }
-            out->set_kind(Resolved::INT64);
+            out->set_id(Resolved::INT64);
             return true;
         case MYSQL_TYPE_DOUBLE:
             // MySQL compares two fixed-scale REAL operands with a tolerance.
             if (item->decimals != DECIMAL_NOT_SPECIFIED) {
                 return b.refuse("fixed-scale DOUBLE is unsupported");
             }
-            out->set_kind(Resolved::DOUBLE);
+            out->set_id(Resolved::DOUBLE);
             return true;
         case MYSQL_TYPE_NEWDECIMAL: {
             uint32_t precision = item->decimal_precision();
@@ -105,7 +105,7 @@ bool type_of(Builder& b, Item* item, Resolved::ResolvedType* out) {
             if (precision == 0 || precision > 38 || scale > precision) {
                 return b.refuse("decimal precision is out of range");
             }
-            out->set_kind(Resolved::DECIMAL);
+            out->set_id(Resolved::DECIMAL);
             out->set_precision(precision);
             out->set_scale(scale);
             return true;
@@ -113,16 +113,16 @@ bool type_of(Builder& b, Item* item, Resolved::ResolvedType* out) {
         case MYSQL_TYPE_VARCHAR:
         case MYSQL_TYPE_VAR_STRING:
         case MYSQL_TYPE_STRING:
-            out->set_kind(Resolved::VARCHAR);
+            out->set_id(Resolved::VARCHAR);
             out->set_collation_id(item->collation.collation->number);
             return true;
         case MYSQL_TYPE_DATE:
         case MYSQL_TYPE_NEWDATE:
-            out->set_kind(Resolved::DATE);
+            out->set_id(Resolved::DATE);
             return true;
         case MYSQL_TYPE_DATETIME:
         case MYSQL_TYPE_TIMESTAMP:
-            out->set_kind(Resolved::DATETIME);
+            out->set_id(Resolved::DATETIME);
             return true;
         default:
             return b.refuse("type " + std::to_string(item->data_type()) +
@@ -139,8 +139,8 @@ bool contains_decimal_avg(const Builder& b, const Resolved::Expr& expr) {
     }
     if (expr.has_aggregate()) {
         const auto& aggregate = expr.aggregate();
-        if (aggregate.kind() == Resolved::Aggregate::AVG &&
-            expr.result_type().kind() == Resolved::DECIMAL) {
+        if (aggregate.fn() == Resolved::Aggregate::AVG &&
+            expr.result_type().id() == Resolved::DECIMAL) {
             return true;
         }
         return aggregate.has_arg() && contains_decimal_avg(b, aggregate.arg());
@@ -182,7 +182,7 @@ bool contains_decimal_quotient(const Builder& b, const Resolved::Expr& expr) {
         const auto& arith = expr.arithmetic();
         return ((arith.op() == Resolved::Arithmetic::DIV ||
                  arith.op() == Resolved::Arithmetic::MOD) &&
-                expr.result_type().kind() == Resolved::DECIMAL) ||
+                expr.result_type().id() == Resolved::DECIMAL) ||
                contains_decimal_quotient(b, arith.left()) ||
                contains_decimal_quotient(b, arith.right());
     }
@@ -216,7 +216,7 @@ bool contains_decimal_quotient(const Builder& b, const Resolved::Expr& expr) {
 // quotient inside an operand above 15 digits.
 bool admit_double_operand(Builder& b, const Resolved::Expr& expr) {
     const auto& type = expr.result_type();
-    if (type.kind() != Resolved::DECIMAL) return true;
+    if (type.id() != Resolved::DECIMAL) return true;
     if (contains_decimal_avg(b, expr)) {
         return b.refuse("decimal AVG operand in a DOUBLE context");
     }
@@ -235,7 +235,7 @@ bool collation_supported(uint32_t id) {
 // or matches, and implements only the supported collations.
 bool admit_string(Builder& b, const Resolved::Expr& expr) {
     const auto& type = expr.result_type();
-    if (type.kind() != Resolved::VARCHAR ||
+    if (type.id() != Resolved::VARCHAR ||
         collation_supported(type.collation_id())) {
         return true;
     }
@@ -247,16 +247,16 @@ bool admit_string(Builder& b, const Resolved::Expr& expr) {
 // comparison-context rules for the numeric, temporal and string profile.
 bool compare_type_of(Builder& b, const Resolved::Expr& left,
                      const Resolved::Expr& right, Resolved::ResolvedType* out) {
-    const auto lk = left.result_type().kind();
-    const auto rk = right.result_type().kind();
+    const auto lk = left.result_type().id();
+    const auto rk = right.result_type().id();
     if (lk == Resolved::INT64 && rk == Resolved::INT64) {
-        out->set_kind(Resolved::INT64);
+        out->set_id(Resolved::INT64);
         return true;
     }
     if ((lk == Resolved::DECIMAL || lk == Resolved::INT64) &&
         (rk == Resolved::DECIMAL || rk == Resolved::INT64)) {
         Resolved::ResolvedType int_type;
-        int_type.set_kind(Resolved::DECIMAL);
+        int_type.set_id(Resolved::DECIMAL);
         int_type.set_precision(19);  // BIGINT needs 19 integer digits
         int_type.set_scale(0);
         const Resolved::ResolvedType& lhs =
@@ -275,7 +275,7 @@ bool compare_type_of(Builder& b, const Resolved::Expr& left,
             (contains_decimal_avg(b, left) || contains_decimal_avg(b, right))) {
             return b.refuse("AVG operand in an over-wide decimal comparison");
         }
-        out->set_kind(Resolved::DECIMAL);
+        out->set_id(Resolved::DECIMAL);
         out->set_precision(std::min<uint32_t>(integer + scale, 38));
         out->set_scale(scale);
         return true;
@@ -288,15 +288,15 @@ bool compare_type_of(Builder& b, const Resolved::Expr& left,
         if (!admit_double_operand(b, left) || !admit_double_operand(b, right)) {
             return false;
         }
-        out->set_kind(Resolved::DOUBLE);
+        out->set_id(Resolved::DOUBLE);
         return true;
     }
     const bool l_temporal = lk == Resolved::DATE || lk == Resolved::DATETIME;
     const bool r_temporal = rk == Resolved::DATE || rk == Resolved::DATETIME;
     if (l_temporal && r_temporal) {
-        out->set_kind(lk == Resolved::DATETIME || rk == Resolved::DATETIME
-                          ? Resolved::DATETIME
-                          : Resolved::DATE);
+        out->set_id(lk == Resolved::DATETIME || rk == Resolved::DATETIME
+                        ? Resolved::DATETIME
+                        : Resolved::DATE);
         return true;
     }
     // A temporal operand against a string: MySQL always compares the pair
@@ -304,14 +304,14 @@ bool compare_type_of(Builder& b, const Resolved::Expr& left,
     // the string's time part participates.
     if ((l_temporal && rk == Resolved::VARCHAR) ||
         (r_temporal && lk == Resolved::VARCHAR)) {
-        out->set_kind(Resolved::DATETIME);
+        out->set_id(Resolved::DATETIME);
         return true;
     }
     if (lk == Resolved::VARCHAR && rk == Resolved::VARCHAR) {
         const uint32_t lc = left.result_type().collation_id();
         const uint32_t rc = right.result_type().collation_id();
         if (lc == rc && collation_supported(lc)) {
-            out->set_kind(Resolved::VARCHAR);
+            out->set_id(Resolved::VARCHAR);
             out->set_collation_id(lc);
             return true;
         }
@@ -326,7 +326,7 @@ bool build_int_literal(Builder& b, Item* item, Resolved::Expr* out) {
         static_cast<uint64_t>(item->val_int()) > INT64_MAX) {
         return b.refuse("integer literal above the signed range");
     }
-    out->mutable_result_type()->set_kind(Resolved::INT64);
+    out->mutable_result_type()->set_id(Resolved::INT64);
     out->mutable_literal()->set_int_value(item->val_int());
     return true;
 }
@@ -363,7 +363,7 @@ bool build_decimal_literal(Builder& b, Item* item, Resolved::Expr* out) {
     }
     if (digits == 0) return b.refuse("malformed decimal literal");
     auto* type = out->mutable_result_type();
-    type->set_kind(Resolved::DECIMAL);
+    type->set_id(Resolved::DECIMAL);
     type->set_precision(digits);
     type->set_scale(scale);
     auto* dec = out->mutable_literal()->mutable_decimal_value();
@@ -375,7 +375,7 @@ bool build_decimal_literal(Builder& b, Item* item, Resolved::Expr* out) {
 bool build_comparison(Builder& b, Item_func* function,
                       Resolved::Comparison::Op op, Resolved::Expr* out) {
     if (function->argument_count() != 2) return b.refuse("comparison arity");
-    out->mutable_result_type()->set_kind(Resolved::BOOL);
+    out->mutable_result_type()->set_id(Resolved::BOOL);
     auto* cmp = out->mutable_comparison();
     cmp->set_op(op);
     if (!build_expr(b, function->arguments()[0], cmp->mutable_left()) ||
@@ -390,14 +390,14 @@ bool build_comparison(Builder& b, Item_func* function,
         const auto& column = *sides[i];
         const auto& other = *sides[1 - i];
         if (column.has_column() &&
-            column.result_type().kind() == Resolved::DECIMAL &&
+            column.result_type().id() == Resolved::DECIMAL &&
             column.result_type().precision() > 15 &&
-            other.result_type().kind() == Resolved::DOUBLE) {
+            other.result_type().id() == Resolved::DOUBLE) {
             return b.refuse("DECIMAL column above 15 digits against DOUBLE");
         }
         if (column.has_column() &&
-            column.result_type().kind() == Resolved::INT64 &&
-            other.result_type().kind() == Resolved::DOUBLE) {
+            column.result_type().id() == Resolved::INT64 &&
+            other.result_type().id() == Resolved::DOUBLE) {
             return b.refuse("integer column against DOUBLE");
         }
     }
@@ -419,16 +419,16 @@ bool build_arithmetic(Builder& b, Item_func* function,
     // number; DuckDB does date arithmetic in days. Constant temporal
     // expressions fold to literals before reaching here.
     for (const auto* side : {&arith->left(), &arith->right()}) {
-        const auto kind = side->result_type().kind();
-        if (kind == Resolved::DATE || kind == Resolved::DATETIME) {
+        const auto id = side->result_type().id();
+        if (id == Resolved::DATE || id == Resolved::DATETIME) {
             return b.refuse("temporal operand in arithmetic is unsupported");
         }
     }
-    if (arith->left().result_type().kind() == Resolved::VARCHAR ||
-        arith->right().result_type().kind() == Resolved::VARCHAR) {
+    if (arith->left().result_type().id() == Resolved::VARCHAR ||
+        arith->right().result_type().id() == Resolved::VARCHAR) {
         return b.refuse("nonconstant string arithmetic is unsupported");
     }
-    if (out->result_type().kind() == Resolved::DOUBLE &&
+    if (out->result_type().id() == Resolved::DOUBLE &&
         (!admit_double_operand(b, arith->left()) ||
          !admit_double_operand(b, arith->right()))) {
         return false;
@@ -459,7 +459,7 @@ bool build_func(Builder& b, Item_func* function, Resolved::Expr* out) {
                                     out);
         case Item_func::NOT_FUNC: {
             if (function->argument_count() != 1) return b.refuse("NOT arity");
-            out->mutable_result_type()->set_kind(Resolved::BOOL);
+            out->mutable_result_type()->set_id(Resolved::BOOL);
             return build_expr(b, function->arguments()[0],
                               out->mutable_not_()->mutable_arg());
         }
@@ -468,7 +468,7 @@ bool build_func(Builder& b, Item_func* function, Resolved::Expr* out) {
             if (function->argument_count() != 1) {
                 return b.refuse("IS NULL arity");
             }
-            out->mutable_result_type()->set_kind(Resolved::BOOL);
+            out->mutable_result_type()->set_id(Resolved::BOOL);
             auto* test = out->mutable_is_null();
             test->set_negated(function->functype() ==
                               Item_func::ISNOTNULL_FUNC);
@@ -480,7 +480,7 @@ bool build_func(Builder& b, Item_func* function, Resolved::Expr* out) {
             if (function->argument_count() != 3) {
                 return b.refuse("BETWEEN arity");
             }
-            out->mutable_result_type()->set_kind(Resolved::BOOL);
+            out->mutable_result_type()->set_id(Resolved::BOOL);
             auto* between = out->mutable_between();
             between->set_negated(between_item->negated);
             if (!build_expr(b, function->arguments()[0],
@@ -504,8 +504,8 @@ bool build_func(Builder& b, Item_func* function, Resolved::Expr* out) {
             // One comparison type governs both bounds, as MySQL aggregates
             // all three operands before installing its comparators.
             auto* compare_as = between->mutable_compare_as();
-            const auto lk2 = low_type.kind();
-            const auto hk2 = high_type.kind();
+            const auto lk2 = low_type.id();
+            const auto hk2 = high_type.id();
             if (lk2 == hk2) {
                 if (lk2 == Resolved::VARCHAR &&
                     low_type.collation_id() != high_type.collation_id()) {
@@ -523,7 +523,7 @@ bool build_func(Builder& b, Item_func* function, Resolved::Expr* out) {
                          {&between->value(), &between->low(),
                           &between->high()}) {
                         const auto& type = operand->result_type();
-                        if (type.kind() == Resolved::DECIMAL) {
+                        if (type.id() == Resolved::DECIMAL) {
                             raw_integer = std::max(
                                 raw_integer, type.precision() - type.scale());
                             raw_scale = std::max(raw_scale, type.scale());
@@ -543,7 +543,7 @@ bool build_func(Builder& b, Item_func* function, Resolved::Expr* out) {
                     const uint32_t integer =
                         std::max(low_type.precision() - low_type.scale(),
                                  high_type.precision() - high_type.scale());
-                    compare_as->set_kind(Resolved::DECIMAL);
+                    compare_as->set_id(Resolved::DECIMAL);
                     compare_as->set_precision(
                         std::min<uint32_t>(integer + scale, 38));
                     compare_as->set_scale(scale);
@@ -559,10 +559,10 @@ bool build_func(Builder& b, Item_func* function, Resolved::Expr* out) {
                     !admit_double_operand(b, between->high())) {
                     return false;
                 }
-                compare_as->set_kind(Resolved::DOUBLE);
+                compare_as->set_id(Resolved::DOUBLE);
             } else if ((lk2 == Resolved::DATE && hk2 == Resolved::DATETIME) ||
                        (lk2 == Resolved::DATETIME && hk2 == Resolved::DATE)) {
-                compare_as->set_kind(Resolved::DATETIME);
+                compare_as->set_id(Resolved::DATETIME);
             } else if ((lk2 == Resolved::INT64 && hk2 == Resolved::DECIMAL) ||
                        (lk2 == Resolved::DECIMAL && hk2 == Resolved::INT64)) {
                 *compare_as =
@@ -575,7 +575,7 @@ bool build_func(Builder& b, Item_func* function, Resolved::Expr* out) {
         case Item_func::IN_FUNC: {
             auto* in_item = down_cast<Item_func_in*>(function);
             if (function->argument_count() < 2) return b.refuse("IN arity");
-            out->mutable_result_type()->set_kind(Resolved::BOOL);
+            out->mutable_result_type()->set_id(Resolved::BOOL);
             auto* in_list = out->mutable_in_list();
             in_list->set_negated(in_item->negated);
             if (!build_expr(b, function->arguments()[0],
@@ -590,13 +590,13 @@ bool build_func(Builder& b, Item_func* function, Resolved::Expr* out) {
             }
             // MySQL picks a comparator per member; DuckDB casts every
             // member to one common type. The translations agree only when
-            // the members already share the value's kind.
-            const auto value_kind = in_list->value().result_type().kind();
+            // the members already share the value's type.
+            const auto value_id = in_list->value().result_type().id();
             const auto value_collation =
                 in_list->value().result_type().collation_id();
             for (const auto& element : in_list->list()) {
-                if (element.result_type().kind() != value_kind) {
-                    return b.refuse("IN list mixes value kinds");
+                if (element.result_type().id() != value_id) {
+                    return b.refuse("IN list mixes value types");
                 }
                 if (element.result_type().collation_id() != value_collation) {
                     return b.refuse("IN list mixes string collations");
@@ -625,7 +625,7 @@ bool build_func(Builder& b, Item_func* function, Resolved::Expr* out) {
                                     out);
         case Item_func::LIKE_FUNC: {
             auto* like_item = down_cast<Item_func_like*>(function);
-            out->mutable_result_type()->set_kind(Resolved::BOOL);
+            out->mutable_result_type()->set_id(Resolved::BOOL);
             auto* like = out->mutable_like();
             if (!build_expr(b, function->arguments()[0],
                             like->mutable_value()) ||
@@ -633,8 +633,8 @@ bool build_func(Builder& b, Item_func* function, Resolved::Expr* out) {
                             like->mutable_pattern())) {
                 return false;
             }
-            if (like->value().result_type().kind() != Resolved::VARCHAR ||
-                like->pattern().result_type().kind() != Resolved::VARCHAR) {
+            if (like->value().result_type().id() != Resolved::VARCHAR ||
+                like->pattern().result_type().id() != Resolved::VARCHAR) {
                 return b.refuse("LIKE operands outside the string profile");
             }
             if (!like_item->escape_is_evaluated()) {
@@ -643,7 +643,7 @@ bool build_func(Builder& b, Item_func* function, Resolved::Expr* out) {
             like->set_escape(like_item->escape());
             const auto& value_type = like->value().result_type();
             const auto& pattern_type = like->pattern().result_type();
-            if (pattern_type.kind() == Resolved::VARCHAR &&
+            if (pattern_type.id() == Resolved::VARCHAR &&
                 pattern_type.collation_id() != value_type.collation_id()) {
                 return b.refuse("LIKE operand collations differ");
             }
@@ -673,7 +673,7 @@ bool build_func(Builder& b, Item_func* function, Resolved::Expr* out) {
                                 branch->mutable_when())) {
                     return false;
                 }
-                if (branch->when().result_type().kind() != Resolved::BOOL) {
+                if (branch->when().result_type().id() != Resolved::BOOL) {
                     return b.refuse("CASE condition is not Boolean "
                                     "(simple CASE is unsupported)");
                 }
@@ -686,7 +686,7 @@ bool build_func(Builder& b, Item_func* function, Resolved::Expr* out) {
                             case_when->mutable_else_result())) {
                 return false;
             }
-            if (out->result_type().kind() == Resolved::DOUBLE) {
+            if (out->result_type().id() == Resolved::DOUBLE) {
                 for (const auto& branch : case_when->branches()) {
                     if (!admit_double_operand(b, branch.then())) return false;
                 }
@@ -696,7 +696,7 @@ bool build_func(Builder& b, Item_func* function, Resolved::Expr* out) {
         }
         case Item_func::YEAR_FUNC: {
             if (function->argument_count() != 1) return b.refuse("YEAR arity");
-            out->mutable_result_type()->set_kind(Resolved::INT64);
+            out->mutable_result_type()->set_id(Resolved::INT64);
             auto* call = out->mutable_function();
             call->set_fn(Resolved::FunctionCall::EXTRACT_YEAR);
             return build_expr(b, function->arguments()[0], call->add_args());
@@ -707,7 +707,7 @@ bool build_func(Builder& b, Item_func* function, Resolved::Expr* out) {
                 function->argument_count() != 1) {
                 return b.refuse("EXTRACT outside YEAR is unsupported");
             }
-            out->mutable_result_type()->set_kind(Resolved::INT64);
+            out->mutable_result_type()->set_id(Resolved::INT64);
             auto* call = out->mutable_function();
             call->set_fn(Resolved::FunctionCall::EXTRACT_YEAR);
             return build_expr(b, function->arguments()[0], call->add_args());
@@ -749,7 +749,7 @@ bool build_func(Builder& b, Item_func* function, Resolved::Expr* out) {
             if (name == "ascii" && function->argument_count() == 1) {
                 // Served by the registered byte-valued mysql_ascii, not
                 // DuckDB's codepoint-valued ascii().
-                out->mutable_result_type()->set_kind(Resolved::INT64);
+                out->mutable_result_type()->set_id(Resolved::INT64);
                 auto* call = out->mutable_function();
                 call->set_fn(Resolved::FunctionCall::ASCII);
                 return build_expr(b, function->arguments()[0],
@@ -770,7 +770,7 @@ bool build_subselect(Builder& b, Item_subselect* subselect,
     auto* subquery = out->mutable_subquery();
     switch (subselect->substype()) {
         case Item_subselect::SINGLEROW_SUBS: {
-            subquery->set_kind(Resolved::Subquery::SCALAR);
+            subquery->set_type(Resolved::Subquery::SCALAR);
             if (!build_block(b, unit->first_query_block(),
                              subquery->mutable_query())) {
                 return false;
@@ -797,8 +797,8 @@ bool build_subselect(Builder& b, Item_subselect* subselect,
                 default:
                     return b.refuse("EXISTS truth transform is unsupported");
             }
-            out->mutable_result_type()->set_kind(Resolved::BOOL);
-            subquery->set_kind(Resolved::Subquery::EXISTS);
+            out->mutable_result_type()->set_id(Resolved::BOOL);
+            subquery->set_type(Resolved::Subquery::EXISTS);
             subquery->set_negated(negated);
             return build_block(b, unit->first_query_block(),
                                subquery->mutable_query(),
@@ -826,11 +826,11 @@ bool build_subselect(Builder& b, Item_subselect* subselect,
                 default:
                     return b.refuse("IN truth transform is unsupported");
             }
-            out->mutable_result_type()->set_kind(Resolved::BOOL);
+            out->mutable_result_type()->set_id(Resolved::BOOL);
             Resolved::Expr in_expr;
-            in_expr.mutable_result_type()->set_kind(Resolved::BOOL);
+            in_expr.mutable_result_type()->set_id(Resolved::BOOL);
             auto* in_subquery = in_expr.mutable_subquery();
-            in_subquery->set_kind(Resolved::Subquery::IN);
+            in_subquery->set_type(Resolved::Subquery::IN);
             in_subquery->set_negated(negated);
             if (!build_expr(b, in_subselect->left_expr,
                             in_subquery->mutable_left())) {
@@ -847,19 +847,19 @@ bool build_subselect(Builder& b, Item_subselect* subselect,
             const auto& left_type = in_subquery->left().result_type();
             const auto& item_type =
                 in_subquery->query().select(0).expression().result_type();
-            if ((left_type.kind() == Resolved::VARCHAR ||
-                 item_type.kind() == Resolved::VARCHAR) &&
-                (left_type.kind() != item_type.kind() ||
+            if ((left_type.id() == Resolved::VARCHAR ||
+                 item_type.id() == Resolved::VARCHAR) &&
+                (left_type.id() != item_type.id() ||
                  left_type.collation_id() != item_type.collation_id())) {
                 return b.refuse("IN subquery mixes string collations");
             }
             // DuckDB compares the two sides without CastTo, and its DECIMAL
             // to DOUBLE cast can round twice above 15 digits.
             auto wide = [](const Resolved::ResolvedType& type) {
-                return type.kind() == Resolved::DECIMAL && type.precision() > 15;
+                return type.id() == Resolved::DECIMAL && type.precision() > 15;
             };
-            if ((left_type.kind() == Resolved::DOUBLE && wide(item_type)) ||
-                (item_type.kind() == Resolved::DOUBLE && wide(left_type))) {
+            if ((left_type.id() == Resolved::DOUBLE && wide(item_type)) ||
+                (item_type.id() == Resolved::DOUBLE && wide(left_type))) {
                 return b.refuse("IN subquery pairs DOUBLE with a wide DECIMAL");
             }
             if (!fold_unknown) {
@@ -872,17 +872,17 @@ bool build_subselect(Builder& b, Item_subselect* subselect,
             auto* fold = out->mutable_case_when();
             auto* branch = fold->add_branches();
             *branch->mutable_when() = std::move(in_expr);
-            branch->mutable_then()->mutable_result_type()->set_kind(
+            branch->mutable_then()->mutable_result_type()->set_id(
                 Resolved::BOOL);
             branch->mutable_then()->mutable_literal()->set_bool_value(true);
-            fold->mutable_else_result()->mutable_result_type()->set_kind(
+            fold->mutable_else_result()->mutable_result_type()->set_id(
                 Resolved::BOOL);
             fold->mutable_else_result()->mutable_literal()->set_bool_value(
                 false);
             return true;
         }
         default:
-            return b.refuse("subquery kind is unsupported");
+            return b.refuse("subquery type is unsupported");
     }
 }
 
@@ -890,58 +890,58 @@ bool build_aggregate(Builder& b, Item_sum* sum, Resolved::Expr* out) {
     if (!type_of(b, sum, out->mutable_result_type())) return false;
     auto* aggregate = out->mutable_aggregate();
     bool distinct = false;
-    Resolved::Aggregate::Kind kind;
+    Resolved::Aggregate::Fn fn;
     switch (sum->sum_func()) {
         case Item_sum::COUNT_FUNC: {
-            out->mutable_result_type()->set_kind(Resolved::INT64);
+            out->mutable_result_type()->set_id(Resolved::INT64);
             Item* arg = sum->argument_count() == 1
                             ? real_item(sum->get_arg(0))
                             : nullptr;
             // COUNT over a never-null constant is COUNT(*): the same rows
             // are counted, and this is the shape MySQL itself uses.
             if (arg != nullptr && arg->const_item() && !arg->is_nullable()) {
-                aggregate->set_kind(Resolved::Aggregate::COUNT_STAR);
+                aggregate->set_fn(Resolved::Aggregate::COUNT_STAR);
                 return true;
             }
-            kind = Resolved::Aggregate::COUNT;
+            fn = Resolved::Aggregate::COUNT;
             break;
         }
         case Item_sum::COUNT_DISTINCT_FUNC:
-            out->mutable_result_type()->set_kind(Resolved::INT64);
-            kind = Resolved::Aggregate::COUNT;
+            out->mutable_result_type()->set_id(Resolved::INT64);
+            fn = Resolved::Aggregate::COUNT;
             distinct = true;
             break;
         case Item_sum::SUM_FUNC:
-            kind = Resolved::Aggregate::SUM;
+            fn = Resolved::Aggregate::SUM;
             break;
         case Item_sum::SUM_DISTINCT_FUNC:
-            kind = Resolved::Aggregate::SUM;
+            fn = Resolved::Aggregate::SUM;
             distinct = true;
             break;
         case Item_sum::AVG_FUNC:
-            kind = Resolved::Aggregate::AVG;
+            fn = Resolved::Aggregate::AVG;
             break;
         case Item_sum::AVG_DISTINCT_FUNC:
-            kind = Resolved::Aggregate::AVG;
+            fn = Resolved::Aggregate::AVG;
             distinct = true;
             break;
         case Item_sum::MIN_FUNC:
-            kind = Resolved::Aggregate::MIN;
+            fn = Resolved::Aggregate::MIN;
             break;
         case Item_sum::MAX_FUNC:
-            kind = Resolved::Aggregate::MAX;
+            fn = Resolved::Aggregate::MAX;
             break;
         default:
             return b.refuse("aggregate is unsupported");
     }
     if (sum->argument_count() != 1) return b.refuse("aggregate arity");
     // DuckDB and MySQL add DOUBLE values in different orders; the sums differ.
-    if ((kind == Resolved::Aggregate::SUM ||
-         kind == Resolved::Aggregate::AVG) &&
-        out->result_type().kind() == Resolved::DOUBLE) {
+    if ((fn == Resolved::Aggregate::SUM ||
+         fn == Resolved::Aggregate::AVG) &&
+        out->result_type().id() == Resolved::DOUBLE) {
         return b.refuse("DOUBLE SUM and AVG are unsupported");
     }
-    aggregate->set_kind(kind);
+    aggregate->set_fn(fn);
     aggregate->set_distinct(distinct);
     return build_expr(b, sum->get_arg(0), aggregate->mutable_arg()) &&
            admit_string(b, aggregate->arg());
@@ -1050,13 +1050,13 @@ bool build_temporal_const(Builder& b, Item* item, Resolved::Expr* out) {
                        (time.month == 2 && leap)) {
         return b.refuse("date constant outside the Gregorian calendar");
     }
-    auto* date = out->result_type().kind() == Resolved::DATE
+    auto* date = out->result_type().id() == Resolved::DATE
                      ? literal->mutable_date_value()
                      : literal->mutable_datetime_value()->mutable_date();
     date->set_year(time.year);
     date->set_month(time.month);
     date->set_day(time.day);
-    if (out->result_type().kind() != Resolved::DATE) {
+    if (out->result_type().id() != Resolved::DATE) {
         auto* datetime = literal->mutable_datetime_value();
         datetime->set_hour(time.hour);
         datetime->set_minute(time.minute);
@@ -1081,7 +1081,7 @@ bool build_expr(Builder& b, Item* item, Resolved::Expr* out) {
         if (!clean) {
             return b.refuse("constant evaluation raised a condition");
         }
-        out->mutable_result_type()->set_kind(Resolved::DOUBLE);
+        out->mutable_result_type()->set_id(Resolved::DOUBLE);
         if (item->null_value) {
             out->mutable_literal()->set_null_value(true);
         } else {
@@ -1132,7 +1132,7 @@ bool build_expr(Builder& b, Item* item, Resolved::Expr* out) {
             String* text = item->val_str(&buffer);
             if (text == nullptr) return b.refuse("string literal");
             auto* type = out->mutable_result_type();
-            type->set_kind(Resolved::VARCHAR);
+            type->set_id(Resolved::VARCHAR);
             type->set_collation_id(item->collation.collation->number);
             out->mutable_literal()->set_string_value(
                 std::string(text->ptr(), text->length()));
@@ -1148,7 +1148,7 @@ bool build_expr(Builder& b, Item* item, Resolved::Expr* out) {
             } else {
                 return b.refuse("logical connective is unsupported");
             }
-            out->mutable_result_type()->set_kind(Resolved::BOOL);
+            out->mutable_result_type()->set_id(Resolved::BOOL);
             auto* logical = out->mutable_logical();
             logical->set_op(op);
             List_iterator<Item> arguments(*cond->argument_list());
@@ -1292,13 +1292,13 @@ bool build_nest(Builder& b, const mem_root_deque<Table_ref*>& nest,
             if (table_ref->join_cond() == nullptr) {
                 return b.refuse("outer join without a condition");
             }
-            join->set_kind(Resolved::JoinRel::LEFT);
+            join->set_type(Resolved::JoinRel::LEFT);
             if (!build_expr(b, table_ref->join_cond(),
                             join->mutable_condition())) {
                 return false;
             }
         } else if (table_ref->join_cond() != nullptr) {
-            join->set_kind(Resolved::JoinRel::INNER);
+            join->set_type(Resolved::JoinRel::INNER);
             if (!build_expr(b, table_ref->join_cond(),
                             join->mutable_condition())) {
                 return false;
@@ -1306,7 +1306,7 @@ bool build_nest(Builder& b, const mem_root_deque<Table_ref*>& nest,
         } else {
             // Resolution moved inner-join conditions into WHERE; what is
             // left is a plain cross product under the WHERE filter.
-            join->set_kind(Resolved::JoinRel::CROSS);
+            join->set_type(Resolved::JoinRel::CROSS);
         }
         accumulated = std::move(joined);
     }
