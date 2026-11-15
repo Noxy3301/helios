@@ -1,7 +1,9 @@
 #include "message_handler.hh"
 #include <spdlog/spdlog.h>
 
+#include <algorithm>
 #include <cstdint>
+#include <cstring>
 #include <sys/socket.h>
 #include <sys/uio.h>
 #include <arpa/inet.h>
@@ -10,46 +12,17 @@
 
 namespace {
 
-// Reads one u32 length word in network order.
-bool recv_len(int socket, uint32_t& len) {
-    uint32_t net_len = 0;
-    ssize_t head_read = recv(socket, &net_len, sizeof(net_len), MSG_WAITALL);
-    if (head_read != static_cast<ssize_t>(sizeof(net_len))) {
-        if (head_read < 0) {
-            SPDLOG_ERROR("Failed to receive a frame length");
-        } else {
-            SPDLOG_DEBUG("Client disconnected while receiving a frame length");
-        }
-        return false;
-    }
-    len = ntohl(net_len);
-    return true;
-}
+// Bytes one recv asks for. A client sends one request and waits for its reply,
+// so a request that fits arrives in one recv instead of one per frame field.
+constexpr size_t kRecvBytes = 16 * 1024;
 
-// Reads one length word and the bytes it counts.
-bool recv_part(int socket, std::string& out) {
-    uint32_t size = 0;
-    if (!recv_len(socket, size)) {
-        return false;
-    }
-    if (size > helios::rpc::kMaxPartBytes) {
-        SPDLOG_ERROR("Frame part of {} bytes exceeds the {} byte limit", size,
-                     helios::rpc::kMaxPartBytes);
-        return false;
-    }
-
-    out.clear();
-    if (size == 0) {
-        return true;
-    }
-
-    // recv(MSG_WAITALL) still caps one call near 2GB, and returns short on a
-    // signal, so the part must be drained in a loop.
-    out.resize(size);
+// Reads exactly size bytes, looping because recv(MSG_WAITALL) returns short on
+// a signal.
+bool recv_all(int socket, char* out, size_t size) {
     size_t read_total = 0;
     while (read_total < size) {
-        const ssize_t chunk = recv(socket, &out[read_total], size - read_total,
-                                   MSG_WAITALL);
+        const ssize_t chunk =
+            recv(socket, out + read_total, size - read_total, MSG_WAITALL);
         if (chunk <= 0) {
             if (chunk < 0) {
                 SPDLOG_ERROR("Failed to receive {} frame bytes", size);
@@ -66,16 +39,48 @@ bool recv_part(int socket, std::string& out) {
 }  // namespace
 
 bool MessageHandler::receive_message(int socket, std::string& envelope) {
-    if (!recv_part(socket, envelope)) {
+    char head[kRecvBytes];
+    uint32_t net_len = 0;
+    size_t got = 0;
+    while (got < sizeof(net_len)) {
+        const ssize_t chunk = recv(socket, head + got, sizeof(head) - got, 0);
+        if (chunk <= 0) {
+            if (chunk < 0) {
+                SPDLOG_ERROR("Failed to receive a frame length");
+            } else {
+                SPDLOG_DEBUG(
+                    "Client disconnected while receiving a frame length");
+            }
+            return false;
+        }
+        got += static_cast<size_t>(chunk);
+    }
+    std::memcpy(&net_len, head, sizeof(net_len));
+    const uint32_t size = ntohl(net_len);
+    if (size > helios::rpc::kMaxPartBytes) {
+        SPDLOG_ERROR("Frame part of {} bytes exceeds the {} byte limit", size,
+                     helios::rpc::kMaxPartBytes);
+        return false;
+    }
+
+    const char* rest = head + sizeof(net_len);
+    got -= sizeof(net_len);
+    const size_t in_envelope = std::min<size_t>(got, size);
+    envelope.resize(size);
+    std::memcpy(envelope.data(), rest, in_envelope);
+    if (!recv_all(socket, envelope.data() + in_envelope, size - in_envelope)) {
         return false;
     }
 
     uint32_t pay_len = 0;
-    if (!recv_len(socket, pay_len)) {
+    const size_t in_pay_len = got - in_envelope;
+    std::memcpy(&pay_len, rest + in_envelope, in_pay_len);
+    if (!recv_all(socket, reinterpret_cast<char*>(&pay_len) + in_pay_len,
+                  sizeof(pay_len) - in_pay_len)) {
         return false;
     }
     if (pay_len != 0) {
-        SPDLOG_ERROR("Request carries a {} byte payload part", pay_len);
+        SPDLOG_ERROR("Request carries a {} byte payload part", ntohl(pay_len));
         return false;
     }
     return true;
