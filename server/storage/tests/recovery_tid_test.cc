@@ -19,7 +19,6 @@ constexpr const char *kTable = "recovery_tid_test";
 helios::storage::Config MakeConfig() {
   helios::storage::Config config;
   config.epoch_duration_ms = 10;
-  config.enable_recovery = true;
   config.work_dir = "./helios_recovery_tid_test_logs";
   return config;
 }

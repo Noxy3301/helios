@@ -189,7 +189,6 @@ class Logger {
   };
 
   const std::string work_dir_;
-  const bool loads_checkpoint_records_;
   Wal wal_;
 
   // One buffer per producer, also retained after that producer exits.

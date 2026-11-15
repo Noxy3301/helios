@@ -276,7 +276,7 @@ def test_acknowledged_rows_survive_a_process_crash(work_dir):
         server = None
         log(f"killed the server; wal.log is {size_before} bytes")
 
-        server = start_server(work_dir, "sync", conf={"enable_recovery": 1})
+        server = start_server(work_dir, "sync")
         start_mysqld()
         rows = sql("SELECT id, v FROM dur.crash ORDER BY id;")
         recovered = {}

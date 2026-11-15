@@ -584,7 +584,7 @@ bool EpochScanCheckpoint::Publish(const LogRecords &records, Stats &stats) {
 }
 
 EpochScanCheckpoint::LoadResult EpochScanCheckpoint::Load(
-    const std::string &work_dir, const bool load_records) {
+    const std::string &work_dir) {
   LoadResult checkpoint;
   const std::string path =
       (std::filesystem::path(work_dir) / CheckpointFileName()).string();
@@ -642,15 +642,13 @@ EpochScanCheckpoint::LoadResult EpochScanCheckpoint::Load(
       return unusable("the checkpoint checksum does not hold");
     }
 
-    if (load_records) {
-      size_t consumed = 0;
-      auto handle =
-          msgpack::unpack(reinterpret_cast<const char *>(payload.data()),
-                          payload.size(), consumed);
-      handle.get().convert(checkpoint.records);
-      if (consumed != payload.size()) {
-        return unusable("the checkpoint payload has trailing bytes");
-      }
+    size_t consumed = 0;
+    auto handle =
+        msgpack::unpack(reinterpret_cast<const char *>(payload.data()),
+                        payload.size(), consumed);
+    handle.get().convert(checkpoint.records);
+    if (consumed != payload.size()) {
+      return unusable("the checkpoint payload has trailing bytes");
     }
   } catch (const std::exception &e) {
     return unusable(std::string("the checkpoint payload does not unpack: ") +

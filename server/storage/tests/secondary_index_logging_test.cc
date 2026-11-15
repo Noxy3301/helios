@@ -137,7 +137,6 @@ class SecondaryIndexLoggingTest : public ::testing::Test {
   void SetUp() override {
     spdlog::set_level(spdlog::level::info);
     std::filesystem::remove_all(config_.work_dir);
-    config_.enable_recovery = true;
     db_ = std::make_unique<helios::storage::Database>(config_);
     TestHelper::CreateTable(*db_, "users");
     spdlog::set_level(spdlog::level::info);
@@ -147,7 +146,6 @@ class SecondaryIndexLoggingTest : public ::testing::Test {
 TEST_F(SecondaryIndexLoggingTest,
        SecondaryIndexDeltaLoggingAvoidsFullPrimaryKeyList) {
   helios::storage::Config config = db_->GetConfig();
-  config.enable_recovery = false;
 
   db_.reset(nullptr);
   std::filesystem::remove_all(config.work_dir);
@@ -264,7 +262,6 @@ TEST_F(SecondaryIndexLoggingTest, RecoveryKeepsADeltaForAnEmptyPrimaryKey) {
 
 TEST_F(SecondaryIndexLoggingTest, RecoveryWithSecondaryIndexWithoutCheckpoint) {
   helios::storage::Config config = db_->GetConfig();
-  config.enable_recovery = true;
 
   db_.reset(nullptr);
   std::filesystem::remove_all(config.work_dir);
@@ -305,7 +302,6 @@ TEST_F(SecondaryIndexLoggingTest, RecoveryWithSecondaryIndexWithoutCheckpoint) {
 
 TEST_F(SecondaryIndexLoggingTest, SecondaryIndexAddTimingRecorded) {
   helios::storage::Config config = db_->GetConfig();
-  config.enable_recovery = false;
   // What this test reports per transaction is how many bytes of log one
   // secondary-index write costs, and it reads that from the file's size. A
   // preallocated log holds its size constant, which would report zero for

@@ -115,30 +115,6 @@ TEST_F(PaxRecoveryTest, RestoresSchemaBeforeCheckpointAndWalValues) {
   }
 }
 
-TEST_F(PaxRecoveryTest, KeepsAllSchemasWhenRowReplayIsDisabled) {
-  {
-    Database db(config_);
-    ASSERT_TRUE(db.CreateTable("old"));
-    ASSERT_TRUE(db.InstallPaxSchema("old", kWidths, kTypes, kScales));
-    ASSERT_TRUE(TestHelper::WriteRow(db, "old", "a", Row(1, 100)));
-  }
-  {
-    auto config = config_;
-    config.enable_recovery = false;
-    Database db(config);
-    ASSERT_NE(db.GetPaxTable("old"), nullptr);
-    EXPECT_FALSE(TestHelper::ReadRow(db, "old", "a").has_value());
-    ASSERT_TRUE(db.CreateTable("new"));
-    ASSERT_TRUE(db.InstallPaxSchema("new", {1, 3}));
-  }
-  {
-    Database db(config_);
-    EXPECT_NE(db.GetPaxTable("old"), nullptr);
-    EXPECT_NE(db.GetPaxTable("new"), nullptr);
-    EXPECT_TRUE(TestHelper::ReadRow(db, "old", "a").has_value());
-  }
-}
-
 TEST_F(PaxRecoveryTest, FailedPublicationDoesNotEnableTheSchema) {
   Database db(config_);
   ASSERT_TRUE(db.CreateTable("first"));

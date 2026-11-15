@@ -90,10 +90,6 @@ void apply_key(const std::string& key, const std::string& value) {
     } else if (key == "commit_durability") {
         if (value != "sync" && value != "async") refuse(key, value, "sync or async");
         g_config.commit_durability = value;
-    } else if (key == "enable_recovery") {
-        if (!parse_bool(value, &g_config.enable_recovery)) {
-            refuse(key, value, "0 or 1, true or false, on or off");
-        }
     } else if (key == "wal_initial_capacity_bytes") {
         if (!parse_number(value, 0, kMaxWalCapacityBytes, &number)) {
             refuse(key, value, "an integer up to 64 GiB");

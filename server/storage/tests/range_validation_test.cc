@@ -22,7 +22,6 @@ constexpr const char *kTable = "range_validation_test";
 
 helios::storage::Config MakeConfig() {
   helios::storage::Config config;
-  config.enable_recovery = false;
   config.work_dir = "./helios_range_validation_test_logs";
   std::filesystem::remove_all(config.work_dir);
   return config;

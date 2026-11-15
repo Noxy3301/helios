@@ -279,7 +279,7 @@ def kill_now(server):
 
 def recovered_rows(work_dir, table):
     """Restarts the server with recovery and reads the table back."""
-    server = start_server(work_dir, "async", conf={"enable_recovery": 1})
+    server = start_server(work_dir, "async")
     start_mysqld()
     rows = {}
     for line in sql(f"SELECT id, v FROM dur.{table} ORDER BY id;") \

@@ -259,7 +259,6 @@ TEST_F(WalPackingTest, ACommitRecordIsTheLogRecordPacking) {
   {
     helios::storage::Config config;
     config.epoch_duration_ms = 10;
-    config.enable_recovery = false;
     config.work_dir = work_dir_;
     config.wal_initial_capacity_bytes = 1ull << 20;
     helios::storage::Database db(config);

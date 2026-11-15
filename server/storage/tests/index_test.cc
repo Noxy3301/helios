@@ -40,7 +40,6 @@ class IndexTest : public ::testing::Test {
   helios::storage::Config config_;
   std::unique_ptr<helios::storage::Database> db_;
   virtual void SetUp() {
-    config_.enable_recovery = false;
     config_.work_dir = "./helios_index_test_logs";
     std::filesystem::remove_all(config_.work_dir);
     db_ = std::make_unique<helios::storage::Database>(config_);

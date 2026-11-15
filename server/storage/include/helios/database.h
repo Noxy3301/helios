@@ -91,8 +91,8 @@ class Database {
    *
    * @details Counted while the rows are installed: a key deleted by its
    * newest write, and an older version of a key, are not counted. A table
-   * that recovered no rows has no entry, and neither does any table when
-   * recovery is disabled. Fixed after construction; commits do not move it.
+   * that recovered no rows has no entry. Fixed after construction; commits
+   * do not move it.
    *
    * @return Live rows keyed by table name.
    */

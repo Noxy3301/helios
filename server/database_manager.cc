@@ -14,17 +14,14 @@ DatabaseManager::DatabaseManager() {
     conf.wal_initial_capacity_bytes = config().wal_initial_capacity_bytes;
     conf.checkpoint_interval_ms     = config().checkpoint_interval_ms;
     conf.checkpoint_once_after_ms   = config().checkpoint_once_after_ms;
-    conf.enable_recovery            = config().enable_recovery;
     set_commit_durability(config().commit_durability == "async"
                               ? helios::storage::CommitDurability::kAsync
                               : helios::storage::CommitDurability::kSync);
     olap::configure_limits();
     // The startup contract on its own line: bench and deploy scripts grep it.
     SPDLOG_INFO("Commit durability: {}", config().commit_durability);
-    SPDLOG_INFO("Epoch {} ms, WAL capacity {} bytes, recovery {}",
-             conf.epoch_duration_ms,
-             static_cast<unsigned long long>(conf.wal_initial_capacity_bytes),
-             conf.enable_recovery ? "on" : "off");
+    SPDLOG_INFO("Epoch {} ms, WAL capacity {} bytes", conf.epoch_duration_ms,
+             static_cast<unsigned long long>(conf.wal_initial_capacity_bytes));
     if (conf.checkpoint_interval_ms != 0 || conf.checkpoint_once_after_ms != 0) {
         SPDLOG_INFO("Checkpoint image: every {} ms, one after {} ms",
                     conf.checkpoint_interval_ms, conf.checkpoint_once_after_ms);

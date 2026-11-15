@@ -152,12 +152,18 @@ def start_storage_server(work_dir, recovery=True):
     """Start a private storage server in `work_dir` (which owns its WAL).
 
     With recovery on the commit contract is Sync, so a row is on the device
-    before the restart below; with it off the restart starts from nothing,
-    which is what the reserved-but-not-durable window needs.
+    before the restart below; with it off the log and the checkpoint are removed
+    first, so the restart starts from nothing, which is what the
+    reserved-but-not-durable window needs.
     """
-    conf = {"server_port": RESTART_SERVER_PORT, "enable_recovery": int(recovery)}
+    conf = {"server_port": RESTART_SERVER_PORT}
     if recovery:
         conf.update(commit_durability="sync")
+    else:
+        data = os.path.join(work_dir, "helios_data")
+        for name in os.listdir(data) if os.path.isdir(data) else []:
+            if name.startswith(("wal", "checkpoint")):
+                os.remove(os.path.join(data, name))
     path = write_conf(work_dir, **conf)
     env = dict(os.environ)
     jemalloc = "/lib/x86_64-linux-gnu/libjemalloc.so.2"

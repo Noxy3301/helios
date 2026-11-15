@@ -66,10 +66,9 @@ class EpochScanCheckpointTest : public ::testing::Test {
     std::filesystem::remove_all(root_, ec);
   }
 
-  helios::storage::Config MakeConfig(bool enable_recovery) const {
+  helios::storage::Config MakeConfig() const {
     helios::storage::Config config;
     config.epoch_duration_ms = 10;
-    config.enable_recovery = enable_recovery;
     config.work_dir = work_dir_;
     config.wal_initial_capacity_bytes = 1ull << 20;
     return config;
@@ -181,7 +180,7 @@ class EpochScanCheckpointTest : public ::testing::Test {
 
 TEST_F(EpochScanCheckpointTest, ACheckpointHoldsWhatTheScanFound) {
   {
-    auto config = MakeConfig(false);
+    auto config = MakeConfig();
     helios::storage::Database db(config);
     TestHelper::CreateTable(db, kTable);
     ASSERT_TRUE(db.CreateSecondaryIndex(
@@ -206,7 +205,7 @@ TEST_F(EpochScanCheckpointTest, ACheckpointHoldsWhatTheScanFound) {
 
 TEST_F(EpochScanCheckpointTest, ADeletedRowLeavesNoEntry) {
   {
-    auto config = MakeConfig(false);
+    auto config = MakeConfig();
     helios::storage::Database db(config);
     TestHelper::CreateTable(db, kTable);
     ASSERT_TRUE(CommitWrite(db, "alice", "one"));
@@ -229,7 +228,7 @@ TEST_F(EpochScanCheckpointTest, AnAbsentCheckpointIsNotAFailure) {
 
 TEST_F(EpochScanCheckpointTest, ADamagedCheckpointIsRefused) {
   {
-    auto config = MakeConfig(false);
+    auto config = MakeConfig();
     helios::storage::Database db(config);
     TestHelper::CreateTable(db, kTable);
     ASSERT_TRUE(CommitWrite(db, "alice", "one"));
@@ -254,7 +253,7 @@ TEST_F(EpochScanCheckpointTest, ADamagedCheckpointIsRefused) {
 
 TEST_F(EpochScanCheckpointTest, TheLogTailWinsOverTheCheckpoint) {
   {
-    auto config = MakeConfig(false);
+    auto config = MakeConfig();
     helios::storage::Database db(config);
     TestHelper::CreateTable(db, kTable);
     ASSERT_TRUE(CommitWrite(db, "alice", "one"));
@@ -268,7 +267,7 @@ TEST_F(EpochScanCheckpointTest, TheLogTailWinsOverTheCheckpoint) {
     ASSERT_TRUE(CommitWrite(db, "dave", "two"));
   }
 
-  auto config = MakeConfig(true);
+  auto config = MakeConfig();
   helios::storage::Database db(config);
   TestHelper::CreateTable(db, kTable);
   EXPECT_EQ(Read(db, "alice").value, "two");
@@ -282,7 +281,7 @@ TEST_F(EpochScanCheckpointTest, TheLogTailWinsOverTheCheckpoint) {
 TEST_F(EpochScanCheckpointTest,
        RecoveryWithTheCheckpointMatchesRecoveryWithout) {
   {
-    auto config = MakeConfig(false);
+    auto config = MakeConfig();
     helios::storage::Database db(config);
     TestHelper::CreateTable(db, kTable);
     ASSERT_TRUE(db.CreateSecondaryIndex(
@@ -325,7 +324,7 @@ TEST_F(EpochScanCheckpointTest,
   std::vector<std::string> with_checkpoint;
   std::vector<std::string> index_with_checkpoint;
   {
-    auto config = MakeConfig(true);
+    auto config = MakeConfig();
     helios::storage::Database db(config);
     TestHelper::CreateTable(db, kTable);
     with_checkpoint = ReadAliceBobCarol(db);
@@ -337,7 +336,7 @@ TEST_F(EpochScanCheckpointTest,
   std::vector<std::string> without_checkpoint;
   std::vector<std::string> index_without_checkpoint;
   {
-    auto config = MakeConfig(true);
+    auto config = MakeConfig();
     helios::storage::Database db(config);
     TestHelper::CreateTable(db, kTable);
     without_checkpoint = ReadAliceBobCarol(db);
@@ -359,7 +358,7 @@ TEST_F(EpochScanCheckpointTest,
 // checkpoint holds.
 TEST_F(EpochScanCheckpointTest, ANonUniqueRecordTheTailRemovesStaysRemoved) {
   {
-    auto config = MakeConfig(false);
+    auto config = MakeConfig();
     helios::storage::Database db(config);
     TestHelper::CreateTable(db, kTable);
     ASSERT_TRUE(db.CreateSecondaryIndex(
@@ -378,7 +377,7 @@ TEST_F(EpochScanCheckpointTest, ANonUniqueRecordTheTailRemovesStaysRemoved) {
   const std::vector<std::string> expected{"s/alice=one", "s/dave=four",
                                           "t/carol=three"};
   {
-    auto config = MakeConfig(true);
+    auto config = MakeConfig();
     helios::storage::Database db(config);
     EXPECT_EQ(ReadIndex(db), expected);
   }
@@ -386,7 +385,7 @@ TEST_F(EpochScanCheckpointTest, ANonUniqueRecordTheTailRemovesStaysRemoved) {
   std::error_code ec;
   ASSERT_TRUE(std::filesystem::remove(checkpoint_path(), ec)) << ec.message();
   {
-    auto config = MakeConfig(true);
+    auto config = MakeConfig();
     helios::storage::Database db(config);
     EXPECT_EQ(ReadIndex(db), expected);
   }
@@ -398,7 +397,7 @@ TEST_F(EpochScanCheckpointTest, ANonUniqueRecordTheTailRemovesStaysRemoved) {
 TEST_F(EpochScanCheckpointTest,
        ARestoredNonUniqueRecordKeepsItsPrimaryKeyLength) {
   {
-    auto config = MakeConfig(false);
+    auto config = MakeConfig();
     helios::storage::Database db(config);
     TestHelper::CreateTable(db, kTable);
     ASSERT_TRUE(db.CreateSecondaryIndex(
@@ -412,7 +411,7 @@ TEST_F(EpochScanCheckpointTest,
   const std::vector<std::string> expected{"s/bbb=two", "ss/cc=three",
                                           "sss/a=one"};
   {
-    auto config = MakeConfig(true);
+    auto config = MakeConfig();
     helios::storage::Database db(config);
     EXPECT_EQ(ReadIndex(db), expected);
 
@@ -433,7 +432,7 @@ TEST_F(EpochScanCheckpointTest,
   std::error_code ec;
   ASSERT_TRUE(std::filesystem::remove(checkpoint_path(), ec)) << ec.message();
   {
-    auto config = MakeConfig(true);
+    auto config = MakeConfig();
     helios::storage::Database db(config);
     EXPECT_EQ(ReadIndex(db), expected);
   }
@@ -441,7 +440,7 @@ TEST_F(EpochScanCheckpointTest,
 
 TEST_F(EpochScanCheckpointTest, AQuietTailAfterTheCheckpointIsAccepted) {
   {
-    auto config = MakeConfig(false);
+    auto config = MakeConfig();
     helios::storage::Database db(config);
     TestHelper::CreateTable(db, kTable);
     ASSERT_TRUE(CommitWrite(db, "alice", "one"));
@@ -463,7 +462,7 @@ TEST_F(EpochScanCheckpointTest, AQuietTailAfterTheCheckpointIsAccepted) {
   }
 
   {
-    auto config = MakeConfig(true);
+    auto config = MakeConfig();
     helios::storage::Database db(config);
     EXPECT_EQ(Read(db, "alice").value, "one");
     EXPECT_EQ(Read(db, "bob").value, "one");
@@ -472,18 +471,18 @@ TEST_F(EpochScanCheckpointTest, AQuietTailAfterTheCheckpointIsAccepted) {
 
   // The new write must be newer than the recovered checkpoint, so its next
   // replay cannot skip it as a frame the checkpoint already covers.
-  auto config = MakeConfig(true);
+  auto config = MakeConfig();
   helios::storage::Database db(config);
   EXPECT_EQ(Read(db, "alice").value, "two");
   EXPECT_EQ(Read(db, "bob").value, "one");
 }
 
-// A start that does not replay still takes the checkpoint's end epoch:
+// A log that ends below the checkpoint's end epoch still resumes above it:
 // publication waited for that epoch to become durable, so resuming below it
 // would hand later commits epochs a replay treats as covered.
-TEST_F(EpochScanCheckpointTest, AStartWithoutAReplayTakesTheCheckpointEpoch) {
+TEST_F(EpochScanCheckpointTest, RecoveryTakesTheCheckpointEndEpoch) {
   {
-    auto config = MakeConfig(false);
+    auto config = MakeConfig();
     helios::storage::Database db(config);
     TestHelper::CreateTable(db, kTable);
     ASSERT_TRUE(CommitWrite(db, "alice", "one"));
@@ -501,7 +500,7 @@ TEST_F(EpochScanCheckpointTest, AStartWithoutAReplayTakesTheCheckpointEpoch) {
     ASSERT_LT(scan.last_epoch, checkpoint.end_epoch);
   }
 
-  helios::storage::wal::Logger logger(MakeConfig(false));
+  helios::storage::wal::Logger logger(MakeConfig());
   const auto recovery = logger.Recover();
   ASSERT_EQ(recovery.status, helios::storage::wal::Logger::RecoveryStatus::kOk);
   EXPECT_EQ(recovery.durable_epoch, checkpoint.end_epoch);
@@ -513,7 +512,7 @@ TEST_F(EpochScanCheckpointTest, ARowLockedDuringTheScanIsRetried) {
   Pipe write_arrived;
   Pipe write_release;
 
-  auto config = MakeConfig(false);
+  auto config = MakeConfig();
   helios::storage::Database db(config);
   TestHelper::CreateTable(db, kTable);
   ASSERT_TRUE(CommitWrite(db, "alice", std::string(64, 'a')));
@@ -603,7 +602,7 @@ TEST_F(EpochScanCheckpointTest, ARowLockedDuringTheScanIsRetried) {
 
 TEST_F(EpochScanCheckpointTest, ALeftoverWorkingFileIsNotRead) {
   {
-    auto config = MakeConfig(false);
+    auto config = MakeConfig();
     helios::storage::Database db(config);
     TestHelper::CreateTable(db, kTable);
     ASSERT_TRUE(CommitWrite(db, "alice", "one"));
