@@ -112,6 +112,17 @@ class Database {
   void ReleaseThreadEpoch();
 
   /**
+   * @brief Blocks until `epoch` is durable, then returns the durable epoch
+   * `D`, which is at least `epoch`.
+   *
+   * @details Lets a caller that committed with an await epoch report the
+   * commit later. A log that cannot make `epoch` durable stops the process,
+   * as it does for a Sync commit that waits inside Commit. The calling thread
+   * must hold no storage epoch.
+   */
+  EpochNumber await_durable(EpochNumber epoch);
+
+  /**
    * @brief Declares a secondary index on a table.
    *
    * @param pk_slices For a non-unique index whose secondary key holds
