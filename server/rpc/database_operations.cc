@@ -210,16 +210,16 @@ void HeliosRpc::handleDbCreateTable(
             widths.push_back(width);
         }
 
-        // Every schema is typed: the request carries one kind per width.
+        // Every schema is typed: the request carries one type per width.
         std::vector<helios::storage::pax::FieldType> types;
         std::vector<int8_t> scales;
         std::vector<bool> not_null(request.pax_field_not_null().begin(),
                                    request.pax_field_not_null().end());
         {
-            types.reserve(request.pax_field_kind_size());
-            for (const uint32_t kind : request.pax_field_kind()) {
+            types.reserve(request.pax_field_type_size());
+            for (const uint32_t type : request.pax_field_type()) {
                 types.push_back(
-                    static_cast<helios::storage::pax::FieldType>(kind));
+                    static_cast<helios::storage::pax::FieldType>(type));
             }
             if (request.pax_field_scale_size() ==
                 request.pax_field_max_bytes_size()) {

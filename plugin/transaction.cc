@@ -35,9 +35,9 @@ inline std::string index_scope_key(const std::string& table,
   return k;
 }
 
-std::string trace_count_event(const char* kind, const std::string& table_name,
+std::string trace_count_event(const char* name, const std::string& table_name,
                               size_t count) {
-  return std::string(kind) + ":" + table_name + ":n=" +
+  return std::string(name) + ":" + table_name + ":n=" +
          std::to_string(count);
 }
 

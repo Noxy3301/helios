@@ -21,8 +21,8 @@
  *             always 1 byte, byteSize = UCHAR_MAX if valueLength = 0
  * - valueLength: length of value
  *                max 4 bytes
- * value: MySQL value shown to users
- *        max 4294967295 bytes, the LONGBLOB limit
+ * value: Field::val_str() bytes, or a typed PAX column's cell
+ *        (common/typed_cell.h); max 4294967295 bytes, the LONGBLOB limit
  * Each row consists of multiple fields.
  * First field stores null flags.
  */

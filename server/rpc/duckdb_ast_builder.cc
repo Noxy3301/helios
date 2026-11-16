@@ -1,5 +1,5 @@
 // Builds DuckDB's parsed AST from a duckdb-query request. Every switch is
-// exhaustive with a refusing default: a node kind without a rule here fails
+// exhaustive with a refusing default: a node type without a rule here fails
 // the request instead of flowing through.
 #include "duckdb_ast_builder.hh"
 
@@ -89,7 +89,7 @@ std::string ColumnAlias(uint32_t ordinal) {
 
 bool ResolveType(Builder& b, const Resolved::ResolvedType& type,
                  LogicalType* out) {
-    switch (type.kind()) {
+    switch (type.id()) {
         case Resolved::INT64:
             *out = LogicalType::BIGINT;
             return true;
@@ -121,8 +121,8 @@ bool ResolveType(Builder& b, const Resolved::ResolvedType& type,
             *out = LogicalType::BOOLEAN;
             return true;
         default:
-            return b.Refuse("unknown type kind " +
-                            std::to_string(type.kind()));
+            return b.Refuse("unknown type id " +
+                            std::to_string(type.id()));
     }
 }
 
@@ -131,22 +131,22 @@ duckdb::unique_ptr<duckdb::SelectStatement> BuildBlock(
     Builder& b, const Resolved::QueryBlock& block);
 
 bool LiteralMatchesType(Resolved::Literal::ValueCase value,
-                        Resolved::TypeKind kind) {
+                        Resolved::TypeId id) {
     switch (value) {
         case Resolved::Literal::kIntValue:
-            return kind == Resolved::INT64;
+            return id == Resolved::INT64;
         case Resolved::Literal::kDecimalValue:
-            return kind == Resolved::DECIMAL;
+            return id == Resolved::DECIMAL;
         case Resolved::Literal::kDoubleValue:
-            return kind == Resolved::DOUBLE;
+            return id == Resolved::DOUBLE;
         case Resolved::Literal::kStringValue:
-            return kind == Resolved::VARCHAR;
+            return id == Resolved::VARCHAR;
         case Resolved::Literal::kDateValue:
-            return kind == Resolved::DATE;
+            return id == Resolved::DATE;
         case Resolved::Literal::kDatetimeValue:
-            return kind == Resolved::DATETIME;
+            return id == Resolved::DATETIME;
         case Resolved::Literal::kBoolValue:
-            return kind == Resolved::BOOL;
+            return id == Resolved::BOOL;
         case Resolved::Literal::kNullValue:
             return true;  // typed by result_type, checked at construction
         default:
@@ -157,7 +157,7 @@ bool LiteralMatchesType(Resolved::Literal::ValueCase value,
 unique_ptr<ParsedExpression> BuildLiteral(Builder& b,
                                           const Resolved::Expr& expr) {
     const auto& lit = expr.literal();
-    if (!LiteralMatchesType(lit.value_case(), expr.result_type().kind())) {
+    if (!LiteralMatchesType(lit.value_case(), expr.result_type().id())) {
         b.Refuse("literal value does not match its declared type");
         return nullptr;
     }
@@ -220,7 +220,7 @@ unique_ptr<ParsedExpression> BuildLiteral(Builder& b,
 unique_ptr<ParsedExpression> AdmitComparisonString(
     Builder& b, const Resolved::ResolvedType& type,
     unique_ptr<ParsedExpression> built) {
-    if (type.kind() != Resolved::VARCHAR) return built;
+    if (type.id() != Resolved::VARCHAR) return built;
     if (CollationIsAiCi(type.collation_id())) {
         return make_uniq<duckdb::CollateExpression>(kMysqlAiCiCollation,
                                                     std::move(built));
@@ -237,7 +237,7 @@ unique_ptr<ParsedExpression> AdmitComparisonString(
 unique_ptr<ParsedExpression> CollateKey(Builder& b,
                                         const Resolved::ResolvedType& type,
                                         unique_ptr<ParsedExpression> built) {
-    if (type.kind() != Resolved::VARCHAR) return built;
+    if (type.id() != Resolved::VARCHAR) return built;
     if (CollationIsAiCi(type.collation_id())) {
         return make_uniq<duckdb::CollateExpression>(kMysqlAiCiCollation,
                                                     std::move(built));
@@ -253,9 +253,9 @@ unique_ptr<ParsedExpression> CollateKey(Builder& b,
 unique_ptr<ParsedExpression> CastTo(Builder& b, const Resolved::Expr& child,
                                     const Resolved::ResolvedType& type,
                                     unique_ptr<ParsedExpression> built) {
-    if (type.kind() == Resolved::TYPE_UNSPECIFIED) return built;
+    if (type.id() == Resolved::TYPE_UNSPECIFIED) return built;
     const auto& have = child.result_type();
-    if (have.kind() == type.kind() && have.precision() == type.precision() &&
+    if (have.id() == type.id() && have.precision() == type.precision() &&
         have.scale() == type.scale()) {
         return built;
     }
@@ -263,7 +263,7 @@ unique_ptr<ParsedExpression> CastTo(Builder& b, const Resolved::Expr& child,
     if (!ResolveType(b, type, &target)) return nullptr;
     // DuckDB can round a DECIMAL above 15 digits twice; the decimal string
     // gives the correctly rounded double, as MySQL does.
-    if (type.kind() == Resolved::DOUBLE && have.kind() == Resolved::DECIMAL &&
+    if (type.id() == Resolved::DOUBLE && have.id() == Resolved::DECIMAL &&
         have.precision() > 15) {
         built = make_uniq<duckdb::CastExpression>(LogicalType::VARCHAR,
                                                   std::move(built));
@@ -333,7 +333,7 @@ unique_ptr<ParsedExpression> BuildAggregate(Builder& b,
                                             const Resolved::Expr& expr) {
     const auto& agg = expr.aggregate();
     const char* name = nullptr;
-    switch (agg.kind()) {
+    switch (agg.fn()) {
         case Resolved::Aggregate::COUNT_STAR:
             name = "count_star";
             break;
@@ -353,11 +353,11 @@ unique_ptr<ParsedExpression> BuildAggregate(Builder& b,
             name = "max";
             break;
         default:
-            b.Refuse("unknown aggregate " + std::to_string(agg.kind()));
+            b.Refuse("unknown aggregate " + std::to_string(agg.fn()));
             return nullptr;
     }
     duckdb::vector<unique_ptr<ParsedExpression>> args;
-    if (agg.kind() == Resolved::Aggregate::COUNT_STAR) {
+    if (agg.fn() == Resolved::Aggregate::COUNT_STAR) {
         if (agg.has_arg() || agg.distinct()) {
             b.Refuse("count_star takes no argument");
             return nullptr;
@@ -370,7 +370,7 @@ unique_ptr<ParsedExpression> BuildAggregate(Builder& b,
         auto built = BuildExpr(b, agg.arg());
         if (built == nullptr) return nullptr;
         const auto& arg_type = agg.arg().result_type();
-        if (arg_type.kind() == Resolved::VARCHAR &&
+        if (arg_type.id() == Resolved::VARCHAR &&
             !CollationIsAiCi(arg_type.collation_id()) &&
             !CollationIsByteSafe(arg_type.collation_id())) {
             b.Refuse("string collation " +
@@ -378,10 +378,10 @@ unique_ptr<ParsedExpression> BuildAggregate(Builder& b,
                      " is unsupported in an aggregate");
             return nullptr;
         }
-        if (arg_type.kind() == Resolved::VARCHAR &&
+        if (arg_type.id() == Resolved::VARCHAR &&
             CollationIsAiCi(arg_type.collation_id())) {
-            if (agg.kind() == Resolved::Aggregate::MIN ||
-                agg.kind() == Resolved::Aggregate::MAX) {
+            if (agg.fn() == Resolved::Aggregate::MIN ||
+                agg.fn() == Resolved::Aggregate::MAX) {
                 // BindMinMax honours a collation carried by the argument
                 // type; the CollateExpression puts it there.
                 built = make_uniq<duckdb::CollateExpression>(
@@ -391,7 +391,7 @@ unique_ptr<ParsedExpression> BuildAggregate(Builder& b,
                 // aggregate children, so deduplicate the sort keys
                 // themselves; COUNT of distinct keys equals COUNT of
                 // distinct values under the collation.
-                if (agg.kind() != Resolved::Aggregate::COUNT) {
+                if (agg.fn() != Resolved::Aggregate::COUNT) {
                     b.Refuse("DISTINCT aggregate over a collated string");
                     return nullptr;
                 }
@@ -416,7 +416,7 @@ unique_ptr<ParsedExpression> BuildSubquery(Builder& b,
     if (statement == nullptr) return nullptr;
     auto node = make_uniq<duckdb::SubqueryExpression>();
     node->subquery = std::move(statement);
-    switch (sub.kind()) {
+    switch (sub.type()) {
         case Resolved::Subquery::SCALAR:
             if (sub.negated() || sub.has_left()) {
                 b.Refuse("scalar subquery shape");
@@ -446,7 +446,7 @@ unique_ptr<ParsedExpression> BuildSubquery(Builder& b,
             break;
         }
         default:
-            b.Refuse("unknown subquery kind");
+            b.Refuse("unknown subquery type");
             return nullptr;
     }
     if (sub.negated()) {
@@ -477,15 +477,15 @@ unique_ptr<ParsedExpression> BuildExpr(Builder& b, const Resolved::Expr& expr) {
                 make_uniq<duckdb::ColumnRefExpression>(
                     ColumnAlias(col.column_ordinal()),
                     RelationAlias(col.relation_id()));
-            // PAX stores DATETIME and other untyped kinds as text; the scan
+            // PAX stores DATETIME and other untyped columns as text; the scan
             // exposes them as VARCHAR. Casting at the reference gives every
             // consumer the declared type instead of the storage type.
             const auto* desc = found->second.desc;
             if (desc != nullptr &&
                 desc->columns(static_cast<int>(col.column_ordinal()))
-                        .pax_kind() == 0 &&
-                expr.result_type().kind() != Resolved::VARCHAR &&
-                expr.result_type().kind() != Resolved::TYPE_UNSPECIFIED) {
+                        .pax_type() == 0 &&
+                expr.result_type().id() != Resolved::VARCHAR &&
+                expr.result_type().id() != Resolved::TYPE_UNSPECIFIED) {
                 LogicalType declared;
                 if (!ResolveType(b, expr.result_type(), &declared)) {
                     return nullptr;
@@ -543,7 +543,7 @@ unique_ptr<ParsedExpression> BuildExpr(Builder& b, const Resolved::Expr& expr) {
             if (left == nullptr) return nullptr;
             auto right = BuildExpr(b, cmp.right());
             if (right == nullptr) return nullptr;
-            if (cmp.compare_as().kind() == Resolved::VARCHAR) {
+            if (cmp.compare_as().id() == Resolved::VARCHAR) {
                 if (!CollationIsAiCi(cmp.compare_as().collation_id()) &&
                     !CollationIsByteSafe(cmp.compare_as().collation_id())) {
                     b.Refuse("comparison collation is unsupported");
@@ -591,7 +591,7 @@ unique_ptr<ParsedExpression> BuildExpr(Builder& b, const Resolved::Expr& expr) {
             if (left == nullptr) return nullptr;
             auto right = BuildExpr(b, arith.right());
             if (right == nullptr) return nullptr;
-            if (arith.result_as().kind() == Resolved::DOUBLE) {
+            if (arith.result_as().id() == Resolved::DOUBLE) {
                 left = CastTo(b, arith.left(), arith.result_as(),
                               std::move(left));
                 right = CastTo(b, arith.right(), arith.result_as(),
@@ -622,7 +622,7 @@ unique_ptr<ParsedExpression> BuildExpr(Builder& b, const Resolved::Expr& expr) {
             // the child type says nothing about what DuckDB produced. The
             // cast repairs the type, not the intermediate rounding; exact
             // decimal division is the upgrade if a gate ever fails on it.
-            if (arith.result_as().kind() != Resolved::TYPE_UNSPECIFIED) {
+            if (arith.result_as().id() != Resolved::TYPE_UNSPECIFIED) {
                 LogicalType target;
                 if (!ResolveType(b, arith.result_as(), &target)) {
                     return nullptr;
@@ -630,7 +630,7 @@ unique_ptr<ParsedExpression> BuildExpr(Builder& b, const Resolved::Expr& expr) {
                 function = make_uniq<duckdb::CastExpression>(
                     target, std::move(function));
             }
-            if (arith.result_as().kind() == Resolved::DOUBLE) {
+            if (arith.result_as().id() == Resolved::DOUBLE) {
                 duckdb::vector<unique_ptr<ParsedExpression>> checked;
                 checked.push_back(std::move(function));
                 function = make_uniq<duckdb::FunctionExpression>(
@@ -646,7 +646,7 @@ unique_ptr<ParsedExpression> BuildExpr(Builder& b, const Resolved::Expr& expr) {
             if (low == nullptr) return nullptr;
             auto high = BuildExpr(b, between.high());
             if (high == nullptr) return nullptr;
-            if (between.compare_as().kind() == Resolved::VARCHAR) {
+            if (between.compare_as().id() == Resolved::VARCHAR) {
                 value = AdmitComparisonString(b, between.compare_as(),
                                               std::move(value));
                 if (value == nullptr) return nullptr;
@@ -683,11 +683,11 @@ unique_ptr<ParsedExpression> BuildExpr(Builder& b, const Resolved::Expr& expr) {
                 return nullptr;
             }
             const auto& value_type = in_list.value().result_type();
-            const bool strings = value_type.kind() == Resolved::VARCHAR;
+            const bool strings = value_type.id() == Resolved::VARCHAR;
             if (strings) {
                 for (const auto& element : in_list.list()) {
                     const auto& t = element.result_type();
-                    if (t.kind() != Resolved::VARCHAR ||
+                    if (t.id() != Resolved::VARCHAR ||
                         t.collation_id() != value_type.collation_id()) {
                         b.Refuse("IN list mixes string collations");
                         return nullptr;
@@ -740,7 +740,7 @@ unique_ptr<ParsedExpression> BuildExpr(Builder& b, const Resolved::Expr& expr) {
             // val_real; CastTo on each branch keeps a DECIMAL above 15 digits
             // off DuckDB's common-type cast, which can round it twice.
             const auto& type = expr.result_type();
-            const bool is_double = type.kind() == Resolved::DOUBLE;
+            const bool is_double = type.id() == Resolved::DOUBLE;
             for (const auto& branch : case_when.branches()) {
                 duckdb::CaseCheck check;
                 check.when_expr = BuildExpr(b, branch.when());
@@ -763,7 +763,7 @@ unique_ptr<ParsedExpression> BuildExpr(Builder& b, const Resolved::Expr& expr) {
             }
             // MySQL aggregated the THEN/ELSE types into result_type; DuckDB
             // would infer its own. Cast so both agree.
-            if (expr.result_type().kind() != Resolved::TYPE_UNSPECIFIED) {
+            if (expr.result_type().id() != Resolved::TYPE_UNSPECIFIED) {
                 LogicalType target;
                 if (!ResolveType(b, expr.result_type(), &target)) {
                     return nullptr;
@@ -887,7 +887,7 @@ duckdb::unique_ptr<duckdb::TableRef> BuildRelation(
             const auto& join = relation.join();
             duckdb::JoinType type;
             bool needs_condition = true;
-            switch (join.kind()) {
+            switch (join.type()) {
                 case Resolved::JoinRel::INNER:
                     type = duckdb::JoinType::INNER;
                     break;
@@ -905,7 +905,7 @@ duckdb::unique_ptr<duckdb::TableRef> BuildRelation(
                     needs_condition = false;
                     break;
                 default:
-                    b.Refuse("unknown join kind");
+                    b.Refuse("unknown join type");
                     return nullptr;
             }
             auto ref = make_uniq<duckdb::JoinRef>(

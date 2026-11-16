@@ -262,6 +262,10 @@ private:
   // info() reads without the share's lock.
   std::vector<std::vector<uint64_t>> key_ndv_;
   uint64_t ndv_gen_{0};
+  // PAX type and DECIMAL scale of each row field (field 0 is the null flags),
+  // computed at open() as CREATE TABLE sent them.
+  std::vector<helios::rpc::PaxType> pax_types_;
+  std::vector<int32_t> pax_scales_;
   MEM_ROOT blobroot;
 
   // State for buffer fetching
@@ -754,7 +758,13 @@ private:
   bool backfill_sorted(const std::vector<const KEY *> &keys,
                        std::string &failed_index);
 
-  void set_write_buffer(uchar *buf);
+  /**
+   * @brief Packs the row in `buf` into write_buffer_.
+   *
+   * @return false when a DECIMAL column's value has no exact cell;
+   * write_buffer_ is then incomplete.
+   */
+  bool set_write_buffer(uchar *buf);
   bool is_primary_key_exists();
   void set_key_and_key_part_info(const TABLE *const table);
 

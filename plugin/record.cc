@@ -3,10 +3,14 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <string>
+#include <string_view>
 #include <vector>
 
+#include "common/typed_cell.h"
 #include "my_dbug.h"
 #include "sql/field.h"
+#include "sql/my_decimal.h"
 #include "sql/sql_class.h"
 #include "sql/sql_const.h"
 #include "sql/sql_lex.h"
@@ -16,6 +20,8 @@
 // paths.
 
 namespace {
+
+using helios::rpc::PaxType;
 
 // Field objects address table->record[0]. Serving a row into another record
 // buffer (record[1], which INSERT ... ON DUPLICATE KEY UPDATE reads the
@@ -46,25 +52,52 @@ class MoveFieldOffset {
 
 }  // namespace
 
-void ha_helios::set_write_buffer(uchar *buf) {
+bool ha_helios::set_write_buffer(uchar *buf) {
   write_buffer_.clear();
   HeliosField::append_field(write_buffer_, reinterpret_cast<const char *>(buf),
                             table->s->null_bytes);
 
   StringBuffer<STRING_BUFFER_USUAL_SIZE> buffer;
   String reference;
+  bool packed = true;
 
   my_bitmap_map *org_bitmap = tmp_use_all_columns(table, table->read_set);
   for (Field **field = table->field; *field; field++) {
+    // PAX field of this column; field 0 is the null flags.
+    const size_t f = (*field)->field_index() + 1;
+    const PaxType type = pax_types_[f];
     if ((*field)->is_nullable() && (*field)->is_null()) {
       HeliosField::append_field(write_buffer_, "", 0);
-    } else {
+    } else if (type == PaxType::kUntyped) {
       buffer.length(0);
       const String *value = (*field)->val_str(&buffer, &reference);
       HeliosField::append_field(write_buffer_, value->ptr(), value->length());
+    } else {
+      // A typed column travels as its cell: an integer, or a DATE as
+      // YYYYMMDD, from val_int and a DECIMAL as value * 10^scale.
+      int64_t cell;
+      if (type == PaxType::kDecimal64) {
+        // A negative zero prints a sign no cell gives back.
+        my_decimal d;
+        (*field)->val_decimal(&d);
+        const bool neg = d.sign();
+        longlong m = 0;
+        if (decimal_shift(&d, pax_scales_[f]) != E_DEC_OK ||
+            decimal2longlong(&d, &m) != E_DEC_OK || (neg && m == 0)) {
+          packed = false;
+          break;
+        }
+        cell = m;
+      } else {
+        cell = (*field)->val_int();
+      }
+      HeliosField::append_field(write_buffer_,
+                                reinterpret_cast<const char *>(&cell),
+                                helios::rpc::cell_width(type));
     }
   }
   tmp_restore_column_map(table->read_set, org_bitmap);
+  return packed;
 }
 
 bool ha_helios::is_primary_key_exists() {
@@ -123,10 +156,12 @@ int ha_helios::set_fields_from_helios(uchar *buf,
   const bool can_skip_unread_fields = serve_memo_can_skip_unread_fields_;
 
   // Full rows map parsed column index directly to TABLE::field[].
+  std::string text;
   size_t columnIndex = 0;
   for (Field **field = table->field; *field; field++) {
     if (columnIndex >= field_pack_.get_row_size()) break;
-    const auto mysqlFieldValue = field_pack_.get_column_of_row(columnIndex++);
+    std::string_view mysqlFieldValue =
+        field_pack_.get_column_of_row(columnIndex++);
     if (can_skip_unread_fields &&
         !bitmap_is_set(table->read_set, (*field)->field_index())) {
       continue;
@@ -134,6 +169,35 @@ int ha_helios::set_fields_from_helios(uchar *buf,
     if ((*field)->is_nullable() && (*field)->is_null()) {
       (*field)->set_null();
     } else {
+      // A typed column arrives as its cell.
+      const size_t f = (*field)->field_index() + 1;
+      const PaxType type = pax_types_[f];
+      if (type != PaxType::kUntyped) {
+        if (mysqlFieldValue.size() != helios::rpc::cell_width(type)) {
+          dbug_tmp_restore_column_map(table->write_set, org_bitmap);
+          return HA_ERR_WRONG_IN_RECORD;
+        }
+        const int64_t v = helios::rpc::load_cell(mysqlFieldValue.data(),
+                                                 mysqlFieldValue.size());
+
+        // An integer or decimal cell stores as its value.
+        if (type != PaxType::kDate) {
+          if (type == PaxType::kDecimal64) {
+            my_decimal d;
+            int2my_decimal(E_DEC_FATAL_ERROR, v, false, &d);
+            decimal_shift(&d, -pax_scales_[f]);
+            (*field)->store_decimal(&d);
+          } else {
+            (*field)->store(v, false);
+          }
+          continue;
+        }
+
+        // A DATE cell stores as its text.
+        text.clear();
+        helios::rpc::format_date(v, text);
+        mysqlFieldValue = text;
+      }
       (*field)->store(mysqlFieldValue.data(), mysqlFieldValue.size(),
                       &my_charset_bin, CHECK_FIELD_WARN);
       if (store_blob_to_field(field)) return HA_ERR_OUT_OF_MEM;

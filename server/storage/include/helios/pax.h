@@ -30,9 +30,8 @@ namespace pax {
  * little-endian binary payload of `field_max_bytes[f]` bytes (4 or 8). A
  * typed cell's u16 length prefix is 0 for SQL NULL and the binary width for a
  * present value; the cell of a typed field declared NOT NULL has no prefix.
- * unpack_row converts input bytes before the commit protocol;
- * ScatterRow writes the unpacked cells without reparsing.
- * GatherRow reconstructs the original field bytes from the typed cells.
+ * The query layer sends a typed field as those bytes (common/typed_cell.h), so
+ * unpack_row, ScatterRow and GatherRow copy them.
  */
 enum class FieldType : uint8_t {
   kUntyped = 0,    // verbatim bytes (default; strings, floats, untyped DECIMAL)
@@ -45,7 +44,7 @@ enum class FieldType : uint8_t {
 /**
  * @brief Returns the fixed binary width of a typed cell, 0 for kUntyped.
  */
-inline uint32_t PackLength(FieldType type) {
+constexpr uint32_t PackLength(FieldType type) {
   switch (type) {
     case FieldType::kInt32:
     case FieldType::kDate:
@@ -179,8 +178,7 @@ class PaxGroup {
      * @brief Returns a memory-safe view of one cell payload.
      *
      * @details Verbatim bytes for an UNTYPED cell, little-endian binary for a
-     * typed one. This does not reformat a typed cell into row-format bytes;
-     * GatherRow does.
+     * typed one.
      *
      * @param field Field index, where 0 is the null-flags field and MySQL
      * column i is field `i + 1`.

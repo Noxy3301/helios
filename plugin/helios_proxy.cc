@@ -17,43 +17,74 @@
 
 namespace {
 
-// Reads one u32 length in network order and the bytes it counts.
-bool recv_part(int socket_fd, std::string& out) {
-    uint32_t net_size = 0;
-    ssize_t header_received =
-        recv(socket_fd, &net_size, sizeof(net_size), MSG_WAITALL);
-    if (header_received != static_cast<ssize_t>(sizeof(net_size))) {
-        LOG_ERROR("SEND_MESSAGE: Failed to receive a frame length, received %zd bytes",
-                  header_received);
-        return false;
-    }
+// Bytes one recv asks for. A reply that fits arrives in one recv instead of one
+// per frame field.
+constexpr size_t kRecvBytes = 16 * 1024;
 
-    const uint32_t size = ntohl(net_size);
-    if (size > helios::rpc::kMaxPartBytes) {
-        LOG_ERROR("SEND_MESSAGE: frame part of %u bytes exceeds the %u byte limit",
-                  size, helios::rpc::kMaxPartBytes);
-        return false;
-    }
-    out.clear();
-    if (size == 0) {
-        return true;
-    }
-
-    // recv(MSG_WAITALL) still caps one call near 2GB, so a large read-plan
-    // result must be drained in a loop.
-    out.resize(size);
+// Reads exactly size bytes, looping because recv(MSG_WAITALL) returns short on
+// a signal.
+bool recv_all(int socket_fd, char* out, size_t size) {
     size_t received_total = 0;
     while (received_total < size) {
-        const ssize_t chunk = recv(socket_fd, &out[received_total],
+        const ssize_t chunk = recv(socket_fd, out + received_total,
                                    size - received_total, MSG_WAITALL);
         if (chunk <= 0) {
-            LOG_ERROR("SEND_MESSAGE: Failed to receive a frame, received %zu/%u bytes",
+            LOG_ERROR("SEND_MESSAGE: Failed to receive a frame, "
+                      "received %zu/%zu bytes",
                       received_total, size);
             return false;
         }
         received_total += static_cast<size_t>(chunk);
     }
     return true;
+}
+
+// Buffered read: copies what is left in head[used, got) into out, then reads
+// the rest of size bytes from the socket.
+bool recv_buffered(int socket_fd, const char* head, size_t got, size_t& used,
+                   char* out, size_t size) {
+    const size_t have = std::min(got - used, size);
+    std::memcpy(out, head + used, have);
+    used += have;
+    return recv_all(socket_fd, out + have, size - have);
+}
+
+// Reads one u32 length in network order and the part it counts.
+bool recv_part(int socket_fd, const char* head, size_t got, size_t& used,
+               std::string& out) {
+    uint32_t net_size = 0;
+    if (!recv_buffered(socket_fd, head, got, used,
+                       reinterpret_cast<char*>(&net_size), sizeof(net_size))) {
+        return false;
+    }
+    const uint32_t size = ntohl(net_size);
+    if (size > helios::rpc::kMaxPartBytes) {
+        LOG_ERROR("SEND_MESSAGE: frame part of %u bytes exceeds the %u byte limit",
+                  size, helios::rpc::kMaxPartBytes);
+        return false;
+    }
+    out.resize(size);
+    return recv_buffered(socket_fd, head, got, used, out.data(), size);
+}
+
+// Reads one reply: [u32 env_len][envelope][u32 pay_len][payload].
+bool recv_reply(int socket_fd, std::string& envelope, std::string& payload) {
+    char head[kRecvBytes];
+    size_t got = 0;
+    while (got < sizeof(uint32_t)) {
+        const ssize_t chunk =
+            recv(socket_fd, head + got, sizeof(head) - got, 0);
+        if (chunk <= 0) {
+            LOG_ERROR("SEND_MESSAGE: Failed to receive a frame length, "
+                      "received %zd bytes",
+                      chunk);
+            return false;
+        }
+        got += static_cast<size_t>(chunk);
+    }
+    size_t used = 0;
+    return recv_part(socket_fd, head, got, used, envelope) &&
+           recv_part(socket_fd, head, got, used, payload);
 }
 
 // Reserves by the wire size: every encoded element costs at least one byte,
@@ -660,7 +691,7 @@ bool HeliosProxy::tx_execute_duckdb_query(
 bool HeliosProxy::db_create_table(
     const std::string& table_name,
     const std::vector<uint32_t>& pax_field_max_bytes,
-    const std::vector<uint32_t>& pax_field_kind,
+    const std::vector<helios::rpc::PaxType>& pax_types,
     const std::vector<int32_t>& pax_field_scale,
     const std::vector<bool>& pax_field_not_null) {
     if (!ensure_connected()) {
@@ -675,8 +706,8 @@ bool HeliosProxy::db_create_table(
     for (const uint32_t width : pax_field_max_bytes) {
         request.add_pax_field_max_bytes(width);
     }
-    for (const uint32_t kind : pax_field_kind) {
-        request.add_pax_field_kind(kind);
+    for (const auto type : pax_types) {
+        request.add_pax_field_type(static_cast<uint32_t>(type));
     }
     for (const int32_t scale : pax_field_scale) {
         request.add_pax_field_scale(scale);
@@ -898,8 +929,7 @@ bool HeliosProxy::exchange_message(const std::string& serialized_request,
         total_sent += bytes_sent;
     }
 
-    if (!recv_part(socket_fd_, serialized_response) ||
-        !recv_part(socket_fd_, payload)) {
+    if (!recv_reply(socket_fd_, serialized_response, payload)) {
         return false;
     }
 

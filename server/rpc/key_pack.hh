@@ -4,6 +4,8 @@
 #include <string>
 #include <string_view>
 
+#include "common/typed_cell.h"
+
 // Byte-level pack/unpack helpers shared across the RPC handlers:
 // HeliosField-format row access plus the int-keyed primary-key layout
 // mirrored from the plugin.
@@ -35,5 +37,20 @@ std::string pack_int_key_part(int64_t value);
  */
 bool unpack_leading_int_key(std::string_view key, int64_t& out);
 
-// Parse a decimal-string column and pack it as int-keyed primary key bytes.
-std::string pack_column_as_int_key(std::string_view column, int64_t int_delta);
+/**
+ * @brief Reads a row column as an integer and packs it as int-keyed primary
+ * key bytes.
+ *
+ * @details An INT32 or INT64 cell is its value. Any other column reads as
+ * strtoll reads its val_str text: a DATE gives its year, a DECIMAL its
+ * integer part.
+ *
+ * @param column The column's row-field payload.
+ * @param type How the column is stored; a typed column carries its cell.
+ * @param scale Fractional digits of a kDecimal64 column.
+ * @param int_delta Added to the value before it is packed.
+ * @return The key part pack_int_key_part builds.
+ */
+std::string pack_column_as_int_key(std::string_view column,
+                                   helios::rpc::PaxType type, int scale,
+                                   int64_t int_delta);

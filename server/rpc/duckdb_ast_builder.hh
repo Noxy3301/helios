@@ -18,7 +18,7 @@ namespace olap {
  *
  * @details The request is the plugin's serialization of MySQL's resolved
  * statement; no SQL text is involved and DuckDB's parser never runs. Every
- * node kind is translated by an explicit rule; a request holding anything
+ * node type is translated by an explicit rule; a request holding anything
  * without a rule is refused, never approximated. Base tables are referenced
  * through the process-lifetime helios_pax_scan(POINTER) table function; the
  * caller owns the scan handles and passes one pointer per Request.tables
