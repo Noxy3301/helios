@@ -8,6 +8,7 @@
 #ifndef HELIOS_STORAGE_INCLUDE_HELIOS_PAX_H
 #define HELIOS_STORAGE_INCLUDE_HELIOS_PAX_H
 
+#include <algorithm>
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
@@ -290,6 +291,28 @@ class PaxGroup {
                 std::memory_order_acquire) >>
             (slot % kVisibilityWordBits)) &
            1u;
+  }
+
+  /**
+   * @brief Returns how many consecutive visible slots start at `slot`, at most
+   * `limit`.
+   */
+  uint32_t visible_length(uint32_t slot, uint32_t limit) const {
+    uint32_t run = 0;
+    while (run < limit) {
+      const uint32_t at = slot + run;
+      const uint32_t bit = at % kVisibilityWordBits;
+      const uint64_t hidden =
+          ~(visible_[at / kVisibilityWordBits].load(std::memory_order_acquire) >>
+            bit);
+      const uint32_t left = kVisibilityWordBits - bit;
+      const uint32_t here =
+          hidden == 0 ? left
+                      : std::min<uint32_t>(left, __builtin_ctzll(hidden));
+      run += here;
+      if (here < left) break;
+    }
+    return std::min(run, limit);
   }
 
   const TableSchema &schema() const { return schema_; }

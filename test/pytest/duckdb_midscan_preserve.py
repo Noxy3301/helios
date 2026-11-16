@@ -101,11 +101,11 @@ DB = "ha_helios_test"
 STACK_PATTERNS = ("build/server/helios-storage",
                   "runtime_output_directory/mysqld")
 
-# A per-row LIKE over a wide column costs about 1.4us, so this is a scan of
-# a few hundred milliseconds on one thread - long enough to span an install.
+# A '_' keeps this LIKE on the general match, slow enough per row that the
+# scan on one thread spans an install.
 ROWS = 180000
 FILLER = "b" * 240 + "aaa"
-QUERY = "SELECT COUNT(*), SUM(v), COUNT(n) FROM {t} WHERE s LIKE '%aaa%'"
+QUERY = "SELECT COUNT(*), SUM(v), COUNT(n) FROM {t} WHERE s LIKE '%a_a%'"
 # The written rows sit where the scan is when the second install lands, so
 # the read view has claimed their group and not finished it.
 TARGET = int(ROWS * INSTALL_AT)

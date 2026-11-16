@@ -39,6 +39,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <charconv>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
@@ -51,6 +52,7 @@
 #include <string_view>
 #include <system_error>
 #include <thread>
+#include <type_traits>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -322,6 +324,7 @@ using duckdb::TableFunctionBindInput;
 using duckdb::TableFunctionInfo;
 using duckdb::TableFunctionInitInput;
 using duckdb::TableFunctionInput;
+using duckdb::UnifiedVectorFormat;
 using duckdb::unique_ptr;
 using duckdb::Vector;
 using duckdb::vector;
@@ -780,6 +783,12 @@ void unpack_decimal_run(const std::byte* src, uint32_t stride, uint32_t prefix,
                         uint32_t width, uint32_t count, Vector& output_vector,
                         idx_t out_base) {
   T* dst = FlatVector::GetData<T>(output_vector) + out_base;
+  if constexpr (std::is_same_v<T, int64_t>) {
+    if (prefix == 0 && stride == sizeof(T)) {
+      std::memcpy(dst, src, count * sizeof(T));
+      return;
+    }
+  }
   for (uint32_t i = 0; i < count; i++, src += stride) {
     if (typed_cell_present(src, prefix, width)) {
       int64_t mantissa;
@@ -816,6 +825,10 @@ void unpack_typed_run(FieldType type, const PaxGroup::Layout& layout,
   switch (type) {
     case FieldType::kInt32: {
       int32_t* dst = FlatVector::GetData<int32_t>(output_vector) + out_base;
+      if (prefix == 0 && stride == sizeof(int32_t)) {
+        std::memcpy(dst, src, count * sizeof(int32_t));
+        break;
+      }
       for (uint32_t i = 0; i < count; i++, src += stride) {
         if (typed_cell_present(src, prefix, width)) {
           std::memcpy(&dst[i], src + prefix, sizeof(int32_t));
@@ -828,6 +841,10 @@ void unpack_typed_run(FieldType type, const PaxGroup::Layout& layout,
     }
     case FieldType::kInt64: {
       int64_t* dst = FlatVector::GetData<int64_t>(output_vector) + out_base;
+      if (prefix == 0 && stride == sizeof(int64_t)) {
+        std::memcpy(dst, src, count * sizeof(int64_t));
+        break;
+      }
       for (uint32_t i = 0; i < count; i++, src += stride) {
         if (typed_cell_present(src, prefix, width)) {
           std::memcpy(&dst[i], src + prefix, sizeof(int64_t));
@@ -1255,10 +1272,14 @@ void pax_scan(ClientContext&, TableFunctionInput& data, DataChunk& output) {
           std::min<uint32_t>(PaxGroup::kRows - slot,
                              static_cast<uint32_t>(max_rows - rows_emitted));
       uint32_t run_length = 1;
-      while (run_length < max_run_length &&
-             !slot_imaged(local_state, slot + run_length) &&
-             group->IsVisible(slot + run_length)) {
-        run_length++;
+      if (!local_state.has_images) {
+        run_length = group->visible_length(slot, max_run_length);
+      } else {
+        while (run_length < max_run_length &&
+               !slot_imaged(local_state, slot + run_length) &&
+               group->IsVisible(slot + run_length)) {
+          run_length++;
+        }
       }
 
       const PaxGroup::Layout& layout = group->layout();
@@ -1287,57 +1308,92 @@ void pax_scan(ClientContext&, TableFunctionInput& data, DataChunk& output) {
 }
 
 /**
- * @brief Packs one result row into the Helios packed row format.
+ * @brief Appends the rows of one result chunk to `response` in the Helios
+ * packed row format.
  *
- * @details Uses DuckDB's own Value::ToString(): an exact fixed-point
- * representation for DECIMAL (no precision loss) and ISO "YYYY-MM-DD" for
- * DATE, matching this codebase's ASCII row-value convention.
+ * @details A chunk is DuckDB's unit of data: up to STANDARD_VECTOR_SIZE rows
+ * held as one vector per column. A query result is a list of chunks. Each
+ * row becomes a null-flags field followed by one text field per column.
+ * VARCHAR, INTEGER, BIGINT and BOOLEAN are read from the vectors; other
+ * types go through Value::ToString(), which prints DECIMAL exactly and DATE
+ * as "YYYY-MM-DD", the text MySQL's val_str gives these types.
  *
- * DECIMAL division / AVG: DuckDB resolves AVG() of a DECIMAL column (and any
- * DECIMAL/DECIMAL division) to DOUBLE by design
- * (https://duckdb.org/docs/stable/sql/data_types/numeric). Value::ToString()
- * on that DOUBLE uses shortest-round-trip formatting; the plugin reformats it
- * to MySQL's decimals convention with exact string/integer rounding once the
- * row crosses the wire.
+ * @note DuckDB computes DECIMAL division and AVG in DOUBLE
+ * (https://duckdb.org/docs/stable/sql/data_types/numeric). The plugin rounds
+ * that text to MySQL's scale, so a value past about 15 significant digits
+ * can round differently from MySQL's exact decimal result.
  *
- * KNOWN LIMITATION: that plugin-side reformatting corrects display scale
- * only. The value itself went through DOUBLE division, and at large enough
- * magnitudes double's ~15-17 significant decimal digits could place the true
- * value on the wrong side of a rounding boundary relative to MySQL's exact
- * fixed-point computation. An exact fix would compute DECIMAL division in
- * integer arithmetic (DuckDB extension or server-side) instead of trusting
- * the DOUBLE result.
+ * @param chunk Result chunk to read.
+ * @param response Reply that receives one packed row per chunk row.
  */
-void pack_row(duckdb::MaterializedQueryResult& result, idx_t row_index,
-              std::string* out) {
+void pack_chunk(DataChunk& chunk,
+                pb::TxExecuteDuckdbQuery::Response* response) {
   // Field 0 is the row null-flags field: bit i of byte i / 8 marks output
   // column i NULL. A NULL and an empty string are both zero-length fields,
   // so this bitmap is what separates them.
-  const idx_t columns = result.ColumnCount();
+  const idx_t columns = chunk.ColumnCount();
+  std::vector<UnifiedVectorFormat> formats(columns);
+  for (idx_t c = 0; c < columns; c++) {
+    chunk.data[c].ToUnifiedFormat(chunk.size(), formats[c]);
+  }
   std::string null_flags(static_cast<size_t>((columns + 7) / 8), '\0');
   std::string body;
-  for (idx_t column_index = 0; column_index < columns; column_index++) {
-    const duckdb::Value value = result.GetValue(column_index, row_index);
-    // Check is_null BEFORE looking at the text: a genuine empty-string result
-    // (value.ToString() == "") is a valid non-null value, not a signal for
-    // the NULL sentinel. The text is only computed in the non-null case.
-    if (value.IsNull()) {
-      null_flags[column_index / 8] |=
-          static_cast<char>(1u << (column_index % 8));
-      append_packed_field(body, "", /*is_null=*/true);
-    } else if (value.type().id() == duckdb::LogicalTypeId::BOOLEAN) {
-      // MySQL's boolean surface is 1/0; Item_string::val_int reads both
-      // "true" and "false" as 0.
-      append_packed_field(body, value.GetValue<bool>() ? "1" : "0",
-                          /*is_null=*/false);
-    } else {
-      const std::string text = value.ToString();
-      append_packed_field(body, text, /*is_null=*/false);
+  char digits[24];  // an int64_t prints in at most 20 characters
+  for (idx_t r = 0; r < chunk.size(); r++) {
+    std::fill(null_flags.begin(), null_flags.end(), '\0');
+    body.clear();
+    for (idx_t c = 0; c < columns; c++) {
+      const UnifiedVectorFormat& format = formats[c];
+      const idx_t at = format.sel->get_index(r);
+      if (!format.validity.RowIsValid(at)) {
+        null_flags[c / 8] |= static_cast<char>(1u << (c % 8));
+        append_packed_field(body, "", /*is_null=*/true);
+        continue;
+      }
+      switch (chunk.data[c].GetType().id()) {
+        case duckdb::LogicalTypeId::VARCHAR: {
+          const auto text =
+              UnifiedVectorFormat::GetData<duckdb::string_t>(format)[at];
+          append_packed_field(body,
+                              std::string_view(text.GetData(), text.GetSize()),
+                              /*is_null=*/false);
+          break;
+        }
+        case duckdb::LogicalTypeId::INTEGER: {
+          const auto end =
+              std::to_chars(digits, digits + sizeof(digits),
+                            UnifiedVectorFormat::GetData<int32_t>(format)[at])
+                  .ptr;
+          append_packed_field(body, std::string_view(digits, end - digits),
+                              /*is_null=*/false);
+          break;
+        }
+        case duckdb::LogicalTypeId::BIGINT: {
+          const auto end =
+              std::to_chars(digits, digits + sizeof(digits),
+                            UnifiedVectorFormat::GetData<int64_t>(format)[at])
+                  .ptr;
+          append_packed_field(body, std::string_view(digits, end - digits),
+                              /*is_null=*/false);
+          break;
+        }
+        case duckdb::LogicalTypeId::BOOLEAN:
+          // MySQL's boolean surface is 1/0; Item_string::val_int reads both
+          // "true" and "false" as 0.
+          append_packed_field(
+              body, UnifiedVectorFormat::GetData<bool>(format)[at] ? "1" : "0",
+              /*is_null=*/false);
+          break;
+        default:
+          append_packed_field(body, chunk.GetValue(c, r).ToString(),
+                              /*is_null=*/false);
+          break;
+      }
     }
+    std::string* row = response->add_rows();
+    append_packed_field(*row, null_flags, /*is_null=*/false);
+    row->append(body);
   }
-  out->clear();
-  append_packed_field(*out, null_flags, /*is_null=*/false);
-  out->append(body);
 }
 
 // ---------------------------------------------------------------------------
@@ -1713,10 +1769,8 @@ void execute_duckdb_query(
       return;
     }
 
-    std::string row;
-    for (idx_t row_index = 0; row_index < result->RowCount(); row_index++) {
-      pack_row(*result, row_index, &row);
-      response->add_rows(std::move(row));
+    for (auto& chunk : result->Collection().Chunks()) {
+      pack_chunk(chunk, response);
     }
     response->set_ok(true);
   } catch (const std::exception& exception) {

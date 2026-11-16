@@ -6,6 +6,8 @@
 #include "server/rpc/collation.hh"
 
 #include <cstring>
+#include <string>
+#include <vector>
 
 #include "server/rpc/uca900_primary.hh"
 
@@ -251,6 +253,122 @@ bool like(std::string_view text, std::string_view pattern, int escape) {
   }
 }
 
+// ASCII under utf8mb4_0900_ai_ci. Every ASCII code point is ignorable or has
+// one weight, so an equal `fold` value means the characters compare equal.
+struct AsciiTable {
+  AsciiTable() {
+    for (int c = 0; c < 128; c++) {
+      weight[c] = table_value(c);
+      fold[c] = 0;
+      if (weight[c] == kIgnorable) continue;
+      fold[c] = static_cast<uint8_t>(c);
+      for (int same = 0; same < c; same++) {
+        if (weight[same] == weight[c]) {
+          fold[c] = static_cast<uint8_t>(same);
+          break;
+        }
+      }
+    }
+  }
+  uint16_t weight[128];
+  uint8_t fold[128];  // 0 for an ignorable character
+};
+
+const AsciiTable kAscii;
+
+bool is_ascii(std::string_view s) {
+  const char *p = s.data();
+  size_t n = s.size();
+  uint64_t bits = 0;
+  for (; n >= sizeof(bits); n -= sizeof(bits), p += sizeof(bits)) {
+    uint64_t word;
+    std::memcpy(&word, p, sizeof(word));
+    bits |= word;
+  }
+  for (; n > 0; n--, p++) bits |= static_cast<uint8_t>(*p);
+  // 0x80 in each byte: nonzero when some byte of `s` had its top bit set.
+  return (bits & 0x8080808080808080ULL) == 0;
+}
+
+// A pattern of ASCII literals and '%' only, as folded literal segments.
+struct AsciiPattern {
+  std::string source;
+  int escape = 0;
+  bool valid = false;  // whether the source took this form
+  bool open_start = false;
+  bool open_end = false;
+  std::vector<std::string> segments;
+
+  void compile(std::string_view pattern, int esc) {
+    source.assign(pattern);
+    escape = esc;
+    valid = false;
+    segments.clear();
+    if (esc == '%' || esc == '_' || !is_ascii(pattern)) return;
+    std::string current;
+    for (const char ch : pattern) {
+      const auto c = static_cast<uint8_t>(ch);
+      if (c == '_' || c == esc) return;
+      if (c == '%') {
+        if (!current.empty()) segments.push_back(std::move(current));
+        current.clear();
+      } else {
+        if (kAscii.fold[c] == 0) return;
+        current.push_back(static_cast<char>(kAscii.fold[c]));
+      }
+    }
+    if (!current.empty()) segments.push_back(std::move(current));
+    open_start = !pattern.empty() && pattern.front() == '%';
+    open_end = !pattern.empty() && pattern.back() == '%';
+    valid = true;
+  }
+
+  // Whether the text, all ASCII, matches.
+  bool match(std::string_view text) const {
+    const auto *t = reinterpret_cast<const uint8_t *>(text.data());
+    size_t left = text.size();
+    size_t first = 0;
+    size_t last = segments.size();
+    if (!open_start && first < last) {
+      if (!take(t, left, segments[first])) return false;
+      t += segments[first].size();
+      left -= segments[first].size();
+      first++;
+    }
+    if (!open_end) {
+      if (first == last) return left == 0;
+      const std::string &tail = segments[--last];
+      if (left < tail.size() || !take(t + left - tail.size(), tail.size(), tail)) {
+        return false;
+      }
+      left -= tail.size();
+    }
+    for (; first < last; first++) {
+      const std::string &segment = segments[first];
+      const size_t n = segment.size();
+      const auto head = static_cast<uint8_t>(segment[0]);
+      size_t at = 0;
+      while (at + n <= left &&
+             !(kAscii.fold[t[at]] == head && take(t + at, n, segment))) {
+        at++;
+      }
+      if (at + n > left) return false;
+      t += at + n;
+      left -= at + n;
+    }
+    return true;
+  }
+
+ private:
+  static bool take(const uint8_t *t, size_t left, const std::string &segment) {
+    if (left < segment.size()) return false;
+    for (size_t i = 0; i < segment.size(); i++) {
+      if (kAscii.fold[t[i]] != static_cast<uint8_t>(segment[i])) return false;
+    }
+    return true;
+  }
+};
+
 }  // namespace
 
 size_t utf8mb4_0900_ai_ci_key(std::string_view s, uint8_t *dst) {
@@ -258,6 +376,12 @@ size_t utf8mb4_0900_ai_ci_key(std::string_view s, uint8_t *dst) {
   const auto *end = p + s.size();
   uint8_t *out = dst;
   while (p != end) {
+    if (*p < 0x80 && kAscii.weight[*p] != kIgnorable) {
+      const uint16_t v = kAscii.weight[*p++];
+      *out++ = v >> 8;
+      *out++ = v & 0xFF;
+      continue;
+    }
     char32_t cp;
     const size_t n = utf8_decode(p, end, &cp);
     if (n == 0) break;
@@ -282,6 +406,13 @@ size_t utf8mb4_0900_ai_ci_key(std::string_view s, uint8_t *dst) {
 
 bool utf8mb4_0900_ai_ci_like(std::string_view text, std::string_view pattern,
                              int escape) {
+  // A constant pattern repeats on every row, so the last compiled one is kept
+  // per thread.
+  static thread_local AsciiPattern ascii;
+  if (escape != ascii.escape || pattern != ascii.source) {
+    ascii.compile(pattern, escape);
+  }
+  if (ascii.valid && is_ascii(text)) return ascii.match(text);
   return like<Coll::kAiCi>(text, pattern, escape);
 }
 

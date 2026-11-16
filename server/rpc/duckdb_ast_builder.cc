@@ -70,6 +70,9 @@ struct Builder {
     };
     std::unordered_map<uint32_t, RelationInfo> relations;
     std::set<uint32_t> used_table_descs;
+    // The next BuildExpr call's result only decides whether a row survives,
+    // where NULL and FALSE both drop it.
+    bool filter_context = false;
 
     bool Refuse(const std::string& why) {
         if (error.empty()) error = why;
@@ -454,6 +457,8 @@ unique_ptr<ParsedExpression> BuildSubquery(Builder& b,
 }
 
 unique_ptr<ParsedExpression> BuildExpr(Builder& b, const Resolved::Expr& expr) {
+    const bool filter_context = b.filter_context;
+    b.filter_context = false;
     switch (expr.node_case()) {
         case Resolved::Expr::kLiteral:
             return BuildLiteral(b, expr);
@@ -507,6 +512,7 @@ unique_ptr<ParsedExpression> BuildExpr(Builder& b, const Resolved::Expr& expr) {
             }
             duckdb::vector<unique_ptr<ParsedExpression>> children;
             for (const auto& arg : logical.args()) {
+                b.filter_context = filter_context;
                 auto built = BuildExpr(b, arg);
                 if (built == nullptr) return nullptr;
                 children.push_back(std::move(built));
@@ -716,6 +722,18 @@ unique_ptr<ParsedExpression> BuildExpr(Builder& b, const Resolved::Expr& expr) {
                 !case_when.has_else_result()) {
                 b.Refuse("case without branches or else");
                 return nullptr;
+            }
+            // CASE WHEN p THEN TRUE ELSE FALSE only folds NULL to FALSE, which a
+            // filter does anyway; bare, an IN subquery can become a semi join.
+            if (filter_context && case_when.branches_size() == 1 &&
+                case_when.branches(0).then().literal().value_case() ==
+                    Resolved::Literal::kBoolValue &&
+                case_when.branches(0).then().literal().bool_value() &&
+                case_when.else_result().literal().value_case() ==
+                    Resolved::Literal::kBoolValue &&
+                !case_when.else_result().literal().bool_value()) {
+                b.filter_context = true;
+                return BuildExpr(b, case_when.branches(0).when());
             }
             auto node = make_uniq<duckdb::CaseExpression>();
             // MySQL converts the chosen branch of a DOUBLE CASE by its own
@@ -939,6 +957,7 @@ duckdb::unique_ptr<duckdb::SelectStatement> BuildBlock(
     node->from_table = BuildRelation(b, block.from());
     if (node->from_table == nullptr) return nullptr;
     if (block.has_where()) {
+        b.filter_context = true;
         node->where_clause = BuildExpr(b, block.where());
         if (node->where_clause == nullptr) return nullptr;
     }
@@ -956,6 +975,7 @@ duckdb::unique_ptr<duckdb::SelectStatement> BuildBlock(
         node->groups.grouping_sets.push_back(std::move(grouping_set));
     }
     if (block.has_having()) {
+        b.filter_context = true;
         node->having = BuildExpr(b, block.having());
         if (node->having == nullptr) return nullptr;
     }
