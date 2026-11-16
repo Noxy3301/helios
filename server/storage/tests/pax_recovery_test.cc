@@ -76,7 +76,7 @@ class PaxRecoveryTest : public ::testing::Test {
     ASSERT_NE(::mkdtemp(path.data()), nullptr);
     config_.work_dir = path.data();
     config_.epoch_duration_ms = 1;
-    config_.wal_initial_capacity_bytes = 4096;
+    config_.wal_segment_bytes = 1u << 20;
   }
 
   void TearDown() override { std::filesystem::remove_all(config_.work_dir); }
@@ -112,30 +112,6 @@ TEST_F(PaxRecoveryTest, RestoresSchemaBeforeCheckpointAndWalValues) {
     EXPECT_FALSE(db.InstallPaxSchema("t", {1, 8, 8}, kTypes, kScales));
     ASSERT_TRUE(TestHelper::WriteRow(db, "t", "a", second));
     EXPECT_EQ(TestHelper::ReadRow(db, "t", "a").value(), second);
-  }
-}
-
-TEST_F(PaxRecoveryTest, KeepsAllSchemasWhenRowReplayIsDisabled) {
-  {
-    Database db(config_);
-    ASSERT_TRUE(db.CreateTable("old"));
-    ASSERT_TRUE(db.InstallPaxSchema("old", kWidths, kTypes, kScales));
-    ASSERT_TRUE(TestHelper::WriteRow(db, "old", "a", Row(1, 100)));
-  }
-  {
-    auto config = config_;
-    config.enable_recovery = false;
-    Database db(config);
-    ASSERT_NE(db.GetPaxTable("old"), nullptr);
-    EXPECT_FALSE(TestHelper::ReadRow(db, "old", "a").has_value());
-    ASSERT_TRUE(db.CreateTable("new"));
-    ASSERT_TRUE(db.InstallPaxSchema("new", {1, 3}));
-  }
-  {
-    Database db(config_);
-    EXPECT_NE(db.GetPaxTable("old"), nullptr);
-    EXPECT_NE(db.GetPaxTable("new"), nullptr);
-    EXPECT_TRUE(TestHelper::ReadRow(db, "old", "a").has_value());
   }
 }
 

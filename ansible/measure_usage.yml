@@ -141,8 +141,8 @@
                   fi
                   printf '%s' "${last##* }" | tr 'A-Z' 'a-z'
                 }
-                # Apparent size: wal.log is preallocated, so this stays at the
-                # initial capacity until the log outgrows it.
+                # Apparent size: segments are written out whole, so this moves
+                # only when a new segment file appears.
                 wal_file_bytes() {
                   local total
                   total=$(du -Lbc ~/helios/helios_data/wal*.log 2>/dev/null \

@@ -1,7 +1,7 @@
 /**
  * @file server/storage/src/wal/wal.cc
- * The log file itself: the frame layout, the reserved capacity, and the
- * startup scan that decides what survived.
+ * The log on disk: numbered segment files of epoch frames, the pool that
+ * prepares and recycles them, and the startup scan that decides what survived.
  */
 
 #include "wal/wal.h"
@@ -16,12 +16,14 @@
 #include <algorithm>
 #include <atomic>
 #include <cctype>
+#include <cinttypes>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
-#include <limits>
 #include <memory>
 #include <msgpack.hpp>
+#include <stdexcept>
 #include <system_error>
 #include <utility>
 #include <vector>
@@ -36,12 +38,19 @@ namespace wal {
 
 namespace {
 
-// Frame header fields, in bytes from the start of the frame. The magic word
+enum RecordType : uint16_t { kHeaderRecord, kFrame, kPadding, kEndRecord };
+
+// Record header fields, in bytes from the start of the record. The magic word
 // opens it at offset 0.
-constexpr size_t kOffFlags = 4;
-constexpr size_t kOffPayloadSize = 6;
-constexpr size_t kOffEpoch = 10;
-constexpr size_t kOffCrc = 14;
+constexpr size_t kOffType = 4;
+constexpr size_t kOffSegment = 6;
+constexpr size_t kOffOffset = 14;
+constexpr size_t kOffPayloadSize = 22;
+constexpr size_t kOffEpoch = 26;
+constexpr size_t kOffCrc = 30;
+
+// How many segments the worker keeps ready ahead of the logger.
+constexpr uint64_t kSpareSegments = 2;
 
 // The header bytes the checksum covers: all of them but the checksum word,
 // which sits last.
@@ -52,6 +61,7 @@ constexpr size_t kCrcCoverage = Wal::kHeaderSize - sizeof(uint32_t);
 struct FrameHead {
   uint8_t bytes[Wal::kHeaderSize + 5];
   size_t size;
+  uint32_t payload_size;
 };
 
 void PutLe16(uint8_t *out, uint16_t value) {
@@ -66,6 +76,11 @@ void PutLe32(uint8_t *out, uint32_t value) {
   out[3] = static_cast<uint8_t>((value >> 24) & 0xffu);
 }
 
+void PutLe64(uint8_t *out, uint64_t value) {
+  PutLe32(out, static_cast<uint32_t>(value));
+  PutLe32(out + 4, static_cast<uint32_t>(value >> 32));
+}
+
 uint16_t GetLe16(const uint8_t *in) {
   return static_cast<uint16_t>(in[0]) |
          static_cast<uint16_t>(static_cast<uint16_t>(in[1]) << 8);
@@ -75,6 +90,35 @@ uint32_t GetLe32(const uint8_t *in) {
   return static_cast<uint32_t>(in[0]) | (static_cast<uint32_t>(in[1]) << 8) |
          (static_cast<uint32_t>(in[2]) << 16) |
          (static_cast<uint32_t>(in[3]) << 24);
+}
+
+uint64_t GetLe64(const uint8_t *in) {
+  return static_cast<uint64_t>(GetLe32(in)) |
+         (static_cast<uint64_t>(GetLe32(in + 4)) << 32);
+}
+
+// Fills in every header field but the checksum.
+void PutRecordHeader(uint8_t *out, RecordType type, uint64_t segment_number,
+                     uint64_t offset, uint32_t payload_size,
+                     EpochNumber epoch) {
+  PutLe32(out, Wal::kMagic);
+  PutLe16(out + kOffType, type);
+  PutLe64(out + kOffSegment, segment_number);
+  PutLe64(out + kOffOffset, offset);
+  PutLe32(out + kOffPayloadSize, payload_size);
+  PutLe32(out + kOffEpoch, epoch);
+}
+
+// Builds the header of a record whose payload is `payload_size` bytes at
+// `payload`.
+void PutCheckedRecord(uint8_t *out, RecordType type, uint64_t segment_number,
+                      uint64_t offset, const uint8_t *payload,
+                      uint32_t payload_size) {
+  PutRecordHeader(out, type, segment_number, offset, payload_size, 0);
+  Crc32c crc;
+  crc.Update(out, kCrcCoverage);
+  crc.Update(payload, payload_size);
+  PutLe32(out + kOffCrc, crc.Finish());
 }
 
 int Fsync(int fd) {
@@ -98,6 +142,28 @@ bool FsyncDirectory(const std::string &directory, int &error) {
   if (!ok) error = errno;
   ::close(dir_fd);
   return ok;
+}
+
+// Closes a descriptor on every path out of a scope.
+struct ScopedFd {
+  explicit ScopedFd(int descriptor) : fd(descriptor) {}
+  ~ScopedFd() {
+    if (fd >= 0) ::close(fd);
+  }
+  ScopedFd(const ScopedFd &) = delete;
+  ScopedFd &operator=(const ScopedFd &) = delete;
+  int fd;
+};
+
+// The segment number a directory entry with this suffix names, or 0.
+uint64_t SegmentNumberOf(const std::string &name, const char *suffix) {
+  uint64_t number = 0;
+  int consumed = 0;
+  if (std::sscanf(name.c_str(), "wal-%" SCNu64 "%n", &number, &consumed) != 1 ||
+      name.compare(consumed, std::string::npos, suffix) != 0) {
+    return 0;
+  }
+  return number;
 }
 
 }  // namespace
@@ -146,14 +212,32 @@ WalIo WalIo::Posix() {
   return io;
 }
 
-Wal::Wal(const std::string &work_dir, WalIo io, uint64_t initial_capacity_bytes)
-    : io_(std::move(io)), initial_capacity_bytes_(initial_capacity_bytes) {
+std::string Wal::SegmentFileName(uint64_t segment_number) {
+  char name[64];
+  std::snprintf(name, sizeof(name), "wal-%016" PRIu64 ".log", segment_number);
+  return name;
+}
+
+std::string Wal::SegmentPath(uint64_t segment_number) const {
+  return directory_ + "/" + SegmentFileName(segment_number);
+}
+
+std::string Wal::TemporaryPath(uint64_t segment_number) const {
+  char name[64];
+  std::snprintf(name, sizeof(name), "/wal-%016" PRIu64 ".tmp", segment_number);
+  return directory_ + name;
+}
+
+Wal::Wal(const std::string &work_dir, WalIo io, uint64_t segment_bytes)
+    : io_(std::move(io)),
+      segment_bytes_(segment_bytes),
+      spare_target_bytes_(kSpareSegments * segment_bytes) {
   // Resolve the path and create the directory.
   // Strip a trailing separator first; parent_path() below must name the
   // true parent, not the directory itself.
   std::filesystem::path directory(work_dir);
   if (!directory.has_filename()) directory = directory.parent_path();
-  path_ = (directory / "wal.log").string();
+  directory_ = directory.string();
 
   std::error_code ec;
   std::filesystem::create_directory(directory, ec);
@@ -161,74 +245,52 @@ Wal::Wal(const std::string &work_dir, WalIo io, uint64_t initial_capacity_bytes)
     throw std::system_error(ec, "create_directory " + work_dir);
   }
 
-  // Open or create, then take the exclusive lock.
-  // O_TRUNC is never used: an existing log is the only record of what was
-  // reported durable. O_APPEND is never used either, and cannot be:
-  // under it a pwrite ignores the offset it is given and lands at the end
-  // of the file.
-  fd_ = ::open(path_.c_str(), O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC, 0644);
-  if (fd_ < 0 && errno == EEXIST) {
-    fd_ = ::open(path_.c_str(), O_RDWR | O_CLOEXEC);
+  // Segments come and go under their names, so the lock is on the directory.
+  // Writing in place puts the offsets under this process's control: a second
+  // process holding the same log would overwrite frames, not interleave.
+  directory_fd_ =
+      ::open(directory_.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+  if (directory_fd_ < 0) {
+    throw std::system_error(errno, std::generic_category(),
+                            "open " + directory_);
   }
-  if (fd_ < 0) {
-    throw std::system_error(errno, std::generic_category(), "open " + path_);
-  }
-
-  // Writing in place puts the offsets under this process's control, so a
-  // second process holding the same log would overwrite frames rather than
-  // interleave with them.
-  if (::flock(fd_, LOCK_EX | LOCK_NB) != 0) {
+  if (::flock(directory_fd_, LOCK_EX | LOCK_NB) != 0) {
     const int error = errno;
-    ::close(fd_);
-    fd_ = -1;
+    ::close(directory_fd_);
+    directory_fd_ = -1;
     throw std::system_error(error, std::generic_category(),
-                            "lock " + path_ + " exclusively");
+                            "lock " + directory_ + " exclusively");
   }
 
-  // Fsync the file and its parents.
   // Every name on the way to the log is made durable here, whether or not
-  // this process is the one that created it. Two processes can race to
-  // create the directory or the file, and the one that loses a create can
-  // still win the lock; it is then the only one left to persist what the
-  // loser was going to.
-  if (Fsync(fd_) != 0) {
-    const int error = errno;
-    ::close(fd_);
-    fd_ = -1;
-    throw std::system_error(error, std::generic_category(), "fsync " + path_);
+  // this process is the one that created it.
+  const std::string parent =
+      directory.has_parent_path() ? directory.parent_path().string() : ".";
+  int error = 0;
+  struct stat directory_stat {};
+  if (!FsyncDirectory(directory_, error) || !FsyncDirectory(parent, error) ||
+      ::fstat(directory_fd_, &directory_stat) != 0) {
+    if (error == 0) error = errno;
+    ::close(directory_fd_);
+    directory_fd_ = -1;
+    throw std::system_error(error, std::generic_category(),
+                            "fsync the directories holding " + directory_);
   }
-  {
-    const std::string parent =
-        directory.has_parent_path() ? directory.parent_path().string() : ".";
-    int error = 0;
-    if (!FsyncDirectory(directory.string(), error) ||
-        !FsyncDirectory(parent, error)) {
-      ::close(fd_);
-      fd_ = -1;
-      throw std::system_error(error, std::generic_category(),
-                              "fsync the directories holding " + path_);
-    }
-  }
+  block_bytes_ = static_cast<uint64_t>(directory_stat.st_blksize);
+  padding_.resize(block_bytes_);
 
-  struct stat file_stat {};
-  if (::fstat(fd_, &file_stat) < 0) {
-    const int error = errno;
-    ::close(fd_);
-    fd_ = -1;
-    throw std::system_error(error, std::generic_category(), "fstat " + path_);
+  // Room for the header block, a frame and the block the end record needs.
+  if (segment_bytes_ % block_bytes_ != 0 || segment_bytes_ < 4 * block_bytes_) {
+    ::close(directory_fd_);
+    directory_fd_ = -1;
+    throw std::invalid_argument("segment size");
   }
-  // fstat into initialised_size_.
-  // The file's size stands in for how far an earlier incarnation got with
-  // writing zeroes. That needs one filesystem ordering: a size that
-  // survives a crash must not run ahead of the zeroes it covers (ext4
-  // data=ordered, the supported configuration). Capacity is not extended
-  // here: the region to initialise begins where the log ends, which is
-  // what Scan establishes.
-  initialised_size_ = file_stat.st_size;
 }
 
 Wal::~Wal() {
-  if (fd_ >= 0) ::close(fd_);
+  for (const auto &segment : ready_) ::close(segment.fd);
+  if (active_.fd >= 0) ::close(active_.fd);
+  if (directory_fd_ >= 0) ::close(directory_fd_);
 }
 
 WalScanResult Wal::IoFailure(const std::string &operation, int error) {
@@ -240,6 +302,14 @@ WalScanResult Wal::IoFailure(const std::string &operation, int error) {
   return result;
 }
 
+// A padding record needs room for its own header, so a gap smaller than that
+// runs on to the end of the next block.
+uint64_t Wal::PaddedEnd(uint64_t end) const {
+  const uint64_t gap = -end & (block_bytes_ - 1);
+  if (gap == 0) return end;
+  return end + gap + (gap < kHeaderSize ? block_bytes_ : 0);
+}
+
 // Writes every byte `iov` names at `offset`, at most IOV_MAX iovecs a call; a
 // short write resumes inside the iovec it stopped in, which `iov` records.
 bool Wal::WriteAllAt(std::vector<iovec> &iov, off_t offset, int &error) {
@@ -247,7 +317,8 @@ bool Wal::WriteAllAt(std::vector<iovec> &iov, off_t offset, int &error) {
   while (next != iov.size()) {
     const auto count =
         static_cast<int>(std::min<size_t>(iov.size() - next, IOV_MAX));
-    const ssize_t written = io_.pwritev(fd_, iov.data() + next, count, offset);
+    const ssize_t written =
+        io_.pwritev(active_.fd, iov.data() + next, count, offset);
     if (written < 0 && errno == EINTR) continue;
     if (written <= 0) {
       error = written == 0 ? EIO : errno;
@@ -268,9 +339,10 @@ bool Wal::WriteAllAt(std::vector<iovec> &iov, off_t offset, int &error) {
   return true;
 }
 
-bool Wal::PreadAll(uint8_t *out, size_t size, off_t offset, int &error) const {
+bool Wal::PreadAll(int fd, uint8_t *out, size_t size, off_t offset,
+                   int &error) const {
   while (size != 0) {
-    const ssize_t got = io_.pread(fd_, out, size, offset);
+    const ssize_t got = io_.pread(fd, out, size, offset);
     if (got > 0) {
       out += got;
       offset += got;
@@ -286,40 +358,37 @@ bool Wal::PreadAll(uint8_t *out, size_t size, off_t offset, int &error) const {
   return true;
 }
 
-// Writes out zeroes over `[from, to)` and persists them. The zeroes move any
-// size, allocation, or extent-state metadata work out of the group-flush
-// path (how much exists depends on the filesystem and device), and they
-// mark a region that holds no frame, which is what lets the scan find the
-// end of the log. Both capacity initialisation and tail repair are this
-// one operation.
-bool Wal::WriteZeroesAndSync(off_t from, off_t to, int &error) {
-  if (to <= from) return true;
+bool Wal::WriteAt(int fd, const uint8_t *data, size_t size, off_t offset,
+                  int &error) {
+  while (size != 0) {
+    const ssize_t written = io_.initialise_pwrite(fd, data, size, offset);
+    if (written > 0) {
+      data += written;
+      offset += written;
+      size -= static_cast<size_t>(written);
+      continue;
+    }
+    if (written < 0 && errno == EINTR) continue;
+    error = written == 0 ? EIO : errno;
+    return false;
+  }
+  return true;
+}
 
+// Writes out zeroes over `[from, to)` and persists them. For a fresh segment
+// this moves size, allocation and extent-state metadata work out of the group
+// flush; for a repair it removes records a shorter group would leave reachable.
+bool Wal::WriteZeroesAndSync(int fd, off_t from, off_t to, int &error) {
   constexpr size_t kChunkSize = 1ull << 20;
   const std::vector<uint8_t> zeroes(kChunkSize, 0);
   for (off_t offset = from; offset < to;) {
     const size_t size =
         static_cast<size_t>(std::min<off_t>(kChunkSize, to - offset));
-    size_t remaining = size;
-    const uint8_t *data = zeroes.data();
-    while (remaining != 0) {
-      const ssize_t written =
-          io_.initialise_pwrite(fd_, data, remaining, offset);
-      if (written > 0) {
-        data += written;
-        offset += written;
-        remaining -= static_cast<size_t>(written);
-        continue;
-      }
-      if (written < 0 && errno == EINTR) continue;
-      error = written == 0 ? EIO : errno;
-      return false;
-    }
+    if (!WriteAt(fd, zeroes.data(), size, offset, error)) return false;
+    offset += static_cast<off_t>(size);
   }
 
-  // The size and the blocks have to reach the device here, so that none of
-  // this initialisation work lands on a group's own fdatasync.
-  if (Fsync(fd_) != 0) {
+  if (Fsync(fd) != 0) {
     error = errno;
     return false;
   }
@@ -328,7 +397,7 @@ bool Wal::WriteZeroesAndSync(off_t from, off_t to, int &error) {
 
 // Reports the offset of the last byte in `[from, to)` that is not zero, or
 // `from - 1` when every byte is.
-bool Wal::FindLastNonZero(off_t from, off_t to, off_t &last_non_zero,
+bool Wal::FindLastNonZero(int fd, off_t from, off_t to, off_t &last_non_zero,
                           int &error) const {
   constexpr size_t kChunkSize = 1ull << 20;
   std::vector<uint8_t> chunk(kChunkSize);
@@ -337,7 +406,7 @@ bool Wal::FindLastNonZero(off_t from, off_t to, off_t &last_non_zero,
   for (off_t at = from; at < to; at += kChunkSize) {
     const size_t size =
         static_cast<size_t>(std::min<off_t>(kChunkSize, to - at));
-    if (!PreadAll(chunk.data(), size, at, error)) return false;
+    if (!PreadAll(fd, chunk.data(), size, at, error)) return false;
     for (size_t i = size; i > 0; --i) {
       if (chunk[i - 1] != 0) {
         last_non_zero = at + static_cast<off_t>(i) - 1;
@@ -348,305 +417,551 @@ bool Wal::FindLastNonZero(off_t from, off_t to, off_t &last_non_zero,
   return true;
 }
 
-bool Wal::EnsureCapacityFor(off_t end_of_log, size_t group_size, int &error) {
-  const uint64_t limit =
-      static_cast<uint64_t>(std::numeric_limits<off_t>::max());
-  if (static_cast<uint64_t>(group_size) >
-      limit - static_cast<uint64_t>(end_of_log)) {
-    error = EFBIG;
+bool Wal::Fdatasync(int fd, int &error) {
+  int rc;
+  do {
+    rc = io_.fdatasync(fd);
+  } while (rc < 0 && errno == EINTR);
+  if (rc < 0) {
+    error = errno;
     return false;
   }
-  // Without preallocation the group's own write is what extends the file,
-  // which is the behaviour this exists to avoid. Writing zeroes over the
-  // region first would cost a second write and a second sync per group.
-  if (initial_capacity_bytes_ == kNoPreallocation) return true;
-
-  const uint64_t needed = static_cast<uint64_t>(end_of_log) + group_size;
-  if (needed <= static_cast<uint64_t>(initialised_size_) &&
-      static_cast<uint64_t>(initialised_size_) >= initial_capacity_bytes_) {
-    return true;
-  }
-
-  // Round up to a whole number of capacity units, so that a log which
-  // outgrows its capacity pays for initialisation once per unit rather than
-  // once per group. Computed rather than counted: a capacity of a few bytes
-  // would make counting cost a step per unit on every group.
-  const uint64_t units = std::max<uint64_t>(
-      1, needed / initial_capacity_bytes_ +
-             (needed % initial_capacity_bytes_ != 0 ? 1 : 0));
-  if (units > limit / initial_capacity_bytes_) {
-    error = EFBIG;
-    return false;
-  }
-  const uint64_t target = units * initial_capacity_bytes_;
-  if (target <= static_cast<uint64_t>(initialised_size_)) return true;
-
-  if (!WriteZeroesAndSync(initialised_size_, static_cast<off_t>(target),
-                          error)) {
-    return false;
-  }
-  initialised_size_ = static_cast<off_t>(target);
   return true;
 }
 
-// Publishes the end of the log and initialises the capacity beyond it: the
-// last step of a successful scan, after which groups may be written.
-WalScanResult Wal::FinishScan(WalScanResult &&result, off_t end_of_log) {
-  int error = 0;
-  if (!EnsureCapacityFor(end_of_log, 0, error)) {
-    return IoFailure("initialise the capacity of " + path_, error);
+// Reads and checks the record at `offset`: its magic, the segment and offset it
+// names, its bounds, and its checksum. False means an I/O failure.
+bool Wal::ReadRecord(int fd, uint64_t segment_number, uint64_t offset,
+                     std::vector<uint8_t> &payload, Record &record,
+                     int &error) const {
+  if (segment_bytes_ - offset < kHeaderSize) {
+    record.invalid = "the segment ends inside a record header";
+    return true;
   }
-  // Published together with Ready: a scan that could not finish leaves no
-  // offset behind to be mistaken for the end of the log.
-  write_offset_ = end_of_log;
+  uint8_t header[kHeaderSize];
+  if (!PreadAll(fd, header, kHeaderSize, static_cast<off_t>(offset), error)) {
+    return false;
+  }
+
+  const uint32_t payload_size = GetLe32(header + kOffPayloadSize);
+  // The checks that need no payload come first: a stale header's length means
+  // nothing, and must not cause a read.
+  if (GetLe32(header) != kMagic) {
+    record.invalid = "record magic mismatch";
+  } else if (GetLe64(header + kOffSegment) != segment_number) {
+    record.invalid = "record of another segment";
+  } else if (GetLe64(header + kOffOffset) != offset) {
+    record.invalid = "record of another offset";
+  } else if (payload_size > kMaxPayloadSize ||
+             payload_size > segment_bytes_ - offset - kHeaderSize) {
+    record.invalid = "record payload past the segment";
+  }
+  if (record.invalid != nullptr) return true;
+
+  payload.resize(payload_size);
+  if (payload_size != 0 &&
+      !PreadAll(fd, payload.data(), payload_size,
+                static_cast<off_t>(offset + kHeaderSize), error)) {
+    return false;
+  }
+  Crc32c crc;
+  crc.Update(header, kCrcCoverage);
+  crc.Update(payload.data(), payload.size());
+  if (crc.Finish() != GetLe32(header + kOffCrc)) {
+    record.invalid = "record checksum mismatch";
+    return true;
+  }
+  record.type = GetLe16(header + kOffType);
+  record.epoch = GetLe32(header + kOffEpoch);
+  return true;
+}
+
+bool Wal::WritePadding(int fd, uint64_t segment_number, uint64_t offset,
+                       int &error) {
+  const uint64_t end = PaddedEnd(offset);
+  std::vector<uint8_t> record(end - offset, 0);
+  PutCheckedRecord(record.data(), kPadding, segment_number, offset,
+                   record.data() + kHeaderSize,
+                   static_cast<uint32_t>(end - offset - kHeaderSize));
+  if (!WriteAt(fd, record.data(), record.size(), static_cast<off_t>(offset),
+               error)) {
+    return false;
+  }
+  if (Fsync(fd) != 0) {
+    error = errno;
+    return false;
+  }
+  return true;
+}
+
+// The last step of the first successful scan. A new group must not leave any
+// earlier group's record reachable, and only then may work be accepted.
+WalScanResult Wal::FinishScan(WalScanResult &&result, bool fresh,
+                              const WalPosition &start, const WalPosition &tail,
+                              const std::vector<uint64_t> &segments,
+                              const std::vector<std::string> &temporaries) {
+  int error = 0;
+  Segment active{-1, tail.segment_number, tail.offset};
+  if (!fresh) {
+    active.fd =
+        ::open(SegmentPath(tail.segment_number).c_str(), O_RDWR | O_CLOEXEC);
+    if (active.fd < 0) {
+      return IoFailure("open " + SegmentPath(tail.segment_number), errno);
+    }
+    active_.fd = active.fd;
+
+    // Zero what follows the valid prefix.
+    const auto from = static_cast<off_t>(tail.offset);
+    off_t last_non_zero = 0;
+    if (!FindLastNonZero(active.fd, from, static_cast<off_t>(segment_bytes_),
+                         last_non_zero, error)) {
+      return IoFailure("pread the tail of " + SegmentPath(tail.segment_number),
+                       error);
+    }
+    if (last_non_zero >= from) {
+      if (!WriteZeroesAndSync(active.fd, from, last_non_zero + 1, error)) {
+        return IoFailure("zero the tail of " + SegmentPath(tail.segment_number),
+                         error);
+      }
+      result.tail_zeroed = true;
+    }
+
+    // A group that tore can leave frames ending mid-block. They count as
+    // durable now, so the next group starts in a block of its own.
+    if (PaddedEnd(tail.offset) != tail.offset) {
+      if (!WritePadding(active.fd, tail.segment_number, tail.offset, error)) {
+        return IoFailure("pad the tail of " + SegmentPath(tail.segment_number),
+                         error);
+      }
+      active.append_offset = PaddedEnd(tail.offset);
+    }
+
+    // A process crash leaves unsynced groups readable, and the scan counted
+    // them as durable. A segment is written only after the one before it
+    // synced, so only the tail and its predecessor can hold such a group.
+    if (!Fdatasync(active.fd, error)) {
+      return IoFailure("fdatasync " + SegmentPath(tail.segment_number), error);
+    }
+    if (tail.segment_number != start.segment_number) {
+      const std::string path = SegmentPath(tail.segment_number - 1);
+      const ScopedFd previous(::open(path.c_str(), O_RDWR | O_CLOEXEC));
+      if (previous.fd < 0) return IoFailure("open " + path, errno);
+      if (!Fdatasync(previous.fd, error)) {
+        return IoFailure("fdatasync " + path, error);
+      }
+    }
+  }
+
+  // Sort the other files out, then make the deletions durable.
+  for (const uint64_t number : segments) {
+    if (number < start.segment_number) covered_.push_back(number);
+    if (number > tail.segment_number &&
+        ::unlink(SegmentPath(number).c_str()) != 0) {
+      return IoFailure("unlink " + SegmentPath(number), errno);
+    }
+  }
+  for (const auto &temporary : temporaries) {
+    if (::unlink(temporary.c_str()) != 0) {
+      return IoFailure("unlink " + temporary, errno);
+    }
+  }
+  if (!FsyncDirectory(directory_, error)) {
+    return IoFailure("fsync " + directory_, error);
+  }
+
+  // Prepare the active segment of a new log, then the spare.
+  next_segment_ = fresh ? 1 : tail.segment_number + 1;
+  oldest_retained_ = start.segment_number;
+  if (fresh) {
+    if (!AcquireReady(active, error)) {
+      return IoFailure("prepare the first segment of " + directory_, error);
+    }
+    active_.fd = active.fd;
+  }
+  if (!Prepare(false, error)) {
+    return IoFailure("prepare a segment of " + directory_, error);
+  }
+
+  active_ = active;
+  durable_end_ = {active.segment_number, active.append_offset};
   last_epoch_ = result.last_epoch;
   state_ = State::kReady;
   return std::move(result);
 }
 
-WalScanResult Wal::Scan(EpochNumber min_epoch, const Replay &replay) {
+WalScanResult Wal::Scan(EpochNumber min_epoch, const Replay &replay,
+                        WalPosition start) {
   // Refuse a scan on an instance that already failed.
   if (state_ == State::kFailed) {
-    return IoFailure("scan " + path_ + " after a failure", EIO);
-  }
-  state_ = State::kUnscanned;
-
-  // Bound the scan by the file size fstat reports.
-  struct stat file_stat {};
-  if (::fstat(fd_, &file_stat) < 0) {
-    return IoFailure("fstat " + path_, errno);
-  }
-  const off_t file_size = file_stat.st_size;
-  initialised_size_ = std::max(initialised_size_, file_size);
-
-  EpochNumber last_epoch = 0;
-  bool have_frame = false;
-  size_t frames_skipped = 0;
-  uint64_t bytes_skipped = 0;
-  off_t offset = 0;
-
-  // Skip checkpoint-covered frames before reading the remaining records.
-  if (min_epoch != 0) {
-    off_t boundary_offset = 0;
-    uint32_t boundary_payload_size = 0;
-    uint8_t boundary_header[kHeaderSize];
-    bool retry_full_scan = false;
-    int error = 0;
-
-    // Follow frame headers to the first epoch after the checkpoint.
-    while (offset < file_size) {
-      if (file_size - offset < static_cast<off_t>(kHeaderSize)) {
-        retry_full_scan = true;
-        break;
-      }
-      uint8_t header[kHeaderSize];
-      if (!PreadAll(header, kHeaderSize, offset, error)) {
-        return IoFailure("pread header of " + path_, error);
-      }
-      const uint32_t magic = GetLe32(header);
-      const uint16_t flags = GetLe16(header + kOffFlags);
-      const uint32_t payload_size = GetLe32(header + kOffPayloadSize);
-      const EpochNumber epoch = GetLe32(header + kOffEpoch);
-      if (magic != kMagic || flags != kFlags ||
-          payload_size > kMaxPayloadSize) {
-        const bool empty_header =
-            std::all_of(header, header + kHeaderSize,
-                        [](uint8_t byte) { return byte == 0; });
-        if (!empty_header) retry_full_scan = true;
-        break;
-      }
-      const uint64_t frame_end =
-          static_cast<uint64_t>(offset) + kHeaderSize + payload_size;
-      if (frame_end > static_cast<uint64_t>(file_size) || epoch == 0 ||
-          (have_frame && epoch < last_epoch)) {
-        retry_full_scan = true;
-        break;
-      }
-      if (epoch > min_epoch) break;
-
-      boundary_offset = offset;
-      boundary_payload_size = payload_size;
-      std::memcpy(boundary_header, header, kHeaderSize);
-      last_epoch = epoch;
-      have_frame = true;
-      ++frames_skipped;
-      bytes_skipped += kHeaderSize + payload_size;
-      offset = static_cast<off_t>(frame_end);
-    }
-
-    // Verify the last skipped frame before trusting the resume offset.
-    if (!retry_full_scan && have_frame) {
-      std::vector<uint8_t> payload(boundary_payload_size);
-      if (!PreadAll(payload.data(), boundary_payload_size,
-                    boundary_offset + static_cast<off_t>(kHeaderSize), error)) {
-        return IoFailure("pread payload of " + path_, error);
-      }
-      Crc32c crc;
-      crc.Update(boundary_header, kCrcCoverage);
-      crc.Update(payload.data(), payload.size());
-      if (crc.Finish() != GetLe32(boundary_header + kOffCrc)) {
-        retry_full_scan = true;
-      }
-    }
-
-    // Retry from offset zero if the header skip could not be verified.
-    if (retry_full_scan) {
-      SPDLOG_WARN(
-          "Could not skip checkpointed frames in {0}; scanning from offset 0",
-          path_);
-      offset = 0;
-      last_epoch = 0;
-      have_frame = false;
-      frames_skipped = 0;
-      bytes_skipped = 0;
-    }
+    return IoFailure("scan " + directory_ + " after a failure", EIO);
   }
 
-  uint8_t header[kHeaderSize];
-  std::vector<uint8_t> payload;
-  std::string stop_reason;
-  // The frames of the last epoch read, which replay receives together.
-  LogRecords batch;
-
-  // Read complete frames until the first invalid frame.
-  while (offset < file_size) {
-    // Validate the header before trusting its payload length.
-    if (file_size - offset < static_cast<off_t>(kHeaderSize)) {
-      stop_reason = "the file ends inside a frame header";
-      break;
+  // List what the directory holds.
+  std::vector<uint64_t> segments;
+  std::vector<std::string> temporaries;
+  std::error_code ec;
+  for (const auto &entry :
+       std::filesystem::directory_iterator(directory_, ec)) {
+    const std::string name = entry.path().filename().string();
+    const uint64_t number = SegmentNumberOf(name, ".log");
+    if (number != 0) segments.push_back(number);
+    if (SegmentNumberOf(name, ".tmp") != 0) {
+      temporaries.push_back(entry.path().string());
     }
-    int error = 0;
-    if (!PreadAll(header, kHeaderSize, offset, error)) {
-      return IoFailure("pread header of " + path_, error);
-    }
-
-    const uint32_t magic = GetLe32(header);
-    const uint16_t flags = GetLe16(header + kOffFlags);
-    const uint32_t payload_size = GetLe32(header + kOffPayloadSize);
-    const EpochNumber epoch = GetLe32(header + kOffEpoch);
-    const uint32_t stored_crc = GetLe32(header + kOffCrc);
-
-    if (magic != kMagic) {
-      stop_reason = "frame magic mismatch";
-    } else if (flags != kFlags) {
-      stop_reason = "unknown frame flags";
-    } else if (payload_size > kMaxPayloadSize) {
-      stop_reason = "payload too large";
-    }
-    if (!stop_reason.empty()) break;
-
-    const uint64_t frame_end =
-        static_cast<uint64_t>(offset) + kHeaderSize + payload_size;
-    if (frame_end > static_cast<uint64_t>(file_size)) {
-      stop_reason = "the file ends inside a frame payload";
-      break;
-    }
-
-    // Read the payload and verify the frame's checksum and epoch.
-    payload.resize(payload_size);
-    if (payload_size != 0 &&
-        !PreadAll(payload.data(), payload_size, offset + kHeaderSize, error)) {
-      return IoFailure("pread payload of " + path_, error);
-    }
-
-    Crc32c crc;
-    crc.Update(header, kCrcCoverage);
-    crc.Update(payload.data(), payload.size());
-    if (crc.Finish() != stored_crc) {
-      stop_reason = "frame checksum mismatch";
-      break;
-    }
-
-    if (epoch == 0 || (have_frame && epoch < last_epoch)) {
-      stop_reason = "frame epoch is zero or regressed";
-      break;
-    }
-
-    // A full-scan fallback still omits records covered by the checkpoint.
-    if (epoch <= min_epoch) {
-      ++frames_skipped;
-      bytes_skipped += kHeaderSize + payload_size;
-      last_epoch = epoch;
-      have_frame = true;
-      offset = static_cast<off_t>(frame_end);
-      continue;
-    }
-
-    // Unpack the records and require them to match the frame's epoch.
-    LogRecords unpacked;
-    try {
-      size_t consumed = 0;
-      auto handle =
-          msgpack::unpack(reinterpret_cast<const char *>(payload.data()),
-                          payload.size(), consumed);
-      handle.get().convert(unpacked);
-      if (consumed != payload.size()) {
-        stop_reason = "frame payload has trailing bytes";
-        break;
-      }
-    } catch (const msgpack::unpack_error &e) {
-      stop_reason = std::string("frame payload does not unpack: ") + e.what();
-      break;
-    } catch (const msgpack::type_error &) {
-      stop_reason = "frame payload has the wrong type";
-      break;
-    }
-    if (unpacked.empty()) {
-      stop_reason = "frame carries no record";
-      break;
-    }
-    const bool epoch_mismatch = std::any_of(
-        unpacked.begin(), unpacked.end(),
-        [epoch](const LogRecord &record) { return record.epoch != epoch; });
-    if (epoch_mismatch) {
-      stop_reason = "record epoch disagrees with its frame";
-      break;
-    }
-
-    // Keep this frame for replay and advance the recovery boundary. An
-    // epoch's frames are handed on once a later epoch begins.
-    if (replay) {
-      if (epoch != last_epoch && !batch.empty()) {
-        replay(batch);
-        batch.clear();
-      }
-      batch.insert(batch.end(), std::make_move_iterator(unpacked.begin()),
-                   std::make_move_iterator(unpacked.end()));
-    }
-    last_epoch = epoch;
-    have_frame = true;
-    offset = static_cast<off_t>(frame_end);
   }
+  if (ec) return IoFailure("list " + directory_, ec.value());
 
-  if (!batch.empty()) replay(batch);
+  const bool fresh =
+      segments.empty() && start.segment_number == 1 && start.offset == 0;
 
   WalScanResult result;
-  result.status = WalScanResult::Status::kOk;
-  result.last_epoch = last_epoch;
-  result.frames_skipped = frames_skipped;
-  result.bytes_skipped = bytes_skipped;
+  WalPosition tail = start;
+  EpochNumber last_epoch = 0;
+  std::vector<uint8_t> payload;
+  std::string stop_reason;
 
-  // Zero only the written suffix after the first invalid frame.
-  if (!stop_reason.empty()) {
-    int error = 0;
-    off_t last_non_zero = 0;
-    if (!FindLastNonZero(offset, file_size, last_non_zero, error)) {
-      return IoFailure("pread the tail of " + path_, error);
+  // Follow the chain of segments from the start through valid end records.
+  for (bool next_segment = !fresh; next_segment;) {
+    next_segment = false;
+    const std::string path = SegmentPath(tail.segment_number);
+    const ScopedFd file(::open(path.c_str(), O_RDONLY | O_CLOEXEC));
+    if (file.fd < 0) return IoFailure("open " + path, errno);
+    struct stat file_stat {};
+    if (::fstat(file.fd, &file_stat) < 0) {
+      return IoFailure("fstat " + path, errno);
     }
-    if (last_non_zero >= offset) {
-      if (!WriteZeroesAndSync(offset, last_non_zero + 1, error)) {
-        return IoFailure("zero the tail of " + path_, error);
+    if (static_cast<uint64_t>(file_stat.st_size) != segment_bytes_) {
+      return IoFailure("the size of " + path, EINVAL);
+    }
+
+    // A segment reaches the log only with a durable header.
+    int error = 0;
+    Record header;
+    if (!ReadRecord(file.fd, tail.segment_number, 0, payload, header, error)) {
+      return IoFailure("pread the header of " + path, error);
+    }
+    if (header.invalid != nullptr || header.type != kHeaderRecord) {
+      return IoFailure("the header of " + path, EIO);
+    }
+    tail.offset = std::max<uint64_t>(tail.offset, kHeaderSize + payload.size());
+
+    // Read records until the first invalid one or the end record.
+    while (stop_reason.empty() && !next_segment) {
+      Record record;
+      if (!ReadRecord(file.fd, tail.segment_number, tail.offset, payload,
+                      record, error)) {
+        return IoFailure("pread " + path, error);
       }
-      SPDLOG_WARN(
-          "Discarded the tail of {0} at offset {1} ({2}); the "
-          "last epoch is {3}",
-          path_, static_cast<long long>(offset), stop_reason, last_epoch);
-      result.tail_zeroed = true;
+      if (record.invalid != nullptr) {
+        stop_reason = record.invalid;
+        break;
+      }
+      const uint64_t record_size = kHeaderSize + payload.size();
+      if (record.type == kPadding) {
+        tail.offset += record_size;
+        continue;
+      }
+      if (record.type == kEndRecord) {
+        next_segment = true;
+        continue;
+      }
+      if (record.type != kFrame) {
+        stop_reason = "unexpected record type";
+        break;
+      }
+
+      if (record.epoch <= last_epoch) {
+        stop_reason = "frame epoch did not increase";
+        break;
+      }
+
+      // Already covered by the checkpoint; nothing here needs replaying.
+      if (record.epoch <= min_epoch) {
+        ++result.frames_skipped;
+        result.bytes_skipped += record_size;
+        last_epoch = record.epoch;
+        tail.offset += record_size;
+        continue;
+      }
+
+      // Unpack the records and require them to match the frame's epoch.
+      LogRecords unpacked;
+      try {
+        size_t consumed = 0;
+        auto handle =
+            msgpack::unpack(reinterpret_cast<const char *>(payload.data()),
+                            payload.size(), consumed);
+        handle.get().convert(unpacked);
+        if (consumed != payload.size()) {
+          stop_reason = "frame payload has trailing bytes";
+          break;
+        }
+      } catch (const msgpack::unpack_error &e) {
+        stop_reason = std::string("frame payload does not unpack: ") + e.what();
+        break;
+      } catch (const msgpack::type_error &) {
+        stop_reason = "frame payload has the wrong type";
+        break;
+      }
+      if (unpacked.empty()) {
+        stop_reason = "frame carries no record";
+        break;
+      }
+      const EpochNumber epoch = record.epoch;
+      const bool epoch_mismatch = std::any_of(
+          unpacked.begin(), unpacked.end(),
+          [epoch](const LogRecord &log) { return log.epoch != epoch; });
+      if (epoch_mismatch) {
+        stop_reason = "record epoch disagrees with its frame";
+        break;
+      }
+
+      if (replay) replay(unpacked);
+      last_epoch = epoch;
+      tail.offset += record_size;
+    }
+
+    if (next_segment) {
+      ++tail.segment_number;
+      tail.offset = 0;
     }
   }
 
-  // Publish the append position after the recovered prefix.
-  return FinishScan(std::move(result), offset);
+  result.status = WalScanResult::Status::kOk;
+  result.last_epoch = last_epoch;
+
+  // A later scan of a running log repairs nothing.
+  if (state_ == State::kReady) return result;
+
+  SPDLOG_INFO(
+      "The log ends at segment {0} offset {1} ({2}); the last epoch is {3}",
+      tail.segment_number, tail.offset, stop_reason, last_epoch);
+  return FinishScan(std::move(result), fresh, start, tail, segments,
+                    temporaries);
+}
+
+// Builds a segment under its temporary name, then publishes the numbered name.
+// Until the directory sync is done nothing refers to the segment, and a crash
+// at any step leaves a file the next start deletes or a covered one.
+bool Wal::FormatSegment(uint64_t segment_number, uint64_t recycled, int &fd,
+                        int &error) {
+  const std::string temporary = TemporaryPath(segment_number);
+  if (recycled != 0) {
+    HELIOS_DEBUG_SYNC("wal.prepare.before_temp_rename");
+    if (::rename(SegmentPath(recycled).c_str(), temporary.c_str()) != 0) {
+      error = errno;
+      return false;
+    }
+    HELIOS_DEBUG_SYNC("wal.prepare.after_temp_rename");
+    fd = ::open(temporary.c_str(), O_RDWR | O_CLOEXEC);
+    if (fd < 0) {
+      error = errno;
+      return false;
+    }
+  } else {
+    fd =
+        ::open(temporary.c_str(), O_RDWR | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+    if (fd < 0) {
+      error = errno;
+      return false;
+    }
+    if (!WriteZeroesAndSync(fd, 0, static_cast<off_t>(segment_bytes_), error)) {
+      return false;
+    }
+  }
+
+  // The header fills the first block, so frames start on a block of their own.
+  std::vector<uint8_t> header(block_bytes_, 0);
+  PutCheckedRecord(header.data(), kHeaderRecord, segment_number, 0,
+                   header.data() + kHeaderSize,
+                   static_cast<uint32_t>(block_bytes_ - kHeaderSize));
+  if (!WriteAt(fd, header.data(), header.size(), 0, error)) return false;
+  HELIOS_DEBUG_SYNC("wal.prepare.after_header_write");
+  if (Fsync(fd) != 0) {
+    error = errno;
+    return false;
+  }
+
+  HELIOS_DEBUG_SYNC("wal.prepare.before_rename");
+  if (::rename(temporary.c_str(), SegmentPath(segment_number).c_str()) != 0) {
+    error = errno;
+    return false;
+  }
+  HELIOS_DEBUG_SYNC("wal.prepare.before_directory_sync");
+  if (!FsyncDirectory(directory_, error)) return false;
+  HELIOS_DEBUG_SYNC("wal.prepare.after_directory_sync");
+  return true;
+}
+
+bool Wal::PrepareSegment() {
+  int error = 0;
+  return Prepare(false, error);
+}
+
+// A preparation for a miss fills the pool up to one segment, any other up to
+// the spare target. Preparations run one at a time, and a miss takes the first
+// segment the one under way pushes.
+bool Wal::Prepare(bool miss, int &error) {
+  Segment segment;
+  uint64_t recycled = 0;
+  {
+    std::unique_lock<std::mutex> lock(pool_mutex_);
+    while (preparing_ && !(miss && !ready_.empty())) pool_cv_.wait(lock);
+    if (!miss && prepare_error_ != 0) {
+      error = prepare_error_;
+      return false;
+    }
+    const uint64_t target = miss ? segment_bytes_ : spare_target_bytes_;
+    if (ready_.size() * segment_bytes_ >= target) return true;
+    preparing_ = true;
+    segment.segment_number = next_segment_++;
+    if (!covered_.empty()) {
+      recycled = covered_.front();
+      covered_.pop_front();
+    }
+  }
+
+  const bool formatted =
+      FormatSegment(segment.segment_number, recycled, segment.fd, error);
+  if (!formatted && segment.fd >= 0) ::close(segment.fd);
+  {
+    std::lock_guard<std::mutex> lock(pool_mutex_);
+    if (formatted) {
+      segment.append_offset = block_bytes_;
+      ready_.push_back(segment);
+      prepare_error_ = 0;
+    } else {
+      // The next preparation takes the same number, so segments stay
+      // consecutive.
+      next_segment_ = segment.segment_number;
+      prepare_error_ = error;
+    }
+    preparing_ = false;
+  }
+  pool_cv_.notify_all();
+  return formatted;
+}
+
+// Takes the next ready segment, which is durable under its numbered name, and
+// prepares one on a miss. Preparation recycles only covered segments, so
+// nothing here can overwrite what recovery still needs.
+bool Wal::AcquireReady(Segment &next, int &error) {
+  std::unique_lock<std::mutex> lock(pool_mutex_);
+  while (ready_.empty()) {
+    lock.unlock();
+    HELIOS_DEBUG_SYNC("wal.pool_miss");
+    if (!Prepare(true, error)) return false;
+    lock.lock();
+  }
+  next = ready_.front();
+  ready_.pop_front();
+  lock.unlock();
+  pool_cv_.notify_all();
+  return true;
+}
+
+void Wal::MarkCovered(uint64_t redo_segment) {
+  std::lock_guard<std::mutex> lock(pool_mutex_);
+  for (; oldest_retained_ < redo_segment; ++oldest_retained_) {
+    covered_.push_back(oldest_retained_);
+  }
+}
+
+Wal::WorkerTask Wal::WaitForWork() {
+  std::unique_lock<std::mutex> lock(pool_mutex_);
+  for (;;) {
+    if (worker_stopped_) return WorkerTask::kStop;
+    // A due checkpoint comes first while a segment is ready: only a checkpoint
+    // frees segments, and zeroing fresh ones cannot outrun a saturated device.
+    const bool checkpoint_due = appended_bytes_ >= checkpoint_threshold_;
+    if (checkpoint_due && !ready_.empty()) return WorkerTask::kCheckpoint;
+    if (prepare_error_ == 0 &&
+        ready_.size() * segment_bytes_ < spare_target_bytes_) {
+      return WorkerTask::kPrepare;
+    }
+    if (checkpoint_due) return WorkerTask::kCheckpoint;
+    pool_cv_.wait(lock);
+  }
+}
+
+void Wal::StopWorker() {
+  {
+    std::lock_guard<std::mutex> lock(pool_mutex_);
+    worker_stopped_ = true;
+  }
+  pool_cv_.notify_all();
+}
+
+WalPosition Wal::durable_end() {
+  std::lock_guard<std::mutex> lock(pool_mutex_);
+  return durable_end_;
+}
+
+uint64_t Wal::appended_bytes() {
+  std::lock_guard<std::mutex> lock(pool_mutex_);
+  return appended_bytes_;
+}
+
+void Wal::set_checkpoint_threshold(uint64_t appended_bytes) {
+  std::lock_guard<std::mutex> lock(pool_mutex_);
+  checkpoint_threshold_ = appended_bytes;
+}
+
+// Publishes where the log ends after an fdatasync, and wakes the worker when
+// that makes a checkpoint due.
+void Wal::PublishEnd(const WalPosition &end, uint64_t written) {
+  bool due;
+  {
+    std::lock_guard<std::mutex> lock(pool_mutex_);
+    durable_end_ = end;
+    appended_bytes_ += written;
+    due = appended_bytes_ >= checkpoint_threshold_;
+  }
+  if (due) pool_cv_.notify_all();
+}
+
+// Writes `iov` at `offset` and persists it: nothing may report it durable
+// before this returns.
+bool Wal::WriteAndSync(std::vector<iovec> &iov, uint64_t offset, int &error) {
+  auto &trace = FlushTrace::Instance();
+  const bool traced = trace.Enabled();
+  const int64_t write_begin = traced ? FlushTrace::Now() : 0;
+  if (!WriteAllAt(iov, static_cast<off_t>(offset), error)) return false;
+  if (traced) trace.GroupWrite(write_begin, FlushTrace::Now());
+  // The records are written but not yet known durable: a Sync commit
+  // waiting on this group must not have been reported when this point
+  // is reached.
+  HELIOS_DEBUG_SYNC("wal.before_fdatasync");
+
+  const int64_t sync_begin = traced ? FlushTrace::Now() : 0;
+  if (!Fdatasync(active_.fd, error)) return false;
+  if (traced) trace.GroupSync(sync_begin, FlushTrace::Now());
+  return true;
+}
+
+// Closes the active segment after the frames in `iov` and moves to the next.
+// The next segment is taken first, so a durable end record always leads to a
+// segment, and the old one is synced before anything lands in its successor.
+bool Wal::Rotate(std::vector<iovec> &iov, size_t group_size, int &error) {
+  Segment next;
+  if (!AcquireReady(next, error)) return false;
+  HELIOS_DEBUG_SYNC("wal.rotate.before_end_record");
+
+  uint8_t end_record[kHeaderSize];
+  PutCheckedRecord(end_record, kEndRecord, active_.segment_number,
+                   active_.append_offset + group_size, nullptr, 0);
+  iov.push_back({end_record, kHeaderSize});
+  if (!WriteAndSync(iov, active_.append_offset, error)) {
+    ::close(next.fd);
+    return false;
+  }
+  HELIOS_DEBUG_SYNC("wal.rotate.after_end_sync");
+
+  ::close(active_.fd);
+  active_ = next;
+  PublishEnd({active_.segment_number, active_.append_offset},
+             group_size + kHeaderSize);
+  return true;
 }
 
 WalAppendResult Wal::AppendGroup(
@@ -659,30 +974,24 @@ WalAppendResult Wal::AppendGroup(
     SPDLOG_CRITICAL(
         "Durability Error: a group was written to {0} while the end of the "
         "log was not established",
-        path_);
+        directory_);
     std::abort();
   }
 
-  // Frame the buckets at or below target into one group. A frame's header and
-  // record list header are built here; its records are written from their
-  // own bytes.
   auto &trace = FlushTrace::Instance();
   const bool traced = trace.Enabled();
   const int64_t pack_begin = traced ? FlushTrace::Now() : 0;
-  uint32_t packed_epochs = 0;
-  size_t group_size = 0;
+
+  // A bucket the scan would reject is refused before anything is written, which
+  // leaves the log's end known and this instance usable.
   // The iovecs point into `heads`, which therefore never reallocates.
   std::vector<FrameHead> heads;
   heads.reserve(buckets.size());
-  std::vector<iovec> iov;
   EpochNumber last_packed = last_epoch_;
   for (const auto &[epoch, records] : buckets) {
     if (epoch > target) break;
-    ++packed_epochs;
-    // A bucket the scan would reject is refused before anything is
-    // written, which leaves the log's end known and this instance usable.
     if (records.empty() || epoch == 0) return {false, EINVAL};
-    if (epoch < last_epoch_) return {false, EINVAL};
+    if (epoch <= last_epoch_) return {false, EINVAL};
     size_t records_size = 0;
     for (const auto &record : records) {
       if (record.epoch != epoch) return {false, EINVAL};
@@ -697,23 +1006,51 @@ WalAppendResult Wal::AppendGroup(
         .pack_array(static_cast<uint32_t>(records.size()));
     const size_t payload_size = list_header.size() + records_size;
     if (payload_size > kMaxPayloadSize ||
-        payload_size > static_cast<size_t>(UINT32_MAX)) {
+        PaddedEnd(block_bytes_ + kHeaderSize + payload_size) + block_bytes_ >
+            segment_bytes_) {
       return {false, EOVERFLOW};
     }
 
     FrameHead &head = heads.emplace_back();
-    uint8_t *frame = head.bytes;
-    PutLe32(frame, kMagic);
-    PutLe16(frame + kOffFlags, kFlags);
-    PutLe32(frame + kOffPayloadSize, static_cast<uint32_t>(payload_size));
-    PutLe32(frame + kOffEpoch, epoch);
-    std::memcpy(frame + kHeaderSize, list_header.data(), list_header.size());
+    std::memcpy(head.bytes + kHeaderSize, list_header.data(),
+                list_header.size());
     head.size = kHeaderSize + list_header.size();
+    head.payload_size = static_cast<uint32_t>(payload_size);
+  }
+  if (heads.empty()) return {true, 0};
+
+  // Frame the buckets, leaving a segment whenever the next whole frame, its
+  // group's padding and the block held for the end record would not fit.
+  int error = 0;
+  std::vector<iovec> iov;
+  size_t group_size = 0;
+  size_t next_head = 0;
+  uint32_t packed_epochs = 0;
+  for (const auto &[epoch, records] : buckets) {
+    if (epoch > target) break;
+    ++packed_epochs;
+    FrameHead &head = heads[next_head++];
+    const size_t frame_size = kHeaderSize + head.payload_size;
+    if (PaddedEnd(active_.append_offset + group_size + frame_size) +
+            block_bytes_ >
+        segment_bytes_) {
+      if (!Rotate(iov, group_size, error)) {
+        state_ = State::kFailed;
+        return {false, error};
+      }
+      iov.clear();
+      group_size = 0;
+    }
+
+    uint8_t *frame = head.bytes;
+    PutRecordHeader(frame, kFrame, active_.segment_number,
+                    active_.append_offset + group_size, head.payload_size,
+                    epoch);
 
     // The checksum runs over the bytes the iovecs name, in their order.
     Crc32c crc;
     crc.Update(frame, kCrcCoverage);
-    crc.Update(frame + kHeaderSize, list_header.size());
+    crc.Update(frame + kHeaderSize, head.size - kHeaderSize);
     iov.push_back({frame, head.size});
     for (const auto &record : records) {
       crc.Update(record.bytes.data(), record.bytes.size());
@@ -721,56 +1058,34 @@ WalAppendResult Wal::AppendGroup(
           {const_cast<char *>(record.bytes.data()), record.bytes.size()});
     }
     PutLe32(frame + kOffCrc, crc.Finish());
-    group_size += kHeaderSize + payload_size;
+    group_size += frame_size;
   }
 
+  // End the group on a block boundary.
+  uint8_t padding_head[kHeaderSize];
+  const uint64_t group_end = active_.append_offset + group_size;
+  const uint64_t padded_end = PaddedEnd(group_end);
+  if (padded_end != group_end) {
+    const auto padding_size =
+        static_cast<uint32_t>(padded_end - group_end - kHeaderSize);
+    PutCheckedRecord(padding_head, kPadding, active_.segment_number, group_end,
+                     padding_.data(), padding_size);
+    iov.push_back({padding_head, kHeaderSize});
+    iov.push_back({padding_.data(), padding_size});
+  }
   if (traced) {
     trace.GroupPack(pack_begin, FlushTrace::Now(), group_size, packed_epochs);
   }
 
-  if (group_size == 0) return {true, 0};
-
-  // Extend the zeroed region if the group does not fit.
-  int error = 0;
-  const off_t initialised_before = initialised_size_;
-  if (!EnsureCapacityFor(write_offset_, group_size, error)) {
-    state_ = State::kFailed;
-    return {false, error};
-  }
-  if (initialised_size_ != initialised_before) {
-    ++extension_count_;
-    SPDLOG_INFO("Extended {0} to {1} bytes ({2} extensions so far)", path_,
-                static_cast<long long>(initialised_size_), extension_count_);
-  }
-
   // Write, fdatasync, then publish the offset and the last epoch.
-  const int64_t write_begin = traced ? FlushTrace::Now() : 0;
-  if (!WriteAllAt(iov, write_offset_, error)) {
+  if (!WriteAndSync(iov, active_.append_offset, error)) {
     state_ = State::kFailed;
     return {false, error};
   }
-  if (traced) trace.GroupWrite(write_begin, FlushTrace::Now());
-  // The records are written but not yet known durable: a Sync commit
-  // waiting on this group must not have been reported when this point
-  // is reached.
-  HELIOS_DEBUG_SYNC("wal.before_fdatasync");
-
-  const int64_t sync_begin = traced ? FlushTrace::Now() : 0;
-  int rc;
-  do {
-    rc = io_.fdatasync(fd_);
-  } while (rc < 0 && errno == EINTR);
-  if (rc < 0) {
-    const int failure = errno;
-    state_ = State::kFailed;
-    return {false, failure};
-  }
-  if (traced) trace.GroupSync(sync_begin, FlushTrace::Now());
-
-  write_offset_ += static_cast<off_t>(group_size);
-  // Without preallocation the group carried the file's size with it.
-  initialised_size_ = std::max(initialised_size_, write_offset_);
+  const uint64_t written = padded_end - active_.append_offset;
+  active_.append_offset = padded_end;
   last_epoch_ = last_packed;
+  PublishEnd({active_.segment_number, active_.append_offset}, written);
   return {true, 0};
 }
 

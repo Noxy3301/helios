@@ -31,6 +31,9 @@
 
 namespace helios::storage {
 
+// Fits a frame of the largest payload, so an epoch never needs splitting.
+inline constexpr uint64_t kWalSegmentBytes = 512ull * 1024ull * 1024ull;
+
 /**
  * @brief Configuration and options for one storage instance.
  */
@@ -48,68 +51,24 @@ struct Config {
   size_t epoch_duration_ms = 40;
 
   /**
-   * @brief Whether the instance replays its log at construction.
+   * @brief Size of each write-ahead log segment.
    *
-   * @details The log is always scanned and its interrupted tail overwritten
-   * with zeroes, which has to happen before the first append lands behind it.
-   * This decides only whether the records the scan read are replayed and
-   * whether a published checkpoint's records are loaded; the checkpoint's
-   * header is read and validated on every start, and its end epoch bounds the
-   * epoch the instance resumes at.
-   * PAX column definitions are always restored before the database starts.
-   *
-   * Default: true
+   * @note Only tests change this, to keep their files small. The server always
+   * runs with kWalSegmentBytes.
    */
-  bool enable_recovery = true;
+  uint64_t wal_segment_bytes = kWalSegmentBytes;
 
   /**
-   * @brief How much of the write-ahead log is made writable in place at a
-   *        time.
+   * @brief The amount of log the server aims to keep, in bytes.
    *
-   * @details The log file is written out with zeroes to this size before any
-   * record lands in it, and records are then written in place, so a commit's
-   * fdatasync persists data and not the size, allocation, or extent-state
-   * metadata a growing file drags in (the benefit is filesystem- and
-   * device-specific). A log that grows past it is extended by the same
-   * amount again: a granularity rather than a limit. Larger means fewer
-   * synchronous extensions but a longer startup scan of the reserved
-   * region. Zero disables reservation and lets the file grow as written.
+   * @details A checkpoint starts when the log that recovery would still need
+   * reaches half of it; the other half is for what is written while the
+   * checkpoint is captured. It is a target, not a hard limit: the log exceeds
+   * it when a capture takes longer than the remaining half lasts.
    *
-   * @note The storage stack must honour fsync/fdatasync; the supported
-   * ext4 setup uses its default data ordering and barriers. A log from a
-   * build that did not reserve is readable here; the reverse does not
-   * hold (such a build reads the reserved zeroes as a broken frame and
-   * refuses to start).
-   *
-   * Default: 64 MiB
+   * Default: 64 GiB
    */
-  uint64_t wal_initial_capacity_bytes = 64ull * 1024ull * 1024ull;
-
-  /**
-   * @brief How often, in milliseconds, a checkpoint of the live rows is
-   *        written; zero writes none.
-   *
-   * The checkpoint is scanned while transactions keep running and is merged
-   * with the log at recovery, which is what bounds the part of the log that has
-   * to be replayed. It does not bound the log on disk: nothing is truncated.
-   *
-   * Requires a durability contract that writes a log, since the checkpoint
-   * alone is not a recoverable state.
-   *
-   * Default: 0 (no checkpoint)
-   */
-  size_t checkpoint_interval_ms = 0;
-
-  /**
-   * @brief One checkpoint written this many milliseconds after startup; zero
-   *        writes none.
-   *
-   * @details When checkpoint_interval_ms is also set, its timer starts after
-   * this first checkpoint, not at startup.
-   *
-   * Default: 0 (no checkpoint)
-   */
-  size_t checkpoint_once_after_ms = 0;
+  uint64_t wal_budget_bytes = 64ull << 30;
 
   /**
    * @brief The working directory, which holds the log and every related

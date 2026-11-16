@@ -265,25 +265,7 @@ Database::Database(const Config &config)
       }
     }
   }
-  // Always scan the log, even without recovery: an interrupted tail has to be
-  // removed before the first append lands behind it, and recovery only
-  // controls whether the records the scan read are replayed.
-  if (config_.enable_recovery) {
-    Recover();
-  } else {
-    const auto scanned = logger_.Recover();
-    if (scanned.status != wal::Logger::RecoveryStatus::kOk) {
-      SPDLOG_CRITICAL(
-          "Startup failed: the write-ahead log could not be read; refusing to "
-          "start with an unknown durable state");
-      exit(EXIT_FAILURE);
-    }
-    if (scanned.durable_epoch != 0) {
-      // Records exist that this instance will not replay; resuming at or
-      // below their epoch would let a Sync commit inherit their durable epoch.
-      epoch_framework_.SetGlobalEpoch(ResumeEpochAbove(scanned.durable_epoch));
-    }
-  }
+  Recover();
 
   // The replay enrolled this thread in the Masstree epoch; leaving it lets
   // other threads reclaim what they retire.

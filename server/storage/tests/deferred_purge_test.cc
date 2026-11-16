@@ -24,8 +24,8 @@ constexpr const char *kTable = "purge_test";
 helios::storage::Config MakeConfig(size_t epoch_duration_ms) {
   helios::storage::Config config;
   config.epoch_duration_ms = epoch_duration_ms;
-  config.enable_recovery = false;
   config.work_dir = "./helios_deferred_purge_test_logs";
+  config.wal_segment_bytes = 1u << 20;
   std::filesystem::remove_all(config.work_dir);
   return config;
 }

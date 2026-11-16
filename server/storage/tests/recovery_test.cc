@@ -68,16 +68,13 @@ class RecoveryTest : public ::testing::Test {
     std::filesystem::remove_all(root_, ec);
   }
 
-  enum class Recovery { kOff, kOn };
+  static constexpr uint64_t kSegmentBytes = 1ull << 20;
 
-  static constexpr uint64_t kWalCapacityBytes = 1ull << 20;
-
-  helios::storage::Config MakeConfig(Recovery recovery) const {
+  helios::storage::Config MakeConfig() const {
     helios::storage::Config config;
     config.epoch_duration_ms = 10;
-    config.enable_recovery = recovery == Recovery::kOn;
     config.work_dir = work_dir_;
-    config.wal_initial_capacity_bytes = kWalCapacityBytes;
+    config.wal_segment_bytes = kSegmentBytes;
     return config;
   }
 
@@ -124,7 +121,7 @@ class RecoveryTest : public ::testing::Test {
 
 TEST_F(RecoveryTest, ALoggedWriteCarriesTheUnlockedTid) {
   {
-    auto config = MakeConfig(Recovery::kOff);
+    auto config = MakeConfig();
     helios::storage::Database db(config);
     TestHelper::CreateTable(db, kTable);
     ASSERT_TRUE(db.CreateSecondaryIndex(
@@ -132,7 +129,7 @@ TEST_F(RecoveryTest, ALoggedWriteCarriesTheUnlockedTid) {
     ASSERT_TRUE(CommitWriteWithIndexEntry(db, "k", "v1", "s"));
   }
 
-  Wal wal(work_dir_, helios::storage::wal::WalIo::Posix(), kWalCapacityBytes);
+  Wal wal(work_dir_, helios::storage::wal::WalIo::Posix(), kSegmentBytes);
   auto scan = ScanRecords(wal);
   ASSERT_EQ(scan.status, WalScanResult::Status::kOk);
 
@@ -166,7 +163,7 @@ TEST_F(RecoveryTest, ALoggedWriteCarriesTheUnlockedTid) {
 
 TEST_F(RecoveryTest, ARecoveredKeyAcceptsAFurtherWrite) {
   {
-    auto config = MakeConfig(Recovery::kOff);
+    auto config = MakeConfig();
     helios::storage::Database db(config);
     TestHelper::CreateTable(db, kTable);
     ASSERT_TRUE(CommitWrite(db, "k", "v1"));
@@ -175,7 +172,7 @@ TEST_F(RecoveryTest, ARecoveredKeyAcceptsAFurtherWrite) {
   // Guarded by the assertion above: a locked TID in the log makes the read
   // and the write below spin rather than fail.
   {
-    Wal wal(work_dir_, helios::storage::wal::WalIo::Posix(), kWalCapacityBytes);
+    Wal wal(work_dir_, helios::storage::wal::WalIo::Posix(), kSegmentBytes);
     auto scan = ScanRecords(wal);
     ASSERT_EQ(scan.status, WalScanResult::Status::kOk);
     bool seen = false;
@@ -189,7 +186,7 @@ TEST_F(RecoveryTest, ARecoveredKeyAcceptsAFurtherWrite) {
     ASSERT_TRUE(seen) << "the log holds no record of the key";
   }
 
-  auto config = MakeConfig(Recovery::kOn);
+  auto config = MakeConfig();
   helios::storage::Database db(config);
   TestHelper::CreateTable(db, kTable);
   const auto recovered = Read(db, "k");
@@ -204,7 +201,7 @@ TEST_F(RecoveryTest, ARecoveredKeyAcceptsAFurtherWrite) {
 
 TEST_F(RecoveryTest, AnIndexWithoutARecordKeepsItsConstraint) {
   {
-    auto config = MakeConfig(Recovery::kOn);
+    auto config = MakeConfig();
     helios::storage::Database db(config);
     ASSERT_TRUE(TestHelper::CreateTable(db, kTable));
     ASSERT_TRUE(db.CreateSecondaryIndex(
@@ -212,7 +209,7 @@ TEST_F(RecoveryTest, AnIndexWithoutARecordKeepsItsConstraint) {
   }
 
   // Nothing was written under the index, so only the catalog can restore it.
-  auto config = MakeConfig(Recovery::kOn);
+  auto config = MakeConfig();
   helios::storage::Database db(config);
   const std::string reason = DuplicateSecondaryKeyReason(db);
   EXPECT_EQ(reason.rfind(helios::storage::kDuplicateSecondaryKeyAbortPrefix, 0),
@@ -222,7 +219,7 @@ TEST_F(RecoveryTest, AnIndexWithoutARecordKeepsItsConstraint) {
 
 TEST_F(RecoveryTest, AnIndexDeclaredBeforeTheSchemaSurvives) {
   {
-    auto config = MakeConfig(Recovery::kOn);
+    auto config = MakeConfig();
     helios::storage::Database db(config);
     ASSERT_TRUE(db.CreateTable(kTable));
     ASSERT_TRUE(db.CreateSecondaryIndex(
@@ -232,7 +229,7 @@ TEST_F(RecoveryTest, AnIndexDeclaredBeforeTheSchemaSurvives) {
   }
 
   // The install is what writes the table's first catalog entry.
-  auto config = MakeConfig(Recovery::kOn);
+  auto config = MakeConfig();
   helios::storage::Database db(config);
   const std::string reason = DuplicateSecondaryKeyReason(db);
   EXPECT_EQ(reason.rfind(helios::storage::kDuplicateSecondaryKeyAbortPrefix, 0),
@@ -247,7 +244,7 @@ TEST_F(RecoveryTest, EarlyPublicationKeepsTheOriginalWalValue) {
   std::string first_key;
   Tidword first_commit_tid;
   {
-    Database db(MakeConfig(Recovery::kOff));
+    Database db(MakeConfig());
     TestHelper::CreateTable(db, kTable);
     ASSERT_TRUE(CommitWrite(db, "alice", "old"));
     ASSERT_TRUE(CommitWrite(db, "bob", "old"));
@@ -297,7 +294,7 @@ TEST_F(RecoveryTest, EarlyPublicationKeepsTheOriginalWalValue) {
     EXPECT_TRUE(writer.get());
   }
 
-  Wal wal(work_dir_);
+  Wal wal(work_dir_, helios::storage::wal::WalIo::Posix(), kSegmentBytes);
   const auto scan = ScanRecords(wal);
   ASSERT_EQ(scan.status, WalScanResult::Status::kOk);
   size_t batch_values = 0;
@@ -322,7 +319,7 @@ TEST_F(RecoveryTest, RecoveredRowCountsAreTheLiveRows) {
   constexpr const char *kOther = "recovery_test_other";
   constexpr const char *kEmptied = "recovery_test_emptied";
   {
-    helios::storage::Database db(MakeConfig(Recovery::kOff));
+    helios::storage::Database db(MakeConfig());
     ASSERT_TRUE(TestHelper::CreateTable(db, kTable));
     ASSERT_TRUE(TestHelper::CreateTable(db, kOther));
     ASSERT_TRUE(TestHelper::CreateTable(db, kEmptied));
@@ -347,7 +344,7 @@ TEST_F(RecoveryTest, RecoveredRowCountsAreTheLiveRows) {
   }
 
   {
-    helios::storage::Database db(MakeConfig(Recovery::kOn));
+    helios::storage::Database db(MakeConfig());
     const auto &counts = db.recovered_row_counts();
     // k2, k4, k5, k6
     ASSERT_EQ(counts.count(kTable), 1u);

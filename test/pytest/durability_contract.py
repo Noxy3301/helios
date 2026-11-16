@@ -264,9 +264,6 @@ def test_acknowledged_rows_survive_a_process_crash(work_dir):
             acknowledged.append(row)
         log(f"acknowledged rows: {acknowledged}")
 
-        wal = os.path.join(work_dir, "helios_data", "wal.log")
-        size_before = os.path.getsize(wal)
-
         # SIGKILL, not shutdown: a clean stop would flush and prove nothing.
         subprocess.run([os.path.join(ROOT, "scripts", "stop_mysql.sh")],
                        cwd=ROOT, stdout=subprocess.DEVNULL,
@@ -274,9 +271,9 @@ def test_acknowledged_rows_survive_a_process_crash(work_dir):
         server.send_signal(signal.SIGKILL)
         server.wait(timeout=10)
         server = None
-        log(f"killed the server; wal.log is {size_before} bytes")
+        log("killed the server")
 
-        server = start_server(work_dir, "sync", conf={"enable_recovery": 1})
+        server = start_server(work_dir, "sync")
         start_mysqld()
         rows = sql("SELECT id, v FROM dur.crash ORDER BY id;")
         recovered = {}

@@ -42,6 +42,7 @@ class CreateSecondaryIndexTest : public ::testing::Test {
   virtual void SetUp() {
     std::filesystem::remove_all(config_.work_dir);
     config_.epoch_duration_ms = 100;
+    config_.wal_segment_bytes = 1u << 20;
     db_ = std::make_unique<helios::storage::Database>(config_);
   }
 };

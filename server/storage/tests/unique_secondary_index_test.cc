@@ -40,6 +40,7 @@ class UniqueSecondaryIndexTest : public ::testing::Test {
   void SetUp() override {
     std::filesystem::remove_all(config_.work_dir);
     config_.epoch_duration_ms = 100;
+    config_.wal_segment_bytes = 1u << 20;
   }
 
   void TearDown() override { std::filesystem::remove_all(config_.work_dir); }
@@ -48,7 +49,6 @@ class UniqueSecondaryIndexTest : public ::testing::Test {
 TEST_F(UniqueSecondaryIndexTest, UniqueIndexRejectsDuplicateSecondaryKey) {
   config_.work_dir = "./helios_unique_secondary_index_test_logs";
   std::filesystem::remove_all(config_.work_dir);
-  config_.enable_recovery = false;
 
   helios::storage::Database db(config_);
   ASSERT_TRUE(TestHelper::CreateTable(db, "users"));
@@ -63,8 +63,6 @@ TEST_F(UniqueSecondaryIndexTest, UniqueIndexRejectsDuplicateSecondaryKey) {
 
 TEST_F(UniqueSecondaryIndexTest,
        RecoveryRestoresUniqueIndexConstraintFromLogs) {
-  config_.enable_recovery = true;
-
   {
     helios::storage::Database db(config_);
     ASSERT_TRUE(TestHelper::CreateTable(db, "users"));
