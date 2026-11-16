@@ -23,6 +23,10 @@ epoch_duration_ms = 40
 # still need reaches half of it.
 wal_budget_bytes = 64G
 
+# Whether the logger writes the log with O_DIRECT, bypassing the page cache:
+# 0 or 1. The filesystem block must be a multiple of 4096 bytes.
+wal_direct_io = 1
+
 # The contract every commit runs under: sync or async.
 commit_durability = sync
 

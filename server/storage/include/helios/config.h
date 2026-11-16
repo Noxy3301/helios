@@ -71,6 +71,18 @@ struct Config {
   uint64_t wal_budget_bytes = 64ull << 30;
 
   /**
+   * @brief Whether the logger writes the log with O_DIRECT, bypassing the page
+   * cache.
+   *
+   * @details Each group is copied into one buffer aligned to 4096 bytes.
+   * Startup fails when the filesystem refuses O_DIRECT or its block is not a
+   * multiple of 4096 bytes.
+   *
+   * Default: true
+   */
+  bool wal_direct_io = true;
+
+  /**
    * @brief The working directory, which holds the log and every related
    *        file.
    *
