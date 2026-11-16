@@ -47,6 +47,9 @@ class TxRpcTrace {
   void record(RpcOp type, uint64_t us, uint32_t req_b,
               uint64_t resp_b, const std::string& meta);
   void record_event(const std::string& kind);
+  void record_event(const char* kind) {
+    if (active_) record_event(std::string(kind));
+  }
   std::string finalize_jsonl(bool committed);
 
   bool active() const { return active_; }

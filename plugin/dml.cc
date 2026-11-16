@@ -8,6 +8,8 @@
 #include "key_pack.hh"
 #include "prefetch.hh"
 #include "my_dbug.h"
+#include "sql/sql_class.h"
+#include "sql/sql_lex.h"
 #include "sql/table.h"
 
 // Handler DML entry points. These methods buffer base-row mutations and their
@@ -16,6 +18,15 @@
 static const std::string kLongKey = "an index entry longer than " +
                                     std::to_string(key_pack::kMaxKeyLength) +
                                     " bytes once packed";
+
+// Whether the statement assigns a column of this key.
+static bool key_assigned(const TABLE *table, const KEY &key) {
+  for (uint p = 0; p < key.user_defined_key_parts; p++) {
+    if (bitmap_is_set(table->write_set, key.key_part[p].fieldnr - 1))
+      return true;
+  }
+  return false;
+}
 
 int ha_helios::duplicate_or_conflict(HeliosTransaction *tx, uint index) {
   if (!tx->reads_still_valid()) {
@@ -214,9 +225,24 @@ int ha_helios::write_row(uchar *buf) {
 int ha_helios::update_row(const uchar *old_data, uchar *new_data) {
   DBUG_TRACE;
 
-  auto tx = get_transaction(ha_thd());
+  THD *thd = ha_thd();
+  auto tx = get_transaction(thd);
+
+  // UPDATE changes only write_set columns unless a trigger or a generated
+  // column is involved. Other statements may not: a REPLACE turned into an
+  // update resets the columns it does not name.
+  const enum_sql_command command = thd->lex->sql_command;
+  const bool write_set_complete =
+      (command == SQLCOM_UPDATE || command == SQLCOM_UPDATE_MULTI) &&
+      table->triggers == nullptr && table->s->vfields == 0;
+
   auto key = extract_key_from_mysql(old_data);
-  auto new_key = extract_key_from_mysql(new_data);
+  std::string new_key;
+  if (!write_set_complete ||
+      (is_primary_key_exists() &&
+       key_assigned(table, table->key_info[table->s->primary_key]))) {
+    new_key = extract_key_from_mysql(new_data);
+  }
 
   if (key.empty()) {
     key = last_fetched_primary_key_;
@@ -228,7 +254,7 @@ int ha_helios::update_row(const uchar *old_data, uchar *new_data) {
 
   last_fetched_primary_key_ = key;
 
-  // A hidden primary key never changes.
+  // A hidden primary key never changes, nor does one left out of write_set.
   if (new_key.empty()) {
     new_key = key;
   }
@@ -258,14 +284,22 @@ int ha_helios::update_row(const uchar *old_data, uchar *new_data) {
   }
 
   // A rejected statement keeps what the handler buffered, so every UNIQUE key
-  // probed before the first write of the row is buffered.
-  std::vector<std::string> old_keys(table->s->keys);
-  std::vector<std::string> new_keys(table->s->keys);
+  // probed before the first write of the row is buffered. An index skipped
+  // here keeps equal empty keys, and both stay empty when none is packed.
+  std::vector<std::string> old_keys;
+  std::vector<std::string> new_keys;
   for (uint i = 0; i < table->s->keys; i++) {
     if (key_pack::same_as_primary(*table->s, i)) {
       continue;
     }
     const auto &key_info = table->key_info[i];
+    if (write_set_complete && !moved && !key_assigned(table, key_info)) {
+      continue;
+    }
+    if (old_keys.empty()) {
+      old_keys.resize(table->s->keys);
+      new_keys.resize(table->s->keys);
+    }
 
     old_keys[i] = build_secondary_key_from_row(old_data, key_info);
     new_keys[i] = build_secondary_key_from_row(new_data, key_info);
@@ -308,7 +342,7 @@ int ha_helios::update_row(const uchar *old_data, uchar *new_data) {
     return abort_errno(tx);
   }
 
-  for (uint i = 0; i < table->s->keys; i++) {
+  for (uint i = 0; i < old_keys.size(); i++) {
     if (key_pack::same_as_primary(*table->s, i) ||
         (!moved && old_keys[i] == new_keys[i])) {
       continue;

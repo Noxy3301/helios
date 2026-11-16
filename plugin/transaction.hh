@@ -32,7 +32,7 @@ class Helios_share;
 class HeliosTransaction
 {
 public:
-  void choose_table(std::string db_table_name);
+  void choose_table(const std::string &db_table_name);
   bool table_is_not_chosen();
 
   // A nonzero column_mask validates the read by those PAX fields only
@@ -321,10 +321,10 @@ private:
 
   TxRpcTrace rpc_trace_;
 
-  std::optional<RowEntry> lookup_write_set(const std::string& table_name,
-                                           const std::string& key) const;
-  std::optional<RowEntry> lookup_row_cache(const std::string& table_name,
-                                           const std::string& key) const;
+  const RowEntry* lookup_write_set(const std::string& table_name,
+                                   const std::string& key) const;
+  const RowEntry* lookup_row_cache(const std::string& table_name,
+                                   const std::string& key) const;
   void drop_row_cache(const std::string& table_name,
                        const std::string& key);
   bool key_is_in_range(const std::string& key,

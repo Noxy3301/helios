@@ -726,7 +726,7 @@ int ha_helios::fetch_and_set_current_result(uchar *buf,
     return HA_ERR_KEY_NOT_FOUND;
   }
 
-  std::string primary_key =
+  const std::string &primary_key =
       secondary_index_results_[current_position_in_index_];
 
   tx->choose_table(db_table_name);
