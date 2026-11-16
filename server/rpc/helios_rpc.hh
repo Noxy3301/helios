@@ -40,8 +40,8 @@ struct TableRowCounts {
     void apply_deltas(const T& deltas) {
         std::unique_lock<std::shared_mutex> lock(s_mutex);
         for (const auto& row_delta : deltas) {
-            auto& count = counts[row_delta.table_name()];
-            count += row_delta.delta();
+            auto& count = counts[std::string(row_delta.table)];
+            count += row_delta.delta;
             if (count < 0) count = 0;
         }
     }
@@ -150,9 +150,7 @@ private:
     void handleTxScanIndex(
         const Helios::Protocol::TxScanIndex::Request& request,
         Helios::Protocol::TxScanIndex::Response* response);
-    void handleTxCommit(
-        const Helios::Protocol::TxCommit::Request& request,
-        Helios::Protocol::TxCommit::Response* response);
+    bool handleTxCommit(std::string_view body, std::string& reply);
 
     // Read-plan execution. The reply is the flat HELIOSRP payload, which
     // rides raw after the envelope.

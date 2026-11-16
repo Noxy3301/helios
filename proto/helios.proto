@@ -20,7 +20,7 @@ message Request {
         TxExecuteReadPlan.Request tx_execute_read_plan = 5;
 
         // The one commit of a transaction
-        TxCommit.Request tx_commit = 6;
+        FlatBody tx_commit = 6;
 
         GetTableStats.Request get_table_stats = 7;
         TxExecuteDuckdbQuery.Request tx_execute_duckdb_query = 8;
@@ -49,8 +49,6 @@ message Response {
         TxScanIndex.Response tx_scan_index = 4;
         FlatReadPlanResult tx_execute_read_plan = 5;
 
-        TxCommit.Response tx_commit = 6;
-
         GetTableStats.Response get_table_stats = 7;
         TxExecuteDuckdbQuery.Response tx_execute_duckdb_query = 8;
 
@@ -63,29 +61,6 @@ message Response {
 
     // Why the request was refused before any handler ran.
     string error = 14;
-}
-
-// Why the server refused a transaction, where the query layer has to tell the
-// cause apart from ordinary contention.
-enum AbortReason {
-    ABORT_REASON_UNSPECIFIED = 0;
-    ABORT_REASON_DUPLICATE_PRIMARY_KEY = 1;
-    ABORT_REASON_DUPLICATE_SECONDARY_KEY = 2;
-}
-
-// A range this transaction scanned. The commit re-runs the scan described
-// by the bounds and requires the records it read with the same TID words.
-message RangeReadEntry {
-    string table_name = 1;
-    string index_name = 2; // Empty means primary index.
-    bytes start_key = 3;
-    bytes end_key = 4;
-    uint64 row_limit = 5; // 0 means compare the whole range.
-    bool reverse_scan = 6;
-    // The rows the scan returned, keyed by primary key, and the records it
-    // visited without returning them, each in scan order.
-    repeated RangeRecord rows = 7;
-    repeated RangeRecord visited = 8;
 }
 
 // An index record a range scan visited and the TID word it read.
@@ -240,55 +215,6 @@ message TxExecuteReadPlan {
     }
 }
 
-// The one commit of a transaction: validates every row and range it read,
-// then installs its writes and index changes under the Silo protocol.
-message TxCommit {
-    message ReadEntry {
-        string table_name = 1;
-        bytes key = 2;
-        uint64 tid = 3;  // as returned by the read; an absent row has a TID too
-        // PAX fields the read used, bit min(f, 63) for field f; 0 validates
-        // the whole row
-        uint64 column_mask = 4;
-    }
-    enum RowOp {
-        UPDATE = 0;
-        INSERT = 1;  // refused when the key holds a row
-        DELETE = 2;
-    }
-    message WriteEntry {
-        string table_name = 1;
-        bytes key = 2;
-        bytes value = 3;
-        RowOp op = 4;
-        // PAX fields the write assigned, bit min(f, 63) for field f
-        uint64 column_mask = 5;
-    }
-    message SecondaryIndexEntry {
-        string table_name = 1;
-        string index_name = 2;
-        bytes secondary_key = 3;
-        bytes primary_key = 4;
-        bool is_delete = 5;
-    }
-    message Request {
-        repeated ReadEntry reads = 1;
-        repeated RangeReadEntry range_reads = 2;
-        repeated WriteEntry writes = 3;  // in the order the query layer issued them
-        repeated SecondaryIndexEntry secondary_index_ops = 4;
-        repeated TableRowDelta row_deltas = 5;
-        // Acknowledge at precommit, as the Async contract does, whatever
-        // contract the server runs under
-        bool async_durability = 6;
-    }
-    message Response {
-        bool committed = 1;
-        repeated TableRowCount table_stats = 2;
-        string abort_detail = 3; // Free-form cause, for tracing only.
-        AbortReason abort_reason = 4;
-    }
-}
-
 // Reserves a range of hidden primary keys for a table without a declared one
 message DbAllocateHiddenKeys {
     message Request {
@@ -329,13 +255,7 @@ message DbSetCommitDurability {
     }
 }
 
-// Row-count delta the query layer reports with its commit.
-message TableRowDelta {
-    string table_name = 1;
-    int64 delta = 2;
-}
-
-// Snapshot of a single table's row count, returned with a commit and with the table stats.
+// Snapshot of a single table's row count, returned with the table stats.
 message TableRowCount {
     string table_name = 1;
     int64 row_count = 2;

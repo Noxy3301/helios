@@ -106,16 +106,15 @@ std::vector<HeliosProxy::RangeRecord> take_visited(Response& response) {
     return visited;
 }
 
-// Copies range records into a commit request, which reads key and tid.
-void add_records(
-    google::protobuf::RepeatedPtrField<Helios::Protocol::RangeRecord>* out,
+// Borrows range records for a commit body, which carries key and tid.
+std::vector<helios::rpc::FlatRecord> flat_records(
     const std::vector<HeliosProxy::RangeRecord>& records) {
-    out->Reserve(static_cast<int>(records.size()));
+    std::vector<helios::rpc::FlatRecord> out;
+    out.reserve(records.size());
     for (const auto& record : records) {
-        auto* added = out->Add();
-        added->set_key(record.key);
-        added->set_tid(record.tid);
+        out.push_back({record.key, record.tid});
     }
+    return out;
 }
 
 }  // namespace
@@ -425,94 +424,73 @@ bool HeliosProxy::tx_commit(
         return false;
     }
 
-    Helios::Protocol::Request envelope;
-    auto& request = *envelope.mutable_tx_commit();
-
+    helios::rpc::FlatCommit request;
+    request.reads.reserve(reads.size());
     for (const auto& entry : reads) {
-        auto* read = request.add_reads();
-        read->set_table_name(entry.table_name);
-        read->set_key(entry.key);
-        read->set_tid(entry.tid);
-        read->set_column_mask(entry.column_mask);
+        request.reads.push_back(
+            {entry.table_name, entry.key, entry.tid, entry.column_mask});
     }
 
+    request.ranges.reserve(range_reads.size());
     for (const auto& entry : range_reads) {
-        auto* range = request.add_range_reads();
-        range->set_table_name(entry.table_name);
-        range->set_index_name(entry.index_name);
-        range->set_start_key(entry.start_key);
-        range->set_end_key(entry.end_key);
-        range->set_row_limit(entry.row_limit);
-        range->set_reverse_scan(entry.reverse_scan);
-        add_records(range->mutable_rows(), entry.rows);
-        add_records(range->mutable_visited(), entry.visited);
+        request.ranges.push_back(
+            {entry.table_name, entry.index_name, entry.start_key, entry.end_key,
+             entry.row_limit, entry.reverse_scan, flat_records(entry.rows),
+             flat_records(entry.visited)});
     }
 
     for (const auto& op : ops) {
         switch (op.type) {
-            case WriteOp::Type::Write: {
-                auto* write = request.add_writes();
-                write->set_table_name(op.table_name);
-                write->set_key(op.key);
-                write->set_value(op.value);
-                write->set_op(op.is_insert
-                                  ? Helios::Protocol::TxCommit::INSERT
-                                  : Helios::Protocol::TxCommit::UPDATE);
-                write->set_column_mask(op.column_mask);
+            case WriteOp::Type::Write:
+                request.writes.push_back(
+                    {op.table_name, op.key, op.value,
+                     op.is_insert ? helios::rpc::FlatRowOp::kInsert
+                                  : helios::rpc::FlatRowOp::kUpdate,
+                     op.column_mask});
                 break;
-            }
-            case WriteOp::Type::Delete: {
-                auto* write = request.add_writes();
-                write->set_table_name(op.table_name);
-                write->set_key(op.key);
-                write->set_op(Helios::Protocol::TxCommit::DELETE);
+            case WriteOp::Type::Delete:
+                request.writes.push_back({op.table_name, op.key, {},
+                                          helios::rpc::FlatRowOp::kDelete, 0});
                 break;
-            }
             case WriteOp::Type::SecondaryIndexWrite:
-            case WriteOp::Type::SecondaryIndexDelete: {
-                auto* index_op = request.add_secondary_index_ops();
-                index_op->set_table_name(op.table_name);
-                index_op->set_index_name(op.index_name);
-                index_op->set_secondary_key(op.secondary_key);
-                index_op->set_primary_key(op.primary_key);
-                index_op->set_is_delete(op.type ==
-                                        WriteOp::Type::SecondaryIndexDelete);
+            case WriteOp::Type::SecondaryIndexDelete:
+                request.index_ops.push_back(
+                    {op.table_name, op.index_name, op.secondary_key,
+                     op.primary_key,
+                     op.type == WriteOp::Type::SecondaryIndexDelete});
                 break;
-            }
         }
     }
 
+    request.row_deltas.reserve(row_deltas.size());
     for (const auto& [table, delta] : row_deltas) {
-        auto* rd = request.add_row_deltas();
-        rd->set_table_name(table);
-        rd->set_delta(delta);
+        request.row_deltas.push_back({table, delta});
     }
-    request.set_async_durability(async_durability);
+    request.async_durability = async_durability;
 
-    Helios::Protocol::Response reply;
-    if (!send_request(envelope, reply)) {
+    std::string body;
+    helios::rpc::pack_commit(request, body);
+
+    std::string reply, unused_payload;
+    helios::rpc::FlatCommitReply response;
+    if (!send_flat(helios::rpc::FlatOp::kCommit,
+                   Helios::Protocol::Request::kTxCommit, body, reply,
+                   unused_payload) ||
+        !helios::rpc::unpack_commit_reply(reply, response)) {
         LOG_ERROR("RPC failed: Failed to send commit message to server");
         if (transport_error != nullptr) *transport_error = true;
         return false;
     }
-    const auto& response = reply.tx_commit();
 
     table_stats_cache_.clear();
-    for (const auto& ts : response.table_stats()) {
-        table_stats_cache_[ts.table_name()] = ts.row_count();
+    for (const auto& [table, count] : response.table_stats) {
+        table_stats_cache_[std::string(table)] = count;
     }
-    if (!response.committed()) {
-        if (abort_detail != nullptr) *abort_detail = response.abort_detail();
-        if (duplicate_key != nullptr) {
-            const auto reason = response.abort_reason();
-            *duplicate_key =
-                reason ==
-                    Helios::Protocol::ABORT_REASON_DUPLICATE_PRIMARY_KEY ||
-                reason ==
-                    Helios::Protocol::ABORT_REASON_DUPLICATE_SECONDARY_KEY;
-        }
+    if (!response.committed) {
+        if (abort_detail != nullptr) *abort_detail = response.abort_detail;
+        if (duplicate_key != nullptr) *duplicate_key = response.duplicate_key;
     }
-    return response.committed();
+    return response.committed;
 }
 
 namespace {

@@ -30,6 +30,9 @@ bool HeliosRpc::handle_rpc(const std::string& message,
             case helios::rpc::FlatOp::kBatchRead:
                 ok = handleTxBatchRead(request_payload, result);
                 break;
+            case helios::rpc::FlatOp::kCommit:
+                ok = handleTxCommit(request_payload, result);
+                break;
         }
         db_manager_->get_database()->ReleaseThreadEpoch();
         if (!ok) {
@@ -62,11 +65,6 @@ bool HeliosRpc::handle_rpc(const std::string& message,
                 response.mutable_tx_execute_read_plan();
                 handleTxExecuteReadPlan(request.tx_execute_read_plan(),
                                         &payload);
-                break;
-
-            // The one commit of a transaction
-            case Request::kTxCommit:
-                handleTxCommit(request.tx_commit(), response.mutable_tx_commit());
                 break;
 
             case Request::kGetTableStats:
@@ -108,6 +106,7 @@ bool HeliosRpc::handle_rpc(const std::string& message,
             // These travel flat, so no envelope names them.
             case Request::kTxRead:
             case Request::kTxBatchRead:
+            case Request::kTxCommit:
             case Request::BODY_NOT_SET:
                 SPDLOG_ERROR("Request envelope carries no body");
                 response.set_error("request carries no body");
