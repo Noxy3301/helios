@@ -21,6 +21,8 @@ struct ServerConfig {
     size_t epoch_duration_ms = 40;
     /// The amount of log the server aims to keep, in bytes.
     uint64_t wal_budget_bytes = 64ull << 30;
+    /// Whether the logger writes the log with O_DIRECT.
+    bool wal_direct_io = true;
     /// The contract every commit runs under: "sync" or "async".
     std::string commit_durability = "sync";
     /// DuckDB thread pool size; zero takes a quarter of the hardware threads.

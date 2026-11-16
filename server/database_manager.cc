@@ -12,6 +12,7 @@ DatabaseManager::DatabaseManager() {
     conf.work_dir                   = config().datadir;
     conf.epoch_duration_ms          = config().epoch_duration_ms;
     conf.wal_budget_bytes           = config().wal_budget_bytes;
+    conf.wal_direct_io              = config().wal_direct_io;
     set_commit_durability(config().commit_durability == "async"
                               ? helios::storage::CommitDurability::kAsync
                               : helios::storage::CommitDurability::kSync);
@@ -19,6 +20,7 @@ DatabaseManager::DatabaseManager() {
     // The startup contract on its own line: bench and deploy scripts grep it.
     SPDLOG_INFO("Commit durability: {}", config().commit_durability);
     SPDLOG_INFO("Epoch {} ms", conf.epoch_duration_ms);
+    SPDLOG_INFO("WAL direct I/O: {}", conf.wal_direct_io ? "on" : "off");
     try {
         database_ = std::make_shared<helios::storage::Database>(conf);
     } catch (const std::system_error& err) {

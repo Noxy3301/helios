@@ -85,6 +85,10 @@ void apply_key(const std::string& key, const std::string& value) {
             refuse(key, value,
                    "a positive byte count with an optional K, M or G suffix");
         }
+    } else if (key == "wal_direct_io") {
+        if (!parse_bool(value, &g_config.wal_direct_io)) {
+            refuse(key, value, "0 or 1, true or false, on or off");
+        }
     } else if (key == "commit_durability") {
         if (value != "sync" && value != "async") refuse(key, value, "sync or async");
         g_config.commit_durability = value;

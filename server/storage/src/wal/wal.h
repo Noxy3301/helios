@@ -136,9 +136,11 @@ class Wal {
    * @brief Opens the directory and takes an exclusive lock on it.
    * @details The constructor reads nothing; Scan finds the end of the log.
    * @param[in] segment_bytes A multiple of the filesystem block.
+   * @param[in] direct_io Writes groups to the active segment with O_DIRECT;
+   * the filesystem block must then be a multiple of 4096.
    */
   Wal(const std::string &work_dir, WalIo io = WalIo::Posix(),
-      uint64_t segment_bytes = kWalSegmentBytes);
+      uint64_t segment_bytes = kWalSegmentBytes, bool direct_io = false);
   ~Wal();
 
   Wal(const Wal &) = delete;
@@ -309,6 +311,9 @@ class Wal {
   WalIo io_;
   const uint64_t segment_bytes_;
   const uint64_t spare_target_bytes_;
+  const bool direct_io_;
+  // Holds a group's bytes for an O_DIRECT write, with room to align them.
+  std::vector<uint8_t> direct_buffer_;
   uint64_t block_bytes_{0};
   // Holds the flock for the life of the instance.
   int directory_fd_{-1};

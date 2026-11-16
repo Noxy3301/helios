@@ -52,6 +52,10 @@ constexpr size_t kOffCrc = 30;
 // How many segments the worker keeps ready ahead of the logger.
 constexpr uint64_t kSpareSegments = 2;
 
+// Alignment of the offset, length and buffer of an O_DIRECT write; it covers
+// the 512 and 4096-byte logical blocks NVMe devices report.
+constexpr uint64_t kDirectIoAlignment = 4096;
+
 // The header bytes the checksum covers: all of them but the checksum word,
 // which sits last.
 constexpr size_t kCrcCoverage = Wal::kHeaderSize - sizeof(uint32_t);
@@ -119,6 +123,15 @@ void PutCheckedRecord(uint8_t *out, RecordType type, uint64_t segment_number,
   crc.Update(out, kCrcCoverage);
   crc.Update(payload, payload_size);
   PutLe32(out + kOffCrc, crc.Finish());
+}
+
+bool SetDirectIo(int fd, int &error) {
+  const int flags = ::fcntl(fd, F_GETFL);
+  if (flags < 0 || ::fcntl(fd, F_SETFL, flags | O_DIRECT) != 0) {
+    error = errno;
+    return false;
+  }
+  return true;
 }
 
 int Fsync(int fd) {
@@ -228,10 +241,12 @@ std::string Wal::TemporaryPath(uint64_t segment_number) const {
   return directory_ + name;
 }
 
-Wal::Wal(const std::string &work_dir, WalIo io, uint64_t segment_bytes)
+Wal::Wal(const std::string &work_dir, WalIo io, uint64_t segment_bytes,
+         bool direct_io)
     : io_(std::move(io)),
       segment_bytes_(segment_bytes),
-      spare_target_bytes_(kSpareSegments * segment_bytes) {
+      spare_target_bytes_(kSpareSegments * segment_bytes),
+      direct_io_(direct_io) {
   // Resolve the path and create the directory.
   // Strip a trailing separator first; parent_path() below must name the
   // true parent, not the directory itself.
@@ -284,6 +299,12 @@ Wal::Wal(const std::string &work_dir, WalIo io, uint64_t segment_bytes)
     ::close(directory_fd_);
     directory_fd_ = -1;
     throw std::invalid_argument("segment size");
+  }
+  // Groups start and end on blocks, which O_DIRECT then sees aligned.
+  if (direct_io_ && block_bytes_ % kDirectIoAlignment != 0) {
+    ::close(directory_fd_);
+    directory_fd_ = -1;
+    throw std::invalid_argument("filesystem block for O_DIRECT");
   }
 }
 
@@ -577,6 +598,11 @@ WalScanResult Wal::FinishScan(WalScanResult &&result, bool fresh,
       return IoFailure("prepare the first segment of " + directory_, error);
     }
     active_.fd = active.fd;
+  }
+  // The repairs above went through the page cache; appends bypass it.
+  if (direct_io_ && !SetDirectIo(active.fd, error)) {
+    return IoFailure("set O_DIRECT on " + SegmentPath(active.segment_number),
+                     error);
   }
   if (!Prepare(false, error)) {
     return IoFailure("prepare a segment of " + directory_, error);
@@ -926,6 +952,27 @@ bool Wal::WriteAndSync(std::vector<iovec> &iov, uint64_t offset, int &error) {
   auto &trace = FlushTrace::Instance();
   const bool traced = trace.Enabled();
   const int64_t write_begin = traced ? FlushTrace::Now() : 0;
+  // O_DIRECT takes the group as one aligned buffer. Zeroes pad it to a
+  // multiple of the alignment, which only an end record leaves short.
+  if (direct_io_) {
+    size_t size = 0;
+    for (const iovec &part : iov) size += part.iov_len;
+    const size_t padded = (size + kDirectIoAlignment - 1) & -kDirectIoAlignment;
+    if (direct_buffer_.size() < padded + kDirectIoAlignment) {
+      direct_buffer_.resize(padded + kDirectIoAlignment);
+    }
+    auto *buffer = reinterpret_cast<uint8_t *>(
+        (reinterpret_cast<uintptr_t>(direct_buffer_.data()) +
+         kDirectIoAlignment - 1) &
+        -kDirectIoAlignment);
+    uint8_t *out = buffer;
+    for (const iovec &part : iov) {
+      std::memcpy(out, part.iov_base, part.iov_len);
+      out += part.iov_len;
+    }
+    std::memset(out, 0, padded - size);
+    iov.assign(1, {buffer, padded});
+  }
   if (!WriteAllAt(iov, static_cast<off_t>(offset), error)) return false;
   if (traced) trace.GroupWrite(write_begin, FlushTrace::Now());
   // The records are written but not yet known durable: a Sync commit
@@ -945,6 +992,10 @@ bool Wal::WriteAndSync(std::vector<iovec> &iov, uint64_t offset, int &error) {
 bool Wal::Rotate(std::vector<iovec> &iov, size_t group_size, int &error) {
   Segment next;
   if (!AcquireReady(next, error)) return false;
+  if (direct_io_ && !SetDirectIo(next.fd, error)) {
+    ::close(next.fd);
+    return false;
+  }
   HELIOS_DEBUG_SYNC("wal.rotate.before_end_record");
 
   uint8_t end_record[kHeaderSize];

@@ -868,6 +868,138 @@ TEST_F(WalSegmentTest, MissingRecoveryMaterialFailsRecovery) {
   }
 }
 
+// A pwritev that checks what O_DIRECT requires of each group write.
+WalIo DirectIo() {
+  WalIo io = WalIo::Posix();
+  io.pwritev = [](int fd, const iovec *iov, int count, off_t offset) {
+    EXPECT_NE(::fcntl(fd, F_GETFL) & O_DIRECT, 0);
+    EXPECT_EQ(count, 1);
+    EXPECT_EQ(reinterpret_cast<uintptr_t>(iov[0].iov_base) % kBlock, 0u);
+    EXPECT_EQ(iov[0].iov_len % kBlock, 0u);
+    EXPECT_EQ(static_cast<uint64_t>(offset) % kBlock, 0u);
+    return ::pwritev(fd, iov, count, offset);
+  };
+  return io;
+}
+
+// Appends groups of two epochs whose sizes are not multiples of the block.
+void AppendUnevenGroups(Wal &wal, int groups, EpochNumber &epoch,
+                        std::vector<EpochNumber> &acknowledged,
+                        std::vector<std::string> &keys) {
+  for (int i = 0; i < groups; ++i) {
+    std::map<EpochNumber, PackedLogRecords> buckets;
+    for (int j = 0; j < 2; ++j) {
+      ++epoch;
+      const std::string key(epoch * 1237 % 9000 + 1, 'a' + epoch % 26);
+      buckets[epoch] = {MakeRecord(epoch, key)};
+      acknowledged.push_back(epoch);
+      keys.push_back(key);
+    }
+    ASSERT_TRUE(wal.AppendGroup(buckets, epoch).ok);
+  }
+}
+
+// Such groups, across rotations and a restart, all come back.
+TEST_F(WalSegmentTest, DirectWritesRecoverGroupsOfAnySize) {
+  const std::string dir = Dir("live");
+  std::vector<EpochNumber> acknowledged;
+  std::vector<std::string> keys;
+  EpochNumber epoch = 0;
+  {
+    Wal wal(dir, DirectIo(), kSegment, true);
+    ASSERT_EQ(wal.Scan().status, WalScanResult::Status::kOk);
+    AppendUnevenGroups(wal, 20, epoch, acknowledged, keys);
+    EXPECT_GT(wal.active_segment(), 2u);
+  }
+  {
+    Wal wal(dir, DirectIo(), kSegment, true);
+    const auto recovered = Recover(wal);
+    ASSERT_EQ(recovered.scan.status, WalScanResult::Status::kOk);
+    EXPECT_EQ(recovered.epochs, acknowledged);
+    AppendUnevenGroups(wal, 3, epoch, acknowledged, keys);
+  }
+  Wal wal(dir, WalIo::Posix(), kSegment);
+  const auto recovered = Recover(wal);
+  ASSERT_EQ(recovered.scan.status, WalScanResult::Status::kOk);
+  EXPECT_EQ(recovered.epochs, acknowledged);
+  EXPECT_EQ(recovered.keys, keys);
+}
+
+// A group that ends exactly on a block needs no padding, and the next group
+// starts on the following block.
+TEST_F(WalSegmentTest, DirectWritesRecoverAGroupEndingOnABlock) {
+  const std::string dir = Dir("live");
+  // The key that makes a one-record frame exactly one block.
+  std::string exact;
+  for (size_t size = 1; size < kBlock && exact.empty(); ++size) {
+    const std::string key(size, 'b');
+    if (Wal::kHeaderSize + 1 + MakeRecord(1, key).bytes.size() == kBlock) {
+      exact = key;
+    }
+  }
+  ASSERT_FALSE(exact.empty());
+
+  {
+    Wal wal(dir, DirectIo(), kSegment, true);
+    ASSERT_EQ(wal.Scan().status, WalScanResult::Status::kOk);
+    const uint64_t before = wal.write_offset();
+    std::map<EpochNumber, PackedLogRecords> buckets;
+    buckets[1] = {MakeRecord(1, exact)};
+    ASSERT_TRUE(wal.AppendGroup(buckets, 1).ok);
+    EXPECT_EQ(wal.write_offset(), before + kBlock);
+    buckets.clear();
+    buckets[2] = {MakeRecord(2, "next")};
+    ASSERT_TRUE(wal.AppendGroup(buckets, 2).ok);
+  }
+  Wal wal(dir, WalIo::Posix(), kSegment);
+  const auto recovered = Recover(wal);
+  ASSERT_EQ(recovered.scan.status, WalScanResult::Status::kOk);
+  EXPECT_EQ(recovered.epochs, (std::vector<EpochNumber>{1, 2}));
+  EXPECT_EQ(recovered.keys, (std::vector<std::string>{exact, "next"}));
+}
+
+// Direct writes into a recycled segment leave its old frames behind the log's
+// end, and recovery replays none of them.
+TEST_F(WalSegmentTest, DirectWritesIntoARecycledSegmentReplayNoOldFrame) {
+  const std::string dir = Dir("live");
+  std::vector<EpochNumber> ignored;
+  std::vector<EpochNumber> retained;
+  EpochNumber epoch = 0;
+  WalPosition start;
+  uint64_t recycled_number = 0;
+  uint64_t live_tail = 0;
+  {
+    Wal wal(dir, DirectIo(), kSegment, true);
+    ASSERT_EQ(wal.Scan().status, WalScanResult::Status::kOk);
+    FillSegment(wal, epoch, ignored);
+    Append(wal, ++epoch, ignored);
+    start = wal.durable_end();
+    wal.MarkCovered(start.segment_number);
+    ASSERT_TRUE(wal.PrepareSegment());
+    recycled_number = wal.active_segment() + 1;
+    EXPECT_FALSE(fs::exists(SegmentPath(dir, 1)));
+
+    FillSegment(wal, epoch, retained);
+    Append(wal, ++epoch, retained);
+    ASSERT_EQ(wal.active_segment(), recycled_number);
+    live_tail = wal.write_offset();
+  }
+
+  // The block after the log's end still holds a frame of segment 1.
+  const auto bytes = ReadFile(SegmentPath(dir, recycled_number));
+  uint32_t magic = 0;
+  uint64_t number = 0;
+  std::memcpy(&magic, bytes.data() + live_tail, 4);
+  std::memcpy(&number, bytes.data() + live_tail + 6, 8);
+  ASSERT_EQ(magic, Wal::kMagic);
+  ASSERT_EQ(number, 1u);
+
+  Wal wal(dir, WalIo::Posix(), kSegment);
+  const auto recovered = Recover(wal, start);
+  ASSERT_EQ(recovered.scan.status, WalScanResult::Status::kOk);
+  EXPECT_EQ(recovered.epochs, retained);
+}
+
 class WalRecyclingTest : public WalSegmentTest {
  protected:
   helios::storage::Config MakeConfig(const std::string &dir) const {
