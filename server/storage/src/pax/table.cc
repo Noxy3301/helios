@@ -281,7 +281,6 @@ PaxGroup *PaxTable::add_group(uint32_t cls) {
                            static_cast<uint32_t>(idx), cls);
   dir_[idx].store(grp, std::memory_order_release);
   group_count_.store(idx + 1, std::memory_order_release);
-  classes_[cls].groups.fetch_add(1, std::memory_order_relaxed);
   return grp;
 }
 
@@ -294,6 +293,7 @@ std::pair<PaxGroup *, uint32_t> PaxTable::allocate(uint32_t cls,
     std::lock_guard<std::mutex> lk(t.mutex);
     if (t.groups.load(std::memory_order_relaxed) == 0) {
       PaxGroup *grp = add_group(top);
+      t.groups.fetch_add(1, std::memory_order_relaxed);
       t.slot.store(uint64_t{grp->index()} << 32, std::memory_order_release);
     }
   }
@@ -306,24 +306,51 @@ std::pair<PaxGroup *, uint32_t> PaxTable::allocate(uint32_t cls,
     if (static_cast<uint32_t>(w) < PaxGroup::kRows)
       return {group(w >> 32), static_cast<uint32_t>(w)};
 
-    std::lock_guard<std::mutex> lk(c.mutex);
-    // A group installed since the fetch_add has fresh slots left.
-    const uint64_t cur = c.slot.load(std::memory_order_relaxed);
-    if (static_cast<uint32_t>(cur) < PaxGroup::kRows) continue;
-    // Pull the slot back to kRows so misses cannot carry into the index.
-    c.slot.store(cur >> 32 << 32 | PaxGroup::kRows, std::memory_order_relaxed);
+    PaxGroup *grp;
+    {
+      std::lock_guard<std::mutex> lk(c.mutex);
+      // A group installed since the fetch_add has fresh slots left.
+      const uint64_t cur = c.slot.load(std::memory_order_relaxed);
+      if (static_cast<uint32_t>(cur) < PaxGroup::kRows) continue;
+      // Pull the slot back to kRows so misses cannot carry into the index.
+      c.slot.store(cur >> 32 << 32 | PaxGroup::kRows,
+                   std::memory_order_relaxed);
 
-    // Checked against this commit's epoch, which is within one of the global
-    // epoch.
-    if (!c.retired.empty() && c.retired.front().first + 2 <= epoch) {
-      const auto slot = c.retired.front().second;
-      c.retired.pop_front();
-      return slot;
+      // Checked against this commit's epoch, which is within one of the
+      // global epoch.
+      if (!c.retired.empty() && c.retired.front().first + 2 <= epoch) {
+        const auto slot = c.retired.front().second;
+        c.retired.pop_front();
+        return slot;
+      }
+      grp = c.spare.exchange(nullptr);
+      if (grp == nullptr) grp = add_group(cls);
+      if (grp == nullptr) return {nullptr, 0};
+      c.groups.fetch_add(1, std::memory_order_relaxed);
+      c.slot.store(uint64_t{grp->index()} << 32 | 1, std::memory_order_release);
     }
-    PaxGroup *grp = add_group(cls);
-    if (grp == nullptr) return {nullptr, 0};
-    c.slot.store(uint64_t{grp->index()} << 32 | 1, std::memory_order_release);
+
+    // A class on its first group gets no spare, so a sparse class holds one.
+    if (c.groups.load(std::memory_order_relaxed) > 1)
+      spare_wanted_.store(true);
     return {grp, 0};
+  }
+}
+
+void PaxTable::BuildSpares() {
+  if (!spare_wanted_.exchange(false)) return;
+  for (uint32_t cls = 0; cls < class_bytes_.size(); cls++) {
+    SizeClass &c = classes_[cls];
+    // One builder a class at a time.
+    bool idle = false;
+    if (c.groups.load(std::memory_order_relaxed) <= 1 ||
+        c.spare.load() != nullptr ||
+        !c.building.compare_exchange_strong(idle, true))
+      continue;
+    if (c.spare.load() == nullptr) c.spare.store(add_group(cls));
+    c.building.store(false);
+    // A spare taken before `building` cleared left its request unserved.
+    if (c.spare.load() == nullptr) spare_wanted_.store(true);
   }
 }
 
@@ -348,7 +375,7 @@ void PaxTable::Retire(PaxGroup *group, uint32_t slot, EpochNumber epoch) {
 }
 
 uint64_t PaxTable::slots_allocated() const {
-  // Every earlier group of a class was filled before the next was added.
+  // Every earlier group of a class was filled before the next was installed.
   uint64_t n = 0;
   for (size_t i = 0; i < class_bytes_.size(); i++) {
     const uint64_t w = classes_[i].slot.load(std::memory_order_acquire);

@@ -18,6 +18,7 @@
 #include "helios/index.h"
 
 #include "index/index_record.h"
+#include "index/reaper.h"
 #include "pax/table.h"
 #include "silo/tidword.h"
 #include "util/epoch.h"
@@ -74,7 +75,6 @@ class Framework;
 
 namespace index {
 class MasstreeIndex;
-class Reaper;
 }  // namespace index
 
 namespace wal {
@@ -300,6 +300,8 @@ class Transaction {
   std::vector<ReadEntry> read_set_;
   std::vector<RangeEntry> range_set_;
   std::map<IndexRecord *, WriteEntry> write_set_;  // Locked in pointer order.
+  // Records this commit emptied, handed to the reaper once after install.
+  std::vector<index::Reaper::Tombstone> tombstones_;
 
   /**
    * @brief Reports whether this attempt holds the record's lock.
@@ -398,7 +400,7 @@ class Transaction {
 
   /**
    * @brief Publishes the TID Apply returned, which unlocks the record, and
-   * queues it when it holds nothing.
+   * adds it to tombstones_ when it holds nothing.
    *
    * @pre Apply and AppendLog completed for this record.
    */

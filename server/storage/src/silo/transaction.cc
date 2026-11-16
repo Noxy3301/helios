@@ -321,6 +321,11 @@ bool Transaction::Commit(CommitDurability durability, std::string &reason,
     Publish(*item, entry, published);
     row_applied = row_applied || is_row;
   }
+  // Queue the tombstones while still joined to the commit epoch.
+  if (!tombstones_.empty()) {
+    reaper_.Enqueue(tombstones_);
+    tombstones_.clear();
+  }
 
   // Buffer the record before leaving, so a flush cannot pass this commit.
   const bool logged = log_writes != 0;
@@ -328,14 +333,19 @@ bool Transaction::Commit(CommitDurability durability, std::string &reason,
   epoch_.Leave();
   // A read-only Sync commit waits too, so it acknowledges only durable data.
   const bool awaits = durability == CommitDurability::kSync;
-  if (await_epoch != nullptr) {
-    if (awaits) {
-      *await_epoch = commit_tid.epoch;
-      // The caller's wait comes later, so ask for this epoch's close now.
-      epoch_.RequestEpochAdvance(commit_tid.epoch + 2);
-    }
-    return true;
+  if (await_epoch != nullptr && awaits) {
+    *await_epoch = commit_tid.epoch;
+    // The caller's wait comes later, so ask for this epoch's close now.
+    epoch_.RequestEpochAdvance(commit_tid.epoch + 2);
   }
+  // Build spare groups after leaving, so a build does not hold back epoch
+  // advancement.
+  for (const auto &[item, entry] : write_set_) {
+    const auto *row = std::get_if<RowUpdate>(&entry.update);
+    if (row == nullptr || row->op == RowOp::kDelete) continue;
+    if (row->store->spare_wanted()) row->store->BuildSpares();
+  }
+  if (await_epoch != nullptr) return true;
   // Leave before waiting, so this worker does not hold back epoch advancement.
   logger_.AwaitCommitDurability(commit_tid.epoch, awaits);
   return true;
@@ -654,10 +664,11 @@ void Transaction::Publish(IndexRecord &item, WriteEntry &entry,
   // A non-unique index record sits under its tree key.
   const auto *index = std::get_if<IndexUpdate>(&entry.update);
   if (index == nullptr || index->constraint == IndexConstraint::kUnique) {
-    reaper_.Enqueue(*entry.index, entry.key, item, published);
+    tombstones_.push_back(
+        {entry.index, std::string(entry.key), &item, published});
     return;
   }
-  reaper_.Enqueue(*entry.index, index->tree_key, item, published);
+  tombstones_.push_back({entry.index, index->tree_key, &item, published});
 }
 
 }  // namespace silo
