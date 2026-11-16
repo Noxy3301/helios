@@ -170,11 +170,7 @@ bool HeliosRpc::handleTxCommit(std::string_view body, std::string& reply) {
         row_counts_->apply_deltas(request.row_deltas);
     }
 
-    const auto counts = row_counts_->snapshot();
-    response.table_stats.reserve(counts.size());
-    for (const auto& [name, count] : counts) {
-        response.table_stats.emplace_back(name, count);
-    }
+    row_counts_->append_to(response.table_stats);
     helios::rpc::pack_commit_reply(response, reply);
     return true;
 }

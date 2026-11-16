@@ -3,6 +3,8 @@
 // token and hidden-key allocator they use.
 #pragma once
 
+#include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <string>
 #include <string_view>
@@ -32,18 +34,36 @@ void add_visited(Reply* reply,
 }
 
 // Server-wide table row count tracker, shared across all connections.
+// s_mutex guards only the set of tables, whose entries are never removed;
+// each count is updated atomically.
 struct TableRowCounts {
     std::shared_mutex s_mutex;
-    std::unordered_map<std::string, int64_t> counts;
+    std::unordered_map<std::string, std::atomic<int64_t>> counts;
+
+    // Adds delta to count, clamping the result at zero.
+    static void add(std::atomic<int64_t>& count, int64_t delta) {
+        int64_t old = count.load();
+        while (!count.compare_exchange_weak(
+            old, std::max<int64_t>(0, old + delta))) {
+        }
+    }
 
     template <typename T>
     void apply_deltas(const T& deltas) {
-        std::unique_lock<std::shared_mutex> lock(s_mutex);
-        for (const auto& row_delta : deltas) {
-            auto& count = counts[std::string(row_delta.table)];
-            count += row_delta.delta;
-            if (count < 0) count = 0;
+        std::shared_lock<std::shared_mutex> shared(s_mutex);
+        auto delta = deltas.begin();
+        for (; delta != deltas.end(); ++delta) {
+            const auto known = counts.find(std::string(delta->table));
+            if (known == counts.end()) break;
+            add(known->second, delta->delta);
         }
+        if (delta == deltas.end()) return;
+        // A table without an entry: add it and the rest under the unique lock.
+        shared.unlock();
+        std::unique_lock<std::shared_mutex> lock(s_mutex);
+        for (; delta != deltas.end(); ++delta)
+            add(counts.try_emplace(std::string(delta->table), 0).first->second,
+                delta->delta);
     }
 
     // Starts the counts from the rows recovery restored, before any connection
@@ -51,12 +71,26 @@ struct TableRowCounts {
     void seed(const std::unordered_map<std::string, uint64_t>& rows) {
         std::unique_lock<std::shared_mutex> lock(s_mutex);
         for (const auto& [name, count] : rows)
-            counts[name] = static_cast<int64_t>(count);
+            counts.try_emplace(name, 0).first->second.store(
+                static_cast<int64_t>(count));
+    }
+
+    // Appends (name, count) for every table to out. The names stay valid
+    // after the call: they are the map's keys.
+    template <typename Out>
+    void append_to(Out& out) {
+        std::shared_lock<std::shared_mutex> lock(s_mutex);
+        out.reserve(out.size() + counts.size());
+        for (const auto& [name, count] : counts)
+            out.emplace_back(name, count.load());
     }
 
     std::unordered_map<std::string, int64_t> snapshot() {
         std::shared_lock<std::shared_mutex> lock(s_mutex);
-        return counts;
+        std::unordered_map<std::string, int64_t> out;
+        for (const auto& [name, count] : counts)
+            out.emplace(name, count.load());
+        return out;
     }
 };
 
