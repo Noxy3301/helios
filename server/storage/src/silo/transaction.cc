@@ -331,12 +331,18 @@ bool Transaction::Commit(CommitDurability durability, std::string &reason,
   const bool logged = log_writes != 0;
   if (logged) logger_.Enqueue(std::move(record));
   epoch_.Leave();
-  // A read-only Sync commit waits too, so it acknowledges only durable data.
-  const bool awaits = durability == CommitDurability::kSync;
+  // A read-only Sync commit waits for the newest version it validated; a
+  // missing record needs no wait, as the reaper purges only durable deletes.
+  EpochNumber required_epoch = commit_tid.epoch;
+  bool awaits = durability == CommitDurability::kSync;
+  if (write_set_.empty()) {
+    required_epoch = max_tid.epoch;
+    awaits = awaits && required_epoch > logger_.GetDurableEpoch();
+  }
   if (await_epoch != nullptr && awaits) {
-    *await_epoch = commit_tid.epoch;
+    *await_epoch = required_epoch;
     // The caller's wait comes later, so ask for this epoch's close now.
-    epoch_.RequestEpochAdvance(commit_tid.epoch + 2);
+    epoch_.RequestEpochAdvance(required_epoch + 2);
   }
   // Build spare groups after leaving, so a build does not hold back epoch
   // advancement.
@@ -347,7 +353,7 @@ bool Transaction::Commit(CommitDurability durability, std::string &reason,
   }
   if (await_epoch != nullptr) return true;
   // Leave before waiting, so this worker does not hold back epoch advancement.
-  logger_.AwaitCommitDurability(commit_tid.epoch, awaits);
+  logger_.AwaitCommitDurability(required_epoch, awaits);
   return true;
 }
 
