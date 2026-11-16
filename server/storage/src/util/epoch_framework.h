@@ -184,6 +184,8 @@ class Framework {
   // a refused attempt is retried shortly. No-op beyond the high-water mark.
   void RequestEpochAdvance(EpochNumber target) {
     if (target > kEpochHighWater) return;
+    // Return without the mutex when a pending request already covers `target`.
+    if (target <= requested_epoch_.load()) return;
     {
       std::lock_guard<std::mutex> lk(epoch_mutex_);
       // A pending request at or above `target` already covers it.
@@ -324,8 +326,8 @@ class Framework {
 
   std::atomic<bool> start_;
   std::atomic<bool> stop_;
-  // The epoch a pending request asks for; guarded by epoch_mutex_.
-  EpochNumber requested_epoch_{0};
+  // The epoch a pending request asks for; written under epoch_mutex_.
+  std::atomic<EpochNumber> requested_epoch_{0};
   // `E`: the global epoch shared by all participants.
   std::atomic<EpochNumber> global_epoch_;
   std::mutex epoch_mutex_;

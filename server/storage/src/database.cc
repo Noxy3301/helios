@@ -29,6 +29,7 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include "helios/config.h"
@@ -162,9 +163,14 @@ void replay_keys(TableDictionary &tables, const wal::LogRecords &records,
  * @brief Installs the rows of one batch whose words replay_keys kept.
  *
  * @details A row takes its value from the first write carrying the kept word,
- * and a slot of the size class that value needs.
+ * and a slot of the size class that value needs. A key's row is installed
+ * once, and replay_keys has already removed every deleted key, so each
+ * install is one live row of its table.
+ *
+ * @param[in,out] installed Raised by one per row installed, per table.
  */
-void replay_rows(TableDictionary &tables, const wal::LogRecords &records) {
+void replay_rows(TableDictionary &tables, const wal::LogRecords &records,
+                 std::unordered_map<Table *, uint64_t> &installed) {
   for (const auto &record : records) {
     for (const auto &write : record.writes) {
       if (!write.index_name.empty()) continue;
@@ -194,6 +200,7 @@ void replay_rows(TableDictionary &tables, const wal::LogRecords &records) {
         exit(EXIT_FAILURE);
       }
       item->InstallRow(row, tid.epoch);
+      ++installed[table];
     }
   }
 }
@@ -311,6 +318,11 @@ Database::~Database() noexcept {
 }
 
 const Config &Database::GetConfig() const noexcept { return config_; }
+
+const std::unordered_map<std::string, uint64_t> &
+Database::recovered_row_counts() const noexcept {
+  return recovered_row_counts_;
+}
 
 std::function<void(EpochNumber)> Database::MakeEpochHook() {
   // The epoch thread calls this with the global epoch it just published.
@@ -450,12 +462,13 @@ void Database::Recover() {
   // The first pass leaves each primary key's newest word and every secondary
   // entry in the indexes; the second installs only the rows that won.
   EpochNumber highest_epoch = 1;
+  std::unordered_map<Table *, uint64_t> installed;
   const auto recovered =
       logger_.Recover({[this, &highest_epoch](const wal::LogRecords &records) {
                          replay_keys(table_dictionary_, records, highest_epoch);
                        },
-                       [this](const wal::LogRecords &records) {
-                         replay_rows(table_dictionary_, records);
+                       [this, &installed](const wal::LogRecords &records) {
+                         replay_rows(table_dictionary_, records, installed);
                        }});
   if (recovered.status != wal::Logger::RecoveryStatus::kOk) {
     SPDLOG_CRITICAL(
@@ -469,7 +482,13 @@ void Database::Recover() {
       ResumeEpochAbove(std::max(highest_epoch, recovered.durable_epoch));
   SPDLOG_DEBUG("  Global epoch is resumed from {0}", resumed_epoch);
   epoch_framework_.SetGlobalEpoch(resumed_epoch);
-  SPDLOG_INFO("Finish recovery process");
+  uint64_t total = 0;
+  for (const auto &[table, rows] : installed) {
+    recovered_row_counts_.emplace(table->Name(), rows);
+    total += rows;
+  }
+  SPDLOG_INFO("Finish recovery process: {} rows in {} tables", total,
+              installed.size());
 }
 
 }  // namespace helios::storage

@@ -10,7 +10,7 @@ public:
     DatabaseManager();
     ~DatabaseManager() = default;
 
-    std::shared_ptr<helios::storage::Database> get_database() const { return database_; }
+    const std::shared_ptr<helios::storage::Database>& get_database() const { return database_; }
 
     // The mode a commit runs under unless its request asks for Async;
     // db_set_commit_durability moves it.

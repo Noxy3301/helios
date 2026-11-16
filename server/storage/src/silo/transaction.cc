@@ -424,7 +424,7 @@ bool Transaction::ValidateReads(Tidword &max_tid, std::string &reason) {
         item ? item->transaction_id.load() : Tidword::Absent();
     // Only our own lock may differ from the word the read observed.
     Tidword expected = read.tid;
-    if (item != nullptr && OwnsLock(item)) expected.lock = true;
+    if (current.lock && item != nullptr && OwnsLock(item)) expected.lock = true;
     if (current != expected) {
       // A masked read outlives a moved word only on a live row nobody locks.
       const bool maskable =

@@ -316,4 +316,50 @@ TEST_F(RecoveryTest, EarlyPublicationKeepsTheOriginalWalValue) {
   EXPECT_TRUE(found_later);
 }
 
+// The server seeds its per-table row counts from this, so it has to be the
+// number of live rows, whatever mix of checkpoint and log they came from.
+TEST_F(RecoveryTest, RecoveredRowCountsAreTheLiveRows) {
+  constexpr const char *kOther = "recovery_test_other";
+  constexpr const char *kEmptied = "recovery_test_emptied";
+  {
+    helios::storage::Database db(MakeConfig(Recovery::kOff));
+    ASSERT_TRUE(TestHelper::CreateTable(db, kTable));
+    ASSERT_TRUE(TestHelper::CreateTable(db, kOther));
+    ASSERT_TRUE(TestHelper::CreateTable(db, kEmptied));
+    // No table was replayed, so none has a count.
+    EXPECT_TRUE(db.recovered_row_counts().empty());
+    for (const char *key : {"k1", "k2", "k3", "k4", "k5"})
+      ASSERT_TRUE(CommitWrite(db, key, "v1"));
+    ASSERT_TRUE(CommitWrite(db, "k2", "v2"));
+    ASSERT_TRUE(TestHelper::Delete(db, kTable, "k3"));
+    ASSERT_TRUE(TestHelper::Write(db, kOther, "a", "x"));
+    ASSERT_TRUE(TestHelper::Write(db, kEmptied, "a", "x"));
+    ASSERT_TRUE(db.WriteCheckpoint());
+    // After the checkpoint: one insert, one delete of a checkpointed row, an
+    // update of one, and a row inserted and deleted again.
+    ASSERT_TRUE(CommitWrite(db, "k6", "v1"));
+    ASSERT_TRUE(TestHelper::Delete(db, kTable, "k1"));
+    ASSERT_TRUE(CommitWrite(db, "k4", "v2"));
+    ASSERT_TRUE(CommitWrite(db, "k7", "v1"));
+    ASSERT_TRUE(TestHelper::Delete(db, kTable, "k7"));
+    ASSERT_TRUE(TestHelper::Write(db, kOther, "b", "y"));
+    ASSERT_TRUE(TestHelper::Delete(db, kEmptied, "a"));
+  }
+
+  {
+    helios::storage::Database db(MakeConfig(Recovery::kOn));
+    const auto &counts = db.recovered_row_counts();
+    // k2, k4, k5, k6
+    ASSERT_EQ(counts.count(kTable), 1u);
+    EXPECT_EQ(counts.at(kTable), 4u);
+    ASSERT_EQ(counts.count(kOther), 1u);
+    EXPECT_EQ(counts.at(kOther), 2u);
+    EXPECT_EQ(counts.count(kEmptied), 0u);
+    EXPECT_EQ(TestHelper::Scan(db, kTable, "", TestHelper::kMaxKey).size(), 4u);
+    // The counts are what recovery found; commits after it do not move them.
+    ASSERT_TRUE(CommitWrite(db, "k8", "v1"));
+    EXPECT_EQ(db.recovered_row_counts().at(kTable), 4u);
+  }
+}
+
 }  // namespace
