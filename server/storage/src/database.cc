@@ -211,6 +211,11 @@ Database::Database() : Database(Config()) {}
 
 void Database::ReleaseThreadEpoch() { index::release_thread_epoch(); }
 
+EpochNumber Database::await_durable(EpochNumber epoch) {
+  logger_.AwaitCommitDurability(epoch, true);
+  return logger_.GetDurableEpoch();
+}
+
 bool Database::HasTable(const std::string_view table_name) {
   return GetTable(table_name) != nullptr;
 }

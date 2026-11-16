@@ -211,8 +211,10 @@ bool Transaction::IndexWrite(std::string_view table_name,
   return true;
 }
 
-bool Transaction::Commit(CommitDurability durability, std::string &reason) {
+bool Transaction::Commit(CommitDurability durability, std::string &reason,
+                         EpochNumber *await_epoch) {
   reason.clear();
+  if (await_epoch != nullptr) *await_epoch = 0;
   // A range without its end bound cannot be revalidated; refuse before
   // locking.
   for (const auto &range : range_set_) {
@@ -324,9 +326,18 @@ bool Transaction::Commit(CommitDurability durability, std::string &reason) {
   const bool logged = log_writes != 0;
   if (logged) logger_.Enqueue(std::move(record));
   epoch_.Leave();
+  // A read-only Sync commit waits too, so it acknowledges only durable data.
+  const bool awaits = durability == CommitDurability::kSync;
+  if (await_epoch != nullptr) {
+    if (awaits) {
+      *await_epoch = commit_tid.epoch;
+      // The caller's wait comes later, so ask for this epoch's close now.
+      epoch_.RequestEpochAdvance(commit_tid.epoch + 2);
+    }
+    return true;
+  }
   // Leave before waiting, so this worker does not hold back epoch advancement.
-  logger_.AwaitCommitDurability(commit_tid.epoch,
-                                durability == CommitDurability::kSync);
+  logger_.AwaitCommitDurability(commit_tid.epoch, awaits);
   return true;
 }
 

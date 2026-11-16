@@ -53,6 +53,23 @@ bool logged(const std::string &work_dir, const std::string &key) {
 // at static initialization, before any case runs.
 [[maybe_unused]] const bool kSyncFacilityArmed =
     (keep_sync_facility_armed(), true);
+
+// Commits one write, or nothing when `key` is empty, and returns the await
+// epoch Commit stored; 99 marks an attempt that left it unset.
+helios::storage::EpochNumber await_epoch_of(
+    helios::storage::Database &db, const std::string &key,
+    helios::storage::RowOp op, helios::storage::CommitDurability durability,
+    bool committed) {
+  helios::storage::silo::Transaction tx(db);
+  std::string reason;
+  if (!key.empty()) {
+    EXPECT_TRUE(tx.Write(kTable, key, TestHelper::Row("v"), op, reason));
+  }
+  helios::storage::EpochNumber epoch = 99;
+  EXPECT_EQ(tx.Commit(durability, reason, &epoch), committed) << reason;
+  db.ReleaseThreadEpoch();
+  return epoch;
+}
 }  // namespace
 
 class DurabilityTest : public ::testing::Test {
@@ -237,6 +254,58 @@ TEST(CommitDurabilityTest, SyncReadViewWaitsForTheSnapshotEpoch) {
     const auto opened = view.get();
     EXPECT_TRUE(opened.valid) << opened.error;
     if (opened.valid) db.ClosePaxView(opened);
+  }
+  std::filesystem::remove_all(config.work_dir);
+}
+
+// With an await epoch a Sync commit, read-only or not, returns before its epoch
+// is durable and names it for await_durable to wait on. An Async commit and an
+// abort name 0.
+TEST(CommitDurabilityTest, AwaitEpochLeavesTheWaitToTheCaller) {
+  using helios::storage::CommitDurability;
+  using helios::storage::EpochNumber;
+  using helios::storage::RowOp;
+  helios::storage::Config config;
+  config.work_dir = "./helios_commit_await_test_logs";
+  std::filesystem::remove_all(config.work_dir);
+  config.enable_recovery = false;
+  // Long epochs: the flush starts within the wait only because Commit asked
+  // for its epoch's close.
+  config.epoch_duration_ms = 10000;
+
+  {
+    // The pipes outlive db: its logger may read release after the scope below.
+    Pipe arrived;
+    Pipe release;
+    helios::storage::Database db(config);
+    ASSERT_TRUE(TestHelper::CreateTable(db, kTable));
+
+    EpochNumber epoch = 0;
+    {
+      // Declared before the points, which are unset first, so no later flush
+      // stops at the point.
+      ReleaseOnExit always_release{release.write_fd()};
+      ArmedSyncPoints points;
+      points.arm("HELIOS_DEBUG_SYNC_WAL_BEFORE_FDATASYNC",
+                 "arrive_and_wait:" + std::to_string(arrived.write_fd()) + ":" +
+                     std::to_string(release.read_fd()));
+      epoch = await_epoch_of(db, "sync_key", RowOp::kInsert,
+                             CommitDurability::kSync, true);
+      ASSERT_NE(epoch, 0u);
+      ASSERT_TRUE(wait_readable(arrived.read_fd(), std::chrono::seconds(5)));
+      EXPECT_LT(db.await_durable(0), epoch) << "Commit waited for durability";
+    }
+    EXPECT_GE(db.await_durable(epoch), epoch);
+
+    EXPECT_EQ(await_epoch_of(db, "async_key", RowOp::kUpdate,
+                             CommitDurability::kAsync, true),
+              0u);
+    EXPECT_NE(
+        await_epoch_of(db, "", RowOp::kUpdate, CommitDurability::kSync, true),
+        0u);
+    EXPECT_EQ(await_epoch_of(db, "sync_key", RowOp::kInsert,
+                             CommitDurability::kSync, false),
+              0u);
   }
   std::filesystem::remove_all(config.work_dir);
 }

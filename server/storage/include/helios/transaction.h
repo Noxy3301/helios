@@ -221,14 +221,19 @@ class Transaction {
    *
    * A log record, if any, is enqueued before the worker leaves the epoch. A
    * Sync commit, read-only or not, waits for its commit epoch to become
-   * durable.
+   * durable, unless it hands that wait to the caller through `await_epoch`.
    *
    * @param[out] reason Cleared on entry and empty on success. On abort, a
    * short label naming the failed check.
+   * @param[out] await_epoch When non-null, Commit does not wait for its
+   * epoch to become durable and stores the epoch the caller must see durable
+   * before it reports the commit: the commit epoch of a Sync commit, read-only
+   * or not, else 0, which is also what an abort stores.
    * @return true after publishing; false on abort, with every lock released
    * and no stored value changed.
    */
-  bool Commit(CommitDurability durability, std::string &reason);
+  bool Commit(CommitDurability durability, std::string &reason,
+              EpochNumber *await_epoch = nullptr);
 
  private:
   struct ReadEntry {
