@@ -1,10 +1,11 @@
-// The RPC surface of the storage server: the handler for every arm of the
-// request envelope, plus the server-wide row counts, boot token and
-// hidden-key allocator they use.
+// The RPC surface of the storage server: the handler for every flat op and
+// every arm of the request envelope, plus the server-wide row counts, boot
+// token and hidden-key allocator they use.
 #pragma once
 
 #include <chrono>
 #include <string>
+#include <string_view>
 #include <memory>
 #include <mutex>
 #include <shared_mutex>
@@ -114,12 +115,11 @@ public:
                  std::shared_ptr<HiddenKeyAllocator> hidden_keys);
     ~HeliosRpc() = default;
 
-    // Parses one request envelope, routes the arm it sets, and serializes the
-    // response envelope into result. payload takes the bytes that ride raw
-    // after the envelope, which only the read-plan reply carries. Returns
-    // false when the response cannot be serialized, which leaves the request
-    // unanswered.
-    bool handle_rpc(const std::string& message, std::string& result,
+    // Routes a one-byte message as a flat request with body request_payload,
+    // any other as a protobuf envelope, and fills result and payload. Returns
+    // false on a malformed flat body or a reply that fails to serialize.
+    bool handle_rpc(const std::string& message,
+                    std::string_view request_payload, std::string& result,
                     std::string& payload);
 
 private:
@@ -141,12 +141,9 @@ private:
     static std::unordered_map<std::string, HistEntry> hist_cache_;
 
     // Reads, scans and the commit of a transaction
-    void handleTxRead(
-        const Helios::Protocol::TxRead::Request& request,
-        Helios::Protocol::TxRead::Response* response);
-    void handleTxBatchRead(
-        const Helios::Protocol::TxBatchRead::Request& request,
-        Helios::Protocol::TxBatchRead::Response* response);
+    bool handleTxRead(std::string_view body, std::string& reply,
+                      std::string& value);
+    bool handleTxBatchRead(std::string_view body, std::string& reply);
     void handleTxScan(
         const Helios::Protocol::TxScan::Request& request,
         Helios::Protocol::TxScan::Response* response);

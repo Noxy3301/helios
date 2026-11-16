@@ -3,11 +3,13 @@
 
 #include <cstdint>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <utility>
 #include <vector>
 #include <memory>
 
+#include "common/rpc_flat.h"
 #include "common/typed_cell.h"
 #include "helios.pb.h"
 
@@ -321,9 +323,15 @@ private:
                       Helios::Protocol::Response& response,
                       const std::string& meta = "",
                       std::string* payload = nullptr);
+    // Sends a flat request and returns its reply parts as received; a false
+    // return is a transport failure.
+    bool send_flat(helios::rpc::FlatOp flat_op, RpcOp op, std::string_view body,
+                   std::string& reply, std::string& payload);
     // The exchange itself. A failure here is a transport failure, which
-    // send_request answers by invalidating the boot token and the channel.
-    bool exchange_message(const std::string& serialized_request,
+    // send_request and send_flat answer by invalidating the boot token and the
+    // channel.
+    bool exchange_message(std::string_view serialized_request,
+                          std::string_view request_payload,
                           std::string& serialized_response,
                           std::string& payload, RpcOp op,
                           const std::string& meta);

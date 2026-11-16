@@ -8,13 +8,13 @@ syntax = "proto3";
 
 package Helios.Protocol;
 
-// Every request the server serves, one arm per RPC. The frame carries no
-// opcode: the arm that is set names the RPC.
+// Every request the server serves, one arm per RPC. A protobuf frame carries
+// no opcode: the arm that is set names the RPC.
 message Request {
     oneof body {
         // Reads
-        TxRead.Request tx_read = 1;
-        TxBatchRead.Request tx_batch_read = 2;
+        FlatBody tx_read = 1;
+        FlatBody tx_batch_read = 2;
         TxScan.Request tx_scan = 3;
         TxScanIndex.Request tx_scan_index = 4;
         TxExecuteReadPlan.Request tx_execute_read_plan = 5;
@@ -34,6 +34,10 @@ message Request {
     }
 }
 
+// Names an RPC that travels as a flat body (common/rpc_flat.h). No envelope
+// sets the arm; the query node's RPC trace reads the name.
+message FlatBody {}
+
 // Marks the read-plan reply, whose flat result rides raw after the envelope.
 message FlatReadPlanResult {}
 
@@ -41,8 +45,6 @@ message FlatReadPlanResult {}
 // request the server cannot route at all sets error and no arm.
 message Response {
     oneof body {
-        TxRead.Response tx_read = 1;
-        TxBatchRead.Response tx_batch_read = 2;
         TxScan.Response tx_scan = 3;
         TxScanIndex.Response tx_scan_index = 4;
         FlatReadPlanResult tx_execute_read_plan = 5;
@@ -127,38 +129,6 @@ message GetTableStats {
         // DbAllocateHiddenKeys.Response. A connection learns it here, so a
         // hidden-key range the query layer already holds stays usable.
         uint64 boot_token = 3;
-    }
-}
-
-// One row by primary key. The commit validates the returned TID.
-message TxRead {
-    message Request {
-        string table_name = 1;
-        bytes key = 2;
-    }
-    message Response {
-        bool found = 1;
-        bytes value = 2;
-        uint64 tid = 3;
-    }
-}
-
-// Several rows by primary key in one round trip.
-message TxBatchRead {
-    message ReadOp {
-        string table_name = 1;
-        bytes key = 2;
-    }
-    message Request {
-        repeated ReadOp ops = 1;
-    }
-    message ReadResult {
-        bool found = 1;
-        bytes value = 2;
-        uint64 tid = 3;
-    }
-    message Response {
-        repeated ReadResult results = 1;
     }
 }
 

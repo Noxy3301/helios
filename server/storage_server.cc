@@ -30,14 +30,16 @@ void StorageServer::handle_client(int client_socket) {
         std::make_shared<HeliosRpc>(db_manager_, row_counts_, hidden_keys_);
 
     while (true) {
-        std::string request;
+        std::string request, request_payload;
 
-        if (!MessageHandler::receive_message(client_socket, request)) {
+        if (!MessageHandler::receive_message(client_socket, request,
+                                             request_payload)) {
             break;  // Client disconnected or error
         }
 
         std::string reply, reply_payload;
-        if (!rpc_handler->handle_rpc(request, reply, reply_payload)) {
+        if (!rpc_handler->handle_rpc(request, request_payload, reply,
+                                     reply_payload)) {
             break;  // Nothing to answer with
         }
 

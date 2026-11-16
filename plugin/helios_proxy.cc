@@ -13,6 +13,7 @@
 #include "helios_proxy.hh"
 #include "rpc_trace.hh"
 #include "log.hh"
+#include "common/rpc_flat.h"
 #include "common/rpc_frame.h"
 
 namespace {
@@ -253,22 +254,29 @@ HeliosProxy::ReadResult HeliosProxy::tx_read(
         return result;
     }
 
-    Helios::Protocol::Request envelope;
-    auto& request = *envelope.mutable_tx_read();
-    request.set_table_name(table_name);
-    request.set_key(key);
+    std::string body;
+    helios::rpc::put_bytes(body, table_name);
+    helios::rpc::put_bytes(body, key);
 
-    Helios::Protocol::Response reply;
-    if (!send_request(envelope, reply)) {
+    std::string reply, value;
+    if (!send_flat(helios::rpc::FlatOp::kRead,
+                   Helios::Protocol::Request::kTxRead, body, reply, value)) {
         LOG_ERROR("RPC failed: Failed to send read message to server");
         return result;
     }
-    const auto& response = reply.tx_read();
+    helios::rpc::FlatReader in(reply);
+    const bool found = in.get<uint8_t>() != 0;
+    const uint64_t tid = in.get<uint64_t>();
+    if (!in.done()) {
+        LOG_ERROR("RPC failed: Malformed read reply of %zu bytes",
+                  reply.size());
+        return result;
+    }
 
     result.ok = true;
-    result.found = response.found();
-    result.tid = response.tid();
-    if (result.found) result.value = response.value();
+    result.found = found;
+    result.tid = tid;
+    if (result.found) result.value = std::move(value);
     return result;
 }
 
@@ -279,30 +287,36 @@ std::vector<HeliosProxy::ReadResult> HeliosProxy::tx_batch_read(
         return {};
     }
 
-    Helios::Protocol::Request envelope;
-    auto& request = *envelope.mutable_tx_batch_read();
+    std::string body;
+    helios::rpc::put<uint32_t>(body, static_cast<uint32_t>(keys.size()));
     for (const auto& key : keys) {
-        auto* op = request.add_ops();
-        op->set_table_name(key.table_name);
-        op->set_key(key.key);
+        helios::rpc::put_bytes(body, key.table_name);
+        helios::rpc::put_bytes(body, key.key);
     }
 
-    Helios::Protocol::Response reply;
-    if (!send_request(envelope, reply)) {
+    std::string reply, unused_payload;
+    if (!send_flat(helios::rpc::FlatOp::kBatchRead,
+                   Helios::Protocol::Request::kTxBatchRead, body, reply,
+                   unused_payload)) {
         LOG_ERROR("RPC failed: Failed to send batch_read message to server");
         return {};
     }
-    const auto& response = reply.tx_batch_read();
 
+    helios::rpc::FlatReader in(reply);
     std::vector<ReadResult> results;
-    results.reserve(response.results_size());
-    for (const auto& r : response.results()) {
+    const uint32_t n = in.get_count(results);
+    for (uint32_t i = 0; i < n && in.ok(); i++) {
         ReadResult result;
         result.ok = true;
-        result.found = r.found();
-        result.value = r.found() ? r.value() : "";
-        result.tid = r.tid();
+        result.found = in.get<uint8_t>() != 0;
+        result.tid = in.get<uint64_t>();
+        result.value = in.get_bytes();
         results.push_back(std::move(result));
+    }
+    if (!in.done()) {
+        LOG_ERROR("RPC failed: Malformed batch_read reply of %zu bytes",
+                  reply.size());
+        return {};
     }
     return results;
 }
@@ -852,7 +866,7 @@ bool HeliosProxy::send_request(const Helios::Protocol::Request& request,
 
     std::string serialized_response;
     std::string discarded_payload;
-    if (!exchange_message(serialized_request, serialized_response,
+    if (!exchange_message(serialized_request, {}, serialized_response,
                           payload != nullptr ? *payload : discarded_payload,
                           request.body_case(), meta)) {
         LOG_ERROR("SEND_REQUEST: Failed to send %s",
@@ -886,36 +900,58 @@ bool HeliosProxy::send_request(const Helios::Protocol::Request& request,
     return true;
 }
 
-bool HeliosProxy::exchange_message(const std::string& serialized_request,
+bool HeliosProxy::send_flat(helios::rpc::FlatOp flat_op, RpcOp op,
+                            std::string_view body, std::string& reply,
+                            std::string& payload) {
+    const char marker = static_cast<char>(flat_op);
+    if (!exchange_message(std::string_view(&marker, 1), body, reply, payload,
+                          op, "")) {
+        LOG_ERROR("SEND_REQUEST: Failed to send %s", rpc_op_name(op));
+        storage_boot_token_ = 0;
+        disconnect();
+        return false;
+    }
+    return true;
+}
+
+bool HeliosProxy::exchange_message(std::string_view serialized_request,
+                                      std::string_view request_payload,
                                       std::string& serialized_response,
                                       std::string& payload, RpcOp op,
                                       const std::string& meta) {
     auto rpc_start_ts = std::chrono::steady_clock::now();
-    const uint32_t req_bytes = static_cast<uint32_t>(serialized_request.size());
+    const uint32_t req_bytes = static_cast<uint32_t>(
+        serialized_request.size() + request_payload.size());
 
     if (!ensure_connected()) {
         LOG_ERROR("SEND_MESSAGE: Not connected!");
         return false;
     }
-    if (serialized_request.size() > UINT32_MAX) {
-        LOG_ERROR("SEND_MESSAGE: request %zu bytes exceeds the u32 frame limit",
-                  serialized_request.size());
+    if (serialized_request.size() > UINT32_MAX ||
+        request_payload.size() > UINT32_MAX) {
+        LOG_ERROR(
+            "SEND_MESSAGE: request %zu + %zu bytes exceeds the u32 frame limit",
+            serialized_request.size(), request_payload.size());
         return false;
     }
 
     const uint32_t env_len =
         htonl(static_cast<uint32_t>(serialized_request.size()));
-    const uint32_t pay_len = 0;  // A request carries no raw payload.
+    const uint32_t pay_len =
+        htonl(static_cast<uint32_t>(request_payload.size()));
 
-    // combine the envelope and the two length words
-    size_t total_size =
-        sizeof(env_len) + serialized_request.size() + sizeof(pay_len);
+    // combine the envelope, the payload and the two length words
+    size_t total_size = sizeof(env_len) + serialized_request.size() +
+                        sizeof(pay_len) + request_payload.size();
     std::vector<char> buffer(total_size);
-    std::memcpy(buffer.data(), &env_len, sizeof(env_len));
-    std::memcpy(buffer.data() + sizeof(env_len), serialized_request.data(),
-                serialized_request.size());
-    std::memcpy(buffer.data() + sizeof(env_len) + serialized_request.size(),
-                &pay_len, sizeof(pay_len));
+    char* out = buffer.data();
+    std::memcpy(out, &env_len, sizeof(env_len));
+    out += sizeof(env_len);
+    std::memcpy(out, serialized_request.data(), serialized_request.size());
+    out += serialized_request.size();
+    std::memcpy(out, &pay_len, sizeof(pay_len));
+    out += sizeof(pay_len);
+    std::memcpy(out, request_payload.data(), request_payload.size());
 
     // send (handle partial writes for large messages)
     size_t total_sent = 0;

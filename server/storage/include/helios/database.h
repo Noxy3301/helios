@@ -280,19 +280,6 @@ class Database {
                   const std::string_view key);
 
   /**
-   * @brief Reads several rows in one call.
-   *
-   * Each `keys[i] = {table_name, key}` is resolved with the same protocol as
-   * Read. Reads do not share state, so this is purely a transport
-   * optimization on top of repeated Read calls.
-   *
-   * @param keys (table_name, key) pairs to look up.
-   * @return One ReadResult per input, in the same order.
-   */
-  std::vector<ReadResult> BatchRead(
-      const std::vector<std::pair<std::string, std::string>> &keys);
-
-  /**
    * @brief Range-scans the primary index and returns the rows observed in
    *        the range.
    *

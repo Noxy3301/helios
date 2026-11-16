@@ -5,6 +5,7 @@
 #include <utility>
 #include <vector>
 
+#include "common/rpc_flat.h"
 #include "helios.pb.h"
 #include "helios/transaction.h"
 
@@ -27,36 +28,39 @@ std::vector<helios::storage::silo::Transaction::RangeRecord> range_records(
 
 }  // namespace
 
-void HeliosRpc::handleTxRead(
-    const Helios::Protocol::TxRead::Request& request,
-    Helios::Protocol::TxRead::Response* response) {
-    auto read_result =
-        db_manager_->get_database()->Read(request.table_name(), request.key());
-    response->set_found(read_result.found);
-    response->set_tid(read_result.tid);
+bool HeliosRpc::handleTxRead(std::string_view body, std::string& reply,
+                             std::string& value) {
+    helios::rpc::FlatReader in(body);
+    const std::string_view table = in.get_bytes();
+    const std::string_view key = in.get_bytes();
+    if (!in.done()) return false;
+
+    auto read_result = db_manager_->get_database()->Read(table, key);
+    helios::rpc::put<uint8_t>(reply, read_result.found);
+    helios::rpc::put<uint64_t>(reply, read_result.tid);
     if (read_result.found) {
-        response->set_value(std::move(read_result.value));
+        value = std::move(read_result.value);
     }
+    return true;
 }
 
-void HeliosRpc::handleTxBatchRead(
-    const Helios::Protocol::TxBatchRead::Request& request,
-    Helios::Protocol::TxBatchRead::Response* response) {
-    std::vector<std::pair<std::string, std::string>> keys;
-    keys.reserve(request.ops_size());
-    for (const auto& op : request.ops()) {
-        keys.emplace_back(op.table_name(), op.key());
-    }
+bool HeliosRpc::handleTxBatchRead(std::string_view body, std::string& reply) {
+    auto& db = *db_manager_->get_database();
+    helios::rpc::FlatReader in(body);
+    const uint32_t n = in.get<uint32_t>();
+    helios::rpc::put<uint32_t>(reply, n);
+    for (uint32_t i = 0; i < n; i++) {
+        const std::string_view table = in.get_bytes();
+        const std::string_view key = in.get_bytes();
+        if (!in.ok()) return false;
 
-    auto read_results = db_manager_->get_database()->BatchRead(keys);
-    for (auto& read_result : read_results) {
-        auto* out = response->add_results();
-        out->set_found(read_result.found);
-        out->set_tid(read_result.tid);
-        if (read_result.found) {
-            out->set_value(std::move(read_result.value));
-        }
+        auto read_result = db.Read(table, key);
+        helios::rpc::put<uint8_t>(reply, read_result.found);
+        helios::rpc::put<uint64_t>(reply, read_result.tid);
+        helios::rpc::put_bytes(reply, read_result.found ? read_result.value
+                                                        : std::string_view());
     }
+    return in.done();
 }
 
 void HeliosRpc::handleTxScan(
