@@ -9,6 +9,7 @@
 #define HELIOS_STORAGE_SRC_WAL_EPOCH_SCAN_CHECKPOINT_H
 
 #include <cstdint>
+#include <functional>
 #include <mutex>
 #include <string>
 #include <string_view>
@@ -93,7 +94,6 @@ class EpochScanCheckpoint {
     WalPosition redo_start;
     EpochNumber start_epoch{0};
     EpochNumber end_epoch{0};
-    LogRecords records;
     std::string detail;
   };
 
@@ -128,12 +128,26 @@ class EpochScanCheckpoint {
   bool RunOnce(Stats *out_stats = nullptr);
 
   /**
-   * @brief Reads the published checkpoint of `work_dir`, if there is a usable
-   * one.
+   * @brief Validates the header of the published checkpoint of `work_dir`, if
+   * there is a usable one. ReadChunks reads what it holds.
    * @param[in] work_dir The directory the database logs into.
-   * @return The file's status and, when Ok, its epoch bounds and records.
+   * @return The file's status and, when Ok, its epoch bounds.
    */
   static LoadResult Load(const std::string &work_dir);
+
+  /**
+   * @brief Reads the published checkpoint's chunks in file order, holding one
+   * in memory at a time.
+   * @pre Load returned kOk for `work_dir`.
+   * @param[in] work_dir The directory the database logs into.
+   * @param[in] apply Called once per chunk with its one record, which is valid
+   * only during the call.
+   * @param[out] detail Why the read failed, when it returns false. Not null.
+   * @return Whether every chunk is intact and the chunks fill the payload.
+   */
+  static bool ReadChunks(const std::string &work_dir,
+                         const std::function<void(const LogRecords &)> &apply,
+                         std::string *detail);
 
   /**
    * @brief Name of the published checkpoint inside the working directory.
@@ -147,6 +161,9 @@ class EpochScanCheckpoint {
   static constexpr uint32_t kMagic = 0x504b4348;  // "HCKP"
   static constexpr uint16_t kFlags = 0;
   static constexpr size_t kHeaderSize = 66;
+  // The writes a chunk gathers before it is written, by estimated size, which
+  // bounds what a capture and a recovery hold in memory.
+  static constexpr size_t kChunkBytes = 32 * 1024 * 1024;
 
  private:
   /**
@@ -158,6 +175,8 @@ class EpochScanCheckpoint {
    */
   enum class CaptureResult { kTaken, kSkipped, kUnstable };
 
+  struct ChunkWriter;
+
   static CaptureResult CapturePrimaryRow(const std::string &table_name,
                                          std::string_view key,
                                          const RowRecord &item,
@@ -167,8 +186,8 @@ class EpochScanCheckpoint {
       const std::string &table_name, const std::string &index_name,
       const index::SecondaryIndex &index, std::string_view key,
       const IndexRecord &item, LogRecord::Write &out, uint64_t &retries);
-  bool CaptureTable(Table &table, LogRecord &record, Stats &stats);
-  bool Publish(const LogRecords &records, Stats &stats);
+  bool CaptureTable(Table &table, ChunkWriter &writer, Stats &stats);
+  bool Publish(const ChunkWriter &writer, Stats &stats);
   void Loop();
 
   const Config &config_;

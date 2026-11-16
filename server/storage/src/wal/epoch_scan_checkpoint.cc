@@ -55,7 +55,8 @@ constexpr auto kPoolPoll = std::chrono::milliseconds(1);
 constexpr uint64_t kRowsPerPoolCheck = 4096;
 
 // Checkpoint header fields, in bytes from the start of the file. The magic word
-// opens it at offset 0 and the checksum closes it at `kHeaderSize - 4`.
+// opens it at offset 0 and the header checksum closes it at `kHeaderSize - 4`.
+// The chunks follow, and the payload size counts them with their prefixes.
 constexpr size_t kOffFlags = 4;
 constexpr size_t kOffGeneration = 6;
 constexpr size_t kOffStartEpoch = 14;
@@ -65,6 +66,7 @@ constexpr size_t kOffSecondaryEntries = 30;
 constexpr size_t kOffPayloadSize = 38;
 constexpr size_t kOffRedoSegment = 46;
 constexpr size_t kOffRedoOffset = 54;
+constexpr size_t kChunkPrefixSize = 8;
 
 void PutLe16(uint8_t *out, uint16_t value) {
   out[0] = static_cast<uint8_t>(value & 0xffu);
@@ -110,12 +112,13 @@ int64_t ElapsedMs(Clock::time_point from) {
       .count();
 }
 
-bool WriteAll(int fd, const void *data, size_t size) {
+bool WriteAll(int fd, const void *data, size_t size, off_t offset) {
   const auto *bytes = static_cast<const uint8_t *>(data);
   while (size != 0) {
-    const ssize_t written = ::write(fd, bytes, size);
+    const ssize_t written = ::pwrite(fd, bytes, size, offset);
     if (written > 0) {
       bytes += written;
+      offset += written;
       size -= static_cast<size_t>(written);
       continue;
     }
@@ -176,7 +179,7 @@ bool FsyncDirectory(const std::string &directory) {
   return ok;
 }
 
-// A checkpoint that is present but cannot be trusted, carrying no records.
+// A checkpoint that is present but cannot be trusted.
 EpochScanCheckpoint::LoadResult unusable(const std::string &detail) {
   EpochScanCheckpoint::LoadResult checkpoint;
   checkpoint.status = EpochScanCheckpoint::LoadResult::Status::kUnusable;
@@ -184,7 +187,68 @@ EpochScanCheckpoint::LoadResult unusable(const std::string &detail) {
   return checkpoint;
 }
 
+bool refuse(std::string *detail, const std::string &reason) {
+  *detail = reason;
+  return false;
+}
+
 }  // namespace
+
+/**
+ * @brief Gathers a capture's writes into chunks of the working file, each
+ *        `[u32 payload_len][u32 crc32c of payload][payload]`.
+ *
+ * @details The payload is one packed LogRecord. The descriptor stays owned by
+ * the caller, and `off` is where the next chunk goes.
+ */
+struct EpochScanCheckpoint::ChunkWriter {
+  int fd;
+  LogRecord record{};
+  size_t estimate{0};
+  uint64_t off{kHeaderSize};
+  bool failed{false};
+  int error{0};
+
+  // Returns false when the chunk this write completed could not be written.
+  bool add(LogRecord::Write &&write) {
+    estimate +=
+        sizeof(LogRecord::Write) + write.key.size() + write.buffer.size();
+    for (const auto &pk : write.primary_keys) estimate += pk.size();
+    record.writes.emplace_back(std::move(write));
+    return estimate < kChunkBytes || flush();
+  }
+
+  bool flush() {
+    if (record.writes.empty()) return true;
+    msgpack::sbuffer payload;
+    msgpack::pack(payload, record);
+
+    Crc32c crc;
+    crc.Update(payload.data(), payload.size());
+    uint8_t prefix[kChunkPrefixSize];
+    PutLe32(prefix, static_cast<uint32_t>(payload.size()));
+    PutLe32(prefix + sizeof(uint32_t), crc.Finish());
+
+    bool written =
+        WriteAll(fd, prefix, sizeof(prefix), off) &&
+        WriteAll(fd, payload.data(), payload.size(), off + sizeof(prefix));
+    // Sync per chunk: a single sync of the whole file stalls the log on the
+    // same device.
+    while (written && ::fdatasync(fd) != 0) {
+      if (errno != EINTR) written = false;
+    }
+    if (!written) {
+      failed = true;
+      error = errno;
+      return false;
+    }
+
+    off += sizeof(prefix) + payload.size();
+    record.writes.clear();
+    estimate = 0;
+    return true;
+  }
+};
 
 const char *EpochScanCheckpoint::CheckpointFileName() { return "checkpoint"; }
 const char *EpochScanCheckpoint::WorkingFileName() {
@@ -341,21 +405,26 @@ bool EpochScanCheckpoint::RunOnce(Stats *out_stats) {
   epoch_framework_.Sync();
   stats.barrier_ms = ElapsedMs(barrier_begin);
 
+  // The walk streams its chunks into the working file; the header goes in the
+  // space left before them once the walk is over.
+  const ScopedFd file(::open(working_path_.c_str(),
+                             O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644));
+  if (file.fd < 0) {
+    SPDLOG_WARN("Checkpoint {0} could not open {1} (errno {2})",
+                stats.generation, working_path_, errno);
+    wal.set_checkpoint_threshold(wal.appended_bytes() + wal.segment_bytes());
+    if (out_stats != nullptr) *out_stats = stats;
+    return false;
+  }
+  ChunkWriter writer{file.fd};
+  writer.record.epoch = stats.start_epoch;
+
   // Walk every table.
   const auto scan_begin = Clock::now();
-  LogRecords records;
   bool abandoned = false;
   tables_.ForEachTable([&](Table &table) {
     if (abandoned) return;
-    LogRecord record;
-    record.epoch = stats.start_epoch;
-    if (!CaptureTable(table, record, stats)) {
-      abandoned = true;
-      return;
-    }
-    if (!record.writes.empty()) {
-      records.emplace_back(std::move(record));
-    }
+    if (!CaptureTable(table, writer, stats)) abandoned = true;
   });
 
   // Drop the epoch pin the walk held; record the scan time and the end
@@ -364,12 +433,14 @@ bool EpochScanCheckpoint::RunOnce(Stats *out_stats) {
   // reclaims anything while a thread is inside a Masstree RCU enrolment.
   index::release_thread_epoch();
 
+  if (!abandoned && !writer.flush()) abandoned = true;
   stats.scan_ms = ElapsedMs(scan_begin);
   // Every version in the checkpoint was published at or below this epoch, which
   // is what the durability gate below is asked about.
   stats.end_epoch = epoch_framework_.GetGlobalEpoch();
 
-  // Keep the previous checkpoint when the scan could not settle.
+  // Keep the previous checkpoint when the scan could not settle or could not
+  // be written out.
   if (abandoned) {
     ::unlink(working_path_.c_str());
     bool stopping = false;
@@ -377,7 +448,10 @@ bool EpochScanCheckpoint::RunOnce(Stats *out_stats) {
       std::lock_guard<std::mutex> lock(stop_mutex_);
       stopping = stop_;
     }
-    if (stopping) {
+    if (writer.failed) {
+      SPDLOG_WARN("Checkpoint {0} abandoned: writing {1} failed (errno {2})",
+                  stats.generation, working_path_, writer.error);
+    } else if (stopping) {
       SPDLOG_INFO("Checkpoint {0} abandoned: the capture thread is stopping",
                   stats.generation);
     } else {
@@ -390,8 +464,8 @@ bool EpochScanCheckpoint::RunOnce(Stats *out_stats) {
     return false;
   }
 
-  // Wait for durability, write, and rename.
-  const bool published = Publish(records, stats);
+  // Finish the file, wait for durability, and rename.
+  const bool published = Publish(writer, stats);
   if (out_stats != nullptr) *out_stats = stats;
   if (!published) {
     wal.set_checkpoint_threshold(wal.appended_bytes() + wal.segment_bytes());
@@ -413,7 +487,7 @@ bool EpochScanCheckpoint::RunOnce(Stats *out_stats) {
   return true;
 }
 
-bool EpochScanCheckpoint::CaptureTable(Table &table, LogRecord &record,
+bool EpochScanCheckpoint::CaptureTable(Table &table, ChunkWriter &writer,
                                        Stats &stats) {
   const std::string &table_name = table.Name();
   std::vector<std::string> unstable_rows;
@@ -430,7 +504,7 @@ bool EpochScanCheckpoint::CaptureTable(Table &table, LogRecord &record,
                               write, stats.version_retries)) {
       case CaptureResult::kTaken:
         ++stats.primary_rows;
-        record.writes.emplace_back(std::move(write));
+        if (!writer.add(std::move(write))) return true;
         break;
       case CaptureResult::kSkipped:
         break;
@@ -444,6 +518,7 @@ bool EpochScanCheckpoint::CaptureTable(Table &table, LogRecord &record,
   // Capture every secondary posting list the same way.
   table.ForEachSecondaryIndex(
       [&](const std::string &index_name, index::SecondaryIndex &index) {
+        if (writer.failed) return;
         index.tree.ForEach([&](std::string_view key, IndexRecord &item) {
           if (++walked % kRowsPerPoolCheck == 0) logger_.wal().PrepareSegment();
           LogRecord::Write write;
@@ -451,7 +526,7 @@ bool EpochScanCheckpoint::CaptureTable(Table &table, LogRecord &record,
                                         item, write, stats.version_retries)) {
             case CaptureResult::kTaken:
               ++stats.secondary_entries;
-              record.writes.emplace_back(std::move(write));
+              if (!writer.add(std::move(write))) return true;
               break;
             case CaptureResult::kSkipped:
               break;
@@ -463,6 +538,7 @@ bool EpochScanCheckpoint::CaptureTable(Table &table, LogRecord &record,
           return false;
         });
       });
+  if (writer.failed) return false;
 
   // Retry pass: resolve the deferred keys again and copy what has settled.
   // Rows held by a writer for the whole spin are resolved again by key: the
@@ -488,7 +564,7 @@ bool EpochScanCheckpoint::CaptureTable(Table &table, LogRecord &record,
                                 stats.version_retries)) {
         case CaptureResult::kTaken:
           ++stats.primary_rows;
-          record.writes.emplace_back(std::move(write));
+          if (!writer.add(std::move(write))) return false;
           break;
         case CaptureResult::kSkipped:
           break;
@@ -510,7 +586,7 @@ bool EpochScanCheckpoint::CaptureTable(Table &table, LogRecord &record,
                                     write, stats.version_retries)) {
         case CaptureResult::kTaken:
           ++stats.secondary_entries;
-          record.writes.emplace_back(std::move(write));
+          if (!writer.add(std::move(write))) return false;
           break;
         case CaptureResult::kSkipped:
           break;
@@ -525,33 +601,7 @@ bool EpochScanCheckpoint::CaptureTable(Table &table, LogRecord &record,
   return !stopped && unstable_rows.empty() && unstable_entries.empty();
 }
 
-bool EpochScanCheckpoint::Publish(const LogRecords &records, Stats &stats) {
-  msgpack::sbuffer payload;
-  msgpack::pack(payload, records);
-
-  // Publishing before the log covers the capture's end epoch would let a
-  // version come back without its transaction. The wait keeps serving the
-  // pool.
-  const auto gate_begin = Clock::now();
-  auto result = Logger::WaitResult::kTimedOut;
-  while (result == Logger::WaitResult::kTimedOut &&
-         Clock::now() - gate_begin < kDurabilityWait) {
-    result =
-        logger_.WaitUntilDurable(stats.end_epoch, Clock::now() + kPoolPoll);
-    if (result == Logger::WaitResult::kTimedOut) logger_.wal().PrepareSegment();
-  }
-  if (result != Logger::WaitResult::kDurable) {
-    // Nothing was written this round; drop any working file an earlier
-    // failed attempt left behind.
-    ::unlink(working_path_.c_str());
-    SPDLOG_WARN(
-        "Checkpoint {0} discarded: the log did not become durable through "
-        "epoch {1}",
-        stats.generation, stats.end_epoch);
-    return false;
-  }
-  stats.durability_ms = ElapsedMs(gate_begin);
-
+bool EpochScanCheckpoint::Publish(const ChunkWriter &writer, Stats &stats) {
   const auto write_begin = Clock::now();
   uint8_t header[kHeaderSize];
   std::memset(header, 0, sizeof(header));
@@ -562,34 +612,44 @@ bool EpochScanCheckpoint::Publish(const LogRecords &records, Stats &stats) {
   PutLe32(header + kOffEndEpoch, stats.end_epoch);
   PutLe64(header + kOffPrimaryRows, stats.primary_rows);
   PutLe64(header + kOffSecondaryEntries, stats.secondary_entries);
-  PutLe64(header + kOffPayloadSize, static_cast<uint64_t>(payload.size()));
+  PutLe64(header + kOffPayloadSize, writer.off - kHeaderSize);
   PutLe64(header + kOffRedoSegment, stats.redo_start.segment_number);
   PutLe64(header + kOffRedoOffset, stats.redo_start.offset);
   Crc32c crc;
   crc.Update(header, kHeaderSize - sizeof(uint32_t));
-  crc.Update(payload.data(), payload.size());
   PutLe32(header + kHeaderSize - sizeof(uint32_t), crc.Finish());
-  stats.checkpoint_bytes = kHeaderSize + payload.size();
 
-  const int fd = ::open(working_path_.c_str(),
-                        O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
-  if (fd < 0) {
-    SPDLOG_WARN("Checkpoint {0} could not open {1} (errno {2})",
-                stats.generation, working_path_, errno);
-    return false;
-  }
-  const bool written = WriteAll(fd, header, sizeof(header)) &&
-                       WriteAll(fd, payload.data(), payload.size()) &&
-                       Fsync(fd) == 0;
-  const int write_errno = errno;
-  ::close(fd);
-  if (!written) {
+  if (!WriteAll(writer.fd, header, sizeof(header), 0) ||
+      Fsync(writer.fd) != 0) {
+    const int write_errno = errno;
     ::unlink(working_path_.c_str());
     SPDLOG_WARN("Checkpoint {0} could not be written to {1} (errno {2})",
                 stats.generation, working_path_, write_errno);
     return false;
   }
   stats.write_ms = ElapsedMs(write_begin);
+
+  // Publishing before the log covers the capture's end epoch would let a
+  // version come back without its transaction. Recovery skips the working
+  // file, so only the rename waits, and the wait keeps serving the pool.
+  const auto gate_begin = Clock::now();
+  auto result = Logger::WaitResult::kTimedOut;
+  while (result == Logger::WaitResult::kTimedOut &&
+         Clock::now() - gate_begin < kDurabilityWait) {
+    result =
+        logger_.WaitUntilDurable(stats.end_epoch, Clock::now() + kPoolPoll);
+    if (result == Logger::WaitResult::kTimedOut) logger_.wal().PrepareSegment();
+  }
+  if (result != Logger::WaitResult::kDurable) {
+    ::unlink(working_path_.c_str());
+    SPDLOG_WARN(
+        "Checkpoint {0} discarded: the log did not become durable through "
+        "epoch {1}",
+        stats.generation, stats.end_epoch);
+    return false;
+  }
+  stats.durability_ms = ElapsedMs(gate_begin);
+  stats.checkpoint_bytes = writer.off;
 
   if (::rename(working_path_.c_str(), checkpoint_path_.c_str()) != 0) {
     const int rename_errno = errno;
@@ -640,6 +700,11 @@ EpochScanCheckpoint::LoadResult EpochScanCheckpoint::Load(
   if (GetLe16(header + kOffFlags) != kFlags) {
     return unusable("the checkpoint carries unknown flags");
   }
+  Crc32c crc;
+  crc.Update(header, kHeaderSize - sizeof(uint32_t));
+  if (crc.Finish() != GetLe32(header + kHeaderSize - sizeof(uint32_t))) {
+    return unusable("the checkpoint checksum does not hold");
+  }
   const uint64_t payload_size = GetLe64(header + kOffPayloadSize);
   if (payload_size != static_cast<uint64_t>(file_stat.st_size) - kHeaderSize) {
     return unusable("the checkpoint length disagrees with its header");
@@ -655,41 +720,81 @@ EpochScanCheckpoint::LoadResult EpochScanCheckpoint::Load(
     return unusable("the checkpoint epochs are not in order");
   }
 
-  // Everything from here allocates in proportion to the file, and a file that
-  // is damaged in its length is exactly the one that would ask for too much.
-  try {
-    std::vector<uint8_t> payload(payload_size);
-    if (payload_size != 0 &&
-        !ReadAll(fd, payload.data(), payload.size(), kHeaderSize)) {
-      return unusable("the checkpoint payload cannot be read");
-    }
-    Crc32c crc;
-    crc.Update(header, kHeaderSize - sizeof(uint32_t));
-    crc.Update(payload.data(), payload.size());
-    if (crc.Finish() != GetLe32(header + kHeaderSize - sizeof(uint32_t))) {
-      return unusable("the checkpoint checksum does not hold");
-    }
-
-    size_t consumed = 0;
-    auto handle =
-        msgpack::unpack(reinterpret_cast<const char *>(payload.data()),
-                        payload.size(), consumed);
-    handle.get().convert(checkpoint.records);
-    if (consumed != payload.size()) {
-      return unusable("the checkpoint payload has trailing bytes");
-    }
-  } catch (const std::exception &e) {
-    return unusable(std::string("the checkpoint payload does not unpack: ") +
-                    e.what());
-  } catch (...) {
-    return unusable("the checkpoint payload does not unpack");
-  }
-
   checkpoint.status = LoadResult::Status::kOk;
   checkpoint.redo_start = redo_start;
   checkpoint.start_epoch = start_epoch;
   checkpoint.end_epoch = end_epoch;
   return checkpoint;
+}
+
+bool EpochScanCheckpoint::ReadChunks(
+    const std::string &work_dir,
+    const std::function<void(const LogRecords &)> &apply, std::string *detail) {
+  const std::string path =
+      (std::filesystem::path(work_dir) / CheckpointFileName()).string();
+  const ScopedFd file(::open(path.c_str(), O_RDONLY | O_CLOEXEC));
+  if (file.fd < 0) {
+    return refuse(detail,
+                  "open " + path + " (errno " + std::to_string(errno) + ")");
+  }
+
+  uint8_t size_field[sizeof(uint64_t)];
+  if (!ReadAll(file.fd, size_field, sizeof(size_field), kOffPayloadSize)) {
+    return refuse(detail, "the checkpoint header cannot be read");
+  }
+  uint64_t remaining = GetLe64(size_field);
+  off_t off = kHeaderSize;
+
+  // A damaged chunk may ask for too much, and a damaged payload may not unpack.
+  try {
+    std::vector<uint8_t> payload;
+    while (remaining != 0) {
+      uint8_t prefix[kChunkPrefixSize];
+      if (remaining < sizeof(prefix)) {
+        return refuse(detail, "the checkpoint ends inside a chunk prefix");
+      }
+      if (!ReadAll(file.fd, prefix, sizeof(prefix), off)) {
+        return refuse(detail, "a checkpoint chunk prefix cannot be read");
+      }
+      remaining -= sizeof(prefix);
+      off += sizeof(prefix);
+
+      const uint32_t payload_len = GetLe32(prefix);
+      if (payload_len > remaining) {
+        return refuse(detail, "a checkpoint chunk runs past the payload");
+      }
+      payload.resize(payload_len);
+      if (!ReadAll(file.fd, payload.data(), payload_len, off)) {
+        return refuse(detail, "a checkpoint chunk cannot be read");
+      }
+      remaining -= payload_len;
+      off += payload_len;
+
+      Crc32c crc;
+      crc.Update(payload.data(), payload.size());
+      if (crc.Finish() != GetLe32(prefix + sizeof(uint32_t))) {
+        return refuse(detail, "a checkpoint chunk checksum does not hold");
+      }
+
+      size_t consumed = 0;
+      auto handle =
+          msgpack::unpack(reinterpret_cast<const char *>(payload.data()),
+                          payload.size(), consumed);
+      // A fresh record per chunk: converting into a used one keeps its strings.
+      LogRecords records(1);
+      handle.get().convert(records[0]);
+      if (consumed != payload.size()) {
+        return refuse(detail, "a checkpoint chunk has trailing bytes");
+      }
+      apply(records);
+    }
+  } catch (const std::exception &e) {
+    return refuse(
+        detail, std::string("a checkpoint chunk does not unpack: ") + e.what());
+  } catch (...) {
+    return refuse(detail, "a checkpoint chunk does not unpack");
+  }
+  return true;
 }
 
 }  // namespace wal
