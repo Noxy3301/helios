@@ -259,9 +259,9 @@ TEST(CommitDurabilityTest, SyncReadViewWaitsForTheSnapshotEpoch) {
   std::filesystem::remove_all(config.work_dir);
 }
 
-// With an await epoch a Sync write returns before its epoch is durable and
-// names it for await_durable to wait on. An Async commit, a commit that read
-// and wrote nothing, and an abort name 0.
+// With an await epoch a Sync write, or a commit that read and wrote nothing,
+// returns before its epoch is durable and names it for await_durable to wait
+// on. An Async commit and an abort name 0.
 TEST(CommitDurabilityTest, AwaitEpochLeavesTheWaitToTheCaller) {
   using helios::storage::CommitDurability;
   using helios::storage::EpochNumber;
@@ -301,7 +301,7 @@ TEST(CommitDurabilityTest, AwaitEpochLeavesTheWaitToTheCaller) {
     EXPECT_EQ(await_epoch_of(db, "async_key", RowOp::kUpdate,
                              CommitDurability::kAsync, true),
               0u);
-    EXPECT_EQ(
+    EXPECT_NE(
         await_epoch_of(db, "", RowOp::kUpdate, CommitDurability::kSync, true),
         0u);
     EXPECT_EQ(await_epoch_of(db, "sync_key", RowOp::kInsert,

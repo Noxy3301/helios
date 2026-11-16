@@ -221,17 +221,17 @@ class Transaction {
    *   TID, which unlocks it.
    *
    * A log record, if any, is enqueued before the worker leaves the epoch. A
-   * Sync commit with writes waits for its commit epoch to become durable. A
-   * Sync commit without writes waits for the newest epoch among the words it
-   * validated, and not at all when that epoch is already durable. Either
-   * hands its wait to the caller through `await_epoch`.
+   * Sync commit with writes, or with no reads and no writes, waits for its
+   * commit epoch to become durable. Any other Sync commit waits for the
+   * newest epoch among the words it validated, and not at all when that
+   * epoch is already durable. Either hands its wait to the caller through
+   * `await_epoch`.
    *
    * @param[out] reason Cleared on entry and empty on success. On abort, a
    * short label naming the failed check.
    * @param[out] await_epoch When non-null, Commit does not wait and stores
    * the epoch the caller must see durable before it reports the commit, or 0
-   * when it need not wait: an Async commit, a read-only commit whose reads
-   * are durable, and an abort store 0.
+   * when it need not wait. Aborts store 0.
    * @return true after publishing; false on abort, with every lock released
    * and no stored value changed.
    */

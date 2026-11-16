@@ -333,9 +333,10 @@ bool Transaction::Commit(CommitDurability durability, std::string &reason,
   epoch_.Leave();
   // A read-only Sync commit waits for the newest version it validated; a
   // missing record needs no wait, as the reaper purges only durable deletes.
+  // An empty commit keeps its own epoch, so it waits for every earlier one.
   EpochNumber required_epoch = commit_tid.epoch;
   bool awaits = durability == CommitDurability::kSync;
-  if (write_set_.empty()) {
+  if (write_set_.empty() && !(read_set_.empty() && range_set_.empty())) {
     required_epoch = max_tid.epoch;
     awaits = awaits && required_epoch > logger_.GetDurableEpoch();
   }
