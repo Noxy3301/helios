@@ -74,6 +74,12 @@ bool MessageHandler::receive_message(int socket, std::string& envelope) {
 
     uint32_t pay_len = 0;
     const size_t in_pay_len = got - in_envelope;
+    // A client waits for each reply, so bytes past this frame break protocol.
+    if (in_pay_len > sizeof(pay_len)) {
+        SPDLOG_ERROR("Request is followed by {} unexpected bytes",
+                     in_pay_len - sizeof(pay_len));
+        return false;
+    }
     std::memcpy(&pay_len, rest + in_envelope, in_pay_len);
     if (!recv_all(socket, reinterpret_cast<char*>(&pay_len) + in_pay_len,
                   sizeof(pay_len) - in_pay_len)) {
