@@ -1,10 +1,13 @@
-// The RPC surface of the storage server: the handler for every arm of the
-// request envelope, plus the server-wide row counts, boot token and
-// hidden-key allocator they use.
+// The RPC surface of the storage server: the handler for every flat op and
+// every arm of the request envelope, plus the server-wide row counts, boot
+// token and hidden-key allocator they use.
 #pragma once
 
+#include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <string>
+#include <string_view>
 #include <memory>
 #include <mutex>
 #include <shared_mutex>
@@ -31,18 +34,36 @@ void add_visited(Reply* reply,
 }
 
 // Server-wide table row count tracker, shared across all connections.
+// s_mutex guards only the set of tables, whose entries are never removed;
+// each count is updated atomically.
 struct TableRowCounts {
     std::shared_mutex s_mutex;
-    std::unordered_map<std::string, int64_t> counts;
+    std::unordered_map<std::string, std::atomic<int64_t>> counts;
+
+    // Adds delta to count, clamping the result at zero.
+    static void add(std::atomic<int64_t>& count, int64_t delta) {
+        int64_t old = count.load();
+        while (!count.compare_exchange_weak(
+            old, std::max<int64_t>(0, old + delta))) {
+        }
+    }
 
     template <typename T>
     void apply_deltas(const T& deltas) {
-        std::unique_lock<std::shared_mutex> lock(s_mutex);
-        for (const auto& row_delta : deltas) {
-            auto& count = counts[row_delta.table_name()];
-            count += row_delta.delta();
-            if (count < 0) count = 0;
+        std::shared_lock<std::shared_mutex> shared(s_mutex);
+        auto delta = deltas.begin();
+        for (; delta != deltas.end(); ++delta) {
+            const auto known = counts.find(std::string(delta->table));
+            if (known == counts.end()) break;
+            add(known->second, delta->delta);
         }
+        if (delta == deltas.end()) return;
+        // A table without an entry: add it and the rest under the unique lock.
+        shared.unlock();
+        std::unique_lock<std::shared_mutex> lock(s_mutex);
+        for (; delta != deltas.end(); ++delta)
+            add(counts.try_emplace(std::string(delta->table), 0).first->second,
+                delta->delta);
     }
 
     // Starts the counts from the rows recovery restored, before any connection
@@ -50,12 +71,26 @@ struct TableRowCounts {
     void seed(const std::unordered_map<std::string, uint64_t>& rows) {
         std::unique_lock<std::shared_mutex> lock(s_mutex);
         for (const auto& [name, count] : rows)
-            counts[name] = static_cast<int64_t>(count);
+            counts.try_emplace(name, 0).first->second.store(
+                static_cast<int64_t>(count));
+    }
+
+    // Appends (name, count) for every table to out. The names stay valid
+    // after the call: they are the map's keys.
+    template <typename Out>
+    void append_to(Out& out) {
+        std::shared_lock<std::shared_mutex> lock(s_mutex);
+        out.reserve(out.size() + counts.size());
+        for (const auto& [name, count] : counts)
+            out.emplace_back(name, count.load());
     }
 
     std::unordered_map<std::string, int64_t> snapshot() {
         std::shared_lock<std::shared_mutex> lock(s_mutex);
-        return counts;
+        std::unordered_map<std::string, int64_t> out;
+        for (const auto& [name, count] : counts)
+            out.emplace(name, count.load());
+        return out;
     }
 };
 
@@ -114,12 +149,11 @@ public:
                  std::shared_ptr<HiddenKeyAllocator> hidden_keys);
     ~HeliosRpc() = default;
 
-    // Parses one request envelope, routes the arm it sets, and serializes the
-    // response envelope into result. payload takes the bytes that ride raw
-    // after the envelope, which only the read-plan reply carries. Returns
-    // false when the response cannot be serialized, which leaves the request
-    // unanswered.
-    bool handle_rpc(const std::string& message, std::string& result,
+    // Routes a one-byte message as a flat request with body request_payload,
+    // any other as a protobuf envelope, and fills result and payload. Returns
+    // false on a malformed flat body or a reply that fails to serialize.
+    bool handle_rpc(const std::string& message,
+                    std::string_view request_payload, std::string& result,
                     std::string& payload);
 
 private:
@@ -141,21 +175,16 @@ private:
     static std::unordered_map<std::string, HistEntry> hist_cache_;
 
     // Reads, scans and the commit of a transaction
-    void handleTxRead(
-        const Helios::Protocol::TxRead::Request& request,
-        Helios::Protocol::TxRead::Response* response);
-    void handleTxBatchRead(
-        const Helios::Protocol::TxBatchRead::Request& request,
-        Helios::Protocol::TxBatchRead::Response* response);
+    bool handleTxRead(std::string_view body, std::string& reply,
+                      std::string& value);
+    bool handleTxBatchRead(std::string_view body, std::string& reply);
     void handleTxScan(
         const Helios::Protocol::TxScan::Request& request,
         Helios::Protocol::TxScan::Response* response);
     void handleTxScanIndex(
         const Helios::Protocol::TxScanIndex::Request& request,
         Helios::Protocol::TxScanIndex::Response* response);
-    void handleTxCommit(
-        const Helios::Protocol::TxCommit::Request& request,
-        Helios::Protocol::TxCommit::Response* response);
+    bool handleTxCommit(std::string_view body, std::string& reply);
 
     // Read-plan execution. The reply is the flat HELIOSRP payload, which
     // rides raw after the envelope.

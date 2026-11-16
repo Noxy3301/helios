@@ -13,6 +13,7 @@
 #include "helios_proxy.hh"
 #include "rpc_trace.hh"
 #include "log.hh"
+#include "common/rpc_flat.h"
 #include "common/rpc_frame.h"
 
 namespace {
@@ -105,16 +106,15 @@ std::vector<HeliosProxy::RangeRecord> take_visited(Response& response) {
     return visited;
 }
 
-// Copies range records into a commit request, which reads key and tid.
-void add_records(
-    google::protobuf::RepeatedPtrField<Helios::Protocol::RangeRecord>* out,
+// Borrows range records for a commit body, which carries key and tid.
+std::vector<helios::rpc::FlatRecord> flat_records(
     const std::vector<HeliosProxy::RangeRecord>& records) {
-    out->Reserve(static_cast<int>(records.size()));
+    std::vector<helios::rpc::FlatRecord> out;
+    out.reserve(records.size());
     for (const auto& record : records) {
-        auto* added = out->Add();
-        added->set_key(record.key);
-        added->set_tid(record.tid);
+        out.push_back({record.key, record.tid});
     }
+    return out;
 }
 
 }  // namespace
@@ -253,22 +253,29 @@ HeliosProxy::ReadResult HeliosProxy::tx_read(
         return result;
     }
 
-    Helios::Protocol::Request envelope;
-    auto& request = *envelope.mutable_tx_read();
-    request.set_table_name(table_name);
-    request.set_key(key);
+    std::string body;
+    helios::rpc::put_bytes(body, table_name);
+    helios::rpc::put_bytes(body, key);
 
-    Helios::Protocol::Response reply;
-    if (!send_request(envelope, reply)) {
+    std::string reply, value;
+    if (!send_flat(helios::rpc::FlatOp::kRead,
+                   Helios::Protocol::Request::kTxRead, body, reply, value)) {
         LOG_ERROR("RPC failed: Failed to send read message to server");
         return result;
     }
-    const auto& response = reply.tx_read();
+    helios::rpc::FlatReader in(reply);
+    const bool found = in.get<uint8_t>() != 0;
+    const uint64_t tid = in.get<uint64_t>();
+    if (!in.done()) {
+        LOG_ERROR("RPC failed: Malformed read reply of %zu bytes",
+                  reply.size());
+        return result;
+    }
 
     result.ok = true;
-    result.found = response.found();
-    result.tid = response.tid();
-    if (result.found) result.value = response.value();
+    result.found = found;
+    result.tid = tid;
+    if (result.found) result.value = std::move(value);
     return result;
 }
 
@@ -279,30 +286,36 @@ std::vector<HeliosProxy::ReadResult> HeliosProxy::tx_batch_read(
         return {};
     }
 
-    Helios::Protocol::Request envelope;
-    auto& request = *envelope.mutable_tx_batch_read();
+    std::string body;
+    helios::rpc::put<uint32_t>(body, static_cast<uint32_t>(keys.size()));
     for (const auto& key : keys) {
-        auto* op = request.add_ops();
-        op->set_table_name(key.table_name);
-        op->set_key(key.key);
+        helios::rpc::put_bytes(body, key.table_name);
+        helios::rpc::put_bytes(body, key.key);
     }
 
-    Helios::Protocol::Response reply;
-    if (!send_request(envelope, reply)) {
+    std::string reply, unused_payload;
+    if (!send_flat(helios::rpc::FlatOp::kBatchRead,
+                   Helios::Protocol::Request::kTxBatchRead, body, reply,
+                   unused_payload)) {
         LOG_ERROR("RPC failed: Failed to send batch_read message to server");
         return {};
     }
-    const auto& response = reply.tx_batch_read();
 
+    helios::rpc::FlatReader in(reply);
     std::vector<ReadResult> results;
-    results.reserve(response.results_size());
-    for (const auto& r : response.results()) {
+    const uint32_t n = in.get_count(results);
+    for (uint32_t i = 0; i < n && in.ok(); i++) {
         ReadResult result;
         result.ok = true;
-        result.found = r.found();
-        result.value = r.found() ? r.value() : "";
-        result.tid = r.tid();
+        result.found = in.get<uint8_t>() != 0;
+        result.tid = in.get<uint64_t>();
+        result.value = in.get_bytes();
         results.push_back(std::move(result));
+    }
+    if (!in.done()) {
+        LOG_ERROR("RPC failed: Malformed batch_read reply of %zu bytes",
+                  reply.size());
+        return {};
     }
     return results;
 }
@@ -411,94 +424,73 @@ bool HeliosProxy::tx_commit(
         return false;
     }
 
-    Helios::Protocol::Request envelope;
-    auto& request = *envelope.mutable_tx_commit();
-
+    helios::rpc::FlatCommit request;
+    request.reads.reserve(reads.size());
     for (const auto& entry : reads) {
-        auto* read = request.add_reads();
-        read->set_table_name(entry.table_name);
-        read->set_key(entry.key);
-        read->set_tid(entry.tid);
-        read->set_column_mask(entry.column_mask);
+        request.reads.push_back(
+            {entry.table_name, entry.key, entry.tid, entry.column_mask});
     }
 
+    request.ranges.reserve(range_reads.size());
     for (const auto& entry : range_reads) {
-        auto* range = request.add_range_reads();
-        range->set_table_name(entry.table_name);
-        range->set_index_name(entry.index_name);
-        range->set_start_key(entry.start_key);
-        range->set_end_key(entry.end_key);
-        range->set_row_limit(entry.row_limit);
-        range->set_reverse_scan(entry.reverse_scan);
-        add_records(range->mutable_rows(), entry.rows);
-        add_records(range->mutable_visited(), entry.visited);
+        request.ranges.push_back(
+            {entry.table_name, entry.index_name, entry.start_key, entry.end_key,
+             entry.row_limit, entry.reverse_scan, flat_records(entry.rows),
+             flat_records(entry.visited)});
     }
 
     for (const auto& op : ops) {
         switch (op.type) {
-            case WriteOp::Type::Write: {
-                auto* write = request.add_writes();
-                write->set_table_name(op.table_name);
-                write->set_key(op.key);
-                write->set_value(op.value);
-                write->set_op(op.is_insert
-                                  ? Helios::Protocol::TxCommit::INSERT
-                                  : Helios::Protocol::TxCommit::UPDATE);
-                write->set_column_mask(op.column_mask);
+            case WriteOp::Type::Write:
+                request.writes.push_back(
+                    {op.table_name, op.key, op.value,
+                     op.is_insert ? helios::rpc::FlatRowOp::kInsert
+                                  : helios::rpc::FlatRowOp::kUpdate,
+                     op.column_mask});
                 break;
-            }
-            case WriteOp::Type::Delete: {
-                auto* write = request.add_writes();
-                write->set_table_name(op.table_name);
-                write->set_key(op.key);
-                write->set_op(Helios::Protocol::TxCommit::DELETE);
+            case WriteOp::Type::Delete:
+                request.writes.push_back({op.table_name, op.key, {},
+                                          helios::rpc::FlatRowOp::kDelete, 0});
                 break;
-            }
             case WriteOp::Type::SecondaryIndexWrite:
-            case WriteOp::Type::SecondaryIndexDelete: {
-                auto* index_op = request.add_secondary_index_ops();
-                index_op->set_table_name(op.table_name);
-                index_op->set_index_name(op.index_name);
-                index_op->set_secondary_key(op.secondary_key);
-                index_op->set_primary_key(op.primary_key);
-                index_op->set_is_delete(op.type ==
-                                        WriteOp::Type::SecondaryIndexDelete);
+            case WriteOp::Type::SecondaryIndexDelete:
+                request.index_ops.push_back(
+                    {op.table_name, op.index_name, op.secondary_key,
+                     op.primary_key,
+                     op.type == WriteOp::Type::SecondaryIndexDelete});
                 break;
-            }
         }
     }
 
+    request.row_deltas.reserve(row_deltas.size());
     for (const auto& [table, delta] : row_deltas) {
-        auto* rd = request.add_row_deltas();
-        rd->set_table_name(table);
-        rd->set_delta(delta);
+        request.row_deltas.push_back({table, delta});
     }
-    request.set_async_durability(async_durability);
+    request.async_durability = async_durability;
 
-    Helios::Protocol::Response reply;
-    if (!send_request(envelope, reply)) {
+    std::string body;
+    helios::rpc::pack_commit(request, body);
+
+    std::string reply, unused_payload;
+    helios::rpc::FlatCommitReply response;
+    if (!send_flat(helios::rpc::FlatOp::kCommit,
+                   Helios::Protocol::Request::kTxCommit, body, reply,
+                   unused_payload) ||
+        !helios::rpc::unpack_commit_reply(reply, response)) {
         LOG_ERROR("RPC failed: Failed to send commit message to server");
         if (transport_error != nullptr) *transport_error = true;
         return false;
     }
-    const auto& response = reply.tx_commit();
 
     table_stats_cache_.clear();
-    for (const auto& ts : response.table_stats()) {
-        table_stats_cache_[ts.table_name()] = ts.row_count();
+    for (const auto& [table, count] : response.table_stats) {
+        table_stats_cache_[std::string(table)] = count;
     }
-    if (!response.committed()) {
-        if (abort_detail != nullptr) *abort_detail = response.abort_detail();
-        if (duplicate_key != nullptr) {
-            const auto reason = response.abort_reason();
-            *duplicate_key =
-                reason ==
-                    Helios::Protocol::ABORT_REASON_DUPLICATE_PRIMARY_KEY ||
-                reason ==
-                    Helios::Protocol::ABORT_REASON_DUPLICATE_SECONDARY_KEY;
-        }
+    if (!response.committed) {
+        if (abort_detail != nullptr) *abort_detail = response.abort_detail;
+        if (duplicate_key != nullptr) *duplicate_key = response.duplicate_key;
     }
-    return response.committed();
+    return response.committed;
 }
 
 namespace {
@@ -852,7 +844,7 @@ bool HeliosProxy::send_request(const Helios::Protocol::Request& request,
 
     std::string serialized_response;
     std::string discarded_payload;
-    if (!exchange_message(serialized_request, serialized_response,
+    if (!exchange_message(serialized_request, {}, serialized_response,
                           payload != nullptr ? *payload : discarded_payload,
                           request.body_case(), meta)) {
         LOG_ERROR("SEND_REQUEST: Failed to send %s",
@@ -886,36 +878,58 @@ bool HeliosProxy::send_request(const Helios::Protocol::Request& request,
     return true;
 }
 
-bool HeliosProxy::exchange_message(const std::string& serialized_request,
+bool HeliosProxy::send_flat(helios::rpc::FlatOp flat_op, RpcOp op,
+                            std::string_view body, std::string& reply,
+                            std::string& payload) {
+    const char marker = static_cast<char>(flat_op);
+    if (!exchange_message(std::string_view(&marker, 1), body, reply, payload,
+                          op, "")) {
+        LOG_ERROR("SEND_REQUEST: Failed to send %s", rpc_op_name(op));
+        storage_boot_token_ = 0;
+        disconnect();
+        return false;
+    }
+    return true;
+}
+
+bool HeliosProxy::exchange_message(std::string_view serialized_request,
+                                      std::string_view request_payload,
                                       std::string& serialized_response,
                                       std::string& payload, RpcOp op,
                                       const std::string& meta) {
     auto rpc_start_ts = std::chrono::steady_clock::now();
-    const uint32_t req_bytes = static_cast<uint32_t>(serialized_request.size());
+    const uint32_t req_bytes = static_cast<uint32_t>(
+        serialized_request.size() + request_payload.size());
 
     if (!ensure_connected()) {
         LOG_ERROR("SEND_MESSAGE: Not connected!");
         return false;
     }
-    if (serialized_request.size() > UINT32_MAX) {
-        LOG_ERROR("SEND_MESSAGE: request %zu bytes exceeds the u32 frame limit",
-                  serialized_request.size());
+    if (serialized_request.size() > UINT32_MAX ||
+        request_payload.size() > UINT32_MAX) {
+        LOG_ERROR(
+            "SEND_MESSAGE: request %zu + %zu bytes exceeds the u32 frame limit",
+            serialized_request.size(), request_payload.size());
         return false;
     }
 
     const uint32_t env_len =
         htonl(static_cast<uint32_t>(serialized_request.size()));
-    const uint32_t pay_len = 0;  // A request carries no raw payload.
+    const uint32_t pay_len =
+        htonl(static_cast<uint32_t>(request_payload.size()));
 
-    // combine the envelope and the two length words
-    size_t total_size =
-        sizeof(env_len) + serialized_request.size() + sizeof(pay_len);
+    // combine the envelope, the payload and the two length words
+    size_t total_size = sizeof(env_len) + serialized_request.size() +
+                        sizeof(pay_len) + request_payload.size();
     std::vector<char> buffer(total_size);
-    std::memcpy(buffer.data(), &env_len, sizeof(env_len));
-    std::memcpy(buffer.data() + sizeof(env_len), serialized_request.data(),
-                serialized_request.size());
-    std::memcpy(buffer.data() + sizeof(env_len) + serialized_request.size(),
-                &pay_len, sizeof(pay_len));
+    char* out = buffer.data();
+    std::memcpy(out, &env_len, sizeof(env_len));
+    out += sizeof(env_len);
+    std::memcpy(out, serialized_request.data(), serialized_request.size());
+    out += serialized_request.size();
+    std::memcpy(out, &pay_len, sizeof(pay_len));
+    out += sizeof(pay_len);
+    std::memcpy(out, request_payload.data(), request_payload.size());
 
     // send (handle partial writes for large messages)
     size_t total_sent = 0;

@@ -1,11 +1,13 @@
-// Dispatch of one request: routes the arm the envelope sets to its handler
-// and releases the thread's epoch once the reply is built.
+// Dispatch of one request: routes the flat op or the arm the envelope sets to
+// its handler and releases the thread's epoch once the reply is built.
 
 #include "helios_rpc.hh"
 
 #include <string>
 
 #include <spdlog/spdlog.h>
+
+#include "common/rpc_flat.h"
 
 using Helios::Protocol::Request;
 
@@ -16,8 +18,30 @@ HeliosRpc::HeliosRpc(std::shared_ptr<DatabaseManager> db_manager,
       hidden_keys_(hidden_keys) {
 }
 
-bool HeliosRpc::handle_rpc(const std::string& message, std::string& result,
-                           std::string& payload) {
+bool HeliosRpc::handle_rpc(const std::string& message,
+                           std::string_view request_payload,
+                           std::string& result, std::string& payload) {
+    if (message.size() == 1) {
+        bool ok = false;
+        switch (static_cast<helios::rpc::FlatOp>(message[0])) {
+            case helios::rpc::FlatOp::kRead:
+                ok = handleTxRead(request_payload, result, payload);
+                break;
+            case helios::rpc::FlatOp::kBatchRead:
+                ok = handleTxBatchRead(request_payload, result);
+                break;
+            case helios::rpc::FlatOp::kCommit:
+                ok = handleTxCommit(request_payload, result);
+                break;
+        }
+        db_manager_->get_database()->ReleaseThreadEpoch();
+        if (!ok) {
+            SPDLOG_ERROR("Malformed flat request of op {} ({} bytes)",
+                         static_cast<int>(message[0]), request_payload.size());
+        }
+        return ok;
+    }
+
     Request request;
     Helios::Protocol::Response response;
 
@@ -28,13 +52,6 @@ bool HeliosRpc::handle_rpc(const std::string& message, std::string& result,
         // No default: -Wswitch reports an arm that has no handler.
         switch (request.body_case()) {
             // Reads
-            case Request::kTxRead:
-                handleTxRead(request.tx_read(), response.mutable_tx_read());
-                break;
-            case Request::kTxBatchRead:
-                handleTxBatchRead(request.tx_batch_read(),
-                                  response.mutable_tx_batch_read());
-                break;
             case Request::kTxScan:
                 handleTxScan(request.tx_scan(), response.mutable_tx_scan());
                 break;
@@ -48,11 +65,6 @@ bool HeliosRpc::handle_rpc(const std::string& message, std::string& result,
                 response.mutable_tx_execute_read_plan();
                 handleTxExecuteReadPlan(request.tx_execute_read_plan(),
                                         &payload);
-                break;
-
-            // The one commit of a transaction
-            case Request::kTxCommit:
-                handleTxCommit(request.tx_commit(), response.mutable_tx_commit());
                 break;
 
             case Request::kGetTableStats:
@@ -91,6 +103,10 @@ bool HeliosRpc::handle_rpc(const std::string& message, std::string& result,
                     response.mutable_db_drop_secondary_indexes());
                 break;
 
+            // These travel flat, so no envelope names them.
+            case Request::kTxRead:
+            case Request::kTxBatchRead:
+            case Request::kTxCommit:
             case Request::BODY_NOT_SET:
                 SPDLOG_ERROR("Request envelope carries no body");
                 response.set_error("request carries no body");

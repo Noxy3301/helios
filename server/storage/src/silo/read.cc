@@ -27,16 +27,6 @@ ReadResult Database::Read(const std::string_view table_name,
   return {row.found, std::move(row.value), row.tid.obj};
 }
 
-std::vector<ReadResult> Database::BatchRead(
-    const std::vector<std::pair<std::string, std::string>> &keys) {
-  std::vector<ReadResult> results;
-  results.reserve(keys.size());
-  for (const auto &[table_name, key] : keys) {
-    results.emplace_back(Read(table_name, key));
-  }
-  return results;
-}
-
 ScanResult Database::Scan(const std::string_view table_name,
                           const std::string_view start_key,
                           const std::string_view end_key, uint64_t row_limit,

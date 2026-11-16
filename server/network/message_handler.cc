@@ -38,7 +38,8 @@ bool recv_all(int socket, char* out, size_t size) {
 
 }  // namespace
 
-bool MessageHandler::receive_message(int socket, std::string& envelope) {
+bool MessageHandler::receive_message(int socket, std::string& envelope,
+                                     std::string& payload) {
     char head[kRecvBytes];
     uint32_t net_len = 0;
     size_t got = 0;
@@ -72,24 +73,34 @@ bool MessageHandler::receive_message(int socket, std::string& envelope) {
         return false;
     }
 
-    uint32_t pay_len = 0;
-    const size_t in_pay_len = got - in_envelope;
+    uint32_t net_pay_len = 0;
+    const size_t in_pay_len = std::min(got - in_envelope, sizeof(net_pay_len));
+    std::memcpy(&net_pay_len, rest + in_envelope, in_pay_len);
+    if (!recv_all(socket, reinterpret_cast<char*>(&net_pay_len) + in_pay_len,
+                  sizeof(net_pay_len) - in_pay_len)) {
+        return false;
+    }
+    const uint32_t pay_len = ntohl(net_pay_len);
+    if (pay_len != 0 && size != 1) {
+        SPDLOG_ERROR("Request carries a {} byte payload part", pay_len);
+        return false;
+    }
+    if (pay_len > helios::rpc::kMaxPartBytes) {
+        SPDLOG_ERROR("Frame part of {} bytes exceeds the {} byte limit",
+                     pay_len, helios::rpc::kMaxPartBytes);
+        return false;
+    }
+
+    const size_t in_payload = got - in_envelope - in_pay_len;
     // A client waits for each reply, so bytes past this frame break protocol.
-    if (in_pay_len > sizeof(pay_len)) {
+    if (in_payload > pay_len) {
         SPDLOG_ERROR("Request is followed by {} unexpected bytes",
-                     in_pay_len - sizeof(pay_len));
+                     in_payload - pay_len);
         return false;
     }
-    std::memcpy(&pay_len, rest + in_envelope, in_pay_len);
-    if (!recv_all(socket, reinterpret_cast<char*>(&pay_len) + in_pay_len,
-                  sizeof(pay_len) - in_pay_len)) {
-        return false;
-    }
-    if (pay_len != 0) {
-        SPDLOG_ERROR("Request carries a {} byte payload part", ntohl(pay_len));
-        return false;
-    }
-    return true;
+    payload.resize(pay_len);
+    std::memcpy(payload.data(), rest + in_envelope + in_pay_len, in_payload);
+    return recv_all(socket, payload.data() + in_payload, pay_len - in_payload);
 }
 
 bool MessageHandler::send_response(int socket, const std::string& envelope,
