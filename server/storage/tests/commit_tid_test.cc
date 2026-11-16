@@ -159,6 +159,21 @@ class CommitTidTest : public ::testing::Test {
     index::release_thread_epoch();
     return committed;
   }
+
+  // Commits as Sync and returns the epoch Commit leaves the caller to await.
+  EpochNumber sync_await(const std::vector<TestHelper::PointRead> &reads,
+                         const std::vector<TestHelper::RowWrite> &writes,
+                         const std::vector<TestHelper::Range> &ranges = {}) {
+    std::vector<TestHelper::RowWrite> rows = writes;
+    for (auto &row : rows) row.value = TestHelper::Row(row.value);
+    silo::Transaction tx(tables_, epoch_, reaper_, *logger_, last_tid_);
+    EpochNumber epoch = 99;
+    EXPECT_TRUE(TestHelper::Feed(tx, reads, ranges, rows, {}, reason_) &&
+                tx.Commit(CommitDurability::kSync, reason_, &epoch))
+        << reason_;
+    index::release_thread_epoch();
+    return epoch;
+  }
 };
 
 constexpr auto kArrivalTimeout = std::chrono::seconds(5);
@@ -851,6 +866,72 @@ TEST_F(CommitTidTest, ReadOnlyCommitAdvancesWorkerOrdering) {
   ASSERT_EQ(wal::WalScanResult::Status::kOk, scan.status);
   ASSERT_EQ(1u, scan.records.size());
   EXPECT_EQ(1u, scan.records.front().writes.size());
+}
+
+// D is 8 and the commit epoch 10: a read-only Sync commit of durable words,
+// a missing key among them, has nothing to wait for.
+TEST_F(CommitTidTest, ReadOnlySyncCommitOfDurableWordsAwaitsNothing) {
+  SeedRow("old", Version(8, 3));
+  TestHelper::Range range;
+  range.table_name = kTable;
+  range.start_key = "old";
+  range.end_key = "olf";
+  range.rows = {{"old", Version(8, 3).obj}};
+  EXPECT_EQ(0u, sync_await({{kTable, "old", Version(8, 3).obj},
+                            {kTable, "none", Tidword::Absent().obj}},
+                           {}, {range}));
+
+  // Without an await epoch it returns although the commit epoch never closes.
+  auto commit = std::async(std::launch::async, [this] {
+    Tidword last_tid;
+    std::string reason;
+    silo::Transaction tx(tables_, epoch_, reaper_, *logger_, last_tid);
+    tx.Read(kTable, "old", Version(8, 3), 0);
+    const bool committed = tx.Commit(CommitDurability::kSync, reason);
+    index::release_thread_epoch();
+    return committed;
+  });
+  const bool prompt =
+      commit.wait_for(std::chrono::seconds(2)) == std::future_status::ready;
+  if (!prompt) SetEpoch(12);
+  EXPECT_TRUE(prompt) << "a read-only Sync commit waited for its commit epoch";
+  EXPECT_TRUE(commit.get());
+}
+
+TEST_F(CommitTidTest, ReadOnlySyncCommitAwaitsTheNewestEpochItRead) {
+  SeedRow("old", Version(8, 3));
+  SeedRow("new", Version(9, 1));
+  EXPECT_EQ(9u, sync_await({{kTable, "old", Version(8, 3).obj},
+                            {kTable, "new", Version(9, 1).obj}},
+                           {}));
+
+  TestHelper::Range range;
+  range.table_name = kTable;
+  range.start_key = "n";
+  range.end_key = "p";
+  range.rows = {{"new", Version(9, 1).obj}, {"old", Version(8, 3).obj}};
+  EXPECT_EQ(9u, sync_await({}, {}, {range}));
+}
+
+// A delete that is not durable yet leaves its record, whose word a point read
+// or a scan observes; the commit waits for that delete.
+TEST_F(CommitTidTest, ReadOnlySyncCommitAwaitsTheDeleteItObserved) {
+  auto &tree = tables_.GetTable(kTable)->GetPrimaryIndex();
+  tree.GetOrInsert("gone")->transaction_id.store(Deleted(9, 2));
+  EXPECT_EQ(9u, sync_await({{kTable, "gone", Deleted(9, 2).obj}}, {}));
+
+  TestHelper::Range range;
+  range.table_name = kTable;
+  range.start_key = "g";
+  range.end_key = "h";
+  range.visited = {{"gone", Deleted(9, 2).obj}};
+  EXPECT_EQ(9u, sync_await({}, {}, {range}));
+}
+
+TEST_F(CommitTidTest, SyncCommitWithWritesAwaitsItsCommitEpoch) {
+  SeedRow("old", Version(8, 3));
+  EXPECT_EQ(10u, sync_await({{kTable, "old", Version(8, 3).obj}},
+                            {{kTable, "other", "value"}}));
 }
 
 TEST_F(CommitTidTest, SecondaryRangeReadContributesIndexAndRowVersions) {

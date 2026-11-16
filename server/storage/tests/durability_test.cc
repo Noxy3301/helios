@@ -259,9 +259,9 @@ TEST(CommitDurabilityTest, SyncReadViewWaitsForTheSnapshotEpoch) {
   std::filesystem::remove_all(config.work_dir);
 }
 
-// With an await epoch a Sync commit, read-only or not, returns before its epoch
-// is durable and names it for await_durable to wait on. An Async commit and an
-// abort name 0.
+// With an await epoch a Sync write, or a commit that read and wrote nothing,
+// returns before its epoch is durable and names it for await_durable to wait
+// on. An Async commit and an abort name 0.
 TEST(CommitDurabilityTest, AwaitEpochLeavesTheWaitToTheCaller) {
   using helios::storage::CommitDurability;
   using helios::storage::EpochNumber;
@@ -307,6 +307,84 @@ TEST(CommitDurabilityTest, AwaitEpochLeavesTheWaitToTheCaller) {
     EXPECT_EQ(await_epoch_of(db, "sync_key", RowOp::kInsert,
                              CommitDurability::kSync, false),
               0u);
+  }
+  std::filesystem::remove_all(config.work_dir);
+}
+
+// With the flush of a delete held before fdatasync, the epoch hook keeps the
+// tombstone past E - 2, so a read-only Sync commit still observes the delete;
+// once it is durable, the record goes.
+TEST(CommitDurabilityTest, ReaperKeepsADeleteUntilItIsDurable) {
+  using helios::storage::CommitDurability;
+  using helios::storage::EpochNumber;
+  using helios::storage::RowOp;
+  using helios::storage::Tidword;
+  helios::storage::Config config;
+  config.work_dir = "./helios_reaper_durability_test_logs";
+  std::filesystem::remove_all(config.work_dir);
+  // Short enough for three epochs, long enough to stay under the lag bound.
+  config.epoch_duration_ms = 20;
+  config.wal_segment_bytes = 1u << 20;
+
+  {
+    Pipe arrived;
+    Pipe release;
+    helios::storage::Database db(config);
+    ASSERT_TRUE(TestHelper::CreateTable(db, kTable));
+    ASSERT_TRUE(TestHelper::WriteRow(db, kTable, "k", TestHelper::Row("v")));
+
+    Tidword deleted;
+    {
+      ReleaseOnExit always_release{release.write_fd()};
+      ArmedSyncPoints points;
+      points.arm("HELIOS_DEBUG_SYNC_WAL_BEFORE_FDATASYNC",
+                 "arrive_and_wait:" + std::to_string(arrived.write_fd()) + ":" +
+                     std::to_string(release.read_fd()));
+      std::string reason;
+      ASSERT_TRUE(
+          TestHelper::CommitRows(db, {}, {{kTable, "k", "", RowOp::kDelete}},
+                                 {}, {}, reason, CommitDurability::kAsync))
+          << reason;
+      deleted = Tidword(db.Read(kTable, "k").tid);
+      db.ReleaseThreadEpoch();
+      ASSERT_TRUE(deleted.absent);
+      ASSERT_TRUE(wait_readable(arrived.read_fd(), std::chrono::seconds(5)));
+
+      // A probe committed in the delete's epoch + 3 shows the hook for + 2,
+      // which may reclaim that epoch, has returned.
+      EpochNumber probe_epoch = 0;
+      while (probe_epoch < deleted.epoch + 3) {
+        ASSERT_TRUE(TestHelper::CommitRows(
+            db, {}, {{kTable, "probe", TestHelper::Row("v")}}, {}, {}, reason,
+            CommitDurability::kAsync))
+            << reason;
+        probe_epoch = Tidword(db.Read(kTable, "probe").tid).epoch;
+        db.ReleaseThreadEpoch();
+        // Keeps one epoch's probes well inside a log segment.
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+      }
+      EXPECT_EQ(deleted.obj, db.Read(kTable, "k").tid)
+          << "the reaper purged a delete that is not durable";
+      db.ReleaseThreadEpoch();
+
+      helios::storage::silo::Transaction tx(db);
+      tx.Read(kTable, "k", deleted, 0);
+      EpochNumber epoch = 99;
+      EXPECT_TRUE(tx.Commit(CommitDurability::kSync, reason, &epoch)) << reason;
+      db.ReleaseThreadEpoch();
+      EXPECT_EQ(deleted.epoch, epoch);
+    }
+    EXPECT_GE(db.await_durable(deleted.epoch), deleted.epoch);
+
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    uint64_t word = deleted.obj;
+    while (word != Tidword::Absent().obj &&
+           std::chrono::steady_clock::now() < deadline) {
+      word = db.Read(kTable, "k").tid;
+      db.ReleaseThreadEpoch();
+    }
+    EXPECT_EQ(Tidword::Absent().obj, word) << "a durable delete was not purged";
   }
   std::filesystem::remove_all(config.work_dir);
 }

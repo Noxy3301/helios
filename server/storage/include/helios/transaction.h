@@ -52,7 +52,7 @@ inline constexpr char kDuplicatePrimaryKeyAbortReason[] =
 inline constexpr char kDuplicateSecondaryKeyAbortPrefix[] = "unique_si_";
 
 /**
- * @brief Whether Commit waits for its commit epoch to become durable.
+ * @brief Whether Commit waits for what it wrote and read to become durable.
  * Carried per commit.
  *
  * The equivalent settings elsewhere, to keep Async from being read as a
@@ -61,7 +61,8 @@ inline constexpr char kDuplicateSecondaryKeyAbortPrefix[] = "unique_si_";
  * durability, COMMIT NOWAIT.
  */
 enum class CommitDurability {
-  kSync,   // Commit returns once the committer's own epoch is durable.
+  kSync,   // Commit returns once its writes and the versions it read are
+           // durable.
   kAsync,  // Commit returns at precommit; a crash can lose it.
 };
 
@@ -220,15 +221,17 @@ class Transaction {
    *   TID, which unlocks it.
    *
    * A log record, if any, is enqueued before the worker leaves the epoch. A
-   * Sync commit, read-only or not, waits for its commit epoch to become
-   * durable, unless it hands that wait to the caller through `await_epoch`.
+   * Sync commit with writes, or with no reads and no writes, waits for its
+   * commit epoch to become durable. Any other Sync commit waits for the
+   * newest epoch among the words it validated, and not at all when that
+   * epoch is already durable. Either hands its wait to the caller through
+   * `await_epoch`.
    *
    * @param[out] reason Cleared on entry and empty on success. On abort, a
    * short label naming the failed check.
-   * @param[out] await_epoch When non-null, Commit does not wait for its
-   * epoch to become durable and stores the epoch the caller must see durable
-   * before it reports the commit: the commit epoch of a Sync commit, read-only
-   * or not, else 0, which is also what an abort stores.
+   * @param[out] await_epoch When non-null, Commit does not wait and stores
+   * the epoch the caller must see durable before it reports the commit, or 0
+   * when it need not wait. Aborts store 0.
    * @return true after publishing; false on abort, with every lock released
    * and no stored value changed.
    */

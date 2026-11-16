@@ -317,12 +317,12 @@ std::function<void(EpochNumber)> Database::MakeEpochHook() {
   return [this, interval, last_tick = std::chrono::steady_clock::time_point()](
              const EpochNumber global_epoch) mutable {
     // Workers lag E by at most one epoch, so none remain in epochs <= E - 2.
-    // Flushing and reclamation have different roles but currently share this
-    // bound. Commit epochs are positive, so E - 2 must be at least 1.
+    // Commit epochs are positive, so E - 2 must be at least 1.
     if (global_epoch >= 3) {
       const EpochNumber closed_epoch = global_epoch - 2;
       logger_.RequestFlush(closed_epoch);
-      reaper_.Purge(closed_epoch);
+      // A purged key reads as never written, so a delete also waits for `D`.
+      reaper_.Purge(std::min(closed_epoch, logger_.GetDurableEpoch()));
     }
 
     // Tick masstree's epoch, which paces only RCU frees of retired leaves,

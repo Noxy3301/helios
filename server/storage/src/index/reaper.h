@@ -60,7 +60,8 @@ class Reaper {
 
   /**
    * @brief Purges candidates deleted at or before reclamation_epoch.
-   * @details reclamation_epoch is the latest delete epoch whose grace has passed.
+   * @details reclamation_epoch is the latest delete epoch whose grace has
+   * passed and whose log is durable.
    * Unlinking is separate from freeing memory, which remains deferred by RCU.
    * Locked records remain queued for the next call; newer epochs are untouched.
    * Called by the epoch thread, never concurrently with another Purge.
