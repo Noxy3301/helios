@@ -23,9 +23,14 @@
 
 #include "wal/logger.h"
 
+#include <linux/futex.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+
 #include <algorithm>
 #include <cassert>
 #include <cerrno>
+#include <climits>
 #include <cstdlib>
 #include <exception>
 #include <utility>
@@ -162,7 +167,7 @@ void Logger::PublishDurable(EpochNumber durable_epoch) {
     if (state_ != State::kRunning) return;
     durable_epoch_.store(durable_epoch, std::memory_order_seq_cst);
   }
-  durability_cv_.notify_all();
+  wake_durability_waiters();
 }
 
 void Logger::PublishFailure(int error_number) {
@@ -183,7 +188,7 @@ void Logger::PublishFailure(int error_number) {
           error_number);
     }
   }
-  durability_cv_.notify_all();
+  wake_durability_waiters();
   if (abort_process) std::abort();
 }
 
@@ -197,7 +202,37 @@ void Logger::PublishStopped() {
     std::lock_guard<std::mutex> lock(durability_mutex_);
     if (state_ == State::kRunning) state_ = State::kStopped;
   }
-  durability_cv_.notify_all();
+  wake_durability_waiters();
+}
+
+void Logger::wake_durability_waiters() {
+  // Every publication changes the word, so a wake before FUTEX_WAIT is seen.
+  durability_wake_.fetch_add(1);
+  ::syscall(SYS_futex, &durability_wake_, FUTEX_WAKE_PRIVATE, INT_MAX);
+}
+
+void Logger::wait_for_durability_change(uint32_t observed, Deadline deadline) {
+  static_assert(sizeof(durability_wake_) == sizeof(uint32_t));
+  static_assert(std::atomic<uint32_t>::is_always_lock_free);
+  timespec timeout;
+  timespec *timeout_ptr = nullptr;
+  if (deadline != Deadline::max()) {
+    const auto remaining = deadline - std::chrono::steady_clock::now();
+    if (remaining <= Deadline::duration::zero()) return;
+    const auto seconds =
+        std::chrono::duration_cast<std::chrono::seconds>(remaining);
+    timeout.tv_sec = seconds.count();
+    timeout.tv_nsec = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                          remaining - seconds)
+                          .count();
+    timeout_ptr = &timeout;
+  }
+  if (::syscall(SYS_futex, &durability_wake_, FUTEX_WAIT_PRIVATE, observed,
+                timeout_ptr) == -1 &&
+      errno != EAGAIN && errno != EINTR && errno != ETIMEDOUT) {
+    SPDLOG_CRITICAL("Durability Error: futex wait failed (errno {0})", errno);
+    std::abort();
+  }
 }
 
 Logger::WaitResult Logger::WaitUntilDurable(EpochNumber commit_epoch,
@@ -209,23 +244,22 @@ Logger::WaitResult Logger::WaitUntilDurable(EpochNumber commit_epoch,
   // The epoch hook requests this epoch's flush once `E = commit_epoch + 2`.
   if (epoch_ != nullptr) epoch_->RequestEpochAdvance(commit_epoch + 2);
 
-  std::unique_lock<std::mutex> lock(durability_mutex_);
-  const auto reached = [&] {
-    return durable_epoch_.load(std::memory_order_seq_cst) >= commit_epoch ||
-           state_ != State::kRunning;
-  };
-  if (deadline == Deadline::max()) {
-    durability_cv_.wait(lock, reached);
-  } else if (!durability_cv_.wait_until(lock, deadline, reached)) {
-    return WaitResult::kTimedOut;
+  for (;;) {
+    const uint32_t observed = durability_wake_.load();
+    // Sampled before the reads below, so a result published by the deadline
+    // is not reported as a timeout.
+    const bool expired = deadline != Deadline::max() &&
+                         std::chrono::steady_clock::now() >= deadline;
+    const State state = state_.load();
+    // Durability outranks a terminal state, including at the deadline.
+    if (GetDurableEpoch() >= commit_epoch) return WaitResult::kDurable;
+    if (state != State::kRunning) {
+      return state == State::kStopped ? WaitResult::kStopped
+                                      : WaitResult::kFailed;
+    }
+    if (expired) return WaitResult::kTimedOut;
+    wait_for_durability_change(observed, deadline);
   }
-
-  // A durable epoch that already covers this one outranks a terminal state: the
-  // records are on the device regardless of what happened afterwards.
-  if (durable_epoch_.load(std::memory_order_seq_cst) >= commit_epoch) {
-    return WaitResult::kDurable;
-  }
-  return state_ == State::kStopped ? WaitResult::kStopped : WaitResult::kFailed;
 }
 
 bool Logger::within_max_lag(epoch::Framework &epoch) const {
@@ -239,9 +273,11 @@ bool Logger::within_max_lag(epoch::Framework &epoch) const {
 void Logger::WaitMaxLag(epoch::Framework &epoch) {
   assert(epoch.ThreadEpoch() == epoch::Framework::kThreadOffline);
   if (within_max_lag(epoch)) return;
-  std::unique_lock<std::mutex> lock(durability_mutex_);
-  durability_cv_.wait(
-      lock, [&] { return state_ != State::kRunning || within_max_lag(epoch); });
+  for (;;) {
+    const uint32_t observed = durability_wake_.load();
+    if (state_ != State::kRunning || within_max_lag(epoch)) return;
+    wait_for_durability_change(observed, Deadline::max());
+  }
 }
 
 void Logger::AwaitCommitDurability(EpochNumber commit_epoch,
