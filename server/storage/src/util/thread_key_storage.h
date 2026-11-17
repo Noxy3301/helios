@@ -18,8 +18,8 @@
 
 /**
  * @file server/storage/src/util/thread_key_storage.h
- * Per-thread slots addressed by a key, with an enumeration over every slot
- * created so far that the epoch framework walks.
+ * Per-thread slots addressed by a key, walked by the epoch framework and the
+ * logger, and reused after their thread exits.
  */
 
 #ifndef HELIOS_STORAGE_SRC_UTIL_THREAD_KEY_STORAGE_H
@@ -28,105 +28,130 @@
 #include <pthread.h>
 
 #include <atomic>
-#include <cerrno>
 #include <cstdlib>
 #include <functional>
 #include <iostream>
-#include <utility>
+#include <mutex>
+#include <optional>
 
 namespace helios::storage {
 
 /**
- * @brief Holds one T per calling thread, and links every T created so far so
- *        another thread can walk them.
+ * @brief Holds one T per calling thread in slots another thread can walk.
  *
- * @details Get() stores the node in pthread TLS and prepends it to
- * head_node_. Destroying this object deletes every node, so no thread may
- * call Get afterwards.
+ * @details Slots sit in blocks of 64, no two on one cache line, and are
+ * never freed or moved while this object lives. A thread that exits leaves
+ * its T in place; the next thread that needs a slot takes it over and sees the
+ * T as the exited thread left it. Destroying this object destroys every T, so
+ * no thread may call Get or ForEach afterwards.
  */
 template <class T>
 class ThreadKeyStorage {
-  struct TlsNode {
-    TlsNode *prev;
-    T payload;
-    TlsNode() : prev(nullptr), payload() {}
-    template <class U>
-    explicit TlsNode(std::function<U()> f)
-        : prev(nullptr), payload(std::move(f())) {}
+  struct alignas(64) Slot {
+    std::atomic<bool> owned{false};
+    std::optional<T> payload;
+  };
+
+  struct Block {
+    Slot slots[64];
+    std::atomic<size_t> size{0};
+    std::atomic<Block *> next{nullptr};
   };
 
  public:
-  ThreadKeyStorage() : head_node_(nullptr) {
-    int err = ::pthread_key_create(&key_, nullptr);
+  ThreadKeyStorage() {
+    const int err = ::pthread_key_create(&key_, release);
     if (err != 0) {
-      // Every access below reads an uninitialized key otherwise.
       std::cerr << "::pthread_key_create failed: " << err << std::endl;
       std::abort();
     }
   }
 
   ~ThreadKeyStorage() {
-    auto *ptr = head_node_.load();
-    while (ptr != nullptr) {
-      auto *prev = ptr->prev;
-      delete ptr;
-      ptr = prev;
+    Block *block = first_.next.load();
+    while (block != nullptr) {
+      Block *next = block->next.load();
+      delete block;
+      block = next;
     }
-    int err = ::pthread_key_delete(key_);
+    const int err = ::pthread_key_delete(key_);
     if (err != 0) {
       std::cerr << "::pthread_key_delete failed: " << err << std::endl;
     }
   }
 
   /**
-   * @brief Returns this thread's object, constructing it with `func` on the
-   *        first call.
+   * @brief Returns this thread's object.
+   *
+   * @details The first call takes over the slot of an exited thread and keeps
+   * the T found there, or constructs a T with `func` in a new slot.
    */
   template <class U>
   T *Get(std::function<U()> &&func) {
-    void *ptr = ::pthread_getspecific(key_);
-    if (ptr == nullptr) ptr = Install(new TlsNode(std::move(func)));
-    return &reinterpret_cast<TlsNode *>(ptr)->payload;
+    auto *slot = static_cast<Slot *>(::pthread_getspecific(key_));
+    if (slot == nullptr) {
+      slot = install([&](Slot &fresh) { fresh.payload.emplace(func()); });
+    }
+    return &*slot->payload;
   }
 
   T *Get() {
-    void *ptr = ::pthread_getspecific(key_);
-    if (ptr == nullptr) ptr = Install(new TlsNode());
-    return &reinterpret_cast<TlsNode *>(ptr)->payload;
+    auto *slot = static_cast<Slot *>(::pthread_getspecific(key_));
+    if (slot == nullptr) {
+      slot = install([](Slot &fresh) { fresh.payload.emplace(); });
+    }
+    return &*slot->payload;
   }
 
   /**
-   * @brief Invokes `f` on every published per-thread T, newest first.
+   * @brief Invokes `f` on every T constructed so far, including those whose
+   *        thread exited.
    */
   void ForEach(std::function<void(T *)> &&f) {
-    TlsNode *ptr = head_node_.load();
-    while (ptr != nullptr) {
-      f(&ptr->payload);
-      ptr = ptr->prev;
+    for (Block *block = &first_; block != nullptr; block = block->next.load()) {
+      const size_t size = block->size.load();
+      for (size_t i = 0; i < size; ++i) f(&*block->slots[i].payload);
     }
   }
 
  private:
-  /**
-   * @brief Binds `node` to this thread and publishes it to the walk.
-   */
-  TlsNode *Install(TlsNode *node) {
-    const int err = ::pthread_setspecific(key_, node);
+  static void release(void *ptr) {
+    static_cast<Slot *>(ptr)->owned.store(false);
+  }
+
+  template <class Initialize>
+  Slot *install(Initialize initialize) {
+    std::lock_guard<std::mutex> lock(install_mutex_);
+    for (Block *block = &first_;; block = block->next.load()) {
+      const size_t size = block->size.load();
+      for (size_t i = 0; i < size; ++i) {
+        Slot &slot = block->slots[i];
+        if (!slot.owned.load()) return bind(slot);
+      }
+      if (size < 64) {
+        Slot &slot = block->slots[size];
+        initialize(slot);
+        bind(slot);
+        block->size.store(size + 1);
+        return &slot;
+      }
+      if (block->next.load() == nullptr) block->next.store(new Block());
+    }
+  }
+
+  Slot *bind(Slot &slot) {
+    const int err = ::pthread_setspecific(key_, &slot);
     if (err != 0) {
       std::cerr << "::pthread_setspecific failed: " << err << std::endl;
       std::abort();
     }
-    for (;;) {
-      TlsNode *old = head_node_.load();
-      node->prev = old;
-      if (head_node_.compare_exchange_weak(old, node)) return node;
-    }
+    slot.owned.store(true);
+    return &slot;
   }
 
   pthread_key_t key_;
-  // pthread TLS cannot be iterated from another thread, so every node is
-  // linked here too.
-  std::atomic<TlsNode *> head_node_;
+  std::mutex install_mutex_;
+  Block first_;
 };
 
 }  // namespace helios::storage
