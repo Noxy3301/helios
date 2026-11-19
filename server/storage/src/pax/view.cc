@@ -130,6 +130,7 @@ bool Database::InstallPaxSchema(const std::string_view table_name,
   // This table has no entry yet: an index declared before the schema is
   // persisted by this install.
   auto &definition = entries[std::string(table_name)];
+  definition.id = table->id();
   definition.schema = schema;
   definition.indexes = table->IndexDefinitions();
   if (!pax::StoreCatalog(config_.work_dir, entries, next_index_id_))

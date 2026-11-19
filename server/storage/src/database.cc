@@ -248,7 +248,7 @@ Database::Database(const Config &config)
   }
   next_index_id_ = catalog.next_index_id;
   for (auto &[name, definition] : catalog.entries) {
-    CreateTable(name);
+    table_dictionary_.CreateTable(name, definition.id);
     Table *table = GetTable(name);
     if (!table->InstallPaxSchema(std::move(definition.schema))) {
       SPDLOG_CRITICAL("Cannot restore PAX schema for table {}", name);
@@ -430,6 +430,7 @@ pax::CatalogEntries Database::CatalogSnapshot() {
     const auto *store = table.GetPaxTable();
     if (store == nullptr) return;
     auto &definition = entries[table.Name()];
+    definition.id = table.id();
     definition.schema = store->schema();
     definition.indexes = table.IndexDefinitions();
   });

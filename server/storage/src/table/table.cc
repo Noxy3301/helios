@@ -15,7 +15,8 @@
 #include "index/masstree_index.h"
 
 namespace helios::storage {
-Table::Table(std::string_view table_name) : table_name_(table_name) {}
+Table::Table(std::string_view table_name, uint32_t id)
+    : table_name_(table_name), id_(id) {}
 
 Table::~Table() {
   delete pax_table_.load(std::memory_order_acquire);

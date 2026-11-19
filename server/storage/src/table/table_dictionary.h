@@ -9,6 +9,7 @@
 #ifndef HELIOS_STORAGE_SRC_TABLE_TABLE_DICTIONARY_H
 #define HELIOS_STORAGE_SRC_TABLE_TABLE_DICTIONARY_H
 
+#include <algorithm>
 #include <atomic>
 #include <functional>
 #include <mutex>
@@ -45,12 +46,17 @@ class TableDictionary {
   /**
    * @brief Publishes a new table.
    *
+   * @param id The id the catalog holds for a table restored at startup; 0
+   *           takes the next free id.
    * @return false when a table of that name already exists.
    */
-  bool CreateTable(std::string_view table_name) {
+  bool CreateTable(std::string_view table_name, uint32_t id = 0) {
     std::lock_guard<std::mutex> lk(create_mutex_);
     if (Find(table_name) != nullptr) return false;
-    auto *node = new Node(table_name, head_.load(std::memory_order_relaxed));
+    if (id == 0) id = next_id_;
+    next_id_ = std::max(next_id_, id + 1);
+    auto *node =
+        new Node(table_name, id, head_.load(std::memory_order_relaxed));
     head_.store(node, std::memory_order_release);
     return true;
   }
@@ -77,8 +83,8 @@ class TableDictionary {
     Table table;
     Node *next;
 
-    Node(std::string_view table_name, Node *next)
-        : name(table_name), table(table_name), next(next) {}
+    Node(std::string_view table_name, uint32_t id, Node *next)
+        : name(table_name), table(table_name, id), next(next) {}
   };
 
   Node *Find(std::string_view table_name) const {
@@ -91,6 +97,8 @@ class TableDictionary {
 
   std::atomic<Node *> head_{nullptr};
   std::mutex create_mutex_;
+  // Above every id handed out or restored; guarded by create_mutex_.
+  uint32_t next_id_ = 1;
 };
 
 }  // namespace helios::storage
