@@ -137,7 +137,7 @@ TEST_F(RecoveryTest, ALoggedWriteCarriesTheUnlockedTid) {
   bool seen_index_entry = false;
   for (const auto &record : scan.records) {
     for (const auto &write : record.writes) {
-      if (write.index_name.empty()) {
+      if (write.secondary_op == helios::storage::wal::SecondaryIndexOp::kNone) {
         if (write.key != "k") continue;
         seen_row = true;
         EXPECT_EQ(write.buffer, TestHelper::Row("v1"));

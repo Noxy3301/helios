@@ -32,24 +32,22 @@ Tidword PublishedTid(Tidword commit_tid, const Record &item) {
 }
 
 // Upper bounds on the msgpack bytes a record adds around its strings: the
-// record, epoch and write-list headers, and per write its array header, five
-// string headers, the TID, index id, key list and op.
+// record, epoch and write-list headers, and per write its array header, three
+// string headers, the TID, table id, index id, key list and op.
 constexpr size_t kLogRecordFraming = 11;
-constexpr size_t kLogWriteFraming = 44;
+constexpr size_t kLogWriteFraming = 38;
 
 // Packs one write as LogRecord::Write's MSGPACK_DEFINE does. A commit logs no
 // primary-key list, which packs as an empty array.
 void pack_write(msgpack::packer<wal::PackedLogRecord> &pk, std::string_view key,
-                std::string_view buffer, Tidword tid,
-                std::string_view table_name, std::string_view index_name,
+                std::string_view buffer, Tidword tid, uint32_t table_id,
                 uint32_t index_id, wal::SecondaryIndexOp op,
                 std::string_view primary_key) {
-  pk.pack_array(9);
+  pk.pack_array(8);
   pk.pack(key);
   pk.pack(buffer);
   pk.pack(tid);
-  pk.pack(table_name);
-  pk.pack(index_name);
+  pk.pack(table_id);
   pk.pack(index_id);
   pk.pack_array(0);
   pk.pack(op);
@@ -288,16 +286,15 @@ bool Transaction::Commit(CommitDurability durability, std::string &reason,
   size_t log_writes = 0;
   size_t log_bytes = kLogRecordFraming;
   for (const auto &[item, entry] : write_set_) {
-    const size_t names = kLogWriteFraming + entry.key.size() +
-                         entry.table->Name().size() + entry.index_name.size();
+    const size_t framing = kLogWriteFraming + entry.key.size();
     if (const auto *row = std::get_if<RowUpdate>(&entry.update)) {
       ++log_writes;
-      log_bytes += names + row->bytes.size();
+      log_bytes += framing + row->bytes.size();
       continue;
     }
     for (const auto &delta : std::get<IndexUpdate>(entry.update).deltas) {
       ++log_writes;
-      log_bytes += names + delta.primary_key.size();
+      log_bytes += framing + delta.primary_key.size();
     }
   }
   // The record packs as LogRecord's MSGPACK_DEFINE does: [epoch, [write...]].
@@ -646,10 +643,10 @@ Tidword Transaction::Apply(IndexRecord &record, const WriteEntry &entry,
 
 void Transaction::AppendLog(msgpack::packer<wal::PackedLogRecord> &pk,
                             const WriteEntry &entry, Tidword published) {
-  const std::string &table_name = entry.table->Name();
+  const uint32_t table_id = entry.table->id();
   if (const auto *row = std::get_if<RowUpdate>(&entry.update)) {
     // The bytes the install unpacked; a delete logs an empty value.
-    pack_write(pk, entry.key, row->bytes, published, table_name, {}, 0,
+    pack_write(pk, entry.key, row->bytes, published, table_id, 0,
                wal::SecondaryIndexOp::kNone, {});
     return;
   }
@@ -657,8 +654,8 @@ void Transaction::AppendLog(msgpack::packer<wal::PackedLogRecord> &pk,
   // Preserve all changes in order, including repeated primary keys.
   const auto &index = std::get<IndexUpdate>(entry.update);
   for (const auto &delta : index.deltas) {
-    pack_write(pk, entry.key, {}, published, table_name, entry.index_name,
-               index.index_id, delta.op, delta.primary_key);
+    pack_write(pk, entry.key, {}, published, table_id, index.index_id, delta.op,
+               delta.primary_key);
   }
 }
 

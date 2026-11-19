@@ -74,7 +74,7 @@ PackedLogRecord MakeRecord(EpochNumber epoch, const std::string &key) {
   record.epoch = epoch;
   LogRecord::Write write;
   write.key = key;
-  write.table_name = "t";
+  write.table_id = 1;
   record.writes.emplace_back(std::move(write));
   PackedLogRecord packed{epoch, {}};
   msgpack::pack(packed, record);
@@ -191,7 +191,7 @@ class WalSegmentTest : public ::testing::Test {
     record.epoch = epoch;
     LogRecord::Write write;
     write.key = key;
-    write.table_name = "t";
+    write.table_id = 1;
     record.writes.emplace_back(std::move(write));
     msgpack::pack(payload, LogRecords{record});
 

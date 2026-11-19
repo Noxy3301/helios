@@ -70,6 +70,14 @@ class TableDictionary {
     return &node->table;
   }
 
+  Table *get_table(uint32_t id) const {
+    for (Node *node = head_.load(std::memory_order_acquire); node != nullptr;
+         node = node->next) {
+      if (node->table.id() == id) return &node->table;
+    }
+    return nullptr;
+  }
+
   void ForEachTable(const std::function<void(Table &)> &f) const {
     for (Node *node = head_.load(std::memory_order_acquire); node != nullptr;
          node = node->next) {

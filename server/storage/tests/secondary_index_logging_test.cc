@@ -86,7 +86,8 @@ SecondaryLogStats GetSecondaryIndexLogStatsForLatestEpoch(
   for (const auto &record : records) {
     if (record.epoch != max_epoch) continue;
     for (const auto &write : record.writes) {
-      if (write.index_name.empty()) continue;
+      if (write.secondary_op == helios::storage::wal::SecondaryIndexOp::kNone)
+        continue;
       stats.secondary_entry_count++;
       stats.primary_keys_count += write.primary_keys.size();
       for (const auto &pk : write.primary_keys) {
@@ -245,6 +246,25 @@ TEST_F(SecondaryIndexLoggingTest, RecoveryKeepsADeltaForAnEmptyPrimaryKey) {
   db_.reset();
   db_ = std::make_unique<helios::storage::Database>(config_);
   EXPECT_TRUE(TestHelper::ReadIndex(*db_, "users", "idx", "k").empty());
+}
+
+TEST_F(SecondaryIndexLoggingTest, RecoverySkipsTheDroppedIndexId) {
+  ASSERT_TRUE(db_->CreateSecondaryIndex(
+      "users", "idx", helios::storage::IndexConstraint::kNone));
+  ASSERT_TRUE(TestHelper::CommitWrites(*db_, {{"users", "a", "value_a"}},
+                                       {{"users", "idx", "old", "a", false}}));
+  ASSERT_TRUE(db_->WriteCheckpoint());
+  ASSERT_TRUE(db_->DropSecondaryIndexes("users", {"idx"}));
+  ASSERT_TRUE(db_->CreateSecondaryIndex(
+      "users", "idx", helios::storage::IndexConstraint::kNone));
+  ASSERT_TRUE(TestHelper::CommitWrites(*db_, {},
+                                       {{"users", "idx", "new", "a", false}}));
+
+  db_.reset();
+  db_ = std::make_unique<helios::storage::Database>(config_);
+  EXPECT_TRUE(TestHelper::ReadIndex(*db_, "users", "idx", "old").empty());
+  EXPECT_EQ(std::vector<std::string>({"a"}),
+            TestHelper::ReadIndex(*db_, "users", "idx", "new"));
 }
 
 TEST_F(SecondaryIndexLoggingTest, RecoveryWithSecondaryIndexWithoutCheckpoint) {

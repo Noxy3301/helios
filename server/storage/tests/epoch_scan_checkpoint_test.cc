@@ -155,7 +155,10 @@ class EpochScanCheckpointTest : public ::testing::Test {
                                                     const std::string &key) {
     for (const auto &record : records) {
       for (const auto &write : record.writes) {
-        if (!write.index_name.empty() || write.key != key) continue;
+        if (write.secondary_op !=
+                helios::storage::wal::SecondaryIndexOp::kNone ||
+            write.key != key)
+          continue;
         return TestHelper::RowPayload(write.buffer);
       }
     }
@@ -169,7 +172,10 @@ class EpochScanCheckpointTest : public ::testing::Test {
     std::vector<std::string> primary_keys;
     for (const auto &record : records) {
       for (const auto &write : record.writes) {
-        if (write.index_name != kIndex || write.key != key) continue;
+        if (write.secondary_op !=
+                helios::storage::wal::SecondaryIndexOp::kFull ||
+            write.key != key)
+          continue;
         primary_keys.insert(primary_keys.end(), write.primary_keys.begin(),
                             write.primary_keys.end());
       }
