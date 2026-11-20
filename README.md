@@ -1,4 +1,10 @@
-# Helios
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset=".github/logo-dark.svg">
+    <source media="(prefers-color-scheme: light)" srcset=".github/logo-light.svg">
+    <img alt="Helios" src=".github/logo-light.svg" height="72">
+  </picture>
+</p>
 
 ## Prerequisites
 
