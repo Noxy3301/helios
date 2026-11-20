@@ -507,7 +507,10 @@ bool ha_helios::backfill_sorted(const std::vector<const KEY *> &keys,
         (index_entries.size() + kBackfillWriteChunkRows - 1) /
         kBackfillWriteChunkRows;
     const size_t mid = chunks / 2 * kBackfillWriteChunkRows;
-    HeliosProxy lower_conn(server_connection_host(), server_connection_port());
+    // A channel runs its requests in order, so the lower half takes another
+    // one.
+    HeliosProxy lower_conn(server_connection_host(), server_connection_port(),
+                           (thd_get_thread_id(ha_thd()) + 1) % kRpcChannels);
     std::atomic<bool> commit_failed{false};
     std::thread lower(commit_range, std::ref(lower_conn),
                       std::cref(db_table_name), std::cref(index_name),

@@ -7,6 +7,9 @@
 #include "rpc/helios_rpc.hh"
 #include "database_manager.hh"
 
+struct AckQueue;
+struct JobQueue;
+
 class StorageServer : public TcpServer {
 public:
     StorageServer();
@@ -23,4 +26,10 @@ private:
     std::shared_ptr<TableRowCounts> row_counts_ = std::make_shared<TableRowCounts>();
     std::shared_ptr<HiddenKeyAllocator> hidden_keys_ =
         std::make_shared<HiddenKeyAllocator>();
+
+    // Commit replies held until their epoch is durable, and the requests that
+    // run off their connection's thread. The threads serving them start in
+    // init() and share ownership, since they never exit.
+    std::shared_ptr<AckQueue> acks_;
+    std::shared_ptr<JobQueue> jobs_;
 };

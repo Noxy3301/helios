@@ -49,6 +49,7 @@ set(HELIOS_SOURCES ha_helios.cc ha_helios.hh
                       log.hh
                       transaction.cc transaction.hh
                       helios_proxy.cc helios_proxy.hh
+                      shared_channel.cc shared_channel.hh
                       key_pack.cc key_pack.hh
                       record.cc
                       index_search.cc index_search.hh

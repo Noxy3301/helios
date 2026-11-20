@@ -77,11 +77,8 @@ bool TcpServer::setup_and_listen(int& server_socket) {
 
 void TcpServer::serve_client(int client_socket, std::string client_ip) {
     handle_client(client_socket);
-    // Ensure socket is closed when done
-    int fd = client_socket;
-    close(client_socket);
     int left = --active_connections;
-    SPDLOG_INFO("Closed connection fd={} ({}) (active={})", fd,
+    SPDLOG_INFO("Closed connection fd={} ({}) (active={})", client_socket,
                 client_ip.c_str(), left);
 }
 

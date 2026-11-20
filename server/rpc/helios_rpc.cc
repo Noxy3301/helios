@@ -18,9 +18,11 @@ HeliosRpc::HeliosRpc(std::shared_ptr<DatabaseManager> db_manager,
       hidden_keys_(hidden_keys) {
 }
 
-bool HeliosRpc::handle_rpc(const std::string& message,
+bool HeliosRpc::handle_rpc(std::string_view message,
                            std::string_view request_payload,
-                           std::string& result, std::string& payload) {
+                           std::string& result, std::string& payload,
+                           helios::storage::EpochNumber& await_epoch) {
+    await_epoch = 0;
     if (message.size() == 1) {
         bool ok = false;
         switch (static_cast<helios::rpc::FlatOp>(message[0])) {
@@ -31,7 +33,7 @@ bool HeliosRpc::handle_rpc(const std::string& message,
                 ok = handleTxBatchRead(request_payload, result);
                 break;
             case helios::rpc::FlatOp::kCommit:
-                ok = handleTxCommit(request_payload, result);
+                ok = handleTxCommit(request_payload, result, await_epoch);
                 break;
         }
         db_manager_->get_database()->ReleaseThreadEpoch();
@@ -45,7 +47,8 @@ bool HeliosRpc::handle_rpc(const std::string& message,
     Request request;
     Helios::Protocol::Response response;
 
-    if (!request.ParseFromString(message)) {
+    if (!request.ParseFromArray(message.data(),
+                                static_cast<int>(message.size()))) {
         SPDLOG_ERROR("Malformed request envelope ({} bytes)", message.size());
         response.set_error("malformed request");
     } else {

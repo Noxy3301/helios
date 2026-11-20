@@ -13,6 +13,8 @@ public:
     bool run();
     
 protected:
+    // Serves one connection until it ends. Takes over the socket, and closes
+    // it once nothing can reply on it any more.
     virtual void handle_client(int client_socket) = 0;
     
 private:

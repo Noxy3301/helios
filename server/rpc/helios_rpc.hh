@@ -149,12 +149,22 @@ public:
                  std::shared_ptr<HiddenKeyAllocator> hidden_keys);
     ~HeliosRpc() = default;
 
-    // Routes a one-byte message as a flat request with body request_payload,
-    // any other as a protobuf envelope, and fills result and payload. Returns
-    // false on a malformed flat body or a reply that fails to serialize.
-    bool handle_rpc(const std::string& message,
-                    std::string_view request_payload, std::string& result,
-                    std::string& payload);
+    /**
+     * @brief Routes one request and puts its reply envelope into `result`.
+     *
+     * A one-byte `message` names a flat request whose body is
+     * `request_payload`; any other is a protobuf envelope, routed by the arm
+     * it sets.
+     *
+     * @param[out] payload The bytes that ride raw after the envelope.
+     * @param[out] await_epoch The epoch that must be durable before the reply
+     * goes out, and 0 when it may go now.
+     * @return false when a flat body is malformed or the response cannot be
+     * serialized, which leaves the request unanswered.
+     */
+    bool handle_rpc(std::string_view message, std::string_view request_payload,
+                    std::string& result, std::string& payload,
+                    helios::storage::EpochNumber& await_epoch);
 
 private:
     std::shared_ptr<DatabaseManager> db_manager_;
@@ -184,7 +194,8 @@ private:
     void handleTxScanIndex(
         const Helios::Protocol::TxScanIndex::Request& request,
         Helios::Protocol::TxScanIndex::Response* response);
-    bool handleTxCommit(std::string_view body, std::string& reply);
+    bool handleTxCommit(std::string_view body, std::string& reply,
+                        helios::storage::EpochNumber& await_epoch);
 
     // Read-plan execution. The reply is the flat HELIOSRP payload, which
     // rides raw after the envelope.

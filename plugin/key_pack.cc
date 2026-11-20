@@ -337,7 +337,7 @@ int ha_helios::generate_hidden_primary_key(HeliosTransaction *tx,
   auto *proxy = get_proxy();
   std::lock_guard<std::mutex> lock(share->hidden_keys.mutex);
   // A range from an earlier server run may overlap what the restarted server
-  // hands out. A connection that does not know the run (token 0) or whose run
+  // hands out. A session that does not know the run (token 0) or whose run
   // differs from the range's reserves again.
   const uint64_t token = proxy->storage_boot_token();
   const bool spent = share->hidden_keys.next >= share->hidden_keys.end;
