@@ -210,13 +210,13 @@ class Logger {
   EpochNumber flush_epoch_{0};
   bool stop_requested_{false};
 
-  // Protects the result reported to commit and checkpoint waiters.
+  // Serializes publishers; waiters read the result without this mutex.
   enum class State { kRunning, kStopped, kFailed };
   // `D`: the highest epoch known to be durable.
   std::atomic<EpochNumber> durable_epoch_{0};
   std::mutex durability_mutex_;
-  std::condition_variable durability_cv_;
-  State state_{State::kRunning};
+  std::atomic<State> state_{State::kRunning};
+  std::atomic<uint32_t> durability_wake_{0};
   bool process_fail_stop_{false};
 
   // Set by Start before any durability wait runs.
@@ -243,6 +243,8 @@ class Logger {
   void PublishDurable(EpochNumber durable_epoch);
   void PublishFailure(int error_number);
   void PublishStopped();
+  void wake_durability_waiters();
+  void wait_for_durability_change(uint32_t observed, Deadline deadline);
 };
 
 }  // namespace wal
