@@ -116,10 +116,10 @@ void replay_keys(TableDictionary &tables, const wal::LogRecords &records,
       });
 
   for (const auto *write : writes) {
-    Table *table = tables.GetTable(write->table_name);
+    Table *table = tables.get_table(write->table_id);
     if (table == nullptr || table->GetPaxTable() == nullptr) {
       SPDLOG_CRITICAL("Recovery failed: PAX schema for table {0} is missing.",
-                      write->table_name);
+                      write->table_id);
       exit(EXIT_FAILURE);
     }
     const Tidword tid = write->transaction_id;
@@ -127,7 +127,7 @@ void replay_keys(TableDictionary &tables, const wal::LogRecords &records,
 
     // A primary key keeps its newest write's word; of two with one TID, the
     // first.
-    if (write->index_name.empty()) {
+    if (write->secondary_op == wal::SecondaryIndexOp::kNone) {
       auto &tree = table->GetPrimaryIndex();
       auto *item = static_cast<RowRecord *>(tree.Get(write->key));
       if (item != nullptr &&
@@ -146,8 +146,12 @@ void replay_keys(TableDictionary &tables, const wal::LogRecords &records,
 
     // An index dropped since, or an earlier one of the same name, has an id
     // the catalog no longer holds; its writes are skipped.
-    index::SecondaryIndex *index = table->GetSecondaryIndex(write->index_name);
-    if (index == nullptr || index->id != write->index_id) continue;
+    index::SecondaryIndex *index = nullptr;
+    table->ForEachSecondaryIndex(
+        [&](const std::string &, index::SecondaryIndex &candidate) {
+          if (candidate.id == write->index_id) index = &candidate;
+        });
+    if (index == nullptr) continue;
     // A checkpoint's list counts as one insert per primary key it holds.
     if (write->secondary_op == wal::SecondaryIndexOp::kFull) {
       for (const auto &primary_key : write->primary_keys)
@@ -173,8 +177,8 @@ void replay_rows(TableDictionary &tables, const wal::LogRecords &records,
                  std::unordered_map<Table *, uint64_t> &installed) {
   for (const auto &record : records) {
     for (const auto &write : record.writes) {
-      if (!write.index_name.empty()) continue;
-      Table *table = tables.GetTable(write.table_name);
+      if (write.secondary_op != wal::SecondaryIndexOp::kNone) continue;
+      Table *table = tables.get_table(write.table_id);
       auto *item =
           static_cast<RowRecord *>(table->GetPrimaryIndex().Get(write.key));
       if (item == nullptr) continue;
@@ -191,12 +195,12 @@ void replay_rows(TableDictionary &tables, const wal::LogRecords &records,
               reinterpret_cast<const std::byte *>(write.buffer.data()),
               write.buffer.size(), row)) {
         SPDLOG_CRITICAL("Recovery failed: value of {} in {} does not fit PAX",
-                        write.key, write.table_name);
+                        write.key, write.table_id);
         exit(EXIT_FAILURE);
       }
       if (!item->AllocateSlot(store, row, tid.epoch)) {
         SPDLOG_CRITICAL("Recovery failed: no PAX slot for {} in {}", write.key,
-                        write.table_name);
+                        write.table_id);
         exit(EXIT_FAILURE);
       }
       item->InstallRow(row, tid.epoch);
@@ -248,7 +252,7 @@ Database::Database(const Config &config)
   }
   next_index_id_ = catalog.next_index_id;
   for (auto &[name, definition] : catalog.entries) {
-    CreateTable(name);
+    table_dictionary_.CreateTable(name, definition.id);
     Table *table = GetTable(name);
     if (!table->InstallPaxSchema(std::move(definition.schema))) {
       SPDLOG_CRITICAL("Cannot restore PAX schema for table {}", name);
@@ -355,7 +359,7 @@ bool Database::CreateSecondaryIndex(const std::string_view table_name,
       (index_type == IndexConstraint::kUnique || pk_slices.size() % 2 != 0)) {
     return false;
   }
-  // An empty index name marks a primary record in the WAL
+  // An empty name addresses the primary index.
   if (index_name.empty()) return false;
   // Serialized with the other definition changes.
   std::lock_guard<std::mutex> lk(ddl_mutex_);
@@ -430,6 +434,7 @@ pax::CatalogEntries Database::CatalogSnapshot() {
     const auto *store = table.GetPaxTable();
     if (store == nullptr) return;
     auto &definition = entries[table.Name()];
+    definition.id = table.id();
     definition.schema = store->schema();
     definition.indexes = table.IndexDefinitions();
   });

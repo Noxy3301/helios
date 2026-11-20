@@ -28,6 +28,7 @@ struct IndexDefinition {
 
 // Everything one table declares: its row format and its secondary indexes.
 struct TableDefinition {
+  uint32_t id = 0;
   TableSchema schema;
   std::vector<IndexDefinition> indexes;
 };

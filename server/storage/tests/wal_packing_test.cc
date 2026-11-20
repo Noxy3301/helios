@@ -76,14 +76,13 @@ LogRecords VariedRecords() {
     row.key = Filled(i + 2, 'k');
     row.buffer = Filled(i, 'v');
     row.transaction_id = Tidword(kTids[i % std::size(kTids)]);
-    row.table_name = Filled(i + 5, 't');
+    row.table_id = i % 2 == 0 ? UINT32_MAX : static_cast<uint32_t>(i + 1);
     writes.push_back(row);
 
     Write delta;
     delta.key = Filled(i + 1, 's');
     delta.transaction_id = Tidword(kTids[(i + 3) % std::size(kTids)]);
-    delta.table_name = Filled(i + 7, 't');
-    delta.index_name = Filled(i + 4, 'i');
+    delta.table_id = row.table_id;
     delta.index_id = i % 2 == 0 ? UINT32_MAX : static_cast<uint32_t>(i);
     delta.secondary_op =
         i % 2 == 0 ? SecondaryIndexOp::kInsert : SecondaryIndexOp::kDelete;
@@ -95,14 +94,13 @@ LogRecords VariedRecords() {
   erased.key = "erased";
   erased.transaction_id = Tidword(kTids[6]);
   erased.transaction_id.absent = true;
-  erased.table_name = "t";
+  erased.table_id = 1;
   writes.push_back(erased);
 
   Write full;
   full.key = "full";
   full.transaction_id = Tidword(kTids[7]);
-  full.table_name = "t";
-  full.index_name = "idx";
+  full.table_id = 1;
   full.index_id = 1;
   full.secondary_op = SecondaryIndexOp::kFull;
   for (size_t i = 0; i < 20; ++i) full.primary_keys.push_back(Filled(i, 'f'));
@@ -215,8 +213,8 @@ struct Commit {
 void SortByRecord(std::vector<Write> &writes) {
   std::stable_sort(writes.begin(), writes.end(),
                    [](const Write &a, const Write &b) {
-                     return std::tie(a.table_name, a.index_name, a.key) <
-                            std::tie(b.table_name, b.index_name, b.key);
+                     return std::tie(a.table_id, a.index_id, a.key) <
+                            std::tie(b.table_id, b.index_id, b.key);
                    });
 }
 
@@ -298,7 +296,7 @@ TEST_F(WalPackingTest, ACommitRecordIsTheLogRecordPacking) {
       write.key = row.key;
       if (row.op != RowOp::kDelete) write.buffer = TestHelper::Row(row.value);
       write.transaction_id.absent = row.op == RowOp::kDelete;
-      write.table_name = row.table;
+      write.table_id = row.table == table ? 1 : 2;
       expected.push_back(write);
     }
     for (const auto &op : commits[c].ops) {
@@ -306,8 +304,7 @@ TEST_F(WalPackingTest, ACommitRecordIsTheLogRecordPacking) {
       write.key = op.secondary_key;
       write.transaction_id.absent =
           commits[c].emptied.count(op.secondary_key) != 0;
-      write.table_name = op.table;
-      write.index_name = op.index;
+      write.table_id = op.table == table ? 1 : 2;
       write.index_id = index_ids.at(op.index);
       write.secondary_op =
           op.remove ? SecondaryIndexOp::kDelete : SecondaryIndexOp::kInsert;
@@ -328,13 +325,12 @@ TEST_F(WalPackingTest, ACommitRecordIsTheLogRecordPacking) {
     for (size_t i = 0; i < actual.size(); ++i) {
       const Write &a = actual[i];
       const Write &e = expected[i];
-      EXPECT_TRUE(
-          a.key == e.key && a.buffer == e.buffer &&
-          a.table_name == e.table_name && a.index_name == e.index_name &&
-          a.index_id == e.index_id && a.primary_keys == e.primary_keys &&
-          a.secondary_op == e.secondary_op &&
-          a.secondary_primary_key == e.secondary_primary_key &&
-          a.transaction_id.absent == e.transaction_id.absent)
+      EXPECT_TRUE(a.key == e.key && a.buffer == e.buffer &&
+                  a.table_id == e.table_id && a.index_id == e.index_id &&
+                  a.primary_keys == e.primary_keys &&
+                  a.secondary_op == e.secondary_op &&
+                  a.secondary_primary_key == e.secondary_primary_key &&
+                  a.transaction_id.absent == e.transaction_id.absent)
           << "commit " << c << " write " << i;
       Tidword word = actual[i].transaction_id;
       word.absent = false;

@@ -49,7 +49,7 @@ LogRecords MakeRecords(EpochNumber epoch, const std::string &key) {
   LogRecord::Write write;
   write.key = key;
   write.buffer = "value-of-" + key;
-  write.table_name = "t";
+  write.table_id = 1;
   record.writes.emplace_back(std::move(write));
   return LogRecords{std::move(record)};
 }

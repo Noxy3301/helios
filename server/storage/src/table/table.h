@@ -50,7 +50,7 @@ class Table {
           next(next) {}
   };
 
-  explicit Table(std::string_view table_name);
+  Table(std::string_view table_name, uint32_t id);
   ~Table();
 
   /**
@@ -92,6 +92,7 @@ class Table {
   pax::PaxTable *GetPaxTable() const;
 
   const std::string &Name() const;
+  uint32_t id() const { return id_; }
 
   index::MasstreeIndex &GetPrimaryIndex();
 
@@ -127,6 +128,7 @@ class Table {
   // Chain of the live indexes, newest first.
   std::atomic<IndexNode *> indexes_{nullptr};
   std::string table_name_;
+  const uint32_t id_;
 
   IndexNode *FindIndex(std::string_view index_name) const;
 };

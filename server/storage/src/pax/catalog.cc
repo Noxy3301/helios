@@ -14,6 +14,7 @@
 #include <filesystem>
 #include <memory>
 #include <msgpack.hpp>
+#include <set>
 #include <stdexcept>
 #include <vector>
 
@@ -30,6 +31,7 @@ using File = std::unique_ptr<FILE, int (*)(FILE *)>;
 // field (0 = null flags) in widths, types and scales, and one entry per index
 // in the four parallel index vectors. Types and constraints are numeric tags.
 struct Entry {
+  uint32_t id = 0;
   std::vector<uint32_t> widths;
   std::vector<uint8_t> types;
   std::vector<int8_t> scales;
@@ -38,7 +40,7 @@ struct Entry {
   std::vector<uint8_t> index_constraints;
   std::vector<std::vector<uint32_t>> index_pk_slices;  // (offset, length) pairs
   std::vector<uint32_t> index_ids;
-  MSGPACK_DEFINE(widths, types, scales, not_null, index_names,
+  MSGPACK_DEFINE(id, widths, types, scales, not_null, index_names,
                  index_constraints, index_pk_slices, index_ids);
 };
 
@@ -64,7 +66,10 @@ bool StoreCatalog(const std::string &work_dir, const CatalogEntries &entries,
   for (const auto &[name, definition] : entries) {
     const auto &schema = definition.schema;
     if (schema.field_max_bytes.empty()) return false;
-    Entry entry{schema.field_max_bytes, {}, schema.field_scale, {}, {}, {}};
+    Entry entry;
+    entry.id = definition.id;
+    entry.widths = schema.field_max_bytes;
+    entry.scales = schema.field_scale;
     entry.not_null = schema.field_not_null;
     for (const auto type : schema.field_type) {
       const auto tag = static_cast<uint8_t>(type);
@@ -171,7 +176,10 @@ Catalog LoadCatalog(const std::string &work_dir) {
       return result;
     }
     result.next_index_id = catalog.next_index_id;
+    std::set<uint32_t> table_ids;
     for (auto &[name, entry] : catalog.entries) {
+      if (entry.id == 0 || !table_ids.insert(entry.id).second)
+        throw std::runtime_error("invalid table id");
       if (entry.widths.empty())
         throw std::runtime_error("PAX schema has no fields");
       if (entry.index_names.size() != entry.index_constraints.size() ||
@@ -179,6 +187,7 @@ Catalog LoadCatalog(const std::string &work_dir) {
           entry.index_names.size() != entry.index_ids.size())
         throw std::runtime_error("secondary index definition is incomplete");
       TableDefinition definition;
+      definition.id = entry.id;
 
       definition.schema.field_max_bytes = std::move(entry.widths);
       definition.schema.field_scale = std::move(entry.scales);

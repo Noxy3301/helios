@@ -115,6 +115,36 @@ TEST_F(PaxRecoveryTest, RestoresSchemaBeforeCheckpointAndWalValues) {
   }
 }
 
+TEST_F(PaxRecoveryTest, TableIdsSurviveCatalogOrderAndNewDeclarations) {
+  {
+    Database db(config_);
+    ASSERT_TRUE(TestHelper::CreateTable(db, "z"));
+    ASSERT_TRUE(TestHelper::CreateTable(db, "a"));
+    ASSERT_TRUE(TestHelper::WriteRow(db, "z", "same", TestHelper::Row("z1")));
+    ASSERT_TRUE(TestHelper::WriteRow(db, "a", "same", TestHelper::Row("a1")));
+    ASSERT_TRUE(db.WriteCheckpoint());
+    ASSERT_TRUE(TestHelper::WriteRow(db, "z", "same", TestHelper::Row("z2")));
+  }
+  {
+    Database db(config_);
+    EXPECT_EQ(TestHelper::ReadRow(db, "z", "same"), TestHelper::Row("z2"));
+    EXPECT_EQ(TestHelper::ReadRow(db, "a", "same"), TestHelper::Row("a1"));
+    ASSERT_TRUE(TestHelper::CreateTable(db, "m"));
+    ASSERT_TRUE(TestHelper::WriteRow(db, "m", "same", TestHelper::Row("m1")));
+    const auto catalog = pax::LoadCatalog(config_.work_dir);
+    ASSERT_EQ(catalog.status, pax::Catalog::Status::kOk);
+    EXPECT_EQ(catalog.entries.at("z").id, 1u);
+    EXPECT_EQ(catalog.entries.at("a").id, 2u);
+    EXPECT_EQ(catalog.entries.at("m").id, 3u);
+  }
+  {
+    Database db(config_);
+    EXPECT_EQ(TestHelper::ReadRow(db, "z", "same"), TestHelper::Row("z2"));
+    EXPECT_EQ(TestHelper::ReadRow(db, "a", "same"), TestHelper::Row("a1"));
+    EXPECT_EQ(TestHelper::ReadRow(db, "m", "same"), TestHelper::Row("m1"));
+  }
+}
+
 TEST_F(PaxRecoveryTest, FailedPublicationDoesNotEnableTheSchema) {
   Database db(config_);
   ASSERT_TRUE(db.CreateTable("first"));

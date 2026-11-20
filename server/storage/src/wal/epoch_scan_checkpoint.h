@@ -177,15 +177,17 @@ class EpochScanCheckpoint {
 
   struct ChunkWriter;
 
-  static CaptureResult CapturePrimaryRow(const std::string &table_name,
+  static CaptureResult CapturePrimaryRow(uint32_t table_id,
                                          std::string_view key,
                                          const RowRecord &item,
                                          LogRecord::Write &out,
                                          uint64_t &retries);
-  static CaptureResult CaptureSecondaryEntry(
-      const std::string &table_name, const std::string &index_name,
-      const index::SecondaryIndex &index, std::string_view key,
-      const IndexRecord &item, LogRecord::Write &out, uint64_t &retries);
+  static CaptureResult CaptureSecondaryEntry(uint32_t table_id,
+                                             const index::SecondaryIndex &index,
+                                             std::string_view key,
+                                             const IndexRecord &item,
+                                             LogRecord::Write &out,
+                                             uint64_t &retries);
   bool CaptureTable(Table &table, ChunkWriter &writer, Stats &stats);
   bool Publish(const ChunkWriter &writer, Stats &stats);
   void Loop();
