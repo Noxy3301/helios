@@ -149,6 +149,10 @@ extern ulong srv_read_path;
 extern bool srv_rpc_trace;
 extern char *srv_rpc_trace_path;
 
+// Connections to the storage server the sessions share; a session uses slot
+// thread id % kRpcChannels.
+constexpr size_t kRpcChannels = 16;
+
 
 namespace helios {
 

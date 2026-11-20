@@ -2,86 +2,90 @@
 #include <spdlog/spdlog.h>
 
 #include <algorithm>
+#include <cerrno>
 #include <cstdint>
 #include <cstring>
+#include <endian.h>
+#include <poll.h>
+#include <sys/eventfd.h>
 #include <sys/socket.h>
-#include <sys/uio.h>
-#include <arpa/inet.h>
+#include <unistd.h>
 
 #include "common/rpc_frame.h"
 
-namespace {
+using helios::rpc::append_len;
+using helios::rpc::kInitialBufferBytes;
+using helios::rpc::kKeptBufferBytes;
+using helios::rpc::load_len;
 
-// Bytes one recv asks for. A client sends one request and waits for its reply,
-// so a request that fits arrives in one recv instead of one per frame field.
-constexpr size_t kRecvBytes = 16 * 1024;
+FrameReader::FrameReader(Connection& conn)
+    : conn_(conn), socket_(conn.socket()) {}
 
-// Reads exactly size bytes, looping because recv(MSG_WAITALL) returns short on
-// a signal.
-bool recv_all(int socket, char* out, size_t size) {
-    size_t read_total = 0;
-    while (read_total < size) {
-        const ssize_t chunk =
-            recv(socket, out + read_total, size - read_total, MSG_WAITALL);
-        if (chunk <= 0) {
-            if (chunk < 0) {
-                SPDLOG_ERROR("Failed to receive {} frame bytes", size);
+bool FrameReader::fill(size_t need) {
+    if (end_ - begin_ >= need) return true;
+    if (begin_ + need > buffer_.size()) {
+        // Move the unread tail to the front, growing only for a larger frame.
+        const size_t unread = end_ - begin_;
+        if (need > buffer_.size()) {
+            std::string grown(std::max(need, kInitialBufferBytes), '\0');
+            std::memcpy(grown.data(), buffer_.data() + begin_, unread);
+            buffer_.swap(grown);
+        } else {
+            std::memmove(buffer_.data(), buffer_.data() + begin_, unread);
+        }
+        begin_ = 0;
+        end_ = unread;
+    }
+    while (end_ - begin_ < need) {
+        // Wait for request bytes, sending the replies others queue meanwhile.
+        pollfd fds[2] = {{socket_, POLLIN, 0}, {conn_.wake_fd(), POLLIN, 0}};
+        if (poll(fds, 2, -1) < 0) {
+            if (errno == EINTR) continue;
+            SPDLOG_ERROR("Failed to poll fd={}", socket_);
+            return false;
+        }
+        if (fds[1].revents != 0) {
+            conn_.take_wake();
+            conn_.flush();
+        }
+        if (fds[0].revents == 0) continue;
+        const ssize_t got =
+            recv(socket_, buffer_.data() + end_, buffer_.size() - end_, 0);
+        if (got <= 0) {
+            if (got < 0) {
+                SPDLOG_ERROR("Failed to receive a request frame");
             } else {
                 SPDLOG_DEBUG("Client disconnected while receiving a frame");
             }
             return false;
         }
-        read_total += static_cast<size_t>(chunk);
+        end_ += static_cast<size_t>(got);
     }
     return true;
 }
 
-}  // namespace
-
-bool MessageHandler::receive_message(int socket, std::string& envelope,
-                                     std::string& payload) {
-    char head[kRecvBytes];
-    uint32_t net_len = 0;
-    size_t got = 0;
-    while (got < sizeof(net_len)) {
-        const ssize_t chunk = recv(socket, head + got, sizeof(head) - got, 0);
-        if (chunk <= 0) {
-            if (chunk < 0) {
-                SPDLOG_ERROR("Failed to receive a frame length");
-            } else {
-                SPDLOG_DEBUG(
-                    "Client disconnected while receiving a frame length");
-            }
-            return false;
-        }
-        got += static_cast<size_t>(chunk);
+bool FrameReader::next(uint64_t& id, std::string_view& envelope,
+                       std::string_view& payload) {
+    begin_ += consumed_;
+    consumed_ = 0;
+    if (begin_ == end_) {
+        begin_ = end_ = 0;
+        if (buffer_.size() > kKeptBufferBytes) std::string().swap(buffer_);
     }
-    std::memcpy(&net_len, head, sizeof(net_len));
-    const uint32_t size = ntohl(net_len);
-    if (size > helios::rpc::kMaxPartBytes) {
-        SPDLOG_ERROR("Frame part of {} bytes exceeds the {} byte limit", size,
-                     helios::rpc::kMaxPartBytes);
+    if (!fill(helios::rpc::kFrameHeadBytes)) return false;
+    uint64_t net_id;
+    std::memcpy(&net_id, buffer_.data() + begin_, sizeof(net_id));
+    id = be64toh(net_id);
+    const uint32_t env_len = load_len(buffer_.data() + begin_ + sizeof(net_id));
+    if (env_len > helios::rpc::kMaxPartBytes) {
+        SPDLOG_ERROR("Frame part of {} bytes exceeds the {} byte limit",
+                     env_len, helios::rpc::kMaxPartBytes);
         return false;
     }
-
-    const char* rest = head + sizeof(net_len);
-    got -= sizeof(net_len);
-    const size_t in_envelope = std::min<size_t>(got, size);
-    envelope.resize(size);
-    std::memcpy(envelope.data(), rest, in_envelope);
-    if (!recv_all(socket, envelope.data() + in_envelope, size - in_envelope)) {
-        return false;
-    }
-
-    uint32_t net_pay_len = 0;
-    const size_t in_pay_len = std::min(got - in_envelope, sizeof(net_pay_len));
-    std::memcpy(&net_pay_len, rest + in_envelope, in_pay_len);
-    if (!recv_all(socket, reinterpret_cast<char*>(&net_pay_len) + in_pay_len,
-                  sizeof(net_pay_len) - in_pay_len)) {
-        return false;
-    }
-    const uint32_t pay_len = ntohl(net_pay_len);
-    if (pay_len != 0 && size != 1) {
+    const size_t pay_at = helios::rpc::kFrameHeadBytes + size_t{env_len};
+    if (!fill(pay_at + sizeof(uint32_t))) return false;
+    const uint32_t pay_len = load_len(buffer_.data() + begin_ + pay_at);
+    if (pay_len != 0 && env_len != 1) {
         SPDLOG_ERROR("Request carries a {} byte payload part", pay_len);
         return false;
     }
@@ -90,70 +94,105 @@ bool MessageHandler::receive_message(int socket, std::string& envelope,
                      pay_len, helios::rpc::kMaxPartBytes);
         return false;
     }
-
-    const size_t in_payload = got - in_envelope - in_pay_len;
-    // A client waits for each reply, so bytes past this frame break protocol.
-    if (in_payload > pay_len) {
-        SPDLOG_ERROR("Request is followed by {} unexpected bytes",
-                     in_payload - pay_len);
-        return false;
-    }
-    payload.resize(pay_len);
-    std::memcpy(payload.data(), rest + in_envelope + in_pay_len, in_payload);
-    return recv_all(socket, payload.data() + in_payload, pay_len - in_payload);
+    const size_t frame = pay_at + sizeof(uint32_t) + pay_len;
+    if (!fill(frame)) return false;
+    const char* head = buffer_.data() + begin_;
+    envelope = std::string_view(head + helios::rpc::kFrameHeadBytes, env_len);
+    payload = std::string_view(head + pay_at + sizeof(uint32_t), pay_len);
+    consumed_ = frame;
+    return true;
 }
 
-bool MessageHandler::send_response(int socket, const std::string& envelope,
-                                   const std::string& payload) {
-    SPDLOG_DEBUG("Sending response ({} + {} bytes)", envelope.size(),
-                 payload.size());
+bool FrameReader::buffered_frame() const {
+    const size_t begin = begin_ + consumed_;
+    const size_t have = end_ - begin;
+    if (have < helios::rpc::kFrameHeadBytes) return false;
+    const size_t pay_at =
+        helios::rpc::kFrameHeadBytes +
+        size_t{load_len(buffer_.data() + begin + sizeof(uint64_t))};
+    if (have < pay_at + sizeof(uint32_t)) return false;
+    return have >= pay_at + sizeof(uint32_t) +
+                       load_len(buffer_.data() + begin + pay_at);
+}
 
-    if (envelope.size() > UINT32_MAX || payload.size() > UINT32_MAX) {
-        SPDLOG_ERROR("Response {} + {} bytes exceeds the u32 frame limit; dropping",
-                  envelope.size(), payload.size());
+Connection::Connection(int socket)
+    : socket_(socket), wake_fd_(eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC)) {
+    if (wake_fd_ < 0) {
+        // Without a wake, replies from other threads would never go out.
+        SPDLOG_ERROR("Failed to create the wake eventfd for fd={}", socket_);
+        shutdown();
+    }
+}
+
+Connection::~Connection() {
+    close(socket_);
+    if (wake_fd_ >= 0) close(wake_fd_);
+}
+
+bool Connection::append(uint64_t id, const std::string& envelope,
+                        const std::string& payload) {
+    if (envelope.size() > helios::rpc::kMaxPartBytes ||
+        payload.size() > helios::rpc::kMaxPartBytes) {
+        SPDLOG_ERROR("Reply of {} + {} bytes exceeds the {} byte part limit; "
+                     "closing fd={}", envelope.size(), payload.size(),
+                     helios::rpc::kMaxPartBytes, socket_);
+        shutdown();
         return false;
     }
+    const uint64_t net_id = htobe64(id);
 
-    const uint32_t env_len = htonl(static_cast<uint32_t>(envelope.size()));
-    const uint32_t pay_len = htonl(static_cast<uint32_t>(payload.size()));
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (failed_) return false;
+    const bool first = out_.empty();
+    out_.append(reinterpret_cast<const char*>(&net_id), sizeof(net_id));
+    append_len(out_, envelope.size());
+    out_.append(envelope);
+    append_len(out_, payload.size());
+    out_.append(payload);
+    return first;
+}
 
-    struct iovec iov[4];
-    iov[0].iov_base = const_cast<uint32_t*>(&env_len);
-    iov[0].iov_len = sizeof(env_len);
-    iov[1].iov_base = const_cast<char*>(envelope.data());
-    iov[1].iov_len = envelope.size();
-    iov[2].iov_base = const_cast<uint32_t*>(&pay_len);
-    iov[2].iov_len = sizeof(pay_len);
-    iov[3].iov_base = const_cast<char*>(payload.data());
-    iov[3].iov_len = payload.size();
+void Connection::wake() { eventfd_write(wake_fd_, 1); }
 
-    size_t total_size = sizeof(env_len) + envelope.size() + sizeof(pay_len) +
-                        payload.size();
-    size_t total_sent = 0;
+void Connection::take_wake() {
+    eventfd_t count;
+    eventfd_read(wake_fd_, &count);
+}
 
-    while (total_sent < total_size) {
-        ssize_t bytes_sent = writev(socket, iov, 4);
-        if (bytes_sent <= 0) {
-            SPDLOG_ERROR("writev failed (sent {}/{} bytes)", total_sent, total_size);
-            return false;
+void Connection::flush() {
+    std::unique_lock<std::mutex> lock(mutex_);
+    while (!out_.empty() && !failed_) {
+        sending_.swap(out_);
+        lock.unlock();
+        size_t sent = 0;
+        while (sent < sending_.size()) {
+            const ssize_t n = send(socket_, sending_.data() + sent,
+                                   sending_.size() - sent, MSG_NOSIGNAL);
+            if (n <= 0) break;
+            sent += static_cast<size_t>(n);
         }
-        total_sent += bytes_sent;
-        if (total_sent < total_size) {
-            // Adjust iov for partial write
-            size_t consumed = bytes_sent;
-            for (int i = 0; i < 4; i++) {
-                if (consumed >= iov[i].iov_len) {
-                    consumed -= iov[i].iov_len;
-                    iov[i].iov_len = 0;
-                } else {
-                    iov[i].iov_base = static_cast<char*>(iov[i].iov_base) + consumed;
-                    iov[i].iov_len -= consumed;
-                    break;
-                }
-            }
+        const bool ok = sent == sending_.size();
+        if (!ok) {
+            SPDLOG_ERROR("Failed to send replies on fd={} (sent {}/{} bytes)",
+                         socket_, sent, sending_.size());
+        }
+        if (sending_.capacity() > kKeptBufferBytes) {
+            std::string().swap(sending_);
+        } else {
+            sending_.clear();
+        }
+        lock.lock();
+        if (!ok) {
+            failed_ = true;
+            out_.clear();
+            ::shutdown(socket_, SHUT_RDWR);
         }
     }
+}
 
-    SPDLOG_DEBUG("Response sent successfully");
-    return true;
+void Connection::shutdown() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    failed_ = true;
+    out_.clear();
+    ::shutdown(socket_, SHUT_RDWR);
 }

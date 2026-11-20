@@ -1,6 +1,7 @@
 #ifndef HELIOS_PROXY_H
 #define HELIOS_PROXY_H
 
+#include <cstddef>
 #include <cstdint>
 #include <string>
 #include <string_view>
@@ -13,6 +14,7 @@
 #include "common/typed_cell.h"
 #include "helios.pb.h"
 
+class SharedChannel;
 class TxRpcTrace;
 
 // The RPC an entry names, as the arm its request envelope sets.
@@ -23,18 +25,13 @@ using RpcOp = Helios::Protocol::Request::BodyCase;
  * current state and leaves nothing behind there; the query layer keeps the
  * transaction and installs it with one tx_commit.
  *
- * Each THD holds a HeliosProxy with its own TCP connection, managed via
- * HeliosThdCtx.
+ * Each THD holds a HeliosProxy, managed via HeliosThdCtx. Its requests go
+ * through the process's shared channel in pool slot `slot`, which other
+ * sessions use as well.
  */
 class HeliosProxy {
 public:
-    HeliosProxy(const std::string& host, int port);
-    ~HeliosProxy();
-
-    // connection management
-    bool connect(const std::string& host, int port);
-    void disconnect();
-    bool is_connected() const;
+    HeliosProxy(const std::string& host, int port, size_t slot);
 
     struct IndexNdvResult {
         bool available = false;
@@ -299,12 +296,12 @@ public:
     // Route per-RPC measurements to the active transaction trace.
     void set_current_trace(TxRpcTrace* trace) { current_trace_ = trace; }
 
-    // Run of the storage server this connection has heard from; 0 until heard
+    // Run of the storage server this session has heard from; 0 until heard
     // and after any transport failure, which forces re-reservation.
     uint64_t storage_boot_token() const { return storage_boot_token_; }
 
-    // Advances whenever an open channel closes, so equal values bracket RPCs
-    // that all went over one channel.
+    // Advances whenever this session leaves a channel after a transport error,
+    // so equal values bracket RPCs that all went over one channel.
     uint64_t generation() const { return generation_; }
 
 private:
@@ -328,24 +325,25 @@ private:
     bool send_flat(helios::rpc::FlatOp flat_op, RpcOp op, std::string_view body,
                    std::string& reply, std::string& payload);
     // The exchange itself. A failure here is a transport failure, which
-    // send_request and send_flat answer by invalidating the boot token and the
-    // channel.
+    // send_request and send_flat answer by invalidating the boot token and
+    // dropping the channel.
     bool exchange_message(std::string_view serialized_request,
                           std::string_view request_payload,
                           std::string& serialized_response,
                           std::string& payload, RpcOp op,
                           const std::string& meta);
 
-    // Connect on demand so a channel closed by a transport error is reopened
-    // by the next RPC.
+    // Takes the pool's channel on demand, so the RPC after a transport error
+    // uses a live one.
     bool ensure_connected();
 
     uint64_t storage_boot_token_ = 0;
     uint64_t generation_ = 0;
-    int socket_fd_;
-    bool connected_;
     std::string host_;
     int port_;
+    size_t slot_;
+    // Kept until an exchange on it fails.
+    std::shared_ptr<SharedChannel> channel_;
     TxRpcTrace* current_trace_ = nullptr;
 };
 

@@ -1,92 +1,16 @@
-#include <sys/socket.h>
-#include <netinet/in.h>
-#include <netinet/tcp.h>
-#include <arpa/inet.h>
-#include <unistd.h>
-#include <errno.h>
 #include <algorithm>
 #include <chrono>
 #include <cstring>
-#include <iostream>
 #include <vector>
 
 #include "helios_proxy.hh"
 #include "rpc_trace.hh"
 #include "log.hh"
+#include "shared_channel.hh"
 #include "common/rpc_flat.h"
 #include "common/rpc_frame.h"
 
 namespace {
-
-// Bytes one recv asks for. A reply that fits arrives in one recv instead of one
-// per frame field.
-constexpr size_t kRecvBytes = 16 * 1024;
-
-// Reads exactly size bytes, looping because recv(MSG_WAITALL) returns short on
-// a signal.
-bool recv_all(int socket_fd, char* out, size_t size) {
-    size_t received_total = 0;
-    while (received_total < size) {
-        const ssize_t chunk = recv(socket_fd, out + received_total,
-                                   size - received_total, MSG_WAITALL);
-        if (chunk <= 0) {
-            LOG_ERROR("SEND_MESSAGE: Failed to receive a frame, "
-                      "received %zu/%zu bytes",
-                      received_total, size);
-            return false;
-        }
-        received_total += static_cast<size_t>(chunk);
-    }
-    return true;
-}
-
-// Buffered read: copies what is left in head[used, got) into out, then reads
-// the rest of size bytes from the socket.
-bool recv_buffered(int socket_fd, const char* head, size_t got, size_t& used,
-                   char* out, size_t size) {
-    const size_t have = std::min(got - used, size);
-    std::memcpy(out, head + used, have);
-    used += have;
-    return recv_all(socket_fd, out + have, size - have);
-}
-
-// Reads one u32 length in network order and the part it counts.
-bool recv_part(int socket_fd, const char* head, size_t got, size_t& used,
-               std::string& out) {
-    uint32_t net_size = 0;
-    if (!recv_buffered(socket_fd, head, got, used,
-                       reinterpret_cast<char*>(&net_size), sizeof(net_size))) {
-        return false;
-    }
-    const uint32_t size = ntohl(net_size);
-    if (size > helios::rpc::kMaxPartBytes) {
-        LOG_ERROR("SEND_MESSAGE: frame part of %u bytes exceeds the %u byte limit",
-                  size, helios::rpc::kMaxPartBytes);
-        return false;
-    }
-    out.resize(size);
-    return recv_buffered(socket_fd, head, got, used, out.data(), size);
-}
-
-// Reads one reply: [u32 env_len][envelope][u32 pay_len][payload].
-bool recv_reply(int socket_fd, std::string& envelope, std::string& payload) {
-    char head[kRecvBytes];
-    size_t got = 0;
-    while (got < sizeof(uint32_t)) {
-        const ssize_t chunk =
-            recv(socket_fd, head + got, sizeof(head) - got, 0);
-        if (chunk <= 0) {
-            LOG_ERROR("SEND_MESSAGE: Failed to receive a frame length, "
-                      "received %zd bytes",
-                      chunk);
-            return false;
-        }
-        got += static_cast<size_t>(chunk);
-    }
-    size_t used = 0;
-    return recv_part(socket_fd, head, got, used, envelope) &&
-           recv_part(socket_fd, head, got, used, payload);
-}
 
 // Reserves by the wire size: every encoded element costs at least one byte,
 // so a count read from a corrupt response cannot force a huge allocation.
@@ -119,79 +43,12 @@ std::vector<helios::rpc::FlatRecord> flat_records(
 
 }  // namespace
 
-HeliosProxy::HeliosProxy(const std::string& host, int port)
-    : socket_fd_(-1), connected_(false), host_(host), port_(port) {
-    LOG_INFO("HeliosProxy(%p): connecting to %s:%d",
-             static_cast<const void*>(this), host_.c_str(), port_);
-    if (!connect(host_, port_)) {
-        std::cerr << "Failed to connect to Helios service at " << host_ << ":" << port_ << std::endl;
-    }
-}
+HeliosProxy::HeliosProxy(const std::string& host, int port, size_t slot)
+    : host_(host), port_(port), slot_(slot) {}
 
-HeliosProxy::~HeliosProxy() {
-    LOG_INFO("HeliosProxy(%p): destructor, connected=%s",
-             static_cast<const void*>(this), connected_ ? "true" : "false");
-    disconnect();
-}
-
-bool HeliosProxy::connect(const std::string& host, int port) {
-    if (connected_) {
-        disconnect();
-    }
-
-    // create TCP socket
-    socket_fd_ = socket(AF_INET, SOCK_STREAM, 0);
-    if (socket_fd_ < 0) {
-        return false;
-    }
-
-    // set up server address
-    struct sockaddr_in server_addr;
-    memset(&server_addr, 0, sizeof(server_addr));
-    server_addr.sin_family = AF_INET;
-    server_addr.sin_port = htons(port);
-
-    if (inet_pton(AF_INET, host.c_str(), &server_addr.sin_addr) <= 0) {
-        close(socket_fd_);
-        socket_fd_ = -1;
-        return false;
-    }
-
-    // connect
-    if (::connect(socket_fd_, (struct sockaddr*)&server_addr, sizeof(server_addr)) < 0) {
-        close(socket_fd_);
-        socket_fd_ = -1;
-        return false;
-    }
-
-    // Disable Nagle's algorithm for low-latency RPC
-    int flag = 1;
-    setsockopt(socket_fd_, IPPROTO_TCP, TCP_NODELAY, &flag, sizeof(flag));
-
-    connected_ = true;
-    host_ = host;
-    port_ = port;
-    return true;
-}
-
-void HeliosProxy::disconnect() {
-    if (socket_fd_ >= 0) {
-        LOG_INFO("HeliosProxy(%p): disconnecting socket_fd=%d",
-                 static_cast<const void*>(this), socket_fd_);
-        close(socket_fd_);
-        socket_fd_ = -1;
-        ++generation_;
-    }
-    connected_ = false;
-}
-
-bool HeliosProxy::is_connected() const {
-    return connected_;
-}
-
-// A transport failure closes the channel; the next RPC opens a new one.
 bool HeliosProxy::ensure_connected() {
-    return connected_ || connect(host_, port_);
+    if (!channel_) channel_ = SharedChannel::acquire(slot_, host_, port_);
+    return channel_ != nullptr;
 }
 
 bool HeliosProxy::fetch_table_stats(
@@ -849,12 +706,12 @@ bool HeliosProxy::send_request(const Helios::Protocol::Request& request,
                           request.body_case(), meta)) {
         LOG_ERROR("SEND_REQUEST: Failed to send %s",
                   rpc_op_name(request.body_case()));
-        // A transport error ends the transaction and the channel: the reset
-        // invalidates the ranges this connection cached, and the close drops a
-        // partially consumed response. The next transaction opens a new
-        // channel.
+        // A transport error ends the transaction, and the session leaves the
+        // channel: the reset invalidates the ranges this session cached, and
+        // the next RPC takes the pool's channel, reopened if this one failed.
         storage_boot_token_ = 0;
-        disconnect();
+        channel_.reset();
+        ++generation_;
         return false;
     }
 
@@ -886,7 +743,8 @@ bool HeliosProxy::send_flat(helios::rpc::FlatOp flat_op, RpcOp op,
                           op, "")) {
         LOG_ERROR("SEND_REQUEST: Failed to send %s", rpc_op_name(op));
         storage_boot_token_ = 0;
-        disconnect();
+        channel_.reset();
+        ++generation_;
         return false;
     }
     return true;
@@ -905,45 +763,18 @@ bool HeliosProxy::exchange_message(std::string_view serialized_request,
         LOG_ERROR("SEND_MESSAGE: Not connected!");
         return false;
     }
-    if (serialized_request.size() > UINT32_MAX ||
-        request_payload.size() > UINT32_MAX) {
+    if (serialized_request.size() > helios::rpc::kMaxPartBytes ||
+        request_payload.size() > helios::rpc::kMaxPartBytes) {
         LOG_ERROR(
-            "SEND_MESSAGE: request %zu + %zu bytes exceeds the u32 frame limit",
-            serialized_request.size(), request_payload.size());
+            "SEND_MESSAGE: request %zu + %zu bytes exceeds the %u byte limit",
+            serialized_request.size(), request_payload.size(),
+            helios::rpc::kMaxPartBytes);
         return false;
     }
 
-    const uint32_t env_len =
-        htonl(static_cast<uint32_t>(serialized_request.size()));
-    const uint32_t pay_len =
-        htonl(static_cast<uint32_t>(request_payload.size()));
-
-    // combine the envelope, the payload and the two length words
-    size_t total_size = sizeof(env_len) + serialized_request.size() +
-                        sizeof(pay_len) + request_payload.size();
-    std::vector<char> buffer(total_size);
-    char* out = buffer.data();
-    std::memcpy(out, &env_len, sizeof(env_len));
-    out += sizeof(env_len);
-    std::memcpy(out, serialized_request.data(), serialized_request.size());
-    out += serialized_request.size();
-    std::memcpy(out, &pay_len, sizeof(pay_len));
-    out += sizeof(pay_len);
-    std::memcpy(out, request_payload.data(), request_payload.size());
-
-    // send (handle partial writes for large messages)
-    size_t total_sent = 0;
-    while (total_sent < total_size) {
-        ssize_t bytes_sent = send(socket_fd_, buffer.data() + total_sent,
-                                  total_size - total_sent, 0);
-        if (bytes_sent <= 0) {
-            LOG_ERROR("SEND_MESSAGE: Failed to send message, sent %zu/%zu bytes", total_sent, total_size);
-            return false;
-        }
-        total_sent += bytes_sent;
-    }
-
-    if (!recv_reply(socket_fd_, serialized_response, payload)) {
+    if (!channel_->exchange(serialized_request, request_payload,
+                            serialized_response, payload)) {
+        LOG_ERROR("SEND_MESSAGE: the channel to the storage server failed");
         return false;
     }
 

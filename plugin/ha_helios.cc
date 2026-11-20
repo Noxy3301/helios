@@ -102,14 +102,15 @@ static HeliosThdCtx *&helios_thd_ctx(THD *thd, handlerton *hton) {
 /**
  * @brief Create the THD context and RPC proxy when this thread has none.
  */
-static void ensure_helios_proxy(HeliosThdCtx *&ctx) {
+static void ensure_helios_proxy(THD *thd, HeliosThdCtx *&ctx) {
   if (ctx == nullptr)
     ctx = new HeliosThdCtx();
   if (!ctx->proxy) {
     std::string host =
         srv_server_host ? srv_server_host : std::string("127.0.0.1");
     int port = static_cast<int>(srv_server_port);
-    ctx->proxy = std::make_shared<HeliosProxy>(host, port);
+    ctx->proxy = std::make_shared<HeliosProxy>(
+        host, port, thd_get_thread_id(thd) % kRpcChannels);
   }
 }
 
@@ -118,7 +119,7 @@ namespace helios {
 std::shared_ptr<HeliosProxy> acquire_shared_proxy(THD *thd) {
   if (thd == nullptr || helios_hton == nullptr) return nullptr;
   HeliosThdCtx *&ctx = helios_thd_ctx(thd, helios_hton);
-  ensure_helios_proxy(ctx);
+  ensure_helios_proxy(thd, ctx);
   return ctx->proxy;
 }
 
@@ -187,7 +188,7 @@ HeliosProxy *ha_helios::get_proxy() {
   // thd_ha_data provides a single void* slot per THD per storage engine.
   // We need HeliosThdCtx to hold both the RPC proxy and the transaction.
   HeliosThdCtx *&ctx = helios_thd_ctx(userThread, helios_hton);
-  ensure_helios_proxy(ctx);
+  ensure_helios_proxy(userThread, ctx);
   return ctx->proxy.get();
 }
 
@@ -336,7 +337,7 @@ HeliosTransaction *ha_helios::active_transaction(THD *thd) const {
 
 HeliosTransaction *&ha_helios::get_transaction(THD *thd) {
   HeliosThdCtx *&ctx = helios_thd_ctx(thd, helios_hton);
-  ensure_helios_proxy(ctx);
+  ensure_helios_proxy(thd, ctx);
   if (ctx->tx == nullptr) {
     ctx->tx = new HeliosTransaction(thd, ctx->proxy.get(), helios_hton);
   }
@@ -499,12 +500,13 @@ static TYPELIB commit_durability_typelib = {
 
 // Publishes the mode on the storage server; a refused switch fails the SET
 // GLOBAL with the server's reason and leaves the variable as it was.
-static void update_commit_durability(THD *, SYS_VAR *, void *var_ptr,
+static void update_commit_durability(THD *thd, SYS_VAR *, void *var_ptr,
                                      const void *save) {
   const ulong mode = *static_cast<const ulong *>(save);
   const std::string host =
       srv_server_host ? srv_server_host : std::string("127.0.0.1");
-  HeliosProxy proxy(host, static_cast<int>(srv_server_port));
+  HeliosProxy proxy(host, static_cast<int>(srv_server_port),
+                    thd_get_thread_id(thd) % kRpcChannels);
   std::string error;
   if (!proxy.db_set_commit_durability(
           mode == kCommitDurabilitySync

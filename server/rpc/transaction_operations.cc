@@ -98,7 +98,8 @@ void HeliosRpc::handleTxScanIndex(
     add_visited(response, scan.visited);
 }
 
-bool HeliosRpc::handleTxCommit(std::string_view body, std::string& reply) {
+bool HeliosRpc::handleTxCommit(std::string_view body, std::string& reply,
+                               helios::storage::EpochNumber& await_epoch) {
     helios::rpc::FlatCommit request;
     if (!helios::rpc::unpack_commit(body, request)) return false;
 
@@ -154,7 +155,8 @@ bool HeliosRpc::handleTxCommit(std::string_view body, std::string& reply) {
     if (request.async_durability) {
         durability = helios::storage::CommitDurability::kAsync;
     }
-    const bool committed = fed && tx.Commit(durability, reason);
+    // The caller holds a Sync reply until await_epoch is durable.
+    const bool committed = fed && tx.Commit(durability, reason, &await_epoch);
 
     helios::rpc::FlatCommitReply response;
     response.committed = committed;
